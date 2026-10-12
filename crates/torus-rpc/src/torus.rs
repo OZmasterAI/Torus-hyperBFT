@@ -1829,6 +1829,7 @@ impl TorusApiServer for RpcState {
             native_action_failures: status.as_ref().map(crate::types::native_action_failures),
             evm_transactions,
             evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
+            core_writer_results: status.as_ref().map(crate::types::core_writer_results),
         }))
     }
 

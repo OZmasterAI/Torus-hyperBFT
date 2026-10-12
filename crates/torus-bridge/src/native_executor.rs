@@ -34,7 +34,7 @@ use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
 use torus_economics::{
     EpochManager, GovernanceManager, RewardDistributor, StakingManager,
 };
-use torus_state::action_status::FailureReason;
+use torus_state::action_status::{CoreWriterKind, FailureReason};
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
@@ -134,6 +134,21 @@ impl NativeActionResult {
             },
         }
     }
+}
+
+/// s112: one drained CoreWriter / lockbox queue row and its result
+/// ([`NativeExecutor::drain_core_writer_entries`]).
+#[derive(Clone, Debug)]
+pub struct CoreWriterDrained {
+    /// The row's sequence in the drain block's queue (key `block ‖ seq`).
+    pub seq: u64,
+    /// `Undecodable` for a row that did not decode.
+    pub kind: CoreWriterKind,
+    /// The precompile caller that queued it; zero for an undecodable row.
+    pub trader: Address,
+    /// The block that queued it; zero for an undecodable row.
+    pub queued_block: u64,
+    pub result: NativeActionResult,
 }
 
 /// Result of executing a batch of native actions.
@@ -11197,6 +11212,25 @@ impl NativeExecutor {
             results.push(result);
         }
         Ok(results)
+    }
+
+    /// [`Self::drain_core_writer`] with each row's identity (s112, the v4
+    /// action status record): queue sequence, kind, trader and queued block
+    /// next to its result, one entry per row in queue order.
+    pub fn drain_core_writer_entries<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+    ) -> Result<Vec<CoreWriterDrained>, torus_core::error::CoreError> {
+        // RED stub: identities not filled yet.
+        Ok(Self::drain_core_writer(ctx)?
+            .into_iter()
+            .map(|result| CoreWriterDrained {
+                seq: 0,
+                kind: CoreWriterKind::Unknown,
+                trader: Address::ZERO,
+                queued_block: 0,
+                result,
+            })
+            .collect())
     }
 
     /// Native leg of a lockbox 0x0820 `depositToNative` queued last block (EVM-PF-05):

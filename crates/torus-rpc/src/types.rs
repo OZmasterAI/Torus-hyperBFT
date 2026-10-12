@@ -652,6 +652,39 @@ pub fn native_action_failures(
         .collect()
 }
 
+/// s112 (v4 record): the result of one CoreWriter / lockbox queue row the
+/// block drained (`torus_getBlockBody` `coreWriterResults`, queue order). A
+/// row is identified by (this block, `seq`); `queuedBlock` is the block whose
+/// EVM queued it (normally this block - 1) and `trader` the precompile caller
+/// (`msg.sender`), both `null` for a row that did not decode (`kind`
+/// `"undecodable"`). `status` is `"executed"`, `"failed"` or `"rejected"`
+/// (a CoreWriter order refused with an HL `*Rejected` status, named in
+/// `rejectStatus`); `reason` (stable lowercase name) and `message` are
+/// absent / empty for an executed row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcCoreWriterResult {
+    pub seq: u64,
+    pub kind: String,
+    pub trader: Option<String>,
+    pub queued_block: Option<String>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_status: Option<String>,
+    pub message: String,
+}
+
+/// The record's CoreWriter results, RPC-shaped.
+pub fn core_writer_results(
+    s: &torus_state::action_status::BlockActionStatus,
+) -> Vec<RpcCoreWriterResult> {
+    // RED stub.
+    let _ = s;
+    Vec::new()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcBlockBody {
@@ -689,6 +722,11 @@ pub struct RpcBlockBody {
     /// `null` like `native_action_status`.
     #[serde(default)]
     pub evm_transaction_status: Option<Vec<String>>,
+    /// s112 (v4): one result per CoreWriter / lockbox queue row this block
+    /// drained, queue order (see [`RpcCoreWriterResult`]). `null` like
+    /// `native_action_status`; empty when the block drained nothing.
+    #[serde(default)]
+    pub core_writer_results: Option<Vec<RpcCoreWriterResult>>,
 }
 
 #[cfg(test)]
@@ -713,6 +751,7 @@ mod action_failure_tests {
             (FailureReason::ReduceOnly, "reduce_only"),
         ];
         let status = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![],
             native_skipped: vec![false; all.len()],
             native_failed: all
@@ -758,7 +797,7 @@ mod action_failure_tests {
             })
             .collect();
         native_failed.push(NativeActionFailure::new(9, 0, 1, FailureReason::Margin, "modify".into()));
-        let status = BlockActionStatus { evm_skipped: vec![], native_skipped: vec![false; 11], native_failed };
+        let status = BlockActionStatus { evm_skipped: vec![], native_skipped: vec![false; 11], native_failed, core_writer: vec![] };
         let stored = BlockActionStatus::decode(&status.encode()).unwrap();
         let rpc = native_action_failures(&stored);
         let got: Vec<_> = rpc
@@ -791,6 +830,7 @@ mod action_failure_tests {
         use torus_state::action_status::Outcome;
         let ioc = FailureReason::IocCancel.book_reject_message();
         let status = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![],
             native_skipped: vec![false; 2],
             native_failed: vec![

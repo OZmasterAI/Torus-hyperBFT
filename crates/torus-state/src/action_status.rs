@@ -48,6 +48,17 @@
 //! `msg` (an IOC no-fill entry: 19 B instead of 98), and a reader restores
 //! that text for a rejected one with an empty `msg`. Same version byte:
 //! records written before still hold the text in full and read the same.
+//!
+//! Encoding v4 (s112, owner option b; written whenever the block drained at
+//! least one CoreWriter queue row): v3 (its `failure_count` may be 0) ‖
+//! `core_writer_count u32 BE ‖ results`, one result per drained queue row in
+//! queue (sequence) order, each `seq u64 BE ‖ kind u8 ‖ trader 20 B ‖
+//! queued_block u64 BE ‖ outcome u8 ‖ reason u8 ‖ msg_len u8 ‖ msg`
+//! ([`CoreWriterResult`]). A row is keyed for a client by (this block = the
+//! drain height, `seq`): the queue row key is `drain height ‖ seq`. An
+//! undecodable row ([`CoreWriterKind::Undecodable`]) has a zero `trader` and
+//! `queued_block`. A block that drained CoreWriter rows has a record even
+//! without native actions or EVM txs (both counts 0).
 
 /// First byte of a v1 record (executed/skipped only).
 const ACTION_STATUS_V1: u8 = 0x01;
@@ -55,6 +66,8 @@ const ACTION_STATUS_V1: u8 = 0x01;
 const ACTION_STATUS_V2: u8 = 0x02;
 /// First byte of a v3 record (v2 + outcome per entry + per-order statuses).
 const ACTION_STATUS_V3: u8 = 0x03;
+/// First byte of a v4 record (v3 + the block's CoreWriter drain results).
+const ACTION_STATUS_V4: u8 = 0x04;
 /// Longest stored failure message, in bytes (cut at a char boundary).
 pub const MAX_MESSAGE_BYTES: usize = 96;
 
@@ -240,6 +253,89 @@ impl Outcome {
     }
 }
 
+/// v4: what kind of CoreWriter / lockbox queue row a [`CoreWriterResult`]
+/// is. The codes mirror the queue row's own borsh tags; stored: never
+/// renumber, only add.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CoreWriterKind {
+    PlaceOrder = 0,
+    CancelOrder = 1,
+    CancelAll = 2,
+    Delegate = 3,
+    Undelegate = 4,
+    ClaimRewards = 5,
+    LockPermanent = 6,
+    ClaimUnbonded = 7,
+    LockboxDeposit = 0x20,
+    LockboxWithdraw = 0x21,
+    /// A code this reader does not know (a newer writer).
+    Unknown = 0xFE,
+    /// The queue row was present but did not decode (A-exception, s111).
+    Undecodable = 0xFF,
+}
+
+impl CoreWriterKind {
+    /// Unknown codes read as [`Self::Unknown`].
+    pub fn from_u8(code: u8) -> Self {
+        match code {
+            0 => Self::PlaceOrder,
+            1 => Self::CancelOrder,
+            2 => Self::CancelAll,
+            3 => Self::Delegate,
+            4 => Self::Undelegate,
+            5 => Self::ClaimRewards,
+            6 => Self::LockPermanent,
+            7 => Self::ClaimUnbonded,
+            0x20 => Self::LockboxDeposit,
+            0x21 => Self::LockboxWithdraw,
+            0xFF => Self::Undecodable,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Stable lowercase name (RPC).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlaceOrder => "place_order",
+            Self::CancelOrder => "cancel_order",
+            Self::CancelAll => "cancel_all",
+            Self::Delegate => "delegate",
+            Self::Undelegate => "undelegate",
+            Self::ClaimRewards => "claim_rewards",
+            Self::LockPermanent => "lock_permanent",
+            Self::ClaimUnbonded => "claim_unbonded",
+            Self::LockboxDeposit => "lockbox_deposit",
+            Self::LockboxWithdraw => "lockbox_withdraw",
+            Self::Unknown => "unknown",
+            Self::Undecodable => "undecodable",
+        }
+    }
+}
+
+/// v4: the result of one CoreWriter / lockbox queue row the block drained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreWriterResult {
+    /// The row's sequence in this block's queue (its key's low 8 bytes; the
+    /// key is `drain height ‖ seq`).
+    pub seq: u64,
+    pub kind: CoreWriterKind,
+    /// The precompile caller (`msg.sender`) that queued it; zero for an
+    /// undecodable row.
+    pub trader: alloy_primitives::Address,
+    /// The block whose EVM queued it (the row's own field); zero for an
+    /// undecodable row.
+    pub queued_block: u64,
+    /// `Executed`, `Failed`, or `Rejected` (a CoreWriter order refused with
+    /// an HL `*Rejected` status, as for a native placement).
+    pub outcome: Outcome,
+    /// `Other` for an executed row.
+    pub reason: FailureReason,
+    /// Empty for an executed row; for a `Rejected` one, empty stands for its
+    /// reason's [`FailureReason::book_reject_message`] (as in v3).
+    pub message: String,
+}
+
 /// Row 50 (v3): one order's status inside an entry (see
 /// [`NativeActionFailure::orders`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,6 +402,9 @@ pub struct BlockActionStatus {
     /// Native actions that executed and failed or were rejected, ascending
     /// `index`; never a skipped one.
     pub native_failed: Vec<NativeActionFailure>,
+    /// v4: one result per CoreWriter queue row drained in this block, queue
+    /// (sequence) order.
+    pub core_writer: Vec<CoreWriterResult>,
 }
 
 fn push_bitmap(out: &mut Vec<u8>, bits: &[bool]) {
@@ -472,6 +571,7 @@ impl BlockActionStatus {
             evm_skipped: read_bitmap(evm_bits, evm_count),
             native_skipped: read_bitmap(native_bits, native_count),
             native_failed,
+            core_writer: Vec::new(),
         })
     }
 
@@ -543,6 +643,7 @@ mod tests {
     #[test]
     fn round_trips_and_packs_one_bit_per_action() {
         let status = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![false, true, false],
             native_skipped: (0..10).map(|i| i == 0 || i == 9).collect(),
             native_failed: vec![],
@@ -584,6 +685,7 @@ mod tests {
             OrderOutcome { outcome: Outcome::Failed, reason: FailureReason::Tick, message: "tick".into() },
         ];
         let status = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![true],
             native_skipped: vec![false, false, false, true, false],
             native_failed: vec![
@@ -621,6 +723,7 @@ mod tests {
             message: "c".into(),
         }];
         let bytes = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![],
             native_skipped: vec![false],
             native_failed: vec![entry],
@@ -743,6 +846,7 @@ mod tests {
     /// (after version 1 + counts 8 + bitmaps 0+1 + entry count 4).
     fn one_entry_record(entry: NativeActionFailure) -> (BlockActionStatus, Vec<u8>) {
         let status = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![],
             native_skipped: vec![false],
             native_failed: vec![entry],
@@ -860,6 +964,7 @@ mod tests {
     #[test]
     fn v3_round_trips_failures() {
         let status = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![],
             native_skipped: vec![true, false, false, false],
             native_failed: vec![
@@ -896,6 +1001,7 @@ mod tests {
     fn long_messages_are_cut_at_a_char_boundary() {
         let long = format!("x{}", "é".repeat(100));
         let status = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![],
             native_skipped: vec![false],
             native_failed: vec![failure(0, 0, 1, FailureReason::Other, &long)],
@@ -932,6 +1038,7 @@ mod tests {
             assert_eq!(FailureReason::from_u8(code), reason, "{name}");
             assert_eq!(reason.as_str(), name);
             let status = BlockActionStatus {
+                core_writer: vec![],
                 evm_skipped: vec![],
                 native_skipped: vec![false],
                 // The message says nothing about the reason: it is not parsed.
@@ -943,6 +1050,145 @@ mod tests {
         assert_eq!(FailureReason::from_u8(200), FailureReason::Other);
     }
 
+    fn cw(seq: u64, kind: CoreWriterKind, outcome: Outcome, reason: FailureReason, msg: &str) -> CoreWriterResult {
+        let undecodable = kind == CoreWriterKind::Undecodable;
+        CoreWriterResult {
+            seq,
+            kind,
+            trader: if undecodable {
+                alloy_primitives::Address::ZERO
+            } else {
+                alloy_primitives::Address::repeat_byte(0x40 + seq as u8)
+            },
+            queued_block: if undecodable { 0 } else { 6 },
+            outcome,
+            reason,
+            message: msg.to_string(),
+        }
+    }
+
+    /// s112 (owner option b): a block's CoreWriter drain results, one per
+    /// queue row in queue order with mixed outcomes, round-trip in a v4
+    /// record next to native failures; a block without native actions or
+    /// EVM txs keeps them too (both counts 0).
+    #[test]
+    fn v4_round_trips_core_writer_results_in_queue_order() {
+        use CoreWriterKind as K;
+        let ioc = FailureReason::IocCancel.book_reject_message();
+        let results = vec![
+            cw(0, K::LockboxDeposit, Outcome::Executed, FailureReason::Other, ""),
+            cw(1, K::Undecodable, Outcome::Failed, FailureReason::Other, "undecodable queued action (block 7, seq 1): x"),
+            cw(2, K::CancelOrder, Outcome::Failed, FailureReason::Other, "action queued in block 7 cannot execute in block 7"),
+            cw(3, K::PlaceOrder, Outcome::Failed, FailureReason::Other, "CoreWriter stop order type 2 is not supported"),
+            cw(4, K::LockboxWithdraw, Outcome::Failed, FailureReason::Margin, "insufficient native balance"),
+            cw(5, K::PlaceOrder, Outcome::Rejected, FailureReason::IocCancel, ioc),
+            cw(9, K::Unknown, Outcome::Executed, FailureReason::Other, ""),
+        ];
+        for (evm, native, failed) in [
+            (vec![], vec![], vec![]),
+            (vec![true], vec![false, false], vec![failure(1, 0, 1, FailureReason::Lot, "lot")]),
+        ] {
+            let status = BlockActionStatus {
+                evm_skipped: evm,
+                native_skipped: native,
+                native_failed: failed,
+                core_writer: results.clone(),
+            };
+            let bytes = status.encode();
+            assert_eq!(bytes[0], ACTION_STATUS_V4, "CoreWriter results write v4");
+            let back = BlockActionStatus::decode(&bytes).expect("v4 decodes");
+            assert_eq!(back, status);
+            let seqs: Vec<u64> = back.core_writer.iter().map(|r| r.seq).collect();
+            assert_eq!(seqs, [0, 1, 2, 3, 4, 5, 9]);
+            assert_eq!(back.core_writer[5].message, ioc, "a canonical rejection reads back in full");
+        }
+        // The canonical rejection text is not stored (as in v3).
+        let one = |message: &str| {
+            BlockActionStatus {
+                core_writer: vec![cw(0, K::PlaceOrder, Outcome::Rejected, FailureReason::IocCancel, message)],
+                ..Default::default()
+            }
+            .encode()
+            .len()
+        };
+        assert_eq!(one(ioc), one(""));
+        // version 1 + counts 8 + failure_count 4 + cw count 4 + seq 8 + kind 1
+        // + trader 20 + queued_block 8 + outcome, reason, msg_len 3.
+        assert_eq!(one(""), 1 + 8 + 4 + 4 + 8 + 1 + 20 + 8 + 3);
+    }
+
+    /// v4: no CoreWriter result keeps the v1 / v3 bytes exactly.
+    #[test]
+    fn no_core_writer_results_keeps_v1_and_v3() {
+        let v1 = BlockActionStatus { native_skipped: vec![false], ..Default::default() };
+        assert_eq!(v1.encode()[0], ACTION_STATUS_V1);
+        let v3 = BlockActionStatus {
+            native_skipped: vec![false],
+            native_failed: vec![failure(0, 0, 1, FailureReason::Lot, "lot")],
+            ..Default::default()
+        };
+        assert_eq!(v3.encode()[0], ACTION_STATUS_V3);
+    }
+
+    /// v4: a truncated or overlong CoreWriter section does not decode; a
+    /// kind or outcome code this reader does not know reads as `Unknown` /
+    /// `Failed`.
+    #[test]
+    fn v4_truncated_section_does_not_decode_and_unknown_codes_read() {
+        let status = BlockActionStatus {
+            core_writer: vec![cw(3, CoreWriterKind::Delegate, Outcome::Failed, FailureReason::Other, "no stake")],
+            ..Default::default()
+        };
+        let bytes = status.encode();
+        assert_eq!(BlockActionStatus::decode(&bytes), Some(status));
+        // The section starts after version 1 + counts 8 + failure_count 4.
+        for cut in 13..bytes.len() {
+            assert_eq!(BlockActionStatus::decode(&bytes[..cut]), None, "cut at {cut}");
+        }
+        let mut overlong = bytes.clone();
+        overlong.push(0);
+        assert_eq!(BlockActionStatus::decode(&overlong), None);
+        let mut huge = bytes.clone();
+        huge[13..17].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(BlockActionStatus::decode(&huge), None);
+        // kind at 17 + 8; outcome at 17 + 8 + 1 + 20 + 8.
+        let (kind_at, outcome_at) = (25, 54);
+        assert_eq!(bytes[kind_at], CoreWriterKind::Delegate as u8);
+        assert_eq!(bytes[outcome_at], Outcome::Failed as u8);
+        let mut kind = bytes.clone();
+        kind[kind_at] = 0x99;
+        assert_eq!(BlockActionStatus::decode(&kind).unwrap().core_writer[0].kind, CoreWriterKind::Unknown);
+        let mut outcome = bytes;
+        outcome[outcome_at] = 0x77;
+        assert_eq!(BlockActionStatus::decode(&outcome).unwrap().core_writer[0].outcome, Outcome::Failed);
+    }
+
+    /// The stored CoreWriter kind codes and names are a format.
+    #[test]
+    fn core_writer_kind_codes_and_names_are_stable() {
+        use CoreWriterKind as K;
+        let all = [
+            (K::PlaceOrder, 0, "place_order"),
+            (K::CancelOrder, 1, "cancel_order"),
+            (K::CancelAll, 2, "cancel_all"),
+            (K::Delegate, 3, "delegate"),
+            (K::Undelegate, 4, "undelegate"),
+            (K::ClaimRewards, 5, "claim_rewards"),
+            (K::LockPermanent, 6, "lock_permanent"),
+            (K::ClaimUnbonded, 7, "claim_unbonded"),
+            (K::LockboxDeposit, 0x20, "lockbox_deposit"),
+            (K::LockboxWithdraw, 0x21, "lockbox_withdraw"),
+            (K::Unknown, 0xFE, "unknown"),
+            (K::Undecodable, 0xFF, "undecodable"),
+        ];
+        for (kind, code, name) in all {
+            assert_eq!(kind as u8, code, "{name}");
+            assert_eq!(K::from_u8(code), kind, "{name}");
+            assert_eq!(kind.as_str(), name);
+        }
+        assert_eq!(K::from_u8(8), K::Unknown);
+    }
+
     #[test]
     fn empty_record_round_trips() {
         let status = BlockActionStatus::default();
@@ -952,13 +1198,14 @@ mod tests {
     #[test]
     fn rejects_unknown_version_and_bad_lengths() {
         let bytes = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![true],
             native_skipped: vec![true; 9],
             native_failed: vec![],
         }
         .encode();
         let mut wrong_version = bytes.clone();
-        wrong_version[0] = 0x04;
+        wrong_version[0] = 0x05;
         assert_eq!(BlockActionStatus::decode(&wrong_version), None);
         assert_eq!(BlockActionStatus::decode(&bytes[..bytes.len() - 1]), None);
         let mut overlong = bytes.clone();
@@ -967,6 +1214,7 @@ mod tests {
         assert_eq!(BlockActionStatus::decode(&[]), None);
 
         let v2 = BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![],
             native_skipped: vec![false; 2],
             native_failed: vec![failure(1, 0, 1, FailureReason::Fill, "boom")],
