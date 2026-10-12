@@ -3558,6 +3558,7 @@ mod tests {
             outcome,
             reason,
             message: message.to_string(),
+            oid: None,
         };
         let results = vec![
             cw(
@@ -3592,6 +3593,18 @@ mod tests {
                 FailureReason::Margin,
                 "short",
             ),
+            // s114: an executed placement carries its order id.
+            CoreWriterResult {
+                oid: Some(0x1_0000_0000_0000_002a),
+                ..cw(
+                    4,
+                    CoreWriterKind::PlaceOrder,
+                    10,
+                    Outcome::Executed,
+                    FailureReason::Other,
+                    "",
+                )
+            },
         ];
         store_applied_height(&state, 4);
         // s114: rows 0 and 2 were queued by EVM txs this node linked (row 0
@@ -3687,6 +3700,17 @@ mod tests {
                 "status": "failed",
                 "reason": "margin",
                 "message": "short",
+                "txHash": null,
+                "callIndex": null
+            },
+            {
+                "seq": 4,
+                "kind": "place_order",
+                "trader": format!("{:#x}", Address::repeat_byte(10)),
+                "queuedBlock": "0x2",
+                "status": "executed",
+                "message": "",
+                "oid": "0x1000000000000002a",
                 "txHash": null,
                 "callIndex": null
             }

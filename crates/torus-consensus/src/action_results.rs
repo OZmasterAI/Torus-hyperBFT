@@ -274,6 +274,7 @@ pub fn core_writer_results(
                 outcome,
                 reason,
                 message,
+                oid: None,
             }
         })
         .collect()
@@ -594,6 +595,7 @@ mod tests {
             trader: Address::repeat_byte(seq as u8),
             queued_block: 4,
             result,
+            oid: None,
         };
         let ioc = NativeActionResult {
             error: Some(Cow::Borrowed(
@@ -619,7 +621,16 @@ mod tests {
                 },
             ),
         ];
+        // s114: an executed CoreWriter placement keeps its order id.
+        let mut entries = entries;
+        entries.push(CoreWriterDrained {
+            oid: Some(77),
+            ..entry(8, K::PlaceOrder, ok())
+        });
         let got = core_writer_results(entries);
+        let oids: Vec<_> = got.iter().map(|r| r.oid).collect();
+        assert_eq!(oids, vec![None, None, None, None, None, Some(77)]);
+        let got = got[..5].to_vec();
         let rows: Vec<_> = got
             .iter()
             .map(|r| (r.seq, r.kind, r.outcome, r.reason, r.message.as_str()))

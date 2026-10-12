@@ -149,6 +149,9 @@ pub struct CoreWriterDrained {
     /// The block that queued it; zero for an undecodable row.
     pub queued_block: u64,
     pub result: NativeActionResult,
+    /// s114: the order id an executed `PlaceOrder` row's order got
+    /// (resting or filled); `None` for every other row.
+    pub oid: Option<OrderId>,
 }
 
 /// Result of executing a batch of native actions.
@@ -11197,6 +11200,7 @@ impl NativeExecutor {
                         trader: Address::ZERO,
                         queued_block: 0,
                         result: NativeActionResult::err("core_writer", bad.to_string()),
+                        oid: None,
                     });
                     continue;
                 }
@@ -11207,6 +11211,7 @@ impl NativeExecutor {
                 trader: qa.trader,
                 queued_block: qa.block_queued,
                 result,
+                oid: None,
             };
             // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
             // queued in the current or a future block (should never happen, but

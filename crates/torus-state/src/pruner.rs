@@ -705,6 +705,7 @@ mod tests {
                 outcome: Outcome::Failed,
                 reason: FailureReason::Other,
                 message: format!("withdraw {h} refused"),
+                oid: None,
             }],
             ..Default::default()
         };
