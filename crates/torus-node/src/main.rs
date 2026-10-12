@@ -1404,31 +1404,32 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         warn!(signal = %s, "second signal during shutdown");
     };
     let outcome = bounded_stop(shutdown_worker, stop, limit, second_signal).await;
-    if outcome.exits_at_once() {
-        // The stop is still running (e.g. a flush stalled on I/O):
-        // `exit()` would run RocksDB's exit handlers, which join its
-        // background threads and block on the same work. Skip them.
-        log_with_grace(
-            move || error!(?outcome, ?limit, "shutdown abandoned; exiting now (exit 1)"),
-            Duration::from_millis(500),
-        );
-        // SAFETY: `_exit` only ends the process; no Rust state is touched.
-        unsafe { libc::_exit(1) };
-    }
-    match outcome {
-        StopOutcome::Clean => {
-            info!(
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "shutdown complete"
-            );
-            Ok(())
-        }
-        StopOutcome::Failed(e) => Err(format!("shutdown failed: {e}").into()),
-        StopOutcome::TimedOut => {
-            Err(format!("shutdown did not finish within {limit:?}; exiting without it").into())
-        }
-        StopOutcome::Interrupted => Err("shutdown interrupted by a second signal".into()),
-    }
+    // Every outcome ends with `_exit`: `exit()` would run RocksDB's exit
+    // handlers, which join its background threads, so a stalled flush or
+    // compaction would hold up the exit with no bound. A clean stop has
+    // already flushed and synced; the others are as after a kill.
+    debug_assert!(outcome.exits_at_once());
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let code = match outcome {
+        StopOutcome::Clean => 0,
+        _ => 1,
+    };
+    log_with_grace(
+        move || match outcome {
+            StopOutcome::Clean => info!(elapsed_ms, "shutdown complete"),
+            StopOutcome::Failed(e) => error!(%e, "shutdown failed (exit 1)"),
+            StopOutcome::TimedOut => error!(
+                ?limit,
+                "shutdown did not finish within the limit; exiting without it (exit 1)"
+            ),
+            StopOutcome::Interrupted => {
+                error!("shutdown interrupted by a second signal (exit 1)")
+            }
+        },
+        Duration::from_millis(500),
+    );
+    // SAFETY: `_exit` only ends the process; no Rust state is touched.
+    unsafe { libc::_exit(code) }
 }
 
 /// Run `log` (the last line before `_exit`) on its own thread and wait at
@@ -1498,9 +1499,10 @@ enum StopOutcome {
 }
 
 impl StopOutcome {
-    /// Whether the process must exit without running exit handlers.
+    /// Whether the process must exit without running exit handlers: always
+    /// (see the end of `run`).
     fn exits_at_once(&self) -> bool {
-        matches!(self, StopOutcome::TimedOut | StopOutcome::Interrupted)
+        true
     }
 }
 
@@ -1813,8 +1815,10 @@ mod tests {
     fn abandoned_stop_exits_without_exit_handlers() {
         assert!(StopOutcome::TimedOut.exits_at_once());
         assert!(StopOutcome::Interrupted.exits_at_once());
-        assert!(!StopOutcome::Clean.exits_at_once());
-        assert!(!StopOutcome::Failed("flush".into()).exits_at_once());
+        // Codex round 4: a clean stop too: an unrelated stalled compaction
+        // would otherwise hold up `exit(0)` after flush + WAL sync.
+        assert!(StopOutcome::Clean.exits_at_once());
+        assert!(StopOutcome::Failed("flush".into()).exits_at_once());
     }
 
     /// Codex stop review: the last log line before `_exit` must not hold up
