@@ -362,11 +362,11 @@ fn spawn_layer_merge(
         .spawn(move || {
             let mut part = layer.split_deferred();
             layer.merge_part(&block, torus_state::LayerPart::Main);
-            before_deferred();
-            part.merge_part(&block, torus_state::LayerPart::Deferred);
             if layer_tx.send(layer).is_err() {
                 return;
             }
+            before_deferred();
+            part.merge_part(&block, torus_state::LayerPart::Deferred);
             let _ = deferred_tx.send(part);
             if slice {
                 before_slice();

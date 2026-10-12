@@ -1339,7 +1339,7 @@ impl NativeStateOverlay {
     #[inline]
     fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
         let layer = match &self.deferred {
-            Some(d) if d.read().is_some() && crate::checkpoint_layer::is_deferred_slot(id.0 as usize) => {
+            Some(d) if crate::checkpoint_layer::is_deferred_slot(id.0 as usize) => {
                 Some(d.read().map(|l| l.pending_state()).ok_or_else(|| {
                     StateError::Io(std::io::Error::other(
                         "since-checkpoint layer merge failed (deferred part lost)",
