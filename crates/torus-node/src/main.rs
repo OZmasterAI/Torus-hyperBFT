@@ -1484,13 +1484,27 @@ async fn bounded_stop(
 /// restart does not replay the WAL. Run after consensus and execution stop.
 fn flush_for_shutdown(state_db: &StateDb) -> Result<(), String> {
     let db = state_db.db_arc();
-    for cf_name in torus_state::cf::ALL_CF_NAMES {
-        if let Some(cf) = db.cf_handle(cf_name) {
-            db.flush_cf(cf)
-                .map_err(|e| format!("flush {cf_name}: {e}"))?;
-        }
-    }
-    state_db.sync_wal().map_err(|e| e.to_string())
+    flush_then_sync(
+        || {
+            for cf_name in torus_state::cf::ALL_CF_NAMES {
+                if let Some(cf) = db.cf_handle(cf_name) {
+                    db.flush_cf(cf)
+                        .map_err(|e| format!("flush {cf_name}: {e}"))?;
+                }
+            }
+            Ok(())
+        },
+        || state_db.sync_wal().map_err(|e| e.to_string()),
+    )
+}
+
+/// The memtable flush, then the WAL sync.
+fn flush_then_sync(
+    flush: impl FnOnce() -> Result<(), String>,
+    sync: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    flush()?;
+    sync()
 }
 
 /// Pure parse of `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (default 5; `< 1` or
@@ -1619,6 +1633,48 @@ fn install_fail_stop_panic_hook(exit: fn(i32)) {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Codex P2: a failed memtable flush must not skip the WAL sync, and the
+    /// error must reach the caller.
+    #[test]
+    fn flush_failure_still_syncs_the_wal_and_reports_the_error() {
+        let mut synced = false;
+        let res = flush_then_sync(
+            || Err("flush cf_accounts: injected".into()),
+            || {
+                synced = true;
+                Ok(())
+            },
+        );
+        assert!(synced, "WAL sync skipped after a flush failure");
+        let err = res.expect_err("flush failure reported as success");
+        assert!(err.contains("injected"), "{err}");
+
+        let res = flush_then_sync(|| Err("f".into()), || Err("s".into()));
+        let err = res.unwrap_err();
+        assert!(err.contains('f') && err.contains('s'), "{err}");
+        assert_eq!(flush_then_sync(|| Ok(()), || Ok(())), Ok(()));
+    }
+
+    /// Codex P2: a second SIGTERM that arrives while the first is being
+    /// handled is not lost (the receivers live across both waits).
+    #[tokio::test]
+    async fn second_sigterm_during_shutdown_is_not_lost() {
+        let first = tokio::spawn(shutdown_signal());
+        tokio::time::sleep(Duration::from_millis(100)).await; // registered
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let got = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("first SIGTERM seen")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, "SIGTERM");
+        // Sent before the shutdown starts waiting for a second signal.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let second = tokio::time::timeout(Duration::from_secs(2), shutdown_signal()).await;
+        assert!(second.is_ok(), "second SIGTERM lost");
+    }
 
     #[test]
     fn shutdown_timeout_parse() {
