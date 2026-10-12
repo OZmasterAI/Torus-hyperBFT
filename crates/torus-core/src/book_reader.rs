@@ -623,21 +623,23 @@ pub enum CloidOrder {
 }
 
 /// s114 (HL `orderStatus` by cloid): `trader`'s open order whose client order
-/// id is `cloid` — a resting order (every layout's order store, as
-/// [`read_open_orders`]) or a pending stop (the classic blob, or the root
-/// CF's stop rows). At most one exists (the executor's uniqueness rule).
+/// id is `cloid` — a pending stop (the classic blob, or the root CF's stop
+/// rows) or a resting order (every layout's order store, as
+/// [`read_open_orders`]). At most one exists (the executor's uniqueness
+/// rule).
+///
+/// The two kinds are separate scans, so a block may commit between them.
+/// The only change that moves a live cloid from one kind to the other is a
+/// stop that fires and places its order (same trader, same cloid), never
+/// the reverse — so stops are scanned FIRST: a commit between the scans
+/// can then only move the order into the second scan, never out of both
+/// (Codex P2).
 pub fn find_by_cloid<S: StateBackend>(
     state: &S,
     trader: &Address,
     cloid: Cloid,
     layout: BookLayout,
 ) -> Result<Option<CloidOrder>, CoreError> {
-    if let Some((mid, order)) = read_open_orders(state, trader, None, layout, usize::MAX)?
-        .into_iter()
-        .find(|(_, o)| o.client_order_id == Some(cloid))
-    {
-        return Ok(Some(CloidOrder::Resting(mid, order)));
-    }
     let hit = |s: &StopOrder| s.trader == *trader && s.client_order_id == Some(cloid);
     for (key, value) in iterate_optional_cf(state, CF_NATIVE_ORDER_BOOKS, None)? {
         let mid = || u64::from_be_bytes(key[..8].try_into().unwrap());
@@ -659,7 +661,10 @@ pub fn find_by_cloid<S: StateBackend>(
             _ => {}
         }
     }
-    Ok(None)
+    Ok(read_open_orders(state, trader, None, layout, usize::MAX)?
+        .into_iter()
+        .find(|(_, o)| o.client_order_id == Some(cloid))
+        .map(|(mid, order)| CloidOrder::Resting(mid, order)))
 }
 
 /// Rebuild one market's full `OrderBook` from the row layouts (mode 1: root CF

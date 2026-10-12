@@ -120,7 +120,10 @@ fn a_stop_that_triggers_between_the_scans_is_still_found() {
         (found, backend.reads.load(Ordering::SeqCst))
     };
     let (all_before, reads) = lookup(usize::MAX);
-    assert!(matches!(all_before, Some(CloidOrder::Stop(1, _))), "{all_before:?}");
+    assert!(
+        matches!(all_before, Some(CloidOrder::Stop(1, _))),
+        "{all_before:?}"
+    );
     assert!(matches!(lookup(0).0, Some(CloidOrder::Resting(1, _))));
     for switch_at in 0..=reads {
         assert!(
