@@ -579,8 +579,9 @@ Differences in `commit` mode:
   absent and every action counts as executed: a cancel-all that later fails
   still resets the sender's open-order estimate (`OPEN_ORDER_BUDGET`).
 - A height that stays without a readable body (null or error) for 5 polls
-  while the next height has one is a hole: counted `missed` and skipped (its
-  actions free by timeout). Errors alone never skip a height in this mode
+  is skipped (counted `missed`, its actions free by timeout) once it is known
+  committed: the next height has a body, or `eth_blockNumber` has passed it
+  (it lags under Phase 3 but catches up at each checkpoint). Errors alone never skip a height in this mode
   (it may not be committed yet); head mode skips after 5 errors because the
   height is at or below `eth_blockNumber`.
 - bench.log's `In-flight cap ...` line ends in ` | tail=commit`.

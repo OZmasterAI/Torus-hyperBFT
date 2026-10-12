@@ -65,7 +65,9 @@ pub enum TailMode {
     /// (`torus-consensus` `persist_committed_block_durably_timed`, called by
     /// `dispatch_to_exec` before the block is executed), and the RPC reads
     /// `CF_BLOCK_BODIES` with no applied-marker or head check. A null result
-    /// = not committed yet (not an error). Released actions carry no
+    /// = not committed yet (not an error). A height without a readable body
+    /// is skipped only once known committed (a later body exists, or
+    /// `eth_blockNumber` has passed it). Released actions carry no
     /// executed/skipped status yet (the status row is written by execution),
     /// so every action counts as executed: a cancel-all that later fails
     /// still resets the sender's open-order estimate.
@@ -708,11 +710,14 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
                         }
                     }
                 }
-                // Long without a readable body: a hole only if a later height
-                // has one (then this height IS committed). Commits land in
-                // height order, so re-read the gap after the ahead probe: it
-                // may have just landed.
-                if !matches!(src.body(cur.next + 1).await, BodyFetch::Keys(_)) {
+                // Long without a readable body: skip it only once it is known
+                // committed, i.e. eth_blockNumber has passed it (it lags but
+                // does catch up, so a run of unreadable bodies is crossed one
+                // height at a time) or the next height has a body. Commits
+                // land in height order, so re-read the gap after the check:
+                // it may have just landed.
+                let past_head = src.head().await.is_some_and(|h| h >= cur.next);
+                if !past_head && !matches!(src.body(cur.next + 1).await, BodyFetch::Keys(_)) {
                     break;
                 }
                 match src.body(cur.next).await {
@@ -1402,6 +1407,37 @@ mod tests {
         assert_eq!(cap.tracker.lock().unwrap().released, [1, 0, 0]);
         assert_eq!(stats(&cap), [1, TAIL_MAX_ATTEMPTS as u64, 0]);
         assert_eq!(cur.next, 2);
+    }
+
+    // Review finding (Codex torus review): two unreadable bodies in a row.
+    // The ahead probe cannot confirm height 1 (height 2 is unreadable too),
+    // but once eth_blockNumber passes them (it lags, then catches up at a
+    // checkpoint) each is skipped after TAIL_MAX_ATTEMPTS and body 3
+    // releases. While the head is below them the tail waits.
+    #[tokio::test]
+    async fn commit_tail_crosses_a_run_of_unreadable_bodies_once_the_head_passes() {
+        for (head, released) in [(Some(0), 0), (Some(2), 1)] {
+            let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Commit);
+            cap.submit(0, &[(9, 1_000, 400, false)]);
+            let node = FakeNode::new(head)
+                .with(1, vec![BodyFetch::Error])
+                .with(2, vec![BodyFetch::Error])
+                .with(3, vec![BodyFetch::Keys(vec![(9, true)])]);
+            let mut cur = TailCursor::new(0);
+            for _ in 0..2 * TAIL_MAX_ATTEMPTS {
+                tail_poll(&cap, &node, &mut cur, far()).await;
+            }
+            let t = cap.tracker.lock().unwrap();
+            assert_eq!(t.released, [released, 0, 0], "head {head:?}");
+            drop(t);
+            if released == 1 {
+                assert_eq!(stats(&cap), [1, 2 * TAIL_MAX_ATTEMPTS as u64, 2]);
+                assert_eq!(cur.next, 4);
+            } else {
+                assert_eq!(stats(&cap), [0, 2 * TAIL_MAX_ATTEMPTS as u64, 0]);
+                assert_eq!(cur.next, 1);
+            }
+        }
     }
 
     #[test]
