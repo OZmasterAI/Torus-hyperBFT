@@ -375,6 +375,18 @@ pub struct RpcOpenOrder {
     pub timestamp: u64,
 }
 
+/// s114: `torus_getOrderByCloid` — the trader's open order with that client
+/// order id. `status` is `"open"` (resting) or `"triggerPending"` (a pending
+/// stop: `order.price` is its limit or price cap, `triggerPrice` its trigger).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcOrderByCloid {
+    pub status: String,
+    pub order: RpcOpenOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcOpenInterest {

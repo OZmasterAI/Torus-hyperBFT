@@ -32,14 +32,14 @@ use std::collections::BTreeMap;
 
 use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
 use torus_state::{StateBackend, StateError};
-use torus_types::{Address, FixedPoint, MarketId, Side};
+use torus_types::{Address, Cloid, FixedPoint, MarketId, Side};
 
 use crate::book_rows::{
     book_meta_key, price_dec, side_from_tag, BookMetaRow, LevelRowData, LEVEL_ROW_VALUE_LEN,
     ROW_TAG_LEVEL, ROW_TAG_META, ROW_TAG_ORDER, ROW_TAG_STOP,
 };
 use crate::error::CoreError;
-use crate::order_book::{Order, OrderBook};
+use crate::order_book::{Order, OrderBook, StopOrder};
 
 /// Node-local mode marker row in `CF_NATIVE_MARKETS` (written by the executor
 /// on its first save; key length != 8 so every market reader skips it).
@@ -611,6 +611,55 @@ pub fn read_open_orders<S: StateBackend>(
     out.sort_by_key(|(mid, o)| (*mid, o.id));
     out.truncate(limit);
     Ok(out)
+}
+
+/// s114: an open order found by `(trader, cloid)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CloidOrder {
+    /// A resting order.
+    Resting(MarketId, Order),
+    /// A pending stop.
+    Stop(MarketId, StopOrder),
+}
+
+/// s114 (HL `orderStatus` by cloid): `trader`'s open order whose client order
+/// id is `cloid` — a resting order (every layout's order store, as
+/// [`read_open_orders`]) or a pending stop (the classic blob, or the root
+/// CF's stop rows). At most one exists (the executor's uniqueness rule).
+pub fn find_by_cloid<S: StateBackend>(
+    state: &S,
+    trader: &Address,
+    cloid: Cloid,
+    layout: BookLayout,
+) -> Result<Option<CloidOrder>, CoreError> {
+    if let Some((mid, order)) = read_open_orders(state, trader, None, layout, usize::MAX)?
+        .into_iter()
+        .find(|(_, o)| o.client_order_id == Some(cloid))
+    {
+        return Ok(Some(CloidOrder::Resting(mid, order)));
+    }
+    let hit = |s: &StopOrder| s.trader == *trader && s.client_order_id == Some(cloid);
+    for (key, value) in iterate_optional_cf(state, CF_NATIVE_ORDER_BOOKS, None)? {
+        let mid = || u64::from_be_bytes(key[..8].try_into().unwrap());
+        match (layout, key_shape(&key)) {
+            (BookLayout::Classic, Some(KeyShape::ClassicBlob)) => {
+                let book = decode_classic_book(&value, mid())?;
+                if let Some(s) = book.pending_stops().iter().find(|s| hit(s)) {
+                    return Ok(Some(CloidOrder::Stop(mid(), s.clone())));
+                }
+            }
+            (BookLayout::OrderRows | BookLayout::LevelAuthority, Some(KeyShape::StopRow)) => {
+                let stop = OrderBook::decode_stop_row(&value).map_err(|e| {
+                    corrupt_err(format!("market {}: stop row does not decode: {e}", mid()))
+                })?;
+                if hit(&stop) {
+                    return Ok(Some(CloidOrder::Stop(mid(), stop)));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// Rebuild one market's full `OrderBook` from the row layouts (mode 1: root CF

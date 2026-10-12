@@ -218,6 +218,16 @@ pub trait TorusApi {
         market_id: Option<String>,
     ) -> RpcResult<Vec<RpcOpenOrder>>;
 
+    /// s114 (HL `orderStatus` by cloid): `trader`'s open order (resting or
+    /// a pending stop) whose client order id is `cloid` (`0x` + 1-32 hex
+    /// digits), or `null`.
+    #[method(name = "getOrderByCloid")]
+    async fn get_order_by_cloid(
+        &self,
+        trader: String,
+        cloid: String,
+    ) -> RpcResult<Option<RpcOrderByCloid>>;
+
     #[method(name = "getOpenInterest")]
     async fn get_open_interest(&self, market_id: String) -> RpcResult<RpcOpenInterest>;
 
@@ -2078,6 +2088,31 @@ impl TorusApiServer for RpcState {
         Ok(orders)
     }
 
+    async fn get_order_by_cloid(
+        &self,
+        trader: String,
+        cloid: String,
+    ) -> RpcResult<Option<RpcOrderByCloid>> {
+        let trader = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+        let cloid = torus_types::cloid_serde::from_hex(&cloid)
+            .map_err(|e| ErrorObjectOwned::from(RpcError::InvalidParams(e)))?;
+        let layout = book_layout(&self.state)?;
+        let found = book_reader::find_by_cloid(&self.state, &trader, cloid, layout)
+            .map_err(book_read_err)?;
+        Ok(found.map(|hit| match hit {
+            book_reader::CloidOrder::Resting(mid, order) => RpcOrderByCloid {
+                status: "open".to_string(),
+                order: order_to_rpc(&order, mid),
+                trigger_price: None,
+            },
+            book_reader::CloidOrder::Stop(mid, stop) => RpcOrderByCloid {
+                status: "triggerPending".to_string(),
+                order: order_to_rpc(&stop_as_order(&stop), mid),
+                trigger_price: Some(dec_fp(stop.trigger_price)),
+            },
+        }))
+    }
+
     async fn get_open_interest(&self, market_id: String) -> RpcResult<RpcOpenInterest> {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
 
@@ -2408,6 +2443,33 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
         votes_against: hex_u256(p.votes_against),
         start_block: hex_u64(p.start_block),
         end_block: hex_u64(p.end_block),
+    }
+}
+
+/// s114: a pending stop in the open-order shape: its order type, the price
+/// its triggered order carries (limit or cap), the whole quantity.
+fn stop_as_order(stop: &torus_core::order_book::StopOrder) -> torus_core::order_book::Order {
+    use torus_types::OrderType;
+    torus_core::order_book::Order {
+        id: stop.id,
+        trader: stop.trader,
+        side: stop.side,
+        price: stop.reservation_price(),
+        remaining_qty: stop.quantity,
+        original_qty: stop.quantity,
+        order_type: match stop.limit_price {
+            Some(limit) => OrderType::StopLimit {
+                trigger: stop.trigger_price,
+                limit,
+            },
+            None => OrderType::StopMarket {
+                trigger: stop.trigger_price,
+            },
+        },
+        time_in_force: stop.time_in_force,
+        timestamp: stop.timestamp,
+        reduce_only: stop.reduce_only,
+        client_order_id: stop.client_order_id,
     }
 }
 
