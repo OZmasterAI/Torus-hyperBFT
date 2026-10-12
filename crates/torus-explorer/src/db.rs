@@ -367,8 +367,8 @@ impl ExplorerDb {
     }
 
     /// R30: move `last_indexed_height` to `height` only when it is the next
-    /// contiguous height (0 on an empty cursor). Never backwards, never past
-    /// a gap.
+    /// contiguous height ([`crate::indexer::FIRST_HEIGHT`] on an empty
+    /// cursor). Never backwards, never past a gap.
     pub fn advance_cursor(&self, height: i64) -> Result<(), rusqlite::Error> {
         advance_cursor_on(&self.conn.lock().unwrap(), height)
     }
@@ -898,7 +898,7 @@ fn advance_cursor_on(conn: &Connection, height: i64) -> Result<(), rusqlite::Err
         )
         .optional()?
         .and_then(|v| v.parse().ok());
-    if cursor.map_or(height == 0, |c| height == c + 1) {
+    if cursor.map_or(height == crate::indexer::FIRST_HEIGHT, |c| height == c + 1) {
         set_indexer_state_on(conn, "last_indexed_height", &height.to_string())?;
     }
     Ok(())

@@ -8,6 +8,10 @@ use tracing::{info, warn};
 use crate::db::*;
 use crate::rpc_client::*;
 
+/// R30: a Torus node never stores block 0 (the genesis parent header is
+/// synthetic), so a fresh explorer starts at block 1.
+pub const FIRST_HEIGHT: i64 = 1;
+
 pub struct Indexer {
     pub rpc: NodeRpcClient,
     pub db: ExplorerDb,
@@ -39,11 +43,7 @@ impl Indexer {
         info!("Backfilling blocks {start}..={chain_height}");
         for h in start..=chain_height {
             if let Err(e) = self.index_block(h).await {
-                return Err(format!(
-                    "backfill stopped at block {h} (indexed through {}): {e}",
-                    h.saturating_sub(1)
-                )
-                .into());
+                return Err(format!("backfill stopped at block {h}: {e}").into());
             }
             if h % 100 == 0 || h == chain_height {
                 info!("Indexed up to block {h}/{chain_height}");
@@ -61,7 +61,10 @@ impl Indexer {
             .db
             .get_last_indexed_height()
             .map_err(|e| -> RpcError { e.to_string().into() })?;
-        Ok((last_indexed.map_or(0, |h| (h + 1) as u64), head))
+        Ok((
+            last_indexed.map_or(FIRST_HEIGHT as u64, |h| (h + 1) as u64),
+            head,
+        ))
     }
 
     /// Index a single block. Handles reorgs by checking hash.
