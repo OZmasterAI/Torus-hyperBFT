@@ -1523,16 +1523,21 @@ type StopReply = tokio::sync::oneshot::Sender<Result<(), String>>;
 /// starts: stopping never needs a new thread, whose failed spawn would drop
 /// the stop (and the replica in it) on the async caller with no bound.
 struct ShutdownWorker {
-    jobs: std::sync::mpsc::SyncSender<(StopJob, StopReply)>,
+    jobs: std::sync::mpsc::SyncSender<(StopJob, StopReply, Duration)>,
 }
 
 impl ShutdownWorker {
     fn spawn() -> std::io::Result<Self> {
-        let (jobs, rx) = std::sync::mpsc::sync_channel::<(StopJob, StopReply)>(1);
+        Self::spawn_with(|| {})
+    }
+
+    /// RED stub: `on_deadline` is not used yet.
+    fn spawn_with(_on_deadline: fn()) -> std::io::Result<Self> {
+        let (jobs, rx) = std::sync::mpsc::sync_channel::<(StopJob, StopReply, Duration)>(1);
         std::thread::Builder::new()
             .name("node-shutdown".into())
             .spawn(move || {
-                if let Ok((job, reply)) = rx.recv() {
+                if let Ok((job, reply, _limit)) = rx.recv() {
                     let _ = reply.send(job());
                 }
             })?;
@@ -1557,7 +1562,9 @@ async fn bounded_stop(
     interrupt: impl std::future::Future<Output = ()>,
 ) -> StopOutcome {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if let Err(std::sync::mpsc::SendError((job, _))) = worker.jobs.send((Box::new(stop), tx)) {
+    if let Err(std::sync::mpsc::SendError((job, _, _))) =
+        worker.jobs.send((Box::new(stop), tx, limit))
+    {
         // Neither run nor drop it here (that blocks this thread with no
         // bound); the process exits next.
         std::mem::forget(job);
@@ -1843,6 +1850,48 @@ mod tests {
         assert!(!done, "a stuck log reported as finished");
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         assert!(log_with_grace(|| {}, Duration::from_secs(5)));
+    }
+
+    /// Codex round 6: the deadline must not depend on the tokio timer (a
+    /// worker stuck in a blocked log stalls it). The shutdown thread arms an
+    /// independent watchdog: no runtime exists in this test.
+    #[test]
+    fn deadline_fires_without_the_async_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        fn fired() {
+            FIRED.store(true, SeqCst);
+        }
+        let w = ShutdownWorker::spawn_with(fired).unwrap();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hung: StopJob = Box::new(move || {
+            let _ = release_rx.recv();
+            Ok(())
+        });
+        w.jobs
+            .send((hung, reply, Duration::from_millis(100)))
+            .unwrap();
+        let t = std::time::Instant::now();
+        while !FIRED.load(SeqCst) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(FIRED.load(SeqCst), "deadline did not fire");
+        drop(release_tx);
+
+        // A stop that finishes in time does not fire it.
+        static LATE: AtomicBool = AtomicBool::new(false);
+        fn late() {
+            LATE.store(true, SeqCst);
+        }
+        let w = ShutdownWorker::spawn_with(late).unwrap();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        w.jobs
+            .send((Box::new(|| Ok(())), reply, Duration::from_millis(300)))
+            .unwrap();
+        assert_eq!(rx.blocking_recv().unwrap(), Ok(()));
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!LATE.load(SeqCst), "fired after a clean stop");
     }
 
     #[test]
