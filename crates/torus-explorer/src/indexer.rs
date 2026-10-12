@@ -1126,4 +1126,24 @@ mod tests {
         assert!(db.get_block(2).unwrap().is_none());
         handle.stop().unwrap();
     }
+    /// R30: an executed tx (listed by the eth block) whose receipt the node
+    /// does not return fails the block, instead of storing the tx as
+    /// "failed" with 0 gas forever.
+    #[tokio::test]
+    async fn missing_receipt_fails_the_block() {
+        let node = r30_with(
+            r30_good_node(1),
+            "eth_getTransactionReceipt",
+            json!("0x0a"),
+            Value::Null,
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.index_block(0).await.unwrap();
+        assert!(indexer.index_block(1).await.is_err());
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        assert!(db.get_transaction("0x0a").unwrap().is_none(), "no tx row");
+        handle.stop().unwrap();
+    }
 }
