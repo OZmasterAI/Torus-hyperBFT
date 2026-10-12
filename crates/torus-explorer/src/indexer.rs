@@ -1193,4 +1193,25 @@ mod tests {
         r30_assert_block1_complete(&db);
         handle.stop().unwrap();
     }
+
+    /// R30 review P2 (stop review): the old binary wrote candles before its
+    /// cursor, so a legacy partial block may already be in the candles.
+    /// Rebuilding it never replays its trades (no double count); candle
+    /// trades stay best effort, as on a trade fetch error.
+    #[tokio::test]
+    async fn legacy_rebuild_never_counts_a_trade_twice() {
+        let db = ExplorerDb::open_in_memory().unwrap();
+        // Old binary: block row and candle written, crashed before the cursor.
+        db.insert_block(&parse_block_row(&r30_block(1, vec![r30_tx("0x0a")]), 1))
+            .unwrap();
+        db.upsert_candle(1, 0x3c, 10_000_000_000, 200_000_000)
+            .unwrap();
+        let (handle, url) = mock_node(r30_good_node(2)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        r30_assert_block1_complete(&db);
+        let c = &db.get_candles(1, "1m", None, None, 10).unwrap()[0];
+        assert_eq!((c.trade_count, c.volume), (1, 200_000_000));
+        handle.stop().unwrap();
+    }
 }
