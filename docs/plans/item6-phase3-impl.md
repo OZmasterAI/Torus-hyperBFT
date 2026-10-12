@@ -310,6 +310,10 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   -5.5% (not met), RSS +1.55 GB peak (not met), exec ms per block flat, block-time p99 +12.7%. New timers: E waits
   23.9 ms per block on the previous layer merge (`checkpoint_settle_wait`, p99 95 ms), upkeep 1.0 ms; free-off-exec
   confirmed (`torus-ckpt-drop`). Also valid for `6d9b78af`. Restart cells: SIGTERM cells on the next step 2 head.
+- **SIGTERM restart cells** (campaign `ozarchy-p3term`, results doc section 52, plan-2 row 57): step 2 `7b006739` at 15 s vs
+  main `219f0c20`, 8 + 4 SIGTERM kills: replay 0 every time, no forced stop, state agrees; exit 7.0 s mean / 10.7 s max
+  (exec-queue drain; checkpoint flush share ~0.15 s); kill -> first commit max 59.8 s (gate 60 s met; the slow kill is
+  the gossipsub resubscribe stall, both arms).
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

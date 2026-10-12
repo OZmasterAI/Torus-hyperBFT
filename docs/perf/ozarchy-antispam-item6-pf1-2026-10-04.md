@@ -5748,6 +5748,117 @@ paired fixed-load microbench (section 44.2's `spawnbench.rs` already gives 0.7 m
 Analysis (`tools/ozarchy-p23b-tools/analyst/`): `a-cells.py` / `a-arms.py` (section 48), `p23-spawn.py` and `p23-exited.py`
 (section 44, copied, the empty-fork guard added), `forks.txt`. Outputs in `ozarchy-p23b-run/analyst/` on ozarchy.
 
+## 52. SIGTERM restart cells on step 2 `7b006739` (interval 15 s) and main `219f0c20` with the graceful SIGTERM shutdown (campaign ozarchy-p3term, 2026-10-12)
+
+**SIGTERM is now a clean stop on both binaries: 12 of 12 kills replay 0 blocks (durable marker = committed height), no
+forced stop, no shutdown timeout, every state hash and digest agrees.** SIGTERM -> process exit: step 2 7.0 s mean /
+10.7 s max (p95 10.2 s), control 3.7 / 8.8 s. Almost all of it is draining the exec queue (~0.3 s per queued block). The
+memtable flush + WAL sync is 0.55 s mean on step 2 vs 0.41 s on control, so the checkpoint adds ~0.15 s. **1 of 8 step 2
+kills ran past Docker's 10 s grace** (10.69 s, 29 blocks queued). All are far inside `TORUS_SHUTDOWN_TIMEOUT_SECS` (unset
+on every node = the 60 s default, checked). **Restart gate (<= 60 s) met, barely in one kill:** kill -> first chain commit
+is at most 59.8 s (step 2) and 21.9 s (control). The 59.8 s kill, and 56-75 s chain-wide stalls in all 3 cells (control
+too), come from the gossipsub resubscribe problem after an in-place restart (Open, restart path item 2), not from the
+shutdown path.
+
+Owner request (via 18c, s112): SIGTERM restart cells on the next step 2 head, now that main has the graceful SIGTERM
+shutdown (`fix/sigterm-shutdown`, merged as `219f0c20`: a pre-started shutdown thread drops the replica, so consensus
+stops and the exec queue drains, then flushes every CF and syncs the WAL, within `TORUS_SHUTDOWN_TIMEOUT_SECS`). Section
+46 found SIGTERM unhandled on `a44bdde6` (= SIGKILL, replay from the marker).
+
+### 52.1 Setup
+
+The section 46 method, in commit-tail mode. Nodes: step 2 `7b006739` (`ca388315`; carries `219f0c20` and the
+zero-replay SIGTERM test `7b006739`) at `TORUS_CHECKPOINT_INTERVAL_MS=15000` (arm s), and control main `219f0c20`
+(`987f4eb6`, knob unset, arm c), the section 51 builds. Bench `05d44313`, harness `218ad251`, with `crash-kill.sh`
+patched (`ozarchy-p3term-tools/matched-bench`): `KILL_SIG`, process-exit polling every 0.1 s (`exit_s`), and a stop still
+running after `KILL_WAIT=75` s would be SIGKILLed and flagged `exit_forced`. Restart: val1 starts in place right after it
+exits. `STATE_HASH_ACTIVATION=1` in every cell (the state hash poller compares every 100-block checkpoint on the 3 nodes).
+tw, Classic, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, shared NVMe, glibc. Cells 22:44-23:26 (driver
+`ozarchy-p3term-campaign.sh`): w0 (s, 60 s, no kill, excluded), t1-s-TERM and t1-c-TERM (540 s, SIGTERM val1 at bench
++60 / 180 / 300 / 420 s), t2-s-TERM (+65 / 187 / 309 / 431 s): 8 step 2 kills and 4 control kills. 62 CHECK OK, no CHECK
+FAIL, no HARD FINDING, the host quiet before every cell. The 3 kill cells are rc 2 REJECT for three reasons. The crash
+gate matches the INFO line `running state hash fail-stop ... on=false` (section 46's known false FAIL; 0 panics). Liveness
+FAIL and "drain not established" come from the chain stalls in 52.4. t2-s-TERM also has "dissemination failures" (body
+fetch exhausted after the stalled restart). Their matched/s (94-121k) is not a throughput measurement.
+
+### 52.2 Per kill (times in s; exit at 0.1 s resolution; phases from val1's log after the signal)
+
+| cell | kill | exec queue at kill (blocks) | SIGTERM -> queue drained | -> memtables flushed + WAL synced | -> `shutdown complete` (elapsed_ms) | -> process exit | marker A ; committed C (replay) | restart -> DB open | restart -> first chain commit | kill -> first chain commit | restart -> rejoin |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| t1-s | 1 | 28 | 8.42 | 8.90 | 8.90 (8,895) | 9.28 | 700 ; 700 (0) | 0.11 | 19.5 | 28.8 | 25.0 |
+| t1-s | 2 | 29 | 9.88 | 10.37 | 10.37 (10,365) | **10.69** | 977 ; 977 (0) | 0.08 | 11.7 | 22.4 | 10.9 |
+| t1-s | 3 | 14 | 4.31 | 4.85 | 4.85 (4,845) | 5.24 | 1144 ; 1144 (0) | 0.14 | 4.3 | 9.5 | 7.3 |
+| t1-s | 4 | 12 | 4.33 | 5.38 | 5.38 (5,374) | 5.90 | 1327 ; 1327 (0) | 0.11 | 3.4 | 9.3 | 6.2 |
+| t2-s | 1 | 26 | 7.73 | 8.47 | 8.47 (8,471) | 8.85 | 678 ; 678 (0) | 0.08 | 16.2 | 25.1 | 4.2 |
+| t2-s | 2 | 21 | 7.20 | 7.44 | 7.44 (7,441) | 7.76 | 968 ; 968 (0) | 0.46 | 1.2 | 9.0 | 4.5 |
+| t2-s | 3 | 10 | 3.69 | 4.31 | 4.31 (4,303) | 4.70 | 1147 ; 1147 (0) | 0.07 | **55.1** | **59.8** | 36.2 |
+| t2-s | 4 | 0 | 3.20 | 3.41 | 3.41 (3,410) | 3.65 | 1154 ; 1154 (0) | 0.13 | 26.9 | 30.5 | 33.4 |
+| t1-c | 1 | 33 | 8.02 | 8.43 | 8.43 (8,427) | 8.75 | 646 ; 646 (0) | 0.37 | 13.2 | 21.9 | 6.5 |
+| t1-c | 2 | 3 | 1.40 | 1.71 | 1.71 (1,708) | 2.02 | 901 ; 901 (0) | 0.45 | 16.8 | 18.8 | 5.2 |
+| t1-c | 3 | 2 | 1.21 | 1.61 | 1.61 (1,610) | 1.91 | 1088 ; 1088 (0) | 0.30 | 10.4 | 12.3 | 6.8 |
+| t1-c | 4 | 3 | 1.40 | 1.95 | 1.95 (1,947) | 2.24 | 1147 ; 1147 (0) | 0.07 | 8.2 | 10.4 | 3.9 |
+
+`shutdown signal received` is logged at +0.00-0.01 s in every kill. `flush worker thread shutting down` (step 2: the
+window closes into a final checkpoint) comes 0.5-1.1 s before `shutdown complete` (t1-s). The process exits 0.24-0.52 s after
+`shutdown complete`. On restart, val1 logs `coalesced state checkpoints ON ... applied=<C>`, i.e. it attaches at the
+committed height, ~0.6 s after the old process completed.
+
+### 52.3 Summary vs the gates (mean / max; p95 by linear interpolation)
+
+| | step 2 (8 kills) | control (4 kills) |
+|---|---|---|
+| SIGTERM -> exit | 7.01 / **10.69** (p95 10.2) | 3.73 / 8.75 (p95 7.8) |
+| of which queue drain | 6.09 / 9.88 | 3.01 / 8.02 |
+| of which flush + WAL sync (flushed - drained) | 0.55 / 1.04 | 0.41 / 0.55 |
+| exits over 10 s (Docker default grace) | **1** (t1-s k2) | 0 |
+| forced stops (alive after 75 s) / shutdown-timeout lines | 0 / 0 | 0 / 0 |
+| replay blocks after restart | **0** in all 8 | **0** in all 4 |
+| restart -> DB open | 0.15 / 0.46 | 0.30 / 0.45 |
+| restart -> first chain commit | 17.3 / 55.1 | 12.1 / 16.8 |
+| kill -> first chain commit (gate 60 s) | 24.3 / **59.8** | 15.9 / 21.9 |
+| restart -> rejoin | 16.0 / 36.2 | 5.6 / 6.8 |
+
+- **Exit time is the exec queue.** Drain time per queued block is ~0.25-0.3 s (the exec wall per block, section 51), so
+  exit ~ 0.3 s x queue + ~0.5 s. Step 2's longer mean comes from its deeper queues at the kill times (10-29 vs 2-33
+  blocks on control; control k1 with 33 blocks took 8.75 s). The checkpoint's own share is the flush step: +0.14 s mean,
+  1.04 s max. The 10 s Docker grace is at risk whenever the exec queue holds more than ~30 blocks: in commit-tail mode
+  under this load the queue sits at 40-60 blocks for most of a cell (section 51: backlog 41-56), so the kills here, at
+  10-33 blocks, were lighter than average. Under Docker, an operator should set `stop_grace_period` well above 10 s
+  (e.g. >= `TORUS_SHUTDOWN_TIMEOUT_SECS` = 60 s).
+- **Correctness:** A = C in all 12 kills (no gap line, the restart attaches at C, replay 0). A >= val1's durable
+  state-hash height before the kill (`marker_lo`) every time. Digests equal and AGREE in all 3 cells (heights 1582 / 1191 /
+  1421). Every state-hash checkpoint agrees on the 3 nodes (18 / 12 / 17 heights; t2-s has one height without val1,
+  which was down then, and no disagreement). No hard finding.
+- **Restart gate:** met. The one kill near 60 s (t2-s k3, 59.8 s) and the two slow t2-s rejoins (33-36 s) are the
+  gossipsub problem below; on the kills it spared, the first chain commit came 1-20 s after the restart.
+
+### 52.4 Chain stalls after the restart (not the shutdown path)
+
+Each kill cell had a chain-wide stall (all 3 nodes, no commits) of 56-75 s:
+
+| cell | stall (val0) | start relative to the nearest restart |
+|---|---|---|
+| t1-s-TERM | 74 s | 26 s after k4's restart |
+| t1-c-TERM (control) | 75 s | 32 s after k3's restart |
+| t2-s-TERM | 56 s, then 62 s | at k3 (-1.8 s), then 84 s after k3's restart |
+
+In 9 of 12 restarts (kills 2-4 of every cell, both arms) val1's log shows hundreds to thousands of
+`NoPeersSubscribedToTopic` lines (476-1,468) and the mesh watchdog's `validator connected but unsubscribed past grace —
+forcing reconnect` 70-80 s after the restart. After each first kill there are only 13-24 such lines and no watchdog
+reconnect. In t2-s k3, val1 also logged `body fetch exhausted 9 retries` and the catch-up gate (empty payloads). This is
+section 46's Open item 2 (in-place restart leaves gossipsub subscriptions un-exchanged): it is in the control too, and it
+does not come from the shutdown path or the checkpoint. It is what puts t2-s k3 at 59.8 s kill -> first commit and what
+fails the cells' liveness check.
+
+**Verdict:** the SIGTERM shutdown works as designed on step 2. Replay is 0, nothing is forced, and state agrees. Exit
+takes 0.3 s per queued exec block + ~0.5 s, of which the Phase 3 checkpoint adds ~0.15 s. With a deep commit-mode
+backlog this can pass Docker's 10 s default grace (1 of 8 here, 10.7 s), never the 60 s node bound. The restart gate
+holds (max 59.8 s), but the margin is eaten by the gossipsub resubscribe stall, which needs its own fix (stop / wait /
+start restart in the harness, or explicit gossipsub peers).
+
+Analysis (`tools/ozarchy-p3term-tools/`): `a-term.py` (section 46's `a-restart.py` + the shutdown phases and exit
+times), output `ozarchy-p3term-run/analyst/a-term.txt`; `matched-bench/crash-kill.sh` (patched).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -5758,6 +5869,11 @@ Analysis (`tools/ozarchy-p23b-tools/analyst/`): `a-cells.py` / `a-arms.py` (sect
   restart in `crash-kill.sh`, or explicit gossipsub peers among the validators. (3) The end-of-cell digest
   compares mark-based account fields more than 60 s after the oracle pause (false DISAGREE in 9 of 12 cells):
   digest accounts before books, or keep the feed alive until the account reads.
+  **SIGTERM measured (section 52, review log row 57):** (1) is fixed on main `219f0c20` (graceful SIGTERM). Step 2
+  `7b006739` and main replay 0 blocks in 12 of 12 SIGTERM kills; exit 7.0 s mean / 10.7 s max on step 2 (0.3 s per queued
+  exec block; 1 of 8 over Docker's 10 s grace; never near the 60 s bound), checkpoint share ~0.15 s. (2) still open: the
+  resubscribe stall hit 9 of 12 restarts (watchdog reconnect at 70-80 s) and stalled the chain 56-75 s once per cell
+  (control too); it set the one 59.8 s kill -> first commit.
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
   41; owner via 18c s107: Classic on testnet, no book mode in genesis now). At the standard shape
