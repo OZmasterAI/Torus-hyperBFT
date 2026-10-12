@@ -24,6 +24,10 @@ impl Indexer {
     }
 
     /// Backfill from last indexed height to current chain tip.
+    ///
+    /// R30: stops at the first block that fails (the error names it), so the
+    /// cursor never passes a gap; the next pass (the live indexer on its next
+    /// head, or a restart) resumes at that block.
     pub async fn backfill(&self) -> Result<(), RpcError> {
         let (start, chain_height) = self.pending_range().await?;
 
@@ -35,7 +39,11 @@ impl Indexer {
         info!("Backfilling blocks {start}..={chain_height}");
         for h in start..=chain_height {
             if let Err(e) = self.index_block(h).await {
-                warn!("Failed to index block {h}: {e}");
+                return Err(format!(
+                    "backfill stopped at block {h} (indexed through {}): {e}",
+                    h.saturating_sub(1)
+                )
+                .into());
             }
             if h % 100 == 0 || h == chain_height {
                 info!("Indexed up to block {h}/{chain_height}");
@@ -57,95 +65,103 @@ impl Indexer {
     }
 
     /// Index a single block. Handles reorgs by checking hash.
+    ///
+    /// R30: all-or-nothing. Every node read the block needs (block, body,
+    /// receipts) happens first and any failure (or a block / body the node
+    /// does not serve) is an error with nothing written; then the block and
+    /// all its rows are written in one transaction ([`ExplorerDb::write_block`]).
+    /// So a stored block is a complete block, and the same-hash skip below
+    /// never skips a half-indexed one. The cursor only moves to the next
+    /// contiguous height.
     pub async fn index_block(&self, height: u64) -> Result<(), RpcError> {
         let h = height as i64;
+        let db_err = |e: rusqlite::Error| -> RpcError { e.to_string().into() };
 
-        let block = match self.rpc.get_block(height).await? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+        let block = self
+            .rpc
+            .get_block(height)
+            .await?
+            .ok_or_else(|| -> RpcError { format!("node has no block {height}").into() })?;
 
         let new_hash = val_str(&block, "hash");
 
         // Reorg check
-        if let Ok(Some(existing)) = self.db.get_block(h) {
+        if let Some(existing) = self.db.get_block(h).map_err(db_err)? {
             if existing.hash == new_hash {
-                return Ok(());
+                return self.db.advance_cursor(h).map_err(db_err);
             }
             warn!(
                 "Reorg at height {height}: {} -> {}",
                 existing.hash, new_hash
             );
-            self.db
-                .delete_block_data(h)
-                .map_err(|e| -> RpcError { e.to_string().into() })?;
         }
-
-        // Parse and store block
-        let block_row = parse_block_row(&block, h);
-        self.db
-            .insert_block(&block_row)
-            .map_err(|e| -> RpcError { e.to_string().into() })?;
 
         // s84: the body lists every EVM tx, executed or skipped, with its
         // status; the eth block lists only the executed ones. Rows use the
         // body position as `tx_index` (first occurrence of a hash).
-        let body = self.rpc.get_block_body(height).await.ok().flatten();
+        let body = self
+            .rpc
+            .get_block_body(height)
+            .await?
+            .ok_or_else(|| -> RpcError { format!("node has no body for block {height}").into() })?;
         let mut body_position: HashMap<String, i32> = HashMap::new();
-        if let Some(txs) = body
-            .as_ref()
-            .and_then(|b| b.get("evmTransactions")?.as_array())
-        {
+        if let Some(txs) = body.get("evmTransactions").and_then(Value::as_array) {
             for (i, tx) in txs.iter().enumerate() {
                 body_position.entry(val_str(tx, "hash")).or_insert(i as i32);
             }
         }
 
-        // Index EVM transactions + receipts
+        let mut write = BlockWrite {
+            block: parse_block_row(&block, h),
+            transactions: Vec::new(),
+            logs: Vec::new(),
+            native_actions: Vec::new(),
+            candle_trades: Vec::new(),
+        };
+
+        // EVM transactions + receipts
         if let Some(txs) = block.get("transactions").and_then(|v| v.as_array()) {
             for (i, tx) in txs.iter().enumerate() {
                 let tx_hash = val_str(tx, "hash");
                 let receipt = self.rpc.get_receipt(&tx_hash).await?;
                 let tx_index = body_position.get(&tx_hash).copied().unwrap_or(i as i32);
-                let tx_row = parse_tx_row(tx, h, tx_index, receipt.as_ref());
-                self.db
-                    .insert_transaction(&tx_row)
-                    .map_err(|e| -> RpcError { e.to_string().into() })?;
-
-                if let Some(receipt) = &receipt {
-                    if let Some(logs) = receipt.get("logs").and_then(|v| v.as_array()) {
-                        for log in logs {
-                            let log_row = parse_log_row(log, h);
-                            self.db
-                                .insert_log(&log_row)
-                                .map_err(|e| -> RpcError { e.to_string().into() })?;
-                        }
-                    }
+                write
+                    .transactions
+                    .push(parse_tx_row(tx, h, tx_index, receipt.as_ref()));
+                if let Some(logs) = receipt
+                    .as_ref()
+                    .and_then(|r| r.get("logs"))
+                    .and_then(|v| v.as_array())
+                {
+                    write
+                        .logs
+                        .extend(logs.iter().map(|log| parse_log_row(log, h)));
                 }
             }
         }
 
-        // Index native actions
-        if let Some(body) = &body {
-            self.record_skipped_evm_txs(h, body)
-                .map_err(|e| -> RpcError { e.to_string().into() })?;
-            let statuses = native_action_status(body);
-            if let Some(actions) = body.get("nativeActions").and_then(|v| v.as_array()) {
-                for (i, action) in actions.iter().enumerate() {
-                    let mut action_row = parse_native_action_row(action, h, i as i32);
-                    action_row.status = statuses.as_ref().and_then(|s| s.get(i).cloned());
-                    self.db
-                        .insert_native_action(&action_row)
-                        .map_err(|e| -> RpcError { e.to_string().into() })?;
-                }
+        // Skipped EVM txs and native actions, from the body
+        write.transactions.extend(skipped_evm_tx_rows(h, &body));
+        let statuses = native_action_status(&body);
+        if let Some(actions) = body.get("nativeActions").and_then(|v| v.as_array()) {
+            for (i, action) in actions.iter().enumerate() {
+                let mut action_row = parse_native_action_row(action, h, i as i32);
+                action_row.status = statuses.as_ref().and_then(|s| s.get(i).cloned());
+                write.native_actions.push(action_row);
             }
         }
+
+        // Trades into OHLCV candles (Phase 7B). Written with the block, so a
+        // retried block never counts a trade twice. Best effort as before: a
+        // node without trade history for the block leaves no candle trades.
+        match self.rpc.get_block_trades(height).await {
+            Ok(trades) => write.candle_trades = candle_trades(height, &trades),
+            Err(e) => warn!("No trades for block {height}: {e}"),
+        }
+
+        self.db.write_block(&write).map_err(db_err)?;
+
         self.fill_unknown_status(h).await;
-
-        // Index trades into OHLCV candles (Phase 7B)
-        if let Ok(trades) = self.rpc.get_block_trades(height).await {
-            index_trades(&self.db, height, &trades);
-        }
 
         // Snapshot validators every 100 blocks
         if height.is_multiple_of(100) {
@@ -153,10 +169,6 @@ impl Indexer {
                 warn!("Failed to snapshot validators at height {height}: {e}");
             }
         }
-
-        self.db
-            .set_indexer_state("last_indexed_height", &height.to_string())
-            .map_err(|e| -> RpcError { e.to_string().into() })?;
 
         Ok(())
     }
@@ -190,18 +202,8 @@ impl Indexer {
     /// position. Nothing while the status is unknown (`null`). Never replaces
     /// an existing row of the same hash ([`ExplorerDb::insert_transaction`]).
     fn record_skipped_evm_txs(&self, height: i64, body: &Value) -> Result<(), rusqlite::Error> {
-        let (Some(txs), Some(status)) = (
-            body.get("evmTransactions").and_then(Value::as_array),
-            body.get("evmTransactionStatus").and_then(Value::as_array),
-        ) else {
-            return Ok(());
-        };
-        for (i, (tx, status)) in txs.iter().zip(status).enumerate() {
-            if status.as_str() == Some("skipped") {
-                let mut row = parse_tx_row(tx, height, i as i32, None);
-                row.status = TxStatus::Skipped;
-                self.db.insert_transaction(&row)?;
-            }
+        for row in skipped_evm_tx_rows(height, body) {
+            self.db.insert_transaction(&row)?;
         }
         Ok(())
     }
@@ -242,11 +244,14 @@ impl Indexer {
                 // block's eth view only once it executed it. Index up to the
                 // node's eth head instead of the announced height, so a block
                 // not executed yet is picked up on a later head.
+                // R30: stop at a failing block; the next head retries it, so
+                // no later block is indexed past the gap.
                 Ok(_) => match self.pending_range().await {
                     Ok((start, head)) => {
                         for height in start..=head {
                             if let Err(e) = self.index_block(height).await {
-                                warn!("Failed to index new block {height}: {e}");
+                                warn!("Failed to index block {height}, retrying on the next head: {e}");
+                                break;
                             }
                         }
                     }
@@ -265,6 +270,28 @@ impl Indexer {
 // ============================================================================
 // Parsing helpers
 // ============================================================================
+
+/// s84: a block's skipped EVM txs (listed by `torus_getBlockBody`, not by the
+/// eth block) as [`TxStatus::Skipped`] rows, `tx_index` = body position.
+/// None while the status is unknown (`null`).
+fn skipped_evm_tx_rows(height: i64, body: &Value) -> Vec<TxRow> {
+    let (Some(txs), Some(status)) = (
+        body.get("evmTransactions").and_then(Value::as_array),
+        body.get("evmTransactionStatus").and_then(Value::as_array),
+    ) else {
+        return Vec::new();
+    };
+    txs.iter()
+        .zip(status)
+        .enumerate()
+        .filter(|(_, (_, status))| status.as_str() == Some("skipped"))
+        .map(|(i, (tx, _))| {
+            let mut row = parse_tx_row(tx, height, i as i32, None);
+            row.status = TxStatus::Skipped;
+            row
+        })
+        .collect()
+}
 
 fn parse_block_row(block: &Value, height: i64) -> BlockRow {
     let tx_count = block
@@ -462,10 +489,11 @@ pub fn parse_native_action_row(
     }
 }
 
-/// Fold one block's `torus_getBlockTrades` rows into the OHLCV candles. A
-/// trade whose price or quantity does not parse (e.g. an old node still
-/// returning fixed-point hex) is skipped with a warning, never written as 0.
-fn index_trades(db: &ExplorerDb, height: u64, trades: &[Value]) {
+/// One block's `torus_getBlockTrades` rows as candle trades. A trade whose
+/// price or quantity does not parse (e.g. an old node still returning
+/// fixed-point hex) is skipped with a warning, never written as 0.
+fn candle_trades(height: u64, trades: &[Value]) -> Vec<CandleTrade> {
+    let mut out = Vec::with_capacity(trades.len());
     for t in trades {
         let market_id = val_hex_i64(t, "marketId");
         let timestamp = val_hex_i64(t, "timestamp");
@@ -478,10 +506,23 @@ fn index_trades(db: &ExplorerDb, height: u64, trades: &[Value]) {
             );
             continue;
         };
-        let (price_raw, qty_raw) = (price_raw as i64, qty_raw as i64);
-        if let Err(e) = db.upsert_candle(market_id, timestamp, price_raw, qty_raw) {
-            warn!("Failed to upsert candle at height {height}: {e}");
-        }
+        out.push(CandleTrade {
+            market_id,
+            timestamp,
+            price_raw: price_raw as i64,
+            qty_raw: qty_raw as i64,
+        });
+    }
+    out
+}
+
+/// Fold one block's `torus_getBlockTrades` rows into the OHLCV candles
+/// ([`candle_trades`] rules), outside a block write.
+#[cfg(test)]
+fn index_trades(db: &ExplorerDb, height: u64, trades: &[Value]) {
+    for c in candle_trades(height, trades) {
+        db.upsert_candle(c.market_id, c.timestamp, c.price_raw, c.qty_raw)
+            .unwrap();
     }
 }
 
