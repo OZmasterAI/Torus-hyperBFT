@@ -76,10 +76,14 @@ struct CkptState {
     /// L. `None` = empty.
     layer: Option<Arc<torus_state::CheckpointLayer>>,
     /// The merge of the previous parent into L, running off E since the end
-    /// of the previous block; joined before L is read or taken. Step 2: with
-    /// a mempool wired it also returns that block's ingress slice, which
-    /// replaces the full frozen set in `view_blocks`.
-    merging: Option<std::thread::JoinHandle<CkptMerged>>,
+    /// of the previous block; L is received before it is read or taken.
+    /// Step 2: with a mempool wired the thread then cuts that block's
+    /// ingress slice (`slicing`).
+    merging: Option<LayerMerge>,
+    /// Step 2: ingress slices still being cut (received by `settle`), each
+    /// to replace its block's full frozen set in `view_blocks`
+    /// (`install_slices`, before the next view publish).
+    slicing: Vec<std::sync::mpsc::Receiver<Arc<torus_state::FrozenPending>>>,
     /// C: `(height, layer)` handed to W, dropped once W's durable height
     /// reaches it.
     inflight: Option<(u64, Arc<torus_state::CheckpointLayer>)>,
@@ -95,35 +99,71 @@ struct CkptState {
     /// swapped for its ingress slice once merged into L (`settle`). Cleared
     /// when a checkpoint closes them (C then holds them) and at a barrier.
     view_blocks: Vec<Arc<torus_state::FrozenPending>>,
+    /// Step 2: E's handle on the view the mempool holds, so the mempool's
+    /// swap only drops a reference and E hands the old view to `dropper`.
+    published: Option<torus_state::ReadView>,
     /// p3s2g 47.1: frees released layers / sets / views off E (`None`:
     /// interval 0, or the thread could not start: E frees them itself).
     dropper: Option<Dropper>,
 }
 
 impl CkptState {
-    /// Join a running merge into L. `false`: the merge panicked — L is
-    /// lost, the caller must fail-stop.
+    /// Receive L from a running merge. Only L: the merge thread hands it
+    /// back before it cuts the ingress slice and lets go of the merged
+    /// block (p3s2g 47.1). `false`: the merge panicked — L is lost, the
+    /// caller must fail-stop.
     fn settle(&mut self) -> bool {
-        let Some(handle) = self.merging.take() else {
+        let Some(merge) = self.merging.take() else {
             return true;
         };
-        match handle.join() {
-            Ok((layer, slice)) => {
+        match merge.layer.recv() {
+            Ok(layer) => {
                 self.layer = Some(Arc::new(layer));
-                // Step 2: the merged block's ingress slice stands in for its
-                // full set in the view (gone already if a barrier cleared it).
-                if let Some(slice) = slice {
-                    if let Some(b) = self
-                        .view_blocks
-                        .iter_mut()
-                        .find(|b| b.height() == slice.height())
-                    {
-                        *b = slice;
-                    }
-                }
+                self.slicing.extend(merge.slice);
                 true
             }
             Err(_) => false,
+        }
+    }
+
+    /// Step 2: the merged blocks' ingress slices stand in for their full
+    /// sets in the view (gone already if a checkpoint or a barrier cleared
+    /// them). Called at the end of the block after `settle`: each slice was
+    /// cut while the block ran, so this rarely waits. A cut that panicked
+    /// leaves the full set, which answers the same.
+    fn install_slices(&mut self) {
+        for rx in std::mem::take(&mut self.slicing) {
+            let Ok(slice) = rx.recv() else {
+                continue;
+            };
+            match self
+                .view_blocks
+                .iter_mut()
+                .find(|b| b.height() == slice.height())
+            {
+                Some(b) => {
+                    let full = std::mem::replace(b, slice);
+                    self.discard(full);
+                }
+                None => self.discard(slice),
+            }
+        }
+    }
+
+    /// Drop the view's blocks (a checkpoint now holds them in C, or a
+    /// barrier made them durable) and any slice still being cut for them.
+    fn clear_view_blocks(&mut self) {
+        self.slicing.clear();
+        for b in std::mem::take(&mut self.view_blocks) {
+            self.discard(b);
+        }
+    }
+
+    /// Free `item` on the dropper (inline without one).
+    fn discard<T: Send + 'static>(&self, item: T) {
+        match &self.dropper {
+            Some(d) => d.drop_later(item),
+            None => drop(item),
         }
     }
 
@@ -151,14 +191,6 @@ struct PendingSlash {
     tombstone: bool,
 }
 
-/// Item 6 Phase 3: what the end-of-block merge thread returns: L with the
-/// previous parent folded in, and (step 2, mempool wired) that block's
-/// ingress slice for the published view.
-type CkptMerged = (
-    torus_state::CheckpointLayer,
-    Option<Arc<torus_state::FrozenPending>>,
-);
-
 /// Item 6 Phase 3: (L, C) under a pipelined overlay's parent.
 type CkptLayers = (
     Option<Arc<torus_state::CheckpointLayer>>,
@@ -178,6 +210,9 @@ struct LayerMerge {
 /// Item 6 Phase 3: merge `block` into `layer` on a `torus-ckpt-merge`
 /// thread; with `slice`, also cut the block's ingress slice
 /// (`before_slice` runs first: a test seam, a no-op in production).
+/// p3s2g 47.1: the thread hands L back first; the slice and the release
+/// of its handle on `block` follow, so E (waiting for L at the start of
+/// the next block) does not wait for them.
 fn spawn_layer_merge(
     mut layer: torus_state::CheckpointLayer,
     block: Arc<torus_state::FrozenPending>,
@@ -190,15 +225,15 @@ fn spawn_layer_merge(
         .name("torus-ckpt-merge".into())
         .spawn(move || {
             layer.merge(&block);
-            let cut = slice.then(|| {
+            if layer_tx.send(layer).is_err() {
+                return;
+            }
+            if slice {
                 before_slice();
-                Arc::new(block.slice(&torus_state::read_view::INGRESS_CFS))
-            });
-            drop(block);
-            let _ = layer_tx.send(layer);
-            if let Some(cut) = cut {
+                let cut = Arc::new(block.slice(&torus_state::read_view::INGRESS_CFS));
                 let _ = slice_tx.send(cut);
             }
+            drop(block);
         })?;
     Ok(LayerMerge {
         layer: layer_rx,
@@ -209,24 +244,47 @@ fn spawn_layer_merge(
 /// Item 6 Phase 3 (p3s2g 47.1): frees what the exec thread lets go of at
 /// a block boundary (a durable checkpoint layer, frozen sets, the previous
 /// ingress view) on its own thread, off the exec thread.
+/// Freeing a ~200 MB layer is ~10^6 small frees (hundreds of ms); a frozen
+/// set of a full block, tens of ms (18c probe).
 struct Dropper {
+    tx: std::sync::mpsc::SyncSender<Box<dyn Send>>,
+    /// Items freed on the thread (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Dropper {
+    /// Items queued at most; past it (or with the thread gone) the caller
+    /// frees the item itself.
+    const QUEUE: usize = 1024;
+
+    /// `None`: the thread could not start (E frees everything itself).
     fn spawn() -> Option<Self> {
-        Some(Self {
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        })
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(Self::QUEUE);
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let count = dropped.clone();
+        std::thread::Builder::new()
+            .name("torus-ckpt-drop".into())
+            .spawn(move || {
+                for item in rx {
+                    drop(item);
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .map_err(|e| tracing::warn!(%e, "item 6 Phase 3: dropper thread did not start — the exec thread frees released layers itself"))
+            .ok()?;
+        Some(Self { tx, dropped })
     }
 
-    /// Hand `item` over to be freed.
+    /// Hand `item` over to be freed (freed here if the queue is full).
     fn drop_later<T: Send + 'static>(&self, item: T) {
-        drop(item);
-        self.dropped.fetch_add(1, Ordering::Relaxed);
+        if let Err(back) = self.tx.try_send(Box::new(item)) {
+            drop(back);
+        }
     }
 
     /// Items freed so far.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -1982,6 +2040,7 @@ impl ExecutionContext {
         });
         *self.ckpt.lock().unwrap() = CkptState {
             base: applied,
+            dropper: self.checkpoint.and_then(|_| Dropper::spawn()),
             ..Default::default()
         };
         // Step 2: a fresh W starts at the durable marker; ingress reads the DB
@@ -2019,13 +2078,18 @@ impl ExecutionContext {
         }
         if self.checkpoint.is_some() {
             let mut st = self.ckpt.lock().unwrap();
-            st.inflight = None;
+            if let Some(c) = st.inflight.take() {
+                st.discard(c);
+            }
             st.since = None;
             st.base = st.base.max(worker.durable_height());
             // Step 2: everything handed off is durable; ingress reads the DB.
-            st.view_blocks.clear();
+            st.clear_view_blocks();
             if let Some(m) = &self.mempool {
                 m.publish_read_view(None);
+                if let Some(old) = st.published.take() {
+                    st.discard(old);
+                }
             }
         }
         // The serial path writes META (running hash) itself from here.
@@ -2152,7 +2216,9 @@ impl ExecutionContext {
             .as_ref()
             .is_some_and(|(h, _)| worker.durable_height() >= *h)
         {
-            st.inflight = None;
+            if let Some(c) = st.inflight.take() {
+                st.discard(c);
+            }
         }
         Ok((
             st.layer.clone(),
@@ -2199,6 +2265,9 @@ impl ExecutionContext {
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
         }
+        // Step 2: the slices cut while this block ran replace their blocks'
+        // full sets before the view is published.
+        st.install_slices();
         let since = *st.since.get_or_insert_with(std::time::Instant::now);
         let fold = prev.filter(|p| p.height() > st.base);
         let current = current.filter(|c| c.height() == height);
@@ -2228,9 +2297,11 @@ impl ExecutionContext {
             if !self.checkpoint_submit(&mut st, height, layer) {
                 return false;
             }
-            // C (in flight) now holds every block up to `height`.
-            st.view_blocks.clear();
-            self.publish_ingress_view(&st, height);
+            // C (in flight) now holds every block up to `height`. Step 1:
+            // `fold` is usually the last handle on block n-1.
+            st.discard((fold, current));
+            st.clear_view_blocks();
+            self.publish_ingress_view(&mut st, height);
             return true;
         }
         debug_assert!(
@@ -2241,21 +2312,12 @@ impl ExecutionContext {
         // frozen sets for it (they would pin every block until the checkpoint).
         if self.mempool.is_some() {
             st.view_blocks.extend(current);
-            self.publish_ingress_view(&st, height);
+            self.publish_ingress_view(&mut st, height);
         }
         if let Some(p) = fold {
-            let mut layer = st.take_layer();
-            let slice = self.mempool.is_some();
-            let spawned = std::thread::Builder::new()
-                .name("torus-ckpt-merge".into())
-                .spawn(move || {
-                    layer.merge(&p);
-                    let slice =
-                        slice.then(|| Arc::new(p.slice(&torus_state::read_view::INGRESS_CFS)));
-                    (layer, slice)
-                });
-            match spawned {
-                Ok(handle) => st.merging = Some(handle),
+            let layer = st.take_layer();
+            match spawn_layer_merge(layer, p, self.mempool.is_some(), || {}) {
+                Ok(merge) => st.merging = Some(merge),
                 Err(e) => {
                     // The layer moved into the failed closure: L is lost.
                     tracing::error!(%e, height, "FATAL: since-checkpoint merge thread spawn failed — fail-stop");
@@ -2269,23 +2331,25 @@ impl ExecutionContext {
 
     /// Item 6 Phase 3 step 2: publish the ingress read view after block
     /// `height`: the frozen sets above S (newest first; ingress slices below
-    /// the newest two, swapped in by `settle`), then C (the checkpoint in
-    /// flight, if any), then the DB. One swap in the mempool;
+    /// the newest two, swapped in by `install_slices`), then C (the
+    /// checkpoint in flight, if any), then the DB. One swap in the mempool;
     /// a layer leaves the view only once durable (C is dropped from `st`
     /// after W reports it durable, the blocks when C or a barrier covers
-    /// them), so a view never answers older than `height`.
-    fn publish_ingress_view(&self, st: &CkptState, height: u64) {
+    /// them), so a view never answers older than `height`. E keeps a handle
+    /// on the published view, so the mempool's swap frees nothing and the
+    /// previous view goes to the dropper (p3s2g 47.1).
+    fn publish_ingress_view(&self, st: &mut CkptState, height: u64) {
         let Some(m) = &self.mempool else {
             return;
         };
         let blocks = st.view_blocks.iter().rev().cloned().collect();
         let inflight = st.inflight.as_ref().map(|(_, c)| c.clone());
-        m.publish_read_view(Some(torus_state::ReadView::new(
-            self.state_db.clone(),
-            height,
-            blocks,
-            inflight,
-        )));
+        let view = torus_state::ReadView::new(self.state_db.clone(), height, blocks, inflight);
+        let old = st.published.replace(view.clone());
+        m.publish_read_view(Some(view));
+        if let Some(old) = old {
+            st.discard(old);
+        }
     }
 
     /// Item 6 Phase 3: close the open window at a barrier / shutdown: L +
@@ -2345,7 +2409,9 @@ impl ExecutionContext {
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
         }
-        st.inflight = Some((height, layer));
+        if let Some(old) = st.inflight.replace((height, layer)) {
+            st.discard(old);
+        }
         st.base = height;
         st.since = Some(std::time::Instant::now());
         true
@@ -24312,7 +24378,8 @@ mod crash_recovery_tests {
         use torus_state::cf::{CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS};
         let (_cfg, db) = make_test_config_and_db();
         let o = NativeStateOverlay::new(db.clone());
-        o.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book", b"blob").unwrap();
+        o.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book", b"blob")
+            .unwrap();
         o.put_cf_raw(CF_NATIVE_POSITIONS, b"pos", b"p").unwrap();
         let block = o.freeze(7);
         let (release, held) = std::sync::mpsc::channel::<()>();
@@ -24352,9 +24419,7 @@ mod crash_recovery_tests {
         struct Probe(std::sync::mpsc::Sender<Option<String>>);
         impl Drop for Probe {
             fn drop(&mut self) {
-                let _ = self
-                    .0
-                    .send(std::thread::current().name().map(String::from));
+                let _ = self.0.send(std::thread::current().name().map(String::from));
             }
         }
         let dropper = Dropper::spawn().expect("dropper thread");
@@ -24400,7 +24465,11 @@ mod crash_recovery_tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let n = dropped().expect("a dropper with an interval");
-        assert!(n >= want, "released off E: {n} over {} blocks", blocks.len());
+        assert!(
+            n >= want,
+            "released off E: {n} over {} blocks",
+            blocks.len()
+        );
         let off = pipeline_ctx(&db, true, None);
         assert!(off.ckpt.lock().unwrap().dropper.is_none(), "interval 0");
     }
