@@ -943,8 +943,9 @@ mod tests {
                          "topics": ["0x01"], "data": "0x"}]})
     }
 
-    /// A healthy node with blocks `0..=head`; block 1 has tx 0x0a (one log)
-    /// and one native action; block 1 has one trade.
+    /// A healthy node with blocks `1..=head`: like a Torus node it has no
+    /// block 0 (the genesis parent header is synthetic, never stored). Block 1
+    /// has tx 0x0a (one log), one native action and one trade.
     fn r30_good_node(head: u64) -> Vec<(&'static str, Value, Value)> {
         let mut r = vec![
             ("eth_blockNumber", Value::Null, json!(format!("0x{head:x}"))),
@@ -956,7 +957,7 @@ mod tests {
                         "price": "100.00000000", "quantity": "2.00000000"}]),
             ),
         ];
-        for h in 0..=head {
+        for h in 1..=head {
             let txs = if h == 1 { vec![r30_tx("0x0a")] } else { vec![] };
             let actions = if h == 1 {
                 vec![json!({"PlaceOrder": {"market_id": 1}})]
@@ -1016,13 +1017,12 @@ mod tests {
         let (handle, url) = mock_node(node).await;
         let db = ExplorerDb::open_in_memory().unwrap();
         let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
-        indexer.index_block(0).await.unwrap();
         assert!(
             indexer.index_block(1).await.is_err(),
             "body error is an error"
         );
         assert!(db.get_block(1).unwrap().is_none(), "no block row");
-        assert_eq!(db.get_last_indexed_height().unwrap(), Some(0));
+        assert_eq!(db.get_last_indexed_height().unwrap(), None);
         handle.stop().unwrap();
 
         // A missing body (null) for a block the node served is also an error.
@@ -1055,7 +1055,6 @@ mod tests {
         let (handle, url) = mock_node(node).await;
         let db = ExplorerDb::open_in_memory().unwrap();
         let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
-        indexer.index_block(0).await.unwrap();
         assert!(indexer.index_block(1).await.is_err());
         assert!(db.get_block(1).unwrap().is_none(), "no partial block row");
         handle.stop().unwrap();
@@ -1078,7 +1077,7 @@ mod tests {
         let node = r30_with(
             r30_good_node(3),
             "torus_getBlockBody",
-            json!(1),
+            json!(2),
             json!({"__error": "body unavailable"}),
         );
         let (handle, url) = mock_node(node).await;
@@ -1090,10 +1089,11 @@ mod tests {
         );
         assert_eq!(
             db.get_last_indexed_height().unwrap(),
-            Some(0),
+            Some(1),
             "cursor before the gap"
         );
-        for h in 1..=3 {
+        r30_assert_block1_complete(&db);
+        for h in 2..=3 {
             assert!(
                 db.get_block(h).unwrap().is_none(),
                 "nothing past the gap: {h}"
@@ -1106,7 +1106,7 @@ mod tests {
         indexer.backfill().await.unwrap();
         assert_eq!(db.get_last_indexed_height().unwrap(), Some(3));
         r30_assert_block1_complete(&db);
-        for h in 0..=3 {
+        for h in 1..=3 {
             assert!(db.get_block(h).unwrap().is_some(), "block {h}");
         }
         handle.stop().unwrap();
@@ -1117,17 +1117,17 @@ mod tests {
     #[tokio::test]
     async fn missing_block_below_head_is_an_error() {
         let node = r30_with(
-            r30_good_node(2),
+            r30_good_node(3),
             "eth_getBlockByNumber",
-            json!("0x1"),
+            json!("0x2"),
             Value::Null,
         );
         let (handle, url) = mock_node(node).await;
         let db = ExplorerDb::open_in_memory().unwrap();
         let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
         assert!(indexer.backfill().await.is_err());
-        assert_eq!(db.get_last_indexed_height().unwrap(), Some(0));
-        assert!(db.get_block(2).unwrap().is_none());
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(1));
+        assert!(db.get_block(3).unwrap().is_none());
         handle.stop().unwrap();
     }
     /// R30: an executed tx (listed by the eth block) whose receipt the node
@@ -1144,10 +1144,25 @@ mod tests {
         let (handle, url) = mock_node(node).await;
         let db = ExplorerDb::open_in_memory().unwrap();
         let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
-        indexer.index_block(0).await.unwrap();
         assert!(indexer.index_block(1).await.is_err());
         assert!(db.get_block(1).unwrap().is_none(), "no block row");
         assert!(db.get_transaction("0x0a").unwrap().is_none(), "no tx row");
+        handle.stop().unwrap();
+    }
+
+    /// R30 review: a Torus node never serves block 0 (the genesis parent
+    /// header is synthetic), so a fresh explorer starts at block 1 instead
+    /// of failing on block 0 forever.
+    #[tokio::test]
+    async fn fresh_explorer_starts_at_block_one() {
+        let (handle, url) = mock_node(r30_good_node(2)).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(2));
+        r30_assert_block1_complete(&db);
+        assert!(db.get_block(2).unwrap().is_some());
+        assert!(db.get_block(0).unwrap().is_none());
         handle.stop().unwrap();
     }
 }
