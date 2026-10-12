@@ -316,6 +316,10 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   1.64 -> 1.01 GB/min, matched/s +3.6%, but CPU at equal fills +4.0% (je commits +15-18% faster, so the closed-loop
   bench submits +13-14% more: offered load differs). CPU-s/1M -6.5% / -8.9% and writes
   -54% / -51% (Phase 3, glibc / jemalloc). Soak (600 s per arm) on glibc next.
+- **SIGTERM restart cells** (campaign `ozarchy-p3term`, results doc section 52, plan-2 row 57): step 2 `7b006739` at 15 s vs
+  main `219f0c20`, 8 + 4 SIGTERM kills: replay 0 every time, no forced stop, state agrees; exit 7.0 s mean / 10.7 s max
+  (exec-queue drain; checkpoint flush share ~0.15 s); kill -> first commit max 59.8 s (gate 60 s met; the slow kill is
+  the gossipsub resubscribe stall, both arms).
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
