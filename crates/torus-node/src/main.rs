@@ -1442,6 +1442,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     unsafe { libc::_exit(code) }
 }
 
+/// The watchdog's action at the shutdown deadline: as a timed-out stop in
+/// `run`, without waiting for anything (no runtime, bounded log).
+fn deadline_exit() {
+    log_with_grace(
+        || error!("shutdown did not finish within the limit; exiting without it (exit 1)"),
+        Duration::from_millis(500),
+    );
+    // SAFETY: `_exit` only ends the process; no Rust state is touched.
+    unsafe { libc::_exit(1) };
+}
+
 /// Run `log` (the last line before `_exit`) on its own thread and wait at
 /// most `grace`: a thread stuck writing to stdout holds its lock, so the
 /// log may never finish. Returns whether it finished. No explicit flush:
@@ -1528,17 +1539,36 @@ struct ShutdownWorker {
 
 impl ShutdownWorker {
     fn spawn() -> std::io::Result<Self> {
-        Self::spawn_with(|| {})
+        Self::spawn_with(deadline_exit)
     }
 
-    /// RED stub: `on_deadline` is not used yet.
-    fn spawn_with(_on_deadline: fn()) -> std::io::Result<Self> {
+    /// Spawn the shutdown thread and its watchdog. The watchdog is armed
+    /// with the job's limit and calls `on_deadline` if the job has not
+    /// finished by then: the bound holds even when the async runtime (and
+    /// so `tokio::time`) is stalled.
+    fn spawn_with(on_deadline: fn()) -> std::io::Result<Self> {
         let (jobs, rx) = std::sync::mpsc::sync_channel::<(StopJob, StopReply, Duration)>(1);
+        let (arm_tx, arm_rx) = std::sync::mpsc::sync_channel::<Duration>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        std::thread::Builder::new()
+            .name("node-shutdown-watchdog".into())
+            .spawn(move || {
+                if let Ok(limit) = arm_rx.recv() {
+                    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        done_rx.recv_timeout(limit)
+                    {
+                        on_deadline();
+                    }
+                }
+            })?;
         std::thread::Builder::new()
             .name("node-shutdown".into())
             .spawn(move || {
-                if let Ok((job, reply, _limit)) = rx.recv() {
-                    let _ = reply.send(job());
+                if let Ok((job, reply, limit)) = rx.recv() {
+                    let _ = arm_tx.send(limit);
+                    let res = job();
+                    let _ = done_tx.send(());
+                    let _ = reply.send(res);
                 }
             })?;
         Ok(Self { jobs })
@@ -1779,8 +1809,9 @@ mod tests {
         assert_eq!(second, Ok("SIGTERM"), "second SIGTERM lost");
     }
 
+    /// A worker whose deadline does nothing (the real one exits the process).
     fn worker() -> ShutdownWorker {
-        ShutdownWorker::spawn().unwrap()
+        ShutdownWorker::spawn_with(|| {}).unwrap()
     }
 
     /// Codex P2 (round 2): a stop the shutdown thread cannot take is never
