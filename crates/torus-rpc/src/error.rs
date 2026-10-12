@@ -79,3 +79,25 @@ impl From<RpcError> for ErrorObjectOwned {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Contract with torus-explorer (`indexer::is_data_pruned`): DataPruned
+    /// is code -32000 with "has been pruned" in the message. The explorer
+    /// indexes a block whose trades are pruned without them instead of
+    /// retrying forever; change both sides together.
+    #[test]
+    fn data_pruned_wire_shape_is_what_the_explorer_matches() {
+        let e = ErrorObjectOwned::from(RpcError::DataPruned { block: 5 });
+        assert_eq!(e.code(), -32000);
+        assert!(
+            e.message().contains("block 5 has been pruned"),
+            "{}",
+            e.message()
+        );
+        let h = ErrorObjectOwned::from(RpcError::HistoricalStateUnavailable { block: 5 });
+        assert!(!h.message().contains("has been pruned"), "{}", h.message());
+    }
+}

@@ -508,6 +508,12 @@ pub fn parse_native_action_row(
     }
 }
 
+/// R30: whether `e` is the node's DataPruned answer (permanent: the trade
+/// history below its retention floor is gone). RED stub.
+fn is_data_pruned(_e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    false
+}
+
 /// One block's `torus_getBlockTrades` rows as candle trades. A trade whose
 /// price or quantity does not parse (e.g. an old node still returning
 /// fixed-point hex) is skipped with a warning, never written as 0.
@@ -1054,6 +1060,74 @@ mod tests {
         r30_assert_block1_complete(&db);
         assert_eq!(db.get_last_indexed_height().unwrap(), Some(1));
         handle.stop().unwrap();
+    }
+
+    /// The error a torus node returns for `torus_getBlockTrades` below its
+    /// retained trade floor (`--trade-retention-blocks`): torus-rpc
+    /// `RpcError::DataPruned`, code -32000.
+    fn r30_pruned(height: u64) -> Value {
+        json!({"__error": format!(
+            "historical data unavailable: block {height} has been pruned. \
+             Connect to an archive node for historical queries."
+        )})
+    }
+
+    /// R30 follow-up (stop-review WARN): pruned trade history is permanent,
+    /// so a DataPruned trade fetch indexes the block without its candle
+    /// trades (warned once) instead of retrying forever: backfill over a
+    /// pruned range completes with every other row. Nothing is replayed
+    /// later (the block is stored complete).
+    #[tokio::test]
+    async fn pruned_trades_index_the_block_without_them_and_backfill_completes() {
+        let mut node = r30_good_node(3);
+        for h in 1..=2 {
+            node = r30_with(node, "torus_getBlockTrades", json!(h), r30_pruned(h));
+        }
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(3));
+        for h in 1..=3 {
+            assert!(db.get_block(h).unwrap().is_some(), "block {h}");
+        }
+        assert_eq!(db.get_block_transactions(1).unwrap().len(), 1, "tx row");
+        assert_eq!(db.get_transaction_logs("0x0a").unwrap().len(), 1, "log row");
+        assert_eq!(db.get_block_native_actions(1).unwrap().len(), 1);
+        assert!(
+            db.get_candles(1, "1m", None, None, 10).unwrap().is_empty(),
+            "pruned trades are not counted"
+        );
+        handle.stop().unwrap();
+
+        // Stored complete: a node that (impossibly) serves the trades again
+        // does not get them counted on a second pass.
+        let (handle, url) = mock_node(r30_good_node(3)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.index_block(1).await.unwrap();
+        assert!(db.get_candles(1, "1m", None, None, 10).unwrap().is_empty());
+        handle.stop().unwrap();
+    }
+
+    /// Only the DataPruned error is permanent; any other -32000 (e.g.
+    /// "historical state not available") or a transport error is transient.
+    #[test]
+    fn only_a_data_pruned_error_counts_as_pruned() {
+        let call = |code: i32, msg: &str| -> RpcError {
+            Box::new(jsonrpsee::core::ClientError::Call(
+                jsonrpsee::types::ErrorObjectOwned::owned(code, msg.to_string(), None::<()>),
+            ))
+        };
+        let pruned = r30_pruned(7)["__error"].as_str().unwrap().to_string();
+        assert!(is_data_pruned(&*call(-32000, &pruned)));
+        assert!(!is_data_pruned(&*call(-32603, &pruned)), "other code");
+        assert!(!is_data_pruned(&*call(-32000, "trades unavailable")));
+        assert!(!is_data_pruned(&*call(
+            -32000,
+            "historical state not available at block 7, only 'latest' is supported"
+        )));
+        let other: RpcError = "has been pruned".into();
+        assert!(!is_data_pruned(&*other), "not a JSON-RPC error");
     }
 
     /// R30: a body fetch error fails the block (no row at all, cursor not
