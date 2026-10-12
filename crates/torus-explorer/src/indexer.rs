@@ -90,6 +90,7 @@ impl Indexer {
 
         // Reorg check. Only a block `write_block` stored whole is skipped; a
         // same-hash row an older binary left partial is rebuilt below.
+        let mut legacy_rebuild = false;
         if let Some(existing) = self.db.get_block(h).map_err(db_err)? {
             if existing.hash != new_hash {
                 warn!(
@@ -100,6 +101,7 @@ impl Indexer {
                 return self.db.advance_cursor(h).map_err(db_err);
             } else {
                 warn!("Rebuilding block {height}: stored without all its rows");
+                legacy_rebuild = true;
             }
         }
 
@@ -165,9 +167,16 @@ impl Indexer {
         // Trades into OHLCV candles (Phase 7B). Written with the block, so a
         // retried block never counts a trade twice. Best effort as before: a
         // node without trade history for the block leaves no candle trades.
-        match self.rpc.get_block_trades(height).await {
-            Ok(trades) => write.candle_trades = candle_trades(height, &trades),
-            Err(e) => warn!("No trades for block {height}: {e}"),
+        // A legacy partial block's trades may already be in the candles (the
+        // old binary wrote them before its cursor); candles keep only totals,
+        // so they are never replayed: no trade is counted twice.
+        if legacy_rebuild {
+            warn!("Block {height}: candle trades not replayed on rebuild");
+        } else {
+            match self.rpc.get_block_trades(height).await {
+                Ok(trades) => write.candle_trades = candle_trades(height, &trades),
+                Err(e) => warn!("No trades for block {height}: {e}"),
+            }
         }
 
         self.db.write_block(&write).map_err(db_err)?;
@@ -1186,11 +1195,22 @@ mod tests {
         let (handle, url) = mock_node(r30_good_node(2)).await;
         let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
         indexer.backfill().await.unwrap();
-        r30_assert_block1_complete(&db);
+        let rows = |db: &ExplorerDb| {
+            (
+                db.get_block_transactions(1).unwrap().len(),
+                db.get_transaction_logs("0x0a").unwrap().len(),
+                db.get_block_native_actions(1).unwrap().len(),
+            )
+        };
+        assert_eq!(rows(&db), (1, 1, 1), "tx, log, action rebuilt");
+        assert!(
+            db.get_candles(1, "1m", None, None, 10).unwrap().is_empty(),
+            "a rebuilt legacy block's trades are not replayed"
+        );
         assert_eq!(db.get_last_indexed_height().unwrap(), Some(2));
-        // Now complete: a second pass skips it (no trade counted twice).
+        // Now complete: a second pass skips it.
         indexer.index_block(1).await.unwrap();
-        r30_assert_block1_complete(&db);
+        assert_eq!(rows(&db), (1, 1, 1));
         handle.stop().unwrap();
     }
 
