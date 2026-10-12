@@ -138,6 +138,12 @@ or drop Phase 3.
 
 ### Step 1: core behind the interval setting
 
+**Step 1 restart and crash cells (campaign `ozarchy-p3r1`, 2026-10-12):** results doc section 46, review log row 51.
+`a44bdde6`, interval 15 s vs unset, state hash on, 48 val1 kills (KILL / TERM / INT, 8 per arm x signal). Restart
+gate met: SIGKILL kill -> first commit 14.4 s mean / 23.2 s max (unset: 14.3 / 16.9); rewind from the last
+checkpoint 7-162 blocks. Crash correctness: no finding (replay from marker + 1, complete, every checkpoint hash
+equal on 3 validators). SIGTERM is a hard kill on this binary (main.rs waits only on SIGINT): owner to decide.
+
 Each task: test first (fails before), then code, then verify with
 `F="--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar"`.
 

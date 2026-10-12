@@ -216,6 +216,24 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p23-300m-u3` | OK | 2026-10-11 18:27 | p3s0r-9b7e29b2 @ 9b7e29b2 | 169567f2 | 300 | 120 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; node defaults | 200,742.1 | 199,311.8 | 213,514.0 | 265,359.0 | 5.5 | 136.9 | 134.80 | 3.82 | AGREE | PASS | ACCEPT |
 | `ozarchy-p23-300m-u4` | OK | 2026-10-11 18:40 | p3s0r-9b7e29b2 @ 9b7e29b2 | 169567f2 | 300 | 120 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; node defaults | 199,590.9 | 199,266.7 | 211,502.2 | 264,891.6 | 6.1 | 126.6 | 123.83 | 3.84 | AGREE | PASS | ACCEPT |
 | `ozarchy-p23-300m-w0` | OK | 2026-10-11 17:50 | p3s0r-9b7e29b2 @ 9b7e29b2 | 169567f2 | 300 | 60 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; node defaults; warm-up | 197,758.9 | 197,758.9 | 207,029.7 | 261,703.8 | 5.5 | 108.1 | 105.65 | 3.81 | AGREE | PASS | ACCEPT |
+## p3r1: Phase 3 step 1 restart / crash cells, one node `7d1a0874` (`a44bdde6`), tw, Classic, state hash on; arms o (`TORUS_CHECKPOINT_INTERVAL_MS` unset) and s (15000); 4 val1 kills per 540 s cell with SIGKILL / SIGTERM / SIGINT; rc 2 / REJECT is the crash gate matching the INFO fail-stop config line; DISAGREE = stale oracle marks in the account digest (section 46.4); warm-up w0 excluded
+
+| cell dir | status | generated | node md5 | dur s | arm / signal | matched/s avg | placed/s | native blk/s | blk/s worst60 | agreement (summarize) | block hashes equal | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p3r1-300m-w0` | OK | 2026-10-12 00:06 | 7d1a0874 | 60 | o / warm-up | 196,792.1 | 260,427.7 | 4.89 | 4.98 | AGREE | True | ACCEPT |
+| `ozarchy-p3r1-300m-x1-o-INT` | INVALID | 2026-10-12 01:16 | 7d1a0874 | 540 | o / INT | 131,396.6 | 172,745.7 | 2.45 | 0.48 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-x1-o-KILL` | INVALID | 2026-10-12 00:20 | 7d1a0874 | 540 | o / KILL | 176,989.6 | 234,834.4 | 6.99 | 4.72 | AGREE | True | REJECT |
+| `ozarchy-p3r1-300m-x1-o-TERM` | INVALID | 2026-10-12 01:03 | 7d1a0874 | 540 | o / TERM | 162,204.1 | 214,984.3 | 6.20 | 1.20 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-x1-s-INT` | INVALID | 2026-10-12 01:29 | 7d1a0874 | 540 | s / INT | 127,814.5 | 168,766.9 | 3.45 | 0.87 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-x1-s-KILL` | INVALID | 2026-10-12 00:33 | 7d1a0874 | 540 | s / KILL | 154,243.0 | 204,714.9 | 10.87 | 6.70 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-x1-s-TERM` | INVALID | 2026-10-12 00:51 | 7d1a0874 | 540 | s / TERM | 57,126.8 | 76,066.1 | 3.55 | 0.00 | AGREE | True | REJECT |
+| `ozarchy-p3r1-300m-y1-o-INT` | INVALID | 2026-10-12 01:55 | 7d1a0874 | 540 | o / INT | 141,317.7 | 186,048.5 | 2.90 | 1.08 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-y1-o-KILL` | INVALID | 2026-10-12 02:48 | 7d1a0874 | 540 | o / KILL | 184,003.5 | 243,807.7 | 7.02 | 4.70 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-y1-o-TERM` | INVALID | 2026-10-12 02:08 | 7d1a0874 | 540 | o / TERM | 175,821.4 | 233,199.4 | 6.96 | 4.55 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-y1-s-INT` | INVALID | 2026-10-12 01:43 | 7d1a0874 | 540 | s / INT | 119,638.5 | 157,847.2 | 4.18 | 1.02 | AGREE | True | REJECT |
+| `ozarchy-p3r1-300m-y1-s-KILL` | INVALID | 2026-10-12 02:35 | 7d1a0874 | 540 | s / KILL | 111,357.8 | 147,784.7 | 5.86 | 0.53 | DISAGREE | True | REJECT |
+| `ozarchy-p3r1-300m-y1-s-TERM` | INVALID | 2026-10-12 02:22 | 7d1a0874 | 540 | s / TERM | 118,454.7 | 157,448.5 | 7.18 | 0.90 | AGREE | True | REJECT |
+
 ## action-results: Per-action execution results (`9195c32`) at 300 markets: warm + r1
 
 | cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
