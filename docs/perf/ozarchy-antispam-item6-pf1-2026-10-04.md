@@ -5583,6 +5583,102 @@ the exec backlog from the node logs), `a-arms.py` (Welch 95% CI, ANCOVA at equal
 by mapping class), `a-heap.py` + `a-heapcat.py` (heap profile). Outputs in
 `ozarchy-p3rss-run/analyst/` on ozarchy (`cells.json`, `arms.txt`, `heapcat.txt`, `smaps.txt`).
 
+## 49. Phase 3 gate rerun: step 1 `b1605417` and step 2 `51a67f57` vs main `8efcb07a`, commit-tail mode, with the checkpoint timers (campaign ozarchy-p3g2, 2026-10-12)
+
+**Step 2 `51a67f57` vs a clean main control: node CPU-s/1M -7.0% (-6.8% at equal fills), device writes -51%,
+matched/s +2.9% [-3.1, +8.9] (tie), native blocks/s -5.5% [-10.4, -0.7] (just resolved), RSS +1.55 GB
+peak / +1.13 GB mean (gate ~270 MB: not met, unchanged from sections 47-48).** The untimed exec residual of
+section 47 is now mostly timed: `checkpoint_settle_wait` (the exec thread joining the previous block's
+merge into `L`) is 23.9 ms per native block and `checkpoint_upkeep` is 1.0 ms. What is left over the control
+is +3.5 ms (residual 16.9 vs 13.4 ms). The layer frees now run on the `torus-ckpt-drop` thread, 5.0-5.5 CPU-s
+per cell on val0. The cancel-all expiry is down to 0-27 per node per cell. All 13 measured cells ACCEPT,
+except the heap-profiled h1-g2 (mark-only DISAGREE, the known slow-digest artifact).
+
+Owner request (18c, s112): rerun the gate on the new heads, step 1 `b1605417` (`feat/item6-phase3-step1`, main
+`8efcb07a` merged in) and step 2 `51a67f57` (`feat/item6-phase3-step2`: step 1 + the exec-thread checkpoint
+timers `7fe4d420`, the layer merge handing `L` back first with releases freed off the exec thread `97cf1d07`,
+the dropper queue cap `7938dbec`, an ignored cancel-all expiry repro and docs), against main `8efcb07a`.
+merge-base(each, origin/main) = `8efcb07a`, so **the control is clean this time** (section 47's 16-commit
+confound is gone). Step 2 head `6d9b78af` adds only the `torus_exec_checkpoint_drop_inline` counter and docs, so
+these results hold for it.
+
+Setup: the section 47 / 48 shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, 120 s
+cells, commit tail, shared NVMe). Nodes (fresh target dirs, frame pointers + line tables + mold): main `8efcb07a`
+(`09827336`, the section 48 build), step 1 `b1605417` (`c2cfb1c9`), step 2 `51a67f57` (`448bd3ac`). One bench
+`05d44313` (section 48). **Harness `bench/summarize-ckpt-timers` `218ad251`** (now merged as `b648bbf2`): `summarize.py` adds
+`checkpoint_settle_wait` and `checkpoint_upkeep` (sub `checkpoint_wait`) as exec-thread phases, subtracted from
+`residual_untimed`, with per-observation p50 / p99 from their buckets; `run-cell.sh` samples them (test
+`main_checkpoint_timers`, RED on main; harness pytest 171 passed). Step 1 `b1605417` does not have the new timers (its
+Phase 3 time stays in `residual_untimed`). Cells 17:52-19:17 (driver `ozarchy-p3g2-campaign.sh`): w0 (main, 60 s,
+excluded), r1 gm g1 g2, r2 g1 g2 gm, r3 g2 gm g1, r4 g2 g1 gm (n = 4 per arm), then h1-g2: step 2 with the section 48
+jemalloc heap profiler, for the free-off-exec-thread check. 182 CHECK OK, no CHECK FAIL, no deaths, the host quiet before
+every cell. All 12 throughput cells rc 0, ACCEPT, AGREE. h1-g2 rc 2, REJECT on agreement: val2 differs from val0 = val1 in
+the 5 mark fields of all 50 accounts only (`accountValue == cash` on 22). val2's digest took 47.7 s vs 19-20 s on the others,
+which is the slow-digest mark artifact of sections 46-47. No cash, position, book or OI field differs: no hard finding.
+
+### 49.1 Gate table (n = 4 per arm, mean; 95% CI vs main)
+
+| | gm main `8efcb07a` | g1 step 1 `b1605417` | g2 step 2 `51a67f57` | g1 vs gm | g2 vs gm |
+|---|---|---|---|---|---|
+| matched/s | 195,884 | 201,862 | 201,533 | +3.1% [-2.3, +8.4] | **+2.9% [-3.1, +8.9]** |
+| native blocks/s | 3.56 | 3.31 | 3.37 | -7.2% [-12.4, -2.1] | **-5.5% [-10.4, -0.7]** |
+| node CPU-s/1M (whole run) | 25.33 | 23.13 | 23.56 | -8.7% [-10.7, -6.7] | **-7.0% [-9.1, -4.9]** |
+| node CPU at equal fills | | | | -8.6% [-9.7, -7.5] | **-6.8% [-8.1, -5.5]** |
+| device writes MB/s per validator | 137.9 | 69.4 | 67.8 | -50% | **-51% [-53, -48]** |
+| RSS peak / mean GB (cpu.csv) | 4.40 / 3.67 | 5.16 / 4.23 | 5.95 / 4.80 | +0.76 [+0.64, +0.88] / +0.55 | **+1.55 [+1.40, +1.71] / +1.13 [+1.03, +1.23]** |
+| RSS growth over the bench window GB/min | 1.15 | 1.44 | 1.78 | +0.29 | +0.63 [+0.49, +0.77] |
+| exec per native block (logs) mean / p50 / p99 ms | 342 / 355 / 654 | 353 / 363 / 679 | 348 / 360 / 662 | p50 +2.1% [-4.0, +8.2] | p50 +1.3% [-5.1, +7.8], p99 +1.1% [-7.9, +10.1] |
+| block time (commit interval, logs) p50 / p99 ms | 147 / 1,074 | 141 / 1,239 | 164 / 1,211 | p99 +15.3% [+11.2, +19.3] | p99 +12.7% [+9.5, +15.9] |
+| exec block_ms (summary) | 251.6 | 270.4 | 265.9 | +7.5% | +5.7% [+2.3, +9.1] |
+| exec busy | 0.949 | 0.967 | 0.963 | | |
+| exec backlog committed - executed (blocks) / lag s | 55.0 / 14.3 | 57.2 / 15.5 | 56.7 / 15.1 | | |
+| actions / fills per native block | 278 / 53,490 | 296 / 56,504 | 291 / 55,831 | | |
+| engine ms per 1k fills | 3.84 | 3.45 | 3.52 | -10.0% | -8.2% |
+
+Gate reading (section 47's criteria): CPU-s/1M down **met**; device writes **met**; matched/s up **not shown** (a tie,
++2.9%, CI crosses 0); native blocks/s no regression **not met** at the 95% level (-5.5%, the upper end -0.7%; the blocks
+are 4.4% larger at the same exec ceiling, so fills/s are flat); RAM (~270 MB) **not met** (+1.55 GB peak, +1.13 GB mean;
+the split is in section 48). Restart is not in scope here (SIGTERM cells on the next step 2 head follow).
+
+### 49.2 Exec-thread checkpoint time: the residual of section 47, now timed
+
+| ms per native block (summary phases, mean of 3 nodes) | gm | g1 | g2 | section 48 ctl / s2 (`2725e321` / `2296be67`) |
+|---|---|---|---|---|
+| `checkpoint_settle_wait` (join of the previous block's merge into `L`) | 0 | (untimed) | **23.9** | - / (untimed) |
+| `checkpoint_upkeep` (trigger, merges, hand-off, view publish) | 0 | (untimed) | **1.0** (of which `checkpoint_wait` 0.1) | - / (untimed) |
+| `residual_untimed` | 13.4 | 48.6 | **16.9** | 14.0 / 55.4 |
+| exec `block_ms` | 251.6 | 270.4 | 265.9 | 255.8 / 277.7 |
+
+Per observation: `checkpoint_settle_wait` p50 1.3 ms, p99 95 ms (mean 14.7 ms over ~860 observations per node per cell:
+most blocks wait little, some wait for a long merge); `checkpoint_upkeep` p50 0.1 ms, p99 6.4 ms. Checkpoints: 14-16 per
+node per cell. **The ~36-41 ms untimed residual of sections 47-48 is now 25 ms timed (almost all the merge join) +
+3.5 ms still untimed.** Phase 3's exec time per block over its control went from ~22 ms (section 48: s2 277.7 vs ctl 255.8)
+to ~14 ms (g2 265.9 vs gm 251.6), across campaigns, so this is only an indication. The difference fits the frees that
+moved off the exec thread. **Free-off-exec-thread check:** in every g2 cell, val0's `torus-ckpt-drop` thread used
+5.0-5.5 CPU-s per 120 s cell (task sampler). That is work the exec thread no longer does (~12 ms per native block). The
+heap-profiled h1-g2 cell shows the same picture under jemalloc: `torus-ckpt-drop` active, residual 17.9 ms,
+`checkpoint_settle_wait` 16.4 ms per block, exec mean 299 ms per block at 4.1 blk/s (smaller blocks: 48,747 fills). Its
+live heap at the bench end: view slices 214 MB, `L` 280 MB, mempool 774 MB, total 2.86 GB per node (one cell; section
+48's hs2 on `2296be67`: 260 / 406 / 743 / 3.17 GB).
+
+### 49.3 Cancel-all mempool expiry and other checks
+
+Nonce-window evictions per node per cell (`mempool_nonce_expired_evictions`): gm 0 in all 4 cells; g1 0 / 0 / 0 /
+(0, 0, 20); g2 0 / 0 / (4, 4, 27) / 0; h1-g2 0. Section 47 had 433-1,351 per cell in 3 of 4 step 2 cells, and section 48
+up to 440 (s2) and 391 (s1). The expiry is **rare in this run but not fixed in these binaries**: `51a67f57` carries
+only the ignored repro test `bd0ecc6e` (owner decision pending). Executed cancel-alls equal those sent in every cell
+(within 0-8 per cell still in flight at the end). No `layer_shared`, no open-limit rejects. RSS is all anonymous heap
+(no swap), as in section 48.
+
+**Verdict:** with a clean control, step 2 `51a67f57` keeps the CPU (-7.0%) and disk (-51%) wins and ties on matched/s.
+Native blocks/s is -5.5% (larger blocks at the exec ceiling) and RAM is +1.55 GB peak: the gate's RAM and blocks/s
+lines are not met. The untimed residual is resolved: 25 ms per block is the merge join (timed now) and +3.5 ms is left.
+Next on the owner's list: allocator A/B (glibc vs jemalloc, section 48's retention), SIGTERM restart cells and a soak
+on the next step 2 head.
+
+Analysis (`tools/ozarchy-p3g2-tools/analyst/`): the section 48 scripts (`a-cells.py`, `a-arms.py`, `a-heap.py`,
+`a-heapcat.py`); outputs in `ozarchy-p3g2-run/analyst/` on ozarchy.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -5633,9 +5729,12 @@ by mapping class), `a-heap.py` + `a-heapcat.py` (heap profile). Outputs in
   live heap +0.25 / +0.32 GB: `L` 316 MB for a 147 MB logical layer, minus the control's 157 MB of frozen pending sets,
   and the view's slices 260 MB; about half of each delta appears only under glibc, i.e. allocator retention). The
   commit-mode backlog is another +0.83 GB (mempool and queued decoded blocks) and is in the control too. RSS still grows
-  at the end of the 120 s cells. The RAM gate is still not met; (b) step 2 only: 0.8-2.6% of cancel-alls per cell expire from the
-  mempool after the 60 s nonce window and never execute (control 0); (c) the ~36 ms per block untimed exec residual (Phase 3
-  overhead, also in step 1); (d) the control carries 16 non-Phase-3 commits (rebase step 2 on main to remove the confound).
+  at the end of the 120 s cells. The RAM gate is still not met; (b) cancel-all nonce-window expiry: 0-27 per node per cell in the gate rerun
+  (section 49; step 1 too, control 0), up to 1,351 in section 47; not fixed in `51a67f57` (repro only); (c) **resolved
+  (section 49, row 54):** the untimed residual is now 23.9 ms `checkpoint_settle_wait` (the merge join) + 1.0 ms upkeep,
+  +3.5 ms left untimed; frees run on `torus-ckpt-drop`; (d) **resolved:** the rerun's control is main `8efcb07a` = the
+  merge-base. **Gate rerun (section 49, `51a67f57` vs `8efcb07a`):** CPU-s/1M -7.0% (-6.8% at equal fills), writes -51%,
+  matched/s +2.9% [-3.1, +8.9] (tie), native blocks/s -5.5% [-10.4, -0.7], RSS +1.55 GB peak: RAM and blocks/s not met.
   The DISAGREE verdicts are the known slow-digest mark artifact (control too), not a divergence.
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
   trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
