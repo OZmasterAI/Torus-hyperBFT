@@ -130,6 +130,24 @@ pub struct BlockExecResult {
     /// native credit is durable iff the EVM burn that paid for it is. Dropping
     /// the result (execution error, crash before commit) drops them too.
     pub native_writes: NativeStateOverlay,
+    /// s114 (CoreWriter follow-up 1): which tx queued each writer-precompile
+    /// queue row in `native_writes` — one entry per row a SUCCESSFUL tx
+    /// queued, in queue (seq) order. Node-local (the `CF_CORE_WRITER_TX`
+    /// index); the queue rows themselves do not carry it.
+    pub core_writer_origins: Vec<CoreWriterOrigin>,
+}
+
+/// s114: the tx that queued one CoreWriter / lockbox queue row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreWriterOrigin {
+    /// The row's target (drain) block: this block + 1.
+    pub target_block: u64,
+    /// The row's sequence in the target block's queue.
+    pub seq: u64,
+    /// Index into [`BlockExecResult::receipts`] of the tx that queued it.
+    pub receipt: usize,
+    /// The row's position among the rows that tx queued (call order).
+    pub call_index: u32,
 }
 
 /// EVM executor configured for the Torus chain.
@@ -394,6 +412,7 @@ impl EvmExecutor {
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,
+            core_writer_origins: Vec::new(),
         })
     }
 
@@ -535,6 +554,7 @@ impl EvmExecutor {
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,
+            core_writer_origins: Vec::new(),
         })
     }
 }

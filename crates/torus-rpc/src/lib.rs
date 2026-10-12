@@ -3594,6 +3594,24 @@ mod tests {
             ),
         ];
         store_applied_height(&state, 4);
+        // s114: rows 0 and 2 were queued by EVM txs this node linked (row 0
+        // by tx 0xA1.., row 2 as the second call of tx 0xA2..); rows 1
+        // (undecodable) and 3 have no link.
+        for height in [1u64, 3] {
+            for (seq, byte, call_index) in [(0u64, 0xA1u8, 0u32), (2, 0xA2, 1)] {
+                state
+                    .put_cf_raw(
+                        torus_state::cf::CF_CORE_WRITER_TX,
+                        &torus_state::corewriter_tx::key(height, seq),
+                        &torus_state::corewriter_tx::CoreWriterTxLink {
+                            tx_hash: B256::repeat_byte(byte),
+                            call_index,
+                        }
+                        .encode(),
+                    )
+                    .unwrap();
+            }
+        }
         for (height, native_skipped) in [(1u64, vec![false]), (3, vec![])] {
             state
                 .put_cf_raw(
@@ -3634,7 +3652,9 @@ mod tests {
                 "trader": format!("{:#x}", Address::repeat_byte(7)),
                 "queuedBlock": "0x2",
                 "status": "executed",
-                "message": ""
+                "message": "",
+                "txHash": format!("{:#x}", B256::repeat_byte(0xA1)),
+                "callIndex": 0
             },
             {
                 "seq": 1,
@@ -3643,7 +3663,9 @@ mod tests {
                 "queuedBlock": null,
                 "status": "failed",
                 "reason": "other",
-                "message": "undecodable queued action (block 3, seq 1): x"
+                "message": "undecodable queued action (block 3, seq 1): x",
+                "txHash": null,
+                "callIndex": null
             },
             {
                 "seq": 2,
@@ -3653,7 +3675,9 @@ mod tests {
                 "status": "rejected",
                 "reason": "ioc_cancel",
                 "rejectStatus": "iocCancelRejected",
-                "message": "order rejected: IOC order could not immediately match against any resting order"
+                "message": "order rejected: IOC order could not immediately match against any resting order",
+                "txHash": format!("{:#x}", B256::repeat_byte(0xA2)),
+                "callIndex": 1
             },
             {
                 "seq": 3,
@@ -3662,7 +3686,9 @@ mod tests {
                 "queuedBlock": "0x2",
                 "status": "failed",
                 "reason": "margin",
-                "message": "short"
+                "message": "short",
+                "txHash": null,
+                "callIndex": null
             }
         ]);
         let one = get(1).await;

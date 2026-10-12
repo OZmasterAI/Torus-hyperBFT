@@ -17973,6 +17973,111 @@ mod crash_recovery_tests {
         assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)));
     }
 
+    /// s114 (CoreWriter follow-up 1): block 1's EVM txs queue CoreWriter rows
+    /// for block 2 (one call, a reverted call, two calls in one tx); the
+    /// committed-block path writes one `CF_CORE_WRITER_TX` row per queued
+    /// row, keyed like the queue row (2, seq), holding the queuing tx's hash
+    /// and the call's index within it. Block 2's plain transfer queues
+    /// nothing and links nothing. Same bytes serial and pipelined.
+    #[test]
+    fn core_writer_tx_links_each_queued_row_to_its_evm_tx() {
+        use torus_state::cf::CF_CORE_WRITER_TX;
+        use torus_state::corewriter_tx::{key as link_key, CoreWriterTxLink};
+        let key = k256::ecdsa::SigningKey::from_slice(&[63u8; 32]).unwrap();
+        let account = |code_hash: B256, balance: U256| revm::state::AccountInfo {
+            balance,
+            nonce: 0,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        // Forward calldata to CoreWriter (0x0810).
+        #[rustfmt::skip]
+        let call = [
+            0x36, 0x5f, 0x5f, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
+            0x5f, 0x5f, 0x36, 0x5f, 0x5f, // retSize retOffset argsSize argsOffset value
+            0x61, 0x08, 0x10, 0x5a, 0xf1, 0x50, // PUSH2 0x0810 GAS CALL POP
+        ];
+        let once = [&call[..], &[0x00]].concat(); // STOP
+        let reverts = [&call[..], &[0x5f, 0x5f, 0xfd]].concat(); // REVERT
+        let twice = [&call[..], &call[..], &[0x00]].concat();
+        let contracts = [
+            (Address::repeat_byte(0xC0), once),
+            (Address::repeat_byte(0xC1), reverts),
+            (Address::repeat_byte(0xC2), twice),
+        ];
+        let mut calldata = alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&[0u8; 31]);
+        calldata.push(42);
+        let to = |i: usize| alloy_primitives::TxKind::Call(contracts[i].0);
+        let txs = vec![
+            signed_eip1559(&key, 0, to(0), calldata.clone()),
+            signed_eip1559(&key, 1, to(1), calldata.clone()),
+            signed_eip1559(&key, 2, to(2), calldata.clone()),
+        ];
+        let hash = |i: usize| alloy_primitives::keccak256(&txs[i]);
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        blocks[0].evm_transactions = txs.clone();
+        blocks[0].header.evm_tx_count = 3;
+        blocks[1].evm_transactions = vec![signed_eip1559(
+            &key,
+            3,
+            alloy_primitives::TxKind::Call(Address::repeat_byte(0x42)),
+            vec![],
+        )];
+        blocks[1].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+
+        let link = |tx: usize, call_index| CoreWriterTxLink {
+            tx_hash: hash(tx),
+            call_index,
+        };
+        let want = vec![
+            (link_key(2, 0).to_vec(), link(0, 0).encode().to_vec()),
+            (link_key(2, 1).to_vec(), link(2, 0).encode().to_vec()),
+            (link_key(2, 2).to_vec(), link(2, 1).encode().to_vec()),
+        ];
+        let mut dumps = Vec::new();
+        for on in [false, true] {
+            let (_cfg, db) = make_test_config_and_db();
+            db.put_account(&k256_address(&key), &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))))
+                .unwrap();
+            for (addr, code) in &contracts {
+                let code_hash = alloy_primitives::keccak256(code);
+                db.put_code(&code_hash, code).unwrap();
+                db.put_account(addr, &account(code_hash, U256::ZERO)).unwrap();
+            }
+            let ctx = pipeline_ctx(&db, on, None);
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            assert_eq!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
+                want,
+                "on={on}: one link per queued row, after block 1"
+            );
+            dispatch_and_execute(&ctx, &db, &blocks[1]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            assert_eq!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
+                want,
+                "on={on}: block 2 queued nothing, linked nothing"
+            );
+            let status = action_status(&db, 2).expect("block 2 drained rows: a record");
+            let seqs: Vec<u64> = status.core_writer.iter().map(|r| r.seq).collect();
+            assert_eq!(seqs, vec![0, 1, 2], "on={on}: the linked rows drained in block 2");
+            dumps.push(dump_all_cfs(&db));
+        }
+        assert_dumps_equal(&dumps[0], &dumps[1], "core writer tx links: serial vs pipelined");
+    }
+
     /// Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
     /// a node executes `block` once; another node stops right after the EVM
     /// section of its first attempt (a hard crash before the native flush) and

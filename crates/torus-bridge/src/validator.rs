@@ -26,6 +26,10 @@ pub struct ValidatedBlock {
     /// in the SAME batch as `bundle` and the block's native flush
     /// (`torus_state::incremental::evm_block_batch_incremental`, consensus bug (c)).
     pub native_writes: torus_state::NativeStateOverlay,
+    /// s114 (CoreWriter follow-up 1): for each queue row in `native_writes`,
+    /// its key `(target block, seq)` and the EVM tx that queued it — the
+    /// node-local `CF_CORE_WRITER_TX` rows, written in the same batch.
+    pub core_writer_links: Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)>,
     /// Computed state root (matches the block header).
     pub state_root: B256,
     /// EVM `(root, TrieUpdates)` pair from this validation's single incremental StateRoot run
@@ -212,6 +216,7 @@ impl BlockValidator {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
             native_writes: exec_result.native_writes,
+            core_writer_links: Vec::new(),
             state_root: computed_root,
             evm_root_updates,
             native_sender_actions: vec![],
@@ -318,6 +323,7 @@ impl BlockValidator {
             receipts: exec_result.receipts,
             bundle: exec_result.bundle,
             native_writes: exec_result.native_writes,
+            core_writer_links: Vec::new(),
             state_root: computed_root,
             // Root computed over the MERGED multi-block bundle — its TrieUpdates are not
             // reusable for a single-block commit.

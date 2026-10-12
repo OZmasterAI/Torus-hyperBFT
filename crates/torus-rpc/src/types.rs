@@ -671,12 +671,22 @@ pub struct RpcCoreWriterResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_status: Option<String>,
     pub message: String,
+    /// s114: hash of the EVM tx (in `queuedBlock`) whose precompile call
+    /// queued this row (node-local `cf_core_writer_tx`); `null` when this
+    /// node has no link (an undecodable row, or a row queued without one).
+    pub tx_hash: Option<String>,
+    /// s114: the row's position among the rows its tx queued (0 = the tx's
+    /// first successful writer-precompile call); `null` with `txHash`.
+    pub call_index: Option<u32>,
 }
 
-/// The record's CoreWriter results, RPC-shaped.
+/// The record's CoreWriter results, RPC-shaped. `link(seq)` is this
+/// block's queue row `seq`'s EVM tx link, if the node has one.
 pub fn core_writer_results(
     s: &torus_state::action_status::BlockActionStatus,
+    link: impl Fn(u64) -> Option<torus_state::corewriter_tx::CoreWriterTxLink>,
 ) -> Vec<RpcCoreWriterResult> {
+    let _ = &link;
     use torus_state::action_status::CoreWriterKind;
     s.core_writer
         .iter()
@@ -700,6 +710,8 @@ pub fn core_writer_results(
                     _ => None,
                 },
                 message: r.message.clone(),
+                tx_hash: None,
+                call_index: None,
             }
         })
         .collect()

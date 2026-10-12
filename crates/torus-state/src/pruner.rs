@@ -725,6 +725,48 @@ mod tests {
         }
     }
 
+    /// s114 (CoreWriter follow-up 1): the queue row -> EVM tx links are
+    /// pruned with the bodies of their TARGET (drain) block: every seq of a
+    /// target below the cutoff gone, at and above it intact.
+    #[test]
+    fn prune_removes_core_writer_tx_links_with_their_target_block() {
+        use crate::cf::CF_CORE_WRITER_TX;
+        use crate::corewriter_tx::{key, CoreWriterTxLink};
+        let dir = TempDir::new().unwrap();
+        let db = setup_db_with_data(dir.path());
+        let link = |h: u64, seq: u64| CoreWriterTxLink {
+            tx_hash: alloy_primitives::B256::repeat_byte(h as u8),
+            call_index: seq as u32,
+        };
+        for h in 0u64..20 {
+            for seq in [0u64, 1, u64::MAX] {
+                db.put_cf_raw(CF_CORE_WRITER_TX, &key(h, seq), &link(h, seq).encode())
+                    .unwrap();
+            }
+        }
+        let config = PrunerConfig {
+            retention_blocks: 10,
+            prune_interval_blocks: 1,
+            batch_size: 100,
+            trade_retention_blocks: None,
+        };
+        let mut pruner = StatePruner::new(db.clone(), config, Arc::new(AtomicU64::new(0)));
+        assert_eq!(pruner.maybe_prune(15).unwrap(), 5);
+        for h in 0u64..20 {
+            for seq in [0u64, 1, u64::MAX] {
+                let stored = db
+                    .get_cf_raw(CF_CORE_WRITER_TX, &key(h, seq))
+                    .unwrap()
+                    .map(|b| CoreWriterTxLink::decode(&b).expect("decodes"));
+                if h < 5 {
+                    assert_eq!(stored, None, "link ({h}, {seq}) pruned");
+                } else {
+                    assert_eq!(stored, Some(link(h, seq)), "link ({h}, {seq}) kept");
+                }
+            }
+        }
+    }
+
     #[test]
     fn archive_mode_prunes_nothing() {
         let dir = TempDir::new().unwrap();
