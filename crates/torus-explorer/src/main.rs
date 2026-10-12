@@ -24,10 +24,11 @@ async fn main() {
     let db = ExplorerDb::open(&config.db_path).expect("failed to open database");
     let rpc = NodeRpcClient::new(&config.rpc_url).expect("failed to create RPC client");
 
-    // Backfill from genesis to current height
+    // Backfill from genesis to current height. R30: it stops at a failing
+    // block; the live indexer below resumes there on every new head.
     let indexer = Indexer::new(rpc.clone(), db.clone(), config.backfill_batch_size);
     if let Err(e) = indexer.backfill().await {
-        error!("Backfill error: {e}");
+        error!("Backfill error: {e}; the live indexer retries from that block");
     }
 
     // Start real-time subscription in background

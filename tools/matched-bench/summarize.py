@@ -22,7 +22,8 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "md5-bench", "genesis-md5", "genesis-markets", "genesis-accounts", "node-env",
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
           "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
-          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget"]:
+          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget",
+          "in-flight-tail"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -130,7 +131,7 @@ for node, rs in rows.items():
 
 # ---------------------------------------------------------------- phase breakdown
 PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "action_status", "save_books", "flush",
-          "body_persist", "end_resident", "end_resident_wait"]
+          "body_persist", "end_resident", "end_resident_wait", "checkpoint_settle_wait", "checkpoint_upkeep"]
 # Item 6 cut 1: `action_status` (the v2 action status: native failures mapped
 # to body positions), exec thread, between engine and save_books; 0.0 on an
 # older binary, where it sits in residual_untimed.
@@ -147,6 +148,16 @@ PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "action_statu
 # non-zero wait count. The rare join on an untouched block lands in that
 # block's wall, not in a native block's chain.
 END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions"]
+# Item 6 Phase 3 (p3s2g 47.1, step 2 `7fe4d420`): the exec thread's checkpoint
+# work, observed once per pipelined block at checkpoint interval > 0:
+# `checkpoint_settle_wait` (the join of the previous block's merge into the
+# since-checkpoint layer, at the start of the block) and `checkpoint_upkeep`
+# (the end-of-block upkeep: trigger, checkpoint-time merges, hand-off incl.
+# `exec_checkpoint_wait`, view publish). Exec-thread phases (subtracted from
+# residual_untimed); 0.0 on an older binary or at interval 0, where they sat
+# in residual_untimed. Not in the chain identity's e_phases (where they fall
+# relative to the chain timer is not pinned here).
+CHECKPOINT_UPKEEP_SUB = ["checkpoint_wait"]
 # r7 state-write-build-vs-db-split: state_write is reported alongside its two
 # halves — state_write_build (serializing the pending maps into the WriteBatch)
 # and state_write_db (the atomic rocksdb write: WAL + memtable). build + db ==
@@ -170,7 +181,8 @@ SUB = {"engine": ["phase_margin", "phase_match", "phase_settle"] + ENGINE_SUB_R6
        "load_books": ["margin_configs"],
        "save_books": SAVE_SUB_BL1,
        "flush": ["root", "state_write"] + FLUSH_SUB_R7 + ["evm_resync"],
-       "end_resident": END_RESIDENT_SUB}
+       "end_resident": END_RESIDENT_SUB,
+       "checkpoint_upkeep": CHECKPOINT_UPKEEP_SUB}
 
 # Item 6 Phase 2 step 0.2: `torus_exec_thread_spawns_<site>` (process totals,
 # torus-telemetry EXEC_SPAWN_SITES order); 0 on an older binary.
@@ -531,6 +543,10 @@ def node_phase(node, rs, hi, buckets, window):
     # Item 6 step 2: the exposed end_resident (join wait), per join.
     p["end_resident_wait_ms_p50"] = pctl("torus_exec_end_resident_wait_seconds_bucket", 0.50)
     p["end_resident_wait_ms_p90"] = pctl("torus_exec_end_resident_wait_seconds_bucket", 0.90)
+    # Item 6 Phase 3: the checkpoint timers per observation (None if absent).
+    for name in ("checkpoint_settle_wait", "checkpoint_upkeep"):
+        for q in (50, 99):
+            p["%s_ms_p%d" % (name, q)] = pctl("torus_exec_%s_seconds_bucket" % name, q / 100)
     p["pipelined_ms_p95"] = pctl("torus_flush_worker_seconds_bucket", 0.95)
     # The ruler's own per-node-cell acceptance gate:
     #   * the chain must COVER every phase still running on the exec thread
@@ -1179,6 +1195,11 @@ def parse_bench_log(path):
         "in_flight_at_end": int(m.group(5)), "tail_url": m.group(6),
         "tail_fetched": int(m.group(7)), "tail_errors": int(m.group(8)),
         "tail_missed": int(m.group(9))}
+    if inflight is not None:
+        # bench --in-flight-tail commit appends " | tail=commit"; head (the
+        # default, and every bench before the flag) prints no suffix.
+        t = re.search(r"missed=\d+ \| tail=(\w+)", text)
+        inflight["tail_mode"] = t.group(1) if t else "head"
     m = re.search(r"Cancel-by-id \(load-gen\): cancel sent (\d+) accepted (\d+) \| modify sent (\d+) "
                   r"accepted (\d+) \| lookups (\d+) errors (\d+) \| no own order (\d+)", text)
     by_id = None if not m else dict(zip(
@@ -1248,6 +1269,8 @@ summary = {
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
              "max_in_flight": int(A.max_in_flight) if A.max_in_flight else None,
+             # run-cell IN_FLIGHT_TAIL; None = unset = the bench default (head).
+             "in_flight_tail": A.in_flight_tail or None,
              # None = unset on the nodes = jsonrpsee's 10 MiB default.
              "rpc_max_response_mb": (int(NODE_ENV["TORUS_RPC_MAX_RESPONSE_MB"])
                                      if str(NODE_ENV.get("TORUS_RPC_MAX_RESPONSE_MB", "")).isdigit() else None),

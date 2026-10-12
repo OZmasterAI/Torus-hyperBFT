@@ -1119,6 +1119,38 @@ mod tests {
         assert_eq!(resolve_block_tag("earliest", 100).unwrap(), 0);
         assert_eq!(resolve_block_tag("pending", 100).unwrap(), 100);
         assert_eq!(resolve_block_tag("0xa", 100).unwrap(), 10);
+        // HotStuff BFT: a committed block is final, so "safe" and
+        // "finalized" are the head.
+        assert_eq!(resolve_block_tag("safe", 100).unwrap(), 100);
+        assert_eq!(resolve_block_tag("finalized", 100).unwrap(), 100);
+    }
+
+    /// Ethereum JSON-RPC QUANTITY: compact hex, no leading zero digits, "0x0"
+    /// for zero (DATA encodings keep their fixed width).
+    #[test]
+    fn hex_u256_is_compact_quantity() {
+        assert_eq!(hex_u256(U256::ZERO), "0x0");
+        assert_eq!(hex_u256(U256::from(7u64)), "0x7");
+        assert_eq!(hex_u256(U256::from(15u64)), "0xf");
+        assert_eq!(hex_u256(U256::from(255u64)), "0xff");
+        assert_eq!(hex_u256(U256::from(256u64)), "0x100");
+        assert_eq!(hex_u256(U256::from(0x1000u64)), "0x1000");
+        assert_eq!(
+            hex_u256(U256::from(2_000_000_000_000_000_000u128)),
+            "0x1bc16d674ec80000"
+        );
+        assert_eq!(
+            hex_u256(U256::from(1u64) << 255),
+            format!("0x8{}", "0".repeat(63))
+        );
+        assert_eq!(hex_u256(U256::MAX), format!("0x{}", "f".repeat(64)));
+        assert_eq!(hex_u64(0), "0x0");
+        assert_eq!(hex_u64(7), "0x7");
+        assert_eq!(hex_u128(0), "0x0");
+        assert_eq!(hex_u128(255), "0xff");
+        // DATA keeps its width.
+        assert_eq!(hex_b256(B256::ZERO), format!("0x{}", "0".repeat(64)));
+        assert_eq!(hex_address(Address::ZERO), format!("0x{}", "0".repeat(40)));
     }
 
     #[tokio::test]
@@ -3380,9 +3412,13 @@ mod tests {
                 core_writer_actions: vec![],
             },
         );
+        // Executed through height 3 (an empty body reports empty lists only
+        // once executed).
+        store_applied_height(&state, 3);
         // v2: action 2 executed and failed (margin). Row 50: action 3 was
         // rejected (an IOC that found nothing to fill).
         let record = torus_state::action_status::BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![true],
             native_skipped: vec![false, true, false, false],
             native_failed: vec![
@@ -3473,6 +3509,182 @@ mod tests {
         assert_eq!(empty["nativeActionStatus"], serde_json::json!([]));
         assert_eq!(empty["nativeActionFailures"], serde_json::json!([]));
         assert_eq!(empty["evmTransactionStatus"], serde_json::json!([]));
+        handle.stop().unwrap();
+    }
+
+    /// s112 (v4): `torus_getBlockBody` lists every CoreWriter / lockbox row
+    /// the block drained, in queue order, with its outcome, also for a block
+    /// with no native action and no EVM tx (whose record holds only them);
+    /// an empty block without a record reports an empty list, a block not
+    /// executed yet `null`. RED before: no `coreWriterResults` entries.
+    #[tokio::test]
+    async fn torus_get_block_body_reports_core_writer_results() {
+        use torus_state::action_status::{
+            BlockActionStatus, CoreWriterKind, CoreWriterResult, FailureReason, Outcome,
+        };
+        let (_dir, state, mempool, executor) = setup();
+        let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let with_action = TorusBlockBody {
+            native_actions: vec![torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                1,
+                &key,
+            )],
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        let empty = TorusBlockBody {
+            native_actions: vec![],
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        // Codex review (P2): height 5 (empty) is committed, not executed yet:
+        // `null`, never `[]` (its queued rows may still drain).
+        for (height, body) in [
+            (1, &with_action),
+            (2, &with_action),
+            (3, &empty),
+            (4, &empty),
+            (5, &empty),
+        ] {
+            store_header(&state, &test_header(height, 0, 1_000_000_000));
+            store_body(&state, height, body);
+        }
+        let cw = |seq, kind, trader: u8, outcome, reason, message: &str| CoreWriterResult {
+            seq,
+            kind,
+            trader: Address::repeat_byte(trader),
+            queued_block: if trader == 0 { 0 } else { 2 },
+            outcome,
+            reason,
+            message: message.to_string(),
+        };
+        let results = vec![
+            cw(
+                0,
+                CoreWriterKind::LockboxDeposit,
+                7,
+                Outcome::Executed,
+                FailureReason::Other,
+                "",
+            ),
+            cw(
+                1,
+                CoreWriterKind::Undecodable,
+                0,
+                Outcome::Failed,
+                FailureReason::Other,
+                "undecodable queued action (block 3, seq 1): x",
+            ),
+            cw(
+                2,
+                CoreWriterKind::PlaceOrder,
+                8,
+                Outcome::Rejected,
+                FailureReason::IocCancel,
+                "",
+            ),
+            cw(
+                3,
+                CoreWriterKind::LockboxWithdraw,
+                9,
+                Outcome::Failed,
+                FailureReason::Margin,
+                "short",
+            ),
+        ];
+        store_applied_height(&state, 4);
+        for (height, native_skipped) in [(1u64, vec![false]), (3, vec![])] {
+            state
+                .put_cf_raw(
+                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                    &height.to_be_bytes(),
+                    &BlockActionStatus {
+                        native_skipped,
+                        core_writer: results.clone(),
+                        ..Default::default()
+                    }
+                    .encode(),
+                )
+                .unwrap();
+        }
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let get = |height: u64| {
+            let client = client.clone();
+            async move {
+                client
+                    .request::<Option<serde_json::Value>, _>(
+                        "torus_getBlockBody",
+                        jsonrpsee::rpc_params![height],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let want = serde_json::json!([
+            {
+                "seq": 0,
+                "kind": "lockbox_deposit",
+                "trader": format!("{:#x}", Address::repeat_byte(7)),
+                "queuedBlock": "0x2",
+                "status": "executed",
+                "message": ""
+            },
+            {
+                "seq": 1,
+                "kind": "undecodable",
+                "trader": null,
+                "queuedBlock": null,
+                "status": "failed",
+                "reason": "other",
+                "message": "undecodable queued action (block 3, seq 1): x"
+            },
+            {
+                "seq": 2,
+                "kind": "place_order",
+                "trader": format!("{:#x}", Address::repeat_byte(8)),
+                "queuedBlock": "0x2",
+                "status": "rejected",
+                "reason": "ioc_cancel",
+                "rejectStatus": "iocCancelRejected",
+                "message": "order rejected: IOC order could not immediately match against any resting order"
+            },
+            {
+                "seq": 3,
+                "kind": "lockbox_withdraw",
+                "trader": format!("{:#x}", Address::repeat_byte(9)),
+                "queuedBlock": "0x2",
+                "status": "failed",
+                "reason": "margin",
+                "message": "short"
+            }
+        ]);
+        let one = get(1).await;
+        assert_eq!(one["coreWriterResults"], want);
+        assert_eq!(one["nativeActionStatus"], serde_json::json!(["executed"]));
+        let cw_only = get(3).await;
+        assert_eq!(
+            cw_only["coreWriterResults"], want,
+            "a block with only CoreWriter results"
+        );
+        assert_eq!(cw_only["nativeActionStatus"], serde_json::json!([]));
+        assert!(
+            get(2).await["coreWriterResults"].is_null(),
+            "not executed yet"
+        );
+        assert_eq!(get(4).await["coreWriterResults"], serde_json::json!([]));
+        let pending_empty = get(5).await;
+        assert!(
+            pending_empty["coreWriterResults"].is_null(),
+            "{pending_empty}"
+        );
+        assert!(pending_empty["nativeActionStatus"].is_null());
         handle.stop().unwrap();
     }
 
@@ -3580,6 +3792,7 @@ mod tests {
                 torus_state::cf::CF_BLOCK_ACTION_STATUS,
                 &1u64.to_be_bytes(),
                 &torus_state::action_status::BlockActionStatus {
+                    core_writer: vec![],
                     evm_skipped: vec![false, true, false],
                     native_skipped: vec![],
                     native_failed: vec![],
@@ -5849,6 +6062,124 @@ mod tests {
         assert_eq!(trades[0].trade_id, hex_u128(200));
         assert_eq!(trades[1].trade_id, hex_u128(300));
         assert_eq!(trades[2].trade_id, hex_u128(100));
+        handle.stop().unwrap();
+    }
+
+    /// R22: eth_getBalance / getCode / getStorageAt / getTransactionCount
+    /// accept exactly the blocks eth_call accepts (the eth head: "latest",
+    /// "pending", its number) and refuse any other block with eth_call's
+    /// error, instead of answering from current state.
+    #[tokio::test]
+    async fn eth_state_reads_refuse_blocks_other_than_head_like_eth_call() {
+        let (_dir, state, mempool, executor) = setup();
+        let who = Address::from([0x11; 20]);
+        let code = vec![0x60u8, 0x80, 0x60, 0x40];
+        let code_hash = alloy_primitives::keccak256(&code);
+        state.put_code(&code_hash, &code).unwrap();
+        state
+            .put_account(
+                &who,
+                &AccountInfo {
+                    balance: U256::from(7u64),
+                    nonce: 5,
+                    code_hash,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        state
+            .put_storage(&who, &U256::from(1u64), &U256::from(9u64))
+            .unwrap();
+        // Committed through 5, executed through 3: the eth head is 3.
+        for h in 0..=5u64 {
+            store_header(&state, &test_header(h, 0, 0));
+        }
+        store_applied_height(&state, 3);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let who_s = hex_address(who);
+        let read = |method: &'static str, tag: &'static str| {
+            let client = &client;
+            let who_s = who_s.clone();
+            async move {
+                match method {
+                    "eth_getStorageAt" => {
+                        client
+                            .request::<String, _>(method, jsonrpsee::rpc_params![who_s, "0x1", tag])
+                            .await
+                    }
+                    _ => {
+                        client
+                            .request::<String, _>(method, jsonrpsee::rpc_params![who_s, tag])
+                            .await
+                    }
+                }
+            }
+        };
+        let want = [
+            ("eth_getBalance", "0x7".to_string()),
+            ("eth_getCode", "0x60806040".to_string()),
+            (
+                "eth_getStorageAt",
+                format!("0x{}", hex::encode(U256::from(9u64).to_be_bytes::<32>())),
+            ),
+            ("eth_getTransactionCount", hex_u64(5)),
+        ];
+        for (method, value) in &want {
+            for tag in ["latest", "0x3", "safe", "finalized"] {
+                assert_eq!(&read(method, tag).await.unwrap(), value, "{method} {tag}");
+            }
+            if *method != "eth_getTransactionCount" {
+                assert_eq!(
+                    &read(method, "pending").await.unwrap(),
+                    value,
+                    "{method} pending"
+                );
+            }
+        }
+        // "pending" nonce keeps its mempool path.
+        assert!(read("eth_getTransactionCount", "pending").await.is_ok());
+
+        // A caller without code (`who` has code, which EIP-3607 refuses).
+        let call = serde_json::json!({
+            "from": hex_address(Address::from([0x33; 20])),
+            "to": hex_address(Address::from([0x22; 20])),
+        });
+        // HotStuff BFT: committed = final, so "safe" and "finalized" are the
+        // head for eth_call too.
+        for tag in ["latest", "0x3", "safe", "finalized"] {
+            let r = client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
+                .await;
+            assert!(r.is_ok(), "eth_call at {tag}: {r:?}");
+        }
+        for tag in ["0x2", "earliest", "0x4", "0x5", "0x63"] {
+            let call_err = client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
+                .await
+                .unwrap_err()
+                .to_string();
+            for (method, _) in &want {
+                let e = read(method, tag)
+                    .await
+                    .expect_err(&format!("{method} at {tag} must be refused"))
+                    .to_string();
+                assert_eq!(e, call_err, "{method} at {tag}: same error as eth_call");
+            }
+        }
+        let call_err = client
+            .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), "0x2"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            call_err.contains("historical state not available at block 2"),
+            "{call_err}"
+        );
         handle.stop().unwrap();
     }
 }

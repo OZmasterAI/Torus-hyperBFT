@@ -132,11 +132,24 @@ CPU-s/1M -5.2% (shared NVMe) / -4.8% (tmpfs): the CPU saving is work removed. ma
 native blocks/s +14.0% / +1.6%: most of the blocks/s gain was disk contention. Inference: a validator with its own disk lands
 between the two (about +3% to +6% matched/s, ~5% less CPU-s/1M; a blocks/s gain above +2% only on a busy disk).
 
+**Step 1 measured (campaign `ozarchy-p3c1`, 2026-10-11):** results doc section 45, review log row 50. `7c178637`, interval 15 s, vs
+`2725e321`, shared NVMe and tmpfs (upper bound), n = 4. CPU-s/1M -7.9% / -8.3% (gate met), native blocks/s +96% / +86% (met),
+matched/s -7.0% / -10.6%: the bench's in-flight release follows `eth_blockNumber`, which step 1 advances only at checkpoints
+(every 100 blocks), so offered load falls 13-16%. The matched/s gate is not decidable before step 2. Checkpoints fire at the
+100-block attest height (94%), not at 15 s; layer_shared 0. Restart and crash not measured there; they ride along
+with the step 2 bench. Also valid for `a44bdde6` (byte-cap fix only; `TORUS_CHECKPOINT_MAX_BYTES` unset in the bench).
+
 **Stop rule:** if the CPU ceiling on tw is below ~5% (gate -6% unreachable), the owner decides
 before step 1. The options are: build anyway for the disk and W-ceiling gains with a lower gate,
 or drop Phase 3.
 
 ### Step 1: core behind the interval setting
+
+**Step 1 restart and crash cells (campaign `ozarchy-p3r1`, 2026-10-12):** results doc section 46, review log row 51.
+`a44bdde6`, interval 15 s vs unset, state hash on, 48 val1 kills (KILL / TERM / INT, 8 per arm x signal). Restart
+gate met: SIGKILL kill -> first commit 14.4 s mean / 23.2 s max (unset: 14.3 / 16.9); rewind from the last
+checkpoint 7-162 blocks. Crash correctness: no finding (replay from marker + 1, complete, every checkpoint hash
+equal on 3 validators). SIGTERM is a hard kill on this binary (main.rs waits only on SIGINT): owner to decide.
 
 Each task: test first (fails before), then code, then verify with
 `F="--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar"`.
@@ -284,6 +297,19 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   checkpoint wall p50 / p99 and the E wait on a second checkpoint, block-time p99 around
   checkpoints and epoch boundaries, RSS.
 - Plus multi-crash restart cells: SIGKILL val1 at random points, n = 3; restart -> ready.
+- **Measured for step 2** (campaign `ozarchy-p3s2g`, results doc section 47, plan-2 row 52; 18c s112): step 2
+  `2296be67` vs main `c97f56f9`, both with the bench in-flight tail on committed bodies. CPU-s/1M -7.4% (met),
+  device writes -53% (met), matched/s -2.2% (tie, not up), native blocks/s -9.4% (borderline), RSS +1.5 GB peak
+  (RAM gate not met: bound ~270 MB). Restart cells: not in this campaign. Owner decision.
+- **RSS split** (campaign `ozarchy-p3rss`, results doc section 48, plan-2 row 53): of step 2's +1.55 GB peak, the
+  commit-mode exec backlog (not Phase 3) is +0.83 GB, the step 1 layer +0.88 GB and the step 2 view +0.68 GB (vs control
+  `2725e321`); about half of each Phase 3 delta is glibc retention (jemalloc live heap +0.51 / +0.45 / +0.33 GB). RSS
+  still climbs at 120 s. Next: allocator A/B and a ~30 min soak.
+- **Gate rerun** (campaign `ozarchy-p3g2`, results doc section 49, plan-2 row 54): step 2 `51a67f57` vs main `8efcb07a`
+  (clean control), commit tail, n = 4. CPU-s/1M -7.0% (met), writes -51% (met), matched/s +2.9% (tie), native blocks/s
+  -5.5% (not met), RSS +1.55 GB peak (not met), exec ms per block flat, block-time p99 +12.7%. New timers: E waits
+  23.9 ms per block on the previous layer merge (`checkpoint_settle_wait`, p99 95 ms), upkeep 1.0 ms; free-off-exec
+  confirmed (`torus-ckpt-drop`). Also valid for `6d9b78af`. Restart cells: SIGTERM cells on the next step 2 head.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

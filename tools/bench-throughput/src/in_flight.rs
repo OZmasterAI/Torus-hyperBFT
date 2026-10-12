@@ -12,7 +12,10 @@
 //!   * is seen COMMITTED: one shared watcher ([`run_tail`]) tails every new
 //!     block body (`torus_getBlockBody`) from ONE validator and releases by
 //!     action identity (nonce + signature, [`action_key`]; the body carries no
-//!     sender address and recovering it would cost an ecrecover per action);
+//!     sender address and recovering it would cost an ecrecover per action).
+//!     How the watcher learns a new body exists is `--in-flight-tail`
+//!     ([`TailMode`]): `head` (default, every campaign before it) reads
+//!     `eth_blockNumber` first, `commit` probes the next body directly;
 //!   * is REFUSED by the RPC: an error reply, nothing admitted, or the
 //!     per-item error of a partially accepted batch. With `--retry-busy` a
 //!     BUSY reply is retried and the slot is held until the final outcome. A
@@ -38,11 +41,52 @@ use torus_types::{ActionSignature, NativeAction};
 
 /// Slack past the nonce window before an unseen action is written off.
 pub const TIMEOUT_MARGIN_MS: u64 = 10_000;
-/// Watcher poll period: one `eth_blockNumber`, then every new body in order.
+/// Watcher poll period: one `eth_blockNumber` (head mode) or one probe of the
+/// next height (commit mode), then every new body in order.
 pub const TAIL_POLL: Duration = Duration::from_millis(200);
 /// Body fetch attempts (one per poll) before a block is counted missed and
-/// skipped; its actions then release by timeout.
+/// skipped; its actions then release by timeout. Commit mode: also the polls
+/// a height may stay without a body before the tail checks whether a later
+/// height has one (a hole).
 pub const TAIL_MAX_ATTEMPTS: u32 = 5;
+
+/// `--in-flight-tail`: how the shared tail learns that a new block body
+/// exists on the watch node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailMode {
+    /// Default (every campaign before the flag): `eth_blockNumber`, then each
+    /// body up to it. `eth_blockNumber` is the node's eth head, min(applied
+    /// marker, committed) (`torus-rpc` `eth::eth_head`); under item 6 Phase 3
+    /// the applied marker reaches the disk only at checkpoints, so the head
+    /// moves in ~100-block steps and slots are released in bursts.
+    Head,
+    /// Probe `torus_getBlockBody(next)` directly. The body is written at
+    /// COMMIT, in the same RocksDB batch as the header
+    /// (`torus-consensus` `persist_committed_block_durably_timed`, called by
+    /// `dispatch_to_exec` before the block is executed), and the RPC reads
+    /// `CF_BLOCK_BODIES` with no applied-marker or head check. A null result
+    /// = not committed yet (not an error). A height without a readable body
+    /// is skipped only once known committed (a later body exists, or
+    /// `eth_blockNumber` has passed it). Released actions carry no
+    /// executed/skipped status yet (the status row is written by execution),
+    /// so every action counts as executed: a cancel-all that later fails
+    /// still resets the sender's open-order estimate.
+    Commit,
+}
+
+/// Validate `--in-flight-tail` (`""` = the default, head).
+pub fn tail_plan(max_in_flight: usize, tail: &str) -> Result<TailMode, String> {
+    match tail {
+        "" | "head" => Ok(TailMode::Head),
+        "commit" if max_in_flight == 0 => {
+            Err("--in-flight-tail commit needs --max-in-flight N (N > 0)".into())
+        }
+        "commit" => Ok(TailMode::Commit),
+        other => Err(format!(
+            "unknown --in-flight-tail {other:?} (expected \"head\" or \"commit\")"
+        )),
+    }
+}
 
 /// Why a slot was released.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,13 +121,37 @@ pub fn action_shape(action: &NativeAction) -> (u64, bool) {
 
 /// The committed actions of one `torus_getBlockBody` result: `(key, ok)` per
 /// native action, where `ok` is false only for a `"skipped"` or `"failed"`
-/// status. `None` when the reply has no action list.
+/// status. `None` when the reply has no action list. (Tests only: the tail
+/// reads [`body_probe`], which also tells a not-yet-committed height apart.)
+#[cfg(test)]
 pub fn body_action_keys(reply: &[u8]) -> Option<Vec<(u64, bool)>> {
+    match body_probe(reply) {
+        BodyFetch::Keys(keys) => Some(keys),
+        BodyFetch::Absent | BodyFetch::Error => None,
+    }
+}
+
+/// One `torus_getBlockBody` read by the tail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BodyFetch {
+    /// The body's actions, as [`body_action_keys`].
+    Keys(Vec<(u64, bool)>),
+    /// A `null` result: no body stored at this height (not committed yet).
+    Absent,
+    /// No reply, an error reply, or a reply that does not parse.
+    Error,
+}
+
+/// Classify one raw `torus_getBlockBody` reply ([`BodyFetch`]).
+pub fn body_probe(reply: &[u8]) -> BodyFetch {
     // Only what the tail needs: unknown fields (the action itself, the EVM
     // list, ...) are skipped by the parser, never built into a Value tree.
     #[derive(serde::Deserialize)]
     struct Reply {
+        #[serde(default)]
         result: Option<Body>,
+        #[serde(default)]
+        error: Option<serde::de::IgnoredAny>,
     }
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -97,9 +165,18 @@ pub fn body_action_keys(reply: &[u8]) -> Option<Vec<(u64, bool)>> {
         nonce: u64,
         signature: ActionSignature,
     }
-    let body = serde_json::from_slice::<Reply>(reply).ok()?.result?;
+    let body = match serde_json::from_slice::<Reply>(reply) {
+        Ok(Reply {
+            result: Some(body), ..
+        }) => body,
+        Ok(Reply {
+            result: None,
+            error: None,
+        }) => return BodyFetch::Absent,
+        Ok(_) | Err(_) => return BodyFetch::Error,
+    };
     let status = body.native_action_status.unwrap_or_default();
-    Some(
+    BodyFetch::Keys(
         body.native_actions
             .iter()
             .enumerate()
@@ -320,16 +397,18 @@ pub struct TailStats {
 pub struct Cap {
     pub n: usize,
     pub url: String,
+    pub tail_mode: TailMode,
     pub tracker: Mutex<Tracker>,
     wake: Vec<Notify>,
     pub tail: TailStats,
 }
 
 impl Cap {
-    pub fn new(senders: usize, n: usize, url: String) -> Self {
+    pub fn new(senders: usize, n: usize, url: String, tail_mode: TailMode) -> Self {
         Self {
             n,
             url,
+            tail_mode,
             tracker: Mutex::new(Tracker::new(
                 senders,
                 n,
@@ -388,7 +467,23 @@ impl Cap {
     /// End-of-run line (parsed by tools/matched-bench/summarize.py).
     pub fn report(&self) -> String {
         let t = self.tracker.lock().unwrap();
-        report_line(self.n, &t, &self.tail, &self.url)
+        report_line_mode(self.n, &t, &self.tail, &self.url, self.tail_mode)
+    }
+}
+
+/// [`report_line`] plus ` | tail=commit` in commit mode (head mode: the
+/// unchanged line).
+pub fn report_line_mode(
+    n: usize,
+    t: &Tracker,
+    tail: &TailStats,
+    url: &str,
+    mode: TailMode,
+) -> String {
+    let line = report_line(n, t, tail, url);
+    match mode {
+        TailMode::Head => line,
+        TailMode::Commit => line + " | tail=commit",
     }
 }
 
@@ -502,19 +597,159 @@ async fn fetch_body_reply(
     Some(resp.bytes().await.ok()?.to_vec())
 }
 
+/// What the tail reads from the watch node (the HTTP node in a run, a
+/// scripted one in the tests).
+trait TailSource {
+    /// `eth_blockNumber` (`None` on any failure).
+    fn head(&self) -> impl std::future::Future<Output = Option<u64>> + Send;
+    /// `torus_getBlockBody(height)`.
+    fn body(&self, height: u64) -> impl std::future::Future<Output = BodyFetch> + Send;
+}
+
+struct HttpTail {
+    client: std::sync::Arc<reqwest::Client>,
+    url: String,
+}
+
+impl TailSource for HttpTail {
+    fn head(&self) -> impl std::future::Future<Output = Option<u64>> + Send {
+        super::fetch_block_number(&self.client, &self.url)
+    }
+
+    async fn body(&self, height: u64) -> BodyFetch {
+        match fetch_body_reply(&self.client, &self.url, height).await {
+            // Multi-MB bodies under load: parse off the async workers so the
+            // senders' fire timing does not jitter.
+            Some(reply) => tokio::task::spawn_blocking(move || body_probe(&reply))
+                .await
+                .unwrap_or(BodyFetch::Error),
+            None => BodyFetch::Error,
+        }
+    }
+}
+
+/// The tail's position: the next height to read, the failed reads of it, and
+/// (commit mode) the polls it has had no body.
+struct TailCursor {
+    next: u64,
+    attempts: u32,
+    idle: u32,
+}
+
+impl TailCursor {
+    fn new(start_block: u64) -> Self {
+        Self {
+            next: start_block + 1,
+            attempts: 0,
+            idle: 0,
+        }
+    }
+}
+
+/// Release the actions of the body at the cursor and step past it.
+fn tail_apply(cap: &Cap, cur: &mut TailCursor, actions: &[(u64, bool)]) {
+    let woken = cap.tracker.lock().unwrap().on_block(actions);
+    cap.wake(woken);
+    cap.tail.fetched.fetch_add(1, Ordering::Relaxed);
+    cur.next += 1;
+    cur.attempts = 0;
+    cur.idle = 0;
+}
+
+/// An unreadable body at the cursor: one error; after `TAIL_MAX_ATTEMPTS`
+/// it is missed and skipped (its actions release by timeout).
+fn tail_error(cap: &Cap, cur: &mut TailCursor) {
+    cap.tail.errors.fetch_add(1, Ordering::Relaxed);
+    cur.attempts += 1;
+    if cur.attempts >= TAIL_MAX_ATTEMPTS {
+        cap.tail.missed.fetch_add(1, Ordering::Relaxed);
+        cur.next += 1;
+        cur.attempts = 0;
+    }
+}
+
+/// One tail poll in `cap.tail_mode` (see [`TailMode`]).
+async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop: Instant) {
+    match cap.tail_mode {
+        TailMode::Head => {
+            let Some(height) = src.head().await else {
+                cap.tail.errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            while cur.next <= height && Instant::now() < stop {
+                match src.body(cur.next).await {
+                    BodyFetch::Keys(actions) => tail_apply(cap, cur, &actions),
+                    BodyFetch::Absent | BodyFetch::Error => {
+                        tail_error(cap, cur);
+                        break;
+                    }
+                }
+            }
+        }
+        TailMode::Commit => {
+            while Instant::now() < stop {
+                match src.body(cur.next).await {
+                    BodyFetch::Keys(actions) => {
+                        tail_apply(cap, cur, &actions);
+                        continue;
+                    }
+                    // Unlike head mode the height may not be committed yet
+                    // (node briefly unreachable before the block): errors
+                    // alone never skip it, only a later body does.
+                    BodyFetch::Error => {
+                        cap.tail.errors.fetch_add(1, Ordering::Relaxed);
+                        cur.attempts = cur.attempts.saturating_add(1);
+                        if cur.attempts < TAIL_MAX_ATTEMPTS {
+                            break;
+                        }
+                    }
+                    BodyFetch::Absent => {
+                        cur.idle = cur.idle.saturating_add(1);
+                        if cur.idle < TAIL_MAX_ATTEMPTS {
+                            break;
+                        }
+                    }
+                }
+                // Long without a readable body: skip it only once it is known
+                // committed, i.e. eth_blockNumber has passed it (it lags but
+                // does catch up, so a run of unreadable bodies is crossed one
+                // height at a time) or the next height has a body. Commits
+                // land in height order, so re-read the gap after the check:
+                // it may have just landed.
+                let past_head = src.head().await.is_some_and(|h| h >= cur.next);
+                if !past_head && !matches!(src.body(cur.next + 1).await, BodyFetch::Keys(_)) {
+                    break;
+                }
+                match src.body(cur.next).await {
+                    BodyFetch::Keys(actions) => tail_apply(cap, cur, &actions),
+                    BodyFetch::Absent | BodyFetch::Error => {
+                        cap.tail.missed.fetch_add(1, Ordering::Relaxed);
+                        cur.next += 1;
+                        cur.attempts = 0;
+                        cur.idle = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The shared block-body tail: every `TAIL_POLL` expire timed-out actions,
-/// read the watch node's height and process every new body in order. A body
-/// that cannot be read is retried on the next poll (the cursor stays on it)
-/// up to `TAIL_MAX_ATTEMPTS`, then counted missed and skipped. Runs until
-/// `stop`.
+/// then read every new body in order ([`TailMode`] says how a new body is
+/// found). A body that cannot be read is retried on the next poll (the cursor
+/// stays on it) up to `TAIL_MAX_ATTEMPTS`, then counted missed and skipped.
+/// Runs until `stop`.
 pub async fn run_tail(
     cap: std::sync::Arc<Cap>,
     client: std::sync::Arc<reqwest::Client>,
     start_block: u64,
     stop: Instant,
 ) {
-    let mut next = start_block + 1;
-    let mut attempts = 0u32;
+    let src = HttpTail {
+        client,
+        url: cap.url.clone(),
+    };
+    let mut cur = TailCursor::new(start_block);
     while Instant::now() < stop {
         tokio::time::sleep(TAIL_POLL).await;
         let now_ms = SystemTime::now()
@@ -523,40 +758,7 @@ pub async fn run_tail(
             .as_millis() as u64;
         let woken = cap.tracker.lock().unwrap().expire(now_ms);
         cap.wake(woken);
-        let Some(height) = super::fetch_block_number(&client, &cap.url).await else {
-            cap.tail.errors.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        while next <= height && Instant::now() < stop {
-            // Multi-MB bodies under load: parse off the async workers so the
-            // senders' fire timing does not jitter.
-            let keys = match fetch_body_reply(&client, &cap.url, next).await {
-                Some(reply) => tokio::task::spawn_blocking(move || body_action_keys(&reply))
-                    .await
-                    .ok()
-                    .flatten(),
-                None => None,
-            };
-            match keys {
-                Some(actions) => {
-                    let woken = cap.tracker.lock().unwrap().on_block(&actions);
-                    cap.wake(woken);
-                    cap.tail.fetched.fetch_add(1, Ordering::Relaxed);
-                    next += 1;
-                    attempts = 0;
-                }
-                None => {
-                    cap.tail.errors.fetch_add(1, Ordering::Relaxed);
-                    attempts += 1;
-                    if attempts >= TAIL_MAX_ATTEMPTS {
-                        cap.tail.missed.fetch_add(1, Ordering::Relaxed);
-                        next += 1;
-                        attempts = 0;
-                    }
-                    break;
-                }
-            }
-        }
+        tail_poll(&cap, &src, &mut cur, stop).await;
     }
 }
 
@@ -907,6 +1109,350 @@ mod tests {
         assert_eq!(
             cap_plan(1, true, "", "http://a:1"),
             Ok(Some((1, "http://a:1".to_string())))
+        );
+    }
+
+    // ---- --in-flight-tail commit (bench/inflight-commit-tail) ----
+
+    /// Scripted watch node: a fixed `eth_blockNumber` and, per height, a
+    /// sequence of `torus_getBlockBody` outcomes (the last one repeats;
+    /// unknown heights are not committed yet).
+    struct FakeNode {
+        head: Option<u64>,
+        bodies: Mutex<HashMap<u64, Vec<BodyFetch>>>,
+        body_calls: Mutex<Vec<u64>>,
+    }
+
+    impl FakeNode {
+        fn new(head: Option<u64>) -> Self {
+            Self {
+                head,
+                bodies: Mutex::new(HashMap::new()),
+                body_calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn with(self, height: u64, script: Vec<BodyFetch>) -> Self {
+            self.bodies.lock().unwrap().insert(height, script);
+            self
+        }
+        fn calls(&self) -> Vec<u64> {
+            std::mem::take(&mut *self.body_calls.lock().unwrap())
+        }
+    }
+
+    impl TailSource for FakeNode {
+        fn head(&self) -> impl std::future::Future<Output = Option<u64>> + Send {
+            let h = self.head;
+            async move { h }
+        }
+        fn body(&self, height: u64) -> impl std::future::Future<Output = BodyFetch> + Send {
+            self.body_calls.lock().unwrap().push(height);
+            let mut bodies = self.bodies.lock().unwrap();
+            let out = match bodies.get_mut(&height) {
+                Some(s) if s.len() > 1 => s.remove(0),
+                Some(s) => s[0].clone(),
+                None => BodyFetch::Absent,
+            };
+            async move { out }
+        }
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    fn stats(cap: &Cap) -> [u64; 3] {
+        [
+            cap.tail.fetched.load(Ordering::Relaxed),
+            cap.tail.errors.load(Ordering::Relaxed),
+            cap.tail.missed.load(Ordering::Relaxed),
+        ]
+    }
+
+    #[test]
+    fn tail_mode_defaults_to_head_and_commit_needs_the_cap() {
+        assert_eq!(tail_plan(0, ""), Ok(TailMode::Head));
+        assert_eq!(tail_plan(4, ""), Ok(TailMode::Head));
+        assert_eq!(tail_plan(4, "head"), Ok(TailMode::Head));
+        assert_eq!(tail_plan(4, "commit"), Ok(TailMode::Commit));
+        assert!(tail_plan(4, "applied").is_err(), "unknown mode");
+        assert!(tail_plan(0, "commit").is_err(), "commit tail without a cap");
+        assert_eq!(
+            tail_plan(0, "head"),
+            Ok(TailMode::Head),
+            "the default spelled out"
+        );
+    }
+
+    #[test]
+    fn body_probe_tells_not_committed_from_a_bad_reply() {
+        let a = signed(1_000, place(3));
+        let reply = |result: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+                .unwrap()
+        };
+        let body = reply(serde_json::json!({"nativeActions": [serde_json::to_value(&a).unwrap()]}));
+        assert_eq!(
+            body_probe(&body),
+            BodyFetch::Keys(vec![(action_key(a.nonce, &a.signature), true)])
+        );
+        // No body at this height yet: null result = not committed.
+        assert_eq!(
+            body_probe(&reply(serde_json::Value::Null)),
+            BodyFetch::Absent
+        );
+        // An error reply, garbage, a body without its action list: bad.
+        assert_eq!(
+            body_probe(br#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"x"}}"#),
+            BodyFetch::Error
+        );
+        assert_eq!(body_probe(b"<html>"), BodyFetch::Error);
+        assert_eq!(
+            body_probe(&reply(serde_json::json!({"nativeActionCount": 0}))),
+            BodyFetch::Error
+        );
+    }
+
+    // The Phase 3 stall: eth_blockNumber (the applied marker) stays put while
+    // the committed body is already on disk. The head tail cannot see it;
+    // the commit tail releases at once.
+    #[tokio::test]
+    async fn commit_tail_releases_on_a_committed_body_while_the_head_stays_put() {
+        for (mode, released) in [(TailMode::Head, 0), (TailMode::Commit, 1)] {
+            let cap = Cap::new(1, 1, "http://v2".into(), mode);
+            cap.submit(0, &[(11, 1_000, 400, false)]);
+            let node = FakeNode::new(Some(0)).with(1, vec![BodyFetch::Keys(vec![(11, true)])]);
+            let mut cur = TailCursor::new(0);
+            tail_poll(&cap, &node, &mut cur, far()).await;
+            let t = cap.tracker.lock().unwrap();
+            assert_eq!(t.released, [released, 0, 0], "{mode:?}");
+            assert_eq!(t.in_flight(0), 1 - released as usize, "{mode:?}");
+            assert_eq!(cur.next, 1 + released, "{mode:?}");
+            assert_eq!(stats(&cap), [released, 0, 0], "{mode:?}");
+            match mode {
+                TailMode::Head => assert!(node.calls().is_empty(), "head 0: no body read"),
+                // Body 1 read, body 2 probed (not committed yet), stop.
+                TailMode::Commit => assert_eq!(node.calls(), vec![1, 2]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_tail_never_releases_twice_or_rereads_a_body() {
+        let cap = Cap::new(2, 1, "http://v2".into(), TailMode::Commit);
+        cap.submit(0, &[(11, 1_000, 400, false)]);
+        cap.submit(1, &[(22, 1_000, 0, true)]);
+        // The same action seen again in a later body (a late duplicate).
+        let node = FakeNode::new(None)
+            .with(1, vec![BodyFetch::Keys(vec![(11, true)])])
+            .with(2, vec![BodyFetch::Keys(vec![(11, true), (22, true)])]);
+        let mut cur = TailCursor::new(0);
+        tail_poll(&cap, &node, &mut cur, far()).await;
+        assert_eq!(node.calls(), vec![1, 2, 3]);
+        for _ in 0..3 {
+            tail_poll(&cap, &node, &mut cur, far()).await;
+        }
+        assert_eq!(
+            node.calls(),
+            vec![3, 3, 3],
+            "only the next height is probed"
+        );
+        let t = cap.tracker.lock().unwrap();
+        assert_eq!(t.released, [2, 0, 0]);
+        assert_eq!(t.open(), 0);
+        assert_eq!(cur.next, 3);
+        drop(t);
+        assert_eq!(stats(&cap), [2, 0, 0], "not committed yet is no error");
+    }
+
+    // Refusal and timeout release exactly as before; a later body with the
+    // same actions releases nothing more.
+    #[tokio::test]
+    async fn commit_tail_keeps_the_refused_and_timeout_paths() {
+        let cap = Cap::new(1, 3, "http://v2".into(), TailMode::Commit);
+        cap.submit(
+            0,
+            &[
+                (1, 1_000, 400, false),
+                (2, 1_001, 400, false),
+                (3, 1_002, 0, true),
+            ],
+        );
+        cap.apply_result(&[1], &Err("rpc: mempool: native pool full".into()));
+        let woken = cap.tracker.lock().unwrap().expire(1_001 + T + 1);
+        assert_eq!(woken, vec![0], "action 1 already refused; 2 times out");
+        let node = FakeNode::new(None).with(
+            1,
+            vec![BodyFetch::Keys(vec![(1, true), (2, true), (3, true)])],
+        );
+        let mut cur = TailCursor::new(0);
+        tail_poll(&cap, &node, &mut cur, far()).await;
+        let t = cap.tracker.lock().unwrap();
+        assert_eq!(t.released, [1, 1, 1], "only the cancel-all commits");
+        assert_eq!(t.open(), 0);
+    }
+
+    // A height that stays without a body while a later one has its body is a
+    // hole: after TAIL_MAX_ATTEMPTS polls it counts as missed and the tail
+    // moves on (its actions release by timeout, as in head mode). The ahead
+    // probe re-reads the gap first, so a body that just landed is not lost.
+    #[tokio::test]
+    async fn commit_tail_skips_a_hole_only_after_waiting() {
+        let cap = Cap::new(1, 2, "http://v2".into(), TailMode::Commit);
+        cap.submit(0, &[(5, 1_000, 400, false)]);
+        let node = FakeNode::new(None).with(2, vec![BodyFetch::Keys(vec![(5, true)])]);
+        let mut cur = TailCursor::new(0);
+        for _ in 1..TAIL_MAX_ATTEMPTS {
+            tail_poll(&cap, &node, &mut cur, far()).await;
+        }
+        assert_eq!(
+            node.calls(),
+            vec![1; TAIL_MAX_ATTEMPTS as usize - 1],
+            "no ahead probe yet"
+        );
+        assert_eq!(stats(&cap), [0, 0, 0]);
+        tail_poll(&cap, &node, &mut cur, far()).await;
+        // Probe 1, ahead 2 (present), re-probe 1 (still absent: hole), then
+        // read 2 and probe 3.
+        assert_eq!(node.calls(), vec![1, 2, 1, 2, 3]);
+        assert_eq!(stats(&cap), [1, 0, 1]);
+        assert_eq!(cur.next, 3);
+        assert_eq!(cap.tracker.lock().unwrap().released, [1, 0, 0]);
+
+        // Race: the gap body lands between the probe and the ahead probe.
+        let cap = Cap::new(1, 2, "http://v2".into(), TailMode::Commit);
+        cap.submit(0, &[(5, 1_000, 400, false), (6, 1_001, 400, false)]);
+        let mut script = vec![BodyFetch::Absent; TAIL_MAX_ATTEMPTS as usize];
+        script.push(BodyFetch::Keys(vec![(5, true)]));
+        let node = FakeNode::new(None)
+            .with(1, script)
+            .with(2, vec![BodyFetch::Keys(vec![(6, true)])]);
+        let mut cur = TailCursor::new(0);
+        for _ in 0..TAIL_MAX_ATTEMPTS {
+            tail_poll(&cap, &node, &mut cur, far()).await;
+        }
+        assert_eq!(stats(&cap), [2, 0, 0], "nothing missed");
+        assert_eq!(cap.tracker.lock().unwrap().released, [2, 0, 0]);
+        assert_eq!(cur.next, 3);
+    }
+
+    // An unreadable body (transport error, error reply, garbage): head mode
+    // knows the height is committed (<= eth_blockNumber) and skips it after
+    // TAIL_MAX_ATTEMPTS errors. Commit mode skips it only once a later
+    // height has a body; errors alone (node unreachable before the block
+    // commits) never skip a height that may still come.
+    #[tokio::test]
+    async fn bad_bodies_skip_in_head_mode_and_only_past_a_later_body_in_commit_mode() {
+        let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Head);
+        let node = FakeNode::new(Some(1)).with(1, vec![BodyFetch::Error]);
+        let mut cur = TailCursor::new(0);
+        for _ in 0..TAIL_MAX_ATTEMPTS {
+            tail_poll(&cap, &node, &mut cur, far()).await;
+        }
+        assert_eq!(
+            (stats(&cap), cur.next),
+            ([0, TAIL_MAX_ATTEMPTS as u64, 1], 2)
+        );
+        // Head mode: a failed eth_blockNumber is one error, no body read.
+        let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Head);
+        let node = FakeNode::new(None);
+        let mut cur = TailCursor::new(0);
+        tail_poll(&cap, &node, &mut cur, far()).await;
+        assert_eq!(stats(&cap), [0, 1, 0]);
+        assert!(node.calls().is_empty());
+
+        // Commit mode, errors and no later body: stay on the height.
+        let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Commit);
+        let node = FakeNode::new(None).with(1, vec![BodyFetch::Error]);
+        let mut cur = TailCursor::new(0);
+        for _ in 0..2 * TAIL_MAX_ATTEMPTS {
+            tail_poll(&cap, &node, &mut cur, far()).await;
+        }
+        assert_eq!(
+            (stats(&cap), cur.next),
+            ([0, 2 * TAIL_MAX_ATTEMPTS as u64, 0], 1)
+        );
+
+        // Commit mode, a later body exists: the unreadable height is missed.
+        let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Commit);
+        cap.submit(0, &[(9, 1_000, 400, false)]);
+        let node = FakeNode::new(None)
+            .with(1, vec![BodyFetch::Error])
+            .with(2, vec![BodyFetch::Keys(vec![(9, true)])]);
+        let mut cur = TailCursor::new(0);
+        for _ in 0..TAIL_MAX_ATTEMPTS {
+            tail_poll(&cap, &node, &mut cur, far()).await;
+        }
+        assert_eq!(
+            (stats(&cap), cur.next),
+            ([1, TAIL_MAX_ATTEMPTS as u64, 1], 3)
+        );
+        assert_eq!(cap.tracker.lock().unwrap().released, [1, 0, 0]);
+    }
+
+    // Review finding (Codex stop review): transport errors before a block
+    // commits must not skip it. Five errors, then block 1 commits: its
+    // actions are released, nothing missed.
+    #[tokio::test]
+    async fn commit_tail_errors_before_the_commit_do_not_skip_the_block() {
+        let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Commit);
+        cap.submit(0, &[(7, 1_000, 400, false)]);
+        let mut script = vec![BodyFetch::Error; TAIL_MAX_ATTEMPTS as usize];
+        script.push(BodyFetch::Keys(vec![(7, true)]));
+        let node = FakeNode::new(None).with(1, script);
+        let mut cur = TailCursor::new(0);
+        for _ in 0..=TAIL_MAX_ATTEMPTS {
+            tail_poll(&cap, &node, &mut cur, far()).await;
+        }
+        assert_eq!(cap.tracker.lock().unwrap().released, [1, 0, 0]);
+        assert_eq!(stats(&cap), [1, TAIL_MAX_ATTEMPTS as u64, 0]);
+        assert_eq!(cur.next, 2);
+    }
+
+    // Review finding (Codex torus review): two unreadable bodies in a row.
+    // The ahead probe cannot confirm height 1 (height 2 is unreadable too),
+    // but once eth_blockNumber passes them (it lags, then catches up at a
+    // checkpoint) each is skipped after TAIL_MAX_ATTEMPTS and body 3
+    // releases. While the head is below them the tail waits.
+    #[tokio::test]
+    async fn commit_tail_crosses_a_run_of_unreadable_bodies_once_the_head_passes() {
+        for (head, released) in [(Some(0), 0), (Some(2), 1)] {
+            let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Commit);
+            cap.submit(0, &[(9, 1_000, 400, false)]);
+            let node = FakeNode::new(head)
+                .with(1, vec![BodyFetch::Error])
+                .with(2, vec![BodyFetch::Error])
+                .with(3, vec![BodyFetch::Keys(vec![(9, true)])]);
+            let mut cur = TailCursor::new(0);
+            for _ in 0..2 * TAIL_MAX_ATTEMPTS {
+                tail_poll(&cap, &node, &mut cur, far()).await;
+            }
+            let t = cap.tracker.lock().unwrap();
+            assert_eq!(t.released, [released, 0, 0], "head {head:?}");
+            drop(t);
+            if released == 1 {
+                assert_eq!(stats(&cap), [1, 2 * TAIL_MAX_ATTEMPTS as u64, 2]);
+                assert_eq!(cur.next, 4);
+            } else {
+                assert_eq!(stats(&cap), [0, 2 * TAIL_MAX_ATTEMPTS as u64, 0]);
+                assert_eq!(cur.next, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn commit_tail_report_line_names_the_mode() {
+        let t = Tracker::new(1, 1, T);
+        let tail = TailStats::default();
+        assert_eq!(
+            report_line_mode(1, &t, &tail, "http://v2", TailMode::Head),
+            report_line(1, &t, &tail, "http://v2"),
+            "head line unchanged"
+        );
+        assert_eq!(
+            report_line_mode(1, &t, &tail, "http://v2", TailMode::Commit),
+            "In-flight cap 1 action(s)/sender: released committed=0 refused=0 timeout=0 \
+             | in flight at end 0 | block tail http://v2: fetched=0 errors=0 missed=0 | tail=commit"
         );
     }
 }

@@ -179,6 +179,20 @@ pub(crate) fn eth_head(state: &RpcState) -> u64 {
     torus_state::running_hash::read_applied_height(&state.state).map_or(0, |h| h.min(committed))
 }
 
+/// R22: the block a state read (eth_call, eth_estimateGas, eth_getBalance,
+/// eth_getCode, eth_getStorageAt, eth_getTransactionCount) may name. Only the
+/// state at the eth head is kept, so "latest", "pending", "safe", "finalized"
+/// (committed = final under HotStuff BFT) and the head's number resolve to it; any other block (older, newer, or "earliest" above genesis)
+/// is `HistoricalStateUnavailable`, never an answer from current state.
+fn head_state_block(state: &RpcState, block: &str) -> Result<u64, RpcError> {
+    let head = eth_head(state);
+    let height = resolve_block_tag(block, head)?;
+    if height != head {
+        return Err(RpcError::HistoricalStateUnavailable { block: height });
+    }
+    Ok(head)
+}
+
 /// Block `height` as the eth view sees it: header and hash, or `None` when it
 /// is not stored or not yet executed on this node.
 fn eth_header(state: &RpcState, height: u64) -> Result<Option<(TorusBlockHeader, B256)>, RpcError> {
@@ -685,7 +699,7 @@ impl EthApiServer for RpcState {
     }
 
     async fn get_balance(&self, addr: String, block: String) -> RpcResult<String> {
-        let _block = resolve_block_tag(&block, self.latest_height.load(Relaxed)).map_err(err)?;
+        head_state_block(self, &block).map_err(err)?;
         let address = parse_address(&addr).map_err(err)?;
         let account = self
             .state
@@ -696,7 +710,7 @@ impl EthApiServer for RpcState {
     }
 
     async fn get_code(&self, addr: String, block: String) -> RpcResult<String> {
-        let _block = resolve_block_tag(&block, self.latest_height.load(Relaxed)).map_err(err)?;
+        head_state_block(self, &block).map_err(err)?;
         let address = parse_address(&addr).map_err(err)?;
         match self
             .state
@@ -725,7 +739,7 @@ impl EthApiServer for RpcState {
         index: String,
         block: String,
     ) -> RpcResult<String> {
-        let _block = resolve_block_tag(&block, self.latest_height.load(Relaxed)).map_err(err)?;
+        head_state_block(self, &block).map_err(err)?;
         let address = parse_address(&addr).map_err(err)?;
         let slot = parse_u256(&index).map_err(err)?;
         let value = self
@@ -741,7 +755,7 @@ impl EthApiServer for RpcState {
         if block == "pending" {
             return Ok(hex_u64(self.mempool.pending_nonce(&address)));
         }
-        let _block = resolve_block_tag(&block, self.latest_height.load(Relaxed)).map_err(err)?;
+        head_state_block(self, &block).map_err(err)?;
         Ok(hex_u64(
             self.state
                 .get_account(&address)
@@ -1032,13 +1046,9 @@ impl EthApiServer for RpcState {
     }
 
     async fn call(&self, tx: CallRequest, block: String) -> RpcResult<String> {
-        let latest = eth_head(self);
-        let height = resolve_block_tag(&block, latest).map_err(err)?;
-        // FIX 7 (EVM-PF-14): Use the resolved block height, not always latest.
-        // We only support latest state — return a clear error for historical queries.
-        if height != latest {
-            return Err(err(RpcError::HistoricalStateUnavailable { block: height }));
-        }
+        // FIX 7 (EVM-PF-14): We only support latest state — return a clear
+        // error for historical queries.
+        let latest = head_state_block(self, &block).map_err(err)?;
         let block_env = if latest > 0 {
             match get_header_with_hash(self, latest).map_err(err)? {
                 Some((h, _, _)) => block_env_from_header(&h),
@@ -1079,15 +1089,11 @@ impl EthApiServer for RpcState {
     }
 
     async fn estimate_gas(&self, tx: CallRequest, block: Option<String>) -> RpcResult<String> {
-        let latest = eth_head(self);
-        let height = match block {
-            Some(b) => resolve_block_tag(&b, latest).map_err(err)?,
-            None => latest,
-        };
         // FIX 7 (EVM-PF-14): Consistent block-tag handling.
-        if height != latest {
-            return Err(err(RpcError::HistoricalStateUnavailable { block: height }));
-        }
+        let latest = match block {
+            Some(b) => head_state_block(self, &b).map_err(err)?,
+            None => eth_head(self),
+        };
         let block_env = if latest > 0 {
             match get_header_with_hash(self, latest).map_err(err)? {
                 Some((h, _, _)) => block_env_from_header(&h),

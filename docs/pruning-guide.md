@@ -83,12 +83,13 @@ deletes, so a half-pruned range is never served):
 
 ## What Gets Pruned
 
-### Pruned (2 column families)
+### Pruned (3 column families)
 
 | Data | Key Format | Impact |
 |------|-----------|--------|
 | **Block bodies** (`cf_block_bodies`) | height(8 BE) | Full transaction data for old blocks unavailable |
 | **Receipts** (`cf_receipts`) | height(8 BE) + tx_index(4 BE) | Transaction receipts and logs for old blocks unavailable |
+| **Action status** (`cf_block_action_status`) | height(8 BE) | Per-action executed / skipped / failed / rejected status and the block's CoreWriter results (`torus_getBlockBody`) unavailable for old blocks |
 
 These are the largest disk consumers. Block bodies contain full transaction
 data; receipts contain execution results and event logs.

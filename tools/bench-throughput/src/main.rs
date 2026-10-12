@@ -215,6 +215,14 @@ enum Command {
         /// Default: the last --rpc-urls entry.
         #[arg(long, default_value = "")]
         in_flight_watch_rpc: String,
+        /// --max-in-flight: how the shared tail finds new block bodies.
+        /// "head" (default, every campaign before this flag): read
+        /// eth_blockNumber, then each body up to it. "commit": probe
+        /// torus_getBlockBody for the next height directly; the body is on
+        /// disk at commit, while eth_blockNumber waits for the applied marker
+        /// (item 6 Phase 3: only at checkpoints, so slots free in bursts).
+        #[arg(long, default_value = "")]
+        in_flight_tail: String,
         /// econ: fixed mid price in whole TRS. 0 = derive as 20 x target-margin
         /// so a 1-lot order's margin lands exactly on target.
         #[arg(long, default_value_t = 0)]
@@ -2215,6 +2223,32 @@ mod max_in_flight_tests {
         (max_in_flight, in_flight_watch_rpc)
     }
 
+    fn tail_flag(extra: &[&str]) -> String {
+        let args = ["bench-throughput", "consensus"]
+            .iter()
+            .chain(extra)
+            .copied();
+        let cli = Cli::try_parse_from(args).expect("parses");
+        let Command::Consensus { in_flight_tail, .. } = cli.command else {
+            panic!("consensus subcommand")
+        };
+        in_flight_tail
+    }
+
+    // Default "" = head (old campaigns reproduce); the value is validated by
+    // in_flight::tail_plan.
+    #[test]
+    fn in_flight_tail_defaults_to_head() {
+        assert_eq!(tail_flag(&[]), "");
+        assert_eq!(
+            in_flight::tail_plan(1, &tail_flag(&[])),
+            Ok(in_flight::TailMode::Head)
+        );
+        let commit = tail_flag(&["--max-in-flight", "4", "--in-flight-tail", "commit"]);
+        let mode = in_flight::tail_plan(4, &commit);
+        assert_eq!(mode, Ok(in_flight::TailMode::Commit));
+    }
+
     #[test]
     fn max_in_flight_defaults_off_and_parses() {
         assert_eq!(flags(&[]), (0, String::new()));
@@ -3182,7 +3216,7 @@ async fn run_consensus(
     metrics_urls_str: &str,
     sweep_bodies: bool,
     spam: Option<SpamCancel>,
-    cap_plan: Option<(usize, String)>,
+    cap_plan: Option<(usize, String, in_flight::TailMode)>,
 ) {
     // Locality plan: 0 = today's uniform draw over 1..=markets (default).
     let plan = MarketPlan::new(markets, markets_per_sender);
@@ -3294,12 +3328,18 @@ async fn run_consensus(
             println!("Rate: unbounded (burst)");
         }
     }
-    if let Some((n, url)) = &cap_plan {
+    if let Some((n, url, tail)) = &cap_plan {
         println!(
             "In-flight cap: {n} action(s)/sender (released on commit seen in {url} block bodies, \
              RPC refusal, or nonce + {}s)",
             (torus_types::eip712::NONCE_WINDOW_MS + in_flight::TIMEOUT_MARGIN_MS) / 1000
         );
+        if *tail == in_flight::TailMode::Commit {
+            println!(
+                "In-flight tail: commit (probes torus_getBlockBody for the next height; \
+                 eth_blockNumber not used)"
+            );
+        }
     }
     if pre_sign > 0 {
         println!(
@@ -3519,12 +3559,12 @@ async fn run_consensus(
     // (else the last url, cap_plan's default), never from val0's ingress.
     let by_id_url = Arc::new(cap_plan.as_ref().map_or_else(
         || rpc_urls.last().cloned().unwrap_or_default(),
-        |(_, u)| u.clone(),
+        |(_, u, _)| u.clone(),
     ));
     let by_id_stats = Arc::new(by_id::Stats::default());
     // --max-in-flight: the shared cap state and its one block-body tail.
     let cap: Option<Arc<in_flight::Cap>> =
-        cap_plan.map(|(n, url)| Arc::new(in_flight::Cap::new(num_senders, n, url)));
+        cap_plan.map(|(n, url, tail)| Arc::new(in_flight::Cap::new(num_senders, n, url, tail)));
     let tail_handle = cap.as_ref().map(|c| {
         tokio::spawn(in_flight::run_tail(
             c.clone(),
@@ -4409,6 +4449,7 @@ async fn main() {
             retry_busy,
             max_in_flight,
             in_flight_watch_rpc,
+            in_flight_tail,
             econ_mid,
             band,
             rate_total,
@@ -4447,8 +4488,10 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
-            let cap = match in_flight::cap_plan(max_in_flight, econ, &in_flight_watch_rpc, &rpc_urls) {
-                Ok(c) => c,
+            let plan = in_flight::cap_plan(max_in_flight, econ, &in_flight_watch_rpc, &rpc_urls)
+                .and_then(|c| Ok((c, in_flight::tail_plan(max_in_flight, &in_flight_tail)?)));
+            let cap = match plan {
+                Ok((c, tail)) => c.map(|(n, url)| (n, url, tail)),
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(2);
