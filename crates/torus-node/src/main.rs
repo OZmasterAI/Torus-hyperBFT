@@ -1380,8 +1380,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // restart replays neither blocks nor WAL. A second signal, or the bound
     // (`TORUS_SHUTDOWN_TIMEOUT_SECS`, default 60), exits at once; recovery
     // after that is the same as after a kill.
+    // One pair of receivers for both waits, so a second signal sent while
+    // the first is handled is queued, not lost.
+    let mut signals = ShutdownSignals::new()?;
     info!("node is running — SIGINT (Ctrl+C) or SIGTERM shuts it down");
-    let signal = shutdown_signal().await?;
+    let signal = signals.recv().await;
     info!(%signal, "shutdown signal received, stopping...");
     let limit = shutdown_timeout(std::env::var("TORUS_SHUTDOWN_TIMEOUT_SECS").ok());
     let started = std::time::Instant::now();
@@ -1389,16 +1392,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let stop = move || {
         drop(replica);
         info!("consensus stopped, execution queue drained");
-        match flush_for_shutdown(&db) {
-            Ok(()) => info!("memtables flushed, WAL synced"),
-            Err(e) => warn!(%e, "shutdown flush failed; restart replays the WAL"),
-        }
+        flush_for_shutdown(&db)?;
+        info!("memtables flushed, WAL synced");
+        Ok(())
     };
     let second_signal = async {
-        match shutdown_signal().await {
-            Ok(s) => warn!(signal = %s, "second signal during shutdown"),
-            Err(_) => std::future::pending::<()>().await,
-        }
+        let s = signals.recv().await;
+        warn!(signal = %s, "second signal during shutdown");
     };
     match bounded_stop(stop, limit, second_signal).await {
         StopOutcome::Clean => {
@@ -1408,7 +1408,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
-        StopOutcome::Failed => Err("shutdown: stopping the node panicked".into()),
+        StopOutcome::Failed(e) => Err(format!("shutdown failed: {e}").into()),
         StopOutcome::TimedOut => {
             Err(format!("shutdown did not finish within {limit:?}; exiting without it").into())
         }
@@ -1416,15 +1416,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Wait for SIGINT or SIGTERM; returns the signal's name.
-async fn shutdown_signal() -> std::io::Result<&'static str> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    Ok(tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
-    })
+/// SIGINT and SIGTERM receivers. Kept for the node's lifetime: a signal
+/// that arrives between two `recv` calls is queued, not lost.
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Wait for the next SIGINT or SIGTERM; returns the signal's name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            Some(()) = self.term.recv() => "SIGTERM",
+            Some(()) = self.int.recv() => "SIGINT",
+            else => std::future::pending().await,
+        }
+    }
 }
 
 /// Pure parse of `TORUS_SHUTDOWN_TIMEOUT_SECS` (default 60; `0` or garbage
@@ -1444,8 +1459,8 @@ fn shutdown_timeout(raw: Option<String>) -> Duration {
 enum StopOutcome {
     /// `stop` returned.
     Clean,
-    /// `stop` panicked.
-    Failed,
+    /// `stop` returned an error or panicked.
+    Failed(String),
     /// `stop` was still running at the limit.
     TimedOut,
     /// `interrupt` finished first (a second signal).
@@ -1456,7 +1471,7 @@ enum StopOutcome {
 /// or until `interrupt` completes. A `stop` still running is left behind (the
 /// caller exits the process).
 async fn bounded_stop(
-    stop: impl FnOnce() + Send + 'static,
+    stop: impl FnOnce() -> Result<(), String> + Send + 'static,
     limit: Duration,
     interrupt: impl std::future::Future<Output = ()>,
 ) -> StopOutcome {
@@ -1464,16 +1479,16 @@ async fn bounded_stop(
     let spawned = std::thread::Builder::new()
         .name("node-shutdown".into())
         .spawn(move || {
-            stop();
-            let _ = tx.send(());
+            let _ = tx.send(stop());
         });
-    if spawned.is_err() {
-        return StopOutcome::Failed;
+    if let Err(e) = spawned {
+        return StopOutcome::Failed(format!("spawn shutdown thread: {e}"));
     }
     tokio::select! {
         done = tokio::time::timeout(limit, rx) => match done {
-            Ok(Ok(())) => StopOutcome::Clean,
-            Ok(Err(_)) => StopOutcome::Failed,
+            Ok(Ok(Ok(()))) => StopOutcome::Clean,
+            Ok(Ok(Err(e))) => StopOutcome::Failed(e),
+            Ok(Err(_)) => StopOutcome::Failed("shutdown thread panicked".into()),
             Err(_) => StopOutcome::TimedOut,
         },
         () = interrupt => StopOutcome::Interrupted,
@@ -1498,13 +1513,18 @@ fn flush_for_shutdown(state_db: &StateDb) -> Result<(), String> {
     )
 }
 
-/// The memtable flush, then the WAL sync.
+/// The memtable flush, then the WAL sync, which runs even when the flush
+/// failed (the WAL is then all a restart has). Either error is returned.
 fn flush_then_sync(
     flush: impl FnOnce() -> Result<(), String>,
     sync: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    flush()?;
-    sync()
+    match (flush(), sync()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(f), Ok(())) => Err(f),
+        (Ok(()), Err(s)) => Err(format!("WAL sync: {s}")),
+        (Err(f), Err(s)) => Err(format!("{f}; WAL sync: {s}")),
+    }
 }
 
 /// Pure parse of `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (default 5; `< 1` or
@@ -1660,20 +1680,17 @@ mod tests {
     /// handled is not lost (the receivers live across both waits).
     #[tokio::test]
     async fn second_sigterm_during_shutdown_is_not_lost() {
-        let first = tokio::spawn(shutdown_signal());
-        tokio::time::sleep(Duration::from_millis(100)).await; // registered
+        let mut signals = ShutdownSignals::new().unwrap();
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-        let got = tokio::time::timeout(Duration::from_secs(5), first)
+        let got = tokio::time::timeout(Duration::from_secs(5), signals.recv())
             .await
-            .expect("first SIGTERM seen")
-            .unwrap()
-            .unwrap();
+            .expect("first SIGTERM seen");
         assert_eq!(got, "SIGTERM");
         // Sent before the shutdown starts waiting for a second signal.
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let second = tokio::time::timeout(Duration::from_secs(2), shutdown_signal()).await;
-        assert!(second.is_ok(), "second SIGTERM lost");
+        let second = tokio::time::timeout(Duration::from_secs(2), signals.recv()).await;
+        assert_eq!(second, Ok("SIGTERM"), "second SIGTERM lost");
     }
 
     #[test]
@@ -1690,17 +1707,25 @@ mod tests {
     async fn bounded_stop_reports_clean_failed_timeout_and_interrupt() {
         let never = std::future::pending::<()>;
         let long = Duration::from_secs(30);
-        assert_eq!(bounded_stop(|| {}, long, never()).await, StopOutcome::Clean);
         assert_eq!(
-            bounded_stop(|| panic!("stop failed"), long, never()).await,
-            StopOutcome::Failed
+            bounded_stop(|| Ok(()), long, never()).await,
+            StopOutcome::Clean
         );
+        assert_eq!(
+            bounded_stop(|| Err("flush failed".into()), long, never()).await,
+            StopOutcome::Failed("flush failed".into())
+        );
+        assert!(matches!(
+            bounded_stop(|| panic!("stop failed"), long, never()).await,
+            StopOutcome::Failed(_)
+        ));
 
         // A hung stop is abandoned at the limit, not waited for.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let t = std::time::Instant::now();
         let hung = move || {
             let _ = release_rx.recv();
+            Ok(())
         };
         let out = bounded_stop(hung, Duration::from_millis(200), never()).await;
         assert_eq!(out, StopOutcome::TimedOut);
@@ -1710,6 +1735,7 @@ mod tests {
         let (release2_tx, release2_rx) = std::sync::mpsc::channel::<()>();
         let hung = move || {
             let _ = release2_rx.recv();
+            Ok(())
         };
         let interrupt = tokio::time::sleep(Duration::from_millis(50));
         let t = std::time::Instant::now();
