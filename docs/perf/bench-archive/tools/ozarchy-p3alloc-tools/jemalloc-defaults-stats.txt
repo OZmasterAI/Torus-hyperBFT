@@ -1,0 +1,205 @@
+___ Begin jemalloc statistics ___
+Version: "5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+Build-time option settings
+  config.cache_oblivious: true
+  config.debug: false
+  config.fill: true
+  config.lazy_lock: false
+  config.malloc_conf: ""
+  config.opt_safety_checks: false
+  config.prof: true
+  config.prof_libgcc: true
+  config.prof_libunwind: false
+  config.prof_frameptr: false
+  config.stats: true
+  config.utrace: false
+  config.xmalloc: false
+System configuration
+  system.thp_mode: "always"
+Run-time option settings
+  Global variable malloc_conf: ""
+  Symbolic link malloc.conf: ""
+  Environment variable MALLOC_CONF: "stats_print:true"
+  opt.abort: false
+  opt.abort_conf: false
+  opt.cache_oblivious: true
+  opt.confirm_conf: false
+  opt.experimental_hpa_start_huge_if_thp_always: true
+  opt.experimental_hpa_enforce_hugify: false
+  opt.retain: true
+  opt.dss: "secondary"
+  opt.narenas: 128
+  opt.percpu_arena: "disabled"
+  opt.oversize_threshold: 8388608
+  opt.hpa: false
+  opt.hpa_slab_max_alloc: 65536
+  opt.hpa_hugification_threshold: 1992294
+  opt.hpa_hugify_delay_ms: 10000
+  opt.hpa_hugify_sync: false
+  opt.hpa_min_purge_interval_ms: 5000
+  opt.experimental_hpa_max_purge_nhp: -1
+  opt.hpa_dirty_mult: "0.25"
+  opt.hpa_purge_threshold: 4096
+  opt.hpa_min_purge_delay_ms: 0
+  opt.hpa_hugify_style: "lazy"
+  opt.hpa_sec_nshards: 2
+  opt.hpa_sec_max_alloc: 32768
+  opt.hpa_sec_max_bytes: 262144
+  opt.hpa_sec_batch_fill_extra: 3
+  opt.huge_arena_pac_thp: false
+  opt.metadata_thp: "disabled"
+  opt.mutex_max_spin: 600
+  opt.background_thread: false (background_thread: false)
+  opt.dirty_decay_ms: 10000 (arenas.dirty_decay_ms: 10000)
+  opt.muzzy_decay_ms: 0 (arenas.muzzy_decay_ms: 0)
+  opt.lg_extent_max_active_fit: 6
+  opt.junk: "false"
+  opt.zero: false
+  opt.experimental_infallible_new: false
+  opt.experimental_tcache_gc: true
+  opt.tcache: true
+  opt.tcache_max: 32768
+  opt.tcache_nslots_small_min: 20
+  opt.tcache_nslots_small_max: 200
+  opt.tcache_nslots_large: 20
+  opt.lg_tcache_nslots_mul: 1
+  opt.tcache_gc_incr_bytes: 65536
+  opt.tcache_gc_delay_bytes: 0
+  opt.lg_tcache_flush_small_div: 1
+  opt.lg_tcache_flush_large_div: 1
+  opt.debug_double_free_max_scan: 0
+  opt.thp: "default"
+  opt.prof: false
+  opt.prof_bt_max: 128
+  opt.prof_prefix: "jeprof"
+  opt.prof_active: true (prof.active: false)
+  opt.prof_thread_active_init: true (prof.thread_active_init: false)
+  opt.lg_prof_sample: 19 (prof.lg_sample: 0)
+  opt.prof_accum: false
+  opt.lg_prof_interval: -1
+  opt.prof_gdump: false
+  opt.prof_final: false
+  opt.prof_leak: false
+  opt.prof_leak_error: false
+  opt.stats_print: true
+  opt.stats_print_opts: ""
+  opt.stats_print: true
+  opt.stats_print_opts: ""
+  opt.stats_interval: -1
+  opt.stats_interval_opts: ""
+  opt.zero_realloc: "free"
+  opt.process_madvise_max_batch: 0
+  opt.disable_large_size_classes: true
+Profiling settings
+  prof.thread_active_init: false
+  prof.active: false
+  prof.gdump: false
+  prof.interval: 0
+  prof.lg_sample: 0
+Arenas: 129
+Quantum size: 16
+Page size: 4096
+Hugepage size: 2097152
+Maximum thread-cached size class: 32768
+Number of bin size classes: 36
+Number of thread-cache bin size classes: 41
+Number of large size classes: 196
+Allocated: 167936, active: 180224, metadata: 6397760 (n_thp 0, edata 768, rtree 786432), resident: 6508544, mapped: 12779520, retained: 1900544
+Count of realloc(non-null-ptr, 0) calls: 0
+Background threads: 0, num_runs: 0, run_interval: 0 ns
+                           n_lock_ops (#/sec)       n_waiting (#/sec)      n_spin_acq (#/sec)  n_owner_switch (#/sec)   total_wait_ns   (#/sec)     max_wait_ns  max_n_thds
+background_thread                   4       0               0       0               0       0               1       0               0         0               0           0
+max_per_bg_thd                      0       0               0       0               0       0               0       0               0         0               0           0
+ctl                                 2       0               0       0               0       0               1       0               0         0               0           0
+prof                                0       0               0       0               0       0               0       0               0         0               0           0
+prof_thds_data                      0       0               0       0               0       0               0       0               0         0               0           0
+prof_dump                           0       0               0       0               0       0               0       0               0         0               0           0
+prof_recent_alloc                   0       0               0       0               0       0               0       0               0         0               0           0
+prof_recent_dump                    0       0               0       0               0       0               0       0               0         0               0           0
+prof_stats                          0       0               0       0               0       0               0       0               0         0               0           0
+arenas[0]:
+name: "auto_0"
+assigned threads: 1
+uptime: 0
+dss allocation precedence: "secondary"
+decaying:  time       npages       sweeps     madvises       purged
+   dirty: 10000            4            0            0            0
+   muzzy:     0            0            0            0            0
+                            allocated         nmalloc   (#/sec)         ndalloc   (#/sec)       nrequests   (#/sec)           nfill   (#/sec)          nflush   (#/sec)
+small:                              0               0         0               0         0               0         0               0         0               0         0
+large:                         167936               3         0               0         0               3         0               3         0               5         0
+total:                         167936               3         0               0         0               3         0               3         0               5         0
+                                     
+active:                        180224
+mapped:                      12779520
+retained:                     1900544
+base:                         6303552
+internal:                       94208
+metadata_edata:                   768
+metadata_rtree:                786432
+metadata_thp:                       0
+tcache_bytes:                       0
+tcache_stashed_bytes:               0
+resident:                     6508544
+abandoned_vm:                       0
+extent_avail:                       0
+                           n_lock_ops (#/sec)       n_waiting (#/sec)      n_spin_acq (#/sec)  n_owner_switch (#/sec)   total_wait_ns   (#/sec)     max_wait_ns  max_n_thds
+large                               2       0               0       0               0       0               1       0               0         0               0           0
+extent_avail                        8       0               0       0               0       0               1       0               0         0               0           0
+extents_dirty                       7       0               0       0               0       0               1       0               0         0               0           0
+extents_muzzy                       2       0               0       0               0       0               1       0               0         0               0           0
+extents_retained                    6       0               0       0               0       0               1       0               0         0               0           0
+decay_dirty                         2       0               0       0               0       0               1       0               0         0               0           0
+decay_muzzy                         2       0               0       0               0       0               1       0               0         0               0           0
+base                              151       0               0       0               0       0               1       0               0         0               0           0
+tcache_list                         4       0               0       0               0       0               1       0               0         0               0           0
+hpa_shard                           0       0               0       0               0       0               0       0               0         0               0           0
+hpa_shard_grow                      0       0               0       0               0       0               0       0               0         0               0           0
+hpa_sec                             0       0               0       0               0       0               0       0               0         0               0           0
+bins:           size ind     allocated       nmalloc (#/sec)       ndalloc (#/sec)      nrequests   (#/sec)  nshards      curregs     curslabs  nonfull_slabs regs pgs   util       nfills (#/sec)     nflushes (#/sec)       nslabs     nreslabs (#/sec)      n_lock_ops (#/sec)       n_waiting (#/sec)      n_spin_acq (#/sec)  n_owner_switch (#/sec)   total_wait_ns   (#/sec)     max_wait_ns  max_n_thds
+                     ---
+large:          size ind    allocated      nmalloc (#/sec)      ndalloc (#/sec)    nrequests (#/sec)  curlextents
+                     ---
+               28672  39        28672            1       0            0       0            1       0            1
+                     ---
+               65536  44        65536            1       0            0       0            1       0            1
+               81920  45        81920            1       0            0       0            1       0            1
+                     ---
+extents:        size ind       ndirty        dirty       nmuzzy        muzzy    nretained     retained       ntotal        total
+                4096   0            1         4096            0            0            0            0            1         4096
+                     ---
+               12288   2            1        12288            0            0            0            0            1        12288
+                     ---
+             2097152  31            0            0            0            0            1      1900544            1      1900544
+                     ---
+Bytes in small extent cache: 0
+Total hits in small extent cache: 0
+Total misses in small extent cache: 0
+Dalloc calls without flush in small extent cache: 0
+Dalloc calls with flush in small extent cache: 0
+sec_fill calls that went over max_bytes: 0
+HPA shard stats:
+  Pageslabs: 0 (0 huge, 0 nonhuge)
+  Active pages: 0 (0 huge, 0 nonhuge)
+  Dirty pages: 0 (0 huge, 0 nonhuge)
+  Retained pages: 0
+  Purge passes: 0 (0 / sec)
+  Purges: 0 (0 / sec)
+  Hugeifies: 0 (0 / sec)
+  Hugify failures: 0 (0 / sec)
+  Dehugifies: 0 (0 / sec)
+
+  In full slabs:
+      npageslabs: 0 huge, 0 nonhuge
+      nactive: 0 huge, 0 nonhuge 
+      ndirty: 0 huge, 0 nonhuge 
+      nretained: 0 huge, 0 nonhuge 
+  In empty slabs:
+      npageslabs: 0 huge, 0 nonhuge
+      nactive: 0 huge, 0 nonhuge 
+      ndirty: 0 huge, 0 nonhuge 
+      nretained: 0 huge, 0 nonhuge 
+  In nonfull slabs:
+                size ind npageslabs_huge    nactive_huge     ndirty_huge  npageslabs_nonhuge     nactive_nonhuge      ndirty_nonhuge   nretained_nonhuge
+                     ---
+--- End jemalloc statistics ---

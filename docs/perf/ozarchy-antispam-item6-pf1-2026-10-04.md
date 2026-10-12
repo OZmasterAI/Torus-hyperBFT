@@ -5748,6 +5748,121 @@ paired fixed-load microbench (section 44.2's `spawnbench.rs` already gives 0.7 m
 Analysis (`tools/ozarchy-p23b-tools/analyst/`): `a-cells.py` / `a-arms.py` (section 48), `p23-spawn.py` and `p23-exited.py`
 (section 44, copied, the empty-fork guard added), `forks.txt`. Outputs in `ozarchy-p23b-run/analyst/` on ozarchy.
 
+## 51. Phase 3 allocator A/B: glibc vs jemalloc on step 2 `7b006739` and main `219f0c20`, commit-tail mode (campaign ozarchy-p3alloc, 2026-10-12)
+
+**jemalloc lowers step 2's RSS and its growth, and step 2 runs faster under it, but the Phase 3 RSS delta stays far above
+the ~270 MB gate under both allocators.** The deltas (step 2 - control) are glibc +1.55 GB peak / +1.08 GB mean and
+jemalloc +0.97 GB peak / +0.71 GB mean. Under jemalloc, step 2's peak RSS is -0.32 GB [-0.53, -0.12] and its growth is
+1.01 vs 1.64 GB/min. Its matched/s is +3.6% [+2.2, +5.0] and its exec wall per native block -13%. Whole-run CPU-s/1M is
+-1.1% [-2.6, +0.5]. On main, jemalloc costs CPU (+1.5% [+0.9, +2.2]) and leaves matched/s and RSS unresolved.
+**Soak winner: jemalloc** (rule and caveat in 51.3).
+All 16 measured cells are valid for throughput. 3 step 2 cells are REJECT on agreement, all from the known mark-only digest artifact (51.4).
+
+Owner request (18c, s112, after section 49): an allocator A/B of section 48's retention question on the next step 2 head,
+then a soak on the winner. Step 2 = `7b006739` (`feat/item6-phase3-step2`: section 49's `51a67f57` + the drop_inline
+counter `43cbcce5` + step 1 with main `219f0c20` merged in + a SIGTERM zero-replay test). Control = main `219f0c20`
+(SIGTERM graceful shutdown, `fix/sigterm-shutdown`), the merge-base of the two, so the control is clean.
+
+Setup: the section 47-50 shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, 120 s
+cells, commit tail, shared NVMe). Nodes: control `219f0c20` (`987f4eb6`), step 2 `7b006739` (`ca388315`, interval
+15 s), both built for this run (`ozarchy-p3next-build`, frame pointers + line tables + mold). Bench `05d44313`, harness
+`bench/summarize-ckpt-timers` `218ad251`. Arms: gm = control glibc, g2 = step 2 glibc, jgm / jg2 = the same binaries
+started through a wrapper that only sets `LD_PRELOAD=/usr/lib/libjemalloc.so.2`. That is system jemalloc 5.3.1, with no
+`MALLOC_CONF` and no `/etc/malloc.conf`, so library defaults (in `ozarchy-p3alloc-tools/jemalloc-defaults-stats.txt`),
+and profiling off. The bench is not preloaded (same bench md5 in every arm). Cells 20:49-22:31 (driver
+`ozarchy-p3alloc-campaign.sh` CAMP=J): w0 (step 2, 60 s, excluded), r1 gm g2 jgm jg2, r2 g2 jgm jg2 gm, r3 jgm jg2 gm g2,
+r4 jg2 gm g2 jgm (n = 4 per arm, rotated). 238 CHECK OK, no CHECK FAIL, no memguard stop, no deaths, the host quiet
+before every cell. **jemalloc check:** in all 8 je cells, `node-preload.txt` shows the preload on all 3 node pids and
+`node-maps-jemalloc.txt` shows `libjemalloc.so.2` mapped in all 3. In all 8 glibc cells, no node has the preload or the
+mapping.
+
+### 51.1 Per arm (n = 4, mean; RSS from cpu.csv, growth from mem-samples.txt over the bench window)
+
+| | gm main glibc | g2 step 2 glibc | jgm main jemalloc | jg2 step 2 jemalloc |
+|---|---|---|---|---|
+| matched/s | 206,597 | 210,835 | 207,822 | 218,439 |
+| native blocks/s | 3.49 | 3.48 | 3.79 | 3.80 |
+| node CPU-s/1M (whole run) | 25.06 | 23.44 | 25.44 | 23.18 |
+| RSS peak / mean GB | 4.12 / 3.52 | 5.67 / 4.60 | 4.38 / 3.58 | 5.34 / 4.29 |
+| RSS growth over the bench window MB/min | 867 | 1,643 | 696 | 1,007 |
+| RSS first / last 15 s of the bench window GB | 1.95 / 4.06 | 1.99 / 5.49 | 2.64 / 4.25 | 2.77 / 5.09 |
+| exec per native block (logs) mean / p50 / p99 ms | 334 / 347 / 665 | 356 / 360 / 719 | 310 / 335 / 605 | 310 / 329 / 607 |
+| exec busy | 0.947 | 0.970 | 0.967 | 0.960 |
+| exec backlog committed - executed (blocks) | 42.5 | 40.9 | 53.4 | 55.7 |
+| bench submit rate (accepted, per s) | 1,163 | 1,163 | 1,317 | 1,331 |
+| fills per native block | 53,957 | 54,765 | 53,886 | 54,025 |
+| engine ms per 1k fills | 3.75 | 3.48 | 3.64 | 3.25 |
+| `checkpoint_settle_wait` / `checkpoint_upkeep` ms per block | 0 / 0 | 23.4 / 1.3 | 0 / 0 | 18.5 / 0.7 |
+| device writes MB/s per validator | 136.1 | 62.6 | 146.0 | 71.7 |
+
+The je r1 cells (r1-jgm, r1-jg2) ran 4.4 native blocks/s with smaller blocks (~46k fills); the other 14 cells ran
+3.4-3.7. That is the sd of the je blocks/s rows (0.4), and no blocks/s difference resolves.
+
+### 51.2 Contrasts (Welch 95% CI; RSS in GB)
+
+| | Phase 3 (s2 - ctl), glibc | Phase 3 (s2 - ctl), jemalloc | allocator (je - glibc), step 2 | allocator (je - glibc), main |
+|---|---|---|---|---|
+| RSS peak | **+1.55 [+1.35, +1.75]** | **+0.97 [+0.66, +1.27]** | **-0.32 [-0.53, -0.12]** | +0.26 [-0.08, +0.60] |
+| RSS mean (whole cpu.csv) | +1.08 [+0.93, +1.23] | +0.71 [+0.42, +1.00] | -0.31 [-0.50, -0.13] | +0.06 [-0.25, +0.37] |
+| RSS mean, bench window (mem-samples) | +0.96 [+0.86, +1.05] | +0.72 [+0.34, +1.10] | +0.8% [-2.0, +3.5] | +7.7% [-4.5, +19.8] |
+| RSS growth GB/min | +0.78 [+0.52, +1.03] | +0.31 [+0.16, +0.46] | **-0.64 [-0.87, -0.40]** | -0.17 [-0.38, +0.03] |
+| matched/s | +2.1% [+0.2, +3.9] | +5.1% [+3.9, +6.3] | **+3.6% [+2.2, +5.0]** | +0.6% [-1.2, +2.4] |
+| node CPU-s/1M, whole run | -6.5% [-7.4, -5.5] | -8.9% [-10.4, -7.4] | **-1.1% [-2.6, +0.5]** | +1.5% [+0.9, +2.2] |
+| node CPU at equal fills (ANCOVA) | -6.4% [-7.1, -5.6] | -8.8% [-10.0, -7.7] | +4.0% [+1.6, +6.3] (extrapolated, see below) | +1.9% [-0.4, +4.1] |
+| exec wall per native block, mean | +6.6% [+2.8, +10.3] | +0.0% [-9.7, +9.8] | -13.1% [-16.3, -9.9] | -7.4% [-16.6, +1.8] |
+| exec p99 | +8.1% [+0.4, +15.7] | +0.4% [-3.8, +4.7] | -15.5% [-22.2, -8.9] | -9.1% [-12.3, -5.9] |
+
+**Against the ~270 MB gate:** Phase 3 costs +1.55 GB peak under glibc and +0.97 GB under jemalloc. Neither CI comes near
+0.27 GB. jemalloc removes ~0.6 GB of the delta (about the glibc retention that section 48 estimated, "about half of each
+Phase 3 delta"). The rest is live heap (section 48.2: view, `L`, and the commit-mode backlog).
+
+**Load caveat:** the jemalloc nodes accept +13-14% more of the bench's offered load (submit rate 1,317-1,331 vs 1,163 per s)
+and carry a larger exec backlog (+11-15 blocks). Over the whole run (including the drain), the je cells execute ~14% more
+fills. The bench-window matched/s gain is +0.6% on main and +3.6% on step 2. The larger backlog under jemalloc works
+against its RSS, so its RSS gain is if anything understated. The ANCOVA "equal fills" line for step 2 extrapolates a
+common slope across that ~14% gap, which is ~10x the within-arm spread of fills (sd ~1-2%), so it depends on the model.
+The whole-run CPU-s/1M (the gate metric of sections 47-50) does not resolve a change.
+
+### 51.3 Soak winner
+
+Rule (the owner's criterion, made explicit): the winner is the allocator with the lower step 2 RSS peak (Welch CI
+excludes 0), provided that neither step 2 matched/s nor step 2 whole-run CPU-s/1M has a 95% CI lying entirely on the
+regression side. If no allocator qualifies, glibc stays (the production default). **jemalloc qualifies:** peak -0.32 GB
+[-0.53, -0.12], matched/s +3.6% [+2.2, +5.0], CPU-s/1M -1.1% [-2.6, +0.5]. Caveats for the owner: (a) on main, jemalloc
+is +1.5% [+0.9, +2.2] CPU-s/1M; (b) the step 2 equal-fills line is +4.0% [+1.6, +6.3], from the extrapolation above;
+(c) jemalloc raises early RSS (first 15 s +0.7-0.8 GB on both binaries) and lowers growth, and the bench-window mean RSS
+is flat (+0.8% [-2.0, +3.5]), so the soak, not these 120 s cells, will show whether the lower slope holds. The soak runs
+with `SOAK_ALLOC=je`.
+
+### 51.4 Digest artifact in 3 step 2 cells
+
+r3-jg2, r3-g2 and r4-g2 are rc 2 REJECT "validator agreement failed". In each, exactly one node differs, and only in the
+5 mark fields (`accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed`, `withdrawable`) of all 50
+accounts (250 fields). Every book, OI and cash line is identical on all 3 nodes (checked). This is the slow-digest mark
+artifact of sections 46-49 (Open, restart path item 3), not a divergence, so their throughput is kept.
+
+| cell | odd node | digest wall s val0 / val1 / val2 | digest heights |
+|---|---|---|---|
+| r3-jg2 | val0 | 38.9 / 41.3 / 40.9 | 1097 / 1098 / 1098 |
+| r3-g2 | val2 | 72.3 / 73.5 / **17.1** | 1267 / 1266 / 1267 |
+| r4-g2 | val2 | 84.9 / 84.9 / **20.6** | 1274 / 1274 / 1273 |
+
+Digest wall per node over all 16 cells (mean, min-max): gm 51.1 s (48-59), jgm 42.0 s (25-56), jg2 40.2 s (24-54),
+g2 57.3 s (17-95). **The step 2 digest is not systematically slower. Under glibc it is bimodal**: r2-g2 ran 17-19 s on
+all nodes, r1-g2 92-95 s, and r3-g2 / r4-g2 split 17-21 s vs 72-85 s within the cell. A within-cell spread of 56-64 s is
+what produces the mark DISAGREE (the odd node reads the accounts at a different time after the oracle pause). The other
+13 cells spread 0.4-8 s. r3-jg2 is the exception: its spread is 2.4 s, and its odd node is the one that sits 1 block lower
+(1097). 0 of 8 control cells disagree; 3 of 8 step 2 cells do.
+
+**Verdict:** under either allocator, Phase 3's RAM cost is ~1-1.5 GB at 120 s against a ~270 MB bound, so the gate's RAM
+line is not met. jemalloc takes ~0.6 GB of retention off step 2 and lowers its growth by 39%, and does not cost step 2
+matched/s or whole-run CPU-s/1M. It does cost ~1.5% CPU on main. Phase 3's CPU and write wins hold under both allocators
+(CPU-s/1M -6.5% / -8.9%, writes -54% / -51%). Next: the soak (`SOAK_ALLOC=je`, 600 s per arm), to see whether step 2's
+RSS levels off.
+
+Analysis (`tools/ozarchy-p3alloc-tools/analyst/`): `a-cells.py` / `a-arms.py` (section 48, unchanged), `a-archive.py`,
+`digest.txt` (per node digest wall / height / digest). Outputs in `ozarchy-p3alloc-run/analyst/` on ozarchy.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -5809,6 +5924,13 @@ Analysis (`tools/ozarchy-p23b-tools/analyst/`): `a-cells.py` / `a-arms.py` (sect
   merge-base. **Gate rerun (section 49, `51a67f57` vs `8efcb07a`):** CPU-s/1M -7.0% (-6.8% at equal fills), writes -51%,
   matched/s +2.9% [-3.1, +8.9] (tie), native blocks/s -5.5% [-10.4, -0.7], RSS +1.55 GB peak: RAM and blocks/s not met.
   The DISAGREE verdicts are the known slow-digest mark artifact (control too), not a divergence.
+- **Phase 3 RAM: allocator A/B done, gate still not met** (section 51, plan review log row 56). Step 2 `7b006739` vs
+  main `219f0c20`, glibc and jemalloc 5.3.1 (LD_PRELOAD, defaults), commit tail, n = 4: the Phase 3 RSS delta is +1.55 GB
+  peak under glibc and +0.97 GB under jemalloc (bound ~270 MB). jemalloc on step 2: peak -0.32 GB [-0.53, -0.12], growth
+  1.64 -> 1.01 GB/min, matched/s +3.6% [+2.2, +5.0], CPU-s/1M -1.1% [-2.6, +0.5]; on main it costs +1.5% [+0.9, +2.2]
+  CPU-s/1M. Soak winner: jemalloc (soak 600 s per arm, `SOAK_ALLOC=je`). Owner: whether to ship jemalloc (a global
+  allocator or a packaging preload) is a separate decision. 3 of 8 step 2 cells hit the mark-only digest artifact (0 of 8
+  control): the glibc step 2 digest is bimodal (17-21 s or 72-95 s per node).
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
   trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
   it is decided again by a tw vs tw + WAL compression A/B after Phase 3. Section 40 (n = 4, vs b
