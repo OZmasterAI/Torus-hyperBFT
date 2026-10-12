@@ -543,6 +543,13 @@ fn read_passphrase_stdin() -> String {
     buf.trim().to_string()
 }
 
+/// R19: load the genesis file; a malformed or ambiguous genesis refuses to
+/// start, naming the file.
+fn load_genesis(path: &std::path::Path) -> Result<Genesis, String> {
+    Genesis::from_file(path)
+        .map_err(|e| format!("refusing to start: genesis {}: {e}", path.display()))
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Validate pruning flags
     let pruner_settings = pruner_config(&cli)?;
@@ -603,9 +610,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Genesis initialization
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
-        // R19: a malformed or ambiguous genesis refuses to start, naming the file.
-        let genesis = Genesis::from_file(genesis_path)
-            .map_err(|e| format!("refusing to start: genesis {}: {e}", genesis_path.display()))?;
+        let genesis = load_genesis(genesis_path)?;
         let config = genesis.chain_config();
 
         // Only initialize if DB is empty (first run)
@@ -1504,6 +1509,49 @@ fn install_fail_stop_panic_hook(exit: fn(i32)) {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// R19 follow-up (owner s112): a genesis with a duplicate validator or an
+    /// address in both accounts[] and evm_alloc refuses to start, naming the
+    /// file and the address.
+    #[test]
+    fn r19_node_refuses_genesis_with_duplicate_validator_or_overlap() {
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../../../devnet/genesis.json")).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("genesis.json");
+        std::fs::write(&path, base.to_string()).unwrap();
+        load_genesis(&path).expect("the tracked devnet genesis loads");
+
+        let v0 = base["validators"][0].clone();
+        let v0_addr = v0["address"].as_str().unwrap().to_lowercase();
+        let mut dup_validator = base.clone();
+        let mut dup = v0.clone();
+        dup["pubkey"] = "0x3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29".into();
+        dup_validator["validators"]
+            .as_array_mut()
+            .unwrap()
+            .push(dup);
+
+        let overlap_addr = "0xcccccccccccccccccccccccccccccccccccccccc";
+        let mut overlap = base.clone();
+        overlap["evm_alloc"] = serde_json::json!({ overlap_addr: { "balance": "0x1" } });
+        overlap["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "address": overlap_addr, "balance": "1" }));
+
+        for (json, addr) in [
+            (dup_validator, v0_addr),
+            (overlap, overlap_addr.to_string()),
+        ] {
+            std::fs::write(&path, json.to_string()).unwrap();
+            let err = load_genesis(&path).expect_err("refused").to_string();
+            assert!(err.starts_with("refusing to start: genesis "), "{err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(err.contains("duplicate"), "{err}");
+            assert!(err.contains(&addr), "names {addr}: {err}");
+        }
+    }
 
     /// R01b A: a panic on a listed thread calls the injected exit with 70; a
     /// panic on an unlisted thread (incl. `torus-async-validate`, which is fed

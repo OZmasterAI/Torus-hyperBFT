@@ -1331,6 +1331,107 @@ mod tests {
         }
     }
 
+    /// R19 follow-up (owner s112): an address in both accounts[] and
+    /// evm_alloc (any spelling) is refused at load, naming the address,
+    /// instead of evm_alloc silently overwriting the account.
+    #[test]
+    fn address_in_both_accounts_and_evm_alloc_is_refused() {
+        let alloc = "0xcccccccccccccccccccccccccccccccccccccccc";
+        for spelling in [
+            alloc,
+            "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        ] {
+            let json = genesis_with(|v| {
+                v["accounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({ "address": spelling, "balance": "7" }))
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{spelling}: {err}");
+            assert!(err.contains(alloc), "names the address: {err}");
+            assert!(
+                err.contains("accounts") && err.contains("evm_alloc"),
+                "names both lists: {err}"
+            );
+        }
+    }
+
+    /// R19 follow-up (owner s112): two validators with the same address (any
+    /// spelling; CF_STAKING_VALIDATORS is keyed by it) are refused at load,
+    /// naming the address.
+    #[test]
+    fn duplicate_validator_address_is_refused() {
+        let addr = "0x1111111111111111111111111111111111111111";
+        for spelling in [addr, "1111111111111111111111111111111111111111"] {
+            let json = genesis_with(|v| {
+                let vals = v["validators"].as_array_mut().unwrap();
+                let mut dup = vals[0].clone();
+                dup["address"] = spelling.into();
+                dup["pubkey"] =
+                    "0x3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29".into();
+                vals.push(dup);
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{spelling}: {err}");
+            assert!(err.contains("validator"), "{err}");
+            assert!(err.contains(addr), "names the address: {err}");
+        }
+    }
+
+    /// R19 follow-up (owner s112): two validators with the same consensus key
+    /// (any hex case) are refused at load, naming the key.
+    #[test]
+    fn duplicate_validator_pubkey_is_refused() {
+        let key = "0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa3f4a18446b7e8f5f7a1d6";
+        for spelling in [
+            key.to_string(),
+            format!("0x{}", key[2..].to_uppercase()),
+            key[2..].to_string(),
+        ] {
+            let json = genesis_with(|v| {
+                let vals = v["validators"].as_array_mut().unwrap();
+                let mut dup = vals[0].clone();
+                dup["address"] = "0x2222222222222222222222222222222222222222".into();
+                dup["pubkey"] = spelling.clone().into();
+                vals.push(dup);
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{spelling}: {err}");
+            assert!(err.contains("validator"), "{err}");
+            assert!(err.contains(key), "names the key: {err}");
+        }
+    }
+
+    /// R19 follow-up: initialize() refuses an edited Genesis with a
+    /// duplicate validator or an accounts/evm_alloc overlap before any write.
+    #[test]
+    fn initialize_refuses_duplicate_validator_or_overlap_before_any_write() {
+        use torus_state::StateBackend;
+        let base = Genesis::from_json(&sample_genesis_json()).unwrap();
+        let mut dup_validator = base.clone();
+        let mut v = dup_validator.validators[0].clone();
+        v.pubkey = "0x3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29".into();
+        dup_validator.validators.push(v);
+        let mut overlap = base.clone();
+        overlap.accounts.push(GenesisAccount {
+            address: "0xcccccccccccccccccccccccccccccccccccccccc".into(),
+            balance: "1".into(),
+            note: None,
+        });
+        for genesis in [dup_validator, overlap] {
+            let dir = TempDir::new().unwrap();
+            let db = StateDb::open(dir.path()).unwrap();
+            let err = genesis.initialize(&db).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{err}");
+            assert!(
+                db.all_accounts().unwrap().is_empty(),
+                "refused before any write"
+            );
+        }
+    }
+
     /// R19: a Genesis built without from_json (fields edited after load) is
     /// still checked by initialize() before the first write.
     #[test]
