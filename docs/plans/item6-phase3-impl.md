@@ -320,6 +320,9 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   main `219f0c20`, 8 + 4 SIGTERM kills: replay 0 every time, no forced stop, state agrees; exit 7.0 s mean / 10.7 s max
   (exec-queue drain; checkpoint flush share ~0.15 s); kill -> first commit max 59.8 s (gate 60 s met; the slow kill is
   the gossipsub resubscribe stall, both arms).
+- **Soak** (campaign `ozarchy-p3soak`, results doc section 53, plan-2 row 58): step 2 `7b006739` vs main `219f0c20`, glibc,
+  600 s each: step 2 RSS still +40-67 MB/min per node at 10 min (main +3-11), Phase 3 delta +1.98 GB per node at 10 min:
+  no plateau (growth finding). Cancel-all expiry hits both arms from minute 2 (~18k per node), matched/s -30% from minute 6.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

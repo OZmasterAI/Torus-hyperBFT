@@ -52,6 +52,7 @@ out of 8.69 GiB in the 211 inventoried dirs.
 **Added `p23b` (2026-10-12, after p23b finished and was analysed): Tier A 107.7 MiB (112,907,432 bytes, 4 files: the `perf.data` of the x cells; fork counts and site tables kept in `ozarchy-p23b-run/analyst/forks.txt` / `p23-spawn-pk.txt`); Tier B 350.8 MiB (367,807,676 bytes, 78 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 13 cell dirs; the u cells' `tasks.txt` is the source of the exited-thread sys row of section 50.2, its figures are in the doc); A + B 458.4 MiB**, out of 599.7 MiB in its 15 dirs. Its binaries live in `ozarchy-p3rss-stage` (block `p3rss`).
 **Added `p3alloc` (2026-10-12, after p3alloc finished and was analysed): Tier A 4.37 GiB (4,689,334,696 bytes, 9 files: the staged nodes and bench in `ozarchy-p3next-stage/{b,m,g2,m-run,g2-run,m-je,g2-je}/release/`, rebuildable from `219f0c20` / `7b006739` / `8efcb07a`; most are btrfs reflinks; **keep until the `ozarchy-p3term` and soak write-ups are done**, they run from this stage); Tier B 465.5 MiB (488,160,549 bytes, 102 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 17 cell dirs); A + B 4.82 GiB**, out of 4.94 GiB in its 22 dirs (section 51 of the ozarchy doc). The cells' `mem-samples.txt`, `state-digest-val*.txt`, `node-preload.txt` / `node-maps-jemalloc.txt` and `ozarchy-p3alloc-run/analyst/` are the source of section 51 (keep).
 **Added `p3term` (2026-10-12, after p3term finished and was analysed): Tier A none (the binaries are in `ozarchy-p3next-stage`, block `p3alloc`); Tier B 173.3 MiB (181,719,514 bytes, 24 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 4 cell dirs; val1's shutdown and restart lines are also in `crash-restart-tail*.log`, kept)**, out of 248.6 MiB in its 6 dirs (section 52 of the ozarchy doc).
+**Added `p3soak` (2026-10-13, after p3soak finished and was analysed): Tier A none (the binaries are in `ozarchy-p3next-stage`, block `p3alloc`); Tier B 129.7 MiB (136,014,713 bytes, 18 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 3 cell dirs)**, out of 178.2 MiB in its 4 dirs (section 53 of the ozarchy doc). `sampler.csv` of k1-ctl / k1-s2 is the source of the per-minute matched/s and mempool size of section 53.2 (its figures are in the doc).
 
 ## Per campaign
 
@@ -2958,6 +2959,7 @@ rm -- \
 * Added `p23b` (2026-10-12): Tier A **0.11 GiB** (112,907,432 bytes), 4 files; Tier B **0.34 GiB** (367,807,676 bytes), 78 files; A + B **0.45 GiB** (480,715,108 bytes), out of 0.59 GiB in its 15 dirs
 * Added `p3alloc` (2026-10-12): Tier A **4.37 GiB** (4,689,334,696 bytes), 9 files; Tier B **0.45 GiB** (488,160,549 bytes), 102 files; A + B **4.82 GiB** (5,177,495,245 bytes), out of 4.94 GiB in its 22 dirs
 * Added `p3term` (2026-10-12): Tier A **0.00 GiB** (0 bytes), 0 files; Tier B **0.17 GiB** (181,719,514 bytes), 24 files; A + B **0.17 GiB** (181,719,514 bytes), out of 0.24 GiB in its 6 dirs
+* Added `p3soak` (2026-10-13): Tier A **0.00 GiB** (0 bytes), 0 files; Tier B **0.13 GiB** (136,014,713 bytes), 18 files; A + B **0.13 GiB** (136,014,713 bytes), out of 0.17 GiB in its 4 dirs
 
 ### `p3s` (A 94.9 MiB, B 14231.7 MiB; dirs: `ozarchy-p3s-300m-tw-c1`, `ozarchy-p3s-300m-tw-c2`, `ozarchy-p3s-300m-tw-c3` ...)
 
@@ -4374,4 +4376,30 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3term-300m-t2-s-TERM/val0.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3term-300m-t2-s-TERM/val1.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3term-300m-t2-s-TERM/val2.log.gz'
+### `p3soak` (A 0 KiB, B 129.7 MiB; dirs: `ozarchy-p3soak-300m-w0`, `ozarchy-p3soak-300m-k1-ctl`, `ozarchy-p3soak-300m-k1-s2`, `ozarchy-p3soak-run`)
+
+The cells' `summary.json`, `mem-samples.txt`, `cpu-ticks.txt`, `cpu.csv`, `state-digest-val*.txt`, `run.log` and `ozarchy-p3soak-run/analyst/` are what section 53 is built on (keep).
+
+Tier B, 129.7 MiB, 18 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-w0/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-w0/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-w0/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-w0/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-w0/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-w0/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-ctl/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-ctl/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-ctl/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-ctl/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-ctl/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-ctl/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-s2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-s2/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-s2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-s2/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-s2/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3soak-300m-k1-s2/val2.log.gz'
 ```

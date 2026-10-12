@@ -6000,6 +6000,74 @@ start restart in the harness, or explicit gossipsub peers).
 
 Analysis (`tools/ozarchy-p3term-tools/`): `a-term.py` (section 46's `a-restart.py` + the shutdown phases and exit
 times), output `ozarchy-p3term-run/analyst/a-term.txt`; `matched-bench/crash-kill.sh` (patched).
+## 53. Phase 3 soak: step 2 `7b006739` vs main `219f0c20`, 600 s per arm, glibc, commit-tail mode (campaign ozarchy-p3soak, 2026-10-12)
+
+**Step 2's RSS does not level off within 10 min: it still grows +40 to +67 MB/min per node over the last 5 min (95% CIs
+exclude 0: GROWTH FINDING).** Main grows +3 to +11 MB/min (2 of 3 node CIs exclude 0, a smaller GROWTH FINDING on the
+control). The Phase 3 delta at 10 min is +1.98 GB per node (mean of 3; +1.67 to +2.27). It is larger than the +1.55 GB
+peak of the 120 s cells, and ~7x the ~270 MB gate. **The load generator degrades in both arms after ~5 min:** cancel-all /
+nonce-window expiry starts at minute 2 (~18k actions per node per cell, both arms) and matched/s drops from ~200k to
+~135k. The last-5-min numbers are therefore at ~30% less load than the first 5 min.
+
+Owner request (via 18c, s112): a fixed 10 min soak per arm on the section 51 winner (glibc), with no extensions, to see
+whether step 2's RSS levels off. Setup: the section 51 shape (tw, Classic, 300 markets, standard shape, MAX_IN_FLIGHT 4,
+budget 900, commit tail, shared NVMe), nodes control `219f0c20` (`987f4eb6`) and step 2 `7b006739` (`ca388315`, interval
+15 s), bench `05d44313`, harness `218ad251`. Driver `ozarchy-p3alloc-campaign.sh` CAMP=S SOAK_ALLOC=glibc. Cells 23:32-00:05:
+w0 (control, 60 s, excluded), k1-ctl (600 s), k1-s2 (600 s). 42 CHECK OK, no CHECK FAIL, no memguard stop (host
+MemAvailable stayed >= ~32 GB), no deaths, the host quiet before every cell. k1-ctl is ACCEPT, AGREE. k1-s2 is rc 2 REJECT on
+agreement only, from the mark-only digest artifact: val2's digest took 17.1 s vs 64.8 / 67.6 s, the 5 mark fields differ
+on 50 accounts (`withdrawable` on 38), and books, OI and cash are identical. Liveness PASS.
+
+### 53.1 RSS per node (VmRSS from mem-samples.txt, 5 s; bench window 603 s)
+
+| | node | RSS @ 5 min MB | RSS @ 10 min MB | peak MB | slope, last 5 min MB/min (95% CI) | slope, whole window MB/min |
+|---|---|---|---|---|---|---|
+| main | val0 | 3,760 | 3,796 | 3,835 | +3.3 [-4.2, +10.8] | +81 |
+| main | val1 | 3,907 | 3,950 | 4,032 | **+11.1 [+5.5, +16.7]** | +95 |
+| main | val2 | 4,712 | 4,769 | 4,788 | **+6.4 [+2.3, +10.5]** | +113 |
+| step 2 | val0 | 5,663 | 6,070 | 6,070 | **+63.1 [+14.6, +111.6]** (n_eff 3) | +195 |
+| step 2 | val1 | 5,559 | 5,934 | 5,934 | **+67.3 [+47.1, +87.4]** | +182 |
+| step 2 | val2 | 6,338 | 6,442 | 6,660 | **+39.8 [+19.1, +60.5]** | +207 |
+| **Phase 3 delta** | mean | **+1.73 GB** | **+1.98 GB** | +2.00 GB | +50 MB/min | |
+
+Slope CIs: OLS over the 5 s samples, with the standard error widened by an AR(1) effective sample size (lag-1 residual
+autocorrelation 0-0.9). val0 of step 2 has n_eff 3, so its CI is wide. The cpu.csv definition of sections 47-51 gives
+RSS peak / mean 4.31 / 4.04 GB (main) and 6.36 / 5.69 GB (step 2). Step 2's checkpoints: 54 per node (one per ~11 s), mean layer
+96 MB per checkpoint.
+
+### 53.2 Throughput, CPU and the load generator
+
+| | main | step 2 |
+|---|---|---|
+| matched/s whole window / last 5 min | 168,384 / 139,804 | 172,911 / 141,893 |
+| matched/s per minute (min 1-10) | 191k 211k 202k 191k 188k 165k 132k 139k 135k 134k | 196k 218k 212k 199k 193k 162k 139k 138k 138k 133k |
+| matched/s drift (OLS over the 10 minutes, per min) | -9.4k [-13.7k, -5.1k] | -10.3k [-15.5k, -5.1k] |
+| node CPU-s/1M whole run / last 5 min (cpu-ticks) | 30.35 / 36.35 | 28.47 / 35.00 |
+| native blocks/s | 2.95 | 3.03 |
+| exec per native block mean ms, exec busy | 324, 0.89 | 327, 0.92 |
+| exec backlog mean (blocks) | 27 | 28 |
+| nonce-expired evictions per node | 17,956 (x3) | 18,615 / 18,615 / 18,694 |
+| bench: released on commit / by 70 s timeout / refused | 659,030 / 17,956 / 1 | 679,956 / 17,378 / 67 |
+| bench tail errors / missed | 0 / 0 | 0 / 0 |
+
+Expiry per minute (val0 log, `evicted nonce-expired`): main 0, 0, 2.9k, 3.3k, 1.1k, 3.3k, 2.3k, 2.6k, 2.2k, 0.3k; step 2 0,
+0, 3.4k, 3.6k, 2.4k, 3.4k, 1.2k, 2.0k, 1.4k, 0.8k. Every expired action holds its sender's in-flight slot until the
+bench's 70 s timeout. Matched/s falls from minute 6, after ~4 min of expiry, while the exec queue drains to 0-5 blocks
+(the chain is no longer exec-bound) and the mempool holds 2.7-7.9k actions. So the **soak load degrades by itself, on main as
+much as on step 2**: this is the cancel-all expiry of sections 47-49 (sender-ordered cancel share), which reproduces on
+main once the run passes ~2 min. It also explains the higher last-5-min CPU-s/1M (fixed per-block CPU over fewer fills).
+Phase 3 at the soak: CPU-s/1M -6.2% whole run, -3.7% over the last 5 min; matched/s +2.7% / +1.5% (single cells, no CI).
+
+**Verdict:** within 10 min, step 2's RSS does not reach a plateau. It is still rising +40-67 MB/min per node at 10 min,
+while main's growth is down to +3-11 MB/min, and the Phase 3 delta is +1.98 GB at 10 min. That is a **GROWTH FINDING
+for 18c**, with two caveats. (a) The last 5 min ran at ~30% lower matched/s in both arms (load-generator expiry). (b) The
+slope is ~1/30 of the 120 s cells' growth (1.64 GB/min). A longer run would show whether it flattens, but per the owner's
+rule it was not extended. The cancel-all expiry also hits main in long cells, so the cancel-share fix A/B has a control
+that reproduces it.
+
+Analysis (`tools/ozarchy-p3soak-tools/analyst/`): `a-soak.py` (RSS at 5 / 10 min, last-5-min slopes with AR(1)-widened CIs,
+per-minute matched/s and drift, last-5-min CPU-s/1M, ingest health), `a-cells.py` (section 48); outputs `soak.txt`,
+`cells.json` in `ozarchy-p3soak-run/analyst/` on ozarchy.
 
 ## Open
 
@@ -6075,6 +6143,10 @@ times), output `ozarchy-p3term-run/analyst/a-term.txt`; `matched-bench/crash-kil
   verdict uses CPU at equal fills: step 2 +4.0% [+1.6, +6.3] -> soak winner glibc (`SOAK_ALLOC=glibc`). Owner: whether to ship jemalloc (a global
   allocator or a packaging preload) is a separate decision. 3 of 8 step 2 cells hit the mark-only digest artifact (0 of 8
   control): the glibc step 2 digest is bimodal (17-21 s or 72-95 s per node).
+- **Phase 3 soak: GROWTH FINDING (18c)** (section 53, plan review log row 58). Step 2 `7b006739` vs main `219f0c20`, glibc,
+  600 s each, commit tail: step 2 RSS still +40 to +67 MB/min per node over the last 5 min (CIs exclude 0), main +3 to +11
+  (2 of 3 CIs exclude 0); Phase 3 delta +1.98 GB per node at 10 min (gate ~270 MB). Both arms lose ~30% matched/s from
+  minute 6: cancel-all nonce-window expiry (~18k per node per cell) starts at minute 2 **on main too**.
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
   trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
   it is decided again by a tw vs tw + WAL compression A/B after Phase 3. Section 40 (n = 4, vs b
