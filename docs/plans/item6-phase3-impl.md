@@ -132,6 +132,13 @@ CPU-s/1M -5.2% (shared NVMe) / -4.8% (tmpfs): the CPU saving is work removed. ma
 native blocks/s +14.0% / +1.6%: most of the blocks/s gain was disk contention. Inference: a validator with its own disk lands
 between the two (about +3% to +6% matched/s, ~5% less CPU-s/1M; a blocks/s gain above +2% only on a busy disk).
 
+**Step 1 measured (campaign `ozarchy-p3c1`, 2026-10-11):** results doc section 45, review log row 50. `7c178637`, interval 15 s, vs
+`2725e321`, shared NVMe and tmpfs (upper bound), n = 4. CPU-s/1M -7.9% / -8.3% (gate met), native blocks/s +96% / +86% (met),
+matched/s -7.0% / -10.6%: the bench's in-flight release follows `eth_blockNumber`, which step 1 advances only at checkpoints
+(every 100 blocks), so offered load falls 13-16%. The matched/s gate is not decidable before step 2. Checkpoints fire at the
+100-block attest height (94%), not at 15 s; layer_shared 0. Restart and crash not measured there; they ride along
+with the step 2 bench. Also valid for `a44bdde6` (byte-cap fix only; `TORUS_CHECKPOINT_MAX_BYTES` unset in the bench).
+
 **Stop rule:** if the CPU ceiling on tw is below ~5% (gate -6% unreachable), the owner decides
 before step 1. The options are: build anyway for the disk and W-ceiling gains with a lower gate,
 or drop Phase 3.
