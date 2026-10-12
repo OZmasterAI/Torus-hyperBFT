@@ -133,6 +133,10 @@ pub enum FailureReason {
     /// Row 50: a stop whose trigger is on the wrong side of the last trade
     /// (HL `badTriggerPxRejected`).
     BadTriggerPx = 14,
+    /// s114: a placement whose client order id (cloid) is already used by
+    /// one of its trader's open orders (resting or pending stop, any
+    /// market). Not an HL `*Rejected` status: recorded `Failed`.
+    DuplicateCloid = 15,
 }
 
 impl FailureReason {
@@ -153,6 +157,7 @@ impl FailureReason {
             12 => Self::MarketNoLiquidity,
             13 => Self::FokCancel,
             14 => Self::BadTriggerPx,
+            15 => Self::DuplicateCloid,
             _ => Self::Other,
         }
     }
@@ -175,6 +180,7 @@ impl FailureReason {
             Self::MarketNoLiquidity => "market_no_liquidity",
             Self::FokCancel => "fok_cancel",
             Self::BadTriggerPx => "bad_trigger_px",
+            Self::DuplicateCloid => "duplicate_cloid",
         }
     }
 
@@ -223,6 +229,9 @@ impl FailureReason {
             Self::Lot => "order rejected: quantity below the lot size",
             Self::Price => "order rejected: price must be positive",
             Self::Tick => "order rejected: price is not a multiple of the tick",
+            Self::DuplicateCloid => {
+                "order rejected: client order id is already used by an open order"
+            }
             _ => "order rejected by the book",
         }
     }

@@ -739,7 +739,9 @@ impl NativePool {
 pub fn is_cancel(action: &NativeAction) -> bool {
     matches!(
         action,
-        NativeAction::CancelOrder { .. } | NativeAction::CancelAllOrders { .. }
+        NativeAction::CancelOrder { .. }
+            | NativeAction::CancelAllOrders { .. }
+            | NativeAction::CancelByCloid { .. }
     )
 }
 
@@ -855,6 +857,15 @@ mod tests {
         assert_eq!(pool.seen.len(), 4);
         assert_eq!(pool.hash_index.values().map(Vec::len).sum::<usize>(), 4);
         assert!(pool.sender_counts.values().all(|&count| count == 1));
+    }
+
+    /// s114: a cancel by cloid sorts and is admitted like any cancel.
+    #[test]
+    fn cancel_by_cloid_is_a_cancel() {
+        assert!(is_cancel(&NativeAction::CancelByCloid {
+            market_id: 1,
+            cloid: 7,
+        }));
     }
 
     #[test]

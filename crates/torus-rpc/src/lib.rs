@@ -1460,7 +1460,7 @@ mod tests {
                     order_type: torus_types::OrderType::Limit,
                     time_in_force: torus_types::TimeInForce::GTC,
                     reduce_only: false,
-                    client_order_id: Some(i as u64),
+                    client_order_id: Some(i as u128),
                 })
                 .collect();
             let signed = torus_types::eip712::sign_native_action(
@@ -1591,7 +1591,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let order = |i: usize, coid: Option<u64>| torus_types::PlaceOrderParams {
+        let order = |i: usize, coid: Option<u128>| torus_types::PlaceOrderParams {
             market_id: 1,
             is_buy: i % 2 == 0,
             price: torus_types::FixedPoint::from_raw(1_000_000_000 + i as i128),
@@ -1606,7 +1606,7 @@ mod tests {
             // Option::None exercises the human-readable/binary serde split.
             torus_types::NativeAction::PlaceOrder(order(0, None)),
             torus_types::NativeAction::PlaceOrderBatch(
-                (0..500).map(|i| order(i, Some(i as u64))).collect(),
+                (0..500).map(|i| order(i, Some(i as u128))).collect(),
             ),
             torus_types::NativeAction::CancelOrder { order_id: 7 },
             torus_types::NativeAction::ModifyOrder {
@@ -3315,7 +3315,7 @@ mod tests {
                 order_type: torus_types::OrderType::Limit,
                 time_in_force: torus_types::TimeInForce::GTC,
                 reduce_only: false,
-                client_order_id: Some(i as u64),
+                client_order_id: Some(i as u128),
             })
             .collect();
         let signed = torus_types::eip712::sign_native_action(

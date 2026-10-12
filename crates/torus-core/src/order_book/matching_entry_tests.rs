@@ -37,6 +37,7 @@ impl OrderBook {
                         &mut ro_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.cloids,
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
@@ -77,6 +78,7 @@ impl OrderBook {
                         &mut ro_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.cloids,
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
@@ -130,7 +132,7 @@ fn order(id: u128, trader: u8, side: Side, price: i128, qty: i128) -> Order {
         time_in_force: TimeInForce::GTC,
         timestamp: 17,
         reduce_only: false,
-        client_order_id: Some(id as u64),
+        client_order_id: Some(id as u128),
     }
 }
 

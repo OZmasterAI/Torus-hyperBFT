@@ -17,7 +17,7 @@ use std::io::{self, Read as IoRead, Write as IoWrite};
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_types::{
-    Address, FixedPoint, MarketId, OrderId, OrderType, PlaceOrderParams, Side, TimeInForce,
+    Address, Cloid, FixedPoint, MarketId, OrderId, OrderType, PlaceOrderParams, Side, TimeInForce,
 };
 
 use crate::error::CoreError;
@@ -105,7 +105,8 @@ pub struct Order {
     pub time_in_force: TimeInForce,
     pub timestamp: u64,
     pub reduce_only: bool,
-    pub client_order_id: Option<u64>,
+    /// s114: u128 (16 bytes in the row); see [`OrderBook::order_id_by_cloid`].
+    pub client_order_id: Option<Cloid>,
 }
 
 /// A fill (execution) between a maker and taker order.
@@ -1013,26 +1014,34 @@ pub enum OrderStatus {
     PendingTrigger,
 }
 
-/// A pending stop order awaiting trigger.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct StopOrder {
-    id: OrderId,
-    trader: Address,
-    market_id: MarketId,
-    side: Side,
-    trigger_price: FixedPoint,
-    limit_price: Option<FixedPoint>,
+/// A pending stop order awaiting trigger (s114: public read access for
+/// cancel-by-id / by-cloid and the RPC lookup).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StopOrder {
+    pub id: OrderId,
+    pub trader: Address,
+    pub market_id: MarketId,
+    pub side: Side,
+    pub trigger_price: FixedPoint,
+    pub limit_price: Option<FixedPoint>,
     /// s515: a StopMarket's slippage cap (worst acceptable price) — the
     /// placed order's `params.price`. ZERO for StopLimit (its limit is the
     /// cap) and for legacy rows persisted before caps existed (such a stop
     /// is rejected at trigger time: a market order needs a positive cap).
-    price_cap: FixedPoint,
-    quantity: FixedPoint,
-    time_in_force: TimeInForce,
-    timestamp: u64,
-    reduce_only: bool,
-    client_order_id: Option<u64>,
+    pub price_cap: FixedPoint,
+    pub quantity: FixedPoint,
+    pub time_in_force: TimeInForce,
+    pub timestamp: u64,
+    pub reduce_only: bool,
+    pub client_order_id: Option<Cloid>,
+}
+
+impl StopOrder {
+    /// The price its triggered order carries (the limit, else the cap) —
+    /// the price its margin reservation was taken at.
+    pub fn reservation_price(&self) -> FixedPoint {
+        self.limit_price.unwrap_or(self.price_cap)
+    }
 }
 
 /// Internal: where an order lives in the book.
@@ -1177,6 +1186,11 @@ pub struct OrderBook {
     trader_orders: HashMap<Address, TraderOrders>,
     /// Pending stop orders.
     pending_stops: Vec<StopOrder>,
+    /// s114: `(trader, cloid) -> id` of every resting order and pending stop
+    /// that carries a cloid — exactly those (`verify_invariants`). Kept by
+    /// every path that adds or removes one; derived from the orders and
+    /// stops (rebuilt on load), never serialized or hashed.
+    cloids: HashMap<(Address, Cloid), OrderId>,
     pub tick_size: FixedPoint,
     pub lot_size: FixedPoint,
     next_id: OrderId,
@@ -1282,6 +1296,7 @@ impl OrderBook {
             order_index: HashMap::default(),
             trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
+            cloids: HashMap::default(),
             tick_size,
             lot_size,
             next_id: 1,
@@ -1361,6 +1376,15 @@ impl OrderBook {
         let order_id = self.alloc_id();
         let side = if params.is_buy { Side::Buy } else { Side::Sell };
 
+        // s114: one live order per (trader, cloid) in this book (the
+        // executor applies the rule across books before the book).
+        if params
+            .client_order_id
+            .is_some_and(|c| self.cloids.contains_key(&(trader, c)))
+        {
+            return PlaceResult::rejected(order_id, FailureReason::DuplicateCloid);
+        }
+
         // Dust order rejection (2.1b.2): qty must be >= lot_size
         if params.quantity < self.lot_size {
             return PlaceResult::rejected(order_id, FailureReason::Lot);
@@ -1427,6 +1451,7 @@ impl OrderBook {
             }
             // P2-1: a stored stop feeds the cancel-all index.
             self.new_traders.push(trader);
+            Self::index_cloid(&mut self.cloids, trader, params.client_order_id, order_id);
             self.pending_stops.push(StopOrder {
                 id: order_id,
                 trader,
@@ -1921,6 +1946,7 @@ impl OrderBook {
         if order.reduce_only {
             self.reduce_only_index.remove(&(order.trader, order_id));
         }
+        Self::forget_cloid(&mut self.cloids, order.trader, order.client_order_id, order_id);
 
         if let Some(ids) = self.trader_orders.get_mut(&order.trader) {
             ids.remove(order_id);
@@ -1966,9 +1992,12 @@ impl OrderBook {
                 .into_iter()
                 .partition(|s| s.trader == *trader);
         self.pending_stops = kept;
+        for s in &taken {
+            Self::forget_cloid(&mut self.cloids, s.trader, s.client_order_id, s.id);
+        }
         taken
             .into_iter()
-            .map(|s| (s.limit_price.unwrap_or(s.price_cap), s.quantity))
+            .map(|s| (s.reservation_price(), s.quantity))
             .collect()
     }
 
@@ -1977,7 +2006,15 @@ impl OrderBook {
     pub fn cancel_all(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
         // Stops hold open-order slots, so they go even when the trader has
         // no resting order.
-        self.pending_stops.retain(|s| s.trader != trader);
+        self.retain_stops(|s| s.trader != trader);
+        let cancelled = self.cancel_all_resting(trader);
+        self.forget_cloids(&cancelled);
+        cancelled
+    }
+
+    /// [`Self::cancel_all`]'s resting-order part (its cloids stay indexed:
+    /// the caller drops them).
+    fn cancel_all_resting(&mut self, trader: Address) -> Vec<Order> {
         self.forget_reduce_only_trader(&trader);
         let order_ids = match self.trader_orders.remove(&trader) {
             Some(ids) => ids.into_vec(),
@@ -2256,6 +2293,44 @@ impl OrderBook {
     }
 
     /// Number of pending stop orders.
+    /// s114: the id of `trader`'s open order (resting, or a pending stop)
+    /// in this book whose client order id is `cloid`.
+    pub fn order_id_by_cloid(&self, trader: &Address, cloid: Cloid) -> Option<OrderId> {
+        self.cloids.get(&(*trader, cloid)).copied()
+    }
+
+    /// s114: entries in the `(trader, cloid)` index (= open orders and
+    /// stops carrying a cloid).
+    pub fn cloid_count(&self) -> usize {
+        self.cloids.len()
+    }
+
+    /// s114: the pending stop with this id.
+    pub fn pending_stop(&self, id: OrderId) -> Option<&StopOrder> {
+        self.pending_stops.iter().find(|s| s.id == id)
+    }
+
+    /// s114: the pending stops, in trigger (id-ascending) order.
+    pub fn pending_stops(&self) -> &[StopOrder] {
+        &self.pending_stops
+    }
+
+    /// s114: remove the pending stop with this id (cancel by id / cloid; it
+    /// was cancellable only through cancel-all). The caller releases its
+    /// reservation (`reserve(reservation_price, quantity)`). The survivors
+    /// keep their order.
+    pub fn cancel_stop(&mut self, id: OrderId) -> Option<StopOrder> {
+        let pos = self.pending_stops.iter().position(|s| s.id == id)?;
+        let stop = self.pending_stops.remove(pos);
+        Self::forget_cloid(&mut self.cloids, stop.trader, stop.client_order_id, stop.id);
+        Some(stop)
+    }
+
+    /// s114: decode one stop row value (see [`Self::stop_rows`]).
+    pub fn decode_stop_row(bytes: &[u8]) -> io::Result<StopOrder> {
+        StopOrder::try_from_slice(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
     pub fn pending_stop_count(&self) -> usize {
         self.pending_stops.len()
     }
@@ -2320,6 +2395,22 @@ impl OrderBook {
         for queue in self.bids.values().chain(self.asks.values()) {
             assert!(!queue.is_empty(), "Empty price level in book");
         }
+        // Invariant 5 (s114): the cloid index holds exactly the resting
+        // orders and pending stops that carry a cloid, one per (trader, cloid).
+        let mut want: HashMap<(Address, Cloid), OrderId> = HashMap::default();
+        let open = self
+            .bids
+            .values()
+            .chain(self.asks.values())
+            .flatten()
+            .map(|o| (o.trader, o.client_order_id, o.id))
+            .chain(self.pending_stops.iter().map(|s| (s.trader, s.client_order_id, s.id)));
+        for (trader, cloid, id) in open {
+            if let Some(c) = cloid {
+                assert!(want.insert((trader, c), id).is_none(), "cloid {c:#x} of {trader} is live twice");
+            }
+        }
+        assert_eq!(self.cloids, want, "cloid index != open orders' cloids");
     }
 
     // ========================================================================
@@ -2378,6 +2469,7 @@ impl OrderBook {
                         &mut self.reduce_only_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.cloids,
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
@@ -2422,6 +2514,7 @@ impl OrderBook {
                         &mut self.reduce_only_positions,
                         &mut self.order_index,
                         &mut self.trader_orders,
+                        &mut self.cloids,
                         &mut self.order_seq,
                         &mut self.row_journal,
                         &mut self.level_journal,
@@ -2460,6 +2553,7 @@ impl OrderBook {
         ro_positions: &mut ReduceOnlyPositions,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, TraderOrders>,
+        cloids: &mut HashMap<(Address, Cloid), OrderId>,
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
         level_journal: &mut BTreeSet<(u8, i128)>,
@@ -2497,6 +2591,7 @@ impl OrderBook {
             if maker.trader == taker.trader {
                 let cancelled = queue.pop_front().unwrap();
                 order_index.remove(&cancelled.id);
+                Self::forget_cloid(cloids, cancelled.trader, cancelled.client_order_id, cancelled.id);
                 if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
                     ids.remove(cancelled.id);
                 }
@@ -2520,6 +2615,7 @@ impl OrderBook {
                     if allowed <= FixedPoint::ZERO {
                         let cut = queue.pop_front().unwrap();
                         order_index.remove(&cut.id);
+                        Self::forget_cloid(cloids, cut.trader, cut.client_order_id, cut.id);
                         if let Some(ids) = trader_orders.get_mut(&cut.trader) {
                             ids.remove(cut.id);
                         }
@@ -2603,6 +2699,7 @@ impl OrderBook {
                 ) {
                     let cut = queue.pop_front().unwrap();
                     order_index.remove(&cut.id);
+                    Self::forget_cloid(cloids, cut.trader, cut.client_order_id, cut.id);
                     if let Some(ids) = trader_orders.get_mut(&cut.trader) {
                         ids.remove(cut.id);
                     }
@@ -2675,6 +2772,7 @@ impl OrderBook {
             if maker.remaining_qty == FixedPoint::ZERO {
                 let filled = queue.pop_front().unwrap();
                 order_index.remove(&filled.id);
+                Self::forget_cloid(cloids, filled.trader, filled.client_order_id, filled.id);
                 if let Some(ids) = trader_orders.get_mut(&filled.trader) {
                     ids.remove(filled.id);
                 }
@@ -2744,6 +2842,7 @@ impl OrderBook {
         if order.reduce_only {
             self.reduce_only_index.insert((trader, id));
         }
+        Self::index_cloid(&mut self.cloids, trader, order.client_order_id, id);
         book.entry(price).or_default().push_back(order);
 
         self.order_index.insert(id, OrderLocation { side, price });
@@ -2763,6 +2862,60 @@ impl OrderBook {
             price.raw(),
             Some(seq),
         );
+    }
+
+    /// s114: index `(trader, cloid) -> id` for an order or stop that goes
+    /// in (no cloid: nothing).
+    #[inline]
+    fn index_cloid(
+        cloids: &mut HashMap<(Address, Cloid), OrderId>,
+        trader: Address,
+        cloid: Option<Cloid>,
+        id: OrderId,
+    ) {
+        if let Some(c) = cloid {
+            let prev = cloids.insert((trader, c), id);
+            debug_assert!(
+                prev.is_none_or(|p| p == id),
+                "cloid {c:#x} of {trader} indexed twice ({prev:?}, {id})"
+            );
+        }
+    }
+
+    /// s114: drop the entry of an order or stop that leaves the book (only
+    /// if it is this id's).
+    #[inline]
+    fn forget_cloid(
+        cloids: &mut HashMap<(Address, Cloid), OrderId>,
+        trader: Address,
+        cloid: Option<Cloid>,
+        id: OrderId,
+    ) {
+        if let Some(c) = cloid {
+            if cloids.get(&(trader, c)) == Some(&id) {
+                cloids.remove(&(trader, c));
+            }
+        }
+    }
+
+    /// s114: [`Self::forget_cloid`] for removed resting orders.
+    fn forget_cloids(&mut self, removed: &[Order]) {
+        for o in removed {
+            Self::forget_cloid(&mut self.cloids, o.trader, o.client_order_id, o.id);
+        }
+    }
+
+    /// `pending_stops.retain(keep)` that also drops the removed stops'
+    /// cloids. Survivors keep their relative (id-ascending) order.
+    fn retain_stops(&mut self, mut keep: impl FnMut(&StopOrder) -> bool) {
+        let cloids = &mut self.cloids;
+        self.pending_stops.retain(|s| {
+            let k = keep(s);
+            if !k {
+                Self::forget_cloid(cloids, s.trader, s.client_order_id, s.id);
+            }
+            k
+        });
     }
 
     /// Would placing an order at `price` cross the spread?
@@ -2912,7 +3065,7 @@ impl OrderBook {
             return Vec::new();
         };
         let mut fired = Vec::new();
-        self.pending_stops.retain(|stop| {
+        self.retain_stops(|stop| {
             let fire = match stop.side {
                 Side::Buy => current_price >= stop.trigger_price,
                 Side::Sell => current_price <= stop.trigger_price,
@@ -3063,6 +3216,7 @@ impl OrderBook {
         }
         let id = stop.id;
         self.new_traders.push(stop.trader);
+        Self::index_cloid(&mut self.cloids, stop.trader, stop.client_order_id, id);
         self.pending_stops.push(stop);
         Ok(id)
     }
@@ -3171,6 +3325,7 @@ impl OrderBook {
         if order.reduce_only {
             self.reduce_only_index.insert((trader, id));
         }
+        Self::index_cloid(&mut self.cloids, trader, order.client_order_id, id);
         queue.push_back(order);
         self.order_index.insert(id, OrderLocation { side, price });
         self.push_trader_order(trader, id);
@@ -3937,7 +4092,7 @@ impl BorshSerialize for Order {
         }])?;
         w.write_all(&self.timestamp.to_be_bytes())?;
         w.write_all(&[u8::from(self.reduce_only)])?;
-        // Option<u64>
+        // Option<Cloid>: 0, or 1 ‖ 16 BE (s114: was 8)
         match self.client_order_id {
             None => w.write_all(&[0u8])?,
             Some(cid) => {
@@ -4019,9 +4174,9 @@ impl BorshDeserialize for Order {
         let client_order_id = if cid_tag[0] == 0 {
             None
         } else {
-            let mut cid_buf = [0u8; 8];
+            let mut cid_buf = [0u8; 16];
             r.read_exact(&mut cid_buf)?;
-            Some(u64::from_be_bytes(cid_buf))
+            Some(Cloid::from_be_bytes(cid_buf))
         };
 
         Ok(Order {
@@ -4149,9 +4304,9 @@ impl BorshDeserialize for StopOrder {
         let client_order_id = if cid_tag[0] == 0 {
             None
         } else {
-            let mut cid_buf = [0u8; 8];
+            let mut cid_buf = [0u8; 16];
             r.read_exact(&mut cid_buf)?;
-            Some(u64::from_be_bytes(cid_buf))
+            Some(Cloid::from_be_bytes(cid_buf))
         };
 
         Ok(StopOrder {
@@ -4250,6 +4405,7 @@ impl BorshDeserialize for OrderBook {
             order_index: HashMap::default(),
             trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
+            cloids: HashMap::default(),
             tick_size,
             lot_size,
             next_id,
@@ -4284,6 +4440,7 @@ impl BorshDeserialize for OrderBook {
         for _ in 0..stop_count {
             let stop = StopOrder::deserialize_reader(r)?;
             book.new_traders.push(stop.trader);
+            Self::index_cloid(&mut book.cloids, stop.trader, stop.client_order_id, stop.id);
             book.pending_stops.push(stop);
         }
 
@@ -5972,7 +6129,7 @@ mod level_preimage_characterization {
             },
             timestamp: m >> 17,
             reduce_only: (m >> 5) & 1 == 1,
-            client_order_id: if (m >> 6) & 1 == 1 { Some(m) } else { None },
+            client_order_id: if (m >> 6) & 1 == 1 { Some(m as u128) } else { None },
         }
     }
 
@@ -6050,7 +6207,7 @@ mod level_preimage_characterization {
             o.id = 200 + idx as OrderId;
             v.push((u64::MAX - idx as u64, o));
         }
-        for (idx, coid) in [None, Some(0u64), Some(u64::MAX)].into_iter().enumerate() {
+        for (idx, coid) in [None, Some(0u128), Some(u128::MAX)].into_iter().enumerate() {
             let mut o = base.clone();
             o.client_order_id = coid;
             o.id = 300 + idx as OrderId;
@@ -6094,7 +6251,8 @@ mod level_preimage_characterization {
     /// PIN 1 — `level_row_data` output at depths 1 / 2 / 100 / 1000, as
     /// `(depth, level_hash hex, total_qty_raw, order_count)`, captured from the
     /// pre-refactor encoder. These are consensus bytes: if this test fails, the
-    /// state-root preimage changed.
+    /// state-root preimage changed. s114: re-pinned for the 16-byte cloid
+    /// (depths >= 2 hold a cloid order; depth 1 and the totals are unchanged).
     const PINNED_LEVELS: [(usize, &str, i128, u32); 4] = [
         (
             1,
@@ -6104,19 +6262,19 @@ mod level_preimage_characterization {
         ),
         (
             2,
-            "a5773c2b3a041435f7d6995bb82b932ca63d9646358ab3e7ae4522fe5f9cead1",
+            "bacca95a3a35f4ba7d9ec3462dd4f2b06fd2a3ada873f4ed87eab03948033098",
             1_430_002,
             2,
         ),
         (
             100,
-            "6f53fb7754706154ef65538416629cb4e4d70388ee835fee48d4833147f5f485",
+            "55daa427f80269db49f428e0ac9da7cb1c8b2f4126fc946eb2030f03c2764f18",
             51_292_508,
             100,
         ),
         (
             1000,
-            "232826303bfc2d1b335f41a54707104aa246f639fb97856cdfaa643b7f517ecc",
+            "70cc7ddc82b6114b356acc9e89de94abcac0309636f27bf7b298d7ac9892b033",
             491_881_418,
             1000,
         ),
@@ -6126,7 +6284,7 @@ mod level_preimage_characterization {
     /// output in `shape_spread()`, each framed by its u32-LE length (so a
     /// length drift is caught as well as a content drift).
     const PINNED_SHAPE_SPREAD: &str =
-        "f5d7a4b2fb1f3a56db9d6f62a902e988eff5e51cd9ebf655b78476415b2687a9";
+        "4a82e830d4cd91fa26c18d73499f73a84a78d49f6746edadb122be1b2b6ee061";
 
     /// Dump helper for (re-)capturing the pins. Ignored by default; run with
     /// `--ignored --nocapture` to print the current constants.
@@ -6326,19 +6484,19 @@ mod level_preimage_characterization {
         ),
         (
             2,
-            "1ae40f8b2c58bdfa7e898dc6fd1c523f7829906bfb286beec16b98b75a3d3939",
+            "d30f5ad6f931118fd975c59cc2df4810a89e217d0cdc7ef18e1b0292ae59aebd",
             1_430_002,
             2,
         ),
         (
             100,
-            "4d6803930eba3b71d8c3e728eabc7380ecc8a0a2bef1371a1571dc8ae7c5a7d1",
+            "6d671cb5d2f487a661f8b698ef1f0388783d35206e84b874ded92a6f9d2c0d4b",
             51_292_508,
             100,
         ),
         (
             1000,
-            "d4785c1dabd2df08f8589170f542279efeba37c5677caed2b62058dd1ff7be0a",
+            "37b70f1e54f93cf9a2f5427c56e78fbd489db30039a6e8552952a7811c735e00",
             491_881_418,
             1000,
         ),

@@ -28,7 +28,7 @@ fn order_params(i: usize) -> PlaceOrderParams {
         client_order_id: if (i / 32) % 2 == 0 {
             None
         } else {
-            Some(u64::MAX - i as u64)
+            Some(u128::MAX - i as u128)
         },
     }
 }
@@ -400,6 +400,11 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
         NativeAction::CancelOrder { order_id } => {
             buf.push(1);
             buf.extend_from_slice(&order_id.to_be_bytes());
+        }
+        NativeAction::CancelByCloid { market_id, cloid } => {
+            buf.push(29);
+            buf.extend_from_slice(&market_id.to_be_bytes());
+            buf.extend_from_slice(&cloid.to_be_bytes());
         }
         NativeAction::CancelAllOrders { market_id } => {
             buf.push(2);

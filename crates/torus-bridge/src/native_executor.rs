@@ -38,7 +38,7 @@ use torus_state::action_status::{CoreWriterKind, FailureReason};
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
 use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams,
+    Cloid, FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams,
     SessionScope, Side, TimeInForce, ValidatorSet, VoteOption, U256,
 };
 
@@ -6154,6 +6154,9 @@ impl NativeExecutor {
             NativeAction::CancelAllOrders { market_id } => {
                 Self::exec_cancel_all(ctx, sender, *market_id)
             }
+            NativeAction::CancelByCloid { market_id, cloid } => {
+                Self::exec_cancel_by_cloid(ctx, sender, *market_id, *cloid)
+            }
             NativeAction::ModifyOrder {
                 order_id,
                 new_price,
@@ -6536,6 +6539,44 @@ impl NativeExecutor {
             }
         }
         ctx.phase_accum.phase1_actions_ns += phase1_timer.elapsed().as_nanos();
+
+        // s114: cloid uniqueness, serially in flat order, before Phase 2
+        // reserves anything: a placement whose cloid is live for its sender
+        // in any book (after Phase 1's cancels) or claimed by an earlier
+        // placement of this call is rejected. The first placement of a cloid
+        // claims it whatever later happens to it (margin reject, fill).
+        if place_order_indices
+            .iter()
+            .any(|&i| matches!(&flat[i].1, FlatAction::Place(p) if p.client_order_id.is_some()))
+        {
+            let mut claimed: HashSet<(Address, Cloid)> = HashSet::default();
+            let books = &ctx.order_books;
+            let metrics = &ctx.metrics;
+            place_order_indices.retain(|&i| {
+                let (sender, FlatAction::Place(p)) = &flat[i] else {
+                    return true;
+                };
+                let Some(cloid) = p.client_order_id else {
+                    return true;
+                };
+                let dup = Self::duplicate_cloid(books, sender, cloid).or_else(|| {
+                    (!claimed.insert((*sender, cloid))).then(|| {
+                        format!(
+                            "duplicate cloid {}: an earlier order of this block already uses it",
+                            torus_types::cloid_serde::to_hex(cloid)
+                        )
+                    })
+                });
+                let Some(msg) = dup else {
+                    return true;
+                };
+                if let Some(m) = metrics {
+                    m.orders_rejected_other.inc();
+                }
+                results[i] = NativeActionResult::rejected("place_order", (FailureReason::DuplicateCloid, msg));
+                false
+            });
+        }
 
         if place_order_indices.is_empty() {
             ctx.debug_assert_index_fed();
@@ -9190,6 +9231,16 @@ impl NativeExecutor {
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
+        // s114: a cloid live for the sender in any market.
+        if let Some(msg) = params
+            .client_order_id
+            .and_then(|c| Self::duplicate_cloid(&ctx.order_books, sender, c))
+        {
+            if let Some(ref m) = ctx.metrics {
+                m.orders_rejected_other.inc();
+            }
+            return NativeActionResult::rejected("place_order", (FailureReason::DuplicateCloid, msg));
+        }
         let open_at_start = Self::open_order_counts(&ctx.order_books, std::iter::once(sender));
         if let Err((reason, msg)) = Self::take_open_slot(
             &mut None,
@@ -9728,9 +9779,33 @@ impl NativeExecutor {
             }
         }
         let Some((market_id, cancelled)) = found else {
-            return NativeActionResult::err("cancel_order", format!("order {order_id} not found"));
+            // s114: a pending stop by id (stops used to be cancellable only
+            // through cancel-all).
+            let stop = ctx
+                .order_books
+                .values()
+                .find_map(|b| b.pending_stop(order_id).map(|s| (b.market_id, s.trader)));
+            return match stop {
+                Some((_, owner)) if owner != *sender => NativeActionResult::err(
+                    "cancel_order",
+                    format!("order {order_id} belongs to {owner}, not sender {sender}"),
+                ),
+                Some((market_id, _)) => Self::cancel_stop_in(ctx, "cancel_order", market_id, order_id),
+                None => NativeActionResult::err("cancel_order", format!("order {order_id} not found")),
+            };
         };
-        // FIX 2 (ECON-FIND-05): Release order margin on cancel.
+        Self::release_cancelled(ctx, market_id, &cancelled);
+        NativeActionResult::ok("cancel_order", 500)
+    }
+
+    /// FIX 2 (ECON-FIND-05): release a cancelled resting order's margin
+    /// (`price × remaining` at the market's integer leverage) and mark its
+    /// market dirty.
+    fn release_cancelled<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_id: MarketId,
+        cancelled: &torus_core::order_book::Order,
+    ) {
         let notional = cancelled.price * cancelled.remaining_qty;
         ctx.dirty_books.insert(market_id);
         let max_lev = ctx
@@ -9744,7 +9819,78 @@ impl NativeExecutor {
         // fail-stops the block (was: skipped / `let _ =`). The result stays
         // `ok`.
         Self::release_order_margin(ctx, &cancelled.trader, margin_to_release);
-        NativeActionResult::ok("cancel_order", 500)
+    }
+
+    /// s114: cancel the pending stop `id` in `market_id` (its owner already
+    /// checked) and release its reservation (`stop_reservation`, what a
+    /// trigger releases).
+    fn cancel_stop_in<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        action_type: &'static str,
+        market_id: MarketId,
+        id: OrderId,
+    ) -> NativeActionResult {
+        let Some(stop) = ctx.order_books.get_mut(&market_id).and_then(|b| b.cancel_stop(id)) else {
+            return NativeActionResult::err(action_type, format!("order {id} not found"));
+        };
+        ctx.dirty_books.insert(market_id);
+        let reserved = Self::stop_reservation(
+            ctx.margin_configs.get(&market_id),
+            stop.reservation_price(),
+            stop.quantity,
+        );
+        Self::release_order_margin(ctx, &stop.trader, reserved);
+        NativeActionResult::ok(action_type, 500)
+    }
+
+    /// s114: `Some(message)` when `cloid` is live for `trader` (a resting
+    /// order or a pending stop) in any book. At most one book holds it, so
+    /// the scan order changes nothing.
+    fn duplicate_cloid(
+        books: &HashMap<MarketId, OrderBook>,
+        trader: &Address,
+        cloid: Cloid,
+    ) -> Option<String> {
+        books
+            .iter()
+            .filter_map(|(m, b)| b.order_id_by_cloid(trader, cloid).map(|id| (*m, id)))
+            .min()
+            .map(|(m, id)| {
+                format!(
+                    "duplicate cloid {}: open order {id} in market {m} uses it",
+                    torus_types::cloid_serde::to_hex(cloid)
+                )
+            })
+    }
+
+    /// s114: `CancelByCloid` — the sender's open order (resting, or a
+    /// pending stop) with `cloid` in `market_id`.
+    fn exec_cancel_by_cloid<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        market_id: MarketId,
+        cloid: Cloid,
+    ) -> NativeActionResult {
+        const ACTION: &str = "cancel_by_cloid";
+        let Some(book) = ctx.order_books.get_mut(&market_id) else {
+            return NativeActionResult::err(ACTION, format!("market {market_id} has no book"));
+        };
+        let Some(id) = book.order_id_by_cloid(sender, cloid) else {
+            return NativeActionResult::err(
+                ACTION,
+                format!(
+                    "no open order with cloid {} in market {market_id}",
+                    torus_types::cloid_serde::to_hex(cloid)
+                ),
+            );
+        };
+        match book.cancel_order(id) {
+            Ok(cancelled) => {
+                Self::release_cancelled(ctx, market_id, &cancelled);
+                NativeActionResult::ok(ACTION, 500)
+            }
+            Err(_) => Self::cancel_stop_in(ctx, ACTION, market_id, id),
+        }
     }
 
     fn exec_cancel_all<T: StateBackend>(
@@ -11555,9 +11701,9 @@ pub enum ActionCategory {
 /// Classify a NativeAction for block ordering.
 pub fn classify_action(action: &NativeAction) -> ActionCategory {
     match action {
-        NativeAction::CancelOrder { .. } | NativeAction::CancelAllOrders { .. } => {
-            ActionCategory::Cancellation
-        }
+        NativeAction::CancelOrder { .. }
+        | NativeAction::CancelAllOrders { .. }
+        | NativeAction::CancelByCloid { .. } => ActionCategory::Cancellation,
         NativeAction::PlaceOrder(params) => match params.order_type {
             OrderType::Market | OrderType::StopMarket { .. } => ActionCategory::NonGtcOrder,
             _ => match params.time_in_force {
