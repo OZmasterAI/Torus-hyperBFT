@@ -1925,6 +1925,27 @@ mod tests {
         assert!(!LATE.load(SeqCst), "fired after a clean stop");
     }
 
+    /// Codex stop review: a panicking stop disconnects the watchdog's
+    /// completion channel; that must count as a failed stop (exit at once),
+    /// not disarm the watchdog.
+    #[test]
+    fn watchdog_fires_when_the_stop_panics() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        fn fired() {
+            FIRED.store(true, SeqCst);
+        }
+        let w = ShutdownWorker::spawn_with(fired).unwrap();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let boom: StopJob = Box::new(|| panic!("stop panicked"));
+        w.jobs.send((boom, reply, Duration::from_secs(30))).unwrap();
+        let t = std::time::Instant::now();
+        while !FIRED.load(SeqCst) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(FIRED.load(SeqCst), "watchdog disarmed by the panic");
+    }
+
     #[test]
     fn shutdown_timeout_parse() {
         let s = Duration::from_secs;
