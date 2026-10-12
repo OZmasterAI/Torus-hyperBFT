@@ -52,6 +52,11 @@ pub enum GenesisError {
     InvalidMarket(String),
     #[error("invalid fee_split: {0}")]
     InvalidFeeSplit(String),
+    /// R19: two spellings of one canonical key (address case / 0x prefix,
+    /// storage slot "0" vs "0x0"). Refused instead of letting HashMap order
+    /// pick the value.
+    #[error("duplicate genesis key: {0}")]
+    DuplicateKey(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -297,16 +302,48 @@ fn parse_fixedpoint_raw(s: &str) -> Result<i128, GenesisError> {
     Ok(if neg { -raw } else { raw })
 }
 
+/// Decode `0x`/`0X`-prefixed or bare hex. R19: an odd digit count or a
+/// non-hex (incl. non-ASCII) character is `InvalidHex`, never a slice panic.
 fn decode_hex(s: &str) -> Result<Vec<u8>, GenesisError> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    let s = s.strip_prefix("0X").unwrap_or(s);
-    (0..s.len())
+    let digits = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if !digits.len().is_multiple_of(2) {
+        return Err(GenesisError::InvalidHex(format!(
+            "{s}: odd number of hex digits"
+        )));
+    }
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(GenesisError::InvalidHex(s.to_string()));
+    }
+    (0..digits.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
+            u8::from_str_radix(&digits[i..i + 2], 16)
                 .map_err(|_| GenesisError::InvalidHex(s.to_string()))
         })
         .collect()
+}
+
+/// R19: `keys` mapped to their canonical form must be distinct. Keys are
+/// visited in sorted order, so the same input always names the same pair.
+fn check_unique_keys<'a, K: Ord>(
+    what: &str,
+    keys: impl Iterator<Item = &'a String>,
+    canon: impl Fn(&str) -> Result<K, GenesisError>,
+) -> Result<(), GenesisError> {
+    let mut keys: Vec<&String> = keys.collect();
+    keys.sort();
+    let mut seen = std::collections::BTreeMap::new();
+    for key in keys {
+        if let Some(prev) = seen.insert(canon(key)?, key) {
+            return Err(GenesisError::DuplicateKey(format!(
+                "{what}: \"{prev}\" and \"{key}\" are the same key"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convert a stake amount (U256 in wei) to a consensus power value (u64).
@@ -331,7 +368,38 @@ impl Genesis {
     pub fn from_json(json: &str) -> Result<Self, GenesisError> {
         let genesis: Self = serde_json::from_str(json)?;
         genesis.check_fee_split()?;
+        genesis.check_keys_and_hex()?;
         Ok(genesis)
+    }
+
+    /// R19: every hex field decodes and every map key is canonical-unique, so
+    /// a bad genesis fails at load (the node refuses to start) and
+    /// `initialize` never depends on HashMap iteration order.
+    fn check_keys_and_hex(&self) -> Result<(), GenesisError> {
+        check_unique_keys("evm_alloc address", self.evm_alloc.keys(), parse_address)?;
+        for (addr_str, entry) in &self.evm_alloc {
+            parse_u256(&entry.balance)?;
+            if let Some(code_hex) = &entry.code {
+                decode_hex(code_hex)?;
+            }
+            if let Some(storage) = &entry.storage {
+                check_unique_keys(
+                    &format!("evm_alloc[{addr_str}] storage slot"),
+                    storage.keys(),
+                    parse_u256,
+                )?;
+                for value in storage.values() {
+                    parse_u256(value)?;
+                }
+            }
+        }
+        for validator in &self.validators {
+            let pubkey = decode_hex(&validator.pubkey)?;
+            if pubkey.len() != 32 {
+                return Err(GenesisError::InvalidPubkey(validator.pubkey.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// Row 80 option D: fees are split by the built-in constants
@@ -385,6 +453,10 @@ impl Genesis {
     /// 3. Seeds validator stakes into `CF_STAKING_VALIDATORS`
     /// 4. Computes and returns the state root
     pub fn initialize(&self, state_db: &StateDb) -> Result<B256, GenesisError> {
+        // R19: keys and hex are checked before any write (also for a Genesis
+        // edited after from_json).
+        self.check_keys_and_hex()?;
+
         // 0. Row 43: every market needs tick_size > 0 and lot_size > 0 (books are
         //    built from the market row). Checked before any write.
         for market in &self.markets {

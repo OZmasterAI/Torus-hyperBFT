@@ -603,7 +603,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Genesis initialization
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
-        let genesis = Genesis::from_file(genesis_path)?;
+        // R19: a malformed or ambiguous genesis refuses to start, naming the file.
+        let genesis = Genesis::from_file(genesis_path)
+            .map_err(|e| format!("refusing to start: genesis {}: {e}", genesis_path.display()))?;
         let config = genesis.chain_config();
 
         // Only initialize if DB is empty (first run)
