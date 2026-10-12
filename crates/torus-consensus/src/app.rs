@@ -24761,4 +24761,172 @@ mod crash_recovery_tests {
         );
         assert_eq!(ctx.ckpt.lock().unwrap().view_blocks.len(), 0);
     }
+
+    /// p3soak (section 53, s114): step 2's RSS kept growing over a 10 min
+    /// soak. With an interval, a mempool wired and no barrier for hundreds of
+    /// blocks (production: epochs are long), what Phase 3 retains must stay
+    /// bounded by the window: every frozen set, ingress slice, L and C a
+    /// block creates is freed within a few windows, and the live counts do
+    /// not grow with the run. Blocks: 1 funds A and B; every later block is
+    /// one fill (A and B swap sides each block, so positions stay flat).
+    #[test]
+    fn checkpoint_retention_bounded_over_long_run() {
+        use std::sync::Weak;
+        use std::time::{Duration, Instant};
+        const BLOCKS: u64 = 600;
+        const EVERY: u64 = 9;
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[81u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[82u8; 32]).unwrap();
+        let deposit = U256::from(100_000 * FixedPoint::ONE.raw() as u128);
+        let order = |is_buy: bool| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let mut blocks = vec![make_block(
+            1,
+            vec![
+                sign(
+                    NativeAction::TransferToPerp { amount: deposit },
+                    block_time_ms(1),
+                    &k_a,
+                ),
+                sign(
+                    NativeAction::TransferToPerp { amount: deposit },
+                    block_time_ms(1),
+                    &k_b,
+                ),
+            ],
+        )];
+        for h in 2..=BLOCKS {
+            let a_sells = h % 2 == 0;
+            blocks.push(make_block(
+                h,
+                vec![
+                    sign(
+                        NativeAction::PlaceOrder(order(!a_sells)),
+                        block_time_ms(h),
+                        &k_a,
+                    ),
+                    sign(
+                        NativeAction::PlaceOrder(order(a_sells)),
+                        block_time_ms(h),
+                        &k_b,
+                    ),
+                ],
+            ));
+        }
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 1_000_000;
+        for k in [&k_a, &k_b] {
+            fund_evm_balance(&db, k256_address(k), deposit);
+        }
+        let mempool = Arc::new(Mempool::new(db.clone(), Default::default()));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool.clone()), false);
+        ctx.checkpoint = Some(ckpt_every(EVERY));
+        ctx.attach_flush_worker(None);
+        // Every distinct object E's checkpoint path holds, by the height it
+        // was first seen at (keyed by address while alive).
+        type Seen<T> = std::collections::HashMap<usize, (u64, Weak<T>)>;
+        let mut sets: Seen<torus_state::FrozenPending> = Default::default();
+        let mut layers: Seen<torus_state::CheckpointLayer> = Default::default();
+        fn track<T>(seen: &mut Seen<T>, h: u64, a: &Arc<T>) {
+            seen.entry(Arc::as_ptr(a) as usize)
+                .or_insert_with(|| (h, Arc::downgrade(a)));
+        }
+        fn alive<T>(seen: &Seen<T>) -> Vec<u64> {
+            let mut v: Vec<u64> = seen
+                .values()
+                .filter(|(_, w)| w.strong_count() > 0)
+                .map(|(h, _)| *h)
+                .collect();
+            v.sort_unstable();
+            v
+        }
+        let (mut early_max, mut late_max) = (0usize, 0usize);
+        let mut checkpoints = 0;
+        for b in &blocks {
+            let h = b.header.height;
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            // W digests every queued block (its queue is a bound of its own,
+            // DIGEST_QUEUE); what is left is what E and its threads retain.
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            if let Some(j) = ctx.last_job.lock().unwrap().as_ref() {
+                track(&mut sets, h, j);
+            }
+            {
+                let st = ctx.ckpt.lock().unwrap();
+                for v in &st.view_blocks {
+                    track(&mut sets, h, v);
+                }
+                if let Some(l) = &st.layer {
+                    track(&mut layers, h, l);
+                }
+                if let Some((top, c)) = &st.inflight {
+                    if *top == h {
+                        checkpoints += 1;
+                    }
+                    track(&mut layers, h, c);
+                }
+            }
+            let view = mempool.ingress_state();
+            assert_eq!(view.height(), Some(h), "the view follows every block");
+            assert!(
+                view.block_count() as u64 <= EVERY,
+                "h{h}: the view holds {} blocks",
+                view.block_count()
+            );
+            for v in view.blocks() {
+                track(&mut sets, h, v);
+            }
+            drop(view);
+            // The dropper and the merge / slice threads run behind E: give
+            // them a moment before counting (they never hold more than a
+            // block or two).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let bounded = |s: &[u64], l: &[u64]| {
+                s.iter()
+                    .chain(l.iter())
+                    .all(|made| h - made <= 2 * EVERY + 2)
+                    && (s.len() + l.len()) as u64 <= EVERY + 10
+            };
+            let (mut s, mut l) = (alive(&sets), alive(&layers));
+            while !bounded(&s, &l) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+                (s, l) = (alive(&sets), alive(&layers));
+            }
+            assert!(
+                bounded(&s, &l),
+                "h{h}: retained past the window (sets first seen at {s:?}, layers first seen at {l:?})"
+            );
+            let n = s.len() + l.len();
+            if (100..200).contains(&h) {
+                early_max = early_max.max(n);
+            }
+            if h > BLOCKS - 100 {
+                late_max = late_max.max(n);
+            }
+            sets.retain(|_, (_, w)| w.strong_count() > 0);
+            layers.retain(|_, (_, w)| w.strong_count() > 0);
+        }
+        assert!(
+            checkpoints as u64 >= BLOCKS / EVERY - 2,
+            "{checkpoints} checkpoints"
+        );
+        eprintln!("live sets + layers: max {early_max} at blocks 100-200, {late_max} at the end");
+        assert!(
+            late_max <= EVERY as usize + 10 && early_max <= EVERY as usize + 10,
+            "live objects: {early_max} at blocks 100-200, {late_max} at the end"
+        );
+    }
 }
