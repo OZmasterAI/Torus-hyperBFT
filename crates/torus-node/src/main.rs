@@ -1431,13 +1431,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Run `log` (the last line before `_exit`). Returns whether it finished.
-fn log_with_grace(log: impl FnOnce() + Send + 'static, _grace: Duration) -> bool {
-    use std::io::Write;
-    log();
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    true
+/// Run `log` (the last line before `_exit`) on its own thread and wait at
+/// most `grace`: a thread stuck writing to stdout holds its lock, so the
+/// log may never finish. Returns whether it finished. No explicit flush:
+/// stdout is line-buffered and the line ends in a newline.
+fn log_with_grace(log: impl FnOnce() + Send + 'static, grace: Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("node-exit-log".into())
+        .spawn(move || {
+            log();
+            let _ = tx.send(());
+        });
+    spawned.is_ok() && rx.recv_timeout(grace).is_ok()
 }
 
 /// SIGINT and SIGTERM receivers. Kept for the node's lifetime: a signal
