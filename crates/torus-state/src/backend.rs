@@ -1338,21 +1338,43 @@ impl NativeStateOverlay {
     /// part, waited for if still being merged; `Err` if that merge failed.
     #[inline]
     fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
-        let layer = match &self.deferred {
+        Ok([
+            self.parent.as_deref().map(|p| &p.state),
+            self.layer_for(id)?,
+            self.inflight.as_deref().map(|c| c.pending_state()),
+        ])
+    }
+
+    /// L as CF `id` sees it: for a deferred CF (with L split) the deferred
+    /// part, waited for if still being merged; `Err` if that merge failed.
+    #[inline]
+    fn layer_for(&self, id: CfId) -> Result<Option<&PendingState>, StateError> {
+        match &self.deferred {
             Some(d) if crate::checkpoint_layer::is_deferred_slot(id.0 as usize) => {
-                Some(d.read().map(|l| l.pending_state()).ok_or_else(|| {
+                d.read().map(|l| Some(l.pending_state())).ok_or_else(|| {
                     StateError::Io(std::io::Error::other(
                         "since-checkpoint layer merge failed (deferred part lost)",
                     ))
-                })?)
+                })
             }
-            _ => self.layer.as_deref().map(|l| l.pending_state()),
-        };
-        Ok([
-            self.parent.as_deref().map(|p| &p.state),
-            layer,
+            _ => Ok(self.layer.as_deref().map(|l| l.pending_state())),
+        }
+    }
+
+    /// The point-read rule over [`Self::lower`]: the first of parent, L, C
+    /// holding `key` (`Some(None)`: a tombstone), `None` if none does. L is
+    /// resolved only on a parent miss, so a parent hit never waits for a
+    /// deferred part still being merged (Codex P3, p3 merge wait r1).
+    #[inline]
+    fn lookup_lower(&self, id: CfId, key: &[u8]) -> Result<Option<Option<&[u8]>>, StateError> {
+        if let Some(hit) = self.parent.as_deref().and_then(|p| p.state.lookup(id, key)) {
+            return Ok(Some(hit));
+        }
+        let rest = [
+            self.layer_for(id)?,
             self.inflight.as_deref().map(|c| c.pending_state()),
-        ])
+        ];
+        Ok(rest.into_iter().flatten().find_map(|l| l.lookup(id, key)))
     }
 
     /// Item 6 Phase 3: the layered parent (the previous block's frozen set).
@@ -2322,10 +2344,8 @@ impl StateBackend for NativeStateOverlay {
             }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes);
             // item 6 Phase 3: then L and C.
-            for layer in self.lower(id)?.into_iter().flatten() {
-                if let Some(hit) = layer.lookup(id, key) {
-                    return Ok(hit.map(<[u8]>::to_vec));
-                }
+            if let Some(hit) = self.lookup_lower(id, key)? {
+                return Ok(hit.map(<[u8]>::to_vec));
             }
         }
         self.db.get_cf_raw(cf, key)
@@ -2474,10 +2494,8 @@ impl StateBackend for NativeStateOverlay {
             if let Some(rows) = self.resident_rows(id) {
                 return Ok(rows.get(key).map(Vec::len));
             }
-            for layer in self.lower(id)?.into_iter().flatten() {
-                if let Some(hit) = layer.lookup(id, key) {
-                    return Ok(hit.map(<[u8]>::len));
-                }
+            if let Some(hit) = self.lookup_lower(id, key)? {
+                return Ok(hit.map(<[u8]>::len));
             }
         }
         StateBackend::get_cf_len(&self.db, cf, key)

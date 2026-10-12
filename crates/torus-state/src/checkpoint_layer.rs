@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use rocksdb::WriteBatch;
 
@@ -267,12 +267,18 @@ impl CheckpointLayer {
 /// fixed, and every later call returns at once.
 pub struct DeferredLayer {
     cell: OnceLock<Option<CheckpointLayer>>,
+    /// The merge thread's channel until a caller settles the part. A
+    /// caller blocked in `recv` holds it outside the mutex (`None` here
+    /// while `cell` is unset); the others wait on `settled`.
     rx: Mutex<Option<Receiver<CheckpointLayer>>>,
-    /// Reads that found the part still being merged and blocked.
+    settled: Condvar,
+    /// Reads that found the part still being merged and blocked (each
+    /// blocked caller once, also one waiting for another's `recv`).
     read_waits: AtomicU64,
     /// Nanoseconds those reads blocked.
     read_wait_ns: AtomicU64,
-    /// Called once before a read blocks (a test seam; `None` in production).
+    /// Called once per read before it blocks (a test seam; `None` in
+    /// production).
     on_block: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
@@ -282,6 +288,7 @@ impl DeferredLayer {
         Self {
             cell: OnceLock::from(Some(layer)),
             rx: Mutex::new(None),
+            settled: Condvar::new(),
             read_waits: AtomicU64::new(0),
             read_wait_ns: AtomicU64::new(0),
             on_block: None,
@@ -294,6 +301,7 @@ impl DeferredLayer {
         Self {
             cell: OnceLock::new(),
             rx: Mutex::new(Some(rx)),
+            settled: Condvar::new(),
             read_waits: AtomicU64::new(0),
             read_wait_ns: AtomicU64::new(0),
             on_block: None,
@@ -317,7 +325,7 @@ impl DeferredLayer {
         self.cell.get().is_some()
     }
 
-    /// Call `f` before a read blocks on this part (a test seam: a test
+    /// Call `f` before each read blocks on this part (a test seam: a test
     /// holding the merge releases it here instead of deadlocking).
     pub fn on_block(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
         self.on_block = Some(Box::new(f));
@@ -339,32 +347,67 @@ impl DeferredLayer {
         self.cell.into_inner().flatten()
     }
 
+    fn lock_rx(&self) -> MutexGuard<'_, Option<Receiver<CheckpointLayer>>> {
+        self.rx.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Settle the part, blocking while it is being merged. Every caller
+    /// that blocks (the one receiving it and each one waiting for that
+    /// receiver) counts once if `count`. The decision is made under `rx`'s
+    /// lock: the receiver is only taken after `try_recv` found nothing, so
+    /// a caller finding it taken knows the part has not been published.
     fn resolve(&self, count: bool) -> Option<&CheckpointLayer> {
         if let Some(done) = self.cell.get() {
             return done.as_ref();
         }
-        self.cell
-            .get_or_init(|| {
-                let rx = self.rx.lock().unwrap_or_else(|p| p.into_inner()).take()?;
-                match rx.try_recv() {
-                    Ok(layer) => Some(layer),
-                    Err(TryRecvError::Disconnected) => None,
-                    Err(TryRecvError::Empty) => {
-                        if let (true, Some(f)) = (count, &self.on_block) {
-                            f();
-                        }
-                        let timer = std::time::Instant::now();
-                        let got = rx.recv().ok();
-                        if count {
-                            self.read_waits.fetch_add(1, Ordering::Relaxed);
-                            self.read_wait_ns
-                                .fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        }
-                        got
-                    }
+        let timer = std::time::Instant::now();
+        let mut blocked = false;
+        let mut g = self.lock_rx();
+        while self.cell.get().is_none() {
+            let arrived = match g.as_ref().map(Receiver::try_recv) {
+                Some(Ok(layer)) => Some(Some(layer)),
+                Some(Err(TryRecvError::Disconnected)) => Some(None),
+                Some(Err(TryRecvError::Empty)) | None => None,
+            };
+            if let Some(got) = arrived {
+                *g = None;
+                let _ = self.cell.set(got);
+                self.settled.notify_all();
+                break;
+            }
+            // Still being merged: this caller blocks.
+            if !blocked {
+                blocked = true;
+                if let (true, Some(f)) = (count, &self.on_block) {
+                    // Without the lock (and with the receiver left in
+                    // place), then look again.
+                    drop(g);
+                    f();
+                    g = self.lock_rx();
+                    continue;
                 }
-            })
-            .as_ref()
+            }
+            match g.take() {
+                // Receive it here, without the lock; other callers wait
+                // on `settled`.
+                Some(rx) => {
+                    drop(g);
+                    let got = rx.recv().ok();
+                    g = self.lock_rx();
+                    let _ = self.cell.set(got);
+                    self.settled.notify_all();
+                }
+                // Another caller is receiving it.
+                None => g = self.settled.wait(g).unwrap_or_else(PoisonError::into_inner),
+            }
+        }
+        drop(g);
+        if blocked && count {
+            self.read_waits.fetch_add(1, Ordering::Relaxed);
+            self.read_wait_ns
+                .fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.cell.get().and_then(Option::as_ref)
     }
 }
 
@@ -894,7 +937,12 @@ mod tests {
         db.put_cf_raw(pos, b"lower", b"db").unwrap();
         // L (deferred part): every key written at height 5.
         let o = NativeStateOverlay::new(db.clone());
-        for (cf, k) in [(pos, &b"p1"[..]), (pos, b"gone"), (pos, b"lower"), (bal, b"b1")] {
+        for (cf, k) in [
+            (pos, &b"p1"[..]),
+            (pos, b"gone"),
+            (pos, b"lower"),
+            (bal, b"b1"),
+        ] {
             o.put_cf_raw(cf, k, b"L").unwrap();
         }
         let mut main = CheckpointLayer::new();
@@ -980,7 +1028,11 @@ mod tests {
         for r in readers {
             assert_eq!(r.join().unwrap(), Some(Some(9)));
         }
-        assert_eq!(blocked.load(Ordering::SeqCst), 2, "each blocked read announced");
+        assert_eq!(
+            blocked.load(Ordering::SeqCst),
+            2,
+            "each blocked read announced"
+        );
         let (waits, time) = d.take_read_waits();
         assert_eq!(waits, 2, "two blocked reads, two waits");
         assert!(time > Duration::ZERO);
