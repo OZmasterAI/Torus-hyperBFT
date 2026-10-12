@@ -5679,6 +5679,75 @@ on the next step 2 head.
 Analysis (`tools/ozarchy-p3g2-tools/analyst/`): the section 48 scripts (`a-cells.py`, `a-arms.py`, `a-heap.py`,
 `a-heapcat.py`); outputs in `ozarchy-p3g2-run/analyst/` on ozarchy.
 
+## 50. P2-3 persistent exec worker pool vs its merge-base, commit-tail mode (campaign ozarchy-p23b, 2026-10-12)
+
+**The pool removes every per-block thread spawn: perf sees 0 forks per native block on the pool arm against 44-46 on
+the control. The throughput and CPU effects are inside the noise, as section 44 predicted:** matched/s -1.2% [-5.0,
++2.6], node CPU-s/1M +0.4% [-1.8, +2.6] (-0.7% [-1.5, +0.0] at equal fills), exec wall per native block +0.3% [-3.0,
++3.7]. The one resolved saving is the spawned threads' own CPU: exited-thread sys 0.12 -> 0.01 CPU-s/1M (val0). That
+is ~0.11 CPU-s/1M (0.4%), inside section 44's 0.05-0.15 band and below what a 120 s cell can resolve in total CPU.
+
+Owner request (18c, s112): A/B the P2-3 pool `perf/p2-3-worker-pool` `efcd1548` against its merge-base `c97f56f9`. Main
+`8efcb07a` is not a clean control: it adds CoreWriter results on the exec path. Commit tail, n = 4. Hard check: perf fork
+count ~0 per native block after warm-up on the pool arm, plus the spawn counters.
+
+Setup: the section 47-49 shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, 120 s cells,
+commit tail, shared NVMe). Nodes: control `c97f56f9` (`f35fab7d`, the p3s2g build), pool `efcd1548` (`dacdeec8`, built
+for this run; frame pointers + line tables + mold); bench `05d44313` and harness `8efcb07a` (as section 48). Cells
+19:18-20:41 (driver `ozarchy-p3rss-campaign.sh` CAMP=B; held during sections 48-49, then relaunched): w0 (control, 60 s,
+excluded), u cells r1 k p, r2 p k, r3 k p, r4 p k (ABBA, n = 4, unprofiled), and perf cells x1-pp x1-pk after r2, x2-pk
+x2-pp after r4. The perf cells use the section 44 method (`prof-sidecar.sh`: `perf record -e cycles:u -g --call-graph fp`
+on val0, 45 s from bench + 35 s; `perf script --show-task-events` -> PERF_RECORD_FORK). **All 12 cells rc 0, ACCEPT,
+AGREE**, 182 CHECK OK, no CHECK FAIL, no deaths.
+
+### 50.1 Forks and spawn counters (hard check)
+
+| cell | window | native blocks | PERF_RECORD_FORK | per native block | parent |
+|---|---|---|---|---|---|
+| x1-pp (pool) | 47.6 s | 180 | **0** | **0.000** | - |
+| x2-pp (pool) | ~48 s | 166 | **0** | **0.000** | - |
+| x1-pk (control) | 47.9 s | 165 | 7,331 | 44.4 | `torus-execution` (2.82 scopes per block, 165 32-way) |
+| x2-pk (control) | 47.5 s | 152 | 7,058 | 46.4 | `torus-execution` (2.99 scopes per block, 155 32-way) |
+
+`torus_exec_thread_spawns_*` deltas per native block over each u cell (`metrics-before/after`, all 3 nodes): **control**
+`match` 19.4-21.2, `settle` 19.3-20.9, `end_resident` 1.00, all other sites 0; **pool** 0 at every site, including
+`end_resident`. The pool's `end_resident` counter is 1 per process (one long-lived holder thread, efcd1548 `spawn_count.rs`),
+not 1 per block. So the "end_resident = 1 per native block" expectation in the request applies to the control only.
+**Hard check passed:** ~0 forks per native block on the pool after warm-up (0 in both 45 s windows; the smoke saw 1 fork in 45 s,
+from the flush worker).
+
+### 50.2 Throughput, CPU and exec time (u cells, n = 4 per arm, 95% CI)
+
+| | k control `c97f56f9` | p pool `efcd1548` | p vs k |
+|---|---|---|---|
+| matched/s | 198,392 | 196,035 | -1.2% [-5.0, +2.6] |
+| native blocks/s | 3.48 | 3.49 | +0.3% [-7.6, +8.2] |
+| node CPU-s/1M (whole run) | 25.19 | 25.29 | +0.4% [-1.8, +2.6] |
+| node CPU at equal fills (ANCOVA) | | | -0.7% [-1.5, +0.0] |
+| val0 exited-thread sys CPU-s/1M (1 Hz task sampler, the spawned workers) | 0.111-0.128 | 0.006-0.013 | **-0.11** |
+| val0 process sys CPU-s/1M | 1.56-1.64 | 1.54-1.71 | not resolved |
+| exec chain_ms per native block (summary) | 260.9 | 259.9 | -0.4% [-4.8, +4.0] |
+| exec wall per native block (logs) mean / p50 / p99 ms | 331.9 / 349.8 / 639.9 | 333.0 / 352.9 / 651.6 | mean +0.3% [-3.0, +3.7], p50 +0.9% [-2.2, +4.0], p99 +1.8% [-4.4, +8.0] |
+| exec thread busy | 0.955 | 0.956 | +0.2% [-0.7, +1.0] |
+| fills per native block | 56,126 | 54,555 | -2.8% [-6.5, +0.9] |
+| engine ms per 1k fills | 3.79 | 3.85 | +1.5% [-1.4, +4.4] |
+| `end_resident` (off-chain) / `end_resident_wait` ms per block | 38.3 / 6.9 | 37.1 / 6.4 | |
+| `residual_untimed` ms per block | 14.1 | 18.2 (r4-p 31.5, others 13.2-14.5) | not resolved |
+| commit interval p99 ms (logs) | 1,103 | 1,088 | -1.4% [-4.2, +1.4] |
+| RSS peak GB | 4.41 | 4.42 | |
+
+The perf cells: pp 25.58 vs pk 26.65 CPU-s/1M. That gap is the perf trap of section 44.2 (inherited per-thread events are
+charged on every new thread, and the pool creates none), not a pool saving.
+
+**Verdict:** the pool works as designed: 0 spawns per block at match, settle and end_resident, and 0 forks in perf. Its
+expected gain (~0.05-0.15 CPU-s/1M, ~1 ms of ~330 ms exec wall per block) does **not resolve** at n = 4 x 120 s in commit
+mode. The CIs on CPU (±2.2%) and exec wall (±3.3%) are 5-10x the expected effect. Only the spawned threads' own sys CPU
+shows the saving (0.11 CPU-s/1M). No regression is visible either. Resolving +0.4% would need ~25x the cells, or a
+paired fixed-load microbench (section 44.2's `spawnbench.rs` already gives 0.7 ms per 32-way scope).
+
+Analysis (`tools/ozarchy-p23b-tools/analyst/`): `a-cells.py` / `a-arms.py` (section 48), `p23-spawn.py` and `p23-exited.py`
+(section 44, copied, the empty-fork guard added), `forks.txt`. Outputs in `ozarchy-p23b-run/analyst/` on ozarchy.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -5720,6 +5789,10 @@ Analysis (`tools/ozarchy-p3g2-tools/analyst/`): the section 48 scripts (`a-cells
 - **P2-3 worker pool (backlog): sized** (section 44, plan review log row 49). Main `4e7fa146` spawns 41
   threads per native block (exact perf FORK counts), all on the execution thread (match 32-way, settle,
   end-resident). A pool saves ~0.05-0.15 CPU-s/1M (ceiling 0.28) and ~0.9-1.4 ms per native block.
+  **A/B done (section 50, review log row 55):** `perf/p2-3-worker-pool` `efcd1548` vs its merge-base `c97f56f9`, commit
+  tail, n = 4: 0 forks per native block (perf) vs 44-46, all spawn counters 0; exited-thread sys -0.11 CPU-s/1M; matched/s
+  -1.2% [-5.0, +2.6], CPU-s/1M +0.4% [-1.8, +2.6] (-0.7% at equal fills), exec wall per block +0.3% [-3.0, +3.7]: the
+  expected ~0.4% gain does not resolve at this n, no regression seen. Merge decision is the owner's.
 - **Phase 3 step 2 gate (commit-tail mode): owner decision needed** (section 47, plan review log row 52). Step 2
   `2296be67` vs main `c97f56f9`, n = 4, shared NVMe: CPU-s/1M -7.4% (-9.2% at equal fills, met), device writes -53% (met),
   matched/s -2.2% [-7.1, +2.7] (tie, not up), native blocks/s -9.4% [-18.6, -0.2] (borderline; -6.7% [-14.9, +1.4] without
