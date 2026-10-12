@@ -251,12 +251,19 @@ struct Dropper {
     /// Items freed on the thread (tests).
     #[cfg_attr(not(test), allow(dead_code))]
     dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Items handed over, the thread's and the inline frees (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    handed: std::sync::atomic::AtomicU64,
 }
 
 impl Dropper {
     /// Items queued at most; past it (or with the thread gone) the caller
-    /// frees the item itself.
-    const QUEUE: usize = 1024;
+    /// frees the item itself. Per block E hands over ~2 (the previous view,
+    /// a replaced full set), which the thread frees in a fraction of a
+    /// block; a lagging thread then costs E its old inline frees instead of
+    /// retaining more retired layers (review: each can be a whole window).
+    /// Retained at most: 2 queued + 1 being freed.
+    const QUEUE: usize = 2;
 
     /// `None`: the thread could not start (E frees everything itself).
     fn spawn() -> Option<Self> {
@@ -273,20 +280,32 @@ impl Dropper {
             })
             .map_err(|e| tracing::warn!(%e, "item 6 Phase 3: dropper thread did not start — the exec thread frees released layers itself"))
             .ok()?;
-        Some(Self { tx, dropped })
+        Some(Self {
+            tx,
+            dropped,
+            handed: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Hand `item` over to be freed (freed here if the queue is full).
     fn drop_later<T: Send + 'static>(&self, item: T) {
+        self.handed.fetch_add(1, Ordering::Relaxed);
         if let Err(back) = self.tx.try_send(Box::new(item)) {
             drop(back);
         }
     }
 
-    /// Items freed so far.
+    /// Items freed on the thread so far.
     #[cfg_attr(not(test), allow(dead_code))]
     fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Items handed over so far (freed on the thread or, past the queue,
+    /// by the caller).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn handed(&self) -> u64 {
+        self.handed.load(Ordering::Relaxed)
     }
 }
 
@@ -24476,7 +24495,10 @@ mod crash_recovery_tests {
         release.send(()).unwrap();
         for _ in 0..2 {
             assert_eq!(
-                names.recv_timeout(Duration::from_secs(5)).unwrap().as_deref(),
+                names
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .as_deref(),
                 Some("torus-ckpt-drop")
             );
         }
@@ -24501,16 +24523,16 @@ mod crash_recovery_tests {
             assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         }
         assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
-        let dropped = || {
-            let st = ctx.ckpt.lock().unwrap();
-            st.dropper.as_ref().map(Dropper::dropped)
-        };
+        // Handed over (the thread frees them, or E past a full queue).
+        let n = ctx
+            .ckpt
+            .lock()
+            .unwrap()
+            .dropper
+            .as_ref()
+            .map(Dropper::handed)
+            .expect("a dropper with an interval");
         let want = blocks.len() as u64 / 2;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while dropped().is_some_and(|n| n < want) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        let n = dropped().expect("a dropper with an interval");
         assert!(
             n >= want,
             "released off E: {n} over {} blocks",
