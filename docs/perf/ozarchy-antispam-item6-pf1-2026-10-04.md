@@ -5750,12 +5750,15 @@ Analysis (`tools/ozarchy-p23b-tools/analyst/`): `a-cells.py` / `a-arms.py` (sect
 
 ## 51. Phase 3 allocator A/B: glibc vs jemalloc on step 2 `7b006739` and main `219f0c20`, commit-tail mode (campaign ozarchy-p3alloc, 2026-10-12)
 
-**jemalloc lowers step 2's RSS and its growth, and step 2 runs faster under it, but the Phase 3 RSS delta stays far above
-the ~270 MB gate under both allocators.** The deltas (step 2 - control) are glibc +1.55 GB peak / +1.08 GB mean and
+**jemalloc lowers step 2's RSS and its growth, but the Phase 3 RSS delta stays far above the ~270 MB gate under both
+allocators, and at equal fills jemalloc costs step 2 CPU.** The deltas (step 2 - control) are glibc +1.55 GB peak / +1.08 GB mean and
 jemalloc +0.97 GB peak / +0.71 GB mean. Under jemalloc, step 2's peak RSS is -0.32 GB [-0.53, -0.12] and its growth is
 1.01 vs 1.64 GB/min. Its matched/s is +3.6% [+2.2, +5.0] and its exec wall per native block -13%. Whole-run CPU-s/1M is
--1.1% [-2.6, +0.5]. On main, jemalloc costs CPU (+1.5% [+0.9, +2.2]) and leaves matched/s and RSS unresolved.
-**Soak winner: jemalloc** (rule and caveat in 51.3).
+-1.1% [-2.6, +0.5], but at equal fills it is +4.0% [+1.6, +6.3]. The offered load is not the same in the two
+allocators: under jemalloc, blocks commit ~15% faster, so the closed-loop bench (4 in flight per sender, released on
+commit) submits +13-14% more (51.2). On main, jemalloc costs CPU (+1.5% [+0.9, +2.2] whole run, +1.9% [-0.4, +4.1] at
+equal fills) and leaves matched/s and RSS unresolved. **Soak winner: glibc**, because jemalloc fails the CPU condition at
+equal fills (rule in 51.3).
 All 16 measured cells are valid for throughput. 3 step 2 cells are REJECT on agreement, all from the known mark-only digest artifact (51.4).
 
 Owner request (18c, s112, after section 49): an allocator A/B of section 48's retention question on the next step 2 head,
@@ -5816,23 +5819,47 @@ The je r1 cells (r1-jgm, r1-jg2) ran 4.4 native blocks/s with smaller blocks (~4
 0.27 GB. jemalloc removes ~0.6 GB of the delta (about the glibc retention that section 48 estimated, "about half of each
 Phase 3 delta"). The rest is live heap (section 48.2: view, `L`, and the commit-mode backlog).
 
-**Load caveat:** the jemalloc nodes accept +13-14% more of the bench's offered load (submit rate 1,317-1,331 vs 1,163 per s)
-and carry a larger exec backlog (+11-15 blocks). Over the whole run (including the drain), the je cells execute ~14% more
-fills. The bench-window matched/s gain is +0.6% on main and +3.6% on step 2. The larger backlog under jemalloc works
-against its RSS, so its RSS gain is if anything understated. The ANCOVA "equal fills" line for step 2 extrapolates a
-common slope across that ~14% gap, which is ~10x the within-arm spread of fills (sd ~1-2%), so it depends on the model.
-The whole-run CPU-s/1M (the gate metric of sections 47-50) does not resolve a change.
+**Where the extra submits under jemalloc come from (both binaries, +13-14%).** The load generator is the same binary
+in every arm (md5 `05d44313`, no preload; `node-preload.txt` shows `LD_PRELOAD` only on the 3 node pids). It is closed-loop:
+each sender keeps at most 4 actions in flight, and in commit-tail mode a slot is released only when the action's block
+commits. Every arm shows `released_committed` only, with 0 timeouts and 0-10 refusals per cell. So the submit rate follows
+the commit cadence, and the commit cadence is what changes:
+
+| (bench window, mean of 4 cells) | gm | jgm | g2 | jg2 |
+|---|---|---|---|---|
+| blocks committed per s (logs, 3 nodes) | 3.82 | 4.39 (+15%) | 3.67 | 4.34 (+18%) |
+| commit interval mean ms | 262 | 231 | 271 | 229 |
+| bench submits per s | 1,163 | 1,317 | 1,163 | 1,331 |
+| RPC submit admit / verify / permit wait ms per call (node metrics) | 0.91 / 12.1 / 6.6 | 0.99 / 13.4 / 7.9 | 0.87 / 10.7 / 6.5 | 0.84 / 10.7 / 6.2 |
+| `torus_view_proposal_arrival` ms | 67.8 | 59.9 | 65.3 | 53.4 |
+| `torus_block_build` ms (select) | 25.4 (13.3) | 33.3 (18.1) | 20.8 (9.5) | 24.1 (11.5) |
+
+The node-side RPC path is **not** faster under jemalloc: admit, verify and permit wait per call are flat or slightly
+higher. What is faster is the consensus round: proposals arrive 12-18% sooner, and blocks commit 15-18% more often.
+Block build is slower per block (more mempool to select from). Which allocation-heavy step of the round gains the
+most is not resolved here (no profile). The extra admitted actions cannot be executed: exec is at its ceiling (busy
+0.96-0.97). They go into the exec backlog (+11-15 blocks) and the mempool. Bench-window matched/s therefore moves only
++0.6% on main and +3.6% on step 2, while over the whole run, drain included, the je cells execute ~14% more fills
+(`a-submit.py`, `submit.txt`).
+
+**This confounds the allocator comparison.** The offered (admitted) load is ~14% higher under jemalloc in both
+binaries. Whole-run CPU-s/1M then mixes the allocator with a different load, so the verdict uses CPU at equal fills
+(ANCOVA on node CPU-s vs fills per cell): step 2 **+4.0% [+1.6, +6.3]**, main +1.9% [-0.4, +4.1]. Caveat: the ~14% fills
+gap is ~10x the within-arm spread (sd ~1-2%), so this adjustment extrapolates a common slope (14-24 CPU-s per 1M fills).
+It is the better of the two estimates, not an exact one. The RSS comparison is conservative for jemalloc, since it
+carries the larger backlog and still has the lower peak.
 
 ### 51.3 Soak winner
 
 Rule (the owner's criterion, made explicit): the winner is the allocator with the lower step 2 RSS peak (Welch CI
-excludes 0), provided that neither step 2 matched/s nor step 2 whole-run CPU-s/1M has a 95% CI lying entirely on the
-regression side. If no allocator qualifies, glibc stays (the production default). **jemalloc qualifies:** peak -0.32 GB
-[-0.53, -0.12], matched/s +3.6% [+2.2, +5.0], CPU-s/1M -1.1% [-2.6, +0.5]. Caveats for the owner: (a) on main, jemalloc
-is +1.5% [+0.9, +2.2] CPU-s/1M; (b) the step 2 equal-fills line is +4.0% [+1.6, +6.3], from the extrapolation above;
-(c) jemalloc raises early RSS (first 15 s +0.7-0.8 GB on both binaries) and lowers growth, and the bench-window mean RSS
-is flat (+0.8% [-2.0, +3.5]), so the soak, not these 120 s cells, will show whether the lower slope holds. The soak runs
-with `SOAK_ALLOC=je`.
+excludes 0), provided that neither step 2 matched/s nor step 2 CPU-s/1M **at equal fills** (the offered load differs,
+above) has a 95% CI lying entirely on the regression side. If jemalloc does not qualify, glibc stays (the production
+default). jemalloc has the lower peak (-0.32 GB [-0.53, -0.12]) and no matched/s regression (+3.6% [+2.2, +5.0]). But its
+step 2 CPU at equal fills is +4.0% [+1.6, +6.3], a CI entirely on the regression side. **jemalloc does not qualify, so the
+soak winner is glibc** (`SOAK_ALLOC=glibc`). On whole-run CPU-s/1M (-1.1% [-2.6, +0.5]) jemalloc would have qualified:
+the decision rests on the equal-fills adjustment and its extrapolation caveat. Also: jemalloc raises early RSS (first
+15 s +0.7-0.8 GB on both binaries) and lowers growth, and the bench-window mean RSS is flat (+0.8% [-2.0, +3.5]). A
+jemalloc soak is the follow-up if the owner wants the slope question answered for it too.
 
 ### 51.4 Digest artifact in 3 step 2 cells
 
@@ -5855,13 +5882,14 @@ what produces the mark DISAGREE (the odd node reads the accounts at a different 
 (1097). 0 of 8 control cells disagree; 3 of 8 step 2 cells do.
 
 **Verdict:** under either allocator, Phase 3's RAM cost is ~1-1.5 GB at 120 s against a ~270 MB bound, so the gate's RAM
-line is not met. jemalloc takes ~0.6 GB of retention off step 2 and lowers its growth by 39%, and does not cost step 2
-matched/s or whole-run CPU-s/1M. It does cost ~1.5% CPU on main. Phase 3's CPU and write wins hold under both allocators
-(CPU-s/1M -6.5% / -8.9%, writes -54% / -51%). Next: the soak (`SOAK_ALLOC=je`, 600 s per arm), to see whether step 2's
-RSS levels off.
+line is not met. jemalloc takes ~0.6 GB of retention off step 2 and lowers its growth by 39%. It also speeds the
+consensus round (+15-18% commits/s), which raises the closed-loop bench's admitted load by 13-14%. At equal fills it costs
+CPU: step 2 +4.0% [+1.6, +6.3], main +1.9% [-0.4, +4.1]. Phase 3's CPU and write wins hold under both allocators
+(CPU-s/1M -6.5% / -8.9%, writes -54% / -51%). Next: the soak on glibc (`SOAK_ALLOC=glibc`, 600 s per arm), to see whether
+step 2's RSS levels off.
 
 Analysis (`tools/ozarchy-p3alloc-tools/analyst/`): `a-cells.py` / `a-arms.py` (section 48, unchanged), `a-archive.py`,
-`digest.txt` (per node digest wall / height / digest). Outputs in `ozarchy-p3alloc-run/analyst/` on ozarchy.
+`digest.txt` (per node digest wall / height / digest), `a-submit.py` / `submit.txt` (RPC and proposal latency per arm). Outputs in `ozarchy-p3alloc-run/analyst/` on ozarchy.
 
 ## Open
 
@@ -5928,7 +5956,8 @@ Analysis (`tools/ozarchy-p3alloc-tools/analyst/`): `a-cells.py` / `a-arms.py` (s
   main `219f0c20`, glibc and jemalloc 5.3.1 (LD_PRELOAD, defaults), commit tail, n = 4: the Phase 3 RSS delta is +1.55 GB
   peak under glibc and +0.97 GB under jemalloc (bound ~270 MB). jemalloc on step 2: peak -0.32 GB [-0.53, -0.12], growth
   1.64 -> 1.01 GB/min, matched/s +3.6% [+2.2, +5.0], CPU-s/1M -1.1% [-2.6, +0.5]; on main it costs +1.5% [+0.9, +2.2]
-  CPU-s/1M. Soak winner: jemalloc (soak 600 s per arm, `SOAK_ALLOC=je`). Owner: whether to ship jemalloc (a global
+  CPU-s/1M; offered load differs (je commits +15-18% faster, so the closed-loop bench submits +13-14% more), so the
+  verdict uses CPU at equal fills: step 2 +4.0% [+1.6, +6.3] -> soak winner glibc (`SOAK_ALLOC=glibc`). Owner: whether to ship jemalloc (a global
   allocator or a packaging preload) is a separate decision. 3 of 8 step 2 cells hit the mark-only digest artifact (0 of 8
   control): the glibc step 2 digest is bimodal (17-21 s or 72-95 s per node).
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run

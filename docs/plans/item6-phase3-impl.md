@@ -313,8 +313,9 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
 - **Allocator A/B** (campaign `ozarchy-p3alloc`, results doc section 51, plan-2 row 56): step 2 `7b006739` vs main
   `219f0c20`, glibc vs jemalloc 5.3.1 (LD_PRELOAD, defaults), commit tail, n = 4. Phase 3 RSS delta +1.55 GB peak (glibc)
   / +0.97 GB (jemalloc): the RAM gate (~270 MB) is not met under either. jemalloc on step 2: peak -0.32 GB, growth
-  1.64 -> 1.01 GB/min, matched/s +3.6%, CPU-s/1M -1.1% (tie); on main +1.5% CPU-s/1M. CPU-s/1M -6.5% / -8.9% and writes
-  -54% / -51% (Phase 3, glibc / jemalloc). Soak (600 s per arm) on jemalloc next.
+  1.64 -> 1.01 GB/min, matched/s +3.6%, but CPU at equal fills +4.0% (je commits +15-18% faster, so the closed-loop
+  bench submits +13-14% more: offered load differs). CPU-s/1M -6.5% / -8.9% and writes
+  -54% / -51% (Phase 3, glibc / jemalloc). Soak (600 s per arm) on glibc next.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
