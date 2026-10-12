@@ -521,6 +521,8 @@ mod tests {
     use serde_json::json;
 
     /// A node stub: `(method, first param, result)`; any other call is `null`.
+    /// A call without params matches first param `null`; a result
+    /// `{"__error": msg}` is answered with a JSON-RPC error.
     async fn mock_node(
         responses: Vec<(&'static str, Value, Value)>,
     ) -> (jsonrpsee::server::ServerHandle, String) {
@@ -531,6 +533,7 @@ mod tests {
         let url = format!("http://{}", server.local_addr().unwrap());
         let mut module = jsonrpsee::RpcModule::new(());
         let mut methods: Vec<&'static str> = responses.iter().map(|r| r.0).collect();
+        methods.sort_unstable();
         methods.dedup();
         for method in methods {
             let table: Vec<(Value, Value)> = responses
@@ -543,11 +546,20 @@ mod tests {
                     let first = params
                         .parse::<Vec<Value>>()
                         .ok()
-                        .and_then(|p| p.first().cloned());
-                    table
+                        .and_then(|p| p.first().cloned())
+                        .unwrap_or(Value::Null);
+                    let result = table
                         .iter()
-                        .find(|(key, _)| Some(key) == first.as_ref())
-                        .map_or(Value::Null, |(_, result)| result.clone())
+                        .find(|(key, _)| *key == first)
+                        .map_or(Value::Null, |(_, result)| result.clone());
+                    match result.get("__error").and_then(Value::as_str) {
+                        Some(msg) => Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                            -32000,
+                            msg.to_string(),
+                            None::<()>,
+                        )),
+                        None => Ok(result),
+                    }
                 })
                 .unwrap();
         }
@@ -856,5 +868,221 @@ mod tests {
         db.delete_block_data(10).unwrap();
         assert!(db.get_block(10).unwrap().is_none());
         assert!(db.get_transaction("0xtx_old").unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // R30: a block is indexed whole or not at all; the cursor never passes a gap.
+    // -----------------------------------------------------------------------
+
+    fn r30_tx(hash: &str) -> Value {
+        json!({"hash": hash, "from": "0xa1", "to": "0xb2", "value": "0x0", "gas": "0x5208",
+               "gasPrice": "0x3b9aca00", "input": "0x", "nonce": "0x0", "type": "0x2"})
+    }
+
+    fn r30_block(height: u64, txs: Vec<Value>) -> Value {
+        json!({"number": format!("0x{height:x}"), "hash": format!("0xb{height}"),
+               "parentHash": "0x00", "timestamp": "0x1", "miner": "0xm", "gasUsed": "0x0",
+               "gasLimit": "0x1", "baseFeePerGas": "0x1", "stateRoot": "0x0", "transactions": txs})
+    }
+
+    fn r30_body(txs: Vec<Value>, actions: Vec<Value>) -> Value {
+        let st: Vec<&str> = txs.iter().map(|_| "executed").collect();
+        let ast: Vec<&str> = actions.iter().map(|_| "executed").collect();
+        json!({"nativeActions": actions, "nativeActionStatus": ast,
+               "evmTransactions": txs, "evmTransactionStatus": st})
+    }
+
+    fn r30_receipt() -> Value {
+        json!({"gasUsed": "0x5208", "status": "0x1", "contractAddress": null,
+               "logs": [{"transactionHash": "0x0a", "logIndex": "0x0", "address": "0xc",
+                         "topics": ["0x01"], "data": "0x"}]})
+    }
+
+    /// A healthy node with blocks `0..=head`; block 1 has tx 0x0a (one log)
+    /// and one native action; block 1 has one trade.
+    fn r30_good_node(head: u64) -> Vec<(&'static str, Value, Value)> {
+        let mut r = vec![
+            ("eth_blockNumber", Value::Null, json!(format!("0x{head:x}"))),
+            ("eth_getTransactionReceipt", json!("0x0a"), r30_receipt()),
+            (
+                "torus_getBlockTrades",
+                json!(1),
+                json!([{"marketId": "0x1", "timestamp": "0x3c",
+                        "price": "100.00000000", "quantity": "2.00000000"}]),
+            ),
+        ];
+        for h in 0..=head {
+            let txs = if h == 1 { vec![r30_tx("0x0a")] } else { vec![] };
+            let actions = if h == 1 {
+                vec![json!({"PlaceOrder": {"market_id": 1}})]
+            } else {
+                vec![]
+            };
+            r.push((
+                "eth_getBlockByNumber",
+                json!(format!("0x{h:x}")),
+                r30_block(h, txs.clone()),
+            ));
+            r.push(("torus_getBlockBody", json!(h), r30_body(txs, actions)));
+            r.push(("torus_getBlockTrades", json!(h), json!([])));
+        }
+        // The first torus_getBlockTrades entry for height 1 wins (find).
+        r
+    }
+
+    fn r30_with(
+        mut node: Vec<(&'static str, Value, Value)>,
+        method: &'static str,
+        key: Value,
+        result: Value,
+    ) -> Vec<(&'static str, Value, Value)> {
+        node.retain(|(m, k, _)| !(*m == method && *k == key));
+        node.insert(0, (method, key, result));
+        node
+    }
+
+    fn r30_assert_block1_complete(db: &ExplorerDb) {
+        assert_eq!(db.get_block(1).unwrap().unwrap().hash, "0xb1");
+        let txs = db.get_block_transactions(1).unwrap();
+        assert_eq!(txs.len(), 1, "tx row");
+        assert_eq!(txs[0].status, TxStatus::Success);
+        assert!(db.get_transaction("0x0a").unwrap().is_some());
+        assert_eq!(db.get_transaction_logs("0x0a").unwrap().len(), 1, "log row");
+        assert_eq!(
+            db.get_block_native_actions(1).unwrap().len(),
+            1,
+            "native action row"
+        );
+        let candles = db.get_candles(1, "1m", None, None, 10).unwrap();
+        assert_eq!(candles.len(), 1, "one candle");
+        assert_eq!(candles[0].trade_count, 1, "trade counted exactly once");
+    }
+
+    /// R30: a body fetch error fails the block (no row at all, cursor not
+    /// moved) instead of storing it without its native actions.
+    #[tokio::test]
+    async fn body_fetch_error_fails_the_block_and_writes_nothing() {
+        let node = r30_with(
+            r30_good_node(1),
+            "torus_getBlockBody",
+            json!(1),
+            json!({"__error": "body unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.index_block(0).await.unwrap();
+        assert!(
+            indexer.index_block(1).await.is_err(),
+            "body error is an error"
+        );
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(0));
+        handle.stop().unwrap();
+
+        // A missing body (null) for a block the node served is also an error.
+        let node = r30_with(
+            r30_good_node(1),
+            "torus_getBlockBody",
+            json!(1),
+            Value::Null,
+        );
+        let (handle, url) = mock_node(node).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(
+            indexer.index_block(1).await.is_err(),
+            "missing body is an error"
+        );
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        handle.stop().unwrap();
+    }
+
+    /// R30: a receipt fetch error mid-block leaves no block row, so the retry
+    /// (same hash) indexes the whole block instead of skipping it.
+    #[tokio::test]
+    async fn receipt_error_then_retry_indexes_the_whole_block() {
+        let node = r30_with(
+            r30_good_node(1),
+            "eth_getTransactionReceipt",
+            json!("0x0a"),
+            json!({"__error": "receipt unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.index_block(0).await.unwrap();
+        assert!(indexer.index_block(1).await.is_err());
+        assert!(db.get_block(1).unwrap().is_none(), "no partial block row");
+        handle.stop().unwrap();
+
+        let (handle, url) = mock_node(r30_good_node(1)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.index_block(1).await.unwrap();
+        r30_assert_block1_complete(&db);
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(1));
+        // Same hash again: skipped, nothing counted twice.
+        indexer.index_block(1).await.unwrap();
+        r30_assert_block1_complete(&db);
+        handle.stop().unwrap();
+    }
+
+    /// R30: backfill stops at a failing block (error returned, cursor before
+    /// it) instead of indexing past the gap; the next pass resumes there.
+    #[tokio::test]
+    async fn backfill_stops_at_a_failing_block_and_resumes_there() {
+        let node = r30_with(
+            r30_good_node(3),
+            "torus_getBlockBody",
+            json!(1),
+            json!({"__error": "body unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(
+            indexer.backfill().await.is_err(),
+            "backfill reports the failure"
+        );
+        assert_eq!(
+            db.get_last_indexed_height().unwrap(),
+            Some(0),
+            "cursor before the gap"
+        );
+        for h in 1..=3 {
+            assert!(
+                db.get_block(h).unwrap().is_none(),
+                "nothing past the gap: {h}"
+            );
+        }
+        handle.stop().unwrap();
+
+        let (handle, url) = mock_node(r30_good_node(3)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(3));
+        r30_assert_block1_complete(&db);
+        for h in 0..=3 {
+            assert!(db.get_block(h).unwrap().is_some(), "block {h}");
+        }
+        handle.stop().unwrap();
+    }
+
+    /// R30: a height the node does not serve (null block at or below its
+    /// head) is an error, not a silent success the cursor can pass.
+    #[tokio::test]
+    async fn missing_block_below_head_is_an_error() {
+        let node = r30_with(
+            r30_good_node(2),
+            "eth_getBlockByNumber",
+            json!("0x1"),
+            Value::Null,
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(indexer.backfill().await.is_err());
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(0));
+        assert!(db.get_block(2).unwrap().is_none());
+        handle.stop().unwrap();
     }
 }
