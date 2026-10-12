@@ -181,8 +181,8 @@ pub(crate) fn eth_head(state: &RpcState) -> u64 {
 
 /// R22: the block a state read (eth_call, eth_estimateGas, eth_getBalance,
 /// eth_getCode, eth_getStorageAt, eth_getTransactionCount) may name. Only the
-/// state at the eth head is kept, so "latest", "pending" and the head's number
-/// resolve to it; any other block (older, newer, or "earliest" above genesis)
+/// state at the eth head is kept, so "latest", "pending", "safe", "finalized"
+/// (committed = final under HotStuff BFT) and the head's number resolve to it; any other block (older, newer, or "earliest" above genesis)
 /// is `HistoricalStateUnavailable`, never an answer from current state.
 fn head_state_block(state: &RpcState, block: &str) -> Result<u64, RpcError> {
     let head = eth_head(state);

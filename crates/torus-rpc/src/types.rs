@@ -19,14 +19,10 @@ pub fn hex_u128(v: u128) -> String {
     format!("{:#x}", v)
 }
 
+/// Ethereum JSON-RPC QUANTITY: compact hex with no leading zero digits
+/// ("0x0" for zero), unlike the fixed-width DATA helpers below.
 pub fn hex_u256(v: U256) -> String {
-    if v.is_zero() {
-        return "0x0".to_string();
-    }
-    let bytes = v.to_be_bytes::<32>();
-    // Skip leading zeros.
-    let start = bytes.iter().position(|&b| b != 0).unwrap_or(31);
-    format!("0x{}", hex::encode(&bytes[start..]))
+    format!("{:#x}", v)
 }
 
 pub fn hex_b256(v: B256) -> String {
@@ -96,11 +92,12 @@ pub fn parse_bytes(s: &str) -> Result<Vec<u8>, RpcError> {
     hex::decode(s).map_err(|e| RpcError::InvalidParams(format!("bad hex: {e}")))
 }
 
-/// Resolve an Ethereum block tag ("latest", "earliest", "pending", or hex number)
-/// to a concrete block number.
+/// Resolve an Ethereum block tag ("latest", "earliest", "pending", "safe",
+/// "finalized", or hex number) to a concrete block number. HotStuff BFT: a
+/// committed block is final, so "safe" and "finalized" are the head too.
 pub fn resolve_block_tag(tag: &str, latest: u64) -> Result<u64, RpcError> {
     match tag {
-        "latest" | "pending" => Ok(latest),
+        "latest" | "pending" | "safe" | "finalized" => Ok(latest),
         "earliest" => Ok(0),
         s => parse_u64(s),
     }

@@ -1139,7 +1139,10 @@ mod tests {
             hex_u256(U256::from(2_000_000_000_000_000_000u128)),
             "0x1bc16d674ec80000"
         );
-        assert_eq!(hex_u256(U256::from(1u64) << 255), format!("0x8{}", "0".repeat(63)));
+        assert_eq!(
+            hex_u256(U256::from(1u64) << 255),
+            format!("0x8{}", "0".repeat(63))
+        );
         assert_eq!(hex_u256(U256::MAX), format!("0x{}", "f".repeat(64)));
         assert_eq!(hex_u64(0), "0x0");
         assert_eq!(hex_u64(7), "0x7");
@@ -5960,18 +5963,18 @@ mod tests {
         // "pending" nonce keeps its mempool path.
         assert!(read("eth_getTransactionCount", "pending").await.is_ok());
 
-        let call =
-            serde_json::json!({ "from": who_s, "to": hex_address(Address::from([0x22; 20])) });
+        // A caller without code (`who` has code, which EIP-3607 refuses).
+        let call = serde_json::json!({
+            "from": hex_address(Address::from([0x33; 20])),
+            "to": hex_address(Address::from([0x22; 20])),
+        });
         // HotStuff BFT: committed = final, so "safe" and "finalized" are the
         // head for eth_call too.
         for tag in ["latest", "0x3", "safe", "finalized"] {
-            assert!(
-                client
-                    .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
-                    .await
-                    .is_ok(),
-                "eth_call at {tag}"
-            );
+            let r = client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
+                .await;
+            assert!(r.is_ok(), "eth_call at {tag}: {r:?}");
         }
         for tag in ["0x2", "earliest", "0x4", "0x5", "0x63"] {
             let call_err = client
