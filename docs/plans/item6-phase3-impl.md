@@ -313,6 +313,10 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
 - **Soak** (campaign `ozarchy-p3soak`, results doc section 53, plan-2 row 58): step 2 `7b006739` vs main `219f0c20`, glibc,
   600 s each: step 2 RSS still +40-67 MB/min per node at 10 min (main +3-11), Phase 3 delta +1.98 GB per node at 10 min:
   no plateau (growth finding). Cancel-all expiry hits both arms from minute 2 (~18k per node), matched/s -30% from minute 6.
+- **Soak on jemalloc** (campaign `ozarchy-p3soakje`, results doc section 53b, plan-2 row 59): the same pair on jemalloc 5.3.1
+  (defaults): step 2 RSS flat after ~2 min, Phase 3 delta +0.68 GB per node (minutes 5-10 mean; +1.01 GB peak). So the
+  glibc growth is allocator retention. Layer size and resting orders do not grow. The minute-6 matched/s drop is margin
+  rejections in the econ workload.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
