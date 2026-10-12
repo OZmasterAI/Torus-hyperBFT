@@ -52,6 +52,11 @@ pub enum GenesisError {
     InvalidMarket(String),
     #[error("invalid fee_split: {0}")]
     InvalidFeeSplit(String),
+    /// R19: two spellings of one canonical key (address case / 0x prefix,
+    /// storage slot "0" vs "0x0"). Refused instead of letting HashMap order
+    /// pick the value.
+    #[error("duplicate genesis key: {0}")]
+    DuplicateKey(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -297,16 +302,48 @@ fn parse_fixedpoint_raw(s: &str) -> Result<i128, GenesisError> {
     Ok(if neg { -raw } else { raw })
 }
 
+/// Decode `0x`/`0X`-prefixed or bare hex. R19: an odd digit count or a
+/// non-hex (incl. non-ASCII) character is `InvalidHex`, never a slice panic.
 fn decode_hex(s: &str) -> Result<Vec<u8>, GenesisError> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    let s = s.strip_prefix("0X").unwrap_or(s);
-    (0..s.len())
+    let digits = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if !digits.len().is_multiple_of(2) {
+        return Err(GenesisError::InvalidHex(format!(
+            "{s}: odd number of hex digits"
+        )));
+    }
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(GenesisError::InvalidHex(s.to_string()));
+    }
+    (0..digits.len())
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
+            u8::from_str_radix(&digits[i..i + 2], 16)
                 .map_err(|_| GenesisError::InvalidHex(s.to_string()))
         })
         .collect()
+}
+
+/// R19: `keys` mapped to their canonical form must be distinct. Keys are
+/// visited in sorted order, so the same input always names the same pair.
+fn check_unique_keys<'a, K: Ord>(
+    what: &str,
+    keys: impl Iterator<Item = &'a String>,
+    canon: impl Fn(&str) -> Result<K, GenesisError>,
+) -> Result<(), GenesisError> {
+    let mut keys: Vec<&String> = keys.collect();
+    keys.sort();
+    let mut seen = std::collections::BTreeMap::new();
+    for key in keys {
+        if let Some(prev) = seen.insert(canon(key)?, key) {
+            return Err(GenesisError::DuplicateKey(format!(
+                "{what}: \"{prev}\" and \"{key}\" are the same key"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Convert a stake amount (U256 in wei) to a consensus power value (u64).
@@ -331,7 +368,71 @@ impl Genesis {
     pub fn from_json(json: &str) -> Result<Self, GenesisError> {
         let genesis: Self = serde_json::from_str(json)?;
         genesis.check_fee_split()?;
+        genesis.check_keys_and_hex()?;
         Ok(genesis)
+    }
+
+    /// R19: every hex field decodes and every map key is canonical-unique, so
+    /// a bad genesis fails at load (the node refuses to start) and
+    /// `initialize` never depends on HashMap iteration order.
+    fn check_keys_and_hex(&self) -> Result<(), GenesisError> {
+        check_unique_keys("evm_alloc address", self.evm_alloc.keys(), parse_address)?;
+        for (addr_str, entry) in &self.evm_alloc {
+            parse_u256(&entry.balance)?;
+            if let Some(code_hex) = &entry.code {
+                decode_hex(code_hex)?;
+            }
+            if let Some(storage) = &entry.storage {
+                check_unique_keys(
+                    &format!("evm_alloc[{addr_str}] storage slot"),
+                    storage.keys(),
+                    parse_u256,
+                )?;
+                for value in storage.values() {
+                    parse_u256(value)?;
+                }
+            }
+        }
+        // R19 follow-up (owner s112): an address in both accounts[] and
+        // evm_alloc is refused instead of evm_alloc overwriting the account.
+        let alloc: std::collections::BTreeMap<Address, &String> = self
+            .evm_alloc
+            .keys()
+            .map(|k| Ok((parse_address(k)?, k)))
+            .collect::<Result<_, GenesisError>>()?;
+        for (i, account) in self.accounts.iter().enumerate() {
+            let address = parse_address(&account.address)?;
+            if let Some(alloc_key) = alloc.get(&address) {
+                return Err(GenesisError::DuplicateKey(format!(
+                    "address {address:#x} is in both accounts[{i}] (\"{}\") and evm_alloc \
+                     (\"{alloc_key}\")",
+                    account.address
+                )));
+            }
+        }
+        // Validators are keyed by address (CF_STAKING_VALIDATORS) and by
+        // consensus key (the hotstuff set): both must be unique.
+        let mut by_address = std::collections::BTreeMap::new();
+        let mut by_pubkey = std::collections::BTreeMap::new();
+        for (i, validator) in self.validators.iter().enumerate() {
+            let address = parse_address(&validator.address)?;
+            let pubkey = decode_hex(&validator.pubkey)?;
+            if pubkey.len() != 32 {
+                return Err(GenesisError::InvalidPubkey(validator.pubkey.clone()));
+            }
+            if let Some(j) = by_address.insert(address, i) {
+                return Err(GenesisError::DuplicateKey(format!(
+                    "validator address {address:#x} is in validators[{j}] and validators[{i}]"
+                )));
+            }
+            if let Some(j) = by_pubkey.insert(pubkey.clone(), i) {
+                return Err(GenesisError::DuplicateKey(format!(
+                    "validator pubkey 0x{} is in validators[{j}] and validators[{i}]",
+                    alloy_primitives::hex::encode(&pubkey)
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Row 80 option D: fees are split by the built-in constants
@@ -385,6 +486,10 @@ impl Genesis {
     /// 3. Seeds validator stakes into `CF_STAKING_VALIDATORS`
     /// 4. Computes and returns the state root
     pub fn initialize(&self, state_db: &StateDb) -> Result<B256, GenesisError> {
+        // R19: keys and hex are checked before any write (also for a Genesis
+        // edited after from_json).
+        self.check_keys_and_hex()?;
+
         // 0. Row 43: every market needs tick_size > 0 and lot_size > 0 (books are
         //    built from the market row). Checked before any write.
         for market in &self.markets {
@@ -1176,5 +1281,218 @@ mod tests {
                 "refused before any write"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // R19: malformed hex is an error, not a panic; alias keys are refused.
+    // -----------------------------------------------------------------------
+
+    fn genesis_with(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        edit(&mut v);
+        v.to_string()
+    }
+
+    /// R19: an odd number of hex digits (or a non-ASCII byte) returns
+    /// InvalidHex instead of slicing past the end / mid-character.
+    #[test]
+    fn decode_hex_odd_length_or_non_ascii_is_an_error_not_a_panic() {
+        for bad in ["abc", "0x6", "0X123", "0xé1", "é"] {
+            let r = std::panic::catch_unwind(|| decode_hex(bad));
+            let r = r.unwrap_or_else(|_| panic!("decode_hex({bad:?}) panicked"));
+            assert!(
+                matches!(r, Err(GenesisError::InvalidHex(_))),
+                "decode_hex({bad:?}) = {r:?}"
+            );
+        }
+        assert_eq!(decode_hex("0x").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_hex("0XaBcD").unwrap(), vec![0xab, 0xcd]);
+        assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xff]);
+    }
+
+    /// R19: odd-length validator pubkey / contract code is refused at load,
+    /// so the node never starts on it (and validator_set() errors, not panics).
+    #[test]
+    fn genesis_with_odd_length_hex_is_refused_at_load() {
+        let json = genesis_with(|v| v["validators"][0]["pubkey"] = "0xabc".into());
+        let err = Genesis::from_json(&json).unwrap_err();
+        assert!(matches!(err, GenesisError::InvalidHex(_)), "{err}");
+
+        let json = genesis_with(|v| {
+            v["evm_alloc"]["0xcccccccccccccccccccccccccccccccccccccccc"]["code"] = "0x608".into()
+        });
+        let err = Genesis::from_json(&json).unwrap_err();
+        assert!(matches!(err, GenesisError::InvalidHex(_)), "{err}");
+    }
+
+    /// R19: storage slot keys "0", "0x0", "0X00" are one slot. Two spellings
+    /// in one map are refused (naming both), at load and before any write,
+    /// instead of HashMap order choosing the value.
+    #[test]
+    fn evm_alloc_storage_slot_aliases_are_refused() {
+        for (a, b) in [("0", "0x0"), ("0x0", "0X00"), ("16", "0x10")] {
+            let json = genesis_with(|v| {
+                v["evm_alloc"]["0xcccccccccccccccccccccccccccccccccccccccc"]["storage"] =
+                    serde_json::json!({ a: "0x1", b: "0x2" })
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{a} / {b}: {err}");
+            assert!(
+                err.contains(&format!("\"{a}\"")) && err.contains(&format!("\"{b}\"")),
+                "error names both spellings: {err}"
+            );
+        }
+    }
+
+    /// R19: evm_alloc addresses differing only by case (or 0x prefix) are one
+    /// account; two spellings are refused, naming both.
+    #[test]
+    fn evm_alloc_address_aliases_are_refused() {
+        let lower = "0xcccccccccccccccccccccccccccccccccccccccc";
+        for other in [
+            "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        ] {
+            let json =
+                genesis_with(|v| v["evm_alloc"][other] = serde_json::json!({ "balance": "0x5" }));
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{other}: {err}");
+            assert!(
+                err.contains(&format!("\"{lower}\"")) && err.contains(&format!("\"{other}\"")),
+                "error names both spellings: {err}"
+            );
+        }
+    }
+
+    /// R19 follow-up (owner s112): an address in both accounts[] and
+    /// evm_alloc (any spelling) is refused at load, naming the address,
+    /// instead of evm_alloc silently overwriting the account.
+    #[test]
+    fn address_in_both_accounts_and_evm_alloc_is_refused() {
+        let alloc = "0xcccccccccccccccccccccccccccccccccccccccc";
+        for spelling in [
+            alloc,
+            "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        ] {
+            let json = genesis_with(|v| {
+                v["accounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({ "address": spelling, "balance": "7" }))
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{spelling}: {err}");
+            assert!(err.contains(alloc), "names the address: {err}");
+            assert!(
+                err.contains("accounts") && err.contains("evm_alloc"),
+                "names both lists: {err}"
+            );
+        }
+    }
+
+    /// R19 follow-up (owner s112): two validators with the same address (any
+    /// spelling; CF_STAKING_VALIDATORS is keyed by it) are refused at load,
+    /// naming the address.
+    #[test]
+    fn duplicate_validator_address_is_refused() {
+        let addr = "0x1111111111111111111111111111111111111111";
+        for spelling in [addr, "1111111111111111111111111111111111111111"] {
+            let json = genesis_with(|v| {
+                let vals = v["validators"].as_array_mut().unwrap();
+                let mut dup = vals[0].clone();
+                dup["address"] = spelling.into();
+                dup["pubkey"] =
+                    "0x3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29".into();
+                vals.push(dup);
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{spelling}: {err}");
+            assert!(err.contains("validator"), "{err}");
+            assert!(err.contains(addr), "names the address: {err}");
+        }
+    }
+
+    /// R19 follow-up (owner s112): two validators with the same consensus key
+    /// (any hex case) are refused at load, naming the key.
+    #[test]
+    fn duplicate_validator_pubkey_is_refused() {
+        let key = "0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa3f4a18446b7e8f5f7a1d6";
+        for spelling in [
+            key.to_string(),
+            format!("0x{}", key[2..].to_uppercase()),
+            key[2..].to_string(),
+        ] {
+            let json = genesis_with(|v| {
+                let vals = v["validators"].as_array_mut().unwrap();
+                let mut dup = vals[0].clone();
+                dup["address"] = "0x2222222222222222222222222222222222222222".into();
+                dup["pubkey"] = spelling.clone().into();
+                vals.push(dup);
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{spelling}: {err}");
+            assert!(err.contains("validator"), "{err}");
+            assert!(err.contains(key), "names the key: {err}");
+        }
+    }
+
+    /// R19 follow-up: initialize() refuses an edited Genesis with a
+    /// duplicate validator or an accounts/evm_alloc overlap before any write.
+    #[test]
+    fn initialize_refuses_duplicate_validator_or_overlap_before_any_write() {
+        use torus_state::StateBackend;
+        let base = Genesis::from_json(&sample_genesis_json()).unwrap();
+        let mut dup_validator = base.clone();
+        let mut v = dup_validator.validators[0].clone();
+        v.pubkey = "0x3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29".into();
+        dup_validator.validators.push(v);
+        let mut overlap = base.clone();
+        overlap.accounts.push(GenesisAccount {
+            address: "0xcccccccccccccccccccccccccccccccccccccccc".into(),
+            balance: "1".into(),
+            note: None,
+        });
+        for genesis in [dup_validator, overlap] {
+            let dir = TempDir::new().unwrap();
+            let db = StateDb::open(dir.path()).unwrap();
+            let err = genesis.initialize(&db).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{err}");
+            assert!(
+                db.all_accounts().unwrap().is_empty(),
+                "refused before any write"
+            );
+        }
+    }
+
+    /// R19: a Genesis built without from_json (fields edited after load) is
+    /// still checked by initialize() before the first write.
+    #[test]
+    fn initialize_refuses_alias_keys_before_any_write() {
+        use torus_state::StateBackend;
+        let mut genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        let entry = genesis
+            .evm_alloc
+            .get_mut("0xcccccccccccccccccccccccccccccccccccccccc")
+            .unwrap();
+        entry
+            .storage
+            .as_mut()
+            .unwrap()
+            .insert("0".to_string(), "0x2".to_string());
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let err = genesis.initialize(&db).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(
+            db.all_accounts().unwrap().is_empty(),
+            "refused before any write"
+        );
+        assert!(
+            db.iterate_cf(CF_STAKING_VALIDATORS, None)
+                .unwrap()
+                .is_empty(),
+            "refused before any write"
+        );
     }
 }
