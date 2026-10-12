@@ -548,3 +548,49 @@ binary.
 Self-tests: `test_summarize.py` (`main_phase2_step0`),
 `test_phase_mapping.py` (`test_phase2_step0_series_are_sampled`),
 `test_harness.py` (`test_cancel_by_id_*`).
+
+## In-flight cap block tail (`MAX_IN_FLIGHT`, `IN_FLIGHT_TAIL`)
+
+With `MAX_IN_FLIGHT=N` each bench sender keeps at most N signed actions in
+flight. A slot frees when the action is refused by the RPC, times out (nonce +
+70 s), or is seen committed by ONE shared block-body tail on val2
+(`tools/bench-throughput/src/in_flight.rs`, `run_tail`). `IN_FLIGHT_TAIL`
+(bench `--in-flight-tail`) picks how that tail finds new bodies:
+
+| `IN_FLIGHT_TAIL` | tail reads | releases when |
+|---|---|---|
+| unset (default) or `head` | `eth_blockNumber`, then `torus_getBlockBody` for each height up to it | the node's eth head passes the block |
+| `commit` | `torus_getBlockBody(next)` every 200 ms; a `null` result = not committed yet | the committed body is on disk |
+
+Why `commit` exists: `eth_blockNumber` is `eth_head` in
+`crates/torus-rpc/src/eth.rs`, min(on-disk applied marker, committed height).
+Under item 6 Phase 3 (step 1 and 2) the applied marker reaches the disk only at
+checkpoints (`TORUS_CHECKPOINT_INTERVAL_MS`, ~100 blocks at 15 s), so the head
+moves in steps of ~100 blocks, slots free in bursts, and the senders stall
+(~37 s per 120 s cell in campaign ozarchy-p3c1, results doc section 45.4).
+The body is written at COMMIT, in one RocksDB batch with the header
+(`persist_committed_block_durably_timed`, called from `dispatch_to_exec`
+before execution), and `torus_getBlockBody` reads `CF_BLOCK_BODIES` with no
+head or applied-marker check, so the `commit` tail follows the committed chain.
+
+Differences in `commit` mode:
+
+- The body is read before it executes, so `nativeActionStatus` is usually
+  absent and every action counts as executed: a cancel-all that later fails
+  still resets the sender's open-order estimate (`OPEN_ORDER_BUDGET`).
+- A height that stays without a readable body (null or error) for 5 polls
+  while the next height has one is a hole: counted `missed` and skipped (its
+  actions free by timeout). Errors alone never skip a height in this mode
+  (it may not be committed yet); head mode skips after 5 errors because the
+  height is at or below `eth_blockNumber`.
+- bench.log's `In-flight cap ...` line ends in ` | tail=commit`.
+  summary.json: `cell.in_flight_tail` (`null` = unset = head) and
+  `ingest.in_flight.tail_mode` (from bench.log).
+
+The default stays `head`, so cells run before the knob reproduce. Use `commit`
+for Phase 3 nodes (or any node whose eth head lags commit). Needs a bench built
+from `bench/inflight-commit-tail` or later; an older bench rejects the flag.
+
+Self-tests: `test_harness.py` (`test_in_flight_tail_*`,
+`test_commit_tail_cell_records_the_tail_mode`); bench crate
+`in_flight::tests` (`commit_tail_*`, `body_probe_*`, `tail_mode_*`).
