@@ -1554,9 +1554,9 @@ impl ShutdownWorker {
             .name("node-shutdown-watchdog".into())
             .spawn(move || {
                 if let Ok(limit) = arm_rx.recv() {
-                    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-                        done_rx.recv_timeout(limit)
-                    {
+                    // Timeout: the stop is late. Disconnected: it panicked
+                    // (the sender dropped unwinding), a failed stop.
+                    if done_rx.recv_timeout(limit).is_err() {
                         on_deadline();
                     }
                 }
