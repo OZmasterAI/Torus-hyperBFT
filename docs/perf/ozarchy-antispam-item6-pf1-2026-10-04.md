@@ -5820,10 +5820,11 @@ per-minute matched/s and drift, last-5-min CPU-s/1M, ingest health), `a-cells.py
 ## 53b. Phase 3 soak under jemalloc: step 2 `7b006739` vs main `219f0c20`, 600 s per arm (campaign ozarchy-p3soakje, 2026-10-13)
 
 **Under jemalloc, step 2's RSS levels off by ~minute 2 and then stays flat for the rest of the 10 min. So the continued
-growth of the glibc soak (section 53) is glibc allocator retention, not live data growth.** The step 2 mean RSS over
+growth of the glibc soak (section 53) is consistent with glibc allocator retention rather than live data growth.** The step 2 mean RSS over
 minutes 5-10 vs minutes 2-5 is -133 / -139 / -27 MB per node (glibc: +349 / +329 / +364). The last-5-min slopes are +15 /
-+33 / +28 MB/min, and only one CI excludes 0 (glibc: +63 / +67 / +40, all three exclude 0). The slope is noise from
-jemalloc's decay (RSS swings by +-300 MB around a flat level, see figure 53b-1). The **Phase 3 delta under jemalloc is +0.68 GB per
++33 / +28 MB/min, and only one CI excludes 0 (glibc: +63 / +67 / +40, all three exclude 0). The slopes are most likely
+jemalloc's decay (RSS swings by +-300 MB around a flat level, see figure 53b-1), but slow growth inside those swings is not
+ruled out by one 10 min pair. The **Phase 3 delta under jemalloc is +0.68 GB per
 node** (mean over minutes 5-10; +0.52 to +0.79). It is +0.69 GB at 10 min and +1.01 GB at the peak (val2 +1.29). Under
 glibc it is +1.86 GB (minutes 5-10), +1.98 GB at 10 min and +2.00 GB at the peak. **Owner RAM gate (levels off, delta <=
 ~1 GB/node): met under jemalloc on the level and on the 5-10 min mean, borderline at the peak. Not met under glibc.**
@@ -5976,8 +5977,11 @@ queue stays at the ~60 cap and blocks/s are 2.7-3.7 (single cells; consistent wi
 jemalloc). (b) val2's exec queue gauge sits at ~65 in all four cells (glibc too), so val2 stays at the queue cap
 throughout. That backlog is the commit-mode part of its higher RSS (+0.5-1.0 GB over val0 / val1, all four cells; section 48).
 
-**Verdict:** the jemalloc soak resolves section 53's growth finding as **allocator retention under glibc**. Under jemalloc
-step 2's RSS is flat after ~2 min (no data growth within 10 min) at a Phase 3 delta of **+0.68 GB per node (minutes 5-10
+**Verdict:** the jemalloc soak points to **allocator retention under glibc** as the main cause of section 53's growth
+(consistent with it, not proof: one 10 min pair, and no live-layer or read-view gauge). Under jemalloc step 2's RSS level
+is flat after ~2 min (minutes 5-10 mean below minutes 2-5 on all three nodes), but the last-5-min slopes are still positive
+(+15 / +33 / +28 MB/min; val1's CI [+3, +63] excludes 0), so slow data growth within jemalloc's +-300 MB swings is not
+ruled out; a longer soak would settle it. Phase 3 delta **+0.68 GB per node (minutes 5-10
 mean; +1.01 GB at the peak)**. That meets the owner's "levels off, delta <= ~1 GB/node" rule on the level and on the mean,
 and is borderline at the peak (val2 +1.29 GB). It is still ~2.5x the old ~270 MB gate. Neither the layer size nor the book
 (resting orders) grows over the soak. The minute-6 matched/s drop is margin exhaustion in the econ workload, not
