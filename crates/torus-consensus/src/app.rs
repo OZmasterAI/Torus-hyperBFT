@@ -255,7 +255,6 @@ struct Dropper {
     #[cfg_attr(not(test), allow(dead_code))]
     handed: std::sync::atomic::AtomicU64,
     /// `torus_exec_checkpoint_drop_inline`: items E freed itself.
-    #[allow(dead_code)]
     metrics: Option<Arc<torus_telemetry::Metrics>>,
 }
 
@@ -296,6 +295,9 @@ impl Dropper {
         self.handed.fetch_add(1, Ordering::Relaxed);
         if let Err(back) = self.tx.try_send(Box::new(item)) {
             drop(back);
+            if let Some(m) = &self.metrics {
+                m.exec_checkpoint_drop_inline.inc();
+            }
         }
     }
 
