@@ -1441,7 +1441,6 @@ mod tests {
     /// duplicate validator or an accounts/evm_alloc overlap before any write.
     #[test]
     fn initialize_refuses_duplicate_validator_or_overlap_before_any_write() {
-        use torus_state::StateBackend;
         let base = Genesis::from_json(&sample_genesis_json()).unwrap();
         let mut dup_validator = base.clone();
         let mut v = dup_validator.validators[0].clone();
