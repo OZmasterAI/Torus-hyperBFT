@@ -88,15 +88,19 @@ impl Indexer {
 
         let new_hash = val_str(&block, "hash");
 
-        // Reorg check
+        // Reorg check. Only a block `write_block` stored whole is skipped; a
+        // same-hash row an older binary left partial is rebuilt below.
         if let Some(existing) = self.db.get_block(h).map_err(db_err)? {
-            if existing.hash == new_hash {
+            if existing.hash != new_hash {
+                warn!(
+                    "Reorg at height {height}: {} -> {}",
+                    existing.hash, new_hash
+                );
+            } else if self.db.is_block_complete(h, &new_hash).map_err(db_err)? {
                 return self.db.advance_cursor(h).map_err(db_err);
+            } else {
+                warn!("Rebuilding block {height}: stored without all its rows");
             }
-            warn!(
-                "Reorg at height {height}: {} -> {}",
-                existing.hash, new_hash
-            );
         }
 
         // s84: the body lists every EVM tx, executed or skipped, with its

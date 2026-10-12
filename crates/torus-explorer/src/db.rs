@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     native_action_count INTEGER NOT NULL,
     epoch               INTEGER NOT NULL,
     validator_set_hash  TEXT NOT NULL,
-    state_root          TEXT NOT NULL
+    state_root          TEXT NOT NULL,
+    complete            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
@@ -126,6 +127,16 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
     if !has_status {
         conn.execute_batch("ALTER TABLE native_actions ADD COLUMN status TEXT;")?;
+    }
+    // R30: 1 = every row of the block was written by `write_block`; rows an
+    // older binary wrote stay 0 and are rebuilt when next visited.
+    let has_complete: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('blocks') WHERE name = 'complete'",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n > 0),
+    )?;
+    if !has_complete {
+        conn.execute_batch("ALTER TABLE blocks ADD COLUMN complete INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }
@@ -362,8 +373,25 @@ impl ExplorerDb {
         for c in &w.candle_trades {
             upsert_candle_on(&tx, c.market_id, c.timestamp, c.price_raw, c.qty_raw)?;
         }
+        tx.execute(
+            "UPDATE blocks SET complete = 1 WHERE height = ?1",
+            params![w.block.height],
+        )?;
         advance_cursor_on(&tx, w.block.height)?;
         tx.commit()
+    }
+
+    /// R30: whether block `height` with `hash` was stored whole by
+    /// [`Self::write_block`] (not a row an older binary left partial).
+    pub fn is_block_complete(&self, height: i64, hash: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT complete FROM blocks WHERE height = ?1 AND hash = ?2",
+            params![height, hash],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|c| c == Some(1))
     }
 
     /// R30: move `last_indexed_height` to `height` only when it is the next
@@ -1208,6 +1236,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_status, 1);
+    }
+
+    /// R30: an old database gains `blocks.complete`; its existing block rows
+    /// read as not complete (rebuilt when next visited).
+    #[test]
+    fn migrate_adds_complete_column_and_old_rows_are_not_complete() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA.replace(
+            ",\n    complete            INTEGER NOT NULL DEFAULT 0\n);",
+            "\n);",
+        );
+        assert_ne!(old_schema, SCHEMA, "fixture strips the complete column");
+        conn.execute_batch(&old_schema).unwrap();
+        insert_block_on(&conn, &test_block(5)).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+        let db = ExplorerDb {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        let hash = db.get_block(5).unwrap().unwrap().hash;
+        assert!(!db.is_block_complete(5, &hash).unwrap());
     }
 
     #[test]
