@@ -297,6 +297,10 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   checkpoint wall p50 / p99 and the E wait on a second checkpoint, block-time p99 around
   checkpoints and epoch boundaries, RSS.
 - Plus multi-crash restart cells: SIGKILL val1 at random points, n = 3; restart -> ready.
+- **Measured for step 2** (campaign `ozarchy-p3s2g`, results doc section 47, plan-2 row 52; 18c s112): step 2
+  `2296be67` vs main `c97f56f9`, both with the bench in-flight tail on committed bodies. CPU-s/1M -7.4% (met),
+  device writes -53% (met), matched/s -2.2% (tie, not up), native blocks/s -9.4% (borderline), RSS +1.5 GB peak
+  (RAM gate not met: bound ~270 MB). Restart cells: not in this campaign. Owner decision.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
