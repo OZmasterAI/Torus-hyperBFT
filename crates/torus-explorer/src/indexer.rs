@@ -8,10 +8,16 @@ use tracing::{info, warn};
 use crate::db::*;
 use crate::rpc_client::*;
 
+/// R30: a Torus node never stores block 0 (the genesis parent header is
+/// synthetic), so a fresh explorer starts at block 1.
+pub const FIRST_HEIGHT: i64 = 1;
+
 pub struct Indexer {
     pub rpc: NodeRpcClient,
     pub db: ExplorerDb,
     pub batch_size: u32,
+    /// R30: the pruned-trade-history warning was logged (once per run).
+    warned_pruned_trades: std::sync::atomic::AtomicBool,
 }
 
 impl Indexer {
@@ -20,10 +26,15 @@ impl Indexer {
             rpc,
             db,
             batch_size,
+            warned_pruned_trades: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Backfill from last indexed height to current chain tip.
+    ///
+    /// R30: stops at the first block that fails (the error names it), so the
+    /// cursor never passes a gap; the next pass (the live indexer on its next
+    /// head, or a restart) resumes at that block.
     pub async fn backfill(&self) -> Result<(), RpcError> {
         let (start, chain_height) = self.pending_range().await?;
 
@@ -35,7 +46,7 @@ impl Indexer {
         info!("Backfilling blocks {start}..={chain_height}");
         for h in start..=chain_height {
             if let Err(e) = self.index_block(h).await {
-                warn!("Failed to index block {h}: {e}");
+                return Err(format!("backfill stopped at block {h}: {e}").into());
             }
             if h % 100 == 0 || h == chain_height {
                 info!("Indexed up to block {h}/{chain_height}");
@@ -53,99 +64,144 @@ impl Indexer {
             .db
             .get_last_indexed_height()
             .map_err(|e| -> RpcError { e.to_string().into() })?;
-        Ok((last_indexed.map_or(0, |h| (h + 1) as u64), head))
+        Ok((
+            last_indexed.map_or(FIRST_HEIGHT as u64, |h| (h + 1) as u64),
+            head,
+        ))
     }
 
     /// Index a single block. Handles reorgs by checking hash.
+    ///
+    /// R30: all-or-nothing. Every node read the block needs (block, body,
+    /// receipts) happens first and any failure (or a block / body the node
+    /// does not serve) is an error with nothing written; then the block and
+    /// all its rows are written in one transaction ([`ExplorerDb::write_block`]).
+    /// So a stored block is a complete block, and the same-hash skip below
+    /// never skips a half-indexed one. The cursor only moves to the next
+    /// contiguous height.
     pub async fn index_block(&self, height: u64) -> Result<(), RpcError> {
         let h = height as i64;
+        let db_err = |e: rusqlite::Error| -> RpcError { e.to_string().into() };
 
-        let block = match self.rpc.get_block(height).await? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+        let block = self
+            .rpc
+            .get_block(height)
+            .await?
+            .ok_or_else(|| -> RpcError { format!("node has no block {height}").into() })?;
 
         let new_hash = val_str(&block, "hash");
 
-        // Reorg check
-        if let Ok(Some(existing)) = self.db.get_block(h) {
-            if existing.hash == new_hash {
-                return Ok(());
+        // Reorg check. Only a block `write_block` stored whole is skipped; a
+        // same-hash row an older binary left partial is rebuilt below.
+        let mut legacy_rebuild = false;
+        if let Some(existing) = self.db.get_block(h).map_err(db_err)? {
+            if existing.hash != new_hash {
+                warn!(
+                    "Reorg at height {height}: {} -> {}",
+                    existing.hash, new_hash
+                );
+            } else if self.db.is_block_complete(h, &new_hash).map_err(db_err)? {
+                return self.db.advance_cursor(h).map_err(db_err);
+            } else {
+                warn!("Rebuilding block {height}: stored without all its rows");
+                legacy_rebuild = true;
             }
-            warn!(
-                "Reorg at height {height}: {} -> {}",
-                existing.hash, new_hash
-            );
-            self.db
-                .delete_block_data(h)
-                .map_err(|e| -> RpcError { e.to_string().into() })?;
         }
-
-        // Parse and store block
-        let block_row = parse_block_row(&block, h);
-        self.db
-            .insert_block(&block_row)
-            .map_err(|e| -> RpcError { e.to_string().into() })?;
 
         // s84: the body lists every EVM tx, executed or skipped, with its
         // status; the eth block lists only the executed ones. Rows use the
         // body position as `tx_index` (first occurrence of a hash).
-        let body = self.rpc.get_block_body(height).await.ok().flatten();
+        let body = self
+            .rpc
+            .get_block_body(height)
+            .await?
+            .ok_or_else(|| -> RpcError { format!("node has no body for block {height}").into() })?;
         let mut body_position: HashMap<String, i32> = HashMap::new();
-        if let Some(txs) = body
-            .as_ref()
-            .and_then(|b| b.get("evmTransactions")?.as_array())
-        {
+        if let Some(txs) = body.get("evmTransactions").and_then(Value::as_array) {
             for (i, tx) in txs.iter().enumerate() {
                 body_position.entry(val_str(tx, "hash")).or_insert(i as i32);
             }
         }
 
-        // Index EVM transactions + receipts
+        let mut write = BlockWrite {
+            block: parse_block_row(&block, h),
+            transactions: Vec::new(),
+            logs: Vec::new(),
+            native_actions: Vec::new(),
+            candle_trades: Vec::new(),
+        };
+
+        // EVM transactions + receipts
         if let Some(txs) = block.get("transactions").and_then(|v| v.as_array()) {
             for (i, tx) in txs.iter().enumerate() {
                 let tx_hash = val_str(tx, "hash");
-                let receipt = self.rpc.get_receipt(&tx_hash).await?;
+                // The eth block lists executed txs only (s84), so each has a
+                // receipt; one the node does not return fails the block.
+                let receipt =
+                    self.rpc
+                        .get_receipt(&tx_hash)
+                        .await?
+                        .ok_or_else(|| -> RpcError {
+                            format!("node has no receipt for tx {tx_hash} in block {height}").into()
+                        })?;
                 let tx_index = body_position.get(&tx_hash).copied().unwrap_or(i as i32);
-                let tx_row = parse_tx_row(tx, h, tx_index, receipt.as_ref());
-                self.db
-                    .insert_transaction(&tx_row)
-                    .map_err(|e| -> RpcError { e.to_string().into() })?;
+                write
+                    .transactions
+                    .push(parse_tx_row(tx, h, tx_index, Some(&receipt)));
+                if let Some(logs) = receipt.get("logs").and_then(|v| v.as_array()) {
+                    write
+                        .logs
+                        .extend(logs.iter().map(|log| parse_log_row(log, h)));
+                }
+            }
+        }
 
-                if let Some(receipt) = &receipt {
-                    if let Some(logs) = receipt.get("logs").and_then(|v| v.as_array()) {
-                        for log in logs {
-                            let log_row = parse_log_row(log, h);
-                            self.db
-                                .insert_log(&log_row)
-                                .map_err(|e| -> RpcError { e.to_string().into() })?;
-                        }
+        // Skipped EVM txs and native actions, from the body
+        write.transactions.extend(skipped_evm_tx_rows(h, &body));
+        let statuses = native_action_status(&body);
+        if let Some(actions) = body.get("nativeActions").and_then(|v| v.as_array()) {
+            for (i, action) in actions.iter().enumerate() {
+                let mut action_row = parse_native_action_row(action, h, i as i32);
+                action_row.status = statuses.as_ref().and_then(|s| s.get(i).cloned());
+                write.native_actions.push(action_row);
+            }
+        }
+
+        // Trades into OHLCV candles (Phase 7B). Written with the block, so a
+        // retried block never counts a trade twice. A trade fetch error fails
+        // the block like every other fetch error (owner s112): it is retried,
+        // never stored without its trades, except DataPruned (permanent). A legacy partial block's trades
+        // may already be in the candles (the old binary wrote them before its
+        // cursor); candles keep only totals, so they are never replayed: no
+        // trade is counted twice (owner s112: it may undercount).
+        if legacy_rebuild {
+            warn!("Block {height}: candle trades not replayed on rebuild");
+        } else {
+            match self.rpc.get_block_trades(height).await {
+                Ok(trades) => write.candle_trades = candle_trades(height, &trades),
+                // Pruned trade history never comes back: index the block
+                // without its candle trades (stored complete, so they are
+                // never fetched or counted later) instead of retrying it
+                // forever. Warned once per run.
+                Err(e) if is_data_pruned(&*e) => {
+                    if !self
+                        .warned_pruned_trades
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        warn!(
+                            "Block {height}: the node pruned its trade history ({e}); \
+                             blocks below its trade retention floor are indexed without \
+                             candle trades (warned once)"
+                        );
                     }
                 }
+                Err(e) => return Err(e),
             }
         }
 
-        // Index native actions
-        if let Some(body) = &body {
-            self.record_skipped_evm_txs(h, body)
-                .map_err(|e| -> RpcError { e.to_string().into() })?;
-            let statuses = native_action_status(body);
-            if let Some(actions) = body.get("nativeActions").and_then(|v| v.as_array()) {
-                for (i, action) in actions.iter().enumerate() {
-                    let mut action_row = parse_native_action_row(action, h, i as i32);
-                    action_row.status = statuses.as_ref().and_then(|s| s.get(i).cloned());
-                    self.db
-                        .insert_native_action(&action_row)
-                        .map_err(|e| -> RpcError { e.to_string().into() })?;
-                }
-            }
-        }
+        self.db.write_block(&write).map_err(db_err)?;
+
         self.fill_unknown_status(h).await;
-
-        // Index trades into OHLCV candles (Phase 7B)
-        if let Ok(trades) = self.rpc.get_block_trades(height).await {
-            index_trades(&self.db, height, &trades);
-        }
 
         // Snapshot validators every 100 blocks
         if height.is_multiple_of(100) {
@@ -153,10 +209,6 @@ impl Indexer {
                 warn!("Failed to snapshot validators at height {height}: {e}");
             }
         }
-
-        self.db
-            .set_indexer_state("last_indexed_height", &height.to_string())
-            .map_err(|e| -> RpcError { e.to_string().into() })?;
 
         Ok(())
     }
@@ -190,18 +242,8 @@ impl Indexer {
     /// position. Nothing while the status is unknown (`null`). Never replaces
     /// an existing row of the same hash ([`ExplorerDb::insert_transaction`]).
     fn record_skipped_evm_txs(&self, height: i64, body: &Value) -> Result<(), rusqlite::Error> {
-        let (Some(txs), Some(status)) = (
-            body.get("evmTransactions").and_then(Value::as_array),
-            body.get("evmTransactionStatus").and_then(Value::as_array),
-        ) else {
-            return Ok(());
-        };
-        for (i, (tx, status)) in txs.iter().zip(status).enumerate() {
-            if status.as_str() == Some("skipped") {
-                let mut row = parse_tx_row(tx, height, i as i32, None);
-                row.status = TxStatus::Skipped;
-                self.db.insert_transaction(&row)?;
-            }
+        for row in skipped_evm_tx_rows(height, body) {
+            self.db.insert_transaction(&row)?;
         }
         Ok(())
     }
@@ -242,11 +284,14 @@ impl Indexer {
                 // block's eth view only once it executed it. Index up to the
                 // node's eth head instead of the announced height, so a block
                 // not executed yet is picked up on a later head.
+                // R30: stop at a failing block; the next head retries it, so
+                // no later block is indexed past the gap.
                 Ok(_) => match self.pending_range().await {
                     Ok((start, head)) => {
                         for height in start..=head {
                             if let Err(e) = self.index_block(height).await {
-                                warn!("Failed to index new block {height}: {e}");
+                                warn!("Failed to index block {height}, retrying on the next head: {e}");
+                                break;
                             }
                         }
                     }
@@ -265,6 +310,28 @@ impl Indexer {
 // ============================================================================
 // Parsing helpers
 // ============================================================================
+
+/// s84: a block's skipped EVM txs (listed by `torus_getBlockBody`, not by the
+/// eth block) as [`TxStatus::Skipped`] rows, `tx_index` = body position.
+/// None while the status is unknown (`null`).
+fn skipped_evm_tx_rows(height: i64, body: &Value) -> Vec<TxRow> {
+    let (Some(txs), Some(status)) = (
+        body.get("evmTransactions").and_then(Value::as_array),
+        body.get("evmTransactionStatus").and_then(Value::as_array),
+    ) else {
+        return Vec::new();
+    };
+    txs.iter()
+        .zip(status)
+        .enumerate()
+        .filter(|(_, (_, status))| status.as_str() == Some("skipped"))
+        .map(|(i, (tx, _))| {
+            let mut row = parse_tx_row(tx, height, i as i32, None);
+            row.status = TxStatus::Skipped;
+            row
+        })
+        .collect()
+}
 
 fn parse_block_row(block: &Value, height: i64) -> BlockRow {
     let tx_count = block
@@ -462,10 +529,23 @@ pub fn parse_native_action_row(
     }
 }
 
-/// Fold one block's `torus_getBlockTrades` rows into the OHLCV candles. A
-/// trade whose price or quantity does not parse (e.g. an old node still
-/// returning fixed-point hex) is skipped with a warning, never written as 0.
-fn index_trades(db: &ExplorerDb, height: u64, trades: &[Value]) {
+/// R30: whether `e` is the node's DataPruned answer (torus-rpc
+/// `RpcError::DataPruned`: code -32000, "... has been pruned ..."; pinned by
+/// torus-rpc `data_pruned_wire_shape_is_what_the_explorer_matches`). It is
+/// permanent: the trade history below the node's retention floor is gone.
+fn is_data_pruned(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    matches!(
+        e.downcast_ref::<jsonrpsee::core::ClientError>(),
+        Some(jsonrpsee::core::ClientError::Call(obj))
+            if obj.code() == -32000 && obj.message().contains("has been pruned")
+    )
+}
+
+/// One block's `torus_getBlockTrades` rows as candle trades. A trade whose
+/// price or quantity does not parse (e.g. an old node still returning
+/// fixed-point hex) is skipped with a warning, never written as 0.
+fn candle_trades(height: u64, trades: &[Value]) -> Vec<CandleTrade> {
+    let mut out = Vec::with_capacity(trades.len());
     for t in trades {
         let market_id = val_hex_i64(t, "marketId");
         let timestamp = val_hex_i64(t, "timestamp");
@@ -478,10 +558,23 @@ fn index_trades(db: &ExplorerDb, height: u64, trades: &[Value]) {
             );
             continue;
         };
-        let (price_raw, qty_raw) = (price_raw as i64, qty_raw as i64);
-        if let Err(e) = db.upsert_candle(market_id, timestamp, price_raw, qty_raw) {
-            warn!("Failed to upsert candle at height {height}: {e}");
-        }
+        out.push(CandleTrade {
+            market_id,
+            timestamp,
+            price_raw: price_raw as i64,
+            qty_raw: qty_raw as i64,
+        });
+    }
+    out
+}
+
+/// Fold one block's `torus_getBlockTrades` rows into the OHLCV candles
+/// ([`candle_trades`] rules), outside a block write.
+#[cfg(test)]
+fn index_trades(db: &ExplorerDb, height: u64, trades: &[Value]) {
+    for c in candle_trades(height, trades) {
+        db.upsert_candle(c.market_id, c.timestamp, c.price_raw, c.qty_raw)
+            .unwrap();
     }
 }
 
@@ -521,6 +614,8 @@ mod tests {
     use serde_json::json;
 
     /// A node stub: `(method, first param, result)`; any other call is `null`.
+    /// A call without params matches first param `null`; a result
+    /// `{"__error": msg}` is answered with a JSON-RPC error.
     async fn mock_node(
         responses: Vec<(&'static str, Value, Value)>,
     ) -> (jsonrpsee::server::ServerHandle, String) {
@@ -531,6 +626,7 @@ mod tests {
         let url = format!("http://{}", server.local_addr().unwrap());
         let mut module = jsonrpsee::RpcModule::new(());
         let mut methods: Vec<&'static str> = responses.iter().map(|r| r.0).collect();
+        methods.sort_unstable();
         methods.dedup();
         for method in methods {
             let table: Vec<(Value, Value)> = responses
@@ -543,11 +639,20 @@ mod tests {
                     let first = params
                         .parse::<Vec<Value>>()
                         .ok()
-                        .and_then(|p| p.first().cloned());
-                    table
+                        .and_then(|p| p.first().cloned())
+                        .unwrap_or(Value::Null);
+                    let result = table
                         .iter()
-                        .find(|(key, _)| Some(key) == first.as_ref())
-                        .map_or(Value::Null, |(_, result)| result.clone())
+                        .find(|(key, _)| *key == first)
+                        .map_or(Value::Null, |(_, result)| result.clone());
+                    match result.get("__error").and_then(Value::as_str) {
+                        Some(msg) => Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                            -32000,
+                            msg.to_string(),
+                            None::<()>,
+                        )),
+                        None => Ok(result),
+                    }
                 })
                 .unwrap();
         }
@@ -602,6 +707,9 @@ mod tests {
                 json!(2),
                 body(vec![tx(ok)], vec!["skipped"]),
             ),
+            // A trade fetch error fails the block (R30): no trades here.
+            ("torus_getBlockTrades", json!(1), json!([])),
+            ("torus_getBlockTrades", json!(2), json!([])),
         ])
         .await;
         let indexer = Indexer::new(
@@ -856,5 +964,411 @@ mod tests {
         db.delete_block_data(10).unwrap();
         assert!(db.get_block(10).unwrap().is_none());
         assert!(db.get_transaction("0xtx_old").unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // R30: a block is indexed whole or not at all; the cursor never passes a gap.
+    // -----------------------------------------------------------------------
+
+    fn r30_tx(hash: &str) -> Value {
+        json!({"hash": hash, "from": "0xa1", "to": "0xb2", "value": "0x0", "gas": "0x5208",
+               "gasPrice": "0x3b9aca00", "input": "0x", "nonce": "0x0", "type": "0x2"})
+    }
+
+    fn r30_block(height: u64, txs: Vec<Value>) -> Value {
+        json!({"number": format!("0x{height:x}"), "hash": format!("0xb{height}"),
+               "parentHash": "0x00", "timestamp": "0x1", "miner": "0xm", "gasUsed": "0x0",
+               "gasLimit": "0x1", "baseFeePerGas": "0x1", "stateRoot": "0x0", "transactions": txs})
+    }
+
+    fn r30_body(txs: Vec<Value>, actions: Vec<Value>) -> Value {
+        let st: Vec<&str> = txs.iter().map(|_| "executed").collect();
+        let ast: Vec<&str> = actions.iter().map(|_| "executed").collect();
+        json!({"nativeActions": actions, "nativeActionStatus": ast,
+               "evmTransactions": txs, "evmTransactionStatus": st})
+    }
+
+    fn r30_receipt() -> Value {
+        json!({"gasUsed": "0x5208", "status": "0x1", "contractAddress": null,
+               "logs": [{"transactionHash": "0x0a", "logIndex": "0x0", "address": "0xc",
+                         "topics": ["0x01"], "data": "0x"}]})
+    }
+
+    /// A healthy node with blocks `1..=head`: like a Torus node it has no
+    /// block 0 (the genesis parent header is synthetic, never stored). Block 1
+    /// has tx 0x0a (one log), one native action and one trade.
+    fn r30_good_node(head: u64) -> Vec<(&'static str, Value, Value)> {
+        let mut r = vec![
+            ("eth_blockNumber", Value::Null, json!(format!("0x{head:x}"))),
+            ("eth_getTransactionReceipt", json!("0x0a"), r30_receipt()),
+            (
+                "torus_getBlockTrades",
+                json!(1),
+                json!([{"marketId": "0x1", "timestamp": "0x3c",
+                        "price": "100.00000000", "quantity": "2.00000000"}]),
+            ),
+        ];
+        for h in 1..=head {
+            let txs = if h == 1 { vec![r30_tx("0x0a")] } else { vec![] };
+            let actions = if h == 1 {
+                vec![json!({"PlaceOrder": {"market_id": 1}})]
+            } else {
+                vec![]
+            };
+            r.push((
+                "eth_getBlockByNumber",
+                json!(format!("0x{h:x}")),
+                r30_block(h, txs.clone()),
+            ));
+            r.push(("torus_getBlockBody", json!(h), r30_body(txs, actions)));
+            r.push(("torus_getBlockTrades", json!(h), json!([])));
+        }
+        // The first torus_getBlockTrades entry for height 1 wins (find).
+        r
+    }
+
+    fn r30_with(
+        mut node: Vec<(&'static str, Value, Value)>,
+        method: &'static str,
+        key: Value,
+        result: Value,
+    ) -> Vec<(&'static str, Value, Value)> {
+        node.retain(|(m, k, _)| !(*m == method && *k == key));
+        node.insert(0, (method, key, result));
+        node
+    }
+
+    fn r30_assert_block1_complete(db: &ExplorerDb) {
+        assert_eq!(db.get_block(1).unwrap().unwrap().hash, "0xb1");
+        let txs = db.get_block_transactions(1).unwrap();
+        assert_eq!(txs.len(), 1, "tx row");
+        assert_eq!(txs[0].status, TxStatus::Success);
+        assert!(db.get_transaction("0x0a").unwrap().is_some());
+        assert_eq!(db.get_transaction_logs("0x0a").unwrap().len(), 1, "log row");
+        assert_eq!(
+            db.get_block_native_actions(1).unwrap().len(),
+            1,
+            "native action row"
+        );
+        let candles = db.get_candles(1, "1m", None, None, 10).unwrap();
+        assert_eq!(candles.len(), 1, "one candle");
+        assert_eq!(candles[0].trade_count, 1, "trade counted exactly once");
+    }
+
+    /// R30 follow-up (owner s112): a trade fetch error fails the block (no
+    /// row at all, cursor not moved), like every other fetch error, instead
+    /// of storing it without its candle trades. The retry indexes it whole
+    /// and counts its trade once.
+    #[tokio::test]
+    async fn trade_fetch_error_fails_the_block_and_the_retry_counts_it_once() {
+        let node = r30_with(
+            r30_good_node(1),
+            "torus_getBlockTrades",
+            json!(1),
+            json!({"__error": "trades unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(
+            indexer.index_block(1).await.is_err(),
+            "trade error is an error"
+        );
+        assert!(indexer.backfill().await.is_err(), "backfill stops on it");
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        assert!(db.get_block_transactions(1).unwrap().is_empty());
+        assert!(db.get_candles(1, "1m", None, None, 10).unwrap().is_empty());
+        assert_eq!(db.get_last_indexed_height().unwrap(), None);
+        handle.stop().unwrap();
+
+        let (handle, url) = mock_node(r30_good_node(1)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        r30_assert_block1_complete(&db);
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(1));
+        handle.stop().unwrap();
+    }
+
+    /// The error a torus node returns for `torus_getBlockTrades` below its
+    /// retained trade floor (`--trade-retention-blocks`): torus-rpc
+    /// `RpcError::DataPruned`, code -32000.
+    fn r30_pruned(height: u64) -> Value {
+        json!({"__error": format!(
+            "historical data unavailable: block {height} has been pruned. \
+             Connect to an archive node for historical queries."
+        )})
+    }
+
+    /// R30 follow-up (stop-review WARN): pruned trade history is permanent,
+    /// so a DataPruned trade fetch indexes the block without its candle
+    /// trades (warned once) instead of retrying forever: backfill over a
+    /// pruned range completes with every other row. Nothing is replayed
+    /// later (the block is stored complete).
+    #[tokio::test]
+    async fn pruned_trades_index_the_block_without_them_and_backfill_completes() {
+        let mut node = r30_good_node(3);
+        for h in 1..=2 {
+            node = r30_with(node, "torus_getBlockTrades", json!(h), r30_pruned(h));
+        }
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(3));
+        for h in 1..=3 {
+            assert!(db.get_block(h).unwrap().is_some(), "block {h}");
+        }
+        assert_eq!(db.get_block_transactions(1).unwrap().len(), 1, "tx row");
+        assert_eq!(db.get_transaction_logs("0x0a").unwrap().len(), 1, "log row");
+        assert_eq!(db.get_block_native_actions(1).unwrap().len(), 1);
+        assert!(
+            db.get_candles(1, "1m", None, None, 10).unwrap().is_empty(),
+            "pruned trades are not counted"
+        );
+        handle.stop().unwrap();
+
+        // Stored complete: a node that (impossibly) serves the trades again
+        // does not get them counted on a second pass.
+        let (handle, url) = mock_node(r30_good_node(3)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.index_block(1).await.unwrap();
+        assert!(db.get_candles(1, "1m", None, None, 10).unwrap().is_empty());
+        handle.stop().unwrap();
+    }
+
+    /// Only the DataPruned error is permanent; any other -32000 (e.g.
+    /// "historical state not available") or a transport error is transient.
+    #[test]
+    fn only_a_data_pruned_error_counts_as_pruned() {
+        let call = |code: i32, msg: &str| -> RpcError {
+            Box::new(jsonrpsee::core::ClientError::Call(
+                jsonrpsee::types::ErrorObjectOwned::owned(code, msg.to_string(), None::<()>),
+            ))
+        };
+        let pruned = r30_pruned(7)["__error"].as_str().unwrap().to_string();
+        assert!(is_data_pruned(&*call(-32000, &pruned)));
+        assert!(!is_data_pruned(&*call(-32603, &pruned)), "other code");
+        assert!(!is_data_pruned(&*call(-32000, "trades unavailable")));
+        assert!(!is_data_pruned(&*call(
+            -32000,
+            "historical state not available at block 7, only 'latest' is supported"
+        )));
+        let other: RpcError = "has been pruned".into();
+        assert!(!is_data_pruned(&*other), "not a JSON-RPC error");
+    }
+
+    /// R30: a body fetch error fails the block (no row at all, cursor not
+    /// moved) instead of storing it without its native actions.
+    #[tokio::test]
+    async fn body_fetch_error_fails_the_block_and_writes_nothing() {
+        let node = r30_with(
+            r30_good_node(1),
+            "torus_getBlockBody",
+            json!(1),
+            json!({"__error": "body unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(
+            indexer.index_block(1).await.is_err(),
+            "body error is an error"
+        );
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        assert_eq!(db.get_last_indexed_height().unwrap(), None);
+        handle.stop().unwrap();
+
+        // A missing body (null) for a block the node served is also an error.
+        let node = r30_with(
+            r30_good_node(1),
+            "torus_getBlockBody",
+            json!(1),
+            Value::Null,
+        );
+        let (handle, url) = mock_node(node).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(
+            indexer.index_block(1).await.is_err(),
+            "missing body is an error"
+        );
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        handle.stop().unwrap();
+    }
+
+    /// R30: a receipt fetch error mid-block leaves no block row, so the retry
+    /// (same hash) indexes the whole block instead of skipping it.
+    #[tokio::test]
+    async fn receipt_error_then_retry_indexes_the_whole_block() {
+        let node = r30_with(
+            r30_good_node(1),
+            "eth_getTransactionReceipt",
+            json!("0x0a"),
+            json!({"__error": "receipt unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(indexer.index_block(1).await.is_err());
+        assert!(db.get_block(1).unwrap().is_none(), "no partial block row");
+        handle.stop().unwrap();
+
+        let (handle, url) = mock_node(r30_good_node(1)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.index_block(1).await.unwrap();
+        r30_assert_block1_complete(&db);
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(1));
+        // Same hash again: skipped, nothing counted twice.
+        indexer.index_block(1).await.unwrap();
+        r30_assert_block1_complete(&db);
+        handle.stop().unwrap();
+    }
+
+    /// R30: backfill stops at a failing block (error returned, cursor before
+    /// it) instead of indexing past the gap; the next pass resumes there.
+    #[tokio::test]
+    async fn backfill_stops_at_a_failing_block_and_resumes_there() {
+        let node = r30_with(
+            r30_good_node(3),
+            "torus_getBlockBody",
+            json!(2),
+            json!({"__error": "body unavailable"}),
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(
+            indexer.backfill().await.is_err(),
+            "backfill reports the failure"
+        );
+        assert_eq!(
+            db.get_last_indexed_height().unwrap(),
+            Some(1),
+            "cursor before the gap"
+        );
+        r30_assert_block1_complete(&db);
+        for h in 2..=3 {
+            assert!(
+                db.get_block(h).unwrap().is_none(),
+                "nothing past the gap: {h}"
+            );
+        }
+        handle.stop().unwrap();
+
+        let (handle, url) = mock_node(r30_good_node(3)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(3));
+        r30_assert_block1_complete(&db);
+        for h in 1..=3 {
+            assert!(db.get_block(h).unwrap().is_some(), "block {h}");
+        }
+        handle.stop().unwrap();
+    }
+
+    /// R30: a height the node does not serve (null block at or below its
+    /// head) is an error, not a silent success the cursor can pass.
+    #[tokio::test]
+    async fn missing_block_below_head_is_an_error() {
+        let node = r30_with(
+            r30_good_node(3),
+            "eth_getBlockByNumber",
+            json!("0x2"),
+            Value::Null,
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(indexer.backfill().await.is_err());
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(1));
+        assert!(db.get_block(3).unwrap().is_none());
+        handle.stop().unwrap();
+    }
+    /// R30: an executed tx (listed by the eth block) whose receipt the node
+    /// does not return fails the block, instead of storing the tx as
+    /// "failed" with 0 gas forever.
+    #[tokio::test]
+    async fn missing_receipt_fails_the_block() {
+        let node = r30_with(
+            r30_good_node(1),
+            "eth_getTransactionReceipt",
+            json!("0x0a"),
+            Value::Null,
+        );
+        let (handle, url) = mock_node(node).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        assert!(indexer.index_block(1).await.is_err());
+        assert!(db.get_block(1).unwrap().is_none(), "no block row");
+        assert!(db.get_transaction("0x0a").unwrap().is_none(), "no tx row");
+        handle.stop().unwrap();
+    }
+
+    /// R30 review: a Torus node never serves block 0 (the genesis parent
+    /// header is synthetic), so a fresh explorer starts at block 1 instead
+    /// of failing on block 0 forever.
+    #[tokio::test]
+    async fn fresh_explorer_starts_at_block_one() {
+        let (handle, url) = mock_node(r30_good_node(2)).await;
+        let db = ExplorerDb::open_in_memory().unwrap();
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(2));
+        r30_assert_block1_complete(&db);
+        assert!(db.get_block(2).unwrap().is_some());
+        assert!(db.get_block(0).unwrap().is_none());
+        handle.stop().unwrap();
+    }
+
+    /// R30 review P2: a block row an older binary left without its other rows
+    /// (same hash, not written by `write_block`) is rebuilt, not taken as
+    /// complete because its hash matches.
+    #[tokio::test]
+    async fn legacy_partial_block_with_same_hash_is_rebuilt() {
+        let db = ExplorerDb::open_in_memory().unwrap();
+        // The old indexer stored block 1's row, then failed before its tx.
+        db.insert_block(&parse_block_row(&r30_block(1, vec![r30_tx("0x0a")]), 1))
+            .unwrap();
+        assert!(db.get_block_transactions(1).unwrap().is_empty());
+        let (handle, url) = mock_node(r30_good_node(2)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        let rows = |db: &ExplorerDb| {
+            (
+                db.get_block_transactions(1).unwrap().len(),
+                db.get_transaction_logs("0x0a").unwrap().len(),
+                db.get_block_native_actions(1).unwrap().len(),
+            )
+        };
+        assert_eq!(rows(&db), (1, 1, 1), "tx, log, action rebuilt");
+        assert!(
+            db.get_candles(1, "1m", None, None, 10).unwrap().is_empty(),
+            "a rebuilt legacy block's trades are not replayed"
+        );
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(2));
+        // Now complete: a second pass skips it.
+        indexer.index_block(1).await.unwrap();
+        assert_eq!(rows(&db), (1, 1, 1));
+        handle.stop().unwrap();
+    }
+
+    /// R30 review P2 (stop review): the old binary wrote candles before its
+    /// cursor, so a legacy partial block may already be in the candles.
+    /// Rebuilding it never replays its trades (no double count; owner s112
+    /// accepted that it may undercount).
+    #[tokio::test]
+    async fn legacy_rebuild_never_counts_a_trade_twice() {
+        let db = ExplorerDb::open_in_memory().unwrap();
+        // Old binary: block row and candle written, crashed before the cursor.
+        db.insert_block(&parse_block_row(&r30_block(1, vec![r30_tx("0x0a")]), 1))
+            .unwrap();
+        db.upsert_candle(1, 0x3c, 10_000_000_000, 200_000_000)
+            .unwrap();
+        let (handle, url) = mock_node(r30_good_node(2)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        r30_assert_block1_complete(&db);
+        let c = &db.get_candles(1, "1m", None, None, 10).unwrap()[0];
+        assert_eq!((c.trade_count, c.volume), (1, 200_000_000));
+        handle.stop().unwrap();
     }
 }

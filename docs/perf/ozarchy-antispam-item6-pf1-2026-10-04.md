@@ -5422,6 +5422,167 @@ line `running state hash fail-stop ... on=false`.
   < 1% (matched/s) and the blocks/s gap to -6.7% (not resolved).
 - One host, one NVMe, 3 validators sharing it, as in every ozarchy campaign.
 
+## 48. Phase 3 step 2 RSS split: commit-mode exec backlog, step 1 layer, step 2 view (campaign ozarchy-p3rss, 2026-10-12)
+
+**Step 2's +1.55 GB RSS peak over the control splits into three parts of similar size: about +0.83 GB
+from the commit-mode exec backlog (control head mode -> commit mode), +0.88 GB from the step 1
+since-checkpoint layer, and +0.68 GB from the step 2 view. Only the last two are Phase 3. Phase 3 alone
+is +1.55 GB peak / +1.12 GB mean over the commit-mode control.** That is far above the ~270 MB gate bound.
+A heap profile (jemalloc, below) finds the live data behind the Phase 3 part: the layer `L` (316-406 MB
+live per node, against a 147 MB logical layer per checkpoint), the step 2 ingress slices (260 MB), and
+RocksDB memtables (+60 MB). Step 1 also frees the 157 MB of frozen pending sets the control's pipeline
+holds. About half of each Phase 3 RSS delta appears only under glibc (allocator retention): under jemalloc,
+the same three steps add +0.51 / +0.45 / +0.33 GB peak. RSS still grows at the end of every 120 s cell
+(0.7-1.9 GB per minute), so all peaks depend on the cell length.
+
+Owner request (18c, s112; the Open entry for section 47, item (a)): split step 2's +1.5 GB RSS (section 47:
+control 4.41 / 3.69 GB peak / mean, step 2 5.93 / 4.82) into the step 1 layer, the step 2 view and the
+commit-mode exec backlog, with RSS time series, queue depth and mempool size, and a no-sudo heap profile
+of control vs step 1 vs step 2.
+
+Setup: the section 47 shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900,
+120 s cells, fresh genesis and data dir per cell, shared NVMe). Harness and **one** bench `bench-throughput`
+(`05d44313`) from origin/main `8efcb07a` (worktree `wt/p3rss-8efcb07a`; it has `IN_FLIGHT_TAIL`).
+**Nodes** (frame pointers + line tables + mold): control `2725e321` (`18fb490d`, the p3c1 build), step 1
+`a44bdde6` (`7d1a0874`, the p3r1 build), step 2 `2296be67` (`1c02893b`, the p3s2g build), and main `8efcb07a`
+(`09827336`, built here). md5s were checked against each build record. **The split is clean:**
+`2725e321` = merge-base(step 1, main), step 1 = control + 13 commits, step 2 = step 1 + 5 commits (a linear
+chain). Arms: **cth** = control, `IN_FLIGHT_TAIL=head`; **ctl** = control, commit; **s1** = step 1, commit,
+`TORUS_CHECKPOINT_INTERVAL_MS=15000`; **s2** = step 2, commit, 15000; **mn** = main `8efcb07a`, commit (2 cells,
+cross-check only: main adds CoreWriter results, RPC and action_status changes, so it is not the clean control).
+Heap-profiled arms **hcth / hctl / hs1 / hs2** are the same nodes with jemalloc preloaded (below). Cells
+15:02-17:43 (driver `ozarchy-p3rss-campaign.sh`, CAMP=A): w0 (ctl, 60 s, excluded), r1-r4 in a rotated order
+(r1 cth ctl s1 s2, r2 ctl s1 s2 cth, r3 s1 s2 cth ctl, r4 s2 cth ctl s1), then m1 h1-ctl h1-s1 h1-s2 after r2 and
+m2 h2-s2 h2-s1 h2-ctl h1-cth after r4. **All 26 cells rc 0, ACCEPT, AGREE**, 364 CHECK OK and no CHECK FAIL.
+The checks were those of section 47 plus a per-arm tail-mode check (head or commit, in run.log, the bench
+command, bench.log and summary.json), knob, enable line and `torus_exec_checkpoints` on the s arms only, and
+`heapchk` (jemalloc preloaded and mapped on all 3 nodes of the h arms, on none elsewhere). No cargo, rustc
+or rust-analyzer ran before any cell, there were no deaths, and no node swapped (VmSwap 0 in every sample;
+the host had 5.6 GB of older swap in use).
+
+Memory sampling (every cell, `memsamp`): per node every 5 s `/proc/<pid>/smaps_rollup` + `/proc/<pid>/status`
+(Rss, anon / file, swap, HWM, threads) plus the memory / queue gauges from `/metrics` (memtables, block cache,
+mempool size, exec queue depth, flush-worker depth, resident rows, resting orders, layer bytes), and val0's
+full `smaps` every 30 s. RSS peak / mean in the tables = the harness `cpu.csv` definition of section 47
+(per node over the whole cell, mean of the 3 nodes); the window rows use the 5 s samples in the bench window.
+
+**Heap profiler without sudo:** no heaptrack / bytehound / valgrind, the node has no jemalloc, and
+`ptrace_scope` = 1 (no gdb attach). The system `libjemalloc.so.2` (5.3.1) is built with profiling and
+`jeprof` is installed, so a wrapper `torus-node` (stage `<key>-heap`) sets `LD_PRELOAD` +
+`MALLOC_CONF=prof:true,lg_prof_sample:19,lg_prof_interval:33` and execs the real binary (same pid, same
+exe md5, comm `torus-node`). Each node writes a sampled heap dump every 8 GiB allocated (~every 4 s, ~60
+per node per cell). `jeprof` truncates Rust names, so `a-heap.py` parses the heap_v2 dumps itself
+(jeprof's unbiasing, readelf LOAD segments for PIE addresses, `llvm-symbolizer --inlining`). `a-heapcat.py`
+then sorts every stack into components by frame regex (first match wins: view slices, `CheckpointLayer`,
+`FrozenPending`, `torus_mempool`, decoded actions / blocks, order books, exec working set, resident positions /
+rows, RocksDB memtables / block cache / other, overlay, network). The figures are live bytes per node,
+averaged over the last 3 dumps at or before the bench end on all 3 nodes. Caveat: jemalloc is a different
+allocator, the h cells ran 3.5-3.8 native blk/s, with blocks 7-10% smaller than the glibc cells of the same arm (hcth 14% larger) and n is 2
+(1 for hcth).
+
+### 48.1 RSS per arm and the three deltas (glibc, n = 4)
+
+| | cth control head | ctl control commit | s1 step 1 | s2 step 2 | mn main (n = 2) |
+|---|---|---|---|---|---|
+| RSS peak / mean GB (cpu.csv, section 47 definition) | 3.56 / 3.17 | 4.38 / 3.64 | 5.26 / 4.27 | 5.94 / 4.76 | 4.38 / 3.67 |
+| bench window: peak / mean / last 15 s GB (5 s samples) | 3.56 / 3.21 / 3.53 | 4.29 / 3.60 / 4.25 | 5.10 / 4.14 / 5.07 | 5.76 / 4.59 / 5.72 | 4.33 / 3.68 / 4.31 |
+| RSS growth over the bench window, GB per minute | 0.73 | 1.07 | 1.57 | 1.86 | 1.00 |
+| VmHWM GB | 3.83 | 4.56 | 5.50 | 6.11 | 4.60 |
+| anon / file-backed GB (window mean) | 3.18 / 0.03 | 3.57 / 0.03 | 4.11 / 0.03 | 4.56 / 0.03 | 3.65 / 0.03 |
+| matched/s | 200,946 | 195,633 | 199,313 | 198,030 | 192,625 |
+| native blocks/s | 6.00 | 3.52 | 3.29 | 3.21 | 3.45 |
+| fills per native block | 26,298 | 54,001 | 56,060 | 57,008 | 53,867 |
+| exec backlog, committed - executed, mean (blocks) | 49.8 | 54.6 | 56.9 | 56.7 | 54.0 |
+| exec queue depth, mean (gauge) | 51.1 | 56.2 | 58.5 | 57.4 | 56.6 |
+| exec lag commit -> done, s | 7.9 | 14.1 | 15.5 | 15.9 | 14.6 |
+| mempool native size, mean / max | 1,328 / 5,361 | 5,418 / 11,012 | 5,742 / 11,558 | 5,870 / 11,613 | 5,660 / 11,521 |
+| resting orders (exec gauge, mean) | 179,510 | 229,374 | 267,999 | 263,153 | 246,992 |
+| RocksDB memtables MB (mean) | 288 | 275 | 219 | 222 | 275 |
+| layer bytes per checkpoint MB (`torus_exec_checkpoint_layer_bytes`) | - | - | 147 | 147 | - |
+| node CPU-s/1M | 25.08 | 25.35 | 23.37 | 23.34 | 25.64 |
+
+The val0 `smaps` snapshots (bench window, peak snapshot) put 86-91% of RSS in anonymous mappings of 32 MiB
+or more (glibc arenas), 4-11% in smaller anonymous mappings (thread stacks, small mmaps; s2 617 MB at its
+peak snapshot), 3-4% in `[heap]`, and 28 MB in the binary's file pages. There are no file-backed data mappings.
+So RSS here is heap.
+
+| delta (glibc, n = 4 vs 4) | RSS peak GB [95% CI] | RSS mean GB [95% CI] | what moved with it |
+|---|---|---|---|
+| **backlog** = ctl - cth | **+0.83** [+0.73, +0.92] | **+0.47** [+0.40, +0.53] | mempool 1.3k -> 5.4k actions (4.1x), blocks twice as large (26k -> 54k fills) with ~5 more of them queued (49.8 -> 54.6, gauge 51 -> 56), resting orders +28% |
+| **layer** = s1 - ctl | **+0.88** [+0.76, +1.00] | **+0.63** [+0.56, +0.70] | layer 147 MB logical per checkpoint, memtables -56 MB, backlog +2.3 blocks, resting orders +17% |
+| **view** = s2 - s1 | **+0.68** [+0.54, +0.82] | **+0.49** [+0.40, +0.58] | nothing else moves (backlog, mempool, layer bytes, memtables, CPU all within noise) |
+| s2 - ctl (Phase 3 total) | +1.55 [+1.43, +1.68] | +1.12 [+1.03, +1.21] | section 47 (vs main `c97f56f9`): +1.53 / +1.13 |
+| mn - ctl (main vs control) | +0.00 [-0.06, +0.06] | +0.03 [-0.01, +0.07] | main's extra commits do not move RSS; section 47's control is equivalent for RSS |
+
+### 48.2 Heap profile: live heap by component (jemalloc, MB per node, mean of the last 3 dumps <= bench end)
+
+| component | hcth (n = 1) | hctl (n = 2) | hs1 (n = 2) | hs2 (n = 2) | backlog hctl - hcth | layer hs1 - hctl | view hs2 - hs1 |
+|---|---|---|---|---|---|---|---|
+| step 2 view slices (`FrozenPending::slice`, read view) | 0 | 0 | 0 | 260 | 0 | 0 | **+260** |
+| step 1 layer `L` (`CheckpointLayer::merge / insert`) | 0 | 0 | 316 | 406 | 0 | **+316** | +90 |
+| frozen pending sets (pipeline hand-off to the flush worker) | 163 | 157 | 0 | 1 | -6 | **-157** | +1 |
+| mempool (`torus_mempool`: actions held for proposal) | 381 | 724 | 761 | 743 | **+343** | +37 | -18 |
+| decoded actions / committed blocks / exec queue | 155 | 381 | 451 | 385 | **+226** | +70 | -66 |
+| order books (resident + save buffers) | 333 | 379 | 347 | 404 | +46 | -32 | +57 |
+| resident positions / rows (`TraderPositions`, `ResidentRows`) | 644 | 722 | 724 | 687 | +78 | +2 | -37 |
+| exec working set (`MatchResult`) | 10 | 31 | 15 | 16 | +21 | -16 | +1 |
+| RocksDB memtables | 92 | 85 | 111 | 145 | -7 | +26 | +34 |
+| RocksDB block cache / reads + other | 15 | 16 | 11 | 9 | +1 | -5 | -2 |
+| state overlay, network / RPC, other | 96 | 103 | 112 | 116 | +7 | +9 | +4 |
+| **live heap total** | **1,889** | **2,597** | **2,847** | **3,171** | **+708** | **+250** | **+324** |
+| RSS peak under jemalloc GB (cpu.csv) | 3.66 | 4.17 | 4.62 | 4.94 | +0.51 | +0.45 | +0.33 |
+| RSS peak under glibc GB (48.1) | 3.56 | 4.38 | 5.26 | 5.94 | +0.83 | +0.88 | +0.68 |
+
+Reading:
+- **Backlog (not Phase 3):** in commit mode the bench keeps 4.1x more actions in the mempool, and each block
+  carries twice the actions, with about the same number of blocks queued between commit and execution. The
+  live heap grows by +0.71 GB, about half in the mempool (+343 MB) and a third in decoded committed blocks
+  waiting for execution (+226 MB). The rest is larger state (resting orders +28%). This part comes from the
+  bench's in-flight release, not from the node.
+- **Layer (step 1):** `L` holds 316 MB live for a 147 MB logical layer (2.1x: hash map and key/value
+  allocation overhead). Step 1 also drops the 157 MB of frozen pending sets the control holds in the flush
+  hand-off, so live heap rises only +250 MB, while glibc RSS rises +0.88 GB. The difference is allocator
+  retention: `L` is rebuilt and freed every checkpoint (15 s), and its frees land in glibc arenas that are
+  not returned (jemalloc: +0.45 GB).
+- **View (step 2):** the ingress slices hold 260 MB live, the `CheckpointLayer` frames hold 90 MB more
+  (cause not separated), and memtables are +34 MB. Live +324 MB,
+  glibc RSS +0.68 GB.
+- **Allocator:** under glibc, step 2 peaks at 5.94 GB; under jemalloc at 4.94 GB (-1.0 GB), while the
+  control moves only 4.38 -> 4.17. For both Phase 3 parts the jemalloc RSS delta is about half the glibc
+  one (layer 0.45 vs 0.88 GB, view 0.33 vs 0.68 GB). This contrasts two allocators on n = 2 cells and is
+  not a proposal. A jemalloc or `MALLOC_ARENA_MAX` / trim A/B would be its own bench.
+- **Growth:** every arm is still growing at the bench end (cth 0.73 -> s2 1.86 GB per minute), and the
+  Phase 3 arms grow faster (s2 - ctl +0.79 GB/min [+0.59, +0.99]). The 120 s peaks are not steady-state
+  values. A longer cell is needed for the plateau (or to show that there is none).
+
+### 48.3 Attribution and confidence
+
+| component of s2 - cth (+2.38 GB peak, glibc) | GB peak (mean) | inside it (heap profile, live MB) | confidence |
+|---|---|---|---|
+| commit-mode exec backlog (bench, not Phase 3) | +0.83 (+0.47) | mempool +343, decoded blocks / exec queue +226, larger state +124 | **high** for the size (n = 4 vs 4, CI ±0.1 GB); **medium** for the split inside it (heap n = 2 vs 1, jemalloc) |
+| step 1 layer | +0.88 (+0.63) | `L` +316, minus frozen pending -157, decoded blocks +70, memtables +26; ~0.4 GB allocator retention | **high** for the size; **medium** for the live part; **low-medium** for the retention share (inferred from the jemalloc contrast) |
+| step 2 view | +0.68 (+0.49) | slices +260, `L` +90, memtables +34; ~0.35 GB allocator retention | **high** for the size; **medium** for the live part; **low-medium** for the retention share |
+| main vs control | +0.00 | - | high (n = 2) |
+
+Other numbers, for reference (step 1 / step 2 vs control, commit mode): node CPU-s/1M -7.8% / -8.0% (at equal
+fills -7.7% / -8.3%), device writes -51% / -50%, matched/s +1.9% / +1.2% (ties), native blocks/s -6.7% / -8.8%,
+the `residual_untimed` exec time 14.0 -> 47.8 -> 55.4 ms per block (the section 47 Phase 3 residual; s2 - s1 +7.6
+ms), commit interval p99 +15% / +14%. Step 1 shows the same cancel-all nonce-window evictions as step 2 in
+section 47 (r1-s1 391 and r3-s1 57-71 per node, r3-s2 440; zero on every control cell).
+
+**Verdict:** the RSS gate (~270 MB) misses by ~1.3 GB peak against the clean commit-mode control: +0.88 GB
+from the layer and +0.68 GB from the view. Of that, 0.57 GB is more live data, the jemalloc RSS rise is
+0.78 GB, and the other ~0.78 GB appears only under glibc (retention).
+The +0.83 GB backlog belongs to the commit-tail bench mode and is in the control too. Levers, by size: allocator
+retention around the per-checkpoint rebuild of `L` and the slices (~0.8 GB, glibc only), the layer's 2.1x in-memory
+overhead over its logical bytes (~170 MB), and the view's slices (260 MB). The gate rerun on step 2 `51a67f57` (frees
+off the exec thread) follows in section 49.
+
+Analysis scripts (`tools/ozarchy-p3rss-tools/analyst/`): `a-cells.py` (per cell, incl. `memsamp` parsing and
+the exec backlog from the node logs), `a-arms.py` (Welch 95% CI, ANCOVA at equal fills), `a-smaps.py` (val0 RSS
+by mapping class), `a-heap.py` + `a-heapcat.py` (heap profile). Outputs in
+`ozarchy-p3rss-run/analyst/` on ozarchy (`cells.json`, `arms.txt`, `heapcat.txt`, `smaps.txt`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -5467,8 +5628,12 @@ line `running state hash fail-stop ... on=false`.
   `2296be67` vs main `c97f56f9`, n = 4, shared NVMe: CPU-s/1M -7.4% (-9.2% at equal fills, met), device writes -53% (met),
   matched/s -2.2% [-7.1, +2.7] (tie, not up), native blocks/s -9.4% [-18.6, -0.2] (borderline; -6.7% [-14.9, +1.4] without
   r3-cd), RSS +1.53 GB peak / +1.13 GB mean (RAM gate ~270 MB: not met). Both arms sit at the exec ceiling (busy 0.96 / 0.98,
-  ~63 blocks behind commit). Open: (a) split the RSS growth between the step 1 layer, the step 2 view and the commit-mode exec
-  backlog (a step-1-only commit-mode arm or a heap profile); (b) step 2 only: 0.8-2.6% of cancel-alls per cell expire from the
+  ~63 blocks behind commit). Open: (a) **RSS split done (section 48, review log row 53):**
+  against the clean commit-mode control `2725e321` the layer adds +0.88 GB peak and the view +0.68 GB (Phase 3 +1.55 GB;
+  live heap +0.25 / +0.32 GB: `L` 316 MB for a 147 MB logical layer, minus the control's 157 MB of frozen pending sets,
+  and the view's slices 260 MB; about half of each delta appears only under glibc, i.e. allocator retention). The
+  commit-mode backlog is another +0.83 GB (mempool and queued decoded blocks) and is in the control too. RSS still grows
+  at the end of the 120 s cells. The RAM gate is still not met; (b) step 2 only: 0.8-2.6% of cancel-alls per cell expire from the
   mempool after the 60 s nonce window and never execute (control 0); (c) the ~36 ms per block untimed exec residual (Phase 3
   overhead, also in step 1); (d) the control carries 16 non-Phase-3 commits (rebase step 2 on main to remove the confound).
   The DISAGREE verdicts are the known slow-digest mark artifact (control too), not a divergence.

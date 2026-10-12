@@ -1119,6 +1119,38 @@ mod tests {
         assert_eq!(resolve_block_tag("earliest", 100).unwrap(), 0);
         assert_eq!(resolve_block_tag("pending", 100).unwrap(), 100);
         assert_eq!(resolve_block_tag("0xa", 100).unwrap(), 10);
+        // HotStuff BFT: a committed block is final, so "safe" and
+        // "finalized" are the head.
+        assert_eq!(resolve_block_tag("safe", 100).unwrap(), 100);
+        assert_eq!(resolve_block_tag("finalized", 100).unwrap(), 100);
+    }
+
+    /// Ethereum JSON-RPC QUANTITY: compact hex, no leading zero digits, "0x0"
+    /// for zero (DATA encodings keep their fixed width).
+    #[test]
+    fn hex_u256_is_compact_quantity() {
+        assert_eq!(hex_u256(U256::ZERO), "0x0");
+        assert_eq!(hex_u256(U256::from(7u64)), "0x7");
+        assert_eq!(hex_u256(U256::from(15u64)), "0xf");
+        assert_eq!(hex_u256(U256::from(255u64)), "0xff");
+        assert_eq!(hex_u256(U256::from(256u64)), "0x100");
+        assert_eq!(hex_u256(U256::from(0x1000u64)), "0x1000");
+        assert_eq!(
+            hex_u256(U256::from(2_000_000_000_000_000_000u128)),
+            "0x1bc16d674ec80000"
+        );
+        assert_eq!(
+            hex_u256(U256::from(1u64) << 255),
+            format!("0x8{}", "0".repeat(63))
+        );
+        assert_eq!(hex_u256(U256::MAX), format!("0x{}", "f".repeat(64)));
+        assert_eq!(hex_u64(0), "0x0");
+        assert_eq!(hex_u64(7), "0x7");
+        assert_eq!(hex_u128(0), "0x0");
+        assert_eq!(hex_u128(255), "0xff");
+        // DATA keeps its width.
+        assert_eq!(hex_b256(B256::ZERO), format!("0x{}", "0".repeat(64)));
+        assert_eq!(hex_address(Address::ZERO), format!("0x{}", "0".repeat(40)));
     }
 
     #[tokio::test]
@@ -6030,6 +6062,124 @@ mod tests {
         assert_eq!(trades[0].trade_id, hex_u128(200));
         assert_eq!(trades[1].trade_id, hex_u128(300));
         assert_eq!(trades[2].trade_id, hex_u128(100));
+        handle.stop().unwrap();
+    }
+
+    /// R22: eth_getBalance / getCode / getStorageAt / getTransactionCount
+    /// accept exactly the blocks eth_call accepts (the eth head: "latest",
+    /// "pending", its number) and refuse any other block with eth_call's
+    /// error, instead of answering from current state.
+    #[tokio::test]
+    async fn eth_state_reads_refuse_blocks_other_than_head_like_eth_call() {
+        let (_dir, state, mempool, executor) = setup();
+        let who = Address::from([0x11; 20]);
+        let code = vec![0x60u8, 0x80, 0x60, 0x40];
+        let code_hash = alloy_primitives::keccak256(&code);
+        state.put_code(&code_hash, &code).unwrap();
+        state
+            .put_account(
+                &who,
+                &AccountInfo {
+                    balance: U256::from(7u64),
+                    nonce: 5,
+                    code_hash,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        state
+            .put_storage(&who, &U256::from(1u64), &U256::from(9u64))
+            .unwrap();
+        // Committed through 5, executed through 3: the eth head is 3.
+        for h in 0..=5u64 {
+            store_header(&state, &test_header(h, 0, 0));
+        }
+        store_applied_height(&state, 3);
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let who_s = hex_address(who);
+        let read = |method: &'static str, tag: &'static str| {
+            let client = &client;
+            let who_s = who_s.clone();
+            async move {
+                match method {
+                    "eth_getStorageAt" => {
+                        client
+                            .request::<String, _>(method, jsonrpsee::rpc_params![who_s, "0x1", tag])
+                            .await
+                    }
+                    _ => {
+                        client
+                            .request::<String, _>(method, jsonrpsee::rpc_params![who_s, tag])
+                            .await
+                    }
+                }
+            }
+        };
+        let want = [
+            ("eth_getBalance", "0x7".to_string()),
+            ("eth_getCode", "0x60806040".to_string()),
+            (
+                "eth_getStorageAt",
+                format!("0x{}", hex::encode(U256::from(9u64).to_be_bytes::<32>())),
+            ),
+            ("eth_getTransactionCount", hex_u64(5)),
+        ];
+        for (method, value) in &want {
+            for tag in ["latest", "0x3", "safe", "finalized"] {
+                assert_eq!(&read(method, tag).await.unwrap(), value, "{method} {tag}");
+            }
+            if *method != "eth_getTransactionCount" {
+                assert_eq!(
+                    &read(method, "pending").await.unwrap(),
+                    value,
+                    "{method} pending"
+                );
+            }
+        }
+        // "pending" nonce keeps its mempool path.
+        assert!(read("eth_getTransactionCount", "pending").await.is_ok());
+
+        // A caller without code (`who` has code, which EIP-3607 refuses).
+        let call = serde_json::json!({
+            "from": hex_address(Address::from([0x33; 20])),
+            "to": hex_address(Address::from([0x22; 20])),
+        });
+        // HotStuff BFT: committed = final, so "safe" and "finalized" are the
+        // head for eth_call too.
+        for tag in ["latest", "0x3", "safe", "finalized"] {
+            let r = client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
+                .await;
+            assert!(r.is_ok(), "eth_call at {tag}: {r:?}");
+        }
+        for tag in ["0x2", "earliest", "0x4", "0x5", "0x63"] {
+            let call_err = client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), tag])
+                .await
+                .unwrap_err()
+                .to_string();
+            for (method, _) in &want {
+                let e = read(method, tag)
+                    .await
+                    .expect_err(&format!("{method} at {tag} must be refused"))
+                    .to_string();
+                assert_eq!(e, call_err, "{method} at {tag}: same error as eth_call");
+            }
+        }
+        let call_err = client
+            .request::<String, _>("eth_call", jsonrpsee::rpc_params![call.clone(), "0x2"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            call_err.contains("historical state not available at block 2"),
+            "{call_err}"
+        );
         handle.stop().unwrap();
     }
 }

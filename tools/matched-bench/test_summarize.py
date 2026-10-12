@@ -130,7 +130,24 @@ END_RESIDENT_WAIT = {"exec_end_resident_wait_seconds": 0.008}
 WAIT_BUCKETS = [("0.004", 5), ("0.008", 5), ("0.016", 10), ("+Inf", 10)]
 
 
-def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_resident_worker=False):
+# Item 6 Phase 3 (p3s2g 47.1): the exec thread's checkpoint timers, per block
+# (settle_wait 6 ms, upkeep 9 ms of which the hand-off wait is 2 ms).
+CHECKPOINT = {
+    "exec_checkpoint_settle_wait_seconds": 0.006,
+    "exec_checkpoint_upkeep_seconds": 0.009,
+    "exec_checkpoint_wait_seconds": 0.002,
+}
+# Their buckets (10 observations each: settle 5 at or below 4 ms, all at or
+# below 8 ms => p50 = 4, p99 = 4 + 4 * (9.9 - 5) / 5 = 7.92; upkeep all in
+# (8, 16] => p50 = 12, p99 = 15.92).
+CKPT_BUCKETS = {
+    "torus_exec_checkpoint_settle_wait_seconds_bucket": [("0.004", 5), ("0.008", 10), ("0.016", 10), ("+Inf", 10)],
+    "torus_exec_checkpoint_upkeep_seconds_bucket": [("0.004", 0), ("0.008", 0), ("0.016", 10), ("+Inf", 10)],
+}
+
+
+def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_resident_worker=False,
+                  checkpoint=False):
     """bl1: 'serial' | 'pipelined' | 'none' (a pre-bl1 node binary).
     end_resident: the binary times end_resident (item 6 step 1);
     end_resident_worker: it runs on a worker, with a join wait (step 2)."""
@@ -140,6 +157,8 @@ def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_re
         per_blk.update(END_RESIDENT)
     if end_resident_worker:
         per_blk.update(END_RESIDENT_WAIT)
+    if checkpoint:
+        per_blk.update(CHECKPOINT)
     if bl1 == "none":
         for k in ("exec_save_books_drain_seconds", "exec_save_books_write_seconds"):
             per_blk.pop(k)
@@ -193,6 +212,11 @@ def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_re
                         "%d,%s,torus_commit_interval_seconds_bucket,%s,%d\n"
                         % (1000 + SPAN, node, le, cum)
                     )
+                if checkpoint:
+                    for metric, bks in CKPT_BUCKETS.items():
+                        for ts, scale in ((1000, 0), (1000 + SPAN, 1)):
+                            for le, cum in bks:
+                                f.write("%d,%s,%s,%s,%d\n" % (ts, node, metric, le, cum * scale))
                 if end_resident_worker:
                     for ts, scale in ((1000, 0), (1000 + SPAN, 1)):
                         for le, cum in WAIT_BUCKETS:
@@ -679,6 +703,55 @@ def main_end_resident_worker():
         close(p0["end_resident_wait_ms_p90"], 14.4, "wait p90")
 
 
+def main_checkpoint_timers():
+    """Item 6 Phase 3 (p3s2g 47.1): a binary that times the exec thread's
+    checkpoint work reports checkpoint_settle_wait and checkpoint_upkeep (with
+    its hand-off wait sub) as exec-thread phases, residual_untimed drops by
+    their sum, per-observation p50 / p99 come from their buckets, the chain
+    identity is unchanged; an older binary reports 0.0 / None; run-cell.sh
+    samples the sums, counts and buckets."""
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True, end_resident_worker=True,
+                      checkpoint=True)
+        p0 = run(out)["phase_by_node"]["val0"]
+        sw = p0["phases"]["checkpoint_settle_wait"]
+        up = p0["phases"]["checkpoint_upkeep"]
+        close(sw["ms"], 6.0, "checkpoint_settle_wait ms/blk")
+        close(up["ms"], 9.0, "checkpoint_upkeep ms/blk")
+        close(up["checkpoint_wait_ms"], 2.0, "checkpoint_wait (sub of upkeep)")
+        assert sw["off_chain"] is False and up["off_chain"] is False, (sw, up)
+        check_phase_accounting(p0, worker=True)
+        # 37 ms untimed with end_resident on a worker (main_end_resident_worker); now 37 - 6 - 9.
+        close(p0["phases"]["residual_untimed"]["ms"], 22.0, "residual (checkpoint timed)")
+        ci = p0["chain_identity"]
+        assert "checkpoint_upkeep" not in ci["e_phases"] and "checkpoint_settle_wait" not in ci["e_phases"], ci
+        close(ci["e_phase_sum_ms"], 818.0, "e_phase_sum_ms unchanged")
+        close(p0["checkpoint_settle_wait_ms_p50"], 4.0, "settle wait p50")
+        close(p0["checkpoint_settle_wait_ms_p99"], 7.92, "settle wait p99")
+        close(p0["checkpoint_upkeep_ms_p50"], 12.0, "upkeep p50")
+        close(p0["checkpoint_upkeep_ms_p99"], 15.92, "upkeep p99")
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True, end_resident_worker=True)
+        p0 = run(out)["phase_by_node"]["val0"]
+        close(p0["phases"]["checkpoint_upkeep"]["ms"], 0.0, "upkeep on an older binary")
+        close(p0["phases"]["residual_untimed"]["ms"], 37.0, "residual (older binary)")
+        assert p0["checkpoint_upkeep_ms_p50"] is None and p0["checkpoint_settle_wait_ms_p99"] is None
+    with open(os.path.join(HERE, "run-cell.sh")) as f:
+        src = f.read()
+    wide = next(l for l in src.splitlines() if l.startswith("WIDE_COLS="))
+    bkt = next(l for l in src.splitlines() if l.startswith("BUCKET_METRICS="))
+    for name in ("checkpoint_settle_wait", "checkpoint_upkeep", "checkpoint_wait"):
+        for suf in ("_sum", "_count"):
+            assert ("torus_exec_%s_seconds%s" % (name, suf)) in wide.replace('"', " ").split(), (name, suf)
+    for name in ("checkpoint_settle_wait", "checkpoint_upkeep"):
+        assert ("torus_exec_%s_seconds_bucket" % name) in bkt, name
+    print("test_summarize.py checkpoint timers: OK")
+
+
+def test_checkpoint_timers():
+    main_checkpoint_timers()
+
+
 def add_oracle_drain(out, blocks, secs):
     """ORACLE_FEED_DRAIN=1 shape: after the load window, the live feed keeps
     producing ORACLE-ONLY native blocks through the drain — every per-block
@@ -881,3 +954,4 @@ if __name__ == "__main__":
     main_s58()
     main_feed_drain()
     main_phase2_step0()
+    main_checkpoint_timers()
