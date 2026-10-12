@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS indexer_state (
@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     native_action_count INTEGER NOT NULL,
     epoch               INTEGER NOT NULL,
     validator_set_hash  TEXT NOT NULL,
-    state_root          TEXT NOT NULL
+    state_root          TEXT NOT NULL,
+    complete            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
@@ -126,6 +127,16 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
     if !has_status {
         conn.execute_batch("ALTER TABLE native_actions ADD COLUMN status TEXT;")?;
+    }
+    // R30: 1 = every row of the block was written by `write_block`; rows an
+    // older binary wrote stay 0 and are rebuilt when next visited.
+    let has_complete: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('blocks') WHERE name = 'complete'",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n > 0),
+    )?;
+    if !has_complete {
+        conn.execute_batch("ALTER TABLE blocks ADD COLUMN complete INTEGER NOT NULL DEFAULT 0;")?;
     }
     Ok(())
 }
@@ -272,6 +283,27 @@ pub struct Stats {
 // Database
 // ============================================================================
 
+/// R30: one candle trade of a block (FixedPoint raw values).
+#[derive(Debug, Clone)]
+pub struct CandleTrade {
+    pub market_id: i64,
+    pub timestamp: i64,
+    pub price_raw: i64,
+    pub qty_raw: i64,
+}
+
+/// R30: every row of one block, written by [`ExplorerDb::write_block`] in
+/// one transaction.
+#[derive(Debug, Clone)]
+pub struct BlockWrite {
+    pub block: BlockRow,
+    /// Executed txs first, then skipped ones ([`ExplorerDb::insert_transaction`] rules).
+    pub transactions: Vec<TxRow>,
+    pub logs: Vec<LogRow>,
+    pub native_actions: Vec<NativeActionRow>,
+    pub candle_trades: Vec<CandleTrade>,
+}
+
 #[derive(Clone)]
 pub struct ExplorerDb {
     conn: Arc<Mutex<Connection>>,
@@ -316,12 +348,57 @@ impl ExplorerDb {
     }
 
     pub fn set_indexer_state(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO indexer_state (key, value) VALUES (?1, ?2)",
-            params![key, value],
+        set_indexer_state_on(&self.conn.lock().unwrap(), key, value)
+    }
+
+    /// R30: every row of one block in one SQLite transaction: rows a previous
+    /// attempt or a reorged block left at this height are deleted, then the
+    /// block, its txs (executed, then skipped), logs, native actions and
+    /// candle trades are written, and the cursor advances when `height` is the
+    /// next contiguous one. All of it or none of it is stored.
+    pub fn write_block(&self, w: &BlockWrite) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        delete_block_data_on(&tx, w.block.height)?;
+        insert_block_on(&tx, &w.block)?;
+        for t in &w.transactions {
+            insert_transaction_on(&tx, t)?;
+        }
+        for l in &w.logs {
+            insert_log_on(&tx, l)?;
+        }
+        for a in &w.native_actions {
+            insert_native_action_on(&tx, a)?;
+        }
+        for c in &w.candle_trades {
+            upsert_candle_on(&tx, c.market_id, c.timestamp, c.price_raw, c.qty_raw)?;
+        }
+        tx.execute(
+            "UPDATE blocks SET complete = 1 WHERE height = ?1",
+            params![w.block.height],
         )?;
-        Ok(())
+        advance_cursor_on(&tx, w.block.height)?;
+        tx.commit()
+    }
+
+    /// R30: whether block `height` with `hash` was stored whole by
+    /// [`Self::write_block`] (not a row an older binary left partial).
+    pub fn is_block_complete(&self, height: i64, hash: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT complete FROM blocks WHERE height = ?1 AND hash = ?2",
+            params![height, hash],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|c| c == Some(1))
+    }
+
+    /// R30: move `last_indexed_height` to `height` only when it is the next
+    /// contiguous height ([`crate::indexer::FIRST_HEIGHT`] on an empty
+    /// cursor). Never backwards, never past a gap.
+    pub fn advance_cursor(&self, height: i64) -> Result<(), rusqlite::Error> {
+        advance_cursor_on(&self.conn.lock().unwrap(), height)
     }
 
     pub fn get_last_indexed_height(&self) -> Result<Option<i64>, rusqlite::Error> {
@@ -332,111 +409,22 @@ impl ExplorerDb {
     // --- Write methods ---
 
     pub fn insert_block(&self, b: &BlockRow) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO blocks
-             (height, hash, parent_hash, timestamp, proposer, gas_used, gas_limit,
-              base_fee, tx_count, native_action_count, epoch, validator_set_hash, state_root)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                b.height,
-                b.hash,
-                b.parent_hash,
-                b.timestamp,
-                b.proposer,
-                b.gas_used,
-                b.gas_limit,
-                b.base_fee,
-                b.tx_count,
-                b.native_action_count,
-                b.epoch,
-                b.validator_set_hash,
-                b.state_root,
-            ],
-        )?;
-        Ok(())
+        insert_block_on(&self.conn.lock().unwrap(), b)
     }
 
     /// Rows are keyed by hash. A skipped tx never replaces an existing row (a
     /// skipped replay of an executed tx keeps the executed one); an executed
     /// tx replaces a skipped row (a tx skipped once, then executed later).
     pub fn insert_transaction(&self, t: &TxRow) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        let on_conflict = if t.status == TxStatus::Skipped {
-            "IGNORE"
-        } else {
-            "REPLACE"
-        };
-        conn.execute(
-            &format!(
-                "INSERT OR {on_conflict} INTO transactions
-                 (hash, block_height, tx_index, from_addr, to_addr, value, gas_limit,
-                  gas_used, gas_price, input_data, nonce, status, contract_address, tx_type)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
-            ),
-            params![
-                t.hash,
-                t.block_height,
-                t.tx_index,
-                t.from_addr,
-                t.to_addr,
-                t.value,
-                t.gas_limit,
-                t.gas_used,
-                t.gas_price,
-                t.input_data,
-                t.nonce,
-                t.status.to_db(),
-                t.contract_address,
-                t.tx_type,
-            ],
-        )?;
-        Ok(())
+        insert_transaction_on(&self.conn.lock().unwrap(), t)
     }
 
     pub fn insert_log(&self, l: &LogRow) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO logs
-             (block_height, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![
-                l.block_height,
-                l.tx_hash,
-                l.log_index,
-                l.address,
-                l.topic0,
-                l.topic1,
-                l.topic2,
-                l.topic3,
-                l.data,
-            ],
-        )?;
-        Ok(())
+        insert_log_on(&self.conn.lock().unwrap(), l)
     }
 
     pub fn insert_native_action(&self, a: &NativeActionRow) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO native_actions
-             (block_height, action_index, action_type, market_id, order_id,
-              validator, target, amount, proposal_id, payload, status)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![
-                a.block_height,
-                a.action_index,
-                a.action_type,
-                a.market_id,
-                a.order_id,
-                a.validator,
-                a.target,
-                a.amount,
-                a.proposal_id,
-                a.payload,
-                a.status,
-            ],
-        )?;
-        Ok(())
+        insert_native_action_on(&self.conn.lock().unwrap(), a)
     }
 
     /// s84: set the executed/skipped status of a block's native actions,
@@ -498,23 +486,13 @@ impl ExplorerDb {
         price_raw: i64,
         qty_raw: i64,
     ) -> Result<(), rusqlite::Error> {
-        const INTERVALS: &[(&str, i64)] = &[("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)];
-        let conn = self.conn.lock().unwrap();
-        for &(interval, secs) in INTERVALS {
-            let open_time = (timestamp / secs) * secs;
-            conn.execute(
-                "INSERT INTO candles (market_id, interval, open_time, open, high, low, close, volume, trade_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
-                 ON CONFLICT(market_id, interval, open_time) DO UPDATE SET
-                     high = MAX(candles.high, excluded.high),
-                     low = MIN(candles.low, excluded.low),
-                     close = excluded.close,
-                     volume = candles.volume + excluded.volume,
-                     trade_count = candles.trade_count + 1",
-                params![market_id, interval, open_time, price_raw, price_raw, price_raw, price_raw, qty_raw.abs()],
-            )?;
-        }
-        Ok(())
+        upsert_candle_on(
+            &self.conn.lock().unwrap(),
+            market_id,
+            timestamp,
+            price_raw,
+            qty_raw,
+        )
     }
 
     /// Query candles for a market and interval within a time range.
@@ -577,22 +555,7 @@ impl ExplorerDb {
     }
 
     pub fn delete_block_data(&self, height: i64) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM logs WHERE block_height = ?1", params![height])?;
-        conn.execute(
-            "DELETE FROM transactions WHERE block_height = ?1",
-            params![height],
-        )?;
-        conn.execute(
-            "DELETE FROM native_actions WHERE block_height = ?1",
-            params![height],
-        )?;
-        conn.execute(
-            "DELETE FROM validator_snapshots WHERE block_height = ?1",
-            params![height],
-        )?;
-        conn.execute("DELETE FROM blocks WHERE height = ?1", params![height])?;
-        Ok(())
+        delete_block_data_on(&self.conn.lock().unwrap(), height)
     }
 
     // --- Read methods ---
@@ -944,6 +907,175 @@ fn row_to_validator_snapshot(row: &rusqlite::Row) -> Result<ValidatorSnapshotRow
 // Tests
 // ============================================================================
 
+// R30: statement bodies shared by the single-row methods and write_block.
+
+fn set_indexer_state_on(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO indexer_state (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn advance_cursor_on(conn: &Connection, height: i64) -> Result<(), rusqlite::Error> {
+    let cursor: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM indexer_state WHERE key = 'last_indexed_height'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|v| v.parse().ok());
+    if cursor.map_or(height == crate::indexer::FIRST_HEIGHT, |c| height == c + 1) {
+        set_indexer_state_on(conn, "last_indexed_height", &height.to_string())?;
+    }
+    Ok(())
+}
+
+fn insert_block_on(conn: &Connection, b: &BlockRow) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO blocks
+         (height, hash, parent_hash, timestamp, proposer, gas_used, gas_limit,
+          base_fee, tx_count, native_action_count, epoch, validator_set_hash, state_root)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![
+            b.height,
+            b.hash,
+            b.parent_hash,
+            b.timestamp,
+            b.proposer,
+            b.gas_used,
+            b.gas_limit,
+            b.base_fee,
+            b.tx_count,
+            b.native_action_count,
+            b.epoch,
+            b.validator_set_hash,
+            b.state_root,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_transaction_on(conn: &Connection, t: &TxRow) -> Result<(), rusqlite::Error> {
+    let on_conflict = if t.status == TxStatus::Skipped {
+        "IGNORE"
+    } else {
+        "REPLACE"
+    };
+    conn.execute(
+        &format!(
+            "INSERT OR {on_conflict} INTO transactions
+             (hash, block_height, tx_index, from_addr, to_addr, value, gas_limit,
+              gas_used, gas_price, input_data, nonce, status, contract_address, tx_type)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+        ),
+        params![
+            t.hash,
+            t.block_height,
+            t.tx_index,
+            t.from_addr,
+            t.to_addr,
+            t.value,
+            t.gas_limit,
+            t.gas_used,
+            t.gas_price,
+            t.input_data,
+            t.nonce,
+            t.status.to_db(),
+            t.contract_address,
+            t.tx_type,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_log_on(conn: &Connection, l: &LogRow) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO logs
+         (block_height, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            l.block_height,
+            l.tx_hash,
+            l.log_index,
+            l.address,
+            l.topic0,
+            l.topic1,
+            l.topic2,
+            l.topic3,
+            l.data,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_native_action_on(conn: &Connection, a: &NativeActionRow) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO native_actions
+         (block_height, action_index, action_type, market_id, order_id,
+          validator, target, amount, proposal_id, payload, status)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            a.block_height,
+            a.action_index,
+            a.action_type,
+            a.market_id,
+            a.order_id,
+            a.validator,
+            a.target,
+            a.amount,
+            a.proposal_id,
+            a.payload,
+            a.status,
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_candle_on(
+    conn: &Connection,
+    market_id: i64,
+    timestamp: i64,
+    price_raw: i64,
+    qty_raw: i64,
+) -> Result<(), rusqlite::Error> {
+    const INTERVALS: &[(&str, i64)] = &[("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)];
+    for &(interval, secs) in INTERVALS {
+        let open_time = (timestamp / secs) * secs;
+        conn.execute(
+            "INSERT INTO candles (market_id, interval, open_time, open, high, low, close, volume, trade_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
+             ON CONFLICT(market_id, interval, open_time) DO UPDATE SET
+                 high = MAX(candles.high, excluded.high),
+                 low = MIN(candles.low, excluded.low),
+                 close = excluded.close,
+                 volume = candles.volume + excluded.volume,
+                 trade_count = candles.trade_count + 1",
+            params![market_id, interval, open_time, price_raw, price_raw, price_raw, price_raw, qty_raw.abs()],
+        )?;
+    }
+    Ok(())
+}
+
+fn delete_block_data_on(conn: &Connection, height: i64) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM logs WHERE block_height = ?1", params![height])?;
+    conn.execute(
+        "DELETE FROM transactions WHERE block_height = ?1",
+        params![height],
+    )?;
+    conn.execute(
+        "DELETE FROM native_actions WHERE block_height = ?1",
+        params![height],
+    )?;
+    conn.execute(
+        "DELETE FROM validator_snapshots WHERE block_height = ?1",
+        params![height],
+    )?;
+    conn.execute("DELETE FROM blocks WHERE height = ?1", params![height])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,6 +1236,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_status, 1);
+    }
+
+    /// R30: an old database gains `blocks.complete`; its existing block rows
+    /// read as not complete (rebuilt when next visited).
+    #[test]
+    fn migrate_adds_complete_column_and_old_rows_are_not_complete() {
+        let conn = Connection::open_in_memory().unwrap();
+        let old_schema = SCHEMA.replace(
+            ",\n    complete            INTEGER NOT NULL DEFAULT 0\n);",
+            "\n);",
+        );
+        assert_ne!(old_schema, SCHEMA, "fixture strips the complete column");
+        conn.execute_batch(&old_schema).unwrap();
+        insert_block_on(&conn, &test_block(5)).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // idempotent
+        let db = ExplorerDb {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        let hash = db.get_block(5).unwrap().unwrap().hash;
+        assert!(!db.is_block_complete(5, &hash).unwrap());
     }
 
     #[test]
