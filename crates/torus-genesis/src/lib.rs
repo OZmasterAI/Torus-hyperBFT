@@ -1177,4 +1177,116 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // R19: malformed hex is an error, not a panic; alias keys are refused.
+    // -----------------------------------------------------------------------
+
+    fn genesis_with(edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        edit(&mut v);
+        v.to_string()
+    }
+
+    /// R19: an odd number of hex digits (or a non-ASCII byte) returns
+    /// InvalidHex instead of slicing past the end / mid-character.
+    #[test]
+    fn decode_hex_odd_length_or_non_ascii_is_an_error_not_a_panic() {
+        for bad in ["abc", "0x6", "0X123", "0xé1", "é"] {
+            let r = std::panic::catch_unwind(|| decode_hex(bad));
+            let r = r.unwrap_or_else(|_| panic!("decode_hex({bad:?}) panicked"));
+            assert!(
+                matches!(r, Err(GenesisError::InvalidHex(_))),
+                "decode_hex({bad:?}) = {r:?}"
+            );
+        }
+        assert_eq!(decode_hex("0x").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_hex("0XaBcD").unwrap(), vec![0xab, 0xcd]);
+        assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xff]);
+    }
+
+    /// R19: odd-length validator pubkey / contract code is refused at load,
+    /// so the node never starts on it (and validator_set() errors, not panics).
+    #[test]
+    fn genesis_with_odd_length_hex_is_refused_at_load() {
+        let json = genesis_with(|v| v["validators"][0]["pubkey"] = "0xabc".into());
+        let err = Genesis::from_json(&json).unwrap_err();
+        assert!(matches!(err, GenesisError::InvalidHex(_)), "{err}");
+
+        let json = genesis_with(|v| {
+            v["evm_alloc"]["0xcccccccccccccccccccccccccccccccccccccccc"]["code"] = "0x608".into()
+        });
+        let err = Genesis::from_json(&json).unwrap_err();
+        assert!(matches!(err, GenesisError::InvalidHex(_)), "{err}");
+    }
+
+    /// R19: storage slot keys "0", "0x0", "0X00" are one slot. Two spellings
+    /// in one map are refused (naming both), at load and before any write,
+    /// instead of HashMap order choosing the value.
+    #[test]
+    fn evm_alloc_storage_slot_aliases_are_refused() {
+        for (a, b) in [("0", "0x0"), ("0x0", "0X00"), ("16", "0x10")] {
+            let json = genesis_with(|v| {
+                v["evm_alloc"]["0xcccccccccccccccccccccccccccccccccccccccc"]["storage"] =
+                    serde_json::json!({ a: "0x1", b: "0x2" })
+            });
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{a} / {b}: {err}");
+            assert!(
+                err.contains(&format!("\"{a}\"")) && err.contains(&format!("\"{b}\"")),
+                "error names both spellings: {err}"
+            );
+        }
+    }
+
+    /// R19: evm_alloc addresses differing only by case (or 0x prefix) are one
+    /// account; two spellings are refused, naming both.
+    #[test]
+    fn evm_alloc_address_aliases_are_refused() {
+        let lower = "0xcccccccccccccccccccccccccccccccccccccccc";
+        for other in [
+            "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        ] {
+            let json =
+                genesis_with(|v| v["evm_alloc"][other] = serde_json::json!({ "balance": "0x5" }));
+            let err = Genesis::from_json(&json).unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{other}: {err}");
+            assert!(
+                err.contains(&format!("\"{lower}\"")) && err.contains(&format!("\"{other}\"")),
+                "error names both spellings: {err}"
+            );
+        }
+    }
+
+    /// R19: a Genesis built without from_json (fields edited after load) is
+    /// still checked by initialize() before the first write.
+    #[test]
+    fn initialize_refuses_alias_keys_before_any_write() {
+        use torus_state::StateBackend;
+        let mut genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        let entry = genesis
+            .evm_alloc
+            .get_mut("0xcccccccccccccccccccccccccccccccccccccccc")
+            .unwrap();
+        entry
+            .storage
+            .as_mut()
+            .unwrap()
+            .insert("0".to_string(), "0x2".to_string());
+        let dir = TempDir::new().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let err = genesis.initialize(&db).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(
+            db.all_accounts().unwrap().is_empty(),
+            "refused before any write"
+        );
+        assert!(
+            db.iterate_cf(CF_STAKING_VALIDATORS, None)
+                .unwrap()
+                .is_empty(),
+            "refused before any write"
+        );
+    }
 }
