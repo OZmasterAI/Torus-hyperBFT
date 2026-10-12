@@ -1168,4 +1168,25 @@ mod tests {
         assert!(db.get_block(0).unwrap().is_none());
         handle.stop().unwrap();
     }
+
+    /// R30 review P2: a block row an older binary left without its other rows
+    /// (same hash, not written by `write_block`) is rebuilt, not taken as
+    /// complete because its hash matches.
+    #[tokio::test]
+    async fn legacy_partial_block_with_same_hash_is_rebuilt() {
+        let db = ExplorerDb::open_in_memory().unwrap();
+        // The old indexer stored block 1's row, then failed before its tx.
+        db.insert_block(&parse_block_row(&r30_block(1, vec![r30_tx("0x0a")]), 1))
+            .unwrap();
+        assert!(db.get_block_transactions(1).unwrap().is_empty());
+        let (handle, url) = mock_node(r30_good_node(2)).await;
+        let indexer = Indexer::new(NodeRpcClient::new(&url).unwrap(), db.clone(), 10);
+        indexer.backfill().await.unwrap();
+        r30_assert_block1_complete(&db);
+        assert_eq!(db.get_last_indexed_height().unwrap(), Some(2));
+        // Now complete: a second pass skips it (no trade counted twice).
+        indexer.index_block(1).await.unwrap();
+        r30_assert_block1_complete(&db);
+        handle.stop().unwrap();
+    }
 }
