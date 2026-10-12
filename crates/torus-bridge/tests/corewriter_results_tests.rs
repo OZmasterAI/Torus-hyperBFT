@@ -54,14 +54,24 @@ fn key(block: u64, seq: u64) -> Vec<u8> {
 /// not convert), 4 a lockbox withdraw without native balance, 5 a cancel of
 /// an order that does not exist.
 fn seed(db: &StateDb) {
-    assert_eq!(enqueue(db, 7, QueuedActionKind::LockboxDeposit { amount: fp(5) }, 1), 0);
+    assert_eq!(
+        enqueue(db, 7, QueuedActionKind::LockboxDeposit { amount: fp(5) }, 1),
+        0
+    );
     db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, 1), &[0xFF, 0x00, 0x01])
         .unwrap();
     // Queued "in block 2": enqueue files it under block 3; move it to (2, 2).
-    assert_eq!(enqueue(db, 12, QueuedActionKind::CancelAll { market_id: 1 }, 2), 0);
-    let bytes = db.get_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0)).unwrap().unwrap();
+    assert_eq!(
+        enqueue(db, 12, QueuedActionKind::CancelAll { market_id: 1 }, 2),
+        0
+    );
+    let bytes = db
+        .get_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0))
+        .unwrap()
+        .unwrap();
     db.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0)).unwrap();
-    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, 2), &bytes).unwrap();
+    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, 2), &bytes)
+        .unwrap();
     let stop = QueuedActionKind::PlaceOrder {
         market_id: 1,
         side: 0,
@@ -71,8 +81,24 @@ fn seed(db: &StateDb) {
         time_in_force: 0,
     };
     assert_eq!(enqueue(db, 11, stop, 1), 3);
-    assert_eq!(enqueue(db, 9, QueuedActionKind::LockboxWithdraw { amount: fp(100) }, 1), 4);
-    assert_eq!(enqueue(db, 10, QueuedActionKind::CancelOrder { order_id: 12_345 }, 1), 5);
+    assert_eq!(
+        enqueue(
+            db,
+            9,
+            QueuedActionKind::LockboxWithdraw { amount: fp(100) },
+            1
+        ),
+        4
+    );
+    assert_eq!(
+        enqueue(
+            db,
+            10,
+            QueuedActionKind::CancelOrder { order_id: 12_345 },
+            1
+        ),
+        5
+    );
 }
 
 fn ctx(db: &StateDb) -> NativeExecContext<StateDb> {
@@ -114,10 +140,25 @@ fn drain_entries_carry_each_rows_identity_and_result_in_queue_order() {
             (5, K::CancelOrder, addr(10), 1, false),
         ]
     );
-    let msg = |i: usize| entries[i].result.error.as_deref().unwrap_or_default().to_string();
-    assert!(msg(1).starts_with("undecodable queued action (block 2, seq 1): "), "{}", msg(1));
+    let msg = |i: usize| {
+        entries[i]
+            .result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        msg(1).starts_with("undecodable queued action (block 2, seq 1): "),
+        "{}",
+        msg(1)
+    );
     assert_eq!(msg(2), "action queued in block 2 cannot execute in block 2");
-    assert!(msg(3).contains("unsupported CoreWriter order_type 2"), "{}", msg(3));
+    assert!(
+        msg(3).contains("unsupported CoreWriter order_type 2"),
+        "{}",
+        msg(3)
+    );
     assert!(!msg(4).is_empty() && !msg(5).is_empty());
     assert!(
         StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None)
@@ -146,7 +187,14 @@ fn drain_core_writer_is_the_entries_results() {
         drop(ctx);
         let out: Vec<_> = results
             .into_iter()
-            .map(|r| (r.action_type, r.success, r.reason, r.error.map(String::from)))
+            .map(|r| {
+                (
+                    r.action_type,
+                    r.success,
+                    r.reason,
+                    r.error.map(String::from),
+                )
+            })
             .collect();
         (dir, out)
     };

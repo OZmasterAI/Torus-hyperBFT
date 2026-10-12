@@ -1791,20 +1791,20 @@ impl TorusApiServer for RpcState {
             .iter()
             .map(|a| serde_json::to_value(a).unwrap_or_default())
             .collect();
-        // s84 executed/skipped record (written by execution; a block with no
-        // actions has none and reports empty lists).
-        let status = if body.native_actions.is_empty() && body.evm_transactions.is_empty() {
-            Some(torus_state::action_status::BlockActionStatus::default())
-        } else {
-            self.state
-                .get_cf_raw(CF_BLOCK_ACTION_STATUS, &key)
-                .map_err(|e| ErrorObjectOwned::from(RpcError::State(e)))?
-                .and_then(|bytes| torus_state::action_status::BlockActionStatus::decode(&bytes))
-                .filter(|s| {
-                    s.native_skipped.len() == body.native_actions.len()
-                        && s.evm_skipped.len() == body.evm_transactions.len()
-                })
-        };
+        // s84 executed/skipped record (written by execution). A block with
+        // no actions has none and reports empty lists, unless it drained
+        // CoreWriter rows (s112 v4: a record with only those results).
+        let empty_body = body.native_actions.is_empty() && body.evm_transactions.is_empty();
+        let status = self
+            .state
+            .get_cf_raw(CF_BLOCK_ACTION_STATUS, &key)
+            .map_err(|e| ErrorObjectOwned::from(RpcError::State(e)))?
+            .and_then(|bytes| torus_state::action_status::BlockActionStatus::decode(&bytes))
+            .filter(|s| {
+                s.native_skipped.len() == body.native_actions.len()
+                    && s.evm_skipped.len() == body.evm_transactions.len()
+            })
+            .or_else(|| empty_body.then(Default::default));
         let labels = |skipped: &[bool]| -> Vec<String> {
             skipped
                 .iter()

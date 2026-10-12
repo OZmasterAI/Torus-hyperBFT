@@ -13,7 +13,7 @@
 //! executed, skipped, failed or rejected.
 //!
 //! One row per executed block that carries at least one native action or EVM
-//! tx, keyed by 8-byte BE height, written in the block's flush batch (same
+//! tx or drained a CoreWriter queue row (v4), keyed by 8-byte BE height, written in the block's flush batch (same
 //! atomic write as its state and applied-height marker; on the pipelined path
 //! the flush worker encodes it into its sidecar of that batch).
 //!
@@ -476,14 +476,18 @@ fn take_message(bytes: &mut &[u8], outcome: Outcome, reason: FailureReason) -> O
 }
 
 impl BlockActionStatus {
-    /// v1 when nothing failed or was rejected (the s84 bytes exactly), else
-    /// v3.
+    /// v1 when nothing failed or was rejected and no CoreWriter row was
+    /// drained (the s84 bytes exactly), v4 when a CoreWriter row was
+    /// drained, else v3.
     pub fn encode(&self) -> Vec<u8> {
-        let failures = !self.native_failed.is_empty();
+        let core_writer = !self.core_writer.is_empty();
+        let failures = core_writer || !self.native_failed.is_empty();
         let mut out = Vec::with_capacity(
             9 + self.evm_skipped.len().div_ceil(8) + self.native_skipped.len().div_ceil(8),
         );
-        out.push(if failures {
+        out.push(if core_writer {
+            ACTION_STATUS_V4
+        } else if failures {
             ACTION_STATUS_V3
         } else {
             ACTION_STATUS_V1
@@ -509,13 +513,28 @@ impl BlockActionStatus {
                 }
             }
         }
+        if core_writer {
+            out.extend_from_slice(&(self.core_writer.len() as u32).to_be_bytes());
+            for r in &self.core_writer {
+                out.extend_from_slice(&r.seq.to_be_bytes());
+                out.push(r.kind as u8);
+                out.extend_from_slice(r.trader.as_slice());
+                out.extend_from_slice(&r.queued_block.to_be_bytes());
+                out.push(r.outcome as u8);
+                out.push(r.reason as u8);
+                push_message(&mut out, r.outcome, r.reason, &r.message);
+            }
+        }
         out
     }
 
     /// `None` for an unknown version or a truncated / overlong record.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let (&version, mut rest) = bytes.split_first()?;
-        if !matches!(version, ACTION_STATUS_V1 | ACTION_STATUS_V2 | ACTION_STATUS_V3) {
+        if !matches!(
+            version,
+            ACTION_STATUS_V1 | ACTION_STATUS_V2 | ACTION_STATUS_V3 | ACTION_STATUS_V4
+        ) {
             return None;
         }
         let evm_count = take_u32(&mut rest)? as usize;
@@ -524,7 +543,7 @@ impl BlockActionStatus {
         let native_bits = take(&mut rest, native_count.div_ceil(8))?;
         let mut native_failed = Vec::new();
         if version != ACTION_STATUS_V1 {
-            let v3 = version == ACTION_STATUS_V3;
+            let v3 = version >= ACTION_STATUS_V3;
             let count = take_u32(&mut rest)?;
             for _ in 0..count {
                 let index = take_u32(&mut rest)?;
@@ -564,6 +583,27 @@ impl BlockActionStatus {
                 });
             }
         }
+        let mut core_writer = Vec::new();
+        if version == ACTION_STATUS_V4 {
+            for _ in 0..take_u32(&mut rest)? {
+                let seq = u64::from_be_bytes(take(&mut rest, 8)?.try_into().ok()?);
+                let kind = CoreWriterKind::from_u8(take_u8(&mut rest)?);
+                let trader = alloy_primitives::Address::from_slice(take(&mut rest, 20)?);
+                let queued_block = u64::from_be_bytes(take(&mut rest, 8)?.try_into().ok()?);
+                let outcome = Outcome::from_u8(take_u8(&mut rest)?);
+                let reason = FailureReason::from_u8(take_u8(&mut rest)?);
+                let message = take_message(&mut rest, outcome, reason)?;
+                core_writer.push(CoreWriterResult {
+                    seq,
+                    kind,
+                    trader,
+                    queued_block,
+                    outcome,
+                    reason,
+                    message,
+                });
+            }
+        }
         if !rest.is_empty() {
             return None;
         }
@@ -571,7 +611,7 @@ impl BlockActionStatus {
             evm_skipped: read_bitmap(evm_bits, evm_count),
             native_skipped: read_bitmap(native_bits, native_count),
             native_failed,
-            core_writer: Vec::new(),
+            core_writer,
         })
     }
 
@@ -1050,7 +1090,13 @@ mod tests {
         assert_eq!(FailureReason::from_u8(200), FailureReason::Other);
     }
 
-    fn cw(seq: u64, kind: CoreWriterKind, outcome: Outcome, reason: FailureReason, msg: &str) -> CoreWriterResult {
+    fn cw(
+        seq: u64,
+        kind: CoreWriterKind,
+        outcome: Outcome,
+        reason: FailureReason,
+        msg: &str,
+    ) -> CoreWriterResult {
         let undecodable = kind == CoreWriterKind::Undecodable;
         CoreWriterResult {
             seq,
@@ -1076,17 +1122,57 @@ mod tests {
         use CoreWriterKind as K;
         let ioc = FailureReason::IocCancel.book_reject_message();
         let results = vec![
-            cw(0, K::LockboxDeposit, Outcome::Executed, FailureReason::Other, ""),
-            cw(1, K::Undecodable, Outcome::Failed, FailureReason::Other, "undecodable queued action (block 7, seq 1): x"),
-            cw(2, K::CancelOrder, Outcome::Failed, FailureReason::Other, "action queued in block 7 cannot execute in block 7"),
-            cw(3, K::PlaceOrder, Outcome::Failed, FailureReason::Other, "CoreWriter stop order type 2 is not supported"),
-            cw(4, K::LockboxWithdraw, Outcome::Failed, FailureReason::Margin, "insufficient native balance"),
-            cw(5, K::PlaceOrder, Outcome::Rejected, FailureReason::IocCancel, ioc),
+            cw(
+                0,
+                K::LockboxDeposit,
+                Outcome::Executed,
+                FailureReason::Other,
+                "",
+            ),
+            cw(
+                1,
+                K::Undecodable,
+                Outcome::Failed,
+                FailureReason::Other,
+                "undecodable queued action (block 7, seq 1): x",
+            ),
+            cw(
+                2,
+                K::CancelOrder,
+                Outcome::Failed,
+                FailureReason::Other,
+                "action queued in block 7 cannot execute in block 7",
+            ),
+            cw(
+                3,
+                K::PlaceOrder,
+                Outcome::Failed,
+                FailureReason::Other,
+                "CoreWriter stop order type 2 is not supported",
+            ),
+            cw(
+                4,
+                K::LockboxWithdraw,
+                Outcome::Failed,
+                FailureReason::Margin,
+                "insufficient native balance",
+            ),
+            cw(
+                5,
+                K::PlaceOrder,
+                Outcome::Rejected,
+                FailureReason::IocCancel,
+                ioc,
+            ),
             cw(9, K::Unknown, Outcome::Executed, FailureReason::Other, ""),
         ];
         for (evm, native, failed) in [
             (vec![], vec![], vec![]),
-            (vec![true], vec![false, false], vec![failure(1, 0, 1, FailureReason::Lot, "lot")]),
+            (
+                vec![true],
+                vec![false, false],
+                vec![failure(1, 0, 1, FailureReason::Lot, "lot")],
+            ),
         ] {
             let status = BlockActionStatus {
                 evm_skipped: evm,
@@ -1100,12 +1186,21 @@ mod tests {
             assert_eq!(back, status);
             let seqs: Vec<u64> = back.core_writer.iter().map(|r| r.seq).collect();
             assert_eq!(seqs, [0, 1, 2, 3, 4, 5, 9]);
-            assert_eq!(back.core_writer[5].message, ioc, "a canonical rejection reads back in full");
+            assert_eq!(
+                back.core_writer[5].message, ioc,
+                "a canonical rejection reads back in full"
+            );
         }
         // The canonical rejection text is not stored (as in v3).
         let one = |message: &str| {
             BlockActionStatus {
-                core_writer: vec![cw(0, K::PlaceOrder, Outcome::Rejected, FailureReason::IocCancel, message)],
+                core_writer: vec![cw(
+                    0,
+                    K::PlaceOrder,
+                    Outcome::Rejected,
+                    FailureReason::IocCancel,
+                    message,
+                )],
                 ..Default::default()
             }
             .encode()
@@ -1120,7 +1215,10 @@ mod tests {
     /// v4: no CoreWriter result keeps the v1 / v3 bytes exactly.
     #[test]
     fn no_core_writer_results_keeps_v1_and_v3() {
-        let v1 = BlockActionStatus { native_skipped: vec![false], ..Default::default() };
+        let v1 = BlockActionStatus {
+            native_skipped: vec![false],
+            ..Default::default()
+        };
         assert_eq!(v1.encode()[0], ACTION_STATUS_V1);
         let v3 = BlockActionStatus {
             native_skipped: vec![false],
@@ -1136,14 +1234,24 @@ mod tests {
     #[test]
     fn v4_truncated_section_does_not_decode_and_unknown_codes_read() {
         let status = BlockActionStatus {
-            core_writer: vec![cw(3, CoreWriterKind::Delegate, Outcome::Failed, FailureReason::Other, "no stake")],
+            core_writer: vec![cw(
+                3,
+                CoreWriterKind::Delegate,
+                Outcome::Failed,
+                FailureReason::Other,
+                "no stake",
+            )],
             ..Default::default()
         };
         let bytes = status.encode();
         assert_eq!(BlockActionStatus::decode(&bytes), Some(status));
         // The section starts after version 1 + counts 8 + failure_count 4.
         for cut in 13..bytes.len() {
-            assert_eq!(BlockActionStatus::decode(&bytes[..cut]), None, "cut at {cut}");
+            assert_eq!(
+                BlockActionStatus::decode(&bytes[..cut]),
+                None,
+                "cut at {cut}"
+            );
         }
         let mut overlong = bytes.clone();
         overlong.push(0);
@@ -1157,10 +1265,16 @@ mod tests {
         assert_eq!(bytes[outcome_at], Outcome::Failed as u8);
         let mut kind = bytes.clone();
         kind[kind_at] = 0x99;
-        assert_eq!(BlockActionStatus::decode(&kind).unwrap().core_writer[0].kind, CoreWriterKind::Unknown);
+        assert_eq!(
+            BlockActionStatus::decode(&kind).unwrap().core_writer[0].kind,
+            CoreWriterKind::Unknown
+        );
         let mut outcome = bytes;
         outcome[outcome_at] = 0x77;
-        assert_eq!(BlockActionStatus::decode(&outcome).unwrap().core_writer[0].outcome, Outcome::Failed);
+        assert_eq!(
+            BlockActionStatus::decode(&outcome).unwrap().core_writer[0].outcome,
+            Outcome::Failed
+        );
     }
 
     /// The stored CoreWriter kind codes and names are a format.

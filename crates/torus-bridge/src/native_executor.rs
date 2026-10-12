@@ -11163,10 +11163,22 @@ impl NativeExecutor {
     pub fn drain_core_writer<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
     ) -> Result<Vec<NativeActionResult>, torus_core::error::CoreError> {
-        let queued = CoreWriterQueue::drain(&ctx.state, ctx.block_height)?;
+        Ok(Self::drain_core_writer_entries(ctx)?
+            .into_iter()
+            .map(|e| e.result)
+            .collect())
+    }
 
-        let mut results = Vec::with_capacity(queued.len());
-        for entry in &queued {
+    /// [`Self::drain_core_writer`] with each row's identity (s112, the v4
+    /// action status record): queue sequence, kind, trader and queued block
+    /// next to its result, one entry per row in queue order.
+    pub fn drain_core_writer_entries<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+    ) -> Result<Vec<CoreWriterDrained>, torus_core::error::CoreError> {
+        let queued = CoreWriterQueue::drain_keyed(&ctx.state, ctx.block_height)?;
+
+        let mut entries = Vec::with_capacity(queued.len());
+        for (seq, entry) in &queued {
             // A-exception (owner s111): a present row that does not decode
             // fails visibly at its queue position (decode-as-absent: never a
             // fail-stop, the same bytes fail alike on every validator); the
@@ -11179,9 +11191,22 @@ impl NativeExecutor {
                         %bad,
                         "CoreWriter queue row does not decode — failed result, row deleted"
                     );
-                    results.push(NativeActionResult::err("core_writer", bad.to_string()));
+                    entries.push(CoreWriterDrained {
+                        seq: *seq,
+                        kind: CoreWriterKind::Undecodable,
+                        trader: Address::ZERO,
+                        queued_block: 0,
+                        result: NativeActionResult::err("core_writer", bad.to_string()),
+                    });
                     continue;
                 }
+            };
+            let drained = |result| CoreWriterDrained {
+                seq: *seq,
+                kind: queued_kind(&qa.kind),
+                trader: qa.trader,
+                queued_block: qa.block_queued,
+                result,
             };
             // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
             // queued in the current or a future block (should never happen, but
@@ -11192,13 +11217,13 @@ impl NativeExecutor {
                     current_block = ctx.block_height,
                     "BUG (3.1): CoreWriter action from current/future block — skipping"
                 );
-                results.push(NativeActionResult::err(
+                entries.push(drained(NativeActionResult::err(
                     "core_writer",
                     format!(
                         "action queued in block {} cannot execute in block {}",
                         qa.block_queued, ctx.block_height
                     ),
-                ));
+                )));
                 continue;
             }
 
@@ -11209,28 +11234,9 @@ impl NativeExecutor {
                 Ok(None) => Self::exec_settle_lockbox_deposit(ctx, qa),
                 Err(e) => NativeActionResult::err("core_writer", e),
             };
-            results.push(result);
+            entries.push(drained(result));
         }
-        Ok(results)
-    }
-
-    /// [`Self::drain_core_writer`] with each row's identity (s112, the v4
-    /// action status record): queue sequence, kind, trader and queued block
-    /// next to its result, one entry per row in queue order.
-    pub fn drain_core_writer_entries<T: StateBackend>(
-        ctx: &mut NativeExecContext<T>,
-    ) -> Result<Vec<CoreWriterDrained>, torus_core::error::CoreError> {
-        // RED stub: identities not filled yet.
-        Ok(Self::drain_core_writer(ctx)?
-            .into_iter()
-            .map(|result| CoreWriterDrained {
-                seq: 0,
-                kind: CoreWriterKind::Unknown,
-                trader: Address::ZERO,
-                queued_block: 0,
-                result,
-            })
-            .collect())
+        Ok(entries)
     }
 
     /// Native leg of a lockbox 0x0820 `depositToNative` queued last block (EVM-PF-05):
@@ -11706,6 +11712,42 @@ mod core_writer_conversion_tests {
         }
     }
 
+    /// s112: a v4 record's CoreWriter kind code is the queue row's own borsh
+    /// tag of the kind (after trader 20 B and block_queued 8 B).
+    #[test]
+    fn queued_kind_codes_are_the_row_tags() {
+        let fp = FixedPoint::from_raw(1);
+        let v = Address::new([2; 20]);
+        let kinds = [
+            place(0).kind,
+            QueuedActionKind::CancelOrder { order_id: 1 },
+            QueuedActionKind::CancelAll { market_id: 1 },
+            QueuedActionKind::Delegate {
+                validator: v,
+                amount: fp,
+            },
+            QueuedActionKind::Undelegate {
+                validator: v,
+                amount: fp,
+            },
+            QueuedActionKind::ClaimRewards,
+            QueuedActionKind::LockPermanent { amount: fp },
+            QueuedActionKind::ClaimUnbonded,
+            QueuedActionKind::LockboxDeposit { amount: fp },
+            QueuedActionKind::LockboxWithdraw { amount: fp },
+        ];
+        for kind in kinds {
+            let code = queued_kind(&kind) as u8;
+            let row = borsh::to_vec(&QueuedAction {
+                trader: Address::ZERO,
+                kind,
+                block_queued: 1,
+            })
+            .unwrap();
+            assert_eq!(row[28], code, "{:?}", CoreWriterKind::from_u8(code));
+        }
+    }
+
     /// Review nit: the conversion itself refuses stop / unknown order types
     /// (no silent Limit fallback left anywhere); Limit and Market convert.
     #[test]
@@ -11719,6 +11761,23 @@ mod core_writer_conversion_tests {
                 other => panic!("order_type {t}: {other:?}"),
             }
         }
+    }
+}
+
+/// s112: the v4 record's kind code of a queued action (the row's own borsh
+/// tag; pinned by `queued_kind_codes_are_the_row_tags`).
+fn queued_kind(kind: &QueuedActionKind) -> CoreWriterKind {
+    match kind {
+        QueuedActionKind::PlaceOrder { .. } => CoreWriterKind::PlaceOrder,
+        QueuedActionKind::CancelOrder { .. } => CoreWriterKind::CancelOrder,
+        QueuedActionKind::CancelAll { .. } => CoreWriterKind::CancelAll,
+        QueuedActionKind::Delegate { .. } => CoreWriterKind::Delegate,
+        QueuedActionKind::Undelegate { .. } => CoreWriterKind::Undelegate,
+        QueuedActionKind::ClaimRewards => CoreWriterKind::ClaimRewards,
+        QueuedActionKind::LockPermanent { .. } => CoreWriterKind::LockPermanent,
+        QueuedActionKind::ClaimUnbonded => CoreWriterKind::ClaimUnbonded,
+        QueuedActionKind::LockboxDeposit { .. } => CoreWriterKind::LockboxDeposit,
+        QueuedActionKind::LockboxWithdraw { .. } => CoreWriterKind::LockboxWithdraw,
     }
 }
 

@@ -25,7 +25,8 @@ use alloy_primitives::Address;
 use torus_bridge::native_executor::classify_action;
 use torus_bridge::NativeBatchResult;
 use torus_state::action_status::{
-    BlockActionStatus, CoreWriterResult, FailureReason, NativeActionFailure, Outcome,
+    BlockActionStatus, CoreWriterKind, CoreWriterResult, FailureReason, NativeActionFailure,
+    Outcome,
 };
 use torus_types::NativeAction;
 
@@ -240,9 +241,42 @@ fn body_position(
 pub fn core_writer_results(
     entries: Vec<torus_bridge::native_executor::CoreWriterDrained>,
 ) -> Vec<CoreWriterResult> {
-    // RED stub.
-    let _ = entries;
-    Vec::new()
+    entries
+        .into_iter()
+        .map(|e| {
+            let r = e.result;
+            let (outcome, reason) = if r.success {
+                (Outcome::Executed, FailureReason::Other)
+            } else if e.kind == CoreWriterKind::PlaceOrder && r.reason.hl_rejected_name().is_some()
+            {
+                // As a native placement (`outcome`): an HL `*Rejected` order.
+                (Outcome::Rejected, r.reason)
+            } else {
+                (Outcome::Failed, r.reason)
+            };
+            let message = match (outcome, r.error) {
+                (Outcome::Executed, _) => String::new(),
+                (_, Some(Cow::Owned(message))) => message,
+                // s100 S2: the canonical rejection text is recorded empty.
+                (Outcome::Rejected, Some(Cow::Borrowed(message)))
+                    if message == reason.book_reject_message() =>
+                {
+                    String::new()
+                }
+                (_, Some(Cow::Borrowed(message))) => message.to_string(),
+                (_, None) => "failed".to_string(),
+            };
+            CoreWriterResult {
+                seq: e.seq,
+                kind: e.kind,
+                trader: e.trader,
+                queued_block: e.queued_block,
+                outcome,
+                reason,
+                message,
+            }
+        })
+        .collect()
 }
 
 /// `status` encoded for `CF_BLOCK_ACTION_STATUS`, counted in the metrics.
@@ -562,15 +596,28 @@ mod tests {
             result,
         };
         let ioc = NativeActionResult {
-            error: Some(Cow::Borrowed(FailureReason::IocCancel.book_reject_message())),
+            error: Some(Cow::Borrowed(
+                FailureReason::IocCancel.book_reject_message(),
+            )),
             ..err(FailureReason::IocCancel, "")
         };
         let entries = vec![
             entry(0, K::LockboxDeposit, ok()),
-            entry(1, K::Undecodable, err(FailureReason::Other, "undecodable queued action")),
+            entry(
+                1,
+                K::Undecodable,
+                err(FailureReason::Other, "undecodable queued action"),
+            ),
             entry(2, K::PlaceOrder, ioc),
             entry(3, K::LockboxWithdraw, err(FailureReason::Margin, "short")),
-            entry(7, K::CancelOrder, NativeActionResult { error: None, ..err(FailureReason::Other, "") }),
+            entry(
+                7,
+                K::CancelOrder,
+                NativeActionResult {
+                    error: None,
+                    ..err(FailureReason::Other, "")
+                },
+            ),
         ];
         let got = core_writer_results(entries);
         let rows: Vec<_> = got
@@ -580,18 +627,54 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                (0, K::LockboxDeposit, Outcome::Executed, FailureReason::Other, ""),
-                (1, K::Undecodable, Outcome::Failed, FailureReason::Other, "undecodable queued action"),
-                (2, K::PlaceOrder, Outcome::Rejected, FailureReason::IocCancel, ""),
-                (3, K::LockboxWithdraw, Outcome::Failed, FailureReason::Margin, "short"),
-                (7, K::CancelOrder, Outcome::Failed, FailureReason::Other, "failed"),
+                (
+                    0,
+                    K::LockboxDeposit,
+                    Outcome::Executed,
+                    FailureReason::Other,
+                    ""
+                ),
+                (
+                    1,
+                    K::Undecodable,
+                    Outcome::Failed,
+                    FailureReason::Other,
+                    "undecodable queued action"
+                ),
+                (
+                    2,
+                    K::PlaceOrder,
+                    Outcome::Rejected,
+                    FailureReason::IocCancel,
+                    ""
+                ),
+                (
+                    3,
+                    K::LockboxWithdraw,
+                    Outcome::Failed,
+                    FailureReason::Margin,
+                    "short"
+                ),
+                (
+                    7,
+                    K::CancelOrder,
+                    Outcome::Failed,
+                    FailureReason::Other,
+                    "failed"
+                ),
             ]
         );
         assert!(got.iter().all(|r| r.queued_block == 4));
         assert_eq!(got[3].trader, Address::repeat_byte(3));
-        let status = BlockActionStatus { core_writer: got, ..Default::default() };
+        let status = BlockActionStatus {
+            core_writer: got,
+            ..Default::default()
+        };
         let back = BlockActionStatus::decode(&encode_status(&status, None)).expect("decodes");
-        assert_eq!(back.core_writer[2].message, FailureReason::IocCancel.book_reject_message());
+        assert_eq!(
+            back.core_writer[2].message,
+            FailureReason::IocCancel.book_reject_message()
+        );
     }
 
     #[test]

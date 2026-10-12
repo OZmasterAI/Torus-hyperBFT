@@ -3503,7 +3503,12 @@ mod tests {
             evm_transactions: vec![],
             core_writer_actions: vec![],
         };
-        for (height, body) in [(1, &with_action), (2, &with_action), (3, &empty), (4, &empty)] {
+        for (height, body) in [
+            (1, &with_action),
+            (2, &with_action),
+            (3, &empty),
+            (4, &empty),
+        ] {
             store_header(&state, &test_header(height, 0, 1_000_000_000));
             store_body(&state, height, body);
         }
@@ -3517,10 +3522,38 @@ mod tests {
             message: message.to_string(),
         };
         let results = vec![
-            cw(0, CoreWriterKind::LockboxDeposit, 7, Outcome::Executed, FailureReason::Other, ""),
-            cw(1, CoreWriterKind::Undecodable, 0, Outcome::Failed, FailureReason::Other, "undecodable queued action (block 3, seq 1): x"),
-            cw(2, CoreWriterKind::PlaceOrder, 8, Outcome::Rejected, FailureReason::IocCancel, ""),
-            cw(3, CoreWriterKind::LockboxWithdraw, 9, Outcome::Failed, FailureReason::Margin, "short"),
+            cw(
+                0,
+                CoreWriterKind::LockboxDeposit,
+                7,
+                Outcome::Executed,
+                FailureReason::Other,
+                "",
+            ),
+            cw(
+                1,
+                CoreWriterKind::Undecodable,
+                0,
+                Outcome::Failed,
+                FailureReason::Other,
+                "undecodable queued action (block 3, seq 1): x",
+            ),
+            cw(
+                2,
+                CoreWriterKind::PlaceOrder,
+                8,
+                Outcome::Rejected,
+                FailureReason::IocCancel,
+                "",
+            ),
+            cw(
+                3,
+                CoreWriterKind::LockboxWithdraw,
+                9,
+                Outcome::Failed,
+                FailureReason::Margin,
+                "short",
+            ),
         ];
         for (height, native_skipped) in [(1u64, vec![false]), (3, vec![])] {
             state
@@ -3597,9 +3630,15 @@ mod tests {
         assert_eq!(one["coreWriterResults"], want);
         assert_eq!(one["nativeActionStatus"], serde_json::json!(["executed"]));
         let cw_only = get(3).await;
-        assert_eq!(cw_only["coreWriterResults"], want, "a block with only CoreWriter results");
+        assert_eq!(
+            cw_only["coreWriterResults"], want,
+            "a block with only CoreWriter results"
+        );
         assert_eq!(cw_only["nativeActionStatus"], serde_json::json!([]));
-        assert!(get(2).await["coreWriterResults"].is_null(), "not executed yet");
+        assert!(
+            get(2).await["coreWriterResults"].is_null(),
+            "not executed yet"
+        );
         assert_eq!(get(4).await["coreWriterResults"], serde_json::json!([]));
         handle.stop().unwrap();
     }

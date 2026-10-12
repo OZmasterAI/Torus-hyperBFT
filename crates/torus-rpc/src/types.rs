@@ -680,9 +680,32 @@ pub struct RpcCoreWriterResult {
 pub fn core_writer_results(
     s: &torus_state::action_status::BlockActionStatus,
 ) -> Vec<RpcCoreWriterResult> {
-    // RED stub.
-    let _ = s;
-    Vec::new()
+    use torus_state::action_status::CoreWriterKind;
+    s.core_writer
+        .iter()
+        .map(|r| {
+            let known = r.kind != CoreWriterKind::Undecodable;
+            let executed = r.outcome == Outcome::Executed;
+            RpcCoreWriterResult {
+                seq: r.seq,
+                kind: r.kind.as_str().to_string(),
+                trader: known.then(|| hex_address(r.trader)),
+                queued_block: known.then(|| hex_u64(r.queued_block)),
+                status: r.outcome.as_str().to_string(),
+                reason: (!executed).then(|| r.reason.as_str().to_string()),
+                reject_status: match r.outcome {
+                    Outcome::Rejected => Some(
+                        r.reason
+                            .hl_rejected_name()
+                            .unwrap_or(r.reason.as_str())
+                            .to_string(),
+                    ),
+                    _ => None,
+                },
+                message: r.message.clone(),
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -796,8 +819,19 @@ mod action_failure_tests {
                 ..NativeActionFailure::new(i as u32, 0, 1, *r, "msg".into())
             })
             .collect();
-        native_failed.push(NativeActionFailure::new(9, 0, 1, FailureReason::Margin, "modify".into()));
-        let status = BlockActionStatus { evm_skipped: vec![], native_skipped: vec![false; 11], native_failed, core_writer: vec![] };
+        native_failed.push(NativeActionFailure::new(
+            9,
+            0,
+            1,
+            FailureReason::Margin,
+            "modify".into(),
+        ));
+        let status = BlockActionStatus {
+            evm_skipped: vec![],
+            native_skipped: vec![false; 11],
+            native_failed,
+            core_writer: vec![],
+        };
         let stored = BlockActionStatus::decode(&status.encode()).unwrap();
         let rpc = native_action_failures(&stored);
         let got: Vec<_> = rpc

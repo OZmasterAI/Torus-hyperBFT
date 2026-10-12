@@ -697,8 +697,12 @@ mod tests {
             ..Default::default()
         };
         for h in 0u64..20 {
-            db.put_cf_raw(CF_BLOCK_ACTION_STATUS, &h.to_be_bytes(), &record(h).encode())
-                .unwrap();
+            db.put_cf_raw(
+                CF_BLOCK_ACTION_STATUS,
+                &h.to_be_bytes(),
+                &record(h).encode(),
+            )
+            .unwrap();
         }
         let config = PrunerConfig {
             retention_blocks: 10,
