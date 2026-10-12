@@ -996,6 +996,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let own_hotstuff_vk = verifying_key;
     let timeout_counter = metrics.consensus_timeout_total.clone();
     let leader_state_for_view = leader_state.clone();
+    // The shutdown thread exists before consensus starts, so stopping never
+    // needs a new thread.
+    let shutdown_worker = ShutdownWorker::spawn()?;
     let replica = ReplicaSpec::builder()
         .app(app)
         .network(network)
@@ -1400,7 +1403,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let s = signals.recv().await;
         warn!(signal = %s, "second signal during shutdown");
     };
-    match bounded_stop(stop, limit, second_signal).await {
+    match bounded_stop(shutdown_worker, stop, limit, second_signal).await {
         StopOutcome::Clean => {
             info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1467,14 +1470,38 @@ enum StopOutcome {
     Interrupted,
 }
 
+/// The thread that runs the shutdown (RED stub: still spawned at stop time).
+struct ShutdownWorker {
+    gone: bool,
+}
+
+impl ShutdownWorker {
+    fn spawn() -> std::io::Result<Self> {
+        Ok(Self { gone: false })
+    }
+
+    /// A worker whose thread could not run the stop.
+    #[cfg(test)]
+    fn gone() -> Self {
+        Self { gone: true }
+    }
+}
+
 /// Run the blocking `stop` on its own thread and wait for it, at most `limit`
 /// or until `interrupt` completes. A `stop` still running is left behind (the
 /// caller exits the process).
 async fn bounded_stop(
+    worker: ShutdownWorker,
     stop: impl FnOnce() -> Result<(), String> + Send + 'static,
     limit: Duration,
     interrupt: impl std::future::Future<Output = ()>,
 ) -> StopOutcome {
+    if worker.gone {
+        // What a failed `Builder::spawn` does today: the closure is dropped
+        // here, on the caller.
+        drop(stop);
+        return StopOutcome::Failed("spawn shutdown thread failed".into());
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let spawned = std::thread::Builder::new()
         .name("node-shutdown".into())
@@ -1693,6 +1720,51 @@ mod tests {
         assert_eq!(second, Ok("SIGTERM"), "second SIGTERM lost");
     }
 
+    fn worker() -> ShutdownWorker {
+        ShutdownWorker::spawn().unwrap()
+    }
+
+    /// Codex P2 (round 2): a stop the shutdown thread cannot take is never
+    /// run or dropped on the calling (async) thread, where dropping the
+    /// replica would block in its joins with no bound and no second-signal
+    /// escape. Normally it runs, and drops, on `node-shutdown`.
+    #[tokio::test]
+    async fn stop_never_runs_or_drops_on_the_caller() {
+        struct Guard(Arc<std::sync::Mutex<Option<String>>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let name = std::thread::current().name().unwrap_or("").to_string();
+                *self.0.lock().unwrap() = Some(name);
+            }
+        }
+        let long = Duration::from_secs(30);
+        let never = std::future::pending::<()>;
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let guard = Guard(seen.clone());
+        let stop = move || {
+            drop(guard);
+            Ok(())
+        };
+        let out = bounded_stop(worker(), stop, long, never()).await;
+        assert_eq!(out, StopOutcome::Clean);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("node-shutdown"));
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let guard = Guard(seen.clone());
+        let stop = move || {
+            let _held = &guard;
+            Ok(())
+        };
+        let out = bounded_stop(ShutdownWorker::gone(), stop, long, never()).await;
+        assert!(matches!(out, StopOutcome::Failed(_)), "{out:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            None,
+            "stop dropped on the calling thread"
+        );
+    }
+
     #[test]
     fn shutdown_timeout_parse() {
         let s = Duration::from_secs;
@@ -1708,15 +1780,15 @@ mod tests {
         let never = std::future::pending::<()>;
         let long = Duration::from_secs(30);
         assert_eq!(
-            bounded_stop(|| Ok(()), long, never()).await,
+            bounded_stop(worker(), || Ok(()), long, never()).await,
             StopOutcome::Clean
         );
         assert_eq!(
-            bounded_stop(|| Err("flush failed".into()), long, never()).await,
+            bounded_stop(worker(), || Err("flush failed".into()), long, never()).await,
             StopOutcome::Failed("flush failed".into())
         );
         assert!(matches!(
-            bounded_stop(|| panic!("stop failed"), long, never()).await,
+            bounded_stop(worker(), || panic!("stop failed"), long, never()).await,
             StopOutcome::Failed(_)
         ));
 
@@ -1727,7 +1799,7 @@ mod tests {
             let _ = release_rx.recv();
             Ok(())
         };
-        let out = bounded_stop(hung, Duration::from_millis(200), never()).await;
+        let out = bounded_stop(worker(), hung, Duration::from_millis(200), never()).await;
         assert_eq!(out, StopOutcome::TimedOut);
         assert!(t.elapsed() < Duration::from_secs(5));
 
@@ -1740,7 +1812,7 @@ mod tests {
         let interrupt = tokio::time::sleep(Duration::from_millis(50));
         let t = std::time::Instant::now();
         assert_eq!(
-            bounded_stop(hung, long, interrupt).await,
+            bounded_stop(worker(), hung, long, interrupt).await,
             StopOutcome::Interrupted
         );
         assert!(t.elapsed() < Duration::from_secs(5));
