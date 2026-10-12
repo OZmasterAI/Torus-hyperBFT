@@ -1403,7 +1403,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let s = signals.recv().await;
         warn!(signal = %s, "second signal during shutdown");
     };
-    match bounded_stop(shutdown_worker, stop, limit, second_signal).await {
+    let outcome = bounded_stop(shutdown_worker, stop, limit, second_signal).await;
+    if outcome.exits_at_once() {
+        // The stop is still running (e.g. a flush stalled on I/O):
+        // `exit()` would run RocksDB's exit handlers, which join its
+        // background threads and block on the same work. Skip them.
+        error!(?outcome, ?limit, "shutdown abandoned; exiting now (exit 1)");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` only ends the process; no Rust state is touched.
+        unsafe { libc::_exit(1) };
+    }
+    match outcome {
         StopOutcome::Clean => {
             info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1473,7 +1485,7 @@ enum StopOutcome {
 impl StopOutcome {
     /// Whether the process must exit without running exit handlers.
     fn exits_at_once(&self) -> bool {
-        false
+        matches!(self, StopOutcome::TimedOut | StopOutcome::Interrupted)
     }
 }
 
