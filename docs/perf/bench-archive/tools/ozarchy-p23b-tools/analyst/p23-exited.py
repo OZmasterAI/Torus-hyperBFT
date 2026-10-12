@@ -45,5 +45,5 @@ for tag in sys.argv[2:]:
     print(
         f"{tag}: window {win} s, fills {fills / 1e6:.2f}M, native blk ~{blk:.0f} ({fpb:.0f} fills/blk) | process user {pu:.1f} sys {ps:.1f} s "
         f"({1e6 * ps / fills:.2f} sys CPU-s/1M) | exited-thread user {xu:.1f} sys {xs:.1f} s = sys {1e6 * xs / fills:.3f} CPU-s/1M, "
-        f"{1e6 * xs / sp:.0f} us sys per spawn (at {SPAWNS_PER_BLK}/blk) | exec live-thread names (torus-execution*) user {eu / 100:.1f} sys {es / 100:.1f} s"
+        f"{(1e6 * xs / sp) if sp else float("nan"):.0f} us sys per spawn (at {SPAWNS_PER_BLK}/blk) | exec live-thread names (torus-execution*) user {eu / 100:.1f} sys {es / 100:.1f} s"
     )
