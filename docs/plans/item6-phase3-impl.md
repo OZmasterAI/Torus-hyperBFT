@@ -340,6 +340,42 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   `2296be67` vs main `c97f56f9`, both with the bench in-flight tail on committed bodies. CPU-s/1M -7.4% (met),
   device writes -53% (met), matched/s -2.2% (tie, not up), native blocks/s -9.4% (borderline), RSS +1.5 GB peak
   (RAM gate not met: bound ~270 MB). Restart cells: not in this campaign. Owner decision.
+- **Follow-up (18c s112, after the p3s2g gate).** Both branches now merge main `8efcb07a`
+  (step 1 `b1605417`, step 2 `303f2eb1`): the next gate has no 16-commit confound.
+  - **Untimed exec time (47.1, +36 ms per block).** Cause: `checkpoint_upkeep` spawns the merge of
+    block n-1 into L at the end of block n, and `checkpoint_read_layers` joins it at the start of
+    block n+1, before the overlay is built. Nothing runs in between, so E waits for the whole merge
+    thread, and no phase timer covers that wait (the pipelined path never observes its
+    `flush_timer`). The join also waited for step 2's ingress `slice` and, in step 1, for the drop of
+    block n-1. E itself freed the sets a slice replaces (step 2: in the mempool's view swap, under its
+    lock), C once durable, and the block handles of a checkpoint-time merge. 18c probe at section-41
+    sizes x2, loaded host (**estimate**): merge ~92 ms, slice ~25 ms, full-set free ~32 ms per block,
+    L free ~200 ms per checkpoint (~4.5 ms per block).
+    New series: `torus_exec_checkpoint_settle_wait_seconds` (the join) and
+    `torus_exec_checkpoint_upkeep_seconds` (end-of-block upkeep), each once per pipelined block. The
+    harness counts both in `residual_untimed` until `summarize.py` `PHASES` lists them.
+    Built (no change to L, slices, the view's answers, state or replay): the merge thread hands L
+    back first, then slices and lets go of the block. Slices are installed at the end of the next
+    block (`install_slices`). A `torus-ckpt-drop` thread (queue 2, past it E frees inline) frees C,
+    replaced sets and the previous view. **Estimate**: ~-35-40% of the Phase 3 untimed time in step
+    2 (slice + frees), ~-25% in step 1 (drop of n-1). Left: the merge itself (~60% of it). It
+    overlaps block n+1 only if L can be read while it is merged. Option: per-CF `RwLock` on L with
+    batched merges, block n-1 read as its own layer above L (a read is then correct at any point of
+    the merge). Read path: consensus-adjacent, needs its own tests. Other options: move the
+    entries instead of cloning when the frozen set is unique (step 1 only), or a persistent map.
+  - **Cancel-all expiry (47.3).** Not a DB lag: nothing on the pool's residency path reads state
+    (eviction by nonce age, removal at commit on the consensus thread, a height-bounded in-flight
+    ledger, selection reads no state). The item C walk takes at most `ceil(limit x 25%)` cancels in
+    `(sender, nonce)` order, and leftover slots reach the other cancels only when phase 2 neither
+    fills the block nor stops at a byte or order budget. With the cancel demand per block at the
+    share, a younger cancel of a lower-address sender passes an older one of a higher-address sender
+    every block. Phase 3 only moved the operating point (fewer, larger blocks). Repro:
+    `native_pool.rs` `cancel_share_never_starves_an_older_cancel` (ignored, fails today). **Owner
+    options:** (a) oldest-first cancel phases (a cancel index by nonce; each sender stays in nonce
+    order; changes block content, bench it, see the s66 note on `SortKey`); (b) a higher
+    `TORUS_CANCEL_BLOCK_SHARE_PCT` (weaker item C); (c) per-sender round-robin in the cancel
+    share; (d) accept it (the bench's 36.7% cancel-all mix is above the 25% share; the in-flight
+    estimate stays conservative).
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
