@@ -534,6 +534,10 @@ async fn main() {
         error!(%e, "node exited with error");
         std::process::exit(1);
     }
+    // Exit now rather than drop the runtime: the drop waits for every
+    // blocking task (e.g. a pruner pass), which could hold up a finished
+    // graceful shutdown.
+    std::process::exit(0);
 }
 
 /// Read a passphrase from stdin (no echo if terminal).
@@ -992,7 +996,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let own_hotstuff_vk = verifying_key;
     let timeout_counter = metrics.consensus_timeout_total.clone();
     let leader_state_for_view = leader_state.clone();
-    let _replica = ReplicaSpec::builder()
+    let replica = ReplicaSpec::builder()
         .app(app)
         .network(network)
         .kv_store(kv_store)
@@ -1368,12 +1372,125 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 13. Wait for shutdown signal
-    info!("node is running — press Ctrl+C to shut down");
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown signal received, stopping...");
+    // 13. Wait for SIGINT (Ctrl+C) or SIGTERM (systemctl / docker / k8s stop),
+    // then stop gracefully within a bound. Dropping the replica stops the
+    // hotstuff threads; its `TorusApp` drop then drains the execution queue
+    // (every committed block is executed and persisted) and joins the exec
+    // and flush threads. Then memtables are flushed and the WAL synced, so a
+    // restart replays neither blocks nor WAL. A second signal, or the bound
+    // (`TORUS_SHUTDOWN_TIMEOUT_SECS`, default 60), exits at once; recovery
+    // after that is the same as after a kill.
+    info!("node is running — SIGINT (Ctrl+C) or SIGTERM shuts it down");
+    let signal = shutdown_signal().await?;
+    info!(%signal, "shutdown signal received, stopping...");
+    let limit = shutdown_timeout(std::env::var("TORUS_SHUTDOWN_TIMEOUT_SECS").ok());
+    let started = std::time::Instant::now();
+    let db = state_db.clone();
+    let stop = move || {
+        drop(replica);
+        info!("consensus stopped, execution queue drained");
+        match flush_for_shutdown(&db) {
+            Ok(()) => info!("memtables flushed, WAL synced"),
+            Err(e) => warn!(%e, "shutdown flush failed; restart replays the WAL"),
+        }
+    };
+    let second_signal = async {
+        match shutdown_signal().await {
+            Ok(s) => warn!(signal = %s, "second signal during shutdown"),
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    match bounded_stop(stop, limit, second_signal).await {
+        StopOutcome::Clean => {
+            info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "shutdown complete"
+            );
+            Ok(())
+        }
+        StopOutcome::Failed => Err("shutdown: stopping the node panicked".into()),
+        StopOutcome::TimedOut => {
+            Err(format!("shutdown did not finish within {limit:?}; exiting without it").into())
+        }
+        StopOutcome::Interrupted => Err("shutdown interrupted by a second signal".into()),
+    }
+}
 
-    Ok(())
+/// Wait for SIGINT or SIGTERM; returns the signal's name.
+async fn shutdown_signal() -> std::io::Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = int.recv() => "SIGINT",
+    })
+}
+
+/// Pure parse of `TORUS_SHUTDOWN_TIMEOUT_SECS` (default 60; `0` or garbage
+/// => 60).
+fn shutdown_timeout(raw: Option<String>) -> Duration {
+    match raw
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(n) if n >= 1 => Duration::from_secs(n),
+        _ => Duration::from_secs(60),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopOutcome {
+    /// `stop` returned.
+    Clean,
+    /// `stop` panicked.
+    Failed,
+    /// `stop` was still running at the limit.
+    TimedOut,
+    /// `interrupt` finished first (a second signal).
+    Interrupted,
+}
+
+/// Run the blocking `stop` on its own thread and wait for it, at most `limit`
+/// or until `interrupt` completes. A `stop` still running is left behind (the
+/// caller exits the process).
+async fn bounded_stop(
+    stop: impl FnOnce() + Send + 'static,
+    limit: Duration,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> StopOutcome {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("node-shutdown".into())
+        .spawn(move || {
+            stop();
+            let _ = tx.send(());
+        });
+    if spawned.is_err() {
+        return StopOutcome::Failed;
+    }
+    tokio::select! {
+        done = tokio::time::timeout(limit, rx) => match done {
+            Ok(Ok(())) => StopOutcome::Clean,
+            Ok(Err(_)) => StopOutcome::Failed,
+            Err(_) => StopOutcome::TimedOut,
+        },
+        () = interrupt => StopOutcome::Interrupted,
+    }
+}
+
+/// Flush every column family's memtables to SST and fsync the WAL, so a
+/// restart does not replay the WAL. Run after consensus and execution stop.
+fn flush_for_shutdown(state_db: &StateDb) -> Result<(), String> {
+    let db = state_db.db_arc();
+    for cf_name in torus_state::cf::ALL_CF_NAMES {
+        if let Some(cf) = db.cf_handle(cf_name) {
+            db.flush_cf(cf)
+                .map_err(|e| format!("flush {cf_name}: {e}"))?;
+        }
+    }
+    state_db.sync_wal().map_err(|e| e.to_string())
 }
 
 /// Pure parse of `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (default 5; `< 1` or
@@ -1502,6 +1619,51 @@ fn install_fail_stop_panic_hook(exit: fn(i32)) {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn shutdown_timeout_parse() {
+        let s = Duration::from_secs;
+        assert_eq!(shutdown_timeout(None), s(60));
+        assert_eq!(shutdown_timeout(Some("15".into())), s(15));
+        assert_eq!(shutdown_timeout(Some(" 120 ".into())), s(120));
+        assert_eq!(shutdown_timeout(Some("0".into())), s(60));
+        assert_eq!(shutdown_timeout(Some("soon".into())), s(60));
+    }
+
+    #[tokio::test]
+    async fn bounded_stop_reports_clean_failed_timeout_and_interrupt() {
+        let never = std::future::pending::<()>;
+        let long = Duration::from_secs(30);
+        assert_eq!(bounded_stop(|| {}, long, never()).await, StopOutcome::Clean);
+        assert_eq!(
+            bounded_stop(|| panic!("stop failed"), long, never()).await,
+            StopOutcome::Failed
+        );
+
+        // A hung stop is abandoned at the limit, not waited for.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::time::Instant::now();
+        let hung = move || {
+            let _ = release_rx.recv();
+        };
+        let out = bounded_stop(hung, Duration::from_millis(200), never()).await;
+        assert_eq!(out, StopOutcome::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(5));
+
+        // A second signal ends the wait at once.
+        let (release2_tx, release2_rx) = std::sync::mpsc::channel::<()>();
+        let hung = move || {
+            let _ = release2_rx.recv();
+        };
+        let interrupt = tokio::time::sleep(Duration::from_millis(50));
+        let t = std::time::Instant::now();
+        assert_eq!(
+            bounded_stop(hung, long, interrupt).await,
+            StopOutcome::Interrupted
+        );
+        assert!(t.elapsed() < Duration::from_secs(5));
+        drop((release_tx, release2_tx));
+    }
 
     /// R01b A: a panic on a listed thread calls the injected exit with 70; a
     /// panic on an unlisted thread (incl. `torus-async-validate`, which is fed
