@@ -1197,6 +1197,16 @@ mod tests {
             evm_skipped: vec![false, true],
             native_skipped: vec![height.is_multiple_of(2)],
             native_failed: Vec::new(),
+            // v4 (main s112): a CoreWriter result rides the checkpoint too.
+            core_writer: vec![torus_state::action_status::CoreWriterResult {
+                seq: height,
+                kind: torus_state::action_status::CoreWriterKind::LockboxDeposit,
+                trader: alloy_primitives::Address::repeat_byte(height as u8),
+                queued_block: height.saturating_sub(1),
+                outcome: torus_state::action_status::Outcome::Failed,
+                reason: torus_state::action_status::FailureReason::Other,
+                message: format!("row {height}"),
+            }],
         };
         let status = height.is_multiple_of(3).then_some(status);
         (o.freeze(height), status)

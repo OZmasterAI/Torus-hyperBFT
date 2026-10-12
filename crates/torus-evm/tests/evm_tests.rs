@@ -1315,7 +1315,11 @@ fn seed_native(db: &StateDb, who: &Address, raw: i128) {
 fn queued_for(db: &StateDb, block: u64) -> Vec<QueuedAction> {
     // Drain through a throwaway overlay: the deletes stay in the overlay, the DB
     // is untouched.
-    CoreWriterQueue::drain(&torus_state::NativeStateOverlay::new(db.clone()), block).unwrap()
+    CoreWriterQueue::drain(&torus_state::NativeStateOverlay::new(db.clone()), block)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.expect("decodable queue row"))
+        .collect()
 }
 
 /// Net native credit (in wei) still pending in the queue for `block`:

@@ -357,9 +357,10 @@ impl<T: StateBackend> StakingManager<T> {
     /// epoch (already distributed). They will not appear in the next epoch's
     /// `distribute_permanent_staking_rewards` since their record is removed/reduced.
     ///
-    /// Vote weight: the staker's 1.5x governance weight automatically decreases
-    /// for future proposals since `compute_vote_weight()` reads live permanent stake.
-    /// Past proposal votes are unaffected (ECON-FIND-16 snapshots).
+    /// Vote weight: the staker's 1.5x governance weight decreases for proposals
+    /// submitted after the unlock (their weight snapshot reads permanent stake
+    /// at submit). Running proposals are unaffected (ECON-FIND-16 / R18
+    /// snapshots).
     pub(crate) fn stage_governance_unlock_permanent_stake(
         &self,
         staker: Address,

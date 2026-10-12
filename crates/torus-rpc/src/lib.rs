@@ -300,7 +300,8 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    /// Create a new RPC server. Scans the DB to find the latest block height.
+    /// [`Self::try_new`], panicking on a startup error (tests, embedders).
+    /// The node binary calls `try_new` and exits with the error.
     pub fn new(
         state_db: StateDb,
         mempool: Arc<Mempool>,
@@ -309,11 +310,38 @@ impl RpcServer {
         epoch_length: u64,
         notifier: BlockNotifier,
     ) -> Self {
+        Self::try_new(
+            state_db,
+            mempool,
+            executor,
+            chain_id,
+            epoch_length,
+            notifier,
+        )
+        .unwrap_or_else(|e| panic!("RpcServer startup failed: {e}"))
+    }
+
+    /// Create a new RPC server. Scans the DB to find the latest block height
+    /// and loads the persisted trade-history cutoff. `Err` when that cutoff
+    /// cannot be read (a local storage fault): startup stops instead of
+    /// serving pruned blocks as "no trades". A missing or not-8-byte row is
+    /// cutoff 0 (nothing pruned).
+    pub fn try_new(
+        state_db: StateDb,
+        mempool: Arc<Mempool>,
+        executor: Arc<EvmExecutor>,
+        chain_id: u64,
+        epoch_length: u64,
+        notifier: BlockNotifier,
+    ) -> Result<Self, String> {
         let latest = find_latest_height(&state_db);
         // Persisted by the pruner: blocks pruned before a restart stay
-        // `DataPruned` whatever this run's flags (a read fault = 0).
-        let trades_cut = torus_state::read_trades_pruned_height(&state_db).unwrap_or(0);
-        Self {
+        // `DataPruned` whatever this run's flags. A read fault stops startup
+        // (owner rule: a storage fault never silently gives wrong answers).
+        let trades_cut = torus_state::read_trades_pruned_height(&state_db).map_err(|e| {
+            format!("cannot read the trade-history cutoff (trades_pruned_height): {e}")
+        })?;
+        Ok(Self {
             state: RpcState {
                 state: state_db,
                 mempool,
@@ -337,7 +365,7 @@ impl RpcServer {
             },
             ip_limiter: None,
             max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
-        }
+        })
     }
 
     /// Install the per-IP weight limit (anti-spam item D).
@@ -3515,9 +3543,13 @@ mod tests {
                 core_writer_actions: vec![],
             },
         );
+        // Executed through height 3 (an empty body reports empty lists only
+        // once executed).
+        store_applied_height(&state, 3);
         // v2: action 2 executed and failed (margin). Row 50: action 3 was
         // rejected (an IOC that found nothing to fill).
         let record = torus_state::action_status::BlockActionStatus {
+            core_writer: vec![],
             evm_skipped: vec![true],
             native_skipped: vec![false, true, false, false],
             native_failed: vec![
@@ -3608,6 +3640,182 @@ mod tests {
         assert_eq!(empty["nativeActionStatus"], serde_json::json!([]));
         assert_eq!(empty["nativeActionFailures"], serde_json::json!([]));
         assert_eq!(empty["evmTransactionStatus"], serde_json::json!([]));
+        handle.stop().unwrap();
+    }
+
+    /// s112 (v4): `torus_getBlockBody` lists every CoreWriter / lockbox row
+    /// the block drained, in queue order, with its outcome, also for a block
+    /// with no native action and no EVM tx (whose record holds only them);
+    /// an empty block without a record reports an empty list, a block not
+    /// executed yet `null`. RED before: no `coreWriterResults` entries.
+    #[tokio::test]
+    async fn torus_get_block_body_reports_core_writer_results() {
+        use torus_state::action_status::{
+            BlockActionStatus, CoreWriterKind, CoreWriterResult, FailureReason, Outcome,
+        };
+        let (_dir, state, mempool, executor) = setup();
+        let key = k256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let with_action = TorusBlockBody {
+            native_actions: vec![torus_types::eip712::sign_native_action(
+                torus_types::NativeAction::ClaimRewards,
+                1,
+                &key,
+            )],
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        let empty = TorusBlockBody {
+            native_actions: vec![],
+            evm_transactions: vec![],
+            core_writer_actions: vec![],
+        };
+        // Codex review (P2): height 5 (empty) is committed, not executed yet:
+        // `null`, never `[]` (its queued rows may still drain).
+        for (height, body) in [
+            (1, &with_action),
+            (2, &with_action),
+            (3, &empty),
+            (4, &empty),
+            (5, &empty),
+        ] {
+            store_header(&state, &test_header(height, 0, 1_000_000_000));
+            store_body(&state, height, body);
+        }
+        let cw = |seq, kind, trader: u8, outcome, reason, message: &str| CoreWriterResult {
+            seq,
+            kind,
+            trader: Address::repeat_byte(trader),
+            queued_block: if trader == 0 { 0 } else { 2 },
+            outcome,
+            reason,
+            message: message.to_string(),
+        };
+        let results = vec![
+            cw(
+                0,
+                CoreWriterKind::LockboxDeposit,
+                7,
+                Outcome::Executed,
+                FailureReason::Other,
+                "",
+            ),
+            cw(
+                1,
+                CoreWriterKind::Undecodable,
+                0,
+                Outcome::Failed,
+                FailureReason::Other,
+                "undecodable queued action (block 3, seq 1): x",
+            ),
+            cw(
+                2,
+                CoreWriterKind::PlaceOrder,
+                8,
+                Outcome::Rejected,
+                FailureReason::IocCancel,
+                "",
+            ),
+            cw(
+                3,
+                CoreWriterKind::LockboxWithdraw,
+                9,
+                Outcome::Failed,
+                FailureReason::Margin,
+                "short",
+            ),
+        ];
+        store_applied_height(&state, 4);
+        for (height, native_skipped) in [(1u64, vec![false]), (3, vec![])] {
+            state
+                .put_cf_raw(
+                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                    &height.to_be_bytes(),
+                    &BlockActionStatus {
+                        native_skipped,
+                        core_writer: results.clone(),
+                        ..Default::default()
+                    }
+                    .encode(),
+                )
+                .unwrap();
+        }
+
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let get = |height: u64| {
+            let client = client.clone();
+            async move {
+                client
+                    .request::<Option<serde_json::Value>, _>(
+                        "torus_getBlockBody",
+                        jsonrpsee::rpc_params![height],
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let want = serde_json::json!([
+            {
+                "seq": 0,
+                "kind": "lockbox_deposit",
+                "trader": format!("{:#x}", Address::repeat_byte(7)),
+                "queuedBlock": "0x2",
+                "status": "executed",
+                "message": ""
+            },
+            {
+                "seq": 1,
+                "kind": "undecodable",
+                "trader": null,
+                "queuedBlock": null,
+                "status": "failed",
+                "reason": "other",
+                "message": "undecodable queued action (block 3, seq 1): x"
+            },
+            {
+                "seq": 2,
+                "kind": "place_order",
+                "trader": format!("{:#x}", Address::repeat_byte(8)),
+                "queuedBlock": "0x2",
+                "status": "rejected",
+                "reason": "ioc_cancel",
+                "rejectStatus": "iocCancelRejected",
+                "message": "order rejected: IOC order could not immediately match against any resting order"
+            },
+            {
+                "seq": 3,
+                "kind": "lockbox_withdraw",
+                "trader": format!("{:#x}", Address::repeat_byte(9)),
+                "queuedBlock": "0x2",
+                "status": "failed",
+                "reason": "margin",
+                "message": "short"
+            }
+        ]);
+        let one = get(1).await;
+        assert_eq!(one["coreWriterResults"], want);
+        assert_eq!(one["nativeActionStatus"], serde_json::json!(["executed"]));
+        let cw_only = get(3).await;
+        assert_eq!(
+            cw_only["coreWriterResults"], want,
+            "a block with only CoreWriter results"
+        );
+        assert_eq!(cw_only["nativeActionStatus"], serde_json::json!([]));
+        assert!(
+            get(2).await["coreWriterResults"].is_null(),
+            "not executed yet"
+        );
+        assert_eq!(get(4).await["coreWriterResults"], serde_json::json!([]));
+        let pending_empty = get(5).await;
+        assert!(
+            pending_empty["coreWriterResults"].is_null(),
+            "{pending_empty}"
+        );
+        assert!(pending_empty["nativeActionStatus"].is_null());
         handle.stop().unwrap();
     }
 
@@ -3715,6 +3923,7 @@ mod tests {
                 torus_state::cf::CF_BLOCK_ACTION_STATUS,
                 &1u64.to_be_bytes(),
                 &torus_state::action_status::BlockActionStatus {
+                    core_writer: vec![],
                     evm_skipped: vec![false, true, false],
                     native_skipped: vec![],
                     native_failed: vec![],
@@ -4224,6 +4433,60 @@ mod tests {
         // Two entries (maker in market 1, taker in market 2) per block.
         assert_eq!(ub, hex_blocks((9..20).rev().flat_map(|b| [b, b])));
         handle.stop().unwrap();
+    }
+
+    /// A storage fault reading the persisted trade-history cutoff fails RPC
+    /// startup (owner rule: a local storage fault never silently gives wrong
+    /// answers); before, it read as cutoff 0 and blocks pruned before the
+    /// restart answered "no trades" instead of `DataPruned`. Here the fault is
+    /// a DB opened without `cf_consensus_meta` (`MissingColumnFamily`).
+    /// Controls: a missing key is 0, a wrong-length row is 0 (unchanged,
+    /// deterministic), a stored cutoff is loaded.
+    #[test]
+    fn rpc_trade_cutoff_read_fault_fails_startup() {
+        use torus_state::cf::{CF_CONSENSUS_META, META_TRADES_PRUNED_HEIGHT};
+        let (_dir, state, mempool, executor) = setup();
+        let cut_of = |db: StateDb| {
+            RpcServer::try_new(
+                db,
+                mempool.clone(),
+                executor.clone(),
+                TORUS_CHAIN_ID,
+                100,
+                BlockNotifier::new(),
+            )
+            .map(|s| s.trades_pruned_up_to().load(Ordering::Acquire))
+        };
+
+        // Control: missing key -> 0.
+        assert_eq!(cut_of(state.clone()), Ok(0), "absent = 0");
+        // Control: a wrong-length row -> 0 (unchanged).
+        state
+            .put_cf_raw(CF_CONSENSUS_META, META_TRADES_PRUNED_HEIGHT, &[1, 2, 3])
+            .unwrap();
+        assert_eq!(cut_of(state.clone()), Ok(0), "not 8 bytes = 0");
+        // Control: a stored cutoff is loaded.
+        state
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_TRADES_PRUNED_HEIGHT,
+                &9u64.to_be_bytes(),
+            )
+            .unwrap();
+        assert_eq!(cut_of(state.clone()), Ok(9));
+
+        // Fault: the read itself fails -> startup error, not cutoff 0.
+        let bad_dir = TempDir::new().unwrap();
+        let bad = StateDb::from_existing_db(rocksdb::DB::open_default(bad_dir.path()).unwrap());
+        assert!(
+            bad.get_cf_raw(CF_CONSENSUS_META, META_TRADES_PRUNED_HEIGHT)
+                .is_err(),
+            "fixture must fault"
+        );
+        match cut_of(bad) {
+            Ok(cut) => panic!("startup must fail on a cutoff read fault, got cutoff {cut}"),
+            Err(e) => assert!(e.contains("trade-history cutoff"), "{e}"),
+        }
     }
 
     /// The cutoff is persisted: after a restart with a larger N (cutoff 9 ->

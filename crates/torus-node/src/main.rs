@@ -1069,14 +1069,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Start RPC server (shares height counter with commit handler)
     let rpc_addr: SocketAddr = cli.rpc_addr.parse()?;
-    let mut rpc_server = RpcServer::new(
+    // A storage fault reading the persisted trade-history cutoff stops the
+    // node here (it would otherwise serve pruned blocks as "no trades").
+    let mut rpc_server = RpcServer::try_new(
         state_db.clone(),
         mempool.clone(),
         executor,
         chain_config.chain_id,
         chain_config.epoch_length,
         notifier,
-    );
+    )?;
     rpc_server.set_latest_height_handle(latest_height_shared);
     rpc_server.set_metrics(metrics.clone());
     // s80 fix 2: all-markets newTrades is off on validators unless

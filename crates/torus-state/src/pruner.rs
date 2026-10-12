@@ -673,6 +673,58 @@ mod tests {
         }
     }
 
+    /// s112 v4: the action status record (CoreWriter results included, on
+    /// blocks with and without a body action) is pruned with the bodies:
+    /// below the cutoff gone, at and above it intact.
+    #[test]
+    fn prune_removes_action_status_records_with_core_writer_results() {
+        use crate::action_status::{
+            BlockActionStatus, CoreWriterKind, CoreWriterResult, FailureReason, Outcome,
+        };
+        let dir = TempDir::new().unwrap();
+        let db = setup_db_with_data(dir.path());
+        let record = |h: u64| BlockActionStatus {
+            native_skipped: vec![false; (h % 2) as usize],
+            core_writer: vec![CoreWriterResult {
+                seq: h,
+                kind: CoreWriterKind::LockboxWithdraw,
+                trader: alloy_primitives::Address::repeat_byte(h as u8),
+                queued_block: h.saturating_sub(1),
+                outcome: Outcome::Failed,
+                reason: FailureReason::Other,
+                message: format!("withdraw {h} refused"),
+            }],
+            ..Default::default()
+        };
+        for h in 0u64..20 {
+            db.put_cf_raw(
+                CF_BLOCK_ACTION_STATUS,
+                &h.to_be_bytes(),
+                &record(h).encode(),
+            )
+            .unwrap();
+        }
+        let config = PrunerConfig {
+            retention_blocks: 10,
+            prune_interval_blocks: 1,
+            batch_size: 100,
+            trade_retention_blocks: None,
+        };
+        let mut pruner = StatePruner::new(db.clone(), config, Arc::new(AtomicU64::new(0)));
+        assert_eq!(pruner.maybe_prune(15).unwrap(), 5);
+        for h in 0u64..20 {
+            let stored = db
+                .get_cf_raw(CF_BLOCK_ACTION_STATUS, &h.to_be_bytes())
+                .unwrap()
+                .map(|b| BlockActionStatus::decode(&b).expect("decodes"));
+            if h < 5 {
+                assert_eq!(stored, None, "record {h} pruned");
+            } else {
+                assert_eq!(stored, Some(record(h)), "record {h} kept whole");
+            }
+        }
+    }
+
     #[test]
     fn archive_mode_prunes_nothing() {
         let dir = TempDir::new().unwrap();
