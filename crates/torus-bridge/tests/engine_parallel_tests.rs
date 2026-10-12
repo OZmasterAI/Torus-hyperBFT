@@ -1723,12 +1723,13 @@ fn b_blind_shapes_identical() {
 // Item 6 Phase 2 step 0.2: thread spawns per site
 // ============================================================================
 
-/// The sharded engine path spawns at the match, settle, margin-prepare and
-/// save-books sites and counts each spawn (`torus_state::spawn_count`; the
-/// counters are process-wide, so other tests only add to the deltas).
+/// The sharded engine path spawns at the margin-prepare and save-books
+/// sites and counts each spawn (`torus_state::spawn_count`, this thread's
+/// counts); P2-3: matching and settle pass A run on the exec pool and spawn
+/// nothing.
 #[test]
 fn parallel_engine_counts_spawns_per_site() {
-    use torus_state::spawn_count::{totals, SpawnSite};
+    use torus_state::spawn_count::{thread_totals as totals, SpawnSite};
     let before = totals();
     let (_dir, db) = open_test_db();
     let mut ctx = NativeExecContext::new_with_mode(
@@ -1755,15 +1756,16 @@ fn parallel_engine_counts_spawns_per_site() {
     }
     ctx.save_order_books();
     let after = totals();
-    for site in [
-        SpawnSite::Match,
-        SpawnSite::Settle,
-        SpawnSite::MarginPrepare,
-        SpawnSite::SaveBooks,
-    ] {
+    for site in [SpawnSite::MarginPrepare, SpawnSite::SaveBooks] {
         assert!(
             after[site as usize] > before[site as usize],
             "{site:?}: no spawn counted"
+        );
+    }
+    for site in [SpawnSite::Match, SpawnSite::Settle] {
+        assert_eq!(
+            after[site as usize], before[site as usize],
+            "{site:?}: P2-3 runs it on the exec pool, no spawn"
         );
     }
 }
