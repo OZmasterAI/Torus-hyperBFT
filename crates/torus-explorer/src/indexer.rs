@@ -165,18 +165,17 @@ impl Indexer {
         }
 
         // Trades into OHLCV candles (Phase 7B). Written with the block, so a
-        // retried block never counts a trade twice. Best effort as before: a
-        // node without trade history for the block leaves no candle trades.
-        // A legacy partial block's trades may already be in the candles (the
-        // old binary wrote them before its cursor); candles keep only totals,
-        // so they are never replayed: no trade is counted twice.
+        // retried block never counts a trade twice. A trade fetch error fails
+        // the block like every other fetch error (owner s112): it is retried,
+        // never stored without its trades. A legacy partial block's trades
+        // may already be in the candles (the old binary wrote them before its
+        // cursor); candles keep only totals, so they are never replayed: no
+        // trade is counted twice (owner s112: it may undercount).
         if legacy_rebuild {
             warn!("Block {height}: candle trades not replayed on rebuild");
         } else {
-            match self.rpc.get_block_trades(height).await {
-                Ok(trades) => write.candle_trades = candle_trades(height, &trades),
-                Err(e) => warn!("No trades for block {height}: {e}"),
-            }
+            let trades = self.rpc.get_block_trades(height).await?;
+            write.candle_trades = candle_trades(height, &trades);
         }
 
         self.db.write_block(&write).map_err(db_err)?;
@@ -675,6 +674,9 @@ mod tests {
                 json!(2),
                 body(vec![tx(ok)], vec!["skipped"]),
             ),
+            // A trade fetch error fails the block (R30): no trades here.
+            ("torus_getBlockTrades", json!(1), json!([])),
+            ("torus_getBlockTrades", json!(2), json!([])),
         ])
         .await;
         let indexer = Indexer::new(
@@ -1250,8 +1252,8 @@ mod tests {
 
     /// R30 review P2 (stop review): the old binary wrote candles before its
     /// cursor, so a legacy partial block may already be in the candles.
-    /// Rebuilding it never replays its trades (no double count); candle
-    /// trades stay best effort, as on a trade fetch error.
+    /// Rebuilding it never replays its trades (no double count; owner s112
+    /// accepted that it may undercount).
     #[tokio::test]
     async fn legacy_rebuild_never_counts_a_trade_twice() {
         let db = ExplorerDb::open_in_memory().unwrap();
