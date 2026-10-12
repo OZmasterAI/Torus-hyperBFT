@@ -301,6 +301,15 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   `2296be67` vs main `c97f56f9`, both with the bench in-flight tail on committed bodies. CPU-s/1M -7.4% (met),
   device writes -53% (met), matched/s -2.2% (tie, not up), native blocks/s -9.4% (borderline), RSS +1.5 GB peak
   (RAM gate not met: bound ~270 MB). Restart cells: not in this campaign. Owner decision.
+- **RSS split** (campaign `ozarchy-p3rss`, results doc section 48, plan-2 row 53): of step 2's +1.55 GB peak, the
+  commit-mode exec backlog (not Phase 3) is +0.83 GB, the step 1 layer +0.88 GB and the step 2 view +0.68 GB (vs control
+  `2725e321`); about half of each Phase 3 delta is glibc retention (jemalloc live heap +0.51 / +0.45 / +0.33 GB). RSS
+  still climbs at 120 s. Next: allocator A/B and a ~30 min soak.
+- **Gate rerun** (campaign `ozarchy-p3g2`, results doc section 49, plan-2 row 54): step 2 `51a67f57` vs main `8efcb07a`
+  (clean control), commit tail, n = 4. CPU-s/1M -7.0% (met), writes -51% (met), matched/s +2.9% (tie), native blocks/s
+  -5.5% (not met), RSS +1.55 GB peak (not met), exec ms per block flat, block-time p99 +12.7%. New timers: E waits
+  23.9 ms per block on the previous layer merge (`checkpoint_settle_wait`, p99 95 ms), upkeep 1.0 ms; free-off-exec
+  confirmed (`torus-ckpt-drop`). Also valid for `6d9b78af`. Restart cells: SIGTERM cells on the next step 2 head.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
