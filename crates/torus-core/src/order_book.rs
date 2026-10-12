@@ -35,6 +35,8 @@ mod matching_entry_tests;
 mod account_margins_p1_tests;
 #[cfg(test)]
 mod mark_charge_tests;
+#[cfg(test)]
+mod cloid_tests;
 
 /// Open orders (resting + pending stops) of each sender in `senders` (value =
 /// its index in the result), summed over `books`. The walk costs, per book,

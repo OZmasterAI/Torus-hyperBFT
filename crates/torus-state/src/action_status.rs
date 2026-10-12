@@ -698,6 +698,7 @@ mod tests {
             "order rejected: no liquidity for the market order within its price cap",
             "order rejected: FOK order could not be filled completely",
             "order rejected: stop trigger price is on the wrong side of the last trade",
+            "order rejected: client order id is already used by an open order",
             fallback,
         ];
         for (code, text) in want.iter().enumerate() {
@@ -1111,6 +1112,7 @@ mod tests {
             (FailureReason::MarketNoLiquidity, 12, "market_no_liquidity"),
             (FailureReason::FokCancel, 13, "fok_cancel"),
             (FailureReason::BadTriggerPx, 14, "bad_trigger_px"),
+            (FailureReason::DuplicateCloid, 15, "duplicate_cloid"),
         ];
         for (reason, code, name) in all {
             assert_eq!(reason as u8, code, "{name}");
