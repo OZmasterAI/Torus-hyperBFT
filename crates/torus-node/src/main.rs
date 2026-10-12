@@ -1470,6 +1470,13 @@ enum StopOutcome {
     Interrupted,
 }
 
+impl StopOutcome {
+    /// Whether the process must exit without running exit handlers.
+    fn exits_at_once(&self) -> bool {
+        false
+    }
+}
+
 type StopJob = Box<dyn FnOnce() -> Result<(), String> + Send>;
 type StopReply = tokio::sync::oneshot::Sender<Result<(), String>>;
 
@@ -1769,6 +1776,18 @@ mod tests {
             None,
             "stop dropped on the calling thread"
         );
+    }
+
+    /// Codex P2 (round 3): after a timeout or a second signal the stop is
+    /// still running (e.g. a RocksDB flush stalled on I/O). `exit()` runs
+    /// RocksDB's exit handlers, which join its background threads and so
+    /// block on the same I/O; those outcomes must skip them (`_exit`).
+    #[test]
+    fn abandoned_stop_exits_without_exit_handlers() {
+        assert!(StopOutcome::TimedOut.exits_at_once());
+        assert!(StopOutcome::Interrupted.exits_at_once());
+        assert!(!StopOutcome::Clean.exits_at_once());
+        assert!(!StopOutcome::Failed("flush".into()).exits_at_once());
     }
 
     #[test]
