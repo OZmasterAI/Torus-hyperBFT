@@ -5047,8 +5047,188 @@ Mean per cell (node counters: mean of the 3 nodes; deltas before -> after the be
 - **Confidence:** high for CPU (every cell, both modes, tight CIs) and blocks/s. High that the matched/s drop is the
   read-lag throttle (the submit stalls line up with the 100-block RPC head steps in every step 1 cell). Medium for the
   equal-fills numbers (extrapolated across a 10-13% fills gap).
+## 46. Phase 3 step 1 restart and crash cells: SIGKILL, SIGTERM and SIGINT at interval 15 s vs off (campaign ozarchy-p3r1, 2026-10-12)
+
+Owner request (via 18c, s111): the restart <= 60 s and crash-correctness part of the Phase 3 gate, measured on
+step 1 `a44bdde6` (`feat/item6-phase3-step1`, off main `2725e321`; differs from the p3c1 commit `7c178637` only by
+the byte-cap fix, which is inactive here because `TORUS_CHECKPOINT_MAX_BYTES` is unset). Measurement only, no node
+change. Section 45 (p3c1) and review log row 50 are on the unmerged branch `docs/p3-step1-bench`, not yet on main,
+so this is section 46 and row 51.
+
+### 46.1 Setup
+
+- **One binary in both arms:** `a44bdde6`, node `7d1a0874` (md5 `7d1a08743778d315ed0c7a21eaeb8f6c`), built in
+  its own worktree and target dir (`~/.cargo-target-p3r1-a44b`, `ozarchy-p3r1-build/md5s.txt`). The bench is
+  the p3c1 control bench `c4559781` (the load generator the p3c1 sd arm ran). Harness `9b7e29b2` (run-cell.sh
+  unchanged; the p3p tools copy, `crash-kill.sh` patched only for `KILL_SIG`). tw (trade history off + WAL
+  2048 MiB), Classic, 300 markets, standard shape (MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900), shared NVMe.
+- **Arms:** o = `TORUS_CHECKPOINT_INTERVAL_MS` unset (today's per-block flush) and s = `15000`. In
+  `exec_pipeline.rs` unset and `0` both parse to `None` (checkpoints off), so the o arm leaves it unset.
+  `TORUS_EXEC_PIPELINE` was unset (default on) and checked in every cell, on all 3 validators and on every
+  restarted val1 (env + `bl2 exec pipeline ENABLED`). The s arm's enable line and checkpoint counter were
+  checked per cell: counter >= 1 on s and 0 on o.
+- **State hash on in every cell:** `STATE_HASH_ACTIVATION=1` (genesis `state_hash_activation = 1`, checked).
+  `TORUS_STATE_HASH_FAILSTOP` was unset (default off), so a mismatch would show as an ERROR line and a counter
+  and the cell would keep its evidence. **The devnet passes no `--state-hash-attest-key`, so no validator
+  submits `AttestStateHash`** (`votes: []`, `quorumHash: null` everywhere). The running hash is computed and
+  checkpointed, but the on-chain quorum comparison does not run. Agreement was checked by the campaign instead:
+  `torus_getStateHash` read every 100-block checkpoint's `localHash` on each validator (polled every 15 s until
+  the harness stop) and compared the three.
+- **Cells:** 12 restart cells of 540 s, each with 4 kills of val1, restarted from the same data dir: x at bench
+  + 60 / 180 / 300 / 420 s and y at + 65 / 187 / 309 / 431 s. Checkpoints come every ~100 blocks (~8-15 s), so
+  the kills land at different points of the window (from 7 to 162 blocks of rewind, below). Two cells per arm x
+  signal, giving 8 kills each and 48 in total. Interleaved order: x1 o-KILL s-KILL s-TERM o-TERM o-INT s-INT,
+  then y1 in reverse. A 60 s warm-up (w0, o, no kill) came first; the prep smoke cell was s INT, 150 s, kill at 60.
+- **Signals:** KILL (`kill -9`) and TERM, as requested, plus INT. **On `a44bdde6` SIGTERM is not a clean stop.**
+  `main.rs` waits only on `tokio::signal::ctrl_c()` (SIGINT), so SIGTERM is the default action: immediate exit,
+  no shutdown line, the same as SIGKILL for the data on disk. SIGINT is the node's real clean-stop path
+  (`shutdown signal received`; the `ExecutionContext` Drop closes the open window into a final checkpoint), so
+  it was added as the clean-stop arm. `KILL_WAIT=60` for every signal.
+- **Samplers added to p3c1's:** every validator's `/metrics` every 1 s (block height, exec queue depth, state
+  hash height, checkpoint family), the state hash poller above, and a per-cell scan of WARN/ERROR lines for
+  correctness evidence.
+- **Host:** quiet before every cell (no rust-analyzer, cargo or rustc; load1 < 2). The coordinator reported one
+  outside `cargo test -p bench-throughput` (another agent's Codex review) from 00:33:29 to 00:35:10. It
+  overlapped only the last ~2 s of x1-s-KILL's end-of-cell state digest and its teardown. That was after the
+  load window (00:22:59-00:32:03) and after all four kills and rejoins (last restart 00:30:00), so no timing is
+  affected and the cell is kept.
+- **Validity:** all 13 cells ran to the end. Every hard check passed (CHECK OK; no CHECK FAIL, no node death,
+  no HARD FINDING line). The 12 restart cells have rc 2, which is the known false FAIL from the INFO line
+  `running state hash fail-stop ... on=false`; summarize's DISAGREE on 9 of them is explained in 46.4.
+
+### 46.2 Method (per kill; scripts in `bench-archive/tools/ozarchy-p3r1-tools/`, `a-restart.py`)
+
+Times come from `crash-kill{,-k}.json` (kill and restart, epoch) and val1's restart tail
+`crash-restart-tail{,-k}.log` (UTC log timestamps).
+- down = kill -> restart: the process exit plus `crash-kill.sh`'s 1 s poll.
+- restart -> DB open = restart -> `state database opened`.
+- Replay: WARN `crash recovery: execution gap detected` gives committed C, applied A (the durable marker) and
+  the gap. Replay s = that line -> `exec pipeline ENABLED ... applied=`. When there is no gap line, A = C = the
+  ENABLED value.
+- **Restart -> first commit (chain)** = restart -> val0's first commit after the restart (`crash-freeze.py`,
+  val0 log). kill -> first commit = down + that. This is the primary number: val1's own first
+  `on_committed_block` can be a block that val0 had already committed (smoke cell: val1 at +2.4 s, the chain
+  at +15.7 s). val1's line is reported as well.
+- **Rejoin** = restart -> first 1 s sample in which val1's committed height >= min(val0, val2) - 2 and val1's
+  executed height (block height - exec queue depth) >= min(val0, val2) executed - 2.
+- **Correctness per kill:** A <= C; the first replayed `block done` height = A + 1; the replayed heights are
+  exactly A+1..C, each once; ENABLED `applied` = C; A >= val1's durable state-hash height in the last 1 s
+  sample before the kill (the replay never starts below what was already durable). **Per cell:** block hashes
+  equal; the RPC state digest (300 books + OI + 50 accounts); every state-hash checkpoint's `localHash` equal
+  on the 3 validators.
+
+### 46.3 Restart vs the 60 s gate (mean / max)
+
+| arm | signal | kills | down s | restart -> DB open s | replay blocks (C - A) | replay s | replay blocks/s | restart -> first commit s | kill -> first commit s | restart -> rejoin s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| o (off) | KILL | 8 | 1.0 / 1.0 | 3.0 / 4.3 | 49 / 65 | 9.5 / 12.8 | 5.1 / 6.7 | 13.3 / 15.9 | 14.3 / 16.9 | 13.2 / 15.4 |
+| s (15 s) | KILL | 8 | 1.0 / 1.1 | 2.4 / 3.6 | 92 / 162 | 7.8 / 20.4 | 13.1 / 21.2 | 13.4 / 22.2 | 14.4 / **23.2** | 11.0 / 22.8 |
+| o | TERM (= kill) | 8 | 1.0 / 1.0 | 3.3 / 4.3 | 53 / 65 | 8.9 / 10.9 | 5.9 / 8.6 | 13.7 / 14.5 | 14.7 / 15.5 | 12.8 / 15.0 |
+| s | TERM (= kill) | 6 (+2, see below) | 1.0 / 1.0 | 2.5 / 3.6 | 56 / 142 | 5.3 / 12.5 | 11.0 / 26.0 | 14.7 / 20.7 | 15.7 / 21.7 | 8.3 / 15.9 |
+| o | INT (clean) | 8 | 9.0 / 12.0 | 3.9 / 4.6 | 0 / 0 | - | - | 10.3 / 13.5 | 19.4 / 22.6 | 24.4 / 125.6 (9.9 / 15.2 without k1 of y1) |
+| s | INT (clean) | 8 | 3.9 / 8.0 | 3.1 / 4.0 | 0 / 0 | - | - | 9.9 / 18.2 | 13.8 / 21.2 | 9.7 / 16.7 |
+
+Per cell (kills 1 / 2 / 3 / 4):
+
+| cell | A (marker) ; C (committed) | replay blocks | replay s | restart -> first commit s | kill -> first commit s | rejoin s |
+|---|---|---|---|---|---|---|
+| x1-o-KILL | 689 / 1554 / 2419 / 3218 ; 754 / 1612 / 2475 / 3249 | 65 / 58 / 56 / 31 | 12.8 / 11.6 / 8.4 / 8.1 | 15.9 / 14.5 / 13.5 / 12.6 | 16.9 / 15.5 / 14.5 / 13.6 | 15.4 / 15.1 / 13.0 / 12.9 |
+| y1-o-KILL | 782 / 1696 / 2558 / 3443 ; 818 / 1755 / 2620 / 3470 | 36 / 59 / 62 / 27 | 6.8 / 9.3 / 11.7 / 7.3 | 10.3 / 13.0 / 14.8 / 11.5 | 11.3 / 14.0 / 15.8 / 12.5 | 10.3 / 14.6 / 14.4 / 9.7 |
+| x1-s-KILL | 1000 / 2300 / 3700 / 5100 ; 1102 / 2417 / 3862 / 5176 | 102 / 117 / 162 / 76 | 7.0 / 7.3 / 20.4 / 6.8 | 11.4 / 2.6 / 22.2 / 13.7 | 12.4 / 3.6 / 23.2 / 14.7 | 11.6 / 10.7 / 22.8 / 10.2 |
+| y1-s-KILL | 1200 / 2400 / 2800 / 3200 ; 1255 / 2494 / 2834 / 3296 | 55 / 94 / 34 / 96 | 5.8 / 4.4 / 5.4 / 5.3 | 17.7 / 18.0 / 11.3 / 9.9 | 18.8 / 19.1 / 12.3 / 10.9 | 7.6 / 8.7 / 7.7 / 8.7 |
+| x1-o-TERM | 629 / 1489 / 2429 / 3388 ; 693 / 1546 / 2476 / 3404 | 64 / 57 / 47 / 16 | 10.8 / 10.4 / 8.8 / 4.8 | 13.8 / 14.2 / 13.2 / 12.0 | 14.8 / 15.2 / 14.2 / 13.0 | 13.1 / 15.0 / 12.5 / 9.1 |
+| y1-o-TERM | 627 / 1529 / 2408 / 3298 ; 689 / 1587 / 2473 / 3355 | 62 / 58 / 65 / 57 | 7.2 / 10.9 / 9.0 / 9.5 | 14.5 / 13.7 / 14.1 / 14.2 | 15.5 / 14.8 / 15.1 / 15.2 | 11.1 / 13.9 / 13.9 / 14.0 |
+| x1-s-TERM | 1000 / 2300 / 2339 / 2354 ; 1073 / 2339 / 2354 / 2354 | 73 / 39 / 15 / 0 | 2.8 / 4.8 / 6.0 / 0.0 | 13.8 / 8.9 / - / - | 14.8 / 9.9 / - / - | 5.0 / 7.2 / 7.5 / 312.6 |
+| y1-s-TERM | 1100 / 2200 / 3700 / 4099 ; 1146 / 2342 / 3731 / 4106 | 46 / 142 / 31 / 7 | 5.3 / 12.5 / 3.2 / 3.1 | 17.4 / 18.0 / 9.4 / 20.7 | 18.4 / 19.0 / 10.4 / 21.7 | 7.6 / 15.9 / 7.7 / 6.6 |
+| x1-o-INT | A = C: 786 / 1185 / 1431 / 1600 | 0 | 0 | 13.5 / 5.8 / 12.6 / 7.2 | 21.5 / 15.8 / 22.6 / 13.2 | 11.4 / 8.0 / 10.1 / 6.1 |
+| y1-o-INT | A = C: 708 / 1229 / 1487 / 1721 | 0 | 0 | 11.4 / 9.8 / 9.6 / 12.8 | 19.4 / 21.9 / 20.6 / 19.8 | 125.6 / 10.3 / 8.2 / 15.2 |
+| x1-s-INT | A = C: 1149 / 1539 / 1732 / 1945 | 0 | 0 | 0.2 / 18.2 / 8.4 / 13.1 | 3.2 / 21.2 / 10.4 / 16.1 | 16.7 / 7.5 / 7.5 / 10.9 |
+| y1-s-INT | A = C: 1135 / 1631 / 1920 / 2437 | 0 | 0 | 12.0 / 12.3 / 4.7 / 10.7 | 16.0 / 16.3 / 12.7 / 14.7 | 7.9 / 7.5 / 5.5 / 14.3 |
+
+- **Gate met in every measured kill:** kill -> first commit max 23.2 s (s, SIGKILL; the 162-block rewind),
+  restart -> first commit max 22.2 s. Compare p3p (section 42.6): prototype all rows SIGKILL 21.3 s mean /
+  26.6 s max restart -> first commit, control 12.1 s. Step 1 SIGKILL: 13.4 s mean / 22.2 s max. Today's path
+  (o) SIGKILL: 13.3 / 15.9.
+- **What sets the replay:** on o, A trails the pre-kill commit height by the exec queue (rewind = queue,
+  16-65 blocks). On s, A is the last checkpoint: a multiple of 100 (the attest-height trigger) in 13 of the 14
+  measured KILL/TERM kills; the other (4099) and the excluded kill 3 of x1-s-TERM (2339) are 15 s time-triggered
+  checkpoints. The rewind is the blocks since that checkpoint plus the queue: 7-162 blocks, mean 92 (KILL) / 56
+  (TERM). The serial replay ran faster per block on s (13.1 vs 5.1 blocks/s mean; not analysed further), so the
+  longer rewind costs at most ~8 s (replay max 20.4 s vs 12.8 s).
+  Mean restart -> first commit is the same in both arms (13.4 vs 13.3 s); the s maximum is 6 s higher.
+- **SIGTERM = SIGKILL on this binary** (down 1.0 s, no shutdown line, same rewind shape), as expected from
+  `main.rs`.
+- **SIGINT (clean stop):** no replay on either arm (A = C every time; the restarted node attaches at the
+  committed height). The node first executes its exec queue and then exits, so down is longer: o 9.0 s mean /
+  12.0 max (queue up to 66 blocks executed per block), s 3.9 / 8.0 (smaller queues at the kill; the window
+  closes into a final checkpoint, smoke cell: `flush worker thread shutting down` 0.59 s after the signal).
+  kill -> first commit: s INT 13.8 s mean, about the same as s KILL (14.4); o INT 19.4 s, longer than o KILL
+  (14.3), because the drain sits in front of the exit (as p3p's graceful arms).
+- **DB open** is 2.4-3.9 s mean (p3p: control 2.8, all rows 4.2); not higher on s.
+- **Rejoin:** 8-13 s mean. Outlier y1-o-INT kill 1 (125.6 s): val1 committed at once but its exec queue stayed
+  at ~65 for 2 minutes under load while the others ran near 0. That is execution lag, not a stall.
+- **Excluded: x1-s-TERM kills 3 and 4.** From 22:41:23 UTC (23 s after kill 2's restart, before kill 3) the
+  chain committed nothing on any validator until 22:50:10 (during the drain), stuck at height 2354. val1 logged
+  `Failed to publish consensus message: NoPeersSubscribedToTopic` and `mesh watchdog: validator connected but
+  unsubscribed past grace — forcing reconnect`, and block-sync made no progress. This is the gossipsub
+  subscription wedge after an in-place restart (memory S395: an instant kill + start leaves the subscriptions
+  un-exchanged; seen before on the testnet, independent of the binary). Kills 3 and 4 landed inside the stall,
+  so they measure the wedge, not the restart. The wedge signature (watchdog reconnects in val1's log) shows in
+  both arms after 20 of the 48 restarts (o 7, s 13; per signal KILL 3, TERM 6, INT 11). This is the only full
+  halt: in every other kill window the longest commit gap is <= 37.6 s (`crash-freeze.py`). Cell blocks/s is
+  lowest in the INT cells (2.5-4.2, vs 5.9-10.9 in the KILL / TERM cells other than x1-s-TERM). It is a harness /
+  network finding (in-place restart pattern), not a Phase 3 one, and it is listed under Open.
+
+### 46.4 Correctness (hard checks): no finding
+
+- **Per kill (all 48):** A <= C; the replay starts at A + 1 and replays exactly A+1..C once; ENABLED
+  `applied` = C; A >= the durable hash height sampled before the kill. No flag on any kill. Nothing starts past
+  the marker or below it.
+- **No divergence, panic or fail-stop:** no `STATE HASH MISMATCH`, `FATAL`, `panicked`, `could not be fully
+  replayed`, `replay stopped` or fail-stop line at WARN/ERROR level on any validator in any cell. The only
+  matches are the INFO config line (the known rc 2).
+- **State hash checkpoints:** every 100-block checkpoint's `localHash` was read on all 3 validators. Equal at
+  every height in every cell (28-79 heights per cell, all 3 validators at all but 2 heights; 0 disagreements),
+  including the heights val1 re-executed after each restart.
+- **End-of-cell RPC digest:** block hashes equal in all 12 cells. Books + open interest (600 lines) and every
+  mark-independent account field (cash, native, EVM balance, stake) are equal on the 3 validators in every
+  cell. **The DISAGREE in 9 cells is a harness artifact:** only `accountValue`, `freeMargin`, the margin fields and
+  `withdrawable` differ, and they split by time. The oracle feed is paused (SIGSTOP) before the digest, and
+  oracle prices are usable for 60 s (`DEFAULT_MAX_ORACLE_AGE_SECS`). Every node whose digest ended <= 67.1 s after
+  the pause shows mark-based values, and every node that ended >= 70.0 s after it shows the stale-mark values
+  (all 36 node-digests fit; the odd node is val0, never restarted, in 3 cells). The clock the age is measured on
+  was not checked.
+  The digest took 31-246 s here, against ~20 s in p3c1. The control-path cells (o) show it as much as s.
+- **Lost or duplicated actions:** none visible. Books, OI and balances are equal, and the state-hash checkpoints
+  (which cover every state write) are equal. The `skipping duplicate/replayed native action on live commit
+  path` warnings (3,000-3,800 per kill cell) have identical counts on all 3 validators: deterministic
+  deduplication of actions the bench resubmitted around the kill. p3p's kill cells show the same.
+
+### 46.5 Reading
+
+- Step 1 at 15 s meets the restart gate: SIGKILL kill -> first commit 14.4 s mean, 23.2 s max (gate 60 s); the
+  same mean as today's path (14.3 s), max +6 s from rewinds up to 162 blocks. Better than the prototype in
+  p3p (21.3 s mean).
+- Crash correctness holds on 48 kills at varied points of the window, with the running state hash on: the
+  marker is honoured, the replay is complete and in order, and the validators agree on every checkpoint hash,
+  book and balance.
+- SIGTERM is a hard kill on this binary; the clean stop is SIGINT. If operators are expected to stop nodes with
+  `systemctl stop` (SIGTERM), main.rs should also wait on SIGTERM. That is a node change for the owner, not
+  measured here.
+- Caveats: one host, three validators on one NVMe; no on-chain state hash attestations (no attest key in the
+  devnet); kills at bench-relative times, not at instrumented points (e.g. inside a checkpoint write); the
+  gossipsub wedge removed 2 of the 48 kills.
 
 ## Open
+
+- **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
+  stop`, `kill`) is a hard kill that replays from the marker. Owner: should main.rs also wait on SIGTERM?
+  (2) The harness restarts val1 in place within ~1 s, which in 20 of 48 restarts left the gossipsub
+  subscriptions un-exchanged (`NoPeersSubscribedToTopic`, mesh watchdog reconnects). Once (x1-s-TERM) this
+  halted the chain for ~9 min (memory S395 wedge, arm-independent). Fix candidates: a stop / wait / start
+  restart in `crash-kill.sh`, or explicit gossipsub peers among the validators. (3) The end-of-cell digest
+  compares mark-based account fields more than 60 s after the oracle pause (false DISAGREE in 9 of 12 cells):
+  digest accounts before books, or keep the feed alive until the account reads.
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
   41; owner via 18c s107: Classic on testnet, no book mode in genesis now). At the standard shape
