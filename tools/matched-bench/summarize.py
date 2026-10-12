@@ -22,7 +22,8 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "md5-bench", "genesis-md5", "genesis-markets", "genesis-accounts", "node-env",
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
           "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
-          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget"]:
+          "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget",
+          "in-flight-tail"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -1179,6 +1180,11 @@ def parse_bench_log(path):
         "in_flight_at_end": int(m.group(5)), "tail_url": m.group(6),
         "tail_fetched": int(m.group(7)), "tail_errors": int(m.group(8)),
         "tail_missed": int(m.group(9))}
+    if inflight is not None:
+        # bench --in-flight-tail commit appends " | tail=commit"; head (the
+        # default, and every bench before the flag) prints no suffix.
+        t = re.search(r"missed=\d+ \| tail=(\w+)", text)
+        inflight["tail_mode"] = t.group(1) if t else "head"
     m = re.search(r"Cancel-by-id \(load-gen\): cancel sent (\d+) accepted (\d+) \| modify sent (\d+) "
                   r"accepted (\d+) \| lookups (\d+) errors (\d+) \| no own order (\d+)", text)
     by_id = None if not m else dict(zip(
@@ -1248,6 +1254,8 @@ summary = {
              "block_cap": int(A.block_cap) if A.block_cap else None,
              "markets_per_sender": int(A.markets_per_sender) if A.markets_per_sender else None,
              "max_in_flight": int(A.max_in_flight) if A.max_in_flight else None,
+             # run-cell IN_FLIGHT_TAIL; None = unset = the bench default (head).
+             "in_flight_tail": A.in_flight_tail or None,
              # None = unset on the nodes = jsonrpsee's 10 MiB default.
              "rpc_max_response_mb": (int(NODE_ENV["TORUS_RPC_MAX_RESPONSE_MB"])
                                      if str(NODE_ENV.get("TORUS_RPC_MAX_RESPONSE_MB", "")).isdigit() else None),
