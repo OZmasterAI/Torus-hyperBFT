@@ -1386,8 +1386,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // then stop gracefully within a bound. Dropping the replica stops the
     // hotstuff threads; its `TorusApp` drop then drains the execution queue
     // (every committed block is executed and persisted) and joins the exec
-    // and flush threads. Then memtables are flushed and the WAL synced, so a
-    // restart replays neither blocks nor WAL. A second signal, or the bound
+    // and flush threads. With item 6 Phase 3 checkpoints on, the exec
+    // thread's `ExecutionContext` drop first closes the open window into a
+    // final checkpoint (durable marker = last executed height), so it lands
+    // here, inside the bounded stop and before the flush below. Then
+    // memtables are flushed and the WAL synced, so a restart replays neither
+    // blocks nor WAL. A second signal, or the bound
     // (`TORUS_SHUTDOWN_TIMEOUT_SECS`, default 60), exits at once; recovery
     // after that is the same as after a kill.
     // Logged before the handlers are installed: if stdout is blocked (a full
