@@ -3380,6 +3380,9 @@ mod tests {
                 core_writer_actions: vec![],
             },
         );
+        // Executed through height 3 (an empty body reports empty lists only
+        // once executed).
+        store_applied_height(&state, 3);
         // v2: action 2 executed and failed (margin). Row 50: action 3 was
         // rejected (an IOC that found nothing to fill).
         let record = torus_state::action_status::BlockActionStatus {
@@ -3503,11 +3506,14 @@ mod tests {
             evm_transactions: vec![],
             core_writer_actions: vec![],
         };
+        // Codex review (P2): height 5 (empty) is committed, not executed yet:
+        // `null`, never `[]` (its queued rows may still drain).
         for (height, body) in [
             (1, &with_action),
             (2, &with_action),
             (3, &empty),
             (4, &empty),
+            (5, &empty),
         ] {
             store_header(&state, &test_header(height, 0, 1_000_000_000));
             store_body(&state, height, body);
@@ -3555,6 +3561,7 @@ mod tests {
                 "short",
             ),
         ];
+        store_applied_height(&state, 4);
         for (height, native_skipped) in [(1u64, vec![false]), (3, vec![])] {
             state
                 .put_cf_raw(
@@ -3640,6 +3647,12 @@ mod tests {
             "not executed yet"
         );
         assert_eq!(get(4).await["coreWriterResults"], serde_json::json!([]));
+        let pending_empty = get(5).await;
+        assert!(
+            pending_empty["coreWriterResults"].is_null(),
+            "{pending_empty}"
+        );
+        assert!(pending_empty["nativeActionStatus"].is_null());
         handle.stop().unwrap();
     }
 
