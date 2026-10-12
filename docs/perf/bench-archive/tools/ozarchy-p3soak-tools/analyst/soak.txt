@@ -1,0 +1,14 @@
+== k1-ctl window 603 s valid=ACCEPT agree=AGREE
+  val0 RSS MB @5min 3760 @10min 3796 peak 3835 end 3796 | slope last 5 min +3.3 MB/min [-4.2, +10.8] (r1 0.37, n_eff 26) | whole window +80.6 [+25.4, +135.8]
+  val1 RSS MB @5min 3907 @10min 3950 peak 4032 end 3950 | slope last 5 min +11.1 MB/min [+5.5, +16.7] (r1 0.34, n_eff 28) | whole window +95.3 [+34.3, +156.3]
+  val2 RSS MB @5min 4712 @10min 4769 peak 4788 end 4769 | slope last 5 min +6.4 MB/min [+2.3, +10.5] (r1 0.00, n_eff 57) | whole window +112.6 [+43.5, +181.6]
+  matched/s last 5 min 139804, whole 168384; per minute [191004, 210758, 201550, 191378, 188332, 165351, 132474, 138900, 135458, 133876]; drift -9419 /min [-13692, -5147]
+  node CPU-s per 1M matched, last 5 min: 36.35
+  ingest: {"submit": 1124.0, "in_flight": {"cap": 4, "released_committed": 659030, "released_refused": 1, "released_timeout": 17956, "in_flight_at_end": 0, "tail_url": "http://127.0.0.1:8647", "tail_fetched": 1752, "tail_errors": 0, "tail_missed": 0, "tail_mode": "commit"}, "evict": [17956, 17956, 17956], "submitted": 676986, "processed": 660842}
+== k1-s2 window 603 s valid=REJECT agree=DISAGREE
+  val0 RSS MB @5min 5663 @10min 6070 peak 6070 end 6070 | slope last 5 min +63.1 MB/min [+14.6, +111.6] (r1 0.90, n_eff 3) | whole window +194.7 [+103.3, +286.2]
+  val1 RSS MB @5min 5559 @10min 5934 peak 5934 end 5934 | slope last 5 min +67.3 MB/min [+47.1, +87.4] (r1 0.53, n_eff 17) | whole window +182.4 [+98.5, +266.2]
+  val2 RSS MB @5min 6338 @10min 6442 peak 6660 end 6442 | slope last 5 min +39.8 MB/min [+19.1, +60.5] (r1 0.66, n_eff 12) | whole window +207.0 [+112.1, +301.9]
+  matched/s last 5 min 141893, whole 172911; per minute [195588, 218263, 212296, 198598, 192897, 161570, 138624, 138110, 138126, 133173]; drift -10333 /min [-15519, -5146]
+  node CPU-s per 1M matched, last 5 min: 35.00
+  ingest: {"submit": 1168.0, "in_flight": {"cap": 4, "released_committed": 679956, "released_refused": 67, "released_timeout": 17378, "in_flight_at_end": 6070, "tail_url": "http://127.0.0.1:8647", "tail_fetched": 1854, "tail_errors": 0, "tail_missed": 0, "tail_mode": "commit"}, "evict": [18615, 18615, 18694], "submitted": 703404, "processed": 686607}

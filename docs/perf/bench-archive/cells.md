@@ -343,6 +343,14 @@ Copied by script from each cell's `summary.json` (`headline`, `cell`, `binaries`
 | `ozarchy-p23b-300m-x2-pk` | OK | 2026-10-12 20:34 | p3rss-8efcb07a @ 8efcb07a | f35fab7d | 300 | 120 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); in-flight tail commit; perf on val0 | 188,551.7 | 187,532.3 | 222,090.6 | 247,490.6 | 3.3 | 191.0 | 266.30 | 4.07 | AGREE | PASS | ACCEPT |
 | `ozarchy-p23b-300m-x2-pp` | OK | 2026-10-12 20:41 | p3rss-8efcb07a @ 8efcb07a | dacdeec8 | 300 | 120 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); in-flight tail commit; perf on val0 | 191,342.5 | 190,031.7 | 217,853.4 | 251,402.7 | 3.3 | 197.4 | 268.87 | 3.93 | AGREE | PASS | ACCEPT |
 
+## p3soak: Phase 3 soak, step 2 `7b006739` (node `ca388315`, 15 s, g2) vs main `219f0c20` (`987f4eb6`, gm), glibc, 600 s per arm, commit tail, tw, Classic, shared NVMe, bench `05d44313`, harness `218ad251`; k1-s2 INVALID = mark-only digest disagreement (section 53); warm-up w0 excluded
+
+| cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ozarchy-p3soak-300m-k1-ctl` | OK | 2026-10-12 23:50 | summarize-ckpt-timers @ 218ad251 | 987f4eb6 | 300 | 600 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); checkpoint interval unset; glibc; in-flight tail commit | 168,384.4 | 200,881.2 | 216,934.5 | 223,090.0 | 3.0 | 325.7 | 279.48 | 4.13 | AGREE | PASS | ACCEPT |
+| `ozarchy-p3soak-300m-k1-s2` | INVALID | 2026-10-13 00:05 | summarize-ckpt-timers @ 218ad251 | ca388315 | 300 | 600 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); checkpoint interval 15000 ms; glibc; in-flight tail commit | 172,910.5 | 206,925.3 | 220,089.0 | 229,838.6 | 3.0 | 319.8 | 290.55 | 3.88 | DISAGREE | PASS | REJECT |
+| `ozarchy-p3soak-300m-w0` | OK | 2026-10-12 23:37 | summarize-ckpt-timers @ 218ad251 | 987f4eb6 | 300 | 60 | 400 | 6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); checkpoint interval unset; glibc; in-flight tail commit; warm-up | 191,123.5 | 191,123.5 | 213,997.5 | 251,474.7 | 3.8 | 148.6 | 216.39 | 3.76 | AGREE | PASS | ACCEPT |
+
 ## action-results: Per-action execution results (`9195c32`) at 300 markets: warm + r1
 
 | cell dir | status | generated | worktree @ commit | node md5 | markets | dur s | block cap | extra env | matched/s avg | first120 | best60 | placed/s | blk/s | txs/blk | chain ms | engine ms/1k fills | agreement | liveness | validity |

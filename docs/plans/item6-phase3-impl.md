@@ -310,6 +310,9 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   -5.5% (not met), RSS +1.55 GB peak (not met), exec ms per block flat, block-time p99 +12.7%. New timers: E waits
   23.9 ms per block on the previous layer merge (`checkpoint_settle_wait`, p99 95 ms), upkeep 1.0 ms; free-off-exec
   confirmed (`torus-ckpt-drop`). Also valid for `6d9b78af`. Restart cells: SIGTERM cells on the next step 2 head.
+- **Soak** (campaign `ozarchy-p3soak`, results doc section 53, plan-2 row 58): step 2 `7b006739` vs main `219f0c20`, glibc,
+  600 s each: step 2 RSS still +40-67 MB/min per node at 10 min (main +3-11), Phase 3 delta +1.98 GB per node at 10 min:
+  no plateau (growth finding). Cancel-all expiry hits both arms from minute 2 (~18k per node), matched/s -30% from minute 6.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
