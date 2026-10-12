@@ -534,6 +534,10 @@ async fn main() {
         error!(%e, "node exited with error");
         std::process::exit(1);
     }
+    // Exit now rather than drop the runtime: the drop waits for every
+    // blocking task (e.g. a pruner pass), which could hold up a finished
+    // graceful shutdown.
+    std::process::exit(0);
 }
 
 /// Read a passphrase from stdin (no echo if terminal).
@@ -999,7 +1003,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let own_hotstuff_vk = verifying_key;
     let timeout_counter = metrics.consensus_timeout_total.clone();
     let leader_state_for_view = leader_state.clone();
-    let _replica = ReplicaSpec::builder()
+    // The shutdown thread exists before consensus starts, so stopping never
+    // needs a new thread.
+    let shutdown_worker = ShutdownWorker::spawn()?;
+    let replica = ReplicaSpec::builder()
         .app(app)
         .network(network)
         .kv_store(kv_store)
@@ -1375,12 +1382,272 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 13. Wait for shutdown signal
-    info!("node is running — press Ctrl+C to shut down");
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown signal received, stopping...");
+    // 13. Wait for SIGINT (Ctrl+C) or SIGTERM (systemctl / docker / k8s stop),
+    // then stop gracefully within a bound. Dropping the replica stops the
+    // hotstuff threads; its `TorusApp` drop then drains the execution queue
+    // (every committed block is executed and persisted) and joins the exec
+    // and flush threads. Then memtables are flushed and the WAL synced, so a
+    // restart replays neither blocks nor WAL. A second signal, or the bound
+    // (`TORUS_SHUTDOWN_TIMEOUT_SECS`, default 60), exits at once; recovery
+    // after that is the same as after a kill.
+    // Logged before the handlers are installed: if stdout is blocked (a full
+    // pipe), the default action still kills the node.
+    info!("node is running — SIGINT (Ctrl+C) or SIGTERM shuts it down");
+    // One pair of receivers for both waits, so a second signal sent while
+    // the first is handled is queued, not lost.
+    let mut signals = ShutdownSignals::new()?;
+    let signal = signals.recv().await;
+    // From here no log is waited for (a blocked stdout would otherwise hold
+    // off the deadline and the second-signal wait).
+    log_with_grace(
+        move || info!(%signal, "shutdown signal received, stopping..."),
+        Duration::ZERO,
+    );
+    let limit = shutdown_timeout(std::env::var("TORUS_SHUTDOWN_TIMEOUT_SECS").ok());
+    let started = std::time::Instant::now();
+    let db = state_db.clone();
+    let stop = move || {
+        drop(replica);
+        info!("consensus stopped, execution queue drained");
+        flush_for_shutdown(&db)?;
+        info!("memtables flushed, WAL synced");
+        Ok(())
+    };
+    let second_signal = async {
+        let s = signals.recv().await;
+        log_with_grace(
+            move || warn!(signal = %s, "second signal during shutdown"),
+            Duration::ZERO,
+        );
+    };
+    let outcome = bounded_stop(shutdown_worker, stop, limit, second_signal).await;
+    // Every outcome ends with `_exit`: `exit()` would run RocksDB's exit
+    // handlers, which join its background threads, so a stalled flush or
+    // compaction would hold up the exit with no bound. A clean stop has
+    // already flushed and synced; the others are as after a kill.
+    debug_assert!(outcome.exits_at_once());
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let code = match outcome {
+        StopOutcome::Clean => 0,
+        _ => 1,
+    };
+    log_with_grace(
+        move || match outcome {
+            StopOutcome::Clean => info!(elapsed_ms, "shutdown complete"),
+            StopOutcome::Failed(e) => error!(%e, "shutdown failed (exit 1)"),
+            StopOutcome::TimedOut => error!(
+                ?limit,
+                "shutdown did not finish within the limit; exiting without it (exit 1)"
+            ),
+            StopOutcome::Interrupted => {
+                error!("shutdown interrupted by a second signal (exit 1)")
+            }
+        },
+        Duration::from_millis(500),
+    );
+    // SAFETY: `_exit` only ends the process; no Rust state is touched.
+    unsafe { libc::_exit(code) }
+}
 
-    Ok(())
+/// The watchdog's action at the shutdown deadline: as a timed-out stop in
+/// `run`, without waiting for anything (no runtime, bounded log).
+fn deadline_exit() {
+    log_with_grace(
+        || error!("shutdown did not finish within the limit; exiting without it (exit 1)"),
+        Duration::from_millis(500),
+    );
+    // SAFETY: `_exit` only ends the process; no Rust state is touched.
+    unsafe { libc::_exit(1) };
+}
+
+/// Run `log` (the last line before `_exit`) on its own thread and wait at
+/// most `grace`: a thread stuck writing to stdout holds its lock, so the
+/// log may never finish. Returns whether it finished. No explicit flush:
+/// stdout is line-buffered and the line ends in a newline.
+fn log_with_grace(log: impl FnOnce() + Send + 'static, grace: Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("node-exit-log".into())
+        .spawn(move || {
+            log();
+            let _ = tx.send(());
+        });
+    spawned.is_ok() && rx.recv_timeout(grace).is_ok()
+}
+
+/// SIGINT and SIGTERM receivers. Kept for the node's lifetime: a signal
+/// that arrives between two `recv` calls is queued, not lost.
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Wait for the next SIGINT or SIGTERM; returns the signal's name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            Some(()) = self.term.recv() => "SIGTERM",
+            Some(()) = self.int.recv() => "SIGINT",
+            else => std::future::pending().await,
+        }
+    }
+}
+
+/// Pure parse of `TORUS_SHUTDOWN_TIMEOUT_SECS` (default 60; `0` or garbage
+/// => 60).
+fn shutdown_timeout(raw: Option<String>) -> Duration {
+    match raw
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(n) if n >= 1 => Duration::from_secs(n),
+        _ => Duration::from_secs(60),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopOutcome {
+    /// `stop` returned.
+    Clean,
+    /// `stop` returned an error or panicked.
+    Failed(String),
+    /// `stop` was still running at the limit.
+    TimedOut,
+    /// `interrupt` finished first (a second signal).
+    Interrupted,
+}
+
+impl StopOutcome {
+    /// Whether the process must exit without running exit handlers: always
+    /// (see the end of `run`).
+    fn exits_at_once(&self) -> bool {
+        true
+    }
+}
+
+type StopJob = Box<dyn FnOnce() -> Result<(), String> + Send>;
+type StopReply = tokio::sync::oneshot::Sender<Result<(), String>>;
+
+/// The thread that runs the shutdown, spawned at startup before consensus
+/// starts: stopping never needs a new thread, whose failed spawn would drop
+/// the stop (and the replica in it) on the async caller with no bound.
+struct ShutdownWorker {
+    jobs: std::sync::mpsc::SyncSender<(StopJob, StopReply, Duration)>,
+}
+
+impl ShutdownWorker {
+    fn spawn() -> std::io::Result<Self> {
+        Self::spawn_with(deadline_exit)
+    }
+
+    /// Spawn the shutdown thread and its watchdog. The watchdog is armed
+    /// with the job's limit and calls `on_deadline` if the job has not
+    /// finished by then: the bound holds even when the async runtime (and
+    /// so `tokio::time`) is stalled.
+    fn spawn_with(on_deadline: fn()) -> std::io::Result<Self> {
+        let (jobs, rx) = std::sync::mpsc::sync_channel::<(StopJob, StopReply, Duration)>(1);
+        let (arm_tx, arm_rx) = std::sync::mpsc::sync_channel::<Duration>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        std::thread::Builder::new()
+            .name("node-shutdown-watchdog".into())
+            .spawn(move || {
+                if let Ok(limit) = arm_rx.recv() {
+                    // Timeout: the stop is late. Disconnected: it panicked
+                    // (the sender dropped unwinding), a failed stop.
+                    if done_rx.recv_timeout(limit).is_err() {
+                        on_deadline();
+                    }
+                }
+            })?;
+        std::thread::Builder::new()
+            .name("node-shutdown".into())
+            .spawn(move || {
+                if let Ok((job, reply, limit)) = rx.recv() {
+                    let _ = arm_tx.send(limit);
+                    let res = job();
+                    let _ = done_tx.send(());
+                    let _ = reply.send(res);
+                }
+            })?;
+        Ok(Self { jobs })
+    }
+
+    /// A worker whose thread is gone.
+    #[cfg(test)]
+    fn gone() -> Self {
+        let (jobs, _) = std::sync::mpsc::sync_channel(1);
+        Self { jobs }
+    }
+}
+
+/// Run the blocking `stop` on the shutdown thread and wait for it, at most
+/// `limit` or until `interrupt` completes. A `stop` still running is left
+/// behind (the caller exits the process).
+async fn bounded_stop(
+    worker: ShutdownWorker,
+    stop: impl FnOnce() -> Result<(), String> + Send + 'static,
+    limit: Duration,
+    interrupt: impl std::future::Future<Output = ()>,
+) -> StopOutcome {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Err(std::sync::mpsc::SendError((job, _, _))) =
+        worker.jobs.send((Box::new(stop), tx, limit))
+    {
+        // Neither run nor drop it here (that blocks this thread with no
+        // bound); the process exits next.
+        std::mem::forget(job);
+        return StopOutcome::Failed("shutdown thread is gone".into());
+    }
+    tokio::select! {
+        done = tokio::time::timeout(limit, rx) => match done {
+            Ok(Ok(Ok(()))) => StopOutcome::Clean,
+            Ok(Ok(Err(e))) => StopOutcome::Failed(e),
+            Ok(Err(_)) => StopOutcome::Failed("shutdown thread panicked".into()),
+            Err(_) => StopOutcome::TimedOut,
+        },
+        () = interrupt => StopOutcome::Interrupted,
+    }
+}
+
+/// Flush every column family's memtables to SST and fsync the WAL, so a
+/// restart does not replay the WAL. Run after consensus and execution stop.
+fn flush_for_shutdown(state_db: &StateDb) -> Result<(), String> {
+    let db = state_db.db_arc();
+    flush_then_sync(
+        || {
+            for cf_name in torus_state::cf::ALL_CF_NAMES {
+                if let Some(cf) = db.cf_handle(cf_name) {
+                    db.flush_cf(cf)
+                        .map_err(|e| format!("flush {cf_name}: {e}"))?;
+                }
+            }
+            Ok(())
+        },
+        || state_db.sync_wal().map_err(|e| e.to_string()),
+    )
+}
+
+/// The memtable flush, then the WAL sync, which runs even when the flush
+/// failed (the WAL is then all a restart has). Either error is returned.
+fn flush_then_sync(
+    flush: impl FnOnce() -> Result<(), String>,
+    sync: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    match (flush(), sync()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(f), Ok(())) => Err(f),
+        (Ok(()), Err(s)) => Err(format!("WAL sync: {s}")),
+        (Err(f), Err(s)) => Err(format!("{f}; WAL sync: {s}")),
+    }
 }
 
 /// Pure parse of `TORUS_ROCKSDB_STATS_INTERVAL_SECS` (default 5; `< 1` or
@@ -1551,6 +1818,236 @@ mod tests {
             assert!(err.contains("duplicate"), "{err}");
             assert!(err.contains(&addr), "names {addr}: {err}");
         }
+    }
+
+    /// Codex P2: a failed memtable flush must not skip the WAL sync, and the
+    /// error must reach the caller.
+    #[test]
+    fn flush_failure_still_syncs_the_wal_and_reports_the_error() {
+        let mut synced = false;
+        let res = flush_then_sync(
+            || Err("flush cf_accounts: injected".into()),
+            || {
+                synced = true;
+                Ok(())
+            },
+        );
+        assert!(synced, "WAL sync skipped after a flush failure");
+        let err = res.expect_err("flush failure reported as success");
+        assert!(err.contains("injected"), "{err}");
+
+        let res = flush_then_sync(|| Err("f".into()), || Err("s".into()));
+        let err = res.unwrap_err();
+        assert!(err.contains('f') && err.contains('s'), "{err}");
+        assert_eq!(flush_then_sync(|| Ok(()), || Ok(())), Ok(()));
+    }
+
+    /// Codex P2: a second SIGTERM that arrives while the first is being
+    /// handled is not lost (the receivers live across both waits).
+    #[tokio::test]
+    async fn second_sigterm_during_shutdown_is_not_lost() {
+        let mut signals = ShutdownSignals::new().unwrap();
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let got = tokio::time::timeout(Duration::from_secs(5), signals.recv())
+            .await
+            .expect("first SIGTERM seen");
+        assert_eq!(got, "SIGTERM");
+        // Sent before the shutdown starts waiting for a second signal.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let second = tokio::time::timeout(Duration::from_secs(2), signals.recv()).await;
+        assert_eq!(second, Ok("SIGTERM"), "second SIGTERM lost");
+    }
+
+    /// A worker whose deadline does nothing (the real one exits the process).
+    fn worker() -> ShutdownWorker {
+        ShutdownWorker::spawn_with(|| {}).unwrap()
+    }
+
+    /// Codex P2 (round 2): a stop the shutdown thread cannot take is never
+    /// run or dropped on the calling (async) thread, where dropping the
+    /// replica would block in its joins with no bound and no second-signal
+    /// escape. Normally it runs, and drops, on `node-shutdown`.
+    #[tokio::test]
+    async fn stop_never_runs_or_drops_on_the_caller() {
+        struct Guard(Arc<std::sync::Mutex<Option<String>>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let name = std::thread::current().name().unwrap_or("").to_string();
+                *self.0.lock().unwrap() = Some(name);
+            }
+        }
+        let long = Duration::from_secs(30);
+        let never = std::future::pending::<()>;
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let guard = Guard(seen.clone());
+        let stop = move || {
+            drop(guard);
+            Ok(())
+        };
+        let out = bounded_stop(worker(), stop, long, never()).await;
+        assert_eq!(out, StopOutcome::Clean);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("node-shutdown"));
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let guard = Guard(seen.clone());
+        let stop = move || {
+            let _held = &guard;
+            Ok(())
+        };
+        let out = bounded_stop(ShutdownWorker::gone(), stop, long, never()).await;
+        assert!(matches!(out, StopOutcome::Failed(_)), "{out:?}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            None,
+            "stop dropped on the calling thread"
+        );
+    }
+
+    /// Codex P2 (round 3): after a timeout or a second signal the stop is
+    /// still running (e.g. a RocksDB flush stalled on I/O). `exit()` runs
+    /// RocksDB's exit handlers, which join its background threads and so
+    /// block on the same I/O; those outcomes must skip them (`_exit`).
+    #[test]
+    fn abandoned_stop_exits_without_exit_handlers() {
+        assert!(StopOutcome::TimedOut.exits_at_once());
+        assert!(StopOutcome::Interrupted.exits_at_once());
+        // Codex round 4: a clean stop too: an unrelated stalled compaction
+        // would otherwise hold up `exit(0)` after flush + WAL sync.
+        assert!(StopOutcome::Clean.exits_at_once());
+        assert!(StopOutcome::Failed("flush".into()).exits_at_once());
+    }
+
+    /// Codex stop review: the last log line before `_exit` must not hold up
+    /// the exit (the stdout lock may be held by a thread stuck writing).
+    #[test]
+    fn last_log_before_exit_is_bounded() {
+        let t = std::time::Instant::now();
+        let done = log_with_grace(
+            || std::thread::sleep(Duration::from_secs(5)),
+            Duration::from_millis(200),
+        );
+        assert!(!done, "a stuck log reported as finished");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(log_with_grace(|| {}, Duration::from_secs(5)));
+    }
+
+    /// Codex round 6: the deadline must not depend on the tokio timer (a
+    /// worker stuck in a blocked log stalls it). The shutdown thread arms an
+    /// independent watchdog: no runtime exists in this test.
+    #[test]
+    fn deadline_fires_without_the_async_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        fn fired() {
+            FIRED.store(true, SeqCst);
+        }
+        let w = ShutdownWorker::spawn_with(fired).unwrap();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hung: StopJob = Box::new(move || {
+            let _ = release_rx.recv();
+            Ok(())
+        });
+        w.jobs
+            .send((hung, reply, Duration::from_millis(100)))
+            .unwrap();
+        let t = std::time::Instant::now();
+        while !FIRED.load(SeqCst) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(FIRED.load(SeqCst), "deadline did not fire");
+        drop(release_tx);
+
+        // A stop that finishes in time does not fire it.
+        static LATE: AtomicBool = AtomicBool::new(false);
+        fn late() {
+            LATE.store(true, SeqCst);
+        }
+        let w = ShutdownWorker::spawn_with(late).unwrap();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        w.jobs
+            .send((Box::new(|| Ok(())), reply, Duration::from_millis(300)))
+            .unwrap();
+        assert_eq!(rx.blocking_recv().unwrap(), Ok(()));
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!LATE.load(SeqCst), "fired after a clean stop");
+    }
+
+    /// Codex stop review: a panicking stop disconnects the watchdog's
+    /// completion channel; that must count as a failed stop (exit at once),
+    /// not disarm the watchdog.
+    #[test]
+    fn watchdog_fires_when_the_stop_panics() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        fn fired() {
+            FIRED.store(true, SeqCst);
+        }
+        let w = ShutdownWorker::spawn_with(fired).unwrap();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let boom: StopJob = Box::new(|| panic!("stop panicked"));
+        w.jobs.send((boom, reply, Duration::from_secs(30))).unwrap();
+        let t = std::time::Instant::now();
+        while !FIRED.load(SeqCst) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(FIRED.load(SeqCst), "watchdog disarmed by the panic");
+    }
+
+    #[test]
+    fn shutdown_timeout_parse() {
+        let s = Duration::from_secs;
+        assert_eq!(shutdown_timeout(None), s(60));
+        assert_eq!(shutdown_timeout(Some("15".into())), s(15));
+        assert_eq!(shutdown_timeout(Some(" 120 ".into())), s(120));
+        assert_eq!(shutdown_timeout(Some("0".into())), s(60));
+        assert_eq!(shutdown_timeout(Some("soon".into())), s(60));
+    }
+
+    #[tokio::test]
+    async fn bounded_stop_reports_clean_failed_timeout_and_interrupt() {
+        let never = std::future::pending::<()>;
+        let long = Duration::from_secs(30);
+        assert_eq!(
+            bounded_stop(worker(), || Ok(()), long, never()).await,
+            StopOutcome::Clean
+        );
+        assert_eq!(
+            bounded_stop(worker(), || Err("flush failed".into()), long, never()).await,
+            StopOutcome::Failed("flush failed".into())
+        );
+        assert!(matches!(
+            bounded_stop(worker(), || panic!("stop failed"), long, never()).await,
+            StopOutcome::Failed(_)
+        ));
+
+        // A hung stop is abandoned at the limit, not waited for.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::time::Instant::now();
+        let hung = move || {
+            let _ = release_rx.recv();
+            Ok(())
+        };
+        let out = bounded_stop(worker(), hung, Duration::from_millis(200), never()).await;
+        assert_eq!(out, StopOutcome::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(5));
+
+        // A second signal ends the wait at once.
+        let (release2_tx, release2_rx) = std::sync::mpsc::channel::<()>();
+        let hung = move || {
+            let _ = release2_rx.recv();
+            Ok(())
+        };
+        let interrupt = tokio::time::sleep(Duration::from_millis(50));
+        let t = std::time::Instant::now();
+        assert_eq!(
+            bounded_stop(worker(), hung, long, interrupt).await,
+            StopOutcome::Interrupted
+        );
+        assert!(t.elapsed() < Duration::from_secs(5));
+        drop((release_tx, release2_tx));
     }
 
     /// R01b A: a panic on a listed thread calls the injected exit with 70; a
