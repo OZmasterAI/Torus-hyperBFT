@@ -3143,6 +3143,24 @@ impl TraderMarkets {
     }
 }
 
+/// s114 follow-up (tests): `(trader, cloid) -> (market, order id)`.
+#[cfg(any(test, feature = "test-reference-paths"))]
+pub type CloidIndexSnapshot = std::collections::BTreeMap<(Address, Cloid), (MarketId, OrderId)>;
+
+/// s114 follow-up (tests): the cross-market cloid index a load would build
+/// from `books` now.
+#[cfg(any(test, feature = "test-reference-paths"))]
+fn cloid_index_rebuilt(books: &HashMap<MarketId, OrderBook>) -> CloidIndexSnapshot {
+    let mut out = CloidIndexSnapshot::new();
+    for (&market, book) in books {
+        for (t, c, id) in book.cloid_entries() {
+            let prev = out.insert((t, c), (market, id));
+            assert!(prev.is_none(), "cloid {c:#x} of {t} live in two books");
+        }
+    }
+    out
+}
+
 /// P2-1 (tests): `(carried, rebuilt)` — `index` (`None`: not built)
 /// and the index a load would build from `books` now (exact).
 #[cfg(any(test, feature = "test-reference-paths"))]
@@ -3173,6 +3191,17 @@ impl ResidentBooks {
         self.inner
             .as_ref()
             .map(|inner| trader_index_snapshot(inner.trader_markets.as_ref(), &inner.books))
+    }
+
+    /// s114 follow-up (tests): `(carried, rebuilt)` — the cross-market cloid
+    /// index carried with the books (`None`: not built since the last load)
+    /// and the one a load would build from them now. `None`: no resident
+    /// books.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn cloid_index(&self) -> Option<(Option<CloidIndexSnapshot>, CloidIndexSnapshot)> {
+        self.inner
+            .as_ref()
+            .map(|inner| (None, cloid_index_rebuilt(&inner.books)))
     }
 
     /// Drop any resident state (books and rows) — the next block rebuilds
@@ -3853,6 +3882,10 @@ mod cancel_batch_toggle_tests {
 #[path = "cancel_batch_exec_tests.rs"]
 mod cancel_batch_exec_tests;
 
+#[cfg(test)]
+#[path = "cloid_index_tests.rs"]
+mod cloid_index_tests;
+
 #[cfg(any(test, feature = "test-reference-paths"))]
 #[path = "reference_paths.rs"]
 mod reference_paths;
@@ -4196,6 +4229,10 @@ pub struct ExecPhaseAccum {
     /// books they probed to find the order.
     pub by_id_actions: u64,
     pub by_id_books_probed: u64,
+    /// s114 follow-up: duplicate-cloid checks run (placements carrying a
+    /// cloid, single path and batch pre-pass), and the books they probed.
+    pub cloid_checks: u64,
+    pub cloid_books_probed: u64,
 }
 
 impl ExecPhaseAccum {
@@ -4750,6 +4787,13 @@ impl<T: StateBackend> NativeExecContext<T> {
     #[cfg(test)]
     pub(crate) fn trader_index(&self) -> (Option<TraderIndexSnapshot>, TraderIndexSnapshot) {
         trader_index_snapshot(self.trader_markets.as_ref(), &self.order_books)
+    }
+
+    /// s114 follow-up (tests): `(carried, rebuilt)` as
+    /// [`ResidentBooks::cloid_index`].
+    #[cfg(test)]
+    pub(crate) fn cloid_index(&self) -> (Option<CloidIndexSnapshot>, CloidIndexSnapshot) {
+        (None, cloid_index_rebuilt(&self.order_books))
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
@@ -6555,6 +6599,7 @@ impl NativeExecutor {
             let mut claimed: HashSet<(Address, Cloid)> = HashSet::default();
             let books = &ctx.order_books;
             let metrics = &ctx.metrics;
+            let accum = &mut ctx.phase_accum;
             place_order_indices.retain(|&i| {
                 let (sender, FlatAction::Place(p)) = &flat[i] else {
                     return true;
@@ -6562,7 +6607,7 @@ impl NativeExecutor {
                 let Some(cloid) = p.client_order_id else {
                     return true;
                 };
-                let dup = Self::duplicate_cloid(books, sender, cloid).or_else(|| {
+                let dup = Self::duplicate_cloid(books, accum, sender, cloid).or_else(|| {
                     (!claimed.insert((*sender, cloid))).then(|| {
                         format!(
                             "duplicate cloid {}: an earlier order of this block already uses it",
@@ -9240,7 +9285,7 @@ impl NativeExecutor {
         // s114: a cloid live for the sender in any market.
         if let Some(msg) = params
             .client_order_id
-            .and_then(|c| Self::duplicate_cloid(&ctx.order_books, sender, c))
+            .and_then(|c| Self::duplicate_cloid(&ctx.order_books, &mut ctx.phase_accum, sender, c))
         {
             if let Some(ref m) = ctx.metrics {
                 m.orders_rejected_other.inc();
@@ -9865,12 +9910,17 @@ impl NativeExecutor {
     /// the scan order changes nothing.
     fn duplicate_cloid(
         books: &HashMap<MarketId, OrderBook>,
+        accum: &mut ExecPhaseAccum,
         trader: &Address,
         cloid: Cloid,
     ) -> Option<String> {
+        accum.cloid_checks += 1;
         books
             .iter()
-            .filter_map(|(m, b)| b.order_id_by_cloid(trader, cloid).map(|id| (*m, id)))
+            .filter_map(|(m, b)| {
+                accum.cloid_books_probed += 1;
+                b.order_id_by_cloid(trader, cloid).map(|id| (*m, id))
+            })
             .min()
             .map(|(m, id)| {
                 format!(

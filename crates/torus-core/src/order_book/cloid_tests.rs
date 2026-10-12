@@ -3,7 +3,9 @@
 //! the `(trader, cloid) -> order id` index kept on EVERY path that adds or
 //! removes a resting order or a pending stop, and pending stops removable by
 //! id. Each removal test checks the entry is gone (lookup `None`, index
-//! empty) and the cloid can be placed again.
+//! empty) and the cloid can be placed again, and that the book's cloid log
+//! carried the change ([`Mirror`]: what the executor's cross-market index
+//! keeps from the log).
 
 use super::*;
 
@@ -70,15 +72,52 @@ fn stop_buy(trigger: i64, cloid: Option<u128>) -> PlaceOrderParams {
     )
 }
 
-/// The cloid is free again: no entry, an empty index, and a fresh order with
-/// it rests and is found.
-fn assert_freed(b: &mut OrderBook, trader: Address, cloid: u128) {
+/// s114 follow-up: the executor's cross-market cloid index restricted to
+/// one book, kept ONLY from the book's cloid log (`drain_cloid_log`), the
+/// way `CloidMarkets::absorb` keeps it: a logged key takes the book's
+/// current entry, or goes when the book has none.
+struct Mirror(HashMap<(Address, u128), OrderId>);
+
+impl Mirror {
+    /// The index built from `b` as it is (its log emptied, as the
+    /// executor's build does).
+    fn of(b: &mut OrderBook) -> Self {
+        b.clear_cloid_log();
+        Mirror(entries(b))
+    }
+
+    /// Drain `b`'s log into the mirror; it must equal the book's index.
+    fn assert_matches(&mut self, b: &mut OrderBook) {
+        b.drain_cloid_log(|t, c, live| match live {
+            Some(id) => {
+                self.0.insert((t, c), id);
+            }
+            None => {
+                self.0.remove(&(t, c));
+            }
+        });
+        assert_eq!(b.cloid_log_len(), 0, "drained");
+        assert_eq!(self.0, entries(b), "the cloid log missed a change");
+    }
+}
+
+fn entries(b: &OrderBook) -> HashMap<(Address, u128), OrderId> {
+    b.cloid_entries().map(|(t, c, id)| ((t, c), id)).collect()
+}
+
+/// The cloid is free again: no entry, an empty index, a log that carried
+/// the removal to `m`, and a fresh order with it rests and is found (and
+/// logged).
+fn assert_freed(b: &mut OrderBook, m: &mut Mirror, trader: Address, cloid: u128) {
+    m.assert_matches(b);
     assert_eq!(b.order_id_by_cloid(&trader, cloid), None);
     assert_eq!(b.cloid_count(), 0);
     b.verify_invariants();
     let r = b.place_order(gtc(true, 1, 1, Some(cloid)), trader, 99);
     assert_eq!(r.status, OrderStatus::Resting);
     assert_eq!(b.order_id_by_cloid(&trader, cloid), Some(r.order_id));
+    m.assert_matches(b);
+    assert_eq!(m.0.len(), 1);
     b.verify_invariants();
 }
 
@@ -126,14 +165,33 @@ fn a_stop_cloid_is_found_and_held() {
     b.verify_invariants();
 }
 
+/// s114 follow-up: every entry that goes in (a resting order, a stored stop)
+/// is logged; an order without a cloid logs nothing.
+#[test]
+fn every_add_is_logged() {
+    let mut b = book();
+    let mut m = Mirror::of(&mut b);
+    b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 1);
+    m.assert_matches(&mut b);
+    b.place_order(stop_buy(300, Some(C + 1)), addr(1), 2);
+    m.assert_matches(&mut b);
+    b.place_order(gtc(true, 99, 1, None), addr(1), 3);
+    assert_eq!(b.cloid_log_len(), 0, "no cloid: nothing logged");
+    b.place_order(gtc(false, 150, 2, Some(C + 2)), addr(2), 4);
+    b.place_order(gtc(true, 150, 1, Some(C + 3)), addr(3), 5); // fills, rests 0
+    m.assert_matches(&mut b);
+    assert_eq!(m.0.len(), 3);
+}
+
 #[test]
 fn cancel_frees_the_cloid() {
     let mut b = book();
     let id = b
         .place_order(gtc(true, 100, 1, Some(C)), addr(1), 1)
         .order_id;
+    let mut m = Mirror::of(&mut b);
     b.cancel_order(id).unwrap();
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
@@ -142,33 +200,39 @@ fn a_full_fill_frees_the_maker_cloid_and_a_partial_fill_keeps_it() {
     let id = b
         .place_order(gtc(false, 100, 3, Some(C)), addr(1), 1)
         .order_id;
+    let mut m = Mirror::of(&mut b);
     b.place_order(gtc(true, 100, 1, None), addr(2), 2);
     assert_eq!(
         b.order_id_by_cloid(&addr(1), C),
         Some(id),
         "partial fill keeps it"
     );
+    m.assert_matches(&mut b);
     b.place_order(gtc(true, 100, 2, None), addr(2), 3);
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
 fn a_taker_that_fills_whole_never_holds_its_cloid() {
     let mut b = book();
     b.place_order(gtc(false, 100, 1, None), addr(2), 1);
+    let mut m = Mirror::of(&mut b);
     let r = b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 2);
     assert_eq!(r.status, OrderStatus::Filled);
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
 fn a_self_trade_cancel_frees_the_resting_cloid() {
     let mut b = book();
     b.place_order(gtc(false, 100, 1, Some(C)), addr(1), 1);
+    let mut m = Mirror::of(&mut b);
     let r = b.place_order(gtc(true, 100, 1, None), addr(1), 2);
     assert_eq!(r.self_trade_cancels.len(), 1);
     // The taker (no cloid) rests; the maker's cloid is free.
     assert_eq!(b.order_id_by_cloid(&addr(1), C), None);
+    m.assert_matches(&mut b);
+    assert!(m.0.is_empty());
     assert_eq!(
         b.place_order(gtc(true, 50, 1, Some(C)), addr(1), 3).status,
         OrderStatus::Resting
@@ -182,11 +246,13 @@ fn cancel_all_frees_resting_and_stop_cloids() {
     b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 1);
     b.place_order(stop_buy(300, Some(C + 1)), addr(1), 2);
     b.place_order(gtc(true, 90, 1, Some(C + 2)), addr(2), 3);
+    let mut m = Mirror::of(&mut b);
     assert_eq!(b.cancel_all(addr(1), None).len(), 1);
     assert_eq!(b.order_id_by_cloid(&addr(1), C + 1), None);
     assert!(b.order_id_by_cloid(&addr(2), C + 2).is_some());
+    m.assert_matches(&mut b);
     b.cancel_all(addr(2), None);
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
@@ -196,13 +262,14 @@ fn cancel_all_many_frees_every_senders_cloids() {
         b.place_order(gtc(true, 100 - i as i64, 1, Some(C)), addr(t), 1);
         b.place_order(stop_buy(300, Some(C + 1)), addr(t), 2);
     }
+    let mut m = Mirror::of(&mut b);
     let out = b.cancel_all_many(&[addr(1), addr(2), addr(3)]);
     assert_eq!(out.iter().map(Vec::len).sum::<usize>(), 3);
     for t in [1u8, 2, 3] {
         assert_eq!(b.order_id_by_cloid(&addr(t), C), None);
         assert_eq!(b.order_id_by_cloid(&addr(t), C + 1), None);
     }
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 /// The batch cancel-all path (deep concentrated level, >= 32 targets).
@@ -214,10 +281,12 @@ fn the_batched_cancel_all_frees_cloids() {
         b.place_order(gtc(true, 100, 1, Some(C + i)), t, 1);
     }
     assert_eq!(b.cloid_count(), 1_100);
+    let mut m = Mirror::of(&mut b);
     assert_eq!(b.cancel_all(addr(1), None).len(), 550);
     assert_eq!(b.cloid_count(), 550);
+    m.assert_matches(&mut b);
     b.cancel_all(addr(2), None);
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
@@ -225,20 +294,22 @@ fn a_triggered_stop_releases_its_entry_and_carries_the_cloid() {
     let mut b = book();
     let s = b.place_order(stop_buy(105, Some(C)), addr(1), 1).order_id;
     b.place_order(gtc(false, 106, 1, None), addr(2), 2);
+    let mut m = Mirror::of(&mut b);
     let r = b.place_order(gtc(true, 106, 1, None), addr(3), 3);
     assert_eq!(r.triggered_stops.len(), 1);
     assert_eq!(r.triggered_stops[0].id, s);
     assert_eq!(r.triggered_stops[0].params.client_order_id, Some(C));
     // Free until the executor places the triggered order under the cloid.
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
 fn take_pending_stops_frees_stop_cloids() {
     let mut b = book();
     b.place_order(stop_buy(300, Some(C)), addr(1), 1);
+    let mut m = Mirror::of(&mut b);
     assert_eq!(b.take_pending_stops(&addr(1)).len(), 1);
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
@@ -247,6 +318,7 @@ fn a_pending_stop_is_cancelled_by_id() {
     let keep = b.place_order(stop_buy(400, None), addr(1), 1).order_id;
     let s = b.place_order(stop_buy(300, Some(C)), addr(1), 2).order_id;
     assert_eq!(b.pending_stop(s).map(|st| st.trader), Some(addr(1)));
+    let mut m = Mirror::of(&mut b);
     let gone = b.cancel_stop(s).expect("stop cancelled");
     assert_eq!(
         (gone.id, gone.trader, gone.client_order_id),
@@ -257,7 +329,7 @@ fn a_pending_stop_is_cancelled_by_id() {
     assert!(b.pending_stop(s).is_none());
     assert!(b.pending_stop(keep).is_some(), "other stops stay");
     assert_eq!(b.pending_stop_count(), 1);
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 #[test]
@@ -266,10 +338,13 @@ fn a_modify_keeps_the_cloid_on_the_same_order() {
     let id = b
         .place_order(gtc(true, 100, 2, Some(C)), addr(1), 1)
         .order_id;
+    let mut m = Mirror::of(&mut b);
     b.modify_order(id, Some(fp(101)), None).unwrap();
     assert_eq!(b.order_id_by_cloid(&addr(1), C), Some(id));
+    m.assert_matches(&mut b);
     b.modify_order(id, None, Some(fp(1))).unwrap();
     assert_eq!(b.order_id_by_cloid(&addr(1), C), Some(id));
+    m.assert_matches(&mut b);
     assert_eq!(b.get_order(id).unwrap().client_order_id, Some(C));
     assert_eq!(b.cloid_count(), 1);
     b.verify_invariants();
@@ -289,12 +364,15 @@ fn a_reduce_only_cut_frees_the_cloid() {
     flat.insert(addr(1), FixedPoint::ZERO);
     flat.insert(addr(2), FixedPoint::ZERO);
     b.set_reduce_only_positions(flat);
+    let mut m = Mirror::of(&mut b);
     let r = b.place_order(gtc(true, 100, 1, None), addr(2), 2);
     assert_eq!(r.reduce_only_cuts.len(), 1);
     b.clear_reduce_only_positions();
     // The taker rests (no cloid); only the cut order held one.
     assert_eq!(b.order_id_by_cloid(&addr(1), C), None);
     assert_eq!(b.cloid_count(), 0);
+    m.assert_matches(&mut b);
+    assert!(m.0.is_empty());
     b.verify_invariants();
 }
 
@@ -337,10 +415,11 @@ fn a_margin_cancel_frees_the_cloid() {
         TimeInForce::IOC,
         None,
     );
+    let mut m = Mirror::of(&mut b);
     let r = b.place_order_with_accounts(sell, addr(2), 2, None, Some(&Broke));
     assert_eq!(r.margin_cancels.len(), 1);
     b.clear_account_margins();
-    assert_freed(&mut b, addr(1), C);
+    assert_freed(&mut b, &mut m, addr(1), C);
 }
 
 /// Restart: a reloaded book (classic blob or rows) rebuilds the index from
@@ -358,6 +437,9 @@ fn a_reloaded_book_rebuilds_the_index() {
 
     let blob = borsh::to_vec(&b).unwrap();
     let mut classic = OrderBook::try_from_slice(&blob).unwrap();
+    // A load is not a change: nothing logged (the executor builds its
+    // index from the loaded books).
+    assert_eq!(classic.cloid_log_len(), 0, "classic load logs nothing");
 
     let mut rows = OrderBook::new(1, cents(1), fp(1));
     rows.set_next_seq(b.next_seq());

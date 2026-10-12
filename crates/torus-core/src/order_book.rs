@@ -2310,6 +2310,22 @@ impl OrderBook {
         self.cloids.len()
     }
 
+    /// s114 follow-up: every `(trader, cloid, id)` of the index (any order).
+    pub fn cloid_entries(&self) -> impl Iterator<Item = (Address, Cloid, OrderId)> + '_ {
+        self.cloids.iter().map(|(&(t, c), &id)| (t, c, id))
+    }
+
+    /// s114 follow-up (RED stub): the cloid log.
+    pub fn drain_cloid_log(&mut self, _f: impl FnMut(Address, Cloid, Option<OrderId>)) {}
+
+    /// s114 follow-up (RED stub).
+    pub fn clear_cloid_log(&mut self) {}
+
+    /// s114 follow-up (RED stub).
+    pub fn cloid_log_len(&self) -> usize {
+        0
+    }
+
     /// s114: the pending stop with this id.
     pub fn pending_stop(&self, id: OrderId) -> Option<&StopOrder> {
         self.pending_stops.iter().find(|s| s.id == id)
