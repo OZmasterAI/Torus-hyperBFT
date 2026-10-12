@@ -44,6 +44,8 @@ out of 8.69 GiB in the 211 inventoried dirs.
 
 **Added `p23` (2026-10-11, after p23 finished and was analysed): Tier A 1.09 GiB (1,168,404,184 bytes, 6 files: the staged node and bench in `ozarchy-p23-stage/n/release/` (main `4e7fa146`, rebuildable) and the 4 `perf.data` files; their fork counts and site tables are kept in `ozarchy-p23-run/analyst/p23-spawn.txt`); Tier B 226.1 MiB (237,121,674 bytes, 45 files: `val*.log.gz`, `buckets.csv`, `sampler.csv` of the 9 cells; `tasks.txt` is kept, the source of section 44.2); A + B 1.31 GiB**, out of 1.38 GiB in its 13 dirs (section 44 of the ozarchy doc).
 
+**Added `p3s2g` (2026-10-12, after p3s2g finished and was analysed): Tier A 3.47 GiB (3,724,141,104 bytes, 7 files: the staged nodes and bench in `ozarchy-p3s2g-stage/{b,c,s,c-run,s-run}/release/`, rebuildable from `c97f56f9` / `2296be67` / `86d2b2bb`; the `-run` copies are btrfs reflinks, so deleting them frees less than their apparent size); Tier B 240.7 MiB (252,424,828 bytes, 54 files: `val*.log.gz`, `buckets.csv`, `tasks.txt`, `sampler.csv` of the 9 cell dirs)**, out of 3.78 GiB in its 14 dirs (section 47 of the ozarchy doc).
+
 ## Per campaign
 
 A campaign here is a group of dirs from the same run (for example all `ozarchy-mif-300m-*` cells). The command blocks further down are in this order.
@@ -2941,6 +2943,7 @@ rm -- \
 * Added `p3p` (2026-10-11): Tier A **0.99 GiB** (1,058,500,432 bytes), 2 files; Tier B **0.80 GiB** (860,704,019 bytes), 174 files; A + B **1.79 GiB** (1,919,204,451 bytes), out of 1.96 GiB in its 34 dirs
 * Added `p3t` (2026-10-11): Tier A none; Tier B **0.44 GiB** (469,417,445 bytes), 102 files; A + B **0.44 GiB** (469,417,445 bytes), out of 0.52 GiB in its 19 dirs
 * Added `p23` (2026-10-11): Tier A **1.09 GiB** (1,168,404,184 bytes), 6 files; Tier B **0.22 GiB** (237,121,674 bytes), 45 files; A + B **1.31 GiB** (1,405,525,858 bytes), out of 1.38 GiB in its 13 dirs
+* Added `p3s2g` (2026-10-12): Tier A **3.47 GiB** (3,724,141,104 bytes), 7 files; Tier B **0.24 GiB** (252,424,828 bytes), 54 files; A + B **3.70 GiB** (3,976,565,932 bytes), out of 3.78 GiB in its 14 dirs
 
 ### `p3s` (A 94.9 MiB, B 14231.7 MiB; dirs: `ozarchy-p3s-300m-tw-c1`, `ozarchy-p3s-300m-tw-c2`, `ozarchy-p3s-300m-tw-c3` ...)
 
@@ -3504,3 +3507,80 @@ rm -- \
 The `bin/A` and `bin/B` dirs of `ubench-adl-dirty-check` are left empty and can stay. Run `du -sh /home/oz/bench-results-matched` to see the real saving.
 
 s29: deleting the staged binaries leaves empty `release/` dirs under the `*-stage` dirs; they can stay. `ozarchy-p2s0b-stage/step0/release/torus-node` has a second hard link elsewhere, so its 541.9 MiB are freed only when that link goes too.
+
+### `p3s2g` (A 3551.6 MiB, B 240.7 MiB; dirs: `ozarchy-p3s2g-300m-w0`, `ozarchy-p3s2g-300m-r1-cd`, `ozarchy-p3s2g-300m-r1-sd` ...)
+
+The cells' `summary.json`, `ckpt-samples.txt`, `p3c1-post.json`, `metrics-*-val*.txt`, `state-digest-val*.txt`, `agreement.jsonl`, `bench.log`, `run.log`, `io-*` files, `cpu.csv`, `rocksdb-LOG-val*.txt` and `ozarchy-p3s2g-run/analyst/` are what section 47 is built on (keep). Note: section 47.1's per-block commit and exec times were parsed from `val*.log.gz` (results in `ozarchy-p3s2g-run/analyst/cells.json`); deleting the logs keeps the numbers but not the re-derivation.
+
+Tier A, 3.47 GiB, 7 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-stage/b/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-stage/c/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-stage/s/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-stage/c-run/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-stage/c-run/release/bench-throughput' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-stage/s-run/release/torus-node' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-stage/s-run/release/bench-throughput'
+```
+
+Tier B, 240.7 MiB, 54 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-w0/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-w0/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-w0/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-w0/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-w0/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-w0/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-cd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-cd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-cd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-cd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-cd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-cd/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-sd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-sd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-sd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-sd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-sd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r1-sd/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-sd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-sd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-sd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-sd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-sd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-sd/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-cd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-cd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-cd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-cd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-cd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r2-cd/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-cd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-cd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-cd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-cd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-cd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-cd/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-sd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-sd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-sd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-sd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-sd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r3-sd/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-sd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-sd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-sd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-sd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-sd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-sd/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-cd/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-cd/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-cd/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-cd/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-cd/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3s2g-300m-r4-cd/val2.log.gz'
+```
