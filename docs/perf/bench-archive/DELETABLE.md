@@ -3742,6 +3742,8 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3r1-300m-y1-s-TERM/val2.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3r1-300m-y1-s-TERM/buckets.csv' \
   '/home/oz/bench-results-matched/ozarchy-p3r1-300m-y1-s-TERM/sampler.csv'
+```
+
 ### `p3s2g` (A 3551.6 MiB, B 240.7 MiB; dirs: `ozarchy-p3s2g-300m-w0`, `ozarchy-p3s2g-300m-r1-cd`, `ozarchy-p3s2g-300m-r1-sd` ...)
 
 The cells' `summary.json`, `ckpt-samples.txt`, `p3c1-post.json`, `metrics-*-val*.txt`, `state-digest-val*.txt`, `agreement.jsonl`, `bench.log`, `run.log`, `io-*` files, `cpu.csv`, `rocksdb-LOG-val*.txt` and `ozarchy-p3s2g-run/analyst/` are what section 47 is built on (keep). Note: section 47.1's per-block commit and exec times were parsed from `val*.log.gz` (results in `ozarchy-p3s2g-run/analyst/cells.json`); deleting the logs keeps the numbers but not the re-derivation.
@@ -4344,6 +4346,8 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3alloc-300m-r4-jgm/val0.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3alloc-300m-r4-jgm/val1.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3alloc-300m-r4-jgm/val2.log.gz'
+```
+
 ### `p3term` (A 0 KiB, B 173.3 MiB; dirs: `ozarchy-p3term-300m-w0`, `ozarchy-p3term-300m-t1-s-TERM`, `ozarchy-p3term-300m-t1-c-TERM` ...)
 
 The cells' `summary.json`, `crash-kill*.json`, `crash-restart-tail*.log`, `state-hashes.txt`, `agreement.jsonl`, `run.log` and `ozarchy-p3term-run/analyst/` are what section 52 is built on (keep).
@@ -4376,6 +4380,8 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3term-300m-t2-s-TERM/val0.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3term-300m-t2-s-TERM/val1.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3term-300m-t2-s-TERM/val2.log.gz'
+```
+
 ### `p3soak` (A 0 KiB, B 129.7 MiB; dirs: `ozarchy-p3soak-300m-w0`, `ozarchy-p3soak-300m-k1-ctl`, `ozarchy-p3soak-300m-k1-s2`, `ozarchy-p3soak-run`)
 
 The cells' `summary.json`, `mem-samples.txt`, `cpu-ticks.txt`, `cpu.csv`, `state-digest-val*.txt`, `run.log` and `ozarchy-p3soak-run/analyst/` are what section 53 is built on (keep).
