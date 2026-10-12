@@ -95,6 +95,9 @@ struct CkptState {
     /// swapped for its ingress slice once merged into L (`settle`). Cleared
     /// when a checkpoint closes them (C then holds them) and at a barrier.
     view_blocks: Vec<Arc<torus_state::FrozenPending>>,
+    /// p3s2g 47.1: frees released layers / sets / views off E (`None`:
+    /// interval 0, or the thread could not start: E frees them itself).
+    dropper: Option<Dropper>,
 }
 
 impl CkptState {
@@ -161,6 +164,73 @@ type CkptLayers = (
     Option<Arc<torus_state::CheckpointLayer>>,
     Option<Arc<torus_state::CheckpointLayer>>,
 );
+
+/// Item 6 Phase 3: the end-of-block merge of the previous parent into L,
+/// running off E (see [`spawn_layer_merge`]).
+struct LayerMerge {
+    /// L with the block folded in. Disconnected without a value: the
+    /// merge panicked (L is lost; fail-stop).
+    layer: std::sync::mpsc::Receiver<torus_state::CheckpointLayer>,
+    /// Step 2 (mempool wired): the block's ingress slice for the view.
+    slice: Option<std::sync::mpsc::Receiver<Arc<torus_state::FrozenPending>>>,
+}
+
+/// Item 6 Phase 3: merge `block` into `layer` on a `torus-ckpt-merge`
+/// thread; with `slice`, also cut the block's ingress slice
+/// (`before_slice` runs first: a test seam, a no-op in production).
+fn spawn_layer_merge(
+    mut layer: torus_state::CheckpointLayer,
+    block: Arc<torus_state::FrozenPending>,
+    slice: bool,
+    before_slice: impl FnOnce() + Send + 'static,
+) -> std::io::Result<LayerMerge> {
+    let (layer_tx, layer_rx) = std::sync::mpsc::sync_channel(1);
+    let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("torus-ckpt-merge".into())
+        .spawn(move || {
+            layer.merge(&block);
+            let cut = slice.then(|| {
+                before_slice();
+                Arc::new(block.slice(&torus_state::read_view::INGRESS_CFS))
+            });
+            drop(block);
+            let _ = layer_tx.send(layer);
+            if let Some(cut) = cut {
+                let _ = slice_tx.send(cut);
+            }
+        })?;
+    Ok(LayerMerge {
+        layer: layer_rx,
+        slice: slice.then_some(slice_rx),
+    })
+}
+
+/// Item 6 Phase 3 (p3s2g 47.1): frees what the exec thread lets go of at
+/// a block boundary (a durable checkpoint layer, frozen sets, the previous
+/// ingress view) on its own thread, off the exec thread.
+struct Dropper {
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Dropper {
+    fn spawn() -> Option<Self> {
+        Some(Self {
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    /// Hand `item` over to be freed.
+    fn drop_later<T: Send + 'static>(&self, item: T) {
+        drop(item);
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Items freed so far.
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
 
 struct CommittedBlockMsg {
     torus_block: TorusBlock,
@@ -24230,6 +24300,109 @@ mod crash_recovery_tests {
                 assert_eq!(o.view, Some((Some(3), 0, true)), "C holds blocks 1-3");
             }
         }
+    }
+
+    /// p3s2g 47.1: E joins the end-of-block layer merge at the start of the
+    /// next block, so whatever the merge thread does before handing L back
+    /// is exec-thread wait. It hands L back first; the ingress slice (step
+    /// 2) and the release of its handle on the merged block come after.
+    #[test]
+    fn layer_merge_hands_l_back_before_the_slice() {
+        use std::time::Duration;
+        use torus_state::cf::{CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS};
+        let (_cfg, db) = make_test_config_and_db();
+        let o = NativeStateOverlay::new(db.clone());
+        o.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book", b"blob").unwrap();
+        o.put_cf_raw(CF_NATIVE_POSITIONS, b"pos", b"p").unwrap();
+        let block = o.freeze(7);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let merge = spawn_layer_merge(
+            torus_state::CheckpointLayer::new(),
+            block.clone(),
+            true,
+            move || {
+                let _ = held.recv();
+            },
+        )
+        .unwrap();
+        let layer = merge
+            .layer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("L handed back while the slice is still being cut");
+        assert_eq!(layer.entry_count(), 2);
+        assert_eq!(layer.top_height(), Some(7));
+        let slice = merge.slice.expect("slice requested");
+        assert!(slice.try_recv().is_err(), "slice still held");
+        release.send(()).unwrap();
+        let slice = slice.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(slice.height(), 7);
+        assert!(slice.touches_only(&torus_state::read_view::INGRESS_CFS));
+        assert!(!slice.touches_only(&[CF_NATIVE_ORDER_BOOKS]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&block) > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(Arc::strong_count(&block), 1, "the merge thread let go");
+    }
+
+    /// p3s2g 47.1: the dropper frees what it is handed on its own thread.
+    #[test]
+    fn dropper_frees_on_its_own_thread() {
+        use std::time::Duration;
+        struct Probe(std::sync::mpsc::Sender<Option<String>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self
+                    .0
+                    .send(std::thread::current().name().map(String::from));
+            }
+        }
+        let dropper = Dropper::spawn().expect("dropper thread");
+        let (tx, rx) = std::sync::mpsc::channel();
+        dropper.drop_later(Probe(tx));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().as_deref(),
+            Some("torus-ckpt-drop")
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while dropper.dropped() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(dropper.dropped(), 1);
+    }
+
+    /// p3s2g 47.1: with an interval and a mempool, E hands what it releases
+    /// at block boundaries (C once durable, the previous ingress view, the
+    /// sets a slice or a checkpoint replaces) to the dropper; interval 0
+    /// has none.
+    #[test]
+    fn checkpoint_releases_go_to_the_dropper() {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        let mempool = Arc::new(Mempool::new(db.clone(), Default::default()));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool), false);
+        ctx.checkpoint = Some(ckpt_every(3));
+        ctx.attach_flush_worker(None);
+        let blocks = pipeline_fixture_blocks();
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        let dropped = || {
+            let st = ctx.ckpt.lock().unwrap();
+            st.dropper.as_ref().map(Dropper::dropped)
+        };
+        let want = blocks.len() as u64 / 2;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dropped().is_some_and(|n| n < want) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let n = dropped().expect("a dropper with an interval");
+        assert!(n >= want, "released off E: {n} over {} blocks", blocks.len());
+        let off = pipeline_ctx(&db, true, None);
+        assert!(off.ckpt.lock().unwrap().dropper.is_none(), "interval 0");
     }
 
     /// Review fix (Codex, step 2): without a mempool nothing reads a view, so
