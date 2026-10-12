@@ -3559,6 +3559,7 @@ mod tests {
             reason,
             message: message.to_string(),
             oid: None,
+            cloid: None,
         };
         let results = vec![
             cw(
@@ -3596,6 +3597,8 @@ mod tests {
             // s114: an executed placement carries its order id.
             CoreWriterResult {
                 oid: Some(0x1_0000_0000_0000_002a),
+                // s114: and the cloid it was placed with.
+                cloid: Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
                 ..cw(
                     4,
                     CoreWriterKind::PlaceOrder,
@@ -3711,6 +3714,7 @@ mod tests {
                 "status": "executed",
                 "message": "",
                 "oid": "0x1000000000000002a",
+                "cloid": "0x0123456789abcdeffedcba9876543210",
                 "txHash": null,
                 "callIndex": null
             }

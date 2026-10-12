@@ -1161,6 +1161,7 @@ mod tests {
             reason,
             message: msg.to_string(),
             oid: None,
+            cloid: None,
         }
     }
 
@@ -1376,7 +1377,7 @@ mod tests {
         assert_eq!(&with[with.len() - 16..], &placed.oid.unwrap().to_be_bytes());
 
         let mut unknown = plain.clone();
-        *unknown.last_mut().unwrap() = 0x02;
+        *unknown.last_mut().unwrap() = 0x04;
         assert_eq!(BlockActionStatus::decode(&unknown), None, "unknown ext bit");
         assert_eq!(
             BlockActionStatus::decode(&with[..with.len() - 1]),
@@ -1440,6 +1441,7 @@ mod tests {
             (K::ClaimRewards, 5, "claim_rewards"),
             (K::LockPermanent, 6, "lock_permanent"),
             (K::ClaimUnbonded, 7, "claim_unbonded"),
+            (K::CancelByCloid, 8, "cancel_by_cloid"),
             (K::LockboxDeposit, 0x20, "lockbox_deposit"),
             (K::LockboxWithdraw, 0x21, "lockbox_withdraw"),
             (K::Unknown, 0xFE, "unknown"),
@@ -1450,7 +1452,46 @@ mod tests {
             assert_eq!(K::from_u8(code), kind, "{name}");
             assert_eq!(kind.as_str(), name);
         }
-        assert_eq!(K::from_u8(8), K::Unknown);
+        assert_eq!(K::from_u8(9), K::Unknown);
+    }
+
+    /// s114: a row that carried a cloid (a placement, a cancel by cloid)
+    /// records it: ext bit 1, 16 BE bytes after the oid (if any).
+    #[test]
+    fn v5_rows_carry_their_cloid() {
+        use CoreWriterKind as K;
+        use FailureReason as R;
+        let cloid = 0xc10d_0000_0000_0000_0000_0000_0000_0001u128;
+        let both = CoreWriterResult {
+            oid: Some(7),
+            cloid: Some(cloid),
+            ..cw(0, K::PlaceOrder, Outcome::Executed, R::Other, "")
+        };
+        let cancel = CoreWriterResult {
+            cloid: Some(u128::MAX),
+            ..cw(1, K::CancelByCloid, Outcome::Failed, R::Other, "no such order")
+        };
+        let dup = CoreWriterResult {
+            cloid: Some(cloid),
+            ..cw(2, K::PlaceOrder, Outcome::Failed, R::DuplicateCloid, "dup")
+        };
+        let status = BlockActionStatus {
+            core_writer: vec![both.clone(), cancel, dup],
+            ..Default::default()
+        };
+        let bytes = status.encode();
+        assert_eq!(bytes[0], ACTION_STATUS_V5);
+        assert_eq!(BlockActionStatus::decode(&bytes), Some(status));
+
+        let one = BlockActionStatus {
+            core_writer: vec![both],
+            ..Default::default()
+        }
+        .encode();
+        assert_eq!(one[one.len() - 33], 0x03, "ext: oid and cloid");
+        assert_eq!(&one[one.len() - 32..one.len() - 16], &7u128.to_be_bytes());
+        assert_eq!(&one[one.len() - 16..], &cloid.to_be_bytes());
+        assert_eq!(BlockActionStatus::decode(&one[..one.len() - 1]), None, "cut cloid");
     }
 
     #[test]
