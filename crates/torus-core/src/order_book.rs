@@ -3057,9 +3057,14 @@ impl OrderBook {
     fn forget_cloid(cloids: &mut BookCloids, trader: Address, cloid: Option<Cloid>, id: OrderId) {
         if let Some(c) = cloid {
             let key = CloidKey::new(trader, c);
-            if cloids.map.get(&key) == Some(&id) {
-                cloids.map.remove(&key);
-                cloids.log.push(key);
+            // perf/cloid-engine-cost: one lookup (was get + remove): take
+            // the entry out, put it back if it is another order's.
+            if let Some(cur) = cloids.map.remove(&key) {
+                if cur == id {
+                    cloids.log.push(key);
+                } else {
+                    cloids.map.insert(key, cur);
+                }
             }
         }
     }

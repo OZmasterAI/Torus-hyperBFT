@@ -857,3 +857,29 @@ fn a_checked_placement_of_a_live_cloid_panics_in_debug() {
     b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 1);
     b.place_order_with_accounts_cloid_checked(gtc(true, 99, 1, Some(C)), addr(1), 2, None, None);
 }
+
+/// perf/cloid-engine-cost (cleanup): `forget_cloid` drops the entry and
+/// logs it only when the entry is this id's; another id's entry stays,
+/// unlogged; a missing key does nothing.
+#[test]
+fn forget_cloid_drops_only_its_own_entry() {
+    let mut b = book();
+    let id = b
+        .place_order(gtc(true, 100, 1, Some(C)), addr(1), 1)
+        .order_id;
+    b.clear_cloid_log();
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), Some(C), id + 1);
+    assert_eq!(b.order_id_by_cloid(&addr(1), C), Some(id), "another id's");
+    assert_eq!(b.cloid_log_len(), 0);
+    OrderBook::forget_cloid(&mut b.cloids, addr(2), Some(C), id);
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), None, id);
+    assert_eq!((b.cloid_count(), b.cloid_log_len()), (1, 0), "no entry");
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), Some(C), id);
+    assert_eq!(b.order_id_by_cloid(&addr(1), C), None);
+    assert_eq!(b.cloid_log_len(), 1);
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), Some(C), id);
+    assert_eq!(b.cloid_log_len(), 1, "gone: nothing more");
+    let mut log = Vec::new();
+    b.drain_cloid_log(|t, c, live| log.push((t, c, live)));
+    assert_eq!(log, vec![(addr(1), C, None)]);
+}
