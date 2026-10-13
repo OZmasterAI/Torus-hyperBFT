@@ -3,7 +3,9 @@
 //! Task 3.1.4: Hardens the native pool that previously had no per-sender
 //! limits and no dedup. Adds pool size cap with priority-based eviction.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{btree_set, BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::iter::Peekable;
 use std::ops::Bound;
 
 use alloy_primitives::{Address, B256};
@@ -34,7 +36,27 @@ use crate::error::MempoolError;
 /// Anti-spam item C: the key is unchanged, but selection no longer takes the
 /// whole cancel range first — cancels get at most `cancel_share_pct` of each
 /// selected block ahead of non-cancels (see [`NativePool::select_entries`]).
+///
+/// s114 (owner decision, option a): cancels are NOT taken in this key order
+/// but oldest-first ([`CancelMerge`]): in `(sender, nonce)` order a younger
+/// cancel of a lower-address sender passed an older one of a higher-address
+/// sender every block while cancel demand stood at the share, until it aged
+/// out of the nonce window (p3s2g cancel-all expiry). Non-cancels keep this
+/// key order; the s66 regression above reordered every action.
 type SortKey = (u8, Address, u64, u64);
+
+/// A sender's cancel-queue head, `(seq, sender, nonce)`: the sender's first
+/// pooled cancel in [`SortKey`] order, keyed by its arrival `seq`.
+type CancelHead = (u64, Address, u64);
+
+fn cancel_head(&(_, sender, nonce, seq): &SortKey) -> CancelHead {
+    (seq, sender, nonce)
+}
+
+/// The [`SortKey`] of a [`CancelHead`].
+fn cancel_key(&(seq, sender, nonce): &CancelHead) -> SortKey {
+    (PRIO_CANCEL, sender, nonce, seq)
+}
 
 /// Priority class of a cancel ([`is_cancel`]).
 pub const PRIO_CANCEL: u8 = 0;
@@ -109,6 +131,93 @@ impl<'a> SelectionWalk<'a> {
         self.selected.push((key, entry));
         Offer::Taken
     }
+
+    /// Whether `sender` holds its per-block cap: nothing more of it can be
+    /// taken in this block.
+    fn sender_full(&self, sender: &Address) -> bool {
+        self.block_counts
+            .get(sender)
+            .is_some_and(|count| *count >= self.max_per_block)
+    }
+
+    /// Offer cancels in oldest-first order until the walk holds `until`
+    /// entries or the cancels run out. `false` on a budget stop (selection
+    /// ends there, deterministic prefix).
+    fn take_cancels(&mut self, cancels: &mut CancelMerge<'a>, until: usize) -> bool {
+        while self.selected.len() < until {
+            let Some((key, entry)) = cancels.pop() else {
+                return true;
+            };
+            if self.offer(key, entry) == Offer::Stop {
+                return false;
+            }
+            // A sender at its block cap has nothing more to offer: drop the
+            // rest of its queue instead of skipping it entry by entry.
+            if !self.sender_full(&entry.sender) {
+                cancels.advance(key);
+            }
+        }
+        true
+    }
+}
+
+/// s114: the pooled cancels in oldest-first order, read-only over the pool.
+///
+/// Each sender's cancels form a queue in [`SortKey`] order (nonce, then
+/// seq); the queues are merged by the arrival `seq` of each queue's head. So
+/// the oldest cancel goes first unless an older-nonce cancel of the same
+/// sender has to precede it, and a sender's cancels never leave nonce order
+/// (a nonce n+1 before n would only fail or reorder that sender's intent).
+///
+/// `heads` walks the pool's incrementally maintained head index in arrival
+/// order; once a head is yielded its sender's next cancel enters `next`.
+/// Each yielded cancel costs O(log n) (one lookup, one successor range, one
+/// heap push), independent of how many senders have cancels pooled.
+struct CancelMerge<'a> {
+    entries: &'a BTreeMap<SortKey, NativePoolEntry>,
+    heads: Peekable<btree_set::Iter<'a, CancelHead>>,
+    /// Successors of yielded cancels, as `(seq, key)`, smallest seq first.
+    next: BinaryHeap<Reverse<(u64, SortKey)>>,
+}
+
+impl<'a> CancelMerge<'a> {
+    fn new(pool: &'a NativePool) -> Self {
+        Self {
+            entries: &pool.entries,
+            heads: pool.cancel_heads.iter().peekable(),
+            next: BinaryHeap::new(),
+        }
+    }
+
+    /// The oldest cancel not yet yielded among the queue fronts.
+    fn pop(&mut self) -> Option<(&'a SortKey, &'a NativePoolEntry)> {
+        loop {
+            let head_seq = self.heads.peek().map(|head| head.0);
+            let next_seq = self.next.peek().map(|Reverse((seq, _))| *seq);
+            let key = match (head_seq, next_seq) {
+                (None, None) => return None,
+                (Some(head), Some(next)) if head < next => cancel_key(self.heads.next()?),
+                (Some(_), None) => cancel_key(self.heads.next()?),
+                (_, Some(_)) => self.next.pop()?.0 .1,
+            };
+            match self.entries.get_key_value(&key) {
+                Some(found) => return Some(found),
+                // Unreachable while the head index is exact (checked by
+                // `assert_index_consistent`); skip rather than end selection.
+                None => debug_assert!(false, "cancel head {key:?} has no entry"),
+            }
+        }
+    }
+
+    /// Queue the cancel after `key` in its sender's queue, if any.
+    fn advance(&mut self, key: &SortKey) {
+        let after = (Bound::Excluded(*key), Bound::Unbounded);
+        if let Some((next, _)) = self.entries.range(after).next() {
+            if next.0 == PRIO_CANCEL && next.1 == key.1 {
+                self.next.push(Reverse((next.3, *next)));
+            }
+        }
+    }
 }
 
 /// Same identity as SortKey, ordered by nonce for expiry-prefix removal.
@@ -167,6 +276,12 @@ pub(crate) struct NativePool {
     /// without scanning the pool. `Vec` len is 1 except under that adversarial
     /// duplicate admit.
     hash_index: HashMap<B256, Vec<SortKey>>,
+    /// s114: the head of every sender's cancel queue (its first pooled
+    /// cancel in [`SortKey`] order), ordered by arrival — the start points
+    /// of the oldest-first cancel walk ([`CancelMerge`]). Exactly one entry
+    /// per sender with a pooled cancel; maintained at insert and in
+    /// `remove_entry_by_key`, the two choke points.
+    cancel_heads: BTreeSet<CancelHead>,
     /// Insertion counter feeding [`SortKey`] tie order.
     next_seq: u64,
     /// Pooled cancels and oracle submissions (every non-[`PRIO_NORMAL`]
@@ -188,6 +303,7 @@ impl NativePool {
             sender_counts: HashMap::new(),
             seen: HashSet::new(),
             hash_index: HashMap::new(),
+            cancel_heads: BTreeSet::new(),
             next_seq: 0,
             priority_count: 0,
             max_size,
@@ -350,6 +466,19 @@ impl NativePool {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let key: SortKey = (priority, sender, action.nonce, seq);
+        if priority == PRIO_CANCEL {
+            // The new cancel heads its sender's queue unless a cancel with a
+            // smaller (nonce, seq) is already pooled.
+            match self.cancel_queue_head(sender) {
+                Some(head) if head < key => {}
+                old => {
+                    if let Some(old) = old {
+                        self.cancel_heads.remove(&cancel_head(&old));
+                    }
+                    self.cancel_heads.insert(cancel_head(&key));
+                }
+            }
+        }
         self.hash_index.entry(action_hash).or_default().push(key);
         self.expiry_index.insert(expiry_key(&key));
         self.entries.insert(
@@ -374,6 +503,11 @@ impl NativePool {
     /// The single choke point for index maintenance on every removal path.
     fn remove_entry_by_key(&mut self, key: &SortKey) -> Option<NativePoolEntry> {
         let entry = self.entries.remove(key)?;
+        if key.0 == PRIO_CANCEL && self.cancel_heads.remove(&cancel_head(key)) {
+            if let Some(next) = self.cancel_queue_head(key.1) {
+                self.cancel_heads.insert(cancel_head(&next));
+            }
+        }
         self.priority_count -= usize::from(entry.priority != PRIO_NORMAL);
         self.expiry_index.remove(&expiry_key(key));
         self.seen.remove(&(entry.sender, entry.action_hash));
@@ -387,9 +521,15 @@ impl NativePool {
         Some(entry)
     }
 
+    /// `sender`'s first pooled cancel in [`SortKey`] order (its queue head).
+    fn cancel_queue_head(&self, sender: Address) -> Option<SortKey> {
+        let queue = (PRIO_CANCEL, sender, 0, 0)..=(PRIO_CANCEL, sender, u64::MAX, u64::MAX);
+        self.entries.range(queue).next().map(|(key, _)| *key)
+    }
+
     /// Item C selection walk shared by every block-selection entry point.
     ///
-    /// 1. cancels, in [`SortKey`] order, until they hold
+    /// 1. cancels, oldest-first ([`CancelMerge`], s114), until they hold
     ///    `ceil(limit * cancel_share_pct / 100)` slots;
     /// 2. non-cancels in their unchanged [`SortKey`] order (sender, nonce) —
     ///    s66: an arrival-order walk here collapsed throughput, so this phase
@@ -397,11 +537,14 @@ impl NativePool {
     ///    ([`PRIO_ORACLE`]) sort before normal entries, so they lead this
     ///    phase: cancels at the share never crowd them out (merge with the
     ///    crab stack; their count is bounded by the per-validator cap);
-    /// 3. work-conserving: if slots remain, the cancels after the last one
-    ///    phase 1 examined.
+    /// 3. work-conserving: if slots remain, the remaining cancels, continuing
+    ///    the same oldest-first walk where phase 1 stopped (so a block's
+    ///    cancels are always the oldest ones not in flight).
     ///
-    /// Each phase is a `BTreeMap::range` over the incrementally sorted pool —
-    /// no sort, no extra allocation beyond the result. Budgets, the
+    /// Phase 2 is a `BTreeMap::range` over the incrementally sorted pool;
+    /// the cancel walk is O(log n) per cancel examined — no sort, no pool
+    /// scan, allocation only the result and a heap of at most one entry
+    /// per sender reached. Budgets, the
     /// per-sender cap and the in-flight exclusion apply across all phases; a
     /// budget stop ends the whole selection (deterministic prefix). At 100 %
     /// phase 1 can take the whole block, which is exactly the old
@@ -443,18 +586,10 @@ impl NativePool {
             selected: Vec::new(),
         };
 
-        // Phase 1: the bounded cancel prefix.
-        let mut resume_after: Option<&SortKey> = None;
-        let mut cancels_left = false;
-        for (key, entry) in self.entries.range(..FIRST_NON_CANCEL) {
-            if walk.selected.len() >= cancel_cap {
-                cancels_left = true;
-                break;
-            }
-            if walk.offer(key, entry) == Offer::Stop {
-                return walk.selected;
-            }
-            resume_after = Some(key);
+        // Phase 1: the bounded cancel prefix, oldest-first.
+        let mut cancels = CancelMerge::new(self);
+        if !walk.take_cancels(&mut cancels, cancel_cap) {
+            return walk.selected;
         }
         // Phase 2: non-cancels, unchanged order.
         for (key, entry) in self.entries.range((Bound::Included(FIRST_NON_CANCEL), end)) {
@@ -465,18 +600,8 @@ impl NativePool {
                 return walk.selected;
             }
         }
-        // Phase 3: leftover slots go to the remaining cancels.
-        if cancels_left {
-            let from = resume_after.map_or(Bound::Unbounded, |k| Bound::Excluded(*k));
-            for (key, entry) in self
-                .entries
-                .range((from, Bound::Excluded(FIRST_NON_CANCEL)))
-            {
-                if walk.full() || walk.offer(key, entry) == Offer::Stop {
-                    break;
-                }
-            }
-        }
+        // Phase 3: leftover slots go to the remaining cancels, same walk.
+        walk.take_cancels(&mut cancels, limit);
         walk.selected
     }
 
@@ -721,6 +846,15 @@ impl NativePool {
             self.entries.len(),
             "every live entry must be indexed exactly once"
         );
+        let mut heads: BTreeSet<CancelHead> = BTreeSet::new();
+        let mut last_sender = None;
+        for key in self.entries.range(..FIRST_NON_CANCEL).map(|(key, _)| key) {
+            if last_sender != Some(key.1) {
+                heads.insert(cancel_head(key));
+                last_sender = Some(key.1);
+            }
+        }
+        assert_eq!(self.cancel_heads, heads, "cancel head index");
     }
 
     fn dec_sender_count(&mut self, sender: &Address) {
@@ -2094,6 +2228,333 @@ mod tests {
         let sel = pool.select_for_block_with_senders_excluding(20, &HashSet::new(), usize::MAX, 8);
         assert_eq!(sel.len(), 8);
         assert_eq!(cancel_flags(&sel).iter().filter(|c| **c).count(), 5);
+    }
+
+    /// ozarchy-p3s2g section 47.3 (step 2 arm): 0.8-2.6% of the bench's
+    /// cancel-alls aged out of the 60 s nonce window in the pool, never
+    /// selected. Mechanism: the item C cancel prefix walks cancels in
+    /// `(sender, nonce)` order and is capped at `cancel_share_pct` of the
+    /// block; while the orders fill the rest of every block (phase 3 never
+    /// runs) and the cancel demand per block is at the cap, a younger cancel
+    /// of a lower-address sender passes an older cancel of a higher-address
+    /// sender every block, for as long as the load lasts. Blocks of 8 at
+    /// 25%: 2 cancel slots; each block 2 fresh cancels from 0x01/0x02 and 6
+    /// orders; one cancel-all from 0xF0, older than all of them.
+    ///
+    /// Owner decision s114: the cancel share is filled oldest-first.
+    #[test]
+    fn cancel_share_never_starves_an_older_cancel() {
+        let mut pool = NativePool::new(10_000, 512, 64);
+        pool.set_cancel_share_pct(25);
+        let cancel_all = |n| make_action(n, NativeAction::CancelAllOrders { market_id: None });
+        let late = Address::repeat_byte(0xF0);
+        let starved = pool.insert(late, cancel_all(1)).unwrap();
+        let mut taken_at = None;
+        for round in 0..20u64 {
+            let nonce = 10 + round * 100;
+            for (i, s) in [0x01u8, 0x02].into_iter().enumerate() {
+                pool.insert(Address::repeat_byte(s), cancel_all(nonce + i as u64))
+                    .unwrap();
+            }
+            for i in 0..6u8 {
+                pool.insert(
+                    Address::repeat_byte(0x40 + i),
+                    make_action(nonce + u64::from(i), NativeAction::ClaimRewards),
+                )
+                .unwrap();
+            }
+            let sel = pool.select_for_block_with_senders(8);
+            assert_eq!(sel.len(), 8, "round {round}: a full block");
+            let hashes: Vec<B256> = sel.iter().map(|(_, a)| compute_action_hash(a)).collect();
+            if taken_at.is_none() && hashes.contains(&starved) {
+                taken_at = Some(round);
+            }
+            pool.remove_committed(&hashes);
+        }
+        assert!(
+            taken_at.is_some_and(|r| r <= 1),
+            "the oldest cancel waits behind younger ones: selected at {taken_at:?}"
+        );
+    }
+
+    // ---- s114: the cancel share is filled oldest-first ----
+
+    /// Deterministic test RNG (64-bit LCG, high bits).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    /// Reference for the cancel selection order, written the slow obvious
+    /// way: each sender's pooled cancels form a queue in `(nonce, seq)`
+    /// order; repeatedly emit the queue head with the smallest `seq`
+    /// (arrival). A sender's own cancels therefore never leave nonce order.
+    fn reference_cancel_order(pool: &NativePool) -> Vec<SortKey> {
+        let mut queues: BTreeMap<Address, Vec<SortKey>> = BTreeMap::new();
+        for key in pool.entries.keys().filter(|k| k.0 == PRIO_CANCEL) {
+            queues.entry(key.1).or_default().push(*key);
+        }
+        let mut pos: HashMap<Address, usize> = HashMap::new();
+        let mut out = Vec::new();
+        loop {
+            let best = queues
+                .iter()
+                .filter_map(|(s, q)| q.get(pos.get(s).copied().unwrap_or(0)).map(|k| (k.3, *s)))
+                .min();
+            let Some((_, sender)) = best else {
+                return out;
+            };
+            let at = pos.entry(sender).or_insert(0);
+            out.push(queues[&sender][*at]);
+            *at += 1;
+        }
+    }
+
+    /// The pool keys of a selection. The action hash omits the sender, so
+    /// two senders can share one; `(sender, hash)` is unique (dedup).
+    fn keys_of(pool: &NativePool, sel: &[(Address, SignedNativeAction)]) -> Vec<SortKey> {
+        sel.iter()
+            .map(|(s, a)| {
+                let keys = &pool.hash_index[&compute_action_hash(a)];
+                let mine: Vec<&SortKey> = keys.iter().filter(|k| k.1 == *s).collect();
+                assert_eq!(mine.len(), 1);
+                *mine[0]
+            })
+            .collect()
+    }
+
+    /// (i) Oldest-first is a merge of the per-sender nonce queues by the
+    /// arrival of each queue's head: 0x01's nonce-20 cancel arrived first,
+    /// but its nonce-10 cancel arrived after 0x02's nonce-1 one, so 0x02
+    /// leads, then 0x01 in nonce order (10 before 20), and 0x01's nonce 20
+    /// (the oldest entry) passes 0x02's younger nonce 2. Sender order would
+    /// have been 0x01/10, 0x01/20, 0x02/1, 0x02/2.
+    #[test]
+    fn oldest_first_keeps_each_senders_cancels_in_nonce_order() {
+        let mut pool = NativePool::new(100, 64, 16);
+        pool.set_cancel_share_pct(100);
+        let (a, b) = (Address::repeat_byte(0x01), Address::repeat_byte(0x02));
+        let cancel = |n, id| make_action(n, NativeAction::CancelOrder { order_id: id });
+        pool.insert(a, cancel(20, 1)).unwrap();
+        pool.insert(b, cancel(1, 2)).unwrap();
+        pool.insert(a, cancel(10, 3)).unwrap();
+        pool.insert(b, cancel(2, 4)).unwrap();
+        let sel = pool.select_for_block_with_senders(10);
+        let got: Vec<(Address, u64)> = sel.iter().map(|(s, x)| (*s, x.nonce)).collect();
+        assert_eq!(got, vec![(b, 1), (a, 10), (a, 20), (b, 2)]);
+        assert_eq!(keys_of(&pool, &sel), reference_cancel_order(&pool));
+    }
+
+    /// (i) + (iii) against the reference, over seeded random pools with
+    /// out-of-order nonces, same-nonce ties, interleaved non-cancels,
+    /// removals and re-inserts: at every limit the selected cancels (phase 1
+    /// then the phase 3 leftover) are exactly a prefix of the reference
+    /// order, with in-flight cancels skipped in place; every sender's cancels
+    /// stay in nonce order.
+    #[test]
+    fn cancel_selection_matches_the_oldest_head_first_reference() {
+        for seed in 0..48u64 {
+            let mut rng = Lcg(seed);
+            let mut pool = NativePool::new(10_000, 512, 512);
+            let fill = |pool: &mut NativePool, rng: &mut Lcg, base: u64| {
+                for i in 0..90u64 {
+                    let sender = Address::repeat_byte(1 + (rng.next() % 7) as u8);
+                    let nonce = rng.next() % 30;
+                    let action = match rng.next() % 5 {
+                        0 => NativeAction::ClaimRewards,
+                        1 => NativeAction::CancelAllOrders { market_id: None },
+                        _ => NativeAction::CancelOrder {
+                            order_id: u128::from(base + i),
+                        },
+                    };
+                    let _ = pool.insert(sender, make_action(nonce, action));
+                }
+            };
+            fill(&mut pool, &mut rng, 0);
+            let victims: Vec<B256> = pool
+                .entries
+                .values()
+                .map(|e| e.action_hash)
+                .filter(|_| rng.next().is_multiple_of(4))
+                .collect();
+            pool.remove_committed(&victims);
+            fill(&mut pool, &mut rng, 1_000);
+            pool.assert_index_consistent();
+
+            let want = reference_cancel_order(&pool);
+            let in_flight: HashSet<B256> = pool
+                .entries
+                .values()
+                .map(|e| e.action_hash)
+                .filter(|_| rng.next().is_multiple_of(6))
+                .collect();
+            let want_live: Vec<SortKey> = want
+                .iter()
+                .filter(|k| !in_flight.contains(&pool.entries[k].action_hash))
+                .copied()
+                .collect();
+            for pct in [0u8, 25, 60, 100] {
+                pool.set_cancel_share_pct(pct);
+                for limit in [1, 4, 17, 40, 80, 400] {
+                    let sel = pool.select_for_block_with_senders_excluding(
+                        limit,
+                        &in_flight,
+                        usize::MAX,
+                        usize::MAX,
+                    );
+                    let cancels: Vec<SortKey> = keys_of(&pool, &sel)
+                        .into_iter()
+                        .filter(|k| k.0 == PRIO_CANCEL)
+                        .collect();
+                    assert_eq!(
+                        cancels,
+                        want_live[..cancels.len()],
+                        "seed {seed} pct {pct} limit {limit}"
+                    );
+                    let mut last: HashMap<Address, (u64, u64)> = HashMap::new();
+                    for k in &cancels {
+                        if let Some(prev) = last.insert(k.1, (k.2, k.3)) {
+                            assert!(prev < (k.2, k.3), "seed {seed}: {k:?} after {prev:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// (ii) Non-cancels keep their (priority, sender, nonce) order whatever
+    /// order the cancels arrive in: oracle submissions, then normal entries
+    /// by sender then nonce.
+    #[test]
+    fn non_cancel_order_is_unchanged_by_oldest_first_cancels() {
+        let mut pool = NativePool::new(1_000, 64, 64);
+        pool.set_cancel_share_pct(25);
+        let mut rng = Lcg(7);
+        // (priority, sender, nonce) of every admitted non-cancel, in arrival
+        // order; a STABLE sort of it is the pre-s114 non-cancel order.
+        let mut others: Vec<(u8, Address, u64)> = Vec::new();
+        for i in 0..60u64 {
+            let sender = Address::repeat_byte(1 + (rng.next() % 9) as u8);
+            let nonce = rng.next() % 1_000;
+            let action = match i % 4 {
+                0 => make_action(
+                    nonce,
+                    NativeAction::CancelOrder {
+                        order_id: u128::from(i),
+                    },
+                ),
+                1 => oracle(nonce),
+                _ => make_action(nonce, NativeAction::ClaimRewards),
+            };
+            let prio = priority_class(&action.action);
+            if pool.insert(sender, action).is_ok() && prio != PRIO_CANCEL {
+                others.push((prio, sender, nonce));
+            }
+        }
+        others.sort_by_key(|&(p, s, n)| (p, s, n));
+        assert!(others.iter().any(|o| o.0 == PRIO_ORACLE));
+        let sel = pool.select_for_block_with_senders(pool.size());
+        assert_eq!(sel.len(), pool.size());
+        let got: Vec<(u8, Address, u64)> = sel
+            .iter()
+            .map(|(s, a)| (priority_class(&a.action), *s, a.nonce))
+            .filter(|o| o.0 != PRIO_CANCEL)
+            .collect();
+        assert_eq!(got, others);
+    }
+
+    /// (iii) Phase 3 is unchanged in WHEN it runs (only with free slots
+    /// after phase 2, never after a budget stop) and continues the same
+    /// oldest-first order after the share. Cancels arrive from the highest
+    /// address down, so oldest-first and sender order disagree everywhere.
+    #[test]
+    fn leftover_cancels_continue_oldest_first_only_when_slots_remain() {
+        let build = |orders: u8| {
+            let mut pool = NativePool::new(1_000, 64, 16);
+            pool.set_cancel_share_pct(25);
+            for i in 0..30u8 {
+                pool.insert(
+                    Address::repeat_byte(30 - i),
+                    make_action(
+                        2_000 + u64::from(i),
+                        NativeAction::CancelAllOrders { market_id: None },
+                    ),
+                )
+                .unwrap();
+            }
+            for i in 0..orders {
+                pool.insert(
+                    Address::repeat_byte(100 + i),
+                    make_action(1_000 + u64::from(i), NativeAction::ClaimRewards),
+                )
+                .unwrap();
+            }
+            pool
+        };
+        let senders = |sel: &[(Address, SignedNativeAction)]| -> Vec<u8> {
+            sel.iter().map(|(s, _)| s.0[0]).collect()
+        };
+        let pool = build(3);
+        // Share: the 5 oldest; then the 3 orders; then the next 12 oldest.
+        let sel = pool.select_for_block_with_senders(20);
+        let mut want: Vec<u8> = (26..=30).rev().collect();
+        want.extend([100, 101, 102]);
+        want.extend((14..=25).rev());
+        assert_eq!(senders(&sel), want);
+        // An order-budget stop in phase 2 ends selection: no phase 3.
+        let sel = pool.select_for_block_with_senders_excluding(20, &HashSet::new(), usize::MAX, 7);
+        assert_eq!(senders(&sel), vec![30, 29, 28, 27, 26, 100, 101]);
+        // A block filled by orders: the share only, the 5 oldest.
+        let sel = build(30).select_for_block_with_senders(20);
+        let mut want: Vec<u8> = (26..=30).rev().collect();
+        want.extend(100..115);
+        assert_eq!(senders(&sel), want);
+    }
+
+    /// (iv) Identical insert sequences give identical selections, at every
+    /// share and limit, and selection is repeatable on the same pool.
+    #[test]
+    fn cancel_selection_is_deterministic_across_identical_pools() {
+        let build = || {
+            let mut rng = Lcg(42);
+            let mut pool = NativePool::new(10_000, 512, 8);
+            for i in 0..300u64 {
+                let sender = Address::repeat_byte(1 + (rng.next() % 11) as u8);
+                let nonce = rng.next() % 100;
+                let action = if rng.next().is_multiple_of(3) {
+                    NativeAction::ClaimRewards
+                } else {
+                    NativeAction::CancelOrder {
+                        order_id: u128::from(i),
+                    }
+                };
+                let _ = pool.insert(sender, make_action(nonce, action));
+            }
+            pool
+        };
+        let ids = |pool: &NativePool, limit| -> Vec<(Address, B256)> {
+            pool.select_for_block_with_senders(limit)
+                .iter()
+                .map(|(s, a)| (*s, compute_action_hash(a)))
+                .collect()
+        };
+        let (mut x, mut y) = (build(), build());
+        for pct in [0u8, 25, 100] {
+            x.set_cancel_share_pct(pct);
+            y.set_cancel_share_pct(pct);
+            for limit in [3, 25, 64, 500] {
+                let sx = ids(&x, limit);
+                assert_eq!(sx, ids(&y, limit));
+                assert_eq!(sx, ids(&x, limit));
+            }
+        }
     }
 
     #[test]
