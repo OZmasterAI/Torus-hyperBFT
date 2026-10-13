@@ -25106,6 +25106,9 @@ mod crash_recovery_tests {
             dispatch_and_execute(&ctx, &db, b);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst));
             assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            // Codex review: let the dropper retire the previous view first
+            // (a late dropper could otherwise hold two at the last gauge).
+            settle(2);
         }
         let (_, _, g_views, g_age) = retention_gauges(&ctx);
         assert!(
