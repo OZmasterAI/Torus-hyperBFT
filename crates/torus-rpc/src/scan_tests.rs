@@ -621,7 +621,10 @@ async fn packed_user_trade_rows_are_charged_by_size_before_decoding() {
         }
         state.put_cf_raw(cf, key, value).unwrap();
     }
-    assert!(row_bytes > 100 * CLASSIC_BLOB_BYTES_PER_ROW, "{row_bytes} B");
+    assert!(
+        row_bytes > 100 * CLASSIC_BLOB_BYTES_PER_ROW,
+        "{row_bytes} B"
+    );
 
     for market in [Some("0x1".to_string()), None] {
         let s = server(&state, 100);
@@ -691,7 +694,11 @@ fn level_book_sides_are_read_from_one_snapshot() {
     };
     for (side, p) in levels(true) {
         state
-            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &level_row_key(1, side, fp(p)), &level_value())
+            .put_cf_raw(
+                CF_NATIVE_ORDER_BOOKS,
+                &level_row_key(1, side, fp(p)),
+                &level_value(),
+            )
             .unwrap();
     }
     let run = Arc::new(AtomicBool::new(true));
@@ -769,6 +776,9 @@ async fn a_corrupt_meta_row_is_an_error_not_an_empty_book() {
             .get_open_orders(hex_addr(addr(MAKER)), Some("0x1".into()))
             .await
             .unwrap_err();
-        assert!(e.message().contains(&want), "mode {mode} open orders: {e:?}");
+        assert!(
+            e.message().contains(&want),
+            "mode {mode} open orders: {e:?}"
+        );
     }
 }

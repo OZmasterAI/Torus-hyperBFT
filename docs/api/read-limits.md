@@ -12,10 +12,24 @@ unset, empty, unparsable or `0` value uses the default. It is read once at
 startup. `RpcServer::set_max_scan_rows` overrides it in embedded use.
 
 A row is one key that the RocksDB iterator returns, or one seek. A row counts
-even when the read filters it out, because reading it costs the same. A classic
-whole-book blob (`TORUS_BOOK_ROWS` unset) counts as one row per started 128
-bytes (about one order). It is charged before it is decoded, because it cannot
-be read in part.
+even when the read filters it out, because reading it costs the same. A value
+that packs many records under one key counts as one row per started 128 bytes
+(about one order), charged before it is decoded, because it cannot be read in
+part. Two kinds of value are charged this way: a classic whole-book blob
+(`TORUS_BOOK_ROWS` unset), and a packed user-trade row, which holds all of a
+trader's fills in one block.
+
+## Book layout detection
+
+Every book read (`torus_getOrderBook`, `torus_getOpenOrders`,
+`torus_getOrderByCloid`, `torus_getUserLimits`, `torus_getMarkPrice`) first
+finds the layout on disk, and that work counts toward the same limit. If the
+`__book_mode__` marker row exists, reading it is one row. Every executor save
+writes the marker. A DB without the marker has not been saved by a current
+executor, so the read checks the shape of every key in the book column family
+(one row each), then makes one seek in the node-local order store. On such a DB
+a large book can make every book read return `-32005`. The RPC never writes the
+marker: reads do not change state.
 
 A read that would go past the limit stops and returns:
 
@@ -31,13 +45,13 @@ never a silently short list.
 
 | Method | Rows read |
 |---|---|
-| `torus_getOrderBook(marketId, depth?)` | Returns `depth` levels per side, best first. The default and maximum are `1000`. Level rows (`TORUS_BOOK_ROWS=2/3`): one seek per side, at most `depth` rows each. Order rows (`=1`): every order of the market. Classic: the market's blob. |
+| `torus_getOrderBook(marketId, depth?)` | Returns `depth` levels per side, best first. The default and maximum are `1000`. Level rows (`TORUS_BOOK_ROWS=2/3`): one seek per side, at most `depth` rows each. Order rows (`=1`): every order of the market. Classic: the market's blob. Under the row layouts the meta row and both sides come from one RocksDB snapshot, so a book that is never crossed on disk is never returned crossed. A meta row that does not decode is an error, not an empty book. |
 | `torus_getOpenOrders(trader, marketId?)` | With `marketId`: that market's orders only. Without it: markets in id order, one seek per market. Stops at 5000 orders or the scan limit. |
 | `torus_getOrderByCloid(trader, cloid)` | Stops at the first hit. Pending stops are read first (row layouts), then resting orders. A miss reads every order. |
 | `torus_getUserLimits(trader)` | Every order row and stop row. There is no per-trader index. |
 | `torus_getOpenInterest(marketId)` | Every position row. Positions are keyed `trader ‖ market`, with no market index. |
 | `torus_getProposals(status?)` | Every proposal row. |
-| `torus_getUserTrades(trader, marketId?, limit?)` | The trader's rows, newest first, until `limit` fills are found. A `marketId` filter skips rows, and those skipped rows count toward the limit. |
+| `torus_getUserTrades(trader, marketId?, limit?)` | The trader's rows, newest first, until `limit` fills are found. Each row (one block's fills) counts by size, as above. A `marketId` filter skips rows, and those skipped rows count toward the limit. |
 
 `torus_getTradeHistory`, `torus_getTradeHistoryRange`, `torus_getBlockTrades`,
 `torus_getMarkets`, `eth_getLogs` (a 10,000-block range and 10,000 logs) and
@@ -60,3 +74,6 @@ These reads stay proportional to the table until an index exists:
   and from trader and cloid to order. The executor keeps both in memory only.
 - `torus_getOrderBook` under order rows (`TORUS_BOOK_ROWS=1`): a price index.
   Level rows (`=2/3`) already provide one.
+- Book layout detection on a DB without the `__book_mode__` marker: write the
+  marker once, from a write path such as a startup migration or the next
+  executor save, never from an RPC. After that, detection is one row.

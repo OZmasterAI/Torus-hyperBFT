@@ -995,10 +995,13 @@ fn row_levels(levels: Vec<book_reader::DepthLevel>) -> Vec<RpcPriceLevel> {
 }
 
 /// The layout actually on disk. Never derived from this process's env — an RPC
-/// node must serve whatever the DB holds.
-fn book_layout(state: &torus_state::StateDb) -> Result<BookLayout, ErrorObjectOwned> {
-    book_reader::detect_layout(state)
-        .map_err(|e| ErrorObjectOwned::from(RpcError::Internal(e.to_string())))
+/// node must serve whatever the DB holds. R24: charged to the request's scan
+/// budget (a DB without the layout marker is sniffed over the whole book CF).
+fn book_layout(
+    state: &torus_state::StateDb,
+    budget: &mut scan::ScanBudget,
+) -> Result<BookLayout, ErrorObjectOwned> {
+    scan::detect_layout(state, budget).map_err(ErrorObjectOwned::from)
 }
 
 fn book_read_err(e: torus_core::error::CoreError) -> ErrorObjectOwned {
@@ -1031,7 +1034,7 @@ impl TorusApiServer for RpcState {
         // handler used to do — silently returns an EMPTY book on a mode-1/2
         // node. Serve what is on disk, and error rather than fake an empty
         // book when the layout cannot be decoded.
-        let layout = book_layout(&self.state)?;
+        let layout = book_layout(&self.state, &mut budget)?;
         let (bids, asks) = if layout.is_rows() {
             let levels = scan::row_book_depth(&self.state, mid, layout, depth, &mut budget)
                 .map_err(ErrorObjectOwned::from)?;
@@ -1194,10 +1197,10 @@ impl TorusApiServer for RpcState {
         let cum_volume = PositionManager::new(self.state.clone())
             .get_cum_volume(&addr)
             .map_err(book_read_err)?;
-        let layout = book_layout(&self.state)?;
-        let open_orders =
-            scan::count_open_orders(&self.state, &addr, layout, &mut self.scan_budget())
-                .map_err(ErrorObjectOwned::from)?;
+        let mut budget = self.scan_budget();
+        let layout = book_layout(&self.state, &mut budget)?;
+        let open_orders = scan::count_open_orders(&self.state, &addr, layout, &mut budget)
+            .map_err(ErrorObjectOwned::from)?;
         Ok(RpcUserLimits {
             open_orders: open_orders as u64,
             open_order_limit: open_order_limit(cum_volume),
@@ -1921,14 +1924,15 @@ impl TorusApiServer for RpcState {
         // Every layout (classic blobs, order rows in the root CF, the mode-2
         // node-local order store). R24: one market reads only that market;
         // all markets stop at OPEN_ORDERS_LIMIT orders or the scan budget.
-        let layout = book_layout(&self.state)?;
+        let mut budget = self.scan_budget();
+        let layout = book_layout(&self.state, &mut budget)?;
         let mut orders = Vec::new();
         scan::trader_orders(
             &self.state,
             &trader_addr,
             market,
             layout,
-            &mut self.scan_budget(),
+            &mut budget,
             |mid, order| {
                 orders.push(order_to_rpc(&order, mid));
                 if orders.len() >= OPEN_ORDERS_LIMIT {
@@ -1950,11 +1954,11 @@ impl TorusApiServer for RpcState {
         let trader = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
         let cloid = torus_types::cloid_serde::from_hex(&cloid)
             .map_err(|e| ErrorObjectOwned::from(RpcError::InvalidParams(e)))?;
-        let layout = book_layout(&self.state)?;
         // R24: stops at the first hit or the scan budget.
-        let found =
-            scan::find_by_cloid(&self.state, &trader, cloid, layout, &mut self.scan_budget())
-                .map_err(ErrorObjectOwned::from)?;
+        let mut budget = self.scan_budget();
+        let layout = book_layout(&self.state, &mut budget)?;
+        let found = scan::find_by_cloid(&self.state, &trader, cloid, layout, &mut budget)
+            .map_err(ErrorObjectOwned::from)?;
         Ok(found.map(|hit| match hit {
             book_reader::CloidOrder::Resting(mid, order) => RpcOrderByCloid {
                 status: "open".to_string(),
@@ -1995,7 +1999,7 @@ impl TorusApiServer for RpcState {
         // in the meta row's `ltp_tag` / `ltp_raw` suffix — reading only the
         // classic blob key reported 0 for every traded market on a mode-1/2
         // node.
-        let layout = book_layout(&self.state)?;
+        let layout = book_layout(&self.state, &mut self.scan_budget())?;
         let last_trade_price = if layout.is_rows() {
             book_reader::read_last_trade_price(&self.state, mid, layout)
                 .map_err(book_read_err)?
@@ -2050,6 +2054,8 @@ impl TorusApiServer for RpcState {
 
             // Each row holds the trader's fills in one block, in trade_index order.
             // R24: a market filter can skip many rows; the scan budget bounds them.
+            // A row is charged by its size before it is decoded (one block can
+            // pack many fills), as a classic book blob is.
             let mut budget = self.scan_budget();
             let mut trades = Vec::with_capacity(limit.min(256));
             'rows: for item in iter {
@@ -2059,7 +2065,9 @@ impl TorusApiServer for RpcState {
                 if !key.starts_with(prefix) {
                     break;
                 }
-                budget.step().map_err(ErrorObjectOwned::from)?;
+                budget
+                    .step_n(scan::packed_rows(value.len()))
+                    .map_err(ErrorObjectOwned::from)?;
                 // Skip an undecodable row (e.g. leftover old format), as above.
                 let decoded = parse_user_trade_key(&key)
                     .ok_or_else(|| format!("key length {}", key.len()))

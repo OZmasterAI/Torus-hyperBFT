@@ -48,7 +48,7 @@
 | Variable | Description |
 |----------|-------------|
 | `RUST_LOG` | Overridden by `--log-level`. Controls tracing filter. Examples: `info`, `torus_consensus=debug,info`, `trace`. |
-| `TORUS_RPC_MAX_SCAN_ROWS` | The maximum number of rows one public read RPC may read before it stops with `-32005` (R24). Default `250000`. An unset, empty, unparsable or `0` value uses the default. Read once at startup. Applies to `torus_getOpenInterest`, `torus_getUserLimits`, `torus_getOpenOrders`, `torus_getOrderByCloid`, `torus_getOrderBook`, `torus_getProposals` and `torus_getUserTrades`. Lower it on public RPC nodes. See `docs/api/read-limits.md`. |
+| `TORUS_RPC_MAX_SCAN_ROWS` | The maximum number of rows one public read RPC may read before it stops with `-32005` (R24). Default `250000`. An unset, empty, unparsable or `0` value uses the default. Read once at startup. Applies to `torus_getOpenInterest`, `torus_getUserLimits`, `torus_getOpenOrders`, `torus_getOrderByCloid`, `torus_getOrderBook`, `torus_getProposals` and `torus_getUserTrades`, and to the book layout detection of `torus_getMarkPrice`. Classic book blobs and packed user-trade rows count one row per 128 bytes. Lower it on public RPC nodes. See `docs/api/read-limits.md`. |
 | `TORUS_ALL_MARKET_TRADES` | Allows all-markets `newTrades` WebSocket subscriptions (no `marketId`). Unset: allowed only on `--rpc-only` nodes, rejected with `-32602` on validators. `1`: allowed. `0`: rejected. Any other value logs a warning and uses the default. Read once at startup. Per-market `newTrades` and `userFills` are always allowed. See `docs/api/streams.md`. |
 
 ## Port Assignments

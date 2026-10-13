@@ -15,15 +15,20 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use borsh::BorshDeserialize;
-use torus_core::book_reader::{self, BookDepth, BookLayout, CloidOrder};
-use torus_core::book_rows::{
-    book_meta_key, ROW_TAG_LEVEL, ROW_TAG_ORDER, ROW_TAG_STOP, SIDE_TAG_ASK, SIDE_TAG_BID,
+use torus_core::book_reader::{
+    self, BookDepth, BookLayout, CloidOrder, LayoutSniff, BOOK_MODE_MARKER_KEY,
 };
+use torus_core::book_rows::{
+    book_meta_key, BookMetaRow, ROW_TAG_LEVEL, ROW_TAG_ORDER, ROW_TAG_STOP, SIDE_TAG_ASK,
+    SIDE_TAG_BID,
+};
+use torus_core::error::CoreError;
 use torus_core::order_book::{Order, OrderBook, StopOrder};
 use torus_core::position::Position;
 use torus_economics::governance::{Proposal, ProposalStatus};
 use torus_state::cf::{
-    CF_BOOK_ORDER_ROWS, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
+    CF_BOOK_ORDER_ROWS, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
+    CF_NATIVE_POSITIONS,
 };
 use torus_state::StateDb;
 use torus_types::{Address, Cloid, FixedPoint, MarketId};
@@ -109,7 +114,8 @@ impl RpcState {
 // Bounded readers
 // ---------------------------------------------------------------------------
 
-/// A classic whole-book blob is charged one row per started
+/// A value that holds many records under one key (a classic whole-book blob,
+/// a packed user-trade row) is charged one row per started
 /// `CLASSIC_BLOB_BYTES_PER_ROW` bytes (about one order), before it is decoded:
 /// its size is the work, and it cannot be read in part.
 pub(crate) const CLASSIC_BLOB_BYTES_PER_ROW: usize = 128;
@@ -122,8 +128,14 @@ fn internal(msg: impl Into<String>) -> RpcError {
     RpcError::Internal(msg.into())
 }
 
-/// Rows charged for a classic blob of `len` bytes.
-fn classic_rows(len: usize) -> usize {
+/// A book reader error, as the unbounded readers report it.
+fn core(e: CoreError) -> RpcError {
+    RpcError::Internal(e.to_string())
+}
+
+/// Rows charged for a packed value (classic blob, packed user-trade row) of
+/// `len` bytes.
+pub(crate) fn packed_rows(len: usize) -> usize {
     len.div_ceil(CLASSIC_BLOB_BYTES_PER_ROW).max(1)
 }
 
@@ -149,11 +161,17 @@ fn done(walk: Result<Flow, RpcError>) -> Result<(), RpcError> {
     walk.map(drop)
 }
 
+/// One RocksDB snapshot shared by the reads of one answer (`None` = each
+/// read sees the latest commit).
+type Snap<'a, 's> = Option<&'a rocksdb::Snapshot<'s>>;
+
 /// The rows of `cf` under `prefix` (empty = the whole CF), in key order, each
 /// charged to `b` BEFORE `visit` sees it; `visit` may stop early. A missing
 /// CF (older DB) has no rows. RocksDB gets an upper bound at the prefix end.
+/// `snap` = read as of that snapshot.
 fn for_each_prefixed(
     state: &StateDb,
+    snap: Snap<'_, '_>,
     cf: &str,
     prefix: &[u8],
     b: &mut ScanBudget,
@@ -163,7 +181,11 @@ fn for_each_prefixed(
         return Ok(GO);
     };
     let db = state.inner();
-    let mut it = db.raw_iterator_cf_opt(handle, torus_state::db::prefix_read_opts(prefix));
+    let mut ro = torus_state::db::prefix_read_opts(prefix);
+    if let Some(snap) = snap {
+        ro.set_snapshot(snap);
+    }
+    let mut it = db.raw_iterator_cf_opt(handle, ro);
     it.seek(prefix);
     while let (Some(key), Some(value)) = (it.key(), it.value()) {
         if !key.starts_with(prefix) {
@@ -186,9 +208,23 @@ fn first_key(
     prefix: &[u8],
     b: &mut ScanBudget,
 ) -> Result<Option<Vec<u8>>, RpcError> {
+    Ok(first_row(state, None, cf, prefix, b)?.map(|(k, _)| k))
+}
+
+/// One `(key, value)` row.
+type KeyValue = (Vec<u8>, Vec<u8>);
+
+/// The first row of `cf` under `prefix` (one seek, charged).
+fn first_row(
+    state: &StateDb,
+    snap: Snap<'_, '_>,
+    cf: &str,
+    prefix: &[u8],
+    b: &mut ScanBudget,
+) -> Result<Option<KeyValue>, RpcError> {
     let mut first = None;
-    done(for_each_prefixed(state, cf, prefix, b, |k, _, _| {
-        first = Some(k.to_vec());
+    done(for_each_prefixed(state, snap, cf, prefix, b, |k, v, _| {
+        first = Some((k.to_vec(), v.to_vec()));
         Ok(STOP)
     }))?;
     if first.is_none() {
@@ -196,6 +232,32 @@ fn first_key(
         b.step()?;
     }
     Ok(first)
+}
+
+/// The book layout on disk (`book_reader::detect_layout`), charged to `b`:
+/// the `__book_mode__` marker is one read; a DB without the marker is
+/// sniffed key by key over the whole book CF (each key charged), then one
+/// seek of the node-local order store. No state is written (follow-up: a
+/// persisted marker on marker-less DBs).
+pub(crate) fn detect_layout(state: &StateDb, b: &mut ScanBudget) -> Result<BookLayout, RpcError> {
+    b.step()?;
+    if let Some(bytes) = state.get_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY)? {
+        return book_reader::layout_from_marker(&bytes).map_err(core);
+    }
+    let mut sniff = LayoutSniff::default();
+    done(for_each_prefixed(
+        state,
+        None,
+        CF_NATIVE_ORDER_BOOKS,
+        &[],
+        b,
+        |k, _, _| {
+            sniff.observe(k).map_err(core)?;
+            Ok(GO)
+        },
+    ))?;
+    let store_nonempty = first_key(state, CF_BOOK_ORDER_ROWS, &[], b)?.is_some();
+    sniff.finish(store_nonempty).map_err(core)
 }
 
 /// Every market with a row in the book root CF, ascending: one seek per
@@ -232,17 +294,27 @@ fn for_each_book_market(
 
 /// One market of a row layout (`book_reader`'s meta-row rule, by one seek:
 /// the meta row `market ‖ 0x00` sorts first under the market prefix, right
-/// after a classic blob's 8-byte key). `false` = no book. A classic blob
-/// under a row layout, or rows without a meta row, is an error (never a
-/// silently empty book).
-fn row_market_exists(state: &StateDb, mid: MarketId, b: &mut ScanBudget) -> Result<bool, RpcError> {
-    match first_key(state, CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes(), b)? {
+/// after a classic blob's 8-byte key). `false` = no book. A meta row that
+/// does not decode (`BookCorrupt`, as `book_reader` reports it), a classic
+/// blob under a row layout, or rows without a meta row, is an error (never
+/// a silently empty book).
+fn row_market_exists(
+    state: &StateDb,
+    snap: Snap<'_, '_>,
+    mid: MarketId,
+    b: &mut ScanBudget,
+) -> Result<bool, RpcError> {
+    match first_row(state, snap, CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes(), b)? {
         None => Ok(false),
-        Some(k) if k.len() == 8 => Err(internal(format!(
+        Some((k, _)) if k.len() == 8 => Err(internal(format!(
             "market {mid}: cf_native_order_books holds a classic whole-book blob under a \
              row layout — the book CF is corrupt (a layout change needs a fresh genesis)"
         ))),
-        Some(k) if k[..] == book_meta_key(mid)[..] => Ok(true),
+        Some((k, v)) if k[..] == book_meta_key(mid)[..] => {
+            BookMetaRow::decode(&v)
+                .map_err(|e| core(CoreError::BookCorrupt(format!("market {mid}: {e}"))))?;
+            Ok(true)
+        }
         Some(_) => Err(internal(format!(
             "market {mid} has order/stop/level rows but no meta row (corrupt row store) — \
              refusing to serve a partial book"
@@ -271,17 +343,17 @@ fn for_each_classic_book(
             match state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())? {
                 None => Ok(GO),
                 Some(blob) => {
-                    b.step_n(classic_rows(blob.len()))?;
+                    b.step_n(packed_rows(blob.len()))?;
                     visit(mid, decode(mid, &blob)?)
                 }
             }
         }
-        None => for_each_prefixed(state, CF_NATIVE_ORDER_BOOKS, &[], b, |k, v, b| {
+        None => for_each_prefixed(state, None, CF_NATIVE_ORDER_BOOKS, &[], b, |k, v, b| {
             let Ok(key) = <[u8; 8]>::try_from(k) else {
                 return Ok(GO);
             };
             let mid = u64::from_be_bytes(key);
-            b.step_n(classic_rows(v.len()))?;
+            b.step_n(packed_rows(v.len()))?;
             visit(mid, decode(mid, v)?)
         }),
     }
@@ -318,7 +390,7 @@ fn row_market_orders(
         )?
         .is_some();
     let mut saw_row = false;
-    let flow = for_each_prefixed(state, cf, &prefix, b, |key, row, _| {
+    let flow = for_each_prefixed(state, None, cf, &prefix, b, |key, row, _| {
         saw_row = true;
         if key.len() != 25 || key[8] != ROW_TAG_ORDER {
             if level_store {
@@ -378,7 +450,7 @@ pub(crate) fn trader_orders(
     }
     match market {
         Some(mid) => {
-            if !row_market_exists(state, mid, b)? {
+            if !row_market_exists(state, None, mid, b)? {
                 return Ok(());
             }
             done(row_market_orders(state, trader, mid, layout, b, &mut visit))
@@ -399,18 +471,26 @@ fn row_trader_stops(
 ) -> Result<Flow, RpcError> {
     for_each_book_market(state, b, |mid, b| {
         let prefix = [&mid.to_be_bytes()[..], &[ROW_TAG_STOP]].concat();
-        for_each_prefixed(state, CF_NATIVE_ORDER_BOOKS, &prefix, b, |key, row, _| {
-            if key.len() != 25 {
-                return Ok(GO);
-            }
-            let stop = OrderBook::decode_stop_row(row)
-                .map_err(|e| internal(format!("market {mid}: stop row does not decode: {e}")))?;
-            Ok(if stop.trader == *trader {
-                visit(mid, stop)
-            } else {
-                GO
-            })
-        })
+        for_each_prefixed(
+            state,
+            None,
+            CF_NATIVE_ORDER_BOOKS,
+            &prefix,
+            b,
+            |key, row, _| {
+                if key.len() != 25 {
+                    return Ok(GO);
+                }
+                let stop = OrderBook::decode_stop_row(row).map_err(|e| {
+                    internal(format!("market {mid}: stop row does not decode: {e}"))
+                })?;
+                Ok(if stop.trader == *trader {
+                    visit(mid, stop)
+                } else {
+                    GO
+                })
+            },
+        )
     })
 }
 
@@ -494,7 +574,9 @@ pub(crate) fn find_by_cloid(
 
 /// `torus_getOrderBook` under a row layout: at most `depth` levels per side,
 /// best first. Mode 2 reads only those level rows (two bounded seeks); mode 1
-/// has no price index, so every order row of the market is aggregated.
+/// has no price index, so every order row of the market is aggregated. The
+/// meta row and both sides are read from ONE snapshot, so a commit that
+/// moves both sides is seen whole or not at all (never a crossed book).
 pub(crate) fn row_book_depth(
     state: &StateDb,
     mid: MarketId,
@@ -502,16 +584,19 @@ pub(crate) fn row_book_depth(
     depth: usize,
     b: &mut ScanBudget,
 ) -> Result<BookDepth, RpcError> {
-    if !row_market_exists(state, mid, b)? {
+    let snapshot = state.inner().snapshot();
+    let snap = Some(&snapshot);
+    if !row_market_exists(state, snap, mid, b)? {
         return Ok(BookDepth::default());
     }
-    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut rows: Vec<KeyValue> = Vec::new();
     if layout == BookLayout::LevelAuthority {
         for side in [SIDE_TAG_BID, SIDE_TAG_ASK] {
             let prefix = [&mid.to_be_bytes()[..], &[ROW_TAG_LEVEL, side]].concat();
             let mut n = 0;
             done(for_each_prefixed(
                 state,
+                snap,
                 CF_NATIVE_ORDER_BOOKS,
                 &prefix,
                 b,
@@ -532,6 +617,7 @@ pub(crate) fn row_book_depth(
         let prefix = [&mid.to_be_bytes()[..], &[ROW_TAG_ORDER]].concat();
         done(for_each_prefixed(
             state,
+            snap,
             CF_NATIVE_ORDER_BOOKS,
             &prefix,
             b,
@@ -558,7 +644,7 @@ pub(crate) fn classic_blob(
     b.step()?;
     let blob = state.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())?;
     if let Some(blob) = &blob {
-        b.step_n(classic_rows(blob.len()))?;
+        b.step_n(packed_rows(blob.len()))?;
     }
     Ok(blob)
 }
@@ -575,6 +661,7 @@ pub(crate) fn open_interest(
     let want = mid.to_be_bytes();
     done(for_each_prefixed(
         state,
+        None,
         CF_NATIVE_POSITIONS,
         &[],
         b,
@@ -604,6 +691,7 @@ pub(crate) fn proposals(
     let mut out = Vec::new();
     done(for_each_prefixed(
         state,
+        None,
         CF_GOVERNANCE_PROPOSALS,
         &[],
         b,
