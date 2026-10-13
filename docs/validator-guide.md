@@ -142,3 +142,9 @@ Validators can rotate their Ed25519 consensus key:
 - [ ] Alerting rules configured (see `monitoring/alerts/`)
 - [ ] Disk space monitored (consider `--retention-blocks` for non-archive nodes)
 - [ ] Node time synchronized (NTP)
+- [ ] Stop grace period longer than `TORUS_SHUTDOWN_TIMEOUT_SECS` (default
+      60 s), e.g. 75 s: Docker `stop -t 75` / Compose `stop_grace_period`,
+      Kubernetes `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`.
+      The defaults of Docker (10 s) and Kubernetes (30 s) kill the node before
+      its clean shutdown ends. See "Stopping the Node" in the
+      [Node Operator Guide](node-operator-guide.md#stopping-the-node).

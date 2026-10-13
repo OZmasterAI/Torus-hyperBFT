@@ -203,15 +203,24 @@ pub(crate) enum Command {
         /// Reduce-only
         #[arg(long, default_value = "false")]
         reduce_only: bool,
-        /// Client-supplied order id
-        #[arg(long)]
-        client_id: Option<u64>,
+        /// Client order id (cloid, u128): 0x + up to 32 hex digits, or decimal
+        #[arg(long, value_parser = commands::trading::parse_cloid)]
+        client_id: Option<u128>,
     },
     /// Cancel an order by id
     CancelOrder {
         /// Order ID (u128)
         #[arg(long)]
         order_id: u128,
+    },
+    /// Cancel your open order (resting or a pending stop) by its client order id
+    CancelByCloid {
+        /// Market ID
+        #[arg(long)]
+        market: u64,
+        /// Client order id: 0x + up to 32 hex digits, or decimal
+        #[arg(long, value_parser = commands::trading::parse_cloid)]
+        cloid: u128,
     },
     /// Cancel all orders (in one market or across all markets)
     CancelAll {
@@ -460,6 +469,9 @@ async fn main() {
         }
         Command::CancelOrder { order_id } => {
             commands::trading::cmd_cancel_order(&cli, &rpc, *order_id).await
+        }
+        Command::CancelByCloid { market, cloid } => {
+            commands::trading::cmd_cancel_by_cloid(&cli, &rpc, *market, *cloid).await
         }
         Command::CancelAll { market, .. } => {
             commands::trading::cmd_cancel_all(&cli, &rpc, *market).await

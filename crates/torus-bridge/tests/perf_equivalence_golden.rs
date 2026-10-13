@@ -895,3 +895,49 @@ fn golden_repins_change_only_rule_h_and_p2_rows() {
     let blocks = scenario_b(&db);
     check("REDUCED_B", &run_all(&db, &blocks, None, R::Off)[2], &REDUCED_B);
 }
+
+/// P2-3 (worker pool): matching, settle pass A and `end_resident` run on
+/// long-lived threads, so a run of native blocks spawns no thread per block
+/// at those sites (exact: counted for this test's thread only; the
+/// end-resident thread starts once per holder). The digests (every hashed
+/// CF, the native state root, the running hash, results, metrics) stay the
+/// ones pinned on the spawning code, at several worker caps, R on (worker
+/// and inline) and off.
+#[test]
+fn pooled_engine_spawns_nothing_per_block_and_keeps_the_digests() {
+    use torus_state::spawn_count::{thread_totals, SpawnSite};
+    for threads in [2usize, 4, 32] {
+        for r in R_MODES {
+            let markets: Vec<MarketId> = (1..=A_MARKETS).collect();
+            let (_d, db) = listed_db(&markets);
+            let blocks = scenario_a(&db);
+            let before = thread_totals();
+            let (digests, pre_row50, row50_out) = run(&db, &blocks, Some(threads), r);
+            let after = thread_totals();
+            check("PRE_ROW50_A", &pre_row50, &PRE_ROW50_A);
+            check("ROW50_OUT_A", &row50_out, &ROW50_OUT_A);
+            check("GOLDEN_A", &digests, &GOLDEN_A);
+            let spawned = |s: SpawnSite| after[s as usize] - before[s as usize];
+            assert_eq!(
+                spawned(SpawnSite::Match),
+                0,
+                "threads={threads} {r:?}: match spawned per block"
+            );
+            assert_eq!(
+                spawned(SpawnSite::Settle),
+                0,
+                "threads={threads} {r:?}: settle spawned per block"
+            );
+            assert!(
+                spawned(SpawnSite::EndResident) <= 1,
+                "threads={threads} {r:?}: end_resident spawned {} threads for {} blocks",
+                spawned(SpawnSite::EndResident),
+                blocks.len()
+            );
+        }
+        let (_d, db) = listed_db(&[1, 2, 3]);
+        let blocks = scenario_b(&db);
+        let (digests, _, _) = run(&db, &blocks, Some(threads), R::Worker);
+        check("GOLDEN_B", &digests, &GOLDEN_B);
+    }
+}

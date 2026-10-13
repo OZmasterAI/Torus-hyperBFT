@@ -2191,6 +2191,18 @@ impl ExecutionContext {
                             )
                         }
                     };
+                    // s114 (CoreWriter follow-up 1): the node-local link of
+                    // each queued row to its EVM tx rides the same batch as
+                    // the row itself (nothing when the block queued nothing).
+                    let built = built.and_then(|mut batch| {
+                        torus_state::corewriter_tx::append_links(
+                            &self.state_db,
+                            &mut batch,
+                            &validated.core_writer_links,
+                        )
+                        .map_err(torus_bridge::BridgeError::from)?;
+                        Ok(batch)
+                    });
                     match built {
                         Ok(batch) => {
                             bundle_extras.add_evm_bundle(&validated.bundle);
@@ -17973,6 +17985,124 @@ mod crash_recovery_tests {
         assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)));
     }
 
+    /// s114 (CoreWriter follow-up 1): block 1's EVM txs queue CoreWriter rows
+    /// for block 2 (one call, a reverted call, two calls in one tx); the
+    /// committed-block path writes one `CF_CORE_WRITER_TX` row per queued
+    /// row, keyed like the queue row (2, seq), holding the queuing tx's hash
+    /// and the call's index within it. Block 2's plain transfer queues
+    /// nothing and links nothing. Same bytes serial and pipelined.
+    #[test]
+    fn core_writer_tx_links_each_queued_row_to_its_evm_tx() {
+        use torus_state::cf::CF_CORE_WRITER_TX;
+        use torus_state::corewriter_tx::{key as link_key, CoreWriterTxLink};
+        let key = k256::ecdsa::SigningKey::from_slice(&[63u8; 32]).unwrap();
+        let account = |code_hash: B256, balance: U256| revm::state::AccountInfo {
+            balance,
+            nonce: 0,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        // Forward calldata to CoreWriter (0x0810).
+        #[rustfmt::skip]
+        let call = [
+            0x36, 0x5f, 0x5f, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
+            0x5f, 0x5f, 0x36, 0x5f, 0x5f, // retSize retOffset argsSize argsOffset value
+            0x61, 0x08, 0x10, 0x5a, 0xf1, 0x50, // PUSH2 0x0810 GAS CALL POP
+        ];
+        let once = [&call[..], &[0x00]].concat(); // STOP
+        let reverts = [&call[..], &[0x5f, 0x5f, 0xfd]].concat(); // REVERT
+        let twice = [&call[..], &call[..], &[0x00]].concat();
+        let contracts = [
+            (Address::repeat_byte(0xC0), once),
+            (Address::repeat_byte(0xC1), reverts),
+            (Address::repeat_byte(0xC2), twice),
+        ];
+        let mut calldata =
+            alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&[0u8; 31]);
+        calldata.push(42);
+        let to = |i: usize| alloy_primitives::TxKind::Call(contracts[i].0);
+        let txs = vec![
+            signed_eip1559(&key, 0, to(0), calldata.clone()),
+            signed_eip1559(&key, 1, to(1), calldata.clone()),
+            signed_eip1559(&key, 2, to(2), calldata.clone()),
+        ];
+        let hash = |i: usize| torus_bridge::decode_rlp_tx(&txs[i]).unwrap().tx_hash;
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        blocks[0].evm_transactions = txs.clone();
+        blocks[0].header.evm_tx_count = 3;
+        blocks[1].evm_transactions = vec![signed_eip1559(
+            &key,
+            3,
+            alloy_primitives::TxKind::Call(Address::repeat_byte(0x42)),
+            vec![],
+        )];
+        blocks[1].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+
+        let link = |tx: usize, call_index| CoreWriterTxLink {
+            tx_hash: hash(tx),
+            call_index,
+        };
+        let want = vec![
+            (link_key(2, 0).to_vec(), link(0, 0).encode().to_vec()),
+            (link_key(2, 1).to_vec(), link(2, 0).encode().to_vec()),
+            (link_key(2, 2).to_vec(), link(2, 1).encode().to_vec()),
+        ];
+        let mut dumps = Vec::new();
+        for on in [false, true] {
+            let (_cfg, db) = make_test_config_and_db();
+            db.put_account(
+                &k256_address(&key),
+                &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))),
+            )
+            .unwrap();
+            for (addr, code) in &contracts {
+                let code_hash = alloy_primitives::keccak256(code);
+                db.put_code(&code_hash, code).unwrap();
+                db.put_account(addr, &account(code_hash, U256::ZERO))
+                    .unwrap();
+            }
+            let ctx = pipeline_ctx(&db, on, None);
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            assert_eq!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
+                want,
+                "on={on}: one link per queued row, after block 1"
+            );
+            dispatch_and_execute(&ctx, &db, &blocks[1]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            assert_eq!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
+                want,
+                "on={on}: block 2 queued nothing, linked nothing"
+            );
+            let status = action_status(&db, 2).expect("block 2 drained rows: a record");
+            let seqs: Vec<u64> = status.core_writer.iter().map(|r| r.seq).collect();
+            assert_eq!(
+                seqs,
+                vec![0, 1, 2],
+                "on={on}: the linked rows drained in block 2"
+            );
+            dumps.push(dump_all_cfs(&db));
+        }
+        assert_dumps_equal(
+            &dumps[0],
+            &dumps[1],
+            "core writer tx links: serial vs pipelined",
+        );
+    }
+
     /// Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
     /// a node executes `block` once; another node stops right after the EVM
     /// section of its first attempt (a hard crash before the native flush) and
@@ -20575,6 +20705,7 @@ mod crash_recovery_tests {
                 price: fp(100),
                 quantity: fp(1),
                 time_in_force: 0,
+                cloid: None,
             };
             assert_eq!(enqueue(11, stop, 1), 3);
             assert_eq!(
@@ -20645,6 +20776,102 @@ mod crash_recovery_tests {
             );
             assert_dumps_equal(&dump_all_cfs(&dbs[0]), &dump_all_cfs(db), "replica");
         }
+    }
+
+    /// s114 (CoreWriter follow-up 2): block 2 drains CoreWriter placements —
+    /// a GTC buy that rests, a GTC buy that an IOC sell after it fills, and
+    /// a cancel of a missing order. The v5 record holds the order id each
+    /// executed placement got: the resting one is the id of its order in the
+    /// persisted book, the filled maker's and the IOC's follow it, the
+    /// cancel has none. Same bytes serial and pipelined.
+    #[test]
+    fn core_writer_placements_record_the_order_id_they_got() {
+        use borsh::BorshDeserialize;
+        use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
+        let fp = |n: i128| FixedPoint::from_raw(n * FixedPoint::SCALE);
+        let order = |side: u8, price: i128, time_in_force: u8| QueuedActionKind::PlaceOrder {
+            market_id: 1,
+            side,
+            order_type: 0,
+            price: fp(price),
+            quantity: fp(1),
+            time_in_force,
+            cloid: None,
+        };
+        let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
+        link_blocks(&mut blocks);
+        let mut dumps = Vec::new();
+        for on in [false, true] {
+            let (_cfg, db) = make_test_config_and_db();
+            let pm = torus_core::position::PositionManager::new(db.clone());
+            for t in [0x31, 0x32, 0x33] {
+                pm.put_native_balance(
+                    &Address::repeat_byte(t),
+                    &torus_core::position::NativeBalance {
+                        available: fp(1_000_000),
+                        order_margin: FixedPoint::ZERO,
+                    },
+                )
+                .unwrap();
+            }
+            for (trader, kind) in [
+                (0x31, order(0, 90, 0)),
+                (0x32, order(0, 91, 0)),
+                (0x33, order(1, 91, 1)),
+                (0x31, QueuedActionKind::CancelOrder { order_id: 999 }),
+            ] {
+                CoreWriterQueue::enqueue(
+                    &db,
+                    &QueuedAction {
+                        trader: Address::repeat_byte(trader),
+                        kind,
+                        block_queued: 1,
+                    },
+                )
+                .unwrap();
+            }
+            let ctx = pipeline_ctx(&db, on, None);
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            drop(ctx);
+            let status = action_status(&db, 2).expect("block 2 has a record");
+            let got: Vec<_> = status.core_writer.iter().map(|r| (r.seq, r.oid)).collect();
+            let book = torus_core::order_book::OrderBook::try_from_slice(
+                &db.get_cf_raw(torus_state::cf::CF_NATIVE_ORDER_BOOKS, &1u64.to_be_bytes())
+                    .unwrap()
+                    .expect("market 1 book"),
+            )
+            .unwrap();
+            let resting = book.orders_for_trader(&Address::repeat_byte(0x31));
+            assert_eq!(resting.len(), 1, "on={on}: the 90 bid rests");
+            let id = resting[0].id;
+            assert!(
+                book.orders_for_trader(&Address::repeat_byte(0x32))
+                    .is_empty(),
+                "on={on}"
+            );
+            assert_eq!(
+                got,
+                vec![
+                    (0, Some(id)),
+                    (1, Some(id + 1)),
+                    (2, Some(id + 2)),
+                    (3, None)
+                ],
+                "on={on}"
+            );
+            dumps.push(dump_all_cfs(&db));
+        }
+        assert_dumps_equal(
+            &dumps[0],
+            &dumps[1],
+            "CoreWriter order ids: serial vs pipelined",
+        );
     }
 
     /// R02 branch 8 (B; owner s111): the CoreWriter due-check's queue read

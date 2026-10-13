@@ -646,7 +646,7 @@ fn cancel_all_integer_margin_matches_legacy_on_deep_compacted_book() {
                 time_in_force: TimeInForce::GTC,
                 timestamp: i,
                 reduce_only: false,
-                client_order_id: Some(i),
+                client_order_id: Some(u128::from(i)),
             };
             if target {
                 let notional = order.price * order.remaining_qty;

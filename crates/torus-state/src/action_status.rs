@@ -58,7 +58,13 @@
 //! drain height, `seq`): the queue row key is `drain height ‖ seq`. An
 //! undecodable row ([`CoreWriterKind::Undecodable`]) has a zero `trader` and
 //! `queued_block`. A block that drained CoreWriter rows has a record even
-//! without native actions or EVM txs (both counts 0).
+//! without native actions or EVM txs (both counts 0). Read only since v5.
+//!
+//! Encoding v5 (s114, written instead of v4): v4 with each result followed
+//! by `ext u8` and the fields its bits announce: bit 0 (`0x01`) = `oid u128
+//! BE`, the order id an executed `PlaceOrder` row's order got (resting or
+//! filled). Every other row has `ext = 0` (one byte). An unknown bit does not
+//! decode (its field's size is unknown).
 
 /// First byte of a v1 record (executed/skipped only).
 const ACTION_STATUS_V1: u8 = 0x01;
@@ -66,8 +72,17 @@ const ACTION_STATUS_V1: u8 = 0x01;
 const ACTION_STATUS_V2: u8 = 0x02;
 /// First byte of a v3 record (v2 + outcome per entry + per-order statuses).
 const ACTION_STATUS_V3: u8 = 0x03;
-/// First byte of a v4 record (v3 + the block's CoreWriter drain results).
+/// First byte of a v4 record (v3 + the block's CoreWriter drain results;
+/// read only since v5).
 const ACTION_STATUS_V4: u8 = 0x04;
+/// First byte of a v5 record (v4 + an ext byte per CoreWriter result: the
+/// order id of an executed `PlaceOrder` row).
+const ACTION_STATUS_V5: u8 = 0x05;
+/// v5 CoreWriter result ext flag: an order id (u128 BE) follows.
+const CW_EXT_OID: u8 = 0x01;
+/// s114: v5 CoreWriter result ext bit 1 — `cloid` u128 BE follows (after the
+/// oid when both are set).
+const CW_EXT_CLOID: u8 = 0x02;
 /// Longest stored failure message, in bytes (cut at a char boundary).
 pub const MAX_MESSAGE_BYTES: usize = 96;
 
@@ -121,6 +136,10 @@ pub enum FailureReason {
     /// Row 50: a stop whose trigger is on the wrong side of the last trade
     /// (HL `badTriggerPxRejected`).
     BadTriggerPx = 14,
+    /// s114: a placement whose client order id (cloid) is already used by
+    /// one of its trader's open orders (resting or pending stop, any
+    /// market). Not an HL `*Rejected` status: recorded `Failed`.
+    DuplicateCloid = 15,
 }
 
 impl FailureReason {
@@ -141,6 +160,7 @@ impl FailureReason {
             12 => Self::MarketNoLiquidity,
             13 => Self::FokCancel,
             14 => Self::BadTriggerPx,
+            15 => Self::DuplicateCloid,
             _ => Self::Other,
         }
     }
@@ -163,6 +183,7 @@ impl FailureReason {
             Self::MarketNoLiquidity => "market_no_liquidity",
             Self::FokCancel => "fok_cancel",
             Self::BadTriggerPx => "bad_trigger_px",
+            Self::DuplicateCloid => "duplicate_cloid",
         }
     }
 
@@ -211,6 +232,9 @@ impl FailureReason {
             Self::Lot => "order rejected: quantity below the lot size",
             Self::Price => "order rejected: price must be positive",
             Self::Tick => "order rejected: price is not a multiple of the tick",
+            Self::DuplicateCloid => {
+                "order rejected: client order id is already used by an open order"
+            }
             _ => "order rejected by the book",
         }
     }
@@ -267,6 +291,8 @@ pub enum CoreWriterKind {
     ClaimRewards = 5,
     LockPermanent = 6,
     ClaimUnbonded = 7,
+    /// s114: CoreWriter `cancelByCloid`.
+    CancelByCloid = 8,
     LockboxDeposit = 0x20,
     LockboxWithdraw = 0x21,
     /// A code this reader does not know (a newer writer).
@@ -287,6 +313,7 @@ impl CoreWriterKind {
             5 => Self::ClaimRewards,
             6 => Self::LockPermanent,
             7 => Self::ClaimUnbonded,
+            8 => Self::CancelByCloid,
             0x20 => Self::LockboxDeposit,
             0x21 => Self::LockboxWithdraw,
             0xFF => Self::Undecodable,
@@ -305,6 +332,7 @@ impl CoreWriterKind {
             Self::ClaimRewards => "claim_rewards",
             Self::LockPermanent => "lock_permanent",
             Self::ClaimUnbonded => "claim_unbonded",
+            Self::CancelByCloid => "cancel_by_cloid",
             Self::LockboxDeposit => "lockbox_deposit",
             Self::LockboxWithdraw => "lockbox_withdraw",
             Self::Unknown => "unknown",
@@ -334,6 +362,12 @@ pub struct CoreWriterResult {
     /// Empty for an executed row; for a `Rejected` one, empty stands for its
     /// reason's [`FailureReason::book_reject_message`] (as in v3).
     pub message: String,
+    /// s114 (v5): the order id an executed `PlaceOrder` row's order got
+    /// (resting or filled); `None` for every other row (and in v4 records).
+    pub oid: Option<u128>,
+    /// s114 (v5 ext bit 1): the client order id the row carried (a
+    /// `place_order` with one, a `cancel_by_cloid`), whatever its outcome.
+    pub cloid: Option<u128>,
 }
 
 /// Row 50 (v3): one order's status inside an entry (see
@@ -477,7 +511,7 @@ fn take_message(bytes: &mut &[u8], outcome: Outcome, reason: FailureReason) -> O
 
 impl BlockActionStatus {
     /// v1 when nothing failed or was rejected and no CoreWriter row was
-    /// drained (the s84 bytes exactly), v4 when a CoreWriter row was
+    /// drained (the s84 bytes exactly), v5 when a CoreWriter row was
     /// drained, else v3.
     pub fn encode(&self) -> Vec<u8> {
         let core_writer = !self.core_writer.is_empty();
@@ -486,7 +520,7 @@ impl BlockActionStatus {
             9 + self.evm_skipped.len().div_ceil(8) + self.native_skipped.len().div_ceil(8),
         );
         out.push(if core_writer {
-            ACTION_STATUS_V4
+            ACTION_STATUS_V5
         } else if failures {
             ACTION_STATUS_V3
         } else {
@@ -523,6 +557,12 @@ impl BlockActionStatus {
                 out.push(r.outcome as u8);
                 out.push(r.reason as u8);
                 push_message(&mut out, r.outcome, r.reason, &r.message);
+                let ext = if r.oid.is_some() { CW_EXT_OID } else { 0 }
+                    | if r.cloid.is_some() { CW_EXT_CLOID } else { 0 };
+                out.push(ext);
+                for v in [r.oid, r.cloid].into_iter().flatten() {
+                    out.extend_from_slice(&v.to_be_bytes());
+                }
             }
         }
         out
@@ -533,7 +573,11 @@ impl BlockActionStatus {
         let (&version, mut rest) = bytes.split_first()?;
         if !matches!(
             version,
-            ACTION_STATUS_V1 | ACTION_STATUS_V2 | ACTION_STATUS_V3 | ACTION_STATUS_V4
+            ACTION_STATUS_V1
+                | ACTION_STATUS_V2
+                | ACTION_STATUS_V3
+                | ACTION_STATUS_V4
+                | ACTION_STATUS_V5
         ) {
             return None;
         }
@@ -584,7 +628,7 @@ impl BlockActionStatus {
             }
         }
         let mut core_writer = Vec::new();
-        if version == ACTION_STATUS_V4 {
+        if version >= ACTION_STATUS_V4 {
             for _ in 0..take_u32(&mut rest)? {
                 let seq = u64::from_be_bytes(take(&mut rest, 8)?.try_into().ok()?);
                 let kind = CoreWriterKind::from_u8(take_u8(&mut rest)?);
@@ -593,6 +637,26 @@ impl BlockActionStatus {
                 let outcome = Outcome::from_u8(take_u8(&mut rest)?);
                 let reason = FailureReason::from_u8(take_u8(&mut rest)?);
                 let message = take_message(&mut rest, outcome, reason)?;
+                let mut oid = None;
+                let mut cloid = None;
+                if version == ACTION_STATUS_V5 {
+                    let ext = take_u8(&mut rest)?;
+                    // A bit this reader does not know: its field's size is
+                    // unknown, so the record does not decode.
+                    if ext & !(CW_EXT_OID | CW_EXT_CLOID) != 0 {
+                        return None;
+                    }
+                    let mut u128_field = |bit| -> Option<Option<u128>> {
+                        if ext & bit == 0 {
+                            return Some(None);
+                        }
+                        Some(Some(u128::from_be_bytes(
+                            take(&mut rest, 16)?.try_into().ok()?,
+                        )))
+                    };
+                    oid = u128_field(CW_EXT_OID)?;
+                    cloid = u128_field(CW_EXT_CLOID)?;
+                }
                 core_writer.push(CoreWriterResult {
                     seq,
                     kind,
@@ -601,6 +665,8 @@ impl BlockActionStatus {
                     outcome,
                     reason,
                     message,
+                    oid,
+                    cloid,
                 });
             }
         }
@@ -659,6 +725,7 @@ mod tests {
             "order rejected: no liquidity for the market order within its price cap",
             "order rejected: FOK order could not be filled completely",
             "order rejected: stop trigger price is on the wrong side of the last trade",
+            "order rejected: client order id is already used by an open order",
             fallback,
         ];
         for (code, text) in want.iter().enumerate() {
@@ -1072,6 +1139,7 @@ mod tests {
             (FailureReason::MarketNoLiquidity, 12, "market_no_liquidity"),
             (FailureReason::FokCancel, 13, "fok_cancel"),
             (FailureReason::BadTriggerPx, 14, "bad_trigger_px"),
+            (FailureReason::DuplicateCloid, 15, "duplicate_cloid"),
         ];
         for (reason, code, name) in all {
             assert_eq!(reason as u8, code, "{name}");
@@ -1110,6 +1178,8 @@ mod tests {
             outcome,
             reason,
             message: msg.to_string(),
+            oid: None,
+            cloid: None,
         }
     }
 
@@ -1181,8 +1251,8 @@ mod tests {
                 core_writer: results.clone(),
             };
             let bytes = status.encode();
-            assert_eq!(bytes[0], ACTION_STATUS_V4, "CoreWriter results write v4");
-            let back = BlockActionStatus::decode(&bytes).expect("v4 decodes");
+            assert_eq!(bytes[0], ACTION_STATUS_V5, "CoreWriter results write v5");
+            let back = BlockActionStatus::decode(&bytes).expect("v5 decodes");
             assert_eq!(back, status);
             let seqs: Vec<u64> = back.core_writer.iter().map(|r| r.seq).collect();
             assert_eq!(seqs, [0, 1, 2, 3, 4, 5, 9]);
@@ -1208,8 +1278,8 @@ mod tests {
         };
         assert_eq!(one(ioc), one(""));
         // version 1 + counts 8 + failure_count 4 + cw count 4 + seq 8 + kind 1
-        // + trader 20 + queued_block 8 + outcome, reason, msg_len 3.
-        assert_eq!(one(""), 1 + 8 + 4 + 4 + 8 + 1 + 20 + 8 + 3);
+        // + trader 20 + queued_block 8 + outcome, reason, msg_len 3 + ext 1.
+        assert_eq!(one(""), 1 + 8 + 4 + 4 + 8 + 1 + 20 + 8 + 3 + 1);
     }
 
     /// v4: no CoreWriter result keeps the v1 / v3 bytes exactly.
@@ -1277,6 +1347,105 @@ mod tests {
         );
     }
 
+    /// s114 (v5): an executed CoreWriter `PlaceOrder` row carries the order
+    /// id its order got: an ext flags byte after the message (bit 0 = oid)
+    /// and the oid, 16 B BE. Every other row carries the flags byte (0)
+    /// only. An unknown ext bit (a newer writer) or a cut oid does not
+    /// decode.
+    #[test]
+    fn v5_place_order_rows_carry_their_order_id() {
+        use CoreWriterKind as K;
+        use FailureReason as R;
+        let placed = CoreWriterResult {
+            oid: Some(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+            ..cw(0, K::PlaceOrder, Outcome::Executed, R::Other, "")
+        };
+        let max = CoreWriterResult {
+            oid: Some(u128::MAX),
+            ..cw(1, K::PlaceOrder, Outcome::Executed, R::Other, "")
+        };
+        let other = cw(
+            2,
+            K::CancelOrder,
+            Outcome::Failed,
+            R::Other,
+            "no such order",
+        );
+        let status = BlockActionStatus {
+            core_writer: vec![placed.clone(), max, other],
+            ..Default::default()
+        };
+        let bytes = status.encode();
+        assert_eq!(bytes[0], ACTION_STATUS_V5);
+        assert_eq!(BlockActionStatus::decode(&bytes), Some(status));
+
+        let one = |r: CoreWriterResult| {
+            BlockActionStatus {
+                core_writer: vec![r],
+                ..Default::default()
+            }
+            .encode()
+        };
+        let plain = one(cw(0, K::PlaceOrder, Outcome::Rejected, R::IocCancel, ""));
+        assert_eq!(plain.len(), 1 + 8 + 4 + 4 + 8 + 1 + 20 + 8 + 3 + 1);
+        assert_eq!(*plain.last().unwrap(), 0x00, "no oid: ext 0");
+        let with = one(placed.clone());
+        assert_eq!(with.len(), plain.len() + 16);
+        assert_eq!(with[with.len() - 17], 0x01, "ext bit 0: oid follows");
+        assert_eq!(&with[with.len() - 16..], &placed.oid.unwrap().to_be_bytes());
+
+        let mut unknown = plain.clone();
+        *unknown.last_mut().unwrap() = 0x04;
+        assert_eq!(BlockActionStatus::decode(&unknown), None, "unknown ext bit");
+        assert_eq!(
+            BlockActionStatus::decode(&with[..with.len() - 1]),
+            None,
+            "cut oid"
+        );
+        assert_eq!(
+            BlockActionStatus::decode(&plain[..plain.len() - 1]),
+            None,
+            "no ext"
+        );
+    }
+
+    /// s114: v4 records (s112, no ext byte per row) still read, every oid
+    /// `None`.
+    #[test]
+    fn v4_records_written_before_v5_still_read() {
+        use CoreWriterKind as K;
+        let rows = vec![
+            cw(
+                0,
+                K::LockboxDeposit,
+                Outcome::Executed,
+                FailureReason::Other,
+                "",
+            ),
+            cw(
+                3,
+                K::Delegate,
+                Outcome::Failed,
+                FailureReason::Other,
+                "no stake",
+            ),
+        ];
+        // A v4 record by hand: version, counts 0/0, failure_count 0, then
+        // each row's v5 bytes without its ext byte.
+        let mut v4 = vec![0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        for r in &rows {
+            let one = BlockActionStatus {
+                core_writer: vec![r.clone()],
+                ..Default::default()
+            }
+            .encode();
+            v4.extend_from_slice(&one[17..one.len() - 1]);
+        }
+        let back = BlockActionStatus::decode(&v4).expect("v4 decodes");
+        assert_eq!(back.core_writer, rows);
+        assert!(back.core_writer.iter().all(|r| r.oid.is_none()));
+    }
+
     /// The stored CoreWriter kind codes and names are a format.
     #[test]
     fn core_writer_kind_codes_and_names_are_stable() {
@@ -1290,6 +1459,7 @@ mod tests {
             (K::ClaimRewards, 5, "claim_rewards"),
             (K::LockPermanent, 6, "lock_permanent"),
             (K::ClaimUnbonded, 7, "claim_unbonded"),
+            (K::CancelByCloid, 8, "cancel_by_cloid"),
             (K::LockboxDeposit, 0x20, "lockbox_deposit"),
             (K::LockboxWithdraw, 0x21, "lockbox_withdraw"),
             (K::Unknown, 0xFE, "unknown"),
@@ -1300,7 +1470,56 @@ mod tests {
             assert_eq!(K::from_u8(code), kind, "{name}");
             assert_eq!(kind.as_str(), name);
         }
-        assert_eq!(K::from_u8(8), K::Unknown);
+        assert_eq!(K::from_u8(9), K::Unknown);
+    }
+
+    /// s114: a row that carried a cloid (a placement, a cancel by cloid)
+    /// records it: ext bit 1, 16 BE bytes after the oid (if any).
+    #[test]
+    fn v5_rows_carry_their_cloid() {
+        use CoreWriterKind as K;
+        use FailureReason as R;
+        let cloid = 0xc10d_0000_0000_0000_0000_0000_0000_0001u128;
+        let both = CoreWriterResult {
+            oid: Some(7),
+            cloid: Some(cloid),
+            ..cw(0, K::PlaceOrder, Outcome::Executed, R::Other, "")
+        };
+        let cancel = CoreWriterResult {
+            cloid: Some(u128::MAX),
+            ..cw(
+                1,
+                K::CancelByCloid,
+                Outcome::Failed,
+                R::Other,
+                "no such order",
+            )
+        };
+        let dup = CoreWriterResult {
+            cloid: Some(cloid),
+            ..cw(2, K::PlaceOrder, Outcome::Failed, R::DuplicateCloid, "dup")
+        };
+        let status = BlockActionStatus {
+            core_writer: vec![both.clone(), cancel, dup],
+            ..Default::default()
+        };
+        let bytes = status.encode();
+        assert_eq!(bytes[0], ACTION_STATUS_V5);
+        assert_eq!(BlockActionStatus::decode(&bytes), Some(status));
+
+        let one = BlockActionStatus {
+            core_writer: vec![both],
+            ..Default::default()
+        }
+        .encode();
+        assert_eq!(one[one.len() - 33], 0x03, "ext: oid and cloid");
+        assert_eq!(&one[one.len() - 32..one.len() - 16], &7u128.to_be_bytes());
+        assert_eq!(&one[one.len() - 16..], &cloid.to_be_bytes());
+        assert_eq!(
+            BlockActionStatus::decode(&one[..one.len() - 1]),
+            None,
+            "cut cloid"
+        );
     }
 
     #[test]
@@ -1319,7 +1538,7 @@ mod tests {
         }
         .encode();
         let mut wrong_version = bytes.clone();
-        wrong_version[0] = 0x05;
+        wrong_version[0] = 0x06;
         assert_eq!(BlockActionStatus::decode(&wrong_version), None);
         assert_eq!(BlockActionStatus::decode(&bytes[..bytes.len() - 1]), None);
         let mut overlong = bytes.clone();

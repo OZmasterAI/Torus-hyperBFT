@@ -37,9 +37,10 @@ use torus_economics::{
 use torus_state::action_status::{CoreWriterKind, FailureReason};
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
+use torus_telemetry::OrderRejectReason;
 use torus_types::{
-    FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams,
-    SessionScope, Side, TimeInForce, ValidatorSet, VoteOption, U256,
+    Cloid, FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, SessionScope,
+    Side, TimeInForce, ValidatorSet, VoteOption, U256,
 };
 
 use crate::market_workers::{MarketWorkerPool, MatchRequest};
@@ -149,6 +150,12 @@ pub struct CoreWriterDrained {
     /// The block that queued it; zero for an undecodable row.
     pub queued_block: u64,
     pub result: NativeActionResult,
+    /// s114: the order id an executed `PlaceOrder` row's order got
+    /// (resting or filled); `None` for every other row.
+    pub oid: Option<OrderId>,
+    /// s114: the cloid the row carried (a placement with one, a cancel by
+    /// cloid), whatever its outcome.
+    pub cloid: Option<Cloid>,
 }
 
 /// Result of executing a batch of native actions.
@@ -821,7 +828,10 @@ mod open_order_count_tests {
 /// Why an order died pre-book (selects its funnel counter).
 #[derive(Clone, Copy)]
 enum RejectReason {
-    Margin,
+    /// The account check; s114: with its reason label
+    /// ([`margin_reject_label`]: the margin split, or `Price` for an
+    /// overflowing notional).
+    Margin(OrderRejectReason),
     OpenLimit,
     Other,
 }
@@ -831,18 +841,94 @@ impl RejectReason {
     /// (the open-order slot check: `OpenLimit` or a state read error).
     fn failure(self) -> FailureReason {
         match self {
-            RejectReason::Margin => FailureReason::Margin,
+            RejectReason::Margin(_) => FailureReason::Margin,
             RejectReason::OpenLimit => FailureReason::OpenLimit,
             RejectReason::Other => FailureReason::Other,
         }
     }
 
-    fn count(self, m: &torus_telemetry::Metrics) {
+    /// Counts one rejected order: its funnel counter and (s114) its reason
+    /// series, `reason` being the result's reason.
+    fn count(self, m: &torus_telemetry::Metrics, reason: FailureReason) {
         match self {
-            RejectReason::Margin => m.orders_rejected_margin.inc(),
+            RejectReason::Margin(_) => m.orders_rejected_margin.inc(),
             RejectReason::OpenLimit => m.orders_rejected_open_limit.inc(),
             RejectReason::Other => m.orders_rejected_other.inc(),
         };
+        m.order_rejected(match self {
+            RejectReason::Margin(label) => label,
+            _ => reject_label(reason),
+        });
+    }
+}
+
+/// s114: the `torus_orders_rejected_reason_total` label of an order rejected
+/// with `reason`. A `Margin` here is the book's match-time cut: the pre-book
+/// account check labels its rejects with [`margin_reject_label`] instead.
+fn reject_label(reason: FailureReason) -> OrderRejectReason {
+    match reason {
+        FailureReason::Margin => OrderRejectReason::MarginMatch,
+        FailureReason::OpenLimit => OrderRejectReason::OpenLimit,
+        FailureReason::Tick => OrderRejectReason::Tick,
+        FailureReason::Lot => OrderRejectReason::Lot,
+        FailureReason::Price => OrderRejectReason::Price,
+        FailureReason::PriceBand => OrderRejectReason::PriceBand,
+        FailureReason::ReduceOnly => OrderRejectReason::ReduceOnly,
+        FailureReason::IocCancel => OrderRejectReason::IocCancel,
+        FailureReason::BadAloPx => OrderRejectReason::BadAloPx,
+        FailureReason::MarketNoLiquidity => OrderRejectReason::MarketNoLiquidity,
+        FailureReason::FokCancel => OrderRejectReason::FokCancel,
+        FailureReason::BadTriggerPx => OrderRejectReason::BadTriggerPx,
+        FailureReason::Fill => OrderRejectReason::Fill,
+        FailureReason::DuplicateCloid => OrderRejectReason::DuplicateCloid,
+        FailureReason::Other | FailureReason::BatchCap => OrderRejectReason::Other,
+    }
+}
+
+#[cfg(test)]
+mod reject_label_tests {
+    use super::*;
+
+    /// s114: every order reject reason has its own series, named like the
+    /// `FailureReason` (so a reason added to torus-state without a label of
+    /// its own fails here, not silently under `other`). Exceptions: a book
+    /// `Margin` is `margin_match` (the pre-book check splits its own), and
+    /// `BatchCap` is not a per-order reject (`other`).
+    #[test]
+    fn every_failure_reason_maps_to_the_label_of_its_name() {
+        for code in 0..=u8::MAX {
+            let reason = FailureReason::from_u8(code);
+            let want = match reason {
+                FailureReason::Margin => "margin_match",
+                FailureReason::BatchCap => "other",
+                r => r.as_str(),
+            };
+            assert_eq!(reject_label(reason).as_str(), want, "code {code}: {reason:?}");
+        }
+    }
+}
+
+/// s114 (archy section 53c.4): the label of a pre-book account-check reject
+/// with `reason`. The check saw `free`; `reserved` is what the sender's
+/// open-order reservations (and, in Phase 2, its earlier orders' commitments
+/// of this batch) took out of it. `passes(f)` re-runs the same pure check at
+/// free margin `f`. `MarginReservation`: it passes with `reserved` released;
+/// `MarginPosition`: it fails even then (positions, losses or cash). Reject
+/// path only: one extra check per margin reject, nothing on a pass.
+fn margin_reject_label(
+    reason: FailureReason,
+    free: FixedPoint,
+    reserved: FixedPoint,
+    passes: impl FnOnce(FixedPoint) -> bool,
+) -> OrderRejectReason {
+    if reason != FailureReason::Margin {
+        return reject_label(reason);
+    }
+    let released = free.checked_add(reserved).unwrap_or(FixedPoint::MAX);
+    if reserved > FixedPoint::ZERO && passes(released) {
+        OrderRejectReason::MarginReservation
+    } else {
+        OrderRejectReason::MarginPosition
     }
 }
 
@@ -3001,6 +3087,9 @@ pub struct ResidentBooks {
     /// which every reader / writer of `rows` calls first, so nothing can see
     /// the slot of the block before the worker finished it.
     rows_pending: Option<PendingRows>,
+    /// P2-3: the long-lived thread [`end_resident_on_worker`] hands its jobs
+    /// to (started at the first one; was a new thread per block).
+    end_thread: Option<EndResidentThread>,
     /// Item 6 Phase 1: R builds (cold start or guard trip) and
     /// `end_resident` calls that found another clone of R alive (test /
     /// ops introspection).
@@ -3010,10 +3099,38 @@ pub struct ResidentBooks {
 
 /// Item 6 step 2: one block's `end_resident` running on a worker thread.
 struct PendingRows {
-    handle: std::thread::JoinHandle<RowsSlot>,
+    /// The job's slot, or its panic payload (P2-3: was the thread's
+    /// `JoinHandle`); a closed channel = the thread died.
+    handle: std::sync::mpsc::Receiver<std::thread::Result<RowsSlot>>,
     height: u64,
     /// For the wait timer at the join.
     metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+/// P2-3: a job for the end-resident thread; it sends its own result.
+type EndResidentTask = Box<dyn FnOnce() + Send>;
+
+/// P2-3: one long-lived `torus-end-resident` thread per [`ResidentBooks`],
+/// running one job at a time (a holder has at most one in flight). A job's
+/// panic is caught there and reported to [`ResidentBooks::settle_rows`]
+/// like a failed join; the thread lives on. Dropping the holder closes the
+/// queue and the thread ends after its current job.
+struct EndResidentThread {
+    tx: std::sync::mpsc::Sender<EndResidentTask>,
+}
+
+impl EndResidentThread {
+    fn spawn() -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<EndResidentTask>();
+        std::thread::Builder::new()
+            .name("torus-end-resident".into())
+            .spawn(move || {
+                for task in rx {
+                    task();
+                }
+            })?;
+        Ok(Self { tx })
+    }
 }
 
 struct RowsSlot {
@@ -3035,10 +3152,132 @@ struct ResidentInner {
     /// Item 6 Phase 2 P2-1: the books' cancel-all index (`None`: not built
     /// since the last load; the next cancel-all builds it from the books).
     trader_markets: Option<TraderMarkets>,
+    /// s114 follow-up: the books' cross-market cloid index (`None`: not
+    /// built since the last load; the next check with a cloid builds it).
+    /// Every book's cloid log is empty here (drained at the stash).
+    cloid_markets: Option<CloidMarkets>,
     /// Post-block global order-id high-water mark (replaces the load scan).
     next_global_order_id: u128,
     /// The block height whose POST-state this reflects (staleness guard).
     height: u64,
+}
+
+/// s114 follow-up: the node-local cross-market cloid index, `(trader,
+/// cloid) -> (market, order id)` of every open order (resting or pending
+/// stop) carrying a cloid in any book. The duplicate-cloid check of a
+/// placement is one lookup here plus one probe of the book it names
+/// ([`NativeExecutor::duplicate_cloid`]) instead of a probe of every book.
+///
+/// Kept from the books' cloid logs ([`OrderBook::drain_cloid_log`]: every
+/// add and remove of a book's own index, whatever path made it), so it
+/// never needs its own hook per removal path:
+/// - ADDS are drained where an order can rest or a stop be stored (the
+///   single placement incl. triggered stops, every book the batch matching
+///   hands back: the [`TraderMarkets::absorb`] sites but a modify, which
+///   keeps the entry's market and id), so before any later check every
+///   live cloid is in the index with its market and id;
+/// - REMOVES may wait in the book's log until the stash drains every book
+///   ([`NativeExecContext::stash_resident`]); until then the entry may be
+///   stale, which is why the check confirms it in the named book (a stale
+///   entry is never a duplicate).
+///
+/// A cloid is live in at most one book (that is what the check enforces),
+/// so applying logged keys per book in any order gives the same index:
+/// a live key takes `(market, id)`, a dead one leaves only if the index
+/// still points at that market. Built from the books at the first check
+/// after a load ([`Self::build`]), carried with the resident books; never
+/// hashed, never persisted: every node gets the same verdicts as the full
+/// scan (debug builds compare the two at every check).
+#[derive(Default)]
+struct CloidMarkets {
+    map: HashMap<(Address, Cloid), (MarketId, OrderId)>,
+}
+
+impl CloidMarkets {
+    /// The index of `books` as they are (their logs are emptied: the scan
+    /// sees everything logged).
+    fn build(books: &mut HashMap<MarketId, OrderBook>) -> Self {
+        let mut index = Self::default();
+        for (&market, book) in books.iter_mut() {
+            book.clear_cloid_log();
+            for (trader, cloid, id) in book.cloid_entries() {
+                index.map.insert((trader, cloid), (market, id));
+            }
+        }
+        index
+    }
+
+    /// Feed `book`'s cloid log (market `market`) into `index`. Without an
+    /// index the log is dropped: the build scans the books.
+    fn absorb(index: &mut Option<Self>, book: &mut OrderBook, market: MarketId) {
+        match index {
+            Some(index) => book.drain_cloid_log(|trader, cloid, live| match live {
+                Some(id) => {
+                    index.map.insert((trader, cloid), (market, id));
+                }
+                None => {
+                    if index
+                        .map
+                        .get(&(trader, cloid))
+                        .is_some_and(|&(m, _)| m == market)
+                    {
+                        index.map.remove(&(trader, cloid));
+                    }
+                }
+            }),
+            None => book.clear_cloid_log(),
+        }
+    }
+
+    /// `(market, id)` of `trader`'s open order with `cloid`: the index
+    /// names the market, that book confirms (an entry whose removal is
+    /// still in the book's log is not live). Counts the check and the probe.
+    fn live(
+        &self,
+        books: &HashMap<MarketId, OrderBook>,
+        accum: &mut ExecPhaseAccum,
+        trader: &Address,
+        cloid: Cloid,
+    ) -> Option<(MarketId, OrderId)> {
+        accum.cloid_checks += 1;
+        let &(market, _) = self.map.get(&(*trader, cloid))?;
+        accum.cloid_books_probed += 1;
+        let id = books.get(&market)?.order_id_by_cloid(trader, cloid)?;
+        Some((market, id))
+    }
+
+    /// Debug builds: every book's live entries are in the index with their
+    /// market and id (what a check relies on); with `exact`, nothing else
+    /// is (after every log was drained). O(cloids).
+    fn debug_assert_covers(&self, books: &HashMap<MarketId, OrderBook>, exact: bool) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut live = 0usize;
+        for (&market, book) in books {
+            for (trader, cloid, id) in book.cloid_entries() {
+                live += 1;
+                assert_eq!(
+                    self.map.get(&(trader, cloid)),
+                    Some(&(market, id)),
+                    "cloid index: {trader}'s cloid {cloid:#x} (order {id}, market {market}) \
+                     is not indexed there"
+                );
+            }
+        }
+        if exact {
+            assert_eq!(
+                self.map.len(),
+                live,
+                "cloid index holds dead entries after a full drain"
+            );
+        }
+    }
+
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    fn snapshot(&self) -> CloidIndexSnapshot {
+        self.map.iter().map(|(k, v)| (*k, *v)).collect()
+    }
 }
 
 /// Item 6 Phase 2 P2-1 (tests): trader -> markets, ascending.
@@ -3137,6 +3376,24 @@ impl TraderMarkets {
     }
 }
 
+/// s114 follow-up (tests): `(trader, cloid) -> (market, order id)`.
+#[cfg(any(test, feature = "test-reference-paths"))]
+pub type CloidIndexSnapshot = std::collections::BTreeMap<(Address, Cloid), (MarketId, OrderId)>;
+
+/// s114 follow-up (tests): the cross-market cloid index a load would build
+/// from `books` now.
+#[cfg(any(test, feature = "test-reference-paths"))]
+fn cloid_index_rebuilt(books: &HashMap<MarketId, OrderBook>) -> CloidIndexSnapshot {
+    let mut out = CloidIndexSnapshot::new();
+    for (&market, book) in books {
+        for (t, c, id) in book.cloid_entries() {
+            let prev = out.insert((t, c), (market, id));
+            assert!(prev.is_none(), "cloid {c:#x} of {t} live in two books");
+        }
+    }
+    out
+}
+
 /// P2-1 (tests): `(carried, rebuilt)` — `index` (`None`: not built)
 /// and the index a load would build from `books` now (exact).
 #[cfg(any(test, feature = "test-reference-paths"))]
@@ -3169,6 +3426,20 @@ impl ResidentBooks {
             .map(|inner| trader_index_snapshot(inner.trader_markets.as_ref(), &inner.books))
     }
 
+    /// s114 follow-up (tests): `(carried, rebuilt)` — the cross-market cloid
+    /// index carried with the books (`None`: not built since the last load)
+    /// and the one a load would build from them now. `None`: no resident
+    /// books.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn cloid_index(&self) -> Option<(Option<CloidIndexSnapshot>, CloidIndexSnapshot)> {
+        self.inner.as_ref().map(|inner| {
+            (
+                inner.cloid_markets.as_ref().map(CloidMarkets::snapshot),
+                cloid_index_rebuilt(&inner.books),
+            )
+        })
+    }
+
     /// Drop any resident state (books and rows) — the next block rebuilds
     /// from the DB. Waits for an `end_resident` worker first (step 2).
     pub fn invalidate(&mut self) {
@@ -3188,7 +3459,9 @@ impl ResidentBooks {
             return;
         };
         let timer = std::time::Instant::now();
-        let joined = handle.join();
+        let joined = handle.recv().unwrap_or_else(|_| {
+            Err(Box::new("end_resident thread died") as Box<dyn std::any::Any + Send>)
+        });
         if let Some(m) = metrics.as_deref() {
             m.exec_end_resident_wait_seconds.observe(timer.elapsed().as_secs_f64());
         }
@@ -3608,7 +3881,8 @@ pub fn end_resident(
 }
 
 /// Item 6 step 2: [`end_resident`] with its work (R applying `delta`, the
-/// decoded positions and the sums carry) on a new worker thread, so it
+/// decoded positions and the sums carry) on a worker thread (P2-3: the
+/// holder's long-lived `torus-end-resident` thread, not one per block), so it
 /// overlaps the next block's work up to its [`begin_resident`]. The checks
 /// (`ok`, R attached, no other clone of R alive) run here, on the calling
 /// thread, exactly as in `end_resident`; the worker then owns R, the delta and
@@ -3639,26 +3913,52 @@ pub fn end_resident_on_worker(
     let height = job.height;
     let checks = timer.elapsed();
     let worker_metrics = metrics.clone();
-    let spawned = std::thread::Builder::new().name("torus-end-resident".into()).spawn(move || {
-        let timer = std::time::Instant::now();
-        let slot = job.run(worker_metrics.as_deref());
-        if let Some(m) = worker_metrics.as_deref() {
-            m.exec_end_resident_seconds.observe((checks + timer.elapsed()).as_secs_f64());
-        }
-        slot
+    let (done, handle) = std::sync::mpsc::sync_channel(1);
+    let task: EndResidentTask = Box::new(move || {
+        let slot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let timer = std::time::Instant::now();
+            let slot = job.run(worker_metrics.as_deref());
+            if let Some(m) = worker_metrics.as_deref() {
+                m.exec_end_resident_seconds
+                    .observe((checks + timer.elapsed()).as_secs_f64());
+            }
+            slot
+        }));
+        // The holder may be gone (dropped mid-job): nothing to report to.
+        let _ = done.send(slot);
     });
-    match spawned {
-        Ok(handle) => {
-            torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::EndResident, 1);
+    // P2-3: the holder's long-lived thread, started at its first job.
+    if holder.end_thread.is_none() {
+        match EndResidentThread::spawn() {
+            Ok(t) => {
+                torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::EndResident, 1);
+                holder.end_thread = Some(t);
+            }
+            Err(e) => {
+                // The job (R included) is dropped with the task.
+                tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
+                return;
+            }
+        }
+    }
+    let sent = holder.end_thread.as_ref().map(|t| t.tx.send(task));
+    match sent {
+        Some(Ok(())) => {
             holder.rows_pending = Some(PendingRows {
                 handle,
                 height,
                 metrics,
             })
         }
-        Err(e) => {
-            // The job (R included) was dropped with the closure.
-            tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
+        _ => {
+            // The thread is gone (never in the normal sequence): the job (R
+            // included) was dropped with the task; the next job starts a
+            // new thread.
+            holder.end_thread = None;
+            tracing::error!(
+                height,
+                "item 6: end_resident thread gone — dropping R (next native block rebuilds it)"
+            );
         }
     }
 }
@@ -3847,6 +4147,10 @@ mod cancel_batch_toggle_tests {
 #[path = "cancel_batch_exec_tests.rs"]
 mod cancel_batch_exec_tests;
 
+#[cfg(test)]
+#[path = "cloid_index_tests.rs"]
+mod cloid_index_tests;
+
 #[cfg(any(test, feature = "test-reference-paths"))]
 #[path = "reference_paths.rs"]
 mod reference_paths;
@@ -3971,6 +4275,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// ([`TraderMarkets`]; `None` until the first cancel-all after a load
     /// builds it, carried in the resident holder).
     trader_markets: Option<TraderMarkets>,
+    /// s114 follow-up: the cross-market cloid index of `order_books`
+    /// ([`CloidMarkets`]; `None` until the first duplicate-cloid check after
+    /// a load builds it, carried in the resident holder).
+    cloid_markets: Option<CloidMarkets>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -4190,6 +4498,10 @@ pub struct ExecPhaseAccum {
     /// books they probed to find the order.
     pub by_id_actions: u64,
     pub by_id_books_probed: u64,
+    /// s114 follow-up: duplicate-cloid checks run (placements carrying a
+    /// cloid, single path and batch pre-pass), and the books they probed.
+    pub cloid_checks: u64,
+    pub cloid_books_probed: u64,
 }
 
 impl ExecPhaseAccum {
@@ -4467,9 +4779,11 @@ impl<T: StateBackend> NativeExecContext<T> {
         // P2-1: the resident books bring their index; a load starts without
         // one (the first cancel-all builds it from the books).
         let mut trader_markets = None;
+        let mut cloid_markets = None;
         let (mut order_books, scanned_next_id, load_error) = match reused_inner {
             Some(inner) => {
                 trader_markets = inner.trader_markets;
+                cloid_markets = inner.cloid_markets;
                 (inner.books, inner.next_global_order_id, None)
             }
             None => match book_mode {
@@ -4492,6 +4806,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             // scans them.
             for book in order_books.values_mut() {
                 book.drain_new_traders();
+            }
+        }
+        if cloid_markets.is_none() {
+            // s114 follow-up: likewise for the cloid index (resident books
+            // come with empty logs: the stash drained them).
+            for book in order_books.values_mut() {
+                book.clear_cloid_log();
             }
         }
 
@@ -4568,6 +4889,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             prev_marks: None,
             sums: None,
             trader_markets,
+            cloid_markets,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -4694,9 +5016,19 @@ impl<T: StateBackend> NativeExecContext<T> {
             return;
         }
         self.debug_assert_index_fed();
+        // s114 follow-up: drain every book's cloid log (the removes the
+        // block left there) so the carried index is exact and the logs
+        // empty. O(books) per block, not per check.
+        for (&market, book) in self.order_books.iter_mut() {
+            CloidMarkets::absorb(&mut self.cloid_markets, book, market);
+        }
+        if let Some(index) = &self.cloid_markets {
+            index.debug_assert_covers(&self.order_books, true);
+        }
         resident.inner = Some(ResidentInner {
             books: std::mem::take(&mut self.order_books),
             trader_markets: self.trader_markets.take(),
+            cloid_markets: self.cloid_markets.take(),
             next_global_order_id: self.next_global_order_id,
             height: self.block_height,
         });
@@ -4744,6 +5076,16 @@ impl<T: StateBackend> NativeExecContext<T> {
     #[cfg(test)]
     pub(crate) fn trader_index(&self) -> (Option<TraderIndexSnapshot>, TraderIndexSnapshot) {
         trader_index_snapshot(self.trader_markets.as_ref(), &self.order_books)
+    }
+
+    /// s114 follow-up (tests): `(carried, rebuilt)` as
+    /// [`ResidentBooks::cloid_index`].
+    #[cfg(test)]
+    pub(crate) fn cloid_index(&self) -> (Option<CloidIndexSnapshot>, CloidIndexSnapshot) {
+        (
+            self.cloid_markets.as_ref().map(CloidMarkets::snapshot),
+            cloid_index_rebuilt(&self.order_books),
+        )
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
@@ -6151,6 +6493,9 @@ impl NativeExecutor {
             NativeAction::CancelAllOrders { market_id } => {
                 Self::exec_cancel_all(ctx, sender, *market_id)
             }
+            NativeAction::CancelByCloid { market_id, cloid } => {
+                Self::exec_cancel_by_cloid(ctx, sender, *market_id, *cloid)
+            }
             NativeAction::ModifyOrder {
                 order_id,
                 new_price,
@@ -6534,6 +6879,53 @@ impl NativeExecutor {
         }
         ctx.phase_accum.phase1_actions_ns += phase1_timer.elapsed().as_nanos();
 
+        // s114: cloid uniqueness, serially in flat order, before Phase 2
+        // reserves anything: a placement whose cloid is live for its sender
+        // in any book (after Phase 1's cancels) or claimed by an earlier
+        // placement of this call is rejected. The first placement of a cloid
+        // claims it whatever later happens to it (margin reject, fill).
+        if place_order_indices
+            .iter()
+            .any(|&i| matches!(&flat[i].1, FlatAction::Place(p) if p.client_order_id.is_some()))
+        {
+            let mut claimed: HashSet<(Address, Cloid)> = HashSet::default();
+            let books = &mut ctx.order_books;
+            let index = ctx
+                .cloid_markets
+                .get_or_insert_with(|| CloidMarkets::build(books));
+            index.debug_assert_covers(books, false);
+            let books = &ctx.order_books;
+            let metrics = &ctx.metrics;
+            let accum = &mut ctx.phase_accum;
+            place_order_indices.retain(|&i| {
+                let (sender, FlatAction::Place(p)) = &flat[i] else {
+                    return true;
+                };
+                let Some(cloid) = p.client_order_id else {
+                    return true;
+                };
+                let dup = Self::duplicate_cloid(books, index, accum, sender, cloid).or_else(|| {
+                    (!claimed.insert((*sender, cloid))).then(|| {
+                        format!(
+                            "duplicate cloid {}: an earlier order of this block already uses it",
+                            torus_types::cloid_serde::to_hex(cloid)
+                        )
+                    })
+                });
+                let Some(msg) = dup else {
+                    return true;
+                };
+                if let Some(m) = metrics {
+                    RejectReason::Other.count(m, FailureReason::DuplicateCloid);
+                }
+                results[i] = NativeActionResult::rejected(
+                    "place_order",
+                    (FailureReason::DuplicateCloid, msg),
+                );
+                false
+            });
+        }
+
         if place_order_indices.is_empty() {
             ctx.debug_assert_index_fed();
             return NativeBatchResult { results, total_gas };
@@ -6913,6 +7305,8 @@ impl NativeExecutor {
         for mbr in market_results.iter_mut() {
             // P2-1: what rested or was stored in this book feeds the index.
             TraderMarkets::absorb(&mut ctx.trader_markets, &mut mbr.book, mbr.market_id);
+            // s114 follow-up: and the cloid index (adds before any later check).
+            CloidMarkets::absorb(&mut ctx.cloid_markets, &mut mbr.book, mbr.market_id);
             mbr.book.clear_reduce_only_positions();
             // Plan 9.11 (telemetry): this book's charged maker fills.
             if let Some(m) = ctx.metrics.as_deref() {
@@ -7199,21 +7593,39 @@ impl NativeExecutor {
                 // unchecked ones (GTC buys, stops) stay strict.
                 let credit = if checked { st.released } else { FixedPoint::ZERO };
                 // Review fix 1: minus what earlier orders committed.
+                let free = bal.available + pn + credit - st.committed;
                 let need = match Self::account_check(
                     market.tiers(),
                     e.signed,
                     e.px,
                     params,
                     res_price,
-                    bal.available + pn + credit - st.committed,
+                    free,
                 ) {
                     Ok(need) => need,
                     Err((reason, msg)) => {
+                        // s114: reservations = resting orders' (this batch's
+                        // accepted ones included) + this batch's commitments.
+                        let reserved = bal
+                            .order_margin
+                            .checked_add(st.committed)
+                            .unwrap_or(FixedPoint::MAX);
+                        let label = margin_reject_label(reason, free, reserved, |f| {
+                            Self::account_check(
+                                market.tiers(),
+                                e.signed,
+                                e.px,
+                                params,
+                                res_price,
+                                f,
+                            )
+                            .is_ok()
+                        });
                         return PrepOutcome::Reject {
-                            funnel: RejectReason::Margin,
+                            funnel: RejectReason::Margin(label),
                             reason,
                             msg,
-                        }
+                        };
                     }
                 };
                 // Review fix 1 (s517): the need beyond the reservation
@@ -7326,7 +7738,7 @@ impl NativeExecutor {
             PrepOutcome::Reject { funnel, reason, msg } => {
                 // Funnel (perf A1): died pre-book.
                 if let Some(ref m) = metrics {
-                    funnel.count(m);
+                    funnel.count(m, reason);
                 }
                 results[i] = NativeActionResult::rejected("place_order", (reason, msg));
             }
@@ -7566,6 +7978,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     continue;
                 }
@@ -7585,7 +7998,12 @@ impl NativeExecutor {
 
                 if let Some(ref m) = ctx.metrics {
                     m.orders_matched.inc_by(result.fills.len() as u64);
-                    Self::record_order_status_funnel(m, &result.status, result.fills.len());
+                    Self::record_order_status_funnel(
+                        m,
+                        &result.status,
+                        result.fills.len(),
+                        result.reject,
+                    );
                 }
 
                 *total_gas += PLACE_ORDER_GAS;
@@ -7760,28 +8178,26 @@ impl NativeExecutor {
                 let mut slots: Vec<Option<Result<MarketSettlePlan, String>>> =
                     (0..mrs.len()).map(|_| None).collect();
                 let plan_for = &plan_for;
-                torus_state::spawn_count::add(
-                    torus_state::spawn_count::SpawnSite::Settle,
-                    chunks.len(),
-                );
+                // P2-3: the chunks run as jobs on the persistent exec pool
+                // (no per-block spawns); a job that died outside the
+                // per-market containment yields an empty vec, as a scoped
+                // thread's failed join did.
+                let jobs: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        move || {
+                            chunk
+                                .into_iter()
+                                .map(|i| (i, plan_for(i)))
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .collect();
                 let chunk_out: Vec<Vec<(usize, Result<MarketSettlePlan, String>)>> =
-                    std::thread::scope(|s| {
-                        let handles: Vec<_> = chunks
-                            .into_iter()
-                            .map(|chunk| {
-                                s.spawn(move || {
-                                    chunk
-                                        .into_iter()
-                                        .map(|i| (i, plan_for(i)))
-                                        .collect::<Vec<_>>()
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().unwrap_or_default())
-                            .collect()
-                    });
+                    crate::exec_pool::run_jobs(jobs)
+                        .into_iter()
+                        .map(|joined| joined.unwrap_or_default())
+                        .collect();
                 // A worker thread that died OUTSIDE the per-market containment
                 // yields an empty vec; its markets stay `None` and become the
                 // fallback trigger below (never a silently skipped market).
@@ -7957,6 +8373,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     continue;
                 }
@@ -7974,7 +8391,12 @@ impl NativeExecutor {
 
                 if let Some(ref m) = ctx.metrics {
                     m.orders_matched.inc_by(result.fills.len() as u64);
-                    Self::record_order_status_funnel(m, &result.status, result.fills.len());
+                    Self::record_order_status_funnel(
+                        m,
+                        &result.status,
+                        result.fills.len(),
+                        result.reject,
+                    );
                 }
 
                 *total_gas += PLACE_ORDER_GAS;
@@ -8164,12 +8586,17 @@ impl NativeExecutor {
     /// the book AND settled (margin rejects, balance errors and fill-application
     /// failures are counted at their own sites as `orders_rejected_margin` /
     /// `orders_rejected_other`). Observability only: nothing in execution reads
-    /// these counters back.
+    /// these counters back. s114: a book reject (`reject`, row 50) is also
+    /// counted under its reason series.
     fn record_order_status_funnel(
         m: &torus_telemetry::Metrics,
         status: &OrderStatus,
         fill_count: usize,
+        reject: Option<FailureReason>,
     ) {
+        if let Some(reason) = reject {
+            m.order_rejected(reject_label(reason));
+        }
         match status {
             OrderStatus::Filled => {
                 m.orders_placed_accepted.inc();
@@ -9187,6 +9614,22 @@ impl NativeExecutor {
         sender: &Address,
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
+        // s114: a cloid live for the sender in any market.
+        if let Some(msg) = params.client_order_id.and_then(|c| {
+            let books = &mut ctx.order_books;
+            let index = ctx
+                .cloid_markets
+                .get_or_insert_with(|| CloidMarkets::build(books));
+            Self::duplicate_cloid(&ctx.order_books, index, &mut ctx.phase_accum, sender, c)
+        }) {
+            if let Some(ref m) = ctx.metrics {
+                RejectReason::Other.count(m, FailureReason::DuplicateCloid);
+            }
+            return NativeActionResult::rejected(
+                "place_order",
+                (FailureReason::DuplicateCloid, msg),
+            );
+        }
         let open_at_start = Self::open_order_counts(&ctx.order_books, std::iter::once(sender));
         if let Err((reason, msg)) = Self::take_open_slot(
             &mut None,
@@ -9197,7 +9640,7 @@ impl NativeExecutor {
             params,
         ) {
             if let Some(ref m) = ctx.metrics {
-                reason.count(m);
+                reason.count(m, reason.failure());
             }
             return NativeActionResult::rejected("place_order", (reason.failure(), msg));
         }
@@ -9302,6 +9745,7 @@ impl NativeExecutor {
             // Funnel (perf A1): died pre-book on validation.
             if let Some(ref m) = ctx.metrics {
                 m.orders_rejected_other.inc();
+                m.order_rejected(reject_label(rejection.0));
             }
             return NativeActionResult::rejected("place_order", rejection);
         }
@@ -9352,6 +9796,7 @@ impl NativeExecutor {
             Err(msg) => {
                 if let Some(ref m) = ctx.metrics {
                     m.orders_rejected_other.inc();
+                    m.order_rejected(OrderRejectReason::Price);
                 }
                 return NativeActionResult::rejected("place_order", (FailureReason::Price, msg));
             }
@@ -9398,22 +9843,30 @@ impl NativeExecutor {
                                 // Funnel (perf A1): died pre-book on a state read error.
                                 if let Some(ref m) = ctx.metrics {
                                     m.orders_rejected_other.inc();
+                                    m.order_rejected(OrderRejectReason::Other);
                                 }
                                 return NativeActionResult::err("place_order", e.to_string());
                             }
                         };
                         let free = bal.available + pos_net;
-                        if let Err(rejection) = Self::account_check(
-                            reader.tiers(market_id),
-                            signed,
-                            px,
-                            params,
-                            res_price,
-                            free,
-                        ) {
+                        let tiers = reader.tiers(market_id);
+                        if let Err(rejection) =
+                            Self::account_check(tiers, signed, px, params, res_price, free)
+                        {
                             // Funnel (perf A1): died pre-book on the margin check.
                             if let Some(ref m) = ctx.metrics {
                                 m.orders_rejected_margin.inc();
+                                // s114: the margin split (reservations =
+                                // the sender's resting orders').
+                                m.order_rejected(margin_reject_label(
+                                    rejection.0,
+                                    free,
+                                    bal.order_margin,
+                                    |f| {
+                                        Self::account_check(tiers, signed, px, params, res_price, f)
+                                            .is_ok()
+                                    },
+                                ));
                             }
                             return NativeActionResult::rejected("place_order", rejection);
                         }
@@ -9430,6 +9883,7 @@ impl NativeExecutor {
                             // Funnel (perf A1): died pre-book on a balance write error.
                             if let Some(ref m) = ctx.metrics {
                                 m.orders_rejected_other.inc();
+                                m.order_rejected(OrderRejectReason::Other);
                             }
                             return NativeActionResult::err("place_order", e.to_string());
                         }
@@ -9440,6 +9894,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died pre-book on a balance read error.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Other);
                     }
                     return NativeActionResult::err("place_order", e.to_string());
                 }
@@ -9505,6 +9960,8 @@ impl NativeExecutor {
         );
         // P2-1: the rest of the order / its stop feeds the cancel-all index.
         TraderMarkets::absorb(&mut ctx.trader_markets, book, market_id);
+        // s114 follow-up: and the cloid index (adds before any later check).
+        CloidMarkets::absorb(&mut ctx.cloid_markets, book, market_id);
         book.clear_reduce_only_positions();
         // Plan 9.11 (telemetry): this placement's charged maker fills.
         if let Some(m) = ctx.metrics.as_deref() {
@@ -9580,6 +10037,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     return NativeActionResult::rejected(
                         "place_order",
@@ -9607,6 +10065,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     return NativeActionResult::rejected(
                         "place_order",
@@ -9634,7 +10093,7 @@ impl NativeExecutor {
 
         if let Some(ref m) = ctx.metrics {
             m.orders_matched.inc_by(result.fills.len() as u64);
-            Self::record_order_status_funnel(m, &result.status, result.fills.len());
+            Self::record_order_status_funnel(m, &result.status, result.fills.len(), result.reject);
         }
 
         NativeActionResult::placed(&result)
@@ -9725,9 +10184,37 @@ impl NativeExecutor {
             }
         }
         let Some((market_id, cancelled)) = found else {
-            return NativeActionResult::err("cancel_order", format!("order {order_id} not found"));
+            // s114: a pending stop by id (stops used to be cancellable only
+            // through cancel-all).
+            let stop = ctx
+                .order_books
+                .values()
+                .find_map(|b| b.pending_stop(order_id).map(|s| (b.market_id, s.trader)));
+            return match stop {
+                Some((_, owner)) if owner != *sender => NativeActionResult::err(
+                    "cancel_order",
+                    format!("order {order_id} belongs to {owner}, not sender {sender}"),
+                ),
+                Some((market_id, _)) => {
+                    Self::cancel_stop_in(ctx, "cancel_order", market_id, order_id)
+                }
+                None => {
+                    NativeActionResult::err("cancel_order", format!("order {order_id} not found"))
+                }
+            };
         };
-        // FIX 2 (ECON-FIND-05): Release order margin on cancel.
+        Self::release_cancelled(ctx, market_id, &cancelled);
+        NativeActionResult::ok("cancel_order", 500)
+    }
+
+    /// FIX 2 (ECON-FIND-05): release a cancelled resting order's margin
+    /// (`price × remaining` at the market's integer leverage) and mark its
+    /// market dirty.
+    fn release_cancelled<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_id: MarketId,
+        cancelled: &torus_core::order_book::Order,
+    ) {
         let notional = cancelled.price * cancelled.remaining_qty;
         ctx.dirty_books.insert(market_id);
         let max_lev = ctx
@@ -9741,7 +10228,90 @@ impl NativeExecutor {
         // fail-stops the block (was: skipped / `let _ =`). The result stays
         // `ok`.
         Self::release_order_margin(ctx, &cancelled.trader, margin_to_release);
-        NativeActionResult::ok("cancel_order", 500)
+    }
+
+    /// s114: cancel the pending stop `id` in `market_id` (its owner already
+    /// checked) and release its reservation (`stop_reservation`, what a
+    /// trigger releases).
+    fn cancel_stop_in<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        action_type: &'static str,
+        market_id: MarketId,
+        id: OrderId,
+    ) -> NativeActionResult {
+        let Some(stop) = ctx
+            .order_books
+            .get_mut(&market_id)
+            .and_then(|b| b.cancel_stop(id))
+        else {
+            return NativeActionResult::err(action_type, format!("order {id} not found"));
+        };
+        ctx.dirty_books.insert(market_id);
+        let reserved = Self::stop_reservation(
+            ctx.margin_configs.get(&market_id),
+            stop.reservation_price(),
+            stop.quantity,
+        );
+        Self::release_order_margin(ctx, &stop.trader, reserved);
+        NativeActionResult::ok(action_type, 500)
+    }
+
+    /// s114: `Some(message)` when `cloid` is live for `trader` (a resting
+    /// order or a pending stop) in any book. Follow-up: one index lookup and
+    /// at most one book probe ([`CloidMarkets::live`]), whatever the market
+    /// count; debug builds check the verdict against the full scan.
+    fn duplicate_cloid(
+        books: &HashMap<MarketId, OrderBook>,
+        index: &CloidMarkets,
+        accum: &mut ExecPhaseAccum,
+        trader: &Address,
+        cloid: Cloid,
+    ) -> Option<String> {
+        let live = index.live(books, accum, trader, cloid);
+        debug_assert_eq!(
+            live,
+            books
+                .iter()
+                .filter_map(|(m, b)| b.order_id_by_cloid(trader, cloid).map(|id| (*m, id)))
+                .min(),
+            "cloid index disagrees with the books for {trader}'s cloid {cloid:#x}"
+        );
+        live.map(|(m, id)| {
+            format!(
+                "duplicate cloid {}: open order {id} in market {m} uses it",
+                torus_types::cloid_serde::to_hex(cloid)
+            )
+        })
+    }
+
+    /// s114: `CancelByCloid` — the sender's open order (resting, or a
+    /// pending stop) with `cloid` in `market_id`.
+    fn exec_cancel_by_cloid<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        market_id: MarketId,
+        cloid: Cloid,
+    ) -> NativeActionResult {
+        const ACTION: &str = "cancel_by_cloid";
+        let Some(book) = ctx.order_books.get_mut(&market_id) else {
+            return NativeActionResult::err(ACTION, format!("market {market_id} has no book"));
+        };
+        let Some(id) = book.order_id_by_cloid(sender, cloid) else {
+            return NativeActionResult::err(
+                ACTION,
+                format!(
+                    "no open order with cloid {} in market {market_id}",
+                    torus_types::cloid_serde::to_hex(cloid)
+                ),
+            );
+        };
+        match book.cancel_order(id) {
+            Ok(cancelled) => {
+                Self::release_cancelled(ctx, market_id, &cancelled);
+                NativeActionResult::ok(ACTION, 500)
+            }
+            Err(_) => Self::cancel_stop_in(ctx, ACTION, market_id, id),
+        }
     }
 
     fn exec_cancel_all<T: StateBackend>(
@@ -10255,6 +10825,9 @@ impl NativeExecutor {
         // P2-1: a re-inserted order feeds the index (its market is listed
         // already: the old order rested there).
         TraderMarkets::absorb(&mut ctx.trader_markets, book, market_id);
+        // s114 follow-up: no cloid-index feed needed: the re-inserted order
+        // keeps its cloid, id and market, so the index entry stays right;
+        // the logged keys wait for the stash.
         if let Err(e) = modified {
             // Unreachable (the order was found above) — undo the reserve.
             Self::release_order_margin(ctx, sender, extra);
@@ -11197,6 +11770,8 @@ impl NativeExecutor {
                         trader: Address::ZERO,
                         queued_block: 0,
                         result: NativeActionResult::err("core_writer", bad.to_string()),
+                        oid: None,
+                        cloid: None,
                     });
                     continue;
                 }
@@ -11207,6 +11782,12 @@ impl NativeExecutor {
                 trader: qa.trader,
                 queued_block: qa.block_queued,
                 result,
+                oid: None,
+                cloid: match qa.kind {
+                    QueuedActionKind::PlaceOrder { cloid, .. } => cloid,
+                    QueuedActionKind::CancelByCloid { cloid, .. } => Some(cloid),
+                    _ => None,
+                },
             };
             // BUG FIX (3.1): CoreWriter delay guard — skip any action that was
             // queued in the current or a future block (should never happen, but
@@ -11229,12 +11810,24 @@ impl NativeExecutor {
 
             // HL-parity: a stop order type (a row queued before the precompile
             // rejected them) fails instead of running as a plain Limit order.
+            // s114 (follow-up 2): a placement that reaches the book takes the
+            // next global order id (`place_order_inner` hands the book
+            // `next_global_order_id` and keeps what it allocated; stops it
+            // triggers keep their own ids), so an executed CoreWriter
+            // placement that advanced the counter got the id it read before.
+            let next_oid = ctx.next_global_order_id;
             let result = match core_writer_to_native(qa) {
                 Ok(Some(action)) => Self::execute(ctx, &qa.trader, &action),
                 Ok(None) => Self::exec_settle_lockbox_deposit(ctx, qa),
                 Err(e) => NativeActionResult::err("core_writer", e),
             };
-            entries.push(drained(result));
+            let placed = matches!(qa.kind, QueuedActionKind::PlaceOrder { .. })
+                && result.success
+                && ctx.next_global_order_id > next_oid;
+            entries.push(CoreWriterDrained {
+                oid: placed.then_some(next_oid),
+                ..drained(result)
+            });
         }
         Ok(entries)
     }
@@ -11538,9 +12131,9 @@ pub enum ActionCategory {
 /// Classify a NativeAction for block ordering.
 pub fn classify_action(action: &NativeAction) -> ActionCategory {
     match action {
-        NativeAction::CancelOrder { .. } | NativeAction::CancelAllOrders { .. } => {
-            ActionCategory::Cancellation
-        }
+        NativeAction::CancelOrder { .. }
+        | NativeAction::CancelAllOrders { .. }
+        | NativeAction::CancelByCloid { .. } => ActionCategory::Cancellation,
         NativeAction::PlaceOrder(params) => match params.order_type {
             OrderType::Market | OrderType::StopMarket { .. } => ActionCategory::NonGtcOrder,
             _ => match params.time_in_force {
@@ -11654,6 +12247,7 @@ fn core_writer_to_native(qa: &QueuedAction) -> Result<Option<NativeAction>, Stri
             price,
             quantity,
             time_in_force,
+            cloid,
         } => NativeAction::PlaceOrder(PlaceOrderParams {
             market_id: *market_id,
             is_buy: *side == 0,
@@ -11663,13 +12257,17 @@ fn core_writer_to_native(qa: &QueuedAction) -> Result<Option<NativeAction>, Stri
                 .ok_or_else(|| format!("unsupported CoreWriter order_type {order_type}"))?,
             time_in_force: decode_time_in_force(*time_in_force),
             reduce_only: false,
-            client_order_id: None,
+            client_order_id: *cloid,
         }),
         QueuedActionKind::CancelOrder { order_id } => NativeAction::CancelOrder {
             order_id: *order_id,
         },
         QueuedActionKind::CancelAll { market_id } => NativeAction::CancelAllOrders {
             market_id: Some(*market_id),
+        },
+        QueuedActionKind::CancelByCloid { market_id, cloid } => NativeAction::CancelByCloid {
+            market_id: *market_id,
+            cloid: *cloid,
         },
         QueuedActionKind::Delegate { validator, amount } => NativeAction::Delegate {
             validator: *validator,
@@ -11707,6 +12305,7 @@ mod core_writer_conversion_tests {
                 price: FixedPoint::from_raw(100),
                 quantity: FixedPoint::from_raw(1),
                 time_in_force: 0,
+                cloid: None,
             },
             block_queued: 1,
         }
@@ -11733,6 +12332,10 @@ mod core_writer_conversion_tests {
             QueuedActionKind::ClaimRewards,
             QueuedActionKind::LockPermanent { amount: fp },
             QueuedActionKind::ClaimUnbonded,
+            QueuedActionKind::CancelByCloid {
+                market_id: 1,
+                cloid: 2,
+            },
             QueuedActionKind::LockboxDeposit { amount: fp },
             QueuedActionKind::LockboxWithdraw { amount: fp },
         ];
@@ -11776,6 +12379,7 @@ fn queued_kind(kind: &QueuedActionKind) -> CoreWriterKind {
         QueuedActionKind::ClaimRewards => CoreWriterKind::ClaimRewards,
         QueuedActionKind::LockPermanent { .. } => CoreWriterKind::LockPermanent,
         QueuedActionKind::ClaimUnbonded => CoreWriterKind::ClaimUnbonded,
+        QueuedActionKind::CancelByCloid { .. } => CoreWriterKind::CancelByCloid,
         QueuedActionKind::LockboxDeposit { .. } => CoreWriterKind::LockboxDeposit,
         QueuedActionKind::LockboxWithdraw { .. } => CoreWriterKind::LockboxWithdraw,
     }

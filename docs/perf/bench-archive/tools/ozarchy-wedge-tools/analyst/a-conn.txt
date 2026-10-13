@@ -1,0 +1,34 @@
+r1-wm k1 val0 disc=10.03 conn=13.94 est=1 ghost=False | val2 disc=10.00 conn=13.99 est=1 ghost=False
+r1-wm k2 val0 disc=10.00 conn=20.72 est=1 ghost=False | val2 disc=10.03 conn=20.73 est=1 ghost=False
+r1-wm k3 val0 disc=10.01 conn=22.25 est=1 ghost=False | val2 disc=10.01 conn=22.25 est=1 ghost=False
+r1-wm k4 val0 disc=10.03 conn=16.58 est=1 ghost=False | val2 disc=10.00 conn=16.59 est=1 ghost=False
+r2b-wm k1 val0 disc=10.01 conn=11.33 est=1 ghost=False | val2 disc=10.01 conn=11.33 est=1 ghost=False
+r2b-wm k2 val0 disc=10.01 conn=20.22 est=1 ghost=False | val2 disc=10.01 conn=20.27 est=1 ghost=False
+r2b-wm k3 val0 disc=10.00 conn=23.13 est=1 ghost=False | val2 disc=10.00 conn=23.14 est=1 ghost=False
+r2b-wm k4 val0 disc=10.03 conn=16.51 est=1 ghost=False | val2 disc=10.03 conn=16.51 est=1 ghost=False
+r3-wm k1 val0 disc=10.00 conn=12.69 est=1 ghost=False | val2 disc=10.00 conn=12.70 est=1 ghost=False
+r3-wm k2 val0 disc=10.02 conn=15.83 est=1 ghost=False | val2 disc=10.02 conn=15.84 est=1 ghost=False
+r3-wm k3 val0 disc=10.03 conn=19.06 est=1 ghost=False | val2 disc=10.01 conn=19.07 est=1 ghost=False
+r3-wm k4 val0 disc=9.99 conn=25.33 est=1 ghost=False | val2 disc=10.06 conn=25.34 est=1 ghost=False
+r4-wm k1 val0 disc=10.03 conn=12.85 est=1 ghost=False | val2 disc=10.03 conn=12.85 est=1 ghost=False
+r4-wm k2 val0 disc=10.05 conn=21.03 est=1 ghost=False | val2 disc=10.01 conn=21.03 est=1 ghost=False
+r4-wm k3 val0 disc=10.04 conn=29.70 est=1 ghost=False | val2 disc=10.04 conn=29.70 est=1 ghost=False
+r4-wm k4 val0 disc=10.02 conn=15.62 est=1 ghost=False | val2 disc=10.01 conn=15.62 est=1 ghost=False
+r1-wf k1 val0 disc=10.02 conn=12.93 est=1 ghost=False | val2 disc=10.02 conn=12.93 est=1 ghost=False
+r1-wf k2 val0 disc=10.04 conn=23.42 est=1 ghost=False | val2 disc=10.04 conn=23.43 est=1 ghost=False
+r1-wf k3 val0 disc=10.01 conn=27.07 est=1 ghost=False | val2 disc=10.01 conn=27.08 est=1 ghost=False
+r1-wf k4 val0 disc=10.11 conn=21.07 est=1 ghost=False | val2 disc=9.98 conn=21.08 est=1 ghost=False
+r2b-wf k1 val0 disc=10.07 conn=11.32 est=1 ghost=False | val2 disc=10.00 conn=11.36 est=1 ghost=False
+r2b-wf k2 val0 disc=10.01 conn=21.41 est=1 ghost=False | val2 disc=10.02 conn=21.42 est=1 ghost=False
+r2b-wf k3 val0 disc=10.01 conn=12.55 est=1 ghost=False | val2 disc=10.01 conn=12.55 est=1 ghost=False
+r2b-wf k4 val0 disc=10.00 conn=16.55 est=1 ghost=False | val2 disc=10.02 conn=16.55 est=1 ghost=False
+r3-wf k1 val0 disc=10.00 conn=12.99 est=1 ghost=False | val2 disc=10.01 conn=13.00 est=1 ghost=False
+r3-wf k2 val0 disc=10.01 conn=20.25 est=1 ghost=False | val2 disc=10.01 conn=20.25 est=1 ghost=False
+r3-wf k3 val0 disc=10.00 conn=24.14 est=1 ghost=False | val2 disc=10.01 conn=24.20 est=1 ghost=False
+r3-wf k4 val0 disc=10.00 conn=18.15 est=1 ghost=False | val2 disc=10.00 conn=18.15 est=1 ghost=False
+r4-wf k1 val0 disc=10.00 conn=11.22 est=1 ghost=False | val2 disc=10.00 conn=11.22 est=1 ghost=False
+r4-wf k2 val0 disc=10.05 conn=19.23 est=1 ghost=False | val2 disc=10.05 conn=19.24 est=1 ghost=False
+r4-wf k3 val0 disc=10.01 conn=21.08 est=1 ghost=False | val2 disc=10.01 conn=21.13 est=1 ghost=False
+r4-wf k4 val0 disc=10.00 conn=18.06 est=1 ghost=False | val2 disc=10.00 conn=18.07 est=1 ghost=False
+TOTAL wm survivor-kill pairs 32 ghost 0
+TOTAL wf survivor-kill pairs 32 ghost 0

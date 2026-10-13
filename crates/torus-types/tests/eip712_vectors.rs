@@ -114,7 +114,7 @@ fn all_vectors() -> Vec<Vector> {
     let addr1 = Address::from([0x11; 20]);
     let addr2 = Address::from([0x22; 20]);
 
-    let mk_place = |is_buy, order_type, tif, reduce_only, coid: Option<u64>| -> NativeAction {
+    let mk_place = |is_buy, order_type, tif, reduce_only, coid: Option<u128>| -> NativeAction {
         NativeAction::PlaceOrder(PlaceOrderParams {
             market_id: 1,
             is_buy,
@@ -168,6 +168,23 @@ fn all_vectors() -> Vec<Vector> {
                 false,
                 Some(1337),
             ),
+        ),
+        build_vector(
+            "PlaceOrder_Limit_Buy_Cloid128",
+            mk_place(
+                true,
+                OrderType::Limit,
+                TimeInForce::GTC,
+                false,
+                Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
+            ),
+        ),
+        build_vector(
+            "CancelByCloid",
+            NativeAction::CancelByCloid {
+                market_id: 1,
+                cloid: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+            },
         ),
         build_vector(
             "CancelOrder_SmallId",

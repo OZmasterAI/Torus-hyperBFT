@@ -665,6 +665,7 @@ fn queue_enqueue_and_drain() {
             price: fp(50_000),
             quantity: fp(5),
             time_in_force: 0,
+            cloid: None,
         },
         block_queued: 100,
     };
@@ -1134,4 +1135,124 @@ fn read_only_is_transparent_for_reader_precompiles() {
         "reader precompile must still run in read-only mode"
     );
     assert_eq!(ro.unwrap(), normal.unwrap());
+}
+
+// ============================================================================
+// s114 cloid: placeOrder with a cloid, cancelByCloid
+// ============================================================================
+
+const CLOID_PLACE_SIG: &str = "placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8,uint128)";
+/// Above u64::MAX.
+const CW_CLOID: u128 = 0xc10d_0000_0000_0000_0000_0000_0000_0007;
+
+fn queued(db: &StateDb, block: u64) -> Vec<QueuedAction> {
+    CoreWriterQueue::drain_keyed(db, block)
+        .unwrap()
+        .into_iter()
+        .map(|(_, r)| r.expect("row decodes"))
+        .collect()
+}
+
+/// The 7-word selector queues the cloid (0 = none); the 6-word one still
+/// queues an order without one.
+#[test]
+fn core_writer_place_order_with_cloid_queues_it() {
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_CORE_WRITER);
+    let words = |cloid: u128| {
+        build_input(
+            CLOID_PLACE_SIG,
+            &[
+                encode_market_id(1),
+                abi::encode_u8(0),
+                abi::encode_u8(0),
+                abi::encode_u128(fp(50_000).raw() as u128),
+                abi::encode_u128(fp(5).raw() as u128),
+                abi::encode_u8(0),
+                abi::encode_u128(cloid),
+            ],
+        )
+    };
+    let out = execute_precompile(&address, &words(CW_CLOID), &addr(1), &db, 100, 0).unwrap();
+    assert_eq!(out, vec![0u8; 32]);
+    execute_precompile(&address, &words(0), &addr(1), &db, 100, 0).unwrap();
+    execute_precompile(&address, &place_order_input(0), &addr(1), &db, 100, 0).unwrap();
+    let cloids: Vec<Option<u128>> = queued(&db, 101)
+        .into_iter()
+        .map(|qa| match qa.kind {
+            QueuedActionKind::PlaceOrder { cloid, .. } => cloid,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(cloids, vec![Some(CW_CLOID), None, None]);
+}
+
+#[test]
+fn core_writer_cancel_by_cloid_queues_it() {
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_CORE_WRITER);
+    let input = build_input(
+        "cancelByCloid(bytes32,uint128)",
+        &[encode_market_id(3), abi::encode_u128(CW_CLOID)],
+    );
+    let out = execute_precompile(&address, &input, &addr(1), &db, 100, 0).unwrap();
+    assert_eq!(out, abi::encode_bool(true).to_vec());
+    let rows = queued(&db, 101);
+    assert_eq!(rows.len(), 1);
+    match &rows[0].kind {
+        QueuedActionKind::CancelByCloid { market_id, cloid } => {
+            assert_eq!((*market_id, *cloid), (3, CW_CLOID))
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Row formats: a placement row ends with its cloid option (`0` or
+/// `1 ‖ 16 BE`); cancel-by-cloid is tag 8 (`market 8 BE ‖ cloid 16 BE`).
+#[test]
+fn cloid_queue_rows_round_trip() {
+    use borsh::BorshDeserialize;
+    let place = |cloid| QueuedActionKind::PlaceOrder {
+        market_id: 1,
+        side: 1,
+        order_type: 0,
+        price: fp(10),
+        quantity: fp(1),
+        time_in_force: 3,
+        cloid,
+    };
+    for kind in [
+        place(Some(CW_CLOID)),
+        place(None),
+        QueuedActionKind::CancelByCloid {
+            market_id: 9,
+            cloid: CW_CLOID,
+        },
+    ] {
+        let qa = QueuedAction {
+            trader: addr(3),
+            kind,
+            block_queued: 42,
+        };
+        let bytes = borsh::to_vec(&qa).unwrap();
+        let back = QueuedAction::try_from_slice(&bytes).unwrap();
+        assert_eq!(format!("{qa:?}"), format!("{back:?}"));
+        match qa.kind {
+            QueuedActionKind::PlaceOrder { cloid: Some(c), .. } => {
+                let mut tail = vec![1u8];
+                tail.extend_from_slice(&c.to_be_bytes());
+                assert!(bytes.ends_with(&tail));
+            }
+            QueuedActionKind::PlaceOrder { cloid: None, .. } => {
+                assert_eq!(*bytes.last().unwrap(), 0)
+            }
+            QueuedActionKind::CancelByCloid { .. } => {
+                let mut want = vec![8u8];
+                want.extend_from_slice(&9u64.to_be_bytes());
+                want.extend_from_slice(&CW_CLOID.to_be_bytes());
+                assert_eq!(&bytes[28..], &want[..]);
+            }
+            _ => unreachable!(),
+        }
+    }
 }

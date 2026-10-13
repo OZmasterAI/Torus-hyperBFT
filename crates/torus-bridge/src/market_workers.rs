@@ -1,6 +1,6 @@
 //! Per-market parallel order matching pool.
 //!
-//! Dispatches PlaceOrder batches to scoped threads for concurrent matching.
+//! Dispatches PlaceOrder batches to the persistent exec pool (`exec_pool`, P2-3) for concurrent matching.
 //! Each thread temporarily owns its market's OrderBook for cache-local access.
 
 use alloy_primitives::map::HashMap;
@@ -47,10 +47,10 @@ pub struct MarketWorkerPanic {
     pub message: String,
 }
 
-/// Parallel matching dispatcher using scoped threads.
+/// Parallel matching dispatcher on the persistent exec pool (P2-3; was scoped threads).
 ///
-/// Each market's batch runs on a dedicated thread for the duration of matching.
-/// The thread owns the OrderBook during execution, ensuring cache-local access
+/// Each chunk of markets runs as one job on a pool thread for the duration of
+/// matching. The job owns the OrderBook during execution, ensuring cache-local access
 /// to BTreeMap nodes without lock contention.
 pub struct MarketWorkerPool;
 
@@ -58,7 +58,7 @@ impl MarketWorkerPool {
     /// Match orders across multiple markets in parallel.
     ///
     /// Takes ownership of each market's OrderBook, dispatches matching to a
-    /// CAPPED set of scoped threads, and returns updated books with match
+    /// CAPPED set of exec pool jobs (P2-3), and returns updated books with match
     /// results. Return order is unspecified (the caller sorts by market_id).
     ///
     /// Worker cap: `TORUS_MATCH_WORKERS` (usize, clamped to >= 1) overrides;
@@ -119,10 +119,10 @@ impl MarketWorkerPool {
             .map(|r| vec![r]);
         }
 
-        // Multiple markets — chunk them across at most `max_workers` scoped
-        // threads. The borrowed `MatchRequest.params` refs outlive the scope
-        // (they borrow from the caller's action slice), so scoped threads may
-        // capture them freely; each chunk is moved into its worker thread.
+        // Multiple markets — chunk them across at most `max_workers` pool
+        // jobs. The borrowed `MatchRequest.params` refs outlive the scope
+        // (they borrow from the caller's action slice), so pool jobs (P2-3) may
+        // capture them freely; each chunk is moved into its job.
         let batches_vec: Vec<(MarketId, OrderBook, Vec<MatchRequest<'a>>)> = batches
             .into_iter()
             .map(|(id, (book, reqs))| (id, book, reqs))
@@ -154,35 +154,31 @@ impl MarketWorkerPool {
                 Self::match_market(market_id, book, requests, timestamp, makers)
             };
 
-        torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::Match, chunks.len());
-        std::thread::scope(|s| {
-            let handles: Vec<_> = chunks
-                .into_iter()
-                .map(|chunk| {
-                    // First market in the chunk represents it for the (theoretical)
-                    // join-failure fallback — a contained worker never unwinds.
-                    let rep = chunk[0].0;
-                    (rep, s.spawn(move || Self::process_chunk(chunk, &match_one)))
-                })
-                .collect();
+        // P2-3: the chunks run as jobs on the persistent exec pool (no
+        // per-block spawns); a job that dies outside the per-market
+        // containment is reported as a scoped thread's join failure was.
+        let reps: Vec<MarketId> = chunks.iter().map(|chunk| chunk[0].0).collect();
+        let jobs: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| move || Self::process_chunk(chunk, &match_one))
+            .collect();
 
-            // Flatten per-worker results in worker order; the first `Err`
-            // short-circuits and the remaining scoped threads are joined at
-            // scope exit. Return order is irrelevant (caller sorts by id).
-            let mut out = Vec::with_capacity(n);
-            for (rep, h) in handles {
-                let chunk_results = h.join().unwrap_or_else(|_| {
-                    vec![Err(MarketWorkerPanic {
-                        market_id: rep,
-                        message: "worker thread died outside contained matching".to_string(),
-                    })]
-                });
-                for r in chunk_results {
-                    out.push(r?);
-                }
+        // Flatten per-job results in job order; the first `Err`
+        // short-circuits (every job has already ended). Return order is
+        // irrelevant (caller sorts by id).
+        let mut out = Vec::with_capacity(n);
+        for (rep, joined) in reps.into_iter().zip(crate::exec_pool::run_jobs(jobs)) {
+            let chunk_results = joined.unwrap_or_else(|_| {
+                vec![Err(MarketWorkerPanic {
+                    market_id: rep,
+                    message: "worker thread died outside contained matching".to_string(),
+                })]
+            });
+            for r in chunk_results {
+                out.push(r?);
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// Resolve the worker cap: `TORUS_MATCH_WORKERS` (clamped to >= 1) if set and

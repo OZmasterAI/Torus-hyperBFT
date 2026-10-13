@@ -1,0 +1,8 @@
+resume_s                n=16 wm mean 19.98 wf mean 19.06  wf-wm -0.92 s [-3.39, +1.54]  wm max 29.92 wf max 27.26
+resume_s     minus netup n=16 wm mean 1.43 wf mean 0.84  wf-wm -0.59 s [-2.05, +0.87]  wm max 6.26 wf max 5.64
+max_gap_s               n=16 wm mean 19.74 wf mean 18.62  wf-wm -1.11 s [-3.66, +1.43]  wm max 29.64 wf max 27.18
+max_gap_s    minus netup n=16 wm mean 1.19 wf mean 0.41  wf-wm -0.78 s [-2.31, +0.75]  wm max 6.23 wf max 5.07
+netup_s                 n=16 wm mean 18.55 wf mean 18.21  wf-wm -0.33 s [-2.89, +2.22]  wm max 29.70 wf max 27.07
+netup_s      minus netup n=16 wm mean 0.00 wf mean 0.00  wf-wm +0.00 s [+0.00, +0.00]  wm max 0.00 wf max 0.00
+kill_node_s             n=16 wm mean 19.16 wf mean 18.54  wf-wm -0.62 s [-3.18, +1.95]  wm max 29.87 wf max 27.22
+kill_node_s  minus netup n=16 wm mean 0.61 wf mean 0.33  wf-wm -0.28 s [-1.02, +0.46]  wm max 4.25 wf max 2.93

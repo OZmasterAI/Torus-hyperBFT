@@ -1,0 +1,4 @@
+ozarchy-p3jesoak-300m-k1-ja REJECT DISAGREE cmp_height [2669, 2669, 2669] block_hash equal True digest_height [2701, 2702, 2702] digest_s [50.5, 18.6, 51.9] distinct digests 2
+  val1 vs val0: 50 lines differ, fields ['accountValue', 'freeMargin', 'maintenanceMarginUsed', 'totalMarginUsed', 'withdrawable'], class mark-only
+ozarchy-p3je-sat-300m-r4-ja REJECT DISAGREE cmp_height [1174, 1174, 1174] block_hash equal True digest_height [1206, 1207, 1207] digest_s [40.7, 41.3, 40.4] distinct digests 2
+  val1 vs val0: 50 lines differ, fields ['accountValue', 'freeMargin', 'maintenanceMarginUsed', 'totalMarginUsed', 'withdrawable'], class mark-only

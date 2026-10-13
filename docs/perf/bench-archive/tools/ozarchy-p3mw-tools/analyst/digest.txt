@@ -1,0 +1,8 @@
+r1-g2 rc=0 ACCEPT AGREE {"verdict": "AGREE", "digest_s": [20.3, 21.1, 20.2], "diffs": {}}
+r1-mw rc=0 ACCEPT AGREE {"verdict": "AGREE", "digest_s": [18.5, 17.9, 24.1], "diffs": {}}
+r2-mw rc=0 ACCEPT AGREE {"verdict": "AGREE", "digest_s": [46.2, 47.5, 68.6], "diffs": {}}
+r2-g2 rc=0 ACCEPT AGREE {"verdict": "AGREE", "digest_s": [17.2, 17.4, 37.4], "diffs": {}}
+r3-g2 rc=0 ACCEPT AGREE {"verdict": "AGREE", "digest_s": [95.4, 92.3, 93.9], "diffs": {}}
+r3-mw rc=2 REJECT DISAGREE {"verdict": "DISAGREE", "digest_s": [17.9, 17.9, 42.8], "diffs": {"val2": {"vs": "val0", "lines": 50, "fields": ["accountValue", "freeMargin", "maintenanceMarginUsed", "totalMarginUsed", "withdrawable"], "cls": "mark-only", "accountValue_eq_cash": 39}}}
+r4-mw rc=2 REJECT DISAGREE {"verdict": "DISAGREE", "digest_s": [26.0, 25.4, 50.8], "diffs": {"val2": {"vs": "val0", "lines": 50, "fields": ["accountValue", "freeMargin", "maintenanceMarginUsed", "totalMarginUsed", "withdrawable"], "cls": "mark-only", "accountValue_eq_cash": 49}}}
+r4-g2 rc=2 REJECT DISAGREE {"verdict": "DISAGREE", "digest_s": [88.5, 23.5, 21.8], "diffs": {"val0": {"vs": "val1", "lines": 50, "fields": ["accountValue", "freeMargin", "maintenanceMarginUsed", "totalMarginUsed", "withdrawable"], "cls": "mark-only", "accountValue_eq_cash": 50}}}

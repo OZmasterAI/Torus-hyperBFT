@@ -6941,6 +6941,7 @@ dependencies = [
  "ed25519-dalek",
  "foldhash 0.2.0",
  "k256",
+ "rayon",
  "revm",
  "rocksdb",
  "serde_json",
