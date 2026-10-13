@@ -57,6 +57,17 @@ hotstuff_rs = { workspace = true }
 # borsh is v1 and its traits don't match hotstuff_rs types.
 borsh = "0.10"
 
+[features]
+default = ["jemalloc"]
+# jemalloc as the process allocator (Linux only; elsewhere this is a no-op).
+# Unprefixed: it also serves C/C++ malloc (RocksDB), like LD_PRELOAD jemalloc.
+# `--no-default-features` builds torus-node on the system allocator.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.7", optional = true, features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.7", optional = true, features = ["stats"] }
+
 [target.'cfg(unix)'.dependencies]
 # getrlimit/setrlimit: raise the soft open-file limit at startup.
 libc = "0.2"

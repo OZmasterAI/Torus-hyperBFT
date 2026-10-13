@@ -639,6 +639,8 @@ pub struct Metrics {
     /// r3: DB-wide RocksDB runtime state + statistics (unlabelled, sampled every
     /// few seconds; the per-CF labelled families above stay for the deep dive).
     pub rocksdb: RocksdbStatMetrics,
+    /// Process allocator (jemalloc) stats; 0 on a system-allocator build.
+    pub jemalloc: JemallocMetrics,
     /// L3 level-hash sponge cache (`TORUS_LEVEL_HASH_CACHE`, default-off): cumulative
     /// O(tail) sponge extensions summed across every book, sampled per block after
     /// `save_order_books`. Set-as-Gauge of a monotonic sum (see `misses`/`seeds`).
@@ -769,6 +771,54 @@ pub struct Metrics {
     /// `TORUS_D2L_BATCH_MAX_BYTES` cap against real traffic (design §7 flags
     /// the per-order bincode size as unmeasured).
     pub d2l_envelope_bytes: Histogram,
+}
+
+/// Process allocator (jemalloc) statistics, unlabelled `torus_jemalloc_*_bytes`
+/// gauges filled by the node's sampler from `stats.{allocated,active,resident,
+/// retained,mapped}`. They stay 0 when torus-node is built without its
+/// `jemalloc` feature (system allocator). resident - allocated is allocator
+/// overhead + dirty pages; retained is virtual memory kept but not resident.
+#[derive(Clone)]
+pub struct JemallocMetrics {
+    pub allocated: Gauge,
+    pub active: Gauge,
+    pub resident: Gauge,
+    pub retained: Gauge,
+    pub mapped: Gauge,
+}
+
+impl JemallocMetrics {
+    /// Every metric name this block registers, in registration order.
+    pub const NAMES: [&'static str; 5] = [
+        "torus_jemalloc_allocated_bytes",
+        "torus_jemalloc_active_bytes",
+        "torus_jemalloc_resident_bytes",
+        "torus_jemalloc_retained_bytes",
+        "torus_jemalloc_mapped_bytes",
+    ];
+
+    const HELP: [&'static str; 5] = [
+        "jemalloc stats.allocated: bytes in live allocations",
+        "jemalloc stats.active: bytes in active pages",
+        "jemalloc stats.resident: bytes in physically resident pages",
+        "jemalloc stats.retained: bytes retained (virtual, not returned to the OS)",
+        "jemalloc stats.mapped: bytes in active extents mapped by the allocator",
+    ];
+
+    fn register(registry: &mut Registry) -> Self {
+        let [allocated, active, resident, retained, mapped] = std::array::from_fn(|i| {
+            let g = Gauge::default();
+            registry.register(Self::NAMES[i], Self::HELP[i], g.clone());
+            g
+        });
+        Self {
+            allocated,
+            active,
+            resident,
+            retained,
+            mapped,
+        }
+    }
 }
 
 /// r3 exec-write-stall-attribution: DB-wide RocksDB runtime state and
@@ -2255,6 +2305,7 @@ impl Metrics {
         );
 
         let rocksdb = RocksdbStatMetrics::register(&mut registry);
+        let jemalloc = JemallocMetrics::register(&mut registry);
 
         let exec_level_hash_cache_hits = Gauge::default();
         registry.register(
@@ -2717,6 +2768,7 @@ impl Metrics {
             exec_save_books_write_seconds,
             exec_native_blocks,
             rocksdb,
+            jemalloc,
             exec_level_hash_cache_hits,
             exec_level_hash_cache_misses,
             exec_level_hash_cache_seeds,
@@ -3357,6 +3409,23 @@ mod tests {
             "torus_exec_level_hash_cache_entries",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+    }
+
+    /// The process-allocator gauges are registered unlabelled under
+    /// `torus_jemalloc_*_bytes` and carry the value the sampler sets.
+    #[test]
+    fn jemalloc_metrics_register() {
+        let m = Metrics::new();
+        m.jemalloc.allocated.set(11);
+        m.jemalloc.active.set(12);
+        m.jemalloc.resident.set(13);
+        m.jemalloc.retained.set(14);
+        m.jemalloc.mapped.set(15);
+        let text = m.encode();
+        for (name, v) in JemallocMetrics::NAMES.iter().zip(11..) {
+            let line = format!("{name} {v}");
+            assert!(text.lines().any(|l| l == line), "{line} missing:\n{text}");
         }
     }
 
