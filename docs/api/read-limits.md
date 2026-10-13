@@ -89,7 +89,7 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `eth_chainId`, `eth_blockNumber`, `eth_gasPrice`, `eth_maxPriorityFeePerGas` | Constant: none, or one header. | none needed |
 | `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` | Constant: account, code and storage point reads at the head. | none needed |
 | `eth_getTransactionByHash`, `eth_getTransactionReceipt` | Constant: the hash index, then one body or receipt. | none needed |
-| `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex` | One block: its header, body and receipts (at most the block's EVM transactions, which its gas limit bounds). | none needed |
+| `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex` | One block: its header, body and receipt slots. NOT charged to the scan budget: the receipt lookup reads one slot per submitted transaction, including undecodable ones that the gas limit does not bound (see Follow-ups). | none |
 | `eth_call`, `eth_estimateGas` | The gas limit bounds the EVM's work (state point reads). | none needed |
 | `eth_getLogs` | Its own limits: a range of at most 10,000 blocks and at most 10,000 logs. Every receipt of every block in the range with EVM transactions is read, even when the filter keeps none of its logs. | `lib.rs` getLogs tests |
 | `eth_feeHistory` | Its own limit: at most 1024 headers. | none needed |
@@ -144,6 +144,7 @@ index exists, or have a known cost noted here:
 - `torus_getValidators` matches each validator against every other
   (quadratic CPU in the validator count; the rows read are the reply): a map
   by address would make it linear.
+- `eth_getBlockByNumber` / `ByHash`, the transaction-count and by-index lookups (and the receipts they load): `get_block_receipts` reads every submitted transaction slot of the block, including undecodable ones, without charging the scan budget (Codex R24 round 4: 100,000 submitted slots, budget 1, 571 ms for a one-field reply). Charge the slot reads to one request budget.
 - `eth_getLogs`: receipts of blocks whose logs the filter drops are not
   counted toward any limit; charging each receipt to the scan budget would
   bound a narrow filter over a full 10,000-block range.
