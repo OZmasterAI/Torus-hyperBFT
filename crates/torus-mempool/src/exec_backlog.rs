@@ -145,16 +145,67 @@ mod tests {
         assert_eq!(b.outstanding(), 0);
     }
 
+    /// Codex r1 finding 2: the teardown is terminal. A registration after it
+    /// is a no-op (no scan, no count), so a dispatch racing the exec loop's
+    /// fail-stop can never leave a positive count behind.
     #[test]
-    fn clear_drops_everything_and_later_heights_count_again() {
+    fn clear_is_terminal_later_heights_never_count() {
         let b = ExecBacklog::default();
         b.dispatched(7, || 9, nop);
         b.dispatched(8, || 1, nop);
         b.clear(nop);
         assert_eq!(b.outstanding(), 0);
         assert_eq!(b.outstanding_heights(), 0);
-        b.dispatched(9, || 2, nop);
-        assert_eq!(b.outstanding(), 2);
+        b.dispatched(9, || panic!("scanned after the teardown"), nop);
+        assert_eq!(b.outstanding(), 0);
+    }
+
+    /// Codex r1 finding 3: the exec thread's release must never wait on a
+    /// registration that is scanning a block's actions. The scan is paused
+    /// (bounded) until the release completes; the release must finish while
+    /// the scan is still paused.
+    #[test]
+    fn release_never_waits_on_an_in_progress_registration_scan() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let b = std::sync::Arc::new(ExecBacklog::default());
+        b.dispatched(1, || 5, nop);
+        let (in_scan_tx, in_scan_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let registrar = {
+            let b = b.clone();
+            std::thread::spawn(move || {
+                b.dispatched(
+                    2,
+                    || {
+                        in_scan_tx.send(()).unwrap();
+                        // Paused mid-scan; bounded so a regression fails
+                        // instead of deadlocking.
+                        let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+                        3
+                    },
+                    nop,
+                );
+            })
+        };
+        in_scan_rx.recv().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let exec = {
+            let b = b.clone();
+            std::thread::spawn(move || {
+                b.finished_through(1, nop);
+                done_tx.send(()).unwrap();
+            })
+        };
+        let released_during_scan = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let _ = resume_tx.send(());
+        registrar.join().unwrap();
+        exec.join().unwrap();
+        assert!(
+            released_during_scan,
+            "exec release blocked by an in-progress registration scan"
+        );
+        assert_eq!(b.outstanding(), 3);
     }
 
     #[test]

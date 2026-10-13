@@ -3182,6 +3182,21 @@ mod tests {
         assert!(!pool.native_admission_backlogged());
     }
 
+    /// Codex r1 finding 2: the teardown is terminal. Once the execution
+    /// pipeline is gone, a later dispatch never counts, so nothing can leak.
+    #[test]
+    fn exec_aware_teardown_is_terminal() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, exec_aware_cfg(true, 10_000, 4));
+        pool.note_exec_dispatched(12, &committed_body(40, 9, 0));
+        assert_eq!(pool.committed_unexecuted_normal(), 9);
+        pool.clear_exec_backlog();
+        assert_eq!(pool.committed_unexecuted_normal(), 0);
+        pool.note_exec_dispatched(13, &committed_body(60, 4, 0));
+        assert_eq!(pool.committed_unexecuted_normal(), 0, "counted after teardown");
+        assert!(!pool.native_admission_backlogged());
+    }
+
     /// Knob on but the admission limit off (horizon 0): nothing to add the
     /// work to, so nothing is tracked and nothing sheds.
     #[test]

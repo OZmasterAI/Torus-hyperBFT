@@ -8940,6 +8940,108 @@ mod exec_dispatch_tests {
         assert_eq!(rx.recv().unwrap().torus_block.header.height, 1);
         assert_eq!(mempool.committed_unexecuted_normal(), 0);
     }
+
+    /// What `execution_loop` does with a message once it executed it.
+    fn exec_done(mempool: &Mempool, msg: CommittedBlockMsg) {
+        mempool.note_exec_finished(msg.torus_block.header.height);
+    }
+
+    /// Codex r1 finding 1: Ready heights committed while a FULL head is
+    /// parked never reach the send, and none of their actions are in this
+    /// node's pool; they still count (registered once, when parked). Drain
+    /// retries and a re-delivery never recount, and the total drains to 0 as
+    /// the heights execute.
+    #[test]
+    fn exec_aware_counts_ready_heights_parked_behind_a_full_head() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+
+        let mut app = TorusApp::stub();
+        let mempool = exec_aware_mempool(&app.state_db, true);
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 1);
+        let t = now_ms();
+        let b1 = block(1, vec![signed(61, t)]);
+        let b2 = block(2, vec![signed(62, t), signed(63, t)]);
+        let b3 = block(
+            3,
+            vec![signed(64, t), signed(65, t), signed(66, t), cancel(67, t)],
+        );
+        let b4 = block(
+            4,
+            vec![signed(68, t), signed(69, t), signed(70, t), signed(71, t)],
+        );
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(b2), vec![]);
+        assert!(app.deferred_exec.contains_key(&2), "h2 parked (channel full)");
+        app.enqueue_for_execution(3, ExecSource::Ready(b3.clone()), vec![]);
+        app.enqueue_for_execution(4, ExecSource::Ready(b4), vec![]);
+        assert_eq!(
+            app.deferred_exec.keys().copied().collect::<Vec<_>>(),
+            vec![2, 3, 4],
+            "h3/h4 parked behind the full head"
+        );
+        assert_eq!(mempool.native_pool_size(), 0, "never in this node's pool");
+        assert_eq!(
+            mempool.committed_unexecuted_normal(),
+            1 + 2 + 3 + 4,
+            "every committed Ready height counts, parked or not"
+        );
+        for _ in 0..3 {
+            app.on_reconcile_tick(); // still full: retries never recount
+        }
+        app.enqueue_for_execution(3, ExecSource::Ready(b3), vec![]); // re-delivery
+        assert_eq!(mempool.committed_unexecuted_normal(), 10);
+
+        let mut left = 10;
+        for (h, n) in [(1u64, 1usize), (2, 2), (3, 3), (4, 4)] {
+            let msg = rx.recv().unwrap();
+            assert_eq!(msg.torus_block.header.height, h);
+            exec_done(&mempool, msg);
+            left -= n;
+            assert_eq!(mempool.committed_unexecuted_normal(), left, "after h{h}");
+            app.on_reconcile_tick();
+        }
+        assert!(app.deferred_exec.is_empty());
+        assert_eq!(mempool.committed_unexecuted_normal(), 0);
+
+        clear_dispatch_env();
+    }
+
+    /// Codex r1 finding 2: the exec loop's fail-stop drops the counts BEFORE
+    /// its receiver is dropped. A dispatch in that window still sends
+    /// successfully; it must not count (the teardown is terminal), or the
+    /// count leaks with nothing left to execute it.
+    #[test]
+    fn exec_aware_dispatch_after_exec_side_teardown_never_counts() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+
+        let mut app = TorusApp::stub();
+        let mempool = exec_aware_mempool(&app.state_db, true);
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 4);
+        let t = now_ms();
+        app.enqueue_for_execution(1, ExecSource::Ready(block(1, vec![signed(81, t)])), vec![]);
+        assert_eq!(mempool.committed_unexecuted_normal(), 1);
+
+        // `execution_loop` fail-stop, step 1 (its `rx` is still alive).
+        mempool.clear_exec_backlog();
+        assert_eq!(mempool.committed_unexecuted_normal(), 0);
+
+        let b2 = block(2, vec![signed(82, t), signed(83, t)]);
+        app.enqueue_for_execution(2, ExecSource::Ready(b2), vec![]);
+        assert!(!app.is_exec_failed(), "the send succeeded");
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 1);
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 2);
+        assert_eq!(
+            mempool.committed_unexecuted_normal(),
+            0,
+            "counted after the teardown: leaked"
+        );
+    }
 }
 
 #[cfg(test)]
