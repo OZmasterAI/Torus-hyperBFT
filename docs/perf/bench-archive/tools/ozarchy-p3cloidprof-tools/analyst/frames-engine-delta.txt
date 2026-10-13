@@ -1,0 +1,21 @@
+engine threads (exec thread + torus-exec-pool), W1 self ms CPU per 1k fills, mean of 3 cells per arm; share = of exec+pool delta
+total exec+pool c0 10.267 c100 11.265 delta +0.999
+  exec: c0 4.442 c100 5.155 delta +0.713
+  pool: c0 5.825 c100 6.110 delta +0.286
+     c0    c100   delta  exec d  pool d  share  frame
+  0.316   0.539  +0.223  +0.189  +0.035  22.4%  _mm_movemask_epi8
+  0.464   0.638  +0.174  +0.141  +0.033  17.4%  spec_eq
+  0.332   0.452  +0.120  +0.120  +0.000  12.0%  __KeccakF1600
+  0.327   0.414  +0.086  +0.080  +0.006   8.6%  foldhash::hash_bytes_long
+  0.080   0.135  +0.055  +0.000  +0.055   5.5%  <OrderBook>::place_order_with_accounts
+  0.004   0.037  +0.033  +0.000  +0.033   3.3%  <alloc::collections::btree::map::entry::Entry<FixedPoint, alloc::colle
+  0.441   0.408  -0.033  +0.000  -0.033  -3.3%  <position::PositionManager>::get_position
+  0.051   0.081  +0.030  +0.018  +0.012   3.0%  write_u128
+  0.006   0.034  +0.027  +0.026  +0.002   2.7%  rotate_right
+  0.244   0.219  -0.025  -0.001  -0.024  -2.5%  reserve_price
+  0.324   0.300  -0.024  -0.025  +0.001  -2.4%  dealloc_nonnull
+  0.069   0.091  +0.022  +0.011  +0.011   2.2%  write_num
+  0.140   0.160  +0.020  +0.012  +0.008   2.0%  write
+  0.006   0.023  +0.017  +0.000  +0.017   1.7%  wrapping_add
+  0.073   0.091  +0.017  +0.011  +0.007   1.7%  <[u8; 20] as core::hash::Hash>::hash
+  0.000   0.016  +0.016  +0.016  +0.000   1.6%  <hashbrown::map::HashMap<(Address, u128), (), alloy_primitives::map::h

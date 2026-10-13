@@ -54,11 +54,98 @@ pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
     !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
+/// Item 6 Phase 3 step 6: the compiled default interval on validators (owner
+/// s109, the gate's 15 s). `--rpc-only` nodes default to 0 (per-block flush).
+pub const VALIDATOR_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Role default for an unset `TORUS_CHECKPOINT_INTERVAL_MS`, set once by the
+/// node binary before [`crate::app::TorusApp::try_new`]. Never set (tests,
+/// tools) = `None`: the per-block flush, as before step 6.
+static CHECKPOINT_INTERVAL_DEFAULT: std::sync::OnceLock<Option<std::time::Duration>> =
+    std::sync::OnceLock::new();
+
+/// The role's default interval: validators [`VALIDATOR_CHECKPOINT_INTERVAL`],
+/// `--rpc-only` nodes `None` (their RPC reads must not lag).
+pub fn role_checkpoint_interval(rpc_only: bool) -> Option<std::time::Duration> {
+    (!rpc_only).then_some(VALIDATOR_CHECKPOINT_INTERVAL)
+}
+
+/// Set the role default for an unset `TORUS_CHECKPOINT_INTERVAL_MS` (the node
+/// binary: `--rpc-only`). First call wins; returns the interval the
+/// environment then selects (before the book-mode check in
+/// [`resolve_checkpoint_interval`]).
+pub fn set_checkpoint_interval_default(rpc_only: bool) -> Option<std::time::Duration> {
+    let _ = CHECKPOINT_INTERVAL_DEFAULT.set(role_checkpoint_interval(rpc_only));
+    checkpoint_interval()
+}
+
+fn checkpoint_interval_default() -> Option<std::time::Duration> {
+    CHECKPOINT_INTERVAL_DEFAULT.get().copied().flatten()
+}
+
 /// Item 6 Phase 3: coalesced state checkpoints. `TORUS_CHECKPOINT_INTERVAL_MS`
-/// is the node-local interval of execution time between checkpoints; unset or
-/// `0` keeps today's per-block flush byte for byte.
+/// is the node-local interval of execution time between checkpoints; `0`
+/// keeps today's per-block flush byte for byte; unset or empty is the role
+/// default (step 6: 15 s on validators, 0 on `--rpc-only`; 0 when no role
+/// default was set).
 pub fn checkpoint_interval() -> Option<std::time::Duration> {
-    parse_checkpoint_interval(std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok())
+    parse_checkpoint_interval(
+        std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok(),
+        checkpoint_interval_default(),
+    )
+}
+
+/// True when `TORUS_CHECKPOINT_INTERVAL_MS` is set to a non-empty value (the
+/// operator chose the interval; the role default did not).
+fn checkpoint_interval_env_set(v: Option<&str>) -> bool {
+    v.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// The interval the node runs, from the env value, the role default and the
+/// book mode. An explicit interval > 0 with a deferred book mode (2/3) refuses
+/// to start ([`check_checkpoint_book_mode`], task 1.2). The role default
+/// yields to a deferred book mode instead (per-block flush, `Ok(None)`): the
+/// operator chose the book mode, not the interval (e.g. the bench
+/// `RECORD_ENV`'s `TORUS_BOOK_ROWS=3`).
+pub fn resolve_checkpoint_interval(
+    raw: Option<String>,
+    default: Option<std::time::Duration>,
+    mode: torus_bridge::native_executor::BookMode,
+) -> Result<Option<std::time::Duration>, String> {
+    let explicit = checkpoint_interval_env_set(raw.as_deref());
+    let interval = parse_checkpoint_interval(raw, default);
+    if explicit {
+        check_checkpoint_book_mode(interval, mode)?;
+        return Ok(interval);
+    }
+    match check_checkpoint_book_mode(interval, mode) {
+        Ok(()) => Ok(interval),
+        Err(_) => {
+            tracing::warn!(
+                ?mode,
+                "TORUS_BOOK_ROWS selects a deferred book save: the compiled default checkpoint \
+                 interval is off (per-block flush); set TORUS_BOOK_ROWS unset/0/1 for checkpoints"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// [`resolve_checkpoint_interval`] from the environment and the role default.
+pub fn effective_checkpoint_interval(
+    mode: torus_bridge::native_executor::BookMode,
+) -> Result<Option<std::time::Duration>, String> {
+    resolve_checkpoint_interval(
+        std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok(),
+        checkpoint_interval_default(),
+        mode,
+    )
+}
+
+/// True when the operator set `TORUS_CHECKPOINT_INTERVAL_MS` (not the role
+/// default).
+pub fn checkpoint_interval_explicit() -> bool {
+    checkpoint_interval_env_set(std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok().as_deref())
 }
 
 /// `TORUS_CHECKPOINT_MAX_BYTES`: cap on the since-checkpoint layer's bytes.
@@ -67,10 +154,16 @@ pub fn checkpoint_max_bytes() -> Option<u64> {
 }
 
 /// Pure parse of `TORUS_CHECKPOINT_INTERVAL_MS` (milliseconds, trimmed). Unset
-/// or `0` -> `None` (per-block flush, exactly today); anything that is not a
-/// plain unsigned integer -> `None` with a warning (fail safe: today's path).
-pub fn parse_checkpoint_interval(v: Option<String>) -> Option<std::time::Duration> {
-    let raw = v?;
+/// or empty -> `default` (the role default, step 6); `0` -> `None` (per-block
+/// flush, exactly as before Phase 3); anything that is not a plain unsigned
+/// integer -> `None` with a warning (fail safe: the per-block path).
+pub fn parse_checkpoint_interval(
+    v: Option<String>,
+    default: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let Some(raw) = v.filter(|s| !s.trim().is_empty()) else {
+        return default;
+    };
     match raw.trim().parse::<u64>() {
         Ok(0) => None,
         Ok(ms) => Some(std::time::Duration::from_millis(ms)),
@@ -118,10 +211,11 @@ pub struct CheckpointPolicy {
 }
 
 impl CheckpointPolicy {
-    /// The node's policy from the environment: `None` (interval unset or 0)
-    /// = today's per-block flush.
-    pub fn from_env() -> Option<Self> {
-        checkpoint_interval().map(|interval| Self {
+    /// The node's policy for `interval` (the resolved
+    /// [`effective_checkpoint_interval`]), with the byte cap from the
+    /// environment: `None` (interval off) = today's per-block flush.
+    pub fn for_interval(interval: Option<std::time::Duration>) -> Option<Self> {
+        interval.map(|interval| Self {
             interval: Some(interval),
             max_bytes: checkpoint_max_bytes(),
             every_blocks: None,
@@ -953,19 +1047,21 @@ mod tests {
     #[test]
     fn checkpoint_interval_parse() {
         use std::time::Duration;
-        assert_eq!(parse_checkpoint_interval(None), None);
-        assert_eq!(parse_checkpoint_interval(Some("0".into())), None);
-        assert_eq!(parse_checkpoint_interval(Some(" 0 ".into())), None);
+        // No role default (tests, tools): unset / empty = per-block flush.
+        assert_eq!(parse_checkpoint_interval(None, None), None);
+        assert_eq!(parse_checkpoint_interval(Some("".into()), None), None);
+        assert_eq!(parse_checkpoint_interval(Some("0".into()), None), None);
+        assert_eq!(parse_checkpoint_interval(Some(" 0 ".into()), None), None);
         assert_eq!(
-            parse_checkpoint_interval(Some("15000".into())),
+            parse_checkpoint_interval(Some("15000".into()), None),
             Some(Duration::from_secs(15))
         );
         assert_eq!(
-            parse_checkpoint_interval(Some(" 1 ".into())),
+            parse_checkpoint_interval(Some(" 1 ".into()), None),
             Some(Duration::from_millis(1))
         );
-        for bad in ["", "abc", "-5", "15s", "1.5"] {
-            assert_eq!(parse_checkpoint_interval(Some(bad.into())), None, "{bad:?}");
+        for bad in ["abc", "-5", "15s", "1.5"] {
+            assert_eq!(parse_checkpoint_interval(Some(bad.into()), None), None, "{bad:?}");
         }
         assert_eq!(parse_checkpoint_max_bytes(None), None);
         assert_eq!(parse_checkpoint_max_bytes(Some("0".into())), None);
@@ -974,6 +1070,68 @@ mod tests {
             Some(268_435_456)
         );
         assert_eq!(parse_checkpoint_max_bytes(Some("lots".into())), None);
+    }
+
+    /// Step 6: the compiled default. Unset or empty = the role default
+    /// (validators 15 s, `--rpc-only` off); explicit values win, `0` = the
+    /// per-block flush; garbage stays the fail-safe per-block flush.
+    #[test]
+    fn checkpoint_interval_role_default_is_15s_on_validators_off_on_rpc_only() {
+        use std::time::Duration;
+        assert_eq!(VALIDATOR_CHECKPOINT_INTERVAL, Duration::from_secs(15));
+        assert_eq!(role_checkpoint_interval(false), Some(Duration::from_secs(15)));
+        assert_eq!(role_checkpoint_interval(true), None);
+        for rpc_only in [false, true] {
+            let d = role_checkpoint_interval(rpc_only);
+            assert_eq!(parse_checkpoint_interval(None, d), d, "{rpc_only}");
+            assert_eq!(parse_checkpoint_interval(Some(" ".into()), d), d, "{rpc_only}");
+            assert_eq!(parse_checkpoint_interval(Some("0".into()), d), None, "{rpc_only}");
+            assert_eq!(
+                parse_checkpoint_interval(Some("5000".into()), d),
+                Some(Duration::from_secs(5)),
+                "{rpc_only}"
+            );
+            assert_eq!(parse_checkpoint_interval(Some("abc".into()), d), None, "{rpc_only}");
+        }
+    }
+
+    /// Step 6: the role default yields to a deferred book mode (per-block
+    /// flush) instead of refusing to start; an explicit interval still
+    /// refuses (task 1.2); Classic / OrderRows run the default.
+    #[test]
+    fn checkpoint_interval_role_default_yields_to_deferred_book_modes() {
+        use std::time::Duration;
+        use torus_bridge::native_executor::BookMode;
+        let d = role_checkpoint_interval(false);
+        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            assert_eq!(resolve_checkpoint_interval(None, d, mode), Ok(None), "{mode:?}");
+            assert_eq!(
+                resolve_checkpoint_interval(Some("".into()), d, mode),
+                Ok(None),
+                "{mode:?}"
+            );
+            let err = resolve_checkpoint_interval(Some("15000".into()), d, mode)
+                .expect_err("an explicit interval with a deferred book mode refuses to start");
+            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
+            assert_eq!(
+                resolve_checkpoint_interval(Some("0".into()), d, mode),
+                Ok(None),
+                "{mode:?}"
+            );
+        }
+        for mode in [BookMode::Classic, BookMode::OrderRows] {
+            assert_eq!(
+                resolve_checkpoint_interval(None, d, mode),
+                Ok(Some(Duration::from_secs(15))),
+                "{mode:?}"
+            );
+            assert_eq!(resolve_checkpoint_interval(None, None, mode), Ok(None), "{mode:?}");
+            assert_eq!(
+                resolve_checkpoint_interval(Some("0".into()), d, mode),
+                Ok(None),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

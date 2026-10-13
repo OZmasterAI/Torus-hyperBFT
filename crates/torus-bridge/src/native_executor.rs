@@ -914,7 +914,9 @@ mod reject_label_tests {
 /// of this batch) took out of it. `passes(f)` re-runs the same pure check at
 /// free margin `f`. `MarginReservation`: it passes with `reserved` released;
 /// `MarginPosition`: it fails even then (positions, losses or cash). Reject
-/// path only: one extra check per margin reject, nothing on a pass.
+/// path only: one extra check per margin reject, nothing on a pass. s118:
+/// only with metrics attached (the label feeds nothing else); without them
+/// the callers take [`unsplit_reject_label`] and run no second check.
 fn margin_reject_label(
     reason: FailureReason,
     free: FixedPoint,
@@ -929,6 +931,17 @@ fn margin_reject_label(
         OrderRejectReason::MarginReservation
     } else {
         OrderRejectReason::MarginPosition
+    }
+}
+
+/// s118: the label of a pre-book account-check reject with `reason` when
+/// metrics are off: never counted, so the margin split's second account
+/// check ([`margin_reject_label`]) is skipped and a margin reject is labelled
+/// `MarginPosition`. The reject's reason and message do not depend on it.
+fn unsplit_reject_label(reason: FailureReason) -> OrderRejectReason {
+    match reason {
+        FailureReason::Margin => OrderRejectReason::MarginPosition,
+        r => reject_label(r),
     }
 }
 
@@ -4193,6 +4206,21 @@ mod cloid_index_tests;
 #[path = "cloid_equiv_tests.rs"]
 mod cloid_equiv_tests;
 
+#[cfg(test)]
+#[path = "margin_label_tests.rs"]
+mod margin_label_tests;
+
+#[cfg(test)]
+thread_local! {
+    /// s118 (tests): calls of [`NativeExecutor::account_check`] on this
+    /// thread (`margin_label_tests`).
+    static ACCOUNT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// s118 (tests): calls of [`NativeExecutor::account_check`] on the
+    /// sharded Phase 2 workers this thread spawned
+    /// ([`NativeExecutor::phase2_parallel_prepare`]), credited when they join.
+    static WORKER_ACCOUNT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(any(test, feature = "test-reference-paths"))]
 #[path = "reference_paths.rs"]
 mod reference_paths;
@@ -7056,6 +7084,8 @@ impl NativeExecutor {
         // Option B (s87) best bids, fix A (s92) / row 42 tick and lot, the
         // configs and marks: each batch market's, once (item 6 M1).
         let markets = Self::phase2_markets(&ctx.order_books, &ctx.state, &reader, &place_orders);
+        // s118: a margin reject's label split only feeds the reason metric.
+        let split_margin_label = ctx.metrics.is_some();
 
         let mut fold_out: Option<FoldOut> = None;
         let mut prep_outcomes: Option<Vec<Option<PrepOutcome>>> = None;
@@ -7081,7 +7111,16 @@ impl NativeExecutor {
                 groups[gi].1.push((i, params));
             }
             if groups.len() >= 2 {
-                match Self::phase2_parallel_prepare(&reader, &open_at_start, &basis, &markets, &groups, engine_threads, n) {
+                match Self::phase2_parallel_prepare(
+                    &reader,
+                    &open_at_start,
+                    &basis,
+                    &markets,
+                    &groups,
+                    engine_threads,
+                    n,
+                    split_margin_label,
+                ) {
                     Some((outcomes, out)) => {
                         // Sender shards are disjoint, so the merged output
                         // is exactly the serial loop's.
@@ -7130,7 +7169,17 @@ impl NativeExecutor {
                     (s, FlatAction::Place(p)) => (s, *p),
                     (_, FlatAction::Other(_)) => unreachable!(),
                 };
-                let outcome = Self::prepare_one(&reader, &open_at_start, &basis, &markets, &mut fold, i, sender, params);
+                let outcome = Self::prepare_one(
+                    &reader,
+                    &open_at_start,
+                    &basis,
+                    &markets,
+                    &mut fold,
+                    i,
+                    sender,
+                    params,
+                    split_margin_label,
+                );
                 Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
@@ -7492,6 +7541,10 @@ impl NativeExecutor {
     /// Option B (s87) bid floor and fix A (s92) shape: `markets` =
     /// [`phase2_markets`]. Item 6 M1: one `senders` entry and at most one
     /// `proj` entry per order (same reads, same arithmetic, same order).
+    /// s118: `split_margin_label` = metrics attached: a margin reject's
+    /// funnel label runs [`margin_reject_label`]'s second account check;
+    /// else [`unsplit_reject_label`] (the outcome's reason and message are
+    /// the same).
     #[allow(clippy::too_many_arguments)]
     fn prepare_one<T: StateBackend>(
         reader: &AccountReader<'_, T>,
@@ -7502,6 +7555,7 @@ impl NativeExecutor {
         i: usize,
         sender: &Address,
         params: &PlaceOrderParams,
+        split_margin_label: bool,
     ) -> PrepOutcome {
         let st = fold.state(sender);
         // Open-order limit first: a rejected order reserves nothing.
@@ -7659,21 +7713,26 @@ impl NativeExecutor {
                     Err((reason, msg)) => {
                         // s114: reservations = resting orders' (this batch's
                         // accepted ones included) + this batch's commitments.
-                        let reserved = bal
-                            .order_margin
-                            .checked_add(st.committed)
-                            .unwrap_or(FixedPoint::MAX);
-                        let label = margin_reject_label(reason, free, reserved, |f| {
-                            Self::account_check(
-                                market.tiers(),
-                                e.signed,
-                                e.px,
-                                params,
-                                res_price,
-                                f,
-                            )
-                            .is_ok()
-                        });
+                        // s118: the split's second check only with metrics.
+                        let label = if split_margin_label {
+                            let reserved = bal
+                                .order_margin
+                                .checked_add(st.committed)
+                                .unwrap_or(FixedPoint::MAX);
+                            margin_reject_label(reason, free, reserved, |f| {
+                                Self::account_check(
+                                    market.tiers(),
+                                    e.signed,
+                                    e.px,
+                                    params,
+                                    res_price,
+                                    f,
+                                )
+                                .is_ok()
+                            })
+                        } else {
+                            unsplit_reject_label(reason)
+                        };
                         return PrepOutcome::Reject {
                             funnel: RejectReason::Margin(label),
                             reason,
@@ -7822,6 +7881,7 @@ impl NativeExecutor {
         groups: &[(Address, Vec<(usize, &PlaceOrderParams)>)],
         threads: usize,
         n: usize,
+        split_margin_label: bool,
     ) -> Option<(Vec<Option<PrepOutcome>>, FoldOut)> {
         let workers = threads.min(groups.len()).max(1);
         let shard = groups.len().div_ceil(workers);
@@ -7831,12 +7891,17 @@ impl NativeExecutor {
             torus_state::spawn_count::SpawnSite::MarginPrepare,
             groups.len().div_ceil(shard),
         );
+        // s118 (tests): the workers' account checks, credited to the caller.
+        #[cfg(test)]
+        let worker_checks = &std::sync::atomic::AtomicU64::new(0);
         let worker_results: Vec<Result<WorkerOut, ()>> = std::thread::scope(|s| {
             let handles: Vec<_> = groups
                 .chunks(shard)
                 .map(|shard_groups| {
                     s.spawn(move || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(test)]
+                            let checks_at_start = ACCOUNT_CHECKS.with(|c| c.get());
                             let orders: usize = shard_groups.iter().map(|(_, o)| o.len()).sum();
                             let mut fold = SenderFold::with_capacity(shard_groups.len());
                             let mut out: Vec<(usize, PrepOutcome)> = Vec::with_capacity(orders);
@@ -7854,10 +7919,16 @@ impl NativeExecutor {
                                             i,
                                             sender,
                                             params,
+                                            split_margin_label,
                                         ),
                                     ));
                                 }
                             }
+                            #[cfg(test)]
+                            worker_checks.fetch_add(
+                                ACCOUNT_CHECKS.with(|c| c.get()) - checks_at_start,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             (out, fold.finish())
                         }))
                         .map_err(|_| ())
@@ -7869,6 +7940,9 @@ impl NativeExecutor {
                 .map(|h| h.join().unwrap_or(Err(())))
                 .collect()
         });
+        #[cfg(test)]
+        WORKER_ACCOUNT_CHECKS
+            .with(|c| c.set(c.get() + worker_checks.load(std::sync::atomic::Ordering::Relaxed)));
 
         let mut outcomes: Vec<Option<PrepOutcome>> = (0..n).map(|_| None).collect();
         let mut merged = FoldOut::default();
@@ -9077,6 +9151,8 @@ impl NativeExecutor {
         res_price: FixedPoint,
         free: FixedPoint,
     ) -> Result<FixedPoint, Rejection> {
+        #[cfg(test)]
+        ACCOUNT_CHECKS.with(|c| c.set(c.get() + 1));
         if params.reduce_only {
             return Ok(FixedPoint::ZERO);
         }
@@ -9907,6 +9983,8 @@ impl NativeExecutor {
                             Self::account_check(tiers, signed, px, params, res_price, free)
                         {
                             // Funnel (perf A1): died pre-book on the margin check.
+                            // s118: the split's second check runs inside this
+                            // `if` only (metrics attached).
                             if let Some(ref m) = ctx.metrics {
                                 m.orders_rejected_margin.inc();
                                 // s114: the margin split (reservations =
@@ -12897,7 +12975,17 @@ mod option_b_fold_pool_tests {
             let mut first_seen: HashMap<Address, bool> = HashMap::default();
             let mut want_excess: HashMap<Address, FixedPoint> = HashMap::default();
             for (i, (s, p)) in orders.iter().enumerate() {
-                let outcome = NativeExecutor::prepare_one(&reader, &open_at_start, &basis, &markets, &mut fold, i, s, p);
+                let outcome = NativeExecutor::prepare_one(
+                    &reader,
+                    &open_at_start,
+                    &basis,
+                    &markets,
+                    &mut fold,
+                    i,
+                    s,
+                    p,
+                    false,
+                );
                 if let PrepOutcome::Pass(pass) = &outcome {
                     let base = basis.get(&i).map_or(NativeExecutor::reserve_price(p), |b| b.0);
                     let qty = basis.get(&i).map_or(p.quantity, |b| b.1);
@@ -12947,9 +13035,17 @@ mod option_b_fold_pool_tests {
                     None => groups.push((*s, vec![(i, p)])),
                 }
             }
-            let (mut outcomes, sharded_out) =
-                NativeExecutor::phase2_parallel_prepare(&reader, &open_at_start, &basis, &markets, &groups, 2, orders.len())
-                    .expect("no worker panic");
+            let (mut outcomes, sharded_out) = NativeExecutor::phase2_parallel_prepare(
+                &reader,
+                &open_at_start,
+                &basis,
+                &markets,
+                &groups,
+                2,
+                orders.len(),
+                false,
+            )
+            .expect("no worker panic");
             let mut sharded: HashMap<MarketId, Vec<PreparedOrder<'_>>> = HashMap::default();
             let mut next_id = 1u128;
             for (i, (s, p)) in orders.iter().enumerate() {

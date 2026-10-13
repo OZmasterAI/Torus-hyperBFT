@@ -73,11 +73,12 @@ itself; a long outage just means you are offline until it does.
   nothing; streams still work) and use a 2048 MiB WAL budget (`TORUS_ROCKSDB_MAX_TOTAL_WAL_MB`). Leave
   both unset. `--rpc-only` nodes keep trade history on; set `TORUS_TRADE_HISTORY=1` only on a validator
   that must also serve history.
-- **Checkpoint interval (item 6 Phase 3, `TORUS_CHECKPOINT_INTERVAL_MS`, off unless set)**: with it
-  set, a validator writes executed state to disk once per interval (and at every 100th block), not every
+- **Checkpoint interval (item 6 Phase 3, `TORUS_CHECKPOINT_INTERVAL_MS`; unset = 15 s on validators, 0 on
+  `--rpc-only` nodes, step 6)**: with it on, a validator writes executed state to disk once per interval (and at every 100th block), not every
   block. Mempool admission (gossip session lookup, the funded and validator-duty checks, the EVM balance
   at `eth_sendRawTransaction`) and the session / market / price-band checks at RPC submit read the
   executed state, so they are current. The validator's other RPC reads (`torus_*` queries, `eth_*`,
   trade history) read the disk and lag by up to one interval; `eth_blockNumber` moves in checkpoint
   steps. Point clients that need current
-  reads at an `--rpc-only` node (interval 0).
+  reads at an `--rpc-only` node (interval 0). Set `TORUS_CHECKPOINT_INTERVAL_MS=0` for the per-block
+  flush on a validator. With `TORUS_BOOK_ROWS=2` or `3` the unset default is off (per-block flush).

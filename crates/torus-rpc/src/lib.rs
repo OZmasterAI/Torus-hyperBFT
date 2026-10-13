@@ -11,6 +11,7 @@ pub mod error;
 pub mod eth;
 pub mod ip_limit;
 pub mod net;
+pub(crate) mod scan;
 pub mod streams;
 pub mod torus;
 pub mod types;
@@ -287,6 +288,11 @@ pub struct RpcState {
     pub(crate) forward_bodies: bool,
     /// Admission control: cap concurrent submit_native_action calls.
     pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
+    /// R24: most rows one public read may examine
+    /// ([`scan::ENV_MAX_SCAN_ROWS`], default [`scan::DEFAULT_MAX_SCAN_ROWS`]).
+    pub(crate) max_scan_rows: usize,
+    /// R24: rows examined by bounded reads since start (all methods).
+    pub(crate) scan_rows_examined: Arc<AtomicU64>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -362,10 +368,20 @@ impl RpcServer {
                 forward_evm_tx: None,
                 forward_bodies: false,
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
+                max_scan_rows: scan::resolve_max_scan_rows(
+                    std::env::var(scan::ENV_MAX_SCAN_ROWS).ok().as_deref(),
+                ),
+                scan_rows_examined: Arc::new(AtomicU64::new(0)),
             },
             ip_limiter: None,
             max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
         })
+    }
+
+    /// R24: most rows one public read may examine (`0` = 1). Default from
+    /// `TORUS_RPC_MAX_SCAN_ROWS`, else [`scan::DEFAULT_MAX_SCAN_ROWS`].
+    pub fn set_max_scan_rows(&mut self, max: usize) {
+        self.state.max_scan_rows = max.max(1);
     }
 
     /// Install the per-IP weight limit (anti-spam item D).
@@ -828,17 +844,30 @@ pub fn set_latest_height(state: &RpcState, height: u64) {
 /// Scan CF_NATIVE_TRADES for all trades at a given block height across all markets.
 /// Serves `torus_getBlockTrades` (the streams are fed from execution, s80).
 pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_json::Value> {
+    scan_trades_for_block_bounded(state, block_height, &mut scan::ScanBudget::unlimited())
+        .expect("an unlimited budget is never exceeded")
+}
+
+/// [`scan_trades_for_block`] charged to `budget` (R24): every market row
+/// visited is one row (an empty block still seeks every market), and every
+/// trade row of the block is charged by its size before it is decoded. Over
+/// the budget = `ScanLimitExceeded`; under it, the same trades.
+pub(crate) fn scan_trades_for_block_bounded(
+    state: &StateDb,
+    block_height: u64,
+    budget: &mut scan::ScanBudget,
+) -> Result<Vec<serde_json::Value>, error::RpcError> {
     use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
     use torus_state::trade_rows::{decode_trade_row, trade_key};
 
     let db = state.inner();
     let market_cf = match db.cf_handle(CF_NATIVE_MARKETS) {
         Some(cf) => cf,
-        None => return vec![],
+        None => return Ok(vec![]),
     };
     let trade_cf = match db.cf_handle(CF_NATIVE_TRADES) {
         Some(cf) => cf,
-        None => return vec![],
+        None => return Ok(vec![]),
     };
 
     let mut trades = Vec::new();
@@ -849,6 +878,7 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
             Ok(kv) => kv,
             Err(_) => continue,
         };
+        budget.step()?;
         let Ok(market_bytes) = <[u8; 8]>::try_from(&market_key[..]) else {
             continue;
         };
@@ -870,6 +900,7 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
             if key.len() < 16 || key[..16] != start_key[..16] {
                 break;
             }
+            budget.step_n(scan::packed_rows(value.len()))?;
             // Skip an undecodable row (e.g. a leftover old-format 20-byte key).
             if key.len() != start_key.len() {
                 continue;
@@ -891,7 +922,7 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
         }
     }
 
-    trades
+    Ok(trades)
 }
 
 #[cfg(test)]

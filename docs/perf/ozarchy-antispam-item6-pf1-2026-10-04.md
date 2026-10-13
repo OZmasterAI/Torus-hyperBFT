@@ -7363,6 +7363,886 @@ survivors' `peer connected` / `peer disconnected` lines), `analyst/paired-kills.
 `analyst/a-wedge.txt`, `a-conn.txt`, `kills.json`, `sat-paired.txt`, `sat-cells.txt`. Drivers
 `ozarchy-wedge-kill-campaign.sh`, `ozarchy-wedge-sat-campaign.sh`, builds `ozarchy-wedge-build*.sh`, md5s `analyst/md5s-all.txt`.
 
+## 59. Cloid cost A/B: `CLOID_SHARE=100` vs `0` on one binary, main `ef812b02` (glibc), saturated, commit-tail mode (campaign ozarchy-p3cloid, 2026-10-13)
+
+**When every placed order carries a client order id (cloid), the node matches 11.7% fewer orders per second: matched/s
+-11.7% [-13.8, -9.6] (paired c100 - c0, n = 4, 95% CI t(3)), placed/s -11.8% [-13.9, -9.6]. Each fill costs more node
+CPU: CPU-s/1M +8.8% [+7.4, +10.3] (+6.4% [+3.1, +9.7] at equal fills). The cost sits in the executor. Exec `block_ms` is
++11.8% [+1.7, +22.0] (+31 ms per native block), engine ms per 1k fills +13.9% [+10.6, +17.2] and signature verify +2.8 ms
+per native block [+1.8, +3.9] (+25%). Exec per native block p99 is +18.9% [+9.4, +28.4].** Exec is the bottleneck in both
+arms (busy 0.952 / 0.955, backlog ~43 blocks, mempool equally full), so the load generator is not what limits c100. The
+closed-loop bench submits 6.9% less [-9.6, -4.1], following the slower commits. Native blocks/s -7.0% [-15.2, +1.2] is
+not resolved. RSS peak is +0.32 GB [+0.14, +0.49] (+7.5%), mean +0.24 GB [+0.13, +0.35] (+6.6%). Device writes are flat
+(+1.8% [-4.0, +7.7]). The cloid share reached the chain exactly as set: stamped / placed 0 and 1.0000, `share_pct` 0 / 100,
+and 0 `duplicate_cloid` rejects on all 3 nodes in every cell. All 8 measured cells, the warm-up and the smoke cell are
+rc 0, ACCEPT, AGREE (no mark-only digest REJECT this time). **100% is the worst case. The cost at a realistic cloid share
+was not measured, and this A/B does not show that it scales linearly with the share.**
+
+Requested by 18c (s116) as optional filler: what does the cloid feature (`feat/cloid` `46a11c14`: u128 client order ids,
+unique across a trader's open orders via the `CloidMarkets` / `BookCloids` indices, consensus format change) cost per
+order? One binary in both arms: main `ef812b02`, node and bench built together, because cloid changed the signed-order
+format and the bench must match the node commit. The arms differ only in run-cell.sh `CLOID_SHARE` (bench
+`--cloid-share`, `ba02c933`). c0 = `CLOID_SHARE=0` (by construction the same actions, byte for byte, as a bench without
+the flag) and c100 = `CLOID_SHARE=100` (every placed order carries a cloid, `(run start ms << 64) | per-sender counter`,
+nonzero and unique per sender).
+
+Setup: the section 54 (p3mw) shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, harness
+RATE 76000 = saturated, 120 s cells + 60 s warm-up, commit tail, shared NVMe), no Phase 3 (no checkpoint knob, no enable
+line, no checkpoint series), glibc. `ef812b02`'s default build has no jemalloc feature: `malloc` is `UND`
+(`malloc@GLIBC_2.2.5`) in `.dynsym`, and no preload or mapped `libjemalloc` on any node in any cell. Built 13:14 with the
+p3q build flags (frame pointers, line tables, mold) into a fresh target dir (`~/.cargo-target-p3cloid-ef812b02`) from a
+clean detached worktree (`/home/oz/projects/wt/p3cloid-ef812b02`): node `6f363582` (build id `016bed06`), bench
+`9fda6c84` (build id `3cdf34c8`). Script `ozarchy-p3cloid-build.sh`, md5s in `ozarchy-p3cloid-build/md5s.txt`, staged in
+`ozarchy-p3cloid-stage/cl-run/release`. Harness = the same `ef812b02` worktree (run-cell.sh with `CLOID_SHARE`,
+summarize.py with `ingest.cloids`, `2eedbce7`). Driver `ozarchy-p3cloid-campaign.sh` CAMP=CLOID (copy of
+`ozarchy-p3q-campaign.sh`) adds a hard check per cell, `cloidchk`. It requires `cloid_share='P'` in run.log,
+`--cloid-share P` in the bench command, `summary.json` `ingest.cloids` `share_pct` = P with placed > 0 and stamped / placed
+= 0 (P = 0) or >= 0.99 (P = 100), and `torus_orders_rejected_reason_total{reason="duplicate_cloid"}` = 0 on all 3 nodes
+(`metrics-after`). A 60 s c100 smoke cell ran first (`ozarchy-p3cloid-smoke-300m-s0-c100`, 13:16-13:19: rc 0, ACCEPT,
+AGREE, all checks OK). Cells ran 13:22-14:14: w0 (c0, 60 s, excluded), r1 c0 c100, r2 c100 c0, r3 c0 c100, r4 c100 c0.
+The log has 135 CHECK OK, no CHECK FAIL, no deaths and no memguard stop. The host was quiet before every cell (no
+cargo / rustc / rust-analyzer, load 1.74-1.94). Cells are 120 s long, so **every figure here is minutes 0-2 only**.
+
+### 59.1 Cells and cloid checks
+
+| cell | arm | rc / agreement | `share_pct` | stamped | placed (orders) | stamped / placed | `duplicate_cloid` rejects val0 / val1 / val2 | matched/s | submit/s |
+|---|---|---|---|---|---|---|---|---|---|
+| smoke s0-c100 (60 s) | c100 | 0, ACCEPT AGREE | 100 | 18,461,600 | 18,461,600 | 1.0000 | 0 / 0 / 0 | 171,674 | 1,196 |
+| w0 (60 s, excluded) | c0 | 0, ACCEPT AGREE | 0 | 0 | 19,174,800 | 0.0000 | 0 / 0 / 0 | 179,134 | 1,254 |
+| r1-c0 / r1-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 31,262,800 | 33,318,000 / 31,262,800 | 0 / 1.0000 | 0 / 0 / 0 both | 188,242 / 169,297 | 1,113 / 1,038 |
+| r2-c0 / r2-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 31,139,600 | 33,492,400 / 31,139,600 | 0 / 1.0000 | 0 / 0 / 0 both | 185,643 / 162,832 | 1,098 / 1,033 |
+| r3-c0 / r3-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 31,641,200 | 33,140,400 / 31,641,200 | 0 / 1.0000 | 0 / 0 / 0 both | 194,876 / 169,909 | 1,105 / 1,046 |
+| r4-c0 / r4-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 29,617,600 | 32,258,400 / 29,617,600 | 0 / 1.0000 | 0 / 0 / 0 both | 185,856 / 164,167 | 1,081 / 979 |
+
+The `duplicate_cloid` series is present (at 0) on every node of every cell, c0 included. The bench never reused a cloid
+among a trader's open orders, and no node rejected one. Per round, matched/s c100 - c0 is -18,945 / -22,811 / -24,967 /
+-21,689: all four rounds point the same way.
+
+### 59.2 Per arm (n = 4, mean; paired c100 - c0 over the 4 rounds, 95% CI t(3))
+
+| | c0 (`CLOID_SHARE=0`) | c100 (`CLOID_SHARE=100`) | c100 - c0 | % [95% CI] |
+|---|---|---|---|---|
+| matched/s (120 s = minutes 0-2) | 188,654 | 166,551 | -22,103 [-26,091, -18,115] | **-11.72% [-13.83, -9.60]** |
+| placed/s | 246,747 | 217,751 | -28,997 | **-11.75% [-13.91, -9.59]** |
+| bench submits/s | 1,099 | 1,024 | -75 | **-6.85% [-9.60, -4.09]** |
+| native blocks/s | 3.41 | 3.17 | -0.24 | -6.99% [-15.20, +1.22] |
+| actions / fills per native block | 270 / 50,613 | 267 / 50,332 | | -1.0% [-7.9, +5.8] / -0.6% [-9.3, +8.1] |
+| exec `block_ms` (summary, mean of 3 nodes) | 262.3 | 293.3 | +31.1 [+4.5, +57.6] | **+11.84% [+1.72, +21.97]** |
+| exec `chain_ms` (summary headline, val0) | 257.4 | 288.3 | +30.9 [+5.0, +56.7] | **+11.99% [+1.96, +22.03]** |
+| exec per native block (logs) mean / p50 / p99 ms | 366 / 370 / 720 | 406 / 417 / 856 | +40.1 / +47.0 / +136.0 | **mean +11.0% [+5.7, +16.3], p50 +12.7% [+5.4, +20.0], p99 +18.9% [+9.4, +28.4]** |
+| engine ms per 1k fills | 4.12 | 4.69 | +0.57 [+0.44, +0.71] | **+13.90% [+10.59, +17.22]** |
+| block time (commit interval, logs) p50 / p99 ms | 159 / 1,251 | 155 / 1,402 | -3.6 / +151 | p50 -2.3% [-16.3, +11.7], p99 **+12.1% [+2.7, +21.5]** |
+| exec busy | 0.952 | 0.955 | +0.002 | +0.2% [-0.6, +1.1] |
+| exec backlog mean / max (blocks) / lag s | 42.5 / 62.7 / 12.3 | 43.5 / 63.0 / 13.2 | +1.1 / +0.3 / +1.0 | +2.5% [-11.9, +16.8] / +0.5% / +7.9% [-3.6, +19.4] |
+| mempool mean / max (actions) | 5,705 / 11,858 | 5,686 / 11,786 | | -0.3% [-7.3, +6.6] / -0.6% [-6.3, +5.1] |
+| node CPU-s/1M (whole run) | 26.43 | 28.77 | +2.34 [+1.95, +2.73] | **+8.84% [+7.37, +10.31]** |
+| node CPU at equal fills (ANCOVA, Welch) | | | | **+6.37% [+3.05, +9.70]** |
+| node CPU-s / fills per node, whole run (M) | 668 / 25.27 | 680 / 23.64 | | |
+| RSS peak / mean per node GB (cpu.csv, mean of 3) | 4.25 / 3.62 | 4.57 / 3.86 | **+0.32 [+0.14, +0.49] / +0.24 [+0.13, +0.35]** | +7.50% [+3.40, +11.61] / +6.63% [+3.55, +9.70] |
+| RSS peak / mean in the bench window GB (mem-samples) | 4.24 / 3.66 | 4.46 / 3.76 | +0.22 [+0.07, +0.38] / +0.10 [-0.20, +0.39] | +5.2% [+1.5, +8.9] / +2.7% [-5.4, +10.8] |
+| VmHWM GB / RSS last 15 s of the window GB | 4.38 / 4.19 | 4.72 / 4.43 | +0.34 [+0.06, +0.62] / +0.23 [+0.07, +0.39] | +7.7% / +5.6% |
+| RSS growth over the bench window GB/min | 0.86 | 1.11 | +0.25 [-0.11, +0.60] | +29% [-13, +70] |
+| memtables MB / resident rows MB | 292 / 195 | 276 / 190 | | -5.6% [-15.5, +4.3] / -2.9% [-8.5, +2.7] |
+| device writes MB/s per validator (io-ticks, bench window) | 145.1 | 147.7 | +2.7 [-5.8, +11.2] | +1.8% [-4.0, +7.7] |
+
+Welch intervals (`arms.txt`) agree in sign and resolution with the paired ones for matched/s (-11.72% [-15.35, -8.08]),
+CPU-s/1M (+8.84% [+6.38, +11.30]), engine ms per 1k fills, exec p99 (+18.87% [+10.31, +27.43]), `block_ms` (+11.84%
+[+4.16, +19.52]) and RSS peak / mean (+7.50% [+4.19, +10.81] / +6.63% [+4.39, +8.87]). Two rows differ. The block time
+p99 is just not resolved under Welch (+12.1% [-0.4, +24.6]). The RSS growth is resolved under Welch (+28.7% [+2.9,
++54.5]) but not paired, so read it as "consistent with faster growth", not established. Node CPU-s per cell is nearly flat
+(668 vs 680), while fills per node fall 6.5%: the executor spends the same CPU and gets fewer fills done.
+
+### 59.3 Where the exec time goes (per native block, ms, mean of 3 nodes; paired c100 - c0, 95% CI t(3))
+
+| phase | c0 | c100 | c100 - c0 [95% CI] |
+|---|---|---|---|
+| `verify` (signature verify) | 11.48 | 14.30 | **+2.82 [+1.78, +3.86]** (+24.6%) |
+| `replay_guard` | 2.84 | 2.62 | -0.23 [-0.70, +0.25] |
+| `load_books` | 0.33 | 0.30 | -0.03 [-0.08, +0.02] |
+| `engine` | 213.49 | 240.41 | **+26.92 [+5.12, +48.72]** (+12.6%) |
+| `action_status` | 0.28 | 0.26 | -0.02 [-0.05, +0.01] |
+| `save_books` | 13.22 | 13.56 | +0.34 [-1.44, +2.12] |
+| `end_resident_wait` | 7.36 | 3.93 | **-3.44 [-4.54, -2.33]** |
+| `residual_untimed` | 13.26 | 17.95 | **+4.70 [+4.09, +5.30]** (+35.4%) |
+| `flush` (off the chain path) | 75.22 | 82.33 | +7.11 [-3.47, +17.69] |
+| `end_resident` (off the chain path) | 37.69 | 36.39 | -1.29 [-6.12, +3.53] |
+
+The on-chain phases add up to the `block_ms` delta: +2.82 (verify) + 26.92 (engine) + 4.70 (residual) - 3.44
+(end_resident wait) + 0.06 (the rest) = +31.06 ms. **The engine carries ~87% of the extra exec time, signature verify ~9%
+and the untimed residual ~15%, partly offset by a shorter wait for the end_resident worker.** At about the same actions
+and fills per block (-1.0% / -0.6%, ties), that points at per-order work. Verify +25% is consistent with hashing and
+verifying larger signed orders (the u128 cloid in the canonical bytes). The engine +13.9% per 1k fills is consistent
+with the per-order cloid index work (`CloidMarkets` insert / remove, `BookCloids` per book) on place, fill and
+cancel-all. No profile was taken, so the split inside the engine is not shown. The shorter `end_resident_wait` is consistent
+with the end_resident worker having more time to finish while the longer engine phase runs.
+
+### 59.4 Agreement and other checks
+
+All 8 measured cells, w0 and the smoke cell: rc 0, ACCEPT, AGREE. In every cell the 3 nodes' digests took within
+~3.4 s of each other (24-79 s per cell), so no node was slow enough for the mark-only digest artifact of sections 46-56,
+and no cell had that REJECT. Nonce-window evictions were 0, in-flight timeouts 0, block-tail errors 0 and action
+failures 0 in every cell. Executed cancel-alls are equal on all 3 nodes and equal to those the load generator accepted. Action rejections (108-633 per cell) are equal on all 3 nodes in
+every cell. In-flight RPC refusals: c0 3 / 0 / 3 / 0, c100 10 / 83 / 6 / 135 (r1-r4). That is more in c100, and small
+next to the 115-135k released on commit per cell. The place / cancel-all mix is 61.1-62.3% place in both arms.
+
+**Verdict:** at 100% share, cloids cost ~12% of the matched/s ceiling and ~9% CPU per fill (6% at equal fills) on this
+glibc main. The cost is executor time per order: engine +14% per 1k fills, signature verify +25%, residual +35%, exec
+`block_ms` +12% and exec p99 +19%. RSS is +0.2-0.3 GB per node (+7%) over minutes 0-2. Writes do not move. Exec is
+saturated in both arms, so the drop is the node's, not the bench's. n = 4 x 120 s, but all four rounds agree:
+decisive for matched/s, placed/s, CPU-s/1M (also at equal fills), engine per 1k fills, verify, exec `block_ms`, exec p99
+and RSS peak / mean; "consistent with" for block time p99 and RSS growth; native blocks/s not resolved.
+
+**Caveats.** (1) **100% share is the worst case.** Real traffic would stamp a share of orders. The cost at a realistic
+share is not measured here. A lower share should cost less, but by how much is not known: this A/B has only the two end
+points and does not show that the cost scales linearly with the share. A c25 / c50 arm would. (2) **glibc only.** `ef812b02` predates the
+jemalloc merge (`655e874a`, now the default allocator on main). The cloid cost under compiled-in jemalloc is not measured.
+(3) 120 s cells: minutes 0-2, not a soak. (4) c0 runs the same cloid-capable node with no cloids on the wire. The cost of
+the cloid code at share 0 against a pre-cloid main is not measured. Section 58's wm (main `925fd962`, before `46a11c14`,
+200,292 matched/s) is another campaign and is not comparable with c0's 188,654. (5) The engine attribution in 59.3 has
+no profile behind it (section 60 profiles it).
+
+Analysis (`tools/ozarchy-p3cloid-tools/analyst/`): `a-cells.py` (p3mw's, plus `ingest.cloids` and the `duplicate_cloid`
+reject deltas per node), `a-arms.py`, `a-paired.py` (p3mw's, unchanged, with `--io` for device writes), `a-archive.py`.
+Outputs `cells.txt`, `arms.txt`, `paired.txt`, `phases.txt` (per-phase paired deltas and the per-cell digest /
+`duplicate_cloid` / action-rejection lines) and `cloids.txt` (per-cell share check). The analyst printed `phases.txt` and
+`cloids.txt` from `cells.json` without a saved script; the verify / engine / residual / end_resident_wait / flush rows were
+recomputed from `cells.json` for this write-up and match. Full outputs (incl. `cells.json`) in
+`ozarchy-p3cloid-run/analyst/` on ozarchy. Driver `tools/ozarchy-p3cloid-tools/ozarchy-p3cloid-campaign.sh` (CAMP=CLOID,
+`cloidchk`), build `ozarchy-p3cloid-build.sh`, md5s `md5s-all.txt`.
+
+## 60. Cloid engine cost by perf profile: `CLOID_SHARE=100` vs `0` on main `ef812b02` (glibc), perf on val1, saturated, commit-tail mode (campaign ozarchy-p3cloidprof, 2026-10-13)
+
+**The cloid engine cost is hash-map work, mostly on the exec thread: index upkeep and the duplicate check ~36% each,
+cleanup ~14%.** Profiled on val1 (perf user space, call graphs, 3 ABBA rounds), the engine threads spend +1.00 ms CPU
+per 1k fills more at c100: exec thread +0.71 (+16%), market workers +0.29 (+5%). Split by cloid site (exec + workers):
+index upkeep +0.36 (`CloidMarkets::absorb` -> `OrderBook::drain_cloid_log` +0.32 on the exec thread, `index_cloid` +0.04
+in the workers), duplicate check +0.36 (the serial pre-pass: claimed set +0.14 incl. `reserve_rehash` 0.06,
+`duplicate_cloid` -> `CloidMarkets::live` +0.14; the per-book `contains_key` in place, `order_book.rs:1397-1402`, +0.08
+in the workers), cleanup `forget_cloid` +0.14, and +0.14 not under any cloid site. 93% of the exec thread's extra CPU
+sits at cloid sites. **All exec-thread cloid sites run outside the engine's phase timers, so the timers put the whole
+engine increase in `engine_untimed`: 0.21 -> 0.78 ms per 1k fills (+0.57; the timed phases move -0.05 together).** The
+extra DRAM demand fills of the exec thread (+12.7% per fill) are all at cloid sites, and those sites run at low IPC
+(index 0.54, duplicate check 1.01, cleanup 0.76, against 1.18 for the c0 exec thread): the index maps miss the cache.
+Hashing (`make_hash`, foldhash over the 36-byte `(Address, u128)` key) is ~27% of the exec thread's extra CPU. No lock
+frames show on the engine threads. Outside the engine, val1's other threads spend +3.19 ms CPU per 1k fills more (+22%):
+Keccak +0.91 (all threads; its callers are not known, see 60.5), the signature pre-verify `verify_one_action_with` +0.80
+and RocksDB background threads +0.82 (mostly zstd compression). The profiled A/B reproduces section 59 within its
+intervals (matched/s -12.5% [-21.6, -3.5] vs -11.7%, engine ms per 1k fills +13.1% vs +13.9%, CPU-s/1M +8.9% vs +8.8%).
+
+Requested by 18c after section 59 (c100 vs c0: matched/s -11.7%, engine ms per 1k fills +13.9%, no profile behind the
+engine split): where inside the engine does the cloid cost go? Same binary and arms as 59: the kept p3cloid stage
+(`ozarchy-p3cloid-stage/cl-run/release`), node `6f363582` (build id `016bed06`, symbols present, not rebuilt) and bench
+`9fda6c84` from main `ef812b02`, glibc. c0 = run-cell.sh `CLOID_SHARE=0`, c100 = `CLOID_SHARE=100`. Same shape as 59
+(tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, RATE 76000 = saturated, 120 s cells + 60
+s warm-up, commit tail, shared NVMe, no Phase 3), harness = the `ef812b02` worktree. Driver
+`ozarchy-p3cloidprof-campaign.sh` CAMP=CLOID (copy of `ozarchy-p3cloid-campaign.sh` with the perf sidecar on both arms,
+w0 + 3 rounds, a stop at a cell boundary on request). Cells ran 15:07-15:46: w0 (c0, 60 s, excluded), r1 c0 c100, r2
+c100 c0, r3 c0 c100. 105 CHECK OK, no CHECK FAIL, all 7 cells rc 0, ACCEPT, AGREE. The host was quiet before every cell
+(no cargo / rustc / rust-analyzer, load 1.71-1.98). `perf_event_paranoid` is 2, so the profile is user space only (`:u`,
+no sudo, no kernel frames).
+
+Profile (`cloidprof-sidecar.sh`, a copy of the p2s0y perf2 sidecar moved from val0 to val1, because val0 serves the
+bench RPC and the headline numbers). W1 = 35-80 s after the bench start: `perf record -e cycles:u -F 499 -g --call-graph
+fp -p <val1>`, the whole process with inherit (exec thread plus the short-lived market workers), 144-151k samples per
+cell, none lost. W2 = 82-102 s: the exec thread only (`-t <exec tid> --no-inherit`), five sampled events: cycles,
+instructions, L1-dcache-load-misses, `ls_dmnd_fills_from_sys.mem_io_local` (demand fills from local DRAM, used as the
+LLC miss count because `LLC-load-misses:u` is not supported on Zen 3) and `ls_dmnd_fills_from_sys.ext_cache_local`
+(fills from the other CCD's L3). Every figure below is ms of CPU (or events) per 1k val1 fills over the window: a sample
+set's share of the period x val1 utime over the window / val1 fills over the window. Frames are inline-expanded with
+`llvm-addr2line -i`. Thread groups: exec = the `torus-execution` task with the most CPU at W1 start (`exec-tid.txt`),
+workers = comm `torus-exec-pool` (rayon market workers), other = the rest (RPC, consensus, RocksDB, flush). A sample's
+cloid site is the innermost frame on its logical stack that matches the site list in `a-prof.py` (functions, plus line
+ranges `native_executor.rs:6879-6940` for the pre-pass and `order_book.rs:1397-1402` for the per-book check), so a site
+includes its callees (hashbrown, foldhash, memcpy). The W1 windows cover 47-48 s of each cell (`windows.txt`). **Every
+figure here is minutes 0-2 only.**
+
+### 60.1 Cells and the whole-cell A/B (n = 3, paired c100 - c0, 95% CI t(2))
+
+| cell | arm | rc / agreement | `share_pct` | stamped / placed (orders) | `duplicate_cloid` rejects val0 / val1 / val2 | matched/s | native blk/s |
+|---|---|---|---|---|---|---|---|
+| w0 (60 s, excluded) | c0 | 0, ACCEPT AGREE | 0 | 0 / 18,635,200 | 0 / 0 / 0 | 190,622 | 4.48 |
+| r1-c0 / r1-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 35,455,200; 31,727,200 / 31,727,200 | 0 / 0 / 0 both | 196,575 / 167,806 | 3.53 / 3.11 |
+| r2-c100 / r2-c0 | | 0 / 0, ACCEPT AGREE | 100 / 0 | 31,670,000 / 31,670,000; 0 / 31,836,400 | 0 / 0 / 0 both | 172,126 / 188,140 | 3.24 / 3.51 |
+| r3-c0 / r3-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 32,734,000; 30,456,400 / 30,456,400 | 0 / 0 / 0 both | 189,981 / 162,777 | 3.39 / 3.01 |
+
+| | c0 | c100 | c100 - c0 | % [95% CI] | section 59 (n = 4, no perf) |
+|---|---|---|---|---|---|
+| matched/s (whole cell, val0 headline) | 191,565 | 167,570 | -23,996 [-41,277, -6,714] | **-12.53% [-21.55, -3.50]** | -11.72% [-13.83, -9.60] |
+| placed/s | 250,428 | 219,216 | -31,212 | **-12.46% [-21.45, -3.47]** | -11.75% |
+| bench submits/s | 1,113 | 1,037 | -76 | -6.80% [-19.30, +5.70] | -6.85% |
+| native blocks/s | 3.48 | 3.12 | -0.36 | **-10.24% [-16.12, -4.37]** | -6.99% (n.s.) |
+| exec `block_ms` (mean of 3 nodes) | 258.6 | 291.8 | +33.2 [+17.4, +49.0] | **+12.83% [+6.73, +18.93]** | +11.84% |
+| engine ms per 1k fills (summary) | 4.07 | 4.60 | +0.53 [+0.11, +0.95] | **+13.10% [+2.81, +23.40]** | +13.90% |
+| exec per native block p99 ms | 708 | 837 | +129 | **+18.20% [+10.33, +26.06]** | +18.9% |
+| residual untimed ms per native block | 13.48 | 17.73 | +4.25 [+2.82, +5.68] | **+31.56% [+20.95, +42.16]** | +35.4% |
+| exec busy | 0.951 | 0.953 | +0.002 | +0.20% [-1.64, +2.04] | +0.2% |
+| node CPU-s/1M (whole run) | 26.35 | 28.70 | +2.36 [+0.91, +3.81] | **+8.94% [+3.44, +14.44]** | +8.84% |
+| node CPU at equal fills (ANCOVA, Welch) | | | | **+7.37% [+4.02, +10.73]** | +6.37% |
+| RSS peak / mean per node GB (cpu.csv) | 4.25 / 3.59 | 4.54 / 3.88 | **+0.29 [+0.28, +0.31] / +0.29 [+0.23, +0.34]** | +6.93% / +8.04% | +0.32 / +0.24 |
+| device writes MB/s per validator | 144.0 | 148.5 | +4.4 [-6.3, +15.2] | +3.09% [-4.36, +10.53] | +1.8% |
+
+All three rounds point the same way (matched/s -28,769 / -16,014 / -27,204). With n = 3 the intervals are about twice as
+wide as 59's, and every row agrees with 59 within them. **Perf on val1:** val1's engine ms per 1k fills inside W1
+is ~4% above its whole-cell value in both arms (c0 4.24 vs 4.08, c100 4.80 vs 4.59; `metrics.txt`). This is an observed
+window-versus-cell difference, not a measured perf overhead (there is no unprofiled control, and the whole-cell value
+includes the profiled window); it is the same in both arms, so it does not change the c100 - c0 picture. The headline matched/s comes from val0, which is not
+profiled.
+
+### 60.2 Where the extra CPU goes (W1, val1, ms CPU per 1k fills, mean of 3 cells per arm)
+
+| thread group | c0 | c100 | c100 - c0 |
+|---|---|---|---|
+| whole process | 24.51 | 28.70 | +4.19 (+17.1%) |
+| exec thread | 4.44 | 5.16 | **+0.71 (+16.1%)** |
+| market workers (`torus-exec-pool`) | 5.83 | 6.11 | **+0.29 (+4.9%)** |
+| other threads | 14.25 | 17.44 | +3.19 (+22.4%) |
+
+By cloid site (`cloid-sites.txt`; inclusive of callees; c0 is 0.00-0.02 at every site):
+
+| candidate | site (file:line at `ef812b02`) | exec | workers | exec + workers | share of +1.00 |
+|---|---|---|---|---|---|
+| 1 index upkeep | `CloidMarkets::absorb` -> `OrderBook::drain_cloid_log` (absorb loop after matching, `native_executor.rs:7309`); `OrderBook::index_cloid` (place, in the worker) | +0.324 | +0.038 | **+0.362** | 36% |
+| 2 duplicate check | serial pre-pass (`native_executor.rs:6882-6930`): claimed `HashSet<(Address, Cloid)>` insert and `retain` +0.140, `duplicate_cloid` -> `CloidMarkets::live` +0.136; per-book `contains_key` in `OrderBook::place` (`order_book.rs:1397-1402`) | +0.276 | +0.081 | **+0.357** | 36% |
+| 3 cleanup | `OrderBook::forget_cloid` (`order_book.rs:2946`; maker fills, cancels, stops) +0.143; `forget_cloids` (batch) +0.002 | +0.064 | +0.080 | **+0.144** | 14% |
+| none | not under a cloid site | +0.048 | +0.088 | +0.136 | 14% |
+| total | | +0.713 | +0.286 | +0.999 | |
+
+What the sites spend it on (exec thread, `frames-children.txt` / `frames-self.txt`). Inclusive: hashbrown `get` +0.43,
+`find` +0.32 (0.65 -> 0.97), `make_hash` / `hash_one` +0.19 (27% of the exec delta), the claimed-set `HashMap<(Address,
+u128), ()>::insert` +0.14, of which `reserve_rehash` +0.055 (the set grows from empty in every block; computed from
+`folded-*.txt` for this write-up). Self (leaf): `_mm_movemask_epi8` (hashbrown group probe) +0.189, `spec_eq` (key
+compare) +0.141, foldhash `hash_bytes_long` +0.080 (the 36-byte key takes foldhash's long path), `write_u128` +0.018.
+Locks: frames matching futex / `Mutex` / `RwLock` / `parking_lot` are 0.000-0.006 ms per 1k fills on the exec thread and
+the workers in both arms (also from `folded-*.txt`; time blocked in the kernel is not visible to `cycles:u`, but exec
+busy is 0.95 in both arms). The non-cloid +0.14 is net: on the exec thread Keccak +0.120 (its samples carry no call
+stack, see 60.5; consistent with section 59's verify +25%) against small decreases (`dealloc_nonnull` -0.025, a
+`native_executor.rs` closure -0.014); in the workers `place_order_with_accounts` self +0.055 and a btree `or_default`
++0.033 against `get_position` -0.033 and `reserve_price` -0.024 (not attributed further).
+
+Engine phase timers (`metrics.txt`, whole cell, mean of val0-2, ms per 1k fills): engine 4.18 -> 4.69 (+0.51, +12.1%),
+of which `engine_untimed` 0.211 -> 0.777 (+0.566; per round +0.570 / +0.537 / +0.592; per native block 9.3 -> 33.7 ms),
+`phase1_actions` +0.041, `phase_margin` -0.033, `phase_match` -0.001, `phase_settle` -0.056. In the `ef812b02` source
+the pre-pass runs after the Phase 1 timer stops and before the margin timer starts, and the absorb loop runs after the
+match timer stops and before the settle timer starts, so both are untimed. The worker sites (per-book check,
+`index_cloid`, worker `forget_cloid`) run inside the parallel match phase, whose wall time does not move.
+
+### 60.3 Cache behaviour on the exec thread (W2, events per 1k val1 fills, mean of 3 cells per arm; `llc.txt`)
+
+| event | c0 | c100 | % | at cloid sites (c100 - c0): index / dup check / cleanup | not at a site |
+|---|---|---|---|---|---|
+| cycles | 13.28 M | 15.17 M | +14.2 | +0.98 M / +0.84 M / +0.18 M | -0.11 M |
+| instructions | 15.71 M | 19.07 M | +21.4 | +0.53 M / +0.86 M / +0.14 M | +1.83 M |
+| L1-dcache-load-misses | 291,278 | 310,551 | +6.6 | +6,818 / +13,143 / +2,397 | -3,085 |
+| DRAM demand fills (`mem_io_local`) | 33,084 | 37,288 | **+12.7** | **+2,785 / +961 / +512** | -53 |
+| other-CCD L3 fills (`ext_cache_local`) | 225 | 275 | +22.4 | +22 / +23 / +6 | 0 |
+
+IPC (c100, instructions / cycles at the site): index 0.54, duplicate check 1.01, cleanup 0.76; the rest of the exec
+thread 1.33 (c0: 1.18). Whole exec thread IPC 1.18 -> 1.26 and DRAM fills per 1k instructions 2.11 -> 1.96, because
+Keccak adds +1.53 M instructions at high IPC outside the cloid sites. **The extra DRAM fills are all at cloid sites, and
+the index upkeep site runs at half the thread's IPC: draining the per-book cloid logs into the cross-market index
+touches memory that is no longer in cache.** The top DRAM-fill leaves are the hashbrown probe (`_mm_movemask_epi8`
++1,282), the key compare (`spec_eq` +1,191) and foldhash (+614).
+
+### 60.4 18c's hypotheses (read-only code check before the run)
+
+| hypothesis | result |
+|---|---|
+| frame `CloidMarkets::live` (pre-pass duplicate check) | **confirmed**, +0.133 exec (all of `duplicate_cloid` +0.136) |
+| frame `CloidMarkets::absorb` | **confirmed**, +0.324 inclusive, almost all in `drain_cloid_log` |
+| frame `drain_cloid_log` | **confirmed**, +0.323, the largest single site (45% of the exec delta) |
+| frame `reserve_rehash` | **confirmed but small**, +0.055 in the claimed-set insert; other rehash time is the same in both arms |
+| frame `find` | **confirmed**, hashbrown `find` +0.32 inclusive on exec (+0.12 in the workers) |
+| site `native_executor.rs:6882` (pre-pass) | **confirmed**, serial block +0.140 + `duplicate_cloid` +0.136 = +0.276 exec |
+| site `native_executor.rs:7309` (`CloidMarkets::absorb` call) | **confirmed**, = the absorb / drain cost, +0.324 |
+| site `order_book.rs:1400` (per-book `contains_key` in place) | **confirmed**, +0.081 in the workers |
+| site `order_book.rs:2946` (`forget_cloid`) | **confirmed**, +0.143 (exec 0.063, workers 0.080); the batch `forget_cloids` only +0.002 |
+
+### 60.5 Outside the engine
+
+val1's other threads: +3.19 ms CPU per 1k fills (+22.4%). The largest parts:
+
+- Keccak (`__KeccakF1600`) self +0.91 over all threads (4.14 -> 5.05; +0.79 outside the exec thread, +0.12 on it). Its
+  samples carry no caller: the assembly Keccak keeps no frame-pointer chain, so `--call-graph fp` stops at the leaf
+  (~99% of the Keccak samples outside the exec thread in `folded-*.txt` are a bare `other;__KeccakF1600` stack). Where
+  it is called from (signature hashing, action hashes, block or DA hashes) is therefore not known from this profile.
+- The rayon signature pre-verify `torus_rpc::torus::verify_one_action_with` +0.80 inclusive (2.59 -> 3.39, +31%), not
+  counting the unattributed Keccak above; k256 `mul_inner` +0.08 of it.
+- RocksDB background threads (`BGThread`) +0.82 inclusive (1.49 -> 2.31, +55%), mostly zstd compression (zstd leaves
+  under the background threads 0.61 -> 1.17, computed from `folded-*.txt` for this write-up).
+
+These threads do not lengthen the exec thread's block time, but they are part of the +8.9% CPU-s/1M. A cost that does
+not scale with fills rises ~12% per fill from the normalisation alone (W1 val1 fills/s 187,635 -> 167,559, -10.7%);
+verify (+31%) and RocksDB background (+55%) rise more than that. Larger signed orders (the u128 cloid in the canonical
+bytes) and larger stored order rows are consistent with both; not checked here.
+
+**Verdict:** the cloid engine cost at 100% share is per-order hash-map work. On the exec thread it is the index upkeep
+(drain the per-book cloid logs into `CloidMarkets` after matching) and the serial duplicate pre-pass (claimed set plus
+`CloidMarkets::live`), each ~0.3 ms CPU per 1k fills; in the workers it is the per-book check, `index_cloid` and
+`forget_cloid`. The index upkeep is cache-bound (IPC 0.54, most of the extra DRAM fills). Both exec-thread parts are
+untimed by the phase timers, which is why section 59 saw only `engine` and `residual_untimed` move. Decisive for the
+split (all exec sites are 0.00-0.02 in c0); n = 3 x 120 s for the whole-cell A/B, consistent with 59.
+
+**Possible levers (suggestions only, not measured):** (1) pre-size the claimed set (`HashSet::with_capacity` from the
+number of cloid placements in the batch) to remove the ~0.06 of `reserve_rehash`; (2) a smaller key or a cheaper hash
+for the cloid maps (for example a 64-bit digest of `(Address, u128)`, or a hash over a prefix, with the full key kept
+for the compare), since foldhash's long path and the key compare are ~0.3 of the exec delta; (3) batch the absorb /
+drain work, or let the workers build each book's index delta so the exec thread only merges it, and (4) skip the
+pre-pass's cross-market lookup for a sender with no live cloids. Each needs its own A/B.
+
+**Caveats.** (1) 100% share is the worst case (as in 59); the split at a realistic share is not measured. (2) One node
+(val1), user space only: kernel time (syscalls, page faults) is not attributed. (3) W1 and W2 are 45 s and 20 s windows
+inside minutes 0-2. (4) Per-1k-fills normalisation spreads every cost over fewer fills in c100 (W1 fills/s -10.7%),
+which inflates costs that do not scale with fills; the cloid sites are 0 in c0, so their deltas are not affected. (5)
+glibc only. (6) Per-site figures are arm means of 3 cells; per-cell variation of the split is not shown (in
+`prof-cells.json`; 60.6 adds it).
+
+Analysis (`tools/ozarchy-p3cloidprof-tools/analyst/`): `run-analysis.sh` (perf script / perf report per cell, then the
+scripts below), `a-prof.py` (W1 / W2 attribution, cloid sites, thread groups; writes `frames-self.txt`,
+`frames-self-loc.txt`, `frames-children.txt`, `cloid-sites.txt`, `llc.txt`, `windows.txt`, `prof-cells.json` and the
+folded stacks), `fg.py` (flame graph SVG from the folded stacks), `a-metrics.py` (engine phase timers, `metrics.txt`),
+and the p3cloid analyst scripts `a-cells.py`, `a-arms.py`, `a-paired.py` (`cells.txt`, `arms.txt`, `paired.txt`;
+`run-analysis.sh` writes their stdout) plus `a-archive.py`. The archived `run-analysis.sh` differs from the analyst's
+copy on ozarchy in one place: it passes the cell prefix to `a-cells.py` and `a-paired.py` with its trailing `-`
+(`"$P-"`), as those scripts build cell paths as prefix + tag; the copy on ozarchy passes `"$P"`, which would open
+`ozarchy-p3cloidprof-300mw0/`. With the fix, `a-paired.py` reproduces `paired.txt` byte for byte and `a-cells.py`
+reproduces the w0 entry of `cells.json`, so the outputs were made with the hyphenated prefix. `frames-engine-delta.txt`
+was printed in the analyst session without a saved script: it is the exec + workers sum of `frames-self.txt` per frame
+(checked for the top rows). The `reserve_rehash` and lock figures in 60.2 and the Keccak / zstd attribution in 60.5 were
+computed from `folded-*.txt` for this write-up, and the per-site IPC in 60.3 from the `llc.txt` counts. Flame graphs
+(FlameGraph-style, us CPU per 1k fills, arm mean, cloid frames in blue):
+`ozarchy-p3cloidprof-run/analyst/flamegraph-c0.svg` and `flamegraph-c100.svg` (0.5 MB each) on ozarchy, not copied into
+the repo (no earlier campaign committed an SVG). Not copied either: the folded stacks (41-42 MB each) and the per-cell
+`perf-report-*.txt` (118-146 KB each, regenerable with `run-analysis.sh`). Driver
+`tools/ozarchy-p3cloidprof-tools/ozarchy-p3cloidprof-campaign.sh`, sidecar `cloidprof-sidecar.sh`, md5s `md5s-all.txt`
+(the p3cloid build's).
+
+### 60.6 Addendum: per-cell noise and Keccak callers (re-analysis of the existing perf.data, 2026-10-13, no new run)
+
+18c asked two follow-ups after 60: how much do the per-site figures vary across the 3 cells per arm (60's caveat 6), and
+who calls Keccak? Nothing was rerun. The inputs are the same W1 data, read-only: `prof-cells.json` (from `a-prof.py`),
+the cells' `prof.script.gz`, `exec-tid.txt` and `perf.data`. For each frame the table gives the arm mean ± SD of the 3
+per-cell values and the paired c100 - c0 delta (pairs r1-r3) with a 95% CI t(2) (t = 4.303, n = 3 pairs). Resolved
+means the CI excludes 0. Units are as in 60.2: W1, val1, ms CPU per 1k val1 fills. Per-cell values are in
+`noise-frames.txt`.
+
+**Every cloid-site delta is resolved with tight intervals (c0 ~0, c100 SD <= 0.02). The workers' group total (+0.29),
+their hashbrown probe and their key compare are within noise. The exec thread total is barely resolved. Keccak callers
+can only be split by thread: 98% of Keccak samples have no caller. Gossip verify (+0.30, resolved) and RPC ingress
+verify (+0.17, not resolved) are the largest parts. In cores, total Keccak rises only +0.072 and both verify pools are
+flat, so most of the per-fill rise comes from the denominator (W1 fills/s -10.7% at c100).**
+
+| frame (thread group, self / inclusive / site as in 60.2) | c0 mean ± SD | c100 mean ± SD | c100 - c0 [95% CI t(2)] | resolved |
+|---|---|---|---|---|
+| exec thread total | 4.442 ± 0.193 | 5.155 ± 0.209 | +0.713 [+0.040, +1.387] | yes (barely) |
+| market workers total | 5.825 ± 0.129 | 6.110 ± 0.260 | +0.286 [-0.221, +0.792] | **no** |
+| other threads total | 14.248 ± 0.510 | 17.438 ± 0.757 | +3.190 [+0.589, +5.792] | yes |
+| whole process | 24.514 ± 0.795 | 28.704 ± 1.221 | +4.189 [+0.440, +7.938] | yes |
+| exec site `OrderBook::drain_cloid_log` | 0.000 ± 0.000 | 0.323 ± 0.019 | +0.323 [+0.275, +0.371] | yes |
+| exec incl `CloidMarkets::absorb` | 0.000 ± 0.000 | 0.324 ± 0.020 | +0.324 [+0.275, +0.373] | yes |
+| exec site `CloidMarkets::absorb` excl. drain | 0.000 ± 0.000 | 0.001 ± 0.000 | +0.001 [+0.000, +0.002] | yes |
+| exec incl `CloidMarkets::live` | 0.000 ± 0.000 | 0.133 ± 0.008 | +0.133 [+0.112, +0.154] | yes |
+| exec site `duplicate_cloid` | 0.000 ± 0.000 | 0.136 ± 0.007 | +0.136 [+0.117, +0.154] | yes |
+| exec site pre-pass serial block (claimed set, `retain`) | 0.015 ± 0.001 | 0.155 ± 0.008 | +0.140 [+0.117, +0.163] | yes |
+| exec incl claimed-set `reserve_rehash` | 0.000 ± 0.000 | 0.060 ± 0.001 | +0.060 [+0.058, +0.061] | yes |
+| exec site `forget_cloid` | 0.000 ± 0.000 | 0.063 ± 0.002 | +0.063 [+0.058, +0.068] | yes |
+| workers site `forget_cloid` | 0.000 ± 0.000 | 0.080 ± 0.008 | +0.080 [+0.059, +0.100] | yes |
+| workers site per-book `contains_key` (`order_book.rs:1397-1402`) | 0.002 ± 0.001 | 0.083 ± 0.004 | +0.081 [+0.072, +0.089] | yes |
+| workers site `index_cloid` | 0.000 ± 0.000 | 0.038 ± 0.003 | +0.038 [+0.030, +0.046] | yes |
+| **exec + workers, all cloid sites** | 0.018 ± 0.002 | 0.881 ± 0.043 | **+0.863 [+0.753, +0.973]** | yes |
+| exec incl hashbrown `find_inner` | 0.522 ± 0.011 | 0.841 ± 0.015 | +0.319 [+0.307, +0.330] | yes |
+| workers incl hashbrown `find_inner` | 0.562 ± 0.004 | 0.666 ± 0.030 | +0.104 [+0.031, +0.178] | yes |
+| exec incl `make_hash` | 0.283 ± 0.019 | 0.474 ± 0.025 | +0.191 [+0.090, +0.292] | yes |
+| workers incl `make_hash` | 0.522 ± 0.009 | 0.581 ± 0.017 | +0.059 [+0.039, +0.079] | yes |
+| exec self `_mm_movemask_epi8` (probe) | 0.121 ± 0.009 | 0.310 ± 0.015 | +0.189 [+0.172, +0.206] | yes |
+| workers self `_mm_movemask_epi8` (probe) | 0.195 ± 0.009 | 0.229 ± 0.008 | +0.035 [-0.006, +0.076] | **no** |
+| exec self `spec_eq` (key compare) | 0.216 ± 0.007 | 0.357 ± 0.013 | +0.141 [+0.117, +0.165] | yes |
+| workers self `spec_eq` (key compare) | 0.248 ± 0.005 | 0.281 ± 0.022 | +0.033 [-0.010, +0.076] | **no** |
+| exec self foldhash (all foldhash leaves) | 0.239 ± 0.019 | 0.395 ± 0.020 | +0.156 [+0.066, +0.246] | yes |
+| workers self foldhash (all foldhash leaves) | 0.433 ± 0.009 | 0.466 ± 0.011 | +0.033 [+0.018, +0.049] | yes |
+| exec self `foldhash::hash_bytes_long` | 0.086 ± 0.005 | 0.166 ± 0.010 | +0.080 [+0.045, +0.116] | yes |
+| exec self Keccak (F1600, absorb / squeeze, wrappers) | 0.343 ± 0.004 | 0.466 ± 0.005 | +0.123 [+0.099, +0.147] | yes |
+| other threads self Keccak (same) | 3.961 ± 0.154 | 4.788 ± 0.199 | +0.827 [+0.130, +1.524] | yes |
+| all threads self `__KeccakF1600` only | 4.138 ± 0.142 | 5.050 ± 0.199 | +0.911 [+0.240, +1.583] | yes |
+| other threads incl `verify_one_action_with` | 2.588 ± 0.113 | 3.391 ± 0.288 | +0.803 [-0.008, +1.613] | **no** |
+
+**Keccak callers.** The call graphs are frame-pointer only (`--call-graph fp`). In each cell 97.8-98.1% of Keccak leaf
+samples are a bare leaf with no user frame below it, because the assembly `__KeccakF1600` breaks the chain. (60.5's ~99%
+counted only the threads outside the exec thread, from `folded-*.txt`.) The other ~2% are wrapper and absorb leaves
+(`KECCAK_ASM_SHA3_absorb`, `keccak256_impl`) whose chains are intact. `a-keccak-comm.py` therefore splits Keccak self
+time (F1600, absorb / squeeze and wrappers; total +0.947) by thread: comm, plus the exec tid from `exec-tid.txt`. Then
+`kc-raw.sh` / `a-kc.py` list the caller and the caller's caller of the intact chains for each thread
+(`keccak-intact-chain-callers.txt`). The function names in the second column come from that 2%. Assigning a thread's
+bare samples to those callers is an inference: plausible for the verify threads, which do little else, and not shown
+for the others.
+
+| thread | intact chains name (caller <- its caller) | Keccak ms per 1k fills, c100 - c0 [95% CI] | Keccak cores, c100 - c0 [95% CI] |
+|---|---|---|---|
+| `torus-gossip-verify` | `eip712_struct_hash` <- `SignedNativeAction::recover_sender` (57-60% of all intact chains); also the domain separator, `verified_cache_key` | **+0.302 [+0.053, +0.550]** | +0.007 [-0.027, +0.040], flat |
+| `torus-ingress-verify` (RPC submit) | `eip712_struct_hash` <- `SignedNativeAction::validate_with_sessions` (32-34%), under `verify_one_action_with` | +0.172 [-0.153, +0.496], n.s. | +0.005 [-0.017, +0.028], flat |
+| `hotstuff-algo` (consensus) | `compute_action_hash_with_scratch` <- `TorusApp::dispatch_to_exec` | **+0.157 [+0.065, +0.248]** | **+0.018 [+0.011, +0.026]** |
+| exec thread | `sort_native_actions_indexed` <- `execute_committed_block_with`; also `verified_cache_key_with_scratch` | **+0.124 [+0.101, +0.146]** | +0.014 [-0.000, +0.028], n.s. |
+| `rpc-worker` | `verified_cache_key` <- `add_native_action_presigned`; `compute_action_hash` <- `NativePool::insert_with_restash_key` / `NativeDaStore::put_batch` | **+0.128 [+0.048, +0.209]** | **+0.016 [+0.012, +0.021]** |
+| `torus-node` (pre-proposal broadcast) | `compute_action_hash_with_scratch` <- `LibP2PNetwork::broadcast_pre_proposal_actions`; c100 only (c0 0.000) | **+0.065 [+0.059, +0.072]** | **+0.011 [+0.011, +0.011]** |
+| total | | **+0.947 [+0.260, +1.634]** | **+0.072 [+0.047, +0.097]** |
+
+Cores = ms per 1k fills x W1 fills/s / 1e6. Per second, both verify pools spend the same Keccak time in both arms. Their
+per-fill rise is what a cost that does not grow with load shows when fills/s fall 10.7% (gossip verify c0 2.191 x 0.12
+= +0.26 of its +0.30). The resolved per-second rises are consensus action hashing, `rpc-worker` and the pre-proposal
+broadcast (+0.045 cores together), plus the exec thread (+0.014, n.s.). As whole threads (all samples, cores): gossip
+verify -0.010 [-0.046, +0.027] (flat), ingress verify +0.085 [+0.006, +0.165] (resolved; not Keccak, which is flat
+there). The `verify_one_action_with` stacks are all on the ingress thread. In ms per 1k fills they are +0.802
+[-0.007, +1.611], not resolved (`keccak-by-thread.txt`).
+
+**What changes against 60's text.**
+
+- The cloid-site split (60.2, 60.4) stands: every site delta is resolved. So are the all-sites total (+0.863
+  [+0.753, +0.973]) and the exec hashing figures (`find_inner`, `make_hash`, probe, key compare, foldhash).
+- The worker-side aggregates are within noise: market workers +0.29 [-0.22, +0.79] (60's "+0.29 (+5%)"), the workers'
+  probe +0.035 and key compare +0.033. The three worker cloid sites (`forget_cloid`, per-book `contains_key`,
+  `index_cloid`) are resolved one by one, and so are the workers' `find_inner`, `make_hash` and foldhash. The exec thread
+  total +0.71 is barely resolved ([+0.04, +1.39]).
+- 60's separate `verify_one_action_with` +0.80 (60.5, inclusive, excluding the bare Keccak) is not resolved per cell
+  ([-0.01, +1.61]). So 60.5's "verify (+31%) ... rise more than [the normalisation]" is not shown at n = 3.
+- 60 never assigned Keccak to RPC verify: 60.5 says its callers are not known from this profile, and that still holds
+  for the bare 98%. This addendum only adds the split by thread and the callers named by the intact 2%, as in the table
+  above. If the callers matter, a rerun with `--call-graph dwarf` or LBR call stacks (`--call-graph lbr`) could recover
+  them (suggestion only, not run).
+
+Files: `ozarchy-p3cloidprof-run/analyst/noise/` on ozarchy, archived in `tools/ozarchy-p3cloidprof-tools/analyst/noise/`:
+`a-noise.py` (-> `noise-frames.txt`, reads `prof-cells.json`), `a-keccak-comm.py` (-> `keccak-by-thread.txt`, reads
+`prof-cells.json` and the cells' `prof.script.gz` / `exec-tid.txt`), `kc-raw.sh` (-> `keccak-intact-chain-callers.raw`)
+and `a-kc.py` (-> `keccak-intact-chain-callers.txt`), and `perf-report-comm-sym.sh` (per-cell `perf report --sort
+comm,sym`, `perf-report-comm-sym-<cell>.txt`, 50-66 KB each). The analyst ran the commands in `kc-raw.sh` and
+`perf-report-comm-sym.sh` inline. They are saved as scripts for the archive with the commands unchanged and only the
+paths parameterised. The perf reports are not in the repo: their header line carries several KB of trailing blanks, and
+the script regenerates them. Reproduction check (rerun with `nice -n 19` into a temp dir, then diffed):
+`noise-frames.txt`, `keccak-by-thread.txt` and `keccak-intact-chain-callers.txt` are byte-identical.
+`keccak-intact-chain-callers.raw` is identical after `sort`, because awk's output order is unspecified. The 6 perf
+reports differ only in perf's random "Tip" footer line.
+
+## 61. Final Phase 3 gate: step 2 `c88d3073` vs main `de1a97c1`, both jemalloc compiled in, SAT n = 4 + 600 s soak + SIGTERM restart per arm, commit-tail mode (campaign ozarchy-p3gate, 2026-10-13)
+
+**5 of 6 measured gates pass (restart on SIGTERM only, see below); the RAM size gate fails in the soak.** Phase 3 (s2, 15 s) vs its own main parent, both
+jemalloc compiled in, full workload:
+
+| gate (section 1 of `item6-phase3-impl.md`) | target | measured | result |
+|---|---|---|---|
+| CPU | no CPU-s/1M regression beyond noise | SAT **-9.72% [-10.46, -8.98]** (26.51 -> 23.94); equal fills -8.39% [-9.26, -7.51]; soak -12.4% (one cell per arm) | **PASS** |
+| disk | state-row bytes written down | device writes SAT **-54.8% [-56.9, -52.7]** (159.0 -> 71.9 MB/s per validator); soak -64.2% (231.6 -> 82.9) | **PASS** |
+| throughput | matched/s up beyond noise; native blocks/s no regression | SAT matched/s **+8.8% [+5.2, +12.4]**, native blocks/s **+20.1% [+10.3, +30.0]**; soak +13.3% / +13.6% | **PASS** |
+| restart | restart -> ready <= 60 s (plan: SIGKILL val1, multi-crash cells) | SIGTERM val1 only: kill -> first chain commit **s2 35.0 s** (19.1 s shutdown + 16.0 s up), m 37.3 s; replay 0 in both; one kill per arm. No SIGKILL / multi-crash cell in this campaign | **PASS for SIGTERM**; SIGKILL not re-measured on `c88d3073` |
+| RAM, levels off | RSS levelling off in a 10 min soak | s2 last-5-min RSS slopes -77 / -66 / -10 MB/min per node; s2 - m difference slopes -53 / -44 / -34 MB/min, all CIs include 0 | **PASS** |
+| RAM, size | Phase 3 delta <= ~1 GB per node | soak **+1.43 GB** per node (minutes 5-10 mean; +1.31 at 10 min, **+1.80 peak**, val0 peak +2.04); SAT (minutes 0-2) mean +0.99 [+0.67, +1.30], peak +1.28 [+0.82, +1.74] | **FAIL** (soak mean and peak) |
+
+The correctness gate (write sets, `h_n`, CF dumps) is the step 1 test suite, not part of this campaign. The plan's restart
+gate names SIGKILL multi-crash cells; the last such measurement is section 46 (step 1 `a44bdde6`: SIGKILL kill -> first
+commit 14.4 s mean / 23.2 s max, replay from the marker correct), not this head, so the restart PASS here covers SIGTERM only. **What the extra RAM
+is:** of the +1.43 GB soak delta, live allocations (`torus_jemalloc_allocated_bytes`) are +0.50 / +0.54 / +0.56 GB per node,
+the same as section 57's je vs je soak (+0.51 to +0.57). The rest, +0.67 to +1.18 GB per node, is jemalloc-resident pages not
+in live use (resident - allocated; section 57: +0.40 to +0.49), and non-heap RSS is equal (-0.11 to +0.01 GB). The live
+heap does not grow (s2 - m allocated difference slopes +30 to +42 MB/min, CIs include 0), so the delta over section 57's
++0.94 GB is allocator retention, not a leak. Caveats: one soak cell per arm (no CI on the soak numbers), and s2 ran +13%
+matched/s in the soak (more work per minute, so more allocator churn). Block time p99 (commit interval) is higher on s2:
++17.7% [+6.7, +28.7] SAT and +23% in the soak (not a gate; 61.2). **The decision is the owner's (pending).**
+
+The FINAL Phase 3 gate run (18c, 2026-10-13). Arms: **s2** = `feat/item6-phase3-step2` `c88d3073` (step 1 + step 2 +
+merge-wait `91a10875`, merged with main `de1a97c1`; node `4e0d8b84`, bench `ae96e0c1`) with
+`TORUS_CHECKPOINT_INTERVAL_MS=15000`. **m** = main `de1a97c1` (`c88d3073`'s second parent; node `f1081574`, bench
+`42365459`), knob unset. Each arm's node and bench were built from its own commit into a fresh target dir
+(`ozarchy-p3gate-build.sh`; cloid changed the signed-order format, so a bench only matches its own node). Both binaries
+have jemalloc compiled in (default feature; preflight nm count 1,168 jemalloc symbols in each node, no LD_PRELOAD, no
+`libjemalloc.so` mapped). CLOID_SHARE=0 (no cloids), default (full) workload with the cancel-share fix in both (it is on
+main), tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, RATE 76000 (saturated), commit tail,
+shared NVMe, btrfs data dirs. Harness = the `c88d3073` worktree (its `summarize.py` reports `checkpoint_deferred_join`),
+tools = c88d3073's `tools/matched-bench` with p3term's `crash-kill.sh` (SIGTERM, 0.1 s exit polling), genesis state hash off
+(`TORUS_STATE_HASH_FAILSTOP` unset). Driver `ozarchy-p3gate-campaign.sh` CAMP=GATE (copy of `ozarchy-p3cloid-campaign.sh`
+plus the restart cells of `ozarchy-p3term-campaign.sh`). Smoke 15:58-16:08: s0-s2-TERM (90 s, SIGTERM val1 at 40 s) and
+s0-m (60 s). Cells 16:10-17:51: w0 (s2, 60 s, excluded); SAT r1-r4 ABBA (r1-s2 r1-m r2-m r2-s2 r3-s2 r3-m r4-m r4-s2, 120 s
+each); soak k1-m, k1-s2 (600 s each, fixed); restart t1-s2-TERM, t1-m-TERM (300 s, one SIGTERM of val1 at bench + 180 s,
+KILL_WAIT 75 s, the bench reads blocks from val2). 225 CHECK OK (+36 in the smoke), no CHECK FAIL, no memguard stop; the
+host was quiet before every cell (no cargo / rustc / rust-analyzer, load 1.72-1.96). Enable line once per validator in
+every s2 cell (twice on the restarted val1), 16 checkpoints per node per SAT cell, 54 per node in the soak.
+
+**Validity.** w0, all 8 SAT cells, both soak cells and smoke s0-m: rc 0, ACCEPT, AGREE (12 cells; `validity.txt` says
+"11" but lists the same 12). Three rc 2 cells are known artifacts, used for their measurements: t1-s2-TERM and smoke
+s0-s2-TERM are REJECT AGREE with one reason, the crash gate's restart-tail scan matching the INFO config echo `running
+state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false` of the restarted val1 (no WARN / ERROR panic or fail-stop line,
+hardscan clean, digests and block hash equal on 3 nodes). t1-m-TERM is REJECT DISAGREE: the same INFO-line false FAIL plus
+the mark-only digest artifact (val0's digest took 64.2 s vs 21.5 / 23.4 s; 50 lines differ, fields `accountValue`,
+`freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed`, `withdrawable` only; block hash equal at height 1,692). No hard
+finding.
+
+### 61.1 SAT, n = 4 ABBA, 120 s (paired s2 - m, 95% CI t(3); `paired.txt`, `arms.txt`)
+
+| metric | m | s2 | delta | % [95% CI] |
+|---|---|---|---|---|
+| matched/s | 198,189 | 215,590 | +17,401 | **+8.78% [+5.17, +12.39]** |
+| submits/s (closed loop) | 1,252 | 1,339 | +87 | +6.93% [+4.40, +9.45] |
+| native blocks/s | 3.82 | 4.58 | +0.77 | **+20.11% [+10.28, +29.95]** |
+| node CPU-s/1M fills | 26.51 | 23.94 | -2.58 | **-9.72% [-10.46, -8.98]**; equal fills (ANCOVA, `arms.txt`) -8.39% [-9.26, -7.51] |
+| device writes MB/s per validator | 159.0 | 71.9 | -87.1 | **-54.80% [-56.87, -52.73]** |
+| engine ms per 1k fills | 3.84 | 3.44 | -0.40 | -10.35% [-12.22, -8.49] |
+| exec `block_ms` (mean of nodes) | 234.4 | 200.6 | -33.8 | -14.43% [-20.61, -8.25] |
+| exec per native block p50 / p99 ms | 354 / 621 | 307 / 590 | -47 / -30 | -13.38% [-15.47, -11.29] / -4.90% [-12.23, +2.42] |
+| block time (commit interval) p50 / p99 ms | 112 / 1,138 | 76 / 1,340 | -37 / +202 | -32.72% [-55.28, -10.17] / **+17.74% [+6.74, +28.74]** |
+| fills / actions per native block | 49,134 / 262 | 44,895 / 241 | | -8.63% [-14.64, -2.61] / -7.94% [-14.12, -1.76] |
+| RSS mean / peak GB per node (cpu.csv) | 3.69 / 4.63 | 4.68 / 5.91 | +0.99 / +1.28 | +0.99 GB [+0.67, +1.30] / +1.28 GB [+0.82, +1.74] |
+| RSS HWM / anon GB | 4.80 / 4.02 | 6.25 / 4.98 | +1.45 / +0.96 | +1.45 [+0.97, +1.94] / +0.96 [+0.62, +1.30] |
+| RSS growth GB/min (whole cell) | 0.68 | 1.01 | +0.33 | +0.33 [+0.18, +0.49] |
+| RSS first 15 s / last 15 s GB | 2.95 / 4.51 | 3.15 / 5.50 | +0.21 / +0.99 | +0.21 [-0.04, +0.45] / +0.99 [+0.59, +1.39] |
+| RocksDB memtables MB | 286 | 264 | -22 | -7.69% [-24.07, +8.68] |
+| exec lag / backlog (blocks) | 13.3 / 53.5 | 11.0 / 53.5 | | -17.35% [-25.99, -8.72] / tie |
+| exec busy | 0.968 | 0.963 | | tie |
+
+Checkpoint timers (`ckpt-timers.txt`, s2 only; main exports none): E's `checkpoint_settle_wait` 3.48 ms per native block on
+the summary phase basis (3.07-4.20 per cell), **3.14 ms per native block on the metrics basis** (`torus_exec_native_blocks_total`;
+p50 / p99 per observation 0.28 / 21.0 ms, cell means); upkeep 0.84 ms per block; **deferred join p50 0.0 ms, p99 0.0-3.2 ms per
+node** (SAT mean 0.66; from the new `summary.json` fields `phase_by_node.val*.checkpoint_deferred_join_ms_p50` / `_p99`,
+written by the `c88d3073` harness's `summarize.py`, s2 only); `ck_wait` 0.39 ms (one cell 1.55). The exec settle phase (`torus_exec_phase_settle_seconds`) is
+**49.0 ms per native block on s2 vs 57.1 on m**. Layer 153 MB per checkpoint (SAT). This is section 54's merge-wait result
+(settle wait 23.4 -> 3.1 ms) on the merged head.
+
+### 61.2 Soak, 600 s per arm, one cell each (`arms-soak.txt`, `series.txt`)
+
+![RSS and jemalloc allocated per node: s2 vs m](ozarchy-p3gate-figs/fig-rss.png)
+
+*Figure 61-1: VmRSS (solid s2, dashed m) and `torus_jemalloc_allocated_bytes` (thin dashed) per node, 5 s samples. s2
+green, m grey.*
+
+| cell | node | mean min 2-5 MB | mean min 5-10 MB | change | end MB | peak MB | slope last 5 min MB/min (95% CI) | je allocated MB | je resident MB | je retained MB | exec queue (min 5-10) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| m | val0 | 4,377 | 4,410 | +33 | 4,530 | 4,606 | -20.3 [-45.9, +5.3] | 2,986 | 3,919 | 3,631 | 60.9 |
+| m | val1 | 4,319 | 4,334 | +15 | 4,347 | 4,544 | -13.8 [-34.0, +6.4] | 2,963 | 3,888 | 3,441 | 59.7 |
+| m | val2 | 5,239 | 5,280 | +41 | 5,325 | 5,584 | **+28.0 [+1.0, +55.0]** | 3,070 | 4,808 | 5,132 | 65.2 |
+| s2 | val0 | 6,184 | 6,022 | -162 | 5,875 | 6,692 | **-76.8 [-137.6, -15.9]** | 3,497 | 5,642 | 5,168 | 55.4 |
+| s2 | val1 | 5,728 | 5,563 | -165 | 5,244 | 6,230 | **-65.9 [-120.3, -11.5]** | 3,517 | 5,131 | 6,501 | 60.7 |
+| s2 | val2 | 6,753 | 6,844 | +91 | 7,123 | 7,341 | -10.2 [-59.8, +39.5] | 3,645 | 6,364 | 7,948 | 65.3 |
+
+jemalloc columns: minutes 5-10 mean of the 5 s gauges; `retained` is address space kept mapped but returned to the OS (not
+in RSS). Deltas per node (GB: mean min 5-10 / at 10 min / peak) and the OLS slope of the difference series over the last
+5 min (MB/min, 95% CI, AR(1) effective n):
+
+| delta s2 - m | val0 | val1 | val2 | mean of 3 |
+|---|---|---|---|---|
+| **RSS** | +1.57 / +1.31 / +2.04; -52.6 [-119.2, +13.9] | +1.20 / +0.88 / +1.65; -43.9 [-106.2, +18.5] | +1.53 / +1.76 / +1.72; -33.5 [-94.5, +27.6] | **+1.43 / +1.31 / +1.80** |
+| je allocated (live) | +0.50 / +0.44 / +1.09; +42.1 [-35.2, +119.3] | +0.54 / +0.66 / +0.80; +32.0 [-15.8, +79.9] | +0.56 / +1.07 / +0.91; +30.1 [-34.6, +94.9] | +0.53 / +0.72 / +0.93 ¹ |
+| je resident | +1.68 / +1.73 / +2.30; -55.3 [-125.8, +15.2] | +1.21 / +1.42 / +1.74; -30.8 [-93.2, +31.7] | +1.52 / +1.74 / +1.89; -42.8 [-116.7, +31.1] | +1.47 / +1.63 / +1.98 ¹ |
+| je resident - allocated (min 5-10) | +1.18 | +0.67 | +0.96 | +0.94 ¹ |
+| je retained (min 5-10, not in RSS) | +1.50 | +2.99 | +2.75 | |
+| RSS - je resident (non-heap) | -0.11 | -0.01 | +0.01 | |
+
+¹ Means of the printed per-node values, and resident - allocated as the difference of the printed rows, computed for this
+write-up (`series.txt` prints only the RSS mean of 3).
+
+| metric (whole 600 s cell) | m | s2 | s2 vs m |
+|---|---|---|---|
+| matched/s | 193,398 | 219,139 | +13.3% |
+| matched/s minutes 0-2 / 2-6 / 6-10 (val0 counter) | 201,679 / 191,823 / 190,516 | 210,202 / 223,560 / 218,481 | 6-10 vs 0-2: m -5.5%, s2 +3.9% |
+| native blocks/s | 2.61 | 2.97 | +13.6% |
+| node CPU-s/1M fills | 27.93 | 24.46 | **-12.4%** |
+| device writes MB/s per validator | 231.6 | 82.9 | **-64.2%** |
+| engine ms per 1k fills | 3.97 | 3.44 | -13.4% |
+| exec `block_ms` / per native block p99 ms | 364.6 / 614 | 327.4 / 570 | -10.2% / -7.2% |
+| block time p50 / p99 ms | 275 / 1,196 | 237 / 1,473 | -13.6% / **+23.1%** |
+| fills / actions per native block | 72,090 / 361 | 72,146 / 361 | tie |
+| settle wait ms per native block (summary phase / metrics) | n/a | 9.04 / 8.8 (p50 / p99 per observation 8.3 / 30.5 ms) | |
+| exec settle phase ms per native block | 91.7 | 82.7 | -9.8% |
+
+![per node per minute: expiry, cancel-alls, margin rejections, matched/s, book, exec queue / busy / ms per block, je overhead, layer, flush queue](ozarchy-p3gate-figs/fig-node.png)
+
+*Figure 61-2: per node (columns), per minute: nonce-expired evictions, cancel-alls executed/s, margin-rejected orders/s,
+matched/s, resting orders, exec queue depth, exec busy, exec ms per block, jemalloc resident - allocated, layer MB per
+checkpoint and flush-worker depth. s2 green, m grey dashed.*
+
+* **Full workload in both arms.** 0 nonce-expired evictions, 0 margin rejections, 0 action failures on every node, 0 bench
+  in-flight timeouts; cancel-alls sent / executed m 211,145 / 211,136, s2 236,644 / 236,639. Resting orders 0.54-0.74 M per
+  node at the end in both. Exec busy 0.99-1.00 and the exec queue at its ~66 cap on both (minutes 5-10 mean 55-65 blocks), so
+  the exec backlog is not a confound (as in section 57).
+* **Layer and checkpoints (s2):** 49 checkpoints per node in the bench window, layer 199 MB mean per checkpoint (early ->
+  late 5 min 183 -> 216 MB), `layer_shared` 0, drop_inline 1,800-1,922 per node; settle ms per block 7.1-7.6 early, 11.7-12.3
+  late. Flush-worker depth 0.1-0.2 (s2) vs 0.3-0.6 (m).
+* **Levels off.** s2's RSS falls over the last 5 min on val0 / val1 (CIs below 0) and is flat on val2; the s2 - m difference
+  slopes are all negative with CIs that include 0. s2's RSS swings by several hundred MB around its level (the 15 s
+  checkpoint rebuild and jemalloc decay; figure 61-1).
+* **Against section 57** (je vs je, `e7be8460` vs `0360c840`, without merge-wait and the later main): the RSS delta is +1.43
+  vs +0.94 GB per node, the live-heap delta is the same (+0.53 vs +0.54 GB mean), and the allocator-resident slack is about
+  double (+0.94 vs ~+0.45 GB). matched/s minutes 6-10 vs 0-2 is close (s2 +3.9% vs jcs +4.4%; m -5.5% vs jmf -4.1%).
+
+### 61.3 SIGTERM restart, one kill per arm (`a-term.txt`)
+
+| arm | kill at height (exec queue) | SIGTERM -> exit s | drained / flushed s | replay | DB open s | up -> val1 first commit s | up -> chain commit s | **kill -> first chain commit s** |
+|---|---|---|---|---|---|---|---|---|
+| s2 | 1,057 (61 blocks) | 19.07 | 18.15 / 18.91 | 0 (A = C = 1,119) | 0.07 | 15.85 | 15.95 | **35.02** |
+| m | 966 (64 blocks) | 21.54 | 20.98 / 21.33 | 0 (A = C = 1,030) | 0.05 | 15.75 | 15.76 | **37.30** |
+
+Both shut down gracefully (not forced; `shutdown complete` logged), replay 0 blocks, digests and block hash agree (t1-m-TERM:
+mark-only digest artifact, above). No SIGKILL kill was made, so the replay path after a hard crash is not exercised on
+`c88d3073` here (section 46 is the last SIGKILL evidence, on step 1). The shutdown time is the exec-queue drain (61-64 queued blocks, ~0.3 s each, as in
+section 52); the checkpoint / memtable flush adds 0.76 s on s2 vs 0.34 s on m. Both exits exceed Docker's 10 s default grace
+(row 57's `stop_grace_period` >= 60 s applies to both arms). The survivors val0 / val2 each kicked one stale connection
+after the restart (`torus_mesh_stale_conn_disconnects_total` 1, the section 58 fix, now on main); no chain stall. One kill
+per arm, no CI.
+
+### 61.4 Verdict
+
+* **Gates: CPU, disk, throughput, restart (SIGTERM only; no SIGKILL multi-crash cells on this head) and RAM-levels-off pass; RAM size (<= ~1 GB per node) fails in the soak:** +1.43
+  GB minutes 5-10 mean and +1.80 GB peak per node (val0 peak +2.04). In the 120 s SAT cells the mean is +0.99 [+0.67, +1.30]
+  and the peak +1.28 [+0.82, +1.74].
+* **RAM interpretation:** the live Phase 3 heap is +0.50-0.56 GB per node, unchanged from section 57, and it does not grow.
+  The rest of the delta is jemalloc-resident pages not in live use (allocator retention), larger here than in 57. One soak
+  cell per arm (no CI), and s2 ran +13% matched/s in the soak.
+* **Other changes:** block time p99 +17.7% [+6.7, +28.7] SAT, +23% soak (p50 -33% / -14%); fills per native block -8.6%
+  SAT (more, smaller blocks).
+* **The merge decision is the owner's (pending).** Possible next steps, suggestions only (not measured): (1) judge the RAM
+  gate on the live heap (`torus_jemalloc_allocated_bytes`) instead of RSS; (2) tune jemalloc decay (e.g. `dirty_decay_ms` /
+  `muzzy_decay_ms`, or a background thread) and rerun the soak; (3) n = 2-3 soaks per arm for a CI on the soak delta.
+
+Analysis (`tools/ozarchy-p3gate-tools/analyst/`): `a-cells.py` (p3cloid's, per-cell extraction -> `cells.json`, stdout
+`cells.txt`), `a-arms.py` (`arms.txt` on the 8 SAT cells with `--io` for device writes; `arms-soak.txt` on the 2 soak
+cells), `a-paired.py` (`paired.txt`), `a-series.py` (section 57's copy with the cells k1-m / k1-s2: `series.txt`,
+`series.json`, figures SVG -> PNG via `rsvg-convert`), `a-term.py` (p3term's: `a-term.txt`) and `a-archive.py`.
+`cells-abba.json` / `cells-soak.json` are the SAT / soak subsets of `cells.json`. `ckpt-timers.txt` and `validity.txt` have
+no saved script: the first was computed in the analyst session from the cells' `summary.json` phases and metrics deltas,
+the second written by the analyst from `cells.txt`, `a-term.txt` and the run logs. **Re-run check for this write-up:** the
+archived scripts, run in a scratch dir against the cells, reproduce `cells.txt`, `cells.json` (all 12 cells), the
+`cells-abba.json` / `cells-soak.json` subsets, `arms.txt`, `arms-soak.txt`, `paired.txt`, `series.txt`, `series.json`, both
+SVGs and `a-term.txt` byte for byte. **The analyst's `a-term.py` (p3term's copy) has two hardcoded p3term paths:** it
+writes its per-kill `kills.json` to `ozarchy-p3term-run/kills.json`, so the analyst's run (17:53) overwrote p3term's file
+with p3gate's 2 kills (p3term's cells and its `a-term.py` are still on ozarchy, so it can be regenerated), and it reads
+the `HARD FINDING` lines for `hard_findings` from `ozarchy-p3term-run/campaign.log`, so `a-term.txt`'s `hard_findings: []`
+does not cover p3gate. Checked directly: p3gate's `campaign.log` and smoke `campaign.log` contain 0 `HARD FINDING`
+lines (hardscan ran on all 13 cells and both smoke cells). The archived copy here writes
+`ozarchy-p3gate-run/analyst/kills.json` and reads `ozarchy-p3gate-run/campaign.log` (its only two changes); it reproduces
+`a-term.txt` byte for byte. Full outputs (incl. `series.json`, the SVGs) in
+`ozarchy-p3gate-run/analyst/` on ozarchy. Driver `tools/ozarchy-p3gate-tools/ozarchy-p3gate-campaign.sh`, build script
+`ozarchy-p3gate-build.sh`, `matched-bench/crash-kill.sh` (p3term's; the rest of the run's `matched-bench/` copy is
+`c88d3073`'s `tools/matched-bench` byte for byte), md5s `md5s-all.txt`.
+
+## 62. Phase 3 SIGKILL restart gate, step 2 `c88d3073` vs main `de1a97c1` (4 SIGKILLs per arm, state hash on), and a jemalloc decay soak pair on `c88d3073` (defaults vs `background_thread:true,dirty_decay_ms:1000`), commit-tail mode (campaign ozarchy-p3kd, 2026-10-13)
+
+**The SIGKILL restart gate passes in both arms; the jemalloc decay setting removes most of the soak RSS gap from section 61.**
+Requested by 18c after section 61. The owner (s118, via 18c) accepted the RAM gate on the live heap (section 61.4
+suggestion 1, option a). Phase 3 merges once the SIGKILL restart gate passes on `c88d3073`. Section 61 measured restart
+on SIGTERM only.
+
+| gate (section 1 of `item6-phase3-impl.md`) | target | measured | result |
+|---|---|---|---|
+| restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | SIGKILL val1 under load, 2 cells x 2 kills per arm (ABBA), state hash on. Kill -> val1's first commit after the restart: **s2 22.3 / 28.4 / 29.5 / 39.5 s (mean 29.9, max 39.5)**; m 32.0 / 25.3 / 21.8 / 29.5 s (mean 27.2, max 31.95). Replay from the durable marker + 1, contiguous, in all 8 kills | **PASS** (both arms) |
+| RAM (owner: judged on the live heap) | Phase 3 delta <= ~1 GB per node, levels off | not re-measured as s2 vs m here. Section 61: live heap +0.50-0.56 GB per node, does not grow. Part B below: with the decay setting, s2's soak RSS equals section 61's main soak (-0.03 GiB per node, cross-session) | accepted by the owner (s118) |
+
+**Part B (not a gate):** same s2 binary, 600 s soak, jemalloc defaults vs `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000`.
+RSS per node (minutes 5-10 mean) drops **6.25 -> 4.53 GiB (-1.72)** and the peak 6.91 -> 5.19 GiB. jemalloc resident -
+allocated drops 2.35 -> 0.67 GiB. Live allocations are unchanged (3.46 -> 3.49 GiB). RSS levels off in both cells. Cost,
+n = 1 per arm: node CPU-s/1M **+4.6%** (24.47 -> 25.60), matched/s -2.5%, native blocks/s +2.6%. The setting is an
+environment variable, not compiled in (see 62.4).
+
+**Setup.** Binaries are reused from the p3gate stage, not rebuilt: **s2** = `feat/item6-phase3-step2` `c88d3073` (node
+`4e0d8b84`, bench `ae96e0c1`) with `TORUS_CHECKPOINT_INTERVAL_MS=15000`; **m** = main `de1a97c1` (node `f1081574`, bench
+`42365459`), knob unset. Both have jemalloc compiled in (preflight nm: 1,168 jemalloc symbols in each node). The rest is
+as section 61: CLOID_SHARE=0, full workload, tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900,
+saturated, commit tail, shared NVMe, btrfs data dirs. Harness = the `c88d3073` worktree. Tools = p3gate's
+`matched-bench` copy (c88d3073's plus p3term's `crash-kill.sh`), byte for byte. Driver `ozarchy-p3kd-campaign.sh` CAMP=KD
+(copy of `ozarchy-p3gate-campaign.sh`).
+* **Part D (restart):** cells d1-s2-KILL, d1-m-KILL, d2-m-KILL, d2-s2-KILL (ABBA), 300 s each. SIGKILL of val1 at bench + 60
+  / 180 s (d1) and + 65 / 187 s (d2), the first two offsets of section 46's two sets. KILL_WAIT 60 s. As section 46:
+  `STATE_HASH_ACTIVATION=1`, 1 s checkpoint / head / state-hash gauge samples, and `torus_getStateHash` read at every
+  retained 100-block checkpoint on each validator.
+* **Part B (soak):** k1-s2def (s2, `MALLOC_CONF` unset = jemalloc defaults) then k1-s2dec (s2 + `MALLOC_CONF` on all 3
+  nodes), 600 s each, state hash off, workload as p3gate's k1 cells.
+* **jemalloc proof:** the binary is tikv-jemallocator built unprefixed (nm: `T malloc`, `V malloc_conf`), so it reads
+  `MALLOC_CONF`, not `_RJEM_MALLOC_CONF`. Preflight: `MALLOC_CONF=...,stats_print:true torus-node --version` prints
+  `opt.background_thread: true`, `opt.dirty_decay_ms: 1000` (`jeconf-proof.txt`); the defaults print `false` / 10000,
+  `muzzy_decay_ms` 0, `narenas` 128 (`jeconf-default.txt`). Live check in each cell: `MALLOC_CONF` in each node's
+  `/proc/<pid>/environ` (`node-preload.txt`), and 4 `jemalloc_bg_thd` threads per node in k1-s2dec vs 0 in every other
+  cell (`node-jethreads.txt`).
+* **Timing and checks:** smoke 18:56-19:05 (s0-m-KILL, 120 s, one SIGKILL at 40 s; s0-s2dec, 60 s). Cells 19:07-20:17: w0
+  (s2, 60 s, excluded), then Part D, then Part B. 134 CHECK OK (+38 in the smoke), no CHECK FAIL, no memguard stop, 0 `HARD
+  FINDING` lines. The host was quiet before every cell (no cargo / rustc / rust-analyzer, 1-min load 1.70-1.88).
+
+**Validity.** w0 and k1-s2def: rc 0, ACCEPT, AGREE. The 4 kill cells are rc 2 REJECT, all from known artifacts; they are
+used for their restart measurements.
+* **Crash gate:** the restart-tail scan matches the INFO config echo `running state hash fail-stop
+  (TORUS_STATE_HASH_FAILSTOP) on=false` once per restart (8 of 8 tails; no WARN / ERROR panic or fail-stop line). On s2 it
+  also reports "rewind N blocks beyond the exec queue (max 2)". That is the Phase 3 design: replay from the last checkpoint
+  (section 46.3).
+* **Digests:** d1-m-KILL and d2-s2-KILL are DISAGREE, the mark-only digest artifact (sections 46.4, 61). 50 account lines
+  differ in `accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed` and `withdrawable` only. The odd
+  node's digest was the fast one: val2 21.5 s vs 69.8 / 39.9 s; val1 18.3 s vs 69.1 / 70.5 s.
+* **Dissemination:** d1-m-KILL also has "dissemination failures": val2 logged one exhausted body fetch, recovered by sync
+  fallback.
+* **k1-s2dec** is rc 2 REJECT DISAGREE on agreement only, the same mark-only artifact. val2's digest took 17.9 s vs 86.5 /
+  87.0 s; the 5 mark fields differ on 50 lines; block hash equal; liveness PASS. Its soak measurements are used.
+
+Smoke: s0-m-KILL rc 2 (the same INFO line); s0-s2dec ACCEPT AGREE with 4 bg threads per node.
+
+### 62.1 SIGKILL restart, 4 kills per arm (`restart.txt`, `a-kill.txt`, `kills.json`)
+
+| cell | kill | height at kill (exec queue) | down s | marker A ; committed C | replayed (C - A) | first replayed, contiguous | DB open s | replay s (blocks/s) | restart -> val1 first commit s | **kill -> val1 first commit s** | kill -> chain commit s | restart -> rejoin s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| d1-s2 | k1 | 707 (65) | 0.35 | 700 ; 772 | 72 | 701, yes | 3.24 | 17.89 (4.03) | 21.93 | **22.28** | 21.85 | 21.48 |
+| d1-s2 | k2 | 1,213 (61) | 0.33 | 1,200 ; 1,274 | 74 | 1,201, yes | 3.46 | 23.83 (3.10) | 28.05 | **28.38** | 28.03 | 27.55 |
+| d1-m | k1 | 658 (65) | 0.23 | 658 ; 723 | 65 | 659, yes | 3.97 | 26.97 (2.41) | 31.72 | **31.95** | 31.54 | 31.35 |
+| d1-m | k2 | 1,112 (61) | 0.35 | 1,112 ; 1,173 | 61 | 1,113, yes | 3.47 | 21.38 (2.85) | 24.99 | **25.34** | 25.60 | 25.77 |
+| d2-m | k1 | 666 (64) | 0.26 | 666 ; 730 | 64 | 667, yes | 1.76 | 19.64 (3.26) | 21.52 | **21.78** | 22.02 | 22.36 |
+| d2-m | k2 | 1,077 (61) | 0.33 | 1,077 ; 1,139 | 62 | 1,078, yes | 3.99 | 25.09 (2.47) | 29.21 | **29.54** | 0.34 ¹ | 29.85 |
+| d2-s2 | k1 | 633 (65) | 0.33 | 600 ; 698 | 98 | 601, yes | 2.71 | 26.32 (3.72) | 29.15 | **29.48** | 29.72 | 30.12 |
+| d2-s2 | k2 | 1,053 (60) | 0.36 | 1,000 ; 1,113 | 113 | 1,001, yes | 3.71 | 35.26 (3.20) | 39.11 | **39.47** | 39.96 | 39.17 |
+
+¹ Artifact of the chain measure (`crash-freeze.py`: kill -> val0's first commit after the restart). val0 committed 0.01 s
+after val1's restart. The gate uses val1's own first commit. On the chain measure (section 61's basis) s2 is 29.9 / 40.0 s
+mean / max; m is 26.4 / 31.5 s without this kill.
+
+| arm (n kills) | kill -> val1 first commit mean / max s | replayed blocks mean / max | replay blocks/s mean | DB open mean / max s | result |
+|---|---|---|---|---|---|
+| **s2** `c88d3073` (4) | **29.9 / 39.5** | 89 / 113 | 3.5 | 3.28 / 3.71 | **PASS** (<= 60 s) |
+| **m** `de1a97c1` (4) | **27.2 / 31.95** | 63 / 65 | 2.7 | 3.30 / 3.99 | **PASS** |
+| section 46 s (step 1 `a44bdde6`, 15 s), SIGKILL (8) | 14.0 / 22.8 | 92 / 162 | 13.1 | | PASS |
+| section 46 o (`a44bdde6`, knob unset), SIGKILL (8) | 14.1 / 16.6 | 49 / 65 | 5.1 | | PASS |
+
+The section 46 rows are recomputed by `a-tables.py` from p3r1's `kills.json` with the same definition (down + restart ->
+val1's first commit). Section 46.3's table gives kill -> first chain commit: 14.4 / 23.2 s for s, 14.3 / 16.9 s for o.
+
+* **Gate met in all 8 kills**, max 39.5 s (d2-s2 k2, the 113-block replay). s2 is 2.7 s slower than m on the mean, from
+  longer replays (89 vs 63 blocks); n = 4 per arm, no CI.
+* **What sets the replay** (as section 46.3). On m the marker A trails the committed height by the exec queue at the kill:
+  61-65 blocks replayed, the queue was 61-65. On s2, A is the last 100-block checkpoint (700, 1,200, 600, 1,000), so the
+  replay is the queue plus the blocks since that checkpoint (7 / 13 / 33 / 53 beyond the queue).
+* **About 2x section 46's times, in both arms.** The replay runs at 2.4-4.0 blocks/s here vs 13.1 (s) / 5.1 (o) blocks/s
+  in section 46. That is the workload. These cells run 221-246 transactions per native block (summary headline,
+  whole cell) at 3.3-4.3 blocks/s; p3r1's SIGKILL cells ran 76-143 per block at 5.9-10.9 blocks/s. The replay rate is
+  about one block per exec time per block in these cells (exec p50 309-350 ms, `cells.txt`). m is as slow (2.7 blocks/s),
+  so this is not Phase 3.
+* **Down** 0.23-0.36 s (patched `crash-kill.sh`, 0.1 s polling; section 46: 1.0 s with 1 s polling). **DB open** 1.8-4.0 s.
+  **Rejoin** 21-39 s after the restart, about when val1 first commits.
+
+### 62.2 Restart correctness: no finding (`a-kill.txt`)
+
+* **Per kill (8 of 8):** A <= C. The replay starts at A + 1 and covers A+1..C exactly once (contiguous). A >= the durable
+  state-hash height sampled in the last 1 s before the kill (`marker_lo`). No flag on any kill.
+* **State-hash checkpoints:** `localHash` was read at every retained 100-block checkpoint on all 3 validators: 122
+  heights in the 4 cells (34 / 33 / 25 / 30; up to height 3,400). 121 have all 3 validators; d2-m-KILL has one height
+  with 2. **0 disagreements**, including the heights val1 re-executed after each restart.
+* **End of cell:** block hash equal in all 4 cells. The digest DISAGREE in d1-m / d2-s2 is mark-only (above). No `HARD
+  FINDING` line (hardscan ran on every cell; `a-kill.py` reads p3kd's own `campaign.log`).
+* **Other:** d2-m-KILL has nonce-expired evictions 0 / 17 / 71 (val0 / val1 / val2); every other cell has 0. Three kill
+  cells show 6-10 executed-action failures per node, equal on val0 / val2 (val1's counter restarts). The soak cells show
+  0. Neither is analysed: the kill cells' throughput is not a measurement.
+
+### 62.3 jemalloc decay soak pair, s2 `c88d3073`, 600 s, one cell each (`soak.txt`, `series.txt`)
+
+![RSS and jemalloc allocated per node: defaults vs decay setting, and against p3gate's soaks](ozarchy-p3kd-figs/fig-rss.png)
+
+*Figure 62-1: VmRSS (solid) and `torus_jemalloc_allocated_bytes` (dashed) per node, 5 s samples. Row 1: def (red) vs dec
+(blue). Row 2: def vs p3gate's k1-s2 (gs2, green; same binary, cross-session). Row 3: dec vs p3gate's main k1-m (gm,
+grey; cross-session).*
+
+| cell | node | RSS mean min 5-10 MB | end MB | peak MB | RSS slope last 5 min MB/min (95% CI) | je allocated MB | je resident MB | je retained MB | exec queue (min 5-10) |
+|---|---|---|---|---|---|---|---|---|---|
+| def | val0 | 5,730 | 5,413 | 6,601 | -7.8 [-44.2, +28.6] | 3,501 | 5,270 | 4,823 | 56.6 |
+| def | val1 | 6,497 | 6,331 | 6,910 | -11.9 [-55.2, +31.3] | 3,507 | 6,070 | 5,415 | 59.3 |
+| def | val2 | 6,964 | 6,401 | 7,704 | +6.9 [-43.3, +57.0] | 3,629 | 6,529 | 5,673 | 65.4 |
+| dec | val0 | 4,569 | 4,611 | 5,180 | +3.3 [-49.1, +55.8] | 3,598 | 4,195 | 6,882 | 65.3 |
+| dec | val1 | 4,514 | 4,876 | 5,084 | +7.4 [-53.8, +68.6] | 3,499 | 4,131 | 6,690 | 58.1 |
+| dec | val2 | 4,840 | 4,911 | 5,690 | -14.3 [-71.0, +42.4] | 3,625 | 4,468 | 7,496 | 63.5 |
+
+jemalloc columns are the minutes 5-10 mean of the 5 s gauges. `retained` is address space kept mapped but returned to
+the OS (not in RSS). Deltas below are from `series.txt` (GB there = MB / 1024 = GiB, as in section 61): mean min 5-10 /
+at 10 min / peak per node, and the slope of the difference series over the last 5 min.
+
+| delta | val0 | val1 | val2 | mean of 3 |
+|---|---|---|---|---|
+| **dec - def RSS** | -1.13 / -0.78 / -1.39; -1.9 [-73.9, +70.0] | -1.94 / -1.42 / -1.78; +7.6 [-82.6, +97.9] | -2.07 / -1.46 / -1.97; -34.7 [-132.1, +62.7] | **-1.72 / -1.22 / -1.71** |
+| dec - def je allocated (min 5-10) | +0.10 | -0.01 | -0.00 | |
+| dec - def je resident (min 5-10) | -1.05 | -1.89 | -2.01 | |
+| dec - def je retained (min 5-10, not in RSS) | +2.01 | +1.24 | +1.78 | |
+| dec - def non-heap (RSS - je resident) | -0.08 | -0.04 | -0.06 | |
+| def - gs2 RSS (p3gate s2, cross-session) | -0.29 / -0.45 / -0.09 | +0.91 / +1.06 / +0.66 | +0.12 / -0.70 / +0.36 | +0.25 / -0.03 / +0.31 |
+| dec - gm RSS (p3gate main, cross-session) | +0.15 / +0.08 / +0.56 | +0.18 / +0.52 / +0.53 | -0.43 / -0.40 / +0.10 | **-0.03 / +0.06 / +0.40** |
+| dec - gm je allocated (min 5-10) | +0.60 | +0.52 | +0.54 | |
+
+| metric (whole 600 s cell) | def | dec | dec vs def | gs2 (p3gate s2) | gm (p3gate m) |
+|---|---|---|---|---|---|
+| RSS mean min 5-10 / peak GiB per node (`soak.txt`) | 6.25 / 6.91 | 4.53 / 5.19 | -1.72 / -1.71 | 6.00 / 6.60 | 4.57 / 4.80 |
+| je allocated / resident / resident - allocated GiB | 3.46 / 5.82 / 2.35 | 3.49 / 4.16 / 0.67 | | 3.47 / 5.58 / 2.11 | 2.94 / 4.11 / 1.17 |
+| matched/s | 217,605 | 212,075 | -2.5% | 219,139 | 193,398 |
+| matched/s minutes 0-2 / 2-6 / 6-10 (val0 counter) | 210,278 / 221,468 / 217,519 | 207,428 / 215,692 / 210,248 | | 210,202 / 223,560 / 218,481 | 201,679 / 191,823 / 190,516 |
+| native blocks/s | 2.95 | 3.02 | +2.6% | 2.97 | 2.61 |
+| node CPU-s/1M fills | 24.47 | 25.60 | **+4.6%** | 24.46 | 27.93 |
+| block time p50 / p99 ms (mean of nodes, `cells.json`) | 239 / 1,398 | 230 / 1,425 | -3.8% / +1.9% | 237 / 1,473 | 275 / 1,196 |
+| exec ms per block (minutes 5-10, per node) | 375-379 | 384-386 | +2.1% | 371-375 | 423-426 |
+| settle wait ms per native block (summary phase) | 9.2 | 8.9 | | 9.0 | n/a |
+
+* **Full workload in both cells.** 0 nonce-expired evictions, 0 margin rejections, 0 action failures, 0 bench in-flight
+  timeouts. Cancel-alls sent / executed: def 234,445 / 234,442, dec 236,764 / 236,749. The exec queue is at its ~66 cap
+  in both (minutes 5-10 mean 57-65), so the exec backlog is not a confound. 48-49 checkpoints per node, layer 196-203 MB
+  mean per checkpoint.
+* **What the setting does:** live allocations are unchanged (+0.10 / -0.01 / -0.00 GiB per node). jemalloc returns dirty
+  pages within ~1 s from its background threads instead of keeping them for 10 s. Resident drops by 1.05-2.01 GiB per
+  node and retained (mapped, not in RSS) rises by about as much. Non-heap RSS is equal.
+* **Levels off** in both cells: every per-node last-5-min slope is within +-15 MB/min, with CIs spanning 0.
+  The dec - def difference slopes all include 0.
+* **Cost (n = 1 per arm, no CI):** node CPU-s/1M +4.6%, matched/s -2.5% (minutes 6-10 -3.3%), native blocks/s +2.6%,
+  exec ms per block +2.1%. For scale, the default cell repeated p3gate's s2 soak (same binary, other session) to within
+  +0.1% CPU-s/1M and -0.7% matched/s. Its RSS was +0.25 GiB per node higher on the mean (val1 +0.91), so cross-session
+  RSS varies by a few tenths of a GiB. That is small next to the -1.72 effect, but a CPU cost of a few percent is not
+  resolved by one cell per arm.
+* **Against section 61's main soak** (gm, cross-session, rough): tuned s2 RSS is -0.03 GiB per node on the mean and +0.40
+  on the peak. CPU-s/1M is -8.4% and matched/s +9.7%. The live heap is still +0.52-0.60 GiB above main (61: +0.50-0.56).
+  So with this setting, Phase 3's soak RSS delta is about its live heap, inside the ~1 GB bound, mean and peak.
+
+![per node per minute: expiry, cancel-alls, margin rejections, matched/s, book, exec queue / busy / ms per block, je overhead, layer, flush queue](ozarchy-p3kd-figs/fig-node.png)
+
+*Figure 62-2: per node (columns), per minute: nonce-expired evictions, cancel-alls executed/s, margin-rejected orders/s,
+matched/s, resting orders, exec queue depth, exec busy, exec ms per block, jemalloc resident - allocated, layer MB per
+checkpoint and flush-worker depth. def red, dec blue, gs2 green dashed, gm grey dashed.*
+
+### 62.4 Verdict
+
+* **Restart gate (SIGKILL val1, multi-crash cells): PASS** on `c88d3073`. Kill -> val1's first commit was 29.9 s mean /
+  39.5 s max over 4 kills (m 27.2 / 31.95), with replay complete and contiguous from the marker. 121 of 122 state-hash
+  checkpoints were read on all 3 validators, with 0 disagreements. This completes the restart line that section 61 left at
+  "SIGTERM only". With the owner's live-heap RAM decision, every Phase 3 gate is now met.
+* **Times are about 2x section 46's** because of the replay rate at this workload, not Phase 3: m is as slow.
+  s2's longer replays (from the last 100-block checkpoint) add ~3 s on the mean.
+* **jemalloc decay:** `background_thread:true,dirty_decay_ms:1000` cuts s2's soak RSS by 1.72 GiB per node (mean) and
+  1.71 GiB (peak), to main's level. The cost is +4.6% CPU-s/1M and -2.5% matched/s, from one cell per arm.
+* **Caveats:**
+  * One soak cell per arm, so no CI.
+  * The setting is an environment variable; nothing is compiled in. A compiled default (e.g. a `malloc_conf` symbol, or
+    the tikv-jemallocator build configuration) is a suggestion for 18c, not done or measured.
+  * Main was not run with the setting.
+
+Analysis (`tools/ozarchy-p3kd-tools/analyst/`):
+* `a-cells.py`: p3gate's, per cell -> `cells.json`, stdout `cells.txt`.
+* `a-kill.py`: p3gate's `a-term.py` with the p3kd paths -> `a-kill.txt` on stdout, `kills.json`.
+* `a-series.py`: p3gate's, with the cells def / dec / gs2 / gm -> `series.txt`, `series.json`, the figures (SVG -> PNG
+  via `rsvg-convert`).
+* `a-tables.py`: `restart.txt` from `kills.json` and p3r1's `kills.json`; `soak.txt` from `series.json`, `cells.json`
+  and p3gate's `cells-soak.json`.
+* `a-archive.py`.
+
+The analyst's `a-kill.py` writes `kills.json` to `ozarchy-p3kd-run/` (not `analyst/`). The archived copies of `a-kill.py`
+and `a-tables.py` differ from the analyst's in one way only: optional output paths (`a-kill.py --kills PATH`;
+`a-tables.py [OUTDIR [KILLS]]`). With no arguments they use the analyst's paths, so the archive smoke check can run them
+without writing into the run dir. **Re-run check for this write-up:** the archived scripts, run in a scratch dir against
+the cells, reproduce byte for byte:
+* `cells.txt` and `cells.json` (all 7 cells);
+* `a-kill.txt` and `kills.json`;
+* `series.txt`, `series.json` and both SVGs;
+* `restart.txt`.
+
+`soak.txt` matches in every number; only its header label differs ("per node GiB" in the analyst's file, "GB" from the
+script; the values are MB / 1024). The archive's smoke entries (`meta/p3kd.toml`) rerun `a-cells.py` on the two soak
+cells, `a-kill.py` on the 4 kill cells, `a-series.py` and `a-tables.py`, and diff them against `cells.txt`, `a-kill.txt`,
+`series.txt`, `restart.txt` and `soak.txt`. `restart.txt` / `soak.txt` read p3r1's `kills.json` and p3gate's
+`cells-soak.json`, which stay on ozarchy.
+
+The run dir also holds `jeconf-proof.txt` / `jeconf-default.txt` (the stats_print proof) and the smoke log. The two
+jeconf files (~0.5 MB of allocator statistics) are not copied into the archive; the option lines are quoted in this
+section. Full outputs
+are in `ozarchy-p3kd-run/analyst/` on ozarchy. The driver is `tools/ozarchy-p3kd-tools/ozarchy-p3kd-campaign.sh`. The
+`matched-bench/` copy is p3gate's (`crash-kill.sh` archived again, the rest is `c88d3073`'s).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

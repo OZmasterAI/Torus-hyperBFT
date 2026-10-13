@@ -1,0 +1,122 @@
+# archive-campaign.py meta for campaign ozarchy-p3cloidprof (results doc section 60, plan row 68).
+# This file is the only hand-written input; everything else (rows, sizes, rm lists, tools copy) is generated.
+# Modelled on meta/p3cloid.toml (every key explained there). First real use of the script (s116).
+
+camp = "p3cloidprof"
+section = "60"
+plan_row = 68
+plan_doc = "docs/plans/item6-phase2-impl.md"
+
+description = "cloid cost profile (CLOID_SHARE 100 vs 0, one binary main ef812b02, glibc, perf on val1)"
+cell_role = "profiled"
+env_base = "6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); perf sidecar on val1 (W1 cycles:u fp 35-80 s, W2 exec thread 5 events 82-102 s)"
+# No ozarchy-p3cloidprof-build dir: the binaries are p3cloid's (stage ozarchy-p3cloid-stage/cl-run/release).
+binaries = "ef812b02 (node 6f363582), bench ef812b02 (9fda6c84), p3cloid stage"
+
+[arms.c0]
+meaning = "main ef812b02, CLOID_SHARE=0, glibc"
+env = "CLOID_SHARE=0; glibc; in-flight tail commit"
+
+[arms.c100]
+meaning = "main ef812b02, CLOID_SHARE=100, glibc"
+env = "CLOID_SHARE=100; glibc; in-flight tail commit"
+
+[dirs]
+run = '''p3cloidprof campaign log, done marker, analyst/ (run-analysis.sh, a-prof.py, fg.py, a-metrics.py, a-cells.py, a-arms.py, a-paired.py, a-archive.py; frames-self.txt, frames-self-loc.txt, frames-children.txt, frames-engine-delta.txt, cloid-sites.txt, llc.txt, windows.txt, metrics.txt, cells.txt, arms.txt, paired.txt, perf-report-*.txt, flamegraph-c0.svg / -c100.svg, folded-c0.txt / -c100.txt, prof-cells.json, a2l-cache.json, cells.json, cells-abba.json, archive-*-p3cloidprof.txt)'''
+tools = '''p3cloidprof campaign driver ozarchy-p3cloidprof-campaign.sh (CAMP=CLOID, copy of ozarchy-p3cloid-campaign.sh with APROF=perf2 on both arms, w0 + 3 rounds, stop-request) and the perf sidecar cloidprof-sidecar.sh (val1)'''
+
+[index]
+update = '''Cloid cost by perf profile, requested by 18c after section 59: the same binary and arms as p3cloid (the kept `ozarchy-p3cloid-stage/cl-run/release`, main `ef812b02`, node `6f363582` with symbols, bench `9fda6c84`, glibc, not rebuilt; c0 = run-cell.sh `CLOID_SHARE=0`, c100 = `CLOID_SHARE=100`), saturated, commit tail, w0 + 3 ABBA rounds, with `cloidprof-sidecar.sh` recording perf on val1 in every cell (user space, `perf_event_paranoid=2`: W1 `cycles:u` with frame-pointer call graphs on the whole process, W2 the exec thread only with 5 events incl. DRAM demand fills); harness = the `ef812b02` worktree. Driver, sidecar and analyst scripts in `tools/ozarchy-p3cloidprof-tools/`. Section 60 is built on the analyst outputs in `ozarchy-p3cloidprof-run/analyst/` (`cloid-sites.txt`, `frames-*.txt`, `llc.txt`, `metrics.txt`, `windows.txt`, `paired.txt`, `arms.txt`, the flame graphs and `folded-*.txt`) and the cells' `summary.json`, `prof-*` window snapshots and `exec-tid.txt` (keep); `perf.data` / `perf-w2.data`, the `*.script.gz` dumps and the folded stacks are Tier A, the node logs, `buckets.csv`, `tasks.txt` and `sampler.csv` Tier B.'''
+
+[cells]
+heading = '''cloid cost by perf profile on one binary, main `ef812b02` (node `6f363582`, bench `9fda6c84`, the p3cloid stage, glibc): c0 = run-cell.sh `CLOID_SHARE=0` vs c100 = `CLOID_SHARE=100`, saturated (RATE 76000), commit tail, n = 3 ABBA, 120 s, tw, Classic, shared NVMe, no Phase 3, perf on val1 in every cell (W1 `cycles:u` fp, W2 exec thread 5 events), harness = the `ef812b02` worktree; all cells ACCEPT, AGREE; warm-up w0 excluded (section 60)'''
+
+[deletable]
+note = '''Campaign ozarchy-{camp} (results doc section {section}, plan row {plan_row}): cloid cost by perf profile on val1, c0 = `CLOID_SHARE=0` vs c100 = `CLOID_SHARE=100` on main `ef812b02` (the p3cloid stage). Section {section} is built on `ozarchy-p3cloidprof-run/analyst/` (`cloid-sites.txt`, `frames-*.txt`, `llc.txt`, `metrics.txt`, `windows.txt`, `paired.txt`, `arms.txt`, `cells.json`, the flame graphs `flamegraph-c0.svg` / `flamegraph-c100.svg` and the per-cell `perf-report-*.txt`) and the cells' `summary.json`, `prof-metrics-w*-*.txt`, `prof-stat-w*-*.txt`, `prof-tasks-w*-*.txt`, `exec-tid.txt` and `cloidprof-sidecar.log` (keep). Tier A = the raw profile: each cell's `perf.data` (W1) and `perf-w2.data` (W2), the `prof.script.gz` / `w2.script.gz` dumps made from them, and in the analyst dir the folded stacks `folded-c0.txt` / `folded-c100.txt`, `prof-cells.json` (per-cell sample aggregates) and `a2l-cache.json` (addr2line cache). A re-analysis needs them: new cloid-site or frame groupings, a per-cell instead of per-arm split, flame graphs of other thread groups, queries like the `reserve_rehash` / lock / Keccak figures of section {section} (run on `folded-*.txt`), or a before/after against a profile of a cloid fix. The folded stacks and `prof-cells.json` are already symbolised; `perf.data` and the `*.script.gz` dumps need the `ef812b02` node binary for symbols, which is p3cloid's Tier A (`ozarchy-p3cloid-stage/cl-run/release/torus-node`, md5 `6f363582`): keep that too while the raw profile is kept.'''
+tier_a_keep = "keep while a re-analysis of the cloid profile is possible: new site groupings, a per-cell split, a before/after against a cloid fix"
+tier_a = [
+  "ozarchy-p3cloidprof-300m-*/perf.data",
+  "ozarchy-p3cloidprof-300m-*/perf-w2.data",
+  "ozarchy-p3cloidprof-300m-*/prof.script.gz",
+  "ozarchy-p3cloidprof-300m-*/w2.script.gz",
+  "ozarchy-p3cloidprof-run/analyst/folded-c0.txt",
+  "ozarchy-p3cloidprof-run/analyst/folded-c100.txt",
+  "ozarchy-p3cloidprof-run/analyst/prof-cells.json",
+  "ozarchy-p3cloidprof-run/analyst/a2l-cache.json",
+]
+kept = ["flamegraph-c0.svg", "flamegraph-c100.svg", "frames-*.txt", "cloid-sites.txt", "llc.txt", "metrics.txt", "summary.json", "prof-metrics-w*-*.txt", "prof-stat-w*-*.txt", "prof-tasks-w*-*.txt", "exec-tid.txt", "cloidprof-sidecar.log"]
+
+[checks]
+# Check (b) names: folded-*.txt are written by a-prof.py under an f-string name, the perf reports by run-analysis.sh (not an
+# a-*.py), frames-engine-delta.txt has no saved script (section 60 says so and how it is derived).
+produced_by = { "folded-c0.txt" = "a-prof.py (f-string name)", "folded-c100.txt" = "a-prof.py (f-string name)", "frames-engine-delta.txt" = "inline python in the analyst session: exec + workers sum of frames-self.txt (noted in section 60)", "perf-report-ozarchy-p3cloidprof-300m-r1-c0.txt" = "run-analysis.sh", "perf-report-ozarchy-p3cloidprof-300m-r1-c100.txt" = "run-analysis.sh", "perf-report-ozarchy-p3cloidprof-300m-r2-c0.txt" = "run-analysis.sh", "perf-report-ozarchy-p3cloidprof-300m-r2-c100.txt" = "run-analysis.sh", "perf-report-ozarchy-p3cloidprof-300m-r3-c0.txt" = "run-analysis.sh", "perf-report-ozarchy-p3cloidprof-300m-r3-c100.txt" = "run-analysis.sh" }
+
+[tools]
+# The folded stacks are 41-42 MB each (Tier A on ozarchy); the per-cell perf reports are regenerable with run-analysis.sh.
+exclude = ["folded-*.txt", "perf-report-*.txt"]
+# fg.py and run-analysis.sh are not a-*.py, so the default copy misses them; the build md5s are p3cloid's.
+extra = [
+  ["ozarchy-p3cloidprof-run/analyst/fg.py", "analyst/fg.py"],
+  ["ozarchy-p3cloidprof-run/analyst/run-analysis.sh", "analyst/run-analysis.sh"],
+  ["ozarchy-p3cloid-build/md5s.txt", "md5s-all.txt"],
+]
+
+[summary]
+file = "docs/perf/ozarchy-summary-2026-10-13.md"
+note = '''- **60 (cloid profile):** 59's binary and arms, n = 3 ABBA, perf recording on val1 in every cell (user space, costs val1's
+  engine ~4%); matched/s is val0's headline (not profiled). Device writes from `paired.txt` (`a-arms.py` has no `wr` row).'''
+note_before = "- **Commit tail everywhere**"
+
+[[summary.rows]]
+label = "60 PROF 120 s"
+arm = "c0"
+text = "c0 main ef812b02, glibc, CLOID_SHARE=0, perf on val1"
+cols = { writes = "144.0" }
+delta = "c100: matched/s {paired:ms:1}; engine/1k fills {paired:eng:1}; CPU {paired:cpu:2}"
+
+[[summary.rows]]
+label = "60 PROF 120 s"
+arm = "c100"
+text = "c100 main ef812b02, glibc, CLOID_SHARE=100, perf on val1"
+cols = { writes = "148.5" }
+
+# Smoke check (see SMOKE in archive-campaign.py's header; meta/p3cloid.toml has the same steps). The arguments are the
+# a-cells.py / a-arms.py / a-paired.py / a-metrics.py lines of analyst/run-analysis.sh with the corrected "$P-" prefix:
+# the analyst's run-analysis.sh on ozarchy passes "$P" (no "-"), which this check now catches (FileNotFoundError on
+# ozarchy-p3cloidprof-300mr1-c0/). a-prof.py / fg.py are not smoke-run: they need the Tier A perf dumps, write fixed
+# file names next to their input, and take minutes.
+[[smoke]]
+name = "a-cells.py on r1-c0"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-r1-c0.json", "{bench}/ozarchy-p3cloidprof-300m-", "r1-c0:c0"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/cells.txt"
+select = "^r1-c0 "
+
+[[smoke]]
+name = "a-cells.py on the ABBA cells"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloidprof-300m-", "r1-c0:c0", "r1-c100:c100", "r2-c100:c100", "r2-c0:c0", "r3-c0:c0", "r3-c100:c100"]
+timeout = 300
+
+[[smoke]]
+script = "analyst/a-arms.py"
+args = ["{out}/cells-abba.json", "c0:c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/arms.txt"
+
+[[smoke]]
+script = "analyst/a-paired.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloidprof-300m-", "c0", "c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/paired.txt"
+
+[[smoke]]
+script = "analyst/a-metrics.py"
+args = ["{bench}/ozarchy-p3cloidprof-300m-r1-c0", "{bench}/ozarchy-p3cloidprof-300m-r1-c100", "{bench}/ozarchy-p3cloidprof-300m-r2-c100", "{bench}/ozarchy-p3cloidprof-300m-r2-c0", "{bench}/ozarchy-p3cloidprof-300m-r3-c0", "{bench}/ozarchy-p3cloidprof-300m-r3-c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/metrics.txt"

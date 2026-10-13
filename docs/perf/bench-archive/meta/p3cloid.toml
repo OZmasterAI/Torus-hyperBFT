@@ -1,0 +1,114 @@
+# archive-campaign.py meta for campaign ozarchy-p3cloid (results doc section 59, plan row 67).
+# This file is the only hand-written input; everything else (rows, sizes, rm lists, tools copy) is generated.
+# It reproduces the archive entries of commit 6b643edb (test_archive_campaign.py, GoldenP3cloid).
+# {section}, {plan_row}, {camp}, {target_size}, {n_targets} in prose are replaced; other braces stay as written.
+
+camp = "p3cloid"
+section = "59"
+plan_row = 67
+plan_doc = "docs/plans/item6-phase2-impl.md"
+# results_doc defaults to docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md ("the ozarchy doc").
+
+# One line: the "what it measured" prefix of every cell row in INDEX.md.
+description = "cloid cost A/B (CLOID_SHARE 100 vs 0, one binary main ef812b02, glibc)"
+# setup defaults to "tw, Classic, standard shape at 300 markets, shared NVMe, commit tail".
+# cells.md "extra env" column = env_base + "; " + arm env (+ "; smoke" / "; warm-up").
+env_base = "6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default)"
+
+[arms.c0]
+meaning = "main ef812b02, CLOID_SHARE=0, glibc"
+env = "CLOID_SHARE=0; glibc; in-flight tail commit"
+
+[arms.c100]
+meaning = "main ef812b02, CLOID_SHARE=100, glibc"
+env = "CLOID_SHARE=100; glibc; in-flight tail commit"
+
+# Non-cell dirs (key = name after "ozarchy-p3cloid-"), "what it measured" column; the order here is the
+# order in the INDEX paragraph and the DELETABLE header.
+[dirs]
+run = '''p3cloid campaign + smoke logs, done markers, analyst/ (a-cells.py, a-arms.py, a-paired.py, a-archive.py, cells.json, cells-abba.json, cells.txt, arms.txt, paired.txt, phases.txt, cloids.txt, archive-*-p3cloid.txt)'''
+tools = '''p3cloid build script ozarchy-p3cloid-build.sh, campaign driver ozarchy-p3cloid-campaign.sh (CAMP=CLOID, copy of ozarchy-p3q-campaign.sh with per-arm CLOID_SHARE and `cloidchk`)'''
+build = '''p3cloid build log (node + bench from one fresh target dir), md5s.txt (cl / b), done marker'''
+stage = '''staged node `torus-node` and bench `bench-throughput` from `ef812b02` (`cl-run/release`), both arms run from here'''
+
+[index]
+# Prose after the generated lead "**Updated <date> (<camp>).** After ... (section N of the ozarchy doc)."
+update = '''Cloid cost A/B on one binary, main `ef812b02` (node `6f363582`, bench `9fda6c84`, built together in a fresh target dir; glibc, no jemalloc feature in `ef812b02`): arm c0 = run-cell.sh `CLOID_SHARE=0`, c100 = `CLOID_SHARE=100`; saturated (RATE 76000), commit tail, no Phase 3; harness = the `ef812b02` worktree (`/home/oz/projects/wt/p3cloid-ef812b02`); driver `ozarchy-p3cloid-campaign.sh` CAMP=CLOID (in `tools/ozarchy-p3cloid-tools/` with the build script and the analyst scripts). Section 59 is built on `analyst/cells.json` (which holds the per-block exec / commit timings from the node logs) and the cells' `summary.json` (`ingest.cloids`, phases), `metrics-*` (`duplicate_cloid`), `cpu.csv`, `io-ticks.txt`, `mem-samples.txt`, `cloid-check.txt` and digest files (keep); the node logs, `buckets.csv`, `tasks.txt` and `sampler.csv` are Tier B.'''
+
+[cells]
+# cells.md section heading after "## p3cloid: ".
+heading = '''cloid cost A/B on one binary, main `ef812b02` (node `6f363582`, bench `9fda6c84` built with it, glibc): c0 = run-cell.sh `CLOID_SHARE=0` vs c100 = `CLOID_SHARE=100`, saturated (RATE 76000), commit tail, n = 4 ABBA, 120 s, tw, Classic, shared NVMe, no Phase 3, harness = the `ef812b02` worktree; all cells ACCEPT, AGREE; warm-up w0 and smoke s0-c100 excluded (section 59)'''
+
+[deletable]
+note = '''Campaign ozarchy-{camp} (results doc section {section}, plan row {plan_row}): cloid cost A/B on one binary, main `ef812b02`, c0 = `CLOID_SHARE=0` vs c100 = `CLOID_SHARE=100`. The cells' `summary.json` (`ingest.cloids`, phases), `metrics-*-val*.txt` (`duplicate_cloid`), `cloid-check.txt`, `cpu.csv`, `io-ticks.txt`, `mem-samples.txt`, `state-digest-val*.txt`, `agreement.jsonl`, `bench.log`, `run.log` and `ozarchy-p3cloid-run/analyst/` (incl. `cells.json`, which holds the per-block exec / commit timings from the node logs) are what section 59 is built on (keep). Tier A = the staged node and bench in `ozarchy-p3cloid-stage/cl-run/release/`, rebuildable from `ef812b02` with `ozarchy-p3cloid-build.sh`. They are also the only bench binary that matches a cloid-format node of that commit, so keep them if a follow-up at a partial share (c25 / c50) is planned on `ef812b02`.'''
+tier_a_keep = "keep while a partial-share follow-up on `ef812b02` is possible"
+# Files the write-up is built on: checked against the rm lists (must not be in them) and against the cells
+# (must exist in at least one); any not named in `note` get an "Also kept:" sentence.
+kept = ["summary.json", "metrics-*-val*.txt", "cloid-check.txt", "cpu.csv", "io-ticks.txt", "mem-samples.txt", "state-digest-val*.txt", "agreement.jsonl", "bench.log", "run.log"]
+# tier_a defaults to every file under ozarchy-p3cloid-stage/ (torus-node first) plus perf.data / perf.folded in cells.
+# tier_b_files defaults to ["buckets.csv", "sampler.csv", "tasks.txt", "val*.log.gz"].
+
+[deletable.outside]
+note = "the fresh target dir, {target_size} apparent (rebuildable with `ozarchy-p3cloid-build.sh`), and the build worktree (clean, detached; `git worktree remove`), on the same condition as Tier A"
+target_dirs = ["/home/oz/.cargo-target-p3cloid-ef812b02"]
+worktrees = ["/home/oz/projects/wt/p3cloid-ef812b02"]
+
+# [checks] is left out on purpose: the p3cloid run shows check (a) on ingest.cloids.* and check (b) on
+# phases.txt / cloids.txt (no saved script). To silence them in a real run:
+# [checks]
+# known_fields = ["ingest.cloids.*"]
+# produced_by = { "phases.txt" = "inline python in the analyst session", "cloids.txt" = "inline python" }
+
+# Summary table (docs/perf/ozarchy-summary-*.md): one row per arm, numbers from analyst/arms.txt, deltas
+# {paired:METRIC:DECIMALS} from analyst/paired.txt (half-up rounding of the printed values). Optional per row:
+# run = "<sub>" (several run dirs), cols = { matched = "...", settle = "..." } to override a column.
+# The "Sources:" sentence at the top of the summary file stays manual.
+[summary]
+file = "docs/perf/ozarchy-summary-2026-10-13.md"
+note = '''- **59 (cloid cost):** one binary (main `ef812b02`, node and bench built together) in both arms; the arms differ only in the
+  bench's cloid share (run-cell.sh `CLOID_SHARE` 0 vs 100). 100% is the worst case; realistic shares are not measured.'''
+note_before = "- **Commit tail everywhere**"
+
+[[summary.rows]]
+label = "59 SAT 120 s"
+arm = "c0"
+text = "c0 main ef812b02, glibc, CLOID_SHARE=0"
+delta = "c100: matched/s {paired:ms:1}; CPU {paired:cpu:2}; exec p99 {paired:exec_p99:1}"
+
+[[summary.rows]]
+label = "59 SAT 120 s"
+arm = "c100"
+text = "c100 main ef812b02, glibc, CLOID_SHARE=100"
+
+# Smoke check (see SMOKE in archive-campaign.py's header): the archived analyst scripts are run from the staged tools copy
+# against the real cells and must reproduce the archived outputs exactly, else nothing is written (exit 5).
+# 1: one cell through a-cells.py (PREFIX + tag, so the prefix ends in "-"), compared with that cell's line of cells.txt.
+[[smoke]]
+name = "a-cells.py on r1-c0"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-r1-c0.json", "{bench}/ozarchy-p3cloid-300m-", "r1-c0:c0"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/cells.txt"
+select = "^r1-c0 "
+
+# 2-4: the arm tables from the 8 ABBA cells (about 5 s): cells.json, then arms.txt (with device writes, --io) and paired.txt.
+[[smoke]]
+name = "a-cells.py on the ABBA cells"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloid-300m-", "r1-c0:c0", "r1-c100:c100", "r2-c100:c100", "r2-c0:c0", "r3-c0:c0", "r3-c100:c100", "r4-c100:c100", "r4-c0:c0"]
+timeout = 300
+
+[[smoke]]
+script = "analyst/a-arms.py"
+args = ["{out}/cells-abba.json", "c0:c100", "--io", "{bench}/ozarchy-p3cloid-300m-"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/arms.txt"
+
+[[smoke]]
+script = "analyst/a-paired.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloid-300m-", "c0", "c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/paired.txt"

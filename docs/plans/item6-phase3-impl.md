@@ -35,10 +35,10 @@ blocks after the last checkpoint S. No consensus rule, no state format and no `h
 |---|---|---|
 | Phase gate, CPU | no node CPU-s/1M regression vs tw beyond noise (was <= -6%; revised owner s111) | interleaved cells, step 4 |
 | Phase gate, disk | state-row bytes written down by the coalescing factor archy measures (step 0) | iostat + RocksDB counters, step 4 |
-| Phase gate, restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | step 4 |
+| Phase gate, restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells). **Final gate (section 62, `c88d3073`): SIGKILL val1, 4 kills per arm: kill -> val1 first commit 29.9 s mean / 39.5 s max (main 27.2 / 31.95), replay complete from the marker, state hashes agree: met** (section 61: SIGTERM 35.0 s) | step 4 |
 | Phase gate, throughput | matched/s UP vs tw beyond noise; native blocks/s no regression (owner s111 after p3t, section 43: on tmpfs the prototype's blocks/s gain is +1.6%, not resolved, so "up" is not required) | step 4 |
 | correctness | per-block write sets, `h_n` and full CF dump identical: interval 15 s vs 0 vs 1 block, crash at random points (incl. mid-checkpoint), 3 replicas with different intervals | tests, step 1 |
-| RAM | a 10 min soak shows RSS levelling off, with a Phase 3 delta <= ~1 GB per node; RSS still growing at the end of the soak blocks the merge (owner s114; was "RSS growth within archy's layer-size figure + 25%", ~270 MB). Which allocator the soak is judged under (glibc fails, jemalloc levels off; sections 53, 53b, 53d) is decided after archy's benches finish. Je vs je (section 57, both arms jemalloc compiled in, no exec-backlog confound): Phase 3 levels off at +0.94 GB per node mean / +1.00 at 10 min / +1.27 peak: met on the level and the mean, not at the peak. Shrinking the layer (~2.1x its logical size) and the view is a follow-up, reconsidered at Phase 4 | soak cells, step 4 |
+| RAM | a 10 min soak shows RSS levelling off, with a Phase 3 delta <= ~1 GB per node; RSS still growing at the end of the soak blocks the merge (owner s114; was "RSS growth within archy's layer-size figure + 25%", ~270 MB). Which allocator the soak is judged under (glibc fails, jemalloc levels off; sections 53, 53b, 53d) is decided after archy's benches finish. Je vs je (section 57, both arms jemalloc compiled in, no exec-backlog confound): Phase 3 levels off at +0.94 GB per node mean / +1.00 at 10 min / +1.27 peak: met on the level and the mean, not at the peak. Shrinking the layer (~2.1x its logical size) and the view is a follow-up, reconsidered at Phase 4. **Final gate (section 61, step 2 `c88d3073` vs main `de1a97c1`, both je): levels off, but +1.43 GB per node mean / +1.80 peak in the soak: not met** (live heap +0.50-0.56 GB as in 57; the rest is jemalloc-resident slack). **Owner s118: judged on the live heap, accepted.** Section 62: `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000` brings s2's soak RSS to main's level (-1.72 GiB per node; +4.6% CPU-s/1M, n = 1, env setting only) | soak cells, step 4 |
 
 The CPU ceiling is ~7% vs tw (step 0: flush worker + state-row memtable / compaction 1.76 CPU-s/1M
 on Classic before tw). The per-block running-hash digest stays on W, so its cost is not saved.
@@ -441,6 +441,25 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   MB/min: levels off. ~+0.55 GB live allocations, ~+0.45 GB jemalloc-resident slack. **RAM rule: met on the level and the
   mean, at the bound at 10 min, not met at the peak (1.05-1.55 GB).** One cell per arm. Secondary ja vs jb (main, no fix):
   no RSS saving at 10 min (+0.15 GB), matched/s minutes 6-10 vs 0-2 -19.9% vs -35.1%.
+- **FINAL Phase 3 gate** (campaign `ozarchy-p3gate`, results doc section 61, plan-2 row 69): s2 = `c88d3073` (step 1 +
+  step 2 + merge-wait, merged with main `de1a97c1`, 15 s) vs m = main `de1a97c1`, both jemalloc compiled in, node and bench
+  built per arm, CLOID_SHARE=0, full workload, commit tail. SAT n = 4 ABBA 120 s: CPU-s/1M -9.72% [-10.46, -8.98] (equal
+  fills -8.39%), writes -54.8% [-56.9, -52.7], matched/s +8.8% [+5.2, +12.4], native blocks/s +20.1% [+10.3, +30.0], block
+  time p99 +17.7% [+6.7, +28.7]; RSS mean +0.99 [+0.67, +1.30] / peak +1.28 [+0.82, +1.74] GB. Soak (600 s, one per arm):
+  CPU -12.4%, writes -64%, matched/s +13%; RSS levels off (s2 last-5-min slopes -77 / -66 / -10 MB/min, difference slope
+  CIs include 0) at **+1.43 GB per node (minutes 5-10 mean), +1.80 peak**; live heap +0.50-0.56 GB (= section 57), the rest
+  jemalloc-resident slack. SIGTERM restart: kill -> first chain commit 35.0 s (m 37.3 s), replay 0; no SIGKILL multi-crash cells on this
+  head (last: section 46, step 1). **Gates: CPU, disk, throughput, restart (SIGTERM only), RAM levels off PASS; RAM size (<= ~1 GB) FAIL in the soak (mean and peak).** Owner decision pending;
+  suggestions (not measured): judge on the live heap, jemalloc decay tuning + soak rerun, n = 2-3 soaks.
+  **Owner (s118, via 18c): RAM accepted on the live heap; Phase 3 merges once the SIGKILL restart gate passes.**
+- **SIGKILL restart gate + jemalloc decay soak** (campaign `ozarchy-p3kd`, results doc section 62, plan-2 row 70): same
+  binaries as the final gate. SIGKILL val1 under load, 2 cells x 2 kills per arm (ABBA), state hash on: kill -> val1 first
+  commit **s2 29.9 s mean / 39.5 s max** (m 27.2 / 31.95); replay from the marker + 1, contiguous (s2 72-113 blocks from the
+  last 100-block checkpoint, m 61-65 = the exec queue); 121 state-hash checkpoints on all 3 validators, 0 disagreements.
+  ~2x section 46's times in both arms (replay 2.4-4.0 blocks/s at this workload). **Restart gate (SIGKILL) PASS; with the
+  live-heap RAM decision every Phase 3 gate is met.** Soak pair on s2: `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000`
+  cuts RSS 6.25 -> 4.53 GiB per node (minutes 5-10 mean; peak 6.91 -> 5.19), live heap unchanged, for +4.6% CPU-s/1M and
+  -2.5% matched/s (n = 1 per arm). An env setting only; a compiled default is a suggestion, not done.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
@@ -451,6 +470,19 @@ About 40 call sites in `torus-rpc` (raw `.inner()` iterators need merged-iterato
 
 Validators get 15 s (or the gate's pick); `--rpc-only` nodes get 0. Same pattern as 9.13 compiled
 defaults.
+
+- **Built** (`feat/p3-step6-15s`, off `c88d3073`, s118; owner: the gate's 15 s): `TORUS_CHECKPOINT_INTERVAL_MS`
+  unset or empty = the role default, set once by the node binary before `TorusApp::try_new`
+  (`exec_pipeline::set_checkpoint_interval_default(rpc_only)`, the `TORUS_TRADE_HISTORY` pattern):
+  validators 15 s (`VALIDATOR_CHECKPOINT_INTERVAL`), `--rpc-only` 0. Explicit values win (`0` = per-block
+  flush). Tests and tools that never set the role default keep the per-block flush. With a deferred
+  book mode (`TORUS_BOOK_ROWS=2/3`, e.g. the bench `RECORD_ENV`) the unset default yields (per-block flush,
+  a warning) instead of refusing to start; an explicit interval still refuses (task 1.2). Tests:
+  `torus-node` `sigterm_shutdown.rs` `env_unset_validator_runs_15s_checkpoints` (RED first),
+  `explicit_zero_interval_keeps_the_per_block_flush`, `env_unset_interval_yields_to_a_deferred_book_mode`;
+  `exec_pipeline` `checkpoint_interval_role_default_*`. `restart_after_sigterm_resumes_from_the_same_applied_state`
+  pins `0` (per-block binary-level restart coverage; `sigterm_with_checkpoints_restarts_with_zero_replay`
+  covers 15 s).
 
 ## 5. Not building
 
@@ -468,6 +500,6 @@ defaults.
 
 ## 7. Rollback
 
-Everything is behind `TORUS_CHECKPOINT_INTERVAL_MS`: unset = today's per-block path byte for byte.
-Rollback = unset the knob, no data migration. A node restarted with the knob unset replays
+Everything is behind `TORUS_CHECKPOINT_INTERVAL_MS`: `0` = today's per-block path byte for byte (since
+step 6, unset on a validator = 15 s). Rollback = set the knob to `0`, no data migration. A node restarted with `0` replays
 (S, committed] serially as today. Task 1.1 (pruner clamp) stays either way.

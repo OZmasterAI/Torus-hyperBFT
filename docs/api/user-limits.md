@@ -44,3 +44,7 @@ Reply:
 
 `torus_getOpenOrders` returns up to 5000 resting orders (pending stops are not
 listed there).
+
+`torus_getUserLimits` reads every order row on the node (no per-trader index
+yet), so it stops with `-32005` once it has read more than
+`TORUS_RPC_MAX_SCAN_ROWS` rows. See `docs/api/read-limits.md`.

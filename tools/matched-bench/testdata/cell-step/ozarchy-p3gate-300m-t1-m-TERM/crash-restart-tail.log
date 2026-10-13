@@ -1,0 +1,10 @@
+2026-10-13T15:47:03.022711Z  INFO torus_node: shutdown signal received, stopping... signal=SIGTERM
+2026-10-13T15:47:03.135520Z  INFO hotstuff_rs::hotstuff::implementation: on_receive_msg: type=Other, view=1046
+2026-10-13T15:47:03.222805Z  INFO torus_network::swarm: received pre-proposal action batch count=400 peer=12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKyTkoWBDWez9kSCVe2Xo
+2026-10-13T15:47:24.685034Z  INFO torus_node: native pool: cancels take at most this share of a selected block ahead of orders (TORUS_CANCEL_BLOCK_SHARE_PCT, 100 = old cancel priority; proposer-local) cancel_block_share_pct=25
+2026-10-13T15:47:24.685058Z  INFO torus_node: native block-selection caps (proposer-local; compiled default = r3 cap-200 bundle) + root bucket-hash workers (node-local, value-neutral; default 8) native_total_block_cap=400 native_orders_per_block_cap=200000 native_block_bytes_cap=12000000 verified_sender_cache_cap=64000 direct_push_body_bytes=8000000 parallel_bucket_hash_threads=8
+2026-10-13T15:47:24.685072Z  INFO torus_node: trade history (TORUS_TRADE_HISTORY; default off on validators, on for --rpc-only) trade_history=false
+2026-10-13T15:47:24.685111Z  INFO torus_consensus::state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false
+2026-10-13T15:47:24.685232Z  INFO torus_consensus::app: native trie maintenance off (default; TORUS_NATIVE_TRIE_MAINTENANCE=1 enables): CF_NATIVE_TRIE/CF_NATIVE_HASHED not maintained, trie marked stale; native root falls back to full scan
+2026-10-13T15:47:24.685339Z  INFO torus_state::running_hash: running state hash activation (chain config) activation=None
+2026-10-13T15:47:24.685399Z  INFO torus_consensus::app: resolved proposer address from signing key address=0x9586A4833970847aef259aD5BFB7aa8901DDf746

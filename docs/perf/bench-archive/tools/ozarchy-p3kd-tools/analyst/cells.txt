@@ -1,0 +1,7 @@
+w0 s2 rc=rc=0 ACCEPT AGREE ms=209426 blk=4.38 cpu1M=23.11 rss pk/mean=5.61/4.22 exec p50/p99=309/607 backlog=51 resid=12.8 evict=[0, 0, 0]
+d1-s2-KILL s2 rc=rc=2 REJECT AGREE ms=197422 blk=4.26 cpu1M=24.09 rss pk/mean=5.87/4.49 exec p50/p99=309/573 backlog=46 resid=22.2 evict=[0, 0, 0]
+d1-m-KILL m rc=rc=2 REJECT DISAGREE ms=176704 blk=3.74 cpu1M=26.82 rss pk/mean=4.38/3.53 exec p50/p99=328/779 backlog=45 resid=27.4 evict=[0, 0, 0]
+d2-m-KILL m rc=rc=2 REJECT AGREE ms=186366 blk=3.31 cpu1M=26.73 rss pk/mean=4.51/3.59 exec p50/p99=350/620 backlog=41 resid=27.2 evict=[0, 17, 71]
+d2-s2-KILL s2 rc=rc=2 REJECT DISAGREE ms=184241 blk=3.52 cpu1M=24.16 rss pk/mean=5.99/4.50 exec p50/p99=316/575 backlog=44 resid=27.7 evict=[0, 0, 0]
+k1-s2def s2 rc=rc=0 ACCEPT AGREE ms=217605 blk=2.95 cpu1M=24.47 rss pk/mean=7.16/6.22 exec p50/p99=360/573 backlog=60 resid=22.5 evict=[0, 0, 0]
+k1-s2dec s2 rc=rc=2 REJECT DISAGREE ms=212075 blk=3.02 cpu1M=25.60 rss pk/mean=5.47/4.46 exec p50/p99=362/604 backlog=60 resid=22.6 evict=[0, 0, 0]

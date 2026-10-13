@@ -33,6 +33,9 @@ cache rebuild per campaign).
    (a build, the smoke test) use the short-wait pattern below.
 3. **Quiet host**: no compile may run during a campaign (results get contaminated).
    Finish every build first, and check: `pgrep -a 'cargo|rustc'` must be empty.
+   If the campaign has a per-cell step (validates each cell, appends a row to
+   `<RUN_DIR>/cells.tsv`), it must run in sequence and finish before the next cell starts:
+   never in the background while a cell is measuring.
 4. **Launch detached as its own systemd --user service**, never as a child of your shell
    (`setsid nohup` keeps your process tree; `systemd-run --scope` keeps you as parent).
    From the repo root:
@@ -67,7 +70,12 @@ cache rebuild per campaign).
    - **Woken with no `campaign.done`**: the unit died (stopped, killed, reboot). Run
      `systemctl --user status bench-<name>.service` once, report "run died" with the log tail,
      and stop. Never start the wait again.
-7. **Analyse and report**: read the results, write the summary, `remember_this` the outcome.
+7. **Analyse and report**: finish the writeup drafted after step 5 (see "Draft while it runs"):
+   - if `<RUN_DIR>/cells.tsv` exists, use it as an index only: re-check each cell from its raw
+     files yourself (rc, AGREE/PASS, node md5 vs the staged md5 of its arm, failure lines);
+   - name every `CELL-FLAG` cell from `campaign.log` and its `<label>-rerun`, and look for drift
+     or trends across cells in run order (one cell's row cannot show them);
+   - add the comparison between arms, verdict and caveats; `remember_this` the outcome.
 
 ## Short waits (builds, smoke tests, up to ~1.8h)
 
@@ -77,6 +85,13 @@ returns the moment the work is done:
 timeout 270 bash -c 'until <done-check>; do sleep 10; done'
 ```
 If it exits 124 (timed out), run the same command again.
+
+## Draft while it runs
+
+Right after step 5, before the first step-6 wait, draft the parts of the writeup that are known
+before any result: question, setup, arms, commit shas, node md5s, cell plan and expected
+duration. Leave the results and verdict for step 7. Light edits only: no builds, no analysis
+tools on the bench host while cells run.
 
 ## Rules
 

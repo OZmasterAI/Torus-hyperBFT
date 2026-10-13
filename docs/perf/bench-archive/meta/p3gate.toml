@@ -1,0 +1,121 @@
+# archive-campaign.py meta for campaign ozarchy-p3gate (results doc section 61, plan row 69).
+# This file is the only hand-written input; everything else (rows, sizes, rm lists, tools copy) is generated.
+# Modelled on meta/p3cloid.toml (every key explained there) and meta/p3cloidprof.toml.
+
+camp = "p3gate"
+section = "61"
+plan_row = 69
+plan_doc = "docs/plans/item6-phase2-impl.md"
+
+# Same text as the analyst's a-archive.py rows (check x compares them).
+description = "final Phase 3 gate (s2 c88d3073 vs main de1a97c1, both je compiled in, CLOID_SHARE=0)"
+# One role for all cells (the script has no per-cell role); the soak and restart cells get their kind from [cell_notes],
+# so their INDEX rows differ from the analyst's archive-index-p3gate.txt in that column only (check x warns, expected).
+cell_role = "throughput"
+# md5s.txt also holds "<key> jemalloc symbols: N" lines that the default parser would read as binaries.
+binaries = "s2 c88d3073 (node 4e0d8b84, bench ae96e0c1), m de1a97c1 (node f1081574, bench 42365459)"
+env_base = "6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default)"
+
+[arms.s2]
+meaning = "Phase 3 c88d3073 = step 1 + step 2 + merge-wait on main de1a97c1, je compiled in, TORUS_CHECKPOINT_INTERVAL_MS=15000"
+env = "TORUS_CHECKPOINT_INTERVAL_MS=15000; je compiled in; CLOID_SHARE=0; in-flight tail commit"
+
+[arms.m]
+meaning = "main de1a97c1, je compiled in, knob unset"
+env = "checkpoint knob unset; je compiled in; CLOID_SHARE=0; in-flight tail commit"
+
+# analyst/cells.json has no w0 and no smoke cells, and "TERM" is the last name token.
+[cell_arms]
+"ozarchy-p3gate-300m-w0" = "s2"
+"ozarchy-p3gate-300m-t1-s2-TERM" = "s2"
+"ozarchy-p3gate-300m-t1-m-TERM" = "m"
+"ozarchy-p3gate-smoke-300m-s0-s2-TERM" = "s2"
+"ozarchy-p3gate-smoke-300m-s0-m" = "m"
+
+[cell_notes]
+"ozarchy-p3gate-300m-k1-m" = "the soak cell (full workload, cancel share on), one per arm"
+"ozarchy-p3gate-300m-k1-s2" = "the soak cell (full workload, cancel share on), one per arm"
+"ozarchy-p3gate-300m-t1-s2-TERM" = "restart cell, SIGTERM val1 at bench+180 s; rc 2 = crash-gate INFO-line false FAIL"
+"ozarchy-p3gate-300m-t1-m-TERM" = "restart cell, SIGTERM val1 at bench+180 s; rc 2 = crash-gate INFO-line false FAIL + mark-only digest DISAGREE (val0)"
+"ozarchy-p3gate-smoke-300m-s0-s2-TERM" = "SIGTERM val1 at 40 s; rc 2 = crash-gate INFO-line false FAIL"
+
+[dirs]
+run = '''p3gate campaign log, done marker, smoke/ (smoke campaign log + done marker), analyst/ (a-cells.py, a-arms.py, a-paired.py, a-series.py, a-term.py, a-archive.py; cells.json, cells-abba.json, cells-soak.json, cells.txt, arms.txt, arms-soak.txt, paired.txt, series.json, series.txt, fig-rss / fig-node svg + png, a-term.txt, ckpt-timers.txt, validity.txt, archive-*-p3gate.txt)'''
+tools = '''p3gate campaign driver ozarchy-p3gate-campaign.sh (CAMP=GATE, copy of ozarchy-p3cloid-campaign.sh + the restart cells of ozarchy-p3term-campaign.sh), build script ozarchy-p3gate-build.sh, matched-bench tools copy (= c88d3073 `tools/matched-bench` + p3term's crash-kill.sh)'''
+build = '''p3gate build logs (s2 / m, node + bench per arm from fresh target dirs), md5s.txt (s2 / bs2 / m / bm + nm jemalloc counts), done markers'''
+stage = '''staged node `torus-node` and bench `bench-throughput` per arm (`s2-run/release` from `c88d3073`, `m-run/release` from `de1a97c1`)'''
+
+[index]
+# The generated summary would say "12 throughput cells" (one cell_role).
+dirs_summary = '''8 SAT cells, 2 soak cells, 2 SIGTERM restart cells, the warm-up `w0`, 2 smoke cells `ozarchy-p3gate-smoke-300m-s0-s2-TERM`, `ozarchy-p3gate-smoke-300m-s0-m`, `ozarchy-p3gate-run`, `-tools`, `-build`, `-stage`'''
+update = '''The FINAL Phase 3 gate (18c): s2 = `feat/item6-phase3-step2` `c88d3073` (step 1 + step 2 + merge-wait `91a10875`, merged with main `de1a97c1`; node `4e0d8b84`, bench `ae96e0c1`) with `TORUS_CHECKPOINT_INTERVAL_MS=15000` vs m = main `de1a97c1` (c88d3073's main parent; node `f1081574`, bench `42365459`), knob unset; each arm's node and bench built from its own commit in a fresh target dir, jemalloc compiled in both (nm), CLOID_SHARE=0, commit tail, full workload; harness = the `c88d3073` worktree; driver `ozarchy-p3gate-campaign.sh` CAMP=GATE (in `tools/ozarchy-p3gate-tools/` with the build script, crash-kill.sh and the analyst scripts). Cells: w0, n = 4 ABBA 120 s SAT, one 600 s soak per arm (k1), one 300 s SIGTERM restart cell per arm (t1, val1 at bench+180 s). Section 61 is built on the analyst outputs in `ozarchy-p3gate-run/analyst/` (`paired.txt`, `arms.txt`, `arms-soak.txt`, `series.txt`, `a-term.txt`, `ckpt-timers.txt`, `validity.txt`, the figures) and the cells' `summary.json`, `cpu.csv`, `io-ticks.txt`, `mem-samples.txt`, `ckpt-samples.txt`, `metrics-*`, `crash-*` and digest files (keep); the node logs, `buckets.csv`, `tasks.txt` and `sampler.csv` are Tier B.'''
+
+[cells]
+heading = '''final Phase 3 gate, s2 = step 2 `c88d3073` (step 1 + step 2 + merge-wait, merged with main `de1a97c1`; node `4e0d8b84`, bench `ae96e0c1`) at `TORUS_CHECKPOINT_INTERVAL_MS=15000` vs m = main `de1a97c1` (node `f1081574`, bench `42365459`), both jemalloc compiled in, CLOID_SHARE=0, commit tail, tw, Classic, shared NVMe, harness = the `c88d3073` worktree: n = 4 ABBA 120 s SAT (RATE 76000), one 600 s soak per arm (k1), one 300 s SIGTERM restart cell per arm (t1); rc 2 / REJECT on t1-s2-TERM, t1-m-TERM and the smoke s0-s2-TERM = crash-gate INFO-line false FAIL (+ mark-only digest DISAGREE on t1-m-TERM); warm-up w0 and the smoke cells excluded (section 61)'''
+
+[deletable]
+note = '''Campaign ozarchy-{camp} (results doc section {section}, plan row {plan_row}): the final Phase 3 gate, s2 = step 2 `c88d3073` (15 s) vs main `de1a97c1`, both jemalloc compiled in. Section {section} is built on `ozarchy-p3gate-run/analyst/` (`paired.txt`, `arms.txt`, `arms-soak.txt`, `cells*.json`, `series.json` / `series.txt`, `fig-rss` / `fig-node`, `a-term.txt`, `ckpt-timers.txt`, `validity.txt`) and the cells' `summary.json`, `cpu.csv`, `cpu-ticks.txt`, `io-ticks.txt`, `mem-samples.txt`, `ckpt-samples.txt`, `metrics-*-val*.txt`, `state-digest-val*.txt`, `agreement.jsonl` and `crash-*` (keep). Tier A = the staged nodes and benches in `ozarchy-p3gate-stage/{s2,m}-run/release/`, rebuildable from `c88d3073` / `de1a97c1` with `ozarchy-p3gate-build.sh`; each bench matches only its own node (cloid order format). p3gate's kills.json was written to `ozarchy-p3term-run/kills.json` by the analyst's a-term.py (hardcoded path; see section {section}), overwriting p3term's; it also read the HARD FINDING lines from p3term's campaign log (archived copy fixed for both).'''
+tier_a_keep = "keep while the owner's Phase 3 decision is pending and a soak rerun on these binaries is possible: jemalloc decay tuning, n = 2-3 soaks"
+kept = ["summary.json", "cpu.csv", "cpu-ticks.txt", "io-ticks.txt", "mem-samples.txt", "ckpt-samples.txt", "metrics-*-val*.txt", "state-digest-val*.txt", "agreement.jsonl"]
+
+[deletable.outside]
+note = "the two fresh target dirs, {target_size} apparent (rebuildable with `ozarchy-p3gate-build.sh`), and the build worktrees (clean, detached; `git worktree remove`), on the same condition as Tier A"
+target_dirs = ["/home/oz/.cargo-target-p3gate-s2-c88d3073", "/home/oz/.cargo-target-p3gate-m-de1a97c1"]
+worktrees = ["/home/oz/projects/wt/p3gate-s2-c88d3073", "/home/oz/projects/wt/p3gate-m-de1a97c1"]
+
+[checks]
+# ckpt-timers.txt and validity.txt were written in the analyst session without a saved script (section 61 says so).
+produced_by = { "ckpt-timers.txt" = "inline python in the analyst session (summary.json phases + metrics deltas; noted in section 61)", "validity.txt" = "written by hand by the analyst from cells.txt, a-term.txt and the run logs (noted in section 61)", "a-term.txt" = "a-term.py stdout", "arms-soak.txt" = "a-arms.py stdout on cells-soak.json" }
+
+[tools]
+# matched-bench/ is c88d3073's tools/matched-bench byte for byte except crash-kill.sh (p3term's copy): keep only that one.
+exclude = ["matched-bench/*"]
+extra = [
+  ["ozarchy-p3gate-tools/matched-bench/crash-kill.sh", "matched-bench/crash-kill.sh"],
+]
+
+[summary]
+file = "docs/perf/ozarchy-summary-2026-10-13.md"
+note = '''- **61 (final Phase 3 gate):** both arms jemalloc compiled in, node and bench built per arm, CLOID_SHARE=0, full workload.
+  SAT = n = 4 ABBA 120 s; soak = one 600 s cell per arm (no CI; soak columns from `arms-soak.txt`, RSS = minutes 5-10 mean /
+  peak of the 3 per-node values in `series.txt`, matched/s minute windows from `series.txt`); soak settle = `ck_settle` (summary
+  phase per native block; per `torus_exec_native_blocks_total` it is 8.8, SAT 3.1). TERM = one 300 s cell per arm, SIGTERM of val1 at bench+180 s; restart = kill -> first chain commit after the restart.'''
+note_before = "- **Commit tail everywhere**"
+
+[[summary.rows]]
+label = "61 SAT 120 s"
+arm = "m"
+text = "m main de1a97c1, je compiled in"
+delta = "s2: CPU {paired:cpu:2}; writes {paired:wr:1}; matched/s {paired:ms:1}; blk/s {paired:blk:1}; RSS mean +0.99 GB [+0.67, +1.30]"
+
+[[summary.rows]]
+label = "61 SAT 120 s"
+arm = "s2"
+text = "s2 step 2 c88d3073, je compiled in, 15 s"
+
+# Soak rows: arms.txt is the SAT table, so every column is given here from arms-soak.txt / series.txt.
+[[summary.rows]]
+label = "61 soak"
+arm = "m"
+text = "m main de1a97c1, je compiled in"
+cols = { matched = "193,398 [201,679 / 190,516]", blk = "2.61", p99 = "1,196", cpu = "27.93", rss = "4.67 / 4.91", writes = "231.6", settle = "n/a" }
+delta = "s2 - m RSS +1.43 GB/node (min 5-10), +1.80 peak; levels off (s2 slopes -77 / -66 / -10 MB/min; diff slope CIs span 0); CPU -12.4%, writes -64%; single cells"
+
+[[summary.rows]]
+label = "61 soak"
+arm = "s2"
+text = "s2 step 2 c88d3073, je compiled in, 15 s"
+cols = { matched = "219,139 [210,202 / 218,481]", blk = "2.97", p99 = "1,473", cpu = "24.46", rss = "6.14 / 6.75", writes = "82.9", settle = "9.0" }
+
+[[summary.rows]]
+label = "61 TERM"
+arm = "m"
+text = "m de1a97c1 (1 SIGTERM)"
+cols = { matched = "SIGTERM -> exit 21.5 s; kill -> first chain commit 37.3 s; replay 0", blk = "-", p99 = "-", cpu = "-", rss = "-", writes = "-", settle = "n/a" }
+delta = "s2 restart 35.0 s vs m 37.3 s (gate 60 s); replay 0 in both; one kill per arm"
+
+[[summary.rows]]
+label = "61 TERM"
+arm = "s2"
+text = "s2 c88d3073 (1 SIGTERM)"
+cols = { matched = "SIGTERM -> exit 19.1 s; kill -> first chain commit 35.0 s; replay 0", blk = "-", p99 = "-", cpu = "-", rss = "-", writes = "-", settle = "-" }

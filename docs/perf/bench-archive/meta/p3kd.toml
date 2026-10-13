@@ -1,0 +1,123 @@
+# archive-campaign.py meta for campaign ozarchy-p3kd (results doc section 62, plan row 70).
+# This file is the only hand-written input; everything else (rows, sizes, rm lists, tools copy) is generated.
+# Modelled on meta/p3gate.toml (smoke entries as meta/p3cloid.toml).
+
+camp = "p3kd"
+section = "62"
+plan_row = 70
+plan_doc = "docs/plans/item6-phase2-impl.md"
+
+# Same text as the analyst's a-archive.py rows (check x compares them).
+description = "Phase 3 SIGKILL restart gate + jemalloc decay (s2 c88d3073 / main de1a97c1, je compiled in, CLOID_SHARE=0)"
+# One role for all cells ("cell <dur> s"); each cell's kind is in [cell_notes]. So the INDEX "what it measured" column of the
+# 4 kill cells, the 2 soak cells and the kill smoke differs from the analyst's archive-index-p3kd.txt ("restart 300 s, ..." /
+# "soak 600 s"): check x warns on those 7 rows, expected. The cells.md rows match the analyst's exactly.
+cell_role = "cell"
+# No ozarchy-p3kd-build: the binaries are p3gate's stage (not rebuilt).
+binaries = "s2 c88d3073 (node 4e0d8b84, bench ae96e0c1), m de1a97c1 (node f1081574, bench 42365459); staged in ozarchy-p3gate-stage"
+env_base = "6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default)"
+
+[arms.s2]
+meaning = "Phase 3 c88d3073, je compiled in, TORUS_CHECKPOINT_INTERVAL_MS=15000"
+env = "TORUS_CHECKPOINT_INTERVAL_MS=15000; je compiled in; CLOID_SHARE=0; in-flight tail commit"
+
+[arms.m]
+meaning = "main de1a97c1, je compiled in, knob unset"
+env = "checkpoint knob unset; je compiled in; CLOID_SHARE=0; in-flight tail commit"
+
+[arms.s2def]
+meaning = "Phase 3 c88d3073, je defaults, TORUS_CHECKPOINT_INTERVAL_MS=15000"
+env = "TORUS_CHECKPOINT_INTERVAL_MS=15000; je compiled in, MALLOC_CONF unset; CLOID_SHARE=0; in-flight tail commit"
+
+[arms.s2dec]
+meaning = "Phase 3 c88d3073, MALLOC_CONF=background_thread:true,dirty_decay_ms:1000, TORUS_CHECKPOINT_INTERVAL_MS=15000"
+env = "TORUS_CHECKPOINT_INTERVAL_MS=15000; je compiled in, MALLOC_CONF=background_thread:true,dirty_decay_ms:1000; CLOID_SHARE=0; in-flight tail commit"
+
+# analyst/cells.json has no smoke cells and gives the soak cells arm "s2" (a-cells.py k1-s2def:s2 k1-s2dec:s2); the soak
+# cells are set to their MALLOC_CONF arms here (the analyst's archive rows use s2def / s2dec too).
+[cell_arms]
+"ozarchy-p3kd-300m-k1-s2def" = "s2def"
+"ozarchy-p3kd-300m-k1-s2dec" = "s2dec"
+"ozarchy-p3kd-smoke-300m-s0-m-KILL" = "m"
+"ozarchy-p3kd-smoke-300m-s0-s2dec" = "s2dec"
+
+[cell_notes]
+"ozarchy-p3kd-300m-d1-s2-KILL" = "restart cell, SIGKILL val1 at bench+60,180 s, state hash on; rc 2 = crash-gate INFO-line false FAIL (+ replay beyond the exec queue, by design)"
+"ozarchy-p3kd-300m-d1-m-KILL" = "restart cell, SIGKILL val1 at bench+60,180 s, state hash on; rc 2 = crash-gate INFO-line false FAIL + mark-only digest DISAGREE (val2)"
+"ozarchy-p3kd-300m-d2-m-KILL" = "restart cell, SIGKILL val1 at bench+65,187 s, state hash on; rc 2 = crash-gate INFO-line false FAIL"
+"ozarchy-p3kd-300m-d2-s2-KILL" = "restart cell, SIGKILL val1 at bench+65,187 s, state hash on; rc 2 = crash-gate INFO-line false FAIL + mark-only digest DISAGREE (val1)"
+"ozarchy-p3kd-300m-k1-s2def" = "soak, jemalloc defaults"
+"ozarchy-p3kd-300m-k1-s2dec" = "soak, MALLOC_CONF decay setting (4 jemalloc_bg_thd per node); rc 2 = mark-only digest DISAGREE (val2)"
+"ozarchy-p3kd-smoke-300m-s0-m-KILL" = "SIGKILL val1 at 40 s, state hash on; rc 2 = crash-gate INFO-line false FAIL"
+
+[dirs]
+run = '''p3kd campaign log, done marker, kills.json (a-kill.py), jeconf-proof.txt / jeconf-default.txt (stats_print proof of MALLOC_CONF / the defaults), smoke/ (smoke campaign log, done marker, jeconf files), analyst/ (a-cells.py, a-kill.py, a-series.py, a-tables.py, a-archive.py; cells.json, cells.txt, a-kill.txt, series.json, series.txt, restart.txt, soak.txt, fig-rss / fig-node svg + png, archive-*-p3kd.txt)'''
+tools = '''p3kd campaign driver ozarchy-p3kd-campaign.sh (CAMP=KD, copy of ozarchy-p3gate-campaign.sh + SIGKILL / state-hash cells + MALLOC_CONF arm), matched-bench tools copy (= p3gate's: c88d3073 `tools/matched-bench` + p3term's crash-kill.sh), archive-copy/ (a-kill.py, a-tables.py with optional output paths, the archived versions)'''
+
+[index]
+dirs_summary = '''4 SIGKILL restart cells, 2 soak cells, the warm-up `w0`, 2 smoke cells `ozarchy-p3kd-smoke-300m-s0-m-KILL`, `ozarchy-p3kd-smoke-300m-s0-s2dec`, `ozarchy-p3kd-run`, `-tools` (binaries: p3gate's stage)'''
+update = '''Phase 3 SIGKILL restart gate + jemalloc decay soak pair (18c, after section 61): the p3gate binaries, not rebuilt (s2 = `c88d3073` with `TORUS_CHECKPOINT_INTERVAL_MS=15000`, node `4e0d8b84`, bench `ae96e0c1`; m = main `de1a97c1`, node `f1081574`, bench `42365459`; staged in `ozarchy-p3gate-stage`), jemalloc compiled in, CLOID_SHARE=0, commit tail, full workload; harness = the `c88d3073` worktree; driver `ozarchy-p3kd-campaign.sh` CAMP=KD (in `tools/ozarchy-p3kd-tools/` with the analyst scripts). Cells: w0; Part D d1-s2-KILL, d1-m-KILL, d2-m-KILL, d2-s2-KILL (300 s, SIGKILL val1 twice, state hash on); Part B k1-s2def / k1-s2dec (600 s soak on s2, jemalloc defaults vs `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000`). Section 62 is built on the analyst outputs in `ozarchy-p3kd-run/analyst/` (`restart.txt`, `a-kill.txt`, `soak.txt`, `series.txt`, `cells.json`, the figures), `ozarchy-p3kd-run/kills.json`, `jeconf-*.txt` and the cells' `summary.json`, `crash-*`, `state-hashes.txt`, `ckpt-samples.txt`, `mem-samples.txt`, `metrics-*`, `node-preload.txt`, `node-jethreads.txt` and digest files (keep); the node logs, `buckets.csv`, `tasks.txt` and `sampler.csv` are Tier B.'''
+
+[cells]
+heading = '''Phase 3 SIGKILL restart gate + jemalloc decay soak pair, p3gate's binaries: s2 = step 2 `c88d3073` (node `4e0d8b84`, bench `ae96e0c1`) at `TORUS_CHECKPOINT_INTERVAL_MS=15000` vs m = main `de1a97c1` (node `f1081574`, bench `42365459`), both jemalloc compiled in, CLOID_SHARE=0, commit tail, tw, Classic, shared NVMe, harness = the `c88d3073` worktree: 4 x 300 s SIGKILL restart cells ABBA (2 kills of val1 each, state hash on) and two 600 s soaks on s2 (jemalloc defaults vs `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000`); rc 2 / REJECT on the kill cells = crash-gate INFO-line false FAIL (+ mark-only digest DISAGREE on d1-m-KILL, d2-s2-KILL), on k1-s2dec = mark-only digest DISAGREE; warm-up w0 and the smoke cells excluded (section 62)'''
+
+[deletable]
+note = '''Campaign ozarchy-{camp} (results doc section {section}, plan row {plan_row}): Phase 3 SIGKILL restart gate on `c88d3073` vs main `de1a97c1` and a jemalloc decay soak pair on `c88d3073`. Section {section} is built on `ozarchy-p3kd-run/analyst/` (`restart.txt`, `a-kill.txt`, `soak.txt`, `cells.json` / `cells.txt`, `series.json` / `series.txt`, `fig-rss` / `fig-node`), `ozarchy-p3kd-run/kills.json`, `ozarchy-p3kd-run/jeconf-*.txt` and the cells' `summary.json`, `crash-*`, `state-hashes.txt`, `ckpt-samples.txt`, `mem-samples.txt`, `cpu.csv`, `metrics-*-val*.txt`, `node-preload.txt`, `node-jethreads.txt`, `state-digest-val*.txt` and `agreement.jsonl` (keep). `a-cells.py` and `a-series.py` read the node logs (`val*.log.gz`, Tier B): after Tier B is deleted the archive smoke entries for them can no longer run. `restart.txt` / `soak.txt` also read `ozarchy-p3r1-run/kills.json` and `ozarchy-p3gate-run/analyst/cells-soak.json`. No Tier A and no outside-tree items of its own: the binaries are p3gate's (`ozarchy-p3gate-stage`, see that block; this campaign was the jemalloc decay rerun its keep condition named).'''
+kept = ["summary.json", "crash-*", "state-hashes.txt", "ckpt-samples.txt", "mem-samples.txt", "cpu.csv", "metrics-*-val*.txt", "node-preload.txt", "node-jethreads.txt", "state-digest-val*.txt", "agreement.jsonl"]
+
+[checks]
+produced_by = { "a-kill.txt" = "a-kill.py stdout" }
+
+[tools]
+# matched-bench/ is p3gate's copy byte for byte (c88d3073's tools/matched-bench + p3term's crash-kill.sh): keep only crash-kill.sh.
+# a-kill.py / a-tables.py: the archived versions are archive-copy/ (optional output paths so the smoke check does not write
+# into the run dir; no arguments = the analyst's paths); the analyst's originals are left out.
+exclude = ["matched-bench/*", "archive-copy/*", "a-kill.py", "a-tables.py"]
+extra = [
+  ["ozarchy-p3kd-tools/matched-bench/crash-kill.sh", "matched-bench/crash-kill.sh"],
+  ["ozarchy-p3kd-tools/archive-copy/a-kill.py", "analyst/a-kill.py"],
+  ["ozarchy-p3kd-tools/archive-copy/a-tables.py", "analyst/a-tables.py"],
+]
+
+# Smoke: rerun the archived analysis on the soak cells and the kill cells (arguments as the analyst's runs; a-kill.py's
+# prefix is relative to its hard-coded bench root, which is the default --bench-root). Order matters: a-tables.py reads
+# cells.json, series.json and kills.json from {out}.
+[[smoke]]
+name = "a-cells.py on the two soak cells"
+script = "analyst/a-cells.py"
+args = ["{out}/cells.json", "{bench}/ozarchy-p3kd-300m-", "k1-s2def:s2", "k1-s2dec:s2"]
+timeout = 300
+[[smoke.compare]]
+want = "analyst/cells.txt"
+select = "^k1-s2de[fc] "
+
+[[smoke]]
+name = "a-kill.py on the 4 SIGKILL cells"
+script = "analyst/a-kill.py"
+args = ["--kills", "{out}/kills.json", "ozarchy-p3kd-300m-", "d1-s2-KILL", "d1-m-KILL", "d2-m-KILL", "d2-s2-KILL"]
+timeout = 300
+[[smoke.compare]]
+want = "analyst/a-kill.txt"
+
+[[smoke]]
+name = "a-series.py on the soak cells (def, dec + p3gate gs2, gm)"
+script = "analyst/a-series.py"
+args = ["{out}"]
+timeout = 300
+[[smoke.compare]]
+want = "analyst/series.txt"
+got = "series.txt"
+
+[[smoke]]
+name = "a-tables.py -> restart.txt, soak.txt"
+script = "analyst/a-tables.py"
+args = ["{out}", "{out}/kills.json"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/restart.txt"
+got = "restart.txt"
+[[smoke.compare]]
+want = "analyst/soak.txt"
+got = "soak.txt"
+# the analyst's soak.txt header says "per node GiB", the script prints "per node GB" (values identical; section 62)
+ignore = ["^per node Gi?B: "]

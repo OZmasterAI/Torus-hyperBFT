@@ -1,0 +1,26 @@
+Keccak-leaf samples WITH an intact user chain (~2% of Keccak samples: wrapper/absorb frames), share of period by thread | caller | caller's caller
+c0  60.4%  c100  57.0%  torus-gossip-ve | torus_types::eip712::eip712_struct_hash | <torus_types::SignedNativeAction>::recover_sender
+c0  32.1%  c100  33.8%  torus-ingress-v | torus_types::eip712::eip712_struct_hash | <torus_types::SignedNativeAction>::validate_with_sessions::<torus_rpc:
+c0   0.8%  c100   1.8%  torus-gossip-ve | <torus_types::SignedNativeAction>::recover_sender | <torus_mempool::Mempool>::add_native_action_from_gossip
+c0   1.4%  c100   0.8%  torus-ingress-v | <torus_types::SignedNativeAction>::validate_with_sessions::< | torus_rpc::torus::verify_one_action_with
+c0   0.4%  c100   1.1%  torus-gossip-ve | torus_types::eip712::eip712_domain_separator_for_chain | <torus_types::SignedNativeAction>::recover_sender
+c0   0.8%  c100   0.6%  torus-gossip-ve | torus_types::verified_cache_key_with_scratch | torus_types::verified_cache_key
+c0   0.6%  c100   0.4%  torus-gossip-ve | torus_types::compute_action_hash_with_scratch | torus_types::compute_action_hash
+c0   0.5%  c100   0.4%  torus-ingress-v | torus_types::eip712::eip712_domain_separator_for_chain | <torus_types::SignedNativeAction>::validate_with_sessions::<torus_rpc:
+c0   0.3%  c100   0.4%  hotstuff-algo | torus_types::compute_action_hash_with_scratch | <torus_consensus::app::TorusApp>::dispatch_to_exec
+c0   0.2%  c100   0.3%  rpc-worker | torus_types::verified_cache_key_with_scratch | torus_types::verified_cache_key
+c0   0.1%  c100   0.4%  torus-ingress-v | torus_rpc::torus::verify_one_action_with | <rayon::iter::collect::consumer::CollectResult<core::result::Result<(a
+c0   0.4%  c100   0.1%  hotstuff-algo | torus_types::compute_action_hash_with_scratch | <core::iter::adapters::map::Map<core::slice::iter::Iter<torus_types::S
+c0   0.2%  c100   0.3%  EXEC | torus_bridge::native_executor::sort_native_actions_indexed | <torus_consensus::app::ExecutionContext>::execute_committed_block_with
+c0   0.2%  c100   0.3%  torus-gossip-ve | torus_types::verified_cache_key | <torus_mempool::Mempool>::add_native_action_from_gossip
+c0   0.1%  c100   0.3%  torus-ingress-v | torus_types::eip712::ecrecover | <torus_types::SignedNativeAction>::validate_with_sessions::<torus_rpc:
+c0   0.2%  c100   0.3%  rpc-worker | torus_types::verified_cache_key | <torus_mempool::Mempool>::add_native_action_presigned
+c0   0.0%  c100   0.4%  torus-gossip-ve | torus_types::compute_action_hash_with_scratch | <torus_state::native_da::NativeDaStore>::put_batch
+c0   0.2%  c100   0.2%  torus-gossip-ve | torus_types::eip712::ecrecover | <torus_types::SignedNativeAction>::recover_sender
+c0   0.2%  c100   0.1%  rpc-worker | torus_types::compute_action_hash | <torus_mempool::native_pool::NativePool>::insert_with_restash_key
+c0   0.2%  c100   0.1%  EXEC | torus_types::verified_cache_key_with_scratch | <alloc::vec::Vec<core::option::Option<alloy_primitives::bits::address:
+c0   0.1%  c100   0.1%  rpc-worker | torus_types::compute_action_hash_with_scratch | torus_types::compute_action_hash
+c0   0.2%  c100   0.1%  hotstuff-algo | <torus_consensus::app::TorusApp>::dispatch_to_exec | <torus_consensus::app::TorusApp as hotstuff_rs::app::App<torus_consens
+c0   0.0%  c100   0.2%  torus-node | torus_types::compute_action_hash_with_scratch | <torus_network::bridge::LibP2PNetwork>::broadcast_pre_proposal_actions
+c0   0.1%  c100   0.1%  torus-gossip-ve | torus_types::compute_action_hash | <torus_mempool::native_pool::NativePool>::insert_with_restash_key
+c0   0.0%  c100   0.1%  rpc-worker | torus_types::compute_action_hash_with_scratch | <torus_state::native_da::NativeDaStore>::put_batch

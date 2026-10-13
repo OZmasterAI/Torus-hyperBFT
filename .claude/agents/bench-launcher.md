@@ -37,6 +37,9 @@ cache rebuild per campaign).
    (a build, the smoke test) use the short-wait pattern below.
 3. **Quiet host**: no compile may run during a campaign (results get contaminated).
    Finish every build first, and check: `pgrep -a 'cargo|rustc'` must be empty.
+   If the campaign has a per-cell step (validates each cell, appends a row to
+   `<RUN_DIR>/cells.tsv`), it must run in sequence and finish before the next cell starts:
+   never in the background while a cell is measuring.
 4. **Launch detached as its own systemd --user service**, never as a child of your shell
    (`setsid nohup` keeps your process tree; `systemd-run --scope` keeps you as parent).
    From the repo root:
@@ -78,8 +81,10 @@ cache rebuild per campaign).
       `log` (`<RUN_DIR>/campaign.log`), `done_marker` (`<RUN_DIR>/campaign.done` and its content),
       `expected_duration`, `analyst_effort` (from your prompt, or `null`).
    b. Extract compact tables to `<RUN_DIR>/handoff-tables.txt`, read-only on the results
-      (never run tools that rewrite result files, e.g. `summarize.py`):
-      per cell: label, rc, AGREE/PASS, node md5, main throughput metric;
+      (never run tools that rewrite result files, e.g. `summarize.py`). If the campaign wrote
+      `<RUN_DIR>/cells.tsv`, copy its rows as the per-cell table and list the `CELL-FLAG` lines
+      from `campaign.log`; otherwise extract per cell: label, rc, AGREE/PASS, node md5, main
+      throughput metric;
       per arm: mean and r1/r2 spread. Numbers only: no ranking, no verdict, no conclusion.
    c. Spawn the analyst with the Agent tool: `subagent_type: "bench-analyst"`, a prompt naming
       the run dir, the question and the `project:` tag, and `effort` = the `analyst_effort`
