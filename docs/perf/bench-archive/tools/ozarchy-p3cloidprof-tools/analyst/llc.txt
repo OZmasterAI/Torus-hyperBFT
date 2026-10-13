@@ -1,0 +1,107 @@
+W2 exec thread only (perf record -t <exec tid> --no-inherit, 20 s), event counts per 1k val1 fills over W2, mean per arm
+fill.mem_io_local = demand data-cache fills from local DRAM (= LLC miss; LLC-load-misses unsupported on Zen 3)
+fill.ext_cache_local = demand fills from the other CCD's L3
+
+event                                        c0           c100   delta%   per-cell c0 | c100
+L1-dcache-load-misses                    291278         310551     +6.6   298727 302163 272943 | 307557 308819 315276
+cycles                                 13278496       15169861    +14.2   13421123 13682656 12731708 | 14982727 14939513 15587344
+fill.ext_cache_local                        225            275    +22.4   272 211 191 | 262 308 254
+fill.mem_io_local                         33084          37288    +12.7   34293 34203 30754 | 37133 36341 38390
+instructions                           15710251       19074323    +21.4   16041794 15815644 15273313 | 18957951 19039253 19225765
+
+L1-dcache-load-misses by cloid site (per 1k fills)
+  1 index          c0            5 c100         6822 delta        +6818
+  2 dup-check      c0         2015 c100        15158 delta       +13143
+  3 cleanup        c0           31 c100         2429 delta        +2397
+  none             c0       289227 c100       286142 delta        -3085
+  top leaf frames by |delta| (L1-dcache-load-misses)
+    c0         5022 c100         9889 delta        +4867  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs]
+    c0         7905 c100        12133 delta        +4227  spec_eq [library/core/src/array/equality.rs]
+    c0        20720 c100        17146 delta        -3575  realloc [?]
+    c0         4639 c100         7667 delta        +3028  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]
+    c0         5855 c100         3373 delta        -2483  cancel_batch::remove_targets [crates/torus-core/order_book/cancel_batch.rs]
+    c0         1943 c100           32 delta        -1911  {closure#2} [crates/torus-bridge/native_executor.rs]
+    c0         8117 c100         6536 delta        -1581  swap_bytes [library/core/src/num/uint_macros.rs]
+    c0         1801 c100         3086 delta        +1284  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]
+    c0         2535 c100         3776 delta        +1241  __KeccakF1600 [/home/oz/.cargo-target-p3cloid-ef812b02/release/build/sha3-asm-f64e649d80a3ba18/out/keccak1600-x86_64.S]
+    c0         5880 c100         4713 delta        -1167  <Order as borsh::ser::BorshSerialize>::serialize [crates/torus-core/order_book.rs]
+    c0         8619 c100         9723 delta        +1103  <NativeExecutor>::execute_batch_phases [crates/torus-bridge/native_executor.rs]
+    c0         5765 c100         4927 delta         -839  append_elements [library/alloc/src/vec/mod.rs]
+
+cycles by cloid site (per 1k fills)
+  1 index          c0            0 c100       981926 delta      +981926
+  2 dup-check      c0        36822 c100       875406 delta      +838584
+  3 cleanup        c0         3292 c100       182873 delta      +179581
+  none             c0     13238382 c100     13129657 delta      -108725
+  top leaf frames by |delta| (cycles)
+    c0       345963 c100       928770 delta      +582807  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs]
+    c0       661926 c100      1047056 delta      +385130  spec_eq [library/core/src/array/equality.rs]
+    c0       946241 c100      1316581 delta      +370340  __KeccakF1600 [/home/oz/.cargo-target-p3cloid-ef812b02/release/build/sha3-asm-f64e649d80a3ba18/out/keccak1600-x86_64.S]
+    c0       288888 c100       463900 delta      +175012  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]
+    c0         2219 c100        76113 delta       +73894  rotate_right [library/core/src/intrinsics/mod.rs]
+    c0       167762 c100        98686 delta       -69075  cancel_batch::remove_targets [crates/torus-core/order_book/cancel_batch.rs]
+    c0       173279 c100       119618 delta       -53661  swap_bytes [library/core/src/num/uint_macros.rs]
+    c0            0 c100        49993 delta       +49993  <hashbrown::map::HashMap<(Address, u128), (), alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs]
+    c0       282315 c100       240847 delta       -41467  copy_nonoverlapping [library/core/src/ptr/mod.rs]
+    c0        50912 c100        92337 delta       +41425  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]
+    c0       133831 c100       175087 delta       +41256  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]
+    c0        39571 c100         1204 delta       -38367  {closure#2} [crates/torus-bridge/native_executor.rs]
+
+fill.ext_cache_local by cloid site (per 1k fills)
+  1 index          c0            0 c100           22 delta          +22
+  2 dup-check      c0            0 c100           23 delta          +23
+  3 cleanup        c0            0 c100            6 delta           +6
+  none             c0          224 c100          224 delta           -0
+  top leaf frames by |delta| (fill.ext_cache_local)
+    c0           12 c100           29 delta          +17  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs]
+    c0            8 c100           18 delta          +11  spec_eq [library/core/src/array/equality.rs]
+    c0           16 c100           23 delta           +8  clone [library/core/src/option.rs]
+    c0            3 c100            7 delta           +4  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]
+    c0           26 c100           22 delta           -4  dealloc_nonnull [library/alloc/src/alloc.rs]
+    c0            3 c100            6 delta           +3  {closure#1} [crates/torus-bridge/native_executor.rs]
+    c0            0 c100            3 delta           +3  taker_margin_limit [crates/torus-bridge/native_executor.rs]
+    c0            0 c100            3 delta           +3  <foldhash::fast::RandomState as core::hash::BuildHasher>::hash_one [library/core/src/hash/mod.rs]
+    c0           16 c100           14 delta           -2  realloc [?]
+    c0            3 c100            0 delta           -2  {closure#2} [crates/torus-state/backend.rs]
+    c0            1 c100            3 delta           +2  call_once [library/core/src/ops/function.rs]
+    c0            3 c100            0 delta           -2  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]
+
+fill.mem_io_local by cloid site (per 1k fills)
+  1 index          c0            2 c100         2787 delta        +2785
+  2 dup-check      c0          532 c100         1493 delta         +961
+  3 cleanup        c0            9 c100          521 delta         +512
+  none             c0        32541 c100        32488 delta          -53
+  top leaf frames by |delta| (fill.mem_io_local)
+    c0         1068 c100         2350 delta        +1282  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs]
+    c0         1616 c100         2807 delta        +1191  spec_eq [library/core/src/array/equality.rs]
+    c0          548 c100         1161 delta         +614  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]
+    c0          484 c100            1 delta         -483  {closure#2} [crates/torus-bridge/native_executor.rs]
+    c0          803 c100         1137 delta         +334  extend [library/std/src/collections/hash/map.rs]
+    c0         1085 c100          906 delta         -178  cfree [?]
+    c0          671 c100          497 delta         -174  apply_cancel_all_many [crates/torus-core/order_book/cancel_batch.rs]
+    c0         1230 c100         1060 delta         -170  realloc [?]
+    c0           97 c100          241 delta         +144  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs]
+    c0          804 c100          947 delta         +143  taker_margin_limit [crates/torus-bridge/native_executor.rs]
+    c0           26 c100          160 delta         +134  rotate_right [library/core/src/intrinsics/mod.rs]
+    c0          744 c100          611 delta         -133  never_rests [crates/torus-bridge/native_executor.rs]
+
+instructions by cloid site (per 1k fills)
+  1 index          c0            0 c100       533454 delta      +533454
+  2 dup-check      c0        17719 c100       882224 delta      +864505
+  3 cleanup        c0         1345 c100       138239 delta      +136894
+  none             c0     15691186 c100     17520406 delta     +1829220
+  top leaf frames by |delta| (instructions)
+    c0      3515675 c100      5050540 delta     +1534865  __KeccakF1600 [/home/oz/.cargo-target-p3cloid-ef812b02/release/build/sha3-asm-f64e649d80a3ba18/out/keccak1600-x86_64.S]
+    c0       240111 c100       597963 delta      +357852  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs]
+    c0       673930 c100       985300 delta      +311371  spec_eq [library/core/src/array/equality.rs]
+    c0       251732 c100       454014 delta      +202282  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]
+    c0       230193 c100       132141 delta       -98051  cancel_batch::remove_targets [crates/torus-core/order_book/cancel_batch.rs]
+    c0       167839 c100       230053 delta       +62214  write [library/core/src/ptr/mod.rs]
+    c0       267015 c100       327439 delta       +60424  select_unpredictable [library/core/src/hint.rs]
+    c0       343422 c100       403551 delta       +60129  alloc [library/alloc/src/alloc.rs]
+    c0       106211 c100       162478 delta       +56267  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]
+    c0        51877 c100       106956 delta       +55079  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]
+    c0        33835 c100        85550 delta       +51715  <foldhash::fast::RandomState as core::hash::BuildHasher>::hash_one [library/core/src/hash/mod.rs]
+    c0       206404 c100       156424 delta       -49980  swap_bytes [library/core/src/num/uint_macros.rs]
+
+derived (exec thread, W2): c0: IPC 1.183, DRAM fills per 1k instr 2.106, L1 miss per 1k instr 18.54; c100: IPC 1.257, DRAM fills per 1k instr 1.955, L1 miss per 1k instr 16.28; 

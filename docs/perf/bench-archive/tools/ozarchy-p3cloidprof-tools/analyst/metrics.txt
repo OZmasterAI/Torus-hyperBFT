@@ -1,0 +1,50 @@
+
+== whole cell, mean over val0-2: ms per native block (_blk) and ms per 1k fills (_1k)
+metric                        c0      c100     delta       %  paired per round
+fpb                    44005.344 43423.916  -581.428    -1.3  r1 -3307.070  r2 +1467.748  r3 +95.037
+engine_blk               183.689   203.462   +19.773   +10.8  r1 +11.830  r2 +19.476  r3 +28.012
+engine_1k                  4.180     4.685    +0.505   +12.1  r1 +0.570  r2 +0.309  r3 +0.636
+engine_untimed_blk         9.268    33.747   +24.479  +264.1  r1 +24.495  r2 +23.242  r3 +25.700
+engine_untimed_1k          0.211     0.777    +0.566  +268.4  r1 +0.570  r2 +0.537  r3 +0.592
+phase1_actions_blk        37.433    38.791    +1.358    +3.6  r1 -0.514  r2 +1.539  r3 +3.049
+phase1_actions_1k          0.852     0.893    +0.041    +4.9  r1 +0.050  r2 +0.006  r3 +0.068
+phase_margin_blk          39.796    37.866    -1.929    -4.8  r1 -3.313  r2 -0.895  r3 -1.580
+phase_margin_1k            0.905     0.872    -0.033    -3.7  r1 -0.009  r2 -0.052  r3 -0.038
+phase_match_blk           21.006    20.726    -0.280    -1.3  r1 -1.049  r2 -0.543  r3 +0.752
+phase_match_1k             0.478     0.477    -0.001    -0.2  r1 +0.011  r2 -0.030  r3 +0.016
+phase_settle_blk          61.608    58.414    -3.195    -5.2  r1 -6.821  r2 -2.075  r3 -0.688
+phase_settle_1k            1.401     1.345    -0.056    -4.0  r1 -0.052  r2 -0.097  r3 -0.019
+
+== whole cell, val1 only (profiled node): ms per native block (_blk) and ms per 1k fills (_1k)
+metric                        c0      c100     delta       %  paired per round
+fpb                    44030.644 43450.188  -580.456    -1.3  r1 -3307.967  r2 +1469.552  r3 +97.048
+engine_blk               179.609   199.528   +19.919   +11.1  r1 +11.014  r2 +20.322  r3 +28.420
+engine_1k                  4.084     4.592    +0.508   +12.4  r1 +0.546  r2 +0.333  r3 +0.645
+engine_untimed_blk         9.106    33.368   +24.263  +266.5  r1 +23.884  r2 +23.400  r3 +25.504
+engine_untimed_1k          0.207     0.768    +0.561  +270.8  r1 +0.555  r2 +0.541  r3 +0.587
+phase1_actions_blk        36.332    38.187    +1.855    +5.1  r1 +0.181  r2 +2.632  r3 +2.751
+phase1_actions_1k          0.826     0.879    +0.053    +6.4  r1 +0.064  r2 +0.033  r3 +0.061
+phase_margin_blk          39.182    37.744    -1.438    -3.7  r1 -3.399  r2 -1.394  r3 +0.481
+phase_margin_1k            0.891     0.869    -0.022    -2.5  r1 -0.012  r2 -0.064  r3 +0.009
+phase_match_blk           20.776    20.359    -0.416    -2.0  r1 -1.748  r2 -0.728  r3 +1.226
+phase_match_1k             0.472     0.469    -0.004    -0.8  r1 -0.005  r2 -0.034  r3 +0.027
+phase_settle_blk          60.311    56.779    -3.532    -5.9  r1 -7.079  r2 -1.967  r3 -1.550
+phase_settle_1k            1.371     1.307    -0.064    -4.7  r1 -0.059  r2 -0.093  r3 -0.039
+
+== val1 W1 profile window (perf record running): ms per native block (_blk) and ms per 1k fills (_1k)
+metric                        c0      c100     delta       %  paired per round
+fpb                    47192.619 49667.564 +2474.945    +5.2  r1 +4171.591  r2 +5608.946  r3 -2355.701
+engine_blk               199.876   238.026   +38.150   +19.1  r1 +43.094  r2 +39.229  r3 +32.126
+engine_1k                  4.238     4.796    +0.558   +13.2  r1 +0.516  r2 +0.291  r3 +0.867
+engine_untimed_blk        10.025    40.141   +30.116  +300.4  r1 +28.634  r2 +29.964  r3 +31.750
+engine_untimed_1k          0.212     0.809    +0.597  +280.7  r1 +0.549  r2 +0.577  r3 +0.664
+phase1_actions_blk        42.775    43.744    +0.969    +2.3  r1 +2.879  r2 +1.004  r3 -0.976
+phase1_actions_1k          0.907     0.882    -0.026    -2.8  r1 -0.010  r2 -0.091  r3 +0.025
+phase_margin_blk          42.890    45.862    +2.973    +6.9  r1 +4.966  r2 +2.889  r3 +1.063
+phase_margin_1k            0.910     0.924    +0.014    +1.5  r1 +0.025  r2 -0.049  r3 +0.065
+phase_match_blk           22.794    25.790    +2.996   +13.1  r1 +2.078  r2 +2.172  r3 +4.737
+phase_match_1k             0.485     0.520    +0.035    +7.2  r1 +0.000  r2 -0.014  r3 +0.119
+phase_settle_blk          66.276    68.434    +2.158    +3.3  r1 +3.705  r2 +5.084  r3 -2.314
+phase_settle_1k            1.403     1.379    -0.024    -1.7  r1 -0.040  r2 -0.055  r3 +0.022
+
+per cell (whole, mean val0-2): ozarchy-p3cloidprof-300m-r1-c0 fills/blk 47493 untimed/1k 0.203 p1/1k 0.825 match/1k 0.461; ozarchy-p3cloidprof-300m-r1-c100 fills/blk 44186 untimed/1k 0.773 p1/1k 0.875 match/1k 0.471; ozarchy-p3cloidprof-300m-r2-c100 fills/blk 42690 untimed/1k 0.753 p1/1k 0.883 match/1k 0.462; ozarchy-p3cloidprof-300m-r2-c0 fills/blk 41222 untimed/1k 0.216 p1/1k 0.877 match/1k 0.492; ozarchy-p3cloidprof-300m-r3-c0 fills/blk 43301 untimed/1k 0.214 p1/1k 0.854 match/1k 0.482; ozarchy-p3cloidprof-300m-r3-c100 fills/blk 43396 untimed/1k 0.805 p1/1k 0.922 match/1k 0.498
