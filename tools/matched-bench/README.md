@@ -627,8 +627,10 @@ to `$RUN/cells.tsv` (header once; tab-separated
 `label arm rep rc agree md5_ok metric flag`):
 
 - `agree`: `yes` iff `validity.verdict` is ACCEPT and the agreement verdict is AGREE (raw result).
-- `md5_ok`: `summary.json` `binaries.torus_node_md5` and every running process's
-  `exe_md5` (`node-environ-trie.txt`, `node-restart-env.txt`) equal the arm's staged md5.
+- `md5_ok`: every running process's `exe_md5` (`node-environ-trie.txt`,
+  `node-restart-env.txt`) equals the arm's staged md5; at least one process record is
+  required. `summary.json` `binaries.torus_node_md5` is checked too when present; a
+  missing one is skipped (the process records are what actually ran).
 - `metric`: matched/s from the analysis row (`a-cells.py` `ms`), else
   `summary.json` `headline.matched_s_avg`, else 0.
 - `flag`: `ok` or `bad:<reasons>`. Reasons are comma-joined, in this order:
