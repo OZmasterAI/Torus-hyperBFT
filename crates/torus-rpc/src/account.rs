@@ -10,7 +10,9 @@
 //! - withdraw check (`check_withdrawal_margin` + the Lockbox cash check):
 //!   [`AccountView::withdrawal_allowed`] and `amount <= available`;
 //! - liquidation (`liq_view` + `liquidation::classify`): maintenance with
-//!   positions marked only in LISTED markets.
+//!   positions marked only in LISTED markets; `torus_getPosition`'s cross
+//!   `liquidationPrice` ([`cross_liquidation_price`], R23) is the mark at
+//!   which that check flips.
 //!
 //! Marks follow the executor's rule (`usable_mark`): the aggregate while
 //! usable at `now`, else none (the position is valued at entry). `now` is
@@ -25,9 +27,10 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::Address;
 use torus_core::error::CoreError;
+use torus_core::liquidation::{classify, Health};
 use torus_core::margin::{market_margin_config, AccountView, MarginTier};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::position::{MarginType, PositionManager};
+use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
 use torus_state::cf::CF_NATIVE_MARKETS;
 use torus_state::StateDb;
 use torus_types::{FixedPoint, MarketId};
@@ -51,6 +54,78 @@ pub struct AccountFigures {
     pub free_margin: FixedPoint,
 }
 
+/// Per market the trader holds: its tiers (`load_margin_configs`: a row
+/// under an 8-byte key, `None` = default 20x), whether it is listed (the
+/// liquidation step marks only listed markets) and its usable mark.
+struct Market {
+    tiers: Option<Vec<MarginTier>>,
+    listed: bool,
+    mark: Option<FixedPoint>,
+}
+
+/// The rows every figure is computed from: one balance read, the trader's
+/// positions and one [`Market`] per market it holds.
+struct AccountRows {
+    bal: NativeBalance,
+    positions: Vec<Position>,
+    markets: BTreeMap<MarketId, Market>,
+}
+
+impl AccountRows {
+    fn read(state: &StateDb, trader: &Address, now: Option<u64>) -> Result<Self, CoreError> {
+        let pm = PositionManager::new(state.clone());
+        let bal = pm.get_native_balance(trader)?;
+        let positions = pm.positions_for_trader(trader)?;
+        let oracle = OracleManager::new(state.clone(), OracleConfig::default());
+        let mut markets: BTreeMap<MarketId, Market> = BTreeMap::new();
+        for p in &positions {
+            if markets.contains_key(&p.market_id) {
+                continue;
+            }
+            let row = state.get_cf_raw(CF_NATIVE_MARKETS, &p.market_id.to_be_bytes())?;
+            let mark = match now {
+                Some(t) => oracle
+                    .get_price_opt(p.market_id, t)?
+                    .and_then(|op| op.usable()),
+                None => None,
+            };
+            markets.insert(
+                p.market_id,
+                Market {
+                    tiers: row
+                        .as_deref()
+                        .and_then(|r| market_margin_config(p.market_id, r))
+                        .map(|c| c.tiers),
+                    listed: row.is_some(),
+                    mark,
+                },
+            );
+        }
+        Ok(Self {
+            bal,
+            positions,
+            markets,
+        })
+    }
+
+    fn tiers(&self, m: MarketId) -> Option<&[MarginTier]> {
+        self.markets.get(&m).and_then(|x| x.tiers.as_deref())
+    }
+
+    /// The executor's mark (placement, withdraw): any market's usable mark.
+    fn mark(&self, m: MarketId) -> Option<FixedPoint> {
+        self.markets.get(&m).and_then(|x| x.mark)
+    }
+
+    /// The liquidation step's mark: listed markets only.
+    fn liq_mark(&self, m: MarketId) -> Option<FixedPoint> {
+        self.markets
+            .get(&m)
+            .filter(|x| x.listed)
+            .and_then(|x| x.mark)
+    }
+}
+
 /// [`AccountFigures`] of `trader` at block time `now` (`None`: no usable
 /// mark, every position valued at entry).
 pub fn account_figures(
@@ -59,56 +134,10 @@ pub fn account_figures(
     now: Option<u64>,
 ) -> Result<AccountFigures, CoreError> {
     let of = |_| CoreError::Overflow("account margin overflows i128".into());
-    let pm = PositionManager::new(state.clone());
-    let bal = pm.get_native_balance(trader)?;
-    let positions = pm.positions_for_trader(trader)?;
-    let oracle = OracleManager::new(state.clone(), OracleConfig::default());
-
-    // Per market the trader holds: its tiers (`load_margin_configs`: a row
-    // under an 8-byte key, `None` = default 20x), whether it is listed (the
-    // liquidation step marks only listed markets) and its usable mark.
-    struct Market {
-        tiers: Option<Vec<MarginTier>>,
-        listed: bool,
-        mark: Option<FixedPoint>,
-    }
-    let mut markets: BTreeMap<MarketId, Market> = BTreeMap::new();
-    for p in &positions {
-        if markets.contains_key(&p.market_id) {
-            continue;
-        }
-        let row = state.get_cf_raw(CF_NATIVE_MARKETS, &p.market_id.to_be_bytes())?;
-        let mark = match now {
-            Some(t) => oracle
-                .get_price_opt(p.market_id, t)?
-                .and_then(|op| op.usable()),
-            None => None,
-        };
-        markets.insert(
-            p.market_id,
-            Market {
-                tiers: row
-                    .as_deref()
-                    .and_then(|r| market_margin_config(p.market_id, r))
-                    .map(|c| c.tiers),
-                listed: row.is_some(),
-                mark,
-            },
-        );
-    }
-    let tiers = |m: MarketId| markets.get(&m).and_then(|x| x.tiers.as_deref());
-    let view = AccountView::build(
-        &bal,
-        &positions,
-        |m| markets.get(&m).and_then(|x| x.mark),
-        tiers,
-    )?;
-    let liq_view = AccountView::build(
-        &bal,
-        &positions,
-        |m| markets.get(&m).filter(|x| x.listed).and_then(|x| x.mark),
-        tiers,
-    )?;
+    let a = AccountRows::read(state, trader, now)?;
+    let (bal, positions) = (&a.bal, &a.positions);
+    let view = AccountView::build(bal, positions, |m| a.mark(m), |m| a.tiers(m))?;
+    let liq_view = AccountView::build(bal, positions, |m| a.liq_mark(m), |m| a.tiers(m))?;
 
     let mut total_margin_used = bal.order_margin.checked_add(view.position_im).map_err(of)?;
     for p in positions
@@ -137,14 +166,85 @@ pub fn account_figures(
 }
 
 /// R23: the cross liquidation price of `trader`'s position in `market` at
-/// block time `now`. RED stub.
+/// block time `now`: the mark of `market` at which the account's equity
+/// meets its maintenance margin, every other market's mark held at what the
+/// liquidation step uses now (listed and usable, else entry).
+///
+/// Nothing is re-derived: each candidate mark is valued with the engine's
+/// [`AccountView::build`] (liquidation marks) and [`classify`]; the answer
+/// is the boundary between `Healthy` and liquidatable, found by bisection on
+/// raw units. With the flat per-market tier every listed market has,
+/// equity − MM is monotone in the mark (UPnL moves by the notional, MM by at
+/// most half of it), so the boundary is unique:
+/// - long: the LOWEST mark still healthy (`equity >= MM`); one raw unit
+///   below, the step liquidates;
+/// - short: the HIGHEST mark still healthy; one raw unit above, it
+///   liquidates.
+///
+/// `None` when no mark of `market` crosses maintenance: no Cross position
+/// there; the market is not listed (the step never marks it); the account
+/// holds a non-Cross position (the step does not value such an account); a
+/// long healthy even at mark 0; a short liquidatable even at mark 0 (it is
+/// liquidatable at every mark); or no crossing below the i128 range.
 pub fn cross_liquidation_price(
-    _state: &StateDb,
-    _trader: &Address,
-    _market: MarketId,
-    _now: Option<u64>,
+    state: &StateDb,
+    trader: &Address,
+    market: MarketId,
+    now: Option<u64>,
 ) -> Result<Option<FixedPoint>, CoreError> {
-    Ok(None)
+    let a = AccountRows::read(state, trader, now)?;
+    let Some(pos) = a.positions.iter().find(|p| p.market_id == market) else {
+        return Ok(None);
+    };
+    if pos.size <= FixedPoint::ZERO
+        || a.positions
+            .iter()
+            .any(|p| p.margin_type != MarginType::Cross)
+        || !a.markets.get(&market).is_some_and(|x| x.listed)
+    {
+        return Ok(None);
+    }
+    // As the step decides: liquidatable iff valued (no overflow) and not
+    // Healthy. An overflow is skipped by the step, so it is not liquidatable.
+    let liquidatable = |raw: i128| {
+        let px = FixedPoint::from_raw(raw);
+        AccountView::build(
+            &a.bal,
+            &a.positions,
+            |m| if m == market { Some(px) } else { a.liq_mark(m) },
+            |m| a.tiers(m),
+        )
+        .ok()
+        .and_then(|v| classify(&v))
+        .is_some_and(|h| h != Health::Healthy)
+    };
+    // Long: liquidatable below the boundary; short: above it. Mark 0 must be
+    // on the liquidatable side for a long and on the healthy side for a short.
+    let long = pos.is_long;
+    let at_zero = liquidatable(0);
+    if at_zero != long {
+        return Ok(None);
+    }
+    // A far end on the other side: double from the entry price.
+    let (mut lo, mut hi) = (0i128, pos.entry_price.raw().max(1));
+    while liquidatable(hi) == at_zero {
+        lo = hi;
+        hi = match hi.checked_mul(2) {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+    }
+    // liquidatable(lo) == at_zero != liquidatable(hi).
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if liquidatable(mid) == at_zero {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // Long: `hi` is the lowest healthy mark; short: `lo` the highest.
+    Ok(Some(FixedPoint::from_raw(if long { hi } else { lo })))
 }
 
 #[cfg(test)]
@@ -153,7 +253,6 @@ mod tests {
     use alloy_primitives::U256;
     use torus_bridge::native_executor::{NativeExecContext, NativeExecutor};
     use torus_core::margin::placement_need;
-    use torus_core::position::NativeBalance;
     use torus_types::{NativeAction, OrderType, PlaceOrderParams, TimeInForce};
 
     fn addr(n: u8) -> Address {
