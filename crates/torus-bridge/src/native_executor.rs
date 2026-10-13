@@ -4158,6 +4158,10 @@ mod cancel_batch_exec_tests;
 #[path = "cloid_index_tests.rs"]
 mod cloid_index_tests;
 
+#[cfg(test)]
+#[path = "cloid_equiv_tests.rs"]
+mod cloid_equiv_tests;
+
 #[cfg(any(test, feature = "test-reference-paths"))]
 #[path = "reference_paths.rs"]
 mod reference_paths;
