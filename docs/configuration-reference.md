@@ -48,6 +48,36 @@
 |----------|-------------|
 | `RUST_LOG` | Overridden by `--log-level`. Controls tracing filter. Examples: `info`, `torus_consensus=debug,info`, `trace`. |
 
+### Native execution admission (experimental)
+
+`TORUS_ADMISSION_EXEC_HORIZON_MS` defaults to `0` (disabled). Set `2000` to
+trial a two-second native execution budget. This local overload control counts
+pooled actions and committed work, including missing-body and full-channel
+parks, without counting a pooled action again when it commits. Non-cancel
+submissions that exceed the budget receive a retryable busy/backlog error.
+Cancels retain their existing signature, sender, memory and pool limits and
+bypass this additional gate. Accepted work keeps the existing block selection
+caps and execution order.
+
+Work is estimated as one unit per native action plus one per placement order,
+so a batch of 400 orders costs 401 units. Capacity follows work completed per
+second of executor service time over a ten-second window. Before samples are
+available (or after they expire), the budget is one reference-size block; its
+steady minimum admits one maximum legal batch. Missing compact bodies reserve
+one maximum batch per hash until materialization provides an exact work count.
+
+This is an approximate native workload budget, not an end-to-end latency
+bound: matching depth, cancel-all cost, EVM gas and downstream visibility are
+not represented by these weights. Compare load sweeps against the disabled
+baseline before changing defaults. `TORUS_ADMISSION_HORIZON_MS` retains its
+existing independent commit-rate pool limit (default 20000 ms).
+
+Prometheus exposes `torus_native_exec_admission_work` and
+`torus_native_exec_admission_limit_work` (both zero when disabled). Atomic
+post-verification rejects use `reason="exec_backlog"` on
+`torus_rpc_submit_admit_rejects_total`; the shared early shedding path keeps
+`reason="backlog_preverify"`.
+
 ## Port Assignments
 
 | Port | Protocol | Service | Configurable Via |

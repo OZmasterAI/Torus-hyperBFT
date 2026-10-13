@@ -45,6 +45,8 @@ pub struct Metrics {
     // Mempool metrics
     pub mempool_evm_size: Gauge,
     pub mempool_native_size: Gauge,
+    pub native_exec_admission_work: Gauge,
+    pub native_exec_admission_limit_work: Gauge,
 
     // Network metrics
     pub peers_connected: Gauge,
@@ -803,6 +805,19 @@ impl Metrics {
             "torus_mempool_native_size",
             "Number of pending native actions",
             mempool_native_size.clone(),
+        );
+
+        let native_exec_admission_work = Gauge::default();
+        registry.register(
+            "torus_native_exec_admission_work",
+            "Outstanding native work units in pool and committed execution (opt-in)",
+            native_exec_admission_work.clone(),
+        );
+        let native_exec_admission_limit_work = Gauge::default();
+        registry.register(
+            "torus_native_exec_admission_limit_work",
+            "Native execution-time admission budget in work units (opt-in)",
+            native_exec_admission_limit_work.clone(),
         );
 
         let peers_connected = Gauge::default();
@@ -1954,6 +1969,8 @@ impl Metrics {
             state_root_compute_seconds,
             mempool_evm_size,
             mempool_native_size,
+            native_exec_admission_work,
+            native_exec_admission_limit_work,
             peers_connected,
             db_size_bytes,
             epoch_number,

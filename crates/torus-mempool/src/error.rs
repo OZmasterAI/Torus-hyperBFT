@@ -34,6 +34,8 @@ pub enum MempoolError {
     State(String),
     /// Native action pool is full.
     NativePoolFull,
+    /// Native work exceeds the local execution-time admission budget.
+    NativeExecutionBacklogged,
     /// Duplicate native action (same sender + action content + nonce).
     DuplicateNativeAction,
     /// Sender has too many pending native actions in the pool.
@@ -84,6 +86,9 @@ impl fmt::Display for MempoolError {
             }
             Self::State(e) => write!(f, "state error: {e}"),
             Self::NativePoolFull => write!(f, "native action pool full"),
+            Self::NativeExecutionBacklogged => {
+                write!(f, "native execution backlog full, retry later")
+            }
             Self::DuplicateNativeAction => write!(f, "duplicate native action"),
             Self::NativeSenderQueueFull { sender } => {
                 write!(f, "too many pending native actions for {sender}")

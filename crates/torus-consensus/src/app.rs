@@ -1480,6 +1480,9 @@ impl ExecutionContext {
                     applied,
                     "execution pipeline: already applied, skipping"
                 );
+                if let Some(ref mempool) = self.mempool {
+                    mempool.complete_native_execution(height, None);
+                }
                 return;
             }
         }
@@ -2350,6 +2353,11 @@ impl ExecutionContext {
             }
         }
 
+        if !self.exec_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(ref mempool) = self.mempool {
+                mempool.complete_native_execution(height, Some(block_timer.elapsed()));
+            }
+        }
         tracing::info!(height, "execution pipeline: block done");
     }
 }
@@ -5287,6 +5295,48 @@ impl TorusApp {
         (native, evm)
     }
 
+    /// Count committed bodies even while they are missing or waiting for a
+    /// full execution channel. Recovered bodies refine estimates before dispatch.
+    fn reserve_native_execution(&self, height: u64, source: &ExecSource) {
+        let Some(ref mempool) = self.mempool else {
+            return;
+        };
+        let exact = matches!(source, ExecSource::Ready(_));
+        if !mempool.native_execution_admission_enabled()
+            || !mempool.native_execution_registration_needed(height, exact)
+        {
+            return;
+        }
+        let (hashes, work, exact) = match source {
+            ExecSource::Ready(block) => {
+                let mut scratch = Vec::new();
+                let hashes = block
+                    .native_actions
+                    .iter()
+                    .map(|a| torus_types::compute_action_hash_with_scratch(a, &mut scratch))
+                    .collect();
+                let work = block
+                    .native_actions
+                    .iter()
+                    .map(|a| torus_mempool::execution_admission::native_work(&a.action))
+                    .fold(0u64, u64::saturating_add);
+                (hashes, work, true)
+            }
+            ExecSource::Compact(block) => (
+                block.native_action_hashes.clone(),
+                (block.native_action_hashes.len() as u64)
+                    .saturating_mul(1 + torus_types::NATIVE_ORDERS_PER_BATCH_CAP as u64),
+                false,
+            ),
+            ExecSource::Durable(_) => (
+                Vec::new(),
+                Mempool::native_execution_bootstrap_work(),
+                false,
+            ),
+        };
+        mempool.register_native_execution(height, hashes, work, exact);
+    }
+
     /// Regime-B strict-order execution gate. Route a committed block into the
     /// execution pipeline while GUARANTEEING it is executed strictly in ascending
     /// height with no gaps — the only correct behaviour, because native matching
@@ -5318,6 +5368,8 @@ impl TorusApp {
         if height < next {
             return;
         }
+
+        self.reserve_native_execution(height, &source);
 
         // HOT PATH: no outstanding hole and this is exactly the next height.
         if self.deferred_exec.is_empty() && height == next {
@@ -5569,19 +5621,45 @@ impl TorusApp {
                 );
             }
 
-            if !torus_block.native_actions.is_empty() {
-                if let Some(ref mempool) = self.mempool {
-                    let mut scratch = Vec::new();
-                    let hashes: Vec<torus_types::B256> = torus_block
-                        .native_actions
-                        .iter()
-                        .map(|action| torus_types::compute_action_hash_with_scratch(action, &mut scratch))
-                        .collect();
-                    let prune_timer = std::time::Instant::now();
-                    mempool.remove_committed_native(&hashes);
-                    if let Some(ref m) = self.metrics {
-                        m.mempool_remove_committed_seconds
-                            .observe(prune_timer.elapsed().as_secs_f64());
+            if let Some(ref mempool) = self.mempool {
+                if mempool.native_execution_admission_enabled()
+                    || !torus_block.native_actions.is_empty()
+                {
+                    let hashes = mempool
+                        .native_execution_admission_enabled()
+                        .then(|| mempool.native_execution_hashes(height))
+                        .flatten()
+                        .filter(|hashes| hashes.len() == torus_block.native_actions.len())
+                        .unwrap_or_else(|| {
+                            let mut scratch = Vec::new();
+                            torus_block
+                                .native_actions
+                                .iter()
+                                .map(|action| {
+                                    torus_types::compute_action_hash_with_scratch(
+                                        action,
+                                        &mut scratch,
+                                    )
+                                })
+                                .collect()
+                        });
+                    if mempool.native_execution_admission_enabled() {
+                        let work = torus_block
+                            .native_actions
+                            .iter()
+                            .map(|a| torus_mempool::execution_admission::native_work(&a.action))
+                            .fold(0u64, u64::saturating_add);
+                        mempool.register_native_execution(height, hashes.clone(), work, true);
+                    }
+                    // Preserve the legacy commit-rate estimator: empty blocks
+                    // were never fed into its native-action sample window.
+                    if !hashes.is_empty() {
+                        let prune_timer = std::time::Instant::now();
+                        mempool.remove_committed_native(&hashes);
+                        if let Some(ref m) = self.metrics {
+                            m.mempool_remove_committed_seconds
+                                .observe(prune_timer.elapsed().as_secs_f64());
+                        }
                     }
                 }
             }
@@ -5686,6 +5764,7 @@ impl TorusApp {
     /// fabricate a heal-hole from perfectly good data). Flag off ⇒ a verbatim
     /// insert, bit-identical to the pre-rank-2 buffer.
     fn park_deferred(&mut self, height: u64, source: ExecSource, slashes: Vec<PendingSlash>) {
+        self.reserve_native_execution(height, &source);
         let (source, ready_bytes) = match source {
             ExecSource::Ready(block) if nonblocking_exec_dispatch() => {
                 let sz = bincode::serialized_size(&block)
@@ -6152,6 +6231,128 @@ mod exec_dispatch_tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(cap);
         app.exec_tx = Some(tx);
         rx
+    }
+
+    #[test]
+    fn execution_admission_counts_full_channel_and_missing_body_once() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        let mut app = TorusApp::stub();
+        let rx = swap_exec_channel(&mut app, 1);
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig {
+                native_admission_horizon_ms: 0,
+                native_exec_admission_horizon_ms: 2000,
+                ..Default::default()
+            },
+        ));
+        app.mempool = Some(mempool.clone());
+        let first = block(1, vec![signed(7, 1)]);
+        let second = block(2, vec![signed(7, 2)]);
+        let third_action = signed(7, 3);
+        let third = CompactBlock::from_block(&block(3, vec![third_action.clone()]));
+        app.enqueue_for_execution(1, ExecSource::Ready(first), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(second.clone()), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(second), vec![]);
+        app.enqueue_for_execution(3, ExecSource::Compact(third.clone()), vec![]);
+        app.enqueue_for_execution(3, ExecSource::Compact(third), vec![]);
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .committed_work,
+            1027
+        );
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 1);
+        mempool.complete_native_execution(1, None);
+        app.drain_exec_queue();
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 2);
+        mempool.complete_native_execution(2, None);
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .committed_work,
+            1025
+        );
+        assert!(app.deferred_exec.contains_key(&3));
+        mempool.mirror_to_da(&third_action);
+        mempool.flush_da_mirrors();
+        app.drain_exec_queue();
+        assert_eq!(rx.recv().unwrap().torus_block.header.height, 3);
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .committed_work,
+            1
+        );
+        mempool.complete_native_execution(3, None);
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .outstanding_work,
+            0
+        );
+        clear_dispatch_env();
+    }
+
+    #[test]
+    fn execution_admission_refines_recovered_body_before_dispatch() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        let mut app = TorusApp::stub();
+        let _rx = swap_exec_channel(&mut app, 1);
+        let mempool = Arc::new(Mempool::new(
+            app.state_db.clone(),
+            torus_mempool::MempoolConfig {
+                native_admission_horizon_ms: 0,
+                native_exec_admission_horizon_ms: 2000,
+                ..Default::default()
+            },
+        ));
+        app.mempool = Some(mempool.clone());
+        app.enqueue_for_execution(1, ExecSource::Ready(block(1, vec![])), vec![]);
+        app.enqueue_for_execution(2, ExecSource::Ready(block(2, vec![])), vec![]);
+        let recovered = block(3, vec![signed(7, 3)]);
+        app.enqueue_for_execution(
+            3,
+            ExecSource::Compact(CompactBlock::from_block(&recovered)),
+            vec![],
+        );
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .committed_work,
+            1025
+        );
+        app.enqueue_for_execution(3, ExecSource::Ready(recovered.clone()), vec![]);
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .committed_work,
+            1
+        );
+        app.enqueue_for_execution(3, ExecSource::Ready(recovered), vec![]);
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .committed_work,
+            1
+        );
+        assert_eq!(
+            app.exec_next_height,
+            Some(2),
+            "refinement must not bypass the full channel"
+        );
+        clear_dispatch_env();
     }
 
     #[test]
@@ -9840,6 +10041,47 @@ mod crash_recovery_tests {
             read_native_applied_height(&state_db),
             Some(3),
             "empty block should be marked as applied"
+        );
+    }
+
+    #[test]
+    fn execution_admission_releases_after_execution_and_already_applied_skip() {
+        let (config, state_db) = make_test_config_and_db();
+        let cfg = torus_mempool::MempoolConfig {
+            native_admission_horizon_ms: 0,
+            native_exec_admission_horizon_ms: 2000,
+            ..Default::default()
+        };
+        let mempool = Arc::new(Mempool::new(state_db.clone(), cfg.clone()));
+        let block = make_block(1, vec![sign_claim_rewards(1)]);
+        mempool.register_native_execution(1, vec![], 1, true);
+        let ctx = make_exec_ctx_with_mempool(&config, &state_db, Some(mempool.clone()), false);
+        ctx.execute_committed_block(block.clone(), vec![]);
+        assert!(!ctx.exec_failed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&state_db), Some(1));
+        assert_eq!(
+            mempool
+                .native_execution_admission_snapshot()
+                .unwrap()
+                .committed_work,
+            0
+        );
+
+        // Fresh local accounting sees a redelivered height after restart.
+        let replay_pool = Arc::new(Mempool::new(state_db.clone(), cfg));
+        let bootstrap = Mempool::native_execution_bootstrap_work();
+        replay_pool.register_native_execution(1, vec![], bootstrap, false);
+        let replay_ctx =
+            make_exec_ctx_with_mempool(&config, &state_db, Some(replay_pool.clone()), false);
+        replay_ctx.execute_committed_block(block, vec![]);
+        assert!(!replay_ctx
+            .exec_failed
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let snapshot = replay_pool.native_execution_admission_snapshot().unwrap();
+        assert_eq!(snapshot.committed_work, 0);
+        assert_eq!(
+            snapshot.limit_work, bootstrap,
+            "skip must not train service capacity"
         );
     }
 

@@ -9,6 +9,7 @@ use alloy_primitives::{Address, B256};
 use torus_types::{compute_action_hash, NativeAction, SignedNativeAction};
 
 use crate::error::MempoolError;
+use crate::execution_admission::{native_work, ExecutionAdmission};
 
 /// Selection-order key (T2.3): `(cancel-priority, sender, nonce, seq)`.
 ///
@@ -78,6 +79,7 @@ pub(crate) struct NativePool {
     max_size: usize,
     max_per_sender: usize,
     max_per_block: usize,
+    pub(crate) execution_admission: Option<ExecutionAdmission>,
 }
 
 impl NativePool {
@@ -92,6 +94,7 @@ impl NativePool {
             max_size,
             max_per_sender,
             max_per_block,
+            execution_admission: None,
         }
     }
 
@@ -197,6 +200,20 @@ impl NativePool {
             return Err(MempoolError::NativeSenderQueueFull { sender });
         }
 
+        // Check under the same write lock as insertion, so concurrent RPC
+        // batches cannot overshoot. Cancels retain their existing limits.
+        if !is_cancel
+            && self.execution_admission.as_ref().is_some_and(|admission| {
+                admission.rejects(
+                    &action_hash,
+                    native_work(&action.action),
+                    std::time::Instant::now(),
+                )
+            })
+        {
+            return Err(MempoolError::NativeExecutionBacklogged);
+        }
+
         // Pool size cap with priority-based eviction.
         if self.entries.len() >= self.max_size {
             if is_cancel {
@@ -220,6 +237,9 @@ impl NativePool {
         let key: SortKey = (u8::from(!is_cancel), sender, action.nonce, seq);
         self.hash_index.entry(action_hash).or_default().push(key);
         self.expiry_index.insert(expiry_key(&key));
+        if let Some(admission) = self.execution_admission.as_mut() {
+            admission.pool_insert(action_hash, native_work(&action.action));
+        }
         self.entries.insert(
             key,
             NativePoolEntry {
@@ -241,6 +261,9 @@ impl NativePool {
     /// The single choke point for index maintenance on every removal path.
     fn remove_entry_by_key(&mut self, key: &SortKey) -> Option<NativePoolEntry> {
         let entry = self.entries.remove(key)?;
+        if let Some(admission) = self.execution_admission.as_mut() {
+            admission.pool_remove(&entry.action_hash);
+        }
         self.expiry_index.remove(&expiry_key(key));
         self.seen.remove(&(entry.sender, entry.action_hash));
         self.dec_sender_count(&entry.sender);
@@ -565,6 +588,118 @@ mod tests {
             nonce,
             signature: sig(),
         }
+    }
+
+    #[test]
+    fn execution_budget_weights_batches_and_preserves_cancel_priority() {
+        use torus_types::{FixedPoint, OrderType, PlaceOrderParams, TimeInForce};
+        let now = std::time::Instant::now();
+        let mut pool = NativePool::new(10, 10, 10);
+        pool.execution_admission = Some(ExecutionAdmission::new(2000, 5, 1));
+        let sender = Address::repeat_byte(1);
+        let order = PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(10 * FixedPoint::SCALE),
+            quantity: FixedPoint::ONE,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        assert!(matches!(
+            pool.insert(
+                sender,
+                make_action(1, NativeAction::PlaceOrderBatch(vec![order.clone(); 5]))
+            ),
+            Err(MempoolError::NativeExecutionBacklogged)
+        ));
+        let hash = pool
+            .insert(
+                sender,
+                make_action(2, NativeAction::PlaceOrderBatch(vec![order; 4])),
+            )
+            .unwrap();
+        pool.execution_admission
+            .as_mut()
+            .unwrap()
+            .register(1, vec![hash], 5, true);
+        pool.remove_committed(&[hash]);
+        assert_eq!(pool.size(), 0, "committed work outlives pool entries");
+        assert!(matches!(
+            pool.insert(sender, make_action(3, NativeAction::ClaimRewards)),
+            Err(MempoolError::NativeExecutionBacklogged)
+        ));
+        pool.insert(
+            sender,
+            make_action(4, NativeAction::CancelOrder { order_id: 1 }),
+        )
+        .unwrap();
+        pool.insert(
+            sender,
+            make_action(5, NativeAction::CancelAllOrders { market_id: None }),
+        )
+        .unwrap();
+        assert_eq!(
+            pool.select_for_block(10).len(),
+            2,
+            "accepted cancels still get proposed"
+        );
+        pool.drain(10);
+        assert_eq!(
+            pool.execution_admission
+                .as_ref()
+                .unwrap()
+                .snapshot(now)
+                .outstanding_work,
+            5
+        );
+        pool.execution_admission
+            .as_mut()
+            .unwrap()
+            .complete(1, None, now);
+        pool.insert(sender, make_action(6, NativeAction::ClaimRewards))
+            .unwrap();
+        assert_eq!(
+            pool.execution_admission
+                .as_ref()
+                .unwrap()
+                .snapshot(now)
+                .outstanding_work,
+            1
+        );
+    }
+
+    #[test]
+    fn execution_budget_removals_and_cancel_eviction_release_pool_work() {
+        let now = std::time::Instant::now();
+        let mut pool = NativePool::new(1, 10, 10);
+        pool.execution_admission = Some(ExecutionAdmission::new(2000, 100, 1));
+        let sender = Address::repeat_byte(1);
+        pool.insert(sender, make_action(1, NativeAction::ClaimRewards))
+            .unwrap();
+        pool.insert(
+            sender,
+            make_action(2, NativeAction::CancelOrder { order_id: 1 }),
+        )
+        .unwrap();
+        assert_eq!(
+            pool.execution_admission
+                .as_ref()
+                .unwrap()
+                .snapshot(now)
+                .outstanding_work,
+            1
+        );
+        pool.drain(10);
+        assert_eq!(
+            pool.execution_admission
+                .as_ref()
+                .unwrap()
+                .snapshot(now)
+                .outstanding_work,
+            0
+        );
     }
 
     #[test]

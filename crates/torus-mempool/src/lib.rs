@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod evm_pool;
+pub mod execution_admission;
 pub mod native_pool;
 pub mod rate_limit;
 pub mod validate;
@@ -87,6 +88,9 @@ pub struct MempoolConfig {
     pub native_admission_horizon_ms: u64,
     /// The admission limit never drops below this many pooled actions.
     pub native_admission_floor: usize,
+    /// Local native execution-time budget. 0 disables (default).
+    /// `TORUS_ADMISSION_EXEC_HORIZON_MS`; 2000 is a candidate for load testing.
+    pub native_exec_admission_horizon_ms: u64,
 }
 
 impl Default for MempoolConfig {
@@ -107,6 +111,10 @@ impl Default for MempoolConfig {
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
             native_admission_horizon_ms: rate_limit::admission_horizon_ms(),
             native_admission_floor: rate_limit::admission_floor(),
+            native_exec_admission_horizon_ms: std::env::var("TORUS_ADMISSION_EXEC_HORIZON_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -172,11 +180,18 @@ pub struct Mempool {
 impl Mempool {
     /// Create a new mempool backed by the given state database.
     pub fn new(state: StateDb, config: MempoolConfig) -> Self {
-        let native_pool = native_pool::NativePool::new(
+        let mut native_pool = native_pool::NativePool::new(
             config.native_pool_max_size,
             config.native_per_sender_cap,
             config.native_per_block_cap,
         );
+        if config.native_exec_admission_horizon_ms != 0 {
+            native_pool.execution_admission = Some(execution_admission::ExecutionAdmission::new(
+                config.native_exec_admission_horizon_ms,
+                Self::native_execution_bootstrap_work(),
+                1 + torus_types::NATIVE_ORDERS_PER_BATCH_CAP as u64,
+            ));
+        }
         // DA store shares the same RocksDB handle; every native-action body the
         // mempool sees is mirrored here durably (decoupled from the nonce gate).
         let da_store = NativeDaStore::new(state.clone());
@@ -228,11 +243,85 @@ impl Mempool {
         )
     }
 
-    /// True when the native pool already holds at least the admission limit:
-    /// new non-cancels would likely expire before inclusion.
+    /// True when the pool or committed execution work reaches an admission
+    /// limit. RPC uses this to shed new non-cancels before verification.
     pub fn native_admission_backlogged(&self) -> bool {
-        self.native_admission_limit()
-            .is_some_and(|limit| self.native.read().unwrap().size() >= limit)
+        let legacy_limit = self.native_admission_limit();
+        let pool = self.native.read().unwrap();
+        legacy_limit.is_some_and(|limit| pool.size() >= limit)
+            || pool.execution_admission.as_ref().is_some_and(|admission| {
+                let snapshot = admission.snapshot(std::time::Instant::now());
+                snapshot.outstanding_work >= snapshot.limit_work
+            })
+    }
+
+    pub fn native_execution_admission_enabled(&self) -> bool {
+        self.config.native_exec_admission_horizon_ms != 0
+    }
+
+    /// One reference-size block, before any execution samples are available.
+    pub fn native_execution_bootstrap_work() -> u64 {
+        (rate_limit::native_total_block_cap() as u64)
+            .saturating_mul(1 + rate_limit::BLOCK_CAP_BUNDLE_REF_BATCH as u64)
+    }
+
+    pub fn native_execution_admission_snapshot(
+        &self,
+    ) -> Option<execution_admission::ExecutionAdmissionSnapshot> {
+        self.native
+            .read()
+            .unwrap()
+            .execution_admission
+            .as_ref()
+            .map(|admission| admission.snapshot(std::time::Instant::now()))
+    }
+
+    pub fn native_execution_registration_needed(&self, height: u64, exact: bool) -> bool {
+        self.native
+            .read()
+            .unwrap()
+            .execution_admission
+            .as_ref()
+            .is_some_and(|admission| admission.registration_needed(height, exact))
+    }
+
+    pub fn native_execution_hashes(&self, height: u64) -> Option<Vec<B256>> {
+        self.native
+            .read()
+            .unwrap()
+            .execution_admission
+            .as_ref()
+            .and_then(|admission| admission.hashes(height))
+    }
+
+    /// Reserve committed work before body recovery/dispatch. An exact body can
+    /// refine a conservative missing-body estimate; retries are idempotent.
+    pub fn register_native_execution(
+        &self,
+        height: u64,
+        hashes: Vec<B256>,
+        units: u64,
+        exact: bool,
+    ) {
+        if !self.native_execution_admission_enabled() {
+            return;
+        }
+        let mut pool = self.native.write().unwrap();
+        if let Some(admission) = pool.execution_admission.as_mut() {
+            admission.register(height, hashes, units, exact);
+        }
+        self.publish_native_pool_size(&pool);
+    }
+
+    pub fn complete_native_execution(&self, height: u64, service: Option<std::time::Duration>) {
+        if !self.native_execution_admission_enabled() {
+            return;
+        }
+        let mut pool = self.native.write().unwrap();
+        if let Some(admission) = pool.execution_admission.as_mut() {
+            admission.complete(height, service, std::time::Instant::now());
+        }
+        self.publish_native_pool_size(&pool);
     }
 
     fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {
@@ -316,6 +405,15 @@ impl Mempool {
     fn publish_native_pool_size(&self, pool: &native_pool::NativePool) {
         if let Some(metrics) = self.metrics.get() {
             metrics.mempool_native_size.set(pool.size() as i64);
+            if let Some(admission) = pool.execution_admission.as_ref() {
+                let snapshot = admission.snapshot(std::time::Instant::now());
+                metrics
+                    .native_exec_admission_work
+                    .set(snapshot.outstanding_work.min(i64::MAX as u64) as i64);
+                metrics
+                    .native_exec_admission_limit_work
+                    .set(snapshot.limit_work.min(i64::MAX as u64) as i64);
+            }
         }
     }
 
@@ -1350,6 +1448,79 @@ mod tests {
             nonce,
             &key,
         )
+    }
+
+    #[test]
+    fn execution_admission_atomic_insertion_bounds_concurrent_ingress() {
+        let (_dir, state) = setup();
+        let pool = std::sync::Arc::new(Mempool::new(
+            state,
+            MempoolConfig {
+                native_admission_horizon_ms: 0,
+                native_exec_admission_horizon_ms: 2000,
+                native_per_sender_cap: 64,
+                ..Default::default()
+            },
+        ));
+        // Learn a one-legal-batch floor (1025 units), then reserve all but one.
+        pool.register_native_execution(1, vec![], 1, true);
+        pool.complete_native_execution(1, Some(std::time::Duration::from_secs(2)));
+        pool.register_native_execution(2, vec![], 1024, true);
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        let base = now_ms();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                let action = gauge_test_action(base + i);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    pool.submit_native_action(action.recover_sender().unwrap(), action)
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(MempoolError::NativeExecutionBacklogged)))
+                .count(),
+            15
+        );
+        assert_eq!(
+            pool.native_execution_admission_snapshot()
+                .unwrap()
+                .outstanding_work,
+            1025
+        );
+        assert_eq!(metrics.native_exec_admission_work.get(), 1025);
+        assert_eq!(metrics.native_exec_admission_limit_work.get(), 1025);
+        assert!(pool.native_admission_backlogged());
+        pool.complete_native_execution(2, None);
+        assert!(!pool.native_admission_backlogged());
+        assert_eq!(metrics.native_exec_admission_work.get(), 1);
+    }
+
+    #[test]
+    fn execution_admission_disabled_leaves_legacy_admission_independent() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(
+            state,
+            MempoolConfig {
+                native_admission_horizon_ms: 0,
+                native_exec_admission_horizon_ms: 0,
+                ..Default::default()
+            },
+        );
+        pool.register_native_execution(1, vec![], u64::MAX, false);
+        assert!(pool.native_execution_admission_snapshot().is_none());
+        assert!(!pool.native_admission_backlogged());
+        let action = gauge_test_action(now_ms());
+        pool.submit_native_action(action.recover_sender().unwrap(), action)
+            .unwrap();
     }
 
     #[test]

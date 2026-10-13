@@ -41,7 +41,7 @@ use crate::RpcState;
 /// Per-item reply when a non-cancel is shed because the native pool is full.
 pub(crate) const POOL_FULL_PREVERIFY_MSG: &str = "mempool: pool full (pre-verify)";
 /// Per-item reply when a non-cancel is shed by the admission limit (s65 item B):
-/// the pool already holds more than the chain can include soon. Retryable.
+/// the pool or committed execution backlog is over budget. Retryable.
 pub(crate) const ADMISSION_BUSY_MSG: &str =
     "mempool: busy, admission limit reached (pre-verify), retry later";
 
@@ -574,6 +574,9 @@ impl RpcState {
                                         ..
                                     } => "sender_queue_full",
                                     torus_mempool::MempoolError::NativePoolFull => "pool_full",
+                                    torus_mempool::MempoolError::NativeExecutionBacklogged => {
+                                        "exec_backlog"
+                                    }
                                     _ => "other",
                                 });
                                 RpcSubmitResult {
