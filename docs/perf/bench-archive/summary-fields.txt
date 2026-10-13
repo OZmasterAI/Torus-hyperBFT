@@ -461,6 +461,8 @@ phase_by_node.val*.chain_identity.save_split_covers_save_books
 phase_by_node.val*.chain_ms
 phase_by_node.val*.chain_ms_p50
 phase_by_node.val*.chain_ms_p95
+phase_by_node.val*.checkpoint_deferred_join_ms_p50
+phase_by_node.val*.checkpoint_deferred_join_ms_p99
 phase_by_node.val*.checkpoint_settle_wait_ms_p50
 phase_by_node.val*.checkpoint_settle_wait_ms_p99
 phase_by_node.val*.checkpoint_upkeep_ms_p50

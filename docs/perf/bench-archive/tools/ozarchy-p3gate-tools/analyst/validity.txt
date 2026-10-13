@@ -1,0 +1,7 @@
+ozarchy-p3gate cell validity (13 cells + 2 smoke): 11 ACCEPT AGREE (w0, r1-r4 x2, k1-m, k1-s2, smoke s0-m).
+rc 2 cells, explained and counted as valid for their measurements:
+- t1-s2-TERM (and smoke s0-s2-TERM): REJECT AGREE. Only reason 'crash gate failed' = 'panic/fail-stop after the restart'. The restarted val1
+  logs 'INFO torus_consensus::state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false' (an INFO config echo,
+  matched by the restart-tail scan). No WARN/ERROR panic/fail-stop line (hardscan clean); digests and block hash equal on 3 nodes.
+- t1-m-TERM: REJECT DISAGREE. Same crash-gate INFO-line false FAIL, plus the known mark-only digest artifact: val0 (digest 64.2 s vs 21.5/23.4 s)
+  differs in 50 lines, fields only accountValue/freeMargin/maintenanceMarginUsed/totalMarginUsed/withdrawable; block hash equal at cmp_height 1692.

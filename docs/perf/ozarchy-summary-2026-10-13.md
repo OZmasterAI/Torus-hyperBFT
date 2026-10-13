@@ -1,7 +1,8 @@
 # ozarchy campaigns 2026-10-13: absolute per-arm values
 
 Sources: results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` sections 53-58 (branch docs/wedge-fix, worktree
-`/home/oz/projects/wt/docs-wedge-fix`), 59 (branch docs/p3-cloid) and 60 (branch docs/p3-cloidprof), `<run>/analyst/{cells.json,arms.txt,paired.txt,soak.txt,series.txt}`
+`/home/oz/projects/wt/docs-wedge-fix`), 59 (branch docs/p3-cloid), 60 (branch docs/p3-cloidprof) and 61 (branch docs/p3-gate), `<run>/analyst/{cells.json,arms.txt,paired.txt,soak.txt,series.txt}`
+(61 also `arms-soak.txt`, `a-term.txt`)
 and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywhere: tw, Classic, 300 markets, MAX_IN_FLIGHT 4, commit tail, shared NVMe.
 
 | Sec | arm (sha, allocator) | matched/s: whole cell [min 0-2 / 6-10] | native blk/s | blk time p99 ms | node CPU-s/1M | RSS mean / peak GB per node | dev writes MB/s/val | settle ms/native blk | key delta (CI), as in the write-up |
@@ -35,6 +36,12 @@ and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywh
 | 59 SAT 120 s | c100 main ef812b02, glibc, CLOID_SHARE=100 | 166,551 | 3.17 | 1,402 | 28.77 | 3.86 / 4.57 | 147.7 | n/a | |
 | 60 PROF 120 s | c0 main ef812b02, glibc, CLOID_SHARE=0, perf on val1 | 191,565 | 3.48 | 1,231 | 26.35 | 3.59 / 4.25 | 144.0 | n/a | c100: matched/s -12.5% [-21.6, -3.5]; engine/1k fills +13.1% [+2.8, +23.4]; CPU +8.94% [+3.44, +14.44] |
 | 60 PROF 120 s | c100 main ef812b02, glibc, CLOID_SHARE=100, perf on val1 | 167,570 | 3.12 | 1,409 | 28.70 | 3.88 / 4.54 | 148.5 | n/a | |
+| 61 SAT 120 s | m main de1a97c1, je compiled in | 198,189 | 3.82 | 1,138 | 26.51 | 3.69 / 4.63 | 159.0 | n/a | s2: CPU -9.72% [-10.46, -8.98]; writes -54.8% [-56.9, -52.7]; matched/s +8.8% [+5.2, +12.4]; blk/s +20.1% [+10.3, +30.0]; RSS mean +0.99 GB [+0.67, +1.30] |
+| 61 SAT 120 s | s2 step 2 c88d3073, je compiled in, 15 s | 215,590 | 4.58 | 1,340 | 23.94 | 4.68 / 5.91 | 71.9 | 3.5 | |
+| 61 soak | m main de1a97c1, je compiled in | 193,398 [201,679 / 190,516] | 2.61 | 1,196 | 27.93 | 4.67 / 4.91 | 231.6 | n/a | s2 - m RSS +1.43 GB/node (min 5-10), +1.80 peak; levels off (s2 slopes -77 / -66 / -10 MB/min; diff slope CIs span 0); CPU -12.4%, writes -64%; single cells |
+| 61 soak | s2 step 2 c88d3073, je compiled in, 15 s | 219,139 [210,202 / 218,481] | 2.97 | 1,473 | 24.46 | 6.14 / 6.75 | 82.9 | 9.0 | |
+| 61 TERM | m de1a97c1 (1 SIGTERM) | SIGTERM -> exit 21.5 s; kill -> first chain commit 37.3 s; replay 0 | - | - | - | - | - | n/a | s2 restart 35.0 s vs m 37.3 s (gate 60 s); replay 0 in both; one kill per arm |
+| 61 TERM | s2 c88d3073 (1 SIGTERM) | SIGTERM -> exit 19.1 s; kill -> first chain commit 35.0 s; replay 0 | - | - | - | - | - | - | |
 
 Definitions and caveats
 
@@ -50,6 +57,10 @@ Definitions and caveats
   bench's cloid share (run-cell.sh `CLOID_SHARE` 0 vs 100). 100% is the worst case; realistic shares are not measured.
 - **60 (cloid profile):** 59's binary and arms, n = 3 ABBA, perf recording on val1 in every cell (user space; val1's W1
   engine is ~4% above its whole-cell value in both arms, not a controlled overhead measurement); matched/s is val0's headline (not profiled). Device writes from `paired.txt` (`a-arms.py` has no `wr` row).
+- **61 (final Phase 3 gate):** both arms jemalloc compiled in, node and bench built per arm, CLOID_SHARE=0, full workload.
+  SAT = n = 4 ABBA 120 s; soak = one 600 s cell per arm (no CI; soak columns from `arms-soak.txt`, RSS = minutes 5-10 mean /
+  peak of the 3 per-node values in `series.txt`, matched/s minute windows from `series.txt`); soak settle = `ck_settle` (summary
+  phase per native block; per `torus_exec_native_blocks_total` it is 8.8, SAT 3.1). TERM = one 300 s cell per arm, SIGTERM of val1 at bench+180 s; restart = kill -> first chain commit after the restart.
 - **Commit tail everywhere** (bench in-flight released on committed bodies); block time p99 = commit interval from val0-2
   logs, mean of 3 nodes. Closed-loop bench: faster commits raise offered load (jemalloc and mw rows).
 - **Settle wait** = `checkpoint_settle_wait` summary phase, ms per native block, mean of 3 nodes; n/a = no Phase 3 (main
@@ -59,8 +70,8 @@ Definitions and caveats
   `native_blk_s`; CPU-s/1M and settle = a-cells.py's definition, mean over nodes of whole-run (user+sys)/fills and of the
   phase ms). The same method reproduces every 53 / 53b / 53c `cells.json` value exactly.
 - ³ No soak analysis for 53d / 57 computed block-time p99 (`summary.json` has only p95; 53-53c from `cells.json` blocks).
-- **Device writes "-" for all soaks:** no soak analysis computed io-ticks writes; deriving them from raw io-ticks would be a
-  new computation, not an existing output.
+- **Device writes "-" for the 53-57 soaks:** no soak analysis computed io-ticks writes; deriving them from raw io-ticks would be a
+  new computation, not an existing output. The 61 soak writes are `arms-soak.txt` row `wr` (a-arms.py `--io`).
 - ⁴ From `ozarchy-wedge-sat-run/analyst/paired.txt` row `wr` (not in section 58's table).
 - ⁵ Kill cells: 540 s, val1 SIGKILL at 60/180/300/420 s, state hash on; their throughput is not analysed (restarts), so
   only stall timing is given (chain = val0 commit lines).
