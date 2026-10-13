@@ -393,30 +393,20 @@ async fn order_book_depth_bounds_the_levels_read() {
         assert_eq!(top.asks[9].price, dec_fp(fp(2009)), "{mode:?}");
         assert!(examined(&s) > 0, "{mode:?}: the read is metered");
 
+        // Every layout reads the whole market (review round 3): mode 1 has
+        // no price index, mode 2 validates every key and level row of the
+        // market as main's `read_book_depth` does (an unknown key or a
+        // corrupt level past the depth is an error, not skipped), classic is
+        // one whole-book blob charged by its size before it is decoded.
+        // `depth` bounds the reply, the budget bounds the rows.
         let s = server(&state, 100);
         let got = s.state().get_order_book("0x1".into(), Some(10)).await;
-        match mode {
-            // Level rows: two seeks of 10 rows, whatever the book's size.
-            BookMode::LevelAuthority => {
-                assert_eq!(got.unwrap().bids.len(), 10);
-                assert!(
-                    (1..=30).contains(&examined(&s)),
-                    "examined {}",
-                    examined(&s)
-                );
-            }
-            // Mode 1: order rows carry no price index, every order of the
-            // market is read. Classic: one whole-book blob (cannot be read in
-            // part), charged by its size before it is decoded.
-            _ => {
-                assert_scan_limit(&got.unwrap_err(), &format!("{mode:?}: 600 orders"));
-                assert!(
-                    (1..=101).contains(&examined(&s)),
-                    "examined {}",
-                    examined(&s)
-                );
-            }
-        }
+        assert_scan_limit(&got.unwrap_err(), &format!("{mode:?}: 600 orders"));
+        assert!(
+            (1..=101).contains(&examined(&s)),
+            "examined {}",
+            examined(&s)
+        );
     }
 }
 
@@ -1049,4 +1039,557 @@ async fn block_trades_are_charged_per_market_to_the_scan_budget() {
     assert!(examined(&s) >= 1000, "examined {}", examined(&s));
     let s = server(&state, 10_000);
     assert!(s.state().get_block_trades(8).await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Review round 3 (Codex): account positions, getProposal, unknown market
+// rows, skipped trade rows; then the method sweep (exactness vs main)
+// ---------------------------------------------------------------------------
+
+/// `trader` holds one position in each market `1..=n`.
+fn put_positions(state: &StateDb, trader: Address, n: u64) {
+    let pm = PositionManager::new(state.clone());
+    for m in 1..=n {
+        pm.put_position(&position(trader, m, m % 2 == 0, 1)).unwrap();
+    }
+}
+
+/// [P1] `getBalances` / `getLiquidatorVault` answer a fixed-size reply from
+/// all of the account's positions: each position row, and each market row
+/// (and oracle aggregate, with a block time) read for them, is charged to
+/// the request budget, so a large position set is refused, not walked.
+#[tokio::test]
+async fn balances_and_liquidator_vault_stop_at_the_scan_budget() {
+    let vault = torus_core::liquidation::LIQUIDATOR_VAULT;
+    let (_d, state) = db();
+    list_markets(&state, 300);
+    put_positions(&state, addr(MAKER), 300);
+    put_positions(&state, vault, 300);
+    let maker = hex_addr(addr(MAKER));
+
+    let s = server(&state, 100);
+    let e = s.state().get_balances(maker.clone()).await.unwrap_err();
+    assert_scan_limit(&e, "getBalances: 300 positions, budget 100");
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
+    let s = server(&state, 100);
+    let e = s.state().get_liquidator_vault().await.unwrap_err();
+    assert_scan_limit(&e, "getLiquidatorVault: 300 positions, budget 100");
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
+
+    // Under the budget: main's figures. No executed header (no block time):
+    // one position row + one market row per market, no oracle read.
+    let s = server(&state, 10_000);
+    let b = s.state().get_balances(maker).await.unwrap();
+    let f = crate::account::account_figures(&state, &addr(MAKER), None).unwrap();
+    assert_eq!(b.account_value, dec_fp(f.account_value));
+    assert_eq!(b.total_margin_used, dec_fp(f.total_margin_used));
+    assert_eq!(b.maintenance_margin_used, dec_fp(f.maintenance_margin_used));
+    assert_eq!(b.free_margin, dec_fp(f.free_margin));
+    assert_eq!(b.withdrawable, dec_fp(f.withdrawable));
+    assert_eq!(examined(&s), 600);
+    let s = server(&state, 10_000);
+    let v = s.state().get_liquidator_vault().await.unwrap();
+    assert_eq!(v.open_positions, 300);
+    assert_eq!(examined(&s), 300);
+}
+
+/// [P2] `getProposal` decodes the whole stored proposal for its reply: the
+/// row is charged one row per started 128 B before it is decoded, as
+/// `getProposals` charges it. A missing id is one read; a row that does not
+/// decode is main's error.
+#[tokio::test]
+async fn get_proposal_charges_the_row_by_size_before_decoding() {
+    use torus_economics::governance::GovernanceManager;
+    let (_d, state) = db();
+    let len = put_big_proposal(&state, 0, 64 * 1024);
+
+    let s = server(&state, 100);
+    let e = s.state().get_proposal(0).await.unwrap_err();
+    assert_scan_limit(&e, &format!("one {len} B proposal"));
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
+
+    let s = server(&state, 10_000);
+    assert!(s.state().get_proposal(0).await.unwrap().is_some());
+    assert_eq!(examined(&s), packed_rows(len) as u64, "{len} B");
+    let s = server(&state, 10_000);
+    assert!(s.state().get_proposal(7).await.unwrap().is_none());
+    assert_eq!(examined(&s), 1, "a missing id is one read");
+
+    state
+        .put_cf_raw(CF_GOVERNANCE_PROPOSALS, &1u64.to_be_bytes(), &[0])
+        .unwrap();
+    let want = format!(
+        "internal error: {}",
+        GovernanceManager::new(state.clone())
+            .get_proposal(1)
+            .unwrap_err()
+    );
+    let e = server(&state, 10_000)
+        .state()
+        .get_proposal(1)
+        .await
+        .unwrap_err();
+    assert_eq!(e.message(), want);
+}
+
+fn layout_of(mode: BookMode) -> BookLayout {
+    match mode {
+        BookMode::Classic => BookLayout::Classic,
+        BookMode::OrderRows => BookLayout::OrderRows,
+        _ => BookLayout::LevelAuthority,
+    }
+}
+
+/// [P2] A row layout's market is validated whole, as main's readers do
+/// (`read_book_depth`, `read_open_orders` with a market): a key of no known
+/// shape anywhere under the market, or a level row past the requested
+/// depth that does not decode, is main's error, never an answer that
+/// skipped it.
+#[tokio::test]
+async fn unknown_or_corrupt_market_rows_fail_as_main() {
+    use torus_core::book_rows::level_row_key;
+    use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+    use torus_types::Side;
+    let maker = addr(MAKER);
+    for mode in [BookMode::OrderRows, BookMode::LevelAuthority] {
+        let layout = layout_of(mode);
+        let (_d, state) = db();
+        seed_crowded(&state, mode);
+        // Sorts after every known row of market 1.
+        let mut key = 1u64.to_be_bytes().to_vec();
+        key.push(0xff);
+        state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &[0]).unwrap();
+
+        let want = book_reader::read_book_depth(&state, 1, layout)
+            .unwrap_err()
+            .to_string();
+        assert!(want.contains("unrecognized"), "{want}");
+        let s = server(&state, 100_000);
+        let e = s
+            .state()
+            .get_order_book("0x1".into(), Some(1))
+            .await
+            .expect_err("main rejects the market");
+        assert_eq!(e.message(), format!("internal error: {want}"), "{mode:?}");
+
+        let want = book_reader::read_open_orders(&state, &maker, Some(1), layout, 5000)
+            .unwrap_err()
+            .to_string();
+        let e = s
+            .state()
+            .get_open_orders(hex_addr(maker), Some("0x1".into()))
+            .await
+            .expect_err("main rejects the market");
+        assert_eq!(e.message(), format!("internal error: {want}"), "{mode:?}");
+    }
+
+    // Mode 2: the worst bid level (past depth 10) does not decode.
+    let (_d, state) = db();
+    seed_deep_book(&state, BookMode::LevelAuthority);
+    state
+        .put_cf_raw(
+            CF_NATIVE_ORDER_BOOKS,
+            &level_row_key(1, Side::Buy, fp(1000)),
+            &[0; 3],
+        )
+        .unwrap();
+    let want = book_reader::read_book_depth(&state, 1, BookLayout::LevelAuthority)
+        .unwrap_err()
+        .to_string();
+    let e = server(&state, 100_000)
+        .state()
+        .get_order_book("0x1".into(), Some(10))
+        .await
+        .expect_err("main rejects the corrupt level");
+    assert_eq!(e.message(), format!("internal error: {want}"));
+}
+
+/// Market 1's newest fill (`getTradeHistory`, limit 1).
+async fn trade_history(s: &RpcServer) -> jsonrpsee::core::RpcResult<Vec<crate::types::RpcTrade>> {
+    s.state().get_trade_history("0x1".into(), Some(1)).await
+}
+
+/// Market 1's first fill in blocks `from..=to` (limit 1).
+async fn trade_range(
+    s: &RpcServer,
+    from: &str,
+    to: &str,
+) -> jsonrpsee::core::RpcResult<Vec<crate::types::RpcTrade>> {
+    s.state()
+        .get_trade_history_range("0x1".into(), from.into(), to.into(), Some(1))
+        .await
+}
+
+/// [P2] `getTradeHistory` / `getTradeHistoryRange` charge every trade row
+/// they visit, by its size and before it is decoded or skipped: rows the
+/// decoder skips (old-format keys) do not fill the `limit`, so they are
+/// bounded by the budget, and one full block row is not one row.
+#[tokio::test]
+async fn trade_history_charges_every_row_visited() {
+    use torus_state::cf::CF_NATIVE_TRADES;
+    use torus_state::trade_rows::TradeFill;
+    let (_d, state) = db();
+    // 1,000 rows of market 1 the decoder skips (20-byte old-format keys).
+    for block in 1..=1000u64 {
+        let key = [
+            &1u64.to_be_bytes()[..],
+            &block.to_be_bytes()[..],
+            &0u32.to_be_bytes()[..],
+        ]
+        .concat();
+        state.put_cf_raw(CF_NATIVE_TRADES, &key, &[0]).unwrap();
+    }
+
+    let s = server(&state, 100);
+    assert_scan_limit(&trade_history(&s).await.unwrap_err(), "1000 skipped rows");
+    assert!((1..=101).contains(&examined(&s)), "{}", examined(&s));
+    let s = server(&state, 100);
+    assert_scan_limit(&trade_range(&s, "0x1", "0x3e8").await.unwrap_err(), "range: 1000 skipped rows");
+    assert!((1..=101).contains(&examined(&s)), "{}", examined(&s));
+
+    // Under the budget: main's answer (every row skipped), each row charged.
+    let s = server(&state, 10_000);
+    assert!(trade_history(&s).await.unwrap().is_empty());
+    assert_eq!(examined(&s), 1000);
+    let s = server(&state, 10_000);
+    assert!(trade_range(&s, "0x1", "0x3e8").await.unwrap().is_empty());
+    assert_eq!(examined(&s), 1000);
+
+    // One full block row (1,024 fills), charged by size even for limit 1.
+    let (_d2, state) = db();
+    let fills: Vec<TradeFill> = (0..1024)
+        .map(|i| TradeFill {
+            trade_index: i,
+            market: 1,
+            maker: addr(MAKER),
+            taker: addr(2),
+            price_raw: 10,
+            qty_raw: 1,
+            taker_side: 0,
+        })
+        .collect();
+    let mut rows = torus_state::PackedCfBatch::default();
+    torus_state::trade_rows::encode_block(5, 50, &fills, &mut rows);
+    let mut row_bytes = 0;
+    for (cf, key, value) in rows.iter() {
+        if cf == CF_NATIVE_TRADES {
+            row_bytes = value.len();
+        }
+        state.put_cf_raw(cf, key, value).unwrap();
+    }
+    assert!(row_bytes > 100 * CLASSIC_BLOB_BYTES_PER_ROW, "{row_bytes} B");
+    let s = server(&state, 100);
+    assert_scan_limit(&trade_history(&s).await.unwrap_err(), "one full row");
+    let s = server(&state, 100);
+    assert_scan_limit(&trade_range(&s, "0x5", "0x5").await.unwrap_err(), "range: one full row");
+    let s = server(&state, 10_000);
+    assert_eq!(trade_history(&s).await.unwrap().len(), 1);
+    assert_eq!(examined(&s), packed_rows(row_bytes) as u64);
+    let s = server(&state, 10_000);
+    assert_eq!(trade_range(&s, "0x5", "0x5").await.unwrap().len(), 1);
+    assert_eq!(examined(&s), packed_rows(row_bytes) as u64);
+}
+
+/// Sweep: `getLeader` looks the leader's key up in every validator row (main
+/// decodes them all before searching; a row that does not decode makes it
+/// fall back to the key): each row is charged to the request budget.
+#[tokio::test]
+async fn leader_lookup_stops_at_the_scan_budget() {
+    use torus_economics::types::{ValidatorState, ValidatorStatus};
+    use torus_state::cf::CF_STAKING_VALIDATORS;
+    let pk = [7u8; 32];
+    let validator = |n: u32, pubkey: [u8; 32]| ValidatorState {
+        address: other(n),
+        pubkey,
+        commission_bps: 0,
+        self_stake: U256::ZERO,
+        total_delegated: U256::ZERO,
+        status: ValidatorStatus::Active,
+        jailed_until: None,
+        last_commission_change_block: None,
+        oracle_signer: None,
+    };
+    let (_d, state) = db();
+    for n in 0..=1000u32 {
+        let v = validator(n, if n == 1000 { pk } else { [1; 32] });
+        state
+            .put_cf_raw(
+                CF_STAKING_VALIDATORS,
+                v.address.as_slice(),
+                &borsh::to_vec(&v).unwrap(),
+            )
+            .unwrap();
+    }
+    let leader = |max| {
+        let mut s = server(&state, max);
+        s.state.leader_vk_fn = Some(Arc::new(move || Some(pk)));
+        s
+    };
+
+    let s = leader(100);
+    let e = s.state().get_leader().await.unwrap_err();
+    assert_scan_limit(&e, "1001 validators, budget 100");
+    assert!((1..=101).contains(&examined(&s)), "{}", examined(&s));
+
+    let s = leader(10_000);
+    let l = s.state().get_leader().await.unwrap();
+    assert_eq!(l.address, crate::types::hex_address(other(1000)));
+    assert_eq!(examined(&s), 1001);
+
+    // A row that does not decode: main's fallback (the key, not an error).
+    state
+        .put_cf_raw(CF_STAKING_VALIDATORS, other(5000).as_slice(), &[0])
+        .unwrap();
+    let s = leader(10_000);
+    let l = s.state().get_leader().await.unwrap();
+    assert_eq!(l.address, format!("0x{}", hex::encode(pk)));
+}
+
+/// Market 2's first order (classic: its blob) made undecodable: another
+/// trader's row, after market 1's.
+fn corrupt_market_2(state: &StateDb, mode: BookMode) {
+    use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+    if matches!(mode, BookMode::Classic) {
+        let blob = state
+            .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &2u64.to_be_bytes())
+            .unwrap()
+            .unwrap();
+        state
+            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &2u64.to_be_bytes(), &blob[..blob.len() / 2])
+            .unwrap();
+    } else {
+        let (cf, key, value) = order_rows(state, mode, 2).remove(0);
+        state.put_cf_raw(cf, &key, &value[..value.len() - 1]).unwrap();
+    }
+}
+
+/// Sweep (exactness): a resting cloid hit is answered only after every
+/// order (classic: every blob) was validated, as main's
+/// `book_reader::find_by_cloid` does: a corrupt row of a later market is
+/// main's error, not a hit.
+#[tokio::test]
+async fn order_by_cloid_validates_every_order_before_answering() {
+    for mode in MODES {
+        let (_d, state) = db();
+        seed_crowded(&state, mode);
+        corrupt_market_2(&state, mode);
+        let want = book_reader::find_by_cloid(&state, &addr(MAKER), CLOID, layout_of(mode))
+            .expect_err("main rejects the corrupt row")
+            .to_string();
+        let e = server(&state, 100_000)
+            .state()
+            .get_order_by_cloid(
+                hex_addr(addr(MAKER)),
+                torus_types::cloid_serde::to_hex(CLOID),
+            )
+            .await
+            .expect_err("a corrupt row is an error, not a hit");
+        assert_eq!(e.message(), format!("internal error: {want}"), "{mode:?}");
+    }
+}
+
+/// Sweep (exactness): under the row layouts main validates every order row
+/// and then truncates to 5,000; the bounded read does too (it does not stop
+/// at the 5,000th order of the trader).
+#[tokio::test]
+async fn open_orders_validate_rows_past_the_reply_limit() {
+    use torus_core::book_reader::BOOK_MODE_MARKER_KEY;
+    use torus_core::book_rows::{level_row_key, BookMetaRow, ROW_TAG_ORDER};
+    use torus_core::order_book::Order;
+    use torus_core::position::OPEN_ORDER_MAX_LIMIT;
+    use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
+    use torus_types::Side;
+    let limit = OPEN_ORDER_MAX_LIMIT as u128;
+    let maker = addr(MAKER);
+    for (marker, layout) in [(1u8, BookLayout::OrderRows), (2, BookLayout::LevelAuthority)] {
+        let (_d, state) = db();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY, &[marker])
+            .unwrap();
+        let meta = BookMetaRow {
+            next_seq: limit as u64 + 2,
+            tick_size: fp(1),
+            lot_size: fp(1),
+            next_id: limit + 2,
+            last_trade_price: None,
+        };
+        state
+            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &book_meta_key(1), &meta.encode())
+            .unwrap();
+        let cf = if marker == 1 {
+            CF_NATIVE_ORDER_BOOKS
+        } else {
+            state
+                .put_cf_raw(
+                    CF_NATIVE_ORDER_BOOKS,
+                    &level_row_key(1, Side::Buy, fp(100)),
+                    &level_value(),
+                )
+                .unwrap();
+            CF_BOOK_ORDER_ROWS
+        };
+        // The maker's 5,000 orders, then another trader's corrupt row.
+        for id in 1..=limit + 1 {
+            let order = Order {
+                id,
+                trader: if id <= limit { maker } else { addr(2) },
+                side: Side::Buy,
+                price: fp(100),
+                remaining_qty: fp(1),
+                original_qty: fp(1),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                timestamp: 1,
+                reduce_only: false,
+                client_order_id: None,
+            };
+            let mut row = (id as u64).to_be_bytes().to_vec();
+            row.extend(borsh::to_vec(&order).unwrap());
+            if id > limit {
+                row.pop();
+            }
+            let key = [&1u64.to_be_bytes()[..], &[ROW_TAG_ORDER], &id.to_be_bytes()[..]].concat();
+            state.put_cf_raw(cf, &key, &row).unwrap();
+        }
+        for market in [None, Some(1u64)] {
+            let want = book_reader::read_open_orders(&state, &maker, market, layout, 5000)
+                .expect_err("main rejects the corrupt row")
+                .to_string();
+            let e = server(&state, 100_000)
+                .state()
+                .get_open_orders(hex_addr(maker), market.map(|m| format!("0x{m:x}")))
+                .await
+                .expect_err("a corrupt row after the 5,000th order is still an error");
+            assert_eq!(
+                e.message(),
+                format!("internal error: {want}"),
+                "{layout:?} {market:?}"
+            );
+        }
+    }
+}
+
+/// Sweep (exactness): `getUserLimits` counts as main's `count_open_orders`
+/// did: under the row layouts only the trader's own order rows are decoded
+/// (another trader's corrupt row is not read), a classic blob that does not
+/// decode is main's "borsh decode order book" error.
+#[tokio::test]
+async fn user_limits_count_as_main_did() {
+    use borsh::BorshDeserialize;
+    use torus_core::order_book::OrderBook;
+    use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+    for mode in MODES {
+        let (_d, state) = db();
+        seed_crowded(&state, mode);
+        corrupt_market_2(&state, mode);
+        let got = server(&state, 100_000)
+            .state()
+            .get_user_limits(hex_addr(addr(MAKER)))
+            .await;
+        if matches!(mode, BookMode::Classic) {
+            let cut = state
+                .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &2u64.to_be_bytes())
+                .unwrap()
+                .unwrap();
+            let want = format!(
+                "internal error: borsh decode order book: {}",
+                OrderBook::try_from_slice(&cut).err().unwrap()
+            );
+            assert_eq!(got.unwrap_err().message(), want);
+        } else {
+            let l = got.unwrap_or_else(|e| panic!("{mode:?}: {e:?}"));
+            assert_eq!(l.open_orders, 4, "{mode:?}: 3 resting + 1 stop");
+        }
+    }
+    // The maker's own row corrupt: main's "book order row" error.
+    for mode in [BookMode::OrderRows, BookMode::LevelAuthority] {
+        let (_d, state) = db();
+        seed_crowded(&state, mode);
+        let (cf, key, value) = order_rows(&state, mode, 1).remove(0);
+        let cut = &value[..value.len() - 1];
+        state.put_cf_raw(cf, &key, cut).unwrap();
+        let want = format!(
+            "internal error: book order row: {}",
+            OrderBook::decode_order_row(cut).unwrap_err()
+        );
+        let e = server(&state, 100_000)
+            .state()
+            .get_user_limits(hex_addr(addr(MAKER)))
+            .await
+            .unwrap_err();
+        assert_eq!(e.message(), want, "{mode:?}");
+    }
+}
+
+/// Sweep (exactness): classic `getOpenOrders` reports main's decode error
+/// ("borsh decode order book"). Without a market, main skipped such a blob;
+/// the bounded read reports it (fail loud, the one intended difference).
+#[tokio::test]
+async fn classic_open_orders_report_main_decode_error() {
+    use borsh::BorshDeserialize;
+    use torus_core::order_book::OrderBook;
+    use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+    let (_d, state) = db();
+    seed_crowded(&state, BookMode::Classic);
+    corrupt_market_2(&state, BookMode::Classic);
+    let cut = state
+        .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &2u64.to_be_bytes())
+        .unwrap()
+        .unwrap();
+    let want = format!(
+        "internal error: borsh decode order book: {}",
+        OrderBook::try_from_slice(&cut).err().unwrap()
+    );
+    for market in [Some("0x2".to_string()), None] {
+        let e = server(&state, 100_000)
+            .state()
+            .get_open_orders(hex_addr(addr(MAKER)), market.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(e.message(), want, "{market:?}");
+    }
+}
+
+/// Sweep (exactness): a proposal row that does not decode is main's error
+/// for each form: the governance manager's with a status filter, "borsh
+/// decode proposal" without.
+#[tokio::test]
+async fn proposals_report_main_decode_errors() {
+    use torus_economics::governance::GovernanceManager;
+    let (_d, state) = db();
+    put_proposal(&state, 0, ProposalStatus::Passed);
+    state
+        .put_cf_raw(CF_GOVERNANCE_PROPOSALS, &1u64.to_be_bytes(), &[0])
+        .unwrap();
+    let want = format!(
+        "internal error: {}",
+        GovernanceManager::new(state.clone())
+            .get_proposals_by_status(ProposalStatus::Passed)
+            .unwrap_err()
+    );
+    let s = server(&state, 10_000);
+    let e = s
+        .state()
+        .get_proposals(Some("Passed".into()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.message(), want);
+    let e = s.state().get_proposals(None).await.unwrap_err();
+    assert!(
+        e.message()
+            .starts_with("internal error: borsh decode proposal: "),
+        "{e:?}"
+    );
 }
