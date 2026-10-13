@@ -1030,6 +1030,47 @@ FULL_COLS = {
 }
 
 
+class CellRoles(FixtureCase):
+    """[cell_roles]: pattern -> role per cell (first match in meta order); cell_role stays the default."""
+
+    def rows(self):
+        return {l.split(" | ")[0][3:-1]: l.split(" | ")[4] for l in self.fx.read("INDEX.md").split("\n") if l.startswith("| `ozarchy-tc")}
+
+    def test_default_single_role(self):
+        fx = self.fx
+        m = dict(fx.meta, cell_role="cell")
+        self.assertOk(fx.run(meta=m))
+        rows = self.rows()
+        self.assertTrue(rows["ozarchy-tc-300m-r1-a"].endswith("; cell 120 s"))
+        self.assertTrue(rows["ozarchy-tc-300m-r1-b"].endswith("; cell 120 s"))
+        # unchanged wording of the generated INDEX paragraph with one role
+        self.assertRegex(fx.read("INDEX.md"), r"its 8 dirs were added \([^:]+: 2 cell cells, the warm-up `w0`,")
+
+    def test_per_cell_roles(self):
+        fx = self.fx
+        # "*-b" also matches the smoke cell: smoke and warm-up keep their own role
+        m = dict(fx.meta, cell_roles={"*-r1-b": "soak", "*-b": "restart", "*-w0": "never"})
+        r = fx.run(meta=m)
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        rows = self.rows()
+        self.assertTrue(rows["ozarchy-tc-300m-r1-a"].endswith("; throughput 120 s"), rows)
+        self.assertTrue(rows["ozarchy-tc-300m-r1-b"].endswith("; soak 120 s"), rows)
+        self.assertTrue(rows["ozarchy-tc-300m-w0"].endswith("; warm-up 60 s, excluded"), rows)
+        self.assertTrue(rows["ozarchy-tc-smoke-300m-s0-b"].endswith("; smoke 60 s, excluded"), rows)
+        # the generated INDEX paragraph counts the cells per role, in run order
+        self.assertIn(": 1 throughput cell, 1 soak cell, the warm-up `w0`,", fx.read("INDEX.md"))
+
+    def test_bad_cell_roles_is_an_error(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        for bad in (["*-b", "soak"], {"*-b": 3}):
+            r = fx.run(meta=dict(fx.meta, cell_roles=bad))
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("cell_roles", r.stderr)
+            self.assertEqual(fx.snapshot(), snap)
+
+
 class SummaryRows(FixtureCase):
     """[summary] rows: numbers from analyst/arms.txt unless [[summary.rows]] cols gives them."""
 

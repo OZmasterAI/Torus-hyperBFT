@@ -26,7 +26,9 @@ WHAT IT WRITES (mechanical part)
   2. INDEX.md: the "Updated" paragraph (after the last one) and one row per dir in sorted position; cells.md: the
      campaign section (before "## action-results:"); DELETABLE.md: the campaign block at the end (Tier A / Tier B
      rm lists with live sizes, outside-tree block). Rows come from each cell's summary.json, node-environ-trie.txt,
-     analyst/cells.json (arm of the warm-up), <cell>.campaign.log (start times) and live file sizes.
+     analyst/cells.json (arm of the warm-up), <cell>.campaign.log (start times) and live file sizes. A cell row's
+     role ("<role> <dur> s") is smoke / warm-up from the dir name, else the first [cell_roles] pattern (fnmatch on
+     the cell dir name, in meta order, e.g. "*-KILL" = "restart") that matches, else cell_role (default throughput).
   3. docs/perf/ozarchy-summary-*.md ([summary] in the meta): one row per arm after the last row of the table, numbers
      from analyst/arms.txt ("per arm mean" table) and {paired:METRIC:DECIMALS} deltas from analyst/paired.txt;
      optional definitions bullet. The "Sources:" sentence stays manual. A row's cols = {matched, blk, p99, cpu, rss,
@@ -355,13 +357,21 @@ class Campaign:
             "generated": s.get("generated_at", ""),
         }
 
+    def cell_kind(self, n):
+        """The role word of a measured cell: the first [cell_roles] pattern (fnmatch on the dir name, meta order)
+        that matches, else cell_role (default "throughput")."""
+        for pat, role in self.meta.get("cell_roles", {}).items():
+            if fnmatch.fnmatchcase(n, pat):
+                return role
+        return self.meta.get("cell_role", "throughput")
+
     def role(self, n):
         i = self.info[n]
         if i["smoke"]:
             return "smoke %s s, excluded" % i["dur"]
         if i["warm"]:
             return "warm-up %s s, excluded" % i["dur"]
-        return "%s %s s" % (self.meta.get("cell_role", "throughput"), i["dur"])
+        return "%s %s s" % (self.cell_kind(n), i["dur"])
 
     # -- deletable lists
 
@@ -618,12 +628,17 @@ def render(c, ta, tb, tds, wts, o):
         timing = ", ".join(parts)
     dsum = ix.get("dirs_summary")
     if not dsum:
-        main = [n for n in c.cells if not c.info[n]["smoke"] and not c.info[n]["warm"]]
+        main = [n for n in c.by_time if not c.info[n]["smoke"] and not c.info[n]["warm"]]
         warm = [n for n in c.cells if c.info[n]["warm"]]
         smoke = [n for n in c.by_time if c.info[n]["smoke"]]
         parts = []
-        if main:
-            parts.append("%d %s cells" % (len(main), m.get("cell_role", "throughput")))
+        kinds = {}
+        for n in main:  # one count per role, in run order
+            kinds[c.cell_kind(n)] = kinds.get(c.cell_kind(n), 0) + 1
+        for kind, k in kinds.items():
+            # one role (cell_role only): the wording as before ("1 throughput cells"); with [cell_roles] 1 cell
+            word = "cell" if k == 1 and m.get("cell_roles") else "cells"
+            parts.append("%d %s %s" % (k, kind, word))
         tags = sorted({c.info[n]["tag"] for n in warm})
         if len(warm) == 1:
             parts.append("the warm-up `%s`" % c.info[warm[0]]["tag"])
@@ -1548,6 +1563,9 @@ def main(argv=None):
             raise Fatal("meta camp %r does not match %r" % (meta.get("camp"), a.camp))
         if "section" not in meta:
             raise Fatal("meta has no section")
+        roles = meta.get("cell_roles", {})
+        if not isinstance(roles, dict) or not all(isinstance(v, str) for v in roles.values()):
+            raise Fatal('[cell_roles] must map a cell dir pattern to a role word, e.g. "*-KILL" = "restart"')
         specs = smoke_specs(meta)
         # absolute: the smoke commands get {bench} with cwd = their scratch dir
         c = Campaign(a.camp, meta, os.path.abspath(a.bench_root), repo)
