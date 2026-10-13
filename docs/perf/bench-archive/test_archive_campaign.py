@@ -1277,6 +1277,21 @@ class StripTrailing(FixtureCase):
         self.assertEqual(self.staged("analyst/blob.txt"), b"x \0 \n")  # binary: copied as is
         self.assertEqual(self.staged("analyst/cells.txt"), CELLS_TXT.encode())
 
+    def test_clean_want_matches_padded_output(self):
+        fx = self.fx
+        # the archived report is clean already, the smoke run prints it padded: still a match under strip_trailing
+        write(self.an("perf-report-r1-a.txt"), PERF_REPORT_STRIPPED)
+        write(self.an("padded.txt"), PERF_REPORT)
+        smoke = {
+            "script": "analyst/a-perf-report-r1-a.py",
+            "args": [self.an("padded.txt")],
+            "compare": [{"want": "analyst/perf-report-r1-a.txt"}],
+        }
+        r = fx.run(meta=self.meta(["analyst/perf-report-*.txt", "analyst/padded.txt"], smoke))
+        self.assertOk(r)
+        self.assertIn("smoke check 2/2 OK", r.stdout)
+        self.assertEqual(self.staged("analyst/perf-report-r1-a.txt"), PERF_REPORT_STRIPPED.encode())
+
     def test_stripped_want_still_catches_a_real_difference(self):
         fx = self.fx
         write(self.an("other.txt"), PERF_REPORT.replace("12.50%", "13.50%"))
