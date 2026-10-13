@@ -448,8 +448,9 @@ impl Mempool {
     }
 
     /// Applies a change to the gauge. Every change is tied to one atomic
-    /// update of the total, so the gauge equals the total once quiescent
-    /// without publishing under a lock.
+    /// update of the total (or the attach-time total), so the gauge equals
+    /// the total once quiescent without publishing under a lock, and never
+    /// goes negative.
     fn publish_committed_unexecuted(&self, delta: i64) {
         if let Some(m) = self.metrics.get() {
             m.mempool_native_committed_unexecuted.inc_by(delta);
@@ -530,6 +531,14 @@ impl Mempool {
             tracing::warn!("mempool metrics already set");
         }
         self.publish_native_pool_size(&pool);
+        // Exec-aware admission: boot parks may have registered before the
+        // metrics existed; publish the counter's total now (lock-free,
+        // synchronized with concurrent updates: see `exec_backlog`). Knob
+        // off: untouched.
+        if self.exec_aware_admission() {
+            self.exec_backlog
+                .attach(|delta| self.publish_committed_unexecuted(delta));
+        }
     }
 
     /// Plan 9.14 C (anti-spam D, measure first): count `n` oracle

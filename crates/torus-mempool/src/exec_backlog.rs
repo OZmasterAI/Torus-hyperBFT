@@ -24,6 +24,16 @@
 //! that counts a block's actions runs with no lock held; [`ExecBacklog::close`]
 //! is terminal: it zeroes the total and every later registration or release
 //! is a no-op, so a dispatch racing the pipeline teardown cannot leak.
+//!
+//! Gauge publication: changes are published as deltas only once
+//! [`ExecBacklog::attach`] ran (the metrics may attach after boot parks
+//! registered). Attach publishes the total at that instant BEFORE it sets
+//! [`ATTACHED`] (release), and an update publishes iff its own CAS saw
+//! [`ATTACHED`] (acquire), so the gauge is the sum of every published delta
+//! and equals the total once quiescent. It never goes negative: an add is
+//! published BEFORE its CAS (and taken back if a close won), a subtraction
+//! AFTER its CAS, so every published subtraction follows the publication of
+//! what it subtracts (its add, or the attach total that included it).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,12 +41,18 @@ use std::sync::Mutex;
 
 /// High bit of [`ExecBacklog::state`]: the execution pipeline is gone.
 const CLOSED: usize = 1 << (usize::BITS - 1);
+/// Next bit: the gauge is attached ([`ExecBacklog::attach`]); updates
+/// publish their deltas from then on. Set once, never cleared.
+const ATTACHED: usize = 1 << (usize::BITS - 2);
+/// The total's bits.
+const TOTAL: usize = ATTACHED - 1;
 
 /// Committed-but-unexecuted normal native actions.
 #[derive(Default)]
 pub struct ExecBacklog {
-    /// Outstanding total in the low bits, [`CLOSED`] once torn down. The only
-    /// state the exec thread and admission readers touch.
+    /// Outstanding total in the low bits ([`TOTAL`]), [`CLOSED`] once torn
+    /// down, [`ATTACHED`] once the gauge is attached. The only state the exec
+    /// thread and admission readers touch.
     state: AtomicUsize,
     /// Dispatcher only: registered heights not yet sent. The exec thread
     /// never takes this lock.
@@ -62,12 +78,13 @@ impl ExecBacklog {
     /// [`Self::close`], is a no-op returning 0 (`count` not called).
     ///
     /// `count` runs with NO lock held; the critical sections are map
-    /// lookups/inserts. `publish` gets the change to the total.
+    /// lookups/inserts. `publish` gets the change to the total (once
+    /// attached; see the module docs).
     pub fn register(
         &self,
         height: u64,
         count: impl FnOnce() -> usize,
-        publish: impl FnOnce(i64),
+        publish: impl Fn(i64),
     ) -> usize {
         self.touch();
         if self.is_closed() {
@@ -87,13 +104,10 @@ impl ExecBacklog {
         if let Some(&counted) = pending.by_height.get(&height) {
             return counted; // a concurrent registrant won (single-dispatcher callers never get here)
         }
-        if !self.add(n) {
+        if !self.add(n, &publish) {
             return 0; // torn down during the scan
         }
         pending.by_height.insert(height, n);
-        if n > 0 {
-            publish(n as i64);
-        }
         n
     }
 
@@ -101,7 +115,7 @@ impl ExecBacklog {
     /// the block (released by [`Self::release`]). Raises the sent watermark.
     /// A registered height below it can never be sent any more (execution is
     /// strictly in height order): its count is dropped here.
-    pub fn sent(&self, height: u64, publish: impl FnOnce(i64)) {
+    pub fn sent(&self, height: u64, publish: impl Fn(i64)) {
         self.touch();
         let mut pending = self.pending.lock().unwrap();
         pending.by_height.remove(&height);
@@ -114,33 +128,70 @@ impl ExecBacklog {
             let above = pending.by_height.split_off(&height);
             let stale = std::mem::replace(&mut pending.by_height, above);
             let n: usize = stale.values().sum();
-            if n > 0 && self.sub(n) {
-                publish(-(n as i64));
-            }
+            self.sub(n, &publish);
         }
     }
 
     /// Exec thread: a block carrying `n` (its [`Self::register`] count) was
     /// executed or abandoned. Lock-free: a single CAS loop on the total; a
     /// no-op after [`Self::close`].
-    pub fn release(&self, n: usize, publish: impl FnOnce(i64)) {
+    pub fn release(&self, n: usize, publish: impl Fn(i64)) {
         if n == 0 {
             return;
         }
         self.touch();
-        if self.sub(n) {
-            publish(-(n as i64));
-        }
+        self.sub(n, &publish);
     }
 
     /// The execution pipeline is gone (fail-stop, closed channel): zero the
     /// total, TERMINALLY. Lock-free (the exec thread calls it); every later
     /// registration or release is a no-op.
-    pub fn close(&self, publish: impl FnOnce(i64)) {
+    pub fn close(&self, publish: impl Fn(i64)) {
         self.touch();
-        let prev = self.state.swap(CLOSED, Ordering::Relaxed);
-        if prev & CLOSED == 0 && prev > 0 {
-            publish(-(prev as i64));
+        // One atomic step: drop the total, keep ATTACHED (set once, never
+        // cleared), set CLOSED.
+        let prev = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                Some((s & ATTACHED) | CLOSED)
+            })
+            .unwrap_or_else(|s| s);
+        let n = prev & TOTAL;
+        if prev & CLOSED == 0 && prev & ATTACHED != 0 && n > 0 {
+            publish(-(n as i64));
+        }
+    }
+
+    /// The gauge is attached (the metrics handle exists now): publish the
+    /// total at this instant, then publish every later change as a delta.
+    /// Lock-free and idempotent. The total is published BEFORE [`ATTACHED`]
+    /// becomes visible, so an update that sees it publishes after the total
+    /// that includes what it changes (never negative, see the module docs).
+    pub fn attach(&self, publish: impl Fn(i64)) {
+        self.touch();
+        let mut cur = self.state.load(Ordering::Acquire);
+        let mut published = 0usize;
+        loop {
+            if cur & ATTACHED != 0 {
+                break; // already attached
+            }
+            let t = if cur & CLOSED != 0 { 0 } else { cur & TOTAL };
+            if t != published {
+                publish(t as i64 - published as i64);
+                published = t;
+            }
+            match self.state.compare_exchange_weak(
+                cur,
+                cur | ATTACHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+        if published > 0 {
+            publish(-(published as i64)); // a concurrent attach won
         }
     }
 
@@ -150,7 +201,7 @@ impl ExecBacklog {
         if s & CLOSED != 0 {
             0
         } else {
-            s
+            s & TOTAL
         }
     }
 
@@ -175,22 +226,53 @@ impl ExecBacklog {
         self.touches.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Add `n` unless closed (atomic with [`Self::close`]).
-    fn add(&self, n: usize) -> bool {
-        self.state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
-                (s & CLOSED == 0).then(|| s.saturating_add(n).min(CLOSED - 1))
-            })
-            .is_ok()
+    /// Add `n` unless closed (atomic with [`Self::close`]). Once attached,
+    /// `+n` is published BEFORE the CAS that adds it (taken back if a close
+    /// wins), so a racing close's `-total` can never publish first.
+    fn add(&self, n: usize, publish: &impl Fn(i64)) -> bool {
+        let mut cur = self.state.load(Ordering::Acquire);
+        let mut published = false;
+        loop {
+            if cur & CLOSED != 0 {
+                if published {
+                    publish(-(n as i64));
+                }
+                return false;
+            }
+            if n > 0 && cur & ATTACHED != 0 && !published {
+                publish(n as i64);
+                published = true;
+            }
+            let total = (cur & TOTAL).saturating_add(n).min(TOTAL);
+            match self.state.compare_exchange_weak(
+                cur,
+                (cur & !TOTAL) | total,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
-    /// Subtract `n` unless closed (atomic with [`Self::close`]).
-    fn sub(&self, n: usize) -> bool {
-        self.state
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
-                (s & CLOSED == 0).then(|| s.saturating_sub(n))
-            })
-            .is_ok()
+    /// Subtract `n` unless closed (atomic with [`Self::close`]); published
+    /// AFTER the CAS, iff that CAS saw [`ATTACHED`].
+    fn sub(&self, n: usize, publish: &impl Fn(i64)) {
+        if n == 0 {
+            return;
+        }
+        let res = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                (s & CLOSED == 0).then(|| (s & !TOTAL) | (s & TOTAL).saturating_sub(n))
+            });
+        if let Ok(prev) = res {
+            let dropped = n.min(prev & TOTAL);
+            if prev & ATTACHED != 0 && dropped > 0 {
+                publish(-(dropped as i64));
+            }
+        }
     }
 }
 
@@ -380,6 +462,8 @@ mod tests {
         let b = ExecBacklog::default();
         let gauge = std::cell::Cell::new(0i64);
         let add = |d: i64| gauge.set(gauge.get() + d);
+        b.attach(add);
+        assert_eq!(gauge.get(), 0);
         let n1 = b.register(1, || 6, add);
         assert_eq!(gauge.get(), 6);
         b.register(2, || 4, add);
@@ -391,6 +475,116 @@ mod tests {
         assert_eq!(gauge.get(), 0);
         b.register(3, || 9, add);
         assert_eq!(gauge.get(), 0);
+    }
+
+    /// Codex r2 finding 2: registrations before the gauge is attached (boot
+    /// parks, before node startup attaches the metrics) publish nothing;
+    /// attaching publishes the total, and later releases bring the gauge
+    /// to exactly 0, never below.
+    #[test]
+    fn attach_after_registration_publishes_the_total_never_negative() {
+        let b = ExecBacklog::default();
+        let gauge = std::cell::Cell::new(0i64);
+        let min = std::cell::Cell::new(0i64);
+        let add = |d: i64| {
+            gauge.set(gauge.get() + d);
+            min.set(min.get().min(gauge.get()));
+        };
+        let n1 = b.register(1, || 1, add);
+        let n2 = b.register(2, || 4, add);
+        assert_eq!(gauge.get(), 0, "not attached yet: nothing published");
+        b.attach(add);
+        assert_eq!(gauge.get(), 5, "attach publishes the total");
+        b.attach(add);
+        assert_eq!(gauge.get(), 5, "attach is idempotent");
+        b.sent(1, add);
+        b.release(n1, add);
+        assert_eq!((b.outstanding(), gauge.get()), (4, 4));
+        b.sent(2, add);
+        b.release(n2, add);
+        assert_eq!((b.outstanding(), gauge.get()), (0, 0));
+        assert_eq!(min.get(), 0, "the gauge went negative");
+    }
+
+    /// Attaching after the teardown publishes 0; nothing later publishes.
+    #[test]
+    fn attach_after_close_publishes_nothing() {
+        let b = ExecBacklog::default();
+        let gauge = std::cell::Cell::new(0i64);
+        let add = |d: i64| gauge.set(gauge.get() + d);
+        let n = b.register(1, || 3, add);
+        b.close(add);
+        b.attach(add);
+        b.release(n, add);
+        b.register(2, || 7, add);
+        assert_eq!((b.outstanding(), gauge.get()), (0, 0));
+    }
+
+    /// Codex r2 finding 2, concurrent: the metrics attach at an arbitrary
+    /// point while the dispatcher registers/sends and the exec thread
+    /// releases (and sometimes fail-stops). The gauge never goes negative
+    /// and ends equal to the counter.
+    #[test]
+    fn concurrent_attach_gauge_never_negative_and_ends_equal() {
+        use std::sync::atomic::AtomicI64;
+        use std::sync::Arc;
+        for case in 0..100u64 {
+            let b = Arc::new(ExecBacklog::default());
+            let gauge = Arc::new(AtomicI64::new(0));
+            let min = Arc::new(AtomicI64::new(0));
+            let publish = {
+                let (gauge, min) = (gauge.clone(), min.clone());
+                move |d: i64| {
+                    let now = gauge.fetch_add(d, Ordering::SeqCst) + d;
+                    min.fetch_min(now, Ordering::SeqCst);
+                }
+            };
+            let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(4);
+            let close_at = (case % 3 == 0).then_some(30 + case as usize);
+            let exec = {
+                let (b, publish) = (b.clone(), publish.clone());
+                std::thread::spawn(move || {
+                    let mut seen = 0;
+                    while let Ok(n) = rx.recv() {
+                        b.release(n, &publish);
+                        seen += 1;
+                        if Some(seen) == close_at {
+                            b.close(&publish);
+                        }
+                    }
+                })
+            };
+            let attacher = {
+                let (b, publish) = (b.clone(), publish.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..(case * 37 % 2_000) {
+                        std::hint::spin_loop();
+                    }
+                    b.attach(&publish);
+                })
+            };
+            for h in 1..=300u64 {
+                // Park a few heights ahead (registered, not yet sent).
+                b.register(h + 2, || ((h + 2) % 7) as usize, &publish);
+                let n = b.register(h, || (h % 7) as usize, &publish);
+                if tx.send(n).is_err() {
+                    break;
+                }
+                b.sent(h, &publish);
+            }
+            drop(tx);
+            exec.join().unwrap();
+            attacher.join().unwrap();
+            assert!(
+                min.load(Ordering::SeqCst) >= 0,
+                "case {case}: gauge went negative"
+            );
+            assert_eq!(
+                gauge.load(Ordering::SeqCst),
+                b.outstanding() as i64,
+                "case {case}: gauge != counter"
+            );
+        }
     }
 
     /// Property: over random sequences of in-order registrations (with
