@@ -7240,6 +7240,129 @@ difference slopes of RSS and of jemalloc allocated / resident; figures SVG -> PN
 A's digest classifier), `a-archive.py`. Outputs `series.txt`, `digest.txt`. Full outputs (incl. `series.json`, SVGs) in
 `ozarchy-p3jesoak-run/analyst/` on ozarchy. Driver: `tools/ozarchy-p3jesoak-tools/ozarchy-p3jesoak-campaign.sh`.
 
+## 58. Gossipsub resubscribe-wedge fix: `fix/mesh-watchdog-resubscribe` `e3bb7cca` vs main `925fd962`, SIGKILL restart cells and a saturated A/B, commit-tail mode (campaign ozarchy-wedge, 2026-10-13)
+
+**Kill cells: the wedge never formed in either arm, so this campaign cannot show the fix's effect on it.** In all 32
+SIGKILL restarts (16 per arm, val1, in-place, same key), both survivors dropped the dead QUIC connection 9.98-10.11 s after
+the kill (idle timeout). The restarted node's p2p came up later, 11.2-29.7 s after the kill: RocksDB open ~4.5 s plus
+the replay of the exec queue at the kill. Every survivor saw it as a new first connection (`num_established=1`, 0 of 64
+survivor-kill pairs with a ghost connection, `a-conn.txt`), so gossipsub exchanged subscriptions normally. The chain stall
+per kill is therefore the restart time: the longest val0 commit gap is 19.7 s mean / 29.6 s max (wm) and 18.6 / 27.2 s (wf),
+and it ends 1.4 s (wm) / 0.8 s (wf) on average after the restarted node's network starts. Paired per kill (same round
+and kill index), wf - wm: longest gap -1.1 s [-3.7, +1.4], kill -> chain resumes -0.9 s [-3.4, +1.5], gap after
+network start -0.8 s [-2.3, +0.8]. No difference is resolved. Mesh watchdog disconnects 0 in both arms, stale-connection
+kicks 0 (wf). `NoPeersSubscribedToTopic` lines: 9 (wm) and 4 (wf) in total, all on the restarted node, 0-1 per kill.
+`Failed to publish tx:` and `failed to publish native batch:` 0. Section 52's wedge needed the network back within the
+~10 s window. SIGTERM gave that: the old process held its connection through the 3.7-10.7 s shutdown, then the restart
+took 3-4 s. A SIGKILL can give it too, if the replay is short. Section 46's p3r1 y1-s-KILL cell (step 1, replay from a
+recent checkpoint) brought the network back 8.1-8.8 s after each kill. 3 of its 4 kills left ghost connections on both
+survivors (`num_established=2`), with 157-291 `NoPeersSubscribedToTopic` lines, 6 watchdog reconnects in the cell and a
+37.5 s stall starting 47 s after kill 3. p3r1's other SIGKILL cells (network 10.3-22.8 s) had none. The precondition is
+the network start, not the signal.
+
+**Saturated A/B (no kill): no regression resolved.** wf - wm, paired over 4 ABBA rounds (95% CI, t(3)): matched/s
+-0.86% [-2.42, +0.69], CPU-s/1M -0.39% [-1.79, +1.02], native blocks/s -0.42% [-9.1, +8.3], commit interval p99 +1.2%
+[-10.9, +13.4], exec p99 -1.3% [-1.8, -0.8] (-8.7 ms). In every healthy cell, both arms showed watchdog disconnects 0,
+stale-connection kicks 0 (wf), `NoPeersSubscribedToTopic` 0 and publish failures 0. wf's subscribe-delay histogram had
+2 observations per node per cell (the startup connections), all in the 50 ms bucket (sum 1-2 ms).
+
+Owner-approved (18c): bench the resubscribe-wedge fix. **wf** = `fix/mesh-watchdog-resubscribe` `e3bb7cca` (= wm + 3
+commits: `df33fe75` RED test, `c9bcd951` connection-denying behaviours first (no ghost connections), `e3bb7cca`
+stale-connection kick + mesh watchdog grace 5 s / tick 1 s, new `torus_mesh_stale_conn_disconnects` and
+`torus_consensus_subscribe_delay_seconds`; node `a16b9ad2`). **wm** = main `925fd962` (watchdog grace 60 s on the 10 s mesh
+tick; node `ea4445ca`). Both glibc (`malloc` UND in `.dynsym`), no Phase 3 (no checkpoint knob, no enable line, no
+checkpoint series), `TORUS_MESH_*` / `TORUS_CONSENSUS_DIRECT_FAN` / `_GOSSIP_MIRROR` / `TORUS_GOSSIP_QUEUE_LEN` unset (node
+defaults) on every node, checked per cell. Fresh target dirs and clean detached worktrees
+(`ozarchy-wedge-build.sh`, the p3je build flags), md5s in `ozarchy-wedge-build/md5s-all.txt`. Bench `05d44313`, harness
+`218ad251`, tw, Classic, 300 markets, MAX_IN_FLIGHT 4, budget 900, **commit tail** (as p3term and the recent A/Bs), shared NVMe.
+
+### 58.1 Kill cells (section 52 method, SIGKILL)
+
+Driver `ozarchy-wedge-kill-campaign.sh` (copy of `ozarchy-p3term-campaign.sh`): 540 s cells, state hash on, SIGKILL of
+val1 at bench + 60, 180, 300, 420 s, same-key in-place restart (patched `crash-kill.sh`, KILL_WAIT 75 s), n = 4 ABBA
+(r1 wm wf, r2 wf wm, r3 wm wf, r4 wf wm) + w0 (wm, 60 s, excluded). The sampler scraped each node's `/metrics` every 1 s,
+including `torus_consensus_subscribed_validators`, `torus_mesh_watchdog_disconnects_total`, `torus_mesh_stale_conn_disconnects_total`
+and the subscribe-delay histogram. The plan killed val2 in rounds 2 and 4. The first launch stopped after r2-wf: the
+bench's commit-mode block tail reads val2's RPC (`127.0.0.1:8647`), so a down val2 gives 469 tail errors and the
+driver's tail-WARNING stop. r2-wf (val2) is kept as an extra outside the ABBA set. The rest ran with val1 kills under the
+tags r2b-* / r3-* / r4-* (`RESUME=1`). A 150 s wf smoke cell (one kill) checked the samplers and the grep first.
+
+Per arm (16 kills each; mean / median / min / max, s from the kill; chain = val0's `on_committed_block` lines):
+
+| | wm `925fd962` | wf `e3bb7cca` |
+|---|---|---|
+| kill -> restarted node's p2p started | 18.6 / 17.8 / 11.3 / 29.7 | 18.2 / 18.7 / 11.2 / 27.1 |
+| kill -> chain resumes (end of the longest gap) | 20.0 / 19.6 / 12.1 / 29.9 | 19.1 / 20.2 / 11.5 / 27.3 |
+| longest chain-wide commit gap | 19.7 / 19.5 / 12.1 / 29.6 | 18.6 / 19.5 / 11.5 / 27.2 |
+| kill -> restarted node's first commit | 19.2 / 18.9 / 11.4 / 29.9 | 18.5 / 19.8 / 11.4 / 27.2 |
+| gaps > 15 s / > 30 s | 13 / 0 | 12 / 0 |
+| `NoPeersSubscribedToTopic` lines (val0 / val1 / val2) | 0 / 9 / 0 | 0 / 4 / 0 |
+| tx / native batch publish failures | 0 / 0 | 0 / 0 |
+| watchdog disconnects / stale kicks | 0 / n.a. | 0 / 0 |
+| subscribe delay (wf, all nodes) | n.a. | 32 obs., all <= 50 ms, sum 0.26 s |
+
+By kill index the longest gap is 13.9 / 21.2 / 24.8 / 19.1 s (wm) and 13.2 / 21.0 / 20.9 / 19.4 s (wf) for kills 1-4.
+Kill 1 is shortest because the exec queue (= the replay) is still short 60 s into the bench. Section 52's "first chain
+commit after the restart" is not used here. After a SIGKILL that restarts in 0.3 s, it is the block already voted before
+the kill (0.4-1.3 s), not the end of the stall.
+
+`consensus_subscribed_validators` per scrape: in wf the survivors show 1 from 10.9-11.9 s after the kill (the QUIC drop at
+10.0 s plus the 1 s watchdog tick). The restarted node shows 0 at its first scrape, then all three show 2 again 1.6 s
+after its network start on average (19.8 s after the kill). wm updates this gauge only on the 10 s mesh tick, so its drop
+and recovery show up 0-10 s late (all-2 again 29.1 s after the kill on average, while the chain resumed at 20.0 s). The two
+arms' gauge timelines are not comparable for this reason. The chain commit times above are.
+
+Extra cell r2-wf (val2 killed, outside the ABBA set): longest gaps 16.5 / 28.4 / 27.9 / 21.3 s, network start 17.1-29.0 s,
+1 `NoPeersSubscribedToTopic` line, no watchdog disconnect or stale kick. Its load ran with 469 block-tail errors (in-flight
+slots freed by the 70 s timeout), so its throughput is not used.
+
+Correctness: every kill cell rc 2 = the known crash-gate false FAIL (it matches the INFO line `running state hash fail-stop
+(TORUS_STATE_HASH_FAILSTOP) on=false` in the restart tail). There were no HARD FINDING and no CHECK FAIL lines, and every
+state-hash checkpoint was equal on the 3 validators (29-39 heights per cell, 0 disagree). Block hashes were equal. 4 of 8
+cells (wm r2b, r3; wf r1, r3) end DISAGREE on the state digest. The restarted val1 differs only in the mark-based fields
+(`accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed`, `withdrawable`) of 50 of 650 accounts. Cash,
+balances and stake are equal. This is section 46 Open item 3's mark-only artifact (oracle paused before the account reads),
+in both arms.
+
+### 58.2 Saturated A/B (no kill)
+
+Driver `ozarchy-wedge-sat-campaign.sh` (copy of `ozarchy-p3je-campaign.sh`, CAMP=WSAT): harness RATE 76000, 120 s cells,
+n = 4 ABBA + w0 (wm, 60 s, excluded), 11:39-12:33. All 9 cells: rc 0, ACCEPT, AGREE. Analysis: section 56's
+`a-cells.py` / `a-paired.py`.
+
+| metric | wm | wf | wf - wm (95% CI, paired, t(3)) |
+|---|---|---|---|
+| matched/s | 200,292 | 198,561 | -1,731 [-4,839, +1,377] = -0.86% [-2.42, +0.69] |
+| CPU-s / 1M matched | 25.86 | 25.76 | -0.39% [-1.79, +1.02] |
+| native blocks/s | 3.546 | 3.531 | -0.42% [-9.14, +8.30] |
+| commit interval p50 / p99 (ms) | 157 / 1,181 | 150 / 1,196 | p99 +1.24% [-10.94, +13.41] |
+| exec per block mean / p99 (ms) | 342 / 675 | 346 / 666 | p99 -1.29% [-1.78, -0.79] |
+| bench submit (window, /s) | 1,144 | 1,157 | +1.16% [-1.07, +3.40] |
+| RSS peak / mean (GB, per node) | 4.11 / 3.49 | 4.17 / 3.53 | +1.5% / +1.1% (CIs include 0) |
+
+Per round matched/s wf - wm: -472, -1,015, -4,642, -794. The resolved exec p99 difference (-1.3%) is small, and this
+change does not touch the exec path. Read it as noise until repeated.
+
+### 58.3 Verdict
+
+* **No throughput or CPU regression** at saturation (matched/s -0.86% [-2.42, +0.69], CPU-s/1M -0.39% [-1.79, +1.02]),
+  and no false-positive kicks or watchdog disconnects in healthy cells or in the 32 kill restarts.
+* **The fix's benefit is not measured here.** With SIGKILL and this harness's restart path on main-based binaries (DB open
+  + exec-queue replay before the network starts, 11-30 s), the survivors' 10 s QUIC idle timeout always clears the old
+  connection first. Neither arm wedged, and the stalls (~19-20 s mean, max 30 s) are the restart time in both. The wedge
+  needs the restarted node's network back within ~10 s of the kill. Section 52's SIGTERM cells (9 of 12 restarts on main)
+  and section 46's y1-s-KILL cell (network at 8.1-8.8 s) had that, and so does 18c's in-process repro (75.4 s -> 0.4-0.7 s).
+  A bench of the benefit needs section 52's SIGTERM cells or a SIGKILL restart whose p2p starts within ~10 s (short
+  replay, e.g. a Phase 3 step binary or kills while the exec queue is short). Owner's call.
+* Trap for the harness: with `IN_FLIGHT_TAIL=commit` only val1 may be killed (the tail reads val2's RPC).
+
+Analysis (`tools/ozarchy-wedge-tools/`): `a-wedge.py` (per kill: network start, survivor drop, chain resume / longest gap
+from val0's commit lines, restarted node's first commit, publish-failure lines per window, mesh counter and histogram
+deltas from the 1 s samples, subscribed-validators recovery), `analyst/a-conn.py` (ghost-connection check from the
+survivors' `peer connected` / `peer disconnected` lines), `analyst/paired-kills.txt` (per-kill paired deltas). Outputs
+`analyst/a-wedge.txt`, `a-conn.txt`, `kills.json`, `sat-paired.txt`, `sat-cells.txt`. Drivers
+`ozarchy-wedge-kill-campaign.sh`, `ozarchy-wedge-sat-campaign.sh`, builds `ozarchy-wedge-build*.sh`, md5s `analyst/md5s-all.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -7255,6 +7378,11 @@ A's digest classifier), `a-archive.py`. Outputs `series.txt`, `digest.txt`. Full
   exec block; 1 of 8 over Docker's 10 s grace; never near the 60 s bound), checkpoint share ~0.15 s. (2) still open: the
   resubscribe stall hit 9 of 12 restarts (watchdog reconnect at 70-80 s) and stalled the chain 56-75 s once per cell
   (control too); it set the one 59.8 s kill -> first commit.
+  **Fix benched (section 58, review log row 66):** `e3bb7cca` (stale-connection kick + 5 s / 1 s watchdog) shows no
+  saturated regression (matched/s -0.86% [-2.42, +0.69], CPU-s/1M -0.39% [-1.79, +1.02]) and no false kicks. Its benefit
+  was not measurable with these SIGKILL cells: the restarted node's network starts 11-30 s after the kill, after the survivors'
+  10 s QUIC idle drop, so neither arm wedged (0 ghost connections in 64 survivor-kill pairs). A benefit bench needs
+  section 52's SIGTERM cells or a SIGKILL restart with p2p up within ~10 s (section 46 y1-s-KILL wedged that way).
 
 - **Mode 3 revisit, before mainnet, deep-book shape only** (section 36, plan 9.13, review log row
   41; owner via 18c s107: Classic on testnet, no book mode in genesis now). At the standard shape

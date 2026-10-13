@@ -4794,3 +4794,145 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-ja/buckets.csv' \
   '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-ja/tasks.txt'
 ```
+
+### `wedge` (A 0 KiB, B 727.4 MiB; dirs: `ozarchy-wedge-kill-smoke-300m-s0-wf`, `ozarchy-wedge-kill-300m-w0`, `ozarchy-wedge-kill-300m-r1-wm`, `ozarchy-wedge-kill-300m-r1-wf`, `ozarchy-wedge-kill-300m-r2-wf`, `ozarchy-wedge-kill-300m-r2b-wf`, `ozarchy-wedge-kill-300m-r2b-wm`, `ozarchy-wedge-kill-300m-r3-wm`, `ozarchy-wedge-kill-300m-r3-wf`, `ozarchy-wedge-kill-300m-r4-wf`, `ozarchy-wedge-kill-300m-r4-wm`, `ozarchy-wedge-sat-300m-w0`, `ozarchy-wedge-sat-300m-r1-wm`, `ozarchy-wedge-sat-300m-r1-wf`, `ozarchy-wedge-sat-300m-r2-wf`, `ozarchy-wedge-sat-300m-r2-wm`, `ozarchy-wedge-sat-300m-r3-wm`, `ozarchy-wedge-sat-300m-r3-wf`, `ozarchy-wedge-sat-300m-r4-wf`, `ozarchy-wedge-sat-300m-r4-wm`)
+
+Campaign ozarchy-wedge (results doc section 58, plan row 66): resubscribe-wedge fix `e3bb7cca` (wf) vs main `925fd962` (wm). Keep each cell's `summary.json`, `ckpt-samples.txt` (1 s mesh gauges), `crash-kill*.json`, `crash-freeze.json`, `metrics-*-val*.txt`, `state-digest-val*.txt`, `cpu*.csv`, `bench.log`, `run.log` and the run dirs `ozarchy-wedge-kill-run` / `ozarchy-wedge-sat-run` (campaign logs, analyst outputs). Tier B = the raw node logs and per-second samplers; the per-kill numbers are in `ozarchy-wedge-kill-run/analyst/kills.json` and `a-wedge.txt`, the ghost-connection check in `a-conn.txt`.
+
+Tier B, 727.4 MiB, 120 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-smoke-300m-s0-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-smoke-300m-s0-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-smoke-300m-s0-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-smoke-300m-s0-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-smoke-300m-s0-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-smoke-300m-s0-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-w0/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-w0/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-w0/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-w0/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-w0/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-w0/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r1-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r2b-wm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r3-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-kill-300m-r4-wm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-w0/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-w0/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-w0/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-w0/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-w0/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-w0/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r1-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r2-wm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wm/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r3-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wf/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wf/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wf/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wf/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wm/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wm/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wm/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wm/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wm/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-wedge-sat-300m-r4-wm/val2.log.gz'
+```
+
+Outside the tree: the two fresh target dirs, 11.32 GiB apparent (rebuildable with `ozarchy-wedge-build.sh`), the staged binaries and the two build worktrees (clean, detached; `git worktree remove`):
+
+```
+rm -r -- \
+  '/home/oz/.cargo-target-wedge-wm-925fd962' \
+  '/home/oz/.cargo-target-wedge-wf-e3bb7cca'
+# staged binaries ozarchy-wedge-stage (reflinks of the built nodes + bench, 3.47 GiB apparent)
+rm -r -- '/home/oz/bench-results-matched/ozarchy-wedge-stage'
+git -C /home/oz/projects/torus-economy/Torus-hyperBFT worktree remove /home/oz/projects/wt/wedge-wm-925fd962
+git -C /home/oz/projects/torus-economy/Torus-hyperBFT worktree remove /home/oz/projects/wt/wedge-wf-e3bb7cca
+```
