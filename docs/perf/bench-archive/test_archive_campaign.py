@@ -10,7 +10,11 @@ Usage: python3 -I docs/perf/bench-archive/test_archive_campaign.py [-v]
   archive or the summary table; DELETABLE.md fence or `bash -n` failure) and each check (a)-(d).
 * Smoke tests: the meta's [[smoke]] analyst commands run from the staged tools copy against the fixture cells; a
   match passes, a mismatch / crash (the p3cloidprof prefix bug) / missing script or output / timeout refuses with
-  exit 5 and writes nothing (also in --dry-run); no declaration warns (s), --strict refuses.
+  exit 5 and writes nothing (also in --dry-run); no declaration warns (s), --strict refuses. SmokeSame: the line
+  comparison (tolerance; a non-finite number only matches the identical string).
+* Options: CellRoles ([cell_roles]), RunExclude ([tools] run_exclude), OutputPaths (--index-file / --cells-file /
+  --deletable-file / --tools-dir), StripTrailing ([tools] strip_trailing, check t), SummaryRows (cols without
+  arms.txt).
 * GoldenP3cloid re-archives campaign ozarchy-p3cloid from the live data in /home/oz/bench-results-matched onto
   the archive files of 6b643edb^ with meta/p3cloid.toml and compares byte for byte with what 6b643edb committed
   (INDEX.md, cells.md, DELETABLE.md, tools/ozarchy-p3cloid-tools/ incl. file modes) and runs the meta's smoke check
@@ -1019,6 +1023,397 @@ class CheckD(FixtureCase):
         self.assertIn("section '12. Not written yet", fx.read("INDEX.md"))
 
 
+FULL_COLS = {
+    "matched": "193,398",
+    "blk": "2.61",
+    "p99": "1,196",
+    "cpu": "27.93",
+    "rss": "4.67 / 4.91",
+    "writes": "231.6",
+    "settle": "n/a",
+}
+
+
+class CellRoles(FixtureCase):
+    """[cell_roles]: pattern -> role per cell (first match in meta order); cell_role stays the default."""
+
+    def rows(self):
+        return {l.split(" | ")[0][3:-1]: l.split(" | ")[4] for l in self.fx.read("INDEX.md").split("\n") if l.startswith("| `ozarchy-tc")}
+
+    def test_default_single_role(self):
+        fx = self.fx
+        m = dict(fx.meta, cell_role="cell")
+        self.assertOk(fx.run(meta=m))
+        rows = self.rows()
+        self.assertTrue(rows["ozarchy-tc-300m-r1-a"].endswith("; cell 120 s"))
+        self.assertTrue(rows["ozarchy-tc-300m-r1-b"].endswith("; cell 120 s"))
+        # unchanged wording of the generated INDEX paragraph with one role
+        self.assertRegex(fx.read("INDEX.md"), r"its 8 dirs were added \([^:]+: 2 cell cells, the warm-up `w0`,")
+
+    def test_per_cell_roles(self):
+        fx = self.fx
+        # "*-b" also matches the smoke cell: smoke and warm-up keep their own role
+        m = dict(fx.meta, cell_roles={"*-r1-b": "soak", "*-b": "restart", "*-w0": "never"})
+        r = fx.run(meta=m)
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        rows = self.rows()
+        self.assertTrue(rows["ozarchy-tc-300m-r1-a"].endswith("; throughput 120 s"), rows)
+        self.assertTrue(rows["ozarchy-tc-300m-r1-b"].endswith("; soak 120 s"), rows)
+        self.assertTrue(rows["ozarchy-tc-300m-w0"].endswith("; warm-up 60 s, excluded"), rows)
+        self.assertTrue(rows["ozarchy-tc-smoke-300m-s0-b"].endswith("; smoke 60 s, excluded"), rows)
+        # the generated INDEX paragraph counts the cells per role, in run order
+        self.assertIn(": 1 throughput cell, 1 soak cell, the warm-up `w0`,", fx.read("INDEX.md"))
+
+    def test_bad_cell_roles_is_an_error(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        for bad in (["*-b", "soak"], {"*-b": 3}):
+            r = fx.run(meta=dict(fx.meta, cell_roles=bad))
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("cell_roles", r.stderr)
+            self.assertEqual(fx.snapshot(), snap)
+
+
+class RunExclude(FixtureCase):
+    """[tools] run_exclude: globs (file name) for the run dir's own *.txt files, which are copied to analyst/."""
+
+    def tools_files(self):
+        t = os.path.join(self.fx.archive, "tools", "ozarchy-tc-tools")
+        return sorted(os.path.relpath(os.path.join(r_, f), t) for r_, _, fs in os.walk(t) for f in fs)
+
+    def setUp(self):
+        super().setUp()
+        rd = os.path.join(self.fx.bench, "ozarchy-tc-run")
+        write(os.path.join(rd, "jeconf-proof.txt"), "x" * 5000)
+        write(os.path.join(rd, "notes.txt"), "n\n")
+
+    def test_default_copies_every_run_txt(self):
+        self.assertOk(self.fx.run())
+        got = self.tools_files()
+        self.assertIn("analyst/jeconf-proof.txt", got)
+        self.assertIn("analyst/notes.txt", got)
+
+    def test_run_exclude(self):
+        fx = self.fx
+        m = json.loads(json.dumps(fx.meta))
+        m["tools"] = {"run_exclude": ["jeconf-*.txt"]}
+        r = fx.run(meta=m)
+        self.assertOk(r)
+        got = self.tools_files()
+        self.assertNotIn("analyst/jeconf-proof.txt", got)
+        self.assertIn("analyst/notes.txt", got)
+        self.assertIn("analyst/cells.txt", got)  # analyst files are not affected
+
+    def test_bad_run_exclude_is_an_error(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        for bad in ("jeconf-*.txt", [1]):
+            m = json.loads(json.dumps(fx.meta))
+            m["tools"] = {"run_exclude": bad}
+            r = fx.run(meta=m)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("run_exclude", r.stderr)
+            self.assertEqual(fx.snapshot(), snap)
+
+
+class OutputPaths(FixtureCase):
+    """--index-file / --cells-file / --deletable-file / --tools-dir: write somewhere else than the archive dir."""
+
+    def setUp(self):
+        super().setUp()
+        fx = self.fx
+        self.out = os.path.join(fx.tmp, "out")
+        self.paths = {
+            "index": os.path.join(self.out, "IDX.md"),
+            "cells": os.path.join(self.out, "C.md"),
+            "deletable": os.path.join(self.out, "D.md"),
+            "tools": os.path.join(self.out, "tools-tc"),
+        }
+        write(self.paths["index"], INDEX_MD)
+        write(self.paths["cells"], CELLS_MD)
+        write(self.paths["deletable"], DELETABLE_MD)
+
+    def args(self):
+        p = self.paths
+        return ["--index-file", p["index"], "--cells-file", p["cells"], "--deletable-file", p["deletable"],
+                "--tools-dir", p["tools"]]
+
+    def test_overridden_paths_are_written_archive_untouched(self):
+        fx = self.fx
+        snap = {k: v for k, v in fx.snapshot().items() if k != "<summary>"}
+        r = fx.run(*self.args())
+        self.assertOk(r)
+        self.assertEqual({k: v for k, v in fx.snapshot().items() if k != "<summary>"}, snap)
+        with open(self.paths["index"]) as f:
+            self.assertIn("**Updated 2026-10-13 (tc).**", f.read())
+        with open(self.paths["cells"]) as f:
+            self.assertIn("## tc: tc heading (section 7)", f.read())
+        with open(self.paths["deletable"]) as f:
+            self.assertIn("### `tc` (A ", f.read())
+        self.assertTrue(os.path.isfile(os.path.join(self.paths["tools"], "analyst", "cells.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(self.paths["tools"], "md5s-all.txt")))
+        self.assertIn("smoke check 1/1 OK", r.stdout)
+        # the refusal sees the overridden files: a second run is refused, nothing changes
+        before = open(self.paths["index"]).read()
+        r = fx.run(*self.args())
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(open(self.paths["index"]).read(), before)
+
+    def test_tools_dir_alone_is_checked_for_presence(self):
+        fx = self.fx
+        os.makedirs(self.paths["tools"])
+        r = fx.run("--tools-dir", self.paths["tools"])
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("tools-tc", r.stderr)
+
+    def test_dry_run_labels_name_the_overridden_files(self):
+        fx = self.fx
+        r = fx.run("--dry-run", *self.args())
+        self.assertOk(r)
+        for p in ("index", "cells", "deletable"):
+            self.assertIn("+++ b/%s\n" % self.paths[p], r.stdout)
+        self.assertIn("+++ b/%s/md5s-all.txt\n" % self.paths["tools"], r.stdout)
+
+    def test_same_output_path_twice_is_refused(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        index = os.path.join(fx.archive, "INDEX.md")
+        r = fx.run("--deletable-file", index)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("same file", r.stderr)
+        self.assertIn(index, r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+        # another spelling of the same file, and a doc inside the tools copy dir
+        r = fx.run("--cells-file", os.path.join(fx.archive, "x", "..", "INDEX.md"))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("same file", r.stderr)
+        r = fx.run(*self.args()[:6], "--tools-dir", self.out)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn(self.out, r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+        self.assertEqual(sorted(os.listdir(self.out)), ["C.md", "D.md", "IDX.md"])
+
+    def test_default_labels_unchanged(self):
+        r = self.fx.run("--dry-run")
+        self.assertOk(r)
+        for f in ("INDEX.md", "cells.md", "DELETABLE.md"):
+            self.assertIn("+++ b/%s\n" % f, r.stdout)
+        self.assertIn("+++ b/tools/ozarchy-tc-tools/md5s-all.txt\n", r.stdout)
+
+
+# a perf report as `perf report --stdio` writes it: the column header lines are padded with blanks
+PERF_REPORT = (
+    "# To display the perf.data header info, please use --header/--header-only options.\n#\n"
+    "# Overhead  Command          Symbol" + " " * 40 + "\n"
+    "# ........  ...............  ......\n#\n"
+    "    12.50%  exec             [.] foo\n\n\n"
+)
+PERF_REPORT_STRIPPED = (
+    "# To display the perf.data header info, please use --header/--header-only options.\n#\n"
+    "# Overhead  Command          Symbol\n"
+    "# ........  ...............  ......\n#\n"
+    "    12.50%  exec             [.] foo\n"
+)
+
+
+class StripTrailing(FixtureCase):
+    """[tools] strip_trailing: globs (path in the tools copy) whose trailing blanks are stripped when staged, so the
+    archived copy passes `git diff --check`; unlisted files are copied byte for byte and warned about (t)."""
+
+    def setUp(self):
+        super().setUp()
+        write(self.an("perf-report-r1-a.txt"), PERF_REPORT)
+        write(self.an("a-perf-report-r1-a.py"), "import sys\nsys.stdout.write(open(sys.argv[1]).read())\n")
+        write(self.an("blob.txt"), b"x \0 \n")
+        write(self.an("a-blob.py"), "")  # its producer (check b)
+
+    def an(self, *p):
+        return os.path.join(self.fx.bench, "ozarchy-tc-run", "analyst", *p)
+
+    def staged(self, rel):
+        with open(os.path.join(self.fx.archive, "tools", "ozarchy-tc-tools", rel), "rb") as f:
+            return f.read()
+
+    def meta(self, globs, smoke=None):
+        m = json.loads(json.dumps(self.fx.meta))
+        m["tools"] = {"strip_trailing": globs}
+        if smoke:
+            m["smoke"] = m["smoke"] + [smoke]
+        return m
+
+    def test_default_copies_verbatim_and_warns(self):
+        fx = self.fx
+        r = fx.run()
+        self.assertOk(r)
+        self.assertEqual(self.staged("analyst/perf-report-r1-a.txt"), PERF_REPORT.encode())
+        w = [l for l in r.stderr.splitlines() if l.startswith("WARNING (t)")]
+        self.assertEqual(len(w), 1, r.stderr)
+        self.assertIn("analyst/perf-report-r1-a.txt", w[0])
+        self.assertIn("strip_trailing", w[0])
+        self.assertNotIn("blob.txt", w[0])  # binary: never touched, never warned about
+
+    def test_strict_refuses_on_trailing_blanks(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        r = fx.run("--strict")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("WARNING (t)", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
+    def test_strip_trailing(self):
+        fx = self.fx
+        # the smoke command reproduces the report with its blanks: compared against the stripped archived copy
+        smoke = {
+            "script": "analyst/a-perf-report-r1-a.py",
+            "args": ["%s" % self.an("perf-report-r1-a.txt")],
+            "compare": [{"want": "analyst/perf-report-r1-a.txt"}],
+        }
+        r = fx.run("--strict", meta=self.meta(["analyst/perf-report-*.txt", "analyst/blob.txt"], smoke))
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        self.assertIn("smoke check 2/2 OK", r.stdout)
+        self.assertEqual(self.staged("analyst/perf-report-r1-a.txt"), PERF_REPORT_STRIPPED.encode())
+        self.assertEqual(self.staged("analyst/blob.txt"), b"x \0 \n")  # binary: copied as is
+        self.assertEqual(self.staged("analyst/cells.txt"), CELLS_TXT.encode())
+
+    def test_clean_want_matches_padded_output(self):
+        fx = self.fx
+        # the archived report is clean already, the smoke run prints it padded: still a match under strip_trailing
+        write(self.an("perf-report-r1-a.txt"), PERF_REPORT_STRIPPED)
+        write(self.an("padded.txt"), PERF_REPORT)
+        smoke = {
+            "script": "analyst/a-perf-report-r1-a.py",
+            "args": [self.an("padded.txt")],
+            "compare": [{"want": "analyst/perf-report-r1-a.txt"}],
+        }
+        r = fx.run(meta=self.meta(["analyst/perf-report-*.txt", "analyst/padded.txt"], smoke))
+        self.assertOk(r)
+        self.assertIn("smoke check 2/2 OK", r.stdout)
+        self.assertEqual(self.staged("analyst/perf-report-r1-a.txt"), PERF_REPORT_STRIPPED.encode())
+
+    def test_stripped_want_still_catches_a_real_difference(self):
+        fx = self.fx
+        write(self.an("other.txt"), PERF_REPORT.replace("12.50%", "13.50%"))
+        smoke = {
+            "script": "analyst/a-perf-report-r1-a.py",
+            "args": [self.an("other.txt")],
+            "compare": [{"want": "analyst/perf-report-r1-a.txt"}],
+        }
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta(["analyst/perf-report-*.txt"], smoke))
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertIn("13.50%", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
+    def test_bad_strip_trailing_is_an_error(self):
+        r = self.fx.run(meta=self.meta("*.txt"))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("strip_trailing", r.stderr)
+
+    def test_crlf_counts_as_trailing_whitespace(self):
+        fx = self.fx
+        # `git diff --check` flags the \r of a CRLF line end
+        write(self.an("crlf.txt"), b"a\r\nb \r\n\r\n")
+        write(self.an("a-crlf.py"), "")
+        snap = fx.snapshot()
+        r = fx.run("--strict", meta=self.meta(["analyst/perf-report-*.txt"]))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        w = [l for l in r.stderr.splitlines() if l.startswith("WARNING (t)")]
+        self.assertEqual(len(w), 1, r.stderr)
+        self.assertIn("analyst/crlf.txt", w[0])
+        self.assertEqual(fx.snapshot(), snap)
+        r = fx.run("--strict", meta=self.meta(["analyst/perf-report-*.txt", "analyst/crlf.txt"]))
+        self.assertOk(r)
+        self.assertEqual(self.staged("analyst/crlf.txt"), b"a\nb\n")
+
+    def test_strip_unit(self):
+        m = load_module()
+        self.assertEqual(m.strip_trailing(PERF_REPORT.encode()), PERF_REPORT_STRIPPED.encode())
+        self.assertEqual(m.strip_trailing(b"a \t\nb  "), b"a\nb")
+        self.assertEqual(m.strip_trailing(b""), b"")
+        self.assertEqual(m.strip_trailing(b"\n\n"), b"")
+        self.assertEqual(m.strip_trailing(b"a\n"), b"a\n")
+        self.assertEqual(m.strip_trailing(b"a\r\nb \r\n\r\n"), b"a\nb\n")
+        self.assertEqual(m.strip_trailing(b"a\r"), b"a")
+        self.assertTrue(m.has_trailing(b"a\r\n"))
+        self.assertFalse(m.has_trailing(b"a\rb\n"))  # a bare \r inside a line is not at its end
+
+
+class SummaryRows(FixtureCase):
+    """[summary] rows: numbers from analyst/arms.txt unless [[summary.rows]] cols gives them."""
+
+    def meta_rows(self, *rows):
+        m = json.loads(json.dumps(self.fx.meta))
+        m["summary"]["rows"] = list(rows)
+        return m
+
+    def summary_lines(self):
+        with open(self.fx.summary) as f:
+            return f.read().split("\n")
+
+    def test_all_cols_overridden_needs_no_arms_txt(self):
+        # a soak row whose numbers all come from another table: arms.txt is not read (it may not exist)
+        fx = self.fx
+        os.rename(
+            os.path.join(fx.bench, "ozarchy-tc-run", "analyst", "arms.txt"),
+            os.path.join(fx.tmp, "arms.txt.away"),
+        )
+        row = {"label": "7 soak 600 s", "arm": "a", "text": "a soak", "cols": FULL_COLS}
+        r = fx.run(meta=self.meta_rows(row))
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        self.assertIn(
+            "| 7 soak 600 s | a soak | 193,398 | 2.61 | 1,196 | 27.93 | 4.67 / 4.91 | 231.6 | n/a | |",
+            self.summary_lines(),
+        )
+
+    def test_all_cols_overridden_arm_not_in_arms_txt(self):
+        row = {"label": "7 soak 600 s", "arm": "soak", "text": "soak", "cols": FULL_COLS}
+        self.assertOk(self.fx.run(meta=self.meta_rows(row)))
+
+    def test_missing_arms_txt_still_fatal_when_a_col_is_not_given(self):
+        fx = self.fx
+        os.rename(
+            os.path.join(fx.bench, "ozarchy-tc-run", "analyst", "arms.txt"),
+            os.path.join(fx.tmp, "arms.txt.away"),
+        )
+        cols = dict(FULL_COLS)
+        del cols["settle"]
+        row = {"label": "7 soak 600 s", "arm": "a", "text": "a soak", "cols": cols}
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_rows(row))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("arms.txt", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
+    def test_overridden_col_missing_from_arms_txt_does_not_warn(self):
+        # wr is not in arms.txt, but the row gives writes: no "no wr in arms.txt" warning
+        fx = self.fx
+        p = os.path.join(fx.bench, "ozarchy-tc-run", "analyst", "arms.txt")
+        write(p, "\n".join(l for l in ARMS_TXT.split("\n") if not l.startswith("wr ")))
+        row = {"label": "7 SAT 120 s", "arm": "a", "text": "a text", "cols": {"writes": "145.1"}}
+        r = fx.run(meta=self.meta_rows(row))
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        self.assertIn(
+            "| 7 SAT 120 s | a text | 188,654 | 3.41 | 1,251 | 26.43 | 3.62 / 4.25 | 145.1 | n/a | |",
+            self.summary_lines(),
+        )
+        # without the override the gap still warns (a fresh fixture: this one is archived now)
+        row = {"label": "7 SAT 120 s", "arm": "a", "text": "a text"}
+        fx2 = Fixture(os.path.join(fx.tmp, "second"))
+        write(
+            os.path.join(fx2.bench, "ozarchy-tc-run", "analyst", "arms.txt"),
+            "\n".join(l for l in ARMS_TXT.split("\n") if not l.startswith("wr ")),
+        )
+        m = json.loads(json.dumps(fx2.meta))
+        m["summary"]["rows"] = [row]
+        r = fx2.run("--dry-run", meta=m)
+        self.assertOk(r)
+        self.assertIn("WARNING (m) summary row a: no wr in arms.txt", r.stderr)
+
+
 class Smoke(FixtureCase):
     """The smoke-run check: the archived analysis is run from the staged tools copy against real cells and its output
     is diffed with the archived output; any failure refuses (exit 5) and writes nothing, like the fence check."""
@@ -1297,6 +1692,18 @@ class Smoke(FixtureCase):
             }
         )
 
+    def test_overflowing_numbers_refused_under_tolerance(self):
+        # 1e400 and 9e400 both parse to inf: a tolerance must not let two different overflowing values match
+        fx = self.fx
+        write(self.an("a-big.py"), "print('r1-b b ms=9e400')\n")
+        write(self.an("big.txt"), "r1-b b ms=1e400\n")
+        cmp_ = {"want": "analyst/big.txt", "tolerance": 1e-4}
+        snap = fx.snapshot()
+        r = fx.run(
+            meta=self.meta_with({"script": "analyst/a-big.py", "compare": [cmp_]})
+        )
+        self.assertRefused(r, snap, "-r1-b b ms=1e400", "+r1-b b ms=9e400")
+
     def test_malformed_declaration_is_an_error(self):
         fx = self.fx
         snap = fx.snapshot()
@@ -1304,6 +1711,57 @@ class Smoke(FixtureCase):
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("smoke", r.stderr)
         self.assertEqual(fx.snapshot(), snap)
+
+
+class SmokeSame(unittest.TestCase):
+    """smoke_same(a, b, tol): a non-finite number (inf, -inf, nan, or a literal that overflows to inf) only matches
+    the identical string; finite numbers keep the relative tolerance."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.same = staticmethod(load_module().smoke_same)
+
+    def test_overflow_to_inf_is_a_mismatch(self):
+        for tol in (0, 1e-4, 0.5):
+            self.assertFalse(self.same("ms=1e400", "ms=9e400", tol), tol)
+            self.assertFalse(self.same("ms=-1e400", "ms=-9e400", tol), tol)
+            self.assertFalse(self.same("a 1e400 b", "a 2E+400 b", tol), tol)
+
+    def test_overflow_vs_finite_is_a_mismatch(self):
+        # inf - 1e308 = inf, inf > tol * inf is False: the old check passed these
+        for tol in (1e-4, 0.5):
+            self.assertFalse(self.same("ms=1e308", "ms=1e400", tol), tol)
+            self.assertFalse(self.same("ms=1e400", "ms=1.7e308", tol), tol)
+
+    def test_overflow_vs_inf_literal_is_a_mismatch(self):
+        for tol in (0, 1e-4):
+            self.assertFalse(self.same("ms=1e400", "ms=inf", tol), tol)
+            self.assertFalse(self.same("ms=inf", "ms=1e400", tol), tol)
+
+    def test_identical_non_finite_strings_match(self):
+        for tol in (0, 1e-4):
+            self.assertTrue(self.same("ms=inf", "ms=inf", tol), tol)
+            self.assertTrue(self.same("ms=-inf", "ms=-inf", tol), tol)
+            self.assertTrue(self.same("ms=nan", "ms=nan", tol), tol)
+            self.assertTrue(self.same("ms=1e400", "ms=1e400", tol), tol)
+        # the identical non-finite part matches while the finite numbers on the line use the tolerance
+        self.assertTrue(self.same("x=1e400 y=1000.0", "x=1e400 y=1000.04", 1e-4))
+        self.assertTrue(self.same("x=inf y=1000.0", "x=inf y=1000.04", 1e-4))
+        self.assertFalse(self.same("x=1e400 y=1000.0", "x=1e400 y=1001.0", 1e-4))
+
+    def test_non_finite_spelled_differently_is_a_mismatch(self):
+        self.assertFalse(self.same("ms=inf", "ms=Infinity", 1e-4))
+        self.assertFalse(self.same("ms=nan", "ms=NaN", 1e-4))
+
+    def test_finite_tolerance_unchanged(self):
+        self.assertTrue(self.same("ms=1000.0 n=3", "ms=1000.0 n=3", 0))
+        self.assertFalse(self.same("ms=1000.0", "ms=1000.04", 0))
+        self.assertTrue(self.same("ms=1000.0", "ms=1000.04", 1e-4))
+        self.assertFalse(self.same("ms=1000.0", "ms=1000.2", 1e-4))
+        self.assertTrue(self.same("ms=1.0e300", "ms=1.00001e300", 1e-4))
+        self.assertTrue(self.same("ms=0", "ms=0.0", 1e-4))
+        self.assertFalse(self.same("ms=1.0 a", "ms=1.0 b", 1e-4))
+        self.assertFalse(self.same("ms=1.0", "ms=1.0 2.0", 1e-4))
 
 
 class Units(unittest.TestCase):

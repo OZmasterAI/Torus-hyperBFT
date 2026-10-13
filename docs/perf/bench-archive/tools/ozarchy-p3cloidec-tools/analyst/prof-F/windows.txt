@@ -1,0 +1,13 @@
+profile windows on val1 (W1 = perf.data, W2 = perf-w2.data): fills, blocks, utime, phase sums
+ec-r1-c100                     w1 span 47.5s fills 9231807 (194270/s) blk 244 utime 211.9s stime 24.5s engine/blk 153.3ms engine/1k 4.053ms engine_untimed/1k 0.505ms phase1_actions/1k 0.673ms phase_margin/1k 0.893ms phase_match/1k 0.479ms phase_settle/1k 1.260ms
+ec-r1-c100                     w2 span 22.7s fills 3975602 (174896/s) blk 84 utime 115.3s stime 12.5s engine/blk 206.8ms engine/1k 4.369ms engine_untimed/1k 0.595ms phase1_actions/1k 0.622ms phase_margin/1k 0.945ms phase_match/1k 0.553ms phase_settle/1k 1.423ms
+ec-r1-c100                     exec tid 3530533 utime W1 37.67s; W1 samples 145134; group ms/1k exec 4.197 other 13.052 pool 5.706
+ec-r4-c100                     w1 span 47.5s fills 8815087 (185678/s) blk 218 utime 221.1s stime 23.7s engine/blk 169.4ms engine/1k 4.189ms engine_untimed/1k 0.512ms phase1_actions/1k 0.700ms phase_margin/1k 0.929ms phase_match/1k 0.514ms phase_settle/1k 1.257ms
+ec-r4-c100                     w2 span 22.5s fills 4096856 (182441/s) blk 70 utime 113.5s stime 9.0s engine/blk 249.8ms engine/1k 4.267ms engine_untimed/1k 0.511ms phase1_actions/1k 0.603ms phase_margin/1k 1.087ms phase_match/1k 0.525ms phase_settle/1k 1.308ms
+ec-r4-c100                     exec tid 3670994 utime W1 37.52s; W1 samples 151292; group ms/1k exec 4.393 other 14.793 pool 5.897
+ec-r6-c100                     w1 span 47.3s fills 8934966 (189022/s) blk 218 utime 216.6s stime 23.4s engine/blk 164.3ms engine/1k 4.009ms engine_untimed/1k 0.504ms phase1_actions/1k 0.672ms phase_margin/1k 0.919ms phase_match/1k 0.503ms phase_settle/1k 1.186ms
+ec-r6-c100                     w2 span 22.9s fills 4197169 (183565/s) blk 71 utime 112.6s stime 8.5s engine/blk 247.7ms engine/1k 4.190ms engine_untimed/1k 0.504ms phase1_actions/1k 0.639ms phase_margin/1k 1.015ms phase_match/1k 0.513ms phase_settle/1k 1.302ms
+ec-r6-c100                     exec tid 3763171 utime W1 37.309999999999995s; W1 samples 148896; group ms/1k exec 4.280 other 14.246 pool 5.721
+ec-r7-c100                     w1 span 47.6s fills 9208862 (193496/s) blk 224 utime 227.7s stime 23.8s engine/blk 166.6ms engine/1k 4.053ms engine_untimed/1k 0.481ms phase1_actions/1k 0.680ms phase_margin/1k 0.934ms phase_match/1k 0.489ms phase_settle/1k 1.227ms
+ec-r7-c100                     w2 span 21.7s fills 4169338 (192130/s) blk 72 utime 104.7s stime 8.1s engine/blk 229.4ms engine/1k 3.962ms engine_untimed/1k 0.482ms phase1_actions/1k 0.598ms phase_margin/1k 0.947ms phase_match/1k 0.551ms phase_settle/1k 1.208ms
+ec-r7-c100                     exec tid 3808375 utime W1 38.58s; W1 samples 153628; group ms/1k exec 4.279 other 14.555 pool 5.891

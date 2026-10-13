@@ -484,3 +484,402 @@ fn the_order_row_stores_the_cloid_in_16_bytes() {
     let none_id = b.place_order(gtc(true, 99, 1, None), addr(1), 1).order_id;
     assert_eq!(b.encode_order_row(none_id).unwrap().len() + 16, some.len());
 }
+
+// ---- perf/cloid-engine-cost: a pinned seeded stream ----
+//
+// The cloid engine-cost changes (pre-sized claimed set, one-pass log,
+// skipped book re-check, compact key) must not change one result. This
+// stream drives one book with cloid traffic (duplicates on purpose, fills,
+// cancels by id / cloid, modifies, cancel-alls, stops, triggers) and folds
+// every result, every drained log record, the index and the serialized
+// book into one digest pinned on the pre-change code (c88d3073).
+
+/// splitmix64: a fixed stream, no dependency.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn pick(&mut self, lo: i64, hi: i64) -> i64 {
+        lo + self.below((hi - lo + 1) as u64) as i64
+    }
+}
+
+/// The digest of `seed`'s stream on one book (see above). Also checks the
+/// book's invariants and the log mirror along the way.
+fn seeded_book_stream(seed: u64, ops: usize) -> u64 {
+    use std::fmt::Write as _;
+    let mut rng = Rng(seed);
+    let mut b = book();
+    let mut m = Mirror::of(&mut b);
+    let mut out = String::new();
+    let cloid = |rng: &mut Rng| (rng.below(4) != 0).then(|| C + rng.below(6) as u128);
+    let live = |b: &OrderBook| {
+        let mut v: Vec<(Address, u128, OrderId)> = b.cloid_entries().collect();
+        v.sort();
+        v
+    };
+    for k in 0..ops {
+        let trader = addr(1 + rng.below(4) as u8);
+        let ts = k as u64;
+        let r = rng.below(100);
+        let _ = write!(out, "{k}:{r}:");
+        if r < 35 {
+            let is_buy = rng.below(2) == 0;
+            let px = if is_buy {
+                rng.pick(96, 101)
+            } else {
+                rng.pick(99, 104)
+            };
+            let res = b.place_order(gtc(is_buy, px, rng.pick(1, 3), cloid(&mut rng)), trader, ts);
+            let _ = write!(out, "{res:?}");
+        } else if r < 45 {
+            let is_buy = rng.below(2) == 0;
+            let px = if is_buy { 106 } else { 94 };
+            let params = p(
+                is_buy,
+                fp(px),
+                fp(rng.pick(1, 4)),
+                OrderType::Limit,
+                TimeInForce::IOC,
+                cloid(&mut rng),
+            );
+            let res = b.place_order(params, trader, ts);
+            let _ = write!(out, "{res:?}");
+        } else if r < 52 {
+            let is_buy = rng.below(2) == 0;
+            let trigger = if is_buy {
+                rng.pick(101, 105)
+            } else {
+                rng.pick(95, 99)
+            };
+            let params = p(
+                is_buy,
+                fp(if is_buy { trigger + 5 } else { trigger - 5 }),
+                fp(1),
+                OrderType::StopMarket {
+                    trigger: fp(trigger),
+                },
+                TimeInForce::GTC,
+                cloid(&mut rng),
+            );
+            let res = b.place_order(params, trader, ts);
+            let _ = write!(out, "{res:?}");
+        } else if r < 62 {
+            // Cancel by cloid (a miss is common).
+            let c = C + rng.below(6) as u128;
+            match b.order_id_by_cloid(&trader, c) {
+                Some(id) if b.pending_stop(id).is_some() => {
+                    let _ = write!(out, "stop {:?}", b.cancel_stop(id).map(|s| s.id));
+                }
+                Some(id) => {
+                    let _ = write!(out, "cancel {:?}", b.cancel_order(id).map(|o| o.id));
+                }
+                None => out.push_str("miss"),
+            }
+        } else if r < 70 {
+            let v = live(&b);
+            if !v.is_empty() {
+                let (_, _, id) = v[rng.below(v.len() as u64) as usize];
+                match b.pending_stop(id) {
+                    Some(_) => {
+                        let _ = write!(out, "stop {:?}", b.cancel_stop(id).map(|s| s.id));
+                    }
+                    None => {
+                        let _ = write!(out, "cancel {:?}", b.cancel_order(id).map(|o| o.id));
+                    }
+                }
+            }
+        } else if r < 75 {
+            let v = live(&b);
+            if !v.is_empty() {
+                let (_, _, id) = v[rng.below(v.len() as u64) as usize];
+                if let Some(o) = b.get_order(id) {
+                    // Passive prices only (a raw book modify does not match).
+                    let new_px = Some(fp(match o.side {
+                        Side::Buy => rng.pick(90, 95),
+                        Side::Sell => rng.pick(105, 110),
+                    }));
+                    let new_q = (rng.below(2) == 0).then(|| fp(1));
+                    let res = b.modify_order(id, new_px, new_q);
+                    let _ = write!(
+                        out,
+                        "modify {:?}",
+                        res.map(|o| (o.id, o.price, o.remaining_qty))
+                    );
+                }
+            }
+        } else if r < 78 {
+            let ids: Vec<OrderId> = b.cancel_all(trader, None).iter().map(|o| o.id).collect();
+            let _ = write!(out, "cancel_all {ids:?}");
+        } else if r < 81 {
+            let fired: Vec<(OrderId, Option<Cloid>)> = b
+                .check_stops()
+                .iter()
+                .map(|s| (s.id, s.params.client_order_id))
+                .collect();
+            let _ = write!(out, "triggered {fired:?}");
+        } else if r < 83 {
+            let _ = write!(out, "take_stops {:?}", b.take_pending_stops(&trader));
+        } else if r < 92 {
+            let is_buy = rng.below(2) == 0;
+            let px = if is_buy {
+                rng.pick(96, 101)
+            } else {
+                rng.pick(99, 104)
+            };
+            let res = b.place_order(gtc(is_buy, px, rng.pick(1, 3), None), trader, ts);
+            let _ = write!(out, "{res:?}");
+        } else {
+            // Drain the log: the records the executor's index keeps.
+            b.drain_cloid_log(|t, c, live| {
+                let _ = write!(out, "[{t} {c:#x} {live:?}]");
+                match live {
+                    Some(id) => {
+                        m.0.insert((t, c), id);
+                    }
+                    None => {
+                        m.0.remove(&(t, c));
+                    }
+                }
+            });
+            assert_eq!(m.0, entries(&b), "op {k}: the log missed a change");
+        }
+        out.push('\n');
+        if k % 97 == 0 {
+            b.verify_invariants();
+        }
+    }
+    m.assert_matches(&mut b);
+    b.verify_invariants();
+    let _ = writeln!(out, "live {:?}", live(&b));
+    let blob = borsh::to_vec(&b).unwrap();
+    // A reload gives the same index.
+    let reloaded = OrderBook::try_from_slice(&blob).unwrap();
+    assert_eq!(live(&reloaded), live(&b));
+    let _ = write!(out, "blob {}", alloy_primitives::hex::encode(&blob));
+    // The stream exercises what it claims to.
+    assert!(
+        out.matches("DuplicateCloid").count() >= 100,
+        "seed {seed}: duplicates"
+    );
+    assert!(
+        out.matches("cancel Ok").count() >= 100,
+        "seed {seed}: cancels"
+    );
+    let fired = out.matches("TriggeredStop {").count() + out.matches("triggered [(").count();
+    assert!(fired >= 5, "seed {seed}: triggers {fired}");
+    // FNV-1a 64: a fixed fold, not a security hash.
+    out.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+        (h ^ x as u64).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Pinned on c88d3073 (before the cloid engine-cost changes): every
+/// result, drained log record, the index and the book bytes of three
+/// seeded streams.
+#[test]
+fn a_seeded_cloid_stream_gives_the_pinned_results() {
+    let got: Vec<u64> = [1u64, 2, 0xc10d]
+        .iter()
+        .map(|&s| seeded_book_stream(s, 3_000))
+        .collect();
+    let want: [u64; 3] = [
+        0x6801_a91a_0438_47d3,
+        0x0caf_afa0_ae93_c5e2,
+        0xe1d7_4ee9_ad42_4e95,
+    ];
+    assert_eq!(got, want, "got {got:#x?}");
+}
+
+/// perf/cloid-engine-cost fix 2: a book whose log a worker resolved
+/// (`resolve_cloid_log`, any number of times, also with changes after the
+/// last one) drains exactly the records, in the same order, as a book that
+/// never resolved: `(trader, cloid, the entry NOW)` per logged key.
+#[test]
+fn a_resolved_log_drains_the_same_records_as_a_plain_one() {
+    type Rec = Vec<(Address, u128, Option<OrderId>)>;
+    let drain = |b: &mut OrderBook| {
+        let mut v: Rec = Vec::new();
+        b.drain_cloid_log(|t, c, live| v.push((t, c, live)));
+        assert_eq!(b.cloid_log_len(), 0);
+        v
+    };
+    let mut drained = 0usize;
+    for seed in 1..=40u64 {
+        let mut rng = Rng(seed);
+        let (mut plain, mut resolved) = (book(), book());
+        for k in 0..400u64 {
+            let trader = addr(1 + rng.below(3) as u8);
+            let c = C + rng.below(4) as u128;
+            match rng.below(10) {
+                0..=3 => {
+                    let is_buy = rng.below(2) == 0;
+                    let px = if is_buy {
+                        rng.pick(97, 101)
+                    } else {
+                        rng.pick(99, 103)
+                    };
+                    let q = rng.pick(1, 2);
+                    let a = plain.place_order(gtc(is_buy, px, q, Some(c)), trader, k);
+                    let b = resolved.place_order(gtc(is_buy, px, q, Some(c)), trader, k);
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"));
+                }
+                4 => {
+                    let a = plain
+                        .order_id_by_cloid(&trader, c)
+                        .map(|id| plain.cancel_order(id).is_ok());
+                    let b = resolved
+                        .order_id_by_cloid(&trader, c)
+                        .map(|id| resolved.cancel_order(id).is_ok());
+                    assert_eq!(a, b);
+                }
+                5 => {
+                    let a: Vec<OrderId> = plain
+                        .cancel_all(trader, None)
+                        .iter()
+                        .map(|o| o.id)
+                        .collect();
+                    let b: Vec<OrderId> = resolved
+                        .cancel_all(trader, None)
+                        .iter()
+                        .map(|o| o.id)
+                        .collect();
+                    assert_eq!(a, b);
+                }
+                6 | 7 => resolved.resolve_cloid_log(),
+                8 => {
+                    let (a, b) = (drain(&mut plain), drain(&mut resolved));
+                    assert_eq!(a, b, "seed {seed} op {k}");
+                    drained += a.len();
+                }
+                _ => {
+                    assert_eq!(
+                        plain.cloid_log_len(),
+                        resolved.cloid_log_len(),
+                        "seed {seed} op {k}"
+                    );
+                }
+            }
+        }
+        assert_eq!(drain(&mut plain), drain(&mut resolved), "seed {seed} end");
+        assert_eq!(entries(&plain), entries(&resolved));
+    }
+    assert!(drained > 1_000, "{drained} records compared");
+}
+
+/// fix 2: clearing a resolved log forgets the resolved records too.
+#[test]
+fn clearing_a_resolved_log_empties_it() {
+    let mut b = book();
+    b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 1);
+    b.resolve_cloid_log();
+    b.place_order(gtc(true, 99, 1, Some(C + 1)), addr(1), 2);
+    assert_eq!(b.cloid_log_len(), 2);
+    b.clear_cloid_log();
+    assert_eq!(b.cloid_log_len(), 0);
+    let mut n = 0;
+    b.drain_cloid_log(|_, _, _| n += 1);
+    assert_eq!(n, 0);
+}
+
+/// perf/cloid-engine-cost fix 3: when the caller has applied the cloid
+/// rule (the cloid is free in this book), the checked entry gives exactly
+/// the result and the book of the regular one. Seeded streams; a live
+/// cloid goes through the regular entry on both books, as the executor's
+/// contract demands.
+#[test]
+fn the_cloid_checked_entry_places_like_the_regular_one() {
+    let mut checked_places = 0usize;
+    for seed in 1..=30u64 {
+        let mut rng = Rng(seed);
+        let (mut regular, mut checked) = (book(), book());
+        for k in 0..300u64 {
+            let trader = addr(1 + rng.below(3) as u8);
+            let c = (rng.below(5) != 0).then(|| C + rng.below(4) as u128);
+            let is_buy = rng.below(2) == 0;
+            let px = if is_buy {
+                rng.pick(97, 101)
+            } else {
+                rng.pick(99, 103)
+            };
+            let tif = if rng.below(4) == 0 {
+                TimeInForce::IOC
+            } else {
+                TimeInForce::GTC
+            };
+            let params = p(is_buy, fp(px), fp(rng.pick(1, 3)), OrderType::Limit, tif, c);
+            if rng.below(6) == 0 {
+                if let Some(c) = c {
+                    if let Some(id) = regular.order_id_by_cloid(&trader, c) {
+                        assert!(regular.cancel_order(id).is_ok());
+                        assert!(checked.cancel_order(id).is_ok());
+                    }
+                }
+            }
+            let free = c.is_none_or(|c| regular.order_id_by_cloid(&trader, c).is_none());
+            let a = regular.place_order_with_accounts(params.clone(), trader, k, None, None);
+            let b = if free {
+                checked_places += 1;
+                checked.place_order_with_accounts_cloid_checked(params, trader, k, None, None)
+            } else {
+                checked.place_order_with_accounts(params, trader, k, None, None)
+            };
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "seed {seed} op {k}");
+        }
+        assert_eq!(entries(&regular), entries(&checked));
+        assert_eq!(
+            borsh::to_vec(&regular).unwrap(),
+            borsh::to_vec(&checked).unwrap()
+        );
+        checked.verify_invariants();
+    }
+    assert!(checked_places > 4_000, "{checked_places}");
+}
+
+/// fix 3: debug builds still look the cloid up on the checked entry and
+/// stop a caller that broke the contract.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "placed as checked but live")]
+fn a_checked_placement_of_a_live_cloid_panics_in_debug() {
+    let mut b = book();
+    b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 1);
+    b.place_order_with_accounts_cloid_checked(gtc(true, 99, 1, Some(C)), addr(1), 2, None, None);
+}
+
+/// perf/cloid-engine-cost (cleanup): `forget_cloid` drops the entry and
+/// logs it only when the entry is this id's; another id's entry stays,
+/// unlogged; a missing key does nothing.
+#[test]
+fn forget_cloid_drops_only_its_own_entry() {
+    let mut b = book();
+    let id = b
+        .place_order(gtc(true, 100, 1, Some(C)), addr(1), 1)
+        .order_id;
+    b.clear_cloid_log();
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), Some(C), id + 1);
+    assert_eq!(b.order_id_by_cloid(&addr(1), C), Some(id), "another id's");
+    assert_eq!(b.cloid_log_len(), 0);
+    OrderBook::forget_cloid(&mut b.cloids, addr(2), Some(C), id);
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), None, id);
+    assert_eq!((b.cloid_count(), b.cloid_log_len()), (1, 0), "no entry");
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), Some(C), id);
+    assert_eq!(b.order_id_by_cloid(&addr(1), C), None);
+    assert_eq!(b.cloid_log_len(), 1);
+    OrderBook::forget_cloid(&mut b.cloids, addr(1), Some(C), id);
+    assert_eq!(b.cloid_log_len(), 1, "gone: nothing more");
+    let mut log = Vec::new();
+    b.drain_cloid_log(|t, c, live| log.push((t, c, live)));
+    assert_eq!(log, vec![(addr(1), C, None)]);
+}

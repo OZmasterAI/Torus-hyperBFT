@@ -8243,6 +8243,313 @@ section. Full outputs
 are in `ozarchy-p3kd-run/analyst/` on ozarchy. The driver is `tools/ozarchy-p3kd-tools/ozarchy-p3kd-campaign.sh`. The
 `matched-bench/` copy is p3gate's (`crash-kill.sh` archived again, the rest is `c88d3073`'s).
 
+## 63. Cloid engine-cost fixes: perf/cloid-engine-cost `bc44a845` vs `c88d3073`, both jemalloc compiled in, CLOID_SHARE 100 (n = 4 ABBA, perf on val1) and 0, commit-tail mode (campaign ozarchy-p3cloidec, 2026-10-13)
+
+**At 100% cloid share the fixes raise matched/s by +5.6% (ABBA paired +10,120 [+256, +19,984], 95% CI t(3); 180,373 ->
+190,493) and recover about a third of B's own cloid cost (34%, CI 1-68%).** On B (`c88d3073`) c100 runs -14.1% below c0
+here. The engine-side views put the recovery at 32-52%. Engine ms per 1k fills drop -0.235 [-0.286, -0.183]. All of that
+is `engine_untimed`, which drops 0.806 -> 0.485 (-0.321 [-0.360, -0.282]; 52% of B's +0.622). Phase 1 and match do not
+move. Exec `block_ms` drops -12.7% [-22.0, -3.4]. On the profiled node (val1, W1), the exec thread spends -0.285 [-0.411,
+-0.159] ms CPU per 1k fills less, and the exec-thread cloid sites drop 0.725 -> 0.364:
+* index upkeep: drain 0.332 -> 0.140;
+* duplicate pre-pass: 0.323 -> 0.167 (`duplicate_cloid` 0.183 -> 0.073, claimed set 0.140 -> 0.094, its `reserve_rehash`
+  0.058 -> 0);
+* cleanup: `forget_cloid` 0.071 -> 0.057.
+
+The market workers are flat (+0.084 [-0.262, +0.429]). Their cloid sites shift: the per-book `contains_key` is gone, and
+the cloid-log resolve (0.057) moved there from the exec thread. Node CPU-s/1M is flat (-0.49% [-1.29, +0.30]), and so is
+RSS. At c0 (n = 2 per arm, a regression check only) F and B tie: matched/s -0.04%.
+
+Requested by 18c after section 60 (where the cloid engine cost goes: index upkeep and the duplicate pre-pass on the exec
+thread, the per-book check / `index_cloid` / `forget_cloid` in the workers). Does 18c's `perf/cloid-engine-cost` remove
+it? **F** = `bc44a845`, 6 commits on `c88d3073`:
+* `d026fa2d`: pinning tests;
+* fix 1 `3f649036`: the pre-pass claimed set is pre-sized for the call's cloid placements;
+* fix 2 `f0144c6f`: the cloid log is resolved in the worker, one lookup per record;
+* fix 3 `927c0721`: the batch workers skip the book's repeated cloid lookup;
+* fix 4 `a2c5bd25`: a packed lossless 40-byte `CloidKey` with a cheaper hash (two `write_u128` and one `write_u32`
+  instead of foldhash's long path over the 36-byte `(Address, u128)`), and a smaller index value;
+* extra `bc44a845`: `forget_cloid` in one lookup.
+
+Node `19ac8761` (build id `de85ebf3`), bench `e562e616`, built fresh by `ozarchy-p3cloidec-build.sh` into
+`/home/oz/.cargo-target-p3cloidec-bc44a845` (21:21). **B** = `c88d3073`, F's merge-base (node `4e0d8b84`, build id
+`77deb7af`, bench `ae96e0c1`): p3gate's s2 build (15:53) reused, not rebuilt. **The build flags are the same in both arms**
+(line 1 of `ozarchy-p3cloidec-build/F.build.log` and `ozarchy-p3gate-build/s2.build.log`):
+`RUSTFLAGS=-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes`,
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, release profile. Both have jemalloc compiled in (preflight nm 1,168
+jemalloc symbols in each node, no LD_PRELOAD, no MALLOC_CONF). `TORUS_CHECKPOINT_INTERVAL_MS=15000` was set per cell on
+both arms. Neither sha has step 6 (unset = 15 s is on main `d3cba5e2` only), so this matches the shipped default. md5s
+(`md5s.txt`): F node `19ac8761473462128bae9f3fe94a2b05`, bench `e562e6163937c6cf9d93a836a44500e0`; B node
+`4e0d8b84f54f53d5b6db2d5e696cd51c`, bench `ae96e0c13f568213822754da8074ed80`.
+
+Workload as section 61 plus cloids: CLOID_SHARE=100 (c100, every placed order stamped) and 0 (c0), full workload, tw, Classic,
+cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, RATE 76000 (saturated), 120 s cells, commit tail, shared
+NVMe, btrfs data dirs. Harness = the `c88d3073` worktree (run-cell.sh, summarize.py, crash-kill.sh, detach.sh); the
+per-cell step files (cell-step.sh, cell_step.py, campaign-template.sh) are main `d3cba5e2`'s. Driver
+`ozarchy-p3cloidec-campaign.sh` CAMP=CLOIDEC (from the campaign template: after every cell, `cell_step` validates it and
+appends a `cells.tsv` row). `cloidprof-sidecar.sh` (section 60's) records perf on val1 in every cell:
+* W1, 35-80 s: `cycles:u`, fp call graphs, the whole process;
+* W2, 82-102 s: the exec thread only, 5 events incl. DRAM demand fills.
+
+Smoke 21:50-21:58 (s0-F100, s0-B0, 60 s; both ACCEPT AGREE). A first smoke attempt was stopped by the quiet-host gate
+(rust-analyzer running) and moved aside (`ozarchy-p3cloidec-smoke1-blocked`, not used). Cells 21:59-23:18:
+* w0 (B100, 60 s, excluded);
+* c100 r1-F r2-B r3-B r4-F r5-B r6-F r7-F r8-B (ABBA x 2, pairs r1-r2, r4-r3, r6-r5, r7-r8);
+* then c0 q1-F q2-B q3-B q4-F (ABBA).
+
+221 CHECK OK, no CHECK FAIL, 0 HARD FINDING. The host was quiet before every cell (no cargo / rustc / rust-analyzer,
+1-min load 1.67-1.99). The node md5 matched the arm's staged md5 in every cell (`node-environ-trie.txt` x 3 and
+`summary.json`; `cell-step/*.json`). The cloid checks pass in every cell:
+* c100: stamped / placed 1.0000, `share_pct` 100;
+* c0: stamped 0, `share_pct` 0;
+* `duplicate_cloid` rejects: 0 on all 3 nodes in all cells.
+
+Checkpoints: 13-16 per node per 120 s cell in both arms.
+
+**Validity.** 12 of 13 cells are rc 0, ACCEPT, AGREE. **q1-F0 is rc 2, REJECT DISAGREE: the mark-only digest artifact**
+(sections 46.4, 61, 62). val2's digest differs from val0's at compare height 1,178 on 50 lines, in `accountValue`,
+`freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed` and `withdrawable` only. The block hash and the counters are equal
+on all 3 nodes, there are 0 panic / fail-stop / error lines, and liveness passes. val2's digest was the fast one (18.4 s vs
+87.4 / 90.7 s). `cell_step` classifies it `mark-only-digest` and keeps the row ok by design. **It is counted in F0 here,**
+as earlier sections count such cells for their measurements. The analyst left it out as a "harness bug" (F0 n = 1): that
+is corrected below (63.6). **perf:** on q4-F0 the sidecar's W1 `perf record` exited rc 255 after ~1 s (0.3 MB
+`perf.data`; W2 is fine). q1-F0's W1 and W2 recordings are complete (27 MB, 4.7 MB), but the analyst did not process them
+(the cell was excluded). So no F c0 profile is analysed in this section. The profile compares F100 with B100 (n = 4 each)
+and uses B0 (q2, q3) as the zero line.
+
+### 63.1 Cells and the c100 A/B (n = 4 ABBA, paired F100 - B100, 95% CI t(3); `paired.txt`, `cells-all.txt`, `ec-metrics.txt`)
+
+| cell | arm | rc / verdict | matched/s | native blk/s | node CPU-s/1M | engine ms per 1k fills | `engine_untimed` per 1k fills |
+|---|---|---|---|---|---|---|---|
+| w0 (60 s, excluded) | B100 | 0, ACCEPT AGREE | 174,713 | 4.25 | 25.98 | | |
+| r1 / r2 | F100 / B100 | 0 / 0, ACCEPT AGREE | 191,625 / 176,292 | 4.30 / 3.58 | 26.19 / 26.34 | 3.952 / 4.203 | 0.509 / 0.857 |
+| r4 / r3 | F100 / B100 | 0 / 0, ACCEPT AGREE | 188,133 / 180,715 | 3.67 / 3.44 | 26.20 / 26.31 | 3.936 / 4.164 | 0.488 / 0.808 |
+| r6 / r5 | F100 / B100 | 0 / 0, ACCEPT AGREE | 191,918 / 176,821 | 3.80 / 3.53 | 25.99 / 26.28 | 3.863 / 4.130 | 0.477 / 0.802 |
+| r7 / r8 | F100 / B100 | 0 / 0, ACCEPT AGREE | 190,297 / 187,665 | 3.89 / 3.54 | 25.95 / 25.92 | 3.821 / 4.014 | 0.466 / 0.755 |
+| q1 / q4 | F0 | 2 (mark-only digest, counted) / 0 | 212,046 / 207,604 | 3.98 / 3.86 | 23.52 / 24.15 | 3.451 / 3.593 | 0.181 / 0.190 |
+| q2 / q3 | B0 | 0 / 0, ACCEPT AGREE | 211,903 / 207,902 | 4.07 / 3.83 | 23.79 / 23.76 | 3.456 / 3.511 | 0.182 / 0.186 |
+
+Engine columns: whole cell, mean of val0-2, from the phase timer metrics (`a-ec-metrics.py`).
+
+| metric | B100 | F100 | F100 - B100 [95% CI] | % [95% CI] |
+|---|---|---|---|---|
+| matched/s | 180,373 | 190,493 | +10,120 [+256, +19,984] | **+5.61% [+0.14, +11.08]**; Welch (`arms.txt`) +5.61% [+1.36, +9.86] |
+| placed/s | 236,154 | 249,506 | +13,352 | +5.65% [+0.13, +11.18] |
+| bench submits/s (closed loop) | 1,197 | 1,201 | +4 | +0.36% [-3.98, +4.69] |
+| native blocks/s | 3.53 | 3.92 | +0.39 | **+11.11% [+1.10, +21.11]** |
+| fills per native block | 49,856 | 45,590 | -4,266 | -8.56% [-16.84, -0.27] |
+| exec `block_ms` (mean of 3 nodes) | 263.2 | 229.7 | -33.5 | **-12.71% [-21.98, -3.44]** |
+| exec per native block p50 / p99 ms | 382 / 730 | 356 / 709 | -26 / -21 | -6.69% [-9.72, -3.67] / -2.89% [-6.28, +0.50] |
+| engine ms per 1k fills (summary) | 4.115 | 3.880 | -0.235 | **-5.71% [-6.73, -4.69]** |
+| residual untimed ms per native block | 21.6 | 19.2 | -2.4 | -11.08% [-37.28, +15.12] |
+| exec busy | 0.963 | 0.964 | +0.001 | tie |
+| node CPU-s/1M | 26.21 | 26.08 | -0.13 | -0.49% [-1.29, +0.30]; equal fills (ANCOVA) -0.46% [-1.42, +0.49] |
+| block time (commit interval) p99 ms | 1,422 | 1,413 | -9 | -0.61% [-9.33, +8.12] |
+| RSS mean / peak GB per node (bench window) | 5.16 / 6.35 | 5.14 / 6.39 | -0.02 / +0.04 | -0.35% [-7.49, +6.79] / +0.57% [-6.25, +7.39] |
+| device writes MB/s per validator | 69.3 | 70.8 | +1.5 | +2.16% [-0.15, +4.48] |
+
+Per pair, matched/s rises +15,333 / +7,418 / +15,097 / +2,632 (r8-B100, 187,665, is the highest B cell). The exec thread is
+saturated in both arms (busy 0.96), so the lower exec time per fill becomes throughput. This is the same mechanism as in
+59/60, in reverse.
+
+### 63.2 How much of B's own cloid cost the fixes recover (`writeup.txt`, `ec-metrics.txt`, `prof-paired.txt`)
+
+| view | B c100 - c0 | F100 - B100 (paired) | recovered |
+|---|---|---|---|
+| matched/s | -29,529 (-14.07%) | +10,120 [+256, +19,984] | **34% [1, 68]** (CI from the paired delta only) |
+| engine ms per 1k fills (metrics) | +0.644 | -0.235 [-0.286, -0.183] | 36% |
+| `engine_untimed` ms per 1k fills | +0.622 | -0.321 [-0.360, -0.282] | **52%** |
+| W1 exec thread, all cloid sites | +0.711 | -0.361 [-0.409, -0.312] | 51% |
+| W1 exec thread total | +0.903 | -0.285 [-0.411, -0.159] | 32% |
+| W1 exec + workers, all cloid sites | +0.901 | -0.380 [-0.440, -0.320] | 42% |
+
+F100 is still -9.25% below B0. **B's c100 cost is larger here than in sections 59/60:** matched/s -14.1% vs -11.7% / -12.5%,
+engine per 1k fills +18.3% vs +13.9% / +13.1%, `engine_untimed` +0.622 vs +0.566, CPU-s/1M +10.2% vs +8.8% / +8.9%. The
+build is different (`c88d3073`, Phase 3 at 15 s, jemalloc compiled in; 59/60 ran `ef812b02` on glibc without Phase 3). The
+B gap is also not interleaved: all c0 cells ran after all c100 cells (22:54-23:18 vs 22:04-22:52), and the four c0 cells
+drift down over that time (212.0k, 211.9k, 207.9k, 207.6k). So the denominator carries cross-block uncertainty that the
+34% CI does not include.
+
+### 63.3 Engine phase timers (whole cell, mean of val0-2, ms per 1k fills; `ec-metrics.txt`, `writeup.txt`)
+
+| phase | B0 (n = 2) | B100 | F100 | F0 (n = 2, q1 counted) | F100 - B100 paired [95% CI] |
+|---|---|---|---|---|---|
+| engine | 3.484 | 4.128 | 3.893 | 3.522 | **-0.235 [-0.286, -0.183]** |
+| `engine_untimed` | 0.184 | 0.806 | 0.485 | 0.186 | **-0.321 [-0.360, -0.282]** |
+| `phase1_actions` | 0.540 | 0.595 | 0.590 | 0.554 | -0.005 [-0.041, +0.031] |
+| `phase_margin` | 0.861 | 0.841 | 0.880 | 0.888 | +0.040 [+0.020, +0.059] |
+| `phase_match` | 0.459 | 0.467 | 0.483 | 0.459 | +0.016 [+0.010, +0.022] |
+| `phase_settle` | 1.216 | 1.202 | 1.227 | 1.216 | +0.024 [+0.003, +0.045] |
+
+The whole engine drop is in `engine_untimed`, where section 60 placed both exec-thread cloid sites (the pre-pass and the
+absorb / drain run outside the phase timers). Phase 1 and match are flat. Margin, match and settle per 1k fills rise
+slightly in F (+0.016 to +0.040, resolved) while F runs 8.6% fewer fills per native block. Per native block all three are
+lower in F (not resolved; `ec-metrics.txt`). The +0.016 in match is consistent with fix 2 moving the cloid-log resolve into
+the workers, inside the match phase (63.4); not tested separately.
+
+### 63.4 Profile: where the exec thread saves (W1, val1, ms CPU per 1k val1 fills; `prof-compare.txt`, `prof-paired.txt`, `prof-*/cloid-sites.txt`)
+
+Same method as section 60 (`a-prof.py`, run per arm through `a-prof-arm.py` with the arm's own staged node for
+`llvm-addr2line` and the arm's own line ranges for the two line-based sites):
+* pre-pass `native_executor.rs` 6888-6935 at `c88d3073`, 6924-6973 at `bc44a845`;
+* per-book check `order_book.rs` 1396-1403 / 1451-1465.
+
+Extra function sites for F's new functions: `resolve_cloid_log`, `drain_cloid_keys`, `order_id_by_cloid_key`. B0 is
+q2/q3 (n = 2); F100 and B100 are n = 4. The deltas are ABBA paired, 95% CI t(3).
+
+| thread group / site | B0 | B100 | F100 | F100 - B100 [95% CI] |
+|---|---|---|---|---|
+| exec thread total | 3.669 | 4.572 | 4.287 | **-0.285 [-0.411, -0.159]** |
+| market workers total | 5.443 | 5.720 | 5.804 | +0.084 [-0.262, +0.429] |
+| other threads | 14.847 | 14.722 | 14.162 | -0.560 [-1.818, +0.698] |
+| whole process | 23.960 | 25.014 | 24.252 | -0.761 [-2.380, +0.858] |
+| exec: index upkeep (B `CloidMarkets::absorb` -> `drain_cloid_log`; F `drain_cloid_keys`) | 0.000 | 0.332 | 0.140 | **-0.192 [-0.206, -0.178]** |
+| exec: duplicate pre-pass, all | 0.014 | 0.323 | 0.167 | **-0.156 [-0.201, -0.110]** |
+| of which `duplicate_cloid` -> `CloidMarkets::live` | 0.000 | 0.183 | 0.073 | -0.110 |
+| of which serial block (claimed set, `retain`) | 0.014 | 0.140 | 0.094 | -0.046 |
+| of which claimed-set `reserve_rehash` (incl.) | 0.000 | 0.058 | 0.000 | -0.058 |
+| exec: cleanup `forget_cloid` / `forget_cloids` | 0.001 | 0.071 | 0.057 | -0.013 [-0.026, -0.001] |
+| **exec: all cloid sites** | 0.015 | 0.725 | 0.364 | **-0.361 [-0.409, -0.312]** |
+| exec: not at a cloid site | 3.654 | 3.847 | 3.923 | +0.076 [-0.005, +0.157] |
+| workers: `index_cloid` | 0.000 | 0.045 | 0.063 | +0.018 |
+| workers: `resolve_cloid_log` (F only, fix 2) | 0.000 | 0.000 | 0.057 | +0.057 |
+| workers: per-book `contains_key` in place | 0.002 | 0.073 | 0.004 | **-0.069 [-0.081, -0.057]** |
+| workers: `forget_cloid` | 0.000 | 0.075 | 0.050 | -0.024 [-0.037, -0.012] |
+| workers: all cloid sites | 0.002 | 0.193 | 0.174 | -0.019 [-0.047, +0.008] |
+
+`reserve_rehash` (`codex-notes.txt`): F's claimed set is a `HashSet<CloidKey>` and shows no rehash. All exec-thread
+`reserve_rehash_inner` time is 0.062 on F100, 0.119 on B100 and 0.062 on B0, so fix 1 removes the claimed-set rehash
+completely.
+
+Hash and compare leaves (self, exec thread; `prof-compare.txt`), B0 / B100 / F100:
+* foldhash `hash_bytes_long` 0.079 / 0.183 / 0.083 (fix 4: the 40-byte key no longer takes the long path);
+* the hashbrown probe `_mm_movemask_epi8` 0.109 / 0.341 / 0.243;
+* the array key compare `spec_eq` 0.197 / 0.355 / 0.216, plus the new `CloidKey` `eq` (`order_book/cloid_key.rs`) 0.074
+  on the exec thread and 0.065 in the workers.
+
+In the workers, `place_order_with_accounts` self (B100 0.120) appears in F as `place_order_checked` (0.136; fix 3's batch
+path).
+
+**Read:** fixes 1 and 4 and the drain change roughly halve the exec-thread cloid time. The rest of it (0.364) is index
+upkeep 0.140, the pre-pass 0.167 and cleanup 0.057. The workers do not get cheaper: the per-book check (-0.069) and
+`forget_cloid` (-0.024) savings are spent on the moved log resolve (+0.057) and `index_cloid` (+0.018). The exec thread is
+the bottleneck, so moving work off it is what counts.
+
+### 63.5 Cache behaviour on the exec thread (W2, events per 1k val1 fills, arm means; `prof-compare.txt`)
+
+| event | B0 | B100 | F100 | F100 vs B100 |
+|---|---|---|---|---|
+| cycles | 11.38 M | 13.26 M | 12.75 M | -3.9% (-1.8 sd) |
+| instructions | 15.51 M | 18.42 M | 17.64 M | -4.2% (-1.8 sd) |
+| IPC (per-cell mean) | 1.363 | 1.389 | 1.384 | tie |
+| L1-dcache-load-misses | 266,908 | 290,372 | 287,812 | -0.9% (-0.3 sd) |
+| DRAM demand fills (`mem_io_local`) | 28,498 | 31,833 | 31,677 | **-0.5% (-0.2 sd), noise** |
+
+Per site, B100 -> F100 (arm means; per-site per-cell spread not printed):
+
+| site | cycles | instructions | IPC | L1 misses | DRAM fills |
+|---|---|---|---|---|---|
+| index upkeep | 932 k -> 404 k | 495 k -> 209 k | 0.53 -> 0.52 | 6,081 -> 5,345 | 2,298 -> 1,219 |
+| duplicate check | 997 k -> 501 k | 879 k -> 306 k | 0.88 -> 0.61 | 15,036 -> 10,186 | 1,731 -> 2,240 |
+| cleanup | 152 k -> 158 k | 178 k -> 159 k | 1.17 -> 1.00 | 3,096 -> 2,914 | 216 -> 277 |
+| not at a site | 11.18 M -> 11.68 M | 16.87 M -> 16.97 M | 1.51 -> 1.45 | 266,159 -> 269,367 | 27,588 -> 27,940 |
+
+The thread's DRAM fills do not move overall. The index site loses about half of its fills (-1,078), and the duplicate
+check gains +509. The duplicate check's IPC falls from 0.88 to 0.61 because its instructions fall by 65% (fewer, cheaper
+hashes and compares), while its cycles fall only 50% and its DRAM fills rise. What is left at that site is more bound by
+memory misses.
+
+### 63.6 c0 regression check (n = 2 per arm, q1-F0 counted; `writeup.txt`)
+
+| metric | F0 (q1 / q4) | B0 (q2 / q3) | F0 - B0 | Welch 95% CI |
+|---|---|---|---|---|
+| matched/s | 209,825 (212,046 / 207,604) | 209,902 (211,903 / 207,902) | **-0.04%** | [-6.17, +6.09] |
+| node CPU-s/1M | 23.83 | 23.78 | +0.24% | [-16.7, +17.2] |
+| native blocks/s | 3.92 | 3.95 | -0.85% | [-43.9, +42.2] |
+| exec per native block p99 ms | 614 | 609 | +0.72% | [-43.7, +45.2] |
+| engine / `engine_untimed` ms per 1k fills (metrics) | 3.522 / 0.186 | 3.484 / 0.184 | +0.038 / +0.002 | |
+| RSS mean GB per node (bench window) | 5.55 | 5.10 | +8.7% | [-4.5, +21.9] |
+| jemalloc allocated GB (bench-window mean of node means) | 2.889 (2.872 / 2.905) | 2.760 (2.733 / 2.788) | +0.13 | |
+
+**No regression at c0 on throughput, CPU or engine time.** The c0 cells are only a regression check: n = 2 per arm, with
+intervals far too wide to resolve a few percent. Without q1-F0 (the analyst's F0 n = 1), the same comparison read
+matched/s -1.1% and engine +0.110 (+3.2%) per 1k fills. Both come from q4-F0 alone, the last cell of the run. F0's RSS and
+jemalloc allocated are higher in both of its cells (+0.44 GB RSS mean, +0.13 GB allocated); with n = 2 that is not
+resolved (the RSS first-15-s figure, +0.66 GB, is). At c100, where the changed code runs, neither moves
+(63.7 c). Not explained; noted.
+
+### 63.7 Codex notes (18c's review of `bc44a845`; `codex-notes.txt`, `jemalloc-rss.txt`)
+
+* **(a) The per-batch cloid count visits every placement** (`native_executor.rs:6929` at `bc44a845`, a `count()` where B
+  had `any()`): self time at F's count lines (6924-6933) is 0.0004 ms per 1k fills at c100. Upper bound: B0's `any()`
+  scans every placement when no order has a cloid, at 0.0127. So the count costs **<= 0.013 ms per 1k fills**.
+* **(b) One vector write per logged cloid change in matching** (`order_book.rs:2453`): F's log push / resolve lines have
+  no self samples. The workers' `index_cloid` rises +0.018 (0.045 -> 0.063); that is the upper bound visible in this
+  profile.
+* **(c) The log vectors keep their capacity (40-80 B per slot):** no retention is visible at c100 in 120 s. jemalloc
+  allocated is F100 2.845 (sd 0.039) vs B100 2.891 (sd 0.083) GB, resident 4.669 vs 4.677 GB, and RSS mean in the bench
+  window 5.138 vs 5.156 GB (paired -0.018 [-0.386, +0.350]). A soak would show slow growth; none was run.
+
+### 63.8 Verdict
+
+* **The fixes work: +5.6% matched/s at 100% cloid share** (paired [+0.1, +11.1]), native blocks/s +11%, exec `block_ms`
+  -12.7%, engine -0.235 ms per 1k fills (all `engine_untimed`), no CPU, RSS or write cost, and no regression at c0.
+* **About a third of B's cloid cost is recovered** (matched/s 34%, CI 1-68%; engine-side views 32-52%). F at c100 is still
+  9.3% below B at c0. What is left on the exec thread is index upkeep 0.140, the pre-pass 0.167 (`duplicate_cloid` 0.073,
+  claimed set 0.094) and cleanup 0.057 ms CPU per 1k fills, and the duplicate check is now miss-bound (IPC 0.61).
+* **What's left:** the analyst suggests 2 more c100 pairs (~25 min) to narrow the recovery CI (now 1-68%). That is the
+  owner's call. An F c0 profile, if wanted, is already recorded in q1-F0 (not analysed).
+
+**Caveats.**
+1. 100% share is the worst case, as in 59/60.
+2. n = 4 pairs at c100. The recovery fraction's CI covers only the paired delta, not the non-interleaved c0 denominator
+   (63.2).
+3. c0 is n = 2 per arm and a regression check only.
+4. The profile is val1 only, user space only, minutes 0-2.
+5. W2 per-site figures are arm means without a per-cell spread.
+6. One profiled cell (q4-F0 W1) failed, and one (q1-F0) was not analysed.
+
+**Method note: perf symbol-cache trap.** Both arms run from one path: the harness copies the arm's node to the worktree's
+`target/release/torus-node` at each cell start (the sidecar logs `exe=` that path with md5 `19ac8761` in F cells). perf
+resolves a recording's DSO through the build-id cache first. On ozarchy the `~/.debug` entries for B's build id
+`77deb7af` and F's `de85ebf3` are hard links (link count 3) to the same inode as that path. After the in-place copy at
+q4-F0's start (23:14:12, the entry's mtime) both hold F's binary (md5 `19ac8761`). A plain `perf script` on a B cell
+therefore resolves B's samples against F's binary: on r2-B100's first 20,000 lines of output, 17,277 lines are `[unknown]`
+without `--symfs`, against 5,184 with it (the kernel frames, `[unknown]` in both). The analyst made every dump with
+`perf script --symfs analyst/symfs-<arm>`, where `symfs-<arm>/<recorded path>` links to the arm's staged node. Checked for
+this write-up: the first 20,000 lines of r2-B100's `prof.script.gz` are byte-identical to a fresh `--symfs symfs-B` run.
+The analyst's saved `prep-prof.sh` lacks the `--symfs` (the dumps came from an inline loop). The archived copy adds it. For
+any A/B that profiles two binaries from one path, run `perf script --symfs` with the staged binary (or `perf buildid-cache
+--add` each staged binary) and do not trust the cache. Side effect: the `c88d3073` harness worktree's
+`target/release/torus-node` now holds F's node (md5 `19ac8761`), not `c88d3073`'s.
+
+Analysis (`tools/ozarchy-p3cloidec-tools/analyst/`; outputs in `ozarchy-p3cloidec-run/analyst/` on ozarchy):
+* The analyst's scripts: `a-cells.py` (section 60's) -> `cells-all.json` / `cells-all.txt`; `a-arms.py` (section 60's,
+  unchanged, run from p3cloidprof's dir on `cells-valid.json`, i.e. without w0 and q1-F0) -> `arms.txt`, whose last
+  comparison, F0 vs B0 with F0 n = 1, ends in a ZeroDivisionError in the ANCOVA; `a-ec-metrics.py` -> `ec-metrics.txt`
+  (lists q1-F0 as `F0-BAD`, left out of the arm means); `prep-prof.sh` + `a-prof-arm.py` (runs p3cloidprof's `a-prof.py`
+  unchanged on disk with the arm's binary and line ranges; its `SRC` path points at the p3cloidprof run dir on ozarchy,
+  archived as `tools/ozarchy-p3cloidprof-tools/analyst/a-prof.py`) -> `prof-F/`, `prof-B/`; `a-prof-compare.py` ->
+  `prof-compare.txt`.
+* Added for this write-up (read-only on the cells): `a-writeup.py` -> `paired.txt` (c100 ABBA pairs, a-paired.py's
+  format) and `writeup.txt` (recovery, c0 with q1-F0 counted, engine timers with q1-F0 counted); `a-prof-paired.py` ->
+  `prof-paired.txt`; `a-arms.py` is copied next to `a-writeup.py`, which uses its `row()` and `welch()`.
+* The analyst's inline queries, saved as scripts with the query unchanged and only the paths parameterised:
+  `a-codex-notes.py` -> `codex-notes.txt`, and `a-jemalloc-rss.py` -> `jemalloc-rss.txt`.
+
+**Re-run check for this write-up** (scratch dir, against the cells): `a-cells.py` reproduces `cells-all.txt` and
+`cells-all.json` byte for byte. The `cells-valid.json` cut reproduces byte for byte. `a-arms.py` reproduces `arms.txt`
+except the 3 traceback path lines (the copy's location). `a-ec-metrics.py`, `a-prof-compare.py`, `a-jemalloc-rss.py`
+(against the analyst's `tee` output) and `a-codex-notes.py` (against the inline output in the analyst session) reproduce
+byte for byte, as does `a-writeup.py` (`paired.txt`, `writeup.txt`, run twice). `a-prof-arm.py` was not rerun: it needs
+the Tier A perf data and takes minutes. The per-arm `a-prof.py` outputs are archived under `analyst/prof-F/` and
+`analyst/prof-B/` (`cloid-sites.txt`, `frames-*.txt`, `windows.txt`, `run.log`; `llc.txt` stays on ozarchy, its W2
+figures are in `prof-compare.txt`). Not copied into the repo: the folded stacks, `prof-cells.json`, `a2l-cache.json` and
+the perf script dumps (Tier A on ozarchy), and the run's `matched-bench/` copy (byte for byte `c88d3073`'s
+`tools/matched-bench` plus `d3cba5e2`'s cell-step files). Driver
+`tools/ozarchy-p3cloidec-tools/ozarchy-p3cloidec-campaign.sh`, build script `ozarchy-p3cloidec-build.sh`, sidecar
+`cloidprof-sidecar.sh`, md5s `md5s-all.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

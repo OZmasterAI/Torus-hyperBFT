@@ -15,21 +15,33 @@ USAGE
   --strict      exit 2 without writing anything if any check warns
   --learn-fields  append the summary.json fields flagged by check (a) to summary-fields.txt (after you noted them)
   --bench-root / --archive-dir / --repo / --fields-file / --summary-file   override the defaults (tests use these)
+  --index-file / --cells-file / --deletable-file / --tools-dir   write somewhere else than <archive-dir>/INDEX.md,
+                cells.md, DELETABLE.md and tools/ozarchy-<camp>-tools/ (the three files must exist: they are updated)
 
   Typical run: write meta/<camp>.toml, `--dry-run`, read the warnings and the diff, fix the meta, run for real,
   review `git diff`, commit together with the results-doc section and the plan row (both still by hand).
 
 WHAT IT WRITES (mechanical part)
   1. tools/ozarchy-<camp>-tools/: the bench tools dir (campaign / build scripts), each run dir's analyst a-*.py and
-     *.txt outputs (not archive-*.txt, not json) under analyst/ (prefixed <sub>- if the campaign has several run
-     dirs), md5s-all.txt from ozarchy-<camp>-build/md5s-all.txt or md5s.txt.
+     *.txt outputs (not archive-*.txt, not json) and the run dir's own *.txt, all under analyst/ (prefixed <sub>- if
+     the campaign has several run dirs), md5s-all.txt from ozarchy-<camp>-build/md5s-all.txt or md5s.txt. [tools]
+     in the meta: exclude = globs left out (path in the tools dir, file name in analyst/), run_exclude = globs (file
+     name) for the run dir's own *.txt, extra = [[src, dst], ...] copied in addition (src relative to --bench-root),
+     strip_trailing = globs (path in the tools copy, e.g. "analyst/perf-report-*.txt") of text files whose blanks at
+     line ends and blank lines at the end are stripped when copied (perf report headers carry ~1 KB of blanks, which
+     `git diff --check` flags); a smoke compare against such a file strips its got side the same way. Unlisted
+     files are copied byte for byte (check t names the ones with trailing blanks). The CR of a CRLF line end counts
+     as a blank (git flags it too): stripping turns CRLF into LF.
   2. INDEX.md: the "Updated" paragraph (after the last one) and one row per dir in sorted position; cells.md: the
      campaign section (before "## action-results:"); DELETABLE.md: the campaign block at the end (Tier A / Tier B
      rm lists with live sizes, outside-tree block). Rows come from each cell's summary.json, node-environ-trie.txt,
-     analyst/cells.json (arm of the warm-up), <cell>.campaign.log (start times) and live file sizes.
+     analyst/cells.json (arm of the warm-up), <cell>.campaign.log (start times) and live file sizes. A cell row's
+     role ("<role> <dur> s") is smoke / warm-up from the dir name, else the first [cell_roles] pattern (fnmatch on
+     the cell dir name, in meta order, e.g. "*-KILL" = "restart") that matches, else cell_role (default throughput).
   3. docs/perf/ozarchy-summary-*.md ([summary] in the meta): one row per arm after the last row of the table, numbers
      from analyst/arms.txt ("per arm mean" table) and {paired:METRIC:DECIMALS} deltas from analyst/paired.txt;
-     optional definitions bullet. The "Sources:" sentence stays manual.
+     optional definitions bullet. The "Sources:" sentence stays manual. A row's cols = {matched, blk, p99, cpu, rss,
+     writes, settle} replace those numbers; a row that gives all seven does not read arms.txt (it need not exist).
 
 REFUSES (exit 3, writes nothing): the campaign is already in INDEX.md / cells.md / DELETABLE.md / tools/, or the
   results-doc section or plan row number is already owned by another entry (INDEX, cells, DELETABLE, summary table).
@@ -44,7 +56,8 @@ WARNS ("WARNING (x) ...", exit 2 with --strict, nothing written then): (a) summa
   writes them; (c) deletable / outside-tree paths that do not exist, kept files that are in an rm list or in no
   cell; (d) results-doc heading missing or naming another campaign, plan row missing or not citing the section;
   (x) cell rows that differ from the analyst's archive-*-<camp>.txt; (m) meta gaps; (s) no [[smoke]] in the meta (the
-  archived analysis was not test-run; older campaigns still archive, --strict refuses).
+  archived analysis was not test-run; older campaigns still archive, --strict refuses); (t) tools files with blanks at
+  line ends or blank lines at the end that [tools] strip_trailing does not cover (`git diff --check` would flag them).
 
 SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as archived)
   Before writing, the script copies the staged tools tree (exactly what it would write to tools/ozarchy-<camp>-tools/)
@@ -67,7 +80,8 @@ SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as a
       select    regex: compare only the lines (of both sides) it matches, e.g. "^r1-c0 " for one cell
       ignore    list of regexes: lines dropped from both sides (timestamps, temp paths)
       tolerance relative tolerance for every number in a line (default 0: exact); the text between numbers must match;
-                a finite number >= 0 (nan, inf, a negative or a string is a meta error)
+                a finite number >= 0 (nan, inf, a negative or a string is a meta error); a number that overflows to
+                inf (e.g. 1e400) only matches the identical string, and inf / nan are text, so exact too
   Example and real use: meta/p3cloid.toml, meta/p3cloidprof.toml.
 
 SAFETY: it never deletes anything (it only writes rm commands into DELETABLE.md for a human to run on ozarchy); the
@@ -353,13 +367,21 @@ class Campaign:
             "generated": s.get("generated_at", ""),
         }
 
+    def cell_kind(self, n):
+        """The role word of a measured cell: the first [cell_roles] pattern (fnmatch on the dir name, meta order)
+        that matches, else cell_role (default "throughput")."""
+        for pat, role in self.meta.get("cell_roles", {}).items():
+            if fnmatch.fnmatchcase(n, pat):
+                return role
+        return self.meta.get("cell_role", "throughput")
+
     def role(self, n):
         i = self.info[n]
         if i["smoke"]:
             return "smoke %s s, excluded" % i["dur"]
         if i["warm"]:
             return "warm-up %s s, excluded" % i["dur"]
-        return "%s %s s" % (self.meta.get("cell_role", "throughput"), i["dur"])
+        return "%s %s s" % (self.cell_kind(n), i["dur"])
 
     # -- deletable lists
 
@@ -616,12 +638,17 @@ def render(c, ta, tb, tds, wts, o):
         timing = ", ".join(parts)
     dsum = ix.get("dirs_summary")
     if not dsum:
-        main = [n for n in c.cells if not c.info[n]["smoke"] and not c.info[n]["warm"]]
+        main = [n for n in c.by_time if not c.info[n]["smoke"] and not c.info[n]["warm"]]
         warm = [n for n in c.cells if c.info[n]["warm"]]
         smoke = [n for n in c.by_time if c.info[n]["smoke"]]
         parts = []
-        if main:
-            parts.append("%d %s cells" % (len(main), m.get("cell_role", "throughput")))
+        kinds = {}
+        for n in main:  # one count per role, in run order
+            kinds[c.cell_kind(n)] = kinds.get(c.cell_kind(n), 0) + 1
+        for kind, k in kinds.items():
+            # one role (cell_role only): the wording as before ("1 throughput cells"); with [cell_roles] 1 cell
+            word = "cell" if k == 1 and m.get("cell_roles") else "cells"
+            parts.append("%d %s %s" % (k, kind, word))
         tags = sorted({c.info[n]["tag"] for n in warm})
         if len(warm) == 1:
             parts.append("the warm-up `%s`" % c.info[warm[0]]["tag"])
@@ -853,6 +880,9 @@ def parse_paired(path):
     return out
 
 
+SUMMARY_COLS = ("matched", "blk", "p99", "cpu", "rss", "writes", "settle")
+
+
 def render_summary(c, text):
     """Per-arm rows for the ozarchy summary table (+ optional definitions bullet) -> new text."""
     sm = c.meta["summary"]
@@ -860,26 +890,36 @@ def render_summary(c, text):
     for spec in sm.get("rows", []):
         rd = c.run_dir_for(spec.get("run", ""))
         an = os.path.join(c.bench, rd or "", "analyst")
-        try:
-            arms = parse_arms(os.path.join(an, "arms.txt"))
-        except (OSError, Fatal) as e:
-            raise Fatal("summary row %s: %s" % (spec.get("arm"), e)) from e
-        v = arms.get(spec["arm"])
-        if v is None:
-            raise Fatal("summary row: arm %r not in %s/arms.txt" % (spec["arm"], an))
+        given = spec.get("cols", {})
+        v = {}
+        # arms.txt is read only for the columns the row does not give (a soak row from another table gives all)
+        if not all(k in given for k in SUMMARY_COLS):
+            try:
+                arms = parse_arms(os.path.join(an, "arms.txt"))
+            except (OSError, Fatal) as e:
+                raise Fatal("summary row %s: %s" % (spec.get("arm"), e)) from e
+            v = arms.get(spec.get("arm"))
+            if v is None:
+                raise Fatal("summary row: arm %r not in %s/arms.txt" % (spec.get("arm"), an))
 
-        def g(metric, nd, comma=False, _v=v, _arm=spec["arm"]):
+        def g(metric, nd, comma=False, _v=v, _arm=spec.get("arm")):
             x = _v.get(metric)
             if x is None or x == "nan":
                 c.warn.append(("m", "summary row %s: no %s in arms.txt" % (_arm, metric)))
                 return "?"
             return ("{:,.%df}" if comma else "{:.%df}").replace("%d", str(nd)).format(q(x, nd))
 
-        st = v.get("ck_settle")
-        settle = "n/a" if st in (None, "nan") or q(st, 1) == 0 else g("ck_settle", 1)
-        cols = {"matched": g("ms", 0, True), "blk": g("blk", 2), "p99": g("ci99", 0, True), "cpu": g("cpu", 2),
-                "rss": "%s / %s" % (g("rss_mean", 2), g("rss_pk", 2)), "writes": g("wr", 1), "settle": settle}
-        cols.update(spec.get("cols", {}))
+        def settle(_v=v, _g=g):
+            st = _v.get("ck_settle")
+            return "n/a" if st in (None, "nan") or q(st, 1) == 0 else _g("ck_settle", 1)
+
+        # only the columns the row does not give are read (and warned about when arms.txt lacks them)
+        make = {"matched": lambda _g=g: _g("ms", 0, True), "blk": lambda _g=g: _g("blk", 2),
+                "p99": lambda _g=g: _g("ci99", 0, True), "cpu": lambda _g=g: _g("cpu", 2),
+                "rss": lambda _g=g: "%s / %s" % (_g("rss_mean", 2), _g("rss_pk", 2)),
+                "writes": lambda _g=g: _g("wr", 1), "settle": settle}
+        cols = {k: make[k]() for k in SUMMARY_COLS if k not in given}
+        cols.update(given)
         delta = spec.get("delta", "")
         if "{paired:" in delta:
             paired = parse_paired(os.path.join(an, "paired.txt"))
@@ -1064,7 +1104,9 @@ def smoke_lines(text, cm):
 
 
 def smoke_same(a, b, tol):
-    """Lines equal, or (tol > 0) equal outside the numbers and every number within relative tolerance tol."""
+    """Lines equal, or (tol > 0) equal outside the numbers and every number within relative tolerance tol. A number
+    that is not finite as a float (a literal that overflows to inf, e.g. 1e400) only matches the identical string:
+    1e400 and 9e400 both parse to inf, and inf - inf = nan passes every `>` check."""
     if a == b:
         return True
     if not tol:
@@ -1076,14 +1118,20 @@ def smoke_same(a, b, tol):
         if i % 2 == 0:
             if x != y:
                 return False
-        elif abs(float(x) - float(y)) > tol * max(abs(float(x)), abs(float(y))):
-            return False
+        else:
+            fx, fy = float(x), float(y)
+            if not (math.isfinite(fx) and math.isfinite(fy)):
+                if x != y:
+                    return False
+            elif abs(fx - fy) > tol * max(abs(fx), abs(fy)):
+                return False
     return True
 
 
-def run_smoke(c, specs, staged):
+def run_smoke(c, specs, staged, stripped=frozenset()):
     """Run the declared analyst commands from a temp copy of the staged tools tree, against the real cells under the
-    bench root, and diff their output with the archived files in the same copy. -> (ok, total, errors)."""
+    bench root, and diff their output with the archived files in the same copy. -> (ok, total, errors).
+    stripped: tools-copy paths staged through strip_trailing; their got side is stripped the same way."""
     import signal
     import tempfile
 
@@ -1170,6 +1218,8 @@ def run_smoke(c, specs, staged):
                     bad = True
                     continue
                 want = want.decode(errors="replace") if isinstance(want, bytes) else want
+                if os.path.normpath(cm["want"]) in stripped:
+                    got = strip_trailing(got.encode()).decode(errors="replace")
                 want_l, got_l = smoke_lines(want, cm), smoke_lines(got, cm)
                 if not want_l:
                     errors.append(
@@ -1209,6 +1259,21 @@ def run_smoke(c, specs, staged):
             if not bad:
                 ok += 1
     return ok, len(specs), errors
+
+
+TRAILING_RE = re.compile(rb"[ \t\r]+(?=\n|\Z)")  # \r too: git flags the CR of a CRLF line end
+
+
+def strip_trailing(data):
+    """Bytes without what `git diff --check` flags: blanks at line ends (CRLF -> LF) and blank lines at the end of
+    the file."""
+    data = TRAILING_RE.sub(b"", data)
+    body = data.rstrip(b"\n")
+    return body + b"\n" if body and data.endswith(b"\n") else body
+
+
+def has_trailing(data):
+    return bool(TRAILING_RE.search(data)) or data.endswith(b"\n\n") or data == b"\n"
 
 
 def udiff(old, new, label, new_file=False):
@@ -1275,6 +1340,7 @@ def tools_plan(c):
     b = c.bench
     td = os.path.join(b, c.prefix + "tools")
     excl = c.meta.get("tools", {}).get("exclude", [])
+    run_excl = c.meta.get("tools", {}).get("run_exclude", [])
     if os.path.isdir(td):
         for root, dirs, files in os.walk(td):
             dirs.sort()
@@ -1312,7 +1378,7 @@ def tools_plan(c):
                 )
         for f in sorted(os.listdir(os.path.join(b, rd))):
             p = os.path.join(b, rd, f)
-            if f.endswith(".txt") and os.path.isfile(p):
+            if f.endswith(".txt") and os.path.isfile(p) and not any(fnmatch.fnmatch(f, e) for e in run_excl):
                 plan.append(
                     (p, "analyst/%s%s" % (sub + "-" if multi and sub else "", f))
                 )
@@ -1517,22 +1583,42 @@ def main(argv=None):
     ap.add_argument("--repo", default=None)
     ap.add_argument("--fields-file", default=os.path.join(here, "summary-fields.txt"))
     ap.add_argument("--summary-file", default=None, help="override [summary] file (path)")
+    ap.add_argument("--index-file", default=None, help="INDEX.md to update (default: in --archive-dir)")
+    ap.add_argument("--cells-file", default=None, help="cells.md to update (default: in --archive-dir)")
+    ap.add_argument("--deletable-file", default=None, help="DELETABLE.md to update (default: in --archive-dir)")
+    ap.add_argument("--tools-dir", default=None, help="tools copy dir (default: <archive-dir>/tools/ozarchy-<camp>-tools)")
     a = ap.parse_args(argv)
     archive = os.path.abspath(a.archive_dir)
     repo = os.path.abspath(a.repo or os.path.join(archive, "..", "..", ".."))
+
+    def label_of(p):
+        """How a written path is named in the report and the dry-run diffs: relative to the archive dir (the
+        defaults), else to the repo, else absolute."""
+        for base in (archive, repo):
+            if p.startswith(base + os.sep):
+                return os.path.relpath(p, base)
+        return p
     try:
         meta = load_meta(a.meta)
         if meta.get("camp", a.camp) != a.camp:
             raise Fatal("meta camp %r does not match %r" % (meta.get("camp"), a.camp))
         if "section" not in meta:
             raise Fatal("meta has no section")
+        for key in ("exclude", "run_exclude", "strip_trailing"):
+            v = (meta.get("tools") or {}).get(key, [])
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise Fatal("[tools] %s must be a list of glob strings, not %r" % (key, v))
+        roles = meta.get("cell_roles", {})
+        if not isinstance(roles, dict) or not all(isinstance(v, str) for v in roles.values()):
+            raise Fatal('[cell_roles] must map a cell dir pattern to a role word, e.g. "*-KILL" = "restart"')
         specs = smoke_specs(meta)
         # absolute: the smoke commands get {bench} with cwd = their scratch dir
         c = Campaign(a.camp, meta, os.path.abspath(a.bench_root), repo)
         names = ["INDEX.md", "cells.md", "DELETABLE.md"]
-        paths = [os.path.join(archive, f) for f in names]
+        given = [a.index_file, a.cells_file, a.deletable_file]
+        paths = [os.path.abspath(g_) if g_ else os.path.join(archive, f) for f, g_ in zip(names, given, strict=True)]
         texts = [read(p) for p in paths]
-        labels = list(names)
+        labels = [label_of(p) for p in paths]
         spath = None
         if meta.get("summary"):
             spath = os.path.abspath(a.summary_file or os.path.join(repo, meta["summary"]["file"]))
@@ -1540,9 +1626,21 @@ def main(argv=None):
             labels.append(os.path.relpath(spath, repo) if spath.startswith(repo + "/") else meta["summary"]["file"])
         else:
             c.warn.append(("m", "no [summary] in the meta: summary table not updated"))
-        tools_dir = os.path.join(archive, "tools", "ozarchy-%s-tools" % a.camp)
+        tools_dir = os.path.abspath(a.tools_dir or os.path.join(archive, "tools", "ozarchy-%s-tools" % a.camp))
+        # one written file per output: a doc named twice (or inside the tools copy) would overwrite another one
+        outs = list(zip(("--index-file", "--cells-file", "--deletable-file"), paths, strict=True))
+        if spath:
+            outs.append(("summary file", spath))
+        tools_real = os.path.realpath(tools_dir)
+        for i, (n1, p1) in enumerate(outs):
+            r1 = os.path.realpath(p1)
+            for n2, p2 in outs[:i]:
+                if os.path.realpath(p2) == r1:
+                    raise Fatal("%s and %s name the same file %s (nothing written)" % (n2, n1, p1))
+            if r1 == tools_real or r1.startswith(tools_real + os.sep):
+                raise Fatal("%s %s is inside --tools-dir %s (nothing written)" % (n1, p1, tools_dir))
         refuse = ["campaign %s already in the archive: %s" % (a.camp, h_) for h_ in present(c, texts, tools_dir)]
-        named = [(n, t, False) for n, t in zip(names, texts, strict=True)]
+        named = [(n, t, False) for n, t in zip(labels[:3], texts, strict=True)]
         if spath:
             named.append((labels[3], stext, True))
         refuse += used_numbers(c, named)
@@ -1568,11 +1666,13 @@ def main(argv=None):
             texts.append(stext)
             new.append(render_summary(c, stext))
         # read every tool source now: a missing or unreadable one must stop the run before anything is written
-        rel_tools = os.path.relpath(tools_dir, archive)
+        rel_tools = label_of(tools_dir)
         sources = [(src, dst, "%s/%s" % (rel_tools, dst)) for src, dst in plan]
         if md5:
             sources.append((md5, "md5s-all.txt", rel_tools + "/md5s-all.txt"))
         files = []
+        strip_globs = (meta.get("tools") or {}).get("strip_trailing", [])
+        stripped, blanks = set(), []
         for src, dst, label in sources:
             try:
                 with open(src, "rb") as f:
@@ -1580,7 +1680,19 @@ def main(argv=None):
                 mode = 0o644 if src == md5 else stat.S_IMODE(os.stat(src).st_mode)
             except OSError as e:
                 raise Fatal("tools source %s: %s (nothing written)" % (src, e.strerror or e)) from e
+            # text only (no NUL byte); e.g. perf report column headers padded with ~1 KB of blanks
+            # every listed text file is a normalized smoke want, clean already or not
+            if b"\0" not in data:
+                if any(fnmatch.fnmatch(dst, g_) for g_ in strip_globs):
+                    data = strip_trailing(data)
+                    stripped.add(os.path.normpath(dst))
+                elif has_trailing(data):
+                    blanks.append(dst)
             files.append((os.path.join(tools_dir, dst), label, data, mode))
+        if blanks:
+            c.warn.append(("t", "tools files with trailing blanks or blank lines at the end (`git diff --check` "
+                                "flags them; list them in [tools] strip_trailing to strip them when copied): %s"
+                           % ", ".join(blanks)))
         staged = [(os.path.relpath(p_, tools_dir), d_, m_) for p_, _, d_, m_ in files]
         if not specs:
             msg = ("no [[smoke]] in the meta: the archived analysis was not test-run against a cell "
@@ -1604,7 +1716,7 @@ def main(argv=None):
         return 4
     print("fence check %d/%d OK" % (ok, total))
     if specs:
-        ok, total, errs = run_smoke(c, specs, staged)
+        ok, total, errs = run_smoke(c, specs, staged, stripped)
         if errs:
             print("archive-campaign: smoke check %d/%d OK, FAILED: the archived analysis does not reproduce its archived "
                   "output from the tools copy; nothing written:" % (ok, total), file=sys.stderr)

@@ -1,0 +1,181 @@
+# archive-campaign.py meta for campaign ozarchy-p3cloidec (results doc section 63, plan row 71).
+# This file is the only hand-written input; everything else (rows, sizes, rm lists, tools copy) is generated.
+# Modelled on meta/p3cloidprof.toml (perf sidecar, Tier A profile) and meta/p3gate.toml (two binaries, je compiled in).
+
+camp = "p3cloidec"
+section = "63"
+plan_row = 71
+plan_doc = "docs/plans/item6-phase2-impl.md"
+
+description = "cloid engine-cost fixes A/B (F bc44a845 vs B c88d3073, both je compiled in, CLOID_SHARE 100 and 0, perf on val1)"
+cell_role = "profiled"
+# md5s.txt also holds "F jemalloc symbols: N"; B's binaries are p3gate's stage (s2-run), copied into ozarchy-p3cloidec-stage/B-run.
+binaries = "F bc44a845 (node 19ac8761, bench e562e616), B c88d3073 (node 4e0d8b84, bench ae96e0c1; p3gate's s2 build, reused)"
+env_base = "6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); TORUS_CHECKPOINT_INTERVAL_MS=15000; je compiled in; perf sidecar on val1 (W1 cycles:u fp 35-80 s, W2 exec thread 5 events 82-102 s)"
+
+[arms.F100]
+meaning = "perf/cloid-engine-cost bc44a845 (4 cloid fixes + forget_cloid in one lookup, on c88d3073), CLOID_SHARE=100"
+env = "CLOID_SHARE=100; in-flight tail commit"
+
+[arms.B100]
+meaning = "c88d3073 (Phase 3 step 2, the base of F), CLOID_SHARE=100"
+env = "CLOID_SHARE=100; in-flight tail commit"
+
+[arms.F0]
+meaning = "perf/cloid-engine-cost bc44a845, CLOID_SHARE=0"
+env = "CLOID_SHARE=0; in-flight tail commit"
+
+[arms.B0]
+meaning = "c88d3073, CLOID_SHARE=0"
+env = "CLOID_SHARE=0; in-flight tail commit"
+
+# No analyst/cells.json (the analyst wrote cells-all.json); w0's tag carries no arm.
+[cell_arms]
+"ozarchy-p3cloidec-300m-w0" = "B100"
+
+[cell_notes]
+"ozarchy-p3cloidec-300m-q1-F0" = "rc 2 / REJECT DISAGREE = mark-only digest artifact (val2 vs val0 at height 1,178: 50 lines, the 5 mark fields only; block hash equal); counted in F0 (section 63); perf W1 + W2 recorded, not analysed"
+"ozarchy-p3cloidec-300m-q4-F0" = "perf W1 failed (sidecar W1 rc 255, 0.3 MB perf.data), W2 ok"
+
+[dirs]
+run = '''p3cloidec campaign log, done marker, cells.tsv (per-cell step rows), cell-step/ (per-cell validation + analysis records), handoff.json / handoff-tables.txt, smoke/ (smoke campaign log, cells.tsv, cell-step), analyst/ (SPEC.txt; a-ec-metrics.py, a-prof-arm.py, a-prof-compare.py, prep-prof.sh, the section 63 additions a-arms.py (section 60's copy), a-writeup.py, a-prof-paired.py, a-codex-notes.py, a-jemalloc-rss.py; cells-all.json / cells-valid.json, cells-all.txt, arms.txt, ec-metrics.txt, prof-compare.txt, jemalloc-rss.txt, paired.txt, writeup.txt, prof-paired.txt, codex-notes.txt; prof-F/ and prof-B/ (a-prof.py outputs per arm: cloid-sites.txt, frames-*.txt, llc.txt, windows.txt, prof-cells.json, folded-*.txt, a2l-cache.json, cells/ with perf script dumps); symfs-F/ and symfs-B/ (perf --symfs links to the staged nodes))'''
+tools = '''p3cloidec campaign driver ozarchy-p3cloidec-campaign.sh (CAMP=CLOIDEC, from the campaign template: per-cell cell_step, perf sidecar on every arm), build script ozarchy-p3cloidec-build.sh (arm F only), perf sidecar cloidprof-sidecar.sh (p3cloidprof's), matched-bench tools copy (= c88d3073's `tools/matched-bench` + d3cba5e2's cell-step files, byte for byte; not archived), analyst/a-cells.py (p3cloidprof's), archive-copy/prep-prof.sh (the analyst's prep-prof.sh plus the --symfs that made the dumps; section 63)'''
+build = '''p3cloidec build log (arm F: node + bench from one fresh target dir), md5s.txt (F / bF built, B / bB reused from p3gate's s2 stage, nm jemalloc count), detach / dry-run logs, done marker'''
+stage = '''staged node `torus-node` and bench `bench-throughput` per arm (`F-run/release` from `bc44a845`, `B-run/release` = p3gate's `s2-run/release` from `c88d3073`)'''
+smoke1-blocked = '''first smoke attempt, stopped by the quiet-host gate (rust-analyzer running): smoke log, cells.tsv, cell-step and its one cell s0-F100; moved aside before the relaunch, not used'''
+
+[index]
+dirs_summary = '''8 c100 cells, 4 c0 cells, the warm-up `w0`, 2 smoke cells `ozarchy-p3cloidec-smoke-300m-s0-F100`, `ozarchy-p3cloidec-smoke-300m-s0-B0`, `ozarchy-p3cloidec-run`, `-tools`, `-build`, `-stage`, `-smoke1-blocked`'''
+update = '''Cloid engine-cost fixes A/B (18c, after section 60): F = `perf/cloid-engine-cost` `bc44a845` (pre-sized claimed set, cloid log resolved in the worker, batch workers skip the repeated per-book lookup, a packed 40-byte `CloidKey` with a cheaper hash, `forget_cloid` in one lookup; on `c88d3073`; node `19ac8761`, bench `e562e616`, built fresh) vs B = `c88d3073` (node `4e0d8b84`, bench `ae96e0c1`, p3gate's s2 build reused); both jemalloc compiled in, same build flags, `TORUS_CHECKPOINT_INTERVAL_MS=15000` per cell on both arms; CLOID_SHARE 100 (n = 4 ABBA) and 0 (n = 2 ABBA, regression check), saturated, commit tail, `cloidprof-sidecar.sh` perf on val1 in every cell; harness = the `c88d3073` worktree with main `d3cba5e2`'s per-cell step files; driver `ozarchy-p3cloidec-campaign.sh` CAMP=CLOIDEC (in `tools/ozarchy-p3cloidec-tools/` with the build script, sidecar and the analyst scripts). Section 63 is built on the analyst outputs in `ozarchy-p3cloidec-run/analyst/` (`paired.txt`, `writeup.txt`, `arms.txt`, `ec-metrics.txt`, `prof-compare.txt`, `prof-paired.txt`, `codex-notes.txt`, `jemalloc-rss.txt`, `prof-*/cloid-sites.txt`, `prof-*/windows.txt`), `cells.tsv`, `cell-step/` and the cells' `summary.json`, `agreement.jsonl`, `metrics-*`, `prof-*` window snapshots, `exec-tid.txt`, `cloidprof-sidecar.log`, `mem-samples.txt`, `cpu.csv` and `io-ticks.txt` (keep); the raw profile (`perf.data`, `perf-w2.data`, the perf script dumps, `prof-cells.json`, the folded stacks) and the staged binaries are Tier A, the node logs, `buckets.csv`, `tasks.txt` and `sampler.csv` Tier B.'''
+
+[cells]
+heading = '''cloid engine-cost fixes A/B, F = `perf/cloid-engine-cost` `bc44a845` (node `19ac8761`, bench `e562e616`) vs B = `c88d3073` (node `4e0d8b84`, bench `ae96e0c1`), both jemalloc compiled in, `TORUS_CHECKPOINT_INTERVAL_MS=15000` on both: CLOID_SHARE=100 n = 4 ABBA (r1-r8) and CLOID_SHARE=0 n = 2 ABBA (q1-q4), saturated (RATE 76000), 120 s, commit tail, tw, Classic, shared NVMe, perf on val1 in every cell, harness = the `c88d3073` worktree; all cells ACCEPT AGREE except q1-F0 (rc 2, mark-only digest DISAGREE, counted); warm-up w0 and the smoke cells excluded (section 63)'''
+
+[deletable]
+note = '''Campaign ozarchy-{camp} (results doc section {section}, plan row {plan_row}): cloid engine-cost fixes, F `bc44a845` vs B `c88d3073`, CLOID_SHARE 100 and 0, perf on val1. Section {section} is built on `ozarchy-p3cloidec-run/analyst/` (`paired.txt`, `writeup.txt`, `arms.txt`, `ec-metrics.txt`, `prof-compare.txt`, `prof-paired.txt`, `codex-notes.txt`, `jemalloc-rss.txt`, `cells-all.json`, `prof-*/cloid-sites.txt`, `prof-*/frames-*.txt`, `prof-*/llc.txt`, `prof-*/windows.txt`), `ozarchy-p3cloidec-run/cells.tsv` / `cell-step/` and the cells' `summary.json`, `agreement.jsonl`, `metrics-*-val*.txt`, `prof-metrics-w*-*.txt`, `prof-stat-w*-*.txt`, `prof-tasks-w*-*.txt`, `exec-tid.txt`, `cloidprof-sidecar.log`, `mem-samples.txt`, `cpu.csv` and `io-ticks.txt` (keep). Tier A = the raw profile and the binaries that symbolise it: each cell's `perf.data` (W1) and `perf-w2.data` (W2), in the analyst dir the perf script dumps `prof-*/cells/*/prof.script.gz` / `w2.script.gz`, the folded stacks, `prof-cells.json` and `a2l-cache.json`, and the staged nodes and benches in `ozarchy-p3cloidec-stage/{F,B}-run/release/`. The two arms ran from one exe path, so `perf.data` needs `perf script --symfs` with the arm's staged node (section {section}; `tools/ozarchy-p3cloidec-tools/analyst/prep-prof.sh`), and the `~/.debug` build-id cache on ozarchy is not a usable source for B. `q1-F0`'s profile (W1 + W2) was recorded but not analysed: keep it while an F c0 profile could be wanted. `ozarchy-p3cloidec-smoke1-blocked` (the blocked first smoke) is not used by the section.'''
+tier_a_keep = "keep while a re-analysis of the cloid-fix profile is possible: new site groupings, the unanalysed q1-F0 profile, a before/after against a further cloid change"
+tier_a = [
+  "ozarchy-p3cloidec-300m-*/perf.data",
+  "ozarchy-p3cloidec-300m-*/perf-w2.data",
+  "ozarchy-p3cloidec-run/analyst/prof-*/cells/*/prof.script.gz",
+  "ozarchy-p3cloidec-run/analyst/prof-*/cells/*/w2.script.gz",
+  "ozarchy-p3cloidec-run/analyst/prof-*/folded-c0.txt",
+  "ozarchy-p3cloidec-run/analyst/prof-*/folded-c100.txt",
+  "ozarchy-p3cloidec-run/analyst/prof-*/prof-cells.json",
+  "ozarchy-p3cloidec-run/analyst/prof-*/a2l-cache.json",
+  "ozarchy-p3cloidec-stage/*/release/torus-node",
+  "ozarchy-p3cloidec-stage/*/release/bench-throughput",
+]
+kept = ["summary.json", "agreement.jsonl", "metrics-*-val*.txt", "prof-metrics-w*-*.txt", "prof-stat-w*-*.txt", "prof-tasks-w*-*.txt", "exec-tid.txt", "cloidprof-sidecar.log", "mem-samples.txt", "cpu.csv", "io-ticks.txt"]
+
+[deletable.outside]
+note = "arm F's fresh target dir, {target_size} apparent (rebuildable with `ozarchy-p3cloidec-build.sh`), and its build worktree (clean, detached; `git worktree remove`), on the same condition as Tier A; arm B's are p3gate's (see that block)"
+target_dirs = ["/home/oz/.cargo-target-p3cloidec-bc44a845"]
+worktrees = ["/home/oz/projects/wt/p3cloidec-bc44a845"]
+
+[checks]
+produced_by = { "cells-all.txt" = "a-cells.py stdout (cells-all.json)", "SPEC.txt" = "the analysis spec written by the launcher (hand-written)", "handoff-tables.txt" = "the campaign driver's handoff step" }
+
+[tools]
+# prep-prof.sh is not an a-*.py: archive the corrected copy (adds the --symfs that made the dumps; section 63).
+# matched-bench/ is byte for byte c88d3073's tools/matched-bench (harness) plus d3cba5e2's cell-step.sh / cell_step.py /
+# campaign-template.sh (checked against the git blobs), with pytest / ruff / pycache dirs: none of it is archived.
+exclude = ["archive-copy/*", "matched-bench/*"]
+# The per-arm a-prof.py outputs live in analyst/prof-F/ and prof-B/ (not copied by default): the small text ones. llc.txt is
+# left out (a trailing blank on its last line fails git diff --check; its W2 figures are in prof-compare.txt).
+extra = [
+  ["ozarchy-p3cloidec-tools/archive-copy/prep-prof.sh", "analyst/prep-prof.sh"],
+  ["ozarchy-p3cloidec-run/analyst/prof-F/cloid-sites.txt", "analyst/prof-F/cloid-sites.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-F/frames-children.txt", "analyst/prof-F/frames-children.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-F/frames-self.txt", "analyst/prof-F/frames-self.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-F/frames-self-loc.txt", "analyst/prof-F/frames-self-loc.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-F/windows.txt", "analyst/prof-F/windows.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-F/run.log", "analyst/prof-F/run.log"],
+  ["ozarchy-p3cloidec-run/analyst/prof-B/cloid-sites.txt", "analyst/prof-B/cloid-sites.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-B/frames-children.txt", "analyst/prof-B/frames-children.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-B/frames-self.txt", "analyst/prof-B/frames-self.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-B/frames-self-loc.txt", "analyst/prof-B/frames-self-loc.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-B/windows.txt", "analyst/prof-B/windows.txt"],
+  ["ozarchy-p3cloidec-run/analyst/prof-B/run.log", "analyst/prof-B/run.log"],
+]
+
+[summary]
+file = "docs/perf/ozarchy-summary-2026-10-13.md"
+note = '''- **63 (cloid engine-cost fixes):** F `bc44a845` and B `c88d3073` built with the same flags, jemalloc compiled in, 15 s
+  checkpoints, CLOID_SHARE=100 (the worst case), perf on val1 in every cell; n = 4 ABBA, deltas paired (`paired.txt`). The c0
+  cells (n = 2 per arm, regression check only) are not in the table: matched/s F0 - B0 -0.04% (`writeup.txt`).'''
+note_before = "- **Commit tail everywhere**"
+
+[[summary.rows]]
+label = "63 SAT 120 s"
+arm = "B100"
+text = "B c88d3073, je compiled in, 15 s, CLOID_SHARE=100, perf on val1"
+delta = "F: matched/s {paired:ms:1}; engine/1k fills {paired:eng:1}; exec block_ms {paired:block_ms:1}; CPU {paired:cpu:2}"
+
+[[summary.rows]]
+label = "63 SAT 120 s"
+arm = "F100"
+text = "F bc44a845 (cloid fixes), je compiled in, 15 s, CLOID_SHARE=100, perf on val1"
+
+# Smoke: rerun the archived analysis (arguments as the analyst's runs and the write-up's). a-prof-arm.py / prep-prof.sh are
+# not smoke-run: they need the Tier A perf data, take minutes and write next to their input. a-arms.py is not smoke-run here:
+# its input cells-valid.json was cut from cells-all.json by an inline one-liner (section 63 shows the rerun check).
+[[smoke]]
+name = "a-cells.py on all 13 cells"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-all.json", "{bench}/ozarchy-p3cloidec-300m-", "w0:B100", "r1-F100:F100", "r2-B100:B100", "r3-B100:B100", "r4-F100:F100", "r5-B100:B100", "r6-F100:F100", "r7-F100:F100", "r8-B100:B100", "q1-F0:F0", "q2-B0:B0", "q3-B0:B0", "q4-F0:F0"]
+timeout = 600
+[[smoke.compare]]
+want = "analyst/cells-all.txt"
+
+[[smoke]]
+name = "a-writeup.py -> paired.txt, writeup.txt"
+script = "analyst/a-writeup.py"
+args = ["{out}/cells-all.json", "{bench}/ozarchy-p3cloidec-300m-", "{out}"]
+timeout = 300
+[[smoke.compare]]
+want = "analyst/paired.txt"
+got = "paired.txt"
+[[smoke.compare]]
+want = "analyst/writeup.txt"
+got = "writeup.txt"
+
+[[smoke]]
+name = "a-ec-metrics.py"
+script = "analyst/a-ec-metrics.py"
+args = ["{bench}/ozarchy-p3cloidec-300m-"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/ec-metrics.txt"
+
+[[smoke]]
+name = "a-jemalloc-rss.py"
+script = "analyst/a-jemalloc-rss.py"
+args = ["{out}/cells-all.json", "{bench}/ozarchy-p3cloidec-300m-"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/jemalloc-rss.txt"
+
+[[smoke]]
+name = "a-prof-compare.py (reads prof-*/prof-cells.json in the run's analyst dir)"
+script = "analyst/a-prof-compare.py"
+args = []
+timeout = 120
+[[smoke.compare]]
+want = "analyst/prof-compare.txt"
+
+[[smoke]]
+name = "a-prof-paired.py"
+script = "analyst/a-prof-paired.py"
+args = ["{bench}/ozarchy-p3cloidec-run/analyst"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/prof-paired.txt"
+
+[[smoke]]
+name = "a-codex-notes.py"
+script = "analyst/a-codex-notes.py"
+args = ["{bench}/ozarchy-p3cloidec-run/analyst"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/codex-notes.txt"
