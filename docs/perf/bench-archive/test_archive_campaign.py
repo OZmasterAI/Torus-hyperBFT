@@ -1189,6 +1189,26 @@ class Smoke(FixtureCase):
         self.assertOk(r)
         self.assertIn("smoke check 3/3 OK", r.stdout)
 
+    def test_stdout_stderr_is_merged_in_order_like_2_redirect(self):
+        # got = "stdout+stderr" is one pipe for both streams (`> f 2>&1`), so the interleaving is kept
+        fx = self.fx
+        write(
+            self.an("a-mix.py"),
+            "import sys\nfor i in range(3):\n    print('out', i, flush=True)\n    print('err', i, file=sys.stderr, flush=True)\n",
+        )
+        write(self.an("mix.txt"), "out 0\nerr 0\nout 1\nerr 1\nout 2\nerr 2\n")
+        smoke = {"script": "analyst/a-mix.py", "compare": [{"got": "stdout+stderr", "want": "analyst/mix.txt"}]}
+        r = fx.run(meta=self.meta_with(smoke))
+        self.assertOk(r)
+        self.assertIn("smoke check 1/1 OK", r.stdout)
+        # one entry cannot compare both the merged stream and stdout alone: a meta error
+        both = dict(smoke, compare=smoke["compare"] + [{"want": "analyst/mix.txt"}])
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_with(both))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("stdout+stderr", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
     def test_malformed_declaration_is_an_error(self):
         fx = self.fx
         snap = fx.snapshot()

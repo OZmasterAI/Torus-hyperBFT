@@ -61,7 +61,8 @@ SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as a
     name      optional label for the report
     [[smoke.compare]] (an entry without one only prepares input for a later entry, e.g. a cells.json)
       want      archived file in the tools copy, e.g. "analyst/cells.txt" (must be there)
-      got       "stdout" (default), "stdout+stderr" (like `> f 2>&1`), or a file name in {out}
+      got       "stdout" (default), "stdout+stderr" (one pipe for both, like `> f 2>&1`, order kept; not together with
+                "stdout" in one entry), or a file name in {out}
       select    regex: compare only the lines (of both sides) it matches, e.g. "^r1-c0 " for one cell
       ignore    list of regexes: lines dropped from both sides (timestamps, temp paths)
       tolerance relative tolerance for every number in a line (default 0: exact); the text between numbers must match
@@ -1004,6 +1005,10 @@ def smoke_specs(meta):
                     re.compile(rx)
                 except (re.error, TypeError) as e:
                     raise Fatal("%s: bad regex %r: %s" % (where, rx, e)) from e
+        gots = {cm.get("got", "stdout") for cm in cmps}
+        if {"stdout", "stdout+stderr"} <= gots:
+            # stdout+stderr runs the command with one pipe for both streams (`2>&1`), so stdout alone is not available
+            raise Fatal("%s: compare got = \"stdout\" and \"stdout+stderr\" in one entry; split it into two entries" % where)
     if specs and not any(s.get("compare") for s in specs):
         raise Fatal("[[smoke]] declares no compare: nothing would be checked")
     return specs
@@ -1069,13 +1074,15 @@ def run_smoke(c, specs, staged):
             interp = [sys.executable, "-I"] if script.endswith(".py") else ["bash"]
             cmd = interp + [script] + [smoke_fill(a, vals) for a in s.get("args", [])]
             t = s.get("timeout", 300)
+            # like `> f 2>&1`: one pipe for both streams keeps the order the script wrote them in
+            merged = any(cm.get("got") == "stdout+stderr" for cm in s.get("compare", []))
             try:
                 p = subprocess.Popen(
                     cmd,
                     cwd=out,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT if merged else subprocess.PIPE,
                     start_new_session=True,
                 )
             except OSError as e:
@@ -1093,9 +1100,9 @@ def run_smoke(c, specs, staged):
                     "%s: timed out after %g s: %s" % (label, t, " ".join(cmd))
                 )
                 continue
-            so, se = so.decode(errors="replace"), se.decode(errors="replace")
+            so, se = so.decode(errors="replace"), (se or b"").decode(errors="replace")
             if p.returncode:
-                tail = se.strip().splitlines()[-6:] or ["(no stderr)"]
+                tail = (so if merged else se).strip().splitlines()[-6:] or ["(no stderr)"]
                 errors.append(
                     "%s: exit status %d: %s\n    %s"
                     % (label, p.returncode, " ".join(cmd), "\n    ".join(tail))
@@ -1107,7 +1114,7 @@ def run_smoke(c, specs, staged):
                 if got_k == "stdout":
                     got = so
                 elif got_k == "stdout+stderr":
-                    got = so + se
+                    got = so  # stderr went into the same pipe
                 else:
                     gp = os.path.join(out, smoke_fill(got_k, vals))
                     if not os.path.isfile(gp):
