@@ -38,7 +38,7 @@ blocks after the last checkpoint S. No consensus rule, no state format and no `h
 | Phase gate, restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | step 4 |
 | Phase gate, throughput | matched/s UP vs tw beyond noise; native blocks/s no regression (owner s111 after p3t, section 43: on tmpfs the prototype's blocks/s gain is +1.6%, not resolved, so "up" is not required) | step 4 |
 | correctness | per-block write sets, `h_n` and full CF dump identical: interval 15 s vs 0 vs 1 block, crash at random points (incl. mid-checkpoint), 3 replicas with different intervals | tests, step 1 |
-| RAM | a 10 min soak shows RSS levelling off, with a Phase 3 delta <= ~1 GB per node; RSS still growing at the end of the soak blocks the merge (owner s114; was "RSS growth within archy's layer-size figure + 25%", ~270 MB). Which allocator the soak is judged under (glibc fails, jemalloc levels off; sections 53, 53b, 53d) is decided after archy's benches finish. Shrinking the layer (~2.1x its logical size) and the view is a follow-up, reconsidered at Phase 4 | soak cells, step 4 |
+| RAM | a 10 min soak shows RSS levelling off, with a Phase 3 delta <= ~1 GB per node; RSS still growing at the end of the soak blocks the merge (owner s114; was "RSS growth within archy's layer-size figure + 25%", ~270 MB). Which allocator the soak is judged under (glibc fails, jemalloc levels off; sections 53, 53b, 53d) is decided after archy's benches finish. Je vs je (section 57, both arms jemalloc compiled in, no exec-backlog confound): Phase 3 levels off at +0.94 GB per node mean / +1.00 at 10 min / +1.27 peak: met on the level and the mean, not at the peak. Shrinking the layer (~2.1x its logical size) and the view is a follow-up, reconsidered at Phase 4 | soak cells, step 4 |
 
 The CPU ceiling is ~7% vs tw (step 0: flush worker + state-row memtable / compaction 1.76 CPU-s/1M
 on Classic before tw). The per-block running-hash digest stays on W, so its cost is not saved.
@@ -355,6 +355,13 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   +4.3% (fixed load, resolved). matched/s is not higher (tie saturated); blocks/s +10-15%, block time p99 -7 to -9%.
   Part B (10 min soaks ja / jb and je-vs-je jcs `e7be8460` / jmf `0360c840`) decides the RAM gate under jemalloc;
   its binaries are staged in `ozarchy-p3je-stage/{jcs,jmf}-run`.
+- **RAM gate, je vs je soak** (campaign `ozarchy-p3jesoak`, results doc section 57, plan-2 row 65): jcs `e7be8460` (step 2
+  + fix + jemalloc, 15 s) vs jmf `0360c840` (main + fix + jemalloc), 600 s each, full workload in both (0 expiries, 0 margin
+  rejections), exec queue at the cap in both. Phase 3 delta +0.94 GB per node (minutes 5-10 mean; +0.86 to +0.98 per node),
+  +1.00 GB at 10 min, +1.27 GB peak; difference slopes over the last 5 min +43 [-4, +90] / -80 [-134, -27] / +8 [-49, +65]
+  MB/min: levels off. ~+0.55 GB live allocations, ~+0.45 GB jemalloc-resident slack. **RAM rule: met on the level and the
+  mean, at the bound at 10 min, not met at the peak (1.05-1.55 GB).** One cell per arm. Secondary ja vs jb (main, no fix):
+  no RSS saving at 10 min (+0.15 GB), matched/s minutes 6-10 vs 0-2 -19.9% vs -35.1%.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

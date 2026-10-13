@@ -4764,3 +4764,33 @@ rm -r -- \
   '/home/oz/.cargo-target-p3je-jcs-e7be8460' \
   '/home/oz/.cargo-target-p3je-jmf-0360c840'
 ```
+
+### `p3jesoak` (A 0 KiB, B 163.9 MiB; dirs: `ozarchy-p3jesoak-smoke-300m-s0-jcs`, `ozarchy-p3jesoak-300m-w0`, `ozarchy-p3jesoak-300m-k1-jmf`, `ozarchy-p3jesoak-300m-k1-jcs`, `ozarchy-p3jesoak-300m-k1-jb`, `ozarchy-p3jesoak-300m-k1-ja`, `ozarchy-p3jesoak-run`)
+
+The cells' `summary.json`, `mem-samples.txt` (incl. the `torus_jemalloc_*` gauges), `ckpt-samples.txt`, `sampler.csv`, `cpu-ticks.txt`, `cpu.csv`, `bench.log`, `val0-2.log.gz` (per node expiry), `metrics-*-val*.txt`, `state-digest-val*.txt`, `agreement.jsonl`, `run.log` and `ozarchy-p3jesoak-run/analyst/` are what section 57 is built on (keep). Section 57's `a-series.py` also reads the `sampler.csv` and `summary.json` of the p3soak, p3soakje, p3cssoak and p3fsoak 600 s cells for the minute 0-2 vs 6-10 table (kept in those blocks). Tier A: none (the binaries are in `ozarchy-p3je-stage`, listed under `p3je`). Part B now being run and written up, the p3je block's "keep until part B" condition on that stage, the four `~/.cargo-target-p3je-*` target dirs and the `wt/p3je-*` worktrees is met; whether a later campaign still needs them is the owner's call.
+
+Tier B, 163.9 MiB, 20 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-smoke-300m-s0-jcs/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-smoke-300m-s0-jcs/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-smoke-300m-s0-jcs/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-smoke-300m-s0-jcs/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-smoke-300m-s0-jcs/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-smoke-300m-s0-jcs/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-w0/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-w0/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-w0/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-w0/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-w0/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-w0/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-jmf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-jmf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-jcs/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-jcs/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-jb/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-jb/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-ja/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3jesoak-300m-k1-ja/tasks.txt'
+```

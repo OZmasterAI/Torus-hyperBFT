@@ -7005,6 +7005,209 @@ in `ozarchy-p3je-{sat,fix}-run/analyst/` on ozarchy. Driver `tools/ozarchy-p3je-
 (CAMP=SAT|FIX, `jechk`, `ratechk`, the dynsym allocator preflight) + `env.sh`. Build scripts `ozarchy-p3je-build.sh` and
 `ozarchy-p3je-build-all.sh`.
 
+## 57. jemalloc batch part B: 10 min soaks with jemalloc compiled in, Phase 3 je vs je (`e7be8460` vs `0360c840`) and main je vs glibc (`88ddc4c2` vs `deeacdb3`) (campaign ozarchy-p3jesoak, 2026-10-13)
+
+**RAM gate, je vs je (both arms have the cancel fix and jemalloc compiled in; the pair differs only by Phase 3): the
+Phase 3 delta is +0.94 GB per node (minutes 5-10 mean; +1.00 GB at 10 min, +1.27 GB peak; per node +0.86 to +0.98 /
++0.78 to +1.32 / +1.05 to +1.55). It levels off: the last-5-min slope of the RSS difference is +43 [-4, +90], -80 [-134,
+-27] and +8 [-49, +65] MB/min (val0 / val1 / val2), so no node shows positive growth that excludes 0. Both arms hold the exec queue at its
+~66-block cap on every node (minutes 5-10 mean 58-65 in both), so unlike section 53d no exec backlog and no allocator
+difference sits in the delta. Of the +0.99 GB jemalloc-resident delta, +0.54 GB is live allocations
+(`torus_jemalloc_allocated_bytes`) and ~+0.45 GB is allocator pages (resident - allocated). Non-heap RSS is equal
+(-0.01 to -0.07 GB).** Owner RAM rule (levels off, delta <= ~1 GB/node): **met on the level and on the minutes 5-10 mean
+(0.86-0.98 GB on every node), at the bound at 10 min (mean 1.00, val1 1.32), not met at the peak (1.05-1.55 GB).** This
+matches section 53d's estimate for Phase 3 alone under jemalloc (~0.9-1.0 GB), now measured without its confounds. One cell
+per arm: "consistent with", with the CIs above.
+
+**Secondary, main je vs glibc without the cancel fix (ja `88ddc4c2` vs jb `deeacdb3`):** both lose the workload from
+minute ~3 (cancel-all expiries from 152-154 s, margin rejections from minute 6, as in sections 53 / 53b), so neither is
+the full workload. Under that load ja's RSS is +0.15 GB per node above jb on the minutes 5-10 mean (+0.06 GB at 10 min,
++0.39 GB peak). jb's RSS grows +7 to +39 MB/min over the last 5 min and ja's +38 to +52 MB/min (all CIs exclude 0). ja holds the exec queue at the cap on
+all nodes while jb's val0 / val1 drain to ~2 blocks (input-bound). matched/s minutes 6-10 vs 0-2: ja -19.9%, jb -35.1%.
+
+Owner-approved (18c's plan): part B of the jemalloc batch, four 10 min soaks, full workload, commit tail, saturated (the
+harness RATE 76000). Arms: **jmf** = `test/main-fix-je` `0360c840` (main + cancel fix `de97682f` + compiled-in jemalloc;
+node `9d6e57c1`), no checkpoint knob (RAM-gate control). **jcs** = `test/p3-cs-je` `e7be8460` (step 2 + fix `41a95355` +
+compiled-in jemalloc; `4521dd5f`), `TORUS_CHECKPOINT_INTERVAL_MS=15000`. **ja** = `88ddc4c2` (main `deeacdb3` + jemalloc;
+`f2fbe17b`, section 56's ja) and **jb** = `deeacdb3` (glibc; `e901fd1d`), neither with the cancel fix, no knob. No
+LD_PRELOAD anywhere: the preflight found `malloc` defined in `.dynsym` (index 30) of jmf / jcs / ja and `UND` (glibc) in jb,
+and every je cell exported `torus_jemalloc_{allocated,resident,retained}_bytes` > 0 on all 3 nodes (jb none). Chain
+(preflight): jmf's parent is `de97682f`, jcs's parent `41a95355`, merge-base(jmf, jcs) = `de97682f`, jmf has no Phase 3 commit
+and no commit outside jcs except its own jemalloc commit. Binaries built and staged by part A (`ozarchy-p3je-stage`,
+md5s `ozarchy-p3je-build/md5s-all.txt`), worktrees `wt/p3je-*` clean at their shas. Bench `05d44313`, harness `218ad251`,
+tw, Classic, 300 markets, MAX_IN_FLIGHT 4, budget 900, commit tail, shared NVMe, memguard (MemAvailable < 6 GB stops the
+cell). Driver `ozarchy-p3jesoak-campaign.sh` (copy of part A's with CAMP=SOAK, arms jmf / jcs, `jechk` and the no-preload
+check generalised to the three je arms, the allocator check on all four binaries). A 60 s jcs smoke cell (08:04-08:07)
+showed the enable line `item 6 Phase 3: coalesced state checkpoints ON` (interval 15 s) once per validator, 11
+checkpoints per node, ACCEPT AGREE. Cells 08:09-09:09: w0 (jmf, 60 s, excluded), k1-jmf, k1-jcs, k1-jb, k1-ja (600 s
+each, fixed, no extensions; each pair adjacent). **w0, k1-jmf, k1-jcs, k1-jb: rc 0, ACCEPT, AGREE. k1-ja: rc 2, REJECT
+DISAGREE = the mark-only digest artifact** (57.4). 80 CHECK OK (+16 in the smoke), no CHECK FAIL, no memguard stop, no deaths, the host quiet
+before every cell.
+
+### 57.1 RSS per node and the jemalloc split (VmRSS, mem-samples.txt, 5 s; bench window 602-604 s)
+
+![RSS and jemalloc allocated per node: jcs vs jmf, ja vs jb](ozarchy-p3jesoak-figs/fig-rss.png)
+
+*Figure 57-1: VmRSS (solid) and `torus_jemalloc_allocated_bytes` (thin dashed) per node. Top: jmf grey dashed, jcs green.
+Bottom: jb (glibc, no gauge) orange dashed, ja blue.*
+
+| cell | node | mean min 2-5 MB | mean min 5-10 MB | change | @10 min MB | peak MB | slope last 5 min MB/min (95% CI) | je allocated MB | je resident MB | je retained MB | exec queue (min 5-10) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| jmf | val0 | 4,165 | 4,157 | -8 | 4,188 | 4,383 | -19.2 [-42.9, +4.5] | 2,752 | 3,794 | 3,923 | 58.5 |
+| jmf | val1 | 4,134 | 4,153 | +19 | 4,048 | 4,329 | -2.3 [-19.9, +15.4] | 2,785 | 3,770 | 3,600 | 59.0 |
+| jmf | val2 | 4,892 | 4,964 | +72 | 5,241 | 5,299 | -9.5 [-35.1, +16.0] | 2,939 | 4,566 | 4,669 | 65.3 |
+| jcs | val0 | 5,027 | 5,159 | +132 | 5,103 | 5,622 | +22.2 [-27.2, +71.6] | 3,313 | 4,805 | 5,241 | 58.1 |
+| jcs | val1 | 5,286 | 5,161 | -125 | 5,403 | 5,921 | **-78.3 [-132.1, -24.5]** | 3,374 | 4,853 | 7,817 | 63.5 |
+| jcs | val2 | 5,842 | 5,840 | -1 | 6,039 | 6,377 | +3.5 [-53.9, +60.8] | 3,464 | 5,493 | 6,800 | 65.4 |
+| jb | val0 | 3,837 | 3,927 | +90 | 4,002 | 4,002 | **+13.8 [+10.9, +16.8]** | - | - | - | 2.0 |
+| jb | val1 | 3,796 | 3,865 | +69 | 3,891 | 3,909 | **+7.1 [+3.6, +10.6]** | - | - | - | 1.6 |
+| jb | val2 | 4,617 | 4,690 | +73 | 4,769 | 4,862 | **+39.0 [+31.8, +46.2]** | - | - | - | 65.4 |
+| ja | val0 | 3,955 | 4,039 | +84 | 4,145 | 4,262 | **+37.7 [+14.6, +60.9]** | 2,610 | 3,616 | 3,498 | 64.9 |
+| ja | val1 | 3,987 | 4,057 | +70 | 4,000 | 4,426 | **+50.3 [+22.4, +78.2]** | 2,572 | 3,602 | 3,579 | 59.2 |
+| ja | val2 | 4,737 | 4,842 | +105 | 4,693 | 5,289 | **+52.3 [+23.8, +80.8]** | 2,685 | 4,405 | 4,286 | 62.2 |
+
+jemalloc columns: minutes 5-10 mean of the 5 s gauges. `retained` is address space jemalloc keeps mapped but has
+returned to the OS (not in RSS). Exec queue: `torus_exec_queue_depth`, 1 s sampler. The cap is ~66 blocks (max seen 66 in
+every arm).
+
+Deltas per node (GB: mean min 5-10 / @10 min / peak) and the OLS slope of the RSS difference series over the last 5 min
+(5 s grid, MB/min, 95% CI with the AR(1) effective n of `ols()`):
+
+| delta | val0 | val1 | val2 | mean of 3 |
+|---|---|---|---|---|
+| **jcs - jmf** RSS (Phase 3, je vs je) | +0.98 / +0.89 / +1.21; +43 [-4, +90] | +0.98 / +1.32 / +1.55; **-80 [-134, -27]** | +0.86 / +0.78 / +1.05; +8 [-49, +65] | **+0.94 / +1.00 / +1.27** |
+| jcs - jmf je allocated (live) | +0.55 / +0.87 / +1.12; -39 [-110, +31] | +0.57 / +0.72 / +0.94; +12 [-58, +82] | +0.51 / +0.79 / +0.80; +45 [-18, +108] | +0.54 / +0.79 / +0.95 |
+| jcs - jmf je resident | +0.99 / +1.08 / +1.47; +31 [-21, +83] | +1.06 / +0.82 / +1.43; **-79 [-148, -10]** | +0.91 / +0.79 / +1.33; +5 [-57, +68] | +0.99 / +0.90 / +1.41 |
+| jcs - jmf RSS - je resident (non-heap) | -0.01 | -0.07 | -0.05 | -0.04 |
+| ja - jb RSS (je vs glibc, no fix) | +0.11 / +0.14 / +0.25; +24 [-1, +49] | +0.19 / +0.11 / +0.50; **+44 [+15, +73]** | +0.15 / -0.07 / +0.42; +17 [-9, +43] | +0.15 / +0.06 / +0.39 |
+
+* **Levels off.** jmf is flat (last-5-min slopes -19 to -2 MB/min, CIs span 0). jcs is flat or falling (+22 / -78 / +4,
+  val1's CI below 0), and so is the difference to jmf. jcs swings around its level, up to ~+0.5 GB above its minutes 5-10
+  mean (the 15 s checkpoint rebuild and jemalloc decay; allocated swings with it). The CIs are +-50-70 MB/min wide, so slow growth of up to
+  ~+50-90 MB/min on val0 is not excluded by one cell. val0's difference slope (+43 [-4, +90]) is the closest to growth.
+* **Exec backlog vs Phase 3.** In section 53d the jcs2 - mf delta (+1.10 GB) carried jcs2's full exec queue on val0 / val1
+  (65 / 62 blocks vs ~1.5 on mf) and the allocator. Here both arms are je and both sit at the cap (58-65 blocks on every
+  node, minutes 5-10). So the exec backlog contributes ~0 to jcs - jmf. The delta is Phase 3: `41a95355` is `de97682f` +
+  35 commits, all on the Phase 3 step 1 / step 2 branches (incl. their merges and one ignored test repro).
+* **Live data vs allocator.** Of the jcs - jmf delta, live allocations are +0.51 to +0.57 GB per node (minutes 5-10) and
+  allocator-resident pages (resident - allocated) another +0.40 to +0.49 GB. Live Phase 3 data is about 2.5-3 x the layer
+  per checkpoint (203 MB mean, 57.2). RocksDB memtables are 50-60 MB *lower* on jcs (224-246 vs 274-293 MB), so the Phase 3
+  structures are ~+0.6 GB live. jemalloc's resident / allocated ratio is 1.35-1.55 on jmf and 1.44-1.59 on jcs. jcs also
+  retains more address space (5.2-7.8 vs 3.6-4.7 GB), outside RSS.
+* **ja vs jb (no fix).** On the mean ja is +0.11 to +0.19 GB above jb, and on val2 (both at the exec cap) +0.15 / -0.07 /
+  +0.42. On val0 / val1, ja holds ~60-65 blocks in the exec queue vs ~2 on jb, which section 48 puts at up to ~+0.8 GB. So
+  jemalloc does not lower main's RSS at 10 min under this collapsed workload. Both arms still grow slowly in the last 5 min,
+  ja faster (difference +17 to +44 MB/min; CI excludes 0 on val1 only). ja's live allocations rise +34 to +54 MB/min (CIs
+  exclude 0) while its book falls (resting 0.31-0.35 -> 0.19-0.27 M). What grows is not identified here. Part A's lower
+  early RSS growth on ja is not visible over 10 min: ja starts higher (+0.48 GB at 1 min on val0) and the gap narrows to
+  +0.1-0.2 GB by minute 3.
+
+### 57.2 Per minute per node (val0; val1 / val2 within a few % except as noted, all in `series.txt`)
+
+![per node per minute: expiry, cancel-alls, margin rejections, matched/s, book, exec queue / busy / ms per block, je overhead, layer, flush queue](ozarchy-p3jesoak-figs/fig-node.png)
+
+*Figure 57-2: per node (columns), per minute: nonce-expired evictions, cancel-alls executed/s, margin-rejected orders/s,
+matched/s, resting orders, exec queue depth, exec busy, exec ms per block, jemalloc resident - allocated, layer MB per
+checkpoint and flush-worker depth. Same colours as figure 57-1.*
+
+Cells: RSS MB at minute end / jemalloc allocated / resident MB (minute mean) / matched/s / resting orders M (minute
+end) / exec queue (mean) / exec ms per block (`torus_exec_block_seconds` sum delta / count delta in the minute) / expiries
+(nonce-expired evictions in the minute) / margin-rejected orders/s. Exec busy is 0.95-1.00 in every minute on jmf, jcs and
+ja; on jb it falls to 0.73-0.85 from minute 4.
+
+| min | jmf, val0 | jcs, val0 | jb, val0 | ja, val0 |
+|---|---|---|---|---|
+| 1 | 3,597 / 1,871 / 2,756 / 200k / 0.22 / 49 / 198 / 0 / 0 | 4,266 / 2,146 / 3,196 / 205k / 0.17 / 50 / 193 / 0 / 0 | 3,290 / - / - / 208k / 0.07 / 39 / 224 / 0 / 0 | 3,733 / 1,904 / 2,750 / 204k / 0.16 / 52 / 255 / 0 / 0 |
+| 2 | 3,968 / 2,530 / 3,544 / 199k / 0.02 / 62 / 298 / 0 / 0 | 4,605 / 2,991 / 4,458 / 212k / 0.13 / 63 / 292 / 0 / 0 | 3,743 / - / - / 222k / 0.44 / 29 / 318 / 0 / 0 | 4,035 / 2,463 / 3,416 / 222k / 0.25 / 64 / 288 / 0 / 0 |
+| 3 | 4,247 / 2,688 / 3,773 / 203k / 0.69 / 62 / 397 / 0 / 0 | 5,159 / 3,266 / 4,590 / 222k / 0.71 / 62 / 380 / 0 / 0 | 3,805 / - / - / 209k / 0.49 / 15 / 356 / 3,431 / 0 | 3,979 / 2,661 / 3,580 / 218k / 0.58 / 65 / 360 / 2,124 / 0 |
+| 4 | 4,193 / 2,857 / 3,852 / 192k / 0.72 / 62 / 418 / 0 / 0 | 5,079 / 3,371 / 4,720 / 220k / 0.65 / 62 / 366 / 0 / 0 | 3,863 / - / - / 186k / 0.41 / 2 / 342 / 3,471 / 0 | 3,938 / 2,552 / 3,502 / 212k / 0.35 / 65 / 351 / 1,772 / 0 |
+| 5 | 4,117 / 2,850 / 3,859 / 192k / 0.66 / 61 / 417 / 0 / 0 | 5,009 / 3,467 / 4,778 / 220k / 0.62 / 61 / 371 / 0 / 0 | 3,888 / - / - / 192k / 0.32 / 2 / 332 / 1,190 / 0 | 3,893 / 2,531 / 3,497 / 213k / 0.36 / 65 / 345 / 3,404 / 0 |
+| 6 | 4,360 / 2,766 / 3,858 / 194k / 0.74 / 60 / 419 / 0 / 0 | 5,367 / 3,472 / 4,815 / 220k / 0.62 / 60 / 371 / 0 / 0 | 3,901 / - / - / 169k / 0.33 / 2 / 315 / 2,321 / 22.7k | 4,049 / 2,515 / 3,523 / 192k / 0.27 / 65 / 336 / 2,097 / 28.6k |
+| 7 | 4,046 / 2,773 / 3,808 / 189k / 0.63 / 59 / 422 / 0 / 0 | 4,857 / 3,330 / 4,816 / 215k / 0.54 / 59 / 375 / 0 / 0 | 3,910 / - / - / 127k / 0.12 / 2 / 255 / 3,220 / 96.6k | 4,047 / 2,578 / 3,530 / 175k / 0.32 / 65 / 290 / 1,957 / 107.2k |
+| 8 | 4,207 / 2,731 / 3,748 / 191k / 0.71 / 59 / 420 / 0 / 0 | 5,220 / 3,208 / 4,706 / 221k / 0.73 / 58 / 376 / 0 / 0 | 3,931 / - / - / 141k / 0.37 / 2 / 260 / 1,980 / 120.3k | 4,028 / 2,598 / 3,598 / 177k / 0.39 / 65 / 291 / 0 / 108.0k |
+| 9 | 4,056 / 2,776 / 3,812 / 193k / 0.69 / 58 / 419 / 0 / 0 | 5,005 / 3,258 / 4,839 / 213k / 0.66 / 58 / 380 / 0 / 0 | 3,982 / - / - / 154k / 0.45 / 2 / 279 / 989 / 92.9k | 4,123 / 2,686 / 3,686 / 172k / 0.28 / 65 / 293 / 0 / 100.8k |
+| 10 | 4,147 / 2,714 / 3,738 / 192k / 0.69 / 57 / 419 / 0 / 0 | 5,137 / 3,263 / 4,831 / 221k / 0.71 / 57 / 374 / 0 / 0 | 3,988 / - / - / 135k / 0.34 / 3 / 260 / 755 / 120.4k | 4,051 / 2,671 / 3,741 / 159k / 0.11 / 65 / 288 / 0 / 120.1k |
+
+* **Expiries and rejections.** jmf and jcs: 0 nonce-expired evictions, 0 margin rejections and 0 action failures on every
+  node, 0 bench in-flight timeouts. Cancel-alls sent / executed per node: jmf 211,681 / 211,678, jcs 235,134 / 235,105 (the
+  rest not accepted at submit; the bench's refused releases, places included, are 86 / 111). **jb: 17,357 nonce-expired evictions per node, the first at
+  153.5-154.2 s (minute 3), the last in minute 10; 16,602 bench releases by the 70 s timeout; 27.39 M margin-rejected
+  orders per node from minute 6 (93-137k/s). ja: 11,354 evictions per node, first at 152.3-152.9 s, none after minute 7;
+  11,354 timeouts; 31.11 M margin-rejected orders from minute 6 (100-124k/s).** Cancel-alls sent - executed = the
+  evictions in both (jb 17,357, ja 11,365 incl. 11 refused). The same pattern as sections 53 / 53b without the fix.
+* **Book and layer (jcs).** Resting orders 0.62-0.73 M (jmf) and 0.54-0.73 M (jcs) per node from minute 3, flat. jb / ja
+  fall from minute 6 (to 0.21-0.30 / 0.19-0.27 M at the end). jcs: 47-48 checkpoints per node, layer 202.6-202.8 MB mean
+  (early -> late 5 min 193 -> 212 MB), `layer_shared` 0, drop_inline 1,910-2,039 per node, settle wait 26 -> 34 ms per
+  native block. Same as 53d's jcs2 (204 MB, 48 checkpoints).
+* **Flush worker and exec.** Flush-worker depth 0.1-0.2 (jcs) and 0.4-0.6 (jmf) every minute: no block backlog in the flush
+  queue. Exec ms per block (minutes 5-10): jmf 419-421, jcs 376-377, ja 297-299, jb 273-324. Native blocks/s (val0,
+  minutes 3-10): jmf 2.32-2.47, jcs 2.63-2.73 (+6 to +15% per minute).
+* **Block-build select time** (proposer builds, minutes 2-10 mean, val0 / val1 / val2): jmf 33.6 / 32.9 / 33.6 ms, jcs 22.6
+  / 28.0 / 24.2 ms at mempool 6.1-6.4k on both. This is 53d's "main + fix selects slower" observation again, now je vs je.
+  It is consistent with step 2's validator ingress readers on a published view, but not established.
+
+### 57.3 matched/s: minutes 0-2 vs 6-10, every soak cell (val0 `torus_orders_matched_total`, 1 s sampler)
+
+Each rate is the counter delta over the window divided by the same window's length (bench seconds 0-120, 120-360 and
+360-600; the bench window is 602-604 s).
+
+| section | cell | min 0-2 | min 2-6 | min 6-10 | 6-10 vs 0-2 | whole window (harness) |
+|---|---|---|---|---|---|---|
+| 57 | **jmf** main + fix `0360c840`, je | 199,262 | 195,252 | 191,138 | **-4.1%** | 194,684 |
+| 57 | **jcs** step 2 + fix `e7be8460`, je | 208,457 | 220,588 | 217,531 | **+4.4%** | 216,765 |
+| 57 | **jb** main `deeacdb3`, glibc, no fix | 214,934 | 188,983 | 139,385 | **-35.1%** | 174,556 |
+| 57 | **ja** main `88ddc4c2`, je, no fix | 213,025 | 208,839 | 170,704 | **-19.9%** | 194,248 |
+| 53d | mf `de97682f`, glibc | 201,476 | 185,861 | 176,031 | -12.6% | 185,054 |
+| 53d | cs2 `41a95355`, glibc | 204,027 | 192,917 | 181,995 | -10.8% | 190,602 |
+| 53d | jcs2 `41a95355`, je (LD_PRELOAD) | 207,969 | 217,500 | 213,669 | +2.7% | 214,299 |
+| 53b | main `219f0c20`, je (LD_PRELOAD) | 208,224 | 212,613 | 163,200 | -21.6% | 191,756 |
+| 53 | main `219f0c20`, glibc | 200,881 | 186,653 | 135,177 | -32.7% | 168,384 |
+
+* With the fix and jemalloc in both arms the sustained rate holds: jmf -4.1%, jcs +4.4% from minutes 0-2 to 6-10 (glibc
+  with the fix lost 11-13% in 53d). The exec queue stays at the cap, exec busy 0.97-1.00, submits ~930 (jmf) / ~1,050
+  (jcs) actions/s from minute 4.
+* Without the fix, jemalloc compiled in loses -19.9% vs glibc's -35.1%, like 53b's LD_PRELOAD main vs 53's glibc main
+  (-21.6% vs -32.7%).
+  ja keeps the exec queue full while jb goes input-bound after minute 3.
+* jcs runs +11.3% matched/s over the whole window vs jmf (exec ms per block -10%, blocks/s +6 to +15% from minute 3),
+  one cell per arm. Section 53d had cs2 vs mf (glibc) at +3.0% and jcs2 (je) vs mf (glibc) at +15.8%. Which part of Phase 3
+  steps 1-2 gives it is not established here.
+
+### 57.4 Agreement and other checks
+
+k1-ja is rc 2 / REJECT DISAGREE on agreement: all three nodes agree on the block hash at the compared height 2,669 and on
+matched / placed / resting / action counts. val1's state digest (taken at height 2,702) differs from val0 / val2 in the 5
+mark fields (`accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed`, `withdrawable`) of all 50 sampled
+accounts only; val0 and val2 agree (`a-digest.py`, part A's classifier). This is the slow-digest mark-only artifact of sections 46-56 (part A's
+SAT r4-ja had the same shape): **no hard finding.** The other four cells and the smoke cell are ACCEPT AGREE. Per cell:
+node exe md5 = the arm's md5 on 3 nodes, trie off, Classic env and cap 8, 4 MiB book CF, no trade/WAL knob, codec and LSM
+defaults, the checkpoint knob only on jcs (enable line with `interval: Some(15s)` once per validator, 47-48 checkpoints per
+node), exec pipeline on, genesis state hash off, btrfs data dirs, commit tail in run.log / bench cmd / bench.log /
+summary.json, no LD_PRELOAD and no jemalloc mapped from a library on any node, allocator gauges on the je arms only. Max
+open fds 385-459 per node.
+
+### 57.5 Verdict
+
+* **RAM gate under jemalloc (je vs je): Phase 3 levels off at +0.94 GB per node (minutes 5-10 mean; +0.86 to +0.98 per
+  node), +1.00 GB at 10 min, +1.27 GB peak.** Rule (levels off, delta <= ~1 GB/node): met on the level and the mean, at the
+  bound at 10 min, over it at the peak (1.05-1.55 GB per node). No exec-backlog or allocator confound in this pair. One
+  cell per arm.
+* **What the delta is.** ~+0.55 GB live allocations (Phase 3 layers and view, ~2.5-3 layers of ~203 MB; memtables 50-60 MB
+  lower) and ~+0.45 GB jemalloc-resident pages not in use (resident - allocated). The peak overshoot is the 15 s rebuild
+  cycle (+-300-500 MB swings). Shrinking the layer (~2.1x its logical size, section 53b) or tighter jemalloc decay would
+  act on these two parts; neither is measured here.
+* **Main, je vs glibc, without the fix:** no RSS saving at 10 min (+0.15 GB on the mean, partly ja's full exec queue on
+  val0 / val1); both still grow slowly. jemalloc keeps more of the throughput through the margin collapse (-19.9% vs
+  -35.1%). The workload is not the full one, so this is not the allocator's answer for main at full load. jmf vs 53d's mf
+  (glibc, same source + fix) is the closest such comparison: RSS minutes 5-10 4.16 / 4.15 / 4.96 vs 3.98 / 3.97 / 5.04 GB,
+  across campaigns.
+
+Analysis (`tools/ozarchy-p3jesoak-tools/analyst/`): `a-series.py` (53d's copy with the cells jmf / jcs / jb / ja, pairs
+jcs - jmf and ja - jb, the `torus_jemalloc_*` gauges per node and minute, exec busy / ms per block / queue depth, and the
+difference slopes of RSS and of jemalloc allocated / resident; figures SVG -> PNG via `rsvg-convert`), `a-digest.py` (part
+A's digest classifier), `a-archive.py`. Outputs `series.txt`, `digest.txt`. Full outputs (incl. `series.json`, SVGs) in
+`ozarchy-p3jesoak-run/analyst/` on ozarchy. Driver: `tools/ozarchy-p3jesoak-tools/ozarchy-p3jesoak-campaign.sh`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
