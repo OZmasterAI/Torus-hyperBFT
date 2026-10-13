@@ -53,6 +53,10 @@ pub struct Metrics {
     // Mempool metrics
     pub mempool_evm_size: Gauge,
     pub mempool_native_size: Gauge,
+    /// Exec-aware admission (`TORUS_ADMISSION_EXEC_AWARE`): normal native
+    /// actions of committed blocks dispatched to execution, not yet executed.
+    /// Always 0 with the knob off.
+    pub mempool_native_committed_unexecuted: Gauge,
 
     // Network metrics
     pub peers_connected: Gauge,
@@ -1141,6 +1145,13 @@ impl Metrics {
             "torus_mempool_native_size",
             "Number of pending native actions",
             mempool_native_size.clone(),
+        );
+
+        let mempool_native_committed_unexecuted = Gauge::default();
+        registry.register(
+            "torus_mempool_native_committed_unexecuted",
+            "Normal native actions committed and dispatched to execution but not yet executed (exec-aware admission; 0 unless TORUS_ADMISSION_EXEC_AWARE is on)",
+            mempool_native_committed_unexecuted.clone(),
         );
 
         let peers_connected = Gauge::default();
@@ -2757,6 +2768,7 @@ impl Metrics {
             state_root_compute_seconds,
             mempool_evm_size,
             mempool_native_size,
+            mempool_native_committed_unexecuted,
             peers_connected,
             db_size_bytes,
             epoch_number,
