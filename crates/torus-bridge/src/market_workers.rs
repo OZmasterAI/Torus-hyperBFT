@@ -75,17 +75,29 @@ impl MarketWorkerPool {
         batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)>,
         timestamp: u64,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
-        Self::match_parallel_with(batches, timestamp, None)
+        Self::match_parallel_with(batches, timestamp, None, false)
     }
 
     /// F1 (s517 #4): [`Self::match_parallel`] with the source of makers'
     /// accounts (read-only, `Sync`; `None` = makers unchecked).
+    /// perf/cloid-engine-cost fix 3: `cloids_checked` = the caller has
+    /// applied the one-live-order-per-`(trader, cloid)` rule to every
+    /// request across every book (the executor's batch pre-pass), so the
+    /// books skip their own lookup
+    /// ([`OrderBook::place_order_with_accounts_cloid_checked`]).
     pub fn match_parallel_with(
         batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)>,
         timestamp: u64,
         makers: Option<&dyn MakerAccountSource>,
+        cloids_checked: bool,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
-        Self::match_parallel_capped_with(batches, timestamp, Self::resolve_worker_cap(), makers)
+        Self::match_parallel_capped_with(
+            batches,
+            timestamp,
+            Self::resolve_worker_cap(),
+            makers,
+            cloids_checked,
+        )
     }
 
     /// [`Self::match_parallel`] with an explicit worker cap (>= 1 enforced).
@@ -96,7 +108,7 @@ impl MarketWorkerPool {
         timestamp: u64,
         max_workers: usize,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
-        Self::match_parallel_capped_with(batches, timestamp, max_workers, None)
+        Self::match_parallel_capped_with(batches, timestamp, max_workers, None, false)
     }
 
     /// F1 (s517 #4): [`Self::match_parallel_capped`] with the makers' source.
@@ -105,6 +117,7 @@ impl MarketWorkerPool {
         timestamp: u64,
         max_workers: usize,
         makers: Option<&dyn MakerAccountSource>,
+        cloids_checked: bool,
     ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic> {
         if batches.is_empty() {
             return Ok(Vec::new());
@@ -114,7 +127,7 @@ impl MarketWorkerPool {
         if batches.len() == 1 {
             let (market_id, (book, requests)) = batches.into_iter().next().unwrap();
             return Self::run_contained(market_id, || {
-                Self::match_market(market_id, book, requests, timestamp, makers)
+                Self::match_market(market_id, book, requests, timestamp, makers, cloids_checked)
             })
             .map(|r| vec![r]);
         }
@@ -151,7 +164,7 @@ impl MarketWorkerPool {
         // per-market matcher `process_chunk` runs.
         let match_one =
             move |market_id: MarketId, book: OrderBook, requests: Vec<MatchRequest<'a>>| {
-                Self::match_market(market_id, book, requests, timestamp, makers)
+                Self::match_market(market_id, book, requests, timestamp, makers, cloids_checked)
             };
 
         // P2-3: the chunks run as jobs on the persistent exec pool (no
@@ -326,19 +339,30 @@ impl MarketWorkerPool {
         requests: Vec<MatchRequest<'_>>,
         timestamp: u64,
         makers: Option<&dyn MakerAccountSource>,
+        cloids_checked: bool,
     ) -> MarketBatchResult {
         let mut results = Vec::with_capacity(requests.len());
 
         for req in requests {
             book.set_next_order_id(req.order_id);
             // C2: THE one params copy in the pipeline — the book takes ownership.
-            let place_result = book.place_order_with_accounts(
-                req.params.clone(),
-                req.sender,
-                timestamp,
-                req.margin.as_ref(),
-                makers,
-            );
+            let place_result = if cloids_checked {
+                book.place_order_with_accounts_cloid_checked(
+                    req.params.clone(),
+                    req.sender,
+                    timestamp,
+                    req.margin.as_ref(),
+                    makers,
+                )
+            } else {
+                book.place_order_with_accounts(
+                    req.params.clone(),
+                    req.sender,
+                    timestamp,
+                    req.margin.as_ref(),
+                    makers,
+                )
+            };
 
             results.push(MatchResult {
                 sender: req.sender,
@@ -390,6 +414,60 @@ mod worker_panic_containment_tests {
         let results =
             MarketWorkerPool::match_parallel(batches, 1000).expect("no worker, no panic");
         assert!(results.is_empty());
+    }
+
+    /// perf/cloid-engine-cost fix 3: only the executor's batch path (which
+    /// checked every cloid first) tells the books to skip their cloid
+    /// lookup; the public entry points without the flag keep it, so two
+    /// requests of one trader's cloid in one book still reject the second,
+    /// one market or several.
+    #[test]
+    fn without_the_executor_check_the_book_still_rejects_a_duplicate_cloid() {
+        use torus_state::action_status::FailureReason;
+        use torus_types::{FixedPoint, OrderType, TimeInForce};
+        let fp = |v: i64| FixedPoint::from_raw(v as i128 * FixedPoint::SCALE);
+        let p = |m: MarketId, px: i64| PlaceOrderParams {
+            market_id: m,
+            is_buy: true,
+            price: fp(px),
+            quantity: fp(1),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: Some(7),
+        };
+        let trader = Address::new([1; 20]);
+        let params: Vec<PlaceOrderParams> = vec![p(1, 50), p(1, 49), p(2, 50), p(2, 49)];
+        for markets in [1u64, 2] {
+            let mut batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
+                HashMap::default();
+            for m in 1..=markets {
+                let reqs = params
+                    .iter()
+                    .filter(|q| q.market_id == m)
+                    .enumerate()
+                    .map(|(k, q)| MatchRequest {
+                        sender: trader,
+                        params: q,
+                        order_id: 10 * m as u128 + k as u128,
+                        margin: None,
+                    })
+                    .collect();
+                batches.insert(m, (OrderBook::new(m, fp(1), fp(1)), reqs));
+            }
+            let results = MarketWorkerPool::match_parallel(batches, 1000).expect("no panic");
+            assert_eq!(results.len(), markets as usize);
+            for r in results {
+                let rejects: Vec<_> = r.results.iter().map(|x| x.result.reject).collect();
+                assert_eq!(
+                    rejects,
+                    vec![None, Some(FailureReason::DuplicateCloid)],
+                    "market {}",
+                    r.market_id
+                );
+                assert_eq!(r.book.cloid_count(), 1);
+            }
+        }
     }
 }
 

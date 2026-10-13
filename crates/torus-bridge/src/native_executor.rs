@@ -7269,10 +7269,17 @@ impl NativeExecutor {
         // Item 6 C3: a maker's `free` = its balance (frozen backend during
         // matching) + its position sums, memoised for the block (was fix 1's
         // per-call `BatchMakerAccounts`): the same value in every market.
+        // fix 3: every request passed the cloid pre-pass above (it ran over
+        // every placement of this call carrying a cloid: live in no book,
+        // claimed by no earlier placement), and nothing since stored an
+        // order in a book (Phase 2 only reserves; a worker adds only its
+        // own requests, whose cloids differ by the claimed set; fired stops
+        // are placed after settlement), so the books skip their re-check.
         let mut market_results = match MarketWorkerPool::match_parallel_with(
             worker_batches,
             ctx.timestamp,
             Some(&reader),
+            true,
         ) {
             Ok(r) => r,
             Err(panic) => {

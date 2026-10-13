@@ -1401,16 +1401,56 @@ impl OrderBook {
         margin: Option<&TakerMarginLimit>,
         makers: Option<&dyn MakerAccountSource>,
     ) -> PlaceResult {
+        self.place_order_checked(params, trader, timestamp, margin, makers, false)
+    }
+
+    /// perf/cloid-engine-cost fix 3: [`Self::place_order_with_accounts`]
+    /// for a caller that has already applied the one-live-order-per-
+    /// `(trader, cloid)` rule to this placement across every book, this
+    /// one included, with nothing added to this book since but orders of
+    /// other cloids: the executor's batch pre-pass (index lookup confirmed
+    /// in the book it names, plus the claimed set of the call) feeding the
+    /// market workers. The book does not look the cloid up again; debug
+    /// builds still do and assert it is free. Any other caller must use
+    /// [`Self::place_order_with_accounts`].
+    pub fn place_order_with_accounts_cloid_checked(
+        &mut self,
+        params: PlaceOrderParams,
+        trader: Address,
+        timestamp: u64,
+        margin: Option<&TakerMarginLimit>,
+        makers: Option<&dyn MakerAccountSource>,
+    ) -> PlaceResult {
+        self.place_order_checked(params, trader, timestamp, margin, makers, true)
+    }
+
+    /// [`Self::place_order_with_accounts`]; `cloid_checked`: the caller
+    /// has applied the cloid rule ([`Self::place_order_with_accounts_cloid_checked`]).
+    fn place_order_checked(
+        &mut self,
+        params: PlaceOrderParams,
+        trader: Address,
+        timestamp: u64,
+        margin: Option<&TakerMarginLimit>,
+        makers: Option<&dyn MakerAccountSource>,
+        cloid_checked: bool,
+    ) -> PlaceResult {
         let order_id = self.alloc_id();
         let side = if params.is_buy { Side::Buy } else { Side::Sell };
 
         // s114: one live order per (trader, cloid) in this book (the
-        // executor applies the rule across books before the book).
-        if params
-            .client_order_id
-            .is_some_and(|c| self.cloids.map.contains_key(&(trader, c)))
-        {
-            return PlaceResult::rejected(order_id, FailureReason::DuplicateCloid);
+        // executor applies the rule across books before the book; fix 3:
+        // its batch path tells the book so and the lookup is skipped).
+        if let Some(c) = params.client_order_id {
+            if cloid_checked {
+                debug_assert!(
+                    !self.cloids.map.contains_key(&(trader, c)),
+                    "cloid {c:#x} of {trader} placed as checked but live in market {}",
+                    self.market_id
+                );
+            } else if self.cloids.map.contains_key(&(trader, c)) {
+                return PlaceResult::rejected(order_id, FailureReason::DuplicateCloid);
+            }
         }
 
         // Dust order rejection (2.1b.2): qty must be >= lot_size

@@ -792,3 +792,68 @@ fn clearing_a_resolved_log_empties_it() {
     b.drain_cloid_log(|_, _, _| n += 1);
     assert_eq!(n, 0);
 }
+
+/// perf/cloid-engine-cost fix 3: when the caller has applied the cloid
+/// rule (the cloid is free in this book), the checked entry gives exactly
+/// the result and the book of the regular one. Seeded streams; a live
+/// cloid goes through the regular entry on both books, as the executor's
+/// contract demands.
+#[test]
+fn the_cloid_checked_entry_places_like_the_regular_one() {
+    let mut checked_places = 0usize;
+    for seed in 1..=30u64 {
+        let mut rng = Rng(seed);
+        let (mut regular, mut checked) = (book(), book());
+        for k in 0..300u64 {
+            let trader = addr(1 + rng.below(3) as u8);
+            let c = (rng.below(5) != 0).then(|| C + rng.below(4) as u128);
+            let is_buy = rng.below(2) == 0;
+            let px = if is_buy {
+                rng.pick(97, 101)
+            } else {
+                rng.pick(99, 103)
+            };
+            let tif = if rng.below(4) == 0 {
+                TimeInForce::IOC
+            } else {
+                TimeInForce::GTC
+            };
+            let params = p(is_buy, fp(px), fp(rng.pick(1, 3)), OrderType::Limit, tif, c);
+            if rng.below(6) == 0 {
+                if let Some(c) = c {
+                    if let Some(id) = regular.order_id_by_cloid(&trader, c) {
+                        assert!(regular.cancel_order(id).is_ok());
+                        assert!(checked.cancel_order(id).is_ok());
+                    }
+                }
+            }
+            let free = c.is_none_or(|c| regular.order_id_by_cloid(&trader, c).is_none());
+            let a = regular.place_order_with_accounts(params.clone(), trader, k, None, None);
+            let b = if free {
+                checked_places += 1;
+                checked.place_order_with_accounts_cloid_checked(params, trader, k, None, None)
+            } else {
+                checked.place_order_with_accounts(params, trader, k, None, None)
+            };
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "seed {seed} op {k}");
+        }
+        assert_eq!(entries(&regular), entries(&checked));
+        assert_eq!(
+            borsh::to_vec(&regular).unwrap(),
+            borsh::to_vec(&checked).unwrap()
+        );
+        checked.verify_invariants();
+    }
+    assert!(checked_places > 4_000, "{checked_places}");
+}
+
+/// fix 3: debug builds still look the cloid up on the checked entry and
+/// stop a caller that broke the contract.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "placed as checked but live")]
+fn a_checked_placement_of_a_live_cloid_panics_in_debug() {
+    let mut b = book();
+    b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 1);
+    b.place_order_with_accounts_cloid_checked(gtc(true, 99, 1, Some(C)), addr(1), 2, None, None);
+}
