@@ -316,14 +316,47 @@ fn read_meta<S: StateBackend>(
     market_id: MarketId,
     rows: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<Option<BookMetaRow>, CoreError> {
-    let mut meta = None;
-    let mut has_other_rows = false;
+    let mut check = MarketRowsCheck::new(market_id);
     for (key, value) in rows {
+        check.observe(key, value)?;
+    }
+    let _ = state;
+    check.finish()
+}
+
+/// [`read_meta`] one row at a time, so a caller can stream (and meter) a
+/// market's rows instead of loading them: [`MarketRowsCheck::observe`] every
+/// `cf_native_order_books` row under the 8-byte market prefix, in key order,
+/// then [`MarketRowsCheck::finish`] for the meta row (`None` = no book).
+/// Same checks and errors as the readers of this module: a key of no known
+/// shape or a classic blob under a row layout, a meta row that does not
+/// decode, rows without a meta row.
+#[derive(Debug)]
+pub struct MarketRowsCheck {
+    market_id: MarketId,
+    meta: Option<BookMetaRow>,
+    has_other_rows: bool,
+}
+
+impl MarketRowsCheck {
+    /// A check of market `market_id`'s rows.
+    pub fn new(market_id: MarketId) -> Self {
+        Self {
+            market_id,
+            meta: None,
+            has_other_rows: false,
+        }
+    }
+
+    /// One row of the market.
+    pub fn observe(&mut self, key: &[u8], value: &[u8]) -> Result<(), CoreError> {
+        let market_id = self.market_id;
         match key_shape(key) {
             Some(KeyShape::Meta) => {
-                meta = Some(BookMetaRow::decode(value).map_err(|e| {
-                    corrupt_err(format!("market {market_id}: {e}"))
-                })?);
+                self.meta = Some(
+                    BookMetaRow::decode(value)
+                        .map_err(|e| corrupt_err(format!("market {market_id}: {e}")))?,
+                );
             }
             Some(KeyShape::ClassicBlob) => {
                 return Err(layout_err(format!(
@@ -332,7 +365,7 @@ fn read_meta<S: StateBackend>(
                      needs a fresh genesis)"
                 )))
             }
-            Some(_) => has_other_rows = true,
+            Some(_) => self.has_other_rows = true,
             None => {
                 return Err(layout_err(format!(
                     "market {market_id}: unrecognized cf_native_order_books key (len {})",
@@ -340,15 +373,20 @@ fn read_meta<S: StateBackend>(
                 )))
             }
         }
+        Ok(())
     }
-    if meta.is_none() && has_other_rows {
-        return Err(corrupt_err(format!(
-            "market {market_id} has order/stop/level rows but no meta row (corrupt row \
-             store) — refusing to serve a partial book"
-        )));
+
+    /// The market's meta row once every row was observed (`None` = no book).
+    pub fn finish(self) -> Result<Option<BookMetaRow>, CoreError> {
+        if self.meta.is_none() && self.has_other_rows {
+            return Err(corrupt_err(format!(
+                "market {} has order/stop/level rows but no meta row (corrupt row \
+                 store) — refusing to serve a partial book",
+                self.market_id
+            )));
+        }
+        Ok(self.meta)
     }
-    let _ = state;
-    Ok(meta)
 }
 
 /// Aggregated depth for one market under `layout`.

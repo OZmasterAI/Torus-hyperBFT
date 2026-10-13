@@ -10,25 +10,25 @@
 //! A "row" is one key the RocksDB iterator returns (or one seek), whether or
 //! not it is kept: filtered rows cost the same to read.
 
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use borsh::BorshDeserialize;
 use torus_core::book_reader::{
-    self, BookDepth, BookLayout, CloidOrder, LayoutSniff, BOOK_MODE_MARKER_KEY,
+    self, BookDepth, BookLayout, CloidOrder, LayoutSniff, MarketRowsCheck, BOOK_MODE_MARKER_KEY,
 };
-use torus_core::book_rows::{
-    book_meta_key, BookMetaRow, ROW_TAG_LEVEL, ROW_TAG_ORDER, ROW_TAG_STOP, SIDE_TAG_ASK,
-    SIDE_TAG_BID,
-};
+use torus_core::book_rows::{ROW_TAG_LEVEL, ROW_TAG_ORDER, ROW_TAG_STOP};
 use torus_core::error::CoreError;
-use torus_core::order_book::{Order, OrderBook, StopOrder};
+use torus_core::order_book::{Order, OrderBook};
 use torus_core::position::Position;
 use torus_economics::governance::{Proposal, ProposalStatus};
+use torus_economics::types::ValidatorState;
+use torus_economics::EconomicsError;
 use torus_state::cf::{
     CF_BOOK_ORDER_ROWS, CF_GOVERNANCE_PROPOSALS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_POSITIONS,
+    CF_NATIVE_POSITIONS, CF_STAKING_VALIDATORS,
 };
 use torus_state::StateDb;
 use torus_types::{Address, Cloid, FixedPoint, MarketId};
@@ -301,34 +301,77 @@ fn for_each_book_market(
     Ok(GO)
 }
 
-/// One market of a row layout (`book_reader`'s meta-row rule, by one seek:
-/// the meta row `market ‖ 0x00` sorts first under the market prefix, right
-/// after a classic blob's 8-byte key). `false` = no book. A meta row that
-/// does not decode (`BookCorrupt`, as `book_reader` reports it), a classic
-/// blob under a row layout, or rows without a meta row, is an error (never
-/// a silently empty book).
-fn row_market_exists(
-    state: &StateDb,
-    snap: Snap<'_, '_>,
-    mid: MarketId,
-    b: &mut ScanBudget,
-) -> Result<bool, RpcError> {
-    match first_row(state, snap, CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes(), b)? {
-        None => Ok(false),
-        Some((k, _)) if k.len() == 8 => Err(internal(format!(
-            "market {mid}: cf_native_order_books holds a classic whole-book blob under a \
-             row layout — the book CF is corrupt (a layout change needs a fresh genesis)"
-        ))),
-        Some((k, v)) if k[..] == book_meta_key(mid)[..] => {
-            BookMetaRow::decode(&v)
-                .map_err(|e| core(CoreError::BookCorrupt(format!("market {mid}: {e}"))))?;
-            Ok(true)
-        }
-        Some(_) => Err(internal(format!(
-            "market {mid} has order/stop/level rows but no meta row (corrupt row store) — \
-             refusing to serve a partial book"
-        ))),
+/// `market ‖ 0x01 ‖ id` (the order row shape `book_reader` reads).
+fn is_order_row(key: &[u8]) -> bool {
+    key.len() == 25 && key[8] == ROW_TAG_ORDER
+}
+
+/// `market ‖ 0x03 ‖ side ‖ price` (the level row shape `book_reader` reads).
+fn is_level_row(key: &[u8]) -> bool {
+    key.len() == 26 && key[8] == ROW_TAG_LEVEL
+}
+
+fn market_of(key: &[u8]) -> MarketId {
+    u64::from_be_bytes(key[..8].try_into().expect("8-byte market prefix"))
+}
+
+fn market_prefix(mid: MarketId, tag: u8) -> [u8; 9] {
+    let mut p = [0u8; 9];
+    p[..8].copy_from_slice(&mid.to_be_bytes());
+    p[8] = tag;
+    p
+}
+
+/// A `BookCorrupt` error, as `book_reader` reports it.
+fn corrupt(msg: String) -> RpcError {
+    core(CoreError::BookCorrupt(msg))
+}
+
+/// An order row of `cf` (`book_reader`'s decode and key-id checks, and
+/// errors).
+fn checked_order(key: &[u8], row: &[u8], cf: &str) -> Result<Order, RpcError> {
+    let mid = market_of(key);
+    let (_, order) = OrderBook::decode_order_row(row)
+        .map_err(|e| corrupt(format!("market {mid}: book order row: {e}")))?;
+    let key_id = u128::from_be_bytes(key[9..25].try_into().expect("25-byte order row key"));
+    if key_id != order.id {
+        return Err(corrupt(format!(
+            "market {mid}: {cf} row key id {key_id} != payload id {} (corrupt row store)",
+            order.id
+        )));
     }
+    Ok(order)
+}
+
+/// A row of the mode-2 node-local order store: any key that is not an
+/// order row is an error (`book_reader::read_open_orders`).
+fn store_order(key: &[u8], row: &[u8]) -> Result<Order, RpcError> {
+    if !is_order_row(key) {
+        return Err(corrupt(format!(
+            "unrecognized cf_book_order_rows key (len {}) — corrupt node-local order store",
+            key.len()
+        )));
+    }
+    checked_order(key, row, CF_BOOK_ORDER_ROWS)
+}
+
+fn stale_store(mid: MarketId) -> RpcError {
+    corrupt(format!(
+        "market {mid}: cf_native_order_books commits level rows but the node-local \
+         cf_book_order_rows store holds no orders for it — the order store is stale or \
+         lost (refusing to report an empty order list)"
+    ))
+}
+
+/// How a classic whole-book blob that does not decode is reported: main's
+/// readers differ, and each method keeps its own text.
+#[derive(Clone, Copy)]
+enum ClassicDecodeErr {
+    /// `torus_getOpenOrders` / `torus_getUserLimits`: "borsh decode order
+    /// book: …".
+    Borsh,
+    /// `book_reader` (`torus_getOrderByCloid`): `BookCorrupt`.
+    Corrupt,
 }
 
 /// Every classic whole-book blob (`market` = one), charged by size before
@@ -336,14 +379,16 @@ fn row_market_exists(
 fn for_each_classic_book(
     state: &StateDb,
     market: Option<MarketId>,
+    how: ClassicDecodeErr,
     b: &mut ScanBudget,
     mut visit: impl FnMut(MarketId, OrderBook) -> Result<Flow, RpcError>,
 ) -> Result<Flow, RpcError> {
     let decode = |mid: MarketId, blob: &[u8]| {
-        OrderBook::try_from_slice(blob).map_err(|e| {
-            internal(format!(
+        OrderBook::try_from_slice(blob).map_err(|e| match how {
+            ClassicDecodeErr::Borsh => internal(format!("borsh decode order book: {e}")),
+            ClassicDecodeErr::Corrupt => corrupt(format!(
                 "market {mid}: cf_native_order_books value is not a classic whole-book blob: {e}"
-            ))
+            )),
         })
     };
     match market {
@@ -368,146 +413,193 @@ fn for_each_classic_book(
     }
 }
 
-/// `trader`'s resting orders of one row-layout market, in order id order.
-/// Every order row is decoded and validated (a corrupt row is `BookCorrupt`,
-/// whoever's it is), then filtered by trader.
-fn row_market_orders(
-    state: &StateDb,
-    trader: &Address,
-    mid: MarketId,
-    layout: BookLayout,
-    b: &mut ScanBudget,
-    visit: &mut impl FnMut(MarketId, Order) -> Flow,
-) -> Result<Flow, RpcError> {
-    let level_store = layout == BookLayout::LevelAuthority;
-    let (cf, prefix) = if level_store {
-        (CF_BOOK_ORDER_ROWS, mid.to_be_bytes().to_vec())
-    } else {
-        (
-            CF_NATIVE_ORDER_BOOKS,
-            [&mid.to_be_bytes()[..], &[ROW_TAG_ORDER]].concat(),
-        )
-    };
-    // Mode 2: committed levels with no node-local order rows = a stale or
-    // lost store (an error, never an empty list).
-    let has_levels = level_store
-        && first_key(
-            state,
-            CF_NATIVE_ORDER_BOOKS,
-            &[&mid.to_be_bytes()[..], &[ROW_TAG_LEVEL]].concat(),
-            b,
-        )?
-        .is_some();
-    let mut saw_row = false;
-    let flow = for_each_prefixed(state, None, cf, &prefix, b, |key, row, _| {
-        saw_row = true;
-        if key.len() != 25 || key[8] != ROW_TAG_ORDER {
-            if level_store {
-                return Err(internal(format!(
-                    "unrecognized cf_book_order_rows key (len {}) — corrupt node-local order store",
-                    key.len()
-                )));
-            }
-            return Ok(GO);
-        }
-        // Every row is decoded and checked BEFORE the trader filter, as
-        // `book_reader::read_open_orders` does: a corrupt row of any trader
-        // is the same `BookCorrupt` error, never silently skipped.
-        let (_, order) = OrderBook::decode_order_row(row).map_err(|e| {
-            core(CoreError::BookCorrupt(format!(
-                "market {mid}: book order row: {e}"
-            )))
-        })?;
-        let key_id = u128::from_be_bytes(key[9..25].try_into().expect("25-byte order row key"));
-        if key_id != order.id {
-            return Err(core(CoreError::BookCorrupt(format!(
-                "market {mid}: {cf} row key id {key_id} != payload id {} (corrupt row store)",
-                order.id
-            ))));
-        }
-        if order.trader != *trader {
-            return Ok(GO);
-        }
-        Ok(visit(mid, order))
-    })?;
-    if has_levels && !saw_row {
-        return Err(internal(format!(
-            "market {mid}: cf_native_order_books commits level rows but the node-local \
-             cf_book_order_rows store holds no orders for it — the order store is stale or \
-             lost (refusing to report an empty order list)"
-        )));
-    }
-    Ok(flow)
-}
-
-/// `trader`'s resting orders (`market` = one market), ascending
-/// `(market, order id)` under the row layouts; `visit` may stop early.
+/// `trader`'s resting orders (`market` = one market), as main returns them.
+///
+/// Classic: `torus_getOpenOrders`'s blob walk (each blob charged by size;
+/// stops once `limit` orders are found). Row layouts:
+/// `book_reader::read_open_orders`, row for row: every order row read is
+/// decoded and checked (whoever's it is), with a market every row of the
+/// market is validated (an unknown key, a bad meta row, rows without one),
+/// then the trader's orders are sorted by `(market, id)` and cut to
+/// `limit`. Only the work is bounded: all markets seek each market's order
+/// rows (mode 1) or its first level row (mode 2) instead of reading the
+/// whole root CF.
 pub(crate) fn trader_orders(
     state: &StateDb,
     trader: &Address,
     market: Option<MarketId>,
     layout: BookLayout,
+    limit: usize,
     b: &mut ScanBudget,
-    mut visit: impl FnMut(MarketId, Order) -> Flow,
-) -> Result<(), RpcError> {
-    if layout == BookLayout::Classic {
-        return done(for_each_classic_book(state, market, b, |mid, book| {
-            for o in book.orders_for_trader(trader) {
-                if visit(mid, o.clone()).is_break() {
-                    return Ok(STOP);
-                }
-            }
-            Ok(GO)
-        }));
-    }
-    match market {
-        Some(mid) => {
-            if !row_market_exists(state, None, mid, b)? {
-                return Ok(());
-            }
-            done(row_market_orders(state, trader, mid, layout, b, &mut visit))
+) -> Result<Vec<(MarketId, Order)>, RpcError> {
+    let mut out: Vec<(MarketId, Order)> = Vec::new();
+    match (layout, market) {
+        (BookLayout::Classic, _) => {
+            done(for_each_classic_book(
+                state,
+                market,
+                ClassicDecodeErr::Borsh,
+                b,
+                |mid, book| {
+                    for o in book.orders_for_trader(trader) {
+                        if out.len() >= limit {
+                            break;
+                        }
+                        out.push((mid, o.clone()));
+                    }
+                    Ok(if out.len() >= limit { STOP } else { GO })
+                },
+            ))?;
+            return Ok(out);
         }
-        None => done(for_each_book_market(state, b, |mid, b| {
-            row_market_orders(state, trader, mid, layout, b, &mut visit)
-        })),
-    }
-}
-
-/// `trader`'s pending stops of a row layout (stop rows `market ‖ 0x02 ‖ id`
-/// of every market, one seek per market).
-fn row_trader_stops(
-    state: &StateDb,
-    trader: &Address,
-    b: &mut ScanBudget,
-    mut visit: impl FnMut(MarketId, StopOrder) -> Flow,
-) -> Result<Flow, RpcError> {
-    for_each_book_market(state, b, |mid, b| {
-        let prefix = [&mid.to_be_bytes()[..], &[ROW_TAG_STOP]].concat();
-        for_each_prefixed(
-            state,
-            None,
-            CF_NATIVE_ORDER_BOOKS,
-            &prefix,
-            b,
-            |key, row, _| {
-                if key.len() != 25 {
-                    return Ok(GO);
+        (BookLayout::OrderRows, Some(mid)) => {
+            // The market's meta check runs over every row first: its error
+            // wins over an order row's, as in `read_open_orders`.
+            let mut check = MarketRowsCheck::new(mid);
+            let mut order_err = None;
+            done(for_each_prefixed(
+                state,
+                None,
+                CF_NATIVE_ORDER_BOOKS,
+                &mid.to_be_bytes(),
+                b,
+                |k, v, _| {
+                    check.observe(k, v).map_err(core)?;
+                    if order_err.is_none() && is_order_row(k) {
+                        match checked_order(k, v, CF_NATIVE_ORDER_BOOKS) {
+                            Ok(o) if o.trader == *trader => out.push((mid, o)),
+                            Ok(_) => {}
+                            Err(e) => order_err = Some(e),
+                        }
+                    }
+                    Ok(GO)
+                },
+            ))?;
+            check.finish().map_err(core)?;
+            if let Some(e) = order_err {
+                return Err(e);
+            }
+        }
+        (BookLayout::OrderRows, None) => {
+            done(for_each_book_market(state, b, |mid, b| {
+                for_each_prefixed(
+                    state,
+                    None,
+                    CF_NATIVE_ORDER_BOOKS,
+                    &market_prefix(mid, ROW_TAG_ORDER),
+                    b,
+                    |k, v, _| {
+                        if is_order_row(k) {
+                            let o = checked_order(k, v, CF_NATIVE_ORDER_BOOKS)?;
+                            if o.trader == *trader {
+                                out.push((mid, o));
+                            }
+                        }
+                        Ok(GO)
+                    },
+                )
+            }))?;
+        }
+        (BookLayout::LevelAuthority, Some(mid)) => {
+            let mut check = MarketRowsCheck::new(mid);
+            let mut has_levels = false;
+            done(for_each_prefixed(
+                state,
+                None,
+                CF_NATIVE_ORDER_BOOKS,
+                &mid.to_be_bytes(),
+                b,
+                |k, v, _| {
+                    check.observe(k, v).map_err(core)?;
+                    has_levels |= is_level_row(k);
+                    Ok(GO)
+                },
+            ))?;
+            check.finish().map_err(core)?;
+            let mut saw_row = false;
+            done(for_each_prefixed(
+                state,
+                None,
+                CF_BOOK_ORDER_ROWS,
+                &mid.to_be_bytes(),
+                b,
+                |k, v, _| {
+                    saw_row = true;
+                    let o = store_order(k, v)?;
+                    if o.trader == *trader {
+                        out.push((mid, o));
+                    }
+                    Ok(GO)
+                },
+            ))?;
+            if has_levels && !saw_row {
+                return Err(stale_store(mid));
+            }
+        }
+        (BookLayout::LevelAuthority, None) => {
+            // Markets committing a level row (one seek each), then the
+            // whole node-local store: a market with levels and no store
+            // row is the stale-store error, which wins over a corrupt store
+            // row, as in `read_open_orders`.
+            let mut with_levels = Vec::new();
+            done(for_each_book_market(state, b, |mid, b| {
+                let mut found = false;
+                done(for_each_prefixed(
+                    state,
+                    None,
+                    CF_NATIVE_ORDER_BOOKS,
+                    &market_prefix(mid, ROW_TAG_LEVEL),
+                    b,
+                    |k, _, _| {
+                        found = is_level_row(k);
+                        Ok(if found { STOP } else { GO })
+                    },
+                ))?;
+                if found {
+                    with_levels.push(mid);
                 }
-                let stop = OrderBook::decode_stop_row(row).map_err(|e| {
-                    internal(format!("market {mid}: stop row does not decode: {e}"))
-                })?;
-                Ok(if stop.trader == *trader {
-                    visit(mid, stop)
-                } else {
-                    GO
-                })
-            },
-        )
-    })
+                Ok(GO)
+            }))?;
+            let mut in_store = BTreeSet::new();
+            let mut row_err = None;
+            done(for_each_prefixed(
+                state,
+                None,
+                CF_BOOK_ORDER_ROWS,
+                &[],
+                b,
+                |k, v, _| {
+                    if is_order_row(k) {
+                        in_store.insert(market_of(k));
+                    }
+                    if row_err.is_none() {
+                        match store_order(k, v) {
+                            Ok(o) if o.trader == *trader => out.push((market_of(k), o)),
+                            Ok(_) => {}
+                            Err(e) => row_err = Some(e),
+                        }
+                    }
+                    Ok(GO)
+                },
+            ))?;
+            if let Some(&mid) = with_levels.iter().find(|m| !in_store.contains(*m)) {
+                return Err(stale_store(mid));
+            }
+            if let Some(e) = row_err {
+                return Err(e);
+            }
+        }
+    }
+    out.sort_by_key(|(mid, o)| (*mid, o.id));
+    out.truncate(limit);
+    Ok(out)
 }
 
 /// `torus_getUserLimits`: `trader`'s open orders over all markets (resting +
-/// pending stops, as `OrderBook::open_order_count` counts them).
+/// pending stops), counted as main's handler counted them: classic blobs
+/// (`OrderBook::open_order_count`); under the row layouts every order row of
+/// the order store is visited and only the trader's own are decoded, then
+/// each market's stop rows (one seek per market).
 pub(crate) fn count_open_orders(
     state: &StateDb,
     trader: &Address,
@@ -516,28 +608,65 @@ pub(crate) fn count_open_orders(
 ) -> Result<usize, RpcError> {
     let mut count = 0;
     if layout == BookLayout::Classic {
-        done(for_each_classic_book(state, None, b, |_, book| {
-            count += book.open_order_count(trader);
-            Ok(GO)
-        }))?;
+        done(for_each_classic_book(
+            state,
+            None,
+            ClassicDecodeErr::Borsh,
+            b,
+            |_, book| {
+                count += book.open_order_count(trader);
+                Ok(GO)
+            },
+        ))?;
         return Ok(count);
     }
-    trader_orders(state, trader, None, layout, b, |_, _| {
-        count += 1;
-        GO
-    })?;
-    done(row_trader_stops(state, trader, b, |_, _| {
-        count += 1;
-        GO
+    let store = match layout {
+        BookLayout::OrderRows => CF_NATIVE_ORDER_BOOKS,
+        _ => CF_BOOK_ORDER_ROWS,
+    };
+    done(for_each_prefixed(
+        state,
+        None,
+        store,
+        &[],
+        b,
+        |k, row, _| {
+            if is_order_row(k) && OrderBook::order_row_trader(row) == Some(trader.as_slice()) {
+                let (_, order) = OrderBook::decode_order_row(row)
+                    .map_err(|e| internal(format!("book order row: {e}")))?;
+                count += usize::from(order.trader == *trader);
+            }
+            Ok(GO)
+        },
+    ))?;
+    done(for_each_book_market(state, b, |mid, b| {
+        for_each_prefixed(
+            state,
+            None,
+            CF_NATIVE_ORDER_BOOKS,
+            &market_prefix(mid, ROW_TAG_STOP),
+            b,
+            |k, row, _| {
+                if k.len() == 25 {
+                    let mut one = OrderBook::new(mid, FixedPoint::ONE, FixedPoint::ONE);
+                    one.restore_stop_row(row)
+                        .map_err(|e| internal(format!("market {mid}: {e}")))?;
+                    count += one.open_order_count(trader);
+                }
+                Ok(GO)
+            },
+        )
     }))?;
     Ok(count)
 }
 
-/// `torus_getOrderByCloid`: `trader`'s open order with `cloid`, stopping at
-/// the first hit. Row layouts scan stops FIRST (a commit between the two
-/// scans can only move a cloid from a stop to a resting order, so it is
-/// never missed; `book_reader::find_by_cloid`). A classic blob holds both
-/// kinds of one market, read at once.
+/// `torus_getOrderByCloid`: `trader`'s open order with `cloid`, as
+/// `book_reader::find_by_cloid` finds it. Pending stops first, stopping at
+/// a stop hit (a commit between the two passes can only move a cloid from
+/// a stop to a resting order, so it is never missed); then every resting
+/// order is read and validated ([`trader_orders`]) before a resting hit is
+/// returned. A classic blob holds both kinds of one market: one pass, a
+/// stop hit returns at once, a resting hit once every blob decoded.
 pub(crate) fn find_by_cloid(
     state: &StateDb,
     trader: &Address,
@@ -545,50 +674,74 @@ pub(crate) fn find_by_cloid(
     layout: BookLayout,
     b: &mut ScanBudget,
 ) -> Result<Option<CloidOrder>, RpcError> {
-    let mut found = None;
     if layout == BookLayout::Classic {
-        done(for_each_classic_book(state, None, b, |mid, book| {
-            if let Some(s) = book
-                .pending_stops()
-                .iter()
-                .find(|s| s.trader == *trader && s.client_order_id == Some(cloid))
-            {
-                found = Some(CloidOrder::Stop(mid, s.clone()));
-            } else if let Some(o) = book
-                .orders_for_trader(trader)
-                .into_iter()
-                .find(|o| o.client_order_id == Some(cloid))
-            {
-                found = Some(CloidOrder::Resting(mid, o.clone()));
-            }
-            Ok(if found.is_some() { STOP } else { GO })
-        }))?;
+        let mut stop = None;
+        let mut resting: Option<(MarketId, Order)> = None;
+        done(for_each_classic_book(
+            state,
+            None,
+            ClassicDecodeErr::Corrupt,
+            b,
+            |mid, book| {
+                if let Some(s) = book
+                    .pending_stops()
+                    .iter()
+                    .find(|s| s.trader == *trader && s.client_order_id == Some(cloid))
+                {
+                    stop = Some(CloidOrder::Stop(mid, s.clone()));
+                    return Ok(STOP);
+                }
+                if resting.is_none() {
+                    resting = book
+                        .orders_for_trader(trader)
+                        .into_iter()
+                        .filter(|o| o.client_order_id == Some(cloid))
+                        .min_by_key(|o| o.id)
+                        .map(|o| (mid, o.clone()));
+                }
+                Ok(GO)
+            },
+        ))?;
+        return Ok(stop.or(resting.map(|(mid, o)| CloidOrder::Resting(mid, o))));
+    }
+    let mut found = None;
+    done(for_each_book_market(state, b, |mid, b| {
+        for_each_prefixed(
+            state,
+            None,
+            CF_NATIVE_ORDER_BOOKS,
+            &market_prefix(mid, ROW_TAG_STOP),
+            b,
+            |k, row, _| {
+                if k.len() != 25 {
+                    return Ok(GO);
+                }
+                let stop = OrderBook::decode_stop_row(row)
+                    .map_err(|e| corrupt(format!("market {mid}: stop row does not decode: {e}")))?;
+                if stop.trader == *trader && stop.client_order_id == Some(cloid) {
+                    found = Some(CloidOrder::Stop(mid, stop));
+                    return Ok(STOP);
+                }
+                Ok(GO)
+            },
+        )
+    }))?;
+    if found.is_some() {
         return Ok(found);
     }
-    done(row_trader_stops(state, trader, b, |mid, s| {
-        if s.client_order_id == Some(cloid) {
-            found = Some(CloidOrder::Stop(mid, s));
-            return STOP;
-        }
-        GO
-    }))?;
-    if found.is_none() {
-        trader_orders(state, trader, None, layout, b, |mid, o| {
-            if o.client_order_id == Some(cloid) {
-                found = Some(CloidOrder::Resting(mid, o));
-                return STOP;
-            }
-            GO
-        })?;
-    }
-    Ok(found)
+    Ok(trader_orders(state, trader, None, layout, usize::MAX, b)?
+        .into_iter()
+        .find(|(_, o)| o.client_order_id == Some(cloid))
+        .map(|(mid, o)| CloidOrder::Resting(mid, o)))
 }
 
 /// `torus_getOrderBook` under a row layout: at most `depth` levels per side,
-/// best first. Mode 2 reads only those level rows (two bounded seeks); mode 1
-/// has no price index, so every order row of the market is aggregated. The
-/// meta row and both sides are read from ONE snapshot, so a commit that
-/// moves both sides is seen whole or not at all (never a crossed book).
+/// best first. Every row of the market is read (charged) and handed to
+/// `book_reader::depth_from_market_rows`, so the answer and every error
+/// (an unknown key, a bad meta or level row anywhere in the market) are
+/// main's; `depth` bounds the reply. The rows come from ONE snapshot, so a
+/// commit that moves both sides is seen whole or not at all (never a
+/// crossed book).
 pub(crate) fn row_book_depth(
     state: &StateDb,
     mid: MarketId,
@@ -597,50 +750,19 @@ pub(crate) fn row_book_depth(
     b: &mut ScanBudget,
 ) -> Result<BookDepth, RpcError> {
     let snapshot = state.inner().snapshot();
-    let snap = Some(&snapshot);
-    if !row_market_exists(state, snap, mid, b)? {
-        return Ok(BookDepth::default());
-    }
     let mut rows: Vec<KeyValue> = Vec::new();
-    if layout == BookLayout::LevelAuthority {
-        for side in [SIDE_TAG_BID, SIDE_TAG_ASK] {
-            let prefix = [&mid.to_be_bytes()[..], &[ROW_TAG_LEVEL, side]].concat();
-            let mut n = 0;
-            done(for_each_prefixed(
-                state,
-                snap,
-                CF_NATIVE_ORDER_BOOKS,
-                &prefix,
-                b,
-                |k, v, _| {
-                    if k.len() != 26 {
-                        return Err(internal(format!(
-                            "market {mid}: level row key of {} bytes (corrupt row store)",
-                            k.len()
-                        )));
-                    }
-                    rows.push((k.to_vec(), v.to_vec()));
-                    n += 1;
-                    Ok(if n >= depth { STOP } else { GO })
-                },
-            ))?;
-        }
-    } else {
-        let prefix = [&mid.to_be_bytes()[..], &[ROW_TAG_ORDER]].concat();
-        done(for_each_prefixed(
-            state,
-            snap,
-            CF_NATIVE_ORDER_BOOKS,
-            &prefix,
-            b,
-            |k, v, _| {
-                rows.push((k.to_vec(), v.to_vec()));
-                Ok(GO)
-            },
-        ))?;
-    }
-    let mut d =
-        book_reader::depth_from_rows(mid, layout, &rows).map_err(|e| internal(e.to_string()))?;
+    done(for_each_prefixed(
+        state,
+        Some(&snapshot),
+        CF_NATIVE_ORDER_BOOKS,
+        &mid.to_be_bytes(),
+        b,
+        |k, v, _| {
+            rows.push((k.to_vec(), v.to_vec()));
+            Ok(GO)
+        },
+    ))?;
+    let mut d = book_reader::depth_from_market_rows(state, mid, layout, &rows).map_err(core)?;
     d.bids.truncate(depth);
     d.asks.truncate(depth);
     Ok(d)
@@ -694,6 +816,19 @@ pub(crate) fn open_interest(
     Ok((long, short))
 }
 
+/// A proposal row that does not decode, as main reported it: the
+/// governance manager's error (`getProposal`, `getProposals` with a status)
+/// or the handler's own "borsh decode proposal" (`getProposals` without).
+fn proposal_decode(v: &[u8], governance_text: bool) -> Result<Proposal, RpcError> {
+    Proposal::try_from_slice(v).map_err(|e| {
+        if governance_text {
+            internal(EconomicsError::Borsh(e.to_string()).to_string())
+        } else {
+            internal(format!("borsh decode proposal: {e}"))
+        }
+    })
+}
+
 /// `torus_getProposals`: every proposal (`status` = only those), id order.
 /// A proposal row costs one row per started 128 B (the row itself
 /// included), charged before it is decoded: its size is the work.
@@ -715,8 +850,7 @@ pub(crate) fn proposals(
             }
             // The row step is already charged.
             b.step_n(packed_rows(v.len()) - 1)?;
-            let p = Proposal::try_from_slice(v)
-                .map_err(|e| internal(format!("borsh decode proposal: {e}")))?;
+            let p = proposal_decode(v, status.is_some())?;
             if status.as_ref().is_none_or(|s| p.status == *s) {
                 out.push(p);
             }
@@ -724,6 +858,80 @@ pub(crate) fn proposals(
         },
     ))?;
     Ok(out)
+}
+
+/// `torus_getProposal`: one proposal row, charged one row per started
+/// 128 B (one read for a missing id) before it is decoded.
+pub(crate) fn proposal(
+    state: &StateDb,
+    id: u64,
+    b: &mut ScanBudget,
+) -> Result<Option<Proposal>, RpcError> {
+    b.step()?;
+    let Some(v) = state
+        .get_cf_raw(CF_GOVERNANCE_PROPOSALS, &id.to_be_bytes())
+        .map_err(|e| internal(EconomicsError::from(e).to_string()))?
+    else {
+        return Ok(None);
+    };
+    b.step_n(packed_rows(v.len()) - 1)?;
+    proposal_decode(&v, true).map(Some)
+}
+
+/// `trader`'s positions (`PositionManager::positions_for_trader`), each row
+/// charged before it is decoded.
+pub(crate) fn trader_positions(
+    state: &StateDb,
+    trader: &Address,
+    b: &mut ScanBudget,
+) -> Result<Vec<Position>, RpcError> {
+    let mut out = Vec::new();
+    done(for_each_prefixed(
+        state,
+        None,
+        CF_NATIVE_POSITIONS,
+        trader.as_slice(),
+        b,
+        |_, v, _| {
+            let p =
+                Position::try_from_slice(v).map_err(|e| core(CoreError::Borsh(e.to_string())))?;
+            out.push(p);
+            Ok(GO)
+        },
+    ))?;
+    Ok(out)
+}
+
+/// `torus_getLeader`: the validator whose consensus key is `pubkey`, as
+/// `StakingManager::find_validator_by_pubkey` finds it (every row decoded
+/// before the search: a row that does not decode makes the lookup fail,
+/// `None` here, the handler's fallback). Each row is charged.
+pub(crate) fn validator_by_pubkey(
+    state: &StateDb,
+    pubkey: &[u8; 32],
+    b: &mut ScanBudget,
+) -> Result<Option<ValidatorState>, RpcError> {
+    let mut hit = None;
+    let mut corrupt_row = false;
+    done(for_each_prefixed(
+        state,
+        None,
+        CF_STAKING_VALIDATORS,
+        &[],
+        b,
+        |_, v, _| {
+            match ValidatorState::try_from_slice(v) {
+                Ok(s) if hit.is_none() && s.pubkey == *pubkey => hit = Some(s),
+                Ok(_) => {}
+                Err(_) => {
+                    corrupt_row = true;
+                    return Ok(STOP);
+                }
+            }
+            Ok(GO)
+        },
+    ))?;
+    Ok(if corrupt_row { None } else { hit })
 }
 
 #[cfg(test)]

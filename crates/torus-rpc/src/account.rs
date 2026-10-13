@@ -20,6 +20,10 @@
 //! No executor structure is touched (torus-bridge is a dev-dependency of
 //! this crate only): no resident book, sums cache, block mark table or exec
 //! pipeline lock, only RocksDB point reads and one prefix scan.
+//!
+//! R24: the prefix scan (one row per position) and the two point reads per
+//! market held (market row, oracle aggregate) are charged to the request's
+//! scan budget ([`account_figures_bounded`]).
 
 use std::collections::BTreeMap;
 
@@ -27,10 +31,13 @@ use alloy_primitives::Address;
 use torus_core::error::CoreError;
 use torus_core::margin::{market_margin_config, AccountView, MarginTier};
 use torus_core::oracle::{OracleConfig, OracleManager};
-use torus_core::position::{MarginType, PositionManager};
+use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
 use torus_state::cf::CF_NATIVE_MARKETS;
 use torus_state::StateDb;
 use torus_types::{FixedPoint, MarketId};
+
+use crate::error::RpcError;
+use crate::scan::{self, ScanBudget};
 
 /// The `torus_getBalances` margin figures of one account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,36 +59,48 @@ pub struct AccountFigures {
 }
 
 /// [`AccountFigures`] of `trader` at block time `now` (`None`: no usable
-/// mark, every position valued at entry).
+/// mark, every position valued at entry), without a row limit.
 pub fn account_figures(
     state: &StateDb,
     trader: &Address,
     now: Option<u64>,
-) -> Result<AccountFigures, CoreError> {
-    let of = |_| CoreError::Overflow("account margin overflows i128".into());
+) -> Result<AccountFigures, RpcError> {
+    account_figures_bounded(state, trader, now, &mut ScanBudget::unlimited())
+}
+
+/// [`account_figures`] charged to `b` (R24): each position row before it is
+/// decoded, and per market held its market row and (with a block time) its
+/// oracle aggregate. A read or decode failure is the handler's error
+/// (`Internal` with the `CoreError` text).
+pub(crate) fn account_figures_bounded(
+    state: &StateDb,
+    trader: &Address,
+    now: Option<u64>,
+    b: &mut ScanBudget,
+) -> Result<AccountFigures, RpcError> {
+    let internal = |e: CoreError| RpcError::Internal(e.to_string());
     let pm = PositionManager::new(state.clone());
-    let bal = pm.get_native_balance(trader)?;
-    let positions = pm.positions_for_trader(trader)?;
+    let bal = pm.get_native_balance(trader).map_err(internal)?;
+    let positions = scan::trader_positions(state, trader, b)?;
     let oracle = OracleManager::new(state.clone(), OracleConfig::default());
 
-    // Per market the trader holds: its tiers (`load_margin_configs`: a row
-    // under an 8-byte key, `None` = default 20x), whether it is listed (the
-    // liquidation step marks only listed markets) and its usable mark.
-    struct Market {
-        tiers: Option<Vec<MarginTier>>,
-        listed: bool,
-        mark: Option<FixedPoint>,
-    }
     let mut markets: BTreeMap<MarketId, Market> = BTreeMap::new();
     for p in &positions {
         if markets.contains_key(&p.market_id) {
             continue;
         }
-        let row = state.get_cf_raw(CF_NATIVE_MARKETS, &p.market_id.to_be_bytes())?;
+        b.step()?;
+        let row = state
+            .get_cf_raw(CF_NATIVE_MARKETS, &p.market_id.to_be_bytes())
+            .map_err(|e| internal(e.into()))?;
         let mark = match now {
-            Some(t) => oracle
-                .get_price_opt(p.market_id, t)?
-                .and_then(|op| op.usable()),
+            Some(t) => {
+                b.step()?;
+                oracle
+                    .get_price_opt(p.market_id, t)
+                    .map_err(internal)?
+                    .and_then(|op| op.usable())
+            }
             None => None,
         };
         markets.insert(
@@ -96,16 +115,35 @@ pub fn account_figures(
             },
         );
     }
+    figures(&bal, &positions, &markets).map_err(internal)
+}
+
+/// Per market the trader holds: its tiers (`load_margin_configs`: a row
+/// under an 8-byte key, `None` = default 20x), whether it is listed (the
+/// liquidation step marks only listed markets) and its usable mark.
+struct Market {
+    tiers: Option<Vec<MarginTier>>,
+    listed: bool,
+    mark: Option<FixedPoint>,
+}
+
+/// The figures from the rows read.
+fn figures(
+    bal: &NativeBalance,
+    positions: &[Position],
+    markets: &BTreeMap<MarketId, Market>,
+) -> Result<AccountFigures, CoreError> {
+    let of = |_| CoreError::Overflow("account margin overflows i128".into());
     let tiers = |m: MarketId| markets.get(&m).and_then(|x| x.tiers.as_deref());
     let view = AccountView::build(
-        &bal,
-        &positions,
+        bal,
+        positions,
         |m| markets.get(&m).and_then(|x| x.mark),
         tiers,
     )?;
     let liq_view = AccountView::build(
-        &bal,
-        &positions,
+        bal,
+        positions,
         |m| markets.get(&m).filter(|x| x.listed).and_then(|x| x.mark),
         tiers,
     )?;

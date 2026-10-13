@@ -1138,9 +1138,15 @@ impl TorusApiServer for RpcState {
         let now = crate::eth::get_header_with_hash(self, executed)
             .map_err(ErrorObjectOwned::from)?
             .map(|(h, _, _)| h.timestamp);
-        let f = crate::account::account_figures(&self.state, &addr, now)
-            .map_err(|e| RpcError::Internal(e.to_string()))
-            .map_err(ErrorObjectOwned::from)?;
+        // R24: the positions, and the market row and oracle aggregate read
+        // for each market held, are charged to the scan budget.
+        let f = crate::account::account_figures_bounded(
+            &self.state,
+            &addr,
+            now,
+            &mut self.scan_budget(),
+        )
+        .map_err(ErrorObjectOwned::from)?;
 
         // Permanent stake from CF_STAKING_PERMANENT
         let permanent_stake = match self.state.get_cf_raw(CF_STAKING_PERMANENT, addr.as_slice()) {
@@ -1171,9 +1177,8 @@ impl TorusApiServer for RpcState {
             .map_err(|e| RpcError::Internal(e.to_string()))
             .map_err(ErrorObjectOwned::from)?
             .available;
-        let open_positions = pm
-            .positions_for_trader(&vault)
-            .map_err(|e| RpcError::Internal(e.to_string()))
+        // R24: every vault position row is charged to the scan budget.
+        let open_positions = scan::trader_positions(&self.state, &vault, &mut self.scan_budget())
             .map_err(ErrorObjectOwned::from)?
             .iter()
             .filter(|p| p.size != FixedPoint::ZERO)
@@ -1302,6 +1307,10 @@ impl TorusApiServer for RpcState {
                 rocksdb::IteratorMode::From(&upper, rocksdb::Direction::Reverse),
             );
             let mut trades = Vec::with_capacity(limit);
+            // R24: every row visited is charged by its size (one row per
+            // started 128 B) before it is decoded or skipped: skipped rows
+            // do not fill `limit`, the budget bounds them.
+            let mut budget = self.scan_budget();
 
             'rows: for item in iter {
                 let (key, value) = item
@@ -1310,6 +1319,9 @@ impl TorusApiServer for RpcState {
                 if !key.starts_with(&prefix) {
                     break;
                 }
+                budget
+                    .step_n(scan::packed_rows(value.len()))
+                    .map_err(ErrorObjectOwned::from)?;
                 let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
                     continue;
                 };
@@ -1566,10 +1578,9 @@ impl TorusApiServer for RpcState {
     // === 2.9.5: Governance ===
 
     async fn get_proposal(&self, proposal_id: u64) -> RpcResult<Option<RpcProposal>> {
-        let gov = GovernanceManager::new(self.state.clone());
-        let proposal = gov
-            .get_proposal(proposal_id)
-            .map_err(|e| RpcError::Internal(e.to_string()))
+        // R24: the row is charged by its size before it is decoded (the
+        // reply omits the execution payload, the decode does not).
+        let proposal = scan::proposal(&self.state, proposal_id, &mut self.scan_budget())
             .map_err(ErrorObjectOwned::from)?;
 
         Ok(proposal.map(map_proposal))
@@ -1685,11 +1696,14 @@ impl TorusApiServer for RpcState {
         };
 
         let (address, peer_id) = if let Some(vk_bytes) = leader_vk_bytes {
-            let staking = StakingManager::new(self.state.clone());
-            let addr = staking
-                .find_validator_by_pubkey(&vk_bytes)
-                .ok()
-                .flatten()
+            // R24: every validator row read is charged; a failed lookup
+            // still falls back to the key (only the budget refuses).
+            let found =
+                match scan::validator_by_pubkey(&self.state, &vk_bytes, &mut self.scan_budget()) {
+                    Err(e @ RpcError::ScanLimitExceeded { .. }) => return Err(e.into()),
+                    found => found.ok().flatten(),
+                };
+            let addr = found
                 .map(|v| hex_address(v.address))
                 .unwrap_or_else(|| format!("0x{}", ::hex::encode(vk_bytes)));
             (addr, format!("0x{}", ::hex::encode(vk_bytes)))
@@ -1889,6 +1903,9 @@ impl TorusApiServer for RpcState {
                 rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
             );
             let mut trades = Vec::with_capacity(limit.min(256));
+            // R24: as `getTradeHistory`, every row visited is charged by
+            // its size before it is decoded or skipped.
+            let mut budget = self.scan_budget();
 
             'rows: for item in iter {
                 let (key, value) = item
@@ -1899,6 +1916,9 @@ impl TorusApiServer for RpcState {
                 if key.len() < 8 || key[..8] != mid.to_be_bytes() || key[..] >= end_key[..] {
                     break;
                 }
+                budget
+                    .step_n(scan::packed_rows(value.len()))
+                    .map_err(ErrorObjectOwned::from)?;
                 let Some((block, timestamp, fills)) = decode_market_row(&key, &value) else {
                     continue;
                 };
@@ -1929,28 +1949,24 @@ impl TorusApiServer for RpcState {
             None => None,
         };
         // Every layout (classic blobs, order rows in the root CF, the mode-2
-        // node-local order store). R24: one market reads only that market;
-        // all markets stop at OPEN_ORDERS_LIMIT orders or the scan budget.
+        // node-local order store), with main's answer and errors. R24: one
+        // market reads only that market; every row read is charged to the
+        // scan budget.
         let mut budget = self.scan_budget();
         let layout = book_layout(&self.state, &mut budget)?;
-        let mut orders = Vec::new();
-        scan::trader_orders(
+        let orders = scan::trader_orders(
             &self.state,
             &trader_addr,
             market,
             layout,
+            OPEN_ORDERS_LIMIT,
             &mut budget,
-            |mid, order| {
-                orders.push(order_to_rpc(&order, mid));
-                if orders.len() >= OPEN_ORDERS_LIMIT {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            },
         )
         .map_err(ErrorObjectOwned::from)?;
-        Ok(orders)
+        Ok(orders
+            .iter()
+            .map(|(mid, order)| order_to_rpc(order, *mid))
+            .collect())
     }
 
     async fn get_order_by_cloid(
@@ -1961,7 +1977,8 @@ impl TorusApiServer for RpcState {
         let trader = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
         let cloid = torus_types::cloid_serde::from_hex(&cloid)
             .map_err(|e| ErrorObjectOwned::from(RpcError::InvalidParams(e)))?;
-        // R24: stops at the first hit or the scan budget.
+        // R24: a stop hit returns at once; a resting hit after every order
+        // was validated (as main); every row read is charged to the budget.
         let mut budget = self.scan_budget();
         let layout = book_layout(&self.state, &mut budget)?;
         let found = scan::find_by_cloid(&self.state, &trader, cloid, layout, &mut budget)

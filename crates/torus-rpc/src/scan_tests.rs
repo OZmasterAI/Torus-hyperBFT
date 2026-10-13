@@ -10,6 +10,7 @@ use alloy_primitives::{Address, U256};
 use jsonrpsee::types::ErrorObjectOwned;
 use tempfile::TempDir;
 use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor};
+use torus_core::book_rows::book_meta_key;
 use torus_core::position::{MarginType, NativeBalance, Position, PositionManager};
 use torus_economics::governance::{Proposal, ProposalStatus, ProposalType};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
@@ -32,6 +33,8 @@ const MODES: [BookMode; 3] = [
 const MAKER: u8 = 0xA1;
 /// The maker's resting order with a cloid (market 1).
 const CLOID: u128 = 0xc10d_0000_0000_0000_0000_0000_0000_0007;
+/// The maker's pending stop's cloid (market 1).
+const STOP_CLOID: u128 = 0xc10d_0000_0000_0000_0000_0000_0000_0057;
 
 fn fp(v: i64) -> FixedPoint {
     FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
@@ -144,7 +147,7 @@ fn seed_crowded(state: &StateDb, mode: BookMode) {
             addr(MAKER),
             PlaceOrderParams {
                 order_type: OrderType::StopMarket { trigger: fp(200) },
-                ..gtc(1, true, 210, None)
+                ..gtc(1, true, 210, Some(STOP_CLOID))
             },
         ),
     ];
@@ -307,22 +310,26 @@ async fn open_orders_of_one_market_read_only_that_market() {
     }
 }
 
+/// A pending stop hit returns at once (stops are read first, one seek per
+/// market). A resting hit is returned only once every order was read and
+/// validated, as main's `book_reader::find_by_cloid` does (review round 3
+/// sweep), so it costs what a miss costs.
 #[tokio::test]
-async fn order_by_cloid_stops_at_the_first_hit() {
+async fn order_by_cloid_stop_hits_return_early_resting_hits_read_every_order() {
     for mode in MODES {
         let (_d, state) = db();
         seed_crowded(&state, mode);
+        let maker = hex_addr(addr(MAKER));
+        let cloid = torus_types::cloid_serde::to_hex;
+
         let s = server(&state, 100);
         let hit = s
             .state()
-            .get_order_by_cloid(
-                hex_addr(addr(MAKER)),
-                torus_types::cloid_serde::to_hex(CLOID),
-            )
+            .get_order_by_cloid(maker.clone(), cloid(STOP_CLOID))
             .await
             .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
-            .expect("resting order found");
-        assert_eq!(hit.status, "open", "{mode:?}");
+            .expect("pending stop found");
+        assert_eq!(hit.status, "triggerPending", "{mode:?}");
         assert_eq!(hit.order.market_id, "0x1", "{mode:?}");
         assert!(
             (1..=100).contains(&examined(&s)),
@@ -330,17 +337,26 @@ async fn order_by_cloid_stops_at_the_first_hit() {
             examined(&s)
         );
 
-        // A miss must read every order: refused at the budget.
-        let s = server(&state, 100);
-        let e = s
+        // A resting hit and a miss read every order: refused at the budget.
+        for c in [CLOID, CLOID + 1] {
+            let s = server(&state, 100);
+            let e = s
+                .state()
+                .get_order_by_cloid(maker.clone(), cloid(c))
+                .await
+                .unwrap_err();
+            assert_scan_limit(&e, &format!("{mode:?} cloid {c:#x}"));
+        }
+        let s = server(&state, 100_000);
+        let hit = s
             .state()
-            .get_order_by_cloid(
-                hex_addr(addr(MAKER)),
-                torus_types::cloid_serde::to_hex(CLOID + 1),
-            )
+            .get_order_by_cloid(maker.clone(), cloid(CLOID))
             .await
-            .unwrap_err();
-        assert_scan_limit(&e, &format!("{mode:?} miss"));
+            .unwrap()
+            .expect("resting order found");
+        assert_eq!(hit.status, "open", "{mode:?}");
+        assert_eq!(hit.order.market_id, "0x1", "{mode:?}");
+        assert!(examined(&s) > 100, "{mode:?}: examined {}", examined(&s));
     }
 }
 
@@ -1050,7 +1066,8 @@ async fn block_trades_are_charged_per_market_to_the_scan_budget() {
 fn put_positions(state: &StateDb, trader: Address, n: u64) {
     let pm = PositionManager::new(state.clone());
     for m in 1..=n {
-        pm.put_position(&position(trader, m, m % 2 == 0, 1)).unwrap();
+        pm.put_position(&position(trader, m, m % 2 == 0, 1))
+            .unwrap();
     }
 }
 
@@ -1256,7 +1273,10 @@ async fn trade_history_charges_every_row_visited() {
     assert_scan_limit(&trade_history(&s).await.unwrap_err(), "1000 skipped rows");
     assert!((1..=101).contains(&examined(&s)), "{}", examined(&s));
     let s = server(&state, 100);
-    assert_scan_limit(&trade_range(&s, "0x1", "0x3e8").await.unwrap_err(), "range: 1000 skipped rows");
+    assert_scan_limit(
+        &trade_range(&s, "0x1", "0x3e8").await.unwrap_err(),
+        "range: 1000 skipped rows",
+    );
     assert!((1..=101).contains(&examined(&s)), "{}", examined(&s));
 
     // Under the budget: main's answer (every row skipped), each row charged.
@@ -1289,11 +1309,17 @@ async fn trade_history_charges_every_row_visited() {
         }
         state.put_cf_raw(cf, key, value).unwrap();
     }
-    assert!(row_bytes > 100 * CLASSIC_BLOB_BYTES_PER_ROW, "{row_bytes} B");
+    assert!(
+        row_bytes > 100 * CLASSIC_BLOB_BYTES_PER_ROW,
+        "{row_bytes} B"
+    );
     let s = server(&state, 100);
     assert_scan_limit(&trade_history(&s).await.unwrap_err(), "one full row");
     let s = server(&state, 100);
-    assert_scan_limit(&trade_range(&s, "0x5", "0x5").await.unwrap_err(), "range: one full row");
+    assert_scan_limit(
+        &trade_range(&s, "0x5", "0x5").await.unwrap_err(),
+        "range: one full row",
+    );
     let s = server(&state, 10_000);
     assert_eq!(trade_history(&s).await.unwrap().len(), 1);
     assert_eq!(examined(&s), packed_rows(row_bytes) as u64);
@@ -1367,11 +1393,17 @@ fn corrupt_market_2(state: &StateDb, mode: BookMode) {
             .unwrap()
             .unwrap();
         state
-            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &2u64.to_be_bytes(), &blob[..blob.len() / 2])
+            .put_cf_raw(
+                CF_NATIVE_ORDER_BOOKS,
+                &2u64.to_be_bytes(),
+                &blob[..blob.len() / 2],
+            )
             .unwrap();
     } else {
         let (cf, key, value) = order_rows(state, mode, 2).remove(0);
-        state.put_cf_raw(cf, &key, &value[..value.len() - 1]).unwrap();
+        state
+            .put_cf_raw(cf, &key, &value[..value.len() - 1])
+            .unwrap();
     }
 }
 
@@ -1413,7 +1445,10 @@ async fn open_orders_validate_rows_past_the_reply_limit() {
     use torus_types::Side;
     let limit = OPEN_ORDER_MAX_LIMIT as u128;
     let maker = addr(MAKER);
-    for (marker, layout) in [(1u8, BookLayout::OrderRows), (2, BookLayout::LevelAuthority)] {
+    for (marker, layout) in [
+        (1u8, BookLayout::OrderRows),
+        (2, BookLayout::LevelAuthority),
+    ] {
         let (_d, state) = db();
         state
             .put_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY, &[marker])
@@ -1460,7 +1495,12 @@ async fn open_orders_validate_rows_past_the_reply_limit() {
             if id > limit {
                 row.pop();
             }
-            let key = [&1u64.to_be_bytes()[..], &[ROW_TAG_ORDER], &id.to_be_bytes()[..]].concat();
+            let key = [
+                &1u64.to_be_bytes()[..],
+                &[ROW_TAG_ORDER],
+                &id.to_be_bytes()[..],
+            ]
+            .concat();
             state.put_cf_raw(cf, &key, &row).unwrap();
         }
         for market in [None, Some(1u64)] {
