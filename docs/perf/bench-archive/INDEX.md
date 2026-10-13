@@ -11,9 +11,12 @@ meta file per campaign (`meta/<camp>.toml`, example `meta/p3cloid.toml`: descrip
 conditions and other prose) it writes the mechanical part: `tools/ozarchy-<camp>-tools/`, the "Updated" paragraph and
 the dir rows here, the `cells.md` section, the `DELETABLE.md` block (rm lists with live sizes, fence + `bash -n` check of
 the whole file) and the per-arm rows of `docs/perf/ozarchy-summary-*.md`. Run it with `--dry-run` first (unified diffs,
-warnings for new `summary.json` fields, analyst outputs without a script, missing paths). It never deletes anything and
-refuses if the campaign, section or plan row is already present. The results-doc section, the plan row and the
-"Sources:" line of the summary file stay by hand. Tests: `python3 -I test_archive_campaign.py`.
+warnings for new `summary.json` fields, analyst outputs without a script, missing paths, tools files with trailing
+blanks). It never deletes anything and refuses if the campaign, section or plan row is already present. Meta options
+for the friction cases: `[cell_roles]` (role per cell pattern), `[tools] run_exclude` / `strip_trailing`, summary rows
+that give all seven `cols` (no `arms.txt` needed); `--index-file` / `--cells-file` / `--deletable-file` /
+`--tools-dir` write elsewhere. The results-doc section, the plan row and the "Sources:" line of the summary file stay
+by hand. Tests: `python3 -I test_archive_campaign.py`.
 
 **Updated 2026-10-08 (s29).** Added 60 dirs written since the snapshot and inventoried the 4 dirs skipped at archive time (their rows changed from S to R), sizes and dates taken 2026-10-08 ~17:45, 13.82 GiB in the 64 dirs: campaigns `ozarchy-p2s0b-*` (section 25 of the ozarchy doc), `ozarchy-p2s0r-*` (section 26), `ozarchy-p2s0x-*` (section 27), `ozarchy-p2s0y-*` (section 28) with their `-build`, `-stage`, `-tools`, `-smoke-*`, `ozarchy-p2s0b-hasher` and `ozarchy-p2s0b-spawn` dirs; pre-merge suite runs `presuite-105a6e28`, `presuite-b26bd3b3`, `presuite-c2-set-holder`, `presuite-item6-p2s0`; `read-gas-stall`; and `presuite-4164382d`, `presuite-76eb081c`, `presuite-ae767806`, `read-precompile-gas-ac`. After the c2h campaign finished (2026-10-08 ~19:15) the 18 `ozarchy-c2h*` dirs were added too (4.28 GiB: 14 cells, `-build`, `c2h2-build`, `-stage`, `-tools`; section 29 of the ozarchy doc), and their scripts copied to `tools/`. `presuite-c2-set-holder` is written up on branch `perf/c2-set-holder` (`c051872b`, pushed to origin), not on this branch. By this update every file in the original `DELETABLE.md` lists had already been deleted on ozarchy, so the sizes in the older rows are archive-time sizes. Top-level files: now 648 (3.4 MiB), all kept. New cells are in `cells.md`, new deletable files in `DELETABLE.md`.
 

@@ -10,7 +10,11 @@ Usage: python3 -I docs/perf/bench-archive/test_archive_campaign.py [-v]
   archive or the summary table; DELETABLE.md fence or `bash -n` failure) and each check (a)-(d).
 * Smoke tests: the meta's [[smoke]] analyst commands run from the staged tools copy against the fixture cells; a
   match passes, a mismatch / crash (the p3cloidprof prefix bug) / missing script or output / timeout refuses with
-  exit 5 and writes nothing (also in --dry-run); no declaration warns (s), --strict refuses.
+  exit 5 and writes nothing (also in --dry-run); no declaration warns (s), --strict refuses. SmokeSame: the line
+  comparison (tolerance; a non-finite number only matches the identical string).
+* Options: CellRoles ([cell_roles]), RunExclude ([tools] run_exclude), OutputPaths (--index-file / --cells-file /
+  --deletable-file / --tools-dir), StripTrailing ([tools] strip_trailing, check t), SummaryRows (cols without
+  arms.txt).
 * GoldenP3cloid re-archives campaign ozarchy-p3cloid from the live data in /home/oz/bench-results-matched onto
   the archive files of 6b643edb^ with meta/p3cloid.toml and compares byte for byte with what 6b643edb committed
   (INDEX.md, cells.md, DELETABLE.md, tools/ozarchy-p3cloid-tools/ incl. file modes) and runs the meta's smoke check
