@@ -4449,3 +4449,25 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-k1-cs2/buckets.csv' \
   '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-k1-cs2/tasks.txt'
 ```
+
+### `p3fsoak` (A 0 KiB, B 116.8 MiB; dirs: `ozarchy-p3fsoak-300m-w0`, `ozarchy-p3fsoak-300m-k1-mf`, `ozarchy-p3fsoak-300m-k1-cs2`, `ozarchy-p3fsoak-300m-k1-jcs2`, `ozarchy-p3fsoak-run`)
+
+The cells' `summary.json`, `mem-samples.txt`, `ckpt-samples.txt`, `sampler.csv`, `cpu-ticks.txt`, `cpu.csv`, `bench.log`, `val0-2.log.gz` (per node expiry), `metrics-*-val*.txt`, `state-digest-val*.txt`, `digest-accounts.txt`, `agreement.jsonl`, `run.log` and `ozarchy-p3fsoak-run/analyst/` are what section 53d is built on (keep). Section 53d's `a-series.py` also reads the `sampler.csv` and `summary.json` of the p3soak, p3soakje and p3cssoak 600 s cells for the minute 0-2 vs 6-10 table (kept in those blocks). Tier A: none (the binaries are in `ozarchy-p3q-stage`: `cs-run`, `cs2-run`, and the wrapper `cs2-je`). Outside this tree: the worktree `/home/oz/projects/wt/p3q-cs-de97682f` (re-created for this campaign; the `de97682f` target dir no longer exists) is in use (owner): not listed for deletion.
+
+Tier B, 116.8 MiB, 12 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-w0/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-w0/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-w0/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-w0/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-w0/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-w0/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-k1-mf/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-k1-mf/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-k1-cs2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-k1-cs2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-k1-jcs2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3fsoak-300m-k1-jcs2/tasks.txt'
+```

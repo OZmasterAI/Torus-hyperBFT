@@ -296,6 +296,9 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         NativeAction::SetOracleSigner { signer, proof } => {
             hash_set_oracle_signer(signer, proof.as_ref(), nonce)
         }
+        NativeAction::CancelByCloid { market_id, cloid } => {
+            hash_cancel_by_cloid(*market_id, *cloid, nonce)
+        }
     }
 }
 
@@ -319,7 +322,7 @@ fn append_place_order_fields(buf: &mut Vec<u8>, p: &PlaceOrderParams) {
     }));
     buf.extend_from_slice(&encode_u8(p.time_in_force as u8));
     buf.extend_from_slice(&encode_bool(p.reduce_only));
-    buf.extend_from_slice(&encode_u64(coid));
+    buf.extend_from_slice(&encode_u128(coid));
     buf.extend_from_slice(&encode_bool(has_coid));
 }
 
@@ -327,7 +330,7 @@ fn hash_place_order(p: &PlaceOrderParams, nonce: u64) -> B256 {
     let th = keccak256(
         "PlaceOrder(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
          uint8 orderType,uint8 timeInForce,bool reduceOnly,\
-         uint64 clientOrderId,bool hasClientOrderId,uint64 nonce)",
+         uint128 clientOrderId,bool hasClientOrderId,uint64 nonce)",
     );
     let mut buf = Vec::with_capacity(11 * 32);
     buf.extend_from_slice(&th.0);
@@ -362,7 +365,7 @@ fn hash_place_order_batch(orders: &[PlaceOrderParams], nonce: u64) -> B256 {
     let item_th = keccak256(
         "PlaceOrderItem(uint64 marketId,bool isBuy,int128 price,int128 quantity,\
          uint8 orderType,uint8 timeInForce,bool reduceOnly,\
-         uint64 clientOrderId,bool hasClientOrderId)",
+         uint128 clientOrderId,bool hasClientOrderId)",
     );
     let mut item_buf = Vec::with_capacity(10 * 32);
     let mut acc = Vec::with_capacity(orders.len() * 32);
@@ -383,6 +386,17 @@ fn hash_cancel_order(order_id: OrderId, nonce: u64) -> B256 {
     let mut buf = Vec::with_capacity(3 * 32);
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_u128(order_id));
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+/// s114: `CancelByCloid(uint64 marketId,uint128 cloid,uint64 nonce)`.
+fn hash_cancel_by_cloid(market_id: MarketId, cloid: crate::Cloid, nonce: u64) -> B256 {
+    let th = keccak256("CancelByCloid(uint64 marketId,uint128 cloid,uint64 nonce)");
+    let mut buf = Vec::with_capacity(4 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_u64(market_id));
+    buf.extend_from_slice(&encode_u128(cloid));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }
@@ -1605,13 +1619,13 @@ mod tests {
                 order_type: OrderType::Limit,
                 time_in_force: TimeInForce::GTC,
                 reduce_only: false,
-                client_order_id: Some(i),
+                client_order_id: Some(i as u128),
             })
             .collect();
         let h = eip712_struct_hash(&NativeAction::PlaceOrderBatch(orders), TEST_NONCE);
         assert_eq!(
             format!("{h}"),
-            "0xe83baa8e255a6aa0ec45ab4148e0e17f5d07b9acbf8c5b4ba54b843bf7d83bda"
+            "0xf032cf19a9dc5c097c7ae2476d67729df2a2f8d7670dce014d719e6a0b134f5d"
         );
     }
 
@@ -1674,7 +1688,7 @@ mod tests {
         let key = test_key();
         let expected = signer_address(&key);
 
-        let mk = |market_id: u64, is_buy: bool, coid: Option<u64>| PlaceOrderParams {
+        let mk = |market_id: u64, is_buy: bool, coid: Option<u128>| PlaceOrderParams {
             market_id,
             is_buy,
             price: FixedPoint::from_raw(1_000_000_000),

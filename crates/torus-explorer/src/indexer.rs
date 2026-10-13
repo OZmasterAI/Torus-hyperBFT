@@ -493,6 +493,7 @@ pub fn parse_native_action_row(
             &[
                 "PlaceOrder",
                 "CancelAllOrders",
+                "CancelByCloid",
                 "UpdateMarketParams",
                 "DelistMarket",
             ],
@@ -922,6 +923,20 @@ mod tests {
         let claim = json!("ClaimRewards");
         let r = parse_native_action_row(&claim, 5, 2);
         assert_eq!(r.action_type, "ClaimRewards");
+
+        // s114: the JSON a node serves for a CancelByCloid (cloid as hex).
+        let action = torus_types::NativeAction::CancelByCloid {
+            market_id: 4,
+            cloid: u128::MAX,
+        };
+        let r = parse_native_action_row(&serde_json::to_value(&action).unwrap(), 5, 3);
+        assert_eq!(r.action_type, "CancelByCloid");
+        assert_eq!(r.market_id, Some(4));
+        assert!(
+            r.payload.contains("0xffffffffffffffffffffffffffffffff"),
+            "{}",
+            r.payload
+        );
     }
 
     #[test]

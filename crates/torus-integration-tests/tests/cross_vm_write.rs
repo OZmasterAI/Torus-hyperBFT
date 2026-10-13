@@ -53,6 +53,7 @@ fn test_core_writer_delayed_execution() {
             price: TestHarness::fp(50000),
             quantity: TestHarness::fp(2),
             time_in_force: 0, // GTC
+            cloid: None,
         },
         block_queued: current_block,
     };
@@ -192,6 +193,7 @@ fn test_execution_ordering_native_vs_core_writer() {
             price: TestHarness::fp(50000),
             quantity: TestHarness::fp(5),
             time_in_force: 0,
+            cloid: None,
         },
         block_queued: block,
     };
@@ -241,6 +243,7 @@ fn drained_stop_order_types_are_rejected_not_run_as_limit() {
             price: TestHarness::fp(40000),
             quantity: TestHarness::fp(1),
             time_in_force: 0,
+            cloid: None,
         },
         block_queued: current_block,
     };
@@ -283,6 +286,7 @@ fn test_invalid_core_writer_action_isolation() {
             price: TestHarness::fp(40000),
             quantity: TestHarness::fp(1),
             time_in_force: 0,
+            cloid: None,
         },
         block_queued: current_block,
     };

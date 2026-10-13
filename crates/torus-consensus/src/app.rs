@@ -20705,6 +20705,7 @@ mod crash_recovery_tests {
                 price: fp(100),
                 quantity: fp(1),
                 time_in_force: 0,
+                cloid: None,
             };
             assert_eq!(enqueue(11, stop, 1), 3);
             assert_eq!(
@@ -20795,6 +20796,7 @@ mod crash_recovery_tests {
             price: fp(price),
             quantity: fp(1),
             time_in_force,
+            cloid: None,
         };
         let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
         link_blocks(&mut blocks);

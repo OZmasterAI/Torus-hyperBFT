@@ -18,6 +18,102 @@ pub type OrderId = u128;
 /// Market identifier.
 pub type MarketId = u64;
 
+/// s114: a client order id (cloid), 128-bit as in Hyperliquid. Unique among
+/// one trader's open orders (resting and pending stops) across all markets.
+pub type Cloid = u128;
+
+/// s114: serde form of a [`Cloid`]. JSON (and every human-readable format)
+/// writes `0x` + 32 lowercase hex digits, the Hyperliquid form, so a cloid
+/// above 2^64 survives `serde_json::Value` and JavaScript clients; it reads
+/// that form, any `0x` hex of 1-32 digits, or a non-negative integer.
+/// Binary formats (bincode wire / DA) keep the plain 16-byte integer.
+pub mod cloid_serde {
+    use super::Cloid;
+    use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+    /// The JSON text of a cloid: `0x` + 32 lowercase hex digits.
+    pub fn to_hex(cloid: Cloid) -> String {
+        format!("0x{cloid:032x}")
+    }
+
+    /// Parse `0x` + 1-32 hex digits.
+    pub fn from_hex(s: &str) -> Result<Cloid, String> {
+        let digits = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .ok_or_else(|| format!("cloid {s:?}: expected 0x + hex"))?;
+        if digits.is_empty() || digits.len() > 32 {
+            return Err(format!("cloid {s:?}: expected 1-32 hex digits"));
+        }
+        Cloid::from_str_radix(digits, 16).map_err(|e| format!("cloid {s:?}: {e}"))
+    }
+
+    struct Repr(Cloid);
+
+    impl Serialize for Repr {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            if s.is_human_readable() {
+                s.serialize_str(&to_hex(self.0))
+            } else {
+                s.serialize_u128(self.0)
+            }
+        }
+    }
+
+    struct HumanVisitor;
+
+    impl de::Visitor<'_> for HumanVisitor {
+        type Value = Cloid;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a cloid: 0x + up to 32 hex digits, or a non-negative integer")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Cloid, E> {
+            from_hex(v).map_err(E::custom)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Cloid, E> {
+            Ok(v.into())
+        }
+        fn visit_u128<E: de::Error>(self, v: u128) -> Result<Cloid, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Cloid, E> {
+            Cloid::try_from(v).map_err(|_| E::custom("cloid must not be negative"))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Repr {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            if d.is_human_readable() {
+                d.deserialize_any(HumanVisitor).map(Repr)
+            } else {
+                Cloid::deserialize(d).map(Repr)
+            }
+        }
+    }
+
+    pub fn serialize<S: Serializer>(cloid: &Cloid, s: S) -> Result<S::Ok, S::Error> {
+        Repr(*cloid).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Cloid, D::Error> {
+        Repr::deserialize(d).map(|r| r.0)
+    }
+
+    /// `Option<Cloid>`: `null` / absent is `None`.
+    pub mod option {
+        use super::{Cloid, Repr};
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        pub fn serialize<S: Serializer>(cloid: &Option<Cloid>, s: S) -> Result<S::Ok, S::Error> {
+            cloid.map(Repr).serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Cloid>, D::Error> {
+            Ok(Option::<Repr>::deserialize(d)?.map(|r| r.0))
+        }
+    }
+}
+
 // ============================================================================
 // Fixed-Point Numeric Type (§5.1)
 // ============================================================================
@@ -738,11 +834,21 @@ pub enum NativeAction {
         signer: Address,
         proof: Option<OracleSignerProof>,
     },
+
+    // === Order Book (appended — s114 cloid) ===
+    /// Cancel the sender's open order (resting, or a pending stop) whose
+    /// client order id is `cloid` in `market_id` (Hyperliquid
+    /// `cancelByCloid`: asset + cloid).
+    CancelByCloid {
+        market_id: MarketId,
+        #[serde(with = "cloid_serde")]
+        cloid: Cloid,
+    },
 }
 
 impl NativeAction {
-    /// Place, batch, cancel, cancel-all and modify: the only actions a session
-    /// key may sign.
+    /// Place, batch, cancel, cancel-by-cloid, cancel-all and modify: the only
+    /// actions a session key may sign.
     pub fn is_trading(&self) -> bool {
         matches!(
             self,
@@ -751,6 +857,7 @@ impl NativeAction {
                 | NativeAction::CancelOrder { .. }
                 | NativeAction::ModifyOrder { .. }
                 | NativeAction::CancelAllOrders { .. }
+                | NativeAction::CancelByCloid { .. }
         )
     }
 
@@ -1024,6 +1131,11 @@ impl NativeAction {
             NativeAction::ClaimUnbonded => {
                 buf.push(27);
             }
+            NativeAction::CancelByCloid { market_id, cloid } => {
+                buf.push(29);
+                buf.extend_from_slice(&market_id.to_be_bytes());
+                buf.extend_from_slice(&cloid.to_be_bytes());
+            }
             NativeAction::SetOracleSigner { signer, proof } => {
                 buf.push(28);
                 buf.extend_from_slice(signer.as_slice());
@@ -1161,7 +1273,10 @@ pub struct PlaceOrderParams {
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
     pub reduce_only: bool,
-    pub client_order_id: Option<u64>,
+    /// s114: u128 (16 bytes in the canonical encoding, `uint128` in
+    /// EIP-712); JSON form: [`cloid_serde`].
+    #[serde(default, with = "cloid_serde::option")]
+    pub client_order_id: Option<Cloid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
