@@ -14,19 +14,35 @@
 //!   run, and distinct across runs on one chain (the run tag is the bench's
 //!   start time in unix ms), so no order can hit `DuplicateCloid`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use torus_types::{Cloid, NativeAction};
 
 /// Per-sender seed base of the selection hash (sender index XORed in).
 pub(crate) const SEED_BASE: u64 = 0xC10D_0000_0000_0000;
 
 /// Parse `--cloid-share`: an integer percent in `0..=100`.
-pub(crate) fn parse_share(_s: &str) -> Result<u8, String> {
-    Err("unimplemented".to_string())
+pub(crate) fn parse_share(s: &str) -> Result<u8, String> {
+    match s.parse::<u8>() {
+        Ok(v) if v <= 100 => Ok(v),
+        _ => Err(format!("{s:?}: want an integer percent 0..=100")),
+    }
 }
 
 /// The run tag: unix ms at bench start.
 pub(crate) fn run_tag_now() -> u64 {
-    0
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_millis() as u64
+}
+
+/// splitmix64 finalizer: a well-mixed 64-bit hash of `z`.
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// One sender's cloid source; see the module comment.
@@ -53,9 +69,83 @@ impl CloidStamper {
 
     /// Give the selected orders of `action` a cloid (other actions are left
     /// alone). Returns `(orders placed, cloids stamped)`.
-    pub(crate) fn stamp(&mut self, _action: &mut NativeAction) -> (u64, u64) {
-        let _ = (self.share, self.seed, self.run_tag, self.order_idx, self.issued);
-        (0, 0)
+    pub(crate) fn stamp(&mut self, action: &mut NativeAction) -> (u64, u64) {
+        let orders = match action {
+            NativeAction::PlaceOrder(p) => std::slice::from_mut(p),
+            NativeAction::PlaceOrderBatch(orders) => orders.as_mut_slice(),
+            _ => return (0, 0),
+        };
+        let placed = orders.len() as u64;
+        if self.share == 0 {
+            // Off: no hash, no write; the action stays byte-identical.
+            self.order_idx += placed;
+            return (placed, 0);
+        }
+        let mut stamped = 0;
+        for p in orders {
+            if let Some(c) = self.next() {
+                p.client_order_id = Some(c);
+                stamped += 1;
+            }
+        }
+        (placed, stamped)
+    }
+
+    /// The next order's cloid, or `None` if it is not selected.
+    fn next(&mut self) -> Option<Cloid> {
+        let idx = self.order_idx;
+        self.order_idx += 1;
+        let picked = self.share >= 100 || mix(self.seed ^ mix(idx)) % 100 < u64::from(self.share);
+        if !picked {
+            return None;
+        }
+        self.issued += 1;
+        Some((Cloid::from(self.run_tag) << 64) | Cloid::from(self.issued))
+    }
+}
+
+impl CloidStamper {
+    /// `(orders seen, cloids issued)` so far.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        (self.order_idx, self.issued)
+    }
+}
+
+/// The bench header line for `--cloid-share`.
+pub(crate) fn header(share: u8, run_tag: u64) -> String {
+    if share == 0 {
+        "Cloid share: 0% of placed orders (off: no client order ids)".to_string()
+    } else {
+        format!(
+            "Cloid share: {share}% of placed orders (per-order hash of a fixed per-sender seed; \
+             cloid = run tag {run_tag} << 64 | per-sender counter from 1)"
+        )
+    }
+}
+
+/// Generated-order totals over every sender's stamper (orders generated,
+/// which includes signed-ahead ones that were never sent).
+#[derive(Default)]
+pub(crate) struct CloidStats {
+    placed: AtomicU64,
+    stamped: AtomicU64,
+}
+
+impl CloidStats {
+    pub(crate) fn add(&self, st: &CloidStamper) {
+        let (placed, stamped) = st.counts();
+        self.placed.fetch_add(placed, Ordering::Relaxed);
+        self.stamped.fetch_add(stamped, Ordering::Relaxed);
+    }
+
+    /// The end-of-run line.
+    pub(crate) fn report(&self, share: u8) -> String {
+        let placed = self.placed.load(Ordering::Relaxed);
+        let stamped = self.stamped.load(Ordering::Relaxed);
+        let pct = if placed > 0 { stamped as f64 * 100.0 / placed as f64 } else { 0.0 };
+        format!(
+            "Cloids (load-gen generated): {stamped} of {placed} orders ({pct:.1}%) | --cloid-share {share}%"
+        )
     }
 }
 
@@ -242,6 +332,24 @@ mod tests {
         };
         assert_eq!(mask(0), mask(0));
         assert_ne!(mask(0), mask(1));
+    }
+
+    #[test]
+    fn stats_sum_the_stampers_and_header_prints_the_share() {
+        let stats = CloidStats::default();
+        for sender in 0..3 {
+            let mut s = econ_stream(11, 100, 10);
+            let mut st = CloidStamper::for_sender(100, sender, TAG);
+            let (placed, n) = stamp_all(&mut st, &mut s);
+            assert_eq!(st.counts(), (placed, n));
+            stats.add(&st);
+        }
+        let line = stats.report(100);
+        assert!(line.starts_with("Cloids (load-gen generated): "), "{line}");
+        assert!(line.contains("(100.0%) | --cloid-share 100%"), "{line}");
+        assert!(header(0, TAG).starts_with("Cloid share: 0% "));
+        assert!(header(50, TAG).starts_with("Cloid share: 50% "));
+        assert!(header(50, TAG).contains(&TAG.to_string()));
     }
 
     // An order stamped with a cloid signs and encodes with that cloid: the
