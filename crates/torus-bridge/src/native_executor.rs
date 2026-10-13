@@ -6895,11 +6895,15 @@ impl NativeExecutor {
         // in any book (after Phase 1's cancels) or claimed by an earlier
         // placement of this call is rejected. The first placement of a cloid
         // claims it whatever later happens to it (margin reject, fill).
-        if place_order_indices
+        let cloid_places = place_order_indices
             .iter()
-            .any(|&i| matches!(&flat[i].1, FlatAction::Place(p) if p.client_order_id.is_some()))
-        {
-            let mut claimed: HashSet<(Address, Cloid)> = HashSet::default();
+            .filter(|&&i| matches!(&flat[i].1, FlatAction::Place(p) if p.client_order_id.is_some()))
+            .count();
+        if cloid_places > 0 {
+            // perf/cloid-engine-cost fix 1: sized for every cloid placement
+            // of the call, so it never grows (no rehash in the loop).
+            let mut claimed: HashSet<(Address, Cloid)> =
+                HashSet::with_capacity_and_hasher(cloid_places, Default::default());
             let books = &mut ctx.order_books;
             let index = ctx
                 .cloid_markets
