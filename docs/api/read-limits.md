@@ -70,7 +70,7 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `torus_getOpenInterest(marketId)` | Budget. Every position row (keyed `trader ‖ market`, no market index). | `open_interest_stops_at_the_scan_budget` |
 | `torus_getBalances(trader)` | Budget. Each of the trader's position rows, and per market held its market row and (with an executed head) its oracle aggregate. The balance, EVM account, header and stake reads are constant. | `balances_and_liquidator_vault_stop_at_the_scan_budget` |
 | `torus_getLiquidatorVault` | Budget. Each of the vault's position rows; the balance read is constant. | `balances_and_liquidator_vault_stop_at_the_scan_budget` |
-| `torus_getPosition(trader, marketId)` | Constant: one position row and one oracle aggregate. | none needed |
+| `torus_getPosition(trader, marketId)` | Budget for a cross position: its `liquidationPrice` (R23) values the whole account, so each of the trader's position rows, and per market held its market row and (with an executed head) its oracle aggregate, are charged as in `torus_getBalances`. The position row, its oracle aggregate and the header read are constant; an isolated position reads nothing more. | `cross_position_liquidation_price_stops_at_the_scan_budget` |
 | `torus_getMarkets(offset?, limit?)` | Budget. Every market row up to `offset + limit` (at most 500 per page): the rows before `offset` are read and counted, because the page start cannot be sought. | `markets_offset_is_charged_to_the_scan_budget` |
 | `torus_getTradeHistory(marketId, limit?)` | Budget, and `limit` (at most 1000 fills). Every trade row visited, newest first, by size, before it is decoded or skipped: rows the decoder skips (old format) do not count toward `limit`. | `trade_history_charges_every_row_visited` |
 | `torus_getTradeHistoryRange(marketId, from, to, limit?)` | Budget, and `limit` (at most 5000 fills). As `torus_getTradeHistory`, over `[from, to]`. | `trade_history_charges_every_row_visited` |
@@ -138,7 +138,7 @@ index exists, or have a known cost noted here:
 - `torus_getBlockTrades`: a per-block trade index (block to the markets that
   traded in it, written with the trade rows), so a block reads only its own
   trade rows instead of seeking every market.
-- `torus_getBalances` / `torus_getLiquidatorVault` read one position per
+- `torus_getBalances` / `torus_getLiquidatorVault` / cross `torus_getPosition` read one position per
   market held, so they stay proportional to the number of markets (listed by
   governance). No index is needed.
 - `torus_getValidators` matches each validator against every other

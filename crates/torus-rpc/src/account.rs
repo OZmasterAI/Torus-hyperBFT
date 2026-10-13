@@ -25,8 +25,9 @@
 //!
 //! R24: the prefix scan (one row per position) and the two point reads per
 //! market held (market row, oracle aggregate) are charged to a scan budget
-//! ([`AccountRows::read_bounded`]); getBalances charges its request's budget
-//! ([`account_figures_bounded`]).
+//! ([`AccountRows::read_bounded`]); getBalances ([`account_figures_bounded`])
+//! and getPosition's cross price ([`cross_liquidation_price_bounded`])
+//! charge their request's budget.
 
 use std::collections::BTreeMap;
 
@@ -85,11 +86,6 @@ fn internal(e: CoreError) -> RpcError {
 }
 
 impl AccountRows {
-    /// [`AccountRows::read_bounded`] without a row limit.
-    fn read(state: &StateDb, trader: &Address, now: Option<u64>) -> Result<Self, RpcError> {
-        Self::read_bounded(state, trader, now, &mut ScanBudget::unlimited())
-    }
-
     /// The rows, charged to `b` (R24): each position row before it is
     /// decoded, and per market held its market row and (with a block time)
     /// its oracle aggregate. A read or decode failure is `Internal` with the
@@ -251,7 +247,19 @@ pub fn cross_liquidation_price(
     market: MarketId,
     now: Option<u64>,
 ) -> Result<Option<FixedPoint>, RpcError> {
-    let a = AccountRows::read(state, trader, now)?;
+    cross_liquidation_price_bounded(state, trader, market, now, &mut ScanBudget::unlimited())
+}
+
+/// [`cross_liquidation_price`] with the account's rows charged to `b`
+/// (R24, [`AccountRows::read_bounded`]); the search itself reads nothing.
+pub(crate) fn cross_liquidation_price_bounded(
+    state: &StateDb,
+    trader: &Address,
+    market: MarketId,
+    now: Option<u64>,
+    b: &mut ScanBudget,
+) -> Result<Option<FixedPoint>, RpcError> {
+    let a = AccountRows::read_bounded(state, trader, now, b)?;
     let Some(pos) = a.positions.iter().find(|p| p.market_id == market) else {
         return Ok(None);
     };

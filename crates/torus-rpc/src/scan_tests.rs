@@ -1118,6 +1118,75 @@ async fn balances_and_liquidator_vault_stop_at_the_scan_budget() {
     assert_eq!(examined(&s), 300);
 }
 
+/// [P1] `getPosition`'s cross `liquidationPrice` (R23) values the whole
+/// account: its position rows and the market row (and oracle aggregate,
+/// with a block time) of each market held are charged to the request
+/// budget, as `getBalances` charges them. An isolated position reads no
+/// account rows.
+#[tokio::test]
+async fn cross_position_liquidation_price_stops_at_the_scan_budget() {
+    let (_d, state) = db();
+    list_markets(&state, 300);
+    put_positions(&state, addr(MAKER), 300);
+    // Cash so that market 1's short has a price (healthy at mark 0).
+    PositionManager::new(state.clone())
+        .put_native_balance(
+            &addr(MAKER),
+            &NativeBalance {
+                available: fp(10_000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+    let maker = hex_addr(addr(MAKER));
+
+    let s = server(&state, 100);
+    let e = s
+        .state()
+        .get_position(maker.clone(), "0x1".into())
+        .await
+        .unwrap_err();
+    assert_scan_limit(&e, "getPosition cross: 300 positions, budget 100");
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
+
+    // Under the budget: main's price. No executed header (no block time):
+    // one position row + one market row per market, no oracle read.
+    let s = server(&state, 10_000);
+    let p = s
+        .state()
+        .get_position(maker, "0x1".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let want = crate::account::cross_liquidation_price(&state, &addr(MAKER), 1, None).unwrap();
+    assert!(want.is_some());
+    assert_eq!(p.liquidation_price, want.map(dec_fp));
+    assert_eq!(examined(&s), 600);
+
+    // Isolated: the reply's own estimate, nothing charged.
+    let iso = other(0);
+    PositionManager::new(state.clone())
+        .put_position(&Position {
+            margin_type: MarginType::Isolated,
+            isolated_margin: fp(10),
+            ..position(iso, 1, true, 1)
+        })
+        .unwrap();
+    let s = server(&state, 0);
+    let p = s
+        .state()
+        .get_position(hex_addr(iso), "0x1".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.liquidation_price, Some(dec_fp(fp(90))));
+    assert_eq!(examined(&s), 0);
+}
+
 /// [P2] `getProposal` decodes the whole stored proposal for its reply: the
 /// row is charged one row per started 128 B before it is decoded, as
 /// `getProposals` charges it. A missing id is one read; a row that does not

@@ -1102,8 +1102,16 @@ impl TorusApiServer for RpcState {
                         let now = crate::eth::get_header_with_hash(self, executed)
                             .map_err(ErrorObjectOwned::from)?
                             .map(|(h, _, _)| h.timestamp);
-                        crate::account::cross_liquidation_price(&self.state, &addr, mid, now)
-                            .map_err(ErrorObjectOwned::from)?
+                        // R24: the account's rows are charged to the
+                        // request's scan budget, as getBalances charges them.
+                        crate::account::cross_liquidation_price_bounded(
+                            &self.state,
+                            &addr,
+                            mid,
+                            now,
+                            &mut self.scan_budget(),
+                        )
+                        .map_err(ErrorObjectOwned::from)?
                     }
                     // Simplified isolated estimate (unchanged).
                     torus_core::position::MarginType::Isolated => Some(
