@@ -1,6 +1,7 @@
 # Implementation Plan: item 6 Phase 4 (one record per trader in memory)
 
-Status: PLAN, nothing built (2026-10-13). Parent design: `market-scaling-in-memory-design.md` Phase 4,
+Status: PLAN, nothing built (2026-10-13). Section 6 decided by the owner (s118): 1 a, 2 b, 3 a, 4 a, 5 a.
+Parent design: `market-scaling-in-memory-design.md` Phase 4,
 section 4 (memory budget), section 5 rules 1, 4, 8, 9, and D4 a. Short form: `item6-phases-2-5-plans.md`
 Phase 4. Format and base: `item6-phase3-impl.md`.
 
@@ -26,7 +27,7 @@ Phase 4 merges three structures that already exist on step 2 into one record per
 
 Writers stay as they are: they put raw rows into the block's pending set, and the record follows the
 block's frozen delta at `end_resident`, as `TraderPositions` does today. Rows "produced at freeze" from
-typed state need typed writes, which is Phase 5 (section 2, row 2; open decision 1).
+typed state need typed writes, which is Phase 5 (section 2, row 2; decision 1).
 
 No runtime switch (D16). Each step keeps a test-only reference path (today's raw R) for the
 differential, behind `cfg(test)` / the existing `test-reference-paths` feature.
@@ -128,7 +129,7 @@ Before every commit: `cargo nextest run --workspace $F` and the doc-test command
 | 2 | overlay reads the two CFs from `Users`; R's two raw maps deleted | M | builder, then Codex torus-adversarial |
 | 3 | sums cache into `UserState`; `SumsCache` deleted | S | builder |
 | 4 | typed loads for `PositionCache`, `BalanceCache`, `cum_volume` | S-M | builder |
-| 5 | open-order count in `UserState` (only on decision 2 b) | M | builder |
+| 5 | open-order count in `UserState` (decision 2 b) | M | builder |
 | 6 | RSS per user ubench + gate campaign | S | builder (ubench), archy (campaign) |
 
 ### Step 0: re-profile (archy, measurement only, no code)
@@ -228,7 +229,9 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
 - Verify: `cargo nextest run -p torus-core $F`, `cargo check --workspace --tests -q`, then
   `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
 
-### Step 5: open-order count (only on decision 2 b)
+### Step 5: open-order count (decision 2 b)
+
+Step 0's `open_order_counts` number goes to the owner before this step starts (decision 2).
 
 - Test first: `open_order_count_in_user_equals_book_scan`. After every block of random places, cancels,
   fills, stops and cancel-alls, each user's count equals `open_order_counts` over the books
@@ -257,17 +260,29 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
 - An ordered index of the balances CF (only a proof-only reader iterates it).
 - Shrinking L or the view (decision 5).
 
-## 6. Open decisions
+## 6. Decisions (owner s118)
 
 1. **Scope of the swap.**
    (a) Read side: `Users` replaces R's two raw maps, writers unchanged (this plan, M).
    (b) Merge records and sums only, keep R's raw maps (S; no RAM change; saves one lookup per trader).
    (c) Also typed writes, rows produced at freeze (L; overlaps Phase 5's typed dirty sets).
    Recommendation: a. It is the summary's Phase 4 without Phase 5's write path.
+   **Decided: a.** HL keeps all state typed in one in-memory struct [RE] (c plus Phase 5); Phase 5 closes
+   that gap.
 2. **Open-order count.**
    (a) Keep counting from the books per call (today).
    (b) A counter in `UserState`, step 5.
    Recommendation: a, unless step 0 shows `open_order_counts` at >= ~5% of exec time.
+   **Decided: b (step 5), confirmed by step 0's number.** The count serves the HL-style per-user cap
+   already on main (min(1000 + cumVolume / 5M, 5000) over all markets, merge `2567e56`; HL docs [O]).
+   (a) walks every book for every sender per batch (`order_book.rs:47` on `c88d3073`), so it grows with
+   markets x senders. Section 11 of the results doc (older build, 300 markets): 0.26-0.36 ms per 1k
+   fills on the exec thread, ~6-8% of today's ~4.4 ms per 1k fills (section 60: +0.71 = +16%)
+   **(estimate, not measured on step 2, which splits the count across threads)**. The node is
+   exec-bound, so exec time saved is blocks/s and matched/s. (b) adds a hash update per rest, cancel,
+   fill and stop (the kind of upkeep that cost cloid +0.36 ms per 1k fills), so the net saving is
+   smaller than the 6-8%. HL checks the cap on every order, which needs a stored count (inference; HL's
+   code is not public).
 3. **Map shape for the liquidation walk and ADL.**
    (a) `HashMap<Address, UserState>` plus E2's sorted holder set and C2's per-market holders (today's
    measured shape).
@@ -275,11 +290,16 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
    balance-only accounts, ~100k at bench shape, every block **(estimate)**; point reads O(log n).
    (c) A `BTreeMap` of position holders plus a hash map of balance-only users.
    Recommendation: a. It keeps the E2 and C2 results and hash point reads.
+   **Decided: a** (today's `TraderPositions` shape, `trader_positions.rs:53`). HL's shape is (b)
+   (`BTreeMap<addr, UserState>` [RE]). (b) costs a tree descent per point read (every prepare and fill)
+   and a walk over balance-only accounts per block; C2's `BTreeSet` -> `HashSet` swap cut `apply` per
+   fill by 36% (`item6-phase2-impl.md` row 40), and (b) would undo that kind of gain.
 4. **Per-block sums memo.**
    (a) Keep `BlockSums.memo`; move only the persistent per-trader sums (step 3).
    (b) A per-user memo cell in `UserState` (drops the per-block `Mutex<HashMap>` and one `Arc` per trader;
    needs a versioned cell).
    Recommendation: a; b only if step 0 shows the memo.
+   **Decided: a** (b only if step 0 shows the memo). HL: not public.
 5. **The s114 RAM follow-up (layer and view shrink).**
    (a) Not in Phase 4. Pick the allocator first (sections 53b, 53d: jemalloc levels off at ~+1.1 GB, glibc
    grows). Shrink as its own task after Phase 4 if the RAM rule still fails.
@@ -288,6 +308,7 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
    (c) Compact L's storage (~2.1x logical today) as an extra Phase 4 step.
    Recommendation: a. Phase 4 saves ~50 MB per node **(estimate)**; the Phase 3 delta is layer, view and
    allocator retention.
+   **Decided: a.** HL: 128 GB RAM per node [O]; allocator and layout not public.
 
 ## 7. Rollback
 
