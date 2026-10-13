@@ -3062,11 +3062,17 @@ mod tests {
                 OrderRejectReason::IocCancel => 1,
                 _ => 0,
             };
-            let line = format!("torus_orders_rejected_reason_total{{reason=\"{}\"}} {want}\n", r.as_str());
+            let line = format!(
+                "torus_orders_rejected_reason_total{{reason=\"{}\"}} {want}\n",
+                r.as_str()
+            );
             assert!(text.contains(&line), "{line}:\n{text}");
             assert_eq!(m.orders_rejected_reason[r as usize].get(), want, "{r:?}");
         }
-        assert!(text.contains("torus_orders_rejected_margin_total 0\n"), "the funnel counter stays");
+        assert!(
+            text.contains("torus_orders_rejected_margin_total 0\n"),
+            "the funnel counter stays"
+        );
     }
 
     /// s92 (B-blind observability): every sell-cut series exists from
