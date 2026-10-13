@@ -5497,14 +5497,18 @@ impl TorusApp {
         // §2.1 W.6, F4). Default ON; `TORUS_EXEC_PIPELINE=0` ⇒ None ⇒ serial chain.
         // Item 6 Phase 3 (task 1.2): a checkpoint interval needs a
         // non-deferred book mode; refuse to start otherwise (owner s109).
-        crate::exec_pipeline::check_checkpoint_book_mode(
-            crate::exec_pipeline::checkpoint_interval(),
+        // Step 6: the role default (15 s on validators) yields to a deferred
+        // book mode instead (per-block flush, warned).
+        let checkpoint_interval = crate::exec_pipeline::effective_checkpoint_interval(
             torus_bridge::native_executor::configured_book_mode(),
         )?;
         if crate::exec_pipeline::exec_pipeline_enabled() {
-            exec_ctx.checkpoint = crate::exec_pipeline::CheckpointPolicy::from_env();
+            exec_ctx.checkpoint =
+                crate::exec_pipeline::CheckpointPolicy::for_interval(checkpoint_interval);
             exec_ctx.attach_flush_worker(None);
-        } else if crate::exec_pipeline::checkpoint_interval().is_some() {
+        } else if checkpoint_interval.is_some()
+            && crate::exec_pipeline::checkpoint_interval_explicit()
+        {
             tracing::warn!(
                 "TORUS_CHECKPOINT_INTERVAL_MS is set but TORUS_EXEC_PIPELINE=0: checkpoints need \
                  the flush worker; every block is written as today"

@@ -49,6 +49,8 @@
 |----------|-------------|
 | `RUST_LOG` | Overridden by `--log-level`. Controls tracing filter. Examples: `info`, `torus_consensus=debug,info`, `trace`. |
 | `TORUS_ALL_MARKET_TRADES` | Allows all-markets `newTrades` WebSocket subscriptions (no `marketId`). Unset: allowed only on `--rpc-only` nodes, rejected with `-32602` on validators. `1`: allowed. `0`: rejected. Any other value logs a warning and uses the default. Read once at startup. Per-market `newTrades` and `userFills` are always allowed. See `docs/api/streams.md`. |
+| `TORUS_CHECKPOINT_INTERVAL_MS` | Item 6 Phase 3 coalesced state checkpoints: execution time (milliseconds) between checkpoints; executed state reaches disk once per interval and at every 100th block, barrier and shutdown, not every block. Unset or empty: the role default, 15000 (15 s) on validators, 0 on `--rpc-only` nodes (step 6). `0`: per-block flush. Not a whole number: a warning and the per-block flush. With a deferred book mode (`TORUS_BOOK_ROWS=2` or `3`) an explicit value above 0 refuses to start, and the unset default is off (per-block flush, a warning). Needs the exec pipeline (`TORUS_EXEC_PIPELINE` not `0`). Node-local. Validator RPC reads other than the submit checks lag by up to one interval (`docs/validator-home-network.md`). Read once at startup. |
+| `TORUS_CHECKPOINT_MAX_BYTES` | Item 6 Phase 3: also checkpoint when the since-checkpoint layer reaches this many bytes. Unset, `0` or not a number (warned): no byte cap. Only with checkpoints on. |
 
 ## Port Assignments
 

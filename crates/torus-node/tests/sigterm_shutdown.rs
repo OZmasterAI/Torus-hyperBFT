@@ -242,11 +242,15 @@ fn applied_head(data: &Path) -> (u64, Vec<u8>) {
 
 #[test]
 fn restart_after_sigterm_resumes_from_the_same_applied_state() {
+    // Per-block flush pinned (`0`): step 6 made 15 s checkpoints the
+    // validator default; `sigterm_with_checkpoints_restarts_with_zero_replay`
+    // covers that path, this test keeps the per-block restart covered.
+    const PER_BLOCK: &[(&str, &str)] = &[("TORUS_CHECKPOINT_INTERVAL_MS", "0")];
     let work = tempfile::tempdir().unwrap();
     let genesis = write_genesis(work.path());
     let data = work.path().join("data");
 
-    let mut node = Node::start(work.path(), &genesis, "a");
+    let mut node = Node::start_env(work.path(), &genesis, "a", PER_BLOCK);
     node.wait_executed_above(MIN_BLOCKS);
     assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
     // Every block the node executed is the stored head: nothing was dropped
@@ -259,7 +263,7 @@ fn restart_after_sigterm_resumes_from_the_same_applied_state() {
         "stored head must be the last executed block"
     );
 
-    let mut node = Node::start(work.path(), &genesis, "b");
+    let mut node = Node::start_env(work.path(), &genesis, "b", PER_BLOCK);
     let resumed = node.wait_executed_above(head);
     let log = node.log_text();
     assert!(

@@ -725,6 +725,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         trade_history,
         "trade history (TORUS_TRADE_HISTORY; default off on validators, on for --rpc-only)"
     );
+    // Item 6 Phase 3 step 6: coalesced checkpoints every 15 s on validators,
+    // off (per-block flush) on --rpc-only; TORUS_CHECKPOINT_INTERVAL_MS
+    // overrides (0 = per-block). A deferred book mode turns the default off.
+    let checkpoint_interval =
+        torus_consensus::exec_pipeline::set_checkpoint_interval_default(cli.rpc_only);
+    info!(
+        ?checkpoint_interval,
+        "checkpoint interval (TORUS_CHECKPOINT_INTERVAL_MS; default 15 s on validators, 0 on --rpc-only)"
+    );
     // R02 branch 8 (D1): a startup storage fault (e.g. the validator rows
     // cannot be read to resolve the proposer address) stops the node here.
     let mut app = TorusApp::try_new(
