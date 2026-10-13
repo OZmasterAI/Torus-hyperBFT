@@ -1,0 +1,29 @@
+phase keys: ['action_status', 'body_persist', 'checkpoint_settle_wait', 'checkpoint_upkeep', 'end_resident', 'end_resident_wait', 'engine', 'evm', 'flush', 'load_books', 'replay_guard', 'residual_untimed', 'save_books', 'verify']
+cell arm | ckpt_settle_wait ms/blk | settle_wait p50/p99 ms | deferred_join p50/p99 ms | upkeep ms/blk | exec phase settle ms/blk | block ms (mean of 3 nodes)
+r1-s2 s2 | 3.35 | 0.23 / 22.47 | 0.00 / 2.60 | 1.03 | - | 191.06 | dj per node {'val0': (0.0, 3.1), 'val1': (0.0, 3.2), 'val2': (0.0, 1.5)}
+r1-m m | 0.00 | - / - | - / - | 0.00 | - | 221.16 | dj per node {'val0': (None, None), 'val1': (None, None), 'val2': (None, None)}
+r2-m m | 0.00 | - / - | - / - | 0.00 | - | 229.81 | dj per node {'val0': (None, None), 'val1': (None, None), 'val2': (None, None)}
+r2-s2 s2 | 3.07 | 0.10 / 19.53 | 0.00 / 0.03 | 0.75 | - | 182.36 | dj per node {'val0': (0.0, 0.0), 'val1': (0.0, 0.1), 'val2': (0.0, 0.0)}
+r3-s2 s2 | 3.29 | 0.10 / 20.43 | 0.00 / 0.00 | 0.79 | - | 199.51 | dj per node {'val0': (0.0, 0.0), 'val1': (0.0, 0.0), 'val2': (0.0, 0.0)}
+r3-m m | 0.00 | - / - | - / - | 0.00 | - | 228.71 | dj per node {'val0': (None, None), 'val1': (None, None), 'val2': (None, None)}
+r4-m m | 0.00 | - / - | - / - | 0.00 | - | 257.91 | dj per node {'val0': (None, None), 'val1': (None, None), 'val2': (None, None)}
+r4-s2 s2 | 4.20 | 0.70 / 21.43 | 0.00 / 0.00 | 0.78 | - | 229.35 | dj per node {'val0': (0.0, 0.0), 'val1': (0.0, 0.0), 'val2': (0.0, 0.0)}
+k1-m m | 0.00 | - / - | - / - | 0.00 | - | 364.57 | dj per node {'val0': (None, None), 'val1': (None, None), 'val2': (None, None)}
+k1-s2 s2 | 9.04 | 8.30 / 30.53 | 0.00 / 0.00 | 1.21 | - | 327.36 | dj per node {'val0': (0.0, 0.0), 'val1': (0.0, 0.0), 'val2': (0.0, 0.0)}
+t1-s2-TERM s2 | 5.18 | 3.47 / 24.37 | 0.00 / 2.20 | 0.94 | - | 254.90 | dj per node {'val0': (0.0, 0.0), 'val1': (0.0, 6.6), 'val2': (0.0, 0.0)}
+t1-m-TERM m | 0.00 | - / - | - / - | 0.00 | - | 317.15 | dj per node {'val0': (None, None), 'val1': (None, None), 'val2': (None, None)}
+SAT mean s2 {'csw': 3.48, 'sw50': 0.28, 'sw99': 20.97, 'dj50': 0.0, 'dj99': 0.66, 'up': 0.84, 'settle': None, 'blk': 200.57}
+SAT mean m {'csw': 0.0, 'sw50': None, 'sw99': None, 'dj50': None, 'dj99': None, 'up': 0.0, 'settle': None, 'blk': 234.4}
+exec phase settle (torus_exec_phase_settle_seconds_sum delta / torus_exec_native_blocks_total delta), ms per native block; checkpoint_settle_wait same basis
+r1-s2 phase_settle [45.66, 46.82, 46.44] ckpt_settle_wait [3.02, 3.0, 3.04]
+r1-m phase_settle [54.2, 53.72, 54.32] ckpt_settle_wait [0.0, 0.0, 0.0]
+r2-m phase_settle [56.4, 56.44, 55.57] ckpt_settle_wait [0.0, 0.0, 0.0]
+r2-s2 phase_settle [45.68, 44.41, 45.56] ckpt_settle_wait [2.83, 2.72, 2.75]
+r3-s2 phase_settle [49.19, 51.27, 50.89] ckpt_settle_wait [3.03, 2.98, 3.15]
+r3-m phase_settle [57.58, 57.13, 57.64] ckpt_settle_wait [0.0, 0.0, 0.0]
+r4-m phase_settle [60.96, 60.76, 60.61] ckpt_settle_wait [0.0, 0.0, 0.0]
+r4-s2 phase_settle [54.73, 53.63, 53.74] ckpt_settle_wait [3.56, 3.67, 3.88]
+k1-m phase_settle [92.04, 91.36, 91.61] ckpt_settle_wait [0.0, 0.0, 0.0]
+k1-s2 phase_settle [82.52, 83.25, 82.25] ckpt_settle_wait [8.72, 8.54, 9.09]
+SAT mean s2 phase_settle 49.00 ms/native blk, ckpt_settle_wait 3.14 ms/native blk
+SAT mean m phase_settle 57.11 ms/native blk, ckpt_settle_wait 0.00 ms/native blk
