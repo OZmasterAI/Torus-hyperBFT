@@ -79,3 +79,44 @@ label = "60 PROF 120 s"
 arm = "c100"
 text = "c100 main ef812b02, glibc, CLOID_SHARE=100, perf on val1"
 cols = { writes = "148.5" }
+
+# Smoke check (see SMOKE in archive-campaign.py's header; meta/p3cloid.toml has the same steps). The arguments are the
+# a-cells.py / a-arms.py / a-paired.py / a-metrics.py lines of analyst/run-analysis.sh with the corrected "$P-" prefix:
+# the analyst's run-analysis.sh on ozarchy passes "$P" (no "-"), which this check now catches (FileNotFoundError on
+# ozarchy-p3cloidprof-300mr1-c0/). a-prof.py / fg.py are not smoke-run: they need the Tier A perf dumps, write fixed
+# file names next to their input, and take minutes.
+[[smoke]]
+name = "a-cells.py on r1-c0"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-r1-c0.json", "{bench}/ozarchy-p3cloidprof-300m-", "r1-c0:c0"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/cells.txt"
+select = "^r1-c0 "
+
+[[smoke]]
+name = "a-cells.py on the ABBA cells"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloidprof-300m-", "r1-c0:c0", "r1-c100:c100", "r2-c100:c100", "r2-c0:c0", "r3-c0:c0", "r3-c100:c100"]
+timeout = 300
+
+[[smoke]]
+script = "analyst/a-arms.py"
+args = ["{out}/cells-abba.json", "c0:c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/arms.txt"
+
+[[smoke]]
+script = "analyst/a-paired.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloidprof-300m-", "c0", "c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/paired.txt"
+
+[[smoke]]
+script = "analyst/a-metrics.py"
+args = ["{bench}/ozarchy-p3cloidprof-300m-r1-c0", "{bench}/ozarchy-p3cloidprof-300m-r1-c100", "{bench}/ozarchy-p3cloidprof-300m-r2-c100", "{bench}/ozarchy-p3cloidprof-300m-r2-c0", "{bench}/ozarchy-p3cloidprof-300m-r3-c0", "{bench}/ozarchy-p3cloidprof-300m-r3-c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/metrics.txt"
