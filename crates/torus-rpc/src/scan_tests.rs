@@ -541,3 +541,234 @@ async fn user_trades_with_a_market_filter_stop_at_the_scan_budget() {
         examined(&s)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review round 1 (Codex): layout sniff, packed trade rows, one snapshot,
+// corrupt meta rows
+// ---------------------------------------------------------------------------
+
+/// [P1] A DB without the `__book_mode__` marker is sniffed by reading every
+/// key of the book CF: that sniff is charged to the request budget like any
+/// other row, never run uncharged before the budget applies.
+#[tokio::test]
+async fn layout_detection_without_a_marker_is_charged_to_the_scan_budget() {
+    use torus_core::book_reader::BOOK_MODE_MARKER_KEY;
+    use torus_state::cf::CF_NATIVE_MARKETS;
+    let (_d, state) = db();
+    seed_deep_book(&state, BookMode::LevelAuthority);
+    state
+        .delete_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY)
+        .unwrap();
+
+    // 1 meta + 600 level rows to sniff: refused at 100.
+    let s = server(&state, 100);
+    let e = s
+        .state()
+        .get_order_book("0x1".into(), Some(1))
+        .await
+        .unwrap_err();
+    assert_scan_limit(&e, "marker-less sniff of 601 rows");
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
+    let s = server(&state, 100);
+    let e = s
+        .state()
+        .get_user_limits(hex_addr(other(0)))
+        .await
+        .unwrap_err();
+    assert_scan_limit(&e, "getUserLimits: marker-less sniff");
+
+    // With room: the same answer as with the marker, the sniff counted.
+    let s = server(&state, 10_000);
+    let top = s
+        .state()
+        .get_order_book("0x1".into(), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(top.bids[0].price, dec_fp(fp(1299)));
+    assert_eq!(top.asks[0].price, dec_fp(fp(2000)));
+    assert!(examined(&s) > 601, "examined {}", examined(&s));
+}
+
+/// [P1] One packed user-trade row can hold a whole block of fills: it is
+/// charged by its size (one row per started 128 B) before it is decoded,
+/// not as one row whatever it holds.
+#[tokio::test]
+async fn packed_user_trade_rows_are_charged_by_size_before_decoding() {
+    use torus_state::trade_rows::TradeFill;
+    let (_d, state) = db();
+    let me = addr(MAKER);
+    let fills: Vec<TradeFill> = (0..2_000)
+        .map(|i| TradeFill {
+            trade_index: i,
+            market: 2,
+            maker: me,
+            taker: addr(2),
+            price_raw: 10,
+            qty_raw: 1,
+            taker_side: 0,
+        })
+        .collect();
+    let mut rows = torus_state::PackedCfBatch::default();
+    torus_state::trade_rows::encode_block(1, 10, &fills, &mut rows);
+    let mut row_bytes = 0;
+    for (cf, key, value) in rows.iter() {
+        if key.starts_with(me.as_slice()) && cf == torus_state::cf::CF_NATIVE_USER_TRADES {
+            row_bytes = value.len();
+        }
+        state.put_cf_raw(cf, key, value).unwrap();
+    }
+    assert!(row_bytes > 100 * CLASSIC_BLOB_BYTES_PER_ROW, "{row_bytes} B");
+
+    for market in [Some("0x1".to_string()), None] {
+        let s = server(&state, 100);
+        let e = s
+            .state()
+            .get_user_trades(hex_addr(me), market.clone(), Some(10))
+            .await
+            .unwrap_err();
+        assert_scan_limit(&e, &format!("{market:?}: one {row_bytes} B row"));
+        assert!(
+            (1..=101).contains(&examined(&s)),
+            "{market:?}: examined {}",
+            examined(&s)
+        );
+    }
+    let s = server(&state, 10_000);
+    let t = s
+        .state()
+        .get_user_trades(hex_addr(me), None, Some(10))
+        .await
+        .unwrap();
+    assert_eq!(t.len(), 10);
+}
+
+fn level_value() -> Vec<u8> {
+    torus_core::book_rows::LevelRowData {
+        total_qty_raw: fp(1).raw(),
+        order_count: 1,
+        level_hash: [0; 32],
+    }
+    .encode()
+    .to_vec()
+}
+
+/// [P2] Mode 2 reads the meta row and both sides from ONE snapshot: a
+/// commit that moves both sides at once is seen whole or not at all, so a
+/// book that is never crossed on disk is never served crossed.
+#[test]
+fn level_book_sides_are_read_from_one_snapshot() {
+    use std::sync::atomic::AtomicBool;
+    use torus_core::book_reader::BOOK_MODE_MARKER_KEY;
+    use torus_core::book_rows::{level_row_key, BookMetaRow};
+    use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
+    use torus_types::Side;
+    let (_d, state) = db();
+    let meta = BookMetaRow {
+        next_seq: 1,
+        tick_size: fp(1),
+        lot_size: fp(1),
+        next_id: 1,
+        last_trade_price: None,
+    };
+    state
+        .put_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY, &[2])
+        .unwrap();
+    state
+        .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &book_meta_key(1), &meta.encode())
+        .unwrap();
+    // Two uncrossed books, swapped atomically: (bid 120, ask 130) and
+    // (bid 100, ask 110). Bid 120 with ask 110 never exists on disk.
+    let levels = |high: bool| {
+        if high {
+            [(Side::Buy, 120), (Side::Sell, 130)]
+        } else {
+            [(Side::Buy, 100), (Side::Sell, 110)]
+        }
+    };
+    for (side, p) in levels(true) {
+        state
+            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &level_row_key(1, side, fp(p)), &level_value())
+            .unwrap();
+    }
+    let run = Arc::new(AtomicBool::new(true));
+    let writer = {
+        let (state, run) = (state.clone(), run.clone());
+        std::thread::spawn(move || {
+            let cf = state.cf_handle(CF_NATIVE_ORDER_BOOKS).unwrap();
+            let mut high = false;
+            while run.load(Relaxed) {
+                let mut batch = rocksdb::WriteBatch::default();
+                for (side, p) in levels(!high) {
+                    batch.delete_cf(cf, level_row_key(1, side, fp(p)));
+                }
+                for (side, p) in levels(high) {
+                    batch.put_cf(cf, level_row_key(1, side, fp(p)), level_value());
+                }
+                state
+                    .write_with(batch, &rocksdb::WriteOptions::default())
+                    .unwrap();
+                high = !high;
+            }
+        })
+    };
+    let mut crossed = 0;
+    for _ in 0..3_000 {
+        let d = row_book_depth(
+            &state,
+            1,
+            BookLayout::LevelAuthority,
+            1,
+            &mut ScanBudget::new(100),
+        )
+        .unwrap();
+        assert_eq!((d.bids.len(), d.asks.len()), (1, 1), "one level per side");
+        if d.bids[0].price >= d.asks[0].price {
+            crossed += 1;
+        }
+    }
+    run.store(false, Relaxed);
+    writer.join().unwrap();
+    assert_eq!(crossed, 0, "books served crossed out of 3000");
+}
+
+/// [P2] A meta row that does not decode is the same `BookCorrupt` error the
+/// unbounded reader returns, never an empty book (the market key alone is
+/// not proof of a book).
+#[tokio::test]
+async fn a_corrupt_meta_row_is_an_error_not_an_empty_book() {
+    use torus_core::book_reader::BOOK_MODE_MARKER_KEY;
+    use torus_core::book_rows::BookMetaRow;
+    use torus_core::error::CoreError;
+    use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
+    for mode in [1u8, 2] {
+        let (_d, state) = db();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY, &[mode])
+            .unwrap();
+        state
+            .put_cf_raw(CF_NATIVE_ORDER_BOOKS, &book_meta_key(1), &[0])
+            .unwrap();
+        let want = CoreError::BookCorrupt(format!(
+            "market 1: {}",
+            BookMetaRow::decode(&[0]).unwrap_err()
+        ))
+        .to_string();
+        let s = server(&state, 100);
+        let e = s
+            .state()
+            .get_order_book("0x1".into(), Some(10))
+            .await
+            .unwrap_err();
+        assert!(e.message().contains(&want), "mode {mode}: {e:?}");
+        let e = s
+            .state()
+            .get_open_orders(hex_addr(addr(MAKER)), Some("0x1".into()))
+            .await
+            .unwrap_err();
+        assert!(e.message().contains(&want), "mode {mode} open orders: {e:?}");
+    }
+}
