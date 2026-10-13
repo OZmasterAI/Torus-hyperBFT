@@ -368,6 +368,73 @@ fn sigterm_with_checkpoints_restarts_with_zero_replay() {
     assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
 }
 
+/// Item 6 Phase 3 step 6: the compiled default. A validator started with
+/// `TORUS_CHECKPOINT_INTERVAL_MS` unset runs coalesced checkpoints every 15 s
+/// (the gate's interval); before step 6 unset meant the per-block flush.
+#[test]
+fn env_unset_validator_runs_15s_checkpoints() {
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis(work.path());
+    let mut node = Node::start(work.path(), &genesis, "a");
+    node.wait_executed_above(MIN_BLOCKS);
+    let log = node.log_text();
+    assert!(
+        log.contains("coalesced state checkpoints ON"),
+        "env unset: a validator must default to checkpoints:\n{}",
+        node.tail()
+    );
+    assert!(
+        log.contains("interval: Some(15s)"),
+        "env unset: the compiled default interval must be 15 s:\n{}",
+        node.tail()
+    );
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
+}
+
+/// `TORUS_CHECKPOINT_INTERVAL_MS=0` still selects today's per-block flush.
+#[test]
+fn explicit_zero_interval_keeps_the_per_block_flush() {
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis(work.path());
+    let mut node = Node::start_env(
+        work.path(),
+        &genesis,
+        "a",
+        &[("TORUS_CHECKPOINT_INTERVAL_MS", "0")],
+    );
+    node.wait_executed_above(MIN_BLOCKS);
+    assert!(
+        !node.log_text().contains("coalesced state checkpoints ON"),
+        "interval 0 must keep the per-block flush:\n{}",
+        node.tail()
+    );
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
+}
+
+/// A deferred book mode (`TORUS_BOOK_ROWS=3`, the bench `RECORD_ENV`) cannot
+/// run with checkpoints (owner s109, task 1.2). With the interval unset the
+/// compiled default yields (per-block flush, a warning) instead of refusing
+/// to start; an explicit interval still refuses.
+#[test]
+fn env_unset_interval_yields_to_a_deferred_book_mode() {
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis(work.path());
+    let mut node = Node::start_env(work.path(), &genesis, "a", &[("TORUS_BOOK_ROWS", "3")]);
+    node.wait_executed_above(MIN_BLOCKS);
+    let log = node.log_text();
+    assert!(
+        !log.contains("coalesced state checkpoints ON"),
+        "a deferred book mode must not run checkpoints:\n{}",
+        node.tail()
+    );
+    assert!(
+        log.contains("compiled default checkpoint interval is off"),
+        "the yield must be logged:\n{}",
+        node.tail()
+    );
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
+}
+
 /// Codex round 5: with stdout blocked (a full pipe nobody reads, e.g. a
 /// stalled log shipper), every log call blocks. SIGTERM must still end the
 /// process within the shutdown bound: no log may stand between the signal
