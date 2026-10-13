@@ -171,7 +171,7 @@ mod tests {
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::GTC,
             reduce_only: false,
-            client_order_id: Some(i),
+            client_order_id: Some(i as u128),
         }
     }
 

@@ -79,6 +79,7 @@ fn seed(db: &StateDb) {
         price: fp(100),
         quantity: fp(1),
         time_in_force: 0,
+        cloid: None,
     };
     assert_eq!(enqueue(db, 11, stop, 1), 3);
     assert_eq!(
@@ -221,6 +222,7 @@ fn cw_order(side: u8, price: i64, time_in_force: u8) -> QueuedActionKind {
         price: fp(price),
         quantity: fp(1),
         time_in_force,
+        cloid: None,
     }
 }
 
