@@ -968,6 +968,285 @@ mod tests {
         assert!(health_at(&ctx, &t, p + one_raw()).is_some_and(|h| h != Health::Healthy));
     }
 
+    // ---- R23 follow-up: 1x leverage, extreme balances ----
+    //
+    // One cross position in listed market 1 (default 20x: IM = n / 20,
+    // MM = IM / 2, both truncated; n = size × mark truncated). "1x" = cash
+    // equal to the cost basis (size × entry, one truncation), so a long is
+    // fully collateralised and a short holds twice its cost basis:
+    // - long: equity = cash + n − cost basis = n >= MM at every mark;
+    // - short: equity = 2 × cost basis − n, crossing at ~2 × entry / 1.025.
+
+    /// t with cash = the position's cost basis + `extra` raw.
+    fn one_x(
+        long: bool,
+        size: FixedPoint,
+        entry: i128,
+        extra: i128,
+    ) -> (tempfile::TempDir, NativeExecContext, Address) {
+        let cb = size.checked_mul(FixedPoint::from_raw(entry)).unwrap().raw();
+        raw_account(cb.checked_add(extra).unwrap(), long, size, entry)
+    }
+
+    /// `p` is the step's boundary: valued `Healthy` at `p`, valued and
+    /// liquidatable one raw unit on the risky side (below for a long, above
+    /// for a short).
+    fn assert_boundary(ctx: &NativeExecContext, t: &Address, long: bool, p: FixedPoint) {
+        assert_eq!(health_at(ctx, t, p), Some(Health::Healthy), "at {p:?}");
+        let risky = if long { p - one_raw() } else { p + one_raw() };
+        assert!(
+            health_at(ctx, t, risky).is_some_and(|h| h != Health::Healthy),
+            "one raw unit past {p:?}: {:?}",
+            health_at(ctx, t, risky)
+        );
+    }
+
+    /// 1x long (cash = cost basis, or more) at every scale: healthy at mark
+    /// 0, so no mark crosses and the price is `None`. At no raw mark tried
+    /// (0, 1, entry, MAX) is it liquidatable; marks whose valuation
+    /// overflows are indeterminate (`None`), never liquidatable.
+    #[test]
+    fn cross_liquidation_price_1x_long_is_none_at_any_balance() {
+        let max = i128::MAX;
+        // (label, size, raw entry, raw cash above the cost basis)
+        let cases: [(&str, FixedPoint, i128, i128); 8] = [
+            ("tiny: 1e-8 @ 1, cash 1e-8", one_raw(), fp(1).raw(), 0),
+            ("normal: 10 @ 1000, cash 10000", fp(10), fp(1_000).raw(), 0),
+            ("normal, cash 1 raw over", fp(10), fp(1_000).raw(), 1),
+            ("huge entry: 1 @ MAX raw, cash MAX", fp(1), max, 0),
+            (
+                "huge size: MAX raw @ 1, cash MAX",
+                FixedPoint::from_raw(max),
+                fp(1).raw(),
+                0,
+            ),
+            ("2 @ MAX/2 raw, cash MAX - 1", fp(2), max / 2, 0),
+            (
+                "huge cash: 10 @ 1000, cash MAX",
+                fp(10),
+                fp(1_000).raw(),
+                max - fp(10_000).raw(),
+            ),
+            ("tiny size, cash MAX", one_raw(), fp(1).raw(), max - 1),
+        ];
+        for (label, size, entry, extra) in cases {
+            let (_d, ctx, t) = one_x(true, size, entry, extra);
+            assert_eq!(liq_price(&ctx, &t, 1), None, "{label}");
+            assert_eq!(
+                health_at(&ctx, &t, FixedPoint::ZERO),
+                Some(Health::Healthy),
+                "{label}: healthy at mark 0"
+            );
+            for raw in [1, entry, max] {
+                let h = health_at(&ctx, &t, FixedPoint::from_raw(raw));
+                assert!(
+                    h.is_none_or(|h| h == Health::Healthy),
+                    "{label}: {h:?} at raw mark {raw}"
+                );
+            }
+        }
+        // The overflow edge of the huge size: valued at mark 1, not above.
+        let (_d, ctx, t) = one_x(true, FixedPoint::from_raw(max), fp(1).raw(), 0);
+        assert_eq!(health_at(&ctx, &t, fp(1)), Some(Health::Healthy));
+        assert_eq!(health_at(&ctx, &t, fp(1) + one_raw()), None);
+    }
+
+    /// A long one raw unit short of 1x (cash = cost basis − 1e-8): Adl at
+    /// mark 0 (equity −1e-8), healthy as soon as the notional is >= 1 raw
+    /// (equity n − 1 >= MM = n / 40). The price is that mark: 1 raw
+    /// whenever size >= 1 (n(1 raw) = size raw / 1e8 >= 1), mark 1 for a
+    /// 1e-8 size (n truncates to 0 below it). Holds up to cost bases at MAX.
+    #[test]
+    fn cross_liquidation_price_long_one_raw_short_of_1x() {
+        let max = i128::MAX;
+        // (label, size, raw entry, expected raw price)
+        let cases: [(&str, FixedPoint, i128, i128); 5] = [
+            (
+                "tiny: 1e-8 @ 1, cash 0",
+                one_raw(),
+                fp(1).raw(),
+                fp(1).raw(),
+            ),
+            ("normal: 10 @ 1000", fp(10), fp(1_000).raw(), 1),
+            ("huge entry: 1 @ MAX raw", fp(1), max, 1),
+            (
+                "huge size: MAX raw @ 1",
+                FixedPoint::from_raw(max),
+                fp(1).raw(),
+                1,
+            ),
+            ("2 @ MAX/2 raw", fp(2), max / 2, 1),
+        ];
+        for (label, size, entry, want) in cases {
+            let (_d, ctx, t) = one_x(true, size, entry, -1);
+            assert_eq!(
+                health_at(&ctx, &t, FixedPoint::ZERO),
+                Some(Health::Adl),
+                "{label}: equity -1e-8 at mark 0"
+            );
+            let p = liq_price(&ctx, &t, 1);
+            assert_eq!(p, Some(FixedPoint::from_raw(want)), "{label}");
+            assert_boundary(&ctx, &t, true, p.unwrap());
+        }
+    }
+
+    /// Cash that only just covers maintenance at entry (10 @ 1000, cash =
+    /// MM = 2.5% × 10000 = 250, UPnL 0): healthy at the entry mark, one raw
+    /// unit worse liquidatable (UPnL −10 raw, MM unchanged after
+    /// truncation). Both sides' price is the entry itself.
+    #[test]
+    fn cross_liquidation_price_is_the_entry_when_cash_only_covers_maintenance() {
+        for long in [true, false] {
+            let (_d, ctx, t) = raw_account(fp(250).raw(), long, fp(10), fp(1_000).raw());
+            let p = liq_price(&ctx, &t, 1);
+            assert_eq!(p, Some(fp(1_000)), "long {long}");
+            assert_boundary(&ctx, &t, long, fp(1_000));
+        }
+    }
+
+    /// 1x short at every scale: healthy at mark 0 (equity 2 × cost basis),
+    /// the price is the highest raw mark with 2 cb − n >= n / 40, i.e.
+    /// ~2 × entry / 1.025 (exact raw values from the truncating formulas),
+    /// always a valued boundary:
+    /// - tiny 1e-8 @ 1 (cb 1 raw): n = 2 raw up to mark 2.99999999, n = 3
+    ///   (equity −1 raw, Adl) from mark 3;
+    /// - normal 10 @ 1000: 20000 − 10P >= P / 4 (raw), P = 1951.21951219;
+    /// - 1 @ MAX/4 raw, 1 @ MAX/2 raw (crossing at 0.9756 MAX, between the
+    ///   entry 2^126 − 1 and its double 2^127 − 2, the last doubling);
+    /// - huge sizes: MAX/2 raw @ 1 (crossing at 1.95121951), MAX raw @ 1
+    ///   raw (cb = MAX / 1e8; healthy at 1 raw, at 2 raw n = 2 cb + 1:
+    ///   Adl);
+    /// - huge cash: 10 @ 1000 with cash MAX − cb (equity MAX at mark 0):
+    ///   crossing at MAX / 10.25.
+    #[test]
+    fn cross_liquidation_price_1x_short_is_a_valued_boundary_at_any_balance() {
+        let max = i128::MAX;
+        // (label, size, raw entry, raw cash above the cost basis, raw price)
+        let cases: [(&str, FixedPoint, i128, i128, i128); 7] = [
+            ("tiny: 1e-8 @ 1", one_raw(), fp(1).raw(), 0, 299_999_999),
+            (
+                "normal: 10 @ 1000",
+                fp(10),
+                fp(1_000).raw(),
+                0,
+                195_121_951_219,
+            ),
+            (
+                "huge entry: 1 @ MAX/4 raw",
+                fp(1),
+                max / 4,
+                0,
+                82_995_699_249_009_381_332_530_392_056_528_832_061,
+            ),
+            (
+                "huge entry: 1 @ MAX/2 raw",
+                fp(1),
+                max / 2,
+                0,
+                165_991_398_498_018_762_665_060_784_113_057_664_123,
+            ),
+            (
+                "huge size: MAX/2 raw @ 1",
+                FixedPoint::from_raw(max / 2),
+                fp(1).raw(),
+                0,
+                195_121_951,
+            ),
+            (
+                "huge size: MAX raw @ 1 raw",
+                FixedPoint::from_raw(max),
+                1,
+                0,
+                1,
+            ),
+            (
+                "huge cash: 10 @ 1000, cash MAX - cb",
+                fp(10),
+                fp(1_000).raw(),
+                max - 2 * fp(10_000).raw(),
+                16_599_139_849_801_876_266_506_078_411_305_766_412,
+            ),
+        ];
+        for (label, size, entry, extra, want) in cases {
+            let (_d, ctx, t) = one_x(false, size, entry, extra);
+            assert_eq!(
+                health_at(&ctx, &t, FixedPoint::ZERO),
+                Some(Health::Healthy),
+                "{label}: healthy at mark 0"
+            );
+            let p = liq_price(&ctx, &t, 1);
+            assert_eq!(p, Some(FixedPoint::from_raw(want)), "{label}");
+            assert_boundary(&ctx, &t, false, p.unwrap());
+        }
+    }
+
+    /// Overflow paths at the limits: `None` (or a valued boundary), never a
+    /// wrong price or a panic.
+    /// - 1x short 1 @ 2^126 raw: equity at mark 0 = 2 × 2^126 = 2^127
+    ///   overflows, so mark 0 is indeterminate and the price is `None`
+    ///   (docs/api/position.md: "`null` when mark 0 overflows"), although
+    ///   the step values it from mark 1 raw on;
+    /// - short 10 @ 1000 with cash MAX: mark 0 overflows likewise (valued
+    ///   from the entry on), `None`;
+    /// - a row no fill can produce, size and entry MAX raw, cost basis MAX
+    ///   (n overflows from mark 1 + 1 raw, so the search starts at an
+    ///   overflowing entry): short cash 0 is healthy at 0 and crosses at
+    ///   mark 0.97560975 (MAX − n >= n / 40), a valued boundary; long cash
+    ///   MAX (1x) has none; long cash MAX − 1 crosses at 1 raw.
+    #[test]
+    fn cross_liquidation_price_1x_overflow_paths_are_none_or_valued() {
+        let max = i128::MAX;
+        let (_d, ctx, t) = one_x(false, fp(1), 1i128 << 126, 0);
+        assert_eq!(
+            health_at(&ctx, &t, FixedPoint::ZERO),
+            None,
+            "mark 0 overflows"
+        );
+        assert_eq!(health_at(&ctx, &t, one_raw()), Some(Health::Healthy));
+        assert_eq!(liq_price(&ctx, &t, 1), None);
+
+        let (_d, ctx, t) = raw_account(max, false, fp(10), fp(1_000).raw());
+        assert_eq!(
+            health_at(&ctx, &t, FixedPoint::ZERO),
+            None,
+            "mark 0 overflows"
+        );
+        assert_eq!(health_at(&ctx, &t, fp(1_000)), Some(Health::Healthy));
+        assert_eq!(liq_price(&ctx, &t, 1), None);
+
+        let row = |cash: i128, long: bool| {
+            let (d, ctx, t) = raw_account(cash, long, fp(1), fp(1).raw());
+            ctx.positions
+                .put_position(&Position {
+                    size: FixedPoint::from_raw(max),
+                    entry_price: FixedPoint::from_raw(max),
+                    cost_basis: FixedPoint::from_raw(max),
+                    ..ctx.positions.get_position(&t, 1).unwrap().unwrap()
+                })
+                .unwrap();
+            (d, ctx, t)
+        };
+        let (_d, ctx, t) = row(0, false);
+        assert_eq!(
+            health_at(&ctx, &t, FixedPoint::from_raw(max)),
+            None,
+            "entry overflows"
+        );
+        assert_eq!(health_at(&ctx, &t, fp(1) + one_raw()), None);
+        let p = liq_price(&ctx, &t, 1);
+        assert_eq!(p, Some(FixedPoint::from_raw(97_560_975)));
+        assert_boundary(&ctx, &t, false, p.unwrap());
+
+        let (_d, ctx, t) = row(max, true);
+        assert_eq!(health_at(&ctx, &t, FixedPoint::ZERO), Some(Health::Healthy));
+        assert_eq!(liq_price(&ctx, &t, 1), None);
+
+        let (_d, ctx, t) = row(max - 1, true);
+        let p = liq_price(&ctx, &t, 1);
+        assert_eq!(p, Some(one_raw()));
+        assert_boundary(&ctx, &t, true, one_raw());
+    }
+
     /// Without a block time the other positions are valued at entry (as
     /// `account_figures`); the shocked market's price is the variable, so
     /// a single long has the same price as with a mark.
