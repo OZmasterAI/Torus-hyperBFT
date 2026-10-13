@@ -6244,6 +6244,216 @@ minute RSS / resting / flush-worker depth / handoff / layer / drop_inline, figur
 `a-soak.py` (section 53, unchanged), `a-cells.py` (digest classes), `a-archive.py`; outputs `series.txt`, `soak.txt`.
 Full outputs (incl. `series.json`, `cells.json`, figure SVGs) in `ozarchy-p3soakje-run/analyst/` on ozarchy.
 
+## 53c. Phase 3 soak with the cancel-share fix: `41a95355` vs step 2 `7b006739`, 600 s per arm, glibc (campaign ozarchy-p3cssoak, 2026-10-13)
+
+**With the cancel-share fix no cancel-all expires, and the minute-6 margin rejections do not appear at all.** On the fixed
+arm, 0 actions were evicted for the nonce window on each of the 3 nodes, and 199,812 of the 199,813 cancel-alls sent were
+executed. On step 2 in the same campaign, 16,168 expired per node, which is section 53's ~18k again. Margin-rejected
+orders: 0 over the whole fixed cell. On step 2 they are 37k/s in minute 6 and 107-134k/s in minutes 7-10. matched/s on
+the fixed arm is at 179-187k/s in minutes 6-10. On step 2 it goes from 209k/s (minutes 1-5) to 144k/s (minutes 6-10).
+**Under glibc, step 2's RSS does not level off with the fix. It grows faster:** the last-5-min slopes are +129 / +178 /
++138 MB/min per node, and all three CIs exclude 0. Step 2 in this pair: +41 / +42 / +85. Against section 53's main the
+Phase 3 delta is **+2.76 GB per node** (minutes 5-10 mean; +3.07 GB at 10 min), vs +1.85 GB for step 2 in this pair.
+**That RAM comparison is not like for like.** The fixed arm carries the full workload for all 10 min: resting orders are
+0.64-0.73 M vs 0.15-0.36 M in minutes 6-10, and the layer per checkpoint is 220-240 MB vs 100-110 MB. The main reference cell (section 53)
+ran the degraded workload. **The margin user behind the minute-6 drop is positions, not open-order reservations.** In every
+soak cell the end-of-run digest shows order margin at <= 0.5% of account value on all 50 sampled senders. Under the old
+cancel order the positions concentrate on low-address senders: their position IM is 74-88% of account value in the lowest
+address quartile vs 6-9% in the highest. With the fix it is 35-39% in every quartile (53c.4). One pair, single cells: the
+expiry and margin results are large and clean, while the RSS and mechanism readings are "consistent with".
+
+Owner queue item 2 (via 18c): the soak pair, cancel-share fix vs step 2, at interval 15 s on both arms, glibc (the build
+allocator), commit tail. The questions: does the fix stop the cancel-all expiry and the book growth, and does step 2's RSS
+then level off under glibc? Nodes: step 2 `7b006739` (`ca388315`, the section 53 binary, `ozarchy-p3q-stage/g2-run`), and
+cs2 = `test/p3-cancel-share` `41a95355` (`2655ab56`, build id `92529c89`). cs2 is `fix/cancel-share-oldest-first`
+`de97682f` merged onto step 2 `7b006739`, 4 commits, `native_pool.rs` only. It was built clean in
+`wt/p3q-cs2-41a95355` -> `~/.cargo-target-p3q-cs2-41a95355` with the p3q flags (frame pointers, line tables, mold;
+`ozarchy-p3cssoak-build.sh` = `ozarchy-p3q-build.sh` + arm key cs2). Bench `05d44313`, harness `218ad251`, tw, Classic,
+300 markets, MAX_IN_FLIGHT 4, budget 900, shared NVMe. Driver `ozarchy-p3cssoak-campaign.sh`: a copy of
+`ozarchy-p3soakje-campaign.sh` with CAMP=X, arm cs2 (knob on, no preload), run dir / prefix `ozarchy-p3cssoak-*`, and a
+preflight chain check (step 2 = ancestor of cs2). Cells 01:38-02:10: w0 (step 2, 60 s, excluded), k1-g2 (step 2, 600 s),
+k1-cs2 (cs2, 600 s), fixed 10 min, no extensions. 42 CHECK OK (incl. knob on 3 nodes, enable line, checkpoints 54-56 / 47-48 per node, glibc with no preload), no CHECK FAIL, no memguard stop, no deaths, host quiet before every cell. k1-cs2 and
+w0 are ACCEPT, AGREE. k1-g2 is rc 2 REJECT on agreement only. This is the known mark-only digest artifact: val2's digest
+took 51.6 s vs 34.3 / 33.6 s, the 5 mark fields differ on 50 accounts, and books, OI and cash are identical. Liveness PASS.
+Comparison cells: section 53's glibc soak (main `219f0c20` = the RAM reference, step 2 `7b006739`), same binaries for step 2.
+
+### 53c.1 Cancel-all expiry (the main result)
+
+| cell | cancel-alls sent | executed (`torus_exec_cancel_all_total` delta, each node) | sent - executed | nonce-expired evictions per node (node logs) | first expiry | bench releases by 70 s timeout |
+|---|---|---|---|---|---|---|
+| step 2, this pair (k1-g2) | 271,266 | 255,098 | 16,168 | 16,168 / 16,168 / 16,168 | bench + 132-133 s | 14,711 |
+| **cs2 (k1-cs2)** | 199,813 | 199,812 | **1** | **0 / 0 / 0** | none | **0** |
+| step 2, section 53 | 272,157 | 253,540 | 18,617 | 18,615 / 18,615 / 18,694 | bench + 134 s | 17,378 |
+| main, section 53 | 263,841 | 245,885 | 17,956 | 17,956 (x3) | bench + 138-139 s | 17,956 |
+
+On the step 2 and main cells, sent - executed equals the evictions, so every evicted action is a cancel-all, as in
+section 47.3. The one cs2 cancel-all not executed is the RPC-refused one (sent 199,813, accepted 199,812). Expiry per
+minute on step 2 (val0, minutes 3-10): 3.1k, 3.3k, 2.7k, 1.6k, 1.2k, 2.0k, 0.7k, 1.5k. On cs2: 0 in every minute on every
+node. Cancel-alls executed per second: cs2 284-413, step 2 375-469. cs2 sends fewer: 34.8% of the mix vs 38.5%. The bench
+is closed-loop, and cs2's senders send fewer actions (953/s vs 1,171/s) consistent with its slower block commits (2.60 vs 3.03 blocks/s, below).
+**Book growth: the fix does not shrink the book. The book is larger with it.** The resting-orders gauge on cs2 is 0.65-0.73
+M per node from minute 3 to 10, with one dip to 0.47 M at minute 7. Step 2 is at 0.26-0.56 M in minutes 2-5, then 0.15-0.36 M
+once the margin rejections start. 18c has withdrawn the book-growth / expiry link. These cells are consistent with that:
+without expiry, the book is still bigger, because placement never collapses.
+
+### 53c.2 RSS per node (VmRSS, mem-samples.txt, 5 s; bench window 602-603 s)
+
+![RSS per node: cs2 vs step 2, with section 53's cells](ozarchy-p3cssoak-figs/fig-rss.png)
+
+*Figure 53c-1: VmRSS per node. cs2 blue, step 2 of this pair red, section 53's step 2 orange dashed and main grey dashed
+(all glibc).*
+
+| cell | node | mean min 2-5 MB | mean min 5-10 MB | change | @10 min MB | peak MB | slope min 2-5 MB/min | slope last 5 min MB/min (95% CI) | vs main (s53) mean min 5-10 / @10 / peak GB |
+|---|---|---|---|---|---|---|---|---|---|
+| main (s53) | val0 | 3,706 | 3,761 | +55 | 3,796 | 3,835 | +19 | +3.3 [-4.2, +10.8] | reference |
+| main (s53) | val1 | 3,879 | 3,943 | +64 | 3,950 | 4,032 | +34 | **+11.1 [+5.5, +16.7]** | reference |
+| main (s53) | val2 | 4,664 | 4,735 | +71 | 4,769 | 4,788 | +54 | **+6.4 [+2.3, +10.5]** | reference |
+| step 2 (s53) | val0 | 5,536 | 5,885 | +349 | 6,070 | 6,070 | +132 | **+63.1 [+14.6, +111.6]** | +2.07 / +2.22 / +2.18 |
+| step 2 (s53) | val1 | 5,371 | 5,700 | +329 | 5,934 | 5,934 | +120 | **+67.3 [+47.1, +87.4]** | +1.72 / +1.94 / +1.86 |
+| step 2 (s53) | val2 | 6,064 | 6,428 | +364 | 6,442 | 6,660 | +185 | **+39.8 [+19.1, +60.5]** | +1.65 / +1.63 / +1.83 |
+| step 2 (this pair) | val0 | 5,484 | 5,769 | +285 | 5,833 | 6,009 | +103 | **+40.8 [+33.7, +48.0]** | +1.96 / +1.99 / +2.12 |
+| step 2 (this pair) | val1 | 5,345 | 5,531 | +186 | 5,696 | 5,750 | +145 | **+42.0 [+16.9, +67.1]** | +1.55 / +1.71 / +1.68 |
+| step 2 (this pair) | val2 | 6,389 | 6,815 | +426 | 6,929 | 7,011 | +134 | **+84.5 [+69.5, +99.5]** | +2.03 / +2.11 / +2.17 |
+| **cs2** | val0 | 5,995 | 6,540 | **+545** | 6,895 | 6,969 | +198 | **+129.3 [+112.9, +145.7]** | **+2.71 / +3.03 / +3.06** |
+| **cs2** | val1 | 5,848 | 6,719 | **+871** | 7,126 | 7,193 | +361 | **+178.0 [+160.0, +196.1]** | **+2.71 / +3.10 / +3.09** |
+| **cs2** | val2 | 6,892 | 7,650 | **+757** | 7,940 | 8,137 | +359 | **+137.6 [+121.8, +153.5]** | **+2.85 / +3.10 / +3.27** |
+| **Phase 3 delta vs main (s53), mean of 3** | step 2 s53 | | | | | | | | +1.81 / +1.93 / +1.96 |
+| | step 2 this pair | | | | | | | | +1.85 / +1.93 / +1.99 |
+| | **cs2** | | | | | | | | **+2.76 / +3.07 / +3.14** |
+
+Slopes: OLS over the 5 s samples. The CI uses an AR(1) effective n, as in sections 53 / 53b (`a-series.py`). cs2 minus
+step 2 (this pair): +0.75 / +1.16 / +0.82 GB (minutes 5-10 mean), +1.04 / +1.40 / +0.99 GB at 10 min. Step 2 in this pair
+reproduces section 53's step 2 closely (delta +1.85 vs +1.81 GB, expiry 16.2k vs 18.6k, margin drop from minute 6). The
+replication supports both cells. On the RAM rule (levels off, delta <= ~1 GB/node vs main's glibc soak), cs2 fails on both
+counts. But the reference is main **with** the expiry and the margin collapse. The like-for-like control is main + the
+fix, and that binary already exists: `de97682f`, `ozarchy-p3q-stage/cs-run`, md5 `e4b34063`.
+
+### 53c.3 Per minute per node (val0; val1 / val2 are the same within a few %, all in `series.txt`)
+
+![per node per minute: expiry, cancel-alls, margin rejections, matched/s, book, pool, select time, layer, flush queue](ozarchy-p3cssoak-figs/fig-node.png)
+
+*Figure 53c-2: per node (columns), per minute: nonce-expired evictions, cancel-alls executed/s, margin-rejected orders/s,
+matched/s, resting orders, cancel-all index entries, mempool size, block-build select ms, layer MB per checkpoint and
+flush-worker depth. Same colours as figure 53c-1.*
+
+Cells: RSS MB at minute end / matched/s / expired / margin-rejected orders/s / resting orders M (minute end) / layer MB
+per checkpoint / drop_inline in the minute / mempool (mean) / select ms per build.
+
+| min | step 2 (this pair), val0 | cs2, val0 |
+|---|---|---|
+| 1 | 4,519 / 205k / 0 / 0 / 0.09 / 128 / 283 / 3.8k / 14.9 | 4,768 / 201k / 0 / 0 / 0.24 / 145 / 246 / 4.6k / 13.0 |
+| 2 | 5,202 / 227k / 0 / 0 / 0.56 / 140 / 132 / 7.3k / 21.3 | 5,528 / 202k / 0 / 0 / 0.30 / 191 / 188 / 6.7k / 17.6 |
+| 3 | 5,479 / 216k / 3,119 / 0 / 0.48 / 122 / 179 / 5.4k / 21.0 | 5,991 / 215k / 0 / 0 / 0.73 / 186 / 126 / 5.9k / 23.1 |
+| 4 | 5,540 / 194k / 3,346 / 0 / 0.26 / 97 / 140 / 5.3k / 20.3 | 6,065 / 191k / 0 / 0 / 0.72 / 234 / 156 / 6.0k / 22.0 |
+| 5 | 5,630 / 204k / 2,666 / 0 / 0.43 / 112 / 129 / 5.9k / 20.4 | 6,242 / 187k / 0 / 0 / 0.71 / 224 / 119 / 6.0k / 20.3 |
+| 6 | 5,685 / 152k / 1,629 / 37.5k / 0.15 / 92 / 146 / 5.5k / 22.1 | 6,308 / 182k / 0 / 0 / 0.64 / 237 / 121 / 6.0k / 20.4 |
+| 7 | 5,780 / 150k / 1,167 / 107.1k / 0.36 / 101 / 176 / 6.0k / 20.4 | 6,430 / 179k / 0 / 0 / 0.47 / 226 / 124 / 6.3k / 20.2 |
+| 8 | 5,822 / 144k / 2,035 / 120.2k / 0.24 / 98 / 131 / 5.5k / 20.9 | 6,617 / 187k / 0 / 0 / 0.69 / 219 / 119 / 6.3k / 22.1 |
+| 9 | 5,800 / 134k / 749 / 133.6k / 0.23 / 88 / 175 / 5.5k / 20.8 | 6,650 / 180k / 0 / 0 / 0.65 / 236 / 125 / 5.9k / 22.3 |
+| 10 | 5,833 / 140k / 1,457 / 132.7k / 0.16 / 108 / 186 / 5.2k / 24.6 | 6,895 / 183k / 0 / 0 / 0.69 / 238 / 123 / 5.9k / 20.4 |
+
+* **Flush-worker depth and handoff:** 0.0-0.1 blocks and 0.01 ms per block on both arms, every minute, every node (cs2 0.5 in
+  minute 1). No backlog of blocks, and so none of their books, is held in the flush queue on either arm.
+* **Layer per checkpoint:** cs2 186-238 MB from minute 2, mean 212 MB (early 191-195, late 229-231 MB per node). Step 2: 88-141
+  MB, mean 108-112 MB. cs2 checkpoints 42-43 times per node in the window (one per ~14 s), step 2 48-51 times. Settle wait per
+  native block: cs2 29-33 ms early, 28-44 ms late. Step 2: 25-28 ms early, 17-23 ms late. `layer_shared` 0 on both arms.
+  drop_inline: cs2 ~120 per minute, step 2 130-186.
+* **Pool and selection:** mempool 6.0-6.1k (cs2) vs 5.6-5.7k (step 2), means over minutes 2-10. Block-build select time per
+  build (`torus_block_build_select_seconds`, proposer builds only, minutes 2-10): cs2 20.8 / 24.5 / 19.4 ms, step 2 21.3 /
+  23.5 / 19.6 ms per node. The oldest-first cancel merge shows no selection cost at this pool size.
+* **Throughput (single cells, no CI):** matched/s whole window cs2 190,776 vs step 2 176,544 (+8.1%). Minutes 1-5: 199k vs
+  209k (-4.7%). Minutes 6-10: 182k vs 144k. Native blocks/s 2.60 vs 3.03 (minutes 6-10: 2.23 vs 2.99). Exec per block p50
+  388 vs 327 ms, p99 640 vs 596 ms. Fills per processed action: cs2 187-214 throughout. Step 2: 184-202 in minutes 1-5, then 108-144 from minute 6. Node CPU-s/1M (cpu-ticks): 24.46 vs 27.78. Step 2 also spends CPU on ~32M margin-rejected orders that never fill.
+  cs2's slower blocks carry more fills (bigger books, no rejects), so it is not a like-for-like throughput A/B.
+* **What RSS tracks on cs2:** resting orders and layer size are flat from minute ~3 (0.65-0.73 M, 220-240 MB), yet RSS keeps
+  rising +130-180 MB/min. That matches section 53b's glibc pattern (flat data, rising RSS), now with layers ~2x larger.
+  It is consistent with glibc retention scaling with the layer size, not proof. There is no live-layer-bytes or read-view
+  gauge (53b.2). A cs2 cell under jemalloc would separate retention from data growth.
+
+### 53c.4 The minute-6 margin rejections: by sender and by reason (18c request)
+
+**What the data records, and what it does not.**
+
+* Node: `torus_orders_rejected_margin_total` is one chain-wide counter. At `41a95355` it is incremented by
+  `RejectReason::count` (`crates/torus-bridge/src/native_executor.rs:842`, phase-2 prepare path, reject built at
+  `:7218-7223`, counted at `:7336`) and at the serial path `:9423`. It carries no reason split and no sender. The reject
+  text "insufficient margin: need N, have F (account)" (`account_check`, `:8618-8621`) goes only into the action's result,
+  not into a log or a metric. Its `have` is already net of the reservations: `free = bal.available + pos_net` (`:9412`;
+  `bal.available + pn + credit - st.committed` at `:7215`), where `available` excludes the order margin and `pos_net` = UPnL
+  - position IM. So even the result text cannot split the cause. The node logs carry no per-reject line.
+* Bench: commit-tail mode releases in-flight slots from block bodies, not action results. It scrapes only the chain-wide
+  counter (`tools/bench-throughput/src/main.rs:2936`). There is no per-sender reject count.
+* Harness: the state digest (`tools/matched-bench/digest-node.sh:66`, `torus_getBalances`) samples 50 of the 5,000 senders,
+  once, after the bench and the drain. So **no per-minute and no per-sender reject split exists for minutes 5 vs 7**.
+  Per minute there is only the chain-wide count, identical on the 3 nodes: step 2 0 (minute 5) -> 37.5k/s (6) ->
+  107.1k/s (7) -> 133k/s (10); cs2 0 in every minute.
+
+**What the end-of-run digest does show (50 senders, val0; `a-margin.py`).** Per account, `torus-rpc` `account.rs` gives
+`native_balance = available + order_margin`, `cash_balance = available`, and `total_margin_used = order_margin + position
+IM`. So order margin = nativeBalance - cashBalance, and position IM = totalMarginUsed - order margin.
+
+| cell | free margin p10 / median (% of account value) | order margin median / max | position IM median / max | senders < 5% free | ... would be >= 5% free without their reservations | position IM by address quartile (low -> high) |
+|---|---|---|---|---|---|---|
+| main s53 (glibc) | 23.0 / 85.3% | 0.00 / 0.17% | 16 / 100% | 2 | 0 | 75 / 31 / 8 / 6% |
+| step 2 s53 (glibc) | 16.6 / 82.4% | 0.00 / 0.21% | 19 / 100% | 5 | 0 | 79 / 30 / 9 / 6% |
+| main 53b (jemalloc) | 15.2 / 81.1% | 0.00 / 0.46% | 20 / 100% | 5 | 0 | 85 / 37 / 14 / 9% |
+| step 2 53b (jemalloc) | 1.4 / 74.8% | 0.00 / 0.28% | 28 / 100% | 6 | 0 | 88 / 41 / 13 / 8% |
+| step 2, this pair | 25.3 / 79.3% | 0.00 / 0.14% | 22 / 100% | 2 | 0 | 74 / 34 / 11 / 6% |
+| **cs2** | **61.0 / 63.5%** | 0.00 / 0.18% | **37 / 40%** | **0** | 0 | **39 / 37 / 36 / 35%** |
+
+* **Reason: positions.** The open-order reservation is <= 0.5% of account value on every sampled sender in all six soak
+  cells. Every sender below 5% free margin sits at 96-100% position IM, and none would clear 5% without its reservations. So
+  margin is used up by positions, not by reservations that an expired cancel-all failed to release. Caveats: this is the
+  state after the drain, not minutes 5 / 7, and 50 senders. But the same 50 addresses are sampled in every cell, and the
+  pattern is the same in all five cells with the drop.
+* **By sender: low addresses.** The exhausted senders are the lowest addresses in the sample (address / 2^160 = 0.04-0.17).
+  Under the old cancel share (cancels walked in sender address order, section 47.3 / `de97682f`), position IM falls
+  steeply with the address: 74-88% in the lowest quartile, 6-9% in the highest. With oldest-first cancels it is flat at
+  35-39%. A mechanism consistent with this, not proven: low-address senders' cancel-alls always commit, so they cycle
+  their 4 in-flight slots at full rate. High-address senders' cancel-alls wait and then expire, and each expired one holds
+  a slot for up to 70 s. So order flow, fills and one-way positions (the econ workload has no closing fills)
+  concentrate on the low addresses. Those reach full IM around minute 5-6. After that their fast-cycling orders are
+  rejected, which is 35-43% of all orders in minutes 7-10. With the fix, the same position build-up is spread over all 5,000 senders: 37%
+  median IM at 10 min, and nobody is exhausted. If the build-up is linear, the uniform book would reach exhaustion much
+  later (~25-30 min). That is an extrapolation, not measured.
+* **Answer to 18c's partial test:** fewer cancel-alls expired (0), and the drop did **not** stay. Read naively, that points
+  at reservations. But the digest shows the reservations are ~0 and the margin is position IM. So the cause is the old
+  cancel order's unfairness concentrating positions, not reservations held by expired cancel-alls.
+
+**The smallest instrumentation that would settle minutes 5 vs 7 directly** (no consensus or format change):
+
+1. Node, reason split (two counters): in the two margin-reject arms (`native_executor.rs:7218-7223`, phase-2 prepare, and
+   `:9418-9425`, serial path), on the reject path only, re-run `account_check` with `free + bal.order_margin` (phase 2:
+   also `+ st.committed`, the same block's earlier orders). If it passes, count
+   `torus_orders_rejected_margin_reserved_total`; otherwise `torus_orders_rejected_margin_position_total`. Register both
+   next to `orders_rejected_margin` (`crates/torus-telemetry/src/lib.rs:135`, `:1218-1222`, `:2623`), and add them to the
+   sampler's `WIDE_COLS` (`tools/matched-bench/run-cell.sh:781`) for per-second series.
+2. Per sender, harness only: run the digest's `torus_getBalances` call (`digest-node.sh:66`) for all 5,000 senders at bench
+   t = 300 s and 420 s, into `balances-t300.jsonl` / `-t420.jsonl`. That gives position IM vs order margin per sender at
+   minutes 5 and 7. Per-sender reject counts would also need a bench-side read of the action results, or a sender label.
+   A Prometheus label for 5,000 senders is not advisable.
+
+### 53c.5 Verdict
+
+* **Expiry: fixed in this soak.** 0 cancel-all expiries on 3 of 3 nodes over 600 s (step 2: 16,168 per node), and all
+  sent cancel-alls but the one RPC-refused were executed. One cell. The effect is large and binary.
+* **Minute-6 drop: gone with the fix in this soak.** 0 margin rejections and matched/s 179-187k/s in minutes 6-10. The margin
+  user behind the drop is positions, concentrated on low-address senders by the old cancel order. Reservations are ruled out
+  for the 50 sampled senders at the end of the run. The per-minute / per-sender split needs the instrumentation above.
+* **RSS under glibc with the fix: does not level off in 10 min.** The slopes are +129 / +178 / +138 MB/min (CIs exclude 0),
+  and the delta vs section 53's main is +2.76 GB per node (minutes 5-10 mean; +3.07 at 10 min, +3.14 peak). The owner's rule
+  (levels off, <= ~1 GB/node) is **not met against that reference**. The comparison is confounded, though: the fixed arm runs
+  ~2x the resting orders and ~2x the layer size for the whole 10 min, while main's reference cell collapsed to the margin-
+  rejected workload. Next measurement that would settle it (not started; merge-wait): a glibc soak pair cs2 `41a95355` vs
+  main + fix `de97682f` (`cs-run`, already staged). With a cs2 jemalloc cell, that separates retention from data.
+
+Analysis (`tools/ozarchy-p3cssoak-tools/analyst/`): `a-series.py` (copy of 53b's, plus per node per minute expiry from each
+node log, cancel-alls executed, margin-rejected and placed orders/s, mempool, select ms, and the sent / executed cancel-all
+balance; figures SVG -> PNG via `rsvg-convert`), `a-margin.py` (digest margin split and address quartiles), `a-cells.py`
+(53b's, digest classes, throughput), `a-archive.py`. Outputs `series.txt`, `margin.txt`. Full outputs (incl. `series.json`,
+`cells.json`, SVGs) are in `ozarchy-p3cssoak-run/analyst/` on ozarchy. Driver and build script:
+`tools/ozarchy-p3cssoak-tools/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -6328,6 +6538,14 @@ Full outputs (incl. `series.json`, `cells.json`, figure SVGs) in `ozarchy-p3soak
   size and resting orders do not grow; RSS tracks neither. The minute-6 matched/s drop is margin rejections in the econ
   workload (105-155k orders/s from minute 6, all four cells), not the generator's rate, the node or the cancel-all expiry
   (which starts at minute 3). Open: positions vs open-order reservations as the margin user (per-sender split).
+- **Phase 3 soak with the cancel-share fix** (section 53c, plan review log row 60). cs2 `41a95355` (= `de97682f` on step 2)
+  vs step 2 `7b006739`, glibc, 600 s each: cancel-all expiry 0 per node (step 2 16,168), margin rejections 0 for the whole
+  cell (step 2 107-134k/s from minute 7), matched/s 179-187k/s in minutes 6-10 (step 2 144k). The margin user is position
+  IM, not reservations (order margin <= 0.5% of account value on all 50 digest senders in six soak cells), concentrated on
+  low-address senders by the old address-ordered cancel share. **Open:** step 2 + fix RSS under glibc does not level off
+  (+129 to +178 MB/min, delta +2.76 GB vs section 53's main), but the reference is confounded (main ran the collapsed
+  workload). Next: glibc soak cs2 vs main + fix `de97682f` (staged), plus a jemalloc cs2 cell. Per-minute reason split
+  needs the counters in 53c.4.
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
   trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
   it is decided again by a tw vs tw + WAL compression A/B after Phase 3. Section 40 (n = 4, vs b

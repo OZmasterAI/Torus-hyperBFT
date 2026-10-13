@@ -4429,3 +4429,23 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3soakje-300m-k1-s2/val1.log.gz' \
   '/home/oz/bench-results-matched/ozarchy-p3soakje-300m-k1-s2/val2.log.gz'
 ```
+
+### `p3cssoak` (A 0 KiB, B 89.1 MiB; dirs: `ozarchy-p3cssoak-300m-w0`, `ozarchy-p3cssoak-300m-k1-g2`, `ozarchy-p3cssoak-300m-k1-cs2`, `ozarchy-p3cssoak-run`)
+
+The cells' `summary.json`, `mem-samples.txt`, `ckpt-samples.txt`, `sampler.csv`, `cpu-ticks.txt`, `cpu.csv`, `bench.log`, `val0-2.log.gz` (per node expiry), `metrics-*-val*.txt`, `state-digest-val*.txt`, `digest-accounts.txt`, `agreement.jsonl`, `run.log` and `ozarchy-p3cssoak-run/analyst/` are what section 53c is built on (keep). Tier A: none (the binaries are in `ozarchy-p3q-stage`: `g2-run`, `cs2`, `cs2-run`; cs2 is also needed for the next soak). Section 53c's `a-series.py` also reads the p3soak cells' `val1.log.gz` / `val2.log.gz` (Tier B in the p3soak block) for section 53's per node expiry; deleting them keeps the numbers in `series.txt` but not the re-derivation. Outside this tree: the worktree `/home/oz/projects/wt/p3q-cs2-41a95355` and the target dir `~/.cargo-target-p3q-cs2-41a95355` (5.7 GiB; remove with `git worktree remove` and a literal-path `rm -r`).
+
+Tier B, 89.1 MiB, 10 files:
+
+```
+rm -- \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-w0/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-w0/sampler.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-w0/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-w0/val0.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-w0/val1.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-w0/val2.log.gz' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-k1-g2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-k1-g2/tasks.txt' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-k1-cs2/buckets.csv' \
+  '/home/oz/bench-results-matched/ozarchy-p3cssoak-300m-k1-cs2/tasks.txt'
+```
