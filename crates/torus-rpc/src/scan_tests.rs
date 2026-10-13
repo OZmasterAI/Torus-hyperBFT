@@ -480,7 +480,15 @@ async fn proposals_stop_at_the_scan_budget() {
             .len(),
         100
     );
-    assert_eq!(examined(&s), 600);
+    // Each proposal row costs one row per started 128 B (round 2), twice.
+    let per_pass: usize =
+        torus_state::StateBackend::iterate_cf(&state, CF_GOVERNANCE_PROPOSALS, None)
+            .unwrap()
+            .iter()
+            .map(|(_, v)| packed_rows(v.len()))
+            .sum();
+    assert!(per_pass >= 300, "{per_pass}");
+    assert_eq!(examined(&s), 2 * per_pass as u64);
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +855,10 @@ fn order_rows(
     rows.into_iter().map(|(k, v)| (cf, k, v)).collect()
 }
 
+/// (market of the corrupt row, its new length from its old one, markets
+/// queried).
+type CorruptRowCase = (MarketId, fn(usize) -> usize, &'static [Option<MarketId>]);
+
 /// [P2] An order row that does not decode is the `BookCorrupt` error the
 /// unbounded reader (`book_reader::read_open_orders`) returns, whoever's row
 /// it is: rows are validated BEFORE the trader filter, never skipped (a
@@ -859,8 +871,7 @@ async fn a_truncated_order_row_is_book_corrupt_not_skipped() {
             BookMode::OrderRows => BookLayout::OrderRows,
             _ => BookLayout::LevelAuthority,
         };
-        // (market of the corrupt row, its new length, markets queried)
-        let cases: [(MarketId, fn(usize) -> usize, &[Option<MarketId>]); 2] = [
+        let cases: [CorruptRowCase; 2] = [
             // The maker's own row cut to 30 B (the trader bytes are gone).
             (1, |_| 30, &[Some(1), None]),
             // Another trader's row cut by one byte (its trader is readable).

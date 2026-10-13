@@ -844,17 +844,30 @@ pub fn set_latest_height(state: &RpcState, height: u64) {
 /// Scan CF_NATIVE_TRADES for all trades at a given block height across all markets.
 /// Serves `torus_getBlockTrades` (the streams are fed from execution, s80).
 pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_json::Value> {
+    scan_trades_for_block_bounded(state, block_height, &mut scan::ScanBudget::unlimited())
+        .expect("an unlimited budget is never exceeded")
+}
+
+/// [`scan_trades_for_block`] charged to `budget` (R24): every market row
+/// visited is one row (an empty block still seeks every market), and every
+/// trade row of the block is charged by its size before it is decoded. Over
+/// the budget = `ScanLimitExceeded`; under it, the same trades.
+pub(crate) fn scan_trades_for_block_bounded(
+    state: &StateDb,
+    block_height: u64,
+    budget: &mut scan::ScanBudget,
+) -> Result<Vec<serde_json::Value>, error::RpcError> {
     use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_TRADES};
     use torus_state::trade_rows::{decode_trade_row, trade_key};
 
     let db = state.inner();
     let market_cf = match db.cf_handle(CF_NATIVE_MARKETS) {
         Some(cf) => cf,
-        None => return vec![],
+        None => return Ok(vec![]),
     };
     let trade_cf = match db.cf_handle(CF_NATIVE_TRADES) {
         Some(cf) => cf,
-        None => return vec![],
+        None => return Ok(vec![]),
     };
 
     let mut trades = Vec::new();
@@ -865,6 +878,7 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
             Ok(kv) => kv,
             Err(_) => continue,
         };
+        budget.step()?;
         let Ok(market_bytes) = <[u8; 8]>::try_from(&market_key[..]) else {
             continue;
         };
@@ -886,6 +900,7 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
             if key.len() < 16 || key[..16] != start_key[..16] {
                 break;
             }
+            budget.step_n(scan::packed_rows(value.len()))?;
             // Skip an undecodable row (e.g. a leftover old-format 20-byte key).
             if key.len() != start_key.len() {
                 continue;
@@ -907,7 +922,7 @@ pub fn scan_trades_for_block(state: &StateDb, block_height: u64) -> Vec<serde_js
         }
     }
 
-    trades
+    Ok(trades)
 }
 
 #[cfg(test)]

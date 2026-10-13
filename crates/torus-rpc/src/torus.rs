@@ -25,8 +25,8 @@ use torus_economics::types::{
 };
 use torus_economics::{lerp_bps, PermanentStakeInfo};
 use torus_state::cf::{
-    CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES, CF_STAKING_PERMANENT,
+    CF_BLOCK_ACTION_STATUS, CF_BLOCK_BODIES, CF_NATIVE_MARKETS, CF_NATIVE_TRADES,
+    CF_NATIVE_USER_TRADES, CF_STAKING_PERMANENT,
 };
 use torus_state::trade_rows::{
     decode_trade_row, decode_user_row, parse_trade_key, parse_user_trade_key, trade_key,
@@ -1228,11 +1228,15 @@ impl TorusApiServer for RpcState {
         let iter = db.iterator_cf(cf, IteratorMode::Start);
         let mut markets = Vec::new();
         let mut scanned = 0usize;
+        // R24: every market row visited, the ones before `offset` included,
+        // is charged to the scan budget (there is no seekable page start).
+        let mut budget = self.scan_budget();
 
         for item in iter {
             let (key, value) = item
                 .map_err(|e| RpcError::Internal(format!("rocksdb: {e}")))
                 .map_err(ErrorObjectOwned::from)?;
+            budget.step().map_err(ErrorObjectOwned::from)?;
             if key.len() != 8 {
                 continue;
             }
@@ -1792,6 +1796,8 @@ impl TorusApiServer for RpcState {
     async fn get_block_trades(&self, block_number: u64) -> RpcResult<Vec<RpcTrade>> {
         // D13: a block below the trade cutoff is pruned, not empty. The scan
         // uses one iterator per market, so it must not overlap a pass.
+        // R24: every market row visited (an empty block still seeks every
+        // market) and every trade row is charged to the scan budget.
         let trades_json = self.with_trade_floor(|floor| {
             if block_number < floor {
                 return Err(RpcError::DataPruned {
@@ -1799,7 +1805,8 @@ impl TorusApiServer for RpcState {
                 }
                 .into());
             }
-            Ok(crate::scan_trades_for_block(&self.state, block_number))
+            crate::scan_trades_for_block_bounded(&self.state, block_number, &mut self.scan_budget())
+                .map_err(ErrorObjectOwned::from)
         })?;
         let mut trades = Vec::with_capacity(trades_json.len());
         for t in trades_json {
@@ -1999,20 +2006,24 @@ impl TorusApiServer for RpcState {
         // in the meta row's `ltp_tag` / `ltp_raw` suffix — reading only the
         // classic blob key reported 0 for every traded market on a mode-1/2
         // node.
-        let layout = book_layout(&self.state, &mut self.scan_budget())?;
+        // R24: one budget for the whole request: the layout, then the meta
+        // row (row layouts, one read) or the classic blob, charged by its
+        // size BEFORE it is decoded (as `getOrderBook` charges it).
+        let mut budget = self.scan_budget();
+        let layout = book_layout(&self.state, &mut budget)?;
         let last_trade_price = if layout.is_rows() {
+            budget.step().map_err(ErrorObjectOwned::from)?;
             book_reader::read_last_trade_price(&self.state, mid, layout)
                 .map_err(book_read_err)?
                 .unwrap_or(FixedPoint::ZERO)
         } else {
-            match self
-                .state
-                .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &mid.to_be_bytes())
-            {
+            match scan::classic_blob(&self.state, mid, &mut budget) {
                 Ok(Some(data)) => OrderBook::try_from_slice(&data)
                     .ok()
                     .and_then(|book| book.last_trade_price())
                     .unwrap_or(FixedPoint::ZERO),
+                Err(e @ RpcError::ScanLimitExceeded { .. }) => return Err(e.into()),
+                // A read or decode failure reports 0, as before.
                 _ => FixedPoint::ZERO,
             }
         };

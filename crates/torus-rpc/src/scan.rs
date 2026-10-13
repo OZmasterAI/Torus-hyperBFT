@@ -83,6 +83,15 @@ impl ScanBudget {
         Ok(())
     }
 
+    /// No limit, not reported (a library caller outside a request).
+    pub(crate) fn unlimited() -> Self {
+        Self {
+            max: usize::MAX,
+            examined: 0,
+            sink: None,
+        }
+    }
+
     /// Rows examined so far.
     #[cfg(test)]
     pub(crate) fn examined(&self) -> usize {
@@ -360,8 +369,8 @@ fn for_each_classic_book(
 }
 
 /// `trader`'s resting orders of one row-layout market, in order id order.
-/// Rows of other traders are skipped by the trader bytes at a fixed offset
-/// of every order row, without decoding them.
+/// Every order row is decoded and validated (a corrupt row is `BookCorrupt`,
+/// whoever's it is), then filtered by trader.
 fn row_market_orders(
     state: &StateDb,
     trader: &Address,
@@ -401,17 +410,20 @@ fn row_market_orders(
             }
             return Ok(GO);
         }
-        if OrderBook::order_row_trader(row) != Some(trader.as_slice()) {
-            return Ok(GO);
-        }
-        let (_, order) = OrderBook::decode_order_row(row)
-            .map_err(|e| internal(format!("market {mid}: book order row: {e}")))?;
+        // Every row is decoded and checked BEFORE the trader filter, as
+        // `book_reader::read_open_orders` does: a corrupt row of any trader
+        // is the same `BookCorrupt` error, never silently skipped.
+        let (_, order) = OrderBook::decode_order_row(row).map_err(|e| {
+            core(CoreError::BookCorrupt(format!(
+                "market {mid}: book order row: {e}"
+            )))
+        })?;
         let key_id = u128::from_be_bytes(key[9..25].try_into().expect("25-byte order row key"));
         if key_id != order.id {
-            return Err(internal(format!(
+            return Err(core(CoreError::BookCorrupt(format!(
                 "market {mid}: {cf} row key id {key_id} != payload id {} (corrupt row store)",
                 order.id
-            )));
+            ))));
         }
         if order.trader != *trader {
             return Ok(GO);
@@ -683,6 +695,8 @@ pub(crate) fn open_interest(
 }
 
 /// `torus_getProposals`: every proposal (`status` = only those), id order.
+/// A proposal row costs one row per started 128 B (the row itself
+/// included), charged before it is decoded: its size is the work.
 pub(crate) fn proposals(
     state: &StateDb,
     status: Option<ProposalStatus>,
@@ -695,10 +709,12 @@ pub(crate) fn proposals(
         CF_GOVERNANCE_PROPOSALS,
         &[],
         b,
-        |k, v, _| {
+        |k, v, b| {
             if k.len() != 8 {
                 return Ok(GO);
             }
+            // The row step is already charged.
+            b.step_n(packed_rows(v.len()) - 1)?;
             let p = Proposal::try_from_slice(v)
                 .map_err(|e| internal(format!("borsh decode proposal: {e}")))?;
             if status.as_ref().is_none_or(|s| p.status == *s) {
