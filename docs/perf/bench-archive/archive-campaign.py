@@ -26,7 +26,11 @@ WHAT IT WRITES (mechanical part)
      *.txt outputs (not archive-*.txt, not json) and the run dir's own *.txt, all under analyst/ (prefixed <sub>- if
      the campaign has several run dirs), md5s-all.txt from ozarchy-<camp>-build/md5s-all.txt or md5s.txt. [tools]
      in the meta: exclude = globs left out (path in the tools dir, file name in analyst/), run_exclude = globs (file
-     name) for the run dir's own *.txt, extra = [[src, dst], ...] copied in addition (src relative to --bench-root).
+     name) for the run dir's own *.txt, extra = [[src, dst], ...] copied in addition (src relative to --bench-root),
+     strip_trailing = globs (path in the tools copy, e.g. "analyst/perf-report-*.txt") of text files whose blanks at
+     line ends and blank lines at the end are stripped when copied (perf report headers carry ~1 KB of blanks, which
+     `git diff --check` flags); a smoke compare against such a file strips its got side the same way. Unlisted
+     files are copied byte for byte (check t names the ones with trailing blanks).
   2. INDEX.md: the "Updated" paragraph (after the last one) and one row per dir in sorted position; cells.md: the
      campaign section (before "## action-results:"); DELETABLE.md: the campaign block at the end (Tier A / Tier B
      rm lists with live sizes, outside-tree block). Rows come from each cell's summary.json, node-environ-trie.txt,
@@ -51,7 +55,8 @@ WARNS ("WARNING (x) ...", exit 2 with --strict, nothing written then): (a) summa
   writes them; (c) deletable / outside-tree paths that do not exist, kept files that are in an rm list or in no
   cell; (d) results-doc heading missing or naming another campaign, plan row missing or not citing the section;
   (x) cell rows that differ from the analyst's archive-*-<camp>.txt; (m) meta gaps; (s) no [[smoke]] in the meta (the
-  archived analysis was not test-run; older campaigns still archive, --strict refuses).
+  archived analysis was not test-run; older campaigns still archive, --strict refuses); (t) tools files with blanks at
+  line ends or blank lines at the end that [tools] strip_trailing does not cover (`git diff --check` would flag them).
 
 SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as archived)
   Before writing, the script copies the staged tools tree (exactly what it would write to tools/ozarchy-<camp>-tools/)
@@ -1122,9 +1127,10 @@ def smoke_same(a, b, tol):
     return True
 
 
-def run_smoke(c, specs, staged):
+def run_smoke(c, specs, staged, stripped=frozenset()):
     """Run the declared analyst commands from a temp copy of the staged tools tree, against the real cells under the
-    bench root, and diff their output with the archived files in the same copy. -> (ok, total, errors)."""
+    bench root, and diff their output with the archived files in the same copy. -> (ok, total, errors).
+    stripped: tools-copy paths staged through strip_trailing; their got side is stripped the same way."""
     import signal
     import tempfile
 
@@ -1211,6 +1217,8 @@ def run_smoke(c, specs, staged):
                     bad = True
                     continue
                 want = want.decode(errors="replace") if isinstance(want, bytes) else want
+                if os.path.normpath(cm["want"]) in stripped:
+                    got = strip_trailing(got.encode()).decode(errors="replace")
                 want_l, got_l = smoke_lines(want, cm), smoke_lines(got, cm)
                 if not want_l:
                     errors.append(
@@ -1250,6 +1258,20 @@ def run_smoke(c, specs, staged):
             if not bad:
                 ok += 1
     return ok, len(specs), errors
+
+
+TRAILING_RE = re.compile(rb"[ \t]+(?=\n|\Z)")
+
+
+def strip_trailing(data):
+    """Bytes without what `git diff --check` flags: blanks at line ends and blank lines at the end of the file."""
+    data = TRAILING_RE.sub(b"", data)
+    body = data.rstrip(b"\n")
+    return body + b"\n" if body and data.endswith(b"\n") else body
+
+
+def has_trailing(data):
+    return bool(TRAILING_RE.search(data)) or data.endswith(b"\n\n") or data == b"\n"
 
 
 def udiff(old, new, label, new_file=False):
@@ -1580,7 +1602,7 @@ def main(argv=None):
             raise Fatal("meta camp %r does not match %r" % (meta.get("camp"), a.camp))
         if "section" not in meta:
             raise Fatal("meta has no section")
-        for key in ("exclude", "run_exclude"):
+        for key in ("exclude", "run_exclude", "strip_trailing"):
             v = (meta.get("tools") or {}).get(key, [])
             if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
                 raise Fatal("[tools] %s must be a list of glob strings, not %r" % (key, v))
@@ -1635,6 +1657,8 @@ def main(argv=None):
         if md5:
             sources.append((md5, "md5s-all.txt", rel_tools + "/md5s-all.txt"))
         files = []
+        strip_globs = (meta.get("tools") or {}).get("strip_trailing", [])
+        stripped, blanks = set(), []
         for src, dst, label in sources:
             try:
                 with open(src, "rb") as f:
@@ -1642,7 +1666,18 @@ def main(argv=None):
                 mode = 0o644 if src == md5 else stat.S_IMODE(os.stat(src).st_mode)
             except OSError as e:
                 raise Fatal("tools source %s: %s (nothing written)" % (src, e.strerror or e)) from e
+            # text only (no NUL byte); e.g. perf report column headers padded with ~1 KB of blanks
+            if b"\0" not in data and has_trailing(data):
+                if any(fnmatch.fnmatch(dst, g_) for g_ in strip_globs):
+                    data = strip_trailing(data)
+                    stripped.add(os.path.normpath(dst))
+                else:
+                    blanks.append(dst)
             files.append((os.path.join(tools_dir, dst), label, data, mode))
+        if blanks:
+            c.warn.append(("t", "tools files with trailing blanks or blank lines at the end (`git diff --check` "
+                                "flags them; list them in [tools] strip_trailing to strip them when copied): %s"
+                           % ", ".join(blanks)))
         staged = [(os.path.relpath(p_, tools_dir), d_, m_) for p_, _, d_, m_ in files]
         if not specs:
             msg = ("no [[smoke]] in the meta: the archived analysis was not test-run against a cell "
@@ -1666,7 +1701,7 @@ def main(argv=None):
         return 4
     print("fence check %d/%d OK" % (ok, total))
     if specs:
-        ok, total, errs = run_smoke(c, specs, staged)
+        ok, total, errs = run_smoke(c, specs, staged, stripped)
         if errs:
             print("archive-campaign: smoke check %d/%d OK, FAILED: the archived analysis does not reproduce its archived "
                   "output from the tools copy; nothing written:" % (ok, total), file=sys.stderr)

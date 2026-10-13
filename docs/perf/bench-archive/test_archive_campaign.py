@@ -1179,6 +1179,109 @@ class OutputPaths(FixtureCase):
         self.assertIn("+++ b/tools/ozarchy-tc-tools/md5s-all.txt\n", r.stdout)
 
 
+# a perf report as `perf report --stdio` writes it: the column header lines are padded with blanks
+PERF_REPORT = (
+    "# To display the perf.data header info, please use --header/--header-only options.\n#\n"
+    "# Overhead  Command          Symbol" + " " * 40 + "\n"
+    "# ........  ...............  ......\n#\n"
+    "    12.50%  exec             [.] foo\n\n\n"
+)
+PERF_REPORT_STRIPPED = (
+    "# To display the perf.data header info, please use --header/--header-only options.\n#\n"
+    "# Overhead  Command          Symbol\n"
+    "# ........  ...............  ......\n#\n"
+    "    12.50%  exec             [.] foo\n"
+)
+
+
+class StripTrailing(FixtureCase):
+    """[tools] strip_trailing: globs (path in the tools copy) whose trailing blanks are stripped when staged, so the
+    archived copy passes `git diff --check`; unlisted files are copied byte for byte and warned about (t)."""
+
+    def setUp(self):
+        super().setUp()
+        write(self.an("perf-report-r1-a.txt"), PERF_REPORT)
+        write(self.an("a-perf-report-r1-a.py"), "import sys\nsys.stdout.write(open(sys.argv[1]).read())\n")
+        write(self.an("blob.txt"), b"x \0 \n")
+        write(self.an("a-blob.py"), "")  # its producer (check b)
+
+    def an(self, *p):
+        return os.path.join(self.fx.bench, "ozarchy-tc-run", "analyst", *p)
+
+    def staged(self, rel):
+        with open(os.path.join(self.fx.archive, "tools", "ozarchy-tc-tools", rel), "rb") as f:
+            return f.read()
+
+    def meta(self, globs, smoke=None):
+        m = json.loads(json.dumps(self.fx.meta))
+        m["tools"] = {"strip_trailing": globs}
+        if smoke:
+            m["smoke"] = m["smoke"] + [smoke]
+        return m
+
+    def test_default_copies_verbatim_and_warns(self):
+        fx = self.fx
+        r = fx.run()
+        self.assertOk(r)
+        self.assertEqual(self.staged("analyst/perf-report-r1-a.txt"), PERF_REPORT.encode())
+        w = [l for l in r.stderr.splitlines() if l.startswith("WARNING (t)")]
+        self.assertEqual(len(w), 1, r.stderr)
+        self.assertIn("analyst/perf-report-r1-a.txt", w[0])
+        self.assertIn("strip_trailing", w[0])
+        self.assertNotIn("blob.txt", w[0])  # binary: never touched, never warned about
+
+    def test_strict_refuses_on_trailing_blanks(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        r = fx.run("--strict")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("WARNING (t)", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
+    def test_strip_trailing(self):
+        fx = self.fx
+        # the smoke command reproduces the report with its blanks: compared against the stripped archived copy
+        smoke = {
+            "script": "analyst/a-perf-report-r1-a.py",
+            "args": ["%s" % self.an("perf-report-r1-a.txt")],
+            "compare": [{"want": "analyst/perf-report-r1-a.txt"}],
+        }
+        r = fx.run("--strict", meta=self.meta(["analyst/perf-report-*.txt", "analyst/blob.txt"], smoke))
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        self.assertIn("smoke check 2/2 OK", r.stdout)
+        self.assertEqual(self.staged("analyst/perf-report-r1-a.txt"), PERF_REPORT_STRIPPED.encode())
+        self.assertEqual(self.staged("analyst/blob.txt"), b"x \0 \n")  # binary: copied as is
+        self.assertEqual(self.staged("analyst/cells.txt"), CELLS_TXT.encode())
+
+    def test_stripped_want_still_catches_a_real_difference(self):
+        fx = self.fx
+        write(self.an("other.txt"), PERF_REPORT.replace("12.50%", "13.50%"))
+        smoke = {
+            "script": "analyst/a-perf-report-r1-a.py",
+            "args": [self.an("other.txt")],
+            "compare": [{"want": "analyst/perf-report-r1-a.txt"}],
+        }
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta(["analyst/perf-report-*.txt"], smoke))
+        self.assertEqual(r.returncode, 5, r.stderr)
+        self.assertIn("13.50%", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
+    def test_bad_strip_trailing_is_an_error(self):
+        r = self.fx.run(meta=self.meta("*.txt"))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("strip_trailing", r.stderr)
+
+    def test_strip_unit(self):
+        m = load_module()
+        self.assertEqual(m.strip_trailing(PERF_REPORT.encode()), PERF_REPORT_STRIPPED.encode())
+        self.assertEqual(m.strip_trailing(b"a \t\nb  "), b"a\nb")
+        self.assertEqual(m.strip_trailing(b""), b"")
+        self.assertEqual(m.strip_trailing(b"\n\n"), b"")
+        self.assertEqual(m.strip_trailing(b"a\n"), b"a\n")
+
+
 class SummaryRows(FixtureCase):
     """[summary] rows: numbers from analyst/arms.txt unless [[summary.rows]] cols gives them."""
 
