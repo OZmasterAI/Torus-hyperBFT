@@ -1,0 +1,11 @@
+r1-g2 g2 native_blocks=582 ckpts=13.3 settle_wait ms/native blk=19.95 (per obs 14.36) upkeep ms/blk=0.81 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=759
+r1-g5 g5 native_blocks=574 ckpts=32.7 settle_wait ms/native blk=19.68 (per obs 13.52) upkeep ms/blk=3.26 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=731
+r2-g5 g5 native_blocks=586 ckpts=33.0 settle_wait ms/native blk=18.64 (per obs 13.83) upkeep ms/blk=3.26 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=694
+r2-g2 g2 native_blocks=605 ckpts=15.0 settle_wait ms/native blk=19.46 (per obs 14.04) upkeep ms/blk=0.99 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=760
+r3-g2 g2 native_blocks=607 ckpts=14.7 settle_wait ms/native blk=18.90 (per obs 13.10) upkeep ms/blk=0.87 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=847
+r3-g5 g5 native_blocks=587 ckpts=32.3 settle_wait ms/native blk=18.44 (per obs 12.48) upkeep ms/blk=3.01 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=730
+r4-g5 g5 native_blocks=565 ckpts=33.7 settle_wait ms/native blk=19.31 (per obs 14.25) upkeep ms/blk=3.43 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=678
+r4-g2 g2 native_blocks=582 ckpts=14.0 settle_wait ms/native blk=20.59 (per obs 15.14) upkeep ms/blk=1.22 deferred_join ms/blk=nan (n=nan, per obs nan) deferred_read_waits per node=[nan, nan, nan] drop_inline=732
+
+g2 {'nb': 594.333, 'ckpts': 14.25, 'inline': 774.417, 'read_waits': nan, 'settle_pb': 19.726, 'settle_obs': 14.161, 'upkeep_pb': 0.974, 'join_pb': nan, 'join_n': nan, 'join_obs': nan} read_waits total 0
+g5 {'nb': 578.25, 'ckpts': 32.917, 'inline': 708.5, 'read_waits': nan, 'settle_pb': 19.017, 'settle_obs': 13.52, 'upkeep_pb': 3.242, 'join_pb': nan, 'join_n': nan, 'join_obs': nan} read_waits total 0

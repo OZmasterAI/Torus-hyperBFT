@@ -6741,6 +6741,122 @@ join per native block and the deferred read waits from `metrics-before/after`), 
 `paired.txt`, `mw.txt`, `digest.txt`, `cells.txt`. Full outputs (incl. `cells.json`) in `ozarchy-p3mw-run/analyst/` on
 ozarchy. Driver: `tools/ozarchy-p3mw-tools/ozarchy-p3q-campaign.sh` (CAMP=M).
 
+## 55. Phase 3 checkpoint interval 5 s vs 15 s on step 2 `7b006739`, glibc, commit-tail mode (campaign ozarchy-p3iv, 2026-10-13)
+
+**At 5 s the step 2 node holds about 0.3 GB less per node over minutes 0-2: RSS peak -0.33 GB [-0.65, -0.01] (-5.8%),
+mean -0.28 GB [-0.50, -0.06] (-6.0%), in-window anon -0.36 GB [-0.53, -0.19] (-7.9%), high-water mark -0.47 GB [-0.72,
+-0.21] (paired g5 - g2, n = 4, 95% CI t(3)). The growth rate over the bench window is unchanged (1.55 vs 1.54 GB/min).
+It costs node CPU-s/1M +1.10% [+0.44, +1.75] (+1.03% [+0.36, +1.70] at equal fills) and device writes +10.8% [+7.0,
++14.6] per validator (64.7 -> 71.7 MB/s), almost all on the WAL / foreground path (+13.6% [+10.5, +16.6]).** Native
+blocks/s (+0.2% [-2.6, +2.9]), matched/s (-0.9% [-2.5, +0.6]), `block_ms` and block time p99 (-4.7% [-20.6, +11.3]) are
+ties. The checkpoint rate in the bench window goes from 4.6 to 12.0 per node per minute (2.6x), the layer per checkpoint
+shrinks only 35% (114 -> 74 MB), so layer bytes per minute rise 50%. All 8 measured cells pass every hard check, and the
+interval took effect in every cell. 3 cells (all g2) are REJECT on agreement, all the known mark-only digest artifact (55.3).
+
+Owner-approved queue item (interval): the same step 2 binary `7b006739` (`ca388315`, the section 51 / 53 / 54 build,
+staged `ozarchy-p3q-stage/g2-run`) in both arms, only `TORUS_CHECKPOINT_INTERVAL_MS` differs: g2 = 15000 (the setting of
+sections 47-54), g5 = 5000. Question: does a shorter interval (smaller layer held between checkpoints) cut the Phase 3
+RSS, and what does it cost in CPU, writes and blocks/s?
+
+Setup: the section 54 shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, 120 s cells
++ 60 s warm-up, commit tail, glibc, shared NVMe). Bench `05d44313`, harness `218ad251`. Driver `ozarchy-p3iv-campaign.sh`
+CAMP=I, a copy of `ozarchy-p3q-campaign.sh` with a per-arm knob value (`AKV[g5]`; the knob check now checks each arm's
+own value) and a new hard check: every validator's Phase 3 enable line must show the arm's interval
+(`CheckpointPolicy { interval: Some(5s) ... }` / `Some(15s)`). A 60 s g5 smoke cell first (`ozarchy-p3iv-smoke-300m-s0-g5`,
+04:38-04:42: rc 0, ACCEPT, AGREE, all checks OK, 22-23 checkpoints per node). Cells 04:44-05:34: w0 (g2, 60 s,
+excluded), r1 g2 g5, r2 g5 g2, r3 g2 g5, r4 g5 g2. 135 CHECK OK, no CHECK FAIL, no deaths, no memguard stop, the host
+quiet before every cell. Cells are 120 s long, so **RSS and matched/s here are minutes 0-2 only, not the soak plateau**
+(section 53d: on glibc the step 2 RSS was still growing at minutes 5-10).
+
+### 55.1 Interval check per cell
+
+| cell | enable line (val0-2) | in-bench checkpoints per node per min | median in-bench gap s (2 s scrape) | checkpoints per node, metrics window |
+|---|---|---|---|---|
+| r1-g2 / r2-g2 / r3-g2 / r4-g2 | `Some(15s)` on all 3 | 4.43 / 4.75 / 4.55 / 4.55 | 14.5 / 14.4 / 14.5 / 14.5 | 13-14 / 15 / 14-16 / 13-15 |
+| r1-g5 / r2-g5 / r3-g5 / r4-g5 | `Some(5s)` on all 3 | 11.97 / 11.71 / 11.87 / 12.30 | 6.2 / 6.2 / 6.2 / 6.2 | 32-33 / 33 / 32-33 / 33-35 |
+
+The env knob was on all 3 node environs in every cell (`node-env-all.txt`). Mean in-bench spacing is 13.1 s (g2) and
+5.0 s (g5); the median gaps sit on the 2 s scrape grid. Over the whole metrics window (bench start - 4 s to the end of
+the drain) the ratio is 2.3x (14.3 -> 32.9 per node, +18.7 [+17.1, +20.2]), not 3x: outside the bench window (setup
+~20 s, drain and digest 60-120 s) both arms checkpoint every ~4-6 s, so something other than the interval triggers
+checkpoints there. That is not investigated here; the knob governs the loaded window, which is what the A/B measures.
+
+### 55.2 Per arm (n = 4, mean; paired g5 - g2 over the 4 rounds, 95% CI t(3))
+
+| | g2 (15 s) | g5 (5 s) | g5 - g2 | % [95% CI] |
+|---|---|---|---|---|
+| RSS peak / mean per node GB (cpu.csv, mean of 3) | 5.68 / 4.61 | 5.35 / 4.34 | **-0.33 [-0.65, -0.01] / -0.28 [-0.50, -0.06]** | -5.8% [-11.5, -0.2] / -6.0% [-10.7, -1.2] |
+| RSS peak / mean in the bench window GB (mem-samples) | 5.57 / 4.58 | 5.22 / 4.22 | **-0.35 [-0.59, -0.12] / -0.36 [-0.53, -0.19]** | -6.4% / -7.9% [-11.5, -4.2] |
+| VmHWM / anon (window mean) GB | 5.96 / 4.54 | 5.50 / 4.18 | **-0.47 [-0.72, -0.21] / -0.36 [-0.53, -0.19]** | -7.8% / -7.9% |
+| RSS first / last 15 s of the bench window GB | 2.09 / 5.50 | 1.80 / 5.18 | -0.29 [-0.71, +0.13] / -0.33 [-0.61, -0.04] | |
+| RSS growth over the bench window GB/min | 1.55 | 1.54 | -0.01 [-0.38, +0.36] | -0.6% [-24.6, +23.5] |
+| memtables MB | 229 | 263 | +34 [+15, +52] | +14.7% [+6.7, +22.8] |
+| layer MB per checkpoint (metrics `layer_bytes` sum / count) | 114.0 | 73.8 | -40.2 [-46.2, -34.2] | **-35.3% [-40.5, -30.0]** |
+| layer MB per checkpoint (gauge, bench window, a-arms.py) | 155 | 90 | -65 [-86, -44] | -41.9% [-55.4, -28.4] |
+| layer MB per node per minute (metrics window) | 794 | 1,190 | +396 [+343, +450] | +50.0% [+43.2, +56.7] |
+| node CPU-s/1M (whole run) | 23.36 | 23.61 | +0.26 [+0.10, +0.41] | **+1.10% [+0.44, +1.75]** |
+| node CPU at equal fills (ANCOVA, Welch) | | | | +1.03% [+0.36, +1.70] |
+| flush-worker checkpoint s per node per cell | 6.23 | 9.49 | +3.26 [+3.03, +3.48] | +52.2% [+48.6, +55.8] |
+| device writes MB/s per validator (io-ticks, bench window) | 64.7 | 71.7 | +6.97 [+4.50, +9.44] | **+10.8% [+7.0, +14.6]** |
+| of which WAL + foreground (all but RocksDB background threads) | 50.8 | 57.7 | +6.89 [+5.35, +8.44] | +13.6% [+10.5, +16.6] |
+| of which RocksDB flush + compaction threads | 14.8 | 15.7 | +0.89 [-0.36, +2.15] | +6.0% [-2.5, +14.6] |
+| native blocks/s | 3.48 | 3.49 | +0.01 | +0.2% [-2.6, +2.9] |
+| matched/s (120 s = minutes 0-2) | 211,652 | 209,656 | -1,996 | -0.9% [-2.5, +0.6] |
+| block time (commit interval, logs) p50 / p99 ms | 167 / 1,293 | 164 / 1,233 | -3.0 / -60 | -1.8% [-7.9, +4.3] / -4.7% [-20.6, +11.3] |
+| exec `block_ms` (summary) | 260.5 | 258.9 | -1.6 [-8.3, +5.0] | -0.6% [-3.2, +1.9] |
+| exec per native block (logs) mean / p99 ms | 347 / 676 | 350 / 682 | +3.9 / +6.2 | +1.1% [-2.9, +5.1] / +0.9% [-4.4, +6.2] |
+| exec busy / backlog (blocks) | 0.961 / 42.0 | 0.956 / 42.8 | | -0.4% [-2.1, +1.2] / +1.8% [-14.7, +18.2] |
+| fills per native block | 55,042 | 54,779 | | -0.5% [-4.0, +3.1] |
+| bench submits/s | 1,184 | 1,175 | -8.8 | -0.7% [-5.6, +4.1] |
+
+Welch intervals (`arms.txt`) agree in sign and resolution with the paired ones for every bolded row (RSS peak -5.8%
+[-9.9, -1.8], mean -6.0% [-9.7, -2.2], CPU-s/1M +1.10% [+0.42, +1.77], writes +10.8% [+7.4, +14.2]).
+
+### 55.3 Exec-thread checkpoint time, agreement and other checks
+
+| ms per native block (mean of 3 nodes) | g2 | g5 | g5 - g2 [95% CI] |
+|---|---|---|---|
+| `checkpoint_settle_wait` (summary phase) | 23.16 | 21.76 | -1.40 [-2.48, -0.32] |
+| `checkpoint_settle_wait`, from the metrics delta (`_sum` / native blocks) | 19.73 | 19.02 | -0.71 [-1.42, +0.00] |
+| settle wait per observation p50 / p99 (summary quantiles) | 2.46 / 95.6 | 0.02 / 95.8 | |
+| `checkpoint_upkeep` (summary phase) | 1.14 | 3.70 | **+2.57 [+2.21, +2.93]** |
+| `checkpoint_upkeep`, from the metrics delta | 0.97 | 3.24 | +2.27 [+2.06, +2.48] |
+| upkeep per observation p50 / p99 | 0.10 / 13.1 | 0.08 / 99.6 | |
+| `drop_inline` per node per cell | 774 | 709 | -8.5% [-16.2, -0.8] |
+
+Exec's total settle wait per block hardly moves with 2.6x more checkpoints (-3.6% to -6%). Each wait is shorter but there
+are more of them, so the wait is consistent with scaling with the merged data, not with the checkpoint count. Upkeep
+per block rises +2.3-2.6 ms and its p99 per observation 13 -> 100 ms. Exec time per block is still a tie, so the extra
+upkeep does not show in `block_ms` here.
+
+r1-g2, r2-g2 and r4-g2 are rc 2, REJECT on agreement (the warm-up w0 too). In each, val2 differs from val0 / val1 in the
+5 mark fields (`accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed`, `withdrawable`) of all 50
+accounts only. In r1-g2 and r4-g2, val2's digest took longest (43.1 s and 46.7 s vs 17-22 s). In r2-g2, val0 and val1
+took 88 s and val2 21 s, so there the odd node is the fast one. Block hashes, compared heights and matched / placed / resting
+/ action counters are equal on all 3 nodes, with no panic or fail-stop lines. This is the slow-digest mark artifact of sections
+46-54: **no hard finding.** All three fell in g2. With 3 REJECTs in 8 cells, 3-of-3 in one arm happens by chance with
+probability ~0.14, and section 54 had them in both arms on this binary. Nonce-window evictions 0, no tail warnings or
+errors, in-flight timeouts 0, in-flight RPC refusals ("server overloaded") 6 / 1 / 2 / 1 in r1-g2 / r1-g5 / r2-g5 /
+r4-g2 and 0 elsewhere, executed cancel-alls equal on all 3 nodes, action failures 0.
+
+**Verdict:** 5 s cuts the Phase 3 RSS level by ~0.3 GB per node (~6%) over minutes 0-2. The paired CIs resolve this on
+peak, mean, window mean and HWM, though the cpu.csv peak only just clears 0. Next to the step 2 - main delta at 15 s in
+section 51 (+1.55 GB peak / +1.08 GB mean, glibc, 120 s, other campaign), that is about a fifth to a quarter of it. The
+growth rate over the window is unchanged, so this A/B gives no sign that 5 s changes the glibc growth that kept the soak
+over the RAM rule (section 53d: +2.62 GB, still growing). That needs a soak to say. The cost is +1.1% CPU-s/1M (resolved,
+also at equal fills), +11% device writes per validator (the WAL path; layer bytes per minute +50%: the layer shrinks less
+than the interval, consistent with hot rows being rewritten in every layer) and +52% flush-worker checkpoint time.
+Throughput, exec time and block time are ties. n = 4 x 120 s: "consistent with" throughout, except the checkpoint rate,
+layer size, writes and upkeep, which are decisive.
+
+Analysis (`tools/ozarchy-p3iv-tools/analyst/`): `a-cells.py`, `a-arms.py`, `a-paired.py` (section 54's, unchanged; `--io`
+for device writes), `a-mw.py` (settle / upkeep per native block; the deferred metrics are absent on `7b006739`), new
+`a-iv.py` (checkpoint count, layer bytes per checkpoint and per minute, settle / upkeep per native block, flush-worker
+checkpoint time, and the WAL vs RocksDB background write split of section 42, paired) and `a-ckgap.py` (in-bench
+checkpoint rate and gaps from `ckpt-samples.txt`), `a-archive.py`. Outputs `arms.txt`, `paired.txt`, `iv.txt`,
+`ckgap.txt`, `mw.txt`, `digest.txt`, `cells.txt`. Full outputs (incl. `cells.json`) in `ozarchy-p3iv-run/analyst/` on
+ozarchy. Driver: `tools/ozarchy-p3iv-tools/ozarchy-p3iv-campaign.sh` (CAMP=I) + `env.sh`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
