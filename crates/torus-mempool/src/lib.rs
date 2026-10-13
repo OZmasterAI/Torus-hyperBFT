@@ -19,6 +19,7 @@ mod verified_cache;
 use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
+use torus_state::backend::StateBackend as _;
 use torus_state::{DaReadTiming, ErasureParams, NativeDaStore, StateDb, StateError, StoredShard};
 use torus_types::SignedNativeAction;
 
@@ -149,6 +150,11 @@ pub struct Mempool {
     evm: RwLock<evm_pool::EvmPool>,
     native: RwLock<native_pool::NativePool>,
     state: StateDb,
+    /// Item 6 Phase 3 step 2: the exec thread's published read view (blocks
+    /// above the last checkpoint + the checkpoint in flight + the DB). `None`
+    /// (interval 0, rpc-only, library users) = the ingress readers read the
+    /// DB as before. See [`Self::publish_read_view`].
+    read_view: RwLock<Option<torus_state::ReadView>>,
     /// Durable, nonce-gate-decoupled native-action body store (out-of-band DA).
     da_store: NativeDaStore,
     /// Coalesced ingress DA mirrors (T2.2): per-action ingest puts are buffered
@@ -221,6 +227,7 @@ impl Mempool {
             evm: RwLock::new(evm_pool::EvmPool::new(initial_base_fee)),
             native: RwLock::new(native_pool),
             state,
+            read_view: RwLock::new(None),
             da_store,
             da_pending: std::sync::Mutex::new(PendingDaMirrors {
                 actions: Vec::new(),
@@ -238,6 +245,24 @@ impl Mempool {
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
             native_commit_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
             addr_limiter: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Item 6 Phase 3 step 2: install the exec thread's read view after a
+    /// block (one swap), or `None` to read the DB again (every block handed
+    /// off is durable: a barrier, a fresh flush worker). Only the exec thread
+    /// calls this, and only with a checkpoint interval set.
+    pub fn publish_read_view(&self, view: Option<torus_state::ReadView>) {
+        *self.read_view.write().unwrap() = view;
+    }
+
+    /// The state the ingress readers use: the published view, else the DB
+    /// alone (every call the plain `StateDb` call). The returned view stays
+    /// valid while held (it pins its layers); fetch a fresh one per check.
+    pub fn ingress_state(&self) -> torus_state::ReadView {
+        match &*self.read_view.read().unwrap() {
+            Some(view) => view.clone(),
+            None => torus_state::ReadView::db_only(self.state.clone()),
         }
     }
 
@@ -269,7 +294,7 @@ impl Mempool {
         // Traded volume via the same accessor the open-order limit uses; a
         // read error counts as no volume (only the buffer applies).
         let volume_trs = || {
-            torus_core::position::PositionManager::new(self.state.clone())
+            torus_core::position::PositionManager::new(self.ingress_state())
                 .get_cum_volume(sender)
                 .map(|v| (v.raw().max(0) / torus_types::FixedPoint::SCALE) as u64)
                 .unwrap_or(0)
@@ -444,7 +469,7 @@ impl Mempool {
             .min(self.config.evm_block_gas_budget);
         let entry = validate::validate_evm_tx(
             &raw_rlp,
-            &self.state,
+            &self.ingress_state(),
             self.config.chain_id,
             max_tx_gas,
             self.current_base_fee
@@ -645,7 +670,9 @@ impl Mempool {
             // A8: the full session check (signature, registration, expiry in
             // ms against this node's clock, scope) — the same as RPC intake.
             torus_types::ActionSignature::Session { .. } => action
-                .resolve_sender(now_ms(), |pk| self.state.get_session(pk).ok().flatten())
+                .resolve_sender(now_ms(), |pk| {
+                    self.ingress_state().get_session(pk).ok().flatten()
+                })
                 .map_err(|e| {
                     MempoolError::NativeValidationFailed(format!("gossip session: {e}"))
                 })?,
@@ -857,7 +884,7 @@ impl Mempool {
     /// only act for its validator in oracle submissions (exec's
     /// `resolve_oracle_reporter`), so its other duty kinds get no exemption.
     fn is_duty_exempt(&self, sender: &Address, action: &torus_types::NativeAction) -> bool {
-        funded::is_validator_duty_of_validator(&self.state, sender, action)
+        funded::is_validator_duty_of_validator(&self.ingress_state(), sender, action)
             || (crate::native_pool::is_oracle_submission(action)
                 && self.oracle_reporter(sender).is_some())
     }
@@ -870,7 +897,8 @@ impl Mempool {
     /// stale index entry never resolves.
     fn oracle_reporter(&self, sender: &Address) -> Option<Vec<Address>> {
         use torus_economics::ValidatorStatus;
-        let staking = torus_economics::StakingManager::new(self.state.clone());
+        let state = self.ingress_state();
+        let staking = torus_economics::StakingManager::new(state.clone());
         if let Some(v) = staking.get_validator(sender).ok()? {
             if v.status != ValidatorStatus::Active {
                 return None;
@@ -880,8 +908,7 @@ impl Mempool {
             return Some(accounts);
         }
         let key = torus_state::cf::oracle_signer_key(sender);
-        let raw = self
-            .state
+        let raw = state
             .get_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &key)
             .ok()??;
         if raw.len() != 20 {
@@ -908,7 +935,7 @@ impl Mempool {
         if min_trs == 0
             || funded::is_exempt(action)
             || duty_exempt
-            || funded::is_funded(&self.state, sender, min_trs)
+            || funded::is_funded(&self.ingress_state(), sender, min_trs)
         {
             return Ok(());
         }
@@ -1429,7 +1456,7 @@ impl Mempool {
     /// nonces starting from state_nonce. Clients use this to avoid nonce collisions
     /// when submitting transactions faster than blocks commit.
     pub fn pending_nonce(&self, sender: &alloy_primitives::Address) -> u64 {
-        let account = self.state.get_account(sender).ok().flatten();
+        let account = self.ingress_state().get_account(sender).ok().flatten();
         let state_nonce = account.map(|a| a.nonce).unwrap_or(0);
         let pool = self.evm.read().unwrap();
         pool.pending_nonce(sender, state_nonce)
@@ -4027,8 +4054,8 @@ mod tests {
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----
 
-    fn put_oracle_validator(
-        state: &StateDb,
+    fn put_oracle_validator<S: torus_state::backend::StateBackend>(
+        state: &S,
         v: Address,
         status: torus_economics::ValidatorStatus,
         signer: Option<Address>,
@@ -4540,7 +4567,12 @@ mod tests {
         }
     }
 
-    fn put_native(state: &StateDb, addr: &Address, available: i128, order_margin: i128) {
+    fn put_native<S: torus_state::backend::StateBackend>(
+        state: &S,
+        addr: &Address,
+        available: i128,
+        order_margin: i128,
+    ) {
         torus_core::position::PositionManager::new(state.clone())
             .put_native_balance(
                 addr,
@@ -5133,5 +5165,76 @@ mod tests {
         assert!(pool.addr_rate_limiter().is_none());
         pool.addr_rate_admits(&address_from_key(&k), &next_action())
             .unwrap();
+    }
+
+    /// Item 6 Phase 3 step 2: the duty exemption, the oracle reporter and
+    /// the funded check read the published view (a block above the DB, or
+    /// the checkpoint in flight C); the newest layer wins; `None` = the DB.
+    #[test]
+    fn ingress_view_serves_duty_oracle_and_funded_checks() {
+        use torus_economics::ValidatorStatus;
+        use torus_state::backend::StateBackend as _;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), funded_cfg(1));
+        let (v, signer, trader) = (key(91), key(92), key(93));
+        let (va, sa, ta) = (
+            address_from_key(&v),
+            address_from_key(&signer),
+            address_from_key(&trader),
+        );
+        let oracle = oracle_from(&v, now_ms()).action;
+        let order = torus_types::NativeAction::CancelAllOrders { market_id: None };
+        // Block 7's rows exist only in its frozen set.
+        let o = torus_state::NativeStateOverlay::new(state.clone());
+        put_oracle_validator(&o, va, ValidatorStatus::Active, Some(sa));
+        put_native(&o, &ta, ONE_TRS, 0);
+        let b7 = o.freeze(7);
+        let visible = |want: bool, what: &str| {
+            assert_eq!(pool.is_duty_exempt(&va, &oracle), want, "{what}: duty");
+            assert_eq!(
+                pool.oracle_reporter(&sa),
+                want.then(|| vec![va, sa]),
+                "{what}: reporter"
+            );
+            assert_eq!(
+                pool.check_funded(&ta, &order, false).is_ok(),
+                want,
+                "{what}: funded"
+            );
+        };
+        visible(false, "DB alone");
+        pool.publish_read_view(Some(torus_state::ReadView::new(
+            state.clone(),
+            7,
+            vec![b7.clone()],
+            None,
+        )));
+        visible(true, "block 7 in the view");
+        let mut c = torus_state::CheckpointLayer::new();
+        c.merge(&b7);
+        let c = std::sync::Arc::new(c);
+        pool.publish_read_view(Some(torus_state::ReadView::new(
+            state.clone(),
+            7,
+            Vec::new(),
+            Some(c.clone()),
+        )));
+        visible(true, "block 7 in C");
+        // Block 8 takes the balance and the validator row away again.
+        let o = torus_state::NativeStateOverlay::new(state.clone());
+        o.delete_cf_raw(torus_state::cf::CF_NATIVE_BALANCES, ta.as_slice())
+            .unwrap();
+        o.delete_cf_raw(torus_state::cf::CF_STAKING_VALIDATORS, va.as_slice())
+            .unwrap();
+        let b8 = o.freeze(8);
+        pool.publish_read_view(Some(torus_state::ReadView::new(
+            state.clone(),
+            8,
+            vec![b8],
+            Some(c),
+        )));
+        visible(false, "block 8 deletes");
+        pool.publish_read_view(None);
+        visible(false, "back to the DB");
     }
 }

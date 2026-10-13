@@ -24,10 +24,12 @@
 //!
 //! A brand-new spammer key pays two point reads and one empty prefix seek.
 //!
-//! The DB the check reads can lag execution by a block or more: a deposit
+//! The state the check reads can lag execution by a block or more: a deposit
 //! becomes visible a little late (the client sees "not funded" briefly), and
 //! an account that just went to zero may still pass for a block. Both are fine
-//! for an anti-spam rule.
+//! for an anti-spam rule. With a checkpoint interval (item 6 Phase 3) the
+//! mempool reads the exec thread's published view
+//! ([`torus_state::ReadView`]), not the DB, which may lag by a whole interval.
 //!
 //! Exempt action kinds — none of them can use perp collateral, and all are
 //! non-cancels, so they never get cancel priority and stay subject to the
@@ -47,8 +49,8 @@
 use alloy_primitives::Address;
 use torus_core::lockbox::fp_to_wei;
 use torus_core::position::PositionManager;
+use torus_state::backend::StateBackend;
 use torus_state::cf::CF_STAKING_VALIDATORS;
-use torus_state::StateDb;
 use torus_types::{FixedPoint, NativeAction};
 
 /// Default `TORUS_INGRESS_MIN_COLLATERAL` in whole TRS (HL charges 1 USDC to
@@ -100,7 +102,7 @@ pub fn is_validator_duty(action: &NativeAction) -> bool {
 /// True when `sender` has a row in the validator table, in any status (a
 /// jailed validator must still be able to unjail). One point read. A read
 /// error counts as registered, as in [`is_funded`].
-pub fn is_registered_validator(state: &StateDb, sender: &Address) -> bool {
+pub fn is_registered_validator<S: StateBackend>(state: &S, sender: &Address) -> bool {
     state
         .get_cf_raw(CF_STAKING_VALIDATORS, sender.as_slice())
         .map(|row| row.is_some())
@@ -108,8 +110,8 @@ pub fn is_registered_validator(state: &StateDb, sender: &Address) -> bool {
 }
 
 /// A validator duty sent by a registered validator: skips items A and B.
-pub fn is_validator_duty_of_validator(
-    state: &StateDb,
+pub fn is_validator_duty_of_validator<S: StateBackend>(
+    state: &S,
     sender: &Address,
     action: &NativeAction,
 ) -> bool {
@@ -119,7 +121,7 @@ pub fn is_validator_duty_of_validator(
 /// True when `sender` holds at least `min_trs` whole TRS (see the module
 /// docs). A state read error counts as funded: a storage hiccup must not turn
 /// into rejecting every honest user.
-pub fn is_funded(state: &StateDb, sender: &Address, min_trs: u64) -> bool {
+pub fn is_funded<S: StateBackend>(state: &S, sender: &Address, min_trs: u64) -> bool {
     let min = FixedPoint::from_raw((min_trs as i128).saturating_mul(FixedPoint::SCALE));
     let pm = PositionManager::new(state.clone());
     // 1. perp collateral (one point read).

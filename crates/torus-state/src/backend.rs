@@ -178,7 +178,7 @@ pub trait StateBackend: Clone + Send + Sync {
 
 /// Read options whose iterate upper bound is the end of `prefix` (the smallest
 /// key above every key starting with it); none when no such key exists.
-fn prefix_read_options(prefix: &[u8]) -> rocksdb::ReadOptions {
+pub(crate) fn prefix_read_options(prefix: &[u8]) -> rocksdb::ReadOptions {
     let mut opts = rocksdb::ReadOptions::default();
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
@@ -384,10 +384,10 @@ impl StateBackend for StateDb {
 /// `(String, Vec<u8>)` composite-key map — proven by
 /// `interned_overlay_stores_identical_rocksdb_keys` below.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct CfId(u8);
+pub(crate) struct CfId(u8);
 
 /// Number of registered CFs — one overlay bucket per CF.
-const NUM_CFS: usize = crate::cf::ALL_CF_NAMES.len();
+pub(crate) const NUM_CFS: usize = crate::cf::ALL_CF_NAMES.len();
 
 impl CfId {
     #[inline]
@@ -401,7 +401,7 @@ impl CfId {
 /// such a CF cannot exist in any target database and no overlay entry for it
 /// could ever flush.
 #[inline]
-fn intern_cf(name: &str) -> Option<CfId> {
+pub(crate) fn intern_cf(name: &str) -> Option<CfId> {
     static TABLE: OnceLock<HashMap<&'static str, u8>> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
         crate::cf::ALL_CF_NAMES
@@ -432,16 +432,16 @@ type DeleteGroup<'a> = (&'a [u8], u64, &'a [u8], &'a [u8]);
 /// composite allocation per get/put, and lookups borrow the caller's `&[u8]`
 /// directly (zero allocations on the read path).
 #[derive(Default)]
-struct CfPending {
-    writes: BTreeMap<Vec<u8>, Vec<u8>>,
+pub(crate) struct CfPending {
+    pub(crate) writes: BTreeMap<Vec<u8>, Vec<u8>>,
     /// `BTreeSet` (was a `HashSet` over composite keys) so delete flush order is
     /// deterministic; final state never depended on it (put/delete keys are
     /// disjoint by invariant), this just removes the last order wobble.
-    deletes: BTreeSet<Vec<u8>>,
+    pub(crate) deletes: BTreeSet<Vec<u8>>,
 }
 
 impl CfPending {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.writes.is_empty() && self.deletes.is_empty()
     }
 }
@@ -458,9 +458,9 @@ fn overlay_visit() {
     OVERLAY_VISITS.with(|c| c.set(c.get() + 1));
 }
 
-struct PendingState {
+pub(crate) struct PendingState {
     /// Indexed by [`CfId`] — one bucket per registered CF.
-    cfs: [CfPending; NUM_CFS],
+    pub(crate) cfs: [CfPending; NUM_CFS],
     /// T4.4: append-only undo trail for writer-precompile side effects. `checkpoints`
     /// holds savepoint lengths into this log so a call frame that reverts can roll its
     /// native writes back (see [`NativeStateOverlay::checkpoint`]).
@@ -478,7 +478,7 @@ struct PendingState {
 }
 
 impl PendingState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cfs: std::array::from_fn(|_| CfPending::default()),
             journal_log: Vec::new(),
@@ -491,7 +491,7 @@ impl PendingState {
     /// Layered point lookup: `Some(Some(v))` = pending write, `Some(None)` =
     /// tombstone, `None` = not in this layer (fall through).
     #[inline]
-    fn lookup(&self, id: CfId, key: &[u8]) -> Option<Option<&[u8]>> {
+    pub(crate) fn lookup(&self, id: CfId, key: &[u8]) -> Option<Option<&[u8]>> {
         let cfp = self.cf(id);
         if let Some(value) = cfp.writes.get(key) {
             return Some(Some(value.as_slice()));
@@ -542,14 +542,14 @@ impl PendingState {
     }
 
     /// Fix 3 (s87): whether this layer holds a write or a tombstone under `prefix`.
-    fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
+    pub(crate) fn touches(&self, id: CfId, prefix: &[u8]) -> bool {
         writes_under(&self.cf(id).writes, prefix).next().is_some()
             || self.deletes_under(id, prefix).next().is_some()
     }
 
     /// Apply this layer's writes/tombstones (under `prefix`) on top of `merged`.
     /// Fix 3 (s87): visits only the layer's keys under `prefix` (range lookup).
-    fn overlay_into(
+    pub(crate) fn overlay_into(
         &self,
         id: CfId,
         prefix: Option<&[u8]>,
@@ -578,7 +578,7 @@ impl PendingState {
     }
 
     #[inline]
-    fn cf(&self, id: CfId) -> &CfPending {
+    pub(crate) fn cf(&self, id: CfId) -> &CfPending {
         &self.cfs[id.0 as usize]
     }
 
@@ -645,7 +645,11 @@ impl PendingState {
     ///
     /// Semantics preserved from pre-C2: a missing CF errors on the WRITE path
     /// and is silently skipped on the DELETE path.
-    fn append_to_batch(&self, db: &rocksdb::DB, batch: &mut WriteBatch) -> Result<(), StateError> {
+    pub(crate) fn append_to_batch(
+        &self,
+        db: &rocksdb::DB,
+        batch: &mut WriteBatch,
+    ) -> Result<(), StateError> {
         for (idx, cfp) in self.cfs.iter().enumerate() {
             let name = CfId(idx as u8).name();
             if !cfp.writes.is_empty() {
@@ -947,6 +951,9 @@ impl Drop for OutOfBatchRecorder {
 pub struct FrozenPending {
     height: u64,
     state: PendingState,
+    /// Item 6 Phase 3 (s114): this set's share of the exec context's
+    /// retention gauges, once attached ([`FrozenPending::track`]).
+    tracked: OnceLock<crate::retention::Tracked>,
 }
 
 /// R's CFs' writes and tombstones in `state`, key-sorted ([`ResidentDelta`]).
@@ -962,9 +969,92 @@ fn resident_delta_of(state: &PendingState) -> ResidentDelta {
 }
 
 impl FrozenPending {
+    /// The frozen pending set (crate-internal: the checkpoint layer merges it).
+    pub(crate) fn pending_state(&self) -> &PendingState {
+        &self.state
+    }
+
     /// The block height whose post-state this set completes.
     pub fn height(&self) -> u64 {
         self.height
+    }
+
+    /// Item 6 Phase 3 (s114): count this set against `stats` until it is
+    /// freed (a no-op if already tracked). Its bytes count from when it is
+    /// merged into a layer ([`crate::CheckpointLayer::merge`]): no walk here.
+    pub fn track(&self, stats: &Arc<crate::RetentionStats>) {
+        self.tracked
+            .get_or_init(|| crate::retention::Tracked::new(stats, 0, Some(self.height)));
+    }
+
+    /// Record this set's [`Self::state_bytes`] (measured by the caller's own
+    /// walk) in its tracked share, if tracked. p3 merge wait: a split merge
+    /// walks [`crate::LayerPart::Main`] then [`crate::LayerPart::Deferred`];
+    /// the main part's bytes replace the share, the deferred part's add to it.
+    pub(crate) fn note_bytes(&self, part: crate::LayerPart, bytes: usize) {
+        if let Some(t) = self.tracked.get() {
+            match part {
+                crate::LayerPart::All | crate::LayerPart::Main => t.set_bytes(bytes),
+                crate::LayerPart::Deferred => t.add_bytes(bytes),
+            }
+        }
+    }
+
+    /// Item 6 Phase 3: the set's state-row bytes in the checkpoint layer's
+    /// measure (key + value per write, key per tombstone; out-of-batch hash
+    /// extras excluded, as the layer excludes them). Merging this set into a
+    /// layer grows it by at most this much (the byte cap's estimate).
+    pub fn state_bytes(&self) -> usize {
+        self.state
+            .cfs
+            .iter()
+            .map(|c| {
+                c.writes
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len())
+                    .sum::<usize>()
+                    + c.deletes.iter().map(Vec::len).sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Item 6 Phase 3 step 2: a copy of this set restricted to `cfs` (same
+    /// height; no hash extras). The ingress read view keeps such slices for
+    /// the blocks under the newest two, so it does not pin every block's book
+    /// blobs until the checkpoint.
+    /// A slice of a tracked set is tracked (its bytes measured here).
+    pub fn slice(&self, cfs: &[&str]) -> FrozenPending {
+        let mut state = PendingState::new();
+        for id in cfs.iter().filter_map(|cf| intern_cf(cf)) {
+            let (dst, src) = (&mut state.cfs[id.0 as usize], self.state.cf(id));
+            dst.writes.clone_from(&src.writes);
+            dst.deletes.clone_from(&src.deletes);
+        }
+        let out = FrozenPending {
+            height: self.height,
+            state,
+            tracked: OnceLock::new(),
+        };
+        if let Some(t) = self.tracked.get() {
+            let bytes = out.state_bytes();
+            let _ = out.tracked.set(crate::retention::Tracked::new(
+                t.stats(),
+                bytes,
+                Some(self.height),
+            ));
+        }
+        out
+    }
+
+    /// Whether every write and tombstone of this set is in one of `cfs`
+    /// (hash extras excluded).
+    pub fn touches_only(&self, cfs: &[&str]) -> bool {
+        let keep: Vec<CfId> = cfs.iter().filter_map(|cf| intern_cf(cf)).collect();
+        self.state
+            .cfs
+            .iter()
+            .enumerate()
+            .all(|(i, c)| c.is_empty() || keep.contains(&CfId(i as u8)))
     }
 
     /// Item 6 cut 5: the frozen block's own writes and tombstones of R's
@@ -989,7 +1079,11 @@ impl FrozenPending {
             crate::cf::META_NATIVE_APPLIED_HEIGHT.to_vec(),
             height.to_be_bytes().to_vec(),
         );
-        Self { height, state }
+        Self {
+            height,
+            state,
+            tracked: OnceLock::new(),
+        }
     }
 
     /// Attach the block's out-of-batch consensus writes (see [`HashExtras`]).
@@ -1049,6 +1143,7 @@ impl FrozenPending {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
+            ChainSrc::Meta,
         )
     }
 
@@ -1069,7 +1164,31 @@ impl FrozenPending {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
-        flush_pending_with_native_trie_stats(
+        self.flush_on_worker(
+            sidecar,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+            None,
+        )
+    }
+
+    /// Item 6 Phase 3: [`Self::flush_with_sidecar_native_trie_stats`] for the
+    /// flush worker, chaining the running hash from `memo` (W's in-memory
+    /// chain state) instead of META, and advancing `memo` once the batch is
+    /// durable. `memo: None` is exactly the sidecar flush. Same batch bytes.
+    pub fn flush_on_worker(
+        &self,
+        sidecar: Option<&FrozenPending>,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+        memo: Option<&mut crate::running_hash::ChainMemo>,
+    ) -> Result<NativeFlushStats, StateError> {
+        flush_pending_after_batch(
+            WriteBatch::default(),
             &self.state,
             sidecar.map(|s| &s.state),
             target,
@@ -1077,7 +1196,52 @@ impl FrozenPending {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
+            memo.map_or(ChainSrc::Meta, ChainSrc::Memo),
         )
+    }
+}
+
+impl FrozenPending {
+    /// Item 6 Phase 3 (`Job::Digest` on the flush worker): the running-hash
+    /// half of [`Self::flush_on_worker`] without the write. Chains `h_height`
+    /// from `memo` over exactly the layers the flush digests (out-of-batch
+    /// extras, this set, `sidecar`), records the rows the flush would have
+    /// appended into `rows`, and advances `memo` at once (the rows are kept
+    /// until the checkpoint; a failed checkpoint latches the fail-stop and
+    /// the restart reloads the chain from META). Returns the digest's
+    /// `(entries, seconds)`.
+    pub fn digest_on_worker(
+        &self,
+        sidecar: Option<&FrozenPending>,
+        target: &StateDb,
+        memo: &mut crate::running_hash::ChainMemo,
+        rows: &mut crate::running_hash::ChainRows,
+    ) -> (usize, f64) {
+        use crate::running_hash::ChainStep;
+        let height = self.height;
+        let step = memo.step(height);
+        let (hash, stats) = match step {
+            ChainStep::Start | ChainStep::Continue(_) => {
+                let mut layers: Vec<&PendingState> = Vec::with_capacity(3);
+                layers.extend(self.state.hash_extras.as_deref());
+                layers.push(&self.state);
+                layers.extend(sidecar.map(|s| &s.state));
+                let (digest, capture, secs) = block_digest(&layers);
+                let entries = digest.entries();
+                if let Some(c) = capture {
+                    crate::running_hash::capture_record(target, height, c);
+                }
+                let prev = match step {
+                    ChainStep::Continue(prev) => prev,
+                    _ => [0; 32],
+                };
+                (Some(digest.chain(&prev, height)), (entries, secs))
+            }
+            _ => (None, (0, 0.0)),
+        };
+        rows.record(target, height, step, hash.as_ref());
+        memo.advance(height, step, hash.as_ref());
+        stats
     }
 }
 
@@ -1115,6 +1279,16 @@ pub struct NativeStateOverlay {
     /// parent is the block R reflects). Set by [`Self::attach_resident`]
     /// BEFORE the overlay is cloned (clones made earlier do not see it).
     resident: Option<Arc<ResidentRows>>,
+    /// Item 6 Phase 3: the since-checkpoint layer L (heights S+1..parent-1,
+    /// last value per key), read after `parent`.
+    layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    /// p3 merge wait: L's [`crate::checkpoint_layer::DEFERRED_CFS`], split
+    /// off `layer` and possibly still being merged; read (waiting for it)
+    /// in `layer`'s place for those CFs only. `None`: `layer` holds every CF.
+    deferred: Option<Arc<crate::checkpoint_layer::DeferredLayer>>,
+    /// Item 6 Phase 3: the checkpoint in flight C (handed to the flush worker,
+    /// not durable yet), read after L and before the DB.
+    inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
 }
 
 impl std::fmt::Debug for NativeStateOverlay {
@@ -1145,12 +1319,115 @@ impl NativeStateOverlay {
     /// (see [`FrozenPending`]). The parent never flushes through this overlay:
     /// `flush*` / `dirty_*` cover this overlay's own writes only.
     pub fn with_parent(db: StateDb, parent: Option<Arc<FrozenPending>>) -> Self {
+        Self::with_layers(db, parent, None, None)
+    }
+
+    /// Item 6 Phase 3: overlay whose reads fall through own pending -> R ->
+    /// `parent` -> `layer` (L) -> `inflight` (C) -> DB. `None`s skip a layer:
+    /// `with_layers(db, parent, None, None)` is [`Self::with_parent`].
+    pub fn with_layers(
+        db: StateDb,
+        parent: Option<Arc<FrozenPending>>,
+        layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+        inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    ) -> Self {
+        Self::with_split_layers(db, parent, layer, None, inflight)
+    }
+
+    /// p3 merge wait: [`Self::with_layers`] with L in two parts: `layer`
+    /// (every CF but [`crate::checkpoint_layer::DEFERRED_CFS`]) and
+    /// `deferred` (those CFs, possibly still being merged). A read of a
+    /// deferred CF that reaches L waits for that part; no other read does.
+    /// What a read returns is the same as with the whole L in `layer`.
+    pub fn with_split_layers(
+        db: StateDb,
+        parent: Option<Arc<FrozenPending>>,
+        layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+        deferred: Option<Arc<crate::checkpoint_layer::DeferredLayer>>,
+        inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    ) -> Self {
         Self {
             db,
             pending: Arc::new(RwLock::new(PendingState::new())),
             parent,
             resident: None,
+            layer,
+            deferred,
+            inflight,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layer_for_tests(&self) -> Option<Arc<crate::checkpoint_layer::CheckpointLayer>> {
+        self.layer.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inflight_for_tests(
+        &self,
+    ) -> Option<Arc<crate::checkpoint_layer::CheckpointLayer>> {
+        self.inflight.clone()
+    }
+
+    /// Item 6 Phase 3: the frozen layers under this overlay's own pending set,
+    /// newest first: parent, L (since-checkpoint layer), C (checkpoint in
+    /// flight). A read resolves in the first layer holding the key, then the
+    /// DB. Without L and C this is exactly the parent alone (bl2).
+    /// p3 merge wait: for a deferred CF (with L split), L is the deferred
+    /// part, waited for if still being merged; `Err` if that merge failed.
+    #[inline]
+    fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
+        Ok([
+            self.parent.as_deref().map(|p| &p.state),
+            self.layer_for(id)?,
+            self.inflight.as_deref().map(|c| c.pending_state()),
+        ])
+    }
+
+    /// L as CF `id` sees it: for a deferred CF (with L split) the deferred
+    /// part, waited for if still being merged; `Err` if that merge failed.
+    #[inline]
+    fn layer_for(&self, id: CfId) -> Result<Option<&PendingState>, StateError> {
+        match &self.deferred {
+            Some(d) if crate::checkpoint_layer::is_deferred_slot(id.0 as usize) => {
+                d.read().map(|l| Some(l.pending_state())).ok_or_else(|| {
+                    StateError::Io(std::io::Error::other(
+                        "since-checkpoint layer merge failed (deferred part lost)",
+                    ))
+                })
+            }
+            _ => Ok(self.layer.as_deref().map(|l| l.pending_state())),
+        }
+    }
+
+    /// The point-read rule over [`Self::lower`]: the first of parent, L, C
+    /// holding `key` (`Some(None)`: a tombstone), `None` if none does. L is
+    /// resolved only on a parent miss, so a parent hit never waits for a
+    /// deferred part still being merged (Codex P3, p3 merge wait r1).
+    #[inline]
+    fn lookup_lower(&self, id: CfId, key: &[u8]) -> Result<Option<Option<&[u8]>>, StateError> {
+        if let Some(hit) = self.parent.as_deref().and_then(|p| p.state.lookup(id, key)) {
+            return Ok(Some(hit));
+        }
+        let rest = [
+            self.layer_for(id)?,
+            self.inflight.as_deref().map(|c| c.pending_state()),
+        ];
+        Ok(rest.into_iter().flatten().find_map(|l| l.lookup(id, key)))
+    }
+
+    /// Item 6 Phase 3: the layered parent (the previous block's frozen set).
+    pub fn parent(&self) -> Option<&Arc<FrozenPending>> {
+        self.parent.as_ref()
+    }
+
+    /// Item 6 Phase 3: drop this overlay's handles on L and C (the end of the
+    /// block takes L back with `Arc::try_unwrap` to merge into it). Reads
+    /// through this overlay no longer see them; call after the hand-off.
+    pub fn detach_layers(&mut self) {
+        self.layer = None;
+        self.deferred = None;
+        self.inflight = None;
     }
 
     /// Height of the layered parent, if any (debug assertions / tests).
@@ -1203,7 +1480,11 @@ impl NativeStateOverlay {
         state.journal_log.clear();
         state.checkpoints.clear();
         state.frozen = false;
-        Arc::new(FrozenPending { height, state })
+        Arc::new(FrozenPending {
+            height,
+            state,
+            tracked: OnceLock::new(),
+        })
     }
 
     /// Attach the block's out-of-batch consensus writes (see [`HashExtras`]);
@@ -1524,6 +1805,7 @@ impl NativeStateOverlay {
             trie_cache,
             member_cache,
             crate::native_trie::native_trie_maintenance_enabled(),
+            ChainSrc::Meta,
         )
     }
 }
@@ -1553,6 +1835,18 @@ fn native_dirty_counts(state: &PendingState, sidecar: Option<&PendingState>) -> 
     counts
 }
 
+/// Where a flush's running-hash step comes from.
+pub(crate) enum ChainSrc<'a> {
+    /// Read META (`chain_step`): the serial path.
+    Meta,
+    /// The flush worker's in-memory chain state; advanced once the batch is
+    /// durable.
+    Memo(&'a mut crate::running_hash::ChainMemo),
+    /// Item 6 Phase 3 checkpoint: no step of its own; the kept rows of the
+    /// digested window join the batch.
+    Rows(&'a crate::running_hash::ChainRows),
+}
+
 /// Running state hash: blocks with at least this many pending entries digest
 /// on a scoped thread, overlapped with the batch build (below it, inline).
 const PARALLEL_DIGEST_MIN_ENTRIES: usize = 4096;
@@ -1577,7 +1871,9 @@ fn block_digest(
 
 /// The one flush implementation, over a borrowed pending set: shared by the live
 /// overlay (serial path, read guard held by the caller) and by [`FrozenPending`]
-/// (flush worker). Byte-identical batch content either way.
+/// (flush worker). Byte-identical batch content either way. Production goes
+/// through [`flush_pending_after_batch`] directly; the tests use this form.
+#[cfg(test)]
 fn flush_pending_with_native_trie_stats(
     state: &PendingState,
     sidecar: Option<&PendingState>,
@@ -1596,6 +1892,31 @@ fn flush_pending_with_native_trie_stats(
         trie_cache,
         member_cache,
         maintain_trie,
+        ChainSrc::Meta,
+    )
+}
+
+/// Item 6 Phase 3: the checkpoint batch (see
+/// [`crate::CheckpointLayer::flush_checkpoint`]).
+pub(crate) fn flush_checkpoint_batch(
+    state: &PendingState,
+    side: Option<&PendingState>,
+    rows: &crate::running_hash::ChainRows,
+    target: &StateDb,
+    height: u64,
+    trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+    member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+) -> Result<NativeFlushStats, StateError> {
+    flush_pending_after_batch(
+        WriteBatch::default(),
+        state,
+        side,
+        target,
+        Some(height),
+        trie_cache,
+        member_cache,
+        crate::native_trie::native_trie_maintenance_enabled(),
+        ChainSrc::Rows(rows),
     )
 }
 
@@ -1611,7 +1932,13 @@ fn flush_pending_after_batch(
     trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     maintain_trie: bool,
+    chain: ChainSrc<'_>,
 ) -> Result<NativeFlushStats, StateError> {
+    let (memo, rows) = match chain {
+        ChainSrc::Meta => (None, None),
+        ChainSrc::Memo(m) => (Some(m), None),
+        ChainSrc::Rows(r) => (None, Some(r)),
+    };
     std::thread::scope(|scope| {
         let raw = target.inner();
 
@@ -1624,7 +1951,18 @@ fn flush_pending_after_batch(
         // the SAME batch as the applied-height marker.
         // Chain-wide activation + validity (review findings 1 / 5): digest
         // only when this height extends a valid chain.
-        let step = applied_height.map(|h| (h, crate::running_hash::chain_step(target, h)));
+        // Item 6 Phase 3: the flush worker passes its in-memory chain state
+        // (`memo`); the serial path reads META as before.
+        // Item 6 Phase 3 checkpoint (`rows`): the window's blocks were
+        // digested one by one on W; this batch carries their kept rows
+        // instead of a step of its own.
+        let step = applied_height.filter(|_| rows.is_none()).map(|h| {
+            let step = match memo.as_deref() {
+                Some(m) => m.step(h),
+                None => crate::running_hash::chain_step(target, h),
+            };
+            (h, step)
+        });
         let hashing = matches!(
             step,
             Some((_, crate::running_hash::ChainStep::Start | crate::running_hash::ChainStep::Continue(_)))
@@ -1776,6 +2114,7 @@ fn flush_pending_after_batch(
 
         // Running state hash: join the digest and append h_n (+ checkpoint),
         // or the unverified marker, to the batch.
+        let mut chain_advance = None;
         if let Some((height, step)) = step {
             let hash = match digest_job {
                 Some(job) => {
@@ -1799,6 +2138,10 @@ fn flush_pending_after_batch(
                 None => None,
             };
             crate::running_hash::append_to_batch(target, &mut batch, height, step, hash.as_ref())?;
+            chain_advance = Some((height, step, hash));
+        }
+        if let Some(rows) = rows {
+            rows.append_to_batch(target, &mut batch)?;
         }
 
         // Measured AFTER the trie/mirror puts and the applied-height marker were
@@ -1813,6 +2156,10 @@ fn flush_pending_after_batch(
 
         match write_result {
             Ok(()) => {
+                // Batch durable: the in-memory chain state follows it.
+                if let (Some(m), Some((h, step, hash))) = (memo, chain_advance) {
+                    m.advance(h, step, hash.as_ref());
+                }
                 // Batch durable: fold the committed changes into the caches. A
                 // trie-maintenance ERROR left the persisted trie stale — the
                 // images must not pretend otherwise (invalidate both, which
@@ -1920,7 +2267,7 @@ pub struct NativeFlushStats {
 }
 
 /// A layer's pending-write keys starting with `prefix`, in key order.
-fn writes_under<'a>(
+pub(crate) fn writes_under<'a>(
     writes: &'a BTreeMap<Vec<u8>, Vec<u8>>,
     prefix: &'a [u8],
 ) -> impl Iterator<Item = &'a Vec<u8>> {
@@ -1936,9 +2283,9 @@ fn writes_under<'a>(
 /// (pending, then parent, then `base`), so tombstones in either layer hide it.
 /// Reads at most `limit` live rows plus the tombstoned base keys in between.
 #[allow(clippy::type_complexity)]
-fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
+pub(crate) fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     pending: &PendingState,
-    parent: Option<&PendingState>,
+    lower: &[Option<&PendingState>],
     id: CfId,
     start: &[u8],
     limit: usize,
@@ -1947,35 +2294,51 @@ fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
     let mut out = Vec::new();
     let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
     let mut pw = pending.cf(id).writes.range::<[u8], _>(range).peekable();
-    let mut aw = parent
-        .into_iter()
-        .flat_map(|s| s.cf(id).writes.range::<[u8], _>(range))
-        .peekable();
+    // Item 6 Phase 3: one write range per lower layer (parent, L, C), newest
+    // first; with only a parent this is exactly the bl2 two-layer merge.
+    let mut aws: Vec<_> = lower
+        .iter()
+        .flatten()
+        .map(|s| s.cf(id).writes.range::<[u8], _>(range).peekable())
+        .collect();
     let mut bh = base.next().transpose()?;
     while out.len() < limit {
-        let heads = [
-            pw.peek().map(|(k, _)| k.as_slice()),
-            aw.peek().map(|(k, _)| k.as_slice()),
-            bh.as_ref().map(|(k, _)| k.as_ref()),
-        ];
-        let Some(key) = heads.into_iter().flatten().min().map(<[u8]>::to_vec) else {
-            break;
+        let key = {
+            let mut min: Option<&[u8]> = pw.peek().map(|(k, _)| k.as_slice());
+            for aw in aws.iter_mut() {
+                if let Some((k, _)) = aw.peek() {
+                    if min.is_none_or(|m| k.as_slice() < m) {
+                        min = Some(k.as_slice());
+                    }
+                }
+            }
+            if let Some((k, _)) = bh.as_ref() {
+                if min.is_none_or(|m| k.as_ref() < m) {
+                    min = Some(k.as_ref());
+                }
+            }
+            match min {
+                Some(k) => k.to_vec(),
+                None => break,
+            }
         };
-        let value = match pending.lookup(id, &key) {
+        let value = match pending
+            .lookup(id, &key)
+            .or_else(|| lower.iter().flatten().find_map(|s| s.lookup(id, &key)))
+        {
             Some(hit) => hit.map(<[u8]>::to_vec),
-            None => match parent.and_then(|s| s.lookup(id, &key)) {
-                Some(hit) => hit.map(<[u8]>::to_vec),
-                None => bh
-                    .as_ref()
-                    .filter(|(k, _)| k.as_ref() == key.as_slice())
-                    .map(|(_, v)| v.as_ref().to_vec()),
-            },
+            None => bh
+                .as_ref()
+                .filter(|(k, _)| k.as_ref() == key.as_slice())
+                .map(|(_, v)| v.as_ref().to_vec()),
         };
         if pw.peek().is_some_and(|(k, _)| **k == key) {
             pw.next();
         }
-        if aw.peek().is_some_and(|(k, _)| **k == key) {
-            aw.next();
+        for aw in aws.iter_mut() {
+            if aw.peek().is_some_and(|(k, _)| **k == key) {
+                aw.next();
+            }
         }
         if bh.as_ref().is_some_and(|(k, _)| k.as_ref() == key.as_slice()) {
             bh = base.next().transpose()?;
@@ -2045,11 +2408,10 @@ impl StateBackend for NativeStateOverlay {
             if let Some(rows) = self.resident_rows(id) {
                 return Ok(rows.get(key).cloned());
             }
-            // bl2 exec pipeline: previous block's frozen set (read-your-writes).
-            if let Some(parent) = &self.parent {
-                if let Some(hit) = parent.state.lookup(id, key) {
-                    return Ok(hit.map(<[u8]>::to_vec));
-                }
+            // bl2 exec pipeline: previous block's frozen set (read-your-writes);
+            // item 6 Phase 3: then L and C.
+            if let Some(hit) = self.lookup_lower(id, key)? {
+                return Ok(hit.map(<[u8]>::to_vec));
             }
         }
         self.db.get_cf_raw(cf, key)
@@ -2127,16 +2489,17 @@ impl StateBackend for NativeStateOverlay {
         // overlay's own pending set — each layer's tombstones remove and its
         // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
-        let parent = self.parent.as_ref().map(|f| &f.state);
+        let lower = self.lower(id)?;
         let state = self.pending.read().unwrap();
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
         // as they are (already sorted and unique under the bytewise comparator).
-        if !state.touches(id, p) && !parent.is_some_and(|s| s.touches(id, p)) {
+        if !state.touches(id, p) && !lower.iter().flatten().any(|s| s.touches(id, p)) {
             return Ok(db_entries);
         }
         let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = db_entries.into_iter().collect();
-        if let Some(parent) = parent {
-            parent.overlay_into(id, prefix, &mut merged);
+        // Oldest layer first (C, L, parent), each over what sits below.
+        for layer in lower.iter().rev().flatten() {
+            layer.overlay_into(id, prefix, &mut merged);
         }
         state.overlay_into(id, prefix, &mut merged);
         drop(state);
@@ -2169,9 +2532,9 @@ impl StateBackend for NativeStateOverlay {
             let base = rows
                 .range::<[u8], _>(range)
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
-            return merge_from(&pending, None, id, start, limit, base);
+            return merge_from(&pending, &[], id, start, limit, base);
         }
-        let parent = self.parent.as_ref().map(|p| &p.state);
+        let lower = self.lower(id)?;
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2182,7 +2545,7 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, parent, id, start, limit, dbi)
+        merge_from(&pending, &lower, id, start, limit, dbi)
     }
 
     /// The layered point-read rule (pending, R, parent, DB) on lengths only.
@@ -2197,10 +2560,8 @@ impl StateBackend for NativeStateOverlay {
             if let Some(rows) = self.resident_rows(id) {
                 return Ok(rows.get(key).map(Vec::len));
             }
-            if let Some(parent) = &self.parent {
-                if let Some(hit) = parent.state.lookup(id, key) {
-                    return Ok(hit.map(<[u8]>::len));
-                }
+            if let Some(hit) = self.lookup_lower(id, key)? {
+                return Ok(hit.map(<[u8]>::len));
             }
         }
         StateBackend::get_cf_len(&self.db, cf, key)
@@ -2231,9 +2592,9 @@ impl StateBackend for NativeStateOverlay {
                 .range::<[u8], _>(range)
                 .take_while(|(k, _)| k.starts_with(prefix))
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
-            return merge_from(&pending, None, id, start, limit, base).map(cut);
+            return merge_from(&pending, &[], id, start, limit, base).map(cut);
         }
-        let parent = self.parent.as_ref().map(|p| &p.state);
+        let lower = self.lower(id)?;
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2245,7 +2606,7 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, parent, id, start, limit, dbi).map(cut)
+        merge_from(&pending, &lower, id, start, limit, dbi).map(cut)
     }
 
     /// Same answer as the merged `iterate_cf`, without materialising it: a key
@@ -2259,12 +2620,17 @@ impl StateBackend for NativeStateOverlay {
         };
         // C6a (B0): R already holds the parent layer — not consulted for R's CFs.
         let rows = self.resident_rows(id);
-        let parent = self.parent.as_ref().filter(|_| rows.is_none());
+        // Item 6 Phase 3: likewise L and C (parent, L, C newest first).
+        let lower = if rows.is_none() {
+            self.lower(id)?
+        } else {
+            [None; 3]
+        };
         let live = |key: &[u8]| -> bool {
             if let Some(hit) = self.pending.read().unwrap().lookup(id, key) {
                 return hit.is_some();
             }
-            match parent.and_then(|p| p.state.lookup(id, key)) {
+            match lower.iter().flatten().find_map(|s| s.lookup(id, key)) {
                 Some(hit) => hit.is_some(),
                 None => true,
             }
@@ -2272,8 +2638,8 @@ impl StateBackend for NativeStateOverlay {
         if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
             return Ok(true);
         }
-        if let Some(parent) = parent {
-            if writes_under(&parent.state.cf(id).writes, prefix).any(|k| live(k)) {
+        for layer in lower.iter().flatten() {
+            if writes_under(&layer.cf(id).writes, prefix).any(|k| live(k)) {
                 return Ok(true);
             }
         }

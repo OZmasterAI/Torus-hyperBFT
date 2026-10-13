@@ -54,6 +54,102 @@ pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
     !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
+/// Item 6 Phase 3: coalesced state checkpoints. `TORUS_CHECKPOINT_INTERVAL_MS`
+/// is the node-local interval of execution time between checkpoints; unset or
+/// `0` keeps today's per-block flush byte for byte.
+pub fn checkpoint_interval() -> Option<std::time::Duration> {
+    parse_checkpoint_interval(std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok())
+}
+
+/// `TORUS_CHECKPOINT_MAX_BYTES`: cap on the since-checkpoint layer's bytes.
+pub fn checkpoint_max_bytes() -> Option<u64> {
+    parse_checkpoint_max_bytes(std::env::var("TORUS_CHECKPOINT_MAX_BYTES").ok())
+}
+
+/// Pure parse of `TORUS_CHECKPOINT_INTERVAL_MS` (milliseconds, trimmed). Unset
+/// or `0` -> `None` (per-block flush, exactly today); anything that is not a
+/// plain unsigned integer -> `None` with a warning (fail safe: today's path).
+pub fn parse_checkpoint_interval(v: Option<String>) -> Option<std::time::Duration> {
+    let raw = v?;
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                "TORUS_CHECKPOINT_INTERVAL_MS is not a whole number of milliseconds; \
+                 ignored (checkpoints off, per-block flush)"
+            );
+            None
+        }
+    }
+}
+
+/// Pure parse of `TORUS_CHECKPOINT_MAX_BYTES` (bytes, trimmed). Unset, `0` or
+/// garbage (warned) -> `None` (no byte cap from the setting).
+pub fn parse_checkpoint_max_bytes(v: Option<String>) -> Option<u64> {
+    let raw = v?;
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(b) => Some(b),
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                "TORUS_CHECKPOINT_MAX_BYTES is not a whole number of bytes; ignored"
+            );
+            None
+        }
+    }
+}
+
+/// Item 6 Phase 3: when E closes the since-checkpoint layer into a
+/// checkpoint (checked at the end of every pipelined block). Attest heights
+/// (`h % 100 == 0`), barriers and shutdown always checkpoint; these are the
+/// node-local extra triggers. `CheckpointPolicy::default()` = only those
+/// ("never by time").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointPolicy {
+    /// Wall time on E since the last checkpoint (`TORUS_CHECKPOINT_INTERVAL_MS`).
+    pub interval: Option<std::time::Duration>,
+    /// Since-checkpoint layer bytes (`TORUS_CHECKPOINT_MAX_BYTES`).
+    pub max_bytes: Option<u64>,
+    /// Every n blocks since the last checkpoint (tests).
+    pub every_blocks: Option<u64>,
+}
+
+impl CheckpointPolicy {
+    /// The node's policy from the environment: `None` (interval unset or 0)
+    /// = today's per-block flush.
+    pub fn from_env() -> Option<Self> {
+        checkpoint_interval().map(|interval| Self {
+            interval: Some(interval),
+            max_bytes: checkpoint_max_bytes(),
+            every_blocks: None,
+        })
+    }
+}
+
+/// Interval > 0 requires a non-deferred book mode (owner s109, plan 6.1): in
+/// modes 2/3 W applies the deferred book save reading the DB as "every height
+/// < N durable", which is false with a since-checkpoint layer. The node
+/// refuses to start; the error names both settings.
+pub fn check_checkpoint_book_mode(
+    interval: Option<std::time::Duration>,
+    mode: torus_bridge::native_executor::BookMode,
+) -> Result<(), String> {
+    use torus_bridge::native_executor::BookMode;
+    match (interval, mode) {
+        (Some(iv), BookMode::LevelAuthority | BookMode::LevelAuthorityChunked) => Err(format!(
+            "TORUS_CHECKPOINT_INTERVAL_MS={} needs a non-deferred book mode, but \
+             TORUS_BOOK_ROWS selects {:?} (deferred book save); unset \
+             TORUS_CHECKPOINT_INTERVAL_MS or use TORUS_BOOK_ROWS unset/0 (Classic) or 1 (OrderRows)",
+            iv.as_millis(),
+            mode
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// One unit of work for W, in commit order.
 pub enum Job {
     /// A native block: flush its frozen pending set (state + trie + marker in one
@@ -84,15 +180,46 @@ pub enum Job {
         height: u64,
         pending: Arc<FrozenPending>,
     },
+    /// Item 6 Phase 3 (checkpoint interval set): a block whose state rows
+    /// are NOT written now. W computes `h_height` from its in-memory
+    /// `h(height-1)` over exactly the layers a `Flush` would digest, and
+    /// keeps the block's running-hash rows, action-status row, EVM accounts
+    /// and order nonces for the next [`Job::Checkpoint`]. Nothing is written
+    /// and `durable_height` does not move.
+    Digest {
+        height: u64,
+        pending: Arc<FrozenPending>,
+        evm_addrs: Vec<Address>,
+        order_nonces: Vec<u64>,
+        action_status: Option<torus_state::action_status::BlockActionStatus>,
+    },
+    /// Item 6 Phase 3: write the since-checkpoint layer `layer` (blocks
+    /// S'+1..=height, last value per key) in ONE atomic batch with the
+    /// marker = `height`, the running-hash rows kept since the last
+    /// checkpoint and the kept action-status rows; then resync the EVM
+    /// mirror for the kept accounts. At most one checkpoint is in flight
+    /// ([`FlushWorker::submit`] waits for the previous one).
+    Checkpoint {
+        height: u64,
+        layer: Arc<torus_state::CheckpointLayer>,
+    },
 }
 
 impl Job {
     pub fn height(&self) -> u64 {
         match self {
-            Job::Flush { height, .. } | Job::Marker { height, .. } => *height,
+            Job::Flush { height, .. }
+            | Job::Marker { height, .. }
+            | Job::Digest { height, .. }
+            | Job::Checkpoint { height, .. } => *height,
         }
     }
 }
+
+/// Item 6 Phase 3: W's queue depth with a checkpoint interval set
+/// (**estimate**, plan task 1.5): digest jobs are small and E must not wait
+/// for a checkpoint write, so the rendezvous becomes a bounded buffer.
+pub const DIGEST_QUEUE: usize = 128;
 
 /// Test hook: a gate W passes through before EVERY job. `hold()` parks W (so a
 /// test can pin "batch(N) in flight"), `release()` lets it run; `fail_next()`
@@ -101,6 +228,10 @@ impl Job {
 #[derive(Default)]
 pub struct WorkerGate {
     held: Mutex<bool>,
+    /// Item 6 Phase 3: park W on checkpoint jobs only (digests pass).
+    hold_ckpt: AtomicBool,
+    /// The checkpoint height W is parked on (`hold_checkpoints`).
+    parked_ckpt: Mutex<Option<u64>>,
     cv: Condvar,
     fail_next: AtomicBool,
     /// Heights W has received (passed the gate) — observability for tests.
@@ -117,8 +248,24 @@ impl WorkerGate {
     }
 
     pub fn release(&self) {
-        *self.held.lock().unwrap() = false;
+        let mut held = self.held.lock().unwrap();
+        *held = false;
+        self.hold_ckpt.store(false, Ordering::SeqCst);
+        drop(held);
         self.cv.notify_all();
+    }
+
+    /// Item 6 Phase 3: park W on the next checkpoint job (its batch "in
+    /// flight": received, not written) until `release`; digest jobs pass.
+    pub fn hold_checkpoints(&self) {
+        let _held = self.held.lock().unwrap();
+        *self.parked_ckpt.lock().unwrap() = None;
+        self.hold_ckpt.store(true, Ordering::SeqCst);
+    }
+
+    /// The checkpoint height W is parked on, if any.
+    pub fn parked_checkpoint(&self) -> Option<u64> {
+        *self.parked_ckpt.lock().unwrap()
     }
 
     pub fn fail_next(&self) {
@@ -143,10 +290,17 @@ impl WorkerGate {
         false
     }
 
-    fn wait_open(&self, height: u64) -> bool {
+    fn wait_open(&self, height: u64, checkpoint: bool) -> bool {
         self.received.lock().unwrap().push(height);
         let mut held = self.held.lock().unwrap();
-        while *held {
+        loop {
+            let ckpt_held = checkpoint && self.hold_ckpt.load(Ordering::SeqCst);
+            if !*held && !ckpt_held {
+                break;
+            }
+            if ckpt_held {
+                *self.parked_ckpt.lock().unwrap() = Some(height);
+            }
             held = self.cv.wait(held).unwrap();
         }
         self.fail_next.swap(false, Ordering::SeqCst)
@@ -162,6 +316,35 @@ struct Shared {
     failed: AtomicBool,
     /// Highest height W has made durable (seeded from the marker at spawn).
     durable_height: AtomicU64,
+    /// Item 6 Phase 3 (task 1.3): the running-hash chain state W digests
+    /// from — `h(n-1)` in memory instead of a META read per block. Seeded
+    /// from META at spawn; reloaded from META after a serial barrier
+    /// (`chain_stale`), when E flushed blocks itself.
+    chain: Mutex<torus_state::running_hash::ChainMemo>,
+    /// Set by E at a barrier (W idle): the serial path is about to write
+    /// META directly, so W reloads `chain` before its next job.
+    chain_stale: AtomicBool,
+    /// Item 6 Phase 3: a checkpoint is handed off and not finished (at most
+    /// one in flight); `ckpt_done` wakes a hand-off waiting on it.
+    ckpt_inflight: Mutex<bool>,
+    ckpt_done: Condvar,
+    /// Checkpoint hand-offs that had to wait for the previous one.
+    ckpt_waits: AtomicU64,
+}
+
+impl Shared {
+    /// W's chain state for the next job (reloaded from META if a serial
+    /// barrier ran since the last job). Only called with W idle or on W.
+    fn chain_for_next(
+        &self,
+        db: &StateDb,
+    ) -> std::sync::MutexGuard<'_, torus_state::running_hash::ChainMemo> {
+        let mut memo = self.chain.lock().unwrap();
+        if self.chain_stale.swap(false, Ordering::SeqCst) {
+            *memo = torus_state::running_hash::ChainMemo::load(db);
+        }
+        memo
+    }
 }
 
 /// `submit` error: W has failed (latched) or its thread is gone.
@@ -178,6 +361,8 @@ pub struct FlushWorker {
     /// Test gate (None in production); released on drop so a failing test
     /// that leaves W parked fails instead of hanging the join.
     gate: Option<Arc<WorkerGate>>,
+    /// The worker's DB (chain-state reload in [`Self::running_hash_prev`]).
+    db: StateDb,
 }
 
 /// Everything W needs to run a job; owned by the worker thread.
@@ -197,12 +382,28 @@ impl FlushWorker {
     /// Spawn W. `durable_height_seed` is the durable applied-height marker at
     /// construction (after boot replay — design §2.1 W.6).
     pub fn spawn(env: WorkerEnv, durable_height_seed: u64) -> Self {
-        let (tx, rx) = sync_channel::<Job>(0);
+        Self::spawn_with_queue(env, durable_height_seed, 0)
+    }
+
+    /// Item 6 Phase 3: W for a checkpoint interval (queue [`DIGEST_QUEUE`]).
+    pub fn spawn_checkpointing(env: WorkerEnv, durable_height_seed: u64) -> Self {
+        Self::spawn_with_queue(env, durable_height_seed, DIGEST_QUEUE)
+    }
+
+    /// `queue` 0 = the bl2 rendezvous (exactly today).
+    fn spawn_with_queue(env: WorkerEnv, durable_height_seed: u64, queue: usize) -> Self {
+        let (tx, rx) = sync_channel::<Job>(queue);
+        let db = env.state_db.clone();
         let shared = Arc::new(Shared {
             outstanding: Mutex::new(0),
             idle: Condvar::new(),
             failed: AtomicBool::new(false),
             durable_height: AtomicU64::new(durable_height_seed),
+            chain: Mutex::new(torus_state::running_hash::ChainMemo::load(&db)),
+            chain_stale: AtomicBool::new(false),
+            ckpt_inflight: Mutex::new(false),
+            ckpt_done: Condvar::new(),
+            ckpt_waits: AtomicU64::new(0),
         });
         let shared_w = shared.clone();
         let gate = env.gate.clone();
@@ -215,6 +416,7 @@ impl FlushWorker {
             handle: Some(handle),
             shared,
             gate,
+            db,
         }
     }
 
@@ -228,6 +430,22 @@ impl FlushWorker {
         let Some(tx) = &self.tx else {
             return Err(WorkerUnavailable);
         };
+        // Item 6 Phase 3: at most one checkpoint in flight. A second one
+        // waits (counted) until W finished the first, or W failed.
+        let ckpt = matches!(job, Job::Checkpoint { .. });
+        if ckpt {
+            let mut busy = self.shared.ckpt_inflight.lock().unwrap();
+            if *busy {
+                self.shared.ckpt_waits.fetch_add(1, Ordering::SeqCst);
+            }
+            while *busy && !self.failed() {
+                busy = self.shared.ckpt_done.wait(busy).unwrap();
+            }
+            if self.failed() {
+                return Err(WorkerUnavailable);
+            }
+            *busy = true;
+        }
         {
             let mut n = self.shared.outstanding.lock().unwrap();
             *n += 1;
@@ -238,6 +456,9 @@ impl FlushWorker {
                 let mut n = self.shared.outstanding.lock().unwrap();
                 *n -= 1;
                 self.shared.idle.notify_all();
+                if ckpt {
+                    release_checkpoint(&self.shared);
+                }
                 Err(WorkerUnavailable)
             }
         }
@@ -261,10 +482,29 @@ impl FlushWorker {
         self.shared.durable_height.load(Ordering::SeqCst)
     }
 
+    /// Item 6 Phase 3: W's in-memory `(height, h_height)` of the last hashed
+    /// block (what the next digest chains from).
+    pub fn running_hash_prev(&self) -> Option<(u64, [u8; 32])> {
+        self.shared.chain_for_next(&self.db).prev()
+    }
+
+    /// Called by E at a barrier, after `wait_idle`: the serial path writes
+    /// META itself from here, so W reloads its chain state before its next
+    /// job.
+    pub fn mark_chain_stale(&self) {
+        self.shared.chain_stale.store(true, Ordering::SeqCst);
+    }
+
     /// Jobs handed off and not yet durable (what `torus_flush_worker_depth`
     /// reports).
     pub fn outstanding(&self) -> usize {
         *self.shared.outstanding.lock().unwrap()
+    }
+
+    /// Item 6 Phase 3: hand-offs of a checkpoint that waited for the
+    /// previous one to become durable.
+    pub fn checkpoint_waits(&self) -> u64 {
+        self.shared.ckpt_waits.load(Ordering::SeqCst)
     }
 }
 
@@ -290,14 +530,41 @@ fn finish_job(shared: &Shared, metrics: &Option<Arc<torus_telemetry::Metrics>>) 
     shared.idle.notify_all();
 }
 
+/// Item 6 Phase 3: the checkpoint in flight is finished (or never reached
+/// W); wake a hand-off waiting for it.
+fn release_checkpoint(shared: &Shared) {
+    *shared.ckpt_inflight.lock().unwrap() = false;
+    shared.ckpt_done.notify_all();
+}
+
+/// Item 6 Phase 3: what W keeps from the digested blocks since the last
+/// checkpoint, for the checkpoint's batch and its after-write work.
+#[derive(Default)]
+struct Window {
+    /// Running-hash META rows of the digested heights (last value per key).
+    rows: torus_state::running_hash::ChainRows,
+    /// Rows W itself produced for the window (action status).
+    side: torus_state::CheckpointLayer,
+    /// EVM accounts the window's native post-commit credited (resync after
+    /// the checkpoint is durable).
+    evm_addrs: std::collections::BTreeSet<Address>,
+    /// Order nonces observed `Durable` once the checkpoint lands.
+    order_nonces: Vec<u64>,
+    /// Last digested height.
+    last: Option<u64>,
+}
+
 fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
     tracing::info!("flush worker thread started (TORUS_EXEC_PIPELINE)");
+    let mut window = Window::default();
     while let Ok(mut job) = rx.recv() {
         let height = job.height();
+        let ckpt = matches!(job, Job::Checkpoint { .. });
+        let digest = matches!(job, Job::Digest { .. });
         if let Some(m) = &env.metrics {
             m.flush_worker_depth.set(*shared.outstanding.lock().unwrap() as i64);
         }
-        let inject_fail = env.gate.as_ref().is_some_and(|g| g.wait_open(height));
+        let inject_fail = env.gate.as_ref().is_some_and(|g| g.wait_open(height, ckpt));
         let timer = std::time::Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if inject_fail {
@@ -309,7 +576,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             if env.exec_failed.load(Ordering::SeqCst) {
                 return Err(JobError::Write("fail-stop latched — refusing to write".into()));
             }
-            run_job(&env, &mut job)
+            run_job(&env, &shared, &mut window, &mut job)
         }));
         let wall = timer.elapsed().as_secs_f64();
         if let Some(m) = &env.metrics {
@@ -320,6 +587,9 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             if matches!(job, Job::Flush { .. }) {
                 m.exec_flush_seconds.observe(wall);
             }
+            if ckpt {
+                m.flush_worker_checkpoint_seconds.observe(wall);
+            }
         }
         if let (Ok(Ok(()) | Err(JobError::TrieStale(_))), Some(m), Job::Flush { order_nonces, .. }) =
             (&result, &env.metrics, &job)
@@ -328,7 +598,13 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         }
         match result {
             Ok(Ok(())) => {
-                shared.durable_height.store(height, Ordering::SeqCst);
+                // A digest makes nothing durable.
+                if !digest {
+                    shared.durable_height.store(height, Ordering::SeqCst);
+                }
+                if ckpt {
+                    release_checkpoint(&shared);
+                }
                 finish_job(&shared, &env.metrics);
             }
             Ok(Err(JobError::TrieStale(e))) => {
@@ -337,6 +613,9 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 // block; caches were invalidated inside the flush. Keep going.
                 tracing::error!(%e, height, "flush worker: native trie maintenance failed (state + marker durable, root stale)");
                 shared.durable_height.store(height, Ordering::SeqCst);
+                if ckpt {
+                    release_checkpoint(&shared);
+                }
                 finish_job(&shared, &env.metrics);
             }
             Ok(Err(JobError::Write(e))) => {
@@ -349,6 +628,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 );
                 shared.failed.store(true, Ordering::SeqCst);
                 env.exec_failed.store(true, Ordering::SeqCst);
+                release_checkpoint(&shared);
                 finish_job(&shared, &env.metrics);
                 return;
             }
@@ -356,6 +636,7 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                 tracing::error!(height, "FATAL: flush worker PANICKED — latching fail-stop");
                 shared.failed.store(true, Ordering::SeqCst);
                 env.exec_failed.store(true, Ordering::SeqCst);
+                release_checkpoint(&shared);
                 finish_job(&shared, &env.metrics);
                 return;
             }
@@ -371,7 +652,13 @@ enum JobError {
     TrieStale(String),
 }
 
-fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
+fn run_job(
+    env: &WorkerEnv,
+    shared: &Shared,
+    window: &mut Window,
+    job: &mut Job,
+) -> Result<(), JobError> {
+    let mut chain = shared.chain_for_next(&env.state_db);
     match job {
         Job::Marker { height, pending } => {
             // Exactly today's `write_native_applied_height` bytes, sequenced
@@ -379,9 +666,117 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
             // through the frozen 1-key set so the bytes are the SAME object the
             // exec thread layered under the next overlay.
             pending
-                .flush_with_native_trie_stats(&env.state_db, Some(*height), None, None)
+                .flush_on_worker(
+                    None,
+                    &env.state_db,
+                    Some(*height),
+                    None,
+                    None,
+                    Some(&mut chain),
+                )
                 .map(|_| ())
                 .map_err(|e| JobError::Write(e.to_string()))
+        }
+        Job::Digest {
+            height,
+            pending,
+            evm_addrs,
+            order_nonces,
+            action_status,
+        } => {
+            // The window is contiguous: E checkpoints before any serial
+            // block, so a gap here is a pipeline bug — never chain over it.
+            if let Some(last) = window.last {
+                if last + 1 != *height {
+                    return Err(JobError::Write(format!(
+                        "digest {height} does not follow the digested window (last {last})"
+                    )));
+                }
+            }
+            // v2 action status: encoded here as on a Flush job, kept in
+            // the window's side rows (and digested as the Flush sidecar).
+            let sidecar = action_status.take().map(|status| {
+                let overlay = torus_state::NativeStateOverlay::new(env.state_db.clone());
+                let bytes = crate::action_results::encode_status(&status, env.metrics.as_deref());
+                if let Err(e) = torus_state::StateBackend::put_cf_raw(
+                    &overlay,
+                    torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                    &height.to_be_bytes(),
+                    &bytes,
+                ) {
+                    tracing::error!(%e, height, "flush worker: failed to stage the action status record");
+                }
+                overlay.freeze(*height)
+            });
+            let (entries, secs) = pending.digest_on_worker(
+                sidecar.as_deref(),
+                &env.state_db,
+                &mut chain,
+                &mut window.rows,
+            );
+            if let Some(m) = &env.metrics {
+                m.state_hash_seconds.observe(secs);
+                m.state_hash_entries.inc_by(entries as u64);
+            }
+            if let Some(side) = &sidecar {
+                window.side.merge(side);
+            }
+            window.evm_addrs.extend(evm_addrs.drain(..));
+            window.order_nonces.append(order_nonces);
+            window.last = Some(*height);
+            Ok(())
+        }
+        Job::Checkpoint { height, layer } => {
+            if window.last != Some(*height) || layer.top_height() != Some(*height) {
+                return Err(JobError::Write(format!(
+                    "checkpoint {height} does not close the digested window (last digest {:?}, layer top {:?})",
+                    window.last,
+                    layer.top_height()
+                )));
+            }
+            let flush_result = {
+                let mut trie_cache = env.trie_cache.lock().expect("trie-cache mutex poisoned");
+                let cache_opt = if torus_state::native_trie::native_root_cache_enabled() {
+                    Some(&mut *trie_cache)
+                } else {
+                    None
+                };
+                let mut member_cache = env
+                    .member_cache
+                    .lock()
+                    .expect("member-cache mutex poisoned");
+                let member_opt = if member_cache.is_enabled() {
+                    Some(&mut *member_cache)
+                } else {
+                    None
+                };
+                layer.flush_checkpoint(
+                    (!window.side.is_empty()).then_some(&window.side),
+                    &window.rows,
+                    &env.state_db,
+                    *height,
+                    cache_opt,
+                    member_opt,
+                )
+            };
+            let landed = match flush_result {
+                Ok(stats) => {
+                    observe_flush_stats(env, &stats);
+                    Ok(())
+                }
+                Err(e) if marker_is(env, *height) => Err(JobError::TrieStale(e.to_string())),
+                Err(e) => return Err(JobError::Write(e.to_string())),
+            };
+            // The window is durable: start the next one.
+            let done = std::mem::take(window);
+            if let Some(m) = &env.metrics {
+                m.observe_order_ages(
+                    torus_telemetry::OrderStage::Durable,
+                    done.order_nonces.iter().copied(),
+                );
+            }
+            resync_evm(env, *height, done.evm_addrs.into_iter().collect());
+            landed
         }
         Job::Flush {
             height,
@@ -455,77 +850,88 @@ fn run_job(env: &WorkerEnv, job: &mut Job) -> Result<(), JobError> {
                 } else {
                     None
                 };
-                pending.flush_with_sidecar_native_trie_stats(
+                pending.flush_on_worker(
                     sidecar.as_deref(),
                     &env.state_db,
                     Some(*height),
                     cache_opt,
                     member_opt,
+                    Some(&mut chain),
                 )
             };
             match flush_result {
-                Ok(stats) => {
-                    if let Some(m) = &env.metrics {
-                        m.exec_root_seconds.observe(stats.root_seconds);
-                        m.state_hash_seconds.observe(stats.state_hash_seconds);
-                        m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
-                        m.exec_state_write_seconds.observe(stats.write_seconds);
-                        m.exec_state_write_build_seconds
-                            .observe(stats.write_build_seconds);
-                        m.exec_state_write_db_seconds
-                            .observe(stats.write_db_seconds);
-                        m.exec_state_write_batch_bytes
-                            .observe(stats.batch_bytes as f64);
-                        m.exec_root_dirty_buckets.observe(stats.dirty_buckets as f64);
-                        m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
-                        m.member_cache_hits.inc_by(stats.member_hits as u64);
-                        m.member_cache_misses.inc_by(stats.member_misses as u64);
-                        m.member_cache_evictions.inc_by(stats.member_evictions as u64);
-                        m.member_cache_resident_buckets
-                            .set(stats.member_resident_buckets as i64);
-                        for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
-                            m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);
-                        }
-                    }
-                }
+                Ok(stats) => observe_flush_stats(env, &stats),
                 Err(e) => {
                     // `flush_with_native_trie_stats` returns Err both when the
                     // write failed (nothing landed) and when the write landed but
                     // trie maintenance failed. The durable marker tells them apart.
-                    let landed = env
-                        .state_db
-                        .get_cf_raw(
-                            torus_state::cf::CF_CONSENSUS_META,
-                            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
-                        )
-                        .ok()
-                        .flatten()
-                        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
-                        .map(u64::from_be_bytes)
-                        == Some(*height);
-                    return Err(if landed {
+                    return Err(if marker_is(env, *height) {
                         JobError::TrieStale(e.to_string())
                     } else {
                         JobError::Write(e.to_string())
                     });
                 }
             }
-            // Phase A: native post-commit credited EVM balances straight to
-            // CF_ACCOUNTS; resync the incremental mirror AFTER our own batch is
-            // durable (DB->DB, sequenced here — design F2). Best-effort, as today.
-            let resync_timer = std::time::Instant::now();
-            if !evm_addrs.is_empty() {
-                if let Err(e) =
-                    torus_state::incremental::resync_evm_accounts(&env.state_db, evm_addrs)
-                {
-                    tracing::error!(%e, height, "flush worker: failed to resync incremental trie after native post-commit");
-                }
-            }
-            if let Some(m) = &env.metrics {
-                m.exec_evm_resync_seconds
-                    .observe(resync_timer.elapsed().as_secs_f64());
-            }
+            resync_evm(env, *height, std::mem::take(evm_addrs));
             Ok(())
+        }
+    }
+}
+
+/// The durable applied marker equals `height` (a flush that returned Err
+/// landed: only trie maintenance failed).
+fn marker_is(env: &WorkerEnv, height: u64) -> bool {
+    env.state_db
+        .get_cf_raw(
+            torus_state::cf::CF_CONSENSUS_META,
+            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+        )
+        .ok()
+        .flatten()
+        .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+        .map(u64::from_be_bytes)
+        == Some(height)
+}
+
+/// Phase A: native post-commit credited EVM balances straight to
+/// CF_ACCOUNTS; resync the incremental mirror AFTER the batch is durable
+/// (DB->DB, sequenced here — design F2). Best-effort, as today.
+fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
+    let resync_timer = std::time::Instant::now();
+    if !evm_addrs.is_empty() {
+        if let Err(e) = torus_state::incremental::resync_evm_accounts(&env.state_db, &evm_addrs) {
+            tracing::error!(%e, height, "flush worker: failed to resync incremental trie after native post-commit");
+        }
+    }
+    if let Some(m) = &env.metrics {
+        m.exec_evm_resync_seconds
+            .observe(resync_timer.elapsed().as_secs_f64());
+    }
+}
+
+fn observe_flush_stats(env: &WorkerEnv, stats: &torus_state::NativeFlushStats) {
+    if let Some(m) = &env.metrics {
+        m.exec_root_seconds.observe(stats.root_seconds);
+        m.state_hash_seconds.observe(stats.state_hash_seconds);
+        m.state_hash_entries.inc_by(stats.state_hash_entries as u64);
+        m.exec_state_write_seconds.observe(stats.write_seconds);
+        m.exec_state_write_build_seconds
+            .observe(stats.write_build_seconds);
+        m.exec_state_write_db_seconds
+            .observe(stats.write_db_seconds);
+        m.exec_state_write_batch_bytes
+            .observe(stats.batch_bytes as f64);
+        m.exec_root_dirty_buckets
+            .observe(stats.dirty_buckets as f64);
+        m.exec_root_bucket_scans.inc_by(stats.bucket_scans as u64);
+        m.member_cache_hits.inc_by(stats.member_hits as u64);
+        m.member_cache_misses.inc_by(stats.member_misses as u64);
+        m.member_cache_evictions
+            .inc_by(stats.member_evictions as u64);
+        m.member_cache_resident_buckets
+            .set(stats.member_resident_buckets as i64);
+        for (i, n) in stats.dirty_entries_by_cf.iter().enumerate() {
+            m.exec_dirty_entries_by_cf[i].inc_by(*n as u64);
         }
     }
 }
@@ -542,6 +948,56 @@ mod tests {
         }
         assert!(!parse_exec_pipeline_toggle(Some("0".to_string())));
         assert!(!parse_exec_pipeline_toggle(Some(" 0 ".to_string())));
+    }
+
+    #[test]
+    fn checkpoint_interval_parse() {
+        use std::time::Duration;
+        assert_eq!(parse_checkpoint_interval(None), None);
+        assert_eq!(parse_checkpoint_interval(Some("0".into())), None);
+        assert_eq!(parse_checkpoint_interval(Some(" 0 ".into())), None);
+        assert_eq!(
+            parse_checkpoint_interval(Some("15000".into())),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            parse_checkpoint_interval(Some(" 1 ".into())),
+            Some(Duration::from_millis(1))
+        );
+        for bad in ["", "abc", "-5", "15s", "1.5"] {
+            assert_eq!(parse_checkpoint_interval(Some(bad.into())), None, "{bad:?}");
+        }
+        assert_eq!(parse_checkpoint_max_bytes(None), None);
+        assert_eq!(parse_checkpoint_max_bytes(Some("0".into())), None);
+        assert_eq!(
+            parse_checkpoint_max_bytes(Some("268435456".into())),
+            Some(268_435_456)
+        );
+        assert_eq!(parse_checkpoint_max_bytes(Some("lots".into())), None);
+    }
+
+    #[test]
+    fn checkpoint_interval_refuses_deferred_book_modes() {
+        use std::time::Duration;
+        use torus_bridge::native_executor::BookMode;
+        let on = Some(Duration::from_secs(15));
+        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            let err = check_checkpoint_book_mode(on, mode)
+                .expect_err("interval > 0 with a deferred book mode must refuse to start");
+            assert!(err.contains("TORUS_CHECKPOINT_INTERVAL_MS"), "{err}");
+            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
+        }
+        for mode in [BookMode::Classic, BookMode::OrderRows] {
+            assert_eq!(check_checkpoint_book_mode(on, mode), Ok(()), "{mode:?}");
+        }
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            assert_eq!(check_checkpoint_book_mode(None, mode), Ok(()), "{mode:?}");
+        }
     }
 
     fn temp_env(gate: Option<Arc<WorkerGate>>) -> (WorkerEnv, tempfile::TempDir) {
@@ -678,6 +1134,287 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker, None, "no marker written after the external latch");
+    }
+
+    // ---- Item 6 Phase 3 task 1.5: Digest and Checkpoint jobs ----
+
+    type CfDump = Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>;
+
+    fn dump_all(db: &StateDb) -> CfDump {
+        torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .map(|cf| {
+                (
+                    *cf,
+                    torus_state::StateBackend::iterate_cf(db, cf, None).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_dumps_eq(a: &CfDump, b: &CfDump, what: &str) {
+        for ((cf, x), (_, y)) in a.iter().zip(b.iter()) {
+            assert_eq!(x, y, "{what}: CF {cf} diverged");
+        }
+    }
+
+    /// One block's frozen set: rewrites / tombstones over a small key space
+    /// in hashed CFs (so blocks overwrite each other's rows), the applied
+    /// marker put as E's fast path does, and every third block an action
+    /// status record.
+    fn ckpt_block(
+        db: &StateDb,
+        height: u64,
+    ) -> (
+        Arc<FrozenPending>,
+        Option<torus_state::action_status::BlockActionStatus>,
+    ) {
+        use torus_state::StateBackend;
+        let o = torus_state::NativeStateOverlay::new(db.clone());
+        let cfs = [
+            torus_state::cf::CF_NATIVE_ORDERS,
+            torus_state::cf::CF_NATIVE_BALANCES,
+            torus_state::cf::CF_SESSIONS,
+        ];
+        for i in 0..6u64 {
+            let x = height.wrapping_mul(2_654_435_761).wrapping_add(i * 97);
+            let cf = cfs[(x % 3) as usize];
+            let key = [b'k', (x % 11) as u8];
+            if x.is_multiple_of(5) {
+                o.delete_cf_raw(cf, &key).unwrap();
+            } else {
+                o.put_cf_raw(cf, &key, &[height as u8, i as u8, (x >> 8) as u8])
+                    .unwrap();
+            }
+        }
+        o.put_cf_raw(
+            torus_state::cf::CF_CONSENSUS_META,
+            torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+            &height.to_be_bytes(),
+        )
+        .unwrap();
+        let status = torus_state::action_status::BlockActionStatus {
+            evm_skipped: vec![false, true],
+            native_skipped: vec![height.is_multiple_of(2)],
+            native_failed: Vec::new(),
+            // v4 (main s112): a CoreWriter result rides the checkpoint too.
+            core_writer: vec![torus_state::action_status::CoreWriterResult {
+                seq: height,
+                kind: torus_state::action_status::CoreWriterKind::LockboxDeposit,
+                trader: alloy_primitives::Address::repeat_byte(height as u8),
+                queued_block: height.saturating_sub(1),
+                outcome: torus_state::action_status::Outcome::Failed,
+                reason: torus_state::action_status::FailureReason::Other,
+                message: format!("row {height}"),
+                // v5 (main s114): the order id / cloid fields ride it too.
+                oid: Some(u128::from(height)),
+                cloid: height
+                    .is_multiple_of(2)
+                    .then_some(u128::MAX - u128::from(height)),
+            }],
+        };
+        let status = height.is_multiple_of(3).then_some(status);
+        (o.freeze(height), status)
+    }
+
+    /// Per-block reference: the same frozen sets through `Job::Flush`.
+    fn reference_db(
+        heights: std::ops::RangeInclusive<u64>,
+        activation: u64,
+    ) -> (StateDb, tempfile::TempDir) {
+        let (env, dir) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(activation)).unwrap();
+        let worker = FlushWorker::spawn(env, 0);
+        for h in heights {
+            let (pending, action_status) = ckpt_block(&db, h);
+            worker
+                .submit(Job::Flush {
+                    height: h,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    books: None,
+                    order_nonces: Vec::new(),
+                    action_status,
+                })
+                .unwrap();
+        }
+        assert!(worker.wait_idle());
+        drop(worker);
+        (db, dir)
+    }
+
+    /// Hand blocks `heights` to `worker` as digest jobs and return the
+    /// since-checkpoint layer E would hold for them.
+    fn digest_window(
+        worker: &FlushWorker,
+        db: &StateDb,
+        heights: std::ops::RangeInclusive<u64>,
+    ) -> torus_state::CheckpointLayer {
+        let mut layer = torus_state::CheckpointLayer::new();
+        for h in heights {
+            let (pending, action_status) = ckpt_block(db, h);
+            layer.merge(&pending);
+            worker
+                .submit(Job::Digest {
+                    height: h,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    order_nonces: Vec::new(),
+                    action_status,
+                })
+                .unwrap();
+        }
+        layer
+    }
+
+    /// 20 blocks as digest jobs leave the DB untouched; the checkpoint at
+    /// 100 then writes ONE batch after which the DB equals the per-block
+    /// flush DB at 100 (state, marker, running hash, activation record,
+    /// attest checkpoint row, action status). A second window (101..=120)
+    /// chains from W's in-memory h(100) and matches again.
+    #[test]
+    fn digest_jobs_then_checkpoint_writes_one_batch() {
+        let (env, _dir) = temp_env(None);
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(81)).unwrap();
+        let before = dump_all(&db);
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+
+        let layer = digest_window(&worker, &db, 81..=100);
+        assert!(worker.wait_idle());
+        assert_dumps_eq(&dump_all(&db), &before, "digests wrote nothing");
+        assert_eq!(worker.durable_height(), 0, "digests are not durable");
+        let (ref100, _r1) = reference_db(81..=100, 81);
+        let h100 =
+            torus_state::running_hash::read_running_hash(&ref100).expect("reference hashed 100");
+        assert_eq!(
+            worker.running_hash_prev(),
+            Some(h100),
+            "W chained h(100) in memory"
+        );
+
+        worker
+            .submit(Job::Checkpoint {
+                height: 100,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        assert_eq!(worker.durable_height(), 100);
+        assert!(
+            torus_state::running_hash::read_checkpoint(&db, 100).is_some(),
+            "attest row"
+        );
+        assert_dumps_eq(&dump_all(&db), &dump_all(&ref100), "checkpoint at 100");
+
+        let before2 = dump_all(&db);
+        let layer = digest_window(&worker, &db, 101..=120);
+        assert!(worker.wait_idle());
+        assert_dumps_eq(
+            &dump_all(&db),
+            &before2,
+            "second window: digests wrote nothing",
+        );
+        worker
+            .submit(Job::Checkpoint {
+                height: 120,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        let (ref120, _r2) = reference_db(81..=120, 81);
+        assert_dumps_eq(&dump_all(&db), &dump_all(&ref120), "checkpoint at 120");
+    }
+
+    /// A failed checkpoint write latches W and the shared fail-stop; nothing
+    /// of the window lands and no later job is accepted.
+    #[test]
+    fn checkpoint_write_failure_latches() {
+        let gate = WorkerGate::new();
+        let (env, _dir) = temp_env(Some(gate.clone()));
+        let db = env.state_db.clone();
+        let exec_failed = env.exec_failed.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let before = dump_all(&db);
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+        let layer = digest_window(&worker, &db, 1..=10);
+        assert!(worker.wait_idle());
+        assert_eq!(worker.durable_height(), 0, "digests are not durable");
+        gate.fail_next();
+        worker
+            .submit(Job::Checkpoint {
+                height: 10,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(!worker.wait_idle(), "wait_idle must report the failure");
+        assert!(worker.failed());
+        assert!(
+            exec_failed.load(Ordering::SeqCst),
+            "shared fail-stop latched"
+        );
+        assert_eq!(worker.durable_height(), 0);
+        assert_dumps_eq(&dump_all(&db), &before, "nothing of the window landed");
+        let (pending, _) = ckpt_block(&db, 11);
+        assert!(
+            worker
+                .submit(Job::Digest {
+                    height: 11,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    order_nonces: Vec::new(),
+                    action_status: None,
+                })
+                .is_err(),
+            "no job may be accepted after the latch"
+        );
+    }
+
+    /// At most one checkpoint in flight: while W holds checkpoint 5, digest
+    /// jobs still queue without blocking E, but handing off checkpoint 10
+    /// blocks until 5 is durable. The end state equals the per-block DB.
+    #[test]
+    fn second_checkpoint_waits_for_first() {
+        let gate = WorkerGate::new();
+        let (env, _dir) = temp_env(Some(gate.clone()));
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let worker = Arc::new(FlushWorker::spawn_checkpointing(env, 0));
+
+        let layer = digest_window(&worker, &db, 1..=5);
+        assert!(worker.wait_idle());
+        gate.hold();
+        worker
+            .submit(Job::Checkpoint {
+                height: 5,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(gate.wait_received(5), "W holds checkpoint 5");
+        // Digest jobs do not wait for the checkpoint (buffered queue).
+        let layer2 = digest_window(&worker, &db, 6..=10);
+        let w2 = worker.clone();
+        let sender = std::thread::spawn(move || {
+            w2.submit(Job::Checkpoint {
+                height: 10,
+                layer: Arc::new(layer2),
+            })
+            .unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !sender.is_finished(),
+            "checkpoint 10 must wait for checkpoint 5"
+        );
+        assert_eq!(worker.durable_height(), 0);
+        gate.release();
+        sender.join().unwrap();
+        assert!(worker.wait_idle());
+        assert_eq!(worker.durable_height(), 10);
+        assert!(worker.checkpoint_waits() >= 1, "the wait is counted");
+        let (reference, _r) = reference_db(1..=10, 1);
+        assert_dumps_eq(&dump_all(&db), &dump_all(&reference), "two checkpoints");
     }
 
     /// Drop drains: a job handed off right before drop is durable after drop.

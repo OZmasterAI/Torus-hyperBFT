@@ -66,12 +66,403 @@ fn refused_proposal() -> ProduceBlockResponse {
     }
 }
 
+/// Item 6 Phase 3: the exec thread's checkpoint bookkeeping (plan section
+/// 3). At the start of pipelined block n the overlay reads own pending -> R
+/// -> parent (frozen n-1) -> `layer` (L: S+1..=n-2, last value per key) ->
+/// `inflight` (C) -> DB, where S = `base` is the last checkpoint handed to
+/// W.
+///
+/// p3 merge wait: between blocks L is in two parts. `layer` holds every CF
+/// but [`torus_state::DEFERRED_CFS`] (positions, balances: ~92% of a
+/// block's keys, read by a native block from R only); `deferred` holds
+/// those, merged by the merge thread after it hands `layer` back, so E
+/// waits at the start of a block only for the small part. A read of a
+/// deferred CF through L waits for its part (same answer as a whole L);
+/// E joins it at the end of the block, before L is read whole or taken.
+#[derive(Default)]
+struct CkptState {
+    /// L, the main part (all of L when `deferred` is `None`). `None` = empty.
+    layer: Option<Arc<torus_state::CheckpointLayer>>,
+    /// p3 merge wait: L's deferred part, possibly still being merged.
+    deferred: Option<Arc<torus_state::DeferredLayer>>,
+    /// The merge of the previous parent into L, running off E since the end
+    /// of the previous block; L is received before it is read or taken.
+    /// Step 2: with a mempool wired the thread then cuts that block's
+    /// ingress slice (`slicing`).
+    merging: Option<LayerMerge>,
+    /// Step 2: ingress slices still being cut (received by `settle`), each
+    /// to replace its block's full frozen set in `view_blocks`
+    /// (`install_slices`, before the next view publish).
+    slicing: Vec<std::sync::mpsc::Receiver<Arc<torus_state::FrozenPending>>>,
+    /// C: `(height, layer)` handed to W, dropped once W's durable height
+    /// reaches it.
+    inflight: Option<(u64, Arc<torus_state::CheckpointLayer>)>,
+    /// S: the height the last checkpoint closed (blocks at or below it are
+    /// never merged into L again).
+    base: u64,
+    /// When the current window started (armed at its first block).
+    since: Option<std::time::Instant>,
+    /// L was still shared when E took it back (deep copy instead).
+    shared_fallbacks: u64,
+    /// Step 2: the frozen sets of the blocks above `base` (oldest first),
+    /// which the published ingress view layers over C and the DB; each is
+    /// swapped for its ingress slice once merged into L (`settle`). Cleared
+    /// when a checkpoint closes them (C then holds them) and at a barrier.
+    view_blocks: Vec<Arc<torus_state::FrozenPending>>,
+    /// Step 2: E's handle on the view the mempool holds, so the mempool's
+    /// swap only drops a reference and E hands the old view to `dropper`.
+    published: Option<torus_state::ReadView>,
+    /// p3s2g 47.1: frees released layers / sets / views off E (`None`:
+    /// interval 0, or the thread could not start: E frees them itself).
+    dropper: Option<Dropper>,
+    /// s114: live counts of the frozen sets, slices, layers and read views
+    /// this path creates (tracked where E makes or first holds them), for
+    /// the `torus_exec_checkpoint_live_*`, `_read_views_live` and
+    /// `_oldest_live_age_blocks` gauges (set once per pipelined block).
+    retention: Arc<torus_state::RetentionStats>,
+    /// p3 merge wait test seam: holds each merge's deferred half (see
+    /// [`DeferredGate`]).
+    #[cfg(test)]
+    test_gate: Option<Arc<DeferredGate>>,
+}
+
+impl CkptState {
+    /// Receive L's main part from a running merge. Only that: the merge
+    /// thread hands it back before it merges the deferred part, cuts the
+    /// ingress slice and lets go of the merged block (p3s2g 47.1, p3 merge
+    /// wait); the deferred part becomes `deferred` (still arriving).
+    /// `false`: the merge panicked — L is lost, the caller must fail-stop.
+    fn settle(&mut self) -> bool {
+        let Some(merge) = self.merging.take() else {
+            return true;
+        };
+        match merge.layer.recv() {
+            Ok(layer) => {
+                self.layer = Some(Arc::new(layer));
+                debug_assert!(self.deferred.is_none(), "the merge took L whole");
+                let part = torus_state::DeferredLayer::pending(merge.deferred);
+                #[cfg(test)]
+                let part = match &self.test_gate {
+                    Some(g) => {
+                        let g = g.clone();
+                        part.on_block(move || g.release())
+                    }
+                    None => part,
+                };
+                self.deferred = Some(Arc::new(part));
+                self.slicing.extend(merge.slice);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// [`Self::settle`], then wait for the deferred part: L is whole after
+    /// it. `false`: a merge panicked (fail-stop).
+    fn settle_all(&mut self) -> bool {
+        self.settle() && self.deferred.as_ref().is_none_or(|d| d.join().is_some())
+    }
+
+    /// Bytes of L (both parts). Call after [`Self::settle_all`].
+    fn layer_bytes(&self) -> usize {
+        self.layer.as_ref().map_or(0, |l| l.bytes())
+            + self
+                .deferred
+                .as_ref()
+                .and_then(|d| d.join())
+                .map_or(0, |l| l.bytes())
+    }
+
+    /// Step 2: the merged blocks' ingress slices stand in for their full
+    /// sets in the view (gone already if a checkpoint or a barrier cleared
+    /// them). Called at the end of the block after `settle`: each slice was
+    /// cut while the block ran, so this rarely waits. A cut that panicked
+    /// leaves the full set, which answers the same.
+    fn install_slices(&mut self) {
+        for rx in std::mem::take(&mut self.slicing) {
+            let Ok(slice) = rx.recv() else {
+                continue;
+            };
+            match self
+                .view_blocks
+                .iter_mut()
+                .find(|b| b.height() == slice.height())
+            {
+                Some(b) => {
+                    let full = std::mem::replace(b, slice);
+                    self.discard(full);
+                }
+                None => self.discard(slice),
+            }
+        }
+    }
+
+    /// Drop the view's blocks (a checkpoint now holds them in C, or a
+    /// barrier made them durable) and any slice still being cut for them.
+    fn clear_view_blocks(&mut self) {
+        self.slicing.clear();
+        for b in std::mem::take(&mut self.view_blocks) {
+            self.discard(b);
+        }
+    }
+
+    /// Free `item` on the dropper (inline without one).
+    fn discard<T: Send + 'static>(&self, item: T) {
+        match &self.dropper {
+            Some(d) => d.drop_later(item),
+            None => drop(item),
+        }
+    }
+
+    /// Take L back whole as an owned layer (empty if none): the main part
+    /// with the deferred part folded back in (moved, not copied). Call
+    /// after `settle_all`.
+    fn take_layer(&mut self) -> torus_state::CheckpointLayer {
+        let mut layer = match self.layer.take() {
+            None => {
+                let mut layer = torus_state::CheckpointLayer::new();
+                layer.track(&self.retention);
+                layer
+            }
+            Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|shared| {
+                self.shared_fallbacks += 1;
+                tracing::warn!(
+                    fallbacks = self.shared_fallbacks,
+                    "item 6 Phase 3: since-checkpoint layer still shared at the end of the block — copying it"
+                );
+                shared.duplicate()
+            }),
+        };
+        if let Some(d) = self.deferred.take() {
+            let part = match Arc::try_unwrap(d) {
+                Ok(d) => d.into_layer(),
+                Err(shared) => {
+                    self.shared_fallbacks += 1;
+                    tracing::warn!(
+                        fallbacks = self.shared_fallbacks,
+                        "item 6 Phase 3: deferred layer part still shared at the end of the block — copying it"
+                    );
+                    shared.join().map(torus_state::CheckpointLayer::duplicate)
+                }
+            };
+            debug_assert!(part.is_some(), "take_layer before settle_all");
+            if let Some(part) = part {
+                layer.absorb(part);
+            }
+        }
+        layer
+    }
+}
+
+/// p3 merge wait test seam: the deferred half of each layer merge waits
+/// until E reaches a point that may need it (the end-of-block upkeep, a
+/// drain) or a read blocks on it, all of which release it. A hold that
+/// times out means E waited for the deferred half where nothing should:
+/// it is counted and the gate opens for the rest of the run.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DeferredGate {
+    state: std::sync::Mutex<DeferredGateState>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+struct DeferredGateState {
+    /// Merges started (each takes the next ticket).
+    spawned: u64,
+    /// Every ticket up to here is released.
+    released: u64,
+    /// Holds that ended by a release.
+    held: u64,
+    /// Holds that timed out (then `open`).
+    timeouts: u64,
+    open: bool,
+}
+
+#[cfg(test)]
+impl DeferredGate {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn ticket(&self) -> u64 {
+        let mut s = self.state.lock().unwrap();
+        s.spawned += 1;
+        s.spawned
+    }
+
+    /// The merge thread, before the deferred half of merge `ticket`.
+    fn hold(&self, ticket: u64) {
+        let s = self.state.lock().unwrap();
+        let (mut s, _) = self
+            .cv
+            .wait_timeout_while(s, Self::TIMEOUT, |s| !s.open && s.released < ticket)
+            .unwrap();
+        if s.released >= ticket {
+            s.held += 1;
+        } else if !s.open {
+            s.timeouts += 1;
+            s.open = true;
+        }
+    }
+
+    /// Release every merge started so far.
+    fn release(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.released = s.spawned;
+        self.cv.notify_all();
+    }
+
+    fn stats(&self) -> DeferredGateState {
+        *self.state.lock().unwrap()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingSlash {
     validator: Address,
     fraction_bps: u16,
     reason: SlashReason,
     tombstone: bool,
+}
+
+/// Item 6 Phase 3: (L, L's deferred part, C) under a pipelined overlay's
+/// parent.
+type CkptLayers = (
+    Option<Arc<torus_state::CheckpointLayer>>,
+    Option<Arc<torus_state::DeferredLayer>>,
+    Option<Arc<torus_state::CheckpointLayer>>,
+);
+
+/// Item 6 Phase 3: the end-of-block merge of the previous parent into L,
+/// running off E (see [`spawn_layer_merge`]).
+struct LayerMerge {
+    /// L's main part with the block folded in. Disconnected without a
+    /// value: the merge panicked (L is lost; fail-stop).
+    layer: std::sync::mpsc::Receiver<torus_state::CheckpointLayer>,
+    /// p3 merge wait: L's deferred part with the block folded in, sent
+    /// after `layer` (same failure rule).
+    deferred: std::sync::mpsc::Receiver<torus_state::CheckpointLayer>,
+    /// Step 2 (mempool wired): the block's ingress slice for the view.
+    slice: Option<std::sync::mpsc::Receiver<Arc<torus_state::FrozenPending>>>,
+}
+
+/// Item 6 Phase 3: merge `block` into `layer` (whole L) on a
+/// `torus-ckpt-merge` thread; with `slice`, also cut the block's ingress
+/// slice (`before_deferred` / `before_slice` run first: test seams, no-ops
+/// in production).
+/// p3s2g 47.1: the thread hands L back first; the slice and the release
+/// of its handle on `block` follow, so E (waiting for L at the start of
+/// the next block) does not wait for them.
+/// p3 merge wait: "L" there is L's main part. The thread splits off the
+/// deferred CFs (positions, balances), merges the rest, hands that back,
+/// then merges the deferred part and sends it on `deferred`.
+fn spawn_layer_merge(
+    mut layer: torus_state::CheckpointLayer,
+    block: Arc<torus_state::FrozenPending>,
+    slice: bool,
+    before_deferred: impl FnOnce() + Send + 'static,
+    before_slice: impl FnOnce() + Send + 'static,
+) -> std::io::Result<LayerMerge> {
+    let (layer_tx, layer_rx) = std::sync::mpsc::sync_channel(1);
+    let (deferred_tx, deferred_rx) = std::sync::mpsc::sync_channel(1);
+    let (slice_tx, slice_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("torus-ckpt-merge".into())
+        .spawn(move || {
+            let mut part = layer.split_deferred();
+            layer.merge_part(&block, torus_state::LayerPart::Main);
+            if layer_tx.send(layer).is_err() {
+                return;
+            }
+            before_deferred();
+            part.merge_part(&block, torus_state::LayerPart::Deferred);
+            let _ = deferred_tx.send(part);
+            if slice {
+                before_slice();
+                let cut = Arc::new(block.slice(&torus_state::read_view::INGRESS_CFS));
+                let _ = slice_tx.send(cut);
+            }
+            drop(block);
+        })?;
+    Ok(LayerMerge {
+        layer: layer_rx,
+        deferred: deferred_rx,
+        slice: slice.then_some(slice_rx),
+    })
+}
+
+/// Item 6 Phase 3 (p3s2g 47.1): frees what the exec thread lets go of at
+/// a block boundary (a durable checkpoint layer, frozen sets, the previous
+/// ingress view) on its own thread, off the exec thread.
+/// Freeing a ~200 MB layer is ~10^6 small frees (hundreds of ms); a frozen
+/// set of a full block, tens of ms (18c probe).
+struct Dropper {
+    tx: std::sync::mpsc::SyncSender<Box<dyn Send>>,
+    /// Items freed on the thread (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// Items handed over, the thread's and the inline frees (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    handed: std::sync::atomic::AtomicU64,
+    /// `torus_exec_checkpoint_drop_inline`: items E freed itself.
+    metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+impl Dropper {
+    /// Items queued at most; past it (or with the thread gone) the caller
+    /// frees the item itself. Per block E hands over ~2 (the previous view,
+    /// a replaced full set), which the thread frees in a fraction of a
+    /// block; a lagging thread then costs E its old inline frees instead of
+    /// retaining more retired layers (review: each can be a whole window).
+    /// Retained at most: 2 queued + 1 being freed.
+    const QUEUE: usize = 2;
+
+    /// `None`: the thread could not start (E frees everything itself).
+    fn spawn(metrics: Option<Arc<torus_telemetry::Metrics>>) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Box<dyn Send>>(Self::QUEUE);
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let count = dropped.clone();
+        std::thread::Builder::new()
+            .name("torus-ckpt-drop".into())
+            .spawn(move || {
+                for item in rx {
+                    drop(item);
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .map_err(|e| tracing::warn!(%e, "item 6 Phase 3: dropper thread did not start — the exec thread frees released layers itself"))
+            .ok()?;
+        Some(Self {
+            tx,
+            dropped,
+            handed: std::sync::atomic::AtomicU64::new(0),
+            metrics,
+        })
+    }
+
+    /// Hand `item` over to be freed (freed here if the queue is full).
+    fn drop_later<T: Send + 'static>(&self, item: T) {
+        self.handed.fetch_add(1, Ordering::Relaxed);
+        if let Err(back) = self.tx.try_send(Box::new(item)) {
+            drop(back);
+            if let Some(m) = &self.metrics {
+                m.exec_checkpoint_drop_inline.inc();
+            }
+        }
+    }
+
+    /// Items freed on the thread so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Items handed over so far (freed on the thread or, past the queue,
+    /// by the caller).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn handed(&self) -> u64 {
+        self.handed.load(Ordering::Relaxed)
+    }
 }
 
 struct CommittedBlockMsg {
@@ -648,6 +1039,14 @@ struct ExecutionContext {
     /// books (resident holder not the predecessor) must then barrier first,
     /// so the reload reads them from the DB. Cleared by every barrier.
     last_job_books_deferred: AtomicBool,
+    /// Item 6 Phase 3: coalesced state checkpoints. `None` (interval unset
+    /// or 0, the default) = today's per-block `Job::Flush`, byte for byte.
+    /// Read by `attach_flush_worker`; set before it.
+    checkpoint: Option<crate::exec_pipeline::CheckpointPolicy>,
+    /// Item 6 Phase 3: E's since-checkpoint layer L, the checkpoint in
+    /// flight C and the window bookkeeping (E-only; the mutex is
+    /// uncontended). Unused while `checkpoint` is `None`.
+    ckpt: std::sync::Mutex<CkptState>,
     /// Test-only stand-in for the process-global `TORUS_BOOK_ROWS` +
     /// `TORUS_RESIDENT_BOOKS=1` (`OnceLock`s in production): `Some(mode)` builds
     /// every native context in `mode` with the resident holder attached.
@@ -1703,6 +2102,21 @@ fn unix_now_secs() -> u64 {
 
 // ---- Execution pipeline ----
 
+/// Item 6 Phase 3: shutdown closes the open window into a final checkpoint
+/// before the flush worker (dropped with the fields) drains and joins. A
+/// latched fail-stop writes nothing (the restart replays from S).
+impl Drop for ExecutionContext {
+    fn drop(&mut self) {
+        if self.checkpoint.is_some()
+            && self.flush_worker.is_some()
+            && !self.exec_failed.load(Ordering::SeqCst)
+            && !self.pipeline_barrier()
+        {
+            tracing::error!("item 6 Phase 3: final checkpoint at shutdown failed (restart replays from the durable marker)");
+        }
+    }
+}
+
 impl ExecutionContext {
     /// Execute a committed block whose durable rows are NOT known to be on disk
     /// (boot crash-replay, tests): the exec-time header/body writes run, exactly
@@ -1788,7 +2202,29 @@ impl ExecutionContext {
             exec_failed: self.exec_failed.clone(),
             gate,
         };
-        self.flush_worker = Some(crate::exec_pipeline::FlushWorker::spawn(env, applied));
+        self.flush_worker = Some(match self.checkpoint {
+            Some(policy) => {
+                tracing::info!(
+                    ?policy,
+                    applied,
+                    "item 6 Phase 3: coalesced state checkpoints ON"
+                );
+                crate::exec_pipeline::FlushWorker::spawn_checkpointing(env, applied)
+            }
+            None => crate::exec_pipeline::FlushWorker::spawn(env, applied),
+        });
+        *self.ckpt.lock().unwrap() = CkptState {
+            base: applied,
+            dropper: self
+                .checkpoint
+                .and_then(|_| Dropper::spawn(self.metrics.clone())),
+            ..Default::default()
+        };
+        // Step 2: a fresh W starts at the durable marker; ingress reads the DB
+        // until E publishes a view after its first pipelined block.
+        if let (Some(_), Some(m)) = (&self.checkpoint, &self.mempool) {
+            m.publish_read_view(None);
+        }
         self.exec_applied.store(applied, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = None;
         self.last_job_books_deferred.store(false, Ordering::SeqCst);
@@ -1806,10 +2242,35 @@ impl ExecutionContext {
         let Some(worker) = &self.flush_worker else {
             return true;
         };
+        // Item 6 Phase 3: a barrier first closes the window (L + the last
+        // digested block) into a checkpoint, so after it everything handed
+        // to W is durable and the serial path runs on the DB as today.
+        if self.checkpoint.is_some() && !self.checkpoint_drain() {
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
         if !worker.wait_idle() {
             self.exec_failed.store(true, Ordering::SeqCst);
             return false;
         }
+        if self.checkpoint.is_some() {
+            let mut st = self.ckpt.lock().unwrap();
+            if let Some(c) = st.inflight.take() {
+                st.discard(c);
+            }
+            st.since = None;
+            st.base = st.base.max(worker.durable_height());
+            // Step 2: everything handed off is durable; ingress reads the DB.
+            st.clear_view_blocks();
+            if let Some(m) = &self.mempool {
+                m.publish_read_view(None);
+                if let Some(old) = st.published.take() {
+                    st.discard(old);
+                }
+            }
+        }
+        // The serial path writes META (running hash) itself from here.
+        worker.mark_chain_stale();
         *self.last_job.lock().unwrap() = None;
         self.last_job_books_deferred.store(false, Ordering::SeqCst);
         true
@@ -1829,9 +2290,54 @@ impl ExecutionContext {
             tracing::error!(height, "fail-stop latched mid-block — block not handed off");
             return false;
         }
+        // Item 6 Phase 3: with a checkpoint interval a block's rows are not
+        // written now: W digests it and keeps its side rows for the next
+        // checkpoint. Deferred book saves never reach here (task 1.2 refuses
+        // modes 2/3 with an interval); one would be a code bug: fail-stop.
+        let job = match (self.checkpoint.is_some(), job) {
+            (
+                true,
+                crate::exec_pipeline::Job::Flush {
+                    height,
+                    pending,
+                    evm_addrs,
+                    books,
+                    order_nonces,
+                    action_status,
+                },
+            ) => {
+                if books.is_some() {
+                    tracing::error!(
+                        height,
+                        "FATAL: deferred book save with a checkpoint interval — fail-stop"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return false;
+                }
+                crate::exec_pipeline::Job::Digest {
+                    height,
+                    pending,
+                    evm_addrs,
+                    order_nonces,
+                    action_status,
+                }
+            }
+            (true, crate::exec_pipeline::Job::Marker { height, pending }) => {
+                crate::exec_pipeline::Job::Digest {
+                    height,
+                    pending,
+                    evm_addrs: Vec::new(),
+                    order_nonces: Vec::new(),
+                    action_status: None,
+                }
+            }
+            (_, job) => job,
+        };
         let pending = match &job {
             crate::exec_pipeline::Job::Flush { pending, .. }
-            | crate::exec_pipeline::Job::Marker { pending, .. } => pending.clone(),
+            | crate::exec_pipeline::Job::Marker { pending, .. }
+            | crate::exec_pipeline::Job::Digest { pending, .. } => Some(pending.clone()),
+            crate::exec_pipeline::Job::Checkpoint { .. } => None,
         };
         let books_deferred = matches!(
             &job,
@@ -1852,10 +2358,291 @@ impl ExecutionContext {
             m.exec_handoff_wait_seconds.observe(wait_secs);
             m.flush_worker_depth.set(worker.outstanding() as i64);
         }
+        let Some(pending) = pending else {
+            return true;
+        };
         self.exec_applied.store(height, Ordering::SeqCst);
         *self.last_job.lock().unwrap() = Some(pending);
         self.last_job_books_deferred
             .store(books_deferred, Ordering::SeqCst);
+        true
+    }
+
+    /// Item 6 Phase 3: the layers the next pipelined overlay reads under its
+    /// parent: (L, L's deferred part, C). Joins a running merge's main part
+    /// only (p3 merge wait); drops C once durable. `(None, None, None)`
+    /// without a checkpoint interval. `Err`: the merge panicked (fail-stop).
+    fn checkpoint_read_layers(&self) -> Result<CkptLayers, ()> {
+        let (Some(_), Some(worker)) = (&self.checkpoint, &self.flush_worker) else {
+            return Ok((None, None, None));
+        };
+        let mut st = self.ckpt.lock().unwrap();
+        // p3s2g 47.1: the previous block's end spawned the merge of its
+        // parent into L just before this, so the join is mostly a wait.
+        let settle_timer = std::time::Instant::now();
+        let settled = st.settle();
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_settle_wait_seconds
+                .observe(settle_timer.elapsed().as_secs_f64());
+        }
+        if !settled {
+            return Err(());
+        }
+        if st
+            .inflight
+            .as_ref()
+            .is_some_and(|(h, _)| worker.durable_height() >= *h)
+        {
+            if let Some(c) = st.inflight.take() {
+                st.discard(c);
+            }
+        }
+        Ok((
+            st.layer.clone(),
+            st.deferred.clone(),
+            st.inflight.as_ref().map(|(_, c)| c.clone()),
+        ))
+    }
+
+    /// Item 6 Phase 3: end-of-block upkeep after the hand-off of block
+    /// `height` (its frozen set is `last_job`). Folds the previous parent
+    /// (n-1) into L off E, or, when a trigger fires, closes L + n-1 + n into
+    /// a checkpoint at `height`. Triggers: attest height (`h % 100 == 0`),
+    /// the policy's interval / byte cap / block count. `false`: fail-stop
+    /// latched (the caller returns).
+    fn checkpoint_upkeep(&self, overlay: &mut NativeStateOverlay, height: u64) -> bool {
+        let Some(policy) = self.checkpoint else {
+            return true;
+        };
+        // p3s2g 47.1: exec-thread time no phase timer covered.
+        let upkeep_timer = std::time::Instant::now();
+        let ok = self.checkpoint_upkeep_with(policy, overlay, height);
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_upkeep_seconds
+                .observe(upkeep_timer.elapsed().as_secs_f64());
+            // s114 retention gauges: a few atomic loads and the first key of
+            // a small map (no walk of any set).
+            let r = self.ckpt.lock().unwrap().retention.clone();
+            m.exec_checkpoint_live_layers.set(r.live_objects());
+            m.exec_checkpoint_live_bytes.set(r.live_bytes());
+            m.exec_checkpoint_read_views_live.set(r.read_views());
+            let oldest = r.oldest_height().unwrap_or(height);
+            m.exec_checkpoint_oldest_live_age_blocks
+                .set(height.saturating_sub(oldest) as i64);
+        }
+        ok
+    }
+
+    /// [`Self::checkpoint_upkeep`] under `policy` (untimed body).
+    fn checkpoint_upkeep_with(
+        &self,
+        policy: crate::exec_pipeline::CheckpointPolicy,
+        overlay: &mut NativeStateOverlay,
+        height: u64,
+    ) -> bool {
+        let prev = overlay.parent().cloned();
+        overlay.detach_layers();
+        let current = self.last_job.lock().unwrap().clone();
+        let mut st = self.ckpt.lock().unwrap();
+        // s114: count the block's set (and its parent, a no-op once
+        // tracked) for the retention gauges until it is freed.
+        for set in prev.iter().chain(current.iter()) {
+            set.track(&st.retention);
+        }
+        #[cfg(test)]
+        if let Some(g) = &st.test_gate {
+            g.release();
+        }
+        // p3 merge wait: the deferred part had the whole block to merge;
+        // the trigger, a checkpoint and the next merge need L whole.
+        let read_waits = st.deferred.as_ref().map(|d| d.take_read_waits().0);
+        let join_timer = std::time::Instant::now();
+        let settled = st.settle_all();
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_deferred_join_seconds
+                .observe(join_timer.elapsed().as_secs_f64());
+            m.exec_checkpoint_deferred_read_waits
+                .inc_by(read_waits.unwrap_or(0));
+        }
+        if !settled {
+            tracing::error!(
+                height,
+                "FATAL: since-checkpoint layer merge panicked — fail-stop"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        // Step 2: the slices cut while this block ran replace their blocks'
+        // full sets before the view is published.
+        st.install_slices();
+        let since = *st.since.get_or_insert_with(std::time::Instant::now);
+        let fold = prev.filter(|p| p.height() > st.base);
+        let current = current.filter(|c| c.height() == height);
+        // The byte cap counts what a checkpoint here would close: L (up to
+        // n-2 once settled) + the folded n-1 + n. Overlapping keys count
+        // twice, so this bounds the merged size from above: early, never late.
+        // Summed only with a cap set (it walks both blocks' sets on E).
+        let bytes = || {
+            (st.layer_bytes()
+                + fold.as_ref().map_or(0, |p| p.state_bytes())
+                + current.as_ref().map_or(0, |c| c.state_bytes())) as u64
+        };
+        let due = height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
+            || policy
+                .every_blocks
+                .is_some_and(|n| height.saturating_sub(st.base) >= n)
+            || policy.interval.is_some_and(|iv| since.elapsed() >= iv)
+            || policy.max_bytes.is_some_and(|cap| bytes() >= cap);
+        if due {
+            let mut layer = st.take_layer();
+            if let Some(p) = &fold {
+                layer.merge(p);
+            }
+            if let Some(c) = &current {
+                layer.merge(c);
+            }
+            if !self.checkpoint_submit(&mut st, height, layer) {
+                return false;
+            }
+            // C (in flight) now holds every block up to `height`. Step 1:
+            // `fold` is usually the last handle on block n-1.
+            st.discard((fold, current));
+            st.clear_view_blocks();
+            self.publish_ingress_view(&mut st, height);
+            return true;
+        }
+        debug_assert!(
+            current.is_some(),
+            "h{height}: the handed-off set is last_job"
+        );
+        // Step 2: only a wired mempool reads the view; without one, keep no
+        // frozen sets for it (they would pin every block until the checkpoint).
+        if self.mempool.is_some() {
+            st.view_blocks.extend(current);
+            self.publish_ingress_view(&mut st, height);
+        }
+        if let Some(p) = fold {
+            let layer = st.take_layer();
+            #[cfg(test)]
+            let before_deferred = {
+                let gate = st.test_gate.clone();
+                let ticket = gate.as_ref().map(|g| g.ticket());
+                move || {
+                    if let (Some(g), Some(t)) = (gate, ticket) {
+                        g.hold(t);
+                    }
+                }
+            };
+            #[cfg(not(test))]
+            let before_deferred = || {};
+            match spawn_layer_merge(layer, p, self.mempool.is_some(), before_deferred, || {}) {
+                Ok(merge) => st.merging = Some(merge),
+                Err(e) => {
+                    // The layer moved into the failed closure: L is lost.
+                    tracing::error!(%e, height, "FATAL: since-checkpoint merge thread spawn failed — fail-stop");
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Item 6 Phase 3 step 2: publish the ingress read view after block
+    /// `height`: the frozen sets above S (newest first; ingress slices below
+    /// the newest two, swapped in by `install_slices`), then C (the
+    /// checkpoint in flight, if any), then the DB. One swap in the mempool;
+    /// a layer leaves the view only once durable (C is dropped from `st`
+    /// after W reports it durable, the blocks when C or a barrier covers
+    /// them), so a view never answers older than `height`. E keeps a handle
+    /// on the published view, so the mempool's swap frees nothing and the
+    /// previous view goes to the dropper (p3s2g 47.1).
+    fn publish_ingress_view(&self, st: &mut CkptState, height: u64) {
+        let Some(m) = &self.mempool else {
+            return;
+        };
+        let blocks = st.view_blocks.iter().rev().cloned().collect();
+        let inflight = st.inflight.as_ref().map(|(_, c)| c.clone());
+        let view = torus_state::ReadView::new(self.state_db.clone(), height, blocks, inflight)
+            .with_stats(&st.retention);
+        let old = st.published.replace(view.clone());
+        m.publish_read_view(Some(view));
+        if let Some(old) = old {
+            st.discard(old);
+        }
+    }
+
+    /// Item 6 Phase 3: close the open window at a barrier / shutdown: L +
+    /// the last digested block (`last_job`, if above S) into a checkpoint.
+    /// Nothing open: nothing to do. `false`: fail-stop.
+    fn checkpoint_drain(&self) -> bool {
+        let top = self.last_job.lock().unwrap().clone();
+        let mut st = self.ckpt.lock().unwrap();
+        #[cfg(test)]
+        if let Some(g) = &st.test_gate {
+            g.release();
+        }
+        if !st.settle_all() {
+            tracing::error!("FATAL: since-checkpoint layer merge panicked — fail-stop");
+            return false;
+        }
+        let Some(top) = top.filter(|t| t.height() > st.base) else {
+            debug_assert!(
+                st.layer.as_ref().is_none_or(|l| l.is_empty())
+                    && st
+                        .deferred
+                        .as_ref()
+                        .and_then(|d| d.join())
+                        .is_none_or(|l| l.is_empty()),
+                "L open without a digested top"
+            );
+            return true;
+        };
+        let mut layer = st.take_layer();
+        layer.merge(&top);
+        self.checkpoint_submit(&mut st, top.height(), layer)
+    }
+
+    /// Hand checkpoint `height` to W (waits while the previous one is in
+    /// flight) and make it C. `false`: W failed (fail-stop latched).
+    fn checkpoint_submit(
+        &self,
+        st: &mut CkptState,
+        height: u64,
+        layer: torus_state::CheckpointLayer,
+    ) -> bool {
+        let Some(worker) = &self.flush_worker else {
+            return false;
+        };
+        let layer = Arc::new(layer);
+        let bytes = layer.bytes();
+        let job = crate::exec_pipeline::Job::Checkpoint {
+            height,
+            layer: layer.clone(),
+        };
+        let wait_timer = std::time::Instant::now();
+        let sent = worker.submit(job).is_ok();
+        if let Some(m) = &self.metrics {
+            m.exec_checkpoint_wait_seconds
+                .observe(wait_timer.elapsed().as_secs_f64());
+            m.exec_checkpoint_layer_bytes.observe(bytes as f64);
+            m.exec_checkpoints.inc();
+            m.exec_checkpoint_layer_shared
+                .inc_by(std::mem::take(&mut st.shared_fallbacks));
+        }
+        if !sent {
+            tracing::error!(
+                height,
+                "FATAL: flush worker unavailable/failed at checkpoint hand-off — fail-stop (restart replays from the durable marker)"
+            );
+            self.exec_failed.store(true, Ordering::SeqCst);
+            return false;
+        }
+        if let Some(old) = st.inflight.replace((height, layer)) {
+            st.discard(old);
+        }
+        st.base = height;
+        st.since = Some(std::time::Instant::now());
         true
     }
 
@@ -2314,7 +3101,30 @@ impl ExecutionContext {
             "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
             parent.as_ref().map(|p| p.height())
         );
-        let mut overlay = NativeStateOverlay::with_parent(self.state_db.clone(), parent);
+        // Item 6 Phase 3: under the parent, L (two parts) and C (checkpoint
+        // interval only).
+        let (layer, deferred, inflight) = if pipelined {
+            match self.checkpoint_read_layers() {
+                Ok(layers) => layers,
+                Err(()) => {
+                    tracing::error!(
+                        height,
+                        "FATAL: since-checkpoint layer merge panicked — fail-stop"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+        let mut overlay = NativeStateOverlay::with_split_layers(
+            self.state_db.clone(),
+            parent,
+            layer,
+            deferred,
+            inflight,
+        );
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
         // due — read only when nothing else runs the native phase (review L1).
@@ -3118,6 +3928,9 @@ impl ExecutionContext {
                 }) {
                     return;
                 }
+                if !self.checkpoint_upkeep(&mut overlay, height) {
+                    return;
+                }
                 resident_ok = true;
             } else {
             if let Some(status) = &action_status {
@@ -3442,6 +4255,9 @@ impl ExecutionContext {
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
+                    return;
+                }
+                if !self.checkpoint_upkeep(&mut overlay, height) {
                     return;
                 }
             } else if let Some(prefix) = evm_batch.take() {
@@ -4584,6 +5400,8 @@ impl TorusApp {
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
             last_job_books_deferred: AtomicBool::new(false),
+            checkpoint: None,
+            ckpt: Default::default(),
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -4677,8 +5495,20 @@ impl TorusApp {
         // (serial) boot replay — so the durable marker equals the replayed top
         // height before `exec_next_height` / manifest parking read it (design
         // §2.1 W.6, F4). Default ON; `TORUS_EXEC_PIPELINE=0` ⇒ None ⇒ serial chain.
+        // Item 6 Phase 3 (task 1.2): a checkpoint interval needs a
+        // non-deferred book mode; refuse to start otherwise (owner s109).
+        crate::exec_pipeline::check_checkpoint_book_mode(
+            crate::exec_pipeline::checkpoint_interval(),
+            torus_bridge::native_executor::configured_book_mode(),
+        )?;
         if crate::exec_pipeline::exec_pipeline_enabled() {
+            exec_ctx.checkpoint = crate::exec_pipeline::CheckpointPolicy::from_env();
             exec_ctx.attach_flush_worker(None);
+        } else if crate::exec_pipeline::checkpoint_interval().is_some() {
+            tracing::warn!(
+                "TORUS_CHECKPOINT_INTERVAL_MS is set but TORUS_EXEC_PIPELINE=0: checkpoints need \
+                 the flush worker; every block is written as today"
+            );
         }
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
@@ -11647,6 +12477,8 @@ mod crash_recovery_tests {
             exec_applied: AtomicU64::new(0),
             last_job: std::sync::Mutex::new(None),
             last_job_books_deferred: AtomicBool::new(false),
+            checkpoint: None,
+            ckpt: Default::default(),
             #[cfg(test)]
             test_book_mode: None,
             #[cfg(test)]
@@ -16837,6 +17669,65 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Item 6 Phase 3 task 1.3: W chains `h_n` from an in-memory `h(n-1)`
+    /// (seeded from META at spawn, advanced after each durable batch). Over
+    /// the `running_hash_identical_serial_pipelined_restart_every_book_mode`
+    /// sequence (pipelined, with and without restarts, every book mode) W's
+    /// in-memory prev equals the META row after EVERY block, and the final
+    /// stored hash still equals the serial run.
+    #[test]
+    fn running_hash_prev_from_memory_equals_meta() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [
+            BookMode::Classic,
+            BookMode::OrderRows,
+            BookMode::LevelAuthority,
+            BookMode::LevelAuthorityChunked,
+        ] {
+            let mut finals = Vec::new();
+            for (on, restarts) in [
+                (false, &[][..]),
+                (true, &[][..]),
+                (true, &[1, 3, 6, 9, 12][..]),
+            ] {
+                let (_cfg, state_db) = make_test_config_and_db();
+                fund_book_fixture(&state_db);
+                let mut ctx = book_pipeline_ctx(&state_db, on, None, mode);
+                let mut checked = 0;
+                for b in &book_fixture_blocks() {
+                    dispatch_and_execute(&ctx, &state_db, b);
+                    if let Some(w) = ctx.flush_worker.as_ref() {
+                        assert!(w.wait_idle(), "{mode:?} h{}: W failed", b.header.height);
+                        let meta = torus_state::running_hash::read_running_hash(&state_db);
+                        assert!(
+                            meta.is_some(),
+                            "{mode:?} h{}: hash written",
+                            b.header.height
+                        );
+                        assert_eq!(
+                            w.running_hash_prev(),
+                            meta,
+                            "{mode:?} {restarts:?} h{}: W's in-memory prev != META",
+                            b.header.height
+                        );
+                        checked += 1;
+                    }
+                    if restarts.contains(&b.header.height) {
+                        drop(ctx);
+                        ctx = book_pipeline_ctx(&state_db, on, None, mode);
+                    }
+                }
+                assert!(!on || checked > 0, "{mode:?}: compared nothing");
+                drop(ctx);
+                finals.push(torus_state::running_hash::read_running_hash(&state_db).unwrap());
+            }
+            assert!(
+                finals.windows(2).all(|w| w[0] == w[1]),
+                "{mode:?}: {finals:?}"
+            );
+        }
+    }
+
     /// Plan 9.13 (18c s107: `TORUS_BOOK_ROWS` stays Classic by default, mode 3
     /// only when set; the book mode is not in genesis). Two equivalences, each
     /// on running state hash, native root, every CF and the `__book_mode__`
@@ -18050,8 +18941,18 @@ mod crash_recovery_tests {
             (link_key(2, 1).to_vec(), link(2, 0).encode().to_vec()),
             (link_key(2, 2).to_vec(), link(2, 1).encode().to_vec()),
         ];
+        // Phase 3: also at checkpoint interval 15000 ms and "never" by time.
+        let ckpt_15000 = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(15_000)),
+            ..Default::default()
+        };
         let mut dumps = Vec::new();
-        for on in [false, true] {
+        for (on, ckpt) in [
+            (false, None),
+            (true, None),
+            (true, Some(ckpt_15000)),
+            (true, Some(ckpt_never())),
+        ] {
             let (_cfg, db) = make_test_config_and_db();
             db.put_account(
                 &k256_address(&key),
@@ -18064,43 +18965,52 @@ mod crash_recovery_tests {
                 db.put_account(addr, &account(code_hash, U256::ZERO))
                     .unwrap();
             }
-            let ctx = pipeline_ctx(&db, on, None);
+            let mut ctx = pipeline_ctx(&db, on, None);
+            ctx.checkpoint = ckpt;
             dispatch_and_execute(&ctx, &db, &blocks[0]);
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on} ckpt={ckpt:?}"
+            );
             if let Some(w) = ctx.flush_worker.as_ref() {
                 assert!(w.wait_idle());
             }
             assert_eq!(
                 StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
                 want,
-                "on={on}: one link per queued row, after block 1"
+                "on={on} ckpt={ckpt:?}: one link per queued row, after block 1"
             );
             dispatch_and_execute(&ctx, &db, &blocks[1]);
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on} ckpt={ckpt:?}"
+            );
             if let Some(w) = ctx.flush_worker.as_ref() {
                 assert!(w.wait_idle());
             }
             drop(ctx);
-            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(2),
+                "on={on} ckpt={ckpt:?}"
+            );
             assert_eq!(
                 StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
                 want,
-                "on={on}: block 2 queued nothing, linked nothing"
+                "on={on} ckpt={ckpt:?}: block 2 queued nothing, linked nothing"
             );
             let status = action_status(&db, 2).expect("block 2 drained rows: a record");
             let seqs: Vec<u64> = status.core_writer.iter().map(|r| r.seq).collect();
             assert_eq!(
                 seqs,
                 vec![0, 1, 2],
-                "on={on}: the linked rows drained in block 2"
+                "on={on} ckpt={ckpt:?}: the linked rows drained in block 2"
             );
             dumps.push(dump_all_cfs(&db));
         }
-        assert_dumps_equal(
-            &dumps[0],
-            &dumps[1],
-            "core writer tx links: serial vs pipelined",
-        );
+        for d in &dumps[1..] {
+            assert_dumps_equal(&dumps[0], d, "core writer tx links: serial vs pipelined");
+        }
     }
 
     /// Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
@@ -20460,6 +21370,136 @@ mod crash_recovery_tests {
         assert_dumps_equal(&dumps[0], &dumps[1], "CoreWriter due: pipeline off vs on");
     }
 
+    /// Phase 3 step 2 variant of the main-branch test: a real EVM tx queues
+    /// a CoreWriter row in block 2; block 3 has no other native work. Per
+    /// configuration: pipeline off; pipeline on with interval 0 (per-block
+    /// flush); interval 15000 ms; "never" by time (attest heights, barriers,
+    /// shutdown only). The EVM block 2 is a barrier: it first closes the
+    /// window (block 1 in L) into a checkpoint and waits for W, then runs
+    /// serially and lands its queue row in its own synchronous flush batch, so
+    /// the row is in the RAW DB before block 3's due-check. Block 3 takes the
+    /// fast path whenever the worker is on (with an interval it stays in the
+    /// since-checkpoint layer, above the durable marker), its drain credits
+    /// the deposit, and after shutdown the queue CF is empty. Same final
+    /// state in every configuration.
+    #[test]
+    fn corewriter_evm_row_drains_in_empty_next_block_with_interval() {
+        use torus_core::precompiles::CoreWriterQueue;
+        use torus_state::cf::CF_CORE_WRITER_QUEUE;
+        let (_key, trader, blocks) = cw_due_blocks();
+        let ckpt_15000 = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(15_000)),
+            ..Default::default()
+        };
+        let configs: [(&str, bool, Option<crate::exec_pipeline::CheckpointPolicy>); 4] = [
+            ("pipeline off", false, None),
+            ("interval 0", true, None),
+            ("interval 15000", true, Some(ckpt_15000)),
+            ("interval never", true, Some(ckpt_never())),
+        ];
+        let mut dumps = Vec::new();
+        for (what, on, ckpt) in configs {
+            let (_cfg, db) = make_test_config_and_db();
+            db.put_account(
+                &trader,
+                &revm::state::AccountInfo {
+                    balance: U256::from(10u128.pow(22)),
+                    nonce: 0,
+                    code_hash: KECCAK_EMPTY_CODE,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+            let (mut config, _) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = ckpt;
+            if on {
+                ctx.attach_flush_worker(None);
+            }
+            let last_job =
+                |ctx: &ExecutionContext| ctx.last_job.lock().unwrap().as_ref().map(|p| p.height());
+
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 1");
+            assert_eq!(
+                last_job(&ctx),
+                on.then_some(1),
+                "{what}: block 1 fast path iff on"
+            );
+            if ckpt.is_some() {
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    None,
+                    "{what}: block 1 in memory (L)"
+                );
+            }
+
+            dispatch_and_execute(&ctx, &db, &blocks[1]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 2");
+            assert_eq!(
+                last_job(&ctx),
+                None,
+                "{what}: the EVM block is a barrier (serial)"
+            );
+            // The invariant the raw-DB due-check relies on.
+            assert_eq!(
+                CoreWriterQueue::pending_count(&db, 3).unwrap(),
+                1,
+                "{what}: block 2's queue row (target 3) is in the raw DB"
+            );
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(2),
+                "{what}: barrier made 1-2 durable"
+            );
+
+            dispatch_and_execute(&ctx, &db, &blocks[2]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 3");
+            assert_eq!(
+                last_job(&ctx),
+                on.then_some(3),
+                "{what}: empty block 3 fast path iff on"
+            );
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            if ckpt.is_some() {
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    Some(2),
+                    "{what}: block 3 still above the durable marker (in L)"
+                );
+            }
+            // Shutdown closes the window into a final checkpoint (interval
+            // runs); then everything block 3 did is durable.
+            drop(ctx);
+            let pm = torus_core::position::PositionManager::new(db.clone());
+            let bal = pm.get_native_balance(&trader).unwrap();
+            assert_eq!(
+                bal.available + bal.order_margin,
+                FixedPoint::from_raw(1_000 * FixedPoint::SCALE),
+                "{what}: block 3's drain credited the deposit (not stranded)"
+            );
+            assert!(
+                StateBackend::iterate_cf(&db, CF_CORE_WRITER_QUEUE, None)
+                    .unwrap()
+                    .is_empty(),
+                "{what}: queue CF empty"
+            );
+            assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
+            dumps.push((what, dump_all_cfs(&db)));
+        }
+        for (what, d) in &dumps[1..] {
+            assert_dumps_equal(
+                &dumps[0].1,
+                d,
+                &format!("CoreWriter due: pipeline off vs {what}"),
+            );
+        }
+    }
+
     /// R02 (audit option A, branch 1; APP:2409): a block whose CoreWriter
     /// queue read fails fail-stops — `exec_failed`, applied marker unchanged,
     /// nothing of the block flushed (every CF as before it ran; the queued
@@ -20800,8 +21840,18 @@ mod crash_recovery_tests {
         };
         let mut blocks = vec![make_block(1, vec![]), make_block(2, vec![])];
         link_blocks(&mut blocks);
+        // Phase 3: also at checkpoint interval 15000 ms and "never" by time.
+        let ckpt_15000 = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(15_000)),
+            ..Default::default()
+        };
         let mut dumps = Vec::new();
-        for on in [false, true] {
+        for (on, ckpt) in [
+            (false, None),
+            (true, None),
+            (true, Some(ckpt_15000)),
+            (true, Some(ckpt_never())),
+        ] {
             let (_cfg, db) = make_test_config_and_db();
             let pm = torus_core::position::PositionManager::new(db.clone());
             for t in [0x31, 0x32, 0x33] {
@@ -20830,14 +21880,18 @@ mod crash_recovery_tests {
                 )
                 .unwrap();
             }
-            let ctx = pipeline_ctx(&db, on, None);
+            let mut ctx = pipeline_ctx(&db, on, None);
+            ctx.checkpoint = ckpt;
             for b in &blocks {
                 dispatch_and_execute(&ctx, &db, b);
             }
             if let Some(w) = ctx.flush_worker.as_ref() {
                 assert!(w.wait_idle());
             }
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on} ckpt={ckpt:?}"
+            );
             drop(ctx);
             let status = action_status(&db, 2).expect("block 2 has a record");
             let got: Vec<_> = status.core_writer.iter().map(|r| (r.seq, r.oid)).collect();
@@ -20848,12 +21902,12 @@ mod crash_recovery_tests {
             )
             .unwrap();
             let resting = book.orders_for_trader(&Address::repeat_byte(0x31));
-            assert_eq!(resting.len(), 1, "on={on}: the 90 bid rests");
+            assert_eq!(resting.len(), 1, "on={on} ckpt={ckpt:?}: the 90 bid rests");
             let id = resting[0].id;
             assert!(
                 book.orders_for_trader(&Address::repeat_byte(0x32))
                     .is_empty(),
-                "on={on}"
+                "on={on} ckpt={ckpt:?}"
             );
             assert_eq!(
                 got,
@@ -20863,15 +21917,13 @@ mod crash_recovery_tests {
                     (2, Some(id + 2)),
                     (3, None)
                 ],
-                "on={on}"
+                "on={on} ckpt={ckpt:?}"
             );
             dumps.push(dump_all_cfs(&db));
         }
-        assert_dumps_equal(
-            &dumps[0],
-            &dumps[1],
-            "CoreWriter order ids: serial vs pipelined",
-        );
+        for d in &dumps[1..] {
+            assert_dumps_equal(&dumps[0], d, "CoreWriter order ids: serial vs pipelined");
+        }
     }
 
     /// R02 branch 8 (B; owner s111): the CoreWriter due-check's queue read
@@ -22234,6 +23286,10 @@ mod crash_recovery_tests {
         cancel_only_blocks: u64,
         /// Reduce-only places (single or in a batch), `p2_blocks(true)` only.
         reduce_only: u64,
+        /// s118, `p2_blocks_with(_, true)` only: places (single, batch leg,
+        /// maker quote) with a cloid, and cancels by cloid.
+        cloids: u64,
+        cancels_by_cloid: u64,
     }
 
     /// The P2 sequence: heights 1..=P2_BLOCKS (ts 1000 + h), linked. C5's
@@ -22251,8 +23307,29 @@ mod crash_recovery_tests {
     /// liquidations close some. The extra draws happen only with `ro`, so
     /// `ro: false` is the original sequence.
     fn p2_blocks(ro: bool) -> (Vec<TorusBlock>, P2Fed) {
+        let (blocks, fed, _) = p2_blocks_with(ro, false);
+        (blocks, fed)
+    }
+
+    /// s118 (Phase 3 step 2 follow-up): one single `PlaceOrder` with a cloid
+    /// in the P2 sequence: (height, body index, trader seed, cloid).
+    type P2CloidPlace = (u64, usize, u8, u128);
+
+    /// [`p2_blocks`], and with `cloid` (s118): every single trader place
+    /// (and half the batch legs) carries a cloid from a small per-trader pool
+    /// (singles 1..=2, batch legs 11..=13, so a single's duplicate is always
+    /// against a single), a fifth of the trader actions are followed by a
+    /// cancel by cloid of a single's cloid, and every maker's first quote
+    /// carries cloid 100 (the maker of even heights cancels all its orders
+    /// every 4th block and one market's in between, the other never
+    /// cancels). So placements hit live cloids (duplicates, across
+    /// blocks and within one), and cloids freed by fills and cancels are
+    /// placed again. The extra draws happen only with `cloid`. Returns the
+    /// single places with a cloid.
+    fn p2_blocks_with(ro: bool, cloid: bool) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
         let mut rng = C5Rng(0x9e21_0008);
         let mut fed = P2Fed::default();
+        let mut cloid_places: Vec<P2CloidPlace> = Vec::new();
         let mut mark = [100i64; 3];
         let mut nonces: std::collections::HashMap<u8, u64> = Default::default();
         let cur_h = std::cell::Cell::new(0u64);
@@ -22357,6 +23434,10 @@ mod crash_recovery_tests {
                 let q = 2 + rng.below(4) as i64;
                 quotes.push(limit(m, true, mark[i] - 1 - rng.below(2) as i64, q));
                 quotes.push(limit(m, false, mark[i] + 1 + rng.below(2) as i64, q));
+            }
+            if cloid {
+                quotes[0].client_order_id = Some(100);
+                fed.cloids += 1;
             }
             actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
             if (2..=40).contains(&h) && h % 4 == 3 {
@@ -22481,12 +23562,42 @@ mod crash_recovery_tests {
                         }
                     }
                 }
+                let mut cancel_by_cloid = None;
+                if cloid {
+                    match &mut action {
+                        NativeAction::PlaceOrder(p) => {
+                            let c = 1 + rng.below(2) as u128;
+                            p.client_order_id = Some(c);
+                            cloid_places.push((h, actions.len(), t, c));
+                            fed.cloids += 1;
+                        }
+                        NativeAction::PlaceOrderBatch(ps) => {
+                            for p in ps {
+                                if rng.below(2) == 0 {
+                                    p.client_order_id = Some(11 + rng.below(3) as u128);
+                                    fed.cloids += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if rng.below(5) == 0 {
+                        fed.cancels_by_cloid += 1;
+                        cancel_by_cloid = Some(NativeAction::CancelByCloid {
+                            market_id: m,
+                            cloid: 1 + rng.below(2) as u128,
+                        });
+                    }
+                }
                 actions.push(sign(t, action));
+                if let Some(cancel) = cancel_by_cloid {
+                    actions.push(sign(t, cancel));
+                }
             }
             blocks.push(make_block(h, actions));
         }
         link_blocks(&mut blocks);
-        (blocks, fed)
+        (blocks, fed, cloid_places)
     }
 
     struct P2Run {
@@ -22511,6 +23622,19 @@ mod crash_recovery_tests {
         /// by the next block.
         ro_resting_max: usize,
         ro_moved: u64,
+        /// Item 6 Phase 3: the most heights executed above the durable
+        /// applied marker after any block (0 with a per-block flush).
+        max_lag: u64,
+        /// Item 6 Phase 3: `(S, persisted native root)` each time the
+        /// durable marker moved (after a block, crash blocks excepted).
+        roots: Vec<(u64, torus_types::B256)>,
+        /// s118 (`P2Fault::CkptCrash`): per crash, `(durable, last)`: the
+        /// heights `durable + 1 ..= last` ran before the crash, were lost
+        /// and replayed from the DB.
+        crash_windows: Vec<(u64, u64)>,
+        /// s118: blocks after which the resident holder carried a built
+        /// cloid index (checked equal to a rebuild from its books).
+        cloid_checked: u64,
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -22534,6 +23658,19 @@ mod crash_recovery_tests {
         /// over the DB at b (holder behind the DB), the staleness guard trips
         /// (height and marker) and rebuilds.
         StaleHolder(Vec<(u64, u64)>),
+        /// Item 6 Phase 3 (pipelined, checkpoint policy set). For each
+        /// `(k, mid)`: a crash at block k. `mid = false`: W parks on its next
+        /// job, E runs k and k + 1 on top, then that job fails. `mid = true`:
+        /// W parks on the next checkpoint (batch in flight, not written), E
+        /// runs blocks from k until a checkpoint was handed off plus one
+        /// more, then the checkpoint fails. The fail-stop latches, nothing
+        /// more lands; a new context keeping the holder replays (S, last]
+        /// from the DB (`replay_committed`) and the run continues.
+        CkptCrash(Vec<(u64, bool)>),
+        /// p3 merge wait (pipelined, checkpoint policy set): every layer
+        /// merge's deferred half waits on the gate until E's next upkeep or
+        /// drain, or a read blocking on it, releases it.
+        DeferredGate(Arc<DeferredGate>),
     }
 
     /// V4's resting orders + pending stops in the classic book blobs of
@@ -22644,6 +23781,19 @@ mod crash_recovery_tests {
         reference: bool,
         fault: &P2Fault,
     ) -> P2Run {
+        p2_run_with(blocks, pipelined, mode, reference, fault, None)
+    }
+
+    /// [`p2_run`] with the item 6 Phase 3 checkpoint policy `ckpt` on the
+    /// pipelined contexts (`None` = per-block flush).
+    fn p2_run_with(
+        blocks: &[TorusBlock],
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        reference: bool,
+        fault: &P2Fault,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+    ) -> P2Run {
         let (config, db) = p2_fixture();
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
@@ -22659,11 +23809,19 @@ mod crash_recovery_tests {
             ctx.test_no_resident = mode.is_none();
             ctx.test_reference_paths = reference;
             ctx.metrics = Some(metrics.clone());
+            ctx.checkpoint = ckpt;
             if pipelined && attach {
                 ctx.attach_flush_worker(Some(gate.clone()));
+                if let P2Fault::DeferredGate(g) = fault {
+                    ctx.ckpt.lock().unwrap().test_gate = Some(g.clone());
+                }
             }
             ctx
         };
+        let mut max_lag = 0;
+        let mut roots: Vec<(u64, torus_types::B256)> = Vec::new();
+        let mut crash_windows: Vec<(u64, u64)> = Vec::new();
+        let mut cloid_checked = 0;
         let mut ctx = new_ctx(true);
         let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
             (0, 0, 0, 0, 0);
@@ -22680,7 +23838,91 @@ mod crash_recovery_tests {
                 P2Fault::CrashAfter(ks) => ks.contains(&(h - 1)),
                 _ => false,
             };
-            if crash {
+            let ckpt_crash = match fault {
+                P2Fault::CkptCrash(points) => points.iter().find(|p| p.0 == h).map(|p| p.1),
+                _ => None,
+            };
+            if let Some(mid) = ckpt_crash {
+                assert!(
+                    pipelined && ckpt.is_some(),
+                    "{what}: a checkpoint crash needs W and a policy"
+                );
+                if mid {
+                    gate.hold_checkpoints();
+                } else {
+                    gate.hold();
+                }
+                let blocks_t = blocks.to_vec();
+                let db_t = db.clone();
+                let t = std::thread::spawn(move || {
+                    let mut i = (h - 1) as usize;
+                    let mut handed_off = false;
+                    loop {
+                        let base = ctx.ckpt.lock().unwrap().base;
+                        dispatch_and_execute(&ctx, &db_t, &blocks_t[i]);
+                        let last = blocks_t[i].header.height;
+                        i += 1;
+                        let done = if mid { handed_off } else { last > h };
+                        if done || ctx.exec_failed.load(Ordering::SeqCst) {
+                            return (ctx, last);
+                        }
+                        handed_off |= ctx.ckpt.lock().unwrap().base != base;
+                    }
+                });
+                // E's blocks never wait here (digests queue; one checkpoint
+                // in flight); bounded so a regression fails, never hangs.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !t.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(t.is_finished(), "{what}: crash at {h}: E blocked");
+                if mid {
+                    while gate.parked_checkpoint().is_none() && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    assert!(
+                        gate.parked_checkpoint().is_some(),
+                        "{what}: W holds a checkpoint at {h}"
+                    );
+                }
+                gate.fail_next();
+                gate.release();
+                let (failed, last) = t.join().unwrap();
+                assert!(
+                    !failed.flush_worker.as_ref().unwrap().wait_idle(),
+                    "{what}: crash at {h}: W failed"
+                );
+                assert!(
+                    failed.exec_failed.load(Ordering::SeqCst),
+                    "{what}: crash at {h} latched"
+                );
+                let holder = std::mem::take(&mut *failed.resident_books.lock().unwrap());
+                drop(failed);
+                let durable = read_native_applied_height(&db).unwrap_or(0);
+                assert!(
+                    durable < last,
+                    "{what}: crash at {h}: {durable} < {last} (blocks lost)"
+                );
+                crash_windows.push((durable, last));
+                let mut replay = new_ctx(false);
+                *replay.resident_books.lock().unwrap() = holder;
+                let (_last, parked) = TorusApp::replay_committed(&db, &replay);
+                assert_eq!(parked, None, "{what}");
+                assert!(
+                    !replay.exec_failed.load(Ordering::SeqCst),
+                    "{what}: replay after {h}"
+                );
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    Some(last),
+                    "{what}: replayed to {last}"
+                );
+                replay.attach_flush_worker(Some(gate.clone()));
+                ctx = replay;
+                faults += 1;
+                skip_to = last;
+            } else if crash {
                 // Blocks k + 1 = h and k + 2 = h + 1: W parks on k + 1, E runs
                 // k + 2 on top of it, then W's write fails.
                 assert!(pipelined, "{what}: a crash needs the flush worker");
@@ -22739,6 +23981,14 @@ mod crash_recovery_tests {
                 if let Some(w) = ctx.flush_worker.as_ref() {
                     assert!(w.wait_idle(), "{what}: W failed");
                 }
+                let durable = read_native_applied_height(&db).unwrap_or(0);
+                max_lag = max_lag.max(h - durable);
+                if durable > 0 && roots.last().is_none_or(|(s, _)| *s != durable) {
+                    roots.push((
+                        durable,
+                        torus_state::native_trie::persisted_native_root(&db).unwrap(),
+                    ));
+                }
             }
             let h = h.max(skip_to);
             v4_last = p2_v4_resting(&db);
@@ -22759,6 +24009,13 @@ mod crash_recovery_tests {
             ro_last = ro_now;
             if p2_index_covers_books(&ctx, &format!("{what}: after {h}")) {
                 index_checked += 1;
+            }
+            // s118: a carried cloid index is exactly what a load would build
+            // from the books (no live cloid missing, no dead one left).
+            if let Some((Some(carried), rebuilt)) = ctx.resident_books.lock().unwrap().cloid_index()
+            {
+                assert_eq!(carried, rebuilt, "{what}: after {h}: carried cloid index");
+                cloid_checked += 1;
             }
             if let P2Fault::StaleHolder(windows) = fault {
                 if windows.iter().any(|w| w.0 == h) {
@@ -22799,6 +24056,10 @@ mod crash_recovery_tests {
             faults,
             ro_resting_max,
             ro_moved,
+            max_lag,
+            roots,
+            crash_windows,
+            cloid_checked,
         }
     }
 
@@ -22939,6 +24200,654 @@ mod crash_recovery_tests {
                 );
             }
         }
+    }
+
+    // ---- Item 6 Phase 3 task 1.6: the E side of the checkpoint interval ----
+
+    fn ckpt_every(n: u64) -> crate::exec_pipeline::CheckpointPolicy {
+        crate::exec_pipeline::CheckpointPolicy {
+            every_blocks: Some(n),
+            ..Default::default()
+        }
+    }
+
+    /// Never by time: only attest heights, barriers and shutdown.
+    fn ckpt_never() -> crate::exec_pipeline::CheckpointPolicy {
+        crate::exec_pipeline::CheckpointPolicy::default()
+    }
+
+    /// The 130 P2 blocks in Classic with resident books: serial, pipelined
+    /// per block, and pipelined with a checkpoint every 5 blocks and never by
+    /// time (only the attest height 100, the epoch boundaries 50 / 100 and
+    /// shutdown) give the same per-block consensus write sets (every `h_n`),
+    /// running hash and full CF dump. The checkpoint runs really kept blocks
+    /// above the durable marker.
+    #[test]
+    fn checkpoint_interval_matches_per_block_classic() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let serial = p2_run(&blocks, false, mode, false, &P2Fault::None);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        assert_eq!(per_block.max_lag, 0, "per-block flush: every block durable");
+        assert!(serial.hash.is_some());
+        let all: Vec<u64> = (1..=P2_BLOCKS).collect();
+        for (name, policy, min_lag) in [("every 5", ckpt_every(5), 4), ("never", ckpt_never(), 40)]
+        {
+            let run = p2_run_with(&blocks, true, mode, false, &P2Fault::None, Some(policy));
+            assert!(
+                run.max_lag >= min_lag,
+                "{name}: max lag {} < {min_lag}",
+                run.max_lag
+            );
+            for (what, base) in [("serial", &serial), ("per-block", &per_block)] {
+                assert_write_sets_equal(
+                    &base.captured,
+                    &run.captured,
+                    &format!("{name} vs {what}"),
+                );
+                assert_eq!(base.hash, run.hash, "{name} vs {what}: running hash");
+                assert_dumps_equal(&base.dump, &run.dump, &format!("{name} vs {what}"));
+            }
+            assert_eq!(
+                run.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+                all,
+                "{name}: every height hashed once"
+            );
+        }
+    }
+
+    /// Item 6 Phase 3: the barrier fixture. `pipeline_fixture_blocks` (13
+    /// blocks, epoch length 4) with an EVM tx in block 6 and a buffered slash
+    /// at block 10; `policy` on a pipelined context (`None`: per block;
+    /// `on = false`: serial). Returns the DB, the per-block write sets and
+    /// the durable marker after each block.
+    fn ckpt_barrier_run(
+        on: bool,
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+    ) -> (StateDb, CapturedWrites, Vec<Option<u64>>) {
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let validator = Address::repeat_byte(0x77);
+        let mut blocks = pipeline_fixture_blocks();
+        blocks[5].evm_transactions = vec![signed_sstore_create(&key, 0)];
+        blocks[5].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        db.put_account(
+            &k256_address(&key),
+            &revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        register_proposer(&db, validator);
+        torus_state::running_hash::capture_begin(&db);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = policy;
+        if on {
+            ctx.attach_flush_worker(None);
+        }
+        let mut markers = Vec::new();
+        for b in &blocks {
+            let h = b.header.height;
+            let durable = persist_committed_block_durably(&db, b);
+            let slashes = if h == 10 {
+                vec![PendingSlash {
+                    validator,
+                    fraction_bps: 500,
+                    reason: SlashReason::DoubleSign,
+                    tombstone: false,
+                }]
+            } else {
+                vec![]
+            };
+            ctx.execute_committed_block_with(b, slashes, durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            markers.push(read_native_applied_height(&db));
+        }
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+        (db, captured, markers)
+    }
+
+    /// Barrier blocks (EVM 6, slash 10, epoch boundaries 4 / 8 / 12) drain
+    /// the since-checkpoint layer: with checkpoints never by time, the
+    /// durable marker after every block is the last barrier at or below it
+    /// (S == that height after each barrier), and shutdown checkpoints 13.
+    /// Write sets, running hash and CF dump equal the per-block and serial
+    /// runs.
+    #[test]
+    fn checkpoint_barriers_drain_layer() {
+        let (db, captured, markers) = ckpt_barrier_run(true, Some(ckpt_never()));
+        let expected: Vec<Option<u64>> = (1..=13u64)
+            .map(|h| [4u64, 6, 8, 10, 12].into_iter().filter(|b| *b <= h).max())
+            .collect();
+        assert_eq!(markers, expected, "durable marker after each block");
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(13),
+            "shutdown checkpoint"
+        );
+        let evm_sender = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        assert_eq!(
+            db.get_account(&k256_address(&evm_sender))
+                .unwrap()
+                .unwrap()
+                .nonce,
+            1,
+            "the EVM tx executed"
+        );
+        for (what, on, policy) in [("per-block", true, None), ("serial", false, None)] {
+            let (db_ref, captured_ref, _) = ckpt_barrier_run(on, policy);
+            assert_write_sets_equal(&captured_ref, &captured, &format!("never vs {what}"));
+            assert_eq!(
+                torus_state::running_hash::read_running_hash(&db_ref),
+                torus_state::running_hash::read_running_hash(&db),
+                "{what}: running hash"
+            );
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                &format!("never vs {what}"),
+            );
+        }
+    }
+
+    /// Every attest height (`h % 100 == 0`) forces a checkpoint: 105 empty
+    /// blocks without an epoch boundary, checkpoints never by time; nothing
+    /// is durable before 100, the marker and the attest checkpoint row of
+    /// 100 are durable right after it. Same dump as the per-block run.
+    #[test]
+    fn checkpoint_attest_heights_force_checkpoint() {
+        let mut blocks: Vec<TorusBlock> = (1..=105).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        let run = |policy: Option<crate::exec_pipeline::CheckpointPolicy>| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 1_000;
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = policy;
+            ctx.attach_flush_worker(None);
+            let mut markers = Vec::new();
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+                assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+                let h = b.header.height;
+                markers.push(read_native_applied_height(&db));
+                if h == 100 {
+                    assert!(
+                        torus_state::running_hash::read_checkpoint(&db, 100).is_some(),
+                        "attest checkpoint row 100 durable right after block 100"
+                    );
+                }
+            }
+            drop(ctx);
+            (db, markers)
+        };
+        let (db, markers) = run(Some(ckpt_never()));
+        let expected: Vec<Option<u64>> = (1..=105u64).map(|h| (h >= 100).then_some(100)).collect();
+        assert_eq!(markers, expected, "durable marker after each block");
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(105),
+            "shutdown checkpoint"
+        );
+        let (db_ref, _) = run(None);
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "never vs per-block",
+        );
+    }
+
+    /// The byte cap counts the blocks a checkpoint at `n` would close (L +
+    /// the folded n-1 + n), not only L: with a 1-byte cap every block's own
+    /// rows (at least the applied marker) exceed it, so every block
+    /// checkpoints at its own height (durable marker == h after each block),
+    /// as with a per-block flush. Before the fix, L held only up to n-2 at
+    /// the check, so the cap fired two blocks late. Same dump as per block.
+    #[test]
+    fn checkpoint_byte_cap_counts_folded_blocks() {
+        let mut blocks: Vec<TorusBlock> = (1..=10).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        let run = |policy: Option<crate::exec_pipeline::CheckpointPolicy>| {
+            let (mut config, db) = make_test_config_and_db();
+            config.epoch_length = 1_000;
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = policy;
+            ctx.attach_flush_worker(None);
+            let mut markers = Vec::new();
+            for b in &blocks {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+                assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+                markers.push(read_native_applied_height(&db));
+            }
+            drop(ctx);
+            (db, markers)
+        };
+        let cap = crate::exec_pipeline::CheckpointPolicy {
+            max_bytes: Some(1),
+            ..Default::default()
+        };
+        let (db, markers) = run(Some(cap));
+        let expected: Vec<Option<u64>> = (1..=10u64).map(Some).collect();
+        assert_eq!(markers, expected, "durable marker after each block");
+        let (db_ref, _) = run(None);
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "1-byte cap vs per-block",
+        );
+    }
+
+    /// The resident staleness guards read the applied marker through the
+    /// overlay (parent layer first), never the DB: over the 130 P2 blocks
+    /// with checkpoints never by time, R and the books are built once, as
+    /// with a per-block flush.
+    #[test]
+    fn resident_guards_do_not_trip_with_interval() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        let never = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            Some(ckpt_never()),
+        );
+        assert!(never.max_lag >= 40, "max lag {}", never.max_lag);
+        for (what, run) in [("per-block", &per_block), ("never", &never)] {
+            assert_eq!(
+                run.metrics.exec_resident_rows_rebuilds.get(),
+                1,
+                "{what}: R builds"
+            );
+            assert_eq!(
+                run.metrics.exec_resident_rebuilds.get(),
+                1,
+                "{what}: book builds"
+            );
+        }
+        // The layer is taken back unshared every block (no deep copies), and
+        // checkpoints ran (attest height 100; barriers 50 / 100; shutdown).
+        assert_eq!(never.metrics.exec_checkpoint_layer_shared.get(), 0);
+        assert!(never.metrics.exec_checkpoints.get() >= 2);
+        assert_eq!(per_block.metrics.exec_checkpoints.get(), 0);
+    }
+
+    /// p3s2g (results doc 47.1): Phase 3's exec-thread work sat outside every
+    /// phase timer (`residual_untimed` 4.8 -> 18.8 ms per 100 actions). Two
+    /// series time it, each once per pipelined block: the join of the
+    /// previous block's layer merge at the start of the block
+    /// (`exec_checkpoint_settle_wait_seconds`) and the end-of-block upkeep
+    /// (`exec_checkpoint_upkeep_seconds`: trigger, checkpoint-time merges and
+    /// hand-off, view publish). Interval 0 observes neither.
+    #[test]
+    fn checkpoint_exec_thread_work_is_timed() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        let every = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            Some(ckpt_every(5)),
+        );
+        let v = |run: &P2Run, name: &str| metric_value(&run.metrics.encode(), name);
+        // Hand-offs count the pipelined blocks plus a 0 per serial native
+        // (barrier) block, so they bound the pipelined count from above.
+        let handoffs = v(&every, "torus_exec_handoff_wait_seconds_count");
+        let pipelined = v(&every, "torus_exec_checkpoint_upkeep_seconds_count");
+        assert!(
+            (100.0..=handoffs).contains(&pipelined),
+            "pipelined blocks: {pipelined} of {handoffs} hand-offs"
+        );
+        for name in [
+            "torus_exec_checkpoint_settle_wait_seconds",
+            "torus_exec_checkpoint_upkeep_seconds",
+        ] {
+            assert_eq!(v(&every, &format!("{name}_count")), pipelined, "{name}");
+            assert!(v(&every, &format!("{name}_sum")) > 0.0, "{name}: timed");
+            assert_eq!(
+                v(&per_block, &format!("{name}_count")),
+                0.0,
+                "{name}: interval 0"
+            );
+        }
+    }
+
+    /// p3 merge wait (results doc 49: E waited 23.9 ms per native block at
+    /// the start of the block for the previous block's merge into L). The
+    /// merge hands L back without positions and balances (~92% of a block's
+    /// keys), which a native block reads from R only; E joins that part at
+    /// the end of the block. Over the 130 P2 blocks, checkpoints never by
+    /// time, every merge's deferred half is held until E's next upkeep (or
+    /// a drain, or a read blocking on it): no hold times out (E never
+    /// waited for it mid-block), no read blocked on it, and the write sets,
+    /// running hash and CF dump equal the per-block run.
+    #[test]
+    fn exec_does_not_wait_for_the_deferred_layer_merge() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        let gate = Arc::new(DeferredGate::default());
+        let run = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::DeferredGate(gate.clone()),
+            Some(ckpt_never()),
+        );
+        let stats = gate.stats();
+        assert_eq!(
+            stats.timeouts, 0,
+            "E waited for a held deferred merge: {stats:?}"
+        );
+        assert!(stats.held >= 100, "merges held until upkeep: {stats:?}");
+        assert_eq!(
+            run.metrics.exec_checkpoint_deferred_read_waits.get(),
+            0,
+            "no read blocked on the deferred part"
+        );
+        let v = |name: &str| metric_value(&run.metrics.encode(), name);
+        assert_eq!(
+            v("torus_exec_checkpoint_deferred_join_seconds_count"),
+            v("torus_exec_checkpoint_upkeep_seconds_count"),
+            "the join is observed once per upkeep"
+        );
+        assert!(run.max_lag >= 40, "max lag {}", run.max_lag);
+        assert_write_sets_equal(&per_block.captured, &run.captured, "gated vs per-block");
+        assert_eq!(per_block.hash, run.hash, "running hash");
+        assert_dumps_equal(&per_block.dump, &run.dump, "gated vs per-block");
+        assert_eq!(run.metrics.exec_checkpoint_layer_shared.get(), 0);
+    }
+
+    // ---- Item 6 Phase 3 task 1.7: crash and replay at interval > 0 ----
+
+    /// `(k, mid_checkpoint)` crash points: no epoch boundary (50 / 100) in
+    /// the blocks each crash runs.
+    const CKPT_CRASHES: [(u64, bool); 6] = [
+        (12, false),
+        (23, true),
+        (37, false),
+        (61, true),
+        (78, true),
+        (112, false),
+    ];
+
+    /// A crashed run digests some heights twice (before the crash on W, then
+    /// in the replay): both write sets must agree. Returns one per height.
+    fn dedup_captured(captured: &CapturedWrites, what: &str) -> CapturedWrites {
+        let mut out: CapturedWrites = Vec::new();
+        for (h, w) in captured {
+            match out.iter().find(|(oh, _)| oh == h) {
+                Some((_, ow)) => assert!(
+                    ow == w,
+                    "{what}: height {h} digested twice, write sets differ"
+                ),
+                None => out.push((*h, w.clone())),
+            }
+        }
+        out.sort_by_key(|(h, _)| *h);
+        out
+    }
+
+    /// The 130 P2 blocks with a checkpoint every 5 blocks and 6 crashes
+    /// (3 with a checkpoint batch in flight): per-block `h_n`, running hash
+    /// and full CF dump equal the uncrashed per-block run; every crash lost
+    /// blocks, and the guard rebuilt the books once per crash.
+    fn ckpt_crash_replay(mode: torus_bridge::native_executor::BookMode) {
+        let (blocks, _) = p2_blocks(false);
+        ckpt_crash_replay_on(mode, &blocks, &format!("{mode:?} checkpoint crashes"));
+    }
+
+    /// [`ckpt_crash_replay`] on `blocks`; returns `(uncrashed per-block
+    /// run, crashed run)`.
+    fn ckpt_crash_replay_on(
+        mode: torus_bridge::native_executor::BookMode,
+        blocks: &[TorusBlock],
+        what: &str,
+    ) -> (P2Run, P2Run) {
+        let reference = p2_run(blocks, true, Some(mode), false, &P2Fault::None);
+        let fault = P2Fault::CkptCrash(CKPT_CRASHES.to_vec());
+        let run = p2_run_with(blocks, true, Some(mode), false, &fault, Some(ckpt_every(5)));
+        assert_eq!(run.faults, CKPT_CRASHES.len() as u64, "{what}");
+        let captured = dedup_captured(&run.captured, what);
+        assert_eq!(
+            captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            (1..=P2_BLOCKS).collect::<Vec<_>>(),
+            "{what}: every height hashed"
+        );
+        assert_write_sets_equal(&reference.captured, &captured, what);
+        assert!(run.hash.is_some());
+        assert_eq!(reference.hash, run.hash, "{what}: running hash");
+        assert_dumps_equal(&reference.dump, &run.dump, what);
+        assert_eq!(
+            run.metrics.exec_resident_rebuilds.get(),
+            1 + CKPT_CRASHES.len() as u64,
+            "{what}: one guard rebuild per crash"
+        );
+        (reference, run)
+    }
+
+    /// s118 (Phase 3 step 2 follow-up, review of c88d3073): [`ckpt_crash_replay`]
+    /// with cloid traffic (`p2_blocks_with(false, true)`). Six crashes at a
+    /// checkpoint every 5 blocks; the uncrashed per-block run is the
+    /// reference. Equal per-block `h_n`, running hash, full CF dump (books
+    /// with their orders' cloids, the action status records with every
+    /// `DuplicateCloid`), the persisted native root at every checkpoint and
+    /// at the end. The resident holder's carried cloid index equals a
+    /// rebuild after every block, before and after each replay (the stale
+    /// holder's is dropped by the guard and rebuilt). Non-vacuous, from the
+    /// stored outcomes of the single places with a cloid: in the replayed
+    /// spans `(durable, last]` a cloid placed at or before the durable
+    /// checkpoint is rejected as a duplicate, and a cloid freed by a fill or
+    /// cancel is placed again; in the 10 blocks after a replay a cloid placed
+    /// before the crash is rejected, and one freed is placed again. A cloid
+    /// lost by the checkpoint or the replay (missing from the books or the
+    /// index) accepts a duplicate there, one resurrected rejects a reuse:
+    /// either changes the action status and books, so the dumps differ.
+    /// (s118 mutant: a book load that forgets its pending stops' cloids
+    /// fails this test; the cloid-free [`ckpt_crash_replay`] passes on it.)
+    fn ckpt_crash_replay_cloids(mode: torus_bridge::native_executor::BookMode) {
+        use torus_state::action_status::FailureReason;
+        let (blocks, fed, singles) = p2_blocks_with(false, true);
+        assert!(fed.cloids >= 300 && fed.cancels_by_cloid >= 30, "{fed:?}");
+        let what = format!("{mode:?} checkpoint crashes, cloids");
+        let (reference, run) = ckpt_crash_replay_on(mode, &blocks, &what);
+        assert_eq!(run.crash_windows.len(), CKPT_CRASHES.len(), "{what}");
+        // State roots: at each checkpoint S and at the end.
+        assert!(
+            run.roots.len() >= 10,
+            "{what}: checkpoints {}",
+            run.roots.len()
+        );
+        for (s, root) in &run.roots {
+            let want = reference
+                .roots
+                .iter()
+                .find(|(h, _)| h == s)
+                .map(|(_, r)| *r);
+            assert_eq!(Some(*root), want, "{what}: native root at checkpoint {s}");
+        }
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        assert_eq!(
+            persisted(&run.db),
+            persisted(&reference.db),
+            "{what}: final root"
+        );
+        // The carried cloid index was built and checked after most blocks
+        // (in the crashed run too: the crash blocks run off the loop).
+        assert!(
+            reference.cloid_checked >= P2_BLOCKS - 10,
+            "{what}: reference {}",
+            reference.cloid_checked
+        );
+        assert!(
+            run.cloid_checked >= P2_BLOCKS - 40,
+            "{what}: crashed {}",
+            run.cloid_checked
+        );
+
+        // Outcomes of the single places with a cloid (the crashed run's
+        // records; equal to the reference's by the dump).
+        let mut last_ok: std::collections::HashMap<(u8, u128), u64> = Default::default();
+        let mut tried: std::collections::HashSet<(u8, u128, u64)> = Default::default();
+        // (placed ok at, duplicate at) and (placed ok at, placed again at).
+        let (mut dups, mut reuses) = (Vec::new(), Vec::new());
+        for &(h, idx, t, c) in &singles {
+            let status = action_status(&run.db, h).expect("a block with actions has a record");
+            assert!(!status.native_skipped[idx], "{what}: {h}/{idx} executed");
+            let failed = status
+                .native_failed
+                .iter()
+                .find(|f| f.index as usize == idx)
+                .map(|f| f.reason);
+            let first_in_block = tried.insert((t, c, h));
+            match (failed, last_ok.get(&(t, c))) {
+                (Some(FailureReason::DuplicateCloid), Some(&h0)) if first_in_block && h0 < h => {
+                    dups.push((h0, h));
+                }
+                (None, prev) => {
+                    if let Some(&h0) = prev {
+                        reuses.push((h0, h));
+                    }
+                    last_ok.insert((t, c), h);
+                }
+                _ => {}
+            }
+        }
+        let count = |pairs: &[(u64, u64)], hit: &dyn Fn(u64, u64, u64, u64) -> bool| {
+            pairs
+                .iter()
+                .filter(|&&(h0, h)| run.crash_windows.iter().any(|&(d, l)| hit(h0, h, d, l)))
+                .count()
+        };
+        let replayed_dup = count(&dups, &|h0, h, d, l| h0 <= d && d < h && h <= l);
+        let replayed_reuse = count(&reuses, &|_, h, d, l| d < h && h <= l);
+        let after_dup = count(&dups, &|h0, h, _, l| h0 <= l && l < h && h <= l + 10);
+        let after_reuse = count(&reuses, &|h0, h, _, l| h0 <= l && l < h && h <= l + 10);
+        println!(
+            "{what}: fed {fed:?}; single cloid places {}, duplicates {}, reuses {}; windows {:?}; \
+             replayed: duplicate of a checkpointed cloid {replayed_dup}, reuse {replayed_reuse}; \
+             after replay: duplicate {after_dup}, reuse {after_reuse}",
+            singles.len(),
+            dups.len(),
+            reuses.len(),
+            run.crash_windows,
+        );
+        // Measured (s118): 11 / 27 replayed, 15 / 35 after; 53 / 109 total.
+        assert!(
+            replayed_dup >= 5 && replayed_reuse >= 10 && after_dup >= 5 && after_reuse >= 10,
+            "{what}: cloid traffic across the crashes"
+        );
+        assert!(
+            dups.len() >= 30 && reuses.len() >= 60,
+            "{what}: {} duplicates, {} reuses",
+            dups.len(),
+            reuses.len()
+        );
+        let labelled = |m: &torus_telemetry::Metrics| {
+            m.orders_rejected_reason[torus_telemetry::OrderRejectReason::DuplicateCloid as usize]
+                .get()
+        };
+        assert!(labelled(&reference.metrics) >= dups.len() as u64, "{what}");
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_with_cloids_matches_uncrashed_classic() {
+        ckpt_crash_replay_cloids(torus_bridge::native_executor::BookMode::Classic);
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_with_cloids_matches_uncrashed_order_rows() {
+        ckpt_crash_replay_cloids(torus_bridge::native_executor::BookMode::OrderRows);
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_matches_uncrashed_classic() {
+        ckpt_crash_replay(torus_bridge::native_executor::BookMode::Classic);
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_matches_uncrashed_order_rows() {
+        ckpt_crash_replay(torus_bridge::native_executor::BookMode::OrderRows);
+    }
+
+    /// Three replicas of the reduce-only P2 sequence (OrderRows) with
+    /// different intervals (per block, every 5 blocks, never by time) agree
+    /// on every `h_n`, the running hash and the full CF dump.
+    #[test]
+    fn three_replicas_different_intervals_identical() {
+        let (blocks, _) = p2_blocks(true);
+        let mode = Some(torus_bridge::native_executor::BookMode::OrderRows);
+        let a = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        for (name, policy) in [("every 5", ckpt_every(5)), ("never", ckpt_never())] {
+            let b = p2_run_with(&blocks, true, mode, false, &P2Fault::None, Some(policy));
+            assert!(b.max_lag >= 4, "{name}: {}", b.max_lag);
+            assert_write_sets_equal(&a.captured, &b.captured, name);
+            assert_eq!(a.hash, b.hash, "{name}: running hash");
+            assert_dumps_equal(&a.dump, &b.dump, name);
+        }
+    }
+
+    /// With native trie maintenance on (forced for every test DB), the
+    /// persisted native root at each checkpoint S equals the per-block run's
+    /// root at S; the final persisted and fully recomputed roots match.
+    #[test]
+    fn checkpoint_trie_maintenance_root_equal() {
+        let (blocks, _) = p2_blocks(false);
+        let mode = Some(torus_bridge::native_executor::BookMode::Classic);
+        let per_block = p2_run(&blocks, true, mode, false, &P2Fault::None);
+        assert_eq!(per_block.roots.len() as u64, P2_BLOCKS, "a root per block");
+        let run = p2_run_with(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::None,
+            Some(ckpt_every(7)),
+        );
+        assert!(run.roots.len() >= 10, "checkpoints: {}", run.roots.len());
+        assert!(run.roots.len() < per_block.roots.len());
+        for (s, root) in &run.roots {
+            let want = per_block
+                .roots
+                .iter()
+                .find(|(h, _)| h == s)
+                .map(|(_, r)| *r);
+            assert_eq!(Some(*root), want, "native root at checkpoint {s}");
+        }
+        // The fixture writes its genesis rows straight to the DB (no trie
+        // maintenance), so the persisted root is not a full recompute in
+        // either run (checked: per block differs too); both match between
+        // the runs.
+        let full = |db: &StateDb| torus_state::native_trie::native_root_full(db).unwrap();
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        assert_eq!(
+            persisted(&run.db),
+            persisted(&per_block.db),
+            "final persisted root"
+        );
+        assert_eq!(full(&run.db), full(&per_block.db), "final full recompute");
     }
 
     #[test]
@@ -23152,5 +25061,868 @@ mod crash_recovery_tests {
                 stale,
             );
         }
+    }
+
+    // ---- Item 6 Phase 3 step 2: validator ingress readers on a published view ----
+
+    /// The ingress-view fixture: real-time blocks (session expiry and the
+    /// gossip nonce window are checked against the wall clock). Heights:
+    ///   1  C TransferToPerp (C's whole EVM balance to perp; run serial,
+    ///      so it is durable)
+    ///   2  A TransferToPerp (native balance credited at n = 2),
+    ///      A CreateSession(S) (session created at n),
+    ///      C Withdraw to D (D's EVM balance credited at n; D is a fresh
+    ///      key, so the DB shows it unfunded until a checkpoint)
+    /// Returns the blocks and the keys `(A, S, C, D)`.
+    fn ingress_view_blocks() -> (
+        Vec<TorusBlock>,
+        k256::ecdsa::SigningKey,
+        ed25519_dalek::SigningKey,
+        k256::ecdsa::SigningKey,
+        k256::ecdsa::SigningKey,
+    ) {
+        let k_d = k256::ecdsa::SigningKey::from_slice(&[74u8; 32]).unwrap();
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let k_c = k256::ecdsa::SigningKey::from_slice(&[73u8; 32]).unwrap();
+        let s_key = ed25519_dalek::SigningKey::from_bytes(&[72u8; 32]);
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let base_s = now_s - 2;
+        let ms = |h: u64| (base_s + h) * 1000;
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let mut blocks = vec![
+            make_block(
+                1,
+                vec![sign(
+                    NativeAction::TransferToPerp { amount: deposit },
+                    ms(1),
+                    &k_c,
+                )],
+            ),
+            make_block(
+                2,
+                vec![
+                    sign(
+                        NativeAction::TransferToPerp { amount: deposit },
+                        ms(2),
+                        &k_a,
+                    ),
+                    sign(
+                        NativeAction::CreateSession {
+                            session_pubkey: s_key.verifying_key().to_bytes(),
+                            expiry: ms(2) + 3_600_000,
+                            scope: torus_types::SessionScope::Trading,
+                        },
+                        ms(2) + 1,
+                        &k_a,
+                    ),
+                    sign(
+                        NativeAction::Withdraw {
+                            amount: deposit,
+                            to: k256_address(&k_d),
+                        },
+                        ms(2),
+                        &k_c,
+                    ),
+                ],
+            ),
+        ];
+        for b in blocks.iter_mut() {
+            b.header.timestamp = base_s + b.header.height;
+        }
+        link_blocks(&mut blocks);
+        (blocks, k_a, s_key, k_c, k_d)
+    }
+
+    /// What gossip / RPC ingress admits at n + 1 after the fixture ran with
+    /// `policy` (`None` = interval 0, the per-block flush). Each entry is
+    /// `(what, result)`; `Ok` = admitted.
+    fn ingress_view_admissions(
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+    ) -> Vec<(&'static str, Result<(), String>)> {
+        let (blocks, k_a, s_key, k_c, k_d) = ingress_view_blocks();
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 1_000;
+        let deposit = U256::from(1_000 * FixedPoint::ONE.raw() as u128);
+        fund_evm_balance(&db, k256_address(&k_a), deposit);
+        fund_evm_balance(&db, k256_address(&k_c), deposit);
+        let mempool = Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig {
+                ingress_min_collateral_trs: 1,
+                ..Default::default()
+            },
+        ));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool.clone()), false);
+        // Block 1 serial (durable: C's EVM balance is 0 in the DB), then W.
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+        assert_eq!(read_native_applied_height(&db), Some(1));
+        ctx.checkpoint = policy;
+        ctx.attach_flush_worker(None);
+        dispatch_and_execute(&ctx, &db, &blocks[1]);
+        assert!(
+            !ctx.exec_failed.load(Ordering::SeqCst),
+            "{policy:?}: fixture must not fail-stop"
+        );
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        let durable = read_native_applied_height(&db).unwrap_or(0);
+        match policy {
+            None => assert_eq!(durable, 2, "interval 0: block 2 durable"),
+            Some(_) => assert_eq!(durable, 1, "{policy:?}: block 2 only in memory"),
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let order = torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: true,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let a = k256_address(&k_a);
+        let d = k256_address(&k_d);
+        let session_order = torus_types::eip712::sign_native_action_with_session(
+            NativeAction::PlaceOrder(order.clone()),
+            now,
+            &s_key,
+        );
+        let d_order =
+            torus_types::eip712::sign_native_action(NativeAction::PlaceOrder(order), now + 1, &k_d);
+        let evm = signed_eip1559_with_value(
+            &k_d,
+            0,
+            alloy_primitives::TxKind::Call(Address::repeat_byte(0x99)),
+            vec![],
+            U256::from(10u128.pow(18)),
+        );
+        let out = vec![
+            (
+                "session gossip (session + A's perp balance at n)",
+                mempool
+                    .add_native_action_from_gossip(a, session_order)
+                    .map_err(|e| e.to_string()),
+            ),
+            (
+                "D gossip (funded by the EVM credit at n)",
+                mempool
+                    .add_native_action_from_gossip(d, d_order)
+                    .map_err(|e| e.to_string()),
+            ),
+            (
+                "D add_evm_tx (balance = the EVM credit at n)",
+                mempool
+                    .add_evm_tx(evm)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            ),
+        ];
+        drop(ctx);
+        out
+    }
+
+    /// Item 6 Phase 3 step 2 (plan "Step 2"): a session created at n, a perp
+    /// balance credited at n and an EVM credit at n are visible to ingress at
+    /// n + 1 with the interval "never" (nothing durable yet) exactly as with
+    /// interval 0 (per-block flush).
+    #[test]
+    fn ingress_view_matches_interval_zero() {
+        let zero = ingress_view_admissions(None);
+        for (what, r) in &zero {
+            assert!(r.is_ok(), "interval 0: {what}: {r:?}");
+        }
+        let never = ingress_view_admissions(Some(ckpt_never()));
+        assert_eq!(never, zero, "interval never vs interval 0");
+    }
+
+    fn ingress_dump<S: StateBackend>(s: &S) -> Vec<CfDump> {
+        torus_state::read_view::INGRESS_CFS
+            .iter()
+            .map(|cf| (*cf, StateBackend::iterate_cf(s, cf, None).unwrap()))
+            .collect()
+    }
+
+    /// One observation after a block: the ingress CFs as the mempool reads
+    /// them, the published view's `(height, blocks, C held)` (`None`: DB
+    /// alone), whether every view block below the newest two is an ingress
+    /// slice, and the durable marker.
+    struct IngressObs {
+        dump: Vec<CfDump>,
+        view: Option<(Option<u64>, usize, bool)>,
+        sliced: bool,
+        durable: u64,
+    }
+
+    /// `pipeline_fixture_blocks` (epoch length 4) with an EVM tx in block 6:
+    /// barriers at 4, 6, 8, 12. Runs pipelined with `policy` and a mempool
+    /// wired; after each block observes what ingress reads WITHOUT waiting
+    /// for W (interval 0: after `wait_idle`, the DB). `hold_at`: W parks on
+    /// the checkpoint handed off at that height until the observation.
+    fn ingress_view_fixture_run(
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+        hold_at: Option<u64>,
+    ) -> Vec<IngressObs> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let mut blocks = pipeline_fixture_blocks();
+        blocks[5].evm_transactions = vec![signed_sstore_create(&key, 0)];
+        blocks[5].header.evm_tx_count = 1;
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        db.put_account(
+            &k256_address(&key),
+            &revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        let mempool = Arc::new(Mempool::new(db.clone(), Default::default()));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool.clone()), false);
+        ctx.checkpoint = policy;
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        ctx.attach_flush_worker(Some(gate.clone()));
+        let mut out = Vec::new();
+        for b in &blocks {
+            let h = b.header.height;
+            if hold_at == Some(h) {
+                gate.hold_checkpoints();
+            }
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            if policy.is_none() {
+                assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            }
+            if hold_at == Some(h) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while gate.parked_checkpoint().is_none() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert_eq!(gate.parked_checkpoint(), Some(h), "W holds checkpoint {h}");
+            }
+            let durable = read_native_applied_height(&db).unwrap_or(0);
+            let view = mempool.ingress_state();
+            let published = view
+                .height()
+                .is_some()
+                .then(|| (view.height(), view.block_count(), view.has_inflight()));
+            let sliced = view
+                .blocks()
+                .iter()
+                .skip(2)
+                .all(|b| b.touches_only(&torus_state::read_view::INGRESS_CFS));
+            out.push(IngressObs {
+                dump: ingress_dump(&view),
+                view: published,
+                sliced,
+                durable,
+            });
+            if hold_at == Some(h) {
+                gate.release();
+            }
+        }
+        drop(ctx);
+        out
+    }
+
+    /// Item 6 Phase 3 step 2: after EVERY block, without waiting for the
+    /// flush worker, the ingress view answers exactly what interval 0 (DB
+    /// after the per-block flush) answers, at interval "every 3 blocks" and
+    /// "never", and with a checkpoint parked in flight (C not durable). A
+    /// barrier (EVM 6, epoch boundaries 4 / 8 / 12) drops the view: every
+    /// block is durable and ingress reads the DB.
+    #[test]
+    fn ingress_view_follows_checkpoints_and_barriers() {
+        let reference = ingress_view_fixture_run(None, None);
+        assert!(
+            reference.iter().all(|o| o.view.is_none()),
+            "interval 0 never publishes"
+        );
+        let barriers = [4u64, 6, 8, 12];
+        for (name, policy, hold_at) in [
+            ("every 3", ckpt_every(3), None),
+            ("every 3, C parked at 3", ckpt_every(3), Some(3)),
+            ("never", ckpt_never(), None),
+        ] {
+            let run = ingress_view_fixture_run(Some(policy), hold_at);
+            let mut ahead = 0;
+            for (i, (got, want)) in run.iter().zip(reference.iter()).enumerate() {
+                let h = i as u64 + 1;
+                assert_dumps_equal(&want.dump, &got.dump, &format!("{name} h{h}"));
+                if barriers.contains(&h) {
+                    assert_eq!(got.view, None, "{name} h{h}: barrier -> DB");
+                    assert_eq!(got.durable, h, "{name} h{h}: barrier durable");
+                } else {
+                    let (height, _, _) = got.view.expect("view published");
+                    assert_eq!(height, Some(h), "{name} h{h}: view height");
+                }
+                if got.durable < h {
+                    ahead += 1;
+                }
+                assert!(
+                    got.sliced,
+                    "{name} h{h}: blocks under the newest two are slices"
+                );
+            }
+            assert!(
+                ahead >= 3,
+                "{name}: blocks above the durable marker: {ahead}"
+            );
+            if name == "never" {
+                // 9, 10, 11 above S = 8: two full sets and one slice.
+                assert_eq!(run[10].view, Some((Some(11), 3, false)), "{name} h11");
+            }
+            if hold_at.is_some() {
+                let o = &run[2];
+                assert!(
+                    o.durable < 3,
+                    "C parked: block 3 not durable ({})",
+                    o.durable
+                );
+                assert_eq!(o.view, Some((Some(3), 0, true)), "C holds blocks 1-3");
+            }
+        }
+    }
+
+    /// p3s2g 47.1: E joins the end-of-block layer merge at the start of the
+    /// next block, so whatever the merge thread does before handing L back
+    /// is exec-thread wait. It hands L back first; the ingress slice (step
+    /// 2) and the release of its handle on the merged block come after.
+    #[test]
+    fn layer_merge_hands_l_back_before_the_slice() {
+        use std::time::Duration;
+        use torus_state::cf::{CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS};
+        let (_cfg, db) = make_test_config_and_db();
+        let o = NativeStateOverlay::new(db.clone());
+        o.put_cf_raw(CF_NATIVE_ORDER_BOOKS, b"book", b"blob")
+            .unwrap();
+        o.put_cf_raw(CF_NATIVE_POSITIONS, b"pos", b"p").unwrap();
+        let block = o.freeze(7);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let merge = spawn_layer_merge(
+            torus_state::CheckpointLayer::new(),
+            block.clone(),
+            true,
+            || {},
+            move || {
+                let _ = held.recv();
+            },
+        )
+        .unwrap();
+        let layer = merge
+            .layer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("L handed back while the slice is still being cut");
+        let deferred = merge
+            .deferred
+            .recv_timeout(Duration::from_secs(5))
+            .expect("deferred part sent before the slice");
+        assert_eq!(layer.entry_count(), 1, "main part: the book");
+        assert_eq!(deferred.entry_count(), 1, "deferred part: the position");
+        assert_eq!(layer.top_height(), Some(7));
+        assert_eq!(deferred.top_height(), Some(7));
+        let slice = merge.slice.expect("slice requested");
+        assert!(slice.try_recv().is_err(), "slice still held");
+        release.send(()).unwrap();
+        let slice = slice.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(slice.height(), 7);
+        assert!(slice.touches_only(&torus_state::read_view::INGRESS_CFS));
+        assert!(!slice.touches_only(&[CF_NATIVE_ORDER_BOOKS]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&block) > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(Arc::strong_count(&block), 1, "the merge thread let go");
+    }
+
+    /// p3s2g 47.1: the dropper frees what it is handed on its own thread.
+    #[test]
+    fn dropper_frees_on_its_own_thread() {
+        use std::time::Duration;
+        struct Probe(std::sync::mpsc::Sender<Option<String>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().name().map(String::from));
+            }
+        }
+        let dropper = Dropper::spawn(None).expect("dropper thread");
+        let (tx, rx) = std::sync::mpsc::channel();
+        dropper.drop_later(Probe(tx));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().as_deref(),
+            Some("torus-ckpt-drop")
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while dropper.dropped() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(dropper.dropped(), 1);
+    }
+
+    /// Review (Codex, p3s2g gate fix): a dropper that falls behind must not
+    /// pile up retired layers / views (each up to a checkpoint window). With
+    /// it stalled, at most two items wait; the next is freed by the caller.
+    #[test]
+    fn dropper_retains_at_most_two_items_when_behind() {
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        use std::time::Duration;
+        struct Stall(Sender<()>, Receiver<()>);
+        impl Drop for Stall {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+                let _ = self.1.recv();
+            }
+        }
+        struct Probe(Sender<Option<String>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().name().map(String::from));
+            }
+        }
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let dropper = Dropper::spawn(Some(metrics.clone())).expect("dropper thread");
+        let (started_tx, started) = channel();
+        let (release, held) = channel();
+        dropper.drop_later(Stall(started_tx, held));
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dropper busy with the stall");
+        let (tx, names) = channel();
+        for _ in 0..3 {
+            dropper.drop_later(Probe(tx.clone()));
+        }
+        let here = std::thread::current().name().map(String::from);
+        assert_eq!(
+            names.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(here),
+            "the third item is freed by the caller"
+        );
+        assert_eq!(
+            metrics.exec_checkpoint_drop_inline.get(),
+            1,
+            "torus_exec_checkpoint_drop_inline"
+        );
+        release.send(()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                names
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .as_deref(),
+                Some("torus-ckpt-drop")
+            );
+        }
+    }
+
+    /// p3s2g 47.1: with an interval and a mempool, E hands what it releases
+    /// at block boundaries (C once durable, the previous ingress view, the
+    /// sets a slice or a checkpoint replaces) to the dropper; interval 0
+    /// has none.
+    #[test]
+    fn checkpoint_releases_go_to_the_dropper() {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        let mempool = Arc::new(Mempool::new(db.clone(), Default::default()));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool), false);
+        ctx.checkpoint = Some(ckpt_every(3));
+        ctx.attach_flush_worker(None);
+        let blocks = pipeline_fixture_blocks();
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        // Handed over (the thread frees them, or E past a full queue).
+        let n = ctx
+            .ckpt
+            .lock()
+            .unwrap()
+            .dropper
+            .as_ref()
+            .map(Dropper::handed)
+            .expect("a dropper with an interval");
+        let want = blocks.len() as u64 / 2;
+        assert!(
+            n >= want,
+            "released off E: {n} over {} blocks",
+            blocks.len()
+        );
+        let off = pipeline_ctx(&db, true, None);
+        assert!(off.ckpt.lock().unwrap().dropper.is_none(), "interval 0");
+    }
+
+    /// Review fix (Codex, step 2): without a mempool nothing reads a view, so
+    /// E keeps no frozen sets for one (they would pin every block's book blobs
+    /// until the checkpoint).
+    #[test]
+    fn ingress_view_not_retained_without_mempool() {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt_never());
+        ctx.attach_flush_worker(None);
+        for b in &pipeline_fixture_blocks()[..3] {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        assert_eq!(
+            read_native_applied_height(&db).unwrap_or(0),
+            0,
+            "blocks 1-3 in memory"
+        );
+        assert_eq!(ctx.ckpt.lock().unwrap().view_blocks.len(), 0);
+    }
+
+    /// Retention tests (p3soak, s114): `blocks_n` pipelined blocks with an
+    /// interval of `every`, a mempool wired, metrics on and no barrier.
+    /// Block 1 funds A and B; every later block is one fill (A and B swap
+    /// sides each block, so positions stay flat).
+    fn retention_fixture(
+        blocks_n: u64,
+        every: u64,
+    ) -> (ExecutionContext, Arc<Mempool>, StateDb, Vec<TorusBlock>) {
+        let k_a = k256::ecdsa::SigningKey::from_slice(&[81u8; 32]).unwrap();
+        let k_b = k256::ecdsa::SigningKey::from_slice(&[82u8; 32]).unwrap();
+        let deposit = U256::from(100_000 * FixedPoint::ONE.raw() as u128);
+        let order = |is_buy: bool| torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy,
+            price: FixedPoint::from_raw(100 * FixedPoint::SCALE),
+            quantity: FixedPoint::from_raw(FixedPoint::SCALE),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let sign = |a: NativeAction, n: u64, k: &k256::ecdsa::SigningKey| {
+            torus_types::eip712::sign_native_action(a, n, k)
+        };
+        let mut blocks = vec![make_block(
+            1,
+            vec![
+                sign(
+                    NativeAction::TransferToPerp { amount: deposit },
+                    block_time_ms(1),
+                    &k_a,
+                ),
+                sign(
+                    NativeAction::TransferToPerp { amount: deposit },
+                    block_time_ms(1),
+                    &k_b,
+                ),
+            ],
+        )];
+        for h in 2..=blocks_n {
+            let a_sells = h % 2 == 0;
+            blocks.push(make_block(
+                h,
+                vec![
+                    sign(
+                        NativeAction::PlaceOrder(order(!a_sells)),
+                        block_time_ms(h),
+                        &k_a,
+                    ),
+                    sign(
+                        NativeAction::PlaceOrder(order(a_sells)),
+                        block_time_ms(h),
+                        &k_b,
+                    ),
+                ],
+            ));
+        }
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 1_000_000;
+        for k in [&k_a, &k_b] {
+            fund_evm_balance(&db, k256_address(k), deposit);
+        }
+        let mempool = Arc::new(Mempool::new(db.clone(), Default::default()));
+        let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool.clone()), false);
+        ctx.checkpoint = Some(ckpt_every(every));
+        // s114: the retention gauges are set only with metrics wired.
+        ctx.metrics = Some(Arc::new(torus_telemetry::Metrics::new()));
+        ctx.attach_flush_worker(None);
+        (ctx, mempool, db, blocks)
+    }
+
+    /// The retention gauges once a block is done: (live objects, live bytes,
+    /// read views, oldest live age in blocks).
+    fn retention_gauges(ctx: &ExecutionContext) -> (i64, i64, i64, i64) {
+        let m = ctx.metrics.as_ref().expect("metrics wired");
+        (
+            m.exec_checkpoint_live_layers.get(),
+            m.exec_checkpoint_live_bytes.get(),
+            m.exec_checkpoint_read_views_live.get(),
+            m.exec_checkpoint_oldest_live_age_blocks.get(),
+        )
+    }
+
+    /// p3soak (section 53, s114): step 2's RSS kept growing over a 10 min
+    /// soak. With an interval, a mempool wired and no barrier for hundreds of
+    /// blocks (production: epochs are long), what Phase 3 retains must stay
+    /// bounded by the window: every frozen set, ingress slice, L and C a
+    /// block creates is freed within a few windows, and the live counts do
+    /// not grow with the run. s114 gauges: the retention stats (and the
+    /// `torus_exec_checkpoint_live_*` / `read_views_live` / oldest-age gauges
+    /// set from them each block) agree with the objects seen alive here.
+    #[test]
+    fn checkpoint_retention_bounded_over_long_run() {
+        use std::sync::Weak;
+        use std::time::{Duration, Instant};
+        const BLOCKS: u64 = 600;
+        const EVERY: u64 = 9;
+        let (ctx, mempool, db, blocks) = retention_fixture(BLOCKS, EVERY);
+        let stats = ctx.ckpt.lock().unwrap().retention.clone();
+        // Every distinct object E's checkpoint path holds, by the height it
+        // was first seen at (keyed by address while alive).
+        type Seen<T> = std::collections::HashMap<usize, (u64, Weak<T>)>;
+        let mut sets: Seen<torus_state::FrozenPending> = Default::default();
+        let mut layers: Seen<torus_state::CheckpointLayer> = Default::default();
+        fn track<T>(seen: &mut Seen<T>, h: u64, a: &Arc<T>) {
+            seen.entry(Arc::as_ptr(a) as usize)
+                .or_insert_with(|| (h, Arc::downgrade(a)));
+        }
+        fn alive<T>(seen: &Seen<T>) -> Vec<u64> {
+            let mut v: Vec<u64> = seen
+                .values()
+                .filter(|(_, w)| w.strong_count() > 0)
+                .map(|(h, _)| *h)
+                .collect();
+            v.sort_unstable();
+            v
+        }
+        let (mut early_max, mut late_max) = (0usize, 0usize);
+        let (mut early_bytes, mut late_bytes) = (0i64, 0i64);
+        let mut bytes_blocks = 0u64;
+        let mut checkpoints = 0;
+        for b in &blocks {
+            let h = b.header.height;
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            // s114 gauges, as set at the end of this block's upkeep (before
+            // the dropper frees what the block let go of).
+            let (g_live, g_bytes, g_views, g_age) = retention_gauges(&ctx);
+            assert!(
+                (1..=EVERY as i64 + 12).contains(&g_live),
+                "h{h}: live layers gauge {g_live}"
+            );
+            assert!(g_bytes >= 0, "h{h}: live bytes gauge {g_bytes}");
+            // Sampled while the next merge runs: right after a checkpoint
+            // went durable, L (just spawned into its first merge) and the
+            // unmerged sets count 0.
+            if g_bytes > 0 {
+                bytes_blocks += 1;
+            }
+            assert!(
+                (2..=3).contains(&g_views),
+                "h{h}: E's and the mempool's view (+ the previous one queued to be freed), gauge {g_views}"
+            );
+            assert!(
+                (0..=2 * EVERY as i64 + 2).contains(&g_age),
+                "h{h}: oldest live age gauge {g_age}"
+            );
+            // W digests every queued block (its queue is a bound of its own,
+            // DIGEST_QUEUE); what is left is what E and its threads retain.
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            if let Some(j) = ctx.last_job.lock().unwrap().as_ref() {
+                track(&mut sets, h, j);
+            }
+            {
+                let st = ctx.ckpt.lock().unwrap();
+                for v in &st.view_blocks {
+                    track(&mut sets, h, v);
+                }
+                if let Some(l) = &st.layer {
+                    track(&mut layers, h, l);
+                }
+                if let Some((top, c)) = &st.inflight {
+                    if *top == h {
+                        checkpoints += 1;
+                    }
+                    track(&mut layers, h, c);
+                }
+            }
+            let view = mempool.ingress_state();
+            assert_eq!(view.height(), Some(h), "the view follows every block");
+            assert!(
+                view.block_count() as u64 <= EVERY,
+                "h{h}: the view holds {} blocks",
+                view.block_count()
+            );
+            for v in view.blocks() {
+                track(&mut sets, h, v);
+            }
+            drop(view);
+            // The dropper and the merge / slice threads run behind E: give
+            // them a moment before counting (they never hold more than a
+            // block or two).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let bounded = |s: &[u64], l: &[u64]| {
+                s.iter()
+                    .chain(l.iter())
+                    .all(|made| h - made <= 2 * EVERY + 2)
+                    && (s.len() + l.len()) as u64 <= EVERY + 10
+            };
+            // s114: the stats count every object seen alive here, plus at
+            // most L being merged (moved out of its Arc, so not seen), its
+            // deferred part (p3 merge wait: split off L on the merge thread,
+            // a tracked layer of its own until absorbed) and the ingress
+            // slice being cut; E's and the mempool's view are the only
+            // handles once the previous one is freed.
+            let counted = |s: &[u64], l: &[u64]| {
+                let (live, seen) = (stats.live_objects(), (s.len() + l.len()) as i64);
+                (seen..=seen + 3).contains(&live)
+                    && stats.read_views() == 2
+                    && stats.oldest_height().is_none_or(|o| h - o <= 2 * EVERY + 2)
+            };
+            let (mut s, mut l) = (alive(&sets), alive(&layers));
+            while !(bounded(&s, &l) && counted(&s, &l)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+                (s, l) = (alive(&sets), alive(&layers));
+            }
+            assert!(
+                bounded(&s, &l),
+                "h{h}: retained past the window (sets first seen at {s:?}, layers first seen at {l:?})"
+            );
+            assert!(
+                counted(&s, &l),
+                "h{h}: stats {} live / {} views / oldest {:?} vs {} seen alive",
+                stats.live_objects(),
+                stats.read_views(),
+                stats.oldest_height(),
+                s.len() + l.len()
+            );
+            let seen_layer_bytes: usize = layers
+                .values()
+                .filter_map(|(_, w)| w.upgrade())
+                .map(|l| l.bytes())
+                .sum();
+            let live_bytes = stats.live_bytes();
+            assert!(
+                live_bytes >= seen_layer_bytes as i64,
+                "h{h}: live bytes {live_bytes} < the live layers' {seen_layer_bytes}"
+            );
+            if (100..200).contains(&h) {
+                early_bytes = early_bytes.max(live_bytes);
+            }
+            if h > BLOCKS - 100 {
+                late_bytes = late_bytes.max(live_bytes);
+            }
+            let n = s.len() + l.len();
+            if (100..200).contains(&h) {
+                early_max = early_max.max(n);
+            }
+            if h > BLOCKS - 100 {
+                late_max = late_max.max(n);
+            }
+            sets.retain(|_, (_, w)| w.strong_count() > 0);
+            layers.retain(|_, (_, w)| w.strong_count() > 0);
+        }
+        assert!(
+            checkpoints as u64 >= BLOCKS / EVERY - 2,
+            "{checkpoints} checkpoints"
+        );
+        eprintln!("live sets + layers: max {early_max} at blocks 100-200, {late_max} at the end");
+        assert!(
+            late_max <= EVERY as usize + 10 && early_max <= EVERY as usize + 10,
+            "live objects: {early_max} at blocks 100-200, {late_max} at the end"
+        );
+        eprintln!("live bytes: max {early_bytes} at blocks 100-200, {late_bytes} at the end; gauge > 0 at {bytes_blocks} blocks");
+        assert!(
+            bytes_blocks >= BLOCKS * 3 / 4,
+            "live bytes gauge > 0 at {bytes_blocks} of {BLOCKS} blocks"
+        );
+        assert!(
+            early_bytes > 0 && late_bytes <= early_bytes * 3 / 2,
+            "live bytes grow with the run: {early_bytes} at blocks 100-200, {late_bytes} at the end"
+        );
+    }
+
+    /// s114: a reader holding an old ingress view shows in the gauges (one
+    /// more live view, the oldest live set ageing past the window) and both
+    /// fall back once it lets go.
+    #[test]
+    fn checkpoint_retention_gauges_show_a_held_view() {
+        use std::time::{Duration, Instant};
+        const EVERY: u64 = 9;
+        let (ctx, mempool, db, blocks) = retention_fixture(62, EVERY);
+        let stats = ctx.ckpt.lock().unwrap().retention.clone();
+        let settle = |want_views: i64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while stats.read_views() != want_views && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(stats.read_views(), want_views, "live views");
+        };
+        let mut held = None;
+        for b in &blocks[..60] {
+            let h = b.header.height;
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            // Set at the end of the block, before this iteration takes the
+            // held view.
+            let (_, _, g_views, _) = retention_gauges(&ctx);
+            let extra = i64::from(held.is_some());
+            assert!(
+                (2 + extra..=3 + extra).contains(&g_views),
+                "h{h}: views gauge {g_views}"
+            );
+            if h == 20 {
+                let v = mempool.ingress_state();
+                assert!(v.block_count() > 0, "the held view pins blocks");
+                held = Some(v);
+            }
+            settle(2 + i64::from(held.is_some()));
+        }
+        let (_, _, g_views, g_age) = retention_gauges(&ctx);
+        assert!(
+            (3..=4).contains(&g_views),
+            "E's, the mempool's and the held view (+ the previous one queued to be freed): {g_views}"
+        );
+        assert!(
+            g_age >= 40,
+            "the held view pins a set from block 19 or 20: age {g_age}"
+        );
+        assert!(
+            stats.oldest_height().is_some_and(|o| o <= 20),
+            "oldest {:?}",
+            stats.oldest_height()
+        );
+        drop(held);
+        settle(2);
+        for b in &blocks[60..] {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            // Codex review: let the dropper retire the previous view first
+            // (a late dropper could otherwise hold two at the last gauge).
+            settle(2);
+        }
+        let (_, _, g_views, g_age) = retention_gauges(&ctx);
+        assert!(
+            (2..=3).contains(&g_views),
+            "views gauge {g_views} after the release"
+        );
+        assert!(
+            g_age <= 2 * EVERY as i64 + 2,
+            "oldest live age {g_age} after the release"
+        );
+        assert!(stats.live_objects() >= 0 && stats.live_bytes() >= 0);
     }
 }

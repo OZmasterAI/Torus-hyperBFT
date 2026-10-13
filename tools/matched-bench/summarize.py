@@ -544,7 +544,8 @@ def node_phase(node, rs, hi, buckets, window):
     p["end_resident_wait_ms_p50"] = pctl("torus_exec_end_resident_wait_seconds_bucket", 0.50)
     p["end_resident_wait_ms_p90"] = pctl("torus_exec_end_resident_wait_seconds_bucket", 0.90)
     # Item 6 Phase 3: the checkpoint timers per observation (None if absent).
-    for name in ("checkpoint_settle_wait", "checkpoint_upkeep"):
+    # p3 merge wait: the deferred join (inside upkeep, not a phase of its own).
+    for name in ("checkpoint_settle_wait", "checkpoint_upkeep", "checkpoint_deferred_join"):
         for q in (50, 99):
             p["%s_ms_p%d" % (name, q)] = pctl("torus_exec_%s_seconds_bucket" % name, q / 100)
     p["pipelined_ms_p95"] = pctl("torus_flush_worker_seconds_bucket", 0.95)

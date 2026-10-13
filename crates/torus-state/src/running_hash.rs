@@ -370,6 +370,86 @@ pub(crate) fn chain_step(db: &StateDb, height: u64) -> ChainStep {
     }
 }
 
+/// Item 6 Phase 3: the running-hash chain state [`chain_step`] reads from
+/// META, held in memory by the flush worker W so its digests chain from the
+/// previous block without a META read (and, with a checkpoint interval,
+/// across blocks whose rows are not durable yet). Loaded from META at W's
+/// spawn and after every serial barrier; advanced after each durable batch
+/// exactly as [`append_to_batch`] changes the rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainMemo {
+    configured: Option<u64>,
+    start: Option<u64>,
+    unverified: Option<u64>,
+    prev: Option<(u64, [u8; 32])>,
+}
+
+impl ChainMemo {
+    /// The chain state as stored in `db` (the reads [`chain_step`] does).
+    pub fn load(db: &StateDb) -> Self {
+        Self {
+            configured: read_configured_activation(db),
+            start: read_activation_height(db),
+            unverified: read_unverified_since(db),
+            prev: read_running_hash(db),
+        }
+    }
+
+    /// `(height, h_height)` of the last hashed block (= [`read_running_hash`]
+    /// once every advanced batch is durable).
+    pub fn prev(&self) -> Option<(u64, [u8; 32])> {
+        self.prev
+    }
+
+    /// [`chain_step`] over this memo instead of META. Same decisions.
+    pub(crate) fn step(&self, height: u64) -> ChainStep {
+        let Some(activation) = self.configured else {
+            return ChainStep::Off;
+        };
+        if height < activation {
+            return ChainStep::Off;
+        }
+        if height == activation {
+            return ChainStep::Start;
+        }
+        if self.unverified.is_some() {
+            return ChainStep::Unverified { first: false };
+        }
+        match self.prev {
+            Some((stored, hash)) if self.start == Some(activation) && stored + 1 == height => {
+                ChainStep::Continue(hash)
+            }
+            stored => {
+                tracing::error!(
+                    height,
+                    activation,
+                    stored_height = ?stored.map(|(h, _)| h),
+                    stored_chain_start = ?self.start,
+                    "running state hash: no valid h(height-1) — node is HASH-UNVERIFIED from here on \
+                     (no hashes, checkpoints, attestations or fail-stop decisions)"
+                );
+                ChainStep::Unverified { first: true }
+            }
+        }
+    }
+
+    /// Apply what [`append_to_batch`] wrote for `height` (call once the batch
+    /// is durable).
+    pub(crate) fn advance(&mut self, height: u64, step: ChainStep, hash: Option<&[u8; 32]>) {
+        match (step, hash) {
+            (ChainStep::Unverified { first: true }, _) => self.unverified = Some(height),
+            (ChainStep::Start | ChainStep::Continue(_), Some(hash)) => {
+                if step == ChainStep::Start {
+                    self.unverified = None;
+                    self.start = Some(height);
+                }
+                self.prev = Some((height, *hash));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Append the flush's running-hash rows to its atomic batch: `h_height` (+
 /// activation record and stale-row cleanup on [`ChainStep::Start`],
 /// checkpoint and checkpoint pruning), or the unverified marker.
@@ -381,35 +461,131 @@ pub(crate) fn append_to_batch(
     hash: Option<&[u8; 32]>,
 ) -> Result<(), crate::StateError> {
     let cf = db.cf_handle(CF_CONSENSUS_META)?;
+    chain_rows(
+        || checkpoint_heights(db),
+        height,
+        step,
+        hash,
+        |key, value| match value {
+            Some(v) => batch.put_cf(cf, key, v),
+            None => batch.delete_cf(cf, key),
+        },
+    );
+    Ok(())
+}
+
+/// The running-hash META rows of one flushed height, in batch order:
+/// `emit(key, Some(value))` = put, `emit(key, None)` = delete. `stored`
+/// lists the retained checkpoint heights (read only on [`ChainStep::Start`]).
+/// The one definition behind [`append_to_batch`] and [`ChainRows::record`].
+fn chain_rows(
+    stored: impl FnOnce() -> Vec<u64>,
+    height: u64,
+    step: ChainStep,
+    hash: Option<&[u8; 32]>,
+    mut emit: impl FnMut(&[u8], Option<&[u8]>),
+) {
     match (step, hash) {
         (ChainStep::Unverified { first: true }, _) => {
-            batch.put_cf(cf, META_RUNNING_STATE_HASH_UNVERIFIED, height.to_be_bytes());
+            emit(
+                META_RUNNING_STATE_HASH_UNVERIFIED,
+                Some(&height.to_be_bytes()),
+            );
         }
         (ChainStep::Start | ChainStep::Continue(_), Some(hash)) => {
             if step == ChainStep::Start {
                 // A fresh chain: nothing stored belongs to it.
-                for h in checkpoint_heights(db) {
-                    batch.delete_cf(cf, checkpoint_key(h));
+                for h in stored() {
+                    emit(&checkpoint_key(h), None);
                 }
-                batch.delete_cf(cf, META_RUNNING_STATE_HASH_UNVERIFIED);
-                batch.put_cf(cf, META_RUNNING_STATE_HASH_ACTIVATION, height.to_be_bytes());
+                emit(META_RUNNING_STATE_HASH_UNVERIFIED, None);
+                emit(
+                    META_RUNNING_STATE_HASH_ACTIVATION,
+                    Some(&height.to_be_bytes()),
+                );
             }
             let mut v = Vec::with_capacity(40);
             v.extend_from_slice(&height.to_be_bytes());
             v.extend_from_slice(hash);
-            batch.put_cf(cf, META_RUNNING_STATE_HASH, v);
+            emit(META_RUNNING_STATE_HASH, Some(&v));
             if height % STATE_HASH_CHECKPOINT_INTERVAL == 0 {
-                batch.put_cf(cf, checkpoint_key(height), hash);
+                emit(&checkpoint_key(height), Some(hash));
                 if let Some(old) =
                     height.checked_sub(STATE_HASH_CHECKPOINT_INTERVAL * STATE_HASH_CHECKPOINT_RETAIN)
                 {
-                    batch.delete_cf(cf, checkpoint_key(old));
+                    emit(&checkpoint_key(old), None);
                 }
             }
         }
         _ => {}
     }
-    Ok(())
+}
+
+/// Item 6 Phase 3: the running-hash META rows of the digested blocks since
+/// the last checkpoint, last value per key (`None` = delete), kept by the
+/// flush worker and written in the checkpoint's batch. Recording heights
+/// S+1..=T one by one and writing the result over the DB at S leaves the
+/// same rows as flushing each height's [`append_to_batch`] in order.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct ChainRows {
+    rows: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl ChainRows {
+    /// Fold height `height`'s rows on top. A [`ChainStep::Start`] deletes
+    /// every checkpoint row: the DB's and the ones kept here.
+    pub(crate) fn record(
+        &mut self,
+        db: &StateDb,
+        height: u64,
+        step: ChainStep,
+        hash: Option<&[u8; 32]>,
+    ) {
+        let kept: Vec<u64> = self
+            .rows
+            .keys()
+            .filter_map(|k| {
+                let h = k.strip_prefix(META_STATE_HASH_CHECKPOINT_PREFIX)?;
+                Some(u64::from_be_bytes(h.try_into().ok()?))
+            })
+            .collect();
+        let rows = &mut self.rows;
+        chain_rows(
+            || {
+                let mut all = checkpoint_heights(db);
+                all.extend(kept);
+                all.sort_unstable();
+                all.dedup();
+                all
+            },
+            height,
+            step,
+            hash,
+            |key, value| {
+                rows.insert(key.to_vec(), value.map(<[u8]>::to_vec));
+            },
+        );
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Append the kept rows to `batch` (`CF_CONSENSUS_META`, key order).
+    pub(crate) fn append_to_batch(
+        &self,
+        db: &StateDb,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<(), crate::StateError> {
+        let cf = db.cf_handle(CF_CONSENSUS_META)?;
+        for (key, value) in &self.rows {
+            match value {
+                Some(v) => batch.put_cf(cf, key, v),
+                None => batch.delete_cf(cf, key),
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

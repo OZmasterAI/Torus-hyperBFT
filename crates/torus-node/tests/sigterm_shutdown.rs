@@ -56,16 +56,26 @@ fn node_command(work: &Path, genesis: &Path) -> Command {
             "info",
         ])
         .env_remove("RUST_LOG")
+        // Item 6 Phase 3 knobs: each test sets what it needs.
+        .env_remove("TORUS_CHECKPOINT_INTERVAL_MS")
+        .env_remove("TORUS_CHECKPOINT_MAX_BYTES")
+        .env_remove("TORUS_EXEC_PIPELINE")
+        .env_remove("TORUS_BOOK_ROWS")
         .stdin(Stdio::null());
     cmd
 }
 
 impl Node {
     fn start(work: &Path, genesis: &Path, run: &str) -> Node {
+        Node::start_env(work, genesis, run, &[])
+    }
+
+    fn start_env(work: &Path, genesis: &Path, run: &str, env: &[(&str, &str)]) -> Node {
         let log = work.join(format!("node-{run}.log"));
         let out = std::fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
         let child = node_command(work, genesis)
+            .envs(env.iter().copied())
             .stdout(out)
             .stderr(err)
             .spawn()
@@ -275,6 +285,87 @@ fn restart_after_sigterm_resumes_from_the_same_applied_state() {
         "header at height {head} changed across the restart"
     );
     assert!(torus_rpc::find_latest_height(&db) >= resumed);
+}
+
+/// The native applied-height marker (the durable marker a restart replays
+/// from), read from the stopped node's data dir; absent (nothing durable
+/// past genesis) reads as 0.
+fn durable_marker(data: &Path) -> u64 {
+    use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+    let db = StateDb::open(data).expect("reopen data dir after the node exited");
+    db.get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+        .unwrap()
+        .map_or(0, |raw| {
+            u64::from_be_bytes(raw.as_slice().try_into().expect("8-byte marker"))
+        })
+}
+
+/// Item 6 Phase 3: with coalesced checkpoints (15 s interval, so no periodic
+/// checkpoint closes before the signal), SIGTERM must close the open window
+/// into a final checkpoint inside the graceful stop, before the CF flush and
+/// WAL sync. The durable marker then equals the last executed height and the
+/// restart replays zero blocks.
+#[test]
+fn sigterm_with_checkpoints_restarts_with_zero_replay() {
+    const CKPT: &[(&str, &str)] = &[("TORUS_CHECKPOINT_INTERVAL_MS", "15000")];
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis(work.path());
+    let data = work.path().join("data");
+
+    let mut node = Node::start_env(work.path(), &genesis, "a", CKPT);
+    node.wait_executed_above(MIN_BLOCKS);
+    assert!(
+        node.log_text().contains("coalesced state checkpoints ON"),
+        "checkpoint mode not active:\n{}",
+        node.tail()
+    );
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
+    assert!(
+        !node
+            .log_text()
+            .contains("final checkpoint at shutdown failed"),
+        "final checkpoint failed:\n{}",
+        node.tail()
+    );
+    let executed = node.executed_height().unwrap();
+    drop(node);
+    assert_eq!(
+        durable_marker(&data),
+        executed,
+        "durable marker after SIGTERM must be the last executed height \
+         (the final checkpoint did not land)"
+    );
+
+    let mut node = Node::start_env(work.path(), &genesis, "b", CKPT);
+    node.wait_executed_above(executed);
+    let log = node.log_text();
+    assert!(
+        !log.contains("execution gap detected, replaying"),
+        "restart replayed blocks after SIGTERM:\n{}",
+        node.tail()
+    );
+    assert!(
+        !log.contains("boot reconciliation delivered"),
+        "graceful stop left committed blocks undelivered:\n{}",
+        node.tail()
+    );
+    assert!(
+        !log.contains("initializing from genesis"),
+        "restart re-ran genesis:\n{}",
+        node.tail()
+    );
+    // Zero replay: no height at or below the restored one executed again.
+    let re_executed: Vec<u64> = log
+        .lines()
+        .filter(|l| l.contains("execution pipeline: block done"))
+        .filter_map(|l| last_height(l, "execution pipeline: block done"))
+        .filter(|h| *h <= executed)
+        .collect();
+    assert!(
+        re_executed.is_empty(),
+        "restart re-executed heights {re_executed:?} (restored {executed})"
+    );
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
 }
 
 /// Codex round 5: with stdout blocked (a full pipe nobody reads, e.g. a

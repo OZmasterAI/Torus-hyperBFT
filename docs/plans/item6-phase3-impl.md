@@ -270,12 +270,51 @@ Readers (reader audit s109):
   balance only (native credits to `CF_ACCOUNTS`).
 
 Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
-`docs/validator-home-network.md`).
+`docs/validator-home-network.md`), except the RPC submit checks (owner s112, follow-up below).
 
 - Test first: `ingress_view_matches_interval_zero`. A session created at n, a balance credited
   at n, an EVM credit at n; gossip admission at n+1 accepts with interval "never" exactly as with
   interval 0. Fails before (session not found).
 - Verify: `cargo nextest run -p torus-mempool -p torus-consensus $F -E 'test(ingress_view)'`.
+- **Built** (`feat/item6-phase3-step2`, off step 1 `a44bdde6`, s111): `torus_state::ReadView`
+  (`read_view.rs`: frozen blocks above S newest first -> C -> DB; no layers = every call the
+  `StateDb` call; writes refused). E keeps the frozen sets above S (`CkptState.view_blocks`) and
+  publishes after each pipelined block (`publish_ingress_view`, after the hand-off and the
+  trigger: a checkpoint here clears them, C holds them); a barrier and a fresh W publish `None`
+  (all durable, the DB). **Memory (checked against step 0):** whole frozen sets would pin the
+  un-coalesced state bytes, ~885 MB per plan-15 s window on tw (section 41: 7,966 MB / 9
+  windows; Classic book blobs 77%), vs ~150 MB for L. So the view answers only the ingress CFs
+  (`read_view::INGRESS_CFS`: sessions, native balances, accounts, positions, validators,
+  oracle; markets and fee config since the s112 follow-up; other CFs read the DB) and the end-of-block merge thread also cuts block n-1 down to
+  those CFs (`FrozenPending::slice`), swapped in at `settle`: full sets only for the newest two
+  blocks. What is left is mostly positions (~23% of written state bytes, 1.5x coalescing), so
+  **estimate** ~150-200 MB per window on tw; archy to measure RSS in step 4.
+  The mempool reads `ingress_state()` (published view, else the DB) for the gossip session lookup, funded check, duty exemption, oracle reporter, `add_evm_tx`
+  (nonce + balance: one account row), `pending_nonce` and the item B volume read. The
+  post-commit EVM nonce prunes stay on the DB (EVM blocks are barriers, so DB nonces are
+  current). Tests: `ingress_view_matches_interval_zero` (RED first: session not found, D
+  unfunded, D balance 0), `ingress_view_follows_checkpoints_and_barriers` (ingress CFs equal
+  interval 0 after every block without waiting for W, at every 3 / never / C parked in
+  flight; barriers drop the view), `ingress_view_serves_duty_oracle_and_funded_checks`,
+  `read_view_*` (random model, newest layer wins, DB-only, ingress CFs only, slices).
+- **Follow-up (owner s112): RPC submit on the view.** `torus.rs` `verify_one_action_with`
+  (session lookup, known market + tick / lot, price band: oracle mark + governance band width)
+  is generic over `StateBackend`; both submit endpoints (`submitNativeAction`,
+  `submitNativeActions[Bin]`) pass `mempool.ingress_state()` (fetched once per call; interval 0:
+  the DB alone, unchanged). The market listings (`CF_NATIVE_MARKETS`, a governance
+  `MarketListing` executes in a block) and the band width (`CF_FEE_CONFIG`, governance
+  `ParameterChange`) can change inside a window, so `INGRESS_CFS` gains both (8 CFs). Memory:
+  per block the markets CF gets one 16-byte order-id counter row when orders flowed (key 24 B)
+  plus a row per listing; the fee-config CF only governance rows: ~100 B per block with
+  overhead, ~10 KB per plan-15 s window, negligible next to positions. Test (RED first:
+  `unknown market_id 1` x3): `torus-rpc` `rpc_submit_sees_ingress_view` (rows of block 5 only
+  in the published view vs in the DB; session order accepted, 120 refused by the 10% band, 105
+  accepted, through both endpoints).
+- Still on the DB (plan: validator RPC stays): the other `torus_*` / `eth_*` reads and
+  `eth_head` (`eth.rs` `eth_head`: durable marker), so `eth_blockNumber` moves in checkpoint
+  steps. The
+  step 1 bench stall (section 45: the in-flight tail polls `eth_blockNumber` on val2) is NOT
+  removed by step 2; owner options in the step 2 report.
 
 ### Step 3: D13 trade-history retention (RPC node)
 
@@ -301,6 +340,46 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   `2296be67` vs main `c97f56f9`, both with the bench in-flight tail on committed bodies. CPU-s/1M -7.4% (met),
   device writes -53% (met), matched/s -2.2% (tie, not up), native blocks/s -9.4% (borderline), RSS +1.5 GB peak
   (RAM gate not met: bound ~270 MB). Restart cells: not in this campaign. Owner decision.
+- **Follow-up (18c s112, after the p3s2g gate).** Both branches now merge main `8efcb07a`
+  (step 1 `b1605417`, step 2 `303f2eb1`): the next gate has no 16-commit confound.
+  - **Untimed exec time (47.1, +36 ms per block).** Cause: `checkpoint_upkeep` spawns the merge of
+    block n-1 into L at the end of block n, and `checkpoint_read_layers` joins it at the start of
+    block n+1, before the overlay is built. Nothing runs in between, so E waits for the whole merge
+    thread, and no phase timer covers that wait (the pipelined path never observes its
+    `flush_timer`). The join also waited for step 2's ingress `slice` and, in step 1, for the drop of
+    block n-1. E itself freed the sets a slice replaces (step 2: in the mempool's view swap, under its
+    lock), C once durable, and the block handles of a checkpoint-time merge. Ranking (throwaway
+    probe, synthetic blocks of section-41 size x2, thread CPU time; **18c-local, loaded host,
+    ranking only**, not for sizing): merge first; then the ingress slice and freeing a block's full
+    set, about equal; then freeing L at a checkpoint (per block, smallest).
+    New series: `torus_exec_checkpoint_settle_wait_seconds` (the join) and
+    `torus_exec_checkpoint_upkeep_seconds` (end-of-block upkeep), each once per pipelined block, and
+    the counter `torus_exec_checkpoint_drop_inline` (items E freed itself because the free thread's
+    queue was full; 0 while it keeps up). The harness counts both series in `residual_untimed`
+    until `summarize.py` `PHASES` lists them.
+    Built (no change to L, slices, the view's answers, state or replay): the merge thread hands L
+    back first, then slices and lets go of the block. Slices are installed at the end of the next
+    block (`install_slices`). A `torus-ckpt-drop` thread (queue 2, past it E frees inline) frees C,
+    replaced sets and the previous view. Expected effect (qualitative; archy measures it): the
+    settle wait drops by the slice (step 2) and the drop of n-1 (step 1), and E no longer frees
+    full sets, old views or C (`upkeep` / settle smaller) unless `drop_inline` counts. Left: the
+    merge itself, the largest item. It overlaps block n+1 only if L can be read while it is merged. Option: per-CF `RwLock` on L with
+    batched merges, block n-1 read as its own layer above L (a read is then correct at any point of
+    the merge). Read path: consensus-adjacent, needs its own tests. Other options: move the
+    entries instead of cloning when the frozen set is unique (step 1 only), or a persistent map.
+  - **Cancel-all expiry (47.3).** Not a DB lag: nothing on the pool's residency path reads state
+    (eviction by nonce age, removal at commit on the consensus thread, a height-bounded in-flight
+    ledger, selection reads no state). The item C walk takes at most `ceil(limit x 25%)` cancels in
+    `(sender, nonce)` order, and leftover slots reach the other cancels only when phase 2 neither
+    fills the block nor stops at a byte or order budget. With the cancel demand per block at the
+    share, a younger cancel of a lower-address sender passes an older one of a higher-address sender
+    every block. Phase 3 only moved the operating point (fewer, larger blocks). Repro:
+    `native_pool.rs` `cancel_share_never_starves_an_older_cancel` (ignored, fails today). **Owner
+    options:** (a) oldest-first cancel phases (a cancel index by nonce; each sender stays in nonce
+    order; changes block content, bench it, see the s66 note on `SortKey`); (b) a higher
+    `TORUS_CANCEL_BLOCK_SHARE_PCT` (weaker item C); (c) per-sender round-robin in the cancel
+    share; (d) accept it (the bench's 36.7% cancel-all mix is above the 25% share; the in-flight
+    estimate stays conservative).
 - **RSS split** (campaign `ozarchy-p3rss`, results doc section 48, plan-2 row 53): of step 2's +1.55 GB peak, the
   commit-mode exec backlog (not Phase 3) is +0.83 GB, the step 1 layer +0.88 GB and the step 2 view +0.68 GB (vs control
   `2725e321`); about half of each Phase 3 delta is glibc retention (jemalloc live heap +0.51 / +0.45 / +0.33 GB). RSS

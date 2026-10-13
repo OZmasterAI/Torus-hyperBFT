@@ -6,7 +6,7 @@ use revm::context_interface::cfg::gas::calculate_initial_tx_gas;
 use revm::primitives::eip3860::MAX_INITCODE_SIZE;
 use revm::primitives::hardfork::SpecId;
 
-use torus_state::StateDb;
+use torus_state::backend::StateBackend;
 
 use crate::error::MempoolError;
 use crate::evm_pool::EvmPoolEntry;
@@ -33,9 +33,9 @@ fn extract_gas_price(tx: &TxEnvelope) -> (u128, u128) {
 ///
 /// Checks: RLP decode, tx type, chain ID, gas limit, initcode size, intrinsic
 /// gas, fee floor, signature recovery, nonce, balance.
-pub fn validate_evm_tx(
+pub fn validate_evm_tx<S: StateBackend>(
     raw_rlp: &[u8],
-    state: &StateDb,
+    state: &S,
     chain_id: u64,
     block_gas_limit: u64,
     base_fee: u64,
