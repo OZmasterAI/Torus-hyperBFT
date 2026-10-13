@@ -2098,6 +2098,121 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Exec-aware admission (`TORUS_ADMISSION_EXEC_AWARE`): an empty pool with
+    /// committed-but-unexecuted work at the limit sheds orders "busy" before
+    /// verification while cancels still pass; once that block executes,
+    /// orders are no longer shed.
+    #[tokio::test]
+    async fn exec_aware_backlog_sheds_orders_keeps_cancels_and_reopens_after_exec() {
+        let dir = TempDir::new().unwrap();
+        let state = StateDb::open(dir.path()).unwrap();
+        let cfg = MempoolConfig {
+            native_admission_horizon_ms: 20_000,
+            native_admission_floor: 3,
+            native_admission_exec_aware: true,
+            ..Default::default()
+        };
+        let mempool = Arc::new(Mempool::new(state.clone(), cfg));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let committed: Vec<_> = (1u8..=3)
+            .map(|seed| {
+                let k = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+                torus_types::eip712::sign_native_action(
+                    torus_types::NativeAction::ClaimRewards,
+                    now_ms,
+                    &k,
+                )
+            })
+            .collect();
+        assert!(!mempool.native_admission_backlogged());
+        mempool.note_exec_dispatched(9, &committed);
+        assert_eq!(mempool.native_pool_size(), 0, "the pool itself is empty");
+        assert!(
+            mempool.native_admission_backlogged(),
+            "3 committed-unexecuted >= limit 3"
+        );
+
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        server.set_metrics(Arc::new(torus_telemetry::Metrics::new()));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let mk = |action: torus_types::NativeAction, nonce: u64| {
+            let signed = torus_types::eip712::sign_native_action(action, nonce, &key);
+            format!("0x{}", hex::encode(serde_json::to_vec(&signed).unwrap()))
+        };
+        let batch = vec![
+            mk(torus_types::NativeAction::ClaimRewards, now_ms + 1),
+            mk(
+                torus_types::NativeAction::CancelOrder { order_id: 7 },
+                now_ms + 2,
+            ),
+        ];
+        let results: Vec<RpcSubmitResult> = client
+            .request("torus_submitNativeActions", jsonrpsee::rpc_params![batch])
+            .await
+            .unwrap();
+        assert_eq!(
+            results[0].error.as_deref(),
+            Some(crate::torus::ADMISSION_BUSY_MSG),
+            "{:?}",
+            results[0]
+        );
+        assert!(
+            !results[1].error.as_deref().unwrap_or("").contains("busy"),
+            "a cancel is never shed for backlog: {:?}",
+            results[1]
+        );
+        let single: Result<String, _> = client
+            .request(
+                "torus_submitNativeAction",
+                jsonrpsee::rpc_params![mk(torus_types::NativeAction::ClaimRewards, now_ms + 3)],
+            )
+            .await;
+        assert!(single
+            .expect_err("single endpoint sheds too")
+            .to_string()
+            .contains("busy"));
+
+        // The committed block executes: admission opens again.
+        mempool.note_exec_finished(9);
+        assert!(!mempool.native_admission_backlogged());
+        let results: Vec<RpcSubmitResult> = client
+            .request(
+                "torus_submitNativeActions",
+                jsonrpsee::rpc_params![vec![mk(
+                    torus_types::NativeAction::ClaimRewards,
+                    now_ms + 4
+                )]],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !results[0].error.as_deref().unwrap_or("").contains("busy"),
+            "{:?}",
+            results[0]
+        );
+        handle.stop().unwrap();
+    }
+
     /// Cut 6: `submitNativeActionsBin` decides the shed from the bincode tag.
     /// While backlogged: a well-formed refused action and (the one deliberate
     /// exception) a refused tag with a broken body both get "busy" and count as

@@ -10,6 +10,7 @@ pub mod addr_rate;
 pub mod bounded_map;
 pub mod error;
 pub mod evm_pool;
+pub mod exec_backlog;
 pub mod funded;
 pub mod native_pool;
 pub mod rate_limit;
@@ -91,6 +92,12 @@ pub struct MempoolConfig {
     pub native_admission_horizon_ms: u64,
     /// The admission limit never drops below this many pooled actions.
     pub native_admission_floor: usize,
+    /// Exec-aware admission (opt-in): the admission check also counts the
+    /// normal actions of committed blocks dispatched to execution but not yet
+    /// executed (they left the pool at dispatch). Off by default; needs the
+    /// limit on (`native_admission_horizon_ms` > 0);
+    /// `TORUS_ADMISSION_EXEC_AWARE` env override.
+    pub native_admission_exec_aware: bool,
     // ---- Anti-spam item A ----
     /// Whole TRS a sender must hold for its native actions to enter the pool
     /// (see [`funded`]). 0 = off — the library default, so embedded users and
@@ -123,6 +130,7 @@ impl Default for MempoolConfig {
             max_memory_bytes: 64 * 1024 * 1024, // 64 MB default
             native_admission_horizon_ms: rate_limit::admission_horizon_ms(),
             native_admission_floor: rate_limit::admission_floor(),
+            native_admission_exec_aware: rate_limit::admission_exec_aware(),
             ingress_min_collateral_trs: 0,
             native_cancel_block_share_pct: rate_limit::cancel_block_share_pct(),
         }
@@ -203,6 +211,10 @@ pub struct Mempool {
     /// [`rate_limit::ADMISSION_RATE_WINDOW_MS`] — the rate the admission limit
     /// follows.
     native_commit_log: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, usize)>>,
+    /// Exec-aware admission: committed-but-unexecuted normal actions, per
+    /// dispatched height. Only touched with the knob on (see
+    /// [`Self::exec_aware_admission`]).
+    exec_backlog: exec_backlog::ExecBacklog,
     /// Anti-spam item B: per-address request limit (unset = off, the library
     /// default; `torus-node` installs it from the env). Charged for every
     /// action that enters the pool, enforced only at RPC ingress.
@@ -244,6 +256,7 @@ impl Mempool {
             metrics: std::sync::OnceLock::new(),
             verified_senders: RwLock::new(FifoCache::new(verified_cap)),
             native_commit_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            exec_backlog: exec_backlog::ExecBacklog::default(),
             addr_limiter: std::sync::OnceLock::new(),
         }
     }
@@ -345,6 +358,42 @@ impl Mempool {
     pub fn native_admission_backlogged(&self) -> bool {
         self.native_admission_limit()
             .is_some_and(|limit| self.native.read().unwrap().normal_size() >= limit)
+    }
+
+
+    /// Exec-aware admission is in effect: the knob is on AND the admission
+    /// limit is on (with the limit off there is nothing to add the work to).
+    pub fn exec_aware_admission(&self) -> bool {
+        todo!()
+    }
+
+    /// Consensus thread, right before a committed block enters the exec
+    /// channel: count its normal actions (cancels and oracle submissions are
+    /// not admission backlog, as in the pool) as committed-but-unexecuted.
+    /// Idempotent per height (a rank-2 retry is not recounted). No-op with
+    /// exec-aware admission off.
+    pub fn note_exec_dispatched(&self, height: u64, actions: &[SignedNativeAction]) {
+        let _ = (height, actions);
+        todo!()
+    }
+
+    /// Exec thread, after it finished (or abandoned) `height`: release every
+    /// counted height at or below it.
+    pub fn note_exec_finished(&self, height: u64) {
+        let _ = height;
+        todo!()
+    }
+
+    /// The execution pipeline is gone (fail-stop, closed channel): drop all
+    /// committed-but-unexecuted counts.
+    pub fn clear_exec_backlog(&self) {
+        todo!()
+    }
+
+    /// Committed normal actions dispatched to execution but not yet executed
+    /// (0 with exec-aware admission off).
+    pub fn committed_unexecuted_normal(&self) -> usize {
+        todo!()
     }
 
     fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {
@@ -2998,6 +3047,151 @@ mod tests {
                 .unwrap();
         }
         assert!(pool.native_admission_backlogged());
+    }
+
+    // ---- Exec-aware admission (TORUS_ADMISSION_EXEC_AWARE) ----
+
+    /// A committed block body: `orders` normal order batches, `cancels`
+    /// cancels (each from its own key).
+    fn committed_body(seed: u8, orders: usize, cancels: usize) -> Vec<SignedNativeAction> {
+        let t0 = now_ms();
+        let mut out = Vec::new();
+        for i in 0..orders {
+            out.push(order_batch(&key(seed.wrapping_add(i as u8)), t0, 3));
+        }
+        for i in 0..cancels {
+            out.push(cancel_all(&key(seed.wrapping_add(100 + i as u8)), t0));
+        }
+        out
+    }
+
+    fn exec_aware_cfg(on: bool, horizon_ms: u64, floor: usize) -> MempoolConfig {
+        MempoolConfig {
+            native_admission_horizon_ms: horizon_ms,
+            native_admission_floor: floor,
+            native_admission_exec_aware: on,
+            ..MempoolConfig::default()
+        }
+    }
+
+    /// Knob OFF (the default) pins today's decision: backlogged iff pooled
+    /// normal entries >= the commit-rate limit, whatever committed work is
+    /// reported dispatched; nothing is tracked.
+    #[test]
+    fn exec_aware_off_pins_todays_admission_decisions() {
+        assert!(
+            !MempoolConfig::default().native_admission_exec_aware
+                || std::env::var("TORUS_ADMISSION_EXEC_AWARE").is_ok(),
+            "the knob defaults off"
+        );
+        for pooled in 0..=6usize {
+            for committed_orders in [0usize, 3, 50] {
+                let (_dir, state) = setup();
+                let pool = Mempool::new(state, exec_aware_cfg(false, 10_000, 4));
+                let t0 = now_ms();
+                for i in 0..pooled {
+                    let k = key(200 + i as u8);
+                    pool.add_native_action_presigned(address_from_key(&k), order_batch(&k, t0, 1))
+                        .unwrap();
+                }
+                pool.note_exec_dispatched(7, &committed_body(1, committed_orders, 2));
+                assert_eq!(pool.committed_unexecuted_normal(), 0, "off: not tracked");
+                assert_eq!(
+                    pool.native_admission_backlogged(),
+                    pooled >= 4,
+                    "off: pooled {pooled}, committed {committed_orders}"
+                );
+                pool.note_exec_finished(7);
+                assert_eq!(pool.native_admission_backlogged(), pooled >= 4);
+            }
+        }
+    }
+
+    /// Knob ON: a small pool plus a large committed-unexecuted backlog sheds;
+    /// once that block executes, admission opens again. Committed cancels
+    /// are not counted (same rule as pooled cancels).
+    #[test]
+    fn exec_aware_on_counts_committed_unexecuted_and_drains_after_exec() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, exec_aware_cfg(true, 10_000, 4));
+        let t0 = now_ms();
+        let k = key(220);
+        pool.add_native_action_presigned(address_from_key(&k), order_batch(&k, t0, 1))
+            .unwrap();
+        assert!(!pool.native_admission_backlogged(), "1 pooled < 4");
+
+        // Height 10: 2 orders + 5 cancels committed -> 2 counted (1 + 2 < 4).
+        pool.note_exec_dispatched(10, &committed_body(1, 2, 5));
+        assert_eq!(pool.committed_unexecuted_normal(), 2);
+        assert!(!pool.native_admission_backlogged());
+        // Height 11: 1 more order -> 1 pooled + 3 committed = 4: shed.
+        pool.note_exec_dispatched(11, &committed_body(30, 1, 0));
+        assert_eq!(pool.committed_unexecuted_normal(), 3);
+        assert!(pool.native_admission_backlogged());
+        // A rank-2 retry of 11 is not counted twice.
+        pool.note_exec_dispatched(11, &committed_body(30, 1, 0));
+        assert_eq!(pool.committed_unexecuted_normal(), 3);
+
+        pool.note_exec_finished(10);
+        assert_eq!(pool.committed_unexecuted_normal(), 1);
+        assert!(!pool.native_admission_backlogged());
+        pool.note_exec_finished(11);
+        assert_eq!(pool.committed_unexecuted_normal(), 0);
+
+        // Teardown path: dispatched work is dropped wholesale.
+        pool.note_exec_dispatched(12, &committed_body(40, 9, 0));
+        assert!(pool.native_admission_backlogged());
+        pool.clear_exec_backlog();
+        assert_eq!(pool.committed_unexecuted_normal(), 0);
+        assert!(!pool.native_admission_backlogged());
+    }
+
+    /// Knob on but the admission limit off (horizon 0): nothing to add the
+    /// work to, so nothing is tracked and nothing sheds.
+    #[test]
+    fn exec_aware_needs_the_admission_limit() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, exec_aware_cfg(true, 0, 0));
+        pool.note_exec_dispatched(3, &committed_body(1, 10, 0));
+        assert_eq!(pool.committed_unexecuted_normal(), 0);
+        assert!(!pool.native_admission_backlogged());
+    }
+
+    /// The gauge follows the counter (set under the counter's lock).
+    #[test]
+    fn exec_aware_gauge_tracks_committed_unexecuted() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, exec_aware_cfg(true, 10_000, 4));
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        pool.note_exec_dispatched(5, &committed_body(1, 3, 1));
+        assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 3);
+        pool.note_exec_dispatched(6, &committed_body(10, 2, 0));
+        assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 5);
+        pool.note_exec_finished(6);
+        assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 0);
+        pool.note_exec_dispatched(7, &committed_body(20, 4, 0));
+        pool.clear_exec_backlog();
+        assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 0);
+        let text = metrics.encode();
+        assert!(
+            text.contains("torus_mempool_native_committed_unexecuted 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn parse_admission_exec_aware_defaults_off() {
+        use crate::rate_limit::parse_admission_exec_aware as p;
+        assert!(!p(None));
+        assert!(!p(Some("".into())));
+        assert!(!p(Some(" ".into())));
+        assert!(!p(Some("0".into())));
+        assert!(!p(Some("false".into())));
+        assert!(!p(Some("junk".into())), "unparsable = off (warned)");
+        assert!(p(Some("1".into())));
+        assert!(p(Some(" 1 ".into())));
+        assert!(p(Some("true".into())));
     }
 
     #[test]

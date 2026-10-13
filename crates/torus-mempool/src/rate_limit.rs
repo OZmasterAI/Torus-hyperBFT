@@ -151,6 +151,19 @@ pub fn admission_horizon_ms() -> u64 {
     parse_admission_horizon_ms(std::env::var("TORUS_ADMISSION_HORIZON_MS").ok())
 }
 
+/// Parse `TORUS_ADMISSION_EXEC_AWARE` (exec-aware admission, opt-in): `1` or
+/// `true` = on; unset, empty, `0` or `false` = off; anything else = off with
+/// a warning.
+pub fn parse_admission_exec_aware(raw: Option<String>) -> bool {
+    let _ = raw;
+    false
+}
+
+/// The node's `TORUS_ADMISSION_EXEC_AWARE` (node-local ingress policy).
+pub fn admission_exec_aware() -> bool {
+    parse_admission_exec_aware(std::env::var("TORUS_ADMISSION_EXEC_AWARE").ok())
+}
+
 /// Default floor under the admission limit: 4 full blocks, so a cold node (no
 /// commits measured yet) or a briefly stalled chain never sheds a normal load.
 pub fn admission_floor() -> usize {
