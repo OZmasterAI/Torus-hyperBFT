@@ -1154,17 +1154,34 @@ impl TorusApiServer for RpcState {
                     .usable_oracle_price(mid)
                     .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price));
 
-                // Simplified liquidation price estimate.
-                let liquidation_price =
-                    if p.size > FixedPoint::ZERO && p.isolated_margin > FixedPoint::ZERO {
-                        if p.is_long {
-                            p.entry_price - p.isolated_margin / p.size
+                let liquidation_price = match p.margin_type {
+                    // R23: the account-wide threshold the liquidation step
+                    // checks, this market's mark varied, the others held
+                    // (`crate::account::cross_liquidation_price`); null when
+                    // no mark crosses. Same executed-head block time as
+                    // getBalances.
+                    torus_core::position::MarginType::Cross => {
+                        let executed = crate::eth::eth_head(self);
+                        let now = crate::eth::get_header_with_hash(self, executed)
+                            .map_err(ErrorObjectOwned::from)?
+                            .map(|(h, _, _)| h.timestamp);
+                        crate::account::cross_liquidation_price(&self.state, &addr, mid, now)
+                            .map_err(|e| RpcError::Internal(e.to_string()))
+                            .map_err(ErrorObjectOwned::from)?
+                    }
+                    // Simplified isolated estimate (unchanged).
+                    torus_core::position::MarginType::Isolated => Some(
+                        if p.size > FixedPoint::ZERO && p.isolated_margin > FixedPoint::ZERO {
+                            if p.is_long {
+                                p.entry_price - p.isolated_margin / p.size
+                            } else {
+                                p.entry_price + p.isolated_margin / p.size
+                            }
                         } else {
-                            p.entry_price + p.isolated_margin / p.size
-                        }
-                    } else {
-                        FixedPoint::ZERO
-                    };
+                            FixedPoint::ZERO
+                        },
+                    ),
+                };
 
                 Ok(Some(RpcPosition {
                     market_id,
@@ -1175,7 +1192,7 @@ impl TorusApiServer for RpcState {
                     realized_pnl: dec_fp(p.realized_pnl),
                     margin: dec_fp(p.isolated_margin),
                     margin_mode: margin_mode.to_string(),
-                    liquidation_price: dec_fp(liquidation_price),
+                    liquidation_price: liquidation_price.map(dec_fp),
                 }))
             }
         }
