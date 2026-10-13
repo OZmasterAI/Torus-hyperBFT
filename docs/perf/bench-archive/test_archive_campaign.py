@@ -383,7 +383,7 @@ class Fixture:
         write(p, json.dumps(meta or self.meta, indent=1))
         return p
 
-    def run(self, *extra, meta=None):
+    def run(self, *extra, meta=None, cwd=None):
         cmd = [
             sys.executable,
             "-I",
@@ -400,7 +400,7 @@ class Fixture:
             "--fields-file",
             self.fields,
         ] + list(extra)
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
 
     def read(self, name):
         with open(os.path.join(self.archive, name)) as f:
@@ -1232,6 +1232,70 @@ class Smoke(FixtureCase):
             self.assertIn("relative path", r.stderr)
             self.assertNotIn("smoke check", r.stdout)
             self.assertEqual(fx.snapshot(), snap)
+
+    def test_analyst_overwriting_the_staged_want_is_refused(self):
+        # the want is compared with the bytes that get archived (snapshotted before any analyst runs), so a script
+        # that rewrites the staged copy of its own expected output cannot make a mismatch pass
+        fx = self.fx
+        write(
+            self.an("a-cheat.py"),
+            "open('../tools/analyst/cells.txt', 'w').write('bad\\n')\nprint('bad')\n",
+        )
+        smoke = {
+            "script": "analyst/a-cheat.py",
+            "compare": [{"want": "analyst/cells.txt"}],
+        }
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_with(smoke))
+        self.assertRefused(r, snap, "analyst/cells.txt", "+bad")
+        r = fx.run("--dry-run", meta=self.meta_with(smoke))
+        self.assertRefused(r, snap, "+bad")
+
+    def test_relative_bench_root_works(self):
+        # {bench} is substituted as an absolute path: the analyst commands run with cwd = the scratch dir
+        # (run from the temp dir with --bench-root bench: a relative path that does not resolve from the scratch dir)
+        fx = self.fx
+        fx.bench = "bench"
+        snap = fx.snapshot()
+        r = fx.run("--dry-run", cwd=fx.tmp)
+        self.assertOk(r)
+        self.assertIn("smoke check 1/1 OK", r.stdout)
+        self.assertEqual(fx.snapshot(), snap)
+
+    def test_bad_tolerance_is_an_error(self):
+        # nan would approve every numeric mismatch (any comparison with nan is False); inf likewise; < 0 never
+        # matches: all are meta errors (exit 1, nothing written, no smoke run)
+        fx = self.fx
+        cmp_ = SMOKE["compare"][0]
+        snap = fx.snapshot()
+        for tol in (float("nan"), float("inf"), -1e-4, "0.1", True):
+            r = fx.run(
+                meta=self.meta_with(dict(SMOKE, compare=[dict(cmp_, tolerance=tol)]))
+            )
+            self.assertEqual(r.returncode, 1, "%r\n%s" % (tol, r.stderr))
+            self.assertIn("tolerance", r.stderr)
+            self.assertNotIn("smoke check", r.stdout)
+            self.assertEqual(fx.snapshot(), snap)
+        m = load_module()
+        for tol in (float("nan"), float("inf")):
+            with self.assertRaises(m.Fatal):
+                m.smoke_specs(
+                    {
+                        "smoke": [
+                            {
+                                "script": "a.py",
+                                "compare": [{"want": "w.txt", "tolerance": tol}],
+                            }
+                        ]
+                    }
+                )
+        m.smoke_specs(
+            {
+                "smoke": [
+                    {"script": "a.py", "compare": [{"want": "w.txt", "tolerance": 0}]}
+                ]
+            }
+        )
 
     def test_malformed_declaration_is_an_error(self):
         fx = self.fx

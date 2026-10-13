@@ -50,12 +50,13 @@ SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as a
   Before writing, the script copies the staged tools tree (exactly what it would write to tools/ozarchy-<camp>-tools/)
   into a temp dir and runs each [[smoke]] entry in order from there, against the real cell dirs under --bench-root,
   with cwd = a temp output dir shared by all entries; then each [[smoke.compare]] is diffed line by line with the
-  archived file in the same copy. Run it against one cell where the script allows (e.g. a-cells.py PREFIX r1-c0:c0
+  archived file's bytes as staged (taken before any entry runs, so a command that rewrites the copy cannot change
+  what it is compared with). Run it against one cell where the script allows (e.g. a-cells.py PREFIX r1-c0:c0
   against that cell's line of cells.txt). Copy the arguments from the analyst's driver (run-analysis.sh or the
   session log) verbatim: a wrong prefix then fails here instead of in the archive. Do not declare scripts that write
   to hard-coded paths (a-archive.py): only {out} is a scratch dir.
     script    relative path in the tools copy (no absolute path, "..", or {placeholder}); .py runs as `python3 -I <script> <args>`, .sh as `bash <script> <args>`
-    args      list of strings; {bench} = --bench-root, {out} = the scratch output dir, {tools} / {analyst} = the
+    args      list of strings; {bench} = --bench-root (made absolute), {out} = the scratch output dir, {tools} / {analyst} = the
               temp tools copy and its analyst/ dir, {camp} = the campaign tag; other braces stay as written
     timeout   seconds per entry (default 300); on expiry the process group is killed and the check fails
     name      optional label for the report
@@ -65,7 +66,8 @@ SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as a
                 "stdout" in one entry), or a relative file name in {out} (no {out} prefix)
       select    regex: compare only the lines (of both sides) it matches, e.g. "^r1-c0 " for one cell
       ignore    list of regexes: lines dropped from both sides (timestamps, temp paths)
-      tolerance relative tolerance for every number in a line (default 0: exact); the text between numbers must match
+      tolerance relative tolerance for every number in a line (default 0: exact); the text between numbers must match;
+                a finite number >= 0 (nan, inf, a negative or a string is a meta error)
   Example and real use: meta/p3cloid.toml, meta/p3cloidprof.toml.
 
 SAFETY: it never deletes anything (it only writes rm commands into DELETABLE.md for a human to run on ozarchy); the
@@ -77,6 +79,7 @@ import difflib
 import fnmatch
 import glob
 import json
+import math
 import os
 import re
 import stat
@@ -1015,6 +1018,10 @@ def smoke_specs(meta):
                     "%s: unknown compare keys %s (known: %s)"
                     % (where, sorted(bad), sorted(CMP_KEYS))
                 )
+            tol = cm.get("tolerance", 0)
+            # nan would pass every numeric mismatch (all comparisons with nan are False), inf too; < 0 never matches
+            if isinstance(tol, bool) or not isinstance(tol, (int, float)) or not math.isfinite(tol) or tol < 0:
+                raise Fatal("%s: compare tolerance must be a finite number >= 0 (relative), not %r" % (where, tol))
             for rx in ([cm["select"]] if "select" in cm else []) + list(
                 cm.get("ignore", [])
             ):
@@ -1084,13 +1091,17 @@ def run_smoke(c, specs, staged):
     with tempfile.TemporaryDirectory(prefix="archive-smoke-") as tmp:
         tools, out = os.path.join(tmp, "tools"), os.path.join(tmp, "out")
         os.makedirs(out)
+        # the expected outputs are the bytes that get archived, taken now: an analyst command that rewrites its
+        # staged want (e.g. ../tools/analyst/x.txt from cwd = out) must not change what it is compared with
+        archived = {os.path.normpath(rel): data for rel, data, _ in staged}
         for rel, data, mode in staged:
             write_atomic(os.path.join(tools, rel), data, mode)
+        # every substituted path absolute: the commands run with cwd = out
         vals = {
-            "bench": c.bench,
-            "out": out,
-            "tools": tools,
-            "analyst": os.path.join(tools, "analyst"),
+            "bench": os.path.abspath(c.bench),
+            "out": os.path.abspath(out),
+            "tools": os.path.abspath(tools),
+            "analyst": os.path.abspath(os.path.join(tools, "analyst")),
             "camp": c.camp,
         }
         for k, s in enumerate(specs, 1):
@@ -1150,15 +1161,16 @@ def run_smoke(c, specs, staged):
                         bad = True
                         continue
                     got = read(gp)
-                wp = smoke_inside(tools, cm["want"])
-                if wp is None or not os.path.isfile(wp):
+                want = archived.get(os.path.normpath(cm["want"]))
+                if want is None:
                     errors.append(
                         "%s: archived output %s is not in the tools copy"
                         % (label, cm["want"])
                     )
                     bad = True
                     continue
-                want_l, got_l = smoke_lines(read(wp), cm), smoke_lines(got, cm)
+                want = want.decode(errors="replace") if isinstance(want, bytes) else want
+                want_l, got_l = smoke_lines(want, cm), smoke_lines(got, cm)
                 if not want_l:
                     errors.append(
                         "%s: no line of %s left after select %r / ignore: nothing to compare"
@@ -1166,7 +1178,7 @@ def run_smoke(c, specs, staged):
                     )
                     bad = True
                     continue
-                tol = float(cm.get("tolerance", 0))
+                tol = float(cm.get("tolerance", 0))  # finite and >= 0 (smoke_specs)
                 if len(want_l) != len(got_l) or not all(
                     smoke_same(a, b, tol) for a, b in zip(want_l, got_l, strict=True)
                 ):
@@ -1515,7 +1527,8 @@ def main(argv=None):
         if "section" not in meta:
             raise Fatal("meta has no section")
         specs = smoke_specs(meta)
-        c = Campaign(a.camp, meta, a.bench_root, repo)
+        # absolute: the smoke commands get {bench} with cwd = their scratch dir
+        c = Campaign(a.camp, meta, os.path.abspath(a.bench_root), repo)
         names = ["INDEX.md", "cells.md", "DELETABLE.md"]
         paths = [os.path.join(archive, f) for f in names]
         texts = [read(p) for p in paths]
