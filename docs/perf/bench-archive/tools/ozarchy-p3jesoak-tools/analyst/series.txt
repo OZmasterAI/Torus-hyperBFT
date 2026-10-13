@@ -1,0 +1,280 @@
+== jmf: main + fix 0360c840 (je, control) [ozarchy-p3jesoak-300m-k1-jmf] window 602.0 s
+  bench: sent place 395240 cancel-all 211681 | accepted cancel-all 211678 | released committed 604295 refused 86 timeout 0
+  val0 cancel-alls executed 211678 (sent - executed 3) | nonce-expired evictions cell 0 window 0 first at nan s | margin-rejected 0 | action failures 0
+  val0 RSS MB mean 2-5 4165 5-10 4157 (change -8) | @1 3552 @5 4118 end 4188 peak 4383 | slope MB/min 2-5 +68.0 [-4.6, +140.7] last5 -19.2 [-42.9, +4.5] n_eff 25 | r(RSS,resting) +0.45
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 2752/2773/3160 active 2928/2953/3346 resident 3794/3890/4066 retained 3923/3916/4223 mapped 4034/4137/4303
+     jemalloc last-5-min slope MB/min: allocated -9.6 [-31.9, +12.7] resident -20.3 [-50.2, +9.5]
+     exec queue max 66 (5 s gauge max 65) mean min 5-10 58.5 | exec busy 5-10 0.98 | exec ms/block 5-10 419
+     resting orders @1/@5/end 0.09/0.67/0.65 M
+  val1 cancel-alls executed 211678 (sent - executed 3) | nonce-expired evictions cell 0 window 0 first at nan s | margin-rejected 0 | action failures 0
+  val1 RSS MB mean 2-5 4134 5-10 4153 (change +19) | @1 3698 @5 4136 end 4048 peak 4329 | slope MB/min 2-5 +57.9 [+5.3, +110.5] last5 -2.3 [-19.9, +15.4] n_eff 43 | r(RSS,resting) +0.45
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 2785/2960/3042 active 2965/3141/3247 resident 3770/3883/4072 retained 3600/3756/4017 mapped 4008/4121/4310
+     jemalloc last-5-min slope MB/min: allocated -11.2 [-35.0, +12.6] resident -13.8 [-39.8, +12.1]
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 59.0 | exec busy 5-10 0.98 | exec ms/block 5-10 420
+     resting orders @1/@5/end 0.09/0.67/0.70 M
+  val2 cancel-alls executed 211678 (sent - executed 3) | nonce-expired evictions cell 0 window 0 first at nan s | margin-rejected 0 | action failures 0
+  val2 RSS MB mean 2-5 4892 5-10 4964 (change +72) | @1 4549 @5 4857 end 5241 peak 5299 | slope MB/min 2-5 +31.5 [-24.8, +87.8] last5 -9.5 [-35.1, +16.0] n_eff 51 | r(RSS,resting) +0.23
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 2939/2808/3208 active 3122/2995/3405 resident 4566/4601/4929 retained 4669/4663/4943 mapped 4809/4843/5172
+     jemalloc last-5-min slope MB/min: allocated -34.8 [-58.9, -10.7] resident -26.3 [-53.3, +0.7]
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 65.3 | exec busy 5-10 0.98 | exec ms/block 5-10 421
+     resting orders @1/@5/end 0.09/0.73/0.71 M
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired(val0) node_cores bench_cores margin_rejected/s  [val0 chain]
+    1    1351    1061    261639    199616  188.1  4.88  0.97    4544  48.9    284541    398      0 5.51/5.54/6.20 1.01 0
+    2    1179    1079    259391    198908  184.4  3.32  0.99    7448  61.9    375470    434      0 5.63/5.68/6.28 1.14 0
+    3    1032     955    263406    202590  212.1  2.47  0.98    5915  61.6    537301    292      0 5.65/5.62/6.24 1.04 0
+    4     940     947    249793    192361  203.2  2.37  0.99    6104  61.8    681026    314      0 5.47/5.47/6.03 1.00 0
+    5     939     947    249623    192421  203.3  2.37  0.99    6025  60.8    688844    320      0 5.18/5.17/5.73 0.92 0
+    6     929     940    251197    193634  206.0  2.35  0.99    6090  59.9    689152    308      0 5.28/5.30/5.90 0.96 0
+    7     934     933    245600    189394  202.9  2.33  0.98    6086  59.1    691832    319      0 5.36/5.34/5.84 0.99 0
+    8     932     927    247389    190784  205.9  2.32  0.97    6030  58.8    676119    304      0 5.26/5.29/5.83 0.97 0
+    9     918     947    249797    192575  203.4  2.37  0.99    5991  57.9    703760    318      0 5.30/5.20/5.84 0.87 0
+   10     927     940    248980    191798  204.0  2.35  0.98    5943  56.8    690569    314      0 5.30/5.34/5.94 1.01 0
+  per node per minute: min RSS_MB je_alloc je_active je_resident je_retained (MB, minute mean) matched/s expired cancel_all/s margin_rej/s resting_M flush_depth exec_busy exec_ms/blk exec_q(mean/max) ckpts layer_MB drop_inline select_ms
+  val0  1   3597   1871   1997   2756   2019   199616      0    398       0  0.22   0.4  0.97    198  48.9/ 66  nan    nan   nan  19.50
+  val0  2   3968   2530   2710   3544   2639   198908      0    434       0  0.02   0.4  0.99    298  61.9/ 64  nan    nan   nan  32.81
+  val0  3   4247   2688   2873   3773   3066   202590      0    292       0  0.69   0.5  0.98    397  61.6/ 64  nan    nan   nan  37.40
+  val0  4   4193   2857   3043   3852   3347   192361      0    314       0  0.72   0.6  0.99    418  61.8/ 63  nan    nan   nan  35.41
+  val0  5   4117   2850   3030   3859   3655   192421      0    320       0  0.66   0.6  0.99    417  60.8/ 62  nan    nan   nan  26.29
+  val0  6   4360   2766   2946   3858   3811   193634      0    308       0  0.74   0.4  0.99    419  59.9/ 62  nan    nan   nan  31.56
+  val0  7   4046   2773   2948   3808   3880   189394      0    319       0  0.63   0.6  0.98    422  59.1/ 61  nan    nan   nan  29.43
+  val0  8   4207   2731   2906   3748   3951   190784      0    304       0  0.71   0.4  0.97    420  58.8/ 61  nan    nan   nan  41.04
+  val0  9   4056   2776   2951   3812   3915   192575      0    318       0  0.69   0.5  0.99    419  57.9/ 60  nan    nan   nan  33.58
+  val0 10   4147   2714   2885   3738   4068   191798      0    314       0  0.69   0.5  0.98    419  56.8/ 59  nan    nan   nan  34.54
+  val1  1   3705   1735   1850   2543   1735   199616      0    398       0  0.22   0.4  0.97    199  49.1/ 66  nan    nan   nan  19.01
+  val1  2   3989   2523   2701   3521   2568   199378      0    434       0  0.01   0.4  0.99    297  62.4/ 65  nan    nan   nan  27.33
+  val1  3   4212   2667   2851   3706   3073   202120      0    294       0  0.69   0.5  0.98    396  61.8/ 64  nan    nan   nan  29.24
+  val1  4   4132   2849   3035   3823   3318   193907      0    314       0  0.73   0.6  0.99    417  61.1/ 63  nan    nan   nan  31.97
+  val1  5   4136   2759   2941   3794   3423   190676      0    319       0  0.66   0.5  0.99    420  60.7/ 63  nan    nan   nan  36.15
+  val1  6   4190   2776   2956   3815   3456   195226      0    308       0  0.74   0.5  0.98    419  60.2/ 62  nan    nan   nan  30.51
+  val1  7   4084   2827   3007   3749   3537   188770      0    321       0  0.64   0.4  0.99    421  59.1/ 61  nan    nan   nan  43.96
+  val1  8   4167   2813   2994   3775   3518   194154      0    308       0  0.72   0.5  0.98    422  58.9/ 60  nan    nan   nan  31.47
+  val1  9   4105   2767   2949   3758   3613   186878      0    311       0  0.68   0.5  0.97    421  58.8/ 61  nan    nan   nan  34.74
+  val1 10   4050   2744   2919   3748   3888   192667      0    314       0  0.68   0.5  0.99    418  58.2/ 60  nan    nan   nan  31.10
+  val2  1   4445   1785   1896   3192   2482   198116      0    394       0  0.19   0.4  0.96    199  50.0/ 66  nan    nan   nan  23.31
+  val2  2   4536   2566   2737   4209   3504   199546      0    405       0  0.31   0.3  0.99    306  65.1/ 66  nan    nan   nan  38.75
+  val2  3   4858   2837   3026   4493   3862   197767      0    319       0  0.66   0.5  0.98    388  65.0/ 66  nan    nan   nan  36.03
+  val2  4   4986   2843   3024   4565   4275   191858      0    313       0  0.69   0.5  0.99    420  65.2/ 66  nan    nan   nan  30.11
+  val2  5   4858   2893   3074   4510   4666   193064      0    311       0  0.73   0.5  0.99    422  65.2/ 66  nan    nan   nan  34.26
+  val2  6   4988   3036   3224   4638   4564   191509      0    316       0  0.70   0.5  0.99    420  65.2/ 66  nan    nan   nan  27.07
+  val2  7   4882   2963   3147   4565   4646   190144      0    321       0  0.59   0.5  0.99    422  65.2/ 66  nan    nan   nan  48.09
+  val2  8   5261   2897   3082   4580   4658   192607      0    304       0  0.68   0.5  0.98    424  65.3/ 66  nan    nan   nan  29.59
+  val2  9   4881   2931   3107   4502   4762   187542      0    304       0  0.72   0.5  0.97    425  65.2/ 66  nan    nan   nan  26.17
+  val2 10   5018   2868   3049   4546   4718   192424      0    311       0  0.74   0.5  0.99    420  65.4/ 66  nan    nan   nan  32.03
+== jcs: step 2 + fix e7be8460 (je, 15 s) [ozarchy-p3jesoak-300m-k1-jcs] window 603.0 s
+  bench: sent place 439842 cancel-all 235134 | accepted cancel-all 235105 | released committed 670944 refused 111 timeout 0
+  val0 cancel-alls executed 235105 (sent - executed 29) | nonce-expired evictions cell 0 window 0 first at nan s | margin-rejected 0 | action failures 0
+  val0 RSS MB mean 2-5 5027 5-10 5159 (change +132) | @1 4226 @5 4998 end 5103 peak 5622 | slope MB/min 2-5 +73.4 [-60.6, +207.5] last5 +22.2 [-27.2, +71.6] n_eff 38 | r(RSS,resting) +0.20
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 3313/3669/4302 active 3508/3861/4504 resident 4805/4995/5568 retained 5241/5076/5745 mapped 5059/5248/5822
+     jemalloc last-5-min slope MB/min: allocated -35.8 [-105.6, +34.0] resident +10.1 [-48.4, +68.6]
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 58.1 | exec busy 5-10 1.00 | exec ms/block 5-10 376
+     resting orders @1/@5/end 0.19/0.66/0.71 M | checkpoints 48 layer MB mean 202.6 early 192.7 late 212.4 | settle ms/block early 26.2 late 34.3 | layer_shared 0 drop_inline 2039
+  val1 cancel-alls executed 235105 (sent - executed 29) | nonce-expired evictions cell 0 window 0 first at nan s | margin-rejected 0 | action failures 0
+  val1 RSS MB mean 2-5 5286 5-10 5161 (change -125) | @1 4165 @5 5357 end 5403 peak 5921 | slope MB/min 2-5 +113.4 [-106.9, +333.6] last5 -78.3 [-132.1, -24.5] n_eff 34 | r(RSS,resting) +0.12
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 3374/3694/4006 active 3582/3916/4214 resident 4853/4722/5537 retained 7817/7998/8481 mapped 5104/4973/5776
+     jemalloc last-5-min slope MB/min: allocated -7.9 [-68.9, +53.2] resident -93.5 [-155.2, -31.8]
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 63.5 | exec busy 5-10 1.00 | exec ms/block 5-10 376
+     resting orders @1/@5/end 0.17/0.70/0.68 M | checkpoints 48 layer MB mean 202.6 early 192.8 late 212.4 | settle ms/block early 25.9 late 33.0 | layer_shared 0 drop_inline 1910
+  val2 cancel-alls executed 235105 (sent - executed 29) | nonce-expired evictions cell 0 window 0 first at nan s | margin-rejected 0 | action failures 0
+  val2 RSS MB mean 2-5 5842 5-10 5840 (change -1) | @1 5003 @5 6064 end 6039 peak 6377 | slope MB/min 2-5 +112.5 [+16.5, +208.6] last5 +3.5 [-53.9, +60.8] n_eff 34 | r(RSS,resting) +0.19
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 3464/3617/4024 active 3660/3833/4231 resident 5493/5411/6288 retained 6800/7017/7442 mapped 5732/5648/6529
+     jemalloc last-5-min slope MB/min: allocated +16.0 [-49.0, +81.1] resident -14.1 [-70.3, +42.0]
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 65.4 | exec busy 5-10 1.00 | exec ms/block 5-10 377
+     resting orders @1/@5/end 0.19/0.70/0.65 M | checkpoints 47 layer MB mean 202.8 early 193.5 late 212.4 | settle ms/block early 26.3 late 34.4 | layer_shared 0 drop_inline 2009
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired(val0) node_cores bench_cores margin_rejected/s  [val0 chain]
+    1    1422    1090    269856    205256  188.4  4.90  0.95    4488  50.4    259330    412      0 5.29/5.25/5.98 1.14 0
+    2    1303    1150    276231    211658  184.1  3.43  1.00    7076  62.7    346778    450      0 5.30/5.30/5.90 1.13 0
+    3    1127    1053    288353    222155  210.9  2.63  1.00    5760  62.0    610986    330      0 5.34/5.33/5.84 1.12 0
+    4    1018    1093    285741    219975  201.2  2.73  1.00    6655  61.6    610243    376      0 4.98/4.99/5.44 1.02 0
+    5    1036    1080    285413    220119  203.8  2.70  1.00    6285  60.6    664563    363      0 4.92/4.89/5.32 1.05 0
+    6    1100    1080    285573    220102  203.8  2.70  1.00    6897  59.6    595759    363      0 5.17/5.06/5.60 1.05 0
+    7    1027    1060    279340    215393  203.2  2.67  1.00    6250  58.9    637804    365      0 5.11/5.01/5.54 1.01 0
+    8    1076    1067    286567    220879  207.1  2.65  1.00    6098  57.6    672791    342      0 5.17/5.23/5.66 1.12 0
+    9    1076    1053    277086    213306  202.5  2.63  1.00    5939  57.7    685486    357      0 5.07/5.11/5.61 1.04 0
+   10    1024    1073    286267    220545  205.5  2.68  1.00    6327  56.7    654468    355      0 5.03/4.96/5.46 1.02 0
+  per node per minute: min RSS_MB je_alloc je_active je_resident je_retained (MB, minute mean) matched/s expired cancel_all/s margin_rej/s resting_M flush_depth exec_busy exec_ms/blk exec_q(mean/max) ckpts layer_MB drop_inline select_ms
+  val0  1   4266   2146   2269   3196   2408   205256      0    412       0  0.17   0.6  0.95    193  50.4/ 66    6  135.4   298  15.34
+  val0  2   4605   2991   3170   4458   3788   211658      0    450       0  0.13   0.1  1.00    292  62.7/ 65    4  180.4   208  24.66
+  val0  3   5159   3266   3458   4590   4429   222155      0    330       0  0.71   0.2  1.00    380  62.0/ 64    4  226.4   133  23.62
+  val0  4   5079   3371   3567   4720   4795   219975      0    376       0  0.65   0.1  1.00    366  61.6/ 64    5  193.7   143  21.53
+  val0  5   5009   3467   3660   4778   5139   220119      0    363       0  0.62   0.2  1.00    371  60.6/ 62    5  229.9   156  21.79
+  val0  6   5367   3472   3679   4815   5180   220102      0    363       0  0.62   0.1  1.00    371  59.6/ 63    5  203.3   159  23.67
+  val0  7   4857   3330   3523   4816   5225   215393      0    365       0  0.54   0.1  1.00    375  58.9/ 61    5  197.8   139  20.43
+  val0  8   5220   3208   3397   4706   5347   220879      0    342       0  0.73   0.1  1.00    376  57.6/ 60    4  225.2   133  22.12
+  val0  9   5005   3258   3443   4839   5226   213306      0    357       0  0.66   0.1  1.00    380  57.7/ 59    5  212.4   142  21.98
+  val0 10   5137   3263   3464   4831   5240   220545      0    355       0  0.71   0.2  1.00    374  56.7/ 59    5  228.1   152  23.58
+  val1  1   4194   2125   2247   3213   2387   205256      0    412       0  0.17   0.6  0.95    194  51.7/ 66    6  135.3   242  17.69
+  val1  2   4619   2971   3150   4287   4651   208609      0    446       0  0.09   0.1  0.99    294  64.9/ 66    4  180.2   209  27.99
+  val1  3   5615   3307   3505   4756   5515   221823      0    324       0  0.74   0.2  1.00    380  65.3/ 66    4  227.0   132  24.26
+  val1  4   5280   3350   3551   5080   6171   219412      0    380       0  0.62   0.1  1.00    365  65.2/ 66    5  193.9   143  26.69
+  val1  5   5469   3452   3659   5058   7064   219921      0    355       0  0.68   0.2  1.00    373  64.0/ 66    5  229.7   153  28.63
+  val1  6   5525   3345   3555   5048   7508   218123      0    368       0  0.57   0.1  1.00    371  64.1/ 65    5  202.8   145  28.94
+  val1  7   4796   3437   3646   5015   7661   214851      0    342       0  0.73   0.1  1.00    384  64.2/ 65    5  199.7   159  27.00
+  val1  8   5207   3340   3545   4754   7936   219877      0    363       0  0.71   0.1  1.00    370  63.9/ 65    4  225.5   130  28.65
+  val1  9   4802   3300   3508   4796   7909   213296      0    358       0  0.62   0.2  1.00    379  63.3/ 66    5  211.8   104  34.41
+  val1 10   5324   3420   3627   4666   8052   222103      0    356       0  0.67   0.2  1.00    372  61.9/ 64    5  226.6   139  25.83
+  val2  1   5058   2281   2404   4020   2729   205256      0    412       0  0.17   0.6  0.95    194  50.9/ 66    6  135.8   297  20.12
+  val2  2   5522   3087   3263   5018   4167   208609      0    446       0  0.10   0.1  1.00    293  64.5/ 66    4  180.4   210  21.92
+  val2  3   5870   3325   3514   5368   5054   221823      0    324       0  0.74   0.2  1.00    383  65.1/ 66    4  227.0   132  28.24
+  val2  4   5814   3460   3646   5488   5461   217226      0    378       0  0.62   0.1  1.00    367  65.4/ 66    5  193.9   142  21.35
+  val2  5   6007   3599   3791   5704   5500   221281      0    348       0  0.75   0.2  1.00    375  65.3/ 66    5  231.8   155  21.94
+  val2  6   6142   3482   3682   5589   6544   216365      0    375       0  0.56   0.1  1.00    370  65.3/ 66    5  203.8   145  27.10
+  val2  7   5509   3483   3681   5516   6780   215914      0    342       0  0.73   0.1  1.00    383  65.4/ 66    5  204.6   153  22.53
+  val2  8   5706   3311   3501   5360   6946   218374      0    362       0  0.69   0.1  1.00    372  65.5/ 66    4  218.7   138  24.87
+  val2  9   5526   3526   3717   5496   6812   213240      0    358       0  0.60   0.1  0.99    380  65.4/ 66    5  213.9   144  24.83
+  val2 10   5987   3505   3701   5511   6899   219048      0    351       0  0.64   0.2  1.00    375  65.4/ 66    4  228.6   131  24.99
+== jb: main deeacdb3 (glibc, no fix) [ozarchy-p3jesoak-300m-k1-jb] window 603.0 s
+  bench: sent place 418953 cancel-all 266105 | accepted cancel-all 266105 | released committed 662139 refused 4 timeout 16602
+  val0 cancel-alls executed 248748 (sent - executed 17357) | nonce-expired evictions cell 17357 window 17357 first at 154 s | margin-rejected 27393914 | action failures 0
+  val0 RSS MB mean 2-5 3837 5-10 3927 (change +90) | @1 3274 @5 3889 end 4002 peak 4002 | slope MB/min 2-5 +50.7 [+40.2, +61.2] last5 +13.8 [+10.9, +16.8] n_eff 39 | r(RSS,resting) -0.61
+     jemalloc MB (mean 5-10 / @10 / peak): allocated nan/nan/nan active nan/nan/nan resident nan/nan/nan retained nan/nan/nan mapped nan/nan/nan
+     exec queue max 62 (5 s gauge max 61) mean min 5-10 2.0 | exec busy 5-10 0.79 | exec ms/block 5-10 273
+     resting orders @1/@5/end 0.05/0.34/0.28 M
+  val1 cancel-alls executed 248748 (sent - executed 17357) | nonce-expired evictions cell 17357 window 17357 first at 154 s | margin-rejected 27393914 | action failures 0
+  val1 RSS MB mean 2-5 3796 5-10 3865 (change +69) | @1 3394 @5 3838 end 3891 peak 3909 | slope MB/min 2-5 +29.6 [+16.8, +42.5] last5 +7.1 [+3.6, +10.6] n_eff 30 | r(RSS,resting) -0.64
+     jemalloc MB (mean 5-10 / @10 / peak): allocated nan/nan/nan active nan/nan/nan resident nan/nan/nan retained nan/nan/nan mapped nan/nan/nan
+     exec queue max 62 (5 s gauge max 62) mean min 5-10 1.6 | exec busy 5-10 0.79 | exec ms/block 5-10 274
+     resting orders @1/@5/end 0.05/0.35/0.30 M
+  val2 cancel-alls executed 248748 (sent - executed 17357) | nonce-expired evictions cell 17357 window 17357 first at 154 s | margin-rejected 27393914 | action failures 0
+  val2 RSS MB mean 2-5 4617 5-10 4690 (change +73) | @1 4104 @5 4645 end 4769 peak 4862 | slope MB/min 2-5 +25.9 [-2.6, +54.5] last5 +39.0 [+31.8, +46.2] n_eff 43 | r(RSS,resting) -0.20
+     jemalloc MB (mean 5-10 / @10 / peak): allocated nan/nan/nan active nan/nan/nan resident nan/nan/nan retained nan/nan/nan mapped nan/nan/nan
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 65.4 | exec busy 5-10 0.94 | exec ms/block 5-10 324
+     resting orders @1/@5/end 0.31/0.36/0.21 M
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired(val0) node_cores bench_cores margin_rejected/s  [val0 chain]
+    1    1311    1070    274131    208012  194.4  4.27  0.96    3818  39.3    213155    381      0 5.32/5.28/5.76 1.02 0
+    2    1112    1120    290907    221857  198.1  3.05  0.97    7255  29.0    277518    384      0 5.30/5.28/5.55 1.06 0
+    3     980    1093    274453    209151  191.3  2.73  0.97    5371  15.1    505765    404   3431 4.99/5.04/5.41 0.87 0
+    4    1027     984    244873    185971  188.9  2.48  0.85    5240   1.8    423307    376   3471 4.81/4.89/5.36 0.91 0
+    5    1041    1020    252960    192257  188.5  2.53  0.84    5931   1.9    382085    383   1190 4.63/4.63/5.19 0.98 0
+    6    1056    1020    233634    168555  165.3  2.57  0.81    5282   1.6    361746    378   2321 4.53/4.47/5.22 0.90 22683
+    7    1245    1151    178452    127480  110.7  2.87  0.73    5069   1.5    246023    454   3220 4.64/4.67/5.52 1.14 96570
+    8    1174    1187    185844    140980  118.8  2.97  0.77    5771   1.6    293797    421   1980 4.80/4.79/5.59 1.02 120286
+    9    1230    1180    203213    153911  130.4  2.97  0.83    5203   2.3    298292    441    989 4.94/5.09/5.76 1.19 92857
+   10    1204    1213    179444    135168  111.4  3.05  0.79    5278   2.8    296198    459    755 4.87/4.95/5.61 1.06 120449
+  per node per minute: min RSS_MB je_alloc je_active je_resident je_retained (MB, minute mean) matched/s expired cancel_all/s margin_rej/s resting_M flush_depth exec_busy exec_ms/blk exec_q(mean/max) ckpts layer_MB drop_inline select_ms
+  val0  1   3290    nan    nan    nan    nan   208012      0    381       0  0.07   0.2  0.96    224  39.3/ 62  nan    nan   nan  19.02
+  val0  2   3743    nan    nan    nan    nan   221857      0    384       0  0.44   0.3  0.97    318  29.0/ 43  nan    nan   nan  26.19
+  val0  3   3805    nan    nan    nan    nan   209151   3431    404       0  0.49   0.4  0.97    356  15.1/ 26  nan    nan   nan  28.31
+  val0  4   3863    nan    nan    nan    nan   185971   3471    376       0  0.41   0.4  0.85    342   1.8/  4  nan    nan   nan  24.74
+  val0  5   3888    nan    nan    nan    nan   192257   1190    383       0  0.32   0.3  0.84    332   1.9/  4  nan    nan   nan  22.02
+  val0  6   3901    nan    nan    nan    nan   168555   2321    378   22683  0.33   0.2  0.81    315   1.6/  3  nan    nan   nan  20.64
+  val0  7   3910    nan    nan    nan    nan   127480   3220    454   96570  0.12   0.2  0.73    255   1.5/  4  nan    nan   nan  23.66
+  val0  8   3931    nan    nan    nan    nan   140980   1980    421  120286  0.37   0.2  0.77    260   1.6/  5  nan    nan   nan  26.68
+  val0  9   3982    nan    nan    nan    nan   153911    989    441   92857  0.45   0.3  0.83    279   2.3/  5  nan    nan   nan  27.55
+  val0 10   3988    nan    nan    nan    nan   135168    755    459  120449  0.34   0.2  0.79    260   2.8/  7  nan    nan   nan  27.02
+  val1  1   3399    nan    nan    nan    nan   206528      0    377       0  0.08   0.3  0.95    225  41.3/ 62  nan    nan   nan  19.42
+  val1  2   3727    nan    nan    nan    nan   220253      0    383       0  0.42   0.2  0.97    319  31.6/ 44  nan    nan   nan  23.62
+  val1  3   3823    nan    nan    nan    nan   207675   3431    404       0  0.45   0.3  0.98    357  18.2/ 29  nan    nan   nan  29.27
+  val1  4   3831    nan    nan    nan    nan   192038   3471    383       0  0.43   0.4  0.87    340   1.9/  7  nan    nan   nan  26.73
+  val1  5   3838    nan    nan    nan    nan   190752   1190    383       0  0.33   0.3  0.84    332   1.3/  3  nan    nan   nan  23.42
+  val1  6   3842    nan    nan    nan    nan   168719   2321    380   23283  0.34   0.3  0.80    313   1.1/  2  nan    nan   nan  25.23
+  val1  7   3867    nan    nan    nan    nan   128160   3220    454   96086  0.11   0.2  0.74    257   1.0/  3  nan    nan   nan  24.79
+  val1  8   3859    nan    nan    nan    nan   140244   1980    420  120395  0.37   0.2  0.78    262   1.3/  4  nan    nan   nan  27.05
+  val1  9   3870    nan    nan    nan    nan   153803    989    442   93732  0.45   0.2  0.83    281   1.9/  5  nan    nan   nan  30.32
+  val1 10   3893    nan    nan    nan    nan   135692    755    456  119349  0.34   0.3  0.80    261   2.5/  7  nan    nan   nan  29.40
+  val2  1   4109    nan    nan    nan    nan   184710      0    303       0  0.37   0.1  0.94    263  54.0/ 66  nan    nan   nan  27.35
+  val2  2   4558    nan    nan    nan    nan   185674      0    397       0  0.07   0.2  0.96    308  65.0/ 66  nan    nan   nan  49.17
+  val2  3   4671    nan    nan    nan    nan   192001   3431    308       0  0.51   0.4  0.95    408  65.5/ 66  nan    nan   nan  57.83
+  val2  4   4569    nan    nan    nan    nan   183571   3471    374       0  0.47   0.3  0.96    389  65.5/ 66  nan    nan   nan  52.71
+  val2  5   4658    nan    nan    nan    nan   192692   2573    378       0  0.46   0.3  0.95    374  65.5/ 66  nan    nan   nan  54.27
+  val2  6   4642    nan    nan    nan    nan   189791    938    386    2508  0.42   0.3  0.95    371  65.6/ 66  nan    nan   nan  47.29
+  val2  7   4650    nan    nan    nan    nan   136186   3220    435   86235  0.31   0.3  0.92    321  65.4/ 66  nan    nan   nan  40.52
+  val2  8   4695    nan    nan    nan    nan   152302   1980    440   95864  0.45   0.3  0.95    317  65.3/ 66  nan    nan   nan  38.74
+  val2  9   4768    nan    nan    nan    nan   139430    989    445  108524  0.45   0.2  0.94    317  65.3/ 66  nan    nan   nan  34.39
+  val2 10   4764    nan    nan    nan    nan   129351    755    478  136604  0.23   0.3  0.94    301  65.4/ 66  nan    nan   nan  39.00
+== ja: main 88ddc4c2 (je, no fix) [ozarchy-p3jesoak-300m-k1-ja] window 604.0 s
+  bench: sent place 478526 cancel-all 289925 | accepted cancel-all 289914 | released committed 750412 refused 36 timeout 11354
+  val0 cancel-alls executed 278560 (sent - executed 11365) | nonce-expired evictions cell 11354 window 11354 first at 152 s | margin-rejected 31112373 | action failures 0
+  val0 RSS MB mean 2-5 3955 5-10 4039 (change +84) | @1 3749 @5 3907 end 4145 peak 4262 | slope MB/min 2-5 -37.6 [-76.9, +1.7] last5 +37.7 [+14.6, +60.9] n_eff 41 | r(RSS,resting) -0.05
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 2610/2623/3067 active 2799/2806/3288 resident 3616/3617/3951 retained 3498/3965/4056 mapped 3854/3854/4188
+     jemalloc last-5-min slope MB/min: allocated +38.7 [+12.9, +64.5] resident +54.1 [+32.1, +76.2]
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 64.9 | exec busy 5-10 0.98 | exec ms/block 5-10 299
+     resting orders @1/@5/end 0.44/0.31/0.19 M
+  val1 cancel-alls executed 278560 (sent - executed 11365) | nonce-expired evictions cell 11354 window 11354 first at 153 s | margin-rejected 31112373 | action failures 0
+  val1 RSS MB mean 2-5 3987 5-10 4057 (change +70) | @1 3780 @5 4008 end 4000 peak 4426 | slope MB/min 2-5 -43.9 [-100.6, +12.8] last5 +50.3 [+22.4, +78.2] n_eff 41 | r(RSS,resting) +0.17
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 2572/2559/2937 active 2765/2737/3160 resident 3602/3492/3896 retained 3579/3993/4074 mapped 3840/3730/4135
+     jemalloc last-5-min slope MB/min: allocated +34.1 [+8.2, +59.9] resident +31.0 [+3.4, +58.6]
+     exec queue max 65 (5 s gauge max 65) mean min 5-10 59.2 | exec busy 5-10 0.98 | exec ms/block 5-10 297
+     resting orders @1/@5/end 0.45/0.35/0.27 M
+  val2 cancel-alls executed 278560 (sent - executed 11365) | nonce-expired evictions cell 11354 window 11354 first at 153 s | margin-rejected 31112373 | action failures 0
+  val2 RSS MB mean 2-5 4737 5-10 4842 (change +105) | @1 4817 @5 4780 end 4693 peak 5289 | slope MB/min 2-5 -32.1 [-119.0, +54.7] last5 +52.3 [+23.8, +80.8] n_eff 56 | r(RSS,resting) -0.13
+     jemalloc MB (mean 5-10 / @10 / peak): allocated 2685/2919/3219 active 2883/3114/3435 resident 4405/4270/4926 retained 4286/4953/4954 mapped 4648/4511/5168
+     jemalloc last-5-min slope MB/min: allocated +54.3 [+18.5, +90.2] resident +53.3 [+21.4, +85.1]
+     exec queue max 66 (5 s gauge max 66) mean min 5-10 62.2 | exec busy 5-10 0.98 | exec ms/block 5-10 299
+     resting orders @1/@5/end 0.45/0.33/0.22 M
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired(val0) node_cores bench_cores margin_rejected/s  [val0 chain]
+    1    1426    1054    268811    204231  193.8  3.78  0.96    4524  51.6    259289    372      0 5.82/5.84/6.45 1.12 0
+    2    1323    1134    291693    221819  195.5  3.42  0.98    6805  63.9    241050    402      0 5.81/5.90/6.35 1.29 0
+    3    1029    1093    285120    218160  199.5  2.73  0.99    6517  65.2    429346    378   2124 5.51/5.56/6.02 0.97 0
+    4    1163    1120    277733    211556  188.9  2.82  0.99    5360  65.2    427661    429   1772 5.41/5.49/5.98 1.07 0
+    5    1191    1147    280395    213197  185.9  2.85  0.98    5294  65.3    397025    437   3404 5.43/5.44/5.95 1.09 0
+    6    1228    1173    264199    192441  164.0  2.93  0.99    5386  65.3    374257    437   2097 5.40/5.46/5.94 1.17 28628
+    7    1377    1351    232746    174726  129.4  3.42  0.99    4826  65.0    249468    504   1957 5.90/5.90/6.45 1.24 107194
+    8    1370    1360    232072    177420  130.5  3.38  0.98    5971  65.0    259300    502      0 5.85/5.91/6.54 1.34 107967
+    9    1346    1316    225393    171985  130.7  3.38  0.99    6825  64.8    292062    495      0 5.87/5.73/6.37 1.29 100841
+   10    1252    1311    208837    158685  121.1  3.35  0.96    6800  64.7    318072    492      0 5.83/5.86/6.32 1.31 120145
+  per node per minute: min RSS_MB je_alloc je_active je_resident je_retained (MB, minute mean) matched/s expired cancel_all/s margin_rej/s resting_M flush_depth exec_busy exec_ms/blk exec_q(mean/max) ckpts layer_MB drop_inline select_ms
+  val0  1   3733   1904   2037   2750   1909   204231      0    372       0  0.16   0.2  0.96    255  51.6/ 66  nan    nan   nan  29.83
+  val0  2   4035   2463   2636   3416   2500   221819      0    402       0  0.25   0.2  0.98    288  63.9/ 66  nan    nan   nan  46.26
+  val0  3   3979   2661   2841   3580   2871   218160   2124    378       0  0.58   0.4  0.99    360  65.2/ 66  nan    nan   nan  49.16
+  val0  4   3938   2552   2726   3502   3182   211556   1772    429       0  0.35   0.4  0.99    351  65.2/ 66  nan    nan   nan  41.85
+  val0  5   3893   2531   2700   3497   3252   213197   3404    437       0  0.36   0.5  0.98    345  65.3/ 66  nan    nan   nan  35.04
+  val0  6   4049   2515   2692   3523   3240   192441   2097    437   28628  0.27   0.4  0.99    336  65.3/ 66  nan    nan   nan  56.12
+  val0  7   4047   2578   2769   3530   3281   174726   1957    504  107194  0.32   0.3  0.99    290  65.0/ 66  nan    nan   nan  60.92
+  val0  8   4028   2598   2792   3598   3499   177420      0    502  107967  0.39   0.3  0.98    291  65.0/ 66  nan    nan   nan  56.30
+  val0  9   4123   2686   2875   3686   3634   171985      0    495  100841  0.28   0.3  0.99    293  64.8/ 66  nan    nan   nan  50.52
+  val0 10   4051   2671   2865   3741   3793   158685      0    492  120145  0.11   0.4  0.96    288  64.7/ 66  nan    nan   nan  46.05
+  val1  1   3814   1904   2036   2748   1887   205584      0    384       0  0.06   0.3  0.96    239  50.2/ 65  nan    nan   nan  26.34
+  val1  2   4008   2445   2626   3453   2498   224526      0    393       0  0.27   0.2  0.98    309  60.9/ 64  nan    nan   nan  30.76
+  val1  3   3991   2655   2837   3652   2793   218647   2124    386       0  0.54   0.4  0.99    357  61.8/ 64  nan    nan   nan  36.01
+  val1  4   3848   2591   2765   3544   3162   212752   1772    423       0  0.40   0.4  0.99    352  60.5/ 63  nan    nan   nan  30.08
+  val1  5   4001   2520   2699   3538   3285   211713   3404    437       0  0.40   0.5  0.98    346  61.5/ 63  nan    nan   nan  34.20
+  val1  6   3970   2489   2671   3566   3339   192680   2097    440   32169  0.31   0.5  0.98    332  61.2/ 64  nan    nan   nan  27.31
+  val1  7   4022   2527   2725   3525   3415   176143   1957    504  107983  0.37   0.3  0.99    289  58.2/ 60  nan    nan   nan  33.45
+  val1  8   4171   2565   2761   3550   3653   177019      0    502  105594  0.44   0.4  0.99    293  58.9/ 61  nan    nan   nan  30.35
+  val1  9   4249   2650   2845   3693   3663   171198      0    493  100615  0.32   0.4  0.99    293  59.7/ 62  nan    nan   nan  34.82
+  val1 10   3958   2630   2827   3685   3786   160253      0    497  124071  0.19   0.4  0.97    284  58.3/ 62  nan    nan   nan  28.77
+  val2  1   4799   1965   2093   3453   2533   205017      0    381       0  0.08   0.3  0.97    253  51.5/ 66  nan    nan   nan  32.27
+  val2  2   5003   2496   2667   4201   3412   224063      0    395       0  0.26   0.2  0.98    291  62.6/ 65  nan    nan   nan  28.80
+  val2  3   4753   2683   2865   4382   3861   218164   2124    386       0  0.53   0.4  0.99    357  63.2/ 65  nan    nan   nan  26.36
+  val2  4   4671   2594   2766   4237   4196   213100   1772    424       0  0.40   0.5  0.98    350  62.1/ 64  nan    nan   nan  32.43
+  val2  5   4759   2596   2779   4356   4094   211324   3404    435       0  0.40   0.3  0.98    348  62.8/ 65  nan    nan   nan  30.48
+  val2  6   4811   2584   2766   4294   4190   193755   2097    440   32163  0.30   0.5  0.99    333  62.4/ 65  nan    nan   nan  32.35
+  val2  7   4872   2610   2815   4342   4198   174268   1957    504  107029  0.35   0.3  0.99    290  60.7/ 63  nan    nan   nan  29.21
+  val2  8   4815   2693   2897   4389   4198   176386      0    499  105731  0.41   0.3  0.98    294  61.2/ 64  nan    nan   nan  33.85
+  val2  9   5001   2717   2916   4489   4219   170943      0    493   99727  0.30   0.4  0.99    294  63.1/ 65  nan    nan   nan  35.46
+  val2 10   4692   2799   3000   4525   4566   157199      0    490  120398  0.13   0.4  0.97    289  63.6/ 65  nan    nan   nan  43.83
+== deltas per node (GB): mean min 5-10 / @10 min / peak | slope of the RSS difference, last 5 min, MB/min [95% CI] n_eff
+  jcs - jmf val0: +0.98 / +0.89 / +1.21 | diff slope +43.0 [-3.8, +89.9] n_eff 28 | exec_q mean 5-10 58.1 vs 58.5
+      je allocated: +0.55 / +0.87 / +1.12 | diff slope -39.3 [-109.8, +31.2]
+      je resident: +0.99 / +1.08 / +1.47 | diff slope +31.4 [-20.6, +83.4]
+      je retained: +1.29 / +1.13 / +1.49
+      RSS - je resident (non-heap: code, file-backed, stacks): jcs 354 MB vs jmf 363 MB (delta -0.01 GB)
+  jcs - jmf val1: +0.98 / +1.32 / +1.55 | diff slope -80.4 [-133.8, -26.9] n_eff 27 | exec_q mean 5-10 63.5 vs 59.0
+      je allocated: +0.57 / +0.72 / +0.94 | diff slope +12.1 [-58.3, +82.4]
+      je resident: +1.06 / +0.82 / +1.43 | diff slope -79.0 [-147.9, -10.1]
+      je retained: +4.12 / +4.14 / +4.36
+      RSS - je resident (non-heap: code, file-backed, stacks): jcs 308 MB vs jmf 384 MB (delta -0.07 GB)
+  jcs - jmf val2: +0.86 / +0.78 / +1.05 | diff slope +7.9 [-48.7, +64.5] n_eff 30 | exec_q mean 5-10 65.4 vs 65.3
+      je allocated: +0.51 / +0.79 / +0.80 | diff slope +45.1 [-17.7, +107.9]
+      je resident: +0.91 / +0.79 / +1.33 | diff slope +5.4 [-57.1, +67.8]
+      je retained: +2.08 / +2.30 / +2.44
+      RSS - je resident (non-heap: code, file-backed, stacks): jcs 347 MB vs jmf 398 MB (delta -0.05 GB)
+  jcs - jmf mean of 3: +0.94 / +1.00 / +1.27
+  ja - jb val0: +0.11 / +0.14 / +0.25 | diff slope +24.2 [-0.9, +49.3] n_eff 26 | exec_q mean 5-10 64.9 vs 2.0
+  ja - jb val1: +0.19 / +0.11 / +0.50 | diff slope +43.8 [+14.5, +73.1] n_eff 28 | exec_q mean 5-10 59.2 vs 1.6
+  ja - jb val2: +0.15 / -0.07 / +0.42 | diff slope +17.0 [-9.2, +43.2] n_eff 44 | exec_q mean 5-10 62.2 vs 65.4
+  ja - jb mean of 3: +0.15 / +0.06 / +0.39
+== matched/s (val0 chain counter): minutes 0-2 | 2-6 | 6-10 | 6-10 vs 0-2 | harness headline (whole window)
+  main + fix 0360c840 (je, control)            199262 |   195252 |   191138 |   -4.1% |   194684  [ozarchy-p3jesoak-300m-k1-jmf] W 602.0
+  step 2 + fix e7be8460 (je, 15 s)             208457 |   220588 |   217531 |   +4.4% |   216765  [ozarchy-p3jesoak-300m-k1-jcs] W 603.0
+  main deeacdb3 (glibc, no fix)                214934 |   188983 |   139385 |  -35.1% |   174556  [ozarchy-p3jesoak-300m-k1-jb] W 603.0
+  main 88ddc4c2 (je, no fix)                   213025 |   208839 |   170704 |  -19.9% |   194248  [ozarchy-p3jesoak-300m-k1-ja] W 604.0
+  53 main 219f0c20 glibc                       200881 |   186653 |   135177 |  -32.7% |   168384  [ozarchy-p3soak-300m-k1-ctl] W 603.0
+  53 step 2 7b006739 glibc                     206925 |   191340 |   137008 |  -33.8% |   172910  [ozarchy-p3soak-300m-k1-s2] W 603.0
+  53b main 219f0c20 je preload                 208224 |   212613 |   163200 |  -21.6% |   191756  [ozarchy-p3soakje-300m-k1-ctl] W 602.0
+  53b step 2 7b006739 je preload               223954 |   221481 |   165169 |  -26.2% |   199134  [ozarchy-p3soakje-300m-k1-s2] W 602.0
+  53c step 2 7b006739 glibc                    215840 |   191401 |   142051 |  -34.2% |   176544  [ozarchy-p3cssoak-300m-k1-g2] W 602.0
+  53c cs2 41a95355 glibc                       201516 |   193866 |   182401 |   -9.5% |   190776  [ozarchy-p3cssoak-300m-k1-cs2] W 603.0
+  53d mf de97682f glibc                        201476 |   185861 |   176031 |  -12.6% |   185054  [ozarchy-p3fsoak-300m-k1-mf] W 602.0
+  53d cs2 41a95355 glibc                       204027 |   192917 |   181995 |  -10.8% |   190602  [ozarchy-p3fsoak-300m-k1-cs2] W 602.0
+  53d jcs2 41a95355 je preload                 207969 |   217500 |   213669 |   +2.7% |   214299  [ozarchy-p3fsoak-300m-k1-jcs2] W 602.0
