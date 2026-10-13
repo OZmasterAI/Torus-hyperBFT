@@ -79,3 +79,36 @@ delta = "c100: matched/s {paired:ms:1}; CPU {paired:cpu:2}; exec p99 {paired:exe
 label = "59 SAT 120 s"
 arm = "c100"
 text = "c100 main ef812b02, glibc, CLOID_SHARE=100"
+
+# Smoke check (see SMOKE in archive-campaign.py's header): the archived analyst scripts are run from the staged tools copy
+# against the real cells and must reproduce the archived outputs exactly, else nothing is written (exit 5).
+# 1: one cell through a-cells.py (PREFIX + tag, so the prefix ends in "-"), compared with that cell's line of cells.txt.
+[[smoke]]
+name = "a-cells.py on r1-c0"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-r1-c0.json", "{bench}/ozarchy-p3cloid-300m-", "r1-c0:c0"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/cells.txt"
+select = "^r1-c0 "
+
+# 2-4: the arm tables from the 8 ABBA cells (about 5 s): cells.json, then arms.txt (with device writes, --io) and paired.txt.
+[[smoke]]
+name = "a-cells.py on the ABBA cells"
+script = "analyst/a-cells.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloid-300m-", "r1-c0:c0", "r1-c100:c100", "r2-c100:c100", "r2-c0:c0", "r3-c0:c0", "r3-c100:c100", "r4-c100:c100", "r4-c0:c0"]
+timeout = 300
+
+[[smoke]]
+script = "analyst/a-arms.py"
+args = ["{out}/cells-abba.json", "c0:c100", "--io", "{bench}/ozarchy-p3cloid-300m-"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/arms.txt"
+
+[[smoke]]
+script = "analyst/a-paired.py"
+args = ["{out}/cells-abba.json", "{bench}/ozarchy-p3cloid-300m-", "c0", "c100"]
+timeout = 60
+[[smoke.compare]]
+want = "analyst/paired.txt"

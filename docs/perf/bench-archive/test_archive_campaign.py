@@ -8,9 +8,13 @@ Usage: python3 -I docs/perf/bench-archive/test_archive_campaign.py [-v]
   temp dir, run the script on them and check the generated rows, rm lists, sizes, tools tree, idempotency,
   --dry-run (unified diffs, nothing written), --strict, the refusals (campaign / section / plan row already in the
   archive or the summary table; DELETABLE.md fence or `bash -n` failure) and each check (a)-(d).
+* Smoke tests: the meta's [[smoke]] analyst commands run from the staged tools copy against the fixture cells; a
+  match passes, a mismatch / crash (the p3cloidprof prefix bug) / missing script or output / timeout refuses with
+  exit 5 and writes nothing (also in --dry-run); no declaration warns (s), --strict refuses.
 * GoldenP3cloid re-archives campaign ozarchy-p3cloid from the live data in /home/oz/bench-results-matched onto
   the archive files of 6b643edb^ with meta/p3cloid.toml and compares byte for byte with what 6b643edb committed
-  (INDEX.md, cells.md, DELETABLE.md, tools/ozarchy-p3cloid-tools/ incl. file modes). Skipped when that data or the
+  (INDEX.md, cells.md, DELETABLE.md, tools/ozarchy-p3cloid-tools/ incl. file modes) and runs the meta's smoke check
+  on the live cells. Skipped when that data or the
   git history is not there. It is a snapshot test: it stays valid while the p3cloid raw data on ozarchy is intact.
 """
 
@@ -185,6 +189,23 @@ cpu                26.432       28.768     +2.337 [   +1.947,    +2.726]   +8.84
 exec_p99          720.427      856.395   +135.968 [  +67.340,  +204.597]  +18.87% [  +9.35,  +28.40]  +190.920
 """
 
+# The fixture's analyst a-cells.py: PREFIX + tag paths like the real ones (the p3cloidprof prefix bug needs the "-").
+A_CELLS_PY = """import json, sys
+P = sys.argv[1]
+for ta in sys.argv[2:]:
+    tag, arm = ta.split(":")
+    s = json.load(open(P + tag + "/summary.json"))
+    print(tag, arm, "ms=%.1f" % s["headline"]["matched_s_avg"])
+"""
+CELLS_TXT = "w0 a ms=1000.0\nr1-a a ms=1000.0\nr1-b b ms=1000.0\n"
+# the fixture meta's smoke declaration: one cell through the archived a-cells.py, compared with its line of cells.txt
+SMOKE = {
+    "script": "analyst/a-cells.py",
+    "args": ["{bench}/ozarchy-tc-300m-", "r1-b:b"],
+    "compare": [{"want": "analyst/cells.txt", "select": "^r1-b "}],
+}
+
+
 # cell name, generated_at, campaign.log start, duration
 CELLS = [
     ("ozarchy-tc-smoke-300m-s0-b", "2026-10-13T10:05:40", "10:03:30", 60),
@@ -261,8 +282,8 @@ class Fixture:
         write(os.path.join(b, "ozarchy-tc-300m-r1-a", "perf.data"), b"p" * 4096)
         an = os.path.join(b, "ozarchy-tc-run", "analyst")
         write(os.path.join(b, "ozarchy-tc-run", "campaign.log"), "[10:07:00] start\n")
-        write(os.path.join(an, "a-cells.py"), 'print("cells")\n')
-        write(os.path.join(an, "cells.txt"), "w0 a\n")
+        write(os.path.join(an, "a-cells.py"), A_CELLS_PY)
+        write(os.path.join(an, "cells.txt"), CELLS_TXT)
         write(
             os.path.join(an, "cells.json"),
             json.dumps(
@@ -306,6 +327,7 @@ class Fixture:
         self.summary = os.path.join(self.repo, "docs", "summary.md")
         write(self.summary, SUMMARY_MD)
         self.meta = {
+            "smoke": [json.loads(json.dumps(SMOKE))],
             "summary": {
                 "file": "docs/summary.md",
                 "rows": [
@@ -650,6 +672,12 @@ class EndToEnd(FixtureCase):
             'label = "7 SAT 120 s"',
             'arm = "b"',
             'text = "b text"',
+            "[[smoke]]",
+            'script = "analyst/a-cells.py"',
+            'args = ["{bench}/ozarchy-tc-300m-", "r1-b:b"]',
+            "[[smoke.compare]]",
+            'want = "analyst/cells.txt"',
+            'select = "^r1-b "',
         ]
         r1 = fx.run()
         self.assertOk(r1)
@@ -991,6 +1019,185 @@ class CheckD(FixtureCase):
         self.assertIn("section '12. Not written yet", fx.read("INDEX.md"))
 
 
+class Smoke(FixtureCase):
+    """The smoke-run check: the archived analysis is run from the staged tools copy against real cells and its output
+    is diffed with the archived output; any failure refuses (exit 5) and writes nothing, like the fence check."""
+
+    def an(self, *p):
+        return os.path.join(self.fx.bench, "ozarchy-tc-run", "analyst", *p)
+
+    def meta_with(self, *smoke):
+        m = json.loads(json.dumps(self.fx.meta))
+        m["smoke"] = list(smoke)
+        return m
+
+    def assertRefused(self, r, snap, *needles):
+        self.assertEqual(
+            r.returncode,
+            5,
+            "rc=%d\nstdout:\n%s\nstderr:\n%s" % (r.returncode, r.stdout, r.stderr),
+        )
+        self.assertIn("smoke check", r.stderr)
+        self.assertIn("nothing written", r.stderr)
+        for n in needles:
+            self.assertIn(n, r.stderr)
+        self.assertEqual(self.fx.snapshot(), snap)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.fx.archive, "tools", "ozarchy-tc-tools"))
+        )
+
+    def test_match_passes_and_writes(self):
+        fx = self.fx
+        r = fx.run()
+        self.assertOk(r)
+        self.assertIn("smoke check 1/1 OK", r.stdout)
+        self.assertNotIn("WARNING", r.stderr)
+        self.assertTrue(
+            os.path.isfile(
+                os.path.join(
+                    fx.archive, "tools", "ozarchy-tc-tools", "analyst", "a-cells.py"
+                )
+            )
+        )
+        self.assertIn("## tc: ", fx.read("cells.md"))
+
+    def test_mismatch_refuses_and_writes_nothing(self):
+        fx = self.fx
+        write(
+            self.an("cells.txt"),
+            CELLS_TXT.replace("r1-b b ms=1000.0", "r1-b b ms=999.0"),
+        )
+        snap = fx.snapshot()
+        r = fx.run()
+        self.assertRefused(
+            r, snap, "analyst/cells.txt", "-r1-b b ms=999.0", "+r1-b b ms=1000.0"
+        )
+
+    def test_dry_run_runs_the_smoke(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        r = fx.run("--dry-run")
+        self.assertOk(r)
+        self.assertIn("smoke check 1/1 OK", r.stdout)
+        self.assertEqual(fx.snapshot(), snap)
+        write(
+            self.an("cells.txt"),
+            CELLS_TXT.replace("r1-b b ms=1000.0", "r1-b b ms=999.0"),
+        )
+        r = fx.run("--dry-run")
+        self.assertRefused(r, snap)
+
+    def test_crash_refuses_and_writes_nothing(self):
+        # the p3cloidprof bug: the cell-path prefix without its trailing "-" -> FileNotFoundError in the analyst script
+        fx = self.fx
+        bad = dict(SMOKE, args=["{bench}/ozarchy-tc-300m", "r1-b:b"])
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_with(bad))
+        self.assertRefused(r, snap, "FileNotFoundError", "exit status 1")
+
+    def test_script_not_in_tools_copy_refuses(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_with(dict(SMOKE, script="analyst/a-gone.py")))
+        self.assertRefused(r, snap, "a-gone.py")
+
+    def test_archived_output_not_in_tools_copy_refuses(self):
+        fx = self.fx
+        m = self.meta_with(SMOKE)
+        m["tools"] = {"exclude": ["cells.txt"]}
+        snap = fx.snapshot()
+        r = fx.run(meta=m)
+        self.assertRefused(r, snap, "analyst/cells.txt")
+
+    def test_select_matching_nothing_refuses(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        cmp_ = [{"want": "analyst/cells.txt", "select": "^r9-x "}]
+        r = fx.run(meta=self.meta_with(dict(SMOKE, compare=cmp_)))
+        self.assertRefused(r, snap, "^r9-x ")
+
+    def test_missing_declaration_warns_and_strict_refuses(self):
+        fx = self.fx
+        m = json.loads(json.dumps(fx.meta))
+        del m["smoke"]
+        snap = fx.snapshot()
+        r = fx.run("--strict", meta=m)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("WARNING (s)", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+        r = fx.run(meta=m)
+        self.assertOk(r)
+        self.assertIn("WARNING (s)", r.stderr)
+        self.assertNotIn("smoke check", r.stdout)
+        self.assertIn("## tc: ", fx.read("cells.md"))
+
+    def test_timeout_refuses(self):
+        fx = self.fx
+        write(
+            self.an("a-slow.py"),
+            "import time\ntime.sleep(60)\nprint('r1-b b ms=1000.0')\n",
+        )
+        slow = dict(SMOKE, script="analyst/a-slow.py", args=[], timeout=1)
+        snap = fx.snapshot()
+        t0 = __import__("time").monotonic()
+        r = fx.run(meta=self.meta_with(slow))
+        self.assertLess(__import__("time").monotonic() - t0, 30)
+        self.assertRefused(r, snap, "timed out after 1 s")
+
+    def test_output_file_ignore_and_tolerance(self):
+        # compare a file the script writes into {out}; ignore a timestamp line; a declared numeric tolerance
+        fx = self.fx
+        write(
+            self.an("a-res.py"),
+            "import sys\nopen(sys.argv[1] + '/res.txt', 'w').write('made 2026-10-14 09:00\\nms=1000.04 n=3\\n')\n",
+        )
+        write(self.an("res.txt"), "made 2026-10-13 17:00\nms=1000.0 n=3\n")
+        cmp_ = {"got": "res.txt", "want": "analyst/res.txt", "ignore": ["^made "]}
+        smoke = {"script": "analyst/a-res.py", "args": ["{out}"], "compare": [cmp_]}
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_with(smoke))
+        self.assertRefused(r, snap, "ms=1000.04")  # exact by default
+        r = fx.run(
+            meta=self.meta_with(dict(smoke, compare=[dict(cmp_, tolerance=1e-4)]))
+        )
+        self.assertOk(r)
+        self.assertIn("smoke check 1/1 OK", r.stdout)
+
+    def test_steps_share_out_and_run_from_the_staged_copy(self):
+        # step 1 writes {out}/x.json, step 2 reads it; scripts run from the staged copy ({tools}), cwd = {out}
+        fx = self.fx
+        write(
+            self.an("a-one.py"),
+            "import json\njson.dump({'n': 3}, open('x.json', 'w'))\n",
+        )
+        write(
+            self.an("a-two.py"),
+            "import json, os, sys\nprint('n=%d' % json.load(open(sys.argv[1]))['n'])\n"
+            "print('staged' if os.path.dirname(os.path.abspath(__file__)) == sys.argv[2] else 'NOT staged')\n",
+        )
+        write(self.an("two.txt"), "n=3\nstaged\n")
+        m = self.meta_with(
+            {"script": "analyst/a-one.py", "args": []},
+            {
+                "script": "analyst/a-two.py",
+                "args": ["{out}/x.json", "{analyst}"],
+                "compare": [{"want": "analyst/two.txt"}],
+            },
+            SMOKE,
+        )
+        r = fx.run(meta=m)
+        self.assertOk(r)
+        self.assertIn("smoke check 3/3 OK", r.stdout)
+
+    def test_malformed_declaration_is_an_error(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_with({"args": []}))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("smoke", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
+
 class Units(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1093,6 +1300,8 @@ class GoldenP3cloid(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("fence check 119/119 OK", r.stdout)
+        # meta/p3cloid.toml's [[smoke]]: the archived a-cells / a-arms / a-paired reproduce cells.txt, arms.txt, paired.txt
+        self.assertIn("smoke check 4/4 OK", r.stdout)
         # summary table: rows and note bullet are generated; the "Sources:" sentence (lines 4-5) is hand-edited
         # prose (it names the branch of the write-up), the one documented diff
         exp = self.git("show", "%s:%s" % (self.SHA, self.SUMMARY)).split("\n")
@@ -1160,7 +1369,7 @@ class GoldenP3cloid(unittest.TestCase):
         self.assertEqual(len(b), 1, r.stderr)
         self.assertIn("phases.txt", b[0])
         self.assertIn("cloids.txt", b[0])
-        for other in ("WARNING (c)", "WARNING (d)", "WARNING (x)"):
+        for other in ("WARNING (c)", "WARNING (d)", "WARNING (x)", "WARNING (s)"):
             self.assertNotIn(other, r.stderr)
 
 

@@ -10,7 +10,8 @@ USAGE
                 non-cell dirs and the DELETABLE note, Tier A keep condition, outside-tree items (target dirs,
                 worktrees), files to name as kept, the summary-table file + per-arm row labels. Prose stays manual
                 in this file. Example with every key explained: meta/p3cloid.toml.
-  --dry-run     print a unified diff of every file it would change or create; write nothing
+  --dry-run     print a unified diff of every file it would change or create; write nothing (the fence check and the
+                smoke check still run and still fail the run)
   --strict      exit 2 without writing anything if any check warns
   --learn-fields  append the summary.json fields flagged by check (a) to summary-fields.txt (after you noted them)
   --bench-root / --archive-dir / --repo / --fields-file / --summary-file   override the defaults (tests use these)
@@ -35,13 +36,39 @@ REFUSES (exit 3, writes nothing): the campaign is already in INDEX.md / cells.md
   It never overwrites or duplicates an entry; to redo one, revert it with git first.
 REFUSES (exit 4, writes nothing): the fence check on the whole DELETABLE.md after the append fails (a ``` fence not
   closed, or a block that `bash -n` rejects). Success prints "fence check N/N OK".
+REFUSES (exit 5, writes nothing): the smoke check fails (see SMOKE): a declared analyst command exits non-zero, crashes,
+  times out or is not in the tools copy, or its output differs from the archived output. Success prints
+  "smoke check N/N OK".
 WARNS ("WARNING (x) ...", exit 2 with --strict, nothing written then): (a) summary.json fields not in
   summary-fields.txt (new metrics the tables do not show: add a note); (b) analyst *.txt outputs with no a-*.py that
   writes them; (c) deletable / outside-tree paths that do not exist, kept files that are in an rm list or in no
   cell; (d) results-doc heading missing or naming another campaign, plan row missing or not citing the section;
-  (x) cell rows that differ from the analyst's archive-*-<camp>.txt; (m) meta gaps.
+  (x) cell rows that differ from the analyst's archive-*-<camp>.txt; (m) meta gaps; (s) no [[smoke]] in the meta (the
+  archived analysis was not test-run; older campaigns still archive, --strict refuses).
 
-SAFETY: it never deletes anything (it only writes rm commands into DELETABLE.md for a human to run on ozarchy).
+SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as archived)
+  Before writing, the script copies the staged tools tree (exactly what it would write to tools/ozarchy-<camp>-tools/)
+  into a temp dir and runs each [[smoke]] entry in order from there, against the real cell dirs under --bench-root,
+  with cwd = a temp output dir shared by all entries; then each [[smoke.compare]] is diffed line by line with the
+  archived file in the same copy. Run it against one cell where the script allows (e.g. a-cells.py PREFIX r1-c0:c0
+  against that cell's line of cells.txt). Copy the arguments from the analyst's driver (run-analysis.sh or the
+  session log) verbatim: a wrong prefix then fails here instead of in the archive. Do not declare scripts that write
+  to hard-coded paths (a-archive.py): only {out} is a scratch dir.
+    script    path in the tools copy; .py runs as `python3 -I <script> <args>`, .sh as `bash <script> <args>`
+    args      list of strings; {bench} = --bench-root, {out} = the scratch output dir, {tools} / {analyst} = the
+              temp tools copy and its analyst/ dir, {camp} = the campaign tag; other braces stay as written
+    timeout   seconds per entry (default 300); on expiry the process group is killed and the check fails
+    name      optional label for the report
+    [[smoke.compare]] (an entry without one only prepares input for a later entry, e.g. a cells.json)
+      want      archived file in the tools copy, e.g. "analyst/cells.txt" (must be there)
+      got       "stdout" (default), "stdout+stderr" (like `> f 2>&1`), or a file name in {out}
+      select    regex: compare only the lines (of both sides) it matches, e.g. "^r1-c0 " for one cell
+      ignore    list of regexes: lines dropped from both sides (timestamps, temp paths)
+      tolerance relative tolerance for every number in a line (default 0: exact); the text between numbers must match
+  Example and real use: meta/p3cloid.toml, meta/p3cloidprof.toml.
+
+SAFETY: it never deletes anything (it only writes rm commands into DELETABLE.md for a human to run on ozarchy); the
+  smoke check's temp dir is removed by Python's TemporaryDirectory.
 """
 
 import argparse
@@ -913,6 +940,230 @@ def fence_check(text, name="DELETABLE.md"):
     return ok, len(blocks) + (cur is not None), errors
 
 
+SMOKE_KEYS = {"script", "args", "compare", "timeout", "name"}
+CMP_KEYS = {"got", "want", "select", "ignore", "tolerance"}
+SMOKE_VARS = ("bench", "out", "tools", "analyst", "camp")
+NUM_RE = re.compile(r"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)")
+
+
+def smoke_specs(meta):
+    """Validate the meta's [[smoke]] entries -> list of dicts (empty if none). Malformed -> Fatal."""
+    specs = meta.get("smoke", [])
+    if isinstance(specs, dict):
+        specs = [specs]
+    if not isinstance(specs, list):
+        raise Fatal("[[smoke]] must be a list of tables")
+    for k, s in enumerate(specs, 1):
+        where = "smoke entry %d" % k
+        if (
+            not isinstance(s, dict)
+            or not isinstance(s.get("script"), str)
+            or not s["script"]
+        ):
+            raise Fatal(
+                '%s: needs script = "<path in the tools copy, e.g. analyst/a-cells.py>"'
+                % where
+            )
+        bad = set(s) - SMOKE_KEYS
+        if bad:
+            raise Fatal(
+                "%s: unknown keys %s (known: %s)"
+                % (where, sorted(bad), sorted(SMOKE_KEYS))
+            )
+        if os.path.splitext(s["script"])[1] not in (".py", ".sh"):
+            raise Fatal(
+                "%s: script must be a .py (run with python3 -I) or .sh (run with bash): %s"
+                % (where, s["script"])
+            )
+        if not isinstance(s.get("args", []), list) or not all(
+            isinstance(a, str) for a in s.get("args", [])
+        ):
+            raise Fatal("%s: args must be a list of strings" % where)
+        t = s.get("timeout", 300)
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0:
+            raise Fatal("%s: timeout must be a positive number of seconds" % where)
+        cmps = s.get("compare", [])
+        if not isinstance(cmps, list):
+            raise Fatal("%s: compare must be a list of tables" % where)
+        for cm in cmps:
+            if not isinstance(cm, dict) or not isinstance(cm.get("want"), str):
+                raise Fatal(
+                    '%s: each compare needs want = "<archived file in the tools copy>"'
+                    % where
+                )
+            bad = set(cm) - CMP_KEYS
+            if bad:
+                raise Fatal(
+                    "%s: unknown compare keys %s (known: %s)"
+                    % (where, sorted(bad), sorted(CMP_KEYS))
+                )
+            for rx in ([cm["select"]] if "select" in cm else []) + list(
+                cm.get("ignore", [])
+            ):
+                try:
+                    re.compile(rx)
+                except (re.error, TypeError) as e:
+                    raise Fatal("%s: bad regex %r: %s" % (where, rx, e)) from e
+    if specs and not any(s.get("compare") for s in specs):
+        raise Fatal("[[smoke]] declares no compare: nothing would be checked")
+    return specs
+
+
+def smoke_fill(text, vals):
+    return re.sub(r"\{(%s)\}" % "|".join(SMOKE_VARS), lambda m: vals[m.group(1)], text)
+
+
+def smoke_lines(text, cm):
+    sel = re.compile(cm["select"]) if "select" in cm else None
+    ign = [re.compile(x) for x in cm.get("ignore", [])]
+    return [
+        l
+        for l in text.splitlines()
+        if (sel is None or sel.search(l)) and not any(x.search(l) for x in ign)
+    ]
+
+
+def smoke_same(a, b, tol):
+    """Lines equal, or (tol > 0) equal outside the numbers and every number within relative tolerance tol."""
+    if a == b:
+        return True
+    if not tol:
+        return False
+    pa, pb = NUM_RE.split(a), NUM_RE.split(b)
+    if len(pa) != len(pb):
+        return False
+    for i, (x, y) in enumerate(zip(pa, pb, strict=True)):
+        if i % 2 == 0:
+            if x != y:
+                return False
+        elif abs(float(x) - float(y)) > tol * max(abs(float(x)), abs(float(y))):
+            return False
+    return True
+
+
+def run_smoke(c, specs, staged):
+    """Run the declared analyst commands from a temp copy of the staged tools tree, against the real cells under the
+    bench root, and diff their output with the archived files in the same copy. -> (ok, total, errors)."""
+    import signal
+    import tempfile
+
+    errors, ok = [], 0
+    with tempfile.TemporaryDirectory(prefix="archive-smoke-") as tmp:
+        tools, out = os.path.join(tmp, "tools"), os.path.join(tmp, "out")
+        os.makedirs(out)
+        for rel, data, mode in staged:
+            write_atomic(os.path.join(tools, rel), data, mode)
+        vals = {
+            "bench": c.bench,
+            "out": out,
+            "tools": tools,
+            "analyst": os.path.join(tools, "analyst"),
+            "camp": c.camp,
+        }
+        for k, s in enumerate(specs, 1):
+            label = "smoke %d (%s)" % (k, s.get("name") or s["script"])
+            script = os.path.join(tools, s["script"])
+            if not os.path.isfile(script):
+                errors.append("%s: %s is not in the tools copy" % (label, s["script"]))
+                continue
+            interp = [sys.executable, "-I"] if script.endswith(".py") else ["bash"]
+            cmd = interp + [script] + [smoke_fill(a, vals) for a in s.get("args", [])]
+            t = s.get("timeout", 300)
+            try:
+                p = subprocess.Popen(
+                    cmd,
+                    cwd=out,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError as e:
+                errors.append("%s: cannot run %s: %s" % (label, " ".join(cmd), e))
+                continue
+            try:
+                so, se = p.communicate(timeout=t)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.communicate()
+                errors.append(
+                    "%s: timed out after %g s: %s" % (label, t, " ".join(cmd))
+                )
+                continue
+            so, se = so.decode(errors="replace"), se.decode(errors="replace")
+            if p.returncode:
+                tail = se.strip().splitlines()[-6:] or ["(no stderr)"]
+                errors.append(
+                    "%s: exit status %d: %s\n    %s"
+                    % (label, p.returncode, " ".join(cmd), "\n    ".join(tail))
+                )
+                continue
+            bad = False
+            for cm in s.get("compare", []):
+                got_k = cm.get("got", "stdout")
+                if got_k == "stdout":
+                    got = so
+                elif got_k == "stdout+stderr":
+                    got = so + se
+                else:
+                    gp = os.path.join(out, smoke_fill(got_k, vals))
+                    if not os.path.isfile(gp):
+                        errors.append("%s: output %s was not written" % (label, got_k))
+                        bad = True
+                        continue
+                    got = read(gp)
+                wp = os.path.join(tools, cm["want"])
+                if not os.path.isfile(wp):
+                    errors.append(
+                        "%s: archived output %s is not in the tools copy"
+                        % (label, cm["want"])
+                    )
+                    bad = True
+                    continue
+                want_l, got_l = smoke_lines(read(wp), cm), smoke_lines(got, cm)
+                if not want_l:
+                    errors.append(
+                        "%s: no line of %s left after select %r / ignore: nothing to compare"
+                        % (label, cm["want"], cm.get("select"))
+                    )
+                    bad = True
+                    continue
+                tol = float(cm.get("tolerance", 0))
+                if len(want_l) != len(got_l) or not all(
+                    smoke_same(a, b, tol) for a, b in zip(want_l, got_l, strict=True)
+                ):
+                    d = list(
+                        difflib.unified_diff(
+                            want_l,
+                            got_l,
+                            "archived " + cm["want"],
+                            "smoke " + got_k,
+                            lineterm="",
+                        )
+                    )
+                    more = (
+                        ["... (%d more diff lines)" % (len(d) - 40)]
+                        if len(d) > 40
+                        else []
+                    )
+                    errors.append(
+                        "%s: output differs from the archived %s%s:\n    %s"
+                        % (
+                            label,
+                            cm["want"],
+                            " (tolerance %g)" % tol if tol else "",
+                            "\n    ".join(d[:40] + more),
+                        )
+                    )
+                    bad = True
+            if not bad:
+                ok += 1
+    return ok, len(specs), errors
+
+
 def udiff(old, new, label, new_file=False):
     a = old.splitlines(True) if old else []
     b = new.splitlines(True)
@@ -1228,6 +1479,7 @@ def main(argv=None):
             raise Fatal("meta camp %r does not match %r" % (meta.get("camp"), a.camp))
         if "section" not in meta:
             raise Fatal("meta has no section")
+        specs = smoke_specs(meta)
         c = Campaign(a.camp, meta, a.bench_root, repo)
         names = ["INDEX.md", "cells.md", "DELETABLE.md"]
         paths = [os.path.join(archive, f) for f in names]
@@ -1281,6 +1533,11 @@ def main(argv=None):
             except OSError as e:
                 raise Fatal("tools source %s: %s (nothing written)" % (src, e.strerror or e)) from e
             files.append((os.path.join(tools_dir, dst), label, data, mode))
+        staged = [(os.path.relpath(p_, tools_dir), d_, m_) for p_, _, d_, m_ in files]
+        if not specs:
+            msg = ("no [[smoke]] in the meta: the archived analysis was not test-run against a cell "
+                   "(declare one: see SMOKE in the usage header)")
+            c.warn.append(("s", msg))
     except Fatal as e:
         print("archive-campaign: error: %s" % e, file=sys.stderr)
         return 1
@@ -1298,6 +1555,15 @@ def main(argv=None):
             print("  " + e, file=sys.stderr)
         return 4
     print("fence check %d/%d OK" % (ok, total))
+    if specs:
+        ok, total, errs = run_smoke(c, specs, staged)
+        if errs:
+            print("archive-campaign: smoke check %d/%d OK, FAILED: the archived analysis does not reproduce its archived "
+                  "output from the tools copy; nothing written:" % (ok, total), file=sys.stderr)
+            for e in errs:
+                print("  " + e, file=sys.stderr)
+            return 5
+        print("smoke check %d/%d OK" % (ok, total))
     if a.strict and c.warn:
         print("archive-campaign: --strict and %d warnings: nothing written" % len(c.warn), file=sys.stderr)
         return 2
