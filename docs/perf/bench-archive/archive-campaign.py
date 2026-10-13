@@ -30,7 +30,8 @@ WHAT IT WRITES (mechanical part)
      strip_trailing = globs (path in the tools copy, e.g. "analyst/perf-report-*.txt") of text files whose blanks at
      line ends and blank lines at the end are stripped when copied (perf report headers carry ~1 KB of blanks, which
      `git diff --check` flags); a smoke compare against such a file strips its got side the same way. Unlisted
-     files are copied byte for byte (check t names the ones with trailing blanks).
+     files are copied byte for byte (check t names the ones with trailing blanks). The CR of a CRLF line end counts
+     as a blank (git flags it too): stripping turns CRLF into LF.
   2. INDEX.md: the "Updated" paragraph (after the last one) and one row per dir in sorted position; cells.md: the
      campaign section (before "## action-results:"); DELETABLE.md: the campaign block at the end (Tier A / Tier B
      rm lists with live sizes, outside-tree block). Rows come from each cell's summary.json, node-environ-trie.txt,
@@ -1260,11 +1261,12 @@ def run_smoke(c, specs, staged, stripped=frozenset()):
     return ok, len(specs), errors
 
 
-TRAILING_RE = re.compile(rb"[ \t]+(?=\n|\Z)")
+TRAILING_RE = re.compile(rb"[ \t\r]+(?=\n|\Z)")  # \r too: git flags the CR of a CRLF line end
 
 
 def strip_trailing(data):
-    """Bytes without what `git diff --check` flags: blanks at line ends and blank lines at the end of the file."""
+    """Bytes without what `git diff --check` flags: blanks at line ends (CRLF -> LF) and blank lines at the end of
+    the file."""
     data = TRAILING_RE.sub(b"", data)
     body = data.rstrip(b"\n")
     return body + b"\n" if body and data.endswith(b"\n") else body
