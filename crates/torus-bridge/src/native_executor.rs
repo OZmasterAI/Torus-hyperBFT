@@ -4180,6 +4180,10 @@ thread_local! {
     /// s118 (tests): calls of [`NativeExecutor::account_check`] on this
     /// thread (`margin_label_tests`).
     static ACCOUNT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// s118 (tests): calls of [`NativeExecutor::account_check`] on the
+    /// sharded Phase 2 workers this thread spawned
+    /// ([`NativeExecutor::phase2_parallel_prepare`]), credited when they join.
+    static WORKER_ACCOUNT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(any(test, feature = "test-reference-paths"))]
@@ -7841,12 +7845,17 @@ impl NativeExecutor {
             torus_state::spawn_count::SpawnSite::MarginPrepare,
             groups.len().div_ceil(shard),
         );
+        // s118 (tests): the workers' account checks, credited to the caller.
+        #[cfg(test)]
+        let worker_checks = &std::sync::atomic::AtomicU64::new(0);
         let worker_results: Vec<Result<WorkerOut, ()>> = std::thread::scope(|s| {
             let handles: Vec<_> = groups
                 .chunks(shard)
                 .map(|shard_groups| {
                     s.spawn(move || {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(test)]
+                            let checks_at_start = ACCOUNT_CHECKS.with(|c| c.get());
                             let orders: usize = shard_groups.iter().map(|(_, o)| o.len()).sum();
                             let mut fold = SenderFold::with_capacity(shard_groups.len());
                             let mut out: Vec<(usize, PrepOutcome)> = Vec::with_capacity(orders);
@@ -7869,6 +7878,11 @@ impl NativeExecutor {
                                     ));
                                 }
                             }
+                            #[cfg(test)]
+                            worker_checks.fetch_add(
+                                ACCOUNT_CHECKS.with(|c| c.get()) - checks_at_start,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             (out, fold.finish())
                         }))
                         .map_err(|_| ())
@@ -7880,6 +7894,9 @@ impl NativeExecutor {
                 .map(|h| h.join().unwrap_or(Err(())))
                 .collect()
         });
+        #[cfg(test)]
+        WORKER_ACCOUNT_CHECKS
+            .with(|c| c.set(c.get() + worker_checks.load(std::sync::atomic::Ordering::Relaxed)));
 
         let mut outcomes: Vec<Option<PrepOutcome>> = (0..n).map(|_| None).collect();
         let mut merged = FoldOut::default();
