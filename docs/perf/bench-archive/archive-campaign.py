@@ -1625,6 +1625,18 @@ def main(argv=None):
         else:
             c.warn.append(("m", "no [summary] in the meta: summary table not updated"))
         tools_dir = os.path.abspath(a.tools_dir or os.path.join(archive, "tools", "ozarchy-%s-tools" % a.camp))
+        # one written file per output: a doc named twice (or inside the tools copy) would overwrite another one
+        outs = list(zip(("--index-file", "--cells-file", "--deletable-file"), paths, strict=True))
+        if spath:
+            outs.append(("summary file", spath))
+        tools_real = os.path.realpath(tools_dir)
+        for i, (n1, p1) in enumerate(outs):
+            r1 = os.path.realpath(p1)
+            for n2, p2 in outs[:i]:
+                if os.path.realpath(p2) == r1:
+                    raise Fatal("%s and %s name the same file %s (nothing written)" % (n2, n1, p1))
+            if r1 == tools_real or r1.startswith(tools_real + os.sep):
+                raise Fatal("%s %s is inside --tools-dir %s (nothing written)" % (n1, p1, tools_dir))
         refuse = ["campaign %s already in the archive: %s" % (a.camp, h_) for h_ in present(c, texts, tools_dir)]
         named = [(n, t, False) for n, t in zip(labels[:3], texts, strict=True)]
         if spath:
