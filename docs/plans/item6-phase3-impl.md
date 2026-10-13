@@ -348,6 +348,13 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   [-0.50, -0.06] per node (~6%), growth rate unchanged; CPU-s/1M +1.10% [+0.44, +1.75]; device writes +10.8% [+7.0, +14.6]
   (WAL path); blocks/s, matched/s, block time p99 ties. Minutes 0-2 only, not the soak plateau. Three REJECTs (g2), all
   the mark-only digest artifact.
+- **jemalloc compiled in (RAM-gate dependency)** (campaign `ozarchy-p3je`, results doc section 56, plan-2 row 64):
+  `feat/jemalloc-allocator` `88ddc4c2` vs main `deeacdb3` (glibc), no Phase 3 in either arm, commit tail, n = 4 ABBA,
+  120 s, saturated and at a fixed 907 actions/s. RSS growth over minutes 0-2 is about halved (-44% / -54%), the
+  fixed-load RSS mean -0.22 GB [-0.30, -0.14] per node and end-of-window -0.36 GB, at CPU-s/1M +2.7% (saturated) /
+  +4.3% (fixed load, resolved). matched/s is not higher (tie saturated); blocks/s +10-15%, block time p99 -7 to -9%.
+  Part B (10 min soaks ja / jb and je-vs-je jcs `e7be8460` / jmf `0360c840`) decides the RAM gate under jemalloc;
+  its binaries are staged in `ozarchy-p3je-stage/{jcs,jmf}-run`.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

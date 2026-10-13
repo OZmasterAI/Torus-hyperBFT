@@ -1,0 +1,1 @@
+RATE=907 = 0.75 x 1209.35 (mean jb SAT submit rate over [10, 110] s, cells r1-r4 jb: 1200.1 1215.6 1200.1 1221.6 actions/s)

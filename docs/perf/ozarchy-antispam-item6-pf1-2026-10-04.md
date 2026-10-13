@@ -6858,6 +6858,153 @@ checkpoint rate, layer MB per minute and gaps from `ckpt-samples.txt`), `a-archi
 `ckgap.txt`, `mw.txt`, `digest.txt`, `cells.txt`. Full outputs (incl. `cells.json`) in `ozarchy-p3iv-run/analyst/` on
 ozarchy. Driver: `tools/ozarchy-p3iv-tools/ozarchy-p3iv-campaign.sh` (CAMP=I) + `env.sh`.
 
+## 56. jemalloc compiled in: feat/jemalloc-allocator `88ddc4c2` vs main `deeacdb3` (glibc), saturated and fixed offered load, commit-tail mode (campaign ozarchy-p3je, 2026-10-13)
+
+**Compiled-in jemalloc does not raise the matched/s ceiling: saturated matched/s -0.3% [-1.5, +0.9] (paired ja - jb, n = 4,
+95% CI t(3)). It does make consensus faster: native blocks/s +14.9% [+3.2, +26.6], smaller blocks, block time p99 -7.2%
+[-12.6, -1.9], exec `block_ms` -14.3% [-25.2, -3.4]. The closed-loop bench then submits more (+6.3% [+1.8, +10.9] over
+the matching window). At fixed offered load (RATE 907 actions/s) it costs node CPU: CPU-s/1M +4.26% [+3.26, +5.25]
+(+4.62% [+2.41, +6.82] at equal fills). It lowers the whole-cell RSS: mean -0.22 GB [-0.30, -0.14] (-6.6%), peak -0.14 GB
+[-0.18, -0.10] (-3.6%), last 15 s of the bench window -0.36 GB [-0.43, -0.29]. It halves the growth over the bench window
+(1.05 -> 0.49 GB/min).** Saturated, CPU-s/1M is +2.66% [+1.83, +3.49], the RSS peak is a tie, the mean is -3.8%
+[-4.6, -2.9] and the growth is -44%. The same direction as section 51's LD_PRELOAD cells on main. There, the "+13-15%"
+was the submit rate and blocks/s, not matched/s: main + jemalloc gave +0.6% matched/s and +1.5% CPU-s/1M. **Caveat on the
+fixed-load mode:** at 907 actions/s the executor is still the bottleneck in both arms (busy 0.95 / 0.97, backlog 44 / 55
+blocks, 780-798 actions/s executed vs 895-907 submitted), so FIX equalises offered load and total work, not an idle
+executor (56.3). 16 measured cells (+ 2 warm-ups + the smoke cell), all rc 0 or rc 2 from the known mark-only digest artifact. Every hard check passed,
+and the allocator was verified in every cell.
+
+Owner-approved plan (18c, part A of the jemalloc batch): `feat/jemalloc-allocator` `88ddc4c2` (tikv-jemallocator 0.7 /
+jemalloc 5.3.1 as the process allocator, default feature `jemalloc`, unprefixed so RocksDB's C++ `malloc` goes through it
+too, plus `torus_jemalloc_{allocated,active,resident,retained,mapped}_bytes` gauges) vs its parent main `deeacdb3`
+(`deeacdb3..88ddc4c2` = that one commit). Arms: ja = `88ddc4c2` (node `f2fbe17b`), jb = `deeacdb3` (node `e901fd1d`), no
+LD_PRELOAD in either arm, no checkpoint knob (both main, no Phase 3), commit tail. Built for this run with frame pointers,
+line tables and mold, each in a fresh target dir (`~/.cargo-target-p3je-<key>-<sha8>`) from a clean detached worktree
+(`/home/oz/projects/wt/p3je-<key>-<sha8>`). Script `ozarchy-p3je-build.sh` (copy of `ozarchy-p3cssoak-build.sh`), md5s in
+`ozarchy-p3je-build/md5s-all.txt`, staged in `ozarchy-p3je-stage/{ja,jb}-run`. Bench `05d44313` (`8efcb07a`), harness
+`218ad251`. Part B's two je-vs-je binaries were built in the same run but not used here: jcs = `e7be8460`
+(`test/p3-cs-je`, `4521dd5f`) and jmf = `0360c840` (`test/main-fix-je`, `9d6e57c1`).
+
+**Allocator check.** Preflight: the ja, jcs and jmf binaries define `malloc` in `.dynsym` (section 30, jemalloc linked in).
+In jb, `malloc` is `UND` (`malloc@GLIBC_2.2.5`). Per cell (new `jechk` hard check): on ja, `torus_jemalloc_allocated /
+resident / retained_bytes` > 0 on all 3 nodes in every cell (smoke included). On jb, no `torus_jemalloc_` series on any
+node. No node had LD_PRELOAD or a mapped `libjemalloc.so` (the old `heapchk`).
+
+Setup: the section 51-55 shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, 120 s cells
++ 60 s jb warm-up, shared NVMe). Driver `ozarchy-p3je-campaign.sh` (copy of `ozarchy-p3iv-campaign.sh`) has two modes.
+CAMP=SAT uses the usual harness RATE 76000 actions/s. That is only an offered ceiling: the CONC semaphore and the
+in-flight cap bound the bench. CAMP=FIX uses RATE 907 (run-cell.sh arg 5 -> bench `--rate-total`, paced, no catch-up).
+Both modes run cells in this order: w0 (jb), r1 jb ja, r2 ja jb, r3 jb ja, r4 ja jb. A 60 s ja smoke cell ran first
+(`ozarchy-p3je-sat-smoke-300m-s0-ja`, 06:00-06:04, rc 0, ACCEPT AGREE). SAT cells ran 06:06-06:59 and FIX cells
+07:01-07:53. Each campaign logged 144 CHECK OK, with no CHECK FAIL, no deaths and no memguard stop. The host was quiet
+before every cell (no cargo / rustc / rust-analyzer, load < 2, no analysis python). 120 s cells mean **all RSS figures are
+minutes 0-2, not a soak plateau** (part B has the soaks).
+
+**How RATE was chosen.** The jb submit rate in SAT was measured over the matching window [10 s, 110 s] of each cell. Count
+and elapsed time come from the same `bench.log` cumulative line: elapsed = submitted / cumulative rate. The four values
+were 1,200.1 / 1,215.6 / 1,200.1 / 1,221.6 actions/s, mean 1,209.35. 75% of that is 907.0, so RATE = 907
+(`ozarchy-p3je-fix-run/RATE.txt`).
+
+### 56.1 Submit-rate check per FIX cell (window [10 s, 110 s]; gate: within 2% of RATE 907)
+
+| cell | submit actions/s | vs RATE | | cell | submit actions/s | vs RATE |
+|---|---|---|---|---|---|---|
+| w0 (jb, 60 s, [10, 50] s) | 907.0 | +0.00% | | | | |
+| r1-jb | 897.4 | -1.06% | | r1-ja | 907.3 | +0.03% |
+| r2-jb | 891.9 | -1.67% | | r2-ja | 906.2 | -0.09% |
+| r3-jb | 897.5 | -1.05% | | r3-ja | 907.3 | +0.03% |
+| r4-jb | 893.1 | -1.53% | | r4-ja | 906.2 | -0.09% |
+
+All 9 cells pass the 2% gate, so none is LOADGEN-SUSPECT. ja holds RATE to 0.1% in every cell. jb runs 1.0-1.7% under it
+in every cell (paired +1.32% [+0.91, +1.72]), so the glibc arm lets slightly fewer paced fires through the in-flight cap.
+The fixed-load comparison is therefore at +1.3% more offered work on ja, and per-fill CPU is the fair metric.
+
+### 56.2 Per arm (n = 4, mean; paired ja - jb over the 4 rounds, 95% CI t(3))
+
+| | SAT jb | SAT ja | SAT ja - jb % [95% CI] | FIX jb | FIX ja | FIX ja - jb % [95% CI] |
+|---|---|---|---|---|---|---|
+| matched/s (bench window) | 215,255 | 214,571 | -0.3% [-1.5, +0.9] | 162,468 | 158,902 | **-2.2% [-3.5, -0.9]** |
+| bench submit actions/s (window [10, 110] s) | 1,209 | 1,286 | **+6.3% [+1.8, +10.9]** | 895 | 907 | +1.3% [+0.9, +1.7] |
+| actions/s executed (val0, bench window) | 1,087 | 1,102 | +1.4% [-1.2, +3.9] | 798 | 780 | -2.2% [-3.6, -0.8] |
+| node CPU-s/1M fills (whole run) | 24.74 | 25.40 | **+2.66% [+1.83, +3.49]** | 29.00 | 30.24 | **+4.26% [+3.26, +5.25]** |
+| node CPU at equal fills (ANCOVA, Welch) | | | +3.66% [-0.27, +7.58] | | | **+4.62% [+2.41, +6.82]** |
+| fills per node, whole run (M) / node CPU-s | 28.30 / 700 | 30.85 / 784 | | 22.84 / 662 | 23.22 / 702 | |
+| RSS peak per node GB (cpu.csv, mean of 3) | 4.07 | 4.08 | +0.4% [-3.4, +4.1] | 3.93 | 3.79 | **-3.6% [-4.7, -2.5]** |
+| RSS mean per node GB (cpu.csv) | 3.48 | 3.35 | **-3.8% [-4.6, -2.9]** | 3.34 | 3.12 | **-6.6% [-8.9, -4.2]** |
+| RSS mean, bench window GB (mem-samples) | 3.51 | 3.68 | +4.8% [+1.0, +8.5] | 3.33 | 3.34 | +0.4% [-3.5, +4.4] |
+| RSS first / last 15 s of the window GB | 1.96 / 4.01 | 2.82 / 3.97 | +0.86 [+0.30, +1.42] / -0.03 [-0.21, +0.14] | 1.40 / 3.88 | 2.23 / 3.52 | +0.84 [+0.32, +1.36] / **-0.36 [-0.43, -0.29]** |
+| RSS growth over the window GB/min | 0.85 | 0.48 | **-44% [-69, -19]** | 1.05 | 0.49 | **-54% [-70, -37]** |
+| VmHWM GB | 4.21 | 4.25 | +0.9% [-2.4, +4.1] | 4.05 | 3.95 | -2.6% [-4.3, -0.8] |
+| native blocks/s | 3.61 | 4.15 | **+14.9% [+3.2, +26.6]** | 3.80 | 4.18 | **+10.2% [+6.9, +13.5]** |
+| actions / fills per native block | 282 / 54,526 | 251 / 48,450 | -10.9% / -11.1% | 198 / 40,204 | 173 / 35,147 | -12.7% / -12.6% (resolved) |
+| block time (commit interval) p50 ms | 163 | 105 | **-35.5% [-41.3, -29.8]** | 132 | 122 | -7.5% [-22.9, +7.8] |
+| block time p99 ms | 1,128 | 1,047 | **-7.2% [-12.6, -1.9]** | 1,161 | 1,059 | **-8.8% [-16.3, -1.3]** |
+| exec `block_ms` (summary) | 248.8 | 213.2 | **-14.3% [-25.2, -3.4]** | 236.0 | 210.9 | **-10.6% [-14.4, -6.9]** |
+| exec per native block (logs) mean / p99 ms | 335 / 644 | 291 / 589 | -13.1% [-17.7, -8.5] / -8.5% [-14.9, -2.1] | 260 / 583 | 236 / 541 | -9.4% [-12.1, -6.8] / -7.3% [-13.8, -0.7] |
+| engine ms per 1k fills | 3.67 | 3.56 | -2.9% [-4.0, -1.7] | 4.30 | 4.22 | -1.8% [-4.0, +0.5] |
+| residual untimed ms per block | 13.7 | 13.0 | -0.7 [-2.1, +0.8] | 17.7 | 27.0 | **+9.3 [+8.8, +9.9]** |
+| exec busy / backlog (blocks) | 0.951 / 41.3 | 0.968 / 53.1 | +1.8% / +11.9 blocks | 0.947 / 44.0 | 0.973 / 55.5 | +2.7% / +11.4 blocks |
+| mempool wait s (Little: mempool mean / executed actions/s) | 5.00 | 3.89 | -22% [-39, -5] | 1.89 | 1.20 | **-37% [-49, -24]** |
+| exec lag s (commit -> executed, logs) | 11.18 | 11.69 | +4.5% [-1.7, +10.8] | 11.20 | 12.37 | **+10.4% [+3.9, +17.0]** |
+| device writes MB/s per validator (io-ticks) | 138.0 | 144.8 | +5.0% [+1.1, +8.9] | 209.0 | 218.2 | +4.4% [+1.8, +7.1] |
+| memtables MB | 285 | 286 | +0.5% | 273 | 273 | -0.1% |
+
+Welch intervals (`arms.txt`) agree in sign and resolution with the paired ones on every bolded row (e.g. FIX CPU-s/1M
++4.26% [+3.66, +4.85], SAT blocks/s +14.9% [+1.6, +28.2], FIX RSS mean -6.6% [-8.5, -4.7]). Fill latency: the harness records no per-action submit -> commit time. The two
+parts it does record point in opposite directions. ja spends less time in the mempool (-37% in FIX) and more in the
+exec queue (+10%). Their sum, mempool wait + exec lag, is 13.1 s (jb) vs 13.6 s (ja) in FIX, consistent with a tie or
+slightly slower on ja. Block time p99 is shorter on ja in both modes.
+
+**jemalloc gauges (ja, bench-window mean per node; max of resident in brackets):**
+
+| | allocated GB | resident GB | retained GB | resident - allocated GB |
+|---|---|---|---|---|
+| SAT | 2.14 | 3.33 [3.95] | 2.47 | 1.19 |
+| FIX | 2.03 | 2.99 [3.60] | 2.61 | 0.96 |
+
+The live heap is ~2.0-2.1 GB per node at minutes 0-2. jemalloc's own resident pages add another ~1.0-1.2 GB (dirty and
+muzzy pages not yet purged, plus metadata). ~2.5 GB of virtual memory is retained (not RSS). Window-mean process RSS (3.68 / 3.34 GB) is
+resident plus ~0.35 GB outside jemalloc (file mappings, thread stacks, other non-heap memory).
+
+### 56.3 What the fixed-load mode did and did not equalise
+
+RATE 907 equalised offered load (56.1) and total work: whole-run fills per node 22.84 vs 23.22 M (+1.7%, following
+the +1.3% offered). It did not take the executor out of saturation. At the slower pace the books are deeper (resting
+orders 398k vs 241k in SAT), and each fill costs more (29.0 vs 24.7 CPU-s/1M, engine 4.3 vs 3.7 ms per 1k fills). Exec
+capacity therefore drops to ~780-800 actions/s, below 907. Both arms build a 44-55 block backlog and an 11-12 s exec lag,
+as in SAT. ja's faster consensus (+10% blocks/s, smaller blocks) runs further ahead of its executor (+11 blocks of
+backlog), which is why its in-window matched/s is -2.2% while its total work is +1.7%. The per-fill CPU cost is
+unaffected by this, since it is measured over the whole run including the drain. An operating point where the executor
+keeps up would need RATE below ~750 on this shape. That was not run.
+
+The FIX-only residual untimed +9.3 ms per block on ja (SAT: tie) is not explained here. It is consistent with
+per-block allocator work (more, smaller blocks) that falls outside the timed phases.
+
+### 56.4 Agreement and other checks
+
+Three cells are rc 2 / REJECT on agreement: SAT r4-ja, FIX r1-ja and FIX r3-jb. In each, val1 differs from val0 / val2
+in the 5 mark fields (`accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed`, `withdrawable`) of all 50
+accounts only. This is the slow-digest mark-only artifact of sections 46-55, in both arms: **no hard finding.** Digest
+times vary across cells in both directions: SAT ja 26-42 s vs jb 51-67 s, FIX ja 41-60 s vs jb 21-45 s. That is not
+an allocator effect we can claim. Nonce-window evictions 0, action failures 0, in-flight timeouts 0, in-flight RPC
+refusals 1 / 1 / 2 (SAT r1-ja / r3-jb / r4-ja), 0 elsewhere, no tail warnings.
+
+**Verdict:** compiled-in jemalloc on main reproduces section 51's LD_PRELOAD picture for main. Consensus is faster (blocks/s
++10-15%, block time p99 -7 to -9%, exec per block -10 to -14% on smaller blocks). Throughput is not higher (matched/s tie
+saturated, -2.2% in the window at fixed load). CPU per fill is higher: +2.7% saturated and +4.3% at equal offered load,
++4.6% at equal fills, resolved. The RSS level over minutes 0-2 is lower or equal: mean -4 to -7%, end of window up to
+-0.36 GB, growth rate about halved. It starts higher (+0.85 GB in the first 15 s), consistent with jemalloc's arenas
+holding pages early and growing less later. For the Phase 3 RAM gate the halved growth is the relevant figure. Whether
+that holds as a plateau is part B's question (10 min soaks ja / jb and jcs / jmf). n = 4 x 120 s: "consistent with"
+throughout. Decisive: CPU-s/1M at fixed load, blocks/s, exec `block_ms`, RSS growth, and the FIX RSS mean / peak.
+
+Analysis (`tools/ozarchy-p3je-tools/analyst/`): `a-cells.py`, `a-arms.py`, `a-paired.py` (section 55's, plus the windowed
+submit rate, the `torus_jemalloc_*` gauges from the 5 s mem samples, executed actions/s and the Little-law mempool wait),
+`a-archive.py`. Outputs per mode: `sat-` / `fix-` `cells.txt`, `arms.txt`, `paired.txt`. Full outputs (incl. `cells.json`)
+in `ozarchy-p3je-{sat,fix}-run/analyst/` on ozarchy. Driver `tools/ozarchy-p3je-tools/ozarchy-p3je-campaign.sh`
+(CAMP=SAT|FIX, `jechk`, `ratechk`, the dynsym allocator preflight) + `env.sh`. Build scripts `ozarchy-p3je-build.sh` and
+`ozarchy-p3je-build-all.sh`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
