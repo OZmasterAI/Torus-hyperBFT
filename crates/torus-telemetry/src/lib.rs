@@ -150,6 +150,12 @@ pub struct Metrics {
     /// Orders that died on other error paths: balance read/write failures,
     /// fill-application failures.
     pub orders_rejected_other: Counter,
+    /// s114 (archy section 53c.4): every rejected PlaceOrder once, by
+    /// [`OrderRejectReason`] (`torus_orders_rejected_reason_total{reason}`),
+    /// indexed `reason as usize`. A fixed label set, no per-sender label; the
+    /// funnel counters above are unchanged. Increment via
+    /// [`Metrics::order_rejected`].
+    pub orders_rejected_reason: [Counter; OrderRejectReason::COUNT],
     /// s92 (B-blind observability): SELL takers whose match-time margin ran
     /// out (the book's `margin_cut_price`), indexed `[non_pool][partial]
     /// [bucket]`: `non_pool` 1 = the sender's D2 taker-only budget (its pool
@@ -1271,6 +1277,20 @@ impl Metrics {
             "Orders that died on other error paths (balance read/write or fill application failures)",
             orders_rejected_other.clone(),
         );
+
+        // s114: one series per reason, created up front so every label
+        // exists at 0 from start-up; the handles share the family's atomics.
+        let orders_rejected_reason_family = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_orders_rejected_reason",
+            "Rejected PlaceOrders by reason: pre-book account margin split into position (fails even with the sender's reservations released) vs reservation (passes with them released), match-time margin, open-order limit, tick, lot, price, price band, reduce-only, the book's HL rejects, fill application, other (s114)",
+            orders_rejected_reason_family.clone(),
+        );
+        let orders_rejected_reason = OrderRejectReason::ALL.map(|r| {
+            orders_rejected_reason_family
+                .get_or_create(&vec![("reason".to_string(), r.as_str().to_string())])
+                .clone()
+        });
 
         let pruner_blocks_removed = Counter::default();
         registry.register(
@@ -2549,6 +2569,7 @@ impl Metrics {
             orders_cancelled_partial_fill,
             orders_self_trade_cancels,
             orders_rejected_other,
+            orders_rejected_reason,
             sell_margin_cuts,
             maker_margin_cancels,
             maker_offmark_charged_fills,
@@ -2741,6 +2762,11 @@ impl Metrics {
         }
     }
 
+    /// s114: count one rejected PlaceOrder under `reason`.
+    pub fn order_rejected(&self, reason: OrderRejectReason) {
+        self.orders_rejected_reason[reason as usize].inc();
+    }
+
     /// Encode all registered metrics in OpenMetrics text format.
     pub fn encode(&self) -> String {
         let mut buf = String::new();
@@ -2880,6 +2906,92 @@ pub const EXEC_SPAWN_SITES: [&str; 9] = [
     "load_books",
 ];
 
+/// s114 (archy section 53c.4): why a PlaceOrder was rejected, the `reason`
+/// label of `torus_orders_rejected_reason_total`. A fixed set: the
+/// executor's `FailureReason`s of an order, with its pre-book account margin
+/// check split in two:
+/// - `MarginPosition`: the order fails the check even with the sender's
+///   open-order reservations (and, in the batch's Phase 2, the margin its
+///   earlier orders of the same batch committed) released — positions,
+///   losses or cash are what is missing;
+/// - `MarginReservation`: it would pass with them released.
+///
+/// `MarginMatch` is the book's match-time cut before a first fill (HL
+/// `perpMarginRejected` at matching). The discriminant indexes
+/// [`Metrics::orders_rejected_reason`]: append only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum OrderRejectReason {
+    MarginPosition,
+    MarginReservation,
+    MarginMatch,
+    OpenLimit,
+    Tick,
+    Lot,
+    Price,
+    PriceBand,
+    ReduceOnly,
+    IocCancel,
+    BadAloPx,
+    MarketNoLiquidity,
+    FokCancel,
+    BadTriggerPx,
+    Fill,
+    Other,
+    /// s114 cloid: the order's cloid is live for its trader (any market).
+    DuplicateCloid,
+}
+
+impl OrderRejectReason {
+    /// Number of reasons (labels).
+    pub const COUNT: usize = 17;
+
+    /// Every reason in discriminant order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::MarginPosition,
+        Self::MarginReservation,
+        Self::MarginMatch,
+        Self::OpenLimit,
+        Self::Tick,
+        Self::Lot,
+        Self::Price,
+        Self::PriceBand,
+        Self::ReduceOnly,
+        Self::IocCancel,
+        Self::BadAloPx,
+        Self::MarketNoLiquidity,
+        Self::FokCancel,
+        Self::BadTriggerPx,
+        Self::Fill,
+        Self::Other,
+        Self::DuplicateCloid,
+    ];
+
+    /// The label value (the `FailureReason` names of torus-state where one
+    /// exists).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MarginPosition => "margin_position",
+            Self::MarginReservation => "margin_reservation",
+            Self::MarginMatch => "margin_match",
+            Self::OpenLimit => "open_limit",
+            Self::Tick => "tick",
+            Self::Lot => "lot",
+            Self::Price => "price",
+            Self::PriceBand => "price_band",
+            Self::ReduceOnly => "reduce_only",
+            Self::IocCancel => "ioc_cancel",
+            Self::BadAloPx => "bad_alo_px",
+            Self::MarketNoLiquidity => "market_no_liquidity",
+            Self::FokCancel => "fok_cancel",
+            Self::BadTriggerPx => "bad_trigger_px",
+            Self::Fill => "fill",
+            Self::Other => "other",
+            Self::DuplicateCloid => "duplicate_cloid",
+        }
+    }
+}
+
 /// s92: the tick buckets of [`Metrics::sell_margin_cuts`] (name suffixes).
 pub const MARGIN_CUT_TICK_BUCKETS: [&str; 6] = ["t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p"];
 
@@ -2933,6 +3045,38 @@ mod tests {
                 "{stage} series must exist at 0:\n{text}"
             );
         }
+    }
+
+    /// s114: every reject-reason series exists at 0 from start-up under
+    /// `torus_orders_rejected_reason_total{reason="..."}`, the discriminants
+    /// index `ALL` in order, and `order_rejected` moves only its own label.
+    #[test]
+    fn order_reject_reason_series_are_exported_per_label() {
+        for (i, r) in OrderRejectReason::ALL.iter().enumerate() {
+            assert_eq!(*r as usize, i, "{r:?}");
+        }
+        let m = Metrics::new();
+        m.order_rejected(OrderRejectReason::MarginReservation);
+        m.order_rejected(OrderRejectReason::MarginReservation);
+        m.order_rejected(OrderRejectReason::IocCancel);
+        let text = m.encode();
+        for r in OrderRejectReason::ALL {
+            let want = match r {
+                OrderRejectReason::MarginReservation => 2,
+                OrderRejectReason::IocCancel => 1,
+                _ => 0,
+            };
+            let line = format!(
+                "torus_orders_rejected_reason_total{{reason=\"{}\"}} {want}\n",
+                r.as_str()
+            );
+            assert!(text.contains(&line), "{line}:\n{text}");
+            assert_eq!(m.orders_rejected_reason[r as usize].get(), want, "{r:?}");
+        }
+        assert!(
+            text.contains("torus_orders_rejected_margin_total 0\n"),
+            "the funnel counter stays"
+        );
     }
 
     /// s92 (B-blind observability): every sell-cut series exists from
