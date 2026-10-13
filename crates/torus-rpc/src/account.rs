@@ -22,6 +22,12 @@
 //! No executor structure is touched (torus-bridge is a dev-dependency of
 //! this crate only): no resident book, sums cache, block mark table or exec
 //! pipeline lock, only RocksDB point reads and one prefix scan.
+//!
+//! R24: the prefix scan (one row per position) and the two point reads per
+//! market held (market row, oracle aggregate) are charged to a scan budget
+//! ([`AccountRows::read_bounded`]); getBalances ([`account_figures_bounded`])
+//! and getPosition's cross price ([`cross_liquidation_price_bounded`])
+//! charge their request's budget.
 
 use std::collections::BTreeMap;
 
@@ -34,6 +40,9 @@ use torus_core::position::{MarginType, NativeBalance, Position, PositionManager}
 use torus_state::cf::CF_NATIVE_MARKETS;
 use torus_state::StateDb;
 use torus_types::{FixedPoint, MarketId};
+
+use crate::error::RpcError;
+use crate::scan::{self, ScanBudget};
 
 /// The `torus_getBalances` margin figures of one account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,22 +80,43 @@ struct AccountRows {
     markets: BTreeMap<MarketId, Market>,
 }
 
+/// A `CoreError` as the handlers report it.
+fn internal(e: CoreError) -> RpcError {
+    RpcError::Internal(e.to_string())
+}
+
 impl AccountRows {
-    fn read(state: &StateDb, trader: &Address, now: Option<u64>) -> Result<Self, CoreError> {
+    /// The rows, charged to `b` (R24): each position row before it is
+    /// decoded, and per market held its market row and (with a block time)
+    /// its oracle aggregate. A read or decode failure is `Internal` with the
+    /// `CoreError` text.
+    fn read_bounded(
+        state: &StateDb,
+        trader: &Address,
+        now: Option<u64>,
+        b: &mut ScanBudget,
+    ) -> Result<Self, RpcError> {
         let pm = PositionManager::new(state.clone());
-        let bal = pm.get_native_balance(trader)?;
-        let positions = pm.positions_for_trader(trader)?;
+        let bal = pm.get_native_balance(trader).map_err(internal)?;
+        let positions = scan::trader_positions(state, trader, b)?;
         let oracle = OracleManager::new(state.clone(), OracleConfig::default());
         let mut markets: BTreeMap<MarketId, Market> = BTreeMap::new();
         for p in &positions {
             if markets.contains_key(&p.market_id) {
                 continue;
             }
-            let row = state.get_cf_raw(CF_NATIVE_MARKETS, &p.market_id.to_be_bytes())?;
+            b.step()?;
+            let row = state
+                .get_cf_raw(CF_NATIVE_MARKETS, &p.market_id.to_be_bytes())
+                .map_err(|e| internal(e.into()))?;
             let mark = match now {
-                Some(t) => oracle
-                    .get_price_opt(p.market_id, t)?
-                    .and_then(|op| op.usable()),
+                Some(t) => {
+                    b.step()?;
+                    oracle
+                        .get_price_opt(p.market_id, t)
+                        .map_err(internal)?
+                        .and_then(|op| op.usable())
+                }
                 None => None,
             };
             markets.insert(
@@ -127,14 +157,31 @@ impl AccountRows {
 }
 
 /// [`AccountFigures`] of `trader` at block time `now` (`None`: no usable
-/// mark, every position valued at entry).
+/// mark, every position valued at entry), without a row limit.
 pub fn account_figures(
     state: &StateDb,
     trader: &Address,
     now: Option<u64>,
-) -> Result<AccountFigures, CoreError> {
+) -> Result<AccountFigures, RpcError> {
+    account_figures_bounded(state, trader, now, &mut ScanBudget::unlimited())
+}
+
+/// [`account_figures`] charged to `b` (R24, [`AccountRows::read_bounded`]).
+/// A read or decode failure is the handler's error (`Internal` with the
+/// `CoreError` text).
+pub(crate) fn account_figures_bounded(
+    state: &StateDb,
+    trader: &Address,
+    now: Option<u64>,
+    b: &mut ScanBudget,
+) -> Result<AccountFigures, RpcError> {
+    let a = AccountRows::read_bounded(state, trader, now, b)?;
+    figures(&a).map_err(internal)
+}
+
+/// The figures from the rows read.
+fn figures(a: &AccountRows) -> Result<AccountFigures, CoreError> {
     let of = |_| CoreError::Overflow("account margin overflows i128".into());
-    let a = AccountRows::read(state, trader, now)?;
     let (bal, positions) = (&a.bal, &a.positions);
     let view = AccountView::build(bal, positions, |m| a.mark(m), |m| a.tiers(m))?;
     let liq_view = AccountView::build(bal, positions, |m| a.liq_mark(m), |m| a.tiers(m))?;
@@ -199,8 +246,20 @@ pub fn cross_liquidation_price(
     trader: &Address,
     market: MarketId,
     now: Option<u64>,
-) -> Result<Option<FixedPoint>, CoreError> {
-    let a = AccountRows::read(state, trader, now)?;
+) -> Result<Option<FixedPoint>, RpcError> {
+    cross_liquidation_price_bounded(state, trader, market, now, &mut ScanBudget::unlimited())
+}
+
+/// [`cross_liquidation_price`] with the account's rows charged to `b`
+/// (R24, [`AccountRows::read_bounded`]); the search itself reads nothing.
+pub(crate) fn cross_liquidation_price_bounded(
+    state: &StateDb,
+    trader: &Address,
+    market: MarketId,
+    now: Option<u64>,
+    b: &mut ScanBudget,
+) -> Result<Option<FixedPoint>, RpcError> {
+    let a = AccountRows::read_bounded(state, trader, now, b)?;
     let Some(pos) = a.positions.iter().find(|p| p.market_id == market) else {
         return Ok(None);
     };

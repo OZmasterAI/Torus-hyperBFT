@@ -11,7 +11,9 @@
 //!   payload strings in the batch; the per-ORDER count is item B's job);
 //! - cheap point reads ([`CHEAP_READS`]) = 2;
 //! - `*unsubscribe` = 1 (cleanup must never be refused for cost);
-//! - every other method (scans, history, eth_call, logs, subscribe) = 20.
+//! - every other method (scans, history, eth_call, logs, subscribe) = 20,
+//!   including `torus_getOpenInterest` / `torus_getUserLimits`, which read up
+//!   to `TORUS_RPC_MAX_SCAN_ROWS` rows (R24; no index serves them yet).
 //!
 //! IPv6 clients are keyed by their /64 (one host gets a whole /64), IPv4 by
 //! address. Memory is bounded to [`DEFAULT_MAX_IPS`] buckets
@@ -57,10 +59,8 @@ pub const CHEAP_READS: &[&str] = &[
     "web3_sha3",
     "torus_getBalances",
     "torus_getPosition",
-    "torus_getUserLimits",
     "torus_getLiquidatorVault",
     "torus_getMarkPrice",
-    "torus_getOpenInterest",
     "torus_getLeader",
     "torus_getEpoch",
     "torus_getStateHash",

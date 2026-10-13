@@ -171,32 +171,55 @@ fn key_shape(key: &[u8]) -> Option<KeyShape> {
 ///    read back identically, so `OrderRows` is returned.
 pub fn detect_layout<S: StateBackend>(state: &S) -> Result<BookLayout, CoreError> {
     if let Some(bytes) = state.get_cf_raw(CF_NATIVE_MARKETS, BOOK_MODE_MARKER_KEY)? {
-        // R02: a marker that is not one byte is a corrupt row (local); one
-        // byte that is no known mode is a build / layout mismatch.
-        let err = if bytes.len() == 1 { layout_err } else { corrupt_err };
-        return match (bytes.len() == 1)
-            .then(|| BookLayout::from_marker_byte(bytes[0]))
-            .flatten()
-        {
-            Some(layout) => Ok(layout),
-            None => Err(err(format!(
-                "__book_mode__ marker row is not a known mode discriminant ({bytes:02x?}) \
-                 — refusing to guess the on-disk book layout"
-            ))),
-        };
+        return layout_from_marker(&bytes);
     }
 
     // Pre-marker DB (or a DB that has never saved a book): sniff.
-    let mut saw_classic = false;
-    let mut saw_order_row = false;
-    let mut saw_level_row = false;
-    let mut saw_meta = false;
+    let mut sniff = LayoutSniff::default();
     for (key, _) in iterate_optional_cf(state, CF_NATIVE_ORDER_BOOKS, None)? {
-        match key_shape(&key) {
-            Some(KeyShape::ClassicBlob) => saw_classic = true,
-            Some(KeyShape::OrderRow) => saw_order_row = true,
-            Some(KeyShape::LevelRow) => saw_level_row = true,
-            Some(KeyShape::Meta) => saw_meta = true,
+        sniff.observe(&key)?;
+    }
+    let store_nonempty = !iterate_optional_cf(state, CF_BOOK_ORDER_ROWS, None)?.is_empty();
+    sniff.finish(store_nonempty)
+}
+
+/// The layout a `__book_mode__` marker value names ([`detect_layout`] step 1).
+pub fn layout_from_marker(bytes: &[u8]) -> Result<BookLayout, CoreError> {
+    // R02: a marker that is not one byte is a corrupt row (local); one
+    // byte that is no known mode is a build / layout mismatch.
+    let err = if bytes.len() == 1 { layout_err } else { corrupt_err };
+    match (bytes.len() == 1)
+        .then(|| BookLayout::from_marker_byte(bytes[0]))
+        .flatten()
+    {
+        Some(layout) => Ok(layout),
+        None => Err(err(format!(
+            "__book_mode__ marker row is not a known mode discriminant ({bytes:02x?}) \
+             — refusing to guess the on-disk book layout"
+        ))),
+    }
+}
+
+/// [`detect_layout`]'s pre-marker sniff, one `cf_native_order_books` key at a
+/// time, so a caller can stream (and meter) the keys instead of loading the
+/// CF: [`LayoutSniff::observe`] every key in order, then
+/// [`LayoutSniff::finish`] with whether `cf_book_order_rows` holds any row.
+#[derive(Debug, Default)]
+pub struct LayoutSniff {
+    saw_classic: bool,
+    saw_order_row: bool,
+    saw_level_row: bool,
+    saw_meta: bool,
+}
+
+impl LayoutSniff {
+    /// One key of `cf_native_order_books`. A key shape of no layout is an error.
+    pub fn observe(&mut self, key: &[u8]) -> Result<(), CoreError> {
+        match key_shape(key) {
+            Some(KeyShape::ClassicBlob) => self.saw_classic = true,
+            Some(KeyShape::OrderRow) => self.saw_order_row = true,
+            Some(KeyShape::LevelRow) => self.saw_level_row = true,
+            Some(KeyShape::Meta) => self.saw_meta = true,
             Some(KeyShape::StopRow) => {}
             None => {
                 return Err(layout_err(format!(
@@ -206,55 +229,64 @@ pub fn detect_layout<S: StateBackend>(state: &S) -> Result<BookLayout, CoreError
                 )))
             }
         }
+        Ok(())
     }
 
-    let store_nonempty = !iterate_optional_cf(state, CF_BOOK_ORDER_ROWS, None)?.is_empty();
-
-    if saw_classic && (saw_order_row || saw_level_row || saw_meta) {
-        return Err(layout_err(
-            "cf_native_order_books mixes classic whole-book blobs with row-layout keys \
-             — the book CF is corrupt (a layout change needs a fresh genesis)",
-        ));
-    }
-    if saw_order_row && saw_level_row {
-        return Err(layout_err(
-            "cf_native_order_books mixes per-order rows (mode 1) with level rows (mode 2) \
-             — the book CF is corrupt (a layout change needs a fresh genesis)",
-        ));
-    }
-    if saw_classic {
-        return Ok(BookLayout::Classic);
-    }
-    if saw_level_row {
-        return Ok(BookLayout::LevelAuthority);
-    }
-    if saw_order_row {
-        return Ok(BookLayout::OrderRows);
-    }
-    if store_nonempty {
-        if saw_meta {
-            // Meta rows + a populated node-local store = mode 2 with every
-            // level currently... impossible (orders imply levels), so this is
-            // a stale/half-written CF.
-            return Err(corrupt_err(
-                "cf_book_order_rows holds order rows but cf_native_order_books has no \
-                 level rows — split-brain between the node-local order store and the \
-                 consensus root (corrupt DB)",
+    /// The layout the observed keys belong to. `store_nonempty`: the
+    /// node-local `cf_book_order_rows` holds at least one row.
+    pub fn finish(self, store_nonempty: bool) -> Result<BookLayout, CoreError> {
+        let Self {
+            saw_classic,
+            saw_order_row,
+            saw_level_row,
+            saw_meta,
+        } = self;
+        if saw_classic && (saw_order_row || saw_level_row || saw_meta) {
+            return Err(layout_err(
+                "cf_native_order_books mixes classic whole-book blobs with row-layout keys \
+                 — the book CF is corrupt (a layout change needs a fresh genesis)",
             ));
         }
-        return Err(corrupt_err(
-            "cf_book_order_rows is non-empty but cf_native_order_books has no book rows \
-             at all — split-brain between the node-local order store and the consensus \
-             root (corrupt DB)",
-        ));
+        if saw_order_row && saw_level_row {
+            return Err(layout_err(
+                "cf_native_order_books mixes per-order rows (mode 1) with level rows (mode 2) \
+                 — the book CF is corrupt (a layout change needs a fresh genesis)",
+            ));
+        }
+        if saw_classic {
+            return Ok(BookLayout::Classic);
+        }
+        if saw_level_row {
+            return Ok(BookLayout::LevelAuthority);
+        }
+        if saw_order_row {
+            return Ok(BookLayout::OrderRows);
+        }
+        if store_nonempty {
+            if saw_meta {
+                // Meta rows + a populated node-local store = mode 2 with every
+                // level currently... impossible (orders imply levels), so this is
+                // a stale/half-written CF.
+                return Err(corrupt_err(
+                    "cf_book_order_rows holds order rows but cf_native_order_books has no \
+                     level rows — split-brain between the node-local order store and the \
+                     consensus root (corrupt DB)",
+                ));
+            }
+            return Err(corrupt_err(
+                "cf_book_order_rows is non-empty but cf_native_order_books has no book rows \
+                 at all — split-brain between the node-local order store and the consensus \
+                 root (corrupt DB)",
+            ));
+        }
+        // Only meta/stop rows, or nothing at all: both row layouts (and, for an
+        // empty CF, the classic layout) read back identically here.
+        Ok(if saw_meta {
+            BookLayout::OrderRows
+        } else {
+            BookLayout::Classic
+        })
     }
-    // Only meta/stop rows, or nothing at all: both row layouts (and, for an
-    // empty CF, the classic layout) read back identically here.
-    Ok(if saw_meta {
-        BookLayout::OrderRows
-    } else {
-        BookLayout::Classic
-    })
 }
 
 /// All `cf_native_order_books` rows for one market (prefix scan on the 8-byte
@@ -284,14 +316,47 @@ fn read_meta<S: StateBackend>(
     market_id: MarketId,
     rows: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<Option<BookMetaRow>, CoreError> {
-    let mut meta = None;
-    let mut has_other_rows = false;
+    let mut check = MarketRowsCheck::new(market_id);
     for (key, value) in rows {
+        check.observe(key, value)?;
+    }
+    let _ = state;
+    check.finish()
+}
+
+/// [`read_meta`] one row at a time, so a caller can stream (and meter) a
+/// market's rows instead of loading them: [`MarketRowsCheck::observe`] every
+/// `cf_native_order_books` row under the 8-byte market prefix, in key order,
+/// then [`MarketRowsCheck::finish`] for the meta row (`None` = no book).
+/// Same checks and errors as the readers of this module: a key of no known
+/// shape or a classic blob under a row layout, a meta row that does not
+/// decode, rows without a meta row.
+#[derive(Debug)]
+pub struct MarketRowsCheck {
+    market_id: MarketId,
+    meta: Option<BookMetaRow>,
+    has_other_rows: bool,
+}
+
+impl MarketRowsCheck {
+    /// A check of market `market_id`'s rows.
+    pub fn new(market_id: MarketId) -> Self {
+        Self {
+            market_id,
+            meta: None,
+            has_other_rows: false,
+        }
+    }
+
+    /// One row of the market.
+    pub fn observe(&mut self, key: &[u8], value: &[u8]) -> Result<(), CoreError> {
+        let market_id = self.market_id;
         match key_shape(key) {
             Some(KeyShape::Meta) => {
-                meta = Some(BookMetaRow::decode(value).map_err(|e| {
-                    corrupt_err(format!("market {market_id}: {e}"))
-                })?);
+                self.meta = Some(
+                    BookMetaRow::decode(value)
+                        .map_err(|e| corrupt_err(format!("market {market_id}: {e}")))?,
+                );
             }
             Some(KeyShape::ClassicBlob) => {
                 return Err(layout_err(format!(
@@ -300,7 +365,7 @@ fn read_meta<S: StateBackend>(
                      needs a fresh genesis)"
                 )))
             }
-            Some(_) => has_other_rows = true,
+            Some(_) => self.has_other_rows = true,
             None => {
                 return Err(layout_err(format!(
                     "market {market_id}: unrecognized cf_native_order_books key (len {})",
@@ -308,15 +373,20 @@ fn read_meta<S: StateBackend>(
                 )))
             }
         }
+        Ok(())
     }
-    if meta.is_none() && has_other_rows {
-        return Err(corrupt_err(format!(
-            "market {market_id} has order/stop/level rows but no meta row (corrupt row \
-             store) — refusing to serve a partial book"
-        )));
+
+    /// The market's meta row once every row was observed (`None` = no book).
+    pub fn finish(self) -> Result<Option<BookMetaRow>, CoreError> {
+        if self.meta.is_none() && self.has_other_rows {
+            return Err(corrupt_err(format!(
+                "market {} has order/stop/level rows but no meta row (corrupt row \
+                 store) — refusing to serve a partial book",
+                self.market_id
+            )));
+        }
+        Ok(self.meta)
     }
-    let _ = state;
-    Ok(meta)
 }
 
 /// Aggregated depth for one market under `layout`.
