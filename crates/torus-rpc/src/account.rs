@@ -181,11 +181,19 @@ pub fn account_figures(
 /// - short: the HIGHEST mark still healthy; one raw unit above, it
 ///   liquidates.
 ///
+/// A mark whose valuation overflows i128 is indeterminate (the step skips
+/// the account there): neither side. Every term is monotone in the mark, so
+/// the marks the step can value form one interval; the search moves only
+/// through valued marks and returns a price only when the two adjacent raw
+/// marks around it are both valued, one `Healthy`, one liquidatable.
+///
 /// `None` when no mark of `market` crosses maintenance: no Cross position
 /// there; the market is not listed (the step never marks it); the account
 /// holds a non-Cross position (the step does not value such an account); a
 /// long healthy even at mark 0; a short liquidatable even at mark 0 (it is
-/// liquidatable at every mark); or no crossing below the i128 range.
+/// liquidatable at every mark); no crossing in `[0, i128::MAX]`; or the
+/// crossing cannot be bracketed by valued marks (mark 0 overflows, or every
+/// mark the step can value is on one side and the other side overflows).
 pub fn cross_liquidation_price(
     state: &StateDb,
     trader: &Address,
@@ -204,8 +212,8 @@ pub fn cross_liquidation_price(
     {
         return Ok(None);
     }
-    // As the step decides: liquidatable iff valued (no overflow) and not
-    // Healthy. An overflow is skipped by the step, so it is not liquidatable.
+    // As the step decides: `Some(liquidatable)` when valued, `None` on an
+    // overflow (the step skips the account: indeterminate, neither side).
     let liquidatable = |raw: i128| {
         let px = FixedPoint::from_raw(raw);
         AccountView::build(
@@ -216,32 +224,41 @@ pub fn cross_liquidation_price(
         )
         .ok()
         .and_then(|v| classify(&v))
-        .is_some_and(|h| h != Health::Healthy)
+        .map(|h| h != Health::Healthy)
     };
     // Long: liquidatable below the boundary; short: above it. Mark 0 must be
-    // on the liquidatable side for a long and on the healthy side for a short.
+    // valued, on the liquidatable side for a long and the healthy side for a
+    // short.
     let long = pos.is_long;
-    let at_zero = liquidatable(0);
-    if at_zero != long {
+    let low_side = Some(long);
+    if liquidatable(0) != low_side {
         return Ok(None);
     }
-    // A far end on the other side: double from the entry price.
+    // `lo` is valued and on the low side; `hi` is the first candidate not
+    // known to be: doubling from the entry price, the last step clamped to
+    // i128::MAX.
     let (mut lo, mut hi) = (0i128, pos.entry_price.raw().max(1));
-    while liquidatable(hi) == at_zero {
+    while liquidatable(hi) == low_side {
+        if hi == i128::MAX {
+            return Ok(None);
+        }
         lo = hi;
-        hi = match hi.checked_mul(2) {
-            Some(h) => h,
-            None => return Ok(None),
-        };
+        hi = hi.checked_mul(2).unwrap_or(i128::MAX);
     }
-    // liquidatable(lo) == at_zero != liquidatable(hi).
+    // `hi` is on the other side or overflows. Valued marks form an interval
+    // containing `lo`, so a mark that overflows lies above every valued one:
+    // move `hi` down to it as to a mark on the other side.
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if liquidatable(mid) == at_zero {
+        if liquidatable(mid) == low_side {
             lo = mid;
         } else {
             hi = mid;
         }
+    }
+    // Both endpoints valued and on opposite sides, else no bracket.
+    if liquidatable(lo) != low_side || liquidatable(hi) != Some(!long) {
+        return Ok(None);
     }
     // Long: `hi` is the lowest healthy mark; short: `lo` the highest.
     Ok(Some(FixedPoint::from_raw(if long { hi } else { lo })))

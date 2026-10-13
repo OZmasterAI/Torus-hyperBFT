@@ -69,7 +69,14 @@ positions, each position's price assumes only its own market moves.
   price cannot trigger liquidation);
 - the account also holds an isolated position (the liquidation step does
   not value such an account);
-- no crossing inside the i128 price range.
+- no crossing inside the i128 price range `[0, i128::MAX]` raw;
+- the crossing cannot be bracketed by marks the engine can value: a mark
+  whose valuation overflows i128 is skipped by the liquidation step, so it
+  counts as neither healthy nor liquidatable. `null` when mark 0 overflows,
+  or when every mark the engine can value is on one side (e.g. liquidatable)
+  and the marks beyond overflow. A returned price is always a mark the
+  engine values as healthy next to one (1e-8 away) it values as
+  liquidatable.
 
 `null` never means "no risk" by itself when other positions exist: a shock
 in another market can still liquidate the account. Read
