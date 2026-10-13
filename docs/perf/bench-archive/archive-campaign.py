@@ -1679,11 +1679,12 @@ def main(argv=None):
             except OSError as e:
                 raise Fatal("tools source %s: %s (nothing written)" % (src, e.strerror or e)) from e
             # text only (no NUL byte); e.g. perf report column headers padded with ~1 KB of blanks
-            if b"\0" not in data and has_trailing(data):
+            # every listed text file is a normalized smoke want, clean already or not
+            if b"\0" not in data:
                 if any(fnmatch.fnmatch(dst, g_) for g_ in strip_globs):
                     data = strip_trailing(data)
                     stripped.add(os.path.normpath(dst))
-                else:
+                elif has_trailing(data):
                     blanks.append(dst)
             files.append((os.path.join(tools_dir, dst), label, data, mode))
         if blanks:
