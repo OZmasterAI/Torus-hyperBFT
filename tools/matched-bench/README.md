@@ -595,3 +595,78 @@ from `bench/inflight-commit-tail` or later; an older bench rejects the flag.
 Self-tests: `test_harness.py` (`test_in_flight_tail_*`,
 `test_commit_tail_cell_records_the_tail_mode`); bench crate
 `in_flight::tests` (`commit_tail_*`, `body_probe_*`, `tail_mode_*`).
+
+## New campaign from the template (per-cell write-up step, rerun queue)
+
+`campaign-template.sh` is the ozarchy-p3gate driver (`docs/perf/bench-archive/tools/`)
+with two additions: a write-up step after every cell and a rerun queue at the end.
+Start a new campaign from it:
+
+1. Copy the harness tools (they include `cell-step.sh` and `cell_step.py`) and the
+   template, and copy the campaign's analyst scripts (at least `a-cells.py`) into
+   the tools dir before the launch:
+   ```
+   T=$R/ozarchy-<camp>-tools; mkdir -p "$T/analyst"
+   cp -r <harness-wt>/tools/matched-bench "$T/"
+   cp <harness-wt>/tools/matched-bench/campaign-template.sh "$T/ozarchy-<camp>-campaign.sh"
+   cp <previous analyst>/a-cells.py "$T/analyst/"
+   ```
+2. Edit only the blocks between `# >>> CAMPAIGN-SPECIFIC` and `# <<< CAMPAIGN-SPECIFIC`:
+   config (paths, shas, knob, arms, `CELLS`, `RUN`, `P`, `ANALYST`,
+   `CELL_STEP_ANALYSIS_CMD`), per-cell samplers / harness env, per-cell hard
+   checks, preflight. `DRY_RUN=1` runs the preflight only.
+3. Launch it detached with its log at `$RUN/campaign.log` (the step appends its
+   `CELL-FLAG` lines there):
+   ```
+   tools/matched-bench/campaign/detach.sh ozarchy-<camp> $RUN/campaign.log "$T/ozarchy-<camp>-campaign.sh" 4
+   ```
+
+**The step.** `run_spec` runs one cell, then `cell_step` (from `cell-step.sh`)
+in the foreground; the next cell starts only after it returns. It appends one row
+to `$RUN/cells.tsv` (header once; tab-separated
+`label arm rep rc agree md5_ok metric flag`):
+
+- `agree`: `yes` iff `validity.verdict` is ACCEPT and the agreement verdict is AGREE (raw result).
+- `md5_ok`: `summary.json` `binaries.torus_node_md5` and every running process's
+  `exe_md5` (`node-environ-trie.txt`, `node-restart-env.txt`) equal the arm's staged md5.
+- `metric`: matched/s from the analysis row (`a-cells.py` `ms`), else
+  `summary.json` `headline.matched_s_avg`, else 0.
+- `flag`: `ok` or `bad:<reasons>`. Reasons are comma-joined, in this order:
+  `md5`, `no-summary`, `death`, `rc-missing`/`rc=<n>`, `disagree`/`agreement-<v>`,
+  `verdict-<v>`, `analysis`/`analysis-timeout`, `step-timeout`.
+
+Known artifacts stay `ok` (with `agree=no`). The first is rc 2 from the crash
+gate counting the restarted node's INFO line `running state hash fail-stop ...
+on=false`; every panic-pattern line in `crash-restart-tail*.log` must be that
+line. The second is the mark-only digest: the differing node's digest lines differ
+only in the 5 mark fields, and block hash, header root and survivor counters are
+equal. A restart cell's `liveness unverified` is also excused. The step records
+the evidence in `$RUN/cell-step/<label>.json`.
+
+**Analysis check.** `CELL_STEP_ANALYSIS_CMD` (placeholders `{out} {prefix} {tag}
+{arm} {label} {cell} {run}`) must exit 0 within `CELL_STEP_ANALYSIS_TIMEOUT`
+(600 s) and write the cell's row (key `{tag}`) to `{out}`. When it does not, the
+cell is flagged `bad:analysis` (or `bad:analysis-timeout`, after the analysis
+process group is killed) and gets a rerun. The output goes to
+`$RUN/cell-step/<label>.analysis.log`. If the script itself is broken, every cell
+is flagged: fix the script, and empty `rerun-queue.tsv` before the main loop ends
+if those reruns are not wanted.
+
+**Timeout.** `CELL_STEP_TIMEOUT` (900 s) bounds the whole step. On expiry
+`timeout` sends TERM, and KILL 15 s later. `cell_step.py` kills its analysis
+child and exits 124. `cell_step` then writes `agree=no md5_ok=no` (unknown),
+the metric from `summary.json` (or 0), the flag `bad:step-timeout`, the
+CELL-FLAG line and the rerun entry, and returns 124. The campaign continues.
+
+**Bad cells and reruns.** A bad cell's row stays as written. The step adds
+`CELL-FLAG <label> <reasons>` to `campaign.log` and queues `<label>-rerun` in
+`$RUN/rerun-queue.tsv` (`rerun_label label arm rep spec`). After the main loop,
+`cell_step_rerun_pass` runs each pending rerun once: the same spec with tag
+`<tag>-rerun`, the same rep, and its own row. A bad rerun is flagged and is not
+requeued. A label that already has a row is refused: exit 3, a
+`CELL-STEP DUPLICATE` line, and nothing written. When `cell()` returns 1 (ABORT,
+CHECK FAIL, STOP), a started cell still gets its row; then the campaign stops,
+and the queued reruns stay in the queue unrun.
+
+Self-test: `python3 tools/matched-bench/test_cell_step.py` (fixtures: trimmed
+copies of three real p3gate cells in `testdata/cell-step/`).

@@ -1,0 +1,165 @@
+{
+ "status": "INVALID",
+ "label": "ozarchy-p3gate-300m-t1-s2-TERM",
+ "binaries": {
+  "torus_node_md5": "4e0d8b84f54f53d5b6db2d5e696cd51c",
+  "bench_throughput_md5": "ae96e0c13f568213822754da8074ed80"
+ },
+ "agreement": {
+  "nodes": [
+   {
+    "node": "val0",
+    "height": 1838,
+    "cmp_height": 1832,
+    "block_hash": "0xc9cbd60df7ccafd2e965782602256ebaceb8169cd8be1b89c0f770adbf82e785",
+    "header_state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "state_digest": "95692cb2c3900c44e3540f13622eb03e2ac9270cfe36137cf2cadb5469ed3c10",
+    "digest_height": 1866,
+    "digest_seconds": 86.4,
+    "matched": 66988832,
+    "placed": 87439079,
+    "resting": 52996475,
+    "actions": 351447,
+    "resident_rebuilds": 1,
+    "panic_or_failstop_lines": 0,
+    "error_lines": 0
+   },
+   {
+    "node": "val1",
+    "height": 1837,
+    "cmp_height": 1832,
+    "block_hash": "0xc9cbd60df7ccafd2e965782602256ebaceb8169cd8be1b89c0f770adbf82e785",
+    "header_state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "state_digest": "95692cb2c3900c44e3540f13622eb03e2ac9270cfe36137cf2cadb5469ed3c10",
+    "digest_height": 1866,
+    "digest_seconds": 62.6,
+    "matched": 22383948,
+    "placed": 29230922,
+    "resting": 17727460,
+    "actions": 122836,
+    "resident_rebuilds": 1,
+    "panic_or_failstop_lines": 0,
+    "error_lines": 0
+   },
+   {
+    "node": "val2",
+    "height": 1838,
+    "cmp_height": 1832,
+    "block_hash": "0xc9cbd60df7ccafd2e965782602256ebaceb8169cd8be1b89c0f770adbf82e785",
+    "header_state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "state_digest": "95692cb2c3900c44e3540f13622eb03e2ac9270cfe36137cf2cadb5469ed3c10",
+    "digest_height": 1865,
+    "digest_seconds": 84.6,
+    "matched": 66988832,
+    "placed": 87439079,
+    "resting": 52996475,
+    "actions": 351447,
+    "resident_rebuilds": 1,
+    "panic_or_failstop_lines": 0,
+    "error_lines": 0
+   }
+  ],
+  "height_spread": 1,
+  "block_hash_equal": true,
+  "header_state_root_equal": true,
+  "state_digest_equal": true,
+  "counters_equal_all_nodes": false,
+  "counters_excluded_node": "val1",
+  "counters_compared_nodes": [
+   "val0",
+   "val2"
+  ],
+  "counters_equal": true,
+  "panic_or_failstop_lines": 0,
+  "error_lines": 0,
+  "resident_rebuilds_per_node": [
+   1,
+   1,
+   1
+  ],
+  "state_digest_quiescent": true,
+  "state_digest_seconds_per_node": [
+   86.4,
+   62.6,
+   84.6
+  ],
+  "state_digest_heights": [
+   1866,
+   1866,
+   1865
+  ],
+  "digest_height_spread": 1,
+  "action_counter_skew_only": false,
+  "agreement_verdict": "AGREE",
+  "validators_agree": true
+ },
+ "validity": {
+  "verdict": "REJECT",
+  "accepted": false,
+  "fail_reasons": [
+   "crash gate failed"
+  ],
+  "unverified_reasons": [
+   "liveness unverified"
+  ]
+ },
+ "headline": {
+  "matched_s_avg": 206651.8,
+  "placed_s_avg": 269821.4,
+  "native_blk_s": 3.683,
+  "agreement_verdict": "AGREE",
+  "crash_gate": "FAIL"
+ },
+ "crash": {
+  "enabled": true,
+  "kill_signal": "TERM",
+  "kill_seq": 1,
+  "exit_ts": 1791905868.1058626,
+  "exit_s": 19.06,
+  "exit_forced": false,
+  "kill_wait_s": 75,
+  "kill_node": "val1",
+  "kill_idx": 1,
+  "killed_pid": 2631496,
+  "restarted_pid": 2652398,
+  "kill_ts": 1791905849.0410678,
+  "restart_ts": 1791905868.113274,
+  "down_s": 19.07,
+  "pre_kill": {
+   "block_height": 1057,
+   "blocks_committed": 1057,
+   "exec_queue_depth": 61,
+   "flush_worker_depth": 0,
+   "matched": 39482325,
+   "log_bytes": 50347318
+  },
+  "restart": {
+   "replay_line_found": false,
+   "gap": 0,
+   "applied_height_at_crash": null,
+   "committed_height_at_crash": null,
+   "pipeline_enabled_line": true,
+   "worker_attached_applied": 1119,
+   "panic_or_failstop_lines": 1,
+   "hole_lines": 0,
+   "error_lines": 0
+  },
+  "kill_at_s": 180,
+  "rewind_blocks": 0,
+  "exec_queue_depth_at_kill": 61,
+  "rewind_beyond_exec_queue": -61,
+  "max_rewind_beyond_exec_queue": 2,
+  "pipeline_flag_expected": false,
+  "pipeline_flag_confirmed": null,
+  "counters_excluded_node": "val1",
+  "counters_compared_nodes": [
+   "val0",
+   "val2"
+  ],
+  "fail_reasons": [
+   "panic/fail-stop after the restart"
+  ],
+  "verdict": "FAIL"
+ },
+ "_fixture_note": "trimmed copy of the real p3gate cell summary.json (keys the cell step reads; values verbatim)"
+}
