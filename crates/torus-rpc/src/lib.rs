@@ -1623,7 +1623,7 @@ mod tests {
                     order_type: torus_types::OrderType::Limit,
                     time_in_force: torus_types::TimeInForce::GTC,
                     reduce_only: false,
-                    client_order_id: Some(i as u64),
+                    client_order_id: Some(i as u128),
                 })
                 .collect();
             let signed = torus_types::eip712::sign_native_action(
@@ -1754,7 +1754,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let order = |i: usize, coid: Option<u64>| torus_types::PlaceOrderParams {
+        let order = |i: usize, coid: Option<u128>| torus_types::PlaceOrderParams {
             market_id: 1,
             is_buy: i % 2 == 0,
             price: torus_types::FixedPoint::from_raw(1_000_000_000 + i as i128),
@@ -1769,7 +1769,7 @@ mod tests {
             // Option::None exercises the human-readable/binary serde split.
             torus_types::NativeAction::PlaceOrder(order(0, None)),
             torus_types::NativeAction::PlaceOrderBatch(
-                (0..500).map(|i| order(i, Some(i as u64))).collect(),
+                (0..500).map(|i| order(i, Some(i as u128))).collect(),
             ),
             torus_types::NativeAction::CancelOrder { order_id: 7 },
             torus_types::NativeAction::ModifyOrder {
@@ -3478,7 +3478,7 @@ mod tests {
                 order_type: torus_types::OrderType::Limit,
                 time_in_force: torus_types::TimeInForce::GTC,
                 reduce_only: false,
-                client_order_id: Some(i as u64),
+                client_order_id: Some(i as u128),
             })
             .collect();
         let signed = torus_types::eip712::sign_native_action(
@@ -3721,6 +3721,8 @@ mod tests {
             outcome,
             reason,
             message: message.to_string(),
+            oid: None,
+            cloid: None,
         };
         let results = vec![
             cw(
@@ -3755,8 +3757,40 @@ mod tests {
                 FailureReason::Margin,
                 "short",
             ),
+            // s114: an executed placement carries its order id.
+            CoreWriterResult {
+                oid: Some(0x1_0000_0000_0000_002a),
+                // s114: and the cloid it was placed with.
+                cloid: Some(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
+                ..cw(
+                    4,
+                    CoreWriterKind::PlaceOrder,
+                    10,
+                    Outcome::Executed,
+                    FailureReason::Other,
+                    "",
+                )
+            },
         ];
         store_applied_height(&state, 4);
+        // s114: rows 0 and 2 were queued by EVM txs this node linked (row 0
+        // by tx 0xA1.., row 2 as the second call of tx 0xA2..); rows 1
+        // (undecodable) and 3 have no link.
+        for height in [1u64, 3] {
+            for (seq, byte, call_index) in [(0u64, 0xA1u8, 0u32), (2, 0xA2, 1)] {
+                state
+                    .put_cf_raw(
+                        torus_state::cf::CF_CORE_WRITER_TX,
+                        &torus_state::corewriter_tx::key(height, seq),
+                        &torus_state::corewriter_tx::CoreWriterTxLink {
+                            tx_hash: B256::repeat_byte(byte),
+                            call_index,
+                        }
+                        .encode(),
+                    )
+                    .unwrap();
+            }
+        }
         for (height, native_skipped) in [(1u64, vec![false]), (3, vec![])] {
             state
                 .put_cf_raw(
@@ -3797,7 +3831,9 @@ mod tests {
                 "trader": format!("{:#x}", Address::repeat_byte(7)),
                 "queuedBlock": "0x2",
                 "status": "executed",
-                "message": ""
+                "message": "",
+                "txHash": format!("{:#x}", B256::repeat_byte(0xA1)),
+                "callIndex": 0
             },
             {
                 "seq": 1,
@@ -3806,7 +3842,9 @@ mod tests {
                 "queuedBlock": null,
                 "status": "failed",
                 "reason": "other",
-                "message": "undecodable queued action (block 3, seq 1): x"
+                "message": "undecodable queued action (block 3, seq 1): x",
+                "txHash": null,
+                "callIndex": null
             },
             {
                 "seq": 2,
@@ -3816,7 +3854,9 @@ mod tests {
                 "status": "rejected",
                 "reason": "ioc_cancel",
                 "rejectStatus": "iocCancelRejected",
-                "message": "order rejected: IOC order could not immediately match against any resting order"
+                "message": "order rejected: IOC order could not immediately match against any resting order",
+                "txHash": format!("{:#x}", B256::repeat_byte(0xA2)),
+                "callIndex": 1
             },
             {
                 "seq": 3,
@@ -3825,7 +3865,21 @@ mod tests {
                 "queuedBlock": "0x2",
                 "status": "failed",
                 "reason": "margin",
-                "message": "short"
+                "message": "short",
+                "txHash": null,
+                "callIndex": null
+            },
+            {
+                "seq": 4,
+                "kind": "place_order",
+                "trader": format!("{:#x}", Address::repeat_byte(10)),
+                "queuedBlock": "0x2",
+                "status": "executed",
+                "message": "",
+                "oid": "0x1000000000000002a",
+                "cloid": "0x0123456789abcdeffedcba9876543210",
+                "txHash": null,
+                "callIndex": null
             }
         ]);
         let one = get(1).await;
@@ -4948,7 +5002,75 @@ mod tests {
         assert_eq!(pos.entry_price, dec_fp(fp(50000)));
         assert_eq!(pos.realized_pnl, dec_fp(fp(100)));
         assert_eq!(pos.margin_mode, "isolated");
+        // R23: isolated keeps the simplified entry − margin / size estimate.
+        assert_eq!(pos.liquidation_price, Some(dec_fp(fp(49_500))));
         handle.stop().unwrap();
+    }
+
+    /// R23: a cross position's liquidationPrice is the account-wide
+    /// threshold (`account::cross_liquidation_price`, tested against the
+    /// engine there): long 10 @ 1000 with cash 1000 at default 20x ⇒
+    /// 923.07692308. A fully funded long (cash 10000) is never liquidated:
+    /// JSON null.
+    #[tokio::test]
+    async fn torus_get_position_cross_liquidation_price() {
+        for (cash, want) in [
+            (fp(1_000), serde_json::json!("923.07692308")),
+            (fp(10_000), serde_json::Value::Null),
+        ] {
+            let (_dir, state, mempool, executor) = setup();
+            let header = test_header(1, 0, 0);
+            store_header(&state, &header);
+            store_applied_height(&state, 1);
+            state
+                .put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), b"listed")
+                .unwrap();
+            let (trader, other) = (Address::from([0x55; 20]), Address::from([0x66; 20]));
+            let pm = PositionManager::new(state.clone());
+            pm.put_native_balance(
+                &trader,
+                &NativeBalance {
+                    available: cash,
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+            pm.apply_fill(&trader, 1, true, fp(10), fp(1000), MarginType::Cross)
+                .unwrap();
+            pm.apply_fill(&other, 1, false, fp(10), fp(1000), MarginType::Cross)
+                .unwrap();
+            let oracle = torus_core::oracle::OracleManager::new(state.clone(), Default::default());
+            let reporters = [
+                Address::from([0xa1; 20]),
+                Address::from([0xa2; 20]),
+                Address::from([0xa3; 20]),
+            ];
+            for v in &reporters {
+                oracle
+                    .submit_price(v, 1, fp(1010), 1, header.timestamp)
+                    .unwrap();
+            }
+            let stakes: Vec<_> = reporters.iter().map(|v| (*v, fp(1))).collect();
+            oracle
+                .aggregate_price(1, 1, header.timestamp, &stakes)
+                .unwrap();
+
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            use jsonrpsee::core::client::ClientT;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let v: serde_json::Value = client
+                .request(
+                    "torus_getPosition",
+                    jsonrpsee::rpc_params![hex_address(trader), "0x1"],
+                )
+                .await
+                .unwrap();
+            assert_eq!(v["marginMode"], "cross", "{v}");
+            assert_eq!(v["liquidationPrice"], want, "cash {cash}: {v}");
+            handle.stop().unwrap();
+        }
     }
 
     #[tokio::test]

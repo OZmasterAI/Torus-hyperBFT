@@ -79,6 +79,7 @@ fn seed(db: &StateDb) {
         price: fp(100),
         quantity: fp(1),
         time_in_force: 0,
+        cloid: None,
     };
     assert_eq!(enqueue(db, 11, stop, 1), 3);
     assert_eq!(
@@ -199,4 +200,90 @@ fn drain_core_writer_is_the_entries_results() {
         (dir, out)
     };
     assert_eq!(run(true).1, run(false).1);
+}
+
+fn fund(db: &StateDb, trader: u8) {
+    torus_core::position::PositionManager::new(db.clone())
+        .put_native_balance(
+            &addr(trader),
+            &torus_core::position::NativeBalance {
+                available: fp(1_000_000),
+                order_margin: FixedPoint::ZERO,
+            },
+        )
+        .unwrap();
+}
+
+fn cw_order(side: u8, price: i64, time_in_force: u8) -> QueuedActionKind {
+    QueuedActionKind::PlaceOrder {
+        market_id: 1,
+        side,
+        order_type: 0,
+        price: fp(price),
+        quantity: fp(1),
+        time_in_force,
+        cloid: None,
+    }
+}
+
+/// s114 (CoreWriter follow-up 2): an executed CoreWriter placement reports
+/// the order id its order got: a GTC buy that rests (the id of its resting
+/// order), an IOC buy that fills (the id the fill's taker order carries,
+/// the next one). A rejected placement (IOC with nothing to fill) and every
+/// other row report none. A native sell rests first at 100.
+#[test]
+fn drain_entries_report_the_order_id_each_placement_got() {
+    let (_dir, db) = open_test_db();
+    for t in [20, 21, 22] {
+        fund(&db, t);
+    }
+    assert_eq!(enqueue(&db, 21, cw_order(0, 90, 0), 1), 0); // GTC buy 90: rests
+    assert_eq!(enqueue(&db, 22, cw_order(0, 100, 1), 1), 1); // IOC buy 100: fills
+    assert_eq!(enqueue(&db, 22, cw_order(0, 80, 1), 1), 2); // IOC buy 80: rejected
+    assert_eq!(
+        enqueue(&db, 21, QueuedActionKind::CancelAll { market_id: 7 }, 1),
+        3
+    );
+    let mut ctx = ctx(&db);
+    let maker = NativeExecutor::execute(
+        &mut ctx,
+        &addr(20),
+        &torus_types::NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+            market_id: 1,
+            is_buy: false,
+            price: fp(100),
+            quantity: fp(1),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        }),
+    );
+    assert!(maker.success, "{:?}", maker.error);
+    let maker_id = ctx.order_books[&1].orders_for_trader(&addr(20))[0].id;
+
+    let entries = NativeExecutor::drain_core_writer_entries(&mut ctx).expect("queue reads");
+    assert_eq!(ctx.take_fatal_error(), None);
+    let got: Vec<_> = entries
+        .iter()
+        .map(|e| (e.seq, e.result.success, e.oid))
+        .collect();
+    let book = &ctx.order_books[&1];
+    let resting = book.orders_for_trader(&addr(21));
+    assert_eq!(resting.len(), 1, "the GTC buy rests");
+    let rest_id = resting[0].id;
+    assert!(rest_id > maker_id);
+    assert_eq!(
+        got,
+        vec![
+            (0, true, Some(rest_id)),
+            (1, true, Some(rest_id + 1)),
+            (2, false, None),
+            (3, true, None),
+        ]
+    );
+    assert!(
+        book.get_order(maker_id).is_none() && book.get_order(rest_id + 1).is_none(),
+        "the IOC filled against the native sell and rests nowhere"
+    );
 }

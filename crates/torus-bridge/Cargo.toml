@@ -23,6 +23,8 @@ sha2 = "0.10"
 serde_json = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
+# P2-3: the exec worker pool (`exec_pool.rs`). Already in Cargo.lock (torus-types, torus-consensus, torus-rpc, torus-node).
+rayon = "1"
 
 [features]
 # L3 save-books attribution sub-timers (SaveTimings). µbench-only: production

@@ -1,0 +1,14 @@
+== k1-ctl window 602 s valid=REJECT agree=DISAGREE
+  val0 RSS MB @5min 4035 @10min 3830 peak 4258 end 3830 | slope last 5 min -16.5 MB/min [-41.4, +8.3] (r1 0.11, n_eff 45) | whole window +26.6 [-7.5, +60.7]
+  val1 RSS MB @5min 4029 @10min 4154 peak 4287 end 4154 | slope last 5 min +8.0 MB/min [-11.3, +27.3] (r1 0.07, n_eff 49) | whole window +45.8 [+13.7, +77.9]
+  val2 RSS MB @5min 4625 @10min 4958 peak 5245 end 4958 | slope last 5 min +26.2 MB/min [-10.1, +62.6] (r1 0.32, n_eff 29) | whole window +41.7 [+11.8, +71.5]
+  matched/s last 5 min 171574, whole 191756; per minute [202946, 213503, 215734, 209658, 216695, 208363, 155919, 183423, 159951, 153505]; drift -6975 /min [-11190, -2760]
+  node CPU-s per 1M matched, last 5 min: 34.18
+  ingest: {"submit": 1249.0, "in_flight": {"cap": 4, "released_committed": 734004, "released_refused": 8, "released_timeout": 12678, "in_flight_at_end": 5342, "tail_url": "http://127.0.0.1:8647", "tail_fetched": 1936, "tail_errors": 0, "tail_missed": 0, "tail_mode": "commit"}, "evict": [13385, 13385, 13385], "submitted": 752024, "processed": 740451}
+== k1-s2 window 602 s valid=ACCEPT agree=AGREE
+  val0 RSS MB @5min 4958 @10min 4665 peak 5158 end 4665 | slope last 5 min +15.3 MB/min [-20.6, +51.2] (r1 0.29, n_eff 30) | whole window +41.2 [-13.2, +95.7]
+  val1 RSS MB @5min 4744 @10min 4470 peak 5115 end 4470 | slope last 5 min +32.7 MB/min [+2.7, +62.7] (r1 0.18, n_eff 38) | whole window +35.4 [-18.7, +89.6]
+  val2 RSS MB @5min 5868 @10min 5888 peak 6539 end 5888 | slope last 5 min +27.9 MB/min [-5.6, +61.5] (r1 0.13, n_eff 42) | whole window +33.7 [-28.2, +95.6]
+  matched/s last 5 min 169205, whole 199134; per minute [215663, 232245, 228628, 233389, 234556, 189353, 176993, 170091, 153771, 159822]; drift -9448 /min [-16498, -2398]
+  node CPU-s per 1M matched, last 5 min: 33.84
+  ingest: {"submit": 1372.0, "in_flight": {"cap": 4, "released_committed": 810313, "released_refused": 9, "released_timeout": 13349, "in_flight_at_end": 2873, "tail_url": "http://127.0.0.1:8647", "tail_fetched": 2187, "tail_errors": 0, "tail_missed": 0, "tail_mode": "commit"}, "evict": [13645, 13668, 13645], "submitted": 826535, "processed": 814708}

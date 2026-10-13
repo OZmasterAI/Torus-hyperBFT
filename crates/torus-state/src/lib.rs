@@ -6,6 +6,7 @@ pub mod bg_writer;
 pub mod block_body;
 pub mod cf;
 pub mod checkpoint_layer;
+pub mod corewriter_tx;
 pub mod db;
 pub mod erasure;
 pub mod error;

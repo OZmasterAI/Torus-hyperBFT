@@ -219,6 +219,16 @@ pub trait TorusApi {
         market_id: Option<String>,
     ) -> RpcResult<Vec<RpcOpenOrder>>;
 
+    /// s114 (HL `orderStatus` by cloid): `trader`'s open order (resting or
+    /// a pending stop) whose client order id is `cloid` (`0x` + 1-32 hex
+    /// digits), or `null`.
+    #[method(name = "getOrderByCloid")]
+    async fn get_order_by_cloid(
+        &self,
+        trader: String,
+        cloid: String,
+    ) -> RpcResult<Option<RpcOrderByCloid>>;
+
     #[method(name = "getOpenInterest")]
     async fn get_open_interest(&self, market_id: String) -> RpcResult<RpcOpenInterest>;
 
@@ -268,11 +278,13 @@ type PeekFn = fn(&str) -> Option<u32>;
 
 /// `NativeAction` variant count: bincode tags are `0..NATIVE_ACTION_TAGS`
 /// (declaration order; variants are only ever appended).
-const NATIVE_ACTION_TAGS: u32 = 29;
+const NATIVE_ACTION_TAGS: u32 = 30;
 /// bincode tags of the actions that pass the pre-verify shed
 /// (`torus_mempool::is_cancel` / `is_oracle_submission`).
 const TAG_CANCEL_ORDER: u32 = 2;
 const TAG_CANCEL_ALL_ORDERS: u32 = 3;
+/// s114: `CancelByCloid` (appended last).
+const TAG_CANCEL_BY_CLOID: u32 = 29;
 pub(crate) const TAG_SUBMIT_ORACLE_PRICES: u32 = 15;
 
 /// bincode ingress tag peek. `SignedNativeAction.action` is the first field
@@ -312,7 +324,10 @@ fn screen_payload(
     // `malformed_body_with_refused_tag_is_shed_while_shedding`.
     if let Some(tag) = peek_tag.and_then(|peek| peek(signed_action)) {
         let passes = tag == TAG_SUBMIT_ORACLE_PRICES
-            || (cancels_pass && (tag == TAG_CANCEL_ORDER || tag == TAG_CANCEL_ALL_ORDERS));
+            || (cancels_pass
+                && (tag == TAG_CANCEL_ORDER
+                    || tag == TAG_CANCEL_ALL_ORDERS
+                    || tag == TAG_CANCEL_BY_CLOID));
         if tag < NATIVE_ACTION_TAGS && !passes {
             return Err(shed_msg.to_string());
         }
@@ -1149,17 +1164,34 @@ impl TorusApiServer for RpcState {
                     .usable_oracle_price(mid)
                     .map_or(FixedPoint::ZERO, |op| p.unrealized_pnl(op.price));
 
-                // Simplified liquidation price estimate.
-                let liquidation_price =
-                    if p.size > FixedPoint::ZERO && p.isolated_margin > FixedPoint::ZERO {
-                        if p.is_long {
-                            p.entry_price - p.isolated_margin / p.size
+                let liquidation_price = match p.margin_type {
+                    // R23: the account-wide threshold the liquidation step
+                    // checks, this market's mark varied, the others held
+                    // (`crate::account::cross_liquidation_price`); null when
+                    // no mark crosses. Same executed-head block time as
+                    // getBalances.
+                    torus_core::position::MarginType::Cross => {
+                        let executed = crate::eth::eth_head(self);
+                        let now = crate::eth::get_header_with_hash(self, executed)
+                            .map_err(ErrorObjectOwned::from)?
+                            .map(|(h, _, _)| h.timestamp);
+                        crate::account::cross_liquidation_price(&self.state, &addr, mid, now)
+                            .map_err(|e| RpcError::Internal(e.to_string()))
+                            .map_err(ErrorObjectOwned::from)?
+                    }
+                    // Simplified isolated estimate (unchanged).
+                    torus_core::position::MarginType::Isolated => Some(
+                        if p.size > FixedPoint::ZERO && p.isolated_margin > FixedPoint::ZERO {
+                            if p.is_long {
+                                p.entry_price - p.isolated_margin / p.size
+                            } else {
+                                p.entry_price + p.isolated_margin / p.size
+                            }
                         } else {
-                            p.entry_price + p.isolated_margin / p.size
-                        }
-                    } else {
-                        FixedPoint::ZERO
-                    };
+                            FixedPoint::ZERO
+                        },
+                    ),
+                };
 
                 Ok(Some(RpcPosition {
                     market_id,
@@ -1170,7 +1202,7 @@ impl TorusApiServer for RpcState {
                     realized_pnl: dec_fp(p.realized_pnl),
                     margin: dec_fp(p.isolated_margin),
                     margin_mode: margin_mode.to_string(),
-                    liquidation_price: dec_fp(liquidation_price),
+                    liquidation_price: liquidation_price.map(dec_fp),
                 }))
             }
         }
@@ -1824,6 +1856,24 @@ impl TorusApiServer for RpcState {
                     && s.evm_skipped.len() == body.evm_transactions.len()
             })
             .or_else(|| executed.then(Default::default));
+        // s114: each drained row's EVM tx (node-local `cf_core_writer_tx`,
+        // keyed like the queue row: this block ‖ seq); `null` for a row this
+        // node has no link for.
+        let mut links = std::collections::HashMap::new();
+        for r in status.iter().flat_map(|s| &s.core_writer) {
+            let link = self
+                .state
+                .get_cf_raw(
+                    torus_state::cf::CF_CORE_WRITER_TX,
+                    &torus_state::corewriter_tx::key(block_number, r.seq),
+                )
+                .map_err(|e| ErrorObjectOwned::from(RpcError::State(e)))?
+                .and_then(|bytes| torus_state::corewriter_tx::CoreWriterTxLink::decode(&bytes));
+            if let Some(link) = link {
+                links.insert(r.seq, link);
+            }
+        }
+        let core_writer_link = |seq: u64| links.get(&seq).copied();
         let labels = |skipped: &[bool]| -> Vec<String> {
             skipped
                 .iter()
@@ -1848,7 +1898,9 @@ impl TorusApiServer for RpcState {
             native_action_failures: status.as_ref().map(crate::types::native_action_failures),
             evm_transactions,
             evm_transaction_status: status.as_ref().map(|s| labels(&s.evm_skipped)),
-            core_writer_results: status.as_ref().map(crate::types::core_writer_results),
+            core_writer_results: status
+                .as_ref()
+                .map(|s| crate::types::core_writer_results(s, core_writer_link)),
         }))
     }
 
@@ -2062,6 +2114,31 @@ impl TorusApiServer for RpcState {
         }
 
         Ok(orders)
+    }
+
+    async fn get_order_by_cloid(
+        &self,
+        trader: String,
+        cloid: String,
+    ) -> RpcResult<Option<RpcOrderByCloid>> {
+        let trader = parse_address(&trader).map_err(ErrorObjectOwned::from)?;
+        let cloid = torus_types::cloid_serde::from_hex(&cloid)
+            .map_err(|e| ErrorObjectOwned::from(RpcError::InvalidParams(e)))?;
+        let layout = book_layout(&self.state)?;
+        let found = book_reader::find_by_cloid(&self.state, &trader, cloid, layout)
+            .map_err(book_read_err)?;
+        Ok(found.map(|hit| match hit {
+            book_reader::CloidOrder::Resting(mid, order) => RpcOrderByCloid {
+                status: "open".to_string(),
+                order: order_to_rpc(&order, mid),
+                trigger_price: None,
+            },
+            book_reader::CloidOrder::Stop(mid, stop) => RpcOrderByCloid {
+                status: "triggerPending".to_string(),
+                order: order_to_rpc(&stop_as_order(&stop), mid),
+                trigger_price: Some(dec_fp(stop.trigger_price)),
+            },
+        }))
     }
 
     async fn get_open_interest(&self, market_id: String) -> RpcResult<RpcOpenInterest> {
@@ -2397,6 +2474,33 @@ fn map_proposal(p: torus_economics::governance::Proposal) -> RpcProposal {
     }
 }
 
+/// s114: a pending stop in the open-order shape: its order type, the price
+/// its triggered order carries (limit or cap), the whole quantity.
+fn stop_as_order(stop: &torus_core::order_book::StopOrder) -> torus_core::order_book::Order {
+    use torus_types::OrderType;
+    torus_core::order_book::Order {
+        id: stop.id,
+        trader: stop.trader,
+        side: stop.side,
+        price: stop.reservation_price(),
+        remaining_qty: stop.quantity,
+        original_qty: stop.quantity,
+        order_type: match stop.limit_price {
+            Some(limit) => OrderType::StopLimit {
+                trigger: stop.trigger_price,
+                limit,
+            },
+            None => OrderType::StopMarket {
+                trigger: stop.trigger_price,
+            },
+        },
+        time_in_force: stop.time_in_force,
+        timestamp: stop.timestamp,
+        reduce_only: stop.reduce_only,
+        client_order_id: stop.client_order_id,
+    }
+}
+
 fn order_to_rpc(order: &torus_core::order_book::Order, market_id: u64) -> RpcOpenOrder {
     use torus_types::{OrderType, Side, TimeInForce};
 
@@ -2427,7 +2531,7 @@ fn order_to_rpc(order: &torus_core::order_book::Order, market_id: u64) -> RpcOpe
         order_type: order_type.to_string(),
         time_in_force: time_in_force.to_string(),
         reduce_only: order.reduce_only,
-        client_order_id: order.client_order_id.map(hex_u64),
+        client_order_id: order.client_order_id.map(torus_types::cloid_serde::to_hex),
         timestamp: order.timestamp,
     }
 }
@@ -3292,6 +3396,7 @@ mod shed_peek_tests {
             NativeAction::AttestStateHash { .. } => 26,
             NativeAction::ClaimUnbonded => 27,
             NativeAction::SetOracleSigner { .. } => 28,
+            NativeAction::CancelByCloid { .. } => 29,
         }
     }
 
@@ -3304,7 +3409,8 @@ mod shed_peek_tests {
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::GTC,
             reduce_only: false,
-            client_order_id: Some(i),
+            // s114: above u64::MAX (JSON hex form).
+            client_order_id: Some(u128::from(i) << 64 | u128::from(i)),
         }
     }
 
@@ -3332,6 +3438,10 @@ mod shed_peek_tests {
             NativeAction::CancelOrder { order_id: 7 },
             NativeAction::CancelAllOrders { market_id: None },
             NativeAction::CancelAllOrders { market_id: Some(3) },
+            NativeAction::CancelByCloid {
+                market_id: 3,
+                cloid: u128::MAX,
+            },
             NativeAction::ModifyOrder {
                 order_id: 7,
                 new_price: Some(FixedPoint::from_raw(5)),
@@ -3452,7 +3562,10 @@ mod shed_peek_tests {
 
     fn is_pass_tag(tag: u32, cancels_pass: bool) -> bool {
         tag == TAG_SUBMIT_ORACLE_PRICES
-            || (cancels_pass && (tag == TAG_CANCEL_ORDER || tag == TAG_CANCEL_ALL_ORDERS))
+            || (cancels_pass
+                && (tag == TAG_CANCEL_ORDER
+                    || tag == TAG_CANCEL_ALL_ORDERS
+                    || tag == TAG_CANCEL_BY_CLOID))
     }
 
     /// Payloads broken after a readable tag (all fail the full decode).
@@ -3481,7 +3594,9 @@ mod shed_peek_tests {
             }
             assert_eq!(
                 torus_mempool::is_cancel(&a),
-                idx == TAG_CANCEL_ORDER || idx == TAG_CANCEL_ALL_ORDERS
+                idx == TAG_CANCEL_ORDER
+                    || idx == TAG_CANCEL_ALL_ORDERS
+                    || idx == TAG_CANCEL_BY_CLOID
             );
             assert_eq!(
                 torus_mempool::is_oracle_submission(&a),
@@ -3519,12 +3634,13 @@ mod shed_peek_tests {
                 }
             }
         }
-        // 2 oracle samples x both modes + 3 cancel samples x busy mode,
-        // each x 2 formats x 2 signatures x 2 prefixes.
-        assert_eq!(proceeds, (2 * 2 + 3) * 8);
+        // 2 oracle samples x both modes + 4 cancel samples (s114: one
+        // CancelByCloid) x busy mode, each x 2 formats x 2 signatures x 2
+        // prefixes.
+        assert_eq!(proceeds, (2 * 2 + 4) * 8);
     }
 
-    /// Pass-through tags (2, 3, 15) are never decided by the peek: a broken
+    /// Pass-through tags (2, 3, 15, 29) are never decided by the peek: a broken
     /// body gets the same decode error as before, and a well-formed one
     /// proceeds to the unchanged full verify (which still rejects bad content).
     #[test]

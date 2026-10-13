@@ -33,6 +33,14 @@ pub const CF_COMMIT_MANIFEST: &str = "cf_commit_manifest";
 /// never hashed, not a native-root CF; see [`crate::action_status`].
 pub const CF_BLOCK_ACTION_STATUS: &str = "cf_block_action_status";
 
+/// s114 (CoreWriter follow-up 1): node-local link from a CoreWriter / lockbox
+/// queue row to the EVM tx that queued it. Key: the queue row key, target
+/// (drain) block (8 BE) ‖ seq (8 BE). Value: see [`crate::corewriter_tx`].
+/// Written in the queuing block's flush batch, only for rows a successful tx
+/// queued; never hashed, not a native-root CF; pruned with the drain block's
+/// body.
+pub const CF_CORE_WRITER_TX: &str = "cf_core_writer_tx";
+
 // Receipts and logs
 pub const CF_RECEIPTS: &str = "cf_receipts";
 /// Reserved for future eth_getLogs indexing. Currently unpopulated.
@@ -303,6 +311,7 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_STATE_HASH_VOTES,
     CF_BLOCK_ACTION_STATUS,
     CF_NATIVE_LIQUIDATION,
+    CF_CORE_WRITER_TX,
 ];
 
 #[cfg(test)]

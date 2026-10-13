@@ -1206,6 +1206,11 @@ mod tests {
                 outcome: torus_state::action_status::Outcome::Failed,
                 reason: torus_state::action_status::FailureReason::Other,
                 message: format!("row {height}"),
+                // v5 (main s114): the order id / cloid fields ride it too.
+                oid: Some(u128::from(height)),
+                cloid: height
+                    .is_multiple_of(2)
+                    .then_some(u128::MAX - u128::from(height)),
             }],
         };
         let status = height.is_multiple_of(3).then_some(status);

@@ -1,0 +1,211 @@
+checks-18c.txt  campaign ozarchy-p3fsoak (18c), read-only analysis 2026-10-13. One cell per arm. Windows: bench seconds since t_bench0 (summary.json), 0-120 / 120-360 / 360-600 s, same as series.txt matched/s line.
+Sources: <cell>/sampler.csv (1 s Prometheus counters), metrics-before/after-valN.txt (histograms), cpu-ticks.txt (per-process utime/stime ticks), tasks.txt (val0 per-thread only), schedstat.json (exec thread run/wait ns, whole cell).
+Note: select and mirror are DISJOINT spans in produce_block (app.rs: select_block_payload, then mirror_or_drop_native); flush_da_mirrors runs inside select (mempool select_native_for_block_with_senders). So select-minus-mirror is not a decomposition; both are reported side by side.
+
+== CHECK 1: block build per proposed block (ms/block = d(sum)/d(count), proposer blocks only)
+arm   node  win       n  select  mirror sel-mir  parent  attest  encode   build
+mf    val0  0-2     157   21.91   15.49    6.42    0.03    3.68    0.11   41.19
+mf    val0  2-6     172   31.03   20.83   10.20    0.05    5.11    0.36   57.33
+mf    val0  6-10    172   31.28   20.45   10.83    0.04    5.06    0.24   57.04
+mf    val0  all     501   28.26   19.03    9.23    0.04    4.64    0.24   52.18
+mf    val1  0-2     157   20.87   16.92    3.94    0.03    4.06    0.27   42.12
+mf    val1  2-6     172   33.10   24.71    8.40    0.04    6.08    0.22   64.11
+mf    val1  6-10    172   26.78   22.19    4.60    0.05    5.91    0.28   55.17
+mf    val1  all     501   27.10   21.40    5.70    0.04    5.39    0.25   54.15
+mf    val2  0-2     157   34.28   18.33   15.95    0.02    4.32    0.11   57.04
+mf    val2  2-6     172   55.06   30.35   24.72    0.03    6.20    0.25   91.86
+mf    val2  6-10    173   60.10   28.41   31.69    0.03    6.23    0.43   95.51
+mf    val2  all     502   50.30   25.92   24.38    0.03    5.62    0.27   82.20
+cs2   val0  0-2     164   14.67   13.98    0.69    0.03    3.39    0.11   32.16
+cs2   val0  2-6     183   24.81   19.94    4.87    0.04    5.35    0.14   50.24
+cs2   val0  6-10    180   21.06   18.84    2.22    0.04    5.04    0.17   45.11
+cs2   val0  all     527   20.37   17.71    2.66    0.04    4.63    0.14   42.86
+cs2   val1  0-2     165   18.24   14.59    3.64    0.03    3.69    0.11   36.64
+cs2   val1  2-6     182   23.72   19.83    3.89    0.04    5.50    0.16   49.20
+cs2   val1  6-10    180   23.04   18.95    4.09    0.04    5.50    0.14   47.63
+cs2   val1  all     527   21.77   17.89    3.88    0.04    4.93    0.14   44.73
+cs2   val2  0-2     164   15.97   16.34   -0.36    0.02    4.24    0.12   36.67
+cs2   val2  2-6     182   19.74   21.27   -1.53    0.02    6.07    0.16   47.25
+cs2   val2  6-10    180   19.26   21.81   -2.55    0.02    6.32    0.17   47.56
+cs2   val2  all     526   18.40   19.92   -1.52    0.02    5.58    0.15   44.06
+jcs2  val0  0-2     185   18.56   16.60    1.96    0.01    3.89    0.16   39.22
+jcs2  val0  2-6     212   21.51   24.28   -2.77    0.01    5.69    0.19   51.68
+jcs2  val0  6-10    210   23.98   26.55   -2.57    0.01    6.20    0.18   56.90
+jcs2  val0  all     607   21.47   22.73   -1.26    0.01    5.32    0.18   49.69
+jcs2  val1  0-2     186   17.48   17.17    0.31    0.01    4.10    0.13   38.89
+jcs2  val1  2-6     212   25.21   24.32    0.89    0.01    5.61    0.29   55.44
+jcs2  val1  6-10    210   24.17   25.55   -1.38    0.02    5.65    0.34   55.71
+jcs2  val1  all     608   22.49   22.56   -0.07    0.01    5.16    0.26   50.47
+jcs2  val2  0-2     186   19.63   17.56    2.07    0.01    4.05    0.09   41.33
+jcs2  val2  2-6     212   24.86   25.63   -0.77    0.01    6.10    0.12   56.71
+jcs2  val2  6-10    210   25.40   25.92   -0.52    0.01    5.76    0.14   57.22
+jcs2  val2  all     608   23.45   23.26    0.19    0.01    5.35    0.12   52.18
+
+-- histogram quantiles, metrics-after minus metrics-before (whole cell incl. warmup/drain), ms; p50/p99 bucket-interpolated (buckets 0.5 ms x2)
+mf    val0  select n=630 mean=22.52 p50=20.20 p90=42.67 p99=217.60 | mirror n=630 mean=15.17 p50=17.28 p90=30.77 p99=62.81
+mf    val1  select n=631 mean=21.79 p50=21.37 p90=46.38 p99=194.21 | mirror n=631 mean=17.05 p50=20.12 p90=31.00 p99=75.04
+mf    val2  select n=630 mean=40.10 p50=19.77 p90=160.00 p99=246.40 | mirror n=630 mean=20.68 p50=20.85 p90=31.96 p99=188.80
+cs2   val0  select n=658 mean=16.34 p50=18.95 p90=31.26 p99=61.56 | mirror n=658 mean=14.20 p50=17.37 p90=30.20 p99=57.62
+cs2   val1  select n=658 mean=17.48 p50=20.92 p90=31.88 p99=68.48 | mirror n=658 mean=14.37 p50=19.01 p90=30.15 p99=55.50
+cs2   val2  select n=657 mean=14.75 p50=15.30 p90=30.47 p99=63.45 | mirror n=657 mean=16.00 p50=20.79 p90=30.83 p99=57.99
+jcs2  val0  select n=753 mean=17.39 p50=18.94 p90=39.12 p99=83.76 | mirror n=753 mean=18.43 p50=20.62 p90=42.96 p99=62.15
+jcs2  val1  select n=753 mean=18.23 p50=20.40 p90=42.89 p99=81.56 | mirror n=753 mean=18.29 p50=19.79 p90=45.57 p99=62.38
+jcs2  val2  select n=753 mean=19.02 p50=19.92 p90=42.54 p99=113.50 | mirror n=753 mean=18.91 p50=21.13 p90=43.41 p99=61.94
+
+== CHECK 2a: exec per node: busy = d(exec_block_seconds_sum)/dt, ms/block = d(sum)/d(count), blk/s = d(exec_block_seconds_count)/dt, chain blk/s = d(torus_blocks_committed_total)/dt, exec_q mean
+arm   node  win     busy  ms/blk exec_blk/s chain_blk/s matched/s exec_q handoff_ms/blk
+mf    val0  0-2    0.957   262.1      3.650       3.650    201476   33.5           0.36
+mf    val0  2-6    0.905   398.7      2.271       2.271    185861    7.2           0.05
+mf    val0  6-10   0.854   397.0      2.150       2.150    176031    1.7           0.01
+mf    val1  0-2    0.956   261.9      3.650       3.650    200708   35.0           0.30
+mf    val1  2-6    0.912   400.0      2.279       2.279    186594    7.5           0.10
+mf    val1  6-10   0.853   396.9      2.150       2.150    175681    1.2           0.01
+mf    val2  0-2    0.940   280.6      3.350       3.350    174566   58.7           0.31
+mf    val2  2-6    0.956   443.0      2.158       2.158    177354   65.5           0.01
+mf    val2  6-10   0.952   442.1      2.154       2.154    176520   65.4           0.01
+cs2   val0  0-2    0.980   253.6      3.867       3.867    204027   36.4           0.02
+cs2   val0  2-6    0.925   390.2      2.371       2.371    192917    6.8           0.01
+cs2   val0  6-10   0.868   391.7      2.217       2.217    181995    1.8           0.01
+cs2   val1  0-2    0.985   254.1      3.875       3.875    204625   34.6           0.01
+cs2   val1  2-6    0.926   392.1      2.362       2.362    192618    6.6           0.01
+cs2   val1  6-10   0.865   389.5      2.221       2.221    182386    1.3           0.01
+cs2   val2  0-2    0.981   277.1      3.542       3.542    175323   60.0           0.01
+cs2   val2  2-6    0.997   442.2      2.254       2.254    185725   65.7           0.01
+cs2   val2  6-10   0.991   445.5      2.225       2.225    181630   65.7           0.01
+jcs2  val0  0-2    0.986   242.0      4.075       4.075    207969   57.7           0.01
+jcs2  val0  2-6    0.998   376.8      2.650       2.650    217500   64.8           0.01
+jcs2  val0  6-10   1.000   382.7      2.612       2.612    213669   65.3           0.01
+jcs2  val1  0-2    0.987   241.6      4.083       4.083    207969   57.7           0.01
+jcs2  val1  2-6    1.000   375.5      2.663       2.663    218274   63.8           0.01
+jcs2  val1  6-10   0.999   382.3      2.612       2.612    213737   62.0           0.02
+jcs2  val2  0-2    0.987   242.3      4.075       4.075    207969   57.6           0.01
+jcs2  val2  2-6    0.999   376.5      2.654       2.654    217500   65.4           0.01
+jcs2  val2  6-10   0.999   382.3      2.612       2.612    214050   65.0           0.01
+
+-- per minute: chain blk/s (val0 committed) vs val2 exec ms/blk and 1000/ms (max exec rate), val2 busy
+arm   min chain_blk/s val2_ms/blk val2_max_blk/s val2_busy val0_ms/blk val1_ms/blk
+mf      1       4.350       258.9          3.862     0.919       216.0       215.1
+mf      2       2.950       305.1          3.278     0.961       330.0       330.8
+mf      3       2.433       449.6          2.224     0.952       398.0       399.6
+mf      4       2.283       451.2          2.216     0.963       405.2       406.2
+mf      5       2.200       433.0          2.310     0.960       395.2       397.0
+mf      6       2.167       438.9          2.278     0.951       396.3       396.9
+mf      7       2.167       442.0          2.263     0.950       399.9       402.4
+mf      8       2.150       441.9          2.263     0.950       391.1       391.4
+mf      9       2.117       448.1          2.231     0.949       392.7       390.7
+mf     10       2.167       436.5          2.291     0.960       404.1       402.9
+mf    Pearson r(chain blk/s, val2 exec ms/blk), minutes 2-10: -0.90
+cs2     1       4.750       243.3          4.109     0.965       203.1       203.9
+cs2     2       2.983       320.0          3.125     0.997       333.9       334.4
+cs2     3       2.533       436.5          2.291     0.997       393.5       397.0
+cs2     4       2.417       443.2          2.257     0.997       394.3       399.9
+cs2     5       2.267       441.6          2.265     0.994       388.4       386.5
+cs2     6       2.267       447.8          2.233     1.000       383.9       384.1
+cs2     7       2.150       446.5          2.240     0.975       393.1       386.7
+cs2     8       2.233       446.8          2.238     0.998       387.4       388.5
+cs2     9       2.233       446.1          2.242     0.996       392.5       383.3
+cs2    10       2.250       442.6          2.260     0.996       393.7       399.5
+cs2   Pearson r(chain blk/s, val2 exec ms/blk), minutes 2-10: -0.92
+jcs2    1       4.633       210.2          4.758     0.974       209.9       209.2
+jcs2    2       3.517       284.6          3.514     1.001       284.4       284.5
+jcs2    3       2.617       384.4          2.602     0.999       382.2       380.8
+jcs2    4       2.650       375.8          2.661     0.996       375.5       376.1
+jcs2    5       2.667       372.0          2.688     0.998       374.5       369.9
+jcs2    6       2.667       373.9          2.675     1.003       374.9       375.4
+jcs2    7       2.600       384.2          2.603     0.992       384.6       382.1
+jcs2    8       2.650       377.6          2.648     1.001       378.6       379.1
+jcs2    9       2.567       386.2          2.590     0.991       385.6       390.7
+jcs2   10       2.633       381.5          2.622     1.011       382.2       377.9
+jcs2  Pearson r(chain blk/s, val2 exec ms/blk), minutes 2-10: -1.00
+
+== CHECK 2b: node process CPU (cpu-ticks.txt, per pid -> node from node-life.txt): cores = d(ticks)/100/dt, sys share = stime/(utime+stime)
+arm   node  win   user_cores sys_cores   sys% CPU-s/blk(chain)
+mf    val0  0-2         4.78      0.36    6.9            1.406
+mf    val0  2-6         4.44      0.34    7.0            2.101
+mf    val0  6-10        4.33      0.33    7.1            2.167
+mf    val1  0-2         4.81      0.38    7.3            1.421
+mf    val1  2-6         4.45      0.33    7.0            2.105
+mf    val1  6-10        4.32      0.34    7.4            2.167
+mf    val2  0-2         5.19      0.41    7.3            1.533
+mf    val2  2-6         4.92      0.37    7.0            2.328
+mf    val2  6-10        4.92      0.38    7.1            2.465
+cs2   val0  0-2         4.48      0.30    6.2            1.235
+cs2   val0  2-6         4.16      0.25    5.8            1.860
+cs2   val0  6-10        4.04      0.27    6.4            1.945
+cs2   val1  0-2         4.51      0.30    6.2            1.243
+cs2   val1  2-6         4.18      0.25    5.6            1.869
+cs2   val1  6-10        4.06      0.26    6.1            1.951
+cs2   val2  0-2         4.94      0.38    7.2            1.377
+cs2   val2  2-6         4.70      0.31    6.1            2.111
+cs2   val2  6-10        4.64      0.32    6.4            2.237
+jcs2  val0  0-2         4.89      0.39    7.3            1.294
+jcs2  val0  2-6         4.66      0.35    7.1            1.891
+jcs2  val0  6-10        4.67      0.36    7.2            1.927
+jcs2  val1  0-2         4.90      0.39    7.3            1.298
+jcs2  val1  2-6         4.68      0.35    7.0            1.901
+jcs2  val1  6-10        4.68      0.37    7.3            1.933
+jcs2  val2  0-2         5.49      0.46    7.8            1.461
+jcs2  val2  2-6         5.16      0.41    7.4            2.101
+jcs2  val2  6-10        5.20      0.42    7.5            2.155
+
+-- val0 main exec thread (tasks.txt, tid from schedstat.json; val1/val2 per-thread not sampled)
+mf    val0 exec 0-2   user 0.789 sys 0.011 cores, sys% 1.4
+mf    val0 exec 2-6   user 0.770 sys 0.009 cores, sys% 1.2
+mf    val0 exec 6-10  user 0.730 sys 0.009 cores, sys% 1.2
+cs2   val0 exec 0-2   user 0.739 sys 0.013 cores, sys% 1.7
+cs2   val0 exec 2-6   user 0.709 sys 0.010 cores, sys% 1.3
+cs2   val0 exec 6-10  user 0.670 sys 0.009 cores, sys% 1.3
+jcs2  val0 exec 0-2   user 0.740 sys 0.022 cores, sys% 2.9
+jcs2  val0 exec 2-6   user 0.753 sys 0.021 cores, sys% 2.6
+jcs2  val0 exec 6-10  user 0.755 sys 0.021 cores, sys% 2.7
+
+-- exec thread schedstat (whole bench, before -> bench_end): on-CPU s, runqueue wait s, on-CPU / exec_block_seconds wall (sampler, same span approx)
+mf    val0  exec on-CPU   462.9 s  rq-wait   24.4 s  exec_block wall(0-600)   536.9 s  on-CPU/wall  0.86
+mf    val1  exec on-CPU   465.0 s  rq-wait   24.4 s  exec_block wall(0-600)   538.3 s  on-CPU/wall  0.86
+mf    val2  exec on-CPU   498.7 s  rq-wait   30.2 s  exec_block wall(0-600)   570.9 s  on-CPU/wall  0.87
+cs2   val0  exec on-CPU   427.7 s  rq-wait   18.5 s  exec_block wall(0-600)   548.1 s  on-CPU/wall  0.78
+cs2   val1  exec on-CPU   431.0 s  rq-wait   18.5 s  exec_block wall(0-600)   548.2 s  on-CPU/wall  0.79
+cs2   val2  exec on-CPU   461.3 s  rq-wait   22.5 s  exec_block wall(0-600)   594.9 s  on-CPU/wall  0.78
+jcs2  val0  exec on-CPU   465.7 s  rq-wait   17.9 s  exec_block wall(0-600)   598.0 s  on-CPU/wall  0.78
+jcs2  val1  exec on-CPU   467.1 s  rq-wait   17.6 s  exec_block wall(0-600)   598.1 s  on-CPU/wall  0.78
+jcs2  val2  exec on-CPU   467.4 s  rq-wait   18.0 s  exec_block wall(0-600)   598.0 s  on-CPU/wall  0.78
+
+== CHECK 2c (addendum): exec cost normalised by block size (blocks in minutes 0-2 are not all full)
+arm   node  win   actions/blk exec_ms/100act
+mf    val0  0-2         287.5           91.2
+mf    val0  2-6         400.0           99.7
+mf    val0  6-10        400.0           99.3
+mf    val1  0-2         286.6           91.4
+mf    val1  2-6         400.0          100.0
+mf    val1  6-10        400.0           99.2
+mf    val2  0-2         277.4          101.2
+mf    val2  2-6         400.0          110.8
+mf    val2  6-10        400.0          110.5
+cs2   val0  0-2         275.1           92.2
+cs2   val0  2-6         399.3           97.7
+cs2   val0  6-10        400.8           97.7
+cs2   val1  0-2         275.4           92.3
+cs2   val1  2-6         400.0           98.0
+cs2   val1  6-10        400.0           97.4
+cs2   val2  0-2         264.6          104.7
+cs2   val2  2-6         400.0          110.6
+cs2   val2  6-10        400.0          111.4
+jcs2  val0  0-2         274.1           88.3
+jcs2  val0  2-6         400.0           94.2
+jcs2  val0  6-10        400.0           95.7
+jcs2  val1  0-2         273.5           88.3
+jcs2  val1  2-6         399.4           94.0
+jcs2  val1  6-10        400.6           95.4
+jcs2  val2  0-2         274.1           88.4
+jcs2  val2  2-6         399.4           94.3
+jcs2  val2  6-10        400.6           95.4
+-- exec thread on-CPU ms per executed block, whole bench (schedstat on-CPU / d(exec_block_seconds_count) 0-600 s)
+mf    val0  blocks  1499  on-CPU ms/blk  308.8
+mf    val1  blocks  1501  on-CPU ms/blk  309.8
+mf    val2  blocks  1437  on-CPU ms/blk  347.0
+cs2   val0  blocks  1565  on-CPU ms/blk  273.3
+cs2   val1  blocks  1565  on-CPU ms/blk  275.4
+cs2   val2  blocks  1500  on-CPU ms/blk  307.6
+jcs2  val0  blocks  1752  on-CPU ms/blk  265.8
+jcs2  val1  blocks  1756  on-CPU ms/blk  266.0
+jcs2  val2  blocks  1753  on-CPU ms/blk  266.7

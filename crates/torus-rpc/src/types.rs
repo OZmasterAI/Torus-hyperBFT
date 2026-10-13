@@ -285,7 +285,10 @@ pub struct RpcPosition {
     pub realized_pnl: String,
     pub margin: String,
     pub margin_mode: String,
-    pub liquidation_price: String,
+    /// Cross: `crate::account::cross_liquidation_price`, `null` when no
+    /// mark of this market crosses maintenance (docs/api/position.md).
+    /// Isolated: the simplified `entry ∓ isolated margin / size` estimate.
+    pub liquidation_price: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -373,6 +376,18 @@ pub struct RpcOpenOrder {
     pub reduce_only: bool,
     pub client_order_id: Option<String>,
     pub timestamp: u64,
+}
+
+/// s114: `torus_getOrderByCloid` — the trader's open order with that client
+/// order id. `status` is `"open"` (resting) or `"triggerPending"` (a pending
+/// stop: `order.price` is its limit or price cap, `triggerPrice` its trigger).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcOrderByCloid {
+    pub status: String,
+    pub order: RpcOpenOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -671,11 +686,29 @@ pub struct RpcCoreWriterResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_status: Option<String>,
     pub message: String,
+    /// s114: the order id an executed `place_order` row's order got
+    /// (resting or filled), hex like every order id; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<String>,
+    /// s114: the client order id the row carried (a `place_order` with one,
+    /// a `cancel_by_cloid`), `0x` + 32 hex digits, whatever its status;
+    /// absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloid: Option<String>,
+    /// s114: hash of the EVM tx (in `queuedBlock`) whose precompile call
+    /// queued this row (node-local `cf_core_writer_tx`); `null` when this
+    /// node has no link (an undecodable row, or a row queued without one).
+    pub tx_hash: Option<String>,
+    /// s114: the row's position among the rows its tx queued (0 = the tx's
+    /// first successful writer-precompile call); `null` with `txHash`.
+    pub call_index: Option<u32>,
 }
 
-/// The record's CoreWriter results, RPC-shaped.
+/// The record's CoreWriter results, RPC-shaped. `link(seq)` is this
+/// block's queue row `seq`'s EVM tx link, if the node has one.
 pub fn core_writer_results(
     s: &torus_state::action_status::BlockActionStatus,
+    link: impl Fn(u64) -> Option<torus_state::corewriter_tx::CoreWriterTxLink>,
 ) -> Vec<RpcCoreWriterResult> {
     use torus_state::action_status::CoreWriterKind;
     s.core_writer
@@ -683,6 +716,7 @@ pub fn core_writer_results(
         .map(|r| {
             let known = r.kind != CoreWriterKind::Undecodable;
             let executed = r.outcome == Outcome::Executed;
+            let tx = known.then(|| link(r.seq)).flatten();
             RpcCoreWriterResult {
                 seq: r.seq,
                 kind: r.kind.as_str().to_string(),
@@ -700,6 +734,10 @@ pub fn core_writer_results(
                     _ => None,
                 },
                 message: r.message.clone(),
+                oid: r.oid.map(hex_u128),
+                cloid: r.cloid.map(torus_types::cloid_serde::to_hex),
+                tx_hash: tx.map(|l| hex_b256(l.tx_hash)),
+                call_index: tx.map(|l| l.call_index),
             }
         })
         .collect()

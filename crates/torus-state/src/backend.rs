@@ -1554,6 +1554,29 @@ impl NativeStateOverlay {
         state.checkpoints.clear();
     }
 
+    /// s114: [`Self::keep_tx`], returning the keys of `cf` this tx wrote
+    /// (and did not roll back) that are still pending writes, in first
+    /// write order, each once. Reads the tx's undo trail, which holds only
+    /// the tx's own surviving writes ([`Self::begin_tx`] opened a scope;
+    /// reverted frames popped theirs): a tx that wrote nothing costs nothing.
+    pub fn keep_tx_written_keys(&self, cf: &str) -> Vec<Vec<u8>> {
+        let mut state = self.pending.write().unwrap();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        if !state.journal_log.is_empty() {
+            if let Some(id) = intern_cf(cf) {
+                let cfp = state.cf(id);
+                for entry in state.journal_log.iter().filter(|e| e.cf == id) {
+                    if cfp.writes.contains_key(&entry.key) && !keys.contains(&entry.key) {
+                        keys.push(entry.key.clone());
+                    }
+                }
+            }
+        }
+        state.journal_log.clear();
+        state.checkpoints.clear();
+        keys
+    }
+
     /// F1 (s515): close the transaction scope DROPPING its writes; earlier
     /// transactions' pending writes are untouched.
     pub fn revert_tx(&self) {

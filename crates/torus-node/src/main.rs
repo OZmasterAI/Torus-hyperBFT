@@ -29,8 +29,16 @@ use torus_state::cf::CF_BLOCK_HEADERS;
 use torus_state::{NativeDaStore, PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
+mod allocator;
 mod forward_batcher;
 mod keystore;
+
+// Process allocator (default feature `jemalloc`, Linux): jemalloc for the Rust
+// heap and, unprefixed, for C/C++ malloc (RocksDB). Only this binary; the
+// helper bins (torus-unwedge, torus-wedge-inject) set no global allocator.
+#[cfg(all(feature = "jemalloc", target_os = "linux"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Production native-DA pull-fallback transport (Phase C Task 6): bridges the
 /// consensus app's [`NativeDaFetcher`] to the libp2p `/torus/native-da/1.0`
@@ -520,6 +528,11 @@ async fn main() {
         version = env!("CARGO_PKG_VERSION"),
         data_dir = %cli.data_dir.display(),
         "starting torus-node"
+    );
+    info!(
+        allocator = allocator::NAME,
+        jemalloc_version = allocator::version().unwrap_or("-"),
+        "process allocator"
     );
 
     // Before the StateDb opens (every SST stays open) and any socket listens.
@@ -1378,6 +1391,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 interval.tick().await;
                 let snap = sdb.runtime_stats();
                 publish_rocksdb_stats(&m.rocksdb, &snap);
+            }
+        });
+    }
+
+    // 12c. Process-allocator (jemalloc) stats into the torus_jemalloc_*_bytes
+    // gauges every 5 s; not spawned on a system-allocator build.
+    if allocator::JEMALLOC {
+        let m = metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Some(s) = allocator::stats() {
+                    allocator::publish(&m.jemalloc, &s);
+                }
             }
         });
     }

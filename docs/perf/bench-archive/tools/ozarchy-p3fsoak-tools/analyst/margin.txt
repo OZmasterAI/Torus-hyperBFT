@@ -1,0 +1,6 @@
+ozarchy-p3fsoak-300m-k1-mf: n=50 free% p10/median 62.8/64.1 | order-margin% median/max 0.00/0.00 | position IM% median/max 35.9/38.9 | accounts free<5%: 0, of which order margin lifts them >=5%: 0; their posIM% [] om% [] upnl% []
+ozarchy-p3fsoak-300m-k1-mf | posIM% mean by address quartile: 37 36 35 33 | free<5% accounts' address pos (0-1): [] | order margin% max 0.0 | posIM% median 36
+ozarchy-p3fsoak-300m-k1-cs2: n=50 free% p10/median 61.1/63.6 | order-margin% median/max 0.00/0.00 | position IM% median/max 36.9/40.0 | accounts free<5%: 0, of which order margin lifts them >=5%: 0; their posIM% [] om% [] upnl% []
+ozarchy-p3fsoak-300m-k1-cs2 | posIM% mean by address quartile: 39 38 36 34 | free<5% accounts' address pos (0-1): [] | order margin% max 0.0 | posIM% median 37
+ozarchy-p3fsoak-300m-k1-jcs2: n=50 free% p10/median 54.6/56.7 | order-margin% median/max 0.00/0.00 | position IM% median/max 43.7/46.8 | accounts free<5%: 0, of which order margin lifts them >=5%: 0; their posIM% [] om% [] upnl% []
+ozarchy-p3fsoak-300m-k1-jcs2 | posIM% mean by address quartile: 45 44 42 40 | free<5% accounts' address pos (0-1): [] | order margin% max 0.0 | posIM% median 44

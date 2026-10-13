@@ -38,7 +38,7 @@ blocks after the last checkpoint S. No consensus rule, no state format and no `h
 | Phase gate, restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | step 4 |
 | Phase gate, throughput | matched/s UP vs tw beyond noise; native blocks/s no regression (owner s111 after p3t, section 43: on tmpfs the prototype's blocks/s gain is +1.6%, not resolved, so "up" is not required) | step 4 |
 | correctness | per-block write sets, `h_n` and full CF dump identical: interval 15 s vs 0 vs 1 block, crash at random points (incl. mid-checkpoint), 3 replicas with different intervals | tests, step 1 |
-| RAM | RSS growth within archy's layer-size figure + 25% | step 4 |
+| RAM | a 10 min soak shows RSS levelling off, with a Phase 3 delta <= ~1 GB per node; RSS still growing at the end of the soak blocks the merge (owner s114; was "RSS growth within archy's layer-size figure + 25%", ~270 MB). Which allocator the soak is judged under (glibc fails, jemalloc levels off; sections 53, 53b, 53d) is decided after archy's benches finish. Je vs je (section 57, both arms jemalloc compiled in, no exec-backlog confound): Phase 3 levels off at +0.94 GB per node mean / +1.00 at 10 min / +1.27 peak: met on the level and the mean, not at the peak. Shrinking the layer (~2.1x its logical size) and the view is a follow-up, reconsidered at Phase 4 | soak cells, step 4 |
 
 The CPU ceiling is ~7% vs tw (step 0: flush worker + state-row memtable / compaction 1.76 CPU-s/1M
 on Classic before tw). The per-block running-hash digest stays on W, so its cost is not saved.
@@ -380,6 +380,67 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
     `TORUS_CANCEL_BLOCK_SHARE_PCT` (weaker item C); (c) per-sender round-robin in the cancel
     share; (d) accept it (the bench's 36.7% cancel-all mix is above the 25% share; the in-flight
     estimate stays conservative).
+- **RSS split** (campaign `ozarchy-p3rss`, results doc section 48, plan-2 row 53): of step 2's +1.55 GB peak, the
+  commit-mode exec backlog (not Phase 3) is +0.83 GB, the step 1 layer +0.88 GB and the step 2 view +0.68 GB (vs control
+  `2725e321`); about half of each Phase 3 delta is glibc retention (jemalloc live heap +0.51 / +0.45 / +0.33 GB). RSS
+  still climbs at 120 s. Next: allocator A/B and a ~30 min soak.
+- **Gate rerun** (campaign `ozarchy-p3g2`, results doc section 49, plan-2 row 54): step 2 `51a67f57` vs main `8efcb07a`
+  (clean control), commit tail, n = 4. CPU-s/1M -7.0% (met), writes -51% (met), matched/s +2.9% (tie), native blocks/s
+  -5.5% (not met), RSS +1.55 GB peak (not met), exec ms per block flat, block-time p99 +12.7%. New timers: E waits
+  23.9 ms per block on the previous layer merge (`checkpoint_settle_wait`, p99 95 ms), upkeep 1.0 ms; free-off-exec
+  confirmed (`torus-ckpt-drop`). Also valid for `6d9b78af`. Restart cells: SIGTERM cells on the next step 2 head.
+- **Allocator A/B** (campaign `ozarchy-p3alloc`, results doc section 51, plan-2 row 56): step 2 `7b006739` vs main
+  `219f0c20`, glibc vs jemalloc 5.3.1 (LD_PRELOAD, defaults), commit tail, n = 4. Phase 3 RSS delta +1.55 GB peak (glibc)
+  / +0.97 GB (jemalloc): the RAM gate (~270 MB) is not met under either. jemalloc on step 2: peak -0.32 GB, growth
+  1.64 -> 1.01 GB/min, matched/s +3.6%, but CPU at equal fills +4.0% (je commits +15-18% faster, so the closed-loop
+  bench submits +13-14% more: offered load differs). CPU-s/1M -6.5% / -8.9% and writes
+  -54% / -51% (Phase 3, glibc / jemalloc). Soak (600 s per arm) on glibc next.
+- **SIGTERM restart cells** (campaign `ozarchy-p3term`, results doc section 52, plan-2 row 57): step 2 `7b006739` at 15 s vs
+  main `219f0c20`, 8 + 4 SIGTERM kills: replay 0 every time, no forced stop, state agrees; exit 7.0 s mean / 10.7 s max
+  (exec-queue drain; checkpoint flush share ~0.15 s); kill -> first commit max 59.8 s (gate 60 s met; the slow kill is
+  the gossipsub resubscribe stall, both arms).
+- **Soak** (campaign `ozarchy-p3soak`, results doc section 53, plan-2 row 58): step 2 `7b006739` vs main `219f0c20`, glibc,
+  600 s each: step 2 RSS still +40-67 MB/min per node at 10 min (main +3-11), Phase 3 delta +1.98 GB per node at 10 min:
+  no plateau (growth finding). Cancel-all expiry hits both arms from minute 2 (~18k per node), matched/s -30% from minute 6.
+- **Soak on jemalloc** (campaign `ozarchy-p3soakje`, results doc section 53b, plan-2 row 59): the same pair on jemalloc 5.3.1
+  (defaults): step 2 RSS flat after ~2 min, Phase 3 delta +0.68 GB per node (minutes 5-10 mean; +1.01 GB peak). So the
+  glibc growth is consistent with allocator retention (one pair; slow growth not ruled out). Layer size and resting orders do not grow. The minute-6 matched/s drop is margin
+  rejections in the econ workload.
+- **Soak with the cancel-share fix** (campaign `ozarchy-p3cssoak`, results doc section 53c, plan-2 row 60): cs2 `41a95355`
+  (`de97682f` on step 2) vs step 2 `7b006739`, glibc, 600 s each: cancel-all expiry 0 (step 2 16k per node) and no margin
+  collapse (the margin user is positions, concentrated on low-address senders by the old cancel order). Step 2 + fix RSS
+  still grows (+129-178 MB/min, +2.76 GB vs section 53's main), against a confounded reference: the fixed arm keeps ~2x the
+  book and layer size for 10 min. Next: cs2 vs main + fix `de97682f`.
+- **Fair RAM soak, fix in every arm** (campaign `ozarchy-p3fsoak`, results doc section 53d, plan-2 row 61): main + fix
+  `de97682f` (glibc, control) vs `41a95355` on glibc and on jemalloc, 600 s each, full workload in all three (0 expiries,
+  0 margin rejections). Glibc: Phase 3 delta +2.62 GB per node (minutes 5-10 mean), still +120-158 MB/min: rule not met.
+  jemalloc: flat, +1.10 GB per node mean / +1.49 GB peak (val2 +0.95 / +1.34): met on the level, borderline on the mean,
+  not at the peak. Same book and layer, so the glibc growth is consistent with retention, not data.
+- **Merge-wait A/B** (campaign `ozarchy-p3mw`, results doc section 54, plan-2 row 62): `perf/p3-merge-wait` `3cf8f72d` vs
+  step 2 `7b006739`, both 15 s, glibc, commit tail, n = 4 ABBA. E's `checkpoint_settle_wait` 23.4 -> 3.1 ms per native
+  block (-20.3 [-20.9, -19.6]), deferred read waits 0, deferred join 0.19 ms per block (inside upkeep); `block_ms` -6.9%,
+  native blocks/s +11.3% [+8.4, +14.1]; matched/s +1.8% and block time p99 -2.9% (ties); RSS / writes neutral; CPU-s/1M
+  +1.35% [+0.09, +2.61] (not resolved at equal fills). Three REJECTs, all the mark-only digest artifact.
+- **Checkpoint interval 5 s vs 15 s** (campaign `ozarchy-p3iv`, results doc section 55, plan-2 row 63): the same step 2
+  `7b006739` binary, glibc, commit tail, n = 4 ABBA, 120 s. Interval confirmed per cell (4.4 vs 11.6 checkpoints per node
+  per minute in the bench window; layer per checkpoint 114 -> 74 MB). RSS -0.33 GB peak [-0.65, -0.01] / -0.28 GB mean
+  [-0.50, -0.06] per node (~6%), growth rate unchanged; CPU-s/1M +1.10% [+0.44, +1.75]; device writes +10.8% [+7.0, +14.6]
+  (WAL path); blocks/s, matched/s, block time p99 ties. Minutes 0-2 only, not the soak plateau. Three REJECTs (g2), all
+  the mark-only digest artifact.
+- **jemalloc compiled in (RAM-gate dependency)** (campaign `ozarchy-p3je`, results doc section 56, plan-2 row 64):
+  `feat/jemalloc-allocator` `88ddc4c2` vs main `deeacdb3` (glibc), no Phase 3 in either arm, commit tail, n = 4 ABBA,
+  120 s, saturated and at a fixed 907 actions/s. RSS growth over minutes 0-2 is about halved (-44% / -54%), the
+  fixed-load RSS mean -0.22 GB [-0.30, -0.14] per node and end-of-window -0.36 GB, at CPU-s/1M +2.7% (saturated) /
+  +4.3% (fixed load, resolved). matched/s is not higher (tie saturated); blocks/s +10-15%, block time p99 -7 to -9%.
+  Part B (10 min soaks ja / jb and je-vs-je jcs `e7be8460` / jmf `0360c840`) decides the RAM gate under jemalloc;
+  its binaries are staged in `ozarchy-p3je-stage/{jcs,jmf}-run`.
+- **RAM gate, je vs je soak** (campaign `ozarchy-p3jesoak`, results doc section 57, plan-2 row 65): jcs `e7be8460` (step 2
+  + fix + jemalloc, 15 s) vs jmf `0360c840` (main + fix + jemalloc), 600 s each, full workload in both (0 expiries, 0 margin
+  rejections), exec queue at the cap in both. Phase 3 delta +0.94 GB per node (minutes 5-10 mean; +0.86 to +0.98 per node),
+  +1.00 GB at 10 min, +1.27 GB peak; difference slopes over the last 5 min +43 [-4, +90] / -80 [-134, -27] / +8 [-49, +65]
+  MB/min: levels off. ~+0.55 GB live allocations, ~+0.45 GB jemalloc-resident slack. **RAM rule: met on the level and the
+  mean, at the bound at 10 min, not met at the peak (1.05-1.55 GB).** One cell per arm. Secondary ja vs jb (main, no fix):
+  no RSS saving at 10 min (+0.15 GB), matched/s minutes 6-10 vs 0-2 -19.9% vs -35.1%.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

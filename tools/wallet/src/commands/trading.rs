@@ -21,7 +21,7 @@ pub(crate) async fn cmd_place_order(
     tif: &str,
     trigger_price: Option<&str>,
     reduce_only: bool,
-    client_id: Option<u64>,
+    client_id: Option<u128>,
 ) -> Result<(), String> {
     let is_buy = match side.to_lowercase().as_str() {
         "buy" => true,
@@ -92,6 +92,33 @@ pub(crate) async fn cmd_cancel_order(
     order_id: u128,
 ) -> Result<(), String> {
     submit_native_action(cli, rpc, NativeAction::CancelOrder { order_id }).await
+}
+
+/// s114: a cloid argument — `0x` + 1-32 hex digits (the RPC / HL form) or a
+/// decimal u128.
+pub(crate) fn parse_cloid(s: &str) -> Result<u128, String> {
+    if s.starts_with("0x") || s.starts_with("0X") {
+        torus_types::cloid_serde::from_hex(s)
+    } else {
+        s.parse::<u128>().map_err(|e| format!("cloid {s:?}: {e}"))
+    }
+}
+
+pub(crate) async fn cmd_cancel_by_cloid(
+    cli: &Cli,
+    rpc: &RpcClient,
+    market: u64,
+    cloid: u128,
+) -> Result<(), String> {
+    submit_native_action(
+        cli,
+        rpc,
+        NativeAction::CancelByCloid {
+            market_id: market,
+            cloid,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn cmd_cancel_all(
@@ -178,6 +205,28 @@ mod tests {
             &key,
         );
         assert_eq!(signed.recover_sender().unwrap(), address_from_key(&key));
+    }
+
+    #[test]
+    fn test_cancel_by_cloid_roundtrip_and_cloid_parsing() {
+        let key = test_signing_key();
+        let signed = sign_native_action(
+            NativeAction::CancelByCloid {
+                market_id: 3,
+                cloid: u128::MAX,
+            },
+            1_700_000_000_000u64,
+            &key,
+        );
+        assert_eq!(signed.recover_sender().unwrap(), address_from_key(&key));
+        assert_eq!(super::parse_cloid("0xff"), Ok(255));
+        assert_eq!(super::parse_cloid("42"), Ok(42));
+        assert_eq!(
+            super::parse_cloid("0xffffffffffffffffffffffffffffffff"),
+            Ok(u128::MAX)
+        );
+        assert!(super::parse_cloid("0x1ffffffffffffffffffffffffffffffff").is_err());
+        assert!(super::parse_cloid("-1").is_err());
     }
 
     #[test]

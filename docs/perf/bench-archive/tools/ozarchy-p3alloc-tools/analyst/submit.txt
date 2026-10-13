@@ -1,0 +1,13 @@
+mean ms per observation (3 nodes, cell delta; mean of 4 cells)
+metric                                               gm       jgm        g2       jg2
+torus_rpc_submit_admit_seconds                    0.910     0.989     0.874     0.837
+torus_rpc_submit_permit_wait_seconds              6.642     7.855     6.536     6.162
+torus_rpc_submit_verify_seconds                  12.108    13.413    10.651    10.709
+torus_rpc_submit_admit_insert_seconds             0.893     0.983     0.858     0.833
+torus_rpc_request_duration_seconds               20.923    23.554    19.294    18.864
+torus_block_build_seconds                        25.366    33.269    20.769    24.053
+torus_block_build_select_seconds                 13.283    18.050     9.535    11.512
+torus_view_propose_build_seconds                 27.961    39.394    21.491    24.920
+torus_view_propose_delay_seconds                 28.165    39.786    21.592    25.049
+torus_view_proposal_arrival_seconds              67.824    59.880    65.301    53.355
+torus_view_propose_finalize_seconds               0.204     0.392     0.101     0.129

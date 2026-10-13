@@ -1214,6 +1214,113 @@ fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
     );
 }
 
+/// s114 (CoreWriter follow-up 1): the block execution reports, for each
+/// queue row a successful tx queued, that tx's receipt and the row's call
+/// index within the tx, in queue order. A reverted tx, a caught inner-frame
+/// revert and a skipped (invalid) tx queue nothing and report nothing; a tx
+/// with two calls reports both, call index 0 then 1; the receipt index skips
+/// the skipped tx (it has no receipt).
+#[test]
+fn block_execution_reports_the_tx_and_call_of_each_queued_row() {
+    use torus_evm::CoreWriterOrigin;
+    let (_dir, db) = open_test_db();
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+
+    let stopper = Address::new([0xC2; 20]);
+    let reverter = Address::new([0xC1; 20]);
+    let twice = Address::new([0xC3; 20]);
+    let outer = Address::new([0xA0; 20]);
+    install_contract(&db, &stopper, &core_writer_proxy_code(&[0x00]));
+    install_contract(&db, &reverter, &core_writer_proxy_code(&[0x5f, 0x5f, 0xfd]));
+    // Two CoreWriter calls, then STOP.
+    install_contract(
+        &db,
+        &twice,
+        &core_writer_proxy_code(&core_writer_proxy_code(&[0x00])),
+    );
+    // Calls the reverter, swallows its revert, STOPs: a caught inner revert.
+    install_contract(&db, &outer, &call_and_swallow_revert_code(&reverter));
+
+    let block_cfg = default_block_cfg(); // number = 1
+    let make_tx = |to: Address, nonce: u64| TxEnv {
+        caller: ALICE,
+        gas_limit: 1_000_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(to),
+        value: U256::ZERO,
+        data: Bytes::from(cancel_order_calldata(42)),
+        nonce,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let txs = vec![
+        make_tx(stopper, 0),  // receipt 0: one row
+        make_tx(reverter, 1), // receipt 1: reverted, no row
+        make_tx(stopper, 9),  // nonce gap: skipped, no receipt
+        make_tx(twice, 2),    // receipt 2: two rows
+        make_tx(outer, 3),    // receipt 3: caught inner revert, no row
+        make_tx(stopper, 4),  // receipt 4: one row
+    ];
+
+    let result = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block(&db, &block_cfg, txs, true)
+        .unwrap();
+    assert_eq!(result.included_indices, vec![0, 1, 3, 4, 5]);
+    let status: Vec<bool> = result.receipts.iter().map(|r| r.status).collect();
+    assert_eq!(status, vec![true, false, true, true, true]);
+
+    let origin = |seq, receipt, call_index| CoreWriterOrigin {
+        target_block: 2,
+        seq,
+        receipt,
+        call_index,
+    };
+    assert_eq!(
+        result.core_writer_origins,
+        vec![
+            origin(0, 0, 0),
+            origin(1, 2, 0),
+            origin(2, 2, 1),
+            origin(3, 4, 0)
+        ]
+    );
+    // The origins describe exactly the queue rows the block's batch writes.
+    let (_root, batch) = torus_state::incremental::evm_block_batch_incremental(
+        &db,
+        &result.bundle,
+        None,
+        Some(&result.native_writes),
+    )
+    .unwrap();
+    db.write(batch).unwrap();
+    assert_eq!(CoreWriterQueue::pending_count(&db, 2).unwrap(), 4);
+}
+
+/// s114: a block whose txs call no writer precompile reports no origin.
+#[test]
+fn block_without_writer_calls_reports_no_origin() {
+    let (_dir, db) = open_test_db();
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 21_000,
+        gas_price: block_cfg.base_fee as u128,
+        kind: TxKind::Call(Address::new([0x42; 20])),
+        value: U256::from(1u64),
+        nonce: 0,
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let result = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block(&db, &block_cfg, vec![tx], false)
+        .unwrap();
+    assert!(result.receipts[0].status);
+    assert!(result.core_writer_origins.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // EVM-PF-05: Lockbox precompile (0x0820) vs revm's block-level State cache.
 //

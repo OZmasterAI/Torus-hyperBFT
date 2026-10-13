@@ -1,0 +1,492 @@
+[
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "matching-inner-loop",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a8c7065a34f3e79f4.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a9b24ff306e8629a6.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "futex-waits",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a1a982cebb1c3a77e.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a33509bc179cb0d5e.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "blocktree-io",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-ad068829632f4906d.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a155de3e09bb7fd9c.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "main-loop",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a843552cc17b20978.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a1748fc82b8ba5961.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "logging-telemetry",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-abc1c8cc9009778c3.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-aaf15c1edd329ef6e.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "event-bus",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-ac25cd01051d4efbc.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-ab20c9380f0642906.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "leader-rotation",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a600dffb6e8094469.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-acf63c575bcba0bc8.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "rpc-ingress",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a4792a4e15b4017e0.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-aa930f7457b5c4c02.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "mempool-structures",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-ae557dcb3376f1b97.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a2ad6114c03327cfc.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "qc-verify",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-af134e421195e1ad7.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-af45ca63cb8dbb043.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "steady-timeouts",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-aa52c938e67b755db.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-ae6ffbcb5994fe6b2.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "msg-encoding",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a2048683fca10ed9a.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a6a5ee689ed1d07b6.jsonl"
+  ]
+ },
+ {
+  "run": "wf_b7c221f5-bab",
+  "model": "opus",
+  "angle": "network-loop",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a2042632837e3ec0f.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_b7c221f5-bab/agent-a751a840e451dc41b.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "sync-catchup",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a0c50fbea81fa6ede.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a6c531db24b3936cd.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "correctness-perf-bugs",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-afb811446e794014b.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-af56d78cd97b6f120.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "trie-hash",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a53ba8b498c4a6c61.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-aa78681e2e043007b.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "bench-generator",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-aed60365a8761c944.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a565eded6bc98dd18.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "graph-hubs",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-aeea8170cfefdd8bc.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a575ccab0eb0f66b8.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "thread-oversubscription",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a364d99284953ebde.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-aca17285c3aeffa23.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "exec-pipeline",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-ad4975425a8894a3f.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a54aa335d30b4246a.jsonl"
+  ]
+ },
+ {
+  "run": "wf_acc1984a-5ff",
+  "model": "opus",
+  "angle": "memory-growth",
+  "angle_prompt": null,
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-a5f48e5c88548facb.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_acc1984a-5ff/agent-ad2dcb10138309ac0.jsonl"
+  ]
+ },
+ {
+  "run": "wf_432acae7-a30",
+  "model": "fable",
+  "angle": "channel-capacity",
+  "angle_prompt": "Bounded channels between threads (sync_channel, tokio mpsc): capacities, what happens when full (block vs drop), and whether any full-channel stall can back up into consensus.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-aa23db8e362b50595.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-a46b591d50b44df6b.jsonl"
+  ]
+ },
+ {
+  "run": "wf_432acae7-a30",
+  "model": "fable",
+  "angle": "body-encoding",
+  "angle_prompt": "Block body encoding efficiency: delta/varint/dictionary encodings for orders, repeated fields (market id, sender), and the impact on DA bytes and hashing time.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-af92668f7892b50a8.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-af85525476a792665.jsonl"
+  ]
+ },
+ {
+  "run": "wf_432acae7-a30",
+  "model": "fable",
+  "angle": "per-market-exec",
+  "angle_prompt": "Deterministic per-market parallel execution beyond what exists: which parts of a block's execution are still serial across markets, and a safe partitioning scheme.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-a46d31bebf3db6324.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-a04e99929e578e779.jsonl"
+  ]
+ },
+ {
+  "run": "wf_432acae7-a30",
+  "model": "fable",
+  "angle": "batch-size-economics",
+  "angle_prompt": "PlaceOrderBatch of 400 orders: is 400 the right size for throughput vs latency vs block packing (cap 200 actions)? Model bytes and CPU per order at other sizes.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-aa469ba728e01cdcd.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-a82263ef31343e4b5.jsonl"
+  ]
+ },
+ {
+  "run": "wf_432acae7-a30",
+  "model": "fable",
+  "angle": "book-persistence",
+  "angle_prompt": "Order book persistence modes (TORUS_BOOK_ROWS, resident books, deferred saves): memory footprint, write volume per block, restart rebuild cost.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-a722a9171debab9af.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-a9adb8ff0d107932d.jsonl"
+  ]
+ },
+ {
+  "run": "wf_432acae7-a30",
+  "model": "fable",
+  "angle": "multi-block-views",
+  "angle_prompt": "Could more than one block be committed per view, or blocks be larger without lengthening views (sub-blocks, pipelined proposals, proposer batching)? What in the protocol limits throughput to one block per ~1.5 views?",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-aab38512a71fecf80.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_432acae7-a30/agent-a1ebd5d73c1180326.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ecaee33e-459",
+  "model": "fable",
+  "angle": "validator-scaling",
+  "angle_prompt": "What breaks or slows as the validator set grows from 3 to 7, 10, 20 (message complexity, certificate size, body fan-out, leader bandwidth)?",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-aee17ac6c13fc71dc.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a6c53b26f7b418d85.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ecaee33e-459",
+  "model": "fable",
+  "angle": "async-blocking",
+  "angle_prompt": "Blocking calls inside async contexts (RocksDB, locks, CPU work on tokio workers without spawn_blocking), runtime starvation risks, and their effect on networking and RPC latency.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a84e1b0fc4c02867a.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a55fe147a940c9a6c.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ecaee33e-459",
+  "model": "fable",
+  "angle": "partition-loss",
+  "angle_prompt": "Behaviour under network partitions, packet loss, or one slow validator (not killed): what the harness never tests, and likely failure modes.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-ae29504576659cc98.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a56d406a6c4e62948.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ecaee33e-459",
+  "model": "fable",
+  "angle": "debug-leftovers",
+  "angle_prompt": "Debug/diagnostic instrumentation left on hot paths in release builds (e.g. body_fetch_diag, wedge_diag, per-message INFO logs), feature flags compiled in, and dead code that still costs time.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a8b94fe3740fe9fec.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a77f36708b9468591.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ecaee33e-459",
+  "model": "fable",
+  "angle": "hasher-choice",
+  "angle_prompt": "Hash map hasher choice on hot paths (SipHash default vs FxHash/ahash), and other std collection choices where a cheaper structure fits.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a9256ec25568466ac.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-ae5c88a1246929ca9.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ecaee33e-459",
+  "model": "fable",
+  "angle": "lock-contention",
+  "angle_prompt": "Shared-state locks (mempool RwLock, block tree, metrics mutexes, caches): hold times and contention between ingress, consensus, and exec threads; lock-free or sharded alternatives.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a64e167ca0e9730f8.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a6cbc3d12a82bdb5d.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ecaee33e-459",
+  "model": "fable",
+  "angle": "recent-change-safety",
+  "angle_prompt": "Safety review of recent performance changes (exec pipeline, body fetch, deferred book saves, batched cancel-all, CTE): look for crash-consistency or determinism bugs a benchmark would not catch.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-afcc4ee12e71c5186.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ecaee33e-459/agent-a0bc17cf097eba140.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "model-checking",
+  "angle_prompt": "Which safety/liveness invariants are (or could be) model-checked (a stateright model exists) or property-tested; gaps between the model and the implementation, especially around recent changes.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a89c76024ae561a17.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a3d61c054f0080ea9.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "state-root-placement",
+  "angle_prompt": "Where the state root sits relative to consensus (lagged roots, execution certificates, post-commit attestations): options that remove execution from the voting critical path while keeping light-client verifiability.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a3e46678e228f122a.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-ad4fcdc6db94f131b.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "upgrade-path",
+  "angle_prompt": "Protocol upgrade and migration mechanics (lockstep-deploy consensus changes noted in code, genesis bumps): risks and a safer upgrade process.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a511be08eb6f737f1.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a49385c68aa4c3246.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "portfolio-margin",
+  "angle_prompt": "Cross-market margin and risk computation complexity per order and per block as accounts hold positions in many markets; scaling limits and incremental designs.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a6ca14f416f2c9154.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-af7d8e60dac54550a.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "rpc-read-load",
+  "angle_prompt": "Read-side load (getOrderBook, positions, trades, websockets) under trading load: its CPU/lock/DB impact on the validator, and whether reads should move to separate RPC/indexer nodes or caches.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a3eb855b42e59bd1f.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a5fe0851d42d7dfb1.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "dag-dissemination",
+  "angle_prompt": "Separating data dissemination from ordering (Narwhal-style worker batches with availability certificates): how it would map onto the existing native DA / CompactBlock design, and the expected effect on view time and leader bandwidth.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-af18871c2fb5a90e6.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a04e30c2898d7829c.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "crash-consistency",
+  "angle_prompt": "Audit every multi-step persistence sequence (block insert, commit write, commit feed, exec flush, deferred book save, trade writer, manifest) for atomicity holes and recovery gaps after SIGKILL or power loss.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a47288850771e7175.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-ad609cd5fa94b0362.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "workload-realism",
+  "angle_prompt": "Benchmark workload realism: compare the generator's order mix (cross fraction, cancels, band, senders, markets) with realistic exchange flow (market makers vs takers, cancel/replace ratios, many markets) and predict how headline numbers would change.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a37573fdd933591e5.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a826846dbed228cd8.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "prod-observability",
+  "angle_prompt": "Operating the chain in production: missing metrics, health signals and alerts (e.g. liveness freezes, expiry rates, fork detection) and cheap ways to add them.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-aee6b1a82406420f9.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-ab451f443cc17f61a.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "matching-design",
+  "angle_prompt": "Matching mechanism design: continuous matching per block vs frequent batch auctions per block/market; throughput, fairness/MEV and determinism implications for this engine.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a9f04093faf77770b.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-ad2fb37d81ed49ef5.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "market-data-streaming",
+  "angle_prompt": "Market-data streaming design (book deltas, trades, fills to clients): current mechanism, cost per subscriber, and a scalable design.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a62dd9812a55c7687.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a49e5585499156334.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "fee-priority",
+  "angle_prompt": "Fee-based prioritisation and anti-spam economics: how fees could drive admission and selection under overload, and interaction with fairness and the matching engine.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-aa75c66a58797e9fe.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a3d0b9914aeee5438.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "validator-key-ops",
+  "angle_prompt": "Validator key management and operational security (e.g. the --validator-key deprecation warning, keystores, session keys), and risks to liveness/safety from key handling.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-ac74a96c26072ee00.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-ade6dd93a98940a5f.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "protocol-alternatives",
+  "angle_prompt": "Compare this HotStuff/MonadBFT fork with newer protocols (HotStuff-2, Jolteon/DiemBFT 2-chain, Narwhal/Bullshark, Mysticeti, Autobahn): which specific ideas could be adopted incrementally here, and what latency/throughput they would buy at n=3 and n>=4.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-abd2f348bef26f953.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a782e7481f4285d95.jsonl"
+  ]
+ },
+ {
+  "run": "wf_ca7d382b-9d4",
+  "model": "opus",
+  "angle": "optimistic-execution",
+  "angle_prompt": "Speculative/optimistic execution: executing a block when it is proposed or voted rather than after commit, to hide exec latency; what the CTE design and exec pipeline would need, and rollback cost.",
+  "partial_transcripts": [
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-a7277d6ce1c4daa9b.jsonl",
+   "/home/18c/.torus/projects/-home-18c-projects-Torus-hyperBFT/73f2d9f3-9d51-4ff5-8557-cc4431dcced2/subagents/workflows/wf_ca7d382b-9d4/agent-adfc37e92c617ac03.jsonl"
+  ]
+ }
+]
