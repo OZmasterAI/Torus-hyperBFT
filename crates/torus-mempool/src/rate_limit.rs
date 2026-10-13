@@ -155,8 +155,20 @@ pub fn admission_horizon_ms() -> u64 {
 /// `true` = on; unset, empty, `0` or `false` = off; anything else = off with
 /// a warning.
 pub fn parse_admission_exec_aware(raw: Option<String>) -> bool {
-    let _ = raw;
-    false
+    let Some(raw) = raw else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" => false,
+        "1" | "true" => true,
+        other => {
+            tracing::warn!(
+                value = other,
+                "TORUS_ADMISSION_EXEC_AWARE: not 0/1/true/false — exec-aware admission OFF"
+            );
+            false
+        }
+    }
 }
 
 /// The node's `TORUS_ADMISSION_EXEC_AWARE` (node-local ingress policy).

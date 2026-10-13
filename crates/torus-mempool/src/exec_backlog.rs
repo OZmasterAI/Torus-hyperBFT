@@ -44,21 +44,46 @@ impl ExecBacklog {
         count: impl FnOnce() -> usize,
         publish: impl FnOnce(usize),
     ) {
-        let _ = (height, count, publish);
-        todo!()
+        let mut inner = self.inner.lock().unwrap();
+        if inner.finished_through.is_some_and(|done| height <= done)
+            || inner.by_height.contains_key(&height)
+        {
+            return;
+        }
+        let n = count();
+        inner.by_height.insert(height, n);
+        inner.sum = inner.sum.saturating_add(n);
+        self.total.store(inner.sum, Ordering::Relaxed);
+        publish(inner.sum);
     }
 
     /// Execution of `height` finished (or was abandoned at it): release every
     /// counted height at or below it.
     pub fn finished_through(&self, height: u64, publish: impl FnOnce(usize)) {
-        let _ = (height, publish);
-        todo!()
+        let mut inner = self.inner.lock().unwrap();
+        inner.finished_through = Some(inner.finished_through.map_or(height, |d| d.max(height)));
+        // Heights above `height` stay; everything at or below is done.
+        let above = match height.checked_add(1) {
+            Some(next) => inner.by_height.split_off(&next),
+            None => BTreeMap::new(),
+        };
+        let done = std::mem::replace(&mut inner.by_height, above);
+        if done.is_empty() {
+            return;
+        }
+        let released: usize = done.values().sum();
+        inner.sum = inner.sum.saturating_sub(released);
+        self.total.store(inner.sum, Ordering::Relaxed);
+        publish(inner.sum);
     }
 
     /// Drop every outstanding height (the execution pipeline is gone).
     pub fn clear(&self, publish: impl FnOnce(usize)) {
-        let _ = publish;
-        todo!()
+        let mut inner = self.inner.lock().unwrap();
+        inner.by_height.clear();
+        inner.sum = 0;
+        self.total.store(0, Ordering::Relaxed);
+        publish(0);
     }
 
     /// Committed-but-unexecuted normal actions now.

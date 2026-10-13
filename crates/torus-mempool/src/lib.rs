@@ -355,16 +355,26 @@ impl Mempool {
     /// stack): at most ORACLE_PENDING_PER_VALIDATOR per validator, and they
     /// bypass this screen themselves, so counting them could only let oracle
     /// traffic shed orders.
+    ///
+    /// Exec-aware admission (opt-in, [`Self::exec_aware_admission`]): the
+    /// normal actions of committed blocks dispatched to execution but not yet
+    /// executed count too (they left the pool at dispatch, yet a new order
+    /// still waits behind them). Off: exactly the pooled count, as before.
     pub fn native_admission_backlogged(&self) -> bool {
-        self.native_admission_limit()
-            .is_some_and(|limit| self.native.read().unwrap().normal_size() >= limit)
+        self.native_admission_limit().is_some_and(|limit| {
+            let pooled = self.native.read().unwrap().normal_size();
+            if self.exec_aware_admission() {
+                pooled.saturating_add(self.exec_backlog.outstanding()) >= limit
+            } else {
+                pooled >= limit
+            }
+        })
     }
-
 
     /// Exec-aware admission is in effect: the knob is on AND the admission
     /// limit is on (with the limit off there is nothing to add the work to).
     pub fn exec_aware_admission(&self) -> bool {
-        todo!()
+        self.config.native_admission_exec_aware && self.config.native_admission_horizon_ms != 0
     }
 
     /// Consensus thread, right before a committed block enters the exec
@@ -373,27 +383,53 @@ impl Mempool {
     /// Idempotent per height (a rank-2 retry is not recounted). No-op with
     /// exec-aware admission off.
     pub fn note_exec_dispatched(&self, height: u64, actions: &[SignedNativeAction]) {
-        let _ = (height, actions);
-        todo!()
+        if !self.exec_aware_admission() {
+            return;
+        }
+        self.exec_backlog.dispatched(
+            height,
+            || {
+                actions
+                    .iter()
+                    .filter(|a| !native_pool::is_priority(&a.action))
+                    .count()
+            },
+            |total| self.publish_committed_unexecuted(total),
+        );
     }
 
     /// Exec thread, after it finished (or abandoned) `height`: release every
     /// counted height at or below it.
     pub fn note_exec_finished(&self, height: u64) {
-        let _ = height;
-        todo!()
+        if !self.exec_aware_admission() {
+            return;
+        }
+        self.exec_backlog
+            .finished_through(height, |total| self.publish_committed_unexecuted(total));
     }
 
     /// The execution pipeline is gone (fail-stop, closed channel): drop all
     /// committed-but-unexecuted counts.
     pub fn clear_exec_backlog(&self) {
-        todo!()
+        if !self.exec_aware_admission() {
+            return;
+        }
+        self.exec_backlog
+            .clear(|total| self.publish_committed_unexecuted(total));
     }
 
     /// Committed normal actions dispatched to execution but not yet executed
     /// (0 with exec-aware admission off).
     pub fn committed_unexecuted_normal(&self) -> usize {
-        todo!()
+        self.exec_backlog.outstanding()
+    }
+
+    /// Called under the counter's lock, so a stale total never overwrites
+    /// a newer one.
+    fn publish_committed_unexecuted(&self, total: usize) {
+        if let Some(m) = self.metrics.get() {
+            m.mempool_native_committed_unexecuted.set(total as i64);
+        }
     }
 
     fn record_native_commits_at(&self, now: std::time::Instant, committed: usize) {

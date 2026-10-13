@@ -4423,7 +4423,16 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         }
         // Rank 1: keep the metrics-free mirror in lockstep with the gauge.
         ctx.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+        // Exec-aware admission: this height (and any skipped below it) is no
+        // longer committed-but-unexecuted. No-op with the knob off.
+        if let Some(ref mempool) = ctx.mempool {
+            mempool.note_exec_finished(height);
+        }
         if ctx.exec_failed.load(Ordering::SeqCst) {
+            // Blocks still queued behind this one never execute here.
+            if let Some(ref mempool) = ctx.mempool {
+                mempool.clear_exec_backlog();
+            }
             // Dropping `rx` closes the channel: the consensus thread's next
             // send fails and latches the same fail-stop on the TorusApp side.
             tracing::error!(
@@ -4432,6 +4441,10 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             );
             return;
         }
+    }
+    // The loop is gone: nothing still counted will execute here.
+    if let Some(ref mempool) = ctx.mempool {
+        mempool.clear_exec_backlog();
     }
     // R01b D: the channel closed. Only a deliberate stop sets `exec_shutdown`;
     // otherwise the consensus side died (its `TorusApp` dropped by a panic) and
@@ -7794,6 +7807,15 @@ impl TorusApp {
         }
 
         if let Some(ref tx) = self.exec_tx {
+            // Exec-aware admission (opt-in): the block's normal actions left
+            // the pool above; count them as committed-but-unexecuted BEFORE
+            // the send (the exec thread releases the height after executing
+            // it, so the count can never be released first). Idempotent per
+            // height: a rank-2 retry is not recounted, and a parked block
+            // stays counted. No-op with the knob off.
+            if let Some(ref mempool) = self.mempool {
+                mempool.note_exec_dispatched(height, &torus_block.native_actions);
+            }
             let msg = CommittedBlockMsg {
                 torus_block,
                 pending_slashes,
@@ -7836,6 +7858,10 @@ impl TorusApp {
                             m.exec_queue_depth.dec();
                         }
                         self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+                        // Nothing dispatched will execute here any more.
+                        if let Some(ref mempool) = self.mempool {
+                            mempool.clear_exec_backlog();
+                        }
                         // T1.5 FAIL-STOP: the execution thread is gone (panic or
                         // fatal) — this block is committed by consensus but will
                         // NEVER execute here. Latch the failure: the node stops
@@ -7854,6 +7880,10 @@ impl TorusApp {
                     m.exec_queue_depth.dec();
                 }
                 self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
+                // Nothing dispatched will execute here any more.
+                if let Some(ref mempool) = self.mempool {
+                    mempool.clear_exec_backlog();
+                }
                 // T1.5 FAIL-STOP: the execution thread is gone (panic or
                 // fatal) — this block is committed by consensus but will
                 // NEVER execute here. Latch the failure: the node stops
