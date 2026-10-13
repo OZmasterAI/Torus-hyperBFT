@@ -15,6 +15,8 @@ USAGE
   --strict      exit 2 without writing anything if any check warns
   --learn-fields  append the summary.json fields flagged by check (a) to summary-fields.txt (after you noted them)
   --bench-root / --archive-dir / --repo / --fields-file / --summary-file   override the defaults (tests use these)
+  --index-file / --cells-file / --deletable-file / --tools-dir   write somewhere else than <archive-dir>/INDEX.md,
+                cells.md, DELETABLE.md and tools/ozarchy-<camp>-tools/ (the three files must exist: they are updated)
 
   Typical run: write meta/<camp>.toml, `--dry-run`, read the warnings and the diff, fix the meta, run for real,
   review `git diff`, commit together with the results-doc section and the plan row (both still by hand).
@@ -1557,9 +1559,21 @@ def main(argv=None):
     ap.add_argument("--repo", default=None)
     ap.add_argument("--fields-file", default=os.path.join(here, "summary-fields.txt"))
     ap.add_argument("--summary-file", default=None, help="override [summary] file (path)")
+    ap.add_argument("--index-file", default=None, help="INDEX.md to update (default: in --archive-dir)")
+    ap.add_argument("--cells-file", default=None, help="cells.md to update (default: in --archive-dir)")
+    ap.add_argument("--deletable-file", default=None, help="DELETABLE.md to update (default: in --archive-dir)")
+    ap.add_argument("--tools-dir", default=None, help="tools copy dir (default: <archive-dir>/tools/ozarchy-<camp>-tools)")
     a = ap.parse_args(argv)
     archive = os.path.abspath(a.archive_dir)
     repo = os.path.abspath(a.repo or os.path.join(archive, "..", "..", ".."))
+
+    def label_of(p):
+        """How a written path is named in the report and the dry-run diffs: relative to the archive dir (the
+        defaults), else to the repo, else absolute."""
+        for base in (archive, repo):
+            if p.startswith(base + os.sep):
+                return os.path.relpath(p, base)
+        return p
     try:
         meta = load_meta(a.meta)
         if meta.get("camp", a.camp) != a.camp:
@@ -1577,9 +1591,10 @@ def main(argv=None):
         # absolute: the smoke commands get {bench} with cwd = their scratch dir
         c = Campaign(a.camp, meta, os.path.abspath(a.bench_root), repo)
         names = ["INDEX.md", "cells.md", "DELETABLE.md"]
-        paths = [os.path.join(archive, f) for f in names]
+        given = [a.index_file, a.cells_file, a.deletable_file]
+        paths = [os.path.abspath(g_) if g_ else os.path.join(archive, f) for f, g_ in zip(names, given, strict=True)]
         texts = [read(p) for p in paths]
-        labels = list(names)
+        labels = [label_of(p) for p in paths]
         spath = None
         if meta.get("summary"):
             spath = os.path.abspath(a.summary_file or os.path.join(repo, meta["summary"]["file"]))
@@ -1587,9 +1602,9 @@ def main(argv=None):
             labels.append(os.path.relpath(spath, repo) if spath.startswith(repo + "/") else meta["summary"]["file"])
         else:
             c.warn.append(("m", "no [summary] in the meta: summary table not updated"))
-        tools_dir = os.path.join(archive, "tools", "ozarchy-%s-tools" % a.camp)
+        tools_dir = os.path.abspath(a.tools_dir or os.path.join(archive, "tools", "ozarchy-%s-tools" % a.camp))
         refuse = ["campaign %s already in the archive: %s" % (a.camp, h_) for h_ in present(c, texts, tools_dir)]
-        named = [(n, t, False) for n, t in zip(names, texts, strict=True)]
+        named = [(n, t, False) for n, t in zip(labels[:3], texts, strict=True)]
         if spath:
             named.append((labels[3], stext, True))
         refuse += used_numbers(c, named)
@@ -1615,7 +1630,7 @@ def main(argv=None):
             texts.append(stext)
             new.append(render_summary(c, stext))
         # read every tool source now: a missing or unreadable one must stop the run before anything is written
-        rel_tools = os.path.relpath(tools_dir, archive)
+        rel_tools = label_of(tools_dir)
         sources = [(src, dst, "%s/%s" % (rel_tools, dst)) for src, dst in plan]
         if md5:
             sources.append((md5, "md5s-all.txt", rel_tools + "/md5s-all.txt"))

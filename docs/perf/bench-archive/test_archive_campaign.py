@@ -1113,6 +1113,72 @@ class RunExclude(FixtureCase):
             self.assertEqual(fx.snapshot(), snap)
 
 
+class OutputPaths(FixtureCase):
+    """--index-file / --cells-file / --deletable-file / --tools-dir: write somewhere else than the archive dir."""
+
+    def setUp(self):
+        super().setUp()
+        fx = self.fx
+        self.out = os.path.join(fx.tmp, "out")
+        self.paths = {
+            "index": os.path.join(self.out, "IDX.md"),
+            "cells": os.path.join(self.out, "C.md"),
+            "deletable": os.path.join(self.out, "D.md"),
+            "tools": os.path.join(self.out, "tools-tc"),
+        }
+        write(self.paths["index"], INDEX_MD)
+        write(self.paths["cells"], CELLS_MD)
+        write(self.paths["deletable"], DELETABLE_MD)
+
+    def args(self):
+        p = self.paths
+        return ["--index-file", p["index"], "--cells-file", p["cells"], "--deletable-file", p["deletable"],
+                "--tools-dir", p["tools"]]
+
+    def test_overridden_paths_are_written_archive_untouched(self):
+        fx = self.fx
+        snap = {k: v for k, v in fx.snapshot().items() if k != "<summary>"}
+        r = fx.run(*self.args())
+        self.assertOk(r)
+        self.assertEqual({k: v for k, v in fx.snapshot().items() if k != "<summary>"}, snap)
+        with open(self.paths["index"]) as f:
+            self.assertIn("**Updated 2026-10-13 (tc).**", f.read())
+        with open(self.paths["cells"]) as f:
+            self.assertIn("## tc: tc heading (section 7)", f.read())
+        with open(self.paths["deletable"]) as f:
+            self.assertIn("### `tc` (A ", f.read())
+        self.assertTrue(os.path.isfile(os.path.join(self.paths["tools"], "analyst", "cells.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(self.paths["tools"], "md5s-all.txt")))
+        self.assertIn("smoke check 1/1 OK", r.stdout)
+        # the refusal sees the overridden files: a second run is refused, nothing changes
+        before = open(self.paths["index"]).read()
+        r = fx.run(*self.args())
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(open(self.paths["index"]).read(), before)
+
+    def test_tools_dir_alone_is_checked_for_presence(self):
+        fx = self.fx
+        os.makedirs(self.paths["tools"])
+        r = fx.run("--tools-dir", self.paths["tools"])
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("tools-tc", r.stderr)
+
+    def test_dry_run_labels_name_the_overridden_files(self):
+        fx = self.fx
+        r = fx.run("--dry-run", *self.args())
+        self.assertOk(r)
+        for p in ("index", "cells", "deletable"):
+            self.assertIn("+++ b/%s\n" % self.paths[p], r.stdout)
+        self.assertIn("+++ b/%s/md5s-all.txt\n" % self.paths["tools"], r.stdout)
+
+    def test_default_labels_unchanged(self):
+        r = self.fx.run("--dry-run")
+        self.assertOk(r)
+        for f in ("INDEX.md", "cells.md", "DELETABLE.md"):
+            self.assertIn("+++ b/%s\n" % f, r.stdout)
+        self.assertIn("+++ b/tools/ozarchy-tc-tools/md5s-all.txt\n", r.stdout)
+
+
 class SummaryRows(FixtureCase):
     """[summary] rows: numbers from analyst/arms.txt unless [[summary.rows]] cols gives them."""
 
