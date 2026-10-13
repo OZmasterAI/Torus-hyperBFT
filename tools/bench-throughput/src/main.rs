@@ -16,6 +16,7 @@ use torus_types::{
 };
 
 mod by_id;
+mod cloid;
 mod in_flight;
 mod oracle_feed;
 
@@ -265,6 +266,15 @@ enum Command {
         /// index range, never a load sender) instead of fresh unfunded keys.
         #[arg(long, default_value_t = false)]
         spam_cancel_funded: bool,
+        /// Percent (0..=100) of placed orders that carry a client order id
+        /// (cloid; s114). Picked per order by a hash of a fixed per-sender
+        /// seed and the sender's order index (repeatable, never draws from
+        /// the load's RNG); the cloid is `run-start-ms << 64 | n`, n a
+        /// per-sender counter from 1, so it is nonzero and never collides
+        /// with the sender's other open orders (see cloid.rs). 0 (default) =
+        /// no cloids, byte-identical to a bench without the flag.
+        #[arg(long, default_value_t = 0, value_parser = cloid::parse_share)]
+        cloid_share: u8,
     },
     Combined {
         #[arg(
@@ -407,10 +417,12 @@ fn sign_payload_batch(
     bin: bool,
     plan: MarketPlan,
     sender_idx: usize,
+    cloids: &mut cloid::CloidStamper,
 ) -> (Vec<String>, u64) {
     let mut payloads = Vec::with_capacity(submit_batch);
     for _ in 0..submit_batch {
-        let action = random_place_order_action(rng, plan, sender_idx, batch_size);
+        let mut action = random_place_order_action(rng, plan, sender_idx, batch_size);
+        cloids.stamp(&mut action);
         let base = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -449,13 +461,15 @@ fn pregen_ammo(
     base_nonce: u64,
     plan: MarketPlan,
     sender_idx: usize,
+    cloids: &mut cloid::CloidStamper,
 ) -> Vec<Vec<String>> {
     let mut nonce = base_nonce;
     let mut ammo = Vec::with_capacity(count);
     for _ in 0..count {
         let mut payloads = Vec::with_capacity(submit_batch);
         for _ in 0..submit_batch {
-            let action = random_place_order_action(rng, plan, sender_idx, batch_size);
+            let mut action = random_place_order_action(rng, plan, sender_idx, batch_size);
+            cloids.stamp(&mut action);
             let signed = sign_one(action, nonce, key, session, mode);
             nonce += 1;
             let bytes = if bin {
@@ -3217,6 +3231,7 @@ async fn run_consensus(
     sweep_bodies: bool,
     spam: Option<SpamCancel>,
     cap_plan: Option<(usize, String, in_flight::TailMode)>,
+    cloid_share: u8,
 ) {
     // Locality plan: 0 = today's uniform draw over 1..=markets (default).
     let plan = MarketPlan::new(markets, markets_per_sender);
@@ -3290,6 +3305,9 @@ async fn run_consensus(
     }
     println!("Batch size: {orders_per_action} order(s)/action");
     println!("Submit batch: {submit_batch} action(s)/RPC call");
+    let cloid_run_tag = cloid::run_tag_now();
+    println!("{}", cloid::header(cloid_share, cloid_run_tag));
+    let cloid_stats = Arc::new(cloid::CloidStats::default());
     println!("RPC endpoints: {}", rpc_urls.len());
     println!(
         "Headline: {} | Body sweep: {}",
@@ -3440,12 +3458,14 @@ async fn run_consensus(
         let calib_session = keys[0].session_key.clone();
         let (calib_actions, calib_secs) = tokio::task::spawn_blocking(move || {
             let mut rng = StdRng::from_entropy();
+            // Same cloid share as the load (cloids cost signing/encoding too).
+            let mut cloids = cloid::CloidStamper::for_sender(cloid_share, 0, cloid_run_tag);
             let t = Instant::now();
             let mut n = 0u64;
             for _ in 0..3 {
                 let (p, _) = sign_payload_batch(
                     &mut rng, &calib_key, &calib_session, sign_mode, batch_size,
-                    submit_batch, 0, bin, plan, 0,
+                    submit_batch, 0, bin, plan, 0, &mut cloids,
                 );
                 n += p.len() as u64;
             }
@@ -3504,9 +3524,12 @@ async fn run_consensus(
         for (sender_idx, sk) in keys.iter().enumerate() {
             let key = sk.signing_key.clone();
             let session = sk.session_key.clone();
+            let cloid_stats = cloid_stats.clone();
             handles.push(tokio::task::spawn_blocking(move || {
                 let mut rng = StdRng::from_entropy();
-                pregen_ammo(
+                let mut cloids =
+                    cloid::CloidStamper::for_sender(cloid_share, sender_idx, cloid_run_tag);
+                let ammo = pregen_ammo(
                     &mut rng,
                     &key,
                     &session,
@@ -3518,7 +3541,10 @@ async fn run_consensus(
                     base_nonce,
                     plan,
                     sender_idx,
-                )
+                    &mut cloids,
+                );
+                cloid_stats.add(&cloids);
+                ammo
             }));
         }
         for h in handles {
@@ -3725,6 +3751,7 @@ async fn run_consensus(
         let cap = cap.clone();
         let mix = mix.clone();
         let (by_id_url, by_id_stats) = (by_id_url.clone(), by_id_stats.clone());
+        let cloid_stats = cloid_stats.clone();
         let sender_ammo = if !stream {
             std::mem::take(&mut ammo[sender_idx])
         } else {
@@ -3756,6 +3783,8 @@ async fn run_consensus(
                 let mut next_fire = Instant::now();
                 // Cancel-by-id cell: this sender's resting orders, each used once.
                 let mut own_orders: Vec<by_id::OwnOrder> = Vec::new();
+                let mut cloids =
+                    cloid::CloidStamper::for_sender(cloid_share, sender_idx, cloid_run_tag);
                 while Instant::now() < deadline {
                     if let Some(iv) = econ_pace {
                         let now = Instant::now();
@@ -3819,6 +3848,11 @@ async fn run_consensus(
                     }
                     if actions.iter().any(|a| matches!(a, NativeAction::CancelAllOrders { .. })) {
                         own_orders.clear();
+                    }
+                    // --cloid-share (off: no write). After the draw, so the
+                    // load's RNG stream is the same at every share.
+                    for a in &mut actions {
+                        cloids.stamp(a);
                     }
                     // Generate inline (cheap), sign+encode on the blocking pool
                     // (the expensive ECDSA/serialize part). Nonces are wall-clock
@@ -3912,6 +3946,7 @@ async fn run_consensus(
                         }
                     });
                 }
+                cloid_stats.add(&cloids);
                 return;
             }
 
@@ -3966,6 +4001,8 @@ async fn run_consensus(
                 let (pregen_tx, mut pregen_rx) = tokio::sync::mpsc::channel::<Vec<String>>(4);
                 let signer = tokio::task::spawn_blocking(move || {
                     let mut rng = StdRng::from_entropy();
+                    let mut cloids =
+                        cloid::CloidStamper::for_sender(cloid_share, sender_idx, cloid_run_tag);
                     let mut last_nonce: u64 = 0;
                     loop {
                         let (payloads, n) = sign_payload_batch(
@@ -3979,12 +4016,14 @@ async fn run_consensus(
                             bin,
                             plan,
                             sender_idx,
+                            &mut cloids,
                         );
                         last_nonce = n;
                         if pregen_tx.blocking_send(payloads).is_err() {
                             break; // submit loop finished — receiver dropped
                         }
                     }
+                    cloid_stats.add(&cloids);
                 });
                 let mut starved_ns: u128 = 0;
                 // Pace the fire loop to the offered rate, same cadence as the
@@ -4223,6 +4262,7 @@ async fn run_consensus(
     if let Some(p) = &spam {
         println!("{}", spam_report(p, &spam_stats));
     }
+    println!("{}", cloid_stats.report(cloid_share));
 
     // Debug: full body-sweep accounting, only when --sweep-bodies re-fetched it.
     if let Some(summary) = &sweep_summary {
@@ -4458,6 +4498,7 @@ async fn main() {
             spam_cancel_keys,
             spam_cancel_rate,
             spam_cancel_funded,
+            cloid_share,
         } => {
             let bin = match format.as_str() {
                 "bin" => true,
@@ -4524,6 +4565,7 @@ async fn main() {
                 sweep_bodies,
                 spam,
                 cap,
+                cloid_share,
             )
             .await
         }
@@ -4568,7 +4610,85 @@ async fn main() {
 mod tests {
     use super::{fire_interval, pregen_ammo, sign_one, sign_payload_batch, MarketPlan, SignMode};
     use super::{summarize_included, SweptBlock};
+    use super::{cloid, Cli, Command};
+    use clap::Parser;
     use rand::{rngs::StdRng, SeedableRng};
+
+    /// --cloid-share 0: the stamper every caller had before the flag.
+    fn off() -> cloid::CloidStamper {
+        cloid::CloidStamper::for_sender(0, 0, 0)
+    }
+
+    fn cloid_share_flag(extra: &[&str]) -> Result<u8, clap::Error> {
+        let cli = Cli::try_parse_from(["bench-throughput", "consensus"].iter().chain(extra).copied())?;
+        let Command::Consensus { cloid_share, .. } = cli.command else {
+            panic!("consensus subcommand")
+        };
+        Ok(cloid_share)
+    }
+
+    #[test]
+    fn cloid_share_defaults_off_and_parses_0_to_100() {
+        assert_eq!(cloid_share_flag(&[]).unwrap(), 0);
+        assert_eq!(cloid_share_flag(&["--cloid-share", "100"]).unwrap(), 100);
+        assert_eq!(cloid_share_flag(&["--econ", "--cloid-share", "37"]).unwrap(), 37);
+        assert!(cloid_share_flag(&["--cloid-share", "101"]).is_err());
+        assert!(cloid_share_flag(&["--cloid-share", "-5"]).is_err());
+    }
+
+    /// The cloids of every order in a hex payload list (json or bin wire form).
+    fn payload_cloids(payloads: &[String], bin: bool) -> Vec<Option<u128>> {
+        payloads
+            .iter()
+            .flat_map(|p| {
+                let bytes = hex::decode(p.trim_start_matches("0x")).unwrap();
+                let s: torus_types::SignedNativeAction = if bin {
+                    bincode::deserialize(&bytes).unwrap()
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                match s.action {
+                    torus_types::NativeAction::PlaceOrder(p) => vec![p.client_order_id],
+                    torus_types::NativeAction::PlaceOrderBatch(o) => {
+                        o.into_iter().map(|p| p.client_order_id).collect()
+                    }
+                    _ => Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    // The legacy streaming and pre-sign paths sign the stamped orders: share
+    // 100 puts a distinct nonzero cloid on every order on the wire, share 0
+    // none, and one stamper keeps counting across calls (no reuse).
+    #[test]
+    fn legacy_paths_sign_the_stamped_cloids() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let plan = MarketPlan::new(3, 0);
+        for bin in [false, true] {
+            let mut rng = StdRng::seed_from_u64(1);
+            let mut all = cloid::CloidStamper::for_sender(100, 4, 0xABC);
+            let (p1, n1) =
+                sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 5, 3, 0, bin, plan, 4, &mut all);
+            let (p2, _) =
+                sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 5, 3, n1, bin, plan, 4, &mut all);
+            let ammo =
+                pregen_ammo(&mut rng, &key, &ed, SignMode::Eip712, 1, 2, 2, bin, 1_700_000_000_000, plan, 4, &mut all);
+            let wire: Vec<String> = p1.into_iter().chain(p2).chain(ammo.into_iter().flatten()).collect();
+            let cloids = payload_cloids(&wire, bin);
+            assert_eq!(cloids.len(), 5 * 3 * 2 + 2 * 2);
+            let set: std::collections::HashSet<u128> =
+                cloids.iter().map(|c| c.expect("share 100: every order")).collect();
+            assert_eq!(set.len(), cloids.len());
+            assert!(set.iter().all(|c| *c != 0 && (c >> 64) as u64 == 0xABC));
+
+            let mut rng = StdRng::seed_from_u64(1);
+            let (p0, _) =
+                sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 5, 3, 0, bin, plan, 4, &mut off());
+            assert!(payload_cloids(&p0, bin).iter().all(Option::is_none));
+        }
+    }
 
     #[test]
     fn sign_payload_batch_nonces_strictly_increase() {
@@ -4577,9 +4697,9 @@ mod tests {
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         let plan = MarketPlan::new(1, 0);
         let (p1, n1) =
-            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, plan, 0);
+            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, 0, false, plan, 0, &mut off());
         let (p2, n2) =
-            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, plan, 0);
+            sign_payload_batch(&mut rng, &key, &ed, SignMode::Eip712, 3, 4, n1, false, plan, 0, &mut off());
         assert_eq!(p1.len(), 4);
         assert_eq!(p2.len(), 4);
         assert!(n2 > n1, "nonce watermark must advance across batches");
@@ -4641,6 +4761,7 @@ mod tests {
             BASE,
             MarketPlan::new(1, 0),
             0,
+            &mut off(),
         );
         assert_eq!(ammo.len(), 3, "one payload-vec per requested count");
         assert!(
