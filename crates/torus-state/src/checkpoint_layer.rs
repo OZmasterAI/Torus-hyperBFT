@@ -14,17 +14,100 @@
 //! Only state rows: a block's out-of-batch hash extras (already durable) are
 //! not merged.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+
 use rocksdb::WriteBatch;
 
-use crate::backend::{FrozenPending, PendingState};
+use crate::backend::{CfPending, FrozenPending, PendingState, NUM_CFS};
 use crate::{StateDb, StateError};
+
+/// p3 merge wait: the CFs of L merged AFTER the end-of-block merge hands L
+/// back to the exec thread ([`LayerPart::Deferred`], read through a
+/// [`DeferredLayer`]). They are R's two big CFs: positions are ~92% of a
+/// block's state keys (results doc 41.1), and a native block reads both
+/// only from R (`NativeStateOverlay::attach_resident`), never through L. A
+/// read that does reach them through L (no R attached: R's rebuild, a
+/// block without R) waits for their merge, so the choice only moves time,
+/// never what a read returns.
+pub const DEFERRED_CFS: [&str; 2] = [
+    crate::cf::CF_NATIVE_POSITIONS,
+    crate::cf::CF_NATIVE_BALANCES,
+];
+
+/// Whether CF slot `i` (the overlay's CF index) is one of [`DEFERRED_CFS`].
+#[inline]
+pub(crate) fn is_deferred_slot(i: usize) -> bool {
+    static SLOTS: OnceLock<[bool; NUM_CFS]> = OnceLock::new();
+    SLOTS
+        .get_or_init(|| std::array::from_fn(|i| DEFERRED_CFS.contains(&crate::cf::ALL_CF_NAMES[i])))
+        [i]
+}
+
+/// Which CFs of a layer an operation covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerPart {
+    /// Every CF.
+    All,
+    /// Every CF except [`DEFERRED_CFS`].
+    Main,
+    /// Only [`DEFERRED_CFS`].
+    Deferred,
+}
+
+impl LayerPart {
+    #[inline]
+    fn holds(self, slot: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Main => !is_deferred_slot(slot),
+            Self::Deferred => is_deferred_slot(slot),
+        }
+    }
+}
+
+/// Fold `src` (newer) into `dst`, keeping `bytes` (key + value per write,
+/// key per tombstone) exact. Returns `src`'s bytes in that measure (s114:
+/// counted in this loop, so no extra walk).
+fn merge_cf(dst: &mut CfPending, bytes: &mut usize, src: &CfPending) -> usize {
+    let mut seen = 0usize;
+    for (k, v) in &src.writes {
+        seen += k.len() + v.len();
+        if dst.deletes.remove(k) {
+            *bytes -= k.len();
+        }
+        match dst.writes.get_mut(k) {
+            Some(old) => {
+                *bytes = *bytes - old.len() + v.len();
+                old.clone_from(v);
+            }
+            None => {
+                *bytes += k.len() + v.len();
+                dst.writes.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    for k in &src.deletes {
+        seen += k.len();
+        if let Some(old) = dst.writes.remove(k) {
+            *bytes -= k.len() + old.len();
+        }
+        if dst.deletes.insert(k.clone()) {
+            *bytes += k.len();
+        }
+    }
+    seen
+}
 
 /// The since-checkpoint layer: last value or tombstone per `(CF, key)` over
 /// the merged blocks, plus a running byte count (keys + values, a tombstone
 /// counts its key) for the checkpoint byte cap.
 pub struct CheckpointLayer {
     state: PendingState,
-    bytes: usize,
+    /// Bytes per CF slot (the byte cap reads the sum; a split moves its
+    /// CFs' counts with them).
+    bytes: [usize; NUM_CFS],
     /// Height of the last merged block (`None` while empty).
     top: Option<u64>,
     /// Item 6 Phase 3 (s114): this layer's share of the exec context's
@@ -42,7 +125,7 @@ impl CheckpointLayer {
     pub fn new() -> Self {
         Self {
             state: PendingState::new(),
-            bytes: 0,
+            bytes: [0; NUM_CFS],
             top: None,
             tracked: None,
         }
@@ -53,7 +136,7 @@ impl CheckpointLayer {
     /// A [`Self::duplicate`] of a tracked layer is tracked.
     pub fn track(&mut self, stats: &std::sync::Arc<crate::RetentionStats>) {
         if self.tracked.is_none() {
-            self.tracked = Some(crate::retention::Tracked::new(stats, self.bytes, None));
+            self.tracked = Some(crate::retention::Tracked::new(stats, self.bytes(), None));
         }
     }
 
@@ -62,39 +145,75 @@ impl CheckpointLayer {
     /// Records `frozen`'s bytes in its tracked share (s114: measured in this
     /// loop, so no extra walk).
     pub fn merge(&mut self, frozen: &FrozenPending) {
+        self.merge_part(frozen, LayerPart::All);
+    }
+
+    /// [`Self::merge`] restricted to `part`'s CFs (p3 merge wait: the
+    /// end-of-block merge folds [`LayerPart::Main`] into L, hands it back,
+    /// then folds [`LayerPart::Deferred`] into the part split off it).
+    pub fn merge_part(&mut self, frozen: &FrozenPending, part: LayerPart) {
         let src = frozen.pending_state();
         let mut seen = 0usize;
-        for (dst, cfp) in self.state.cfs.iter_mut().zip(src.cfs.iter()) {
-            for (k, v) in &cfp.writes {
-                seen += k.len() + v.len();
-                if dst.deletes.remove(k) {
-                    self.bytes -= k.len();
-                }
-                match dst.writes.get_mut(k) {
-                    Some(old) => {
-                        self.bytes = self.bytes - old.len() + v.len();
-                        old.clone_from(v);
-                    }
-                    None => {
-                        self.bytes += k.len() + v.len();
-                        dst.writes.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            for k in &cfp.deletes {
-                seen += k.len();
-                if let Some(old) = dst.writes.remove(k) {
-                    self.bytes -= k.len() + old.len();
-                }
-                if dst.deletes.insert(k.clone()) {
-                    self.bytes += k.len();
-                }
+        for (i, ((dst, bytes), cfp)) in self
+            .state
+            .cfs
+            .iter_mut()
+            .zip(self.bytes.iter_mut())
+            .zip(src.cfs.iter())
+            .enumerate()
+        {
+            if part.holds(i) {
+                seen += merge_cf(dst, bytes, cfp);
             }
         }
         self.top = Some(self.top.map_or(frozen.height(), |t| t.max(frozen.height())));
-        frozen.note_bytes(seen);
+        frozen.note_bytes(part, seen);
         if let Some(t) = &self.tracked {
-            t.set_bytes(self.bytes);
+            t.set_bytes(self.bytes());
+        }
+    }
+
+    /// p3 merge wait: move the [`DEFERRED_CFS`] out into a layer of their
+    /// own (same top), leaving this one without them. O(number of CFs): the
+    /// maps move, nothing is copied. [`Self::absorb`] puts them back.
+    pub fn split_deferred(&mut self) -> CheckpointLayer {
+        let mut out = CheckpointLayer::new();
+        for i in (0..NUM_CFS).filter(|i| is_deferred_slot(*i)) {
+            std::mem::swap(&mut self.state.cfs[i], &mut out.state.cfs[i]);
+            std::mem::swap(&mut self.bytes[i], &mut out.bytes[i]);
+        }
+        out.top = self.top;
+        // s114 retention: the part is a live layer of its own until
+        // [`Self::absorb`] takes it back; the bytes move with it.
+        if let Some(t) = &self.tracked {
+            t.set_bytes(self.bytes());
+            out.track(t.stats());
+        }
+        out
+    }
+
+    /// Fold `newer` on top of this layer, consuming it. A CF only `newer`
+    /// holds moves over without copying (the [`Self::split_deferred`] part
+    /// coming back); a CF both hold merges entry by entry, `newer` winning.
+    pub fn absorb(&mut self, mut newer: CheckpointLayer) {
+        for i in 0..NUM_CFS {
+            let src = &mut newer.state.cfs[i];
+            if src.is_empty() {
+                continue;
+            }
+            if self.state.cfs[i].is_empty() {
+                std::mem::swap(&mut self.state.cfs[i], src);
+                self.bytes[i] = newer.bytes[i];
+            } else {
+                merge_cf(&mut self.state.cfs[i], &mut self.bytes[i], src);
+            }
+        }
+        self.top = match (self.top, newer.top) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(t) = &self.tracked {
+            t.set_bytes(self.bytes());
         }
     }
 
@@ -113,13 +232,13 @@ impl CheckpointLayer {
             tracked: self
                 .tracked
                 .as_ref()
-                .map(|t| crate::retention::Tracked::new(t.stats(), self.bytes, None)),
+                .map(|t| crate::retention::Tracked::new(t.stats(), self.bytes(), None)),
         }
     }
 
     /// Bytes held (key + value per write, key per tombstone).
     pub fn bytes(&self) -> usize {
-        self.bytes
+        self.bytes.iter().sum()
     }
 
     /// Height of the last merged block.
@@ -176,6 +295,157 @@ impl CheckpointLayer {
             trie_cache,
             member_cache,
         )
+    }
+}
+
+/// p3 merge wait: the [`LayerPart::Deferred`] part of L while the merge
+/// thread may still be folding the previous block into it. Readers that
+/// need it ([`Self::read`]) block until it arrives; every other read of L
+/// goes on without it. Once it arrived (or the sender died) the answer is
+/// fixed, and every later call returns at once.
+pub struct DeferredLayer {
+    cell: OnceLock<Option<CheckpointLayer>>,
+    /// The merge thread's channel until a caller settles the part. A
+    /// caller blocked in `recv` holds it outside the mutex (`None` here
+    /// while `cell` is unset); the others wait on `settled`.
+    rx: Mutex<Option<Receiver<CheckpointLayer>>>,
+    settled: Condvar,
+    /// Reads that found the part still being merged and blocked (each
+    /// blocked caller once, also one waiting for another's `recv`).
+    read_waits: AtomicU64,
+    /// Nanoseconds those reads blocked.
+    read_wait_ns: AtomicU64,
+    /// Called once per read before it blocks (a test seam; `None` in
+    /// production).
+    on_block: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl DeferredLayer {
+    /// A part that is already merged.
+    pub fn ready(layer: CheckpointLayer) -> Self {
+        Self {
+            cell: OnceLock::from(Some(layer)),
+            rx: Mutex::new(None),
+            settled: Condvar::new(),
+            read_waits: AtomicU64::new(0),
+            read_wait_ns: AtomicU64::new(0),
+            on_block: None,
+        }
+    }
+
+    /// A part the merge thread sends on `rx` once merged. A sender dropped
+    /// without a value (the merge panicked) makes it `None` for good.
+    pub fn pending(rx: Receiver<CheckpointLayer>) -> Self {
+        Self {
+            cell: OnceLock::new(),
+            rx: Mutex::new(Some(rx)),
+            settled: Condvar::new(),
+            read_waits: AtomicU64::new(0),
+            read_wait_ns: AtomicU64::new(0),
+            on_block: None,
+        }
+    }
+
+    /// The merged part for a read (blocks while it is being merged; such a
+    /// read is counted in [`Self::read_waits`]). `None`: the merge failed.
+    pub fn read(&self) -> Option<&CheckpointLayer> {
+        self.resolve(true)
+    }
+
+    /// The merged part for the exec thread's end-of-block join (not counted
+    /// as a read wait). `None`: the merge failed.
+    pub fn join(&self) -> Option<&CheckpointLayer> {
+        self.resolve(false)
+    }
+
+    /// Whether the part has arrived (or failed) without blocking.
+    pub fn is_settled(&self) -> bool {
+        self.cell.get().is_some()
+    }
+
+    /// Call `f` before each read blocks on this part (a test seam: a test
+    /// holding the merge releases it here instead of deadlocking).
+    pub fn on_block(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_block = Some(Box::new(f));
+        self
+    }
+
+    /// `(reads that blocked, total time they blocked)` since the last call
+    /// (the counters restart at 0).
+    pub fn take_read_waits(&self) -> (u64, std::time::Duration) {
+        (
+            self.read_waits.swap(0, Ordering::Relaxed),
+            std::time::Duration::from_nanos(self.read_wait_ns.swap(0, Ordering::Relaxed)),
+        )
+    }
+
+    /// The part itself (joins first). `None`: the merge failed.
+    pub fn into_layer(self) -> Option<CheckpointLayer> {
+        self.join();
+        self.cell.into_inner().flatten()
+    }
+
+    fn lock_rx(&self) -> MutexGuard<'_, Option<Receiver<CheckpointLayer>>> {
+        self.rx.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Settle the part, blocking while it is being merged. Every caller
+    /// that blocks (the one receiving it and each one waiting for that
+    /// receiver) counts once if `count`. The decision is made under `rx`'s
+    /// lock: the receiver is only taken after `try_recv` found nothing, so
+    /// a caller finding it taken knows the part has not been published.
+    fn resolve(&self, count: bool) -> Option<&CheckpointLayer> {
+        if let Some(done) = self.cell.get() {
+            return done.as_ref();
+        }
+        let timer = std::time::Instant::now();
+        let mut blocked = false;
+        let mut g = self.lock_rx();
+        while self.cell.get().is_none() {
+            let arrived = match g.as_ref().map(Receiver::try_recv) {
+                Some(Ok(layer)) => Some(Some(layer)),
+                Some(Err(TryRecvError::Disconnected)) => Some(None),
+                Some(Err(TryRecvError::Empty)) | None => None,
+            };
+            if let Some(got) = arrived {
+                *g = None;
+                let _ = self.cell.set(got);
+                self.settled.notify_all();
+                break;
+            }
+            // Still being merged: this caller blocks.
+            if !blocked {
+                blocked = true;
+                if let (true, Some(f)) = (count, &self.on_block) {
+                    // Without the lock (and with the receiver left in
+                    // place), then look again.
+                    drop(g);
+                    f();
+                    g = self.lock_rx();
+                    continue;
+                }
+            }
+            match g.take() {
+                // Receive it here, without the lock; other callers wait
+                // on `settled`.
+                Some(rx) => {
+                    drop(g);
+                    let got = rx.recv().ok();
+                    g = self.lock_rx();
+                    let _ = self.cell.set(got);
+                    self.settled.notify_all();
+                }
+                // Another caller is receiving it.
+                None => g = self.settled.wait(g).unwrap_or_else(PoisonError::into_inner),
+            }
+        }
+        drop(g);
+        if blocked && count {
+            self.read_waits.fetch_add(1, Ordering::Relaxed);
+            self.read_wait_ns
+                .fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.cell.get().and_then(Option::as_ref)
     }
 }
 
@@ -495,5 +765,323 @@ mod tests {
             layer.merge(&frozen);
             assert!(layer.bytes() <= bound, "h{h}: {} > {bound}", layer.bytes());
         }
+    }
+
+    // ---- p3 merge wait: L split into a main and a deferred part ----
+
+    /// The CFs of the split tests: two deferred (R's) and four others.
+    const SPLIT_CFS: [&str; 6] = [
+        crate::cf::CF_NATIVE_POSITIONS,
+        crate::cf::CF_NATIVE_BALANCES,
+        crate::cf::CF_NATIVE_ORDER_BOOKS,
+        crate::cf::CF_NATIVE_NONCES,
+        crate::cf::CF_SESSIONS,
+        crate::cf::CF_CONSENSUS_META,
+    ];
+
+    fn split_block(db: &StateDb, h: u64, rng: &mut Rng) -> Arc<FrozenPending> {
+        let o = NativeStateOverlay::new(db.clone());
+        for _ in 0..rng.below(24) {
+            let cf = SPLIT_CFS[rng.below(SPLIT_CFS.len() as u64) as usize];
+            let k = key(rng.below(40));
+            if rng.below(3) == 0 {
+                o.delete_cf_raw(cf, &k).unwrap();
+            } else {
+                o.put_cf_raw(cf, &k, &rng.bytes(12)).unwrap();
+            }
+        }
+        o.freeze(h)
+    }
+
+    /// Every (CF, key, value-or-tombstone) of a layer, in order.
+    type LayerRow = (usize, Vec<u8>, Option<Vec<u8>>);
+
+    fn layer_rows(l: &CheckpointLayer) -> Vec<LayerRow> {
+        let mut out = Vec::new();
+        for (i, c) in l.pending_state().cfs.iter().enumerate() {
+            out.extend(
+                c.writes
+                    .iter()
+                    .map(|(k, v)| (i, k.clone(), Some(v.clone()))),
+            );
+            out.extend(c.deletes.iter().map(|k| (i, k.clone(), None)));
+        }
+        out
+    }
+
+    /// The end-of-block merge as the exec pipeline runs it (split, main
+    /// part, deferred part, absorb back) leaves exactly the layer a whole
+    /// merge does: same rows, bytes and top, over 400 random blocks. The
+    /// split part holds only `DEFERRED_CFS`, the main part none of them.
+    #[test]
+    fn split_merge_equals_whole_merge_random() {
+        let (db, _dir) = temp_db();
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut whole = CheckpointLayer::new();
+        let mut split = CheckpointLayer::new();
+        let deferred_slots: Vec<usize> = DEFERRED_CFS
+            .iter()
+            .map(|cf| {
+                crate::cf::ALL_CF_NAMES
+                    .iter()
+                    .position(|n| n == cf)
+                    .unwrap()
+            })
+            .collect();
+        for h in 1..=400u64 {
+            let b = split_block(&db, h, &mut rng);
+            whole.merge(&b);
+            let mut part = split.split_deferred();
+            for (i, c) in split.pending_state().cfs.iter().enumerate() {
+                assert!(
+                    !deferred_slots.contains(&i) || c.is_empty(),
+                    "h{h}: main part holds a deferred CF"
+                );
+            }
+            for (i, c) in part.pending_state().cfs.iter().enumerate() {
+                assert!(
+                    deferred_slots.contains(&i) || c.is_empty(),
+                    "h{h}: deferred part holds another CF"
+                );
+            }
+            split.merge_part(&b, LayerPart::Main);
+            part.merge_part(&b, LayerPart::Deferred);
+            split.absorb(part);
+            assert_eq!(layer_rows(&split), layer_rows(&whole), "h{h}: rows");
+            assert_eq!(split.bytes(), whole.bytes(), "h{h}: bytes");
+            assert_eq!(split.top_height(), whole.top_height(), "h{h}: top");
+        }
+        assert!(!whole.is_empty());
+    }
+
+    /// `absorb` of a layer sharing CFs merges it on top (newer wins), the
+    /// same as merging its blocks one by one.
+    #[test]
+    fn absorb_overlapping_layer_is_a_merge() {
+        let (db, _dir) = temp_db();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let blocks: Vec<_> = (1..=60u64).map(|h| split_block(&db, h, &mut rng)).collect();
+        let mut whole = CheckpointLayer::new();
+        blocks.iter().for_each(|b| whole.merge(b));
+        let (mut old, mut new) = (CheckpointLayer::new(), CheckpointLayer::new());
+        blocks[..30].iter().for_each(|b| old.merge(b));
+        blocks[30..].iter().for_each(|b| new.merge(b));
+        old.absorb(new);
+        assert_eq!(layer_rows(&old), layer_rows(&whole));
+        assert_eq!(old.bytes(), whole.bytes());
+        assert_eq!(old.top_height(), Some(60));
+    }
+
+    /// Split L: with the deferred part still being merged, reads of every
+    /// other CF (point, length, scans, prefix checks) answer at once; a read
+    /// of a deferred CF waits for the part, then answers as the whole layer
+    /// would, and is counted. A part whose merge died is an error for its
+    /// CFs only.
+    #[test]
+    fn deferred_part_blocks_only_deferred_reads() {
+        use std::time::Duration;
+        let (db, _dir) = temp_db();
+        let pos = crate::cf::CF_NATIVE_POSITIONS;
+        let books = crate::cf::CF_NATIVE_ORDER_BOOKS;
+        db.put_cf_raw(pos, b"p1", b"db").unwrap();
+        let o = NativeStateOverlay::new(db.clone());
+        o.put_cf_raw(pos, b"p1", b"L").unwrap();
+        o.put_cf_raw(books, b"b1", b"L").unwrap();
+        let mut main = CheckpointLayer::new();
+        let mut part = main.split_deferred();
+        let block = o.freeze(5);
+        main.merge_part(&block, LayerPart::Main);
+        part.merge_part(&block, LayerPart::Deferred);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let deferred = Arc::new(DeferredLayer::pending(rx));
+        let ov = NativeStateOverlay::with_split_layers(
+            db.clone(),
+            None,
+            Some(Arc::new(main)),
+            Some(deferred.clone()),
+            None,
+        );
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = ov.clone();
+        std::thread::spawn(move || {
+            let r = (
+                reader.get_cf_raw(books, b"b1").unwrap(),
+                reader.get_cf_len(books, b"b1").unwrap(),
+                StateBackend::iterate_cf(&reader, books, None).unwrap(),
+                StateBackend::iterate_cf_from(&reader, books, b"", 5).unwrap(),
+                StateBackend::prefix_exists(&reader, books, b"b").unwrap(),
+            );
+            let _ = done_tx.send(r);
+        });
+        let (got, len, all, from, exists) = done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("non-deferred reads do not wait for the deferred part");
+        assert_eq!(got, Some(b"L".to_vec()));
+        assert_eq!(len, Some(1));
+        assert_eq!(all, vec![(b"b1".to_vec(), b"L".to_vec())]);
+        assert_eq!(from, all);
+        assert!(exists);
+        assert!(!deferred.is_settled());
+
+        let (pos_tx, pos_rx) = std::sync::mpsc::channel();
+        let reader = ov.clone();
+        std::thread::spawn(move || {
+            let _ = pos_tx.send(reader.get_cf_raw(pos, b"p1").unwrap());
+        });
+        assert!(
+            pos_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a deferred read waits for the part"
+        );
+        tx.send(part).unwrap();
+        assert_eq!(
+            pos_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Some(b"L".to_vec()),
+            "L over the DB once merged"
+        );
+        assert_eq!(deferred.take_read_waits().0, 1, "one read blocked");
+        assert_eq!(deferred.take_read_waits().0, 0, "taken");
+        assert_eq!(
+            StateBackend::iterate_cf(&ov, pos, None).unwrap(),
+            vec![(b"p1".to_vec(), b"L".to_vec())]
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CheckpointLayer>(1);
+        drop(tx);
+        let lost = NativeStateOverlay::with_split_layers(
+            db.clone(),
+            None,
+            Some(Arc::new(CheckpointLayer::new())),
+            Some(Arc::new(DeferredLayer::pending(rx))),
+            None,
+        );
+        assert!(lost.get_cf_raw(pos, b"p1").is_err(), "lost part: error");
+        assert!(StateBackend::iterate_cf(&lost, pos, None).is_err());
+        assert_eq!(lost.get_cf_raw(books, b"b1").unwrap(), None);
+    }
+
+    /// Codex P3 (merge wait r1): a point read of a deferred CF whose key the
+    /// parent holds (a write or a tombstone) answers from the parent at once,
+    /// without waiting for L's deferred part, and is not counted as a wait.
+    /// A key the parent lacks still waits and then reads L. Answers are the
+    /// ones the whole layer gives.
+    #[test]
+    fn parent_hit_does_not_wait_for_the_deferred_part() {
+        use std::time::Duration;
+        let (db, _dir) = temp_db();
+        let pos = crate::cf::CF_NATIVE_POSITIONS;
+        let bal = crate::cf::CF_NATIVE_BALANCES;
+        db.put_cf_raw(pos, b"gone", b"db").unwrap();
+        db.put_cf_raw(pos, b"lower", b"db").unwrap();
+        // L (deferred part): every key written at height 5.
+        let o = NativeStateOverlay::new(db.clone());
+        for (cf, k) in [
+            (pos, &b"p1"[..]),
+            (pos, b"gone"),
+            (pos, b"lower"),
+            (bal, b"b1"),
+        ] {
+            o.put_cf_raw(cf, k, b"L").unwrap();
+        }
+        let mut main = CheckpointLayer::new();
+        let mut part = main.split_deferred();
+        let block = o.freeze(5);
+        main.merge_part(&block, LayerPart::Main);
+        part.merge_part(&block, LayerPart::Deferred);
+        // Parent (height 6): writes p1 and b1, tombstones `gone`.
+        let p = NativeStateOverlay::new(db.clone());
+        p.put_cf_raw(pos, b"p1", b"parent").unwrap();
+        p.put_cf_raw(bal, b"b1", b"parent").unwrap();
+        p.delete_cf_raw(pos, b"gone").unwrap();
+        let parent = p.freeze(6);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let deferred = Arc::new(DeferredLayer::pending(rx));
+        let ov = NativeStateOverlay::with_split_layers(
+            db.clone(),
+            Some(parent),
+            Some(Arc::new(main)),
+            Some(deferred.clone()),
+            None,
+        );
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = ov.clone();
+        std::thread::spawn(move || {
+            let r = (
+                reader.get_cf_raw(pos, b"p1").unwrap(),
+                reader.get_cf_raw(bal, b"b1").unwrap(),
+                reader.get_cf_raw(pos, b"gone").unwrap(),
+                reader.get_cf_len(pos, b"p1").unwrap(),
+                reader.get_cf_len(pos, b"gone").unwrap(),
+            );
+            let _ = done_tx.send(r);
+        });
+        let got = done.recv_timeout(Duration::from_secs(2));
+        // Unblock a reader stuck on the part before asserting (no leak).
+        let _ = tx.send(part);
+        let (p1, b1, gone, p1_len, gone_len) =
+            got.expect("a parent hit does not wait for the deferred part");
+        assert_eq!(p1, Some(b"parent".to_vec()));
+        assert_eq!(b1, Some(b"parent".to_vec()));
+        assert_eq!(gone, None, "the parent's tombstone wins over L and the DB");
+        assert_eq!(p1_len, Some(6));
+        assert_eq!(gone_len, None);
+        assert_eq!(deferred.take_read_waits().0, 0, "parent hits are not waits");
+        assert_eq!(
+            ov.get_cf_raw(pos, b"lower").unwrap(),
+            Some(b"L".to_vec()),
+            "a parent miss reads L"
+        );
+    }
+
+    /// Codex P3 (merge wait r1): every read that blocks on the deferred
+    /// part is counted, including one waiting while another thread receives
+    /// it (two blocked readers record 2). Reads after it arrived, and the
+    /// exec join, are not counted.
+    #[test]
+    fn concurrent_blocked_reads_are_each_counted() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::{Duration, Instant};
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let seen = blocked.clone();
+        let d = Arc::new(DeferredLayer::pending(rx).on_block(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let d = d.clone();
+                std::thread::spawn(move || d.read().map(|l| l.top_height()))
+            })
+            .collect();
+        // Both readers announce they block (bounded: a reader that never
+        // announces it fails the count below rather than hanging).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while blocked.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut part = CheckpointLayer::new();
+        part.top = Some(9);
+        tx.send(part).unwrap();
+        for r in readers {
+            assert_eq!(r.join().unwrap(), Some(Some(9)));
+        }
+        assert_eq!(
+            blocked.load(Ordering::SeqCst),
+            2,
+            "each blocked read announced"
+        );
+        let (waits, time) = d.take_read_waits();
+        assert_eq!(waits, 2, "two blocked reads, two waits");
+        assert!(time > Duration::ZERO);
+        assert!(d.read().is_some() && d.join().is_some());
+        assert_eq!(d.take_read_waits().0, 0, "settled: no more waits");
+
+        // Arrived before the first read: no wait.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(CheckpointLayer::new()).unwrap();
+        let d = DeferredLayer::pending(rx);
+        assert!(d.read().is_some());
+        assert_eq!(d.take_read_waits().0, 0, "already merged: no wait");
     }
 }

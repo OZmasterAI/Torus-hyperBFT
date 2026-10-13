@@ -84,6 +84,12 @@ impl Tracked {
             .fetch_add(bytes as i64 - old as i64, Relaxed);
     }
 
+    /// The object now holds `bytes` more.
+    pub(crate) fn add_bytes(&self, bytes: usize) {
+        self.bytes.fetch_add(bytes, Relaxed);
+        self.stats.bytes.fetch_add(bytes as i64, Relaxed);
+    }
+
     pub(crate) fn stats(&self) -> &Arc<RetentionStats> {
         &self.stats
     }
@@ -208,6 +214,62 @@ mod tests {
         assert_eq!(stats.oldest_height(), None);
         drop(untracked);
         assert_eq!(stats.live_objects(), 0, "untracked sets never count");
+    }
+
+    /// p3 merge wait x s114: a split merge keeps the counts exact. The
+    /// deferred part of a tracked L is a tracked layer of its own until
+    /// absorbed (the bytes move with it); a set merged as main then deferred
+    /// part counts its whole bytes once.
+    #[test]
+    fn split_merge_counts_parts_and_sets_once() {
+        let (db, _dir) = temp_db();
+        let stats = RetentionStats::new();
+        let block = |h: u64| {
+            let o = NativeStateOverlay::new(db.clone());
+            o.put_cf_raw(crate::cf::CF_SESSIONS, &[h as u8; 4], b"session")
+                .unwrap();
+            for cf in crate::DEFERRED_CFS {
+                o.put_cf_raw(cf, &[h as u8; 8], &[7u8; 50]).unwrap();
+            }
+            o.freeze(h)
+        };
+        let (b1, b2) = (block(1), block(2));
+        b1.track(&stats);
+        b2.track(&stats);
+        let mut l = CheckpointLayer::new();
+        l.track(&stats);
+        l.merge(&b1);
+        let whole = l.bytes();
+        assert_eq!(
+            stats.live_bytes() as usize,
+            whole + b1.state_bytes(),
+            "L + the merged set"
+        );
+
+        let mut part = l.split_deferred();
+        assert!(part.bytes() > 0 && l.bytes() < whole);
+        assert_eq!(stats.live_objects(), 4, "b1, b2, L and its deferred part");
+        assert_eq!(
+            stats.live_bytes() as usize,
+            whole + b1.state_bytes(),
+            "the split moves bytes, adds none"
+        );
+        l.merge_part(&b2, crate::LayerPart::Main);
+        part.merge_part(&b2, crate::LayerPart::Deferred);
+        assert_eq!(
+            stats.live_bytes() as usize,
+            l.bytes() + part.bytes() + b1.state_bytes() + b2.state_bytes(),
+            "b2 counts its main and deferred bytes once"
+        );
+        l.absorb(part);
+        assert_eq!(stats.live_objects(), 3, "the part is gone once absorbed");
+        assert_eq!(
+            stats.live_bytes() as usize,
+            l.bytes() + b1.state_bytes() + b2.state_bytes()
+        );
+        drop((l, b1, b2));
+        assert_eq!(stats.live_objects(), 0);
+        assert_eq!(stats.live_bytes(), 0);
     }
 
     /// Every handle on a tracked view counts (clones too) until dropped;

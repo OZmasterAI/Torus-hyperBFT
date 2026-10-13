@@ -387,7 +387,7 @@ impl StateBackend for StateDb {
 pub(crate) struct CfId(u8);
 
 /// Number of registered CFs — one overlay bucket per CF.
-const NUM_CFS: usize = crate::cf::ALL_CF_NAMES.len();
+pub(crate) const NUM_CFS: usize = crate::cf::ALL_CF_NAMES.len();
 
 impl CfId {
     #[inline]
@@ -441,7 +441,7 @@ pub(crate) struct CfPending {
 }
 
 impl CfPending {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.writes.is_empty() && self.deletes.is_empty()
     }
 }
@@ -988,10 +988,15 @@ impl FrozenPending {
     }
 
     /// Record this set's [`Self::state_bytes`] (measured by the caller's own
-    /// walk) in its tracked share, if tracked.
-    pub(crate) fn note_bytes(&self, bytes: usize) {
+    /// walk) in its tracked share, if tracked. p3 merge wait: a split merge
+    /// walks [`crate::LayerPart::Main`] then [`crate::LayerPart::Deferred`];
+    /// the main part's bytes replace the share, the deferred part's add to it.
+    pub(crate) fn note_bytes(&self, part: crate::LayerPart, bytes: usize) {
         if let Some(t) = self.tracked.get() {
-            t.set_bytes(bytes);
+            match part {
+                crate::LayerPart::All | crate::LayerPart::Main => t.set_bytes(bytes),
+                crate::LayerPart::Deferred => t.add_bytes(bytes),
+            }
         }
     }
 
@@ -1277,6 +1282,10 @@ pub struct NativeStateOverlay {
     /// Item 6 Phase 3: the since-checkpoint layer L (heights S+1..parent-1,
     /// last value per key), read after `parent`.
     layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    /// p3 merge wait: L's [`crate::checkpoint_layer::DEFERRED_CFS`], split
+    /// off `layer` and possibly still being merged; read (waiting for it)
+    /// in `layer`'s place for those CFs only. `None`: `layer` holds every CF.
+    deferred: Option<Arc<crate::checkpoint_layer::DeferredLayer>>,
     /// Item 6 Phase 3: the checkpoint in flight C (handed to the flush worker,
     /// not durable yet), read after L and before the DB.
     inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
@@ -1322,12 +1331,28 @@ impl NativeStateOverlay {
         layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
         inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
     ) -> Self {
+        Self::with_split_layers(db, parent, layer, None, inflight)
+    }
+
+    /// p3 merge wait: [`Self::with_layers`] with L in two parts: `layer`
+    /// (every CF but [`crate::checkpoint_layer::DEFERRED_CFS`]) and
+    /// `deferred` (those CFs, possibly still being merged). A read of a
+    /// deferred CF that reaches L waits for that part; no other read does.
+    /// What a read returns is the same as with the whole L in `layer`.
+    pub fn with_split_layers(
+        db: StateDb,
+        parent: Option<Arc<FrozenPending>>,
+        layer: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+        deferred: Option<Arc<crate::checkpoint_layer::DeferredLayer>>,
+        inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    ) -> Self {
         Self {
             db,
             pending: Arc::new(RwLock::new(PendingState::new())),
             parent,
             resident: None,
             layer,
+            deferred,
             inflight,
         }
     }
@@ -1348,13 +1373,47 @@ impl NativeStateOverlay {
     /// newest first: parent, L (since-checkpoint layer), C (checkpoint in
     /// flight). A read resolves in the first layer holding the key, then the
     /// DB. Without L and C this is exactly the parent alone (bl2).
+    /// p3 merge wait: for a deferred CF (with L split), L is the deferred
+    /// part, waited for if still being merged; `Err` if that merge failed.
     #[inline]
-    fn lower(&self) -> [Option<&PendingState>; 3] {
-        [
+    fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
+        Ok([
             self.parent.as_deref().map(|p| &p.state),
-            self.layer.as_deref().map(|l| l.pending_state()),
+            self.layer_for(id)?,
             self.inflight.as_deref().map(|c| c.pending_state()),
-        ]
+        ])
+    }
+
+    /// L as CF `id` sees it: for a deferred CF (with L split) the deferred
+    /// part, waited for if still being merged; `Err` if that merge failed.
+    #[inline]
+    fn layer_for(&self, id: CfId) -> Result<Option<&PendingState>, StateError> {
+        match &self.deferred {
+            Some(d) if crate::checkpoint_layer::is_deferred_slot(id.0 as usize) => {
+                d.read().map(|l| Some(l.pending_state())).ok_or_else(|| {
+                    StateError::Io(std::io::Error::other(
+                        "since-checkpoint layer merge failed (deferred part lost)",
+                    ))
+                })
+            }
+            _ => Ok(self.layer.as_deref().map(|l| l.pending_state())),
+        }
+    }
+
+    /// The point-read rule over [`Self::lower`]: the first of parent, L, C
+    /// holding `key` (`Some(None)`: a tombstone), `None` if none does. L is
+    /// resolved only on a parent miss, so a parent hit never waits for a
+    /// deferred part still being merged (Codex P3, p3 merge wait r1).
+    #[inline]
+    fn lookup_lower(&self, id: CfId, key: &[u8]) -> Result<Option<Option<&[u8]>>, StateError> {
+        if let Some(hit) = self.parent.as_deref().and_then(|p| p.state.lookup(id, key)) {
+            return Ok(Some(hit));
+        }
+        let rest = [
+            self.layer_for(id)?,
+            self.inflight.as_deref().map(|c| c.pending_state()),
+        ];
+        Ok(rest.into_iter().flatten().find_map(|l| l.lookup(id, key)))
     }
 
     /// Item 6 Phase 3: the layered parent (the previous block's frozen set).
@@ -1367,6 +1426,7 @@ impl NativeStateOverlay {
     /// through this overlay no longer see them; call after the hand-off.
     pub fn detach_layers(&mut self) {
         self.layer = None;
+        self.deferred = None;
         self.inflight = None;
     }
 
@@ -2327,10 +2387,8 @@ impl StateBackend for NativeStateOverlay {
             }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes);
             // item 6 Phase 3: then L and C.
-            for layer in self.lower().into_iter().flatten() {
-                if let Some(hit) = layer.lookup(id, key) {
-                    return Ok(hit.map(<[u8]>::to_vec));
-                }
+            if let Some(hit) = self.lookup_lower(id, key)? {
+                return Ok(hit.map(<[u8]>::to_vec));
             }
         }
         self.db.get_cf_raw(cf, key)
@@ -2408,7 +2466,7 @@ impl StateBackend for NativeStateOverlay {
         // overlay's own pending set — each layer's tombstones remove and its
         // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
-        let lower = self.lower();
+        let lower = self.lower(id)?;
         let state = self.pending.read().unwrap();
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
         // as they are (already sorted and unique under the bytewise comparator).
@@ -2453,7 +2511,7 @@ impl StateBackend for NativeStateOverlay {
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
             return merge_from(&pending, &[], id, start, limit, base);
         }
-        let lower = self.lower();
+        let lower = self.lower(id)?;
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2479,10 +2537,8 @@ impl StateBackend for NativeStateOverlay {
             if let Some(rows) = self.resident_rows(id) {
                 return Ok(rows.get(key).map(Vec::len));
             }
-            for layer in self.lower().into_iter().flatten() {
-                if let Some(hit) = layer.lookup(id, key) {
-                    return Ok(hit.map(<[u8]>::len));
-                }
+            if let Some(hit) = self.lookup_lower(id, key)? {
+                return Ok(hit.map(<[u8]>::len));
             }
         }
         StateBackend::get_cf_len(&self.db, cf, key)
@@ -2515,7 +2571,7 @@ impl StateBackend for NativeStateOverlay {
                 .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
             return merge_from(&pending, &[], id, start, limit, base).map(cut);
         }
-        let lower = self.lower();
+        let lower = self.lower(id)?;
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2543,7 +2599,7 @@ impl StateBackend for NativeStateOverlay {
         let rows = self.resident_rows(id);
         // Item 6 Phase 3: likewise L and C (parent, L, C newest first).
         let lower = if rows.is_none() {
-            self.lower()
+            self.lower(id)?
         } else {
             [None; 3]
         };

@@ -621,7 +621,18 @@ pub struct Metrics {
     /// Item 6 Phase 3 (p3s2g 47.1): exec thread blocked at the start of a
     /// pipelined block joining the previous block's merge into the
     /// since-checkpoint layer. Once per pipelined block at interval > 0.
+    /// p3 merge wait: only the main part (every CF but positions and
+    /// balances); the deferred part is joined at the end of the block.
     pub exec_checkpoint_settle_wait_seconds: Histogram,
+    /// Item 6 Phase 3 (p3 merge wait): exec thread blocked at the end of a
+    /// pipelined block joining the deferred part (positions, balances) of
+    /// the merge started at the end of the previous block. Inside
+    /// `exec_checkpoint_upkeep_seconds`. Once per pipelined block.
+    pub exec_checkpoint_deferred_join_seconds: Histogram,
+    /// Item 6 Phase 3 (p3 merge wait): reads that blocked on the deferred
+    /// part of the layer while it was still being merged (any thread; a
+    /// native block reads those CFs from R, so expected ~0).
+    pub exec_checkpoint_deferred_read_waits: Counter,
     /// Item 6 Phase 3 (p3s2g 47.1): exec thread time in the end-of-block
     /// checkpoint upkeep (trigger, checkpoint-time merges and hand-off, which
     /// includes `exec_checkpoint_wait_seconds`, and the ingress view publish).
@@ -2253,6 +2264,19 @@ impl Metrics {
             "Item 6 Phase 3: exec thread blocked joining the previous block's since-checkpoint layer merge (once per pipelined block)",
             exec_checkpoint_settle_wait_seconds.clone(),
         );
+        let exec_checkpoint_deferred_join_seconds =
+            Histogram::new(DEFERRED_JOIN_BUCKETS_SECONDS.iter().copied());
+        registry.register(
+            "torus_exec_checkpoint_deferred_join_seconds",
+            "Item 6 Phase 3: exec thread blocked at the end of a pipelined block joining the deferred (positions, balances) part of the layer merge (inside upkeep; once per pipelined block)",
+            exec_checkpoint_deferred_join_seconds.clone(),
+        );
+        let exec_checkpoint_deferred_read_waits = Counter::default();
+        registry.register(
+            "torus_exec_checkpoint_deferred_read_waits",
+            "Item 6 Phase 3: reads that blocked on the deferred part of the since-checkpoint layer while it was being merged",
+            exec_checkpoint_deferred_read_waits.clone(),
+        );
         let exec_checkpoint_upkeep_seconds = Histogram::new(exponential_buckets(0.000_05, 2.0, 16));
         registry.register(
             "torus_exec_checkpoint_upkeep_seconds",
@@ -2814,6 +2838,8 @@ impl Metrics {
             exec_checkpoint_layer_bytes,
             exec_checkpoint_layer_shared,
             exec_checkpoint_settle_wait_seconds,
+            exec_checkpoint_deferred_join_seconds,
+            exec_checkpoint_deferred_read_waits,
             exec_checkpoint_upkeep_seconds,
             exec_checkpoint_drop_inline,
             exec_checkpoint_live_layers,
@@ -3016,6 +3042,16 @@ pub const EXEC_SPAWN_SITES: [&str; 9] = [
 ];
 
 /// s92: the tick buckets of [`Metrics::sell_margin_cuts`] (name suffixes).
+/// p3 merge wait: `torus_exec_checkpoint_deferred_join_seconds` bounds.
+/// Bound ratio at most 1.5 over 1-50 ms (factor-2 buckets put a 13 ms and a
+/// 24 ms join in one bucket), 50 us to 1 s overall.
+pub const DEFERRED_JOIN_BUCKETS_SECONDS: [f64; 25] = [
+    0.000_05, 0.000_1, 0.000_25, 0.000_5, // sub-ms
+    0.001, 0.001_5, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.010, 0.012, 0.015, 0.020, 0.025,
+    0.030, 0.040, 0.050, // 1-50 ms
+    0.075, 0.1, 0.25, 0.5, 1.0,
+];
+
 pub const MARGIN_CUT_TICK_BUCKETS: [&str; 6] = ["t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p"];
 
 /// s92: the [`MARGIN_CUT_TICK_BUCKETS`] index of a cut `ticks` above the
@@ -3173,6 +3209,57 @@ mod tests {
         );
     }
 
+    /// p3 merge wait: the deferred join histogram separates 1-50 ms (the
+    /// upkeep p99 rose 10 -> 24 ms in ozarchy-p3mw; factor-2 buckets put 13
+    /// and 24 ms in one bucket). Every bound ratio in [1 ms, 50 ms] is at most
+    /// 1.5, 1 ms and 50 ms are bounds, and one observation counts once.
+    #[test]
+    fn deferred_join_histogram_separates_1_to_50_ms() {
+        let m = Metrics::new();
+        let name = "torus_exec_checkpoint_deferred_join_seconds";
+        assert!(
+            m.encode().contains(&format!("{name}_count 0")),
+            "{name} not registered"
+        );
+        m.exec_checkpoint_deferred_join_seconds.observe(0.013);
+        let text = m.encode();
+        assert!(text.contains(&format!("{name}_count 1")), "{text}");
+        let bounds: Vec<f64> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix(&format!("{name}_bucket{{le=\"")))
+            .filter_map(|l| l.split('"').next())
+            .filter(|le| *le != "+Inf")
+            .map(|le| le.parse().unwrap())
+            .collect();
+        for edge in [0.001, 0.05] {
+            assert!(
+                bounds.iter().any(|b| (b - edge).abs() < 1e-12),
+                "{edge} not a bound: {bounds:?}"
+            );
+        }
+        let fine: Vec<f64> = bounds
+            .iter()
+            .copied()
+            .filter(|b| (0.001 - 1e-12..=0.05 + 1e-12).contains(b))
+            .collect();
+        for w in fine.windows(2) {
+            assert!(
+                w[1] / w[0] <= 1.5 + 1e-9,
+                "{} -> {} too coarse: {bounds:?}",
+                w[0],
+                w[1]
+            );
+        }
+        assert!(
+            bounds.first().is_some_and(|b| *b <= 0.000_1),
+            "sub-ms join must stay visible: {bounds:?}"
+        );
+        assert!(
+            bounds.last().is_some_and(|b| *b >= 1.0),
+            "a stuck join must stay visible: {bounds:?}"
+        );
+    }
+
     /// Ingress-verify-fix Option A: the admit sub-phase histograms must be
     /// registered so the probe can split admit cost into mempool insert vs
     /// leader-forward.
@@ -3299,6 +3386,8 @@ mod tests {
             "torus_exec_checkpoint_layer_bytes",
             "torus_exec_checkpoint_layer_shared",
             "torus_exec_checkpoint_settle_wait_seconds",
+            "torus_exec_checkpoint_deferred_join_seconds",
+            "torus_exec_checkpoint_deferred_read_waits",
             "torus_exec_checkpoint_upkeep_seconds",
             "torus_exec_checkpoint_drop_inline",
             "torus_exec_checkpoint_live_layers",

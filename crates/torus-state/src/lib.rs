@@ -30,7 +30,7 @@ pub use backend::{
     OutOfBatchRecorder, StateBackend,
 };
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, EncodeRows, PackedCfBatch, RawCfKv};
-pub use checkpoint_layer::CheckpointLayer;
+pub use checkpoint_layer::{CheckpointLayer, DeferredLayer, LayerPart, DEFERRED_CFS};
 pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
 pub use error::StateError;
 pub use native_da::{DaReadTiming, NativeDaStore};
