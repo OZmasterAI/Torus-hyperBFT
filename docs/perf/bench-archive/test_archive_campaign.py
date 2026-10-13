@@ -1071,6 +1071,48 @@ class CellRoles(FixtureCase):
             self.assertEqual(fx.snapshot(), snap)
 
 
+class RunExclude(FixtureCase):
+    """[tools] run_exclude: globs (file name) for the run dir's own *.txt files, which are copied to analyst/."""
+
+    def tools_files(self):
+        t = os.path.join(self.fx.archive, "tools", "ozarchy-tc-tools")
+        return sorted(os.path.relpath(os.path.join(r_, f), t) for r_, _, fs in os.walk(t) for f in fs)
+
+    def setUp(self):
+        super().setUp()
+        rd = os.path.join(self.fx.bench, "ozarchy-tc-run")
+        write(os.path.join(rd, "jeconf-proof.txt"), "x" * 5000)
+        write(os.path.join(rd, "notes.txt"), "n\n")
+
+    def test_default_copies_every_run_txt(self):
+        self.assertOk(self.fx.run())
+        got = self.tools_files()
+        self.assertIn("analyst/jeconf-proof.txt", got)
+        self.assertIn("analyst/notes.txt", got)
+
+    def test_run_exclude(self):
+        fx = self.fx
+        m = json.loads(json.dumps(fx.meta))
+        m["tools"] = {"run_exclude": ["jeconf-*.txt"]}
+        r = fx.run(meta=m)
+        self.assertOk(r)
+        got = self.tools_files()
+        self.assertNotIn("analyst/jeconf-proof.txt", got)
+        self.assertIn("analyst/notes.txt", got)
+        self.assertIn("analyst/cells.txt", got)  # analyst files are not affected
+
+    def test_bad_run_exclude_is_an_error(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        for bad in ("jeconf-*.txt", [1]):
+            m = json.loads(json.dumps(fx.meta))
+            m["tools"] = {"run_exclude": bad}
+            r = fx.run(meta=m)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("run_exclude", r.stderr)
+            self.assertEqual(fx.snapshot(), snap)
+
+
 class SummaryRows(FixtureCase):
     """[summary] rows: numbers from analyst/arms.txt unless [[summary.rows]] cols gives them."""
 

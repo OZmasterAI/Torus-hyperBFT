@@ -21,8 +21,10 @@ USAGE
 
 WHAT IT WRITES (mechanical part)
   1. tools/ozarchy-<camp>-tools/: the bench tools dir (campaign / build scripts), each run dir's analyst a-*.py and
-     *.txt outputs (not archive-*.txt, not json) under analyst/ (prefixed <sub>- if the campaign has several run
-     dirs), md5s-all.txt from ozarchy-<camp>-build/md5s-all.txt or md5s.txt.
+     *.txt outputs (not archive-*.txt, not json) and the run dir's own *.txt, all under analyst/ (prefixed <sub>- if
+     the campaign has several run dirs), md5s-all.txt from ozarchy-<camp>-build/md5s-all.txt or md5s.txt. [tools]
+     in the meta: exclude = globs left out (path in the tools dir, file name in analyst/), run_exclude = globs (file
+     name) for the run dir's own *.txt, extra = [[src, dst], ...] copied in addition (src relative to --bench-root).
   2. INDEX.md: the "Updated" paragraph (after the last one) and one row per dir in sorted position; cells.md: the
      campaign section (before "## action-results:"); DELETABLE.md: the campaign block at the end (Tier A / Tier B
      rm lists with live sizes, outside-tree block). Rows come from each cell's summary.json, node-environ-trie.txt,
@@ -1312,6 +1314,7 @@ def tools_plan(c):
     b = c.bench
     td = os.path.join(b, c.prefix + "tools")
     excl = c.meta.get("tools", {}).get("exclude", [])
+    run_excl = c.meta.get("tools", {}).get("run_exclude", [])
     if os.path.isdir(td):
         for root, dirs, files in os.walk(td):
             dirs.sort()
@@ -1349,7 +1352,7 @@ def tools_plan(c):
                 )
         for f in sorted(os.listdir(os.path.join(b, rd))):
             p = os.path.join(b, rd, f)
-            if f.endswith(".txt") and os.path.isfile(p):
+            if f.endswith(".txt") and os.path.isfile(p) and not any(fnmatch.fnmatch(f, e) for e in run_excl):
                 plan.append(
                     (p, "analyst/%s%s" % (sub + "-" if multi and sub else "", f))
                 )
@@ -1563,6 +1566,10 @@ def main(argv=None):
             raise Fatal("meta camp %r does not match %r" % (meta.get("camp"), a.camp))
         if "section" not in meta:
             raise Fatal("meta has no section")
+        for key in ("exclude", "run_exclude"):
+            v = (meta.get("tools") or {}).get(key, [])
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                raise Fatal("[tools] %s must be a list of glob strings, not %r" % (key, v))
         roles = meta.get("cell_roles", {})
         if not isinstance(roles, dict) or not all(isinstance(v, str) for v in roles.values()):
             raise Fatal('[cell_roles] must map a cell dir pattern to a role word, e.g. "*-KILL" = "restart"')
