@@ -7499,7 +7499,7 @@ jemalloc merge (`655e874a`, now the default allocator on main). The cloid cost u
 (3) 120 s cells: minutes 0-2, not a soak. (4) c0 runs the same cloid-capable node with no cloids on the wire. The cost of
 the cloid code at share 0 against a pre-cloid main is not measured. Section 58's wm (main `925fd962`, before `46a11c14`,
 200,292 matched/s) is another campaign and is not comparable with c0's 188,654. (5) The engine attribution in 59.3 has
-no profile behind it.
+no profile behind it (section 60 profiles it).
 
 Analysis (`tools/ozarchy-p3cloid-tools/analyst/`): `a-cells.py` (p3mw's, plus `ingest.cloids` and the `duplicate_cloid`
 reject deltas per node), `a-arms.py`, `a-paired.py` (p3mw's, unchanged, with `--io` for device writes), `a-archive.py`.
@@ -7509,6 +7509,212 @@ Outputs `cells.txt`, `arms.txt`, `paired.txt`, `phases.txt` (per-phase paired de
 recomputed from `cells.json` for this write-up and match. Full outputs (incl. `cells.json`) in
 `ozarchy-p3cloid-run/analyst/` on ozarchy. Driver `tools/ozarchy-p3cloid-tools/ozarchy-p3cloid-campaign.sh` (CAMP=CLOID,
 `cloidchk`), build `ozarchy-p3cloid-build.sh`, md5s `md5s-all.txt`.
+
+## 60. Cloid engine cost by perf profile: `CLOID_SHARE=100` vs `0` on main `ef812b02` (glibc), perf on val1, saturated, commit-tail mode (campaign ozarchy-p3cloidprof, 2026-10-13)
+
+**The cloid engine cost is hash-map work, mostly on the exec thread: index upkeep and the duplicate check ~36% each,
+cleanup ~14%.** Profiled on val1 (perf user space, call graphs, 3 ABBA rounds), the engine threads spend +1.00 ms CPU
+per 1k fills more at c100: exec thread +0.71 (+16%), market workers +0.29 (+5%). Split by cloid site (exec + workers):
+index upkeep +0.36 (`CloidMarkets::absorb` -> `OrderBook::drain_cloid_log` +0.32 on the exec thread, `index_cloid` +0.04
+in the workers), duplicate check +0.36 (the serial pre-pass: claimed set +0.14 incl. `reserve_rehash` 0.06,
+`duplicate_cloid` -> `CloidMarkets::live` +0.14; the per-book `contains_key` in place, `order_book.rs:1397-1402`, +0.08
+in the workers), cleanup `forget_cloid` +0.14, and +0.14 not under any cloid site. 93% of the exec thread's extra CPU
+sits at cloid sites. **All exec-thread cloid sites run outside the engine's phase timers, so the timers put the whole
+engine increase in `engine_untimed`: 0.21 -> 0.78 ms per 1k fills (+0.57; the timed phases move -0.05 together).** The
+extra DRAM demand fills of the exec thread (+12.7% per fill) are all at cloid sites, and those sites run at low IPC
+(index 0.54, duplicate check 1.01, cleanup 0.76, against 1.18 for the c0 exec thread): the index maps miss the cache.
+Hashing (`make_hash`, foldhash over the 36-byte `(Address, u128)` key) is ~27% of the exec thread's extra CPU. No lock
+frames show on the engine threads. Outside the engine, val1's other threads spend +3.19 ms CPU per 1k fills more (+22%):
+Keccak +0.91 (all threads; its callers are not known, see 60.5), the signature pre-verify `verify_one_action_with` +0.80
+and RocksDB background threads +0.82 (mostly zstd compression). The profiled A/B reproduces section 59 within its
+intervals (matched/s -12.5% [-21.6, -3.5] vs -11.7%, engine ms per 1k fills +13.1% vs +13.9%, CPU-s/1M +8.9% vs +8.8%).
+
+Requested by 18c after section 59 (c100 vs c0: matched/s -11.7%, engine ms per 1k fills +13.9%, no profile behind the
+engine split): where inside the engine does the cloid cost go? Same binary and arms as 59: the kept p3cloid stage
+(`ozarchy-p3cloid-stage/cl-run/release`), node `6f363582` (build id `016bed06`, symbols present, not rebuilt) and bench
+`9fda6c84` from main `ef812b02`, glibc. c0 = run-cell.sh `CLOID_SHARE=0`, c100 = `CLOID_SHARE=100`. Same shape as 59
+(tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, RATE 76000 = saturated, 120 s cells + 60
+s warm-up, commit tail, shared NVMe, no Phase 3), harness = the `ef812b02` worktree. Driver
+`ozarchy-p3cloidprof-campaign.sh` CAMP=CLOID (copy of `ozarchy-p3cloid-campaign.sh` with the perf sidecar on both arms,
+w0 + 3 rounds, a stop at a cell boundary on request). Cells ran 15:07-15:46: w0 (c0, 60 s, excluded), r1 c0 c100, r2
+c100 c0, r3 c0 c100. 105 CHECK OK, no CHECK FAIL, all 7 cells rc 0, ACCEPT, AGREE. The host was quiet before every cell
+(no cargo / rustc / rust-analyzer, load 1.71-1.98). `perf_event_paranoid` is 2, so the profile is user space only (`:u`,
+no sudo, no kernel frames).
+
+Profile (`cloidprof-sidecar.sh`, a copy of the p2s0y perf2 sidecar moved from val0 to val1, because val0 serves the
+bench RPC and the headline numbers). W1 = 35-80 s after the bench start: `perf record -e cycles:u -F 499 -g --call-graph
+fp -p <val1>`, the whole process with inherit (exec thread plus the short-lived market workers), 144-151k samples per
+cell, none lost. W2 = 82-102 s: the exec thread only (`-t <exec tid> --no-inherit`), five sampled events: cycles,
+instructions, L1-dcache-load-misses, `ls_dmnd_fills_from_sys.mem_io_local` (demand fills from local DRAM, used as the
+LLC miss count because `LLC-load-misses:u` is not supported on Zen 3) and `ls_dmnd_fills_from_sys.ext_cache_local`
+(fills from the other CCD's L3). Every figure below is ms of CPU (or events) per 1k val1 fills over the window: a sample
+set's share of the period x val1 utime over the window / val1 fills over the window. Frames are inline-expanded with
+`llvm-addr2line -i`. Thread groups: exec = the `torus-execution` task with the most CPU at W1 start (`exec-tid.txt`),
+workers = comm `torus-exec-pool` (rayon market workers), other = the rest (RPC, consensus, RocksDB, flush). A sample's
+cloid site is the innermost frame on its logical stack that matches the site list in `a-prof.py` (functions, plus line
+ranges `native_executor.rs:6879-6940` for the pre-pass and `order_book.rs:1397-1402` for the per-book check), so a site
+includes its callees (hashbrown, foldhash, memcpy). The W1 windows cover 47-48 s of each cell (`windows.txt`). **Every
+figure here is minutes 0-2 only.**
+
+### 60.1 Cells and the whole-cell A/B (n = 3, paired c100 - c0, 95% CI t(2))
+
+| cell | arm | rc / agreement | `share_pct` | stamped / placed (orders) | `duplicate_cloid` rejects val0 / val1 / val2 | matched/s | native blk/s |
+|---|---|---|---|---|---|---|---|
+| w0 (60 s, excluded) | c0 | 0, ACCEPT AGREE | 0 | 0 / 18,635,200 | 0 / 0 / 0 | 190,622 | 4.48 |
+| r1-c0 / r1-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 35,455,200; 31,727,200 / 31,727,200 | 0 / 0 / 0 both | 196,575 / 167,806 | 3.53 / 3.11 |
+| r2-c100 / r2-c0 | | 0 / 0, ACCEPT AGREE | 100 / 0 | 31,670,000 / 31,670,000; 0 / 31,836,400 | 0 / 0 / 0 both | 172,126 / 188,140 | 3.24 / 3.51 |
+| r3-c0 / r3-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 32,734,000; 30,456,400 / 30,456,400 | 0 / 0 / 0 both | 189,981 / 162,777 | 3.39 / 3.01 |
+
+| | c0 | c100 | c100 - c0 | % [95% CI] | section 59 (n = 4, no perf) |
+|---|---|---|---|---|---|
+| matched/s (whole cell, val0 headline) | 191,565 | 167,570 | -23,996 [-41,277, -6,714] | **-12.53% [-21.55, -3.50]** | -11.72% [-13.83, -9.60] |
+| placed/s | 250,428 | 219,216 | -31,212 | **-12.46% [-21.45, -3.47]** | -11.75% |
+| bench submits/s | 1,113 | 1,037 | -76 | -6.80% [-19.30, +5.70] | -6.85% |
+| native blocks/s | 3.48 | 3.12 | -0.36 | **-10.24% [-16.12, -4.37]** | -6.99% (n.s.) |
+| exec `block_ms` (mean of 3 nodes) | 258.6 | 291.8 | +33.2 [+17.4, +49.0] | **+12.83% [+6.73, +18.93]** | +11.84% |
+| engine ms per 1k fills (summary) | 4.07 | 4.60 | +0.53 [+0.11, +0.95] | **+13.10% [+2.81, +23.40]** | +13.90% |
+| exec per native block p99 ms | 708 | 837 | +129 | **+18.20% [+10.33, +26.06]** | +18.9% |
+| residual untimed ms per native block | 13.48 | 17.73 | +4.25 [+2.82, +5.68] | **+31.56% [+20.95, +42.16]** | +35.4% |
+| exec busy | 0.951 | 0.953 | +0.002 | +0.20% [-1.64, +2.04] | +0.2% |
+| node CPU-s/1M (whole run) | 26.35 | 28.70 | +2.36 [+0.91, +3.81] | **+8.94% [+3.44, +14.44]** | +8.84% |
+| node CPU at equal fills (ANCOVA, Welch) | | | | **+7.37% [+4.02, +10.73]** | +6.37% |
+| RSS peak / mean per node GB (cpu.csv) | 4.25 / 3.59 | 4.54 / 3.88 | **+0.29 [+0.28, +0.31] / +0.29 [+0.23, +0.34]** | +6.93% / +8.04% | +0.32 / +0.24 |
+| device writes MB/s per validator | 144.0 | 148.5 | +4.4 [-6.3, +15.2] | +3.09% [-4.36, +10.53] | +1.8% |
+
+All three rounds point the same way (matched/s -28,769 / -16,014 / -27,204). With n = 3 the intervals are about twice as
+wide as 59's, and every row agrees with 59 within them. **Perf on val1:** val1's engine ms per 1k fills inside W1
+is ~4% above its whole-cell value in both arms (c0 4.24 vs 4.08, c100 4.80 vs 4.59; `metrics.txt`). This is an observed
+window-versus-cell difference, not a measured perf overhead (there is no unprofiled control, and the whole-cell value
+includes the profiled window); it is the same in both arms, so it does not change the c100 - c0 picture. The headline matched/s comes from val0, which is not
+profiled.
+
+### 60.2 Where the extra CPU goes (W1, val1, ms CPU per 1k fills, mean of 3 cells per arm)
+
+| thread group | c0 | c100 | c100 - c0 |
+|---|---|---|---|
+| whole process | 24.51 | 28.70 | +4.19 (+17.1%) |
+| exec thread | 4.44 | 5.16 | **+0.71 (+16.1%)** |
+| market workers (`torus-exec-pool`) | 5.83 | 6.11 | **+0.29 (+4.9%)** |
+| other threads | 14.25 | 17.44 | +3.19 (+22.4%) |
+
+By cloid site (`cloid-sites.txt`; inclusive of callees; c0 is 0.00-0.02 at every site):
+
+| candidate | site (file:line at `ef812b02`) | exec | workers | exec + workers | share of +1.00 |
+|---|---|---|---|---|---|
+| 1 index upkeep | `CloidMarkets::absorb` -> `OrderBook::drain_cloid_log` (absorb loop after matching, `native_executor.rs:7309`); `OrderBook::index_cloid` (place, in the worker) | +0.324 | +0.038 | **+0.362** | 36% |
+| 2 duplicate check | serial pre-pass (`native_executor.rs:6882-6930`): claimed `HashSet<(Address, Cloid)>` insert and `retain` +0.140, `duplicate_cloid` -> `CloidMarkets::live` +0.136; per-book `contains_key` in `OrderBook::place` (`order_book.rs:1397-1402`) | +0.276 | +0.081 | **+0.357** | 36% |
+| 3 cleanup | `OrderBook::forget_cloid` (`order_book.rs:2946`; maker fills, cancels, stops) +0.143; `forget_cloids` (batch) +0.002 | +0.064 | +0.080 | **+0.144** | 14% |
+| none | not under a cloid site | +0.048 | +0.088 | +0.136 | 14% |
+| total | | +0.713 | +0.286 | +0.999 | |
+
+What the sites spend it on (exec thread, `frames-children.txt` / `frames-self.txt`). Inclusive: hashbrown `get` +0.43,
+`find` +0.32 (0.65 -> 0.97), `make_hash` / `hash_one` +0.19 (27% of the exec delta), the claimed-set `HashMap<(Address,
+u128), ()>::insert` +0.14, of which `reserve_rehash` +0.055 (the set grows from empty in every block; computed from
+`folded-*.txt` for this write-up). Self (leaf): `_mm_movemask_epi8` (hashbrown group probe) +0.189, `spec_eq` (key
+compare) +0.141, foldhash `hash_bytes_long` +0.080 (the 36-byte key takes foldhash's long path), `write_u128` +0.018.
+Locks: frames matching futex / `Mutex` / `RwLock` / `parking_lot` are 0.000-0.006 ms per 1k fills on the exec thread and
+the workers in both arms (also from `folded-*.txt`; time blocked in the kernel is not visible to `cycles:u`, but exec
+busy is 0.95 in both arms). The non-cloid +0.14 is net: on the exec thread Keccak +0.120 (its samples carry no call
+stack, see 60.5; consistent with section 59's verify +25%) against small decreases (`dealloc_nonnull` -0.025, a
+`native_executor.rs` closure -0.014); in the workers `place_order_with_accounts` self +0.055 and a btree `or_default`
++0.033 against `get_position` -0.033 and `reserve_price` -0.024 (not attributed further).
+
+Engine phase timers (`metrics.txt`, whole cell, mean of val0-2, ms per 1k fills): engine 4.18 -> 4.69 (+0.51, +12.1%),
+of which `engine_untimed` 0.211 -> 0.777 (+0.566; per round +0.570 / +0.537 / +0.592; per native block 9.3 -> 33.7 ms),
+`phase1_actions` +0.041, `phase_margin` -0.033, `phase_match` -0.001, `phase_settle` -0.056. In the `ef812b02` source
+the pre-pass runs after the Phase 1 timer stops and before the margin timer starts, and the absorb loop runs after the
+match timer stops and before the settle timer starts, so both are untimed. The worker sites (per-book check,
+`index_cloid`, worker `forget_cloid`) run inside the parallel match phase, whose wall time does not move.
+
+### 60.3 Cache behaviour on the exec thread (W2, events per 1k val1 fills, mean of 3 cells per arm; `llc.txt`)
+
+| event | c0 | c100 | % | at cloid sites (c100 - c0): index / dup check / cleanup | not at a site |
+|---|---|---|---|---|---|
+| cycles | 13.28 M | 15.17 M | +14.2 | +0.98 M / +0.84 M / +0.18 M | -0.11 M |
+| instructions | 15.71 M | 19.07 M | +21.4 | +0.53 M / +0.86 M / +0.14 M | +1.83 M |
+| L1-dcache-load-misses | 291,278 | 310,551 | +6.6 | +6,818 / +13,143 / +2,397 | -3,085 |
+| DRAM demand fills (`mem_io_local`) | 33,084 | 37,288 | **+12.7** | **+2,785 / +961 / +512** | -53 |
+| other-CCD L3 fills (`ext_cache_local`) | 225 | 275 | +22.4 | +22 / +23 / +6 | 0 |
+
+IPC (c100, instructions / cycles at the site): index 0.54, duplicate check 1.01, cleanup 0.76; the rest of the exec
+thread 1.33 (c0: 1.18). Whole exec thread IPC 1.18 -> 1.26 and DRAM fills per 1k instructions 2.11 -> 1.96, because
+Keccak adds +1.53 M instructions at high IPC outside the cloid sites. **The extra DRAM fills are all at cloid sites, and
+the index upkeep site runs at half the thread's IPC: draining the per-book cloid logs into the cross-market index
+touches memory that is no longer in cache.** The top DRAM-fill leaves are the hashbrown probe (`_mm_movemask_epi8`
++1,282), the key compare (`spec_eq` +1,191) and foldhash (+614).
+
+### 60.4 18c's hypotheses (read-only code check before the run)
+
+| hypothesis | result |
+|---|---|
+| frame `CloidMarkets::live` (pre-pass duplicate check) | **confirmed**, +0.133 exec (all of `duplicate_cloid` +0.136) |
+| frame `CloidMarkets::absorb` | **confirmed**, +0.324 inclusive, almost all in `drain_cloid_log` |
+| frame `drain_cloid_log` | **confirmed**, +0.323, the largest single site (45% of the exec delta) |
+| frame `reserve_rehash` | **confirmed but small**, +0.055 in the claimed-set insert; other rehash time is the same in both arms |
+| frame `find` | **confirmed**, hashbrown `find` +0.32 inclusive on exec (+0.12 in the workers) |
+| site `native_executor.rs:6882` (pre-pass) | **confirmed**, serial block +0.140 + `duplicate_cloid` +0.136 = +0.276 exec |
+| site `native_executor.rs:7309` (`CloidMarkets::absorb` call) | **confirmed**, = the absorb / drain cost, +0.324 |
+| site `order_book.rs:1400` (per-book `contains_key` in place) | **confirmed**, +0.081 in the workers |
+| site `order_book.rs:2946` (`forget_cloid`) | **confirmed**, +0.143 (exec 0.063, workers 0.080); the batch `forget_cloids` only +0.002 |
+
+### 60.5 Outside the engine
+
+val1's other threads: +3.19 ms CPU per 1k fills (+22.4%). The largest parts:
+
+- Keccak (`__KeccakF1600`) self +0.91 over all threads (4.14 -> 5.05; +0.79 outside the exec thread, +0.12 on it). Its
+  samples carry no caller: the assembly Keccak keeps no frame-pointer chain, so `--call-graph fp` stops at the leaf
+  (~99% of the Keccak samples outside the exec thread in `folded-*.txt` are a bare `other;__KeccakF1600` stack). Where
+  it is called from (signature hashing, action hashes, block or DA hashes) is therefore not known from this profile.
+- The rayon signature pre-verify `torus_rpc::torus::verify_one_action_with` +0.80 inclusive (2.59 -> 3.39, +31%), not
+  counting the unattributed Keccak above; k256 `mul_inner` +0.08 of it.
+- RocksDB background threads (`BGThread`) +0.82 inclusive (1.49 -> 2.31, +55%), mostly zstd compression (zstd leaves
+  under the background threads 0.61 -> 1.17, computed from `folded-*.txt` for this write-up).
+
+These threads do not lengthen the exec thread's block time, but they are part of the +8.9% CPU-s/1M. A cost that does
+not scale with fills rises ~12% per fill from the normalisation alone (W1 val1 fills/s 187,635 -> 167,559, -10.7%);
+verify (+31%) and RocksDB background (+55%) rise more than that. Larger signed orders (the u128 cloid in the canonical
+bytes) and larger stored order rows are consistent with both; not checked here.
+
+**Verdict:** the cloid engine cost at 100% share is per-order hash-map work. On the exec thread it is the index upkeep
+(drain the per-book cloid logs into `CloidMarkets` after matching) and the serial duplicate pre-pass (claimed set plus
+`CloidMarkets::live`), each ~0.3 ms CPU per 1k fills; in the workers it is the per-book check, `index_cloid` and
+`forget_cloid`. The index upkeep is cache-bound (IPC 0.54, most of the extra DRAM fills). Both exec-thread parts are
+untimed by the phase timers, which is why section 59 saw only `engine` and `residual_untimed` move. Decisive for the
+split (all exec sites are 0.00-0.02 in c0); n = 3 x 120 s for the whole-cell A/B, consistent with 59.
+
+**Possible levers (suggestions only, not measured):** (1) pre-size the claimed set (`HashSet::with_capacity` from the
+number of cloid placements in the batch) to remove the ~0.06 of `reserve_rehash`; (2) a smaller key or a cheaper hash
+for the cloid maps (for example a 64-bit digest of `(Address, u128)`, or a hash over a prefix, with the full key kept
+for the compare), since foldhash's long path and the key compare are ~0.3 of the exec delta; (3) batch the absorb /
+drain work, or let the workers build each book's index delta so the exec thread only merges it, and (4) skip the
+pre-pass's cross-market lookup for a sender with no live cloids. Each needs its own A/B.
+
+**Caveats.** (1) 100% share is the worst case (as in 59); the split at a realistic share is not measured. (2) One node
+(val1), user space only: kernel time (syscalls, page faults) is not attributed. (3) W1 and W2 are 45 s and 20 s windows
+inside minutes 0-2. (4) Per-1k-fills normalisation spreads every cost over fewer fills in c100 (W1 fills/s -10.7%),
+which inflates costs that do not scale with fills; the cloid sites are 0 in c0, so their deltas are not affected. (5)
+glibc only. (6) Per-site figures are arm means of 3 cells; per-cell variation of the split is not shown (in
+`prof-cells.json`).
+
+Analysis (`tools/ozarchy-p3cloidprof-tools/analyst/`): `run-analysis.sh` (perf script / perf report per cell, then the
+scripts below), `a-prof.py` (W1 / W2 attribution, cloid sites, thread groups; writes `frames-self.txt`,
+`frames-self-loc.txt`, `frames-children.txt`, `cloid-sites.txt`, `llc.txt`, `windows.txt`, `prof-cells.json` and the
+folded stacks), `fg.py` (flame graph SVG from the folded stacks), `a-metrics.py` (engine phase timers, `metrics.txt`),
+and the p3cloid analyst scripts `a-cells.py`, `a-arms.py`, `a-paired.py` (`cells.txt`, `arms.txt`, `paired.txt`;
+`run-analysis.sh` writes their stdout) plus `a-archive.py`. The archived `run-analysis.sh` differs from the analyst's
+copy on ozarchy in one place: it passes the cell prefix to `a-cells.py` and `a-paired.py` with its trailing `-`
+(`"$P-"`), as those scripts build cell paths as prefix + tag; the copy on ozarchy passes `"$P"`, which would open
+`ozarchy-p3cloidprof-300mw0/`. With the fix, `a-paired.py` reproduces `paired.txt` byte for byte and `a-cells.py`
+reproduces the w0 entry of `cells.json`, so the outputs were made with the hyphenated prefix. `frames-engine-delta.txt`
+was printed in the analyst session without a saved script: it is the exec + workers sum of `frames-self.txt` per frame
+(checked for the top rows). The `reserve_rehash` and lock figures in 60.2 and the Keccak / zstd attribution in 60.5 were
+computed from `folded-*.txt` for this write-up, and the per-site IPC in 60.3 from the `llc.txt` counts. Flame graphs
+(FlameGraph-style, us CPU per 1k fills, arm mean, cloid frames in blue):
+`ozarchy-p3cloidprof-run/analyst/flamegraph-c0.svg` and `flamegraph-c100.svg` (0.5 MB each) on ozarchy, not copied into
+the repo (no earlier campaign committed an SVG). Not copied either: the folded stacks (41-42 MB each) and the per-cell
+`perf-report-*.txt` (118-146 KB each, regenerable with `run-analysis.sh`). Driver
+`tools/ozarchy-p3cloidprof-tools/ozarchy-p3cloidprof-campaign.sh`, sidecar `cloidprof-sidecar.sh`, md5s `md5s-all.txt`
+(the p3cloid build's).
 
 ## Open
 

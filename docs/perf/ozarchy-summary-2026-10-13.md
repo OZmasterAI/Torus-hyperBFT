@@ -1,7 +1,7 @@
 # ozarchy campaigns 2026-10-13: absolute per-arm values
 
 Sources: results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` sections 53-58 (branch docs/wedge-fix, worktree
-`/home/oz/projects/wt/docs-wedge-fix`) and 59 (branch docs/p3-cloid), `<run>/analyst/{cells.json,paired.txt,soak.txt,series.txt}`
+`/home/oz/projects/wt/docs-wedge-fix`), 59 (branch docs/p3-cloid) and 60 (branch docs/p3-cloidprof), `<run>/analyst/{cells.json,arms.txt,paired.txt,soak.txt,series.txt}`
 and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywhere: tw, Classic, 300 markets, MAX_IN_FLIGHT 4, commit tail, shared NVMe.
 
 | Sec | arm (sha, allocator) | matched/s: whole cell [min 0-2 / 6-10] | native blk/s | blk time p99 ms | node CPU-s/1M | RSS mean / peak GB per node | dev writes MB/s/val | settle ms/native blk | key delta (CI), as in the write-up |
@@ -33,6 +33,8 @@ and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywh
 | 58 KILL ⁵ | wf e3bb7cca (16 SIGKILLs) | longest gap 18.6 mean / 27.2 max s; kill -> resume 19.1 / 27.3 s | - | - | - | - | - | n/a | |
 | 59 SAT 120 s | c0 main ef812b02, glibc, CLOID_SHARE=0 | 188,654 | 3.41 | 1,251 | 26.43 | 3.62 / 4.25 | 145.1 | n/a | c100: matched/s -11.7% [-13.8, -9.6]; CPU +8.84% [+7.37, +10.31]; exec p99 +18.9% [+9.4, +28.4] |
 | 59 SAT 120 s | c100 main ef812b02, glibc, CLOID_SHARE=100 | 166,551 | 3.17 | 1,402 | 28.77 | 3.86 / 4.57 | 147.7 | n/a | |
+| 60 PROF 120 s | c0 main ef812b02, glibc, CLOID_SHARE=0, perf on val1 | 191,565 | 3.48 | 1,231 | 26.35 | 3.59 / 4.25 | 144.0 | n/a | c100: matched/s -12.5% [-21.6, -3.5]; engine/1k fills +13.1% [+2.8, +23.4]; CPU +8.94% [+3.44, +14.44] |
+| 60 PROF 120 s | c100 main ef812b02, glibc, CLOID_SHARE=100, perf on val1 | 167,570 | 3.12 | 1,409 | 28.70 | 3.88 / 4.54 | 148.5 | n/a | |
 
 Definitions and caveats
 
@@ -46,6 +48,8 @@ Definitions and caveats
   tikv-jemallocator (also covers RocksDB). Everything else glibc.
 - **59 (cloid cost):** one binary (main `ef812b02`, node and bench built together) in both arms; the arms differ only in the
   bench's cloid share (run-cell.sh `CLOID_SHARE` 0 vs 100). 100% is the worst case; realistic shares are not measured.
+- **60 (cloid profile):** 59's binary and arms, n = 3 ABBA, perf recording on val1 in every cell (user space; val1's W1
+  engine is ~4% above its whole-cell value in both arms, not a controlled overhead measurement); matched/s is val0's headline (not profiled). Device writes from `paired.txt` (`a-arms.py` has no `wr` row).
 - **Commit tail everywhere** (bench in-flight released on committed bodies); block time p99 = commit interval from val0-2
   logs, mean of 3 nodes. Closed-loop bench: faster commits raise offered load (jemalloc and mw rows).
 - **Settle wait** = `checkpoint_settle_wait` summary phase, ms per native block, mean of 3 nodes; n/a = no Phase 3 (main
