@@ -317,6 +317,11 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   (defaults): step 2 RSS flat after ~2 min, Phase 3 delta +0.68 GB per node (minutes 5-10 mean; +1.01 GB peak). So the
   glibc growth is consistent with allocator retention (one pair; slow growth not ruled out). Layer size and resting orders do not grow. The minute-6 matched/s drop is margin
   rejections in the econ workload.
+- **Soak with the cancel-share fix** (campaign `ozarchy-p3cssoak`, results doc section 53c, plan-2 row 60): cs2 `41a95355`
+  (`de97682f` on step 2) vs step 2 `7b006739`, glibc, 600 s each: cancel-all expiry 0 (step 2 16k per node) and no margin
+  collapse (the margin user is positions, concentrated on low-address senders by the old cancel order). Step 2 + fix RSS
+  still grows (+129-178 MB/min, +2.76 GB vs section 53's main), against a confounded reference: the fixed arm keeps ~2x the
+  book and layer size for 10 min. Next: cs2 vs main + fix `de97682f`.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
