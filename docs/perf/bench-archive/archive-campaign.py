@@ -29,7 +29,8 @@ WHAT IT WRITES (mechanical part)
      analyst/cells.json (arm of the warm-up), <cell>.campaign.log (start times) and live file sizes.
   3. docs/perf/ozarchy-summary-*.md ([summary] in the meta): one row per arm after the last row of the table, numbers
      from analyst/arms.txt ("per arm mean" table) and {paired:METRIC:DECIMALS} deltas from analyst/paired.txt;
-     optional definitions bullet. The "Sources:" sentence stays manual.
+     optional definitions bullet. The "Sources:" sentence stays manual. A row's cols = {matched, blk, p99, cpu, rss,
+     writes, settle} replace those numbers; a row that gives all seven does not read arms.txt (it need not exist).
 
 REFUSES (exit 3, writes nothing): the campaign is already in INDEX.md / cells.md / DELETABLE.md / tools/, or the
   results-doc section or plan row number is already owned by another entry (INDEX, cells, DELETABLE, summary table).
@@ -854,6 +855,9 @@ def parse_paired(path):
     return out
 
 
+SUMMARY_COLS = ("matched", "blk", "p99", "cpu", "rss", "writes", "settle")
+
+
 def render_summary(c, text):
     """Per-arm rows for the ozarchy summary table (+ optional definitions bullet) -> new text."""
     sm = c.meta["summary"]
@@ -861,26 +865,36 @@ def render_summary(c, text):
     for spec in sm.get("rows", []):
         rd = c.run_dir_for(spec.get("run", ""))
         an = os.path.join(c.bench, rd or "", "analyst")
-        try:
-            arms = parse_arms(os.path.join(an, "arms.txt"))
-        except (OSError, Fatal) as e:
-            raise Fatal("summary row %s: %s" % (spec.get("arm"), e)) from e
-        v = arms.get(spec["arm"])
-        if v is None:
-            raise Fatal("summary row: arm %r not in %s/arms.txt" % (spec["arm"], an))
+        given = spec.get("cols", {})
+        v = {}
+        # arms.txt is read only for the columns the row does not give (a soak row from another table gives all)
+        if not all(k in given for k in SUMMARY_COLS):
+            try:
+                arms = parse_arms(os.path.join(an, "arms.txt"))
+            except (OSError, Fatal) as e:
+                raise Fatal("summary row %s: %s" % (spec.get("arm"), e)) from e
+            v = arms.get(spec.get("arm"))
+            if v is None:
+                raise Fatal("summary row: arm %r not in %s/arms.txt" % (spec.get("arm"), an))
 
-        def g(metric, nd, comma=False, _v=v, _arm=spec["arm"]):
+        def g(metric, nd, comma=False, _v=v, _arm=spec.get("arm")):
             x = _v.get(metric)
             if x is None or x == "nan":
                 c.warn.append(("m", "summary row %s: no %s in arms.txt" % (_arm, metric)))
                 return "?"
             return ("{:,.%df}" if comma else "{:.%df}").replace("%d", str(nd)).format(q(x, nd))
 
-        st = v.get("ck_settle")
-        settle = "n/a" if st in (None, "nan") or q(st, 1) == 0 else g("ck_settle", 1)
-        cols = {"matched": g("ms", 0, True), "blk": g("blk", 2), "p99": g("ci99", 0, True), "cpu": g("cpu", 2),
-                "rss": "%s / %s" % (g("rss_mean", 2), g("rss_pk", 2)), "writes": g("wr", 1), "settle": settle}
-        cols.update(spec.get("cols", {}))
+        def settle(_v=v, _g=g):
+            st = _v.get("ck_settle")
+            return "n/a" if st in (None, "nan") or q(st, 1) == 0 else _g("ck_settle", 1)
+
+        # only the columns the row does not give are read (and warned about when arms.txt lacks them)
+        make = {"matched": lambda _g=g: _g("ms", 0, True), "blk": lambda _g=g: _g("blk", 2),
+                "p99": lambda _g=g: _g("ci99", 0, True), "cpu": lambda _g=g: _g("cpu", 2),
+                "rss": lambda _g=g: "%s / %s" % (_g("rss_mean", 2), _g("rss_pk", 2)),
+                "writes": lambda _g=g: _g("wr", 1), "settle": settle}
+        cols = {k: make[k]() for k in SUMMARY_COLS if k not in given}
+        cols.update(given)
         delta = spec.get("delta", "")
         if "{paired:" in delta:
             paired = parse_paired(os.path.join(an, "paired.txt"))

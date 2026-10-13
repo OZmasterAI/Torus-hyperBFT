@@ -1019,6 +1019,91 @@ class CheckD(FixtureCase):
         self.assertIn("section '12. Not written yet", fx.read("INDEX.md"))
 
 
+FULL_COLS = {
+    "matched": "193,398",
+    "blk": "2.61",
+    "p99": "1,196",
+    "cpu": "27.93",
+    "rss": "4.67 / 4.91",
+    "writes": "231.6",
+    "settle": "n/a",
+}
+
+
+class SummaryRows(FixtureCase):
+    """[summary] rows: numbers from analyst/arms.txt unless [[summary.rows]] cols gives them."""
+
+    def meta_rows(self, *rows):
+        m = json.loads(json.dumps(self.fx.meta))
+        m["summary"]["rows"] = list(rows)
+        return m
+
+    def summary_lines(self):
+        with open(self.fx.summary) as f:
+            return f.read().split("\n")
+
+    def test_all_cols_overridden_needs_no_arms_txt(self):
+        # a soak row whose numbers all come from another table: arms.txt is not read (it may not exist)
+        fx = self.fx
+        os.rename(
+            os.path.join(fx.bench, "ozarchy-tc-run", "analyst", "arms.txt"),
+            os.path.join(fx.tmp, "arms.txt.away"),
+        )
+        row = {"label": "7 soak 600 s", "arm": "a", "text": "a soak", "cols": FULL_COLS}
+        r = fx.run(meta=self.meta_rows(row))
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        self.assertIn(
+            "| 7 soak 600 s | a soak | 193,398 | 2.61 | 1,196 | 27.93 | 4.67 / 4.91 | 231.6 | n/a | |",
+            self.summary_lines(),
+        )
+
+    def test_all_cols_overridden_arm_not_in_arms_txt(self):
+        row = {"label": "7 soak 600 s", "arm": "soak", "text": "soak", "cols": FULL_COLS}
+        self.assertOk(self.fx.run(meta=self.meta_rows(row)))
+
+    def test_missing_arms_txt_still_fatal_when_a_col_is_not_given(self):
+        fx = self.fx
+        os.rename(
+            os.path.join(fx.bench, "ozarchy-tc-run", "analyst", "arms.txt"),
+            os.path.join(fx.tmp, "arms.txt.away"),
+        )
+        cols = dict(FULL_COLS)
+        del cols["settle"]
+        row = {"label": "7 soak 600 s", "arm": "a", "text": "a soak", "cols": cols}
+        snap = fx.snapshot()
+        r = fx.run(meta=self.meta_rows(row))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("arms.txt", r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+
+    def test_overridden_col_missing_from_arms_txt_does_not_warn(self):
+        # wr is not in arms.txt, but the row gives writes: no "no wr in arms.txt" warning
+        fx = self.fx
+        p = os.path.join(fx.bench, "ozarchy-tc-run", "analyst", "arms.txt")
+        write(p, "\n".join(l for l in ARMS_TXT.split("\n") if not l.startswith("wr ")))
+        row = {"label": "7 SAT 120 s", "arm": "a", "text": "a text", "cols": {"writes": "145.1"}}
+        r = fx.run(meta=self.meta_rows(row))
+        self.assertOk(r)
+        self.assertNotIn("WARNING", r.stderr)
+        self.assertIn(
+            "| 7 SAT 120 s | a text | 188,654 | 3.41 | 1,251 | 26.43 | 3.62 / 4.25 | 145.1 | n/a | |",
+            self.summary_lines(),
+        )
+        # without the override the gap still warns (a fresh fixture: this one is archived now)
+        row = {"label": "7 SAT 120 s", "arm": "a", "text": "a text"}
+        fx2 = Fixture(os.path.join(fx.tmp, "second"))
+        write(
+            os.path.join(fx2.bench, "ozarchy-tc-run", "analyst", "arms.txt"),
+            "\n".join(l for l in ARMS_TXT.split("\n") if not l.startswith("wr ")),
+        )
+        m = json.loads(json.dumps(fx2.meta))
+        m["summary"]["rows"] = [row]
+        r = fx2.run("--dry-run", meta=m)
+        self.assertOk(r)
+        self.assertIn("WARNING (m) summary row a: no wr in arms.txt", r.stderr)
+
+
 class Smoke(FixtureCase):
     """The smoke-run check: the archived analysis is run from the staged tools copy against real cells and its output
     is diffed with the archived output; any failure refuses (exit 5) and writes nothing, like the fence check."""
