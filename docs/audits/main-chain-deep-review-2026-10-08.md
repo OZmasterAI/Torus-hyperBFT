@@ -2,6 +2,47 @@
 
 **Reviewed source:** `main` and `origin/main` at `bf2edda6510bf46826e1cc3aec812e895a7de768` (`bf2edda6`). **Review date:** 2026-10-08. **Report branch:** `docs/main-chain-deep-review-2026-10-08`, created directly from that commit. This is a source review; no implementation files were edited and no builds, tests, fault injections, or benchmarks ran. Existing test sources and historical measurements are evidence of intent or prior observations, not fresh verification.
 
+## Status update (2026-10-13, main `32dfc8b1`)
+
+This section was added after the review; the rest of the document is unchanged and still describes `bf2edda6`. Source line links in the rest of the document point at the reviewed commit, not at current main. Status per finding, with the merge commits on main that address it (each checked with `git merge-base --is-ancestor`):
+
+**Counts:** Fixed 8, Partly fixed 3, Planned 6, Decided not to fix 1, Open 14. Statuses marked † rest on backlog notes rather than an explicit owner decision on the finding.
+
+| ID | Status | Evidence (commits on main) | Note |
+|---|---|---|---|
+| R01 | Fixed | 19f8f534, d2b2736b, 5d7075be, e58b92b0 | Failed serial/marker writes and thread panics exit 70; fault tests passed |
+| R02 | Fixed | 4bef6406, ed2354fb, 1eced05c, f4c57d01, 5a308acb, 602c72c7, 12b2cfec, 969ab0c3, 23ae7fc1, c9ed0ba7 | Storage read faults fail-stop in every branch; a decode error still reads as absent (owner s111) |
+| R03 | Fixed | 12979d4b, 9793f1ec, 0c5f10f7 | Typed EVM transactions keep their type; EIP-1559 senders pay base fee + tip |
+| R04 | Fixed | 50808e7b | Original bytecode stored at all 5 CF_CODE writers |
+| R05 | Planned † | none (counter added s99) | Plan 9.11 backlog; options 4/6/7 to compare |
+| R06 | Open | none | Round-robin liquidation caps unchanged |
+| R07 | Open | 85857762 (speed only) | ADL holder sets faster; no funded backstop policy |
+| R08 | Open | none | Stale-mark policy unchanged |
+| R09 | Open | none | Oracle still the mark; stops still trigger on last trade |
+| R10 | Planned | none | Funding in backlog; mechanism undecided |
+| R11 | Planned † | none | Native trading fees in backlog |
+| R12 | Planned | none | Unknown market ids create books (consensus) and Delist/UpdateMarketParams, after Phase 3 |
+| R13 | Open | none | Production still one flat tier |
+| R14 | Open | none | Equal parent/child timestamps still allowed |
+| R15 | Open | none | Commitment and fail-stop defaults unchanged |
+| R16 | Open | none | Consensus execution work still unbounded |
+| R17 | Decided not to fix † | 50808e7b, 12979d4b | Policy: every launch is a fresh genesis, no activation heights (s104/s111) |
+| R18 | Fixed | fa875c3d | Per-proposal snapshot weight and quorum, no live fallback |
+| R19 | Fixed | adcc6239, 684961ac | Odd-length hex, alias keys, accounts/evm_alloc overlap, duplicate validators refused |
+| R20 | Open | none | Devnet and testnet genesis still both chain_id 7778 |
+| R21 | Planned | 0c5f10f7 (related only) | EVM pool still drains before inclusion; fix after Phase 3 |
+| R22 | Fixed | 6b9a01f1 | State reads follow the block tag; historical blocks refused |
+| R23 | Partly fixed | e8b75162 | getBalances fixed; getPosition cross liquidation price still 0 |
+| R24 | Open | none | Full-scan RPC paths unchanged |
+| R25 | Open | 7c4856ca, 959fe3bc (related) | Trade history still async; no durability watermark |
+| R26 | Open | none | Modify still rejects crossing prices |
+| R27 | Partly fixed | 46a11c14, 0c14906f | u128 client order ids, cancel and lookup by cloid; no dead-man switch, expiry or TWAP |
+| R28 | Partly fixed | 3efff0d6, 56914dd1, 85857762 | Cancel-all index, worker pool; EVM serial barrier remains, Phase 3 not merged |
+| R29 | Open | none | Snapshot restore authenticity unchanged |
+| R30 | Fixed | 57170d68 | Explorer indexes a block whole or retries it |
+| R31 | Open | 3f54704e (related) | Only the mempool cancel share is oldest-first; in-block sort unchanged |
+| R32 | Planned † | none | Margin currency in backlog, undecided |
+
 ## Assessment
 
 The chain has substantial working infrastructure: ordered committed execution, parallel market matching, cross-margin accounting, oracle aggregation, staged liquidation and ADL, staking/governance, EVM/native bridging, and separate execution/history persistence. Several serious defects described by older audits have already been addressed. Those older reports are not a reliable inventory of current bugs.
