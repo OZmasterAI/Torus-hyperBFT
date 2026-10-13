@@ -343,7 +343,7 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   native blocks/s +11.3% [+8.4, +14.1]; matched/s +1.8% and block time p99 -2.9% (ties); RSS / writes neutral; CPU-s/1M
   +1.35% [+0.09, +2.61] (not resolved at equal fills). Three REJECTs, all the mark-only digest artifact.
 - **Checkpoint interval 5 s vs 15 s** (campaign `ozarchy-p3iv`, results doc section 55, plan-2 row 63): the same step 2
-  `7b006739` binary, glibc, commit tail, n = 4 ABBA, 120 s. Interval confirmed per cell (4.6 vs 12.0 checkpoints per node
+  `7b006739` binary, glibc, commit tail, n = 4 ABBA, 120 s. Interval confirmed per cell (4.4 vs 11.6 checkpoints per node
   per minute in the bench window; layer per checkpoint 114 -> 74 MB). RSS -0.33 GB peak [-0.65, -0.01] / -0.28 GB mean
   [-0.50, -0.06] per node (~6%), growth rate unchanged; CPU-s/1M +1.10% [+0.44, +1.75]; device writes +10.8% [+7.0, +14.6]
   (WAL path); blocks/s, matched/s, block time p99 ties. Minutes 0-2 only, not the soak plateau. Three REJECTs (g2), all

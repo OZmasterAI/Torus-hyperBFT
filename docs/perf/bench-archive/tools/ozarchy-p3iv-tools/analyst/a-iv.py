@@ -1,9 +1,10 @@
 """ozarchy-p3iv: checkpoint interval 5 s (g5) vs 15 s (g2), extra per-cell rows (python3 -I a-iv.py PREFIX BASE OTHER TAG:ARM ...).
 Per cell (mean of 3 nodes unless noted), over the metrics window (metrics-before -> metrics-after):
   ckpts        torus_exec_checkpoints_total delta per node
-  ckpt_per_min checkpoints per node per minute of the metrics window (bench t_bench0 -> t_bench1 length)
+  ckpt_per_min checkpoints per node per minute of that node's metrics window (metrics-before -> metrics-after file mtimes,
+               i.e. the harness scrape times: bench start - ~4 s to the end of the drain; NOT the bench-only window)
   layer_mb     torus_exec_checkpoint_layer_bytes sum / count delta (MB per checkpoint layer)
-  layer_mb_min layer MB per node per minute (layer bytes sum delta / bench minutes)
+  layer_mb_min layer MB per node per minute of the same metrics window (layer bytes sum delta / window minutes)
   settle_pb    torus_exec_checkpoint_settle_wait_seconds sum / native blocks (ms per native block)
   upkeep_pb    torus_exec_checkpoint_upkeep_seconds sum / native blocks (ms per native block)
   flush_ck_s   torus_flush_worker_checkpoint_seconds sum delta per node (s)
@@ -15,6 +16,7 @@ Then the paired OTHER - BASE per round rK with a t(n-1) 95% CI (same as a-paired
 
 import json
 import math
+import os
 import re
 import statistics as st
 import sys
@@ -70,11 +72,12 @@ def cell(P, tag):
     c = P + tag
     s = json.load(open(c + "/summary.json"))
     t0, t1 = s["timing"]["t_bench0"], s["timing"]["t_bench1"]
-    mins = (t1 - t0) / 60
     rows = []
     for v in V:
         b, a = met(f"{c}/metrics-before-{v}.txt"), met(f"{c}/metrics-after-{v}.txt")
         d = {k: a.get(k, float("nan")) - b.get(k, 0.0) for k in K}
+        # the deltas span the scrape window, so the rates use the scrape times (file mtimes), not t_bench0 -> t_bench1
+        mins = (os.path.getmtime(f"{c}/metrics-after-{v}.txt") - os.path.getmtime(f"{c}/metrics-before-{v}.txt")) / 60
         nb = d["torus_exec_native_blocks_total"]
         rows.append(
             dict(

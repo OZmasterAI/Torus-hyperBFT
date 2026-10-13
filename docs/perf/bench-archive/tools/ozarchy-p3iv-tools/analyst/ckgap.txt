@@ -1,11 +1,11 @@
-r1-g2 g2 in-bench ckpts/node/min=4.43 (nodes [4.43, 4.43, 4.43]) median in-bench gap s=14.5 outside-bench ckpts/node=17.0
-r1-g5 g5 in-bench ckpts/node/min=11.97 (nodes [11.8, 11.8, 12.3]) median in-bench gap s=6.2 outside-bench ckpts/node=23.3
-r2-g5 g5 in-bench ckpts/node/min=11.71 (nodes [11.71, 11.71, 11.71]) median in-bench gap s=6.2 outside-bench ckpts/node=26.0
-r2-g2 g2 in-bench ckpts/node/min=4.75 (nodes [4.92, 4.92, 4.43]) median in-bench gap s=14.4 outside-bench ckpts/node=25.3
-r3-g2 g2 in-bench ckpts/node/min=4.55 (nodes [4.39, 4.39, 4.88]) median in-bench gap s=14.5 outside-bench ckpts/node=12.3
-r3-g5 g5 in-bench ckpts/node/min=11.87 (nodes [11.71, 11.71, 12.2]) median in-bench gap s=6.2 outside-bench ckpts/node=21.0
-r4-g5 g5 in-bench ckpts/node/min=12.30 (nodes [12.3, 12.3, 12.3]) median in-bench gap s=6.2 outside-bench ckpts/node=21.7
-r4-g2 g2 in-bench ckpts/node/min=4.55 (nodes [4.39, 4.88, 4.39]) median in-bench gap s=14.5 outside-bench ckpts/node=17.7
+r1-g2 g2 in-bench ckpts/node/min=4.01 (nodes [4.01, 4.01, 4.01]) in-bench layer MB/node/min=657 median in-bench gap s=14.5 outside-bench ckpts/node=17.0
+r1-g5 g5 in-bench ckpts/node/min=11.70 (nodes [11.53, 11.53, 12.03]) in-bench layer MB/node/min=1034 median in-bench gap s=6.2 outside-bench ckpts/node=23.3
+r2-g5 g5 in-bench ckpts/node/min=11.51 (nodes [11.51, 11.51, 11.51]) in-bench layer MB/node/min=1031 median in-bench gap s=6.2 outside-bench ckpts/node=26.0
+r2-g2 g2 in-bench ckpts/node/min=4.85 (nodes [5.02, 5.02, 4.52]) in-bench layer MB/node/min=660 median in-bench gap s=14.4 outside-bench ckpts/node=25.3
+r3-g2 g2 in-bench ckpts/node/min=4.59 (nodes [4.43, 4.43, 4.92]) in-bench layer MB/node/min=664 median in-bench gap s=14.5 outside-bench ckpts/node=12.3
+r3-g5 g5 in-bench ckpts/node/min=11.66 (nodes [11.5, 11.5, 11.99]) in-bench layer MB/node/min=1042 median in-bench gap s=6.2 outside-bench ckpts/node=21.0
+r4-g5 g5 in-bench ckpts/node/min=11.53 (nodes [11.53, 11.53, 11.53]) in-bench layer MB/node/min=1068 median in-bench gap s=6.2 outside-bench ckpts/node=21.7
+r4-g2 g2 in-bench ckpts/node/min=4.18 (nodes [4.01, 4.51, 4.01]) in-bench layer MB/node/min=660 median in-bench gap s=14.5 outside-bench ckpts/node=17.7
 
-g2 {'per_min': 4.57, 'gap_med': 14.47, 'outside': 18.08}
-g5 {'per_min': 11.96, 'gap_med': 6.16, 'outside': 23.0}
+g2 {'per_min': 4.41, 'layer_mb_min': 660.19, 'gap_med': 14.47, 'outside': 18.08}
+g5 {'per_min': 11.6, 'layer_mb_min': 1043.81, 'gap_med': 6.16, 'outside': 23.0}

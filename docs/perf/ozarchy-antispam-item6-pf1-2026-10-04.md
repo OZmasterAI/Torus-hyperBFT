@@ -6749,8 +6749,8 @@ mean -0.28 GB [-0.50, -0.06] (-6.0%), in-window anon -0.36 GB [-0.53, -0.19] (-7
 It costs node CPU-s/1M +1.10% [+0.44, +1.75] (+1.03% [+0.36, +1.70] at equal fills) and device writes +10.8% [+7.0,
 +14.6] per validator (64.7 -> 71.7 MB/s), almost all on the WAL / foreground path (+13.6% [+10.5, +16.6]).** Native
 blocks/s (+0.2% [-2.6, +2.9]), matched/s (-0.9% [-2.5, +0.6]), `block_ms` and block time p99 (-4.7% [-20.6, +11.3]) are
-ties. The checkpoint rate in the bench window goes from 4.6 to 12.0 per node per minute (2.6x), the layer per checkpoint
-shrinks only 35% (114 -> 74 MB), so layer bytes per minute rise 50%. All 8 measured cells pass every hard check, and the
+ties. The checkpoint rate in the bench window goes from 4.4 to 11.6 per node per minute (2.6x), the layer per checkpoint
+shrinks only 35% (114 -> 74 MB), so layer bytes per minute rise 58% (660 -> 1,044 MB per node). All 8 measured cells pass every hard check, and the
 interval took effect in every cell. 3 cells (all g2) are REJECT on agreement, all the known mark-only digest artifact (55.3).
 
 Owner-approved queue item (interval): the same step 2 binary `7b006739` (`ca388315`, the section 51 / 53 / 54 build,
@@ -6772,11 +6772,11 @@ quiet before every cell. Cells are 120 s long, so **RSS and matched/s here are m
 
 | cell | enable line (val0-2) | in-bench checkpoints per node per min | median in-bench gap s (2 s scrape) | checkpoints per node, metrics window |
 |---|---|---|---|---|
-| r1-g2 / r2-g2 / r3-g2 / r4-g2 | `Some(15s)` on all 3 | 4.43 / 4.75 / 4.55 / 4.55 | 14.5 / 14.4 / 14.5 / 14.5 | 13-14 / 15 / 14-16 / 13-15 |
-| r1-g5 / r2-g5 / r3-g5 / r4-g5 | `Some(5s)` on all 3 | 11.97 / 11.71 / 11.87 / 12.30 | 6.2 / 6.2 / 6.2 / 6.2 | 32-33 / 33 / 32-33 / 33-35 |
+| r1-g2 / r2-g2 / r3-g2 / r4-g2 | `Some(15s)` on all 3 | 4.01 / 4.85 / 4.59 / 4.18 | 14.5 / 14.4 / 14.5 / 14.5 | 13-14 / 15 / 14-16 / 13-15 |
+| r1-g5 / r2-g5 / r3-g5 / r4-g5 | `Some(5s)` on all 3 | 11.70 / 11.51 / 11.66 / 11.53 | 6.2 / 6.2 / 6.2 / 6.2 | 32-33 / 33 / 32-33 / 33-35 |
 
-The env knob was on all 3 node environs in every cell (`node-env-all.txt`). Mean in-bench spacing is 13.1 s (g2) and
-5.0 s (g5); the median gaps sit on the 2 s scrape grid. Over the whole metrics window (bench start - 4 s to the end of
+The env knob was on all 3 node environs in every cell (`node-env-all.txt`). Mean in-bench spacing is 13.6 s (g2) and
+5.2 s (g5) (rate = counter change between the first and last in-bench scrape / the time between them); the median gaps sit on the 2 s scrape grid. Over the whole metrics window (bench start - 4 s to the end of
 the drain) the ratio is 2.3x (14.3 -> 32.9 per node, +18.7 [+17.1, +20.2]), not 3x: outside the bench window (setup
 ~20 s, drain and digest 60-120 s) both arms checkpoint every ~4-6 s, so something other than the interval triggers
 checkpoints there. That is not investigated here; the knob governs the loaded window, which is what the A/B measures.
@@ -6793,7 +6793,8 @@ checkpoints there. That is not investigated here; the knob governs the loaded wi
 | memtables MB | 229 | 263 | +34 [+15, +52] | +14.7% [+6.7, +22.8] |
 | layer MB per checkpoint (metrics `layer_bytes` sum / count) | 114.0 | 73.8 | -40.2 [-46.2, -34.2] | **-35.3% [-40.5, -30.0]** |
 | layer MB per checkpoint (gauge, bench window, a-arms.py) | 155 | 90 | -65 [-86, -44] | -41.9% [-55.4, -28.4] |
-| layer MB per node per minute (metrics window) | 794 | 1,190 | +396 [+343, +450] | +50.0% [+43.2, +56.7] |
+| layer MB per node per minute (bench window, 2 s scrapes, a-ckgap.py) | 660 | 1,044 | +384 [+357, +410] | **+58.1% [+54.1, +62.1]** |
+| layer MB per node per minute (metrics window, scrape-time denominator, a-iv.py) | 616 | 923 | +306 [+278, +335] | +49.8% [+45.1, +54.4] |
 | node CPU-s/1M (whole run) | 23.36 | 23.61 | +0.26 [+0.10, +0.41] | **+1.10% [+0.44, +1.75]** |
 | node CPU at equal fills (ANCOVA, Welch) | | | | +1.03% [+0.36, +1.70] |
 | flush-worker checkpoint s per node per cell | 6.23 | 9.49 | +3.26 [+3.03, +3.48] | +52.2% [+48.6, +55.8] |
@@ -6844,7 +6845,7 @@ peak, mean, window mean and HWM, though the cpu.csv peak only just clears 0. Nex
 section 51 (+1.55 GB peak / +1.08 GB mean, glibc, 120 s, other campaign), that is about a fifth to a quarter of it. The
 growth rate over the window is unchanged, so this A/B gives no sign that 5 s changes the glibc growth that kept the soak
 over the RAM rule (section 53d: +2.62 GB, still growing). That needs a soak to say. The cost is +1.1% CPU-s/1M (resolved,
-also at equal fills), +11% device writes per validator (the WAL path; layer bytes per minute +50%: the layer shrinks less
+also at equal fills), +11% device writes per validator (the WAL path; layer bytes per minute +58%: the layer shrinks less
 than the interval, consistent with hot rows being rewritten in every layer) and +52% flush-worker checkpoint time.
 Throughput, exec time and block time are ties. n = 4 x 120 s: "consistent with" throughout, except the checkpoint rate,
 layer size, writes and upkeep, which are decisive.
@@ -6853,7 +6854,7 @@ Analysis (`tools/ozarchy-p3iv-tools/analyst/`): `a-cells.py`, `a-arms.py`, `a-pa
 for device writes), `a-mw.py` (settle / upkeep per native block; the deferred metrics are absent on `7b006739`), new
 `a-iv.py` (checkpoint count, layer bytes per checkpoint and per minute, settle / upkeep per native block, flush-worker
 checkpoint time, and the WAL vs RocksDB background write split of section 42, paired) and `a-ckgap.py` (in-bench
-checkpoint rate and gaps from `ckpt-samples.txt`), `a-archive.py`. Outputs `arms.txt`, `paired.txt`, `iv.txt`,
+checkpoint rate, layer MB per minute and gaps from `ckpt-samples.txt`), `a-archive.py`. Outputs `arms.txt`, `paired.txt`, `iv.txt`,
 `ckgap.txt`, `mw.txt`, `digest.txt`, `cells.txt`. Full outputs (incl. `cells.json`) in `ozarchy-p3iv-run/analyst/` on
 ozarchy. Driver: `tools/ozarchy-p3iv-tools/ozarchy-p3iv-campaign.sh` (CAMP=I) + `env.sh`.
 

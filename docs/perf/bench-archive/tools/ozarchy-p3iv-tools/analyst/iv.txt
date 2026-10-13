@@ -1,18 +1,18 @@
-r1-g2 g2 ckpts/node=[13.0, 13.0, 14.0] per_min=6.56 layer_mb=118.1 layer_mb/min=774 settle ms/blk=19.95 upkeep ms/blk=0.81 flush_ckpt_s=6.11 inline=759 wr=64.3 wal_wb=50.2 rdb_wb=14.4 MB/s
-r1-g5 g5 ckpts/node=[32.0, 33.0, 33.0] per_min=16.07 layer_mb=74.5 layer_mb/min=1197 settle ms/blk=19.68 upkeep ms/blk=3.26 flush_ckpt_s=9.42 inline=731 wr=72.4 wal_wb=58.4 rdb_wb=15.7 MB/s
-r2-g5 g5 ckpts/node=[33.0, 33.0, 33.0] per_min=16.10 layer_mb=72.5 layer_mb/min=1167 settle ms/blk=18.64 upkeep ms/blk=3.26 flush_ckpt_s=9.52 inline=694 wr=71.4 wal_wb=57.6 rdb_wb=15.8 MB/s
-r2-g2 g2 ckpts/node=[15.0, 15.0, 15.0] per_min=7.38 layer_mb=109.9 layer_mb/min=811 settle ms/blk=19.46 upkeep ms/blk=0.99 flush_ckpt_s=6.43 inline=760 wr=63.7 wal_wb=50.8 rdb_wb=14.5 MB/s
-r3-g2 g2 ckpts/node=[14.0, 14.0, 16.0] per_min=7.15 layer_mb=110.7 layer_mb/min=790 settle ms/blk=18.90 upkeep ms/blk=0.87 flush_ckpt_s=6.21 inline=847 wr=63.9 wal_wb=50.4 rdb_wb=14.5 MB/s
-r3-g5 g5 ckpts/node=[32.0, 32.0, 33.0] per_min=15.77 layer_mb=74.3 layer_mb/min=1172 settle ms/blk=18.44 upkeep ms/blk=3.01 flush_ckpt_s=9.42 inline=730 wr=71.2 wal_wb=57.2 rdb_wb=15.8 MB/s
-r4-g5 g5 ckpts/node=[33.0, 33.0, 35.0] per_min=16.56 layer_mb=74.0 layer_mb/min=1225 settle ms/blk=19.31 upkeep ms/blk=3.43 flush_ckpt_s=9.60 inline=678 wr=71.6 wal_wb=57.5 rdb_wb=15.3 MB/s
-r4-g2 g2 ckpts/node=[13.0, 14.0, 15.0] per_min=6.83 layer_mb=117.3 layer_mb/min=799 settle ms/blk=20.59 upkeep ms/blk=1.22 flush_ckpt_s=6.18 inline=732 wr=66.9 wal_wb=51.7 rdb_wb=15.6 MB/s
+r1-g2 g2 ckpts/node=[13.0, 13.0, 14.0] per_min=5.08 layer_mb=118.1 layer_mb/min=599 settle ms/blk=19.95 upkeep ms/blk=0.81 flush_ckpt_s=6.11 inline=759 wr=64.3 wal_wb=50.2 rdb_wb=14.4 MB/s
+r1-g5 g5 ckpts/node=[32.0, 33.0, 33.0] per_min=12.26 layer_mb=74.5 layer_mb/min=913 settle ms/blk=19.68 upkeep ms/blk=3.26 flush_ckpt_s=9.42 inline=731 wr=72.4 wal_wb=58.4 rdb_wb=15.7 MB/s
+r2-g5 g5 ckpts/node=[33.0, 33.0, 33.0] per_min=12.64 layer_mb=72.5 layer_mb/min=916 settle ms/blk=18.64 upkeep ms/blk=3.26 flush_ckpt_s=9.52 inline=694 wr=71.4 wal_wb=57.6 rdb_wb=15.8 MB/s
+r2-g2 g2 ckpts/node=[15.0, 15.0, 15.0] per_min=5.71 layer_mb=109.9 layer_mb/min=627 settle ms/blk=19.46 upkeep ms/blk=0.99 flush_ckpt_s=6.43 inline=760 wr=63.7 wal_wb=50.8 rdb_wb=14.5 MB/s
+r3-g2 g2 ckpts/node=[14.0, 14.0, 16.0] per_min=5.60 layer_mb=110.7 layer_mb/min=618 settle ms/blk=18.90 upkeep ms/blk=0.87 flush_ckpt_s=6.21 inline=847 wr=63.9 wal_wb=50.4 rdb_wb=14.5 MB/s
+r3-g5 g5 ckpts/node=[32.0, 32.0, 33.0] per_min=12.30 layer_mb=74.3 layer_mb/min=913 settle ms/blk=18.44 upkeep ms/blk=3.01 flush_ckpt_s=9.42 inline=730 wr=71.2 wal_wb=57.2 rdb_wb=15.8 MB/s
+r4-g5 g5 ckpts/node=[33.0, 33.0, 35.0] per_min=12.81 layer_mb=74.0 layer_mb/min=947 settle ms/blk=19.31 upkeep ms/blk=3.43 flush_ckpt_s=9.60 inline=678 wr=71.6 wal_wb=57.5 rdb_wb=15.3 MB/s
+r4-g2 g2 ckpts/node=[13.0, 14.0, 15.0] per_min=5.29 layer_mb=117.3 layer_mb/min=619 settle ms/blk=20.59 upkeep ms/blk=1.22 flush_ckpt_s=6.18 inline=732 wr=66.9 wal_wb=51.7 rdb_wb=15.6 MB/s
 
 paired rounds: ['r1', 'r2', 'r3', 'r4']  (g5 - g2); CI = mean +- t(n-1) * sd / sqrt(n)
 metric            g2 mean      g5 mean      delta                 95% CI        %                 % CI  per-round deltas
 ckpts              14.250       32.917    +18.667 [  +17.105,   +20.228] +130.99% [+120.04, +141.95]  +19.333 +18.000 +17.667 +19.667
-ckpt_per_min        6.980       16.123     +9.144 [   +8.258,   +10.029] +131.01% [+118.32, +143.70]  +9.508 +8.721 +8.618 +9.728
+ckpt_per_min        5.419       12.501     +7.083 [   +6.525,    +7.640] +130.70% [+120.42, +140.99]  +7.185 +6.934 +6.697 +7.515
 layer_mb          114.003       73.817    -40.186 [  -46.215,   -34.158]  -35.25% [ -40.54,  -29.96]  -43.563 -37.441 -36.411 -43.330
-layer_mb_min      793.533     1189.870   +396.337 [ +342.809,  +449.866]  +49.95% [ +43.20,  +56.69]  +422.916 +355.815 +381.512 +425.106
+layer_mb_min      616.040      922.503   +306.463 [ +278.111,  +334.815]  +49.75% [ +45.14,  +54.35]  +314.296 +288.859 +295.012 +327.684
 settle_pb          19.726       19.017     -0.708 [   -1.418,    +0.001]   -3.59% [  -7.19,   +0.01]  -0.271 -0.817 -0.461 -1.285
 upkeep_pb           0.974        3.242     +2.268 [   +2.055,    +2.482] +232.99% [+211.03, +254.95]  +2.451 +2.272 +2.133 +2.217
 flush_ck_s          6.233        9.488     +3.256 [   +3.031,    +3.480]  +52.23% [ +48.63,  +55.84]  +3.308 +3.084 +3.214 +3.416
