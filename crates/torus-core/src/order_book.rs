@@ -1287,10 +1287,21 @@ pub struct OrderBook {
 /// a logged key takes this book's entry, or leaves when it has none and the
 /// index points at this market. Orders without a cloid log nothing. In-RAM
 /// only: never serialized, hashed, or read by matching or saving.
+///
+/// perf/cloid-engine-cost fix 2: a market worker resolves the log at the
+/// end of its matching ([`OrderBook::resolve_cloid_log`]): each logged key
+/// moves to `resolved` with its entry looked up there, in the worker, so
+/// the executor's drain reads the entry from the record instead of probing
+/// the map again on the exec thread. Every change of `map` logs its key, so
+/// while `log` is empty no entry changed since the resolve and the resolved
+/// entries are the current ones; when `log` is not empty the drain looks
+/// every key up again, as before. `resolved` holds keys logged before any
+/// key in `log`.
 #[derive(Default)]
 struct BookCloids {
     map: HashMap<(Address, Cloid), OrderId>,
     log: Vec<(Address, Cloid)>,
+    resolved: Vec<(Address, Cloid, Option<OrderId>)>,
 }
 
 /// One chunk's aggregate for the chunked level digest: the keccak of its
@@ -2338,21 +2349,57 @@ impl OrderBook {
     /// cloid here any more). The executor's cross-market index is kept from
     /// this ([`BookCloids`]).
     pub fn drain_cloid_log(&mut self, mut f: impl FnMut(Address, Cloid, Option<OrderId>)) {
-        let BookCloids { map, log } = &mut self.cloids;
-        for (t, c) in log.drain(..) {
-            f(t, c, map.get(&(t, c)).copied());
+        let BookCloids { map, log, resolved } = &mut self.cloids;
+        if log.is_empty() {
+            // fix 2: nothing changed since the resolve: its entries are
+            // the current ones.
+            for (t, c, live) in resolved.drain(..) {
+                debug_assert_eq!(
+                    live,
+                    map.get(&(t, c)).copied(),
+                    "stale resolved cloid record"
+                );
+                f(t, c, live);
+            }
+        } else {
+            for (t, c, _) in resolved.drain(..) {
+                f(t, c, map.get(&(t, c)).copied());
+            }
+            for (t, c) in log.drain(..) {
+                f(t, c, map.get(&(t, c)).copied());
+            }
         }
+    }
+
+    /// perf/cloid-engine-cost fix 2: look the logged keys up now (a market
+    /// worker, at the end of its matching) so [`Self::drain_cloid_log`] on
+    /// the exec thread need not, as long as nothing changes in between
+    /// ([`BookCloids`]). Drains the same records either way.
+    pub fn resolve_cloid_log(&mut self) {
+        let BookCloids { map, log, resolved } = &mut self.cloids;
+        if log.is_empty() {
+            return;
+        }
+        // A record resolved earlier may be stale by now: look it up again.
+        for (t, c, live) in resolved.iter_mut() {
+            *live = map.get(&(*t, *c)).copied();
+        }
+        resolved.extend(
+            log.drain(..)
+                .map(|(t, c)| (t, c, map.get(&(t, c)).copied())),
+        );
     }
 
     /// s114 follow-up: empty the cloid log unread (a load, or no index to
     /// feed).
     pub fn clear_cloid_log(&mut self) {
         self.cloids.log.clear();
+        self.cloids.resolved.clear();
     }
 
-    /// s114 follow-up: keys in the cloid log.
+    /// s114 follow-up: keys in the cloid log (resolved or not).
     pub fn cloid_log_len(&self) -> usize {
-        self.cloids.log.len()
+        self.cloids.log.len() + self.cloids.resolved.len()
     }
 
     /// s114: the pending stop with this id.

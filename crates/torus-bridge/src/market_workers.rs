@@ -347,6 +347,9 @@ impl MarketWorkerPool {
             });
         }
 
+        // perf/cloid-engine-cost fix 2: look this book's logged cloid keys
+        // up here, in parallel, so the exec thread's drain does not.
+        book.resolve_cloid_log();
         let next_order_id = book.next_order_id();
         MarketBatchResult {
             market_id,

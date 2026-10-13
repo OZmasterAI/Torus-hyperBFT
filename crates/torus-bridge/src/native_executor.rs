@@ -3223,12 +3223,13 @@ impl CloidMarkets {
                     index.map.insert((trader, cloid), (market, id));
                 }
                 None => {
-                    if index
-                        .map
-                        .get(&(trader, cloid))
-                        .is_some_and(|&(m, _)| m == market)
-                    {
-                        index.map.remove(&(trader, cloid));
+                    // fix 2: one lookup: take the entry out, put it back
+                    // if it names another market (then this book's
+                    // removal is not the index's).
+                    if let Some(entry) = index.map.remove(&(trader, cloid)) {
+                        if entry.0 != market {
+                            index.map.insert((trader, cloid), entry);
+                        }
                     }
                 }
             }),

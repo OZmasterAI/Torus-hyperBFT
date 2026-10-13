@@ -701,3 +701,94 @@ fn a_seeded_cloid_stream_gives_the_pinned_results() {
     ];
     assert_eq!(got, want, "got {got:#x?}");
 }
+
+/// perf/cloid-engine-cost fix 2: a book whose log a worker resolved
+/// (`resolve_cloid_log`, any number of times, also with changes after the
+/// last one) drains exactly the records, in the same order, as a book that
+/// never resolved: `(trader, cloid, the entry NOW)` per logged key.
+#[test]
+fn a_resolved_log_drains_the_same_records_as_a_plain_one() {
+    type Rec = Vec<(Address, u128, Option<OrderId>)>;
+    let drain = |b: &mut OrderBook| {
+        let mut v: Rec = Vec::new();
+        b.drain_cloid_log(|t, c, live| v.push((t, c, live)));
+        assert_eq!(b.cloid_log_len(), 0);
+        v
+    };
+    let mut drained = 0usize;
+    for seed in 1..=40u64 {
+        let mut rng = Rng(seed);
+        let (mut plain, mut resolved) = (book(), book());
+        for k in 0..400u64 {
+            let trader = addr(1 + rng.below(3) as u8);
+            let c = C + rng.below(4) as u128;
+            match rng.below(10) {
+                0..=3 => {
+                    let is_buy = rng.below(2) == 0;
+                    let px = if is_buy {
+                        rng.pick(97, 101)
+                    } else {
+                        rng.pick(99, 103)
+                    };
+                    let q = rng.pick(1, 2);
+                    let a = plain.place_order(gtc(is_buy, px, q, Some(c)), trader, k);
+                    let b = resolved.place_order(gtc(is_buy, px, q, Some(c)), trader, k);
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"));
+                }
+                4 => {
+                    let a = plain
+                        .order_id_by_cloid(&trader, c)
+                        .map(|id| plain.cancel_order(id).is_ok());
+                    let b = resolved
+                        .order_id_by_cloid(&trader, c)
+                        .map(|id| resolved.cancel_order(id).is_ok());
+                    assert_eq!(a, b);
+                }
+                5 => {
+                    let a: Vec<OrderId> = plain
+                        .cancel_all(trader, None)
+                        .iter()
+                        .map(|o| o.id)
+                        .collect();
+                    let b: Vec<OrderId> = resolved
+                        .cancel_all(trader, None)
+                        .iter()
+                        .map(|o| o.id)
+                        .collect();
+                    assert_eq!(a, b);
+                }
+                6 | 7 => resolved.resolve_cloid_log(),
+                8 => {
+                    let (a, b) = (drain(&mut plain), drain(&mut resolved));
+                    assert_eq!(a, b, "seed {seed} op {k}");
+                    drained += a.len();
+                }
+                _ => {
+                    assert_eq!(
+                        plain.cloid_log_len(),
+                        resolved.cloid_log_len(),
+                        "seed {seed} op {k}"
+                    );
+                }
+            }
+        }
+        assert_eq!(drain(&mut plain), drain(&mut resolved), "seed {seed} end");
+        assert_eq!(entries(&plain), entries(&resolved));
+    }
+    assert!(drained > 1_000, "{drained} records compared");
+}
+
+/// fix 2: clearing a resolved log forgets the resolved records too.
+#[test]
+fn clearing_a_resolved_log_empties_it() {
+    let mut b = book();
+    b.place_order(gtc(true, 100, 1, Some(C)), addr(1), 1);
+    b.resolve_cloid_log();
+    b.place_order(gtc(true, 99, 1, Some(C + 1)), addr(1), 2);
+    assert_eq!(b.cloid_log_len(), 2);
+    b.clear_cloid_log();
+    assert_eq!(b.cloid_log_len(), 0);
+    let mut n = 0;
+    b.drain_cloid_log(|_, _, _| n += 1);
+    assert_eq!(n, 0);
+}
