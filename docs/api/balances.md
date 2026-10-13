@@ -54,6 +54,9 @@ How the figures are valued (the executor's rules, on the same rows):
 - `freeMargin` is the single-order pool. Inside one batch the engine also
   charges the sender's earlier orders of the same batch; a balance read sees
   only committed state.
+- Per position, `torus_getPosition`'s `liquidationPrice` is the mark of
+  that market at which `accountValue` meets `maintenanceMarginUsed`, the
+  other marks held ([position.md](position.md)).
 
 Cost: the balance row, a prefix scan of the account's positions, and per
 market it holds one market row and one oracle row, plus the head header. Only

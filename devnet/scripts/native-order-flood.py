@@ -76,7 +76,7 @@ DOMAIN_SEPARATOR = bytes.fromhex(
 PLACE_ORDER_TYPEHASH = keccak256(
     b"PlaceOrder(uint64 marketId,bool isBuy,int128 price,int128 quantity,"
     b"uint8 orderType,uint8 timeInForce,bool reduceOnly,"
-    b"uint64 clientOrderId,bool hasClientOrderId,uint64 nonce)"
+    b"uint128 clientOrderId,bool hasClientOrderId,uint64 nonce)"  # s114: uint128
 )
 
 ORDER_TYPE_LIMIT = 0

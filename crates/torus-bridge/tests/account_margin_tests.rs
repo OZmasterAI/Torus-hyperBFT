@@ -1599,6 +1599,11 @@ fn sell_cut_counter_non_pool_zero_fill(path: Path) {
     assert_eq!(resting_in(&ctx, &x, 2), vec![fp(1)], "{path:?}: X's bid untouched");
     assert_eq!(sell_cuts(&metrics), vec![(1, 0, 2, 1)], "{path:?}");
     assert_eq!(metrics.orders_rejected_cancelled.get(), 1, "{path:?}");
+    // s114: the book's match-time cut is `margin_match`, not a pre-book split.
+    let reasons: Vec<u64> = metrics.orders_rejected_reason.iter().map(|c| c.get()).collect();
+    let mut want = vec![0; torus_telemetry::OrderRejectReason::COUNT];
+    want[torus_telemetry::OrderRejectReason::MarginMatch as usize] = 1;
+    assert_eq!(reasons, want, "{path:?}");
 }
 batch_paths!(sell_cut_counter_non_pool_zero_fill);
 

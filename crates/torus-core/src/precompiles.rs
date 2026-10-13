@@ -15,7 +15,7 @@ use alloy_primitives::keccak256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::*;
 use torus_state::{StateBackend, StateDb};
-use torus_types::{Address, FixedPoint, MarketId, OrderId, U256};
+use torus_types::{Address, Cloid, FixedPoint, MarketId, OrderId, U256};
 
 use crate::error::CoreError;
 use crate::lockbox::{wei_to_fp_floor, WEI_PER_NATIVE_UNIT};
@@ -1151,13 +1151,21 @@ fn core_writer(
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
 
-    if sel == selector_for("placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)") {
+    // s114: the 7-word form appends a client order id (cloid), 0 = none.
+    let with_cloid =
+        sel == selector_for("placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8,uint128)");
+    if with_cloid || sel == selector_for("placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)") {
         let market_id = abi::decode_market_id(&abi::word(input, 0)?);
         let side = abi::decode_u8(&abi::word(input, 1)?);
         let order_type = abi::decode_u8(&abi::word(input, 2)?);
         let price = abi::decode_u128(&abi::word(input, 3)?);
         let quantity = abi::decode_u128(&abi::word(input, 4)?);
         let time_in_force = abi::decode_u8(&abi::word(input, 5)?);
+        let cloid = if with_cloid {
+            Some(abi::decode_u128(&abi::word(input, 6)?)).filter(|&c| c != 0)
+        } else {
+            None
+        };
 
         // FIX ECON-FIND-27: Validate enum discriminant ranges before use
         // Side: 0=Buy, 1=Sell
@@ -1197,6 +1205,7 @@ fn core_writer(
                 price: FixedPoint::from_raw(price as i128),
                 quantity: FixedPoint::from_raw(quantity as i128),
                 time_in_force,
+                cloid,
             },
             block_queued: current_block,
         };
@@ -1212,6 +1221,18 @@ fn core_writer(
         let action = QueuedAction {
             trader: *caller,
             kind: QueuedActionKind::CancelOrder { order_id },
+            block_queued: current_block,
+        };
+        CoreWriterQueue::enqueue(state_db, &action)?;
+        Ok(abi::encode_bool(true).to_vec())
+    } else if sel == selector_for("cancelByCloid(bytes32,uint128)") {
+        // s114: cancel the caller's open order (resting or a pending stop)
+        // with this cloid in this market.
+        let market_id = abi::decode_market_id(&abi::word(input, 0)?);
+        let cloid = abi::decode_u128(&abi::word(input, 1)?);
+        let action = QueuedAction {
+            trader: *caller,
+            kind: QueuedActionKind::CancelByCloid { market_id, cloid },
             block_queued: current_block,
         };
         CoreWriterQueue::enqueue(state_db, &action)?;
@@ -1602,6 +1623,9 @@ pub enum QueuedActionKind {
         price: FixedPoint,
         quantity: FixedPoint,
         time_in_force: u8,
+        /// s114: the client order id (row: `0`, or `1 ‖ 16 BE` after
+        /// `time_in_force`).
+        cloid: Option<Cloid>,
     },
     CancelOrder {
         order_id: OrderId,
@@ -1623,6 +1647,12 @@ pub enum QueuedActionKind {
     },
     /// Claim all matured unbonding entries (borsh tag 7 — appended).
     ClaimUnbonded,
+    /// s114: cancel by client order id (borsh tag 8 — appended):
+    /// `market 8 BE ‖ cloid 16 BE`.
+    CancelByCloid {
+        market_id: MarketId,
+        cloid: Cloid,
+    },
     /// Lockbox 0x0820 `depositToNative`: credit `amount` native. The EVM value was
     /// already burned in the depositing tx — the drain must NOT debit EVM again.
     LockboxDeposit {
@@ -1674,6 +1704,7 @@ impl BorshSerialize for QueuedActionKind {
                 price,
                 quantity,
                 time_in_force,
+                cloid,
             } => {
                 w.write_all(&[0])?;
                 w.write_all(&market_id.to_be_bytes())?;
@@ -1682,6 +1713,13 @@ impl BorshSerialize for QueuedActionKind {
                 borsh_write_fp(price, w)?;
                 borsh_write_fp(quantity, w)?;
                 w.write_all(&[*time_in_force])?;
+                match cloid {
+                    None => w.write_all(&[0])?,
+                    Some(c) => {
+                        w.write_all(&[1])?;
+                        w.write_all(&c.to_be_bytes())?;
+                    }
+                }
             }
             Self::CancelOrder { order_id } => {
                 w.write_all(&[1])?;
@@ -1710,6 +1748,11 @@ impl BorshSerialize for QueuedActionKind {
             }
             Self::ClaimUnbonded => {
                 w.write_all(&[7])?;
+            }
+            Self::CancelByCloid { market_id, cloid } => {
+                w.write_all(&[8])?;
+                w.write_all(&market_id.to_be_bytes())?;
+                w.write_all(&cloid.to_be_bytes())?;
             }
             Self::LockboxDeposit { amount } => {
                 w.write_all(&[TAG_LOCKBOX_DEPOSIT])?;
@@ -1743,6 +1786,22 @@ impl BorshDeserialize for QueuedActionKind {
                 let quantity = borsh_read_fp(r)?;
                 let mut tf = [0u8; 1];
                 r.read_exact(&mut tf)?;
+                let mut ct = [0u8; 1];
+                r.read_exact(&mut ct)?;
+                let cloid = match ct[0] {
+                    0 => None,
+                    1 => {
+                        let mut cb = [0u8; 16];
+                        r.read_exact(&mut cb)?;
+                        Some(Cloid::from_be_bytes(cb))
+                    }
+                    x => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid PlaceOrder cloid tag: {x}"),
+                        ))
+                    }
+                };
                 Ok(Self::PlaceOrder {
                     market_id,
                     side,
@@ -1750,6 +1809,7 @@ impl BorshDeserialize for QueuedActionKind {
                     price,
                     quantity,
                     time_in_force: tf[0],
+                    cloid,
                 })
             }
             1 => {
@@ -1782,6 +1842,16 @@ impl BorshDeserialize for QueuedActionKind {
                 Ok(Self::LockPermanent { amount })
             }
             7 => Ok(Self::ClaimUnbonded),
+            8 => {
+                let mut mb = [0u8; 8];
+                r.read_exact(&mut mb)?;
+                let mut cb = [0u8; 16];
+                r.read_exact(&mut cb)?;
+                Ok(Self::CancelByCloid {
+                    market_id: u64::from_be_bytes(mb),
+                    cloid: Cloid::from_be_bytes(cb),
+                })
+            }
             TAG_LOCKBOX_DEPOSIT => Ok(Self::LockboxDeposit {
                 amount: borsh_read_fp(r)?,
             }),

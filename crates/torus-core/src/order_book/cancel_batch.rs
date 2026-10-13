@@ -453,6 +453,7 @@ impl OrderBook {
             self.trader_orders.remove(sender);
             self.forget_reduce_only_trader(sender);
             let orders: Vec<Order> = cancelled.by_ref().take(range.len()).collect();
+            self.forget_cloids(&orders);
             for order in &orders {
                 let loc = self
                     .order_index
@@ -476,8 +477,7 @@ impl OrderBook {
         // Each owner's `retain` in the sequential loop, as one stable pass.
         stop_owners.sort_unstable();
         if !stop_owners.is_empty() {
-            self.pending_stops
-                .retain(|stop| stop_owners.binary_search(&stop.trader).is_err());
+            self.retain_stops(|stop| stop_owners.binary_search(&stop.trader).is_err());
         }
         out
     }
@@ -509,7 +509,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             timestamp: id * 7,
             reduce_only: id % 2 == 0,
-            client_order_id: Some(id + 11),
+            client_order_id: Some(u128::from(id + 11)),
         }
     }
 

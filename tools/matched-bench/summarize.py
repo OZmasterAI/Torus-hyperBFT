@@ -1170,13 +1170,14 @@ def parse_dissem(raw):
 
 def parse_bench_log(path):
     """bench.log end-of-run lines -> (submit rate actions/s, econ mix, in-flight
-    releases, cancel-by-id counts); each None when its line is absent (older
-    bench, cap off, no cancel-by-id cell)."""
+    releases, cancel-by-id counts, cloid counts); each None when its line is
+    absent (older bench, cap off, no cancel-by-id cell, bench before
+    --cloid-share)."""
     try:
         with open(path, errors="replace") as f:
             text = f.read()
     except OSError:
-        return None, None, None, None
+        return None, None, None, None, None
     m = re.search(r"Submitted \(load-gen accepted\): [0-9,]+ native actions \(([0-9.]+)/s\)", text)
     rate = float(m.group(1)) if m else None
     m = re.search(r"Econ mix \(load-gen accepted\): place (\d+) \(([0-9.]+)%\) \| "
@@ -1205,10 +1206,14 @@ def parse_bench_log(path):
     by_id = None if not m else dict(zip(
         ("cancel_sent", "cancel_accepted", "modify_sent", "modify_accepted", "lookups",
          "lookup_errors", "no_own_order"), map(int, m.groups())))
-    return rate, mix, inflight, by_id
+    m = re.search(r"Cloids \(load-gen generated\): (\d+) of (\d+) orders \([0-9.]+%\) \| "
+                  r"--cloid-share (\d+)%", text)
+    cloids = None if not m else {
+        "share_pct": int(m.group(3)), "stamped": int(m.group(1)), "placed": int(m.group(2))}
+    return rate, mix, inflight, by_id, cloids
 
 
-bench_submit_rate, econ_mix, in_flight, cancel_by_id = parse_bench_log(os.path.join(OUT, "bench.log"))
+bench_submit_rate, econ_mix, in_flight, cancel_by_id, cloids = parse_bench_log(os.path.join(OUT, "bench.log"))
 dissem = parse_dissem(A.dissem)
 if dissem:
     dissem["raw"] = A.dissem.strip()   # re-fed verbatim by resummarize.sh
@@ -1325,6 +1330,8 @@ summary = {
                "bench_submit_rate": bench_submit_rate,
                "econ_mix": econ_mix,
                "cancel_by_id": cancel_by_id,
+               # Generated orders incl. signed-ahead ones never sent.
+               "cloids": cloids,
                "in_flight": in_flight,
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
                "mempool_nonce_expired_evictions_per_node": [int(x) for x in A.evicted.split()],

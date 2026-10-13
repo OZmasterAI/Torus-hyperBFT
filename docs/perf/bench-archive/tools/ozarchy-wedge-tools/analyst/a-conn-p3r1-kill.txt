@@ -1,0 +1,18 @@
+x1-o-KILL k1 val0 disc=10.00 conn=16.00 est=1 ghost=False | val2 disc=10.00 conn=16.00 est=1 ghost=False
+x1-o-KILL k2 val0 disc=10.01 conn=15.22 est=1 ghost=False | val2 disc=10.01 conn=15.23 est=1 ghost=False
+x1-o-KILL k3 val0 disc=10.14 conn=13.83 est=1 ghost=False | val2 disc=10.00 conn=13.84 est=1 ghost=False
+x1-o-KILL k4 val0 disc=10.05 conn=13.30 est=1 ghost=False | val2 disc=10.05 conn=13.30 est=1 ghost=False
+x1-s-KILL k1 val0 disc=10.01 conn=11.74 est=1 ghost=False | val2 disc=10.02 conn=11.76 est=1 ghost=False
+x1-s-KILL k2 val0 disc=10.02 conn=11.52 est=1 ghost=False | val2 disc=10.02 conn=11.53 est=1 ghost=False
+x1-s-KILL k3 val0 disc=11.08 conn=22.83 est=1 ghost=False | val2 disc=11.08 conn=22.84 est=1 ghost=False
+x1-s-KILL k4 val0 disc=10.01 conn=10.31 est=1 ghost=False | val2 disc=10.01 conn=10.31 est=1 ghost=False
+y1-o-KILL k1 val0 disc=10.01 conn=10.95 est=1 ghost=False | val2 disc=10.01 conn=10.95 est=1 ghost=False
+y1-o-KILL k2 val0 disc=10.01 conn=13.72 est=1 ghost=False | val2 disc=10.00 conn=13.72 est=1 ghost=False
+y1-o-KILL k3 val0 disc=10.05 conn=15.12 est=1 ghost=False | val2 disc=10.05 conn=15.12 est=1 ghost=False
+y1-o-KILL k4 val0 disc=10.01 conn=10.44 est=1 ghost=False | val2 disc=10.01 conn=10.44 est=1 ghost=False
+y1-s-KILL k1 val0 disc=10.00 conn=11.44 est=1 ghost=False | val2 disc=10.00 conn=11.45 est=1 ghost=False
+y1-s-KILL k2 val0 disc=10.07 conn=8.78 est=2 ghost=True | val2 disc=10.07 conn=8.78 est=2 ghost=True
+y1-s-KILL k3 val0 disc=10.00 conn=8.14 est=2 ghost=True | val2 disc=10.00 conn=8.17 est=2 ghost=True
+y1-s-KILL k4 val0 disc=10.00 conn=8.78 est=2 ghost=True | val2 disc=10.00 conn=8.78 est=2 ghost=True
+TOTAL o survivor-kill pairs 16 ghost 0
+TOTAL s survivor-kill pairs 16 ghost 6

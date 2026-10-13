@@ -275,6 +275,7 @@ pub fn core_writer_results(
                 reason,
                 message,
                 oid: e.oid,
+                cloid: e.cloid,
             }
         })
         .collect()
@@ -596,6 +597,7 @@ mod tests {
             queued_block: 4,
             result,
             oid: None,
+            cloid: None,
         };
         let ioc = NativeActionResult {
             error: Some(Cow::Borrowed(
@@ -625,11 +627,15 @@ mod tests {
         let mut entries = entries;
         entries.push(CoreWriterDrained {
             oid: Some(77),
+            cloid: Some(u128::MAX),
             ..entry(8, K::PlaceOrder, ok())
         });
         let got = core_writer_results(entries);
         let oids: Vec<_> = got.iter().map(|r| r.oid).collect();
         assert_eq!(oids, vec![None, None, None, None, None, Some(77)]);
+        // s114: and the cloid its row carried.
+        let cloids: Vec<_> = got.iter().map(|r| r.cloid).collect();
+        assert_eq!(cloids, vec![None, None, None, None, None, Some(u128::MAX)]);
         let got = got[..5].to_vec();
         let rows: Vec<_> = got
             .iter()

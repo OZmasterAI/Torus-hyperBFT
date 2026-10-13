@@ -80,6 +80,11 @@
 #                in-flight watch node) instead of the drawn action; bench.log
 #                "Cancel-by-id ..." -> summary.json ingest.cancel_by_id. Needs a
 #                bench built with the flags. Unset (default) = flags omitted.
+#   CLOID_SHARE=P  bench --cloid-share P (0..100): P% of the placed orders carry
+#                a client order id (s114 cloid), unique per sender and nonzero;
+#                bench.log prints "Cloid share: ..." and "Cloids (load-gen
+#                generated): ...". Needs a bench built with the flag. Unset
+#                (default) = flag omitted = no cloids.
 #   BLOCK_CAP=N  block-cap-raise sweep bundle: exports the COHERENT set of
 #                proposer-local selection caps for an N-action native block
 #                (TORUS_NATIVE_TOTAL_BLOCK_CAP=N plus the companion caps that
@@ -268,6 +273,7 @@ SPAM_CANCEL_RATE=${SPAM_CANCEL_RATE:-}
 SPAM_CANCEL_FUNDED=${SPAM_CANCEL_FUNDED:-}
 CANCEL_BY_ID_FRACTION=${CANCEL_BY_ID_FRACTION:-}
 MODIFY_FRACTION=${MODIFY_FRACTION:-}
+CLOID_SHARE=${CLOID_SHARE:-}
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -463,6 +469,7 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [ -z "$SPAM_CANCEL_RATE" ] || [[ "$SPAM_CANCEL_RATE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "FATAL: SPAM_CANCEL_RATE must be a number (actions/s)" >&2; exit 2; }
 [ -z "$SPAM_CANCEL_FUNDED" ] || [ "$SPAM_CANCEL_FUNDED" = 1 ] || { echo "FATAL: SPAM_CANCEL_FUNDED must be 1 or unset" >&2; exit 2; }
 [ -z "$SPAM_CANCEL_KEYS" ] || [ -n "$SPAM_CANCEL_RATE" ] || { echo "FATAL: SPAM_CANCEL_KEYS needs SPAM_CANCEL_RATE" >&2; exit 2; }
+[ -z "$CLOID_SHARE" ] || { [[ "$CLOID_SHARE" =~ ^[0-9]+$ ]] && [ "$CLOID_SHARE" -le 100 ]; } || { echo "FATAL: CLOID_SHARE must be an integer 0..100" >&2; exit 2; }
 for f in "$CANCEL_BY_ID_FRACTION" "$MODIFY_FRACTION"; do [ -z "$f" ] || [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: CANCEL_BY_ID_FRACTION / MODIFY_FRACTION '$f' must be in [0,1]" >&2; exit 2; }; done
 for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
@@ -575,7 +582,7 @@ trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 # Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
 if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' cloid_share='${CLOID_SHARE:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
@@ -831,6 +838,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 [ "$SPAM_CANCEL_FUNDED" = 1 ] && BENCH_CMD+=(--spam-cancel-funded)
 [ -n "$CANCEL_BY_ID_FRACTION" ] && BENCH_CMD+=(--cancel-by-id-fraction "$CANCEL_BY_ID_FRACTION")
 [ -n "$MODIFY_FRACTION" ] && BENCH_CMD+=(--modify-fraction "$MODIFY_FRACTION")
+[ -n "$CLOID_SHARE" ] && BENCH_CMD+=(--cloid-share "$CLOID_SHARE")
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!
