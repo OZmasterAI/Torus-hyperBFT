@@ -880,9 +880,8 @@ fn reject_label(reason: FailureReason) -> OrderRejectReason {
         FailureReason::FokCancel => OrderRejectReason::FokCancel,
         FailureReason::BadTriggerPx => OrderRejectReason::BadTriggerPx,
         FailureReason::Fill => OrderRejectReason::Fill,
-        FailureReason::Other | FailureReason::BatchCap | FailureReason::DuplicateCloid => {
-            OrderRejectReason::Other
-        }
+        FailureReason::DuplicateCloid => OrderRejectReason::DuplicateCloid,
+        FailureReason::Other | FailureReason::BatchCap => OrderRejectReason::Other,
     }
 }
 

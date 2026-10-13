@@ -2938,11 +2938,13 @@ pub enum OrderRejectReason {
     BadTriggerPx,
     Fill,
     Other,
+    /// s114 cloid: the order's cloid is live for its trader (any market).
+    DuplicateCloid,
 }
 
 impl OrderRejectReason {
     /// Number of reasons (labels).
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
 
     /// Every reason in discriminant order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -2962,6 +2964,7 @@ impl OrderRejectReason {
         Self::BadTriggerPx,
         Self::Fill,
         Self::Other,
+        Self::DuplicateCloid,
     ];
 
     /// The label value (the `FailureReason` names of torus-state where one
@@ -2984,6 +2987,7 @@ impl OrderRejectReason {
             Self::BadTriggerPx => "bad_trigger_px",
             Self::Fill => "fill",
             Self::Other => "other",
+            Self::DuplicateCloid => "duplicate_cloid",
         }
     }
 }
