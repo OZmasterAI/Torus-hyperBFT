@@ -266,6 +266,36 @@ fn margin_rejects_split_position_vs_reservation_on_every_path() {
     }
 }
 
+/// s114 cloid: a placement whose cloid is live for its sender is counted
+/// under `duplicate_cloid` (funnel: `orders_rejected_other`), on the single
+/// path (exec_place_order) and the batch engine (Phase 1b): against a
+/// resting order in the same market and in another market, and against an
+/// earlier placement of the same block. Another trader's cloid is free.
+#[test]
+fn duplicate_cloids_count_under_duplicate_cloid_on_every_path() {
+    let (a, b) = (addr(1), addr(3));
+    let with = |cloid: u128, p: PlaceOrderParams| PlaceOrderParams { client_order_id: Some(cloid), ..p };
+    let block = vec![
+        place(a, with(7, gtc(3, true, 50, 1))),
+        place(a, with(7, gtc(1, true, 50, 2))),
+        place(b, with(7, gtc(3, true, 50, 1))),
+        place(a, with(9, gtc(3, true, 51, 1))),
+        place(a, with(9, gtc(3, true, 52, 1))),
+    ];
+    for mode in MODES {
+        let (_d, mut ctx, m) = fresh();
+        fund_native(&ctx, &b, fp(1_000_000));
+        let setup = place(a, with(7, gtc(3, true, 40, 1)));
+        assert!(exec(&mut ctx, mode, std::slice::from_ref(&setup))[0].success, "{mode:?}");
+        let r = exec(&mut ctx, mode, &block);
+        let ok: Vec<bool> = r.iter().map(|r| r.success).collect();
+        assert_eq!(ok, [false, false, true, true, false], "{mode:?}: {r:?}");
+        assert_eq!(by_reason(&m), vec![("duplicate_cloid", 3)], "{mode:?}: {r:?}");
+        assert_eq!(m.orders_rejected_other.get(), 3, "{mode:?}");
+        assert_totals(mode, &m, failed(&r));
+    }
+}
+
 /// Metrics stay observability only: results are identical without them.
 #[test]
 fn reason_counters_do_not_change_results() {

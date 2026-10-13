@@ -886,6 +886,29 @@ fn reject_label(reason: FailureReason) -> OrderRejectReason {
     }
 }
 
+#[cfg(test)]
+mod reject_label_tests {
+    use super::*;
+
+    /// s114: every order reject reason has its own series, named like the
+    /// `FailureReason` (so a reason added to torus-state without a label of
+    /// its own fails here, not silently under `other`). Exceptions: a book
+    /// `Margin` is `margin_match` (the pre-book check splits its own), and
+    /// `BatchCap` is not a per-order reject (`other`).
+    #[test]
+    fn every_failure_reason_maps_to_the_label_of_its_name() {
+        for code in 0..=u8::MAX {
+            let reason = FailureReason::from_u8(code);
+            let want = match reason {
+                FailureReason::Margin => "margin_match",
+                FailureReason::BatchCap => "other",
+                r => r.as_str(),
+            };
+            assert_eq!(reject_label(reason).as_str(), want, "code {code}: {reason:?}");
+        }
+    }
+}
+
 /// s114 (archy section 53c.4): the label of a pre-book account-check reject
 /// with `reason`. The check saw `free`; `reserved` is what the sender's
 /// open-order reservations (and, in Phase 2, its earlier orders' commitments
