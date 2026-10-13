@@ -16,6 +16,7 @@ use torus_types::{
 };
 
 mod by_id;
+mod cloid;
 mod in_flight;
 mod oracle_feed;
 
