@@ -105,6 +105,11 @@ struct CkptState {
     /// p3s2g 47.1: frees released layers / sets / views off E (`None`:
     /// interval 0, or the thread could not start: E frees them itself).
     dropper: Option<Dropper>,
+    /// s114: live counts of the frozen sets, slices, layers and read views
+    /// this path creates (tracked where E makes or first holds them), for
+    /// the `torus_exec_checkpoint_live_*`, `_read_views_live` and
+    /// `_oldest_live_age_blocks` gauges (set once per pipelined block).
+    retention: Arc<torus_state::RetentionStats>,
 }
 
 impl CkptState {
@@ -170,7 +175,11 @@ impl CkptState {
     /// Take L back as an owned layer (empty if none). Call after `settle`.
     fn take_layer(&mut self) -> torus_state::CheckpointLayer {
         match self.layer.take() {
-            None => torus_state::CheckpointLayer::new(),
+            None => {
+                let mut layer = torus_state::CheckpointLayer::new();
+                layer.track(&self.retention);
+                layer
+            }
             Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|shared| {
                 self.shared_fallbacks += 1;
                 tracing::warn!(
@@ -2269,6 +2278,15 @@ impl ExecutionContext {
         if let Some(m) = &self.metrics {
             m.exec_checkpoint_upkeep_seconds
                 .observe(upkeep_timer.elapsed().as_secs_f64());
+            // s114 retention gauges: a few atomic loads and the first key of
+            // a small map (no walk of any set).
+            let r = self.ckpt.lock().unwrap().retention.clone();
+            m.exec_checkpoint_live_layers.set(r.live_objects());
+            m.exec_checkpoint_live_bytes.set(r.live_bytes());
+            m.exec_checkpoint_read_views_live.set(r.read_views());
+            let oldest = r.oldest_height().unwrap_or(height);
+            m.exec_checkpoint_oldest_live_age_blocks
+                .set(height.saturating_sub(oldest) as i64);
         }
         ok
     }
@@ -2284,6 +2302,11 @@ impl ExecutionContext {
         overlay.detach_layers();
         let current = self.last_job.lock().unwrap().clone();
         let mut st = self.ckpt.lock().unwrap();
+        // s114: count the block's set (and its parent, a no-op once
+        // tracked) for the retention gauges until it is freed.
+        for set in prev.iter().chain(current.iter()) {
+            set.track(&st.retention);
+        }
         if !st.settle() {
             tracing::error!(
                 height,
@@ -2371,7 +2394,8 @@ impl ExecutionContext {
         };
         let blocks = st.view_blocks.iter().rev().cloned().collect();
         let inflight = st.inflight.as_ref().map(|(_, c)| c.clone());
-        let view = torus_state::ReadView::new(self.state_db.clone(), height, blocks, inflight);
+        let view = torus_state::ReadView::new(self.state_db.clone(), height, blocks, inflight)
+            .with_stats(&st.retention);
         let old = st.published.replace(view.clone());
         m.publish_read_view(Some(view));
         if let Some(old) = old {
@@ -24762,19 +24786,14 @@ mod crash_recovery_tests {
         assert_eq!(ctx.ckpt.lock().unwrap().view_blocks.len(), 0);
     }
 
-    /// p3soak (section 53, s114): step 2's RSS kept growing over a 10 min
-    /// soak. With an interval, a mempool wired and no barrier for hundreds of
-    /// blocks (production: epochs are long), what Phase 3 retains must stay
-    /// bounded by the window: every frozen set, ingress slice, L and C a
-    /// block creates is freed within a few windows, and the live counts do
-    /// not grow with the run. Blocks: 1 funds A and B; every later block is
-    /// one fill (A and B swap sides each block, so positions stay flat).
-    #[test]
-    fn checkpoint_retention_bounded_over_long_run() {
-        use std::sync::Weak;
-        use std::time::{Duration, Instant};
-        const BLOCKS: u64 = 600;
-        const EVERY: u64 = 9;
+    /// Retention tests (p3soak, s114): `blocks_n` pipelined blocks with an
+    /// interval of `every`, a mempool wired, metrics on and no barrier.
+    /// Block 1 funds A and B; every later block is one fill (A and B swap
+    /// sides each block, so positions stay flat).
+    fn retention_fixture(
+        blocks_n: u64,
+        every: u64,
+    ) -> (ExecutionContext, Arc<Mempool>, StateDb, Vec<TorusBlock>) {
         let k_a = k256::ecdsa::SigningKey::from_slice(&[81u8; 32]).unwrap();
         let k_b = k256::ecdsa::SigningKey::from_slice(&[82u8; 32]).unwrap();
         let deposit = U256::from(100_000 * FixedPoint::ONE.raw() as u128);
@@ -24806,7 +24825,7 @@ mod crash_recovery_tests {
                 ),
             ],
         )];
-        for h in 2..=BLOCKS {
+        for h in 2..=blocks_n {
             let a_sells = h % 2 == 0;
             blocks.push(make_block(
                 h,
@@ -24832,8 +24851,41 @@ mod crash_recovery_tests {
         }
         let mempool = Arc::new(Mempool::new(db.clone(), Default::default()));
         let mut ctx = make_exec_ctx_with_mempool(&config, &db, Some(mempool.clone()), false);
-        ctx.checkpoint = Some(ckpt_every(EVERY));
+        ctx.checkpoint = Some(ckpt_every(every));
+        // s114: the retention gauges are set only with metrics wired.
+        ctx.metrics = Some(Arc::new(torus_telemetry::Metrics::new()));
         ctx.attach_flush_worker(None);
+        (ctx, mempool, db, blocks)
+    }
+
+    /// The retention gauges once a block is done: (live objects, live bytes,
+    /// read views, oldest live age in blocks).
+    fn retention_gauges(ctx: &ExecutionContext) -> (i64, i64, i64, i64) {
+        let m = ctx.metrics.as_ref().expect("metrics wired");
+        (
+            m.exec_checkpoint_live_layers.get(),
+            m.exec_checkpoint_live_bytes.get(),
+            m.exec_checkpoint_read_views_live.get(),
+            m.exec_checkpoint_oldest_live_age_blocks.get(),
+        )
+    }
+
+    /// p3soak (section 53, s114): step 2's RSS kept growing over a 10 min
+    /// soak. With an interval, a mempool wired and no barrier for hundreds of
+    /// blocks (production: epochs are long), what Phase 3 retains must stay
+    /// bounded by the window: every frozen set, ingress slice, L and C a
+    /// block creates is freed within a few windows, and the live counts do
+    /// not grow with the run. s114 gauges: the retention stats (and the
+    /// `torus_exec_checkpoint_live_*` / `read_views_live` / oldest-age gauges
+    /// set from them each block) agree with the objects seen alive here.
+    #[test]
+    fn checkpoint_retention_bounded_over_long_run() {
+        use std::sync::Weak;
+        use std::time::{Duration, Instant};
+        const BLOCKS: u64 = 600;
+        const EVERY: u64 = 9;
+        let (ctx, mempool, db, blocks) = retention_fixture(BLOCKS, EVERY);
+        let stats = ctx.ckpt.lock().unwrap().retention.clone();
         // Every distinct object E's checkpoint path holds, by the height it
         // was first seen at (keyed by address while alive).
         type Seen<T> = std::collections::HashMap<usize, (u64, Weak<T>)>;
@@ -24853,11 +24905,35 @@ mod crash_recovery_tests {
             v
         }
         let (mut early_max, mut late_max) = (0usize, 0usize);
+        let (mut early_bytes, mut late_bytes) = (0i64, 0i64);
+        let mut bytes_blocks = 0u64;
         let mut checkpoints = 0;
         for b in &blocks {
             let h = b.header.height;
             dispatch_and_execute(&ctx, &db, b);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            // s114 gauges, as set at the end of this block's upkeep (before
+            // the dropper frees what the block let go of).
+            let (g_live, g_bytes, g_views, g_age) = retention_gauges(&ctx);
+            assert!(
+                (1..=EVERY as i64 + 12).contains(&g_live),
+                "h{h}: live layers gauge {g_live}"
+            );
+            assert!(g_bytes >= 0, "h{h}: live bytes gauge {g_bytes}");
+            // Sampled while the next merge runs: right after a checkpoint
+            // went durable, L (just spawned into its first merge) and the
+            // unmerged sets count 0.
+            if g_bytes > 0 {
+                bytes_blocks += 1;
+            }
+            assert!(
+                (2..=3).contains(&g_views),
+                "h{h}: E's and the mempool's view (+ the previous one queued to be freed), gauge {g_views}"
+            );
+            assert!(
+                (0..=2 * EVERY as i64 + 2).contains(&g_age),
+                "h{h}: oldest live age gauge {g_age}"
+            );
             // W digests every queued block (its queue is a bound of its own,
             // DIGEST_QUEUE); what is left is what E and its threads retain.
             assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
@@ -24900,8 +24976,18 @@ mod crash_recovery_tests {
                     .all(|made| h - made <= 2 * EVERY + 2)
                     && (s.len() + l.len()) as u64 <= EVERY + 10
             };
+            // s114: the stats count every object seen alive here, plus at
+            // most L being merged (moved out of its Arc, so not seen) and
+            // the ingress slice being cut; E's and the mempool's view are
+            // the only handles once the previous one is freed.
+            let counted = |s: &[u64], l: &[u64]| {
+                let (live, seen) = (stats.live_objects(), (s.len() + l.len()) as i64);
+                (seen..=seen + 2).contains(&live)
+                    && stats.read_views() == 2
+                    && stats.oldest_height().is_none_or(|o| h - o <= 2 * EVERY + 2)
+            };
             let (mut s, mut l) = (alive(&sets), alive(&layers));
-            while !bounded(&s, &l) && Instant::now() < deadline {
+            while !(bounded(&s, &l) && counted(&s, &l)) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(2));
                 (s, l) = (alive(&sets), alive(&layers));
             }
@@ -24909,6 +24995,30 @@ mod crash_recovery_tests {
                 bounded(&s, &l),
                 "h{h}: retained past the window (sets first seen at {s:?}, layers first seen at {l:?})"
             );
+            assert!(
+                counted(&s, &l),
+                "h{h}: stats {} live / {} views / oldest {:?} vs {} seen alive",
+                stats.live_objects(),
+                stats.read_views(),
+                stats.oldest_height(),
+                s.len() + l.len()
+            );
+            let seen_layer_bytes: usize = layers
+                .values()
+                .filter_map(|(_, w)| w.upgrade())
+                .map(|l| l.bytes())
+                .sum();
+            let live_bytes = stats.live_bytes();
+            assert!(
+                live_bytes >= seen_layer_bytes as i64,
+                "h{h}: live bytes {live_bytes} < the live layers' {seen_layer_bytes}"
+            );
+            if (100..200).contains(&h) {
+                early_bytes = early_bytes.max(live_bytes);
+            }
+            if h > BLOCKS - 100 {
+                late_bytes = late_bytes.max(live_bytes);
+            }
             let n = s.len() + l.len();
             if (100..200).contains(&h) {
                 early_max = early_max.max(n);
@@ -24928,5 +25038,84 @@ mod crash_recovery_tests {
             late_max <= EVERY as usize + 10 && early_max <= EVERY as usize + 10,
             "live objects: {early_max} at blocks 100-200, {late_max} at the end"
         );
+        eprintln!("live bytes: max {early_bytes} at blocks 100-200, {late_bytes} at the end; gauge > 0 at {bytes_blocks} blocks");
+        assert!(
+            bytes_blocks >= BLOCKS * 3 / 4,
+            "live bytes gauge > 0 at {bytes_blocks} of {BLOCKS} blocks"
+        );
+        assert!(
+            early_bytes > 0 && late_bytes <= early_bytes * 3 / 2,
+            "live bytes grow with the run: {early_bytes} at blocks 100-200, {late_bytes} at the end"
+        );
+    }
+
+    /// s114: a reader holding an old ingress view shows in the gauges (one
+    /// more live view, the oldest live set ageing past the window) and both
+    /// fall back once it lets go.
+    #[test]
+    fn checkpoint_retention_gauges_show_a_held_view() {
+        use std::time::{Duration, Instant};
+        const EVERY: u64 = 9;
+        let (ctx, mempool, db, blocks) = retention_fixture(62, EVERY);
+        let stats = ctx.ckpt.lock().unwrap().retention.clone();
+        let settle = |want_views: i64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while stats.read_views() != want_views && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(stats.read_views(), want_views, "live views");
+        };
+        let mut held = None;
+        for b in &blocks[..60] {
+            let h = b.header.height;
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            // Set at the end of the block, before this iteration takes the
+            // held view.
+            let (_, _, g_views, _) = retention_gauges(&ctx);
+            let extra = i64::from(held.is_some());
+            assert!(
+                (2 + extra..=3 + extra).contains(&g_views),
+                "h{h}: views gauge {g_views}"
+            );
+            if h == 20 {
+                let v = mempool.ingress_state();
+                assert!(v.block_count() > 0, "the held view pins blocks");
+                held = Some(v);
+            }
+            settle(2 + i64::from(held.is_some()));
+        }
+        let (_, _, g_views, g_age) = retention_gauges(&ctx);
+        assert!(
+            (3..=4).contains(&g_views),
+            "E's, the mempool's and the held view (+ the previous one queued to be freed): {g_views}"
+        );
+        assert!(
+            g_age >= 40,
+            "the held view pins a set from block 19 or 20: age {g_age}"
+        );
+        assert!(
+            stats.oldest_height().is_some_and(|o| o <= 20),
+            "oldest {:?}",
+            stats.oldest_height()
+        );
+        drop(held);
+        settle(2);
+        for b in &blocks[60..] {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        }
+        let (_, _, g_views, g_age) = retention_gauges(&ctx);
+        assert!(
+            (2..=3).contains(&g_views),
+            "views gauge {g_views} after the release"
+        );
+        assert!(
+            g_age <= 2 * EVERY as i64 + 2,
+            "oldest live age {g_age} after the release"
+        );
+        assert!(stats.live_objects() >= 0 && stats.live_bytes() >= 0);
     }
 }

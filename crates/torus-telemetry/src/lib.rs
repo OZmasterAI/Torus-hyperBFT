@@ -631,6 +631,27 @@ pub struct Metrics {
     /// thread freed itself because the background free thread's queue was
     /// full (0 while that thread keeps up).
     pub exec_checkpoint_drop_inline: Counter,
+    /// Item 6 Phase 3 step 2 (s114): live objects the checkpoint path
+    /// retains, wherever held (exec thread, merge thread, dropper queue,
+    /// flush worker, read views): frozen block sets, ingress slices, the
+    /// since-checkpoint layer L and the checkpoint in flight C. Bounded by
+    /// about two windows; set once per pipelined block at interval > 0.
+    pub exec_checkpoint_live_layers: Gauge,
+    /// Item 6 Phase 3 step 2 (s114): bytes of those objects in the
+    /// `torus_exec_checkpoint_layer_bytes` measure (keys + values, a
+    /// tombstone its key). A frozen set counts once merged into L, so the
+    /// newest one or two blocks' sets count 0, and L counts its bytes before
+    /// the merge running when the gauge is set.
+    pub exec_checkpoint_live_bytes: Gauge,
+    /// Item 6 Phase 3 step 2 (s114): live handles on published ingress read
+    /// views (the exec thread's, the mempool's, per-request clones in the
+    /// mempool checks and the RPC submit verify, views queued to be freed).
+    /// About 2 at rest.
+    pub exec_checkpoint_read_views_live: Gauge,
+    /// Item 6 Phase 3 step 2 (s114): executed height minus the height of the
+    /// oldest live frozen set or ingress slice (0 with none): what a held
+    /// read view or a lagging free pins. About two windows at most.
+    pub exec_checkpoint_oldest_live_age_blocks: Gauge,
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
@@ -2244,6 +2265,30 @@ impl Metrics {
             "Item 6 Phase 3: released layers / sets / views freed on the exec thread (background free queue full)",
             exec_checkpoint_drop_inline.clone(),
         );
+        let exec_checkpoint_live_layers = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_live_layers",
+            "Item 6 Phase 3: live frozen sets / ingress slices / layers (L, C) the checkpoint path retains, wherever held",
+            exec_checkpoint_live_layers.clone(),
+        );
+        let exec_checkpoint_live_bytes = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_live_bytes",
+            "Item 6 Phase 3: bytes of those live objects (layer_bytes measure; a frozen set counts once merged into L)",
+            exec_checkpoint_live_bytes.clone(),
+        );
+        let exec_checkpoint_read_views_live = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_read_views_live",
+            "Item 6 Phase 3: live handles on published ingress read views (exec thread, mempool, per-request clones)",
+            exec_checkpoint_read_views_live.clone(),
+        );
+        let exec_checkpoint_oldest_live_age_blocks = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_oldest_live_age_blocks",
+            "Item 6 Phase 3: executed height minus the oldest live frozen set / slice height (0 with none)",
+            exec_checkpoint_oldest_live_age_blocks.clone(),
+        );
         let flush_worker_checkpoint_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
         registry.register(
             "torus_flush_worker_checkpoint_seconds",
@@ -2771,6 +2816,10 @@ impl Metrics {
             exec_checkpoint_settle_wait_seconds,
             exec_checkpoint_upkeep_seconds,
             exec_checkpoint_drop_inline,
+            exec_checkpoint_live_layers,
+            exec_checkpoint_live_bytes,
+            exec_checkpoint_read_views_live,
+            exec_checkpoint_oldest_live_age_blocks,
             flush_worker_checkpoint_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
@@ -3252,6 +3301,10 @@ mod tests {
             "torus_exec_checkpoint_settle_wait_seconds",
             "torus_exec_checkpoint_upkeep_seconds",
             "torus_exec_checkpoint_drop_inline",
+            "torus_exec_checkpoint_live_layers",
+            "torus_exec_checkpoint_live_bytes",
+            "torus_exec_checkpoint_read_views_live",
+            "torus_exec_checkpoint_oldest_live_age_blocks",
             "torus_flush_worker_checkpoint_seconds",
             "torus_exec_save_books_drain_seconds",
             "torus_exec_save_books_write_seconds",

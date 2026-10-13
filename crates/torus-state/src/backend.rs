@@ -951,6 +951,9 @@ impl Drop for OutOfBatchRecorder {
 pub struct FrozenPending {
     height: u64,
     state: PendingState,
+    /// Item 6 Phase 3 (s114): this set's share of the exec context's
+    /// retention gauges, once attached ([`FrozenPending::track`]).
+    tracked: OnceLock<crate::retention::Tracked>,
 }
 
 /// R's CFs' writes and tombstones in `state`, key-sorted ([`ResidentDelta`]).
@@ -976,6 +979,22 @@ impl FrozenPending {
         self.height
     }
 
+    /// Item 6 Phase 3 (s114): count this set against `stats` until it is
+    /// freed (a no-op if already tracked). Its bytes count from when it is
+    /// merged into a layer ([`crate::CheckpointLayer::merge`]): no walk here.
+    pub fn track(&self, stats: &Arc<crate::RetentionStats>) {
+        self.tracked
+            .get_or_init(|| crate::retention::Tracked::new(stats, 0, Some(self.height)));
+    }
+
+    /// Record this set's [`Self::state_bytes`] (measured by the caller's own
+    /// walk) in its tracked share, if tracked.
+    pub(crate) fn note_bytes(&self, bytes: usize) {
+        if let Some(t) = self.tracked.get() {
+            t.set_bytes(bytes);
+        }
+    }
+
     /// Item 6 Phase 3: the set's state-row bytes in the checkpoint layer's
     /// measure (key + value per write, key per tombstone; out-of-batch hash
     /// extras excluded, as the layer excludes them). Merging this set into a
@@ -998,6 +1017,7 @@ impl FrozenPending {
     /// height; no hash extras). The ingress read view keeps such slices for
     /// the blocks under the newest two, so it does not pin every block's book
     /// blobs until the checkpoint.
+    /// A slice of a tracked set is tracked (its bytes measured here).
     pub fn slice(&self, cfs: &[&str]) -> FrozenPending {
         let mut state = PendingState::new();
         for id in cfs.iter().filter_map(|cf| intern_cf(cf)) {
@@ -1005,10 +1025,20 @@ impl FrozenPending {
             dst.writes.clone_from(&src.writes);
             dst.deletes.clone_from(&src.deletes);
         }
-        FrozenPending {
+        let out = FrozenPending {
             height: self.height,
             state,
+            tracked: OnceLock::new(),
+        };
+        if let Some(t) = self.tracked.get() {
+            let bytes = out.state_bytes();
+            let _ = out.tracked.set(crate::retention::Tracked::new(
+                t.stats(),
+                bytes,
+                Some(self.height),
+            ));
         }
+        out
     }
 
     /// Whether every write and tombstone of this set is in one of `cfs`
@@ -1044,7 +1074,11 @@ impl FrozenPending {
             crate::cf::META_NATIVE_APPLIED_HEIGHT.to_vec(),
             height.to_be_bytes().to_vec(),
         );
-        Self { height, state }
+        Self {
+            height,
+            state,
+            tracked: OnceLock::new(),
+        }
     }
 
     /// Attach the block's out-of-batch consensus writes (see [`HashExtras`]).
@@ -1386,7 +1420,11 @@ impl NativeStateOverlay {
         state.journal_log.clear();
         state.checkpoints.clear();
         state.frozen = false;
-        Arc::new(FrozenPending { height, state })
+        Arc::new(FrozenPending {
+            height,
+            state,
+            tracked: OnceLock::new(),
+        })
     }
 
     /// Attach the block's out-of-batch consensus writes (see [`HashExtras`]);

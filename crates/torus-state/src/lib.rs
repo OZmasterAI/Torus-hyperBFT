@@ -16,6 +16,7 @@ pub mod overlay;
 pub mod pruner;
 pub mod read_view;
 pub mod resident_rows;
+pub mod retention;
 pub mod running_hash;
 pub mod shard_store;
 pub mod snapshot;
@@ -37,6 +38,7 @@ pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
 pub use read_view::ReadView;
 pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRows};
+pub use retention::RetentionStats;
 pub use erasure::ErasureParams;
 pub use shard_store::{
     decode_stored_shard, encode_stored_shard, shard_key, StoredShard, SHARD_KEY_LEN,

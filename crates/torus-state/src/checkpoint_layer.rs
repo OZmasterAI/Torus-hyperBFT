@@ -27,6 +27,9 @@ pub struct CheckpointLayer {
     bytes: usize,
     /// Height of the last merged block (`None` while empty).
     top: Option<u64>,
+    /// Item 6 Phase 3 (s114): this layer's share of the exec context's
+    /// retention gauges, once attached ([`Self::track`]).
+    tracked: Option<crate::retention::Tracked>,
 }
 
 impl Default for CheckpointLayer {
@@ -41,15 +44,29 @@ impl CheckpointLayer {
             state: PendingState::new(),
             bytes: 0,
             top: None,
+            tracked: None,
+        }
+    }
+
+    /// Item 6 Phase 3 (s114): count this layer against `stats` until it is
+    /// freed (a no-op if already tracked); its bytes follow [`Self::bytes`].
+    /// A [`Self::duplicate`] of a tracked layer is tracked.
+    pub fn track(&mut self, stats: &std::sync::Arc<crate::RetentionStats>) {
+        if self.tracked.is_none() {
+            self.tracked = Some(crate::retention::Tracked::new(stats, self.bytes, None));
         }
     }
 
     /// Fold `frozen` (the next block) on top: its writes replace earlier
     /// writes and tombstones, its tombstones replace earlier writes.
+    /// Records `frozen`'s bytes in its tracked share (s114: measured in this
+    /// loop, so no extra walk).
     pub fn merge(&mut self, frozen: &FrozenPending) {
         let src = frozen.pending_state();
+        let mut seen = 0usize;
         for (dst, cfp) in self.state.cfs.iter_mut().zip(src.cfs.iter()) {
             for (k, v) in &cfp.writes {
+                seen += k.len() + v.len();
                 if dst.deletes.remove(k) {
                     self.bytes -= k.len();
                 }
@@ -65,6 +82,7 @@ impl CheckpointLayer {
                 }
             }
             for k in &cfp.deletes {
+                seen += k.len();
                 if let Some(old) = dst.writes.remove(k) {
                     self.bytes -= k.len() + old.len();
                 }
@@ -74,6 +92,10 @@ impl CheckpointLayer {
             }
         }
         self.top = Some(self.top.map_or(frozen.height(), |t| t.max(frozen.height())));
+        frozen.note_bytes(seen);
+        if let Some(t) = &self.tracked {
+            t.set_bytes(self.bytes);
+        }
     }
 
     /// A deep copy (the fallback when another handle on a shared layer is
@@ -88,6 +110,10 @@ impl CheckpointLayer {
             state,
             bytes: self.bytes,
             top: self.top,
+            tracked: self
+                .tracked
+                .as_ref()
+                .map(|t| crate::retention::Tracked::new(t.stats(), self.bytes, None)),
         }
     }
 

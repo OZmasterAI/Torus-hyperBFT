@@ -88,6 +88,10 @@ struct Layers {
 pub struct ReadView {
     db: StateDb,
     layers: Arc<Layers>,
+    /// Item 6 Phase 3 (s114): this handle's count in the exec context's
+    /// `torus_exec_checkpoint_read_views_live` ([`Self::with_stats`]); each
+    /// clone counts until dropped.
+    pin: Option<crate::retention::ViewPin>,
 }
 
 impl std::fmt::Debug for ReadView {
@@ -117,6 +121,7 @@ impl ReadView {
                 blocks: Vec::new(),
                 inflight: None,
             }),
+            pin: None,
         }
     }
 
@@ -141,7 +146,15 @@ impl ReadView {
                 blocks,
                 inflight,
             }),
+            pin: None,
         }
+    }
+
+    /// Item 6 Phase 3 (s114): count this handle and every clone of it in
+    /// `stats` ([`crate::RetentionStats::read_views`]) while alive.
+    pub fn with_stats(mut self, stats: &Arc<crate::RetentionStats>) -> Self {
+        self.pin = Some(crate::retention::ViewPin::new(stats));
+        self
     }
 
     /// Executed height the view reflects (`None`: the DB alone).
