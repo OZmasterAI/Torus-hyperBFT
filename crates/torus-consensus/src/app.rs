@@ -7936,16 +7936,28 @@ impl TorusApp {
     /// fabricate a heal-hole from perfectly good data). Flag off ⇒ a verbatim
     /// insert, bit-identical to the pre-rank-2 buffer.
     fn park_deferred(&mut self, height: u64, source: ExecSource, slashes: Vec<PendingSlash>) {
-        // Exec-aware admission (opt-in): a materialized committed block
-        // parked behind a full head or a hole is committed-but-unexecuted
-        // too; count it now (once per height, before any demotion), or it
-        // stays invisible to admission until it reaches the send. Only with
-        // a live pipeline (a closed counter ignores it anyway). No-op with
-        // the knob off.
-        if let (ExecSource::Ready(block), Some(mempool), Some(_)) =
-            (&source, &self.mempool, &self.exec_tx)
-        {
-            mempool.note_exec_committed(height, &block.native_actions);
+        // Exec-aware admission (opt-in): a committed block parked behind a
+        // full head or a hole is committed-but-unexecuted too; count it now
+        // (once per height, before any demotion), or it stays invisible to
+        // admission until it reaches the send. Ready: exact (normal actions).
+        // Compact (Codex r2 finding 1, owner option A; e.g. a follower
+        // without a matching proposal cache, or a manifest-backed boot /
+        // watchdog park): every action hash, no body read; lowered once to
+        // the exact count when the height is first materialized (Ready
+        // re-park or `dispatch_to_exec`). Durable (legacy manifest-less boot
+        // park): only a disk read could count it, so it counts at its
+        // materialization. Only with a live pipeline (a closed counter
+        // ignores it anyway). No-op with the knob off.
+        if let (Some(mempool), Some(_)) = (&self.mempool, &self.exec_tx) {
+            match &source {
+                ExecSource::Ready(block) => {
+                    mempool.note_exec_committed(height, &block.native_actions);
+                }
+                ExecSource::Compact(compact) => {
+                    mempool.note_exec_parked_compact(height, compact.native_action_hashes.len());
+                }
+                ExecSource::Durable(_) => {}
+            }
         }
         let (source, ready_bytes) = match source {
             ExecSource::Ready(block) if nonblocking_exec_dispatch() => {
@@ -12989,6 +13001,57 @@ mod crash_recovery_tests {
             app.deferred_exec.contains_key(&5),
             "boot must seed the manifest-only committed height into the exec queue for heal"
         );
+    }
+
+    /// Codex r2 finding 1, boot: a manifest-backed height parked at boot (the
+    /// F-1 reconcile here; the FIX 1b hole loop makes the same
+    /// `park_deferred(recovery_exec_source(..))` call) as a Compact reference
+    /// counts every action hash before the metrics attach; attaching
+    /// publishes it, and its first materialization lowers it once to the
+    /// normal count.
+    #[test]
+    fn exec_aware_boot_compact_park_counts_all_hashes() {
+        let (config, state_db) = make_test_config_and_db();
+        for h in 1..=4u64 {
+            persist_block_for_test(&state_db, &make_block(h, vec![]));
+        }
+        state_db
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_NATIVE_APPLIED_HEIGHT,
+                &4u64.to_be_bytes(),
+            )
+            .unwrap();
+        let key = k256::ecdsa::SigningKey::from_slice(&[171u8; 32]).unwrap();
+        let cancel = |nonce: u64| {
+            torus_types::eip712::sign_native_action(
+                NativeAction::CancelOrder { order_id: 1 },
+                nonce,
+                &key,
+            )
+        };
+        let actions = vec![sign_claim_rewards(5), cancel(6), cancel(7)];
+        let b5 = make_block(5, actions.clone());
+        persist_commit_manifest(&state_db, 5, &encode_proposal_datum(&b5, true));
+
+        let mempool = exec_aware_mempool(&state_db);
+        let app = TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        assert!(matches!(
+            app.deferred_exec.get(&5).map(|e| &e.source),
+            Some(ExecSource::Compact(_))
+        ));
+        assert_eq!(
+            mempool.committed_unexecuted_normal(),
+            3,
+            "boot Compact park counts every action hash"
+        );
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        mempool.set_metrics(metrics.clone());
+        assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 3);
+        assert_eq!(mempool.note_exec_committed(5, &actions), 1, "lowered");
+        assert_eq!(mempool.committed_unexecuted_normal(), 1);
+        assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 1);
+        drop(app);
     }
 
     #[test]

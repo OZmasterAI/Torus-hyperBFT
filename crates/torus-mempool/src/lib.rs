@@ -383,7 +383,9 @@ impl Mempool {
     /// not admission backlog, as in the pool) as committed-but-unexecuted and
     /// returns that count; the block carries it to the exec thread, which
     /// hands it to [`Self::note_exec_released`]. Idempotent per height (a
-    /// retry or re-park returns the same count, no rescan). The scan runs
+    /// retry or re-park returns the same count, no rescan); a height counted
+    /// provisionally by [`Self::note_exec_parked_compact`] is lowered here,
+    /// once, to the exact count. The scan runs
     /// with no lock held. Returns 0 and touches nothing with exec-aware
     /// admission off.
     pub fn note_exec_committed(&self, height: u64, actions: &[SignedNativeAction]) -> usize {
@@ -402,9 +404,23 @@ impl Mempool {
         )
     }
 
-    /// RED stub (Codex r2 finding 1).
-    pub fn note_exec_parked_compact(&self, _height: u64, _action_hashes: usize) -> usize {
-        0
+    /// Consensus thread: a committed block is parked as a Compact reference
+    /// (its action hashes only; bodies not read). Counts all `action_hashes`
+    /// (cancels and oracle submissions included: telling them apart needs
+    /// the bodies) as committed-but-unexecuted at once; the height's first
+    /// [`Self::note_exec_committed`] (its materialization) lowers that ONCE
+    /// to the exact normal count, which the block carries. Never double
+    /// counts a height (a re-park, or a height already counted exactly,
+    /// returns its current count). Returns 0 and touches nothing with
+    /// exec-aware admission off.
+    pub fn note_exec_parked_compact(&self, height: u64, action_hashes: usize) -> usize {
+        if !self.exec_aware_admission() {
+            return 0;
+        }
+        self.exec_backlog
+            .register_provisional(height, action_hashes, |delta| {
+                self.publish_committed_unexecuted(delta)
+            })
     }
 
     /// Consensus thread: `height` entered the exec channel (its count rides

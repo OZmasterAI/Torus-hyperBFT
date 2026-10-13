@@ -9,9 +9,13 @@
 //!
 //! Thread roles:
 //! - the dispatcher (the consensus thread, the only caller of
-//!   [`ExecBacklog::register`] / [`ExecBacklog::sent`]) counts a committed
-//!   height once, when it is first materialized for execution (sent or
-//!   parked), and hands its count to the exec thread with the block;
+//!   [`ExecBacklog::register`] / [`ExecBacklog::register_provisional`] /
+//!   [`ExecBacklog::sent`]) counts a committed height once: exactly when it
+//!   is first materialized for execution (sent or parked Ready), or, parked
+//!   as a Compact reference (action hashes only), provisionally as every
+//!   hash (no body read), lowered once to the exact count when it is first
+//!   materialized; it hands the exact count to the exec thread with the
+//!   block;
 //! - the exec thread releases that count after executing the block
 //!   ([`ExecBacklog::release`]): one CAS on an atomic, never a lock, so it
 //!   can never wait on the dispatcher;
@@ -19,9 +23,11 @@
 //!
 //! Invariants: the total equals the sum of the counts of the registered
 //! heights not yet sent plus the counts carried by blocks sent but not yet
-//! released; a height is counted at most once (idempotent registration, and
-//! a height at or below the sent watermark never counts again); the scan
-//! that counts a block's actions runs with no lock held; [`ExecBacklog::close`]
+//! released (a provisional count until the height is materialized, the
+//! exact one from then on); a height is counted at most once (idempotent
+//! registration, lowered at most once, and a height at or below the sent
+//! watermark never counts again); the scan that counts a block's actions
+//! runs with no lock held; [`ExecBacklog::close`]
 //! is terminal: it zeroes the total and every later registration or release
 //! is a no-op, so a dispatch racing the pipeline teardown cannot leak.
 //!
@@ -64,9 +70,19 @@ pub struct ExecBacklog {
 
 #[derive(Default)]
 struct Pending {
-    by_height: BTreeMap<u64, usize>,
+    by_height: BTreeMap<u64, Counted>,
     /// Highest height handed to the exec channel (this process).
     sent_through: Option<u64>,
+}
+
+/// A registered height's count.
+#[derive(Clone, Copy)]
+struct Counted {
+    n: usize,
+    /// Registered from a Compact park ([`ExecBacklog::register_provisional`]):
+    /// `n` is every action hash (an upper bound), lowered once to the exact
+    /// normal count by the first [`ExecBacklog::register`].
+    provisional: bool,
 }
 
 impl ExecBacklog {
@@ -90,35 +106,86 @@ impl ExecBacklog {
         if self.is_closed() {
             return 0;
         }
-        {
+        let provisional = {
             let pending = self.pending.lock().unwrap();
             if pending.sent_through.is_some_and(|s| height <= s) {
                 return 0;
             }
-            if let Some(&n) = pending.by_height.get(&height) {
-                return n;
+            match pending.by_height.get(&height) {
+                Some(c) if !c.provisional => return c.n,
+                Some(c) => Some(c.n),
+                None => None,
             }
-        }
+        };
         let n = count();
         let mut pending = self.pending.lock().unwrap();
-        if let Some(&counted) = pending.by_height.get(&height) {
-            return counted; // a concurrent registrant won (single-dispatcher callers never get here)
+        match (pending.by_height.get(&height).copied(), provisional) {
+            // A concurrent registrant won (single-dispatcher callers never
+            // get here).
+            (Some(c), _) if !c.provisional => return c.n,
+            // The Compact park's upper bound, lowered ONCE to the exact
+            // count (raising is only defensive: the bound counts every
+            // action).
+            (Some(c), Some(_)) => {
+                let ok = if n < c.n {
+                    self.sub(c.n - n, &publish)
+                } else {
+                    self.add(n - c.n, &publish)
+                };
+                if !ok {
+                    return 0; // torn down during the scan
+                }
+            }
+            (None, None) => {
+                if !self.add(n, &publish) {
+                    return 0; // torn down during the scan
+                }
+            }
+            // Registered, or dropped (sent past / closed), during the scan:
+            // single-dispatcher callers never get here.
+            (Some(_), None) | (None, Some(_)) => return 0,
         }
-        if !self.add(n, &publish) {
-            return 0; // torn down during the scan
-        }
-        pending.by_height.insert(height, n);
+        pending.by_height.insert(
+            height,
+            Counted {
+                n,
+                provisional: false,
+            },
+        );
         n
     }
 
-    /// RED stub (Codex r2 finding 1).
-    pub fn register_provisional(
-        &self,
-        _height: u64,
-        _upper: usize,
-        _publish: impl Fn(i64),
-    ) -> usize {
-        0
+    /// Dispatcher: `height` is parked as a Compact reference (action hashes
+    /// only, no body read). Counts `upper` (every action hash: cancels and
+    /// oracle submissions included) at once, with no scan; the height's
+    /// first [`Self::register`] (its materialization) lowers it to the exact
+    /// count. Returns the height's current count. Never double counts: an
+    /// already-registered height returns its count unchanged (never raised
+    /// back after lowering); 0 at or below the sent watermark or after
+    /// [`Self::close`].
+    pub fn register_provisional(&self, height: u64, upper: usize, publish: impl Fn(i64)) -> usize {
+        self.touch();
+        if self.is_closed() {
+            return 0;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        if pending.sent_through.is_some_and(|s| height <= s) {
+            return 0;
+        }
+        if let Some(c) = pending.by_height.get(&height) {
+            return c.n;
+        }
+        if !self.add(upper, &publish) {
+            return 0;
+        }
+        pending.by_height.insert(
+            height,
+            Counted {
+                n: upper,
+                provisional: true,
+            },
+        );
+        upper
     }
 
     /// Dispatcher: `height` entered the exec channel; its count now rides
@@ -137,7 +204,7 @@ impl ExecBacklog {
         {
             let above = pending.by_height.split_off(&height);
             let stale = std::mem::replace(&mut pending.by_height, above);
-            let n: usize = stale.values().sum();
+            let n: usize = stale.values().map(|c| c.n).sum();
             self.sub(n, &publish);
         }
     }
@@ -267,21 +334,25 @@ impl ExecBacklog {
     }
 
     /// Subtract `n` unless closed (atomic with [`Self::close`]); published
-    /// AFTER the CAS, iff that CAS saw [`ATTACHED`].
-    fn sub(&self, n: usize, publish: &impl Fn(i64)) {
+    /// AFTER the CAS, iff that CAS saw [`ATTACHED`]. False iff closed.
+    fn sub(&self, n: usize, publish: &impl Fn(i64)) -> bool {
         if n == 0 {
-            return;
+            return !self.is_closed();
         }
         let res = self
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
                 (s & CLOSED == 0).then(|| (s & !TOTAL) | (s & TOTAL).saturating_sub(n))
             });
-        if let Ok(prev) = res {
-            let dropped = n.min(prev & TOTAL);
-            if prev & ATTACHED != 0 && dropped > 0 {
-                publish(-(dropped as i64));
+        match res {
+            Ok(prev) => {
+                let dropped = n.min(prev & TOTAL);
+                if prev & ATTACHED != 0 && dropped > 0 {
+                    publish(-(dropped as i64));
+                }
+                true
             }
+            Err(_) => false,
         }
     }
 }
