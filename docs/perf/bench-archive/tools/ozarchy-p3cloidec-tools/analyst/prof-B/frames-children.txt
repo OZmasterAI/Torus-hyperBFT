@@ -1,0 +1,169 @@
+W1 inclusive (children) time per logical frame, ms CPU/1k fills (counted once per sample)
+
+== CHILDREN by function -- thread group exec: total c0 3.669 c100 4.572 delta +0.903 ms CPU/1k fills (+24.6%)
+      c0     c100    delta   %dlt  frame
+   3.322    4.121   +0.799   88.4  call_once
+   3.322    4.121   +0.799   88.4  {closure#0}
+   3.322    4.121   +0.799   88.4  <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+   3.322    4.121   +0.799   88.4  <std::sys::thread::unix::Thread>::new::thread_start
+   3.322    4.121   +0.799   88.4  <std::thread::lifecycle::spawn_unchecked<<TorusApp>::try_new{cl}, ()>{cl} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+   3.322    4.121   +0.799   88.4  catch_unwind
+   3.322    4.121   +0.799   88.4  do_call
+   3.322    4.121   +0.799   88.4  execution_loop
+   3.322    4.121   +0.799   88.4  std::sys::backtrace::__rust_begin_short_backtrace
+   3.322    4.121   +0.799   88.4  {closure#1}
+   3.322    4.121   +0.799   88.4  {closure#2}
+   3.320    4.118   +0.799   88.4  <ExecutionContext>::execute_committed_block_with
+   2.748    3.494   +0.746   82.6  <ExecutionContext>::execute_committed_block_with{cl}
+   2.734    3.473   +0.740   81.9  execute_batch
+   2.734    3.473   +0.740   81.9  execute_batch_inner
+   2.702    3.439   +0.738   81.7  <NativeExecutor>::execute_batch_phases
+   0.546    1.081   +0.535   59.2  get
+   0.477    0.865   +0.388   43.0  find_inner
+   0.601    0.989   +0.388   43.0  find
+   0.000    0.332   +0.332   36.8  <CloidMarkets>::absorb
+   0.000    0.331   +0.331   36.7  <OrderBook>::drain_cloid_log
+   0.117    0.443   +0.326   36.1  {closure#4}
+   0.000    0.322   +0.322   35.7  retain
+   0.000    0.322   +0.322   35.7  retain_mut
+   0.000    0.321   +0.321   35.5  <alloc::vec::Vec<usize>>::retain
+   0.109    0.341   +0.232   25.7  _mm_movemask_epi8
+   0.103    0.334   +0.232   25.7  match_tag
+   0.251    0.473   +0.222   24.6  hash_one
+   0.273    0.491   +0.219   24.2  make_hash
+   0.193    0.381   +0.188   20.8  hash
+   0.000    0.183   +0.183   20.3  <NativeExecutor>::duplicate_cloid
+   0.293    0.472   +0.179   19.8  eq
+   0.000    0.179   +0.179   19.8  live
+   0.140    0.318   +0.179   19.8  insert
+   0.248    0.427   +0.178   19.8  equivalent
+   0.197    0.355   +0.158   17.5  spec_eq
+   0.475    0.629   +0.154   17.0  exec_cancel_all_run
+   0.413    0.554   +0.142   15.7  <OrderBook>::cancel_all_many
+   0.131    0.266   +0.135   14.9  <[u8; 20] as core::hash::Hash>::hash
+   0.000    0.132   +0.132   14.6  or_else
+top by c100 self:
+   3.322    4.121   +0.799  {closure#0}
+   3.322    4.121   +0.799  call_once
+   3.322    4.121   +0.799  <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+   3.322    4.121   +0.799  <std::sys::thread::unix::Thread>::new::thread_start
+   3.322    4.121   +0.799  <std::thread::lifecycle::spawn_unchecked<<TorusApp>::try_new{cl}, ()>{cl} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+   3.322    4.121   +0.799  catch_unwind
+   3.322    4.121   +0.799  do_call
+   3.322    4.121   +0.799  execution_loop
+   3.322    4.121   +0.799  std::sys::backtrace::__rust_begin_short_backtrace
+   3.322    4.121   +0.799  {closure#1}
+   3.322    4.121   +0.799  {closure#2}
+   3.320    4.118   +0.799  <ExecutionContext>::execute_committed_block_with
+
+== CHILDREN by function -- thread group pool: total c0 5.443 c100 5.720 delta +0.276 ms CPU/1k fills (+5.1%)
+      c0     c100    delta   %dlt  frame
+   2.838    3.162   +0.325  117.5  <OrderBook>::place_order_with_accounts
+   3.243    3.558   +0.315  114.0  <torus_bridge::market_workers::MarketWorkerPool>::match_market
+   3.279    3.594   +0.314  113.7  {closure#6}
+   3.281    3.595   +0.314  113.7  <torus_bridge::market_workers::MarketWorkerPool>::process_chunk
+   3.279    3.594   +0.314  113.7  run_contained
+   3.284    3.596   +0.313  113.1  <rayon_core::scope::ScopeBase>::execute_job_closure
+   3.284    3.596   +0.313  113.1  <rayon_core::job::HeapJob<<rayon_core::scope::Scope>::spawn<torus_bridge::exec_pool::run_jobs<alloc::vec::Vec<core::result::Result<torus_bridge::marke
+   5.409    5.689   +0.280  101.4  <rayon_core::registry::WorkerThread>::wait_until_cold
+   5.384    5.664   +0.279  101.1  execute_job
+   5.387    5.665   +0.278  100.6  halt_unwinding
+   5.387    5.665   +0.278  100.6  execute
+   5.439    5.715   +0.276  100.0  call_once
+   5.439    5.715   +0.276   99.9  <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+   5.439    5.715   +0.276   99.9  <rayon_core::registry::ThreadBuilder>::run
+   5.439    5.715   +0.276   99.9  <std::sys::thread::unix::Thread>::new::thread_start
+   5.439    5.715   +0.276   99.9  <std::thread::lifecycle::spawn_unchecked<<rayon_core::registry::DefaultSpawn as rayon_core::registry::ThreadSpawn>::spawn{cl}, ()>{cl} as core::ops::f
+   5.439    5.715   +0.276   99.9  catch_unwind
+   5.439    5.715   +0.276   99.9  do_call
+   5.439    5.715   +0.276   99.9  main_loop
+   5.439    5.715   +0.276   99.9  std::sys::backtrace::__rust_begin_short_backtrace
+   5.439    5.715   +0.276   99.9  wait_until
+   5.439    5.715   +0.276   99.9  wait_until_out_of_work
+   5.439    5.716   +0.276   99.9  {closure#0}
+   5.439    5.715   +0.276   99.9  {closure#1}
+   0.745    0.883   +0.138   50.0  get
+   1.619    1.743   +0.124   44.9  <OrderBook>::match_at_level
+   1.712    1.834   +0.122   44.2  execute_match
+   0.827    0.946   +0.119   43.1  find
+   0.559    0.669   +0.111   40.0  find_inner
+   0.503    0.589   +0.086   31.2  <OrderBook>::insert_order
+   0.000    0.075   +0.075   27.0  <OrderBook>::forget_cloid
+   0.041    0.111   +0.070   25.3  contains_key
+   0.000    0.068   +0.068   24.5  <hashbrown::map::HashMap<(Address, u128), u128, alloy_primitives::map::hasher::DefaultHashBuilder>>::contains_key
+   0.051    0.117   +0.066   24.0  is_some_and
+   0.543    0.597   +0.054   19.6  insert
+   0.475    0.526   +0.051   18.4  hash_one
+   0.498    0.548   +0.050   17.9  make_hash
+   0.191    0.240   +0.049   17.8  match_tag
+   0.190    0.238   +0.049   17.6  _mm_movemask_epi8
+   0.000    0.045   +0.045   16.4  index_cloid
+top by c100 self:
+   5.439    5.716   +0.276  {closure#0}
+   5.439    5.715   +0.276  call_once
+   5.439    5.715   +0.276  {closure#1}
+   5.439    5.715   +0.276  <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+   5.439    5.715   +0.276  <rayon_core::registry::ThreadBuilder>::run
+   5.439    5.715   +0.276  <std::sys::thread::unix::Thread>::new::thread_start
+   5.439    5.715   +0.276  <std::thread::lifecycle::spawn_unchecked<<rayon_core::registry::DefaultSpawn as rayon_core::registry::ThreadSpawn>::spawn{cl}, ()>{cl} as core::ops::f
+   5.439    5.715   +0.276  catch_unwind
+   5.439    5.715   +0.276  do_call
+   5.439    5.715   +0.276  main_loop
+   5.439    5.715   +0.276  std::sys::backtrace::__rust_begin_short_backtrace
+   5.439    5.715   +0.276  wait_until
+
+== CHILDREN by function -- thread group all: total c0 23.960 c100 25.014 delta +1.054 ms CPU/1k fills (+4.4%)
+      c0     c100    delta   %dlt  frame
+   3.494    4.295   +0.801   76.0  {closure#2}
+   3.322    4.121   +0.799   75.8  <std::thread::lifecycle::spawn_unchecked<<TorusApp>::try_new{cl}, ()>{cl} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+   3.322    4.121   +0.799   75.8  execution_loop
+   3.320    4.118   +0.799   75.8  <ExecutionContext>::execute_committed_block_with
+  17.665   18.457   +0.792   75.2  call_once
+  17.665   18.457   +0.792   75.2  <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+  17.665   18.457   +0.792   75.2  <std::sys::thread::unix::Thread>::new::thread_start
+  17.665   18.457   +0.792   75.2  {closure#1}
+  17.665   18.457   +0.792   75.1  catch_unwind
+  17.665   18.457   +0.792   75.1  do_call
+  17.664   18.456   +0.792   75.1  std::sys::backtrace::__rust_begin_short_backtrace
+  17.667   18.458   +0.792   75.1  {closure#0}
+   2.748    3.494   +0.746   70.8  <ExecutionContext>::execute_committed_block_with{cl}
+   2.734    3.473   +0.740   70.2  execute_batch
+   2.734    3.473   +0.740   70.2  execute_batch_inner
+   2.702    3.439   +0.738   70.0  <NativeExecutor>::execute_batch_phases
+   1.435    2.082   +0.647   61.4  get
+   1.478    1.984   +0.506   48.0  find
+   1.079    1.579   +0.500   47.4  find_inner
+   2.225    1.880   -0.345  -32.7  <rayon_core::job::HeapJob<rayon_core::spawn::spawn_job<torus_node::run{cl}{cl}{cl}>{cl}> as rayon_core::job::Job>::execute
+   2.222    1.879   -0.343  -32.6  <torus_mempool::Mempool>::add_native_action_from_gossip
+   1.388    1.726   +0.338   32.1  std::enable_if
+   0.000    0.332   +0.332   31.5  <CloidMarkets>::absorb
+   0.000    0.331   +0.331   31.4  <OrderBook>::drain_cloid_log
+   1.237    1.564   +0.328   31.1  std::function
+   1.233    1.561   +0.328   31.1  rocksdb::ThreadPoolImpl::Impl::BGThreadWrapper(void*)
+   1.233    1.561   +0.328   31.1  rocksdb::ThreadPoolImpl::Impl::BGThread(unsigned long)
+   1.233    1.561   +0.328   31.1  std::__invoke_result
+   1.233    1.561   +0.328   31.1  void std::_Bind
+   1.233    1.561   +0.328   31.1  void std::__invoke_impl
+   1.233    1.561   +0.328   31.1  std::_Function_handler
+   2.838    3.162   +0.325   30.8  <OrderBook>::place_order_with_accounts
+   0.000    0.323   +0.323   30.6  retain
+   0.000    0.323   +0.322   30.6  retain_mut
+   0.000    0.321   +0.321   30.5  <alloc::vec::Vec<usize>>::retain
+   3.243    3.558   +0.315   29.9  <torus_bridge::market_workers::MarketWorkerPool>::match_market
+   3.515    3.830   +0.315   29.9  {closure#6}
+   3.281    3.595   +0.314   29.8  <torus_bridge::market_workers::MarketWorkerPool>::process_chunk
+   3.279    3.594   +0.314   29.8  run_contained
+   3.284    3.596   +0.313   29.7  <rayon_core::scope::ScopeBase>::execute_job_closure
+top by c100 self:
+  17.667   18.458   +0.792  {closure#0}
+  17.665   18.457   +0.792  call_once
+  17.665   18.457   +0.792  <std::sys::thread::unix::Thread>::new::thread_start
+  17.665   18.457   +0.792  {closure#1}
+  17.665   18.457   +0.792  <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+  17.665   18.457   +0.792  catch_unwind
+  17.665   18.457   +0.792  do_call
+  17.664   18.456   +0.792  std::sys::backtrace::__rust_begin_short_backtrace
+  10.568   10.395   -0.174  wait_until
+  10.568   10.394   -0.174  <rayon_core::registry::ThreadBuilder>::run
+  10.568   10.394   -0.174  <std::thread::lifecycle::spawn_unchecked<<rayon_core::registry::DefaultSpawn as rayon_core::registry::ThreadSpawn>::spawn{cl}, ()>{cl} as core::ops::f
+  10.568   10.394   -0.174  main_loop

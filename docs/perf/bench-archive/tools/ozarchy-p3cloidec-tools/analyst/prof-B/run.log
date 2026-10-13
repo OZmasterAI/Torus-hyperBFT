@@ -1,0 +1,7 @@
+loaded ec-q2-c0: 164045 samples, fills W1 10323622, utime 243.8s
+loaded ec-r2-c100: 145128 samples, fills W1 8360775, utime 208.6s
+loaded ec-r3-c100: 147213 samples, fills W1 8515624, utime 213.5s
+loaded ec-q3-c0: 163059 samples, fills W1 9936309, utime 241.5s
+loaded ec-r5-c100: 149328 samples, fills W1 8754065, utime 222.7s
+loaded ec-r8-c100: 148912 samples, fills W1 8796819, utime 216.3s
+done

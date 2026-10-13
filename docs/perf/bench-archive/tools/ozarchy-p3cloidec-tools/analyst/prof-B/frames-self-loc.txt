@@ -1,0 +1,169 @@
+W1 self time by leaf function @ file:line, ms CPU/1k fills
+
+== SELF by function@line -- thread group exec: total c0 3.669 c100 4.572 delta +0.903 ms CPU/1k fills (+24.6%)
+      c0     c100    delta   %dlt  frame
+   0.109    0.341   +0.232   25.7  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs] @ library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:1621
+   0.197    0.355   +0.158   17.5  spec_eq [library/core/src/array/equality.rs] @ library/core/src/array/equality.rs:157
+   0.030    0.084   +0.054    6.0  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:335
+   0.020    0.058   +0.038    4.2  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:279
+   0.014    0.038   +0.025    2.7  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:0
+   0.081    0.102   +0.021    2.4  eq [library/core/src/cmp.rs] @ library/core/src/cmp.rs:1878
+   0.067    0.087   +0.019    2.1  copy_nonoverlapping [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:549
+   0.002    0.018   +0.017    1.9  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:94
+   0.028    0.044   +0.016    1.7  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs] @ /rust/deps/hashbrown-0.17.1/src/control/bitmask.rs:40
+   0.017    0.032   +0.014    1.6  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs] @ /rust/deps/hashbrown-0.17.1/src/raw.rs:2452
+   0.013    0.000   -0.013   -1.4  {closure#2} [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:6896
+   0.028    0.037   +0.010    1.1  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:26
+   0.008    0.018   +0.010    1.1  unlikely [library/core/src/intrinsics/mod.rs] @ library/core/src/intrinsics/mod.rs:459
+   0.067    0.076   +0.009    1.0  write [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1939
+   0.012    0.021   +0.009    1.0  __KeccakF1600 [/home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/sha3-asm-f64e649d80a3ba18/out/keccak1600-x86_64.S] @ /home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/sha3-asm-f64e649d80a3ba18/out/keccak1600-x86_64.S:21
+   0.032    0.041   +0.009    1.0  cancel_batch::remove_targets [crates/torus-core/order_book/cancel_batch.rs] @ crates/torus-core/src/order_book/cancel_batch.rs:112
+   0.087    0.079   -0.008   -0.9  sell_top_ups [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:9378
+   0.039    0.047   +0.008    0.9  <NativeExecutor>::prepare_one [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:7470
+   0.088    0.080   -0.008   -0.9  extend [library/std/src/collections/hash/map.rs] @ library/std/src/collections/hash/map.rs:3032
+   0.041    0.049   +0.008    0.9  iralloct_explicit_slab [/home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/tikv-jemalloc-sys-91f307a957e06586/out/build/include/jemalloc/internal/jemalloc_internal_inlines_c.h] @ /home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/tikv-jemalloc-sys-91f307a957e06586/out/build/include/jemalloc/internal/jemalloc_internal_inlines_c.h:235
+   0.022    0.030   +0.008    0.8  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs] @ /rust/deps/hashbrown-0.17.1/src/control/tag.rs:47
+   0.014    0.021   +0.007    0.8  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:118
+   0.009    0.016   +0.007    0.8  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:336
+   0.012    0.019   +0.007    0.7  read [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1731
+   0.002    0.008   +0.006    0.7  rotate_right [library/core/src/intrinsics/mod.rs] @ library/core/src/intrinsics/mod.rs:2059
+   0.007    0.013   +0.006    0.7  {closure#0} [/rust/deps/hashbrown-0.17.1/src/map.rs] @ /rust/deps/hashbrown-0.17.1/src/map.rs:4880
+   0.017    0.023   +0.006    0.6  <position::PositionManager>::get_native_balance [crates/torus-core/position.rs] @ crates/torus-core/src/position.rs:327
+   0.037    0.043   +0.006    0.6  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:93
+   0.005    0.010   +0.006    0.6  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:115
+   0.020    0.015   -0.006   -0.6  right_kv [library/alloc/src/collections/btree/node.rs] @ library/alloc/src/collections/btree/node.rs:896
+   0.010    0.016   +0.006    0.6  folded_multiply [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:172
+   0.014    0.019   +0.005    0.6  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:44
+   0.000    0.005   +0.005    0.5  <hashbrown::map::HashMap<(Address, u128), (), alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs] @ /rust/deps/hashbrown-0.17.1/src/map.rs:1806
+   0.023    0.027   +0.005    0.5  clone [crates/torus-core/position.rs] @ crates/torus-core/src/position.rs:53
+   0.007    0.011   +0.004    0.5  wrapping_mul [library/core/src/num/uint_macros.rs] @ library/core/src/num/uint_macros.rs:2688
+   0.138    0.134   -0.004   -0.4  drop_glue [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:823
+   0.006    0.010   +0.004    0.4  <foldhash::fast::RandomState as core::hash::BuildHasher>::hash_one [library/core/src/hash/mod.rs] @ library/core/src/hash/mod.rs:702
+   0.021    0.025   +0.004    0.4  append_elements [library/alloc/src/vec/mod.rs] @ library/alloc/src/vec/mod.rs:2949
+   0.011    0.015   +0.004    0.4  find_inner [/rust/deps/hashbrown-0.17.1/src/raw.rs] @ /rust/deps/hashbrown-0.17.1/src/raw.rs:2032
+   0.002    0.006   +0.004    0.4  _mm_cmpeq_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs] @ library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:920
+top by c100 self:
+   0.197    0.355   +0.158  spec_eq [library/core/src/array/equality.rs] @ library/core/src/array/equality.rs:157
+   0.109    0.341   +0.232  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs] @ library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:1621
+   0.138    0.134   -0.004  drop_glue [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:823
+   0.081    0.102   +0.021  eq [library/core/src/cmp.rs] @ library/core/src/cmp.rs:1878
+   0.090    0.091   +0.001  select_unpredictable [library/core/src/hint.rs] @ library/core/src/hint.rs:879
+   0.067    0.087   +0.019  copy_nonoverlapping [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:549
+   0.030    0.084   +0.054  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:335
+   0.088    0.080   -0.008  extend [library/std/src/collections/hash/map.rs] @ library/std/src/collections/hash/map.rs:3032
+   0.087    0.079   -0.008  sell_top_ups [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:9378
+   0.067    0.076   +0.009  write [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1939
+   0.058    0.061   +0.002  <torus_state::backend::NativeStateOverlay as torus_state::backend::StateBackend>::put_cf_raw_owned [crates/torus-state/backend.rs] @ crates/torus-state/src/backend.rs:2445
+   0.020    0.058   +0.038  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:279
+
+== SELF by function@line -- thread group pool: total c0 5.443 c100 5.720 delta +0.276 ms CPU/1k fills (+5.1%)
+      c0     c100    delta   %dlt  frame
+   0.190    0.238   +0.049   17.6  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs] @ library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:1621
+   0.013    0.054   +0.041   14.8  <OrderBook>::place_order_with_accounts [crates/torus-core/order_book.rs] @ crates/torus-core/src/order_book.rs:1749
+   0.238    0.279   +0.040   14.6  spec_eq [library/core/src/array/equality.rs] @ library/core/src/array/equality.rs:157
+   0.001    0.022   +0.021    7.5  <alloc::collections::btree::map::entry::Entry<FixedPoint, alloc::collections::vec_deque::VecDeque<Order>>>::or_default [library/alloc/src/collections/btree/map/entry.rs] @ library/alloc/src/collections/btree/map/entry.rs:366
+   0.183    0.169   -0.014   -5.1  clone [crates/torus-types/lib.rs] @ crates/torus-types/src/lib.rs:1267
+   0.092    0.079   -0.012   -4.4  <NativeExecutor>::compute_market_settle_plan [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:8473
+   0.000    0.012   +0.012    4.2  <trader_orders::TraderOrders>::remove [crates/torus-core/order_book/trader_orders.rs] @ crates/torus-core/src/order_book/trader_orders.rs:62
+   0.261    0.272   +0.011    3.8  select_unpredictable [library/core/src/hint.rs] @ library/core/src/hint.rs:879
+   0.000    0.009   +0.009    3.2  <hashbrown::map::HashMap<(Address, u128), u128, alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs] @ /rust/deps/hashbrown-0.17.1/src/map.rs:1822
+   0.025    0.033   +0.008    3.0  likely [library/core/src/intrinsics/mod.rs] @ library/core/src/intrinsics/mod.rs:436
+   0.002    0.010   +0.008    2.8  <hashbrown::map::HashMap<u128, OrderLocation, alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs] @ /rust/deps/hashbrown-0.17.1/src/map.rs:1806
+   0.051    0.059   +0.008    2.7  cmp [library/core/src/cmp.rs] @ library/core/src/cmp.rs:2011
+   0.112    0.119   +0.008    2.7  keys [library/alloc/src/collections/btree/node.rs] @ library/alloc/src/collections/btree/node.rs:396
+   0.026    0.019   -0.007   -2.6  {closure#0} [crates/torus-core/order_book/trader_orders.rs] @ crates/torus-core/src/order_book/trader_orders.rs:64
+   0.004    0.011   +0.007    2.5  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:94
+   0.015    0.022   +0.006    2.3  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:335
+   0.367    0.361   -0.006   -2.2  <position::PositionManager>::get_position [crates/torus-core/position.rs] @ crates/torus-core/src/position.rs:284
+   0.005    0.011   +0.006    2.1  wrapping_add [library/core/src/num/uint_macros.rs] @ library/core/src/num/uint_macros.rs:2612
+   0.007    0.012   +0.006    2.1  wrapping_mul [library/core/src/num/uint_macros.rs] @ library/core/src/num/uint_macros.rs:2688
+   0.092    0.097   +0.006    2.1  write [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1939
+   0.194    0.189   -0.005   -2.0  reserve_price [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:8916
+   0.082    0.087   +0.005    1.9  eq [library/core/src/cmp.rs] @ library/core/src/cmp.rs:1878
+   0.022    0.017   -0.005   -1.9  eq [library/core/src/ptr/non_null.rs] @ library/core/src/ptr/non_null.rs:1650
+   0.050    0.045   -0.005   -1.8  is_read_lockable [library/std/src/sys/sync/rwlock/futex.rs] @ library/std/src/sys/sync/rwlock/futex.rs:54
+   0.018    0.023   +0.005    1.7  next [library/core/src/slice/iter/macros.rs] @ library/core/src/slice/iter/macros.rs:180
+   0.070    0.065   -0.005   -1.6  overflowing_mul [library/core/src/num/int_macros.rs] @ library/core/src/num/int_macros.rs:2765
+   0.027    0.031   +0.004    1.5  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:118
+   0.039    0.043   +0.004    1.5  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs] @ /rust/deps/hashbrown-0.17.1/src/raw.rs:2452
+   0.001    0.005   +0.004    1.5  <alloc::collections::btree::map::entry::Entry<FixedPoint, alloc::collections::vec_deque::VecDeque<Order>>>::or_default [library/alloc/src/collections/btree/map/entry.rs] @ library/alloc/src/collections/btree/map/entry.rs:363
+   0.025    0.021   -0.004   -1.5  is_le [library/core/src/cmp.rs] @ library/core/src/cmp.rs:520
+   0.052    0.056   +0.004    1.5  <position::PositionManager>::get_native_balance [crates/torus-core/position.rs] @ crates/torus-core/src/position.rs:327
+   0.026    0.030   +0.004    1.4  entry [library/alloc/src/collections/btree/map.rs] @ library/alloc/src/collections/btree/map.rs:1506
+   0.030    0.026   -0.004   -1.4  wait_until [index.crates.io-1949cf8c6b5b557f/rayon-core-1.13.0/src/registry.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rayon-core-1.13.0/src/registry.rs:775
+   0.000    0.004   +0.004    1.4  {closure#0} [crates/torus-core/order_book.rs] @ crates/torus-core/src/order_book.rs:1400
+   0.113    0.117   +0.004    1.4  find_key_index [library/alloc/src/collections/btree/search.rs] @ library/alloc/src/collections/btree/search.rs:226
+   0.015    0.019   +0.004    1.3  get [/rust/deps/hashbrown-0.17.1/src/map.rs] @ /rust/deps/hashbrown-0.17.1/src/map.rs:1284
+   0.002    0.005   +0.003    1.2  set_next_order_id [crates/torus-core/order_book.rs] @ crates/torus-core/src/order_book.rs:2187
+   0.009    0.012   +0.003    1.2  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:336
+   0.010    0.007   -0.003   -1.1  edata_list_inactive_remove [/home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/tikv-jemalloc-sys-91f307a957e06586/out/build/include/jemalloc/internal/edata.h] @ /home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/tikv-jemalloc-sys-91f307a957e06586/out/build/include/jemalloc/internal/edata.h:278
+   0.015    0.018   +0.003    1.1  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:115
+top by c100 self:
+   0.367    0.361   -0.006  <position::PositionManager>::get_position [crates/torus-core/position.rs] @ crates/torus-core/src/position.rs:284
+   0.238    0.279   +0.040  spec_eq [library/core/src/array/equality.rs] @ library/core/src/array/equality.rs:157
+   0.261    0.272   +0.011  select_unpredictable [library/core/src/hint.rs] @ library/core/src/hint.rs:879
+   0.190    0.238   +0.049  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs] @ library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:1621
+   0.194    0.189   -0.005  reserve_price [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:8916
+   0.188    0.186   -0.002  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:279
+   0.183    0.169   -0.014  clone [crates/torus-types/lib.rs] @ crates/torus-types/src/lib.rs:1267
+   0.119    0.120   +0.001  read [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1731
+   0.112    0.119   +0.008  keys [library/alloc/src/collections/btree/node.rs] @ library/alloc/src/collections/btree/node.rs:396
+   0.113    0.117   +0.004  find_key_index [library/alloc/src/collections/btree/search.rs] @ library/alloc/src/collections/btree/search.rs:226
+   0.092    0.097   +0.006  write [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1939
+   0.089    0.092   +0.003  overflowing_add [library/core/src/num/int_macros.rs] @ library/core/src/num/int_macros.rs:2553
+
+== SELF by function@line -- thread group all: total c0 23.960 c100 25.014 delta +1.054 ms CPU/1k fills (+4.4%)
+      c0     c100    delta   %dlt  frame
+   0.316    0.595   +0.279   26.4  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs] @ library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:1621
+   0.447    0.648   +0.201   19.1  spec_eq [library/core/src/array/equality.rs] @ library/core/src/array/equality.rs:157
+   0.046    0.106   +0.060    5.7  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:335
+   0.036    0.084   +0.048    4.6  ZSTD_compressBlock_doubleFast_noDict_generic [index.crates.io-1949cf8c6b5b557f/zstd-sys-2.0.16+zstd.1.5.7/zstd/lib/compress/zstd_double_fast.c] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zstd-sys-2.0.16+zstd.1.5.7/zstd/lib/compress/zstd_double_fast.c:190
+   0.013    0.054   +0.041    3.9  <OrderBook>::place_order_with_accounts [crates/torus-core/order_book.rs] @ crates/torus-core/src/order_book.rs:1749
+   0.208    0.244   +0.036    3.4  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:279
+   0.162    0.189   +0.027    2.5  eq [library/core/src/cmp.rs] @ library/core/src/cmp.rs:1878
+   0.006    0.030   +0.024    2.2  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:94
+   0.025    0.048   +0.024    2.2  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:0
+   0.032    0.056   +0.024    2.2  HIST_count_simple [index.crates.io-1949cf8c6b5b557f/zstd-sys-2.0.16+zstd.1.5.7/zstd/lib/compress/hist.c] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zstd-sys-2.0.16+zstd.1.5.7/zstd/lib/compress/hist.c:50
+   0.191    0.168   -0.024   -2.2  mul_inner [index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs:341
+   0.001    0.022   +0.021    2.0  <alloc::collections::btree::map::entry::Entry<FixedPoint, alloc::collections::vec_deque::VecDeque<Order>>>::or_default [library/alloc/src/collections/btree/map/entry.rs] @ library/alloc/src/collections/btree/map/entry.rs:366
+   0.095    0.076   -0.019   -1.8  branch [library/core/src/result.rs] @ library/core/src/result.rs:2176
+   0.059    0.078   +0.019    1.8  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs] @ /rust/deps/hashbrown-0.17.1/src/raw.rs:2452
+   0.135    0.154   +0.018    1.8  wrapping_add [library/core/src/num/uint_macros.rs] @ library/core/src/num/uint_macros.rs:2612
+   0.069    0.086   +0.017    1.6  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs] @ /rust/deps/hashbrown-0.17.1/src/control/bitmask.rs:40
+   0.146    0.162   +0.016    1.5  copy_nonoverlapping [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:549
+   0.061    0.077   +0.016    1.5  rotate_right [library/core/src/intrinsics/mod.rs] @ library/core/src/intrinsics/mod.rs:2059
+   0.111    0.125   +0.014    1.4  __KeccakF1600 [/home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/sha3-asm-f64e649d80a3ba18/out/keccak1600-x86_64.S] @ /home/oz/.cargo-target-p3gate-s2-c88d3073/release/build/sha3-asm-f64e649d80a3ba18/out/keccak1600-x86_64.S:21
+   0.093    0.079   -0.014   -1.3  mul_inner [index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs:404
+   0.000    0.014   +0.014    1.3  <core::mem::maybe_uninit::MaybeUninit<u8>>::write [library/core/src/mem/maybe_uninit.rs] @ library/core/src/mem/maybe_uninit.rs:575
+   0.183    0.169   -0.014   -1.3  clone [crates/torus-types/lib.rs] @ crates/torus-types/src/lib.rs:1267
+   0.132    0.118   -0.014   -1.3  mul_inner [index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs:322
+   0.013    0.000   -0.013   -1.2  {closure#2} [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:6896
+   0.077    0.065   -0.013   -1.2  conditional_assign [index.crates.io-1949cf8c6b5b557f/subtle-2.6.1/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/subtle-2.6.1/src/lib.rs:443
+   0.417    0.430   +0.013    1.2  select_unpredictable [library/core/src/hint.rs] @ library/core/src/hint.rs:879
+   0.138    0.150   +0.012    1.2  std::__cxx11::basic_string [/usr/include/c++/16/bits/basic_string.h] @ /usr/include/c++/16/bits/basic_string.h:1594
+   0.082    0.094   +0.012    1.2  likely [library/core/src/intrinsics/mod.rs] @ library/core/src/intrinsics/mod.rs:436
+   0.092    0.079   -0.012   -1.2  <NativeExecutor>::compute_market_settle_plan [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:8473
+   0.059    0.047   -0.012   -1.1  mul_inner [index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs:379
+   0.059    0.071   +0.012    1.1  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:26
+   0.000    0.012   +0.012    1.1  <trader_orders::TraderOrders>::remove [crates/torus-core/order_book/trader_orders.rs] @ crates/torus-core/src/order_book/trader_orders.rs:62
+   0.041    0.052   +0.011    1.1  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs:118
+   0.054    0.043   -0.011   -1.0  compare [library/core/src/slice/cmp.rs] @ library/core/src/slice/cmp.rs:340
+   0.208    0.218   +0.011    1.0  write [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1939
+   0.048    0.038   -0.010   -1.0  clone [crates/torus-types/lib.rs] @ crates/torus-types/src/lib.rs:1270
+   0.198    0.208   +0.010    1.0  keys [library/alloc/src/collections/btree/node.rs] @ library/alloc/src/collections/btree/node.rs:396
+   0.015    0.025   +0.010    1.0  wrapping_mul [library/core/src/num/uint_macros.rs] @ library/core/src/num/uint_macros.rs:2688
+   0.018    0.028   +0.010    1.0  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:336
+   0.031    0.041   +0.010    1.0  unlikely [library/core/src/intrinsics/mod.rs] @ library/core/src/intrinsics/mod.rs:459
+top by c100 self:
+   0.447    0.648   +0.201  spec_eq [library/core/src/array/equality.rs] @ library/core/src/array/equality.rs:157
+   0.316    0.595   +0.279  _mm_movemask_epi8 [library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs] @ library/core/src/../../stdarch/crates/core_arch/src/x86/sse2.rs:1621
+   0.417    0.430   +0.013  select_unpredictable [library/core/src/hint.rs] @ library/core/src/hint.rs:879
+   0.367    0.361   -0.006  <position::PositionManager>::get_position [crates/torus-core/position.rs] @ crates/torus-core/src/position.rs:284
+   0.208    0.244   +0.036  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs:279
+   0.216    0.220   +0.003  find_key_index [library/alloc/src/collections/btree/search.rs] @ library/alloc/src/collections/btree/search.rs:226
+   0.208    0.218   +0.011  write [library/core/src/ptr/mod.rs] @ library/core/src/ptr/mod.rs:1939
+   0.198    0.208   +0.010  keys [library/alloc/src/collections/btree/node.rs] @ library/alloc/src/collections/btree/node.rs:396
+   0.196    0.191   -0.006  reserve_price [crates/torus-bridge/native_executor.rs] @ crates/torus-bridge/src/native_executor.rs:8916
+   0.162    0.189   +0.027  eq [library/core/src/cmp.rs] @ library/core/src/cmp.rs:1878
+   0.183    0.169   -0.014  clone [crates/torus-types/lib.rs] @ crates/torus-types/src/lib.rs:1267
+   0.191    0.168   -0.024  mul_inner [index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs] @ .cargo/registry/src/index.crates.io-1949cf8c6b5b557f/k256-0.13.4/src/arithmetic/field/field_5x52.rs:341

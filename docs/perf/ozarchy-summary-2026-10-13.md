@@ -1,8 +1,8 @@
 # ozarchy campaigns 2026-10-13: absolute per-arm values
 
 Sources: results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` sections 53-58 (branch docs/wedge-fix, worktree
-`/home/oz/projects/wt/docs-wedge-fix`), 59 (branch docs/p3-cloid), 60 (branch docs/p3-cloidprof), 61 (branch docs/p3-gate) and 62 (branch docs/p3-kd), `<run>/analyst/{cells.json,arms.txt,paired.txt,soak.txt,series.txt}`
-(61 also `arms-soak.txt`, `a-term.txt`; 62 also `restart.txt`)
+`/home/oz/projects/wt/docs-wedge-fix`), 59 (branch docs/p3-cloid), 60 (branch docs/p3-cloidprof), 61 (branch docs/p3-gate), 62 (branch docs/p3-kd) and 63 (branch docs/p3-cloidec), `<run>/analyst/{cells.json,arms.txt,paired.txt,soak.txt,series.txt}`
+(61 also `arms-soak.txt`, `a-term.txt`; 62 also `restart.txt`; 63 has `cells-all.json` instead of `cells.json`, and its `paired.txt` is `a-writeup.py`'s)
 and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywhere: tw, Classic, 300 markets, MAX_IN_FLIGHT 4, commit tail, shared NVMe.
 
 | Sec | arm (sha, allocator) | matched/s: whole cell [min 0-2 / 6-10] | native blk/s | blk time p99 ms | node CPU-s/1M | RSS mean / peak GB per node | dev writes MB/s/val | settle ms/native blk | key delta (CI), as in the write-up |
@@ -46,6 +46,8 @@ and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywh
 | 62 KILL | s2 c88d3073 (4 SIGKILLs) | kill -> val1 first commit 29.9 mean / 39.5 max s; replay 72-113 blocks (last 100-block checkpoint) | - | - | - | - | - | - | |
 | 62 soak | s2def c88d3073, je defaults, 15 s | 217,605 [210,278 / 217,519] | 2.95 | 1,398 | 24.47 | 6.40 / 7.07 | - | 9.2 | dec - def RSS -1.72 GiB/node (min 5-10), -1.71 peak; je allocated unchanged; CPU +4.6%, matched/s -2.5%, blk/s +2.6%; single cells |
 | 62 soak | s2dec c88d3073, je + MALLOC_CONF=background_thread:true,dirty_decay_ms:1000, 15 s | 212,075 [207,428 / 210,248] | 3.02 | 1,425 | 25.60 | 4.64 / 5.32 | - | 8.9 | |
+| 63 SAT 120 s | B c88d3073, je compiled in, 15 s, CLOID_SHARE=100, perf on val1 | 180,373 | 3.53 | 1,422 | 26.21 | 4.97 / 6.34 | 69.3 | 4.5 | F: matched/s +5.6% [+0.1, +11.1]; engine/1k fills -5.7% [-6.7, -4.7]; exec block_ms -12.7% [-22.0, -3.4]; CPU -0.49% [-1.29, +0.30] |
+| 63 SAT 120 s | F bc44a845 (cloid fixes), je compiled in, 15 s, CLOID_SHARE=100, perf on val1 | 190,493 | 3.92 | 1,413 | 26.08 | 4.92 / 6.34 | 70.8 | 4.1 | |
 
 Definitions and caveats
 
@@ -71,6 +73,9 @@ Definitions and caveats
   per-node MB values in `series.txt` / 1000, as the 61 soak rows (the delta text and section 62 use GiB = MB / 1024:
   6.25 -> 4.53); blk/s, CPU, p99 and settle from `cells.json` (p99 = mean of nodes, a-arms.py's definition); device writes
   not computed (no `a-arms.py --io` run). The decay setting is `MALLOC_CONF` in the node environment, not compiled in.
+- **63 (cloid engine-cost fixes):** F `bc44a845` and B `c88d3073` built with the same flags, jemalloc compiled in, 15 s
+  checkpoints, CLOID_SHARE=100 (the worst case), perf on val1 in every cell; n = 4 ABBA, deltas paired (`paired.txt`). The c0
+  cells (n = 2 per arm, regression check only) are not in the table: matched/s F0 - B0 -0.04% (`writeup.txt`).
 - **Commit tail everywhere** (bench in-flight released on committed bodies); block time p99 = commit interval from val0-2
   logs, mean of 3 nodes. Closed-loop bench: faster commits raise offered load (jemalloc and mw rows).
 - **Settle wait** = `checkpoint_settle_wait` summary phase, ms per native block, mean of 3 nodes; n/a = no Phase 3 (main

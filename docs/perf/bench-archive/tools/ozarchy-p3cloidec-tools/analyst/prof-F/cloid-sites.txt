@@ -1,0 +1,203 @@
+W1 samples by innermost cloid site on the logical stack (inclusive of callees: hashbrown, memcpy...), ms CPU/1k fills
+
+== CLOID SITE (candidate|label) -- thread group exec: total c0 0.000 c100 4.287 delta +4.287 ms CPU/1k fills (+0.0%)
+      c0     c100    delta   %dlt  frame
+   0.000    3.923   +3.923   91.5  none|-
+   0.000    0.140   +0.140    3.3  1 index|OrderBook::drain_cloid_keys (F)
+   0.000    0.094   +0.094    2.2  2 dup-check|prepass serial block (claimed set, retain)
+   0.000    0.073   +0.073    1.7  2 dup-check|prepass duplicate_cloid
+   0.000    0.054   +0.054    1.3  3 cleanup|OrderBook::forget_cloid
+   0.000    0.003   +0.003    0.1  3 cleanup|OrderBook::forget_cloids
+   0.000    0.000   +0.000    0.0  1 index|CloidMarkets::absorb
+top by c100 self:
+   0.000    3.923   +3.923  none|-
+   0.000    0.140   +0.140  1 index|OrderBook::drain_cloid_keys (F)
+   0.000    0.094   +0.094  2 dup-check|prepass serial block (claimed set, retain)
+   0.000    0.073   +0.073  2 dup-check|prepass duplicate_cloid
+   0.000    0.054   +0.054  3 cleanup|OrderBook::forget_cloid
+   0.000    0.003   +0.003  3 cleanup|OrderBook::forget_cloids
+   0.000    0.000   +0.000  1 index|CloidMarkets::absorb
+
+== CLOID SITE (candidate|label) -- thread group pool: total c0 0.000 c100 5.804 delta +5.804 ms CPU/1k fills (+0.0%)
+      c0     c100    delta   %dlt  frame
+   0.000    5.630   +5.630   97.0  none|-
+   0.000    0.063   +0.063    1.1  1 index|OrderBook::index_cloid
+   0.000    0.057   +0.057    1.0  1 index|OrderBook::resolve_cloid_log (F worker)
+   0.000    0.050   +0.050    0.9  3 cleanup|OrderBook::forget_cloid
+   0.000    0.004   +0.004    0.1  2 dup-check|book place contains_key (order_book.rs:1397-1402)
+top by c100 self:
+   0.000    5.630   +5.630  none|-
+   0.000    0.063   +0.063  1 index|OrderBook::index_cloid
+   0.000    0.057   +0.057  1 index|OrderBook::resolve_cloid_log (F worker)
+   0.000    0.050   +0.050  3 cleanup|OrderBook::forget_cloid
+   0.000    0.004   +0.004  2 dup-check|book place contains_key (order_book.rs:1397-1402)
+
+== CLOID SITE (candidate|label) -- thread group other: total c0 0.000 c100 14.162 delta +14.162 ms CPU/1k fills (+0.0%)
+      c0     c100    delta   %dlt  frame
+   0.000   14.162  +14.162  100.0  none|-
+top by c100 self:
+   0.000   14.162  +14.162  none|-
+
+== CLOID SITE (candidate|label) -- thread group all: total c0 0.000 c100 24.252 delta +24.252 ms CPU/1k fills (+0.0%)
+      c0     c100    delta   %dlt  frame
+   0.000   23.714  +23.714   97.8  none|-
+   0.000    0.140   +0.140    0.6  1 index|OrderBook::drain_cloid_keys (F)
+   0.000    0.104   +0.104    0.4  3 cleanup|OrderBook::forget_cloid
+   0.000    0.094   +0.094    0.4  2 dup-check|prepass serial block (claimed set, retain)
+   0.000    0.073   +0.073    0.3  2 dup-check|prepass duplicate_cloid
+   0.000    0.063   +0.063    0.3  1 index|OrderBook::index_cloid
+   0.000    0.057   +0.057    0.2  1 index|OrderBook::resolve_cloid_log (F worker)
+   0.000    0.004   +0.004    0.0  2 dup-check|book place contains_key (order_book.rs:1397-1402)
+   0.000    0.003   +0.003    0.0  3 cleanup|OrderBook::forget_cloids
+   0.000    0.000   +0.000    0.0  1 index|CloidMarkets::absorb
+top by c100 self:
+   0.000   23.714  +23.714  none|-
+   0.000    0.140   +0.140  1 index|OrderBook::drain_cloid_keys (F)
+   0.000    0.104   +0.104  3 cleanup|OrderBook::forget_cloid
+   0.000    0.094   +0.094  2 dup-check|prepass serial block (claimed set, retain)
+   0.000    0.073   +0.073  2 dup-check|prepass duplicate_cloid
+   0.000    0.063   +0.063  1 index|OrderBook::index_cloid
+   0.000    0.057   +0.057  1 index|OrderBook::resolve_cloid_log (F worker)
+   0.000    0.004   +0.004  2 dup-check|book place contains_key (order_book.rs:1397-1402)
+   0.000    0.003   +0.003  3 cleanup|OrderBook::forget_cloids
+   0.000    0.000   +0.000  1 index|CloidMarkets::absorb
+
+hashbrown / hash leaf frames by cloid site of the sample (candidate 'none' = not under a cloid site)
+
+== HASH LEAF (leaf|cand) -- thread group exec: total c0 0.000 c100 4.287 delta +4.287 ms CPU/1k fills (+0.0%)
+      c0     c100    delta   %dlt  frame
+   0.000    0.083   +0.083    1.9  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.043   +0.043    1.0  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.038   +0.038    0.9  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.030   +0.030    0.7  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|none
+   0.000    0.023   +0.023    0.5  next [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.022   +0.022    0.5  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.020   +0.020    0.5  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|none
+   0.000    0.020   +0.020    0.5  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.019   +0.019    0.4  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.018   +0.018    0.4  <[u8; 20] as core::hash::Hash>::hash [library/core/src/array/mod.rs]|none
+   0.000    0.012   +0.012    0.3  find_inner [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.012   +0.012    0.3  {closure#0} [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.011   +0.011    0.3  folded_multiply [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.011   +0.011    0.3  <foldhash::fast::RandomState as core::hash::BuildHasher>::hash_one [library/core/src/hash/mod.rs]|none
+   0.000    0.011   +0.011    0.3  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|2 dup-check
+   0.000    0.011   +0.011    0.2  set_ctrl [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.008   +0.008    0.2  hash [/rust/deps/hashbrown-0.17.1/src/map.rs]|2 dup-check
+   0.000    0.008   +0.008    0.2  write [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.007   +0.007    0.2  reserve [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.006   +0.006    0.1  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|1 index
+   0.000    0.005   +0.005    0.1  <hashbrown::map::HashMap<cloid_key::CloidKey, CloidSlot, alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs]|1 index
+   0.000    0.004   +0.004    0.1  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write [library/core/src/hash/sip.rs]|none
+   0.000    0.004   +0.004    0.1  remove [/rust/deps/hashbrown-0.17.1/src/map.rs]|1 index
+   0.000    0.004   +0.004    0.1  <hashbrown::map::HashMap<Address, CachedBalance, alloy_primitives::map::hasher::DefaultHashBuilder>>::rustc_entry [/rust/deps/hashbrown-0.17.1/src/rustc_entry.rs]|none
+   0.000    0.003   +0.003    0.1  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|1 index
+   0.000    0.002   +0.002    0.1  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|2 dup-check
+   0.000    0.002   +0.002    0.1  record_item_insert_at [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.002   +0.002    0.1  find_insert_index_in_group [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.002   +0.002    0.0  prepare_resize [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.002   +0.002    0.0  <hashbrown::raw::RawTable<(cloid_key::CloidKey, CloidSlot)>>::remove_entry [/rust/deps/hashbrown-0.17.1/src/raw.rs]|1 index
+top by c100 self:
+   0.000    0.083   +0.083  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.043   +0.043  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.038   +0.038  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.030   +0.030  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|none
+   0.000    0.023   +0.023  next [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.022   +0.022  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.020   +0.020  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|none
+   0.000    0.020   +0.020  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.019   +0.019  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.018   +0.018  <[u8; 20] as core::hash::Hash>::hash [library/core/src/array/mod.rs]|none
+   0.000    0.012   +0.012  find_inner [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.012   +0.012  {closure#0} [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+
+== HASH LEAF (leaf|cand) -- thread group pool: total c0 0.000 c100 5.804 delta +5.804 ms CPU/1k fills (+0.0%)
+      c0     c100    delta   %dlt  frame
+   0.000    0.235   +0.235    4.1  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.055   +0.055    0.9  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.050   +0.050    0.9  <[u8; 20] as core::hash::Hash>::hash [library/core/src/array/mod.rs]|none
+   0.000    0.046   +0.046    0.8  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.039   +0.039    0.7  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|none
+   0.000    0.037   +0.037    0.6  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.035   +0.035    0.6  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.031   +0.031    0.5  folded_multiply [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.019   +0.019    0.3  write [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.017   +0.017    0.3  reserve [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.016   +0.016    0.3  find_inner [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.015   +0.015    0.3  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|none
+   0.000    0.011   +0.011    0.2  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.010   +0.010    0.2  <foldhash::fast::RandomState as core::hash::BuildHasher>::hash_one [library/core/src/hash/mod.rs]|none
+   0.000    0.009   +0.009    0.2  get [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.009   +0.009    0.2  <hashbrown::map::HashMap<u128, OrderLocation, alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.008   +0.008    0.1  <hashbrown::map::HashMap<Address, trader_orders::TraderOrders, alloy_primitives::map::hasher::DefaultHashBuilder>>::rustc_entry [/rust/deps/hashbrown-0.17.1/src/rustc_entry.rs]|none
+   0.000    0.006   +0.006    0.1  set_ctrl [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.006   +0.006    0.1  <(Address, u64) as core::hash::Hash>::hash [library/core/src/hash/mod.rs]|none
+   0.000    0.006   +0.006    0.1  <hashbrown::map::HashMap<(Address, u64), core::option::Option<position::Position>, alloy_primitives::map::hasher::DefaultHashBuilder>>::rustc_entry [/rust/deps/hashbrown-0.17.1/src/rustc_entry.rs]|none
+   0.000    0.005   +0.005    0.1  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write [library/core/src/hash/sip.rs]|none
+   0.000    0.005   +0.005    0.1  <hashbrown::map::HashMap<(Address, u64), (), alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.005   +0.005    0.1  <hashbrown::map::HashMap<u128, u64, alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.005   +0.005    0.1  record_item_insert_at [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.004   +0.004    0.1  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|1 index
+   0.000    0.004   +0.004    0.1  <hashbrown::map::HashMap<Address, TraderMargins, alloy_primitives::map::hasher::DefaultHashBuilder>>::rustc_entry [/rust/deps/hashbrown-0.17.1/src/rustc_entry.rs]|none
+   0.000    0.003   +0.003    0.1  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|1 index
+   0.000    0.003   +0.003    0.1  prepare_resize [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.003   +0.003    0.1  find_insert_index_in_group [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.003   +0.003    0.1  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|1 index
+top by c100 self:
+   0.000    0.235   +0.235  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.055   +0.055  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.050   +0.050  <[u8; 20] as core::hash::Hash>::hash [library/core/src/array/mod.rs]|none
+   0.000    0.046   +0.046  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.039   +0.039  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|none
+   0.000    0.037   +0.037  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.035   +0.035  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.031   +0.031  folded_multiply [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.019   +0.019  write [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.017   +0.017  reserve [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.016   +0.016  find_inner [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.015   +0.015  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|none
+
+== HASH LEAF (leaf|cand) -- thread group all: total c0 0.000 c100 24.252 delta +24.252 ms CPU/1k fills (+0.0%)
+      c0     c100    delta   %dlt  frame
+   0.000    0.319   +0.319    1.3  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.074   +0.074    0.3  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.073   +0.073    0.3  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.072   +0.072    0.3  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|none
+   0.000    0.067   +0.067    0.3  <[u8; 20] as core::hash::Hash>::hash [library/core/src/array/mod.rs]|none
+   0.000    0.065   +0.065    0.3  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.061   +0.061    0.3  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.053   +0.053    0.2  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.042   +0.042    0.2  folded_multiply [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.036   +0.036    0.1  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|none
+   0.000    0.029   +0.029    0.1  find_inner [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.027   +0.027    0.1  write [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.024   +0.024    0.1  reserve [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.023   +0.023    0.1  next [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.021   +0.021    0.1  <foldhash::fast::RandomState as core::hash::BuildHasher>::hash_one [library/core/src/hash/mod.rs]|none
+   0.000    0.020   +0.020    0.1  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write [library/core/src/hash/sip.rs]|none
+   0.000    0.017   +0.017    0.1  set_ctrl [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.012   +0.012    0.0  {closure#0} [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.011   +0.011    0.0  get [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.011   +0.011    0.0  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|2 dup-check
+   0.000    0.009   +0.009    0.0  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|1 index
+   0.000    0.009   +0.009    0.0  <hashbrown::map::HashMap<u128, OrderLocation, alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+   0.000    0.008   +0.008    0.0  hash [/rust/deps/hashbrown-0.17.1/src/map.rs]|2 dup-check
+   0.000    0.008   +0.008    0.0  <hashbrown::map::HashMap<Address, trader_orders::TraderOrders, alloy_primitives::map::hasher::DefaultHashBuilder>>::rustc_entry [/rust/deps/hashbrown-0.17.1/src/rustc_entry.rs]|none
+   0.000    0.007   +0.007    0.0  record_item_insert_at [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.007   +0.007    0.0  <(Address, u64) as core::hash::Hash>::hash [library/core/src/hash/mod.rs]|none
+   0.000    0.006   +0.006    0.0  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|1 index
+   0.000    0.006   +0.006    0.0  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|1 index
+   0.000    0.006   +0.006    0.0  <hashbrown::map::HashMap<(Address, u64), core::option::Option<position::Position>, alloy_primitives::map::hasher::DefaultHashBuilder>>::rustc_entry [/rust/deps/hashbrown-0.17.1/src/rustc_entry.rs]|none
+   0.000    0.006   +0.006    0.0  <hashbrown::map::HashMap<(Address, u64), (), alloy_primitives::map::hasher::DefaultHashBuilder>>::insert [/rust/deps/hashbrown-0.17.1/src/map.rs]|none
+top by c100 self:
+   0.000    0.319   +0.319  foldhash::hash_bytes_long [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.074   +0.074  write_num [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.073   +0.073  with_seed [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.072   +0.072  lowest_set_bit [/rust/deps/hashbrown-0.17.1/src/control/bitmask.rs]|none
+   0.000    0.067   +0.067  <[u8; 20] as core::hash::Hash>::hash [library/core/src/array/mod.rs]|none
+   0.000    0.065   +0.065  finish [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.061   +0.061  probe_seq [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.053   +0.053  write_u128 [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
+   0.000    0.042   +0.042  folded_multiply [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/lib.rs]|none
+   0.000    0.036   +0.036  full [/rust/deps/hashbrown-0.17.1/src/control/tag.rs]|none
+   0.000    0.029   +0.029  find_inner [/rust/deps/hashbrown-0.17.1/src/raw.rs]|none
+   0.000    0.027   +0.027  write [index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0/src/fast.rs]|none
