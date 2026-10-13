@@ -633,7 +633,8 @@ to `$RUN/cells.tsv` (header once; tab-separated
   `summary.json` `headline.matched_s_avg`, else 0.
 - `flag`: `ok` or `bad:<reasons>`. Reasons are comma-joined, in this order:
   `md5`, `no-summary`, `death`, `rc-missing`/`rc=<n>`, `disagree`/`agreement-<v>`,
-  `verdict-<v>`, `analysis`/`analysis-timeout`, `step-timeout`.
+  `verdict-<v>`, the campaign's own failure of the cell (`check`, `stop-tail`,
+  `stop-fd`, `abort-*`), `analysis`/`analysis-timeout`, `step-timeout`/`step-error`.
 
 Known artifacts stay `ok` (with `agree=no`). The first is rc 2 from the crash
 gate counting the restarted node's INFO line `running state hash fail-stop ...
@@ -645,8 +646,8 @@ the evidence in `$RUN/cell-step/<label>.json`.
 
 **Analysis check.** `CELL_STEP_ANALYSIS_CMD` (placeholders `{out} {prefix} {tag}
 {arm} {label} {cell} {run}`) must exit 0 within `CELL_STEP_ANALYSIS_TIMEOUT`
-(600 s) and write the cell's row (key `{tag}`) to `{out}`. When it does not, the
-cell is flagged `bad:analysis` (or `bad:analysis-timeout`, after the analysis
+(600 s) and write the cell's row (key `{tag}`) to `{out}`. When it does not (an
+unparsable command, e.g. unbalanced quotes, included), the cell is flagged `bad:analysis` (or `bad:analysis-timeout`, after the analysis
 process group is killed) and gets a rerun. The output goes to
 `$RUN/cell-step/<label>.analysis.log`. If the script itself is broken, every cell
 is flagged: fix the script, and empty `rerun-queue.tsv` before the main loop ends
@@ -658,6 +659,20 @@ child and exits 124. `cell_step` then writes `agree=no md5_ok=no` (unknown),
 the metric from `summary.json` (or 0), the flag `bad:step-timeout`, the
 CELL-FLAG line and the rerun entry, and returns 124. The campaign continues.
 
+**Step error.** Any other step exit that leaves no row for the label (a crash,
+an unexpected error: `cell_step.py` exits 5) gets the same fallback row with
+`bad:step-error` and the CELL-FLAG line and rerun; `cell_step` returns 1. A
+finished cell is never lost.
+
+**Campaign check failures.** When `cell()` fails a started cell (`return 1`),
+`run_spec` passes the reason to the step (`cell_step`'s 9th argument, the
+step's `--extra-reasons`): `check` for a failed hard check (the default), or the
+`CELL_FAIL` value a failure site outside the hard-check block sets before its
+`return 1` (`stop-tail`, `stop-fd`, `abort-detach`, `abort-no-pid`,
+`abort-node-left`). The row is `bad:<reason>` (with the step's own reasons
+first) even when the run itself was clean, with the CELL-FLAG line and a queued
+rerun.
+
 **Bad cells and reruns.** A bad cell's row stays as written. The step adds
 `CELL-FLAG <label> <reasons>` to `campaign.log` and queues `<label>-rerun` in
 `$RUN/rerun-queue.tsv` (`rerun_label label arm rep spec`). After the main loop,
@@ -665,7 +680,7 @@ CELL-FLAG line and the rerun entry, and returns 124. The campaign continues.
 `<tag>-rerun`, the same rep, and its own row. A bad rerun is flagged and is not
 requeued. A label that already has a row is refused: exit 3, a
 `CELL-STEP DUPLICATE` line, and nothing written. When `cell()` returns 1 (ABORT,
-CHECK FAIL, STOP), a started cell still gets its row; then the campaign stops,
+CHECK FAIL, STOP), a started cell still gets its row (flagged as above); then the campaign stops,
 and the queued reruns stay in the queue unrun.
 
 Self-test: `python3 tools/matched-bench/test_cell_step.py` (fixtures: trimmed

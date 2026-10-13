@@ -511,6 +511,53 @@ def test_bad_analysis_timeout(e):
     assert not alive(int(open(pidf).read())), "hung analysis process still alive"
 
 
+@with_env(OK)
+def test_bad_analysis_malformed_command(e):
+    """unbalanced quoting in the analysis command (shlex 'No closing quotation') is an analysis failure: the row
+    is still written (bad:analysis), with the CELL-FLAG line and a queued rerun; the step does not crash"""
+    r = e.step(
+        OK, "m", "r1", analysis="python3 -I '%s {out} {prefix} {tag}:{arm}" % FAKE
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+    (row,) = e.table()
+    assert bad_reasons(row["flag"]) == ["analysis"], row
+    assert e.flags() == ["CELL-FLAG %s analysis" % OK], e.flags()
+    assert [x[0] for x in e.pending()] == [OK + "-rerun"]
+    ev = json.load(open(e.run_path("cell-step", OK + ".json")))
+    assert "quotation" in ev["analysis"]["detail"], ev["analysis"]
+
+
+@with_env(OK)
+def test_extra_reasons_flag_a_good_cell_bad(e):
+    """--extra-reasons (the campaign's own failed hard checks) make an otherwise good cell bad:<reason>, with the
+    CELL-FLAG line and a queued rerun; the reasons come after the step's own and before the analysis reason"""
+    r = e.step(OK, "m", "r1", extra=["--extra-reasons", "check"])
+    assert r.returncode == 1, r.stdout + r.stderr
+    (row,) = e.table()
+    assert row["flag"] == "bad:check" and row["agree"] == "yes", row
+    assert e.flags() == ["CELL-FLAG %s check" % OK], e.flags()
+    assert [x[0] for x in e.pending()] == [OK + "-rerun"]
+    set_rc(e, OK, "rc=1\n")
+    shutil.copytree(e.path(OK), e.path(OK + "-b"))
+    shutil.copy(e.path(OK + ".cell.rc"), e.path(OK + "-b.cell.rc"))
+    r = e.step(
+        OK + "-b",
+        "m",
+        "r1",
+        tag="r1-m-b",
+        env={"FAKE_ANALYSIS_MODE": "fail"},
+        extra=["--extra-reasons", "check,Stop FD!"],
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert bad_reasons(e.table()[1]["flag"]) == [
+        "rc=1",
+        "check",
+        "stop-fd",
+        "analysis",
+    ], e.table()
+
+
 # ---------------------------------------------------------------- CELL-FLAG, rerun queue, duplicates
 
 
@@ -685,6 +732,56 @@ def test_helper_timeout_fallback_row(e):
 
 
 @with_env(OK)
+def test_helper_step_error_fallback_row(e):
+    """a step that exits without writing its row (crash, unexpected error) still leaves a row: cell_step writes
+    bad:step-error (metric from summary.json), the CELL-FLAG line and the rerun, and returns 1"""
+    crash = e.run_path("crash_step.py")
+    with open(crash, "w") as fh:
+        fh.write("import sys\nraise ValueError('No closing quotation')\n")
+    r = bash(helper_call(e, OK, "m", "r1"), env={"CELL_STEP_PY": crash})
+    assert "helper_rc=1" in r.stdout, r.stdout + r.stderr
+    (row,) = e.table()
+    assert row["label"] == OK and row["arm"] == "m" and row["rep"] == "r1", row
+    assert (
+        row["flag"] == "bad:step-error"
+        and row["agree"] == "no"
+        and row["md5_ok"] == "no"
+        and row["rc"] == "0"
+    ), row
+    assert re.fullmatch(r"\d+(\.\d+)?", row["metric"]), row
+    assert e.flags() == ["CELL-FLAG %s step-error" % OK], e.flags()
+    assert [x[0] for x in e.pending()] == [OK + "-rerun"]
+    # a step that did write its row is left alone (no second row, no extra CELL-FLAG)
+    r = bash(helper_call(e, OK, "m", "r1"))
+    assert "helper_rc=3" in r.stdout, r.stdout + r.stderr
+    assert len(e.table()) == 1 and len(e.flags()) == 1, (e.table(), e.flags())
+
+
+@with_env(OK)
+def test_helper_extra_reasons_arg(e):
+    """cell_step's optional 9th arg (failed campaign checks) reaches the row; on a step timeout the fallback row
+    carries it too (bad:check,step-timeout)"""
+    r = bash(helper_call(e, OK, "m", "r1").replace("; echo", " check; echo", 1))
+    assert "helper_rc=1" in r.stdout, r.stdout + r.stderr
+    assert e.table()[0]["flag"] == "bad:check", e.table()
+    e.add(OK, OK + "-t")
+    r = bash(
+        helper_call(e, OK + "-t", "m", "r1", tag="r1-m-t").replace(
+            "; echo", " check; echo", 1
+        ),
+        env={
+            "CELL_STEP_TIMEOUT": "3",
+            "CELL_STEP_ANALYSIS_TIMEOUT": "100",
+            "FAKE_ANALYSIS_MODE": "sleep",
+            "FAKE_ANALYSIS_PIDFILE": e.run_path("analysis.pid"),
+        },
+    )
+    assert "helper_rc=124" in r.stdout, r.stdout + r.stderr
+    assert e.table()[1]["flag"] == "bad:check,step-timeout", e.table()
+    assert e.flags()[-1] == "CELL-FLAG %s-t check,step-timeout" % OK, e.flags()
+
+
+@with_env(OK)
 def test_helper_rerun_pass_runs_each_once(e):
     """cell_step_rerun_pass: calls the campaign's runner once per pending rerun (spec, -rerun suffix),
     and a bad rerun is not run again by a second pass"""
@@ -775,6 +872,74 @@ cell_step_rerun_pass "$RUN" run_spec; echo "pass2=$?"
     ], tab
     assert "did not start" in r.stdout, out
     assert e.flags() == ["CELL-FLAG %s rc=1" % OK], e.flags()
+
+
+@with_env()
+def test_template_run_spec_check_fail_flags_row(e):
+    """the template's run_spec (verbatim) with a stub cell() whose run is clean (rc 0, ACCEPT AGREE) but whose
+    hard checks fail after the start (CHECK FAIL, return 1): the row is bad:check with CELL-FLAG and a queued
+    rerun (not flag=ok, queued=0); a STOP site's own reason (CELL_FAIL) is used instead of 'check'"""
+    t = open(TEMPLATE).read()
+    m = re.search(r"^run_spec\(\) \{.*?^\}\n", t, re.M | re.S)
+    assert m, "run_spec() not found in the template"
+    stub = r"""
+set -u
+source %(helper)s
+export CELL_STEP_ANALYSIS_CMD=%(analysis)s CELL_STEP_ANALYSIS_METRIC=ms
+R=%(R)s RUN=%(RUN)s P=ozarchy-p3gate-300m FIX=%(fix)s
+declare -A ABIN=([m]=m [s2]=s2) BMD5=([m]=%(md5m)s [s2]=%(md5s2)s)
+cell() { # stub: a clean run, then a failed campaign check (r1-m) or a STOP (r2-m)
+    local label=$P-$1
+    cp -r "$FIX/$P-r1-m" "$R/$label"; STARTED_LABEL=$label; echo rc=0 > "$R/$label.cell.rc"
+    case $1 in
+        r1-m) echo "CHECK FAIL $label: TORUS_CHECKPOINT_INTERVAL_MS set on 3 node lines (arm m has no knob)"; return 1 ;;
+        r2-m) CELL_FAIL=stop-fd; echo "STOP: a node held too many fds"; return 1 ;;
+    esac
+    return 0
+}
+%(run_spec)s
+run_spec "r1-m:m:120:none:"; echo "spec1=$?"
+run_spec "r2-m:m:120:none:"; echo "spec2=$?"
+""" % {
+        "helper": q(HELPER),
+        "analysis": q(ANALYSIS),
+        "R": q(e.R),
+        "RUN": q(e.RUN),
+        "fix": q(FIX),
+        "md5m": MD5["m"],
+        "md5s2": MD5["s2"],
+        "run_spec": m.group(0),
+    }
+    r = bash(stub)
+    out = r.stdout + r.stderr
+    assert "spec1=1" in r.stdout and "spec2=1" in r.stdout, out
+    tab = e.table()
+    assert [(x["label"], x["agree"], x["flag"]) for x in tab] == [
+        (P + "r1-m", "yes", "bad:check"),
+        (P + "r2-m", "yes", "bad:stop-fd"),
+    ], (tab, out)
+    assert e.flags() == [
+        "CELL-FLAG %sr1-m check" % P,
+        "CELL-FLAG %sr2-m stop-fd" % P,
+    ], e.flags()
+    assert [x[0] for x in e.pending()] == [P + "r1-m-rerun", P + "r2-m-rerun"]
+
+
+def test_template_cell_names_its_failures():
+    """every 'return 1' in cell() after the cell started either sits in the hard-check block (reason: check, the
+    run_spec default) or sets CELL_FAIL first, so the row names why the campaign failed the cell"""
+    t = open(TEMPLATE).read()
+    body = re.search(r"^cell\(\) \{.*?^\}\n", t, re.M | re.S).group(0)
+    after = body[body.index("STARTED_LABEL=$label") :]
+    hc0 = after.index("# >>> CAMPAIGN-SPECIFIC: per-cell hard checks")
+    hc1 = after.index("# <<< CAMPAIGN-SPECIFIC: per-cell hard checks")
+    for mm in re.finditer(r"return 1", after):
+        if hc0 < mm.start() < hc1:
+            continue
+        line = after[after.rfind("\n", 0, mm.start()) + 1 : mm.start()]
+        assert "CELL_FAIL=" in line, "return 1 without CELL_FAIL: %r" % line
+    run_spec = re.search(r"^run_spec\(\) \{.*?^\}\n", t, re.M | re.S).group(0)
+    assert "CELL_FAIL=" in run_spec, "run_spec must reset CELL_FAIL before each cell"
 
 
 def test_bash_syntax():

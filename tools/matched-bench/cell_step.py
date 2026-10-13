@@ -8,7 +8,7 @@ campaign's archived analysis on it, and appends one row to <RUN_DIR>/cells.tsv.
   cell_step.py record --run-dir RUN --cell-dir DIR --label LABEL --tag TAG --arm ARM --rep REP
                       --staged-md5 MD5 [--spec SPEC] [--rc-file F] [--campaign-log F]
                       [--analysis-cmd TEMPLATE] [--analysis-key TEMPLATE] [--analysis-metric KEY]
-                      [--analysis-timeout S]
+                      [--analysis-timeout S] [--extra-reasons R1,R2]
   cell_step.py pending-reruns --run-dir RUN
 
 cells.tsv (fixed contract): header written once, then one row per finished cell,
@@ -24,8 +24,10 @@ tab-separated:  label arm rep rc agree md5_ok metric flag
           headline.matched_s_avg, else 0 (no summary); plain number
   flag    ok | bad:<reason>[,<reason>...]   reasons, in this order:
           md5, no-summary, death (node-death.txt), rc-missing | rc=<n>, disagree |
-          agreement-<verdict>, verdict-<verdict> (rc 0 but not ACCEPT), analysis | analysis-timeout
-          (cell-step.sh's outer timeout writes bad:step-timeout itself)
+          agreement-<verdict>, verdict-<verdict> (rc 0 but not ACCEPT), the --extra-reasons (the campaign's
+          own failures of the cell: a failed hard check "check", a STOP site's reason), analysis |
+          analysis-timeout (cell-step.sh writes bad:step-timeout / bad:step-error itself when the step
+          ends without a row)
 
 Known artifacts (stay ok; named on stdout and in the evidence json):
   crash-gate-info-failstop-line  restart cell, rc 2: the crash gate counted the restarted node's INFO
@@ -51,7 +53,8 @@ Analysis check: --analysis-cmd is the campaign's archived analysis for one cell,
 Placeholders: {out} (RUN/cell-step/<label>.analysis.json), {prefix} (cell dir minus the tag, a-cells.py's
 PREFIX), {tag} {arm} {label} {cell} {run}. It must exit 0 within --analysis-timeout (default 600 s) and
 write a JSON object holding the key --analysis-key (default "{tag}"); with --analysis-metric, that row
-must carry a finite number under it. Anything else flags bad:analysis (timeout: bad:analysis-timeout;
+must carry a finite number under it. Anything else (an unparsable command, e.g. unbalanced quotes,
+included) flags bad:analysis (timeout: bad:analysis-timeout;
 the analysis process group is SIGKILLed). Output: RUN/cell-step/<label>.analysis.log. Policy: an
 analysis failure is a BAD cell (rerun queued): an end-of-campaign table must not silently lose the cell.
 If the analysis script itself is broken every cell flags bad:analysis — fix the script and re-run the
@@ -60,8 +63,9 @@ analysis by hand; the reruns can be skipped by emptying the queue before the cam
 Idempotency: a label that already has a row is refused (exit 3, "CELL-STEP DUPLICATE <label> ..." in the
 campaign log, nothing written). A rerun is a different label (<label>-rerun) and gets its own row.
 
-Exit: 0 ok row, 1 bad row, 2 usage / foreign cells.tsv header, 3 duplicate, 124 terminated (SIGTERM:
-the analysis child is killed first; cell-step.sh then writes the bad:step-timeout row).
+Exit: 0 ok row, 1 bad row, 2 usage / foreign cells.tsv header, 3 duplicate, 5 unexpected error (traceback on
+stderr; cell-step.sh then writes the bad:step-error row), 124 terminated (SIGTERM: the analysis child is
+killed first; cell-step.sh then writes the bad:step-timeout row).
 """
 
 import argparse
@@ -76,6 +80,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 
 HEADER = ("label", "arm", "rep", "rc", "agree", "md5_ok", "metric", "flag")
 QUEUE = "rerun-queue.tsv"
@@ -412,7 +417,12 @@ def run_analysis(a, cell, step_dir):
         "cell": cell_n,
         "run": os.path.normpath(a.run_dir),
     }
-    argv = [fill(t, ph) for t in shlex.split(a.analysis_cmd)]
+    try:
+        argv = [fill(t, ph) for t in shlex.split(a.analysis_cmd)]
+    except ValueError as e:  # e.g. "No closing quotation": a broken command is a failed analysis, not a lost row
+        return "fail", None, "cannot parse the analysis command %r: %s" % (a.analysis_cmd, e)
+    if not argv:
+        return "fail", None, "empty analysis command"
     t0 = time.time()
     with open(logp, "w") as lf:
         lf.write("# %s\n" % " ".join(shlex.quote(x) for x in argv))
@@ -502,6 +512,15 @@ def queue_rerun(run, a):
     return rl, True
 
 
+def extra_reasons(txt):
+    """--extra-reasons "check,stop-fd": the campaign's own failures of this cell, slugged, in order, deduped."""
+    out = []
+    for x in (txt or "").split(","):
+        if x.strip() and slug(x) not in out:
+            out.append(slug(x))
+    return out
+
+
 def record(a):
     run = a.run_dir
     for name, v in (
@@ -541,9 +560,19 @@ def record(a):
     summary = load_json(os.path.join(cell, "summary.json"))
     md5ok, md5ev = md5_check(cell, summary, a.staged_md5)
     reasons, artifacts, notes = judge(cell, summary, rc_num, md5ok)
+    for x in extra_reasons(a.extra_reasons):
+        if x not in reasons:
+            reasons.append(x)
     an_status, an_metric, an_detail = "skipped", None, "no --analysis-cmd"
     if a.analysis_cmd:
-        an_status, an_metric, an_detail = run_analysis(a, cell, step_dir)
+        try:
+            an_status, an_metric, an_detail = run_analysis(a, cell, step_dir)
+        except Exception as e:  # noqa: BLE001 — any analysis-path error flags the cell, the row is still written
+            an_status, an_metric, an_detail = (
+                "fail",
+                None,
+                "analysis step error %s: %s" % (type(e).__name__, e),
+            )
         if an_status == "fail":
             reasons.append("analysis")
         elif an_status == "timeout":
@@ -683,6 +712,7 @@ def main():
     r.add_argument("--analysis-key", default="{tag}")
     r.add_argument("--analysis-metric", default="")
     r.add_argument("--analysis-timeout", type=float, default=600.0)
+    r.add_argument("--extra-reasons", default="")
     p = sub.add_parser("pending-reruns")
     p.add_argument("--run-dir", required=True)
     a = ap.parse_args()
@@ -691,7 +721,11 @@ def main():
     if a.cmd == "record":
         if not (a.analysis_timeout > 0):
             die(2, "--analysis-timeout must be > 0")
-        return record(a)
+        try:
+            return record(a)
+        except Exception:  # noqa: BLE001 — distinct code; cell-step.sh writes the bad:step-error row
+            traceback.print_exc()
+            return 5
     return pending(a)
 
 

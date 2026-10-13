@@ -641,11 +641,11 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = abort
     [ "$kind" = none ] || E+=(CRASH_KILL_AT_S="$killat" KILL_SIG="$sig" KILL_WAIT=75)
     # <<< CAMPAIGN-SPECIFIC: per-cell samplers and the harness environment
     "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
-        "${E[@]}" "$HARNESS" "$WT_H" "$label" "$MK" "$dur" 76000 "$xe" || { stopbg "$EP" "$CP" "$TP" "$FP" "$IP" "$DP" "$KP" "$MP" "$LP" "$RP" "$WSP"; return 1; }
+        "${E[@]}" "$HARNESS" "$WT_H" "$label" "$MK" "$dur" 76000 "$xe" || { stopbg "$EP" "$CP" "$TP" "$FP" "$IP" "$DP" "$KP" "$MP" "$LP" "$RP" "$WSP"; CELL_FAIL=abort-detach; return 1; }
     until mp=$(systemctl --user show -p MainPID --value "$unit.service" 2>/dev/null) && [ -n "$mp" ] && [ "$mp" != 0 ] \
           && HP=$(pgrep -P "$mp" | head -1) && [ -n "$HP" ]; do
         sleep 0.2; t=$((t+1))
-        [ $t -gt 150 ] && { echo "ABORT: no run-cell.sh pid in $unit"; systemctl --user stop "$unit.service"; stopbg "$EP" "$CP" "$TP" "$FP" "$IP" "$DP" "$KP" "$MP" "$LP" "$RP" "$WSP"; return 1; }
+        [ $t -gt 150 ] && { echo "ABORT: no run-cell.sh pid in $unit"; systemctl --user stop "$unit.service"; stopbg "$EP" "$CP" "$TP" "$FP" "$IP" "$DP" "$KP" "$MP" "$LP" "$RP" "$WSP"; CELL_FAIL=abort-no-pid; return 1; }
     done
     echo "[$(date +%T)] $label unit=$unit main_pid=$mp harness_pid=$HP ($(cat /proc/$HP/comm 2>/dev/null))"
     watch_nodes "$R/$label" "$HP" & WP=$!
@@ -662,7 +662,7 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = abort
     if [ -e "$R/$label/node-death.txt" ]; then
         stopbg "$EP" "$CP" "$TP" "$FP" "$IP" "$LP" "$RP"
         echo "[$(date +%T)] CELL FAIL $label rc=$rc death: $(cat "$R/$label/node-death.txt") -> continuing"
-        sleep 5; [ -z "$(pgrep -x torus-node)" ] || { echo "ABORT: torus-node left running after $label"; return 1; }
+        sleep 5; [ -z "$(pgrep -x torus-node)" ] || { echo "ABORT: torus-node left running after $label"; CELL_FAIL=abort-node-left; return 1; }
         return 0
     fi
     wait "$EP" "$CP" "$TP" "$FP" "$IP" "$LP"
@@ -670,7 +670,9 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = abort
     echo "[$(date +%T)] END $label rc=$rc $(tail -1 "$R/$label.campaign.log")"
     grep -E 'Econ mix|In-flight cap|Cancel-by-id|WARNING: in-flight|crash gate: kill' "$R/$label/run.log" "$R/$label/bench.log" 2>/dev/null | sed "s/^/[$label] /" | head -20
     echo "[$label] $(fdsum "$label")" || true; fdsum "$label" > /dev/null || fdok=1
-    # >>> CAMPAIGN-SPECIFIC: per-cell hard checks (a CHECK FAIL stops the campaign after the cell's row is written)
+    # >>> CAMPAIGN-SPECIFIC: per-cell hard checks (a CHECK FAIL stops the campaign after the cell's row is written,
+    # flagged bad:check: run_spec passes "check" to the step for any `return 1` here; other failure sites after the
+    # start set CELL_FAIL=<reason> just before their `return 1`)
     if [ -s "$R/$label/node-environ-trie.txt" ]; then
         [ "$(grep -c "exe_md5=$nm" "$R/$label/node-environ-trie.txt")" = 3 ] || { echo "CHECK FAIL $label: node exe md5 != $nm"; return 1; }
         check "$label" "$CRASHCELL" || return 1
@@ -718,9 +720,9 @@ print("[ckpt]", " ".join("%s=%s"%(k,v) for k,v in walk(s) if "deferred_join" in 
     python3 -I "$POST" "$R/$label" "$arm" 2>&1 | sed "s/^/[$label] /"
     [ "$rc" = 0 ] || echo "CELL FAIL $label: run-cell rc=$rc -> recorded, continuing"
     if grep -q 'WARNING: in-flight block tail' "$R/$label/bench.log" 2>/dev/null; then
-        echo "[$(date +%T)] STOP: tail WARNING in capped cell $label"; return 1
+        echo "[$(date +%T)] STOP: tail WARNING in capped cell $label"; CELL_FAIL=stop-tail; return 1
     fi
-    if [ "$fdok" = 1 ]; then echo "[$(date +%T)] STOP: a node held > $FD_STOP open fds in $label"; return 1; fi
+    if [ "$fdok" = 1 ]; then echo "[$(date +%T)] STOP: a node held > $FD_STOP open fds in $label"; CELL_FAIL=stop-fd; return 1; fi
     return 0
 }
 
@@ -779,13 +781,16 @@ echo "[$(date +%T)] PREFLIGHT OK CAMP=$CAMP harness=${SHA_HARNESS:0:8} s2=${BSHA
 
 run_spec() { # SPEC [SUFFIX]: one cell, then its write-up step, in sequence (the next cell starts only after the step
     # returned). SUFFIX "-rerun" = the queued rerun of a bad cell. Returns cell()'s code: 0 = go on, 1 = stop the campaign.
-    local spec=$1 sfx=${2:-} tg arm dur kind killat label crc
+    # A started cell that cell() failed (return 1: CHECK FAIL, a post-start ABORT, a STOP) is passed to the step as
+    # bad:<CELL_FAIL, default check>, so its row is flagged with a CELL-FLAG line and a queued rerun.
+    local spec=$1 sfx=${2:-} tg arm dur kind killat label crc xr=
     IFS=: read -r tg arm dur kind killat <<< "$spec"
     tg=$tg$sfx; label=$P-$tg
-    STARTED_LABEL=
+    STARTED_LABEL= CELL_FAIL=
     cell "$tg" "$arm" "$dur" "$kind" "$killat"; crc=$?
     if [ "$STARTED_LABEL" = "$label" ]; then
-        cell_step "$RUN" "$R/$label" "$label" "$tg" "$arm" "${tg%%-*}" "${BMD5[${ABIN[$arm]}]}" "${spec}"
+        [ "$crc" = 0 ] || { xr=${CELL_FAIL:-check}; echo "[$(date +%T)] $label failed the campaign (cell rc $crc): step flags it bad:$xr"; }
+        cell_step "$RUN" "$R/$label" "$label" "$tg" "$arm" "${tg%%-*}" "${BMD5[${ABIN[$arm]}]}" "${spec}" "$xr"
     else
         echo "[$(date +%T)] $label did not start: no cells.tsv row"
     fi
