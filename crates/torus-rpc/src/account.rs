@@ -807,6 +807,91 @@ mod tests {
         );
     }
 
+    /// t (addr 1) with raw `cash` and one cross position in listed market 1
+    /// (size `size`, raw entry `entry`); no mark (the shocked market's price
+    /// is the variable).
+    fn raw_account(
+        cash: i128,
+        long: bool,
+        size: FixedPoint,
+        entry: i128,
+    ) -> (tempfile::TempDir, NativeExecContext, Address) {
+        let (d, db) = test_db(&[1]);
+        let ctx = ctx_of(&db);
+        let t = addr(1);
+        fund(&ctx, &t, FixedPoint::from_raw(cash));
+        ctx.positions
+            .apply_fill(
+                &t,
+                1,
+                long,
+                size,
+                FixedPoint::from_raw(entry),
+                MarginType::Cross,
+            )
+            .unwrap();
+        (d, ctx, t)
+    }
+
+    /// The liquidation step's verdict on t with market 1 marked at `px`
+    /// (default tiers): `None` when the valuation overflows (the step skips
+    /// the account).
+    fn health_at(ctx: &NativeExecContext, t: &Address, px: FixedPoint) -> Option<Health> {
+        let bal = ctx.positions.get_native_balance(t).unwrap();
+        let positions = ctx.positions.positions_for_trader(t).unwrap();
+        AccountView::build(&bal, &positions, |_| Some(px), |_| None)
+            .ok()
+            .and_then(|v| classify(&v))
+    }
+
+    /// Codex R1 P2 (account.rs:217): an overflowing valuation is
+    /// indeterminate, not healthy.
+    /// - short 3 @ MAX/4, cash MAX/10: healthy at 0, valued up to mark
+    ///   MAX/3 (notional 3P), crossing at 0.2764 MAX; the first doubling
+    ///   (MAX/2) overflows. The price is the highest healthy raw mark;
+    /// - long 2 @ 0.45 MAX, cash −MAX/10: liquidatable at every mark the
+    ///   step can value (up to MAX/2), overflow above. No valid valuation
+    ///   is healthy, so there is no price (not the overflow edge).
+    #[test]
+    fn cross_liquidation_price_overflow_is_indeterminate_not_healthy() {
+        let max = i128::MAX;
+        let (_d, ctx, t) = raw_account(max / 10, false, fp(3), max / 4);
+        let p = liq_price(&ctx, &t, 1).expect("crossing below the overflow");
+        assert_eq!(
+            p,
+            FixedPoint::from_raw(47_030_896_241_105_316_088_433_888_832_033_004_834)
+        );
+        assert_eq!(health_at(&ctx, &t, p), Some(Health::Healthy));
+        assert!(health_at(&ctx, &t, p + one_raw()).is_some_and(|h| h != Health::Healthy));
+
+        let (_d, ctx, t) = raw_account(-(max / 10), true, fp(2), max / 20 * 9);
+        let last = FixedPoint::from_raw(max / 2);
+        assert!(health_at(&ctx, &t, last).is_some_and(|h| h != Health::Healthy));
+        assert_eq!(health_at(&ctx, &t, last + one_raw()), None, "overflow");
+        assert_eq!(liq_price(&ctx, &t, 1), None, "no healthy valid mark");
+    }
+
+    /// Codex R1 P2 (account.rs:234): when doubling overflows i128 the search
+    /// still checks the rest of the range up to MAX. Short 1 @ raw 1, cash
+    /// 3 MAX/4: healthy at 0, Adl at MAX, crossing at 0.7317 MAX (above the
+    /// last power of two, 2^126).
+    #[test]
+    fn cross_liquidation_price_searches_up_to_the_max_mark() {
+        let max = i128::MAX;
+        let (_d, ctx, t) = raw_account(max / 4 * 3, false, fp(1), 1);
+        assert_eq!(
+            health_at(&ctx, &t, FixedPoint::from_raw(max)),
+            Some(Health::Adl)
+        );
+        let p = liq_price(&ctx, &t, 1).expect("crossing between 2^126 and MAX");
+        assert_eq!(
+            p,
+            FixedPoint::from_raw(124_493_548_873_514_071_998_795_588_084_793_248_092)
+        );
+        assert_eq!(health_at(&ctx, &t, p), Some(Health::Healthy));
+        assert!(health_at(&ctx, &t, p + one_raw()).is_some_and(|h| h != Health::Healthy));
+    }
+
     /// Without a block time the other positions are valued at entry (as
     /// `account_figures`); the shocked market's price is the variable, so
     /// a single long has the same price as with a mark.
