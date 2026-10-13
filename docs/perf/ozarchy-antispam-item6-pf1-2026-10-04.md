@@ -7914,6 +7914,231 @@ lines (hardscan ran on all 13 cells and both smoke cells). The archived copy her
 `ozarchy-p3gate-build.sh`, `matched-bench/crash-kill.sh` (p3term's; the rest of the run's `matched-bench/` copy is
 `c88d3073`'s `tools/matched-bench` byte for byte), md5s `md5s-all.txt`.
 
+## 62. Phase 3 SIGKILL restart gate, step 2 `c88d3073` vs main `de1a97c1` (4 SIGKILLs per arm, state hash on), and a jemalloc decay soak pair on `c88d3073` (defaults vs `background_thread:true,dirty_decay_ms:1000`), commit-tail mode (campaign ozarchy-p3kd, 2026-10-13)
+
+**The SIGKILL restart gate passes in both arms; the jemalloc decay setting removes most of the soak RSS gap from section 61.**
+Requested by 18c after section 61. The owner (s118, via 18c) accepted the RAM gate on the live heap (section 61.4
+suggestion 1, option a). Phase 3 merges once the SIGKILL restart gate passes on `c88d3073`. Section 61 measured restart
+on SIGTERM only.
+
+| gate (section 1 of `item6-phase3-impl.md`) | target | measured | result |
+|---|---|---|---|
+| restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | SIGKILL val1 under load, 2 cells x 2 kills per arm (ABBA), state hash on. Kill -> val1's first commit after the restart: **s2 22.3 / 28.4 / 29.5 / 39.5 s (mean 29.9, max 39.5)**; m 32.0 / 25.3 / 21.8 / 29.5 s (mean 27.2, max 31.95). Replay from the durable marker + 1, contiguous, in all 8 kills | **PASS** (both arms) |
+| RAM (owner: judged on the live heap) | Phase 3 delta <= ~1 GB per node, levels off | not re-measured as s2 vs m here. Section 61: live heap +0.50-0.56 GB per node, does not grow. Part B below: with the decay setting, s2's soak RSS equals section 61's main soak (-0.03 GiB per node, cross-session) | accepted by the owner (s118) |
+
+**Part B (not a gate):** same s2 binary, 600 s soak, jemalloc defaults vs `MALLOC_CONF=background_thread:true,dirty_decay_ms:1000`.
+RSS per node (minutes 5-10 mean) drops **6.25 -> 4.53 GiB (-1.72)** and the peak 6.91 -> 5.19 GiB. jemalloc resident -
+allocated drops 2.35 -> 0.67 GiB. Live allocations are unchanged (3.46 -> 3.49 GiB). RSS levels off in both cells. Cost,
+n = 1 per arm: node CPU-s/1M **+4.6%** (24.47 -> 25.60), matched/s -2.5%, native blocks/s +2.6%. The setting is an
+environment variable, not compiled in (see 62.4).
+
+**Setup.** Binaries are reused from the p3gate stage, not rebuilt: **s2** = `feat/item6-phase3-step2` `c88d3073` (node
+`4e0d8b84`, bench `ae96e0c1`) with `TORUS_CHECKPOINT_INTERVAL_MS=15000`; **m** = main `de1a97c1` (node `f1081574`, bench
+`42365459`), knob unset. Both have jemalloc compiled in (preflight nm: 1,168 jemalloc symbols in each node). The rest is
+as section 61: CLOID_SHARE=0, full workload, tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900,
+saturated, commit tail, shared NVMe, btrfs data dirs. Harness = the `c88d3073` worktree. Tools = p3gate's
+`matched-bench` copy (c88d3073's plus p3term's `crash-kill.sh`), byte for byte. Driver `ozarchy-p3kd-campaign.sh` CAMP=KD
+(copy of `ozarchy-p3gate-campaign.sh`).
+* **Part D (restart):** cells d1-s2-KILL, d1-m-KILL, d2-m-KILL, d2-s2-KILL (ABBA), 300 s each. SIGKILL of val1 at bench + 60
+  / 180 s (d1) and + 65 / 187 s (d2), the first two offsets of section 46's two sets. KILL_WAIT 60 s. As section 46:
+  `STATE_HASH_ACTIVATION=1`, 1 s checkpoint / head / state-hash gauge samples, and `torus_getStateHash` read at every
+  retained 100-block checkpoint on each validator.
+* **Part B (soak):** k1-s2def (s2, `MALLOC_CONF` unset = jemalloc defaults) then k1-s2dec (s2 + `MALLOC_CONF` on all 3
+  nodes), 600 s each, state hash off, workload as p3gate's k1 cells.
+* **jemalloc proof:** the binary is tikv-jemallocator built unprefixed (nm: `T malloc`, `V malloc_conf`), so it reads
+  `MALLOC_CONF`, not `_RJEM_MALLOC_CONF`. Preflight: `MALLOC_CONF=...,stats_print:true torus-node --version` prints
+  `opt.background_thread: true`, `opt.dirty_decay_ms: 1000` (`jeconf-proof.txt`); the defaults print `false` / 10000,
+  `muzzy_decay_ms` 0, `narenas` 128 (`jeconf-default.txt`). Live check in each cell: `MALLOC_CONF` in each node's
+  `/proc/<pid>/environ` (`node-preload.txt`), and 4 `jemalloc_bg_thd` threads per node in k1-s2dec vs 0 in every other
+  cell (`node-jethreads.txt`).
+* **Timing and checks:** smoke 18:56-19:05 (s0-m-KILL, 120 s, one SIGKILL at 40 s; s0-s2dec, 60 s). Cells 19:07-20:17: w0
+  (s2, 60 s, excluded), then Part D, then Part B. 134 CHECK OK (+38 in the smoke), no CHECK FAIL, no memguard stop, 0 `HARD
+  FINDING` lines. The host was quiet before every cell (no cargo / rustc / rust-analyzer, 1-min load 1.70-1.88).
+
+**Validity.** w0 and k1-s2def: rc 0, ACCEPT, AGREE. The 4 kill cells are rc 2 REJECT, all from known artifacts; they are
+used for their restart measurements.
+* **Crash gate:** the restart-tail scan matches the INFO config echo `running state hash fail-stop
+  (TORUS_STATE_HASH_FAILSTOP) on=false` once per restart (8 of 8 tails; no WARN / ERROR panic or fail-stop line). On s2 it
+  also reports "rewind N blocks beyond the exec queue (max 2)". That is the Phase 3 design: replay from the last checkpoint
+  (section 46.3).
+* **Digests:** d1-m-KILL and d2-s2-KILL are DISAGREE, the mark-only digest artifact (sections 46.4, 61). 50 account lines
+  differ in `accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed` and `withdrawable` only. The odd
+  node's digest was the fast one: val2 21.5 s vs 69.8 / 39.9 s; val1 18.3 s vs 69.1 / 70.5 s.
+* **Dissemination:** d1-m-KILL also has "dissemination failures": val2 logged one exhausted body fetch, recovered by sync
+  fallback.
+* **k1-s2dec** is rc 2 REJECT DISAGREE on agreement only, the same mark-only artifact. val2's digest took 17.9 s vs 86.5 /
+  87.0 s; the 5 mark fields differ on 50 lines; block hash equal; liveness PASS. Its soak measurements are used.
+
+Smoke: s0-m-KILL rc 2 (the same INFO line); s0-s2dec ACCEPT AGREE with 4 bg threads per node.
+
+### 62.1 SIGKILL restart, 4 kills per arm (`restart.txt`, `a-kill.txt`, `kills.json`)
+
+| cell | kill | height at kill (exec queue) | down s | marker A ; committed C | replayed (C - A) | first replayed, contiguous | DB open s | replay s (blocks/s) | restart -> val1 first commit s | **kill -> val1 first commit s** | kill -> chain commit s | restart -> rejoin s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| d1-s2 | k1 | 707 (65) | 0.35 | 700 ; 772 | 72 | 701, yes | 3.24 | 17.89 (4.03) | 21.93 | **22.28** | 21.85 | 21.48 |
+| d1-s2 | k2 | 1,213 (61) | 0.33 | 1,200 ; 1,274 | 74 | 1,201, yes | 3.46 | 23.83 (3.10) | 28.05 | **28.38** | 28.03 | 27.55 |
+| d1-m | k1 | 658 (65) | 0.23 | 658 ; 723 | 65 | 659, yes | 3.97 | 26.97 (2.41) | 31.72 | **31.95** | 31.54 | 31.35 |
+| d1-m | k2 | 1,112 (61) | 0.35 | 1,112 ; 1,173 | 61 | 1,113, yes | 3.47 | 21.38 (2.85) | 24.99 | **25.34** | 25.60 | 25.77 |
+| d2-m | k1 | 666 (64) | 0.26 | 666 ; 730 | 64 | 667, yes | 1.76 | 19.64 (3.26) | 21.52 | **21.78** | 22.02 | 22.36 |
+| d2-m | k2 | 1,077 (61) | 0.33 | 1,077 ; 1,139 | 62 | 1,078, yes | 3.99 | 25.09 (2.47) | 29.21 | **29.54** | 0.34 ¹ | 29.85 |
+| d2-s2 | k1 | 633 (65) | 0.33 | 600 ; 698 | 98 | 601, yes | 2.71 | 26.32 (3.72) | 29.15 | **29.48** | 29.72 | 30.12 |
+| d2-s2 | k2 | 1,053 (60) | 0.36 | 1,000 ; 1,113 | 113 | 1,001, yes | 3.71 | 35.26 (3.20) | 39.11 | **39.47** | 39.96 | 39.17 |
+
+¹ Artifact of the chain measure (`crash-freeze.py`: kill -> val0's first commit after the restart). val0 committed 0.01 s
+after val1's restart. The gate uses val1's own first commit. On the chain measure (section 61's basis) s2 is 29.9 / 40.0 s
+mean / max; m is 26.4 / 31.5 s without this kill.
+
+| arm (n kills) | kill -> val1 first commit mean / max s | replayed blocks mean / max | replay blocks/s mean | DB open mean / max s | result |
+|---|---|---|---|---|---|
+| **s2** `c88d3073` (4) | **29.9 / 39.5** | 89 / 113 | 3.5 | 3.28 / 3.71 | **PASS** (<= 60 s) |
+| **m** `de1a97c1` (4) | **27.2 / 31.95** | 63 / 65 | 2.7 | 3.30 / 3.99 | **PASS** |
+| section 46 s (step 1 `a44bdde6`, 15 s), SIGKILL (8) | 14.0 / 22.8 | 92 / 162 | 13.1 | | PASS |
+| section 46 o (`a44bdde6`, knob unset), SIGKILL (8) | 14.1 / 16.6 | 49 / 65 | 5.1 | | PASS |
+
+The section 46 rows are recomputed by `a-tables.py` from p3r1's `kills.json` with the same definition (down + restart ->
+val1's first commit). Section 46.3's table gives kill -> first chain commit: 14.4 / 23.2 s for s, 14.3 / 16.9 s for o.
+
+* **Gate met in all 8 kills**, max 39.5 s (d2-s2 k2, the 113-block replay). s2 is 2.7 s slower than m on the mean, from
+  longer replays (89 vs 63 blocks); n = 4 per arm, no CI.
+* **What sets the replay** (as section 46.3). On m the marker A trails the committed height by the exec queue at the kill:
+  61-65 blocks replayed, the queue was 61-65. On s2, A is the last 100-block checkpoint (700, 1,200, 600, 1,000), so the
+  replay is the queue plus the blocks since that checkpoint (7 / 13 / 33 / 53 beyond the queue).
+* **About 2x section 46's times, in both arms.** The replay runs at 2.4-4.0 blocks/s here vs 13.1 (s) / 5.1 (o) blocks/s
+  in section 46. That is the workload. These cells run 221-246 transactions per native block (summary headline,
+  whole cell) at 3.3-4.3 blocks/s; p3r1's SIGKILL cells ran 76-143 per block at 5.9-10.9 blocks/s. The replay rate is
+  about one block per exec time per block in these cells (exec p50 309-350 ms, `cells.txt`). m is as slow (2.7 blocks/s),
+  so this is not Phase 3.
+* **Down** 0.23-0.36 s (patched `crash-kill.sh`, 0.1 s polling; section 46: 1.0 s with 1 s polling). **DB open** 1.8-4.0 s.
+  **Rejoin** 21-39 s after the restart, about when val1 first commits.
+
+### 62.2 Restart correctness: no finding (`a-kill.txt`)
+
+* **Per kill (8 of 8):** A <= C. The replay starts at A + 1 and covers A+1..C exactly once (contiguous). A >= the durable
+  state-hash height sampled in the last 1 s before the kill (`marker_lo`). No flag on any kill.
+* **State-hash checkpoints:** `localHash` was read at every retained 100-block checkpoint on all 3 validators: 122
+  heights in the 4 cells (34 / 33 / 25 / 30; up to height 3,400). 121 have all 3 validators; d2-m-KILL has one height
+  with 2. **0 disagreements**, including the heights val1 re-executed after each restart.
+* **End of cell:** block hash equal in all 4 cells. The digest DISAGREE in d1-m / d2-s2 is mark-only (above). No `HARD
+  FINDING` line (hardscan ran on every cell; `a-kill.py` reads p3kd's own `campaign.log`).
+* **Other:** d2-m-KILL has nonce-expired evictions 0 / 17 / 71 (val0 / val1 / val2); every other cell has 0. Three kill
+  cells show 6-10 executed-action failures per node, equal on val0 / val2 (val1's counter restarts). The soak cells show
+  0. Neither is analysed: the kill cells' throughput is not a measurement.
+
+### 62.3 jemalloc decay soak pair, s2 `c88d3073`, 600 s, one cell each (`soak.txt`, `series.txt`)
+
+![RSS and jemalloc allocated per node: defaults vs decay setting, and against p3gate's soaks](ozarchy-p3kd-figs/fig-rss.png)
+
+*Figure 62-1: VmRSS (solid) and `torus_jemalloc_allocated_bytes` (dashed) per node, 5 s samples. Row 1: def (red) vs dec
+(blue). Row 2: def vs p3gate's k1-s2 (gs2, green; same binary, cross-session). Row 3: dec vs p3gate's main k1-m (gm,
+grey; cross-session).*
+
+| cell | node | RSS mean min 5-10 MB | end MB | peak MB | RSS slope last 5 min MB/min (95% CI) | je allocated MB | je resident MB | je retained MB | exec queue (min 5-10) |
+|---|---|---|---|---|---|---|---|---|---|
+| def | val0 | 5,730 | 5,413 | 6,601 | -7.8 [-44.2, +28.6] | 3,501 | 5,270 | 4,823 | 56.6 |
+| def | val1 | 6,497 | 6,331 | 6,910 | -11.9 [-55.2, +31.3] | 3,507 | 6,070 | 5,415 | 59.3 |
+| def | val2 | 6,964 | 6,401 | 7,704 | +6.9 [-43.3, +57.0] | 3,629 | 6,529 | 5,673 | 65.4 |
+| dec | val0 | 4,569 | 4,611 | 5,180 | +3.3 [-49.1, +55.8] | 3,598 | 4,195 | 6,882 | 65.3 |
+| dec | val1 | 4,514 | 4,876 | 5,084 | +7.4 [-53.8, +68.6] | 3,499 | 4,131 | 6,690 | 58.1 |
+| dec | val2 | 4,840 | 4,911 | 5,690 | -14.3 [-71.0, +42.4] | 3,625 | 4,468 | 7,496 | 63.5 |
+
+jemalloc columns are the minutes 5-10 mean of the 5 s gauges. `retained` is address space kept mapped but returned to
+the OS (not in RSS). Deltas below are from `series.txt` (GB there = MB / 1024 = GiB, as in section 61): mean min 5-10 /
+at 10 min / peak per node, and the slope of the difference series over the last 5 min.
+
+| delta | val0 | val1 | val2 | mean of 3 |
+|---|---|---|---|---|
+| **dec - def RSS** | -1.13 / -0.78 / -1.39; -1.9 [-73.9, +70.0] | -1.94 / -1.42 / -1.78; +7.6 [-82.6, +97.9] | -2.07 / -1.46 / -1.97; -34.7 [-132.1, +62.7] | **-1.72 / -1.22 / -1.71** |
+| dec - def je allocated (min 5-10) | +0.10 | -0.01 | -0.00 | |
+| dec - def je resident (min 5-10) | -1.05 | -1.89 | -2.01 | |
+| dec - def je retained (min 5-10, not in RSS) | +2.01 | +1.24 | +1.78 | |
+| dec - def non-heap (RSS - je resident) | -0.08 | -0.04 | -0.06 | |
+| def - gs2 RSS (p3gate s2, cross-session) | -0.29 / -0.45 / -0.09 | +0.91 / +1.06 / +0.66 | +0.12 / -0.70 / +0.36 | +0.25 / -0.03 / +0.31 |
+| dec - gm RSS (p3gate main, cross-session) | +0.15 / +0.08 / +0.56 | +0.18 / +0.52 / +0.53 | -0.43 / -0.40 / +0.10 | **-0.03 / +0.06 / +0.40** |
+| dec - gm je allocated (min 5-10) | +0.60 | +0.52 | +0.54 | |
+
+| metric (whole 600 s cell) | def | dec | dec vs def | gs2 (p3gate s2) | gm (p3gate m) |
+|---|---|---|---|---|---|
+| RSS mean min 5-10 / peak GiB per node (`soak.txt`) | 6.25 / 6.91 | 4.53 / 5.19 | -1.72 / -1.71 | 6.00 / 6.60 | 4.57 / 4.80 |
+| je allocated / resident / resident - allocated GiB | 3.46 / 5.82 / 2.35 | 3.49 / 4.16 / 0.67 | | 3.47 / 5.58 / 2.11 | 2.94 / 4.11 / 1.17 |
+| matched/s | 217,605 | 212,075 | -2.5% | 219,139 | 193,398 |
+| matched/s minutes 0-2 / 2-6 / 6-10 (val0 counter) | 210,278 / 221,468 / 217,519 | 207,428 / 215,692 / 210,248 | | 210,202 / 223,560 / 218,481 | 201,679 / 191,823 / 190,516 |
+| native blocks/s | 2.95 | 3.02 | +2.6% | 2.97 | 2.61 |
+| node CPU-s/1M fills | 24.47 | 25.60 | **+4.6%** | 24.46 | 27.93 |
+| block time p50 / p99 ms (mean of nodes, `cells.json`) | 239 / 1,398 | 230 / 1,425 | -3.8% / +1.9% | 237 / 1,473 | 275 / 1,196 |
+| exec ms per block (minutes 5-10, per node) | 375-379 | 384-386 | +2.1% | 371-375 | 423-426 |
+| settle wait ms per native block (summary phase) | 9.2 | 8.9 | | 9.0 | n/a |
+
+* **Full workload in both cells.** 0 nonce-expired evictions, 0 margin rejections, 0 action failures, 0 bench in-flight
+  timeouts. Cancel-alls sent / executed: def 234,445 / 234,442, dec 236,764 / 236,749. The exec queue is at its ~66 cap
+  in both (minutes 5-10 mean 57-65), so the exec backlog is not a confound. 48-49 checkpoints per node, layer 196-203 MB
+  mean per checkpoint.
+* **What the setting does:** live allocations are unchanged (+0.10 / -0.01 / -0.00 GiB per node). jemalloc returns dirty
+  pages within ~1 s from its background threads instead of keeping them for 10 s. Resident drops by 1.05-2.01 GiB per
+  node and retained (mapped, not in RSS) rises by about as much. Non-heap RSS is equal.
+* **Levels off** in both cells: every per-node last-5-min slope is within +-15 MB/min, with CIs spanning 0.
+  The dec - def difference slopes all include 0.
+* **Cost (n = 1 per arm, no CI):** node CPU-s/1M +4.6%, matched/s -2.5% (minutes 6-10 -3.3%), native blocks/s +2.6%,
+  exec ms per block +2.1%. For scale, the default cell repeated p3gate's s2 soak (same binary, other session) to within
+  +0.1% CPU-s/1M and -0.7% matched/s. Its RSS was +0.25 GiB per node higher on the mean (val1 +0.91), so cross-session
+  RSS varies by a few tenths of a GiB. That is small next to the -1.72 effect, but a CPU cost of a few percent is not
+  resolved by one cell per arm.
+* **Against section 61's main soak** (gm, cross-session, rough): tuned s2 RSS is -0.03 GiB per node on the mean and +0.40
+  on the peak. CPU-s/1M is -8.4% and matched/s +9.7%. The live heap is still +0.52-0.60 GiB above main (61: +0.50-0.56).
+  So with this setting, Phase 3's soak RSS delta is about its live heap, inside the ~1 GB bound, mean and peak.
+
+![per node per minute: expiry, cancel-alls, margin rejections, matched/s, book, exec queue / busy / ms per block, je overhead, layer, flush queue](ozarchy-p3kd-figs/fig-node.png)
+
+*Figure 62-2: per node (columns), per minute: nonce-expired evictions, cancel-alls executed/s, margin-rejected orders/s,
+matched/s, resting orders, exec queue depth, exec busy, exec ms per block, jemalloc resident - allocated, layer MB per
+checkpoint and flush-worker depth. def red, dec blue, gs2 green dashed, gm grey dashed.*
+
+### 62.4 Verdict
+
+* **Restart gate (SIGKILL val1, multi-crash cells): PASS** on `c88d3073`. Kill -> val1's first commit was 29.9 s mean /
+  39.5 s max over 4 kills (m 27.2 / 31.95), with replay complete and contiguous from the marker. 121 of 122 state-hash
+  checkpoints were read on all 3 validators, with 0 disagreements. This completes the restart line that section 61 left at
+  "SIGTERM only". With the owner's live-heap RAM decision, every Phase 3 gate is now met.
+* **Times are about 2x section 46's** because of the replay rate at this workload, not Phase 3: m is as slow.
+  s2's longer replays (from the last 100-block checkpoint) add ~3 s on the mean.
+* **jemalloc decay:** `background_thread:true,dirty_decay_ms:1000` cuts s2's soak RSS by 1.72 GiB per node (mean) and
+  1.71 GiB (peak), to main's level. The cost is +4.6% CPU-s/1M and -2.5% matched/s, from one cell per arm.
+* **Caveats:**
+  * One soak cell per arm, so no CI.
+  * The setting is an environment variable; nothing is compiled in. A compiled default (e.g. a `malloc_conf` symbol, or
+    the tikv-jemallocator build configuration) is a suggestion for 18c, not done or measured.
+  * Main was not run with the setting.
+
+Analysis (`tools/ozarchy-p3kd-tools/analyst/`):
+* `a-cells.py`: p3gate's, per cell -> `cells.json`, stdout `cells.txt`.
+* `a-kill.py`: p3gate's `a-term.py` with the p3kd paths -> `a-kill.txt` on stdout, `kills.json`.
+* `a-series.py`: p3gate's, with the cells def / dec / gs2 / gm -> `series.txt`, `series.json`, the figures (SVG -> PNG
+  via `rsvg-convert`).
+* `a-tables.py`: `restart.txt` from `kills.json` and p3r1's `kills.json`; `soak.txt` from `series.json`, `cells.json`
+  and p3gate's `cells-soak.json`.
+* `a-archive.py`.
+
+The analyst's `a-kill.py` writes `kills.json` to `ozarchy-p3kd-run/` (not `analyst/`). The archived copies of `a-kill.py`
+and `a-tables.py` differ from the analyst's in one way only: optional output paths (`a-kill.py --kills PATH`;
+`a-tables.py [OUTDIR [KILLS]]`). With no arguments they use the analyst's paths, so the archive smoke check can run them
+without writing into the run dir. **Re-run check for this write-up:** the archived scripts, run in a scratch dir against
+the cells, reproduce byte for byte:
+* `cells.txt` and `cells.json` (all 7 cells);
+* `a-kill.txt` and `kills.json`;
+* `series.txt`, `series.json` and both SVGs;
+* `restart.txt`.
+
+`soak.txt` matches in every number; only its header label differs ("per node GiB" in the analyst's file, "GB" from the
+script; the values are MB / 1024). The archive's smoke entries (`meta/p3kd.toml`) rerun `a-cells.py` on the two soak
+cells, `a-kill.py` on the 4 kill cells, `a-series.py` and `a-tables.py`, and diff them against `cells.txt`, `a-kill.txt`,
+`series.txt`, `restart.txt` and `soak.txt`. `restart.txt` / `soak.txt` read p3r1's `kills.json` and p3gate's
+`cells-soak.json`, which stay on ozarchy.
+
+The run dir also holds `jeconf-proof.txt` / `jeconf-default.txt` (the stats_print proof) and the smoke log. The two
+jeconf files (~0.5 MB of allocator statistics) are not copied into the archive; the option lines are quoted in this
+section. Full outputs
+are in `ozarchy-p3kd-run/analyst/` on ozarchy. The driver is `tools/ozarchy-p3kd-tools/ozarchy-p3kd-campaign.sh`. The
+`matched-bench/` copy is p3gate's (`crash-kill.sh` archived again, the rest is `c88d3073`'s).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

@@ -1,0 +1,18 @@
+Part D: SIGKILL of val1 under load, kill -> val1 first commit = down_s + restart->val1 'on_committed_block: sending' (gate <= 60 s)
+chain = kill -> val0's first commit after the restart (crash-freeze.py); A = durable applied marker, C = committed at restart, gap = replayed blocks
+cell        k  pre_h  q | A     C     gap first contig | dbopen replay(s) blk/s | kill->v1commit kill->chain rejoin | flags
+d1-s2-KILL  k1   707  65 |   700   772  72   701 True |  3.24  17.89  4.03 |  22.28  21.85  21.48 | -
+d1-s2-KILL  k2  1213  61 |  1200  1274  74  1201 True |  3.46  23.83  3.10 |  28.38  28.03  27.55 | -
+d1-m-KILL   k1   658  65 |   658   723  65   659 True |  3.97  26.97  2.41 |  31.95  31.54  31.35 | -
+d1-m-KILL   k2  1112  61 |  1112  1173  61  1113 True |  3.47  21.38  2.85 |  25.34  25.60  25.77 | -
+d2-m-KILL   k1   666  64 |   666   730  64   667 True |  1.76  19.64  3.26 |  21.78  22.02  22.36 | -
+d2-m-KILL   k2  1077  61 |  1077  1139  62  1078 True |  3.99  25.09  2.47 |  29.54   0.34  29.85 | -
+d2-s2-KILL  k1   633  65 |   600   698  98   601 True |  2.71  26.32  3.72 |  29.48  29.72  30.12 | -
+d2-s2-KILL  k2  1053  60 |  1000  1113 113  1001 True |  3.71  35.26  3.20 |  39.47  39.96  39.17 | -
+
+p3kd s2                                n=4 kill->v1commit mean 29.9 max 39.5 | gap mean 89 max 113 | replay blk/s mean 3.5 | PASS
+p3kd m                                 n=4 kill->v1commit mean 27.2 max 31.9 | gap mean 63 max 65 | replay blk/s mean 2.7 | PASS
+section 46 s (a44bdde6, 15 s) all 8    n=8 kill->v1commit mean 14.0 max 22.8 | gap mean 92 max 162 | replay blk/s mean 13.1 | PASS
+section 46 s (a44bdde6, 15 s) k1+k2 only n=4 kill->v1commit mean 12.7 max 14.8 | gap mean 92 max 117 | replay blk/s mean 15.3 | PASS
+section 46 o (a44bdde6, unset) all 8   n=8 kill->v1commit mean 14.1 max 16.6 | gap mean 49 max 65 | replay blk/s mean 5.1 | PASS
+section 46 o (a44bdde6, unset) k1+k2 only n=4 kill->v1commit mean 14.2 max 16.0 | gap mean 54 max 65 | replay blk/s mean 5.4 | PASS
