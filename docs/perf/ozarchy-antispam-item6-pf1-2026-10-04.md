@@ -6638,6 +6638,109 @@ all soak cells incl. 53 / 53b / 53c; figures SVG -> PNG via `rsvg-convert`), `a-
 `a-archive.py`. Outputs `series.txt`, `margin.txt`. Full outputs (incl. `series.json`, SVGs) in `ozarchy-p3fsoak-run/analyst/`
 on ozarchy. Driver and the jcs2 wrapper: `tools/ozarchy-p3fsoak-tools/`.
 
+## 54. Phase 3 merge-wait fix: `3cf8f72d` vs step 2 `7b006739`, both at 15 s, glibc, commit-tail mode (campaign ozarchy-p3mw, 2026-10-13)
+
+**The exec thread no longer waits for the whole previous layer merge. `checkpoint_settle_wait` falls from 23.4 to 3.1 ms
+per native block (-20.3 ms [-20.9, -19.6], paired, n = 4; p99 per observation 95 -> 16 ms). No read blocks on the
+deferred part (`torus_exec_checkpoint_deferred_read_waits` 0 on every node of every mw cell), and the end-of-block join
+of the deferred part costs 0.19 ms per native block, inside upkeep. Exec `block_ms` falls by about the same amount (-18.0 ms,
+-6.9% [-11.3, -2.5]), and native blocks/s rises +11.3% [+8.4, +14.1].** matched/s is a tie (+1.8% [-1.9, +5.4]): the
+extra blocks are smaller (fills per native block -4.4% [-9.4, +0.6]). Block time p99 is a tie (-2.9% [-10.2, +4.3]),
+p50 is down 12.7% [-15.5, -10.0]. RSS is neutral (peak -0.12 GB [-0.35, +0.12]). Node CPU-s/1M is +1.35% [+0.09, +2.61]:
+small, just resolved in the paired test and not at equal fills (+1.1% [-3.0, +5.3]). It is consistent with the per-block
+cost of 11% more, smaller blocks, but that is not established here. All 8 measured cells pass every hard check. 3 of
+them are REJECT on agreement, all the known mark-only digest artifact (54.3).
+
+Owner-approved queue item (merge-wait): A/B of `perf/p3-merge-wait` `3cf8f72d` (key mw; step 2 `7b006739` + 4 commits:
+`b32ca313` the merge thread hands `L` back without positions and balances and merges those two CFs into a deferred part
+while the next block runs; E joins it at the end of the block, `torus_exec_checkpoint_deferred_join_seconds`, inside upkeep;
+a read that reaches `L`'s deferred CFs waits, `torus_exec_checkpoint_deferred_read_waits`; `1e7854db` / `3cf8f72d`
+parent hits skip the deferred part, every blocked read counts) against step 2 `7b006739` (g2), both with
+`TORUS_CHECKPOINT_INTERVAL_MS=15000`, glibc, commit tail, n = 4 ABBA. Expected: settle wait a few ms per block (step 2:
+23.9 ms in section 49), 0 deferred read waits, the join ~0.
+
+Setup: the section 47-51 shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, 120 s cells
++ 60 s warm-up, commit tail, shared NVMe). Nodes: g2 `7b006739` (`ca388315`, the section 51 / 53 build, staged
+`ozarchy-p3q-stage/g2-run`), mw `3cf8f72d` (`8bb0dc8a`, build id `8f16c0f2`, built 2026-10-12 23:29 in
+`wt/p3q-mw-3cf8f72d`, staged `ozarchy-p3q-stage/mw-run`, unused until now). Bench `05d44313`, harness `218ad251`. Driver
+`ozarchy-p3q-campaign.sh` CAMP=M (preflight chain: mw = step 2 + 4 commits). A 60 s mw smoke cell first
+(`ozarchy-p3mw-smoke-300m-s0-mw`, 03:32-03:35: rc 0, ACCEPT, AGREE, all checks OK, the new metrics in the scrape). Cells
+03:37-04:30: w0 (g2, 60 s, excluded), r1 g2 mw, r2 mw g2, r3 g2 mw, r4 mw g2. 126 CHECK OK (knob + enable line +
+13-17 checkpoints per node in every measured cell, glibc with no preload, commit tail), no CHECK FAIL, no deaths, no memguard stop,
+the host quiet before every cell. Cells are 120 s long, so **matched/s is minutes 0-2 only** (section 53d.3: the glibc rate falls
+~11-13% by minutes 6-10; this A/B says nothing about the sustained rate).
+
+### 54.1 Per arm (n = 4, mean; paired mw - g2 over the 4 rounds, 95% CI t(3))
+
+| | g2 step 2 `7b006739` | mw `3cf8f72d` | mw - g2 | % [95% CI] |
+|---|---|---|---|---|
+| matched/s (120 s = minutes 0-2) | 213,819 | 217,658 | +3,838 | +1.8% [-1.9, +5.4] |
+| native blocks/s | 3.51 | 3.90 | +0.40 | **+11.3% [+8.4, +14.1]** |
+| block time (commit interval, logs) p50 / p99 ms | 164 / 1,321 | 143 / 1,282 | -20.9 / -38.7 | p50 **-12.7% [-15.5, -10.0]**, p99 -2.9% [-10.2, +4.3] |
+| exec `block_ms` (summary) | 261.8 | 243.8 | -18.0 [-29.5, -6.5] | **-6.9% [-11.3, -2.5]** |
+| exec per native block (logs) mean / p50 / p99 ms | 345 / 355 / 669 | 321 / 332 / 659 | -23.8 / -22.8 / -9.5 | mean -6.9% [-13.3, -0.5], p50 -6.4% [-11.2, -1.6], p99 -1.4% [-9.5, +6.7] |
+| exec busy | 0.965 | 0.960 | -0.005 | -0.5% [-1.8, +0.7] |
+| exec backlog (blocks) / lag s | 43.2 / 11.6 | 40.2 / 10.0 | -3.0 / -1.6 | -7% [-25, +11] / -14% [-30, +2] |
+| fills / actions per native block | 55,411 / 288 | 52,974 / 275 | | -4.4% [-9.4, +0.6] / -4.4% [-9.2, +0.4] |
+| engine ms per 1k fills | 3.39 | 3.51 | +0.11 | +3.4% [+0.1, +6.7] |
+| node CPU-s/1M (whole run) | 23.29 | 23.61 | +0.31 | +1.35% [+0.09, +2.61] |
+| node CPU at equal fills (ANCOVA, Welch) | | | | +1.1% [-3.0, +5.3] |
+| RSS peak / mean per node GB (cpu.csv, mean of 3) | 5.67 / 4.64 | 5.56 / 4.53 | -0.12 [-0.35, +0.12] / -0.11 [-0.34, +0.12] | -2.1% / -2.3% |
+| RSS growth over the bench window GB/min | 1.66 | 1.47 | -0.19 [-0.50, +0.12] | -11% [-30, +7] |
+| layer MB per checkpoint | 153 | 154 | +1.2 | +0.8% [-7.3, +8.8] |
+| device writes MB/s per validator | 65.1 | 66.8 | +1.7 | +2.6% [-0.3, +5.5] |
+| bench submits/s | 1,194 | 1,241 | +46.5 | +3.9% [+1.9, +5.9] |
+
+The bench is closed-loop: faster commits let it submit +3.9% more (the section 51 offered-load caveat, smaller here).
+Welch intervals (`arms.txt`) agree in sign and resolution with the paired ones for every bolded row (blocks/s +11.3%
+[+4.1, +18.4], `block_ms` -6.9% [-13.1, -0.6]); CPU-s/1M is +1.35% [+0.07, +2.63] there too.
+
+### 54.2 Exec-thread checkpoint time and the new counters
+
+| ms per native block (mean of 3 nodes) | g2 | mw | mw - g2 [95% CI] |
+|---|---|---|---|
+| `checkpoint_settle_wait` (summary phase; section 49: 23.9) | 23.36 | **3.09** | **-20.27 [-20.92, -19.62]** |
+| `checkpoint_settle_wait`, from the metrics delta (`_sum` / native blocks) | 20.12 | 2.72 | |
+| per observation p50 / p99 (summary quantiles) | 0.46 / 95.5 | 0.29 / 15.8 | |
+| `checkpoint_upkeep` (incl. the deferred join) | 1.16 | 1.23 | +0.07 [-0.34, +0.48] |
+| upkeep per observation p50 / p99 | 0.09 / 10.0 | 0.10 / 23.9 | |
+| `torus_exec_checkpoint_deferred_join_seconds` | absent (not in `7b006739`) | **0.19** (0.13 per observation, ~923 per node per cell) | |
+| `torus_exec_checkpoint_deferred_read_waits_total` | absent (not in `7b006739`) | **0 on all 12 node-cells** | |
+| `residual_untimed` | 17.2 | 17.6 | +0.4 [-0.8, +1.6] |
+| checkpoints per node per cell / `drop_inline` | 14.9 / 839 | 15.6 / 885 | |
+
+Both new metrics are in every mw scrape (`metrics-after-val*.txt`, `ckpt-samples.txt`). The summary phase and the
+metrics delta differ by ~3 ms in g2 (different windows: summary phases vs bench start -> end); the drop is ~87% either
+way. **The deferred read counter stays 0: no native block read reached `L`'s deferred positions / balances, as
+designed. The join at the block end is ~0.2 ms, so the deferred merge is done by then almost every time.** The upkeep
+p99 per observation rises 10 -> 24 ms while its mean per block is flat (+0.07 ms). That is consistent with the deferred
+join landing in a few upkeeps (checkpoint triggers take `L` whole), but the harness has no per-observation join
+quantiles to confirm it.
+
+### 54.3 Agreement and other checks
+
+r3-mw, r4-mw and r4-g2 are rc 2, REJECT on agreement. In each, one node differs from the other two in the 5 mark fields
+(`accountValue`, `freeMargin`, `maintenanceMarginUsed`, `totalMarginUsed`, `withdrawable`) of all 50 accounts only
+(`accountValue == cash` on 39 / 49 / 50), and that node's digest took longest: val2 42.8 s and 50.8 s vs 18-26 s, val0
+88.5 s vs 22-24 s. Block hashes and counters are equal on all 3 nodes, and no cash, position, book or OI field differs.
+This is the slow-digest mark artifact of sections 46-51, in both arms: **no hard finding.** (r3-g2 took 92-95 s on all
+three nodes and agreed.) Nonce-window evictions 0 in every cell; no tail warnings, no tail errors, no in-flight
+timeouts; in-flight RPC refusals 0 except r1-g2 (18) and r3-g2 (7); executed cancel-alls equal those sent (within 0-3
+per cell, the same on all 3 nodes).
+
+**Verdict:** the merge-wait change does what it claims. Exec waits ~3 ms per block for its share of the merge instead of
+~23 ms. No read ever waits for the deferred part, and the join costs ~0.2 ms. RSS and writes are unchanged. The freed exec
+time shows up as +11% native blocks/s at a ~7% lower `block_ms`. Exec is still the ceiling (busy 0.96), the blocks get
+smaller, and matched/s over minutes 0-2 is a tie. Block time p99 is a tie, so section 49's +12.7% p99 vs main is not
+shown to be recovered. CPU-s/1M +1.35% is the only possible cost, and it does not resolve at equal fills. n = 4 x 120 s:
+these are "consistent with", except settle wait and blocks/s, which are decisive.
+
+Analysis (`tools/ozarchy-p3mw-tools/analyst/`): `a-cells.py`, `a-arms.py` (section 51's, unchanged), `a-paired.py`
+(new: paired mw - g2 per round over `a-arms.py`'s rows, t(3) CI, + device writes), `a-mw.py` (settle / upkeep / deferred
+join per native block and the deferred read waits from `metrics-before/after`), `a-archive.py`. Outputs `arms.txt`,
+`paired.txt`, `mw.txt`, `digest.txt`, `cells.txt`. Full outputs (incl. `cells.json`) in `ozarchy-p3mw-run/analyst/` on
+ozarchy. Driver: `tools/ozarchy-p3mw-tools/ozarchy-p3q-campaign.sh` (CAMP=M).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

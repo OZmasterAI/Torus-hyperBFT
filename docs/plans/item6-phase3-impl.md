@@ -337,6 +337,11 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   0 margin rejections). Glibc: Phase 3 delta +2.62 GB per node (minutes 5-10 mean), still +120-158 MB/min: rule not met.
   jemalloc: flat, +1.10 GB per node mean / +1.49 GB peak (val2 +0.95 / +1.34): met on the level, borderline on the mean,
   not at the peak. Same book and layer, so the glibc growth is consistent with retention, not data.
+- **Merge-wait A/B** (campaign `ozarchy-p3mw`, results doc section 54, plan-2 row 62): `perf/p3-merge-wait` `3cf8f72d` vs
+  step 2 `7b006739`, both 15 s, glibc, commit tail, n = 4 ABBA. E's `checkpoint_settle_wait` 23.4 -> 3.1 ms per native
+  block (-20.3 [-20.9, -19.6]), deferred read waits 0, deferred join 0.19 ms per block (inside upkeep); `block_ms` -6.9%,
+  native blocks/s +11.3% [+8.4, +14.1]; matched/s +1.8% and block time p99 -2.9% (ties); RSS / writes neutral; CPU-s/1M
+  +1.35% [+0.09, +2.61] (not resolved at equal fills). Three REJECTs, all the mark-only digest artifact.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
