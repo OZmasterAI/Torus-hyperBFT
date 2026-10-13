@@ -74,6 +74,37 @@ The binary is at `target/release/torus-node`.
 |------------|-------------|
 | `keygen --output <path>` | Generate a new validator keypair and encrypted keystore |
 
+### Stopping the Node
+
+Stop the node with SIGTERM or SIGINT (Ctrl+C). The node then shuts down
+cleanly: it stops consensus, executes and persists every committed block
+still in the execution queue, flushes memtables and syncs the WAL. A restart
+after a clean stop replays no blocks and no WAL.
+
+The shutdown is bounded by `TORUS_SHUTDOWN_TIMEOUT_SECS` (default 60). If the
+bound passes, or a second signal arrives, the node exits at once. Recovery is
+then the same as after a kill: the node replays on restart, which is slower
+but safe.
+
+The service manager must wait longer than this bound before it sends SIGKILL.
+The defaults of Docker (10 s) and Kubernetes (30 s) are shorter, so set the
+grace period to the bound plus a margin, e.g. 75 s:
+
+| Runtime | Setting |
+|---------|---------|
+| Docker | `docker stop -t 75 <container>` |
+| Docker Compose | `stop_grace_period: 75s` on the service |
+| Kubernetes | `terminationGracePeriodSeconds: 75` in the pod spec |
+| systemd | `TimeoutStopSec=75` and `KillSignal=SIGTERM` in the unit |
+
+Make sure the signal reaches `torus-node` itself. In a container, start the
+node in exec form (`ENTRYPOINT ["torus-node", ...]`) or with `exec` in a
+wrapper script. A shell started as `sh -c "torus-node ..."` may not forward
+SIGTERM, so the node gets only the SIGKILL. Do not send a second signal
+(`docker kill`, a second Ctrl+C) during a normal stop: it cuts the clean
+shutdown short. If you raise `TORUS_SHUTDOWN_TIMEOUT_SECS`, raise the grace
+period with it.
+
 ## Network Ports
 
 | Port | Protocol | Service | Description |
