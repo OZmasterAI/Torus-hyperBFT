@@ -162,7 +162,11 @@ fn seed_crowded(state: &StateDb, mode: BookMode) {
 fn max_scan_rows_env_parses_with_the_default_on_empty_bad_or_zero() {
     assert_eq!(resolve_max_scan_rows(None), DEFAULT_MAX_SCAN_ROWS);
     for raw in ["", "  ", "0", "abc", "-5"] {
-        assert_eq!(resolve_max_scan_rows(Some(raw)), DEFAULT_MAX_SCAN_ROWS, "{raw:?}");
+        assert_eq!(
+            resolve_max_scan_rows(Some(raw)),
+            DEFAULT_MAX_SCAN_ROWS,
+            "{raw:?}"
+        );
     }
     assert_eq!(resolve_max_scan_rows(Some(" 500 ")), 500);
 }
@@ -214,13 +218,19 @@ async fn open_interest_stops_at_the_scan_budget() {
     for i in 0..1000 {
         pm.put_position(&position(other(i), 2, true, 1)).unwrap();
     }
-    pm.put_position(&position(addr(MAKER), 1, true, 10)).unwrap();
-    pm.put_position(&position(addr(MAKER + 1), 1, false, 7)).unwrap();
+    pm.put_position(&position(addr(MAKER), 1, true, 10))
+        .unwrap();
+    pm.put_position(&position(addr(MAKER + 1), 1, false, 7))
+        .unwrap();
 
     let s = server(&state, 100);
     let e = s.state().get_open_interest("0x1".into()).await.unwrap_err();
     assert_scan_limit(&e, "1,002 position rows, budget 100");
-    assert!((1..=101).contains(&examined(&s)), "examined {}", examined(&s));
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
 
     let s = server(&state, 5_000);
     let oi = s.state().get_open_interest("0x1".into()).await.unwrap();
@@ -243,7 +253,11 @@ async fn user_limits_stop_at_the_scan_budget() {
         let s = server(&state, 100);
         let e = s.state().get_user_limits(maker.clone()).await.unwrap_err();
         assert_scan_limit(&e, &format!("{mode:?}"));
-        assert!((1..=101).contains(&examined(&s)), "{mode:?}: examined {}", examined(&s));
+        assert!(
+            (1..=101).contains(&examined(&s)),
+            "{mode:?}: examined {}",
+            examined(&s)
+        );
 
         let s = server(&state, 100_000);
         let l = s.state().get_user_limits(maker).await.unwrap();
@@ -266,13 +280,25 @@ async fn open_orders_of_one_market_read_only_that_market() {
             .await
             .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"));
         assert_eq!(one.len(), 3, "{mode:?}");
-        assert!((1..=100).contains(&examined(&s)), "{mode:?}: examined {}", examined(&s));
+        assert!(
+            (1..=100).contains(&examined(&s)),
+            "{mode:?}: examined {}",
+            examined(&s)
+        );
 
         // All markets must read market 2's 1,000 rows: refused at the budget.
         let s = server(&state, 100);
-        let e = s.state().get_open_orders(maker.clone(), None).await.unwrap_err();
+        let e = s
+            .state()
+            .get_open_orders(maker.clone(), None)
+            .await
+            .unwrap_err();
         assert_scan_limit(&e, &format!("{mode:?} all markets"));
-        assert!((1..=101).contains(&examined(&s)), "{mode:?}: examined {}", examined(&s));
+        assert!(
+            (1..=101).contains(&examined(&s)),
+            "{mode:?}: examined {}",
+            examined(&s)
+        );
 
         let s = server(&state, 100_000);
         let all = s.state().get_open_orders(maker, None).await.unwrap();
@@ -289,19 +315,29 @@ async fn order_by_cloid_stops_at_the_first_hit() {
         let s = server(&state, 100);
         let hit = s
             .state()
-            .get_order_by_cloid(hex_addr(addr(MAKER)), torus_types::cloid_serde::to_hex(CLOID))
+            .get_order_by_cloid(
+                hex_addr(addr(MAKER)),
+                torus_types::cloid_serde::to_hex(CLOID),
+            )
             .await
             .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"))
             .expect("resting order found");
         assert_eq!(hit.status, "open", "{mode:?}");
         assert_eq!(hit.order.market_id, "0x1", "{mode:?}");
-        assert!((1..=100).contains(&examined(&s)), "{mode:?}: examined {}", examined(&s));
+        assert!(
+            (1..=100).contains(&examined(&s)),
+            "{mode:?}: examined {}",
+            examined(&s)
+        );
 
         // A miss must read every order: refused at the budget.
         let s = server(&state, 100);
         let e = s
             .state()
-            .get_order_by_cloid(hex_addr(addr(MAKER)), torus_types::cloid_serde::to_hex(CLOID + 1))
+            .get_order_by_cloid(
+                hex_addr(addr(MAKER)),
+                torus_types::cloid_serde::to_hex(CLOID + 1),
+            )
             .await
             .unwrap_err();
         assert_scan_limit(&e, &format!("{mode:?} miss"));
@@ -330,14 +366,30 @@ async fn order_book_depth_bounds_the_levels_read() {
 
         let s = server(&state, 100_000);
         let full = s.state().get_order_book("0x1".into(), None).await.unwrap();
-        assert_eq!((full.bids.len(), full.asks.len()), (300, 300), "{mode:?}: default depth");
+        assert_eq!(
+            (full.bids.len(), full.asks.len()),
+            (300, 300),
+            "{mode:?}: default depth"
+        );
 
         let s = server(&state, 100_000);
-        let top = s.state().get_order_book("0x1".into(), Some(10)).await.unwrap();
+        let top = s
+            .state()
+            .get_order_book("0x1".into(), Some(10))
+            .await
+            .unwrap();
         assert_eq!((top.bids.len(), top.asks.len()), (10, 10), "{mode:?}");
-        assert_eq!(top.bids[0].price, dec_fp(fp(1299)), "{mode:?}: best bid first");
+        assert_eq!(
+            top.bids[0].price,
+            dec_fp(fp(1299)),
+            "{mode:?}: best bid first"
+        );
         assert_eq!(top.bids[9].price, dec_fp(fp(1290)), "{mode:?}");
-        assert_eq!(top.asks[0].price, dec_fp(fp(2000)), "{mode:?}: best ask first");
+        assert_eq!(
+            top.asks[0].price,
+            dec_fp(fp(2000)),
+            "{mode:?}: best ask first"
+        );
         assert_eq!(top.asks[9].price, dec_fp(fp(2009)), "{mode:?}");
         assert!(examined(&s) > 0, "{mode:?}: the read is metered");
 
@@ -347,14 +399,22 @@ async fn order_book_depth_bounds_the_levels_read() {
             // Level rows: two seeks of 10 rows, whatever the book's size.
             BookMode::LevelAuthority => {
                 assert_eq!(got.unwrap().bids.len(), 10);
-                assert!((1..=30).contains(&examined(&s)), "examined {}", examined(&s));
+                assert!(
+                    (1..=30).contains(&examined(&s)),
+                    "examined {}",
+                    examined(&s)
+                );
             }
             // Mode 1: order rows carry no price index, every order of the
             // market is read. Classic: one whole-book blob (cannot be read in
             // part), charged by its size before it is decoded.
             _ => {
                 assert_scan_limit(&got.unwrap_err(), &format!("{mode:?}: 600 orders"));
-                assert!((1..=101).contains(&examined(&s)), "examined {}", examined(&s));
+                assert!(
+                    (1..=101).contains(&examined(&s)),
+                    "examined {}",
+                    examined(&s)
+                );
             }
         }
     }
@@ -381,7 +441,11 @@ fn put_proposal(state: &StateDb, id: u64, status: ProposalStatus) {
         execution_payload: None,
     };
     state
-        .put_cf_raw(CF_GOVERNANCE_PROPOSALS, &id.to_be_bytes(), &borsh::to_vec(&p).unwrap())
+        .put_cf_raw(
+            CF_GOVERNANCE_PROPOSALS,
+            &id.to_be_bytes(),
+            &borsh::to_vec(&p).unwrap(),
+        )
         .unwrap();
 }
 
@@ -389,19 +453,31 @@ fn put_proposal(state: &StateDb, id: u64, status: ProposalStatus) {
 async fn proposals_stop_at_the_scan_budget() {
     let (_d, state) = db();
     for id in 0..300 {
-        let status = if id % 3 == 0 { ProposalStatus::Passed } else { ProposalStatus::Active };
+        let status = if id % 3 == 0 {
+            ProposalStatus::Passed
+        } else {
+            ProposalStatus::Active
+        };
         put_proposal(&state, id, status);
     }
     for status in [None, Some("Passed".to_string())] {
         let s = server(&state, 100);
         let e = s.state().get_proposals(status.clone()).await.unwrap_err();
         assert_scan_limit(&e, &format!("{status:?}"));
-        assert!((1..=101).contains(&examined(&s)), "{status:?}: examined {}", examined(&s));
+        assert!(
+            (1..=101).contains(&examined(&s)),
+            "{status:?}: examined {}",
+            examined(&s)
+        );
     }
     let s = server(&state, 1_000);
     assert_eq!(s.state().get_proposals(None).await.unwrap().len(), 300);
     assert_eq!(
-        s.state().get_proposals(Some("Passed".into())).await.unwrap().len(),
+        s.state()
+            .get_proposals(Some("Passed".into()))
+            .await
+            .unwrap()
+            .len(),
         100
     );
     assert_eq!(examined(&s), 600);
@@ -445,11 +521,23 @@ async fn user_trades_with_a_market_filter_stop_at_the_scan_budget() {
         .await
         .unwrap_err();
     assert_scan_limit(&e, "market 1 is behind 500 rows of market 2");
-    assert!((1..=101).contains(&examined(&s)), "examined {}", examined(&s));
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
 
     // Unfiltered: the limit stops it after 10 rows.
     let s = server(&state, 100);
-    let t = s.state().get_user_trades(hex_addr(me), None, Some(10)).await.unwrap();
+    let t = s
+        .state()
+        .get_user_trades(hex_addr(me), None, Some(10))
+        .await
+        .unwrap();
     assert_eq!(t.len(), 10);
-    assert!((1..=10).contains(&examined(&s)), "examined {}", examined(&s));
+    assert!(
+        (1..=10).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
 }
