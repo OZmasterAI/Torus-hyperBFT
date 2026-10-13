@@ -67,7 +67,8 @@ SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as a
       select    regex: compare only the lines (of both sides) it matches, e.g. "^r1-c0 " for one cell
       ignore    list of regexes: lines dropped from both sides (timestamps, temp paths)
       tolerance relative tolerance for every number in a line (default 0: exact); the text between numbers must match;
-                a finite number >= 0 (nan, inf, a negative or a string is a meta error)
+                a finite number >= 0 (nan, inf, a negative or a string is a meta error); a number that overflows to
+                inf (e.g. 1e400) only matches the identical string, and inf / nan are text, so exact too
   Example and real use: meta/p3cloid.toml, meta/p3cloidprof.toml.
 
 SAFETY: it never deletes anything (it only writes rm commands into DELETABLE.md for a human to run on ozarchy); the
@@ -1064,7 +1065,9 @@ def smoke_lines(text, cm):
 
 
 def smoke_same(a, b, tol):
-    """Lines equal, or (tol > 0) equal outside the numbers and every number within relative tolerance tol."""
+    """Lines equal, or (tol > 0) equal outside the numbers and every number within relative tolerance tol. A number
+    that is not finite as a float (a literal that overflows to inf, e.g. 1e400) only matches the identical string:
+    1e400 and 9e400 both parse to inf, and inf - inf = nan passes every `>` check."""
     if a == b:
         return True
     if not tol:
@@ -1076,8 +1079,13 @@ def smoke_same(a, b, tol):
         if i % 2 == 0:
             if x != y:
                 return False
-        elif abs(float(x) - float(y)) > tol * max(abs(float(x)), abs(float(y))):
-            return False
+        else:
+            fx, fy = float(x), float(y)
+            if not (math.isfinite(fx) and math.isfinite(fy)):
+                if x != y:
+                    return False
+            elif abs(fx - fy) > tol * max(abs(fx), abs(fy)):
+                return False
     return True
 
 
