@@ -111,6 +111,16 @@ impl ExecBacklog {
         n
     }
 
+    /// RED stub (Codex r2 finding 1).
+    pub fn register_provisional(
+        &self,
+        _height: u64,
+        _upper: usize,
+        _publish: impl Fn(i64),
+    ) -> usize {
+        0
+    }
+
     /// Dispatcher: `height` entered the exec channel; its count now rides
     /// the block (released by [`Self::release`]). Raises the sent watermark.
     /// A registered height below it can never be sent any more (execution is
@@ -339,6 +349,232 @@ mod tests {
         assert_eq!(b.pending_heights(), 0);
         b.release(n, nop);
         assert_eq!(b.outstanding(), 0);
+    }
+
+    /// Codex r2 finding 1 (owner option A): a Compact park registers its
+    /// action-hash count (an upper bound: cancels and oracle submissions
+    /// included) with no scan. The first exact registration (the height
+    /// materialized) lowers it ONCE to the exact normal count, and the
+    /// block carries that exact count; later registrations never rescan.
+    #[test]
+    fn provisional_park_counts_upper_bound_then_lowers_once_to_exact() {
+        let b = ExecBacklog::default();
+        assert_eq!(b.register_provisional(5, 6, nop), 6);
+        assert_eq!(b.outstanding(), 6);
+        // A re-park of the same Compact height: no double count.
+        assert_eq!(b.register_provisional(5, 6, nop), 6);
+        assert_eq!(b.outstanding(), 6);
+        assert_eq!(b.pending_heights(), 1);
+        // Materialized: lowered to the exact normal count.
+        let n = b.register(5, || 3, nop);
+        assert_eq!(n, 3);
+        assert_eq!(b.outstanding(), 3);
+        // Retry / re-park after materialization: exact, never rescanned or
+        // raised back.
+        assert_eq!(
+            b.register(5, || panic!("rescanned a lowered height"), nop),
+            3
+        );
+        assert_eq!(b.register_provisional(5, 6, nop), 3);
+        assert_eq!(b.outstanding(), 3);
+        b.sent(5, nop);
+        b.release(n, nop);
+        assert_eq!(b.outstanding(), 0);
+    }
+
+    /// An exactly-registered height (Ready park, demoted later to Compact)
+    /// is never re-registered provisionally.
+    #[test]
+    fn provisional_after_exact_is_a_noop() {
+        let b = ExecBacklog::default();
+        assert_eq!(b.register(4, || 2, nop), 2);
+        assert_eq!(b.register_provisional(4, 10, nop), 2);
+        assert_eq!(b.outstanding(), 2);
+    }
+
+    /// A provisionally counted height skipped by the sent watermark is
+    /// dropped with its provisional count; at or below the watermark a
+    /// provisional registration is a no-op.
+    #[test]
+    fn provisional_counts_follow_the_sent_watermark() {
+        let b = ExecBacklog::default();
+        b.register_provisional(2, 4, nop);
+        let n3 = b.register(3, || 1, nop);
+        b.sent(3, nop);
+        assert_eq!(b.outstanding(), 1);
+        assert_eq!(b.register_provisional(2, 9, nop), 0);
+        assert_eq!(b.register_provisional(3, 9, nop), 0);
+        assert_eq!(b.outstanding(), 1);
+        b.release(n3, nop);
+        assert_eq!(b.outstanding(), 0);
+    }
+
+    /// Closed: provisional registrations are no-ops; a close during the
+    /// exact scan of a provisional height wins (the carried count is 0).
+    #[test]
+    fn provisional_respects_the_terminal_close() {
+        let b = ExecBacklog::default();
+        assert_eq!(b.register_provisional(1, 5, nop), 5);
+        let n = b.register(
+            1,
+            || {
+                b.close(nop);
+                2
+            },
+            nop,
+        );
+        assert_eq!(n, 0);
+        assert_eq!(b.outstanding(), 0);
+        assert_eq!(b.register_provisional(2, 3, nop), 0);
+        assert_eq!(b.outstanding(), 0);
+    }
+
+    /// The gauge follows the provisional count and its lowering, and ends
+    /// at 0 (never negative), attached before or after the park.
+    #[test]
+    fn provisional_publishes_and_lowering_never_goes_negative() {
+        for attach_first in [true, false] {
+            let b = ExecBacklog::default();
+            let gauge = std::cell::Cell::new(0i64);
+            let min = std::cell::Cell::new(0i64);
+            let add = |d: i64| {
+                gauge.set(gauge.get() + d);
+                min.set(min.get().min(gauge.get()));
+            };
+            if attach_first {
+                b.attach(add);
+            }
+            b.register_provisional(1, 6, add);
+            if !attach_first {
+                b.attach(add);
+            }
+            assert_eq!(gauge.get(), 6);
+            let n = b.register(1, || 2, add);
+            assert_eq!((b.outstanding(), gauge.get()), (2, 2));
+            b.sent(1, add);
+            b.release(n, add);
+            assert_eq!((b.outstanding(), gauge.get()), (0, 0));
+            assert_eq!(min.get(), 0);
+        }
+    }
+
+    /// Property: random in-order heights, some parked Compact (provisional
+    /// upper bound), refined at most once (on a retry, or at the send),
+    /// sends, FIFO releases and a rare close: the total always equals the
+    /// model, and ends at 0.
+    #[test]
+    fn total_equals_model_with_provisional_parks() {
+        let mut rng: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _case in 0..200 {
+            let b = ExecBacklog::default();
+            // height -> (counted, exact count)
+            let mut pending: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
+            let mut exact_done: std::collections::BTreeSet<u64> = Default::default();
+            let mut in_flight: VecDeque<usize> = VecDeque::new();
+            let mut registered_to = 0u64;
+            let mut closed = false;
+            for _step in 0..300 {
+                match next() % 10 {
+                    // New committed height: Compact park (provisional) or
+                    // Ready park (exact).
+                    0..=3 => {
+                        let h = registered_to + 1;
+                        let exact = (next() % 40) as usize;
+                        if next() % 2 == 0 {
+                            let upper = exact + (next() % 5) as usize;
+                            let got = b.register_provisional(h, upper, nop);
+                            if closed {
+                                assert_eq!(got, 0);
+                            } else {
+                                assert_eq!(got, upper);
+                                pending.insert(h, (upper, exact));
+                            }
+                        } else {
+                            let got = b.register(h, || exact, nop);
+                            if closed {
+                                assert_eq!(got, 0);
+                            } else {
+                                assert_eq!(got, exact);
+                                pending.insert(h, (exact, exact));
+                                exact_done.insert(h);
+                            }
+                        }
+                        registered_to = h;
+                    }
+                    // A drain materializes some pending height (refine).
+                    4 => {
+                        if let Some(&h) = pending.keys().nth((next() % 3) as usize) {
+                            let (_, exact) = pending[&h];
+                            let got = b.register(
+                                h,
+                                || {
+                                    assert!(!exact_done.contains(&h), "rescanned h{h}");
+                                    exact
+                                },
+                                nop,
+                            );
+                            if !closed {
+                                assert_eq!(got, exact);
+                                pending.insert(h, (exact, exact));
+                                exact_done.insert(h);
+                            }
+                        }
+                    }
+                    // Send the lowest pending height (materialized first).
+                    5 | 6 => {
+                        if let Some((&h, &(_, exact))) = pending.first_key_value() {
+                            let n = b.register(
+                                h,
+                                || {
+                                    assert!(!exact_done.contains(&h), "rescanned h{h}");
+                                    exact
+                                },
+                                nop,
+                            );
+                            assert_eq!(n, exact);
+                            pending.remove(&h);
+                            b.sent(h, nop);
+                            in_flight.push_back(n);
+                        }
+                    }
+                    7 | 8 => {
+                        if let Some(n) = in_flight.pop_front() {
+                            b.release(n, nop);
+                        }
+                    }
+                    _ => {
+                        if next() % 16 == 0 {
+                            b.close(nop);
+                            closed = true;
+                            pending.clear();
+                        }
+                    }
+                }
+                let model = if closed {
+                    0
+                } else {
+                    pending.values().map(|&(c, _)| c).sum::<usize>()
+                        + in_flight.iter().sum::<usize>()
+                };
+                assert_eq!(b.outstanding(), model);
+            }
+            while let Some((&h, &(_, exact))) = pending.first_key_value() {
+                let n = b.register(h, || exact, nop);
+                pending.remove(&h);
+                b.sent(h, nop);
+                in_flight.push_back(n);
+            }
+            while let Some(n) = in_flight.pop_front() {
+                b.release(n, nop);
+            }
+            assert_eq!(b.outstanding(), 0, "leaked after executing everything");
+        }
     }
 
     /// Codex r1 finding 2: the teardown is terminal. A registration after it

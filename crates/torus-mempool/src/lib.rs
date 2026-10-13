@@ -402,6 +402,11 @@ impl Mempool {
         )
     }
 
+    /// RED stub (Codex r2 finding 1).
+    pub fn note_exec_parked_compact(&self, _height: u64, _action_hashes: usize) -> usize {
+        0
+    }
+
     /// Consensus thread: `height` entered the exec channel (its count rides
     /// the block). No-op with exec-aware admission off.
     pub fn note_exec_sent(&self, height: u64) {
@@ -3172,6 +3177,8 @@ mod tests {
                     pooled >= 4,
                     "off: pooled {pooled}, committed {committed_orders}"
                 );
+                assert_eq!(pool.note_exec_parked_compact(8, committed_orders + 2), 0);
+                assert_eq!(pool.committed_unexecuted_normal(), 0, "off: compact park");
                 pool.note_exec_released(n);
                 pool.close_exec_backlog();
                 assert_eq!(pool.native_admission_backlogged(), pooled >= 4);
@@ -3220,6 +3227,41 @@ mod tests {
         pool.close_exec_backlog();
         assert_eq!(pool.committed_unexecuted_normal(), 0);
         assert!(!pool.native_admission_backlogged());
+    }
+
+    /// Codex r2 finding 1 (owner option A): a Compact park (action hashes
+    /// only) counts every hash at once (cancels included: no body read);
+    /// the first materialization lowers it once to the exact normal count,
+    /// which the block carries; a re-park never raises it again.
+    #[test]
+    fn exec_aware_compact_park_counts_hashes_then_lowers_at_materialize() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, exec_aware_cfg(true, 10_000, 4));
+        let t0 = now_ms();
+        let k = key(221);
+        pool.add_native_action_presigned(address_from_key(&k), order_batch(&k, t0, 1))
+            .unwrap();
+        // Height 10: 2 orders + 5 cancels, parked as a Compact reference.
+        assert_eq!(pool.note_exec_parked_compact(10, 7), 7);
+        assert_eq!(pool.committed_unexecuted_normal(), 7);
+        assert!(pool.native_admission_backlogged(), "1 pooled + 7 >= 4");
+        assert_eq!(
+            pool.note_exec_parked_compact(10, 7),
+            7,
+            "re-park: no double count"
+        );
+        assert_eq!(pool.committed_unexecuted_normal(), 7);
+        // Materialized: exact normal count.
+        let n10 = pool.note_exec_committed(10, &committed_body(1, 2, 5));
+        assert_eq!(n10, 2);
+        assert_eq!(pool.committed_unexecuted_normal(), 2);
+        assert!(!pool.native_admission_backlogged(), "1 pooled + 2 < 4");
+        assert_eq!(pool.note_exec_parked_compact(10, 7), 2, "demoted re-park");
+        assert_eq!(pool.note_exec_committed(10, &committed_body(1, 2, 5)), 2);
+        assert_eq!(pool.committed_unexecuted_normal(), 2);
+        pool.note_exec_sent(10);
+        pool.note_exec_released(n10);
+        assert_eq!(pool.committed_unexecuted_normal(), 0);
     }
 
     /// Codex r1 finding 2: the teardown is terminal. Once the execution

@@ -9119,6 +9119,266 @@ mod exec_dispatch_tests {
             "counted after the teardown: leaked"
         );
     }
+
+    /// Codex r2 finding 1 (owner option A): a follower without a matching
+    /// proposal cache parks Compact references (action hashes only). Each
+    /// Compact park counts ALL its hashes at once (cancels included; no
+    /// body read), whether it parks as a hole or behind one; the first
+    /// materialization at the head lowers it ONCE to the exact normal
+    /// count, which the block carries; retries never recount; the total
+    /// returns to 0 after execution.
+    #[test]
+    fn exec_aware_compact_parks_count_all_hashes_then_lower_once() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+
+        let mut app = TorusApp::stub();
+        let mempool = exec_aware_mempool(&app.state_db, true);
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 1);
+        let t = now_ms();
+        let b1 = block(1, vec![signed(131, t)]);
+        let a2 = vec![signed(132, t), signed(133, t), cancel(134, t)];
+        let a3 = vec![signed(135, t), cancel(136, t)];
+        let (b2, b3) = (block(2, a2.clone()), block(3, a3.clone()));
+        mempool.mirror_native_to_da(&a3).unwrap(); // h3 reconstructable, h2 not yet
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        assert_eq!(mempool.committed_unexecuted_normal(), 1);
+        // h2: Compact, bodies missing: a hole park.
+        app.enqueue_for_execution(
+            2,
+            ExecSource::Compact(CompactBlock::from_block(&b2)),
+            vec![],
+        );
+        // h3: Compact, parked behind the hole.
+        app.enqueue_for_execution(
+            3,
+            ExecSource::Compact(CompactBlock::from_block(&b3)),
+            vec![],
+        );
+        assert_eq!(
+            app.deferred_exec.keys().copied().collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            mempool.committed_unexecuted_normal(),
+            1 + 3 + 2,
+            "Compact parks count every action hash"
+        );
+        // Hole retries and a re-delivery never count twice.
+        app.on_reconcile_tick();
+        app.enqueue_for_execution(
+            3,
+            ExecSource::Compact(CompactBlock::from_block(&b3)),
+            vec![],
+        );
+        assert_eq!(mempool.committed_unexecuted_normal(), 6);
+
+        // h2 heals: materialized at the head (channel still full): lowered
+        // once to its 2 normal actions; h3 not materialized yet.
+        mempool.mirror_native_to_da(&a2).unwrap();
+        app.on_reconcile_tick();
+        assert!(app.deferred_exec.contains_key(&2), "head put back (full)");
+        assert_eq!(mempool.committed_unexecuted_normal(), 1 + 2 + 2);
+        app.on_reconcile_tick(); // full again: no recount
+        assert_eq!(mempool.committed_unexecuted_normal(), 5);
+
+        let msg = rx.recv().unwrap();
+        assert_eq!(
+            (msg.torus_block.header.height, msg.committed_unexecuted),
+            (1, 1)
+        );
+        exec_done(&mempool, msg);
+        assert_eq!(mempool.committed_unexecuted_normal(), 4);
+        // h2 sent; h3 materialized at the head (full): lowered to 1.
+        app.on_reconcile_tick();
+        assert_eq!(
+            app.deferred_exec.keys().copied().collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(mempool.committed_unexecuted_normal(), 2 + 1);
+
+        let msg = rx.recv().unwrap();
+        assert_eq!(
+            (msg.torus_block.header.height, msg.committed_unexecuted),
+            (2, 2)
+        );
+        exec_done(&mempool, msg);
+        app.on_reconcile_tick();
+        assert!(app.deferred_exec.is_empty());
+        let msg = rx.recv().unwrap();
+        assert_eq!(
+            (msg.torus_block.header.height, msg.committed_unexecuted),
+            (3, 1)
+        );
+        exec_done(&mempool, msg);
+        assert_eq!(mempool.committed_unexecuted_normal(), 0);
+
+        clear_dispatch_env();
+    }
+
+    /// Compact park, then the same height re-delivered Ready (block-sync)
+    /// and DEMOTED back to Compact by the Ready-byte budget, then drain
+    /// retries and the send: counted once (hashes), lowered once (exact at
+    /// the Ready park), never raised or double counted; 0 after execution.
+    #[test]
+    fn exec_aware_compact_then_ready_then_demoted_counts_once() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        std::env::set_var("TORUS_DEFERRED_EXEC_READY_BYTES", "0");
+
+        let mut app = TorusApp::stub();
+        let mempool = exec_aware_mempool(&app.state_db, true);
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 1);
+        let t = now_ms();
+        let b1 = block(1, vec![signed(141, t)]);
+        let a2 = vec![signed(142, t), signed(143, t), cancel(144, t)];
+        let b2 = block(2, a2.clone());
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        app.enqueue_for_execution(
+            2,
+            ExecSource::Compact(CompactBlock::from_block(&b2)),
+            vec![],
+        );
+        assert_eq!(mempool.committed_unexecuted_normal(), 1 + 3);
+
+        // Bodies arrive; block-sync re-delivers h2 Ready: exact count now,
+        // and the Ready park is demoted to Compact (budget 0, durable).
+        mempool.mirror_native_to_da(&a2).unwrap();
+        app.enqueue_for_execution(2, ExecSource::Ready(b2.clone()), vec![]);
+        assert!(matches!(
+            app.deferred_exec.get(&2).map(|e| &e.source),
+            Some(ExecSource::Compact(_))
+        ));
+        assert_eq!(mempool.committed_unexecuted_normal(), 1 + 2);
+        for _ in 0..3 {
+            app.on_reconcile_tick(); // rematerialized, full: never recounted
+        }
+        app.enqueue_for_execution(
+            2,
+            ExecSource::Compact(CompactBlock::from_block(&b2)),
+            vec![],
+        );
+        assert_eq!(mempool.committed_unexecuted_normal(), 3);
+
+        let msg = rx.recv().unwrap();
+        exec_done(&mempool, msg);
+        app.on_reconcile_tick();
+        assert!(app.deferred_exec.is_empty());
+        let msg = rx.recv().unwrap();
+        assert_eq!(
+            (msg.torus_block.header.height, msg.committed_unexecuted),
+            (2, 2)
+        );
+        exec_done(&mempool, msg);
+        assert_eq!(mempool.committed_unexecuted_normal(), 0);
+
+        clear_dispatch_env();
+    }
+
+    /// The drain watchdog (and the boot park loops, same `park_deferred`
+    /// call with `recovery_exec_source`) re-parks a manifest-backed height
+    /// as a Compact reference: counted (all hashes) while its bodies are
+    /// missing, exact once it materializes and is sent, 0 after execution.
+    #[test]
+    fn exec_aware_manifest_reparked_compact_counts_until_executed() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+
+        let mut app = TorusApp::stub();
+        let mempool = exec_aware_mempool(&app.state_db, true);
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 4);
+        let t = now_ms();
+        let a1 = vec![signed(151, t), cancel(152, t), cancel(153, t)];
+        let b1 = block(1, a1.clone());
+        let datum = bincode::serialize(&CompactBlock::from_block(&b1)).unwrap();
+        persist_commit_manifest(&app.state_db, 1, &datum);
+        app.exec_next_height = Some(1);
+
+        app.drain_exec_queue();
+        assert!(
+            app.deferred_exec.contains_key(&1),
+            "re-parked from the manifest"
+        );
+        assert_eq!(mempool.committed_unexecuted_normal(), 3);
+        app.drain_exec_queue(); // still missing: no recount
+        assert_eq!(mempool.committed_unexecuted_normal(), 3);
+
+        mempool.mirror_native_to_da(&a1).unwrap();
+        app.drain_exec_queue();
+        assert!(app.deferred_exec.is_empty());
+        assert_eq!(mempool.committed_unexecuted_normal(), 1);
+        let msg = rx.recv().unwrap();
+        assert_eq!(
+            (msg.torus_block.header.height, msg.committed_unexecuted),
+            (1, 1)
+        );
+        exec_done(&mempool, msg);
+        assert_eq!(mempool.committed_unexecuted_normal(), 0);
+    }
+
+    /// Knob off: Compact parks (hole and behind it), the heal, a Ready
+    /// re-delivery, demotion, retries, sends and the dead-pipeline teardown
+    /// never touch the counter; every block carries 0.
+    #[test]
+    fn exec_aware_off_compact_parks_touch_nothing() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+        std::env::set_var("TORUS_DEFERRED_EXEC_READY_BYTES", "0");
+
+        let mut app = TorusApp::stub();
+        let mempool = exec_aware_mempool(&app.state_db, false);
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 1);
+        let t = now_ms();
+        let b1 = block(1, vec![signed(161, t)]);
+        let a2 = vec![signed(162, t), cancel(163, t)];
+        let a3 = vec![signed(164, t)];
+        let b2 = block(2, a2.clone());
+        let datum = bincode::serialize(&CompactBlock::from_block(&block(3, a3.clone()))).unwrap();
+        persist_commit_manifest(&app.state_db, 3, &datum);
+
+        app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
+        app.enqueue_for_execution(
+            2,
+            ExecSource::Compact(CompactBlock::from_block(&b2)),
+            vec![],
+        );
+        app.on_reconcile_tick();
+        mempool.mirror_native_to_da(&a2).unwrap();
+        mempool.mirror_native_to_da(&a3).unwrap();
+        app.enqueue_for_execution(2, ExecSource::Ready(b2), vec![]);
+        app.on_reconcile_tick();
+        for h in 1..=3u64 {
+            let msg = rx.recv().unwrap();
+            assert_eq!(msg.torus_block.header.height, h);
+            assert_eq!(msg.committed_unexecuted, 0, "off: h{h} carries nothing");
+            app.on_reconcile_tick();
+        }
+        assert!(app.deferred_exec.is_empty());
+        // h3 came back through the manifest watchdog (never enqueued live).
+        drop(rx);
+        let a4 = vec![signed(165, t)];
+        mempool.mirror_native_to_da(&a4).unwrap();
+        let b4 = block(4, a4);
+        app.enqueue_for_execution(
+            4,
+            ExecSource::Compact(CompactBlock::from_block(&b4)),
+            vec![],
+        );
+        assert!(app.is_exec_failed(), "dead pipeline at h4's send");
+        assert_eq!(mempool.committed_unexecuted_normal(), 0);
+        assert_eq!(mempool.exec_backlog_touches(), 0, "off: counter touched");
+
+        clear_dispatch_env();
+    }
 }
 
 #[cfg(test)]
@@ -17158,6 +17418,82 @@ mod crash_recovery_tests {
             "the fixture executes cleanly"
         );
         drop(app); // closes the channel; the loop exits
+        handle.join().unwrap();
+    }
+
+    /// Codex r2 finding 1, end to end with the real `execution_loop`: a
+    /// follower's Compact heights (no matching proposal cache) park as a
+    /// hole and behind it, counted by action hashes; once their bodies
+    /// arrive they materialize, are lowered to their exact normal counts and
+    /// sent, and the loop releases exactly that: back to 0 with every block
+    /// applied.
+    #[test]
+    fn exec_aware_compact_parks_return_to_zero_after_execution_loop() {
+        let blocks = pipeline_fixture_blocks();
+        let (_c, db) = make_test_config_and_db();
+        fund_pipeline_fixture(&db);
+        let mempool = exec_aware_mempool(&db);
+        let mut app = TorusApp::stub_on(db.clone());
+        app.mempool = Some(mempool.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        app.replace_exec_tx(tx);
+        // h1 Ready (sent); every later height arrives as a Compact reference
+        // whose bodies are not local yet.
+        app.enqueue_for_execution(1, ExecSource::Ready(blocks[0].clone()), vec![]);
+        for b in &blocks[1..] {
+            app.enqueue_for_execution(
+                b.header.height,
+                ExecSource::Compact(CompactBlock::from_block(b)),
+                vec![],
+            );
+        }
+        let parked: Vec<u64> = app.deferred_exec.keys().copied().collect();
+        assert!(!parked.is_empty(), "a Compact hole parked");
+        let sent_normal: usize = normal_actions(
+            &blocks
+                .iter()
+                .filter(|b| !parked.contains(&b.header.height))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let parked_hashes: usize = blocks
+            .iter()
+            .filter(|b| parked.contains(&b.header.height))
+            .map(|b| b.native_actions.len())
+            .sum();
+        assert_eq!(
+            mempool.committed_unexecuted_normal(),
+            sent_normal + parked_hashes,
+            "parked Compact heights count every hash"
+        );
+        for b in &blocks[1..] {
+            mempool.mirror_native_to_da(&b.native_actions).unwrap();
+        }
+        app.drain_exec_queue();
+        assert!(app.deferred_exec.is_empty());
+        assert_eq!(
+            mempool.committed_unexecuted_normal(),
+            normal_actions(&blocks),
+            "materialized: lowered to the exact normal counts"
+        );
+
+        let mut ctx = pipeline_ctx(&db, false, None);
+        ctx.mempool = Some(mempool.clone());
+        ctx.exec_shutdown.store(true, Ordering::SeqCst);
+        let latch = ctx.exec_failed.clone();
+        let handle = std::thread::spawn(move || execution_loop(rx, ctx));
+        let top = blocks.len() as u64;
+        assert!(
+            wait_executed_and_released(&db, &mempool, top),
+            "applied {:?}, still counted {}",
+            native_applied_height(&db).unwrap(),
+            mempool.committed_unexecuted_normal()
+        );
+        assert!(
+            !latch.load(Ordering::SeqCst),
+            "the fixture executes cleanly"
+        );
+        drop(app);
         handle.join().unwrap();
     }
 
