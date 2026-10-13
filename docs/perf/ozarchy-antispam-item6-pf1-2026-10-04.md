@@ -7363,6 +7363,153 @@ survivors' `peer connected` / `peer disconnected` lines), `analyst/paired-kills.
 `analyst/a-wedge.txt`, `a-conn.txt`, `kills.json`, `sat-paired.txt`, `sat-cells.txt`. Drivers
 `ozarchy-wedge-kill-campaign.sh`, `ozarchy-wedge-sat-campaign.sh`, builds `ozarchy-wedge-build*.sh`, md5s `analyst/md5s-all.txt`.
 
+## 59. Cloid cost A/B: `CLOID_SHARE=100` vs `0` on one binary, main `ef812b02` (glibc), saturated, commit-tail mode (campaign ozarchy-p3cloid, 2026-10-13)
+
+**When every placed order carries a client order id (cloid), the node matches 11.7% fewer orders per second: matched/s
+-11.7% [-13.8, -9.6] (paired c100 - c0, n = 4, 95% CI t(3)), placed/s -11.8% [-13.9, -9.6]. Each fill costs more node
+CPU: CPU-s/1M +8.8% [+7.4, +10.3] (+6.4% [+3.1, +9.7] at equal fills). The cost sits in the executor. Exec `block_ms` is
++11.8% [+1.7, +22.0] (+31 ms per native block), engine ms per 1k fills +13.9% [+10.6, +17.2] and signature verify +2.8 ms
+per native block [+1.8, +3.9] (+25%). Exec per native block p99 is +18.9% [+9.4, +28.4].** Exec is the bottleneck in both
+arms (busy 0.952 / 0.955, backlog ~43 blocks, mempool equally full), so the load generator is not what limits c100. The
+closed-loop bench submits 6.9% less [-9.6, -4.1], following the slower commits. Native blocks/s -7.0% [-15.2, +1.2] is
+not resolved. RSS peak is +0.32 GB [+0.14, +0.49] (+7.5%), mean +0.24 GB [+0.13, +0.35] (+6.6%). Device writes are flat
+(+1.8% [-4.0, +7.7]). The cloid share reached the chain exactly as set: stamped / placed 0 and 1.0000, `share_pct` 0 / 100,
+and 0 `duplicate_cloid` rejects on all 3 nodes in every cell. All 8 measured cells, the warm-up and the smoke cell are
+rc 0, ACCEPT, AGREE (no mark-only digest REJECT this time). **100% is the worst case. The cost at a realistic cloid share
+was not measured, and this A/B does not show that it scales linearly with the share.**
+
+Requested by 18c (s116) as optional filler: what does the cloid feature (`feat/cloid` `46a11c14`: u128 client order ids,
+unique across a trader's open orders via the `CloidMarkets` / `BookCloids` indices, consensus format change) cost per
+order? One binary in both arms: main `ef812b02`, node and bench built together, because cloid changed the signed-order
+format and the bench must match the node commit. The arms differ only in run-cell.sh `CLOID_SHARE` (bench
+`--cloid-share`, `ba02c933`). c0 = `CLOID_SHARE=0` (by construction the same actions, byte for byte, as a bench without
+the flag) and c100 = `CLOID_SHARE=100` (every placed order carries a cloid, `(run start ms << 64) | per-sender counter`,
+nonzero and unique per sender).
+
+Setup: the section 54 (p3mw) shape (tw, Classic, cap 8, 300 markets, standard shape, MAX_IN_FLIGHT 4, budget 900, harness
+RATE 76000 = saturated, 120 s cells + 60 s warm-up, commit tail, shared NVMe), no Phase 3 (no checkpoint knob, no enable
+line, no checkpoint series), glibc. `ef812b02`'s default build has no jemalloc feature: `malloc` is `UND`
+(`malloc@GLIBC_2.2.5`) in `.dynsym`, and no preload or mapped `libjemalloc` on any node in any cell. Built 13:14 with the
+p3q build flags (frame pointers, line tables, mold) into a fresh target dir (`~/.cargo-target-p3cloid-ef812b02`) from a
+clean detached worktree (`/home/oz/projects/wt/p3cloid-ef812b02`): node `6f363582` (build id `016bed06`), bench
+`9fda6c84` (build id `3cdf34c8`). Script `ozarchy-p3cloid-build.sh`, md5s in `ozarchy-p3cloid-build/md5s.txt`, staged in
+`ozarchy-p3cloid-stage/cl-run/release`. Harness = the same `ef812b02` worktree (run-cell.sh with `CLOID_SHARE`,
+summarize.py with `ingest.cloids`, `2eedbce7`). Driver `ozarchy-p3cloid-campaign.sh` CAMP=CLOID (copy of
+`ozarchy-p3q-campaign.sh`) adds a hard check per cell, `cloidchk`. It requires `cloid_share='P'` in run.log,
+`--cloid-share P` in the bench command, `summary.json` `ingest.cloids` `share_pct` = P with placed > 0 and stamped / placed
+= 0 (P = 0) or >= 0.99 (P = 100), and `torus_orders_rejected_reason_total{reason="duplicate_cloid"}` = 0 on all 3 nodes
+(`metrics-after`). A 60 s c100 smoke cell ran first (`ozarchy-p3cloid-smoke-300m-s0-c100`, 13:16-13:19: rc 0, ACCEPT,
+AGREE, all checks OK). Cells ran 13:22-14:14: w0 (c0, 60 s, excluded), r1 c0 c100, r2 c100 c0, r3 c0 c100, r4 c100 c0.
+The log has 135 CHECK OK, no CHECK FAIL, no deaths and no memguard stop. The host was quiet before every cell (no
+cargo / rustc / rust-analyzer, load 1.74-1.94). Cells are 120 s long, so **every figure here is minutes 0-2 only**.
+
+### 59.1 Cells and cloid checks
+
+| cell | arm | rc / agreement | `share_pct` | stamped | placed (orders) | stamped / placed | `duplicate_cloid` rejects val0 / val1 / val2 | matched/s | submit/s |
+|---|---|---|---|---|---|---|---|---|---|
+| smoke s0-c100 (60 s) | c100 | 0, ACCEPT AGREE | 100 | 18,461,600 | 18,461,600 | 1.0000 | 0 / 0 / 0 | 171,674 | 1,196 |
+| w0 (60 s, excluded) | c0 | 0, ACCEPT AGREE | 0 | 0 | 19,174,800 | 0.0000 | 0 / 0 / 0 | 179,134 | 1,254 |
+| r1-c0 / r1-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 31,262,800 | 33,318,000 / 31,262,800 | 0 / 1.0000 | 0 / 0 / 0 both | 188,242 / 169,297 | 1,113 / 1,038 |
+| r2-c0 / r2-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 31,139,600 | 33,492,400 / 31,139,600 | 0 / 1.0000 | 0 / 0 / 0 both | 185,643 / 162,832 | 1,098 / 1,033 |
+| r3-c0 / r3-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 31,641,200 | 33,140,400 / 31,641,200 | 0 / 1.0000 | 0 / 0 / 0 both | 194,876 / 169,909 | 1,105 / 1,046 |
+| r4-c0 / r4-c100 | | 0 / 0, ACCEPT AGREE | 0 / 100 | 0 / 29,617,600 | 32,258,400 / 29,617,600 | 0 / 1.0000 | 0 / 0 / 0 both | 185,856 / 164,167 | 1,081 / 979 |
+
+The `duplicate_cloid` series is present (at 0) on every node of every cell, c0 included. The bench never reused a cloid
+among a trader's open orders, and no node rejected one. Per round, matched/s c100 - c0 is -18,945 / -22,811 / -24,967 /
+-21,689: all four rounds point the same way.
+
+### 59.2 Per arm (n = 4, mean; paired c100 - c0 over the 4 rounds, 95% CI t(3))
+
+| | c0 (`CLOID_SHARE=0`) | c100 (`CLOID_SHARE=100`) | c100 - c0 | % [95% CI] |
+|---|---|---|---|---|
+| matched/s (120 s = minutes 0-2) | 188,654 | 166,551 | -22,103 [-26,091, -18,115] | **-11.72% [-13.83, -9.60]** |
+| placed/s | 246,747 | 217,751 | -28,997 | **-11.75% [-13.91, -9.59]** |
+| bench submits/s | 1,099 | 1,024 | -75 | **-6.85% [-9.60, -4.09]** |
+| native blocks/s | 3.41 | 3.17 | -0.24 | -6.99% [-15.20, +1.22] |
+| actions / fills per native block | 270 / 50,613 | 267 / 50,332 | | -1.0% [-7.9, +5.8] / -0.6% [-9.3, +8.1] |
+| exec `block_ms` (summary, mean of 3 nodes) | 262.3 | 293.3 | +31.1 [+4.5, +57.6] | **+11.84% [+1.72, +21.97]** |
+| exec `chain_ms` (summary headline, val0) | 257.4 | 288.3 | +30.9 [+5.0, +56.7] | **+11.99% [+1.96, +22.03]** |
+| exec per native block (logs) mean / p50 / p99 ms | 366 / 370 / 720 | 406 / 417 / 856 | +40.1 / +47.0 / +136.0 | **mean +11.0% [+5.7, +16.3], p50 +12.7% [+5.4, +20.0], p99 +18.9% [+9.4, +28.4]** |
+| engine ms per 1k fills | 4.12 | 4.69 | +0.57 [+0.44, +0.71] | **+13.90% [+10.59, +17.22]** |
+| block time (commit interval, logs) p50 / p99 ms | 159 / 1,251 | 155 / 1,402 | -3.6 / +151 | p50 -2.3% [-16.3, +11.7], p99 **+12.1% [+2.7, +21.5]** |
+| exec busy | 0.952 | 0.955 | +0.002 | +0.2% [-0.6, +1.1] |
+| exec backlog mean / max (blocks) / lag s | 42.5 / 62.7 / 12.3 | 43.5 / 63.0 / 13.2 | +1.1 / +0.3 / +1.0 | +2.5% [-11.9, +16.8] / +0.5% / +7.9% [-3.6, +19.4] |
+| mempool mean / max (actions) | 5,705 / 11,858 | 5,686 / 11,786 | | -0.3% [-7.3, +6.6] / -0.6% [-6.3, +5.1] |
+| node CPU-s/1M (whole run) | 26.43 | 28.77 | +2.34 [+1.95, +2.73] | **+8.84% [+7.37, +10.31]** |
+| node CPU at equal fills (ANCOVA, Welch) | | | | **+6.37% [+3.05, +9.70]** |
+| node CPU-s / fills per node, whole run (M) | 668 / 25.27 | 680 / 23.64 | | |
+| RSS peak / mean per node GB (cpu.csv, mean of 3) | 4.25 / 3.62 | 4.57 / 3.86 | **+0.32 [+0.14, +0.49] / +0.24 [+0.13, +0.35]** | +7.50% [+3.40, +11.61] / +6.63% [+3.55, +9.70] |
+| RSS peak / mean in the bench window GB (mem-samples) | 4.24 / 3.66 | 4.46 / 3.76 | +0.22 [+0.07, +0.38] / +0.10 [-0.20, +0.39] | +5.2% [+1.5, +8.9] / +2.7% [-5.4, +10.8] |
+| VmHWM GB / RSS last 15 s of the window GB | 4.38 / 4.19 | 4.72 / 4.43 | +0.34 [+0.06, +0.62] / +0.23 [+0.07, +0.39] | +7.7% / +5.6% |
+| RSS growth over the bench window GB/min | 0.86 | 1.11 | +0.25 [-0.11, +0.60] | +29% [-13, +70] |
+| memtables MB / resident rows MB | 292 / 195 | 276 / 190 | | -5.6% [-15.5, +4.3] / -2.9% [-8.5, +2.7] |
+| device writes MB/s per validator (io-ticks, bench window) | 145.1 | 147.7 | +2.7 [-5.8, +11.2] | +1.8% [-4.0, +7.7] |
+
+Welch intervals (`arms.txt`) agree in sign and resolution with the paired ones for matched/s (-11.72% [-15.35, -8.08]),
+CPU-s/1M (+8.84% [+6.38, +11.30]), engine ms per 1k fills, exec p99 (+18.87% [+10.31, +27.43]), `block_ms` (+11.84%
+[+4.16, +19.52]) and RSS peak / mean (+7.50% [+4.19, +10.81] / +6.63% [+4.39, +8.87]). Two rows differ. The block time
+p99 is just not resolved under Welch (+12.1% [-0.4, +24.6]). The RSS growth is resolved under Welch (+28.7% [+2.9,
++54.5]) but not paired, so read it as "consistent with faster growth", not established. Node CPU-s per cell is nearly flat
+(668 vs 680), while fills per node fall 6.5%: the executor spends the same CPU and gets fewer fills done.
+
+### 59.3 Where the exec time goes (per native block, ms, mean of 3 nodes; paired c100 - c0, 95% CI t(3))
+
+| phase | c0 | c100 | c100 - c0 [95% CI] |
+|---|---|---|---|
+| `verify` (signature verify) | 11.48 | 14.30 | **+2.82 [+1.78, +3.86]** (+24.6%) |
+| `replay_guard` | 2.84 | 2.62 | -0.23 [-0.70, +0.25] |
+| `load_books` | 0.33 | 0.30 | -0.03 [-0.08, +0.02] |
+| `engine` | 213.49 | 240.41 | **+26.92 [+5.12, +48.72]** (+12.6%) |
+| `action_status` | 0.28 | 0.26 | -0.02 [-0.05, +0.01] |
+| `save_books` | 13.22 | 13.56 | +0.34 [-1.44, +2.12] |
+| `end_resident_wait` | 7.36 | 3.93 | **-3.44 [-4.54, -2.33]** |
+| `residual_untimed` | 13.26 | 17.95 | **+4.70 [+4.09, +5.30]** (+35.4%) |
+| `flush` (off the chain path) | 75.22 | 82.33 | +7.11 [-3.47, +17.69] |
+| `end_resident` (off the chain path) | 37.69 | 36.39 | -1.29 [-6.12, +3.53] |
+
+The on-chain phases add up to the `block_ms` delta: +2.82 (verify) + 26.92 (engine) + 4.70 (residual) - 3.44
+(end_resident wait) + 0.06 (the rest) = +31.06 ms. **The engine carries ~87% of the extra exec time, signature verify ~9%
+and the untimed residual ~15%, partly offset by a shorter wait for the end_resident worker.** At about the same actions
+and fills per block (-1.0% / -0.6%, ties), that points at per-order work. Verify +25% is consistent with hashing and
+verifying larger signed orders (the u128 cloid in the canonical bytes). The engine +13.9% per 1k fills is consistent
+with the per-order cloid index work (`CloidMarkets` insert / remove, `BookCloids` per book) on place, fill and
+cancel-all. No profile was taken, so the split inside the engine is not shown. The shorter `end_resident_wait` is consistent
+with the end_resident worker having more time to finish while the longer engine phase runs.
+
+### 59.4 Agreement and other checks
+
+All 8 measured cells, w0 and the smoke cell: rc 0, ACCEPT, AGREE. In every cell the 3 nodes' digests took within
+~3.4 s of each other (24-79 s per cell), so no node was slow enough for the mark-only digest artifact of sections 46-56,
+and no cell had that REJECT. Nonce-window evictions were 0, in-flight timeouts 0, block-tail errors 0 and action
+failures 0 in every cell. Executed cancel-alls are equal on all 3 nodes and equal to those the load generator accepted. Action rejections (108-633 per cell) are equal on all 3 nodes in
+every cell. In-flight RPC refusals: c0 3 / 0 / 3 / 0, c100 10 / 83 / 6 / 135 (r1-r4). That is more in c100, and small
+next to the 115-135k released on commit per cell. The place / cancel-all mix is 61.1-62.3% place in both arms.
+
+**Verdict:** at 100% share, cloids cost ~12% of the matched/s ceiling and ~9% CPU per fill (6% at equal fills) on this
+glibc main. The cost is executor time per order: engine +14% per 1k fills, signature verify +25%, residual +35%, exec
+`block_ms` +12% and exec p99 +19%. RSS is +0.2-0.3 GB per node (+7%) over minutes 0-2. Writes do not move. Exec is
+saturated in both arms, so the drop is the node's, not the bench's. n = 4 x 120 s, but all four rounds agree:
+decisive for matched/s, placed/s, CPU-s/1M (also at equal fills), engine per 1k fills, verify, exec `block_ms`, exec p99
+and RSS peak / mean; "consistent with" for block time p99 and RSS growth; native blocks/s not resolved.
+
+**Caveats.** (1) **100% share is the worst case.** Real traffic would stamp a share of orders. The cost at a realistic
+share is not measured here. A lower share should cost less, but by how much is not known: this A/B has only the two end
+points and does not show that the cost scales linearly with the share. A c25 / c50 arm would. (2) **glibc only.** `ef812b02` predates the
+jemalloc merge (`655e874a`, now the default allocator on main). The cloid cost under compiled-in jemalloc is not measured.
+(3) 120 s cells: minutes 0-2, not a soak. (4) c0 runs the same cloid-capable node with no cloids on the wire. The cost of
+the cloid code at share 0 against a pre-cloid main is not measured. Section 58's wm (main `925fd962`, before `46a11c14`,
+200,292 matched/s) is another campaign and is not comparable with c0's 188,654. (5) The engine attribution in 59.3 has
+no profile behind it.
+
+Analysis (`tools/ozarchy-p3cloid-tools/analyst/`): `a-cells.py` (p3mw's, plus `ingest.cloids` and the `duplicate_cloid`
+reject deltas per node), `a-arms.py`, `a-paired.py` (p3mw's, unchanged, with `--io` for device writes), `a-archive.py`.
+Outputs `cells.txt`, `arms.txt`, `paired.txt`, `phases.txt` (per-phase paired deltas and the per-cell digest /
+`duplicate_cloid` / action-rejection lines) and `cloids.txt` (per-cell share check). The analyst printed `phases.txt` and
+`cloids.txt` from `cells.json` without a saved script; the verify / engine / residual / end_resident_wait / flush rows were
+recomputed from `cells.json` for this write-up and match. Full outputs (incl. `cells.json`) in
+`ozarchy-p3cloid-run/analyst/` on ozarchy. Driver `tools/ozarchy-p3cloid-tools/ozarchy-p3cloid-campaign.sh` (CAMP=CLOID,
+`cloidchk`), build `ozarchy-p3cloid-build.sh`, md5s `md5s-all.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

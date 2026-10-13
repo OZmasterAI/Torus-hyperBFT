@@ -1,0 +1,22 @@
+per-phase ms/native block (mean over 3 nodes), paired c100-c0, n=4, t(3) 95% CI
+verify                       c0    11.48 c100    14.30 delta   +2.82 [  +1.78,  +3.86]
+replay_guard                 c0     2.84 c100     2.62 delta   -0.23 [  -0.70,  +0.25]
+load_books                   c0     0.33 c100     0.30 delta   -0.03 [  -0.08,  +0.02]
+engine                       c0   213.49 c100   240.41 delta  +26.92 [  +5.12, +48.72]
+action_status                c0     0.28 c100     0.26 delta   -0.02 [  -0.05,  +0.01]
+save_books                   c0    13.22 c100    13.56 delta   +0.34 [  -1.44,  +2.12]
+flush                        c0    75.22 c100    82.33 delta   +7.11 [  -3.47, +17.69]
+end_resident                 c0    37.69 c100    36.39 delta   -1.29 [  -6.12,  +3.53]
+end_resident_wait            c0     7.36 c100     3.93 delta   -3.44 [  -4.54,  -2.33]
+residual_untimed             c0    13.26 c100    17.95 delta   +4.70 [  +4.09,  +5.30]
+
+digest / agreement per cell:
+w0 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [293.0, 293.0, 293.0]
+r1-c0 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [416.0, 416.0, 416.0]
+r1-c100 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [386.0, 386.0, 386.0]
+r2-c100 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [312.0, 312.0, 312.0]
+r2-c0 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [360.0, 360.0, 360.0]
+r3-c0 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [563.0, 563.0, 563.0]
+r3-c100 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [108.0, 108.0, 108.0]
+r4-c100 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [439.0, 439.0, 439.0]
+r4-c0 AGREE null dup_cloid_delta [0.0, 0.0, 0.0] action_rej [633.0, 633.0, 633.0]
