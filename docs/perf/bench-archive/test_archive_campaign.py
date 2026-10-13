@@ -1311,6 +1311,22 @@ class StripTrailing(FixtureCase):
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("strip_trailing", r.stderr)
 
+    def test_crlf_counts_as_trailing_whitespace(self):
+        fx = self.fx
+        # `git diff --check` flags the \r of a CRLF line end
+        write(self.an("crlf.txt"), b"a\r\nb \r\n\r\n")
+        write(self.an("a-crlf.py"), "")
+        snap = fx.snapshot()
+        r = fx.run("--strict", meta=self.meta(["analyst/perf-report-*.txt"]))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        w = [l for l in r.stderr.splitlines() if l.startswith("WARNING (t)")]
+        self.assertEqual(len(w), 1, r.stderr)
+        self.assertIn("analyst/crlf.txt", w[0])
+        self.assertEqual(fx.snapshot(), snap)
+        r = fx.run("--strict", meta=self.meta(["analyst/perf-report-*.txt", "analyst/crlf.txt"]))
+        self.assertOk(r)
+        self.assertEqual(self.staged("analyst/crlf.txt"), b"a\nb\n")
+
     def test_strip_unit(self):
         m = load_module()
         self.assertEqual(m.strip_trailing(PERF_REPORT.encode()), PERF_REPORT_STRIPPED.encode())
@@ -1318,6 +1334,10 @@ class StripTrailing(FixtureCase):
         self.assertEqual(m.strip_trailing(b""), b"")
         self.assertEqual(m.strip_trailing(b"\n\n"), b"")
         self.assertEqual(m.strip_trailing(b"a\n"), b"a\n")
+        self.assertEqual(m.strip_trailing(b"a\r\nb \r\n\r\n"), b"a\nb\n")
+        self.assertEqual(m.strip_trailing(b"a\r"), b"a")
+        self.assertTrue(m.has_trailing(b"a\r\n"))
+        self.assertFalse(m.has_trailing(b"a\rb\n"))  # a bare \r inside a line is not at its end
 
 
 class SummaryRows(FixtureCase):
