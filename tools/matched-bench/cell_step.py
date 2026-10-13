@@ -17,9 +17,9 @@ tab-separated:  label arm rep rc agree md5_ok metric flag
   agree   yes iff summary.json validity.verdict == ACCEPT and agreement_verdict == AGREE (the RAW
           result: a known-artifact cell has agree=no and flag=ok)
   md5_ok  yes iff every recorded node binary md5 of the cell equals the staged md5 of its arm:
-          summary.json binaries.torus_node_md5 (full) and each running process's exe_md5
-          (node-environ-trie.txt, 3 nodes; node-restart-env.txt, a restarted node) — at least
-          one process record is required
+          each running process's exe_md5 (node-environ-trie.txt, 3 nodes; node-restart-env.txt,
+          a restarted node) — at least one process record is required — and summary.json
+          binaries.torus_node_md5 (full) when present (optional: a missing one is skipped)
   metric  matched/s: the analysis row's --analysis-metric value, else summary.json
           headline.matched_s_avg, else 0 (no summary); plain number
   flag    ok | bad:<reason>[,<reason>...]   reasons, in this order:
