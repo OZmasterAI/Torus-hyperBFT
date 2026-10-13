@@ -1175,6 +1175,25 @@ class OutputPaths(FixtureCase):
             self.assertIn("+++ b/%s\n" % self.paths[p], r.stdout)
         self.assertIn("+++ b/%s/md5s-all.txt\n" % self.paths["tools"], r.stdout)
 
+    def test_same_output_path_twice_is_refused(self):
+        fx = self.fx
+        snap = fx.snapshot()
+        index = os.path.join(fx.archive, "INDEX.md")
+        r = fx.run("--deletable-file", index)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("same file", r.stderr)
+        self.assertIn(index, r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+        # another spelling of the same file, and a doc inside the tools copy dir
+        r = fx.run("--cells-file", os.path.join(fx.archive, "x", "..", "INDEX.md"))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("same file", r.stderr)
+        r = fx.run(*self.args()[:6], "--tools-dir", self.out)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn(self.out, r.stderr)
+        self.assertEqual(fx.snapshot(), snap)
+        self.assertEqual(sorted(os.listdir(self.out)), ["C.md", "D.md", "IDX.md"])
+
     def test_default_labels_unchanged(self):
         r = self.fx.run("--dry-run")
         self.assertOk(r)
