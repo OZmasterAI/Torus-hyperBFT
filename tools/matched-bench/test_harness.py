@@ -379,6 +379,20 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d)
         self.assertIsNone(s["ingest"]["cancel_by_id"])
 
+    def test_cloid_line_is_ingested(self):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED + (
+                "Cloids (load-gen generated): 4521 of 9040 orders (50.0%) | --cloid-share 50%\n"))
+        s, _ = run_summarize(self.d)
+        self.assertEqual(s["ingest"]["cloids"], {
+            "share_pct": 50, "stamped": 4521, "placed": 9040})
+        # A bench before --cloid-share prints no line: None, not 0%.
+        write_cell(self.d, 1_000, 1_000)
+        s, _ = run_summarize(self.d)
+        self.assertIsNone(s["ingest"]["cloids"])
+
     def test_first120_equals_avg_on_a_120s_cell(self):
         write_cell(self.d, 40_000, 0, dur=120)
         write_agreement(self.d, ["same"] * 3)
