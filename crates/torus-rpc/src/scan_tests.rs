@@ -782,3 +782,260 @@ async fn a_corrupt_meta_row_is_an_error_not_an_empty_book() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Review round 2 (Codex): classic mark price, truncated order rows, proposal
+// size, getMarkets / getBlockTrades
+// ---------------------------------------------------------------------------
+
+/// [P1] Classic `getMarkPrice` decodes the market's whole-book blob for one
+/// scalar: the blob is charged by its size (one row per started 128 B) to
+/// the request budget before it is decoded, as `getOrderBook` charges it.
+/// Row layouts read only the meta row.
+#[tokio::test]
+async fn classic_mark_price_charges_the_blob_before_decoding() {
+    for mode in MODES {
+        let (_d, state) = db();
+        seed_deep_book(&state, mode);
+
+        let s = server(&state, 100);
+        let got = s.state().get_mark_price("0x1".into()).await;
+        if matches!(mode, BookMode::Classic) {
+            assert_scan_limit(&got.unwrap_err(), "classic blob of 600 orders, budget 100");
+            assert!(
+                (1..=101).contains(&examined(&s)),
+                "examined {}",
+                examined(&s)
+            );
+        } else {
+            let m = got.unwrap_or_else(|e| panic!("{mode:?}: {e:?}"));
+            assert_eq!(m.last_trade_price, dec_fp(FixedPoint::ZERO), "{mode:?}");
+            assert!(
+                (1..=5).contains(&examined(&s)),
+                "{mode:?}: examined {}",
+                examined(&s)
+            );
+        }
+
+        // Under the budget: the answer is unchanged, the blob counted.
+        let s = server(&state, 100_000);
+        let m = s.state().get_mark_price("0x1".into()).await.unwrap();
+        assert_eq!(m.last_trade_price, dec_fp(FixedPoint::ZERO), "{mode:?}");
+        if matches!(mode, BookMode::Classic) {
+            assert!(examined(&s) > 100, "examined {}", examined(&s));
+        }
+    }
+}
+
+/// The order rows of market `mid` under `mode` (`(cf, key, value)`).
+fn order_rows(
+    state: &StateDb,
+    mode: BookMode,
+    mid: MarketId,
+) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
+    use torus_state::StateBackend;
+    let (cf, prefix) = match mode {
+        BookMode::OrderRows => (
+            CF_NATIVE_ORDER_BOOKS,
+            [&mid.to_be_bytes()[..], &[ROW_TAG_ORDER]].concat(),
+        ),
+        _ => (CF_BOOK_ORDER_ROWS, mid.to_be_bytes().to_vec()),
+    };
+    let rows = StateBackend::iterate_cf(state, cf, Some(&prefix)).unwrap();
+    assert!(!rows.is_empty(), "{mode:?}: market {mid} has order rows");
+    rows.into_iter().map(|(k, v)| (cf, k, v)).collect()
+}
+
+/// [P2] An order row that does not decode is the `BookCorrupt` error the
+/// unbounded reader (`book_reader::read_open_orders`) returns, whoever's row
+/// it is: rows are validated BEFORE the trader filter, never skipped (a
+/// truncated row has no readable trader, a row cut by one byte still has).
+#[tokio::test]
+async fn a_truncated_order_row_is_book_corrupt_not_skipped() {
+    let maker = addr(MAKER);
+    for mode in [BookMode::OrderRows, BookMode::LevelAuthority] {
+        let layout = match mode {
+            BookMode::OrderRows => BookLayout::OrderRows,
+            _ => BookLayout::LevelAuthority,
+        };
+        // (market of the corrupt row, its new length, markets queried)
+        let cases: [(MarketId, fn(usize) -> usize, &[Option<MarketId>]); 2] = [
+            // The maker's own row cut to 30 B (the trader bytes are gone).
+            (1, |_| 30, &[Some(1), None]),
+            // Another trader's row cut by one byte (its trader is readable).
+            (2, |n| n - 1, &[None, Some(2)]),
+        ];
+        for (mid, cut, queries) in cases {
+            let (_d, state) = db();
+            seed_crowded(&state, mode);
+            let (cf, key, value) = order_rows(&state, mode, mid).remove(0);
+            state
+                .put_cf_raw(cf, &key, &value[..cut(value.len())])
+                .unwrap();
+            for &market in queries {
+                let want = book_reader::read_open_orders(&state, &maker, market, layout, 5000)
+                    .expect_err("the unbounded reader rejects the row")
+                    .to_string();
+                assert!(want.contains("book order row"), "{want}");
+                let s = server(&state, 100_000);
+                let e = s
+                    .state()
+                    .get_open_orders(hex_addr(maker), market.map(|m| format!("0x{m:x}")))
+                    .await
+                    .expect_err("a corrupt row is an error, not a short list");
+                assert!(
+                    e.message().contains(&want),
+                    "{mode:?} row of market {mid}, query {market:?}: {e:?} (want {want})"
+                );
+            }
+        }
+    }
+}
+
+fn put_big_proposal(state: &StateDb, id: u64, description_bytes: usize) -> usize {
+    let p = Proposal {
+        id,
+        proposer: addr(1),
+        title: format!("p{id}"),
+        description: "x".repeat(description_bytes),
+        proposal_type: ProposalType::TextProposal,
+        status: ProposalStatus::Active,
+        votes_for: U256::ZERO,
+        votes_against: U256::ZERO,
+        start_block: 1,
+        end_block: 2,
+        executable_after: 3,
+        snapshot_block: 1,
+        execution_payload: None,
+    };
+    let bytes = borsh::to_vec(&p).unwrap();
+    state
+        .put_cf_raw(CF_GOVERNANCE_PROPOSALS, &id.to_be_bytes(), &bytes)
+        .unwrap();
+    bytes.len()
+}
+
+/// [P2] A proposal row is charged by its size (one row per started 128 B,
+/// the row itself included) before it is decoded: one large proposal is not
+/// one row, even when a status filter drops it.
+#[tokio::test]
+async fn proposal_rows_are_charged_by_size_before_decoding() {
+    let (_d, state) = db();
+    let len = put_big_proposal(&state, 0, 64 * 1024);
+    for status in [Some("Passed".to_string()), None] {
+        let s = server(&state, 100);
+        let e = s.state().get_proposals(status.clone()).await.unwrap_err();
+        assert_scan_limit(&e, &format!("{status:?}: one {len} B proposal"));
+        assert!(
+            (1..=101).contains(&examined(&s)),
+            "{status:?}: examined {}",
+            examined(&s)
+        );
+    }
+    let s = server(&state, 10_000);
+    assert_eq!(s.state().get_proposals(None).await.unwrap().len(), 1);
+    assert_eq!(examined(&s), packed_rows(len) as u64, "{len} B");
+    let s = server(&state, 10_000);
+    assert!(s
+        .state()
+        .get_proposals(Some("Passed".into()))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Markets `1..=n` in the governance borsh layout (`StoredMarket`).
+fn list_markets(state: &StateDb, n: u64) {
+    use borsh::BorshSerialize;
+    use torus_state::cf::CF_NATIVE_MARKETS;
+    for mid in 1..=n {
+        let mut row = Vec::new();
+        "BTC".to_string().serialize(&mut row).unwrap();
+        "USD".to_string().serialize(&mut row).unwrap();
+        FixedPoint::SCALE.serialize(&mut row).unwrap();
+        FixedPoint::SCALE.serialize(&mut row).unwrap();
+        (5 * FixedPoint::SCALE).serialize(&mut row).unwrap();
+        state
+            .put_cf_raw(CF_NATIVE_MARKETS, &mid.to_be_bytes(), &row)
+            .unwrap();
+    }
+}
+
+/// [P2] `getMarkets(offset)` walks every market row before the offset: each
+/// row visited is charged, so a deep offset is refused at the budget.
+#[tokio::test]
+async fn markets_offset_is_charged_to_the_scan_budget() {
+    let (_d, state) = db();
+    list_markets(&state, 1000);
+
+    let s = server(&state, 100);
+    let e = s.state().get_markets(Some(999), Some(1)).await.unwrap_err();
+    assert_scan_limit(&e, "offset 999 of 1000 markets, budget 100");
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
+
+    // The first page fits: the same rows as before.
+    let s = server(&state, 100);
+    let page = s.state().get_markets(None, Some(10)).await.unwrap();
+    assert_eq!(page.len(), 10);
+    assert_eq!(page[0].market_id, "0x1");
+    assert!(
+        (1..=10).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
+
+    let s = server(&state, 10_000);
+    let last = s.state().get_markets(Some(999), Some(1)).await.unwrap();
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].market_id, "0x3e8");
+}
+
+/// [P2] `getBlockTrades` seeks every market's trade rows for the block, even
+/// for an empty block: each market row visited (and each trade row, by size)
+/// is charged, so a large market table is refused at the budget.
+#[tokio::test]
+async fn block_trades_are_charged_per_market_to_the_scan_budget() {
+    use torus_state::trade_rows::TradeFill;
+    let (_d, state) = db();
+    list_markets(&state, 1000);
+    let fill = TradeFill {
+        trade_index: 0,
+        market: 5,
+        maker: addr(MAKER),
+        taker: addr(2),
+        price_raw: 10,
+        qty_raw: 1,
+        taker_side: 0,
+    };
+    let mut rows = torus_state::PackedCfBatch::default();
+    torus_state::trade_rows::encode_block(7, 70, &[fill], &mut rows);
+    for (cf, key, value) in rows.iter() {
+        state.put_cf_raw(cf, key, value).unwrap();
+    }
+
+    for block in [7, 8] {
+        let s = server(&state, 100);
+        let e = s.state().get_block_trades(block).await.unwrap_err();
+        assert_scan_limit(&e, &format!("block {block}: 1000 markets, budget 100"));
+        assert!(
+            (1..=101).contains(&examined(&s)),
+            "block {block}: examined {}",
+            examined(&s)
+        );
+    }
+
+    // Under the budget: the same trades as the unbudgeted scan.
+    let s = server(&state, 10_000);
+    let t = s.state().get_block_trades(7).await.unwrap();
+    assert_eq!(t.len(), crate::scan_trades_for_block(&state, 7).len());
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].market_id, "0x5");
+    assert!(examined(&s) >= 1000, "examined {}", examined(&s));
+    let s = server(&state, 10_000);
+    assert!(s.state().get_block_trades(8).await.unwrap().is_empty());
+}
