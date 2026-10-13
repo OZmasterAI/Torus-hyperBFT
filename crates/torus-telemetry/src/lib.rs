@@ -690,6 +690,14 @@ pub struct Metrics {
     /// Validators force-disconnected by the mesh watchdog (connected but
     /// unsubscribed past grace) to re-trigger the subscription exchange.
     pub mesh_watchdog_disconnects: Counter,
+    /// s114: validators force-disconnected because they opened a new
+    /// connection while we still held an older one (fast restart over a dead
+    /// QUIC connection: gossipsub skips sending our subscriptions on it).
+    pub mesh_stale_conn_disconnects: Counter,
+    /// s114: time from a validator's connect to our seeing it subscribed to
+    /// the consensus topic, spanning watchdog/stale-connection reconnects
+    /// (a wedge shows up as one long observation).
+    pub consensus_subscribe_delay_seconds: Histogram,
 
     // RocksDB runtime state (S405 BS-3) — the propose cost accumulates with
     // process lifetime, not persistent DB size; these expose the in-process
@@ -2381,6 +2389,21 @@ impl Metrics {
             mesh_watchdog_disconnects.clone(),
         );
 
+        let mesh_stale_conn_disconnects = Counter::default();
+        registry.register(
+            "torus_mesh_stale_conn_disconnects",
+            "Validators force-disconnected for redialing over a stale connection we still held (gossipsub skips resending subscriptions)",
+            mesh_stale_conn_disconnects.clone(),
+        );
+
+        // 50 ms .. ~102 s.
+        let consensus_subscribe_delay_seconds = Histogram::new(exponential_buckets(0.05, 2.0, 12));
+        registry.register(
+            "torus_consensus_subscribe_delay_seconds",
+            "Time from a validator connecting to it being seen subscribed to the consensus topic (spans watchdog reconnects)",
+            consensus_subscribe_delay_seconds.clone(),
+        );
+
         let rocksdb_l0_files = Family::<Vec<(String, String)>, Gauge>::default();
         registry.register(
             "torus_rocksdb_l0_files",
@@ -2722,6 +2745,8 @@ impl Metrics {
             consensus_mesh_peers,
             consensus_subscribed_validators,
             mesh_watchdog_disconnects,
+            mesh_stale_conn_disconnects,
+            consensus_subscribe_delay_seconds,
             rocksdb_l0_files,
             rocksdb_memtable_bytes,
             rocksdb_pending_compaction_bytes,
@@ -3333,11 +3358,15 @@ mod tests {
         m.consensus_mesh_peers.set(2);
         m.consensus_subscribed_validators.set(2);
         m.mesh_watchdog_disconnects.inc();
+        m.mesh_stale_conn_disconnects.inc();
+        m.consensus_subscribe_delay_seconds.observe(0.3);
         let text = m.encode();
         for name in [
             "torus_consensus_mesh_peers",
             "torus_consensus_subscribed_validators",
             "torus_mesh_watchdog_disconnects",
+            "torus_mesh_stale_conn_disconnects",
+            "torus_consensus_subscribe_delay_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }

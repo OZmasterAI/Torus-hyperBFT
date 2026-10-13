@@ -939,6 +939,183 @@ pub async fn run_swarm(
     .await
 }
 
+/// s114 mesh watchdog: what the swarm loop does after `handle_event` for a
+/// connection/subscription event (see [`crate::mesh_watchdog`]).
+enum WatchdogFollowUp {
+    None,
+    /// A validator redialed (connection established, or denied by the
+    /// per-peer cap) over stale connections we still hold: disconnect it
+    /// entirely so the reconnect re-runs the gossipsub subscription exchange.
+    StaleKick(PeerId),
+    /// A peer we kicked just lost its last connection: redial it now.
+    Redial(PeerId),
+}
+
+/// Feed one swarm event to the mesh watchdog (before `handle_event` consumes
+/// it). Pure bookkeeping; the returned action runs after `handle_event`.
+fn watchdog_observe_event(
+    event: &SwarmEvent<TorusBehaviourEvent>,
+    watchdog: &mut crate::mesh_watchdog::MeshWatchdog,
+    swarm: &Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    consensus_hash: &gossipsub::TopicHash,
+) -> WatchdogFollowUp {
+    let now = Instant::now();
+    match event {
+        SwarmEvent::ConnectionEstablished {
+            peer_id,
+            connection_id,
+            ..
+        } => {
+            let is_validator = is_validator_peer(shared, peer_id);
+            let already_subscribed = swarm
+                .behaviour()
+                .gossipsub
+                .all_peers()
+                .any(|(p, topics)| p == peer_id && topics.contains(&consensus_hash));
+            if watchdog.on_connection_established(
+                now,
+                *peer_id,
+                *connection_id,
+                is_validator,
+                already_subscribed,
+            ) {
+                return WatchdogFollowUp::StaleKick(*peer_id);
+            }
+        }
+        // Our per-peer connection cap is full of connections the peer no
+        // longer has (e.g. two dead QUIC connections of a killed node): the
+        // restarted peer is locked out until they idle out (10 s).
+        SwarmEvent::IncomingConnectionError {
+            peer_id: Some(peer_id),
+            error: libp2p::swarm::ListenError::Denied { .. },
+            ..
+        } => {
+            if watchdog.on_connection_denied(now, *peer_id, is_validator_peer(shared, peer_id)) {
+                return WatchdogFollowUp::StaleKick(*peer_id);
+            }
+        }
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            connection_id,
+            ..
+        } => {
+            if watchdog.on_connection_closed(*peer_id, *connection_id) {
+                return WatchdogFollowUp::Redial(*peer_id);
+            }
+        }
+        SwarmEvent::Behaviour(TorusBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+            peer_id,
+            topic,
+        })) if topic == consensus_hash => {
+            watchdog.on_subscribed(now, *peer_id);
+            observe_subscribe_delays(watchdog, shared);
+        }
+        _ => {}
+    }
+    WatchdogFollowUp::None
+}
+
+fn apply_watchdog_follow_up(
+    follow_up: WatchdogFollowUp,
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+) {
+    match follow_up {
+        WatchdogFollowUp::None => {}
+        WatchdogFollowUp::StaleKick(pid) => {
+            warn!(%pid, "mesh watchdog: validator redialed over stale connection(s) we still hold (gossipsub would skip our subscriptions) — forcing a clean reconnect");
+            if let Some(ref m) = shared.metrics {
+                m.mesh_stale_conn_disconnects.inc();
+            }
+            let _ = swarm.disconnect_peer_id(pid);
+        }
+        WatchdogFollowUp::Redial(pid) => watchdog_redial(swarm, shared, pid),
+    }
+}
+
+/// Redial a kicked peer, under the shared per-peer redial backoff.
+fn watchdog_redial(swarm: &mut Swarm<TorusBehaviour>, shared: &SharedState, pid: PeerId) {
+    if should_redial_now(shared, &pid) {
+        if let Err(e) = swarm.dial(pid) {
+            debug!(%pid, %e, "mesh watchdog redial failed");
+        }
+    }
+}
+
+fn observe_subscribe_delays(
+    watchdog: &mut crate::mesh_watchdog::MeshWatchdog,
+    shared: &SharedState,
+) {
+    let delays = watchdog.take_subscribe_delays();
+    if let Some(ref m) = shared.metrics {
+        for d in delays {
+            m.consensus_subscribe_delay_seconds.observe(d.as_secs_f64());
+        }
+    }
+}
+
+/// One mesh-watchdog evaluation (S395 wedge; s114: every
+/// `mesh_watchdog_tick`, default 1 s). A CURRENT-validator peer that stays
+/// connected but unsubscribed to the consensus topic past the grace gets a
+/// forced disconnect and an immediate redial (on its close, and here as a
+/// retry), re-running the subscription exchange the fast-restart race lost.
+fn run_watchdog_tick(
+    swarm: &mut Swarm<TorusBehaviour>,
+    shared: &SharedState,
+    watchdog: &mut crate::mesh_watchdog::MeshWatchdog,
+    consensus_hash: &gossipsub::TopicHash,
+) {
+    let local_pid = *swarm.local_peer_id();
+    let mapped: Vec<PeerId> = shared
+        .peer_map
+        .read()
+        .unwrap()
+        .peer_ids()
+        .filter(|pid| **pid != local_pid)
+        .copied()
+        .collect();
+    // peer_map also holds non-validator peers (RPC nodes).
+    let connected_validators: Vec<PeerId> = mapped
+        .into_iter()
+        .filter(|pid| is_validator_peer(shared, pid) && swarm.is_connected(pid))
+        .collect();
+    let subscribed: HashSet<PeerId> = swarm
+        .behaviour()
+        .gossipsub
+        .all_peers()
+        .filter(|(_, topics)| topics.contains(&consensus_hash))
+        .map(|(pid, _)| *pid)
+        .collect();
+    let now = Instant::now();
+    for pid in watchdog.tick(now, &connected_validators, &subscribed) {
+        warn!(%pid, "mesh watchdog: validator connected but unsubscribed past grace — forcing reconnect");
+        if let Some(ref m) = shared.metrics {
+            m.mesh_watchdog_disconnects.inc();
+        }
+        let _ = swarm.disconnect_peer_id(pid);
+    }
+    for pid in watchdog.redial_due(now, |p| swarm.is_connected(p)) {
+        watchdog_redial(swarm, shared, pid);
+    }
+    observe_subscribe_delays(watchdog, shared);
+    if let Some(ref m) = shared.metrics {
+        m.consensus_mesh_peers.set(
+            swarm
+                .behaviour()
+                .gossipsub
+                .mesh_peers(consensus_hash)
+                .count() as i64,
+        );
+        m.consensus_subscribed_validators.set(
+            connected_validators
+                .iter()
+                .filter(|pid| subscribed.contains(*pid))
+                .count() as i64,
+        );
+    }
+}
+
 pub async fn run_swarm_with_config(
     mut swarm: Swarm<TorusBehaviour>,
     mut command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
@@ -980,8 +1157,14 @@ pub async fn run_swarm_with_config(
 
     let mut mesh_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     mesh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // S395 subscription-wedge watchdog, evaluated on the mesh tick (Task 3).
-    let mut mesh_watchdog = crate::mesh_watchdog::MeshWatchdog::default();
+    // Subscription-wedge watchdog (S395; s114: own fast tick, 5 s grace,
+    // stale-connection kick on reconnect — see crate::mesh_watchdog).
+    let mut mesh_watchdog = crate::mesh_watchdog::MeshWatchdog::new(
+        config.mesh_watchdog_grace,
+        config.mesh_stale_conn_kick,
+    );
+    let mut watchdog_interval = tokio::time::interval(config.mesh_watchdog_tick);
+    watchdog_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut native_batch: Vec<Vec<u8>> = Vec::with_capacity(256);
     // Running on-wire size of `native_batch` (header + length-prefixed entries),
@@ -1093,34 +1276,11 @@ pub async fn run_swarm_with_config(
                 for pid in &validator_pids {
                     swarm.behaviour_mut().gossipsub.add_explicit_peer(pid);
                 }
-
-                // Watchdog (S395 wedge): a CURRENT-validator peer that stays
-                // connected but unsubscribed to the consensus topic past grace
-                // gets a forced disconnect; the dial above re-establishes the
-                // connection next tick, re-running the subscription exchange
-                // the fast-restart race lost.
-                let connected_validators: Vec<PeerId> = validator_pids.iter()
-                    .filter(|pid| swarm.is_connected(pid))
-                    .copied()
-                    .collect();
-                let consensus_hash = consensus_topic.hash();
-                let subscribed: HashSet<PeerId> = swarm.behaviour().gossipsub.all_peers()
-                    .filter(|(_, topics)| topics.contains(&&consensus_hash))
-                    .map(|(pid, _)| *pid)
-                    .collect();
-                for pid in mesh_watchdog.tick(std::time::Instant::now(), &connected_validators, &subscribed) {
-                    warn!(%pid, "mesh watchdog: validator connected but unsubscribed past grace — forcing reconnect");
-                    if let Some(ref m) = shared.metrics {
-                        m.mesh_watchdog_disconnects.inc();
-                    }
-                    let _ = swarm.disconnect_peer_id(pid);
-                }
-                if let Some(ref m) = shared.metrics {
-                    m.consensus_mesh_peers
-                        .set(swarm.behaviour().gossipsub.mesh_peers(&consensus_hash).count() as i64);
-                    m.consensus_subscribed_validators
-                        .set(connected_validators.iter().filter(|pid| subscribed.contains(*pid)).count() as i64);
-                }
+                continue;
+            }
+            // Watchdog (S395 wedge, s114 fast tick): see `run_watchdog_tick`.
+            _ = watchdog_interval.tick() => {
+                run_watchdog_tick(&mut swarm, &shared, &mut mesh_watchdog, &consensus_topic.hash());
                 continue;
             }
         };
@@ -1130,6 +1290,13 @@ pub async fn run_swarm_with_config(
         }
         match action {
             SwarmAction::Event(event) => {
+                let follow_up = watchdog_observe_event(
+                    &event,
+                    &mut mesh_watchdog,
+                    &swarm,
+                    &shared,
+                    &consensus_topic.hash(),
+                );
                 handle_event(
                     *event,
                     &mut swarm,
@@ -1142,6 +1309,7 @@ pub async fn run_swarm_with_config(
                     max_consensus_msg_size,
                     max_tx_msg_size,
                 );
+                apply_watchdog_follow_up(follow_up, &mut swarm, &shared);
             }
             SwarmAction::DaServeDone(Some((channel, response, peer))) => {
                 if swarm

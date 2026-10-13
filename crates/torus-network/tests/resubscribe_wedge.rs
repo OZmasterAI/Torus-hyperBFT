@@ -31,9 +31,15 @@ use torus_network::bridge::peer_id_from_verifying_key;
 use torus_network::{LibP2PNetwork, NetworkConfig};
 
 const CHILD_ENV: &str = "TORUS_WEDGE_CHILD";
-/// Restarted-node publishes must reach both peers within this budget. Before
-/// the fix recovery waits for the 60 s watchdog grace + a 10 s tick.
-const RECOVERY_BUDGET: Duration = Duration::from_secs(15);
+/// Restarted-node publishes must reach both peers within this budget via the
+/// peers' stale-connection kick (measured 0.4-0.7 s). Below the watchdog
+/// backstop's floor (5 s grace + tick), so the kick itself is what passes.
+/// Before the fix: 75 s (60 s grace + 10 s tick).
+const RECOVERY_BUDGET: Duration = Duration::from_secs(5);
+/// Watchdog-only recovery budget: 5 s grace + 1 s tick on the restarted
+/// node, plus one backed-off retry (another grace) if the first redial lands
+/// before the peers' dead QUIC connection has idled out (10 s after the kill).
+const WATCHDOG_ONLY_BUDGET: Duration = Duration::from_secs(20);
 /// Views carry `generation * GEN_STRIDE + counter`, so the parent can tell
 /// post-restart publishes apart from anything the first incarnation sent.
 const GEN_STRIDE: u64 = 1_000_000;
@@ -122,6 +128,8 @@ struct ChildSpec {
     generation: u64,
     peers: Vec<(PeerId, Multiaddr)>,
     validators: Vec<VerifyingKey>,
+    /// Extra env for the child (e.g. `TORUS_MESH_STALE_CONN_KICK=0`).
+    env: Vec<(&'static str, &'static str)>,
 }
 
 fn spawn_child(spec: &ChildSpec) -> ChildGuard {
@@ -145,6 +153,7 @@ fn spawn_child(spec: &ChildSpec) -> ChildGuard {
         .env("WEDGE_GEN", spec.generation.to_string())
         .env("WEDGE_PEERS", peers)
         .env("WEDGE_VALIDATORS", vals)
+        .envs(spec.env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -156,7 +165,7 @@ fn spawn_child(spec: &ChildSpec) -> ChildGuard {
 /// consensus message every 200 ms until killed (hard cap 180 s as a safety
 /// net should the parent die without reaping it).
 #[tokio::test]
-#[ignore = "child-process entry point for restarted_validator_can_publish_within_budget"]
+#[ignore = "child-process entry point for the restart_scenario tests"]
 async fn wedge_child_node() {
     if std::env::var(CHILD_ENV).is_err() {
         return;
@@ -216,19 +225,19 @@ async fn wait_for_generation(
     None
 }
 
-/// RED (s114): kill -9 a validator and restart it on the same key/port within
-/// ~1.5 s; its consensus publishes must reach both peers within
-/// [`RECOVERY_BUDGET`]. Before the fix the restarted node stays
-/// connected-but-unsubscribed until the 60 s watchdog grace expires.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restarted_validator_can_publish_within_budget() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let budget = std::env::var("TORUS_WEDGE_TEST_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(RECOVERY_BUDGET);
-
+/// Kill -9 node B, restart it on the same key/port ~1.5 s later (A and C
+/// still hold the dead QUIC connection(s)), and time until B's post-restart
+/// publishes reach both A and C. `stale_kick` sets `mesh_stale_conn_kick` on
+/// every node. `b_dials_first`: B's first incarnation also dials A and C, so
+/// each pair ends up with TWO connections (simultaneous dial) and the dead
+/// pair fills the per-peer cap (restarted B is denied); otherwise only A
+/// and C dial B, leaving ONE dead connection each (restarted B connects
+/// but is never sent their subscriptions). `None` = timed out after `budget`.
+async fn restart_scenario(
+    stale_kick: bool,
+    b_dials_first: bool,
+    budget: Duration,
+) -> (Duration, Option<Duration>) {
     let (sk_a, sk_c) = (seed_key(1), seed_key(3));
     let (vk_a, vk_b, vk_c) = (
         sk_a.verifying_key(),
@@ -247,13 +256,26 @@ async fn restarted_validator_can_publish_within_budget() {
         seed: 2,
         port: port_b,
         generation,
-        peers: vec![(pid_a, quic_addr(port_a)), (pid_c, quic_addr(port_c))],
+        peers: if generation > 1 || b_dials_first {
+            vec![(pid_a, quic_addr(port_a)), (pid_c, quic_addr(port_c))]
+        } else {
+            vec![]
+        },
         validators: validators.clone(),
+        env: if stale_kick {
+            vec![]
+        } else {
+            vec![("TORUS_MESH_STALE_CONN_KICK", "0")]
+        },
+    };
+    let config = |port, peers| NetworkConfig {
+        mesh_stale_conn_kick: stale_kick,
+        ..node_config(port, peers)
     };
 
     let mut child = spawn_child(&spec(1));
     let (mut net_a, _ta, _na) = LibP2PNetwork::new(
-        node_config(
+        config(
             port_a,
             vec![(pid_b, quic_addr(port_b)), (pid_c, quic_addr(port_c))],
         ),
@@ -262,7 +284,7 @@ async fn restarted_validator_can_publish_within_budget() {
     .await
     .unwrap();
     let (mut net_c, _tc, _nc) = LibP2PNetwork::new(
-        node_config(
+        config(
             port_c,
             vec![(pid_a, quic_addr(port_a)), (pid_b, quic_addr(port_b))],
         ),
@@ -282,7 +304,6 @@ async fn restarted_validator_can_publish_within_budget() {
     )
     .await
     .expect("baseline: B's publishes never reached A and C on a fresh mesh");
-    eprintln!("baseline mesh delivery after {baseline:?}");
     // Let the mesh settle (heartbeats, explicit peering) like a live chain.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -295,8 +316,8 @@ async fn restarted_validator_can_publish_within_budget() {
 
     let recovered = wait_for_generation(&mut [&mut net_a, &mut net_c], vk_b, 2, budget).await;
     let line = format!(
-        "baseline {baseline:?}; restart -> B's publishes at A and C: {recovered:?} \
-         (budget {budget:?}, wall {:?})\n",
+        "stale_kick={stale_kick} b_dials_first={b_dials_first}: baseline {baseline:?}; restart -> B's publishes at A and C: \
+         {recovered:?} (budget {budget:?}, wall {:?})\n",
         restarted.elapsed()
     );
     eprint!("{line}");
@@ -310,9 +331,165 @@ async fn restarted_validator_can_publish_within_budget() {
             .unwrap();
         f.write_all(line.as_bytes()).unwrap();
     }
+    (baseline, recovered)
+}
+
+fn budget_or(default: Duration) -> Duration {
+    std::env::var("TORUS_WEDGE_TEST_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+/// s114: kill -9 a validator and restart it on the same key/port within
+/// ~1.5 s; its consensus publishes must reach both peers within
+/// [`RECOVERY_BUDGET`]. Before the fix the restarted node stayed
+/// connected-but-unsubscribed until the 60 s watchdog grace expired (75 s
+/// measured). Two dead connections per pair: the peers' denial-path
+/// stale-connection kick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_validator_can_publish_within_budget() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let budget = budget_or(RECOVERY_BUDGET);
+    let (_, recovered) = restart_scenario(true, true, budget).await;
     assert!(
         recovered.is_some(),
         "restarted validator could not publish to its peers within {budget:?} \
          (gossipsub resubscribe wedge)"
     );
+}
+
+/// s114: same restart with ONE dead connection per pair: the restarted
+/// node's connection is accepted as a second one (gossipsub skips our
+/// subscriptions) and the peers' established-path stale-connection kick
+/// forces the clean reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_validator_single_stale_connection_within_budget() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let budget = budget_or(RECOVERY_BUDGET);
+    let (_, recovered) = restart_scenario(true, false, budget).await;
+    assert!(
+        recovered.is_some(),
+        "restarted validator (one stale connection per peer) could not publish within {budget:?}"
+    );
+}
+
+/// s114: the unsubscribed-watchdog BACKSTOP alone (stale-connection kick off
+/// on every node), one dead connection per pair: the restarted node sees its
+/// peers connected but unsubscribed and kicks them after the 5 s grace
+/// (1 s tick), retrying once if the first redial lands before the peers'
+/// dead connection idles out. With the old 60 s grace / 10 s tick: 75 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restarted_validator_recovers_via_watchdog_alone() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let budget = budget_or(WATCHDOG_ONLY_BUDGET);
+    let (_, recovered) = restart_scenario(false, false, budget).await;
+    assert!(
+        recovered.is_some(),
+        "watchdog alone did not recover the restarted validator within {budget:?}"
+    );
+}
+
+/// s114 anti-flap: a healthy 3-validator mesh (bootstrapped at once, so
+/// simultaneous dials happen) running consensus-like traffic never triggers
+/// the watchdog or the stale-connection kick, even at an aggressive 2 s
+/// grace / 200 ms tick, and every node sees both peers subscribed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthy_mesh_never_triggers_watchdog() {
+    use std::sync::Arc;
+    use torus_telemetry::Metrics;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let sks = [seed_key(11), seed_key(12), seed_key(13)];
+    let vks: Vec<VerifyingKey> = sks.iter().map(|s| s.verifying_key()).collect();
+    let pids: Vec<PeerId> = vks.iter().map(peer_id_from_verifying_key).collect();
+    let ports = [free_udp_port(), free_udp_port(), free_udp_port()];
+
+    let mut nets = Vec::new();
+    let mut handles = Vec::new();
+    let mut metrics = Vec::new();
+    for i in 0..3 {
+        let peers = (0..3)
+            .filter(|j| *j != i)
+            .map(|j| (pids[j], quic_addr(ports[j])))
+            .collect();
+        let cfg = NetworkConfig {
+            mesh_watchdog_grace: Duration::from_secs(2),
+            mesh_watchdog_tick: Duration::from_millis(200),
+            mesh_stale_conn_kick: true,
+            ..node_config(ports[i], peers)
+        };
+        let m = Arc::new(Metrics::new());
+        // Keep the gossip handles alive: a dropped handle closes its channel
+        // and the swarm loop's biased select would spin on the closed
+        // receiver, starving the timer arms (watchdog included).
+        let (mut net, tx, na) = LibP2PNetwork::with_metrics(cfg, sks[i].clone(), Some(m.clone()))
+            .await
+            .unwrap();
+        net.init_validator_set(validator_set(&vks));
+        handles.push((tx, na));
+        nets.push(net);
+        metrics.push(m);
+    }
+
+    // 20 s of traffic: every node publishes every 200 ms; track who heard
+    // whom during the last 5 s.
+    let start = Instant::now();
+    let mut heard = [[false; 3]; 3];
+    let mut counter = 0u64;
+    while start.elapsed() < Duration::from_secs(20) {
+        counter += 1;
+        for net in nets.iter_mut() {
+            net.broadcast(vote(counter));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let late = start.elapsed() > Duration::from_secs(15);
+        for (i, net) in nets.iter_mut().enumerate() {
+            while let Some((vk, _)) = net.recv() {
+                if let Some(j) = vks.iter().position(|v| *v == vk) {
+                    if late && j != i {
+                        heard[i][j] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let report: Vec<String> = metrics
+        .iter()
+        .map(|m| {
+            format!(
+                "wd={} stale={} subscribed={} mesh={}",
+                m.mesh_watchdog_disconnects.get(),
+                m.mesh_stale_conn_disconnects.get(),
+                m.consensus_subscribed_validators.get(),
+                m.consensus_mesh_peers.get()
+            )
+        })
+        .collect();
+    let detail = format!("{report:?} heard={heard:?}");
+    for (i, m) in metrics.iter().enumerate() {
+        assert_eq!(
+            m.mesh_watchdog_disconnects.get(),
+            0,
+            "node {i}: false watchdog kick; {detail}"
+        );
+        assert_eq!(
+            m.mesh_stale_conn_disconnects.get(),
+            0,
+            "node {i}: false stale-conn kick; {detail}"
+        );
+        assert_eq!(
+            m.consensus_subscribed_validators.get(),
+            2,
+            "node {i}: both peers subscribed; {detail}"
+        );
+        for (j, heard_j) in heard[i].iter().enumerate() {
+            assert!(
+                i == j || *heard_j,
+                "node {i} stopped hearing node {j}; {detail}"
+            );
+        }
+    }
 }

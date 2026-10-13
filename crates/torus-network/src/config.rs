@@ -66,6 +66,18 @@ pub struct NetworkConfig {
     /// devnets / single-host meshes where the fabric IS a private subnet.
     /// Explicit `--p2p-peers` entries are always exempt — operator intent wins.
     pub allow_private_addrs: bool,
+    /// s114 mesh watchdog: how long a validator peer may stay connected but
+    /// unsubscribed to the consensus topic before a forced reconnect
+    /// (`TORUS_MESH_WATCHDOG_GRACE_MS`, default 5000). Was a hardcoded 60 s.
+    pub mesh_watchdog_grace: std::time::Duration,
+    /// s114: watchdog evaluation period (`TORUS_MESH_WATCHDOG_TICK_MS`,
+    /// default 1000). Was the 10 s mesh-maintenance tick.
+    pub mesh_watchdog_tick: std::time::Duration,
+    /// s114: force a clean reconnect when a validator opens a new connection
+    /// while we still hold an older one (a fast restart over a dead QUIC
+    /// connection, where gossipsub skips sending our subscriptions)
+    /// (`TORUS_MESH_STALE_CONN_KICK`, default ON; `0` = watchdog only).
+    pub mesh_stale_conn_kick: bool,
 }
 
 /// Effective gossipsub per-peer send-queue length: `TORUS_GOSSIP_QUEUE_LEN`
@@ -117,6 +129,54 @@ pub fn consensus_gossip_mirror() -> bool {
             true,
         )
     })
+}
+
+/// s114: effective `TORUS_MESH_WATCHDOG_GRACE_MS` (see
+/// [`NetworkConfig::mesh_watchdog_grace`]). Read once at first use.
+pub fn mesh_watchdog_grace() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_duration_ms(
+            std::env::var("TORUS_MESH_WATCHDOG_GRACE_MS")
+                .ok()
+                .as_deref(),
+            crate::mesh_watchdog::DEFAULT_WATCHDOG_GRACE,
+        )
+    })
+}
+
+/// s114: effective `TORUS_MESH_WATCHDOG_TICK_MS` (see
+/// [`NetworkConfig::mesh_watchdog_tick`]). Read once at first use.
+pub fn mesh_watchdog_tick() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_duration_ms(
+            std::env::var("TORUS_MESH_WATCHDOG_TICK_MS").ok().as_deref(),
+            crate::mesh_watchdog::DEFAULT_WATCHDOG_TICK,
+        )
+    })
+}
+
+/// s114: effective `TORUS_MESH_STALE_CONN_KICK` (see
+/// [`NetworkConfig::mesh_stale_conn_kick`]). Read once at first use.
+pub fn mesh_stale_conn_kick() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_env_flag(
+            std::env::var("TORUS_MESH_STALE_CONN_KICK").ok().as_deref(),
+            true,
+        )
+    })
+}
+
+/// Pure parse seam for millisecond env knobs. Unset, unparsable, or zero
+/// (a zero tokio interval panics; a zero grace kicks every new connection)
+/// falls back to `default`.
+fn parse_duration_ms(raw: Option<&str>, default: std::time::Duration) -> std::time::Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(default)
 }
 
 /// Pure parse seam for the B2 boolean env knobs (unit-testable without
@@ -222,6 +282,9 @@ impl Default for NetworkConfig {
             consensus_direct_fan: consensus_direct_fan(),
             consensus_gossip_mirror: consensus_gossip_mirror(),
             allow_private_addrs: false,
+            mesh_watchdog_grace: mesh_watchdog_grace(),
+            mesh_watchdog_tick: mesh_watchdog_tick(),
+            mesh_stale_conn_kick: mesh_stale_conn_kick(),
         }
     }
 }
@@ -306,6 +369,27 @@ mod tests {
             cfg.consensus_gossip_mirror,
             "gossip mirror defaults ON (observers stay fed during rollout)"
         );
+    }
+
+    /// s114: mesh watchdog knobs — ms parse seam and the shipped defaults
+    /// (5 s grace, 1 s tick, stale-connection kick ON).
+    #[test]
+    fn mesh_watchdog_knobs_parse_seam_and_defaults() {
+        use std::time::Duration;
+        let d = Duration::from_secs(5);
+        assert_eq!(parse_duration_ms(None, d), d);
+        assert_eq!(parse_duration_ms(Some("60000"), d), Duration::from_secs(60));
+        assert_eq!(
+            parse_duration_ms(Some(" 250 "), d),
+            Duration::from_millis(250)
+        );
+        assert_eq!(parse_duration_ms(Some("0"), d), d);
+        assert_eq!(parse_duration_ms(Some("-5"), d), d);
+        assert_eq!(parse_duration_ms(Some("5s"), d), d);
+        let cfg = NetworkConfig::default();
+        assert_eq!(cfg.mesh_watchdog_grace, Duration::from_secs(5));
+        assert_eq!(cfg.mesh_watchdog_tick, Duration::from_secs(1));
+        assert!(cfg.mesh_stale_conn_kick);
     }
 
     #[test]
