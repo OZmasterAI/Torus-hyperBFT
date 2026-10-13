@@ -7694,7 +7694,7 @@ pre-pass's cross-market lookup for a sender with no live cloids. Each needs its 
 inside minutes 0-2. (4) Per-1k-fills normalisation spreads every cost over fewer fills in c100 (W1 fills/s -10.7%),
 which inflates costs that do not scale with fills; the cloid sites are 0 in c0, so their deltas are not affected. (5)
 glibc only. (6) Per-site figures are arm means of 3 cells; per-cell variation of the split is not shown (in
-`prof-cells.json`).
+`prof-cells.json`; 60.6 adds it).
 
 Analysis (`tools/ozarchy-p3cloidprof-tools/analyst/`): `run-analysis.sh` (perf script / perf report per cell, then the
 scripts below), `a-prof.py` (W1 / W2 attribution, cloid sites, thread groups; writes `frames-self.txt`,
@@ -7715,6 +7715,110 @@ the repo (no earlier campaign committed an SVG). Not copied either: the folded s
 `perf-report-*.txt` (118-146 KB each, regenerable with `run-analysis.sh`). Driver
 `tools/ozarchy-p3cloidprof-tools/ozarchy-p3cloidprof-campaign.sh`, sidecar `cloidprof-sidecar.sh`, md5s `md5s-all.txt`
 (the p3cloid build's).
+
+### 60.6 Addendum: per-cell noise and Keccak callers (re-analysis of the existing perf.data, 2026-10-13, no new run)
+
+18c asked two follow-ups after 60: how much do the per-site figures vary across the 3 cells per arm (60's caveat 6), and
+who calls Keccak? Nothing was rerun. The inputs are the same W1 data, read-only: `prof-cells.json` (from `a-prof.py`),
+the cells' `prof.script.gz`, `exec-tid.txt` and `perf.data`. For each frame the table gives the arm mean ± SD of the 3
+per-cell values and the paired c100 - c0 delta (pairs r1-r3) with a 95% CI t(2) (t = 4.303, n = 3 pairs). Resolved
+means the CI excludes 0. Units are as in 60.2: W1, val1, ms CPU per 1k val1 fills. Per-cell values are in
+`noise-frames.txt`.
+
+**Every cloid-site delta is resolved with tight intervals (c0 ~0, c100 SD <= 0.02). The workers' group total (+0.29),
+their hashbrown probe and their key compare are within noise. The exec thread total is barely resolved. Keccak callers
+can only be split by thread: 98% of Keccak samples have no caller. Gossip verify (+0.30, resolved) and RPC ingress
+verify (+0.17, not resolved) are the largest parts. In cores, total Keccak rises only +0.072 and both verify pools are
+flat, so most of the per-fill rise comes from the denominator (W1 fills/s -10.7% at c100).**
+
+| frame (thread group, self / inclusive / site as in 60.2) | c0 mean ± SD | c100 mean ± SD | c100 - c0 [95% CI t(2)] | resolved |
+|---|---|---|---|---|
+| exec thread total | 4.442 ± 0.193 | 5.155 ± 0.209 | +0.713 [+0.040, +1.387] | yes (barely) |
+| market workers total | 5.825 ± 0.129 | 6.110 ± 0.260 | +0.286 [-0.221, +0.792] | **no** |
+| other threads total | 14.248 ± 0.510 | 17.438 ± 0.757 | +3.190 [+0.589, +5.792] | yes |
+| whole process | 24.514 ± 0.795 | 28.704 ± 1.221 | +4.189 [+0.440, +7.938] | yes |
+| exec site `OrderBook::drain_cloid_log` | 0.000 ± 0.000 | 0.323 ± 0.019 | +0.323 [+0.275, +0.371] | yes |
+| exec incl `CloidMarkets::absorb` | 0.000 ± 0.000 | 0.324 ± 0.020 | +0.324 [+0.275, +0.373] | yes |
+| exec site `CloidMarkets::absorb` excl. drain | 0.000 ± 0.000 | 0.001 ± 0.000 | +0.001 [+0.000, +0.002] | yes |
+| exec incl `CloidMarkets::live` | 0.000 ± 0.000 | 0.133 ± 0.008 | +0.133 [+0.112, +0.154] | yes |
+| exec site `duplicate_cloid` | 0.000 ± 0.000 | 0.136 ± 0.007 | +0.136 [+0.117, +0.154] | yes |
+| exec site pre-pass serial block (claimed set, `retain`) | 0.015 ± 0.001 | 0.155 ± 0.008 | +0.140 [+0.117, +0.163] | yes |
+| exec incl claimed-set `reserve_rehash` | 0.000 ± 0.000 | 0.060 ± 0.001 | +0.060 [+0.058, +0.061] | yes |
+| exec site `forget_cloid` | 0.000 ± 0.000 | 0.063 ± 0.002 | +0.063 [+0.058, +0.068] | yes |
+| workers site `forget_cloid` | 0.000 ± 0.000 | 0.080 ± 0.008 | +0.080 [+0.059, +0.100] | yes |
+| workers site per-book `contains_key` (`order_book.rs:1397-1402`) | 0.002 ± 0.001 | 0.083 ± 0.004 | +0.081 [+0.072, +0.089] | yes |
+| workers site `index_cloid` | 0.000 ± 0.000 | 0.038 ± 0.003 | +0.038 [+0.030, +0.046] | yes |
+| **exec + workers, all cloid sites** | 0.018 ± 0.002 | 0.881 ± 0.043 | **+0.863 [+0.753, +0.973]** | yes |
+| exec incl hashbrown `find_inner` | 0.522 ± 0.011 | 0.841 ± 0.015 | +0.319 [+0.307, +0.330] | yes |
+| workers incl hashbrown `find_inner` | 0.562 ± 0.004 | 0.666 ± 0.030 | +0.104 [+0.031, +0.178] | yes |
+| exec incl `make_hash` | 0.283 ± 0.019 | 0.474 ± 0.025 | +0.191 [+0.090, +0.292] | yes |
+| workers incl `make_hash` | 0.522 ± 0.009 | 0.581 ± 0.017 | +0.059 [+0.039, +0.079] | yes |
+| exec self `_mm_movemask_epi8` (probe) | 0.121 ± 0.009 | 0.310 ± 0.015 | +0.189 [+0.172, +0.206] | yes |
+| workers self `_mm_movemask_epi8` (probe) | 0.195 ± 0.009 | 0.229 ± 0.008 | +0.035 [-0.006, +0.076] | **no** |
+| exec self `spec_eq` (key compare) | 0.216 ± 0.007 | 0.357 ± 0.013 | +0.141 [+0.117, +0.165] | yes |
+| workers self `spec_eq` (key compare) | 0.248 ± 0.005 | 0.281 ± 0.022 | +0.033 [-0.010, +0.076] | **no** |
+| exec self foldhash (all foldhash leaves) | 0.239 ± 0.019 | 0.395 ± 0.020 | +0.156 [+0.066, +0.246] | yes |
+| workers self foldhash (all foldhash leaves) | 0.433 ± 0.009 | 0.466 ± 0.011 | +0.033 [+0.018, +0.049] | yes |
+| exec self `foldhash::hash_bytes_long` | 0.086 ± 0.005 | 0.166 ± 0.010 | +0.080 [+0.045, +0.116] | yes |
+| exec self Keccak (F1600, absorb / squeeze, wrappers) | 0.343 ± 0.004 | 0.466 ± 0.005 | +0.123 [+0.099, +0.147] | yes |
+| other threads self Keccak (same) | 3.961 ± 0.154 | 4.788 ± 0.199 | +0.827 [+0.130, +1.524] | yes |
+| all threads self `__KeccakF1600` only | 4.138 ± 0.142 | 5.050 ± 0.199 | +0.911 [+0.240, +1.583] | yes |
+| other threads incl `verify_one_action_with` | 2.588 ± 0.113 | 3.391 ± 0.288 | +0.803 [-0.008, +1.613] | **no** |
+
+**Keccak callers.** The call graphs are frame-pointer only (`--call-graph fp`). In each cell 97.8-98.1% of Keccak leaf
+samples are a bare leaf with no user frame below it, because the assembly `__KeccakF1600` breaks the chain. (60.5's ~99%
+counted only the threads outside the exec thread, from `folded-*.txt`.) The other ~2% are wrapper and absorb leaves
+(`KECCAK_ASM_SHA3_absorb`, `keccak256_impl`) whose chains are intact. `a-keccak-comm.py` therefore splits Keccak self
+time (F1600, absorb / squeeze and wrappers; total +0.947) by thread: comm, plus the exec tid from `exec-tid.txt`. Then
+`kc-raw.sh` / `a-kc.py` list the caller and the caller's caller of the intact chains for each thread
+(`keccak-intact-chain-callers.txt`). The function names in the second column come from that 2%. Assigning a thread's
+bare samples to those callers is an inference: plausible for the verify threads, which do little else, and not shown
+for the others.
+
+| thread | intact chains name (caller <- its caller) | Keccak ms per 1k fills, c100 - c0 [95% CI] | Keccak cores, c100 - c0 [95% CI] |
+|---|---|---|---|
+| `torus-gossip-verify` | `eip712_struct_hash` <- `SignedNativeAction::recover_sender` (57-60% of all intact chains); also the domain separator, `verified_cache_key` | **+0.302 [+0.053, +0.550]** | +0.007 [-0.027, +0.040], flat |
+| `torus-ingress-verify` (RPC submit) | `eip712_struct_hash` <- `SignedNativeAction::validate_with_sessions` (32-34%), under `verify_one_action_with` | +0.172 [-0.153, +0.496], n.s. | +0.005 [-0.017, +0.028], flat |
+| `hotstuff-algo` (consensus) | `compute_action_hash_with_scratch` <- `TorusApp::dispatch_to_exec` | **+0.157 [+0.065, +0.248]** | **+0.018 [+0.011, +0.026]** |
+| exec thread | `sort_native_actions_indexed` <- `execute_committed_block_with`; also `verified_cache_key_with_scratch` | **+0.124 [+0.101, +0.146]** | +0.014 [-0.000, +0.028], n.s. |
+| `rpc-worker` | `verified_cache_key` <- `add_native_action_presigned`; `compute_action_hash` <- `NativePool::insert_with_restash_key` / `NativeDaStore::put_batch` | **+0.128 [+0.048, +0.209]** | **+0.016 [+0.012, +0.021]** |
+| `torus-node` (pre-proposal broadcast) | `compute_action_hash_with_scratch` <- `LibP2PNetwork::broadcast_pre_proposal_actions`; c100 only (c0 0.000) | **+0.065 [+0.059, +0.072]** | **+0.011 [+0.011, +0.011]** |
+| total | | **+0.947 [+0.260, +1.634]** | **+0.072 [+0.047, +0.097]** |
+
+Cores = ms per 1k fills x W1 fills/s / 1e6. Per second, both verify pools spend the same Keccak time in both arms. Their
+per-fill rise is what a cost that does not grow with load shows when fills/s fall 10.7% (gossip verify c0 2.191 x 0.12
+= +0.26 of its +0.30). The resolved per-second rises are consensus action hashing, `rpc-worker` and the pre-proposal
+broadcast (+0.045 cores together), plus the exec thread (+0.014, n.s.). As whole threads (all samples, cores): gossip
+verify -0.010 [-0.046, +0.027] (flat), ingress verify +0.085 [+0.006, +0.165] (resolved; not Keccak, which is flat
+there). The `verify_one_action_with` stacks are all on the ingress thread. In ms per 1k fills they are +0.802
+[-0.007, +1.611], not resolved (`keccak-by-thread.txt`).
+
+**What changes against 60's text.**
+
+- The cloid-site split (60.2, 60.4) stands: every site delta is resolved. So are the all-sites total (+0.863
+  [+0.753, +0.973]) and the exec hashing figures (`find_inner`, `make_hash`, probe, key compare, foldhash).
+- The worker-side aggregates are within noise: market workers +0.29 [-0.22, +0.79] (60's "+0.29 (+5%)"), the workers'
+  probe +0.035 and key compare +0.033. The three worker cloid sites (`forget_cloid`, per-book `contains_key`,
+  `index_cloid`) are resolved one by one, and so are the workers' `find_inner`, `make_hash` and foldhash. The exec thread
+  total +0.71 is barely resolved ([+0.04, +1.39]).
+- 60's separate `verify_one_action_with` +0.80 (60.5, inclusive, excluding the bare Keccak) is not resolved per cell
+  ([-0.01, +1.61]). So 60.5's "verify (+31%) ... rise more than [the normalisation]" is not shown at n = 3.
+- 60 never assigned Keccak to RPC verify: 60.5 says its callers are not known from this profile, and that still holds
+  for the bare 98%. This addendum only adds the split by thread and the callers named by the intact 2%, as in the table
+  above. If the callers matter, a rerun with `--call-graph dwarf` or LBR call stacks (`--call-graph lbr`) could recover
+  them (suggestion only, not run).
+
+Files: `ozarchy-p3cloidprof-run/analyst/noise/` on ozarchy, archived in `tools/ozarchy-p3cloidprof-tools/analyst/noise/`:
+`a-noise.py` (-> `noise-frames.txt`, reads `prof-cells.json`), `a-keccak-comm.py` (-> `keccak-by-thread.txt`, reads
+`prof-cells.json` and the cells' `prof.script.gz` / `exec-tid.txt`), `kc-raw.sh` (-> `keccak-intact-chain-callers.raw`)
+and `a-kc.py` (-> `keccak-intact-chain-callers.txt`), and `perf-report-comm-sym.sh` (per-cell `perf report --sort
+comm,sym`, `perf-report-comm-sym-<cell>.txt`, 50-66 KB each). The analyst ran the commands in `kc-raw.sh` and
+`perf-report-comm-sym.sh` inline. They are saved as scripts for the archive with the commands unchanged and only the
+paths parameterised. The perf reports are not in the repo: their header line carries several KB of trailing blanks, and
+the script regenerates them. Reproduction check (rerun with `nice -n 19` into a temp dir, then diffed):
+`noise-frames.txt`, `keccak-by-thread.txt` and `keccak-intact-chain-callers.txt` are byte-identical.
+`keccak-intact-chain-callers.raw` is identical after `sort`, because awk's output order is unspecified. The 6 perf
+reports differ only in perf's random "Tip" footer line.
 
 ## 61. Final Phase 3 gate: step 2 `c88d3073` vs main `de1a97c1`, both jemalloc compiled in, SAT n = 4 + 600 s soak + SIGTERM restart per arm, commit-tail mode (campaign ozarchy-p3gate, 2026-10-13)
 
