@@ -471,6 +471,19 @@ About 40 call sites in `torus-rpc` (raw `.inner()` iterators need merged-iterato
 Validators get 15 s (or the gate's pick); `--rpc-only` nodes get 0. Same pattern as 9.13 compiled
 defaults.
 
+- **Built** (`feat/p3-step6-15s`, off `c88d3073`, s118; owner: the gate's 15 s): `TORUS_CHECKPOINT_INTERVAL_MS`
+  unset or empty = the role default, set once by the node binary before `TorusApp::try_new`
+  (`exec_pipeline::set_checkpoint_interval_default(rpc_only)`, the `TORUS_TRADE_HISTORY` pattern):
+  validators 15 s (`VALIDATOR_CHECKPOINT_INTERVAL`), `--rpc-only` 0. Explicit values win (`0` = per-block
+  flush). Tests and tools that never set the role default keep the per-block flush. With a deferred
+  book mode (`TORUS_BOOK_ROWS=2/3`, e.g. the bench `RECORD_ENV`) the unset default yields (per-block flush,
+  a warning) instead of refusing to start; an explicit interval still refuses (task 1.2). Tests:
+  `torus-node` `sigterm_shutdown.rs` `env_unset_validator_runs_15s_checkpoints` (RED first),
+  `explicit_zero_interval_keeps_the_per_block_flush`, `env_unset_interval_yields_to_a_deferred_book_mode`;
+  `exec_pipeline` `checkpoint_interval_role_default_*`. `restart_after_sigterm_resumes_from_the_same_applied_state`
+  pins `0` (per-block binary-level restart coverage; `sigterm_with_checkpoints_restarts_with_zero_replay`
+  covers 15 s).
+
 ## 5. Not building
 
 - Change-set log file (D5 c); own snapshot format (D7 b); LtHash snapshot trust (D8 b); P2P
@@ -487,6 +500,6 @@ defaults.
 
 ## 7. Rollback
 
-Everything is behind `TORUS_CHECKPOINT_INTERVAL_MS`: unset = today's per-block path byte for byte.
-Rollback = unset the knob, no data migration. A node restarted with the knob unset replays
+Everything is behind `TORUS_CHECKPOINT_INTERVAL_MS`: `0` = today's per-block path byte for byte (since
+step 6, unset on a validator = 15 s). Rollback = set the knob to `0`, no data migration. A node restarted with `0` replays
 (S, committed] serially as today. Task 1.1 (pruner clamp) stays either way.
