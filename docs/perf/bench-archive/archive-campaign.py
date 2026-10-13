@@ -54,15 +54,15 @@ SMOKE (the [[smoke]] entries of the meta; proves the archived workflow runs as a
   against that cell's line of cells.txt). Copy the arguments from the analyst's driver (run-analysis.sh or the
   session log) verbatim: a wrong prefix then fails here instead of in the archive. Do not declare scripts that write
   to hard-coded paths (a-archive.py): only {out} is a scratch dir.
-    script    path in the tools copy; .py runs as `python3 -I <script> <args>`, .sh as `bash <script> <args>`
+    script    relative path in the tools copy (no absolute path, "..", or {placeholder}); .py runs as `python3 -I <script> <args>`, .sh as `bash <script> <args>`
     args      list of strings; {bench} = --bench-root, {out} = the scratch output dir, {tools} / {analyst} = the
               temp tools copy and its analyst/ dir, {camp} = the campaign tag; other braces stay as written
     timeout   seconds per entry (default 300); on expiry the process group is killed and the check fails
     name      optional label for the report
     [[smoke.compare]] (an entry without one only prepares input for a later entry, e.g. a cells.json)
-      want      archived file in the tools copy, e.g. "analyst/cells.txt" (must be there)
+      want      archived file in the tools copy, relative, e.g. "analyst/cells.txt" (must be there)
       got       "stdout" (default), "stdout+stderr" (one pipe for both, like `> f 2>&1`, order kept; not together with
-                "stdout" in one entry), or a file name in {out}
+                "stdout" in one entry), or a relative file name in {out} (no {out} prefix)
       select    regex: compare only the lines (of both sides) it matches, e.g. "^r1-c0 " for one cell
       ignore    list of regexes: lines dropped from both sides (timestamps, temp paths)
       tolerance relative tolerance for every number in a line (default 0: exact); the text between numbers must match
@@ -947,6 +947,23 @@ SMOKE_VARS = ("bench", "out", "tools", "analyst", "camp")
 NUM_RE = re.compile(r"([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)")
 
 
+def smoke_relpath(path):
+    """True for a plain relative path that stays inside its base: not absolute, no "..", no {placeholder}."""
+    return (
+        isinstance(path, str)
+        and bool(path)
+        and not os.path.isabs(path)
+        and "{" not in path
+        and ".." not in path.replace("\\", "/").split("/")
+    )
+
+
+def smoke_inside(base, rel):
+    """base/rel if it resolves inside base (symlinks followed), else None."""
+    p = os.path.realpath(os.path.join(base, rel))
+    return p if p.startswith(os.path.realpath(base) + os.sep) else None
+
+
 def smoke_specs(meta):
     """Validate the meta's [[smoke]] entries -> list of dicts (empty if none). Malformed -> Fatal."""
     specs = meta.get("smoke", [])
@@ -1005,6 +1022,17 @@ def smoke_specs(meta):
                     re.compile(rx)
                 except (re.error, TypeError) as e:
                     raise Fatal("%s: bad regex %r: %s" % (where, rx, e)) from e
+        # what is run and compared must be the staged copy (what gets archived) and the command's own output
+        bad = [("script", s["script"])] if not smoke_relpath(s["script"]) else []
+        for cm in cmps:
+            if not smoke_relpath(cm["want"]):
+                bad.append(("want", cm["want"]))
+            g = cm.get("got", "stdout")
+            if g not in ("stdout", "stdout+stderr") and not smoke_relpath(g):
+                bad.append(("got", g))
+        if bad:
+            raise Fatal("%s: %s must be a relative path inside the tools copy (script, want) or the scratch dir (got), "
+                        "without \"..\" or {placeholders}" % (where, ", ".join("%s = %r" % b for b in bad)))
         gots = {cm.get("got", "stdout") for cm in cmps}
         if {"stdout", "stdout+stderr"} <= gots:
             # stdout+stderr runs the command with one pipe for both streams (`2>&1`), so stdout alone is not available
@@ -1067,8 +1095,8 @@ def run_smoke(c, specs, staged):
         }
         for k, s in enumerate(specs, 1):
             label = "smoke %d (%s)" % (k, s.get("name") or s["script"])
-            script = os.path.join(tools, s["script"])
-            if not os.path.isfile(script):
+            script = smoke_inside(tools, s["script"])
+            if script is None or not os.path.isfile(script):
                 errors.append("%s: %s is not in the tools copy" % (label, s["script"]))
                 continue
             interp = [sys.executable, "-I"] if script.endswith(".py") else ["bash"]
@@ -1116,14 +1144,14 @@ def run_smoke(c, specs, staged):
                 elif got_k == "stdout+stderr":
                     got = so  # stderr went into the same pipe
                 else:
-                    gp = os.path.join(out, smoke_fill(got_k, vals))
-                    if not os.path.isfile(gp):
+                    gp = smoke_inside(out, got_k)
+                    if gp is None or not os.path.isfile(gp):
                         errors.append("%s: output %s was not written" % (label, got_k))
                         bad = True
                         continue
                     got = read(gp)
-                wp = os.path.join(tools, cm["want"])
-                if not os.path.isfile(wp):
+                wp = smoke_inside(tools, cm["want"])
+                if wp is None or not os.path.isfile(wp):
                     errors.append(
                         "%s: archived output %s is not in the tools copy"
                         % (label, cm["want"])

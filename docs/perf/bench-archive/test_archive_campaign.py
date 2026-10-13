@@ -1209,6 +1209,30 @@ class Smoke(FixtureCase):
         self.assertIn("stdout+stderr", r.stderr)
         self.assertEqual(fx.snapshot(), snap)
 
+    def test_paths_outside_the_staged_copy_are_refused(self):
+        # script / want must name files in the staged tools copy and got a file in {out}: an absolute path or "..".
+        # would test (or compare with) something that is not what gets archived
+        fx = self.fx
+        live = self.an("a-cells.py")  # exists on disk, but is not the staged copy
+        cmp_ = SMOKE["compare"][0]
+        bad = [
+            dict(SMOKE, script=live),
+            dict(SMOKE, script="../ozarchy-tc-tools/analyst/a-cells.py"),
+            dict(SMOKE, script="analyst/../../x/a-cells.py"),
+            dict(SMOKE, compare=[dict(cmp_, want=self.an("cells.txt"))]),
+            dict(SMOKE, compare=[dict(cmp_, want="analyst/../../cells.txt")]),
+            dict(SMOKE, compare=[dict(cmp_, got=self.an("cells.txt"))]),
+            dict(SMOKE, compare=[dict(cmp_, got="{analyst}/cells.txt")]),
+            dict(SMOKE, compare=[dict(cmp_, got="../tools/analyst/cells.txt")]),
+        ]
+        snap = fx.snapshot()
+        for b_ in bad:
+            r = fx.run(meta=self.meta_with(b_))
+            self.assertEqual(r.returncode, 1, "%r\n%s" % (b_, r.stderr))
+            self.assertIn("relative path", r.stderr)
+            self.assertNotIn("smoke check", r.stdout)
+            self.assertEqual(fx.snapshot(), snap)
+
     def test_malformed_declaration_is_an_error(self):
         fx = self.fx
         snap = fx.snapshot()
