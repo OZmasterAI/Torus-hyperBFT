@@ -1,0 +1,19 @@
+ANALYSIS SPEC for campaign ozarchy-p3cloidec (project: torus-economy, tag campaign:ozarchy-p3cloidec)
+Run dir: /home/oz/bench-results-matched/ozarchy-p3cloidec-run (log campaign.log, marker campaign.done = exit=0, index cells.tsv, handoff.json, handoff-tables.txt)
+Arms: F = bc44a845 (node 19ac8761, bench e562e616); B = c88d3073 (node 4e0d8b84, bench ae96e0c1). TORUS_CHECKPOINT_INTERVAL_MS=15000 on both.
+Cells: w0 (B, warm-up, not in means); r1-r8 CLOID_SHARE=100 ABBA x4; q1-q4 CLOID_SHARE=0 ABBA x2. q1-F0 is BAD (rc=2, REJECT DISAGREE, row mis-flagged ok).
+
+1. Per arm, matched/s and exec ms per 1k fills (torus_exec_engine_untimed, engine, phase1, match), at c100 and c0. Size every delta against replicate noise.
+2. c100 F-vs-B recovery as a fraction of B's own c100-vs-c0 gap. Section 60 measured -11.7% to -12.5% on ef812b02 glibc.
+3. perf on val1 at c100, compared against section 60's exec thread +0.713 ms/1k fills and worker pool +0.286 ms/1k:
+   - per-site breakdown: CloidMarkets::absorb/drain_cloid_log; the pre-pass dup check + claimed set + RawTable reserve_rehash; forget_cloid; index_cloid; book contains_key;
+   - W2 DRAM fills (ls_dmnd_fills_from_sys.mem_io_local) and IPC.
+   Section 60 analysis scripts: /home/oz/bench-results-matched/ozarchy-p3cloidprof-run/analyst/ and /home/oz/bench-results-matched/ozarchy-p3cloidprof-tools/analyst/ (the cloidec copy is at /home/oz/bench-results-matched/ozarchy-p3cloidec-tools/analyst/).
+4. Codex notes, quantified where visible:
+   (a) the per-batch cloid count visits every placement (native_executor.rs:6929 at bc44a845);
+   (b) one vector write per logged cloid change in matching (order_book.rs:2453);
+   (c) log vectors keep capacity (40-80 B/slot): check RSS and allocated.
+5. c0 regression check, F vs B, with noise (note q1-F0 is excluded).
+6. Re-check every cell from the raw files (cells.tsv is an index only). Report ACCEPT/AGREE and md5 per cell.
+7. remember_this the RESULT (project:torus-economy, campaign:ozarchy-p3cloidec). Do NOT write docs. Do NOT commit.
+Working outputs for this analysis go in this analyst/ directory.

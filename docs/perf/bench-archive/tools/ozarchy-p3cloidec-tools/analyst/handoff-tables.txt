@@ -1,0 +1,27 @@
+# per-cell table: cells.tsv index rows + node md5 (campaign.log START line) + verdict ([rates] line). Numbers only, unverified against raw files.
+label	arm	rep	rc	agree	md5_ok	metric	flag	node_md5	verdict
+ozarchy-p3cloidec-300m-w0	B100	w0	0	yes	yes	174713.1	ok	4e0d8b84	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r1-F100	F100	r1	0	yes	yes	191625.3	ok	19ac8761	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r2-B100	B100	r2	0	yes	yes	176292.2	ok	4e0d8b84	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r3-B100	B100	r3	0	yes	yes	180715.4	ok	4e0d8b84	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r4-F100	F100	r4	0	yes	yes	188133.3	ok	19ac8761	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r5-B100	B100	r5	0	yes	yes	176821.1	ok	4e0d8b84	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r6-F100	F100	r6	0	yes	yes	191918.4	ok	19ac8761	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r7-F100	F100	r7	0	yes	yes	190296.7	ok	19ac8761	ACCEPT AGREE
+ozarchy-p3cloidec-300m-r8-B100	B100	r8	0	yes	yes	187664.8	ok	4e0d8b84	ACCEPT AGREE
+ozarchy-p3cloidec-300m-q1-F0	F0	q1	2	no	yes	212045.8	ok	19ac8761	REJECT DISAGREE
+ozarchy-p3cloidec-300m-q2-B0	B0	q2	0	yes	yes	211903.3	ok	4e0d8b84	ACCEPT AGREE
+ozarchy-p3cloidec-300m-q3-B0	B0	q3	0	yes	yes	207901.6	ok	4e0d8b84	ACCEPT AGREE
+ozarchy-p3cloidec-300m-q4-F0	F0	q4	0	yes	yes	207603.9	ok	19ac8761	ACCEPT AGREE
+
+# per arm, index metric (matched/s), w0 excluded, valid = rc 0 and agree yes and md5_ok yes; replicate min/max as spread
+B0 n=2 mean=209902.5 min=207901.6 max=211903.3
+B100 n=4 mean=180373.4 min=176292.2 max=187664.8
+F0 excluded: ozarchy-p3cloidec-300m-q1-F0(rc=2,agree=no)
+F0 n=1 mean=207603.9 min=207603.9 max=207603.9
+F100 n=4 mean=190493.4 min=188133.3 max=191918.4
+
+# CELL-FLAG lines: 0
+# CELL FAIL lines:
+CELL FAIL ozarchy-p3cloidec-300m-q1-F0: run-cell rc=2 -> recorded, continuing
+# w0 warm-up (B100) is listed in the per-cell table but not in the arm means
