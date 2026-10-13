@@ -310,6 +310,28 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   -5.5% (not met), RSS +1.55 GB peak (not met), exec ms per block flat, block-time p99 +12.7%. New timers: E waits
   23.9 ms per block on the previous layer merge (`checkpoint_settle_wait`, p99 95 ms), upkeep 1.0 ms; free-off-exec
   confirmed (`torus-ckpt-drop`). Also valid for `6d9b78af`. Restart cells: SIGTERM cells on the next step 2 head.
+- **Allocator A/B** (campaign `ozarchy-p3alloc`, results doc section 51, plan-2 row 56): step 2 `7b006739` vs main
+  `219f0c20`, glibc vs jemalloc 5.3.1 (LD_PRELOAD, defaults), commit tail, n = 4. Phase 3 RSS delta +1.55 GB peak (glibc)
+  / +0.97 GB (jemalloc): the RAM gate (~270 MB) is not met under either. jemalloc on step 2: peak -0.32 GB, growth
+  1.64 -> 1.01 GB/min, matched/s +3.6%, but CPU at equal fills +4.0% (je commits +15-18% faster, so the closed-loop
+  bench submits +13-14% more: offered load differs). CPU-s/1M -6.5% / -8.9% and writes
+  -54% / -51% (Phase 3, glibc / jemalloc). Soak (600 s per arm) on glibc next.
+- **SIGTERM restart cells** (campaign `ozarchy-p3term`, results doc section 52, plan-2 row 57): step 2 `7b006739` at 15 s vs
+  main `219f0c20`, 8 + 4 SIGTERM kills: replay 0 every time, no forced stop, state agrees; exit 7.0 s mean / 10.7 s max
+  (exec-queue drain; checkpoint flush share ~0.15 s); kill -> first commit max 59.8 s (gate 60 s met; the slow kill is
+  the gossipsub resubscribe stall, both arms).
+- **Soak** (campaign `ozarchy-p3soak`, results doc section 53, plan-2 row 58): step 2 `7b006739` vs main `219f0c20`, glibc,
+  600 s each: step 2 RSS still +40-67 MB/min per node at 10 min (main +3-11), Phase 3 delta +1.98 GB per node at 10 min:
+  no plateau (growth finding). Cancel-all expiry hits both arms from minute 2 (~18k per node), matched/s -30% from minute 6.
+- **Soak on jemalloc** (campaign `ozarchy-p3soakje`, results doc section 53b, plan-2 row 59): the same pair on jemalloc 5.3.1
+  (defaults): step 2 RSS flat after ~2 min, Phase 3 delta +0.68 GB per node (minutes 5-10 mean; +1.01 GB peak). So the
+  glibc growth is consistent with allocator retention (one pair; slow growth not ruled out). Layer size and resting orders do not grow. The minute-6 matched/s drop is margin
+  rejections in the econ workload.
+- **Soak with the cancel-share fix** (campaign `ozarchy-p3cssoak`, results doc section 53c, plan-2 row 60): cs2 `41a95355`
+  (`de97682f` on step 2) vs step 2 `7b006739`, glibc, 600 s each: cancel-all expiry 0 (step 2 16k per node) and no margin
+  collapse (the margin user is positions, concentrated on low-address senders by the old cancel order). Step 2 + fix RSS
+  still grows (+129-178 MB/min, +2.76 GB vs section 53's main), against a confounded reference: the fixed arm keeps ~2x the
+  book and layer size for 10 min. Next: cs2 vs main + fix `de97682f`.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 

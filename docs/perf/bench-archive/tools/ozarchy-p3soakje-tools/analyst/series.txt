@@ -1,0 +1,214 @@
+== glibc ctl window 603 s
+  val0 RSS MB mean 2-5 3706 5-10 3761 8-10 3769 | start 155 @1 3336 @5 3760 end 3796 peak 3835 | delta 1->10 +461 5->10 +37 | slope MB/min early(0-5) +259.5 [+76.6, +442.3] late(5-10) +3.3 [-4.2, +10.8] n_eff 26 | 2-5 +19.4 5-8 -4.4 8-10 +10.5
+     gauges @1/@5/end: exec_resident_rows_bytes=213.913M/214.134M/214.135M exec_resting_orders=429.012k/343.741k/255.772k exec_cancel_all_index_entries=710.88k/971.553k/589.095k rocksdb_memtable_bytes_all=184.904M/396.646M/263.036M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9803/5998/1989 exec_queue_depth=47/2/4
+  val1 RSS MB mean 2-5 3879 5-10 3943 8-10 3960 | start 154 @1 3365 @5 3907 end 3950 peak 4032 | delta 1->10 +585 5->10 +42 | slope MB/min early(0-5) +299.8 [+108.3, +491.4] late(5-10) +11.1 [+5.5, +16.7] n_eff 28 | 2-5 +33.5 5-8 +12.4 8-10 +9.9
+     gauges @1/@5/end: exec_resident_rows_bytes=213.813M/214.134M/214.135M exec_resting_orders=407.401k/358.562k/207.435k exec_cancel_all_index_entries=689.548k/971.553k/517.563k rocksdb_memtable_bytes_all=334.646M/370.568M/329.233M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9403/5998/2084 exec_queue_depth=50/2/2
+  val2 RSS MB mean 2-5 4664 5-10 4735 8-10 4745 | start 153 @1 3951 @5 4712 end 4769 peak 4788 | delta 1->10 +818 5->10 +57 | slope MB/min early(0-5) +361.4 [+153.0, +569.9] late(5-10) +6.4 [+2.3, +10.5] n_eff 57 | 2-5 +54.3 5-8 +5.2 8-10 +10.0
+     gauges @1/@5/end: exec_resident_rows_bytes=212.965M/214.134M/214.135M exec_resting_orders=245.467k/411.347k/348.242k exec_cancel_all_index_entries=457.659k/1.07767M/844.907k rocksdb_memtable_bytes_all=331.501M/381.19M/259.352M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9403/5998/2084 exec_queue_depth=66/66/65
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired node_cores(v0,v1,v2) bench_cores margin_rejected/s
+    1    1262     978    251688    191004  195.3  4.05  0.94    3997  38.5    220918    346      0 5.18/5.14/5.62 0.97 0
+    2    1015    1081    276313    210758  195.0  3.15  0.98    7898  29.9    288030    380      0 5.04/5.04/5.42 0.97 0
+    3     949    1033    264393    201550  195.0  2.60  0.97    5436  16.8    495609    376   2943 4.98/5.00/5.23 0.87 0
+    4     991    1013    252233    191378  188.9  2.52  0.90    5625   2.8    408482    373   3338 4.90/5.06/5.58 0.93 0
+    5    1064     993    247713    188332  189.6  2.50  0.85    5367   1.8    387195    378   1080 4.53/4.55/5.17 0.97 0
+    6    1068    1007    225500    165351  164.3  2.50  0.82    5438   1.6    371022    386   3272 4.61/4.65/5.34 0.95 18729
+    7    1201    1153    181382    132474  114.9  2.88  0.78    5407   1.8    262208    433   2266 4.72/4.76/5.57 1.07 105999
+    8    1204    1187    183536    138900  117.1  2.98  0.81    5305   2.0    279926    436   2561 4.89/4.92/5.57 1.09 117499
+    9    1231    1247    179489    135458  108.7  3.10  0.82    5242   2.0    267322    463   2171 4.92/4.93/5.62 1.20 130272
+   10    1262    1247    175436    133876  107.4  3.12  0.81    5518   2.3    266507    471    325 5.11/5.12/5.79 1.14 135466
+  per node per minute: min RSS_MB anon_MB matched/s resting_M flush_depth handoff_ms ckpts layer_MB drop_inline
+  val0  1   3343   3310   191004   0.19    0.2   0.15  nan    nan   nan
+  val0  2   3657   3624   210758   0.33    0.3   0.19  nan    nan   nan
+  val0  3   3686   3653   201550   0.50    0.4   0.01  nan    nan   nan
+  val0  4   3729   3696   191378   0.45    0.4   0.01  nan    nan   nan
+  val0  5   3743   3710   188332   0.41    0.4   0.03  nan    nan   nan
+  val0  6   3751   3718   165351   0.27    0.3   0.01  nan    nan   nan
+  val0  7   3717   3684   132474   0.27    0.2   0.01  nan    nan   nan
+  val0  8   3753   3720   138900   0.31    0.2   0.13  nan    nan   nan
+  val0  9   3749   3716   135458   0.30    0.1   0.01  nan    nan   nan
+  val0 10   3794   3761   133876   0.28    0.2   0.01  nan    nan   nan
+  val1  1   3369   3336   190250   0.28    0.1   0.09  nan    nan   nan
+  val1  2   3732   3699   208431   0.30    0.4   0.10  nan    nan   nan
+  val1  3   3856   3823   202563   0.50    0.3   0.01  nan    nan   nan
+  val1  4   3899   3866   194947   0.45    0.3   0.01  nan    nan   nan
+  val1  5   3909   3876   187772   0.41    0.2   0.05  nan    nan   nan
+  val1  6   3916   3883   165579   0.26    0.4   0.01  nan    nan   nan
+  val1  7   3933   3900   132417   0.28    0.2   0.01  nan    nan   nan
+  val1  8   3957   3923   138965   0.32    0.2   0.02  nan    nan   nan
+  val1  9   3941   3908   134281   0.24    0.3   0.01  nan    nan   nan
+  val1 10   3956   3923   133973   0.28    0.2   0.01  nan    nan   nan
+  val2  1   3963   3930   165248   0.28    0.2   0.02  nan    nan   nan
+  val2  2   4557   4524   187165   0.47    0.3   0.13  nan    nan   nan
+  val2  3   4586   4554   176774   0.47    0.3   0.01  nan    nan   nan
+  val2  4   4688   4655   184086   0.41    0.3   0.01  nan    nan   nan
+  val2  5   4712   4679   188336   0.38    0.3   0.01  nan    nan   nan
+  val2  6   4740   4707   189042   0.39    0.3   0.01  nan    nan   nan
+  val2  7   4720   4687   142111   0.28    0.4   0.01  nan    nan   nan
+  val2  8   4740   4707   134828   0.22    0.3   0.01  nan    nan   nan
+  val2  9   4733   4700   137661   0.30    0.2   0.01  nan    nan   nan
+  val2 10   4773   4740   138755   0.34    0.2   0.01  nan    nan   nan
+  track val0: r(RSS level, resting level) -0.64; r(dRSS, dresting) +0.03; r(dRSS, layer MB) +nan; (minutes 3-10) resting min3->min10 0.50->0.28 M; RSS 3686->3794 MB
+  track val1: r(RSS level, resting level) -0.83; r(dRSS, dresting) +0.32; r(dRSS, layer MB) +nan; (minutes 3-10) resting min3->min10 0.50->0.28 M; RSS 3856->3956 MB
+  track val2: r(RSS level, resting level) -0.67; r(dRSS, dresting) -0.06; r(dRSS, layer MB) +nan; (minutes 3-10) resting min3->min10 0.47->0.34 M; RSS 4586->4773 MB
+== glibc s2 window 603 s
+  val0 RSS MB mean 2-5 5536 5-10 5885 8-10 5977 | start 1050 @1 4605 @5 5663 end 6070 peak 6070 | delta 1->10 +1466 5->10 +408 | slope MB/min early(0-5) +483.5 [+229.0, +738.0] late(5-10) +63.1 [+14.6, +111.6] n_eff 3 | 2-5 +131.5 5-8 +55.5 8-10 +104.8
+     gauges @1/@5/end: exec_resident_rows_bytes=213.975M/214.133M/214.135M exec_resting_orders=101.463k/427.182k/223.55k exec_cancel_all_index_entries=177.217k/1.12019M/536.866k rocksdb_memtable_bytes_all=299.394M/290.605M/282.947M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9569/4561/8104 exec_queue_depth=30/2/0
+     checkpoints 49 layer MB mean 104.7 early 116.3 late 92.7 | settle ms/block early 26.9 late 18.0 | flush-worker ckpt s early 0.53 late 0.51 | layer_shared 0 drop_inline 2087
+  val1 RSS MB mean 2-5 5371 5-10 5700 8-10 5806 | start 1168 @1 4493 @5 5559 end 5934 peak 5934 | delta 1->10 +1441 5->10 +376 | slope MB/min early(0-5) +450.5 [+201.4, +699.7] late(5-10) +67.3 [+47.1, +87.4] n_eff 17 | 2-5 +120.4 5-8 +29.2 8-10 +133.1
+     gauges @1/@5/end: exec_resident_rows_bytes=213.707M/214.133M/214.135M exec_resting_orders=405.083k/394.579k/223.55k exec_cancel_all_index_entries=675.281k/1.05583M/549.428k rocksdb_memtable_bytes_all=124.664M/223.496M/223.314M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9508/4752/7704 exec_queue_depth=53/1/0
+     checkpoints 49 layer MB mean 104.5 early 115.9 late 92.6 | settle ms/block early 26.0 late 17.5 | flush-worker ckpt s early 0.52 late 0.51 | layer_shared 0 drop_inline 2095
+  val2 RSS MB mean 2-5 6064 5-10 6428 8-10 6482 | start 1502 @1 4851 @5 6338 end 6442 peak 6660 | delta 1->10 +1591 5->10 +104 | slope MB/min early(0-5) +529.3 [+317.1, +741.4] late(5-10) +39.8 [+19.1, +60.5] n_eff 12 | 2-5 +184.5 5-8 +39.7 8-10 +74.5
+     gauges @1/@5/end: exec_resident_rows_bytes=213.013M/214.133M/214.134M exec_resting_orders=261.018k/400.401k/398.059k exec_cancel_all_index_entries=448.831k/1.00966M/816.488k rocksdb_memtable_bytes_all=244.201M/434.26M/299.724M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9542/5433/7704 exec_queue_depth=66/66/65
+     checkpoints 47 layer MB mean 103.7 early 120.8 late 87.4 | settle ms/block early 29.2 late 22.5 | flush-worker ckpt s early 0.51 late 0.50 | layer_shared 0 drop_inline 2010
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired node_cores(v0,v1,v2) bench_cores margin_rejected/s
+    1    1328    1005    257128    195588  194.6  4.33  0.97    3906  44.6    225344    359      0 5.09/5.09/5.64 1.01 0
+    2    1014    1071    286367    218263  203.8  2.87  0.99    6916  36.9    308786    352      0 4.63/4.66/5.04 0.96 0
+    3    1050    1127    279053    212296  188.4  2.83  1.00    5253  20.9    495303    426   3446 4.71/4.72/5.01 0.92 0
+    4    1107    1060    261727    198598  187.4  2.63  0.92    5137   4.1    416557    396   3601 4.68/4.72/5.27 1.00 0
+    5    1044    1033    254287    192897  186.7  2.60  0.89    5515   1.9    391793    401   2408 4.33/4.39/5.02 0.91 0
+    6    1114    1067    225855    161570  151.5  2.65  0.86    5434   2.1    340886    393   3397 4.34/4.34/5.08 1.02 40242
+    7    1219    1187    188294    138624  116.8  2.97  0.81    5714   1.4    244789    452   1171 4.55/4.60/5.43 1.11 105846
+    8    1288    1267    183335    138110  109.0  3.17  0.86    5147   2.3    270999    464   1988 4.84/4.96/5.61 1.20 136110
+    9    1208    1220    182258    138126  113.2  3.05  0.87    5231   2.7    287764    443   1367 4.73/4.83/5.55 1.06 126255
+   10    1318    1273    178094    133173  104.6  3.18  0.93    5239   3.8    309435    477    836 4.98/5.04/5.74 1.26 139219
+  per node per minute: min RSS_MB anon_MB matched/s resting_M flush_depth handoff_ms ckpts layer_MB drop_inline
+  val0  1   4556   4523   195588   0.07    0.1   0.01    5  133.8   235
+  val0  2   5267   5234   218263   0.60    0.1   0.01    5  146.3   173
+  val0  3   5499   5467   212296   0.44    0.1   0.01    5  108.7   143
+  val0  4   5604   5571   198598   0.44    0.0   0.01    5   96.1   166
+  val0  5   5673   5640   192897   0.29    0.1   0.02    5   96.4   147
+  val0  6   5835   5802   161570   0.24    0.1   0.01    5   91.6   142
+  val0  7   5843   5811   138624   0.16    0.0   0.01    4   68.1   137
+  val0  8   5872   5839   138110   0.20    0.1   0.01    6   84.2   183
+  val0  9   5976   5943   138126   0.37    0.1   0.01    5  104.9   160
+  val0 10   6071   6038   133173   0.24    0.0   0.01    3  108.4   159
+  val1  1   4497   4464   195277   0.07    0.1   0.02    5  133.8   242
+  val1  2   5162   5129   218573   0.61    0.1   0.01    5  144.5   173
+  val1  3   5254   5221   213798   0.46    0.1   0.01    5  110.6   142
+  val1  4   5436   5403   198064   0.42    0.1   0.01    5   95.0   165
+  val1  5   5579   5547   193406   0.31    0.1   0.01    5   95.7   143
+  val1  6   5618   5585   160334   0.25    0.1   0.01    5   90.7   144
+  val1  7   5604   5571   138384   0.18    0.0   0.01    4   70.0   137
+  val1  8   5654   5621   138373   0.20    0.0   0.02    6   83.7   181
+  val1  9   5845   5813   138230   0.37    0.1   0.01    5  104.9   164
+  val1 10   5934   5901   134017   0.24    0.1   0.01    3  108.4   164
+  val2  1   4915   4882   178044   0.34    0.1   0.01    5  129.6   260
+  val2  2   5583   5551   191630   0.53    0.0   0.01    4  143.7   136
+  val2  3   5951   5918   186200   0.45    0.1   0.01    4  139.8   126
+  val2  4   6150   6117   190923   0.37    0.1   0.01    5  101.8   146
+  val2  5   6304   6271   194624   0.39    0.0   0.01    5   95.0   141
+  val2  6   6418   6385   189208   0.38    0.1   0.01    4   94.9   128
+  val2  7   6396   6364   135696   0.20    0.0   0.01    6   73.7   178
+  val2  8   6455   6422   147659   0.33    0.0   0.01    5   89.7   184
+  val2  9   6446   6413   142190   0.40    0.1   0.01    5   86.0   151
+  val2 10   6442   6409   125921   0.40    0.0   0.01    4  100.8   167
+  track val0: r(RSS level, resting level) -0.60; r(dRSS, dresting) +0.10; r(dRSS, layer MB) +0.64; (minutes 3-10) resting min3->min10 0.44->0.24 M; RSS 5499->6071 MB
+  track val1: r(RSS level, resting level) -0.55; r(dRSS, dresting) +0.40; r(dRSS, layer MB) +0.73; (minutes 3-10) resting min3->min10 0.46->0.24 M; RSS 5254->5934 MB
+  track val2: r(RSS level, resting level) -0.44; r(dRSS, dresting) +0.01; r(dRSS, layer MB) +0.62; (minutes 3-10) resting min3->min10 0.45->0.40 M; RSS 5951->6442 MB
+== je ctl window 602 s
+  val0 RSS MB mean 2-5 4032 5-10 3953 8-10 3918 | start 2132 @1 3766 @5 4035 end 3830 peak 4258 | delta 1->10 +63 5->10 -205 | slope MB/min early(0-5) +145.2 [+30.3, +260.1] late(5-10) -16.5 [-41.4, +8.3] n_eff 45 | 2-5 -22.1 5-8 +24.9 8-10 -64.1
+     gauges @1/@5/end: exec_resident_rows_bytes=213.025M/214.135M/214.135M exec_resting_orders=308.038k/396.637k/97.285k exec_cancel_all_index_entries=534.694k/1.01993M/223.052k rocksdb_memtable_bytes_all=265.651M/201.825M/318.848M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9582/6022/2643 exec_queue_depth=66/60/44
+  val1 RSS MB mean 2-5 4015 5-10 4060 8-10 4062 | start 2198 @1 3820 @5 4029 end 4154 peak 4287 | delta 1->10 +334 5->10 +125 | slope MB/min early(0-5) +139.8 [+15.2, +264.4] late(5-10) +8.0 [-11.3, +27.3] n_eff 49 | 2-5 -9.2 5-8 +45.3 8-10 -36.2
+     gauges @1/@5/end: exec_resident_rows_bytes=213.076M/214.135M/214.135M exec_resting_orders=310.327k/346.381k/463.872k exec_cancel_all_index_entries=550.754k/935.74k/836.44k rocksdb_memtable_bytes_all=346.372M/121.221M/423.607M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9985/6298/2243 exec_queue_depth=64/65/65
+  val2 RSS MB mean 2-5 4765 5-10 4798 8-10 4841 | start 2992 @1 4532 @5 4625 end 4958 peak 5245 | delta 1->10 +426 5->10 +332 | slope MB/min early(0-5) +122.5 [+13.8, +231.3] late(5-10) +26.2 [-10.1, +62.6] n_eff 29 | 2-5 -38.9 5-8 +57.2 8-10 -92.4
+     gauges @1/@5/end: exec_resident_rows_bytes=213.076M/214.135M/214.135M exec_resting_orders=310.327k/358.074k/449.899k exec_cancel_all_index_entries=550.754k/950.628k/836.44k rocksdb_memtable_bytes_all=289.613M/207.462M/250.229M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=9699/6046/2243 exec_queue_depth=65/65/65
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired node_cores(v0,v1,v2) bench_cores margin_rejected/s
+    1    1455    1018    266780    202946  199.4  3.67  0.96    4710  50.0    250980    341      0 5.84/5.88/6.47 1.14 0
+    2    1231    1146    279960    213503  186.4  3.27  0.98    7398  63.7    292007    443      0 5.74/5.77/6.22 1.19 0
+    3    1078    1067    282367    215734  202.3  2.67  0.98    5582  62.3    459178    363   2220 5.51/5.55/5.88 1.01 0
+    4    1114    1140    275080    209658  183.9  2.85  0.99    5368  61.4    440633    444   3221 5.43/5.52/5.86 1.03 0
+    5    1172    1140    284900    216695  190.1  2.85  0.98    5592  60.0    383426    431   2048 5.32/5.44/5.78 1.13 0
+    6    1215    1127    275539    208363  184.9  2.83  0.99    5266  59.0    378659    423   1813 5.35/5.42/5.83 1.11 4734
+    7    1341    1360    222647    155919  114.6  3.38  0.99    5015  56.9    282344    515   2531 5.85/5.88/6.31 1.23 111146
+    8    1317    1313    240464    183423  139.7  3.28  0.98    6250  54.7    273755    486    114 5.69/5.72/6.25 1.25 89316
+    9    1258    1287    209532    159951  124.3  3.22  0.97    6049  49.1    341877    483    731 5.69/5.79/6.35 1.27 111280
+   10    1313    1362    201889    153505  112.7  3.45  0.99    4957  46.5    358653    506    707 5.82/5.83/6.25 1.20 139044
+  per node per minute: min RSS_MB anon_MB matched/s resting_M flush_depth handoff_ms ckpts layer_MB drop_inline
+  val0  1   3805   3771   202946   0.38    0.2   0.49  nan    nan   nan
+  val0  2   4006   3973   213503   0.10    0.3   0.37  nan    nan   nan
+  val0  3   4067   4033   215734   0.49    0.5   0.68  nan    nan   nan
+  val0  4   4100   4067   209658   0.33    0.5   0.01  nan    nan   nan
+  val0  5   4021   3988   216695   0.32    0.5   0.01  nan    nan   nan
+  val0  6   3916   3883   208363   0.45    0.3   0.01  nan    nan   nan
+  val0  7   3879   3845   155919   0.31    0.3   0.16  nan    nan   nan
+  val0  8   4083   4050   183423   0.53    0.4   0.56  nan    nan   nan
+  val0  9   3961   3927   159951   0.38    0.4   0.41  nan    nan   nan
+  val0 10   3899   3865   153505   0.37    0.3   0.24  nan    nan   nan
+  val1  1   3851   3818   204447   0.38    0.2   0.53  nan    nan   nan
+  val1  2   4058   4024   208953   0.08    0.2   0.62  nan    nan   nan
+  val1  3   4154   4120   214162   0.46    0.4   0.49  nan    nan   nan
+  val1  4   4021   3988   210171   0.47    0.4   0.08  nan    nan   nan
+  val1  5   4028   3995   214257   0.41    0.4   0.01  nan    nan   nan
+  val1  6   4008   3975   207582   0.37    0.3   0.04  nan    nan   nan
+  val1  7   3954   3921   153322   0.24    0.3   0.01  nan    nan   nan
+  val1  8   4224   4191   179974   0.43    0.3   4.91  nan    nan   nan
+  val1  9   4192   4159   162296   0.44    0.5   0.57  nan    nan   nan
+  val1 10   4136   4102   151523   0.39    0.4   0.39  nan    nan   nan
+  val2  1   4662   4628   203398   0.38    0.3   0.40  nan    nan   nan
+  val2  2   4804   4771   211542   0.08    0.2   0.53  nan    nan   nan
+  val2  3   4936   4903   214164   0.48    0.5   0.44  nan    nan   nan
+  val2  4   4846   4812   209170   0.45    0.3   0.53  nan    nan   nan
+  val2  5   4649   4615   215249   0.41    0.5   0.01  nan    nan   nan
+  val2  6   4789   4756   206054   0.37    0.4   0.05  nan    nan   nan
+  val2  7   4696   4662   153198   0.24    0.3   0.01  nan    nan   nan
+  val2  8   4949   4916   180093   0.43    0.4   4.79  nan    nan   nan
+  val2  9   4899   4866   160764   0.44    0.4   0.43  nan    nan   nan
+  val2 10   4990   4957   151863   0.39    0.3   0.09  nan    nan   nan
+  track val0: r(RSS level, resting level) +0.35; r(dRSS, dresting) +0.47; r(dRSS, layer MB) +nan; (minutes 3-10) resting min3->min10 0.49->0.37 M; RSS 4067->3899 MB
+  track val1: r(RSS level, resting level) +0.60; r(dRSS, dresting) +0.78; r(dRSS, layer MB) +nan; (minutes 3-10) resting min3->min10 0.46->0.39 M; RSS 4154->4136 MB
+  track val2: r(RSS level, resting level) +0.54; r(dRSS, dresting) +0.64; r(dRSS, layer MB) +nan; (minutes 3-10) resting min3->min10 0.48->0.39 M; RSS 4936->4990 MB
+== je s2 window 602 s
+  val0 RSS MB mean 2-5 4834 5-10 4701 8-10 4729 | start 888 @1 4563 @5 4958 end 4665 peak 5158 | delta 1->10 +101 5->10 -294 | slope MB/min early(0-5) +217.3 [+21.6, +412.9] late(5-10) +15.3 [-20.6, +51.2] n_eff 30 | 2-5 -87.2 5-8 -30.3 8-10 +38.7
+     gauges @1/@5/end: exec_resident_rows_bytes=213.981M/214.135M/214.135M exec_resting_orders=100.284k/393.621k/361.513k exec_cancel_all_index_entries=193.154k/1.00029M/772.338k rocksdb_memtable_bytes_all=211.649M/228.432M/157.246M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=1806/7021/4976 exec_queue_depth=56/62/62
+     checkpoints 49 layer MB mean 115.1 early 117.3 late 112.4 | settle ms/block early 21.2 late 18.8 | flush-worker ckpt s early 0.49 late 0.62 | layer_shared 0 drop_inline 2183
+  val1 RSS MB mean 2-5 4717 5-10 4578 8-10 4634 | start 976 @1 4286 @5 4744 end 4470 peak 5115 | delta 1->10 +185 5->10 -274 | slope MB/min early(0-5) +201.8 [-1.0, +404.5] late(5-10) +32.7 [+2.7, +62.7] n_eff 38 | 2-5 -54.4 5-8 +5.3 8-10 -0.1
+     gauges @1/@5/end: exec_resident_rows_bytes=213.979M/214.135M/214.135M exec_resting_orders=85.636k/358.632k/330.847k exec_cancel_all_index_entries=167.51k/969.836k/725.142k rocksdb_memtable_bytes_all=305.108M/239.966M/188.84M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=1006/7124/4576 exec_queue_depth=61/64/66
+     checkpoints 49 layer MB mean 115.0 early 117.1 late 112.5 | settle ms/block early 22.3 late 18.7 | flush-worker ckpt s early 0.50 late 0.61 | layer_shared 0 drop_inline 2347
+  val2 RSS MB mean 2-5 5610 5-10 5583 8-10 5597 | start 1028 @1 5962 @5 5868 end 5888 peak 6539 | delta 1->10 -74 5->10 +20 | slope MB/min early(0-5) +169.9 [-81.0, +420.9] late(5-10) +27.9 [-5.6, +61.5] n_eff 42 | 2-5 +4.1 5-8 +54.1 8-10 +29.9
+     gauges @1/@5/end: exec_resident_rows_bytes=213.98M/214.135M/214.135M exec_resting_orders=80.533k/389.903k/358.135k exec_cancel_all_index_entries=164.539k/987.973k/766.203k rocksdb_memtable_bytes_all=263.03M/386.743M/313.326M rocksdb_block_cache_bytes=87/87/87 mempool_native_size=74/6904/4764 exec_queue_depth=64/64/64
+     checkpoints 48 layer MB mean 116.6 early 120.2 late 112.5 | settle ms/block early 22.2 late 18.5 | flush-worker ckpt s early 0.53 late 0.60 | layer_shared 0 drop_inline 2257
+  min submit/s processed/s placed/s matched/s matched/action blk/s exec_busy mempool exec_q resting cancel-all/s expired node_cores(v0,v1,v2) bench_cores margin_rejected/s
+    1    1455    1112    284271    215663  193.9  4.60  0.98    4264  51.3    214688    396      0 5.43/5.39/6.08 1.13 0
+    2    1305    1165    304120    232245  199.3  3.12  1.00    7259  63.0    274897    398      0 5.38/5.38/5.94 1.22 0
+    3    1214    1187    299973    228628  192.7  2.97  1.00    5266  63.0    475616    434   3056 5.35/5.32/5.82 1.10 0
+    4    1265    1253    307327    233389  186.2  3.13  1.00    5422  62.1    421637    482   3137 5.22/5.24/5.66 1.18 0
+    5    1318    1240    308307    234556  189.2  3.10  1.00    5332  62.1    376304    466   1489 5.19/5.13/5.69 1.19 0
+    6    1337    1367    267143    189353  138.6  3.42  1.00    5304  62.1    341271    527   3102 5.26/5.34/5.76 1.17 67460
+    7    1464    1433    232995    176993  123.5  3.58  1.00    4978  61.2    249849    537    439 5.66/5.65/6.20 1.36 124262
+    8    1496    1433    223446    170091  118.7  3.60  1.00    5615  61.6    275356    532   1027 5.66/5.68/6.26 1.40 138537
+    9    1431    1433    203645    153771  107.3  3.57  0.97    5136  62.5    374524    536   1099 5.60/5.55/6.09 1.35 154145
+   10    1445    1465    211293    159822  109.1  3.67  1.01    5108  62.4    333884    544    296 5.50/5.56/6.09 1.37 152850
+  per node per minute: min RSS_MB anon_MB matched/s resting_M flush_depth handoff_ms ckpts layer_MB drop_inline
+  val0  1   4535   4502   215663   0.13    0.1   0.01    6  131.0   285
+  val0  2   4925   4892   232245   0.47    0.1   0.01    4  164.7   155
+  val0  3   4729   4696   228628   0.52    0.1   0.01    5  132.9   168
+  val0  4   4858   4825   233389   0.42    0.1   0.01    6   93.5   184
+  val0  5   4958   4924   234556   0.43    0.1   0.03    5   81.7   110
+  val0  6   4423   4390   189353   0.26    0.1   0.01    5  100.4   170
+  val0  7   4713   4680   176993   0.25    0.1   0.01    5  102.3   218
+  val0  8   4732   4699   170091   0.41    0.1   0.02    4  112.3    86
+  val0  9   4655   4621   153771   0.30    0.0   0.04    5  121.1   199
+  val0 10   4664   4631   159822   0.27    0.1   0.01    4  128.3   216
+  val1  1   4292   4258   211900   0.09    0.1   0.01    6  130.9   284
+  val1  2   4865   4831   232969   0.46    0.0   0.01    3  170.9   155
+  val1  3   4572   4538   227886   0.49    0.1   0.01    6  130.1   168
+  val1  4   4785   4751   232633   0.38    0.1   0.03    6   94.1   185
+  val1  5   4740   4707   234480   0.39    0.1   0.01    5   80.7   154
+  val1  6   4341   4307   191264   0.29    0.1   0.01    5  101.6   170
+  val1  7   4582   4548   175964   0.22    0.0   0.01    5  102.1   233
+  val1  8   4669   4636   170790   0.39    0.0   0.02    4  111.8   195
+  val1  9   4506   4473   155910   0.29    0.1   0.01    4  125.2   195
+  val1 10   4458   4425   159458   0.45    0.0   0.02    5  123.6   214
+  val2  1   5892   5859   213301   0.11    0.0   0.01    6  131.0   285
+  val2  2   5430   5397   231568   0.46    0.1   0.01    3  170.8   134
+  val2  3   5319   5286   228599   0.50    0.1   0.03    6  130.3   155
+  val2  4   5877   5844   233488   0.39    0.0   0.01    5  105.0   137
+  val2  5   5859   5826   234440   0.39    0.1   0.03    5   80.6   154
+  val2  6   5518   5485   191609   0.31    0.1   0.02    5  101.6   171
+  val2  7   5577   5543   176005   0.23    0.1   0.03    5  102.2   235
+  val2  8   5779   5746   171705   0.41    0.1   0.02    4  112.3   186
+  val2  9   5566   5533   153080   0.30    0.0   0.02    5  121.1   200
+  val2 10   5819   5786   160665   0.42    0.1   0.01    4  127.9   207
+  track val0: r(RSS level, resting level) +0.60; r(dRSS, dresting) +0.51; r(dRSS, layer MB) -0.12; (minutes 3-10) resting min3->min10 0.52->0.27 M; RSS 4729->4664 MB
+  track val1: r(RSS level, resting level) +0.22; r(dRSS, dresting) +0.12; r(dRSS, layer MB) -0.19; (minutes 3-10) resting min3->min10 0.49->0.45 M; RSS 4572->4458 MB
+  track val2: r(RSS level, resting level) +0.03; r(dRSS, dresting) +0.27; r(dRSS, layer MB) +0.15; (minutes 3-10) resting min3->min10 0.50->0.42 M; RSS 5319->5819 MB

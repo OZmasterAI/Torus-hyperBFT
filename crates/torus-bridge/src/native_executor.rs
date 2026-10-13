@@ -3007,6 +3007,9 @@ pub struct ResidentBooks {
     /// which every reader / writer of `rows` calls first, so nothing can see
     /// the slot of the block before the worker finished it.
     rows_pending: Option<PendingRows>,
+    /// P2-3: the long-lived thread [`end_resident_on_worker`] hands its jobs
+    /// to (started at the first one; was a new thread per block).
+    end_thread: Option<EndResidentThread>,
     /// Item 6 Phase 1: R builds (cold start or guard trip) and
     /// `end_resident` calls that found another clone of R alive (test /
     /// ops introspection).
@@ -3016,10 +3019,38 @@ pub struct ResidentBooks {
 
 /// Item 6 step 2: one block's `end_resident` running on a worker thread.
 struct PendingRows {
-    handle: std::thread::JoinHandle<RowsSlot>,
+    /// The job's slot, or its panic payload (P2-3: was the thread's
+    /// `JoinHandle`); a closed channel = the thread died.
+    handle: std::sync::mpsc::Receiver<std::thread::Result<RowsSlot>>,
     height: u64,
     /// For the wait timer at the join.
     metrics: Option<Arc<torus_telemetry::Metrics>>,
+}
+
+/// P2-3: a job for the end-resident thread; it sends its own result.
+type EndResidentTask = Box<dyn FnOnce() + Send>;
+
+/// P2-3: one long-lived `torus-end-resident` thread per [`ResidentBooks`],
+/// running one job at a time (a holder has at most one in flight). A job's
+/// panic is caught there and reported to [`ResidentBooks::settle_rows`]
+/// like a failed join; the thread lives on. Dropping the holder closes the
+/// queue and the thread ends after its current job.
+struct EndResidentThread {
+    tx: std::sync::mpsc::Sender<EndResidentTask>,
+}
+
+impl EndResidentThread {
+    fn spawn() -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<EndResidentTask>();
+        std::thread::Builder::new()
+            .name("torus-end-resident".into())
+            .spawn(move || {
+                for task in rx {
+                    task();
+                }
+            })?;
+        Ok(Self { tx })
+    }
 }
 
 struct RowsSlot {
@@ -3348,7 +3379,9 @@ impl ResidentBooks {
             return;
         };
         let timer = std::time::Instant::now();
-        let joined = handle.join();
+        let joined = handle.recv().unwrap_or_else(|_| {
+            Err(Box::new("end_resident thread died") as Box<dyn std::any::Any + Send>)
+        });
         if let Some(m) = metrics.as_deref() {
             m.exec_end_resident_wait_seconds.observe(timer.elapsed().as_secs_f64());
         }
@@ -3768,7 +3801,8 @@ pub fn end_resident(
 }
 
 /// Item 6 step 2: [`end_resident`] with its work (R applying `delta`, the
-/// decoded positions and the sums carry) on a new worker thread, so it
+/// decoded positions and the sums carry) on a worker thread (P2-3: the
+/// holder's long-lived `torus-end-resident` thread, not one per block), so it
 /// overlaps the next block's work up to its [`begin_resident`]. The checks
 /// (`ok`, R attached, no other clone of R alive) run here, on the calling
 /// thread, exactly as in `end_resident`; the worker then owns R, the delta and
@@ -3799,26 +3833,52 @@ pub fn end_resident_on_worker(
     let height = job.height;
     let checks = timer.elapsed();
     let worker_metrics = metrics.clone();
-    let spawned = std::thread::Builder::new().name("torus-end-resident".into()).spawn(move || {
-        let timer = std::time::Instant::now();
-        let slot = job.run(worker_metrics.as_deref());
-        if let Some(m) = worker_metrics.as_deref() {
-            m.exec_end_resident_seconds.observe((checks + timer.elapsed()).as_secs_f64());
-        }
-        slot
+    let (done, handle) = std::sync::mpsc::sync_channel(1);
+    let task: EndResidentTask = Box::new(move || {
+        let slot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let timer = std::time::Instant::now();
+            let slot = job.run(worker_metrics.as_deref());
+            if let Some(m) = worker_metrics.as_deref() {
+                m.exec_end_resident_seconds
+                    .observe((checks + timer.elapsed()).as_secs_f64());
+            }
+            slot
+        }));
+        // The holder may be gone (dropped mid-job): nothing to report to.
+        let _ = done.send(slot);
     });
-    match spawned {
-        Ok(handle) => {
-            torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::EndResident, 1);
+    // P2-3: the holder's long-lived thread, started at its first job.
+    if holder.end_thread.is_none() {
+        match EndResidentThread::spawn() {
+            Ok(t) => {
+                torus_state::spawn_count::add(torus_state::spawn_count::SpawnSite::EndResident, 1);
+                holder.end_thread = Some(t);
+            }
+            Err(e) => {
+                // The job (R included) is dropped with the task.
+                tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
+                return;
+            }
+        }
+    }
+    let sent = holder.end_thread.as_ref().map(|t| t.tx.send(task));
+    match sent {
+        Some(Ok(())) => {
             holder.rows_pending = Some(PendingRows {
                 handle,
                 height,
                 metrics,
             })
         }
-        Err(e) => {
-            // The job (R included) was dropped with the closure.
-            tracing::error!(%e, height, "item 6: end_resident worker spawn failed — dropping R (next native block rebuilds it)");
+        _ => {
+            // The thread is gone (never in the normal sequence): the job (R
+            // included) was dropped with the task; the next job starts a
+            // new thread.
+            holder.end_thread = None;
+            tracing::error!(
+                height,
+                "item 6: end_resident thread gone — dropping R (next native block rebuilds it)"
+            );
         }
     }
 }
@@ -8014,28 +8074,26 @@ impl NativeExecutor {
                 let mut slots: Vec<Option<Result<MarketSettlePlan, String>>> =
                     (0..mrs.len()).map(|_| None).collect();
                 let plan_for = &plan_for;
-                torus_state::spawn_count::add(
-                    torus_state::spawn_count::SpawnSite::Settle,
-                    chunks.len(),
-                );
+                // P2-3: the chunks run as jobs on the persistent exec pool
+                // (no per-block spawns); a job that died outside the
+                // per-market containment yields an empty vec, as a scoped
+                // thread's failed join did.
+                let jobs: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        move || {
+                            chunk
+                                .into_iter()
+                                .map(|i| (i, plan_for(i)))
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .collect();
                 let chunk_out: Vec<Vec<(usize, Result<MarketSettlePlan, String>)>> =
-                    std::thread::scope(|s| {
-                        let handles: Vec<_> = chunks
-                            .into_iter()
-                            .map(|chunk| {
-                                s.spawn(move || {
-                                    chunk
-                                        .into_iter()
-                                        .map(|i| (i, plan_for(i)))
-                                        .collect::<Vec<_>>()
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().unwrap_or_default())
-                            .collect()
-                    });
+                    crate::exec_pool::run_jobs(jobs)
+                        .into_iter()
+                        .map(|joined| joined.unwrap_or_default())
+                        .collect();
                 // A worker thread that died OUTSIDE the per-market containment
                 // yields an empty vec; its markets stay `None` and become the
                 // fallback trigger below (never a silently skipped market).
