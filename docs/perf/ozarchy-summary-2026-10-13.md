@@ -1,8 +1,8 @@
 # ozarchy campaigns 2026-10-13: absolute per-arm values
 
 Sources: results doc `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` sections 53-58 (branch docs/wedge-fix, worktree
-`/home/oz/projects/wt/docs-wedge-fix`), 59 (branch docs/p3-cloid), 60 (branch docs/p3-cloidprof) and 61 (branch docs/p3-gate), `<run>/analyst/{cells.json,arms.txt,paired.txt,soak.txt,series.txt}`
-(61 also `arms-soak.txt`, `a-term.txt`)
+`/home/oz/projects/wt/docs-wedge-fix`), 59 (branch docs/p3-cloid), 60 (branch docs/p3-cloidprof), 61 (branch docs/p3-gate) and 62 (branch docs/p3-kd), `<run>/analyst/{cells.json,arms.txt,paired.txt,soak.txt,series.txt}`
+(61 also `arms-soak.txt`, `a-term.txt`; 62 also `restart.txt`)
 and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywhere: tw, Classic, 300 markets, MAX_IN_FLIGHT 4, commit tail, shared NVMe.
 
 | Sec | arm (sha, allocator) | matched/s: whole cell [min 0-2 / 6-10] | native blk/s | blk time p99 ms | node CPU-s/1M | RSS mean / peak GB per node | dev writes MB/s/val | settle ms/native blk | key delta (CI), as in the write-up |
@@ -42,6 +42,10 @@ and, for 53d / 57 only, the cells' `summary.json` (see footnotes). Shape everywh
 | 61 soak | s2 step 2 c88d3073, je compiled in, 15 s | 219,139 [210,202 / 218,481] | 2.97 | 1,473 | 24.46 | 6.14 / 6.75 | 82.9 | 9.0 | |
 | 61 TERM | m de1a97c1 (1 SIGTERM) | SIGTERM -> exit 21.5 s; kill -> first chain commit 37.3 s; replay 0 | - | - | - | - | - | n/a | s2 restart 35.0 s vs m 37.3 s (gate 60 s); replay 0 in both; one kill per arm |
 | 61 TERM | s2 c88d3073 (1 SIGTERM) | SIGTERM -> exit 19.1 s; kill -> first chain commit 35.0 s; replay 0 | - | - | - | - | - | - | |
+| 62 KILL | m de1a97c1 (4 SIGKILLs) | kill -> val1 first commit 27.2 mean / 31.95 max s; replay 61-65 blocks (= exec queue) | - | - | - | - | - | n/a | s2 29.9 / 39.5 s vs m 27.2 / 31.95 s (gate 60 s); replay from the marker + 1, contiguous; state hashes agree (121 checkpoints) |
+| 62 KILL | s2 c88d3073 (4 SIGKILLs) | kill -> val1 first commit 29.9 mean / 39.5 max s; replay 72-113 blocks (last 100-block checkpoint) | - | - | - | - | - | - | |
+| 62 soak | s2def c88d3073, je defaults, 15 s | 217,605 [210,278 / 217,519] | 2.95 | 1,398 | 24.47 | 6.40 / 7.07 | - | 9.2 | dec - def RSS -1.72 GiB/node (min 5-10), -1.71 peak; je allocated unchanged; CPU +4.6%, matched/s -2.5%, blk/s +2.6%; single cells |
+| 62 soak | s2dec c88d3073, je + MALLOC_CONF=background_thread:true,dirty_decay_ms:1000, 15 s | 212,075 [207,428 / 210,248] | 3.02 | 1,425 | 25.60 | 4.64 / 5.32 | - | 8.9 | |
 
 Definitions and caveats
 
@@ -61,6 +65,12 @@ Definitions and caveats
   SAT = n = 4 ABBA 120 s; soak = one 600 s cell per arm (no CI; soak columns from `arms-soak.txt`, RSS = minutes 5-10 mean /
   peak of the 3 per-node values in `series.txt`, matched/s minute windows from `series.txt`); soak settle = `ck_settle` (summary
   phase per native block; per `torus_exec_native_blocks_total` it is 8.8, SAT 3.1). TERM = one 300 s cell per arm, SIGTERM of val1 at bench+180 s; restart = kill -> first chain commit after the restart.
+- **62 (SIGKILL restart gate + jemalloc decay):** p3gate's staged binaries (not rebuilt), CLOID_SHARE=0, full workload. KILL =
+  2 cells x 2 SIGKILLs of val1 per arm (300 s, state hash on), restart = kill -> val1's own first commit (`restart.txt`; on
+  the 61 chain basis s2 29.9 / 40.0 s). Soak = one 600 s cell per setting on s2: RSS = minutes 5-10 mean / peak of the 3
+  per-node MB values in `series.txt` / 1000, as the 61 soak rows (the delta text and section 62 use GiB = MB / 1024:
+  6.25 -> 4.53); blk/s, CPU, p99 and settle from `cells.json` (p99 = mean of nodes, a-arms.py's definition); device writes
+  not computed (no `a-arms.py --io` run). The decay setting is `MALLOC_CONF` in the node environment, not compiled in.
 - **Commit tail everywhere** (bench in-flight released on committed bodies); block time p99 = commit interval from val0-2
   logs, mean of 3 nodes. Closed-loop bench: faster commits raise offered load (jemalloc and mw rows).
 - **Settle wait** = `checkpoint_settle_wait` summary phase, ms per native block, mean of 3 nodes; n/a = no Phase 3 (main
