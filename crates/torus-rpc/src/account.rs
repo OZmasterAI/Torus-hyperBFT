@@ -136,6 +136,17 @@ pub fn account_figures(
     })
 }
 
+/// R23: the cross liquidation price of `trader`'s position in `market` at
+/// block time `now`. RED stub.
+pub fn cross_liquidation_price(
+    _state: &StateDb,
+    _trader: &Address,
+    _market: MarketId,
+    _now: Option<u64>,
+) -> Result<Option<FixedPoint>, CoreError> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +486,237 @@ mod tests {
         assert_eq!(f.cash_balance, fp(800));
         // 800 + 0 − max(500, 1000) < 0.
         assert_eq!(f.withdrawable, FixedPoint::ZERO);
+    }
+
+    // ---- R23: cross liquidation price ----
+
+    fn gtc_sell(m: MarketId, price: i64, qty: i64) -> PlaceOrderParams {
+        PlaceOrderParams {
+            is_buy: false,
+            ..gtc_buy(m, price, qty)
+        }
+    }
+
+    /// One cross leg of t: (market, long?, size, entry).
+    type Leg = (MarketId, bool, i64, i64);
+
+    /// t (addr 1) with `cash` and cross `legs` (s = addr 2 holds the other
+    /// side); maker addr 3 rests `quotes` (market, buy?, price, size) for a
+    /// stage-1 liquidation to fill against; then every market in `marks` is
+    /// marked. Markets 1 and 2 are listed (default 20x: MM 2.5% notional).
+    fn liq_scenario(
+        cash: FixedPoint,
+        legs: &[Leg],
+        quotes: &[(MarketId, bool, i64, i64)],
+        marks: &[(MarketId, FixedPoint)],
+    ) -> (tempfile::TempDir, NativeExecContext, Address) {
+        let (d, db) = test_db(&[1, 2]);
+        let mut ctx = ctx_of(&db);
+        let (t, s, mk) = (addr(1), addr(2), addr(3));
+        fund(&ctx, &t, cash);
+        fund(&ctx, &s, fp(1_000_000));
+        fund(&ctx, &mk, fp(1_000_000));
+        for &(m, long, qty, px) in legs {
+            let (l, sh) = if long { (&t, &s) } else { (&s, &t) };
+            open_pair(&ctx, l, sh, m, qty, px);
+        }
+        for &(m, buy, px, qty) in quotes {
+            let p = if buy {
+                gtc_buy(m, px, qty)
+            } else {
+                gtc_sell(m, px, qty)
+            };
+            let r = NativeExecutor::execute(&mut ctx, &mk, &NativeAction::PlaceOrder(p));
+            assert!(r.success, "{:?}", r.error);
+        }
+        for &(m, px) in marks {
+            set_mark(&ctx, m, px);
+        }
+        (d, ctx, t)
+    }
+
+    fn liq_price(ctx: &NativeExecContext, t: &Address, m: MarketId) -> Option<FixedPoint> {
+        cross_liquidation_price(&ctx.state, t, m, Some(ctx.timestamp)).unwrap()
+    }
+
+    /// Whether the engine's liquidation step touches t (any position size
+    /// changes) on the [`liq_scenario`] state.
+    fn engine_liquidates(
+        cash: FixedPoint,
+        legs: &[Leg],
+        quotes: &[(MarketId, bool, i64, i64)],
+        marks: &[(MarketId, FixedPoint)],
+    ) -> bool {
+        let (_d, mut ctx, t) = liq_scenario(cash, legs, quotes, marks);
+        let sizes = |ctx: &NativeExecContext| -> Vec<FixedPoint> {
+            legs.iter()
+                .map(|&(m, ..)| {
+                    ctx.positions
+                        .get_position(&t, m)
+                        .unwrap()
+                        .map_or(FixedPoint::ZERO, |p| p.size)
+                })
+                .collect()
+        };
+        let before = sizes(&ctx);
+        NativeExecutor::run_liquidations(&mut ctx);
+        assert!(ctx.fatal_error.is_none());
+        sizes(&ctx) != before
+    }
+
+    /// One raw unit (1e-8).
+    fn one_raw() -> FixedPoint {
+        FixedPoint::from_raw(1)
+    }
+
+    /// Long 10 @ 1000, cash 1000: healthy iff 1000 + 10P − 10000 >= 2.5% ×
+    /// 10P, so P = 9000 / 9.75 = 923.0769230.., rounded up to the raw unit
+    /// at which equity first covers MM. The engine leaves the account alone
+    /// at that mark and liquidates one raw unit below it.
+    #[test]
+    fn cross_long_liquidation_price_is_the_engine_threshold() {
+        let legs = [(1, true, 10, 1_000)];
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &legs, &[], &[(1, fp(1_000))]);
+        let p = liq_price(&ctx, &t, 1).expect("a long has a liquidation price");
+        assert_eq!(p, FixedPoint::from_raw(92_307_692_308));
+        // The current mark does not move it (only this market's mark is
+        // the variable).
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &legs, &[], &[(1, fp(1_100))]);
+        assert_eq!(liq_price(&ctx, &t, 1), Some(p));
+
+        let bid = [(1, true, 920, 10)];
+        assert!(!engine_liquidates(fp(1_000), &legs, &bid, &[(1, p)]));
+        assert!(engine_liquidates(
+            fp(1_000),
+            &legs,
+            &bid,
+            &[(1, p - one_raw())]
+        ));
+    }
+
+    /// Short 10 @ 1000, cash 1000: healthy iff 11000 − 10P >= 2.5% × 10P,
+    /// P = 11000 / 10.25 = 1073.1707317.., the highest raw price still
+    /// healthy. The engine liquidates one raw unit above it.
+    #[test]
+    fn cross_short_liquidation_price_is_the_engine_threshold() {
+        let legs = [(1, false, 10, 1_000)];
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &legs, &[], &[(1, fp(1_000))]);
+        let p = liq_price(&ctx, &t, 1).expect("a short has a liquidation price");
+        assert_eq!(p, FixedPoint::from_raw(107_317_073_170));
+
+        let ask = [(1, false, 1_080, 10)];
+        assert!(!engine_liquidates(fp(1_000), &legs, &ask, &[(1, p)]));
+        assert!(engine_liquidates(
+            fp(1_000),
+            &legs,
+            &ask,
+            &[(1, p + one_raw())]
+        ));
+    }
+
+    /// Cross account with two positions: long 10 @ 1000 in market 1 and
+    /// short 1 @ 2000 in market 2, cash 1000. Each position's price is the
+    /// shock of its own market with the other market's mark held fixed:
+    /// - market 1 (market 2 at 2100: UPnL −100, MM 52.5): 9.75 P >= 9152.5,
+    ///   P = 938.7179487..;
+    /// - market 2 (market 1 at 1000: UPnL 0, MM 250): 3000 − Q >= 250 +
+    ///   2.5% Q, Q = 2682.9268292.. (highest healthy raw price).
+    #[test]
+    fn cross_two_positions_each_shocks_its_own_market() {
+        let legs = [(1, true, 10, 1_000), (2, false, 1, 2_000)];
+        let marks = [(1, fp(1_000)), (2, fp(2_100))];
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &legs, &[], &marks);
+        let p1 = liq_price(&ctx, &t, 1).unwrap();
+        assert_eq!(p1, FixedPoint::from_raw(93_871_794_872));
+        let quotes = [(1, true, 930, 10), (2, false, 2_110, 1)];
+        assert!(!engine_liquidates(
+            fp(1_000),
+            &legs,
+            &quotes,
+            &[(1, p1), (2, fp(2_100))]
+        ));
+        assert!(engine_liquidates(
+            fp(1_000),
+            &legs,
+            &quotes,
+            &[(1, p1 - one_raw()), (2, fp(2_100))]
+        ));
+
+        let p2 = liq_price(&ctx, &t, 2).unwrap();
+        // Market 1 is held at its current mark 1000, whatever market 2's
+        // current mark is.
+        assert_eq!(p2, FixedPoint::from_raw(268_292_682_927));
+        let quotes = [(1, true, 990, 10), (2, false, 2_690, 1)];
+        assert!(!engine_liquidates(
+            fp(1_000),
+            &legs,
+            &quotes,
+            &[(1, fp(1_000)), (2, p2)]
+        ));
+        assert!(engine_liquidates(
+            fp(1_000),
+            &legs,
+            &quotes,
+            &[(1, fp(1_000)), (2, p2 + one_raw())]
+        ));
+    }
+
+    /// No mark of the market crosses maintenance ⇒ `None`:
+    /// - a fully funded long is healthy even at mark 0 (cash 10000 covers
+    ///   the whole cost basis);
+    /// - an account liquidatable at every mark (here a short whose equity
+    ///   is negative even at mark 0);
+    /// - no position in the market;
+    /// - a position in an unlisted market (the liquidation step never marks
+    ///   it, so its price cannot trigger liquidation);
+    /// - the account also holds an isolated position (the liquidation step
+    ///   does not value such an account).
+    #[test]
+    fn cross_liquidation_price_none_when_no_mark_crosses() {
+        let (_d, ctx, t) =
+            liq_scenario(fp(10_000), &[(1, true, 10, 1_000)], &[], &[(1, fp(1_000))]);
+        assert_eq!(liq_price(&ctx, &t, 1), None, "fully funded long");
+        assert!(!engine_liquidates(
+            fp(10_000),
+            &[(1, true, 10, 1_000)],
+            &[(1, true, 1, 1)],
+            &[(1, one_raw())]
+        ));
+
+        let (_d, ctx, t) = liq_scenario(
+            fp(-10_001),
+            &[(1, false, 10, 1_000)],
+            &[],
+            &[(1, fp(1_000))],
+        );
+        assert_eq!(liq_price(&ctx, &t, 1), None, "liquidatable at any mark");
+
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &[(1, true, 10, 1_000)], &[], &[]);
+        assert_eq!(liq_price(&ctx, &t, 2), None, "no position");
+
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &[(7, true, 10, 1_000)], &[], &[(7, fp(1_000))]);
+        assert_eq!(liq_price(&ctx, &t, 7), None, "unlisted market");
+
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &[(1, true, 10, 1_000)], &[], &[(1, fp(1_000))]);
+        ctx.positions
+            .apply_fill(&t, 2, true, fp(1), fp(100), MarginType::Isolated)
+            .unwrap();
+        assert_eq!(
+            liq_price(&ctx, &t, 1),
+            None,
+            "account with an isolated position"
+        );
+    }
+
+    /// Without a block time the other positions are valued at entry (as
+    /// `account_figures`); the shocked market's price is the variable, so
+    /// a single long has the same price as with a mark.
+    #[test]
+    fn cross_liquidation_price_without_block_time() {
+        let (_d, ctx, t) = liq_scenario(fp(1_000), &[(1, true, 10, 1_000)], &[], &[(1, fp(1_000))]);
+        assert_eq!(
+            cross_liquidation_price(&ctx.state, &t, 1, None).unwrap(),
+            Some(FixedPoint::from_raw(92_307_692_308))
+        );
     }
 }

@@ -1175,7 +1175,7 @@ impl TorusApiServer for RpcState {
                     realized_pnl: dec_fp(p.realized_pnl),
                     margin: dec_fp(p.isolated_margin),
                     margin_mode: margin_mode.to_string(),
-                    liquidation_price: dec_fp(liquidation_price),
+                    liquidation_price: Some(dec_fp(liquidation_price)),
                 }))
             }
         }
