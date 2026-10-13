@@ -23286,6 +23286,10 @@ mod crash_recovery_tests {
         cancel_only_blocks: u64,
         /// Reduce-only places (single or in a batch), `p2_blocks(true)` only.
         reduce_only: u64,
+        /// s118, `p2_blocks_with(_, true)` only: places (single, batch leg,
+        /// maker quote) with a cloid, and cancels by cloid.
+        cloids: u64,
+        cancels_by_cloid: u64,
     }
 
     /// The P2 sequence: heights 1..=P2_BLOCKS (ts 1000 + h), linked. C5's
@@ -23303,8 +23307,29 @@ mod crash_recovery_tests {
     /// liquidations close some. The extra draws happen only with `ro`, so
     /// `ro: false` is the original sequence.
     fn p2_blocks(ro: bool) -> (Vec<TorusBlock>, P2Fed) {
+        let (blocks, fed, _) = p2_blocks_with(ro, false);
+        (blocks, fed)
+    }
+
+    /// s118 (Phase 3 step 2 follow-up): one single `PlaceOrder` with a cloid
+    /// in the P2 sequence: (height, body index, trader seed, cloid).
+    type P2CloidPlace = (u64, usize, u8, u128);
+
+    /// [`p2_blocks`], and with `cloid` (s118): every single trader place
+    /// (and half the batch legs) carries a cloid from a small per-trader pool
+    /// (singles 1..=2, batch legs 11..=13, so a single's duplicate is always
+    /// against a single), a fifth of the trader actions are followed by a
+    /// cancel by cloid of a single's cloid, and every maker's first quote
+    /// carries cloid 100 (the maker of even heights cancels all its orders
+    /// every 4th block and one market's in between, the other never
+    /// cancels). So placements hit live cloids (duplicates, across
+    /// blocks and within one), and cloids freed by fills and cancels are
+    /// placed again. The extra draws happen only with `cloid`. Returns the
+    /// single places with a cloid.
+    fn p2_blocks_with(ro: bool, cloid: bool) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
         let mut rng = C5Rng(0x9e21_0008);
         let mut fed = P2Fed::default();
+        let mut cloid_places: Vec<P2CloidPlace> = Vec::new();
         let mut mark = [100i64; 3];
         let mut nonces: std::collections::HashMap<u8, u64> = Default::default();
         let cur_h = std::cell::Cell::new(0u64);
@@ -23409,6 +23434,10 @@ mod crash_recovery_tests {
                 let q = 2 + rng.below(4) as i64;
                 quotes.push(limit(m, true, mark[i] - 1 - rng.below(2) as i64, q));
                 quotes.push(limit(m, false, mark[i] + 1 + rng.below(2) as i64, q));
+            }
+            if cloid {
+                quotes[0].client_order_id = Some(100);
+                fed.cloids += 1;
             }
             actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
             if (2..=40).contains(&h) && h % 4 == 3 {
@@ -23533,12 +23562,42 @@ mod crash_recovery_tests {
                         }
                     }
                 }
+                let mut cancel_by_cloid = None;
+                if cloid {
+                    match &mut action {
+                        NativeAction::PlaceOrder(p) => {
+                            let c = 1 + rng.below(2) as u128;
+                            p.client_order_id = Some(c);
+                            cloid_places.push((h, actions.len(), t, c));
+                            fed.cloids += 1;
+                        }
+                        NativeAction::PlaceOrderBatch(ps) => {
+                            for p in ps {
+                                if rng.below(2) == 0 {
+                                    p.client_order_id = Some(11 + rng.below(3) as u128);
+                                    fed.cloids += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if rng.below(5) == 0 {
+                        fed.cancels_by_cloid += 1;
+                        cancel_by_cloid = Some(NativeAction::CancelByCloid {
+                            market_id: m,
+                            cloid: 1 + rng.below(2) as u128,
+                        });
+                    }
+                }
                 actions.push(sign(t, action));
+                if let Some(cancel) = cancel_by_cloid {
+                    actions.push(sign(t, cancel));
+                }
             }
             blocks.push(make_block(h, actions));
         }
         link_blocks(&mut blocks);
-        (blocks, fed)
+        (blocks, fed, cloid_places)
     }
 
     struct P2Run {
@@ -23569,6 +23628,13 @@ mod crash_recovery_tests {
         /// Item 6 Phase 3: `(S, persisted native root)` each time the
         /// durable marker moved (after a block, crash blocks excepted).
         roots: Vec<(u64, torus_types::B256)>,
+        /// s118 (`P2Fault::CkptCrash`): per crash, `(durable, last)`: the
+        /// heights `durable + 1 ..= last` ran before the crash, were lost
+        /// and replayed from the DB.
+        crash_windows: Vec<(u64, u64)>,
+        /// s118: blocks after which the resident holder carried a built
+        /// cloid index (checked equal to a rebuild from its books).
+        cloid_checked: u64,
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -23754,6 +23820,8 @@ mod crash_recovery_tests {
         };
         let mut max_lag = 0;
         let mut roots: Vec<(u64, torus_types::B256)> = Vec::new();
+        let mut crash_windows: Vec<(u64, u64)> = Vec::new();
+        let mut cloid_checked = 0;
         let mut ctx = new_ctx(true);
         let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
             (0, 0, 0, 0, 0);
@@ -23836,6 +23904,7 @@ mod crash_recovery_tests {
                     durable < last,
                     "{what}: crash at {h}: {durable} < {last} (blocks lost)"
                 );
+                crash_windows.push((durable, last));
                 let mut replay = new_ctx(false);
                 *replay.resident_books.lock().unwrap() = holder;
                 let (_last, parked) = TorusApp::replay_committed(&db, &replay);
@@ -23941,6 +24010,13 @@ mod crash_recovery_tests {
             if p2_index_covers_books(&ctx, &format!("{what}: after {h}")) {
                 index_checked += 1;
             }
+            // s118: a carried cloid index is exactly what a load would build
+            // from the books (no live cloid missing, no dead one left).
+            if let Some((Some(carried), rebuilt)) = ctx.resident_books.lock().unwrap().cloid_index()
+            {
+                assert_eq!(carried, rebuilt, "{what}: after {h}: carried cloid index");
+                cloid_checked += 1;
+            }
             if let P2Fault::StaleHolder(windows) = fault {
                 if windows.iter().any(|w| w.0 == h) {
                     let holder = std::mem::take(&mut *ctx.resident_books.lock().unwrap());
@@ -23982,6 +24058,8 @@ mod crash_recovery_tests {
             ro_moved,
             max_lag,
             roots,
+            crash_windows,
+            cloid_checked,
         }
     }
 
@@ -24538,33 +24616,170 @@ mod crash_recovery_tests {
     /// blocks, and the guard rebuilt the books once per crash.
     fn ckpt_crash_replay(mode: torus_bridge::native_executor::BookMode) {
         let (blocks, _) = p2_blocks(false);
-        let what = format!("{mode:?} checkpoint crashes");
-        let reference = p2_run(&blocks, true, Some(mode), false, &P2Fault::None);
+        ckpt_crash_replay_on(mode, &blocks, &format!("{mode:?} checkpoint crashes"));
+    }
+
+    /// [`ckpt_crash_replay`] on `blocks`; returns `(uncrashed per-block
+    /// run, crashed run)`.
+    fn ckpt_crash_replay_on(
+        mode: torus_bridge::native_executor::BookMode,
+        blocks: &[TorusBlock],
+        what: &str,
+    ) -> (P2Run, P2Run) {
+        let reference = p2_run(blocks, true, Some(mode), false, &P2Fault::None);
         let fault = P2Fault::CkptCrash(CKPT_CRASHES.to_vec());
-        let run = p2_run_with(
-            &blocks,
-            true,
-            Some(mode),
-            false,
-            &fault,
-            Some(ckpt_every(5)),
-        );
+        let run = p2_run_with(blocks, true, Some(mode), false, &fault, Some(ckpt_every(5)));
         assert_eq!(run.faults, CKPT_CRASHES.len() as u64, "{what}");
-        let captured = dedup_captured(&run.captured, &what);
+        let captured = dedup_captured(&run.captured, what);
         assert_eq!(
             captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
             (1..=P2_BLOCKS).collect::<Vec<_>>(),
             "{what}: every height hashed"
         );
-        assert_write_sets_equal(&reference.captured, &captured, &what);
+        assert_write_sets_equal(&reference.captured, &captured, what);
         assert!(run.hash.is_some());
         assert_eq!(reference.hash, run.hash, "{what}: running hash");
-        assert_dumps_equal(&reference.dump, &run.dump, &what);
+        assert_dumps_equal(&reference.dump, &run.dump, what);
         assert_eq!(
             run.metrics.exec_resident_rebuilds.get(),
             1 + CKPT_CRASHES.len() as u64,
             "{what}: one guard rebuild per crash"
         );
+        (reference, run)
+    }
+
+    /// s118 (Phase 3 step 2 follow-up, review of c88d3073): [`ckpt_crash_replay`]
+    /// with cloid traffic (`p2_blocks_with(false, true)`). Six crashes at a
+    /// checkpoint every 5 blocks; the uncrashed per-block run is the
+    /// reference. Equal per-block `h_n`, running hash, full CF dump (books
+    /// with their orders' cloids, the action status records with every
+    /// `DuplicateCloid`), the persisted native root at every checkpoint and
+    /// at the end. The resident holder's carried cloid index equals a
+    /// rebuild after every block, before and after each replay (the stale
+    /// holder's is dropped by the guard and rebuilt). Non-vacuous, from the
+    /// stored outcomes of the single places with a cloid: in the replayed
+    /// spans `(durable, last]` a cloid placed at or before the durable
+    /// checkpoint is rejected as a duplicate, and a cloid freed by a fill or
+    /// cancel is placed again; in the 10 blocks after a replay a cloid placed
+    /// before the crash is rejected, and one freed is placed again. A cloid
+    /// lost by the checkpoint or the replay (missing from the books or the
+    /// index) accepts a duplicate there, one resurrected rejects a reuse:
+    /// either changes the action status and books, so the dumps differ.
+    /// (s118 mutant: a book load that forgets its pending stops' cloids
+    /// fails this test; the cloid-free [`ckpt_crash_replay`] passes on it.)
+    fn ckpt_crash_replay_cloids(mode: torus_bridge::native_executor::BookMode) {
+        use torus_state::action_status::FailureReason;
+        let (blocks, fed, singles) = p2_blocks_with(false, true);
+        assert!(fed.cloids >= 300 && fed.cancels_by_cloid >= 30, "{fed:?}");
+        let what = format!("{mode:?} checkpoint crashes, cloids");
+        let (reference, run) = ckpt_crash_replay_on(mode, &blocks, &what);
+        assert_eq!(run.crash_windows.len(), CKPT_CRASHES.len(), "{what}");
+        // State roots: at each checkpoint S and at the end.
+        assert!(
+            run.roots.len() >= 10,
+            "{what}: checkpoints {}",
+            run.roots.len()
+        );
+        for (s, root) in &run.roots {
+            let want = reference
+                .roots
+                .iter()
+                .find(|(h, _)| h == s)
+                .map(|(_, r)| *r);
+            assert_eq!(Some(*root), want, "{what}: native root at checkpoint {s}");
+        }
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        assert_eq!(
+            persisted(&run.db),
+            persisted(&reference.db),
+            "{what}: final root"
+        );
+        // The carried cloid index was built and checked after most blocks
+        // (in the crashed run too: the crash blocks run off the loop).
+        assert!(
+            reference.cloid_checked >= P2_BLOCKS - 10,
+            "{what}: reference {}",
+            reference.cloid_checked
+        );
+        assert!(
+            run.cloid_checked >= P2_BLOCKS - 40,
+            "{what}: crashed {}",
+            run.cloid_checked
+        );
+
+        // Outcomes of the single places with a cloid (the crashed run's
+        // records; equal to the reference's by the dump).
+        let mut last_ok: std::collections::HashMap<(u8, u128), u64> = Default::default();
+        let mut tried: std::collections::HashSet<(u8, u128, u64)> = Default::default();
+        // (placed ok at, duplicate at) and (placed ok at, placed again at).
+        let (mut dups, mut reuses) = (Vec::new(), Vec::new());
+        for &(h, idx, t, c) in &singles {
+            let status = action_status(&run.db, h).expect("a block with actions has a record");
+            assert!(!status.native_skipped[idx], "{what}: {h}/{idx} executed");
+            let failed = status
+                .native_failed
+                .iter()
+                .find(|f| f.index as usize == idx)
+                .map(|f| f.reason);
+            let first_in_block = tried.insert((t, c, h));
+            match (failed, last_ok.get(&(t, c))) {
+                (Some(FailureReason::DuplicateCloid), Some(&h0)) if first_in_block && h0 < h => {
+                    dups.push((h0, h));
+                }
+                (None, prev) => {
+                    if let Some(&h0) = prev {
+                        reuses.push((h0, h));
+                    }
+                    last_ok.insert((t, c), h);
+                }
+                _ => {}
+            }
+        }
+        let count = |pairs: &[(u64, u64)], hit: &dyn Fn(u64, u64, u64, u64) -> bool| {
+            pairs
+                .iter()
+                .filter(|&&(h0, h)| run.crash_windows.iter().any(|&(d, l)| hit(h0, h, d, l)))
+                .count()
+        };
+        let replayed_dup = count(&dups, &|h0, h, d, l| h0 <= d && d < h && h <= l);
+        let replayed_reuse = count(&reuses, &|_, h, d, l| d < h && h <= l);
+        let after_dup = count(&dups, &|h0, h, _, l| h0 <= l && l < h && h <= l + 10);
+        let after_reuse = count(&reuses, &|h0, h, _, l| h0 <= l && l < h && h <= l + 10);
+        println!(
+            "{what}: fed {fed:?}; single cloid places {}, duplicates {}, reuses {}; windows {:?}; \
+             replayed: duplicate of a checkpointed cloid {replayed_dup}, reuse {replayed_reuse}; \
+             after replay: duplicate {after_dup}, reuse {after_reuse}",
+            singles.len(),
+            dups.len(),
+            reuses.len(),
+            run.crash_windows,
+        );
+        // Measured (s118): 11 / 27 replayed, 15 / 35 after; 53 / 109 total.
+        assert!(
+            replayed_dup >= 5 && replayed_reuse >= 10 && after_dup >= 5 && after_reuse >= 10,
+            "{what}: cloid traffic across the crashes"
+        );
+        assert!(
+            dups.len() >= 30 && reuses.len() >= 60,
+            "{what}: {} duplicates, {} reuses",
+            dups.len(),
+            reuses.len()
+        );
+        let labelled = |m: &torus_telemetry::Metrics| {
+            m.orders_rejected_reason[torus_telemetry::OrderRejectReason::DuplicateCloid as usize]
+                .get()
+        };
+        assert!(labelled(&reference.metrics) >= dups.len() as u64, "{what}");
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_with_cloids_matches_uncrashed_classic() {
+        ckpt_crash_replay_cloids(torus_bridge::native_executor::BookMode::Classic);
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_with_cloids_matches_uncrashed_order_rows() {
+        ckpt_crash_replay_cloids(torus_bridge::native_executor::BookMode::OrderRows);
     }
 
     #[test]
