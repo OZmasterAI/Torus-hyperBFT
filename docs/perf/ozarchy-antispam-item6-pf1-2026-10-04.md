@@ -6069,6 +6069,181 @@ Analysis (`tools/ozarchy-p3soak-tools/analyst/`): `a-soak.py` (RSS at 5 / 10 min
 per-minute matched/s and drift, last-5-min CPU-s/1M, ingest health), `a-cells.py` (section 48); outputs `soak.txt`,
 `cells.json` in `ozarchy-p3soak-run/analyst/` on ozarchy.
 
+## 53b. Phase 3 soak under jemalloc: step 2 `7b006739` vs main `219f0c20`, 600 s per arm (campaign ozarchy-p3soakje, 2026-10-13)
+
+**Under jemalloc, step 2's RSS levels off by ~minute 2 and then stays flat for the rest of the 10 min. So the continued
+growth of the glibc soak (section 53) is consistent with glibc allocator retention rather than live data growth.** The step 2 mean RSS over
+minutes 5-10 vs minutes 2-5 is -133 / -139 / -27 MB per node (glibc: +349 / +329 / +364). The last-5-min slopes are +15 /
++33 / +28 MB/min, and only one CI excludes 0 (glibc: +63 / +67 / +40, all three exclude 0). The slopes are most likely
+jemalloc's decay (RSS swings by +-300 MB around a flat level, see figure 53b-1), but slow growth inside those swings is not
+ruled out by one 10 min pair. The **Phase 3 delta under jemalloc is +0.68 GB per
+node** (mean over minutes 5-10; +0.52 to +0.79). It is +0.69 GB at 10 min and +1.01 GB at the peak (val2 +1.29). Under
+glibc it is +1.86 GB (minutes 5-10), +1.98 GB at 10 min and +2.00 GB at the peak. **Owner RAM gate (levels off, delta <=
+~1 GB/node): met under jemalloc on the level and on the 5-10 min mean, borderline at the peak. Not met under glibc.**
+RSS follows neither the Phase 3 layer metrics nor the resting-order (book) gauge: neither of them grows during the soak
+(53b.2). **The matched/s drop from ~minute 6 comes from the workload, not from the generator's send rate and not from a
+node slowdown.** From minute 6 the chain rejects 105-155k orders/s for margin in all four cells, while bench submits,
+processed actions/s, node CPU and (under jemalloc) exec busy hold or rise. Section 53's link to the cancel-all expiry is
+not supported: expiry starts 3 min earlier (53b.3).
+
+Owner request (18c, queue item 1 after section 53): the section 53 soak pair repeated on jemalloc. Flat RSS under
+jemalloc means allocator retention; RSS that still grows means data growth. The binaries, bench, harness and shape are
+those of section 53: control `219f0c20` (`987f4eb6`), step 2 `7b006739` (`ca388315`, interval 15 s), bench `05d44313`,
+harness `218ad251`, tw, Classic, 300 markets, MAX_IN_FLIGHT 4, budget 900, commit tail, shared NVMe. Arms jgm / jg2 are
+section 51's: a wrapper that only sets `LD_PRELOAD=/usr/lib/libjemalloc.so.2` (system jemalloc 5.3.1, `MALLOC_CONF`
+unset, no `/etc/malloc.conf`, so library defaults, profiling off) and then execs the real node (`ozarchy-p3q-stage/{m,g2}-je`,
+same as `ozarchy-p3next-stage`'s). Driver `ozarchy-p3soakje-campaign.sh`: a copy of `ozarchy-p3q-campaign.sh` whose only
+change is that CAMP=S SOAK_ALLOC=je writes `ozarchy-p3soakje-*` (so the glibc soak's dirs stay untouched). Cells 00:48-01:20:
+w0 (jgm, 60 s, excluded), k1-ctl (jgm, 600 s), k1-s2 (jg2, 600 s). 42 CHECK OK (incl. jemalloc preloaded and mapped on 3
+nodes, `MALLOC_CONF` unset), no CHECK FAIL, no memguard stop, no deaths, the host quiet before every cell. k1-s2 is ACCEPT,
+AGREE. k1-ctl is rc 2 REJECT on agreement only, from the known mark-only digest artifact: val0's digest took 38 s vs 54 / 53 s,
+the 5 mark fields differ on 50 accounts, and books, OI and cash are identical. Liveness PASS. The heap profile at minute 5 vs 10
+(18c, mid-run) was skipped because the campaign was already running.
+
+### 53b.1 RSS per node, both allocators (VmRSS, mem-samples.txt, 5 s; bench window 602-603 s)
+
+![RSS per node over time](ozarchy-p3soakje-figs/fig-rss.png)
+
+*Figure 53b-1: VmRSS per node, main dashed, step 2 solid; left glibc (section 53), right jemalloc.*
+
+| alloc | arm | node | mean min 2-5 MB | mean min 5-10 MB | change | @10 min MB | peak MB | slope min 2-5 MB/min | slope last 5 min MB/min (95% CI) |
+|---|---|---|---|---|---|---|---|---|---|
+| glibc | main | val0 | 3,706 | 3,761 | +55 | 3,796 | 3,835 | +19 | +3.3 [-4.2, +10.8] |
+| glibc | main | val1 | 3,879 | 3,943 | +64 | 3,950 | 4,032 | +34 | **+11.1 [+5.5, +16.7]** |
+| glibc | main | val2 | 4,664 | 4,735 | +71 | 4,769 | 4,788 | +54 | **+6.4 [+2.3, +10.5]** |
+| glibc | step 2 | val0 | 5,536 | 5,885 | **+349** | 6,070 | 6,070 | +132 | **+63.1 [+14.6, +111.6]** |
+| glibc | step 2 | val1 | 5,371 | 5,700 | **+329** | 5,934 | 5,934 | +120 | **+67.3 [+47.1, +87.4]** |
+| glibc | step 2 | val2 | 6,064 | 6,428 | **+364** | 6,442 | 6,660 | +185 | **+39.8 [+19.1, +60.5]** |
+| je | main | val0 | 4,032 | 3,953 | -79 | 3,830 | 4,258 | -22 | -16.5 [-41.4, +8.3] |
+| je | main | val1 | 4,015 | 4,060 | +45 | 4,154 | 4,287 | -9 | +8.0 [-11.3, +27.3] |
+| je | main | val2 | 4,765 | 4,798 | +33 | 4,958 | 5,245 | -39 | +26.2 [-10.1, +62.6] |
+| je | step 2 | val0 | 4,834 | 4,701 | -133 | 4,665 | 5,158 | -87 | +15.3 [-20.6, +51.2] |
+| je | step 2 | val1 | 4,717 | 4,578 | -139 | 4,470 | 5,115 | -54 | **+32.7 [+2.7, +62.7]** |
+| je | step 2 | val2 | 5,610 | 5,583 | -27 | 5,888 | 6,539 | +4 | +27.9 [-5.6, +61.5] |
+| **Phase 3 delta** | glibc | mean | +1.57 GB | **+1.86 GB** | | +1.98 GB | +2.00 GB | | step 2 +57 vs main +7 |
+| **Phase 3 delta** | je | mean | +0.78 GB | **+0.68 GB** | | +0.69 GB | +1.01 GB | | step 2 +25 vs main +6 |
+
+Slopes are OLS over the 5 s samples. The CI uses an AR(1) effective n, as in section 53 (`a-soak.py`). Under jemalloc the
+last-5-min slope is dominated by the swings (step 2 val0 / val1 dip at minute 6 and partly recover), so the window
+means are the better level measure: 5 of 6 jemalloc nodes are flat or lower in minutes 5-10 than in minutes 2-5. Main
+under jemalloc sits +63 to +192 MB above main under glibc (minutes 5-10). Step 2 under jemalloc sits 0.85-1.18 GB below
+step 2 under glibc. Throughput under jemalloc (single cells): matched/s step 2 199,134 vs main 191,756 (+3.8%),
+CPU-s/1M 27.78 vs 29.93 (-7.2%). Under glibc: 172,911 vs 168,384, 28.47 vs 30.35. Both jemalloc arms run ~14-15% more
+matched/s than their glibc arms, as in section 51.2 (blocks commit faster, the closed-loop bench offers more).
+
+### 53b.2 RSS next to the Phase 3 layer / checkpoint metrics and the data gauges (both soaks)
+
+![glibc soak: RSS and layer metrics per node](ozarchy-p3soakje-figs/fig-layer-glibc.png)
+
+*Figure 53b-2: glibc soak (section 53 cells), per node (columns), step 2 solid, main grey dashed: VmRSS, flush-worker
+queue depth, exec handoff wait, checkpoint drop_inline rate, resting orders, cancel-all index entries, checkpoints,
+layer MB per checkpoint, settle wait per block, flush-worker checkpoint time, mempool / exec queue.*
+
+![jemalloc soak: RSS and layer metrics per node](ozarchy-p3soakje-figs/fig-layer-je.png)
+
+*Figure 53b-3: the same for the jemalloc soak.*
+
+Per minute, val0 (val1 / val2 behave the same; all three nodes are in `series.txt` in the tools dir). Cells: RSS MB at
+minute end / resting orders M (gauge, minute end) / [step 2: layer MB per checkpoint in the minute / drop_inline in the
+minute] / flush-worker depth (mean) / exec handoff wait ms per block. Last column: matched/s glibc main / glibc step 2 /
+je main / je step 2.
+
+| min | glibc main | glibc step 2 | je main | je step 2 | matched/s |
+|---|---|---|---|---|---|
+| 1 | 3,343 / 0.19 / 0.2 / 0.15 | 4,556 / 0.07 / 134 / 235 / 0.1 / 0.01 | 3,805 / 0.38 / 0.2 / 0.49 | 4,535 / 0.13 / 131 / 285 / 0.1 / 0.01 | 191k / 196k / 203k / 216k |
+| 2 | 3,657 / 0.33 / 0.3 / 0.19 | 5,267 / 0.60 / 146 / 173 / 0.1 / 0.01 | 4,006 / 0.10 / 0.3 / 0.37 | 4,925 / 0.47 / 165 / 155 / 0.1 / 0.01 | 211k / 218k / 214k / 232k |
+| 3 | 3,686 / 0.50 / 0.4 / 0.01 | 5,499 / 0.44 / 109 / 143 / 0.1 / 0.01 | 4,067 / 0.49 / 0.5 / 0.68 | 4,729 / 0.52 / 133 / 168 / 0.1 / 0.01 | 202k / 212k / 216k / 229k |
+| 4 | 3,729 / 0.45 / 0.4 / 0.01 | 5,604 / 0.44 / 96 / 166 / 0.0 / 0.01 | 4,100 / 0.33 / 0.5 / 0.01 | 4,858 / 0.42 / 94 / 184 / 0.1 / 0.01 | 191k / 199k / 210k / 233k |
+| 5 | 3,743 / 0.41 / 0.4 / 0.03 | 5,673 / 0.29 / 96 / 147 / 0.1 / 0.02 | 4,021 / 0.32 / 0.5 / 0.01 | 4,958 / 0.43 / 82 / 110 / 0.1 / 0.03 | 188k / 193k / 217k / 235k |
+| 6 | 3,751 / 0.27 / 0.3 / 0.01 | 5,835 / 0.24 / 92 / 142 / 0.1 / 0.01 | 3,916 / 0.45 / 0.3 / 0.01 | 4,423 / 0.26 / 100 / 170 / 0.1 / 0.01 | 165k / 162k / 208k / 189k |
+| 7 | 3,717 / 0.27 / 0.2 / 0.01 | 5,843 / 0.16 / 68 / 137 / 0.0 / 0.01 | 3,879 / 0.31 / 0.3 / 0.16 | 4,713 / 0.25 / 102 / 218 / 0.1 / 0.01 | 132k / 139k / 156k / 177k |
+| 8 | 3,753 / 0.31 / 0.2 / 0.13 | 5,872 / 0.20 / 84 / 183 / 0.1 / 0.01 | 4,083 / 0.53 / 0.4 / 0.56 | 4,732 / 0.41 / 112 / 86 / 0.1 / 0.02 | 139k / 138k / 183k / 170k |
+| 9 | 3,749 / 0.30 / 0.1 / 0.01 | 5,976 / 0.37 / 105 / 160 / 0.1 / 0.01 | 3,961 / 0.38 / 0.4 / 0.41 | 4,655 / 0.30 / 121 / 199 / 0.0 / 0.04 | 135k / 138k / 160k / 154k |
+| 10 | 3,794 / 0.28 / 0.2 / 0.01 | 6,071 / 0.24 / 108 / 159 / 0.0 / 0.01 | 3,899 / 0.37 / 0.3 / 0.24 | 4,664 / 0.27 / 128 / 216 / 0.1 / 0.01 | 134k / 133k / 154k / 160k |
+
+What the metrics show (both soaks, all nodes):
+
+* **Layer bytes do not grow.** Step 2 checkpoints ~5 times per minute (one per ~12 s; 47-49 per node per cell). The
+  layer per checkpoint is 130-170 MB in minutes 1-2 (start-up books) and 70-140 MB afterwards, with no upward trend
+  (glibc 116 -> 93 MB mean, first vs last 5 min; jemalloc 117 -> 112 MB). `layer_shared` is 0. drop_inline is 1.5-4 per s
+  after the first minute (more in minute 1). Settle wait is 18-29 ms per native block (glibc 26.9 -> 18.0 ms on
+  val0, first vs last 5 min; jemalloc 21.2 -> 18.8). The flush-worker checkpoint time is 0.4-0.7 s.
+* **The book does not grow either.** The resting-orders gauge is 0.2-0.6 M per node in both arms. It peaks at minute 2-3
+  and falls after minute 5, when the margin rejections start (53b.3); minute 3 -> 10 it goes 0.44 -> 0.24 M (glibc step
+  2 val0) and 0.52 -> 0.27 M (jemalloc). The cancel-all index entries (0.5-1.1 M) and the resident rows (214 MB, flat from
+  minute 1) behave the same way.
+* **Flush-worker queue and handoff:** on step 2 the flush-worker depth averages 0.0-0.1 blocks (main 0.1-0.5). The exec
+  handoff wait is 0.01-0.04 ms per block (main 0.01-0.7, with two ~5 ms minutes on jemalloc main). So the flush-worker
+  queue holds no backlog of blocks (and none of their books) in these runs.
+* **RSS tracks neither.** Over minutes 3-10, glibc step 2's RSS rises +572 / +680 / +491 MB while its resting orders fall
+  (Pearson r of RSS level vs resting-orders level -0.44 to -0.60) and its layer size is flat or falling. Under jemalloc,
+  with the same layer and book profiles, RSS is flat. The only correlation is under glibc: the per-minute RSS increase
+  correlates with that minute's layer size (r +0.62 to +0.73; jemalloc -0.12 to +0.15). Minutes with larger layers push
+  the glibc high-water mark further, which is the pattern of allocator retention around the per-checkpoint rebuild
+  (section 48: ~half of each Phase 3 delta is glibc-only). It is not data that accumulates.
+* **Not scraped / not exported:** there is no gauge of live layer bytes or layer entries (`exec_checkpoint_layer_bytes`
+  is a histogram of each new layer's size, not of the layers held), no read-view count, pin or age metric, and no per-book
+  copy count. So the "layers / views stay capped at 1-2 windows" result of 18c's retention test cannot be checked from
+  these cells directly. It is consistent with everything above.
+
+### 53b.3 The matched/s drop after minute 6: generator or node?
+
+![generator vs node per minute](ozarchy-p3soakje-figs/fig-load.png)
+
+*Figure 53b-4: per minute, val0 counters, both soaks, both arms: bench submit vs processed actions, placed vs
+margin-rejected orders, matched/s, nonce-expired actions, exec queue and busy, mempool, CPU (node mean, bench).*
+
+| min | margin-rejected orders/s (val0): glibc main / step 2, je main / step 2 | placed accepted k/s (same order) | processed actions/s (same order) | expired per min (same order) | exec busy (same order) |
+|---|---|---|---|---|---|
+| 1-5 | 0 / 0 / 0 / 0 | 248-276 / 254-286 / 267-285 / 284-308 | 978-1,081 / 1,005-1,127 / 1,018-1,146 / 1,112-1,253 | 0-3.3k / 0-3.6k / 0-3.2k / 0-3.1k | 0.85-0.98 / 0.89-1.00 / 0.96-0.99 / 0.98-1.00 |
+| 6 | 18.7k / 40.2k / 4.7k / 67.5k | 226 / 226 / 276 / 267 | 1,007 / 1,067 / 1,127 / 1,367 | 3.3k / 3.4k / 1.8k / 3.1k | 0.82 / 0.86 / 0.99 / 1.00 |
+| 7-10 | 106-135k / 106-139k / 89-139k / 124-154k | 175-184 / 178-188 / 202-240 / 204-233 | 1,153-1,247 / 1,187-1,273 / 1,287-1,362 / 1,433-1,465 | 0.3-2.6k / 0.8-2.0k / 0.1-2.5k / 0.3-1.1k | 0.78-0.82 / 0.81-0.93 / 0.97-0.99 / 0.97-1.01 |
+
+* **What changes at minute 6 is the chain's margin rejections.** `torus_orders_rejected_margin_total` is 0 for 5 min in
+  all four cells. It starts in minute 6 and reaches 105-155k orders/s in minutes 7-10, i.e. ~40% of the orders sent.
+  Placed-accepted orders fall by the same amount, and fills per processed action fall from ~190 to ~105-140. No other
+  reject counter moves: open-limit, book and other are 0, and cancelled is < 0.1k/s after minute 1.
+* **The generator is not the limit.** Bench submits rise after minute 6 (glibc ~1,000 -> ~1,250/s, jemalloc ~1,100-1,300 ->
+  ~1,250-1,500/s), and so do the processed actions. Bench CPU is 0.9-1.4 cores, flat. The bench is not saturated: it is
+  closed-loop and sends faster once blocks carry fewer fills.
+* **The node is not slower.** Node CPU is flat at 4.3-6.5 cores per node. Under jemalloc the exec thread stays saturated
+  (busy 0.97-1.00, exec queue at its ~60 cap) before and after the drop, so per-block capacity is unchanged. Each block
+  just yields fewer fills. The mempool stays at ~5-6k.
+* **The cancel-all expiry is not the direct cause.** Nonce-window expiry starts in minute 3 (2-3.6k actions per minute in
+  all cells; per cell ~18k per node under glibc, ~13.4-13.7k under jemalloc), 3 min before the drop, and it declines
+  while the drop persists. Expired cancel-alls also do not show up as a growing book: the resting-orders gauge falls after
+  minute 5.
+* **Answer (calibrated):** high confidence that the drop is workload-side. The econ workload grows each sender's positions
+  one way (`econ_side_is_buy`, no closing fills), so after ~5 min of trading (minute 6 in both
+  allocators and both arms) a growing share of senders run out of free margin, and the chain rejects their orders. It is
+  neither the generator's send rate nor a node slowdown. What this data cannot settle is whether the margin is used up by
+  positions or by open-order reservations that an expired cancel-all failed to release. The end-of-run digest covers only 50
+  sampled accounts (6 of 50 with < 5% free margin, p10 1.4%, median 75%). **Metric that would settle it:** per sender,
+  the position margin vs the open-order reservation (`totalMarginUsed` split) for all senders at minutes 5 and 7, or margin
+  rejects counted per sender by the bench. The cancel-share soak pair (next in the queue) gives a partial test: if fewer
+  cancel-alls expire and the minute-6 drop stays, it is positions.
+
+Other observations: (a) under glibc, val0 / val1's exec queue drains to ~2 blocks by minute 4. Exec busy falls to
+0.78-0.90 and native blocks/s to ~2.5 in minutes 4-6, so the glibc chain was input-bound well before the margin drop. Under jemalloc the
+queue stays at the ~60 cap and blocks/s are 2.7-3.7 (single cells; consistent with section 51.2's faster commits under
+jemalloc). (b) val2's exec queue gauge sits at ~65 in all four cells (glibc too), so val2 stays at the queue cap
+throughout. That backlog is the commit-mode part of its higher RSS (+0.5-1.0 GB over val0 / val1, all four cells; section 48).
+
+**Verdict:** the jemalloc soak points to **allocator retention under glibc** as the main cause of section 53's growth
+(consistent with it, not proof: one 10 min pair, and no live-layer or read-view gauge). Under jemalloc step 2's RSS level
+is flat after ~2 min (minutes 5-10 mean below minutes 2-5 on all three nodes), but the last-5-min slopes are still positive
+(+15 / +33 / +28 MB/min; val1's CI [+3, +63] excludes 0), so slow data growth within jemalloc's +-300 MB swings is not
+ruled out; a longer soak would settle it. Phase 3 delta **+0.68 GB per node (minutes 5-10
+mean; +1.01 GB at the peak)**. That meets the owner's "levels off, delta <= ~1 GB/node" rule on the level and on the mean,
+and is borderline at the peak (val2 +1.29 GB). It is still ~2.5x the old ~270 MB gate. Neither the layer size nor the book
+(resting orders) grows over the soak. The minute-6 matched/s drop is margin exhaustion in the econ workload, not
+the generator's rate and not the node.
+
+Analysis (`tools/ozarchy-p3soakje-tools/analyst/`): `a-series.py` (per-minute generator vs node table, per node per
+minute RSS / resting / flush-worker depth / handoff / layer / drop_inline, figures as SVG -> PNG via `rsvg-convert`),
+`a-soak.py` (section 53, unchanged), `a-cells.py` (digest classes), `a-archive.py`; outputs `series.txt`, `soak.txt`.
+Full outputs (incl. `series.json`, `cells.json`, figure SVGs) in `ozarchy-p3soakje-run/analyst/` on ozarchy.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
@@ -6147,6 +6322,12 @@ per-minute matched/s and drift, last-5-min CPU-s/1M, ingest health), `a-cells.py
   600 s each, commit tail: step 2 RSS still +40 to +67 MB/min per node over the last 5 min (CIs exclude 0), main +3 to +11
   (2 of 3 CIs exclude 0); Phase 3 delta +1.98 GB per node at 10 min (gate ~270 MB). Both arms lose ~30% matched/s from
   minute 6: cancel-all nonce-window expiry (~18k per node per cell) starts at minute 2 **on main too**.
+- **Phase 3 soak under jemalloc: growth = glibc retention** (section 53b, plan review log row 59). Same pair on jemalloc
+  5.3.1 (defaults, LD_PRELOAD): step 2 RSS flat after ~2 min (minutes 5-10 mean vs 2-5: -133 / -139 / -27 MB per node; glibc
+  +349 / +329 / +364), Phase 3 delta +0.68 GB per node (minutes 5-10 mean; +1.01 GB peak; glibc +1.86 / +2.00). Layer
+  size and resting orders do not grow; RSS tracks neither. The minute-6 matched/s drop is margin rejections in the econ
+  workload (105-155k orders/s from minute 6, all four cells), not the generator's rate, the node or the cancel-all expiry
+  (which starts at minute 3). Open: positions vs open-order reservations as the margin user (per-sender split).
 - **Phase 3 baseline: tw** (sections 37-40, plan review log rows 42-45; owner s109): validators run
   trade history off + WAL budget 2048 MiB. The WAL compression knob is merged (`4a3f6546`) but off;
   it is decided again by a tw vs tw + WAL compression A/B after Phase 3. Section 40 (n = 4, vs b
