@@ -3271,6 +3271,42 @@ mod tests {
         );
     }
 
+    /// Codex r2 finding 2: boot Ready parks register BEFORE node startup
+    /// attaches the metrics. Attaching must publish the counter's current
+    /// total, so the gauge equals the counter and the later release can never
+    /// drive it negative.
+    #[test]
+    fn exec_aware_gauge_attached_after_registration_equals_the_counter() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, exec_aware_cfg(true, 10_000, 4));
+        let n1 = pool.note_exec_committed(1, &committed_body(1, 1, 0));
+        let n2 = pool.note_exec_committed(2, &committed_body(10, 2, 1));
+        assert_eq!(pool.committed_unexecuted_normal(), 3);
+        let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
+        pool.set_metrics(metrics.clone());
+        let gauge = || metrics.mempool_native_committed_unexecuted.get();
+        assert_eq!(gauge(), 3, "after_attach: counted=3");
+        pool.note_exec_sent(1);
+        pool.note_exec_released(n1);
+        assert_eq!((pool.committed_unexecuted_normal(), gauge()), (2, 2));
+        pool.note_exec_sent(2);
+        pool.note_exec_released(n2);
+        assert_eq!(
+            (pool.committed_unexecuted_normal(), gauge()),
+            (0, 0),
+            "after_release: never negative"
+        );
+    }
+
+    /// Knob off: attaching the metrics leaves the counter untouched.
+    #[test]
+    fn exec_aware_off_attach_touches_nothing() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state, exec_aware_cfg(false, 10_000, 4));
+        pool.set_metrics(std::sync::Arc::new(torus_telemetry::Metrics::new()));
+        assert_eq!(pool.exec_backlog_touches(), 0);
+    }
+
     #[test]
     fn parse_admission_exec_aware_defaults_off() {
         use crate::rate_limit::parse_admission_exec_aware as p;
