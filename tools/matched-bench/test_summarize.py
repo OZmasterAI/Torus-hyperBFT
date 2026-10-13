@@ -144,7 +144,8 @@ CKPT_BUCKETS = {
     "torus_exec_checkpoint_settle_wait_seconds_bucket": [("0.004", 5), ("0.008", 10), ("0.016", 10), ("+Inf", 10)],
     "torus_exec_checkpoint_upkeep_seconds_bucket": [("0.004", 0), ("0.008", 0), ("0.016", 10), ("+Inf", 10)],
     # p3 merge wait: the deferred join, 8 at or below 0.5 ms, 2 in (20, 25] ms
-    # => p50 = 0.5 * 5 / 8 = 0.3125, p99 = 20 + 5 * (9.9 - 8) / 2 = 24.75.
+    # => p50 = 0.5 * 5 / 8 = 0.3125, p99 = 20 + 5 * (9.9 - 8) / 2 = 24.75
+    # (summarize rounds to 0.1 ms: 0.3, 24.8).
     "torus_exec_checkpoint_deferred_join_seconds_bucket": [("0.0005", 8), ("0.02", 8), ("0.025", 10), ("+Inf", 10)],
 }
 
@@ -733,8 +734,8 @@ def main_checkpoint_timers():
         close(p0["checkpoint_settle_wait_ms_p99"], 7.92, "settle wait p99")
         close(p0["checkpoint_upkeep_ms_p50"], 12.0, "upkeep p50")
         close(p0["checkpoint_upkeep_ms_p99"], 15.92, "upkeep p99")
-        close(p0["checkpoint_deferred_join_ms_p50"], 0.3125, "deferred join p50")
-        close(p0["checkpoint_deferred_join_ms_p99"], 24.75, "deferred join p99")
+        close(p0["checkpoint_deferred_join_ms_p50"], 0.3, "deferred join p50")
+        close(p0["checkpoint_deferred_join_ms_p99"], 24.8, "deferred join p99")
         assert "checkpoint_deferred_join" not in p0["phases"], "the join is inside upkeep, not a phase"
     with tempfile.TemporaryDirectory() as out:
         write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True, end_resident_worker=True)

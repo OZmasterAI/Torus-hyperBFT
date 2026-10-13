@@ -2244,7 +2244,7 @@ impl Metrics {
             exec_checkpoint_settle_wait_seconds.clone(),
         );
         let exec_checkpoint_deferred_join_seconds =
-            Histogram::new(exponential_buckets(0.000_05, 2.0, 16));
+            Histogram::new(DEFERRED_JOIN_BUCKETS_SECONDS.iter().copied());
         registry.register(
             "torus_exec_checkpoint_deferred_join_seconds",
             "Item 6 Phase 3: exec thread blocked at the end of a pipelined block joining the deferred (positions, balances) part of the layer merge (inside upkeep; once per pipelined block)",
@@ -2993,6 +2993,16 @@ pub const EXEC_SPAWN_SITES: [&str; 9] = [
 ];
 
 /// s92: the tick buckets of [`Metrics::sell_margin_cuts`] (name suffixes).
+/// p3 merge wait: `torus_exec_checkpoint_deferred_join_seconds` bounds.
+/// Bound ratio at most 1.5 over 1-50 ms (factor-2 buckets put a 13 ms and a
+/// 24 ms join in one bucket), 50 us to 1 s overall.
+pub const DEFERRED_JOIN_BUCKETS_SECONDS: [f64; 25] = [
+    0.000_05, 0.000_1, 0.000_25, 0.000_5, // sub-ms
+    0.001, 0.001_5, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008, 0.010, 0.012, 0.015, 0.020, 0.025,
+    0.030, 0.040, 0.050, // 1-50 ms
+    0.075, 0.1, 0.25, 0.5, 1.0,
+];
+
 pub const MARGIN_CUT_TICK_BUCKETS: [&str; 6] = ["t0", "t1_2", "t3_5", "t6_10", "t11_30", "t31p"];
 
 /// s92: the [`MARGIN_CUT_TICK_BUCKETS`] index of a cut `ticks` above the
