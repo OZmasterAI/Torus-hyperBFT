@@ -1,0 +1,111 @@
+{
+ "status": "OK",
+ "label": "ozarchy-p3gate-300m-r1-m",
+ "binaries": {
+  "torus_node_md5": "f10815747be79f22f502b51a8cd466eb",
+  "bench_throughput_md5": "42365459adc29fa0ae314f50dafe0bed"
+ },
+ "agreement": {
+  "nodes": [
+   {
+    "node": "val0",
+    "height": 1235,
+    "cmp_height": 1229,
+    "block_hash": "0x032869c3cfeb345de70ace437a19182a32e1bdd4713c44f9a3bc75c8e71ec7c4",
+    "header_state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "state_digest": "57463c480b4344fac96366d936c2d3138db976a3ac2a8694dfad48a540b325a0",
+    "digest_height": 1262,
+    "digest_seconds": 20.3,
+    "matched": 28182412,
+    "placed": 36904475,
+    "resting": 22407309,
+    "actions": 151098,
+    "resident_rebuilds": 1,
+    "panic_or_failstop_lines": 0,
+    "error_lines": 0
+   },
+   {
+    "node": "val1",
+    "height": 1235,
+    "cmp_height": 1229,
+    "block_hash": "0x032869c3cfeb345de70ace437a19182a32e1bdd4713c44f9a3bc75c8e71ec7c4",
+    "header_state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "state_digest": "57463c480b4344fac96366d936c2d3138db976a3ac2a8694dfad48a540b325a0",
+    "digest_height": 1261,
+    "digest_seconds": 20.3,
+    "matched": 28182412,
+    "placed": 36904475,
+    "resting": 22407309,
+    "actions": 151098,
+    "resident_rebuilds": 1,
+    "panic_or_failstop_lines": 0,
+    "error_lines": 0
+   },
+   {
+    "node": "val2",
+    "height": 1234,
+    "cmp_height": 1229,
+    "block_hash": "0x032869c3cfeb345de70ace437a19182a32e1bdd4713c44f9a3bc75c8e71ec7c4",
+    "header_state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "state_digest": "57463c480b4344fac96366d936c2d3138db976a3ac2a8694dfad48a540b325a0",
+    "digest_height": 1262,
+    "digest_seconds": 20.2,
+    "matched": 28182412,
+    "placed": 36904475,
+    "resting": 22407309,
+    "actions": 151098,
+    "resident_rebuilds": 1,
+    "panic_or_failstop_lines": 0,
+    "error_lines": 0
+   }
+  ],
+  "height_spread": 1,
+  "block_hash_equal": true,
+  "header_state_root_equal": true,
+  "state_digest_equal": true,
+  "counters_equal_all_nodes": true,
+  "counters_excluded_node": null,
+  "counters_compared_nodes": [
+   "val0",
+   "val1",
+   "val2"
+  ],
+  "counters_equal": true,
+  "panic_or_failstop_lines": 0,
+  "error_lines": 0,
+  "resident_rebuilds_per_node": [
+   1,
+   1,
+   1
+  ],
+  "state_digest_quiescent": true,
+  "state_digest_seconds_per_node": [
+   20.3,
+   20.3,
+   20.2
+  ],
+  "state_digest_heights": [
+   1262,
+   1261,
+   1262
+  ],
+  "digest_height_spread": 1,
+  "action_counter_skew_only": false,
+  "agreement_verdict": "AGREE",
+  "validators_agree": true
+ },
+ "validity": {
+  "verdict": "ACCEPT",
+  "accepted": true,
+  "fail_reasons": [],
+  "unverified_reasons": []
+ },
+ "headline": {
+  "matched_s_avg": 199153.9,
+  "placed_s_avg": 261190.9,
+  "native_blk_s": 4.024,
+  "agreement_verdict": "AGREE",
+  "crash_gate": null
+ },
+ "_fixture_note": "trimmed copy of the real p3gate cell summary.json (keys the cell step reads; values verbatim)"
+}
