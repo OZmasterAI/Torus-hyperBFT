@@ -3150,6 +3150,57 @@ mod tests {
         );
     }
 
+    /// p3 merge wait: the deferred join histogram separates 1-50 ms (the
+    /// upkeep p99 rose 10 -> 24 ms in ozarchy-p3mw; factor-2 buckets put 13
+    /// and 24 ms in one bucket). Every bound ratio in [1 ms, 50 ms] is at most
+    /// 1.5, 1 ms and 50 ms are bounds, and one observation counts once.
+    #[test]
+    fn deferred_join_histogram_separates_1_to_50_ms() {
+        let m = Metrics::new();
+        let name = "torus_exec_checkpoint_deferred_join_seconds";
+        assert!(
+            m.encode().contains(&format!("{name}_count 0")),
+            "{name} not registered"
+        );
+        m.exec_checkpoint_deferred_join_seconds.observe(0.013);
+        let text = m.encode();
+        assert!(text.contains(&format!("{name}_count 1")), "{text}");
+        let bounds: Vec<f64> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix(&format!("{name}_bucket{{le=\"")))
+            .filter_map(|l| l.split('"').next())
+            .filter(|le| *le != "+Inf")
+            .map(|le| le.parse().unwrap())
+            .collect();
+        for edge in [0.001, 0.05] {
+            assert!(
+                bounds.iter().any(|b| (b - edge).abs() < 1e-12),
+                "{edge} not a bound: {bounds:?}"
+            );
+        }
+        let fine: Vec<f64> = bounds
+            .iter()
+            .copied()
+            .filter(|b| (0.001 - 1e-12..=0.05 + 1e-12).contains(b))
+            .collect();
+        for w in fine.windows(2) {
+            assert!(
+                w[1] / w[0] <= 1.5 + 1e-9,
+                "{} -> {} too coarse: {bounds:?}",
+                w[0],
+                w[1]
+            );
+        }
+        assert!(
+            bounds.first().is_some_and(|b| *b <= 0.000_1),
+            "sub-ms join must stay visible: {bounds:?}"
+        );
+        assert!(
+            bounds.last().is_some_and(|b| *b >= 1.0),
+            "a stuck join must stay visible: {bounds:?}"
+        );
+    }
+
     /// Ingress-verify-fix Option A: the admit sub-phase histograms must be
     /// registered so the probe can split admit cost into mempool insert vs
     /// leader-forward.
