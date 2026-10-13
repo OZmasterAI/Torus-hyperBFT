@@ -1297,6 +1297,18 @@ class Smoke(FixtureCase):
             }
         )
 
+    def test_overflowing_numbers_refused_under_tolerance(self):
+        # 1e400 and 9e400 both parse to inf: a tolerance must not let two different overflowing values match
+        fx = self.fx
+        write(self.an("a-big.py"), "print('r1-b b ms=9e400')\n")
+        write(self.an("big.txt"), "r1-b b ms=1e400\n")
+        cmp_ = {"want": "analyst/big.txt", "tolerance": 1e-4}
+        snap = fx.snapshot()
+        r = fx.run(
+            meta=self.meta_with({"script": "analyst/a-big.py", "compare": [cmp_]})
+        )
+        self.assertRefused(r, snap, "-r1-b b ms=1e400", "+r1-b b ms=9e400")
+
     def test_malformed_declaration_is_an_error(self):
         fx = self.fx
         snap = fx.snapshot()
@@ -1304,6 +1316,57 @@ class Smoke(FixtureCase):
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("smoke", r.stderr)
         self.assertEqual(fx.snapshot(), snap)
+
+
+class SmokeSame(unittest.TestCase):
+    """smoke_same(a, b, tol): a non-finite number (inf, -inf, nan, or a literal that overflows to inf) only matches
+    the identical string; finite numbers keep the relative tolerance."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.same = staticmethod(load_module().smoke_same)
+
+    def test_overflow_to_inf_is_a_mismatch(self):
+        for tol in (0, 1e-4, 0.5):
+            self.assertFalse(self.same("ms=1e400", "ms=9e400", tol), tol)
+            self.assertFalse(self.same("ms=-1e400", "ms=-9e400", tol), tol)
+            self.assertFalse(self.same("a 1e400 b", "a 2E+400 b", tol), tol)
+
+    def test_overflow_vs_finite_is_a_mismatch(self):
+        # inf - 1e308 = inf, inf > tol * inf is False: the old check passed these
+        for tol in (1e-4, 0.5):
+            self.assertFalse(self.same("ms=1e308", "ms=1e400", tol), tol)
+            self.assertFalse(self.same("ms=1e400", "ms=1.7e308", tol), tol)
+
+    def test_overflow_vs_inf_literal_is_a_mismatch(self):
+        for tol in (0, 1e-4):
+            self.assertFalse(self.same("ms=1e400", "ms=inf", tol), tol)
+            self.assertFalse(self.same("ms=inf", "ms=1e400", tol), tol)
+
+    def test_identical_non_finite_strings_match(self):
+        for tol in (0, 1e-4):
+            self.assertTrue(self.same("ms=inf", "ms=inf", tol), tol)
+            self.assertTrue(self.same("ms=-inf", "ms=-inf", tol), tol)
+            self.assertTrue(self.same("ms=nan", "ms=nan", tol), tol)
+            self.assertTrue(self.same("ms=1e400", "ms=1e400", tol), tol)
+        # the identical non-finite part matches while the finite numbers on the line use the tolerance
+        self.assertTrue(self.same("x=1e400 y=1000.0", "x=1e400 y=1000.04", 1e-4))
+        self.assertTrue(self.same("x=inf y=1000.0", "x=inf y=1000.04", 1e-4))
+        self.assertFalse(self.same("x=1e400 y=1000.0", "x=1e400 y=1001.0", 1e-4))
+
+    def test_non_finite_spelled_differently_is_a_mismatch(self):
+        self.assertFalse(self.same("ms=inf", "ms=Infinity", 1e-4))
+        self.assertFalse(self.same("ms=nan", "ms=NaN", 1e-4))
+
+    def test_finite_tolerance_unchanged(self):
+        self.assertTrue(self.same("ms=1000.0 n=3", "ms=1000.0 n=3", 0))
+        self.assertFalse(self.same("ms=1000.0", "ms=1000.04", 0))
+        self.assertTrue(self.same("ms=1000.0", "ms=1000.04", 1e-4))
+        self.assertFalse(self.same("ms=1000.0", "ms=1000.2", 1e-4))
+        self.assertTrue(self.same("ms=1.0e300", "ms=1.00001e300", 1e-4))
+        self.assertTrue(self.same("ms=0", "ms=0.0", 1e-4))
+        self.assertFalse(self.same("ms=1.0 a", "ms=1.0 b", 1e-4))
+        self.assertFalse(self.same("ms=1.0", "ms=1.0 2.0", 1e-4))
 
 
 class Units(unittest.TestCase):
