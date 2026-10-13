@@ -38,7 +38,7 @@ run_tool("indexer", "code_query", {"project": "<dir-name>", "question": "...", "
 1. **Memory**: `search_knowledge` for known issues, past decisions, and conventions in this area.
 2. **Diff**: `git diff` / `git diff --stat` (or the range given) to see what changed.
 3. **Impact**: `code_graph(blast_radius)` on changed symbols — who calls/reads this? Review callers too, not just the diff.
-4. **Review** each change against: correctness, security (injection, secrets, unsafe input), performance (hot paths, N+1, allocations), conventions (match surrounding code), simplification (dead code, needless abstraction).
+4. **Review** each change against: correctness, security (injection, secrets, unsafe input), performance (hot paths, N+1, allocations), conventions (match surrounding code), simplification (dead code, needless abstraction). If the diff touches a hot-path crate listed in `prompts/review-item6-lens.md`, also follow that file (separate "Item 6 notes" section; notes never block a merge on their own).
 5. **Fix**: Read the file, apply the fix, run tests. Show output — no "fixed" claims without evidence.
 6. **Record**: `remember_this` for each significant finding or fix, tagged `type:fix` or `type:decision`.
 
