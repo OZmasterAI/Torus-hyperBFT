@@ -285,7 +285,10 @@ pub struct RpcPosition {
     pub realized_pnl: String,
     pub margin: String,
     pub margin_mode: String,
-    pub liquidation_price: String,
+    /// Cross: `crate::account::cross_liquidation_price`, `null` when no
+    /// mark of this market crosses maintenance (docs/api/position.md).
+    /// Isolated: the simplified `entry ∓ isolated margin / size` estimate.
+    pub liquidation_price: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

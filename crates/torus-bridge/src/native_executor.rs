@@ -37,6 +37,7 @@ use torus_economics::{
 use torus_state::action_status::{CoreWriterKind, FailureReason};
 use torus_state::trade_rows::{encode_block, FillExtras, TradeFill};
 use torus_state::{NativeStateOverlay, PackedCfBatch, StateBackend, StateDb};
+use torus_telemetry::OrderRejectReason;
 use torus_types::{
     Cloid, FixedPoint, MarketId, NativeAction, OrderId, OrderType, PlaceOrderParams, SessionScope,
     Side, TimeInForce, ValidatorSet, VoteOption, U256,
@@ -827,7 +828,10 @@ mod open_order_count_tests {
 /// Why an order died pre-book (selects its funnel counter).
 #[derive(Clone, Copy)]
 enum RejectReason {
-    Margin,
+    /// The account check; s114: with its reason label
+    /// ([`margin_reject_label`]: the margin split, or `Price` for an
+    /// overflowing notional).
+    Margin(OrderRejectReason),
     OpenLimit,
     Other,
 }
@@ -837,18 +841,94 @@ impl RejectReason {
     /// (the open-order slot check: `OpenLimit` or a state read error).
     fn failure(self) -> FailureReason {
         match self {
-            RejectReason::Margin => FailureReason::Margin,
+            RejectReason::Margin(_) => FailureReason::Margin,
             RejectReason::OpenLimit => FailureReason::OpenLimit,
             RejectReason::Other => FailureReason::Other,
         }
     }
 
-    fn count(self, m: &torus_telemetry::Metrics) {
+    /// Counts one rejected order: its funnel counter and (s114) its reason
+    /// series, `reason` being the result's reason.
+    fn count(self, m: &torus_telemetry::Metrics, reason: FailureReason) {
         match self {
-            RejectReason::Margin => m.orders_rejected_margin.inc(),
+            RejectReason::Margin(_) => m.orders_rejected_margin.inc(),
             RejectReason::OpenLimit => m.orders_rejected_open_limit.inc(),
             RejectReason::Other => m.orders_rejected_other.inc(),
         };
+        m.order_rejected(match self {
+            RejectReason::Margin(label) => label,
+            _ => reject_label(reason),
+        });
+    }
+}
+
+/// s114: the `torus_orders_rejected_reason_total` label of an order rejected
+/// with `reason`. A `Margin` here is the book's match-time cut: the pre-book
+/// account check labels its rejects with [`margin_reject_label`] instead.
+fn reject_label(reason: FailureReason) -> OrderRejectReason {
+    match reason {
+        FailureReason::Margin => OrderRejectReason::MarginMatch,
+        FailureReason::OpenLimit => OrderRejectReason::OpenLimit,
+        FailureReason::Tick => OrderRejectReason::Tick,
+        FailureReason::Lot => OrderRejectReason::Lot,
+        FailureReason::Price => OrderRejectReason::Price,
+        FailureReason::PriceBand => OrderRejectReason::PriceBand,
+        FailureReason::ReduceOnly => OrderRejectReason::ReduceOnly,
+        FailureReason::IocCancel => OrderRejectReason::IocCancel,
+        FailureReason::BadAloPx => OrderRejectReason::BadAloPx,
+        FailureReason::MarketNoLiquidity => OrderRejectReason::MarketNoLiquidity,
+        FailureReason::FokCancel => OrderRejectReason::FokCancel,
+        FailureReason::BadTriggerPx => OrderRejectReason::BadTriggerPx,
+        FailureReason::Fill => OrderRejectReason::Fill,
+        FailureReason::DuplicateCloid => OrderRejectReason::DuplicateCloid,
+        FailureReason::Other | FailureReason::BatchCap => OrderRejectReason::Other,
+    }
+}
+
+#[cfg(test)]
+mod reject_label_tests {
+    use super::*;
+
+    /// s114: every order reject reason has its own series, named like the
+    /// `FailureReason` (so a reason added to torus-state without a label of
+    /// its own fails here, not silently under `other`). Exceptions: a book
+    /// `Margin` is `margin_match` (the pre-book check splits its own), and
+    /// `BatchCap` is not a per-order reject (`other`).
+    #[test]
+    fn every_failure_reason_maps_to_the_label_of_its_name() {
+        for code in 0..=u8::MAX {
+            let reason = FailureReason::from_u8(code);
+            let want = match reason {
+                FailureReason::Margin => "margin_match",
+                FailureReason::BatchCap => "other",
+                r => r.as_str(),
+            };
+            assert_eq!(reject_label(reason).as_str(), want, "code {code}: {reason:?}");
+        }
+    }
+}
+
+/// s114 (archy section 53c.4): the label of a pre-book account-check reject
+/// with `reason`. The check saw `free`; `reserved` is what the sender's
+/// open-order reservations (and, in Phase 2, its earlier orders' commitments
+/// of this batch) took out of it. `passes(f)` re-runs the same pure check at
+/// free margin `f`. `MarginReservation`: it passes with `reserved` released;
+/// `MarginPosition`: it fails even then (positions, losses or cash). Reject
+/// path only: one extra check per margin reject, nothing on a pass.
+fn margin_reject_label(
+    reason: FailureReason,
+    free: FixedPoint,
+    reserved: FixedPoint,
+    passes: impl FnOnce(FixedPoint) -> bool,
+) -> OrderRejectReason {
+    if reason != FailureReason::Margin {
+        return reject_label(reason);
+    }
+    let released = free.checked_add(reserved).unwrap_or(FixedPoint::MAX);
+    if reserved > FixedPoint::ZERO && passes(released) {
+        OrderRejectReason::MarginReservation
+    } else {
+        OrderRejectReason::MarginPosition
     }
 }
 
@@ -6836,7 +6916,7 @@ impl NativeExecutor {
                     return true;
                 };
                 if let Some(m) = metrics {
-                    m.orders_rejected_other.inc();
+                    RejectReason::Other.count(m, FailureReason::DuplicateCloid);
                 }
                 results[i] = NativeActionResult::rejected(
                     "place_order",
@@ -7513,21 +7593,39 @@ impl NativeExecutor {
                 // unchecked ones (GTC buys, stops) stay strict.
                 let credit = if checked { st.released } else { FixedPoint::ZERO };
                 // Review fix 1: minus what earlier orders committed.
+                let free = bal.available + pn + credit - st.committed;
                 let need = match Self::account_check(
                     market.tiers(),
                     e.signed,
                     e.px,
                     params,
                     res_price,
-                    bal.available + pn + credit - st.committed,
+                    free,
                 ) {
                     Ok(need) => need,
                     Err((reason, msg)) => {
+                        // s114: reservations = resting orders' (this batch's
+                        // accepted ones included) + this batch's commitments.
+                        let reserved = bal
+                            .order_margin
+                            .checked_add(st.committed)
+                            .unwrap_or(FixedPoint::MAX);
+                        let label = margin_reject_label(reason, free, reserved, |f| {
+                            Self::account_check(
+                                market.tiers(),
+                                e.signed,
+                                e.px,
+                                params,
+                                res_price,
+                                f,
+                            )
+                            .is_ok()
+                        });
                         return PrepOutcome::Reject {
-                            funnel: RejectReason::Margin,
+                            funnel: RejectReason::Margin(label),
                             reason,
                             msg,
-                        }
+                        };
                     }
                 };
                 // Review fix 1 (s517): the need beyond the reservation
@@ -7640,7 +7738,7 @@ impl NativeExecutor {
             PrepOutcome::Reject { funnel, reason, msg } => {
                 // Funnel (perf A1): died pre-book.
                 if let Some(ref m) = metrics {
-                    funnel.count(m);
+                    funnel.count(m, reason);
                 }
                 results[i] = NativeActionResult::rejected("place_order", (reason, msg));
             }
@@ -7880,6 +7978,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     continue;
                 }
@@ -7899,7 +7998,12 @@ impl NativeExecutor {
 
                 if let Some(ref m) = ctx.metrics {
                     m.orders_matched.inc_by(result.fills.len() as u64);
-                    Self::record_order_status_funnel(m, &result.status, result.fills.len());
+                    Self::record_order_status_funnel(
+                        m,
+                        &result.status,
+                        result.fills.len(),
+                        result.reject,
+                    );
                 }
 
                 *total_gas += PLACE_ORDER_GAS;
@@ -8269,6 +8373,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     continue;
                 }
@@ -8286,7 +8391,12 @@ impl NativeExecutor {
 
                 if let Some(ref m) = ctx.metrics {
                     m.orders_matched.inc_by(result.fills.len() as u64);
-                    Self::record_order_status_funnel(m, &result.status, result.fills.len());
+                    Self::record_order_status_funnel(
+                        m,
+                        &result.status,
+                        result.fills.len(),
+                        result.reject,
+                    );
                 }
 
                 *total_gas += PLACE_ORDER_GAS;
@@ -8476,12 +8586,17 @@ impl NativeExecutor {
     /// the book AND settled (margin rejects, balance errors and fill-application
     /// failures are counted at their own sites as `orders_rejected_margin` /
     /// `orders_rejected_other`). Observability only: nothing in execution reads
-    /// these counters back.
+    /// these counters back. s114: a book reject (`reject`, row 50) is also
+    /// counted under its reason series.
     fn record_order_status_funnel(
         m: &torus_telemetry::Metrics,
         status: &OrderStatus,
         fill_count: usize,
+        reject: Option<FailureReason>,
     ) {
+        if let Some(reason) = reject {
+            m.order_rejected(reject_label(reason));
+        }
         match status {
             OrderStatus::Filled => {
                 m.orders_placed_accepted.inc();
@@ -9508,7 +9623,7 @@ impl NativeExecutor {
             Self::duplicate_cloid(&ctx.order_books, index, &mut ctx.phase_accum, sender, c)
         }) {
             if let Some(ref m) = ctx.metrics {
-                m.orders_rejected_other.inc();
+                RejectReason::Other.count(m, FailureReason::DuplicateCloid);
             }
             return NativeActionResult::rejected(
                 "place_order",
@@ -9525,7 +9640,7 @@ impl NativeExecutor {
             params,
         ) {
             if let Some(ref m) = ctx.metrics {
-                reason.count(m);
+                reason.count(m, reason.failure());
             }
             return NativeActionResult::rejected("place_order", (reason.failure(), msg));
         }
@@ -9630,6 +9745,7 @@ impl NativeExecutor {
             // Funnel (perf A1): died pre-book on validation.
             if let Some(ref m) = ctx.metrics {
                 m.orders_rejected_other.inc();
+                m.order_rejected(reject_label(rejection.0));
             }
             return NativeActionResult::rejected("place_order", rejection);
         }
@@ -9680,6 +9796,7 @@ impl NativeExecutor {
             Err(msg) => {
                 if let Some(ref m) = ctx.metrics {
                     m.orders_rejected_other.inc();
+                    m.order_rejected(OrderRejectReason::Price);
                 }
                 return NativeActionResult::rejected("place_order", (FailureReason::Price, msg));
             }
@@ -9726,22 +9843,30 @@ impl NativeExecutor {
                                 // Funnel (perf A1): died pre-book on a state read error.
                                 if let Some(ref m) = ctx.metrics {
                                     m.orders_rejected_other.inc();
+                                    m.order_rejected(OrderRejectReason::Other);
                                 }
                                 return NativeActionResult::err("place_order", e.to_string());
                             }
                         };
                         let free = bal.available + pos_net;
-                        if let Err(rejection) = Self::account_check(
-                            reader.tiers(market_id),
-                            signed,
-                            px,
-                            params,
-                            res_price,
-                            free,
-                        ) {
+                        let tiers = reader.tiers(market_id);
+                        if let Err(rejection) =
+                            Self::account_check(tiers, signed, px, params, res_price, free)
+                        {
                             // Funnel (perf A1): died pre-book on the margin check.
                             if let Some(ref m) = ctx.metrics {
                                 m.orders_rejected_margin.inc();
+                                // s114: the margin split (reservations =
+                                // the sender's resting orders').
+                                m.order_rejected(margin_reject_label(
+                                    rejection.0,
+                                    free,
+                                    bal.order_margin,
+                                    |f| {
+                                        Self::account_check(tiers, signed, px, params, res_price, f)
+                                            .is_ok()
+                                    },
+                                ));
                             }
                             return NativeActionResult::rejected("place_order", rejection);
                         }
@@ -9758,6 +9883,7 @@ impl NativeExecutor {
                             // Funnel (perf A1): died pre-book on a balance write error.
                             if let Some(ref m) = ctx.metrics {
                                 m.orders_rejected_other.inc();
+                                m.order_rejected(OrderRejectReason::Other);
                             }
                             return NativeActionResult::err("place_order", e.to_string());
                         }
@@ -9768,6 +9894,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died pre-book on a balance read error.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Other);
                     }
                     return NativeActionResult::err("place_order", e.to_string());
                 }
@@ -9910,6 +10037,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     return NativeActionResult::rejected(
                         "place_order",
@@ -9937,6 +10065,7 @@ impl NativeExecutor {
                     // Funnel (perf A1): died on fill application, not on the book.
                     if let Some(ref m) = ctx.metrics {
                         m.orders_rejected_other.inc();
+                        m.order_rejected(OrderRejectReason::Fill);
                     }
                     return NativeActionResult::rejected(
                         "place_order",
@@ -9964,7 +10093,7 @@ impl NativeExecutor {
 
         if let Some(ref m) = ctx.metrics {
             m.orders_matched.inc_by(result.fills.len() as u64);
-            Self::record_order_status_funnel(m, &result.status, result.fills.len());
+            Self::record_order_status_funnel(m, &result.status, result.fills.len(), result.reject);
         }
 
         NativeActionResult::placed(&result)

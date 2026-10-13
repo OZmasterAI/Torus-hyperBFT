@@ -22,13 +22,24 @@ pub const NATIVE_ACTION_TOPIC: &str = "/torus/native-actions/1.0";
 
 #[derive(NetworkBehaviour)]
 pub struct TorusBehaviour {
+    /// Peer block list for banning (Phase 3: 3.1.7).
+    ///
+    /// The two connection-DENYING behaviours (`block_list`,
+    /// `connection_limits`) must stay the FIRST fields: the derive calls each
+    /// field's `handle_established_*_connection` in field order, and a
+    /// stateful behaviour placed before a denier has already registered the
+    /// connection when it is denied — it then never sees a
+    /// `ConnectionClosed`, leaving a ghost connection (s114: request-response
+    /// round-robins requests to it; debug builds panic the swarm task).
+    pub block_list: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
+    /// Connection limits enforcement (Phase 3: 3.1.7). Must precede every
+    /// stateful behaviour — see `block_list`.
+    pub connection_limits: connection_limits::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub direct: request_response::Behaviour<BorshCodec>,
     pub sync_proto: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub identify: identify::Behaviour,
-    /// Connection limits enforcement (Phase 3: 3.1.7).
-    pub connection_limits: connection_limits::Behaviour,
     /// Dedicated block-data fetch protocol (hybrid pipelining Task 2).
     pub block_data: request_response::Behaviour<BlockDataCodec>,
     /// Dedicated native-action DA fetch protocol (Phase C Task 5): serves
@@ -42,8 +53,6 @@ pub struct TorusBehaviour {
     /// negotiated per-peer, so a pre-shard binary simply never advertises it and
     /// the fetcher falls back to the whole-body pull (mixed-binary safe).
     pub native_da_shards: request_response::Behaviour<NativeDaShardsCodec>,
-    /// Peer block list for banning (Phase 3: 3.1.7).
-    pub block_list: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
 
 /// Default gossipsub heartbeat interval (ms). Single source of truth shared
@@ -272,6 +281,90 @@ mod tests {
             crate::config::NetworkConfig::default().gossipsub_heartbeat_ms,
             DEFAULT_GOSSIPSUB_HEARTBEAT_MS
         );
+    }
+
+    /// s114 ghost-connection regression: `connection_limits` caps established
+    /// connections at 2 per peer, but it sat AFTER gossipsub / direct /
+    /// sync_proto in the derive, and `#[derive(NetworkBehaviour)]` calls each
+    /// field's `handle_established_*_connection` in field order. A 3rd
+    /// connection (e.g. a fast-restarted validator dialing while we still hold
+    /// its dead QUIC connection) was preloaded into those behaviours and THEN
+    /// denied, so it never got a `ConnectionClosed`: request-response kept a
+    /// ghost connection it round-robins requests to (votes silently lost), and
+    /// in debug builds its `debug_assert` panicked the swarm task once the real
+    /// connections closed. Denying behaviours must come first.
+    #[tokio::test]
+    async fn denied_third_connection_leaves_no_ghost_state() {
+        use futures::StreamExt;
+        use libp2p::swarm::SwarmEvent;
+        use libp2p::{Multiaddr, Swarm, SwarmBuilder};
+
+        fn quic_swarm() -> Swarm<TorusBehaviour> {
+            SwarmBuilder::with_new_identity()
+                .with_tokio()
+                .with_quic()
+                .with_behaviour(|key| TorusBehaviour::new(key).expect("behaviour"))
+                .expect("behaviour")
+                .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build()
+        }
+
+        let mut x = quic_swarm();
+        let mut y = quic_swarm();
+        let y_id = *y.local_peer_id();
+        y.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let y_addr: Multiaddr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = y.select_next_some().await {
+                break address;
+            }
+        };
+        // Address dials carry no peer condition: three connections race, the
+        // per-peer limit (2) must deny one of them on at least one side.
+        for _ in 0..3 {
+            x.dial(y_addr.clone()).unwrap();
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let (mut x_est, mut denied, mut disconnecting) = (0u32, false, false);
+        let mut y_closed_all = false;
+        while !(y_closed_all && disconnecting) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out: x_est={x_est} denied={denied} disconnecting={disconnecting}"
+            );
+            tokio::select! {
+                ev = x.select_next_some() => match ev {
+                    SwarmEvent::ConnectionEstablished { .. } => x_est += 1,
+                    SwarmEvent::OutgoingConnectionError { .. } => denied = true,
+                    _ => {}
+                },
+                ev = y.select_next_some() => match ev {
+                    SwarmEvent::IncomingConnectionError { .. } => denied = true,
+                    SwarmEvent::ConnectionClosed { num_established: 0, .. } if disconnecting => {
+                        y_closed_all = true;
+                    }
+                    _ => {}
+                },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            if !disconnecting && denied && x_est >= 2 {
+                // Close every real connection; a ghost entry trips
+                // request-response's `debug_assert` right here.
+                x.disconnect_peer_id(y_id).unwrap();
+                disconnecting = true;
+            }
+        }
+        // Drain a little longer on both sides so x's own close path runs too.
+        let settle = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < settle {
+            tokio::select! {
+                _ = x.select_next_some() => {}
+                _ = y.select_next_some() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        assert!(!x.is_connected(&y_id), "all connections closed");
     }
 
     /// T6: the erasure-shard fetch protocol is registered on the behaviour. This
