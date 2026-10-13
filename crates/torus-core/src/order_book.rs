@@ -25,7 +25,10 @@ use torus_state::action_status::FailureReason;
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
+mod cloid_key;
 mod trader_orders;
+
+pub use cloid_key::CloidKey;
 
 use trader_orders::TraderOrders;
 
@@ -37,6 +40,10 @@ mod account_margins_p1_tests;
 mod mark_charge_tests;
 #[cfg(test)]
 mod cloid_tests;
+
+// perf/cloid-engine-cost fix 4.
+#[cfg(test)]
+mod cloid_key_tests;
 
 /// Open orders (resting + pending stops) of each sender in `senders` (value =
 /// its index in the result), summed over `books`. The walk costs, per book,
@@ -1298,10 +1305,13 @@ pub struct OrderBook {
 /// every key up again, as before. `resolved` holds keys logged before any
 /// key in `log`.
 #[derive(Default)]
+///
+/// fix 4: keyed by the packed [`CloidKey`] (lossless, 40 bytes, a cheaper
+/// hash) instead of the `(Address, Cloid)` tuple.
 struct BookCloids {
-    map: HashMap<(Address, Cloid), OrderId>,
-    log: Vec<(Address, Cloid)>,
-    resolved: Vec<(Address, Cloid, Option<OrderId>)>,
+    map: HashMap<CloidKey, OrderId>,
+    log: Vec<CloidKey>,
+    resolved: Vec<(CloidKey, Option<OrderId>)>,
 }
 
 /// One chunk's aggregate for the chunked level digest: the keccak of its
@@ -1442,13 +1452,14 @@ impl OrderBook {
         // executor applies the rule across books before the book; fix 3:
         // its batch path tells the book so and the lookup is skipped).
         if let Some(c) = params.client_order_id {
+            let key = CloidKey::new(trader, c);
             if cloid_checked {
                 debug_assert!(
-                    !self.cloids.map.contains_key(&(trader, c)),
+                    !self.cloids.map.contains_key(&key),
                     "cloid {c:#x} of {trader} placed as checked but live in market {}",
                     self.market_id
                 );
-            } else if self.cloids.map.contains_key(&(trader, c)) {
+            } else if self.cloids.map.contains_key(&key) {
                 return PlaceResult::rejected(order_id, FailureReason::DuplicateCloid);
             }
         }
@@ -2369,7 +2380,13 @@ impl OrderBook {
     /// s114: the id of `trader`'s open order (resting, or a pending stop)
     /// in this book whose client order id is `cloid`.
     pub fn order_id_by_cloid(&self, trader: &Address, cloid: Cloid) -> Option<OrderId> {
-        self.cloids.map.get(&(*trader, cloid)).copied()
+        self.order_id_by_cloid_key(&CloidKey::new(*trader, cloid))
+    }
+
+    /// fix 4: [`Self::order_id_by_cloid`] by the packed key.
+    #[inline]
+    pub fn order_id_by_cloid_key(&self, key: &CloidKey) -> Option<OrderId> {
+        self.cloids.map.get(key).copied()
     }
 
     /// s114: entries in the `(trader, cloid)` index (= open orders and
@@ -2380,7 +2397,15 @@ impl OrderBook {
 
     /// s114 follow-up: every `(trader, cloid, id)` of the index (any order).
     pub fn cloid_entries(&self) -> impl Iterator<Item = (Address, Cloid, OrderId)> + '_ {
-        self.cloids.map.iter().map(|(&(t, c), &id)| (t, c, id))
+        self.cloids
+            .map
+            .iter()
+            .map(|(k, &id)| (k.trader(), k.cloid(), id))
+    }
+
+    /// fix 4: [`Self::cloid_entries`] by the packed key.
+    pub fn cloid_key_entries(&self) -> impl Iterator<Item = (CloidKey, OrderId)> + '_ {
+        self.cloids.map.iter().map(|(&k, &id)| (k, id))
     }
 
     /// s114 follow-up: empty the cloid log, calling `f(trader, cloid, live)`
@@ -2389,24 +2414,25 @@ impl OrderBook {
     /// cloid here any more). The executor's cross-market index is kept from
     /// this ([`BookCloids`]).
     pub fn drain_cloid_log(&mut self, mut f: impl FnMut(Address, Cloid, Option<OrderId>)) {
+        self.drain_cloid_keys(|k, live| f(k.trader(), k.cloid(), live));
+    }
+
+    /// fix 4: [`Self::drain_cloid_log`] by the packed key.
+    pub fn drain_cloid_keys(&mut self, mut f: impl FnMut(CloidKey, Option<OrderId>)) {
         let BookCloids { map, log, resolved } = &mut self.cloids;
         if log.is_empty() {
             // fix 2: nothing changed since the resolve: its entries are
             // the current ones.
-            for (t, c, live) in resolved.drain(..) {
-                debug_assert_eq!(
-                    live,
-                    map.get(&(t, c)).copied(),
-                    "stale resolved cloid record"
-                );
-                f(t, c, live);
+            for (k, live) in resolved.drain(..) {
+                debug_assert_eq!(live, map.get(&k).copied(), "stale resolved cloid record");
+                f(k, live);
             }
         } else {
-            for (t, c, _) in resolved.drain(..) {
-                f(t, c, map.get(&(t, c)).copied());
+            for (k, _) in resolved.drain(..) {
+                f(k, map.get(&k).copied());
             }
-            for (t, c) in log.drain(..) {
-                f(t, c, map.get(&(t, c)).copied());
+            for k in log.drain(..) {
+                f(k, map.get(&k).copied());
             }
         }
     }
@@ -2421,13 +2447,10 @@ impl OrderBook {
             return;
         }
         // A record resolved earlier may be stale by now: look it up again.
-        for (t, c, live) in resolved.iter_mut() {
-            *live = map.get(&(*t, *c)).copied();
+        for (k, live) in resolved.iter_mut() {
+            *live = map.get(k).copied();
         }
-        resolved.extend(
-            log.drain(..)
-                .map(|(t, c)| (t, c, map.get(&(t, c)).copied())),
-        );
+        resolved.extend(log.drain(..).map(|k| (k, map.get(&k).copied())));
     }
 
     /// s114 follow-up: empty the cloid log unread (a load, or no index to
@@ -2534,7 +2557,7 @@ impl OrderBook {
         }
         // Invariant 5 (s114): the cloid index holds exactly the resting
         // orders and pending stops that carry a cloid, one per (trader, cloid).
-        let mut want: HashMap<(Address, Cloid), OrderId> = HashMap::default();
+        let mut want: HashMap<CloidKey, OrderId> = HashMap::default();
         let open = self
             .bids
             .values()
@@ -2549,7 +2572,7 @@ impl OrderBook {
         for (trader, cloid, id) in open {
             if let Some(c) = cloid {
                 assert!(
-                    want.insert((trader, c), id).is_none(),
+                    want.insert(CloidKey::new(trader, c), id).is_none(),
                     "cloid {c:#x} of {trader} is live twice"
                 );
             }
@@ -3018,8 +3041,9 @@ impl OrderBook {
     #[inline]
     fn index_cloid(cloids: &mut BookCloids, trader: Address, cloid: Option<Cloid>, id: OrderId) {
         if let Some(c) = cloid {
-            let prev = cloids.map.insert((trader, c), id);
-            cloids.log.push((trader, c));
+            let key = CloidKey::new(trader, c);
+            let prev = cloids.map.insert(key, id);
+            cloids.log.push(key);
             debug_assert!(
                 prev.is_none_or(|p| p == id),
                 "cloid {c:#x} of {trader} indexed twice ({prev:?}, {id})"
@@ -3032,9 +3056,10 @@ impl OrderBook {
     #[inline]
     fn forget_cloid(cloids: &mut BookCloids, trader: Address, cloid: Option<Cloid>, id: OrderId) {
         if let Some(c) = cloid {
-            if cloids.map.get(&(trader, c)) == Some(&id) {
-                cloids.map.remove(&(trader, c));
-                cloids.log.push((trader, c));
+            let key = CloidKey::new(trader, c);
+            if cloids.map.get(&key) == Some(&id) {
+                cloids.map.remove(&key);
+                cloids.log.push(key);
             }
         }
     }

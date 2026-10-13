@@ -662,7 +662,7 @@ fn seeded_book_stream(seed: u64, ops: usize) -> u64 {
     }
     m.assert_matches(&mut b);
     b.verify_invariants();
-    let _ = write!(out, "live {:?}\n", live(&b));
+    let _ = writeln!(out, "live {:?}", live(&b));
     let blob = borsh::to_vec(&b).unwrap();
     // A reload gives the same index.
     let reloaded = OrderBook::try_from_slice(&blob).unwrap();

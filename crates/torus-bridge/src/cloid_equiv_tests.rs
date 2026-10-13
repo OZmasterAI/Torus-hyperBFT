@@ -236,7 +236,7 @@ fn run_block(
     out: &mut String,
 ) -> Vec<NativeActionResult> {
     let path = rng.below(5);
-    let _ = write!(out, "path {path}\n");
+    let _ = writeln!(out, "path {path}");
     match path {
         0 => NativeExecutor::execute_batch(ctx, block).results,
         1 => NativeExecutor::execute_batch_cancel_mode(ctx, block, true).results,
@@ -296,12 +296,12 @@ fn seeded_run(seed: u64, mode: BookMode, run: Run) -> (u64, usize, usize) {
         let block = random_block(&mut rng, &ctx);
         let results = run_block(&mut rng, &mut ctx, &block, &mut out);
         for r in &results {
-            let _ = write!(out, "{} {:?} {:?}\n", r.success, r.reason, r.error);
+            let _ = writeln!(out, "{} {:?} {:?}", r.success, r.reason, r.error);
             dups += usize::from(r.reason == FailureReason::DuplicateCloid);
             oks += usize::from(r.success);
         }
         let (_, rebuilt) = ctx.cloid_index();
-        let _ = write!(out, "index {rebuilt:?}\n");
+        let _ = writeln!(out, "index {rebuilt:?}");
         ctx.save_order_books();
         ctx.stash_resident(&mut holder);
         if resident {
@@ -317,7 +317,7 @@ fn seeded_run(seed: u64, mode: BookMode, run: Run) -> (u64, usize, usize) {
     }
     let ctx = ctx_at(&db, 99, mode, None);
     let root = compute_native_state_root(&ctx.state).unwrap();
-    let _ = write!(out, "root {root}\n");
+    let _ = writeln!(out, "root {root}");
     (fnv(&out), dups, oks)
 }
 
@@ -431,5 +431,23 @@ fn a_second_order_with_the_cloid_in_the_same_book_and_call_is_a_duplicate() {
             .count();
         assert_eq!(resting_c1, 1, "{what}: one of the batch's pair rests");
         book.verify_invariants();
+    }
+}
+
+/// fix 4: the cross-market index's entry is 64 bytes (was 80) and its
+/// packed value gives back the market and id it was made from.
+#[test]
+fn the_cloid_index_entry_is_64_bytes_and_its_slot_lossless() {
+    assert_eq!(std::mem::size_of::<(CloidKey, CloidSlot)>(), 64);
+    assert_eq!(
+        std::mem::size_of::<((Address, Cloid), (MarketId, OrderId))>(),
+        80
+    );
+    for (m, id) in [(0, 0), (u64::MAX, u128::MAX), (7, 1u128 << 64 | 5), (1, C)] {
+        let s = CloidSlot::new(m, id);
+        assert_eq!((s.market, s.id()), (m, id));
+        assert_eq!(s, CloidSlot::new(m, id));
+        assert_ne!(s, CloidSlot::new(m, id ^ 1));
+        assert_ne!(s, CloidSlot::new(m ^ 1, id));
     }
 }

@@ -23,7 +23,7 @@ use torus_core::margin::{
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
     band_reference, market_row_shape, order_price_violation, price_band_violation, reduce_only_allowance,
-    shape_violation, AccountMargins, Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult,
+    shape_violation, AccountMargins, CloidKey, Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult,
     PriceBand, ReduceOnlyPositions, ShapeViolation, TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
@@ -3195,9 +3195,35 @@ struct ResidentInner {
 /// after a load ([`Self::build`]), carried with the resident books; never
 /// hashed, never persisted: every node gets the same verdicts as the full
 /// scan (debug builds compare the two at every check).
+/// fix 4: keyed by the packed [`CloidKey`], the value packed in
+/// [`CloidSlot`]: a 64-byte entry, was 80.
 #[derive(Default)]
 struct CloidMarkets {
-    map: HashMap<(Address, Cloid), (MarketId, OrderId)>,
+    map: HashMap<CloidKey, CloidSlot>,
+}
+
+/// perf/cloid-engine-cost fix 4: `(market, order id)` at align 8, 24
+/// bytes (the tuple is 32: u128 is align 16). Lossless.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CloidSlot {
+    market: MarketId,
+    /// The order id, low and high 64 bits.
+    id: [u64; 2],
+}
+
+impl CloidSlot {
+    #[inline]
+    fn new(market: MarketId, id: OrderId) -> Self {
+        Self {
+            market,
+            id: [id as u64, (id >> 64) as u64],
+        }
+    }
+
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    fn id(&self) -> OrderId {
+        (self.id[1] as u128) << 64 | self.id[0] as u128
+    }
 }
 
 impl CloidMarkets {
@@ -3207,8 +3233,8 @@ impl CloidMarkets {
         let mut index = Self::default();
         for (&market, book) in books.iter_mut() {
             book.clear_cloid_log();
-            for (trader, cloid, id) in book.cloid_entries() {
-                index.map.insert((trader, cloid), (market, id));
+            for (key, id) in book.cloid_key_entries() {
+                index.map.insert(key, CloidSlot::new(market, id));
             }
         }
         index
@@ -3218,17 +3244,17 @@ impl CloidMarkets {
     /// index the log is dropped: the build scans the books.
     fn absorb(index: &mut Option<Self>, book: &mut OrderBook, market: MarketId) {
         match index {
-            Some(index) => book.drain_cloid_log(|trader, cloid, live| match live {
+            Some(index) => book.drain_cloid_keys(|key, live| match live {
                 Some(id) => {
-                    index.map.insert((trader, cloid), (market, id));
+                    index.map.insert(key, CloidSlot::new(market, id));
                 }
                 None => {
                     // fix 2: one lookup: take the entry out, put it back
                     // if it names another market (then this book's
                     // removal is not the index's).
-                    if let Some(entry) = index.map.remove(&(trader, cloid)) {
-                        if entry.0 != market {
-                            index.map.insert((trader, cloid), entry);
+                    if let Some(slot) = index.map.remove(&key) {
+                        if slot.market != market {
+                            index.map.insert(key, slot);
                         }
                     }
                 }
@@ -3248,9 +3274,10 @@ impl CloidMarkets {
         cloid: Cloid,
     ) -> Option<(MarketId, OrderId)> {
         accum.cloid_checks += 1;
-        let &(market, _) = self.map.get(&(*trader, cloid))?;
+        let key = CloidKey::new(*trader, cloid);
+        let market = self.map.get(&key)?.market;
         accum.cloid_books_probed += 1;
-        let id = books.get(&market)?.order_id_by_cloid(trader, cloid)?;
+        let id = books.get(&market)?.order_id_by_cloid_key(&key)?;
         Some((market, id))
     }
 
@@ -3266,8 +3293,8 @@ impl CloidMarkets {
             for (trader, cloid, id) in book.cloid_entries() {
                 live += 1;
                 assert_eq!(
-                    self.map.get(&(trader, cloid)),
-                    Some(&(market, id)),
+                    self.map.get(&CloidKey::new(trader, cloid)),
+                    Some(&CloidSlot::new(market, id)),
                     "cloid index: {trader}'s cloid {cloid:#x} (order {id}, market {market}) \
                      is not indexed there"
                 );
@@ -3284,7 +3311,10 @@ impl CloidMarkets {
 
     #[cfg(any(test, feature = "test-reference-paths"))]
     fn snapshot(&self) -> CloidIndexSnapshot {
-        self.map.iter().map(|(k, v)| (*k, *v)).collect()
+        self.map
+            .iter()
+            .map(|(k, s)| ((k.trader(), k.cloid()), (s.market, s.id())))
+            .collect()
     }
 }
 
@@ -6903,7 +6933,7 @@ impl NativeExecutor {
         if cloid_places > 0 {
             // perf/cloid-engine-cost fix 1: sized for every cloid placement
             // of the call, so it never grows (no rehash in the loop).
-            let mut claimed: HashSet<(Address, Cloid)> =
+            let mut claimed: HashSet<CloidKey> =
                 HashSet::with_capacity_and_hasher(cloid_places, Default::default());
             let books = &mut ctx.order_books;
             let index = ctx
@@ -6921,7 +6951,7 @@ impl NativeExecutor {
                     return true;
                 };
                 let dup = Self::duplicate_cloid(books, index, accum, sender, cloid).or_else(|| {
-                    (!claimed.insert((*sender, cloid))).then(|| {
+                    (!claimed.insert(CloidKey::new(*sender, cloid))).then(|| {
                         format!(
                             "duplicate cloid {}: an earlier order of this block already uses it",
                             torus_types::cloid_serde::to_hex(cloid)
