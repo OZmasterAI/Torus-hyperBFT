@@ -188,6 +188,7 @@ fn one_book_probe_per_check_at_300_markets() {
         let db = StateDb::open(dir.path()).unwrap();
         let mut ctx = ctx_at(&db, 1, BookMode::Classic, None);
         fund(&ctx, 1);
+        fund(&ctx, 2);
         setup_300(&mut ctx, path);
         assert_eq!(ctx.order_books.len(), MARKETS as usize);
         let (carried, rebuilt) = ctx.cloid_index();

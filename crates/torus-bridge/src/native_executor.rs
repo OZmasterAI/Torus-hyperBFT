@@ -3041,10 +3041,132 @@ struct ResidentInner {
     /// Item 6 Phase 2 P2-1: the books' cancel-all index (`None`: not built
     /// since the last load; the next cancel-all builds it from the books).
     trader_markets: Option<TraderMarkets>,
+    /// s114 follow-up: the books' cross-market cloid index (`None`: not
+    /// built since the last load; the next check with a cloid builds it).
+    /// Every book's cloid log is empty here (drained at the stash).
+    cloid_markets: Option<CloidMarkets>,
     /// Post-block global order-id high-water mark (replaces the load scan).
     next_global_order_id: u128,
     /// The block height whose POST-state this reflects (staleness guard).
     height: u64,
+}
+
+/// s114 follow-up: the node-local cross-market cloid index, `(trader,
+/// cloid) -> (market, order id)` of every open order (resting or pending
+/// stop) carrying a cloid in any book. The duplicate-cloid check of a
+/// placement is one lookup here plus one probe of the book it names
+/// ([`NativeExecutor::duplicate_cloid`]) instead of a probe of every book.
+///
+/// Kept from the books' cloid logs ([`OrderBook::drain_cloid_log`]: every
+/// add and remove of a book's own index, whatever path made it), so it
+/// never needs its own hook per removal path:
+/// - ADDS are drained where an order can rest or a stop be stored (the
+///   single placement incl. triggered stops, every book the batch matching
+///   hands back: the [`TraderMarkets::absorb`] sites but a modify, which
+///   keeps the entry's market and id), so before any later check every
+///   live cloid is in the index with its market and id;
+/// - REMOVES may wait in the book's log until the stash drains every book
+///   ([`NativeExecContext::stash_resident`]); until then the entry may be
+///   stale, which is why the check confirms it in the named book (a stale
+///   entry is never a duplicate).
+///
+/// A cloid is live in at most one book (that is what the check enforces),
+/// so applying logged keys per book in any order gives the same index:
+/// a live key takes `(market, id)`, a dead one leaves only if the index
+/// still points at that market. Built from the books at the first check
+/// after a load ([`Self::build`]), carried with the resident books; never
+/// hashed, never persisted: every node gets the same verdicts as the full
+/// scan (debug builds compare the two at every check).
+#[derive(Default)]
+struct CloidMarkets {
+    map: HashMap<(Address, Cloid), (MarketId, OrderId)>,
+}
+
+impl CloidMarkets {
+    /// The index of `books` as they are (their logs are emptied: the scan
+    /// sees everything logged).
+    fn build(books: &mut HashMap<MarketId, OrderBook>) -> Self {
+        let mut index = Self::default();
+        for (&market, book) in books.iter_mut() {
+            book.clear_cloid_log();
+            for (trader, cloid, id) in book.cloid_entries() {
+                index.map.insert((trader, cloid), (market, id));
+            }
+        }
+        index
+    }
+
+    /// Feed `book`'s cloid log (market `market`) into `index`. Without an
+    /// index the log is dropped: the build scans the books.
+    fn absorb(index: &mut Option<Self>, book: &mut OrderBook, market: MarketId) {
+        match index {
+            Some(index) => book.drain_cloid_log(|trader, cloid, live| match live {
+                Some(id) => {
+                    index.map.insert((trader, cloid), (market, id));
+                }
+                None => {
+                    if index
+                        .map
+                        .get(&(trader, cloid))
+                        .is_some_and(|&(m, _)| m == market)
+                    {
+                        index.map.remove(&(trader, cloid));
+                    }
+                }
+            }),
+            None => book.clear_cloid_log(),
+        }
+    }
+
+    /// `(market, id)` of `trader`'s open order with `cloid`: the index
+    /// names the market, that book confirms (an entry whose removal is
+    /// still in the book's log is not live). Counts the check and the probe.
+    fn live(
+        &self,
+        books: &HashMap<MarketId, OrderBook>,
+        accum: &mut ExecPhaseAccum,
+        trader: &Address,
+        cloid: Cloid,
+    ) -> Option<(MarketId, OrderId)> {
+        accum.cloid_checks += 1;
+        let &(market, _) = self.map.get(&(*trader, cloid))?;
+        accum.cloid_books_probed += 1;
+        let id = books.get(&market)?.order_id_by_cloid(trader, cloid)?;
+        Some((market, id))
+    }
+
+    /// Debug builds: every book's live entries are in the index with their
+    /// market and id (what a check relies on); with `exact`, nothing else
+    /// is (after every log was drained). O(cloids).
+    fn debug_assert_covers(&self, books: &HashMap<MarketId, OrderBook>, exact: bool) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut live = 0usize;
+        for (&market, book) in books {
+            for (trader, cloid, id) in book.cloid_entries() {
+                live += 1;
+                assert_eq!(
+                    self.map.get(&(trader, cloid)),
+                    Some(&(market, id)),
+                    "cloid index: {trader}'s cloid {cloid:#x} (order {id}, market {market}) \
+                     is not indexed there"
+                );
+            }
+        }
+        if exact {
+            assert_eq!(
+                self.map.len(),
+                live,
+                "cloid index holds dead entries after a full drain"
+            );
+        }
+    }
+
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    fn snapshot(&self) -> CloidIndexSnapshot {
+        self.map.iter().map(|(k, v)| (*k, *v)).collect()
+    }
 }
 
 /// Item 6 Phase 2 P2-1 (tests): trader -> markets, ascending.
@@ -3199,9 +3321,12 @@ impl ResidentBooks {
     /// books.
     #[cfg(any(test, feature = "test-reference-paths"))]
     pub fn cloid_index(&self) -> Option<(Option<CloidIndexSnapshot>, CloidIndexSnapshot)> {
-        self.inner
-            .as_ref()
-            .map(|inner| (None, cloid_index_rebuilt(&inner.books)))
+        self.inner.as_ref().map(|inner| {
+            (
+                inner.cloid_markets.as_ref().map(CloidMarkets::snapshot),
+                cloid_index_rebuilt(&inner.books),
+            )
+        })
     }
 
     /// Drop any resident state (books and rows) — the next block rebuilds
@@ -4010,6 +4135,10 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// ([`TraderMarkets`]; `None` until the first cancel-all after a load
     /// builds it, carried in the resident holder).
     trader_markets: Option<TraderMarkets>,
+    /// s114 follow-up: the cross-market cloid index of `order_books`
+    /// ([`CloidMarkets`]; `None` until the first duplicate-cloid check after
+    /// a load builds it, carried in the resident holder).
+    cloid_markets: Option<CloidMarkets>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -4510,9 +4639,11 @@ impl<T: StateBackend> NativeExecContext<T> {
         // P2-1: the resident books bring their index; a load starts without
         // one (the first cancel-all builds it from the books).
         let mut trader_markets = None;
+        let mut cloid_markets = None;
         let (mut order_books, scanned_next_id, load_error) = match reused_inner {
             Some(inner) => {
                 trader_markets = inner.trader_markets;
+                cloid_markets = inner.cloid_markets;
                 (inner.books, inner.next_global_order_id, None)
             }
             None => match book_mode {
@@ -4535,6 +4666,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             // scans them.
             for book in order_books.values_mut() {
                 book.drain_new_traders();
+            }
+        }
+        if cloid_markets.is_none() {
+            // s114 follow-up: likewise for the cloid index (resident books
+            // come with empty logs: the stash drained them).
+            for book in order_books.values_mut() {
+                book.clear_cloid_log();
             }
         }
 
@@ -4611,6 +4749,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             prev_marks: None,
             sums: None,
             trader_markets,
+            cloid_markets,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -4737,9 +4876,19 @@ impl<T: StateBackend> NativeExecContext<T> {
             return;
         }
         self.debug_assert_index_fed();
+        // s114 follow-up: drain every book's cloid log (the removes the
+        // block left there) so the carried index is exact and the logs
+        // empty. O(books) per block, not per check.
+        for (&market, book) in self.order_books.iter_mut() {
+            CloidMarkets::absorb(&mut self.cloid_markets, book, market);
+        }
+        if let Some(index) = &self.cloid_markets {
+            index.debug_assert_covers(&self.order_books, true);
+        }
         resident.inner = Some(ResidentInner {
             books: std::mem::take(&mut self.order_books),
             trader_markets: self.trader_markets.take(),
+            cloid_markets: self.cloid_markets.take(),
             next_global_order_id: self.next_global_order_id,
             height: self.block_height,
         });
@@ -4793,7 +4942,10 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// [`ResidentBooks::cloid_index`].
     #[cfg(test)]
     pub(crate) fn cloid_index(&self) -> (Option<CloidIndexSnapshot>, CloidIndexSnapshot) {
-        (None, cloid_index_rebuilt(&self.order_books))
+        (
+            self.cloid_markets.as_ref().map(CloidMarkets::snapshot),
+            cloid_index_rebuilt(&self.order_books),
+        )
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
@@ -6597,6 +6749,11 @@ impl NativeExecutor {
             .any(|&i| matches!(&flat[i].1, FlatAction::Place(p) if p.client_order_id.is_some()))
         {
             let mut claimed: HashSet<(Address, Cloid)> = HashSet::default();
+            let books = &mut ctx.order_books;
+            let index = ctx
+                .cloid_markets
+                .get_or_insert_with(|| CloidMarkets::build(books));
+            index.debug_assert_covers(books, false);
             let books = &ctx.order_books;
             let metrics = &ctx.metrics;
             let accum = &mut ctx.phase_accum;
@@ -6607,7 +6764,7 @@ impl NativeExecutor {
                 let Some(cloid) = p.client_order_id else {
                     return true;
                 };
-                let dup = Self::duplicate_cloid(books, accum, sender, cloid).or_else(|| {
+                let dup = Self::duplicate_cloid(books, index, accum, sender, cloid).or_else(|| {
                     (!claimed.insert((*sender, cloid))).then(|| {
                         format!(
                             "duplicate cloid {}: an earlier order of this block already uses it",
@@ -7008,6 +7165,8 @@ impl NativeExecutor {
         for mbr in market_results.iter_mut() {
             // P2-1: what rested or was stored in this book feeds the index.
             TraderMarkets::absorb(&mut ctx.trader_markets, &mut mbr.book, mbr.market_id);
+            // s114 follow-up: and the cloid index (adds before any later check).
+            CloidMarkets::absorb(&mut ctx.cloid_markets, &mut mbr.book, mbr.market_id);
             mbr.book.clear_reduce_only_positions();
             // Plan 9.11 (telemetry): this book's charged maker fills.
             if let Some(m) = ctx.metrics.as_deref() {
@@ -9283,10 +9442,13 @@ impl NativeExecutor {
         params: &PlaceOrderParams,
     ) -> NativeActionResult {
         // s114: a cloid live for the sender in any market.
-        if let Some(msg) = params
-            .client_order_id
-            .and_then(|c| Self::duplicate_cloid(&ctx.order_books, &mut ctx.phase_accum, sender, c))
-        {
+        if let Some(msg) = params.client_order_id.and_then(|c| {
+            let books = &mut ctx.order_books;
+            let index = ctx
+                .cloid_markets
+                .get_or_insert_with(|| CloidMarkets::build(books));
+            Self::duplicate_cloid(&ctx.order_books, index, &mut ctx.phase_accum, sender, c)
+        }) {
             if let Some(ref m) = ctx.metrics {
                 m.orders_rejected_other.inc();
             }
@@ -9613,6 +9775,8 @@ impl NativeExecutor {
         );
         // P2-1: the rest of the order / its stop feeds the cancel-all index.
         TraderMarkets::absorb(&mut ctx.trader_markets, book, market_id);
+        // s114 follow-up: and the cloid index (adds before any later check).
+        CloidMarkets::absorb(&mut ctx.cloid_markets, book, market_id);
         book.clear_reduce_only_positions();
         // Plan 9.11 (telemetry): this placement's charged maker fills.
         if let Some(m) = ctx.metrics.as_deref() {
@@ -9906,28 +10070,31 @@ impl NativeExecutor {
     }
 
     /// s114: `Some(message)` when `cloid` is live for `trader` (a resting
-    /// order or a pending stop) in any book. At most one book holds it, so
-    /// the scan order changes nothing.
+    /// order or a pending stop) in any book. Follow-up: one index lookup and
+    /// at most one book probe ([`CloidMarkets::live`]), whatever the market
+    /// count; debug builds check the verdict against the full scan.
     fn duplicate_cloid(
         books: &HashMap<MarketId, OrderBook>,
+        index: &CloidMarkets,
         accum: &mut ExecPhaseAccum,
         trader: &Address,
         cloid: Cloid,
     ) -> Option<String> {
-        accum.cloid_checks += 1;
-        books
-            .iter()
-            .filter_map(|(m, b)| {
-                accum.cloid_books_probed += 1;
-                b.order_id_by_cloid(trader, cloid).map(|id| (*m, id))
-            })
-            .min()
-            .map(|(m, id)| {
-                format!(
-                    "duplicate cloid {}: open order {id} in market {m} uses it",
-                    torus_types::cloid_serde::to_hex(cloid)
-                )
-            })
+        let live = index.live(books, accum, trader, cloid);
+        debug_assert_eq!(
+            live,
+            books
+                .iter()
+                .filter_map(|(m, b)| b.order_id_by_cloid(trader, cloid).map(|id| (*m, id)))
+                .min(),
+            "cloid index disagrees with the books for {trader}'s cloid {cloid:#x}"
+        );
+        live.map(|(m, id)| {
+            format!(
+                "duplicate cloid {}: open order {id} in market {m} uses it",
+                torus_types::cloid_serde::to_hex(cloid)
+            )
+        })
     }
 
     /// s114: `CancelByCloid` — the sender's open order (resting, or a
@@ -10471,6 +10638,9 @@ impl NativeExecutor {
         // P2-1: a re-inserted order feeds the index (its market is listed
         // already: the old order rested there).
         TraderMarkets::absorb(&mut ctx.trader_markets, book, market_id);
+        // s114 follow-up: no cloid-index feed needed: the re-inserted order
+        // keeps its cloid, id and market, so the index entry stays right;
+        // the logged keys wait for the stash.
         if let Err(e) = modified {
             // Unreachable (the order was found above) — undo the reserve.
             Self::release_order_margin(ctx, sender, extra);

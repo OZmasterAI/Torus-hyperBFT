@@ -1189,8 +1189,9 @@ pub struct OrderBook {
     /// s114: `(trader, cloid) -> id` of every resting order and pending stop
     /// that carries a cloid — exactly those (`verify_invariants`). Kept by
     /// every path that adds or removes one; derived from the orders and
-    /// stops (rebuilt on load), never serialized or hashed.
-    cloids: HashMap<(Address, Cloid), OrderId>,
+    /// stops (rebuilt on load), never serialized or hashed. Logs the keys it
+    /// changes ([`BookCloids`]).
+    cloids: BookCloids,
     pub tick_size: FixedPoint,
     pub lot_size: FixedPoint,
     next_id: OrderId,
@@ -1276,6 +1277,22 @@ pub struct OrderBook {
     new_traders: Vec<Address>,
 }
 
+/// s114: a book's `(trader, cloid) -> id` index ([`OrderBook::order_id_by_cloid`])
+/// and, since the executor last drained it ([`OrderBook::drain_cloid_log`]),
+/// the keys it changed. Only `index_cloid` / `forget_cloid` write it, and
+/// both log, so every path that adds or removes an entry (placement, stop
+/// store, fill, cancel, cancel-all, self-trade / reduce-only / margin
+/// cancel, trigger, `take_pending_stops`, load) is logged. The executor's
+/// cross-market index (trader, cloid) -> (market, id) is kept from the log:
+/// a logged key takes this book's entry, or leaves when it has none and the
+/// index points at this market. Orders without a cloid log nothing. In-RAM
+/// only: never serialized, hashed, or read by matching or saving.
+#[derive(Default)]
+struct BookCloids {
+    map: HashMap<(Address, Cloid), OrderId>,
+    log: Vec<(Address, Cloid)>,
+}
+
 /// One chunk's aggregate for the chunked level digest: the keccak of its
 /// member frames plus the parts of the level aggregate it contributes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1296,7 +1313,7 @@ impl OrderBook {
             order_index: HashMap::default(),
             trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
-            cloids: HashMap::default(),
+            cloids: BookCloids::default(),
             tick_size,
             lot_size,
             next_id: 1,
@@ -1380,7 +1397,7 @@ impl OrderBook {
         // executor applies the rule across books before the book).
         if params
             .client_order_id
-            .is_some_and(|c| self.cloids.contains_key(&(trader, c)))
+            .is_some_and(|c| self.cloids.map.contains_key(&(trader, c)))
         {
             return PlaceResult::rejected(order_id, FailureReason::DuplicateCloid);
         }
@@ -2301,29 +2318,41 @@ impl OrderBook {
     /// s114: the id of `trader`'s open order (resting, or a pending stop)
     /// in this book whose client order id is `cloid`.
     pub fn order_id_by_cloid(&self, trader: &Address, cloid: Cloid) -> Option<OrderId> {
-        self.cloids.get(&(*trader, cloid)).copied()
+        self.cloids.map.get(&(*trader, cloid)).copied()
     }
 
     /// s114: entries in the `(trader, cloid)` index (= open orders and
     /// stops carrying a cloid).
     pub fn cloid_count(&self) -> usize {
-        self.cloids.len()
+        self.cloids.map.len()
     }
 
     /// s114 follow-up: every `(trader, cloid, id)` of the index (any order).
     pub fn cloid_entries(&self) -> impl Iterator<Item = (Address, Cloid, OrderId)> + '_ {
-        self.cloids.iter().map(|(&(t, c), &id)| (t, c, id))
+        self.cloids.map.iter().map(|(&(t, c), &id)| (t, c, id))
     }
 
-    /// s114 follow-up (RED stub): the cloid log.
-    pub fn drain_cloid_log(&mut self, _f: impl FnMut(Address, Cloid, Option<OrderId>)) {}
+    /// s114 follow-up: empty the cloid log, calling `f(trader, cloid, live)`
+    /// per logged key in log order (a key may repeat) with the key's entry
+    /// in this book NOW (`None`: no open order of the trader holds the
+    /// cloid here any more). The executor's cross-market index is kept from
+    /// this ([`BookCloids`]).
+    pub fn drain_cloid_log(&mut self, mut f: impl FnMut(Address, Cloid, Option<OrderId>)) {
+        let BookCloids { map, log } = &mut self.cloids;
+        for (t, c) in log.drain(..) {
+            f(t, c, map.get(&(t, c)).copied());
+        }
+    }
 
-    /// s114 follow-up (RED stub).
-    pub fn clear_cloid_log(&mut self) {}
+    /// s114 follow-up: empty the cloid log unread (a load, or no index to
+    /// feed).
+    pub fn clear_cloid_log(&mut self) {
+        self.cloids.log.clear();
+    }
 
-    /// s114 follow-up (RED stub).
+    /// s114 follow-up: keys in the cloid log.
     pub fn cloid_log_len(&self) -> usize {
-        0
+        self.cloids.log.len()
     }
 
     /// s114: the pending stop with this id.
@@ -2438,7 +2467,7 @@ impl OrderBook {
                 );
             }
         }
-        assert_eq!(self.cloids, want, "cloid index != open orders' cloids");
+        assert_eq!(self.cloids.map, want, "cloid index != open orders' cloids");
     }
 
     // ========================================================================
@@ -2581,7 +2610,7 @@ impl OrderBook {
         ro_positions: &mut ReduceOnlyPositions,
         order_index: &mut HashMap<OrderId, OrderLocation>,
         trader_orders: &mut HashMap<Address, TraderOrders>,
-        cloids: &mut HashMap<(Address, Cloid), OrderId>,
+        cloids: &mut BookCloids,
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
         level_journal: &mut BTreeSet<(u8, i128)>,
@@ -2900,14 +2929,10 @@ impl OrderBook {
     /// s114: index `(trader, cloid) -> id` for an order or stop that goes
     /// in (no cloid: nothing).
     #[inline]
-    fn index_cloid(
-        cloids: &mut HashMap<(Address, Cloid), OrderId>,
-        trader: Address,
-        cloid: Option<Cloid>,
-        id: OrderId,
-    ) {
+    fn index_cloid(cloids: &mut BookCloids, trader: Address, cloid: Option<Cloid>, id: OrderId) {
         if let Some(c) = cloid {
-            let prev = cloids.insert((trader, c), id);
+            let prev = cloids.map.insert((trader, c), id);
+            cloids.log.push((trader, c));
             debug_assert!(
                 prev.is_none_or(|p| p == id),
                 "cloid {c:#x} of {trader} indexed twice ({prev:?}, {id})"
@@ -2918,15 +2943,11 @@ impl OrderBook {
     /// s114: drop the entry of an order or stop that leaves the book (only
     /// if it is this id's).
     #[inline]
-    fn forget_cloid(
-        cloids: &mut HashMap<(Address, Cloid), OrderId>,
-        trader: Address,
-        cloid: Option<Cloid>,
-        id: OrderId,
-    ) {
+    fn forget_cloid(cloids: &mut BookCloids, trader: Address, cloid: Option<Cloid>, id: OrderId) {
         if let Some(c) = cloid {
-            if cloids.get(&(trader, c)) == Some(&id) {
-                cloids.remove(&(trader, c));
+            if cloids.map.get(&(trader, c)) == Some(&id) {
+                cloids.map.remove(&(trader, c));
+                cloids.log.push((trader, c));
             }
         }
     }
@@ -4438,7 +4459,7 @@ impl BorshDeserialize for OrderBook {
             order_index: HashMap::default(),
             trader_orders: HashMap::default(),
             pending_stops: Vec::new(),
-            cloids: HashMap::default(),
+            cloids: BookCloids::default(),
             tick_size,
             lot_size,
             next_id,
@@ -4482,6 +4503,7 @@ impl BorshDeserialize for OrderBook {
         // drains the journals; leaving them populated only leaks memory).
         book.row_journal.clear();
         book.level_journal.clear();
+        book.cloids.log.clear();
 
         Ok(book)
     }
