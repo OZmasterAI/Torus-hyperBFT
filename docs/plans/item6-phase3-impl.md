@@ -38,7 +38,7 @@ blocks after the last checkpoint S. No consensus rule, no state format and no `h
 | Phase gate, restart | restart -> ready <= 60 s (SIGKILL val1, multi-crash cells) | step 4 |
 | Phase gate, throughput | matched/s UP vs tw beyond noise; native blocks/s no regression (owner s111 after p3t, section 43: on tmpfs the prototype's blocks/s gain is +1.6%, not resolved, so "up" is not required) | step 4 |
 | correctness | per-block write sets, `h_n` and full CF dump identical: interval 15 s vs 0 vs 1 block, crash at random points (incl. mid-checkpoint), 3 replicas with different intervals | tests, step 1 |
-| RAM | RSS growth within archy's layer-size figure + 25% | step 4 |
+| RAM | a 10 min soak shows RSS levelling off, with a Phase 3 delta <= ~1 GB per node; RSS still growing at the end of the soak blocks the merge (owner s114; was "RSS growth within archy's layer-size figure + 25%", ~270 MB). Which allocator the soak is judged under (glibc fails, jemalloc levels off; sections 53, 53b, 53d) is decided after archy's benches finish. Shrinking the layer (~2.1x its logical size) and the view is a follow-up, reconsidered at Phase 4 | soak cells, step 4 |
 
 The CPU ceiling is ~7% vs tw (step 0: flush worker + state-row memtable / compaction 1.76 CPU-s/1M
 on Classic before tw). The per-block running-hash digest stays on W, so its cost is not saved.
@@ -332,6 +332,11 @@ Validator RPC (`torus.rs`, `eth.rs`) stays on the DB and lags (documented in
   collapse (the margin user is positions, concentrated on low-address senders by the old cancel order). Step 2 + fix RSS
   still grows (+129-178 MB/min, +2.76 GB vs section 53's main), against a confounded reference: the fixed arm keeps ~2x the
   book and layer size for 10 min. Next: cs2 vs main + fix `de97682f`.
+- **Fair RAM soak, fix in every arm** (campaign `ozarchy-p3fsoak`, results doc section 53d, plan-2 row 61): main + fix
+  `de97682f` (glibc, control) vs `41a95355` on glibc and on jemalloc, 600 s each, full workload in all three (0 expiries,
+  0 margin rejections). Glibc: Phase 3 delta +2.62 GB per node (minutes 5-10 mean), still +120-158 MB/min: rule not met.
+  jemalloc: flat, +1.10 GB per node mean / +1.49 GB peak (val2 +0.95 / +1.34): met on the level, borderline on the mean,
+  not at the peak. Same book and layer, so the glibc growth is consistent with retention, not data.
 
 ### Step 5 (only if the owner asks): RPC readers on the view (Option A)
 
