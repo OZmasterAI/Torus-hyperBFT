@@ -6632,6 +6632,38 @@ harness's `matched_s_first120`. The 120 s A/B cells (sections 49-51) measure onl
 * **RSS tracks neither resting orders nor layer bytes as data.** Both are flat or slowly rising in both step 2 + fix arms.
   RSS follows the layer trend only under glibc.
 
+### 53d.5 Follow-up checks on the same cells (18c, no new runs)
+
+**Check 1: select time, mf 29-57 ms vs cs2 19-23 ms per proposed block.** The selection code is the same in both. The
+select timer also covers `flush_da_mirrors` (a database write), and `torus_block_build_mirror_seconds` times the mirror
+step separately. Hypothesis: the write contends with main's per-block flush. Minutes 6-10, ms per proposed block:
+
+| node | mf select | cs2 select | mf mirror | cs2 mirror |
+|---|---|---|---|---|
+| val0 | 31.3 | 21.1 | 20.5 | 18.8 |
+| val1 | 26.8 | 23.0 | 22.2 | 19.0 |
+| val2 | 60.1 | 19.3 | 28.4 | 21.8 |
+
+The mirror step is only 1.6-6.6 ms slower on mf, against a select gap of up to 40.8 ms (val2). The gap is a tail: val2
+select p50 19.8 vs 15.3 ms, p90 160 vs 30 ms. jcs2 select is 19-25 ms. **Contention is not confirmed by the mirror timer.**
+What remains is a rare 100-250 ms stall inside select. That fits a stall in the `flush_da_mirrors` write, but the mirror
+timer mostly doesn't see that path, so it can't confirm it (confidence medium-low).
+
+**Check 2: the glibc -10..-13% matched/s after minute 2.** From minute 3 every block is full (400 actions), so
+matched/s = blocks/s. Minutes 6-10:
+
+* **val2's exec sets the block rate.** Its exec is busy 0.95 (mf), 0.99 (cs2) and 1.00 (jcs2) with its queue at the cap
+  (65), and chain blocks/s tracks 1000 / val2 exec ms per block (per-minute correlation -0.90 / -0.92 / -1.00).
+* **val2 is slower per action under glibc:** 110.5 (mf) and 111.4 (cs2) exec ms per 100 actions vs 99.3 / 97.7 on val0 /
+  val1. Under jemalloc all three nodes are at 95.4.
+* **The extra cost is user CPU, not system time** (so not page-fault work). System share 5.6-7.4% under glibc vs
+  7.0-7.8% under jemalloc. val2 on-CPU ms per block: 347 (mf), 308 (cs2), 267 (jcs2).
+* **Why only after minute 2:** in minutes 0-2 the chain runs ahead of val2 while val2's queue fills (3.65 vs 3.35
+  blocks/s). Once the queue is at the cap, val2's slower exec caps the chain.
+* Exec cost per action rises 6-9% over the cell in every arm, jemalloc included, so that part is not allocator-specific.
+
+One cell per arm: consistent with, not proof. Tables: `docs/perf/bench-archive/tools/ozarchy-p3fsoak-tools/analyst/checks-18c.txt`.
+
 Analysis (`tools/ozarchy-p3fsoak-tools/analyst/`): `a-series.py` (53c's copy with the cells mf / cs2 / jcs2, deltas vs mf,
 the OLS slope of each RSS difference series, RSS vs resting / layer correlations, and the minute 0-2 vs 6-10 matched/s of
 all soak cells incl. 53 / 53b / 53c; figures SVG -> PNG via `rsvg-convert`), `a-margin.py` (53c's, unchanged),
