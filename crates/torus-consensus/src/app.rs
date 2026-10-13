@@ -474,6 +474,11 @@ struct CommittedBlockMsg {
     /// the same bytes would land in the same key. `Default` (both `false`) =
     /// "not known durable" ⇒ execution writes them, exactly as before.
     durable: DurableRows,
+    /// Exec-aware admission: the normal actions this block added to the
+    /// committed-but-unexecuted count (`Mempool::note_exec_committed`); the
+    /// exec thread releases exactly this after executing it. 0 with the
+    /// knob off (the exec thread then touches nothing).
+    committed_unexecuted: usize,
 }
 
 /// Which of a committed block's node-local durable rows are known to be on
@@ -4403,6 +4408,7 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             torus_block,
             pending_slashes,
             durable,
+            committed_unexecuted,
         } = msg;
         let height = torus_block.header.height;
         // T1.5: contain execution panics — a panic here must become a
@@ -4423,15 +4429,21 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
         }
         // Rank 1: keep the metrics-free mirror in lockstep with the gauge.
         ctx.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
-        // Exec-aware admission: this height (and any skipped below it) is no
-        // longer committed-but-unexecuted. No-op with the knob off.
-        if let Some(ref mempool) = ctx.mempool {
-            mempool.note_exec_finished(height);
+        // Exec-aware admission: this block's count is no longer
+        // committed-but-unexecuted. Lock-free (one CAS), never waits on the
+        // consensus thread; with the knob off the count is 0 and nothing is
+        // touched.
+        if committed_unexecuted > 0 {
+            if let Some(ref mempool) = ctx.mempool {
+                mempool.note_exec_released(committed_unexecuted);
+            }
         }
         if ctx.exec_failed.load(Ordering::SeqCst) {
-            // Blocks still queued behind this one never execute here.
+            // Blocks still queued behind this one never execute here. The
+            // teardown is terminal: a dispatch racing in before `rx` drops
+            // can no longer count anything.
             if let Some(ref mempool) = ctx.mempool {
-                mempool.clear_exec_backlog();
+                mempool.close_exec_backlog();
             }
             // Dropping `rx` closes the channel: the consensus thread's next
             // send fails and latches the same fail-stop on the TorusApp side.
@@ -4442,9 +4454,9 @@ fn execution_loop(rx: std::sync::mpsc::Receiver<CommittedBlockMsg>, ctx: Executi
             return;
         }
     }
-    // The loop is gone: nothing still counted will execute here.
+    // The loop is gone: nothing still counted will execute here (terminal).
     if let Some(ref mempool) = ctx.mempool {
-        mempool.clear_exec_backlog();
+        mempool.close_exec_backlog();
     }
     // R01b D: the channel closed. Only a deliberate stop sets `exec_shutdown`;
     // otherwise the consensus side died (its `TorusApp` dropped by a panic) and
@@ -7809,17 +7821,22 @@ impl TorusApp {
         if let Some(ref tx) = self.exec_tx {
             // Exec-aware admission (opt-in): the block's normal actions left
             // the pool above; count them as committed-but-unexecuted BEFORE
-            // the send (the exec thread releases the height after executing
-            // it, so the count can never be released first). Idempotent per
-            // height: a rank-2 retry is not recounted, and a parked block
-            // stays counted. No-op with the knob off.
-            if let Some(ref mempool) = self.mempool {
-                mempool.note_exec_dispatched(height, &torus_block.native_actions);
-            }
+            // the send, and hand the count to the exec thread with the block
+            // (it releases exactly that after executing it). Idempotent per
+            // height: a height already counted when parked, or a rank-2
+            // retry, returns its count without rescanning. 0 and untouched
+            // with the knob off.
+            let committed_unexecuted = match self.mempool {
+                Some(ref mempool) => {
+                    mempool.note_exec_committed(height, &torus_block.native_actions)
+                }
+                None => 0,
+            };
             let msg = CommittedBlockMsg {
                 torus_block,
                 pending_slashes,
                 durable: self.exec_prepared_durable,
+                committed_unexecuted,
             };
             // inc BEFORE the (possibly blocking) send so a consensus thread stalled
             // on a full channel is visible as depth ≥ the bound, not hidden.
@@ -7850,6 +7867,7 @@ impl TorusApp {
                             torus_block,
                             pending_slashes,
                             durable: _,
+                            committed_unexecuted: _,
                         } = msg;
                         return DispatchOutcome::Full(torus_block, pending_slashes);
                     }
@@ -7860,7 +7878,7 @@ impl TorusApp {
                         self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
                         // Nothing dispatched will execute here any more.
                         if let Some(ref mempool) = self.mempool {
-                            mempool.clear_exec_backlog();
+                            mempool.close_exec_backlog();
                         }
                         // T1.5 FAIL-STOP: the execution thread is gone (panic or
                         // fatal) — this block is committed by consensus but will
@@ -7882,7 +7900,7 @@ impl TorusApp {
                 self.exec_queue_len.fetch_sub(1, Ordering::Relaxed);
                 // Nothing dispatched will execute here any more.
                 if let Some(ref mempool) = self.mempool {
-                    mempool.clear_exec_backlog();
+                    mempool.close_exec_backlog();
                 }
                 // T1.5 FAIL-STOP: the execution thread is gone (panic or
                 // fatal) — this block is committed by consensus but will
@@ -7895,6 +7913,11 @@ impl TorusApp {
                     "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
                 );
                 return DispatchOutcome::Failed;
+            }
+            // In the channel: its count now rides the block. No-op with the
+            // knob off.
+            if let Some(ref mempool) = self.mempool {
+                mempool.note_exec_sent(height);
             }
         }
         DispatchOutcome::Sent
@@ -7913,6 +7936,17 @@ impl TorusApp {
     /// fabricate a heal-hole from perfectly good data). Flag off ⇒ a verbatim
     /// insert, bit-identical to the pre-rank-2 buffer.
     fn park_deferred(&mut self, height: u64, source: ExecSource, slashes: Vec<PendingSlash>) {
+        // Exec-aware admission (opt-in): a materialized committed block
+        // parked behind a full head or a hole is committed-but-unexecuted
+        // too; count it now (once per height, before any demotion), or it
+        // stays invisible to admission until it reaches the send. Only with
+        // a live pipeline (a closed counter ignores it anyway). No-op with
+        // the knob off.
+        if let (ExecSource::Ready(block), Some(mempool), Some(_)) =
+            (&source, &self.mempool, &self.exec_tx)
+        {
+            mempool.note_exec_committed(height, &block.native_actions);
+        }
         let (source, ready_bytes) = match source {
             ExecSource::Ready(block) if nonblocking_exec_dispatch() => {
                 let sz = bincode::serialized_size(&block)
@@ -8881,8 +8915,9 @@ mod exec_dispatch_tests {
         assert_eq!(mempool.committed_unexecuted_normal(), 3);
 
         // The exec thread digests h1 (what `execution_loop` reports).
-        assert_eq!(rx.recv().unwrap().torus_block.header.height, 1);
-        mempool.note_exec_finished(1);
+        let msg = rx.recv().unwrap();
+        assert_eq!(msg.torus_block.header.height, 1);
+        exec_done(&mempool, msg);
         assert_eq!(mempool.committed_unexecuted_normal(), 1);
         app.on_reconcile_tick();
         assert!(app.deferred_exec.is_empty(), "h2 sent");
@@ -8941,9 +8976,48 @@ mod exec_dispatch_tests {
         assert_eq!(mempool.committed_unexecuted_normal(), 0);
     }
 
+    /// Knob off, consensus thread: sends, a Full park, Ready parks behind
+    /// it, drain retries, a re-delivery and the dead-pipeline teardown never
+    /// scan, lock or count (the counter is never touched, so nothing is
+    /// allocated either), and every block carries 0 to the exec thread.
+    #[test]
+    fn exec_aware_off_touches_nothing_on_dispatch_parks_or_teardown() {
+        let _guard = env_lock();
+        clear_dispatch_env();
+        std::env::set_var("TORUS_EXEC_NONBLOCKING_DISPATCH", "1");
+
+        let mut app = TorusApp::stub();
+        let mempool = exec_aware_mempool(&app.state_db, false);
+        app.mempool = Some(mempool.clone());
+        let rx = swap_exec_channel(&mut app, 1);
+        let t = now_ms();
+        let blocks: Vec<TorusBlock> = (1..=4u64)
+            .map(|h| block(h, vec![signed(90 + h as u8, t), cancel(100 + h as u8, t)]))
+            .collect();
+        for b in &blocks {
+            app.enqueue_for_execution(b.header.height, ExecSource::Ready(b.clone()), vec![]);
+        }
+        assert_eq!(app.deferred_exec.len(), 3, "h2..h4 parked");
+        app.on_reconcile_tick();
+        app.enqueue_for_execution(3, ExecSource::Ready(blocks[2].clone()), vec![]);
+        for h in 1..=4u64 {
+            let msg = rx.recv().unwrap();
+            assert_eq!(msg.torus_block.header.height, h);
+            assert_eq!(msg.committed_unexecuted, 0, "off: h{h} carries nothing");
+            app.on_reconcile_tick();
+        }
+        drop(rx);
+        app.enqueue_for_execution(5, ExecSource::Ready(block(5, vec![signed(120, t)])), vec![]);
+        assert!(app.is_exec_failed());
+        assert_eq!(mempool.committed_unexecuted_normal(), 0);
+        assert_eq!(mempool.exec_backlog_touches(), 0, "off: counter touched");
+
+        clear_dispatch_env();
+    }
+
     /// What `execution_loop` does with a message once it executed it.
     fn exec_done(mempool: &Mempool, msg: CommittedBlockMsg) {
-        mempool.note_exec_finished(msg.torus_block.header.height);
+        mempool.note_exec_released(msg.committed_unexecuted);
     }
 
     /// Codex r1 finding 1: Ready heights committed while a FULL head is
@@ -8975,7 +9049,10 @@ mod exec_dispatch_tests {
 
         app.enqueue_for_execution(1, ExecSource::Ready(b1), vec![]);
         app.enqueue_for_execution(2, ExecSource::Ready(b2), vec![]);
-        assert!(app.deferred_exec.contains_key(&2), "h2 parked (channel full)");
+        assert!(
+            app.deferred_exec.contains_key(&2),
+            "h2 parked (channel full)"
+        );
         app.enqueue_for_execution(3, ExecSource::Ready(b3.clone()), vec![]);
         app.enqueue_for_execution(4, ExecSource::Ready(b4), vec![]);
         assert_eq!(
@@ -9028,7 +9105,7 @@ mod exec_dispatch_tests {
         assert_eq!(mempool.committed_unexecuted_normal(), 1);
 
         // `execution_loop` fail-stop, step 1 (its `rx` is still alive).
-        mempool.clear_exec_backlog();
+        mempool.close_exec_backlog();
         assert_eq!(mempool.committed_unexecuted_normal(), 0);
 
         let b2 = block(2, vec![signed(82, t), signed(83, t)]);
@@ -16945,6 +17022,7 @@ mod crash_recovery_tests {
                 torus_block: b.clone(),
                 pending_slashes: vec![],
                 durable,
+                committed_unexecuted: 0,
             };
             if tx.send(msg).is_err() {
                 break; // the loop already exited
@@ -17083,6 +17161,42 @@ mod crash_recovery_tests {
         handle.join().unwrap();
     }
 
+    /// Knob off, exec thread: the real `execution_loop` executes every block
+    /// and exits without touching the counter (each block carries 0).
+    #[test]
+    fn exec_aware_off_execution_loop_touches_nothing() {
+        let blocks = pipeline_fixture_blocks();
+        let (_c, db) = make_test_config_and_db();
+        fund_pipeline_fixture(&db);
+        let mempool = Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig {
+                native_admission_horizon_ms: 20_000,
+                native_admission_exec_aware: false,
+                ..Default::default()
+            },
+        ));
+        let mut app = TorusApp::stub_on(db.clone());
+        app.mempool = Some(mempool.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        app.replace_exec_tx(tx);
+        for b in &blocks {
+            app.enqueue_for_execution(b.header.height, ExecSource::Ready(b.clone()), vec![]);
+        }
+        assert!(normal_actions(&blocks) > 0);
+        let mut ctx = pipeline_ctx(&db, false, None);
+        ctx.mempool = Some(mempool.clone());
+        ctx.exec_shutdown.store(true, Ordering::SeqCst);
+        let latch = ctx.exec_failed.clone();
+        let handle = std::thread::spawn(move || execution_loop(rx, ctx));
+        let top = blocks.len() as u64;
+        assert!(wait_executed_and_released(&db, &mempool, top));
+        drop(app); // closes the channel; the loop exits (its teardown too)
+        handle.join().unwrap();
+        assert!(!latch.load(Ordering::SeqCst));
+        assert_eq!(mempool.exec_backlog_touches(), 0, "off: counter touched");
+    }
+
     /// Poll (bounded) until `top` is applied and nothing is counted.
     fn wait_executed_and_released(db: &StateDb, mempool: &Mempool, top: u64) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -17110,15 +17224,18 @@ mod crash_recovery_tests {
         let latch = ctx.exec_failed.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
         for b in &blocks[..5] {
-            // What `dispatch_to_exec` does: count, then send.
-            mempool.note_exec_dispatched(b.header.height, &b.native_actions);
+            // What `dispatch_to_exec` does: count, send with the count.
+            let committed_unexecuted =
+                mempool.note_exec_committed(b.header.height, &b.native_actions);
             let durable = persist_committed_block_durably(&db, b);
             tx.send(CommittedBlockMsg {
                 torus_block: b.clone(),
                 pending_slashes: vec![],
                 durable,
+                committed_unexecuted,
             })
             .unwrap();
+            mempool.note_exec_sent(b.header.height);
         }
         assert_eq!(
             mempool.committed_unexecuted_normal(),
@@ -17167,9 +17284,13 @@ mod crash_recovery_tests {
         assert_eq!(mempool.committed_unexecuted_normal(), 0);
 
         // Live blocks after the replay: counted at dispatch, released by the
-        // loop.
+        // loop. The channel swap detaches the app's own exec thread, whose
+        // exit tears its counter down for good (terminal close), so the live
+        // part runs on a fresh pool the detached thread never saw.
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         app.replace_exec_tx(tx);
+        let mempool = exec_aware_mempool(&db);
+        app.mempool = Some(mempool.clone());
         for b in &blocks[6..] {
             app.enqueue_for_execution(b.header.height, ExecSource::Ready(b.clone()), vec![]);
         }

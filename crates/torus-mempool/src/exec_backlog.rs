@@ -4,144 +4,258 @@
 //! the execution thread, before they execute. With the exec channel holding up
 //! to [`crate::rate_limit::EXEC_QUEUE_DEPTH`] blocks (plus rank-2 parks), that
 //! committed-but-unexecuted work is invisible to the pooled-backlog check.
-//! [`ExecBacklog`] counts it per height so admission can add it to the pooled
-//! normal entries.
+//! [`ExecBacklog`] counts it so admission can add it to the pooled normal
+//! entries.
 //!
-//! Invariants: the total equals the sum of the outstanding heights; a height
-//! is counted at most once; finishing height `h` releases every height at or
-//! below `h` (execution is strictly in height order), and a height at or below
-//! the finished watermark is never counted again. So the total never goes
-//! negative and cannot leak upward through a skipped or re-delivered height.
+//! Thread roles:
+//! - the dispatcher (the consensus thread, the only caller of
+//!   [`ExecBacklog::register`] / [`ExecBacklog::sent`]) counts a committed
+//!   height once, when it is first materialized for execution (sent or
+//!   parked), and hands its count to the exec thread with the block;
+//! - the exec thread releases that count after executing the block
+//!   ([`ExecBacklog::release`]): one CAS on an atomic, never a lock, so it
+//!   can never wait on the dispatcher;
+//! - admission readers load the atomic total.
+//!
+//! Invariants: the total equals the sum of the counts of the registered
+//! heights not yet sent plus the counts carried by blocks sent but not yet
+//! released; a height is counted at most once (idempotent registration, and
+//! a height at or below the sent watermark never counts again); the scan
+//! that counts a block's actions runs with no lock held; [`ExecBacklog::close`]
+//! is terminal: it zeroes the total and every later registration or release
+//! is a no-op, so a dispatch racing the pipeline teardown cannot leak.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Committed-but-unexecuted normal native actions, per dispatched height.
+/// High bit of [`ExecBacklog::state`]: the execution pipeline is gone.
+const CLOSED: usize = 1 << (usize::BITS - 1);
+
+/// Committed-but-unexecuted normal native actions.
 #[derive(Default)]
 pub struct ExecBacklog {
-    inner: Mutex<Inner>,
-    /// Lock-free mirror of `Inner::sum` for the admission hot path.
-    total: AtomicUsize,
+    /// Outstanding total in the low bits, [`CLOSED`] once torn down. The only
+    /// state the exec thread and admission readers touch.
+    state: AtomicUsize,
+    /// Dispatcher only: registered heights not yet sent. The exec thread
+    /// never takes this lock.
+    pending: Mutex<Pending>,
+    /// Every scan, lock or total update (knob-off zero-cost evidence: the
+    /// mempool never reaches this type with the knob off).
+    touches: AtomicUsize,
 }
 
 #[derive(Default)]
-struct Inner {
+struct Pending {
     by_height: BTreeMap<u64, usize>,
-    sum: usize,
-    /// Highest height reported executed (this process).
-    finished_through: Option<u64>,
+    /// Highest height handed to the exec channel (this process).
+    sent_through: Option<u64>,
 }
 
 impl ExecBacklog {
-    /// Count `height` as dispatched to execution with `count()` normal
-    /// actions. A no-op (and `count` is not called) when `height` is already
-    /// counted or at or below the finished watermark. `publish` gets the new
-    /// total under the lock, so a gauge never goes stale.
-    pub fn dispatched(
+    /// Dispatcher: `height` is committed and materialized for execution
+    /// (about to be sent, or parked). Counts it with `count()` and returns
+    /// its count, which the block carries to the exec thread. Idempotent: an
+    /// already-registered height returns its count without rescanning. A
+    /// height at or below the sent watermark, or any height after
+    /// [`Self::close`], is a no-op returning 0 (`count` not called).
+    ///
+    /// `count` runs with NO lock held; the critical sections are map
+    /// lookups/inserts. `publish` gets the change to the total.
+    pub fn register(
         &self,
         height: u64,
         count: impl FnOnce() -> usize,
-        publish: impl FnOnce(usize),
-    ) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.finished_through.is_some_and(|done| height <= done)
-            || inner.by_height.contains_key(&height)
+        publish: impl FnOnce(i64),
+    ) -> usize {
+        self.touch();
+        if self.is_closed() {
+            return 0;
+        }
         {
-            return;
+            let pending = self.pending.lock().unwrap();
+            if pending.sent_through.is_some_and(|s| height <= s) {
+                return 0;
+            }
+            if let Some(&n) = pending.by_height.get(&height) {
+                return n;
+            }
         }
         let n = count();
-        inner.by_height.insert(height, n);
-        inner.sum = inner.sum.saturating_add(n);
-        self.total.store(inner.sum, Ordering::Relaxed);
-        publish(inner.sum);
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(&counted) = pending.by_height.get(&height) {
+            return counted; // a concurrent registrant won (single-dispatcher callers never get here)
+        }
+        if !self.add(n) {
+            return 0; // torn down during the scan
+        }
+        pending.by_height.insert(height, n);
+        if n > 0 {
+            publish(n as i64);
+        }
+        n
     }
 
-    /// Execution of `height` finished (or was abandoned at it): release every
-    /// counted height at or below it.
-    pub fn finished_through(&self, height: u64, publish: impl FnOnce(usize)) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.finished_through = Some(inner.finished_through.map_or(height, |d| d.max(height)));
-        // Heights above `height` stay; everything at or below is done.
-        let above = match height.checked_add(1) {
-            Some(next) => inner.by_height.split_off(&next),
-            None => BTreeMap::new(),
-        };
-        let done = std::mem::replace(&mut inner.by_height, above);
-        if done.is_empty() {
+    /// Dispatcher: `height` entered the exec channel; its count now rides
+    /// the block (released by [`Self::release`]). Raises the sent watermark.
+    /// A registered height below it can never be sent any more (execution is
+    /// strictly in height order): its count is dropped here.
+    pub fn sent(&self, height: u64, publish: impl FnOnce(i64)) {
+        self.touch();
+        let mut pending = self.pending.lock().unwrap();
+        pending.by_height.remove(&height);
+        pending.sent_through = Some(pending.sent_through.map_or(height, |s| s.max(height)));
+        if pending
+            .by_height
+            .first_key_value()
+            .is_some_and(|(&low, _)| low < height)
+        {
+            let above = pending.by_height.split_off(&height);
+            let stale = std::mem::replace(&mut pending.by_height, above);
+            let n: usize = stale.values().sum();
+            if n > 0 && self.sub(n) {
+                publish(-(n as i64));
+            }
+        }
+    }
+
+    /// Exec thread: a block carrying `n` (its [`Self::register`] count) was
+    /// executed or abandoned. Lock-free: a single CAS loop on the total; a
+    /// no-op after [`Self::close`].
+    pub fn release(&self, n: usize, publish: impl FnOnce(i64)) {
+        if n == 0 {
             return;
         }
-        let released: usize = done.values().sum();
-        inner.sum = inner.sum.saturating_sub(released);
-        self.total.store(inner.sum, Ordering::Relaxed);
-        publish(inner.sum);
+        self.touch();
+        if self.sub(n) {
+            publish(-(n as i64));
+        }
     }
 
-    /// Drop every outstanding height (the execution pipeline is gone).
-    pub fn clear(&self, publish: impl FnOnce(usize)) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.by_height.clear();
-        inner.sum = 0;
-        self.total.store(0, Ordering::Relaxed);
-        publish(0);
+    /// The execution pipeline is gone (fail-stop, closed channel): zero the
+    /// total, TERMINALLY. Lock-free (the exec thread calls it); every later
+    /// registration or release is a no-op.
+    pub fn close(&self, publish: impl FnOnce(i64)) {
+        self.touch();
+        let prev = self.state.swap(CLOSED, Ordering::Relaxed);
+        if prev & CLOSED == 0 && prev > 0 {
+            publish(-(prev as i64));
+        }
     }
 
-    /// Committed-but-unexecuted normal actions now.
+    /// Committed-but-unexecuted normal actions now (0 once closed).
     pub fn outstanding(&self) -> usize {
-        self.total.load(Ordering::Relaxed)
+        let s = self.state.load(Ordering::Relaxed);
+        if s & CLOSED != 0 {
+            0
+        } else {
+            s
+        }
     }
 
-    /// Heights currently counted (tests, diagnostics).
-    pub fn outstanding_heights(&self) -> usize {
-        self.inner.lock().unwrap().by_height.len()
+    /// Registered heights not yet sent (tests, diagnostics; 0 once closed).
+    pub fn pending_heights(&self) -> usize {
+        if self.is_closed() {
+            return 0;
+        }
+        self.pending.lock().unwrap().by_height.len()
+    }
+
+    /// Scans, locks and total updates so far (tests: knob-off zero cost).
+    pub fn touches(&self) -> usize {
+        self.touches.load(Ordering::Relaxed)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Relaxed) & CLOSED != 0
+    }
+
+    fn touch(&self) {
+        self.touches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add `n` unless closed (atomic with [`Self::close`]).
+    fn add(&self, n: usize) -> bool {
+        self.state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                (s & CLOSED == 0).then(|| s.saturating_add(n).min(CLOSED - 1))
+            })
+            .is_ok()
+    }
+
+    /// Subtract `n` unless closed (atomic with [`Self::close`]).
+    fn sub(&self, n: usize) -> bool {
+        self.state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                (s & CLOSED == 0).then(|| s.saturating_sub(n))
+            })
+            .is_ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
-    fn nop(_: usize) {}
+    fn nop(_: i64) {}
 
     #[test]
-    fn counts_dispatch_and_releases_on_finish() {
+    fn counts_registration_and_releases_what_the_block_carries() {
         let b = ExecBacklog::default();
-        b.dispatched(5, || 10, nop);
-        b.dispatched(6, || 7, nop);
+        let n5 = b.register(5, || 10, nop);
+        let n6 = b.register(6, || 7, nop);
+        assert_eq!((n5, n6), (10, 7));
         assert_eq!(b.outstanding(), 17);
-        b.finished_through(5, nop);
+        b.sent(5, nop);
+        b.sent(6, nop);
+        assert_eq!(b.outstanding(), 17, "sent, not executed");
+        assert_eq!(b.pending_heights(), 0);
+        b.release(n5, nop);
         assert_eq!(b.outstanding(), 7);
-        b.finished_through(6, nop);
+        b.release(n6, nop);
         assert_eq!(b.outstanding(), 0);
-        assert_eq!(b.outstanding_heights(), 0);
     }
 
     #[test]
-    fn dispatch_is_idempotent_per_height_and_skips_counting() {
+    fn registration_is_idempotent_per_height_and_skips_counting() {
         let b = ExecBacklog::default();
-        b.dispatched(3, || 4, nop);
-        // A rank-2 retry of the same height: not counted, `count` not run.
-        b.dispatched(3, || panic!("recounted a counted height"), nop);
+        assert_eq!(b.register(3, || 4, nop), 4);
+        // A rank-2 retry / park of the same height: not counted, `count` not
+        // run, and the same count is handed back for the send.
+        assert_eq!(
+            b.register(3, || panic!("recounted a counted height"), nop),
+            4
+        );
         assert_eq!(b.outstanding(), 4);
+        assert_eq!(b.pending_heights(), 1);
     }
 
     #[test]
-    fn finish_sweeps_lower_heights_and_watermark_blocks_late_adds() {
+    fn sent_watermark_blocks_late_registrations() {
         let b = ExecBacklog::default();
-        b.dispatched(1, || 2, nop);
-        b.dispatched(2, || 3, nop);
-        b.dispatched(4, || 5, nop);
-        // Finishing 3 (never counted) releases 1 and 2, keeps 4.
-        b.finished_through(3, nop);
+        let n = b.register(4, || 5, nop);
+        b.sent(4, nop);
+        assert_eq!(b.register(4, || panic!("recounted a sent height"), nop), 0);
+        assert_eq!(
+            b.register(2, || panic!("counted below the watermark"), nop),
+            0
+        );
         assert_eq!(b.outstanding(), 5);
-        // A stale dispatch at or below the watermark never counts.
-        b.dispatched(2, || panic!("counted below the watermark"), nop);
-        b.dispatched(3, || panic!("counted at the watermark"), nop);
-        assert_eq!(b.outstanding(), 5);
-        // A lower finish does not lower the watermark or touch 4.
-        b.finished_through(1, nop);
-        assert_eq!(b.outstanding(), 5);
-        b.finished_through(4, nop);
+        b.release(n, nop);
+        assert_eq!(b.outstanding(), 0);
+    }
+
+    #[test]
+    fn sending_past_a_registered_height_drops_its_count() {
+        let b = ExecBacklog::default();
+        b.register(2, || 3, nop);
+        let n = b.register(3, || 4, nop);
+        b.sent(3, nop); // 2 can never be sent now
+        assert_eq!(b.outstanding(), 4);
+        assert_eq!(b.pending_heights(), 0);
+        b.release(n, nop);
         assert_eq!(b.outstanding(), 0);
     }
 
@@ -151,12 +265,34 @@ mod tests {
     #[test]
     fn clear_is_terminal_later_heights_never_count() {
         let b = ExecBacklog::default();
-        b.dispatched(7, || 9, nop);
-        b.dispatched(8, || 1, nop);
-        b.clear(nop);
+        b.register(7, || 9, nop);
+        let n8 = b.register(8, || 1, nop);
+        b.sent(7, nop);
+        b.close(nop);
         assert_eq!(b.outstanding(), 0);
-        assert_eq!(b.outstanding_heights(), 0);
-        b.dispatched(9, || panic!("scanned after the teardown"), nop);
+        assert_eq!(b.pending_heights(), 0);
+        assert_eq!(
+            b.register(9, || panic!("scanned after the teardown"), nop),
+            0
+        );
+        b.release(n8, nop); // a late release cannot underflow or reopen
+        assert_eq!(b.outstanding(), 0);
+    }
+
+    /// Codex r1 finding 2: a close landing DURING a registration's scan wins:
+    /// the scanned count is not added.
+    #[test]
+    fn close_during_the_scan_wins() {
+        let b = ExecBacklog::default();
+        let n = b.register(
+            1,
+            || {
+                b.close(nop);
+                6
+            },
+            nop,
+        );
+        assert_eq!(n, 0);
         assert_eq!(b.outstanding(), 0);
     }
 
@@ -169,13 +305,14 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
         let b = std::sync::Arc::new(ExecBacklog::default());
-        b.dispatched(1, || 5, nop);
+        let n1 = b.register(1, || 5, nop);
+        b.sent(1, nop);
         let (in_scan_tx, in_scan_rx) = mpsc::channel::<()>();
         let (resume_tx, resume_rx) = mpsc::channel::<()>();
         let registrar = {
             let b = b.clone();
             std::thread::spawn(move || {
-                b.dispatched(
+                b.register(
                     2,
                     || {
                         in_scan_tx.send(()).unwrap();
@@ -193,7 +330,7 @@ mod tests {
         let exec = {
             let b = b.clone();
             std::thread::spawn(move || {
-                b.finished_through(1, nop);
+                b.release(n1, nop);
                 done_tx.send(()).unwrap();
             })
         };
@@ -208,27 +345,62 @@ mod tests {
         assert_eq!(b.outstanding(), 3);
     }
 
+    /// The scan also runs outside the pending-map lock: a diagnostic read
+    /// of the map completes while a registration is paused mid-scan.
     #[test]
-    fn publish_sees_the_new_total() {
-        let b = ExecBacklog::default();
-        let seen = std::cell::Cell::new(usize::MAX);
-        b.dispatched(1, || 6, |t| seen.set(t));
-        assert_eq!(seen.get(), 6);
-        b.dispatched(2, || 4, |t| seen.set(t));
-        assert_eq!(seen.get(), 10);
-        b.finished_through(1, |t| seen.set(t));
-        assert_eq!(seen.get(), 4);
-        b.clear(|t| seen.set(t));
-        assert_eq!(seen.get(), 0);
+    fn scan_holds_no_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let b = std::sync::Arc::new(ExecBacklog::default());
+        let (in_scan_tx, in_scan_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let registrar = {
+            let b = b.clone();
+            std::thread::spawn(move || {
+                b.register(
+                    1,
+                    || {
+                        in_scan_tx.send(()).unwrap();
+                        let _ = resume_rx.recv_timeout(Duration::from_secs(5));
+                        2
+                    },
+                    nop,
+                )
+            })
+        };
+        in_scan_rx.recv().unwrap();
+        let unlocked = b.pending.try_lock().is_ok();
+        let _ = resume_tx.send(());
+        assert_eq!(registrar.join().unwrap(), 2);
+        assert!(unlocked, "the scan held the pending-map lock");
     }
 
-    /// Property: over random interleavings of in-order dispatches (with
-    /// re-dispatch retries and stale re-deliveries), in-order finishes
-    /// (sometimes of uncounted heights) and clears, the total always equals
-    /// the sum over a reference model of outstanding heights, and ends at 0
-    /// once everything is finished.
     #[test]
-    fn total_equals_sum_of_outstanding_under_random_sequences() {
+    fn publish_sees_every_change_and_sums_to_the_total() {
+        let b = ExecBacklog::default();
+        let gauge = std::cell::Cell::new(0i64);
+        let add = |d: i64| gauge.set(gauge.get() + d);
+        let n1 = b.register(1, || 6, add);
+        assert_eq!(gauge.get(), 6);
+        b.register(2, || 4, add);
+        assert_eq!(gauge.get(), 10);
+        b.sent(1, add);
+        b.release(n1, add);
+        assert_eq!(gauge.get(), 4);
+        b.close(add);
+        assert_eq!(gauge.get(), 0);
+        b.register(3, || 9, add);
+        assert_eq!(gauge.get(), 0);
+    }
+
+    /// Property: over random sequences of in-order registrations (with
+    /// park re-registrations and stale re-deliveries), in-order sends,
+    /// FIFO releases (as the exec channel delivers) and a rare terminal
+    /// close, the total always equals the reference model (pending counts
+    /// plus in-flight counts, 0 once closed), and ends at 0 once everything
+    /// is sent and released.
+    #[test]
+    fn total_equals_model_under_random_sequences() {
         let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move || {
             rng ^= rng << 13;
@@ -238,78 +410,139 @@ mod tests {
         };
         for _case in 0..200 {
             let b = ExecBacklog::default();
-            let mut model: BTreeMap<u64, usize> = BTreeMap::new();
-            let mut watermark: Option<u64> = None;
-            let mut dispatched_to = 0u64; // highest height dispatched
+            let mut pending: BTreeMap<u64, usize> = BTreeMap::new();
+            let mut in_flight: VecDeque<usize> = VecDeque::new();
+            let mut sent_through = 0u64;
+            let mut registered_to = 0u64;
+            let mut closed = false;
             for _step in 0..300 {
                 match next() % 10 {
-                    // New height (strictly ascending, maybe with a gap).
+                    // A newly committed height (ascending, maybe parked).
                     0..=3 => {
-                        let h = dispatched_to + 1 + next() % 2;
+                        let h = registered_to + 1;
                         let n = (next() % 50) as usize;
-                        b.dispatched(h, || n, nop);
-                        if watermark.is_none_or(|w| h > w) {
-                            model.entry(h).or_insert(n);
+                        let got = b.register(h, || n, nop);
+                        if closed {
+                            assert_eq!(got, 0);
+                        } else {
+                            assert_eq!(got, n);
+                            pending.insert(h, n);
                         }
-                        dispatched_to = h;
+                        registered_to = h;
                     }
                     // Retry / re-delivery of an already-seen height.
                     4 => {
-                        if dispatched_to > 0 {
-                            let h = 1 + next() % dispatched_to;
-                            b.dispatched(h, || 1_000_000, nop);
-                            if watermark.is_none_or(|w| h > w) && !model.contains_key(&h) {
-                                model.insert(h, 1_000_000);
-                            }
+                        if registered_to > 0 {
+                            let h = 1 + next() % registered_to;
+                            let got = b.register(h, || 1_000_000, nop);
+                            let want = if closed || h <= sent_through {
+                                0
+                            } else {
+                                pending[&h]
+                            };
+                            assert_eq!(got, want);
                         }
                     }
-                    // Execution finishes the next outstanding height, or a
-                    // height in between (a skipped / uncounted block).
-                    5..=8 => {
-                        let lo = watermark.map_or(1, |w| w + 1);
-                        if lo <= dispatched_to {
-                            let h = lo + next() % (dispatched_to - lo + 1).min(3);
-                            b.finished_through(h, nop);
-                            model.retain(|k, _| *k > h);
-                            watermark = Some(watermark.map_or(h, |w| w.max(h)));
+                    // Send the lowest pending height.
+                    5 | 6 => {
+                        if let Some((&h, &n)) = pending.first_key_value() {
+                            pending.remove(&h);
+                            b.sent(h, nop);
+                            sent_through = h;
+                            in_flight.push_back(n);
                         }
                     }
-                    // Pipeline teardown.
+                    // Execute the oldest in-flight block.
+                    7 | 8 => {
+                        if let Some(n) = in_flight.pop_front() {
+                            b.release(n, nop);
+                        }
+                    }
+                    // Pipeline teardown (rare, terminal).
                     _ => {
-                        if next() % 8 == 0 {
-                            b.clear(nop);
-                            model.clear();
+                        if next() % 16 == 0 {
+                            b.close(nop);
+                            closed = true;
+                            pending.clear();
                         }
                     }
                 }
-                assert_eq!(b.outstanding(), model.values().sum::<usize>());
-                assert_eq!(b.outstanding_heights(), model.len());
+                let model = if closed {
+                    0
+                } else {
+                    pending.values().sum::<usize>() + in_flight.iter().sum::<usize>()
+                };
+                assert_eq!(b.outstanding(), model);
+                if !closed {
+                    assert_eq!(b.pending_heights(), pending.len());
+                }
             }
-            b.finished_through(dispatched_to, nop);
-            assert_eq!(b.outstanding(), 0, "leaked after finishing everything");
+            while let Some((&h, &n)) = pending.first_key_value() {
+                pending.remove(&h);
+                b.sent(h, nop);
+                in_flight.push_back(n);
+            }
+            while let Some(n) = in_flight.pop_front() {
+                b.release(n, nop);
+            }
+            assert_eq!(b.outstanding(), 0, "leaked after executing everything");
         }
     }
 
     #[test]
-    fn concurrent_dispatch_and_finish_end_at_zero() {
+    fn concurrent_dispatch_and_release_end_at_zero() {
         let b = std::sync::Arc::new(ExecBacklog::default());
-        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(8);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(8);
         let exec = {
             let b = b.clone();
             std::thread::spawn(move || {
-                while let Ok(h) = rx.recv() {
-                    b.finished_through(h, nop);
+                while let Ok(n) = rx.recv() {
+                    b.release(n, nop);
                 }
             })
         };
         for h in 1..=5_000u64 {
-            // Counted BEFORE the send, as dispatch does.
-            b.dispatched(h, || (h % 17) as usize, nop);
-            tx.send(h).unwrap();
+            // Registered BEFORE the send, its count riding the block.
+            let n = b.register(h, || (h % 17) as usize, nop);
+            tx.send(n).unwrap();
+            b.sent(h, nop);
         }
         drop(tx);
         exec.join().unwrap();
         assert_eq!(b.outstanding(), 0);
-        assert_eq!(b.outstanding_heights(), 0);
+        assert_eq!(b.pending_heights(), 0);
+    }
+
+    /// A close racing a live dispatcher + exec thread: the total ends at 0
+    /// and stays there.
+    #[test]
+    fn concurrent_close_never_leaks() {
+        for _ in 0..50 {
+            let b = std::sync::Arc::new(ExecBacklog::default());
+            let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(4);
+            let exec = {
+                let b = b.clone();
+                std::thread::spawn(move || {
+                    let mut seen = 0;
+                    while let Ok(n) = rx.recv() {
+                        b.release(n, nop);
+                        seen += 1;
+                        if seen == 20 {
+                            b.close(nop); // fail-stop; rx still alive
+                        }
+                    }
+                })
+            };
+            for h in 1..=200u64 {
+                let n = b.register(h, || 3, nop);
+                if tx.send(n).is_err() {
+                    break;
+                }
+                b.sent(h, nop);
+            }
+            drop(tx);
+            exec.join().unwrap();
+            assert_eq!(b.outstanding(), 0);
+        }
     }
 }

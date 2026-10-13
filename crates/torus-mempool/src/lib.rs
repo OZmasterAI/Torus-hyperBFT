@@ -377,16 +377,20 @@ impl Mempool {
         self.config.native_admission_exec_aware && self.config.native_admission_horizon_ms != 0
     }
 
-    /// Consensus thread, right before a committed block enters the exec
-    /// channel: count its normal actions (cancels and oracle submissions are
-    /// not admission backlog, as in the pool) as committed-but-unexecuted.
-    /// Idempotent per height (a rank-2 retry is not recounted). No-op with
-    /// exec-aware admission off.
-    pub fn note_exec_dispatched(&self, height: u64, actions: &[SignedNativeAction]) {
+    /// Consensus thread: a committed block is materialized for execution
+    /// (about to be sent to the exec channel, or parked behind a full head or
+    /// a hole). Counts its normal actions (cancels and oracle submissions are
+    /// not admission backlog, as in the pool) as committed-but-unexecuted and
+    /// returns that count; the block carries it to the exec thread, which
+    /// hands it to [`Self::note_exec_released`]. Idempotent per height (a
+    /// retry or re-park returns the same count, no rescan). The scan runs
+    /// with no lock held. Returns 0 and touches nothing with exec-aware
+    /// admission off.
+    pub fn note_exec_committed(&self, height: u64, actions: &[SignedNativeAction]) -> usize {
         if !self.exec_aware_admission() {
-            return;
+            return 0;
         }
-        self.exec_backlog.dispatched(
+        self.exec_backlog.register(
             height,
             || {
                 actions
@@ -394,28 +398,41 @@ impl Mempool {
                     .filter(|a| !native_pool::is_priority(&a.action))
                     .count()
             },
-            |total| self.publish_committed_unexecuted(total),
-        );
+            |delta| self.publish_committed_unexecuted(delta),
+        )
     }
 
-    /// Exec thread, after it finished (or abandoned) `height`: release every
-    /// counted height at or below it.
-    pub fn note_exec_finished(&self, height: u64) {
+    /// Consensus thread: `height` entered the exec channel (its count rides
+    /// the block). No-op with exec-aware admission off.
+    pub fn note_exec_sent(&self, height: u64) {
         if !self.exec_aware_admission() {
             return;
         }
         self.exec_backlog
-            .finished_through(height, |total| self.publish_committed_unexecuted(total));
+            .sent(height, |delta| self.publish_committed_unexecuted(delta));
+    }
+
+    /// Exec thread: a block carrying `count` (from [`Self::note_exec_committed`])
+    /// was executed or abandoned. Lock-free (one CAS); never waits on the
+    /// consensus thread. `count` is 0 with the knob off: a no-op.
+    pub fn note_exec_released(&self, count: usize) {
+        if count == 0 || !self.exec_aware_admission() {
+            return;
+        }
+        self.exec_backlog
+            .release(count, |delta| self.publish_committed_unexecuted(delta));
     }
 
     /// The execution pipeline is gone (fail-stop, closed channel): drop all
-    /// committed-but-unexecuted counts.
-    pub fn clear_exec_backlog(&self) {
+    /// committed-but-unexecuted counts, TERMINALLY: every later registration
+    /// is a no-op, so a dispatch racing the teardown cannot leak a count.
+    /// Lock-free. No-op with exec-aware admission off.
+    pub fn close_exec_backlog(&self) {
         if !self.exec_aware_admission() {
             return;
         }
         self.exec_backlog
-            .clear(|total| self.publish_committed_unexecuted(total));
+            .close(|delta| self.publish_committed_unexecuted(delta));
     }
 
     /// Committed normal actions dispatched to execution but not yet executed
@@ -424,11 +441,18 @@ impl Mempool {
         self.exec_backlog.outstanding()
     }
 
-    /// Called under the counter's lock, so a stale total never overwrites
-    /// a newer one.
-    fn publish_committed_unexecuted(&self, total: usize) {
+    /// How often the exec-aware counter was touched (scan, lock or update).
+    /// Stays 0 with the knob off (tests: zero cost on both threads).
+    pub fn exec_backlog_touches(&self) -> usize {
+        self.exec_backlog.touches()
+    }
+
+    /// Applies a change to the gauge. Every change is tied to one atomic
+    /// update of the total, so the gauge equals the total once quiescent
+    /// without publishing under a lock.
+    fn publish_committed_unexecuted(&self, delta: i64) {
         if let Some(m) = self.metrics.get() {
-            m.mempool_native_committed_unexecuted.set(total as i64);
+            m.mempool_native_committed_unexecuted.inc_by(delta);
         }
     }
 
@@ -3130,15 +3154,19 @@ mod tests {
                     pool.add_native_action_presigned(address_from_key(&k), order_batch(&k, t0, 1))
                         .unwrap();
                 }
-                pool.note_exec_dispatched(7, &committed_body(1, committed_orders, 2));
+                let n = pool.note_exec_committed(7, &committed_body(1, committed_orders, 2));
+                assert_eq!(n, 0, "off: nothing carried to the exec thread");
+                pool.note_exec_sent(7);
                 assert_eq!(pool.committed_unexecuted_normal(), 0, "off: not tracked");
                 assert_eq!(
                     pool.native_admission_backlogged(),
                     pooled >= 4,
                     "off: pooled {pooled}, committed {committed_orders}"
                 );
-                pool.note_exec_finished(7);
+                pool.note_exec_released(n);
+                pool.close_exec_backlog();
                 assert_eq!(pool.native_admission_backlogged(), pooled >= 4);
+                assert_eq!(pool.exec_backlog_touches(), 0, "off: never touched");
             }
         }
     }
@@ -3157,27 +3185,30 @@ mod tests {
         assert!(!pool.native_admission_backlogged(), "1 pooled < 4");
 
         // Height 10: 2 orders + 5 cancels committed -> 2 counted (1 + 2 < 4).
-        pool.note_exec_dispatched(10, &committed_body(1, 2, 5));
+        let n10 = pool.note_exec_committed(10, &committed_body(1, 2, 5));
+        assert_eq!(n10, 2);
+        pool.note_exec_sent(10);
         assert_eq!(pool.committed_unexecuted_normal(), 2);
         assert!(!pool.native_admission_backlogged());
         // Height 11: 1 more order -> 1 pooled + 3 committed = 4: shed.
-        pool.note_exec_dispatched(11, &committed_body(30, 1, 0));
+        let n11 = pool.note_exec_committed(11, &committed_body(30, 1, 0));
         assert_eq!(pool.committed_unexecuted_normal(), 3);
         assert!(pool.native_admission_backlogged());
-        // A rank-2 retry of 11 is not counted twice.
-        pool.note_exec_dispatched(11, &committed_body(30, 1, 0));
+        // A rank-2 retry of 11 is not counted twice; same count carried.
+        assert_eq!(pool.note_exec_committed(11, &committed_body(30, 1, 0)), n11);
         assert_eq!(pool.committed_unexecuted_normal(), 3);
+        pool.note_exec_sent(11);
 
-        pool.note_exec_finished(10);
+        pool.note_exec_released(n10);
         assert_eq!(pool.committed_unexecuted_normal(), 1);
         assert!(!pool.native_admission_backlogged());
-        pool.note_exec_finished(11);
+        pool.note_exec_released(n11);
         assert_eq!(pool.committed_unexecuted_normal(), 0);
 
         // Teardown path: dispatched work is dropped wholesale.
-        pool.note_exec_dispatched(12, &committed_body(40, 9, 0));
+        pool.note_exec_committed(12, &committed_body(40, 9, 0));
         assert!(pool.native_admission_backlogged());
-        pool.clear_exec_backlog();
+        pool.close_exec_backlog();
         assert_eq!(pool.committed_unexecuted_normal(), 0);
         assert!(!pool.native_admission_backlogged());
     }
@@ -3188,12 +3219,16 @@ mod tests {
     fn exec_aware_teardown_is_terminal() {
         let (_dir, state) = setup();
         let pool = Mempool::new(state, exec_aware_cfg(true, 10_000, 4));
-        pool.note_exec_dispatched(12, &committed_body(40, 9, 0));
+        pool.note_exec_committed(12, &committed_body(40, 9, 0));
         assert_eq!(pool.committed_unexecuted_normal(), 9);
-        pool.clear_exec_backlog();
+        pool.close_exec_backlog();
         assert_eq!(pool.committed_unexecuted_normal(), 0);
-        pool.note_exec_dispatched(13, &committed_body(60, 4, 0));
-        assert_eq!(pool.committed_unexecuted_normal(), 0, "counted after teardown");
+        pool.note_exec_committed(13, &committed_body(60, 4, 0));
+        assert_eq!(
+            pool.committed_unexecuted_normal(),
+            0,
+            "counted after teardown"
+        );
         assert!(!pool.native_admission_backlogged());
     }
 
@@ -3203,26 +3238,31 @@ mod tests {
     fn exec_aware_needs_the_admission_limit() {
         let (_dir, state) = setup();
         let pool = Mempool::new(state, exec_aware_cfg(true, 0, 0));
-        pool.note_exec_dispatched(3, &committed_body(1, 10, 0));
+        assert_eq!(pool.note_exec_committed(3, &committed_body(1, 10, 0)), 0);
         assert_eq!(pool.committed_unexecuted_normal(), 0);
+        assert_eq!(pool.exec_backlog_touches(), 0);
         assert!(!pool.native_admission_backlogged());
     }
 
-    /// The gauge follows the counter (set under the counter's lock).
+    /// The gauge follows the counter (every change applied as a delta).
     #[test]
     fn exec_aware_gauge_tracks_committed_unexecuted() {
         let (_dir, state) = setup();
         let pool = Mempool::new(state, exec_aware_cfg(true, 10_000, 4));
         let metrics = std::sync::Arc::new(torus_telemetry::Metrics::new());
         pool.set_metrics(metrics.clone());
-        pool.note_exec_dispatched(5, &committed_body(1, 3, 1));
+        let n5 = pool.note_exec_committed(5, &committed_body(1, 3, 1));
         assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 3);
-        pool.note_exec_dispatched(6, &committed_body(10, 2, 0));
+        let n6 = pool.note_exec_committed(6, &committed_body(10, 2, 0));
         assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 5);
-        pool.note_exec_finished(6);
+        pool.note_exec_sent(5);
+        pool.note_exec_sent(6);
+        pool.note_exec_released(n5);
+        pool.note_exec_released(n6);
         assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 0);
-        pool.note_exec_dispatched(7, &committed_body(20, 4, 0));
-        pool.clear_exec_backlog();
+        pool.note_exec_committed(7, &committed_body(20, 4, 0));
+        assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 4);
+        pool.close_exec_backlog();
         assert_eq!(metrics.mempool_native_committed_unexecuted.get(), 0);
         let text = metrics.encode();
         assert!(

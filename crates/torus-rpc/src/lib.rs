@@ -2128,7 +2128,8 @@ mod tests {
             })
             .collect();
         assert!(!mempool.native_admission_backlogged());
-        mempool.note_exec_dispatched(9, &committed);
+        let carried = mempool.note_exec_committed(9, &committed);
+        mempool.note_exec_sent(9);
         assert_eq!(mempool.native_pool_size(), 0, "the pool itself is empty");
         assert!(
             mempool.native_admission_backlogged(),
@@ -2193,7 +2194,7 @@ mod tests {
             .contains("busy"));
 
         // The committed block executes: admission opens again.
-        mempool.note_exec_finished(9);
+        mempool.note_exec_released(carried);
         assert!(!mempool.native_admission_backlogged());
         let results: Vec<RpcSubmitResult> = client
             .request(
