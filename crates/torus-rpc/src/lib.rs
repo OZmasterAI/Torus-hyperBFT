@@ -11,6 +11,7 @@ pub mod error;
 pub mod eth;
 pub mod ip_limit;
 pub mod net;
+pub(crate) mod scan;
 pub mod streams;
 pub mod torus;
 pub mod types;
@@ -287,6 +288,11 @@ pub struct RpcState {
     pub(crate) forward_bodies: bool,
     /// Admission control: cap concurrent submit_native_action calls.
     pub(crate) submit_semaphore: Arc<tokio::sync::Semaphore>,
+    /// R24: most rows one public read may examine
+    /// ([`scan::ENV_MAX_SCAN_ROWS`], default [`scan::DEFAULT_MAX_SCAN_ROWS`]).
+    pub(crate) max_scan_rows: usize,
+    /// R24: rows examined by bounded reads since start (all methods).
+    pub(crate) scan_rows_examined: Arc<AtomicU64>,
 }
 
 /// JSON-RPC server combining eth, net, and web3 namespaces.
@@ -362,10 +368,20 @@ impl RpcServer {
                 forward_evm_tx: None,
                 forward_bodies: false,
                 submit_semaphore: Arc::new(tokio::sync::Semaphore::new(SUBMIT_PERMITS)),
+                max_scan_rows: scan::resolve_max_scan_rows(
+                    std::env::var(scan::ENV_MAX_SCAN_ROWS).ok().as_deref(),
+                ),
+                scan_rows_examined: Arc::new(AtomicU64::new(0)),
             },
             ip_limiter: None,
             max_subs_per_conn: ip_limit::DEFAULT_MAX_SUBS_PER_CONN,
         })
+    }
+
+    /// R24: most rows one public read may examine (`0` = 1). Default from
+    /// `TORUS_RPC_MAX_SCAN_ROWS`, else [`scan::DEFAULT_MAX_SCAN_ROWS`].
+    pub fn set_max_scan_rows(&mut self, max: usize) {
+        self.state.max_scan_rows = max.max(1);
     }
 
     /// Install the per-IP weight limit (anti-spam item D).

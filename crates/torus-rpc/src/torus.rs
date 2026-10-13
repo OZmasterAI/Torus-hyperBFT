@@ -98,8 +98,14 @@ fn decode_market_row(key: &[u8], value: &[u8]) -> Option<(u64, u64, Vec<MarketTr
 #[rpc(server, namespace = "torus")]
 pub trait TorusApi {
     // --- 2.9.1: Trading reads ---
+    /// Aggregated levels, best first. `depth`: levels per side (default and
+    /// max [`crate::scan::ORDER_BOOK_MAX_LEVELS`]).
     #[method(name = "getOrderBook")]
-    async fn get_order_book(&self, market_id: String) -> RpcResult<RpcOrderBook>;
+    async fn get_order_book(
+        &self,
+        market_id: String,
+        depth: Option<u32>,
+    ) -> RpcResult<RpcOrderBook>;
 
     #[method(name = "getPosition")]
     async fn get_position(
@@ -1094,7 +1100,11 @@ const OPEN_ORDERS_LIMIT: usize = OPEN_ORDER_MAX_LIMIT as usize;
 impl TorusApiServer for RpcState {
     // === 2.9.1: Trading reads ===
 
-    async fn get_order_book(&self, market_id: String) -> RpcResult<RpcOrderBook> {
+    async fn get_order_book(
+        &self,
+        market_id: String,
+        _depth: Option<u32>,
+    ) -> RpcResult<RpcOrderBook> {
         let mid = parse_u64(&market_id).map_err(ErrorObjectOwned::from)?;
         let key = mid.to_be_bytes();
 

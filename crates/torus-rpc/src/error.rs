@@ -30,6 +30,12 @@ pub enum RpcError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// R24: a public read would examine more rows than one request may
+    /// (`TORUS_RPC_MAX_SCAN_ROWS`). The read stops at the limit instead of
+    /// scanning the whole table first.
+    #[error("query would read more than {limit} rows (TORUS_RPC_MAX_SCAN_ROWS); narrow it (e.g. pass a marketId) or use a node with a higher limit")]
+    ScanLimitExceeded { limit: usize },
+
     #[error("historical data unavailable: block {block} has been pruned. Connect to an archive node for historical queries.")]
     DataPruned { block: u64 },
 
@@ -59,7 +65,9 @@ impl From<RpcError> for ErrorObjectOwned {
             RpcError::BlockNotFound | RpcError::TxNotFound => {
                 ErrorObjectOwned::owned(-32001, err.to_string(), None::<()>)
             }
-            RpcError::TooManyResults { .. } | RpcError::BlockRangeTooLarge { .. } => {
+            RpcError::TooManyResults { .. }
+            | RpcError::BlockRangeTooLarge { .. }
+            | RpcError::ScanLimitExceeded { .. } => {
                 ErrorObjectOwned::owned(-32005, err.to_string(), None::<()>)
             }
             RpcError::DataPruned { .. } | RpcError::HistoricalStateUnavailable { .. } => {
