@@ -506,3 +506,174 @@ fn open_count_time_and_absorbed_deltas_are_accumulated() {
         assert_eq!(ctx.phase_accum.open_count_deltas, want, "scan {scan}");
     }
 }
+
+/// What happens to the counted context's book map (Codex r1 finding: the
+/// map is public; a counter built before the change must not diverge).
+#[derive(Clone, Copy, Debug)]
+enum MapChange {
+    /// The receiver's map is replaced by a donor context's counted books
+    /// (their logs drained into the donor's counter).
+    TransferIn,
+    /// Book 1 is replaced (`insert`) by its reload (a decoded book logs its
+    /// whole count).
+    ReplaceWithReload,
+    /// Book 1 is overwritten in place (`get_mut`) by its reload.
+    OverwriteWithReload,
+    /// Book 2 is removed from the map.
+    Remove,
+}
+
+/// `a` holds limit - 1 open orders (markets 1 and 2) in a context whose
+/// counter has absorbed them, the map then changes, and `a` places three
+/// more GTC bids. The cap decisions (and the final open count) with the
+/// counter must equal the book scan's: release-mode relevant (results, not
+/// only the debug cross-check).
+#[allow(clippy::type_complexity)]
+fn map_change_run(
+    mode: BookMode,
+    change: MapChange,
+    scan: bool,
+) -> ((Vec<(bool, FailureReason)>, usize), Option<(BTreeMap<Address, u32>, BTreeMap<Address, u32>)>) {
+    let limit = OPEN_ORDER_BASE_LIMIT as usize;
+    let (a, b) = (addr(1), addr(2));
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    // A count call that absorbs every book's log (b's IOC never rests).
+    let count_call = |ctx: &mut NativeExecContext| {
+        let ioc = params(1, false, 5_000, 1, OrderType::Limit, TimeInForce::IOC);
+        NativeExecutor::execute_batch(ctx, &[(b, NativeAction::PlaceOrder(ioc))]);
+    };
+    let reload = |book: &OrderBook| -> OrderBook {
+        borsh::from_slice(&borsh::to_vec(book).unwrap()).unwrap()
+    };
+    let mut ctx = ctx_at(&db, 1, mode, None);
+    ctx.test_open_count_scan = scan;
+    fund(&ctx, a, 100_000_000);
+    fund(&ctx, b, 100_000_000);
+    match change {
+        MapChange::TransferIn => {
+            let dir2 = tempfile::tempdir().unwrap();
+            let db2 = StateDb::open(dir2.path()).unwrap();
+            let mut donor = ctx_at(&db2, 1, mode, None);
+            donor.test_open_count_scan = scan;
+            fund(&donor, a, 100_000_000);
+            fund(&donor, b, 100_000_000);
+            rest_bids(&mut donor, a, limit - 1);
+            count_call(&mut donor);
+            // The receiver counted (empty books) before the transfer.
+            count_call(&mut ctx);
+            ctx.order_books = std::mem::take(&mut donor.order_books);
+            ctx.next_global_order_id = donor.next_global_order_id;
+        }
+        MapChange::ReplaceWithReload => {
+            rest_bids(&mut ctx, a, limit - 1);
+            count_call(&mut ctx);
+            let book = reload(&ctx.order_books[&1]);
+            ctx.order_books.insert(1, book);
+        }
+        MapChange::OverwriteWithReload => {
+            rest_bids(&mut ctx, a, limit - 1);
+            count_call(&mut ctx);
+            let book = reload(&ctx.order_books[&1]);
+            *ctx.order_books.get_mut(&1).unwrap() = book;
+        }
+        MapChange::Remove => {
+            rest_bids(&mut ctx, a, limit - 1);
+            count_call(&mut ctx);
+            ctx.order_books.remove(&2);
+        }
+    }
+    let mut out = Vec::new();
+    for price in [7, 6, 5] {
+        let r = NativeExecutor::execute(&mut ctx, &a, &NativeAction::PlaceOrder(gtc(1, true, price, 1)));
+        out.push((r.success, r.reason));
+    }
+    let open: usize = ctx.order_books.values().map(|b| b.open_order_count(&a)).sum();
+    let view = (!scan).then(|| ctx.open_count_view());
+    ((out, open), view)
+}
+
+/// Codex r1: transferring counted books into a counted context, replacing
+/// or overwriting a book with its reload, or removing a book, leaves the
+/// cap deciding exactly as the book scan, in every book mode.
+#[test]
+fn the_cap_follows_book_transfer_reload_and_removal() {
+    let limit = OPEN_ORDER_BASE_LIMIT as usize;
+    let mut diverged = Vec::new();
+    for mode in MODES {
+        for change in [
+            MapChange::TransferIn,
+            MapChange::ReplaceWithReload,
+            MapChange::OverwriteWithReload,
+            MapChange::Remove,
+        ] {
+            let ((want, want_open), _) = map_change_run(mode, change, true);
+            match change {
+                MapChange::Remove => {
+                    assert!(want.iter().all(|r| r.0), "{mode:?} {change:?}: {want:?}");
+                }
+                _ => {
+                    assert!(want[0].0, "{mode:?} {change:?}: one slot left: {want:?}");
+                    assert!(
+                        want[1..].iter().all(|r| !r.0 && r.1 == FailureReason::OpenLimit),
+                        "{mode:?} {change:?}: then at the limit: {want:?}"
+                    );
+                    assert_eq!(want_open, limit, "{mode:?} {change:?}");
+                }
+            }
+            let (got, view) = map_change_run(mode, change, false);
+            if got != (want.clone(), want_open) {
+                diverged.push(format!("{mode:?} {change:?}: {got:?} vs scan {:?}", (want, want_open)));
+            }
+            let (counter, books) = view.expect("counter run");
+            if counter != books {
+                diverged.push(format!("{mode:?} {change:?}: counter {counter:?} vs books {books:?}"));
+            }
+        }
+    }
+    assert!(diverged.is_empty(), "counter != book scan:\n{}", diverged.join("\n"));
+}
+
+/// Codex r1, resident books: a book removed after the last count and
+/// before the stash. The carried counter must still equal the books, and
+/// the next block's cap must decide as the book scan, in every book mode.
+#[test]
+fn the_carried_counter_follows_a_book_removed_before_the_stash() {
+    let limit = OPEN_ORDER_BASE_LIMIT as usize;
+    let a = addr(1);
+    let run = |mode: BookMode, scan: bool| -> Vec<(bool, FailureReason)> {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut holder = ResidentBooks::default();
+        let mut ctx = ctx_at(&db, 1, mode, Some(&mut holder));
+        ctx.test_open_count_scan = scan;
+        fund(&ctx, a, 100_000_000);
+        rest_bids(&mut ctx, a, limit - 1);
+        // A count: the counter absorbs the placements.
+        let r = NativeExecutor::execute(&mut ctx, &a, &NativeAction::PlaceOrder(gtc(1, true, 9, 1)));
+        assert!(r.success, "{mode:?}: the last slot");
+        ctx.order_books.remove(&2);
+        ctx.save_order_books();
+        ctx.stash_resident(&mut holder);
+        drop(ctx);
+        if !scan {
+            let (carried, rebuilt) = holder.open_count_view().expect("resident");
+            if let Some(carried) = carried {
+                assert_eq!(carried, rebuilt, "{mode:?}: carried counter");
+            }
+        }
+        let mut ctx = ctx_at(&db, 2, mode, Some(&mut holder));
+        ctx.test_open_count_scan = scan;
+        (0..3)
+            .map(|k| {
+                let r = NativeExecutor::execute(&mut ctx, &a, &NativeAction::PlaceOrder(gtc(1, true, 8 - k, 1)));
+                (r.success, r.reason)
+            })
+            .collect()
+    };
+    for mode in MODES {
+        let want = run(mode, true);
+        assert!(want.iter().all(|r| r.0), "{mode:?}: book 2's orders left with it: {want:?}");
+        assert_eq!(run(mode, false), want, "{mode:?}: counter != book scan");
+    }
+}
