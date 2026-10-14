@@ -596,6 +596,26 @@ Self-tests: `test_harness.py` (`test_in_flight_tail_*`,
 `test_commit_tail_cell_records_the_tail_mode`); bench crate
 `in_flight::tests` (`commit_tail_*`, `body_probe_*`, `tail_mode_*`).
 
+### Release timing lines (`release-timing*`, s121)
+
+With the cap on, bench.log also carries release-timing lines (format and
+field meanings: module doc of `tools/bench-throughput/src/release_timing.rs`).
+No extra RPC, no new lock on the send path.
+
+- Every 15 s from the tail, and once more at the end with `final=1`:
+  `release-timing: t=.. wall_ms=.. final=0 released=.. age_p50_ms=.. ...`
+  (release age = body seen minus action nonce; `wait_cap_*` / `wait_cancel_*`
+  = sender waits split by cap-full vs own cancel-all pending; `tail_*` = polls,
+  bodies per poll, poll duration, head lag in head mode), and
+  `release-timing-blocks: t=.. seen=<height>@<unix ms>,...`.
+  `torus_getBlockBody` has no commit timestamp: join `seen` with the node's
+  commit log offline for the commit-to-seen delay.
+- End of run, next to the `In-flight cap ...` line, one
+  `release-timing-hist: what=<age_ms|wait_cap_us|wait_cancel_us|tail_round_us|tail_fetched_per_round|tail_lag_heights> n= sum= p50= p90= p99= p999= max= buckets=<lo>:<count>,...`
+  per histogram (16 buckets per power of two, quantiles at most 6.25% low).
+
+summarize.py does not read them yet: `grep '^release-timing' bench.log`.
+
 ## New campaign from the template (per-cell write-up step, rerun queue)
 
 `campaign-template.sh` is the ozarchy-p3gate driver (`docs/perf/bench-archive/tools/`)

@@ -4256,6 +4256,9 @@ async fn run_consensus(
             h.abort();
         }
         println!("{}", c.report());
+        for line in c.timing_report() {
+            println!("{line}");
+        }
         if let Some(w) = in_flight::tail_warning(&c.tail, &c.url) {
             println!("{w}");
         }
