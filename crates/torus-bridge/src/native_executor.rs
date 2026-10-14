@@ -1137,32 +1137,26 @@ type SumsResult = Result<PosSums, ()>;
 /// Address length: a positions key's trader prefix.
 const TRADER_PREFIX: usize = 20;
 
-/// Item 6 C3: the persistent sums, kept in the resident rows slot and
-/// read-only during a block: each trader's sums over its rows in R, valued
-/// with the mark table / configs of `version`. An entry follows the
-/// trader's rows: a block that writes them moves it on to the rows after the
-/// block or drops it (item 6 M1, [`SumsCarry::trader`]); it is read only
-/// while the version holds (versions are never reused, so an entry at
-/// another version is never read; the map is cleared when the version moves).
-#[derive(Debug, Default)]
-struct SumsCache {
-    version: u64,
-    map: HashMap<Address, SumsResult>,
-    /// Item 6 M1 (tests): entries `end_resident` moved on to a trader's rows
-    /// after the block (instead of dropping them).
-    #[cfg(test)]
-    carried: usize,
-}
-
-/// Item 6 C3: one block's sums state on the context — the slot's cache and
-/// the block's memo (fix 1's pattern: the map lock covers the lookup only,
+/// Item 6 C3: one block's sums state on the context — the persistent sums
+/// (Phase 4 step 3: each user's entry on its record, [`users::UserState::sums`],
+/// read through [`Self::records`]: a trader's sums over its rows in R, valued
+/// with the mark table / configs of the entry's tag; an entry follows the
+/// trader's rows — a block that writes them moves it on to the rows after
+/// the block or drops it, item 6 M1, [`SumsCarry::trader`] — and is read
+/// only while its tag equals the block's version: versions are never reused,
+/// so an entry at another version is never read, and a moving version clears
+/// nothing) and the block's memo (fix 1's pattern: the map lock covers the lookup only,
 /// callers needing the same trader wait on its cell for ONE computation;
 /// safe under parallel Phase 2 / 3). A cell holds `None` when the result may
 /// not be cached (a positions read error, or a mark outside the table):
 /// callers then compute it directly.
 #[derive(Debug, Default)]
 pub(crate) struct BlockSums {
-    cache: SumsCache,
+    /// Phase 4 step 3 (was `SumsCache::version`): the version the slot's
+    /// entries were last joined at (the previous block's memo version; 0
+    /// after a rebuild). Node-local carry policy only ([`Self::into_carry`]);
+    /// reads check each entry's own tag.
+    slot_version: u64,
     /// The mark version the memo's entries are valued at (set by
     /// `fill_block_marks`; `None`: no table, the cache is not used).
     memo_version: Option<u64>,
@@ -1172,7 +1166,8 @@ pub(crate) struct BlockSums {
     /// overlay). Read only for a trader with nothing pending
     /// ([`AccountReader::resident_positions`]). Phase 4 step 2: the same
     /// record set R reads those CFs from (shared; dropped before
-    /// `end_resident` takes it back).
+    /// `end_resident` takes it back). Phase 4 step 3: also the persistent
+    /// sums (each user's entry).
     records: Option<Arc<Users>>,
     /// P1 (tests): every cached answer is also computed by the reference
     /// path; differences are recorded (a panic in a worker would be caught).
@@ -1186,33 +1181,67 @@ pub(crate) struct BlockSums {
 
 /// Item 6 M1 / step 1: the slot's sums after a block, while R's decoded
 /// positions follow the block's delta ([`Users::apply`] reports
-/// each written trader to [`Self::trader`]).
+/// each written trader, with its sums entry, to [`Self::trader`]); then
+/// [`Self::finish`] joins the block's memo into the users' entries.
 struct SumsCarry<'a> {
-    cache: SumsCache,
+    /// The tag of the entries this block writes (the memo's version; the
+    /// slot's previous one when the block had no table).
+    version: u64,
+    /// The block's memo (empty when the block had no table): each trader's
+    /// sums over its rows in R before the block, at `version`.
+    memo: HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>,
     /// The block's mark table / configs (and the configs' tiers by market)
     /// when the entries may be carried; `None`: written traders' entries are
     /// dropped.
     table: Option<(&'a BlockMarksState, DenseTiers<'a>)>,
+    /// Item 6 M1 (tests): entries moved on to a trader's rows after the
+    /// block (instead of dropped).
+    #[cfg(test)]
+    carried: usize,
 }
 
 impl SumsCarry<'_> {
+    /// No sums came back with the block (the context kept them): no memo,
+    /// no carry; written traders' entries are dropped, the others stay
+    /// (their rows did not change).
+    fn none() -> Self {
+        Self {
+            version: 0,
+            memo: HashMap::default(),
+            table: None,
+            #[cfg(test)]
+            carried: 0,
+        }
+    }
+
     /// A trader the block wrote under: its entry (sums over R's rows before
-    /// the block, at the table's version) moves on to its rows after the
-    /// block, or is dropped when that is not possible (no entry, no carry,
-    /// `changes` unknown: `None`, a Cross position in a market outside the
-    /// table, an overflow or the guard of [`sums_with_changes`]). Exact: the
-    /// entry is then `build` over R's rows after the block at the version,
-    /// as an entry the next block would compute (used only while the version
-    /// holds, i.e. the same marks and configs). `changes` / `now`: the
-    /// trader's changed positions (before, after) and its positions after
-    /// the block (see [`Users::apply`]); when re-valuing all of
-    /// `now` costs no more terms than the changes (2 per change), `build`
-    /// over `now` instead (the same sums, exactly).
-    fn trader(&mut self, trader: &Address, report: Option<(&[users::Change], &[torus_core::position::Position])>) {
+    /// the block at the table's version: the block's memo, else its entry
+    /// tagged with that version) moves on to its rows after the block, or is
+    /// dropped when that is not possible (no entry, no carry, `report`
+    /// unknown: `None`, a Cross position in a market outside the table, an
+    /// overflow or the guard of [`sums_with_changes`]). Exact: the entry is
+    /// then `build` over R's rows after the block at the version, as an entry
+    /// the next block would compute (used only while the version holds, i.e.
+    /// the same marks and configs). `report`: the trader's changed positions
+    /// (before, after), its positions after the block and its sums entry (see
+    /// [`Users::apply`]; `None`: its record was re-decoded and starts without
+    /// sums); when re-valuing all of `now` costs no more terms than the
+    /// changes (2 per change), `build` over `now` instead (the same sums,
+    /// exactly). The trader's memo is never joined after this (it is over
+    /// its rows before the block).
+    fn trader(&mut self, trader: &Address, report: Option<(&[users::Change], &[torus_core::position::Position], &mut users::Sums)>) {
+        let memo = self.memo.remove(trader).and_then(|cell| cell.get().copied().flatten());
+        let Some((changes, now, slot)) = report else {
+            return;
+        };
+        let version = self.version;
         let moved = (|| {
             let (t, dense) = self.table.as_ref()?;
-            let (changes, now) = report?;
-            let base = self.cache.map.get(trader)?.ok()?;
+            let base = match memo {
+                Some(r) => r,
+                None => slot.as_deref().filter(|e| e.0 == version)?.1,
+            }
+            .ok()?;
             let tiers = |m: MarketId| {
                 if dense.tiers.is_empty() {
                     t.configs.get(&m).map(|c| c.tiers.as_slice())
@@ -1235,16 +1264,36 @@ impl SumsCarry<'_> {
         })();
         match moved {
             Some(r) => {
-                self.cache.map.insert(*trader, r);
+                put_sums(slot, version, r);
                 #[cfg(test)]
                 {
-                    self.cache.carried += 1;
+                    self.carried += 1;
                 }
             }
-            None => {
-                self.cache.map.remove(trader);
+            None => *slot = None,
+        }
+    }
+
+    /// After the record set followed the delta: the block's memo joins the
+    /// users' entries (tagged `version`; overwriting whatever tag was there)
+    /// for the traders the block did not write, each with a record (an
+    /// opaque trader or one without rows keeps no sums). Returns the tag,
+    /// the slot's version for the next block's carry policy.
+    fn finish(self, users: &mut Users) -> u64 {
+        for (trader, cell) in self.memo {
+            if let (Some(Some(r)), Some(slot)) = (cell.get(), users.sums_slot_mut(&trader)) {
+                put_sums(slot, self.version, *r);
             }
         }
+        self.version
+    }
+}
+
+/// Phase 4 step 3: set a user's sums entry (reusing its box).
+fn put_sums(slot: &mut users::Sums, version: u64, r: SumsResult) {
+    match slot {
+        Some(e) => **e = (version, r),
+        None => *slot = Some(Box::new((version, r))),
     }
 }
 
@@ -1311,8 +1360,8 @@ impl SumsCounters {
 }
 
 impl BlockSums {
-    fn new(cache: SumsCache) -> Self {
-        Self { cache, ..Self::default() }
+    fn new(slot_version: u64) -> Self {
+        Self { slot_version, ..Self::default() }
     }
 
     /// The block's mark table was (re)filled: the memo restarts at `version`.
@@ -1321,53 +1370,42 @@ impl BlockSums {
         self.memo_version = version;
     }
 
-    /// C6b: `trader`'s sums over R's rows, if already known: the slot's
-    /// entry at `version`, else the block's memo (not computed here). `None`
-    /// also for a build that overflowed (no terms to adjust).
+    /// C6b: `trader`'s sums over R's rows, if already known: the user's
+    /// entry tagged `version`, else the block's memo (not computed here).
+    /// `None` also for a build that overflowed (no terms to adjust).
     fn base(&self, version: u64, trader: &Address) -> Option<PosSums> {
-        if self.cache.version == version {
-            if let Some(r) = self.cache.map.get(trader) {
-                return r.ok();
-            }
+        if let Some(r) = self.records.as_deref().and_then(|u| u.sums(trader, version)) {
+            return r.ok();
         }
         let cell = self.memo.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(trader).cloned()?;
         let r = (*cell.get()?)?;
         r.ok()
     }
 
-    /// End of the block: the memo joins the cache (at the memo's version),
-    /// returned with what [`SumsCarry::trader`] needs to move on the entry of
-    /// each trader the block wrote under (item 6 M1): `table`, the block's
+    /// End of the block: what [`SumsCarry`] needs to move on the entry of
+    /// each trader the block wrote under (item 6 M1) and then join the memo
+    /// into the users' entries (at the memo's version): `table`, the block's
     /// mark table and configs, when the entries may be carried (see below).
     fn into_carry(self, table: Option<&BlockMarksState>) -> SumsCarry<'_> {
         // Node-local policy: carry only while the mark version held across
-        // the previous block (the slot's cache is at this block's version).
-        // A moving version (marks move most blocks) clears the next block's
-        // cache, so carried entries would be thrown away (measured: ~1 ms
-        // per 1k fills of block-end work for nothing at walk 10).
-        let stable = self.memo_version.is_some_and(|v| v == self.cache.version);
-        let mut cache = self.cache;
-        #[cfg(test)]
-        {
-            cache.carried = 0;
-        }
-        if let Some(version) = self.memo_version {
-            if cache.version != version {
-                cache.map.clear();
-                cache.version = version;
-            }
-            let memo = self.memo.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (trader, cell) in memo {
-                if let Some(Some(r)) = cell.get() {
-                    cache.map.insert(trader, *r);
-                }
-            }
-        }
+        // the previous block (the slot's entries were joined at this block's
+        // version). A moving version makes the next block ignore them, so
+        // carried entries would be wasted (measured: ~1 ms per 1k fills of
+        // block-end work for nothing at walk 10).
+        let stable = self.memo_version.is_some_and(|v| v == self.slot_version);
+        let memo = match self.memo_version {
+            Some(_) => self.memo.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner),
+            None => HashMap::default(),
+        };
         // Carry only at the version the entries are valued at.
-        let table = table.filter(|t| {
-            stable && self.memo_version == Some(t.marks.version) && cache.version == t.marks.version
-        });
-        SumsCarry { cache, table: table.map(|t| (t, DenseTiers::of(&t.configs))) }
+        let table = table.filter(|t| stable && self.memo_version == Some(t.marks.version));
+        SumsCarry {
+            version: self.memo_version.unwrap_or(self.slot_version),
+            memo,
+            table: table.map(|t| (t, DenseTiers::of(&t.configs))),
+            #[cfg(test)]
+            carried: 0,
+        }
     }
 
     /// P1 shadow check: `cached` == the reference path's answer.
@@ -1815,12 +1853,10 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
 
     /// Paths 3 and 4 (the trader has nothing pending this block).
     fn cached_sums(&self, s: &BlockSums, version: u64, trader: &Address) -> Result<SumsResult, CoreError> {
-        if s.cache.version == version {
-            if let Some(r) = s.cache.map.get(trader) {
-                #[cfg(test)]
-                bump(&s.counters.persistent);
-                return Ok(*r);
-            }
+        if let Some(r) = s.records.as_deref().and_then(|u| u.sums(trader, version)) {
+            #[cfg(test)]
+            bump(&s.counters.persistent);
+            return Ok(r);
         }
         let cell = s
             .memo
@@ -3148,9 +3184,13 @@ struct RowsSlot {
     /// C2: the mark table / configs of block `height` (None: that block had
     /// no table — the next one takes a new version).
     marks: Option<BlockMarksState>,
-    /// C3: the traders' margin sums over `rows` (plan 2.4). Built empty with
-    /// R, dropped with it.
-    sums: SumsCache,
+    /// C3 / Phase 4 step 3: the version the users' sums entries were last
+    /// joined at ([`BlockSums::slot_version`]; the entries themselves live on
+    /// `users`' records, built empty with R, dropped with it).
+    sums_version: u64,
+    /// Item 6 M1 (tests): entries the last `end_resident` carried.
+    #[cfg(test)]
+    sums_carried: usize,
     /// C7 / Phase 4 step 1: `rows`' positions and balances decoded per
     /// trader. Built with R, updated by each block's delta, dropped with it.
     /// Phase 4 step 2: also `rows`' source for those two CFs (the same
@@ -3568,8 +3608,23 @@ impl ResidentBooks {
     /// trader afresh. Returns the entries dropped. Waits for an
     /// `end_resident` worker. Not called on the node path.
     pub fn drop_sums_cache(&mut self) -> usize {
+        self.with_slot_users(Users::clear_sums).unwrap_or(0)
+    }
+
+    /// Phase 4 step 3: `f` on the slot's record set between blocks (R's
+    /// source taken off for it and put back). `None`: no slot, or R or the
+    /// record set shared. Waits for an `end_resident` worker. Not called on
+    /// the node path.
+    fn with_slot_users<O>(&mut self, f: impl FnOnce(&mut Users) -> O) -> Option<O> {
         self.settle_rows();
-        self.rows.as_mut().map_or(0, |s| std::mem::take(&mut s.sums.map).len())
+        let slot = self.rows.as_mut()?;
+        let r = Arc::get_mut(&mut slot.rows)?;
+        let had = r.take_source().is_some();
+        let out = Arc::get_mut(&mut slot.users).map(f);
+        if had {
+            r.set_source(slot.users.clone());
+        }
+        out
     }
 
     /// Whether the holder currently carries state (test/ops introspection).
@@ -3841,7 +3896,7 @@ pub fn begin_resident(
                 block.marks = slot.marks;
                 block.sums = Some(BlockSums {
                     records: Some(slot.users.clone()),
-                    ..BlockSums::new(slot.sums)
+                    ..BlockSums::new(slot.sums_version)
                 });
                 block.users = Some(slot.users);
                 Some(slot.rows)
@@ -4169,11 +4224,12 @@ impl EndResidentJob {
         }
         let r = Arc::get_mut(&mut rows).expect("end_resident_take checked R is not shared");
         let u = Arc::get_mut(&mut users).expect("end_resident_take checked the record set is not shared");
-        // C3: the block's memo joins the slot's sums; item 6 M1: every trader
-        // whose positions the block wrote or deleted has its sums moved on to
-        // its rows after the block, else loses them (step 1: while its decoded
-        // positions follow the delta, below).
-        let mut carry = sums.map(|s| s.into_carry(marks.as_ref()));
+        // Item 6 M1: every trader whose positions the block wrote or deleted
+        // has its sums moved on to its rows after the block, else loses them
+        // (step 1: while its decoded positions follow the delta, below; Phase
+        // 4 step 3: also when no sums came back, so no entry outlives its
+        // rows); then the block's memo joins the users' entries.
+        let mut carry = sums.map_or_else(SumsCarry::none, |s| s.into_carry(marks.as_ref()));
         // Item 6 cut 5: from the frozen set (pipelined), here on the worker.
         let delta = delta.into_delta();
         // Phase 4 step 2: R's raw CFs (liquidation, oracle, markets) only.
@@ -4185,18 +4241,25 @@ impl EndResidentJob {
         // C7 / Phase 4 step 1: the record set follows the delta of positions
         // and balances (step 2: R's only copy of them).
         let timer = std::time::Instant::now();
-        match carry.as_mut() {
-            Some(c) => u.apply(&delta, Some(&mut |t: &Address, report| c.trader(t, report))),
-            None => u.apply(&delta, None),
-        }
+        u.apply(&delta, Some(&mut |t: &Address, report| carry.trader(t, report)));
         if let Some(m) = metrics {
             m.exec_end_resident_users_seconds.observe(timer.elapsed().as_secs_f64());
             set_resident_gauges(m, r, Some(u));
         }
+        #[cfg(test)]
+        let sums_carried = carry.carried;
+        let sums_version = carry.finish(u);
         r.set_source(users.clone());
-        let sums = carry.map(|c| c.cache).unwrap_or_default();
         drop(delta);
-        RowsSlot { rows, marks, sums, users, height }
+        RowsSlot {
+            rows,
+            marks,
+            sums_version,
+            #[cfg(test)]
+            sums_carried,
+            users,
+            height,
+        }
     }
 }
 

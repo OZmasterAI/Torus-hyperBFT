@@ -87,8 +87,13 @@ pub(crate) const BALANCES: usize = 1;
 /// its position before the block and after (`None`: no row).
 pub(crate) type Change = (Option<Position>, Option<Position>);
 
-/// Item 6 step 1: [`Users::apply`]'s per-trader report.
-pub(crate) type Seen<'a> = dyn FnMut(&Address, Option<(&[Change], &[Position])>) + 'a;
+/// Phase 4 step 3: a user's margin sums with the mark version they are
+/// valued at (the tag), boxed so a user without sums pays 8 bytes.
+pub(crate) type Sums = Option<Box<(u64, SumsResult)>>;
+
+/// Item 6 step 1: [`Users::apply`]'s per-trader report. Phase 4 step 3:
+/// with the trader's sums entry, which the callee moves on or clears.
+pub(crate) type Seen<'a> = dyn FnMut(&Address, Option<(&[Change], &[Position], &mut Sums)>) + 'a;
 
 /// One regular trader's record: its rows of both CFs, decoded.
 #[derive(Debug, Default)]
@@ -99,11 +104,14 @@ pub(crate) struct UserState {
     pub(crate) cum_volume: Option<FixedPoint>,
     /// Market order (= key order), without growth slack after a rebuild.
     pub(crate) positions: Vec<Position>,
-    /// Phase 4 step 3 (plan section 3): the trader's margin sums with their
-    /// mark version, boxed so a light user pays 8 bytes. Always `None` in
-    /// step 1 (`SumsCache` still holds the sums).
-    #[allow(dead_code)]
-    pub(crate) sums: Option<Box<(u64, SumsResult)>>,
+    /// Phase 4 step 3 (plan section 3, "Sums"; was C3's `SumsCache`): the
+    /// trader's margin sums over these positions, tagged with the mark
+    /// version they are valued at. Read only while the tag equals the
+    /// block's version ([`Users::sums`]; versions are never reused); a
+    /// moving version clears nothing, a stale entry is ignored and later
+    /// overwritten. Written only at `end_resident` (the block's memo, the
+    /// carry of a written trader); a re-decoded record starts without.
+    pub(crate) sums: Sums,
 }
 
 impl UserState {
@@ -460,8 +468,10 @@ impl Users {
     /// followed: `Some((changes, now))` for a trader regular before and after
     /// the block, with each changed position row's position before / after
     /// (composing exactly from its positions before the block to `now`, its
-    /// positions after); `None` when its rows are re-decoded (opaque before,
-    /// or an irregular write in either CF).
+    /// positions after) and its sums entry (Phase 4 step 3; the callee moves
+    /// it on or clears it); `None` when its rows are re-decoded (opaque
+    /// before, or an irregular write in either CF: a new record starts
+    /// without sums).
     pub(crate) fn apply(&mut self, delta: &ResidentDelta, mut seen: Option<&mut Seen<'_>>) {
         // A trader's balance and `cvlm` rows are not adjacent in key order:
         // gathered per trader first.
@@ -595,11 +605,11 @@ impl Users {
             }
         }
         if let Some(f) = seen {
-            f(&t, Some((changes.as_slice(), ps.as_slice())));
+            f(&t, Some((changes.as_slice(), u.positions.as_slice(), &mut u.sums)));
         }
         // E2: a regular trader's position rows are all 28-byte keys.
         if keyed {
-            if ps.is_empty() {
+            if u.positions.is_empty() {
                 self.traders.remove(&t);
             } else {
                 self.traders.insert(t);
@@ -685,6 +695,35 @@ impl Users {
             return None;
         }
         Some(self.map.get(trader).map_or(&[], |u| u.positions.as_slice()))
+    }
+
+    /// Phase 4 step 3: `trader`'s sums entry if it is tagged `version` (an
+    /// entry at another version is never returned).
+    #[inline]
+    pub(crate) fn sums(&self, trader: &Address, version: u64) -> Option<SumsResult> {
+        match self.map.get(trader)?.sums.as_deref() {
+            Some(&(tag, r)) if tag == version => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Phase 4 step 3: `trader`'s sums entry to write (`None`: no record —
+    /// opaque, or no rows: nothing to keep sums on).
+    pub(crate) fn sums_slot_mut(&mut self, trader: &Address) -> Option<&mut Sums> {
+        self.map.get_mut(trader).map(|u| &mut u.sums)
+    }
+
+    /// Phase 4 step 3: drop every user's sums entry; returns the entries
+    /// dropped (O(users): tests only, through
+    /// `ResidentBooks::drop_sums_cache`; the node never clears all users).
+    pub(crate) fn clear_sums(&mut self) -> usize {
+        self.map.values_mut().filter_map(|u| u.sums.take()).count()
+    }
+
+    /// Phase 4 step 3 (tests): every sums entry as (trader, tag, sums).
+    #[cfg(test)]
+    pub(crate) fn sums_entries(&self) -> impl Iterator<Item = (Address, u64, SumsResult)> + '_ {
+        self.map.iter().filter_map(|(t, u)| u.sums.as_deref().map(|&(v, r)| (*t, v, r)))
     }
 
     /// Item 6 E2: [`torus_core::liquidation::traders_after`]`(state, after,

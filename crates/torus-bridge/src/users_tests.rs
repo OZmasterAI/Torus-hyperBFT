@@ -417,8 +417,8 @@ fn users_equal_decoded_rows_after_random_deltas() {
             let mut reports: Vec<Report> = Vec::new();
             rec.apply(
                 &delta,
-                Some(&mut |t: &Address, r: Option<(&[Change], &[Position])>| {
-                    reports.push((*t, r.map(|(c, n)| (c.to_vec(), n.to_vec()))));
+                Some(&mut |t: &Address, r: Option<(&[Change], &[Position], &mut Sums)>| {
+                    reports.push((*t, r.map(|(c, n, _)| (c.to_vec(), n.to_vec()))));
                 }),
             );
             plain.apply(&delta, None);
@@ -1225,8 +1225,8 @@ fn ubench_trader_positions_apply() {
             let start = std::time::Instant::now();
             rec.apply(
                 delta,
-                Some(&mut |_: &Address, r: Option<(&[Change], &[Position])>| {
-                    sink += r.map_or(1, |(c, _)| c.len())
+                Some(&mut |_: &Address, r: Option<(&[Change], &[Position], &mut Sums)>| {
+                    sink += r.map_or(1, |(c, _, _)| c.len())
                 }),
             );
             ns += start.elapsed().as_nanos();
