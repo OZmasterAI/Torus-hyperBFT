@@ -16,14 +16,20 @@
 //!   ready_calls=<n> wait_cap_n= wait_cap_s= wait_cap_p50_ms= wait_cap_p99_ms=
 //!   wait_cancel_n= wait_cancel_s= wait_cancel_p50_ms= wait_cancel_p99_ms=
 //!   tail_rounds= tail_fetched= tail_fetch_max= tail_round_p50_ms=
-//!   tail_round_max_ms= tail_lag_max=
-//! release-timing-blocks: t=<s> seen=<height>@<unix ms>,...
+//!   tail_round_max_ms= tail_lag_max= tail_fetch_p50_ms= tail_fetch_p99_ms=
+//!   tail_fetch_max_ms= tail_apply_wait_p50_ms= tail_apply_wait_p99_ms=
+//!   tail_apply_wait_max_ms=
+//! release-timing-blocks: t=<s> fetch_ms=<height>:<ms>,...
+//!   applied=<height>@<unix ms>,... seen=<height>@<unix ms>,...
 //! ```
 //! (each is ONE line; wrapped here.)
 //!
 //! * `released`, `age_*`: actions released COMMITTED in the window; age =
-//!   wall ms when the tail had the body parsed minus the action nonce (wall ms
-//!   at signing, same host clock): sign + submit + mempool + consensus + tail.
+//!   wall ms when the tail applied the body (its slots freed) minus the action
+//!   nonce (wall ms at signing, same host clock): sign + submit + mempool +
+//!   consensus + tail. At `--in-flight-tail-depth` 1 a body is applied as
+//!   soon as it is parsed; deeper, a body that lands before a lower height
+//!   waits for it (`tail_apply_wait_*`).
 //! * `ready_calls`: `Cap::wait_ready` calls that returned a free slot (fires).
 //!   `wait_cap_*`: the calls that waited while the sender was at its cap;
 //!   `wait_cancel_*`: below the cap but held by its own in-flight cancel-all
@@ -38,9 +44,16 @@
 //!   `eth_blockNumber` minus the last read height at the poll start (the eth
 //!   head is min(applied, committed), so this is lag behind the head, not
 //!   behind commit); `-` in commit mode (no extra RPC to learn the head).
-//! * `seen`: when the tail had each body parsed. `torus_getBlockBody` carries
-//!   no commit or block timestamp, so join these with the node's commit log
-//!   offline for the commit-to-seen delay.
+//! * `tail_fetch_*`: per applied body, its read: `torus_getBlockBody` sent to
+//!   reply parsed (the reads of a missing or unreadable height are not
+//!   timed). `tail_apply_wait_*`: per applied body, reply parsed to applied
+//!   (about 0 at depth 1).
+//! * `seen`: when the tail had each body parsed (its reply's arrival, also
+//!   when a lower height kept it waiting). `torus_getBlockBody` carries no
+//!   commit or block timestamp, so join these with the node's commit log
+//!   offline for the commit-to-seen delay. `applied`: when its slots freed.
+//!   `fetch_ms`: its read time, as `tail_fetch_*`. `seen` stays the last
+//!   field, so parsers of the s121 line still read it to the end of the line.
 //!
 //! End of run, one line per histogram (run totals):
 //!
@@ -48,7 +61,8 @@
 //! release-timing-hist: what=<name> n= sum= p50= p90= p99= p999= max= buckets=<lo>:<count>,...
 //! ```
 //! names: `age_ms`, `wait_cap_us`, `wait_cancel_us`, `tail_round_us`,
-//! `tail_fetched_per_round`, `tail_lag_heights`.
+//! `tail_fetched_per_round`, `tail_lag_heights`, `tail_fetch_us`,
+//! `tail_apply_wait_us`.
 //!
 //! Histogram: values below 32 exact, above that 16 buckets per power of two;
 //! a quantile is its bucket's lower bound (at most 6.25% low), capped at max.
@@ -281,6 +295,21 @@ impl ReleaseTiming {
     }
 }
 
+/// One body the tail applied (`release-timing-blocks:`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TailBody {
+    pub height: u64,
+    /// Wall ms when its reply had arrived and was parsed (`seen`).
+    pub seen_ms: u64,
+    /// Wall ms when it was applied: its slots released (`applied`).
+    pub applied_ms: u64,
+    /// Its read: request sent to reply parsed, microseconds.
+    pub fetch_us: u64,
+    /// Reply parsed to applied, microseconds: the wait for the lower heights
+    /// still in flight (`--in-flight-tail-depth` > 1; about 0 at depth 1).
+    pub wait_us: u64,
+}
+
 /// Block-tail timing (one writer: the tail task). Each body and the head
 /// lag are recorded as soon as they are read, so a poll cut short (the tail
 /// aborted at the end of the run) keeps what it read.
@@ -289,7 +318,9 @@ pub struct TailTiming {
     round_us: Series,
     fetched: Series,
     lag: Series,
-    seen: Vec<(u64, u64)>,
+    fetch_us: Series,
+    apply_wait_us: Series,
+    seen: Vec<TailBody>,
     /// The open poll: bodies read so far and its head lag.
     round_fetched: u64,
     round_lag: Option<u64>,
@@ -300,14 +331,18 @@ pub struct TailWindow {
     pub round_us: Summary,
     pub fetched: Summary,
     pub lag: Summary,
-    pub seen: Vec<(u64, u64)>,
+    pub fetch_us: Summary,
+    pub apply_wait_us: Summary,
+    pub seen: Vec<TailBody>,
 }
 
 impl TailTiming {
-    /// The open poll read the body at `height`, parsed at `seen_ms`.
-    pub fn on_body(&mut self, height: u64, seen_ms: u64) {
+    /// The open poll applied `body`.
+    pub fn on_body(&mut self, body: TailBody) {
         self.round_fetched += 1;
-        self.seen.push((height, seen_ms));
+        self.fetch_us.record(body.fetch_us);
+        self.apply_wait_us.record(body.wait_us);
+        self.seen.push(body);
     }
 
     /// Head mode: the open poll's head lag (`eth_blockNumber` minus the last
@@ -330,15 +365,19 @@ impl TailTiming {
             round_us: self.round_us.roll(),
             fetched: self.fetched.roll(),
             lag: self.lag.roll(),
+            fetch_us: self.fetch_us.roll(),
+            apply_wait_us: self.apply_wait_us.roll(),
             seen: std::mem::take(&mut self.seen),
         }
     }
 
-    pub fn totals(&self) -> [(&'static str, &Hist); 3] {
+    pub fn totals(&self) -> [(&'static str, &Hist); 5] {
         [
             ("tail_round_us", &self.round_us.total),
             ("tail_fetched_per_round", &self.fetched.total),
             ("tail_lag_heights", &self.lag.total),
+            ("tail_fetch_us", &self.fetch_us.total),
+            ("tail_apply_wait_us", &self.apply_wait_us.total),
         ]
     }
 }
@@ -369,7 +408,8 @@ pub fn window_lines(
         "release-timing: t={t_s:.1} wall_ms={wall_ms} final={} released={} age_p50_ms={} \
          age_p90_ms={} age_p99_ms={} age_max_ms={} ready_calls={} {} {} tail_rounds={} \
          tail_fetched={} tail_fetch_max={} tail_round_p50_ms={} tail_round_max_ms={} \
-         tail_lag_max={}",
+         tail_lag_max={} tail_fetch_p50_ms={} tail_fetch_p99_ms={} tail_fetch_max_ms={} \
+         tail_apply_wait_p50_ms={} tail_apply_wait_p99_ms={} tail_apply_wait_max_ms={}",
         u8::from(last),
         age.n,
         n(age.p50),
@@ -385,13 +425,22 @@ pub fn window_lines(
         ms(tail.round_us.p50),
         ms(max(&tail.round_us)),
         n(max(&tail.lag)),
+        ms(tail.fetch_us.p50),
+        ms(tail.fetch_us.p99),
+        ms(max(&tail.fetch_us)),
+        ms(tail.apply_wait_us.p50),
+        ms(tail.apply_wait_us.p99),
+        ms(max(&tail.apply_wait_us)),
     );
-    let seen: Vec<String> = tail
-        .seen
-        .iter()
-        .map(|(h, ms)| format!("{h}@{ms}"))
-        .collect();
-    let blocks = format!("release-timing-blocks: t={t_s:.1} seen={}", seen.join(","));
+    let list =
+        |f: &dyn Fn(&TailBody) -> String| tail.seen.iter().map(f).collect::<Vec<_>>().join(",");
+    // `seen` last: parsers of the s121 line read it to the end of the line.
+    let blocks = format!(
+        "release-timing-blocks: t={t_s:.1} fetch_ms={} applied={} seen={}",
+        list(&|b| format!("{}:{:.1}", b.height, b.fetch_us as f64 / 1e3)),
+        list(&|b| format!("{}@{}", b.height, b.applied_ms)),
+        list(&|b| format!("{}@{}", b.height, b.seen_ms)),
+    );
     [main, blocks]
 }
 
@@ -504,21 +553,54 @@ mod tests {
         assert_eq!(totals[2].1.n, 2);
     }
 
+    /// A body seen at `seen_ms`, read in `fetch_us`, applied `wait_us` later.
+    fn body(height: u64, seen_ms: u64, fetch_us: u64, wait_us: u64) -> TailBody {
+        TailBody {
+            height,
+            seen_ms,
+            applied_ms: seen_ms + wait_us / 1_000,
+            fetch_us,
+            wait_us,
+        }
+    }
+
     #[test]
     fn tail_rounds_and_seen_heights_roll_per_window() {
         let mut t = TailTiming::default();
         t.on_lag(3);
-        t.on_body(7, 1_000);
-        t.on_body(8, 1_050);
+        t.on_body(body(7, 1_000, 900, 0));
+        t.on_body(body(8, 1_050, 2_000, 3_000));
         t.end_round(4_000);
         t.end_round(1_500);
         let w = t.roll();
         assert_eq!((w.round_us.n, w.round_us.max), (2, 4_000));
         assert_eq!((w.fetched.sum, w.fetched.max), (2, 2));
         assert_eq!((w.lag.n, w.lag.max), (1, 3), "lag only when known");
-        assert_eq!(w.seen, vec![(7, 1_000), (8, 1_050)]);
+        assert_eq!(
+            w.seen
+                .iter()
+                .map(|b| (b.height, b.seen_ms, b.applied_ms))
+                .collect::<Vec<_>>(),
+            vec![(7, 1_000, 1_000), (8, 1_050, 1_053)]
+        );
+        // Per-body read time and apply wait, one sample per applied body.
+        assert_eq!((w.fetch_us.n, w.fetch_us.max), (2, 2_000));
+        assert_eq!((w.apply_wait_us.n, w.apply_wait_us.max), (2, 3_000));
         assert!(t.roll().seen.is_empty());
-        assert_eq!(t.totals()[0].1.n, 2);
+        let totals = t.totals();
+        assert_eq!(totals[0].1.n, 2);
+        assert_eq!(
+            totals.iter().map(|(what, _)| *what).collect::<Vec<_>>(),
+            [
+                "tail_round_us",
+                "tail_fetched_per_round",
+                "tail_lag_heights",
+                "tail_fetch_us",
+                "tail_apply_wait_us"
+            ]
+        );
+        assert_eq!((totals[3].1.n, totals[3].1.sum), (2, 2_900));
+        assert_eq!((totals[4].1.n, totals[4].1.sum), (2, 3_000));
     }
 
     /// Counts this thread's heap allocations (the test binary's allocator).
@@ -598,11 +680,11 @@ mod tests {
         r.on_ready([Some(5_000), Some(2_000)]);
         let mut t = TailTiming::default();
         t.on_lag(3);
-        t.on_body(7, 1_000);
-        t.on_body(8, 1_050);
+        t.on_body(body(7, 1_000, 1_200, 0));
+        t.on_body(body(8, 1_050, 3_400, 2_000));
         t.end_round(4_000);
         t.on_lag(1);
-        t.on_body(9, 1_300);
+        t.on_body(body(9, 1_300, 90_000, 0));
         t.end_round(12_000);
         let lines = window_lines(15.04, 1_760_000_015_000, false, &r.roll(), &t.roll());
         assert_eq!(
@@ -612,11 +694,16 @@ mod tests {
              wait_cap_n=2 wait_cap_s=0.006 wait_cap_p50_ms=1.0 wait_cap_p99_ms=4.9 \
              wait_cancel_n=1 wait_cancel_s=0.002 wait_cancel_p50_ms=2.0 wait_cancel_p99_ms=2.0 \
              tail_rounds=2 tail_fetched=3 tail_fetch_max=2 tail_round_p50_ms=4.0 \
-             tail_round_max_ms=12.0 tail_lag_max=3"
+             tail_round_max_ms=12.0 tail_lag_max=3 tail_fetch_p50_ms=3.3 \
+             tail_fetch_p99_ms=86.0 tail_fetch_max_ms=90.0 tail_apply_wait_p50_ms=0.0 \
+             tail_apply_wait_p99_ms=2.0 tail_apply_wait_max_ms=2.0"
         );
+        // `seen` stays the last field (parsers of the s121 line read it to
+        // the end of the line).
         assert_eq!(
             lines[1],
-            "release-timing-blocks: t=15.0 seen=7@1000,8@1050,9@1300"
+            "release-timing-blocks: t=15.0 fetch_ms=7:1.2,8:3.4,9:90.0 \
+             applied=7@1000,8@1052,9@1300 seen=7@1000,8@1050,9@1300"
         );
         // An idle window: no samples.
         let idle = window_lines(30.0, 1_760_000_030_000, true, &r.roll(), &t.roll());
@@ -627,9 +714,14 @@ mod tests {
              wait_cap_n=0 wait_cap_s=0.000 wait_cap_p50_ms=- wait_cap_p99_ms=- \
              wait_cancel_n=0 wait_cancel_s=0.000 wait_cancel_p50_ms=- wait_cancel_p99_ms=- \
              tail_rounds=0 tail_fetched=0 tail_fetch_max=- tail_round_p50_ms=- \
-             tail_round_max_ms=- tail_lag_max=-"
+             tail_round_max_ms=- tail_lag_max=- tail_fetch_p50_ms=- tail_fetch_p99_ms=- \
+             tail_fetch_max_ms=- tail_apply_wait_p50_ms=- tail_apply_wait_p99_ms=- \
+             tail_apply_wait_max_ms=-"
         );
-        assert_eq!(idle[1], "release-timing-blocks: t=30.0 seen=");
+        assert_eq!(
+            idle[1],
+            "release-timing-blocks: t=30.0 fetch_ms= applied= seen="
+        );
         let (what, age) = r.totals()[0];
         assert_eq!(
             hist_line(what, age),
