@@ -387,7 +387,7 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(w0["tail_fetch_max"], 2)
         self.assertEqual(w0["tail_round_max_ms"], 12.0)
         self.assertEqual(w0["tail_body_p50_ms"], 3.2, "unknown keys pass through")
-        self.assertEqual(len(w0), 25)
+        self.assertEqual(len(w0), 24, "23 printed today + tail_body_p50_ms")
         self.assertEqual(w1["final"], 1)
         self.assertIsNone(w1["age_p50_ms"], "'-' = no sample in the window")
         self.assertIsNone(w1["tail_lag_max"])

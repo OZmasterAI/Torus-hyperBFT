@@ -1179,14 +1179,14 @@ def parse_dissem(raw):
 
 def parse_bench_log(path):
     """bench.log end-of-run lines -> (submit rate actions/s, econ mix, in-flight
-    releases, cancel-by-id counts, cloid counts); each None when its line is
-    absent (older bench, cap off, no cancel-by-id cell, bench before
-    --cloid-share)."""
+    releases, cancel-by-id counts, cloid counts, release timing); each None when
+    its line is absent (older bench, cap off, no cancel-by-id cell, bench before
+    --cloid-share, bench before release timing)."""
     try:
         with open(path, errors="replace") as f:
             text = f.read()
     except OSError:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
     m = re.search(r"Submitted \(load-gen accepted\): [0-9,]+ native actions \(([0-9.]+)/s\)", text)
     rate = float(m.group(1)) if m else None
     m = re.search(r"Econ mix \(load-gen accepted\): place (\d+) \(([0-9.]+)%\) \| "
@@ -1219,10 +1219,50 @@ def parse_bench_log(path):
                   r"--cloid-share (\d+)%", text)
     cloids = None if not m else {
         "share_pct": int(m.group(3)), "stamped": int(m.group(1)), "placed": int(m.group(2))}
-    return rate, mix, inflight, by_id, cloids
+    return rate, mix, inflight, by_id, cloids, parse_release_timing(text)
 
 
-bench_submit_rate, econ_mix, in_flight, cancel_by_id, cloids = parse_bench_log(os.path.join(OUT, "bench.log"))
+def _rt_value(v):
+    """One release-timing value: '-' (no sample in the window) -> None."""
+    if v == "-":
+        return None
+    for cast in (int, float):
+        try:
+            return cast(v)
+        except ValueError:
+            pass
+    return v
+
+
+def parse_release_timing(text):
+    """bench --max-in-flight release-timing lines (release_timing.rs module doc)
+    -> {"windows": one dict per 15 s `release-timing:` line (final=1 = the
+    partial last window), "seen_bodies": heights in the `release-timing-blocks:`
+    lines (the heights themselves stay in bench.log for the offline join with
+    the commit log), "hist": {what: run-total histogram, buckets [[lo, count]]}}.
+    Every key=value is kept as printed, so fields a later bench adds come
+    through unchanged. None when the bench printed none."""
+    windows, seen, hist = [], 0, {}
+    for line in text.splitlines():
+        tag, _, rest = line.partition(" ")
+        if tag not in ("release-timing:", "release-timing-blocks:", "release-timing-hist:"):
+            continue
+        kv = dict(f.split("=", 1) for f in rest.split() if "=" in f)
+        if tag == "release-timing:":
+            windows.append({k: _rt_value(v) for k, v in kv.items()})
+        elif tag == "release-timing-blocks:":
+            seen += len([h for h in kv.get("seen", "").split(",") if h])
+        else:
+            what = kv.pop("what")
+            buckets = [[int(x) for x in b.split(":")] for b in kv.pop("buckets", "").split(",") if b]
+            hist[what] = {**{k: _rt_value(v) for k, v in kv.items()}, "buckets": buckets}
+    if not (windows or hist):
+        return None
+    return {"windows": windows, "seen_bodies": seen, "hist": hist}
+
+
+bench_submit_rate, econ_mix, in_flight, cancel_by_id, cloids, release_timing = parse_bench_log(
+    os.path.join(OUT, "bench.log"))
 dissem = parse_dissem(A.dissem)
 if dissem:
     dissem["raw"] = A.dissem.strip()   # re-fed verbatim by resummarize.sh
@@ -1342,6 +1382,7 @@ summary = {
                # Generated orders incl. signed-ahead ones never sent.
                "cloids": cloids,
                "in_flight": in_flight,
+               "release_timing": release_timing,
                "val0_actions_processed": int(v0.get("delta_native_actions_processed_total", 0)),
                "mempool_nonce_expired_evictions_per_node": [int(x) for x in A.evicted.split()],
                "note": "NONCE_WINDOW_MS=60s: backlog older than 60 s is evicted silently; submitted-processed gap = expiry"},

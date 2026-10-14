@@ -614,7 +614,12 @@ No extra RPC, no new lock on the send path.
   `release-timing-hist: what=<age_ms|wait_cap_us|wait_cancel_us|tail_round_us|tail_fetched_per_round|tail_lag_heights> n= sum= p50= p90= p99= p999= max= buckets=<lo>:<count>,...`
   per histogram (16 buckets per power of two, quantiles at most 6.25% low).
 
-summarize.py does not read them yet: `grep '^release-timing' bench.log`.
+summarize.py puts them in `ingest.release_timing` (None without them):
+`windows` (one dict per `release-timing:` line, every key as printed,
+`-` = null; keys a later bench adds come through unchanged), `seen_bodies`
+(count only; the `height@ms` pairs stay in bench.log for the offline join)
+and `hist` (`what` -> n, sum, quantiles, max, `buckets` [[lo, count]]).
+Self-test: `test_harness.py` `test_release_timing_lines_are_summarized`.
 
 ## New campaign from the template (per-cell write-up step, rerun queue)
 
