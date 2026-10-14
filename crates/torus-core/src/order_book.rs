@@ -6305,8 +6305,8 @@ mod tests {
         let ids = (a.instance_id(), b.instance_id());
         std::mem::swap(&mut a, &mut b);
         assert_eq!((b.instance_id(), a.instance_id()), ids, "a move keeps the id");
-        let held = BookInstance(7);
-        assert_ne!(held.clone().0, 7, "a clone gets a fresh id");
+        let held = BookInstance::fresh();
+        assert_ne!(held.clone().0, held.0, "a clone gets a fresh id");
     }
 }
 

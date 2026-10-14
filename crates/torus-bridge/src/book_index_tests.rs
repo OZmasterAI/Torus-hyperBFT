@@ -401,3 +401,96 @@ fn guard_replace_with_stale_copy_is_indexed() {
 fn for_each_swap_with_stale_copy_is_indexed() {
     stale_copy_is_indexed(Via::ForEach, Op::Swap);
 }
+
+// ---- Codex review r2 P2 (s120): the lent book's own id comes back, but
+// its logs were drained elsewhere while it was out: moved into another
+// context (`insert_order_book` feeds them to that context's indexes) and
+// back, or drained straight through the `&mut`. The same id no longer
+// means the logs hold every change since this context last drained them.
+
+/// The ways the lent book's logs leave it while it is lent.
+#[derive(Clone, Copy, Debug)]
+enum Leak {
+    /// Into another context's `insert_order_book` and back out.
+    OtherContext,
+    /// `drain_new_traders` / `clear_cloid_log` straight on the lent book.
+    DrainedInPlace,
+}
+
+/// Lend market 3's book through `via`; on it, `addr(3)` rests `C + 80`;
+/// then its logs leave through `leak` and the same book goes back in its
+/// slot. `C + 80` is found, a cancel-all of `addr(3)` reaches market 3.
+fn drained_logs_roundtrip_is_indexed(via: Via, leak: Leak) {
+    let what = format!("{via:?} {leak:?} roundtrip");
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut holder = ResidentBooks::default();
+    let mut ctx = ctx_at(&db, 1, &mut holder);
+    seed(&mut ctx);
+
+    let dir_b = tempfile::tempdir().unwrap();
+    let db_b = StateDb::open(dir_b.path()).unwrap();
+    let mut holder_b = ResidentBooks::default();
+    let mut other = ctx_at(&db_b, 1, &mut holder_b);
+    seed(&mut other);
+
+    let lent_id = ctx.order_book(3).unwrap().instance_id();
+    let mut on_lent = |slot: &mut OrderBook| {
+        slot.place_order(params(3, false, 500, Some(C + 80)), addr(3), 1);
+        match leak {
+            Leak::OtherContext => {
+                let placeholder = OrderBook::new(3, FixedPoint::ONE, FixedPoint::ONE);
+                let lent = std::mem::replace(slot, placeholder);
+                assert!(other.insert_order_book(30, lent).is_none());
+                let empty = OrderBook::new(30, FixedPoint::ONE, FixedPoint::ONE);
+                let back = other.insert_order_book(30, empty).expect("the lent book");
+                drop(std::mem::replace(slot, back));
+            }
+            Leak::DrainedInPlace => {
+                slot.drain_new_traders();
+                slot.clear_cloid_log();
+            }
+        }
+    };
+    match via {
+        Via::Guard => on_lent(&mut ctx.order_book_mut(3).unwrap()),
+        Via::ForEach => ctx.for_each_order_book_mut(|m, slot| {
+            if m == 3 {
+                on_lent(slot);
+            }
+        }),
+    }
+    assert_eq!(ctx.order_book(3).unwrap().instance_id(), lent_id, "{what}: the same book is back");
+    assert_eq!(ctx.order_book(3).unwrap().open_order_count(&addr(3)), 1, "{what}: C + 80 rests");
+
+    assert_consistent(&ctx, &what);
+    dup(&exec(&mut ctx, 3, sell(8, 500, Some(C + 80))), &format!("{what}: C + 80 rests in 3"));
+    ok(&exec(&mut ctx, 3, cancel_all()), &what);
+    assert_eq!(
+        ctx.order_book(3).unwrap().open_order_count(&addr(3)),
+        0,
+        "{what}: cancel-all reached 3"
+    );
+    ok(&exec(&mut ctx, 3, sell(8, 500, Some(C + 80))), &format!("{what}: C + 80 freed"));
+    stash_and_check(ctx, &mut holder, &what);
+}
+
+#[test]
+fn guard_roundtrip_through_other_context_is_indexed() {
+    drained_logs_roundtrip_is_indexed(Via::Guard, Leak::OtherContext);
+}
+
+#[test]
+fn for_each_roundtrip_through_other_context_is_indexed() {
+    drained_logs_roundtrip_is_indexed(Via::ForEach, Leak::OtherContext);
+}
+
+#[test]
+fn guard_logs_drained_in_place_are_indexed() {
+    drained_logs_roundtrip_is_indexed(Via::Guard, Leak::DrainedInPlace);
+}
+
+#[test]
+fn for_each_logs_drained_in_place_are_indexed() {
+    drained_logs_roundtrip_is_indexed(Via::ForEach, Leak::DrainedInPlace);
+}
