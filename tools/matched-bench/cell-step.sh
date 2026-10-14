@@ -92,18 +92,23 @@ cell_step_fallback() { # RUN_DIR CELL_DIR LABEL ARM REP SPEC REASON: bash-only r
 }
 
 cell_step_rerun_pass() { # RUN_DIR RUNNER: run each queued <label>-rerun once, through RUNNER SPEC -rerun
-    local run=$1 fn=$2 line rl ol arm rep spec n=0 out
-    local -a q=()
-    out=$(timeout 60 python3 -I "$CELL_STEP_PY" pending-reruns --run-dir "$run" < /dev/null) \
+    # RUNNER runs in this shell, and bash locals are dynamically scoped: a runner that assigns a name without
+    # `local` writes OUR variable (the template's cell() sets n=0, so every rerun of ozarchy-p4gate printed 1/N).
+    # Hence the _csrp_ names, and the progress index comes from the for word list (expanded once, before the
+    # first call), so nothing the runner assigns can change the count, the total or the label we print.
+    local _csrp_run=$1 _csrp_fn=$2 _csrp_line _csrp_rl _csrp_ol _csrp_arm _csrp_rep _csrp_spec _csrp_out _csrp_i
+    local _csrp_total
+    local -a _csrp_q=()
+    _csrp_out=$(timeout 60 python3 -I "$CELL_STEP_PY" pending-reruns --run-dir "$_csrp_run" < /dev/null) \
         || { echo "[$(date +%T)] RERUN PASS: cannot read the queue"; return 2; }
-    [ -n "$out" ] && mapfile -t q <<< "$out"
-    if [ ${#q[@]} = 0 ]; then echo "[$(date +%T)] RERUN PASS: nothing queued"; return 0; fi
-    echo "[$(date +%T)] RERUN PASS: ${#q[@]} queued: $(for line in "${q[@]}"; do printf '%s ' "${line%%$'\t'*}"; done)"
-    for line in "${q[@]}"; do
-        IFS=$'\t' read -r rl ol arm rep spec <<< "$line"
-        n=$((n + 1))
-        echo "[$(date +%T)] RERUN $n/${#q[@]} $rl (bad cell $ol, arm $arm, rep $rep, spec $spec)"
-        "$fn" "$spec" -rerun || { echo "[$(date +%T)] RERUN PASS STOP at $rl"; return 1; }
+    [ -n "$_csrp_out" ] && mapfile -t _csrp_q <<< "$_csrp_out"
+    _csrp_total=${#_csrp_q[@]}
+    if [ "$_csrp_total" = 0 ]; then echo "[$(date +%T)] RERUN PASS: nothing queued"; return 0; fi
+    echo "[$(date +%T)] RERUN PASS: $_csrp_total queued: $(for _csrp_line in "${_csrp_q[@]}"; do printf '%s ' "${_csrp_line%%$'\t'*}"; done)"
+    for _csrp_i in $(seq 1 "$_csrp_total"); do
+        IFS=$'\t' read -r _csrp_rl _csrp_ol _csrp_arm _csrp_rep _csrp_spec <<< "${_csrp_q[_csrp_i - 1]}"
+        echo "[$(date +%T)] RERUN $_csrp_i/$_csrp_total $_csrp_rl (bad cell $_csrp_ol, arm $_csrp_arm, rep $_csrp_rep, spec $_csrp_spec)"
+        "$_csrp_fn" "$_csrp_spec" -rerun || { echo "[$(date +%T)] RERUN PASS STOP at $_csrp_rl"; return 1; }
     done
     echo "[$(date +%T)] RERUN PASS END"
     return 0
