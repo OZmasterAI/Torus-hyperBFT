@@ -1,0 +1,122 @@
+# archive-campaign.py meta for campaign ozarchy-g3 (results doc section 65, plan row 73).
+# This file is the only hand-written input; everything else (rows, sizes, rm lists, tools copy) is generated.
+# Modelled on meta/p4s0.toml (binaries of ozarchy-g3s0's stage, analyst scripts not named a-*.py).
+
+camp = "g3"
+section = "65"
+plan_row = 73
+plan_doc = "docs/plans/item6-phase2-impl.md"
+# The cells ran 02:33-04:42 local time on 2026-10-14 (summary.json generated_at is UTC).
+date = "2026-10-14"
+
+description = "item 6 Gate 3 checkpoint (main d3cba5e2 vs pre-item-6 main 199bdc97 with backported bench; oracle off / on; 199bdc97 + LD_PRELOAD je)"
+cell_role = "throughput"
+env_base = "6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; TORUS_CHECKPOINT_INTERVAL_MS unset (M: 15 s validator default; G: no checkpoints); CLOID_SHARE=0"
+# No ozarchy-g3-build / -stage: the binaries are ozarchy-g3s0's (md5s.txt lines G, bG, bench-bG, M, bench-M).
+binaries = "G 199bdc97 (node d6b05d8e = bench/g3-base-199bdc97 22d3cc03 node, bench a951801c from 22d3cc03), M d3cba5e2 (node c2fda80f, bench ff08433d), GJ wrapper e676f703 (LD_PRELOAD /usr/lib/libjemalloc.so.2, execs the G node); ozarchy-g3s0's build, staged in ozarchy-g3s0-stage/{g-run,g-je,m-run}"
+
+[arms.goff]
+meaning = "G: pre-item-6 main 199bdc97 node (glibc), backported bench 22d3cc03, oracle feed off"
+env = "glibc; ORACLE_FEED=0; bench a951801c (backport); in-flight tail commit"
+
+[arms.moff]
+meaning = "M: main d3cba5e2 node (jemalloc compiled in), oracle feed off"
+env = "je compiled in; ORACLE_FEED=0; in-flight tail commit"
+
+[arms.mon]
+meaning = "M: main d3cba5e2 node (jemalloc compiled in), oracle feed on (30000, 2000 ms, walk 0), as shipped"
+env = "je compiled in; ORACLE_FEED=1 (30000, 2000 ms, walk 0); in-flight tail commit"
+
+[arms.gjoff]
+meaning = "GJ: the G node behind the LD_PRELOAD wrapper (system jemalloc 5.3.1, MALLOC_CONF unset), oracle feed off"
+env = "LD_PRELOAD /usr/lib/libjemalloc.so.2 (wrapper e676f703); ORACLE_FEED=0; bench a951801c (backport); in-flight tail commit"
+
+# analyst/cells.json is a list (no tag lookup), and "w0" / "rerun" are the last name tokens.
+[cell_arms]
+"ozarchy-g3-300m-w0" = "moff"
+"ozarchy-g3-300m-r1-gjoff-rerun" = "gjoff"
+"ozarchy-g3-300m-r2-gjoff-rerun" = "gjoff"
+"ozarchy-g3-300m-r3-gjoff-rerun" = "gjoff"
+"ozarchy-g3-300m-r4-gjoff-rerun" = "gjoff"
+"ozarchy-g3-300m-r2-moff-rerun" = "moff"
+"ozarchy-g3-smoke-300m-s0-gjoff-rerun" = "gjoff"
+"ozarchy-g3-smoke-300m-s0-mon-rerun" = "mon"
+
+[cell_notes]
+"ozarchy-g3-300m-r2-moff" = "EXCLUDED by the owner (Codex stop review 03:01-03:04 overlapped it, load1 36.9); replaced by r2-moff-rerun"
+"ozarchy-g3-300m-r2-moff-rerun" = "replaces r2-moff (owner; appended to rerun-queue.tsv by hand)"
+"ozarchy-g3-300m-r1-gjoff" = "md5 CELL-FLAG = false positive (wrapper md5 in summary.json; running exe d6b05d8e, je preloaded + mapped on 3 nodes)"
+"ozarchy-g3-300m-r2-gjoff" = "md5 CELL-FLAG = false positive (wrapper md5)"
+"ozarchy-g3-300m-r3-gjoff" = "md5 CELL-FLAG = false positive (wrapper md5); localsearch window"
+"ozarchy-g3-300m-r4-gjoff" = "md5 CELL-FLAG = false positive (wrapper md5)"
+"ozarchy-g3-300m-r1-gjoff-rerun" = "extra GJ replicate (queued for the md5 flag); md5 CELL-FLAG = false positive"
+"ozarchy-g3-300m-r2-gjoff-rerun" = "extra GJ replicate (queued for the md5 flag); md5 CELL-FLAG = false positive"
+"ozarchy-g3-300m-r3-gjoff-rerun" = "extra GJ replicate (queued for the md5 flag); md5 CELL-FLAG = false positive"
+"ozarchy-g3-300m-r4-gjoff-rerun" = "extra GJ replicate (queued for the md5 flag); md5 CELL-FLAG = false positive"
+"ozarchy-g3-300m-r2-goff" = "localsearch window (03:19-03:47), kept"
+"ozarchy-g3-300m-r3-mon" = "localsearch window (03:19-03:47), kept"
+"ozarchy-g3-300m-r3-goff" = "localsearch window (03:19-03:47), kept"
+"ozarchy-g3-300m-r3-moff" = "localsearch window (03:19-03:47), kept; -4.0% vs r1-moff (borderline)"
+"ozarchy-g3-smoke-300m-s0-mon" = "rc 2 DISAGREE: block hash read ERR on val0 / val1, state digests identical; rerun AGREE"
+"ozarchy-g3-smoke-300m-s0-gjoff" = "md5 CELL-FLAG = false positive (wrapper md5)"
+"ozarchy-g3-smoke-300m-s0-gjoff-rerun" = "md5 CELL-FLAG = false positive (wrapper md5)"
+
+[dirs]
+run = '''g3 campaign log, done marker, cells.tsv (per-cell step rows), rerun-queue.tsv, cell-step/ (per-cell validation + analysis records), handoff.json / handoff-tables.txt, smoke/ (smoke campaign log, cells.tsv, rerun-queue.tsv, cell-step), analyst/ (extract.py, stats.py, secondary.py, cells.json; extract.txt, stats.txt, secondary.txt and writeup.py / writeup.txt made for the write-up)'''
+tools = '''g3 campaign driver ozarchy-g3-campaign.sh (CAMP=G3) and its generator make-g3-driver.py (from ozarchy-p4s0-campaign.sh), analyst/a-cells.py (section 60's, not run), matched-bench tools copy (= d3cba5e2's `tools/matched-bench`, byte for byte; not archived)'''
+
+[index]
+dirs_summary = '''16 SAT cells (r1-r4 x goff / moff / mon / gjoff), 5 rerun cells (r1-r4-gjoff-rerun, r2-moff-rerun), the warm-up `w0`, 6 smoke cells `ozarchy-g3-smoke-300m-s0-*`, `ozarchy-g3-run`, `-tools` (binaries: ozarchy-g3s0's stage)'''
+update = '''Item 6 Gate 3 checkpoint (18c, owner design s54): G = pre-item-6 main `199bdc97` (glibc; node `d6b05d8e`), bench backported on branch `bench/g3-base-199bdc97` @ `22d3cc03` (tools/bench-throughput only, old signing, `--cloid-share 0` only; bench `a951801c`; the base sha stays `199bdc97`) vs M = main `d3cba5e2` (Phases 1-3 + step 6, jemalloc compiled in; node `c2fda80f`, bench `ff08433d`); arms goff / moff (oracle off on both: `199bdc97` has no mark aggregation), mon (M oracle on, "as shipped") and gjoff (the G node through an LD_PRELOAD jemalloc wrapper, md5 `e676f703`); binaries from ozarchy-g3s0's build, staged in `ozarchy-g3s0-stage/`; 300 markets, CLOID_SHARE=0, saturated (RATE 76000), commit tail; harness = the `d3cba5e2` worktree; driver `ozarchy-g3-campaign.sh` CAMP=G3 (in `tools/ozarchy-g3-tools/` with its generator and the analyst scripts). Cells: w0 (60 s), r1-r4 in rotated balanced rounds (120 s), reruns r1-r4-gjoff-rerun (extra replicates) and r2-moff-rerun (replaces r2-moff, excluded by the owner). Section 65 is built on `ozarchy-g3-run/analyst/` (`cells.json`, `extract.txt`, `stats.txt`, `secondary.txt`, `writeup.txt`), `cells.tsv`, `handoff.json`, `campaign.log` and the cells' `summary.json`, `agreement.jsonl`, `state-digest-val*.txt`, `node-environ-trie.txt`, `node-preload.txt`, `node-maps-jemalloc.txt`, `cpu.csv`, `mem-samples.txt`, `metrics-after-val*.txt` and `buckets.csv` (keep); the node logs, `tasks.txt` and `sampler.csv` are Tier B.'''
+
+[cells]
+heading = '''item 6 Gate 3 checkpoint: goff = pre-item-6 main `199bdc97` (glibc, node `d6b05d8e`, backported bench `a951801c` from `bench/g3-base-199bdc97` `22d3cc03`), moff / mon = main `d3cba5e2` (jemalloc compiled in, node `c2fda80f`, bench `ff08433d`) with the oracle feed off / on, gjoff = the G node behind an LD_PRELOAD jemalloc wrapper (`e676f703`); 300 markets, CLOID_SHARE=0, saturated (RATE 76000), commit tail, tw, Classic, shared NVMe, harness = the `d3cba5e2` worktree; n = 4 per arm in rotated balanced rounds, 120 s; all cells ACCEPT AGREE; r2-moff excluded by the owner (replaced by r2-moff-rerun), GJ reruns are extra replicates, GJ md5 flags are false positives; warm-up w0 and the smoke cells excluded (section 65)'''
+
+[deletable]
+note = '''Campaign ozarchy-{camp} (results doc section {section}, plan row {plan_row}): item 6 Gate 3 checkpoint, main `d3cba5e2` vs pre-item-6 main `199bdc97` (backported bench). Section {section} is built on `ozarchy-g3-run/analyst/` (`cells.json`, `extract.txt`, `stats.txt`, `secondary.txt`, `writeup.txt` and the scripts), `ozarchy-g3-run/cells.tsv` / `handoff.json` / `campaign.log` / `cell-step/` and the cells' `summary.json`, `agreement.jsonl`, `state-digest-val*.txt`, `node-environ-trie.txt`, `node-preload.txt`, `node-maps-jemalloc.txt`, `cpu.csv`, `mem-samples.txt`, `metrics-after-val*.txt` and `buckets.csv` (keep; `extract.py` reads all of them, `buckets.csv` for the block time). No Tier A in this campaign's dirs: the binaries are ozarchy-g3s0's (`ozarchy-g3s0-build/`, `ozarchy-g3s0-stage/{g-run,g-je,m-run}`; md5s in `ozarchy-g3s0-build/md5s.txt`), shared with ozarchy-p4s0, whose raw profile needs the staged M node. Keep them while a Gate 3 rerun on these binaries (after Phases 4-5) or a p4s0 re-analysis is possible; G and the backported bench are rebuildable from `199bdc97` / `22d3cc03` with `ozarchy-g3s0-build/build-bg.sh`, M from `d3cba5e2` with `build-m.sh`. Do not run the Tier B rm before the commit-interval p99 attribution follow-up (running on 2026-10-14) is written up: it may read the node logs and `sampler.csv`.'''
+tier_b_files = ["sampler.csv", "tasks.txt", "val*.log.gz"]
+kept = ["summary.json", "agreement.jsonl", "state-digest-val*.txt", "node-environ-trie.txt", "node-preload.txt", "node-maps-jemalloc.txt", "cpu.csv", "mem-samples.txt", "metrics-after-val*.txt", "buckets.csv"]
+
+[checks]
+# G / GJ cells (backported bench, no cloids) write `ingest.cloids: null`; section 65 notes it.
+known_fields = ["ingest.cloids"]
+produced_by = { "extract.txt" = "extract.py stdout (re-run for section 65 with the cells.json output in a scratch dir; cells.json byte for byte the analyst's)", "stats.txt" = "stats.py stdout (re-run for section 65; the analyst saved no text outputs)", "secondary.txt" = "secondary.py stdout (re-run for section 65)", "writeup.txt" = "writeup.py stdout (written for section 65)", "handoff-tables.txt" = "the campaign driver's handoff step" }
+
+[tools]
+# matched-bench/ is byte for byte d3cba5e2's tools/matched-bench (25 top-level files checked against the git blobs).
+exclude = ["matched-bench/*"]
+# The analyst's scripts are not named a-*.py, so the default copy misses them; the build md5s are g3s0's.
+extra = [
+  ["ozarchy-g3-run/analyst/extract.py", "analyst/extract.py"],
+  ["ozarchy-g3-run/analyst/stats.py", "analyst/stats.py"],
+  ["ozarchy-g3-run/analyst/secondary.py", "analyst/secondary.py"],
+  ["ozarchy-g3-run/analyst/writeup.py", "analyst/writeup.py"],
+  ["ozarchy-g3s0-build/md5s.txt", "md5s-all.txt"],
+]
+
+# Smoke: stats.py, secondary.py and writeup.py read the run's analyst/cells.json (hard-coded read path; they write nothing)
+# and the cells' cpu.csv / summary.json; each must reproduce its archived stdout. extract.py is not smoke-run: it writes
+# cells.json into the run's analyst dir (hard-coded path); its re-run into a scratch dir is noted in section 65.
+[[smoke]]
+name = "stats.py (ratios, Welch CIs, all treatments)"
+script = "analyst/stats.py"
+args = []
+timeout = 120
+[[smoke.compare]]
+want = "analyst/stats.txt"
+
+[[smoke]]
+name = "secondary.py (per-arm secondary metrics, load)"
+script = "analyst/secondary.py"
+args = []
+timeout = 120
+[[smoke.compare]]
+want = "analyst/secondary.txt"
+
+[[smoke]]
+name = "writeup.py (section 65 tables)"
+script = "analyst/writeup.py"
+args = []
+timeout = 120
+[[smoke.compare]]
+want = "analyst/writeup.txt"

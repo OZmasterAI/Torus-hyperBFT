@@ -1,0 +1,60 @@
+== owner (r2-moff->rerun)
+  goff   n=4 mean=  115066.8 sd=   599.6 cv= 0.52% min=114245.7 max=115666.0
+  moff   n=4 mean=  222132.0 sd=  4037.8 cv= 1.82% min=216504.6 max=225609.1
+  mon    n=4 mean=  211136.3 sd=  4661.9 cv= 2.21% min=207521.3 max=217949.9
+  gjoff  n=8 mean=  127454.1 sd=  2699.5 cv= 2.12% min=123337.6 max=132016.2
+  moff/goff: 1.9305 [95% CI 1.8769, 1.9851] df=3.5 step=107065 pooled_sd=2887 step/sd=37.1
+  mon/goff: 1.8349 [95% CI 1.7736, 1.8977] df=3.3 step=96070 pooled_sd=3324 step/sd=28.9
+  gjoff/goff: 1.1077 [95% CI 1.0876, 1.1277] df=8.5 step=12387 pooled_sd=2282 step/sd=5.4
+  moff/gjoff: 1.7428 [95% CI 1.6950, 1.7923] df=7.0 step=94678 pooled_sd=3161 step/sd=30.0
+  mon/moff: 0.9505 [95% CI 0.9176, 0.9845] df=5.8 step=-10996 pooled_sd=4361 step/sd=-2.5
+== owner (r2-moff->rerun) | without localsearch 5
+  goff   n=2 mean=  115472.9 sd=   273.2 cv= 0.24% min=115279.7 max=115666.0
+  moff   n=3 mean=  224007.8 sd=  1828.8 cv= 0.82% min=222014.9 max=225609.1
+  mon    n=3 mean=  211488.0 sd=  5644.3 cv= 2.67% min=207521.3 max=217949.9
+  gjoff  n=7 mean=  127501.5 sd=  2912.2 cv= 2.28% min=123337.6 max=132016.2
+  moff/goff: 1.9399 [95% CI 1.9050, 1.9754] df=2.5 step=108535 pooled_sd=1502 step/sd=72.3
+  mon/goff: 1.8315 [95% CI 1.7162, 1.9536] df=2.0 step=96015 pooled_sd=4611 step/sd=20.8
+  gjoff/goff: 1.1042 [95% CI 1.0808, 1.1276] df=6.4 step=12029 pooled_sd=2698 step/sd=4.5
+  moff/gjoff: 1.7569 [95% CI 1.7178, 1.7976] df=8.0 step=96506 pooled_sd=2683 step/sd=36.0
+  mon/moff: 0.9441 [95% CI 0.8895, 1.0017] df=2.4 step=-12520 pooled_sd=4195 step/sd=-3.0
+== kept (r2-moff + rerun)
+  goff   n=4 mean=  115066.8 sd=   599.6 cv= 0.52% min=114245.7 max=115666.0
+  moff   n=5 mean=  215867.3 sd= 14438.2 cv= 6.69% min=190808.5 max=225609.1
+  mon    n=4 mean=  211136.3 sd=  4661.9 cv= 2.21% min=207521.3 max=217949.9
+  gjoff  n=8 mean=  127454.1 sd=  2699.5 cv= 2.12% min=123337.6 max=132016.2
+  moff/goff: 1.8760 [95% CI 1.7174, 2.0415] df=4.1 step=100800 pooled_sd=10921 step/sd=9.2
+  mon/goff: 1.8349 [95% CI 1.7736, 1.8977] df=3.3 step=96070 pooled_sd=3324 step/sd=28.9
+  gjoff/goff: 1.1077 [95% CI 1.0876, 1.1277] df=8.5 step=12387 pooled_sd=2282 step/sd=5.4
+  moff/gjoff: 1.6937 [95% CI 1.5522, 1.8418] df=4.5 step=88413 pooled_sd=8969 step/sd=9.9
+  mon/moff: 0.9781 [95% CI 0.8997, 1.0669] df=4.9 step=-4731 pooled_sd=11333 step/sd=-0.4
+== kept (r2-moff + rerun) | without localsearch 5
+  goff   n=2 mean=  115472.9 sd=   273.2 cv= 0.24% min=115279.7 max=115666.0
+  moff   n=4 mean=  215708.0 sd= 16666.7 cv= 7.73% min=190808.5 max=225609.1
+  mon    n=3 mean=  211488.0 sd=  5644.3 cv= 2.67% min=207521.3 max=217949.9
+  gjoff  n=7 mean=  127501.5 sd=  2912.2 cv= 2.28% min=123337.6 max=132016.2
+  moff/goff: 1.8680 [95% CI 1.6399, 2.1179] df=3.0 step=100235 pooled_sd=14434 step/sd=6.9
+  mon/goff: 1.8315 [95% CI 1.7162, 1.9536] df=2.0 step=96015 pooled_sd=4611 step/sd=20.8
+  gjoff/goff: 1.1042 [95% CI 1.0808, 1.1276] df=6.4 step=12029 pooled_sd=2698 step/sd=4.5
+  moff/gjoff: 1.6918 [95% CI 1.4900, 1.9127] df=3.3 step=88206 pooled_sd=9912 step/sd=8.9
+  mon/moff: 0.9804 [95% CI 0.8698, 1.1099] df=3.8 step=-4220 pooled_sd=13394 step/sd=-0.3
+== main only (r2-moff, no rerun, no GJ reruns)
+  goff   n=4 mean=  115066.8 sd=   599.6 cv= 0.52% min=114245.7 max=115666.0
+  moff   n=4 mean=  214330.4 sd= 16192.6 cv= 7.55% min=190808.5 max=225609.1
+  mon    n=4 mean=  211136.3 sd=  4661.9 cv= 2.21% min=207521.3 max=217949.9
+  gjoff  n=4 mean=  128133.3 sd=  3054.3 cv= 2.38% min=124727.0 max=132016.2
+  moff/goff: 1.8627 [95% CI 1.6417, 2.1040] df=3.0 step=99264 pooled_sd=11458 step/sd=8.7
+  mon/goff: 1.8349 [95% CI 1.7736, 1.8977] df=3.3 step=96070 pooled_sd=3324 step/sd=28.9
+  gjoff/goff: 1.1136 [95% CI 1.0730, 1.1552] df=3.3 step=13067 pooled_sd=2201 step/sd=5.9
+  moff/gjoff: 1.6727 [95% CI 1.4816, 1.8809] df=3.6 step=86197 pooled_sd=11652 step/sd=7.4
+  mon/moff: 0.9851 [95% CI 0.8756, 1.1128] df=3.5 step=-3194 pooled_sd=11915 step/sd=-0.3
+== main only (r2-moff, no rerun, no GJ reruns) | without localsearch 5
+  goff   n=2 mean=  115472.9 sd=   273.2 cv= 0.24% min=115279.7 max=115666.0
+  moff   n=3 mean=  213605.7 sd= 19752.2 cv= 9.25% min=190808.5 max=225609.1
+  mon    n=3 mean=  211488.0 sd=  5644.3 cv= 2.67% min=207521.3 max=217949.9
+  gjoff  n=3 mean=  128470.2 sd=  3648.6 cv= 2.84% min=124727.0 max=132016.2
+  moff/goff: 1.8498 [95% CI 1.4563, 2.3358] df=2.0 step=98133 pooled_sd=16128 step/sd=6.1
+  mon/goff: 1.8315 [95% CI 1.7162, 1.9536] df=2.0 step=96015 pooled_sd=4611 step/sd=20.8
+  gjoff/goff: 1.1126 [95% CI 1.0374, 1.1925] df=2.0 step=12997 pooled_sd=2983 step/sd=4.4
+  moff/gjoff: 1.6627 [95% CI 1.3381, 2.0549] df=2.4 step=85135 pooled_sd=14203 step/sd=6.0
+  mon/moff: 0.9901 [95% CI 0.7994, 1.2329] df=2.3 step=-2118 pooled_sd=14526 step/sd=-0.1

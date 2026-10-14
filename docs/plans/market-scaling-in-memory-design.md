@@ -1007,6 +1007,14 @@ fixes 3/2a/1 + B); Gate 2 >= 0.9x main after Phase 1; Gate 3 >= 1.4x today's
 main at 300 markets after all phases. Devnet, oracle on, paired alternating
 cells, AGREE/PASS, normal drain.
 
+**Gate 3 checkpoint measured** (campaign ozarchy-g3, results doc section 65,
+2026-10-14; after Phases 1-3 + step 6, not after all phases): main `d3cba5e2`
+vs pre-item-6 main `199bdc97` (bench backported, branch
+`bench/g3-base-199bdc97`), matched/s 1.931x [1.877, 1.985] with the oracle
+off on both arms (`199bdc97` never computes marks) and 1.835x [1.774, 1.898]
+as shipped (`d3cba5e2` oracle on). The bench binaries and the action mix
+differ between the arms, so the ratio is end to end, not node only.
+
 ## Not building (YAGNI)
 
 - Async native trie maintenance: trie maintenance is off and has no
