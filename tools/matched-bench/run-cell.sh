@@ -59,6 +59,16 @@
 #                senders stall). Needs MAX_IN_FLIGHT and a bench built with the
 #                flag. Unset (default) = flag omitted = head. Recorded as
 #                cell.in_flight_tail in summary.json.
+#   IN_FLIGHT_TAIL_DEPTH=N  bench --in-flight-tail-depth N: the MAX_IN_FLIGHT
+#                block tail keeps up to N torus_getBlockBody reads in flight
+#                (heights next..next+N-1, still on val2) and applies the bodies
+#                strictly in height order; 1 = one at a time (the bench
+#                default). For testing whether the tail (~11 bodies/s one at a
+#                time) paces the senders. Either tail mode. Integer 1..64,
+#                needs MAX_IN_FLIGHT and a bench built with the flag
+#                (feat/bench-tail-depth or later). Unset (default) = flag
+#                omitted. Recorded as cell.in_flight_tail_depth in
+#                summary.json.
 #   ANTISPAM=1   turn the node anti-spam limits ON (devnet/wsl/env.sh has them
 #                OFF): TORUS_INGRESS_MIN_COLLATERAL=1, TORUS_ADDR_RATE_LIMIT=1,
 #                TORUS_RPC_IP_WEIGHT_PER_MIN=1200. Exported before EXTRA_ENV,
@@ -267,6 +277,7 @@ OPEN_ORDER_BUDGET=${OPEN_ORDER_BUDGET:-}
 RETRY_BUSY=${RETRY_BUSY:-}
 MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-}
 IN_FLIGHT_TAIL=${IN_FLIGHT_TAIL:-}
+IN_FLIGHT_TAIL_DEPTH=${IN_FLIGHT_TAIL_DEPTH:-}
 ANTISPAM=${ANTISPAM:-}
 SPAM_CANCEL_KEYS=${SPAM_CANCEL_KEYS:-}
 SPAM_CANCEL_RATE=${SPAM_CANCEL_RATE:-}
@@ -464,6 +475,8 @@ for t in jq curl python3 md5sum awk; do command -v $t >/dev/null || { echo "FATA
 [ -z "$MAX_IN_FLIGHT" ] || [[ "$MAX_IN_FLIGHT" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: MAX_IN_FLIGHT must be a positive integer" >&2; exit 2; }
 [ -z "$IN_FLIGHT_TAIL" ] || [ "$IN_FLIGHT_TAIL" = head ] || [ "$IN_FLIGHT_TAIL" = commit ] || { echo "FATAL: IN_FLIGHT_TAIL must be head, commit or unset" >&2; exit 2; }
 [ -z "$IN_FLIGHT_TAIL" ] || [ -n "$MAX_IN_FLIGHT" ] || { echo "FATAL: IN_FLIGHT_TAIL needs MAX_IN_FLIGHT" >&2; exit 2; }
+[ -z "$IN_FLIGHT_TAIL_DEPTH" ] || { [[ "$IN_FLIGHT_TAIL_DEPTH" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$IN_FLIGHT_TAIL_DEPTH" -le 64 ]; } || { echo "FATAL: IN_FLIGHT_TAIL_DEPTH must be an integer 1..64 or unset" >&2; exit 2; }
+[ -z "$IN_FLIGHT_TAIL_DEPTH" ] || [ -n "$MAX_IN_FLIGHT" ] || { echo "FATAL: IN_FLIGHT_TAIL_DEPTH needs MAX_IN_FLIGHT" >&2; exit 2; }
 [ -z "$ANTISPAM" ] || [ "$ANTISPAM" = 1 ] || { echo "FATAL: ANTISPAM must be 1 or unset" >&2; exit 2; }
 [ -z "$SPAM_CANCEL_KEYS" ] || [[ "$SPAM_CANCEL_KEYS" =~ ^[0-9]+$ ]] || { echo "FATAL: SPAM_CANCEL_KEYS must be an integer" >&2; exit 2; }
 [ -z "$SPAM_CANCEL_RATE" ] || [[ "$SPAM_CANCEL_RATE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "FATAL: SPAM_CANCEL_RATE must be a number (actions/s)" >&2; exit 2; }
@@ -582,7 +595,7 @@ trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 # Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
 if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' cloid_share='${CLOID_SHARE:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' in_flight_tail_depth='${IN_FLIGHT_TAIL_DEPTH:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' cloid_share='${CLOID_SHARE:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
@@ -833,6 +846,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 [ "$RETRY_BUSY" = 1 ] && BENCH_CMD+=(--retry-busy)
 [ -n "$MAX_IN_FLIGHT" ] && BENCH_CMD+=(--max-in-flight "$MAX_IN_FLIGHT" --in-flight-watch-rpc "${RPCS[2]}")
 [ -n "$IN_FLIGHT_TAIL" ] && BENCH_CMD+=(--in-flight-tail "$IN_FLIGHT_TAIL")
+[ -n "$IN_FLIGHT_TAIL_DEPTH" ] && BENCH_CMD+=(--in-flight-tail-depth "$IN_FLIGHT_TAIL_DEPTH")
 [ -n "$SPAM_CANCEL_KEYS" ] && BENCH_CMD+=(--spam-cancel-keys "$SPAM_CANCEL_KEYS")
 [ -n "$SPAM_CANCEL_RATE" ] && BENCH_CMD+=(--spam-cancel-rate "$SPAM_CANCEL_RATE")
 [ "$SPAM_CANCEL_FUNDED" = 1 ] && BENCH_CMD+=(--spam-cancel-funded)
@@ -1172,6 +1186,7 @@ python3 "$TOOLS_DIR/summarize.py" \
     --drain-timeout "$DRAIN_TIMEOUT" --markets-per-sender "${MPS:-}" \
     --max-in-flight "${MAX_IN_FLIGHT:-}" --open-order-budget "${OPEN_ORDER_BUDGET:-}" \
     --in-flight-tail "${IN_FLIGHT_TAIL:-}" \
+    --in-flight-tail-depth "${IN_FLIGHT_TAIL_DEPTH:-}" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}

@@ -16,14 +16,20 @@
 //!   ready_calls=<n> wait_cap_n= wait_cap_s= wait_cap_p50_ms= wait_cap_p99_ms=
 //!   wait_cancel_n= wait_cancel_s= wait_cancel_p50_ms= wait_cancel_p99_ms=
 //!   tail_rounds= tail_fetched= tail_fetch_max= tail_round_p50_ms=
-//!   tail_round_max_ms= tail_lag_max=
-//! release-timing-blocks: t=<s> seen=<height>@<unix ms>,...
+//!   tail_round_max_ms= tail_lag_max= tail_fetch_p50_ms= tail_fetch_p99_ms=
+//!   tail_fetch_max_ms= tail_apply_wait_p50_ms= tail_apply_wait_p99_ms=
+//!   tail_apply_wait_max_ms=
+//! release-timing-blocks: t=<s> fetch_ms=<height>:<ms>,...
+//!   applied=<height>@<unix ms>,... seen=<height>@<unix ms>,...
 //! ```
 //! (each is ONE line; wrapped here.)
 //!
 //! * `released`, `age_*`: actions released COMMITTED in the window; age =
-//!   wall ms when the tail had the body parsed minus the action nonce (wall ms
-//!   at signing, same host clock): sign + submit + mempool + consensus + tail.
+//!   wall ms when the tail applied the body (its slots freed) minus the action
+//!   nonce (wall ms at signing, same host clock): sign + submit + mempool +
+//!   consensus + tail. At `--in-flight-tail-depth` 1 a body is applied as
+//!   soon as it is parsed; deeper, a body that lands before a lower height
+//!   waits for it (`tail_apply_wait_*`).
 //! * `ready_calls`: `Cap::wait_ready` calls that returned a free slot (fires).
 //!   `wait_cap_*`: the calls that waited while the sender was at its cap;
 //!   `wait_cancel_*`: below the cap but held by its own in-flight cancel-all
@@ -38,9 +44,16 @@
 //!   `eth_blockNumber` minus the last read height at the poll start (the eth
 //!   head is min(applied, committed), so this is lag behind the head, not
 //!   behind commit); `-` in commit mode (no extra RPC to learn the head).
-//! * `seen`: when the tail had each body parsed. `torus_getBlockBody` carries
-//!   no commit or block timestamp, so join these with the node's commit log
-//!   offline for the commit-to-seen delay.
+//! * `tail_fetch_*`: per applied body, its read: `torus_getBlockBody` sent to
+//!   reply parsed (the reads of a missing or unreadable height are not
+//!   timed). `tail_apply_wait_*`: per applied body, reply parsed to applied
+//!   (about 0 at depth 1).
+//! * `seen`: when the tail had each body parsed (its reply's arrival, also
+//!   when a lower height kept it waiting). `torus_getBlockBody` carries no
+//!   commit or block timestamp, so join these with the node's commit log
+//!   offline for the commit-to-seen delay. `applied`: when its slots freed.
+//!   `fetch_ms`: its read time, as `tail_fetch_*`. `seen` stays the last
+//!   field, so parsers of the s121 line still read it to the end of the line.
 //!
 //! End of run, one line per histogram (run totals):
 //!
@@ -48,7 +61,8 @@
 //! release-timing-hist: what=<name> n= sum= p50= p90= p99= p999= max= buckets=<lo>:<count>,...
 //! ```
 //! names: `age_ms`, `wait_cap_us`, `wait_cancel_us`, `tail_round_us`,
-//! `tail_fetched_per_round`, `tail_lag_heights`.
+//! `tail_fetched_per_round`, `tail_lag_heights`, `tail_fetch_us`,
+//! `tail_apply_wait_us`.
 //!
 //! Histogram: values below 32 exact, above that 16 buckets per power of two;
 //! a quantile is its bucket's lower bound (at most 6.25% low), capped at max.
@@ -326,6 +340,8 @@ impl TailTiming {
     /// The open poll applied `body`.
     pub fn on_body(&mut self, body: TailBody) {
         self.round_fetched += 1;
+        self.fetch_us.record(body.fetch_us);
+        self.apply_wait_us.record(body.wait_us);
         self.seen.push(body);
     }
 
@@ -392,7 +408,8 @@ pub fn window_lines(
         "release-timing: t={t_s:.1} wall_ms={wall_ms} final={} released={} age_p50_ms={} \
          age_p90_ms={} age_p99_ms={} age_max_ms={} ready_calls={} {} {} tail_rounds={} \
          tail_fetched={} tail_fetch_max={} tail_round_p50_ms={} tail_round_max_ms={} \
-         tail_lag_max={}",
+         tail_lag_max={} tail_fetch_p50_ms={} tail_fetch_p99_ms={} tail_fetch_max_ms={} \
+         tail_apply_wait_p50_ms={} tail_apply_wait_p99_ms={} tail_apply_wait_max_ms={}",
         u8::from(last),
         age.n,
         n(age.p50),
@@ -408,13 +425,22 @@ pub fn window_lines(
         ms(tail.round_us.p50),
         ms(max(&tail.round_us)),
         n(max(&tail.lag)),
+        ms(tail.fetch_us.p50),
+        ms(tail.fetch_us.p99),
+        ms(max(&tail.fetch_us)),
+        ms(tail.apply_wait_us.p50),
+        ms(tail.apply_wait_us.p99),
+        ms(max(&tail.apply_wait_us)),
     );
-    let seen: Vec<String> = tail
-        .seen
-        .iter()
-        .map(|b| format!("{}@{}", b.height, b.seen_ms))
-        .collect();
-    let blocks = format!("release-timing-blocks: t={t_s:.1} seen={}", seen.join(","));
+    let list =
+        |f: &dyn Fn(&TailBody) -> String| tail.seen.iter().map(f).collect::<Vec<_>>().join(",");
+    // `seen` last: parsers of the s121 line read it to the end of the line.
+    let blocks = format!(
+        "release-timing-blocks: t={t_s:.1} fetch_ms={} applied={} seen={}",
+        list(&|b| format!("{}:{:.1}", b.height, b.fetch_us as f64 / 1e3)),
+        list(&|b| format!("{}@{}", b.height, b.applied_ms)),
+        list(&|b| format!("{}@{}", b.height, b.seen_ms)),
+    );
     [main, blocks]
 }
 
@@ -551,7 +577,10 @@ mod tests {
         assert_eq!((w.fetched.sum, w.fetched.max), (2, 2));
         assert_eq!((w.lag.n, w.lag.max), (1, 3), "lag only when known");
         assert_eq!(
-            w.seen.iter().map(|b| (b.height, b.seen_ms, b.applied_ms)).collect::<Vec<_>>(),
+            w.seen
+                .iter()
+                .map(|b| (b.height, b.seen_ms, b.applied_ms))
+                .collect::<Vec<_>>(),
             vec![(7, 1_000, 1_000), (8, 1_050, 1_053)]
         );
         // Per-body read time and apply wait, one sample per applied body.

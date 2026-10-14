@@ -610,11 +610,49 @@ No extra RPC, no new lock on the send path.
   `release-timing-blocks: t=.. seen=<height>@<unix ms>,...`.
   `torus_getBlockBody` has no commit timestamp: join `seen` with the node's
   commit log offline for the commit-to-seen delay.
+- Per-body read time and apply lag (feat/bench-tail-depth, any depth): the
+  `release-timing:` line ends in `tail_fetch_p50_ms= tail_fetch_p99_ms=
+  tail_fetch_max_ms= tail_apply_wait_p50_ms= tail_apply_wait_p99_ms=
+  tail_apply_wait_max_ms=` (fetch = `torus_getBlockBody` sent to reply
+  parsed, per applied body; apply wait = reply parsed to applied, ~0 at
+  depth 1), and the blocks line is
+  `release-timing-blocks: t=.. fetch_ms=<h>:<ms>,... applied=<h>@<unix ms>,... seen=<h>@<unix ms>,...`.
+  `seen` is still the reply's arrival (also when a lower height kept the body
+  waiting) and stays the LAST field, so parsers of the older line still work;
+  `applied` = when its slots freed (release age `age_*` counts to it).
 - End of run, next to the `In-flight cap ...` line, one
-  `release-timing-hist: what=<age_ms|wait_cap_us|wait_cancel_us|tail_round_us|tail_fetched_per_round|tail_lag_heights> n= sum= p50= p90= p99= p999= max= buckets=<lo>:<count>,...`
+  `release-timing-hist: what=<age_ms|wait_cap_us|wait_cancel_us|tail_round_us|tail_fetched_per_round|tail_lag_heights|tail_fetch_us|tail_apply_wait_us> n= sum= p50= p90= p99= p999= max= buckets=<lo>:<count>,...`
   per histogram (16 buckets per power of two, quantiles at most 6.25% low).
+  Bench-side fetch time per body for the run: `what=tail_fetch_us` p50/p99.
 
 summarize.py does not read them yet: `grep '^release-timing' bench.log`.
+
+### Tail read-ahead (`IN_FLIGHT_TAIL_DEPTH`)
+
+`IN_FLIGHT_TAIL_DEPTH=N` (bench `--in-flight-tail-depth N`, 1..64, needs
+`MAX_IN_FLIGHT`) lets the in-flight tail keep N `torus_getBlockBody` reads in
+flight, for heights next..next+N-1 (head mode: up to `eth_blockNumber`),
+still on val2 (`RPCS[2]`). Replies are taken strictly in height order
+(`FuturesOrdered`): a body that lands early waits for the lower heights, so
+the tracker releases blocks in order and each height once. The first height
+without a readable body ends the poll exactly as at depth 1 (one error /
+idle poll, the reads above it are dropped and issued again next poll; the
+commit-mode hole check still reads one height at a time), so misses and
+skips are the same as at depth 1. Depth 1 (the default; unset = flag
+omitted, so older bench binaries still run) is the one-at-a-time tail, read
+for read. Use it to test whether the tail (one body at a time, ~11 bodies/s
+under 10-market load) paces the sender releases: compare
+`tail_fetch_*`/`tail_apply_wait_*` and `age_*` between depths.
+
+At the tip in commit mode every poll issues N reads, N-1 of them for heights
+not committed yet (`null`, cheap). bench.log: `In-flight tail depth: N ...`
+at start and ` | tail_depth=N` at the end of the `In-flight cap ...` line
+(N > 1 only). summary.json: `cell.in_flight_tail_depth` (`null` = unset = 1)
+and `ingest.in_flight.tail_depth` (from bench.log, 1 without the suffix).
+
+Self-tests: `test_harness.py` (`test_in_flight_tail_depth_*`,
+`test_deep_tail_cell_records_the_tail_depth`); bench crate `in_flight::tests`
+(`depth_one_matches_*`, `deep_tail_*`, `tail_depth_*`).
 
 ## New campaign from the template (per-cell write-up step, rerun queue)
 

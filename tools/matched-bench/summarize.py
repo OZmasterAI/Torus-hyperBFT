@@ -23,7 +23,7 @@ for a in ["out", "label", "worktree", "commit", "dirty", "markets", "dur", "rate
           "env-digests", "extra-env", "bench-cmd", "pids", "evicted", "bench-submitted",
           "block-cap", "dissem", "digest-secs", "digest-heights", "digest-quiescent",
           "drain-timeout", "markets-per-sender", "max-in-flight", "open-order-budget",
-          "in-flight-tail"]:
+          "in-flight-tail", "in-flight-tail-depth"]:
     ap.add_argument("--" + a, default="")
 A = ap.parse_args()
 OUT = A.out
@@ -1210,6 +1210,10 @@ def parse_bench_log(path):
         # default, and every bench before the flag) prints no suffix.
         t = re.search(r"missed=\d+ \| tail=(\w+)", text)
         inflight["tail_mode"] = t.group(1) if t else "head"
+        # --in-flight-tail-depth N > 1 appends " | tail_depth=N" (after the
+        # tail mode); 1 (the default, every bench before the flag) prints none.
+        d = re.search(r"missed=\d+(?: \| tail=\w+)? \| tail_depth=(\d+)", text)
+        inflight["tail_depth"] = int(d.group(1)) if d else 1
     m = re.search(r"Cancel-by-id \(load-gen\): cancel sent (\d+) accepted (\d+) \| modify sent (\d+) "
                   r"accepted (\d+) \| lookups (\d+) errors (\d+) \| no own order (\d+)", text)
     by_id = None if not m else dict(zip(
@@ -1285,6 +1289,8 @@ summary = {
              "max_in_flight": int(A.max_in_flight) if A.max_in_flight else None,
              # run-cell IN_FLIGHT_TAIL; None = unset = the bench default (head).
              "in_flight_tail": A.in_flight_tail or None,
+             # run-cell IN_FLIGHT_TAIL_DEPTH; None = unset = the bench default (1).
+             "in_flight_tail_depth": int(A.in_flight_tail_depth) if A.in_flight_tail_depth else None,
              # None = unset on the nodes = jsonrpsee's 10 MiB default.
              "rpc_max_response_mb": (int(NODE_ENV["TORUS_RPC_MAX_RESPONSE_MB"])
                                      if str(NODE_ENV.get("TORUS_RPC_MAX_RESPONSE_MB", "")).isdigit() else None),
