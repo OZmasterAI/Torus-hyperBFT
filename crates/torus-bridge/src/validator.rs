@@ -39,8 +39,6 @@ pub struct ValidatedBlock {
     pub evm_root_updates: Option<(B256, TrieUpdates)>,
     /// Recovered (sender, action) pairs for post-commit native execution.
     pub native_sender_actions: Vec<(Address, NativeAction)>,
-    /// Consumed nonces for post-commit persistence.
-    pub native_consumed_nonces: Vec<(Address, u64)>,
 }
 
 /// Validates proposed blocks by re-executing EVM transactions and verifying the state root.
@@ -221,7 +219,6 @@ impl BlockValidator {
             state_root: computed_root,
             evm_root_updates,
             native_sender_actions: vec![],
-            native_consumed_nonces: vec![],
         })
     }
 
@@ -331,7 +328,6 @@ impl BlockValidator {
             // reusable for a single-block commit.
             evm_root_updates: None,
             native_sender_actions: vec![],
-            native_consumed_nonces: vec![],
         })
     }
 }

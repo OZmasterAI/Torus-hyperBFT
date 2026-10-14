@@ -13,6 +13,7 @@ pub mod error;
 pub mod incremental;
 pub mod native_da;
 pub mod native_trie;
+pub mod nonce_window;
 pub mod overlay;
 pub mod pruner;
 pub mod read_view;
