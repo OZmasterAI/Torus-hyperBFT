@@ -425,6 +425,11 @@ mod liquidation_step;
 
 #[path = "users.rs"]
 mod users;
+
+// Item 6 Phase 4 step 5: the per-user open-order counter.
+#[path = "open_orders.rs"]
+mod open_orders;
+use open_orders::OpenOrders;
 use users::Users;
 
 #[cfg(test)]
@@ -721,6 +726,7 @@ struct PrepPass {
 /// (median ~0.87x) under emulated bursty load, which still leaves out the
 /// bench's spawn waits. Larger counts (e.g. 1000 books x 400 senders: 38 ms
 /// serial, ~12 ms on 4 workers on an idle host) still split.
+#[cfg(any(test, debug_assertions, feature = "test-reference-paths"))]
 const OPEN_COUNT_WORK_PER_THREAD: usize = 100_000;
 
 #[cfg(test)]
@@ -3218,6 +3224,10 @@ struct ResidentInner {
     /// built since the last load; the next check with a cloid builds it).
     /// Every book's cloid log is empty here (drained at the stash).
     cloid_markets: Option<CloidMarkets>,
+    /// Item 6 Phase 4 step 5: the books' per-user open-order counter
+    /// ([`OpenOrders`]; `None`: not built since the last load); the logs it
+    /// has not absorbed yet ride in the books.
+    open_orders: Option<OpenOrders>,
     /// Post-block global order-id high-water mark (replaces the load scan).
     next_global_order_id: u128,
     /// The block height whose POST-state this reflects (staleness guard).
@@ -3529,6 +3539,26 @@ impl ResidentBooks {
             (
                 inner.cloid_markets.as_ref().map(CloidMarkets::snapshot),
                 cloid_index_rebuilt(&inner.books),
+            )
+        })
+    }
+
+    /// Item 6 Phase 4 step 5 (tests): `(carried, books)`: the open-order
+    /// counter carried with the books plus their logs not absorbed yet
+    /// (`None`: not built since the last load), and every user's count over
+    /// them. `None`: no resident books.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    #[allow(clippy::type_complexity)]
+    pub fn open_count_view(
+        &self,
+    ) -> Option<(
+        Option<std::collections::BTreeMap<Address, u32>>,
+        std::collections::BTreeMap<Address, u32>,
+    )> {
+        self.inner.as_ref().map(|inner| {
+            (
+                inner.open_orders.as_ref().map(|c| c.with_logs(&inner.books)),
+                OpenOrders::recount(&inner.books),
             )
         })
     }
@@ -4474,6 +4504,11 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// ([`CloidMarkets`]; `None` until the first duplicate-cloid check after
     /// a load builds it, carried in the resident holder).
     cloid_markets: Option<CloidMarkets>,
+    /// Item 6 Phase 4 step 5: each user's open orders over `order_books`
+    /// ([`OpenOrders`]; `None` until the first count after a load builds it
+    /// from the books, carried in the resident holder); read through
+    /// [`Self::open_counts`].
+    open_orders: Option<OpenOrders>,
     /// FIX 6 (ECON-FIND-09): Global order ID counter shared across all markets.
     pub next_global_order_id: u128,
     /// Counter value at load time — the counter row is persisted only when it
@@ -4627,6 +4662,12 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// overlay writes are compared against. Default off.
     #[cfg(any(test, feature = "test-reference-paths"))]
     pub test_flush_per_row: bool,
+    /// Item 6 Phase 4 step 5: test-only reference switch. `true` counts each
+    /// sender's open orders over every book per call (the pre-step-5 path,
+    /// [`NativeExecutor::open_order_counts`]) instead of reading the
+    /// counter, the reference the counter is compared against. Default off.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_open_count_scan: bool,
 }
 
 /// bl1 exec-chain-sub-100-attribution: per-block nanosecond split of
@@ -4697,6 +4738,14 @@ pub struct ExecPhaseAccum {
     /// cloid, single path and batch pre-pass), and the books they probed.
     pub cloid_checks: u64,
     pub cloid_books_probed: u64,
+    /// Item 6 Phase 4 step 5: exec-thread time getting the senders' open
+    /// orders for the cap ([`NativeExecContext::open_counts`]: absorbing the
+    /// books' logs into the counter plus the lookups). Nested in `margin_ns`
+    /// (batch path) or `phase1_actions_ns` (single path); not in the total.
+    pub open_count_ns: u128,
+    /// Step 5: open-order log entries absorbed (one per (book, user) whose
+    /// count changed since the last absorb).
+    pub open_count_deltas: u64,
 }
 
 impl ExecPhaseAccum {
@@ -4975,10 +5024,14 @@ impl<T: StateBackend> NativeExecContext<T> {
         // one (the first cancel-all builds it from the books).
         let mut trader_markets = None;
         let mut cloid_markets = None;
+        // Step 5: the resident counter; a load starts without one (the
+        // first count builds it from the books).
+        let mut open_orders = None;
         let (mut order_books, scanned_next_id, load_error) = match reused_inner {
             Some(inner) => {
                 trader_markets = inner.trader_markets;
                 cloid_markets = inner.cloid_markets;
+                open_orders = inner.open_orders;
                 (inner.books, inner.next_global_order_id, None)
             }
             None => match book_mode {
@@ -5008,6 +5061,13 @@ impl<T: StateBackend> NativeExecContext<T> {
             // come with empty logs: the stash drained them).
             for book in order_books.values_mut() {
                 book.clear_cloid_log();
+            }
+        }
+        if open_orders.is_none() {
+            // Step 5: likewise for the open-order counter (the build counts
+            // the books; what the load logged is in them).
+            for book in order_books.values_mut() {
+                book.clear_open_log();
             }
         }
 
@@ -5085,6 +5145,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             sums: None,
             trader_markets,
             cloid_markets,
+            open_orders,
             next_global_order_id,
             loaded_next_global_order_id: persisted_next_id,
             block_height,
@@ -5128,6 +5189,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             test_cancel_all_full_scan: false,
             #[cfg(any(test, feature = "test-reference-paths"))]
             test_flush_per_row: false,
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            test_open_count_scan: false,
         }
     }
 
@@ -5227,10 +5290,17 @@ impl<T: StateBackend> NativeExecContext<T> {
         if let Some(index) = &self.cloid_markets {
             index.debug_assert_covers(&self.order_books, true);
         }
+        // Step 5: the counter goes with the books, unabsorbed logs inside
+        // them (the next block's first count absorbs them, timed there).
+        #[cfg(debug_assertions)]
+        if let Some(counter) = &self.open_orders {
+            counter.debug_assert_exact(&self.order_books);
+        }
         resident.inner = Some(ResidentInner {
             books: std::mem::take(&mut self.order_books),
             trader_markets: self.trader_markets.take(),
             cloid_markets: self.cloid_markets.take(),
+            open_orders: self.open_orders.take(),
             next_global_order_id: self.next_global_order_id,
             height: self.block_height,
         });
@@ -5239,6 +5309,51 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// rank8 staleness guard input: the DB's native applied-height marker.
     fn read_applied_marker(state: &T) -> Result<Option<u64>, torus_state::error::StateError> {
         applied_marker(state)
+    }
+
+    /// Item 6 Phase 4 step 5: open orders (resting plus pending stops, all
+    /// books) of each of `senders` (one entry per distinct sender), for the
+    /// per-user cap. Absorbs the books' open-order logs into the counter,
+    /// then reads it: O(changed (book, user) pairs + senders), was a walk of
+    /// every book per call. Debug builds compare with that walk.
+    fn open_counts<'a>(
+        &mut self,
+        senders: impl Iterator<Item = &'a Address>,
+    ) -> HashMap<Address, u32> {
+        let timer = std::time::Instant::now();
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        if self.test_open_count_scan {
+            let out = NativeExecutor::open_order_counts(&self.order_books, senders);
+            self.phase_accum.open_count_ns += timer.elapsed().as_nanos();
+            return out;
+        }
+        let books = &mut self.order_books;
+        let counter = self.open_orders.get_or_insert_with(|| OpenOrders::build(books));
+        self.phase_accum.open_count_deltas += counter.absorb(books);
+        let mut out: HashMap<Address, u32> = HashMap::default();
+        for sender in senders {
+            out.entry(*sender).or_insert_with(|| counter.get(sender));
+        }
+        self.phase_accum.open_count_ns += timer.elapsed().as_nanos();
+        #[cfg(debug_assertions)]
+        {
+            let want = NativeExecutor::open_order_counts(&self.order_books, out.keys());
+            assert!(out == want, "step 5: open-order counter != books: {out:?} vs {want:?}");
+        }
+        out
+    }
+
+    /// Step 5 (tests): `(counter, books)`: the counter (built if not yet)
+    /// after absorbing the books' logs, and every user's count over the
+    /// books.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn open_count_view(
+        &mut self,
+    ) -> (std::collections::BTreeMap<Address, u32>, std::collections::BTreeMap<Address, u32>) {
+        let books = &mut self.order_books;
+        let counter = self.open_orders.get_or_insert_with(|| OpenOrders::build(books));
+        counter.absorb(books);
+        (counter.with_logs(books), OpenOrders::recount(books))
     }
 
     /// Item 6 Phase 2 P2-1: the cancel-all index, built from the books on
@@ -7148,13 +7263,13 @@ impl NativeExecutor {
         // an open-order slot (read by the serial loop and the sharded workers).
         // Taken per call: a block's post-EVM call sees its pre-EVM call's
         // orders and, through cum_volume, its fills.
-        let open_at_start = Self::open_order_counts(
-            &ctx.order_books,
-            place_order_indices.iter().filter_map(|&i| match &flat[i] {
+        // Item 6 Phase 4 step 5: from the stored counter.
+        let open_at_start = ctx.open_counts(place_order_indices.iter().filter_map(|&i| {
+            match &flat[i] {
                 (sender, FlatAction::Place(p)) if takes_open_slot(p) => Some(sender),
                 _ => None,
-            }),
-        );
+            }
+        }));
 
         // O1: write-through balance cache, scoped to this execute_batch call. Serves
         // repeated Phase 2 reserve / Phase 4 release reads for the same sender without
@@ -7516,6 +7631,9 @@ impl NativeExecutor {
                     "market worker panicked (market {}): {}",
                     panic.market_id, panic.message
                 ));
+                // Step 5: the consumed books' orders leave the counter (as
+                // they left a count over the books): the next count builds.
+                ctx.open_orders = None;
                 return NativeBatchResult { results, total_gas };
             }
         };
@@ -9138,6 +9256,9 @@ impl NativeExecutor {
     /// over all books (`torus_core::order_book::open_order_counts`: book-outer,
     /// smaller side per book, stops walked once). Split by book over up to the
     /// match worker cap once the walk is big enough to pay for the threads.
+    /// Item 6 Phase 4 step 5: the reference the stored counter replaced
+    /// (`test_open_count_scan`, debug-build checks).
+    #[cfg(any(test, debug_assertions, feature = "test-reference-paths"))]
     fn open_order_counts<'a>(
         books: &HashMap<MarketId, OrderBook>,
         senders: impl Iterator<Item = &'a Address>,
@@ -9906,7 +10027,7 @@ impl NativeExecutor {
                 (FailureReason::DuplicateCloid, msg),
             );
         }
-        let open_at_start = Self::open_order_counts(&ctx.order_books, std::iter::once(sender));
+        let open_at_start = ctx.open_counts(std::iter::once(sender));
         if let Err((reason, msg)) = Self::take_open_slot(
             &mut None,
             &ctx.positions,

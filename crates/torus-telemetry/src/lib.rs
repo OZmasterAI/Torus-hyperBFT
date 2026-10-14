@@ -352,6 +352,14 @@ pub struct Metrics {
     /// End-of-`execute_batch` position + balance cache `flush_all` into the
     /// overlay (nested inside `exec_phase_settle_seconds`).
     pub exec_cache_flush_seconds: Histogram,
+    /// Item 6 Phase 4 step 5: exec-thread time per native block getting the
+    /// senders' open-order counts for the per-user cap (absorbing the books'
+    /// open-order logs into the stored counter plus the lookups); nested in
+    /// `exec_phase_margin_seconds` / `exec_phase1_actions_seconds`.
+    pub exec_open_count_seconds: Histogram,
+    /// Step 5: open-order log entries the counter absorbed (one per (book,
+    /// user) whose count changed since the last absorb).
+    pub exec_open_count_deltas: Counter,
     /// Post-engine tail on the exec thread: core-writer drain, governance,
     /// fee distribution and the epoch boundary.
     pub exec_post_engine_tail_seconds: Histogram,
@@ -1791,6 +1799,19 @@ impl Metrics {
             exec_cache_flush_seconds.clone(),
         );
 
+        let exec_open_count_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 14));
+        registry.register(
+            "torus_exec_open_count_seconds",
+            "Item 6 Phase 4 step 5: open-order counts for the cap per native block (counter log absorb + lookups)",
+            exec_open_count_seconds.clone(),
+        );
+        let exec_open_count_deltas = Counter::default();
+        registry.register(
+            "torus_exec_open_count_deltas",
+            "Item 6 Phase 4 step 5: book open-order log entries absorbed by the counter",
+            exec_open_count_deltas.clone(),
+        );
+
         let exec_post_engine_tail_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_post_engine_tail_seconds",
@@ -2889,6 +2910,8 @@ impl Metrics {
             exec_settle_pass_a_seconds,
             exec_settle_pass_b_seconds,
             exec_cache_flush_seconds,
+            exec_open_count_seconds,
+            exec_open_count_deltas,
             exec_post_engine_tail_seconds,
             exec_engine_untimed_seconds,
             exec_save_books_seconds,

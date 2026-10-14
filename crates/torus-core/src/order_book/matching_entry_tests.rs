@@ -169,7 +169,7 @@ fn fixture(mode: u8) -> OrderBook {
 fn assert_book_state(actual: &OrderBook, expected: &OrderBook) {
     assert_eq!(actual.bids, expected.bids);
     assert_eq!(actual.asks, expected.asks);
-    assert_eq!(actual.trader_orders, expected.trader_orders);
+    assert_eq!(*actual.trader_orders, *expected.trader_orders);
     assert_eq!(actual.order_index.len(), expected.order_index.len());
     for (id, loc) in &actual.order_index {
         let old = &expected.order_index[id];

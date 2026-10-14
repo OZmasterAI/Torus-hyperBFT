@@ -182,7 +182,10 @@ FLUSH_SUB_R7 = ["state_write_build", "state_write_db"]
 # + engine_untimed == engine (by construction); settle_pass_a / settle_pass_b /
 # cache_flush are NESTED inside phase_settle, so do not re-add them.
 ENGINE_SUB_R6 = ["phase1_actions", "settle_pass_a", "settle_pass_b", "cache_flush",
-                 "post_engine_tail", "engine_untimed"]
+                 "post_engine_tail", "engine_untimed", "open_count"]
+# Item 6 Phase 4 step 5: `open_count` = the open-order counts for the cap
+# (counter log absorb + lookups), nested in phase_margin / phase1_actions;
+# 0.0 on an older binary (there the book walk sits inside phase_margin).
 # bl1 exec-chain-sub-100-attribution: save_books pass 1 (journal DRAIN, reads the
 # LIVE book levels -> can never leave the exec thread) vs pass 2 (overlay WRITES
 # -> the only half a flush worker could take). drain + write == save_books to

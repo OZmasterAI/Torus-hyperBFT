@@ -3705,6 +3705,10 @@ impl ExecutionContext {
                     .observe(secs(accum.settle_pass_b_ns));
                 m.exec_cache_flush_seconds
                     .observe(secs(accum.cache_flush_ns));
+                // Item 6 Phase 4 step 5: the open-order counts (nested).
+                m.exec_open_count_seconds
+                    .observe(secs(accum.open_count_ns));
+                m.exec_open_count_deltas.inc_by(accum.open_count_deltas);
                 m.exec_post_engine_tail_seconds.observe(tail_secs);
                 m.exec_engine_untimed_seconds.observe(untimed_secs);
                 // Item 6 Phase 2 step 0.2: node-local counts, once per block.

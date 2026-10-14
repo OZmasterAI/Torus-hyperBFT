@@ -450,7 +450,7 @@ impl OrderBook {
                 out.push(Vec::new());
                 continue;
             };
-            self.trader_orders.remove(sender);
+            self.trader_orders.remove_trader(sender);
             self.forget_reduce_only_trader(sender);
             let orders: Vec<Order> = cancelled.by_ref().take(range.len()).collect();
             self.forget_cloids(&orders);
@@ -624,7 +624,7 @@ mod tests {
         }
         // Make receipt order neither level order nor FIFO order. Recovery may
         // restore trader order lists differently; cancellation must honor it.
-        book.trader_orders.get_mut(&addr(1)).unwrap().edit(|v| v.reverse());
+        book.trader_orders.map_mut().get_mut(&addr(1)).unwrap().edit(|v| v.reverse());
         book.pending_stops.push(StopOrder {
             id: 900_000,
             trader: addr(1),
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(borsh::to_vec(a).unwrap(), borsh::to_vec(b).unwrap());
         assert_eq!(a.next_seq, b.next_seq);
         assert_eq!(a.order_seq, b.order_seq);
-        assert_eq!(a.trader_orders, b.trader_orders);
+        assert_eq!(*a.trader_orders, *b.trader_orders);
         let index = |book: &OrderBook| -> BTreeMap<_, _> {
             book.order_index
                 .iter()
@@ -792,10 +792,11 @@ mod tests {
                         book.order_index.get_mut(&id).unwrap().price = fp(999);
                     }
                     5 => {
-                        book.trader_orders.get_mut(&addr(1)).unwrap().push(id);
+                        book.trader_orders.map_mut().get_mut(&addr(1)).unwrap().push(id);
                     }
                     6 => {
                         book.trader_orders
+                            .map_mut()
                             .get_mut(&addr(1))
                             .unwrap()
                             .edit(|v| v.insert(0, 999_999));
@@ -860,6 +861,7 @@ mod tests {
         for book in [&mut a, &mut b] {
             book.insert_order(order(1_000_100, addr(1), Side::Buy, 99));
             book.trader_orders
+                .map_mut()
                 .get_mut(&addr(1))
                 .unwrap()
                 .edit(|v| v.rotate_right(1));
@@ -919,7 +921,7 @@ mod tests {
 impl OrderBook {
     fn cancel_all_original(&mut self, trader: Address, _market_id: Option<MarketId>) -> Vec<Order> {
         self.pending_stops.retain(|s| s.trader != trader);
-        let order_ids = match self.trader_orders.remove(&trader) {
+        let order_ids = match self.trader_orders.remove_trader(&trader) {
             Some(ids) => ids.to_vec(),
             None => return vec![],
         };

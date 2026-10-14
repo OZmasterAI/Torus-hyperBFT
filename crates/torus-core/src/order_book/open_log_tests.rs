@@ -122,6 +122,8 @@ fn reloads(book: &mut OrderBook) -> [OrderBook; 2] {
     let blob = borsh::to_vec(&*book).unwrap();
     let classic = OrderBook::try_from_slice(&blob).unwrap();
     let mut rows = OrderBook::new(book.market_id, book.tick_size, book.lot_size);
+    rows.set_next_order_id(book.next_order_id());
+    rows.set_next_seq(book.next_seq());
     let mut loaded: Vec<(u64, Order)> = book
         .full_row_ops()
         .into_iter()
@@ -135,8 +137,6 @@ fn reloads(book: &mut OrderBook) -> [OrderBook; 2] {
     for (_, bytes) in book.stop_rows() {
         rows.restore_stop_row(&bytes).unwrap();
     }
-    rows.set_next_order_id(book.next_order_id());
-    rows.set_next_seq(book.next_seq());
     [classic, rows]
 }
 

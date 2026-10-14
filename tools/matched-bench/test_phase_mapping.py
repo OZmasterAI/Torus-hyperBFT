@@ -178,6 +178,29 @@ class PhaseMappingTests(unittest.TestCase):
         self.assertIsNotNone(sub, "SUB has no load_books entry")
         self.assertIn('"margin_configs"', sub.group(1))
 
+    def test_open_count_split_of_the_engine_is_sampled_and_summarized(self):
+        """Item 6 Phase 4 step 5: the open-order counts for the cap (counter
+        log absorb + lookups, nested in phase_margin) are sampled (sum,
+        count) with the absorbed log entries, and summarize.py reports them
+        under the engine (0.0 on an older binary)."""
+        here = Path(__file__).parent
+        wide = (
+            re.search(r'^WIDE_COLS="([^"]+)"', (here / "run-cell.sh").read_text(), re.M)
+            .group(1)
+            .split()
+        )
+        for name in (
+            "torus_exec_open_count_seconds_sum",
+            "torus_exec_open_count_seconds_count",
+            "torus_exec_open_count_deltas_total",
+        ):
+            self.assertIn(name, wide)
+        sub = re.search(
+            r"^ENGINE_SUB_R6 = \[([^\]]*)\]", (here / "summarize.py").read_text(), re.M
+        )
+        self.assertIsNotNone(sub)
+        self.assertIn('"open_count"', sub.group(1))
+
     def test_action_status_phase_is_sampled_and_summarized(self):
         """Item 6 cut 1: the action status (native failures mapped to body
         positions, exec thread, after the engine) is sampled (sum, count) and

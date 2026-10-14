@@ -314,6 +314,50 @@ stays only if its own A/B (counter upkeep netted) shows a gain; otherwise it is 
   (`order_book.rs:45`), serial and with match workers.
 - Code: per-market workers return per-trader count deltas; E applies them in market order (rule 2);
   `open_at_start` (`native_executor.rs:6560`) reads the record. Books rebuilt from the DB rebuild the counts.
+- **Built (s120, branch `feat/item6-phase4-step5`, on step 4; kept only if the A/B below nets a gain).**
+  torus-core: `OrderBook.trader_orders` is a `TraderIndex` (`order_book/trader_orders.rs`): the trader map plus an
+  open-order log (`HashMap<Address, i32>`, net change of each trader's `open_order_count` in that book since the last
+  drain). The map is read through `Deref` only (no `DerefMut`), so every path that changes a resting count goes
+  through a logging method (`push`, `remove_id` at the four `match_at_level` sites, `remove_id_drop_empty`,
+  `remove_trader`); pending stops log at their sites (store, `retain_stops` = trigger / cancel-all, `cancel_stop`,
+  `take_pending_stops`, `restore_stop_row`, classic decode). A loaded book logs its whole count. New API:
+  `drain_open_log`, `open_log`, `open_log_len`, `clear_open_log`, `for_each_open_count`. torus-bridge: `OpenOrders`
+  (`open_orders.rs`, `HashMap<Address, u32>`, absent = 0) with the invariant counter + books' unabsorbed logs ==
+  books' counts. `NativeExecContext::open_counts` absorbs every book's log (exact integer sums, any book order) and
+  reads the senders; it replaces `NativeExecutor::open_order_counts` in `execute_batch` (`open_at_start`, same
+  output map, so `SenderFold` sizing is unchanged) and `exec_place_order`. The counter is carried in `ResidentInner`
+  with the books (the stash does not absorb: the logs ride in the books); after a load the first count builds it
+  from the books (`OpenOrders::build`, clearing their logs), like the cancel-all and cloid indexes, which also keeps
+  tests that hand books from one context to a fresh one exact; a market worker panic drops it (the next count
+  builds from the remaining books). Reference path: `test_open_count_scan`
+  (`cfg(test)` / `test-reference-paths`) counts over the books as before; debug builds compare the counter with
+  that walk at every read and check counter + logs == books for every user at every stash.
+  Tests: `open_log_tests.rs` (torus-core, 24 seeds x 400 random ops on one book incl. reloads),
+  `open_count_tests.rs` (torus-bridge: the seeded stream over 4 book modes x resident / non-resident / restart,
+  every executor path, results and root equal to the scan; the cap at its edge; the liquidation step's cancels and
+  stage-1 close; the A/B instrument), `open_count_metrics_are_exported` (torus-telemetry).
+  Deviations from the text above: (1) the counter is not a field of `UserState`. `Users` is shared (`Arc`) during
+  the block and follows the frozen delta at `end_resident`, but the cap needs counts that move within a block
+  (Phase 1 cancels, the post-EVM call after the pre-EVM call's fills) and the books' lifecycle (resident reuse,
+  load, worker panic) is not R's; a separate map carried with the books, like the cancel-all and cloid indexes,
+  keeps both exact. (2) The workers return nothing new: the deltas ride in each book's log, so every book path is
+  covered without a hook per site, and the exec thread applies them at the next count read. No order expiry or
+  eviction path exists in the executor, so none is covered.
+  Metrics: `torus_exec_open_count_seconds` (per native block: the exec thread's absorb + lookups, nested in
+  `exec_phase_margin_seconds` on the batch path and `exec_phase1_actions_seconds` on the single path; summarize.py
+  `engine.open_count_ms`) and `torus_exec_open_count_deltas_total` (log entries absorbed). Both are in WIDE_COLS.
+  **What the A/B compares** (archy, same shape as step 0: 300 markets uniform, oracle on, interval 15 s, Classic,
+  same allocator, n = 4 ABBA, 120 s cells): arm A = step 4 tip `2a245321`, arm B = the step 5 tip.
+  Net effect (the keep rule): matched/s and native blocks/s, exec `block_ms`, engine ms per 1k fills. Removed work
+  vs added work on the exec thread: `phase_margin` ms per native block (A holds the book walk there, B the absorb +
+  lookups, so B - A is the exec-thread net of the swap); B's `engine.open_count_ms` alone is the absorb + lookups
+  (A reads 0.0: it has no such series; A's walk is the perf share of `torus_core::order_book::open_order_counts` /
+  `OrderBook::add_open_order_counts`, 1.45% / 3.5 ms per native block in step 0). The upkeep: the log update is one
+  hash entry per resting placement, maker full fill, self-trade / reduce-only / margin cut, cancel and stop change,
+  inline in the book, so it lands in `phase_match` (market workers; the phase's wall time), `phase1_actions`
+  (cancels, cancel-alls, modifies on the exec thread) and `phase_settle` (fired stops placed); compare those three
+  per native block A vs B, and `open_count_deltas_total` per native block for the merge size. Keep step 5 only if
+  the net is a gain (owner s119); otherwise drop it or move it to Phase 5.
 
 ### Step 6: RSS per user and gate campaign
 

@@ -310,7 +310,7 @@ fn seeded_run(seed: u64, mode: BookMode, run: Run, scan: bool) -> (String, usize
         ctx.stash_resident(&mut holder);
         if resident && !scan {
             let (carried, rebuilt) = holder.open_count_view().expect("resident books");
-            assert_eq!(carried, rebuilt, "{what}: carried counter");
+            assert_eq!(carried.expect("built by the block's counts"), rebuilt, "{what}: carried counter");
         }
     }
     let ctx = ctx_at(&db, 99, mode, None);
@@ -472,7 +472,7 @@ fn liquidation_closes_and_cancels_keep_the_counter_exact() {
     ctx.save_order_books();
     ctx.stash_resident(&mut holder);
     let (carried, rebuilt) = holder.open_count_view().expect("resident");
-    assert_eq!(carried, rebuilt, "carried");
+    assert_eq!(carried.expect("built"), rebuilt, "carried");
     assert_eq!(rebuilt.get(&m), Some(&1));
     assert_eq!(rebuilt.get(&t), None);
 }

@@ -4,8 +4,9 @@
 
 use alloy_primitives::map::HashMap;
 use std::fmt;
+use std::ops::Deref;
 
-use torus_types::OrderId;
+use torus_types::{Address, OrderId};
 
 /// Marks a removed slot (no real order id reaches it).
 const HOLE: OrderId = OrderId::MAX;
@@ -131,6 +132,111 @@ impl Eq for TraderOrders {}
 impl fmt::Debug for TraderOrders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// Item 6 Phase 4 step 5: a book's `trader -> TraderOrders` map plus its
+/// open-order log. Every change of a trader's resting-order count goes
+/// through a method here and is logged, net per trader, until the executor
+/// drains it ([`super::OrderBook::drain_open_log`]); pending stops log
+/// through [`Self::note`] at their (few) sites in the book. Read access is
+/// the plain map (`Deref`); there is no `DerefMut`, so no path can change a
+/// count without logging it. The log is in-RAM bookkeeping only: never
+/// serialized, hashed, or read by matching or saving.
+#[derive(Default)]
+pub(super) struct TraderIndex {
+    map: HashMap<Address, TraderOrders>,
+    /// Net change of each trader's open-order count (resting orders plus
+    /// pending stops) in this book since the last drain; 0 entries possible.
+    log: HashMap<Address, i32>,
+}
+
+impl Deref for TraderIndex {
+    type Target = HashMap<Address, TraderOrders>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl TraderIndex {
+    /// Log a change of `trader`'s open-order count by `delta`.
+    #[inline]
+    pub(super) fn note(&mut self, trader: Address, delta: i32) {
+        if delta != 0 {
+            *self.log.entry(trader).or_default() += delta;
+        }
+    }
+
+    /// Append `id` to `trader`'s list; true when the trader had no resting
+    /// order in this book until now (absent or empty list).
+    pub(super) fn push(&mut self, trader: Address, id: OrderId) -> bool {
+        let ids = self.map.entry(trader).or_default();
+        let was_empty = ids.is_empty();
+        // `TraderOrders::push` always adds one to `len`.
+        ids.push(id);
+        self.note(trader, 1);
+        was_empty
+    }
+
+    /// Remove `id` from `trader`'s list, keeping the (possibly empty) list
+    /// (the matching sites).
+    pub(super) fn remove_id(&mut self, trader: &Address, id: OrderId) {
+        if let Some(ids) = self.map.get_mut(trader) {
+            let before = ids.len();
+            ids.remove(id);
+            let delta = ids.len() as i64 - before as i64;
+            self.note(*trader, delta as i32);
+        }
+    }
+
+    /// Remove `id` from `trader`'s list; the list goes once empty.
+    pub(super) fn remove_id_drop_empty(&mut self, trader: &Address, id: OrderId) {
+        if let Some(ids) = self.map.get_mut(trader) {
+            let before = ids.len();
+            ids.remove(id);
+            let (after, empty) = (ids.len(), ids.is_empty());
+            if empty {
+                self.map.remove(trader);
+            }
+            self.note(*trader, (after as i64 - before as i64) as i32);
+        }
+    }
+
+    /// Take `trader`'s whole list.
+    pub(super) fn remove_trader(&mut self, trader: &Address) -> Option<TraderOrders> {
+        let ids = self.map.remove(trader)?;
+        self.note(*trader, -(ids.len() as i64) as i32);
+        Some(ids)
+    }
+
+    /// Hand every non-zero logged delta to `f`; the log is empty afterwards.
+    pub(super) fn drain_log(&mut self, mut f: impl FnMut(Address, i32)) {
+        for (trader, delta) in self.log.drain() {
+            if delta != 0 {
+                f(trader, delta);
+            }
+        }
+    }
+
+    /// The logged deltas, not drained (0 entries skipped).
+    pub(super) fn log(&self) -> impl Iterator<Item = (Address, i32)> + '_ {
+        self.log.iter().filter(|(_, d)| **d != 0).map(|(t, d)| (*t, *d))
+    }
+
+    /// Entries in the log (0 entries included).
+    pub(super) fn log_len(&self) -> usize {
+        self.log.len()
+    }
+
+    pub(super) fn clear_log(&mut self) {
+        self.log.clear();
+    }
+
+    /// Tests: the map itself, NOT logged (to build corrupt states).
+    #[cfg(test)]
+    pub(super) fn map_mut(&mut self) -> &mut HashMap<Address, TraderOrders> {
+        &mut self.map
     }
 }
 

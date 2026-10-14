@@ -331,9 +331,10 @@ fn cancel_all_many_falls_back_on_stale_or_shared_indexes() {
                         book.order_index.get_mut(&id).unwrap().price = fp(999);
                     }
                     // The same id listed under two traders of the run.
-                    3 => book.trader_orders.get_mut(&addr(4)).unwrap().push(id),
+                    3 => book.trader_orders.map_mut().get_mut(&addr(4)).unwrap().push(id),
                     _ => book
                         .trader_orders
+                        .map_mut()
                         .get_mut(&addr(4))
                         .unwrap()
                         .edit(|v| v.insert(0, 777_777)),
@@ -407,7 +408,7 @@ fn cancel_all_many_exhaustive_small_queues() {
                         }
                         // Reversed receipt order on one trader: output order
                         // must follow trader_orders, not FIFO.
-                        if let Some(ids) = book.trader_orders.get_mut(&addr(2)) {
+                        if let Some(ids) = book.trader_orders.map_mut().get_mut(&addr(2)) {
                             ids.edit(|v| v.reverse());
                         }
                         prime(&mut book);

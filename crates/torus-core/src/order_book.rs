@@ -30,7 +30,7 @@ mod trader_orders;
 
 pub use cloid_key::CloidKey;
 
-use trader_orders::TraderOrders;
+use trader_orders::{TraderIndex, TraderOrders};
 
 #[cfg(test)]
 mod matching_entry_tests;
@@ -1193,8 +1193,9 @@ pub struct OrderBook {
     asks: BTreeMap<FixedPoint, VecDeque<Order>>,
     /// O(1) order lookup by ID → location.
     order_index: HashMap<OrderId, OrderLocation>,
-    /// Per-trader order tracking for cancel-all.
-    trader_orders: HashMap<Address, TraderOrders>,
+    /// Per-trader order tracking for cancel-all. Item 6 Phase 4 step 5: with
+    /// the open-order log ([`TraderIndex`], [`Self::drain_open_log`]).
+    trader_orders: TraderIndex,
     /// Pending stop orders.
     pending_stops: Vec<StopOrder>,
     /// s114: `(trader, cloid) -> id` of every resting order and pending stop
@@ -1336,7 +1337,7 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             order_index: HashMap::default(),
-            trader_orders: HashMap::default(),
+            trader_orders: TraderIndex::default(),
             pending_stops: Vec::new(),
             cloids: BookCloids::default(),
             tick_size,
@@ -1535,6 +1536,8 @@ impl OrderBook {
             // P2-1: a stored stop feeds the cancel-all index.
             self.new_traders.push(trader);
             Self::index_cloid(&mut self.cloids, trader, params.client_order_id, order_id);
+            // Step 5: a stored stop holds an open-order slot.
+            self.trader_orders.note(trader, 1);
             self.pending_stops.push(StopOrder {
                 id: order_id,
                 trader,
@@ -2036,12 +2039,7 @@ impl OrderBook {
             order_id,
         );
 
-        if let Some(ids) = self.trader_orders.get_mut(&order.trader) {
-            ids.remove(order_id);
-            if ids.is_empty() {
-                self.trader_orders.remove(&order.trader);
-            }
-        }
+        self.trader_orders.remove_id_drop_empty(&order.trader, order_id);
 
         let seq = self.order_seq.remove(&order_id);
         self.row_journal.insert(order_id);
@@ -2080,6 +2078,7 @@ impl OrderBook {
                 .into_iter()
                 .partition(|s| s.trader == *trader);
         self.pending_stops = kept;
+        self.trader_orders.note(*trader, -(taken.len() as i32));
         for s in &taken {
             Self::forget_cloid(&mut self.cloids, s.trader, s.client_order_id, s.id);
         }
@@ -2104,7 +2103,7 @@ impl OrderBook {
     /// the caller drops them).
     fn cancel_all_resting(&mut self, trader: Address) -> Vec<Order> {
         self.forget_reduce_only_trader(&trader);
-        let order_ids = match self.trader_orders.remove(&trader) {
+        let order_ids = match self.trader_orders.remove_trader(&trader) {
             Some(ids) => ids.into_vec(),
             None => return vec![],
         };
@@ -2363,7 +2362,7 @@ impl OrderBook {
     /// nothing), plus one pass over the pending stops (not one per trader).
     pub fn add_open_order_counts(&self, idx: &HashMap<Address, usize>, counts: &mut [usize]) {
         if self.trader_orders.len() < idx.len() {
-            for (trader, ids) in &self.trader_orders {
+            for (trader, ids) in self.trader_orders.iter() {
                 if let Some(&i) = idx.get(trader) {
                     counts[i] += ids.len();
                 }
@@ -2377,6 +2376,50 @@ impl OrderBook {
             if let Some(&i) = idx.get(&stop.trader) {
                 counts[i] += 1;
             }
+        }
+    }
+
+    /// Item 6 Phase 4 step 5: hand every trader whose open-order count
+    /// ([`Self::open_order_count`]) changed since the last drain its net
+    /// change (never 0); the log is empty afterwards. Every path that rests,
+    /// removes, stores or removes a stop logs (placement, fill, self-trade,
+    /// reduce-only and margin cuts, cancel, cancel-all, modify, trigger,
+    /// `take_pending_stops`, the loads), so the sum of every drained delta
+    /// since the book was created equals its current count. A loaded book
+    /// (classic decode, `insert_loaded_order`, `restore_stop_row`) logs its
+    /// whole count. In-RAM only: never serialized, hashed, or read by
+    /// matching or saving.
+    pub fn drain_open_log(&mut self, f: impl FnMut(Address, i32)) {
+        self.trader_orders.drain_log(f);
+    }
+
+    /// Step 5: the open-order log, not drained (no 0 deltas).
+    pub fn open_log(&self) -> impl Iterator<Item = (Address, i32)> + '_ {
+        self.trader_orders.log()
+    }
+
+    /// Step 5: entries in the open-order log (a trader whose changes netted
+    /// to 0 may still hold one).
+    pub fn open_log_len(&self) -> usize {
+        self.trader_orders.log_len()
+    }
+
+    /// Step 5: drop the open-order log (the caller counts from the book).
+    pub fn clear_open_log(&mut self) {
+        self.trader_orders.clear_log();
+    }
+
+    /// Step 5: every trader's open orders in this book, as parts that add
+    /// up per trader (its resting orders once, then 1 per pending stop);
+    /// traders with none are skipped.
+    pub fn for_each_open_count(&self, mut f: impl FnMut(Address, usize)) {
+        for (trader, ids) in self.trader_orders.iter() {
+            if !ids.is_empty() {
+                f(*trader, ids.len());
+            }
+        }
+        for stop in &self.pending_stops {
+            f(stop.trader, 1);
         }
     }
 
@@ -2486,6 +2529,7 @@ impl OrderBook {
     pub fn cancel_stop(&mut self, id: OrderId) -> Option<StopOrder> {
         let pos = self.pending_stops.iter().position(|s| s.id == id)?;
         let stop = self.pending_stops.remove(pos);
+        self.trader_orders.note(stop.trader, -1);
         Self::forget_cloid(&mut self.cloids, stop.trader, stop.client_order_id, stop.id);
         Some(stop)
     }
@@ -2723,7 +2767,7 @@ impl OrderBook {
         reduce_only_cuts: &mut Vec<ReduceOnlyCut>,
         ro_positions: &mut ReduceOnlyPositions,
         order_index: &mut HashMap<OrderId, OrderLocation>,
-        trader_orders: &mut HashMap<Address, TraderOrders>,
+        trader_orders: &mut TraderIndex,
         cloids: &mut BookCloids,
         order_seq: &mut HashMap<OrderId, u64>,
         row_journal: &mut BTreeSet<OrderId>,
@@ -2768,9 +2812,7 @@ impl OrderBook {
                     cancelled.client_order_id,
                     cancelled.id,
                 );
-                if let Some(ids) = trader_orders.get_mut(&cancelled.trader) {
-                    ids.remove(cancelled.id);
-                }
+                trader_orders.remove_id(&cancelled.trader, cancelled.id);
                 let seq = order_seq.remove(&cancelled.id);
                 Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
                 row_journal.insert(cancelled.id);
@@ -2792,9 +2834,7 @@ impl OrderBook {
                         let cut = queue.pop_front().unwrap();
                         order_index.remove(&cut.id);
                         Self::forget_cloid(cloids, cut.trader, cut.client_order_id, cut.id);
-                        if let Some(ids) = trader_orders.get_mut(&cut.trader) {
-                            ids.remove(cut.id);
-                        }
+                        trader_orders.remove_id(&cut.trader, cut.id);
                         let seq = order_seq.remove(&cut.id);
                         Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
                         row_journal.insert(cut.id);
@@ -2876,9 +2916,7 @@ impl OrderBook {
                     let cut = queue.pop_front().unwrap();
                     order_index.remove(&cut.id);
                     Self::forget_cloid(cloids, cut.trader, cut.client_order_id, cut.id);
-                    if let Some(ids) = trader_orders.get_mut(&cut.trader) {
-                        ids.remove(cut.id);
-                    }
+                    trader_orders.remove_id(&cut.trader, cut.id);
                     let seq = order_seq.remove(&cut.id);
                     Self::mark_chunk_dirty(chunked_on, dirty_chunks, tag, raw_price, seq);
                     row_journal.insert(cut.id);
@@ -2949,9 +2987,7 @@ impl OrderBook {
                 let filled = queue.pop_front().unwrap();
                 order_index.remove(&filled.id);
                 Self::forget_cloid(cloids, filled.trader, filled.client_order_id, filled.id);
-                if let Some(ids) = trader_orders.get_mut(&filled.trader) {
-                    ids.remove(filled.id);
-                }
+                trader_orders.remove_id(&filled.trader, filled.id);
                 order_seq.remove(&filled.id);
             }
             if margin.as_ref().is_some_and(|m| m.exhausted) || unchecked.as_ref().is_some_and(|u| u.exhausted) {
@@ -3084,10 +3120,12 @@ impl OrderBook {
     /// cloids. Survivors keep their relative (id-ascending) order.
     fn retain_stops(&mut self, mut keep: impl FnMut(&StopOrder) -> bool) {
         let cloids = &mut self.cloids;
+        let index = &mut self.trader_orders;
         self.pending_stops.retain(|s| {
             let k = keep(s);
             if !k {
                 Self::forget_cloid(cloids, s.trader, s.client_order_id, s.id);
+                index.note(s.trader, -1);
             }
             k
         });
@@ -3342,11 +3380,9 @@ impl OrderBook {
     /// here). P2-1: a trader with no resting order in this book until now
     /// feeds the cancel-all index.
     fn push_trader_order(&mut self, trader: Address, id: OrderId) {
-        let ids = self.trader_orders.entry(trader).or_default();
-        if ids.is_empty() {
+        if self.trader_orders.push(trader, id) {
             self.new_traders.push(trader);
         }
-        ids.push(id);
     }
 
     /// Item 6 Phase 2 P2-1: the traders logged since the last call (see the
@@ -3392,6 +3428,7 @@ impl OrderBook {
         let id = stop.id;
         self.new_traders.push(stop.trader);
         Self::index_cloid(&mut self.cloids, stop.trader, stop.client_order_id, id);
+        self.trader_orders.note(stop.trader, 1);
         self.pending_stops.push(stop);
         Ok(id)
     }
@@ -4578,7 +4615,7 @@ impl BorshDeserialize for OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             order_index: HashMap::default(),
-            trader_orders: HashMap::default(),
+            trader_orders: TraderIndex::default(),
             pending_stops: Vec::new(),
             cloids: BookCloids::default(),
             tick_size,
@@ -4616,12 +4653,15 @@ impl BorshDeserialize for OrderBook {
             let stop = StopOrder::deserialize_reader(r)?;
             book.new_traders.push(stop.trader);
             Self::index_cloid(&mut book.cloids, stop.trader, stop.client_order_id, stop.id);
+            book.trader_orders.note(stop.trader, 1);
             book.pending_stops.push(stop);
         }
 
         // Deserializing is a LOAD, not a mutation: the insert_order calls
         // above journaled every order/level — clear that (classic mode never
         // drains the journals; leaving them populated only leaks memory).
+        // Step 5: the open-order log stays: a loaded book logs its whole
+        // count, which a fresh executor counter absorbs.
         book.row_journal.clear();
         book.level_journal.clear();
         book.cloids.log.clear();
