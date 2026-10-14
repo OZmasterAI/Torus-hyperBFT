@@ -153,7 +153,7 @@ Before every commit: `cargo nextest run --workspace $F` and the doc-test command
 | 2 | hot writers mutate `Users` in place; caches and their flush deleted; write-through; EVM fold | L | builder, then Codex torus-adversarial |
 | 3 | book rows from a dirty set (Classic) | M | builder, then Codex torus-adversarial |
 | 4 | (optional) open-order count in `UserState` from the book dirty sites | M | builder |
-| 5 | crab: summary updated inline per fill | M | builder |
+| 5 | crab: summary updated inline per fill; summary slimmed for light users (owner s121) | M | builder |
 | 6 | (conditional) remaining hot overlay reads (oracle, markets) to typed tables | S | builder |
 | 7 | RAM ubench, 1M genesis cell, gate campaign incl. final Gate 3 (1.4x) | M | builder (ubench), archy (campaigns) |
 
@@ -284,6 +284,13 @@ counter read ~3.7 ms per native block); revisit after step 0, needs a cheaper co
 - Code: the fill applied to a `UserState` updates its versioned summary (one term per fill) when the entry's version
   equals the block's; otherwise the entry stays stale and is recomputed on read, as Phase 4 step 3 does.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
+- RAM (owner s121): Phase 4 step 6 measured light users (2 positions) at 726 / 819 B per user (100k / 1M, jemalloc,
+  with sums) vs the ~0.6 KB target, accepted for Phase 4. The excess is the summary entry, one
+  `Box<(u64, SumsResult)>` per user (176 B, class 192) where section 1 budgets ~80 B per position, plus record-table
+  slack after a doubling (~100 B per user at 1M). Here, with the summary reworked anyway: keep it only for users that
+  traded recently (drop it for idle users, recompute on their next order), and/or store it inline in `UserState`
+  instead of boxed. Test first: a dropped summary recomputes bit-exact to `AccountView::build`. Re-measure with
+  `ubench_users_rss` (step 7); pass = light <= ~0.6 KB, active and market-maker shapes no worse.
 
 ### Step 6 (conditional): typed oracle and market tables
 
