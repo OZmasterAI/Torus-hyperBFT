@@ -5124,7 +5124,7 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p3gate-stage/s2-run/release/bench-throughput'
 ```
 
-Tier B, 490.6 MiB, 90 files:
+Tier B, 490.6 MiB, 90 files (section 66, the commit-interval p99 attribution, re-runs from the `val0/1/2.log.gz` and `sampler.csv` of r1-r4 and k1, both arms: keep those while it may need a re-run; its extracted per-interval data, `ozarchy-p3gate-run/analyst/p99-commit/fl/*.csv`, stays in the run dir):
 
 ```
 rm -- \
@@ -5490,7 +5490,7 @@ rm -- \
   '/home/oz/bench-results-matched/ozarchy-p4s0-run/analyst/nm.txt'
 ```
 
-Tier B, 182.9 MiB, 39 files:
+Tier B, 182.9 MiB, 39 files (section 66 also reads `val0.log.gz` and `val2.log.gz` of u1, u2 and k1: keep those while it may need a re-run):
 
 ```
 rm -- \

@@ -1,0 +1,44 @@
+== SAT: threshold T = baseline (m) mean per-validator p99 = 1138 ms
+cell    arm   p99 p99 no-ckpt ckpt time% ckpts | intervals > T per validator per 100 s: total    ckpt timeout   epoch  execbp   other | share of time >T in ckpt windows
+r1-s2   s2   1466        1090      25.3%  16.0 |                                        11.95    6.25    2.72    0.00    1.90    1.09 |  76.5%
+r2-s2   s2   1314        1096      23.8%  16.0 |                                        11.23    5.75    3.29    0.00    1.64    0.55 |  69.3%
+r3-s2   s2   1353        1127      22.7%  16.0 |                                         9.38    5.24    1.66    0.55    1.93    0.00 |  75.4%
+r4-s2   s2   1227         989      18.8%  15.0 |                                         6.33    3.58    1.10    0.00    1.38    0.27 |  62.7%
+r1-m    m    1168        1168       0.0%   0.0 |                                         7.69    0.00    0.82    1.65    0.83    4.39 |   0.0%
+r2-m    m    1141        1141       0.0%   0.0 |                                         5.80    0.00    0.00    0.83    3.03    1.94 |   0.0%
+r3-m    m    1129        1129       0.0%   0.0 |                                         4.65    0.00    0.82    0.00    1.91    1.91 |   0.0%
+r4-m    m    1114        1114       0.0%   0.0 |                                         4.14    0.00    0.00    0.28    2.48    1.38 |   0.0%
+u1-d3   d3   1275        1066      21.2%  15.0 |                                         8.44    3.81    1.91    0.00    2.18    0.54 |  35.5%
+u2-d3   d3   1232        1074      23.1%  15.0 |                                         8.53    4.68    1.65    0.55    1.38    0.27 |  52.0%
+per arm mean (sd over cells where n>1):
+  s2  n=4 p99  1340 (sd   99)  p99 excl. ckpt-window intervals  1075 (sd   60)  >T/100s  9.72 (sd 2.51) ckpt  5.20 timeout  2.19 epoch  0.14 execbp  1.71 other  0.48
+  m   n=4 p99  1138 (sd   23)  p99 excl. ckpt-window intervals  1138 (sd   23)  >T/100s  5.57 (sd 1.58) ckpt  0.00 timeout  0.41 epoch  0.69 execbp  2.06 other  2.41
+  d3  n=2 p99  1253 (sd   30)  p99 excl. ckpt-window intervals  1070 (sd    6)  >T/100s  8.49 (sd 0.06) ckpt  4.24 timeout  1.78 epoch  0.28 execbp  1.78 other  0.41
+== soak: threshold T = baseline (m) mean per-validator p99 = 1196 ms
+cell    arm   p99 p99 no-ckpt ckpt time% ckpts | intervals > T per validator per 100 s: total    ckpt timeout   epoch  execbp   other | share of time >T in ckpt windows
+k1-s2   s2   1473        1012      30.0%  54.0 |                                         6.72    5.44    0.22    0.00    0.94    0.11 |  92.5%
+k1-m    m    1196        1196       0.0%   0.0 |                                         5.88    0.00    0.28    0.50    2.89    2.22 |   0.0%
+k1-d3   d3   1433        1031      30.5%  53.0 |                                         6.89    5.28    0.33    0.00    1.22    0.06 |  84.9%
+per arm mean (sd over cells where n>1):
+  s2  n=1 p99  1473 (sd  nan)  p99 excl. ckpt-window intervals  1012 (sd  nan)  >T/100s  6.72 (sd  nan) ckpt  5.44 timeout  0.22 epoch  0.00 execbp  0.94 other  0.11
+  m   n=1 p99  1196 (sd  nan)  p99 excl. ckpt-window intervals  1196 (sd  nan)  >T/100s  5.88 (sd  nan) ckpt  0.00 timeout  0.28 epoch  0.50 execbp  2.89 other  2.22
+  d3  n=1 p99  1433 (sd  nan)  p99 excl. ckpt-window intervals  1031 (sd  nan)  >T/100s  6.89 (sd  nan) ckpt  5.28 timeout  0.33 epoch  0.00 execbp  1.22 other  0.06
+== SAT: rate of intervals > T=1138 ms inside vs outside checkpoint write windows (per validator per 100 s of window / non-window time);
+   m cells use the matching s2 cell's windows (pseudo) as the control for chance coincidence
+cell    arm win time%  rate in rate out in/out p99 all p99 excl win
+r1-s2   s2      25.3%    24.73     7.63    3.2    1466         1090
+r2-s2   s2      23.8%    24.14     7.18    3.4    1314         1096
+r3-s2   s2      22.7%    23.10     5.34    4.3    1353         1127
+r4-s2   s2      18.8%    19.01     3.38    5.6    1227          989
+r1-m    m       25.5%    11.83     6.25    1.9    1168         1145
+r2-m    m       24.0%     5.75     5.81    1.0    1141         1092
+r3-m    m       23.3%     5.86     4.27    1.4    1129         1085
+r4-m    m       18.5%     7.46     3.38    2.2    1114         1062
+u1-d3   d3      21.2%    17.95     5.87    3.1    1275         1066
+u2-d3   d3      23.1%    20.24     4.99    4.1    1232         1074
+== soak: rate of intervals > T=1196 ms inside vs outside checkpoint write windows (per validator per 100 s of window / non-window time);
+   m cells use the matching s2 cell's windows (pseudo) as the control for chance coincidence
+cell    arm win time%  rate in rate out in/out p99 all p99 excl win
+k1-s2   s2      29.9%    18.15     1.82   10.0    1473         1012
+k1-m    m       30.0%     7.59     5.15    1.5    1196         1182
+k1-d3   d3      30.5%    17.30     2.32    7.5    1433         1031

@@ -7992,7 +7992,7 @@ per arm, no CI.
   The rest of the delta is jemalloc-resident pages not in live use (allocator retention), larger here than in 57. One soak
   cell per arm (no CI), and s2 ran +13% matched/s in the soak.
 * **Other changes:** block time p99 +17.7% [+6.7, +28.7] SAT, +23% soak (p50 -33% / -14%); fills per native block -8.6%
-  SAT (more, smaller blocks).
+  SAT (more, smaller blocks). The p99 rise sits in the checkpoint state-write windows (section 66).
 * **The merge decision is the owner's (pending).** Possible next steps, suggestions only (not measured): (1) judge the RAM
   gate on the live heap (`torus_jemalloc_allocated_bytes`) instead of RSS; (2) tune jemalloc decay (e.g. `dirty_decay_ms` /
   `muzzy_decay_ms`, or a background thread) and rerun the soak; (3) n = 2-3 soaks per arm for a CI on the soak delta.
@@ -8709,7 +8709,7 @@ phase 1 excess become "other engine work at normal fills". The grouping above us
   * Decision 4 (memo): 0.18%; (a) stands.
 * **p99:** the exec tail is a start-of-bench ramp, epoch-boundary blocks and checkpoint upkeep spikes, not RocksDB stalls.
   Phase 4 does not target any of these. The commit-interval p99 rise of section 61 is a separate question and is not answered
-  here.
+  here (see section 66).
 
 **Caveats.**
 1. n = 2 profiled cells, val1 only, user space (`cycles:u`), W1 = 35-80 s of a 120 s cell.
@@ -8875,7 +8875,7 @@ host has 32 CPUs). Place share = place / (place + cancel-all) executed (`ingest.
 
 Block time comes from the `torus_commit_interval_seconds` histogram in `buckets.csv` (bench window, interpolated in the
 bucket, mean of 3 nodes; `extract.py`). It is context only: the attribution of the commit-interval p99 is a separate
-follow-up analysis (running); no p99 cause is read from this campaign. RSS peak is the mean of the 3 per-node peaks in the
+follow-up analysis (section 66); no p99 cause is read from this campaign. RSS peak is the mean of the 3 per-node peaks in the
 bench window (the analyst's handoff gives the largest node's peak in MiB: goff 4.0, moff 6.8, mon 6.4, gjoff 4.0; mean 2.9
 / 4.7 / 4.8 / 2.6).
 
@@ -8939,7 +8939,7 @@ bench window (the analyst's handoff gives the largest node's peak in MiB: goff 4
 * **Allocator:** LD_PRELOAD jemalloc alone gives G about 1.11x matched/s, by using more CPU. The -44% CPU per
   fill and 1.74x over GJ are item 6.
 * **Block time p99** (G off 2,043, M off 1,625, M on 1,645, GJ off 1,226 ms) is context only; the commit-interval p99
-  attribution is a separate follow-up analysis.
+  attribution is a separate follow-up analysis (section 66).
 * **Confidence: high** on the direction and on "above 1.4x" (n = 4 per arm, CV <= 2.2%, every treatment and sensitivity
   above 1.4x at its lower CI bound). **Medium** on the exact ratio, because of the bench and mix confound.
 
@@ -8963,6 +8963,256 @@ Analysis (`tools/ozarchy-g3-tools/analyst/`; outputs in `ozarchy-g3-run/analyst/
 * Driver `tools/ozarchy-g3-tools/ozarchy-g3-campaign.sh` with its generator `make-g3-driver.py`; md5s `md5s-all.txt`
   (ozarchy-g3s0's `md5s.txt`); `analyst/a-cells.py` is section 60's copy from the tools dir, not run here. The run's
   `matched-bench/` copy (= `d3cba5e2`'s) is not archived. The backport is on branch `bench/g3-base-199bdc97`.
+
+## 66. Why Phase 3 raised block-time (commit interval) p99: checkpoint state-write windows stall the fleet; analysis of ozarchy-p3gate (`c88d3073` vs `de1a97c1`) and ozarchy-p4s0 (`d3cba5e2`) cells (2026-10-14)
+
+**Section 61's block-time p99 rise on Phase 3 happens inside the checkpoint state-write windows.** Without the
+intervals that overlap a window, s2's p99 drops to main's level or below:
+* **SAT:** 1,340 -> 1,075 ms on s2 vs 1,096 on m. The step is +202 ms with every interval counted and -21 ms without the
+  window intervals, so the windows hold all of the step.
+* **Soak:** 1,473 -> 1,012 on s2 vs 1,182 on m. The step is +277 with every interval and -170 without, so the windows hold
+  more than the step. Outside the windows s2 is faster, because its exec is faster (section 61).
+* **`d3cba5e2`** (main with Phase 3, section 64's cells, another day) shows the same pattern.
+
+A window is the one to three seconds in which a node's flush worker writes the checkpoint to RocksDB. All three
+validators checkpoint within about a second of each other, and a commit needs all three (quorum 3 of 3). So every window
+holds up the whole fleet.
+
+What happens inside a long interval during a window:
+* The consensus wait, when no node is persisting, blocked on the exec send or building a block, is about 0.45 s longer
+  than in m's long intervals.
+* The time blocked on the exec channel is not longer.
+* View timeouts are 3.5x m's count, and about half of them fall inside the windows.
+
+**Which call stalls consensus during the windows is not found.** Ruled out:
+* exec back-pressure;
+* RocksDB write stalls (the counters are 0 in every cell);
+* CPU (13-15 of 32 cores busy in the median window second).
+
+The host's dirty-page limit (256 MB) is below the ~0.6-0.77 GB the three nodes write per window. Writeback throttling of
+any thread that writes is therefore a candidate mechanism. This is a **hypothesis, not a finding.**
+
+Confidence:
+* **High** on where the step happens (n = 4 SAT pairs plus the soak and `d3cba5e2`, pseudo-window control).
+* **Medium-low** on the mechanism.
+
+Analysis only, with no new run: the section 61 cells (campaign ozarchy-p3gate) and the section 64 cells (ozarchy-p4s0),
+read from their node logs, `sampler.csv`, `metrics-*`, `io-ticks.txt` and `cpu-ticks.txt`. The question was left open in
+sections 61, 64 and 65.
+
+The three arms:
+* **s2** = `c88d3073` (Phase 3 step 2 + merge-wait, 15 s checkpoint interval): SAT r1-r4 and the 600 s soak k1.
+* **m** = main `de1a97c1` (no checkpoints): r1-r4 and k1.
+* **d3** = main `d3cba5e2` (Phases 1-3 + step 6, 15 s default): p4s0 u1, u2 (SAT) and k1 (soak). These are not paired with
+  an m arm and ran on another day.
+
+All 13 cells are rc 0, AGREE, the node md5 is the same within each arm (s2 `4e0d8b84`, m `f1081574`, d3 `c2fda80f`), and
+none has a CELL-FLAG. The TERM cells are not used.
+
+### 66.1 Metric, windows and control
+
+* **Block time (commit interval)** is section 61's metric (`a-cells.py`): on each validator, the time from
+  `on_commit_block fired` at height h-1 to the same line at h, in the bench window. The p99 is taken per validator and the
+  three are averaged. `fleet.py` rebuilds the intervals from the node logs, and its p99s equal section 61's (1,340 / 1,138
+  SAT, 1,473 / 1,196 soak).
+* **Checkpoint write window** (`attrib.py`), per node, in 1 s sampler seconds: it starts at the second in which the exec
+  thread submits a checkpoint (`torus_exec_checkpoint_wait_seconds_count` steps). It ends at the second in which the flush
+  worker's state write finishes (`torus_exec_state_write_db_seconds_count` steps, within 6 s). Most windows last 1-3 s.
+* **What the writes look like** (`writeup.txt` 3):
+  * The checkpoints come in pairs. First a big write: 1.25-1.51 s median total (build + DB) per node and cell, p90 up to
+    1.75 s; the DB part has a median of 0.86-0.99 s; the batch has a median of 205-255 MB, at most 269 MB.
+  * 2-8 s later comes a smaller follow-up: median 0.29-0.54 s, p90 0.70-0.97 s.
+  * The next pair starts 15-17 s after the follow-up. That gives about 16 submits per node per 120 s (15 in r4 and in the
+    d3 cells), with windows covering 19-25% of the time in the SAT cells and 30% in the soaks.
+  * In SAT, the submits of val1 and val2 fall within 1 s of val0's in 179 of 186 cases (2 s for the rest). In the soaks the
+    gap grows to 0-5 s (within 1 s in 60 of 108 for s2, 50 of 106 for d3). The windows still overlap mostly, because each
+    lasts 1-3 s.
+* **Control:** m has no checkpoints. Each m cell gets the windows of the matching s2 cell (same round), moved to the same
+  offset from its first interval: these are the "pseudo-windows". Removing the pseudo-window intervals from m and the
+  window intervals from s2 then compares like with like. The pseudo-windows are not perfectly neutral: m's tail rate inside
+  them is 1.6x its rate outside (SAT), against 3.9x for s2.
+* **Tail:** an interval above T, where T is m's mean per-validator p99 (1,138 ms SAT, 1,196 ms soak). Tails are counted per
+  validator per 100 s.
+
+### 66.2 Where the extra tail is (`attrib.txt`, `attribution-table.txt`)
+
+| | s2 | m (pseudo-windows) | s2 - m |
+|---|---|---|---|
+| **SAT (n = 4 per arm)** | | | |
+| p99, all intervals ms | 1,340 (sd 99) | 1,138 (sd 23) | **+202** |
+| p99 without window intervals ms | 1,075 (sd 60) | 1,096 (sd 35) | **-21** |
+| window share of time | 18.8-25.3% | same windows | |
+| tails > T per validator per 100 s | 9.72 | 5.57 | +4.15 |
+| tail rate in windows (per 100 s of window time) | 22.7 | 7.7 | -> **+3.40 (82% of +4.15)** |
+| tail rate outside windows (per 100 s of other time) | 5.9 | 4.9 | -> +0.74 (18%; sd per cell 1.98 / 1.29, not resolved) |
+| share of the tail excess time (ms above T) in windows | 63-77% | | |
+| **Soak (n = 1 per arm)** | | | |
+| p99, all intervals ms | 1,473 | 1,196 | **+277** |
+| p99 without window intervals ms | 1,012 | 1,182 | **-170** |
+| tails > T per validator per 100 s | 6.72 | 5.88 | +0.84 |
+| tail rate in / outside windows | 18.2 / 1.8 | 7.6 / 5.2 | +3.16 in, -2.33 outside |
+| share of the tail excess time in windows | 92.5% | | |
+
+Per cell (SAT), the in / outside tail rate ratio is 3.2-5.6 on s2 and 1.0-2.2 on m with pseudo-windows. Per cell, the p99
+without the window intervals is 989-1,127 on s2 and 1,062-1,145 on m.
+
+**`d3cba5e2`** (no control arm; T = the p3gate m value):
+
+| cell | p99 all ms | p99 without windows | window time | tail rate in / out | in / out ratio |
+|---|---|---|---|---|---|
+| u1 (SAT) | 1,275 | 1,066 | 21.2% | 17.95 / 5.87 | 3.1 |
+| u2 (SAT) | 1,232 | 1,074 | 23.1% | 20.24 / 4.99 | 4.1 |
+| k1 (soak) | 1,433 | 1,031 | 30.5% | 17.30 / 2.32 | 7.5 |
+
+### 66.3 Outside the windows (`writeup.txt` 1, `timeouts-vs-windows.txt`)
+
+The +0.74 SAT tails outside the windows are within noise. By tag (`attrib.py`, first match: timeout, epoch boundary, exec
+back-pressure = the fleet blocked on the exec send for >= 50% of the interval, other), with m's pseudo-window intervals
+removed:
+
+| tails > T per validator per 100 s, outside windows | s2 SAT | m SAT | s2 - m | s2 soak | m soak | s2 - m |
+|---|---|---|---|---|---|---|
+| view timeout or round skip | 2.19 | 0.41 | **+1.78** | 0.22 | 0.22 | 0.00 |
+| exec back-pressure | 1.71 | 1.58 | +0.13 | 0.94 | 1.83 | -0.89 |
+| epoch boundary | 0.14 | 0.48 | -0.34 | 0.00 | 0.28 | -0.28 |
+| other | 0.48 | 1.31 | -0.83 | 0.11 | 1.28 | -1.17 |
+| **total outside** | 4.52 | 3.78 | **+0.74** | 1.28 | 3.61 | **-2.33** |
+
+(`attrib.txt` and the analyst's table give m's per-tag counts over all of m's time, including its pseudo-window
+intervals: exec back-pressure -0.35, epoch -0.55, other -1.93. Those sum to -1.05, not +0.74. The table above is the
+like-for-like split.)
+
+**View timeouts** (count of `torus_consensus_timeout_total` steps, all nodes):
+
+| arm | timeouts | in a window | within 3 s after a window | elsewhere |
+|---|---|---|---|---|
+| s2 SAT (4 cells) | **59** | 30 (51%) | 14 (24%) | 15 |
+| m SAT (pseudo-windows) | 17 | 7 | 4 | 6 |
+| s2 soak | **38** | 21 (55%) | 11 (29%) | 6 |
+| m soak | 7 | 0 | 1 | 6 |
+| d3 SAT (u1, u2) | 21 | 3 | 8 | 10 |
+| d3 soak | 34 | 25 | 7 | 2 |
+
+Windows cover 22-30% of the time, and the 3 s band after them about as much. So the s2 SAT timeouts outside the windows,
+which are the +1.78, are partly the windows' aftermath: 14 of 29 fall within 3 s after a window, against about 37% by
+chance.
+
+### 66.4 Inside a window tail (`fleet.py`, `writeup.txt` 2)
+
+`fleet.py` splits each interval over the three nodes' HotStuff (consensus) threads. Its segments are taken from the INFO
+log:
+* **persist:** from `fired` at h-1 to `sending to execution pipeline` at h (materialize + durable header / body write).
+* **blocked:** from `sending` at h to the exec start of h-64 (the blocking send on the 64-deep exec channel).
+* **produce:** from `produce_block called` to `pre-proposal push sent` (the leader builds and pushes a block).
+
+The node with the most busy time is the critical node. The **residual** is the interval minus the critical node's busy
+time: no node is in any of these segments, so the fleet is in consensus rounds and message delivery.
+
+| tail intervals > T | n | mean ms | blocked on exec send (union) | commit persist, max over nodes, p50 | exec inter-block gap, critical node | residual |
+|---|---|---|---|---|---|---|
+| s2 SAT, in windows | 76 | 1,580 | 503 (32%) | 59 | 45 ms (n 58) | **943 (60%)** |
+| m SAT, in pseudo-windows | 26 | 1,331 | 542 (41%) | 170 | 16 | 494 (37%) |
+| s2 SAT, outside | 66 | 1,330 | 441 (33%) | 48 | 1 | 755 (57%) |
+| m SAT, outside | 55 | 1,281 | 598 (47%) | 101 | 8 | 458 (36%) |
+| s2 soak, in windows | 98 | 1,591 | 615 (39%) | 47 | 24 ms (n 90) | **826 (52%)** |
+| m soak, in pseudo-windows | 41 | 1,348 | 652 (48%) | 230 | 10 | 395 (29%) |
+| d3 SAT / soak, in windows | 31 / 95 | 1,454 / 1,571 | 586 / 644 | 58 / 51 | 72 / 44 | 691 / 700 |
+
+(The exec gap is a mean over the intervals that have a blocked segment.)
+
+Compared with m's tails at the same offsets, s2's window tails are ~250 ms longer, and all of that is residual
+(+449 SAT, +431 soak ms):
+* The fleet waits on the exec channel for no longer than in m's tails (0.50-0.62 s against 0.54-0.65 s). Exec
+  back-pressure is the same in both arms (section 64: exec p99 flat), so it does not explain the step.
+* The exec thread's inter-block gap (24-45 ms, ~1.5-3%) and the commit persist (~50 ms, ~3%) are small.
+* The rest, ~0.8-0.9 s, is the HotStuff threads idle and waiting. The analyst reads the `on_receive_msg` lines as proposals
+  and votes arriving late; this write-up did not re-derive that.
+
+### 66.5 What it is not, and candidates
+
+* **Not exec:** exec time per native block is flat (section 61: p99 621 -> 590 ms SAT; section 64: 581-596). The
+  exec-thread checkpoint costs are small: settle 3.5, upkeep 0.8 and wait 0.4 ms per block (means). The checkpoint write
+  runs on the flush worker, not on the exec thread. This is why exec p99 stays flat while block time p99 rises.
+* **Not the consensus or network code:** `crates/hotstuff_rs`, `crates/torus-network` and `torus-consensus`'s
+  `network.rs` / `kv_store.rs` are byte-identical between `de1a97c1` and `c88d3073`. The `app.rs` changes are in the exec
+  context (checkpoint policy, flush worker) and at startup. The commit path touches exec only through the 64-slot
+  blocking send (`bounded channel (64 blocks)`), which is full in both arms.
+* **No RocksDB write stalls:** `stall_micros`, `write_stall_*` and `write_stopped` are 0 in all 13 cells, on both arms
+  (`writeup.txt` 5; the counters may be unpopulated).
+* **Consensus-side write histograms are not slower at p99 on s2** (cell totals, `hist-p3gate.txt`, SAT means): commit
+  persist p99 43 vs 68 ms, vote-state write 1.5 vs 42 ms, view insert persist 159 vs 220 ms.
+* **Not CPU:** the three nodes use a median 13.0-15.5 cores and at most 23-25 cores of 32 in window seconds, and 11-16
+  cores outside (`cpu-ticks.txt`, `writeup.txt` 4).
+* **Disk:** in window seconds the three nodes write 0.32-0.37 GB/s at the median, 0.53-0.74 at p90 and up to 0.87 GB/s,
+  against 0-0.19 GB/s at the median outside (`io-ticks.txt` `write_bytes`).
+
+Not pinned: which call stalls the consensus message flow while all three nodes write at once. Candidates:
+1. **Page-cache writeback throttling (hypothesis).** On ozarchy (checked 2026-10-14) `vm.dirty_bytes` = 268,435,456
+   (256 MB) and `vm.dirty_background_bytes` = 67,108,864 (64 MB). One window's state batches from the three nodes, ~0.6-0.77
+   GB (3 x 205-255 MB, plus RocksDB's own WAL / flush writes), exceed the dirty limit. Above it, the kernel makes any thread
+   that dirties pages wait in `balance_dirty_pages`, including a HotStuff thread writing its block tree or vote state.
+   The per-call histograms above do not show that wait at p99, and nothing here measures it.
+2. **A shared RocksDB write path** (block tree / DA writes vs the state batch): not separated.
+3. **Lead from the far tails** (cell totals, bucket-interpolated, not time-aligned; `hist-p3gate.txt`), counts above 0.5 s
+   per validator summed over the 4 SAT cells:
+   * The mempool admission insert `torus_rpc_submit_admit_insert_seconds` has ~34 on s2 and 0 on m. In the soak it is ~46
+     vs 0, and the d3 cells show the same. The state write has ~32 events above 0.5 s on s2 in the same cells.
+   * The timed region is `mempool.add_native_action_presigned`. With a checkpoint interval, its funded-sender check reads
+     the exec thread's published `ReadView`, not the DB (`torus-mempool/src/funded.rs`, changed in Phase 3).
+   * `torus_view_vote_delay_seconds` has ~6 vs 0 and `torus_view_insert_persist_seconds` ~6 vs 0.3.
+   * Whether the HotStuff thread waits on the same thing is not shown.
+
+### 66.6 Verdict and next cells
+
+* **The Phase 3 block-time p99 rise (+17.7% SAT, +23.1% soak) comes from the checkpoint state-write windows.** About 16
+  short windows per 120 s, nearly simultaneous on all three validators, make the 3-of-3 fleet wait ~0.25 s longer in each
+  long interval inside a window. View timeouts become 3.5x as frequent. Outside the windows Phase 3 is not worse (SAT p99
+  1,075 vs 1,096; soak 1,012 vs 1,182).
+* **The same holds on main `d3cba5e2`**, so it ships with Phase 3.
+* **Mechanism open:** not exec back-pressure, RocksDB stall counters or CPU. Dirty-page throttling is a hypothesis.
+* **Suggested next cells (owner's call, none run):**
+  1. **An off-CPU profile of the HotStuff thread across a window** (e.g. `offcputime` / `perf sched` on the
+     `hotstuff-algo` tid of one node for 20-30 s, plus the mempool admission threads), to name the blocking call.
+  2. **Checkpoint interval A/B, 15 s vs 60 s, n = 2** on `d3cba5e2`: fewer, larger windows. This tests whether the p99 step
+     scales with the window count or the write size.
+  3. **A larger `vm.dirty_bytes`** (for example 2 GB, background 512 MB) on the same binary, n = 2: tests hypothesis 1.
+     It is a host setting, so the campaign must restore it.
+  4. **Spread the checkpoint times across validators** (an offset per validator): with 3-of-3 quorum, at most one node
+     would be writing at a time. This should remove most of the step if the stall is per node, but it is untested and is
+     a code change.
+
+**Caveats.**
+1. The windows are in 1 s sampler resolution, and an interval counts as "in" a window if it overlaps one on any node. That
+   is generous: 19-30% of the time is "window".
+2. The soak is n = 1 per arm, and d3 has no control arm and ran on another day.
+3. The pseudo-window control is imperfect: m's tail rate inside the pseudo-windows is 1.6x its outside rate.
+4. The `fleet.py` segments come from INFO log lines. "Residual" is time when no node is in a logged segment, not a
+   measured wait.
+5. The histogram counts in 66.5 are bucket-interpolated cell totals with no timestamps. They are a lead, not evidence of
+   coincidence with the windows.
+6. The RocksDB stall counters read 0 everywhere, so they may not be populated in these builds.
+
+Analysis (`tools/ozarchy-p3gate-tools/analyst/p99-commit/`; outputs in `ozarchy-p3gate-run/analyst/p99-commit/` on
+ozarchy):
+* `fleet.py CELL T0 T1 OUT.csv` builds the per-interval fleet decomposition from the three `val*.log.gz` files ->
+  `fl/<cell>.csv`. T0 / T1 are the bench windows in `windows-p3gate.txt` and `windows-p4s0.txt`.
+* `attrib.py` (tags, windows, pseudo-windows, counterfactual p99; reads `fl/` and each cell's `sampler.csv`) ->
+  `attrib.txt`, `attrib-tagged.csv`, `attrib-windows.json`.
+* `hist.py` (histogram deltas, `metrics-after` minus `metrics-before`, mean of 3 nodes) -> `hist-p3gate.txt`.
+* `tl.py` is the first single-node version, superseded by `fleet.py` (`tl/r1-s2-val1.csv`).
+* `attribution-table.txt` is the analyst's summary. `timeouts-vs-windows.txt` and `big-small-windows.txt` were made inline
+  (no script).
+* `writeup.py` (written for this section) -> `writeup.txt`: the like-for-like outside-window tags (66.3), the tail
+  decomposition by arm and window (66.4), the state write sizes, the disk and CPU rates in and out of the windows, and the
+  stall counters.
+* **Re-run check for this write-up:**
+  * `fleet.py` on all 13 cells reproduces `fl/*.csv` byte for byte.
+  * `attrib.py` into a scratch prefix reproduces `attrib.txt` (same lines, the m rows in another order, from the argument
+    order).
+  * `hist.py` reproduces `hist-p3gate.txt` (same lines, another cell order).
+* Not copied into the repo: `fl/*.csv` (3.8 MB) and `attrib-tagged.csv` (4.2 MB); `fleet.py` and `attrib.py` rebuild them
+  from the node logs and `sampler.csv`, which are Tier B in these cells (keep them if this analysis must stay
+  re-runnable).
 
 ## Open
 
