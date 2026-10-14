@@ -129,6 +129,14 @@ pub fn native_nonce_key(sender: &alloy_primitives::Address, nonce: u64) -> [u8; 
     key
 }
 
+/// Decode a [`CF_NATIVE_NONCES`] key back into `(nonce, sender)`; `None` if it is
+/// not 28 bytes.
+pub fn native_nonce_key_parts(key: &[u8]) -> Option<(u64, alloy_primitives::Address)> {
+    // RED stub (D12).
+    let _ = key;
+    None
+}
+
 /// Build the hot-oracle-signer reverse-index key in [`CF_NATIVE_ORACLE`]:
 /// `"sgn" ‖ signer(20)` -> validator(20) (s517, `SetOracleSigner`).
 ///

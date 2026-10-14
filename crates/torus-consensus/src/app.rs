@@ -1103,6 +1103,10 @@ struct ExecutionContext {
     /// I/O error, as a failed RocksDB access does.
     #[cfg(test)]
     test_replay_fault: Option<ReplayFault>,
+    /// D12 test log: `(height, rows scanned, rows deleted)` of every block's
+    /// nonce-window prune.
+    #[cfg(test)]
+    test_nonce_prune: std::sync::Mutex<Vec<(u64, usize, usize)>>,
     /// adl-budget A7, node-local proof flag (`TORUS_LIQ_VALUE_SUM=1`, read
     /// once at construction): copied into every block's context; with
     /// metrics attached the liquidation step logs the value sum over all
@@ -1149,6 +1153,8 @@ fn read_native_applied_height(state_db: &StateDb) -> Option<u64> {
 enum ReplayFault {
     NonceRead,
     NoncePut,
+    /// D12: the nonce-window prune's read (parent header or nonce range).
+    NoncePrune,
     SessionRead,
     AppliedRead,
     /// R02 branch 3: a reader without `&mut ctx` (`AccountReader::mark`,
@@ -5510,6 +5516,8 @@ impl TorusApp {
             test_core_writer_read_fault: false,
             #[cfg(test)]
             test_replay_fault: None,
+            #[cfg(test)]
+            test_nonce_prune: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
         };
 
@@ -13228,6 +13236,8 @@ mod crash_recovery_tests {
             test_core_writer_read_fault: false,
             #[cfg(test)]
             test_replay_fault: None,
+            #[cfg(test)]
+            test_nonce_prune: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
         }
     }
@@ -27141,5 +27151,307 @@ mod crash_recovery_tests {
             }
         }
         assert!(failures.is_empty(), "applied blocks without their header:\n{}", failures.join("\n"));
+    }
+
+    // ======================================================================
+    // D12 nonce window: CF_NATIVE_NONCES keeps only rows inside the window
+    // (docs/plans/market-scaling-in-memory-design.md, D12)
+    // ======================================================================
+
+    /// A `ClaimRewards` signed by key `[seed; 32]` (nonce consumed whether or
+    /// not the claim pays anything).
+    fn d12_claim(seed: u8, nonce: u64) -> SignedNativeAction {
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, nonce, &key)
+    }
+
+    fn d12_block(height: u64, secs: u64, actions: Vec<SignedNativeAction>) -> TorusBlock {
+        let mut b = make_block(height, actions);
+        b.header.timestamp = secs;
+        b
+    }
+
+    /// The D12 fixture (epoch length 4 under `pipeline_ctx`: 4 / 8 / 12 are
+    /// serial barriers; empties are Marker jobs when pipelined). Times in
+    /// seconds; nonces in ms; the cutoff of a block is `block_ms - 60 s`.
+    ///   1  t=2000  A 1_999_000, A 1_999_999, B 2_000_000
+    ///   2  t=2000  C 2_000_000, B 2_000_000 again (replay inside the window: skipped)
+    ///   3  t=2030  empty (cutoff 1_970_000: nothing expired)
+    ///   4  t=2059  A 2_059_000 (boundary)
+    ///   5  t=2060  empty: cutoff 2_000_000 deletes A 1_999_000 and A 1_999_999,
+    ///              keeps B / C at 2_000_000 (equal to the cutoff: still valid)
+    ///   6  t=2060  same second: B 2_000_000 replay (row still there) and
+    ///              A 1_999_999 (outside the window): both skipped, nothing read
+    ///   7  t=2061  empty: deletes B / C 2_000_000
+    ///   8  t=2200  empty (boundary): deletes A 2_059_000
+    ///   9  t=2200  D 2_200_000
+    ///  10  t=2300  E 2_240_000 (exactly the cutoff) and deletes D (native block)
+    ///  11  t=2300  empty
+    ///  12  t=2301  empty (boundary): deletes E
+    ///  13  t=2301  F 2_301_000
+    fn d12_blocks() -> Vec<TorusBlock> {
+        let (a, b, c, d, e, f) = (0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6);
+        let mut blocks = vec![
+            d12_block(
+                1,
+                2000,
+                vec![
+                    d12_claim(a, 1_999_000),
+                    d12_claim(a, 1_999_999),
+                    d12_claim(b, 2_000_000),
+                ],
+            ),
+            d12_block(2, 2000, vec![d12_claim(c, 2_000_000), d12_claim(b, 2_000_000)]),
+            d12_block(3, 2030, vec![]),
+            d12_block(4, 2059, vec![d12_claim(a, 2_059_000)]),
+            d12_block(5, 2060, vec![]),
+            d12_block(6, 2060, vec![d12_claim(b, 2_000_000), d12_claim(a, 1_999_999)]),
+            d12_block(7, 2061, vec![]),
+            d12_block(8, 2200, vec![]),
+            d12_block(9, 2200, vec![d12_claim(d, 2_200_000)]),
+            d12_block(10, 2300, vec![d12_claim(e, 2_240_000)]),
+            d12_block(11, 2300, vec![]),
+            d12_block(12, 2301, vec![]),
+            d12_block(13, 2301, vec![d12_claim(f, 2_301_000)]),
+        ];
+        link_blocks(&mut blocks);
+        blocks
+    }
+
+    /// `(nonce, signer seed)` of every live nonce row, in key order.
+    fn d12_rows(db: &StateDb) -> Vec<(u64, u8)> {
+        let seeds: std::collections::HashMap<Address, u8> = [0xa1u8, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]
+            .iter()
+            .map(|s| (d12_claim(*s, 0).recover_sender().unwrap(), *s))
+            .collect();
+        StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_NONCES, None)
+            .unwrap()
+            .iter()
+            .map(|(k, _)| {
+                let (nonce, sender) = torus_state::cf::native_nonce_key_parts(k).expect("28-byte key");
+                (nonce, seeds[&sender])
+            })
+            .collect()
+    }
+
+    /// The rows after each height of `d12_blocks`.
+    fn d12_expected_rows(h: u64) -> Vec<(u64, u8)> {
+        let (a, b, c, d, e, f) = (0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6);
+        match h {
+            1 => vec![(1_999_000, a), (1_999_999, a), (2_000_000, b)],
+            2 | 3 => vec![(1_999_000, a), (1_999_999, a), (2_000_000, b), (2_000_000, c)],
+            4 => vec![
+                (1_999_000, a),
+                (1_999_999, a),
+                (2_000_000, b),
+                (2_000_000, c),
+                (2_059_000, a),
+            ],
+            5 | 6 => vec![(2_000_000, b), (2_000_000, c), (2_059_000, a)],
+            7 => vec![(2_059_000, a)],
+            8 | 12 => vec![],
+            9 => vec![(2_200_000, d)],
+            10 | 11 => vec![(2_240_000, e)],
+            13 => vec![(2_301_000, f)],
+            _ => unreachable!(),
+        }
+    }
+
+    /// D12: after every block no nonce row older than the window exists —
+    /// native blocks, empty blocks (Marker jobs) and serial boundary blocks
+    /// all prune, serial and pipelined alike. A nonce equal to the cutoff
+    /// survives, one ms older is deleted; a replay inside the window is still
+    /// rejected; a nonce outside the window is rejected by the window check
+    /// and its row is not written back. The scan reads nothing in a
+    /// same-second block and at most one chunk past the deleted rows.
+    #[test]
+    fn d12_nonce_rows_follow_the_window() {
+        let a = d12_claim(0xa1, 0).recover_sender().unwrap();
+        let (a_old, a_edge) = (
+            torus_state::cf::native_nonce_key(&a, 1_999_000),
+            torus_state::cf::native_nonce_key(&a, 1_999_999),
+        );
+        for on in [false, true] {
+            let (_c, db) = make_test_config_and_db();
+            let ctx = pipeline_ctx(&db, on, None);
+            for blk in &d12_blocks() {
+                let h = blk.header.height;
+                dispatch_and_execute(&ctx, &db, blk);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on} h={h}");
+                if on {
+                    assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+                }
+                assert_eq!(d12_rows(&db), d12_expected_rows(h), "on={on}: rows after {h}");
+                if h == 5 {
+                    assert!(db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &a_old).unwrap().is_none());
+                    assert!(db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &a_edge).unwrap().is_none());
+                }
+            }
+            assert_eq!(
+                action_status(&db, 2).expect("record").native_skipped,
+                vec![false, true],
+                "on={on}: replay inside the window"
+            );
+            assert_eq!(
+                action_status(&db, 6).expect("record").native_skipped,
+                vec![true, true],
+                "on={on}: replay at the cutoff and a nonce below it"
+            );
+            let log = ctx.test_nonce_prune.lock().unwrap().clone();
+            assert_eq!(
+                log.iter().map(|(h, _, _)| *h).collect::<Vec<_>>(),
+                (1..=13).collect::<Vec<_>>(),
+                "on={on}: every block prunes once"
+            );
+            let deleted: Vec<usize> = log.iter().map(|(_, _, d)| *d).collect();
+            assert_eq!(deleted, vec![0, 0, 0, 0, 2, 0, 2, 1, 0, 1, 0, 1, 0], "on={on}");
+            for (h, scanned, del) in &log {
+                assert!(
+                    *scanned <= del + torus_state::nonce_window::NONCE_PRUNE_CHUNK,
+                    "on={on} h={h}: scanned {scanned} for {del} deleted"
+                );
+            }
+            for same_second in [2, 6, 9, 11, 13] {
+                assert_eq!(log[same_second - 1].1, 0, "on={on}: h={same_second} reads nothing");
+            }
+        }
+    }
+
+    /// One D12 run: the per-block write sets, the running hash and the full
+    /// dump. `on`: pipelined; `policy`: checkpoint interval (pipelined only).
+    fn d12_run(
+        on: bool,
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+    ) -> (CapturedWrites, Option<(u64, [u8; 32])>, Vec<CfDump>) {
+        let (_c, db) = make_test_config_and_db();
+        torus_state::running_hash::capture_begin(&db);
+        let mut ctx = pipeline_ctx(&db, false, None);
+        ctx.checkpoint = policy;
+        if on {
+            ctx.attach_flush_worker(None);
+        }
+        for b in &d12_blocks() {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        }
+        drop(ctx); // drains + joins W
+        let captured = torus_state::running_hash::capture_take(&db);
+        let hash = torus_state::running_hash::read_running_hash(&db);
+        (captured, hash, dump_all_cfs(&db))
+    }
+
+    /// The nonce tombstones of one height's write set (CF id 6 in h_n).
+    fn d12_tombstones(captured: &CapturedWrites, h: u64) -> usize {
+        captured
+            .iter()
+            .filter(|(x, _)| *x == h)
+            .flat_map(|(_, w)| w.iter())
+            .filter(|(id, _, v)| *id == 6 && v.is_none())
+            .count()
+    }
+
+    /// D12: serial, pipelined per block, and pipelined with checkpoint
+    /// intervals (every 3 blocks; never by time) give the same per-block
+    /// write sets (every h_n), running hash and full dump. The prune of a
+    /// pipelined block reads the parent layer's rows (block 9's row is
+    /// deleted by block 10 while 9 may still be in flight) and the deletes
+    /// enter h_n as tombstones.
+    #[test]
+    fn d12_pipelined_and_checkpoint_runs_match_serial() {
+        let (serial, hash, dump) = d12_run(false, None);
+        assert!(hash.is_some());
+        for (h, n) in [(5, 2), (7, 2), (8, 1), (10, 1), (12, 1)] {
+            assert_eq!(d12_tombstones(&serial, h), n, "serial: tombstones of {h}");
+        }
+        assert_eq!(
+            cf_rows(&dump, torus_state::cf::CF_NATIVE_NONCES).len(),
+            1,
+            "only F's row is left"
+        );
+        for (name, on, policy) in [
+            ("pipelined", true, None),
+            ("every 3", true, Some(ckpt_every(3))),
+            ("never", true, Some(ckpt_never())),
+        ] {
+            let (run, run_hash, run_dump) = d12_run(on, policy);
+            assert_write_sets_equal(&serial, &run, &format!("{name} vs serial"));
+            assert_eq!(hash, run_hash, "{name}: running hash");
+            assert_dumps_equal(&dump, &run_dump, &format!("{name} vs serial"));
+        }
+    }
+
+    /// D12 crash replay: blocks committed (header + body durable) but not
+    /// executed when the node stops are replayed on restart and give the same
+    /// write sets, running hash and dump as the straight run — the prune
+    /// cursor is the parent header's time, not node-local state.
+    #[test]
+    fn d12_crash_replay_matches_straight_run() {
+        let (straight, hash, dump) = d12_run(false, None);
+        for crash_after in [1usize, 4, 5, 6, 9] {
+            let (_c, db) = make_test_config_and_db();
+            torus_state::running_hash::capture_begin(&db);
+            let blocks = d12_blocks();
+            let ctx = pipeline_ctx(&db, true, None);
+            for b in &blocks[..crash_after] {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            drop(ctx);
+            for b in &blocks[crash_after..] {
+                let durable = persist_committed_block_durably(&db, b);
+                assert!(durable.header && durable.body);
+            }
+            let ctx = pipeline_ctx(&db, false, None);
+            let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(13));
+            let captured = torus_state::running_hash::capture_take(&db);
+            let what = format!("crash after {crash_after}");
+            assert_write_sets_equal(&straight, &captured, &what);
+            assert_eq!(hash, torus_state::running_hash::read_running_hash(&db), "{what}");
+            assert_dumps_equal(&dump, &dump_all_cfs(&db), &what);
+        }
+    }
+
+    /// D12: the first block after genesis takes the genesis parent header
+    /// (time 0) as its cursor, so its range starts at 0 and every row below
+    /// its cutoff goes (here a stray row seeded before the chain started).
+    #[test]
+    fn d12_first_block_after_genesis_prunes_from_zero() {
+        for on in [false, true] {
+            let (_c, db) = make_test_config_and_db();
+            let stray = d12_claim(0xa1, 0).recover_sender().unwrap();
+            for nonce in [0u64, 7, 4_939_999] {
+                db.put_cf_raw(
+                    torus_state::cf::CF_NATIVE_NONCES,
+                    &torus_state::cf::native_nonce_key(&stray, nonce),
+                    &0u64.to_be_bytes(),
+                )
+                .unwrap();
+            }
+            let ctx = pipeline_ctx(&db, on, None);
+            let mut blocks = vec![d12_block(1, 5000, vec![d12_claim(0xb2, 4_940_000)])];
+            link_blocks(&mut blocks);
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            drop(ctx);
+            assert_eq!(d12_rows(&db), vec![(4_940_000, 0xb2)], "on={on}");
+        }
+    }
+
+    /// D12 R02: a failed prune read (parent header or nonce range) fail-stops
+    /// the block — skipping the prune would leave rows another node deletes.
+    /// Restart replays it without the fault to the no-fault state.
+    #[test]
+    fn d12_prune_read_fault_fail_stops_block() {
+        let mut blocks = vec![
+            d12_block(1, 2000, vec![d12_claim(0xa1, 1_999_000)]),
+            d12_block(2, 2061, vec![d12_claim(0xb2, 2_061_000)]),
+        ];
+        link_blocks(&mut blocks);
+        r02_assert_fault_fail_stops_then_replays(&blocks, &|_| {}, ReplayFault::NoncePrune, &|db| {
+            assert_eq!(d12_rows(db), vec![(2_061_000, 0xb2)]);
+        });
     }
 }
