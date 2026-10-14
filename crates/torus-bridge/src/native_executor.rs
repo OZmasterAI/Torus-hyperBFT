@@ -426,6 +426,9 @@ mod liquidation_step;
 #[path = "users.rs"]
 mod users;
 use users::Users;
+/// Phase 4 step 6: the users RSS ubench seam (`users::bench`; not an API).
+#[doc(hidden)]
+pub use users::bench as users_bench;
 
 #[cfg(test)]
 #[path = "balance_cache_tests.rs"]

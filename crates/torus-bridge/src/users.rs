@@ -1206,6 +1206,91 @@ pub(crate) fn find(ps: &[Position], market_id: MarketId) -> Option<&Position> {
     ps.binary_search_by_key(&market_id, |p| p.market_id).ok().map(|i| &ps[i])
 }
 
+/// Phase 4 step 6 (`docs/plans/item6-phase4-impl.md` "Step 6"): the seam of
+/// the users RSS ubench (`tests/ubench_users_rss.rs`, an integration test,
+/// which cannot name the crate-private record set). A cold build of the
+/// record set from raw rows of both CFs (the build R's rebuild runs) and
+/// what the ubench checks on it. Not an API: nothing in the node calls it.
+#[doc(hidden)]
+pub mod bench {
+    use std::collections::BTreeMap;
+
+    use super::{Users, CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
+    use crate::native_executor::{put_sums, PosSums};
+    use torus_types::FixedPoint;
+
+    /// One record set, built cold.
+    pub struct UsersProbe(Users);
+
+    impl UsersProbe {
+        /// The record set of the rows `pos` (positions CF) and `bal`
+        /// (balances CF), as R's rebuild builds it.
+        pub fn build(pos: &BTreeMap<Vec<u8>, Vec<u8>>, bal: &BTreeMap<Vec<u8>, Vec<u8>>) -> Self {
+            Self(Users::build_maps(pos, bal))
+        }
+
+        /// Regular traders (with a record).
+        pub fn regular(&self) -> usize {
+            self.0.map.len()
+        }
+
+        /// Traders kept raw (an irregular row) plus rows under no trader.
+        pub fn raw_rows(&self) -> usize {
+            self.0.opaque.values().chain([&self.0.other]).map(|r| r.footprint().0).sum()
+        }
+
+        /// Positions held on records.
+        pub fn positions(&self) -> usize {
+            self.0.map.values().map(|u| u.positions.len()).sum()
+        }
+
+        /// Records with a balance row, and with a `cvlm` row.
+        pub fn balances_and_volumes(&self) -> (usize, usize) {
+            let n = |f: fn(&super::UserState) -> bool| self.0.map.values().filter(|u| f(u)).count();
+            (n(|u| u.balance.is_some()), n(|u| u.cum_volume.is_some()))
+        }
+
+        /// E2's trader set, and adl C2's (market, holder) entries.
+        pub fn traders_and_holders(&self) -> (usize, usize) {
+            (self.0.traders.len(), self.0.holders.values().map(|h| h.len()).sum())
+        }
+
+        /// The record map's capacity (its one table allocation).
+        pub fn map_capacity(&self) -> usize {
+            self.0.map.capacity()
+        }
+
+        /// Rows held and their key + value bytes (the users gauges).
+        pub fn rows_and_bytes(&self) -> (usize, usize) {
+            (self.0.row_count(), self.0.row_bytes())
+        }
+
+        /// The rows of `positions` (else balances) as R holds them.
+        pub fn encode_rows(&self, positions: bool) -> BTreeMap<Vec<u8>, Vec<u8>> {
+            self.0.encode_rows(if positions { CF_NATIVE_POSITIONS } else { CF_NATIVE_BALANCES })
+        }
+
+        /// Give every record a sums entry at mark version `version` (the
+        /// steady state: `end_resident` writes one per valued trader and a
+        /// moving version clears none). Returns the records given one.
+        pub fn fill_sums(&mut self, version: u64) -> usize {
+            let z = FixedPoint::ZERO;
+            let sums = PosSums { upnl: z, position_im: z, notional: z, maintenance: z, isolated: 0, marked: 0, abs: [0; 4] };
+            let mut n = 0;
+            for u in self.0.map.values_mut() {
+                put_sums(&mut u.sums, version, Ok(sums));
+                n += 1;
+            }
+            n
+        }
+
+        /// Records whose sums entry is tagged `version`.
+        pub fn sums_at(&self, version: u64) -> usize {
+            self.0.map.keys().filter(|t| self.0.sums(t, version).is_some()).count()
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "users_tests.rs"]
 mod tests;
