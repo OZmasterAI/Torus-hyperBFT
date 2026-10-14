@@ -319,6 +319,7 @@ class SummarizeTest(unittest.TestCase):
                 "tail_errors": 12,
                 "tail_missed": 1,
                 "tail_mode": "head",
+                "tail_depth": 1,
             },
         )
 
@@ -340,6 +341,41 @@ class SummarizeTest(unittest.TestCase):
         self.assertIsNone(s["cell"]["in_flight_tail"], "unset = flag omitted")
         self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "head")
 
+    def test_deep_tail_cell_records_the_tail_depth(self):
+        """IN_FLIGHT_TAIL_DEPTH -> cell.in_flight_tail_depth (None = unset =
+        the bench default, 1) and, from bench.log's ' | tail_depth=N' suffix
+        (printed only for N > 1), ingest.in_flight.tail_depth."""
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(
+                self.BENCH_LOG_CAPPED.replace(
+                    "missed=1\n", "missed=1 | tail=commit | tail_depth=4\n"
+                )
+            )
+        s, _ = run_summarize(
+            self.d,
+            extra=[
+                "--max-in-flight", "1", "--in-flight-tail", "commit",
+                "--in-flight-tail-depth", "4",
+            ],
+        )
+        self.assertEqual(s["cell"]["in_flight_tail_depth"], 4)
+        self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 4)
+        self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "commit")
+        # Head mode: the depth suffix alone is not a tail mode.
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail_depth=2\n"))
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1", "--in-flight-tail-depth", "2"])
+        self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "head")
+        self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 2)
+        # Unset: no suffix, depth 1.
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
+        self.assertIsNone(s["cell"]["in_flight_tail_depth"], "unset = flag omitted")
+        self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 1)
+
     def test_rpc_max_response_mb_comes_from_the_node_env(self):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
@@ -359,6 +395,7 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d)
         self.assertIsNone(s["cell"]["max_in_flight"])
         self.assertIsNone(s["cell"]["in_flight_tail"])
+        self.assertIsNone(s["cell"]["in_flight_tail_depth"])
         self.assertIsNone(s["cell"]["open_order_budget"])
         self.assertIsNone(s["ingest"]["bench_submit_rate"])
         self.assertIsNone(s["ingest"]["econ_mix"])
@@ -979,6 +1016,78 @@ class CrashKillGuardTest(unittest.TestCase):
             self.assertIn("FATAL", r.stderr)
         r = run(IN_FLIGHT_TAIL="commit")
         self.assertEqual(r.returncode, 2, "commit tail without MAX_IN_FLIGHT")
+        self.assertIn("FATAL", r.stderr)
+
+    def test_in_flight_tail_depth_reaches_the_bench_only_when_set(self):
+        """IN_FLIGHT_TAIL_DEPTH=N -> bench --in-flight-tail-depth N (body
+        reads the in-flight tail keeps in flight; applied in height order).
+        Unset (default) = flag omitted, so older bench binaries still run.
+        Positive integer <= 64, needs MAX_IN_FLIGHT. Validated, logged,
+        allowlisted in campaign/run_cell.py, recorded as
+        cell.in_flight_tail_depth (also on resummarize). The tail stays on
+        val2 (RPCS[2])."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        self.assertIn("IN_FLIGHT_TAIL_DEPTH=${IN_FLIGHT_TAIL_DEPTH:-}", src)
+        self.assertIn("in_flight_tail_depth='${IN_FLIGHT_TAIL_DEPTH:-unset}'", src)
+        self.assertIn('--in-flight-tail-depth "${IN_FLIGHT_TAIL_DEPTH:-}"', src)
+        self.assertLess(
+            src.index("#   IN_FLIGHT_TAIL_DEPTH="), src.index("set -uo pipefail")
+        )
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"IN_FLIGHT_TAIL_DEPTH",', f.read())
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            self.assertIn(
+                '--in-flight-tail-depth "$(j \'.cell.in_flight_tail_depth // ""\')"',
+                f.read(),
+            )
+        lines = [
+            l
+            for l in src.splitlines()
+            if ("IN_FLIGHT_TAIL" in l or "MAX_IN_FLIGHT" in l)
+            and not l.lstrip().startswith(("#", "log ", "--", "python3", "if ", "export "))
+        ]
+        snippet = (
+            "RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
+            "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
+        )
+
+        def run(**env):
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("MAX_IN_FLIGHT", "IN_FLIGHT_TAIL", "IN_FLIGHT_TAIL_DEPTH")
+            }
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
+
+        watch = "--max-in-flight 4 --in-flight-watch-rpc http://127.0.0.1:8647"
+        r = run(MAX_IN_FLIGHT="4")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, watch), r.stderr)
+        self.assertNotIn("--in-flight-tail-depth", r.stdout, "unset = flag absent")
+        for n in ("1", "4", "64"):
+            r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL_DEPTH=n)
+            self.assertEqual(
+                (r.returncode, r.stdout.strip()),
+                (0, f"{watch} --in-flight-tail-depth {n}"),
+                r.stderr,
+            )
+        r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL="commit", IN_FLIGHT_TAIL_DEPTH="4")
+        self.assertEqual(
+            r.stdout.strip(),
+            f"{watch} --in-flight-tail commit --in-flight-tail-depth 4",
+            r.stderr,
+        )
+        for bad in ("x", "0", "-1", "1.5", "65", "04"):
+            r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL_DEPTH=bad)
+            self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
+            self.assertIn("FATAL", r.stderr)
+        r = run(IN_FLIGHT_TAIL_DEPTH="4")
+        self.assertEqual(r.returncode, 2, "a deep tail without MAX_IN_FLIGHT")
         self.assertIn("FATAL", r.stderr)
 
     def test_max_in_flight_raises_the_node_rpc_response_cap(self):

@@ -225,6 +225,12 @@ enum Command {
         /// (item 6 Phase 3: only at checkpoints, so slots free in bursts).
         #[arg(long, default_value = "")]
         in_flight_tail: String,
+        /// --max-in-flight: block bodies the shared tail reads at once
+        /// (heights next..next+N-1 in flight, applied strictly in height
+        /// order). 1 (default, every bench before this flag) = one at a
+        /// time. N > 1 needs --max-in-flight; at most 64.
+        #[arg(long, default_value_t = 1)]
+        in_flight_tail_depth: usize,
         /// econ: fixed mid price in whole TRS. 0 = derive as 20 x target-margin
         /// so a 1-lot order's margin lands exactly on target.
         #[arg(long, default_value_t = 0)]
@@ -2262,6 +2268,30 @@ mod max_in_flight_tests {
         let commit = tail_flag(&["--max-in-flight", "4", "--in-flight-tail", "commit"]);
         let mode = in_flight::tail_plan(4, &commit);
         assert_eq!(mode, Ok(in_flight::TailMode::Commit));
+    }
+
+    fn tail_depth_flag(extra: &[&str]) -> Result<usize, clap::Error> {
+        let args = ["bench-throughput", "consensus"]
+            .iter()
+            .chain(extra)
+            .copied();
+        let Command::Consensus { in_flight_tail_depth, .. } = Cli::try_parse_from(args)?.command
+        else {
+            panic!("consensus subcommand")
+        };
+        Ok(in_flight_tail_depth)
+    }
+
+    // Default 1 = one body at a time (benches before the flag); validated
+    // by in_flight::tail_depth_plan.
+    #[test]
+    fn in_flight_tail_depth_defaults_to_one() {
+        assert_eq!(tail_depth_flag(&[]).unwrap(), 1);
+        assert_eq!(in_flight::tail_depth_plan(0, 1), Ok(1));
+        let deep = tail_depth_flag(&["--max-in-flight", "4", "--in-flight-tail-depth", "8"]);
+        assert_eq!(deep.unwrap(), 8);
+        assert!(tail_depth_flag(&["--in-flight-tail-depth", "x"]).is_err());
+        assert!(tail_depth_flag(&["--in-flight-tail-depth", "-1"]).is_err());
     }
 
     #[test]
@@ -4497,6 +4527,7 @@ async fn main() {
             max_in_flight,
             in_flight_watch_rpc,
             in_flight_tail,
+            in_flight_tail_depth: _,
             econ_mid,
             band,
             rate_total,

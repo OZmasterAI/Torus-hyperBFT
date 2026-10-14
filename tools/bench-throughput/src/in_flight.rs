@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use torus_types::{ActionSignature, NativeAction};
 
-use crate::release_timing::{wall_ms, ReleaseTiming, TailTiming, WaitReason};
+use crate::release_timing::{wall_ms, ReleaseTiming, TailBody, TailTiming, WaitReason};
 
 /// Slack past the nonce window before an unseen action is written off.
 pub const TIMEOUT_MARGIN_MS: u64 = 10_000;
@@ -88,6 +88,15 @@ pub fn tail_plan(max_in_flight: usize, tail: &str) -> Result<TailMode, String> {
             "unknown --in-flight-tail {other:?} (expected \"head\" or \"commit\")"
         )),
     }
+}
+
+/// Upper bound of `--in-flight-tail-depth`.
+pub const TAIL_DEPTH_MAX: usize = 64;
+
+/// Validate `--in-flight-tail-depth` (bodies the tail reads ahead at once).
+pub fn tail_depth_plan(max_in_flight: usize, depth: usize) -> Result<usize, String> {
+    let _ = max_in_flight;
+    Ok(depth)
 }
 
 /// Why a slot was released.
@@ -423,6 +432,9 @@ pub struct Cap {
     pub n: usize,
     pub url: String,
     pub tail_mode: TailMode,
+    /// `--in-flight-tail-depth`: body reads in flight at once (1 = one at a
+    /// time, every bench before the flag).
+    pub tail_depth: usize,
     pub tracker: Mutex<Tracker>,
     wake: Vec<Notify>,
     pub tail: TailStats,
@@ -437,6 +449,7 @@ impl Cap {
             n,
             url,
             tail_mode,
+            tail_depth: 1,
             tracker: Mutex::new(Tracker::new(
                 senders,
                 n,
@@ -447,6 +460,12 @@ impl Cap {
             tail_timing: Mutex::new(TailTiming::default()),
             started: Instant::now(),
         }
+    }
+
+    /// `--in-flight-tail-depth` (at least 1).
+    pub fn with_tail_depth(mut self, depth: usize) -> Self {
+        self.tail_depth = depth.max(1);
+        self
     }
 
     fn wake(&self, senders: Vec<usize>) {
@@ -707,11 +726,49 @@ impl TailCursor {
     }
 }
 
-/// Release the actions of the body at the cursor and step past it.
-fn tail_apply(cap: &Cap, cur: &mut TailCursor, actions: &[(u64, bool)]) {
+/// One body read by the tail: the reply, when it arrived, how long it took.
+struct Fetched {
+    height: u64,
+    body: BodyFetch,
+    /// Wall ms when the reply was parsed (`seen`).
+    seen_ms: u64,
+    /// Request sent to reply parsed.
+    fetch_us: u64,
+    arrived: Instant,
+}
+
+/// Start reading the body at `height`. The request is issued here (in call
+/// order), its reply is timed when it lands.
+fn fetch<S: TailSource>(src: &S, height: u64) -> impl std::future::Future<Output = Fetched> + '_ {
+    let t0 = Instant::now();
+    let reply = src.body(height);
+    async move {
+        let body = reply.await;
+        let arrived = Instant::now();
+        Fetched {
+            height,
+            body,
+            seen_ms: wall_ms(),
+            fetch_us: arrived.duration_since(t0).as_micros() as u64,
+            arrived,
+        }
+    }
+}
+
+/// Release the actions of the body at the cursor (`f`, read for that
+/// height) and step past it. The release age counts to now, when the slots
+/// free; `seen` stays the reply's arrival.
+fn tail_apply(cap: &Cap, cur: &mut TailCursor, f: &Fetched, actions: &[(u64, bool)]) {
+    debug_assert_eq!(f.height, cur.next, "bodies apply in height order");
     let now = wall_ms();
     let woken = cap.tracker.lock().unwrap().on_block_at(actions, now);
-    cap.tail_timing.lock().unwrap().on_body(cur.next, now);
+    cap.tail_timing.lock().unwrap().on_body(TailBody {
+        height: cur.next,
+        seen_ms: f.seen_ms,
+        applied_ms: now.max(f.seen_ms),
+        fetch_us: f.fetch_us,
+        wait_us: f.arrived.elapsed().as_micros() as u64,
+    });
     cap.wake(woken);
     cap.tail.fetched.fetch_add(1, Ordering::Relaxed);
     cur.next += 1;
@@ -742,8 +799,9 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
             let lag = height.saturating_sub(cur.next - 1);
             cap.tail_timing.lock().unwrap().on_lag(lag);
             while cur.next <= height && Instant::now() < stop {
-                match src.body(cur.next).await {
-                    BodyFetch::Keys(actions) => tail_apply(cap, cur, &actions),
+                let f = fetch(src, cur.next).await;
+                match &f.body {
+                    BodyFetch::Keys(actions) => tail_apply(cap, cur, &f, actions),
                     BodyFetch::Absent | BodyFetch::Error => {
                         tail_error(cap, cur);
                         break;
@@ -753,9 +811,10 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
         }
         TailMode::Commit => {
             while Instant::now() < stop {
-                match src.body(cur.next).await {
+                let f = fetch(src, cur.next).await;
+                match &f.body {
                     BodyFetch::Keys(actions) => {
-                        tail_apply(cap, cur, &actions);
+                        tail_apply(cap, cur, &f, actions);
                         continue;
                     }
                     // Unlike head mode the height may not be committed yet
@@ -785,8 +844,9 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
                 if !past_head && !matches!(src.body(cur.next + 1).await, BodyFetch::Keys(_)) {
                     break;
                 }
-                match src.body(cur.next).await {
-                    BodyFetch::Keys(actions) => tail_apply(cap, cur, &actions),
+                let f = fetch(src, cur.next).await;
+                match &f.body {
+                    BodyFetch::Keys(actions) => tail_apply(cap, cur, &f, actions),
                     BodyFetch::Absent | BodyFetch::Error => {
                         cap.tail.missed.fetch_add(1, Ordering::Relaxed);
                         cur.next += 1;
@@ -1223,6 +1283,21 @@ mod tests {
         body_calls: Mutex<Vec<u64>>,
         /// Body RPCs at or above this height never return.
         stall_from: Option<u64>,
+        /// Heights whose replies are held until the test opens the gate.
+        gates: HashMap<u64, std::sync::Arc<tokio::sync::Semaphore>>,
+        /// Body RPCs issued and not yet answered (or dropped), and the most
+        /// at once.
+        open_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_open_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Counts one open body RPC until it is answered or dropped.
+    struct OpenRead(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for OpenRead {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     impl FakeNode {
@@ -1232,7 +1307,26 @@ mod tests {
                 bodies: Mutex::new(HashMap::new()),
                 body_calls: Mutex::new(Vec::new()),
                 stall_from: None,
+                gates: HashMap::new(),
+                open_reads: Default::default(),
+                max_open_reads: Default::default(),
             }
+        }
+        /// Hold the replies for `height` until [`open`](Self::open).
+        fn gate(mut self, height: u64) -> Self {
+            let g = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            self.gates.insert(height, g);
+            self
+        }
+        fn open(&self, height: u64) {
+            self.gates[&height].add_permits(1 << 20);
+        }
+        /// Body RPCs issued so far (not consumed, unlike `calls`).
+        fn issued(&self) -> Vec<u64> {
+            self.body_calls.lock().unwrap().clone()
+        }
+        fn max_open(&self) -> usize {
+            self.max_open_reads.load(Ordering::SeqCst)
         }
         fn with(self, height: u64, script: Vec<BodyFetch>) -> Self {
             self.bodies.lock().unwrap().insert(height, script);
@@ -1261,9 +1355,17 @@ mod tests {
                 None => BodyFetch::Absent,
             };
             let stall = self.stall_from.is_some_and(|s| height >= s);
+            let gate = self.gates.get(&height).cloned();
+            let open = self.open_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_open_reads.fetch_max(open, Ordering::SeqCst);
+            let read = OpenRead(self.open_reads.clone());
             async move {
+                let _read = read;
                 if stall {
                     std::future::pending::<()>().await;
+                }
+                if let Some(g) = gate {
+                    let _ = g.acquire().await;
                 }
                 out
             }
@@ -1657,7 +1759,12 @@ mod tests {
             line.contains(" tail_rounds=1 tail_fetched=2 tail_fetch_max=2 "),
             "{line}"
         );
-        assert!(line.ends_with(" tail_lag_max=3"), "{line}");
+        assert!(line.contains(" tail_lag_max=3 tail_fetch_p50_ms="), "{line}");
+        assert!(line.contains(" tail_apply_wait_max_ms="), "{line}");
+        assert!(!line.contains("tail_fetch_p50_ms=-"), "two bodies timed: {line}");
+        // Per body: its read time, when it was applied, when it was seen.
+        assert!(blocks.contains(" fetch_ms=1:"), "{blocks}");
+        assert!(blocks.contains(" applied=1@"), "{blocks}");
         let seen: Vec<(u64, u64)> = blocks
             .split_once(" seen=")
             .unwrap()
@@ -1677,9 +1784,9 @@ mod tests {
         let mut cur = TailCursor::new(0);
         tail_round(&cap, &node, &mut cur, far()).await;
         let report = cap.timing_report();
-        assert_eq!(report.len(), 8, "{report:?}");
+        assert_eq!(report.len(), 10, "{report:?}");
         assert!(report[0].contains(" final=1 "), "{}", report[0]);
-        assert!(report[0].ends_with(" tail_lag_max=-"), "{}", report[0]);
+        assert!(report[0].contains(" tail_lag_max=- "), "{}", report[0]);
         assert!(report[1].starts_with("release-timing-blocks: t="));
         assert!(report[2].starts_with("release-timing-hist: what=age_ms n=0 "));
         assert!(report[5].starts_with("release-timing-hist: what=tail_round_us n=1 "));
@@ -1687,6 +1794,8 @@ mod tests {
             report[6].starts_with("release-timing-hist: what=tail_fetched_per_round n=1 sum=1 ")
         );
         assert!(report[7].starts_with("release-timing-hist: what=tail_lag_heights n=0 "));
+        assert!(report[8].starts_with("release-timing-hist: what=tail_fetch_us n=1 "));
+        assert!(report[9].starts_with("release-timing-hist: what=tail_apply_wait_us n=1 "));
     }
 
     #[tokio::test]
@@ -1717,7 +1826,7 @@ mod tests {
             "{}",
             report[0]
         );
-        assert!(report[0].ends_with(" tail_lag_max=3"), "{}", report[0]);
+        assert!(report[0].contains(" tail_lag_max=3 "), "{}", report[0]);
         assert!(report[1].contains(" seen=1@"), "{}", report[1]);
         assert!(!report[1].contains(','), "{}", report[1]);
         assert!(
@@ -1735,5 +1844,334 @@ mod tests {
             "{}",
             report[7]
         );
+    }
+
+    // ---- --in-flight-tail-depth (feat/bench-tail-depth) ----
+
+    #[test]
+    fn tail_depth_defaults_to_one_and_needs_the_cap_above_one() {
+        assert_eq!(tail_depth_plan(0, 1), Ok(1), "the default, cap off");
+        assert_eq!(tail_depth_plan(4, 1), Ok(1));
+        assert_eq!(tail_depth_plan(4, 8), Ok(8));
+        assert_eq!(tail_depth_plan(4, TAIL_DEPTH_MAX), Ok(TAIL_DEPTH_MAX));
+        assert!(tail_depth_plan(4, 0).is_err(), "depth 0 reads nothing");
+        assert!(tail_depth_plan(4, TAIL_DEPTH_MAX + 1).is_err());
+        assert!(tail_depth_plan(0, 4).is_err(), "a deep tail without a cap");
+        let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Head);
+        assert_eq!(cap.tail_depth, 1);
+        assert_eq!(cap.with_tail_depth(0).tail_depth, 1);
+    }
+
+    #[test]
+    fn report_line_names_a_deep_tail_only() {
+        let cap = Cap::new(1, 1, "http://v2".into(), TailMode::Commit);
+        let one = cap.report();
+        assert!(one.ends_with("missed=0 | tail=commit"), "{one}");
+        let deep = Cap::new(1, 1, "http://v2".into(), TailMode::Commit).with_tail_depth(4);
+        assert_eq!(deep.report(), one + " | tail_depth=4");
+        let head = Cap::new(1, 1, "http://v2".into(), TailMode::Head).with_tail_depth(2);
+        assert!(head.report().ends_with("missed=0 | tail_depth=2"), "{}", head.report());
+    }
+
+    /// The tail as it was before `--in-flight-tail-depth` (s121,
+    /// 4b928297): one body read at a time. Depth 1 must match it request
+    /// for request.
+    async fn reference_poll(cap: &Cap, src: &FakeNode, cur: &mut TailCursor, stop: Instant) {
+        fn apply(cap: &Cap, cur: &mut TailCursor, actions: &[(u64, bool)]) {
+            let now = wall_ms();
+            let woken = cap.tracker.lock().unwrap().on_block_at(actions, now);
+            cap.tail_timing.lock().unwrap().on_body(TailBody {
+                height: cur.next,
+                seen_ms: now,
+                applied_ms: now,
+                ..TailBody::default()
+            });
+            cap.wake(woken);
+            cap.tail.fetched.fetch_add(1, Ordering::Relaxed);
+            cur.next += 1;
+            cur.attempts = 0;
+            cur.idle = 0;
+        }
+        match cap.tail_mode {
+            TailMode::Head => {
+                let Some(height) = src.head().await else {
+                    cap.tail.errors.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                let lag = height.saturating_sub(cur.next - 1);
+                cap.tail_timing.lock().unwrap().on_lag(lag);
+                while cur.next <= height && Instant::now() < stop {
+                    match src.body(cur.next).await {
+                        BodyFetch::Keys(actions) => apply(cap, cur, &actions),
+                        BodyFetch::Absent | BodyFetch::Error => {
+                            tail_error(cap, cur);
+                            break;
+                        }
+                    }
+                }
+            }
+            TailMode::Commit => {
+                while Instant::now() < stop {
+                    match src.body(cur.next).await {
+                        BodyFetch::Keys(actions) => {
+                            apply(cap, cur, &actions);
+                            continue;
+                        }
+                        BodyFetch::Error => {
+                            cap.tail.errors.fetch_add(1, Ordering::Relaxed);
+                            cur.attempts = cur.attempts.saturating_add(1);
+                            if cur.attempts < TAIL_MAX_ATTEMPTS {
+                                break;
+                            }
+                        }
+                        BodyFetch::Absent => {
+                            cur.idle = cur.idle.saturating_add(1);
+                            if cur.idle < TAIL_MAX_ATTEMPTS {
+                                break;
+                            }
+                        }
+                    }
+                    let past_head = src.head().await.is_some_and(|h| h >= cur.next);
+                    if !past_head && !matches!(src.body(cur.next + 1).await, BodyFetch::Keys(_)) {
+                        break;
+                    }
+                    match src.body(cur.next).await {
+                        BodyFetch::Keys(actions) => apply(cap, cur, &actions),
+                        BodyFetch::Absent | BodyFetch::Error => {
+                            cap.tail.missed.fetch_add(1, Ordering::Relaxed);
+                            cur.next += 1;
+                            cur.attempts = 0;
+                            cur.idle = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A scripted node from `seed`: a head (or none) and, per height 1..=10,
+    /// 1-3 outcomes (body with the height's action, not committed, error);
+    /// some heights never get a body.
+    fn scripted(seed: u64) -> (Option<u64>, Vec<(u64, Vec<BodyFetch>)>) {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut r = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let head = match r(4) {
+            0 => None,
+            _ => Some(r(12)),
+        };
+        let mut heights = Vec::new();
+        for h in 1..=10u64 {
+            if r(6) == 0 {
+                continue;
+            }
+            let script = (0..=r(3))
+                .map(|_| match r(5) {
+                    0..=2 => BodyFetch::Keys(vec![(1_000 + h, true)]),
+                    3 => BodyFetch::Absent,
+                    _ => BodyFetch::Error,
+                })
+                .collect();
+            heights.push((h, script));
+        }
+        (head, heights)
+    }
+
+    fn node_from(head: Option<u64>, heights: &[(u64, Vec<BodyFetch>)]) -> FakeNode {
+        heights
+            .iter()
+            .fold(FakeNode::new(head), |n, (h, s)| n.with(*h, s.clone()))
+    }
+
+    fn cap_for(mode: TailMode, depth: usize) -> Cap {
+        let cap = Cap::new(1, 64, "http://v2".into(), mode).with_tail_depth(depth);
+        let keys: Vec<_> = (1..=12).map(|h| (1_000 + h, 1_000, 1, false)).collect();
+        cap.submit(0, &keys);
+        cap
+    }
+
+    fn applied_heights(cap: &Cap) -> Vec<u64> {
+        cap.tail_timing.lock().unwrap().roll().seen.iter().map(|b| b.height).collect()
+    }
+
+    // (1) Depth 1 (the default) = the tail before the flag: the same body
+    // and head reads in the same order, the same releases, counters and
+    // cursor after every poll, both modes.
+    #[tokio::test]
+    async fn depth_one_matches_the_one_at_a_time_tail_request_for_request() {
+        for seed in 0..300 {
+            for mode in [TailMode::Head, TailMode::Commit] {
+                let (head, heights) = scripted(seed);
+                let (new_node, old_node) = (node_from(head, &heights), node_from(head, &heights));
+                let (new_cap, old_cap) = (cap_for(mode, 1), cap_for(mode, 1));
+                let (mut new_cur, mut old_cur) = (TailCursor::new(0), TailCursor::new(0));
+                for poll in 0..2 * TAIL_MAX_ATTEMPTS + 3 {
+                    tail_poll(&new_cap, &new_node, &mut new_cur, far()).await;
+                    reference_poll(&old_cap, &old_node, &mut old_cur, far()).await;
+                    let at = format!("seed {seed} {mode:?} poll {poll}");
+                    assert_eq!(new_node.calls(), old_node.calls(), "{at}: body reads");
+                    assert_eq!(stats(&new_cap), stats(&old_cap), "{at}: tail counters");
+                    assert_eq!(
+                        (new_cur.next, new_cur.attempts, new_cur.idle),
+                        (old_cur.next, old_cur.attempts, old_cur.idle),
+                        "{at}: cursor"
+                    );
+                    assert_eq!(
+                        new_cap.tracker.lock().unwrap().released,
+                        old_cap.tracker.lock().unwrap().released,
+                        "{at}: releases"
+                    );
+                    assert_eq!(applied_heights(&new_cap), applied_heights(&old_cap), "{at}");
+                    assert!(new_node.max_open() <= 1, "{at}: one read at a time");
+                }
+            }
+        }
+    }
+
+    // (2) Depth N: up to N body reads in flight at once; replies that land
+    // out of order are held and applied in height order, each height once.
+    // `seen` is the reply's arrival, `applied` when its slots freed.
+    #[tokio::test]
+    async fn deep_tail_reads_ahead_and_applies_in_height_order() {
+        for mode in [TailMode::Head, TailMode::Commit] {
+            let cap = cap_for(mode, 3);
+            let node = (1..=5)
+                .fold(FakeNode::new(Some(5)), |n, h| {
+                    n.with(h, vec![BodyFetch::Keys(vec![(1_000 + h, true)])])
+                })
+                .gate(1)
+                .gate(2)
+                .gate(3);
+            let mut cur = TailCursor::new(0);
+            let poll = tail_poll(&cap, &node, &mut cur, far());
+            let driver = async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while node.issued().len() < 3 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{mode:?}: 3 reads in flight, got {:?}", node.issued()));
+                assert_eq!(node.issued(), vec![1, 2, 3], "{mode:?}");
+                // Replies land 3, 2, 1: nothing applies before height 1.
+                for h in [3, 2] {
+                    node.open(h);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    assert_eq!(cap.tail.fetched.load(Ordering::Relaxed), 0, "{mode:?}");
+                }
+                node.open(1);
+            };
+            tokio::join!(poll, driver);
+            let seen = cap.tail_timing.lock().unwrap().roll().seen;
+            assert_eq!(
+                seen.iter().map(|b| b.height).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5],
+                "{mode:?}: height order, no gap, no repeat"
+            );
+            let at = |h: u64| seen[h as usize - 1];
+            assert!(at(3).seen_ms < at(2).seen_ms, "{mode:?}: {seen:?}");
+            assert!(at(2).seen_ms < at(1).seen_ms, "{mode:?}: {seen:?}");
+            assert!(at(3).applied_ms >= at(1).seen_ms, "{mode:?}: held for 1");
+            assert!(at(3).wait_us >= 9_000, "{mode:?}: {seen:?}");
+            assert!(at(3).fetch_us < at(1).fetch_us, "{mode:?}: {seen:?}");
+            assert!(seen.windows(2).all(|w| w[0].applied_ms <= w[1].applied_ms));
+            assert_eq!(node.max_open(), 3, "{mode:?}: depth 3 = 3 reads at once");
+            assert_eq!(cap.tracker.lock().unwrap().released, [5, 0, 0], "{mode:?}");
+            assert_eq!(cur.next, 6, "{mode:?}");
+            assert_eq!(stats(&cap), [5, 0, 0], "{mode:?}");
+            let issued = node.calls();
+            assert_eq!(&issued[..5], &[1, 2, 3, 4, 5], "{mode:?}: each body read once");
+            match mode {
+                TailMode::Head => assert_eq!(issued.len(), 5, "head 5: nothing above it"),
+                // At the tip: 6, 7, 8 read ahead, 6 not committed, stop.
+                TailMode::Commit => assert_eq!(&issued[5..], &[6, 7, 8]),
+            }
+        }
+    }
+
+    // (3) A failed read with later reads in flight: the poll stops at the
+    // failed height as at depth 1 (one error, nothing above it applied, the
+    // later replies dropped) and the next poll retries it; a height that
+    // stays unreadable is skipped exactly as at depth 1. Same releases,
+    // counters, cursor and applied heights as depth 1.
+    #[tokio::test]
+    async fn deep_tail_failures_retry_and_skip_like_depth_one() {
+        let keys = |h: u64| BodyFetch::Keys(vec![(1_000 + h, true)]);
+        let mut errs = vec![BodyFetch::Error; TAIL_MAX_ATTEMPTS as usize];
+        errs.push(keys(2));
+        let cases: Vec<(TailMode, Option<u64>, Vec<(u64, Vec<BodyFetch>)>)> = vec![
+            // Error once, then the body.
+            (TailMode::Head, Some(5), vec![(2, vec![BodyFetch::Error, keys(2)])]),
+            (TailMode::Commit, None, vec![(2, vec![BodyFetch::Error, keys(2)])]),
+            // Never readable: missed after TAIL_MAX_ATTEMPTS.
+            (TailMode::Head, Some(5), vec![(2, vec![BodyFetch::Error])]),
+            (TailMode::Commit, None, vec![(2, vec![BodyFetch::Error])]),
+            (TailMode::Commit, Some(5), vec![(2, vec![BodyFetch::Absent])]),
+            // Commit: errors before the commit never skip it.
+            (TailMode::Commit, None, vec![(2, errs)]),
+        ];
+        for (i, (mode, head, special)) in cases.into_iter().enumerate() {
+            let mut heights: Vec<_> = (1..=5u64).map(|h| (h, vec![keys(h)])).collect();
+            for (h, s) in special {
+                heights[h as usize - 1].1 = s;
+            }
+            let mut outcome = Vec::new();
+            for depth in [1, 3] {
+                let node = node_from(head, &heights);
+                let cap = cap_for(mode, depth);
+                let mut cur = TailCursor::new(0);
+                let mut applied = Vec::new();
+                for _ in 0..2 * TAIL_MAX_ATTEMPTS + 2 {
+                    tail_poll(&cap, &node, &mut cur, far()).await;
+                    applied.extend(applied_heights(&cap));
+                }
+                let released = cap.tracker.lock().unwrap().released;
+                outcome.push((applied, released, stats(&cap), cur.next));
+            }
+            assert_eq!(outcome[1], outcome[0], "case {i} ({mode:?}): depth 3 vs depth 1");
+            let applied = &outcome[1].0;
+            assert!(applied.windows(2).all(|w| w[0] < w[1]), "case {i}: {applied:?}");
+        }
+    }
+
+    // (3) A slow read that then fails (a timed-out RPC), with the bodies
+    // above it already in: they are not applied past it, the poll ends at
+    // the error (no stall), and the next poll applies 2, 3, 4 in order.
+    #[tokio::test]
+    async fn deep_tail_slow_failed_read_holds_the_later_bodies_until_retried() {
+        let cap = cap_for(TailMode::Head, 3);
+        let node = FakeNode::new(Some(4))
+            .with(1, vec![BodyFetch::Keys(vec![(1_001, true)])])
+            .with(2, vec![BodyFetch::Error, BodyFetch::Keys(vec![(1_002, true)])])
+            .with(3, vec![BodyFetch::Keys(vec![(1_003, true)])])
+            .with(4, vec![BodyFetch::Keys(vec![(1_004, true)])])
+            .gate(2);
+        let mut cur = TailCursor::new(0);
+        let poll = tail_poll(&cap, &node, &mut cur, far());
+        let driver = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.issued().len() < 4 || cap.tail.fetched.load(Ordering::Relaxed) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("reads 1..=4 in flight, got {:?}", node.issued()));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(cap.tail.fetched.load(Ordering::Relaxed), 1, "3, 4 wait for 2");
+            node.open(2);
+        };
+        tokio::join!(poll, driver);
+        assert_eq!(node.calls(), vec![1, 2, 3, 4]);
+        assert_eq!((stats(&cap), cur.next), ([1, 1, 0], 2), "one error, cursor on 2");
+        assert_eq!(applied_heights(&cap), vec![1]);
+        tail_poll(&cap, &node, &mut cur, far()).await;
+        assert_eq!(node.calls(), vec![2, 3, 4], "2 retried, 3 and 4 read again");
+        assert_eq!(applied_heights(&cap), vec![2, 3, 4]);
+        assert_eq!((stats(&cap), cur.next), ([4, 1, 0], 5));
+        assert_eq!(cap.tracker.lock().unwrap().released, [4, 0, 0]);
     }
 }
