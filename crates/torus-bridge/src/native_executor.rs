@@ -4150,7 +4150,7 @@ impl EndResidentJob {
             }
         };
         if let Some(m) = metrics {
-            m.exec_end_resident_positions_seconds.observe(timer.elapsed().as_secs_f64());
+            m.exec_end_resident_users_seconds.observe(timer.elapsed().as_secs_f64());
         }
         let sums = carry.map(|c| c.cache).unwrap_or_default();
         drop(delta);

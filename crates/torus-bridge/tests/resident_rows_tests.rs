@@ -273,7 +273,7 @@ fn metrics_count_rebuilds_and_size() {
     let text = metrics.encode();
     assert!(text.contains("torus_exec_resident_rows_build_seconds_count 1"), "{text}");
     // Item 6 step 1: end_resident and its two main parts, once per block.
-    for name in ["end_resident", "end_resident_rows", "end_resident_positions"] {
+    for name in ["end_resident", "end_resident_rows", "end_resident_users"] {
         assert!(text.contains(&format!("torus_exec_{name}_seconds_count 3")), "{name}: {text}");
     }
 }
