@@ -68,13 +68,21 @@ pub fn wall_ms() -> u64 {
 }
 
 fn bucket(v: u64) -> usize {
-    let _ = v;
-    todo!()
+    if v < EXACT as u64 {
+        return v as usize;
+    }
+    let e = 63 - v.leading_zeros(); // >= 5
+    let sub = (v >> (e - 4)) & 15;
+    EXACT + (e as usize - 5) * 16 + sub as usize
 }
 
 fn bucket_lo(i: usize) -> u64 {
-    let _ = i;
-    todo!()
+    if i < EXACT {
+        return i as u64;
+    }
+    let j = i - EXACT;
+    let e = 5 + (j / 16) as u32;
+    (1u64 << e) | (((j % 16) as u64) << (e - 4))
 }
 
 /// Log-linear histogram of `u64` samples (see the module doc).
@@ -89,19 +97,44 @@ pub struct Hist {
 
 impl Hist {
     pub fn record(&mut self, v: u64) {
-        let _ = v;
-        todo!()
+        if self.counts.is_empty() {
+            self.counts = vec![0; BUCKETS];
+        }
+        self.counts[bucket(v)] += 1;
+        self.n += 1;
+        self.sum = self.sum.saturating_add(v);
+        self.max = self.max.max(v);
     }
 
     /// Nearest-rank quantile (`q` in 0..=1); `None` when empty.
     pub fn quantile(&self, q: f64) -> Option<u64> {
-        let _ = q;
-        todo!()
+        if self.n == 0 {
+            return None;
+        }
+        let rank = ((q * self.n as f64).ceil() as u64).clamp(1, self.n);
+        let mut seen = 0;
+        for (i, &c) in self.counts.iter().enumerate() {
+            seen += c;
+            if seen >= rank {
+                return Some(bucket_lo(i).min(self.max));
+            }
+        }
+        Some(self.max)
     }
 
     pub fn merge(&mut self, other: &Hist) {
-        let _ = other;
-        todo!()
+        if other.n == 0 {
+            return;
+        }
+        if self.counts.is_empty() {
+            self.counts = vec![0; BUCKETS];
+        }
+        for (a, b) in self.counts.iter_mut().zip(&other.counts) {
+            *a += b;
+        }
+        self.n += other.n;
+        self.sum = self.sum.saturating_add(other.sum);
+        self.max = self.max.max(other.max);
     }
 
     /// `(bucket lower bound, count)` of every non-empty bucket.
@@ -128,7 +161,9 @@ impl Series {
 
     /// Close the window: fold it into the total and return it.
     pub fn roll(&mut self) -> Hist {
-        todo!()
+        let w = std::mem::take(&mut self.window);
+        self.total.merge(&w);
+        w
     }
 }
 
@@ -160,19 +195,26 @@ pub struct RelWindow {
 impl ReleaseTiming {
     /// One action released committed, its body seen at `now_ms`.
     pub fn on_release(&mut self, now_ms: u64, nonce: u64) {
-        let _ = (now_ms, nonce);
-        todo!()
+        self.age_ms.record(now_ms.saturating_sub(nonce));
     }
 
     /// One `wait_ready` call returned ready; `waited_us[reason]` = time spent
     /// waiting for that reason (`None` = never waited for it).
     pub fn on_ready(&mut self, waited_us: [Option<u64>; 2]) {
-        let _ = waited_us;
-        todo!()
+        self.ready_calls += 1;
+        for (series, us) in self.wait_us.iter_mut().zip(waited_us) {
+            if let Some(us) = us {
+                series.record(us);
+            }
+        }
     }
 
     pub fn roll(&mut self) -> RelWindow {
-        todo!()
+        RelWindow {
+            age_ms: self.age_ms.roll(),
+            wait_us: [self.wait_us[0].roll(), self.wait_us[1].roll()],
+            ready_calls: std::mem::take(&mut self.ready_calls),
+        }
     }
 
     /// Run-total histograms (complete after the last [`roll`](Self::roll)).
@@ -212,12 +254,21 @@ impl TailTiming {
         lag: Option<u64>,
         seen: &mut Vec<(u64, u64)>,
     ) {
-        let _ = (round_us, fetched, lag, seen);
-        todo!()
+        self.round_us.record(round_us);
+        self.fetched.record(fetched);
+        if let Some(lag) = lag {
+            self.lag.record(lag);
+        }
+        self.seen.append(seen);
     }
 
     pub fn roll(&mut self) -> TailWindow {
-        todo!()
+        TailWindow {
+            round_us: self.round_us.roll(),
+            fetched: self.fetched.roll(),
+            lag: self.lag.roll(),
+            seen: std::mem::take(&mut self.seen),
+        }
     }
 
     pub fn totals(&self) -> [(&'static str, &Hist); 3] {
@@ -237,14 +288,66 @@ pub fn window_lines(
     rel: &RelWindow,
     tail: &TailWindow,
 ) -> [String; 2] {
-    let _ = (t_s, wall_ms, last, rel, tail);
-    todo!()
+    let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
+    let ms =
+        |us: Option<u64>| us.map_or_else(|| "-".to_string(), |v| format!("{:.1}", v as f64 / 1e3));
+    let max = |h: &Hist| (h.n > 0).then_some(h.max);
+    let age = &rel.age_ms;
+    let wait = |name: &str, h: &Hist| {
+        format!(
+            "wait_{name}_n={} wait_{name}_s={:.3} wait_{name}_p50_ms={} wait_{name}_p99_ms={}",
+            h.n,
+            h.sum as f64 / 1e6,
+            ms(h.quantile(0.5)),
+            ms(h.quantile(0.99)),
+        )
+    };
+    let main = format!(
+        "release-timing: t={t_s:.1} wall_ms={wall_ms} final={} released={} age_p50_ms={} \
+         age_p90_ms={} age_p99_ms={} age_max_ms={} ready_calls={} {} {} tail_rounds={} \
+         tail_fetched={} tail_fetch_max={} tail_round_p50_ms={} tail_round_max_ms={} \
+         tail_lag_max={}",
+        u8::from(last),
+        age.n,
+        n(age.quantile(0.5)),
+        n(age.quantile(0.9)),
+        n(age.quantile(0.99)),
+        n(max(age)),
+        rel.ready_calls,
+        wait("cap", &rel.wait_us[0]),
+        wait("cancel", &rel.wait_us[1]),
+        tail.round_us.n,
+        tail.fetched.sum,
+        n(max(&tail.fetched)),
+        ms(tail.round_us.quantile(0.5)),
+        ms(max(&tail.round_us)),
+        n(max(&tail.lag)),
+    );
+    let seen: Vec<String> = tail
+        .seen
+        .iter()
+        .map(|(h, ms)| format!("{h}@{ms}"))
+        .collect();
+    let blocks = format!("release-timing-blocks: t={t_s:.1} seen={}", seen.join(","));
+    [main, blocks]
 }
 
 /// One end-of-run `release-timing-hist:` line.
 pub fn hist_line(what: &str, h: &Hist) -> String {
-    let _ = (what, h);
-    todo!()
+    let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
+    let buckets: Vec<String> = h.buckets().map(|(lo, c)| format!("{lo}:{c}")).collect();
+    format!(
+        "release-timing-hist: what={what} n={} sum={} p50={} p90={} p99={} p999={} max={} \
+         buckets={}",
+        h.n,
+        h.sum,
+        n(h.quantile(0.5)),
+        n(h.quantile(0.9)),
+        n(h.quantile(0.99)),
+        n(h.quantile(0.999)),
+        n((h.n > 0).then_some(h.max)),
+        buckets.join(","),
+    )
 }
 
 #[cfg(test)]
@@ -294,10 +397,7 @@ mod tests {
         one.record(1_000);
         assert_eq!(one.quantile(0.5), Some(992));
         assert_eq!(one.max, 1_000);
-        assert_eq!(
-            small.buckets().collect::<Vec<_>>(),
-            vec![(3, 2), (7, 1)]
-        );
+        assert_eq!(small.buckets().collect::<Vec<_>>(), vec![(3, 2), (7, 1)]);
     }
 
     #[test]

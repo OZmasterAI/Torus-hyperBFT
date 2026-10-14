@@ -264,8 +264,11 @@ impl Tracker {
     /// Why `sender` is not [`ready`](Self::ready): at its cap, else held by
     /// its own in-flight cancel-all.
     pub fn wait_reason(&self, sender: usize) -> WaitReason {
-        let _ = sender;
-        todo!()
+        if self.senders[sender].in_flight >= self.cap {
+            WaitReason::CapFull
+        } else {
+            WaitReason::CancelPending
+        }
     }
 
     /// Register one action as in flight (BEFORE it is sent, so a fast commit
@@ -328,7 +331,6 @@ impl Tracker {
     /// `now_ms` - nonce). Cancel-alls are applied before places (the
     /// executor runs a block's cancel-alls first).
     pub fn on_block_at(&mut self, actions: &[(u64, bool)], now_ms: u64) -> Vec<usize> {
-        let _ = now_ms;
         let mut woken = Vec::new();
         for cancels_pass in [true, false] {
             for &(key, ok) in actions {
@@ -338,6 +340,7 @@ impl Tracker {
                 let Some((s, p)) = self.release(key, Release::Committed) else {
                     continue;
                 };
+                self.timing.on_release(now_ms, p.nonce);
                 if p.cancel {
                     if ok {
                         self.senders[s].committed_open = 0;
@@ -459,15 +462,25 @@ impl Cap {
         budget: u64,
         deadline: Instant,
     ) -> Option<(u64, bool, bool)> {
-        let mut waited = false;
+        // Release timing: the time since each check goes to the reason seen
+        // at it (recorded under this lock; no clock read unless waiting).
+        let mut since: Option<(Instant, WaitReason)> = None;
+        let mut waited_us = [None; 2];
         loop {
             {
-                let t = self.tracker.lock().unwrap();
+                let mut t = self.tracker.lock().unwrap();
+                if let Some((t0, why)) = since {
+                    let us = t0.elapsed().as_micros() as u64;
+                    let w: &mut Option<u64> = &mut waited_us[why as usize];
+                    *w = Some(w.unwrap_or(0) + us);
+                }
                 if t.ready(sender, batch, budget) {
+                    t.timing.on_ready(waited_us);
+                    let waited = since.is_some();
                     return Some((t.estimate(sender), t.cancel_pending(sender), waited));
                 }
+                since = Some((Instant::now(), t.wait_reason(sender)));
             }
-            waited = true;
             // A release between the check and this await leaves a stored
             // permit (notify_one), so no wakeup is lost.
             tokio::select! {
@@ -498,13 +511,22 @@ impl Cap {
     /// Close the current release-timing window: its two log lines
     /// (`release_timing` module doc).
     pub fn timing_window(&self, last: bool) -> [String; 2] {
-        let _ = last;
-        todo!()
+        let rel = self.tracker.lock().unwrap().timing.roll();
+        let tail = self.tail_timing.lock().unwrap().roll();
+        let t_s = self.started.elapsed().as_secs_f64();
+        crate::release_timing::window_lines(t_s, wall_ms(), last, &rel, &tail)
     }
 
     /// End of run: the last (partial) window, then one histogram line each.
     pub fn timing_report(&self) -> Vec<String> {
-        todo!()
+        let mut lines = self.timing_window(true).to_vec();
+        let hist = crate::release_timing::hist_line;
+        let t = self.tracker.lock().unwrap();
+        lines.extend(t.timing.totals().iter().map(|(what, h)| hist(what, h)));
+        drop(t);
+        let tail = self.tail_timing.lock().unwrap();
+        lines.extend(tail.totals().iter().map(|(what, h)| hist(what, h)));
+        lines
     }
 }
 
@@ -692,7 +714,9 @@ impl TailCursor {
 
 /// Release the actions of the body at the cursor and step past it.
 fn tail_apply(cap: &Cap, cur: &mut TailCursor, actions: &[(u64, bool)]) {
-    let woken = cap.tracker.lock().unwrap().on_block_at(actions, 0);
+    let now = wall_ms();
+    let woken = cap.tracker.lock().unwrap().on_block_at(actions, now);
+    cur.seen.push((cur.next, now));
     cap.wake(woken);
     cap.tail.fetched.fetch_add(1, Ordering::Relaxed);
     cur.next += 1;
@@ -720,6 +744,7 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
                 cap.tail.errors.fetch_add(1, Ordering::Relaxed);
                 return;
             };
+            cur.lag = Some(height.saturating_sub(cur.next - 1));
             while cur.next <= height && Instant::now() < stop {
                 match src.body(cur.next).await {
                     BodyFetch::Keys(actions) => tail_apply(cap, cur, &actions),
@@ -780,7 +805,16 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
 
 /// One [`tail_poll`], timed (`release_timing`).
 async fn tail_round<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop: Instant) {
+    let t0 = Instant::now();
+    let fetched0 = cap.tail.fetched.load(Ordering::Relaxed);
+    cur.lag = None;
     tail_poll(cap, src, cur, stop).await;
+    let round_us = t0.elapsed().as_micros() as u64;
+    let fetched = cap.tail.fetched.load(Ordering::Relaxed) - fetched0;
+    cap.tail_timing
+        .lock()
+        .unwrap()
+        .on_round(round_us, fetched, cur.lag, &mut cur.seen);
 }
 
 /// The shared block-body tail: every `TAIL_POLL` expire timed-out actions,
@@ -799,6 +833,7 @@ pub async fn run_tail(
         url: cap.url.clone(),
     };
     let mut cur = TailCursor::new(start_block);
+    let mut next_line = Instant::now() + crate::release_timing::WINDOW;
     while Instant::now() < stop {
         tokio::time::sleep(TAIL_POLL).await;
         let now_ms = SystemTime::now()
@@ -807,7 +842,13 @@ pub async fn run_tail(
             .as_millis() as u64;
         let woken = cap.tracker.lock().unwrap().expire(now_ms);
         cap.wake(woken);
-        tail_poll(&cap, &src, &mut cur, stop).await;
+        tail_round(&cap, &src, &mut cur, stop).await;
+        if Instant::now() >= next_line {
+            next_line += crate::release_timing::WINDOW;
+            for line in cap.timing_window(false) {
+                println!("{line}");
+            }
+        }
     }
 }
 
@@ -1539,7 +1580,10 @@ mod tests {
         use std::sync::Arc;
         let end = far();
         let cap = Arc::new(Cap::new(1, 1, "http://v2".into(), TailMode::Commit));
-        assert_eq!(cap.wait_ready(0, 400, 0, end).await, Some((0, false, false)));
+        assert_eq!(
+            cap.wait_ready(0, 400, 0, end).await,
+            Some((0, false, false))
+        );
         cap.submit(0, &[(1, 1_000, 400, false)]);
         let c = cap.clone();
         let w = tokio::spawn(async move { c.wait_ready(0, 400, 0, end).await });
@@ -1613,8 +1657,9 @@ mod tests {
         assert!(report[1].starts_with("release-timing-blocks: t="));
         assert!(report[2].starts_with("release-timing-hist: what=age_ms n=0 "));
         assert!(report[5].starts_with("release-timing-hist: what=tail_round_us n=1 "));
-        assert!(report[6]
-            .starts_with("release-timing-hist: what=tail_fetched_per_round n=1 sum=1 "));
+        assert!(
+            report[6].starts_with("release-timing-hist: what=tail_fetched_per_round n=1 sum=1 ")
+        );
         assert!(report[7].starts_with("release-timing-hist: what=tail_lag_heights n=0 "));
     }
 }
