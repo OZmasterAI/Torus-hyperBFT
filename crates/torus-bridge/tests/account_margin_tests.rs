@@ -195,7 +195,7 @@ fn pos_in(ctx: &NativeExecContext, t: &Address, m: MarketId) -> FixedPoint {
 
 /// Remaining quantities of `t`'s resting orders in market `m`.
 fn resting_in(ctx: &NativeExecContext, t: &Address, m: MarketId) -> Vec<FixedPoint> {
-    ctx.order_books
+    ctx.order_books()
         .get(&m)
         .map(|b| b.orders_for_trader(t).iter().map(|o| o.remaining_qty).collect())
         .unwrap_or_default()
@@ -1507,7 +1507,7 @@ fn modify_of_a_resting_non_pool_sell_keeps_the_a5_identity(path: Path) {
     run(&mut ctx, path, &[place(mk, limit(2, true, 101, 4))]);
     fund_native(&ctx, &t, fp(200));
     run(&mut ctx, path, &[place(t, pool_order()), place(t, limit(2, false, 100, 10))]);
-    let id = ctx.order_books[&2].orders_for_trader(&t)[0].id;
+    let id = ctx.order_books()[&2].orders_for_trader(&t)[0].id;
     let r = run(&mut ctx, path, &[(t, NativeAction::ModifyOrder { order_id: id, new_price: Some(fp(102)), new_qty: Some(fp(8)) })]);
     assert!(r[0].success, "{path:?}: {:?}", r[0].error);
     assert_eq!(resting_in(&ctx, &t, 2), vec![fp(8)], "{path:?}");
@@ -1713,7 +1713,7 @@ fn order_margin_matches_resting_reservations_under_option_b() {
             assert!(r.results.iter().any(|x| x.success), "threads={threads} block={block}");
             fills = fills.max(ctx.trade_index);
             for s in &senders {
-                let resting = ctx.order_books.values().flat_map(|b| b.orders_for_trader(s)).fold(FixedPoint::ZERO, |acc, o| {
+                let resting = ctx.order_books().values().flat_map(|b| b.orders_for_trader(s)).fold(FixedPoint::ZERO, |acc, o| {
                     acc + torus_core::margin::order_initial_margin(None, o.price * o.remaining_qty)
                 });
                 assert_eq!(bal(&ctx, s).order_margin, resting, "threads={threads} block={block} sender {s}");

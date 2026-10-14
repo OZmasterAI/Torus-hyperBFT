@@ -402,8 +402,8 @@ fn cancels_resting_orders_and_pending_stops_with_their_reservations() {
     place(&mut ctx, &m, limit(1, true, 985, 10));
     set_mark(&ctx, 1, fp(990)); // AV 195 + 105 - 100 = 200 -> stage 1
     NativeExecutor::run_liquidations(&mut ctx);
-    assert!(ctx.order_books[&1].orders_for_trader(&t).is_empty());
-    assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "t's stop removed");
+    assert!(ctx.order_books()[&1].orders_for_trader(&t).is_empty());
+    assert_eq!(ctx.order_books()[&1].pending_stop_count(), 0, "t's stop removed");
     assert_eq!(ab(&ctx, &t), (fp(150), FixedPoint::ZERO));
     assert_eq!(pos(&ctx, &t, 1), FixedPoint::ZERO);
 }
@@ -470,7 +470,7 @@ fn during_the_cooldown_stage1_orders_the_entire_position() {
         NativeExecutor::run_liquidations(&mut c);
         assert!(c.fatal_error.is_none());
         assert_eq!(pos(&c, &t, 1), fp(left), "h {h}: in cooldown the order is for the entire position");
-        assert!(c.order_books[&1].orders_for_trader(&m).is_empty(), "h {h}: the whole bid was taken");
+        assert!(c.order_books()[&1].orders_for_trader(&m).is_empty(), "h {h}: the whole bid was taken");
         assert_eq!(cooldown_ts(&c, &t), Some(1_001), "h {h}: a full-position order does not restart the cooldown");
         assert_eq!(liq_rows(&c, 0x06).len(), 1, "h {h}: still under MM -> pending");
         c.save_order_books();
@@ -649,7 +649,7 @@ fn backstop_through_the_step_moves_everything_to_the_vault() {
     assert_eq!(pos(&ctx, &LIQUIDATOR_VAULT, 1), fp(10));
     assert_eq!(ab(&ctx, &t), (FixedPoint::ZERO, FixedPoint::ZERO));
     assert_eq!(bal(&ctx, &LIQUIDATOR_VAULT).available, fp(95));
-    assert!(ctx.order_books[&1].orders_for_trader(&t).is_empty());
+    assert!(ctx.order_books()[&1].orders_for_trader(&t).is_empty());
     assert_eq!(traders(&ctx), { let mut v = vec![s, LIQUIDATOR_VAULT]; v.sort(); v });
     assert_eq!(total_value(&ctx, &marks(&[(1, 975)])), before);
 }
@@ -1182,7 +1182,7 @@ fn p2_d9_remainder_is_never_positive() {
         assert_eq!(ab(&c, &a), (FixedPoint::ZERO, FixedPoint::ZERO), "{a}: cash");
         let left: Vec<MarketId> = c.positions.positions_for_trader(&a).unwrap().iter().map(|p| p.market_id).collect();
         assert_eq!(left, vec![5], "{a}: marked positions flat, the unmarked one stays (H2)");
-        assert!((1..=4).all(|m| c.order_books[&m].orders_for_trader(&a).is_empty()), "{a}: D4");
+        assert!((1..=4).all(|m| c.order_books()[&m].orders_for_trader(&a).is_empty()), "{a}: D4");
         c.save_order_books();
     }
     assert!(events.errors().is_empty(), "no error line: {:?}", events.errors());
@@ -1729,7 +1729,7 @@ fn budgets_carry_over_through_the_cursor_round_robin() {
     }
     set_mark(&ctx, 1, fp(990)); // each: AV 245 < MM 247.5, 3 x 245 >= 495 -> stage 1; bids @ 900 < cap 965.25: no fill
     let acted = |c: &NativeExecContext| -> Vec<bool> {
-        accts.iter().map(|a| c.order_books[&1].orders_for_trader(a).is_empty()).collect()
+        accts.iter().map(|a| c.order_books()[&1].orders_for_trader(a).is_empty()).collect()
     };
     let cursor = |c: &NativeExecContext| liq_rows(c, 0x04).first().map(|(_, v)| Address::from_slice(v));
     NativeExecutor::run_liquidations_with(&mut ctx, 2, 2, ADL_WORK_PER_BLOCK);
@@ -1813,12 +1813,12 @@ fn the_vault_in_the_window_does_not_end_a_pass_early() {
     set_mark(&ctx, 1, fp(990)); // b, c: AV 245 < MM 247.5 -> stage 1
     assert_eq!(traders(&ctx), vec![LIQUIDATOR_VAULT, b, c, s]);
     NativeExecutor::run_liquidations_with(&mut ctx, 1, 1, ADL_WORK_PER_BLOCK);
-    assert!(ctx.order_books[&1].orders_for_trader(&b).is_empty(), "b acted");
-    assert_eq!(ctx.order_books[&1].orders_for_trader(&c).len(), 1, "c not yet");
+    assert!(ctx.order_books()[&1].orders_for_trader(&b).is_empty(), "b acted");
+    assert_eq!(ctx.order_books()[&1].orders_for_trader(&c).len(), 1, "c not yet");
     let cursor = liq_rows(&ctx, 0x04).first().map(|(_, v)| Address::from_slice(v));
     assert_eq!(cursor, Some(b), "cut after b: the pass continues at c next block");
     NativeExecutor::run_liquidations_with(&mut ctx, 1, 1, ADL_WORK_PER_BLOCK);
-    assert!(ctx.order_books[&1].orders_for_trader(&c).is_empty(), "c acted next");
+    assert!(ctx.order_books()[&1].orders_for_trader(&c).is_empty(), "c acted next");
 }
 
 /// Review H1 (user decision s517): a previous-mark row counts only if the

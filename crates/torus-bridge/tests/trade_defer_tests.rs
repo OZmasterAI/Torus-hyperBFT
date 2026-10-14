@@ -465,7 +465,7 @@ fn settle_fills(
 
 /// Id of `trader`'s only resting order on `market`.
 fn resting_id(ctx: &NativeExecContext, market: MarketId, trader: u8) -> u128 {
-    let orders = ctx.order_books[&market].orders_for_trader(&addr(trader));
+    let orders = ctx.order_books()[&market].orders_for_trader(&addr(trader));
     assert_eq!(orders.len(), 1, "trader {trader} market {market}");
     orders[0].id
 }

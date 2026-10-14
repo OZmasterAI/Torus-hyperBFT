@@ -59,7 +59,7 @@ fn live(
     trader: &Address,
     cloid: u128,
 ) -> Option<u128> {
-    ctx.order_books
+    ctx.order_books()
         .get(&market_id)
         .and_then(|b| b.order_id_by_cloid(trader, cloid))
 }
@@ -173,6 +173,6 @@ fn core_writer_places_and_cancels_by_cloid() {
         ]
     );
     assert!(live(&ctx, 1, &t, C).is_none());
-    assert_eq!(ctx.order_books[&1].order_count(), 1);
-    assert_eq!(ctx.order_books.get(&2).map_or(0, |b| b.order_count()), 0);
+    assert_eq!(ctx.order_books()[&1].order_count(), 1);
+    assert_eq!(ctx.order_books().get(&2).map_or(0, |b| b.order_count()), 0);
 }

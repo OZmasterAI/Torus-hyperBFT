@@ -126,7 +126,7 @@ fn book_markets_are_in_the_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     let mut ctx = ctx_at(db.clone(), 9, NOW);
-    ctx.order_books.insert(30, OrderBook::new(30, fp(1), fp(1)));
+    ctx.insert_order_book(30, OrderBook::new(30, fp(1), fp(1)));
     let _ = NativeExecutor::begin_block_oracle(&mut ctx);
     let table = ctx.block_marks.as_ref().unwrap();
     assert_eq!(table.marks.get(&30), Some(&None));

@@ -102,7 +102,7 @@ fn assert_bal(ctx: &NativeExecContext, trader: &Address, avail: FixedPoint, marg
 
 /// `(price, remaining)` of a resting order in market 1.
 fn order(ctx: &NativeExecContext, id: u128) -> Option<(FixedPoint, FixedPoint)> {
-    ctx.order_books
+    ctx.order_books()
         .get(&1)
         .and_then(|b| b.get_order(id))
         .map(|o| (o.price, o.remaining_qty))
@@ -363,7 +363,7 @@ fn reserve_modify_cancel_returns_margin_exactly() {
 fn qty_only_modify_of_off_tick_order_is_accepted() {
     for path in PATHS {
         let (_d, mut ctx, owner, id) = owner_with_bid(path);
-        ctx.order_books.get_mut(&1).unwrap().tick_size = fp(3); // 100 is now off-tick
+        ctx.order_book_mut(1).unwrap().tick_size = fp(3); // 100 is now off-tick
         let r = run(&mut ctx, path, &[modify(owner, id, None, Some(fp(2)))]);
         assert!(r[0].success, "{path:?}: qty-only modify: {:?}", r[0].error);
         assert_eq!(order(&ctx, id), Some((fp(100), fp(2))), "{path:?}");
@@ -398,7 +398,7 @@ fn reduce_only_modify_clamp_below_lot_mirrors_placement() {
         place_one(&mut ctx, path, maker, limit(1, false, 100, 5));
         let r = run(&mut ctx, path, &[place(t, limit(1, true, 100, 5))]);
         assert!(r[0].success, "{path:?}: {:?}", r[0].error);
-        ctx.order_books.get_mut(&1).unwrap().lot_size = fp(10);
+        ctx.order_book_mut(1).unwrap().lot_size = fp(10);
         let ro_sell = |qty| PlaceOrderParams {
             reduce_only: true,
             ..limit(1, false, 200, qty)
@@ -417,7 +417,7 @@ fn reduce_only_modify_clamp_below_lot_mirrors_placement() {
         let before = ctx.next_global_order_id;
         let r = run(&mut ctx, path, &[place(t, ro_sell(4))]);
         let rests = ctx
-            .order_books
+            .order_books()
             .get(&1)
             .unwrap()
             .get_order(before)
@@ -457,7 +457,7 @@ fn long_m2_with_bid_m1(ctx: &mut NativeExecContext) -> u128 {
     NativeExecutor::execute(ctx, &cp, &NativeAction::PlaceOrder(limit(2, false, 100, 10)));
     assert!(NativeExecutor::execute(ctx, &t, &NativeAction::PlaceOrder(limit(2, true, 100, 10))).success);
     assert!(NativeExecutor::execute(ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 90, 1))).success);
-    ctx.order_books[&1].orders_for_trader(&t)[0].id
+    ctx.order_books()[&1].orders_for_trader(&t)[0].id
 }
 
 /// F1 (s517): a modify's extra reservation must fit the account's free
@@ -516,7 +516,7 @@ fn modify_is_gated_on_the_position_tier_need() {
         assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 100, 5))).success);
         assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 100, 4))).success);
         assert_bal(&ctx, &t, fp(80), fp(20), "setup");
-        let id = ctx.order_books[&1].orders_for_trader(&t)[0].id;
+        let id = ctx.order_books()[&1].orders_for_trader(&t)[0].id;
         let (s, a) = modify(t, id, None, Some(fp(qty)));
         let r = NativeExecutor::execute(&mut ctx, &s, &a);
         assert_eq!(r.success, ok, "qty {qty}: {:?}", r.error);
@@ -544,7 +544,7 @@ fn modify_credits_the_old_reservation() {
     assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, true, 100, 10))).success);
     assert!(NativeExecutor::execute(&mut ctx, &t, &NativeAction::PlaceOrder(limit(1, false, 100, 15))).success);
     assert_bal(&ctx, &t, fp(50), fp(150), "setup");
-    let id = ctx.order_books[&1].orders_for_trader(&t)[0].id;
+    let id = ctx.order_books()[&1].orders_for_trader(&t)[0].id;
     let (s, a) = modify(t, id, Some(fp(101)), None);
     let r = NativeExecutor::execute(&mut ctx, &s, &a);
     assert!(r.success, "{:?}", r.error);

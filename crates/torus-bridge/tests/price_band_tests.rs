@@ -232,7 +232,7 @@ fn the_probe_attack_at_2x_and_half_the_mark_is_rejected_at_placement() {
         }
         let r = exec(&mut ctx, mode, &[place(addr(1), gtc(false, fp(49)))]);
         assert!(is_band_reject(&r[0], "49.00000000", "50.00", "100.00000000"), "{mode:?}: {:?}", r[0]);
-        assert!(ctx.order_books.get(&M).is_none_or(|b| b.best_bid().is_none() && b.best_ask().is_none()));
+        assert!(ctx.order_books().get(&M).is_none_or(|b| b.best_bid().is_none() && b.best_ask().is_none()));
     }
 }
 
@@ -314,7 +314,7 @@ fn a_modify_out_of_the_band_is_rejected() {
     let (_d, mut ctx) = setup(Some(100));
     let r = exec(&mut ctx, None, &[place(addr(1), gtc(true, fp(90)))]);
     assert!(r[0].0);
-    let id = ctx.order_books[&M].orders_for_trader(&addr(1))[0].id;
+    let id = ctx.order_books()[&M].orders_for_trader(&addr(1))[0].id;
     let modify = |p: i64| NativeAction::ModifyOrder { order_id: id, new_price: Some(fp(p)), new_qty: None };
     let r = NativeExecutor::execute(&mut ctx, &addr(1), &modify(40));
     assert!(!r.success && r.reason == FailureReason::PriceBand, "{r:?}");

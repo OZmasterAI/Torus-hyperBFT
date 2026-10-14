@@ -357,7 +357,7 @@ fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats
             NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
         // Multi-tier config for market 2, changing every 7 blocks.
         ctx.margin_configs.insert(2, tiered(2, if (h / 7) % 2 == 0 { 20 } else { 25 }));
-        ctx.order_books = std::mem::take(&mut books);
+        ctx.set_order_books(std::mem::take(&mut books));
         ctx.next_global_order_id = next_id;
         ctx.attach_resident_block(&mut rb);
         if cached {
@@ -393,7 +393,7 @@ fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats
             stats.delta_fallback += c.delta_fallback.load(std::sync::atomic::Ordering::Relaxed);
             stats.records += c.records.load(std::sync::atomic::Ordering::Relaxed);
         }
-        books = std::mem::take(&mut ctx.order_books);
+        books = ctx.take_order_books();
         next_id = ctx.next_global_order_id;
         ctx.detach_resident_block(&mut rb);
         drop(ctx);

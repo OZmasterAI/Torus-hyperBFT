@@ -306,7 +306,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             ctx.governance.listed_market_ids().unwrap(),
         );
         ctx.margin_configs.insert(2, tiered(2));
-        ctx.order_books = std::mem::take(&mut books);
+        ctx.set_order_books(std::mem::take(&mut books));
         ctx.next_global_order_id = next_id;
         ctx.metrics = Some(metrics.clone());
         ctx.attach_resident_block(&mut rb);
@@ -382,7 +382,7 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
             stats.memo += get(&c.memo);
             stats.dirty += get(&c.dirty);
         }
-        books = std::mem::take(&mut ctx.order_books);
+        books = ctx.take_order_books();
         next_id = ctx.next_global_order_id;
         ctx.detach_resident_block(&mut rb);
         drop(ctx);

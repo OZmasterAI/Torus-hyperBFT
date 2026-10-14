@@ -185,8 +185,8 @@ fn multi_market_fills_settle_correctly() {
     );
 
     // Verify order books exist for both markets
-    assert!(ctx.order_books.contains_key(&1));
-    assert!(ctx.order_books.contains_key(&2));
+    assert!(ctx.order_books().contains_key(&1));
+    assert!(ctx.order_books().contains_key(&2));
 }
 
 // ============================================================================
@@ -661,8 +661,8 @@ fn batch_same_sender_orders_equal_individual_batches() {
     );
 
     // All six rest → total resting-order count identical (and equal to 6).
-    let count_a: usize = ctx_a.order_books.values().map(|b| b.order_count()).sum();
-    let count_b: usize = ctx_b.order_books.values().map(|b| b.order_count()).sum();
+    let count_a: usize = ctx_a.order_books().values().map(|b| b.order_count()).sum();
+    let count_b: usize = ctx_b.order_books().values().map(|b| b.order_count()).sum();
     assert_eq!(count_a, 6, "expected all six orders resting in Run A");
     assert_eq!(count_a, count_b, "resting-order count diverges A vs B");
 }

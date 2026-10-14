@@ -123,8 +123,8 @@ fn seed(db: &StateDb, mode: BookMode) -> Expected {
     assert!(r.results.iter().all(|x| x.success), "seed block failed");
     ctx.save_order_books();
 
-    let b1 = ctx.order_books.get(&1).expect("market 1 book");
-    let b2 = ctx.order_books.get(&2).expect("market 2 book");
+    let b1 = ctx.order_books().get(&1).expect("market 1 book");
+    let b2 = ctx.order_books().get(&2).expect("market 2 book");
     let mut maker_orders: Vec<(MarketId, u128, FixedPoint, FixedPoint)> = Vec::new();
     for (mid, book) in [(1u64, b1), (2u64, b2)] {
         for o in book.orders_for_trader(&maker) {
@@ -452,7 +452,7 @@ fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
             }
         }
         assert!(ctx
-            .order_books
+            .order_books()
             .get(&2)
             .expect("market 2")
             .bid_depth()

@@ -118,7 +118,7 @@ fn place(sender: Address, p: PlaceOrderParams) -> (Address, NativeAction) {
 /// Borsh bytes (the consensus format the row store must reproduce exactly).
 fn book_bytes(ctx: &NativeExecContext) -> Vec<(MarketId, Vec<u8>)> {
     let mut out: Vec<(MarketId, Vec<u8>)> = ctx
-        .order_books
+        .order_books()
         .iter()
         .map(|(mid, book)| (*mid, borsh::to_vec(book).expect("book borsh")))
         .collect();

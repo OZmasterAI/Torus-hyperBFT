@@ -143,7 +143,7 @@ fn test_partial_fill() {
     assert_eq!(pos_seller.size, TestHarness::fp(3));
 
     // The remaining 7 units should still be resting on the book
-    let book = ctx.order_books.get(&market).expect("order book exists");
+    let book = ctx.order_books().get(&market).expect("order book exists");
     assert!(
         book.best_bid().is_some(),
         "resting buy orders should remain"
@@ -169,7 +169,7 @@ fn test_cancel_order() {
     assert!(r.success);
 
     // The order should be resting (no matching sell)
-    let book = ctx.order_books.get(&market).unwrap();
+    let book = ctx.order_books().get(&market).unwrap();
     assert!(book.best_bid().is_some());
 
     // Find the order id — the first order placed gets id=1
@@ -181,7 +181,7 @@ fn test_cancel_order() {
     assert!(cr.success, "cancel should succeed");
 
     // Book should be empty now
-    let book = ctx.order_books.get(&market).unwrap();
+    let book = ctx.order_books().get(&market).unwrap();
     assert!(
         book.best_bid().is_none(),
         "bids should be empty after cancel"
@@ -231,8 +231,8 @@ fn test_multiple_markets() {
         .is_none());
 
     // Both books should have resting orders
-    assert!(!ctx.order_books.get(&market_1).unwrap().best_bid().is_none());
-    assert!(ctx.order_books.get(&market_2).unwrap().best_ask().is_some());
+    assert!(!ctx.order_books().get(&market_1).unwrap().best_bid().is_none());
+    assert!(ctx.order_books().get(&market_2).unwrap().best_ask().is_some());
 }
 
 /// Batch execution: execute actions as a batch and verify ordering.

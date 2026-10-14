@@ -260,7 +260,7 @@ fn drain_entries_report_the_order_id_each_placement_got() {
         }),
     );
     assert!(maker.success, "{:?}", maker.error);
-    let maker_id = ctx.order_books[&1].orders_for_trader(&addr(20))[0].id;
+    let maker_id = ctx.order_books()[&1].orders_for_trader(&addr(20))[0].id;
 
     let entries = NativeExecutor::drain_core_writer_entries(&mut ctx).expect("queue reads");
     assert_eq!(ctx.take_fatal_error(), None);
@@ -268,7 +268,7 @@ fn drain_entries_report_the_order_id_each_placement_got() {
         .iter()
         .map(|e| (e.seq, e.result.success, e.oid))
         .collect();
-    let book = &ctx.order_books[&1];
+    let book = &ctx.order_books()[&1];
     let resting = book.orders_for_trader(&addr(21));
     assert_eq!(resting.len(), 1, "the GTC buy rests");
     let rest_id = resting[0].id;

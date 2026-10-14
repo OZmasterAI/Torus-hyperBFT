@@ -3246,12 +3246,41 @@ impl CloidMarkets {
     fn build(books: &mut HashMap<MarketId, OrderBook>) -> Self {
         let mut index = Self::default();
         for (&market, book) in books.iter_mut() {
-            book.clear_cloid_log();
-            for (key, id) in book.cloid_key_entries() {
-                index.map.insert(key, CloidSlot::new(market, id));
-            }
+            index.add_live(book, market);
         }
         index
+    }
+
+    /// Index every live cloid of `book` at `market` (its log is emptied:
+    /// the scan sees everything logged).
+    fn add_live(&mut self, book: &mut OrderBook, market: MarketId) {
+        book.clear_cloid_log();
+        for (key, id) in book.cloid_key_entries() {
+            self.map.insert(key, CloidSlot::new(market, id));
+        }
+    }
+
+    /// s120: `book` enters at `market` whole ([`NativeExecContext::insert_order_book`]).
+    /// Without an index the log is dropped: the build scans the books.
+    fn add_book(index: &mut Option<Self>, book: &mut OrderBook, market: MarketId) {
+        match index {
+            Some(index) => index.add_live(book, market),
+            None => book.clear_cloid_log(),
+        }
+    }
+
+    /// s120: `book` leaves `market` whole. Its logged removes are applied,
+    /// then every live cloid of it that the index places at `market` is
+    /// taken out, so the index stays exact.
+    fn forget_book(index: &mut Option<Self>, book: &mut OrderBook, market: MarketId) {
+        Self::absorb(index, book, market);
+        if let Some(index) = index {
+            for (key, _) in book.cloid_key_entries() {
+                if index.map.get(&key).is_some_and(|slot| slot.market == market) {
+                    index.map.remove(&key);
+                }
+            }
+        }
     }
 
     /// Feed `book`'s cloid log (market `market`) into `index`. Without an
@@ -3357,16 +3386,31 @@ impl TraderMarkets {
     /// The index of `books` as they are (their logs are emptied: the scan
     /// already sees everything logged).
     fn build(books: &mut HashMap<MarketId, OrderBook>) -> Self {
-        for book in books.values_mut() {
-            book.drain_new_traders();
-        }
         let mut index = Self::default();
-        for (&market, book) in books.iter() {
-            for trader in book.traders_present() {
-                index.insert(*trader, market);
-            }
+        for (&market, book) in books.iter_mut() {
+            index.add_present(book, market);
         }
         index
+    }
+
+    /// List every trader present in `book` for `market` (its log is
+    /// emptied: the scan sees everything logged).
+    fn add_present(&mut self, book: &mut OrderBook, market: MarketId) {
+        book.drain_new_traders();
+        for trader in book.traders_present() {
+            self.insert(*trader, market);
+        }
+    }
+
+    /// s120: `book` enters at `market` whole ([`NativeExecContext::insert_order_book`]).
+    /// Without an index the log is dropped: the build scans the books.
+    fn add_book(index: &mut Option<Self>, book: &mut OrderBook, market: MarketId) {
+        match index {
+            Some(index) => index.add_present(book, market),
+            None => {
+                book.drain_new_traders();
+            }
+        }
     }
 
     fn insert(&mut self, trader: Address, market: MarketId) {
@@ -4320,6 +4364,41 @@ mod advance_untouched_toggle_tests {
     }
 }
 
+/// s120: one book of a [`NativeExecContext`] borrowed mutably from outside
+/// the executor ([`NativeExecContext::order_book_mut`]). Derefs to the
+/// book; on drop, the book's logs (traders that rested or stored, cloids
+/// added or removed) are fed into the context's cancel-all and cloid
+/// indexes, so an order placed or cancelled straight on the book is seen by
+/// the next cancel-all and duplicate-cloid check.
+pub struct OrderBookMut<'a> {
+    market: MarketId,
+    book: &'a mut OrderBook,
+    trader_markets: &'a mut Option<TraderMarkets>,
+    cloid_markets: &'a mut Option<CloidMarkets>,
+}
+
+impl std::ops::Deref for OrderBookMut<'_> {
+    type Target = OrderBook;
+    #[inline]
+    fn deref(&self) -> &OrderBook {
+        self.book
+    }
+}
+
+impl std::ops::DerefMut for OrderBookMut<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut OrderBook {
+        self.book
+    }
+}
+
+impl Drop for OrderBookMut<'_> {
+    fn drop(&mut self) {
+        TraderMarkets::absorb(self.trader_markets, self.book, self.market);
+        CloidMarkets::absorb(self.cloid_markets, self.book, self.market);
+    }
+}
+
 pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub positions: PositionManager<T>,
     pub oracle: OracleManager<T>,
@@ -4327,8 +4406,12 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     pub governance: GovernanceManager<T>,
     pub state: T,
 
-    /// Order books (per market, in-memory).
-    pub order_books: HashMap<MarketId, OrderBook>,
+    /// Order books (per market, in-memory). Private (s120): whole books
+    /// enter, leave or are replaced only through the methods that keep
+    /// `trader_markets` and `cloid_markets` consistent
+    /// ([`Self::insert_order_book`], [`Self::take_order_books`],
+    /// [`Self::set_order_books`], the batch move pair, the stash).
+    order_books: HashMap<MarketId, OrderBook>,
     /// Markets whose book was mutated during THIS block (placed / matched /
     /// cancelled / modified). `save_order_books` writes only these — untouched
     /// books already hold identical bytes in the CF, so skipping them is
@@ -5164,6 +5247,12 @@ impl<T: StateBackend> NativeExecContext<T> {
         )
     }
 
+    // ---- s120: `order_books` access. The field is private: a whole book
+    // enters, leaves or is replaced only through the methods below, which
+    // keep the cancel-all index (`trader_markets`) and the cloid index
+    // (`cloid_markets`) consistent with the books. In-module hot paths
+    // mutate books in place and feed both indexes at their sites.
+
     /// Every book, read-only.
     #[inline]
     pub fn order_books(&self) -> &HashMap<MarketId, OrderBook> {
@@ -5176,24 +5265,93 @@ impl<T: StateBackend> NativeExecContext<T> {
         self.order_books.get(&market)
     }
 
-    /// RED stub: `market`'s book, mutable.
-    pub fn order_book_mut(&mut self, market: MarketId) -> Option<&mut OrderBook> {
-        self.order_books.get_mut(&market)
+    /// `market`'s book, mutable, for callers outside the executor (tests,
+    /// tools). When the guard drops, what the caller rested, stored or
+    /// removed is fed into both indexes, as the executor's own sites do.
+    /// Does not mark the book dirty.
+    #[inline]
+    pub fn order_book_mut(&mut self, market: MarketId) -> Option<OrderBookMut<'_>> {
+        let book = self.order_books.get_mut(&market)?;
+        Some(OrderBookMut {
+            market,
+            book,
+            trader_markets: &mut self.trader_markets,
+            cloid_markets: &mut self.cloid_markets,
+        })
     }
 
-    /// RED stub: put `book` at `market`.
-    pub fn insert_order_book(&mut self, market: MarketId, book: OrderBook) -> Option<OrderBook> {
-        self.order_books.insert(market, book)
+    /// Run `f` on every book (any order), feeding both indexes after each
+    /// (as [`Self::order_book_mut`]). Does not mark books dirty.
+    pub fn for_each_order_book_mut(&mut self, mut f: impl FnMut(MarketId, &mut OrderBook)) {
+        for (&market, book) in self.order_books.iter_mut() {
+            f(market, book);
+            TraderMarkets::absorb(&mut self.trader_markets, book, market);
+            CloidMarkets::absorb(&mut self.cloid_markets, book, market);
+        }
     }
 
-    /// RED stub: take every book out.
+    /// Put `book` at `market`, returning the book it replaces. A built
+    /// index forgets the replaced book's cloids and takes every trader and
+    /// cloid of `book` (its logs are emptied: the scan sees everything).
+    /// O(the two books); not a hot path. Does not mark the book dirty.
+    pub fn insert_order_book(&mut self, market: MarketId, mut book: OrderBook) -> Option<OrderBook> {
+        let mut old = self.order_books.remove(&market);
+        if let Some(old) = old.as_mut() {
+            // The cancel-all index is a superset: the old book's entries
+            // may stay (one extra probe each).
+            CloidMarkets::forget_book(&mut self.cloid_markets, old, market);
+        }
+        TraderMarkets::add_book(&mut self.trader_markets, &mut book, market);
+        CloidMarkets::add_book(&mut self.cloid_markets, &mut book, market);
+        self.order_books.insert(market, book);
+        old
+    }
+
+    /// Take every book out. Both indexes are dropped with them (the next
+    /// use builds them from the books then present).
     pub fn take_order_books(&mut self) -> HashMap<MarketId, OrderBook> {
+        self.trader_markets = None;
+        self.cloid_markets = None;
         std::mem::take(&mut self.order_books)
     }
 
-    /// RED stub: replace every book.
-    pub fn set_order_books(&mut self, books: HashMap<MarketId, OrderBook>) {
+    /// Replace every book, as a load would: both indexes are dropped (the
+    /// next use builds them from `books`) and the books' logs emptied.
+    /// Does not mark books dirty.
+    pub fn set_order_books(&mut self, mut books: HashMap<MarketId, OrderBook>) {
+        self.trader_markets = None;
+        self.cloid_markets = None;
+        for book in books.values_mut() {
+            book.drain_new_traders();
+            book.clear_cloid_log();
+        }
         self.order_books = books;
+    }
+
+    /// Batch matching: take `market`'s book out of `books` (the context's
+    /// `order_books`; a field borrow, so the batch can hold other fields)
+    /// to match it on a worker. The indexes keep its entries: the book
+    /// comes back through [`Self::return_matched_book`] after its logs were
+    /// fed into them.
+    #[inline]
+    fn take_book_for_matching(
+        books: &mut HashMap<MarketId, OrderBook>,
+        market: MarketId,
+    ) -> Option<OrderBook> {
+        books.remove(&market)
+    }
+
+    /// Batch matching: put a matched book back (it, or a new book for a
+    /// market that had none). The batch fed its logs into both indexes
+    /// before settling ([`TraderMarkets::absorb`], [`CloidMarkets::absorb`]),
+    /// so the feed here finds them empty (no work); it keeps the move
+    /// consistent for any caller that settles without that step (the r02
+    /// unit tests call the settle passes directly).
+    #[inline]
+    fn return_matched_book(&mut self, market: MarketId, mut book: OrderBook) {
+        TraderMarkets::absorb(&mut self.trader_markets, &mut book, market);
+        CloidMarkets::absorb(&mut self.cloid_markets, &mut book, market);
+        self.order_books.insert(market, book);
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
@@ -7286,7 +7444,8 @@ impl NativeExecutor {
         for (&market_id, prepared) in &market_batches {
             // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
             // checked against (`shapes` holds every batch market).
-            let mut book = ctx.order_books.remove(&market_id).unwrap_or_else(|| {
+            let mut book = NativeExecContext::<T>::take_book_for_matching(&mut ctx.order_books, market_id)
+                .unwrap_or_else(|| {
                 let (tick, lot) = markets.get(&market_id).map(|m| m.shape).unwrap_or_else(|| {
                     // R02 branch 5: a failed read fail-stops (reader channel).
                     Self::market_shape(&ctx.state, market_id).unwrap_or_else(|e| {
@@ -8022,7 +8181,7 @@ impl NativeExecutor {
             let market_id = mbr.market_id;
 
             // Reinsert updated book
-            ctx.order_books.insert(market_id, mbr.book);
+            ctx.return_matched_book(market_id, mbr.book);
             ctx.dirty_books.insert(market_id);
 
             // Update global ID high-water mark
@@ -8440,7 +8599,7 @@ impl NativeExecutor {
             let market_id = mbr.market_id;
 
             // Reinsert updated book
-            ctx.order_books.insert(market_id, mbr.book);
+            ctx.return_matched_book(market_id, mbr.book);
             ctx.dirty_books.insert(market_id);
 
             // Update global ID high-water mark
@@ -12965,7 +13124,7 @@ mod option_b_fold_pool_tests {
                         client_order_id: None,
                     };
                     b.place_order(bid, maker, 1);
-                    ctx.order_books.insert(m, b);
+                    ctx.insert_order_book(m, b);
                 }
             }
             let orders: Vec<(Address, PlaceOrderParams)> = (0..2 + rng.below(30))

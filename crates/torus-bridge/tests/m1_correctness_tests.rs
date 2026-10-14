@@ -152,9 +152,11 @@ fn run_m1(mode: Mode, block: &[(Address, NativeAction)]) -> Run {
         fund_native(&ctx, &addr(n), fp(1_000_000));
     }
     exec(&mut ctx, mode, &[place(addr(2), gtc(1, false, 60, 6))]);
-    let book = ctx.order_books.get_mut(&1).expect("m1 book");
-    book.tick_size = fp(2);
-    book.lot_size = fp(2);
+    {
+        let mut book = ctx.order_book_mut(1).expect("m1 book");
+        book.tick_size = fp(2);
+        book.lot_size = fp(2);
+    }
     let metrics = Arc::new(Metrics::new());
     ctx.metrics = Some(metrics.clone());
     let results = exec(&mut ctx, mode, block);
@@ -298,17 +300,17 @@ fn row42_books_created_from_the_market_row() {
         assert!(err_has(&r[2], "order rejected: quantity 0.05000000 below the lot size 0.10000000"), "{mode:?}: {:?}", r[2]);
         assert!(err_has(&r[4], "is not a multiple of the tick 1.00000000"), "{mode:?}: {:?}", r[4]);
         assert!(err_has(&r[5], "below the lot size 1.00000000"), "{mode:?}: {:?}", r[5]);
-        let b5 = &ctx.order_books[&5];
+        let b5 = &ctx.order_books()[&5];
         assert_eq!((b5.tick_size, b5.lot_size), (fpr(S / 2), fpr(S / 10)), "{mode:?}");
         assert_eq!(b5.best_bid(), Some(fpr(100 * S + S / 2)), "{mode:?}");
-        let b6 = &ctx.order_books[&6];
+        let b6 = &ctx.order_books()[&6];
         assert_eq!((b6.tick_size, b6.lot_size), (FixedPoint::ONE, FixedPoint::ONE), "{mode:?}");
-        assert!(!ctx.order_books.contains_key(&7), "{mode:?}: a rejected order creates no book");
+        assert!(!ctx.order_books().contains_key(&7), "{mode:?}: a rejected order creates no book");
         let w = world(&mut ctx);
         // The book's stored meta carries the row's tick / lot across a reload.
         drop(ctx);
         let reloaded = NativeExecContext::new(db, 2, 1001, 0, 100, 10, addr(99), addr(100), addr(101));
-        let b5 = &reloaded.order_books[&5];
+        let b5 = &reloaded.order_books()[&5];
         assert_eq!((b5.tick_size, b5.lot_size), (fpr(S / 2), fpr(S / 10)), "{mode:?}: reloaded");
         if mode.is_some() {
             batch.push((r, w));
@@ -328,10 +330,10 @@ fn row42_existing_book_keeps_its_meta() {
         db.put_cf_raw(CF_NATIVE_MARKETS, &5u64.to_be_bytes(), &market_row(S / 2, S / 10)).unwrap();
         let mut ctx = NativeExecContext::new(db, 1, 1000, 0, 100, 10, addr(99), addr(100), addr(101));
         fund_native(&ctx, &a, fp(1_000_000));
-        ctx.order_books.insert(5, OrderBook::new(5, FixedPoint::ONE, FixedPoint::ONE));
+        ctx.insert_order_book(5, OrderBook::new(5, FixedPoint::ONE, FixedPoint::ONE));
         let r = exec(&mut ctx, mode, &[place(a, order(5, true, fpr(100 * S + S / 2), fp(1))), place(a, gtc(5, true, 100, 1))]);
         assert!(err_has(&r[0], "is not a multiple of the tick 1.00000000"), "{mode:?}: {:?}", r[0]);
         assert!(r[1].0, "{mode:?}: {:?}", r[1]);
-        assert_eq!(ctx.order_books[&5].tick_size, FixedPoint::ONE, "{mode:?}");
+        assert_eq!(ctx.order_books()[&5].tick_size, FixedPoint::ONE, "{mode:?}");
     }
 }

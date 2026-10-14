@@ -301,10 +301,10 @@ fn dump_validator_state<T: StateBackend>(ctx: &NativeExecContext<T>, v: Address)
             }
         }
     }
-    let mut markets: Vec<_> = ctx.order_books.keys().copied().collect();
+    let mut markets: Vec<_> = ctx.order_books().keys().copied().collect();
     markets.sort_unstable();
     for m in markets {
-        for o in ctx.order_books[&m].orders_for_trader(&v) {
+        for o in ctx.order_books()[&m].orders_for_trader(&v) {
             out.push(format!("order {m} {o:?}"));
         }
     }
@@ -337,7 +337,7 @@ fn signer_cannot_act_for_its_validator() {
     };
     let r = NativeExecutor::execute(&mut ctx, &addr(V1), &order(true, 90));
     assert!(r.success, "{:?}", r.error);
-    let v1_order = ctx.order_books[&1].orders_for_trader(&addr(V1))[0].id;
+    let v1_order = ctx.order_books()[&1].orders_for_trader(&addr(V1))[0].id;
     let before = dump_validator_state(&ctx, addr(V1));
     assert!(before.iter().any(|l| l.starts_with("order 1")), "{before:?}");
 

@@ -151,7 +151,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
             special(101),
         );
         ctx.attach_resident_block(&mut rows);
-        ctx.order_books = std::mem::take(&mut books);
+        ctx.set_order_books(std::mem::take(&mut books));
         ctx.next_global_order_id = next_id;
         ctx.metrics = Some(metrics.clone());
         if fed {
@@ -177,7 +177,7 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         let pa = ctx.phase_accum;
         let fills = ctx.trade_index as u64;
-        books = std::mem::take(&mut ctx.order_books);
+        books = ctx.take_order_books();
         next_id = ctx.next_global_order_id;
         ctx.detach_resident_block(&mut rows);
         drop(ctx);

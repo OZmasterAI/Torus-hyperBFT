@@ -2879,7 +2879,7 @@ mod tick_lot_ingress_tests {
                 ),
             }
         }
-        let book = &ctx.order_books[&1];
+        let book = &ctx.order_books()[&1];
         assert_eq!((book.tick_size, book.lot_size), (fpr(S / 2), fpr(S / 10)));
     }
 

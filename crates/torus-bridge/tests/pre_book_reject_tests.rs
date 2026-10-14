@@ -133,9 +133,11 @@ fn run(mode: Mode, block: &[(Address, NativeAction)]) -> Run {
         fund_native(&ctx, &addr(n), fp(1_000_000));
     }
     exec(&mut ctx, mode, &[place(addr(2), gtc(1, false, 60, 5))]);
-    let book = ctx.order_books.get_mut(&1).expect("m1 book");
-    book.tick_size = fp(2);
-    book.lot_size = fp(2);
+    {
+        let mut book = ctx.order_book_mut(1).expect("m1 book");
+        book.tick_size = fp(2);
+        book.lot_size = fp(2);
+    }
     let metrics = Arc::new(Metrics::new());
     ctx.metrics = Some(metrics.clone());
     let results = exec(&mut ctx, mode, block);
@@ -251,7 +253,7 @@ fn off_tick_sell_does_not_claim_the_d2_pool() {
         assert!(!pos.is_long && pos.size == fp(20), "{mode:?}: the m2 sell used the pool: {pos:?}");
         let bal = ctx.positions.get_native_balance(&t).unwrap();
         assert_eq!((bal.available, bal.order_margin), (fp(100), FixedPoint::ZERO), "{mode:?}");
-        assert!(!ctx.order_books.contains_key(&1), "{mode:?}: no book created for the reject");
+        assert!(!ctx.order_books().contains_key(&1), "{mode:?}: no book created for the reject");
         ctx.save_order_books();
         worlds.push((r, state_dump(&ctx), ctx.next_global_order_id));
     }

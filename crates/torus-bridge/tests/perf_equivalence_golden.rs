@@ -359,7 +359,7 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
             None,
         );
         ctx.attach_resident_block(&mut rows);
-        ctx.order_books = std::mem::take(&mut books);
+        ctx.set_order_books(std::mem::take(&mut books));
         ctx.next_global_order_id = next_id;
         ctx.metrics = Some(metrics.clone());
         for &(m, units) in &b.marks {
@@ -421,7 +421,7 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
                 ctx.trade_index,
             );
         }
-        books = std::mem::take(&mut ctx.order_books);
+        books = ctx.take_order_books();
         next_id = ctx.next_global_order_id;
         ctx.detach_resident_block(&mut rows);
         drop(ctx);

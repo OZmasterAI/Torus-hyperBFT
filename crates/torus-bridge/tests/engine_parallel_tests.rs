@@ -791,7 +791,7 @@ fn open_limit_counts_pending_stops_at_block_start() {
 
 /// Open orders of `trader` over every resident book.
 fn open_orders(ctx: &NativeExecContext, trader: &Address) -> usize {
-    ctx.order_books.values().map(|b| b.open_order_count(trader)).sum()
+    ctx.order_books().values().map(|b| b.open_order_count(trader)).sum()
 }
 
 /// A stop fired by a trade becomes the order it stands for (s515: the book
@@ -828,7 +828,7 @@ fn fired_stop_case(
     block1.push(place(c, gtc(6, false, 100, 1)));
     let r1 = NativeExecutor::execute_batch_engine_mode(&mut ctx, &block1, threads);
     assert!(r1.results.iter().all(|r| r.success), "setup");
-    assert_eq!(ctx.order_books[&6].pending_stop_count(), 1);
+    assert_eq!(ctx.order_books()[&6].pending_stop_count(), 1);
     assert_eq!(open_orders(&ctx, &a), 1000, "999 resting + 1 pending stop");
 
     // d's IOC buy trades at 100 against c and fires a's buy stop: a buy
@@ -848,7 +848,7 @@ fn fired_stop_case(
             .collect()
     };
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    let book = &ctx.order_books[&6];
+    let book = &ctx.order_books()[&6];
     assert_eq!(book.pending_stop_count(), 0, "the stop fired");
     let a_on_6: Vec<_> = book.orders_for_trader(&a).iter().map(|o| o.price).collect();
     assert!(a_on_6.contains(&fp(90)), "the fired stop rests at its limit: {a_on_6:?}");
@@ -1347,7 +1347,7 @@ fn open_limit_book_rejected_orders_keep_their_slot_but_off_tick_and_dust_take_no
         assert_eq!(metrics.orders_rejected_book.get(), 1);
         assert_eq!(metrics.orders_rejected_other.get(), 2);
         assert_eq!(metrics.orders_rejected_open_limit.get(), 1);
-        let open: usize = ctx.order_books.values().map(|b| b.open_order_count(&q)).sum();
+        let open: usize = ctx.order_books().values().map(|b| b.open_order_count(&q)).sum();
         assert_eq!(open, 999, "the two on-tick GTCs rested");
         ctx.save_order_books();
         runs.push((results, state_dump(&ctx)));
@@ -1443,7 +1443,7 @@ fn f1_account_margin_shapes_identical() {
         // Sanity: the shape really exercises the maker cancel — mk's m4 bid
         // is gone and mk never got a position there.
         assert!(
-            ctx.order_books.get(&4).is_none_or(|b| b.orders_for_trader(&mk).is_empty()),
+            ctx.order_books().get(&4).is_none_or(|b| b.orders_for_trader(&mk).is_empty()),
             "threads={threads}: mk's under-water bid must be margin-cancelled"
         );
         assert!(ctx.positions.get_position(&mk, 4).unwrap().is_none(), "threads={threads}");
