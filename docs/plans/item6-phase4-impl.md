@@ -354,7 +354,7 @@ stays only if its own A/B (counter upkeep netted) shows a gain; otherwise it is 
   branch adds only the ubench and its unused seam) vs Phase 3 head = main @ `21d238e0` (last main before the step 1
   merge `7487b764`; includes merge-wait `06611175`). Interval 15 s, Classic, standard 300-market shape, oracle on,
   n = 4 ABBA, 120 s cells; plus 10-market cells and one 10 min soak pair; allocator jemalloc (the `torus-node`
-  default feature). Report as listed above. Step 5 (`feat/item6-phase4-step5` @ `becf5275`, on step 4) is on its own
+  default feature). Report as listed above. Step 5 (`feat/item6-phase4-step5` @ `6288ebe8`, on step 4, incl. the Codex r1 fix) is on its own
   branch: its A/B (step 5 vs step 4, counter upkeep netted) is a separate campaign, not part of this one.
 
 ## 5. Not building
