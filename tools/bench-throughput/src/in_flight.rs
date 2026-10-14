@@ -1213,6 +1213,8 @@ mod tests {
         head: Option<u64>,
         bodies: Mutex<HashMap<u64, Vec<BodyFetch>>>,
         body_calls: Mutex<Vec<u64>>,
+        /// Body RPCs at or above this height never return.
+        stall_from: Option<u64>,
     }
 
     impl FakeNode {
@@ -1221,10 +1223,15 @@ mod tests {
                 head,
                 bodies: Mutex::new(HashMap::new()),
                 body_calls: Mutex::new(Vec::new()),
+                stall_from: None,
             }
         }
         fn with(self, height: u64, script: Vec<BodyFetch>) -> Self {
             self.bodies.lock().unwrap().insert(height, script);
+            self
+        }
+        fn stall_from(mut self, height: u64) -> Self {
+            self.stall_from = Some(height);
             self
         }
         fn calls(&self) -> Vec<u64> {
@@ -1245,7 +1252,13 @@ mod tests {
                 Some(s) => s[0].clone(),
                 None => BodyFetch::Absent,
             };
-            async move { out }
+            let stall = self.stall_from.is_some_and(|s| height >= s);
+            async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                out
+            }
         }
     }
 
@@ -1663,5 +1676,53 @@ mod tests {
             report[6].starts_with("release-timing-hist: what=tail_fetched_per_round n=1 sum=1 ")
         );
         assert!(report[7].starts_with("release-timing-hist: what=tail_lag_heights n=0 "));
+    }
+
+    #[tokio::test]
+    async fn tail_abort_mid_round_keeps_the_bodies_already_read() {
+        // Codex r1: the end of the run aborts the tail; when that lands in a
+        // later body RPC, the bodies this round already read must still be
+        // in the tail timing (seen heights, fetched, the partial round).
+        use std::sync::Arc;
+        let cap = Arc::new(Cap::new(1, 2, "http://v2".into(), TailMode::Head));
+        cap.submit(0, &[(11, 1_000, 400, false)]);
+        let node = FakeNode::new(Some(3))
+            .with(1, vec![BodyFetch::Keys(vec![(11, true)])])
+            .stall_from(2);
+        let c = cap.clone();
+        let h = tokio::spawn(async move {
+            let mut cur = TailCursor::new(0);
+            tail_round(&c, &node, &mut cur, far()).await;
+        });
+        while cap.tail.fetched.load(Ordering::Relaxed) < 1 {
+            tokio::task::yield_now().await;
+        }
+        h.abort();
+        assert!(h.await.unwrap_err().is_cancelled());
+        let report = cap.timing_report();
+        assert!(report[0].contains(" released=1 "), "{}", report[0]);
+        assert!(
+            report[0].contains(" tail_rounds=1 tail_fetched=1 tail_fetch_max=1 "),
+            "{}",
+            report[0]
+        );
+        assert!(report[0].ends_with(" tail_lag_max=3"), "{}", report[0]);
+        assert!(report[1].contains(" seen=1@"), "{}", report[1]);
+        assert!(!report[1].contains(','), "{}", report[1]);
+        assert!(
+            report[5].starts_with("release-timing-hist: what=tail_round_us n=1 "),
+            "{}",
+            report[5]
+        );
+        assert!(
+            report[6].starts_with("release-timing-hist: what=tail_fetched_per_round n=1 sum=1 "),
+            "{}",
+            report[6]
+        );
+        assert!(
+            report[7].starts_with("release-timing-hist: what=tail_lag_heights n=1 "),
+            "{}",
+            report[7]
+        );
     }
 }
