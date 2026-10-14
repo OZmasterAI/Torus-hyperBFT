@@ -4254,6 +4254,9 @@ async fn run_consensus(
     if let Some(c) = &cap {
         if let Some(h) = tail_handle {
             h.abort();
+            // Wait for the cancel: dropping the tail closes its open poll in
+            // the release timing before the report reads it.
+            let _ = h.await;
         }
         println!("{}", c.report());
         for line in c.timing_report() {

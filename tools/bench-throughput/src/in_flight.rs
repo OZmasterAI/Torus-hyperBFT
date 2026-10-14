@@ -695,11 +695,6 @@ struct TailCursor {
     next: u64,
     attempts: u32,
     idle: u32,
-    /// Head mode: `eth_blockNumber` minus the last read height at this
-    /// poll's start (release timing).
-    lag: Option<u64>,
-    /// `(height, seen wall ms)` of the bodies read this poll.
-    seen: Vec<(u64, u64)>,
 }
 
 impl TailCursor {
@@ -708,8 +703,6 @@ impl TailCursor {
             next: start_block + 1,
             attempts: 0,
             idle: 0,
-            lag: None,
-            seen: Vec::new(),
         }
     }
 }
@@ -718,7 +711,7 @@ impl TailCursor {
 fn tail_apply(cap: &Cap, cur: &mut TailCursor, actions: &[(u64, bool)]) {
     let now = wall_ms();
     let woken = cap.tracker.lock().unwrap().on_block_at(actions, now);
-    cur.seen.push((cur.next, now));
+    cap.tail_timing.lock().unwrap().on_body(cur.next, now);
     cap.wake(woken);
     cap.tail.fetched.fetch_add(1, Ordering::Relaxed);
     cur.next += 1;
@@ -746,7 +739,8 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
                 cap.tail.errors.fetch_add(1, Ordering::Relaxed);
                 return;
             };
-            cur.lag = Some(height.saturating_sub(cur.next - 1));
+            let lag = height.saturating_sub(cur.next - 1);
+            cap.tail_timing.lock().unwrap().on_lag(lag);
             while cur.next <= height && Instant::now() < stop {
                 match src.body(cur.next).await {
                     BodyFetch::Keys(actions) => tail_apply(cap, cur, &actions),
@@ -805,18 +799,32 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
     }
 }
 
+/// Closes the open tail poll in the tail timing when dropped: at the end of
+/// [`tail_round`], or when the tail task is aborted inside the poll (the
+/// bodies it read are already recorded; this adds the partial round).
+struct RoundTimer<'a> {
+    cap: &'a Cap,
+    t0: Instant,
+}
+
+impl Drop for RoundTimer<'_> {
+    fn drop(&mut self) {
+        let round_us = self.t0.elapsed().as_micros() as u64;
+        // No unwrap in drop: a poisoned lock must not turn a panic into an
+        // abort.
+        if let Ok(mut t) = self.cap.tail_timing.lock() {
+            t.end_round(round_us);
+        }
+    }
+}
+
 /// One [`tail_poll`], timed (`release_timing`).
 async fn tail_round<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop: Instant) {
-    let t0 = Instant::now();
-    let fetched0 = cap.tail.fetched.load(Ordering::Relaxed);
-    cur.lag = None;
+    let _round = RoundTimer {
+        cap,
+        t0: Instant::now(),
+    };
     tail_poll(cap, src, cur, stop).await;
-    let round_us = t0.elapsed().as_micros() as u64;
-    let fetched = cap.tail.fetched.load(Ordering::Relaxed) - fetched0;
-    cap.tail_timing
-        .lock()
-        .unwrap()
-        .on_round(round_us, fetched, cur.lag, &mut cur.seen);
 }
 
 /// The shared block-body tail: every `TAIL_POLL` expire timed-out actions,
@@ -1638,7 +1646,6 @@ mod tests {
         let mut cur = TailCursor::new(0);
         let before = wall_ms();
         tail_round(&cap, &node, &mut cur, far()).await;
-        assert!(cur.seen.is_empty(), "handed to the tail timing");
         let [line, blocks] = cap.timing_window(false);
         assert!(line.starts_with("release-timing: t="), "{line}");
         assert!(line.contains(" final=0 released=1 "), "{line}");

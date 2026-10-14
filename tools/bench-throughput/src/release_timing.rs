@@ -1,8 +1,9 @@
 //! Release timing for the `--max-in-flight` cap (s121): how long a slot stays
 //! taken, how long senders wait for one, and how the block tail keeps up.
 //! Cheap by design: the sender path adds no lock and no allocation (the wait
-//! is recorded under the tracker lock `Cap::wait_ready` already holds), the
-//! tail adds no RPC.
+//! is recorded under the tracker lock `Cap::wait_ready` already holds, into
+//! histogram buffers allocated once at start and cleared in place each
+//! window), the tail adds no RPC.
 //!
 //! bench.log lines (stdout, `key=value`, `-` = no sample in the window):
 //!
@@ -28,7 +29,8 @@
 //!   `wait_cancel_*`: below the cap but held by its own in-flight cancel-all
 //!   over its open-order budget. A wait is split by the reason seen at each
 //!   check, so one call can add to both. `_n` = calls, `_s` = total seconds.
-//! * `tail_rounds`: tail polls (one per `TAIL_POLL` + the poll itself);
+//! * `tail_rounds`: tail polls (one per `TAIL_POLL` + the poll itself; a
+//!   poll cut short by the end of the run counts, with what it read);
 //!   `tail_fetched`: bodies read; `tail_fetch_max`: most bodies in one poll
 //!   (commit mode reads until it is caught up, so this is the heights it was
 //!   behind at the poll start); `tail_round_*`: one poll's duration (RPC round
@@ -88,7 +90,7 @@ fn bucket_lo(i: usize) -> u64 {
 /// Log-linear histogram of `u64` samples (see the module doc).
 #[derive(Clone, Debug, Default)]
 pub struct Hist {
-    /// Empty until the first sample (an idle window allocates nothing).
+    /// Empty until the first sample unless [`preallocated`](Self::preallocated).
     counts: Vec<u64>,
     pub n: u64,
     pub sum: u64,
@@ -96,6 +98,35 @@ pub struct Hist {
 }
 
 impl Hist {
+    /// A histogram with its bucket buffer already allocated (recording into
+    /// it, and [`clear`](Self::clear), never allocate).
+    pub fn preallocated() -> Self {
+        Self {
+            counts: vec![0; BUCKETS],
+            ..Self::default()
+        }
+    }
+
+    /// Empty it, keeping the bucket buffer.
+    pub fn clear(&mut self) {
+        self.counts.fill(0);
+        self.n = 0;
+        self.sum = 0;
+        self.max = 0;
+    }
+
+    /// What a window line needs (no buffer copy).
+    pub fn summary(&self) -> Summary {
+        Summary {
+            n: self.n,
+            sum: self.sum,
+            max: self.max,
+            p50: self.quantile(0.5),
+            p90: self.quantile(0.9),
+            p99: self.quantile(0.99),
+        }
+    }
+
     pub fn record(&mut self, v: u64) {
         if self.counts.is_empty() {
             self.counts = vec![0; BUCKETS];
@@ -147,11 +178,32 @@ impl Hist {
     }
 }
 
-/// One quantity: the current window and the run total.
-#[derive(Default)]
+/// One closed window of a [`Series`]: count, sum, max and quantiles
+/// (`None` when empty).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Summary {
+    pub n: u64,
+    pub sum: u64,
+    pub max: u64,
+    pub p50: Option<u64>,
+    pub p90: Option<u64>,
+    pub p99: Option<u64>,
+}
+
+/// One quantity: the current window and the run total. Both buffers are
+/// allocated at construction and reused for the whole run.
 pub struct Series {
     pub window: Hist,
     pub total: Hist,
+}
+
+impl Default for Series {
+    fn default() -> Self {
+        Self {
+            window: Hist::preallocated(),
+            total: Hist::preallocated(),
+        }
+    }
 }
 
 impl Series {
@@ -159,10 +211,12 @@ impl Series {
         self.window.record(v);
     }
 
-    /// Close the window: fold it into the total and return it.
-    pub fn roll(&mut self) -> Hist {
-        let w = std::mem::take(&mut self.window);
-        self.total.merge(&w);
+    /// Close the window: fold it into the total, clear it in place and
+    /// return its summary (no allocation).
+    pub fn roll(&mut self) -> Summary {
+        let w = self.window.summary();
+        self.total.merge(&self.window);
+        self.window.clear();
         w
     }
 }
@@ -187,8 +241,8 @@ pub struct ReleaseTiming {
 
 /// One closed window of [`ReleaseTiming`].
 pub struct RelWindow {
-    pub age_ms: Hist,
-    pub wait_us: [Hist; 2],
+    pub age_ms: Summary,
+    pub wait_us: [Summary; 2],
     pub ready_calls: u64,
 }
 
@@ -227,39 +281,48 @@ impl ReleaseTiming {
     }
 }
 
-/// Block-tail timing (one writer: the tail task).
+/// Block-tail timing (one writer: the tail task). Each body and the head
+/// lag are recorded as soon as they are read, so a poll cut short (the tail
+/// aborted at the end of the run) keeps what it read.
 #[derive(Default)]
 pub struct TailTiming {
     round_us: Series,
     fetched: Series,
     lag: Series,
     seen: Vec<(u64, u64)>,
+    /// The open poll: bodies read so far and its head lag.
+    round_fetched: u64,
+    round_lag: Option<u64>,
 }
 
 /// One closed window of [`TailTiming`].
 pub struct TailWindow {
-    pub round_us: Hist,
-    pub fetched: Hist,
-    pub lag: Hist,
+    pub round_us: Summary,
+    pub fetched: Summary,
+    pub lag: Summary,
     pub seen: Vec<(u64, u64)>,
 }
 
 impl TailTiming {
-    /// One tail poll: its duration, bodies read, head lag (head mode) and the
-    /// `(height, seen wall ms)` of each body read (drained).
-    pub fn on_round(
-        &mut self,
-        round_us: u64,
-        fetched: u64,
-        lag: Option<u64>,
-        seen: &mut Vec<(u64, u64)>,
-    ) {
+    /// The open poll read the body at `height`, parsed at `seen_ms`.
+    pub fn on_body(&mut self, height: u64, seen_ms: u64) {
+        self.round_fetched += 1;
+        self.seen.push((height, seen_ms));
+    }
+
+    /// Head mode: the open poll's head lag (`eth_blockNumber` minus the last
+    /// read height at its start).
+    pub fn on_lag(&mut self, lag: u64) {
+        self.round_lag = Some(lag);
+    }
+
+    /// Close the open poll (finished or cut short) after `round_us`.
+    pub fn end_round(&mut self, round_us: u64) {
         self.round_us.record(round_us);
-        self.fetched.record(fetched);
-        if let Some(lag) = lag {
+        self.fetched.record(std::mem::take(&mut self.round_fetched));
+        if let Some(lag) = self.round_lag.take() {
             self.lag.record(lag);
         }
-        self.seen.append(seen);
     }
 
     pub fn roll(&mut self) -> TailWindow {
@@ -291,15 +354,15 @@ pub fn window_lines(
     let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
     let ms =
         |us: Option<u64>| us.map_or_else(|| "-".to_string(), |v| format!("{:.1}", v as f64 / 1e3));
-    let max = |h: &Hist| (h.n > 0).then_some(h.max);
+    let max = |h: &Summary| (h.n > 0).then_some(h.max);
     let age = &rel.age_ms;
-    let wait = |name: &str, h: &Hist| {
+    let wait = |name: &str, h: &Summary| {
         format!(
             "wait_{name}_n={} wait_{name}_s={:.3} wait_{name}_p50_ms={} wait_{name}_p99_ms={}",
             h.n,
             h.sum as f64 / 1e6,
-            ms(h.quantile(0.5)),
-            ms(h.quantile(0.99)),
+            ms(h.p50),
+            ms(h.p99),
         )
     };
     let main = format!(
@@ -309,9 +372,9 @@ pub fn window_lines(
          tail_lag_max={}",
         u8::from(last),
         age.n,
-        n(age.quantile(0.5)),
-        n(age.quantile(0.9)),
-        n(age.quantile(0.99)),
+        n(age.p50),
+        n(age.p90),
+        n(age.p99),
         n(max(age)),
         rel.ready_calls,
         wait("cap", &rel.wait_us[0]),
@@ -319,7 +382,7 @@ pub fn window_lines(
         tail.round_us.n,
         tail.fetched.sum,
         n(max(&tail.fetched)),
-        ms(tail.round_us.quantile(0.5)),
+        ms(tail.round_us.p50),
         ms(max(&tail.round_us)),
         n(max(&tail.lag)),
     );
@@ -444,10 +507,11 @@ mod tests {
     #[test]
     fn tail_rounds_and_seen_heights_roll_per_window() {
         let mut t = TailTiming::default();
-        let mut seen = vec![(7, 1_000), (8, 1_050)];
-        t.on_round(4_000, 2, Some(3), &mut seen);
-        assert!(seen.is_empty(), "drained");
-        t.on_round(1_500, 0, None, &mut seen);
+        t.on_lag(3);
+        t.on_body(7, 1_000);
+        t.on_body(8, 1_050);
+        t.end_round(4_000);
+        t.end_round(1_500);
         let w = t.roll();
         assert_eq!((w.round_us.n, w.round_us.max), (2, 4_000));
         assert_eq!((w.fetched.sum, w.fetched.max), (2, 2));
@@ -511,7 +575,11 @@ mod tests {
             assert_eq!(allocations() - a0, 0, "window {window}: wait/release path");
             let a0 = allocations();
             let w = r.roll();
-            assert_eq!(allocations() - a0, 0, "window {window}: roll (tracker lock)");
+            assert_eq!(
+                allocations() - a0,
+                0,
+                "window {window}: roll (tracker lock)"
+            );
             assert_eq!((w.ready_calls, w.wait_us[0].n, w.wait_us[1].n), (3, 1, 1));
             assert_eq!((w.age_ms.n, w.age_ms.max), (1, 500 + window));
         }
@@ -529,8 +597,13 @@ mod tests {
         r.on_ready([Some(1_000), None]);
         r.on_ready([Some(5_000), Some(2_000)]);
         let mut t = TailTiming::default();
-        t.on_round(4_000, 2, Some(3), &mut vec![(7, 1_000), (8, 1_050)]);
-        t.on_round(12_000, 1, Some(1), &mut vec![(9, 1_300)]);
+        t.on_lag(3);
+        t.on_body(7, 1_000);
+        t.on_body(8, 1_050);
+        t.end_round(4_000);
+        t.on_lag(1);
+        t.on_body(9, 1_300);
+        t.end_round(12_000);
         let lines = window_lines(15.04, 1_760_000_015_000, false, &r.roll(), &t.roll());
         assert_eq!(
             lines[0],
