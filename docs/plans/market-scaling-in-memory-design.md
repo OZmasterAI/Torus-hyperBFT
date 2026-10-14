@@ -932,6 +932,23 @@ D12. Nonce rows (one row per action forever, `app.rs:2140-2147`, `cf.rs:93-98`).
 - b) Windowed set: drop nonces older than block time - 60 s at execution;
   consensus rule + hash change, fresh genesis (HL-like).
 - Recommendation: b, before Phase 5.
+- **Owner s119: b, at the public testnet genesis** (bundled with R20, the new chain id, and L3; no code
+  overlap with either, they share one genesis regeneration, one testnet reset and one `h_n` release note).
+  Sizing (read-only check on main `7487b764`): S-M. Only execution touches the CF (read after
+  `check_nonce_window`, write per action, key helper `native_nonce_key` in `cf.rs`); no mempool, RPC, EVM or
+  genesis reader; snapshots copy the whole DB. Nonces are not in the header state root, only in `h_n`
+  (deletes enter as tombstones). Golden A / B need no re-pin (they write no nonce rows); some `app.rs`
+  fixtures may change. A disk item, not a speed item: ~240 rows/s (~20M rows/day); `replay_guard`
+  2.84 ms per native block stays about flat **(estimate)**.
+  - Key: nonce(8 BE) ++ sender(20) (time-major), so expired nonces are one contiguous range. Point checks
+    are unchanged.
+  - Prune on **every block**: delete the range [parent block_ms - 60 s, block_ms - 60 s), strictly below the
+    cutoff (a nonce equal to block_ms - 60 s is still valid). Invariant after each block: no nonce row older
+    than the window exists. Block timestamps never go backwards.
+  - Cursor: the **parent header's timestamp** (consensus data), not a node-local meta key.
+  - Remove the dead `native_consumed_nonces` field (`torus-bridge` `validator.rs`, always empty) in the same
+    change.
+  - Risk: tombstones at the front of the range; use the existing background-compaction hook.
 
 D13. Trade history.
 - a) Keep packed rows (4.1 CPU-s/1M) + retention pruning.
