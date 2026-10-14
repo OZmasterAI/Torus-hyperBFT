@@ -9,7 +9,7 @@ use alloy_primitives::map::{HashMap, HashSet};
 use alloy_primitives::U256;
 use borsh::{BorshDeserialize, BorshSerialize};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
-use torus_state::{StateBackend, StateDb};
+use torus_state::{OwnPendingRow, StateBackend, StateDb};
 use torus_types::{Address, FixedPoint, MarketId};
 
 use crate::error::CoreError;
@@ -256,6 +256,41 @@ pub fn open_order_limit(cum_volume: FixedPoint) -> u32 {
 }
 
 // ============================================================================
+// Typed rows (item 6 Phase 4 step 4)
+// ============================================================================
+
+/// Item 6 Phase 4 step 4: a decoded copy of the resident rows R's positions
+/// and balances rows, per trader (the executor's record set). Each method
+/// answers `Some(row)` (`Some(None)`: R holds no such row) exactly as
+/// decoding R's bytes would, or `None` when it cannot (an opaque trader:
+/// read the bytes). Only consulted for a key with no own pending row in the
+/// block ([`OwnPendingRow::Resident`]); see the `_typed` reads of
+/// [`PositionManager`].
+pub trait TypedRows: Send + Sync {
+    /// `trader`'s position in `market_id` (the row at [`position_key`]).
+    fn position(&self, trader: &Address, market_id: MarketId) -> Option<Option<Position>>;
+    /// `trader`'s balance row (`None` inside: no row; the read defaults it).
+    fn balance(&self, trader: &Address) -> Option<Option<NativeBalance>>;
+    /// `trader`'s `cvlm` row (`None` inside: no row; the read reads zero).
+    fn cum_volume(&self, trader: &Address) -> Option<Option<FixedPoint>>;
+}
+
+fn decode_position(data: &[u8]) -> Result<Position, CoreError> {
+    Position::try_from_slice(data).map_err(|e| CoreError::Borsh(e.to_string()))
+}
+
+fn decode_native_balance(data: &[u8]) -> Result<NativeBalance, CoreError> {
+    NativeBalance::try_from_slice(data).map_err(|e| CoreError::Borsh(e.to_string()))
+}
+
+fn decode_cum_volume(data: &[u8]) -> Result<FixedPoint, CoreError> {
+    let raw: [u8; 16] = data
+        .try_into()
+        .map_err(|_| CoreError::Borsh(format!("cum_volume row has {} bytes, expected 16", data.len())))?;
+    Ok(FixedPoint::from_raw(i128::from_be_bytes(raw)))
+}
+
+// ============================================================================
 // PositionManager — CRUD for positions and native balances
 // ============================================================================
 
@@ -282,10 +317,32 @@ impl<T: StateBackend> PositionManager<T> {
     ) -> Result<Option<Position>, CoreError> {
         let key = position_key(trader, market_id);
         match self.state.get_cf_raw(CF_NATIVE_POSITIONS, &key)? {
-            Some(data) => Ok(Some(
-                Position::try_from_slice(&data).map_err(|e| CoreError::Borsh(e.to_string()))?,
-            )),
+            Some(data) => Ok(Some(decode_position(&data)?)),
             None => Ok(None),
+        }
+    }
+
+    /// Item 6 Phase 4 step 4: [`Self::get_position`], with the block's own
+    /// pending row first (bytes, decoded as there), else `typed`'s record
+    /// when the backend reads R for the key; any other case (no `typed`, the
+    /// backend cannot tell, `typed` declines) reads `get_cf_raw`. Same
+    /// result, same errors.
+    pub fn get_position_typed(
+        &self,
+        typed: Option<&dyn TypedRows>,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<Option<Position>, CoreError> {
+        let Some(typed) = typed else {
+            return self.get_position(trader, market_id);
+        };
+        match self.state.own_pending_row(CF_NATIVE_POSITIONS, &position_key(trader, market_id)) {
+            OwnPendingRow::Pending(row) => row.as_deref().map(decode_position).transpose(),
+            OwnPendingRow::Resident => match typed.position(trader, market_id) {
+                Some(pos) => Ok(pos),
+                None => self.get_position(trader, market_id),
+            },
+            OwnPendingRow::Unknown => self.get_position(trader, market_id),
         }
     }
 
@@ -312,9 +369,7 @@ impl<T: StateBackend> PositionManager<T> {
             .iterate_cf(CF_NATIVE_POSITIONS, Some(trader.as_slice()))?;
         let mut out = Vec::with_capacity(entries.len());
         for (_key, value) in entries {
-            out.push(
-                Position::try_from_slice(&value).map_err(|e| CoreError::Borsh(e.to_string()))?,
-            );
+            out.push(decode_position(&value)?);
         }
         Ok(out)
     }
@@ -326,10 +381,30 @@ impl<T: StateBackend> PositionManager<T> {
             .state
             .get_cf_raw(CF_NATIVE_BALANCES, trader.as_slice())?
         {
-            Some(data) => Ok(NativeBalance::try_from_slice(&data)
-                .map_err(|e| CoreError::Borsh(e.to_string()))?),
+            Some(data) => decode_native_balance(&data),
             None => Ok(NativeBalance::default()),
         }
+    }
+
+    /// Item 6 Phase 4 step 4: [`Self::get_native_balance`] through `typed`
+    /// (see [`Self::get_position_typed`]).
+    pub fn get_native_balance_typed(
+        &self,
+        typed: Option<&dyn TypedRows>,
+        trader: &Address,
+    ) -> Result<NativeBalance, CoreError> {
+        let Some(typed) = typed else {
+            return self.get_native_balance(trader);
+        };
+        let row = match self.state.own_pending_row(CF_NATIVE_BALANCES, trader.as_slice()) {
+            OwnPendingRow::Pending(row) => row.as_deref().map(decode_native_balance).transpose()?,
+            OwnPendingRow::Resident => match typed.balance(trader) {
+                Some(bal) => bal,
+                None => return self.get_native_balance(trader),
+            },
+            OwnPendingRow::Unknown => return self.get_native_balance(trader),
+        };
+        Ok(row.unwrap_or_default())
     }
 
     pub fn put_native_balance(
@@ -350,14 +425,30 @@ impl<T: StateBackend> PositionManager<T> {
             .state
             .get_cf_raw(CF_NATIVE_BALANCES, &cum_volume_key(trader))?
         {
-            Some(data) => {
-                let raw: [u8; 16] = data.as_slice().try_into().map_err(|_| {
-                    CoreError::Borsh(format!("cum_volume row has {} bytes, expected 16", data.len()))
-                })?;
-                Ok(FixedPoint::from_raw(i128::from_be_bytes(raw)))
-            }
+            Some(data) => decode_cum_volume(&data),
             None => Ok(FixedPoint::ZERO),
         }
+    }
+
+    /// Item 6 Phase 4 step 4: [`Self::get_cum_volume`] through `typed` (see
+    /// [`Self::get_position_typed`]).
+    pub fn get_cum_volume_typed(
+        &self,
+        typed: Option<&dyn TypedRows>,
+        trader: &Address,
+    ) -> Result<FixedPoint, CoreError> {
+        let Some(typed) = typed else {
+            return self.get_cum_volume(trader);
+        };
+        let row = match self.state.own_pending_row(CF_NATIVE_BALANCES, &cum_volume_key(trader)) {
+            OwnPendingRow::Pending(row) => row.as_deref().map(decode_cum_volume).transpose()?,
+            OwnPendingRow::Resident => match typed.cum_volume(trader) {
+                Some(volume) => volume,
+                None => return self.get_cum_volume(trader),
+            },
+            OwnPendingRow::Unknown => return self.get_cum_volume(trader),
+        };
+        Ok(row.unwrap_or(FixedPoint::ZERO))
     }
 
     pub fn put_cum_volume(&self, trader: &Address, volume: FixedPoint) -> Result<(), CoreError> {
@@ -445,7 +536,29 @@ impl<T: StateBackend> PositionManager<T> {
         fill_price: FixedPoint,
         margin_type: MarginType,
     ) -> Result<FillEffect, CoreError> {
-        cache.update_in_place(self, trader, market_id, |existing| {
+        self.apply_fill_cached_effect_typed(
+            cache, None, trader, market_id, is_buy, fill_qty, fill_price, margin_type,
+        )
+    }
+
+    /// Item 6 Phase 4 step 4: [`apply_fill_cached_effect`], a cache miss
+    /// read through `typed` ([`Self::get_position_typed`]). Same effect,
+    /// same cache writes.
+    ///
+    /// [`apply_fill_cached_effect`]: Self::apply_fill_cached_effect
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_fill_cached_effect_typed(
+        &self,
+        cache: &mut PositionCache,
+        typed: Option<&dyn TypedRows>,
+        trader: &Address,
+        market_id: MarketId,
+        is_buy: bool,
+        fill_qty: FixedPoint,
+        fill_price: FixedPoint,
+        margin_type: MarginType,
+    ) -> Result<FillEffect, CoreError> {
+        cache.update_in_place(self, typed, trader, market_id, |existing| {
             let start_size = signed_size(&existing);
             let (new_pos, pnl) = fill_transition(
                 existing,
@@ -647,11 +760,23 @@ impl PositionCache {
         trader: &Address,
         market_id: MarketId,
     ) -> Result<Option<Position>, CoreError> {
+        self.load_typed(positions, None, trader, market_id)
+    }
+
+    /// Item 6 Phase 4 step 4: [`Self::load`], a miss read through `typed`
+    /// ([`PositionManager::get_position_typed`]).
+    pub fn load_typed<T: StateBackend>(
+        &mut self,
+        positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Result<Option<Position>, CoreError> {
         let key = (*trader, market_id);
         if let Some(entry) = self.map.get(&key) {
             return Ok(entry.clone());
         }
-        let pos = positions.get_position(trader, market_id)?;
+        let pos = positions.get_position_typed(typed, trader, market_id)?;
         self.map.insert(key, pos.clone());
         Ok(pos)
     }
@@ -671,6 +796,7 @@ impl PositionCache {
     fn update_in_place<T: StateBackend, R>(
         &mut self,
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         trader: &Address,
         market_id: MarketId,
         f: impl FnOnce(Option<Position>) -> (Option<Position>, R),
@@ -678,7 +804,7 @@ impl PositionCache {
         let key = (*trader, market_id);
         let slot = match self.map.entry(key) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(positions.get_position(trader, market_id)?),
+            Entry::Vacant(e) => e.insert(positions.get_position_typed(typed, trader, market_id)?),
         };
         if slot
             .as_ref()

@@ -77,7 +77,7 @@ fn check_typed<T: StateBackend>(ctx: &NativeExecContext<T>, stats: &mut Stats, t
     let typed: &dyn TypedRows = users;
     let state = ctx.positions.state();
     let pm = &ctx.positions;
-    let mut expect = |cf: &str, key: &[u8], opaque: bool, kind: usize, n: usize, before: ([usize; 3], usize), stats: &mut Stats| {
+    let expect = |cf: &str, key: &[u8], opaque: bool, kind: usize, n: usize, before: ([usize; 3], usize), stats: &mut Stats| {
         let (hits, declined) = users.typed_counts();
         let own = state.own_pending_row(cf, key);
         match own {

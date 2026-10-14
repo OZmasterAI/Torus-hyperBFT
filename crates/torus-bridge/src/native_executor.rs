@@ -27,7 +27,7 @@ use torus_core::order_book::{
     PriceBand, ReduceOnlyPositions, ShapeViolation, TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
-    open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
+    open_order_limit, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager, TypedRows,
     OPEN_ORDER_BASE_LIMIT,
 };
 use torus_core::precompiles::{CoreWriterQueue, QueuedAction, QueuedActionKind};
@@ -341,15 +341,18 @@ impl BalanceCache {
     }
 
     /// Return the sender's balance, reading through to `positions` on a miss.
+    /// Item 6 Phase 4 step 4: a miss reads the block's own pending row, else
+    /// `typed`'s record (`PositionManager::get_native_balance_typed`).
     fn load<T: StateBackend>(
         &mut self,
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         addr: &Address,
     ) -> Result<NativeBalance, CoreError> {
         if let Some(entry) = self.map.get(addr) {
             return Ok(entry.balance.clone());
         }
-        let bal = positions.get_native_balance(addr)?;
+        let bal = positions.get_native_balance_typed(typed, addr)?;
         self.map.insert(
             *addr,
             CachedBalance {
@@ -1634,6 +1637,12 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         }
     }
 
+    /// Item 6 Phase 4 step 4: the typed loads' source, the block's record
+    /// set (`None`: no records; loads read the overlay).
+    fn typed(&self) -> Option<&'a dyn TypedRows> {
+        Some(self.sums?.records.as_deref()?)
+    }
+
     /// R02: record `e` on the reader fault channel when it is a local fault
     /// (the first is kept); the caller then returns its "absent" value, which
     /// the block never uses (it fail-stops).
@@ -2322,10 +2331,11 @@ impl SenderState {
     fn load_balance<'s, T: StateBackend>(
         slot: &'s mut Option<NativeBalance>,
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         sender: &Address,
     ) -> Result<&'s mut NativeBalance, CoreError> {
         if slot.is_none() {
-            *slot = Some(positions.get_native_balance(sender)?);
+            *slot = Some(positions.get_native_balance_typed(typed, sender)?);
         }
         Ok(slot.get_or_insert_with(NativeBalance::default))
     }
@@ -5121,6 +5131,13 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// block's table and configs) from `block` — call before
     /// [`NativeExecutor::begin_block_oracle`]. Without it (reference path,
     /// tests) every block's table takes a new version.
+    /// Item 6 Phase 4 step 4: the typed loads' source, the block's record
+    /// set (R's source of positions and balances; `None` without R: loads
+    /// read the overlay).
+    fn typed_rows(&self) -> Option<&dyn TypedRows> {
+        Some(self.sums.as_ref()?.records.as_deref()?)
+    }
+
     pub fn attach_resident_block(&mut self, block: &mut ResidentBlock) {
         self.prev_marks = block.marks.take();
         // C3: the slot's sums cache (used once the table is filled).
@@ -7322,6 +7339,7 @@ impl NativeExecutor {
         // they run before the pools are read.
         let [full, partial, none] = Self::sell_top_ups(
             &ctx.positions,
+            ctx.typed_rows(),
             &ctx.reader_fault,
             &markets,
             &basis,
@@ -7338,6 +7356,7 @@ impl NativeExecutor {
         }
         let pools = Self::d2_pools(
             &ctx.positions,
+            ctx.typed_rows(),
             &ctx.reader_fault,
             &pool_takers,
             &excess_by_sender,
@@ -7617,7 +7636,7 @@ impl NativeExecutor {
         let mut volumes: Vec<_> = vol_cache.into_iter().collect();
         volumes.sort_unstable_by_key(|(trader, _)| *trader);
         for (trader, add) in volumes {
-            if let Err(e) = Self::add_cum_volume(&ctx.positions, &trader, add) {
+            if let Err(e) = Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &trader, add) {
                 ctx.fatal_error = Some(format!("cum_volume flush failed: {e}"));
             }
         }
@@ -7673,6 +7692,7 @@ impl NativeExecutor {
         let taken = match Self::take_open_slot(
             &mut st.open_slots,
             reader.positions,
+            reader.typed(),
             reader.fault,
             open_at_start,
             sender,
@@ -7759,7 +7779,7 @@ impl NativeExecutor {
         let mut excess = FixedPoint::ZERO;
         let mut projection: Option<&mut Projection> = None;
         if required > FixedPoint::ZERO || checked || needs_account {
-            let bal = match SenderState::load_balance(&mut st.balance, reader.positions, sender) {
+            let bal = match SenderState::load_balance(&mut st.balance, reader.positions, reader.typed(), sender) {
                 Ok(bal) => bal,
                 Err(e) => {
                     // R02: a local fault fail-stops (rejected meanwhile).
@@ -8130,7 +8150,7 @@ impl NativeExecutor {
                     );
 
                     if margin_to_release > FixedPoint::ZERO {
-                        match bal_cache.load(&ctx.positions, &prep.sender) {
+                        match bal_cache.load(&ctx.positions, ctx.typed_rows(), &prep.sender) {
                             Ok(mut bal) => {
                                 let release = margin_to_release.min(bal.order_margin);
                                 bal.order_margin -= release;
@@ -8163,6 +8183,7 @@ impl NativeExecutor {
                     let notional = fill.price * fill.quantity;
                     let taker = match Self::apply_fill_via_caches(
                         &ctx.positions,
+                        ctx.typed_rows(),
                         pos_cache,
                         bal_cache,
                         &fill.taker,
@@ -8187,6 +8208,7 @@ impl NativeExecutor {
                     *vol_cache.entry(fill.taker).or_insert(FixedPoint::ZERO) += notional;
                     let maker = match Self::apply_fill_via_caches(
                         &ctx.positions,
+                        ctx.typed_rows(),
                         pos_cache,
                         bal_cache,
                         &fill.maker,
@@ -8258,7 +8280,7 @@ impl NativeExecutor {
             for (trader, amount) in
                 Self::maker_margin_releases(ctx, market_id, mbr.results.iter().map(|m| &m.result))
             {
-                match bal_cache.load(&ctx.positions, &trader) {
+                match bal_cache.load(&ctx.positions, ctx.typed_rows(), &trader) {
                     Ok(mut bal) => {
                         let release = amount.min(bal.order_margin);
                         bal.order_margin -= release;
@@ -8360,6 +8382,7 @@ impl NativeExecutor {
         let pass_a_timer = std::time::Instant::now();
         let plans: Vec<Result<MarketSettlePlan, String>> = {
             let positions = &ctx.positions;
+            let typed = ctx.typed_rows();
             let margin_configs = &ctx.margin_configs;
             let record_fills = ctx.record_fills;
             let mrs: &[crate::market_workers::MarketBatchResult] = &market_results;
@@ -8389,6 +8412,7 @@ impl NativeExecutor {
                 crate::panic_scope::catch_recoverable(|| {
                     Self::compute_market_settle_plan(
                         positions,
+                        typed,
                         cfg,
                         mbr,
                         prepared,
@@ -8552,7 +8576,7 @@ impl NativeExecutor {
                 // Taker-side margin release (amount precomputed; clamp here,
                 // where the balance authority lives).
                 if oplan.margin_release > FixedPoint::ZERO {
-                    match bal_cache.load(&ctx.positions, &prep.sender) {
+                    match bal_cache.load(&ctx.positions, ctx.typed_rows(), &prep.sender) {
                         Ok(mut bal) => {
                             let release = oplan.margin_release.min(bal.order_margin);
                             bal.order_margin -= release;
@@ -8578,7 +8602,7 @@ impl NativeExecutor {
                 let mut fill_failed: Option<String> = None;
                 let mut sides_applied = 2 * result.fills.len();
                 for (side, trader, pnl, at) in &oplan.pnl_events {
-                    match bal_cache.load(&ctx.positions, trader) {
+                    match bal_cache.load(&ctx.positions, ctx.typed_rows(), trader) {
                         Ok(mut bal) => {
                             bal.available += *pnl;
                             bal_cache.set(trader, bal);
@@ -8661,7 +8685,7 @@ impl NativeExecutor {
             // A5 maker/STP releases — amounts precomputed by the worker in the
             // canonical order; clamps applied here against live balances.
             for (trader, amount) in plan.maker_releases {
-                match bal_cache.load(&ctx.positions, &trader) {
+                match bal_cache.load(&ctx.positions, ctx.typed_rows(), &trader) {
                     Ok(mut bal) => {
                         let release = amount.min(bal.order_margin);
                         bal.order_margin -= release;
@@ -8683,6 +8707,7 @@ impl NativeExecutor {
     /// `record_fills` (s80): also keep each fill's effects for its extras.
     fn compute_market_settle_plan<T: StateBackend>(
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         cfg: Option<&MarketMarginConfig>,
         mbr: &crate::market_workers::MarketBatchResult,
         prepared: &[PreparedOrder<'_>],
@@ -8721,8 +8746,9 @@ impl NativeExecutor {
                     ])
                     .enumerate()
                 {
-                    match positions.apply_fill_cached_effect(
+                    match positions.apply_fill_cached_effect_typed(
                         &mut pos_cache,
+                        typed,
                         trader,
                         market_id,
                         is_buy,
@@ -8790,6 +8816,7 @@ impl NativeExecutor {
     #[allow(clippy::too_many_arguments)]
     fn apply_fill_via_caches<T: StateBackend>(
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         pos_cache: &mut PositionCache,
         bal_cache: &mut BalanceCache,
         trader: &Address,
@@ -8798,8 +8825,9 @@ impl NativeExecutor {
         qty: FixedPoint,
         price: FixedPoint,
     ) -> Result<FillEffect, CoreError> {
-        let effect = positions.apply_fill_cached_effect(
+        let effect = positions.apply_fill_cached_effect_typed(
             pos_cache,
+            typed,
             trader,
             market_id,
             is_buy,
@@ -8808,7 +8836,7 @@ impl NativeExecutor {
             MarginType::Cross,
         )?;
         if let Some(pnl) = effect.closed_pnl {
-            let mut bal = bal_cache.load(positions, trader)?;
+            let mut bal = bal_cache.load(positions, typed, trader)?;
             bal.available += pnl;
             bal_cache.set(trader, bal);
         }
@@ -9051,6 +9079,7 @@ impl NativeExecutor {
     fn take_open_slot<T: StateBackend>(
         slots: &mut Option<OpenSlots>,
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         fault: &std::sync::OnceLock<String>,
         open_at_start: &HashMap<Address, u32>,
         sender: &Address,
@@ -9062,7 +9091,7 @@ impl NativeExecutor {
         let s = match *slots {
             Some(s) => s,
             None => {
-                let volume = positions.get_cum_volume(sender).map_err(|e| {
+                let volume = positions.get_cum_volume_typed(typed, sender).map_err(|e| {
                     note_reader_fault(fault, "open order slot cum_volume read", &e);
                     (RejectReason::Other, e.to_string())
                 })?;
@@ -9129,10 +9158,11 @@ impl NativeExecutor {
     /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
     fn add_cum_volume<T: StateBackend>(
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         trader: &Address,
         amount: FixedPoint,
     ) -> Result<(), CoreError> {
-        let volume = positions.get_cum_volume(trader)?;
+        let volume = positions.get_cum_volume_typed(typed, trader)?;
         positions.put_cum_volume(trader, volume + amount)
     }
 
@@ -9532,6 +9562,7 @@ impl NativeExecutor {
 
     fn d2_pools<T: StateBackend>(
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         fault: &std::sync::OnceLock<String>,
         pool_takers: &HashMap<Address, (MarketId, FixedPoint)>,
         excess_by_sender: &HashMap<Address, FixedPoint>,
@@ -9540,7 +9571,7 @@ impl NativeExecutor {
         let mut pools: HashMap<(Address, MarketId), FixedPoint> =
             HashMap::with_capacity_and_hasher(pool_takers.len(), Default::default());
         for (&sender, &(market_id, pos_net)) in pool_takers {
-            let available = match bal_cache.load(positions, &sender) {
+            let available = match bal_cache.load(positions, typed, &sender) {
                 Ok(b) => b.available,
                 Err(e) => {
                     note_reader_fault(fault, "D2 pool balance read", &e);
@@ -9587,6 +9618,7 @@ impl NativeExecutor {
     #[allow(clippy::too_many_arguments)]
     fn sell_top_ups<T: StateBackend>(
         positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
         fault: &std::sync::OnceLock<String>,
         markets: &HashMap<MarketId, Phase2Market<'_>>,
         basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
@@ -9616,7 +9648,7 @@ impl NativeExecutor {
             }
             // R02: a local fault fail-stops (`fault`: the reader fault
             // channel); no top-up meanwhile.
-            let mut bal = match bal_cache.load(positions, &p.sender) {
+            let mut bal = match bal_cache.load(positions, typed, &p.sender) {
                 Ok(bal) => bal,
                 Err(e) => {
                     note_reader_fault(fault, "sell top-up balance read", &e);
@@ -9874,6 +9906,7 @@ impl NativeExecutor {
         if let Err((reason, msg)) = Self::take_open_slot(
             &mut None,
             &ctx.positions,
+            ctx.typed_rows(),
             &ctx.reader_fault,
             &open_at_start,
             sender,
@@ -10268,7 +10301,7 @@ impl NativeExecutor {
                     MarginType::Cross,
                 )
                 .and_then(|effect| {
-                    Self::add_cum_volume(&ctx.positions, &fill.taker, notional)?;
+                    Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.taker, notional)?;
                     Ok(effect)
                 }) {
                 Ok(effect) => effect,
@@ -10298,7 +10331,7 @@ impl NativeExecutor {
                     MarginType::Cross,
                 )
                 .and_then(|effect| {
-                    Self::add_cum_volume(&ctx.positions, &fill.maker, notional)?;
+                    Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.maker, notional)?;
                     Ok(effect)
                 }) {
                 Ok(effect) => effect,

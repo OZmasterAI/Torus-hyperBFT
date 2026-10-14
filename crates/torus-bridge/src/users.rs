@@ -33,7 +33,9 @@
 //! `cvlm` + 20 bytes) are kept raw too, so the record set holds every row of
 //! the two CFs ([`Users::encode_rows`] == R's) and follows a delta without R.
 //! Readers use a record only for a trader with no own pending position
-//! writes in the block (`AccountReader`).
+//! writes in the block (`AccountReader`). Phase 4 step 4: the typed loads
+//! (`PositionCache`, `BalanceCache`, the `cum_volume` reads) use it per key,
+//! for a key with no own pending row ([`TypedRows`]).
 //!
 //! Item 6 E2: the traders of R's 28-byte keys, sorted, kept with the records
 //! (same lifecycle), so the liquidation step's candidate list
@@ -53,7 +55,7 @@ use std::ops::Bound;
 
 use alloy_primitives::Address;
 use borsh::{BorshDeserialize, BorshSerialize};
-use torus_core::position::{cum_volume_key, position_key, NativeBalance, Position, POSITION_V2_LEN};
+use torus_core::position::{cum_volume_key, position_key, NativeBalance, Position, TypedRows, POSITION_V2_LEN};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::error::StateError;
 use torus_state::resident_rows::{ResidentRow, ResidentRowIter, ResidentSource};
@@ -180,6 +182,10 @@ pub(crate) struct Users {
     /// their key + value bytes, kept per change (the users gauges).
     rows: usize,
     bytes: usize,
+    /// Phase 4 step 4 (tests): typed loads answered from a record, per kind
+    /// (position, balance, volume), and declined (an opaque trader).
+    #[cfg(test)]
+    typed: ([std::sync::atomic::AtomicUsize; 3], std::sync::atomic::AtomicUsize),
 }
 
 type Holders = HashMap<MarketId, HashSet<Address>>;
@@ -1045,6 +1051,68 @@ impl Users {
         }
         rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Box::new(rows.into_iter().take_while(move |(k, _)| k.starts_with(&under)))
+    }
+}
+
+/// Phase 4 step 4: the typed loads (`PositionCache`, `BalanceCache`, the
+/// `cum_volume` reads) of a key with no own pending row in the block: a
+/// regular trader's record answers (no row: `Some(None)`), exactly the row R
+/// encodes from it ([`ResidentSource::get`]); an opaque trader declines and
+/// the caller reads its raw row through the overlay. The keys asked are a
+/// trader's own (`t ‖ m`, `t`, `cvlm ‖ t`), never a row under no trader.
+impl TypedRows for Users {
+    #[inline]
+    fn position(&self, trader: &Address, market_id: MarketId) -> Option<Option<Position>> {
+        let Some(ps) = self.get(trader) else {
+            self.count_typed(None);
+            return None;
+        };
+        self.count_typed(Some(0));
+        Some(find(ps, market_id).cloned())
+    }
+
+    #[inline]
+    fn balance(&self, trader: &Address) -> Option<Option<NativeBalance>> {
+        if self.opaque_of(trader).is_some() {
+            self.count_typed(None);
+            return None;
+        }
+        self.count_typed(Some(1));
+        Some(self.map.get(trader).and_then(|u| u.balance.clone()))
+    }
+
+    #[inline]
+    fn cum_volume(&self, trader: &Address) -> Option<Option<FixedPoint>> {
+        if self.opaque_of(trader).is_some() {
+            self.count_typed(None);
+            return None;
+        }
+        self.count_typed(Some(2));
+        Some(self.map.get(trader).and_then(|u| u.cum_volume))
+    }
+}
+
+impl Users {
+    /// Phase 4 step 4 (tests): count one typed load (`Some(kind)`: answered
+    /// from a record; `None`: declined).
+    #[inline]
+    fn count_typed(&self, _kind: Option<usize>) {
+        #[cfg(test)]
+        {
+            let c = match _kind {
+                Some(k) => &self.typed.0[k],
+                None => &self.typed.1,
+            };
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Phase 4 step 4 (tests): typed loads answered per kind (position,
+    /// balance, volume) and declined, so far.
+    #[cfg(test)]
+    pub(crate) fn typed_counts(&self) -> ([usize; 3], usize) {
+        let load = |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::Relaxed);
+        (self.typed.0.each_ref().map(load), load(&self.typed.1))
     }
 }
 

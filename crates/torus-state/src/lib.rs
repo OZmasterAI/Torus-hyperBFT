@@ -28,7 +28,7 @@ pub mod trie_cursor;
 
 pub use backend::{
     AtomicWriteOp, FrozenPending, HashExtras, NativeFlushStats, NativeStateOverlay,
-    OutOfBatchRecorder, StateBackend,
+    OutOfBatchRecorder, OwnPendingRow, StateBackend,
 };
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, EncodeRows, PackedCfBatch, RawCfKv};
 pub use checkpoint_layer::{CheckpointLayer, DeferredLayer, LayerPart, DEFERRED_CFS};

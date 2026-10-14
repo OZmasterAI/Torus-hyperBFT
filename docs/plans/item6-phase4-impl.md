@@ -282,6 +282,26 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
   on `StateBackend` (default: none).
 - Verify: `cargo nextest run -p torus-core $F`, `cargo check --workspace --tests -q`, then
   `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
+- **Built (s120, branch `feat/item6-phase4-step4`, on step 3).** `StateBackend::own_pending_row(cf, key)` ->
+  `OwnPendingRow::{Unknown, Pending(Option<bytes>), Resident}` (torus-state; default `Unknown`; the overlay answers
+  only with R attached for the CF: own pending write / tombstone, else `Resident`). torus-core: trait `TypedRows`
+  (position / balance / `cum_volume` of a trader, `None` = decline), implemented by `Users` in torus-bridge (an
+  opaque trader declines; no record = `Some(None)`), so the dependency direction holds (row 12).
+  `PositionManager::{get_position, get_native_balance, get_cum_volume}_typed(typed, ..)`: own pending bytes decoded
+  as before, else the record when `Resident`, else (`Unknown`, no source, a decline) `get_cf_raw`; same errors.
+  `PositionCache::load_typed`, `apply_fill_cached_effect_typed` (the private `update_in_place` takes the source);
+  the untyped `load` / `apply_fill_cached_effect` remain as `None` wrappers. torus-bridge passes the block's
+  record set (`BlockSums.records`; `NativeExecContext::typed_rows`, `AccountReader::typed`) to `BalanceCache::load`,
+  the sequential and parallel settle (`apply_fill_via_caches`, `compute_market_settle_plan`), the `cum_volume`
+  reads (`take_open_slot`, `add_cum_volume`), and `d2_pools` / `sell_top_ups`. The check is per key (own pending
+  row), finer than `AccountReader`'s per-trader dirty check. Tests: `own_pending_row_matches_get_cf_raw`
+  (torus-state), `typed_rows_tests.rs` (torus-core, fake backend and source: routing and errors),
+  `typed_loads_equal_overlay_reads` (torus-bridge: 4 seeds x 24 blocks x 3 calls, engine forced / sequential /
+  parallel settle, own pending tombstones, an opaque trader; `Users` test counters).
+  Deviations from the text above: also `SenderState::load_balance` (Phase 2's per-sender balance load, which is
+  `BalanceCache::load` by another name), `d2_pools` and `sell_top_ups` (their `BalanceCache::load` calls) and the
+  single-action path's `add_cum_volume` / `take_open_slot`. Not changed: `AccountReader::maker_free`'s balance read
+  and the single-action path's `get_native_balance` / `apply_fill` (not named by the plan).
 
 ### Step 5: open-order count (decision 2 b)
 

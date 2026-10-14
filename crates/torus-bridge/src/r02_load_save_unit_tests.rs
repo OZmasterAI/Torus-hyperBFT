@@ -194,6 +194,7 @@ fn pools(fault: bool) -> (Pools, Option<String>) {
     let mut cache = BalanceCache::new();
     let out = NativeExecutor::d2_pools(
         &ctx.positions,
+        None,
         &ctx.reader_fault,
         &takers,
         &excess,
