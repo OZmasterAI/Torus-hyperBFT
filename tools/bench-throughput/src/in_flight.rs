@@ -226,6 +226,8 @@ impl Tracker {
         }
     }
 
+    /// Per-sender in-flight count (test-only: the runtime reads `open`).
+    #[cfg(test)]
     pub fn in_flight(&self, sender: usize) -> usize {
         self.senders[sender].in_flight
     }
