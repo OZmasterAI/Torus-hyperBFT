@@ -376,8 +376,11 @@ roll back one at a time; no data migration.
    soak.
    **Decided:**
 9. **Scope by the Gate 3 gap (after Gate 3).** Pick the row of section 1's scope table.
-   Recommendation: TBD (Gate 3).
-   **Decided:**
+   Gate 3 (section 65): `d3cba5e2` / `199bdc97` = 1.931x [1.877, 1.985] oracle off, 1.835x as shipped, so the
+   >= 1.36 row applies: Phase 5 is not needed for the gate.
+   **Decided (owner s119): build Phase 5 for the gain, not the gate** (~+10-25% matched/s **(estimate)**, the typed
+   base for option D). Step 0 sizes what is built: only the items it measures as worth it. Block-time p99 (section
+   66) is worked on in parallel by archy and is not a Phase 5 gate beyond "no regression".
 
 ## 8. Risks
 
