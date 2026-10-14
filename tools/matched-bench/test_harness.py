@@ -328,7 +328,9 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail=commit\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail=commit\n")
+            )
         s, _ = run_summarize(
             self.d, extra=["--max-in-flight", "1", "--in-flight-tail", "commit"]
         )
@@ -370,13 +372,26 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED + (
-                "Cancel-by-id (load-gen): cancel sent 900 accepted 880 | modify sent 450 "
-                "accepted 440 | lookups 700 errors 3 | no own order 25\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED
+                + (
+                    "Cancel-by-id (load-gen): cancel sent 900 accepted 880 | modify sent 450 "
+                    "accepted 440 | lookups 700 errors 3 | no own order 25\n"
+                )
+            )
         s, _ = run_summarize(self.d)
-        self.assertEqual(s["ingest"]["cancel_by_id"], {
-            "cancel_sent": 900, "cancel_accepted": 880, "modify_sent": 450,
-            "modify_accepted": 440, "lookups": 700, "lookup_errors": 3, "no_own_order": 25})
+        self.assertEqual(
+            s["ingest"]["cancel_by_id"],
+            {
+                "cancel_sent": 900,
+                "cancel_accepted": 880,
+                "modify_sent": 450,
+                "modify_accepted": 440,
+                "lookups": 700,
+                "lookup_errors": 3,
+                "no_own_order": 25,
+            },
+        )
         write_cell(self.d, 1_000, 1_000)
         s, _ = run_summarize(self.d)
         self.assertIsNone(s["ingest"]["cancel_by_id"])
@@ -385,11 +400,16 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED + (
-                "Cloids (load-gen generated): 4521 of 9040 orders (50.0%) | --cloid-share 50%\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED
+                + (
+                    "Cloids (load-gen generated): 4521 of 9040 orders (50.0%) | --cloid-share 50%\n"
+                )
+            )
         s, _ = run_summarize(self.d)
-        self.assertEqual(s["ingest"]["cloids"], {
-            "share_pct": 50, "stamped": 4521, "placed": 9040})
+        self.assertEqual(
+            s["ingest"]["cloids"], {"share_pct": 50, "stamped": 4521, "placed": 9040}
+        )
         # A bench before --cloid-share prints no line: None, not 0%.
         write_cell(self.d, 1_000, 1_000)
         s, _ = run_summarize(self.d)
@@ -973,7 +993,9 @@ class CrashKillGuardTest(unittest.TestCase):
         for mode in ("head", "commit"):
             r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=mode)
             self.assertEqual(
-                (r.returncode, r.stdout.strip()), (0, f"--in-flight-tail {mode}"), r.stderr
+                (r.returncode, r.stdout.strip()),
+                (0, f"--in-flight-tail {mode}"),
+                r.stderr,
             )
         for bad in ("x", "applied", "1"):
             r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=bad)
@@ -1071,22 +1093,35 @@ class CrashKillGuardTest(unittest.TestCase):
         for v in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION"):
             self.assertIn(f"{v}=${{{v}:-}}", src)
             self.assertIn(f"'${{{v}:-unset}}'", src)
-        lines = [l for l in src.splitlines()
-                 if ("CANCEL_BY_ID_FRACTION" in l or "MODIFY_FRACTION" in l)
-                 and not l.lstrip().startswith(("#", "log "))]
+        lines = [
+            l
+            for l in src.splitlines()
+            if ("CANCEL_BY_ID_FRACTION" in l or "MODIFY_FRACTION" in l)
+            and not l.lstrip().startswith(("#", "log "))
+        ]
         snippet = "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
 
         def run(**env):
-            base = {k: v for k, v in os.environ.items()
-                    if k not in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION")}
-            return subprocess.run(["bash", "-c", snippet], capture_output=True,
-                                  text=True, env=dict(base, **env))
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION")
+            }
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
 
         r = run()
         self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
         r = run(CANCEL_BY_ID_FRACTION="0.1", MODIFY_FRACTION="0.05")
-        self.assertEqual(r.stdout.strip(),
-                         "--cancel-by-id-fraction 0.1 --modify-fraction 0.05", r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "--cancel-by-id-fraction 0.1 --modify-fraction 0.05",
+            r.stderr,
+        )
         for bad in ({"CANCEL_BY_ID_FRACTION": "2"}, {"MODIFY_FRACTION": "x"}):
             r = run(**bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
@@ -2183,7 +2218,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
         doc = self.src.index("#   ORACLE_FEED_DRAIN=1")
         self.assertLess(self.src.index("#   ORACLE_FEED=1"), doc)
         self.assertLess(doc, self.src.index("set -uo pipefail"))
-        self.assertIn("ORACLE_FEED_DRAIN_MAX_LAG=${ORACLE_FEED_DRAIN_MAX_LAG:-2}", self.src)
+        self.assertIn(
+            "ORACLE_FEED_DRAIN_MAX_LAG=${ORACLE_FEED_DRAIN_MAX_LAG:-2}", self.src
+        )
         self.assertLess(doc, self.src.index("#   ORACLE_FEED_DRAIN_MAX_LAG=N"))
         with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
             allow = f.read()
@@ -2215,13 +2252,17 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 ),
                 (
                     dict(
-                        ORACLE_FEED="1", ORACLE_FEED_DRAIN="1", ORACLE_FEED_DRAIN_MAX_LAG="x"
+                        ORACLE_FEED="1",
+                        ORACLE_FEED_DRAIN="1",
+                        ORACLE_FEED_DRAIN_MAX_LAG="x",
                     ),
                     "ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer",
                 ),
                 (
                     dict(
-                        ORACLE_FEED="1", ORACLE_FEED_DRAIN="1", ORACLE_FEED_DRAIN_MAX_LAG="-1"
+                        ORACLE_FEED="1",
+                        ORACLE_FEED_DRAIN="1",
+                        ORACLE_FEED_DRAIN_MAX_LAG="-1",
                     ),
                     "ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer",
                 ),
@@ -2334,7 +2375,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
         out_dir, out = self._run_drain_flow("1", "100")
         py = [l for l in out.splitlines() if l.startswith("PY ")]
         self.assertEqual(len(py), 2, out)
-        self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 100"), py[0])
+        self.assertTrue(
+            py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 100"), py[0]
+        )
         self.assertNotIn("--max-lag", py[1])
         self.assertIn("exec lag <= 100", out)
 
@@ -2347,7 +2390,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertTrue(
             py[0].startswith("PY S /tools/health.py drain --out %s " % out_dir), py[0]
         )
-        self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 2"), py[0])
+        self.assertTrue(
+            py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 2"), py[0]
+        )
         # paused right after it, then a legacy quiet settle before the digest
         self.assertTrue(
             py[1].startswith(
@@ -2430,7 +2475,6 @@ class OracleFeedHarnessTest(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
-
 LIQUIDATOR_VAULT = "0x746f7275732d6c697175696461746f722d766c74"
 
 
@@ -2450,7 +2494,10 @@ def sandbox_repo(tmp):
     os.makedirs(wsl)
     shutil.copy2(RUN_CELL_SH, tools)
     shutil.copy2(os.path.join(REPO, "devnet", "wsl", "bench-validator-keys.json"), wsl)
-    for p in (os.path.join(tools, "digest-node.sh"), os.path.join(wsl, "launch-3val.sh")):
+    for p in (
+        os.path.join(tools, "digest-node.sh"),
+        os.path.join(wsl, "launch-3val.sh"),
+    ):
         with open(p, "w") as f:
             f.write("#!/bin/sh\nexit 0\n")
         os.chmod(p, 0o755)
@@ -2489,7 +2536,9 @@ class StaleArtifactGuardTest(unittest.TestCase):
         self.real_full = _stat(WEIGHTED_FULL)
         self.tmp = tempfile.mkdtemp(prefix="stale-guard-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        fake_target(self.tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>")
+        fake_target(
+            self.tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>"
+        )
         self.script, self.wt = sandbox_repo(self.tmp)
         self.called = os.path.join(self.tmp, "generator-called")
         gen = os.path.join(self.wt, "devnet", "wsl", "gen-3val-genesis.sh")
@@ -2507,28 +2556,56 @@ class StaleArtifactGuardTest(unittest.TestCase):
         os.chmod(os.path.join(self.bin, "pgrep"), 0o755)
 
     def tearDown(self):
-        self.assertEqual(_stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched")
+        self.assertEqual(
+            _stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched"
+        )
 
     def write_full(self, rows):
-        base = [{"address": "0x%040x" % i, "available": "1.0", "note": "bench sender %d" % i}
-                for i in range(3)]
+        base = [
+            {
+                "address": "0x%040x" % i,
+                "available": "1.0",
+                "note": "bench sender %d" % i,
+            }
+            for i in range(3)
+        ]
         with open(self.full, "w") as f:
             json.dump({"native_balances": base + rows, "accounts": []}, f)
 
     @staticmethod
     def bulk(n):
-        return [{"address": "0x%040x" % (60 + i), "available": "100000000.0",
-                 "note": "bulk-test %d" % (60 + i)} for i in range(n)]
+        return [
+            {
+                "address": "0x%040x" % (60 + i),
+                "available": "100000000.0",
+                "note": "bulk-test %d" % (60 + i),
+            }
+            for i in range(n)
+        ]
 
     def run_cell(self, **env):
-        e = {k: v for k, v in os.environ.items()
-             if not k.startswith(("LIQ_", "ORACLE_", "EXPECT_")) and k not in ("FORCE", "SENDERS")}
-        e.update(PATH=self.bin + os.pathsep + os.environ["PATH"], TARGET_DIR=self.tmp,
-                 RESULTS_ROOT=os.path.join(self.tmp, "results"),
-                 DATA_ROOT=os.path.join(self.tmp, "data"), BENCH_ALLOW_UNDETACHED="1",
-                 SENDERS="5", **env)
-        r = subprocess.run([self.script, self.wt, "guard-x"], capture_output=True,
-                           text=True, timeout=60, env=e)
+        e = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("LIQ_", "ORACLE_", "EXPECT_"))
+            and k not in ("FORCE", "SENDERS")
+        }
+        e.update(
+            PATH=self.bin + os.pathsep + os.environ["PATH"],
+            TARGET_DIR=self.tmp,
+            RESULTS_ROOT=os.path.join(self.tmp, "results"),
+            DATA_ROOT=os.path.join(self.tmp, "data"),
+            BENCH_ALLOW_UNDETACHED="1",
+            SENDERS="5",
+            **env,
+        )
+        r = subprocess.run(
+            [self.script, self.wt, "guard-x"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=e,
+        )
         try:
             with open(os.path.join(self.tmp, "results", "guard-x", "run.log")) as f:
                 log = f.read()
@@ -2538,8 +2615,15 @@ class StaleArtifactGuardTest(unittest.TestCase):
 
     def test_stale_weighted_full_genesis_fails_before_the_generator(self):
         # the s17 file: the stub bench's help line became one "bulk" row
-        self.write_full([{"address": "oracle-feed", "available": "100000000.0",
-                          "note": "bulk-test Usage:"}])
+        self.write_full(
+            [
+                {
+                    "address": "oracle-feed",
+                    "available": "100000000.0",
+                    "note": "bulk-test Usage:",
+                }
+            ]
+        )
         r, log = self.run_cell()
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("FATAL", log)
@@ -2585,7 +2669,10 @@ class StaleArtifactGuardTest(unittest.TestCase):
 
     def test_expected_md5_mismatch_refuses_and_prints_both(self):
         self.write_full(self.bulk(5))
-        for var, name in (("EXPECT_BENCH_MD5", "bench-throughput"), ("EXPECT_NODE_MD5", "torus-node")):
+        for var, name in (
+            ("EXPECT_BENCH_MD5", "bench-throughput"),
+            ("EXPECT_NODE_MD5", "torus-node"),
+        ):
             with self.subTest(var=var):
                 r, log = self.run_cell(OVERWRITE="1", **{var: "0123abcd"})
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
@@ -2594,12 +2681,16 @@ class StaleArtifactGuardTest(unittest.TestCase):
                 self.assertIn(name, fatal[0])
                 self.assertIn(self.md5(name), fatal[0])
                 self.assertIn("0123abcd", fatal[0])
-                self.assertFalse(os.path.exists(self.called), "must stop before the genesis")
+                self.assertFalse(
+                    os.path.exists(self.called), "must stop before the genesis"
+                )
 
     def test_expected_md5_match_proceeds(self):
         self.write_full(self.bulk(5))
-        r, log = self.run_cell(EXPECT_BENCH_MD5=self.md5("bench-throughput")[:8],
-                               EXPECT_NODE_MD5=self.md5("torus-node"))
+        r, log = self.run_cell(
+            EXPECT_BENCH_MD5=self.md5("bench-throughput")[:8],
+            EXPECT_NODE_MD5=self.md5("torus-node"),
+        )
         self.assertTrue(os.path.exists(self.called), r.stdout + r.stderr + log)
         self.assertIn("bench-throughput md5=%s" % self.md5("bench-throughput"), log)
         self.assertIn("expected %s" % self.md5("bench-throughput")[:8], log)
@@ -2950,6 +3041,130 @@ class LiqStressHarnessTest(unittest.TestCase):
             " torus_liquidation_adl_queue torus_liquidation_adl_queue_deficit",
             r.stderr,
         )
+
+    # Codex P2: the summarizer of an older worktree (TOOLS_FROM_WORKTREE=1, e.g.
+    # main 46bb3a40 or the Phase 4 build) rejects --liq-thin/--liq-thin-avail as
+    # unrecognized, so passing them unconditionally lost every summary.
+    OLD_SUMMARIZER = (
+        "import argparse\nap = argparse.ArgumentParser()\n"
+        "for a in ['out', 'label', 'in-flight-tail']:\n"
+        "    ap.add_argument('--' + a, default='')\nap.parse_args()\n"
+    )
+
+    def _liq_args(self, tools_dir, **env):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        i = self.src.index("summarizer_has_liq_opts() {")
+        j = self.src.index("SUMMARIZE_LIQ_ARGS=()", i)
+        block = self.src[i : self.src.index("\nfi\n", j) + 4]
+        script = (
+            "TOOLS_DIR=%s\nTOOLS_FROM_WORKTREE=1\n" % tools_dir
+            + on
+            + block
+            + 'printf "<%s>\\n" "${SUMMARIZE_LIQ_ARGS[@]}"\n'
+        )
+        return self._run(script, **env)
+
+    def test_summarizer_liq_options_only_when_enabled_and_supported(self):
+        tmp = tempfile.mkdtemp(prefix="liq-sumopt-")
+        try:
+            old = os.path.join(tmp, "old")
+            broken = os.path.join(tmp, "broken")
+            for d, body in (
+                (old, self.OLD_SUMMARIZER),
+                (broken, "import sys\nsys.exit(1)\n"),
+            ):
+                os.makedirs(d)
+                with open(os.path.join(d, "summarize.py"), "w") as f:
+                    f.write(body)
+            off = dict(LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="0")
+            thin = dict(LIQ_THIN="5", LIQ_THIN_AVAIL="2.5", ORACLE_SHOCK_BP="0")
+            shock = dict(
+                LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="400"
+            )
+            # Off: nothing passed, whatever the summarizer (exactly as on main).
+            for d in (HERE, old, broken):
+                r = self._liq_args(d, **off)
+                self.assertEqual((r.returncode, r.stdout), (0, "<>\n"), (d, r.stderr))
+            # On + a summarizer that knows the options: both passed.
+            r = self._liq_args(HERE, **thin)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(
+                r.stdout.split(), ["<--liq-thin>", "<5>", "<--liq-thin-avail>", "<2.5>"]
+            )
+            r = self._liq_args(HERE, **shock)
+            self.assertEqual(
+                r.stdout.split(),
+                ["<--liq-thin>", "<0>", "<--liq-thin-avail>", "<1000000.0>"],
+                r.stderr,
+            )
+            # On + an older (or broken) summarizer: FATAL, rc 1, names the fix.
+            for d in (old, broken):
+                for env in (thin, shock):
+                    r = self._liq_args(d, **env)
+                    self.assertEqual(r.returncode, 1, (d, env, r.stdout, r.stderr))
+                    self.assertIn("FATAL", r.stderr)
+                    self.assertIn(os.path.join(d, "summarize.py"), r.stderr)
+                    self.assertIn("--liq-thin", r.stderr)
+                    self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_summarizer_liq_options_checked_in_preflight(self):
+        # Before the results dir exists and before anything is launched.
+        at = self.src.index("SUMMARIZE_LIQ_ARGS=()")
+        self.assertLess(self.src.index("liq_stress_on() {"), at)
+        self.assertLess(at, self.src.index('mkdir -p "$OUT"'))
+        # The summarizer call passes them only through the gated array.
+        call = self.fn(
+            'python3 "$TOOLS_DIR/summarize.py" \\', '| tee -a "$OUT/run.log"'
+        )
+        self.assertNotIn("--liq-thin", call)
+        self.assertIn('"${SUMMARIZE_LIQ_ARGS[@]}"', call)
+
+    def test_stress_cell_with_an_older_worktree_summarizer_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="liq-oldsum-")
+        try:
+            fake_target(
+                tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>"
+            )
+            script, wt = sandbox_repo(tmp)
+            # The sandbox worktree IS the repo: its summarize.py is the one that
+            # TOOLS_FROM_WORKTREE=1 selects.
+            with open(
+                os.path.join(wt, "tools", "matched-bench", "summarize.py"), "w"
+            ) as f:
+                f.write(self.OLD_SUMMARIZER)
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith(("LIQ_", "ORACLE_", "TOOLS_"))
+            }
+            for env in (
+                dict(LIQ_THIN="5", SENDERS="5"),
+                dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="30"),
+            ):
+                r = subprocess.run(
+                    [script, wt, "liq-oldsum-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        base,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
+                    ),
+                )
+                self.assertEqual(r.returncode, 1, (env, r.stdout, r.stderr))
+                self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr, env)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "liq-oldsum-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
 
     def test_summary_records_liq_thin(self):
         d = tempfile.mkdtemp(prefix="liq-sum-")

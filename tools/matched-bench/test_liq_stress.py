@@ -47,7 +47,7 @@ PENDING = {s: 40 - 4 * (s - 21) for s in range(21, 30)}
 
 
 def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pending_tail=None,
-                      drop=(), adl=False, adl_tail=None):
+                      drop=(), adl=False, adl_tail=None, pending_late=None, adl_late=None):
 
     """60 s at 10 blk/s. Shock at T0+20; liquidations +5/s on T0+21..T0+30
     (last increase at height 300, shock at height 200 -> 100 blocks). Post
@@ -56,7 +56,8 @@ def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pen
     before, 4 ms/block in the window except 8 ms/block in second 22; per
     window second 3 stage-1, 1 backstop, 1 ADL, 20 scanned, 5 acted; pending
     from PENDING (pending_tail: the value from s=30 on, default 0); deferred
-    12 in seconds 21..22."""
+    12 in seconds 21..22. pending_late / adl_late = (s0, v): the gauge is v
+    from second s0 on (work that comes back after a transient zero)."""
     cols = COLS if liq_col else [c for c in COLS if "liquid" not in c]
     if not tel_col:
         cols = [c for c in cols if c not in TEL]
@@ -79,6 +80,11 @@ def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pen
             pend = PENDING.get(s, 0)
             if s >= 30 and pending_tail is not None:
                 pend = pending_tail
+            if pending_late is not None and s >= pending_late[0]:
+                pend = pending_late[1]
+            adl_q = ADL.get(s, adl_tail if s >= 25 and adl_tail is not None else 0)
+            if adl_late is not None and s >= adl_late[0]:
+                adl_q = adl_late[1]
             row = {
                 "torus_block_height": 10 * s,
                 "torus_exec_queue_depth": 7 if s == 25 else (3 if in_window else 1),
@@ -98,7 +104,7 @@ def write_stress_cell(d, liq_col=True, shock=True, vault=True, tel_col=True, pen
                 "torus_liquidation_acted_total": 5 * k,
                 "torus_liquidation_pending": pend,
                 "torus_liquidation_deferred": 12 if s in (21, 22) else 0,
-                ADL_Q: ADL.get(s, adl_tail if s >= 25 and adl_tail is not None else 0),
+                ADL_Q: adl_q,
                 ADL_QD: 5 * ADL.get(s, 0),
                 "scrape_valid": 1,
             }
@@ -261,6 +267,39 @@ class LiqStressTest(unittest.TestCase):
         self.assertEqual(r["pending"]["last"], {"ts": T0 + 60, "height": 600, "pending": 3})
         self.assertIn("pending never returned to 0", " ".join(r["missing"]))
 
+    def test_pending_back_above_zero_at_the_end_is_reported(self):
+        # Codex P2: 40 -> 0 (s=30) -> 3 from s=45 to the last sample. The first
+        # return to 0 is still reported, but the work left at the end is flagged.
+        write_stress_cell(self.d, pending_late=(45, 3))
+        r = analyze(self.d)
+        self.assertEqual(r["pending"]["zero"], {"ts": T0 + 30, "height": 300})
+        self.assertEqual(r["blocks_shock_to_pending_zero"], 90)
+        self.assertEqual(r["pending"]["last"], {"ts": T0 + 60, "height": 600, "pending": 3})
+        joined = " ".join(r["missing"])
+        self.assertIn("pending is 3 at the last sample", joined)
+        self.assertIn("after first returning to 0", joined)
+        self.assertIn("the drain ended with liquidation work left", joined)
+        self.assertNotIn("pending never returned to 0", joined)
+
+    def test_pending_zero_at_the_end_after_a_relapse_is_not_flagged(self):
+        write_stress_cell(self.d, pending_late=(45, 3), pending_tail=None)
+        with open(os.path.join(self.d, "sampler.csv")) as f:
+            lines = f.read().splitlines()
+        # s=50.. back to 0: work came back but drained before the end
+        hdr = lines[0].split(",")
+        k = hdr.index("torus_liquidation_pending")
+        out = [lines[0]]
+        for ln in lines[1:]:
+            c = ln.split(",")
+            if int(c[0]) >= T0 + 50:
+                c[k] = "0"
+            out.append(",".join(c))
+        with open(os.path.join(self.d, "sampler.csv"), "w") as f:
+            f.write("\n".join(out) + "\n")
+        r = analyze(self.d)
+        self.assertEqual(r["pending"]["zero"], {"ts": T0 + 30, "height": 300})
+        self.assertNotIn("liquidation work left", " ".join(r["missing"]))
+
     def test_default_cell_reports_absence_not_zeros(self):
         write_stress_cell(self.d, liq_col=False, shock=False, vault=False)
         r = analyze(self.d)
@@ -365,6 +404,20 @@ class LiqStressTest(unittest.TestCase):
         self.assertIsNone(r["adl_queue"]["zero"])
         self.assertIsNone(r["adl_queue"]["drain_blocks"])
         self.assertIn("adl_queue never returned to 0", " ".join(r["missing"]))
+
+    def test_adl_queue_back_above_zero_at_the_end_is_reported(self):
+        # Codex P2: 6 -> 0 (s=25) -> 2 from s=45 to the last sample.
+        write_stress_cell(self.d, adl=True, adl_late=(45, 2))
+        r = analyze(self.d)
+        q = r["adl_queue"]
+        self.assertEqual(q["zero"], {"ts": T0 + 25, "height": 250})
+        self.assertEqual(q["drain_blocks"], 30)
+        self.assertEqual(q["last"], {"ts": T0 + 60, "height": 600, "value": 2})
+        joined = " ".join(r["missing"])
+        self.assertIn("adl_queue is 2 at the last sample", joined)
+        self.assertIn("after first returning to 0", joined)
+        self.assertIn("the ADL queue was not drained", joined)
+        self.assertNotIn("adl_queue never returned to 0", joined)
 
     def test_adl_queue_absent_is_skipped_silently(self):
         write_stress_cell(self.d)
