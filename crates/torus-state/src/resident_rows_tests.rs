@@ -617,3 +617,336 @@ fn frozen_resident_delta_equals_the_delta_before_freeze() {
     }
     assert!(nonempty > 100, "{nonempty}");
 }
+
+// ======================================================================
+// Item 6 Phase 4 step 2 (plan Task 2.1): R's first two CFs from a
+// byte-level source (`Users` in torus-bridge), the other three raw.
+// ======================================================================
+
+use super::{ResidentRowIter, ResidentSource};
+use crate::checkpoint_layer::{CheckpointLayer, DeferredLayer};
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A source for R's positions (slot 0) and balances (slot 1) that hands out
+/// owned rows built per read, as `Users` does; counts its reads.
+#[derive(Debug, Default)]
+struct TestSource {
+    cfs: [BTreeMap<Vec<u8>, Vec<u8>>; 2],
+    reads: AtomicUsize,
+}
+
+impl TestSource {
+    /// The rows of R's first two CFs as `rows` (raw R) holds them.
+    fn of(rows: &ResidentRows) -> Self {
+        Self {
+            cfs: [
+                rows.rows(CF_NATIVE_POSITIONS).expect("raw R").clone(),
+                rows.rows(CF_NATIVE_BALANCES).expect("raw R").clone(),
+            ],
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// Every row of both CFs as `backend` sees them.
+    fn from_backend<B: StateBackend>(backend: &B) -> Self {
+        Self {
+            cfs: [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
+                .map(|cf| backend.iterate_cf(cf, None).unwrap().into_iter().collect()),
+            reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ResidentSource for TestSource {
+    fn get(&self, slot: usize, key: &[u8]) -> Option<Vec<u8>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.cfs[slot].get(key).cloned()
+    }
+
+    fn range<'a>(&'a self, slot: usize, start: &[u8], prefix: &[u8]) -> ResidentRowIter<'a> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let prefix = prefix.to_vec();
+        Box::new(
+            self.cfs[slot]
+                .range::<[u8], _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
+                .take_while(move |(k, _)| k.starts_with(&prefix))
+                .map(|(k, v)| (Cow::Owned(k.clone()), Cow::Owned(v.clone()))),
+        )
+    }
+}
+
+/// Every read of `cf` the overlay offers (the step 2 set: point, length,
+/// full and prefix scans, seeks with and without a prefix bound, prefix
+/// checks, and the own-pending introspection R enables), over `keys` and
+/// `prefixes`, as one comparable dump.
+fn full_read_dump(ov: &NativeStateOverlay, cf: &str, keys: &BTreeSet<Vec<u8>>, prefixes: &BTreeSet<Vec<u8>>) -> Vec<String> {
+    let mut out = read_dump(ov, cf, keys, prefixes);
+    for k in keys.iter().chain(prefixes.iter()) {
+        out.push(format!("len {k:?} {:?}", ov.get_cf_len(cf, k).unwrap()));
+    }
+    for p in prefixes {
+        out.push(format!("touches {p:?} {}", ov.layer_touches(cf, p)));
+        out.push(format!("changes {p:?} {:?}", ov.resident_changes(cf, p)));
+        let starts = [p.clone(), [p.as_slice(), &[0x00]].concat(), [p.as_slice(), &[0xff]].concat(), p[..p.len().saturating_sub(1)].to_vec()];
+        for s in starts.iter().chain(keys.iter()) {
+            for limit in [1usize, 3, usize::MAX] {
+                out.push(format!("pfrom {p:?} {s:?} {limit} {:?}", ov.iterate_cf_prefix_from(cf, p, s, limit).unwrap()));
+            }
+        }
+    }
+    out.push(format!("keys {:?}", ov.layer_keys(cf)));
+    out
+}
+
+/// Plan Task 2.1: for every layering (own pending, parent, L, C, DB) and
+/// random keys, an overlay whose positions and balances come from a source
+/// answers `get_cf_raw`, `get_cf_len`, `iterate_cf`, `iterate_cf_from`,
+/// `iterate_cf_prefix_from`, `prefix_exists`, `layer_touches`, `layer_keys`
+/// and `resident_changes` exactly as the same rows held raw in R; the other
+/// R CFs (raw in both) and a non-R CF too.
+#[test]
+fn resident_source_reads_match_raw_rows() {
+    let mut seed: u64 = 0x5EED_0402;
+    let mut rnd = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    const ALPHABET: [u8; 4] = [0x00, 0x01, 0xfe, 0xff];
+    let cfs: Vec<&str> = RESIDENT_CFS.iter().copied().chain([CF_NATIVE_ORDERS]).collect();
+    let (mut compared, mut source_reads, mut layered) = (0usize, 0usize, 0usize);
+    for round in 0..32 {
+        let (db, _d) = temp_db();
+        let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for _ in 0..4 + rnd(12) {
+            let len = 1 + rnd(4) as usize;
+            keys.insert((0..len).map(|_| ALPHABET[rnd(4) as usize]).collect());
+        }
+        // Per (cf, key): in DB, in R, parent / L / C / pending op (0 none, 1 put, 2 delete).
+        let ops: Vec<(&str, Vec<u8>, bool, bool, [u64; 4])> = cfs
+            .iter()
+            .flat_map(|cf| keys.iter().map(move |k| (*cf, k.clone())))
+            .map(|(cf, k)| (cf, k, rnd(2) == 1, rnd(2) == 1, [rnd(3), rnd(3), rnd(3), rnd(3)]))
+            .collect();
+        let mut raw = ResidentRows::default();
+        let seed_delta = NativeStateOverlay::new(db.clone());
+        for (cf, k, in_db, in_r, _) in &ops {
+            if *in_db {
+                db.put_cf_raw(cf, k, &[b"db".as_slice(), k].concat()).unwrap();
+            }
+            if RESIDENT_CFS.contains(cf) && *in_r {
+                seed_delta.put_cf_raw(cf, k, &[b"r".as_slice(), k].concat()).unwrap();
+            }
+        }
+        raw.apply(&seed_delta.own_pending_delta());
+        seed_delta.discard_tx();
+        let layer_of = |layer: usize, height: u64| {
+            let ov = NativeStateOverlay::new(db.clone());
+            for (cf, k, _, _, op) in &ops {
+                match op[layer] {
+                    1 => ov.put_cf_raw(cf, k, &[&[layer as u8], k.as_slice()].concat()).unwrap(),
+                    2 => ov.delete_cf_raw(cf, k).unwrap(),
+                    _ => {}
+                }
+            }
+            ov.freeze(height)
+        };
+        let parent = (round % 4 != 0).then(|| layer_of(0, 9));
+        let ckpt = |layer: usize, height: u64| {
+            (round % 3 != 0).then(|| {
+                let mut l = CheckpointLayer::new();
+                l.merge(&layer_of(layer, height));
+                Arc::new(l)
+            })
+        };
+        let (l, c) = (ckpt(1, 8), ckpt(2, 7));
+        layered += usize::from(parent.is_some() && l.is_some());
+        let source = Arc::new(TestSource::of(&raw));
+        let mut from_source = raw.clone();
+        from_source.set_source(source.clone());
+        assert!(from_source.has_source() && !raw.has_source());
+        assert!(from_source.rows(CF_NATIVE_POSITIONS).is_none(), "the source replaces the raw map");
+        let overlay = |r: ResidentRows| {
+            let mut ov = NativeStateOverlay::with_layers(db.clone(), parent.clone(), l.clone(), c.clone());
+            ov.attach_resident(Arc::new(r));
+            for (cf, k, _, _, op) in &ops {
+                match op[3] {
+                    1 => ov.put_cf_raw(cf, k, &[b"own".as_slice(), k].concat()).unwrap(),
+                    2 => ov.delete_cf_raw(cf, k).unwrap(),
+                    _ => {}
+                }
+            }
+            ov
+        };
+        let (a, b) = (overlay(raw), overlay(from_source));
+        let mut prefixes: BTreeSet<Vec<u8>> = BTreeSet::new();
+        prefixes.insert(Vec::new());
+        for k in &keys {
+            for n in 1..=k.len() {
+                prefixes.insert(k[..n].to_vec());
+            }
+            prefixes.insert([k.as_slice(), &[0xff]].concat());
+        }
+        for cf in cfs.iter().copied() {
+            let (x, y) = (full_read_dump(&a, cf, &keys, &prefixes), full_read_dump(&b, cf, &keys, &prefixes));
+            assert_eq!(x.len(), y.len());
+            for (x, y) in x.iter().zip(y.iter()) {
+                assert_eq!(x, y, "round {round} {cf}: raw R vs source");
+            }
+            compared += x.len();
+        }
+        source_reads += source.reads.load(Ordering::Relaxed);
+    }
+    assert!(compared > 20_000, "non-vacuous: {compared}");
+    assert!(source_reads > 5_000, "the source served the reads: {source_reads}");
+    assert!(layered > 10, "parent and L both present: {layered}");
+}
+
+/// Plan rows 9 / 12 (merge wait): with R's source attached, no read of the
+/// positions or balances CF goes past R, so none reaches L's deferred part:
+/// with that part lost (its merge died: a read reaching it errors) every
+/// read method answers, and with the part still being merged no read
+/// blocks. Without the source (taken off) the same reads reach L
+/// (non-vacuous: they error / block).
+#[test]
+fn resident_source_reads_never_reach_the_deferred_part() {
+    use std::time::Duration;
+    let (db, _dir) = temp_db();
+    for t in 1..=4u8 {
+        db.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(t, 1), &[b'p', t]).unwrap();
+        db.put_cf_raw(CF_NATIVE_BALANCES, &[t; 20], &[b'b', t]).unwrap();
+        db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[t; 3], b"liq").unwrap();
+    }
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(CF_NATIVE_POSITIONS, &pos_key(5, 1), b"parent").unwrap();
+    let parent = parent.freeze(4);
+    let built = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+    let source: Arc<dyn ResidentSource> = Arc::new(TestSource::from_backend(&built));
+    let r = ResidentRows::build_with_source(&built, source).unwrap();
+    let reads = |ov: &NativeStateOverlay| -> Result<usize, crate::error::StateError> {
+        let mut n = 0;
+        for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+            for t in 0..=6u8 {
+                n += usize::from(ov.get_cf_raw(cf, &pos_key(t, 1))?.is_some());
+                n += usize::from(ov.get_cf_raw(cf, &[t; 20])?.is_some());
+                n += usize::from(ov.get_cf_len(cf, &[t; 20])?.is_some());
+                n += ov.iterate_cf(cf, Some(&[t; 20]))?.len();
+                n += usize::from(ov.prefix_exists(cf, &[t; 20])?);
+                n += ov.iterate_cf_prefix_from(cf, &[t; 20], &pos_key(t, 0), 4)?.len();
+            }
+            n += ov.iterate_cf(cf, None)?.len();
+            n += ov.iterate_cf_from(cf, &[], 100)?.len();
+        }
+        Ok(n)
+    };
+    let split = |deferred: Arc<DeferredLayer>, r: Option<ResidentRows>| {
+        let mut main = CheckpointLayer::new();
+        let part = main.split_deferred();
+        drop(part);
+        let mut ov = NativeStateOverlay::with_split_layers(db.clone(), Some(parent.clone()), Some(Arc::new(main)), Some(deferred), None);
+        if let Some(r) = r {
+            ov.attach_resident(Arc::new(r));
+        }
+        ov
+    };
+    // Lost part: a read reaching it is an error.
+    let lost = || {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CheckpointLayer>(1);
+        drop(tx);
+        Arc::new(DeferredLayer::pending(rx))
+    };
+    let with_source = split(lost(), Some(r.clone()));
+    assert!(reads(&with_source).unwrap() > 20, "every read answered from R");
+    let mut detached = r.clone();
+    assert!(detached.take_source().is_some());
+    assert!(!detached.has_source());
+    assert!(detached.dump(CF_NATIVE_POSITIONS).is_none(), "no source: R does not hold the CF");
+    assert!(reads(&split(lost(), Some(detached))).is_err(), "without the source the reads reach L");
+    assert!(reads(&split(lost(), None)).is_err(), "no R: the reads reach L");
+    // Part still being merged: no read blocks, none counted.
+    let (_tx, rx) = std::sync::mpsc::sync_channel::<CheckpointLayer>(1);
+    let deferred = Arc::new(DeferredLayer::pending(rx));
+    let ov = split(deferred.clone(), Some(r.clone()));
+    let (done_tx, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(reads(&ov).map_err(|e| e.to_string()));
+    });
+    assert!(done.recv_timeout(Duration::from_secs(10)).expect("no read waits for the deferred part").unwrap() > 20);
+    assert_eq!(deferred.take_read_waits().0, 0, "no read blocked");
+    assert!(!deferred.is_settled());
+}
+
+/// Plan Task 2.1: `build_with_source` holds the liquidation, oracle and
+/// market rows raw (== `iterate_cf`) and the source for positions and
+/// balances (no raw map; `dump` reads the source); `len` / `bytes` count
+/// the raw rows only; `apply` leaves the source's CFs to the source's owner;
+/// taking the source off leaves those CFs to the layers below (the overlay
+/// then reads them like an overlay without R); setting it again restores
+/// R. A source R and a raw R with the same rows are equal.
+#[test]
+fn build_with_source_holds_three_cfs_raw_and_the_source() {
+    let (db, _dir) = temp_db();
+    for cf in RESIDENT_CFS {
+        for k in odd_keys().iter().chain([pos_key(1, 1), pos_key(2, 3), vec![2u8; 20]].iter()) {
+            db.put_cf_raw(cf, k, &[cf.as_bytes(), k].concat()).unwrap();
+        }
+    }
+    let parent = NativeStateOverlay::new(db.clone());
+    for cf in RESIDENT_CFS {
+        parent.put_cf_raw(cf, &[0x04; 3], b"parent-new").unwrap();
+        parent.delete_cf_raw(cf, &pos_key(1, 1)).unwrap();
+    }
+    let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    let source = Arc::new(TestSource::from_backend(&overlay));
+    let mut r = ResidentRows::build_with_source(&overlay, source.clone()).unwrap();
+    assert!(r.has_source());
+    let mut raw_total = (0, 0);
+    for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
+        let want = overlay.iterate_cf(cf, None).unwrap();
+        assert!(!want.is_empty(), "{cf}: non-vacuous");
+        assert_eq!(r.dump(cf).unwrap(), want, "{cf}: dump");
+        if slot < 2 {
+            assert!(r.rows(cf).is_none(), "{cf}: not held raw");
+        } else {
+            assert_eq!(rows_of(&r, cf), want, "{cf}: raw");
+            raw_total.0 += want.len();
+            raw_total.1 += want.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        }
+    }
+    assert_eq!((r.len(), r.bytes()), raw_total, "len / bytes: the raw rows only");
+    assert_eq!(r, ResidentRows::build(&overlay).unwrap(), "source R == raw R over the same rows");
+    // A delta over every R CF: the raw CFs take it, the source CFs do not.
+    let block = NativeStateOverlay::new(db.clone());
+    for cf in RESIDENT_CFS {
+        block.put_cf_raw(cf, &[0x05; 4], b"block").unwrap();
+        block.delete_cf_raw(cf, &vec![2u8; 20]).unwrap();
+    }
+    r.apply(&block.own_pending_delta());
+    for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
+        let dump = r.dump(cf).unwrap();
+        let written = dump.iter().any(|(k, _)| k == &[0x05; 4]);
+        assert_eq!(written, slot >= 2, "{cf}: applied iff raw");
+        if slot < 2 {
+            assert_eq!(dump, overlay.iterate_cf(cf, None).unwrap(), "{cf}: the source's rows, untouched");
+        }
+    }
+    // Taken off: the overlay reads the two CFs below R (here: the DB).
+    let taken = r.take_source().expect("attached");
+    assert!(Arc::ptr_eq(&taken, &(source.clone() as Arc<dyn ResidentSource>)));
+    assert!(r.take_source().is_none());
+    let mut ov = NativeStateOverlay::new(db.clone());
+    ov.attach_resident(Arc::new(r.clone()));
+    for cf in RESIDENT_CFS {
+        let below = StateBackend::iterate_cf(&db, cf, None).unwrap();
+        let read = ov.iterate_cf(cf, None).unwrap();
+        assert_eq!(read == below, resident_slot_is_source(cf), "{cf}: below R iff a source CF");
+    }
+    assert!(ov.layer_keys(CF_NATIVE_POSITIONS).is_none(), "not resident without the source");
+    assert!(ov.layer_keys(CF_NATIVE_LIQUIDATION).is_some());
+    r.set_source(taken);
+    assert_eq!(r.dump(CF_NATIVE_BALANCES).unwrap(), overlay.iterate_cf(CF_NATIVE_BALANCES, None).unwrap());
+}
+
+fn resident_slot_is_source(cf: &str) -> bool {
+    cf == CF_NATIVE_POSITIONS || cf == CF_NATIVE_BALANCES
+}

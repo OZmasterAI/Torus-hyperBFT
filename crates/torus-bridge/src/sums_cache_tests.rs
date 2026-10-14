@@ -116,7 +116,7 @@ fn check_slot_sums(holder: &ResidentBooks, tag: &str) -> usize {
     use borsh::BorshDeserialize;
     let Some(slot) = holder.rows.as_ref() else { return 0 };
     let Some(t) = slot.marks.as_ref().filter(|t| t.marks.version == slot.sums.version) else { return 0 };
-    let rows = slot.rows.rows(CF_NATIVE_POSITIONS).unwrap();
+    let rows: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = slot.rows.dump(CF_NATIVE_POSITIONS).unwrap().into_iter().collect();
     for (trader, cached) in &slot.sums.map {
         let ps: Vec<Position> = rows
             .range(trader.to_vec()..)
@@ -1017,7 +1017,7 @@ fn slot_guards(worker: bool) {
     let check = |holder: &mut ResidentBooks, h: u64, builds: u64, what: &str| {
         assert_eq!(holder.rows_builds(), builds, "{what}: builds after {h}");
         assert_eq!(holder.trader_positions_match_rows(), Some(true), "{what}: records == cold decode of R after {h}");
-        let rows = holder.rows().unwrap().rows(CF_NATIVE_POSITIONS).unwrap().clone();
+        let rows: std::collections::BTreeMap<_, _> = holder.rows().unwrap().dump(CF_NATIVE_POSITIONS).unwrap().into_iter().collect();
         let db_rows: std::collections::BTreeMap<_, _> =
             StateBackend::iterate_cf(&db, CF_NATIVE_POSITIONS, None).unwrap().into_iter().collect();
         assert_eq!(rows, db_rows, "{what}: R == DB after {h}");

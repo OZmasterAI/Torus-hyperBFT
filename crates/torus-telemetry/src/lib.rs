@@ -3540,6 +3540,8 @@ mod tests {
             "torus_exec_resident_rebuilds",
             "torus_exec_resident_rows",
             "torus_exec_resident_rows_bytes",
+            "torus_exec_resident_users",
+            "torus_exec_resident_users_bytes",
             "torus_exec_resident_rows_rebuilds",
             "torus_exec_resident_rows_build_seconds",
             "torus_exec_end_resident_seconds",

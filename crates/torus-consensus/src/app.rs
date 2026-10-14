@@ -21770,7 +21770,7 @@ mod crash_recovery_tests {
         holder.rows().map(|r| {
             torus_state::resident_rows::RESIDENT_CFS
                 .iter()
-                .map(|cf| (*cf, r.rows(cf).unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+                .map(|cf| (*cf, r.dump(cf).unwrap()))
                 .collect()
         })
     }
@@ -24594,6 +24594,10 @@ mod crash_recovery_tests {
         /// s118: blocks after which the resident holder carried a built
         /// cloid index (checked equal to a rebuild from its books).
         cloid_checked: u64,
+        /// Item 6 Phase 4 step 2: blocks after which everything was durable
+        /// (the DB at the block) and the holder's R (positions and balances
+        /// read through `Users`) was checked equal to the DB scan of its CFs.
+        r_db_checked: u64,
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -24753,7 +24757,25 @@ mod crash_recovery_tests {
         fault: &P2Fault,
         ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
     ) -> P2Run {
+        p2_run_seeded(blocks, pipelined, mode, reference, fault, ckpt, &|_| {}, false)
+    }
+
+    /// [`p2_run_with`] on a `p2_fixture` DB that `seed` wrote to first, and
+    /// with `no_r`: every context without R (`test_no_resident_rows`, the
+    /// reads of R's CFs go to the layers and the DB).
+    #[allow(clippy::too_many_arguments)]
+    fn p2_run_seeded(
+        blocks: &[TorusBlock],
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        reference: bool,
+        fault: &P2Fault,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        seed: &dyn Fn(&StateDb),
+        no_r: bool,
+    ) -> P2Run {
         let (config, db) = p2_fixture();
+        seed(&db);
         torus_state::running_hash::capture_begin(&db);
         let metrics = Arc::new(torus_telemetry::Metrics::new());
         let what = format!("pipelined={pipelined} {mode:?} reference={reference} {fault:?}");
@@ -24767,6 +24789,7 @@ mod crash_recovery_tests {
                 Some(mode.unwrap_or(torus_bridge::native_executor::BookMode::Classic));
             ctx.test_no_resident = mode.is_none();
             ctx.test_reference_paths = reference;
+            ctx.test_no_resident_rows = no_r;
             ctx.metrics = Some(metrics.clone());
             ctx.checkpoint = ckpt;
             if pipelined && attach {
@@ -24781,6 +24804,7 @@ mod crash_recovery_tests {
         let mut roots: Vec<(u64, torus_types::B256)> = Vec::new();
         let mut crash_windows: Vec<(u64, u64)> = Vec::new();
         let mut cloid_checked = 0;
+        let mut r_db_checked = 0;
         let mut ctx = new_ctx(true);
         let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
             (0, 0, 0, 0, 0);
@@ -24942,6 +24966,13 @@ mod crash_recovery_tests {
                 }
                 let durable = read_native_applied_height(&db).unwrap_or(0);
                 max_lag = max_lag.max(h - durable);
+                // Phase 4 step 2: everything durable -> R (positions and
+                // balances through `Users`) == the DB scan.
+                let r_at_h = ctx.resident_books.lock().unwrap().rows_height() == Some(h);
+                if durable == h && r_at_h {
+                    assert_resident_rows_track_db(&ctx, &db, h, &what);
+                    r_db_checked += 1;
+                }
                 if durable > 0 && roots.last().is_none_or(|(s, _)| *s != durable) {
                     roots.push((
                         durable,
@@ -25019,6 +25050,7 @@ mod crash_recovery_tests {
             roots,
             crash_windows,
             cloid_checked,
+            r_db_checked,
         }
     }
 
@@ -25537,6 +25569,101 @@ mod crash_recovery_tests {
         assert_eq!(per_block.hash, run.hash, "running hash");
         assert_dumps_equal(&per_block.dump, &run.dump, "gated vs per-block");
         assert_eq!(run.metrics.exec_checkpoint_layer_shared.get(), 0);
+    }
+
+    /// Item 6 Phase 4 step 2: rows the node itself never writes, which
+    /// `Users` keeps raw: a trader whose long position row decodes leniently
+    /// (`is_long` byte 2: opaque, read raw through R) facing a regular short
+    /// (both with a balance, OI symmetric, written through `apply_fill`), a
+    /// positions key and a balances key under no trader, and a balance-only
+    /// trader whose address starts with `cvlm`.
+    fn p2_seed_irregular(db: &StateDb) {
+        use torus_core::position::{position_key, MarginType, NativeBalance, PositionManager};
+        let pm = PositionManager::new(db.clone());
+        let (odd, even) = (Address::repeat_byte(0xA7), Address::repeat_byte(0xA8));
+        for (t, long) in [(odd, true), (even, false)] {
+            pm.put_native_balance(&t, &NativeBalance { available: px(1_000), order_margin: FixedPoint::ZERO })
+                .unwrap();
+            pm.apply_fill(&t, 1, long, px(1), px(100), MarginType::Cross).unwrap();
+        }
+        let key = position_key(&odd, 1);
+        let mut row = db.get_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, &key).unwrap().expect("odd's position");
+        assert_eq!(row[1 + 20 + 8], 1, "is_long byte");
+        row[1 + 20 + 8] = 2;
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, &key, &row).unwrap();
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, b"short", b"under-no-trader").unwrap();
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_BALANCES, b"odd-balances-key", b"under-no-trader").unwrap();
+        let mut c = [0x11u8; 20];
+        c[..4].copy_from_slice(b"cvlm");
+        pm.put_native_balance(&Address::new(c), &NativeBalance { available: px(5), order_margin: FixedPoint::ZERO })
+            .unwrap();
+    }
+
+    /// Item 6 Phase 4 step 2 (plan Task 2.2, rows 9 / 12): with positions
+    /// and balances read from `Users` (irregular rows included, kept raw), no
+    /// read of the two CFs goes past R: over the 130 P2 blocks at interval
+    /// "never", every layer merge's deferred half held until E's next upkeep,
+    /// no read blocked on it and E never waited mid-block. The write sets
+    /// (every `h_n`), running hash and CF dump equal the per-block run with R
+    /// and the runs without R (serial and pipelined, today's DB path).
+    #[test]
+    fn users_reads_never_reach_the_deferred_part() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let seed: &dyn Fn(&StateDb) = &p2_seed_irregular;
+        let gate = Arc::new(DeferredGate::default());
+        let gated = p2_run_seeded(
+            &blocks,
+            true,
+            mode,
+            false,
+            &P2Fault::DeferredGate(gate.clone()),
+            Some(ckpt_never()),
+            seed,
+            false,
+        );
+        let stats = gate.stats();
+        assert_eq!(stats.timeouts, 0, "E waited for a held deferred merge: {stats:?}");
+        assert!(stats.held >= 100, "merges held until upkeep: {stats:?}");
+        assert_eq!(gated.metrics.exec_checkpoint_deferred_read_waits.get(), 0, "no read blocked on the deferred part");
+        assert!(gated.max_lag >= 40, "max lag {}", gated.max_lag);
+        assert!(gated.r_db_checked >= 2, "R (through Users) == DB at the durable heights: {}", gated.r_db_checked);
+        let per_block = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, None, seed, false);
+        assert!(per_block.r_db_checked >= 100, "{}", per_block.r_db_checked);
+        let off = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, Some(ckpt_never()), seed, true);
+        let serial_off = p2_run_seeded(&blocks, false, mode, false, &P2Fault::None, None, seed, true);
+        assert_eq!(off.r_db_checked + serial_off.r_db_checked, 0, "no R");
+        for (what, run) in [("per-block", &per_block), ("never without R", &off), ("serial without R", &serial_off)] {
+            assert_write_sets_equal(&run.captured, &gated.captured, &format!("gated vs {what}"));
+            assert_eq!(run.hash, gated.hash, "gated vs {what}: running hash");
+            assert_dumps_equal(&run.dump, &gated.dump, &format!("gated vs {what}"));
+        }
+        // The seeded rows were state (and the lenient row is still raw or was rewritten by a block).
+        let has = |cf: &str, k: &[u8]| gated.dump.iter().any(|(c, rows)| *c == cf && rows.iter().any(|(key, _)| key == k));
+        assert!(has(torus_state::cf::CF_NATIVE_POSITIONS, b"short") && has(torus_state::cf::CF_NATIVE_BALANCES, b"odd-balances-key"));
+    }
+
+    /// Item 6 Phase 4 step 2 (plan Task 2.2): after every block whose
+    /// writes are all durable, the holder's R — positions and balances read
+    /// through `Users` — equals the DB scan of R's CFs (and `Users` equals a
+    /// cold build of its own rows), at interval 0 (serial and pipelined),
+    /// every 5 blocks (15 s-like) and never by time; the runs land the same
+    /// state as the serial one.
+    #[test]
+    fn resident_rows_equal_db_after_every_flush_every_interval() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p2_blocks(false);
+        let mode = Some(BookMode::Classic);
+        let serial = p2_run(&blocks, false, mode, false, &P2Fault::None);
+        assert!(serial.r_db_checked >= 100, "serial: {}", serial.r_db_checked);
+        for (name, policy, min) in [("per-block", None, 100), ("every 5", Some(ckpt_every(5)), 15), ("never", Some(ckpt_never()), 2)] {
+            let run = p2_run_with(&blocks, true, mode, false, &P2Fault::None, policy);
+            assert!(run.r_db_checked >= min, "{name}: R == DB checked after {} blocks", run.r_db_checked);
+            assert_write_sets_equal(&serial.captured, &run.captured, &format!("{name} vs serial"));
+            assert_eq!(serial.hash, run.hash, "{name} vs serial: running hash");
+            assert_dumps_equal(&serial.dump, &run.dump, &format!("{name} vs serial"));
+        }
     }
 
     // ---- Item 6 Phase 3 task 1.7: crash and replay at interval > 0 ----

@@ -37,7 +37,7 @@ fn seed(db: &StateDb) {
 fn dump_rows(rows: &ResidentRows) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
     RESIDENT_CFS
         .iter()
-        .map(|cf| rows.rows(cf).unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .map(|cf| rows.dump(cf).unwrap())
         .collect()
 }
 
@@ -270,6 +270,20 @@ fn metrics_count_rebuilds_and_size() {
     assert_eq!(metrics.exec_resident_rows_rebuilds.get(), 1);
     assert_eq!(metrics.exec_resident_rows.get(), rows.len() as i64);
     assert_eq!(metrics.exec_resident_rows_bytes.get(), rows.bytes() as i64);
+    // Phase 4 step 2: R's raw rows are the liquidation, oracle and market
+    // rows; positions and balances are counted by the users gauges (both
+    // together: R's five CFs, the gauges' meaning before step 2).
+    let db_total = |cfs: &[&str]| -> (i64, i64) {
+        cfs.iter()
+            .flat_map(|cf| StateBackend::iterate_cf(&db, cf, None).unwrap())
+            .fold((0, 0), |(n, b), (k, v)| (n + 1, b + (k.len() + v.len()) as i64))
+    };
+    assert_eq!((rows.len() as i64, rows.bytes() as i64), db_total(&RESIDENT_CFS[2..]), "R: raw rows only");
+    assert_eq!(
+        (metrics.exec_resident_users.get(), metrics.exec_resident_users_bytes.get()),
+        db_total(&RESIDENT_CFS[..2]),
+        "users gauges"
+    );
     let text = metrics.encode();
     assert!(text.contains("torus_exec_resident_rows_build_seconds_count 1"), "{text}");
     // Item 6 step 1: end_resident and its two main parts, once per block.
