@@ -3700,6 +3700,25 @@ mod tests {
         }
     }
 
+    /// Item 6 Phase 4 step 5: the open-order count's exec-thread time per
+    /// native block and the book log entries the counter absorbed.
+    #[test]
+    fn open_count_metrics_are_exported() {
+        let m = Metrics::new();
+        m.exec_open_count_seconds.observe(0.002);
+        m.exec_open_count_deltas.inc_by(7);
+        let text = m.encode();
+        for (name, want) in [
+            ("torus_exec_open_count_seconds_count", 1),
+            ("torus_exec_open_count_deltas_total", 7),
+        ] {
+            assert!(
+                text.contains(&format!("{name} {want}\n")),
+                "{name}:\n{text}"
+            );
+        }
+    }
+
     /// L3 level-hash sponge cache stats (perf/l3-cache-stats): the aggregated
     /// hit/miss/seed/entries gauges must be registered so the cache's node-local
     /// effectiveness is scrapeable when `TORUS_LEVEL_HASH_CACHE` is on. Gauges

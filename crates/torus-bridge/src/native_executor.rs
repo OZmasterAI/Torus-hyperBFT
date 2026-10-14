@@ -4355,6 +4355,10 @@ mod sums_cache_tests;
 mod typed_loads_tests;
 
 #[cfg(test)]
+#[path = "open_count_tests.rs"]
+mod open_count_tests;
+
+#[cfg(test)]
 #[path = "end_resident_worker_tests.rs"]
 mod end_resident_worker_tests;
 

@@ -45,6 +45,10 @@ mod cloid_tests;
 #[cfg(test)]
 mod cloid_key_tests;
 
+// Item 6 Phase 4 step 5: the open-order log.
+#[cfg(test)]
+mod open_log_tests;
+
 /// Open orders (resting + pending stops) of each sender in `senders` (value =
 /// its index in the result), summed over `books`. The walk costs, per book,
 /// min(its traders, senders) probes plus its stops; it runs on scoped
