@@ -9777,6 +9777,223 @@ tail / release-timing line (tail height and releases per second) so the round tr
 * Outputs: `ozarchy-p4soak10-run/analyst/`.
 * Raw perf data: `perf-{a,b}.data` in the k1 cell dirs, 187-316 MB each.
 
+## 71. What stalls consensus in the checkpoint write windows: 300-market 600 s cells on Phase 4 `2a245321`, 1 Hz RocksDB / host series, val1 off-CPU, and a raised dirty-page limit (campaign ozarchy-p4j3, 2026-10-15)
+
+**The block-time p99 in the checkpoint windows comes from RocksDB's write queue, not from page-cache writeback.** During
+a window, the flush worker writes a ~200 MB checkpoint batch into the shared state DB (val1 DB write 0.57-0.62 s mean).
+Every other writer to that DB queues behind it in `rocksdb::WriteThread::AwaitState`:
+* the HotStuff algorithm thread's block-tree writes (`RocksKVStore::write` from `on_receive_*` / `vote_if_body`): up to
+  476 ms per wait;
+* mempool admission's DA mirror (`NativeDaStore::put_batch` from `mirror_to_da`), on gossip (verify pool) and on RPC
+  submit: up to 615 ms per wait.
+
+In val1's off-CPU profile, writeback throttling (`balance_dirty_pages`), fsync and io_wait are 0 or near 0 in every
+thread. In the phase 1 cells, host Dirty never goes above 75 MB, below the point where the 256 MB limit starts to
+throttle writers. A cell at 2 GB / 512 MB dirty limits (d1) stays inside the baseline noise on block-time p99 and
+matched/s. **H2 (18c's lead) is supported; H1 (writeback throttling) is ruled out at this setup.**
+
+Question (18c, follow-up to section 66): which call stalls consensus in the checkpoint windows? Two hypotheses:
+* **H1:** shared-host writeback throttling (the batch is about the size of the 256 MB `vm.dirty_bytes`).
+* **H2:** mempool admission's DA write and / or the HotStuff store wait behind the checkpoint batch in the shared state
+  RocksDB (`WriteThread::AwaitState` / `JoinBatchGroup`).
+
+Setup:
+* Node: Phase 4 `2a245321`, node md5 `3a303574` (`exe_md5=3a303574` on all 3 pids in every cell).
+* Bench: `9b725823` (`ff822b95`: release timing, tail depth, summarize release-timing parsing).
+* Workload: 300 markets, Classic, oracle on, 15 s checkpoint default, jemalloc, commit tail, in-flight tail depth 1
+  (CHECK OK in every cell), MAX_IN_FLIGHT 4, budget 900, genesis md5 `b83180e1` (= p4gate 300 m).
+* RocksDB stats: `TORUS_ROCKSDB_STATS=2` (db.write histogram, write_other / write_self, stall tickers) and
+  `TORUS_ROCKSDB_STATS_INTERVAL_SECS=1`.
+* Sidecars: 1 Hz soak-sampler on all 3 nodes (`/metrics`, RSS, `/proc/meminfo` Dirty / Writeback) and `vmstat 1`.
+
+Phases:
+* **Phase 1** (`vm.dirty_bytes` 256 MB / `dirty_background_bytes` 64 MB): w0 (60 s warm-up), b1, p1, b2 (600 s).
+  * p1 adds val1 off-CPU: `perf record -e context-switches -c 1 -g --switch-events` for 45 s from bench +240 s.
+  * `sched:sched_switch` was unreadable as user, so the event is context-switches, with no prev_state.
+  * The window holds 5 val1 checkpoint windows: 8.2 s in, 36.9 s out; stack coverage 100%.
+* **Phase 2** (2 GB / 512 MB, checked at cell start and end): wd (60 s warm-up), d1 (600 s).
+
+**Validity:** 6/6 cells rc 0, ACCEPT AGREE, md5_ok yes, 0 CELL-FLAG, rerun pass empty. 84 + 42 CHECK OK, 0 CHECK FAIL.
+The only "fail-stop" match in the node logs is the INFO line `state hash fail-stop ... on=false`.
+
+### 71.1 Cells (`[rates]` and `CHECK LAG` lines in `ozarchy-p4j3-run/p{1,2}/campaign.log`; block time = commit-interval p99, mean of 3 nodes, `analyst/out/acells.json`)
+
+| cell (run order) | dirty limit | matched/s | native blk/s | block time p99 ms (val0 / val1 / val2) | tail lag committed-applied p50 / p99 (heights) | commit -> seen p50 / p99 ms | CPU-s/1M |
+|---|---|---|---|---|---|---|---|
+| w0 (60 s) | 256 M | 223,724 | 5.29 | 1,121 (1,256 / 1,102 / 1,007) | 16 / 59 | 4,478 / 6,771 | 22.37 |
+| b1 | 256 M | 229,819 | 3.237 | 1,434 (1,507 / 1,392 / 1,403) | 1 / 51 | 388 / 6,685 | 23.43 |
+| p1 (perf 45 s) | 256 M | 225,927 | 3.134 | 1,339 (1,462 / 1,191 / 1,364) | 1 / 51 | 342 / 6,729 | 23.64 |
+| b2 | 256 M | 227,374 | 3.144 | 1,294 (1,451 / 1,169 / 1,261) | 1 / 49 | 322 / 7,007 | 23.60 |
+| wd (60 s) | 2 G | 222,403 | 4.603 | 1,187 (1,046 / 1,304 / 1,212) | 12 / 54 | 4,054 / 5,969 | 22.64 |
+| d1 | 2 G | 229,435 | 3.171 | 1,279 (1,426 / 1,182 / 1,230) | 1 / 51 | 348 / 7,365 | 23.50 |
+
+There is no drift in run order: matched/s goes 229.8k, 225.9k, 227.4k, then 229.4k. **The baseline (b1, p1, b2, n = 3)
+has matched/s mean 227,707, sd 1,967, and block time p99 mean 1,356 ms, sd 72.**
+* d1's matched/s (229,435) is inside the range (+0.8%, 0.9 sd).
+* d1's block time p99 (1,279) is 15 ms below the lowest baseline cell (-1.1 sd). **Not resolved**: with n = 1 against 3,
+  a step this size cannot be told from noise.
+* These b-cells match job 1's 300-market B soak k1-b (section 67.1: 225,824 matched/s, 3.16 blk/s, block time p99
+  1,340 ms).
+
+Tail lag at depth 1 (`taillag.py`, `CHECK LAG`):
+* In the 600 s cells the tail is 1 height behind at p50 and 49-51 at p99. The first release window starts 520-608
+  heights behind (`tail_fetch_max`), and commit -> seen p99 is 6.7-7.4 s.
+* **The 60 s depth smokes:**
+  * Depth 1 (`smoke-ff8-d1`): lag p50 19 / p99 57, commit -> seen p50 4,968 / p99 6,373 ms, 4.778 blk/s, 223,383
+    matched/s.
+  * Depth 4 (`smoke-ff8-d4`): lag 1 / 6, commit -> seen 257 / 859 ms, but 2.571 blk/s and 211,823 matched/s.
+* Depth 4 keeps the tail current, but it changes the closed loop at 300 markets (fewer, larger blocks; -5.2% matched/s,
+  n = 1 at 60 s). The campaign kept depth 1 so the cells compare with job 1. **The depth must be chosen per market
+  count; the 300-market and 10-market loops are not the same.**
+
+### 71.2 Per second, aligned with checkpoint windows (`analyst/j3.py`)
+
+Method:
+* A window is a node's `torus_flush_worker_checkpoint_seconds` step, widened by the 1 s scrape period.
+* A second is "in" when it overlaps any node's window, since the quorum is 3/3.
+* RocksDB and admission values are fleet sums of 1 Hz deltas.
+* The first 20 s of each cell are skipped.
+
+| metric | b1 | p1 | b2 | d1 |
+|---|---|---|---|---|
+| analysed s in / out | 233 / 350 | 199 / 383 | 221 / 361 | 240 / 342 |
+| val1 checkpoint flush s mean / max | 0.822 / 1.389 | 0.874 / 1.569 | 0.815 / 1.574 | 0.716 / 1.255 |
+| val1 checkpoint DB write s mean | 0.572 | 0.616 | 0.568 | 0.514 |
+| val1 batch MB mean / max | 194.9 / 269.1 | 200.3 / 268.7 | 197.0 / 266.8 | 195.1 / 269.0 |
+| val0 commit p99 ms in / out | 1,971 / 1,164 | 1,767 / 1,281 | 1,740 / 1,203 | 1,526 / 1,147 |
+| val0 intervals > 1 s in / out | 69 / 43 | 48 / 66 | 63 / 62 | 80 / 50 |
+| val0 tails (> out-p99) per 100 s in / out | 27.9 / 10.9 | 16.6 / 10.2 | 23.1 / 8.9 | 28.8 / 9.7 |
+| mean DB write us in / out | 17,299 / 1,372 | 18,667 / 1,461 | 16,665 / 1,452 | 16,649 / 1,256 |
+| write_other per s in / out | 1.18 / 0.08 | 1.32 / 0.09 | 1.44 / 0.06 | 1.12 / 0.07 |
+| stall micros, write_stall count, write_stopped s | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 |
+| slow (> 0.512 s) admit per 100 s in / out | 33.5 / 0 | 43.7 / 0 | 34.4 / 0 | 31.3 / 0 |
+| slow submit_verify per 100 s in / out | 32.2 / 8.9 | 28.6 / 0.3 | 39.8 / 1.1 | 45.0 / 0 |
+| host Dirty MB mean / max (in) | 45 / 65 | 42 / 65 | 42 / 75 | 261 / 507 |
+| host Writeback MB max in / out | 56.2 / 12.9 | 12.0 / 57.2 | 5.8 / 8.1 | 17.5 / 6.6 |
+| vmstat wa mean in / out | 0.18 / 0.04 | 0.17 / 0.10 | 0.18 / 0.06 | 0.10 / 0.06 |
+
+**Yes, DB write time and the block-time tail land in the checkpoint seconds.**
+* The mean DB write is 12-13x longer in the windows (16.6-18.7 ms vs 1.26-1.46 ms).
+* Writes that join another writer's group (write_other) are 13-24x more frequent.
+* Every slow admission (> 0.512 s) falls in a window: 31-44 per 100 s in, 0 out.
+* The val0 commit p99 is 460-810 ms higher in the windows (2-3x the tail rate).
+
+Superposed epoch (val1 window end second = 0, 46-48 windows per cell):
+* The mean DB write peaks at 0 (33-59 ms) and +1 (14-28 ms).
+* The per-second commit-interval max peaks at -1 (1,032-1,272 ms, against about 800-900 at other offsets).
+
+Not in the windows:
+* No RocksDB stall of any kind: stall micros, write_stall and write_stopped are 0 in every cell.
+* No writeback pressure: in phase 1, Dirty peaks at 65-75 MB, near the 64 MB background threshold and below the
+  ~160 MB at which `balance_dirty_pages` starts to throttle with a 256 MB limit; vmstat wa is <= 0.18%.
+* Outside the windows, val0's p99 is still 1.15-1.28 s (8.9-10.9 tails per 100 s). That residual floor is not
+  checkpoint-related.
+
+### 71.3 Off-CPU, val1, p1 (`offcpu-sched.txt`, plus a WriteThread caller pass over the same `perf-sched.data`, `analyst/out/offcpu-wt-callers.txt`)
+
+Share of each thread group's off-CPU time, in vs out of val1's windows (`offcpu-sched.py` classes):
+
+| group | rocksdb WriteThread in / out | writeback throttle | fsync | io_wait in / out | dominant otherwise |
+|---|---|---|---|---|---|
+| hotstuff-algo (consensus) | **22.8% (1.99 s in 8.2 s of window; 6 waits > 100 ms)** / 0.2% (0.07 s in 36.9 s) | 0 | 0 | 0 / 0.1% | channel wait (proposal / vote recv) |
+| verify (gossip admission pool) | **4.4% (40 waits > 100 ms)** / 0.1% (4) | 0 | 0 | 0 | rayon idle |
+| rpc-worker (tokio blocking / RPC) | 0.5% (10 waits > 100 ms) / 0.0% | 0 | 0 | 0 | blocking-pool idle |
+| torus-execution, exec-pool | 0.0% | 0 | 0 | 0 | rayon idle |
+| flush-worker (checkpoint writer) | 0.0% | 0 | 0 | 2.3% / 0 | job channel wait; the batch write itself runs on CPU |
+| rocksdb-bg | 0.0% | 0 | 0.1% / 1.7% | 0 | pool condvar (12.5 s/s in vs 1.3 out: flush / compaction threads wake for the batch) |
+
+WriteThread waits by caller (the deep user stack). The first three rows are DA mirror writes (`StateDb::write` <-
+`NativeDaStore::put_batch` <- `Mempool::mirror_to_da`):
+
+| caller | group | s in windows (n, > 100 ms, max) | s out (n, max) |
+|---|---|---|---|
+| DA mirror, from `add_native_action_from_gossip` | verify | **12.49 (86, 40, 615 ms)** | 1.15 (79, 138 ms) |
+| DA mirror, from `add_native_action_presigned` (RPC submit) | rpc-worker | **3.23 (17, 10, 493 ms)** | 0.08 (12, 38 ms) |
+| `RocksKVStore::write` <- `BlockTreeSingleton` <- `HotStuff::on_receive_*` / `vote_if_body` | hotstuff-algo | **1.99 (25, 6 > 100 ms, 476 ms)** | 0.07 (all < 7 ms) |
+
+* In the 45 s profile, the 20 longest WriteThread waits are all inside windows: 309-615 ms, 12 of them within
+  0.25 s around one window (t = 1792016720.49-720.74).
+* `RocksKVStore` is the consensus column family on the same `Arc<DB>` that `StateDb` opens (`kv_store.rs`). The HotStuff
+  writes and the DA writes share one write queue with the checkpoint batch.
+* The waits (up to 0.48-0.62 s) are the size of val1's checkpoint DB write (0.57-0.62 s mean).
+* `torus_vote_state_write_seconds` is not the stall: val0 b1 has 2,888 writes, 1.22 s in total, 1 over 164 ms.
+
+**Sizing.** The HotStuff thread waits ~0.4 s per val1 window (1.99 s over 5 windows, longest 476 ms). With 3/3
+quorum and all three nodes checkpointing within about a second (section 66), each window holds the chain for about one
+such wait. That is about half to most of the 460-810 ms in-window p99 step, and about the +130-470 ms excess in the epoch
+commit max at offset -1. The rest is not attributed: val0 / val2 were not profiled, and the admission waits slow the
+supply of actions. Top stacks inside the windows otherwise: rpc-worker blocking-pool idle (643 s), rayon idle (exec 338,
+exec-pool 267, verify 243), rocksdb-bg condvar (102). All of these are idle threads, not stalls.
+
+### 71.4 Dirty limit 2 G / 512 M (d1) vs the baseline (b1, p1, b2)
+
+| metric | baseline range (n = 3) | d1 (n = 1) | reading |
+|---|---|---|---|
+| block time p99, 3-node mean ms | 1,294-1,434 (mean 1,356, sd 72) | 1,279 | 15 ms below the range, -1.1 sd: **not resolved** |
+| val0 in-window commit p99 ms | 1,740-1,971 | 1,526 | lower, but more > 1 s intervals in windows (80 vs 48-69) and tails per 100 s 28.8 vs 16.6-27.9: mixed |
+| val1 checkpoint DB write s / flush s | 0.568-0.616 / 0.815-0.874 | 0.514 / 0.716 | about 10-12% shorter; val0 and val2 agree (flush 0.737 / 0.748 vs 0.786-0.886) |
+| Dirty mean / max MB (in windows) | 42-45 / 65-75 | 261 / 507 | Dirty rises as expected; never near 2 GB |
+| Writeback max MB (in windows) | 5.8-56.2 | 17.5 | inside |
+| slow admits per 100 s (in windows) | 33.5-43.7 | 31.3 | at the bottom edge |
+| matched/s | 225,927-229,819 | 229,435 | inside |
+
+A 4x higher dirty limit does not remove or measurably shrink the window tail. The slightly shorter checkpoint writes on
+d1 fit the writer itself doing less synchronous page-cache work, but that is one cell. It does not move block-time p99
+outside the noise.
+
+### 71.5 Verdict
+
+1. **H2, consensus and admission writers queue behind the checkpoint batch in the shared RocksDB write queue: supported,
+   confidence medium-high.**
+   * Direct off-CPU stacks: HotStuff `RocksKVStore::write` and mempool `mirror_to_da` in `WriteThread::AwaitState`,
+     only inside the windows.
+   * Mean DB write and write_other rise 12-24x in the windows; slow admissions occur only in the windows.
+   * Wait lengths match the checkpoint DB write duration.
+   * Limits: one profiled node (val1), 5 windows, one cell.
+2. **H1, writeback throttling: ruled out at this setup, confidence high.** 0 s in `balance_dirty_pages` in every thread;
+   Dirty <= 75 MB at the 256 MB limit; d1 at 2 GB is inside the noise.
+3. **RocksDB stalls, fsync, IO wait: ruled out** (counters 0; off-CPU 0-2.3%, only rocksdb-bg / flush-worker).
+4. **Not explained:** the out-of-window p99 floor (1.15-1.28 s on val0) and the share of the in-window step beyond the
+   HotStuff wait on val1.
+
+Next, for the owner (not run):
+* **Take the checkpoint batch out of the shared write queue**, in either of two ways:
+  * write it in slices (several smaller `WriteBatch`es, so queued writers get in between);
+  * or give consensus meta and the DA store their own RocksDB instance (or write path), so a 200 MB batch does not
+    block them.
+* A prototype A/B (300 m, 600 s, n >= 3 per arm, about 15 min per cell) would show whether in-window p99 falls to the
+  out-of-window level.
+* Profile val0 and val2 too (perf on all 3 nodes, 45 s) to attribute the rest of the step.
+
+### 71.6 Caveats and anomalies
+
+* **Off-CPU event:** context-switches (no prev_state), not `sched:sched_switch` (tracefs events unreadable as user, logged
+  WARNING). perf script reported 34 out-of-order events.
+* **perf overhead:** p1 is the lowest baseline cell on matched/s and the slowest on checkpoint flush (0.874 s). It is
+  still inside the range used above.
+* **Window definition:** windows are widened by the scrape period and use any node, so 34-41% of seconds are "in".
+  In-window rates are diluted, not inflated.
+* **Commit p50 differs by node** (val0 ~100 ms, val1 / val2 ~250-300 ms). It is the same in every cell and not studied
+  here.
+* **Tail depth:** memory from the prep recorded a depth-4 decision. The run used depth 1 (preflight `depth=1`, CHECK OK
+  per cell), the comparable setting.
+* **Gate 27** blocks the analyst from writing non-.md files. The WriteThread caller pass therefore ran as inline Python
+  (importing `offcpu-sched.py`, unchanged), and its output is in `analyst/out/offcpu-wt-callers.txt`. No new script file
+  was saved.
+* **Doc numbering:** section 70 is on `origin/docs/p4-swap10` (not on main). This section also sits before `## Open`,
+  so a merge of both branches will conflict there.
+
+### 71.7 Files
+
+* Cells: `~/bench-results-matched/ozarchy-p4j3-300m-{w0,b1,p1,b2,wd,d1}` (+ `.campaign.log`, `.cell.rc`). p1 holds
+  `perf-sched.data` (324 MB), `offcpu-sched.{txt,json}`, `perf.log`.
+* Run dirs: `ozarchy-p4j3-run/{p1,p2}` (`campaign.log`, `cells.tsv`, `campaign.done`); smokes
+  `ozarchy-p4j3-run/smoke-ff8-d1`, `smoke-ff8-d4`.
+* Tools: `ozarchy-p4j3-tools/` (`make-p4j3-driver.py`, `ozarchy-p4j3-p{1,2}-campaign.sh`, `soak-sampler.py`).
+* Analysis: `ozarchy-p4j3-tools/analyst/{j3.py,a-cells.py,offcpu-sched.py,taillag.py}`. Outputs in
+  `ozarchy-p4j3-tools/analyst/out/`: `j3.txt`, `j3.json`, `j3-<cell>-sec.tsv`, `acells.json`,
+  `offcpu-wt-callers.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
