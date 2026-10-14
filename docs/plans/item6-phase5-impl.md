@@ -333,7 +333,10 @@ roll back one at a time; no data migration.
    (b) D12 b at a fresh genesis before Phase 5 (bundle with L3), then a typed live-nonce set.
    (c) Keep all nonces but hold the consumed set in memory (RAM grows with every action ever; section 4 rejects it).
    Recommendation: a. `replay_guard` was 2.8 ms per native block (section 59.3); D12 stays a genesis item.
-   **Decided:**
+   **Decided: a** (owner s119). D12 b moves out of Phase 5 into the public testnet genesis bundle with R20 (new
+   chain id) and L3. Rationale: since s94 execution already drops nonces older than block time - 60 s
+   (`check_nonce_window`, `torus-types/src/eip712.rs`), so older nonce rows only grow state; that is a state-size
+   item for a long-lived chain, not a Phase 5 throughput item.
 3. **Cold writers to the typed CFs.**
    (a) Write-through in the overlay (decode, apply, dirty) for every raw write; only the hot writers move to `UsersMut`.
    (b) Move every writer (lockbox, liquidation, ADL, `margin.rs`'s balance writes) to `UsersMut`.

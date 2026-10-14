@@ -975,7 +975,7 @@ D16. Rollout.
 | D9 | a: out-of-band distribution first |
 | D10 | a: RPC reads from a block-consistent memory view |
 | D11 | a: EVM state stays in RocksDB; EVM blocks force a checkpoint |
-| D12 | b: drop nonces older than block time - 60 s (consensus rule + hash change; fresh genesis), before Phase 5 |
+| D12 | b: drop nonces older than block time - 60 s (consensus rule + hash change; fresh genesis); owner s119: at the public testnet genesis, bundled with R20 (new chain id) and L3, not before Phase 5 |
 | D13 | a: keep packed trade-history rows + retention pruning. Hourly files would need a separate indexer, and validators run `TORUS_TRADE_HISTORY=0`, so neither option touches chain throughput |
 | D14 | b: 64 GB per testnet validator + a resting-order cap sized at ~400 B/order. The devnet needs no separate target (one 94 GB host for 3 nodes, ~30 GB each; ~5 GB/node used today) |
 | D15 | b: relative gates per phase, HL parity as end goal. "No regression at 10 markets" means extra 10-market cells in the SAME campaign (phase vs main), next to the primary 300-market cells, never against old benches |
