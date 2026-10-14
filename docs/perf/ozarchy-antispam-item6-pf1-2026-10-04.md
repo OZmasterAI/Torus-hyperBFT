@@ -9547,6 +9547,69 @@ Files: scripts and outputs in `~/bench-results-matched/ozarchy-p4swap10-tools/an
 They sit in the tools dir rather than the run dir because the analyst gate keeps the run dir unchanged. Re-run:
 `python3 -I blocks_extract.py <cell> blocks/<tag>.tsv`, then `python3 -I waves.py > waves.txt` and the others.
 
+### 70.6 End-of-block worker (`torus-end-resident`), node A vs node B (18c's question, from the existing cells)
+
+**Question.** In Phase 4, B does extra per-trader work on the end-of-block worker. Is that worker clearly heavier
+on node B, especially on val2? If so, it is a node-side contributor to the 10-market gap.
+
+**Data.** The 16 measured cells of 70.1 (warm-up excluded): 17/17 rc 0 and ACCEPT AGREE, no CELL-FLAG, node md5
+8447a8c1 (A) / 3a303574 (B) on every cell of its arm. For each node (val0 / val1 / val2), from
+`metrics-after - metrics-before`:
+* `torus_exec_end_resident_seconds` is the end-resident total: the exec-thread checks plus the worker's job.
+  `end_resident_on_worker` is identical in both builds. Its count equals `torus_exec_native_blocks_total` in every
+  cell and node.
+* `torus_exec_end_resident_wait_seconds` is the time the exec thread waits for the worker (`settle_rows`).
+* The sub-timers differ: A has `..._positions_seconds` and B has `..._users_seconds`. They time different work and
+  are not compared. `..._rows_seconds` has the same name on both builds.
+
+Per-thread CPU was recorded. `io-threads-start.txt` / `io-threads-end.txt` hold utime+stime ticks per thread at
+bench start and bench end (~303 s), and `tasks.txt` samples them at 1 Hz. The thread appears there as
+`torus-end-resid`.
+
+Per wave = per-native-block value x nonempty blocks per wave (73.4 A / 72.8 B, 70.5). Effects are from the
+two-factor model with rounds as blocks (df 9, 95% CI). The bench-build effect covers 0 for every total and for CPU.
+
+| val2 (val0 / val1 alike) | node A | node B | B - A [95% CI] |
+|---|---:|---:|---:|
+| end-resident total, ms per native block | 1.578 | 0.927 | **-0.651 [-0.703, -0.599]** |
+| end-resident total, ms per 1k actions | 12.45 | 7.65 | -4.80 [-5.00, -4.60] |
+| end-resident total, ms per wave | 115.7 | 67.4 | **-48.2 [-50.3, -46.1]** |
+| wait, ms per native block | 0.0178 | 0.0091 | -0.0087 [-0.0104, -0.0069] |
+| wait, ms per 1k actions | 0.141 | 0.076 | -0.065 [-0.082, -0.048] |
+| wait, ms per wave | 1.30 | 0.66 | -0.64 [-0.78, -0.50] |
+| rows sub-timer, ms per native block | 0.683 | 0.007 | -0.676 [-0.702, -0.651] |
+| `torus-end-resid` CPU, s per cell | 5.15 | 3.05 | **-2.09 [-2.17, -2.02]** |
+| `torus-end-resid` CPU, ms per 1k actions | 11.16 | 6.75 | -4.41 [-4.61, -4.21] |
+
+val0 / val1, node effect on the total: -0.669 / -0.660 ms per block. On thread CPU: -2.16 / -2.14 s per cell. The
+groups separate completely: on val2 the 8 A cells span 1.49-1.65 ms per block and 5.02-5.22 s CPU, and the 8 B
+cells span 0.89-0.96 ms and 2.99-3.16 s.
+
+**Sized against the gap.** The question assumed the worker might be heavier on B. It is lighter, by the same amount
+on all three nodes:
+* B's extra per-trader work is outweighed by the near-removal of the rows work (rows sub-timer 0.68 -> 0.007 ms per
+  block).
+* Per wave on val2, the total is -48 ms and the wait -0.6 ms. Both have the opposite sign to the +297 ms wave and
+  the +523 ms idle refill.
+* The thread uses ~1.7% of one core on A and ~1.0% on B, of 32 cores. That is far too small to contend with body
+  serving.
+* The change is the same on val0, val1 and val2, so it cancels in the val2 - mean(val0, val1) differencing behind
+  the +9.1 ms per 400 actions serving cost (70.5). It cannot be val2-specific contention.
+
+**Verdict.** The end-of-block worker is not a node-side contributor to the 10-market gap. If anything, it frees
+~2 s of CPU per node per cell on B. Contention on val2's `getBlockBody` serving stays the lead.
+
+Confidence: high on the measurement. The groups separate, the code path is identical, and the counts match the
+native blocks.
+
+Caveat: the metric totals span before-bench to after-drain, while thread CPU spans the bench only; both normalise
+to their own blocks and actions.
+
+Files: the cells' `metrics-{before,after}-val*.txt`, `io-threads-{start,end}.txt`, `procstat.raw` (pid to val),
+and `ozarchy-p4swap10-tools/analyst/waves/waves.json` (blocks per wave). The analysis ran as a stdin script
+(`python3 -I -`), using `swap.twofactor` from `ozarchy-p4swap10-tools/analyst/swap.py`. The analyst gate blocked
+saving a `.py` next to the other scripts, so it is not on disk.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
