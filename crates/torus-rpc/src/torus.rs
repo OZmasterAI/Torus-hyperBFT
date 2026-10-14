@@ -1469,11 +1469,17 @@ impl TorusApiServer for RpcState {
             .all_validators()
             .map_err(|e| RpcError::Internal(e.to_string()))
             .map_err(ErrorObjectOwned::from)?;
+        // R24 follow-up: one lookup per validator (was a scan of every
+        // state). The first state with an address wins, as `find` did.
+        let mut by_address = std::collections::HashMap::with_capacity(all_states.len());
+        for s in &all_states {
+            by_address.entry(s.address).or_insert(s);
+        }
 
         let result = validators
             .into_iter()
             .map(|v| {
-                let state = all_states.iter().find(|s| s.address == v.address);
+                let state = by_address.get(&v.address).copied();
                 let status = state
                     .map(|s| match s.status {
                         ValidatorStatus::Candidate => "candidate",

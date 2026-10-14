@@ -1702,3 +1702,202 @@ async fn proposals_report_main_decode_errors() {
         "{e:?}"
     );
 }
+
+/// A header at `height` claiming `slots` submitted EVM txs, with receipts
+/// (executed txs) only at body positions `executed`; the node executed it.
+/// The other slots are what undecodable txs leave: a body slot, no receipt.
+fn put_block_with_slots(state: &StateDb, height: u64, slots: u32, executed: &[u32]) -> String {
+    use alloy_primitives::{Bloom, B256};
+    use torus_state::cf::{CF_BLOCK_HASH_TO_NUMBER, CF_BLOCK_HEADERS, CF_CONSENSUS_META, CF_RECEIPTS, META_NATIVE_APPLIED_HEIGHT};
+    let header = torus_types::TorusBlockHeader {
+        height,
+        parent_hash: B256::ZERO,
+        timestamp: 1_700_000_000 + height,
+        proposer: Address::ZERO,
+        state_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Bloom::ZERO,
+        evm_gas_used: 0,
+        evm_fee_revenue: 0,
+        evm_gas_limit: 30_000_000,
+        native_action_count: 0,
+        evm_tx_count: slots,
+        base_fee_per_gas: 1,
+        epoch: 0,
+        validator_set_hash: B256::ZERO,
+        sig_attestation: [0u8; 64],
+    };
+    // commit_block's format: block_hash(32) || header_json.
+    let hash = alloy_primitives::keccak256(header.canonical_header_bytes());
+    let mut data = hash.to_vec();
+    data.extend_from_slice(&serde_json::to_vec(&header).unwrap());
+    state.put_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes(), &data).unwrap();
+    state.put_cf_raw(CF_BLOCK_HASH_TO_NUMBER, hash.as_slice(), &height.to_be_bytes()).unwrap();
+    state.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &height.to_be_bytes()).unwrap();
+    for &i in executed {
+        let receipt = torus_types::Receipt {
+            tx_hash: B256::repeat_byte(i as u8 + 1),
+            block_number: height,
+            block_hash: hash,
+            tx_index: i,
+            cumulative_gas_used: 21_000,
+            gas_used: 21_000,
+            contract_address: None,
+            logs: Vec::new(),
+            logs_bloom: Bloom::ZERO,
+            status: true,
+            effective_gas_price: 1,
+        };
+        let mut key = [0u8; 12];
+        key[..8].copy_from_slice(&height.to_be_bytes());
+        key[8..].copy_from_slice(&i.to_be_bytes());
+        state.put_cf_raw(CF_RECEIPTS, &key, &serde_json::to_vec(&receipt).unwrap()).unwrap();
+        // The hash index, so `eth_getTransactionReceipt` finds it.
+        let mut loc = height.to_be_bytes().to_vec();
+        loc.extend_from_slice(&i.to_be_bytes());
+        state
+            .put_cf_raw(torus_state::cf::CF_TX_HASH_TO_LOCATION, receipt.tx_hash.as_slice(), &loc)
+            .unwrap();
+    }
+    format!("{hash:#x}")
+}
+
+/// Codex R24 round 4: the block lookups read one receipt slot per
+/// submitted tx of the block, undecodable ones (no receipt, not bounded by
+/// gas) included. Every slot read is charged to the request's budget: a
+/// block with more slots than the budget is `-32005` after at most
+/// `max + 1` reads; under the budget the answer is as before and each slot
+/// counts once.
+#[tokio::test]
+async fn block_lookups_charge_every_receipt_slot_to_the_scan_budget() {
+    use crate::eth::EthApiServer;
+    let (_d, state) = db();
+    let hash = put_block_with_slots(&state, 1, 1000, &[10, 900]);
+    let tx900 = format!("{:#x}", alloy_primitives::B256::repeat_byte(900u32 as u8 + 1));
+    let n = || "0x1".to_string();
+
+    let s = server(&state, 100);
+    let st = s.state();
+    let mut before = 0;
+    // Each call is -32005 after at most `max + 1` slot reads.
+    macro_rules! over_budget {
+        ($what:literal, $call:expr) => {{
+            let e = $call.await.unwrap_err();
+            assert_scan_limit(&e, concat!($what, ": 1000 slots, budget 100"));
+            let read = examined(&s) - before;
+            assert!((1..=101).contains(&read), "{}: {read}", $what);
+            before = examined(&s);
+        }};
+    }
+    over_budget!("getBlockByNumber", st.get_block_by_number(n(), false));
+    over_budget!("getBlockByHash", st.get_block_by_hash(hash.clone(), true));
+    over_budget!("countByNumber", st.get_block_transaction_count_by_number(n()));
+    over_budget!("countByHash", st.get_block_transaction_count_by_hash(hash.clone()));
+    over_budget!("txByNumberAndIndex", st.get_transaction_by_block_number_and_index(n(), "0x0".into()));
+    over_budget!("txByHashAndIndex", st.get_transaction_by_block_hash_and_index(hash.clone(), "0x1".into()));
+    // Its eth index and log offset: the 900 slots before it.
+    over_budget!("receipt", st.get_transaction_receipt(tx900.clone()));
+    let _ = before;
+
+    // Under the budget: the answer as before, one row per slot read.
+    let s = server(&state, 10_000);
+    let st = s.state();
+    let b = st.get_block_by_number(n(), false).await.unwrap().expect("block 1");
+    assert_eq!(b.transactions.as_array().map(Vec::len), Some(2));
+    assert_eq!(examined(&s), 1000);
+    assert_eq!(st.get_block_transaction_count_by_hash(hash.clone()).await.unwrap().as_deref(), Some("0x2"));
+    assert_eq!(examined(&s), 2000);
+    // No body stored: the tx itself is not served (as before).
+    assert!(st.get_transaction_by_block_number_and_index(n(), "0x1".into()).await.unwrap().is_none());
+    assert_eq!(examined(&s), 3000);
+    let r = st.get_transaction_receipt(tx900).await.unwrap().expect("receipt");
+    assert_eq!(r.transaction_index, "0x1");
+    assert_eq!(examined(&s), 3900);
+}
+
+/// `torus_getValidators` looks each validator's state up by address (a map,
+/// linear), not by a scan of every state per validator (quadratic). The
+/// reply is unchanged, order included: it is compared with main's
+/// first-match lookup, also where two rows (a corrupt DB) carry the same
+/// address.
+#[tokio::test]
+async fn validators_reply_is_unchanged_by_the_address_map() {
+    use torus_economics::types::{ValidatorState, ValidatorStatus};
+    use torus_economics::StakingManager;
+    use torus_state::cf::CF_STAKING_VALIDATORS;
+    let statuses = [
+        ValidatorStatus::Candidate,
+        ValidatorStatus::Active,
+        ValidatorStatus::Jailed,
+        ValidatorStatus::Tombstoned,
+    ];
+    let (_d, state) = db();
+    let put = |key: Address, address: Address, n: u32| {
+        let v = ValidatorState {
+            address,
+            pubkey: [n as u8; 32],
+            commission_bps: n as u16,
+            self_stake: U256::from(n) * U256::from(10u64).pow(U256::from(18u64)),
+            total_delegated: U256::from(n),
+            status: statuses[n as usize % 4],
+            jailed_until: None,
+            last_commission_change_block: None,
+            oracle_signer: n.is_multiple_of(3).then(|| other(10_000 + n)),
+        };
+        state
+            .put_cf_raw(CF_STAKING_VALIDATORS, key.as_slice(), &borsh::to_vec(&v).unwrap())
+            .unwrap();
+    };
+    for n in (0..200u32).rev() {
+        put(other(n), other(n), n);
+    }
+    // A second row naming other(7): main's lookup takes the first state.
+    put(other(5000), other(7), 6);
+
+    // Main's lookup, verbatim: the first state with the validator's address.
+    let staking = StakingManager::new(state.clone());
+    let infos = torus_economics::queries::get_validators(&staking).unwrap();
+    let all = staking.all_validators().unwrap();
+    let expected: Vec<serde_json::Value> = infos
+        .into_iter()
+        .map(|v| {
+            let st = all.iter().find(|s| s.address == v.address);
+            let status = st
+                .map(|s| match s.status {
+                    ValidatorStatus::Candidate => "candidate",
+                    ValidatorStatus::Active => "active",
+                    ValidatorStatus::Jailed => "jailed",
+                    ValidatorStatus::Tombstoned => "tombstoned",
+                })
+                .unwrap_or("unknown");
+            serde_json::to_value(crate::types::RpcValidatorInfo {
+                address: crate::types::hex_address(v.address),
+                pubkey: format!("0x{}", hex::encode(v.pubkey.0)),
+                power: crate::types::hex_u64(v.power),
+                commission_bps: v.commission_bps,
+                status: status.to_string(),
+                oracle_signer: st.and_then(|s| s.oracle_signer).map(crate::types::hex_address),
+            })
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(expected.len(), 201);
+    // The duplicate's row reports the first other(7) state's status.
+    let sevens: Vec<_> = expected
+        .iter()
+        .filter(|v| v["address"] == hex_addr(other(7)))
+        .map(|v| v["status"].clone())
+        .collect();
+    assert_eq!(sevens, vec![serde_json::json!("tombstoned"); 2]);
+
+    let s = server(&state, 10);
+    let got: Vec<serde_json::Value> = s
+        .state()
+        .get_validators()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| serde_json::to_value(v).unwrap())
+        .collect();
+    assert_eq!(got, expected);
+}
