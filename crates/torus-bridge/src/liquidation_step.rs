@@ -104,13 +104,13 @@ struct LiqStats {
 ///   lookup (never iterated); dropped for both parties of every close and
 ///   for the vault on a pairing, i.e. for every account the drain writes.
 /// * `dirty` (adl-budget C2): the block's dirty traders per market
-///   ([`trader_positions::dirty_by_market_and_traders`]), taken at the drain's first
+///   ([`users::dirty_by_market_and_traders`]), taken at the drain's first
 ///   ranking with R attached. A ranking of `m` reads R's holders of `m`
 ///   merged with them. That list covers every holder of `m` for the whole
 ///   drain for the reason `traders` stays exact: the drain gives no trader a
 ///   new key. (A listed trader gone flat reads no position and is skipped.)
 /// * `dirty_traders` (adl-dirty-check, node-local): the traders the block
-///   wrote under ([`trader_positions::dirty_by_market_and_traders`]), taken with `dirty`
+///   wrote under ([`users::dirty_by_market_and_traders`]), taken with `dirty`
 ///   and grown by every drain write ([`Self::touched`]), so it equals
 ///   `layer_touches` at every ranking (`debug_assert`). The ranking's
 ///   reader asks it instead of a `layer_touches` per read.
@@ -134,7 +134,7 @@ impl DrainCache {
         }
         let Some(list) = self.traders.as_mut() else { return Ok(()) };
         let Ok(i) = list.binary_search(t) else { return Ok(()) };
-        if ctx.positions.get_position(t, m)?.is_none() && !trader_positions::has_key(&ctx.state, t)? {
+        if ctx.positions.get_position(t, m)?.is_none() && !users::has_key(&ctx.state, t)? {
             list.remove(i);
             #[cfg(test)]
             ADL_CACHE_STATS.with(|s| s.set((s.get().0, s.get().1 + 1, s.get().2)));
@@ -578,7 +578,7 @@ impl NativeExecutor {
     ///
     /// C2 (owner 18c s96 / s99): with the records attached the point reads go
     /// only to the traders that may hold `m` — R's holders of `m` merged with
-    /// the block's dirty traders of `m` ([`TraderPositions::holders_with`]),
+    /// the block's dirty traders of `m` ([`Users::holders_with`]),
     /// ascending — instead of every trader: the same candidates in the same
     /// order (every holder is in the list, a listed non-holder is skipped as
     /// C1 skips it), shadow-checked against C1 at every ranking in tests. The
@@ -629,7 +629,7 @@ impl NativeExecutor {
             None => None,
             Some(_) if on => {
                 if dirty_cache.is_none() {
-                    if let Some((m, t)) = trader_positions::dirty_by_market_and_traders(&ctx.state)
+                    if let Some((m, t)) = users::dirty_by_market_and_traders(&ctx.state)
                     {
                         (*dirty_cache, *dirty_traders) = (Some(m), Some(t));
                     }
@@ -637,7 +637,7 @@ impl NativeExecutor {
                 dirty_cache.as_ref()
             }
             Some(_) => {
-                fresh_dirty = trader_positions::dirty_by_market(&ctx.state);
+                fresh_dirty = users::dirty_by_market(&ctx.state);
                 fresh_dirty.as_ref()
             }
         };

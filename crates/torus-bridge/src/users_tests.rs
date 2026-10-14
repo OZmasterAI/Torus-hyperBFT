@@ -455,14 +455,14 @@ fn users_encode_byte_identical_to_rows() {
         assert_eq!(u.cum_volume.unwrap().raw().to_be_bytes().to_vec(), rb[&cum_volume_key(&a)[..]], "a: cvlm");
         let ub = rec.map.get(&b).expect("b: balance-only user");
         assert!(ub.positions.is_empty() && ub.cum_volume.is_none() && ub.balance.is_some());
-        assert_eq!(rec.get(&b), Some(&[][..]), "b: no positions");
+        assert_eq!(rec.get(&b).map(<[Position]>::len), Some(0), "b: no positions");
         assert!(!rec.traders.contains(&b), "b: no liquidation candidate");
         for cf in both {
             assert_eq!(&rec.encode_rows(cf), rows.rows(cf).unwrap(), "{cf}: byte-identical");
         }
     }
     // One block writes an irregular row of `a`, the next the regular one back.
-    let mut block = |rows: &mut ResidentRows, rec: &mut Users, cf: &str, key: &[u8], value: &[u8]| {
+    let block = |rows: &mut ResidentRows, rec: &mut Users, cf: &str, key: &[u8], value: &[u8]| {
         let o = NativeStateOverlay::new(db.clone());
         o.put_cf_raw(cf, key, value).unwrap();
         let delta = o.own_pending_delta();
