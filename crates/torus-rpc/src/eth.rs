@@ -44,6 +44,7 @@ use torus_state::cf::{
 use torus_types::{Receipt, TorusBlockBody, TorusBlockHeader};
 
 use crate::error::RpcError;
+use crate::scan::ScanBudget;
 use crate::types::*;
 use crate::RpcState;
 
@@ -237,14 +238,20 @@ pub(crate) fn body_evm_tx_json(
 /// EVM tx count this is the eth view's tx list: item `i` is the tx at eth
 /// `transactionIndex` i, and its `tx_index` is the body position. With
 /// `tx_count` = a body position, `len()` is that tx's eth index.
+///
+/// R24: one slot read per position, undecodable txs (no receipt) included,
+/// so the gas limit does not bound it: each read is one row of `b`, charged
+/// before it is made (`-32005` past the budget, no partial result).
 fn get_block_receipts(
     state: &RpcState,
     height: u64,
     tx_count: u32,
+    b: &mut ScanBudget,
 ) -> Result<Vec<Receipt>, RpcError> {
     let mut receipts = Vec::new();
     let height_bytes = height.to_be_bytes();
     for idx in 0..tx_count {
+        b.step()?;
         let mut key = [0u8; 12];
         key[..8].copy_from_slice(&height_bytes);
         key[8..12].copy_from_slice(&idx.to_be_bytes());
@@ -838,7 +845,7 @@ impl EthApiServer for RpcState {
             None => B256::ZERO,
         };
         // s84: the eth index = executed txs before this body position.
-        let eth_index = get_block_receipts(self, height, tx_index)
+        let eth_index = get_block_receipts(self, height, tx_index, &mut self.scan_budget())
             .map_err(err)?
             .len() as u32;
         Ok(Some(build_rpc_tx(
@@ -903,7 +910,8 @@ impl EthApiServer for RpcState {
             None => B256::ZERO,
         };
         // s84: the executed txs before this one give its eth index and log offset.
-        let prior = get_block_receipts(self, height, tx_index).map_err(err)?;
+        let prior =
+            get_block_receipts(self, height, tx_index, &mut self.scan_budget()).map_err(err)?;
         let eth_index = prior.len() as u32;
         let log_index_offset: u32 = prior.iter().map(|r| r.logs.len() as u32).sum();
         let logs: Vec<RpcLog> = receipt
@@ -953,7 +961,9 @@ impl EthApiServer for RpcState {
         if header.evm_tx_count > 0 {
             check_pruned(self, height)?;
         }
-        let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
+        let receipts =
+            get_block_receipts(self, height, header.evm_tx_count, &mut self.scan_budget())
+                .map_err(err)?;
         let body = if header.evm_tx_count > 0 {
             get_body(self, height).map_err(err)?
         } else {
@@ -982,7 +992,9 @@ impl EthApiServer for RpcState {
         if header.evm_tx_count > 0 {
             check_pruned(self, height)?;
         }
-        let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
+        let receipts =
+            get_block_receipts(self, height, header.evm_tx_count, &mut self.scan_budget())
+                .map_err(err)?;
         Ok(Some(hex_u64(receipts.len() as u64)))
     }
 
@@ -1011,7 +1023,9 @@ impl EthApiServer for RpcState {
         }
         check_pruned(self, height)?;
         // s84: `index` is over the executed txs (the listed ones).
-        let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
+        let receipts =
+            get_block_receipts(self, height, header.evm_tx_count, &mut self.scan_budget())
+                .map_err(err)?;
         let Some(receipt) = usize::try_from(index).ok().and_then(|i| receipts.get(i)) else {
             return Ok(None);
         };
@@ -1182,7 +1196,11 @@ impl EthApiServer for RpcState {
             if header.evm_tx_count == 0 {
                 continue;
             }
-            let receipts = get_block_receipts(self, height, header.evm_tx_count).map_err(err)?;
+            // Not charged (docs/api/read-limits.md, Follow-ups): the range and
+            // log limits bound getLogs.
+            let receipts =
+                get_block_receipts(self, height, header.evm_tx_count, &mut ScanBudget::unlimited())
+                    .map_err(err)?;
             let mut global_log_index: u32 = 0;
             for (eth_index, receipt) in receipts.iter().enumerate() {
                 for log in &receipt.logs {

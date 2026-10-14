@@ -79,7 +79,7 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `torus_getProposal(id)` | Budget. One row, by size, before it is decoded (the reply leaves out the execution payload; the decode does not). | `get_proposal_charges_the_row_by_size_before_decoding` |
 | `torus_getProposals(status?)` | Budget. Every proposal row, by size, before it is decoded (a status filter does not make a row cheaper). | `proposals_stop_at_the_scan_budget`, `proposal_rows_are_charged_by_size_before_decoding`, `proposals_report_main_decode_errors` |
 | `torus_getLeader` | Budget. Every validator row (main decodes them all before it looks the leader's key up). | `leader_lookup_stops_at_the_scan_budget` |
-| `torus_getValidators` | Answer: every validator row is in the reply (read twice). | none needed |
+| `torus_getValidators` | Answer: every validator row is in the reply (read twice). Each validator's state is found by one lookup in a map by address (was a scan of every state per validator, quadratic CPU); the first row with an address wins, as before. | `validators_reply_is_unchanged_by_the_address_map` |
 | `torus_getStakingInfo(address)` | Answer: the address's delegations (all in the reply), plus two point reads. | none needed |
 | `torus_getDelegations(delegator)` | Answer: the delegator's delegations. | none needed |
 | `torus_getStateHash(height?)` | Constant: the retained checkpoint keys (at most 64), then that height's votes (in the reply, at most one per validator). | none needed |
@@ -88,8 +88,8 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `torus_subscribe` | No DB reads: items are pushed from execution. | none needed |
 | `eth_chainId`, `eth_blockNumber`, `eth_gasPrice`, `eth_maxPriorityFeePerGas` | Constant: none, or one header. | none needed |
 | `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` | Constant: account, code and storage point reads at the head. | none needed |
-| `eth_getTransactionByHash`, `eth_getTransactionReceipt` | Constant: the hash index, then one body or receipt. | none needed |
-| `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex` | One block: its header, body and receipt slots. NOT charged to the scan budget: the receipt lookup reads one slot per submitted transaction, including undecodable ones that the gas limit does not bound (see Follow-ups). | none |
+| `eth_getTransactionByHash`, `eth_getTransactionReceipt` | Budget. The hash index, one body and the tx's receipt are constant; its eth index (and the receipt's log offset) reads one receipt slot per earlier body position, each charged as one row. | `block_lookups_charge_every_receipt_slot_to_the_scan_budget` (receipt) |
+| `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex` | Budget. The header and body are constant; the receipt lookup reads one slot per submitted transaction of the block, undecodable ones included (the gas limit does not bound them), and each slot read is one row, charged before it is made. A by-index lookup still reads every slot (as before) before it answers. | `block_lookups_charge_every_receipt_slot_to_the_scan_budget` |
 | `eth_call`, `eth_estimateGas` | The gas limit bounds the EVM's work (state point reads). | none needed |
 | `eth_getLogs` | Its own limits: a range of at most 10,000 blocks and at most 10,000 logs. Every receipt of every block in the range with EVM transactions is read, even when the filter keeps none of its logs. | `lib.rs` getLogs tests |
 | `eth_feeHistory` | Its own limit: at most 1024 headers. | none needed |
@@ -141,13 +141,11 @@ index exists, or have a known cost noted here:
 - `torus_getBalances` / `torus_getLiquidatorVault` / cross `torus_getPosition` read one position per
   market held, so they stay proportional to the number of markets (listed by
   governance). No index is needed.
-- `torus_getValidators` matches each validator against every other
-  (quadratic CPU in the validator count; the rows read are the reply): a map
-  by address would make it linear.
-- `eth_getBlockByNumber` / `ByHash`, the transaction-count and by-index lookups (and the receipts they load): `get_block_receipts` reads every submitted transaction slot of the block, including undecodable ones, without charging the scan budget (Codex R24 round 4: 100,000 submitted slots, budget 1, 571 ms for a one-field reply). Charge the slot reads to one request budget.
 - `eth_getLogs`: receipts of blocks whose logs the filter drops are not
-  counted toward any limit; charging each receipt to the scan budget would
-  bound a narrow filter over a full 10,000-block range.
+  counted toward any limit (the block lookups above charge the same receipt
+  slot reads; `eth_getLogs` reads them with no budget); charging each receipt
+  to the scan budget would bound a narrow filter over a full 10,000-block
+  range.
 - Book layout detection on a DB without the `__book_mode__` marker: write the
   marker once, from a write path such as a startup migration or the next
   executor save, never from an RPC. After that, detection is one row.

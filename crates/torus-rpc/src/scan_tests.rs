@@ -1778,29 +1778,26 @@ async fn block_lookups_charge_every_receipt_slot_to_the_scan_budget() {
 
     let s = server(&state, 100);
     let st = s.state();
-    let checks: Vec<(&str, ErrorObjectOwned)> = vec![
-        ("getBlockByNumber", st.get_block_by_number(n(), false).await.unwrap_err()),
-        ("getBlockByHash", st.get_block_by_hash(hash.clone(), true).await.unwrap_err()),
-        ("countByNumber", st.get_block_transaction_count_by_number(n()).await.unwrap_err()),
-        ("countByHash", st.get_block_transaction_count_by_hash(hash.clone()).await.unwrap_err()),
-        (
-            "txByNumberAndIndex",
-            st.get_transaction_by_block_number_and_index(n(), "0x0".into()).await.unwrap_err(),
-        ),
-        (
-            "txByHashAndIndex",
-            st.get_transaction_by_block_hash_and_index(hash.clone(), "0x1".into())
-                .await
-                .unwrap_err(),
-        ),
-        // Its eth index and log offset: the 900 slots before it.
-        ("receipt", st.get_transaction_receipt(tx900.clone()).await.unwrap_err()),
-    ];
-    for (i, (what, e)) in checks.iter().enumerate() {
-        assert_scan_limit(e, &format!("{what}: 1000 slots, budget 100"));
-        let at_most = 101 * (i as u64 + 1);
-        assert!(examined(&s) <= at_most, "{what}: {} > {at_most}", examined(&s));
+    let mut before = 0;
+    // Each call is -32005 after at most `max + 1` slot reads.
+    macro_rules! over_budget {
+        ($what:literal, $call:expr) => {{
+            let e = $call.await.unwrap_err();
+            assert_scan_limit(&e, concat!($what, ": 1000 slots, budget 100"));
+            let read = examined(&s) - before;
+            assert!((1..=101).contains(&read), "{}: {read}", $what);
+            before = examined(&s);
+        }};
     }
+    over_budget!("getBlockByNumber", st.get_block_by_number(n(), false));
+    over_budget!("getBlockByHash", st.get_block_by_hash(hash.clone(), true));
+    over_budget!("countByNumber", st.get_block_transaction_count_by_number(n()));
+    over_budget!("countByHash", st.get_block_transaction_count_by_hash(hash.clone()));
+    over_budget!("txByNumberAndIndex", st.get_transaction_by_block_number_and_index(n(), "0x0".into()));
+    over_budget!("txByHashAndIndex", st.get_transaction_by_block_hash_and_index(hash.clone(), "0x1".into()));
+    // Its eth index and log offset: the 900 slots before it.
+    over_budget!("receipt", st.get_transaction_receipt(tx900.clone()));
+    let _ = before;
 
     // Under the budget: the answer as before, one row per slot read.
     let s = server(&state, 10_000);
@@ -1845,7 +1842,7 @@ async fn validators_reply_is_unchanged_by_the_address_map() {
             status: statuses[n as usize % 4],
             jailed_until: None,
             last_commission_change_block: None,
-            oracle_signer: (n % 3 == 0).then(|| other(10_000 + n)),
+            oracle_signer: n.is_multiple_of(3).then(|| other(10_000 + n)),
         };
         state
             .put_cf_raw(CF_STAKING_VALIDATORS, key.as_slice(), &borsh::to_vec(&v).unwrap())
