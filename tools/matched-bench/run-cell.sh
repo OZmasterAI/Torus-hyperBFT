@@ -236,7 +236,10 @@
 #                and the liquidation telemetry (step timer _sum/_count, per-class /
 #                scanned / acted counters, pending / deferred gauges) are sampled
 #                at 1 Hz; otherwise the cell is unchanged. Analysis:
-#                tools/matched-bench/liq_stress.py <results-dir>.
+#                tools/matched-bench/liq_stress.py <results-dir>. Either knob
+#                needs a summarizer with --liq-thin/--liq-thin-avail: pre-flight
+#                refuses the cell when the selected one (see TOOLS_FROM_WORKTREE;
+#                an older worktree's) lacks them.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -588,6 +591,29 @@ fi
 liq_stress_on() {
     [ "$LIQ_THIN" -gt 0 ] || [ "$ORACLE_SHOCK_BP" -gt 0 ]
 }
+# summarizer_has_liq_opts: the selected summarize.py accepts --liq-thin and
+# --liq-thin-avail (asked through its own argparse --help). An older one (the
+# worktree's own under TOOLS_FROM_WORKTREE=1, e.g. main 46bb3a40 or the
+# Phase 4 build) exits on them as unrecognized arguments, after the run.
+summarizer_has_liq_opts() {
+    local h
+    h=$(python3 "$TOOLS_DIR/summarize.py" --help 2>/dev/null) || return 1
+    case "$h" in *--liq-thin-avail*) return 0 ;; esac
+    return 1
+}
+# Pre-flight: a liquidation cell passes the options, and refuses here (not after
+# the run) when the summarizer lacks them; any other cell passes none, as before.
+SUMMARIZE_LIQ_ARGS=()
+if liq_stress_on; then
+    summarizer_has_liq_opts || {
+        echo "FATAL: liquidation stress (LIQ_THIN=$LIQ_THIN ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP) needs a summarizer" \
+            "that accepts --liq-thin/--liq-thin-avail, and $TOOLS_DIR/summarize.py does not" \
+            "(TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; score with this harness's own tools:" \
+            "TOOLS_FROM_WORKTREE=0, or point TOOLS_DIR= at a newer tools/matched-bench)" >&2
+        exit 1
+    }
+    SUMMARIZE_LIQ_ARGS=(--liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL")
+fi
 # liq_thin_patch <genesis> <n> <available>: native `available` = <available> on
 # the balances noted "bulk-test 60" .. "bulk-test 60+n-1" (load senders
 # 0..n-1). Prints the rows changed. rc 1, genesis untouched, unless exactly n
@@ -1305,7 +1331,7 @@ python3 "$TOOLS_DIR/summarize.py" \
     --drain-timeout "$DRAIN_TIMEOUT" --markets-per-sender "${MPS:-}" \
     --max-in-flight "${MAX_IN_FLIGHT:-}" --open-order-budget "${OPEN_ORDER_BUDGET:-}" \
     --in-flight-tail "${IN_FLIGHT_TAIL:-}" \
-    --liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL" \
+    "${SUMMARIZE_LIQ_ARGS[@]}" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}

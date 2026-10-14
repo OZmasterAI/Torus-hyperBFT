@@ -276,7 +276,8 @@ def analyze(d):
     )
 
     # Pending gauge (val0): from the shock (or the first sample) on, the peak,
-    # the first sample back at 0 after a pending > 0, the last sample.
+    # the first sample back at 0 after a pending > 0, the last sample (flagged when
+    # nonzero, whether or not it ever reached 0 before).
     has_pending = PENDING in header
     r["pending"] = {"peak": None, "zero": None, "last": None}
     r["pending_timeline"] = []
@@ -300,6 +301,13 @@ def analyze(d):
                 missing.append(
                     "pending never returned to 0 by the last sample (%s): the drain ended "
                     "with liquidation work left" % (r["pending"]["last"],)
+                )
+            # The last sample on its own: work can come back after a transient 0.
+            if z is not None and after[-1][PENDING] > 0:
+                missing.append(
+                    "pending is %s at the last sample (%s) after first returning to 0 at "
+                    "%s: the drain ended with liquidation work left"
+                    % (num(after[-1][PENDING]), r["pending"]["last"], r["pending"]["zero"])
                 )
             # Timeline: the sample before the first pending > 0 .. the zero sample
             # (or the end), each with the step ms per block since the previous sample.
@@ -341,6 +349,12 @@ def analyze(d):
                 missing.append(
                     "adl_queue never returned to 0 by the last sample (%s): the ADL "
                     "queue was not drained" % (q["last"],)
+                )
+            if z is not None and qa[-1][ADL_Q] > 0:
+                missing.append(
+                    "adl_queue is %s at the last sample (%s) after first returning to 0 "
+                    "at %s: the ADL queue was not drained"
+                    % (num(qa[-1][ADL_Q]), q["last"], q["zero"])
                 )
         r["adl_queue"] = q
     if ADL_QD in header:
