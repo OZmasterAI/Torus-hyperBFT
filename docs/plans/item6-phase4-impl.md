@@ -252,6 +252,23 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
   `BlockSums::base` (:1238) and `cached_sums` (:1728) read the user's entry; `SumsCarry::trader`
   (:1096-1148) and `drop_written` (:1150) write it.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
+- **Built (s120, branch `feat/item6-phase4-step3`, on step 2).** `UserState.sums: Option<Box<(u64, SumsResult)>>`
+  (tag = mark version); `Users::sums(trader, version)` returns an entry only when its tag equals the version.
+  `SumsCache` and `RowsSlot.sums` deleted; `BlockSums::base` and `cached_sums` read the user's entry through
+  `BlockSums.records`. At `end_resident`, `Users::apply` hands each trader written in the positions CF to
+  `SumsCarry::trader` together with its entry: the entry is moved on (base = the block's memo, else the entry
+  tagged with the version) or cleared; a re-decoded record starts with no sums. After apply, `SumsCarry::finish`
+  joins the memo into the users' entries (tagged with the memo version) for traders the block did not write.
+  A moving version clears nothing: stale entries stay and are ignored or overwritten (`stale_version_entry_never_read`).
+  `UserState` is still 112 B (step 1 already counted the field).
+  Deviations from the text above: `drop_written` was already gone (step 2). `RowsSlot` keeps one `sums_version: u64`
+  (the version entries were last joined at). The node-local "carry only while the version held" rule needs it;
+  reads never use it. A trader with no record (opaque, or no rows left after the block) keeps no sums, so a
+  trader whose last row was deleted loses its entry. Before, the cache kept such an entry; no result changes.
+  `SumsCarry::trader` also runs when no sums came back with the block (a context that never handed back its
+  block state). Written traders' entries are then cleared, the rest stay valid, because before this change the
+  whole cache was dropped in that case. `drop_sums_cache` (tests only) clears every user's entry. Metrics and bench
+  tools are unchanged: the memo join moved after the users apply, outside the users sub-timer, as before.
 
 ### Step 4: typed loads
 

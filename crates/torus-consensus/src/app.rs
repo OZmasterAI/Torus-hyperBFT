@@ -1103,12 +1103,21 @@ struct ExecutionContext {
     /// I/O error, as a failed RocksDB access does.
     #[cfg(test)]
     test_replay_fault: Option<ReplayFault>,
+    /// Item 6 Phase 4 step 2 coverage (Codex r1 note): runs on every native
+    /// block's context right after the liquidation step (mid-block: R
+    /// attached, the previous layer merge's deferred part possibly held).
+    #[cfg(test)]
+    test_block_probe: Option<BlockProbe>,
     /// adl-budget A7, node-local proof flag (`TORUS_LIQ_VALUE_SUM=1`, read
     /// once at construction): copied into every block's context; with
     /// metrics attached the liquidation step logs the value sum over all
     /// accounts. Never changes what a block writes.
     liq_value_sum: bool,
 }
+
+/// See [`ExecutionContext::test_block_probe`].
+#[cfg(test)]
+type BlockProbe = Arc<dyn Fn(&NativeExecContext<NativeStateOverlay>) + Send + Sync>;
 
 /// adl-budget A7: `TORUS_LIQ_VALUE_SUM=1` turns on the liquidation step's
 /// node-local value-sum walk (proof runs only; it reads every balance and
@@ -3680,6 +3689,10 @@ impl ExecutionContext {
             };
             #[cfg(not(test))]
             let _ = NativeExecutor::run_liquidations(&mut ctx);
+            #[cfg(test)]
+            if let Some(probe) = self.test_block_probe.as_ref() {
+                probe(&ctx);
+            }
             // F11: a storage fault in the step (or, R02, in the CoreWriter
             // drain above) fail-stops exactly like the batches' check above.
             if let Some(reason) = ctx.take_fatal_error() {
@@ -5510,6 +5523,8 @@ impl TorusApp {
             test_core_writer_read_fault: false,
             #[cfg(test)]
             test_replay_fault: None,
+            #[cfg(test)]
+            test_block_probe: None,
             liq_value_sum: liq_value_sum_enabled(),
         };
 
@@ -13360,6 +13375,8 @@ mod crash_recovery_tests {
             test_core_writer_read_fault: false,
             #[cfg(test)]
             test_replay_fault: None,
+            #[cfg(test)]
+            test_block_probe: None,
             liq_value_sum: liq_value_sum_enabled(),
         }
     }
@@ -24960,12 +24977,14 @@ mod crash_recovery_tests {
         fault: &P2Fault,
         ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
     ) -> P2Run {
-        p2_run_seeded(blocks, pipelined, mode, reference, fault, ckpt, &|_| {}, false)
+        p2_run_seeded(blocks, pipelined, mode, reference, fault, ckpt, &|_| {}, false, None)
     }
 
     /// [`p2_run_with`] on a `p2_fixture` DB that `seed` wrote to first, and
     /// with `no_r`: every context without R (`test_no_resident_rows`, the
-    /// reads of R's CFs go to the layers and the DB).
+    /// reads of R's CFs go to the layers and the DB). `probe`: run on every
+    /// native block's context after the liquidation step
+    /// (`test_block_probe`), with the liquidation value-sum walk on.
     #[allow(clippy::too_many_arguments)]
     fn p2_run_seeded(
         blocks: &[TorusBlock],
@@ -24976,6 +24995,7 @@ mod crash_recovery_tests {
         ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
         seed: &dyn Fn(&StateDb),
         no_r: bool,
+        probe: Option<&BlockProbe>,
     ) -> P2Run {
         let (config, db) = p2_fixture();
         seed(&db);
@@ -24993,6 +25013,10 @@ mod crash_recovery_tests {
             ctx.test_no_resident = mode.is_none();
             ctx.test_reference_paths = reference;
             ctx.test_no_resident_rows = no_r;
+            if let Some(p) = probe {
+                ctx.test_block_probe = Some(p.clone());
+                ctx.liq_value_sum = true;
+            }
             ctx.metrics = Some(metrics.clone());
             ctx.checkpoint = ckpt;
             if pipelined && attach {
@@ -25796,10 +25820,85 @@ mod crash_recovery_tests {
         db.put_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, &key, &row).unwrap();
         db.put_cf_raw(torus_state::cf::CF_NATIVE_POSITIONS, b"short", b"under-no-trader").unwrap();
         db.put_cf_raw(torus_state::cf::CF_NATIVE_BALANCES, b"odd-balances-key", b"under-no-trader").unwrap();
+        pm.put_native_balance(&p2_cvlm_user(), &NativeBalance { available: px(5), order_margin: FixedPoint::ZERO })
+            .unwrap();
+    }
+
+    /// [`p2_seed_irregular`]'s balance-only trader whose address starts with `cvlm`.
+    fn p2_cvlm_user() -> Address {
         let mut c = [0x11u8; 20];
         c[..4].copy_from_slice(b"cvlm");
-        pm.put_native_balance(&Address::new(c), &NativeBalance { available: px(5), order_margin: FixedPoint::ZERO })
-            .unwrap();
+        Address::new(c)
+    }
+
+    /// What [`p2_irregular_probe`] saw.
+    #[derive(Debug, Default)]
+    struct IrregularProbeStats {
+        /// Native blocks probed.
+        blocks: u64,
+        /// Of them, with R attached to the block's overlay.
+        resident: u64,
+        /// Of them, with R attached and a layer merge's deferred part not yet
+        /// released by the gate (`spawned > released`).
+        held: u64,
+    }
+
+    /// Codex r1 note on step 2: execution's reads of the rows `Users` keeps
+    /// raw and of the balance-only `cvlm` user, mid-block (after the
+    /// liquidation step, which with the value-sum walk on pages through both
+    /// CFs). Point reads, prefix and seek reads of the two keys under no
+    /// trader and the `cvlm` user's balance (raw and typed) equal the seeded
+    /// rows; with R attached no read blocked on the deferred part
+    /// (`deferred_read_waits` unchanged: answered by R, above L).
+    fn p2_irregular_probe(
+        gate: Option<Arc<DeferredGate>>,
+        stats: Arc<std::sync::Mutex<IrregularProbeStats>>,
+    ) -> BlockProbe {
+        use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
+        Arc::new(move |ctx: &NativeExecContext<NativeStateOverlay>| {
+            let h = ctx.block_height;
+            let held = gate.as_ref().is_some_and(|g| {
+                let s = g.stats();
+                s.spawned > s.released
+            });
+            let waits = || ctx.metrics.as_ref().map_or(0, |m| m.exec_checkpoint_deferred_read_waits.get());
+            let before = waits();
+            let st = &ctx.state;
+            let raw = |v: &[u8]| Some(v.to_vec());
+            assert_eq!(st.get_cf_raw(CF_NATIVE_POSITIONS, b"short").unwrap(), raw(b"under-no-trader"), "block {h}: short positions key");
+            assert_eq!(
+                st.get_cf_raw(CF_NATIVE_BALANCES, b"odd-balances-key").unwrap(),
+                raw(b"under-no-trader"),
+                "block {h}: balances key under no trader"
+            );
+            assert_eq!(
+                st.iterate_cf(CF_NATIVE_POSITIONS, Some(b"sho")).unwrap(),
+                vec![(b"short".to_vec(), b"under-no-trader".to_vec())],
+                "block {h}: positions prefix read"
+            );
+            assert_eq!(
+                st.iterate_cf_from(CF_NATIVE_BALANCES, b"odd-", 1).unwrap(),
+                vec![(b"odd-balances-key".to_vec(), b"under-no-trader".to_vec())],
+                "block {h}: balances seek"
+            );
+            let c = p2_cvlm_user();
+            let want = torus_core::position::NativeBalance { available: px(5), order_margin: FixedPoint::ZERO };
+            let row = st.get_cf_raw(CF_NATIVE_BALANCES, c.as_slice()).unwrap().expect("cvlm user's balance row");
+            assert_eq!(row, borsh::to_vec(&want).unwrap(), "block {h}: cvlm user's balance row");
+            let typed = ctx.positions.get_native_balance(&c).unwrap();
+            assert_eq!((typed.available, typed.order_margin), (want.available, want.order_margin), "block {h}: typed");
+            let under = st.iterate_cf(CF_NATIVE_BALANCES, Some(b"cvlm")).unwrap();
+            assert!(under.contains(&(c.to_vec(), row.clone())), "block {h}: cvlm-headed prefix read lists the user");
+            assert_eq!(st.iterate_cf_from(CF_NATIVE_BALANCES, c.as_slice(), 1).unwrap(), vec![(c.to_vec(), row)], "block {h}: seek");
+            let resident = st.has_resident();
+            if resident {
+                assert_eq!(waits(), before, "block {h}: a read of the two CFs blocked on the deferred part");
+            }
+            let mut s = stats.lock().unwrap();
+            s.blocks += 1;
+            s.resident += u64::from(resident);
+            s.held += u64::from(resident && held);
+        })
     }
 
     /// Item 6 Phase 4 step 2 (plan Task 2.2, rows 9 / 12): with positions
@@ -25816,6 +25915,10 @@ mod crash_recovery_tests {
         let mode = Some(BookMode::Classic);
         let seed: &dyn Fn(&StateDb) = &p2_seed_irregular;
         let gate = Arc::new(DeferredGate::default());
+        // Codex r1 note: execution reads the rows under no trader and the
+        // balance-only `cvlm` user through R while the merge is held.
+        let seen = Arc::new(std::sync::Mutex::new(IrregularProbeStats::default()));
+        let probe = p2_irregular_probe(Some(gate.clone()), seen.clone());
         let gated = p2_run_seeded(
             &blocks,
             true,
@@ -25825,17 +25928,29 @@ mod crash_recovery_tests {
             Some(ckpt_never()),
             seed,
             false,
+            Some(&probe),
         );
+        let probed = std::mem::take(&mut *seen.lock().unwrap());
+        assert!(probed.blocks >= 100 && probed.resident == probed.blocks, "R attached at every probe: {probed:?}");
+        assert!(probed.held >= 100, "probed while a deferred merge was held: {probed:?}");
         let stats = gate.stats();
         assert_eq!(stats.timeouts, 0, "E waited for a held deferred merge: {stats:?}");
         assert!(stats.held >= 100, "merges held until upkeep: {stats:?}");
         assert_eq!(gated.metrics.exec_checkpoint_deferred_read_waits.get(), 0, "no read blocked on the deferred part");
         assert!(gated.max_lag >= 40, "max lag {}", gated.max_lag);
         assert!(gated.r_db_checked >= 2, "R (through Users) == DB at the durable heights: {}", gated.r_db_checked);
-        let per_block = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, None, seed, false);
+        let per_block = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, None, seed, false, None);
         assert!(per_block.r_db_checked >= 100, "{}", per_block.r_db_checked);
-        let off = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, Some(ckpt_never()), seed, true);
-        let serial_off = p2_run_seeded(&blocks, false, mode, false, &P2Fault::None, None, seed, true);
+        // Without R the probe reads the layers and the DB: same values.
+        let off_probe = p2_irregular_probe(None, seen.clone());
+        let off = p2_run_seeded(&blocks, true, mode, false, &P2Fault::None, Some(ckpt_never()), seed, true, Some(&off_probe));
+        let off_probed = std::mem::take(&mut *seen.lock().unwrap());
+        assert!(off_probed.blocks == probed.blocks && off_probed.resident == 0, "{off_probed:?}");
+        // The value-sum walk (both CFs, every row) read the same rows through
+        // R as without it (the last block's sum).
+        let value_sum = |run: &P2Run| metric_value(&run.metrics.encode(), "torus_liquidation_value_sum");
+        assert_eq!(value_sum(&gated), value_sum(&off), "value-sum walk through R == without R");
+        let serial_off = p2_run_seeded(&blocks, false, mode, false, &P2Fault::None, None, seed, true, None);
         assert_eq!(off.r_db_checked + serial_off.r_db_checked, 0, "no R");
         for (what, run) in [("per-block", &per_block), ("never without R", &off), ("serial without R", &serial_off)] {
             assert_write_sets_equal(&run.captured, &gated.captured, &format!("gated vs {what}"));

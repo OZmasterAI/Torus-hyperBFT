@@ -107,17 +107,19 @@ struct Stats {
 }
 
 /// Item 6 step 1 (warm == cold): after `end_resident`, every entry of the
-/// slot's sums cache a later block can read (the slot's mark version) ==
-/// `build` over R's rows after the block, decoded cold from R (not from the
-/// decoded records), with the slot's mark table and configs; every market a
-/// cached trader's Cross positions use is in the table. Returns the entries
-/// checked.
+/// slot's sums a later block can read (Phase 4 step 3: a user's entry tagged
+/// with the slot's mark version) == `build` over R's rows after the block,
+/// decoded cold from R (not from the decoded records), with the slot's mark
+/// table and configs; every market a cached trader's Cross positions use is
+/// in the table. Returns the entries checked.
 fn check_slot_sums(holder: &ResidentBooks, tag: &str) -> usize {
     use borsh::BorshDeserialize;
     let Some(slot) = holder.rows.as_ref() else { return 0 };
-    let Some(t) = slot.marks.as_ref().filter(|t| t.marks.version == slot.sums.version) else { return 0 };
+    let Some(t) = slot.marks.as_ref() else { return 0 };
     let rows: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = slot.rows.dump(CF_NATIVE_POSITIONS).unwrap().into_iter().collect();
-    for (trader, cached) in &slot.sums.map {
+    let entries: Vec<(Address, SumsResult)> =
+        slot.users.sums_entries().filter(|(_, v, _)| *v == t.marks.version).map(|(a, _, r)| (a, r)).collect();
+    for (trader, cached) in &entries {
         let ps: Vec<Position> = rows
             .range(trader.to_vec()..)
             .take_while(|(k, _)| k.starts_with(trader.as_slice()))
@@ -134,7 +136,7 @@ fn check_slot_sums(holder: &ResidentBooks, tag: &str) -> usize {
         assert!(in_table.get(), "{tag}: cached {trader} uses a market outside the table");
         assert_eq!(*cached, want, "{tag}: slot sums of {trader} != cold build over R");
     }
-    slot.sums.map.len()
+    entries.len()
 }
 
 /// Cache path == reference path for every trader: `view`, `pos_net`,
@@ -413,7 +415,7 @@ fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats
         if cached && (!worker || h % 2 == 1) {
             holder.settle_rows();
             assert_eq!(holder.trader_positions_match_rows(), Some(true), "seed {seed} block {h}: records warm == cold");
-            stats.carried += holder.rows.as_ref().map_or(0, |slot| slot.sums.carried);
+            stats.carried += holder.rows.as_ref().map_or(0, |slot| slot.sums_carried);
             stats.slot_checked += check_slot_sums(&holder, &format!("seed {seed} block {h}"));
         }
         if let Some(p) = parent.take() {
@@ -515,8 +517,9 @@ fn end_resident_on_worker_equals_inline_and_reference() {
 /// The cache is dropped with the slot: a guard trip (skipped height) rebuilds
 /// R with an empty cache. Item 6 M1: `end_resident` moves the sums of a
 /// trader the block wrote (positions) on to its rows after the block
-/// (before M1: dropped), keeps the others, and keeps nothing at a stale
-/// version. Every answer is shadow-checked against `build`.
+/// (before M1: dropped) and keeps the others. Phase 4 step 3: the entries
+/// live on the users' records (stale tags: `stale_version_entry_never_read`).
+/// Every answer is shadow-checked against `build`.
 #[test]
 fn end_resident_carries_dirtied_traders_and_rebuild_starts_empty() {
     let dir = tempfile::tempdir().unwrap();
@@ -525,6 +528,11 @@ fn end_resident_carries_dirtied_traders_and_rebuild_starts_empty() {
     db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(1), &agg_row(fp(MID), 10_000)).unwrap();
     let (a, b) = (trader(0), trader(1));
     for t in [a, b] {
+        // Phase 4 step 3: the sums live on the trader's record, so `a` keeps
+        // one (its balance) after the block deleting its only position.
+        PositionManager::new(db.clone())
+            .put_native_balance(&t, &NativeBalance { available: fp(100_000), order_margin: FixedPoint::ZERO })
+            .unwrap();
         PositionManager::new(db.clone())
             .put_position(&Position {
                 trader: t,
@@ -563,17 +571,130 @@ fn end_resident_carries_dirtied_traders_and_rebuild_starts_empty() {
         let delta = overlay.own_pending_delta();
         overlay.flush_with_native_trie_and_marker(&db, h).unwrap();
         end_resident(holder, rb, &mut overlay, delta, true, None);
-        let mut kept: Vec<Address> = holder.rows.as_ref().unwrap().sums.map.keys().copied().collect();
+        let mut kept: Vec<Address> = holder.rows.as_ref().unwrap().users.sums_entries().map(|(t, _, _)| t).collect();
         kept.sort();
         (kept, hits)
     };
     assert_eq!(block(&mut holder, 1, false), (vec![a, b], 0), "both valued and kept");
     assert_eq!(block(&mut holder, 2, true), (vec![a, b], 2), "a's positions written: carried");
-    assert_eq!(holder.rows.as_ref().unwrap().sums.carried, 1);
+    assert_eq!(holder.rows.as_ref().unwrap().sums_carried, 1);
     assert_eq!(block(&mut holder, 3, false), (vec![a, b], 2), "a's carried sums (now flat) from the slot");
     assert_eq!(block(&mut holder, 4, false), (vec![a, b], 2), "both from the slot");
     assert_eq!(block(&mut holder, 6, false), (vec![a, b], 0), "skipped height: R rebuilt, cache starts empty");
     assert_eq!(holder.rows_builds(), 2);
+}
+
+/// Phase 4 step 3 (plan section 3, "Sums"): a user's entry is read only
+/// while its tag equals the block's mark version, and a moving version clears
+/// nothing. Entries planted with a wrong value under the old tag are never a
+/// base (`BlockSums::base`) nor a cached answer, in the block that moves the
+/// version (dirty and clean traders) and after the marks come back (versions
+/// are never reused); a trader neither valued nor written keeps its old-tag
+/// entry across the move (no step clears all users); an entry at the version
+/// is still used. Every answer is shadow-checked against `build`.
+#[test]
+fn stale_version_entry_never_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    db.put_cf_raw(CF_NATIVE_MARKETS, &1u64.to_be_bytes(), &market_row(5)).unwrap();
+    db.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(1), &agg_row(fp(MID), 10_000)).unwrap();
+    let (a, b, c) = (trader(0), trader(1), trader(2));
+    let pos = |t: Address, size: i64| Position {
+        trader: t,
+        market_id: 1,
+        is_long: true,
+        size: fp(size),
+        entry_price: fp(MID - 10),
+        cost_basis: fp(MID - 10) * fp(size),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    for (i, t) in [a, b, c].into_iter().enumerate() {
+        let pm = PositionManager::new(db.clone());
+        pm.put_native_balance(&t, &NativeBalance { available: fp(100_000), order_margin: FixedPoint::ZERO }).unwrap();
+        pm.put_position(&pos(t, 2 + i as i64)).unwrap();
+    }
+    let mut holder = ResidentBooks::default();
+    // One block at `h` (mark price `px` written first when given): values
+    // `value` (after rewriting `write`'s position, if any). Returns the
+    // block's mark version and persistent hits.
+    let block = |holder: &mut ResidentBooks, h: u64, px: Option<i64>, value: &[Address], write: Option<Address>| -> (u64, usize) {
+        let now = 10_000 + h;
+        let mut overlay = NativeStateOverlay::new(db.clone());
+        let mut rb = begin_resident(Some(holder), &mut overlay, h, None);
+        if let Some(px) = px {
+            overlay.put_cf_raw(CF_NATIVE_ORACLE, &agg_key(1), &agg_row(fp(px), now - 1)).unwrap();
+        }
+        let mut ctx = NativeExecContext::new(overlay.clone(), h, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+        ctx.attach_resident_block(&mut rb);
+        ctx.sums.as_mut().unwrap().shadow = true;
+        let _ = NativeExecutor::begin_block_oracle(&mut ctx);
+        let version = ctx.mark_version().expect("mark table");
+        if let Some(t) = write {
+            ctx.positions.put_position(&pos(t, 9)).unwrap();
+        }
+        {
+            let s = ctx.sums.as_ref().unwrap();
+            let reference = AccountReader { sums: None, ..AccountReader::of(&ctx) };
+            for t in [a, b, c] {
+                if let Some(p) = s.base(version, &t) {
+                    assert_eq!(Some(Ok(p)), reference.reference_sums(&t).ok(), "block {h}: base of {t} at version {version}");
+                }
+            }
+        }
+        let reader = AccountReader::of(&ctx);
+        for t in value {
+            reader.pos_net(t).unwrap();
+        }
+        let s = ctx.sums.as_ref().unwrap();
+        let hits = s.counters.persistent.load(std::sync::atomic::Ordering::Relaxed);
+        let bad = s.shadow_mismatches.lock().unwrap().clone();
+        assert!(bad.is_empty(), "block {h}: {bad:?}");
+        ctx.detach_resident_block(&mut rb);
+        drop(ctx);
+        let delta = overlay.own_pending_delta();
+        overlay.flush_with_native_trie_and_marker(&db, h).unwrap();
+        end_resident(holder, rb, &mut overlay, delta, true, None);
+        (version, hits)
+    };
+    let tag = |holder: &ResidentBooks, t: Address| -> Option<u64> {
+        holder.rows.as_ref().unwrap().users.sums_entries().find(|(x, _, _)| *x == t).map(|(_, v, _)| v)
+    };
+    let (v1, hits) = block(&mut holder, 1, None, &[a, b, c], None);
+    assert_eq!(hits, 0, "R built: no entries yet");
+    assert_eq!([a, b, c].map(|t| tag(&holder, t)), [Some(v1); 3], "all three valued at v1");
+    // Plant wrong values under the old tag: reading one fails the shadow check.
+    let planted = holder
+        .with_slot_users(|u| {
+            for t in [a, b, c] {
+                let slot = u.sums_slot_mut(&t).expect("a record");
+                let (v, r) = **slot.as_ref().expect("an entry");
+                assert_eq!(v, v1);
+                let p = r.expect("no overflow");
+                let wrong = PosSums { upnl: FixedPoint::from_raw(p.upnl.raw() + 12_345), ..p };
+                *slot = Some(Box::new((v1, Ok(wrong))));
+            }
+        })
+        .is_some();
+    assert!(planted, "slot users reachable between blocks");
+    // The version moves: no old-tag entry is read, dirty (b) or clean (a).
+    let (v2, hits) = block(&mut holder, 2, Some(MID + 7), &[a, b], Some(b));
+    assert_ne!(v2, v1, "marks moved: a new version");
+    assert_eq!(hits, 0, "no entry at v2 yet");
+    assert_eq!(tag(&holder, a), Some(v2), "a: overwritten by the block's memo");
+    assert_eq!(tag(&holder, b), None, "b: written, not carried (the version moved)");
+    assert_eq!(tag(&holder, c), Some(v1), "c: neither valued nor written, its old entry kept (no clear)");
+    // The marks come back: still a new version, c's old entry is not read.
+    let (v3, hits) = block(&mut holder, 3, Some(MID), &[a, b, c], None);
+    assert!(v3 != v1 && v3 != v2, "versions are never reused");
+    assert_eq!(hits, 0, "every entry is at an older version");
+    assert_eq!([a, b, c].map(|t| tag(&holder, t)), [Some(v3); 3]);
+    // The version holds: entries at it are used.
+    let (v4, hits) = block(&mut holder, 4, None, &[a, b, c], None);
+    assert_eq!(v4, v3, "marks held");
+    assert_eq!(hits, 3, "all three from their entries");
+    assert_eq!(holder.rows_builds(), 1, "R built once");
 }
 
 /// C6b (the cliff): a maker filled by an IOC order in the block's first
