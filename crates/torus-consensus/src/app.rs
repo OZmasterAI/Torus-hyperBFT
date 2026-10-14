@@ -1179,8 +1179,9 @@ enum ReplayFault {
     CoreWriterDueRead,
     /// Applied-block header (Codex D12 r2): every exec-time header write
     /// OUTSIDE the block's flush batch fails — `commit_block_metadata`'s own
-    /// batch (EVM blocks) and the standalone header put. A header that rides
-    /// the flush batch with the applied marker is not affected.
+    /// batch (EVM blocks; before the fix also the standalone header put of
+    /// empty blocks). A header that rides the flush batch with the applied
+    /// marker is not affected.
     StandaloneHeaderWrite,
 }
 
@@ -2179,16 +2180,6 @@ impl ExecutionContext {
         BlockCommitter::commit_block_metadata(&self.state_db, block, receipts)
     }
 
-    /// The standalone exec-time header put ([`persist_block_header`]; the test
-    /// seam can make it fail).
-    fn persist_header_standalone(&self, block: &TorusBlock) -> bool {
-        #[cfg(test)]
-        if self.test_replay_fault == Some(ReplayFault::StandaloneHeaderWrite) {
-            tracing::error!(height = block.header.height, "injected standalone header put failure (test)");
-            return false;
-        }
-        persist_block_header(&self.state_db, block)
-    }
 
     /// R02: a local storage fault on the replay-guard / session path. Latch
     /// the fail-stop: the caller returns, nothing of the block flushes, the
@@ -2713,15 +2704,29 @@ impl ExecutionContext {
     /// through the one hashed flush so the running state hash advances with the
     /// marker in the same atomic batch.
     ///
+    /// `prefix` is written first in the SAME atomic batch: the block's EVM
+    /// batch (bug (c)) and, when the dispatcher did not land it, the block's
+    /// header record (Codex D12 r2), so neither can lag the marker.
+    ///
     /// R01: a failure latches the fail-stop (`exec_failed`) and returns
     /// `false`; the caller must return without executing anything further.
     /// The marker stays at the previous height, so no later height can flush
     /// over the gap, and the restart replays this block from the durable
     /// marker — the same rule as the native flush and the flush worker.
-    fn flush_marker_only(&self, pending: torus_state::FrozenPending) -> bool {
+    fn flush_marker_only(
+        &self,
+        prefix: rocksdb::WriteBatch,
+        pending: torus_state::FrozenPending,
+    ) -> bool {
         let height = pending.height();
         let flushed = self.pre_flush_check(height).and_then(|()| {
-            pending.flush_with_native_trie_stats(&self.state_db, Some(height), None, None)
+            pending.flush_after_batch_with_native_trie_stats(
+                prefix,
+                &self.state_db,
+                Some(height),
+                None,
+                None,
+            )
         });
         if let Err(e) = flushed {
             tracing::error!(
@@ -2853,6 +2858,41 @@ impl ExecutionContext {
         let has_evm = !torus_block.evm_transactions.is_empty();
         let has_native = !torus_block.native_actions.is_empty();
 
+        // Applied-block header (Codex D12 r2): a block whose header the
+        // dispatcher did NOT land (boot crash-replay, a failed dispatch-time
+        // batch: `!durable.header`) gets its header record in the SAME atomic
+        // batch that writes its applied marker — the native flush (folded into
+        // the overlay) or the marker-only flush (in its prefix), on every path:
+        // native, EVM success, EVM ordinary error / skipped, empty, epoch
+        // boundary. A durable marker never runs ahead of its block's header
+        // (the successor's parent reads and the boot replay depend on it, and
+        // re-delivery skips an applied block, so nothing would repair it).
+        // Identical bytes to the dispatch-time row; CF_BLOCK_HEADERS is neither
+        // a native-root CF nor hashed, so roots and the running hash are
+        // untouched. `durable.header` (the live path) writes nothing here.
+        // An unencodable header (never seen) fail-stops before any write.
+        let header_record = if durable.header {
+            None
+        } else {
+            match header_record_bytes(torus_block) {
+                Some(bytes) => Some(bytes),
+                None => {
+                    tracing::error!(
+                        height,
+                        "FATAL: committed header does not encode — cannot persist it with the \
+                         applied marker (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        };
+        // Fail-stop paths below keep the pre-fold contract: a header that
+        // would have ridden the flush is put standalone, so the committed
+        // height stays visible to `find_last_committed_height` for the replay
+        // (a header without its marker is safe; the reverse is not).
+        let fold_header = header_record.is_some();
+
         // bl2 exec pipeline (design §2.1 step 2): a block takes the FAST PATH —
         // flush handed to W, next block layered on this block's pending set —
         // only when every reader/writer that bypasses the overlay is known to be
@@ -2943,8 +2983,8 @@ impl ExecutionContext {
 
         // ---- EVM execution ----
         // PROFILER (s470): time the whole EVM section (validate + commit bundle +
-        // block metadata, or the bare header persist when there is no EVM) so it
-        // is attributed rather than sitting in the block residual.
+        // block metadata) so it is attributed rather than sitting in the block
+        // residual.
         let evm_timer = std::time::Instant::now();
         let mut bundle = BundleState::default();
         let mut bundle_extras = torus_state::HashExtras::new();
@@ -3063,27 +3103,17 @@ impl ExecutionContext {
                     tracing::error!(%e, height, "EVM execution failed for committed block");
                 }
             }
-        } else if !durable.header && !has_native {
-            // Empty / non-native block whose header the dispatcher did NOT
-            // already land (boot crash-replay, or a failed dispatch-time batch):
-            // no native flush batch to ride, keep the standalone header put
-            // (cheap, rare). When `durable.header` the same hash‖JSON bytes are
-            // already at this key (`persist_committed_block_durably`), so the
-            // rewrite is skipped.
-            self.persist_header_standalone(torus_block);
         }
-        // r3 exec-write-stall-attribution: for a native-only block whose header
-        // is NOT already durable (boot crash-replay / failed dispatch batch) the
-        // header record is NOT put here as its own RocksDB write (that single
-        // small put measured 60-90 ms/blk on the exec thread — a full
-        // write-group wait behind the background trade writer's batch, not put
-        // cost). It is folded into the native overlay below and lands in the
-        // SAME atomic flush batch as the state + applied-height marker
-        // (identical bytes; CF_BLOCK_HEADERS is not a native-root CF, so the
-        // root is untouched). On a flush failure the standalone put runs as a
-        // fallback. When `durable.header` (the live dispatch path) nothing is
-        // written at all: the commit-time FIX 1a batch already landed it.
-        let fold_header = !has_evm && has_native && !durable.header;
+        // r3 exec-write-stall-attribution: a header that is NOT already durable
+        // is never put here as its own RocksDB write (that single small put
+        // measured 60-90 ms/blk on the exec thread — a write-group wait behind
+        // the background trade writer's batch). Codex D12 r2: nor for an empty
+        // or EVM block — every such header rides the block's marker batch
+        // (`header_record` above): folded into the native overlay below, or
+        // the prefix of the marker-only flush. `commit_block_metadata` above
+        // (EVM success) still writes the same bytes in its own batch, with the
+        // receipts; the marker no longer depends on that write landing.
+        debug_assert!(!(pipelined && fold_header), "a pipelined block's header is dispatch-durable");
         if let Some(ref m) = self.metrics {
             m.exec_evm_seconds
                 .observe(evm_timer.elapsed().as_secs_f64());
@@ -3386,13 +3416,14 @@ impl ExecutionContext {
             }
 
             overlay.seed_from_bundle(&bundle);
-            // r3: header record rides the flush batch (see `fold_header`).
-            let mut header_folded = false;
-            if fold_header {
-                if let Some(bytes) = header_record_bytes(torus_block) {
-                    header_folded = overlay
-                        .put_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes(), &bytes)
-                        .is_ok();
+            // r3 / Codex D12 r2: the header record rides the flush batch (see
+            // `header_record`). The overlay put fails only on a code bug
+            // (unregistered CF, frozen overlay); it fail-stops rather than let
+            // the marker land without the header (no post-flush fallback).
+            if let Some(bytes) = &header_record {
+                if let Err(e) = overlay.put_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes(), bytes) {
+                    self.fail_stop_on_fault(torus_block, fold_header, "header fold into the flush batch", &e);
+                    return;
                 }
             }
 
@@ -3585,7 +3616,7 @@ impl ExecutionContext {
                 self.exec_failed.store(true, Ordering::SeqCst);
                 // r3: the folded header will never flush; keep the pre-fold
                 // contract (header persisted at exec) for the restart's replay.
-                if header_folded {
+                if fold_header {
                     persist_block_header(&self.state_db, torus_block);
                 }
                 return;
@@ -3658,7 +3689,7 @@ impl ExecutionContext {
                     "FATAL: native liquidation step failed — halting execution pipeline (fail-stop)"
                 );
                 self.exec_failed.store(true, Ordering::SeqCst);
-                if header_folded {
+                if fold_header {
                     persist_block_header(&self.state_db, torus_block);
                 }
                 return;
@@ -3676,7 +3707,7 @@ impl ExecutionContext {
                     "FATAL: native block tail (governance / fees / epoch) failed — halting execution pipeline (fail-stop)"
                 );
                 self.exec_failed.store(true, Ordering::SeqCst);
-                if header_folded {
+                if fold_header {
                     persist_block_header(&self.state_db, torus_block);
                 }
                 return;
@@ -3824,7 +3855,7 @@ impl ExecutionContext {
                     "FATAL: native book save failed — halting execution pipeline (fail-stop)"
                 );
                 self.exec_failed.store(true, Ordering::SeqCst);
-                if header_folded {
+                if fold_header {
                     persist_block_header(&self.state_db, torus_block);
                 }
                 return;
@@ -4076,11 +4107,6 @@ impl ExecutionContext {
                     return;
                 }
             }
-            if fold_header && !header_folded {
-                // Header encode/put into the overlay failed: fall back to the
-                // standalone exec-time put (exact-pre-r3 behaviour).
-                persist_block_header(&self.state_db, torus_block);
-            }
 
             // Phase A: native post-commit credited EVM account balances (fees / validator rewards)
             // straight to CF_ACCOUNTS via the overlay flush, bypassing incremental trie maintenance.
@@ -4292,29 +4318,39 @@ impl ExecutionContext {
                 if !self.checkpoint_upkeep(&mut overlay, height) {
                     return;
                 }
-            } else if let Some(prefix) = evm_batch.take() {
-                // Bug (c): an EVM block without a native phase (no fee revenue):
-                // its EVM batch rides the marker flush — one atomic write.
-                let pending = torus_state::FrozenPending::marker_only(height)
-                    .with_hash_extras(hash_extras.take().unwrap_or_default());
-                if let Err(e) = self.pre_flush_check(height).and_then(|()| {
-                    pending.flush_after_batch_with_native_trie_stats(
-                        prefix,
-                        &self.state_db,
-                        Some(height),
-                        None,
-                        None,
-                    )
-                }) {
-                    tracing::error!(%e, height, "FATAL: EVM block marker flush failed — fail-stop (restart replays it)");
-                    self.exec_failed.store(true, Ordering::SeqCst);
+            } else {
+                // Serial: ONE atomic write. Its prefix carries the EVM batch of
+                // an EVM block without a native phase (bug (c); for a failed
+                // EVM section only its executed/skipped record) and the header
+                // record of a block whose header is not durable (Codex D12 r2:
+                // empty and EVM blocks alike), then the marker.
+                let mut prefix = evm_batch.take().unwrap_or_default();
+                if let Some(bytes) = &header_record {
+                    match self.state_db.cf_handle(CF_BLOCK_HEADERS) {
+                        Ok(cf) => prefix.put_cf(cf, height.to_be_bytes(), bytes),
+                        Err(e) => {
+                            self.fail_stop_on_fault(
+                                torus_block,
+                                fold_header,
+                                "header row into the marker batch",
+                                &e,
+                            );
+                            return;
+                        }
+                    }
+                }
+                if !self.flush_marker_only(
+                    prefix,
+                    torus_state::FrozenPending::marker_only(height)
+                        .with_hash_extras(hash_extras.take().unwrap_or_default()),
+                ) {
+                    // As the native flush failure: the header did not land
+                    // with the batch; keep the pre-fold contract.
+                    if fold_header {
+                        persist_block_header(&self.state_db, torus_block);
+                    }
                     return;
                 }
-            } else if !self.flush_marker_only(
-                torus_state::FrozenPending::marker_only(height)
-                    .with_hash_extras(hash_extras.take().unwrap_or_default()),
-            ) {
-                return;
             }
             // r2 resident-books-stale-rebuild: this block never built a context,
             // so the order books are untouched — the rank8 resident holder is
