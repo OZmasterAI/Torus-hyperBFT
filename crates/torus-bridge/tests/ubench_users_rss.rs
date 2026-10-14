@@ -7,7 +7,10 @@
 //! from raw rows of both CFs) and reports the bytes it allocates per user:
 //! light users (2 positions) and active users (10 positions), each with a
 //! balance row and a `cvlm` row, at 100k and 1M users (`UB_USERS`, comma
-//! separated, default `100000,1000000`). Positions sit in distinct markets of
+//! separated, default `100000,1000000`), and market makers (`mm100`: 100
+//! positions, `mm300`: 300, every market) at 1k and 10k users (`UB_MM_USERS`,
+//! default `1000,10000`). `UB_SHAPES` (comma separated names, default all)
+//! picks shapes. Positions sit in distinct markets of
 //! 300 (the standard bench shape), 1 in 10 Isolated; addresses are hashed
 //! (random key order, as real addresses). Then every record gets a sums entry
 //! (the steady state after step 3: one per valued trader, never cleared).
@@ -21,11 +24,13 @@
 //! above: what the node's allocator holds, slab fragmentation not counted).
 //! Plus the process RSS delta (informational: glibc keeps freed build
 //! temporaries). The pass criterion uses the jemalloc column with sums:
-//! light <= ~0.6 KB, active <= ~2.3 KB per user (section 1). The table marks
+//! light <= ~0.6 KB, active <= ~2.3 KB per user, market makers 175 B + ~205 B
+//! per position (20,675 B for mm100, 61,675 B for mm300; section 1). The table marks
 //! each row ok / OVER; the test asserts only loose sanity bounds.
 //!
 //!   cargo test --release -p torus-bridge --test ubench_users_rss -- --ignored --nocapture
 //!   UB_USERS=100000 cargo test --release -p torus-bridge --test ubench_users_rss -- --ignored --nocapture
+//!   UB_SHAPES=mm100,mm300 cargo test --release -p torus-bridge --test ubench_users_rss -- --ignored --nocapture
 //!
 //! Run with `--ignored` (not `--include-ignored`): the counters are process
 //! wide; every test here takes `LOCK` so they do not overlap.
@@ -322,19 +327,51 @@ struct Shape {
     positions: usize,
     /// Section 1's target, bytes per user (jemalloc, with sums).
     target: usize,
+    /// A market maker: few of them, so sized by `UB_MM_USERS`, not `UB_USERS`.
+    mm: bool,
 }
 
-const SHAPES: [Shape; 2] =
-    [Shape { name: "light", positions: 2, target: 600 }, Shape { name: "active", positions: 10, target: 2300 }];
+/// Section 1's per-user formula: 175 B per account + ~125 B per position +
+/// ~80 B sums per position (light and active use the section's rounded
+/// figures).
+const fn mm_target(positions: usize) -> usize {
+    175 + (125 + 80) * positions
+}
+
+const SHAPES: [Shape; 4] = [
+    Shape { name: "light", positions: 2, target: 600, mm: false },
+    Shape { name: "active", positions: 10, target: 2300, mm: false },
+    Shape { name: "mm100", positions: 100, target: mm_target(100), mm: true },
+    Shape { name: "mm300", positions: 300, target: mm_target(300), mm: true },
+];
+
+/// The comma separated user counts in env `var`, else `default`.
+fn env_sizes(var: &str, default: &str) -> Vec<u64> {
+    std::env::var(var)
+        .unwrap_or_else(|_| default.into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap_or_else(|_| panic!("{var}: comma separated user counts")))
+        .collect()
+}
 
 #[test]
 #[ignore = "ubench: cargo test --release -p torus-bridge --test ubench_users_rss -- --ignored --nocapture"]
 fn ubench_users_rss() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let sizes: Vec<u64> = std::env::var("UB_USERS")
-        .unwrap_or_else(|_| "100000,1000000".into())
-        .split(',')
-        .map(|s| s.trim().parse().expect("UB_USERS: comma separated user counts"))
+    let (sizes, mm_sizes) = (env_sizes("UB_USERS", "100000,1000000"), env_sizes("UB_MM_USERS", "1000,10000"));
+    let only: Option<Vec<String>> = std::env::var("UB_SHAPES").ok().map(|v| v.split(',').map(|s| s.trim().to_owned()).collect());
+    if let Some(only) = &only {
+        for name in only {
+            assert!(SHAPES.iter().any(|s| s.name == name), "UB_SHAPES: unknown shape {name:?}");
+        }
+    }
+    let picked = |s: &Shape| only.as_ref().is_none_or(|o| o.iter().any(|n| n == s.name));
+    // Light and active at each `UB_USERS` size, then the market makers at
+    // each `UB_MM_USERS` size.
+    let runs: Vec<(u64, &Shape)> = [(false, &sizes), (true, &mm_sizes)]
+        .into_iter()
+        .flat_map(|(mm, ns)| ns.iter().flat_map(move |&n| SHAPES.iter().filter(move |s| s.mm == mm).map(move |s| (n, s))))
+        .filter(|(_, s)| picked(s))
         .collect();
     println!("USERS_RSS bytes per user of the Users record set (orders excluded); allocator: counting over System,");
     println!("USERS_RSS columns: req = asked for, glibc = usable + 8 B header, jemalloc = jemalloc 5 size class (the node's allocator),");
@@ -343,48 +380,46 @@ fn ubench_users_rss() {
         "USERS_RSS {:<6} {:>9} {:>4} | {:>7} {:>7} {:>8} {:>7} | {:>12} {:>12} {:>7} | {:>7} {:>7} {:>8} {:>6} {:>5}",
         "shape", "users", "pos", "req", "glibc", "jemalloc", "allocs", "+sums glibc", "+sums jemal", "target", "rss", "+rss", "logical", "map_lf", "pass"
     );
-    for n in sizes {
-        for s in &SHAPES {
-            let k = s.positions;
-            let (pos, bal) = synth(n, k);
-            let s0 = snap();
-            let mut p = UsersProbe::build(&pos, &bal);
-            let s1 = snap();
-            check_regular(&p, n, k);
-            assert_eq!(p.fill_sums(1), n as usize);
-            let s2 = snap();
-            assert_eq!(p.sums_at(1), n as usize);
-            let (b, w) = (s1 - s0, s2 - s0);
-            let per = |x: isize| x as f64 / n as f64;
-            let logical = p.rows_and_bytes().1 as f64 / n as f64;
-            let lf = n as f64 / p.map_capacity() as f64;
-            let pass = if per(w.je) <= s.target as f64 { "ok" } else { "OVER" };
-            println!(
-                "USERS_RSS {:<6} {:>9} {:>4} | {:>7.0} {:>7.0} {:>8.0} {:>7.2} | {:>12.0} {:>12.0} {:>7} | {:>7.0} {:>7.0} {:>8.0} {:>6.2} {:>5}",
-                s.name,
-                n,
-                k,
-                per(b.req),
-                per(b.glibc),
-                per(b.je),
-                per(b.live),
-                per(w.glibc),
-                per(w.je),
-                s.target,
-                per(b.rss),
-                per(w.rss),
-                logical,
-                lf,
-                pass
-            );
-            // Loose sanity only (not the gate): the positions alone, and at
-            // most ~4x the target.
-            assert!(per(b.req) >= (k * 112) as f64, "{} {n}: {:.0} B/user below its positions", s.name, per(b.req));
-            assert!(per(w.je) <= (4 * s.target) as f64, "{} {n}: {:.0} B/user, over 4x the target", s.name, per(w.je));
-            drop(p);
-            let freed = snap() - s0;
-            assert_eq!(freed.live, 0, "drop frees the record set");
-            drop((pos, bal));
-        }
+    for (n, s) in runs {
+        let k = s.positions;
+        let (pos, bal) = synth(n, k);
+        let s0 = snap();
+        let mut p = UsersProbe::build(&pos, &bal);
+        let s1 = snap();
+        check_regular(&p, n, k);
+        assert_eq!(p.fill_sums(1), n as usize);
+        let s2 = snap();
+        assert_eq!(p.sums_at(1), n as usize);
+        let (b, w) = (s1 - s0, s2 - s0);
+        let per = |x: isize| x as f64 / n as f64;
+        let logical = p.rows_and_bytes().1 as f64 / n as f64;
+        let lf = n as f64 / p.map_capacity() as f64;
+        let pass = if per(w.je) <= s.target as f64 { "ok" } else { "OVER" };
+        println!(
+            "USERS_RSS {:<6} {:>9} {:>4} | {:>7.0} {:>7.0} {:>8.0} {:>7.2} | {:>12.0} {:>12.0} {:>7} | {:>7.0} {:>7.0} {:>8.0} {:>6.2} {:>5}",
+            s.name,
+            n,
+            k,
+            per(b.req),
+            per(b.glibc),
+            per(b.je),
+            per(b.live),
+            per(w.glibc),
+            per(w.je),
+            s.target,
+            per(b.rss),
+            per(w.rss),
+            logical,
+            lf,
+            pass
+        );
+        // Loose sanity only (not the gate): the positions alone, and at
+        // most ~4x the target.
+        assert!(per(b.req) >= (k * 112) as f64, "{} {n}: {:.0} B/user below its positions", s.name, per(b.req));
+        assert!(per(w.je) <= (4 * s.target) as f64, "{} {n}: {:.0} B/user, over 4x the target", s.name, per(w.je));
+        drop(p);
+        let freed = snap() - s0;
+        assert_eq!(freed.live, 0, "drop frees the record set");
+        drop((pos, bal));
     }
 }
