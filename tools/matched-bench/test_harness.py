@@ -326,7 +326,9 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail=commit\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail=commit\n")
+            )
         s, _ = run_summarize(
             self.d, extra=["--max-in-flight", "1", "--in-flight-tail", "commit"]
         )
@@ -339,6 +341,93 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
         self.assertIsNone(s["cell"]["in_flight_tail"], "unset = flag omitted")
         self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "head")
+
+    # bench --max-in-flight release timing (feat/bench-release-timing, s121):
+    # the lines exactly as release_timing.rs window_and_hist_lines_are_stable
+    # prints them, plus one key and one histogram the bench does not print yet
+    # (a later bench adding fields must come through without a summarize.py
+    # change).
+    BENCH_LOG_RELEASE_TIMING = (
+        "release-timing: t=15.0 wall_ms=1760000015000 final=0 released=4 "
+        "age_p50_ms=416 age_p90_ms=1600 age_p99_ms=1600 age_max_ms=1600 ready_calls=3 "
+        "wait_cap_n=2 wait_cap_s=0.006 wait_cap_p50_ms=1.0 wait_cap_p99_ms=4.9 "
+        "wait_cancel_n=1 wait_cancel_s=0.002 wait_cancel_p50_ms=2.0 wait_cancel_p99_ms=2.0 "
+        "tail_rounds=2 tail_fetched=3 tail_fetch_max=2 tail_round_p50_ms=4.0 "
+        "tail_round_max_ms=12.0 tail_lag_max=3 tail_body_p50_ms=3.2\n"
+        "release-timing-blocks: t=15.0 seen=7@1000,8@1050,9@1300\n"
+        "release-timing: t=30.0 wall_ms=1760000030000 final=1 released=0 "
+        "age_p50_ms=- age_p90_ms=- age_p99_ms=- age_max_ms=- ready_calls=0 "
+        "wait_cap_n=0 wait_cap_s=0.000 wait_cap_p50_ms=- wait_cap_p99_ms=- "
+        "wait_cancel_n=0 wait_cancel_s=0.000 wait_cancel_p50_ms=- wait_cancel_p99_ms=- "
+        "tail_rounds=0 tail_fetched=0 tail_fetch_max=- tail_round_p50_ms=- "
+        "tail_round_max_ms=- tail_lag_max=-\n"
+        "release-timing-blocks: t=30.0 seen=\n"
+        "release-timing-hist: what=age_ms n=4 sum=3320 p50=416 p90=1600 p99=1600 "
+        "p999=1600 max=1600 buckets=400:1,416:1,896:1,1600:1\n"
+        "release-timing-hist: what=wait_cancel_us n=0 sum=0 p50=- p90=- p99=- p999=- "
+        "max=- buckets=\n"
+        "release-timing-hist: what=tail_body_us n=1 sum=3200 p50=3200 p90=3200 "
+        "p99=3200 p999=3200 max=3200 buckets=3200:1\n"
+    )
+
+    def test_release_timing_lines_are_summarized(self):
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED + self.BENCH_LOG_RELEASE_TIMING)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
+        rt = s["ingest"]["release_timing"]
+        w0, w1 = rt["windows"]
+        self.assertEqual(w0["t"], 15.0)
+        self.assertEqual(w0["wall_ms"], 1760000015000)
+        self.assertEqual(w0["final"], 0)
+        self.assertEqual(w0["released"], 4)
+        self.assertEqual(w0["age_p50_ms"], 416)
+        self.assertEqual(w0["wait_cap_s"], 0.006)
+        self.assertEqual(w0["tail_fetch_max"], 2)
+        self.assertEqual(w0["tail_round_max_ms"], 12.0)
+        self.assertEqual(w0["tail_body_p50_ms"], 3.2, "unknown keys pass through")
+        self.assertEqual(len(w0), 25)
+        self.assertEqual(w1["final"], 1)
+        self.assertIsNone(w1["age_p50_ms"], "'-' = no sample in the window")
+        self.assertIsNone(w1["tail_lag_max"])
+        self.assertEqual(w1["wait_cap_s"], 0.0)
+        # Seen heights stay in bench.log (offline join with the commit log).
+        self.assertEqual(rt["seen_bodies"], 3)
+        self.assertEqual(
+            rt["hist"]["age_ms"],
+            {
+                "n": 4,
+                "sum": 3320,
+                "p50": 416,
+                "p90": 1600,
+                "p99": 1600,
+                "p999": 1600,
+                "max": 1600,
+                "buckets": [[400, 1], [416, 1], [896, 1], [1600, 1]],
+            },
+        )
+        self.assertEqual(
+            rt["hist"]["wait_cancel_us"],
+            {
+                "n": 0,
+                "sum": 0,
+                "p50": None,
+                "p90": None,
+                "p99": None,
+                "p999": None,
+                "max": None,
+                "buckets": [],
+            },
+        )
+        self.assertEqual(
+            rt["hist"]["tail_body_us"]["p50"], 3200, "unknown hists pass through"
+        )
+        # A bench without release timing (or cap off): None, not an empty dict.
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED)
+        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
+        self.assertIsNone(s["ingest"]["release_timing"])
 
     def test_rpc_max_response_mb_comes_from_the_node_env(self):
         write_cell(self.d, 1_000, 1_000)
@@ -368,13 +457,26 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED + (
-                "Cancel-by-id (load-gen): cancel sent 900 accepted 880 | modify sent 450 "
-                "accepted 440 | lookups 700 errors 3 | no own order 25\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED
+                + (
+                    "Cancel-by-id (load-gen): cancel sent 900 accepted 880 | modify sent 450 "
+                    "accepted 440 | lookups 700 errors 3 | no own order 25\n"
+                )
+            )
         s, _ = run_summarize(self.d)
-        self.assertEqual(s["ingest"]["cancel_by_id"], {
-            "cancel_sent": 900, "cancel_accepted": 880, "modify_sent": 450,
-            "modify_accepted": 440, "lookups": 700, "lookup_errors": 3, "no_own_order": 25})
+        self.assertEqual(
+            s["ingest"]["cancel_by_id"],
+            {
+                "cancel_sent": 900,
+                "cancel_accepted": 880,
+                "modify_sent": 450,
+                "modify_accepted": 440,
+                "lookups": 700,
+                "lookup_errors": 3,
+                "no_own_order": 25,
+            },
+        )
         write_cell(self.d, 1_000, 1_000)
         s, _ = run_summarize(self.d)
         self.assertIsNone(s["ingest"]["cancel_by_id"])
@@ -383,11 +485,16 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED + (
-                "Cloids (load-gen generated): 4521 of 9040 orders (50.0%) | --cloid-share 50%\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED
+                + (
+                    "Cloids (load-gen generated): 4521 of 9040 orders (50.0%) | --cloid-share 50%\n"
+                )
+            )
         s, _ = run_summarize(self.d)
-        self.assertEqual(s["ingest"]["cloids"], {
-            "share_pct": 50, "stamped": 4521, "placed": 9040})
+        self.assertEqual(
+            s["ingest"]["cloids"], {"share_pct": 50, "stamped": 4521, "placed": 9040}
+        )
         # A bench before --cloid-share prints no line: None, not 0%.
         write_cell(self.d, 1_000, 1_000)
         s, _ = run_summarize(self.d)
@@ -971,7 +1078,9 @@ class CrashKillGuardTest(unittest.TestCase):
         for mode in ("head", "commit"):
             r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=mode)
             self.assertEqual(
-                (r.returncode, r.stdout.strip()), (0, f"--in-flight-tail {mode}"), r.stderr
+                (r.returncode, r.stdout.strip()),
+                (0, f"--in-flight-tail {mode}"),
+                r.stderr,
             )
         for bad in ("x", "applied", "1"):
             r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=bad)
@@ -1069,22 +1178,35 @@ class CrashKillGuardTest(unittest.TestCase):
         for v in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION"):
             self.assertIn(f"{v}=${{{v}:-}}", src)
             self.assertIn(f"'${{{v}:-unset}}'", src)
-        lines = [l for l in src.splitlines()
-                 if ("CANCEL_BY_ID_FRACTION" in l or "MODIFY_FRACTION" in l)
-                 and not l.lstrip().startswith(("#", "log "))]
+        lines = [
+            l
+            for l in src.splitlines()
+            if ("CANCEL_BY_ID_FRACTION" in l or "MODIFY_FRACTION" in l)
+            and not l.lstrip().startswith(("#", "log "))
+        ]
         snippet = "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
 
         def run(**env):
-            base = {k: v for k, v in os.environ.items()
-                    if k not in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION")}
-            return subprocess.run(["bash", "-c", snippet], capture_output=True,
-                                  text=True, env=dict(base, **env))
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION")
+            }
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
 
         r = run()
         self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
         r = run(CANCEL_BY_ID_FRACTION="0.1", MODIFY_FRACTION="0.05")
-        self.assertEqual(r.stdout.strip(),
-                         "--cancel-by-id-fraction 0.1 --modify-fraction 0.05", r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "--cancel-by-id-fraction 0.1 --modify-fraction 0.05",
+            r.stderr,
+        )
         for bad in ({"CANCEL_BY_ID_FRACTION": "2"}, {"MODIFY_FRACTION": "x"}):
             r = run(**bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
