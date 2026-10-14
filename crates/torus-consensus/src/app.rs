@@ -27802,4 +27802,84 @@ mod crash_recovery_tests {
             );
         }
     }
+
+    /// Codex D12 r2 regression: block 2 (a valid EVM tx, a failed dispatch
+    /// batch = `DurableRows::default()`, an ordinary EVM section error, no
+    /// native phase) is applied WITH its header, so block 3's nonce-window
+    /// prune reads its parent header (the cursor) and proceeds: live, and in
+    /// the boot replay of a node that restarts before executing block 3. A
+    /// restart after block 3 (the probe's restart) replays nothing and does
+    /// not fail. Block 3's cutoff expires block 1's nonce row: its prune ran
+    /// with block 2's time as the cursor. Serial and pipelined. Before the
+    /// fix (Codex probe `d12_r2_evm_header_probe`): `after_block2
+    /// applied=Some(2) header_present=false failed=false`, `block3
+    /// failed=true`, `restart failed=true applied=Some(2) parked=None`.
+    #[test]
+    fn d12_r2_evm_ordinary_error_block_keeps_header_successor_and_replay_proceed() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x65; 32]).unwrap();
+        for on in [false, true] {
+            for restart_before_3 in [false, true] {
+                let what = format!("on={on} restart_before_3={restart_before_3}");
+                let (_c, db) = make_test_config_and_db();
+                r02_fund(&db, &key);
+                let mut b2 = d12_block(2, 2000, vec![]);
+                b2.evm_transactions = vec![hdr_evm_call(&key, 0)];
+                b2.header.evm_tx_count = 1;
+                let mut blocks = vec![
+                    d12_block(1, 2000, vec![d12_claim(0xa1, 1_999_000)]),
+                    b2,
+                    d12_block(3, 2061, vec![]),
+                ];
+                link_blocks(&mut blocks);
+                assert!(evm_body_fits_header(&blocks[1].header, &blocks[1].evm_transactions));
+                let mut ctx = pipeline_ctx(&db, on, None);
+                dispatch_and_execute(&ctx, &db, &blocks[0]);
+                assert!(ctx.pipeline_barrier(), "{what}");
+                assert_eq!(d12_rows(&db), vec![(1_999_000, 0xa1)], "{what}");
+                ctx.test_replay_fault = Some(ReplayFault::EvmSectionError);
+                ctx.execute_committed_block_with(&blocks[1], vec![], DurableRows::default());
+                ctx.test_replay_fault = None;
+                let header2 = db.get_cf_raw(CF_BLOCK_HEADERS, &2u64.to_be_bytes()).unwrap();
+                assert_eq!(
+                    (
+                        read_native_applied_height(&db),
+                        header2 == header_record_bytes(&blocks[1]),
+                        ctx.exec_failed.load(Ordering::SeqCst)
+                    ),
+                    (Some(2), true, false),
+                    "{what}: after block 2 (applied, header_present, failed)"
+                );
+                let ctx = if restart_before_3 {
+                    // Block 3 committed (dispatch rows durable), not executed.
+                    let durable = persist_committed_block_durably(&db, &blocks[2]);
+                    assert!(durable.header && durable.body, "{what}");
+                    drop(ctx);
+                    let ctx = pipeline_ctx(&db, false, None);
+                    let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: boot replay failed");
+                    assert_eq!(parked, None, "{what}");
+                    assert_eq!(last.height, 3, "{what}: block 3 replayed");
+                    ctx
+                } else {
+                    dispatch_and_execute(&ctx, &db, &blocks[2]);
+                    assert!(ctx.pipeline_barrier(), "{what}");
+                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 3 failed");
+                    ctx
+                };
+                assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
+                assert_eq!(
+                    ctx.test_nonce_prune.lock().unwrap().last().map(|&(h, _, deleted)| (h, deleted)),
+                    Some((3, 1)),
+                    "{what}: block 3's prune deleted block 1's row"
+                );
+                assert!(d12_rows(&db).is_empty(), "{what}");
+                drop(ctx);
+                let ctx = pipeline_ctx(&db, false, None);
+                let (_, parked) = TorusApp::replay_committed(&db, &ctx);
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: restart failed");
+                assert_eq!(parked, None, "{what}");
+                assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
+            }
+        }
+    }
 }
