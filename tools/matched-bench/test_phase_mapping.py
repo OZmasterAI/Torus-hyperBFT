@@ -140,10 +140,12 @@ class PhaseMappingTests(unittest.TestCase):
         self.assertIn(f"peak_execq={19 * 1180}", output)
 
     def test_wide_cols_carry_every_end_resident_series_summarize_reads(self):
-        """Item 6 steps 1 / 2: summarize.py reads end_resident, its two subs
+        """Item 6 steps 1 / 2: summarize.py reads end_resident, its subs
         and the join wait (per native block, plus the wait's count to tell a
         step 2 binary, plus its buckets for p50 / p90). A series missing from
-        WIDE_COLS reads as 0.0 in summary.json (ozarchy, 5524646)."""
+        WIDE_COLS reads as 0.0 in summary.json (ozarchy, 5524646). Phase 4
+        step 1 renamed the positions sub to users; both stay sampled so an
+        A/B against an older binary still reads its positions sub."""
         script = (Path(__file__).parent / "run-cell.sh").read_text()
         wide = re.search(r'^WIDE_COLS="([^"]+)"', script, re.M).group(1).split()
         buckets = re.search(r'^BUCKET_METRICS="([^"]+)"', script, re.M).group(1).split()
@@ -151,6 +153,7 @@ class PhaseMappingTests(unittest.TestCase):
             "end_resident",
             "end_resident_rows",
             "end_resident_positions",
+            "end_resident_users",
             "end_resident_wait",
         ):
             self.assertIn(f"torus_exec_{name}_seconds_sum", wide, name)

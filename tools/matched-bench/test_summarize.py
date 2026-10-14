@@ -115,11 +115,19 @@ COUNTERS = {
 COMMIT_BUCKETS = [("0.1", 0), ("0.2", 50), ("0.4", 100), ("+Inf", 100)]
 
 
-# Item 6 step 1: end_resident and its two subs (per native block).
+# Item 6 step 1: end_resident and its two subs (per native block), as an
+# older binary (before Phase 4 step 1) emits them.
 END_RESIDENT = {
     "exec_end_resident_seconds": 0.030,
     "exec_end_resident_rows_seconds": 0.012,
     "exec_end_resident_positions_seconds": 0.010,
+}
+# Phase 4 step 1 renamed the positions sub to users (it also follows balance
+# and cvlm rows); a new binary emits only the users series.
+END_RESIDENT_USERS = {
+    "exec_end_resident_seconds": 0.030,
+    "exec_end_resident_rows_seconds": 0.012,
+    "exec_end_resident_users_seconds": 0.010,
 }
 
 
@@ -153,11 +161,14 @@ CKPT_BUCKETS = {
 def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_resident_worker=False,
                   checkpoint=False):
     """bl1: 'serial' | 'pipelined' | 'none' (a pre-bl1 node binary).
-    end_resident: the binary times end_resident (item 6 step 1);
+    end_resident: the binary times end_resident (item 6 step 1); "users":
+    a Phase 4 step 1 binary (users sub in place of positions);
     end_resident_worker: it runs on a worker, with a join wait (step 2)."""
     extra = {"serial": BL1_SERIAL, "pipelined": BL1_PIPELINED, "none": {}}[bl1]
     per_blk = dict(PER_BLK)
-    if end_resident:
+    if end_resident == "users":
+        per_blk.update(END_RESIDENT_USERS)
+    elif end_resident:
         per_blk.update(END_RESIDENT)
     if end_resident_worker:
         per_blk.update(END_RESIDENT_WAIT)
@@ -663,6 +674,7 @@ def main_end_resident():
         close(er["ms"], 30.0, "end_resident ms/blk")
         close(er["end_resident_rows_ms"], 12.0, "end_resident_rows_ms")
         close(er["end_resident_positions_ms"], 10.0, "end_resident_positions_ms")
+        close(er["end_resident_users_ms"], 0.0, "end_resident_users_ms on an older binary")
         assert er["off_chain"] is False, "end_resident runs on the exec thread"
         check_phase_accounting(p0, worker=True)
         close(p0["phases"]["residual_untimed"]["ms"], 15.0, "residual (pipelined, end_resident timed)")
@@ -677,6 +689,23 @@ def main_end_resident():
         assert "end_resident" in p0["chain_identity"]["e_phases"]
         close(p0["phases"]["end_resident_wait"]["ms"], 0.0, "no wait before step 2")
         assert p0["end_resident_wait_ms_p50"] is None
+
+
+def main_end_resident_users():
+    """Item 6 Phase 4 step 1: a new binary emits the users sub
+    (`exec_end_resident_users_seconds`) and no positions sub; summarize reads
+    users, positions reads 0.0, and end_resident / residual are unchanged."""
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident="users")
+        p0 = run(out)["phase_by_node"]["val0"]
+        er = p0["phases"]["end_resident"]
+        close(er["ms"], 30.0, "end_resident ms/blk (users binary)")
+        close(er["end_resident_rows_ms"], 12.0, "end_resident_rows_ms (users binary)")
+        close(er["end_resident_users_ms"], 10.0, "end_resident_users_ms")
+        close(er["end_resident_positions_ms"], 0.0, "end_resident_positions_ms on a users binary")
+        check_phase_accounting(p0, worker=True)
+        close(p0["phases"]["residual_untimed"]["ms"], 15.0, "residual (users binary)")
+    print("test_summarize.py end_resident users: OK")
 
 
 def main_end_resident_worker():
@@ -958,6 +987,7 @@ def main_phase2_step0():
 if __name__ == "__main__":
     main()
     main_end_resident()
+    main_end_resident_users()
     main_end_resident_worker()
     main_s58()
     main_feed_drain()
