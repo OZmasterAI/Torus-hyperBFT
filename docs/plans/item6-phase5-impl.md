@@ -269,6 +269,8 @@ Codex torus-adversarial review before step 4.
 
 Only if Phase 4 step 5 was dropped or moved (owner s119) and step 0 still shows `open_order_counts` at a size worth it.
 Same keep rule as s119: kept only on its own net A/B (counter upkeep netted). Decision 5.
+**Moved here (owner s120):** Phase 4 step 5 (`6288ebe8`) had no net gain (section 68: walk saved -2.76 ms per 1k fills,
+counter read ~3.7 ms per native block); revisit after step 0, needs a cheaper counter read; drop if still no net gain.
 
 - Test first: `open_order_count_in_user_equals_book_scan` (Phase 4 step 5's test), serial and with match workers.
 - Code: count deltas from the book dirty sites of step 3 (shared upkeep); `open_at_start` (:7019, :9762) reads the
