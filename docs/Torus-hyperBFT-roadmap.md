@@ -205,6 +205,22 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 - **Acceptance:** A revert test proves a writer-precompile write is undone on revert (fixes the correctness bug regardless of parallelism). Then, if parallel execution is pursued: identical state root vs sequential execution over a large chaos workload.
 - **Effort:** the journaling is medium; Block-STM is large. **Risk:** high for the parallel part. **Impact:** fixes a real correctness bug *now*, and is the only path to parallel execution *later* — but only pays off once the gas budget rises toward the 30M block limit (today's 5M selection budget makes serial execution adequate). **Sequence the journaling fix early (correctness); defer Block-STM until the gas budget is the binding constraint.**
 
+## Tier 5 — Latency: block cadence and tail *(after item 6; added s121)*
+
+> **Why after item 6:** item 6 (Phases 1-5) targets matched/s on the exec-bound axis. Block time is where Hyperliquid is furthest ahead: HL publishes a 0.2 s median and 0.9 s p99 end-to-end latency (co-located client, request to committed response; HL docs, HyperCore overview) and runs ~70 ms blocks (unofficial figure). Our bench (300 markets, Phase 4 node, section 71 of `perf/ozarchy-antispam-item6-pf1-2026-10-04.md`) runs ~310 ms per block with a block-time p99 of 1.29-1.43 s. The numbers are not like for like (HL: end-to-end latency at normal load; ours: block interval under a saturating bench, 3 validators on one host), so step 1 of each item is measuring them the same way.
+
+### T5.1 — The ~310 ms block cadence (consensus timing) [LOCAL first, LOCKSTEP if timers change]
+- **Problem:** 3.13-3.24 blocks/s at 300 markets (section 71), ~4x HL's block interval. s67 found the view dominated by waiting for the proposal (~345 ms of a ~600 ms view, block building), not by votes (vote-DB A/B: vote save p99 113 -> 4 ms, no change downstream).
+- **Plan:** (1) Attribution, no code: per view, time from QC to proposal sent, block build, dissemination, proposal arrival, vote, QC; at 10 and 300 markets, idle and loaded. (2) Then pick: pacemaker / timer settings, building the next proposal earlier (pipelining), smaller or earlier bodies.
+- **Acceptance:** a measured breakdown of one view that sums to the block interval, then an A/B of the chosen change (blocks/s, block-time p50/p99, matched/s no regression).
+- **Effort:** attribution small; the fix unknown until then.
+
+### T5.2 — The unexplained ~1.2 s block-time p99 floor
+- **Problem:** outside checkpoint windows, val0 commit p99 is still 1,164-1,281 ms (section 71; inside windows 1,740-1,971 ms). The in-window part is the checkpoint write queue (consensus and mempool writes behind the ~200 MB checkpoint batch in the shared state DB), handled separately (section 71 follow-up; own DB for the HotStuff and DA stores, or a checkpoint write off the shared path). Nothing explains the floor yet.
+- **Plan:** (1) Attribution, no code: which views make the slowest 1% outside checkpoint windows (timeouts, late proposals, slow validation, GC / compaction, network), from existing 600 s cells first. (2) Fix by cause.
+- **Acceptance:** the slow views explained by cause, then an A/B of the fix (block-time p99 outside windows down, no regression elsewhere).
+- **Effort:** attribution small to medium; fix unknown.
+
 ---
 
 ## Product-parity track — P0 to P5 *(runs alongside Tiers 1–4)*
