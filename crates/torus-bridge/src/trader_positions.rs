@@ -440,3 +440,9 @@ pub(crate) fn find(ps: &[Position], market_id: MarketId) -> Option<&Position> {
 #[cfg(test)]
 #[path = "trader_positions_tests.rs"]
 mod tests;
+
+// Item 6 Phase 4 step 1 (RED): the `Users` record set's tests; `users.rs`
+// replaces this module.
+#[cfg(test)]
+#[path = "users_tests.rs"]
+mod users_tests;
