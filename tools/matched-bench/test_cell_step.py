@@ -819,6 +819,52 @@ def test_helper_rerun_pass_runs_each_once(e):
 
 
 @with_env()
+def test_helper_rerun_pass_counter_advances_when_the_runner_clobbers_its_names(e):
+    """the RERUN i/N progress line counts 1/3 2/3 3/3 even when the runner assigns the pass's own variable names
+    without `local` (bash dynamic scope: the template's cell() sets n=0 for its TORUS_SHUTDOWN_TIMEOUT_SECS check,
+    which made every rerun of ozarchy-p4gate print 1/N), and every queued rerun still runs once with its own spec"""
+    with open(e.run_path("rerun-queue.tsv"), "w") as fh:
+        for i in (1, 2, 3):
+            fh.write("c%d-rerun\tc%d\tm\tr%d\tc%d:m:120:none:\n" % (i, i, i, i))
+    calls = e.run_path("runner-calls.txt")
+    script = (
+        "source %s\n"
+        'run_spec() { echo "$1|$2" >> %s; n=0; i=0; rl=clobbered; ol=x; arm=x; rep=x; spec=x; q=(); line=x; out=x; '
+        "return 0; }\n"
+        'cell_step_rerun_pass %s run_spec; echo "pass=$?"\n'
+        % (q(HELPER), q(calls), q(e.RUN))
+    )
+    r = bash(script)
+    out = r.stdout + r.stderr
+    assert "pass=0" in r.stdout, out
+    prog = re.findall(r"RERUN (\d+)/(\d+) (\S+)", r.stdout)
+    assert prog == [
+        ("1", "3", "c1-rerun"),
+        ("2", "3", "c2-rerun"),
+        ("3", "3", "c3-rerun"),
+    ], out
+    assert open(calls).read().splitlines() == [
+        "c1:m:120:none:|-rerun",
+        "c2:m:120:none:|-rerun",
+        "c3:m:120:none:|-rerun",
+    ], open(calls).read()
+
+
+@with_env()
+def test_helper_rerun_pass_stop_names_the_failing_rerun(e):
+    """a runner that fails (and clobbers rl) stops the pass, and the STOP line names the rerun that failed"""
+    with open(e.run_path("rerun-queue.tsv"), "w") as fh:
+        fh.write("c1-rerun\tc1\tm\tr1\tc1:m:120:none:\n")
+    r = bash(
+        "source %s\n"
+        "run_spec() { rl=clobbered; return 1; }\n"
+        'cell_step_rerun_pass %s run_spec; echo "pass=$?"\n' % (q(HELPER), q(e.RUN))
+    )
+    assert "pass=1" in r.stdout, r.stdout + r.stderr
+    assert "RERUN PASS STOP at c1-rerun" in r.stdout, r.stdout + r.stderr
+
+
+@with_env()
 def test_template_run_spec_with_stub_cell(e):
     """the template's own run_spec (extracted verbatim) with a stub cell(): a started bad cell gets its row and a
     rerun, a cell that never started gets no row, the rerun pass runs <tag>-rerun once with the same arm and rep"""
