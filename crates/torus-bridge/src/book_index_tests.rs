@@ -251,3 +251,153 @@ fn order_book_mut_feeds_indexes() {
     assert_eq!(ctx.order_book(3).unwrap().open_order_count(&addr(3)), 0, "cancel-all reached 3");
     stash_and_check(ctx, &mut holder, "order_book_mut");
 }
+
+// ---- Codex review P2 (s120): a whole book swapped in through the
+// `&mut OrderBook` that `order_book_mut` / `for_each_order_book_mut` hand
+// out. A loaded or copied book carries no log of its traders and cloids,
+// so feeding logs alone leaves them unindexed: the context must notice the
+// book is not the one it lent and rebuild both indexes.
+
+#[derive(Clone, Copy, Debug)]
+enum Via {
+    Guard,
+    ForEach,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    Replace,
+    Swap,
+}
+
+/// `book` as a load (or a copy: `OrderBook` is not `Clone`) gives it: the
+/// same orders, empty logs.
+fn as_loaded(book: &OrderBook) -> OrderBook {
+    let bytes = borsh::to_vec(book).unwrap();
+    let mut copy = <OrderBook as borsh::BorshDeserialize>::try_from_slice(&bytes).unwrap();
+    copy.drain_new_traders();
+    copy.clear_cloid_log();
+    copy
+}
+
+/// Put `book` at `market` through `via` with `op`; `book` then holds the
+/// book it replaced.
+fn put_book(ctx: &mut NativeExecContext, via: Via, op: Op, market: MarketId, book: &mut OrderBook) {
+    fn put(slot: &mut OrderBook, book: &mut OrderBook, op: Op) {
+        match op {
+            Op::Swap => std::mem::swap(slot, book),
+            Op::Replace => {
+                let placeholder = OrderBook::new(0, FixedPoint::ONE, FixedPoint::ONE);
+                let incoming = std::mem::replace(book, placeholder);
+                *book = std::mem::replace(slot, incoming);
+            }
+        }
+    }
+    match via {
+        Via::Guard => put(&mut ctx.order_book_mut(market).unwrap(), book, op),
+        Via::ForEach => {
+            let mut hits = 0;
+            ctx.for_each_order_book_mut(|m, slot| {
+                if m == market {
+                    put(slot, book, op);
+                    hits += 1;
+                }
+            });
+            assert_eq!(hits, 1);
+        }
+    }
+}
+
+/// Market 3's book replaced by a loaded one holding `addr(3)`'s `C + 70`
+/// and `C + 71`: both are found, `addr(1)`'s `C + 3` left with the old
+/// book, a cancel-all of `addr(3)` reaches market 3.
+fn loaded_book_is_indexed(via: Via, op: Op) {
+    let what = format!("{via:?} {op:?} loaded");
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut holder = ResidentBooks::default();
+    let mut ctx = ctx_at(&db, 1, &mut holder);
+    seed(&mut ctx);
+
+    let mut built = OrderBook::new(3, FixedPoint::ONE, FixedPoint::ONE);
+    built.place_order(params(3, true, 90, Some(C + 70)), addr(3), 1);
+    built.place_order(params(3, false, 600, Some(C + 71)), addr(3), 1);
+    let mut book = as_loaded(&built);
+    put_book(&mut ctx, via, op, 3, &mut book);
+    assert_eq!(book.open_order_count(&addr(1)), 1, "{what}: the old book came out");
+    assert_eq!(ctx.order_book(3).unwrap().open_order_count(&addr(3)), 2, "{what}: in");
+
+    dup(&exec(&mut ctx, 3, sell(8, 500, Some(C + 70))), &format!("{what}: C + 70 rests in 3"));
+    dup(&exec(&mut ctx, 3, buy(8, 90, Some(C + 71))), &format!("{what}: C + 71 rests in 3"));
+    ok(&exec(&mut ctx, 1, sell(8, 500, Some(C + 3))), &format!("{what}: C + 3 left"));
+    assert_consistent(&ctx, &what);
+    ok(&exec(&mut ctx, 3, cancel_all()), &what);
+    assert_eq!(
+        ctx.order_book(3).unwrap().open_order_count(&addr(3)),
+        0,
+        "{what}: cancel-all reached 3"
+    );
+    stash_and_check(ctx, &mut holder, &what);
+}
+
+/// Market 3's book replaced by a copy of itself taken before `addr(1)`'s
+/// `C + 3` was cancelled and `addr(2)`'s `C + 50` rested: `C + 3` is live
+/// again, `C + 50` is free, a cancel-all of `addr(1)` reaches market 3.
+fn stale_copy_is_indexed(via: Via, op: Op) {
+    let what = format!("{via:?} {op:?} copy");
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut holder = ResidentBooks::default();
+    let mut ctx = ctx_at(&db, 1, &mut holder);
+    seed(&mut ctx);
+
+    let mut copy = as_loaded(ctx.order_book(3).unwrap());
+    ok(
+        &exec(&mut ctx, 1, NativeAction::CancelAllOrders { market_id: Some(3) }),
+        &format!("{what}: cancel C + 3"),
+    );
+    ok(&exec(&mut ctx, 2, buy(3, 95, Some(C + 50))), &format!("{what}: C + 50"));
+    dup(&exec(&mut ctx, 2, sell(8, 500, Some(C + 50))), &format!("{what}: C + 50 rests"));
+    put_book(&mut ctx, via, op, 3, &mut copy);
+
+    dup(&exec(&mut ctx, 1, sell(8, 500, Some(C + 3))), &format!("{what}: C + 3 is back"));
+    ok(&exec(&mut ctx, 2, sell(8, 500, Some(C + 50))), &format!("{what}: C + 50 left"));
+    assert_consistent(&ctx, &what);
+    ok(&exec(&mut ctx, 1, cancel_all()), &what);
+    assert_eq!(
+        ctx.order_book(3).unwrap().open_order_count(&addr(1)),
+        0,
+        "{what}: cancel-all reached 3"
+    );
+    stash_and_check(ctx, &mut holder, &what);
+}
+
+#[test]
+fn guard_replace_with_loaded_book_is_indexed() {
+    loaded_book_is_indexed(Via::Guard, Op::Replace);
+}
+
+#[test]
+fn guard_swap_with_loaded_book_is_indexed() {
+    loaded_book_is_indexed(Via::Guard, Op::Swap);
+}
+
+#[test]
+fn for_each_replace_with_loaded_book_is_indexed() {
+    loaded_book_is_indexed(Via::ForEach, Op::Replace);
+}
+
+#[test]
+fn for_each_swap_with_loaded_book_is_indexed() {
+    loaded_book_is_indexed(Via::ForEach, Op::Swap);
+}
+
+#[test]
+fn guard_replace_with_stale_copy_is_indexed() {
+    stale_copy_is_indexed(Via::Guard, Op::Replace);
+}
+
+#[test]
+fn for_each_swap_with_stale_copy_is_indexed() {
+    stale_copy_is_indexed(Via::ForEach, Op::Swap);
+}
