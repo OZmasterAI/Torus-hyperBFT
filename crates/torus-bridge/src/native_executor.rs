@@ -23,7 +23,7 @@ use torus_core::margin::{
 use torus_core::oracle::{OracleConfig, OracleManager};
 use torus_core::order_book::{
     band_reference, market_row_shape, order_price_violation, price_band_violation, reduce_only_allowance,
-    shape_violation, AccountMargins, CloidKey, Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult,
+    shape_violation, AccountMargins, BookLogMark, CloidKey, Fill, MakerAccount, MakerAccountSource, OrderBook, OrderStatus, PlaceResult,
     PriceBand, ReduceOnlyPositions, ShapeViolation, TakerMarginLimit, TriggeredStop,
 };
 use torus_core::position::{
@@ -4370,13 +4370,14 @@ mod advance_untouched_toggle_tests {
 /// added or removed) are fed into the context's cancel-all and cloid
 /// indexes, so an order placed or cancelled straight on the book is seen by
 /// the next cancel-all and duplicate-cloid check. A book replaced or
-/// swapped whole through the `&mut` (its [`OrderBook::instance_id`]
-/// changed) drops both indexes instead (rebuilt from the books at next
-/// use): a loaded or copied book's logs do not describe its orders.
+/// swapped whole through the `&mut`, or whose logs were emptied elsewhere
+/// meanwhile (its [`OrderBook::log_mark`] changed), drops both indexes
+/// instead (rebuilt from the books at next use): its logs do not describe
+/// the changes since the lend.
 pub struct OrderBookMut<'a> {
     market: MarketId,
-    /// The lent book's [`OrderBook::instance_id`].
-    lent: u64,
+    /// The lent book's [`OrderBook::log_mark`].
+    lent: BookLogMark,
     book: &'a mut OrderBook,
     trader_markets: &'a mut Option<TraderMarkets>,
     cloid_markets: &'a mut Option<CloidMarkets>,
@@ -4406,25 +4407,28 @@ impl Drop for OrderBookMut<'_> {
 /// s120: `book` (market `market`) comes back from `&mut` lent out of the
 /// executor ([`NativeExecContext::order_book_mut`],
 /// [`NativeExecContext::for_each_order_book_mut`]); `lent` is the
-/// [`OrderBook::instance_id`] of the book that was lent.
+/// [`OrderBook::log_mark`] of the book that was lent.
 ///
-/// - Same id: the same book, whatever was moved in and out meanwhile, and
-///   its logs hold every change made to it since the executor last drained
-///   them; they are fed into both indexes.
-/// - Another id: the slot holds another book (`mem::replace`, `mem::swap`,
-///   assignment) whose logs need not describe its orders (a load or copy
-///   has empty logs), and the lent book's entries are stale. Both indexes
-///   are dropped (the next use builds them from the books, as after a
-///   load); the logs are emptied.
+/// - Same mark: the same book, and nothing emptied its logs meanwhile
+///   (every method that does bumps the mark, whoever calls it), so they
+///   hold every change made to it since the executor last drained them;
+///   they are fed into both indexes.
+/// - Another mark: the slot holds another book (`mem::replace`,
+///   `mem::swap`, assignment; a load or copy has empty logs), or the lent
+///   book's logs were taken elsewhere (moved through another context's
+///   [`NativeExecContext::insert_order_book`] and back, drained straight
+///   through the `&mut`; Codex r2). Either way the logs do not describe
+///   the changes since the lend. Both indexes are dropped (the next use
+///   builds them from the books, as after a load); the logs are emptied.
 #[inline]
 fn reconcile_lent_book(
     trader_markets: &mut Option<TraderMarkets>,
     cloid_markets: &mut Option<CloidMarkets>,
     book: &mut OrderBook,
     market: MarketId,
-    lent: u64,
+    lent: BookLogMark,
 ) {
-    if book.instance_id() != lent {
+    if book.log_mark() != lent {
         *trader_markets = None;
         *cloid_markets = None;
     }
@@ -5301,14 +5305,15 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// `market`'s book, mutable, for callers outside the executor (tests,
     /// tools). When the guard drops, what the caller rested, stored or
     /// removed is fed into both indexes, as the executor's own sites do; a
-    /// book replaced or swapped whole drops both (rebuilt at next use).
+    /// book replaced or swapped whole, or whose logs were emptied
+    /// elsewhere meanwhile, drops both (rebuilt at next use).
     /// Does not mark the book dirty.
     #[inline]
     pub fn order_book_mut(&mut self, market: MarketId) -> Option<OrderBookMut<'_>> {
         let book = self.order_books.get_mut(&market)?;
         Some(OrderBookMut {
             market,
-            lent: book.instance_id(),
+            lent: book.log_mark(),
             book,
             trader_markets: &mut self.trader_markets,
             cloid_markets: &mut self.cloid_markets,
@@ -5320,7 +5325,7 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// [`Self::order_book_mut`]). Does not mark books dirty.
     pub fn for_each_order_book_mut(&mut self, mut f: impl FnMut(MarketId, &mut OrderBook)) {
         for (&market, book) in self.order_books.iter_mut() {
-            let lent = book.instance_id();
+            let lent = book.log_mark();
             f(market, book);
             reconcile_lent_book(&mut self.trader_markets, &mut self.cloid_markets, book, market, lent);
         }

@@ -1291,6 +1291,25 @@ pub struct OrderBook {
     /// about the indexes). Never serialized, hashed, or read by matching or
     /// saving; differs between nodes and runs.
     instance: BookInstance,
+    /// s120 (Codex r2): how many times the logs (`new_traders`, the cloid
+    /// log) were emptied: bumped by every method that takes or drops
+    /// entries out of them ([`Self::drain_new_traders`],
+    /// [`Self::drain_cloid_keys`] / [`Self::drain_cloid_log`],
+    /// [`Self::clear_cloid_log`]), whoever calls it. With the instance id
+    /// it makes [`Self::log_mark`]: an unchanged mark means the logs still
+    /// hold every change since the mark was read. In-RAM only, as
+    /// `instance`.
+    log_drains: u64,
+}
+
+/// s120 (Codex r2): [`OrderBook::log_mark`]: which in-memory book, and how
+/// many times its logs were emptied. Two equal marks of one slot taken at
+/// two times mean the same book is there and nothing took its logs in
+/// between: they hold every trader and cloid change made to it since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookLogMark {
+    instance: u64,
+    drains: u64,
 }
 
 /// s120: see [`OrderBook::instance_id`]. `Clone` issues a fresh id, so a
@@ -1384,6 +1403,7 @@ impl OrderBook {
             dirty_chunks: BTreeSet::new(),
             new_traders: Vec::new(),
             instance: BookInstance::fresh(),
+            log_drains: 0,
         }
     }
 
@@ -1396,6 +1416,19 @@ impl OrderBook {
     #[inline]
     pub fn instance_id(&self) -> u64 {
         self.instance.0
+    }
+
+    /// s120 (Codex r2): this book's identity and log-drain count
+    /// ([`BookLogMark`]). The executor reads it before lending `&mut` out
+    /// and again on return: unchanged = feed the logs into its indexes;
+    /// changed = another book is in the slot, or this one's logs were
+    /// emptied elsewhere meanwhile, so the indexes are dropped.
+    #[inline]
+    pub fn log_mark(&self) -> BookLogMark {
+        BookLogMark {
+            instance: self.instance.0,
+            drains: self.log_drains,
+        }
     }
 
     fn alloc_id(&mut self) -> OrderId {
@@ -2460,6 +2493,7 @@ impl OrderBook {
 
     /// fix 4: [`Self::drain_cloid_log`] by the packed key.
     pub fn drain_cloid_keys(&mut self, mut f: impl FnMut(CloidKey, Option<OrderId>)) {
+        self.log_drains += 1;
         let BookCloids { map, log, resolved } = &mut self.cloids;
         if log.is_empty() {
             // fix 2: nothing changed since the resolve: its entries are
@@ -2497,6 +2531,7 @@ impl OrderBook {
     /// s114 follow-up: empty the cloid log unread (a load, or no index to
     /// feed).
     pub fn clear_cloid_log(&mut self) {
+        self.log_drains += 1;
         self.cloids.log.clear();
         self.cloids.resolved.clear();
     }
@@ -3390,6 +3425,7 @@ impl OrderBook {
     /// `new_traders` field), in log order, possibly repeated; the log is
     /// empty afterwards (also when the iterator is dropped unread).
     pub fn drain_new_traders(&mut self) -> std::vec::Drain<'_, Address> {
+        self.log_drains += 1;
         self.new_traders.drain(..)
     }
 
@@ -4638,6 +4674,7 @@ impl BorshDeserialize for OrderBook {
             dirty_chunks: BTreeSet::new(),
             new_traders: Vec::new(),
             instance: BookInstance::fresh(),
+            log_drains: 0,
         };
 
         for _ in 0..order_count {
@@ -6307,6 +6344,41 @@ mod tests {
         assert_eq!((b.instance_id(), a.instance_id()), ids, "a move keeps the id");
         let held = BookInstance::fresh();
         assert_ne!(held.clone().0, held.0, "a clone gets a fresh id");
+    }
+
+    /// s120 (Codex r2): every way the logs are emptied changes the mark;
+    /// changes that only add to them, matching, and resolving (the log
+    /// stays in the book) do not; a move keeps it.
+    #[test]
+    fn log_mark_changes_on_every_drain() {
+        let mut a = book();
+        let mut cloid_order = limit_buy(fp(99), fp(8));
+        cloid_order.client_order_id = Some(5);
+        let m0 = a.log_mark();
+        a.place_order(cloid_order, addr(3), 3);
+        a.place_order(limit_sell(fp(101), fp(8)), addr(4), 3);
+        a.resolve_cloid_log();
+        assert_eq!(a.log_mark(), m0, "adding to the logs and resolving keep the mark");
+        let moved = a;
+        assert_eq!(moved.log_mark(), m0, "a move keeps the mark");
+        let mut a = moved;
+
+        let m = a.log_mark();
+        drop(a.drain_new_traders());
+        assert_ne!(a.log_mark(), m, "drain_new_traders");
+        let m = a.log_mark();
+        a.drain_cloid_log(|_, _, _| {});
+        assert_ne!(a.log_mark(), m, "drain_cloid_log");
+        let m = a.log_mark();
+        a.drain_cloid_keys(|_, _| {});
+        assert_ne!(a.log_mark(), m, "drain_cloid_keys");
+        let m = a.log_mark();
+        a.clear_cloid_log();
+        assert_ne!(a.log_mark(), m, "clear_cloid_log");
+
+        let bytes = borsh::to_vec(&a).unwrap();
+        let loaded = OrderBook::try_from_slice(&bytes).unwrap();
+        assert_ne!(loaded.log_mark(), a.log_mark(), "a load is another book");
     }
 }
 
