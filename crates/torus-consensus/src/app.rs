@@ -1177,6 +1177,11 @@ enum ReplayFault {
     /// R02 branch 8 (B): the CoreWriter due-check's queue read
     /// (`CoreWriterQueue::pending_count`) failed.
     CoreWriterDueRead,
+    /// Applied-block header (Codex D12 r2): every exec-time header write
+    /// OUTSIDE the block's flush batch fails — `commit_block_metadata`'s own
+    /// batch (EVM blocks) and the standalone header put. A header that rides
+    /// the flush batch with the applied marker is not affected.
+    StandaloneHeaderWrite,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -2159,6 +2164,32 @@ impl ExecutionContext {
         native_applied_height(&self.state_db)
     }
 
+    /// [`BlockCommitter::commit_block_metadata`] on this context's DB (header,
+    /// body, receipts, indices in their own batch, outside the block's flush;
+    /// the test seam can make it fail).
+    fn commit_block_metadata(
+        &self,
+        block: &TorusBlock,
+        receipts: &[torus_types::Receipt],
+    ) -> Result<torus_types::B256, torus_bridge::BridgeError> {
+        #[cfg(test)]
+        if self.test_replay_fault == Some(ReplayFault::StandaloneHeaderWrite) {
+            return Err(injected_fault("block metadata write").into());
+        }
+        BlockCommitter::commit_block_metadata(&self.state_db, block, receipts)
+    }
+
+    /// The standalone exec-time header put ([`persist_block_header`]; the test
+    /// seam can make it fail).
+    fn persist_header_standalone(&self, block: &TorusBlock) -> bool {
+        #[cfg(test)]
+        if self.test_replay_fault == Some(ReplayFault::StandaloneHeaderWrite) {
+            tracing::error!(height = block.header.height, "injected standalone header put failure (test)");
+            return false;
+        }
+        persist_block_header(&self.state_db, block)
+    }
+
     /// R02: a local storage fault on the replay-guard / session path. Latch
     /// the fail-stop: the caller returns, nothing of the block flushes, the
     /// marker stays put and the restart replays the block. `persist_header`
@@ -3009,11 +3040,7 @@ impl ExecutionContext {
                             return;
                         }
                     }
-                    if let Err(e) = BlockCommitter::commit_block_metadata(
-                        &self.state_db,
-                        torus_block,
-                        &validated.receipts,
-                    ) {
+                    if let Err(e) = self.commit_block_metadata(torus_block, &validated.receipts) {
                         tracing::error!(%e, height, "failed to commit block metadata");
                     }
                     bundle = validated.bundle;
@@ -3043,7 +3070,7 @@ impl ExecutionContext {
             // (cheap, rare). When `durable.header` the same hash‖JSON bytes are
             // already at this key (`persist_committed_block_durably`), so the
             // rewrite is skipped.
-            persist_block_header(&self.state_db, torus_block);
+            self.persist_header_standalone(torus_block);
         }
         // r3 exec-write-stall-attribution: for a native-only block whose header
         // is NOT already durable (boot crash-replay / failed dispatch batch) the
@@ -26883,5 +26910,200 @@ mod crash_recovery_tests {
             "oldest live age {g_age} after the release"
         );
         assert!(stats.live_objects() >= 0 && stats.live_bytes() >= 0);
+    }
+
+
+    // ======================================================================
+    // Applied block without its header (Codex D12 r2, pre-existing on main):
+    // every block whose applied marker is durable has its CF_BLOCK_HEADERS
+    // row durable, in the SAME atomic batch as its state and the marker when
+    // the dispatcher did not land it (`DurableRows::default()`: boot replay,
+    // or a failed dispatch-time WriteBatch).
+    // ======================================================================
+
+    /// Every block of `blocks` at or below the durable applied marker has its
+    /// committed header record at `CF_BLOCK_HEADERS[height]`.
+    fn hdr_assert_applied_headers(db: &StateDb, blocks: &[TorusBlock], what: &str) {
+        let applied = read_native_applied_height(db).unwrap_or(0);
+        for b in blocks.iter().filter(|b| b.header.height <= applied) {
+            let h = b.header.height;
+            let row = db.get_cf_raw(CF_BLOCK_HEADERS, &h.to_be_bytes()).unwrap();
+            assert!(row.is_some(), "{what}: applied marker {applied} but header {h} missing");
+            assert_eq!(row, header_record_bytes(b), "{what}: header {h} is not the committed record");
+        }
+    }
+
+    /// The heights of `blocks` at or below the durable applied marker whose
+    /// header row is missing or not the committed record.
+    fn hdr_missing_headers(db: &StateDb, blocks: &[TorusBlock]) -> Vec<u64> {
+        let applied = read_native_applied_height(db).unwrap_or(0);
+        blocks
+            .iter()
+            .filter(|b| b.header.height <= applied)
+            .filter(|b| {
+                db.get_cf_raw(CF_BLOCK_HEADERS, &b.header.height.to_be_bytes()).unwrap()
+                    != header_record_bytes(b)
+            })
+            .map(|b| b.header.height)
+            .collect()
+    }
+
+    /// An EVM tx of `key` calling an empty account (valid, succeeds unless a
+    /// fault is injected).
+    fn hdr_evm_call(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+        signed_eip1559(key, nonce, alloy_primitives::TxKind::Call(Address::repeat_byte(0x66)), vec![])
+    }
+
+    /// Codex D12 r2 scenario: block 2 carries a valid EVM tx, its dispatch-time
+    /// batch failed (`DurableRows::default()`) and its EVM section ends in an
+    /// ordinary error (logged, skipped; no fee revenue, so no native phase:
+    /// the EVM marker flush). The applied marker advances to 2 and block 2's
+    /// header must land with it. Then block 3 (its parent is block 2) either
+    /// executes live, or is committed and the node restarts before executing
+    /// it: the boot replay on a fresh context applies it. Serial and pipelined
+    /// (an EVM block is a barrier either way). RED before: marker 2, no header
+    /// row 2.
+    #[test]
+    fn applied_block_keeps_header_evm_ordinary_error() {
+        for on in [false, true] {
+            for restart in [false, true] {
+                let what = format!("on={on} restart={restart}");
+                let (_c, db) = make_test_config_and_db();
+                let key = k256::ecdsa::SigningKey::from_slice(&[0x65; 32]).unwrap();
+                r02_fund(&db, &key);
+                let mut b2 = make_block(2, vec![]);
+                b2.evm_transactions = vec![hdr_evm_call(&key, 0)];
+                b2.header.evm_tx_count = 1;
+                let mut blocks = vec![make_block(1, vec![]), b2, make_block(3, vec![])];
+                link_blocks(&mut blocks);
+                let mut ctx = pipeline_ctx(&db, on, None);
+                dispatch_and_execute(&ctx, &db, &blocks[0]);
+                assert!(ctx.pipeline_barrier());
+                ctx.test_replay_fault = Some(ReplayFault::EvmSectionError);
+                ctx.execute_committed_block_with(&blocks[1], vec![], DurableRows::default());
+                ctx.test_replay_fault = None;
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 2 no fail-stop");
+                assert_eq!(read_native_applied_height(&db), Some(2), "{what}");
+                hdr_assert_applied_headers(&db, &blocks, &format!("{what} after block 2"));
+                if restart {
+                    // Block 3 committed (dispatch rows durable), not executed.
+                    let durable = persist_committed_block_durably(&db, &blocks[2]);
+                    assert!(durable.header && durable.body, "{what}");
+                    drop(ctx);
+                    let ctx = pipeline_ctx(&db, false, None);
+                    let (last, parked) = TorusApp::replay_committed(&db, &ctx);
+                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: boot replay no fail-stop");
+                    assert_eq!(parked, None, "{what}");
+                    assert_eq!(last.height, 3, "{what}: block 3 replayed");
+                } else {
+                    dispatch_and_execute(&ctx, &db, &blocks[2]);
+                    assert!(ctx.pipeline_barrier(), "{what}");
+                    assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 3 no fail-stop");
+                }
+                assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
+                hdr_assert_applied_headers(&db, &blocks, &format!("{what} after block 3"));
+            }
+        }
+    }
+
+    /// The same with a native action in block 2 (the EVM section's ordinary
+    /// error, then the native phase's flush carries the marker). RED before:
+    /// `fold_header` excluded EVM blocks, so no header row 2.
+    #[test]
+    fn applied_block_keeps_header_evm_ordinary_error_with_native_phase() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x67; 32]).unwrap();
+        let (blocks, b) =
+            r02_evm_blocks(&key, alloy_primitives::TxKind::Create, vec![0x60, 0x01, 0x60, 0x00, 0x55]);
+        for on in [false, true] {
+            let (_c, db) = make_test_config_and_db();
+            r02_fund(&db, &key);
+            let mut ctx = pipeline_ctx(&db, on, None);
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            assert!(ctx.pipeline_barrier());
+            ctx.test_replay_fault = Some(ReplayFault::EvmSectionError);
+            ctx.execute_committed_block_with(&blocks[1], vec![], DurableRows::default());
+            ctx.test_replay_fault = None;
+            assert!(ctx.pipeline_barrier(), "on={on}");
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: no fail-stop");
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            assert!(r02_nonce_consumed(&db, &b), "on={on}: native phase ran");
+            hdr_assert_applied_headers(&db, &blocks, &format!("on={on}"));
+        }
+    }
+
+    /// Every block kind whose header is not dispatch-durable, with every
+    /// exec-time header write OUTSIDE the flush batch failing
+    /// (`commit_block_metadata`'s batch, the standalone put): the applied
+    /// marker still advances only together with the header, i.e. the header
+    /// rides the marker's batch. Serial and pipelined. RED before for the
+    /// empty block (standalone put), the empty epoch-boundary block
+    /// (standalone put, native phase) and the EVM-success blocks (header only
+    /// in `commit_block_metadata`'s separate batch).
+    #[test]
+    fn applied_block_header_rides_the_marker_batch_on_every_path() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x68; 32]).unwrap();
+        let evm = |h: u64, base_fee: u64, actions: Vec<SignedNativeAction>| {
+            let mut b = make_block(h, actions);
+            b.evm_transactions = vec![hdr_evm_call(&key, 0)];
+            b.header.evm_tx_count = 1;
+            b.header.base_fee_per_gas = base_fee;
+            b
+        };
+        let ms = block_time_ms(1);
+        // (what, blocks: the last one runs with the seam, EVM tx expected to run)
+        let cases: Vec<(&str, Vec<TorusBlock>, bool)> = vec![
+            ("empty block (marker-only flush)", vec![make_block(1, vec![]), make_block(2, vec![])], false),
+            (
+                "empty epoch-boundary block (native phase, no actions)",
+                (1..=4).map(|h| make_block(h, vec![])).collect(),
+                false,
+            ),
+            (
+                "native-only block",
+                vec![make_block(1, vec![r02_claim(ms)]), make_block(2, vec![r02_claim(ms + 1)])],
+                false,
+            ),
+            (
+                "EVM success, fee revenue (native phase)",
+                vec![make_block(1, vec![]), evm(2, 1_000_000_000, vec![])],
+                true,
+            ),
+            ("EVM success, no fee revenue (EVM marker flush)", vec![make_block(1, vec![]), evm(2, 0, vec![])], true),
+            (
+                "EVM success + native action",
+                vec![make_block(1, vec![r02_claim(ms)]), evm(2, 1_000_000_000, vec![r02_claim(ms + 1)])],
+                true,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (what, mut blocks, evm_ran) in cases {
+            link_blocks(&mut blocks);
+            let (last, prefix) = blocks.split_last().unwrap();
+            for on in [false, true] {
+                let (_c, db) = make_test_config_and_db();
+                r02_fund(&db, &key);
+                let mut ctx = pipeline_ctx(&db, on, None);
+                for b in prefix {
+                    dispatch_and_execute(&ctx, &db, b);
+                }
+                assert!(ctx.pipeline_barrier(), "{what} on={on}");
+                ctx.test_replay_fault = Some(ReplayFault::StandaloneHeaderWrite);
+                ctx.execute_committed_block_with(last, vec![], DurableRows::default());
+                ctx.test_replay_fault = None;
+                assert!(ctx.pipeline_barrier(), "{what} on={on}");
+                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what} on={on}: no fail-stop");
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    Some(last.header.height),
+                    "{what} on={on}"
+                );
+                assert_eq!(r02_evm_nonce(&db, &key), u64::from(evm_ran), "{what} on={on}: EVM tx ran");
+                let missing = hdr_missing_headers(&db, &blocks);
+                if !missing.is_empty() {
+                    failures.push(format!("{what} on={on}: applied, header(s) {missing:?} missing"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "applied blocks without their header:\n{}", failures.join("\n"));
     }
 }
