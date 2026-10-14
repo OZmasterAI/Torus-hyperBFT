@@ -69,6 +69,12 @@ Phase gate: +0-10% matched/s; RSS per user within section 4's estimate.
 Phase gate: Gate 3, >= 1.4x today's main matched/s at 300 markets; 1M-account /
 1M-resting-order genesis cell for RSS and restart.
 
+## Block-time p99 follow-up (Phase 3 regression, owner s119)
+
+Section 66: the Phase 3 p99 rise sits in the checkpoint write windows. Archy (paused until Phase 4 is built) runs
+an off-CPU HotStuff profile and a larger `vm.dirty_bytes` cell on the Phase 4 head after Phase 4 step 6; a builder
+looks at the slow mempool admission on `ReadView` between Phase 4 steps. Details: `item6-phase5-impl.md` section 9.
+
 ## After Phase 5 (separate plans)
 
 - D: sequential second pass for margin-cut takers (design section 3.6), golden A re-pin.

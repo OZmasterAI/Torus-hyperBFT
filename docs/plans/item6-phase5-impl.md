@@ -399,6 +399,19 @@ native block does not explain it (590 / 570 ms on s2, section 61; 581-596 / 585 
 tail = start burst, epoch-boundary blocks, checkpoint upkeep spikes, no RocksDB stalls). A decomposition is queued for
 archy after Gate 3.
 
-**Result:** TBD (archy decomposition after Gate 3). Phase 5 effect on it: TBD. If the cause is on E (e.g. checkpoint
-upkeep or freeze), the block time p99 gate in section 1 gets a target; if it is consensus-side, it stays a
-no-regression check.
+**Result (section 66, no new run):** the rise sits in the checkpoint state-write windows. The flush worker writes
+~0.9 s (205-255 MB per node); in SAT all 3 validators start within the same second. Excluding window intervals,
+Phase 3 is level (SAT) or lower (soak). Inside a window tail about half the time all three HotStuff threads are
+silent and view timeouts are 3.5x. Ruled out: exec back-pressure, RocksDB stall counters, CPU. The stalling call is
+not found. Hypothesis (unproven): one shared host and one 256 MB `vm.dirty_bytes`, so kernel writeback throttling
+stalls any writing thread, consensus included (a single-host devnet artifact in part). Second lead: on `c88d3073`
+~34 mempool admission inserts take > 0.5 s (0 on `de1a97c1`); Phase 3 moved that check onto `ReadView`.
+
+**Plan (owner s119).** Phase 5 does not target this; its block time p99 gate stays "no regression" unless the
+cause turns out to be on E.
+- Archy, when back (archy is paused until Phase 4 is built), on the Phase 4 head, after Phase 4 step 6's campaign:
+  (1) off-CPU profile of the HotStuff thread across one checkpoint window; (2) one run with a larger
+  `vm.dirty_bytes` (tests the shared-host hypothesis). Then, once the cause is known: (4) spread checkpoint times
+  across validators. Skipped: the 15 s vs 60 s interval A/B (it changes the frequency, not the cause).
+- Builder: the slow mempool admission inserts on `ReadView` (code-side, not a host artifact): read-only
+  investigation first, slotted between Phase 4 steps so it does not run beside a Phase 4 build.
