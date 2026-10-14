@@ -8209,6 +8209,88 @@ mod scratch_db_dir_tests {
         let next = scratch_db_dir("torus-unit");
         assert_ne!(dir, next, "every call gets a fresh dir");
     }
+
+    const CHILD_TEST: &str = "app::scratch_db_dir_tests::scratch_child";
+
+    /// Child process of `scratch_dirs_survive_runs_in_other_pid_namespaces`:
+    /// takes a scratch dir, prints it, and with mode `hold` keeps running (as a
+    /// live test run) until its stdin closes. Does nothing when run directly.
+    #[test]
+    #[ignore = "child process of scratch_dirs_survive_runs_in_other_pid_namespaces"]
+    fn scratch_child() {
+        let Ok(mode) = std::env::var("TORUS_SCRATCH_CHILD") else {
+            return;
+        };
+        let dir = scratch_db_dir("child");
+        std::fs::write(dir.join("marker"), b"live").unwrap();
+        println!("SCRATCH_DIR={}", dir.display());
+        if mode == "hold" {
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        }
+    }
+
+    fn child_scratch_dir(out: &mut impl std::io::BufRead) -> std::path::PathBuf {
+        std::io::BufRead::lines(&mut *out)
+            .map_while(Result::ok)
+            .find_map(|l| l.strip_prefix("SCRATCH_DIR=").map(Into::into))
+            .expect("child printed its scratch dir")
+    }
+
+    /// Test runs in another PID namespace sharing /tmp (Codex's bwrap sandbox
+    /// does this) must not delete a live run's scratch DBs, and two such runs
+    /// (same pid inside their namespaces) must not get the same dir. Needs a
+    /// `bwrap` that can unshare the PID namespace: `TORUS_TEST_BWRAP`, else
+    /// `bwrap` on PATH; skipped without one.
+    #[test]
+    fn scratch_dirs_survive_runs_in_other_pid_namespaces() {
+        use std::process::{Command, Stdio};
+        let bwrap = std::env::var("TORUS_TEST_BWRAP").unwrap_or_else(|_| "bwrap".into());
+        let ns_args = ["--unshare-pid", "--dev-bind", "/", "/", "--proc", "/proc"];
+        let usable = Command::new(&bwrap)
+            .args(ns_args)
+            .arg("true")
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !usable {
+            eprintln!("skipped: no bwrap that can unshare the PID namespace");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let child = |mode: &str, in_new_pid_ns: bool| {
+            let mut cmd = if in_new_pid_ns {
+                let mut c = Command::new(&bwrap);
+                c.args(ns_args).arg(&exe);
+                c
+            } else {
+                Command::new(&exe)
+            };
+            cmd.args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+                .env("TMPDIR", tmp.path())
+                .env("TORUS_SCRATCH_CHILD", mode)
+                .stdout(Stdio::piped());
+            cmd
+        };
+        let mut holder = child("hold", false).stdin(Stdio::piped()).spawn().unwrap();
+        // Kept open until the holder exits (it still prints its test result).
+        let mut held_out = std::io::BufReader::new(holder.stdout.take().unwrap());
+        let held = child_scratch_dir(&mut held_out);
+        let ns_run = || {
+            let out = child("run", true).output().unwrap();
+            assert!(out.status.success(), "namespaced child failed: {out:?}");
+            child_scratch_dir(&mut &out.stdout[..])
+        };
+        let (a, b) = (ns_run(), ns_run());
+        let held_survived = held.join("marker").exists();
+        drop(holder.stdin.take());
+        holder.wait().unwrap();
+        assert!(
+            held_survived,
+            "a run in another PID namespace deleted a live run's scratch dir {held:?}"
+        );
+        assert_ne!(a, b, "runs in different PID namespaces got the same scratch dir");
+    }
 }
 
 #[cfg(test)]
