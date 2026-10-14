@@ -971,6 +971,27 @@ rpc() { # $1=url $2=method $3=params-json
     curl -s -m "$RPC_TIMEOUT" -H 'content-type: application/json' "$1" \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}"
 }
+# Agreement compare height: at or below EVERY node's served head. eth_getBlockByNumber answers null
+# above eth_blockNumber = min(applied marker, committed), and item 6 Phase 3+ writes the applied
+# marker only at checkpoints (15 s, ~160 blocks at 10 markets), so HMIN-5 from torus_block_height
+# (committed) can sit above it: the hash read ERR and seven ozarchy-p4gate 10-market cells were
+# DISAGREE with equal state digests. Older binaries (marker every block) serve >= HMIN-5: unchanged.
+# A node whose head does not read stays out of the min (WARNING at the call): its block read then
+# decides, so a real RPC failure still reads ERR and DISAGREE.
+agree_cmp_height() { # BASE URL... -> AGREE_HCMP = min(BASE, served heads), AGREE_SERVED[i] = head or ERR
+    local base=$1 u h; shift
+    AGREE_HCMP=$base; AGREE_SERVED=()
+    for u in "$@"; do
+        h=$(rpc "$u" eth_blockNumber '[]' | jq -r '.result // empty' 2>/dev/null)
+        if [[ "$h" =~ ^0x[0-9a-fA-F]{1,15}$ ]]; then
+            h=$((h)); AGREE_SERVED+=("$h")
+            [ "$h" -lt "$AGREE_HCMP" ] && AGREE_HCMP=$h
+        else
+            AGREE_SERVED+=(ERR)
+        fi
+    done
+    return 0
+}
 declare -a HGT
 for i in 0 1 2; do HGT[$i]=$(mval torus_block_height < "$OUT/metrics-after-val$i.txt"); HGT[$i]=${HGT[$i]%.*}; done
 HMIN=$(printf '%s\n' "${HGT[@]}" | sort -n | head -1); HMAX=$(printf '%s\n' "${HGT[@]}" | sort -n | tail -1)
@@ -1052,10 +1073,17 @@ if [ "$ORACLE_FEED" = 1 ]; then
     log "oracle feed: oracle_feed=1 $(jq -c '{sent,accepted,rejected,last_error}' "$OUT/oracle-feed-stats.json" 2>/dev/null || echo 'stats=MISSING') stale_marks_at_bench_end=$(jq -r '.markets - .usable' <<<"$ORACLE_MEND" 2>/dev/null) fresh_after_s=$ORACLE_FRESH_S"
 fi
 
+agree_cmp_height "$HCMP" "${RPCS[@]}"
+if [ "$AGREE_HCMP" != "$HCMP" ]; then
+    log "agreement: block $HCMP is above a node's served (applied) head (served ${AGREE_SERVED[*]}); comparing block $AGREE_HCMP instead"
+    HCMP=$AGREE_HCMP; HHEX=$(printf '0x%x' "$HCMP")
+fi
+case " ${AGREE_SERVED[*]} " in *" ERR "*) log "WARNING: agreement: eth_blockNumber unreadable on a node (served ${AGREE_SERVED[*]}); its block read at $HCMP decides" ;; esac
 : > "$OUT/agreement.jsonl"
 for i in 0 1 2; do
     blk=$(rpc "${RPCS[$i]}" eth_getBlockByNumber "[\"$HHEX\",false]")
     bh=$(printf '%s' "$blk" | jq -r '.result.hash // "ERR"'); sr=$(printf '%s' "$blk" | jq -r '.result.stateRoot // "ERR"')
+    [ "$bh" = ERR ] && [ "${AGREE_SERVED[$i]}" != ERR ] && log "ERROR: agreement: val$i did not return block $HCMP although it serves up to ${AGREE_SERVED[$i]}: an RPC failure, not the applied-marker lag"
     dig=${DIGSHA[$i]}
     matched=$(mval torus_orders_matched_total < "$OUT/metrics-after-val$i.txt")
     placed=$(mval torus_orders_placed_accepted_total < "$OUT/metrics-after-val$i.txt")
