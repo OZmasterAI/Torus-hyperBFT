@@ -24,6 +24,13 @@
 #
 # Without it (or with an empty 7th argument) the stream is unchanged.
 #
+#   digest-node.sh --capabilities
+#
+# prints one capability per line and exits 0: `position-accounts` (the 7th
+# argument above). run-cell.sh asks before a liquidation-stress cell: an older
+# script (TOOLS_FROM_WORKTREE=1 against an older worktree) ignores the 7th
+# argument without a word, and only prints its usage (rc 2) here.
+#
 # WHY THIS FILE EXISTS: at 300 markets the serial loop is 650 `curl -m 10` round
 # trips and takes ~4 min per node, so val0's digest was taken ~8 min before
 # val2's. If anything at all still moved in between, three honest validators
@@ -36,6 +43,7 @@
 # unit test in test_harness.py answers high market ids first on purpose).
 set -uo pipefail
 
+if [ "${1:-}" = --capabilities ]; then echo position-accounts; exit 0; fi
 [ $# -ge 4 ] || { sed -n '2,6p' "$0" >&2; exit 2; }
 URL=$1
 MARKETS=$2

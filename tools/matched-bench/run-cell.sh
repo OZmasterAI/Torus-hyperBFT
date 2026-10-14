@@ -240,9 +240,10 @@
 #                scanned / acted counters, pending / deferred gauges) are sampled
 #                at 1 Hz; otherwise the cell is unchanged. Analysis:
 #                tools/matched-bench/liq_stress.py <results-dir>. Either knob
-#                needs a summarizer with --liq-thin/--liq-thin-avail: pre-flight
-#                refuses the cell when the selected one (see TOOLS_FROM_WORKTREE;
-#                an older worktree's) lacks them.
+#                needs a summarizer with --liq-thin/--liq-thin-avail and a
+#                digest-node.sh whose --capabilities lists position-accounts:
+#                pre-flight refuses the cell when the selected ones (see
+#                TOOLS_FROM_WORKTREE; an older worktree's) lack them.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -610,9 +611,23 @@ summarizer_has_liq_opts() {
     case "$h" in *--liq-thin-avail*) return 0 ;; esac
     return 1
 }
+# digest_has_position_accounts: the selected digest-node.sh digests the
+# position accounts it is handed as 7th argument (`--capabilities` lists
+# `position-accounts`). An older one ignores that argument silently, so the
+# cell would report agreement without a single protocol position checked; asked
+# for capabilities it only prints its usage and exits 2.
+digest_has_position_accounts() {
+    local c
+    c=$("$TOOLS_DIR/digest-node.sh" --capabilities 2>/dev/null) || return 1
+    case $'\n'"$c"$'\n' in *$'\n'position-accounts$'\n'*) return 0 ;; esac
+    return 1
+}
 # Pre-flight: a liquidation cell passes the options, and refuses here (not after
-# the run) when the summarizer lacks them; any other cell passes none, as before.
+# the run) when the summarizer lacks them or the digest script would not cover
+# the protocol accounts' positions; any other cell passes none and asks neither
+# script anything, as before.
 SUMMARIZE_LIQ_ARGS=()
+DIGEST_HAS_POS=0
 if liq_stress_on; then
     summarizer_has_liq_opts || {
         echo "FATAL: liquidation stress (LIQ_THIN=$LIQ_THIN ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP) needs a summarizer" \
@@ -621,6 +636,15 @@ if liq_stress_on; then
             "TOOLS_FROM_WORKTREE=0, or point TOOLS_DIR= at a newer tools/matched-bench)" >&2
         exit 1
     }
+    digest_has_position_accounts || {
+        echo "FATAL: liquidation stress (LIQ_THIN=$LIQ_THIN ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP) needs a digest script" \
+            "that covers the protocol accounts' positions (digest-node.sh --capabilities lists position-accounts)," \
+            "and $TOOLS_DIR/digest-node.sh does not: it would ignore them and report agreement unchecked" \
+            "(TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; score with this harness's own tools:" \
+            "TOOLS_FROM_WORKTREE=0, or point TOOLS_DIR= at a newer tools/matched-bench)" >&2
+        exit 1
+    }
+    DIGEST_HAS_POS=1
     SUMMARIZE_LIQ_ARGS=(--liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL")
 fi
 # liq_thin_patch <genesis> <n> <available>: native `available` = <available> on
@@ -1182,7 +1206,12 @@ if liq_stress_on; then
     printf '%s\n' "$LIQUIDATOR_VAULT" "$ADL_ESCROW_LONG" "$ADL_ESCROW_SHORT" >> "$OUT/digest-accounts.txt"
     printf '%s\n' "$LIQUIDATOR_VAULT" "$ADL_ESCROW_LONG" "$ADL_ESCROW_SHORT" > "$OUT/digest-position-accounts.txt"
     DIG_POS=("$OUT/digest-position-accounts.txt")
-    log "liquidation stress: liquidator vault $LIQUIDATOR_VAULT and ADL escrows $ADL_ESCROW_LONG $ADL_ESCROW_SHORT added to the state digest (balances + positions in all $MARKETS markets)"
+    # Coverage is claimed only when pre-flight confirmed the digest script has it.
+    if [ "${DIGEST_HAS_POS:-0}" = 1 ]; then
+        log "liquidation stress: liquidator vault $LIQUIDATOR_VAULT and ADL escrows $ADL_ESCROW_LONG $ADL_ESCROW_SHORT added to the state digest (balances + positions in all $MARKETS markets)"
+    else
+        log "WARNING: liquidation stress: liquidator vault $LIQUIDATOR_VAULT and ADL escrows $ADL_ESCROW_LONG $ADL_ESCROW_SHORT added to the state digest balances; their positions are NOT confirmed covered ($TOOLS_DIR/digest-node.sh does not list position-accounts)"
+    fi
 fi
 DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")
 if [ ${#DIG_POS[@]} -gt 0 ]; then DIG_POS_ACCTS=$(grep -c . "${DIG_POS[0]}"); else DIG_POS_ACCTS=0; fi
