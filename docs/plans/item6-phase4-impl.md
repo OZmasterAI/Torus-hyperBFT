@@ -343,6 +343,17 @@ stays only if its own A/B (counter upkeep netted) shows a gain; otherwise it is 
   keeps both exact. (2) The workers return nothing new: the deltas ride in each book's log, so every book path is
   covered without a hook per site, and the exec thread applies them at the next count read. No order expiry or
   eviction path exists in the executor, so none is covered.
+  Codex r1 fix: `order_books` is public, so books moved in from another context, a book replaced (by `insert` or in
+  place through `get_mut`) with its reload, or a book removed left a built counter wrong, in release builds too (the
+  cap accepted excess orders or rejected legal ones). Each book now carries the id of the counter that holds its
+  count minus its log (`OrderBook::open_log_owner`; `drain_open_log(owner, ..)` / `clear_open_log(owner)` set it;
+  0 = fresh: created or decoded, the log is the whole count; `u64::MAX` = nobody). Before every absorb the counter
+  checks that the map holds exactly the books it counted (`OpenOrders::covers`: every non-fresh book carries its id
+  and their number is the number it counted; `OrderBook` is not `Clone`, so an owned book cannot be duplicated);
+  fresh books (a new market's book from a match worker) are absorbed as they are; otherwise it rebuilds from the
+  books. The stash drops a counter that no longer covers the books (the next block builds). Tests:
+  `the_cap_follows_book_transfer_reload_and_removal`, `the_carried_counter_follows_a_book_removed_before_the_stash`
+  (cap decisions vs the scan, 4 modes), `open_log_owner_follows_drains_clears_and_decodes` (torus-core).
   Metrics: `torus_exec_open_count_seconds` (per native block: the exec thread's absorb + lookups, nested in
   `exec_phase_margin_seconds` on the batch path and `exec_phase1_actions_seconds` on the single path; summarize.py
   `engine.open_count_ms`) and `torus_exec_open_count_deltas_total` (log entries absorbed). Both are in WIDE_COLS.

@@ -5065,9 +5065,10 @@ impl<T: StateBackend> NativeExecContext<T> {
         }
         if open_orders.is_none() {
             // Step 5: likewise for the open-order counter (the build counts
-            // the books; what the load logged is in them).
+            // the books; what the load logged is in them). Nobody owns
+            // them until it does.
             for book in order_books.values_mut() {
-                book.clear_open_log();
+                book.clear_open_log(OrderBook::OPEN_LOG_UNKNOWN);
             }
         }
 
@@ -5292,6 +5293,15 @@ impl<T: StateBackend> NativeExecContext<T> {
         }
         // Step 5: the counter goes with the books, unabsorbed logs inside
         // them (the next block's first count absorbs them, timed there).
+        // Codex r1: not if the map changed under it since its last count
+        // (books moved in, replaced, removed): the next block builds.
+        if self
+            .open_orders
+            .as_ref()
+            .is_some_and(|c| !c.covers(&self.order_books))
+        {
+            self.open_orders = None;
+        }
         #[cfg(debug_assertions)]
         if let Some(counter) = &self.open_orders {
             counter.debug_assert_exact(&self.order_books);

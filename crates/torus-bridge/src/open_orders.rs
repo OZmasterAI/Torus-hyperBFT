@@ -15,37 +15,86 @@
 //! (exact integer sums: the order of books cannot change a count).
 //! Node-local: never hashed or persisted; a restart rebuilds it from the
 //! loaded books.
+//!
+//! Codex r1: the book map is public and can change under a built counter
+//! (books moved in from another context, a book replaced by its reload,
+//! removed). So the counter checks, before every absorb, that the map holds
+//! exactly the books it counted ([`Self::covers`]): every book it drained
+//! or built carries its id ([`OrderBook::open_log_owner`]), and it knows how
+//! many there were. Fresh books (created or decoded: their log is their
+//! whole count, e.g. a new market's book from a match worker) are absorbed
+//! as they are. Anything else (a book owned by another counter or by
+//! nobody, a counted book gone) and it counts again from the books
+//! ([`Self::build`]), in every build profile: the cap can never read a
+//! count the books do not hold.
 
 #[cfg(any(test, debug_assertions, feature = "test-reference-paths"))]
 use std::collections::BTreeMap;
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::map::HashMap;
 use alloy_primitives::Address;
 use torus_core::order_book::OrderBook;
 use torus_types::MarketId;
 
-#[derive(Default, Debug)]
+/// Counter ids, unique per process: never [`OrderBook::OPEN_LOG_FRESH`] (0)
+/// or [`OrderBook::OPEN_LOG_UNKNOWN`] (`u64::MAX`, unreachable).
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
 pub(crate) struct OpenOrders {
     /// Users with at least one open order; absent = 0.
     map: HashMap<Address, u32>,
+    /// This counter's id: every book it counted carries it
+    /// ([`OrderBook::open_log_owner`]).
+    id: u64,
+    /// Books carrying `id` (the map's size at the last build or absorb).
+    books: usize,
 }
 
 impl OpenOrders {
     /// Apply every book's open-order log (and empty it). Returns the log
     /// entries applied (one per (book, user) changed since the last absorb).
+    /// A map that is not the one this counter counted ([`Self::covers`]):
+    /// counts again from the books instead (returns 0).
     pub(crate) fn absorb(&mut self, books: &mut HashMap<MarketId, OrderBook>) -> u64 {
+        if !self.covers(books) {
+            *self = Self::build(books);
+            return 0;
+        }
         let mut applied = 0u64;
-        let map = &mut self.map;
+        let (id, map) = (self.id, &mut self.map);
         for book in books.values_mut() {
-            if book.open_log_len() == 0 {
+            if book.open_log_len() == 0 && book.open_log_owner() == id {
                 continue;
             }
-            book.drain_open_log(|trader, delta| {
+            // A fresh book (whole count in its log) becomes ours here.
+            book.drain_open_log(id, |trader, delta| {
                 applied += 1;
                 Self::apply(map, trader, delta);
             });
         }
+        self.books = books.len();
         applied
+    }
+
+    /// Codex r1: `books` is the map this counter counted, give or take
+    /// fresh books: every other book carries this counter's id, and there
+    /// are as many as it counted. A book this counter drained cannot be
+    /// duplicated (`OrderBook` is not `Clone`) and no other counter or path
+    /// sets this id, so the owned books are exactly the counted ones. O(books).
+    pub(crate) fn covers(&self, books: &HashMap<MarketId, OrderBook>) -> bool {
+        let mut owned = 0usize;
+        for book in books.values() {
+            let owner = book.open_log_owner();
+            if owner == self.id {
+                owned += 1;
+            } else if owner != OrderBook::OPEN_LOG_FRESH {
+                return false;
+            }
+        }
+        owned == self.books
     }
 
     /// Add `delta` to `trader`'s count. Never below 0 (the invariant; a
@@ -77,22 +126,26 @@ impl OpenOrders {
         self.map.get(trader).copied().unwrap_or(0)
     }
 
-    /// Count from the books (their logs cleared): the first count after a
-    /// load, or after a market worker panic consumed a book.
+    /// Count from the books (their logs cleared, each now carrying the new
+    /// counter's id): the first count after a load, after a market worker
+    /// panic consumed a book, or when the map changed under the counter
+    /// ([`Self::absorb`]).
     pub(crate) fn build(books: &mut HashMap<MarketId, OrderBook>) -> Self {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut map: HashMap<Address, u32> = HashMap::default();
         for book in books.values_mut() {
-            book.clear_open_log();
+            book.clear_open_log(id);
             book.for_each_open_count(|trader, n| {
                 let e = map.entry(trader).or_default();
                 *e = e.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
             });
         }
-        Self { map }
+        Self { map, id, books: books.len() }
     }
 
     /// Every user's count: this counter plus the books' logs not absorbed
-    /// yet (tests and debug checks; does not absorb).
+    /// yet (tests and debug checks; does not absorb). Meaningful while
+    /// [`Self::covers`] holds.
     #[cfg(any(test, debug_assertions, feature = "test-reference-paths"))]
     pub(crate) fn with_logs(&self, books: &HashMap<MarketId, OrderBook>) -> BTreeMap<Address, u32> {
         let mut out: BTreeMap<Address, i64> =
@@ -122,6 +175,7 @@ impl OpenOrders {
     /// every user. O(books' traders + stops).
     #[cfg(debug_assertions)]
     pub(crate) fn debug_assert_exact(&self, books: &HashMap<MarketId, OrderBook>) {
+        assert!(self.covers(books), "step 5: the counter does not cover these books");
         let got = self.with_logs(books);
         let want = Self::recount(books);
         assert!(got == want, "step 5: open-order counter + logs != books\n{got:?}\n{want:?}");

@@ -149,6 +149,10 @@ pub(super) struct TraderIndex {
     /// Net change of each trader's open-order count (resting orders plus
     /// pending stops) in this book since the last drain; 0 entries possible.
     log: HashMap<Address, i32>,
+    /// Who holds this book's count minus `log` (Codex r1): 0 (the default,
+    /// [`super::OrderBook::OPEN_LOG_FRESH`]) = nobody, the log holds the
+    /// whole count; otherwise the id the last drain or clear passed.
+    owner: u64,
 }
 
 impl Deref for TraderIndex {
@@ -210,8 +214,10 @@ impl TraderIndex {
         Some(ids)
     }
 
-    /// Hand every non-zero logged delta to `f`; the log is empty afterwards.
-    pub(super) fn drain_log(&mut self, mut f: impl FnMut(Address, i32)) {
+    /// Hand every non-zero logged delta to `f`; the log is empty afterwards
+    /// and `owner` holds the book's count.
+    pub(super) fn drain_log(&mut self, owner: u64, mut f: impl FnMut(Address, i32)) {
+        self.owner = owner;
         for (trader, delta) in self.log.drain() {
             if delta != 0 {
                 f(trader, delta);
@@ -229,8 +235,14 @@ impl TraderIndex {
         self.log.len()
     }
 
-    pub(super) fn clear_log(&mut self) {
+    /// Drop the log; `owner` counts the book from its orders.
+    pub(super) fn clear_log(&mut self, owner: u64) {
+        self.owner = owner;
         self.log.clear();
+    }
+
+    pub(super) fn owner(&self) -> u64 {
+        self.owner
     }
 
     /// Tests: the map itself, NOT logged (to build corrupt states).

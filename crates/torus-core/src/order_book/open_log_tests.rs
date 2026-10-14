@@ -101,7 +101,7 @@ fn counts(book: &OrderBook) -> BTreeMap<Address, i64> {
 
 /// Drain `book`'s log into `acc` (zero sums dropped).
 fn drain(book: &mut OrderBook, acc: &mut BTreeMap<Address, i64>) {
-    book.drain_open_log(|t, d| {
+    book.drain_open_log(7, |t, d| {
         assert_ne!(d, 0, "a drained delta is never 0");
         *acc.entry(t).or_default() += i64::from(d);
     });
@@ -253,7 +253,7 @@ fn open_log_sums_to_open_order_count_over_random_ops() {
         // A cleared log drops what it held: counting again starts from the books.
         book.place_order(params(true, 50, 1, OrderType::Limit, TimeInForce::GTC), addr(1), 9_999);
         assert!(book.open_log_len() > 0);
-        book.clear_open_log();
+        book.clear_open_log(OrderBook::OPEN_LOG_UNKNOWN);
         assert_eq!(book.open_log_len(), 0);
     }
     // The stream exercises every op.
@@ -274,7 +274,7 @@ fn open_log_nets_per_trader_until_drained() {
     let stop = OrderType::StopMarket { trigger: fp(110) };
     b.place_order(params(true, 120, 1, stop, TimeInForce::GTC), a, 4);
     let mut got = Vec::new();
-    b.drain_open_log(|t, d| got.push((t, d)));
+    b.drain_open_log(7, |t, d| got.push((t, d)));
     got.sort();
     assert_eq!(got, vec![(a, 2), (m, 1)]);
 
@@ -291,6 +291,27 @@ fn open_log_nets_per_trader_until_drained() {
     let id = b.place_order(params(true, 91, 1, OrderType::Limit, TimeInForce::GTC), a, 7).order_id;
     b.cancel_order(id).unwrap();
     let mut got = Vec::new();
-    b.drain_open_log(|t, d| got.push((t, d)));
+    b.drain_open_log(7, |t, d| got.push((t, d)));
     assert_eq!(got, vec![(m, -1)]);
+}
+
+/// Codex r1: the log's owner. A new or decoded book is fresh (its log is
+/// its whole count); a drain hands the count to the drain's owner, a clear
+/// to the clear's.
+#[test]
+fn open_log_owner_follows_drains_clears_and_decodes() {
+    let mut b = OrderBook::new(1, fp(1), fp(1));
+    assert_eq!(b.open_log_owner(), OrderBook::OPEN_LOG_FRESH);
+    b.place_order(params(true, 90, 1, OrderType::Limit, TimeInForce::GTC), addr(1), 1);
+    let decoded: OrderBook = borsh::from_slice(&borsh::to_vec(&b).unwrap()).unwrap();
+    assert_eq!(decoded.open_log_owner(), OrderBook::OPEN_LOG_FRESH);
+    assert_eq!(decoded.open_log().collect::<Vec<_>>(), vec![(addr(1), 1)], "the whole count");
+    b.drain_open_log(5, |_, _| {});
+    assert_eq!(b.open_log_owner(), 5);
+    b.place_order(params(true, 91, 1, OrderType::Limit, TimeInForce::GTC), addr(1), 2);
+    assert_eq!(b.open_log_owner(), 5, "matching keeps the owner");
+    b.clear_open_log(OrderBook::OPEN_LOG_UNKNOWN);
+    assert_eq!(b.open_log_owner(), OrderBook::OPEN_LOG_UNKNOWN);
+    b.clear_open_log(9);
+    assert_eq!(b.open_log_owner(), 9);
 }

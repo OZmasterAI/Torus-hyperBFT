@@ -2389,8 +2389,31 @@ impl OrderBook {
     /// (classic decode, `insert_loaded_order`, `restore_stop_row`) logs its
     /// whole count. In-RAM only: never serialized, hashed, or read by
     /// matching or saving.
-    pub fn drain_open_log(&mut self, f: impl FnMut(Address, i32)) {
-        self.trader_orders.drain_log(f);
+    ///
+    /// Codex r1: `owner` (never [`Self::OPEN_LOG_FRESH`]) is the id of the
+    /// counter the deltas go to; it now holds this book's count minus the
+    /// log ([`Self::open_log_owner`]).
+    pub fn drain_open_log(&mut self, owner: u64, f: impl FnMut(Address, i32)) {
+        debug_assert_ne!(owner, Self::OPEN_LOG_FRESH, "step 5: a drain has an owner");
+        self.trader_orders.drain_log(owner, f);
+    }
+
+    /// Step 5 (Codex r1): [`Self::open_log_owner`] of a book whose log
+    /// holds its whole count: created or decoded, never drained or cleared.
+    pub const OPEN_LOG_FRESH: u64 = 0;
+
+    /// Step 5 (Codex r1): an owner no counter has: the log was dropped and
+    /// nobody counted the book (a counter must count it from its orders).
+    pub const OPEN_LOG_UNKNOWN: u64 = u64::MAX;
+
+    /// Step 5 (Codex r1): who holds this book's open-order count minus its
+    /// log: [`Self::OPEN_LOG_FRESH`] (nobody; the log is the whole count),
+    /// [`Self::OPEN_LOG_UNKNOWN`], or the id the last
+    /// [`Self::drain_open_log`] / [`Self::clear_open_log`] passed. A counter
+    /// that finds a book it does not own (and is not fresh) in its map
+    /// cannot know what that book adds, so it counts again from the books.
+    pub fn open_log_owner(&self) -> u64 {
+        self.trader_orders.owner()
     }
 
     /// Step 5: the open-order log, not drained (no 0 deltas).
@@ -2404,9 +2427,12 @@ impl OrderBook {
         self.trader_orders.log_len()
     }
 
-    /// Step 5: drop the open-order log (the caller counts from the book).
-    pub fn clear_open_log(&mut self) {
-        self.trader_orders.clear_log();
+    /// Step 5: drop the open-order log; `owner` counts from the book
+    /// ([`Self::OPEN_LOG_UNKNOWN`]: nobody yet). Never
+    /// [`Self::OPEN_LOG_FRESH`] (the log no longer holds the whole count).
+    pub fn clear_open_log(&mut self, owner: u64) {
+        debug_assert_ne!(owner, Self::OPEN_LOG_FRESH, "step 5: a cleared log is not fresh");
+        self.trader_orders.clear_log(owner);
     }
 
     /// Step 5: every trader's open orders in this book, as parts that add
