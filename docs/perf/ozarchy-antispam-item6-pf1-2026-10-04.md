@@ -9777,6 +9777,559 @@ tail / release-timing line (tail height and releases per second) so the round tr
 * Outputs: `ozarchy-p4soak10-run/analyst/`.
 * Raw perf data: `perf-{a,b}.data` in the k1 cell dirs, 187-316 MB each.
 
+## 70. Node or bench? 2 x 2 build swap at 10 markets: Phase 4 steps 1-4 `2a245321` vs main `21d238e0`, node build x bench build, plus bench release timing (campaign ozarchy-p4swap10, 2026-10-14)
+
+**The NODE build carries the 10-market gap. The bench build has no effect.** On headline matched/s, node B - node A
+is -2.51% [-3.19, -1.83], bench B - bench A is +0.28% [-0.40, +0.95], and the interaction (node effect with bench B
+minus node effect with bench A) is +1.05% [-0.30, +2.40], which is not significant. The total bb - aa is -2.23%
+[-3.19, -1.28], in line with sections 67 (-2.75%) and 69 (-2.43%). Actions/s show the same split: node -2.23%
+[-2.96, -1.50], bench -0.19% [-0.91, +0.54]. Matched per action has a small node effect (-0.34% [-0.56, -0.13]). The
+node build also sets the load wave: 13.5 s on node B vs 13.1 s on node A (+3.2% [+1.1, +5.4]), and node B's chain is
+short of actions in 3.3 pp [+0.5, +6.2] more seconds. Bench release timing (read without changing the bench) shows that
+the 20,000-action in-flight cap never binds: the bench's in-flight estimate averages 6-8k and is never >= 19k. Each
+wave, every sender fires ~4 actions (20.0k per wave) and then waits for its commits to show up in the commit tail. The
+tail lag is bistable from cell to cell (0.2-3.8 s mean) and does not follow the combo. So the gap is node-side: B's node
+turns the same bench load into ~3% longer waves. Section 69 found B's node faster on every latency it measured, so the
+cost is somewhere it did not measure.
+
+Question (18c, after section 69; Phase 4's merge waits on it): does the 10-market matched/s gap (B = Phase 4 `2a245321`
+below A = main `21d238e0`: section 67 -2.75% [-3.73, -1.78], section 69 -2.43% [-4.55, -0.30]) come from the NODE build
+or the BENCH build? `tools/bench-throughput` is the same source in A and B, but it links torus-bridge / torus-core /
+torus-state, which Phase 4 changed, so the two bench binaries differ. 18c also asked when the bench releases actions
+and how many are in flight, per second and per wave.
+
+Design: 2 x 2, node build x bench build, the p4gate binaries (not rebuilt), copied into
+`ozarchy-p4swap10-stage/<combo>-run/release/` (md5 checked against `ozarchy-p4gate-build/md5s.txt` before the launch):
+
+| combo (arm) | node | bench |
+|---|---|---|
+| nA-bA (aa) | A `8447a8c1` | A `652594b7` |
+| nA-bB (ab) | A `8447a8c1` | B `3e8e6af9` |
+| nB-bA (ba) | B `3a303574` | A `652594b7` |
+| nB-bB (bb) | B `3a303574` | B `3e8e6af9` |
+
+`run-cell.sh` takes both binaries from `TARGET_DIR` (= the combo dir): the node is copied into the harness worktree and
+the bench runs in place (it also writes the genesis and runs the oracle feed). It has no EXPECT_NODE_MD5 /
+EXPECT_BENCH_MD5 knobs, so the driver checks the combo after every cell (`combochk`, a hard check): exe md5 of the 3
+running nodes; `summary.json` `binaries.torus_node_md5` and `binaries.bench_throughput_md5` (full md5s); the run.log
+md5 lines and paths of the node source and the bench; the bench command line runs the combo dir's binary; the staged
+files are unchanged after the cell. The cell step also checks the node md5 (`md5_ok`).
+
+Settings = sections 67 / 69's 10-market cells: Classic, 10 markets, oracle feed on (30000, 2,000 ms, walk 0), 15 s
+checkpoint default, jemalloc compiled in, commit tail, CLOID_SHARE=0, block cap 400, MAX_IN_FLIGHT 4 (5,000 senders),
+budget 900, RATE 76000, `TORUS_ROCKSDB_STATS_INTERVAL_SECS=1` (as section 69), `TORUS_ROCKSDB_STATS` unset. Genesis md5
+`a3e617d1` checked per cell (either bench writes the same genesis). Harness: frozen copy `ozarchy-p4swap10-tools/` =
+section 69's tools (2a245321 + `657f5ad3` + `a91ce47c`, + `testnet/`, `devnet/genesis.json`), unchanged; new clean
+harness worktree `wt/p4swap10-h-2a245321` (section 69's worktree node file is hard-linked into `~/.debug`). Driver
+`ozarchy-p4swap10-campaign.sh` (CAMP=P4SWAP10) from `make-p4swap10-driver.py` (section 69's checks minus perf, plus
+`combochk`). Sidecars: section 69's 1 Hz `/metrics` sampler and vmstat; no perf.
+
+Cells: warm-up w0 (nB-bB, 60 s), then 4 rounds x 4 combos, 300 s each, in a Williams square (each combo once per round
+position; each ordered pair of neighbours once; the node, bench and interaction contrasts are each orthogonal to a
+linear trend over the 16 cells): r1 aa ab bb ba | r2 ab ba aa bb | r3 ba bb ab aa | r4 bb aa ba ab. Cell length: a
+load wave is ~13.5 s, so a 300 s cell holds ~22 waves; the partial wave at the window edge moves a cell's mean by at
+most ~1/22 of one wave's swing, and in random direction across 16 cells. Section 69's 60 s windows had a SD of ~3%;
+section 67's 120 s cells ~0.8% within arm; with 300 s cells and n = 4 per combo the main-effect SE is ~sigma/2.
+
+Smoke (60 s, the two cross combos): s0-ba 298,220, s0-ab 308,645, both rc 0 ACCEPT AGREE, combochk OK, genesis
+`a3e617d1`.
+
+Release timing (no bench change, no rebuild): (1) `bench.log` prints the cumulative "submitted" count about every 0.5 s
+with the running average rate; the time of each line is count / rate (the bench's own elapsed clock, +-0.1 s at 300 s).
+(2) Clock alignment: the shift that best matches the increments of the 3 nodes' cumulative RPC admits
+(`torus_rpc_submit_admit_seconds_count`) from bench +10 s (smoke: +0.3 / +0.6 s, mean abs error ~100-140 actions).
+(3) The commit tail: the bench releases a slot when it sees the action in a block body it fetched from val2
+(`torus_getBlockBody`, one body at a time). val2's `torus_rpc_requests_total{method="torus_getBlockBody"}` at 1 Hz gives
+the tail's progress; tail height = start height + bodies fetched (capped at the committed height); tail lag = now - the
+time the chain reached the tail height; committed-unreleased = actions processed since then; bench in flight (estimate) =
+submitted - actions up to the tail height.
+
+Cells (local 18:32-20:50; all rc 0 ACCEPT AGREE; `combochk` OK on all 17 cells, so every cell ran its intended
+node / bench pair. 289 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, 0 HARD FINDING, no rerun. cells.tsv: 17 rows, 0 bad; the
+analyst re-read every cell's rc, summary verdicts, both binary md5s, the 3 exe md5s and the bench path. Host check
+before every cell: no cargo / rustc / rust-analyzer / perf.) Headline matched/s, val0 actions/s, mean wave length
+(mempool minima), % of seconds with val0 mempool <= 1,000, commit-tail lag (mean s), bench in-flight estimate (mean):
+
+| pos | cell | node | bench | matched/s | actions/s | wave s | mempool <= 1k | tail lag s | in flight |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | w0-bb (60 s) | B | B | 303,425 | 1,477 | 14.3 | 31.7% | 1.57 | 6,242 |
+| 1 | r1-aa | A | A | 298,290 | 1,523 | 12.3 | 29.3% | 3.45 | 8,908 |
+| 2 | r1-ab | A | B | 297,752 | 1,511 | 13.1 | 36.0% | 0.46 | 4,984 |
+| 3 | r1-bb | B | B | 292,579 | 1,489 | 13.6 | 34.3% | 3.45 | 9,278 |
+| 4 | r1-ba | B | A | 291,880 | 1,477 | 13.5 | 38.3% | 0.27 | 4,468 |
+| 5 | r2-ab | A | B | 300,416 | 1,522 | 13.2 | 30.0% | 2.89 | 8,922 |
+| 6 | r2-ba | B | A | 289,089 | 1,480 | 13.6 | 38.7% | 1.27 | 5,391 |
+| 7 | r2-aa | A | A | 300,483 | 1,538 | 13.1 | 29.3% | 1.18 | 6,095 |
+| 8 | r2-bb | B | B | 289,686 | 1,474 | 13.6 | 36.0% | 3.78 | 9,566 |
+| 9 | r3-ba | B | A | 290,886 | 1,481 | 13.4 | 34.7% | 2.99 | 8,453 |
+| 10 | r3-bb | B | B | 295,224 | 1,497 | 13.6 | 33.7% | 0.17 | 4,602 |
+| 11 | r3-ab | A | B | 297,415 | 1,511 | 13.2 | 34.0% | 1.64 | 6,499 |
+| 12 | r3-aa | A | A | 298,795 | 1,511 | 13.4 | 35.3% | 0.26 | 4,450 |
+| 13 | r4-bb | B | B | 292,700 | 1,489 | 13.4 | 37.3% | 3.39 | 9,299 |
+| 14 | r4-aa | A | A | 299,036 | 1,522 | 13.2 | 35.0% | 0.31 | 5,138 |
+| 15 | r4-ba | B | A | 288,986 | 1,485 | 13.6 | 37.7% | 1.63 | 5,905 |
+| 16 | r4-ab | A | B | 298,056 | 1,502 | 13.3 | 35.0% | 3.31 | 9,277 |
+
+All 8 node-A cells (297.4-300.5k) are above all 8 node-B cells (289.0-295.2k), whatever the bench.
+
+### 70.1 Two-factor result
+
+Model: log value = combo + round (rounds as blocks), residual df 9; effects in % of the A level, 95% t CIs. "Node" =
+node B - node A averaged over both benches; "bench" likewise; "interaction" = (bb - ba) - (ab - aa).
+
+| metric | combo means aa / ab / ba / bb | node | bench | interaction | bb - aa |
+|---|---|---|---|---|---|
+| matched/s (headline) | 299,151 / 298,410 / 290,210 / 292,547 | **-2.51% [-3.19, -1.83]** | +0.28% [-0.40, +0.95] | +1.05% [-0.30, +2.40] | -2.23% [-3.19, -1.28] |
+| matched/s (val0, first 300 s) | 299,513 / 297,331 / 290,335 / 291,345 | **-2.57% [-3.23, -1.92]** | -0.19% [-0.85, +0.46] | +1.08% [-0.24, +2.39] | -2.77% [-3.70, -1.84] |
+| actions/s (val0) | 1,523.6 / 1,511.5 / 1,480.9 / 1,487.2 | **-2.23% [-2.96, -1.50]** | -0.19% [-0.91, +0.54] | +1.22% [-0.24, +2.68] | -2.41% [-3.44, -1.38] |
+| matched per action | 196.6 / 196.7 / 196.1 / 195.9 | -0.34% [-0.56, -0.13] | -0.01% [-0.22, +0.21] | -0.14% [-0.58, +0.29] | -0.35% [-0.66, -0.05] |
+| bench submits/s | 1,533.9 / 1,531.8 / 1,490.6 / 1,499.8 | -2.49% [-3.25, -1.73] | +0.24% [-0.52, +1.00] | +0.74% [-0.78, +2.26] | -2.25% [-3.33, -1.17] |
+| wave period (periodogram, matched) | 13.30 / 13.30 / 13.62 / 13.60 s | +2.33% [+0.93, +3.72] | -0.08% [-1.48, +1.31] | -0.19% [-2.98, +2.59] | +2.24% [+0.27, +4.21] |
+| wave length (mempool minima) | 13.00 / 13.21 / 13.52 / 13.55 s | +3.23% [+1.05, +5.41] | +0.91% [-1.27, +3.09] | -1.47% [-5.83, +2.88] | +4.14% [+1.06, +7.22] |
+| seconds with mempool <= 1,000 | 32.3 / 33.8 / 37.3 / 35.3% | +3.33 pp [+0.48, +6.19] | -0.25 pp [-3.10, +2.60] | -3.50 pp [-9.20, +2.20] | +3.08 pp [-0.95, +7.12] |
+| commit-tail lag (mean) | 1.30 / 2.08 / 1.54 / 2.70 s | +0.43 s [-1.32, +2.18] | +0.97 s [-0.79, +2.72] | +0.38 s [-3.12, +3.89] | +1.40 s [-1.08, +3.88] |
+
+Residual SD of matched/s is 0.60% per 300 s cell (section 67's 120 s cells: ~0.8%). No drift by run order: residual
+from the combo mean vs position, slope -0.012% per cell [-0.069, +0.045]. The interaction CI includes 0 and is less
+than half the node effect. With bench A on both nodes the node gap is -2.9% (290,210 vs 299,151); with bench B it is
+-2.0%. A bench share of the gap of more than ~1 point cannot be excluded at the 95% level, but the point estimate of
+the bench main effect is +0.3%.
+
+### 70.2 Bench release timing and in flight (18c's question)
+
+No bench change was needed. Sources:
+* `bench.log`'s cumulative "submitted" line (about every 0.5 s; time = count / running rate);
+* the 3 nodes' RPC admit counters to align the bench clock (shift +0.4 to +1.4 s, mean absolute error 75-157 actions);
+* val2's `torus_rpc_requests_total{method="torus_getBlockBody"}` at 1 Hz for the commit tail (the bench releases a
+  slot only when the action shows up in a body it fetched from val2, one body at a time).
+
+Per-second series per cell are in `series.tsv` (matched, actions, mempool, in flight, submits, commits).
+* **The in-flight cap does not bind.** The bench in-flight estimate (submitted - actions up to the tail height)
+  averages 6,148 / 7,421 / 6,054 / 8,186 (aa / ab / ba / bb). It is >= 19,000 in 0 seconds of any cell. Submitted -
+  processed peaks at 8.3-8.6k per wave.
+* **Per wave**: n = 84-86 waves per combo. Each wave submits 19.8-20.2k actions, i.e. ~4 per sender (place, place,
+  cancel-all: the 900-order open-order budget with 400-order batches allows two places before a cancel-all, which
+  must be seen committed). Per wave, aa / ab / ba / bb:
+  * length 13.0 / 13.2 / 13.5 / 13.6 s;
+  * seconds with mempool <= 1,000: 4.1 / 4.6 / 5.0 / 4.8;
+  * peak mempool 7.3k / 7.6k / 7.3k / 7.7k;
+  * minimum submitted - processed 768 / 753 / 610 / 572.
+* **Shape of a wave** (the smoke's 1 Hz series show the same):
+  * Full 400-action blocks commit at 3-5 blocks/s (1,200-2,000 actions/s) while the bench submits only 500-800/s.
+  * The mempool drains, and a run of 30-60 small blocks/s follows.
+  * The commit tail falls ~100+ bodies behind, then catches up at 25-40 bodies/s.
+  * Senders release in a burst (3,500-4,500 submits/s for 2-3 s), and the next wave starts.
+  * Submits and commits run about half a wave out of phase (their cross-correlation peaks at +-6-7 s).
+* **Tail lag is bistable across cells, not per combo.** Some cells sit behind for 95-100% of seconds (mean lag 2.9-3.8
+  s, ~11 bodies/s when behind). Others are behind only 10-60% of the time (mean lag 0.2-1.6 s, ~14 bodies/s). Each
+  combo has both kinds (aa 1 of 4 behind, ab 2, ba 1, bb 3). Node and bench effects on the lag are not significant
+  (+0.4 s [-1.3, +2.2], +1.0 s [-0.8, +2.7]). Within a combo, the lag barely moves matched/s (r = -0.30; -0.4% per
+  "always behind" vs "never behind"). It is not the source of the gap.
+
+### 70.3 Anomalies (none per combo)
+
+* **Extra admits at bench start.** In 11 of 17 cells the 3 nodes admit 4.5k-45k more actions than the bench counts as
+  submitted, all inside the bench's first ~2 s (start_extra = end_extra, so nothing extra after that). It occurs in
+  every combo (aa r1 45k, ab r3 38k, ba r3 / r4 35-37k, bb w0 36k) and is also in section 69's k1-a (A / A, ~40k), so
+  it is a start-up transient of the bench + node pair, not a build signature. Within-combo correlation with matched/s:
+  r = -0.33.
+* `torus_exec_action_rejections` 429-1,080 per cell (3 nodes) in every combo; `missing_action_rejections` 3-12. The
+  60 s cross-combo smokes: s0-ab had 12 rejections and no start burst.
+* The 60 s warm-up w0-bb reads 303k: the 60 s window holds ~4 waves, and the start wave weighs more. It is not used.
+
+### 70.4 Verdict and next
+
+* Phase 4's 10-market matched/s gap is in the **node** build: -2.5% [-3.2, -1.8]. The bench build adds +0.3%
+  [-0.4, +1.0], and the interaction is +1.0% [-0.3, +2.4], not significant. The question "is it an artefact of the
+  bench binary?" is answered no.
+* Mechanism, as far as these series go: same bench, same loop, but on node B each load wave takes ~3% longer
+  (13.5 vs 13.1 s), with the same ~20k actions per wave and more seconds with an empty mempool. Section 69 found B's
+  admit / commit / exec latencies equal or shorter, so the extra time sits in a part of the wave cycle those averages
+  do not cover. Candidates:
+  * the burst of small blocks after the mempool drains (native blk/s mean 11.36 on node B vs 11.16 on node A);
+  * the latency from commit to body serving on val2 (`torus_getBlockBody`);
+  * per-wave cancel-all / place execution order (matched per action -0.34%).
+* Next, if 18c wants the cause before merging: a per-wave phase breakdown of node A vs node B with one bench binary.
+  These cells have the 1 Hz data for it (`metrics-1hz.txt.gz`, `series.tsv`). Look at where in the wave the 0.4 s goes
+  (drain phase, small-block run, tail catch-up, release burst), and compare `torus_getBlockBody` serve time. No new run
+  needed for a first cut.
+
+Files: run dir `~/bench-results-matched/ozarchy-p4swap10-run/` (`campaign.log`, `cells.tsv`, `analyst/swap.txt`,
+`swap.json`, `series.tsv`, `section70-setup.md`); cells `ozarchy-p4swap10-10m-{w0-bb,r1..r4-*}`; smoke
+`ozarchy-p4swap10-smoke-10m-s0-{ba,ab}`; tools `ozarchy-p4swap10-tools/` (`make-p4swap10-driver.py`,
+`ozarchy-p4swap10-campaign.sh`, `analyst/swap.py`; re-run: `python3 -I analyst/swap.py ozarchy-p4swap10-10m OUT
+w0-bb:bb r1-aa:aa ...` in run order); stage `ozarchy-p4swap10-stage/` (read-only copies).
+
+### 70.5 Per-wave cycle, node A vs node B (18c's four items, from the existing cells)
+
+No new run. The 16 main cells were re-checked first: rc 0, AGREE / ACCEPT, node and bench md5 = the staged combo
+binaries, no CELL-FLAG. Node effects are the two-factor node main effect (B - A, pooled over both bench builds,
+rounds as blocks, residual df 9, 95% t CI) on per-cell wave means. Bench effects and interactions are all inside
+noise for the quantities below. "p50 / p90" are over all waves of a node arm (A n = 168, B n = 164).
+
+**Sources.**
+* Per block, from the three node logs (`val*.log.gz`): commit time (`on_committed_block: sending to execution
+  pipeline height=H native=N`), action count, exec start and end (`executing finalized block` / `block done`).
+* The bench's commit tail position: val2's `torus_getBlockBody` ok count at 1 Hz plus an offset. The offset is
+  committed height minus count at t0 + 1.5-5 s, after the tail has read the empty backlog up to the head.
+* `buckets.csv` order-age histograms (age = now - nonce, where the nonce is the bench's clock at signing).
+* val2 `torus_exec_cancel_all_total`; `proc_cpu_by_node`; `bench.log`.
+
+**Wave definition.** A wave runs from the exec start of one main segment to the next. A main segment is a val2
+exec busy segment, split at 0.25 s of exec idle, holding >= 8,000 actions. Each wave has:
+* a main segment of ~60 blocks, 45 of them full (the 400-action block cap);
+* then an "echo": 1-3 short segments (~2-3k actions);
+* then idle (no committed actions, a run of empty blocks).
+
+Wave lengths match 70.2's mempool-minimum waves: 13.26 s vs 13.55 s.
+
+**What node B does differently, per wave**
+
+| step (per wave) | node A mean (p50 / p90) | node B mean (p50 / p90) | node B - A [95% CI] |
+|---|---|---|---|
+| wave length | 13,258 ms (13,155 / 15,629) | 13,555 ms (13,484 / 15,479) | **+297 ms [+131, +464]** |
+| main segment, exec busy | 9,138 ms (9,139 / 10,640) | 8,800 ms (8,776 / 9,930) | **-338 ms [-543, -134]** |
+| main segment, first to last commit | 8,419 ms | 8,105 ms | -315 ms [-593, -36] |
+| exec idle after the main segment | 2,486 ms (2,471 / 3,590) | 3,008 ms (2,988 / 4,055) | **+523 ms [+422, +623]** |
+| echo exec busy | 1,295 ms | 1,449 ms | +154 ms [+3, +305] |
+| refill (main exec end -> next main start) | 3,781 ms (3,863 / 5,886) | 4,457 ms (4,621 / 6,206) | **+677 ms [+446, +907]** |
+| exec rate while busy (val2, whole window) | 1,939 act/s | 1,980 act/s | **+41 [+25, +57]** (+2.1%) |
+| exec time per full 400-action block | 209.9 ms | 206.4 ms | -3.5 ms [-5.3, -1.7] |
+| exec busy share of the window | 80.0% | 76.4% | -3.7 pp [-4.3, -3.0] |
+
+Node B executes faster but idles longer. The 3.7-point busy-share loss times the 2.1% faster busy rate gives val2's
+-35 act/s [-46, -25] (1,532 vs 1,497).
+
+**Item 1: budget hit -> cancel-all committed -> budget reset.** Not recoverable per sender: the bench logs no
+per-sender event, and the node keeps only histograms. Fleet-level proxies per wave, A vs B:
+* Release / sign -> admit (`order_age_admit`, 3 nodes):
+  * p50: 236 vs 215 ms, -21 [-42, +0];
+  * p90: 893 vs 878 ms.
+* Sign -> commit (`order_age_commit`, val2, all actions; a cancel-all's nonce is its budget-hit moment):
+  * p50: 2,136 vs 2,096 ms, -40 [-200, +119];
+  * p90: 5,012 vs 4,951 ms.
+* Commit -> the bench's tail reads the body (= budget reset):
+  * at the main segment's last block: 6,189 vs 6,401 ms, +212 [-102, +526]; p50 / p90 5,983 / 7,311 vs
+    6,416 / 7,389;
+  * action-weighted over the main segment: 4,939 vs 5,198 ms, +259 [-49, +568].
+* Tail read - val2 exec end: p50 per cell 4,004 vs 4,329 ms, +325 [+4, +646].
+
+**The tail never catches up during load in any cell.** It stays 3-11 heights behind at best (median 50-72). It is
+>= 5 heights behind in 99.9% of 1 s intervals in every cell. It reads ~11.3 bodies/s, one at a time, so it is busy
+throughout. Releases are therefore paced by the tail's read speed, and the chain idles while senders wait for it.
+
+**Correction to 70.2.** The "bistable" tail lag in 70.2 comes from its offset. That offset was taken at t0 + shift
+(+6-7 s), already 5-13 heights behind the tail, and then clipped at the head. With the start offset the lag is the
+same kind in all 16 cells.
+
+**Item 2: cancel-all status and timeouts.**
+* Status is present on every body the bench read. Every body was read after val2 executed it: 100% of actions,
+  except 0.47% in r2-aa and r3-bb. So the "missing status = executed" default practically never applied.
+* `torus_exec_cancel_all_total` equals the bench's accepted cancel-alls exactly in all 16 cells (169,323-177,400).
+* `torus_exec_action_failures` is 0. `torus_exec_action_rejections` is 143-360 per node per cell, all action kinds.
+* Bench in-flight releases: timeout = 0 in all cells; refused 0-41 per cell.
+* Cancel-alls executed per wave: 7,723 vs 7,736 (+13 [-65, +90]).
+  * In the main segment: 6,393 vs 6,148 (-246 [-400, -92]).
+  * In the echo: 1,330 vs 1,588 (+259 [+126, +391]).
+* Not recorded: the bench counts committed / refused / timeout, but not statuses other than "executed". A counter of
+  non-executed cancel-all statuses in `in_flight::Tracker::on_block` would record it.
+
+**Item 3: blocks per wave and actions per block** (val2 commits within the wave):
+
+| per wave | node A (p50 / p90) | node B (p50 / p90) | node B - A |
+|---|---|---|---|
+| actions | 20,163 (20,268 / 22,863) | 20,167 (20,157 / 22,293) | +4 [-180, +189] |
+| blocks | 149.6 (148.5 / 182.3) | 156.3 (153.5 / 187.5) | +6.6 [+0.7, +12.5] |
+| nonempty blocks | 73.4 | 72.8 | -0.6 [-2.8, +1.7] |
+| full (400) blocks | 45.0 | 45.1 | +0.2 [-0.5, +0.8] |
+| empty blocks | 76.3 (77.0 / 98.0) | 83.5 (82.5 / 104.0) | **+7.2 [+3.1, +11.3]** |
+| actions per nonempty block | 277.8 (274.3 / 315.8) | 279.9 (278.5 / 323.4) | +2.1 [-6.6, +10.8] |
+| main-segment blocks | 60.0 | 56.7 | -3.3 [-5.5, -1.1] |
+| main actions / echo actions | 17,523 / 2,674 | 17,087 / 3,114 | -436 [-791, -82] / +441 [+129, +752] |
+
+The extra blocks are the empty blocks made during the longer idle.
+
+**Item 4: which block each cancel-all lands in.** Not recoverable. Bodies were not kept: the val data dirs are
+reused per cell, and `--sweep-bodies` was off. The logs give only per-block counts, and a body carries no sender
+address. Proxies from the 1 Hz cancel-all counter, mapped onto the exec timeline:
+* The first half of the main segment's blocks holds 66.1% / 64.8% of its actions but only 49.8% / 46.9% of its
+  cancel-alls (-2.9 pp [-5.9, +0.0]). Cancel-alls land late in the wave, as the third fire.
+* Node B moves ~250 cancel-alls per wave from the main segment into the echo.
+
+Recording it would take one of:
+* a bench log line per release (sender, cancel-all nonce, height seen, tail read time, reset time);
+* a copy of val2's `CF_BLOCK_BODIES` at cell end, plus the bench's per-fire nonce log to map signer to sender.
+
+**Which step node B lengthens.** The refill, mostly its idle part:
+* refill +677 ms [+446, +907], of which idle +523 ms [+422, +623] per wave;
+* the main exec segment is 338 ms [134, 543] shorter;
+* net wave length +297 ms [+131, +464], i.e. -2.2% actions/s, as in 70.1.
+
+The refill ends when senders are released, and releases come from the bench tail reading val2's bodies.
+
+**Candidate cause, sized.** Serving `torus_getBlockBody` on val2, which is what the tail waits on. The handler reads
+the raw `CF_BLOCK_BODIES` row and re-serializes every action to JSON.
+* val2's CPU minus the mean of val0 / val1 (same consensus and exec work, no body serving) is 215 vs 221 s per cell.
+* Per 400 actions the tail released, that is **189.7 vs 198.8 ms, +9.1 ms [+5.6, +12.7]**. All 8 node-B cells are
+  at 193.9-205.2 ms. The 8 node-A cells are at 186.4-194.3 ms.
+* That cost is ~85% of the ~226 ms the tail spends per full body. Taken as fully serial, it could add up to +460 ms
+  [+280, +640] per wave (50.4 full-body equivalents), which covers the +297 ms.
+* Reading the +7 extra empty bodies adds only ~+30 ms per wave (~4 ms each).
+* A direct fit of tail read time per full body cannot resolve it: +2.5 ms [-2.6, +7.7].
+* The `getBlockBody` path (`torus-rpc`) is not in the Phase 4 diff. The production changes are in `torus-bridge`
+  (executor, `users.rs`), `torus-state` (`resident_rows.rs`, `backend.rs`), `torus-core` (`position.rs`) and
+  telemetry; the `app.rs` changes are test-only.
+* So any Phase 4 effect on serving would be indirect: contention on val2 between body serialization and B's
+  executor (CPU, cache or allocator). B's nodes use less CPU overall: val0 / val1 -40 s per cell. These data do not
+  single out a Phase 4 function.
+
+**Reading.** At 10 markets this load is bound by the bench's tail, not by the node:
+* Node B executes 2.1% faster per busy second, and its admit / commit / exec ages are equal or shorter (section 69).
+* The 10-market gap shows up as idle time while senders wait for the tail.
+* The gap may therefore be a harness artifact of a tail-bound cycle plus a small per-body serving cost, not a node
+  throughput regression.
+
+Confidence:
+* high that the extra time is in the idle refill and that B's exec is faster;
+* medium that val2 body serving is the cause (CPU differencing, no per-request timing);
+* low on any Phase 4 code link.
+
+**Next, to resolve.** Two short A/B pairs (120 s, 2 rounds, ~25 min), with a bench that logs per-body tail fetch
+time (height, actions, ms) and a node `torus_getBlockBody` duration histogram:
+* (a) as here, which isolates the serving cost;
+* (b) with the tail pointed at a non-validator `--rpc-only` node, or reading bodies faster, so that the cycle is no
+  longer tail-bound.
+
+If (b) closes the gap, the 10-market gap is not a node regression.
+
+Files: scripts and outputs in `~/bench-results-matched/ozarchy-p4swap10-tools/analyst/waves/`:
+* `blocks_extract.py` -> `blocks/<tag>.tsv`;
+* `waves.py` -> `waves.txt`, `waves.json`;
+* `tailrate.py`, `status.py`, `offset_check.py`, `busy.py`, `cpu.py` (`cpu-per-action.txt`).
+
+They sit in the tools dir rather than the run dir because the analyst gate keeps the run dir unchanged. Re-run:
+`python3 -I blocks_extract.py <cell> blocks/<tag>.tsv`, then `python3 -I waves.py > waves.txt` and the others.
+
+### 70.6 End-of-block worker (`torus-end-resident`), node A vs node B (18c's question, from the existing cells)
+
+**Question.** In Phase 4, B does extra per-trader work on the end-of-block worker. Is that worker clearly heavier
+on node B, especially on val2? If so, it is a node-side contributor to the 10-market gap.
+
+**Data.** The 16 measured cells of 70.1 (warm-up excluded): 17/17 rc 0 and ACCEPT AGREE, no CELL-FLAG, node md5
+8447a8c1 (A) / 3a303574 (B) on every cell of its arm. For each node (val0 / val1 / val2), from
+`metrics-after - metrics-before`:
+* `torus_exec_end_resident_seconds` is the end-resident total: the exec-thread checks plus the worker's job.
+  `end_resident_on_worker` is identical in both builds. Its count equals `torus_exec_native_blocks_total` in every
+  cell and node.
+* `torus_exec_end_resident_wait_seconds` is the time the exec thread waits for the worker (`settle_rows`).
+* The sub-timers differ: A has `..._positions_seconds` and B has `..._users_seconds`. They time different work and
+  are not compared. `..._rows_seconds` has the same name on both builds.
+
+Per-thread CPU was recorded. `io-threads-start.txt` / `io-threads-end.txt` hold utime+stime ticks per thread at
+bench start and bench end (~303 s), and `tasks.txt` samples them at 1 Hz. The thread appears there as
+`torus-end-resid`.
+
+Per wave = per-native-block value x nonempty blocks per wave (73.4 A / 72.8 B, 70.5). Effects are from the
+two-factor model with rounds as blocks (df 9, 95% CI). The bench-build effect covers 0 for every total and for CPU.
+
+| val2 (val0 / val1 alike) | node A | node B | B - A [95% CI] |
+|---|---:|---:|---:|
+| end-resident total, ms per native block | 1.578 | 0.927 | **-0.651 [-0.703, -0.599]** |
+| end-resident total, ms per 1k actions | 12.45 | 7.65 | -4.80 [-5.00, -4.60] |
+| end-resident total, ms per wave | 115.7 | 67.4 | **-48.2 [-50.3, -46.1]** |
+| wait, ms per native block | 0.0178 | 0.0091 | -0.0087 [-0.0104, -0.0069] |
+| wait, ms per 1k actions | 0.141 | 0.076 | -0.065 [-0.082, -0.048] |
+| wait, ms per wave | 1.30 | 0.66 | -0.64 [-0.78, -0.50] |
+| rows sub-timer, ms per native block | 0.683 | 0.007 | -0.676 [-0.702, -0.651] |
+| `torus-end-resid` CPU, s per cell | 5.15 | 3.05 | **-2.09 [-2.17, -2.02]** |
+| `torus-end-resid` CPU, ms per 1k actions | 11.16 | 6.75 | -4.41 [-4.61, -4.21] |
+
+val0 / val1, node effect on the total: -0.669 / -0.660 ms per block. On thread CPU: -2.16 / -2.14 s per cell. The
+groups separate completely: on val2 the 8 A cells span 1.49-1.65 ms per block and 5.02-5.22 s CPU, and the 8 B
+cells span 0.89-0.96 ms and 2.99-3.16 s.
+
+**Sized against the gap.** The question assumed the worker might be heavier on B. It is lighter, by the same amount
+on all three nodes:
+* B's extra per-trader work is outweighed by the near-removal of the rows work (rows sub-timer 0.68 -> 0.007 ms per
+  block).
+* Per wave on val2, the total is -48 ms and the wait -0.6 ms. Both have the opposite sign to the +297 ms wave and
+  the +523 ms idle refill.
+* The thread uses ~1.7% of one core on A and ~1.0% on B, of 32 cores. That is far too small to contend with body
+  serving.
+* The change is the same on val0, val1 and val2, so it cancels in the val2 - mean(val0, val1) differencing behind
+  the +9.1 ms per 400 actions serving cost (70.5). It cannot be val2-specific contention.
+
+**Verdict.** The end-of-block worker is not a node-side contributor to the 10-market gap. If anything, it frees
+~2 s of CPU per node per cell on B. Contention on val2's `getBlockBody` serving stays the lead.
+
+Confidence: high on the measurement. The groups separate, the code path is identical, and the counts match the
+native blocks.
+
+Caveat: the metric totals span before-bench to after-drain, while thread CPU spans the bench only; both normalise
+to their own blocks and actions.
+
+Files: the cells' `metrics-{before,after}-val*.txt`, `io-threads-{start,end}.txt`, `procstat.raw` (pid to val),
+and `ozarchy-p4swap10-tools/analyst/waves/waves.json` (blocks per wave). The analysis ran as a stdin script
+(`python3 -I -`), using `swap.twofactor` from `ozarchy-p4swap10-tools/analyst/swap.py`. The analyst gate blocked
+saving a `.py` next to the other scripts, so it is not on disk.
+
+### 70.7 Tail read-ahead: does the node gap close when the commit tail reads faster? (campaign ozarchy-p4tail10, 2026-10-14)
+
+**Question (18c; Phase 4's merge waits on it).** 70.5 found the load tail-bound: the bench's in-flight commit tail
+reads val2's `torus_getBlockBody` one body at a time (~11 bodies/s), stays 50-72 heights behind (median) during load,
+and paces the sender releases. Node B lengthens the idle refill (+523 ms per wave) while executing 2.1% faster, and
+val2's body-serving CPU per 400 actions is +9.1 ms [+5.6, +12.7] on B. Hypothesis: tail-bound cycle + slightly costlier
+body serving on B. Test: let the tail read ahead. If B - A closes at depth > 1, the gap is a harness effect.
+
+**Setup.**
+* One bench build for every cell: `feat/bench-tail-depth` `7733a0e1` (local, Codex-reviewed, no findings; on top of
+  18c's release-timing `4b928297`), `bench-throughput` md5 `bd6d954e`. `--in-flight-tail-depth N` keeps up to N
+  `torus_getBlockBody` reads in flight (heights next..next+N-1, still on val2) and applies the bodies strictly in
+  height order; N = 1 is the old one-at-a-time tail, read for read. Harness env `IN_FLIGHT_TAIL_DEPTH`, passed
+  explicitly in every cell (1 or 4). p4swap10 found no bench-build effect (+0.28% n.s.), so one bench across arms is
+  clean.
+* Nodes (not rebuilt, md5-checked): A `8447a8c1` (main `21d238e0`), B `3a303574` (`2a245321`), copied from
+  `ozarchy-p4swap10-stage/` into `ozarchy-p4tail10-stage/n{A,B}-bT-run/release/` next to the tail-depth bench.
+* Settings = p4swap10 / job 1 10-market cells: Classic, oracle on (30000 / 2000 ms / walk 0), 15 s checkpoint default,
+  jemalloc, `TORUS_ROCKSDB_STATS` default, `STATS_INTERVAL` 1 s, commit tail (`IN_FLIGHT_TAIL=commit`), CLOID 0,
+  BLOCK_CAP 400, MAX_IN_FLIGHT 4, budget 900.
+* Tools: frozen `ozarchy-p4tail10-tools/` = the p4swap10 copy (`2a245321` + `657f5ad3` + `a91ce47c`) with
+  `tools/matched-bench/{run-cell.sh, summarize.py, resummarize.sh, campaign/run_cell.py, README.md, test_harness.py}`
+  from `7733a0e1` (that branch already has both harness fixes; 170 harness Python tests pass in the copy). Driver
+  generated by `make-p4tail10-driver.py`; per cell it hard-checks node md5 (3 exes, summary, run.log), bench md5,
+  staged files unchanged, and the depth (run.log setting, bench cmd, bench.log `In-flight tail depth:` line and
+  `| tail_depth=` suffix at N > 1 and neither at 1, summary `cell.in_flight_tail_depth` and
+  `ingest.in_flight.tail_depth`).
+* Depth choice. Smoke at depth 4 (s0-b4, 60 s, node B, ACCEPT AGREE) kept the tail within a few heights during load:
+  lag p50 3, p99 11, max 12 heights (s0-a1 at depth 1: 67 / 130 / 133). So depth 4 is used; 8 was not needed.
+* Cells: warm-up w0-b4 (60 s), then two mirrored rounds of the four arms, 300 s each (~22 waves at depth 1):
+  r1 a1 a4 b4 b1 | r2 b1 b4 a4 a1. Within each depth the node order is A B B A; node, depth and interaction
+  contrasts are orthogonal to a linear time trend. Effects from the two-way node x depth model with rounds as blocks
+  (residual df 3, t 3.182); matched/s on the log scale (%).
+
+**Metrics per cell** (window t0 + 10 s .. t0 + 300 s): matched/s = harness `matched_s_avg`; wave = val2 exec busy
+segments split at exec idle >= 0.25 s, main segment >= 8000 actions, wave = main start to next main start (70.5);
+tail lag in heights = every 0.1 s, val2's committed height (log `sending to execution pipeline`) minus the highest
+height the tail had applied (bench.log `release-timing-blocks: ... applied=h@ms`; exact, no offset estimate as in
+70.5); fetch per body = `release-timing-hist: what=tail_fetch_us` p50 / p99 (whole run, empty bodies included) and
+full bodies (>= 400 actions) from the per-block `fetch_ms` in the window; val2 CPU per 400 actions = (val2 - mean(val0,
+val1)) load-window user+sys per 400 actions released as committed (70.5).
+
+**The answer at n = 2 is suggestive but not significant.** At depth 4 the node gap is gone in the point estimate:
+B - A on matched/s is +0.55% [-2.21, +3.31] at depth 4 vs -1.48% [-4.24, +1.28] at depth 1. The gap change is
++2.03 points [-1.87, +5.93] (two-way node x depth, rounds as blocks, df 3). The read-ahead lifts both nodes a lot:
++4.49% [+1.73, +7.25] on A and +6.52% [+3.76, +9.28] on B. The tail lag falls from ~60 to 2 heights and the ~13.5 s
+load wave disappears. So the tail paces the 10-market cells, and that is a harness effect of about 5%. B's extra val2
+serving cost is still there at depth 4 (+6.5 ms per 400 actions). But with the tail off the critical path it no longer
+costs matched/s. The depth-1 gap here (-1.48%) is smaller than p4swap10's -2.51% because of one low A cell (r1-a1,
+see anomalies). The other depth-1 pair reproduces p4swap10 (-2.66%).
+
+**Cells.** 9/9 rc 0, ACCEPT AGREE, md5_ok, flag ok in `cells.tsv`. No CELL-FLAG, CHECK FAIL or HARD FINDING lines,
+and no rerun was queued. Every cell passed the depth check. Node md5 is 8447a8c1 (A) / 3a303574 (B) and bench
+bd6d954e in each cell's summary. All cells use the 10-market genesis a3e617d1 (= p4gate). The warm-up w0-b4 (60 s,
+286,285 matched/s) is excluded.
+
+Per cell, in run order. Wave = mean ms (number of main exec segments in the window). Lag = heights behind, p50 / p99.
+fmax = the release-timing 15 s windows' `tail_fetch_max`, p50 / p99. Fetch = ms per body (`tail_fetch_us`), p50 / p99,
+over all bodies and over full bodies only. CPU = val2 minus mean(val0, val1), ms per 400 actions released. Tip = val2
+extra CPU in ms/s during tip seconds.
+
+| cell | node | depth | matched/s | wave ms (segs) | lag p50 / p99 | fmax p50 / p99 | fetch all p50 / p99 | fetch full p50 / p99 | CPU / 400 | tip ms/s |
+|---|---|---:|---:|---|---|---|---|---|---:|---:|
+| r1-a1 | A | 1 | 291,010 | 13,544 (21) | 67 / 143 | - | 5.6 / 393 | 265 / 492 | 195.9 | - |
+| r1-a4 | A | 4 | 307,861 | no wave (4) | 2 / 8 | 6 / 37 | 311 / 754 | 314 / 765 | 249.0 | 539 |
+| r1-b4 | B | 4 | 310,137 | no wave (5) | 2 / 7 | 5 / 28 | 328 / 754 | 339 / 731 | 258.3 | 629 |
+| r1-b1 | B | 1 | 290,152 | 13,554 (21) | 63 / 146 | - | 5.6 / 426 | 269 / 582 | 197.8 | - |
+| r2-b1 | B | 1 | 291,490 | 13,610 (21) | 56 / 146 | - | 7.7 / 426 | 270 / 531 | 195.3 | - |
+| r2-b4 | B | 4 | 310,690 | no wave (3) | 2 / 6 | 6 / 81 | 295 / 786 | 316 / 749 | 253.8 | 530 |
+| r2-a4 | A | 4 | 309,561 | no wave (3) | 2 / 7 | 4 / 29 | 295 / 721 | 300 / 693 | 250.1 | 537 |
+| r2-a1 | A | 1 | 299,352 | 13,140 (21) | 53 / 133 | - | 9.7 / 426 | 264 / 513 | 190.1 | - |
+
+How to read the columns:
+* **No wave at depth 4.** The exec thread runs in 3-5 long busy stretches (main segments 27-54 s apart) instead of a
+  ~13.5 s wave. The 70.5 wave length is therefore not defined at depth 4 and is compared at depth 1 only.
+* **Lag vs fmax (18c item 2).** The tail lag is the exact committed-minus-applied height, sampled every 0.1 s. fmax
+  is the largest number of bodies one poll round fetched in a 15 s window, so it is an upper bound on the lag at the
+  start of that round. At depth 4 its p50 (4-6) sits just above the lag p50 (2), as expected. At depth 1 there is
+  only the final window: the single poll round never caught up during the whole cell (3,135-3,572 bodies in one
+  round), so fmax per window does not exist there. The lag column is the measure for both depths.
+* **Fetch time caveat.** At depth > 1, `tail_fetch_us` starts when the read is queued, not when it is first polled,
+  so it includes a little time applying the body before it (well under 1 ms, per 18c). The all-bodies p50 at depth 1
+  is small because the tail also reads empty blocks.
+
+Effects (two-way node x depth, rounds as blocks, df 3, t 3.182):
+
+| metric | A1 | B1 | A4 | B4 | gap B-A depth 1 | gap B-A depth 4 | gap change | depth 4 - 1, A / B |
+|---|---:|---:|---:|---:|---|---|---|---|
+| matched/s (log, %) | 295,152 | 290,820 | 308,710 | 310,413 | -1.48 [-4.24, +1.28] | +0.55 [-2.21, +3.31] | **+2.03 [-1.87, +5.93]** | +4.49 [+1.73, +7.25] / +6.52 [+3.76, +9.28] |
+| actions released (log, %) | 450,069 | 443,614 | 466,836 | 463,901 | -1.44 [-3.89, +1.00] | -0.63 [-3.08, +1.82] | +0.81 [-2.65, +4.28] | +3.66 / +4.47 |
+| wave ms (depth 1 only) | 13,342 | 13,582 | - | - | +240 (r1 +10, r2 +470) | - | - | - |
+| tail lag p50, heights | 60 | 59.5 | 2 | 2 | -0.5 | 0 | +0.5 | -58 / -57.5 |
+| tail lag p99, heights | 138 | 146 | 7.5 | 6.5 | +8 [-2.6, +18.6] | -1 [-11.6, +9.6] | -9 | -130.5 / -139.5 |
+| fetch per full body p50, ms | 264 | 270 | 307 | 328 | +5 [-21, +31] | +21 [-5, +47] | +15 | +43 / +58 |
+| fetch per body p99, ms (hist) | 410 | 426 | 737 | 770 | +16 | +33 | +16 | +328 / +344 |
+| val2 CPU per 400 actions, ms | 193.0 | 196.6 | 249.6 | 256.1 | +3.6 [-3.1, +10.4] | **+6.5 [-0.3, +13.2]** | +2.9 [-6.7, +12.4] | +56.6 / +59.5 |
+| val2 extra CPU, ms/s (load) | 721.6 | 716.7 | 950.1 | 962.8 | -4.9 [-14.3, +4.6] | +12.8 [+3.3, +22.2] | +17.6 [+4.2, +31.0] | +228.5 / +246.1 |
+
+Within-round gaps on matched/s: depth 1 r1 -0.30%, r2 -2.66%; depth 4 r1 +0.74%, r2 +0.36%.
+
+**Serving cost at the higher depth (18c item 4).** B - A on val2's CPU per 400 actions is +3.6 [-3.1, +10.4] at
+depth 1 and +6.5 [-0.3, +13.2] at depth 4. p4swap10 measured +9.1 [+5.6, +12.7] at depth 1. Pooled over both depths
+the node effect is +5.1 [+0.3, +9.8]. So the difference is still there at depth 4 and about the same size (the change
+is not significant). It just no longer limits matched/s. Read-ahead itself makes serving dearer on both nodes:
++57-60 ms per 400 actions, and full-body fetch +43-58 ms with 4 reads in flight. val2 does not serve concurrent
+bodies for free, but 4 in flight still deliver more bodies per second than 1.
+
+**Tip churn (18c's extra check).** At the tip in commit mode, depth N cancels N-1 in-flight reads per poll. I split
+val2's extra CPU (host-1hz cpu ticks, val2 minus mean(val0, val1)) into tip seconds: seconds where the lag was <= 2
+heights in every 0.1 s sample.
+* Depth 4: 30-38 tip seconds per cell. val2 extra there is 530-629 ms/s (A 539 / 537, B 629 / 530), well below the
+  950-963 ms/s load mean. So tip polling does not show up as extra val2 CPU.
+* Depth 1: no tip seconds in any load window (the tail never caught up). The drain cannot stand in either, because
+  the bench, and with it the tail, has stopped by then.
+* val2's `torus_getBlockBody` ok count is lower at depth 4 (2,450-2,640 vs 3,145-3,573 at depth 1). Fuller blocks
+  mean fewer heights, and cancelled reads do not appear as ok requests. So reconnect churn cannot be counted from
+  node metrics. Nothing points to it, but it is not measured directly.
+
+**Depth 1 vs p4swap10 (18c item 5).** p4swap10's 8 cells per node: A 297,415-300,483 (mean 298,780), B
+288,986-295,224 (mean 291,379); waves A 13,021-13,452 ms, B 13,392-13,756 ms; tail lag median 50-72 heights (offset
+method).
+* Here the B cells (290,152 / 291,490; waves 13,554 / 13,610) and r2-a1 (299,352; 13,140 ms) fall in those ranges.
+  Lag medians of 53-67 also match.
+* **Flag:** r1-a1 (291,010 matched/s, 13,544 ms wave, 443.8k released) is 2.6% below the lowest p4swap10 A cell and
+  looks like a B cell. It is valid (ACCEPT AGREE, md5 8447a8c1). Its node WARN/ERROR lines (303-313) are in the depth-1 range
+  (303-494), the host was quiet, and its load1 average was 23.2 (other cells 23.2-36.9). It was the first measured cell after the 60 s warm-up. I found no cause.
+* Without r1-a1, depth 1 would give A 299k vs B 291k (about -2.9%), i.e. p4swap10's gap. 18c verified that depth 1
+  is the old tail read for read, so the depth-1 cells are comparable.
+
+**Verdict.** Freeing the tail removes the 10-market gap in the point estimate (+0.55% at depth 4) and raises
+throughput ~5% on both nodes. That fits the hypothesis: a tail-bound cycle plus B's slightly dearer body serving on
+val2, which is a harness effect and not a node regression on the critical path. But the gap change, +2.03 points
+[-1.87, +5.93], does not exclude 0 at n = 2. The depth-1 control is itself noisy because of r1-a1. The depth-4 gap's
+CI, [-2.21, +3.31], does exclude p4swap10's -2.51%, though only barely. To make the gap change significant, two
+more mirrored rounds would be needed (8 cells, ~70 min). Alternatively, 10-market gates could run at depth 4 from now
+on.
+
+Confidence: high that the tail paced throughput (lag 60 -> 2 heights, +4.5-6.5% matched/s, waves gone). Medium that
+B's gap is a harness effect (point estimates agree, but n = 2). Medium on the serving-cost difference persisting at
+depth 4.
+
+Caveats:
+* The tail-depth bench is a 24 MB binary from its own target dir; the p4gate benches were 483 MB with debug info.
+  Same release code, different profile settings were not checked.
+* Summaries were re-summarized after the last cell with 18c's `summarize.py` (detached worktree
+  `/home/oz/projects/wt/p4tail10-resum` at `14520097` = origin/feat/summarize-release-timing, which contains
+  `7733a0e1`). This adds `ingest.release_timing`. The originals are kept as `summary.orig.json`; the headline is
+  unchanged in all 11 cells. `resummarize.sh` drops the `oracle_feed` block (run-cell writes it after summarize), so
+  it was copied back from `summary.orig.json`.
+* Before the launch I stopped the main session's rust-analyzer (the driver preflight refuses to run with it).
+
+Files: run dir `~/bench-results-matched/ozarchy-p4tail10-run/` (campaign.log, cells.tsv), cells
+`ozarchy-p4tail10-10m-{w0-b4, r1-a1, r1-a4, r1-b4, r1-b1, r2-b1, r2-b4, r2-a4, r2-a1}`, smoke
+`ozarchy-p4tail10-smoke-10m-s0-{b4,a1}`; tools `ozarchy-p4tail10-tools/` (driver, `make-p4tail10-driver.py`,
+`analyst/tail/tail.py` + `blocks_extract.py`, output `analyst/tail/tail.txt`, `tail.json`). Rerun:
+`python3 -I tail.py ozarchy-p4tail10-10m-r1-a1:a:1:1 ... --json tail.json` (label:node:depth:round).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
