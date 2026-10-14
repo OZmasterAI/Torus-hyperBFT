@@ -39,6 +39,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use torus_types::{ActionSignature, NativeAction};
 
+use crate::release_timing::{wall_ms, ReleaseTiming, TailTiming, WaitReason};
+
 /// Slack past the nonce window before an unseen action is written off.
 pub const TIMEOUT_MARGIN_MS: u64 = 10_000;
 /// Watcher poll period: one `eth_blockNumber` (head mode) or one probe of the
@@ -213,6 +215,8 @@ pub struct Tracker {
     senders: Vec<SenderState>,
     /// Indexed by [`Release`].
     pub released: [u64; 3],
+    /// Release age and wait timing (`release_timing`).
+    pub timing: ReleaseTiming,
 }
 
 impl Tracker {
@@ -223,6 +227,7 @@ impl Tracker {
             pending: HashMap::new(),
             senders: vec![SenderState::default(); senders],
             released: [0; 3],
+            timing: ReleaseTiming::default(),
         }
     }
 
@@ -256,6 +261,13 @@ impl Tracker {
             && !(budget > 0
                 && self.cancel_pending(sender)
                 && self.estimate(sender) + batch.max(1) > budget)
+    }
+
+    /// Why `sender` is not [`ready`](Self::ready): at its cap, else held by
+    /// its own in-flight cancel-all.
+    pub fn wait_reason(&self, sender: usize) -> WaitReason {
+        let _ = sender;
+        todo!()
     }
 
     /// Register one action as in flight (BEFORE it is sent, so a fast commit
@@ -308,9 +320,17 @@ impl Tracker {
             .collect()
     }
 
-    /// One committed block. Cancel-alls are applied before places (the
-    /// executor runs a block's cancel-alls first).
+    /// [`on_block_at`](Self::on_block_at) without a clock (tests).
+    #[cfg(test)]
     pub fn on_block(&mut self, actions: &[(u64, bool)]) -> Vec<usize> {
+        self.on_block_at(actions, 0)
+    }
+
+    /// One committed block, its body seen at `now_ms` (release age =
+    /// `now_ms` - nonce). Cancel-alls are applied before places (the
+    /// executor runs a block's cancel-alls first).
+    pub fn on_block_at(&mut self, actions: &[(u64, bool)], now_ms: u64) -> Vec<usize> {
+        let _ = now_ms;
         let mut woken = Vec::new();
         for cancels_pass in [true, false] {
             for &(key, ok) in actions {
@@ -403,6 +423,9 @@ pub struct Cap {
     pub tracker: Mutex<Tracker>,
     wake: Vec<Notify>,
     pub tail: TailStats,
+    /// Written by the tail task only (and read at the end of the run).
+    tail_timing: Mutex<TailTiming>,
+    started: Instant,
 }
 
 impl Cap {
@@ -418,6 +441,8 @@ impl Cap {
             )),
             wake: (0..senders).map(|_| Notify::new()).collect(),
             tail: TailStats::default(),
+            tail_timing: Mutex::new(TailTiming::default()),
+            started: Instant::now(),
         }
     }
 
@@ -470,6 +495,18 @@ impl Cap {
     pub fn report(&self) -> String {
         let t = self.tracker.lock().unwrap();
         report_line_mode(self.n, &t, &self.tail, &self.url, self.tail_mode)
+    }
+
+    /// Close the current release-timing window: its two log lines
+    /// (`release_timing` module doc).
+    pub fn timing_window(&self, last: bool) -> [String; 2] {
+        let _ = last;
+        todo!()
+    }
+
+    /// End of run: the last (partial) window, then one histogram line each.
+    pub fn timing_report(&self) -> Vec<String> {
+        todo!()
     }
 }
 
@@ -636,6 +673,11 @@ struct TailCursor {
     next: u64,
     attempts: u32,
     idle: u32,
+    /// Head mode: `eth_blockNumber` minus the last read height at this
+    /// poll's start (release timing).
+    lag: Option<u64>,
+    /// `(height, seen wall ms)` of the bodies read this poll.
+    seen: Vec<(u64, u64)>,
 }
 
 impl TailCursor {
@@ -644,13 +686,15 @@ impl TailCursor {
             next: start_block + 1,
             attempts: 0,
             idle: 0,
+            lag: None,
+            seen: Vec::new(),
         }
     }
 }
 
 /// Release the actions of the body at the cursor and step past it.
 fn tail_apply(cap: &Cap, cur: &mut TailCursor, actions: &[(u64, bool)]) {
-    let woken = cap.tracker.lock().unwrap().on_block(actions);
+    let woken = cap.tracker.lock().unwrap().on_block_at(actions, 0);
     cap.wake(woken);
     cap.tail.fetched.fetch_add(1, Ordering::Relaxed);
     cur.next += 1;
@@ -734,6 +778,11 @@ async fn tail_poll<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop
             }
         }
     }
+}
+
+/// One [`tail_poll`], timed (`release_timing`).
+async fn tail_round<S: TailSource>(cap: &Cap, src: &S, cur: &mut TailCursor, stop: Instant) {
+    tail_poll(cap, src, cur, stop).await;
 }
 
 /// The shared block-body tail: every `TAIL_POLL` expire timed-out actions,
@@ -1456,5 +1505,118 @@ mod tests {
             "In-flight cap 1 action(s)/sender: released committed=0 refused=0 timeout=0 \
              | in flight at end 0 | block tail http://v2: fetched=0 errors=0 missed=0 | tail=commit"
         );
+    }
+
+    // ---- release timing (s121, `release_timing`) ----
+
+    #[test]
+    fn wait_reason_splits_cap_full_from_cancel_pending() {
+        let mut t = Tracker::new(1, 3, T);
+        t.submit(0, 1, 1_000, 400, false);
+        t.submit(0, 2, 1_001, 0, true);
+        // Below the cap, own cancel-all in flight, next batch over budget.
+        assert!(!t.ready(0, 400, 500));
+        assert_eq!(t.wait_reason(0), WaitReason::CancelPending);
+        t.submit(0, 3, 1_002, 400, false);
+        assert!(!t.ready(0, 400, 0));
+        assert_eq!(t.wait_reason(0), WaitReason::CapFull, "the cap first");
+    }
+
+    #[test]
+    fn release_age_is_recorded_for_committed_actions_only() {
+        let mut t = Tracker::new(1, 4, T);
+        t.submit(0, 1, 50_000, 400, false);
+        t.submit(0, 2, 50_100, 400, false);
+        t.submit(0, 3, 1_000, 400, false);
+        t.apply_result(&[2], &Err("rpc: refused".into()));
+        assert_eq!(t.expire(1_000 + T + 1), vec![0], "key 3 times out");
+        assert_eq!(t.on_block_at(&[(1, true), (9, true)], 50_750), vec![0]);
+        let w = t.timing.roll();
+        assert_eq!((w.age_ms.n, w.age_ms.max), (1, 750));
+        assert_eq!(t.released, [1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_records_its_wait_by_reason() {
+        use std::sync::Arc;
+        let end = far();
+        let cap = Arc::new(Cap::new(1, 1, "http://v2".into(), TailMode::Commit));
+        assert_eq!(cap.wait_ready(0, 400, 0, end).await, Some((0, false, false)));
+        cap.submit(0, &[(1, 1_000, 400, false)]);
+        let c = cap.clone();
+        let w = tokio::spawn(async move { c.wait_ready(0, 400, 0, end).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cap.apply_result(&[1], &Err("rpc: refused".into()));
+        assert_eq!(w.await.unwrap(), Some((0, false, true)));
+        let r = cap.tracker.lock().unwrap().timing.roll();
+        assert_eq!(r.ready_calls, 2, "a call that did not wait counts too");
+        assert_eq!(r.wait_us[0].n, 1);
+        assert!(r.wait_us[0].sum >= 30_000, "{}", r.wait_us[0].sum);
+        assert_eq!(r.wait_us[1].n, 0);
+
+        // Below the cap, held by its own cancel-all over the budget.
+        let cap = Arc::new(Cap::new(1, 3, "http://v2".into(), TailMode::Commit));
+        cap.submit(0, &[(2, 1_000, 400, false), (3, 1_001, 0, true)]);
+        let c = cap.clone();
+        let w = tokio::spawn(async move { c.wait_ready(0, 400, 500, end).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let woken = cap.tracker.lock().unwrap().on_block_at(&[(3, true)], 2_001);
+        cap.wake(woken);
+        assert_eq!(w.await.unwrap(), Some((400, false, true)));
+        let r = cap.tracker.lock().unwrap().timing.roll();
+        assert_eq!((r.ready_calls, r.wait_us[0].n, r.wait_us[1].n), (1, 0, 1));
+        assert!(r.wait_us[1].sum >= 20_000, "{}", r.wait_us[1].sum);
+        assert_eq!((r.age_ms.n, r.age_ms.max), (1, 1_000));
+    }
+
+    #[tokio::test]
+    async fn tail_round_times_polls_and_logs_seen_heights() {
+        // Head mode: head 3; bodies 1 and 2 read, 3 not readable yet.
+        let cap = Cap::new(1, 2, "http://v2".into(), TailMode::Head);
+        cap.submit(0, &[(11, 1_000, 400, false)]);
+        let node = FakeNode::new(Some(3))
+            .with(1, vec![BodyFetch::Keys(vec![(11, true)])])
+            .with(2, vec![BodyFetch::Keys(vec![])])
+            .with(3, vec![BodyFetch::Error]);
+        let mut cur = TailCursor::new(0);
+        let before = wall_ms();
+        tail_round(&cap, &node, &mut cur, far()).await;
+        assert!(cur.seen.is_empty(), "handed to the tail timing");
+        let [line, blocks] = cap.timing_window(false);
+        assert!(line.starts_with("release-timing: t="), "{line}");
+        assert!(line.contains(" final=0 released=1 "), "{line}");
+        assert!(
+            line.contains(" tail_rounds=1 tail_fetched=2 tail_fetch_max=2 "),
+            "{line}"
+        );
+        assert!(line.ends_with(" tail_lag_max=3"), "{line}");
+        let seen: Vec<(u64, u64)> = blocks
+            .split_once(" seen=")
+            .unwrap()
+            .1
+            .split(',')
+            .map(|e| {
+                let (h, ms) = e.split_once('@').unwrap();
+                (h.parse().unwrap(), ms.parse().unwrap())
+            })
+            .collect();
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(seen.iter().all(|s| s.1 >= before), "{blocks}");
+
+        // Commit mode: no head read, so no lag.
+        let cap = Cap::new(1, 2, "http://v2".into(), TailMode::Commit);
+        let node = FakeNode::new(Some(9)).with(1, vec![BodyFetch::Keys(vec![])]);
+        let mut cur = TailCursor::new(0);
+        tail_round(&cap, &node, &mut cur, far()).await;
+        let report = cap.timing_report();
+        assert_eq!(report.len(), 8, "{report:?}");
+        assert!(report[0].contains(" final=1 "), "{}", report[0]);
+        assert!(report[0].ends_with(" tail_lag_max=-"), "{}", report[0]);
+        assert!(report[1].starts_with("release-timing-blocks: t="));
+        assert!(report[2].starts_with("release-timing-hist: what=age_ms n=0 "));
+        assert!(report[5].starts_with("release-timing-hist: what=tail_round_us n=1 "));
+        assert!(report[6]
+            .starts_with("release-timing-hist: what=tail_fetched_per_round n=1 sum=1 "));
+        assert!(report[7].starts_with("release-timing-hist: what=tail_lag_heights n=0 "));
     }
 }
