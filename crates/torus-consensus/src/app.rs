@@ -8134,42 +8134,80 @@ impl TorusApp {
 }
 
 /// Parent of the scratch DB dirs opened by `TorusApp::stub` and the test
-/// fixtures: `<tmp>/torus-consensus-test-dbs/<pid>/`.
+/// fixtures: `<tmp>/torus-consensus-test-dbs/<owner>/`, one `<owner>` dir per
+/// process, next to the `<owner>.lock` that process holds locked.
 const SCRATCH_DB_ROOT: &str = "torus-consensus-test-dbs";
 
-/// A fresh, created scratch DB dir `<tmp>/SCRATCH_DB_ROOT/<pid>/<prefix>-<n>`.
+/// A fresh, created scratch DB dir `<tmp>/SCRATCH_DB_ROOT/<owner>/<prefix>-<n>`.
 /// The DB stays open until its test ends, so nothing removes the dir on drop;
 /// instead the first call in each process removes the dirs of processes that
 /// have exited (nextest runs one process per test, so finished tests' dirs go
-/// at the next test's start).
+/// at the next test's start). Liveness is the owner's file lock, not its pid:
+/// test runs in other PID namespaces share the tmp dir (Codex's bwrap
+/// sandbox), where a pid names another process or none.
 fn scratch_db_dir(prefix: &str) -> std::path::PathBuf {
-    static SWEEP: std::sync::Once = std::sync::Once::new();
+    static OWNER: std::sync::OnceLock<(std::path::PathBuf, std::fs::File)> =
+        std::sync::OnceLock::new();
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let root = std::env::temp_dir().join(SCRATCH_DB_ROOT);
-    SWEEP.call_once(|| sweep_dead_process_dirs(&root));
+    let (owner, _lock) = OWNER.get_or_init(|| {
+        let root = std::env::temp_dir().join(SCRATCH_DB_ROOT);
+        sweep_abandoned_scratch_dirs(&root);
+        claim_scratch_owner_dir(&root)
+    });
     let name = format!("{prefix}-{}", COUNTER.fetch_add(1, Ordering::Relaxed));
-    let dir = root.join(std::process::id().to_string()).join(name);
+    let dir = owner.join(name);
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 
-/// Remove every `<parent>/<pid>` dir whose process has exited. Needs `/proc`
-/// (Linux); without it, and for names that are not pids, does nothing.
-fn sweep_dead_process_dirs(parent: &std::path::Path) {
-    let proc = std::path::Path::new("/proc");
-    if !proc.join("self").exists() {
-        return;
+/// Create this process's owner dir under `root` and lock its `<owner>.lock`
+/// (held until the returned file is dropped, i.e. until the process exits).
+/// The name (pid, clock, attempt) is new: `create_new` refuses a taken one.
+fn claim_scratch_owner_dir(root: &std::path::Path) -> (std::path::PathBuf, std::fs::File) {
+    std::fs::create_dir_all(root).expect("create the scratch DB root");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for attempt in 0u64.. {
+        let name = format!("{}-{nanos}-{attempt}", std::process::id());
+        let lock_path = root.join(format!("{name}.lock"));
+        let lock = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("create scratch DB lock {lock_path:?}: {e}"),
+        };
+        // A sweep may take the lock between create and lock and remove the
+        // file: then the lock fails or the path is gone; take another name.
+        if lock.try_lock().is_ok() && lock_path.exists() {
+            let dir = root.join(name);
+            std::fs::create_dir(&dir).expect("create the scratch DB owner dir");
+            return (dir, lock);
+        }
     }
-    let Ok(entries) = std::fs::read_dir(parent) else {
+    unreachable!("ran out of scratch DB owner names")
+}
+
+/// Remove the owner dirs of exited processes: each `<owner>.lock` in `root`
+/// nobody holds, with its `<owner>` dir. Other entries are left alone.
+fn sweep_abandoned_scratch_dirs(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().filter(|n| n.parse::<u32>().is_ok()) else {
+        let lock_path = entry.path();
+        if lock_path.extension().is_none_or(|e| e != "lock") {
+            continue;
+        }
+        let Ok(lock) = std::fs::File::open(&lock_path) else {
             continue;
         };
-        if !proc.join(pid).exists() {
-            let _ = std::fs::remove_dir_all(entry.path());
+        if lock.try_lock().is_ok() {
+            let _ = std::fs::remove_dir_all(lock_path.with_extension(""));
+            let _ = std::fs::remove_file(&lock_path);
         }
     }
 }
@@ -8179,35 +8217,129 @@ mod scratch_db_dir_tests {
     use super::*;
 
     #[test]
-    fn sweep_removes_only_dirs_of_exited_processes() {
-        let parent = tempfile::tempdir().unwrap();
-        // Above the kernel's pid_max (2^22), so never a live process.
-        let dead = parent.path().join("4294967295");
-        let own = parent.path().join(std::process::id().to_string());
-        let other = parent.path().join("not-a-pid");
-        for d in [&dead, &own, &other] {
+    fn sweep_removes_only_dirs_whose_lock_is_free() {
+        let root = tempfile::tempdir().unwrap();
+        let (live, _live_lock) = claim_scratch_owner_dir(root.path());
+        // What an exited owner leaves: its dir and an unlocked lock file. (Not
+        // made by dropping a claimed lock: a child another test forks in that
+        // moment holds the lock until its exec, and the sweep would skip it.)
+        let dead = root.path().join("1-1-0");
+        std::fs::write(dead.with_extension("lock"), b"").unwrap();
+        let other = root.path().join("2");
+        for d in [&live, &dead, &other] {
             std::fs::create_dir_all(d.join("db")).unwrap();
         }
-        sweep_dead_process_dirs(parent.path());
-        assert!(!dead.exists(), "dir of an exited process is removed");
-        assert!(own.exists(), "dir of a live process is kept");
-        assert!(other.exists(), "non-pid names are left alone");
+        sweep_abandoned_scratch_dirs(root.path());
+        assert!(!dead.exists(), "dir of an exited owner is removed");
+        assert!(!dead.with_extension("lock").exists(), "and its lock file");
+        assert!(live.exists(), "dir of a live owner is kept");
+        assert!(other.exists(), "entries without a lock file are left alone");
     }
 
     #[test]
     fn scratch_db_dir_is_per_process_and_created() {
         let dir = scratch_db_dir("torus-unit");
         assert!(dir.is_dir());
+        let owner = dir.parent().unwrap();
         assert_eq!(
-            dir.parent().unwrap(),
-            std::env::temp_dir()
-                .join(SCRATCH_DB_ROOT)
-                .join(std::process::id().to_string())
+            owner.parent().unwrap(),
+            std::env::temp_dir().join(SCRATCH_DB_ROOT)
+        );
+        let lock = std::fs::File::open(owner.with_extension("lock")).unwrap();
+        assert!(
+            lock.try_lock().is_err(),
+            "this process holds its owner lock"
         );
         let name = dir.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("torus-unit-"));
         let next = scratch_db_dir("torus-unit");
         assert_ne!(dir, next, "every call gets a fresh dir");
+        assert_eq!(next.parent().unwrap(), owner, "one owner dir per process");
+    }
+
+    const CHILD_TEST: &str = "app::scratch_db_dir_tests::scratch_child";
+
+    /// Child process of `scratch_dirs_survive_runs_in_other_pid_namespaces`:
+    /// takes a scratch dir, prints it, and with mode `hold` keeps running (as a
+    /// live test run) until its stdin closes. Does nothing when run directly.
+    #[test]
+    #[ignore = "child process of scratch_dirs_survive_runs_in_other_pid_namespaces"]
+    fn scratch_child() {
+        let Ok(mode) = std::env::var("TORUS_SCRATCH_CHILD") else {
+            return;
+        };
+        let dir = scratch_db_dir("child");
+        std::fs::write(dir.join("marker"), b"live").unwrap();
+        println!("SCRATCH_DIR={}", dir.display());
+        if mode == "hold" {
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        }
+    }
+
+    fn child_scratch_dir(out: &mut impl std::io::BufRead) -> std::path::PathBuf {
+        std::io::BufRead::lines(&mut *out)
+            .map_while(Result::ok)
+            .find_map(|l| l.strip_prefix("SCRATCH_DIR=").map(Into::into))
+            .expect("child printed its scratch dir")
+    }
+
+    /// Test runs in another PID namespace sharing /tmp (Codex's bwrap sandbox
+    /// does this) must not delete a live run's scratch DBs, and two such runs
+    /// (same pid inside their namespaces) must not get the same dir. Needs a
+    /// `bwrap` that can unshare the PID namespace: `TORUS_TEST_BWRAP`, else
+    /// `bwrap` on PATH; skipped without one.
+    #[test]
+    fn scratch_dirs_survive_runs_in_other_pid_namespaces() {
+        use std::process::{Command, Stdio};
+        let bwrap = std::env::var("TORUS_TEST_BWRAP").unwrap_or_else(|_| "bwrap".into());
+        let ns_args = ["--unshare-pid", "--dev-bind", "/", "/", "--proc", "/proc"];
+        let usable = Command::new(&bwrap)
+            .args(ns_args)
+            .arg("true")
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !usable {
+            eprintln!("skipped: no bwrap that can unshare the PID namespace");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let child = |mode: &str, in_new_pid_ns: bool| {
+            let mut cmd = if in_new_pid_ns {
+                let mut c = Command::new(&bwrap);
+                c.args(ns_args).arg(&exe);
+                c
+            } else {
+                Command::new(&exe)
+            };
+            cmd.args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+                .env("TMPDIR", tmp.path())
+                .env("TORUS_SCRATCH_CHILD", mode)
+                .stdout(Stdio::piped());
+            cmd
+        };
+        let mut holder = child("hold", false).stdin(Stdio::piped()).spawn().unwrap();
+        // Kept open until the holder exits (it still prints its test result).
+        let mut held_out = std::io::BufReader::new(holder.stdout.take().unwrap());
+        let held = child_scratch_dir(&mut held_out);
+        let ns_run = || {
+            let out = child("run", true).output().unwrap();
+            assert!(out.status.success(), "namespaced child failed: {out:?}");
+            child_scratch_dir(&mut &out.stdout[..])
+        };
+        let (a, b) = (ns_run(), ns_run());
+        let held_survived = held.join("marker").exists();
+        drop(holder.stdin.take());
+        holder.wait().unwrap();
+        assert!(
+            held_survived,
+            "a run in another PID namespace deleted a live run's scratch dir {held:?}"
+        );
+        assert_ne!(
+            a, b,
+            "runs in different PID namespaces got the same scratch dir"
+        );
     }
 }
 
