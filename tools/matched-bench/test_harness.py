@@ -447,8 +447,12 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(
             self.d,
             extra=[
-                "--max-in-flight", "1", "--in-flight-tail", "commit",
-                "--in-flight-tail-depth", "4",
+                "--max-in-flight",
+                "1",
+                "--in-flight-tail",
+                "commit",
+                "--in-flight-tail-depth",
+                "4",
             ],
         )
         self.assertEqual(s["cell"]["in_flight_tail_depth"], 4)
@@ -456,8 +460,12 @@ class SummarizeTest(unittest.TestCase):
         self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "commit")
         # Head mode: the depth suffix alone is not a tail mode.
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail_depth=2\n"))
-        s, _ = run_summarize(self.d, extra=["--max-in-flight", "1", "--in-flight-tail-depth", "2"])
+            f.write(
+                self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail_depth=2\n")
+            )
+        s, _ = run_summarize(
+            self.d, extra=["--max-in-flight", "1", "--in-flight-tail-depth", "2"]
+        )
         self.assertEqual(s["ingest"]["in_flight"]["tail_mode"], "head")
         self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 2)
         # Unset: no suffix, depth 1.
@@ -466,6 +474,47 @@ class SummarizeTest(unittest.TestCase):
         s, _ = run_summarize(self.d, extra=["--max-in-flight", "1"])
         self.assertIsNone(s["cell"]["in_flight_tail_depth"], "unset = flag omitted")
         self.assertEqual(s["ingest"]["in_flight"]["tail_depth"], 1)
+
+    def test_resummarize_keeps_the_oracle_feed_block(self):
+        """run-cell.sh adds summary.json .oracle_feed AFTER summarize.py; a
+        resummarize rebuilds summary.json, so it must carry the block over
+        (archy p4tail10: it was dropped). A cell without one gets none."""
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+        with open(os.path.join(self.d, "bench.log"), "w") as f:
+            f.write(self.BENCH_LOG_CAPPED + self.BENCH_LOG_RELEASE_TIMING)
+        run_summarize(self.d, extra=["--max-in-flight", "1"])
+        p = os.path.join(self.d, "summary.json")
+        with open(p) as f:
+            d = json.load(f)
+        feed = {
+            "oracle_feed": 1,
+            "sent": 120,
+            "accepted": 118,
+            "stale_marks_at_bench_end": 0,
+        }
+        d["oracle_feed"] = feed
+        with open(p, "w") as f:
+            json.dump(d, f)
+
+        def resummarize():
+            r = subprocess.run(
+                ["bash", os.path.join(HERE, "resummarize.sh"), self.d],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(p) as f:
+                return json.load(f)
+
+        s = resummarize()
+        self.assertEqual(s["oracle_feed"], feed)
+        self.assertEqual(s["ingest"]["release_timing"]["seen_bodies"], 3, "rebuilt")
+        del s["oracle_feed"]
+        with open(p, "w") as f:
+            json.dump(s, f)
+        self.assertNotIn("oracle_feed", resummarize())
 
     def test_rpc_max_response_mb_comes_from_the_node_env(self):
         write_cell(self.d, 1_000, 1_000)
@@ -1156,7 +1205,9 @@ class CrashKillGuardTest(unittest.TestCase):
             l
             for l in src.splitlines()
             if ("IN_FLIGHT_TAIL" in l or "MAX_IN_FLIGHT" in l)
-            and not l.lstrip().startswith(("#", "log ", "--", "python3", "if ", "export "))
+            and not l.lstrip().startswith(
+                ("#", "log ", "--", "python3", "if ", "export ")
+            )
         ]
         snippet = (
             "RPCS=(http://127.0.0.1:8645 http://127.0.0.1:8646 http://127.0.0.1:8647)\n"
