@@ -45,7 +45,7 @@ use torus_bridge::native_executor::{
 };
 use torus_core::position::NativeBalance;
 use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
-use torus_state::{NativeStateOverlay, ResidentRows, StateBackend, StateDb};
+use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::FixedPoint;
 
 struct Sample {
@@ -228,7 +228,9 @@ fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>)
         p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
     }
     let t = std::time::Instant::now();
-    let r = ResidentRows::build(&db).expect("R build");
+    // Phase 4 step 2: as the node builds R (raw liquidation / oracle / market
+    // rows, positions and balances from the record set).
+    let r = torus_bridge::native_executor::resident_rows_cold(&db).expect("R build");
     let r_build = RBuild { rows: r.len(), bytes: r.bytes(), ms: t.elapsed().as_secs_f64() * 1e3 };
     if let Some(held) = holder.rows() {
         assert_eq!(held, &r, "carried R == cold build over the final DB");

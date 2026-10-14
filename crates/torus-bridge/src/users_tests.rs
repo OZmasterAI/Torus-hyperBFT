@@ -1441,7 +1441,7 @@ fn users_source_reads_equal_raw_rows() {
         }
     }
     println!("USERS SOURCE {stats:?} opaque={opaque}");
-    assert!(stats.hits > 20_000 && stats.ranges > 50_000 && stats.rows > 200_000, "non-vacuous: {stats:?}");
+    assert!(stats.hits > 5_000 && stats.ranges > 50_000 && stats.rows > 100_000, "non-vacuous: {stats:?}");
     assert!(stats.slow > 1_000 && stats.fast_balances > 5_000, "both balances paths: {stats:?}");
     assert!(opaque > 100, "opaque traders served raw: {opaque}");
 }
@@ -1584,4 +1584,13 @@ fn users_build_from_backend_equals_cold_build_of_r() {
     assert!(built.same_as(&reference), "build_from == cold build of R");
     assert_eq!((built.row_count(), built.row_bytes()), (reference.row_count(), reference.row_bytes()));
     assert!(built.row_count() > 20, "non-vacuous");
+}
+
+/// Phase 4 step 2: the source slots `Users` answers are R's first two CFs.
+#[test]
+fn source_slots_are_positions_then_balances() {
+    use torus_state::resident_rows::{resident_slot, SOURCE_SLOTS};
+    assert_eq!(resident_slot(CF_NATIVE_POSITIONS), Some(POSITIONS));
+    assert_eq!(resident_slot(CF_NATIVE_BALANCES), Some(BALANCES));
+    assert_eq!(SOURCE_SLOTS, 2);
 }

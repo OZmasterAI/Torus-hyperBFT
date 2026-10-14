@@ -1170,8 +1170,10 @@ pub(crate) struct BlockSums {
     /// Item 6 C7 / Phase 4 step 1: R's positions and balances decoded per
     /// trader (the slot's [`Users`]; `None`: every read goes through the
     /// overlay). Read only for a trader with nothing pending
-    /// ([`AccountReader::resident_positions`]).
-    records: Option<Users>,
+    /// ([`AccountReader::resident_positions`]). Phase 4 step 2: the same
+    /// record set R reads those CFs from (shared; dropped before
+    /// `end_resident` takes it back).
+    records: Option<Arc<Users>>,
     /// P1 (tests): every cached answer is also computed by the reference
     /// path; differences are recorded (a panic in a worker would be caught).
     #[cfg(test)]
@@ -1241,19 +1243,6 @@ impl SumsCarry<'_> {
             }
             None => {
                 self.cache.map.remove(trader);
-            }
-        }
-    }
-
-    /// Every trader the block wrote under loses its entry (no decoded
-    /// positions to follow).
-    fn drop_written(&mut self, delta: &torus_state::ResidentDelta) {
-        let mut last: Option<&[u8]> = None;
-        for (key, _) in delta.entries(torus_state::cf::CF_NATIVE_POSITIONS) {
-            let Some(prefix) = key.get(..TRADER_PREFIX) else { continue };
-            if last != Some(prefix) {
-                self.cache.map.remove(&Address::from_slice(prefix));
-                last = Some(prefix);
             }
         }
     }
@@ -1728,7 +1717,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
     /// overlay): no records, the trader is dirty, or it holds an irregular
     /// row.
     fn resident_positions(&self, trader: &Address) -> Option<&'a [torus_core::position::Position]> {
-        let records = self.sums?.records.as_ref()?;
+        let records = self.sums?.records.as_deref()?;
         if self.dirty(trader) {
             return None;
         }
@@ -1850,7 +1839,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             }
             // C7: the caller found the trader clean, so its record (if
             // any) is exactly the overlay's rows.
-            let (r, in_table) = match s.records.as_ref().and_then(|rec| rec.get(trader)) {
+            let (r, in_table) = match s.records.as_deref().and_then(|rec| rec.get(trader)) {
                 Some(ps) => {
                     #[cfg(test)]
                     bump(&s.counters.records);
@@ -3164,7 +3153,9 @@ struct RowsSlot {
     sums: SumsCache,
     /// C7 / Phase 4 step 1: `rows`' positions and balances decoded per
     /// trader. Built with R, updated by each block's delta, dropped with it.
-    users: Users,
+    /// Phase 4 step 2: also `rows`' source for those two CFs (the same
+    /// `Arc`; R holds no raw map of them).
+    users: Arc<Users>,
     height: u64,
 }
 
@@ -3562,10 +3553,14 @@ impl ResidentBooks {
 
     /// Item 6 C7 / Phase 4 step 1: whether the slot's record set equals a
     /// cold decode of its R and re-encodes to exactly R's positions and
-    /// balances rows (`None`: no slot). Test / ops introspection.
+    /// balances rows (`None`: no slot). Test / ops introspection. Phase 4
+    /// step 2: R reads those rows from the record set, so: R has its source
+    /// and the record set equals a cold build of its own rows, its row count
+    /// and bytes a fresh count (the rows are checked against the DB through
+    /// [`torus_state::ResidentRows::dump`]).
     pub fn trader_positions_match_rows(&mut self) -> Option<bool> {
         self.settle_rows();
-        self.rows.as_ref().map(|s| s.users.match_rows(&s.rows))
+        self.rows.as_ref().map(|s| s.rows.has_source() && s.users.self_consistent())
     }
 
     /// Item 6 C5 (tests): empty the slot's sums cache (R, its decoded
@@ -3730,6 +3725,11 @@ pub struct ResidentBlock {
     /// [`NativeExecContext::detach_resident_block`], this block's memo;
     /// `end_resident` merges them. `None`: R not attached (no cache).
     sums: Option<BlockSums>,
+    /// Phase 4 step 2: the record set R reads positions and balances from
+    /// (`None`: R not attached). `end_resident` takes it back unshared
+    /// (else the slot is dropped, like a live clone of R) and applies the
+    /// block's delta to it.
+    users: Option<Arc<Users>>,
     /// Item 6 cut 5: [`Self::drop_later`].
     retired: Retired,
     /// R02: the applied-marker read of the slot's staleness guard failed
@@ -3822,6 +3822,7 @@ pub fn begin_resident(
         rebuilt: false,
         marks: None,
         sums: None,
+        users: None,
         retired: Retired::default(),
         marker_fault: None,
         #[cfg(test)]
@@ -3839,9 +3840,10 @@ pub fn begin_resident(
             Ok(true) => {
                 block.marks = slot.marks;
                 block.sums = Some(BlockSums {
-                    records: Some(slot.users),
+                    records: Some(slot.users.clone()),
                     ..BlockSums::new(slot.sums)
                 });
+                block.users = Some(slot.users);
                 Some(slot.rows)
             }
             Ok(false) => None,
@@ -3865,13 +3867,14 @@ pub fn begin_resident(
         Some(rows) => rows,
         None => {
             let timer = std::time::Instant::now();
-            match torus_state::ResidentRows::build(&*overlay) {
-                Ok(rows) => {
+            match build_resident(&*overlay) {
+                Ok((rows, users)) => {
                     holder.rows_builds += 1;
                     block.rebuilt = true;
                     // C3: an empty sums cache; C7 / Phase 4: R's positions
-                    // and balances decoded.
-                    block.sums = Some(BlockSums { records: Some(Users::build(&rows)), ..BlockSums::default() });
+                    // and balances decoded (step 2: and R's source of them).
+                    block.sums = Some(BlockSums { records: Some(users.clone()), ..BlockSums::default() });
+                    block.users = Some(users);
                     if let Some(m) = metrics {
                         m.exec_resident_rows_rebuilds.inc();
                         m.exec_resident_rows_build_seconds
@@ -3895,12 +3898,41 @@ pub fn begin_resident(
         }
     };
     if let Some(m) = metrics {
-        m.exec_resident_rows.set(rows.len() as i64);
-        m.exec_resident_rows_bytes.set(rows.bytes() as i64);
+        set_resident_gauges(m, &rows, block.users.as_deref());
     }
+    debug_assert!(rows.has_source(), "R reads positions and balances from its record set");
     overlay.attach_resident(rows);
     block.attached = true;
     block
+}
+
+/// Item 6 Phase 4 step 2: R as the node builds it from `backend` (an overlay
+/// WITHOUT R: DB + parent layer): the liquidation, oracle and market rows
+/// raw, positions and balances from the record set built from the same
+/// rows (returned too: the typed readers' records).
+fn build_resident<B: StateBackend>(
+    backend: &B,
+) -> Result<(torus_state::ResidentRows, Arc<Users>), torus_state::error::StateError> {
+    let users = Arc::new(Users::build_from(backend)?);
+    let rows = torus_state::ResidentRows::build_with_source(backend, users.clone())?;
+    Ok((rows, users))
+}
+
+/// Item 6 Phase 4 step 2: R cold, as [`begin_resident`] builds it (bench
+/// harnesses: the build cost, and the carried R compared with it).
+pub fn resident_rows_cold<B: StateBackend>(backend: &B) -> Result<torus_state::ResidentRows, torus_state::error::StateError> {
+    build_resident(backend).map(|(rows, _)| rows)
+}
+
+/// The resident gauges: R's raw rows (liquidation, oracle, market) and,
+/// Phase 4 step 2, the record set's rows of positions and balances.
+fn set_resident_gauges(m: &torus_telemetry::Metrics, rows: &torus_state::ResidentRows, users: Option<&Users>) {
+    m.exec_resident_rows.set(rows.len() as i64);
+    m.exec_resident_rows_bytes.set(rows.bytes() as i64);
+    if let Some(u) = users {
+        m.exec_resident_users.set(u.row_count() as i64);
+        m.exec_resident_users_bytes.set(u.row_bytes() as i64);
+    }
 }
 
 /// Item 6 Phase 1: end of a native block, after the hand-off (pipelined) or
@@ -3937,8 +3969,8 @@ pub fn end_resident(
 /// decoded positions and the sums carry) on a worker thread (P2-3: the
 /// holder's long-lived `torus-end-resident` thread, not one per block), so it
 /// overlaps the next block's work up to its [`begin_resident`]. The checks
-/// (`ok`, R attached, no other clone of R alive) run here, on the calling
-/// thread, exactly as in `end_resident`; the worker then owns R, the delta and
+/// (`ok`, R attached, no other clone of R alive; Phase 4 step 2: nor of its
+/// record set) run here, on the calling thread, exactly as in `end_resident`; the worker then owns R, the delta and
 /// the block's sums, and never touches `holder`. The slot it makes enters
 /// `holder` at the next access of the rows slot ([`ResidentBooks::settle_rows`]:
 /// `begin_resident`, `advance_untouched`, `invalidate`, the introspection
@@ -4046,8 +4078,12 @@ impl BlockDelta {
 /// Item 6 step 2: `end_resident`'s inputs once its checks passed — owned by
 /// whichever thread runs [`Self::run`].
 struct EndResidentJob {
-    /// R, with no other clone alive (checked by [`end_resident_take`]).
+    /// R, with no other clone alive (checked by [`end_resident_take`]), its
+    /// source taken off.
     rows: Arc<torus_state::ResidentRows>,
+    /// Phase 4 step 2: the record set, with no other clone alive (checked
+    /// by [`end_resident_take`]).
+    users: Arc<Users>,
     height: u64,
     marks: Option<BlockMarksState>,
     sums: Option<BlockSums>,
@@ -4060,6 +4096,8 @@ struct EndResidentJob {
 
 /// `end_resident`'s checks: detach R from `overlay`; `None` (slot stays
 /// empty) if R was not attached, `!ok`, or another clone of R is alive.
+/// Phase 4 step 2: R's source and the block's sums' handle on the record
+/// set are dropped, then likewise `None` if another clone of it is alive.
 fn end_resident_take(
     holder: &mut ResidentBooks,
     block: ResidentBlock,
@@ -4071,17 +4109,35 @@ fn end_resident_take(
     if !block.attached || !ok {
         return None;
     }
-    if Arc::get_mut(&mut rows).is_none() {
+    let Some(r) = Arc::get_mut(&mut rows) else {
         holder.rows_shared_fallbacks += 1;
         tracing::warn!(
             height = block.height,
             "item 6: resident rows still shared at end of block — dropping R (next block rebuilds)"
         );
         return None;
+    };
+    drop(r.take_source());
+    let ResidentBlock { height, marks, mut sums, users, retired, .. } = block;
+    if let Some(s) = sums.as_mut() {
+        drop(s.records.take());
     }
-    let ResidentBlock { height, marks, sums, retired, .. } = block;
+    let Some(mut users) = users else {
+        tracing::error!(height, "item 6: R attached without its record set — dropping R (next block rebuilds)");
+        return None;
+    };
+    // A clone of the record set alive (a reader kept by mistake).
+    if Arc::get_mut(&mut users).is_none() {
+        holder.rows_shared_fallbacks += 1;
+        tracing::warn!(
+            height,
+            "item 6: the record set (Users) still shared at end of block — dropping R (next block rebuilds)"
+        );
+        return None;
+    }
     Some(EndResidentJob {
         rows,
+        users,
         height,
         marks,
         sums,
@@ -4097,6 +4153,7 @@ impl EndResidentJob {
     fn run(self, metrics: Option<&torus_telemetry::Metrics>) -> RowsSlot {
         let EndResidentJob {
             mut rows,
+            mut users,
             height,
             marks,
             sums,
@@ -4111,47 +4168,32 @@ impl EndResidentJob {
             (hook.0)();
         }
         let r = Arc::get_mut(&mut rows).expect("end_resident_take checked R is not shared");
+        let u = Arc::get_mut(&mut users).expect("end_resident_take checked the record set is not shared");
         // C3: the block's memo joins the slot's sums; item 6 M1: every trader
         // whose positions the block wrote or deleted has its sums moved on to
         // its rows after the block, else loses them (step 1: while its decoded
         // positions follow the delta, below).
-        let (mut carry, records) = match sums {
-            Some(mut s) => {
-                let records = s.records.take();
-                (Some(s.into_carry(marks.as_ref())), records)
-            }
-            None => (None, None),
-        };
+        let mut carry = sums.map(|s| s.into_carry(marks.as_ref()));
         // Item 6 cut 5: from the frozen set (pipelined), here on the worker.
         let delta = delta.into_delta();
+        // Phase 4 step 2: R's raw CFs (liquidation, oracle, markets) only.
         let timer = std::time::Instant::now();
         r.apply(&delta);
         if let Some(m) = metrics {
             m.exec_end_resident_rows_seconds.observe(timer.elapsed().as_secs_f64());
-            m.exec_resident_rows.set(r.len() as i64);
-            m.exec_resident_rows_bytes.set(r.bytes() as i64);
         }
-        // C7 / Phase 4 step 1: the record set follows the delta (decoded
-        // cold if the context kept the block's state).
+        // C7 / Phase 4 step 1: the record set follows the delta of positions
+        // and balances (step 2: R's only copy of them).
         let timer = std::time::Instant::now();
-        let users = match records {
-            Some(mut u) => {
-                match carry.as_mut() {
-                    Some(c) => u.apply(&delta, Some(&mut |t: &Address, report| c.trader(t, report))),
-                    None => u.apply(&delta, None),
-                }
-                u
-            }
-            None => {
-                if let Some(c) = carry.as_mut() {
-                    c.drop_written(&delta);
-                }
-                Users::build(r)
-            }
-        };
+        match carry.as_mut() {
+            Some(c) => u.apply(&delta, Some(&mut |t: &Address, report| c.trader(t, report))),
+            None => u.apply(&delta, None),
+        }
         if let Some(m) = metrics {
             m.exec_end_resident_users_seconds.observe(timer.elapsed().as_secs_f64());
+            set_resident_gauges(m, r, Some(u));
         }
+        r.set_source(users.clone());
         let sums = carry.map(|c| c.cache).unwrap_or_default();
         drop(delta);
         RowsSlot { rows, marks, sums, users, height }

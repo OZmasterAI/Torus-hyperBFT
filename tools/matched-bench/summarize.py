@@ -155,6 +155,11 @@ PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "action_statu
 # steps (step 1 moved balance / cvlm work into users; step 2 removes the raw
 # rows apply), so cross-step comparisons use the `end_resident` total and
 # `end_resident_wait`, not the subs.
+# Item 6 Phase 4 step 2: same names; `end_resident_rows` is now R applying
+# its raw CFs only (liquidation, oracle, markets) and `end_resident_users` is
+# the only apply of positions and balances. The gauge
+# `exec_resident_rows_bytes` (campaign G lines) likewise covers R's raw rows
+# only; `exec_resident_users_bytes` (absent on older binaries) is the rest.
 END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions", "end_resident_users"]
 # Item 6 Phase 3 (p3s2g 47.1, step 2 `7fe4d420`): the exec thread's checkpoint
 # work, observed once per pipelined block at checkpoint interval > 0:

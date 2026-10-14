@@ -21863,7 +21863,11 @@ mod crash_recovery_tests {
             let mut holder = ctx.resident_books.lock().unwrap();
             assert_eq!(holder.rows_builds(), 1, "on={on}: built once at block 1");
             assert_eq!(holder.rows_shared_fallbacks(), 0, "on={on}: Arc::get_mut never fails");
-            assert!(holder.rows().unwrap().len() > 2, "non-vacuous");
+            // Phase 4 step 2: `len` counts R's raw rows only (no positions or
+            // balances): count every R CF through `dump`.
+            let r = holder.rows().unwrap();
+            let rows: usize = torus_state::resident_rows::RESIDENT_CFS.iter().map(|cf| r.dump(cf).unwrap().len()).sum();
+            assert!(rows > 2, "non-vacuous: {rows}");
         }
     }
 
@@ -24070,7 +24074,11 @@ mod crash_recovery_tests {
                 ctx = new_ctx();
             }
         }
-        let r_rows = ctx.resident_books.lock().unwrap().rows().map_or(0, |r| r.len());
+        // Phase 4 step 2: every R CF (positions and balances through `Users`;
+        // `len` counts R's raw rows only).
+        let r_rows = ctx.resident_books.lock().unwrap().rows().map_or(0, |r| {
+            torus_state::resident_rows::RESIDENT_CFS.iter().map(|cf| r.dump(cf).map_or(0, |d| d.len())).sum()
+        });
         builds += ctx.resident_books.lock().unwrap().rows_builds();
         drop(ctx);
         let captured = torus_state::running_hash::capture_take(&db);

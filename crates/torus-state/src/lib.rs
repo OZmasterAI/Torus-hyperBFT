@@ -38,7 +38,7 @@ pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
 pub use read_view::ReadView;
-pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRows};
+pub use resident_rows::{ResidentChange, ResidentDelta, ResidentRow, ResidentRowIter, ResidentRows, ResidentSource};
 pub use retention::RetentionStats;
 pub use erasure::ErasureParams;
 pub use shard_store::{

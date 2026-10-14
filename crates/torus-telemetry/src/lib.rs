@@ -512,9 +512,21 @@ pub struct Metrics {
     pub exec_resident_rebuilds: Counter,
     /// Item 6 Phase 1: rows in the resident rows R (`CF_NATIVE_POSITIONS` +
     /// `CF_NATIVE_BALANCES` held in memory across blocks), set per native block.
+    /// Phase 4 step 2: R's RAW rows only — the liquidation, oracle and market
+    /// rows (E2-E4); positions and balances are the record set's
+    /// ([`Self::exec_resident_users`]). rows + users == the older meaning.
     pub exec_resident_rows: Gauge,
-    /// Item 6 Phase 1: key + value bytes in R.
+    /// Item 6 Phase 1: key + value bytes in R. Phase 4 step 2: of R's raw
+    /// rows only (see [`Self::exec_resident_rows`]); + users bytes == the
+    /// older meaning.
     pub exec_resident_rows_bytes: Gauge,
+    /// Item 6 Phase 4 step 2: rows of `CF_NATIVE_POSITIONS` +
+    /// `CF_NATIVE_BALANCES` held by the `Users` record set (R's source for
+    /// them), set per native block. Absent on older binaries (reads 0).
+    pub exec_resident_users: Gauge,
+    /// Item 6 Phase 4 step 2: those rows' key + value bytes as stored (the
+    /// logical row size, not the record set's heap footprint).
+    pub exec_resident_users_bytes: Gauge,
     /// Item 6 Phase 1: native blocks that (re)built R from the DB + parent
     /// layer (startup, staleness guard, a fatal / failed block before). One
     /// per process in a normal sequence.
@@ -526,7 +538,10 @@ pub struct Metrics {
     /// landed in summarize.py's `residual_untimed`.
     pub exec_end_resident_seconds: Histogram,
     /// Item 6 step 1: inside `end_resident`, `ResidentRows::apply` (R takes
-    /// the block's delta).
+    /// the block's delta). Phase 4 step 2: R's raw CFs only (liquidation,
+    /// oracle, markets); positions and balances moved to
+    /// [`Self::exec_end_resident_users_seconds`], so values are not
+    /// comparable across Phase 4 steps (compare `end_resident` totals).
     pub exec_end_resident_rows_seconds: Histogram,
     /// Item 6 Phase 4 step 1: inside `end_resident`, the `Users` record set
     /// (positions, balances and `cvlm` rows) following the delta plus the
@@ -2140,14 +2155,26 @@ impl Metrics {
         let exec_resident_rows = Gauge::default();
         registry.register(
             "torus_exec_resident_rows",
-            "Item 6: rows of cf_native_positions + cf_native_balances resident in memory (R)",
+            "Item 6: raw rows resident in memory (R; Phase 4: liquidation, oracle, market rows; positions and balances: torus_exec_resident_users)",
             exec_resident_rows.clone(),
         );
         let exec_resident_rows_bytes = Gauge::default();
         registry.register(
             "torus_exec_resident_rows_bytes",
-            "Item 6: key + value bytes of the resident rows R",
+            "Item 6: key + value bytes of the resident rows R's raw rows (Phase 4: without positions and balances)",
             exec_resident_rows_bytes.clone(),
+        );
+        let exec_resident_users = Gauge::default();
+        registry.register(
+            "torus_exec_resident_users",
+            "Item 6 Phase 4: rows of cf_native_positions + cf_native_balances held by the Users record set (R's source for them)",
+            exec_resident_users.clone(),
+        );
+        let exec_resident_users_bytes = Gauge::default();
+        registry.register(
+            "torus_exec_resident_users_bytes",
+            "Item 6 Phase 4: key + value bytes of the rows the Users record set holds",
+            exec_resident_users_bytes.clone(),
         );
         let exec_resident_rows_rebuilds = Counter::default();
         registry.register(
@@ -2917,6 +2944,8 @@ impl Metrics {
             exec_resident_rebuilds,
             exec_resident_rows,
             exec_resident_rows_bytes,
+            exec_resident_users,
+            exec_resident_users_bytes,
             exec_resident_rows_rebuilds,
             exec_resident_rows_build_seconds,
             exec_end_resident_seconds,

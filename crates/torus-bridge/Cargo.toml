@@ -38,7 +38,7 @@ save-timings = []
 # `ResidentBlock::test_inject_marker_fault`. The switches default to off:
 # turning the feature on changes no behaviour by itself. No node build reaches
 # it (`cargo tree -e features,no-dev -p torus-node -i torus-bridge`).
-test-reference-paths = ["torus-core/test-reference-paths"]
+test-reference-paths = ["torus-core/test-reference-paths", "torus-state/test-reference-paths"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -52,6 +52,9 @@ foldhash = "0.2"
 # Item 6 Phase 2 (plan 9.8): this crate's own tests reach the core reference
 # paths (`PositionCache::flush_all_per_row`) the feature build does.
 torus-core = { workspace = true, features = ["test-reference-paths"] }
+# Item 6 Phase 4 step 2: raw R (`ResidentRows::build`), the reference of the
+# Users-source differentials.
+torus-state = { workspace = true, features = ["test-reference-paths"] }
 
 [[test]]
 name = "l3_savebooks_ubench"

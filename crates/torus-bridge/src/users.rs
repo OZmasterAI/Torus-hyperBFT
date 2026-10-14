@@ -4,8 +4,16 @@
 //! and updated from each block's [`ResidentDelta`] at `end_resident` (built
 //! cold with R). It replaces C7's `TraderPositions` (decoded positions, E2's
 //! trader set, adl-budget C2's holder lists) and also follows the balance and
-//! `cvlm` rows. Node-local, never consensus-visible, no format change. Step 1:
-//! raw R still serves every read; the record set is checked against R.
+//! `cvlm` rows. Node-local, never consensus-visible, no format change.
+//!
+//! Phase 4 step 2 (Task 2.2): the record set is R's source for both CFs
+//! ([`ResidentSource`]): R holds no raw map of them, and every overlay read
+//! of them (point, length, prefix, seek, prefix check) is answered here —
+//! records encoded per read, opaque traders' and the other rows as bytes.
+//! The positions CF in key order walks the trader set (address order), each
+//! user's positions in market order, merged with the raw rows; the balances
+//! CF in key order (only the proof-only `liquidation_value_sum` walks it) is
+//! a collect-and-sort slow path unless the prefix names one trader.
 //!
 //! A trader's rows: every positions key under its 20-byte prefix, its 20-byte
 //! balance row and its 24-byte `cvlm ‖ trader` row. The trader is regular
@@ -37,6 +45,7 @@
 //! `m` (merged with the block's dirty traders of `m`) instead of every
 //! trader ([`Users::holders_with`], [`dirty_by_market`]).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_primitives::map::{HashMap, HashSet};
@@ -44,10 +53,13 @@ use std::ops::Bound;
 
 use alloy_primitives::Address;
 use borsh::{BorshDeserialize, BorshSerialize};
-use torus_core::position::{cum_volume_key, NativeBalance, Position, POSITION_V2_LEN};
+use torus_core::position::{cum_volume_key, position_key, NativeBalance, Position, POSITION_V2_LEN};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::error::StateError;
-use torus_state::{ResidentDelta, ResidentRows, StateBackend};
+use torus_state::resident_rows::{ResidentRow, ResidentRowIter, ResidentSource};
+#[cfg(test)]
+use torus_state::ResidentRows;
+use torus_state::{ResidentDelta, StateBackend};
 use torus_types::{FixedPoint, MarketId};
 
 use super::SumsResult;
@@ -62,6 +74,14 @@ const CVLM_KEY: usize = 24;
 /// non-zero byte as long / Isolated).
 const IS_LONG_AT: usize = 1 + 20 + 8;
 const MARGIN_TYPE_AT: usize = POSITION_V2_LEN - 1;
+/// A regular balance row's value: version byte + two raw `FixedPoint`s.
+const BALANCE_LEN: usize = 33;
+/// A regular `cvlm` row's value: a raw `FixedPoint`, 16 bytes BE.
+const VOLUME_LEN: usize = 16;
+
+/// Phase 4 step 2: [`ResidentSource`] slots (R's `RESIDENT_CFS` order).
+pub(crate) const POSITIONS: usize = 0;
+pub(crate) const BALANCES: usize = 1;
 
 /// Item 6 step 1: one changed row of a regular trader at the end of a block:
 /// its position before the block and after (`None`: no row).
@@ -91,6 +111,13 @@ impl UserState {
         self.balance.is_none() && self.cum_volume.is_none() && self.positions.is_empty()
     }
 
+    /// Phase 4 step 2: its rows and their key + value bytes (every regular
+    /// row has a fixed size).
+    fn footprint(&self) -> (usize, usize) {
+        let (n, b, v) = (self.positions.len(), usize::from(self.balance.is_some()), usize::from(self.cum_volume.is_some()));
+        (n + b + v, n * (KEY + POSITION_V2_LEN) + b * (TRADER + BALANCE_LEN) + v * (CVLM_KEY + VOLUME_LEN))
+    }
+
     /// `t`'s rows of both CFs, as R holds them.
     fn raw(&self, t: &Address) -> RawRows {
         let mut out = RawRows::default();
@@ -98,7 +125,7 @@ impl UserState {
             out.positions.insert([t.as_slice(), &p.market_id.to_be_bytes()].concat(), encode(p, POSITION_V2_LEN));
         }
         if let Some(b) = &self.balance {
-            out.balances.insert(t.to_vec(), encode(b, 33));
+            out.balances.insert(t.to_vec(), encode(b, BALANCE_LEN));
         }
         if let Some(v) = self.cum_volume {
             out.balances.insert(cum_volume_key(t).to_vec(), v.raw().to_be_bytes().to_vec());
@@ -112,6 +139,14 @@ impl UserState {
 pub(crate) struct RawRows {
     positions: BTreeMap<Vec<u8>, Vec<u8>>,
     balances: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl RawRows {
+    /// Phase 4 step 2: its rows and their key + value bytes.
+    fn footprint(&self) -> (usize, usize) {
+        let bytes = |m: &BTreeMap<Vec<u8>, Vec<u8>>| m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        (self.positions.len() + self.balances.len(), bytes(&self.positions) + bytes(&self.balances))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -133,6 +168,10 @@ pub(crate) struct Users {
     /// foldhash (alloy's map and set), unordered: the only iteration is
     /// [`Self::holders_with`], which sorts (c2-holder-hashset).
     holders: Holders,
+    /// Phase 4 step 2: rows of both CFs held (records, opaque, other) and
+    /// their key + value bytes, kept per change (the users gauges).
+    rows: usize,
+    bytes: usize,
 }
 
 type Holders = HashMap<MarketId, HashSet<Address>>;
@@ -193,7 +232,7 @@ fn decode(key: &[u8], value: &[u8]) -> Option<Position> {
 /// a row that decodes re-encodes to itself).
 fn decode_balance(value: &[u8]) -> Option<NativeBalance> {
     let b = NativeBalance::try_from_slice(value).ok()?;
-    debug_assert!(encode(&b, 33) == value, "balance re-encode check");
+    debug_assert!(encode(&b, BALANCE_LEN) == value && value.len() == BALANCE_LEN, "balance re-encode check");
     Some(b)
 }
 
@@ -242,13 +281,25 @@ fn classify(raw: RawRows) -> Result<Option<UserState>, RawRows> {
 }
 
 impl Users {
-    /// Every trader of R's positions and balances (cold: with R, or when a
-    /// block's state did not come back).
+    /// Phase 4 step 2: every row of both CFs as `backend` sees them (R's
+    /// rebuild: through the overlay WITHOUT R, DB + parent layer = the
+    /// previous block's post-state).
+    pub(crate) fn build_from<B: StateBackend>(backend: &B) -> Result<Self, StateError> {
+        let pos: BTreeMap<Vec<u8>, Vec<u8>> = backend.iterate_cf(CF_NATIVE_POSITIONS, None)?.into_iter().collect();
+        let bal: BTreeMap<Vec<u8>, Vec<u8>> = backend.iterate_cf(CF_NATIVE_BALANCES, None)?.into_iter().collect();
+        Ok(Self::build_maps(&pos, &bal))
+    }
+
+    /// Every trader of raw R's positions and balances (tests: the reference).
+    #[cfg(test)]
     pub(crate) fn build(rows: &ResidentRows) -> Self {
-        let mut out = Self::default();
         let empty = BTreeMap::new();
-        let pos = rows.rows(CF_NATIVE_POSITIONS).unwrap_or(&empty);
-        let bal = rows.rows(CF_NATIVE_BALANCES).unwrap_or(&empty);
+        Self::build_maps(rows.rows(CF_NATIVE_POSITIONS).unwrap_or(&empty), rows.rows(CF_NATIVE_BALANCES).unwrap_or(&empty))
+    }
+
+    /// Every trader of the rows `pos` (positions CF) and `bal` (balances CF).
+    fn build_maps(pos: &BTreeMap<Vec<u8>, Vec<u8>>, bal: &BTreeMap<Vec<u8>, Vec<u8>>) -> Self {
+        let mut out = Self::default();
         // Traders with an irregular row: their rows are copied raw below.
         let mut bad: HashSet<Address> = HashSet::default();
         let mut cur: Option<(Address, Option<Vec<Position>>)> = None;
@@ -317,7 +368,66 @@ impl Users {
             }
             out.opaque.insert(t, raw);
         }
+        (out.rows, out.bytes) = out.recount();
         out
+    }
+
+    /// Rows and key + value bytes held, counted afresh.
+    fn recount(&self) -> (usize, usize) {
+        let fps = self.map.values().map(UserState::footprint);
+        let raws = self.opaque.values().chain([&self.other]).map(RawRows::footprint);
+        fps.chain(raws).fold((0, 0), |(n, b), (dn, db)| (n + dn, b + db))
+    }
+
+    /// Phase 4 step 2: rows of both CFs held (the users gauge).
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows
+    }
+
+    /// Phase 4 step 2: their key + value bytes (the users bytes gauge).
+    pub(crate) fn row_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The footprint of `t`'s rows held (record or opaque raw rows).
+    fn footprint_of(&self, t: &Address) -> (usize, usize) {
+        match self.opaque_of(t) {
+            Some(raw) => raw.footprint(),
+            None => self.map.get(t).map_or((0, 0), UserState::footprint),
+        }
+    }
+
+    /// Account for a trader's rows going from `old` to `new`.
+    fn track(&mut self, old: (usize, usize), new: (usize, usize)) {
+        self.rows = self.rows + new.0 - old.0;
+        self.bytes = self.bytes + new.1 - old.1;
+    }
+
+    /// A write / tombstone of a row under no trader.
+    fn put_other(&mut self, positions: bool, key: &[u8], value: Option<&[u8]>) {
+        let map = if positions { &mut self.other.positions } else { &mut self.other.balances };
+        let old = match value {
+            Some(v) => map.insert(key.to_vec(), v.to_vec()),
+            None => map.remove(key),
+        };
+        if let Some(old) = old {
+            self.rows -= 1;
+            self.bytes -= key.len() + old.len();
+        }
+        if let Some(v) = value {
+            self.rows += 1;
+            self.bytes += key.len() + v.len();
+        }
+    }
+
+    /// `t`'s raw rows if it is opaque.
+    #[inline]
+    fn opaque_of(&self, t: &Address) -> Option<&RawRows> {
+        if self.opaque.is_empty() {
+            None
+        } else {
+            self.opaque.get(t)
+        }
     }
 
     /// `t`'s rows (`raw`) as its record, opaque, or nothing.
@@ -360,7 +470,7 @@ impl Users {
             match balance_owner(k) {
                 Some((t, BalanceRow::Balance)) => balances.entry(t).or_default().balance = Some(v),
                 Some((t, BalanceRow::Volume)) => balances.entry(t).or_default().volume = Some(v),
-                None => put(&mut self.other.balances, k, v),
+                None => self.put_other(false, k, v),
             }
         }
         let mut group: Vec<(&[u8], Option<&[u8]>)> = Vec::new();
@@ -371,7 +481,7 @@ impl Users {
         let mut entries = delta.entries(CF_NATIVE_POSITIONS).peekable();
         while let Some(first) = entries.next() {
             if first.0.len() < TRADER {
-                put(&mut self.other.positions, first.0, first.1);
+                self.put_other(true, first.0, first.1);
                 continue;
             }
             group.clear();
@@ -443,6 +553,7 @@ impl Users {
             None => None,
         };
         let collect = seen.is_some();
+        let old = self.map.get(&t).map_or((0, 0), UserState::footprint);
         let u = self.map.entry(t).or_default();
         if let Some(x) = balance {
             u.balance = x;
@@ -494,9 +605,11 @@ impl Users {
                 self.traders.insert(t);
             }
         }
+        let new = u.footprint();
         if u.is_empty() {
             self.map.remove(&t);
         }
+        self.track(old, new);
         true
     }
 
@@ -505,6 +618,7 @@ impl Users {
     /// holders move per key from the delta; its trader-set entry follows its
     /// 28-byte keys.
     fn reload(&mut self, t: Address, group: &[(&[u8], Option<&[u8]>)], b: BalanceDelta<'_>) {
+        let old = self.footprint_of(&t);
         let mut raw = match self.opaque.remove(&t) {
             Some(raw) => raw,
             None => self.map.remove(&t).map(|u| u.raw(&t)).unwrap_or_default(),
@@ -531,6 +645,8 @@ impl Users {
             }
         }
         self.set(t, raw);
+        let new = self.footprint_of(&t);
+        self.track(old, new);
     }
 
     /// C2: whether R holds `t ‖ m` now.
@@ -565,7 +681,7 @@ impl Users {
     /// `trader`'s positions in key order (empty: no rows), `None` if opaque.
     #[inline]
     pub(crate) fn get(&self, trader: &Address) -> Option<&[Position]> {
-        if !self.opaque.is_empty() && self.opaque.contains_key(trader) {
+        if self.opaque_of(trader).is_some() {
             return None;
         }
         Some(self.map.get(trader).map_or(&[], |u| u.positions.as_slice()))
@@ -650,15 +766,267 @@ impl Users {
             && self.map.iter().all(|(t, u)| other.map.get(t).is_some_and(|o| o.raw(t) == u.raw(t)))
     }
 
-    /// [`Self::same_as`] a cold build of `rows`, and re-encodes to exactly
-    /// `rows`' positions and balances (tests and `ResidentBooks`
-    /// introspection).
-    pub(crate) fn match_rows(&self, rows: &ResidentRows) -> bool {
-        let empty = BTreeMap::new();
-        self.same_as(&Self::build(rows))
-            && [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
-                .into_iter()
-                .all(|cf| self.encode_rows(cf) == *rows.rows(cf).unwrap_or(&empty))
+    /// Phase 4 step 2 (R holds no raw rows of the two CFs to compare
+    /// with): [`Self::same_as`] a cold build of its own rows (records,
+    /// opaque and other rows, indexes), with its kept row count and bytes
+    /// equal to a fresh count (tests and `ResidentBooks` introspection; the
+    /// rows themselves are compared with the DB through R's `dump`).
+    pub(crate) fn self_consistent(&self) -> bool {
+        let rows = |cf| self.encode_rows(cf);
+        let cold = Self::build_maps(&rows(CF_NATIVE_POSITIONS), &rows(CF_NATIVE_BALANCES));
+        self.same_as(&cold) && (self.rows, self.bytes) == self.recount() && (cold.rows, cold.bytes) == (self.rows, self.bytes)
+    }
+}
+
+/// Phase 4 step 2: one row the record set holds, before it is encoded.
+#[derive(Clone, Copy)]
+enum Row<'a> {
+    Raw(&'a [u8]),
+    Position(&'a Position),
+    Balance(&'a NativeBalance),
+    Volume(FixedPoint),
+}
+
+impl<'a> Row<'a> {
+    /// Its bytes, as R held them (a record re-encodes to its row: regular).
+    #[inline]
+    fn value(self) -> Cow<'a, [u8]> {
+        match self {
+            Self::Raw(v) => Cow::Borrowed(v),
+            Self::Position(p) => Cow::Owned(encode(p, POSITION_V2_LEN)),
+            Self::Balance(b) => Cow::Owned(encode(b, BALANCE_LEN)),
+            Self::Volume(v) => Cow::Owned(v.raw().to_be_bytes().to_vec()),
+        }
+    }
+
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::Raw(v) => v.len(),
+            Self::Position(_) => POSITION_V2_LEN,
+            Self::Balance(_) => BALANCE_LEN,
+            Self::Volume(_) => VOLUME_LEN,
+        }
+    }
+}
+
+fn borrowed<'a>((k, v): (&'a Vec<u8>, &'a Vec<u8>)) -> ResidentRow<'a> {
+    (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))
+}
+
+/// The smallest trader whose keys may be >= `start`: every key of a trader
+/// below it is below `start` (`start`'s first 20 bytes, zero-padded).
+fn first_trader_from(start: &[u8]) -> Address {
+    let mut a = [0u8; TRADER];
+    let n = start.len().min(TRADER);
+    a[..n].copy_from_slice(&start[..n]);
+    Address::new(a)
+}
+
+// Phase 4 step 2: the balances slow path's runs (the collect-and-sort of
+// every balances row; tests count it).
+#[cfg(test)]
+thread_local! {
+    static BALANCE_SLOW_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Phase 4 step 2 (tests): balances ranges this thread answered from the
+/// collect-and-sort slow path.
+#[cfg(test)]
+pub(crate) fn balance_slow_scans() -> usize {
+    BALANCE_SLOW_SCANS.with(std::cell::Cell::get)
+}
+
+/// A k-way merge of key-ordered row runs with disjoint keys.
+struct MergeRows<'a> {
+    runs: Vec<ResidentRowIter<'a>>,
+    /// Each run's next row.
+    heads: Vec<Option<ResidentRow<'a>>>,
+}
+
+impl<'a> MergeRows<'a> {
+    fn new(mut runs: Vec<ResidentRowIter<'a>>) -> Self {
+        let heads = runs.iter_mut().map(Iterator::next).collect();
+        Self { runs, heads }
+    }
+}
+
+impl<'a> Iterator for MergeRows<'a> {
+    type Item = ResidentRow<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut best: Option<usize> = None;
+        for (i, head) in self.heads.iter().enumerate() {
+            let Some((k, _)) = head else { continue };
+            let smaller = match best.and_then(|b| self.heads[b].as_ref()) {
+                Some((bk, _)) => k.as_ref() < bk.as_ref(),
+                None => true,
+            };
+            if smaller {
+                best = Some(i);
+            }
+        }
+        let i = best?;
+        let next = self.runs[i].next();
+        std::mem::replace(&mut self.heads[i], next)
+    }
+}
+
+impl Users {
+    /// The positions row at `key`, as R held it.
+    fn position_row(&self, key: &[u8]) -> Option<Row<'_>> {
+        if key.len() < TRADER {
+            return self.other.positions.get(key).map(|v| Row::Raw(v));
+        }
+        let t = Address::from_slice(&key[..TRADER]);
+        if let Some(raw) = self.opaque_of(&t) {
+            return raw.positions.get(key).map(|v| Row::Raw(v));
+        }
+        // A regular trader's position rows are all `t ‖ m`.
+        if key.len() != KEY {
+            return None;
+        }
+        find(&self.map.get(&t)?.positions, market_of(key)).map(Row::Position)
+    }
+
+    /// The balances row at `key`, as R held it.
+    fn balance_row(&self, key: &[u8]) -> Option<Row<'_>> {
+        let Some((t, row)) = balance_owner(key) else {
+            return self.other.balances.get(key).map(|v| Row::Raw(v));
+        };
+        if let Some(raw) = self.opaque_of(&t) {
+            return raw.balances.get(key).map(|v| Row::Raw(v));
+        }
+        let u = self.map.get(&t)?;
+        match row {
+            BalanceRow::Balance => u.balance.as_ref().map(Row::Balance),
+            BalanceRow::Volume => u.cum_volume.map(Row::Volume),
+        }
+    }
+
+    fn row(&self, slot: usize, key: &[u8]) -> Option<Row<'_>> {
+        debug_assert!(slot == POSITIONS || slot == BALANCES, "source slot {slot}");
+        match slot {
+            POSITIONS => self.position_row(key),
+            _ => self.balance_row(key),
+        }
+    }
+
+    /// The positions CF from `start` while under `prefix`, in key order.
+    fn position_range<'a>(&'a self, start: &[u8], prefix: &[u8]) -> ResidentRowIter<'a> {
+        let under = prefix.to_vec();
+        if prefix.len() >= TRADER && start >= prefix {
+            // One trader's rows: every key under `prefix` is `t`'s, and they
+            // all lie in `[prefix, start)` or from `start` on (start >= prefix).
+            let t = Address::from_slice(&prefix[..TRADER]);
+            if let Some(raw) = self.opaque_of(&t) {
+                return Box::new(
+                    raw.positions
+                        .range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+                        .take_while(move |(k, _)| k.starts_with(&under))
+                        .map(borrowed),
+                );
+            }
+            let ps = self.map.get(&t).map_or(&[][..], |u| u.positions.as_slice());
+            let from = start.to_vec();
+            return Box::new(
+                ps.iter()
+                    .map(move |p| (position_key(&t, p.market_id), p))
+                    .skip_while(move |(k, _)| k.as_slice() < from.as_slice())
+                    .take_while(move |(k, _)| k.starts_with(&under))
+                    .map(|(k, p)| (Cow::Owned(k.to_vec()), Row::Position(p).value())),
+            );
+        }
+        // The traders in address order (each one's positions in market order),
+        // merged with the opaque traders' and the other rows.
+        let from = start.to_vec();
+        let regular = self
+            .traders
+            .range(first_trader_from(start)..)
+            .filter(move |t| self.opaque_of(t).is_none())
+            .flat_map(move |t| {
+                let ps = self.map.get(t).map_or(&[][..], |u| u.positions.as_slice());
+                ps.iter().map(move |p| (position_key(t, p.market_id), p))
+            })
+            .skip_while(move |(k, _)| k.as_slice() < from.as_slice())
+            .map(|(k, p)| (Cow::Owned(k.to_vec()), Row::Position(p).value()));
+        let range = || (Bound::Included(start), Bound::Unbounded);
+        let mut opaque: Vec<ResidentRow<'a>> =
+            self.opaque.values().flat_map(|r| r.positions.range::<[u8], _>(range()).map(borrowed)).collect();
+        opaque.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let other = self.other.positions.range::<[u8], _>(range()).map(borrowed);
+        let runs: Vec<ResidentRowIter<'a>> = vec![Box::new(regular), Box::new(opaque.into_iter()), Box::new(other)];
+        Box::new(MergeRows::new(runs).take_while(move |(k, _)| k.starts_with(&under)))
+    }
+
+    /// The balances CF from `start` while under `prefix`, in key order: one
+    /// trader's rows and the rows under no trader for a prefix naming one
+    /// trader, else every row collected and sorted (the slow path; only the
+    /// proof-only `liquidation_value_sum` walks the whole CF).
+    fn balance_range<'a>(&'a self, start: &[u8], prefix: &[u8]) -> ResidentRowIter<'a> {
+        let under = prefix.to_vec();
+        let mut rows: Vec<ResidentRow<'a>> = Vec::new();
+        // A prefix of 20+ bytes holds at most one balance row (the prefix
+        // itself, 20 bytes) or one `cvlm` row (the prefix itself, a 24-byte
+        // `cvlm` key) and rows under no trader — unless it is a `cvlm` head
+        // shorter than a `cvlm` key (many traders' `cvlm` rows).
+        let one_trader = prefix.len() >= TRADER && start >= prefix && !(prefix.len() < CVLM_KEY && prefix.starts_with(CVLM));
+        if one_trader {
+            let own = prefix.len() == TRADER || (prefix.len() == CVLM_KEY && prefix.starts_with(CVLM));
+            if own && prefix >= start {
+                if let Some(row) = self.balance_row(prefix) {
+                    rows.push((Cow::Owned(prefix.to_vec()), row.value()));
+                }
+            }
+            rows.extend(
+                self.other
+                    .balances
+                    .range::<[u8], _>((Bound::Included(start), Bound::Unbounded))
+                    .take_while(|(k, _)| k.starts_with(prefix))
+                    .map(borrowed),
+            );
+        } else {
+            #[cfg(test)]
+            BALANCE_SLOW_SCANS.with(|c| c.set(c.get() + 1));
+            for (t, u) in &self.map {
+                if u.balance.is_some() && t.as_slice() >= start {
+                    rows.push((Cow::Owned(t.to_vec()), self.balance_row(t.as_slice()).expect("a balance").value()));
+                }
+                if let Some(v) = u.cum_volume {
+                    let k = cum_volume_key(t);
+                    if k.as_slice() >= start {
+                        rows.push((Cow::Owned(k.to_vec()), Row::Volume(v).value()));
+                    }
+                }
+            }
+            let range = || (Bound::Included(start), Bound::Unbounded);
+            for r in self.opaque.values().chain([&self.other]) {
+                rows.extend(r.balances.range::<[u8], _>(range()).map(borrowed));
+            }
+        }
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Box::new(rows.into_iter().take_while(move |(k, _)| k.starts_with(&under)))
+    }
+}
+
+/// Phase 4 step 2: R's positions (slot 0) and balances (slot 1), every row:
+/// a regular trader's from its record (encoded per read), an opaque trader's
+/// and the rows under no trader as bytes.
+impl ResidentSource for Users {
+    fn get(&self, slot: usize, key: &[u8]) -> Option<Vec<u8>> {
+        self.row(slot, key).map(|r| r.value().into_owned())
+    }
+
+    fn get_len(&self, slot: usize, key: &[u8]) -> Option<usize> {
+        self.row(slot, key).map(Row::len)
+    }
+
+    fn range<'a>(&'a self, slot: usize, start: &[u8], prefix: &[u8]) -> ResidentRowIter<'a> {
+        debug_assert!(slot == POSITIONS || slot == BALANCES, "source slot {slot}");
+        match slot {
+            POSITIONS => self.position_range(start, prefix),
+            _ => self.balance_range(start, prefix),
+        }
     }
 }
 

@@ -217,6 +217,28 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
   (`native_executor.rs:3494-3590`, `app.rs:3201`); `EndResidentJob::run` applies the delta to `Users`
   only for the two CFs (`native_executor.rs:3782-3805`); gauges split into rows and users bytes.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`, then `cargo nextest run --workspace $F`.
+- **Built (s120, branch `feat/item6-phase4-step2`).** `ResidentSource` (point get, length, ordered range "from a key
+  while under a prefix") in `resident_rows.rs`; `ResidentRows::build_with_source` holds slots 2-4 raw and reads
+  slots 0-1 from the source; `apply` skips them; today's raw R stays as the reference (`ResidentRows::build` /
+  `Default`, `cfg(test)` / torus-state feature `test-reference-paths`). The overlay reads all R CFs through one
+  view (`Resident`), read order unchanged. `Users` implements the trait: point reads encode the record (opaque /
+  other rows as bytes); positions in key order walk the trader set merged with opaque and other rows; balances
+  ranges under a prefix naming one trader (20+ bytes, not a `cvlm` head under 24) read that trader's row and the
+  other rows, every other balances range is the collect-and-sort slow path (thread-local test counter). R keeps
+  its source (an `Arc<Users>`, the same one `BlockSums.records` and `ResidentBlock.users` hold) in the slot
+  between blocks; `end_resident_take` takes the source off and drops the sums' handle, then requires the record
+  set unshared like R (a live clone: `rows_shared_fallbacks` + 1, slot empty, next block rebuilds).
+  Deviations from the text above: no separate "len / bytes" on the trait (the bridge sets the gauges from typed
+  `Users`, which keeps a row count and bytes per change); `SumsCarry::drop_written` deleted (the record set always
+  comes back with R now, so the "context kept the block's state" rebuild path is gone); `trader_positions_match_rows`
+  checks `Users` against a cold build of its own rows (R has no raw rows to compare), the rows themselves are checked
+  against the DB through `ResidentRows::dump` (p2 runs now check R == DB after every block whose writes are all
+  durable, at interval 0 / every 5 / never).
+  Metrics: `torus_exec_resident_rows` / `_bytes` now count R's raw rows (liquidation, oracle, markets) only; new
+  `torus_exec_resident_users` / `_bytes` count the record set's rows of positions and balances (key + value
+  bytes as stored); rows + users == the older meaning. `exec_end_resident_rows_seconds` likewise covers the raw
+  CFs only. `tools/matched-bench/campaign-template.sh` samples both bytes gauges on the G lines (an older binary
+  omits the users one: reads 0); summarize.py reads neither and keeps the sub names.
 
 ### Step 3: sums cache into `UserState`
 

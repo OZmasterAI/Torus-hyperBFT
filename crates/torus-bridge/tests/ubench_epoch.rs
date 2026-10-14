@@ -502,7 +502,8 @@ fn run() {
     // Cold R build at this size, as a node builds it (DB + parent layer).
     let ov = NativeStateOverlay::with_parent(db.clone(), chain.parent.clone());
     let t = Instant::now();
-    let cold = torus_state::ResidentRows::build(&ov).expect("R build");
+    // Phase 4 step 2: raw liquidation / oracle / market rows + the record set.
+    let cold = torus_bridge::native_executor::resident_rows_cold(&ov).expect("R build");
     let build_ms = ms(t);
     println!(
         "UBENCH R cold build: rows={} bytes={} build_ms={build_ms:.1} ms_per_1M_rows={:.0}",

@@ -11,11 +11,23 @@
 //! of the block R takes the block's own writes and tombstones of R's CFs
 //! ([`ResidentDelta`], from [`crate::NativeStateOverlay::own_pending_delta`]).
 //!
+//! Item 6 Phase 4 step 2 (`docs/plans/item6-phase4-impl.md` Task 2.1): R
+//! holds the liquidation, oracle and market rows raw and reads positions and
+//! balances (the first [`SOURCE_SLOTS`] CFs) from a [`ResidentSource`]: the
+//! per-trader record set `Users` in torus-bridge (this crate cannot name its
+//! types), which follows the delta of those two CFs itself. The source answers
+//! both CFs completely (irregular rows included): no read of them goes past R,
+//! so none reaches L's deferred part (p3 merge wait). Today's raw R for all
+//! five CFs stays as the test-only reference path ([`ResidentRows::build`],
+//! `cfg(test)` / feature `test-reference-paths`).
+//!
 //! Node-local cache, never consensus-visible: R is built from and equal to
 //! what the DB (plus the parent layer) holds, every key included (`cvlm`
 //! rows, keys of any length).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::backend::StateBackend;
 use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_MARKETS, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS};
@@ -41,12 +53,125 @@ pub fn resident_slot(cf: &str) -> Option<usize> {
     RESIDENT_CFS.iter().position(|c| *c == cf)
 }
 
-/// One sorted map per resident CF.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+/// Item 6 Phase 4 step 2: the first `SOURCE_SLOTS` CFs of [`RESIDENT_CFS`]
+/// (positions, balances) are read from a [`ResidentSource`].
+pub const SOURCE_SLOTS: usize = 2;
+
+/// One row of a [`ResidentSource`]: key and value, borrowed when the source
+/// holds the bytes, owned when it builds them (a record encoded per read).
+pub type ResidentRow<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
+
+/// An ordered run of [`ResidentRow`]s.
+pub type ResidentRowIter<'a> = Box<dyn Iterator<Item = ResidentRow<'a>> + 'a>;
+
+/// Item 6 Phase 4 step 2 (plan row 12): a byte-level source for R's first
+/// [`SOURCE_SLOTS`] CFs (slot 0 `CF_NATIVE_POSITIONS`, slot 1
+/// `CF_NATIVE_BALANCES`), implemented by torus-bridge's `Users`. It must
+/// hold every row of both CFs as the DB (plus the parent layer) does — the
+/// overlay never reads them past R — and answer exactly as those rows held
+/// in a sorted map would.
+pub trait ResidentSource: Send + Sync {
+    /// The row of `key` in `slot`, `None` if absent.
+    fn get(&self, slot: usize, key: &[u8]) -> Option<Vec<u8>>;
+
+    /// The length of [`Self::get`]'s row.
+    fn get_len(&self, slot: usize, key: &[u8]) -> Option<usize> {
+        self.get(slot, key).map(|v| v.len())
+    }
+
+    /// The rows of `slot` with key >= `start`, in key order, up to (not
+    /// including) the first whose key does not start with `prefix` (a sorted
+    /// map's `range(start..).take_while(|k| k.starts_with(prefix))`).
+    fn range<'a>(&'a self, slot: usize, start: &[u8], prefix: &[u8]) -> ResidentRowIter<'a>;
+}
+
+/// Who answers R's first two CFs.
+#[derive(Clone)]
+enum SourceSlots {
+    /// R's own raw maps (today's R; the test-only reference path).
+    #[cfg_attr(not(any(test, feature = "test-reference-paths")), allow(dead_code))]
+    Raw,
+    /// The record set (the node).
+    Source(Arc<dyn ResidentSource>),
+    /// Nobody (the source was taken off for the end-of-block upkeep): the
+    /// overlay reads the two CFs below R, as without R.
+    Detached,
+}
+
+/// One sorted map per raw resident CF, and the source of the first two.
+#[derive(Clone)]
 pub struct ResidentRows {
+    /// Slots 0..SOURCE_SLOTS are empty unless `users` is `Raw`.
     cfs: [BTreeMap<Vec<u8>, Vec<u8>>; N],
+    users: SourceSlots,
     /// Sum of key + value lengths over every map.
     bytes: usize,
+}
+
+/// Item 6 Phase 4 step 2: how R answers one CF slot for the overlay.
+#[derive(Clone, Copy)]
+pub(crate) enum Resident<'a> {
+    Raw(&'a BTreeMap<Vec<u8>, Vec<u8>>),
+    Source(&'a dyn ResidentSource, usize),
+}
+
+impl<'a> Resident<'a> {
+    #[inline]
+    pub(crate) fn get(self, key: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Self::Raw(map) => map.get(key).cloned(),
+            Self::Source(s, slot) => s.get(slot, key),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get_len(self, key: &[u8]) -> Option<usize> {
+        match self {
+            Self::Raw(map) => map.get(key).map(Vec::len),
+            Self::Source(s, slot) => s.get_len(slot, key),
+        }
+    }
+
+    /// The rows with key >= `start`, up to the first not under `prefix`.
+    #[inline]
+    pub(crate) fn range<'k>(self, start: &'k [u8], prefix: &'k [u8]) -> ResidentRange<'a, 'k> {
+        match self {
+            Self::Raw(map) => ResidentRange::Raw {
+                range: map.range::<[u8], _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded)),
+                prefix,
+            },
+            Self::Source(s, slot) => ResidentRange::Source(s.range(slot, start, prefix)),
+        }
+    }
+}
+
+/// [`Resident::range`]'s rows.
+pub(crate) enum ResidentRange<'a, 'k> {
+    Raw {
+        range: std::collections::btree_map::Range<'a, Vec<u8>, Vec<u8>>,
+        prefix: &'k [u8],
+    },
+    Source(ResidentRowIter<'a>),
+    Done,
+}
+
+impl<'a> Iterator for ResidentRange<'a, '_> {
+    type Item = ResidentRow<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Raw { range, prefix } => match range.next() {
+                Some((k, v)) if k.starts_with(prefix) => Some((Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
+                _ => {
+                    *self = Self::Done;
+                    None
+                }
+            },
+            Self::Source(it) => it.next(),
+            Self::Done => None,
+        }
+    }
 }
 
 /// One block's own writes (`Some`) and tombstones (`None`) of R's CFs,
@@ -94,25 +219,133 @@ pub struct ResidentChange {
     pub current: Option<Vec<u8>>,
 }
 
+impl std::fmt::Debug for ResidentRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let users = match &self.users {
+            SourceSlots::Raw => "raw",
+            SourceSlots::Source(_) => "source",
+            SourceSlots::Detached => "detached",
+        };
+        f.debug_struct("ResidentRows")
+            .field("raw_rows", &self.len())
+            .field("bytes", &self.bytes)
+            .field("positions_and_balances", &users)
+            .finish()
+    }
+}
+
+/// Same rows in every CF (raw or from a source; tests and introspection).
+impl PartialEq for ResidentRows {
+    fn eq(&self, other: &Self) -> bool {
+        RESIDENT_CFS.iter().all(|cf| self.dump(cf) == other.dump(cf))
+    }
+}
+
+impl Eq for ResidentRows {}
+
+/// Today's raw R, empty (the test-only reference path).
+#[cfg(any(test, feature = "test-reference-paths"))]
+impl Default for ResidentRows {
+    fn default() -> Self {
+        Self::empty(SourceSlots::Raw)
+    }
+}
+
 impl ResidentRows {
-    /// Every row of R's CFs as `backend` sees them (`iterate_cf(cf, None)`).
-    /// Build it through an overlay WITHOUT R attached: DB + parent layer = the
-    /// previous block's post-state.
+    fn empty(users: SourceSlots) -> Self {
+        Self { cfs: Default::default(), users, bytes: 0 }
+    }
+
+    /// The raw slots' rows as `backend` sees them (`iterate_cf(cf, None)`).
+    fn fill<B: StateBackend>(&mut self, backend: &B, slots: std::ops::Range<usize>) -> Result<(), StateError> {
+        for slot in slots {
+            let entries = backend.iterate_cf(RESIDENT_CFS[slot], None)?;
+            self.bytes += entries.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+            self.cfs[slot] = entries.into_iter().collect();
+        }
+        Ok(())
+    }
+
+    /// Today's raw R (the test-only reference path): every row of R's five
+    /// CFs as `backend` sees them (`iterate_cf(cf, None)`). Build it through
+    /// an overlay WITHOUT R attached: DB + parent layer = the previous
+    /// block's post-state.
+    #[cfg(any(test, feature = "test-reference-paths"))]
     pub fn build<B: StateBackend>(backend: &B) -> Result<Self, StateError> {
         let mut rows = Self::default();
-        for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
-            let entries = backend.iterate_cf(cf, None)?;
-            rows.bytes += entries.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
-            rows.cfs[slot] = entries.into_iter().collect();
-        }
+        rows.fill(backend, 0..N)?;
         Ok(rows)
     }
 
-    /// Apply a block's own writes and tombstones. Copies the values on
-    /// purpose: moving the delta's buffers into R measured 2x slower upkeep
-    /// and a ~2.5x slower liquidation walk over R in `ubench_econ` (s90).
+    /// Item 6 Phase 4 step 2: R as the node builds it: the liquidation,
+    /// oracle and market rows raw as `backend` sees them, positions and
+    /// balances from `source` (built from the same `backend`). Build it
+    /// through an overlay WITHOUT R attached.
+    pub fn build_with_source<B: StateBackend>(backend: &B, source: Arc<dyn ResidentSource>) -> Result<Self, StateError> {
+        let mut rows = Self::empty(SourceSlots::Source(source));
+        rows.fill(backend, SOURCE_SLOTS..N)?;
+        Ok(rows)
+    }
+
+    /// Item 6 Phase 4 step 2: read positions and balances from `source`
+    /// from now on (raw maps of them, if any, are dropped).
+    pub fn set_source(&mut self, source: Arc<dyn ResidentSource>) {
+        for map in &mut self.cfs[..SOURCE_SLOTS] {
+            self.bytes -= map.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+            *map = BTreeMap::new();
+        }
+        self.users = SourceSlots::Source(source);
+    }
+
+    /// Item 6 Phase 4 step 2: take the source off (the end of the block
+    /// takes the record set back with `Arc::get_mut`). Until
+    /// [`Self::set_source`], R does not hold positions and balances: an
+    /// overlay reads them below R.
+    pub fn take_source(&mut self) -> Option<Arc<dyn ResidentSource>> {
+        match std::mem::replace(&mut self.users, SourceSlots::Detached) {
+            SourceSlots::Source(s) => Some(s),
+            other => {
+                self.users = other;
+                None
+            }
+        }
+    }
+
+    /// Whether positions and balances come from a source.
+    pub fn has_source(&self) -> bool {
+        matches!(self.users, SourceSlots::Source(_))
+    }
+
+    /// How R answers CF `slot` of [`RESIDENT_CFS`] (`None`: it does not hold
+    /// that CF now).
+    #[inline]
+    pub(crate) fn view(&self, slot: usize) -> Option<Resident<'_>> {
+        if slot >= SOURCE_SLOTS {
+            return Some(Resident::Raw(&self.cfs[slot]));
+        }
+        match &self.users {
+            SourceSlots::Raw => Some(Resident::Raw(&self.cfs[slot])),
+            SourceSlots::Source(s) => Some(Resident::Source(&**s, slot)),
+            SourceSlots::Detached => None,
+        }
+    }
+
+    /// Every row R holds of `cf` in key order, raw or from the source
+    /// (`None`: `cf` is not resident, or its source is taken off). Tests and
+    /// introspection.
+    pub fn dump(&self, cf: &str) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let view = self.view(resident_slot(cf)?)?;
+        Some(view.range(&[], &[]).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
+    }
+
+    /// Apply a block's own writes and tombstones to the raw CFs (positions
+    /// and balances only when held raw: a source's owner applies them to
+    /// it). Copies the values on purpose: moving the delta's buffers into R
+    /// measured 2x slower upkeep and a ~2.5x slower liquidation walk over R
+    /// in `ubench_econ` (s90).
     pub fn apply(&mut self, delta: &ResidentDelta) {
-        for (map, entries) in self.cfs.iter_mut().zip(delta.cfs.iter()) {
+        let from = if matches!(self.users, SourceSlots::Raw) { 0 } else { SOURCE_SLOTS };
+        for (map, entries) in self.cfs.iter_mut().zip(delta.cfs.iter()).skip(from) {
             for (key, value) in entries {
                 let old = match value {
                     Some(v) => {
@@ -128,17 +361,17 @@ impl ResidentRows {
         }
     }
 
-    /// The rows of `cf`, `None` if `cf` is not resident.
+    /// The raw rows of `cf`, `None` if `cf` is not resident or not held raw
+    /// (positions and balances from a source: [`Self::dump`]).
     pub fn rows(&self, cf: &str) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
-        resident_slot(cf).map(|s| &self.cfs[s])
+        match self.view(resident_slot(cf)?)? {
+            Resident::Raw(map) => Some(map),
+            Resident::Source(..) => None,
+        }
     }
 
-    #[inline]
-    pub(crate) fn slot(&self, slot: usize) -> &BTreeMap<Vec<u8>, Vec<u8>> {
-        &self.cfs[slot]
-    }
-
-    /// Rows over R's CFs.
+    /// Raw rows over R's CFs (with a source: the liquidation, oracle and
+    /// market rows).
     pub fn len(&self) -> usize {
         self.cfs.iter().map(BTreeMap::len).sum()
     }
@@ -147,7 +380,7 @@ impl ResidentRows {
         self.cfs.iter().all(BTreeMap::is_empty)
     }
 
-    /// Key + value bytes over R's CFs (map overhead not included).
+    /// Key + value bytes of R's raw rows (map overhead not included).
     pub fn bytes(&self) -> usize {
         self.bytes
     }
