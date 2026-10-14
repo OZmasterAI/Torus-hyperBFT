@@ -987,7 +987,11 @@ async fn markets_offset_is_charged_to_the_scan_budget() {
     list_markets(&state, 1000);
 
     let s = server(&state, 100);
-    let e = s.state().get_markets(Some(999), Some(1), None).await.unwrap_err();
+    let e = s
+        .state()
+        .get_markets(Some(999), Some(1), None)
+        .await
+        .unwrap_err();
     assert_scan_limit(&e, "offset 999 of 1000 markets, budget 100");
     assert!(
         (1..=101).contains(&examined(&s)),
@@ -1007,7 +1011,11 @@ async fn markets_offset_is_charged_to_the_scan_budget() {
     );
 
     let s = server(&state, 10_000);
-    let last = s.state().get_markets(Some(999), Some(1), None).await.unwrap();
+    let last = s
+        .state()
+        .get_markets(Some(999), Some(1), None)
+        .await
+        .unwrap();
     assert_eq!(last.len(), 1);
     assert_eq!(last[0].market_id, "0x3e8");
 }
@@ -1022,22 +1030,43 @@ async fn markets_after_cursor_seeks_to_the_page() {
     list_markets(&state, 1000);
 
     let s = server(&state, 100);
-    let page = s.state().get_markets(None, Some(10), Some("0x5".into())).await.unwrap();
+    let page = s
+        .state()
+        .get_markets(None, Some(10), Some("0x5".into()))
+        .await
+        .unwrap();
     let ids: Vec<_> = page.iter().map(|m| m.market_id.as_str()).collect();
-    assert_eq!(ids, ["0x6", "0x7", "0x8", "0x9", "0xa", "0xb", "0xc", "0xd", "0xe", "0xf"]);
+    assert_eq!(
+        ids,
+        ["0x6", "0x7", "0x8", "0x9", "0xa", "0xb", "0xc", "0xd", "0xe", "0xf"]
+    );
     assert_eq!(examined(&s), 10, "only the page's rows");
 
     // Deep in the table, under a budget the offset form is refused at.
     let s = server(&state, 100);
-    let last = s.state().get_markets(None, Some(10), Some("0x3e7".into())).await.unwrap();
+    let last = s
+        .state()
+        .get_markets(None, Some(10), Some("0x3e7".into()))
+        .await
+        .unwrap();
     assert_eq!(last.len(), 1);
     assert_eq!(last[0].market_id, "0x3e8");
     assert_eq!(examined(&s), 1);
 
     // Past the last market, and at u64::MAX (no market above it): empty.
     let s = server(&state, 100);
-    assert!(s.state().get_markets(None, None, Some("0x3e8".into())).await.unwrap().is_empty());
-    assert!(s.state().get_markets(None, None, Some("0xffffffffffffffff".into())).await.unwrap().is_empty());
+    assert!(s
+        .state()
+        .get_markets(None, None, Some("0x3e8".into()))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(s
+        .state()
+        .get_markets(None, None, Some("0xffffffffffffffff".into()))
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(examined(&s), 0);
 
     // Listing all 1000 in pages of 500 by cursor reads 1000 rows; by offset
@@ -1046,7 +1075,11 @@ async fn markets_after_cursor_seeks_to_the_page() {
     let mut all = Vec::new();
     let mut after = None;
     loop {
-        let page = s.state().get_markets(None, Some(500), after.clone()).await.unwrap();
+        let page = s
+            .state()
+            .get_markets(None, Some(500), after.clone())
+            .await
+            .unwrap();
         let n = page.len();
         after = page.last().map(|m| m.market_id.clone());
         all.extend(page);
@@ -1059,18 +1092,33 @@ async fn markets_after_cursor_seeks_to_the_page() {
     assert_eq!(examined(&s), 1000);
     let s = server(&state, 10_000);
     for offset in [0, 500, 1000] {
-        s.state().get_markets(Some(offset), Some(500), None).await.unwrap();
+        s.state()
+            .get_markets(Some(offset), Some(500), None)
+            .await
+            .unwrap();
     }
     assert_eq!(examined(&s), 2500);
 
     // offset counts from the table start, so it cannot be combined with a
     // cursor (0 / absent is fine); a bad cursor is invalid params.
     let s = server(&state, 10_000);
-    let page = s.state().get_markets(Some(0), Some(1), Some("0x1".into())).await.unwrap();
+    let page = s
+        .state()
+        .get_markets(Some(0), Some(1), Some("0x1".into()))
+        .await
+        .unwrap();
     assert_eq!(page[0].market_id, "0x2");
-    let e = s.state().get_markets(Some(1), Some(1), Some("0x1".into())).await.unwrap_err();
+    let e = s
+        .state()
+        .get_markets(Some(1), Some(1), Some("0x1".into()))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), -32602, "{e:?}");
-    let e = s.state().get_markets(None, Some(1), Some("not-hex".into())).await.unwrap_err();
+    let e = s
+        .state()
+        .get_markets(None, Some(1), Some("not-hex".into()))
+        .await
+        .unwrap_err();
     assert_eq!(e.code(), -32602, "{e:?}");
 }
 
@@ -1900,7 +1948,11 @@ async fn get_logs_charges_every_receipt_slot_to_the_scan_budget() {
     let s = server(&state, 100);
     let e = s.state().get_logs(filter()).await.unwrap_err();
     assert_scan_limit(&e, "getLogs: 120 slots over 2 blocks, budget 100");
-    assert!((1..=101).contains(&examined(&s)), "examined {}", examined(&s));
+    assert!(
+        (1..=101).contains(&examined(&s)),
+        "examined {}",
+        examined(&s)
+    );
 
     let s = server(&state, 10_000);
     assert!(s.state().get_logs(filter()).await.unwrap().is_empty());
