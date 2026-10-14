@@ -1,0 +1,69 @@
+PER CELL (run order; local time of the bench window; load1 = cpu.csv mean in the window; node %CPU = summary mean of 3 nodes)
+cell arm start end matched/s cpu_s_per_1M node_pcpu load1 blk_s place_share evict_per_node rss_mean/peak_GB
+w0 moff 02:33:37 02:34:40 223629.9 26.03 331.0 20.6 3.63 0.628 0 4.26/5.47
+r1-goff goff 02:38:06 02:40:09 115666.0 47.05 385.9 19.5 3.95 0.286 0 3.02/3.76
+r1-moff moff 02:44:18 02:46:20 225609.1 25.74 398.7 20.3 3.49 0.612 0 4.72/5.91
+r1-mon mon 02:50:06 02:52:08 208992.9 27.11 379.1 20.0 4.06 0.617 0 4.79/5.80
+r1-gjoff gjoff 02:55:43 02:57:45 128667.4 47.19 418.5 25.3 6.49 0.204 7122 2.73/3.50
+r2-moff moff 03:02:29 03:04:32 190808.5 26.81 357.5 36.9 2.89 0.611 0 4.89/6.48
+r2-mon mon 03:08:29 03:10:32 207521.3 26.93 377.9 28.3 3.77 0.622 0 4.89/5.92
+r2-gjoff gjoff 03:14:19 03:16:21 124727.0 46.40 406.8 28.2 6.61 0.185 5179 2.65/3.45
+r2-goff goff 03:20:22 03:22:24 115075.8 46.06 380.9 24.2 3.98 0.269 0 3.00/3.56
+r3-mon mon 03:26:35 03:28:37 210081.2 26.58 378.7 25.0 3.66 0.623 0 4.90/5.83
+r3-gjoff gjoff 03:32:43 03:34:45 127122.7 45.22 403.0 28.9 5.88 0.218 5614 2.71/3.37
+r3-goff goff 03:38:56 03:41:00 114245.7 46.87 380.8 31.4 3.73 0.283 0 3.05/3.66
+r3-moff moff 03:45:06 03:47:09 216504.6 26.39 400.2 18.7 3.42 0.613 0 4.69/6.01
+r4-gjoff gjoff 03:50:55 03:52:57 132016.2 45.57 418.6 24.1 5.71 0.223 5933 2.75/3.46
+r4-goff goff 03:56:56 03:58:59 115279.7 46.24 377.1 23.5 3.76 0.272 0 2.92/3.54
+r4-moff moff 04:03:08 04:05:11 224399.4 25.67 400.8 19.6 3.42 0.613 0 4.99/6.45
+r4-mon mon 04:09:04 04:11:07 217949.9 25.97 360.3 20.5 3.94 0.623 0 5.00/6.21
+r1-gjoff-rerun gjoff 04:14:29 04:16:32 123337.6 49.25 426.5 38.3 9.10 0.144 6811 2.67/3.17
+r2-gjoff-rerun gjoff 04:20:55 04:22:58 127782.8 45.75 419.8 31.9 7.09 0.185 5905 2.70/3.43
+r3-gjoff-rerun gjoff 04:26:53 04:28:55 126657.0 46.75 416.0 33.9 7.65 0.177 7767 2.63/3.28
+r2-moff-rerun moff 04:33:09 04:35:11 222014.9 26.00 401.7 27.8 3.48 0.612 0 4.92/6.67
+r4-gjoff-rerun gjoff 04:38:45 04:40:48 129322.5 45.41 413.1 28.0 6.22 0.198 7390 2.68/3.35
+
+PER ARM, owner set (r2-moff replaced by its rerun, GJ reruns included): mean [min, max]
+goff n=4
+   rss_mean_gb         2.998 [2.921, 3.055]
+   rss_pk_gb           3.631 [3.539, 3.761]
+   evict_m             0.000 [0.000, 0.000]
+   place_share         0.278 [0.269, 0.286]
+   submitted      207601.500 [195261.000, 218547.000]
+moff n=4
+   rss_mean_gb         4.827 [4.685, 4.988]
+   rss_pk_gb           6.260 [5.914, 6.671]
+   je_alloc_gb         1.746 [1.711, 1.791]
+   je_res_gb           2.815 [2.572, 3.000]
+   evict_m             0.000 [0.000, 0.000]
+   place_share         0.613 [0.612, 0.613]
+   submitted      170573.250 [169066.000, 171714.000]
+mon n=4
+   rss_mean_gb         4.894 [4.795, 4.995]
+   rss_pk_gb           5.939 [5.805, 6.208]
+   je_alloc_gb         1.696 [1.562, 1.879]
+   je_res_gb           3.452 [2.983, 4.372]
+   evict_m             0.000 [0.000, 0.000]
+   place_share         0.621 [0.617, 0.623]
+   submitted      165423.250 [162540.000, 168281.000]
+gjoff n=8
+   rss_mean_gb         2.691 [2.626, 2.750]
+   rss_pk_gb           3.377 [3.173, 3.500]
+   evict_m          6465.083 [5179.000, 7767.000]
+   place_share         0.192 [0.144, 0.223]
+   submitted      367551.625 [313392.000, 468866.000]
+
+WELCH RATIOS of the per-arm means, owner set (log scale, 95% CI, as stats.py)
+  cpu_s_per_1M moff/goff 0.557 [0.546, 0.569]  mon/goff 0.572 [0.556, 0.589]  gjoff/goff 0.998 [0.973, 1.023]  moff/gjoff 0.559 [0.544, 0.574]  mon/moff 1.027 [0.998, 1.057]
+  node_pcpu moff/goff 1.050 [1.035, 1.065]  mon/goff 0.981 [0.945, 1.018]  gjoff/goff 1.090 [1.070, 1.109]  moff/gjoff 0.964 [0.949, 0.979]  mon/moff 0.934 [0.898, 0.971]
+  native_blk_s moff/goff 0.895 [0.851, 0.941]  mon/goff 1.000 [0.932, 1.073]  gjoff/goff 1.774 [1.543, 1.998]  moff/gjoff 0.504 [0.449, 0.579]  mon/moff 1.118 [1.042, 1.198]
+  fills_per_blk moff/goff 1.904 [1.813, 2.001]  mon/goff 1.600 [1.507, 1.698]  gjoff/goff 0.644 [0.561, 0.725]  moff/gjoff 2.959 [2.634, 3.387]  mon/moff 0.840 [0.794, 0.888]
+  engine_ms_1k moff/goff 0.709 [0.675, 0.746]  mon/goff 0.742 [0.706, 0.780]  gjoff/goff 0.974 [0.928, 1.023]  moff/gjoff 0.728 [0.705, 0.752]  mon/moff 1.046 [1.013, 1.080]
+  bt_p50 moff/goff 0.949 [0.650, 1.440]  mon/goff 1.308 [0.880, 2.044]  gjoff/goff 0.524 [0.353, 0.777]  moff/gjoff 1.809 [1.451, 2.351]  mon/moff 1.378 [1.135, 1.694]
+  bt_p99 moff/goff 0.795 [0.637, 1.009]  mon/goff 0.805 [0.645, 1.021]  gjoff/goff 0.600 [0.478, 0.752]  moff/gjoff 1.325 [1.169, 1.529]  mon/moff 1.012 [0.922, 1.111]
+  rss_mean_gb moff/goff 1.610 [1.536, 1.686]  mon/goff 1.632 [1.582, 1.684]  gjoff/goff 0.897 [0.873, 0.923]  moff/gjoff 1.794 [1.712, 1.879]  mon/moff 1.014 [0.968, 1.062]
+  rss_pk_gb moff/goff 1.724 [1.581, 1.876]  mon/goff 1.636 [1.555, 1.721]  gjoff/goff 0.930 [0.891, 0.970]  moff/gjoff 1.854 [1.700, 2.017]  mon/moff 0.949 [0.872, 1.034]
+
+SENSITIVITY (matched/s, owner set)
+  without r1-gjoff-rerun (load1 38.3): gjoff/goff 1.113 [1.094, 1.132]  moff/gjoff 1.735 [1.688, 1.783]
+  r2-moff vs the owner-set moff mean: -14.10%; vs r1-moff -15.43%; r3-moff vs r1-moff -4.04%

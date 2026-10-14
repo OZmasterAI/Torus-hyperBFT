@@ -1,0 +1,55 @@
+PER-CELL (cells.tsv rows; exe md5 = node-environ-trie.txt running exe; summary md5 = summary.json binaries.torus_node_md5)
+label	arm	rep	rc	agree(cell_step)	md5_ok(cell_step)	matched_s	flag	verdict	agreement	exe_md5(3 nodes)	summary_md5	preload(node-preload)
+w0	moff	w0	0	yes	yes	223629.9	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r1-goff	goff	r1	0	yes	yes	115666	ok	ACCEPT	AGREE	d6b05d8e x3	d6b05d8e	none
+r1-moff	moff	r1	0	yes	yes	225609.1	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r1-mon	mon	r1	0	yes	yes	208992.9	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r1-gjoff	gjoff	r1	0	yes	no	128667.4	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+r2-moff	moff	r2	0	yes	yes	190808.5	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r2-mon	mon	r2	0	yes	yes	207521.3	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r2-gjoff	gjoff	r2	0	yes	no	124727	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+r2-goff	goff	r2	0	yes	yes	115075.8	ok	ACCEPT	AGREE	d6b05d8e x3	d6b05d8e	none
+r3-mon	mon	r3	0	yes	yes	210081.2	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r3-gjoff	gjoff	r3	0	yes	no	127122.7	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+r3-goff	goff	r3	0	yes	yes	114245.7	ok	ACCEPT	AGREE	d6b05d8e x3	d6b05d8e	none
+r3-moff	moff	r3	0	yes	yes	216504.6	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r4-gjoff	gjoff	r4	0	yes	no	132016.2	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+r4-goff	goff	r4	0	yes	yes	115279.7	ok	ACCEPT	AGREE	d6b05d8e x3	d6b05d8e	none
+r4-moff	moff	r4	0	yes	yes	224399.4	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r4-mon	mon	r4	0	yes	yes	217949.9	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r1-gjoff-rerun	gjoff	r1	0	yes	no	123337.6	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+r2-gjoff-rerun	gjoff	r2	0	yes	no	127782.8	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+r3-gjoff-rerun	gjoff	r3	0	yes	no	126657	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+r2-moff-rerun	moff	r2	0	yes	yes	222014.9	ok	ACCEPT	AGREE	c2fda80f x3	c2fda80f	none
+r4-gjoff-rerun	gjoff	r4	0	yes	no	129322.5	bad:md5	ACCEPT	AGREE	d6b05d8e x3	e676f703	LD_PRELOAD=/usr/lib/libjemalloc.so.2
+
+PER-ARM matched/s (main rounds r1-r4; w0 warm-up and reruns excluded)
+arm	n	r1	r2	r3	r4	mean	min	max	|r1-r2|
+goff	4	115666.0	115075.8	114245.7	115279.7	115066.8	114245.7	115666.0	590.2
+moff	4	225609.1	190808.5	216504.6	224399.4	214330.4	190808.5	225609.1	34800.6
+mon	4	208992.9	207521.3	210081.2	217949.9	211136.3	207521.3	217949.9	1471.6
+gjoff	4	128667.4	124727.0	127122.7	132016.2	128133.3	124727.0	132016.2	3940.4
+
+PER-ARM including reruns (extra replicates per coordinator note; GJ reruns are valid, moff r2 rerun is an anomaly, see notes)
+arm	n_all	mean_all	min_all	max_all	reruns
+goff	4	115066.8	114245.7	115666.0	-
+moff	5	215867.3	190808.5	225609.1	r2-moff-rerun=222014.9
+mon	4	211136.3	207521.3	217949.9	-
+gjoff	8	127454.1	123337.6	132016.2	r1-gjoff-rerun=123337.6;r2-gjoff-rerun=127782.8;r3-gjoff-rerun=126657.0;r4-gjoff-rerun=129322.5
+
+CELL-FLAG lines (campaign.log)
+CELL-FLAG r1-gjoff md5
+CELL-FLAG r2-gjoff md5
+CELL-FLAG r3-gjoff md5
+CELL-FLAG r4-gjoff md5
+CELL-FLAG r1-gjoff-rerun md5
+CELL-FLAG r2-gjoff-rerun md5
+CELL-FLAG r3-gjoff-rerun md5
+CELL-FLAG r4-gjoff-rerun md5
+
+rerun-queue.tsv (as written by the campaign; not edited):
+ozarchy-g3-300m-r1-gjoff-rerun	ozarchy-g3-300m-r1-gjoff	gjoff	r1	r1-gjoff:gjoff:120:none:
+ozarchy-g3-300m-r2-gjoff-rerun	ozarchy-g3-300m-r2-gjoff	gjoff	r2	r2-gjoff:gjoff:120:none:
+ozarchy-g3-300m-r3-gjoff-rerun	ozarchy-g3-300m-r3-gjoff	gjoff	r3	r3-gjoff:gjoff:120:none:
+ozarchy-g3-300m-r2-moff-rerun	ozarchy-g3-300m-r2-moff	moff	r2	r2-moff:moff:120:none:
+ozarchy-g3-300m-r4-gjoff-rerun	ozarchy-g3-300m-r4-gjoff	gjoff	r4	r4-gjoff:gjoff:120:none:

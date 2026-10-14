@@ -8744,6 +8744,226 @@ Analysis (`tools/ozarchy-p4s0-tools/analyst/`; outputs in `ozarchy-p4s0-run/anal
   `tools/ozarchy-p4s0-tools/ozarchy-p4s0-campaign.sh`, config patcher `patch-p4s0.py`, sidecar `perf-sidecar.sh`, md5s
   `md5s-all.txt` (g3s0's `md5s.txt`); `analyst/a-cells.py` is section 60's copy from the tools dir, not run here.
 
+## 65. Item 6 Gate 3 checkpoint: main `d3cba5e2` vs pre-item-6 main `199bdc97` (backported bench), 300 markets, oracle off (primary) and on ("as shipped"), plus `199bdc97` + LD_PRELOAD jemalloc, commit-tail mode (campaign ozarchy-g3, 2026-10-14)
+
+**Like for like, main `d3cba5e2` with the oracle off runs 1.93x the matched/s of pre-item-6 main `199bdc97` with the
+oracle off: 1.931 [1.877, 1.985].** The Gate 3 target is >= 1.4x "after all phases"
+(`docs/plans/market-scaling-in-memory-design.md`, stage gates). This is a checkpoint after Phases 1-3 + step 6, so it is
+above the target before Phases 4-5. **"As shipped"** (M oracle on vs G oracle off) is **1.835 [1.774, 1.898]**. All 22
+cells are rc 0, ACCEPT, AGREE, liveness PASS.
+
+| ratio of arm means, matched/s (Welch 95% CI on log matched/s; `stats.py`) | owner treatment (r2-moff replaced by its rerun) | r2-moff kept + rerun | owner treatment without the 5 localsearch cells |
+|---|---|---|---|
+| **primary: M off / G off** (Gate 3 like for like; target >= 1.4x after all phases) | **1.931 [1.877, 1.985]** | 1.876 [1.717, 2.042] | 1.940 [1.905, 1.975] |
+| **"as shipped": M on / G off** | **1.835 [1.774, 1.898]** | 1.835 [1.774, 1.898] | 1.831 [1.716, 1.954] |
+| allocator: GJ off / G off (LD_PRELOAD jemalloc on `199bdc97`) | 1.108 [1.088, 1.128] | 1.108 [1.088, 1.128] | 1.104 [1.081, 1.128] |
+| M off / GJ off (item 6 with both on jemalloc) | 1.743 [1.695, 1.792] | 1.694 [1.552, 1.842] | 1.757 [1.718, 1.798] |
+| marks: M on / M off | 0.951 [0.918, 0.984] | 0.978 [0.900, 1.067] | 0.944 [0.889, 1.002] |
+
+**Read the primary with its confound:** it is not a node-only comparison. The bench binaries differ (G `a951801c`, the
+backport; M `ff08433d`) and so does the action mix: place share 0.28 on G off vs 0.61 on M off, and the mix is partly an
+outcome of node speed (closed-loop bench). See 65.4.
+
+Gate 3 checkpoint requested by 18c (owner design s54, 2026-10-14), after the Phase 4 step 0 re-profile (section 64). Arms:
+* **goff (G)** = **`199bdc97`**, pre-item-6 main, glibc as shipped (preflight `nm`: 0 `_rjem_` symbols), node `d6b05d8e`,
+  oracle feed off. **The base sha stays `199bdc97`; its bench is backported:** branch `bench/g3-base-199bdc97` @
+  `22d3cc03` (pushed, not merged) changes only `tools/bench-throughput` (oracle-feed, `--max-in-flight`,
+  `--in-flight-tail`, `--open-order-budget`, `--retry-busy` ported from main). Signing is `199bdc97`'s own (the old order
+  format, no cloids), and `--cloid-share` accepts only 0. The node built at `22d3cc03` has md5 `d6b05d8e`, the same as a
+  plain `199bdc97` build (`md5s.txt`: `G` = `bG`, same worktree path and target dir). Bench `a951801c`.
+* **moff (M)** = **main `d3cba5e2`** (Phases 1-3 + merge-wait + step 6, 15 s checkpoints by default), jemalloc compiled in
+  (700 `_rjem_` symbols; no preload, no `libjemalloc.so` mapped), node `c2fda80f`, bench `ff08433d`, oracle feed off. The
+  same staged build as section 64.
+* **mon** = M with the oracle feed on (`ORACLE_FEED=1`, price 30000, 2,000 ms interval, walk 0), as in section 64.
+* **gjoff (GJ)** = the G node started through a bash wrapper (`ozarchy-g3s0-stage/g-je/release/torus-node`, md5
+  `e676f703`) that sets `LD_PRELOAD=/usr/lib/libjemalloc.so.2` (system jemalloc 5.3.1, defaults, `MALLOC_CONF` unset) and
+  `exec`s the real G binary. Oracle feed off.
+
+**Allocators as shipped:** `199bdc97` uses glibc malloc; `d3cba5e2` has jemalloc compiled in (default feature `jemalloc`,
+`88ddc4c2`, section 56). GJ separates the allocator from item 6.
+
+**Why the primary is oracle off on both arms:** pre-item-6 mains have no mark aggregation. At `199bdc97`
+`NativeExecutor::aggregate_oracle_prices` exists but has no caller (`git grep` at `199bdc97`: only the definition), so a
+live `199bdc97` node never computes marks even when fed prices. Per-block aggregation is `454a9bba`, which reached main in
+`59fa407b` (the Phase 1 merge, 2026-10-06). The like-for-like ratio is therefore oracle off on both arms. "As shipped"
+compares M with the oracle on against the same G oracle-off cells, because the old node never computed marks. Gate 2's
+base was set up the same way (section 19: oracle feed on the crab arm only). The design's gate text says "oracle on"; here
+only the "as shipped" ratio has it.
+
+Build (ozarchy-g3s0, 2026-10-13/14, `ozarchy-g3s0-build/`): `build-g.sh` / `build-bg.sh` (target
+`/home/oz/.cargo-target-g3s0-199bdc97`) and `build-m.sh` (`/home/oz/.cargo-target-g3s0-d3cba5e2`), all with `RUSTFLAGS=-C
+link-arg=-fuse-ld=mold -C force-frame-pointers=yes`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, release; staged in
+`ozarchy-g3s0-stage/{g-run,g-je,m-run}` (`gj-run` is a symlink to `g-je`). Harness = the `d3cba5e2` worktree
+(`/home/oz/projects/wt/g3s0-d3cba5e2`); every arm, including G, runs under its `run-cell.sh`. The run's `matched-bench/`
+copy matches `d3cba5e2`'s `tools/matched-bench` byte for byte (25 top-level files checked against the git blobs). Driver
+`ozarchy-g3-campaign.sh` CAMP=G3, generated by `make-g3-driver.py` from `ozarchy-p4s0-campaign.sh` (only the config,
+per-cell checks and preflight differ).
+
+Workload in every cell: 300 markets uniform, 5,000 senders, CLOID_SHARE=0, Classic book rows, tw, block cap 400,
+MAX_IN_FLIGHT 4, budget 900, RATE 76000 (saturated), commit tail, `TORUS_CHECKPOINT_INTERVAL_MS` unset (M: the 15 s
+validator default, 14-16 checkpoints per node per cell; G / GJ: no checkpoint enable line, no checkpoint series), genesis
+state hash off, shared NVMe, btrfs data dirs.
+
+Smoke 02:03-02:30 (60 s each, context only): s0-goff 124,191, s0-moff 221,478, s0-gjoff 127,533 (md5 flag, see below) and
+its queued rerun 130,836. s0-mon was rc 2 DISAGREE: `agreement.jsonl` has block hash `ERR` on val0 / val1 at compare
+height 1,104 (the hash was not read) and the hash read on val2. The state digests were identical on all 3 nodes. Its rerun
+s0-mon-rerun was AGREE (216,343). Cells 02:33-04:42: w0 (moff, 60 s, warm-up, excluded), then r1-r4 in rotated balanced
+rounds, 120 s each (r1: goff moff mon gjoff; r2: moff mon gjoff goff; r3: mon gjoff goff moff; r4: gjoff goff moff mon).
+Then the rerun pass 04:14-04:42: r1-r4-gjoff-rerun (queued by `cell_step` for the md5 flag) and r2-moff-rerun (appended to
+`rerun-queue.tsv` by hand mid-campaign, owner decision; `cell_step` had not queued it).
+
+**Validity.** 22 of 22 cells (w0 + 16 + 5 reruns) rc 0, ACCEPT, AGREE, liveness PASS. Block hash and state digest are
+equal on 3 nodes in every cell, with 0 panic / fail-stop and 0 error lines (`agreement.jsonl`). The running exe md5
+(`node-environ-trie.txt`) is the arm's node on all 3 nodes in all 22 cells (G / GJ `d6b05d8e`, M `c2fda80f`). 286 CHECK OK
+(+78 in the smoke), no CHECK FAIL, 0 HARD FINDING. The host check before every cell found no cargo / rustc / rust-analyzer
+and no analysis process (1-min load 1.70-1.99). The 8 CELL-FLAG lines are all `md5` on GJ cells: **false positives.** The
+GJ arm's staged `torus-node` is the wrapper, so `summary.json` records the wrapper's md5 (`e676f703`). The running exe is
+`d6b05d8e` on all 3 nodes, and in every GJ cell `node-preload.txt` shows `LD_PRELOAD=/usr/lib/libjemalloc.so.2` with
+`MALLOC_CONF` unset on 3 nodes and `node-maps-jemalloc.txt` shows libjemalloc mapped on 3 nodes (`extract.py`: 3 / 0 / 3).
+The driver's `jemalloc` check passed in all 8. (Cosmetic: the G cells' "no preload" CHECK OK line says "jemalloc compiled
+in", text copied from the M check; preflight's `nm` found 0 `_rjem_` symbols in the G node.)
+
+### 65.1 Cells (`cells.tsv`, `analyst/extract.txt`, `analyst/writeup.txt`, the cells' `summary.json` / `cpu.csv`)
+
+| cell (run order) | arm | bench window | matched/s | CPU-s/1M | node %CPU | load1 | native blk/s | place share | note |
+|---|---|---|---|---|---|---|---|---|---|
+| w0 (60 s) | moff | 02:33:37-02:34:40 | 223,630 | 26.03 | 331 | 20.6 | 3.63 | 0.628 | warm-up, excluded |
+| r1-goff | goff | 02:38:06-02:40:09 | 115,666 | 47.05 | 386 | 19.5 | 3.95 | 0.286 | |
+| r1-moff | moff | 02:44:18-02:46:20 | 225,609 | 25.74 | 399 | 20.3 | 3.49 | 0.612 | |
+| r1-mon | mon | 02:50:06-02:52:08 | 208,993 | 27.11 | 379 | 20.0 | 4.06 | 0.617 | |
+| r1-gjoff | gjoff | 02:55:43-02:57:45 | 128,667 | 47.19 | 419 | 25.3 | 6.49 | 0.204 | md5 flag (false) |
+| **r2-moff** | moff | 03:02:29-03:04:32 | **190,808** | 26.81 | **357** | **36.9** | 2.89 | 0.611 | **excluded (owner): Codex stop review 03:01-03:04** |
+| r2-mon | mon | 03:08:29-03:10:32 | 207,521 | 26.93 | 378 | 28.3 | 3.77 | 0.622 | |
+| r2-gjoff | gjoff | 03:14:19-03:16:21 | 124,727 | 46.40 | 407 | 28.2 | 6.61 | 0.185 | md5 flag (false) |
+| r2-goff | goff | 03:20:22-03:22:24 | 115,076 | 46.06 | 381 | 24.2 | 3.98 | 0.269 | localsearch window |
+| r3-mon | mon | 03:26:35-03:28:37 | 210,081 | 26.58 | 379 | 25.0 | 3.66 | 0.623 | localsearch window |
+| r3-gjoff | gjoff | 03:32:43-03:34:45 | 127,123 | 45.22 | 403 | 28.9 | 5.88 | 0.218 | localsearch window; md5 flag (false) |
+| r3-goff | goff | 03:38:56-03:41:00 | 114,246 | 46.87 | 381 | 31.4 | 3.73 | 0.283 | localsearch window |
+| r3-moff | moff | 03:45:06-03:47:09 | 216,505 | 26.39 | 400 | 18.7 | 3.42 | 0.613 | localsearch window; -4.0% vs r1-moff |
+| r4-gjoff | gjoff | 03:50:55-03:52:57 | 132,016 | 45.57 | 419 | 24.1 | 5.71 | 0.223 | md5 flag (false) |
+| r4-goff | goff | 03:56:56-03:58:59 | 115,280 | 46.24 | 377 | 23.5 | 3.76 | 0.272 | |
+| r4-moff | moff | 04:03:08-04:05:11 | 224,399 | 25.67 | 401 | 19.6 | 3.42 | 0.613 | |
+| r4-mon | mon | 04:09:04-04:11:07 | 217,950 | 25.97 | 360 | 20.5 | 3.94 | 0.623 | |
+| r1-gjoff-rerun | gjoff | 04:14:29-04:16:32 | 123,338 | 49.25 | 427 | 38.3 | 9.10 | 0.144 | extra GJ replicate |
+| r2-gjoff-rerun | gjoff | 04:20:55-04:22:58 | 127,783 | 45.75 | 420 | 31.9 | 7.09 | 0.185 | extra GJ replicate |
+| r3-gjoff-rerun | gjoff | 04:26:53-04:28:55 | 126,657 | 46.75 | 416 | 33.9 | 7.65 | 0.177 | extra GJ replicate |
+| **r2-moff-rerun** | moff | 04:33:09-04:35:11 | **222,015** | 26.00 | 402 | 27.8 | 3.48 | 0.612 | **replaces r2-moff** |
+| r4-gjoff-rerun | gjoff | 04:38:45-04:40:48 | 129,323 | 45.41 | 413 | 28.0 | 6.22 | 0.198 | extra GJ replicate |
+
+CPU-s/1M = node (user + sys) CPU over the load phase per 1M fills, mean of 3 nodes (`extract.py`). Node %CPU =
+`summary.json` `cpu.pcpu_avg_by_proc`, mean of the 3 nodes. load1 = `cpu.csv` mean in the bench window (10 s samples; the
+host has 32 CPUs). Place share = place / (place + cancel-all) executed (`ingest.econ_mix`). The G and GJ cells'
+`summary.json` has `ingest.cloids: null` (the backported bench stamps no cloids); the M cells report 0 stamped.
+
+### 65.2 Per arm (owner treatment: n = 4 G off / M off / M on, n = 8 GJ off; `secondary.txt`, `writeup.txt`)
+
+| metric | goff (G, glibc) | moff (M) | mon (M, marks) | gjoff (G + LD_PRELOAD je) | M off / G off [95% CI] |
+|---|---|---|---|---|---|
+| **matched/s** | 115,067 | **222,132** | 211,136 | 127,454 | **1.931 [1.877, 1.985]** |
+| CV across cells | 0.52% | 1.82% | 2.21% | 2.12% | |
+| node CPU-s/1M fills | 46.55 | **25.95** | 26.65 | 46.44 | **0.557 [0.546, 0.569]** (-44.3%) |
+| node %CPU (mean of 3 nodes) | 381 | 400 | 374 | 415 | 1.050 [1.035, 1.065] |
+| engine ms per 1k fills | 4.70 | 3.33 | 3.48 | 4.58 | 0.709 [0.675, 0.746] |
+| native blocks/s | 3.86 | 3.45 | 3.86 | 6.84 | 0.895 [0.851, 0.941] |
+| fills per native block | 33,138 | 63,096 | 53,010 | 21,326 | 1.904 [1.813, 2.001] |
+| bench actions submitted (120 s) | 207,602 | 170,573 | 165,423 | 367,552 | |
+| place share (executed) | 0.278 | 0.613 | 0.621 | 0.192 | |
+| nonce-expired evictions per node | 0 | 0 | 0 | 6,465 (5,179-7,767) | |
+| block time (commit interval) p50 / p95 / p99 ms, context only | 79 / 981 / 2,043 | 74 / 882 / 1,625 | 103 / 899 / 1,645 | 41 / 672 / 1,226 | |
+| RSS mean / peak per node, GB (kB / 10^6, as 61-63) | 3.00 / 3.63 | 4.83 / 6.26 | 4.89 / 5.94 | 2.69 / 3.38 | 1.610 [1.536, 1.686] / 1.724 [1.581, 1.876] |
+| jemalloc allocated / resident at cell end, GB (bytes / 10^9) | n/a | 1.75 / 2.82 | 1.70 / 3.45 | not exported | |
+
+Block time comes from the `torus_commit_interval_seconds` histogram in `buckets.csv` (bench window, interpolated in the
+bucket, mean of 3 nodes; `extract.py`). It is context only: the attribution of the commit-interval p99 is a separate
+follow-up analysis (running); no p99 cause is read from this campaign. RSS peak is the mean of the 3 per-node peaks in the
+bench window (the analyst's handoff gives the largest node's peak in MiB: goff 4.0, moff 6.8, mon 6.4, gjoff 4.0; mean 2.9
+/ 4.7 / 4.8 / 2.6).
+
+### 65.3 Excluded and sensitive cells
+
+* **r2-moff (190,808, -14.1% vs the other four M-off cells' mean, -15.4% vs r1-moff) is EXCLUDED by the owner.** The
+  parent session's Codex stop review ran 03:01-03:04, overlapping r2-moff's bench window (03:02:29-03:04:32). That review
+  is now off. In the window load1 averaged 36.9 (`cpu.csv`; `summary.json` `load1_avg` 36.1), against 18.7-20.3 in r1 / r3
+  / r4-moff and 27.8 in the rerun. The nodes got less CPU: 357% vs 399-402% in the other M-off cells, and 2.89 native
+  blocks/s vs 3.42-3.49. **r2-moff-rerun (222,015) replaces it.** Both treatments are in the ratio table. With r2-moff
+  kept beside its rerun (n = 5), M off / G off is 1.876 [1.717, 2.042]. With only the 16 main-round cells (r2-moff in, no
+  reruns) it is 1.863 [1.642, 2.104], and without the localsearch cells 1.850 [1.456, 2.336] (G off n = 2, M off n = 3).
+  Every treatment is above 1.4x, including the lower CI bounds.
+* **The localsearch indexer ran 03:19-03:47** (about 0.25 core on average; now masked) during r2-goff, r3-mon, r3-gjoff,
+  r3-goff and r3-moff. Their values are inside the replicate spread and they are kept. Without them (owner treatment): M
+  off / G off 1.940 [1.905, 1.975], M on / G off 1.831 [1.716, 1.954], GJ off / G off 1.104 [1.081, 1.128], M off / GJ off
+  1.757 [1.718, 1.798] (table above; G off is then n = 2). **r3-moff is borderline: -4.0% vs r1-moff** (216,505 vs
+  225,609), with normal node CPU (400%) and the lowest load1 of the campaign (18.7). Its window began 03:45, near the
+  indexer's end.
+* **Load in the GJ reruns.** load1 was 28.0-38.3 in the four GJ reruns (04:14-04:41) and 24.1-28.9 in the main GJ cells.
+  No outside job is recorded for that time. load1 counts runnable threads, and GJ runs 6-9 native blocks/s with about 1.8x
+  G's submitted actions, so part of it is the arm's own. Unlike r2-moff, the GJ nodes were not short of CPU (403-427%, the
+  highest of any arm). r1-gjoff-rerun has the highest load (38.3) and the lowest GJ value (123,338). Without it, GJ off /
+  G off is 1.113 [1.094, 1.132] and M off / GJ off 1.735 [1.688, 1.783] (`writeup.txt`). With the 4 main-round GJ cells
+  only, GJ off / G off is 1.114 [1.073, 1.155].
+
+### 65.4 Confounds and what the allocator split shows
+
+* **Bench binaries differ.** G and GJ run the backported bench `a951801c` (old signing, `199bdc97`'s order format); M runs
+  `ff08433d` (main's bench). The old node cannot take main's signed orders and the reverse, so one bench for both arms is
+  not possible. The backport keeps the load shape (oracle-feed, in-flight cap and tail, budget, busy retry from main), but
+  the two binaries are not proven to generate identical streams.
+* **The action mix differs, partly as an outcome of node speed.** Place share 0.28 (G off) vs 0.61 (M off), and 0.19 on GJ
+  off. The bench is closed loop (in-flight cap 4 per sender, released on commit; open-order budget 900), so what it sends
+  next depends on what the node has committed. G off submits 22% more actions than M off (207,602 vs 170,573); 72% of the
+  actions it executes are cancel-alls (M off 39%), and M packs 1.9x the fills into a native block. The matched/s ratio is
+  the end-to-end result for this bench setup, not a node-only speed-up at a fixed action stream.
+* **GJ is a different workload again.** It ran 1.8x G's native blocks/s at 0.64x the fills per block and submitted 1.8x
+  G's actions. It is the only arm with nonce-expired evictions (5,179-7,767 per node per cell; in r1-gjoff the bench's
+  7,122 in-flight timeouts match the 7,122 evictions per node, about 2% of the actions submitted). It is not a pure
+  allocator swap at a fixed load.
+* **Allocator split (as the analyst noted).** LD_PRELOAD jemalloc on `199bdc97` gives +10.8% matched/s [+8.8, +12.8] but
+  no lower CPU per fill: CPU-s/1M 46.44 vs 46.55 (0.998 [0.973, 1.023]). Its nodes used 9% more CPU (415% vs 381%, 1.090
+  [1.070, 1.109]). The GJ gain is more node CPU in use, not cheaper fills. The CPU-per-fill saving of M (-44%; 0.559
+  [0.544, 0.574] vs GJ) is item 6's own. M off / GJ off, both on jemalloc, is 1.743 [1.695, 1.792].
+* **Marks cost about 5% of throughput** on M: M on / M off 0.951 [0.918, 0.984]. Block time p50 rises 74 -> 103 ms (1.378
+  [1.135, 1.694]), CPU-s/1M +2.7% (1.027 [0.998, 1.057]) and native blocks/s +11.8% at 16% fewer fills per block. There is
+  no G-on arm to compare against (the old node computes no marks).
+* **Memory.** M uses more RSS than G (mean 4.83 vs 3.00 GB per node, peak 6.26 vs 3.63), with jemalloc compiled in and
+  15 s checkpoints. GJ is below G (2.69 / 3.38). The item 6 RAM gate was settled in sections 61-62 (live heap); this campaign
+  does not change it.
+
+### 65.5 Verdict
+
+* **Gate 3 checkpoint: M off / G off 1.931 [1.877, 1.985]**, against the >= 1.4x target that the design sets for after all
+  phases. This checkpoint (Phases 1-3 + step 6, main `d3cba5e2`) is already 1.93x like for like. The lower CI bound is
+  above 1.4x in every treatment (lowest 1.456: the main-round cells only, without the localsearch cells, n = 2 vs 3). "As
+  shipped" (M with marks vs G, which never computed marks) is **1.835 [1.774, 1.898]**.
+* **Not node-only:** the bench binaries and the action mix differ between the arms (65.4). The ratio is end-to-end at this
+  bench setup.
+* **Allocator:** LD_PRELOAD jemalloc alone gives G about 1.11x matched/s, by using more CPU. The -44% CPU per
+  fill and 1.74x over GJ are item 6.
+* **Block time p99** (G off 2,043, M off 1,625, M on 1,645, GJ off 1,226 ms) is context only; the commit-interval p99
+  attribution is a separate follow-up analysis.
+* **Confidence: high** on the direction and on "above 1.4x" (n = 4 per arm, CV <= 2.2%, every treatment and sensitivity
+  above 1.4x at its lower CI bound). **Medium** on the exact ratio, because of the bench and mix confound.
+
+**Method.** The ratio is the ratio of arm means; the CI is a Welch t interval on the difference of mean log matched/s
+(unpaired: rotated balanced rounds, not ABBA pairs; the design asks for paired alternating cells, and here every round
+holds every arm in a rotated order). The secondary ratios in 65.2-65.4 use the same method on the per-cell values.
+
+Analysis (`tools/ozarchy-g3-tools/analyst/`; outputs in `ozarchy-g3-run/analyst/` on ozarchy):
+* `extract.py` (the analyst's per-cell extraction from each cell's `summary.json`, `agreement.jsonl`, state digests,
+  `node-environ-trie.txt`, `node-preload.txt`, `node-maps-jemalloc.txt`, `cpu.csv`, `mem-samples.txt`, `metrics-after-*`,
+  `buckets.csv` -> `cells.json`, stdout `extract.txt`), `stats.py` (ratios with Welch CIs in the three treatments, each
+  with and without the localsearch cells -> `stats.txt`) and `secondary.py` (per-arm secondary metrics, load per cell ->
+  `secondary.txt`). `writeup.py` (written for this section) adds the per-cell table, RSS in the sections 61-63 convention,
+  jemalloc GB, evictions, the Welch ratios of the secondary metrics and the r1-gjoff-rerun sensitivity (`writeup.txt`).
+* **Re-run check for this write-up:** the analyst saved the scripts and `cells.json` but no text outputs. `extract.py`,
+  run with its output redirected to a scratch dir, reproduces `cells.json` byte for byte. `stats.py` and `secondary.py`,
+  run on it, give `stats.txt` and `secondary.txt`. Those match the analyst's handoff numbers except for the units noted in
+  65.2 (RSS and jemalloc "GB" there are MiB / 1000). The archive smoke check (`meta/g3.toml`) runs `stats.py`,
+  `secondary.py` and `writeup.py` from the archived copy against the cells and matches `stats.txt`, `secondary.txt` and
+  `writeup.txt` byte for byte (3/3; fence check 131/131).
+* Driver `tools/ozarchy-g3-tools/ozarchy-g3-campaign.sh` with its generator `make-g3-driver.py`; md5s `md5s-all.txt`
+  (ozarchy-g3s0's `md5s.txt`); `analyst/a-cells.py` is section 60's copy from the tools dir, not run here. The run's
+  `matched-bench/` copy (= `d3cba5e2`'s) is not archived. The backport is on branch `bench/g3-base-199bdc97`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

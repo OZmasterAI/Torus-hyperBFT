@@ -1,0 +1,8 @@
+# 2026-10-13T23:28:27+02:00 ozarchy-g3s0 backport build: branch bench/g3-base-199bdc97 (worktree /home/oz/projects/wt/g3-bench-199bdc97, target /home/oz/.cargo-target-g3s0-199bdc97); base sha stays 199bdc97
+G 199bdc97 d6b05d8e7272b91360b342560f70acc4
+bG 22d3cc03f540ed61f5b6930d56834112db84b284 d6b05d8e7272b91360b342560f70acc4
+bench-bG 22d3cc03f540ed61f5b6930d56834112db84b284 a951801c582b025e0e1dab1d392c6be2
+# node md5 G == bG: EQUAL
+# 2026-10-14T00:22:05+02:00 ozarchy-g3s0 M arm build: d3cba5e2 (worktree /home/oz/projects/wt/g3s0-d3cba5e2, target /home/oz/.cargo-target-g3s0-d3cba5e2); jemalloc compiled in (default feature)
+M d3cba5e2 c2fda80ff5f31fe3c3ff67a34ca7f3bc
+bench-M d3cba5e2 ff08433d5ac92d3c78043bfdbcf69290
