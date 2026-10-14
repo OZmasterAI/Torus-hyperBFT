@@ -1951,6 +1951,32 @@ fn detect_parent_link_violation<B: StateBackend>(
     true
 }
 
+/// D12 nonce window: the parent block's time in ms, the cursor of the
+/// block's nonce-window prune (consensus data, not a node-local key). Height
+/// 1's parent is the synthetic genesis header (time 0). `Ok(None)`: the
+/// parent header row is absent or does not decode; the caller then scans from
+/// 0, which finds the same rows (after every block no row below its cutoff
+/// is left, so nothing lies below the parent's cutoff), only with more
+/// RocksDB tombstones to step over. `Err`: a read fault (the caller
+/// fail-stops).
+fn parent_block_ms<B: StateBackend>(
+    state: &B,
+    height: u64,
+) -> Result<Option<u64>, torus_state::StateError> {
+    if height <= 1 {
+        return Ok(Some(torus_types::eip712::block_timestamp_ms(
+            torus_bridge::genesis_parent_header().timestamp,
+        )));
+    }
+    let Some(row) = state.get_cf_raw(CF_BLOCK_HEADERS, &(height - 1).to_be_bytes())? else {
+        return Ok(None);
+    };
+    Ok(row
+        .get(32..)
+        .and_then(|json| serde_json::from_slice::<TorusBlockHeader>(json).ok())
+        .map(|parent| torus_types::eip712::block_timestamp_ms(parent.timestamp)))
+}
+
 /// A proposal's parent as this replica's block tree shows it (s84 decision 2).
 enum ParentHeader {
     /// The torus header at the front of the parent's datum.
@@ -2186,6 +2212,39 @@ impl ExecutionContext {
         BlockCommitter::commit_block_metadata(&self.state_db, block, receipts)
     }
 
+    /// D12 nonce window: the [`CF_NATIVE_NONCES`] keys this block deletes —
+    /// every live row with `parent_ms - 60 s <= nonce < block_ms - 60 s`, read
+    /// through `overlay` (the pipelined parent layer, L and C included).
+    /// Every block runs it, native phase or not; the deletes enter the
+    /// block's change set (and `h_n`) as tombstones.
+    ///
+    /// [`CF_NATIVE_NONCES`]: torus_state::cf::CF_NATIVE_NONCES
+    fn expired_nonces(
+        &self,
+        overlay: &NativeStateOverlay,
+        block: &TorusBlock,
+    ) -> Result<Vec<Vec<u8>>, torus_state::StateError> {
+        let height = block.header.height;
+        let block_ms = torus_types::eip712::block_timestamp_ms(block.header.timestamp);
+        let parent_ms = match parent_block_ms(overlay, height)? {
+            Some(ms) => ms,
+            None => {
+                tracing::warn!(
+                    height,
+                    "D12: parent header not readable — nonce-window prune scans from 0 \
+                     (same rows, more tombstones to step over)"
+                );
+                0
+            }
+        };
+        let expired = torus_state::nonce_window::expired_nonce_keys(overlay, parent_ms, block_ms)?;
+        #[cfg(test)]
+        self.test_nonce_prune
+            .lock()
+            .unwrap()
+            .push((height, expired.scanned, expired.keys.len()));
+        Ok(expired.keys)
+    }
 
     /// R02: a local storage fault on the replay-guard / session path. Latch
     /// the fail-stop: the caller returns, nothing of the block flushes, the
@@ -3193,6 +3252,24 @@ impl ExecutionContext {
             deferred,
             inflight,
         );
+        // D12 nonce window: the nonce rows this block's cutoff passes, deleted
+        // in the native phase below or, without one, riding the marker set.
+        // R02: a read fault is not "nothing expired" (other nodes delete
+        // them): fail-stop.
+        let expired_nonces = self.expired_nonces(&overlay, torus_block);
+        #[cfg(test)]
+        let expired_nonces = if self.test_replay_fault == Some(ReplayFault::NoncePrune) {
+            Err(injected_fault("nonce prune"))
+        } else {
+            expired_nonces
+        };
+        let expired_nonces = match expired_nonces {
+            Ok(keys) => keys,
+            Err(e) => {
+                self.fail_stop_on_fault(torus_block, fold_header, "nonce-window prune read", &e);
+                return;
+            }
+        };
         // C2: the ONE flag for "this block ran the native phase" (marker / books below).
         // Item 2 (C1): while submission rows exist the block-start oracle step is
         // due — read only when nothing else runs the native phase (review L1).
@@ -3230,6 +3307,15 @@ impl ExecutionContext {
             // session owner); `None` marks an invalid signature. Reused below so we
             // never recover the same action twice.
             overlay.set_hash_extras(hash_extras.take().unwrap_or_default());
+            // D12: no nonce this block can consume lies in the pruned range
+            // (the window check rejects anything below the cutoff), so the
+            // deletes and the nonce puts below never touch the same key.
+            for key in &expired_nonces {
+                if let Err(e) = overlay.delete_cf_raw(torus_state::cf::CF_NATIVE_NONCES, key) {
+                    self.fail_stop_on_fault(torus_block, fold_header, "nonce-window prune", &e);
+                    return;
+                }
+            }
             let verify_timer = std::time::Instant::now();
             // A8: header SECONDS -> the MILLISECONDS of session expiry and nonces.
             let block_ms = torus_types::eip712::block_timestamp_ms(torus_block.header.timestamp);
@@ -4316,6 +4402,7 @@ impl ExecutionContext {
                 // parent layer (design §2.1 step 10).
                 let pending = Arc::new(
                     torus_state::FrozenPending::marker_only(height)
+                        .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
@@ -4348,6 +4435,7 @@ impl ExecutionContext {
                 if !self.flush_marker_only(
                     prefix,
                     torus_state::FrozenPending::marker_only(height)
+                        .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 ) {
                     // As the native flush failure: the header did not land
@@ -27218,7 +27306,8 @@ mod crash_recovery_tests {
         blocks
     }
 
-    /// `(nonce, signer seed)` of every live nonce row, in key order.
+    /// `(nonce, signer seed)` of every live nonce row, sorted (key order is
+    /// nonce, then sender address, not seed).
     fn d12_rows(db: &StateDb) -> Vec<(u64, u8)> {
         let seeds: std::collections::HashMap<Address, u8> = [0xa1u8, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]
             .iter()
@@ -27231,6 +27320,8 @@ mod crash_recovery_tests {
                 let (nonce, sender) = torus_state::cf::native_nonce_key_parts(k).expect("28-byte key");
                 (nonce, seeds[&sender])
             })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
@@ -27317,12 +27408,12 @@ mod crash_recovery_tests {
         }
     }
 
-    /// One D12 run: the per-block write sets, the running hash and the full
-    /// dump. `on`: pipelined; `policy`: checkpoint interval (pipelined only).
-    fn d12_run(
-        on: bool,
-        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
-    ) -> (CapturedWrites, Option<(u64, [u8; 32])>, Vec<CfDump>) {
+    /// One D12 run: the per-block write sets, the running hash, the full dump.
+    type D12Run = (CapturedWrites, Option<(u64, [u8; 32])>, Vec<CfDump>);
+
+    /// One D12 run (see [`D12Run`]). `on`: pipelined; `policy`: checkpoint
+    /// interval (pipelined only).
+    fn d12_run(on: bool, policy: Option<crate::exec_pipeline::CheckpointPolicy>) -> D12Run {
         let (_c, db) = make_test_config_and_db();
         torus_state::running_hash::capture_begin(&db);
         let mut ctx = pipeline_ctx(&db, false, None);
@@ -27378,6 +27469,46 @@ mod crash_recovery_tests {
             assert_eq!(hash, run_hash, "{name}: running hash");
             assert_dumps_equal(&dump, &run_dump, &format!("{name} vs serial"));
         }
+    }
+
+    /// D12: a pipelined block's prune reads the parent layer. W is parked
+    /// inside block 9's job (D's row not durable yet) while block 10 runs:
+    /// its prune still finds D through pending(9) and deletes it.
+    #[test]
+    fn d12_pipelined_prune_reads_parent_layer() {
+        let (_c, db) = make_test_config_and_db();
+        let blocks = d12_blocks();
+        let gate = crate::exec_pipeline::WorkerGate::new();
+        let ctx = pipeline_ctx(&db, true, Some(gate.clone()));
+        for b in &blocks[..8] {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        gate.hold();
+        dispatch_and_execute(&ctx, &db, &blocks[8]); // native 9 -> W parked inside it
+        assert!(gate.wait_received(9));
+        let d_key = torus_state::cf::native_nonce_key(
+            &d12_claim(0xd4, 0).recover_sender().unwrap(),
+            2_200_000,
+        );
+        assert!(
+            db.get_cf_raw(torus_state::cf::CF_NATIVE_NONCES, &d_key).unwrap().is_none(),
+            "batch(9) not durable yet"
+        );
+        let (db_t, b10) = (db.clone(), blocks[9].clone());
+        let t = std::thread::spawn(move || {
+            dispatch_and_execute(&ctx, &db_t, &b10); // runs on pending(9); hand-off waits
+            ctx
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!t.is_finished(), "E waits at the hand-off of 10");
+        gate.release();
+        let ctx = t.join().unwrap();
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        let log = ctx.test_nonce_prune.lock().unwrap().clone();
+        assert_eq!(log.last().map(|(h, _, d)| (*h, *d)), Some((10, 1)), "10 deleted D");
+        drop(ctx);
+        assert_eq!(d12_rows(&db), d12_expected_rows(10));
     }
 
     /// D12 crash replay: blocks committed (header + body durable) but not

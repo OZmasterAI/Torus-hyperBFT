@@ -1092,6 +1092,23 @@ impl FrozenPending {
         self
     }
 
+    /// Add a tombstone for each of `keys` in `cf` (D12: the nonce-window
+    /// prune of a block without a native phase rides its marker-only set, so
+    /// it is flushed, hashed and layered like any delete). Panics on an
+    /// unregistered CF (a code bug, as in [`Self::marker_only`]).
+    pub fn with_deletes(mut self, cf: &str, keys: &[Vec<u8>]) -> Self {
+        if keys.is_empty() {
+            return self;
+        }
+        let id = intern_cf(cf).expect("with_deletes: CF is registered");
+        let cfp = self.state.cf_mut(id);
+        for key in keys {
+            cfp.writes.remove(key.as_slice());
+            cfp.deletes.insert(key.clone());
+        }
+        self
+    }
+
     /// Number of pending writes + tombstones in this set.
     pub fn entry_count(&self) -> usize {
         self.state

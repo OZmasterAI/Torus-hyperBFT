@@ -113,28 +113,32 @@ pub const CF_SLASH_RECORDS: &str = "cf_slash_records";
 pub const CF_JAIL_VOTES: &str = "cf_jail_votes";
 
 // Replay protection (FIX ECON-FIND-03)
-/// Consumed EIP-712 nonces. Key: sender(20) ++ nonce(8 BE). Value: block_height(8 BE).
+/// Consumed EIP-712 nonces still inside the nonce window (D12: every block
+/// deletes the rows its cutoff passes, `crate::nonce_window`). Key: nonce(8 BE)
+/// ++ sender(20), time-major. Value: block_height(8 BE).
 pub const CF_NATIVE_NONCES: &str = "cf_native_nonces";
 
-/// Build the [`CF_NATIVE_NONCES`] key for a `(sender, nonce)` pair: sender(20) ++ nonce(8 BE).
+/// Build the [`CF_NATIVE_NONCES`] key for a `(sender, nonce)` pair: nonce(8 BE) ++
+/// sender(20). Time-major (D12), so the rows a block's cutoff passes are one
+/// contiguous key range.
 ///
 /// Single source of truth for the replay-protection key layout. Used by the
-/// live-execution replay guard and nonce-write loop (torus-consensus app.rs) and the
-/// sync/catchup validator (torus-bridge validator.rs); keep them in lock-step via this
+/// live-execution replay guard, the nonce-write loop and the window prune
+/// (torus-consensus app.rs, `crate::nonce_window`); keep them in lock-step via this
 /// helper so the key format can never silently drift between read and write paths.
 pub fn native_nonce_key(sender: &alloy_primitives::Address, nonce: u64) -> [u8; 28] {
     let mut key = [0u8; 28];
-    key[..20].copy_from_slice(sender.as_slice());
-    key[20..28].copy_from_slice(&nonce.to_be_bytes());
+    key[..8].copy_from_slice(&nonce.to_be_bytes());
+    key[8..].copy_from_slice(sender.as_slice());
     key
 }
 
 /// Decode a [`CF_NATIVE_NONCES`] key back into `(nonce, sender)`; `None` if it is
 /// not 28 bytes.
 pub fn native_nonce_key_parts(key: &[u8]) -> Option<(u64, alloy_primitives::Address)> {
-    // RED stub (D12).
-    let _ = key;
-    None
+    let key: &[u8; 28] = key.try_into().ok()?;
+    let nonce = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
+    Some((nonce, alloy_primitives::Address::from_slice(&key[8..])))
 }
 
 /// Build the hot-oracle-signer reverse-index key in [`CF_NATIVE_ORACLE`]:

@@ -50,15 +50,34 @@ pub fn expired_nonce_keys<B: StateBackend>(
     parent_block_ms: u64,
     block_ms: u64,
 ) -> Result<ExpiredNonces, StateError> {
-    // RED stub (D12): the prune is not implemented yet.
-    let _ = (
-        state,
-        parent_block_ms,
-        block_ms,
-        NONCE_PRUNE_CHUNK,
-        CF_NATIVE_NONCES,
-    );
-    Ok(ExpiredNonces::default())
+    let from = nonce_cutoff_ms(parent_block_ms);
+    let to = nonce_cutoff_ms(block_ms);
+    let mut out = ExpiredNonces::default();
+    if from >= to {
+        return Ok(out);
+    }
+    // Keys are nonce(8 BE) ++ sender(20): a key is below `to` exactly when it
+    // sorts below the 8-byte prefix `to` (a key whose nonce equals `to` has
+    // that prefix and is longer, so it sorts above it).
+    let end = to.to_be_bytes();
+    let mut start = from.to_be_bytes().to_vec();
+    loop {
+        let rows = state.iterate_cf_from(CF_NATIVE_NONCES, &start, NONCE_PRUNE_CHUNK)?;
+        out.scanned += rows.len();
+        let full = rows.len() == NONCE_PRUNE_CHUNK;
+        for (key, _) in rows {
+            if key.as_slice() >= end.as_slice() {
+                return Ok(out);
+            }
+            out.keys.push(key);
+        }
+        if !full {
+            return Ok(out);
+        }
+        // The smallest key above the last one read.
+        start = out.keys.last().expect("a full chunk below the cutoff").clone();
+        start.push(0);
+    }
 }
 
 #[cfg(test)]
