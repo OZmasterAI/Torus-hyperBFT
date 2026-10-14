@@ -1282,6 +1282,35 @@ pub struct OrderBook {
     /// of [`Self::traders_present`] over all books) is kept from it. Never
     /// serialized, never read by matching, saving or hashing.
     new_traders: Vec<Address>,
+
+    // ---- s120: instance identity (in-RAM only) ----
+    /// Which in-memory book this is ([`Self::instance_id`]): unique per
+    /// construction, load and clone in this process; a move keeps it. The
+    /// executor compares it before and after lending `&mut OrderBook` out,
+    /// to see a book replaced or swapped whole (its logs then say nothing
+    /// about the indexes). Never serialized, hashed, or read by matching or
+    /// saving; differs between nodes and runs.
+    instance: BookInstance,
+}
+
+/// s120: see [`OrderBook::instance_id`]. `Clone` issues a fresh id, so a
+/// copy is never taken for the book it was copied from.
+struct BookInstance(u64);
+
+static NEXT_BOOK_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl BookInstance {
+    #[inline]
+    fn fresh() -> Self {
+        Self(NEXT_BOOK_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Clone for BookInstance {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::fresh()
+    }
 }
 
 /// s114: a book's `(trader, cloid) -> id` index ([`OrderBook::order_id_by_cloid`])
@@ -1354,7 +1383,19 @@ impl OrderBook {
             level_chunks: HashMap::default(),
             dirty_chunks: BTreeSet::new(),
             new_traders: Vec::new(),
+            instance: BookInstance::fresh(),
         }
+    }
+
+    /// s120: this in-memory book's identity: unique among the books built
+    /// ([`Self::new`]), loaded (borsh) or cloned in this process, kept
+    /// across moves. Two equal ids are the same book, so its logs hold
+    /// every change made to it since they were last drained. In-RAM only:
+    /// never serialized or hashed, differs between nodes; for bookkeeping
+    /// that must not affect state.
+    #[inline]
+    pub fn instance_id(&self) -> u64 {
+        self.instance.0
     }
 
     fn alloc_id(&mut self) -> OrderId {
@@ -4596,6 +4637,7 @@ impl BorshDeserialize for OrderBook {
             level_chunks: HashMap::default(),
             dirty_chunks: BTreeSet::new(),
             new_traders: Vec::new(),
+            instance: BookInstance::fresh(),
         };
 
         for _ in 0..order_count {
@@ -6243,6 +6285,28 @@ mod tests {
         assert_eq!(restored.get_order(1).unwrap().remaining_qty, fp(10));
         assert!(restored.get_order(3).is_some());
         assert_eq!(restored.get_order(3).unwrap().remaining_qty, fp(8));
+    }
+
+    /// s120: the instance id is per in-memory book: fresh on construction,
+    /// load and clone, kept by a move, and not in the serialized bytes.
+    #[test]
+    fn instance_id_is_per_book_and_not_serialized() {
+        let mut a = book();
+        let mut b = book();
+        a.place_order(limit_buy(fp(99), fp(8)), addr(3), 3);
+        b.place_order(limit_buy(fp(99), fp(8)), addr(3), 3);
+        assert_ne!(a.instance_id(), b.instance_id());
+        let bytes = borsh::to_vec(&a).unwrap();
+        assert_eq!(bytes, borsh::to_vec(&b).unwrap(), "the id is not serialized");
+        let loaded = OrderBook::try_from_slice(&bytes).unwrap();
+        assert_ne!(loaded.instance_id(), a.instance_id());
+        let copy = OrderBook::try_from_slice(&bytes).unwrap();
+        assert_ne!(copy.instance_id(), loaded.instance_id());
+        let ids = (a.instance_id(), b.instance_id());
+        std::mem::swap(&mut a, &mut b);
+        assert_eq!((b.instance_id(), a.instance_id()), ids, "a move keeps the id");
+        let held = BookInstance(7);
+        assert_ne!(held.clone().0, 7, "a clone gets a fresh id");
     }
 }
 

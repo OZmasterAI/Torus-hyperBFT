@@ -4369,9 +4369,14 @@ mod advance_untouched_toggle_tests {
 /// book; on drop, the book's logs (traders that rested or stored, cloids
 /// added or removed) are fed into the context's cancel-all and cloid
 /// indexes, so an order placed or cancelled straight on the book is seen by
-/// the next cancel-all and duplicate-cloid check.
+/// the next cancel-all and duplicate-cloid check. A book replaced or
+/// swapped whole through the `&mut` (its [`OrderBook::instance_id`]
+/// changed) drops both indexes instead (rebuilt from the books at next
+/// use): a loaded or copied book's logs do not describe its orders.
 pub struct OrderBookMut<'a> {
     market: MarketId,
+    /// The lent book's [`OrderBook::instance_id`].
+    lent: u64,
     book: &'a mut OrderBook,
     trader_markets: &'a mut Option<TraderMarkets>,
     cloid_markets: &'a mut Option<CloidMarkets>,
@@ -4394,9 +4399,37 @@ impl std::ops::DerefMut for OrderBookMut<'_> {
 
 impl Drop for OrderBookMut<'_> {
     fn drop(&mut self) {
-        TraderMarkets::absorb(self.trader_markets, self.book, self.market);
-        CloidMarkets::absorb(self.cloid_markets, self.book, self.market);
+        reconcile_lent_book(self.trader_markets, self.cloid_markets, self.book, self.market, self.lent);
     }
+}
+
+/// s120: `book` (market `market`) comes back from `&mut` lent out of the
+/// executor ([`NativeExecContext::order_book_mut`],
+/// [`NativeExecContext::for_each_order_book_mut`]); `lent` is the
+/// [`OrderBook::instance_id`] of the book that was lent.
+///
+/// - Same id: the same book, whatever was moved in and out meanwhile, and
+///   its logs hold every change made to it since the executor last drained
+///   them; they are fed into both indexes.
+/// - Another id: the slot holds another book (`mem::replace`, `mem::swap`,
+///   assignment) whose logs need not describe its orders (a load or copy
+///   has empty logs), and the lent book's entries are stale. Both indexes
+///   are dropped (the next use builds them from the books, as after a
+///   load); the logs are emptied.
+#[inline]
+fn reconcile_lent_book(
+    trader_markets: &mut Option<TraderMarkets>,
+    cloid_markets: &mut Option<CloidMarkets>,
+    book: &mut OrderBook,
+    market: MarketId,
+    lent: u64,
+) {
+    if book.instance_id() != lent {
+        *trader_markets = None;
+        *cloid_markets = None;
+    }
+    TraderMarkets::absorb(trader_markets, book, market);
+    CloidMarkets::absorb(cloid_markets, book, market);
 }
 
 pub struct NativeExecContext<T: StateBackend = StateDb> {
@@ -5267,26 +5300,29 @@ impl<T: StateBackend> NativeExecContext<T> {
 
     /// `market`'s book, mutable, for callers outside the executor (tests,
     /// tools). When the guard drops, what the caller rested, stored or
-    /// removed is fed into both indexes, as the executor's own sites do.
+    /// removed is fed into both indexes, as the executor's own sites do; a
+    /// book replaced or swapped whole drops both (rebuilt at next use).
     /// Does not mark the book dirty.
     #[inline]
     pub fn order_book_mut(&mut self, market: MarketId) -> Option<OrderBookMut<'_>> {
         let book = self.order_books.get_mut(&market)?;
         Some(OrderBookMut {
             market,
+            lent: book.instance_id(),
             book,
             trader_markets: &mut self.trader_markets,
             cloid_markets: &mut self.cloid_markets,
         })
     }
 
-    /// Run `f` on every book (any order), feeding both indexes after each
-    /// (as [`Self::order_book_mut`]). Does not mark books dirty.
+    /// Run `f` on every book (any order), feeding both indexes after each,
+    /// or dropping both for a book `f` replaced whole (as
+    /// [`Self::order_book_mut`]). Does not mark books dirty.
     pub fn for_each_order_book_mut(&mut self, mut f: impl FnMut(MarketId, &mut OrderBook)) {
         for (&market, book) in self.order_books.iter_mut() {
+            let lent = book.instance_id();
             f(market, book);
-            TraderMarkets::absorb(&mut self.trader_markets, book, market);
-            CloidMarkets::absorb(&mut self.cloid_markets, book, market);
+            reconcile_lent_book(&mut self.trader_markets, &mut self.cloid_markets, book, market, lent);
         }
     }
 
