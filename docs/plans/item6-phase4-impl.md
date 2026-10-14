@@ -325,6 +325,37 @@ stays only if its own A/B (counter upkeep netted) shows a gain; otherwise it is 
   Allocator: the one Phase 3 picks (glibc and jemalloc pairs if still open).
 - Report: matched/s, native blocks/s, `block_ms`, exec busy, engine ms per 1k fills, `end_resident` ms,
   rows and users bytes, RSS mean / peak / slope, CPU-s/1M, block time p99.
+- **Built (s120, branch `feat/item6-phase4-step6`, on step 4; ubench only).** `crates/torus-bridge/tests/ubench_users_rss.rs`.
+  Users: hashed addresses, light 2 / active 10 positions in distinct markets of 300 (1 in 10 Isolated), each with a
+  balance row and a `cvlm` row, built cold from raw rows the way R's rebuild does (`Users::build_maps`, through the
+  `#[doc(hidden)]` seam `native_executor::users_bench::UsersProbe`). Then every record gets a sums entry (step 3's
+  steady state: entries are never cleared). Allocator stats: the test binary has no jemalloc (only `torus-node` sets
+  it as `#[global_allocator]`), so a counting global allocator over `System` counts live bytes three ways: requested,
+  glibc (`malloc_usable_size` + 8 B header), jemalloc 5 size class (small classes <= 14 KiB; above that, the request
+  rounded up to whole pages; slab fragmentation not counted). Pass is judged on the jemalloc column with sums. The
+  ubench asserts only loose bounds (at least the positions' bytes, at most 4x the target, drop frees all). Non-ignored
+  checks in the same file: synthetic users are regular and round-trip byte for byte, the size-class table, the counter
+  sees a build and its drop.
+  Run: `cargo test -q --release -p torus-bridge --test ubench_users_rss -- --ignored --nocapture` (default sizes
+  `100000,1000000`; `UB_USERS=100000` for one size; ~330 s on 18c). Measured on 18c (B per user, jemalloc column,
+  no sums / with sums):
+
+  | shape | 100k | 1M | target |
+  |---|---|---|---|
+  | light (2 positions) | 534 / 726 | 627 / 819 | ~600: **over with sums** |
+  | active (10 positions) | 1,786 / 1,978 | 2,044 / 2,236 | ~2,300: ok |
+
+  Why light is over: the sums entry is one `Box<(u64, SumsResult)>` per user, 176 B (jemalloc class 192). The
+  section 1 budget is ~80 B per position, so 160 B for 2 positions. The record table (`HashMap<Address, UserState>`,
+  144 B per slot) runs at load 0.87 at 100k and 0.54 at 1M (just after a doubling), which adds ~100 B per user at 1M.
+  Logical row bytes: 371 (light), 1,483 (active). glibc column: light within ~15 B of jemalloc; active ~160 B lower
+  (a 10-position `Vec`, 1,120 B, is class 1,280 in jemalloc). Full table in the test output (`USERS_RSS` lines).
+- **Campaign: ready for archy.** Phase 4 head = `feat/item6-phase4-step4` @ `2a245321` (steps 1-4; the step 6
+  branch adds only the ubench and its unused seam) vs Phase 3 head = main @ `21d238e0` (last main before the step 1
+  merge `7487b764`; includes merge-wait `06611175`). Interval 15 s, Classic, standard 300-market shape, oracle on,
+  n = 4 ABBA, 120 s cells; plus 10-market cells and one 10 min soak pair; allocator jemalloc (the `torus-node`
+  default feature). Report as listed above. Step 5 (`feat/item6-phase4-step5` @ `becf5275`, on step 4) is on its own
+  branch: its A/B (step 5 vs step 4, counter upkeep netted) is a separate campaign, not part of this one.
 
 ## 5. Not building
 

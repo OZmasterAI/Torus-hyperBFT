@@ -204,8 +204,33 @@ fn fp(x: u64) -> FixedPoint {
 /// `cvlm` row: (positions CF, balances CF), as R holds them.
 #[allow(clippy::type_complexity)]
 fn synth(n: u64, k: usize) -> (BTreeMap<Vec<u8>, Vec<u8>>, BTreeMap<Vec<u8>, Vec<u8>>) {
-    let _ = (n, k, trader(0), markets(0, 0), fp(0));
-    (BTreeMap::new(), BTreeMap::new())
+    let (mut pos, mut bal) = (BTreeMap::new(), BTreeMap::new());
+    for i in 0..n {
+        let t = trader(i);
+        for (j, m) in markets(i, k).into_iter().enumerate() {
+            let h = splitmix(i.wrapping_mul(1_000).wrapping_add(j as u64));
+            let size = 1 + h % 1_000_000;
+            let price = 1_000 + (h >> 20) % 100_000;
+            let isolated = (h >> 40).is_multiple_of(10);
+            let p = Position {
+                trader: t,
+                market_id: m,
+                is_long: h & 1 == 0,
+                size: fp(size),
+                entry_price: fp(price),
+                cost_basis: fp(size * price),
+                realized_pnl: FixedPoint::from_raw(i128::from((h >> 8) % 10_000) - 5_000),
+                isolated_margin: if isolated { fp(size * price / 10) } else { FixedPoint::ZERO },
+                margin_type: if isolated { MarginType::Isolated } else { MarginType::Cross },
+            };
+            pos.insert(position_key(&t, m).to_vec(), borsh::to_vec(&p).expect("encode position"));
+        }
+        let h = splitmix(i ^ 0xBA1A);
+        let b = NativeBalance { available: fp(h % 1_000_000_000), order_margin: fp((h >> 32) % 1_000_000) };
+        bal.insert(t.to_vec(), borsh::to_vec(&b).expect("encode balance"));
+        bal.insert(cum_volume_key(&t).to_vec(), fp(1 + (h >> 16) % 1_000_000_000).raw().to_be_bytes().to_vec());
+    }
+    (pos, bal)
 }
 
 /// Check that `p` holds the users of `synth(n, k)`, all regular.
