@@ -4,6 +4,9 @@
 set -euo pipefail
 D=$(cd "$1" && pwd); T=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 j() { jq -r "$@" "$D/summary.json"; }
+# run-cell.sh adds .oracle_feed AFTER summarize.py (feed stats, marks at bench
+# end): keep it across the rebuild.
+FEED=$(jq -c '.oracle_feed // empty' "$D/summary.json")
 python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .worktree)" --commit "$(j .commit)" \
   --dirty "$(j .dirty_files)" --markets "$(j .cell.markets)" --dur "$(j .cell.duration_s)" --rate "$(j .cell.rate_total)" \
   --senders "$(j .cell.senders)" --t-bench0 "$(j .timing.t_bench0)" --t-bench1 "$(j .timing.t_bench1)" \
@@ -25,3 +28,7 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
   --digest-quiescent "$(j 'if .agreement.state_digest_quiescent == false then "0" else "1" end')" \
   --digest-secs "$(j '(.agreement.state_digest_seconds_per_node // [])|map(tostring)|join(" ")')" \
   --digest-heights "$(j '(.agreement.state_digest_heights // [])|map(tostring)|join(" ")')"
+if [ -n "$FEED" ]; then
+  jq --argjson o "$FEED" '.oracle_feed = $o' "$D/summary.json" > "$D/summary.json.tmp"
+  mv "$D/summary.json.tmp" "$D/summary.json"
+fi
