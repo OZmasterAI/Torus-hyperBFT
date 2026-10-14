@@ -3331,6 +3331,177 @@ class LiqStressHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
+    # Codex P2 (62898e32): under TOOLS_FROM_WORKTREE=1 an older worktree's
+    # digest-node.sh silently ignores the 7th argument (the position accounts),
+    # so a stress cell would report agreement without having digested a single
+    # protocol position. Pre-flight therefore also asks the selected digest
+    # script for its capabilities (`digest-node.sh --capabilities` must list
+    # `position-accounts`); an older one only prints its usage and exits 2.
+    NEW_SUMMARIZER = (
+        "import argparse\nap = argparse.ArgumentParser()\n"
+        "for a in ['out', 'label', 'in-flight-tail', 'liq-thin', 'liq-thin-avail']:\n"
+        "    ap.add_argument('--' + a, default='')\nap.parse_args()\n"
+    )
+
+    def _tools(self, root, name, digest):
+        """<root>/<name>/{summarize.py (new), digest-node.sh} -> the dir and
+        the marker file the digest stub touches whenever it is invoked."""
+        d = os.path.join(root, name)
+        os.makedirs(d)
+        with open(os.path.join(d, "summarize.py"), "w") as f:
+            f.write(self.NEW_SUMMARIZER)
+        marker = os.path.join(d, "digest-called")
+        dig = os.path.join(d, "digest-node.sh")
+        if digest == "new":
+            shutil.copy2(DIGEST_SH, dig)
+        else:
+            body = {
+                # The pre-62898e32 script: fewer than 4 arguments -> usage, rc 2.
+                "old": "[ $# -ge 4 ] || { echo 'usage: digest-node.sh <rpc-url> ...' >&2; exit 2; }\n",
+                # The sandbox stub: rc 0 but no capability listed.
+                "noop": "exit 0\n",
+                "other": "echo 'some-other-capability'\n",
+            }[digest]
+            with open(dig, "w") as f:
+                f.write("#!/bin/sh\ntouch '%s'\n%s" % (marker, body))
+            os.chmod(dig, 0o755)
+        return d, marker
+
+    def _preflight(self, tools_dir, **env):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        i = self.src.index("summarizer_has_liq_opts() {")
+        j = self.src.index("SUMMARIZE_LIQ_ARGS=()", i)
+        block = self.src[i : self.src.index("\nfi\n", j) + 4]
+        script = (
+            "TOOLS_DIR=%s\nTOOLS_FROM_WORKTREE=1\n" % tools_dir
+            + on
+            + block
+            + 'echo "args=${SUMMARIZE_LIQ_ARGS[*]-} pos=${DIGEST_HAS_POS-unset}"\n'
+        )
+        return self._run(script, **env)
+
+    def test_real_digest_script_lists_position_accounts(self):
+        r = subprocess.run(
+            [DIGEST_SH, "--capabilities"], capture_output=True, text=True, timeout=10
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("position-accounts", r.stdout.split("\n"))
+
+    def test_stress_cell_needs_a_digest_script_that_covers_positions(self):
+        tmp = tempfile.mkdtemp(prefix="liq-digcap-")
+        try:
+            off = dict(LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="0")
+            thin = dict(LIQ_THIN="5", LIQ_THIN_AVAIL="2.5", ORACLE_SHOCK_BP="0")
+            shock = dict(
+                LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="400"
+            )
+            for kind in ("old", "noop", "other"):
+                d, marker = self._tools(tmp, kind, kind)
+                # Stress cell + digest script without the capability: FATAL rc 1.
+                for env in (thin, shock):
+                    r = self._preflight(d, **env)
+                    self.assertEqual(r.returncode, 1, (kind, env, r.stdout, r.stderr))
+                    self.assertIn("FATAL", r.stderr)
+                    self.assertIn(os.path.join(d, "digest-node.sh"), r.stderr)
+                    self.assertIn("position", r.stderr)
+                    self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr)
+                # Normal cell: unchanged, the digest script is not even asked.
+                os.path.exists(marker) and os.unlink(marker)
+                r = self._preflight(d, **off)
+                self.assertEqual(
+                    (r.returncode, r.stdout), (0, "args= pos=0\n"), (kind, r.stderr)
+                )
+                self.assertFalse(os.path.exists(marker), kind)
+            # A digest script that covers positions: accepted, both cell kinds.
+            d, _ = self._tools(tmp, "new", "new")
+            r = self._preflight(d, **thin)
+            self.assertEqual(
+                (r.returncode, r.stdout),
+                (0, "args=--liq-thin 5 --liq-thin-avail 2.5 pos=1\n"),
+                r.stderr,
+            )
+            r = self._preflight(d, **shock)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(r.stdout.endswith(" pos=1\n"), r.stdout)
+            r = self._preflight(d, **off)
+            self.assertEqual((r.returncode, r.stdout), (0, "args= pos=0\n"), r.stderr)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_digest_capability_checked_before_launch(self):
+        at = self.src.index("digest_has_position_accounts ||")
+        self.assertLess(self.src.index('[ -x "$TOOLS_DIR/digest-node.sh" ]'), at)
+        self.assertLess(at, self.src.index('mkdir -p "$OUT"'))
+
+    def test_stress_cell_with_an_older_worktree_digest_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="liq-olddig-")
+        try:
+            fake_target(
+                tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>"
+            )
+            script, wt = sandbox_repo(tmp)
+            tools = os.path.join(wt, "tools", "matched-bench")
+            # A summarizer that passes its own check, so only the digest
+            # script (the sandbox stub: no capabilities) can refuse the cell.
+            with open(os.path.join(tools, "summarize.py"), "w") as f:
+                f.write(self.NEW_SUMMARIZER)
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith(("LIQ_", "ORACLE_", "TOOLS_"))
+            }
+            for env in (
+                dict(LIQ_THIN="5", SENDERS="5"),
+                dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="30"),
+            ):
+                r = subprocess.run(
+                    [script, wt, "liq-olddig-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        base,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
+                    ),
+                )
+                self.assertEqual(r.returncode, 1, (env, r.stdout, r.stderr))
+                self.assertIn(os.path.join(tools, "digest-node.sh"), r.stderr, env)
+                self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr, env)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "liq-olddig-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_digest_log_claims_positions_only_when_covered(self):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        block = self.fn("DIG_POS=()\nif liq_stress_on; then", "\nfi\n")
+        tmp = tempfile.mkdtemp(prefix="liq-diglog-")
+        try:
+            script = (
+                'log() { echo "$*" >&2; }\nLIQUIDATOR_VAULT=0x1\nADL_ESCROW_LONG=0x2\n'
+                "ADL_ESCROW_SHORT=0x3\nMARKETS=4\nOUT=%s\n" % tmp
+                + on
+                + block
+            )
+            stress = dict(LIQ_THIN="5", ORACLE_SHOCK_BP="0")
+            r = self._run(script, DIGEST_HAS_POS="1", **stress)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("positions in all 4 markets", r.stderr)
+            for has in ("0", ""):
+                r = self._run(script, DIGEST_HAS_POS=has, **stress)
+                self.assertNotIn("positions in all", r.stderr, has)
+                self.assertIn("NOT", r.stderr, has)
+            r = self._run(script, DIGEST_HAS_POS="1", LIQ_THIN="0", ORACLE_SHOCK_BP="0")
+            self.assertEqual((r.returncode, r.stderr), (0, ""))
+        finally:
+            shutil.rmtree(tmp)
+
     def test_summary_records_liq_thin(self):
         d = tempfile.mkdtemp(prefix="liq-sum-")
         try:
