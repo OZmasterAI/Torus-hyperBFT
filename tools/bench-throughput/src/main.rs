@@ -1637,7 +1637,7 @@ fn run_matching_engine_on<T: torus_state::StateBackend>(
 
     // Sender pool (0 = legacy unique-address-per-order).
     let sender_pool: Vec<Address> = (0..senders).map(|_| random_address(&mut rng)).collect();
-    let mut pick_sender = {
+    let pick_sender = {
         let pool = sender_pool.clone();
         move |rng: &mut rand::rngs::ThreadRng| -> Address {
             if pool.is_empty() {
