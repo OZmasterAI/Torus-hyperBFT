@@ -72,4 +72,5 @@ Phase gate: Gate 3, >= 1.4x today's main matched/s at 300 markets; 1M-account /
 ## After Phase 5 (separate plans)
 
 - D: sequential second pass for margin-cut takers (design section 3.6), golden A re-pin.
-- L3 + D12 at one fresh genesis (owner decision).
+- L3 at the public testnet genesis with R20 (owner decision). D12 moved earlier (owner s119): built after Phase 4's
+  gate campaign (step 6) and before Phase 5 step 0; see `item6-phase4-impl.md` after step 6.

@@ -260,6 +260,11 @@ stays only if its own A/B (counter upkeep netted) shows a gain; otherwise it is 
 - Report: matched/s, native blocks/s, `block_ms`, exec busy, engine ms per 1k fills, `end_resident` ms,
   rows and users bytes, RSS mean / peak / slope, CPU-s/1M, block time p99.
 
+**After step 6 (owner s119): D12** (nonce window, design doc D12; not item 6). It lands between this gate campaign
+and Phase 5 step 0, so neither phase's A/B carries its cost (one delete per action): Phase 4's gate is measured
+without it, Phase 5's baseline includes it. No testnet or long-running devnet exists, so landing it on main needs no
+reset. R20 (chain id) and L3 stay at the testnet genesis.
+
 ## 5. Not building
 
 - Per-trader rows on disk or in the hash (D4 b; fresh genesis, with D12 / L3 if ever).

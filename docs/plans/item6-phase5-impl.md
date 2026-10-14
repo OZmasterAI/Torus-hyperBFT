@@ -159,7 +159,9 @@ Before every commit: `cargo nextest run --workspace $F` and the doc-test command
 
 ### Step 0: re-profile (archy, measurement only, no code)
 
-On the Phase 4 head, 300 markets uniform, oracle on and off, interval 15 s, perf on val1 (section 64's sidecar). Measure
+Precondition (owner s119): D12 is on main (built after Phase 4 step 6), so this baseline includes its cost.
+
+On the Phase 4 head + D12, 300 markets uniform, oracle on and off, interval 15 s, perf on val1 (section 64's sidecar). Measure
 the exec-thread share and ms per native block of:
 - overlay writes to the two typed CFs: `put_cf_raw` / `put_cf_raw_owned` / `delete_cf_raw` incl. the lock, the key and
   value copies and the `BTreeMap` insert, plus the callers' Borsh encode;
@@ -333,8 +335,9 @@ roll back one at a time; no data migration.
    (b) D12 b at a fresh genesis before Phase 5 (bundle with L3), then a typed live-nonce set.
    (c) Keep all nonces but hold the consumed set in memory (RAM grows with every action ever; section 4 rejects it).
    Recommendation: a. `replay_guard` was 2.8 ms per native block (section 59.3); D12 stays a genesis item.
-   **Decided: a** (owner s119). D12 b moves out of Phase 5 into the public testnet genesis bundle with R20 (new
-   chain id) and L3. Rationale: since s94 execution already drops nonces older than block time - 60 s
+   **Decided: a** (owner s119): Phase 5 keeps nonce rows raw, no typed nonce set. D12 b itself is built before
+   this phase, after Phase 4 step 6 (see step 0), so the rows Phase 5 sees are already windowed. Rationale for not
+   typing them: since s94 execution already drops nonces older than block time - 60 s
    (`check_nonce_window`, `torus-types/src/eip712.rs`), so older nonce rows only grow state; that is a state-size
    item for a long-lived chain, not a Phase 5 throughput item.
 3. **Cold writers to the typed CFs.**

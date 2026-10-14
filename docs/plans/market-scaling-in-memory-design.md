@@ -932,8 +932,9 @@ D12. Nonce rows (one row per action forever, `app.rs:2140-2147`, `cf.rs:93-98`).
 - b) Windowed set: drop nonces older than block time - 60 s at execution;
   consensus rule + hash change, fresh genesis (HL-like).
 - Recommendation: b, before Phase 5.
-- **Owner s119: b, at the public testnet genesis** (bundled with R20, the new chain id, and L3; no code
-  overlap with either, they share one genesis regeneration, one testnet reset and one `h_n` release note).
+- **Owner s119: b, built after Phase 4's gate campaign (step 6) and before Phase 5 step 0**, so neither phase's
+  A/B carries its cost. No testnet or long-running devnet exists, so it needs no reset. R20 (new chain id) and L3
+  stay at the testnet genesis; no code overlap with either.
   Sizing (read-only check on main `7487b764`): S-M. Only execution touches the CF (read after
   `check_nonce_window`, write per action, key helper `native_nonce_key` in `cf.rs`); no mempool, RPC, EVM or
   genesis reader; snapshots copy the whole DB. Nonces are not in the header state root, only in `h_n`
@@ -992,7 +993,7 @@ D16. Rollout.
 | D9 | a: out-of-band distribution first |
 | D10 | a: RPC reads from a block-consistent memory view |
 | D11 | a: EVM state stays in RocksDB; EVM blocks force a checkpoint |
-| D12 | b: drop nonces older than block time - 60 s (consensus rule + hash change; fresh genesis); owner s119: at the public testnet genesis, bundled with R20 (new chain id) and L3, not before Phase 5 |
+| D12 | b: drop nonces older than block time - 60 s (consensus rule + hash change; fresh genesis); owner s119: built after Phase 4 step 6, before Phase 5 step 0 (no testnet or long-running devnet to reset); R20 and L3 stay at the testnet genesis |
 | D13 | a: keep packed trade-history rows + retention pruning. Hourly files would need a separate indexer, and validators run `TORUS_TRADE_HISTORY=0`, so neither option touches chain throughput |
 | D14 | b: 64 GB per testnet validator + a resting-order cap sized at ~400 B/order. The devnet needs no separate target (one 94 GB host for 3 nodes, ~30 GB each; ~5 GB/node used today) |
 | D15 | b: relative gates per phase, HL parity as end goal. "No regression at 10 markets" means extra 10-market cells in the SAME campaign (phase vs main), next to the primary 300-market cells, never against old benches |
