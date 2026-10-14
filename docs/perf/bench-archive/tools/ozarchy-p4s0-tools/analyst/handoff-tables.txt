@@ -1,0 +1,11 @@
+# per cell (cells.tsv index + summary.json headline, read-only): label rc agree md5_ok matched_s_avg native_blk_s validity agreement
+ozarchy-p4s0-300m-w0 0 yes yes 216548.2 4.906 ACCEPT AGREE
+ozarchy-p4s0-300m-p1-mperf 0 yes yes 213357.3 4.138 ACCEPT AGREE
+ozarchy-p4s0-300m-p2-mperf 0 yes yes 214408.6 4.385 ACCEPT AGREE
+ozarchy-p4s0-300m-u1-m 0 yes yes 216559.6 4.26 ACCEPT AGREE
+ozarchy-p4s0-300m-u2-m 0 yes yes 216974.3 4.163 ACCEPT AGREE
+ozarchy-p4s0-300m-k1-m 0 yes yes 220066.2 2.97 ACCEPT AGREE
+# per arm (matched/s from the cells.tsv metric column)
+arm m SAT u1,u2: mean 216767.0, spread 414.7 (u2-u1 +414.7); w0 warm-up 216548.2; k1 600 s soak 220066.2
+arm mperf (perf sidecar on val1) p1,p2: mean 213883.0, spread 1051.3 (p2-p1 +1051.3)
+# CELL-FLAG lines in campaign.log: 0

@@ -145,6 +145,14 @@ On the Phase 3 head (step 2 + merge-wait), 300 markets uniform, oracle on, inter
 **Stop rule:** if the items Phase 4 removes are below ~2% of exec-thread time, the throughput gate is
 about 0. The owner then decides: build Phase 4 now as Phase 5's base, or fold it into Phase 5.
 
+**Measured (campaign ozarchy-p4s0, results doc section 64, plan row 72; main `d3cba5e2`, 2026-10-14).** % of exec-thread
+wall, mean of 2 perf cells: R reads of the two CFs 2.43 (exec thread 1.21 + settle-pool `PositionCache` misses the exec
+thread waits on 1.21), memo lock + `Arc<OnceLock>` 0.18, `open_order_counts` 1.45 (3.5 ms per native block); sum 4.06,
+2.61 without `open_order_counts`, gross (the typed replacements' cost is not netted). Load misses: no counter in the build;
+`BalanceCache::load` miss path 0.29%. `end_resident` rows 13.3 / positions 10.0 ms per native block on the worker, exec
+wait 2.1 ms; `exec_resident_rows_bytes` 214 MB. **Above ~2%: Phase 4 goes ahead; the margin is thin** (2.43% for R reads
+alone, since the memo stays under decision 4 a). Decision 2's number for the owner: 1.45% / 3.5 ms per native block.
+
 ### Step 1: `Users` record set next to raw R
 
 Raw R still serves every read. The new record set only replaces `TraderPositions` and is checked against R.

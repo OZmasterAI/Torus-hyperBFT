@@ -1,0 +1,19 @@
+item (% of exec-thread wall, W1)                                    p1      p2    mean
+wall_ms_per_native_block                                        246.59  242.14  244.36
+exec_oncpu_ms_per_block                                         187.94  188.05  187.99
+R_reads_exec_thread                                               1.12    1.31    1.21
+R_reads_pool_settle_PositionCache_misses                          1.15    1.28    1.21
+R_reads_total                                                     2.27    2.58    2.43
+  of which BalanceCache::load miss (exec)                         0.29    0.30    0.29
+memo_lock_OnceLock                                                0.16    0.21    0.18
+open_order_counts                                                 1.41    1.48    1.45
+open_order_counts_ms_per_block                                    3.48    3.59    3.54
+end_resident_wait_exec (upper, raw apply share)                   0.79    0.92    0.85
+SUM strict (R+memo+ooc)                                           3.84    4.27    4.06
+SUM without open_order_counts                                     2.43    2.79    2.61
+SUM upper (+end_resident_wait +resident_changes R get/clone)      5.30    5.88    5.59
+end_resident_rows_ms_per_block (worker)                          13.01   13.68   13.34
+end_resident_positions_ms_per_block (worker)                      9.81   10.11    9.96
+end_resident_wait_ms_per_block                                    1.95    2.23    2.09
+exec_oncpu_share_strict_W1 (%% of exec samples)                   3.53    3.86    3.69
+exec_oncpu_share_strict_W2cycles                                  3.90    3.61    3.76

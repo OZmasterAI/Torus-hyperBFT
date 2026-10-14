@@ -1,0 +1,62 @@
+== u1-m: native blocks 405, p50 313 ms, p99 581 ms, above-p99 5; ckpt intervals 92 compactions 42 flushes 118 median matched/s 219426
+feature                  rate_all rate_top  mean_ms(cap400) with/without
+epoch_nonpipelined          0.01    0.00      337 /    342  (n=2)
+ramp_first8s                0.03    0.80      563 /    335  (n=10)
+settle_wait_gt25ms          0.01    0.20      469 /    340  (n=5)
+ckpt_write_inflight         0.30    0.00      306 /    352  (n=72)
+end_res_wait_gt64ms         0.00    0.00      nan /    342  (n=0)
+compaction_overlap          0.32    0.40      324 /    348  (n=87)
+flush_overlap               0.22    0.20      376 /    332  (n=69)
+rocksdb_stall               0.00    0.00      nan /    342  (n=0)
+prev_oracle_only            0.06    0.00      302 /    342  (n=5)
+fills_burst_gt1.2med        0.57    0.00      331 /    362  (n=216)
+  h=439 t+  4.1s  581ms nc=400 pipe=1 : ramp_first8s,compaction_overlap
+  h=440 t+  4.7s  615ms nc=400 pipe=1 : ramp_first8s
+  h=441 t+  5.3s  629ms nc=400 pipe=1 : ramp_first8s
+  h=442 t+  6.0s  608ms nc=400 pipe=1 : ramp_first8s,flush_overlap
+  h=463 t+ 14.4s  648ms nc=400 pipe=1 : settle_wait_gt25ms,compaction_overlap
+== u2-m: native blocks 397, p50 312 ms, p99 596 ms, above-p99 4; ckpt intervals 92 compactions 44 flushes 119 median matched/s 231358
+feature                  rate_all rate_top  mean_ms(cap400) with/without
+epoch_nonpipelined          0.01    0.00      451 /    338  (n=3)
+ramp_first8s                0.04    0.50      531 /    332  (n=11)
+settle_wait_gt25ms          0.00    0.00      nan /    339  (n=0)
+ckpt_write_inflight         0.27    0.50      334 /    341  (n=93)
+end_res_wait_gt64ms         0.00    0.00      nan /    339  (n=0)
+compaction_overlap          0.37    0.25      276 /    364  (n=93)
+flush_overlap               0.18    0.25      390 /    326  (n=64)
+rocksdb_stall               0.00    0.00      nan /    339  (n=0)
+prev_oracle_only            0.04    0.00      297 /    340  (n=7)
+fills_burst_gt1.2med        0.28    0.25      342 /    337  (n=105)
+  h=410 t+  3.1s  596ms nc=400 pipe=1 : ramp_first8s,flush_overlap
+  h=412 t+  4.3s  623ms nc=400 pipe=1 : ramp_first8s,compaction_overlap
+  h=436 t+ 14.0s  733ms nc=400 pipe=1 : ckpt_write_inflight,fills_burst_gt1.2med
+  h=681 t+ 58.1s  627ms nc=400 pipe=1 : ckpt_write_inflight
+== k1-m: native blocks 1681, p50 355 ms, p99 585 ms, above-p99 17; ckpt intervals 324 compactions 197 flushes 489 median matched/s 221008
+feature                  rate_all rate_top  mean_ms(cap400) with/without
+epoch_nonpipelined          0.01    0.29      538 /    358  (n=16)
+ramp_first8s                0.01    0.18      519 /    359  (n=12)
+settle_wait_gt25ms          0.11    0.06      370 /    358  (n=191)
+ckpt_write_inflight         0.24    0.65      372 /    356  (n=375)
+end_res_wait_gt64ms         0.00    0.00      nan /    360  (n=0)
+compaction_overlap          0.33    0.35      370 /    355  (n=524)
+flush_overlap               0.19    0.53      394 /    352  (n=310)
+rocksdb_stall               0.00    0.00      nan /    360  (n=0)
+prev_oracle_only            0.01    0.00      332 /    360  (n=5)
+fills_burst_gt1.2med        0.62    0.35      363 /    355  (n=1027)
+  h=409 t+  3.3s  647ms nc=400 pipe=1 : ramp_first8s,flush_overlap
+  h=412 t+  5.0s  655ms nc=400 pipe=1 : ramp_first8s,compaction_overlap
+  h=413 t+  5.7s  637ms nc=400 pipe=1 : ramp_first8s
+  h=436 t+ 14.3s  670ms nc=400 pipe=1 : ckpt_write_inflight,fills_burst_gt1.2med
+  h=600 t+ 43.6s  617ms nc=400 pipe=0 : epoch_nonpipelined,ckpt_write_inflight,flush_overlap
+  h=677 t+ 59.4s  588ms nc=400 pipe=1 : ckpt_write_inflight
+  h=745 t+ 75.8s  614ms nc=400 pipe=1 : compaction_overlap,fills_burst_gt1.2med
+  h=746 t+ 76.4s  600ms nc=400 pipe=1 : compaction_overlap
+  h=749 t+ 78.0s  598ms nc=400 pipe=1 : flush_overlap
+  h=1000 t+161.6s  676ms nc=400 pipe=0 : epoch_nonpipelined,ckpt_write_inflight,flush_overlap
+  h=1500 t+346.8s  593ms nc=400 pipe=0 : epoch_nonpipelined,ckpt_write_inflight,compaction_overlap,flush_overlap,fills_burst_gt1.2med
+  h=1547 t+363.5s  585ms nc=400 pipe=1 : ckpt_write_inflight,fills_burst_gt1.2med
+  h=1700 t+421.5s  614ms nc=400 pipe=0 : epoch_nonpipelined,settle_wait_gt25ms,ckpt_write_inflight,flush_overlap,fills_burst_gt1.2med
+  h=1847 t+475.0s  634ms nc=400 pipe=1 : ckpt_write_inflight,fills_burst_gt1.2med
+  h=1900 t+496.0s  628ms nc=400 pipe=0 : epoch_nonpipelined,ckpt_write_inflight,flush_overlap
+  h=2087 t+564.3s  609ms nc=400 pipe=1 : ckpt_write_inflight,compaction_overlap,flush_overlap
+  h=2088 t+564.9s  597ms nc=400 pipe=1 : ckpt_write_inflight,compaction_overlap,flush_overlap

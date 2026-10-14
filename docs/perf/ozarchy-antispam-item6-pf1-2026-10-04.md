@@ -8550,6 +8550,200 @@ the perf script dumps (Tier A on ozarchy), and the run's `matched-bench/` copy (
 `tools/ozarchy-p3cloidec-tools/ozarchy-p3cloidec-campaign.sh`, build script `ozarchy-p3cloidec-build.sh`, sidecar
 `cloidprof-sidecar.sh`, md5s `md5s-all.txt`.
 
+## 64. Phase 4 step 0 re-profile and exec-time p99 causes on main `d3cba5e2` (jemalloc compiled in, 15 s checkpoints, oracle on), 300 markets, commit-tail mode (campaign ozarchy-p4s0, 2026-10-14)
+
+**The step 0 items cost about 4% of exec-thread wall time (sum 4.06%; p1 3.84, p2 4.27): above the plan's ~2% stop
+rule, so Phase 4 goes ahead as planned.** The margin is thin, and most of it depends on what is counted:
+* `open_order_counts` (step 5) is 1.45% (3.5 ms per native block). Without it the sum is 2.61%.
+* The `BlockSums` memo lock and `Arc<OnceLock>` are 0.18%. That is too small for decision 4 (b), so (a) stands and the memo
+  stays: this 0.18% is not removed by Phase 4. R reads plus `open_order_counts` = 3.88%; R reads alone = 2.43%
+  (p1 2.27).
+* Half of the R-read share (1.21 of 2.43%) is a wall-equivalent estimate: misses on the settle pool's `PositionCache`
+  (`update_in_place` -> `PositionManager::get_position` -> overlay `get_cf_raw`) that the exec thread waits on. The exec
+  thread's own R reads are 1.21%.
+* All of these are gross costs. The cost of the typed replacements (step 4's typed loads, step 5's counter upkeep per rest,
+  cancel, fill and stop) is not measured and not netted.
+
+Confidence medium (n = 2 profiled cells, val1 only, user space).
+
+**Exec time per native block, p99 on val1: 581 / 596 ms SAT (u1 / u2), 585 ms in the 600 s soak (k1);** p50 313 / 312 /
+355 ms. Of the 9 SAT blocks above p99, 6 are in the arrival / fill burst 3-6 s after bench start, 2 are at the first
+checkpoint (~14 s) and 1 is unexplained. Of the 17 soak blocks: 5 epoch-boundary blocks (height % 100 = 0, not pipelined), 4
+with a checkpoint write in flight, 3 in the start burst, 3 in a fill burst at ~76 s, 2 unexplained. No cell had a RocksDB
+write stall. **This is exec time per native block, not section 61's block time (commit interval).** Section 61's block-time
+p99 rose +17.7% SAT and +23.1% soak on Phase 3 (p50 -32.7% / -13.6%); its exec p99 per native block was 590 SAT / 570 soak ms
+on s2, close to this campaign's 581-596 / 585. The block-time p99 rise is not decomposed here.
+
+Requested by 18c (owner change of plan: Phase 4 step 0 before Gate 3), per `docs/plans/item6-phase4-impl.md` step 0: on the
+Phase 3 head, 300 markets uniform, oracle on, 15 s interval, measure the exec-thread share of what Phase 4 removes. One
+binary, two cell kinds:
+* **m** = main `d3cba5e2` (Phase 3 step 2 + merge-wait + step 6), node `c2fda80f` (build id `5c8e43a2`), bench `ff08433d`.
+  Built by ozarchy-g3s0's build (`ozarchy-g3s0-build/build-m.sh`, target `/home/oz/.cargo-target-g3s0-d3cba5e2`;
+  `RUSTFLAGS=-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`,
+  release). Staged in `ozarchy-g3s0-stage/m-run` (shared with Gate 3, not rebuilt; md5s in `ozarchy-g3s0-build/md5s.txt`,
+  line `M`). jemalloc compiled in (preflight: 700 `_rjem_` symbols; no `LD_PRELOAD`, no `MALLOC_CONF`).
+  `TORUS_CHECKPOINT_INTERVAL_MS` unset = the 15 s validator default (step 6; the enable line logs `interval: Some(15s)`).
+* **mperf** = the same binary and settings with the perf sidecar on val1 (`perf-sidecar.sh`, byte for byte section 60's
+  `cloidprof-sidecar.sh`): W1 35-80 s `cycles:u`, fp call graphs, the whole process; W2 82-102 s the exec thread only,
+  5 events.
+
+Workload: oracle feed on (`ORACLE_FEED=1`, price 30000, 2,000 ms interval, walk 0; every update accepted except 1 of 1,848 in k1,
+val2 "server overloaded"; all 300 marks fresh at bench end), CLOID_SHARE=0, Classic book rows, 300 markets, 5,000 senders, block cap 400, MAX_IN_FLIGHT
+4, budget 900, RATE 76000 (saturated), commit tail, shared NVMe. Harness = the `d3cba5e2` worktree
+`/home/oz/projects/wt/g3s0-d3cba5e2`; the run's `matched-bench/` copy is byte for byte `d3cba5e2`'s `tools/matched-bench`
+(top-level files checked against the git blobs). Driver `ozarchy-p4s0-campaign.sh` CAMP=P4S0 (from the campaign template,
+config by `patch-p4s0.py`; after every cell `cell_step` validates it and appends a `cells.tsv` row).
+
+Smoke 00:36 (s0-m 60 s, 218,555 matched/s; s0-mperf 120 s, 216,668 and a complete `perf.data`; both ACCEPT AGREE). Cells
+00:52-01:32: w0 (60 s warm-up), p1, p2 (mperf, 120 s), u1, u2 (m, 120 s), k1 (m, 600 s soak).
+
+**Validity.** 6 of 6 cells rc 0, ACCEPT, AGREE, node md5 = staged md5, 0 CELL-FLAG; 78 CHECK OK, no CHECK FAIL, 0 HARD
+FINDING. The host was quiet before every cell (no cargo / rustc / rust-analyzer, no analysis process; 1-min load
+0.18-1.88). `exec_resident_rebuilds` 1 per node.
+
+### 64.1 Cells (`cells.tsv`, `handoff-tables.txt`, the cells' `summary.json`)
+
+| cell | kind | rc / verdict | matched/s | native blk/s | fills per native block | engine ms per 1k fills |
+|---|---|---|---|---|---|---|
+| w0 (60 s, warm-up) | m | 0, ACCEPT AGREE | 216,548 | 4.91 | 35,057 | 3.40 |
+| p1 (120 s) | mperf | 0, ACCEPT AGREE | 213,357 | 4.14 | 49,108 | 3.47 |
+| p2 (120 s) | mperf | 0, ACCEPT AGREE | 214,409 | 4.39 | 48,880 | 3.44 |
+| u1 (120 s) | m | 0, ACCEPT AGREE | 216,560 | 4.26 | 48,140 | 3.42 |
+| u2 (120 s) | m | 0, ACCEPT AGREE | 216,974 | 4.16 | 50,031 | 3.44 |
+| k1 (600 s soak) | m | 0, ACCEPT AGREE | 220,066 | 2.97 | 72,126 | 3.42 |
+
+SAT (u1, u2) mean 216,767 matched/s; the perf cells run 1.3% lower (213,883), the usual recording cost on val1. No A/B in
+this campaign: there is no comparison arm.
+
+### 64.2 Step 0: what Phase 4 removes, % of exec-thread wall time (W1, val1; `step0-table.txt`, `step0-shares.txt`)
+
+| item (plan step 0) | p1 | p2 | mean | removed by |
+|---|---|---|---|---|
+| wall ms per native block (W1) | 246.6 | 242.1 | 244.4 | |
+| exec on-CPU ms per native block (perf samples) | 187.9 | 188.1 | 188.0 | |
+| R reads of the two CFs, exec thread | 1.12 | 1.31 | 1.21 | steps 2 + 4 |
+| R reads, settle-pool `PositionCache` misses the exec thread waits on | 1.15 | 1.28 | 1.21 | steps 2 + 4 |
+| **R reads, total** | **2.27** | **2.58** | **2.43** | |
+| of which `BalanceCache::load` miss (exec) | 0.29 | 0.30 | 0.29 | |
+| `BlockSums` memo lock + `Arc<OnceLock>` | 0.16 | 0.21 | 0.18 | decision 4 (b) only; (a) stands |
+| `open_order_counts` | 1.41 | 1.48 | 1.45 | step 5 |
+| `open_order_counts` ms per native block | 3.48 | 3.59 | 3.54 | |
+| **sum (R + memo + `open_order_counts`)** | **3.84** | **4.27** | **4.06** | |
+| sum without `open_order_counts` | 2.43 | 2.79 | 2.61 | |
+| R + `open_order_counts` (without the memo, which stays) | 3.68 | 4.06 | 3.88 | |
+| upper: sum + end_resident wait + `resident_changes` R get / clone | 5.30 | 5.88 | 5.59 | |
+| exec on-CPU share, strict union, W1 (% of exec samples) | 3.53 | 3.86 | 3.69 | |
+| same, W2 cycles (exec thread only, 82-102 s) | 3.90 | 3.61 | 3.76 | |
+
+How the shares are made: `step0.py` tags each W1 sample of the exec thread (tid from the sidecar's `exec-tid.txt`) by the
+frames on its stack (R reads = `get_native_balance`, `get_cum_volume`, `get_position` outside the caches, `has_key` /
+`positions_for_trader`; memo = `pos_sums` residual or a `memo` / `OnceLock` frame; `open_order_counts` /
+`add_open_order_counts`). A share of exec samples times on-CPU over wall per native block gives % of exec wall. The settle-pool
+row comes from `timeline.py`: 2 ms bins where the pool runs `compute_market_settle_plan` and the exec thread has no sample
+(it waits), weighted by the pool's R-read sample fraction in each bin, as ms per native block. W2 (exec thread only, cycles)
+agrees with W1 on the exec-thread union: 3.76 vs 3.69% of exec samples.
+
+The rest of step 0's list:
+* **`PositionCache::load` / `BalanceCache::load` misses per native block:** this build has no counter for them (no cache-miss
+  metric in `metrics-*-val1.txt`), so there is no count. The perf proxy: the `BalanceCache::load` miss path is 0.37 / 0.39% of
+  exec samples (0.29% of exec wall, in the R row above); the `PositionCache::load` miss path on the exec thread is 0.02 /
+  0.01% of exec samples. The position misses that matter run in the settle pool (`update_in_place`; 1.21% wall-equivalent
+  above).
+* **`open_order_counts`:** 3.5 ms per native block, all on the exec thread (`torus_exec_thread_spawns_open_orders` 0). Per 1k
+  fills that is 0.071 / 0.073 ms (p1 / p2), against 0.26-0.36 in section 11 (older build) that decision 2's "~6-8%"
+  estimate used. 1.45% is below the ~5% at which decision 2's recommendation would prefer (b).
+* **`end_resident` (whole W1, val1, metrics deltas per native block):** rows 13.01 / 13.68 ms and positions 9.81 / 10.11 ms
+  on the end_resident worker; the exec thread waits for it 1.95 / 2.23 ms (0.79 / 0.92% of exec wall, in the upper row).
+  Phase 4 removes the raw apply of the two CFs from the rows part. Whole-cell values agree (p1: rows 9.5, positions 7.4,
+  wait 2.1 ms per engine block over all 804 blocks incl. ramp and drain).
+* **`exec_resident_rows_bytes`:** 214,046,039 B (204 MiB) on val1 in the five 120 s and 600 s cells (w0: 214,038,394).
+
+**Rough throughput size (estimate, gross).** With the plans' rule of thumb (`item6-phase2-impl.md` section 9) (+0.4-0.55% matched/s per ms saved per native
+block): R + `open_order_counts` 3.88% of ~244 ms = ~9.5 ms -> +3.8-5.2%; R alone ~5.9 ms -> +2.4-3.3%; `open_order_counts`
+alone 3.5 ms -> +1.4-1.9%. All before the typed replacements' own cost.
+
+### 64.3 Exec-time p99 per native block, val1 (`p99-attribution.txt`, `p99-phases.txt`, `p99-causes.txt`, `p99-*.json`)
+
+`blocks.py` reads each executed block's start and end from val1's log (`executing finalized block` / `block done`) into
+`blocks-<cell>-val1.csv`. `attrib.py` takes the native blocks in the bench window, sets p50 / p99 and tags every block with
+features: first 8 s (ramp), checkpoint settle wait > 25.6 ms in that second, a checkpoint write in flight (`ckpt-samples.txt`,
+2 s samples), end_resident wait > 64 ms, RocksDB compaction or flush overlap (`rocksdb-LOG-val1.txt`), a RocksDB stall,
+matched/s above 1.2 x the median, the previous block oracle-only, and epoch boundary / not pipelined. `phases.py` adds the
+engine phase timers per engine block in the 1 s sampler interval that holds the block. These are approximate: a 1 s interval
+holds about 2 blocks.
+
+| cell | native blocks | p50 ms | p99 ms | above p99 | causes |
+|---|---|---|---|---|---|
+| u1 (SAT) | 405 | 313 | 581 | 5 | 4 start burst (h 439-442, 4.1-6.0 s); 1 first checkpoint (h 463, 14.4 s: checkpoint settle wait > 25.6 ms, phase 1 58 vs 24 ms median) |
+| u2 (SAT) | 397 | 312 | 596 | 4 | 2 start burst (h 410, 412; 3.1, 4.3 s); 1 first checkpoint (h 436, 14.0 s, 733 ms: write in flight, upkeep 53 ms per block in that second); 1 unexplained (h 681, 58.1 s, 627 ms) |
+| k1 (soak) | 1,681 | 355 | 585 | 17 | 5 epoch boundary (h 600, 1000, 1500, 1700, 1900; 593-676 ms); 4 checkpoint (h 436 first, with a 2x fill burst; h 677, upkeep 86 ms per block; h 2087 / 2088, upkeep 21); 3 start burst (h 409, 412, 413; 3.3-5.7 s); 3 fill burst (h 745, 746, 749; 75.8-78.0 s); 2 unexplained (h 1547 at 585 = the p99 itself, h 1847 at 634) |
+
+* **Start burst (6 of 9 SAT blocks, 3 of 17 soak):** the first seconds carry 2-2.4x the median fills per engine block (u1
+  h 439-440: 219k vs 91k; margin 243 vs 73 ms, settle 430 vs 102 ms, end_resident wait 28 vs 0.7 ms). The bench's arrival
+  ramp, not a node effect. Full blocks in the first 8 s average 563 / 531 / 519 ms against 335 / 332 / 359 ms after.
+* **Epoch boundary (5 of 17 soak):** every 100th height executes unpipelined (rewards). The 16 full epoch / unpipelined blocks
+  of k1 average 538 ms against 358 ms for the rest. SAT cells have 2-3 such blocks, none above p99.
+* **Checkpoint (2 SAT, 4 soak):** the first checkpoint after bench start (~14 s) and later ones with a long upkeep. Over all
+  full blocks, "checkpoint write in flight" is not slower on average (k1 372 vs 356 ms, u1 306 vs 352): it is the occasional
+  long upkeep or settle wait, not the write itself.
+* **Fill burst at ~76 s (3 soak):** fills 181k vs 91k median at h 746 (margin 232, match 172 ms), with compaction overlap.
+* **No RocksDB write stall** in any cell (the stall feature is 0 everywhere). Compaction and flush overlap do not separate the
+  tail consistently (full blocks with vs without: -88 to +64 ms, mixed sign).
+
+`p99-causes.txt` (`phases.py`'s automatic rule: the largest excess component over the median, > 15 ms) labels some of the
+same blocks differently: the start-burst blocks with normal fills (u1 h 441-442) and the checkpoint blocks with a fills or
+phase 1 excess become "other engine work at normal fills". The grouping above uses the time and the feature tags from
+`p99-attribution.txt` with the phase timers, as the analyst did.
+
+### 64.4 Verdict and owner decision
+
+* **Step 0 is above the stop rule: Phase 4 goes ahead as planned** (steps 1-6). The plan's stop rule only asks for an owner
+  decision below ~2% (build now as Phase 5's base, or fold into Phase 5).
+* **The margin is thin.** The sum is 4.06% (3.84-4.27) with the memo and 3.88% without it (the memo stays under decision 4
+  a). It is 2.43% without `open_order_counts` (p1 2.27), and only 1.21% if the settle-pool wait share does not move with the
+  exec thread. These are gross costs; the typed loads and the counter upkeep take part of them back.
+* **Owner decisions this feeds:**
+  * Decision 2 (`open_order_counts`, step 5): the number the plan sends to the owner before step 5 is **1.45% of exec wall,
+    3.5 ms per native block (0.07 ms per 1k fills)**, gross. That is below the ~5% the recommendation named for (b), and well
+    below section 11's estimate. (b) is decided; whether to keep step 5 in Phase 4 is the owner's call.
+  * Decision 4 (memo): 0.18%; (a) stands.
+* **p99:** the exec tail is a start-of-bench ramp, epoch-boundary blocks and checkpoint upkeep spikes, not RocksDB stalls.
+  Phase 4 does not target any of these. The commit-interval p99 rise of section 61 is a separate question and is not answered
+  here.
+
+**Caveats.**
+1. n = 2 profiled cells, val1 only, user space (`cycles:u`), W1 = 35-80 s of a 120 s cell.
+2. "% of exec wall" uses perf's sample count as on-CPU time (187.9 / 188.1 ms per native block). The exec tid's `/proc`
+   ticks over W1 give 199.8 / 199.2 ms (user 194.1 / 194.3), so the exec-thread rows may be 3-6% (relative) low; the verdict
+   does not change.
+3. The settle-pool row is a wall-equivalent estimate from 2 ms bins, not a measured wait.
+4. Stack tags are by frame name; inlined frames can move samples between rows. The analyst also made `--inline` dumps
+   (`*-inline.script.gz`; 5 `addr2line` read errors each in `p*-w1-inl.err`).
+5. p99 attribution: one node, 1 s phase intervals, 2 s checkpoint samples; 3 blocks stay unexplained.
+6. No cache-miss counter for `PositionCache` / `BalanceCache` in the build: step 0's "misses per native block" is a perf
+   share, not a count.
+
+**Method note.** The sidecar picks the exec thread per cell (the `torus-execution` task with the most CPU at W1 start): tid
+78864 in p1, 121714 in p2 (`exec-tid.txt`); every per-thread filter uses that cell's tid. The perf dumps were made with
+`perf script --symfs analyst/symfs`, whose `<recorded path>` links to the staged node; build id `5c8e43a2` = the staged
+binary (md5 `c2fda80f`), so the symbol-cache trap of section 63 does not apply.
+
+Analysis (`tools/ozarchy-p4s0-tools/analyst/`; outputs in `ozarchy-p4s0-run/analyst/` on ozarchy):
+* `scripts/stacks.py` (perf script reader), `scripts/step0.py` -> one JSON line per cell and window (`step0-shares.txt`,
+  W1 = all exec samples, W2cyc = W2's cycles event); `scripts/timeline.py` (settle-pool wait), `scripts/pool.py`,
+  `scripts/allthreads.py`, `scripts/q.py`, `scripts/tree.py` (inline queries); `step0-table.txt` is assembled from these and
+  the W1 metric deltas inline (no script).
+* `scripts/blocks.py` -> `blocks-*-val1.csv`; `scripts/attrib.py` -> `p99-attribution.txt`, `p99-<cell>.json`;
+  `scripts/phases.py` -> `p99-phases.txt` and `p99-causes.txt` (the attribution part was added after `p99-phases.txt` was
+  written).
+* **Re-run check for this write-up** (light, niced; the host was running a bench): `phases.py` on u1 reproduces u1's lines of
+  `p99-phases.txt` and `p99-causes.txt` byte for byte (the archive smoke check). The perf scripts were not rerun (no perf or
+  heavy analysis on the host during the Gate 3 campaign).
+* Not copied into the repo: `nm.txt` (15.8 MB, the node's symbol table), the perf script dumps (`*.script.gz`, Tier A with
+  `perf.data` / `perf-w2.data`) and `blocks-*-val1.csv` (rebuilt by `blocks.py` from `val1.log.gz`, which stays). Driver
+  `tools/ozarchy-p4s0-tools/ozarchy-p4s0-campaign.sh`, config patcher `patch-p4s0.py`, sidecar `perf-sidecar.sh`, md5s
+  `md5s-all.txt` (g3s0's `md5s.txt`); `analyst/a-cells.py` is section 60's copy from the tools dir, not run here.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
