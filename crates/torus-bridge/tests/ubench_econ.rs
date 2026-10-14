@@ -76,10 +76,11 @@ fn hist_sum(metrics: &torus_telemetry::Metrics, name: &str) -> Option<f64> {
 }
 
 /// Item 6 step 1: end_resident's sub-timers (ms, summed over the measured
-/// blocks): R applying the delta, the decoded positions + sums carry; step 2:
+/// blocks): R applying the delta, the Users record set (positions, balances,
+/// cvlm rows) + sums carry (Phase 4 step 1); step 2:
 /// the whole of end_resident (worker side) and the join's wait.
 const END_SUBS: [&str; 4] =
-    ["exec_end_resident_rows", "exec_end_resident_positions", "exec_end_resident", "exec_end_resident_wait"];
+    ["exec_end_resident_rows", "exec_end_resident_users", "exec_end_resident", "exec_end_resident_wait"];
 
 fn run_once(seed: u64) -> (Vec<Sample>, u64, u64, u64, RBuild, Vec<Option<f64>>) {
     let senders = env("UB_SENDERS", 600);
@@ -285,7 +286,7 @@ fn ubench_econ() {
             "UB run={r} blocks={} fills/blk={:.0} engine_ms/blk={:.1} engine_ms/1k_fills={:.2} \
              [exec/1k={:.2} margin/1k={:.2} match/1k={:.2} settle/1k={:.2} tail(liq)/1k={:.2}] \
              rejected_cancelled={} accepted={} resting_end={} r_end/blk={:.2}ms \
-             [end_resident/blk={:.2}ms rows/blk={}ms positions/blk={}ms timer/blk={}ms wait/blk={}ms] \
+             [end_resident/blk={:.2}ms rows/blk={}ms users/blk={}ms timer/blk={}ms wait/blk={}ms] \
              R rows={} bytes={} build_ms={:.1} build_ms_per_1M_rows={:.0}",
             s.len(),
             fills as f64 / n,

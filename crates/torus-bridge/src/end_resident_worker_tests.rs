@@ -380,7 +380,7 @@ fn worker_and_join_observe_their_timers_once_per_block() {
     };
     assert_eq!(count("exec_end_resident"), 3.0);
     assert_eq!(count("exec_end_resident_rows"), 3.0);
-    assert_eq!(count("exec_end_resident_positions"), 3.0);
+    assert_eq!(count("exec_end_resident_users"), 3.0);
     assert_eq!(count("exec_end_resident_wait"), 3.0, "begin of 2, begin of 3, the final read");
 }
 

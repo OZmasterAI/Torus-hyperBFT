@@ -147,7 +147,15 @@ PHASES = ["evm", "verify", "replay_guard", "load_books", "engine", "action_statu
 # critical path (0.0 before step 2). A step 2 binary is recognised by a
 # non-zero wait count. The rare join on an untouched block lands in that
 # block's wall, not in a native block's chain.
-END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions"]
+# Item 6 Phase 4 step 1 (s119): the positions sub became `end_resident_users`
+# (the Users record set: positions, balances and cvlm rows following the
+# delta, plus the sums carry). A binary emits one of the two, the other reads
+# 0.0 (old binary: positions only; new binary: users only), so both stay
+# listed and archived cells keep summarizing. The subs shift between Phase 4
+# steps (step 1 moved balance / cvlm work into users; step 2 removes the raw
+# rows apply), so cross-step comparisons use the `end_resident` total and
+# `end_resident_wait`, not the subs.
+END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions", "end_resident_users"]
 # Item 6 Phase 3 (p3s2g 47.1, step 2 `7fe4d420`): the exec thread's checkpoint
 # work, observed once per pipelined block at checkpoint interval > 0:
 # `checkpoint_settle_wait` (the join of the previous block's merge into the

@@ -1,0 +1,125 @@
+label arm load1 own_cores excess
+w0 moff 20.6 10.7 10.0
+r1-goff goff 19.5 12.0 7.5
+r1-moff moff 20.3 13.0 7.3
+r1-mon mon 20.0 12.4 7.6
+r1-gjoff gjoff 25.3 13.4 11.9
+r2-moff moff 36.9 11.6 25.3
+r2-mon mon 28.3 12.2 16.1
+r2-gjoff gjoff 28.2 13.2 15.0
+r2-goff goff 24.2 12.0 12.2
+r3-mon mon 25.0 12.3 12.8
+r3-gjoff gjoff 28.9 12.9 16.0
+r3-goff goff 31.4 12.0 19.4
+r3-moff moff 18.7 12.9 5.9
+r4-gjoff gjoff 24.1 13.4 10.7
+r4-goff goff 23.5 12.4 11.1
+r4-moff moff 19.6 13.0 6.6
+r4-mon mon 20.5 11.6 8.9
+r1-gjoff-rerun gjoff 38.3 14.0 24.3
+r2-gjoff-rerun gjoff 31.9 13.6 18.2
+r3-gjoff-rerun gjoff 33.9 13.4 20.4
+r2-moff-rerun moff 27.8 13.0 14.8
+r4-gjoff-rerun gjoff 28.0 13.4 14.6
+
+PER ARM (owner set: r2-moff replaced by rerun, GJ reruns included): mean [min,max]
+goff n= 4
+   cpu_s_per_1M              46.55 [46.06, 47.05]
+   cpu_s_per_1M_whole        42.58 [41.68, 43.42]
+   node_pcpu                381.18 [377.07, 385.87]
+   bt_p50                    78.51 [55.32, 97.04]
+   bt_p95                   980.98 [938.71, 1017.83]
+   bt_p99                  2042.96 [1820.43, 2534.32]
+   ci_avg                   214.35 [201.60, 228.50]
+   wall_ms_per_block        236.82 [226.50, 250.00]
+   rss_peak_mb             3999.52 [3891.30, 4169.39]
+   rss_mean_mb             2928.04 [2852.40, 2983.17]
+   vmhwm_mb                3759.76 [3660.76, 3807.01]
+   native_blk_s               3.86 [3.73, 3.98]
+   fills_per_blk          33138.20 [31929.80, 34208.50]
+   engine_ms_1k               4.70 [4.57, 4.92]
+   submitted             207601.50 [195261.00, 218547.00]
+   excess_load               12.53 [7.48, 19.37]
+   place_share          0.278   evictions/node mean 0
+moff n= 4
+   cpu_s_per_1M              25.95 [25.67, 26.39]
+   cpu_s_per_1M_whole        23.59 [23.47, 23.73]
+   node_pcpu                400.33 [398.70, 401.67]
+   bt_p50                    74.47 [63.13, 84.03]
+   bt_p95                   881.63 [837.81, 911.48]
+   bt_p99                  1625.01 [1515.54, 1719.05]
+   ci_avg                   202.40 [194.10, 215.30]
+   wall_ms_per_block        225.00 [213.70, 241.20]
+   rss_peak_mb             6831.46 [6192.89, 7734.21]
+   rss_mean_mb             4713.61 [4575.27, 4870.99]
+   vmhwm_mb                6391.31 [6052.14, 6675.36]
+   je_alloc_mb             1665.09 [1632.04, 1708.18]
+   je_resident_mb          2684.34 [2452.68, 2861.01]
+   native_blk_s               3.45 [3.42, 3.49]
+   fills_per_blk          63095.97 [62575.40, 63909.50]
+   engine_ms_1k               3.33 [3.27, 3.43]
+   submitted             170573.25 [169066.00, 171714.00]
+   excess_load                8.64 [5.86, 14.79]
+   place_share          0.613   evictions/node mean 0
+mon n= 4
+   cpu_s_per_1M              26.65 [25.97, 27.11]
+   cpu_s_per_1M_whole        23.77 [23.54, 23.86]
+   node_pcpu                374.00 [360.33, 379.10]
+   bt_p50                   102.66 [99.47, 104.11]
+   bt_p95                   898.83 [848.01, 930.68]
+   bt_p99                  1644.65 [1544.45, 1742.67]
+   ci_avg                   230.10 [218.20, 241.20]
+   wall_ms_per_block        259.68 [246.50, 273.50]
+   rss_peak_mb             6439.72 [5877.86, 6925.00]
+   rss_mean_mb             4779.73 [4682.18, 4878.12]
+   vmhwm_mb                6254.31 [6024.93, 6546.66]
+   je_alloc_mb             1617.29 [1490.03, 1792.14]
+   je_resident_mb          3292.24 [2844.60, 4169.05]
+   native_blk_s               3.86 [3.66, 4.06]
+   fills_per_blk          53009.62 [50342.10, 54870.60]
+   engine_ms_1k               3.48 [3.42, 3.54]
+   submitted             165423.25 [162540.00, 168281.00]
+   excess_load               11.35 [7.62, 16.09]
+   place_share          0.621   evictions/node mean 0
+gjoff n= 8
+   cpu_s_per_1M              46.44 [45.22, 49.25]
+   cpu_s_per_1M_whole        42.65 [41.33, 45.40]
+   node_pcpu                415.30 [403.00, 426.50]
+   bt_p50                    41.18 [26.86, 61.29]
+   bt_p95                   672.32 [483.58, 793.86]
+   bt_p99                  1226.01 [932.56, 1456.28]
+   ci_avg                   138.09 [105.70, 162.10]
+   wall_ms_per_block        145.16 [107.90, 169.70]
+   rss_peak_mb             3981.82 [3714.02, 4124.63]
+   rss_mean_mb             2627.75 [2563.99, 2685.69]
+   vmhwm_mb                3412.40 [3249.68, 3516.90]
+   native_blk_s               6.84 [5.71, 9.10]
+   fills_per_blk          21325.59 [15674.90, 25239.00]
+   engine_ms_1k               4.58 [4.35, 4.73]
+   submitted             367551.62 [313392.00, 468866.00]
+   excess_load               16.40 [10.74, 24.32]
+   place_share          0.192   evictions/node mean 6465
+
+DRIFT matched/s in run order
+w0 moff 223629.9
+r1-goff goff 115666.0
+r1-moff moff 225609.1
+r1-mon mon 208992.9
+r1-gjoff gjoff 128667.4
+r2-moff moff 190808.5
+r2-mon mon 207521.3
+r2-gjoff gjoff 124727.0
+r2-goff goff 115075.8
+r3-mon mon 210081.2
+r3-gjoff gjoff 127122.7
+r3-goff goff 114245.7
+r3-moff moff 216504.6
+r4-gjoff gjoff 132016.2
+r4-goff goff 115279.7
+r4-moff moff 224399.4
+r4-mon mon 217949.9
+r1-gjoff-rerun gjoff 123337.6
+r2-gjoff-rerun gjoff 127782.8
+r3-gjoff-rerun gjoff 126657.0
+r2-moff-rerun moff 222014.9
+r4-gjoff-rerun gjoff 129322.5

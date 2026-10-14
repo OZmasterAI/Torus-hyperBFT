@@ -1,15 +1,25 @@
-//! Item 6 C7 (plan 5.2) P1: the decoded per-trader positions equal the
-//! decoding of R's rows, trader by trader, after every random block delta,
-//! and the records maintained warm (`apply`) equal a cold `build`.
-//! Irregular rows (keys other than `trader ‖ market`, values that do not
-//! decode or name another trader / market, short keys) never break it: their
-//! trader reads through the overlay, as today.
+//! Item 6 Phase 4 step 1 (plan Task 1.1): the record set [`Users`] — one
+//! record per trader of R's `CF_NATIVE_POSITIONS` and `CF_NATIVE_BALANCES`
+//! rows (its positions, balance and `cvlm` row), the irregular traders' rows
+//! and the rows under no trader kept raw — equals R decoded, trader by
+//! trader, after every random block delta, re-encodes to exactly R's rows of
+//! both CFs, and the records maintained warm (`apply`) equal a cold `build`.
+//! A trader is regular only when every row of it in both CFs decodes AND
+//! re-encodes to the same bytes: a lenient decode (`is_long` byte 2,
+//! `margin_type` byte 7) or a trailing byte makes it opaque. Irregular rows
+//! (keys other than `trader ‖ market`, values that do not decode or name
+//! another trader / market, short keys) never break it: their trader reads
+//! through the overlay, as today.
+//!
+//! The C7 / E2 / adl-budget C2 tests are moved over from
+//! `trader_positions_tests.rs` unchanged (`TraderPositions` -> `Users`; `apply`
+//! no longer takes R: the record set follows the delta on its own).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
-use torus_core::position::{position_key, MarginType, PositionManager};
-use torus_state::cf::CF_NATIVE_POSITIONS;
+use torus_core::position::{cum_volume_key, position_key, MarginType, NativeBalance, PositionManager, POSITION_V2_LEN};
+use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::{NativeStateOverlay, StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId};
 
@@ -48,6 +58,66 @@ fn bytes(p: &Position) -> Vec<u8> {
     borsh::to_vec(p).unwrap()
 }
 
+fn balance(raw: u64) -> NativeBalance {
+    NativeBalance {
+        available: FixedPoint::from_raw(i128::from(raw) * 13 + 1),
+        order_margin: FixedPoint::from_raw(i128::from(raw % 7)),
+    }
+}
+
+fn bal_bytes(b: &NativeBalance) -> Vec<u8> {
+    borsh::to_vec(b).unwrap()
+}
+
+/// A `cvlm` row's value: a raw `FixedPoint`, 16 bytes big-endian.
+fn volume_bytes(raw: u64) -> Vec<u8> {
+    i128::from(raw).to_be_bytes().to_vec()
+}
+
+/// A v2 position row's two flag bytes, which `Position`'s Borsh decode reads
+/// leniently (any non-zero byte = long / Isolated).
+const IS_LONG_AT: usize = 1 + 20 + 8;
+const MARGIN_TYPE_AT: usize = POSITION_V2_LEN - 1;
+
+/// `p`'s row made irregular: `is_long` byte 2 (`how` 0), `margin_type` byte 7
+/// (1) — both still decode — or a trailing byte (2, does not decode).
+fn lenient(p: &Position, how: u64) -> Vec<u8> {
+    let mut b = bytes(p);
+    match how {
+        0 => b[IS_LONG_AT] = 2,
+        1 => b[MARGIN_TYPE_AT] = 7,
+        _ => b.push(0),
+    }
+    b
+}
+
+/// The trader a balances key belongs to: a 20-byte balance row or a 24-byte
+/// `cvlm ‖ trader` row; `None`: a row under no trader.
+fn balance_owner(k: &[u8]) -> Option<Address> {
+    match k.len() {
+        20 => Some(Address::from_slice(k)),
+        24 if k.starts_with(b"cvlm") => Some(Address::from_slice(&k[4..])),
+        _ => None,
+    }
+}
+
+/// The spec of a regular trader (a full re-encode, not `Users`' own check):
+/// every positions row under `t` is a 28-byte `t ‖ m` whose value decodes to
+/// a position of `t` and `m` and re-encodes to the same bytes; its balance
+/// row (if any) decodes and re-encodes to the same bytes; its `cvlm` row (if
+/// any) has 16 bytes.
+fn reference_regular(rows: &ResidentRows, t: &Address) -> bool {
+    let pos = rows.rows(CF_NATIVE_POSITIONS).unwrap();
+    let bal = rows.rows(CF_NATIVE_BALANCES).unwrap();
+    let positions = pos.range(t.to_vec()..).take_while(|(k, _)| k.starts_with(t.as_slice())).all(|(k, v)| {
+        k.len() == 28
+            && Position::try_from_slice(v).is_ok_and(|p| position_key(&p.trader, p.market_id) == k[..] && bytes(&p) == *v)
+    });
+    let balance = bal.get(t.as_slice()).is_none_or(|v| NativeBalance::try_from_slice(v).is_ok_and(|b| bal_bytes(&b) == *v));
+    let volume = bal.get(&cum_volume_key(t)[..]).is_none_or(|v| v.len() == 16);
+    positions && balance && volume
+}
+
 #[derive(Default, Debug)]
 struct Stats {
     regular: usize,
@@ -58,18 +128,25 @@ struct Stats {
     reported: usize,
     reported_none: usize,
     changes: usize,
+    /// Phase 4: regular users with a balance / a `cvlm` row; opaque traders
+    /// all of whose rows decode (irregular only by the re-encode check);
+    /// rows under no trader.
+    balances: usize,
+    volumes: usize,
+    lenient: usize,
+    other: usize,
 }
 
 /// One trader's report of `apply` (owned copy).
 type Report = (Address, Option<(Vec<Change>, Vec<Position>)>);
 
 /// Item 6 step 1: `apply`'s reports for one block — exactly one per trader
-/// prefix the delta writes under (key order); a trader reported with
-/// changes was regular before (`before`) and after (`after`), its `now` is
-/// its record after, and its changes compose its record before into it, each
-/// change's `before` being its position before; a trader reported without
-/// was opaque before or after.
-fn check_reports(reports: &[Report], delta: &ResidentDelta, before: &TraderPositions, after: &TraderPositions, stats: &mut Stats, tag: &str) {
+/// prefix the delta writes under in the positions CF (key order); a trader
+/// reported with changes was regular before (`before`) and after (`after`),
+/// its `now` is its record after, and its changes compose its record before
+/// into it, each change's `before` being its position before; a trader
+/// reported without was opaque before or after.
+fn check_reports(reports: &[Report], delta: &ResidentDelta, before: &Users, after: &Users, stats: &mut Stats, tag: &str) {
     let mut written: Vec<Address> =
         delta.entries(CF_NATIVE_POSITIONS).filter(|(k, _)| k.len() >= 20).map(|(k, _)| Address::from_slice(&k[..20])).collect();
     written.dedup();
@@ -103,14 +180,21 @@ fn check_reports(reports: &[Report], delta: &ResidentDelta, before: &TraderPosit
     }
 }
 
-/// `rec` == a cold build over `rows`, and for every trader prefix in R (and
-/// every test trader): a recorded trader's positions == the DB's
-/// `positions_for_trader` and each market's `get_position` (`db` == R); an
-/// opaque trader's range holds an irregular row.
-fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut Stats, tag: &str) {
-    assert!(rec.same_as(&TraderPositions::build(rows)), "{tag}: warm records != cold build");
+/// `rec` == a cold build over `rows`; `rec` re-encodes to exactly R's rows
+/// of both CFs; and for every trader in R (and every test trader): a
+/// recorded trader is regular by the spec ([`reference_regular`]), its
+/// positions == the DB's `positions_for_trader` and each market's
+/// `get_position`, its balance and `cvlm` fields == R's rows byte for byte
+/// (absent iff no row) and the DB's reads (`db` == R); an opaque trader has
+/// an irregular row in one of the two CFs.
+fn check(rec: &Users, rows: &ResidentRows, db: &StateDb, stats: &mut Stats, tag: &str) {
+    assert!(rec.same_as(&Users::build(rows)), "{tag}: warm records != cold build");
+    for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+        assert_eq!(&rec.encode_rows(cf), rows.rows(cf).unwrap(), "{tag}: {cf}: the record set != R's rows");
+    }
     let pm = PositionManager::new(db.clone());
     let r = rows.rows(CF_NATIVE_POSITIONS).unwrap();
+    let b = rows.rows(CF_NATIVE_BALANCES).unwrap();
     // E2: the trader set = the traders of R's 28-byte keys (opaque or not).
     let with_key: BTreeSet<Address> = r.keys().filter(|k| k.len() == 28).map(|k| Address::from_slice(&k[..20])).collect();
     assert_eq!(rec.traders, with_key, "{tag}: trader set != traders of R's 28-byte keys");
@@ -137,12 +221,18 @@ fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut S
             "{tag}: holders_with({m}) != the BTreeSet reference"
         );
     }
+    stats.other += r.keys().filter(|k| k.len() < 20).count() + b.keys().filter(|k| balance_owner(k).is_none()).count();
     let mut prefixes: BTreeSet<Address> =
         r.keys().filter(|k| k.len() >= 20).map(|k| Address::from_slice(&k[..20])).collect();
+    prefixes.extend(b.keys().filter_map(|k| balance_owner(k)));
     prefixes.extend((0..=TRADERS).map(trader));
     for t in prefixes {
+        let regular = reference_regular(rows, &t);
+        let bal_row = b.get(t.as_slice());
+        let vol_row = b.get(&cum_volume_key(&t)[..]);
         match rec.get(&t) {
             Some(ps) => {
+                assert!(regular, "{tag}: {t} has a record but an irregular row");
                 stats.regular += 1;
                 let want = pm.positions_for_trader(&t).expect("a recorded trader decodes");
                 assert_eq!(
@@ -155,17 +245,35 @@ fn check(rec: &TraderPositions, rows: &ResidentRows, db: &StateDb, stats: &mut S
                     stats.found += usize::from(want.is_some());
                     assert_eq!(find(ps, m).map(bytes), want.as_ref().map(bytes), "{tag}: {t} market {m}");
                 }
+                let u = rec.map.get(&t);
+                assert_eq!(
+                    u.is_some(),
+                    !ps.is_empty() || bal_row.is_some() || vol_row.is_some(),
+                    "{tag}: {t} has a record iff it has a row"
+                );
+                // Absent != zero: `None` iff R has no row.
+                let bal = u.and_then(|u| u.balance.as_ref());
+                assert_eq!(bal.map(bal_bytes).as_ref(), bal_row, "{tag}: {t} balance row");
+                if let Some(bal) = bal {
+                    stats.balances += 1;
+                    assert_eq!(bal_bytes(&pm.get_native_balance(&t).unwrap()), bal_bytes(bal), "{tag}: {t} balance read");
+                }
+                let vol = u.and_then(|u| u.cum_volume);
+                assert_eq!(vol.map(|v| v.raw().to_be_bytes().to_vec()).as_ref(), vol_row, "{tag}: {t} cvlm row");
+                if let Some(v) = vol {
+                    stats.volumes += 1;
+                    assert_eq!(pm.get_cum_volume(&t).unwrap(), v, "{tag}: {t} cum_volume read");
+                }
             }
             None => {
                 stats.opaque += 1;
-                let irregular = r
-                    .range(t.to_vec()..)
-                    .take_while(|(k, _)| k.starts_with(t.as_slice()))
-                    .any(|(k, v)| {
-                        k.len() != 28
-                            || Position::try_from_slice(v).map_or(true, |p| position_key(&p.trader, p.market_id) != k[..])
-                    });
-                assert!(irregular, "{tag}: {t} opaque without an irregular row");
+                assert!(!regular, "{tag}: {t} opaque without an irregular row");
+                let decodes = r.range(t.to_vec()..).take_while(|(k, _)| k.starts_with(t.as_slice())).all(|(k, v)| {
+                    k.len() == 28
+                        && Position::try_from_slice(v).is_ok_and(|p| position_key(&p.trader, p.market_id) == k[..])
+                }) && bal_row.is_none_or(|v| NativeBalance::try_from_slice(v).is_ok())
+                    && vol_row.is_none_or(|v| v.len() == 16);
+                stats.lenient += usize::from(decodes);
             }
         }
     }
@@ -213,10 +321,55 @@ fn random_block(o: &NativeStateOverlay, rng: &mut Lcg) {
     }
 }
 
-/// P1: 8 seeds x 150 blocks, the records maintained by `apply` after every
-/// block == a cold build == the decoded DB rows trader by trader.
+/// Phase 4: one random block's balance, `cvlm` and irregular rows: balance
+/// and `cvlm` writes / tombstones in every block; in about one block of six
+/// also irregular balance rows (a trailing byte, a value that does not
+/// decode, a 17-byte `cvlm`), position rows that decode leniently but do not
+/// re-encode (`is_long` 2, `margin_type` 7) or carry a trailing byte, and
+/// balances keys under no trader (a short key, a 24-byte key that is not
+/// `cvlm`, a 23-byte `cvlm` key). Each irregular row stays until its own key
+/// is rewritten or deleted.
+fn random_balance_block(o: &NativeStateOverlay, rng: &mut Lcg) {
+    let wild = rng.below(6) == 0;
+    for _ in 0..1 + rng.below(10) {
+        let t = trader(rng.below(TRADERS));
+        let raw = rng.below(1_000);
+        let mut choice = rng.below(100);
+        if !wild && choice >= 85 {
+            choice = 0;
+        }
+        let not_cvlm = [b"cvlx".as_slice(), t.as_slice()].concat();
+        let short_cvlm = [b"cvlm".as_slice(), &t.as_slice()[..19]].concat();
+        match choice {
+            0..=39 => o.put_cf_raw(CF_NATIVE_BALANCES, t.as_slice(), &bal_bytes(&balance(raw))).unwrap(),
+            40..=54 => o.delete_cf_raw(CF_NATIVE_BALANCES, t.as_slice()).unwrap(),
+            55..=74 => o.put_cf_raw(CF_NATIVE_BALANCES, &cum_volume_key(&t), &volume_bytes(raw)).unwrap(),
+            75..=84 => o.delete_cf_raw(CF_NATIVE_BALANCES, &cum_volume_key(&t)).unwrap(),
+            85 => o.put_cf_raw(CF_NATIVE_BALANCES, t.as_slice(), &[bal_bytes(&balance(raw)), vec![0]].concat()).unwrap(),
+            86 => o.put_cf_raw(CF_NATIVE_BALANCES, t.as_slice(), &[9, 9]).unwrap(),
+            87 => o.put_cf_raw(CF_NATIVE_BALANCES, &cum_volume_key(&t), &[0u8; 17]).unwrap(),
+            88..=90 => {
+                let m = 1 + rng.below(MARKETS);
+                let p = position(t, m, raw, true);
+                o.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t, m), &lenient(&p, choice - 88)).unwrap();
+            }
+            91 => o.put_cf_raw(CF_NATIVE_BALANCES, &t.as_slice()[..5], &[1]).unwrap(),
+            92 => o.delete_cf_raw(CF_NATIVE_BALANCES, &t.as_slice()[..5]).unwrap(),
+            93 => o.put_cf_raw(CF_NATIVE_BALANCES, &not_cvlm, &[2; 16]).unwrap(),
+            94 => o.delete_cf_raw(CF_NATIVE_BALANCES, &not_cvlm).unwrap(),
+            95 => o.put_cf_raw(CF_NATIVE_BALANCES, &short_cvlm, &[3; 16]).unwrap(),
+            96 => o.delete_cf_raw(CF_NATIVE_BALANCES, &short_cvlm).unwrap(),
+            _ => o.put_cf_raw(CF_NATIVE_BALANCES, t.as_slice(), &bal_bytes(&balance(raw))).unwrap(),
+        }
+    }
+}
+
+/// P1 (plan Task 1.1): 8 seeds x 150 blocks over positions, balances, `cvlm`
+/// rows and irregular rows; the records maintained by `apply` after every
+/// block == a cold build == R decoded trader by trader, and re-encode to R's
+/// rows of both CFs.
 #[test]
-fn records_equal_decoded_rows_after_random_deltas() {
+fn users_equal_decoded_rows_after_random_deltas() {
     let mut stats = Stats::default();
     for seed in 1..=8u64 {
         let dir = tempfile::tempdir().unwrap();
@@ -226,29 +379,30 @@ fn records_equal_decoded_rows_after_random_deltas() {
         for _ in 0..4 {
             let o = NativeStateOverlay::new(db.clone());
             random_block(&o, &mut rng);
+            random_balance_block(&o, &mut rng);
             o.flush(&db).unwrap();
         }
         let mut rows = ResidentRows::build(&db).unwrap();
-        let mut rec = TraderPositions::build(&rows);
-        let mut plain = TraderPositions::build(&rows);
+        let mut rec = Users::build(&rows);
+        let mut plain = Users::build(&rows);
         check(&rec, &rows, &db, &mut stats, &format!("seed {seed} start"));
         let mut was_opaque: HashSet<Address> = (0..TRADERS).map(trader).filter(|t| rec.get(t).is_none()).collect();
         for h in 1..=150 {
             let o = NativeStateOverlay::new(db.clone());
             random_block(&o, &mut rng);
+            random_balance_block(&o, &mut rng);
             let delta = o.own_pending_delta();
             o.flush(&db).unwrap();
-            let before = TraderPositions::build(&rows);
+            let before = Users::build(&rows);
             rows.apply(&delta);
             let mut reports: Vec<Report> = Vec::new();
             rec.apply(
                 &delta,
-                &rows,
                 Some(&mut |t: &Address, r: Option<(&[Change], &[Position])>| {
                     reports.push((*t, r.map(|(c, n)| (c.to_vec(), n.to_vec()))));
                 }),
             );
-            plain.apply(&delta, &rows, None);
+            plain.apply(&delta, None);
             assert!(plain.same_as(&rec), "seed {seed} block {h}: records with / without reports");
             assert_eq!(rows, ResidentRows::build(&db).unwrap(), "seed {seed} block {h}: R == DB");
             check(&rec, &rows, &db, &mut stats, &format!("seed {seed} block {h}"));
@@ -258,17 +412,138 @@ fn records_equal_decoded_rows_after_random_deltas() {
             was_opaque = now;
         }
     }
-    println!("TRADER_POSITIONS P1 {stats:?}");
+    println!("USERS P1 {stats:?}");
     assert!(stats.regular > 3_000 && stats.found > 10_000, "non-vacuous: {stats:?}");
     assert!(stats.opaque > 500 && stats.cleared > 20, "irregular rows come and go: {stats:?}");
     assert!(stats.reported > 1_000 && stats.reported_none > 50 && stats.changes > 3_000, "reports: {stats:?}");
+    assert!(stats.balances > 1_000 && stats.volumes > 1_000, "balance and cvlm rows: {stats:?}");
+    assert!(stats.lenient > 50 && stats.other > 50, "lenient rows, rows under no trader: {stats:?}");
+}
+
+/// Plan Task 1.1: a regular user's fields re-encode to R's bytes (each
+/// position row, the balance row, the `cvlm` row); a balance-only user is a
+/// record but no liquidation candidate. A row that decodes but re-encodes
+/// differently (`is_long` byte 2, `margin_type` byte 7), a trailing byte, or
+/// a `cvlm` of the wrong length makes the trader opaque — its rows then kept
+/// raw, byte for byte — and the regular row back makes it regular again,
+/// warm (`apply`) and cold (`build`). Every single-byte change of a position
+/// row and of a balance row: the trader is regular iff the row re-encodes to
+/// itself (and names its key).
+#[test]
+fn users_encode_byte_identical_to_rows() {
+    let (a, b) = (trader(0), trader(1));
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let pa = [position(a, 1, 3, true), position(a, 7, 5, false)];
+    for p in &pa {
+        db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&a, p.market_id), &bytes(p)).unwrap();
+    }
+    db.put_cf_raw(CF_NATIVE_BALANCES, a.as_slice(), &bal_bytes(&balance(4))).unwrap();
+    db.put_cf_raw(CF_NATIVE_BALANCES, &cum_volume_key(&a), &volume_bytes(77)).unwrap();
+    db.put_cf_raw(CF_NATIVE_BALANCES, b.as_slice(), &bal_bytes(&balance(9))).unwrap();
+    let mut rows = ResidentRows::build(&db).unwrap();
+    let mut rec = Users::build(&rows);
+    let both = [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES];
+    {
+        let (rp, rb) = (rows.rows(CF_NATIVE_POSITIONS).unwrap(), rows.rows(CF_NATIVE_BALANCES).unwrap());
+        let u = rec.map.get(&a).expect("a: regular user");
+        assert_eq!(u.positions.len(), 2);
+        for p in &u.positions {
+            assert_eq!(bytes(p), rp[&position_key(&a, p.market_id)[..]], "a: position {}", p.market_id);
+        }
+        assert_eq!(bal_bytes(u.balance.as_ref().unwrap()), rb[a.as_slice()], "a: balance");
+        assert_eq!(u.cum_volume.unwrap().raw().to_be_bytes().to_vec(), rb[&cum_volume_key(&a)[..]], "a: cvlm");
+        let ub = rec.map.get(&b).expect("b: balance-only user");
+        assert!(ub.positions.is_empty() && ub.cum_volume.is_none() && ub.balance.is_some());
+        assert_eq!(rec.get(&b).map(<[Position]>::len), Some(0), "b: no positions");
+        assert!(!rec.traders.contains(&b), "b: no liquidation candidate");
+        for cf in both {
+            assert_eq!(&rec.encode_rows(cf), rows.rows(cf).unwrap(), "{cf}: byte-identical");
+        }
+    }
+    // One block writes an irregular row of `a`, the next the regular one back.
+    let block = |rows: &mut ResidentRows, rec: &mut Users, cf: &str, key: &[u8], value: &[u8]| {
+        let o = NativeStateOverlay::new(db.clone());
+        o.put_cf_raw(cf, key, value).unwrap();
+        let delta = o.own_pending_delta();
+        o.flush(&db).unwrap();
+        rows.apply(&delta);
+        rec.apply(&delta, None);
+    };
+    let pk = |m: MarketId| position_key(&a, m).to_vec();
+    let irregular: Vec<(&str, &str, Vec<u8>, Vec<u8>)> = vec![
+        ("is_long byte 2", CF_NATIVE_POSITIONS, pk(1), lenient(&pa[0], 0)),
+        ("margin_type byte 7", CF_NATIVE_POSITIONS, pk(7), lenient(&pa[1], 1)),
+        ("position trailing byte", CF_NATIVE_POSITIONS, pk(1), lenient(&pa[0], 2)),
+        ("balance trailing byte", CF_NATIVE_BALANCES, a.to_vec(), [bal_bytes(&balance(4)), vec![0]].concat()),
+        ("cvlm 17 bytes", CF_NATIVE_BALANCES, cum_volume_key(&a).to_vec(), vec![0; 17]),
+        ("cvlm 15 bytes", CF_NATIVE_BALANCES, cum_volume_key(&a).to_vec(), vec![0; 15]),
+    ];
+    for (what, cf, key, bad) in irregular {
+        let good = rows.rows(cf).unwrap()[&key[..]].clone();
+        if what.contains("byte 2") || what.contains("byte 7") {
+            let p = Position::try_from_slice(&bad).expect("decodes leniently");
+            assert_eq!(bytes(&p), good, "{what}: decodes to the regular row's position");
+        }
+        for (value, regular) in [(bad, false), (good, true)] {
+            block(&mut rows, &mut rec, cf, &key, &value);
+            let tag = format!("{what}, regular {regular}");
+            assert_eq!(rec.get(&a).is_some(), regular, "{tag}");
+            assert_eq!(rec.opaque.contains_key(&a), !regular, "{tag}: raw rows kept iff opaque");
+            assert!(rec.same_as(&Users::build(&rows)), "{tag}: warm == cold");
+            for cf in both {
+                assert_eq!(&rec.encode_rows(cf), rows.rows(cf).unwrap(), "{tag}: {cf} byte-identical");
+            }
+            assert!(rec.get(&b).is_some(), "{tag}: b untouched");
+        }
+    }
+    // Every single-byte change of a canonical row, warm and cold.
+    let (mut kept, mut turned) = (0usize, 0usize);
+    let cases: [(&str, Vec<u8>, Vec<u8>); 2] =
+        [(CF_NATIVE_POSITIONS, pk(1), bytes(&pa[0])), (CF_NATIVE_BALANCES, a.to_vec(), bal_bytes(&balance(4)))];
+    for (cf, key, canonical) in cases {
+        for i in 0..canonical.len() {
+            for x in [0u8, 1, 2, 7, 0x80, 0xff] {
+                let mut value = canonical.clone();
+                value[i] = x;
+                let want = if cf == CF_NATIVE_POSITIONS {
+                    Position::try_from_slice(&value)
+                        .is_ok_and(|p| bytes(&p) == value && position_key(&p.trader, p.market_id) == key[..])
+                } else {
+                    NativeBalance::try_from_slice(&value).is_ok_and(|b| bal_bytes(&b) == value)
+                };
+                block(&mut rows, &mut rec, cf, &key, &value);
+                let tag = format!("{cf} byte {i} = {x:#x}");
+                assert_eq!(rec.get(&a).is_some(), want, "{tag}: warm");
+                assert_eq!(Users::build(&rows).get(&a).is_some(), want, "{tag}: cold");
+                for cf in both {
+                    assert_eq!(&rec.encode_rows(cf), rows.rows(cf).unwrap(), "{tag}: {cf} byte-identical");
+                }
+                if want { kept += 1 } else { turned += 1 }
+                block(&mut rows, &mut rec, cf, &key, &canonical);
+                assert!(rec.get(&a).is_some(), "{tag}: restored");
+            }
+        }
+    }
+    println!("USERS byte changes: regular {kept} opaque {turned}");
+    assert!(kept > 300 && turned > 100, "non-vacuous: {kept} / {turned}");
+}
+
+/// Plan Task 1.1 / row 6: the in-memory sizes, pinned (estimate:
+/// `UserState` <= 112 B, `Position` 112 B).
+#[test]
+fn users_size_of_pins() {
+    let (user, position) = (std::mem::size_of::<UserState>(), std::mem::size_of::<Position>());
+    println!("USERS size_of UserState {user} Position {position}");
+    assert_eq!(position, 112, "Position");
+    assert_eq!(user, 112, "UserState");
 }
 
 /// A trader without rows reads as no positions; `find` misses a market it
 /// does not hold.
 #[test]
 fn empty_trader_and_missing_market() {
-    let rec = TraderPositions::build(&ResidentRows::default());
+    let rec = Users::build(&ResidentRows::default());
     assert_eq!(rec.get(&trader(0)).map(<[Position]>::len), Some(0));
     let ps = [position(trader(0), 2, 1, true), position(trader(0), 5, 2, false)];
     assert_eq!(find(&ps, 5).map(|p| p.market_id), Some(5));
@@ -296,7 +571,7 @@ fn traders_after_equals_the_walk_over_r_and_pending() {
             o.flush(&db).unwrap();
         }
         let mut rows = ResidentRows::build(&db).unwrap();
-        let mut rec = TraderPositions::build(&rows);
+        let mut rec = Users::build(&rows);
         for h in 1..=80 {
             let mut o = NativeStateOverlay::new(db.clone());
             o.attach_resident(std::sync::Arc::new(rows.clone()));
@@ -347,7 +622,7 @@ fn traders_after_equals_the_walk_over_r_and_pending() {
             o.detach_resident();
             o.flush(&db).unwrap();
             rows.apply(&delta);
-            rec.apply(&delta, &rows, None);
+            rec.apply(&delta, None);
         }
     }
     println!("TRADERS_AFTER compared={compared} appeared={appeared} vanished={vanished}");
@@ -380,7 +655,7 @@ fn holder_lists_with_the_dirty_traders_cover_the_walk() {
             o.flush(&db).unwrap();
         }
         let mut rows = ResidentRows::build(&db).unwrap();
-        let mut rec = TraderPositions::build(&rows);
+        let mut rec = Users::build(&rows);
         assert!(dirty_by_market(&db).is_none(), "no R: no dirty map");
         for h in 1..=80 {
             let mut o = NativeStateOverlay::new(db.clone());
@@ -426,7 +701,7 @@ fn holder_lists_with_the_dirty_traders_cover_the_walk() {
             o.detach_resident();
             o.flush(&db).unwrap();
             rows.apply(&delta);
-            rec.apply(&delta, &rows, None);
+            rec.apply(&delta, None);
         }
     }
     println!("HOLDERS compared={compared} extra={extra} new_holders={new_holders}");
@@ -521,7 +796,7 @@ fn holder_lists_follow_scripted_blocks_bit_identically() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     let mut rows = ResidentRows::build(&db).unwrap();
-    let mut rec = TraderPositions::build(&rows);
+    let mut rec = Users::build(&rows);
     let mut stats = Stats::default();
     let markets: Vec<MarketId> = (0..=5).chain([MarketId::MAX]).collect();
     for (h, ops) in blocks.iter().enumerate() {
@@ -560,7 +835,7 @@ fn holder_lists_follow_scripted_blocks_bit_identically() {
         let delta = o.own_pending_delta();
         o.flush(&db).unwrap();
         rows.apply(&delta);
-        rec.apply(&delta, &rows, None);
+        rec.apply(&delta, None);
         let tag = format!("block {}", h + 1);
         check(&rec, &rows, &db, &mut stats, &tag);
         let walk = liq::traders_after(&db, None, usize::MAX).unwrap();
@@ -611,7 +886,7 @@ fn holder_index_untouched_when_presence_does_not_change() {
         .unwrap();
     }
     let mut rows = ResidentRows::build(&db).unwrap();
-    let mut rec = TraderPositions::build(&rows);
+    let mut rec = Users::build(&rows);
     rec.holders.get_mut(&1).unwrap().remove(&t0);
     rec.holders.entry(3).or_default().insert(t1);
     let o = NativeStateOverlay::new(db.clone());
@@ -634,7 +909,7 @@ fn holder_index_untouched_when_presence_does_not_change() {
     let delta = o.own_pending_delta();
     o.flush(&db).unwrap();
     rows.apply(&delta);
-    rec.apply(&delta, &rows, None);
+    rec.apply(&delta, None);
     let set = |m: MarketId| {
         rec.holders
             .get(&m)
@@ -760,15 +1035,15 @@ fn holders_with_ascending_whatever_the_insertion_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     let mut rows = ResidentRows::build(&db).unwrap();
-    let mut rec = TraderPositions::build(&rows);
+    let mut rec = Users::build(&rows);
     let mut block = |f: &dyn Fn(&NativeStateOverlay)| {
         let o = NativeStateOverlay::new(db.clone());
         f(&o);
         let delta = o.own_pending_delta();
         o.flush(&db).unwrap();
         rows.apply(&delta);
-        rec.apply(&delta, &rows, None);
-        assert!(rec.same_as(&TraderPositions::build(&rows)), "warm == cold");
+        rec.apply(&delta, None);
+        assert!(rec.same_as(&Users::build(&rows)), "warm == cold");
         rec.holders_with(1, &[])
     };
     let open = |o: &NativeStateOverlay, i: u64| {
@@ -818,7 +1093,7 @@ fn holders_with_ascending_whatever_the_insertion_order() {
     assert_eq!(rec.holders_with(2, &[]), ts(&[]));
 }
 
-/// c2-holder-hashset µbench: [`TraderPositions::apply`] (with a `seen`
+/// c2-holder-hashset µbench: [`Users::apply`] (with a `seen`
 /// callback, like the node) over `UB_TP_BLOCKS` (20) blocks of
 /// `UB_TP_WRITES` (50,000, ~2 per fill) position writes over `UB_TP_TRADERS`
 /// (10,000) traders x `UB_TP_MARKETS` (300) markets, R starting with
@@ -924,14 +1199,13 @@ fn ubench_trader_positions_apply() {
     }
     let mut per_rep = Vec::new();
     for rep in 0..reps {
-        let mut rec = TraderPositions::build(&rows0);
+        let mut rec = Users::build(&rows0);
         let mut ns = 0u128;
         let mut sink = 0usize;
-        for (delta, rows) in &deltas {
+        for (delta, _) in &deltas {
             let start = std::time::Instant::now();
             rec.apply(
                 delta,
-                rows,
                 Some(&mut |_: &Address, r: Option<(&[Change], &[Position])>| {
                     sink += r.map_or(1, |(c, _)| c.len())
                 }),
@@ -940,7 +1214,7 @@ fn ubench_trader_positions_apply() {
         }
         if rep == 0 {
             assert!(
-                rec.same_as(&TraderPositions::build(&deltas.last().unwrap().1)),
+                rec.same_as(&Users::build(&deltas.last().unwrap().1)),
                 "warm == cold"
             );
         }

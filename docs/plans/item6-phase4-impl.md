@@ -175,6 +175,13 @@ Raw R still serves every read. The new record set only replaces `TraderPositions
   (`native_executor.rs:3036`), `BlockSums.records` (:1074), `begin_resident` (:3555), `end_resident`
   (:3794-3805).
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
+- Metric rename (owner s119): the `end_resident` sub timer now also covers balance and `cvlm` rows, so
+  `exec_end_resident_positions_seconds` became `exec_end_resident_users_seconds`
+  (`torus_exec_end_resident_users_seconds`); its values are not comparable with older builds.
+  `tools/matched-bench` samples and summarizes both names (the one a binary does not emit reads 0.0), so
+  archived cells still summarize. The subs shift between Phase 4 steps (step 1 moved balance / `cvlm` work
+  into users; step 2 removes the raw rows apply), so cross-step comparisons use the `end_resident` total and
+  `end_resident_wait`, not the subs.
 
 ### Step 2: the overlay reads the two CFs from `Users`
 

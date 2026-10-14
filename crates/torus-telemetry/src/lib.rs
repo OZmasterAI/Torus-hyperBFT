@@ -528,13 +528,15 @@ pub struct Metrics {
     /// Item 6 step 1: inside `end_resident`, `ResidentRows::apply` (R takes
     /// the block's delta).
     pub exec_end_resident_rows_seconds: Histogram,
-    /// Item 6 step 1: inside `end_resident`, the decoded positions following
-    /// the delta (`TraderPositions`) plus the sums carry that rides that pass
-    /// (M1 cut 4). rows + positions + the memo merge / drops ==
-    /// `exec_end_resident_seconds` (item 6 cut 5: pipelined, the rest also
-    /// holds taking the block's delta from its frozen set, and dropping the
-    /// block's batch results).
-    pub exec_end_resident_positions_seconds: Histogram,
+    /// Item 6 Phase 4 step 1: inside `end_resident`, the `Users` record set
+    /// (positions, balances and `cvlm` rows) following the delta plus the
+    /// sums carry that rides that pass (M1 cut 4). Renamed from the older
+    /// positions-only timer (s119); values are not comparable with older
+    /// builds. rows + users + the memo merge /
+    /// drops == `exec_end_resident_seconds` (item 6 cut 5: pipelined, the
+    /// rest also holds taking the block's delta from its frozen set, and
+    /// dropping the block's batch results).
+    pub exec_end_resident_users_seconds: Histogram,
     /// Item 6 step 2: time the exec thread waited for the `end_resident`
     /// worker at the join (next block's `begin_resident`, or an untouched
     /// block's advance), once per worker joined: the part of
@@ -2171,11 +2173,11 @@ impl Metrics {
             "Item 6: end_resident, R applying the block's delta (ResidentRows::apply)",
             exec_end_resident_rows_seconds.clone(),
         );
-        let exec_end_resident_positions_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        let exec_end_resident_users_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
-            "torus_exec_end_resident_positions_seconds",
-            "Item 6: end_resident, decoded positions following the delta plus the sums carry",
-            exec_end_resident_positions_seconds.clone(),
+            "torus_exec_end_resident_users_seconds",
+            "Item 6 Phase 4: end_resident, the Users record set (positions, balances, cvlm rows) following the delta plus the sums carry",
+            exec_end_resident_users_seconds.clone(),
         );
         let exec_end_resident_wait_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
@@ -2919,7 +2921,7 @@ impl Metrics {
             exec_resident_rows_build_seconds,
             exec_end_resident_seconds,
             exec_end_resident_rows_seconds,
-            exec_end_resident_positions_seconds,
+            exec_end_resident_users_seconds,
             exec_end_resident_wait_seconds,
             exec_cancel_all,
             exec_cancel_all_books_visited,
@@ -3542,7 +3544,7 @@ mod tests {
             "torus_exec_resident_rows_build_seconds",
             "torus_exec_end_resident_seconds",
             "torus_exec_end_resident_rows_seconds",
-            "torus_exec_end_resident_positions_seconds",
+            "torus_exec_end_resident_users_seconds",
             "torus_exec_end_resident_wait_seconds",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",

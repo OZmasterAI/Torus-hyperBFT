@@ -420,9 +420,9 @@ impl BalanceCache {
 #[path = "liquidation_step.rs"]
 mod liquidation_step;
 
-#[path = "trader_positions.rs"]
-mod trader_positions;
-use trader_positions::TraderPositions;
+#[path = "users.rs"]
+mod users;
+use users::Users;
 
 #[cfg(test)]
 #[path = "balance_cache_tests.rs"]
@@ -1032,7 +1032,7 @@ const ABS_GUARD: u128 = i128::MAX as u128;
 /// the guard on the result.
 fn sums_with_changes<'t>(
     base: PosSums,
-    changes: &[trader_positions::Change],
+    changes: &[users::Change],
     marks: &BlockMarks,
     tiers: impl Fn(MarketId) -> Option<&'t [MarginTier]>,
 ) -> Option<SumsResult> {
@@ -1167,10 +1167,11 @@ pub(crate) struct BlockSums {
     /// `fill_block_marks`; `None`: no table, the cache is not used).
     memo_version: Option<u64>,
     memo: std::sync::Mutex<HashMap<Address, Arc<std::sync::OnceLock<Option<SumsResult>>>>>,
-    /// Item 6 C7: R's positions decoded per trader (from the slot; `None`:
-    /// every read goes through the overlay). Read only for a trader with
-    /// nothing pending ([`AccountReader::resident_positions`]).
-    records: Option<TraderPositions>,
+    /// Item 6 C7 / Phase 4 step 1: R's positions and balances decoded per
+    /// trader (the slot's [`Users`]; `None`: every read goes through the
+    /// overlay). Read only for a trader with nothing pending
+    /// ([`AccountReader::resident_positions`]).
+    records: Option<Users>,
     /// P1 (tests): every cached answer is also computed by the reference
     /// path; differences are recorded (a panic in a worker would be caught).
     #[cfg(test)]
@@ -1182,7 +1183,7 @@ pub(crate) struct BlockSums {
 }
 
 /// Item 6 M1 / step 1: the slot's sums after a block, while R's decoded
-/// positions follow the block's delta ([`TraderPositions::apply`] reports
+/// positions follow the block's delta ([`Users::apply`] reports
 /// each written trader to [`Self::trader`]).
 struct SumsCarry<'a> {
     cache: SumsCache,
@@ -1202,10 +1203,10 @@ impl SumsCarry<'_> {
     /// as an entry the next block would compute (used only while the version
     /// holds, i.e. the same marks and configs). `changes` / `now`: the
     /// trader's changed positions (before, after) and its positions after
-    /// the block (see [`TraderPositions::apply`]); when re-valuing all of
+    /// the block (see [`Users::apply`]); when re-valuing all of
     /// `now` costs no more terms than the changes (2 per change), `build`
     /// over `now` instead (the same sums, exactly).
-    fn trader(&mut self, trader: &Address, report: Option<(&[trader_positions::Change], &[torus_core::position::Position])>) {
+    fn trader(&mut self, trader: &Address, report: Option<(&[users::Change], &[torus_core::position::Position])>) {
         let moved = (|| {
             let (t, dense) = self.table.as_ref()?;
             let (changes, now) = report?;
@@ -1744,7 +1745,7 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         let Some(ps) = self.resident_positions(trader) else {
             return self.positions.get_position(trader, market_id);
         };
-        let p = trader_positions::find(ps, market_id).cloned();
+        let p = users::find(ps, market_id).cloned();
         #[cfg(test)]
         if let Some(s) = self.sums {
             bump(&s.counters.records);
@@ -3161,9 +3162,9 @@ struct RowsSlot {
     /// C3: the traders' margin sums over `rows` (plan 2.4). Built empty with
     /// R, dropped with it.
     sums: SumsCache,
-    /// C7: `rows`' positions decoded per trader. Built with R, updated by
-    /// each block's delta, dropped with it.
-    positions: TraderPositions,
+    /// C7 / Phase 4 step 1: `rows`' positions and balances decoded per
+    /// trader. Built with R, updated by each block's delta, dropped with it.
+    users: Users,
     height: u64,
 }
 
@@ -3559,11 +3560,12 @@ impl ResidentBooks {
         self.rows_shared_fallbacks
     }
 
-    /// Item 6 C7: whether the slot's decoded positions equal a cold decode
-    /// of its R (`None`: no slot). Test / ops introspection.
+    /// Item 6 C7 / Phase 4 step 1: whether the slot's record set equals a
+    /// cold decode of its R and re-encodes to exactly R's positions and
+    /// balances rows (`None`: no slot). Test / ops introspection.
     pub fn trader_positions_match_rows(&mut self) -> Option<bool> {
         self.settle_rows();
-        self.rows.as_ref().map(|s| s.positions.same_as(&TraderPositions::build(&s.rows)))
+        self.rows.as_ref().map(|s| s.users.match_rows(&s.rows))
     }
 
     /// Item 6 C5 (tests): empty the slot's sums cache (R, its decoded
@@ -3837,7 +3839,7 @@ pub fn begin_resident(
             Ok(true) => {
                 block.marks = slot.marks;
                 block.sums = Some(BlockSums {
-                    records: Some(slot.positions),
+                    records: Some(slot.users),
                     ..BlockSums::new(slot.sums)
                 });
                 Some(slot.rows)
@@ -3867,9 +3869,9 @@ pub fn begin_resident(
                 Ok(rows) => {
                     holder.rows_builds += 1;
                     block.rebuilt = true;
-                    // C3: an empty sums cache; C7: R's positions decoded.
-                    block.sums =
-                        Some(BlockSums { records: Some(TraderPositions::build(&rows)), ..BlockSums::default() });
+                    // C3: an empty sums cache; C7 / Phase 4: R's positions
+                    // and balances decoded.
+                    block.sums = Some(BlockSums { records: Some(Users::build(&rows)), ..BlockSums::default() });
                     if let Some(m) = metrics {
                         m.exec_resident_rows_rebuilds.inc();
                         m.exec_resident_rows_build_seconds
@@ -4129,30 +4131,30 @@ impl EndResidentJob {
             m.exec_resident_rows.set(r.len() as i64);
             m.exec_resident_rows_bytes.set(r.bytes() as i64);
         }
-        // C7: the decoded positions follow the delta (decoded cold if the
-        // context kept the block's state).
+        // C7 / Phase 4 step 1: the record set follows the delta (decoded
+        // cold if the context kept the block's state).
         let timer = std::time::Instant::now();
-        let positions = match records {
-            Some(mut p) => {
+        let users = match records {
+            Some(mut u) => {
                 match carry.as_mut() {
-                    Some(c) => p.apply(&delta, r, Some(&mut |t: &Address, report| c.trader(t, report))),
-                    None => p.apply(&delta, r, None),
+                    Some(c) => u.apply(&delta, Some(&mut |t: &Address, report| c.trader(t, report))),
+                    None => u.apply(&delta, None),
                 }
-                p
+                u
             }
             None => {
                 if let Some(c) = carry.as_mut() {
                     c.drop_written(&delta);
                 }
-                TraderPositions::build(r)
+                Users::build(r)
             }
         };
         if let Some(m) = metrics {
-            m.exec_end_resident_positions_seconds.observe(timer.elapsed().as_secs_f64());
+            m.exec_end_resident_users_seconds.observe(timer.elapsed().as_secs_f64());
         }
         let sums = carry.map(|c| c.cache).unwrap_or_default();
         drop(delta);
-        RowsSlot { rows, marks, sums, positions, height }
+        RowsSlot { rows, marks, sums, users, height }
     }
 }
 
