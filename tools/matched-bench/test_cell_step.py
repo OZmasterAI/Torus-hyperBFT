@@ -988,6 +988,17 @@ def test_template_cell_names_its_failures():
     assert "CELL_FAIL=" in run_spec, "run_spec must reset CELL_FAIL before each cell"
 
 
+def test_template_samples_resident_rows_and_users_bytes():
+    """item 6 Phase 4 step 2: R no longer holds positions and balances (the record set Users does), so
+    torus_exec_resident_rows_bytes is R's raw rows only; the G lines sample it and the users bytes gauge,
+    whose sum is the older rows-bytes meaning (a binary without the users gauge just omits it: reads 0)"""
+    t = open(TEMPLATE).read()
+    g = [line for line in t.splitlines() if 'echo "G $(date' in line]
+    assert len(g) == 1, g
+    assert "exec_resident_rows_bytes|" in g[0], g[0]
+    assert "exec_resident_users_bytes|" in g[0], g[0]
+
+
 def test_bash_syntax():
     """bash -n on the helper and the campaign template"""
     for f in (HELPER, TEMPLATE):

@@ -8,7 +8,7 @@ use rocksdb::WriteBatch;
 use crate::cf::{CF_ACCOUNTS, CF_SESSIONS};
 use crate::db::{decode_account_info, encode_account_info, StateDb};
 use crate::error::StateError;
-use crate::resident_rows::{ResidentChange, ResidentDelta, ResidentRows, RESIDENT_CFS};
+use crate::resident_rows::{Resident, ResidentChange, ResidentDelta, ResidentRows, RESIDENT_CFS};
 
 pub enum AtomicWriteOp<'a> {
     Put {
@@ -1453,11 +1453,13 @@ impl NativeStateOverlay {
         self.resident.is_some()
     }
 
-    /// The resident rows of `id`, if R is attached and `id` is one of its CFs.
+    /// How R answers CF `id`, if R is attached and holds `id` (one of its
+    /// raw CFs, or positions / balances from its source: item 6 Phase 4
+    /// step 2).
     #[inline]
-    fn resident_rows(&self, id: CfId) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
+    fn resident(&self, id: CfId) -> Option<Resident<'_>> {
         let rows = self.resident.as_ref()?;
-        resident_slot_of(id).map(|s| rows.slot(s))
+        rows.view(resident_slot_of(id)?)
     }
 
     /// Item 6 Phase 1: this overlay's OWN pending writes and tombstones of R's
@@ -2357,7 +2359,7 @@ pub(crate) fn merge_from<K: AsRef<[u8]>, V: AsRef<[u8]>>(
 fn overlay_sorted<'a>(
     cfp: &CfPending,
     prefix: &[u8],
-    base: impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+    base: impl Iterator<Item = crate::resident_rows::ResidentRow<'a>>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut writes = cfp
         .writes
@@ -2370,18 +2372,18 @@ fn overlay_sorted<'a>(
     loop {
         let take_base = match (base.peek(), writes.peek()) {
             (None, None) => break,
-            (Some((bk, _)), Some((wk, _))) => bk < wk,
+            (Some((bk, _)), Some((wk, _))) => bk.as_ref() < wk.as_slice(),
             (Some(_), None) => true,
             (None, Some(_)) => false,
         };
         if take_base {
             let (k, v) = base.next().expect("peeked");
-            if !cfp.deletes.contains(k) {
-                out.push((k.clone(), v.clone()));
+            if !cfp.deletes.contains(k.as_ref()) {
+                out.push((k.into_owned(), v.into_owned()));
             }
         } else {
             let (k, v) = writes.next().expect("peeked");
-            if base.peek().is_some_and(|(bk, _)| *bk == k) {
+            if base.peek().is_some_and(|(bk, _)| bk.as_ref() == k.as_slice()) {
                 base.next();
             }
             out.push((k.clone(), v.clone()));
@@ -2405,8 +2407,8 @@ impl StateBackend for NativeStateOverlay {
             }
             // Item 6 Phase 1: R replaces the DB for its CFs; C6a (B0):
             // and the parent layer, which R already holds.
-            if let Some(rows) = self.resident_rows(id) {
-                return Ok(rows.get(key).cloned());
+            if let Some(rows) = self.resident(id) {
+                return Ok(rows.get(key));
             }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes);
             // item 6 Phase 3: then L and C.
@@ -2474,13 +2476,11 @@ impl StateBackend for NativeStateOverlay {
         // CFs. C6a (B0): R already holds the parent layer, so only this
         // overlay's own pending set goes on top — merged straight into the
         // result (no intermediate Vec / BTreeMap).
-        if let Some(rows) = self.resident_rows(id) {
-            let base = rows
-                .range::<[u8], _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
-                .take_while(|(k, _)| k.starts_with(p));
+        if let Some(rows) = self.resident(id) {
+            let base = rows.range(p, p);
             let state = self.pending.read().unwrap();
             if !state.touches(id, p) {
-                return Ok(base.map(|(k, v)| (k.clone(), v.clone())).collect());
+                return Ok(base.map(|(k, v)| (k.into_owned(), v.into_owned())).collect());
             }
             return Ok(overlay_sorted(state.cf(id), p, base));
         }
@@ -2524,14 +2524,11 @@ impl StateBackend for NativeStateOverlay {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
         let pending = self.pending.read().unwrap();
         // Item 6 Phase 1: R's range stands in for the RocksDB iterator; C6a
         // (B0): R already holds the parent layer.
-        if let Some(rows) = self.resident_rows(id) {
-            let base = rows
-                .range::<[u8], _>(range)
-                .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
+        if let Some(rows) = self.resident(id) {
+            let base = rows.range(start, &[]).map(Ok::<_, StateError>);
             return merge_from(&pending, &[], id, start, limit, base);
         }
         let lower = self.lower(id)?;
@@ -2557,8 +2554,8 @@ impl StateBackend for NativeStateOverlay {
                     return Ok(hit.map(<[u8]>::len));
                 }
             }
-            if let Some(rows) = self.resident_rows(id) {
-                return Ok(rows.get(key).map(Vec::len));
+            if let Some(rows) = self.resident(id) {
+                return Ok(rows.get_len(key));
             }
             if let Some(hit) = self.lookup_lower(id, key)? {
                 return Ok(hit.map(<[u8]>::len));
@@ -2585,13 +2582,9 @@ impl StateBackend for NativeStateOverlay {
         let cut = |rows: Vec<(Vec<u8>, Vec<u8>)>| {
             rows.into_iter().take_while(|(k, _)| k.starts_with(prefix)).collect()
         };
-        let range = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
         let pending = self.pending.read().unwrap();
-        if let Some(rows) = self.resident_rows(id) {
-            let base = rows
-                .range::<[u8], _>(range)
-                .take_while(|(k, _)| k.starts_with(prefix))
-                .map(|(k, v)| Ok::<_, StateError>((k.as_slice(), v.as_slice())));
+        if let Some(rows) = self.resident(id) {
+            let base = rows.range(start, prefix).map(Ok::<_, StateError>);
             return merge_from(&pending, &[], id, start, limit, base).map(cut);
         }
         let lower = self.lower(id)?;
@@ -2619,7 +2612,7 @@ impl StateBackend for NativeStateOverlay {
             return StateBackend::prefix_exists(&self.db, cf, prefix);
         };
         // C6a (B0): R already holds the parent layer — not consulted for R's CFs.
-        let rows = self.resident_rows(id);
+        let rows = self.resident(id);
         // Item 6 Phase 3: likewise L and C (parent, L, C newest first).
         let lower = if rows.is_none() {
             self.lower(id)?
@@ -2645,10 +2638,7 @@ impl StateBackend for NativeStateOverlay {
         }
         // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
         if let Some(rows) = rows {
-            return Ok(rows
-                .range::<[u8], _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded))
-                .take_while(|(k, _)| k.starts_with(prefix))
-                .any(|(k, _)| live(k)));
+            return Ok(rows.range(prefix, prefix).any(|(k, _)| live(&k)));
         }
         let db = self.db.inner();
         let cf_handle = db
@@ -2670,7 +2660,7 @@ impl StateBackend for NativeStateOverlay {
     /// holds a write or tombstone under `prefix`. Otherwise "assume dirty".
     fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
         match intern_cf(cf) {
-            Some(id) if self.resident_rows(id).is_some() => {
+            Some(id) if self.resident(id).is_some() => {
                 self.pending.read().unwrap().touches(id, prefix)
             }
             _ => true,
@@ -2679,7 +2669,7 @@ impl StateBackend for NativeStateOverlay {
 
     fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
         let id = intern_cf(cf)?;
-        self.resident_rows(id)?;
+        self.resident(id)?;
         let state = self.pending.read().unwrap();
         let cfp = state.cf(id);
         let mut keys: Vec<Vec<u8>> = cfp.writes.keys().chain(cfp.deletes.iter()).cloned().collect();
@@ -2689,11 +2679,11 @@ impl StateBackend for NativeStateOverlay {
 
     fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<ResidentChange>> {
         let id = intern_cf(cf)?;
-        let rows = self.resident_rows(id)?;
+        let rows = self.resident(id)?;
         let state = self.pending.read().unwrap();
         let change = |key: &Vec<u8>, current: Option<&Vec<u8>>| ResidentChange {
             key: key.clone(),
-            resident: rows.get(key).cloned(),
+            resident: rows.get(key),
             current: current.cloned(),
         };
         let cfp = state.cf(id);

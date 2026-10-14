@@ -451,7 +451,7 @@ fn run_all(db: &StateDb, blocks: &[Block], threads: Option<usize>, r: R) -> [Vec
         assert_eq!(holder.rows_shared_fallbacks(), 0);
         let r = holder.rows().expect("R stashed after the last block");
         for cf in torus_state::resident_rows::RESIDENT_CFS {
-            let rows: Vec<_> = r.rows(cf).unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let rows = r.dump(cf).unwrap();
             assert_eq!(rows, db.iterate_cf(cf, None).unwrap(), "R == DB after the last flush ({cf})");
         }
     } else {

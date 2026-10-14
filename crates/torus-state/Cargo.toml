@@ -24,6 +24,14 @@ bincode = { workspace = true }
 # (no local toolchain) — see crates/torus-state/src/erasure.rs.
 reed-solomon-erasure = { workspace = true }
 
+[features]
+# Item 6 Phase 4 step 2: TEST-ONLY. Compiles today's raw R for all five
+# resident CFs (`ResidentRows::build`, `Default`), the reference path of the
+# step 2 differentials, into non-test builds for other crates' tests (enabled
+# from torus-bridge's `test-reference-paths` and its dev-dependencies only).
+# Changes no behaviour by itself; no node build reaches it.
+test-reference-paths = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }

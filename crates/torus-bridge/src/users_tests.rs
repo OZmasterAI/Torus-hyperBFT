@@ -192,6 +192,8 @@ fn check(rec: &Users, rows: &ResidentRows, db: &StateDb, stats: &mut Stats, tag:
     for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
         assert_eq!(&rec.encode_rows(cf), rows.rows(cf).unwrap(), "{tag}: {cf}: the record set != R's rows");
     }
+    // Phase 4 step 2: the tracked row count / bytes (the users gauges).
+    assert_eq!((rec.row_count(), rec.row_bytes()), row_totals(rows), "{tag}: tracked rows / bytes");
     let pm = PositionManager::new(db.clone());
     let r = rows.rows(CF_NATIVE_POSITIONS).unwrap();
     let b = rows.rows(CF_NATIVE_BALANCES).unwrap();
@@ -281,13 +283,24 @@ fn check(rec: &Users, rows: &ResidentRows, db: &StateDb, stats: &mut Stats, tag:
 
 use borsh::BorshDeserialize;
 
+/// The test traders `0..TRADERS`.
+fn test_traders() -> Vec<Address> {
+    (0..TRADERS).map(trader).collect()
+}
+
 /// One random block's writes / tombstones of `CF_NATIVE_POSITIONS`.
 fn random_block(o: &NativeStateOverlay, rng: &mut Lcg) {
+    random_block_over(o, rng, &test_traders());
+}
+
+/// [`random_block`] over `traders` (same draws for [`test_traders`]).
+fn random_block_over(o: &NativeStateOverlay, rng: &mut Lcg, traders: &[Address]) {
+    let n = traders.len() as u64;
     // Irregular rows are written in about one block of six (they stay until
     // their own key is rewritten or deleted); removals happen in any block.
     let wild = rng.below(6) == 0;
     for _ in 0..1 + rng.below(12) {
-        let t = trader(rng.below(TRADERS));
+        let t = traders[rng.below(n) as usize];
         let m = 1 + rng.below(MARKETS);
         let key = position_key(&t, m);
         let p = position(t, m, rng.below(1_000), rng.below(2) == 0);
@@ -303,7 +316,7 @@ fn random_block(o: &NativeStateOverlay, rng: &mut Lcg) {
             87..=90 => o.delete_cf_raw(CF_NATIVE_POSITIONS, &[&key[..], &[1]].concat()).unwrap(),
             // a valid position of another trader / market at this key
             91 => {
-                let other = position(trader((rng.below(TRADERS) + 1) % TRADERS), m + 1, 5, true);
+                let other = position(traders[((rng.below(n) + 1) % n) as usize], m + 1, 5, true);
                 o.put_cf_raw(CF_NATIVE_POSITIONS, &key, &bytes(&other)).unwrap();
             }
             92 => {
@@ -330,9 +343,15 @@ fn random_block(o: &NativeStateOverlay, rng: &mut Lcg) {
 /// `cvlm`, a 23-byte `cvlm` key). Each irregular row stays until its own key
 /// is rewritten or deleted.
 fn random_balance_block(o: &NativeStateOverlay, rng: &mut Lcg) {
+    random_balance_block_over(o, rng, &test_traders());
+}
+
+/// [`random_balance_block`] over `traders` (same draws for [`test_traders`]).
+fn random_balance_block_over(o: &NativeStateOverlay, rng: &mut Lcg, traders: &[Address]) {
+    let n = traders.len() as u64;
     let wild = rng.below(6) == 0;
     for _ in 0..1 + rng.below(10) {
-        let t = trader(rng.below(TRADERS));
+        let t = traders[rng.below(n) as usize];
         let raw = rng.below(1_000);
         let mut choice = rng.below(100);
         if !wild && choice >= 85 {
@@ -1232,4 +1251,346 @@ fn ubench_trader_positions_apply() {
         held.len(),
         med / (writes as f64 / 2.0) * 1e3
     );
+}
+
+// ======================================================================
+// Item 6 Phase 4 step 2 (plan Task 2.2): `Users` as R's source for the
+// positions and balances CFs (raw R's two maps deleted).
+// ======================================================================
+
+use std::ops::Bound as B;
+use torus_state::resident_rows::ResidentSource;
+
+/// Rows and key + value bytes of raw R's positions and balances.
+fn row_totals(rows: &ResidentRows) -> (usize, usize) {
+    [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
+        .iter()
+        .flat_map(|cf| rows.rows(cf).unwrap().iter())
+        .fold((0, 0), |(n, b), (k, v)| (n + 1, b + k.len() + v.len()))
+}
+
+/// Traders whose address starts with `cvlm`: their balance rows sort among
+/// the `cvlm ‖ trader` rows of the balances CF.
+fn cvlm_trader(i: u64) -> Address {
+    let mut b = [0x63u8; 20];
+    b[..4].copy_from_slice(b"cvlm");
+    b[12..].copy_from_slice(&(i + 1).to_be_bytes());
+    Address::new(b)
+}
+
+/// The step 2 trader set: the test traders, two `cvlm`-headed ones, and the
+/// all-zero / all-ones addresses (the key space's ends).
+fn step2_traders() -> Vec<Address> {
+    let mut out = test_traders();
+    out.extend([cvlm_trader(0), cvlm_trader(1), Address::ZERO, Address::new([0xff; 20])]);
+    out
+}
+
+/// What raw R answers for a source range: its rows with key >= `start`, up
+/// to the first whose key does not start with `prefix`.
+fn raw_range(map: &BTreeMap<Vec<u8>, Vec<u8>>, start: &[u8], prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    map.range::<[u8], _>((B::Included(start), B::Unbounded))
+        .take_while(|(k, _)| k.starts_with(prefix))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn source_range(u: &Users, slot: usize, start: &[u8], prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    ResidentSource::range(u, slot, start, prefix).map(|(k, v)| (k.into_owned(), v.into_owned())).collect()
+}
+
+/// Keys the source is probed with: every row of both CFs, per trader its
+/// prefix, its `cvlm` key, every market key, a longer key; short and empty
+/// keys; the key space's ends.
+fn probe_keys(rows: &ResidentRows, traders: &[Address]) -> BTreeSet<Vec<u8>> {
+    let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+        keys.extend(rows.rows(cf).unwrap().keys().cloned());
+    }
+    for t in traders {
+        keys.insert(t.to_vec());
+        keys.insert(cum_volume_key(t).to_vec());
+        keys.insert(t.as_slice()[..5].to_vec());
+        for m in 0..=MARKETS + 1 {
+            keys.insert(position_key(t, m).to_vec());
+        }
+        keys.insert([&position_key(t, 1)[..], &[1]].concat());
+    }
+    keys.extend([Vec::new(), vec![0x00], b"cvl".to_vec(), b"cvlm".to_vec(), vec![0xff; 30]]);
+    keys
+}
+
+/// Prefixes: the empty one, every probe key cut at the trader / `cvlm` /
+/// market boundaries (1, 4, 5, 19..=25, 27, 28, 29 bytes).
+fn probe_prefixes(keys: &BTreeSet<Vec<u8>>) -> BTreeSet<Vec<u8>> {
+    let mut out: BTreeSet<Vec<u8>> = BTreeSet::new();
+    out.insert(Vec::new());
+    for k in keys {
+        for n in [1, 4, 5, 19, 20, 21, 23, 24, 25, 27, 28, 29] {
+            if n <= k.len() {
+                out.insert(k[..n].to_vec());
+            }
+        }
+    }
+    out
+}
+
+/// Starts for a prefix: the prefix, just above and below it inside its
+/// range, its predecessor-ish (shorter), past its range, and the empty key.
+fn probe_starts(p: &[u8], keys: &BTreeSet<Vec<u8>>, rng: &mut Lcg) -> Vec<Vec<u8>> {
+    let mut past = p.to_vec();
+    if let Some(last) = past.last_mut() {
+        *last = last.wrapping_add(1);
+    }
+    let mut out = vec![p.to_vec(), [p, &[0x00]].concat(), [p, &[0x80]].concat(), p[..p.len().saturating_sub(1)].to_vec(), past, Vec::new()];
+    let ks: Vec<&Vec<u8>> = keys.range::<[u8], _>((B::Included(p), B::Unbounded)).take(40).collect();
+    if !ks.is_empty() {
+        out.push(ks[rng.below(ks.len() as u64) as usize].clone());
+    }
+    out
+}
+
+#[derive(Default, Debug)]
+struct SourceStats {
+    gets: usize,
+    hits: usize,
+    ranges: usize,
+    rows: usize,
+    /// Balances ranges answered by the collect-and-sort slow path / without it.
+    slow: usize,
+    fast_balances: usize,
+}
+
+/// `rec` as R's source == raw `rows`: point reads and lengths of every
+/// probe key, and a sample of ranges (start, prefix) over both CFs. The
+/// balances ranges under a trader-length prefix (20+ bytes, not a `cvlm`
+/// head shorter than a `cvlm` key) never take the slow path.
+fn check_source(rec: &Users, rows: &ResidentRows, traders: &[Address], rng: &mut Lcg, stats: &mut SourceStats, tag: &str) {
+    let keys = probe_keys(rows, traders);
+    let prefixes: Vec<Vec<u8>> = probe_prefixes(&keys).into_iter().collect();
+    for (slot, cf) in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES].into_iter().enumerate() {
+        let raw = rows.rows(cf).unwrap();
+        for k in &keys {
+            let want = raw.get(k).cloned();
+            stats.gets += 1;
+            stats.hits += usize::from(want.is_some());
+            assert_eq!(ResidentSource::get(rec, slot, k), want, "{tag} {cf}: get {k:?}");
+            assert_eq!(ResidentSource::get_len(rec, slot, k), want.map(|v| v.len()), "{tag} {cf}: len {k:?}");
+        }
+        // Every trader-length prefix of a trader, and a random sample of the rest.
+        let mut sample: Vec<&Vec<u8>> = prefixes.iter().filter(|p| p.len() == 20 || p.len() == 24 || p.is_empty()).collect();
+        for _ in 0..40 {
+            sample.push(&prefixes[rng.below(prefixes.len() as u64) as usize]);
+        }
+        for p in sample {
+            for s in probe_starts(p, &keys, rng) {
+                let before = balance_slow_scans();
+                let got = source_range(rec, slot, &s, p);
+                let slow = balance_slow_scans() - before;
+                assert_eq!(got, raw_range(raw, &s, p), "{tag} {cf}: range from {s:?} under {p:?}");
+                stats.ranges += 1;
+                stats.rows += got.len();
+                let fast = slot == 0 || (p.len() >= 20 && s.as_slice() >= p.as_slice() && !(p.len() < 24 && p.starts_with(b"cvlm")));
+                if fast {
+                    assert_eq!(slow, 0, "{tag} {cf}: range from {s:?} under {p:?} took the slow path");
+                    stats.fast_balances += usize::from(slot == 1);
+                } else {
+                    stats.slow += slow;
+                }
+            }
+        }
+    }
+}
+
+/// Plan Task 2.2 / section 3 (Reads, Ordered iteration): `Users` as R's
+/// source answers every point read, length and range (start, prefix) of
+/// both CFs exactly as raw R's rows, after every random block over regular,
+/// lenient and irregular rows, rows under no trader, tombstones, and traders
+/// whose address starts with `cvlm` (their balance rows sort among the
+/// `cvlm` rows) — opaque traders and rows under no trader served raw, the
+/// positions CF in key order from the trader set, the balances CF from the
+/// collect-and-sort slow path (counted) unless the prefix names one trader.
+#[test]
+fn users_source_reads_equal_raw_rows() {
+    let traders = step2_traders();
+    let mut stats = SourceStats::default();
+    let mut opaque = 0;
+    for seed in 1..=4u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x51ED_0002);
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block_over(&o, &mut rng, &traders);
+            random_balance_block_over(&o, &mut rng, &traders);
+            o.flush(&db).unwrap();
+        }
+        let mut rows = ResidentRows::build(&db).unwrap();
+        let mut rec = Users::build(&rows);
+        check_source(&rec, &rows, &traders, &mut rng, &mut stats, &format!("seed {seed} start"));
+        for h in 1..=40 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block_over(&o, &mut rng, &traders);
+            random_balance_block_over(&o, &mut rng, &traders);
+            let delta = o.own_pending_delta();
+            o.flush(&db).unwrap();
+            rows.apply(&delta);
+            rec.apply(&delta, None);
+            opaque += traders.iter().filter(|t| rec.get(t).is_none()).count();
+            check_source(&rec, &rows, &traders, &mut rng, &mut stats, &format!("seed {seed} block {h}"));
+        }
+    }
+    println!("USERS SOURCE {stats:?} opaque={opaque}");
+    assert!(stats.hits > 5_000 && stats.ranges > 50_000 && stats.rows > 100_000, "non-vacuous: {stats:?}");
+    assert!(stats.slow > 1_000 && stats.fast_balances > 5_000, "both balances paths: {stats:?}");
+    assert!(opaque > 100, "opaque traders served raw: {opaque}");
+}
+
+/// Every read of `cf` an overlay offers, over `keys` and `prefixes`.
+fn overlay_read_dump(ov: &NativeStateOverlay, cf: &str, keys: &BTreeSet<Vec<u8>>, prefixes: &[Vec<u8>]) -> Vec<String> {
+    let mut out = vec![format!("all {:?}", ov.iterate_cf(cf, None).unwrap()), format!("keys {:?}", ov.layer_keys(cf))];
+    for k in keys {
+        out.push(format!("get {k:?} {:?} {:?}", ov.get_cf_raw(cf, k).unwrap(), ov.get_cf_len(cf, k).unwrap()));
+    }
+    for p in prefixes {
+        out.push(format!("pfx {p:?} {:?}", ov.iterate_cf(cf, Some(p)).unwrap()));
+        out.push(format!("exists {p:?} {:?}", ov.prefix_exists(cf, p).unwrap()));
+        out.push(format!("touches {p:?} {:?}", ov.layer_touches(cf, p)));
+        let mut changes = ov.resident_changes(cf, p);
+        if let Some(c) = changes.as_mut() {
+            c.sort_by(|a, b| a.key.cmp(&b.key));
+        }
+        out.push(format!("changes {p:?} {changes:?}"));
+        for limit in [1usize, 2, usize::MAX] {
+            out.push(format!("from {p:?} {limit} {:?}", ov.iterate_cf_from(cf, p, limit).unwrap()));
+            let start = [p.as_slice(), &[0x00]].concat();
+            out.push(format!("pfrom {p:?} {limit} {:?}", ov.iterate_cf_prefix_from(cf, p, &start, limit).unwrap()));
+        }
+    }
+    out
+}
+
+/// Plan Task 2.2: the block's overlay with R whose positions and balances
+/// come from `Users` reads both CFs exactly as with raw R (today's R, the
+/// reference path), with the block's own writes and tombstones on top (own
+/// pending first, then R), after every random block; the record set then
+/// follows the block's delta. R is the same `ResidentRows` either way but
+/// for the source.
+#[test]
+fn overlay_through_users_equals_raw_r() {
+    let traders = step2_traders();
+    let mut compared = 0usize;
+    for seed in 1..=3u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x0E2A_0002);
+        for _ in 0..3 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block_over(&o, &mut rng, &traders);
+            random_balance_block_over(&o, &mut rng, &traders);
+            o.flush(&db).unwrap();
+        }
+        let mut raw = ResidentRows::build(&db).unwrap();
+        let mut users = std::sync::Arc::new(Users::build(&raw));
+        for h in 1..=25 {
+            let scratch = NativeStateOverlay::new(db.clone());
+            random_block_over(&scratch, &mut rng, &traders);
+            random_balance_block_over(&scratch, &mut rng, &traders);
+            let delta = scratch.own_pending_delta();
+            let mut with_source = raw.clone();
+            with_source.set_source(users.clone());
+            let overlay = |r: ResidentRows| {
+                let mut ov = NativeStateOverlay::new(db.clone());
+                ov.attach_resident(std::sync::Arc::new(r));
+                for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+                    for (k, v) in delta.entries(cf) {
+                        match v {
+                            Some(v) => ov.put_cf_raw(cf, k, v).unwrap(),
+                            None => ov.delete_cf_raw(cf, k).unwrap(),
+                        }
+                    }
+                }
+                ov
+            };
+            let (a, b) = (overlay(raw.clone()), overlay(with_source));
+            let keys = probe_keys(&raw, &traders);
+            let mut prefixes: Vec<Vec<u8>> = probe_prefixes(&keys).into_iter().filter(|p| p.len() <= 20 || p.len() == 24).collect();
+            prefixes.retain(|_| rng.below(3) == 0);
+            for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+                let (x, y) = (overlay_read_dump(&a, cf, &keys, &prefixes), overlay_read_dump(&b, cf, &keys, &prefixes));
+                for (x, y) in x.iter().zip(y.iter()) {
+                    assert_eq!(x, y, "seed {seed} block {h} {cf}: raw R vs Users");
+                }
+                compared += x.len();
+            }
+            drop((a, b));
+            scratch.flush(&db).unwrap();
+            raw.apply(&delta);
+            std::sync::Arc::get_mut(&mut users).expect("the overlays dropped their R").apply(&delta, None);
+            assert!(users.same_as(&Users::build(&raw)), "seed {seed} block {h}: warm == cold");
+        }
+    }
+    assert!(compared > 50_000, "non-vacuous: {compared}");
+}
+
+/// Phase 4 step 2: the record set's row count and key + value bytes (the
+/// users gauges, kept per change) equal its rows of both CFs after every
+/// random block, cold and warm.
+#[test]
+fn users_row_count_and_bytes_track_the_rows() {
+    let traders = step2_traders();
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut rng = Lcg(0xB17E5);
+    let mut rows = ResidentRows::build(&db).unwrap();
+    let mut rec = Users::build(&rows);
+    assert_eq!((rec.row_count(), rec.row_bytes()), (0, 0), "empty");
+    for h in 1..=120 {
+        let o = NativeStateOverlay::new(db.clone());
+        random_block_over(&o, &mut rng, &traders);
+        random_balance_block_over(&o, &mut rng, &traders);
+        let delta = o.own_pending_delta();
+        o.flush(&db).unwrap();
+        rows.apply(&delta);
+        rec.apply(&delta, None);
+        assert_eq!((rec.row_count(), rec.row_bytes()), row_totals(&rows), "block {h}: warm");
+        let cold = Users::build(&rows);
+        assert_eq!((cold.row_count(), cold.row_bytes()), row_totals(&rows), "block {h}: cold");
+    }
+    assert!(row_totals(&rows).0 > 30, "non-vacuous");
+}
+
+/// Phase 4 step 2: R's rebuild reads both CFs through the overlay without R
+/// (DB + parent layer): `Users::build_from` == a cold build of raw R over the
+/// same overlay, irregular rows and rows under no trader included.
+#[test]
+fn users_build_from_backend_equals_cold_build_of_r() {
+    let traders = step2_traders();
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let mut rng = Lcg(0xC01D);
+    for _ in 0..6 {
+        let o = NativeStateOverlay::new(db.clone());
+        random_block_over(&o, &mut rng, &traders);
+        random_balance_block_over(&o, &mut rng, &traders);
+        o.flush(&db).unwrap();
+    }
+    let parent = NativeStateOverlay::new(db.clone());
+    random_block_over(&parent, &mut rng, &traders);
+    random_balance_block_over(&parent, &mut rng, &traders);
+    let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    let built = Users::build_from(&ov).unwrap();
+    let reference = Users::build(&ResidentRows::build(&ov).unwrap());
+    assert!(built.same_as(&reference), "build_from == cold build of R");
+    assert_eq!((built.row_count(), built.row_bytes()), (reference.row_count(), reference.row_bytes()));
+    assert!(built.row_count() > 20, "non-vacuous");
+}
+
+/// Phase 4 step 2: the source slots `Users` answers are R's first two CFs.
+#[test]
+fn source_slots_are_positions_then_balances() {
+    use torus_state::resident_rows::{resident_slot, SOURCE_SLOTS};
+    assert_eq!(resident_slot(CF_NATIVE_POSITIONS), Some(POSITIONS));
+    assert_eq!(resident_slot(CF_NATIVE_BALANCES), Some(BALANCES));
+    assert_eq!(SOURCE_SLOTS, 2);
 }

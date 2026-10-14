@@ -42,7 +42,7 @@ type Dump = Vec<Vec<(Vec<u8>, Vec<u8>)>>;
 fn dump_rows(rows: &ResidentRows) -> Dump {
     RESIDENT_CFS
         .iter()
-        .map(|cf| rows.rows(cf).unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .map(|cf| rows.dump(cf).unwrap())
         .collect()
 }
 
@@ -443,4 +443,76 @@ fn frozen_delta_on_the_worker_equals_the_delta_before_freeze() {
     let dropped = dropped.lock().unwrap();
     assert_eq!(dropped.len(), 32);
     assert_eq!(dropped.iter().filter(|n| *n == "torus-end-resident").count(), 16, "{dropped:?}");
+}
+
+/// Plan Task 2.2 (P7): a live clone of the block's `Users` at the end (a
+/// reader kept by mistake) leaves the slot empty, counted like a live clone
+/// of R, inline and on the worker (no job deferred); the next block rebuilds
+/// R and `Users` from the DB.
+#[test]
+fn live_clone_of_users_falls_back_to_a_rebuild() {
+    for mode in [Mode::Inline, Mode::Worker] {
+        let (_d, db) = open_db();
+        seed(&db);
+        let mut holder = ResidentBooks::default();
+        block(&db, &mut holder, 1, mode, None, true, None);
+        let mut overlay = NativeStateOverlay::new(db.clone());
+        let rb = begin_resident(Some(&mut holder), &mut overlay, 2, None);
+        assert!(!rb.rebuilt());
+        let leaked = rb.users.clone().expect("the block holds the record set");
+        let delta = overlay.own_pending_delta();
+        overlay.flush_with_native_trie_and_marker(&db, 2).unwrap();
+        match mode {
+            Mode::Inline => end_resident(&mut holder, rb, &mut overlay, delta, true, None),
+            Mode::Worker => end_resident_on_worker(&mut holder, rb, &mut overlay, delta, true, None),
+        }
+        assert!(!holder.rows_in_flight(), "{mode:?}: shared Users: nothing deferred");
+        assert_eq!(holder.rows_shared_fallbacks(), 1, "{mode:?}");
+        assert_eq!(holder.rows_height(), None, "{mode:?}: slot empty");
+        drop(leaked);
+        assert!(block(&db, &mut holder, 3, mode, None, true, None), "{mode:?}: rebuild");
+        assert_eq!(dump_rows(holder.rows().unwrap()), dump_db(&db), "{mode:?}: rebuilt R == DB");
+        assert_eq!(holder.trader_positions_match_rows(), Some(true), "{mode:?}");
+        assert_eq!(holder.rows_builds(), 2, "{mode:?}");
+    }
+}
+
+/// Phase 4 step 2: the slot's R holds the liquidation, oracle and market
+/// rows raw and reads positions and balances from the slot's `Users` (no raw
+/// map, the same record set), inline and on the worker; the gauges split:
+/// rows / bytes of R's raw rows, and of the record set (together: R's five
+/// CFs as before).
+#[test]
+fn slot_reads_positions_and_balances_from_users() {
+    use torus_state::cf::CF_NATIVE_LIQUIDATION;
+    for mode in [Mode::Inline, Mode::Worker] {
+        let (_d, db) = open_db();
+        seed(&db);
+        db.put_cf_raw(CF_NATIVE_LIQUIDATION, &[7u8; 3], b"liq").unwrap();
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut holder = ResidentBooks::default();
+        for h in 1..=3 {
+            block(&db, &mut holder, h, mode, None, true, Some(metrics.clone()));
+        }
+        let r = holder.rows().unwrap();
+        assert!(r.has_source(), "{mode:?}");
+        for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+            assert!(r.rows(cf).is_none(), "{mode:?} {cf}: no raw map");
+        }
+        assert_eq!(dump_rows(r), dump_db(&db), "{mode:?}: R == DB");
+        let total = |cfs: &[&str]| -> (i64, i64) {
+            cfs.iter()
+                .flat_map(|cf| StateBackend::iterate_cf(&db, cf, None).unwrap())
+                .fold((0, 0), |(n, b), (k, v)| (n + 1, b + (k.len() + v.len()) as i64))
+        };
+        let (raw_rows, raw_bytes) = total(&RESIDENT_CFS[2..]);
+        let (user_rows, user_bytes) = total(&RESIDENT_CFS[..2]);
+        assert_eq!((r.len() as i64, r.bytes() as i64), (raw_rows, raw_bytes), "{mode:?}: R's raw rows");
+        assert_eq!(metrics.exec_resident_rows.get(), raw_rows, "{mode:?}");
+        assert_eq!(metrics.exec_resident_rows_bytes.get(), raw_bytes, "{mode:?}");
+        assert_eq!(metrics.exec_resident_users.get(), user_rows, "{mode:?}");
+        assert_eq!(metrics.exec_resident_users_bytes.get(), user_bytes, "{mode:?}");
+        let slot = holder.rows.as_ref().unwrap();
+        assert_eq!((slot.users.row_count() as i64, slot.users.row_bytes() as i64), (user_rows, user_bytes));
+    }
 }
