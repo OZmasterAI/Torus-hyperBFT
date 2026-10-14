@@ -457,6 +457,68 @@ mod tests {
         assert_eq!(t.totals()[0].1.n, 2);
     }
 
+    /// Counts this thread's heap allocations (the test binary's allocator).
+    mod alloc_count {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static COUNT: Cell<u64> = const { Cell::new(0) };
+        }
+
+        struct Counting;
+
+        // SAFETY: every call forwards to `System`; the counter is a
+        // destructor-free const thread-local (no allocation to reach it).
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                unsafe { System.alloc(l) }
+            }
+            unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+                let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                unsafe { System.alloc_zeroed(l) }
+            }
+            unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+                let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+                unsafe { System.realloc(p, l, new) }
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                unsafe { System.dealloc(p, l) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOC: Counting = Counting;
+
+        pub fn allocations() -> u64 {
+            COUNT.with(|c| c.get())
+        }
+    }
+
+    #[test]
+    fn recording_and_rolling_never_allocate_after_setup() {
+        // Codex r1: each window's first wait allocated the histogram buffer
+        // under the tracker lock (wait_ready), and roll threw it away.
+        use alloc_count::allocations;
+        let mut r = ReleaseTiming::default();
+        for window in 0..4 {
+            let a0 = allocations();
+            r.on_ready([Some(5_000 + window), None]);
+            r.on_ready([None, Some(700)]);
+            r.on_ready([None, None]);
+            r.on_release(10_500, 10_000 - window);
+            assert_eq!(allocations() - a0, 0, "window {window}: wait/release path");
+            let a0 = allocations();
+            let w = r.roll();
+            assert_eq!(allocations() - a0, 0, "window {window}: roll (tracker lock)");
+            assert_eq!((w.ready_calls, w.wait_us[0].n, w.wait_us[1].n), (3, 1, 1));
+            assert_eq!((w.age_ms.n, w.age_ms.max), (1, 500 + window));
+        }
+        assert_eq!(r.totals()[1].1.n, 4);
+        assert_eq!(r.totals()[1].1.max, 5_003);
+    }
+
     #[test]
     fn window_and_hist_lines_are_stable() {
         let mut r = ReleaseTiming::default();
