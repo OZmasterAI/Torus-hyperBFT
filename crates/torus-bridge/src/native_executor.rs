@@ -4341,6 +4341,10 @@ mod block_marks_tests;
 mod sums_cache_tests;
 
 #[cfg(test)]
+#[path = "typed_loads_tests.rs"]
+mod typed_loads_tests;
+
+#[cfg(test)]
 #[path = "end_resident_worker_tests.rs"]
 mod end_resident_worker_tests;
 
