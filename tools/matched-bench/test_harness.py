@@ -65,18 +65,25 @@ class StubRpc(BaseHTTPRequestHandler):
         method, params = req.get("method", ""), req.get("params", [])
         arg = params[0] if params else ""
         # Skew: high market ids answer FIRST, so completion order != id order.
+        # The market id is the LAST param (torus_getPosition is [addr, market]).
+        key = params[-1] if params else ""
         try:
-            skew = max(0, 40 - int(str(arg), 16)) if str(arg).startswith("0x") else 5
+            skew = max(0, 40 - int(str(key), 16)) if str(key).startswith("0x") else 5
         except ValueError:
             skew = 5
         import time
 
         time.sleep(skew / 1000.0)
+        result = {"m": method, "a": str(arg)}
+        if len(params) > 1:
+            result["b"] = str(params[1])
+            # Optional per-(account, market) position state (PositionDigestTest).
+            result["s"] = self.server.positions.get((str(arg), str(params[1])))
         body = json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": req.get("id", 1),
-                "result": {"m": method, "a": str(arg)},
+                "result": result,
             }
         ).encode()
         self.send_response(200)
@@ -90,6 +97,7 @@ class DigestOrderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), StubRpc)
+        cls.srv.positions = {}
         cls.url = "http://127.0.0.1:%d" % cls.srv.server_address[1]
         cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
         cls.t.start()
@@ -98,7 +106,8 @@ class DigestOrderTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown()
 
-    def expected_stream(self, markets, accounts):
+    def expected_stream(self, markets, accounts, pos_accounts=(), positions=None):
+        positions = positions or {}
         lines = []
         for m in range(1, markets + 1):
             hx = "0x%x" % m
@@ -106,17 +115,42 @@ class DigestOrderTest(unittest.TestCase):
             lines.append(jq_compact({"m": "torus_getOpenInterest", "a": hx}))
         for a in accounts:
             lines.append(jq_compact({"m": "torus_getBalances", "a": a}))
+        # Positions last: account by account (file order), markets in id order.
+        for a in pos_accounts:
+            for m in range(1, markets + 1):
+                hx = "0x%x" % m
+                lines.append(
+                    jq_compact(
+                        {
+                            "m": "torus_getPosition",
+                            "a": a,
+                            "b": hx,
+                            "s": positions.get((a, hx)),
+                        }
+                    )
+                )
         return "".join(line + "\n" for line in lines)
 
-    def run_digest(self, markets, accounts, par):
+    def run_digest(self, markets, accounts, par, pos_accounts=None):
+        """pos_accounts: None = the 6-argument call (no positions file);
+        a list = written to a file passed as the 7th argument; "" = an
+        explicit empty 7th argument."""
         d = tempfile.mkdtemp(prefix="digest-test-")
         try:
             acct = os.path.join(d, "accounts.txt")
             with open(acct, "w") as f:
                 f.write("".join(a + "\n" for a in accounts))
             out = os.path.join(d, "state-digest.txt")
+            argv = ["bash", DIGEST_SH, self.url, str(markets), acct, out, str(par), "10"]
+            if pos_accounts == "":
+                argv.append("")
+            elif pos_accounts is not None:
+                pos = os.path.join(d, "position-accounts.txt")
+                with open(pos, "w") as f:
+                    f.write("".join(a + "\n" for a in pos_accounts))
+                argv.append(pos)
             r = subprocess.run(
-                ["bash", DIGEST_SH, self.url, str(markets), acct, out, str(par), "10"],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=180,
@@ -153,6 +187,61 @@ class DigestOrderTest(unittest.TestCase):
         self.assertEqual(len(parts), 2, "stdout must be '<sha256> <wall_seconds>'")
         self.assertEqual(len(parts[0]), 64)
         float(parts[1])
+
+    # --- liquidation stress: positions of the protocol accounts (vault + ADL
+    # escrows) via torus_getPosition per market, after the balances.
+    def test_position_accounts_follow_balances_in_order(self):
+        accounts = ["0xaa01", "0xaa02"]
+        pos = ["0xee01", "0xee02", "0xee03"]
+        want = self.expected_stream(30, accounts, pos)
+        serial, out1 = self.run_digest(30, accounts, 1, pos)
+        self.assertEqual(serial, want, "positions: account order, then market order")
+        par, out8 = self.run_digest(30, accounts, 8, pos)
+        self.assertEqual(par, serial, "-P 8 must not reorder the position parts")
+        sha = hashlib.sha256(want.encode()).hexdigest()
+        self.assertIn(sha, out1)
+        self.assertIn(sha, out8)
+
+    def test_no_or_empty_position_file_leaves_stream_unchanged(self):
+        accounts = ["0xaa01", "0xaa02"]
+        want = self.expected_stream(9, accounts)
+        self.assertEqual(self.run_digest(9, accounts, 4)[0], want)
+        self.assertEqual(self.run_digest(9, accounts, 4, "")[0], want)
+
+    def test_escrow_position_changes_the_digest(self):
+        esc = "0x746f7275732d61646c2d657363726f772d6c6e67"
+        accounts = ["0xaa01", esc]
+        try:
+            self.srv.positions = {}
+            flat, sflat = self.run_digest(5, accounts, 4, [esc])
+            base, sbase = self.run_digest(5, accounts, 4)
+            self.srv.positions = {(esc, "0x3"): {"side": "long", "size": "2.5"}}
+            held, sheld = self.run_digest(5, accounts, 4, [esc])
+            base2, sbase2 = self.run_digest(5, accounts, 4)
+        finally:
+            self.srv.positions = {}
+        self.assertNotEqual(sflat.split()[0], sheld.split()[0])
+        self.assertIn('"size":"2.5"', held)
+        # Without the positions file the escrow position is invisible.
+        self.assertEqual(sbase.split()[0], sbase2.split()[0])
+
+    def test_unreadable_position_file_is_refused(self):
+        d = tempfile.mkdtemp(prefix="digest-test-")
+        try:
+            acct = os.path.join(d, "a.txt")
+            with open(acct, "w") as f:
+                f.write("0xaa01\n")
+            r = subprocess.run(
+                ["bash", DIGEST_SH, self.url, "2", acct, os.path.join(d, "o"),
+                 "2", "10", os.path.join(d, "missing.txt")],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("position accounts", r.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ summarize.py
@@ -2476,6 +2565,10 @@ class OracleFeedHarnessTest(unittest.TestCase):
 
 
 LIQUIDATOR_VAULT = "0x746f7275732d6c697175696461746f722d766c74"
+# torus_core::liquidation::ADL_ESCROW_LONG / ADL_ESCROW_SHORT.
+ADL_ESCROW_LONG = "0x746f7275732d61646c2d657363726f772d6c6e67"
+ADL_ESCROW_SHORT = "0x746f7275732d61646c2d657363726f772d736874"
+PROTOCOL_ACCOUNTS = [LIQUIDATOR_VAULT, ADL_ESCROW_LONG, ADL_ESCROW_SHORT]
 
 
 def sandbox_repo(tmp):
@@ -2743,6 +2836,8 @@ class LiqStressHarnessTest(unittest.TestCase):
         for doc in ("#   LIQ_THIN=N", "#   ORACLE_SHOCK_BP=S"):
             self.assertIn(doc, head)
         self.assertIn(f"LIQUIDATOR_VAULT={LIQUIDATOR_VAULT}", self.src)
+        self.assertIn(f"ADL_ESCROW_LONG={ADL_ESCROW_LONG}", self.src)
+        self.assertIn(f"ADL_ESCROW_SHORT={ADL_ESCROW_SHORT}", self.src)
         with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
             allow = f.read()
         for k in (
@@ -2941,12 +3036,42 @@ class LiqStressHarnessTest(unittest.TestCase):
             env=dict(base, **env),
         )
 
+    def test_protocol_addresses_match_the_rust_constants(self):
+        """The run-cell.sh hex addresses are the 20-byte ASCII names in
+        torus_core::liquidation (a renamed constant must fail here, not
+        silently digest an empty account)."""
+        import re
+
+        with open(
+            os.path.join(REPO, "crates", "torus-core", "src", "liquidation.rs")
+        ) as f:
+            rs = f.read()
+        for name in ("LIQUIDATOR_VAULT", "ADL_ESCROW_LONG", "ADL_ESCROW_SHORT"):
+            m = re.search(
+                r"pub const %s: Address = Address::new\(\*b\"([^\"]{20})\"\);" % name,
+                rs,
+            )
+            self.assertIsNotNone(m, name)
+            want = "0x" + m.group(1).encode().hex()
+            self.assertIn(f"\n{name}={want}\n", self.src, name)
+        self.assertIn(
+            "*a == ADL_ESCROW_LONG || *a == ADL_ESCROW_SHORT", rs,
+            "is_adl_escrow no longer names exactly the two escrows: update the digest",
+        )
+
     def test_vault_joins_the_digest_only_when_enabled(self):
+        """Liquidation stress: the vault and both ADL escrows join the
+        balance accounts AND the position accounts (torus_getPosition per
+        market); default cells digest exactly the 50 load senders, no
+        positions file."""
         on = self.fn("liq_stress_on() {", "\n}\n")
         block = self.fn(
             '"$BENCH" gen-accounts --offset 60 --count 50',
-            'DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")',
+            "DIG_POS_ACCTS=",
         )
+        block = block + self.src[
+            self.src.index("DIG_POS_ACCTS=", self.src.index(block)) + len("DIG_POS_ACCTS=") :
+        ].split("\n", 1)[0] + "\n"
         tmp = tempfile.mkdtemp(prefix="liq-dig-")
         try:
             bench = os.path.join(tmp, "bt")
@@ -2954,31 +3079,71 @@ class LiqStressHarnessTest(unittest.TestCase):
                 f.write("#!/bin/sh\necho '60 0xaaa'\necho '61 0xbbb'\n")
             os.chmod(bench, 0o755)
             script = (
-                'log() { echo "$*" >&2; }\nLIQUIDATOR_VAULT=%s\nBENCH=%s\nOUT=%s\n'
-                % (LIQUIDATOR_VAULT, bench, tmp)
+                'log() { echo "$*" >&2; }\nLIQUIDATOR_VAULT=%s\nADL_ESCROW_LONG=%s\n'
+                "ADL_ESCROW_SHORT=%s\nBENCH=%s\nOUT=%s\n"
+                % (LIQUIDATOR_VAULT, ADL_ESCROW_LONG, ADL_ESCROW_SHORT, bench, tmp)
                 + on
                 + block
-                + '\necho "$DIG_ACCTS"\n'
+                + '\necho "$DIG_ACCTS $DIG_POS_ACCTS ${#DIG_POS[@]} ${DIG_POS[*]-}"\n'
             )
-            for env, accts in (
-                (dict(LIQ_THIN="0", ORACLE_SHOCK_BP="0"), ["0xaaa", "0xbbb"]),
+            posf = os.path.join(tmp, "digest-position-accounts.txt")
+            for env, accts, pos in (
+                (dict(LIQ_THIN="0", ORACLE_SHOCK_BP="0"), ["0xaaa", "0xbbb"], None),
                 (
                     dict(LIQ_THIN="5", ORACLE_SHOCK_BP="0"),
-                    ["0xaaa", "0xbbb", LIQUIDATOR_VAULT],
+                    ["0xaaa", "0xbbb"] + PROTOCOL_ACCOUNTS,
+                    PROTOCOL_ACCOUNTS,
                 ),
                 (
                     dict(LIQ_THIN="0", ORACLE_SHOCK_BP="400"),
-                    ["0xaaa", "0xbbb", LIQUIDATOR_VAULT],
+                    ["0xaaa", "0xbbb"] + PROTOCOL_ACCOUNTS,
+                    PROTOCOL_ACCOUNTS,
                 ),
             ):
+                if os.path.exists(posf):
+                    os.unlink(posf)
                 r = self._run(script, **env)
+                want = (
+                    "%d 0 0" % len(accts)
+                    if pos is None
+                    else "%d %d 1 %s" % (len(accts), len(pos), posf)
+                )
                 self.assertEqual(
-                    (r.returncode, r.stdout.strip()),
-                    (0, str(len(accts))),
-                    (env, r.stderr),
+                    (r.returncode, r.stdout.strip()), (0, want), (env, r.stderr)
                 )
                 with open(os.path.join(tmp, "digest-accounts.txt")) as f:
                     self.assertEqual(f.read().split(), accts, env)
+                if pos is None:
+                    self.assertFalse(os.path.exists(posf), env)
+                else:
+                    with open(posf) as f:
+                        self.assertEqual(f.read().split(), pos, env)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_digest_nodes_get_the_positions_file_only_when_enabled(self):
+        loop = self.fn("DIG_PIDS=()\n", 'wait "${DIG_PIDS[@]}"')
+        tmp = tempfile.mkdtemp(prefix="liq-dign-")
+        try:
+            stub = os.path.join(tmp, "digest-node.sh")
+            with open(stub, "w") as f:
+                f.write('#!/bin/sh\necho "$# ${7-}"\n')
+            os.chmod(stub, 0o755)
+            for pos, want in (
+                ("DIG_POS=()", "6"),
+                ('DIG_POS=("%s/p.txt")' % tmp, "7 %s/p.txt" % tmp),
+            ):
+                script = (
+                    "set -u\nTOOLS_DIR=%s\nOUT=%s\nRPCS=(u0 u1 u2)\nMARKETS=3\n"
+                    "DIGEST_PAR=2\nRPC_TIMEOUT=5\n%s\n" % (tmp, tmp, pos)
+                    + loop
+                    + "\n"
+                )
+                r = self._run(script)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for i in range(3):
+                    with open(os.path.join(tmp, "digest-val%d.out" % i)) as f:
+                        self.assertEqual(f.read().strip(), want, pos)
         finally:
             shutil.rmtree(tmp)
 
