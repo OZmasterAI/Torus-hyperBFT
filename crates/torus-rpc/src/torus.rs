@@ -126,11 +126,15 @@ pub trait TorusApi {
     async fn get_liquidator_vault(&self) -> RpcResult<RpcLiquidatorVault>;
 
     // --- 2.9.2: Market info ---
+    /// `after`: a market id as the reply prints it; the page starts at the
+    /// first market above it (sought, not skipped). Pass the last id of a page
+    /// to get the next one. Not combined with an `offset` above 0.
     #[method(name = "getMarkets")]
     async fn get_markets(
         &self,
         offset: Option<u32>,
         limit: Option<u32>,
+        after: Option<String>,
     ) -> RpcResult<Vec<RpcMarketInfo>>;
 
     #[method(name = "getTradeHistory")]
@@ -1253,10 +1257,29 @@ impl TorusApiServer for RpcState {
         &self,
         offset: Option<u32>,
         limit: Option<u32>,
+        after: Option<String>,
     ) -> RpcResult<Vec<RpcMarketInfo>> {
         const MAX_MARKETS_PER_PAGE: usize = 500;
         let offset = offset.unwrap_or(0) as usize;
         let limit = limit.unwrap_or(100).min(MAX_MARKETS_PER_PAGE as u32) as usize;
+        // The page start: the first key above the cursor. Keys are u64
+        // big-endian, so byte order is id order. No market above u64::MAX.
+        let start = match after {
+            None => None,
+            Some(_) if offset > 0 => {
+                return Err(RpcError::InvalidParams(
+                    "offset counts from the first market; pass offset 0 with after".into(),
+                )
+                .into())
+            }
+            Some(a) => match parse_u64(&a)
+                .map_err(ErrorObjectOwned::from)?
+                .checked_add(1)
+            {
+                Some(next) => Some(next.to_be_bytes()),
+                None => return Ok(Vec::new()),
+            },
+        };
 
         let db = self.state.inner();
         let cf = db
@@ -1264,11 +1287,14 @@ impl TorusApiServer for RpcState {
             .ok_or_else(|| RpcError::Internal("missing CF_NATIVE_MARKETS".into()))
             .map_err(ErrorObjectOwned::from)?;
 
-        let iter = db.iterator_cf(cf, IteratorMode::Start);
+        let iter = match &start {
+            Some(key) => db.iterator_cf(cf, IteratorMode::From(key, rocksdb::Direction::Forward)),
+            None => db.iterator_cf(cf, IteratorMode::Start),
+        };
         let mut markets = Vec::new();
         let mut scanned = 0usize;
         // R24: every market row visited, the ones before `offset` included,
-        // is charged to the scan budget (there is no seekable page start).
+        // is charged to the scan budget (`after` seeks past them instead).
         let mut budget = self.scan_budget();
 
         for item in iter {

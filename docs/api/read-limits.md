@@ -71,7 +71,7 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `torus_getBalances(trader)` | Budget. Each of the trader's position rows, and per market held its market row and (with an executed head) its oracle aggregate. The balance, EVM account, header and stake reads are constant. | `balances_and_liquidator_vault_stop_at_the_scan_budget` |
 | `torus_getLiquidatorVault` | Budget. Each of the vault's position rows; the balance read is constant. | `balances_and_liquidator_vault_stop_at_the_scan_budget` |
 | `torus_getPosition(trader, marketId)` | Budget for a cross position: its `liquidationPrice` (R23) values the whole account, so each of the trader's position rows, and per market held its market row and (with an executed head) its oracle aggregate, are charged as in `torus_getBalances`. The position row, its oracle aggregate and the header read are constant; an isolated position reads nothing more. | `cross_position_liquidation_price_stops_at_the_scan_budget` |
-| `torus_getMarkets(offset?, limit?)` | Budget. Every market row up to `offset + limit` (at most 500 per page): the rows before `offset` are read and counted, because the page start cannot be sought. | `markets_offset_is_charged_to_the_scan_budget` |
+| `torus_getMarkets(offset?, limit?, after?)` | Budget. With `after` (a market id as the reply prints it; s121) the page starts at the first market above it, sought directly: a page reads only its own rows (at most 500), so listing every market reads each row once. With `offset` every market row up to `offset + limit` is read and counted. `offset` above 0 with `after` is `-32602`. | `markets_offset_is_charged_to_the_scan_budget`, `markets_after_cursor_seeks_to_the_page` |
 | `torus_getTradeHistory(marketId, limit?)` | Budget, and `limit` (at most 1000 fills). Every trade row visited, newest first, by size, before it is decoded or skipped: rows the decoder skips (old format) do not count toward `limit`. | `trade_history_charges_every_row_visited` |
 | `torus_getTradeHistoryRange(marketId, from, to, limit?)` | Budget, and `limit` (at most 5000 fills). As `torus_getTradeHistory`, over `[from, to]`. | `trade_history_charges_every_row_visited` |
 | `torus_getBlockTrades(blockNumber)` | Budget. Every market row (one seek per market into the block's trade rows), even for a block with no trades, plus the block's trade rows by size. | `block_trades_are_charged_per_market_to_the_scan_budget` |
@@ -91,7 +91,7 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `eth_getTransactionByHash`, `eth_getTransactionReceipt` | Budget. The hash index, one body and the tx's receipt are constant; its eth index (and the receipt's log offset) reads one receipt slot per earlier body position, each charged as one row. | `block_lookups_charge_every_receipt_slot_to_the_scan_budget` (receipt) |
 | `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex` | Budget. The header and body are constant; the receipt lookup reads one slot per submitted transaction of the block, undecodable ones included (the gas limit does not bound them), and each slot read is one row, charged before it is made. A by-index lookup still reads every slot (as before) before it answers. | `block_lookups_charge_every_receipt_slot_to_the_scan_budget` |
 | `eth_call`, `eth_estimateGas` | The gas limit bounds the EVM's work (state point reads). | none needed |
-| `eth_getLogs` | Its own limits: a range of at most 10,000 blocks and at most 10,000 logs. Every receipt of every block in the range with EVM transactions is read, even when the filter keeps none of its logs. | `lib.rs` getLogs tests |
+| `eth_getLogs` | Budget, plus its own limits: a range of at most 10,000 blocks and at most 10,000 logs. Every receipt slot of every block in the range with EVM transactions is read and charged as one row, even when the filter keeps none of its logs (s121); blocks without EVM transactions read no receipt. | `get_logs_charges_every_receipt_slot_to_the_scan_budget`, `lib.rs` getLogs tests |
 | `eth_feeHistory` | Its own limit: at most 1024 headers. | none needed |
 | `eth_subscribe` | No DB reads: items are pushed from execution. | none needed |
 | `net_version`, `net_listening`, `net_peerCount`, `web3_clientVersion`, `web3_sha3` | No DB reads. | none needed |
@@ -133,19 +133,18 @@ index exists, or have a known cost noted here:
   so that every key and level row is validated as before. Reading only the
   best `depth` levels (mode 2 has a price index; mode 1 would need one) means
   giving up that whole-market validation, an owner decision.
-- `torus_getMarkets` with a large `offset`: seekable pagination (a cursor that
-  is a market id, seeked to directly) instead of skipping `offset` rows.
 - `torus_getBlockTrades`: a per-block trade index (block to the markets that
   traded in it, written with the trade rows), so a block reads only its own
   trade rows instead of seeking every market.
 - `torus_getBalances` / `torus_getLiquidatorVault` / cross `torus_getPosition` read one position per
   market held, so they stay proportional to the number of markets (listed by
   governance). No index is needed.
-- `eth_getLogs`: receipts of blocks whose logs the filter drops are not
-  counted toward any limit (the block lookups above charge the same receipt
-  slot reads; `eth_getLogs` reads them with no budget); charging each receipt
-  to the scan budget would bound a narrow filter over a full 10,000-block
-  range.
+- Block `logsBloom`: the proposer writes a zero bloom in every header (the
+  block is built before it executes), so `eth_getBlockByNumber` /
+  `ByHash` report `logsBloom` 0x00.. even for blocks with logs, and
+  `eth_getLogs` cannot skip blocks by bloom. A client or indexer that
+  trusts block blooms would skip blocks that have logs. Not a read limit;
+  listed here because it came up with the `eth_getLogs` budget (s121).
 - Book layout detection on a DB without the `__book_mode__` marker: write the
   marker once, from a write path such as a startup migration or the next
   executor save, never from an RPC. After that, detection is one row.

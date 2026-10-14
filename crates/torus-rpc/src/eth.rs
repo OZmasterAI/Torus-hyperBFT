@@ -1185,6 +1185,9 @@ impl EthApiServer for RpcState {
         check_pruned(self, from)?;
         const MAX_LOGS: usize = 10_000;
         let mut all_logs = Vec::new();
+        // R24 (owner s121): every receipt slot read, across the whole range and
+        // whether or not the filter keeps its logs, is charged to one budget.
+        let mut budget = self.scan_budget();
         // s84: blocks past the eth head are not executed here (their logs do
         // not exist yet) and are never scanned, so a range never comes back
         // short and later fills in.
@@ -1196,11 +1199,8 @@ impl EthApiServer for RpcState {
             if header.evm_tx_count == 0 {
                 continue;
             }
-            // Not charged (docs/api/read-limits.md, Follow-ups): the range and
-            // log limits bound getLogs.
             let receipts =
-                get_block_receipts(self, height, header.evm_tx_count, &mut ScanBudget::unlimited())
-                    .map_err(err)?;
+                get_block_receipts(self, height, header.evm_tx_count, &mut budget).map_err(err)?;
             let mut global_log_index: u32 = 0;
             for (eth_index, receipt) in receipts.iter().enumerate() {
                 for log in &receipt.logs {
