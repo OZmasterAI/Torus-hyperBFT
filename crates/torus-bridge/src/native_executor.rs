@@ -12846,7 +12846,10 @@ mod maker_accounts_tests {
             let table = BlockMarks::new(BlockMarks::read(&ctx.oracle, now, markets.iter().copied()).unwrap(), 7);
             // The block's view: an overlay with R (nothing pending), its context.
             let mut overlay = NativeStateOverlay::new(db.clone());
-            overlay.attach_resident(Arc::new(torus_state::ResidentRows::build(&overlay).unwrap()));
+            let rows = torus_state::ResidentRows::build(&overlay).unwrap();
+            // Phase 4 step 3: the persistent sums live on the users' records.
+            let mut users = Users::build(&rows);
+            overlay.attach_resident(Arc::new(rows));
             let rctx = NativeExecContext::new(overlay, 9, now, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
             let mut memo_sums = BlockSums { shadow: true, ..BlockSums::default() };
             memo_sums.start(Some(7));
@@ -12895,7 +12898,8 @@ mod maker_accounts_tests {
             let computed = c.computed.load(std::sync::atomic::Ordering::Relaxed);
             assert!(computed <= traders.len(), "round {round}: each trader built once ({computed})");
             assert!(memo_sums.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
-            let mut next = BlockSums { shadow: true, ..BlockSums::new(memo_sums.into_carry(None).cache) };
+            memo_sums.into_carry(None).finish(&mut users);
+            let mut next = BlockSums { shadow: true, records: Some(Arc::new(std::mem::take(&mut users))), ..BlockSums::default() };
             next.start(Some(7));
             let carried = AccountReader { marks: Some(&table), sums: Some(&next), ..AccountReader::of(&rctx) };
             for &(t, m) in &pairs {
