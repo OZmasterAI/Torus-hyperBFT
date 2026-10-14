@@ -987,7 +987,7 @@ async fn markets_offset_is_charged_to_the_scan_budget() {
     list_markets(&state, 1000);
 
     let s = server(&state, 100);
-    let e = s.state().get_markets(Some(999), Some(1)).await.unwrap_err();
+    let e = s.state().get_markets(Some(999), Some(1), None).await.unwrap_err();
     assert_scan_limit(&e, "offset 999 of 1000 markets, budget 100");
     assert!(
         (1..=101).contains(&examined(&s)),
@@ -997,7 +997,7 @@ async fn markets_offset_is_charged_to_the_scan_budget() {
 
     // The first page fits: the same rows as before.
     let s = server(&state, 100);
-    let page = s.state().get_markets(None, Some(10)).await.unwrap();
+    let page = s.state().get_markets(None, Some(10), None).await.unwrap();
     assert_eq!(page.len(), 10);
     assert_eq!(page[0].market_id, "0x1");
     assert!(
@@ -1007,9 +1007,71 @@ async fn markets_offset_is_charged_to_the_scan_budget() {
     );
 
     let s = server(&state, 10_000);
-    let last = s.state().get_markets(Some(999), Some(1)).await.unwrap();
+    let last = s.state().get_markets(Some(999), Some(1), None).await.unwrap();
     assert_eq!(last.len(), 1);
     assert_eq!(last[0].market_id, "0x3e8");
+}
+
+/// `getMarkets(offset?, limit?, after?)`: `after` is a market id (as the
+/// reply prints it) and the page starts at the first market above it, sought
+/// directly, so a page reads only its own rows and listing every market
+/// reads each row once (offset paging re-reads every row before the page).
+#[tokio::test]
+async fn markets_after_cursor_seeks_to_the_page() {
+    let (_d, state) = db();
+    list_markets(&state, 1000);
+
+    let s = server(&state, 100);
+    let page = s.state().get_markets(None, Some(10), Some("0x5".into())).await.unwrap();
+    let ids: Vec<_> = page.iter().map(|m| m.market_id.as_str()).collect();
+    assert_eq!(ids, ["0x6", "0x7", "0x8", "0x9", "0xa", "0xb", "0xc", "0xd", "0xe", "0xf"]);
+    assert_eq!(examined(&s), 10, "only the page's rows");
+
+    // Deep in the table, under a budget the offset form is refused at.
+    let s = server(&state, 100);
+    let last = s.state().get_markets(None, Some(10), Some("0x3e7".into())).await.unwrap();
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].market_id, "0x3e8");
+    assert_eq!(examined(&s), 1);
+
+    // Past the last market, and at u64::MAX (no market above it): empty.
+    let s = server(&state, 100);
+    assert!(s.state().get_markets(None, None, Some("0x3e8".into())).await.unwrap().is_empty());
+    assert!(s.state().get_markets(None, None, Some("0xffffffffffffffff".into())).await.unwrap().is_empty());
+    assert_eq!(examined(&s), 0);
+
+    // Listing all 1000 in pages of 500 by cursor reads 1000 rows; by offset
+    // the same pages read 500 + 1000 + 1000 = 2500.
+    let s = server(&state, 10_000);
+    let mut all = Vec::new();
+    let mut after = None;
+    loop {
+        let page = s.state().get_markets(None, Some(500), after.clone()).await.unwrap();
+        let n = page.len();
+        after = page.last().map(|m| m.market_id.clone());
+        all.extend(page);
+        if n < 500 {
+            break;
+        }
+    }
+    assert_eq!(all.len(), 1000);
+    assert_eq!(all[999].market_id, "0x3e8");
+    assert_eq!(examined(&s), 1000);
+    let s = server(&state, 10_000);
+    for offset in [0, 500, 1000] {
+        s.state().get_markets(Some(offset), Some(500), None).await.unwrap();
+    }
+    assert_eq!(examined(&s), 2500);
+
+    // offset counts from the table start, so it cannot be combined with a
+    // cursor (0 / absent is fine); a bad cursor is invalid params.
+    let s = server(&state, 10_000);
+    let page = s.state().get_markets(Some(0), Some(1), Some("0x1".into())).await.unwrap();
+    assert_eq!(page[0].market_id, "0x2");
+    let e = s.state().get_markets(Some(1), Some(1), Some("0x1".into())).await.unwrap_err();
+    assert_eq!(e.code(), -32602, "{e:?}");
+    let e = s.state().get_markets(None, Some(1), Some("not-hex".into())).await.unwrap_err();
+    assert_eq!(e.code(), -32602, "{e:?}");
 }
 
 /// [P2] `getBlockTrades` seeks every market's trade rows for the block, even
@@ -1813,6 +1875,36 @@ async fn block_lookups_charge_every_receipt_slot_to_the_scan_budget() {
     let r = st.get_transaction_receipt(tx900).await.unwrap().expect("receipt");
     assert_eq!(r.transaction_index, "0x1");
     assert_eq!(examined(&s), 3900);
+}
+
+/// R24 follow-up (owner s121, option a): `eth_getLogs` charges every receipt
+/// slot it reads to the request's one scan budget, across all blocks of the
+/// range, also when the filter drops every log. Blocks without EVM txs read
+/// no receipt and are not charged. Over the budget: `-32005` after at most
+/// `max + 1` reads; under it the answer is as before.
+#[tokio::test]
+async fn get_logs_charges_every_receipt_slot_to_the_scan_budget() {
+    use crate::eth::EthApiServer;
+    let (_d, state) = db();
+    put_block_with_slots(&state, 1, 60, &[10]);
+    put_block_with_slots(&state, 2, 60, &[]);
+    put_block_with_slots(&state, 3, 0, &[]);
+    let filter = || crate::types::LogFilter {
+        from_block: Some("0x1".into()),
+        to_block: Some("0x3".into()),
+        address: Some(serde_json::json!(hex_addr(addr(7)))),
+        topics: None,
+    };
+
+    // Each block fits the budget on its own; the range does not.
+    let s = server(&state, 100);
+    let e = s.state().get_logs(filter()).await.unwrap_err();
+    assert_scan_limit(&e, "getLogs: 120 slots over 2 blocks, budget 100");
+    assert!((1..=101).contains(&examined(&s)), "examined {}", examined(&s));
+
+    let s = server(&state, 10_000);
+    assert!(s.state().get_logs(filter()).await.unwrap().is_empty());
+    assert_eq!(examined(&s), 120, "one per slot; block 3 has none");
 }
 
 /// `torus_getValidators` looks each validator's state up by address (a map,
