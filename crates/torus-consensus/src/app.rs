@@ -1971,29 +1971,42 @@ fn detect_parent_link_violation<B: StateBackend>(
 }
 
 /// D12 nonce window: the parent block's time in ms, the cursor of the
-/// block's nonce-window prune (consensus data, not a node-local key). Height
-/// 1's parent is the synthetic genesis header (time 0). `Ok(None)`: the
-/// parent header row is absent or does not decode; the caller then scans from
-/// 0, which finds the same rows (after every block no row below its cutoff
-/// is left, so nothing lies below the parent's cutoff), only with more
-/// RocksDB tombstones to step over. `Err`: a read fault (the caller
-/// fail-stops).
+/// block's nonce-window prune (consensus data, not a node-local key).
+///
+/// Height 1's parent is the synthetic genesis header (time 0, never
+/// persisted): its cursor is explicit, and the scan from 0 is bounded because
+/// no block ran before it — the CF holds no tombstone and no nonce row a block
+/// wrote (genesis writes none).
+///
+/// Any other height: the parent header row must exist and decode. An absent or
+/// undecodable row is a local fault (`Err`, the caller fail-stops), never a
+/// scan from 0 — that finds the same rows but steps over every nonce
+/// tombstone ever written (nonce compaction is not wired), unbounded work.
+/// Headers are never pruned and snapshots copy the whole DB, so the row of a
+/// committed parent is always there on a healthy node.
 fn parent_block_ms<B: StateBackend>(
     state: &B,
     height: u64,
-) -> Result<Option<u64>, torus_state::StateError> {
+) -> Result<u64, torus_state::StateError> {
     if height <= 1 {
-        return Ok(Some(torus_types::eip712::block_timestamp_ms(
+        return Ok(torus_types::eip712::block_timestamp_ms(
             torus_bridge::genesis_parent_header().timestamp,
-        )));
+        ));
     }
-    let Some(row) = state.get_cf_raw(CF_BLOCK_HEADERS, &(height - 1).to_be_bytes())? else {
-        return Ok(None);
+    let parent = height - 1;
+    let Some(row) = state.get_cf_raw(CF_BLOCK_HEADERS, &parent.to_be_bytes())? else {
+        return Err(torus_state::StateError::InvalidData(format!(
+            "D12: parent header {parent} missing"
+        )));
     };
-    Ok(row
-        .get(32..)
+    row.get(32..)
         .and_then(|json| serde_json::from_slice::<TorusBlockHeader>(json).ok())
-        .map(|parent| torus_types::eip712::block_timestamp_ms(parent.timestamp)))
+        .map(|parent| torus_types::eip712::block_timestamp_ms(parent.timestamp))
+        .ok_or_else(|| {
+            torus_state::StateError::InvalidData(format!(
+                "D12: parent header {parent} does not decode"
+            ))
+        })
 }
 
 /// A proposal's parent as this replica's block tree shows it (s84 decision 2).
@@ -2245,17 +2258,9 @@ impl ExecutionContext {
     ) -> Result<Vec<Vec<u8>>, torus_state::StateError> {
         let height = block.header.height;
         let block_ms = torus_types::eip712::block_timestamp_ms(block.header.timestamp);
-        let parent_ms = match parent_block_ms(overlay, height)? {
-            Some(ms) => ms,
-            None => {
-                tracing::warn!(
-                    height,
-                    "D12: parent header not readable — nonce-window prune scans from 0 \
-                     (same rows, more tombstones to step over)"
-                );
-                0
-            }
-        };
+        // A missing / undecodable parent header is an `Err` too: the caller
+        // fail-stops (Codex r1: a scan from 0 is unbounded work).
+        let parent_ms = parent_block_ms(overlay, height)?;
         #[cfg(not(test))]
         let expired = torus_state::nonce_window::expired_nonce_keys(overlay, parent_ms, block_ms)?;
         #[cfg(test)]
@@ -3283,7 +3288,8 @@ impl ExecutionContext {
         // D12 nonce window: the nonce rows this block's cutoff passes, deleted
         // in the native phase below or, without one, riding the marker set.
         // R02: a read fault is not "nothing expired" (other nodes delete
-        // them): fail-stop.
+        // them): fail-stop. So is an unreadable non-genesis parent header
+        // (the cursor; Codex r1).
         let expired_nonces = self.expired_nonces(&overlay, torus_block);
         #[cfg(test)]
         let expired_nonces = if self.test_replay_fault == Some(ReplayFault::NoncePrune) {
@@ -10661,6 +10667,9 @@ mod crash_recovery_tests {
         let (config, state_db) = make_test_config_and_db();
         let exec_ctx = make_exec_ctx(&config, &state_db);
         let block = make_block(5, vec![sign_claim_rewards(21), sign_claim_rewards(22)]);
+        // D12: the parent header is the nonce-window cursor; a non-genesis
+        // block without it fail-stops (Codex r1).
+        persist_block_header(&state_db, &make_block(4, vec![]));
         assert!(
             state_db
                 .get_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes())
@@ -13256,6 +13265,9 @@ mod crash_recovery_tests {
         state_db
             .put_cf_raw(CF_BLOCK_HEADERS, &block.header.height.to_be_bytes(), &data)
             .unwrap();
+        // D12: the applied parent's header (the nonce-window cursor; a
+        // non-genesis block without it fail-stops, Codex r1).
+        persist_block_header(&state_db, &make_block(2, vec![]));
 
         // ADAPTED for T156-F2 whole-gap replay: replay now walks the ENTIRE
         // [applied+1, committed] gap, not just the single top committed height.
