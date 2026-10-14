@@ -4209,6 +4209,10 @@ mod cloid_index_tests;
 mod cloid_equiv_tests;
 
 #[cfg(test)]
+#[path = "book_index_tests.rs"]
+mod book_index_tests;
+
+#[cfg(test)]
 #[path = "margin_label_tests.rs"]
 mod margin_label_tests;
 
@@ -5158,6 +5162,38 @@ impl<T: StateBackend> NativeExecContext<T> {
             self.cloid_markets.as_ref().map(CloidMarkets::snapshot),
             cloid_index_rebuilt(&self.order_books),
         )
+    }
+
+    /// Every book, read-only.
+    #[inline]
+    pub fn order_books(&self) -> &HashMap<MarketId, OrderBook> {
+        &self.order_books
+    }
+
+    /// `market`'s book, read-only.
+    #[inline]
+    pub fn order_book(&self, market: MarketId) -> Option<&OrderBook> {
+        self.order_books.get(&market)
+    }
+
+    /// RED stub: `market`'s book, mutable.
+    pub fn order_book_mut(&mut self, market: MarketId) -> Option<&mut OrderBook> {
+        self.order_books.get_mut(&market)
+    }
+
+    /// RED stub: put `book` at `market`.
+    pub fn insert_order_book(&mut self, market: MarketId, book: OrderBook) -> Option<OrderBook> {
+        self.order_books.insert(market, book)
+    }
+
+    /// RED stub: take every book out.
+    pub fn take_order_books(&mut self) -> HashMap<MarketId, OrderBook> {
+        std::mem::take(&mut self.order_books)
+    }
+
+    /// RED stub: replace every book.
+    pub fn set_order_books(&mut self, books: HashMap<MarketId, OrderBook>) {
+        self.order_books = books;
     }
 
     /// Drain the block's fills (`trade_index` order). Under `defer_trades` the
