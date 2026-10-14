@@ -263,6 +263,32 @@ fn synthetic_users_are_regular_and_round_trip() {
     }
 }
 
+/// Market makers (the `mm100` / `mm300` shapes): 100 and 300 positions, in
+/// distinct markets (300 = every market), regular and byte-for-byte round
+/// trips like the light and active users.
+#[test]
+fn synthetic_market_makers_are_regular_and_round_trip() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for k in [100, 300] {
+        let (pos, bal) = synth(60, k);
+        let p = UsersProbe::build(&pos, &bal);
+        check_regular(&p, 60, k);
+        assert_eq!(p.encode_rows(true), pos, "positions CF round trip (k {k})");
+        assert_eq!(p.encode_rows(false), bal, "balances CF round trip (k {k})");
+    }
+    // Every stride, every start: `markets(i, k)` is k distinct markets of
+    // 1..=300 (and all 300 for k = 300).
+    for i in 0..2000 {
+        for k in [100, 300] {
+            let ms = markets(i, k);
+            assert_eq!(ms.len(), k);
+            assert!(ms.windows(2).all(|w| w[0] < w[1]), "user {i}: {k} distinct markets");
+            assert!(ms.iter().all(|m| (1..=MARKETS).contains(m)));
+        }
+        assert_eq!(markets(i, 300), (1..=MARKETS).collect::<Vec<_>>(), "user {i}: every market");
+    }
+}
+
 /// jemalloc's size classes as the counter rounds them.
 #[test]
 fn jemalloc_size_classes() {
