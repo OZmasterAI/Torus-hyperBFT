@@ -1,0 +1,60 @@
+== 1. tails > T per validator per 100 s, by tag; IN = in a (pseudo-)window, others outside
+SAT T=1138 ms
+  IN       s2  5.20  m  1.79  s2-m +3.42
+  timeout  s2  2.19  m  0.41  s2-m +1.78
+  epoch    s2  0.14  m  0.48  s2-m -0.34
+  execbp   s2  1.71  m  1.58  s2-m +0.13
+  other    s2  0.48  m  1.31  s2-m -0.83
+  outside  s2  4.52  m  3.78  s2-m +0.74
+soak T=1196 ms
+  IN       s2  5.44  m  2.28  s2-m +3.16
+  timeout  s2  0.22  m  0.22  s2-m -0.00
+  epoch    s2  0.00  m  0.28  s2-m -0.28
+  execbp   s2  0.94  m  1.83  s2-m -0.89
+  other    s2  0.11  m  1.28  s2-m -1.17
+  outside  s2  1.28  m  3.61  s2-m -2.33
+== 2. tail intervals > T: mean ms and share of the summed interval length
+d3  SAT  out n  31  interval  1533  blocked-on-send  526 (34%)  persist max-node p50   30  exec gap mean (n 19)    2  residual  825 (54%)
+d3  SAT  win n  31  interval  1454  blocked-on-send  586 (40%)  persist max-node p50   58  exec gap mean (n 25)   72  residual  691 (48%)
+d3  soak out n  29  interval  1414  blocked-on-send  833 (59%)  persist max-node p50   62  exec gap mean (n 24)    1  residual  458 (32%)
+d3  soak win n  95  interval  1571  blocked-on-send  644 (41%)  persist max-node p50   51  exec gap mean (n 80)   44  residual  700 (45%)
+m   SAT  out n  55  interval  1281  blocked-on-send  598 (47%)  persist max-node p50  101  exec gap mean (n 47)    8  residual  458 (36%)
+m   SAT  win n  26  interval  1331  blocked-on-send  542 (41%)  persist max-node p50  170  exec gap mean (n 22)   16  residual  494 (37%)
+m   soak out n  65  interval  1321  blocked-on-send  692 (52%)  persist max-node p50  199  exec gap mean (n 63)   11  residual  340 (26%)
+m   soak win n  41  interval  1348  blocked-on-send  652 (48%)  persist max-node p50  230  exec gap mean (n 36)   10  residual  395 (29%)
+s2  SAT  out n  66  interval  1330  blocked-on-send  441 (33%)  persist max-node p50   48  exec gap mean (n 33)    1  residual  755 (57%)
+s2  SAT  win n  76  interval  1580  blocked-on-send  503 (32%)  persist max-node p50   59  exec gap mean (n 58)   45  residual  943 (60%)
+s2  soak out n  23  interval  1333  blocked-on-send  884 (66%)  persist max-node p50   62  exec gap mean (n 20)    1  residual  300 (23%)
+s2  soak win n  98  interval  1591  blocked-on-send  615 (39%)  persist max-node p50   47  exec gap mean (n 90)   24  residual  826 (52%)
+== 3. state writes per node: big = total >= 1.0 s; seconds and MB per write sample
+r1-s2  big n 19 total s p10/p50/p90 1.21/1.39/1.70  DB s p50 0.86  MB p50 228 max 238 | follow-ups n  27 total s p50/p90 0.29/0.86
+r2-s2  big n 18 total s p10/p50/p90 1.24/1.51/1.69  DB s p50 0.92  MB p50 234 max 244 | follow-ups n  26 total s p50/p90 0.29/0.75
+r3-s2  big n 18 total s p10/p50/p90 1.05/1.51/1.75  DB s p50 0.99  MB p50 219 max 232 | follow-ups n  29 total s p50/p90 0.34/0.70
+r4-s2  big n 12 total s p10/p50/p90 1.15/1.27/1.33  DB s p50 0.86  MB p50 233 max 242 | follow-ups n  29 total s p50/p90 0.49/0.76
+k1-s2  big n 67 total s p10/p50/p90 1.07/1.25/1.48  DB s p50 0.95  MB p50 254 max 268 | follow-ups n 118 total s p50/p90 0.48/0.90
+u1-d3  big n 14 total s p10/p50/p90 1.06/1.30/1.45  DB s p50 0.87  MB p50 205 max 258 | follow-ups n  27 total s p50/p90 0.40/0.97
+u2-d3  big n 14 total s p10/p50/p90 1.03/1.39/1.70  DB s p50 0.89  MB p50 215 max 229 | follow-ups n  28 total s p50/p90 0.46/0.83
+k1-d3  big n 73 total s p10/p50/p90 1.08/1.32/1.49  DB s p50 0.92  MB p50 255 max 269 | follow-ups n 101 total s p50/p90 0.54/0.93
+== 4. per second, 3 nodes: disk writes GB/s and node CPU cores, in / out of windows
+r1-s2  write GB/s in p50 0.34 p90 0.56 max 0.81 | out p50 0.00 p90 0.24   cores in p10  3.4 p50 14.0 max 24.7 | out p50 11.1
+r2-s2  write GB/s in p50 0.34 p90 0.74 max 0.85 | out p50 0.00 p90 0.24   cores in p10  3.5 p50 15.3 max 23.6 | out p50 11.0
+r3-s2  write GB/s in p50 0.34 p90 0.53 max 0.61 | out p50 0.12 p90 0.28   cores in p10  3.2 p50 13.0 max 24.7 | out p50 13.7
+r4-s2  write GB/s in p50 0.37 p90 0.74 max 0.87 | out p50 0.11 p90 0.25   cores in p10  3.5 p50 14.4 max 25.2 | out p50 13.3
+k1-s2  write GB/s in p50 0.34 p90 0.57 max 0.85 | out p50 0.17 p90 0.31   cores in p10 11.7 p50 15.5 max 23.4 | out p50 15.3
+u1-d3  write GB/s in p50 0.36 p90 0.55 max 0.68 | out p50 0.13 p90 0.28   cores in p10  3.2 p50 14.1 max 25.0 | out p50 13.8
+u2-d3  write GB/s in p50 0.32 p90 0.54 max 0.69 | out p50 0.16 p90 0.29   cores in p10  5.1 p50 13.5 max 25.4 | out p50 13.9
+k1-d3  write GB/s in p50 0.34 p90 0.56 max 0.82 | out p50 0.19 p90 0.31   cores in p10 11.6 p50 15.1 max 24.2 | out p50 15.9
+== 5. RocksDB stall counters, max over the cell and nodes
+r1-s2  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+r1-m   stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+r2-s2  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+r2-m   stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+r3-s2  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+r3-m   stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+r4-s2  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+r4-m   stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+k1-s2  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+k1-m   stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+u1-d3  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+u2-d3  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
+k1-d3  stall_micros=0 write_stall_count=0 write_stall_max_micros=0 write_stall_p99_micros=0 write_stall_sum_micros=0 write_stopped=0
