@@ -224,7 +224,7 @@ fn levels(n: i64) -> Vec<i64> {
 
 /// MAKER's resting orders on market 1 below `price` (the churn the tests add).
 fn churn_ids<T: StateBackend + Clone>(ctx: &NativeExecContext<T>, below: i64) -> Vec<u128> {
-    let book = ctx.order_books.get(&1).expect("book loaded");
+    let book = ctx.order_books().get(&1).expect("book loaded");
     book.orders_for_trader(&MAKER)
         .iter()
         .filter(|o| o.price < fp(below))
@@ -766,7 +766,7 @@ fn churn_levels(db: &StateDb, prices: &[i64]) {
         .unwrap();
     let mut ctx = ctx_on(db.clone(), 3, BookMode::LevelAuthority);
     let ids: Vec<u128> = {
-        let book = ctx.order_books.get(&1).expect("book");
+        let book = ctx.order_books().get(&1).expect("book");
         book.orders_for_trader(&MAKER)
             .iter()
             .filter(|o| o.price > fp(100))
@@ -847,7 +847,7 @@ fn parent_and_current_block_deletes_change_neither_gas_nor_answer() {
     let ov = NativeStateOverlay::new(db.clone());
     let mut ctx = ctx_on(ov.clone(), 3, BookMode::LevelAuthority);
     let ids: Vec<u128> = {
-        let book = ctx.order_books.get(&1).expect("book");
+        let book = ctx.order_books().get(&1).expect("book");
         book.orders_for_trader(&MAKER)
             .iter()
             .filter(|o| o.price > fp(100))
@@ -911,7 +911,7 @@ fn a_block_flush_that_deletes_level_rows_compacts_them_away() {
     let ov = NativeStateOverlay::new(db.clone());
     let mut ctx = ctx_on(ov.clone(), 3, BookMode::LevelAuthority);
     let ids = {
-        let book = ctx.order_books.get(&1).expect("book");
+        let book = ctx.order_books().get(&1).expect("book");
         book.orders_for_trader(&MAKER)
             .iter()
             .filter(|o| o.price > fp(100))

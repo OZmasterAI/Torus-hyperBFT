@@ -85,7 +85,7 @@ fn save_writes_only_dirty_markets() {
     // Block 2 (fresh context = fresh block): touch market 1 only.
     let mut ctx = make_ctx(db.clone());
     fund_native(&ctx, &addr(2), fp(1_000_000));
-    assert_eq!(ctx.order_books.len(), 2, "both books load");
+    assert_eq!(ctx.order_books().len(), 2, "both books load");
     let r = NativeExecutor::execute(&mut ctx, &addr(2), &resting_buy(1));
     assert!(r.success, "{:?}", r.error);
     assert_eq!(
@@ -96,7 +96,7 @@ fn save_writes_only_dirty_markets() {
 
     // Reload: market 2's book is intact (skipping the write lost nothing).
     let ctx = make_ctx(db);
-    let book2 = ctx.order_books.get(&2).expect("market 2 book still loads");
+    let book2 = ctx.order_books().get(&2).expect("market 2 book still loads");
     assert_eq!(book2.market_id, 2);
 }
 
@@ -112,7 +112,7 @@ fn untouched_block_saves_nothing() {
 
     // A block that executes NO order actions must not rewrite any book.
     let mut ctx = make_ctx(db);
-    assert_eq!(ctx.order_books.len(), 1);
+    assert_eq!(ctx.order_books().len(), 1);
     assert_eq!(ctx.save_order_books(), 0, "no mutations => no writes");
 }
 
@@ -129,7 +129,7 @@ fn next_global_order_id_survives_book_drain_across_restart() {
     let id_after_place = ctx.next_global_order_id;
     assert!(id_after_place > 1, "an id was allocated");
     let order_id = ctx
-        .order_books
+        .order_books()
         .get(&1)
         .and_then(|b| b.best_bid().map(|_| ()))
         .map(|_| id_after_place - 1)

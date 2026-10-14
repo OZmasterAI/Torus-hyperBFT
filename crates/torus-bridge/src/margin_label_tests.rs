@@ -172,7 +172,7 @@ fn run(mode: Mode, metrics: bool) -> Run {
             addr(100),
             addr(101),
         );
-        ctx.order_books = std::mem::take(&mut books);
+        ctx.set_order_books(std::mem::take(&mut books));
         ctx.next_global_order_id = next_id;
         if metrics {
             ctx.metrics = Some(m.clone());
@@ -202,7 +202,7 @@ fn run(mode: Mode, metrics: bool) -> Run {
             assert!(r.iter().all(|r| r.success), "{mode:?} block {h}: {r:?}");
         }
         ctx.save_order_books();
-        books = std::mem::take(&mut ctx.order_books);
+        books = ctx.take_order_books();
         next_id = ctx.next_global_order_id;
         let trade_index = ctx.trade_index;
         drop(ctx);

@@ -120,7 +120,7 @@ fn pos(ctx: &NativeExecContext, trader: &Address) -> FixedPoint {
 
 /// Remaining quantities of `trader`'s resting orders in market 1 (sorted).
 fn resting(ctx: &NativeExecContext, trader: &Address) -> Vec<FixedPoint> {
-    ctx.order_books
+    ctx.order_books()
         .get(&1)
         .map(|b| {
             let mut v: Vec<_> = b
@@ -451,7 +451,7 @@ fn triggered_reduce_only_stop_after_position_closed_is_not_placed() {
         );
         let r = run(&mut ctx, path, &[place(x, limit(1, false, 95, 1))]);
         assert!(r[0].success, "{path:?}: {:?}", r[0].error);
-        assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "{path:?}: stop fired");
+        assert_eq!(ctx.order_books()[&1].pending_stop_count(), 0, "{path:?}: stop fired");
         assert_eq!(pos(&ctx, &t), FixedPoint::ZERO, "{path:?}: must not open a short");
         assert_eq!(resting(&ctx, &m4), vec![fp(4)], "{path:?}: bid @94 untouched");
         assert_bal(&ctx, &t, fp(FUNDING), FixedPoint::ZERO, "stop reservation released");
@@ -504,7 +504,7 @@ fn reduce_only_stop_from_flat_trader_rejected_on_every_path() {
         if matches!(path, Path::Single) {
             assert!(!r[0].success, "single: flat reduce-only stop must be rejected");
         }
-        let pending = ctx.order_books.get(&1).map_or(0, |b| b.pending_stop_count());
+        let pending = ctx.order_books().get(&1).map_or(0, |b| b.pending_stop_count());
         assert_eq!(pending, 0, "{path:?}: nothing pending");
         assert_bal(&ctx, &t, fp(FUNDING), FixedPoint::ZERO, "trader");
     }
@@ -607,7 +607,7 @@ fn modify(
 
 /// `(id, price, remaining)` of `trader`'s resting orders in market 1, by id.
 fn resting_by_id(ctx: &NativeExecContext, trader: &Address) -> Vec<(u128, FixedPoint, FixedPoint)> {
-    let mut v: Vec<_> = ctx.order_books[&1]
+    let mut v: Vec<_> = ctx.order_books()[&1]
         .orders_for_trader(trader)
         .iter()
         .map(|o| (o.id, o.price, o.remaining_qty))
@@ -650,7 +650,7 @@ fn reduce_only_modify_growing_older_order_cancels_younger() {
             "{path:?}: B swept"
         );
         assert_bal(&ctx, &t, fp(FUNDING - 22), fp(22), "B's margin released");
-        assert!(ctx.order_books[&1].has_reduce_only_orders(), "{path:?}");
+        assert!(ctx.order_books()[&1].has_reduce_only_orders(), "{path:?}");
     }
 }
 
@@ -712,11 +712,12 @@ fn reduce_only_modify_of_order_past_the_budget_cancels_it() {
         // A uses up (placed on the book unpoliced, its margin reserved by hand).
         // Order ids are global: give B one no book (the Parallel filler's
         // market 9 included) has used.
-        let book = ctx.order_books.get_mut(&1).unwrap();
-        book.set_next_order_id(1_000_000);
-        let b = book
-            .place_order(ro(limit(1, false, 120, 2)), t, 1000)
-            .order_id;
+        let b = {
+            let mut book = ctx.order_book_mut(1).unwrap();
+            book.set_next_order_id(1_000_000);
+            book.place_order(ro(limit(1, false, 120, 2)), t, 1000)
+                .order_id
+        };
         assert_eq!(b, 1_000_000, "{path:?}");
         let mut bal = ctx.positions.get_native_balance(&t).unwrap();
         bal.available -= fp(12);
@@ -745,9 +746,11 @@ fn reduce_only_modify_that_changes_nothing_still_sweeps() {
         assert!(r[0].success, "{path:?}: {:?}", r[0].error);
         let a = resting_by_id(&ctx, &t)[0].0;
         // A leftover past the budget A uses up (as in the test above).
-        let book = ctx.order_books.get_mut(&1).unwrap();
-        book.set_next_order_id(1_000_000);
-        book.place_order(ro(limit(1, false, 120, 2)), t, 1000);
+        {
+            let mut book = ctx.order_book_mut(1).unwrap();
+            book.set_next_order_id(1_000_000);
+            book.place_order(ro(limit(1, false, 120, 2)), t, 1000);
+        }
         let mut bal = ctx.positions.get_native_balance(&t).unwrap();
         bal.available -= fp(12);
         bal.order_margin += fp(12);

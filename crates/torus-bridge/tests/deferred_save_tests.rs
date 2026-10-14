@@ -317,7 +317,7 @@ fn run_universe(mode: BookMode, leg: Leg, seed: u64) -> RunResult {
             )
         };
         let mut post: Vec<(MarketId, Vec<u8>)> = ctx
-            .order_books
+            .order_books()
             .iter()
             .map(|(mid, b)| (*mid, borsh::to_vec(b).expect("book borsh")))
             .collect();

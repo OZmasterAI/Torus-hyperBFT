@@ -112,7 +112,7 @@ fn place(sender: Address, p: PlaceOrderParams) -> (Address, NativeAction) {
 
 fn book_bytes(ctx: &NativeExecContext) -> Vec<(MarketId, Vec<u8>)> {
     let mut out: Vec<(MarketId, Vec<u8>)> = ctx
-        .order_books
+        .order_books()
         .iter()
         .map(|(mid, book)| (*mid, borsh::to_vec(book).expect("book borsh")))
         .collect();
@@ -389,7 +389,7 @@ fn resident_stale_holder_rebuilds_from_db() {
     let ctx = make_ctx(db.clone(), 3, true, Some(&mut holder));
     assert!(!ctx.resident_reused(), "stale holder must not be reused");
     assert!(!holder.is_populated(), "stale holder must be drained");
-    let book = ctx.order_books.get(&1).expect("book rebuilt from DB");
+    let book = ctx.order_books().get(&1).expect("book rebuilt from DB");
     assert_eq!(book.order_count(), 2, "rebuild must include block 2's order");
 }
 
@@ -483,7 +483,7 @@ fn untouched_blocks_advance_holder_and_keep_reuse() {
         ctx.resident_reused(),
         "holder advanced across untouched blocks must be reused (no stale rebuild)"
     );
-    let book = ctx.order_books.get(&1).expect("resident book");
+    let book = ctx.order_books().get(&1).expect("resident book");
     assert_eq!(book.order_count(), 1);
 }
 
@@ -550,7 +550,7 @@ fn advance_untouched_kill_switch_restores_pre_candidate_rebuild() {
     let ctx = make_ctx(db.clone(), 3, true, Some(&mut holder));
     assert!(!ctx.resident_reused(), "pre-candidate behaviour is a rebuild");
     assert!(ctx.resident_rebuilt());
-    assert_eq!(ctx.order_books.get(&1).expect("book").order_count(), 1);
+    assert_eq!(ctx.order_books().get(&1).expect("book").order_count(), 1);
 
     // And with the switch ON the same sequence reuses.
     let mut holder = ResidentBooks::default();
@@ -747,7 +747,7 @@ fn resident_rows_save_is_incremental_via_journal() {
     let ctx = make_ctx(db.clone(), 4, true, None);
     assert!(ctx.fatal_error.is_none());
     assert_eq!(
-        ctx.order_books.get(&1).unwrap().order_count(),
+        ctx.order_books().get(&1).unwrap().order_count(),
         201,
         "200 seeded + 1 new (front of 89 partially filled, still resting)"
     );
@@ -839,7 +839,7 @@ fn resident_guard_sees_marker_through_parent_layer() {
         ctx.resident_reused(),
         "guard must pass: marker 1 is visible through the parent layer while W still writes it"
     );
-    assert_eq!(ctx.order_books.get(&1).unwrap().order_count(), 1);
+    assert_eq!(ctx.order_books().get(&1).unwrap().order_count(), 1);
 }
 
 #[test]

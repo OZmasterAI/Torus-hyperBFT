@@ -201,7 +201,7 @@ fn test_execution_ordering_native_vs_core_writer() {
 
     // 3. In block 50, native buy is resting, CoreWriter order hasn't executed yet
     assert!(
-        ctx.order_books
+        ctx.order_books()
             .get(&market_id)
             .unwrap()
             .best_bid()

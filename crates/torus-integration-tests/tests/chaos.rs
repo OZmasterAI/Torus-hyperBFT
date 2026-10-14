@@ -847,7 +847,7 @@ fn test_mixed_success_failure() {
     // State should reflect only successful actions:
     // - Buy at 50000 matched by sell -> position created
     // - Buy at 49000 resting on book
-    let book = ctx.order_books.get(&market).unwrap();
+    let book = ctx.order_books().get(&market).unwrap();
     assert_eq!(book.order_count(), 1, "One resting order (buy at 49000)");
     assert_eq!(book.best_bid(), Some(fp(49000)));
 

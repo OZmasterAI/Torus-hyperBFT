@@ -116,7 +116,7 @@ fn dump_cf(db: &StateDb, cf: &'static str) -> Vec<(Vec<u8>, Vec<u8>)> {
 /// Classic whole-book Borsh bytes — the canonical in-memory book comparator.
 fn book_bytes(ctx: &NativeExecContext) -> Vec<(MarketId, Vec<u8>)> {
     let mut out: Vec<(MarketId, Vec<u8>)> = ctx
-        .order_books
+        .order_books()
         .iter()
         .map(|(mid, book)| (*mid, borsh::to_vec(book).expect("book borsh")))
         .collect();
@@ -432,7 +432,7 @@ fn mode3_incremental_saves_survive_fresh_reload_boot_verify() {
         // modify ops (sent by traders[0]; ops on already-gone ids may fail —
         // fine for this test).
         placed = ctx
-            .order_books
+            .order_books()
             .get(&1)
             .map(|b| b.orders_for_trader(&traders[0]).iter().map(|o| o.id).collect())
             .unwrap_or_default();
@@ -441,7 +441,7 @@ fn mode3_incremental_saves_survive_fresh_reload_boot_verify() {
         // Move the ctx forward a block without reloading books.
         ctx.block_height = height + 1;
     }
-    let book = ctx.order_books.get(&1).expect("market 1 book");
+    let book = ctx.order_books().get(&1).expect("market 1 book");
     let (levels_with_state, chunks, dirty) = book.level_chunk_stats();
     assert!(levels_with_state > 0 && chunks > levels_with_state, "chunk state must be multi-chunk");
     assert_eq!(dirty, 0, "everything drained");
@@ -458,7 +458,7 @@ fn mode3_incremental_saves_survive_fresh_reload_boot_verify() {
     );
     assert_eq!(book_bytes(&ctx), live_books, "reloaded books must equal the live books");
     // And explicitly: every persisted level row == from-scratch chunked digest.
-    let book = ctx.order_books.get(&1).unwrap();
+    let book = ctx.order_books().get(&1).unwrap();
     let mut checked = 0usize;
     for (k, v) in dump_cf(&db, CF_NATIVE_ORDER_BOOKS) {
         if k.len() == 26 && k[8] == 0x03 && &k[..8] == &1u64.to_be_bytes() {
@@ -533,7 +533,7 @@ fn fail_stop_matrix_all_mode_pairs() {
                     "{write_mode:?} -> {load_mode:?} must load clean: {:?}",
                     ctx.fatal_error
                 );
-                assert!(!ctx.order_books.is_empty(), "books must be present");
+                assert!(!ctx.order_books().is_empty(), "books must be present");
             } else {
                 let err = ctx.fatal_error.as_deref().unwrap_or("");
                 assert!(
@@ -1211,11 +1211,11 @@ fn save_book_full_equals_accumulated_deltas() {
     // fresh DB; the book CFs must be byte-identical.
     let mut ctx = make_ctx(db_delta.clone(), 5, BookMode::LevelAuthority);
     assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
-    let mut mids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+    let mut mids: Vec<MarketId> = ctx.order_books().keys().copied().collect();
     mids.sort_unstable();
     for mid in mids {
-        let book = ctx.order_books.get_mut(&mid).unwrap();
-        NativeExecContext::<StateDb>::save_book_full(&db_full, book, BookMode::LevelAuthority);
+        let mut book = ctx.order_book_mut(mid).unwrap();
+        NativeExecContext::<StateDb>::save_book_full(&db_full, &mut book, BookMode::LevelAuthority);
     }
 
     // Compare only the book rows (the delta DB also carries balances etc.).

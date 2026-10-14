@@ -498,7 +498,7 @@ fn level_hash_cache_stats_aggregates_across_books() {
 
         // Manual fold: what the exported gauges should read.
         let mut want = (0u64, 0u64, 0u64, 0u64);
-        for book in ctx.order_books.values() {
+        for book in ctx.order_books().values() {
             if let Some((h, m, s, e)) = book.level_hash_cache_stats() {
                 want.0 += h;
                 want.1 += m;

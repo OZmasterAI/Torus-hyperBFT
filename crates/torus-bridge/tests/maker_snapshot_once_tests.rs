@@ -101,7 +101,7 @@ fn fixture() -> Fixture {
         assert!(r.success, "{:?}", r.error);
     }
     assert!(setup.fatal_error.is_none(), "{:?}", setup.fatal_error);
-    let books = std::mem::take(&mut setup.order_books);
+    let books = setup.take_order_books();
     let next_id = setup.next_global_order_id;
     drop(setup);
     let mut holder = ResidentBooks::default();
@@ -111,7 +111,7 @@ fn fixture() -> Fixture {
     let state = CountingBackend::new(overlay);
     let mut ctx = NativeExecContext::new(state.clone(), 2, 1_002, 0, 1_000, 10, addr(99), addr(100), addr(101));
     assert_eq!(ctx.margin_configs.len(), MARKETS as usize);
-    ctx.order_books = books;
+    ctx.set_order_books(books);
     ctx.next_global_order_id = next_id;
     ctx.attach_resident_block(&mut block);
     let _ = NativeExecutor::begin_block_oracle(&mut ctx);

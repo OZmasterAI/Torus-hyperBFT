@@ -288,7 +288,7 @@ fn run_universe(
         written.push(ctx.save_order_books());
         workers_used.push(ctx.last_save_workers());
         let mut post: Vec<(MarketId, Vec<u8>, Option<(u64, u64, u64, usize)>)> = ctx
-            .order_books
+            .order_books()
             .iter()
             .map(|(mid, b)| (*mid, borsh::to_vec(b).expect("book borsh"), b.level_hash_cache_stats()))
             .collect();
@@ -529,7 +529,7 @@ fn save_books_workers_matrix_mode3_chunked_byte_identical() {
             "{label}: mode-3 reload boot verify failed: {:?}",
             ctx.fatal_error
         );
-        assert!(!ctx.order_books.is_empty(), "{label}: reload found no books");
+        assert!(!ctx.order_books().is_empty(), "{label}: reload found no books");
         // And a mode-2 reload of the same DB must fail-stop (marker/preimage
         // mismatch) — the fleets cannot silently mix.
         let ctx2 = NativeExecContext::new_with_mode(

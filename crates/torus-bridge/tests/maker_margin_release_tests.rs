@@ -410,8 +410,7 @@ fn legacy_cancel_all_margin(
 
     match market_id {
         Some(mid) => {
-            if let Some(book) = ctx.order_books.get_mut(&mid) {
-                let cancelled = book.cancel_all(*sender, Some(mid));
+            if let Some(cancelled) = ctx.order_book_mut(mid).map(|mut book| book.cancel_all(*sender, Some(mid))) {
                 if !cancelled.is_empty() {
                     ctx.dirty_books.insert(mid);
                 }
@@ -428,10 +427,9 @@ fn legacy_cancel_all_margin(
             }
         }
         None => {
-            let market_ids: Vec<MarketId> = ctx.order_books.keys().copied().collect();
+            let market_ids: Vec<MarketId> = ctx.order_books().keys().copied().collect();
             for mid in market_ids {
-                if let Some(book) = ctx.order_books.get_mut(&mid) {
-                    let cancelled = book.cancel_all(*sender, None);
+                if let Some(cancelled) = ctx.order_book_mut(mid).map(|mut book| book.cancel_all(*sender, None)) {
                     if !cancelled.is_empty() {
                         ctx.dirty_books.insert(mid);
                     }
@@ -480,7 +478,7 @@ fn cancel_integer_fixture(clamp: bool) -> (tempfile::TempDir, NativeExecContext)
     for mid in 1..=3 {
         let mut book = OrderBook::new(mid, FixedPoint::from_raw(1), FixedPoint::from_raw(1));
         book.set_level_hash_chunked(true);
-        ctx.order_books.insert(mid, book);
+        ctx.insert_order_book(mid, book);
     }
     let mut tiered = MarketMarginConfig::new(1, 999);
     // The config's scalar max_leverage is not the selected tier leverage.
@@ -543,7 +541,7 @@ fn cancel_integer_fixture(clamp: bool) -> (tempfile::TempDir, NativeExecContext)
     consume.time_in_force = TimeInForce::IOC;
     let fill = NativeExecutor::execute_batch_settle_mode(&mut ctx, &[place(taker, consume)], false);
     assert!(fill.results[0].success);
-    assert!(ctx.order_books[&1]
+    assert!(ctx.order_books()[&1]
         .orders_for_trader(&maker)
         .iter()
         .any(|order| order.remaining_qty < order.original_qty));
@@ -552,10 +550,10 @@ fn cancel_integer_fixture(clamp: bool) -> (tempfile::TempDir, NativeExecContext)
         balance.order_margin = FixedPoint::from_raw(7);
         ctx.positions.put_native_balance(&maker, &balance).unwrap();
     }
-    for book in ctx.order_books.values_mut() {
+    ctx.for_each_order_book_mut(|_, book| {
         let _ = book.take_row_ops();
         let _ = book.take_level_ops();
-    }
+    });
     ctx.dirty_books.clear();
     (dir, ctx)
 }
@@ -572,14 +570,14 @@ fn assert_cancel_integer_state(actual: &mut NativeExecContext, expected: &mut Na
     };
     assert_eq!(balances(actual), balances(expected));
     assert_eq!(actual.dirty_books, expected.dirty_books);
-    let mut mids: Vec<_> = actual.order_books.keys().copied().collect();
+    let mut mids: Vec<_> = actual.order_books().keys().copied().collect();
     mids.sort_unstable();
-    let mut expected_mids: Vec<_> = expected.order_books.keys().copied().collect();
+    let mut expected_mids: Vec<_> = expected.order_books().keys().copied().collect();
     expected_mids.sort_unstable();
     assert_eq!(mids, expected_mids);
     for mid in mids {
-        let a = actual.order_books.get_mut(&mid).unwrap();
-        let e = expected.order_books.get_mut(&mid).unwrap();
+        let mut a = actual.order_book_mut(mid).unwrap();
+        let mut e = expected.order_book_mut(mid).unwrap();
         assert_eq!(a.stop_rows(), e.stop_rows());
         // Drain before full_row_ops, which clears the journal as a full save.
         assert_eq!(
@@ -594,7 +592,7 @@ fn assert_cancel_integer_state(actual: &mut NativeExecContext, expected: &mut Na
                 .map(|(key, row)| (key, row.map(|row| row.encode().to_vec())))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(levels(a), levels(e), "level journal market={mid}");
+        assert_eq!(levels(&mut a), levels(&mut e), "level journal market={mid}");
         let full_levels = |book: &mut OrderBook| {
             book.full_level_ops()
                 .into_iter()
@@ -602,8 +600,8 @@ fn assert_cancel_integer_state(actual: &mut NativeExecContext, expected: &mut Na
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            full_levels(a),
-            full_levels(e),
+            full_levels(&mut a),
+            full_levels(&mut e),
             "mode3 commitments market={mid}"
         );
         assert_eq!(a.order_count(), e.order_count());
@@ -663,7 +661,7 @@ fn cancel_all_integer_margin_matches_legacy_on_deep_compacted_book() {
         balance.order_margin = reserved;
         ctx.positions.put_native_balance(&sender, &balance).unwrap();
         ctx.margin_configs.insert(1, config);
-        ctx.order_books.insert(1, book);
+        ctx.insert_order_book(1, book);
         (dir, ctx, reserved)
     }
     let (_actual_dir, mut actual, reserved) = fixture();
@@ -674,8 +672,8 @@ fn cancel_all_integer_margin_matches_legacy_on_deep_compacted_book() {
     );
     assert!(result.success);
     assert!(legacy_cancel_all_margin(&mut expected, &addr(1), Some(1)).success);
-    assert_eq!(actual.order_books[&1].order_count(), 2048 - 80);
-    assert_eq!(actual.order_books[&1].journaled_rows(), 80);
+    assert_eq!(actual.order_books()[&1].order_count(), 2048 - 80);
+    assert_eq!(actual.order_books()[&1].journaled_rows(), 80);
     assert_bal(&actual, &addr(1), fp(1_000_000), FixedPoint::ZERO, "deep cancel release");
     assert_cancel_integer_state(&mut actual, &mut expected);
 }
@@ -767,7 +765,7 @@ fn cancel_all_integer_margin_zero_preserves_mutation_boundary() {
     };
     assert_eq!(panic_text(&new), panic_text(&old));
     assert!(panic_text(&new).starts_with("FixedPoint division error"));
-    assert!(actual.order_books[&1].orders_for_trader(&sender).is_empty());
+    assert!(actual.order_books()[&1].orders_for_trader(&sender).is_empty());
     assert!(actual.dirty_books.contains(&1));
     assert_eq!(
         actual

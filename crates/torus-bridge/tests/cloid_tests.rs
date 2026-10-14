@@ -168,7 +168,7 @@ fn live(
     trader: &Address,
     cloid: u128,
 ) -> Option<u128> {
-    ctx.order_books
+    ctx.order_books()
         .get(&market_id)
         .and_then(|b| b.order_id_by_cloid(trader, cloid))
 }
@@ -203,7 +203,7 @@ fn a_live_cloid_rejects_a_placement_in_any_market() {
             &what,
         );
         // Nothing the rejects did is left behind: one order per live cloid.
-        assert_eq!(ctx.order_books[&1].open_order_count(&addr(1)), 1, "{what}");
+        assert_eq!(ctx.order_books()[&1].open_order_count(&addr(1)), 1, "{what}");
         // Cancelled -> free again, in any market.
         let id = live(&ctx, 1, &addr(1), C).unwrap();
         ok(
@@ -284,7 +284,7 @@ fn cancel_by_cloid_cancels_a_resting_order_and_releases_its_margin() {
 
         ok(&run(&mut ctx, path, addr(1), by_cloid(1, C)), &what);
         assert!(live(&ctx, 1, &addr(1), C).is_none(), "{what}");
-        assert_eq!(ctx.order_books[&1].order_count(), 0, "{what}");
+        assert_eq!(ctx.order_books()[&1].order_count(), 0, "{what}");
         assert_eq!(margin(&ctx, &addr(1)), FixedPoint::ZERO, "{what}");
         assert!(
             !run(&mut ctx, path, addr(1), by_cloid(1, C)).success,
@@ -304,10 +304,10 @@ fn cancel_by_cloid_cancels_a_pending_stop_and_releases_its_margin() {
         let other = margin(&ctx, &addr(1));
         ok(&run(&mut ctx, path, addr(1), stop(1, 800, Some(C))), &what);
         assert!(margin(&ctx, &addr(1)) > other, "{what}: the stop reserved");
-        assert_eq!(ctx.order_books[&1].pending_stop_count(), 2, "{what}");
+        assert_eq!(ctx.order_books()[&1].pending_stop_count(), 2, "{what}");
 
         ok(&run(&mut ctx, path, addr(1), by_cloid(1, C)), &what);
-        assert_eq!(ctx.order_books[&1].pending_stop_count(), 1, "{what}");
+        assert_eq!(ctx.order_books()[&1].pending_stop_count(), 1, "{what}");
         assert_eq!(
             margin(&ctx, &addr(1)),
             other,
@@ -339,7 +339,7 @@ fn cancel_order_cancels_a_pending_stop_by_id_for_its_owner_only() {
             r.error.as_deref().unwrap_or("").contains("belongs to"),
             "{what}: {r:?}"
         );
-        assert_eq!(ctx.order_books[&1].pending_stop_count(), 1, "{what}");
+        assert_eq!(ctx.order_books()[&1].pending_stop_count(), 1, "{what}");
 
         ok(
             &run(
@@ -350,7 +350,7 @@ fn cancel_order_cancels_a_pending_stop_by_id_for_its_owner_only() {
             ),
             &what,
         );
-        assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "{what}");
+        assert_eq!(ctx.order_books()[&1].pending_stop_count(), 0, "{what}");
         assert_eq!(margin(&ctx, &addr(1)), FixedPoint::ZERO, "{what}");
         assert!(live(&ctx, 1, &addr(1), C).is_none(), "{what}");
     }
@@ -385,7 +385,7 @@ fn a_triggered_stop_keeps_its_cloid() {
         &NativeExecutor::execute(&mut ctx, &addr(3), &buy(1, 106, None)),
         "trade at 106",
     );
-    assert_eq!(ctx.order_books[&1].pending_stop_count(), 0);
+    assert_eq!(ctx.order_books()[&1].pending_stop_count(), 0);
     assert_eq!(
         live(&ctx, 1, &addr(1), C),
         Some(stop_id),

@@ -146,7 +146,7 @@ fn pos(ctx: &NativeExecContext, trader: &Address) -> FixedPoint {
 
 /// Remaining quantities of `trader`'s resting orders in market 1.
 fn resting(ctx: &NativeExecContext, trader: &Address) -> Vec<FixedPoint> {
-    ctx.order_books
+    ctx.order_books()
         .get(&1)
         .map(|b| {
             let mut v: Vec<_> = b
@@ -380,7 +380,7 @@ fn triggered_stop_market_respects_cap() {
         assert_eq!(pos(&ctx, &x), fp(1), "{path:?}: trigger trade settled");
         assert_eq!(pos(&ctx, &t), FixedPoint::ZERO, "{path:?}: nothing within cap");
         assert_eq!(resting(&ctx, &m2), vec![fp(5)], "{path:?}: 105 ask untouched");
-        assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "{path:?}: stop consumed");
+        assert_eq!(ctx.order_books()[&1].pending_stop_count(), 0, "{path:?}: stop consumed");
         assert_bal(&ctx, &t, fp(FUNDING), FixedPoint::ZERO, "stop reservation released");
     }
 }
@@ -1125,12 +1125,12 @@ fn cancel_all_cancels_pending_stops_and_releases_their_margin() {
                     ],
                 );
                 assert!(r.iter().all(|r| r.success), "{what}");
-                assert_eq!(ctx.order_books[&1].pending_stop_count(), 0, "{what}");
+                assert_eq!(ctx.order_books()[&1].pending_stop_count(), 0, "{what}");
                 assert_bal(&ctx, &t, fp(FUNDING), FixedPoint::ZERO, &what);
                 ctx.save_order_books();
                 let reloaded = make_ctx(ctx.state.clone());
                 assert_eq!(
-                    reloaded.order_books.get(&1).map_or(0, |b| b.pending_stop_count()),
+                    reloaded.order_books().get(&1).map_or(0, |b| b.pending_stop_count()),
                     0,
                     "{what}: persisted"
                 );

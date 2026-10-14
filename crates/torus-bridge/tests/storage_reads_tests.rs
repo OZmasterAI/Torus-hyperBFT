@@ -179,7 +179,7 @@ fn run_fed_sequence(walk_bp: u64) -> FedRun {
             backend.clone(), h + 1, 1000 + h, 0, 1_000_000, 100, special(99), special(100), special(101),
         );
         ctx.attach_resident_block(&mut resident);
-        ctx.order_books = std::mem::take(&mut books);
+        ctx.set_order_books(std::mem::take(&mut books));
         ctx.next_global_order_id = next_id;
         walk.step();
         for m in 1..=MARKETS {
@@ -200,7 +200,7 @@ fn run_fed_sequence(walk_bp: u64) -> FedRun {
         oracle_reads.push(backend.oracle_reads());
         assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
         fills += ctx.trade_index as u64;
-        books = std::mem::take(&mut ctx.order_books);
+        books = ctx.take_order_books();
         next_id = ctx.next_global_order_id;
         ctx.detach_resident_block(&mut resident);
         drop(ctx);

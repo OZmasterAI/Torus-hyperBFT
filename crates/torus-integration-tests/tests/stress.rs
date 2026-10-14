@@ -84,7 +84,7 @@ fn generate_action(seed: usize, market_id: u64) -> NativeAction {
 
 /// Verify order book invariants for all books in the context.
 fn verify_all_book_invariants(ctx: &torus_bridge::native_executor::NativeExecContext) {
-    for (_market_id, book) in &ctx.order_books {
+    for (_market_id, book) in ctx.order_books() {
         book.verify_invariants();
     }
 }
@@ -220,7 +220,7 @@ fn test_multi_market_stress() {
 
     // Verify per-market invariants independently.
     for market_id in 1..=num_markets {
-        if let Some(book) = ctx.order_books.get(&market_id) {
+        if let Some(book) = ctx.order_books().get(&market_id) {
             book.verify_invariants();
         }
     }
@@ -454,7 +454,7 @@ fn test_deep_book_sweep() {
         }
     }
 
-    let book = ctx.order_books.get(&market).unwrap();
+    let book = ctx.order_books().get(&market).unwrap();
     assert_eq!(
         book.order_count(),
         total_orders,
@@ -482,7 +482,7 @@ fn test_deep_book_sweep() {
     assert!(r.success, "Sweep order should succeed");
 
     // After sweep: 9,000 orders should remain (1,000 filled).
-    let book = ctx.order_books.get(&market).unwrap();
+    let book = ctx.order_books().get(&market).unwrap();
     assert_eq!(
         book.order_count(),
         (num_levels - 100) * orders_per_level,

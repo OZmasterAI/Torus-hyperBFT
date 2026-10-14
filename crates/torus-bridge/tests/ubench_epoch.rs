@@ -158,7 +158,7 @@ impl Chain {
             overlay.clone(), h, ts, h / EPOCH, EPOCH, 100, special(99), special(100), special(101),
         );
         ctx.attach_resident_block(rows);
-        ctx.order_books = std::mem::take(&mut self.books);
+        ctx.set_order_books(std::mem::take(&mut self.books));
         ctx.next_global_order_id = self.next_id;
         ctx
     }
@@ -174,7 +174,7 @@ impl Chain {
         mut rows: ResidentBlock,
     ) -> f64 {
         let mut ctx = ctx;
-        self.books = std::mem::take(&mut ctx.order_books);
+        self.books = ctx.take_order_books();
         self.next_id = ctx.next_global_order_id;
         ctx.detach_resident_block(&mut rows);
         drop(ctx);

@@ -115,7 +115,7 @@ struct Snapshot {
 }
 
 fn snapshot(ctx: &NativeExecContext, order_id: u128, price: i64, who: &[Address]) -> Snapshot {
-    let book = &ctx.order_books[&(MARKET as _)];
+    let book = &ctx.order_books()[&(MARKET as _)];
     Snapshot {
         row: book.encode_order_row(order_id),
         seq: book.order_seq_of(order_id),
@@ -144,7 +144,7 @@ fn setup(path: Path) -> (tempfile::TempDir, NativeExecContext, u128) {
     assert!(r.success, "{:?}", r.error);
     let r = run(&mut ctx, path, addr(3), sell(110, 4));
     assert!(r.success, "{:?}", r.error);
-    let book = &ctx.order_books[&(MARKET as _)];
+    let book = &ctx.order_books()[&(MARKET as _)];
     let ids = book.orders_for_trader(&addr(1));
     assert_eq!(ids.len(), 1);
     let id = ids[0].id;
@@ -196,7 +196,7 @@ fn owner_modify_price_change_still_works() {
         let (_dir, mut ctx, id) = setup(path);
         let r = run(&mut ctx, path, a, modify(id, Some(120), None));
         assert!(r.success, "{path:?}: {:?}", r.error);
-        let book = &ctx.order_books[&(MARKET as _)];
+        let book = &ctx.order_books()[&(MARKET as _)];
         let o = book.get_order(id).expect("still resting");
         assert_eq!(
             (o.price, o.remaining_qty, o.trader),
@@ -234,7 +234,7 @@ fn owner_modify_qty_decrease_keeps_priority() {
             "{path:?}: queue order kept"
         );
         assert_eq!(after.level_ids.first(), Some(&id), "{path:?}");
-        let o = ctx.order_books[&(MARKET as _)]
+        let o = ctx.order_books()[&(MARKET as _)]
             .get_order(id)
             .unwrap()
             .clone();

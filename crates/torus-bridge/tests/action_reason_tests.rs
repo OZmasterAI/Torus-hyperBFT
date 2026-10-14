@@ -250,7 +250,7 @@ fn book_rejections_carry_their_hl_reason_on_every_path() {
             let gas = if mode.is_none() && i == 3 { 0 } else { 1000 };
             assert_eq!(r.gas_used, gas, "{mode:?} #{i}: a book outcome keeps the executed order's gas");
         }
-        let book = &ctx.order_books[&3];
+        let book = &ctx.order_books()[&3];
         assert_eq!(book.best_ask(), None, "{mode:?}: the partial IOC took the ask");
         assert_eq!(book.best_bid(), Some(fp(100)), "{mode:?}: nothing rejected rests");
     }
