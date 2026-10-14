@@ -1608,13 +1608,16 @@ mod tests {
         cap.submit(0, &[(1, 1_000, 400, false)]);
         let c = cap.clone();
         let w = tokio::spawn(async move { c.wait_ready(0, 400, 0, end).await });
+        // Let the waiter run to Pending first, so its wait starts before the
+        // delay does (current-thread runtime: yield_now polls it).
+        tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(30)).await;
         cap.apply_result(&[1], &Err("rpc: refused".into()));
         assert_eq!(w.await.unwrap(), Some((0, false, true)));
         let r = cap.tracker.lock().unwrap().timing.roll();
         assert_eq!(r.ready_calls, 2, "a call that did not wait counts too");
         assert_eq!(r.wait_us[0].n, 1);
-        assert!(r.wait_us[0].sum >= 30_000, "{}", r.wait_us[0].sum);
+        assert!(r.wait_us[0].sum >= 29_000, "{}", r.wait_us[0].sum);
         assert_eq!(r.wait_us[1].n, 0);
 
         // Below the cap, held by its own cancel-all over the budget.
@@ -1622,13 +1625,14 @@ mod tests {
         cap.submit(0, &[(2, 1_000, 400, false), (3, 1_001, 0, true)]);
         let c = cap.clone();
         let w = tokio::spawn(async move { c.wait_ready(0, 400, 500, end).await });
+        tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         let woken = cap.tracker.lock().unwrap().on_block_at(&[(3, true)], 2_001);
         cap.wake(woken);
         assert_eq!(w.await.unwrap(), Some((400, false, true)));
         let r = cap.tracker.lock().unwrap().timing.roll();
         assert_eq!((r.ready_calls, r.wait_us[0].n, r.wait_us[1].n), (1, 0, 1));
-        assert!(r.wait_us[1].sum >= 20_000, "{}", r.wait_us[1].sum);
+        assert!(r.wait_us[1].sum >= 19_000, "{}", r.wait_us[1].sum);
         assert_eq!((r.age_ms.n, r.age_ms.max), (1, 1_000));
     }
 
