@@ -1,0 +1,102 @@
+# archive-campaign.py meta for campaign ozarchy-p4s0 (results doc section 64, plan row 72).
+# This file is the only hand-written input; everything else (rows, sizes, rm lists, tools copy) is generated.
+# Modelled on meta/p3cloidprof.toml (perf sidecar, Tier A profile; binaries of another campaign's stage).
+
+camp = "p4s0"
+section = "64"
+plan_row = 72
+plan_doc = "docs/plans/item6-phase2-impl.md"
+# The cells ran 00:52-01:32 local time on 2026-10-14 (summary.json generated_at is UTC, 2026-10-13).
+date = "2026-10-14"
+
+description = "Phase 4 step 0 re-profile + exec p99 (one binary main d3cba5e2, je compiled in, 15 s ckpt, oracle on, perf on val1 in p1/p2)"
+cell_role = "throughput"
+env_base = "6 knobs empty; book rows empty (Classic); trade history off + WAL 2048 MiB; exec pipeline on (default); TORUS_CHECKPOINT_INTERVAL_MS unset (15 s validator default); ORACLE_FEED=1 (30000, 2000 ms, walk 0)"
+# No ozarchy-p4s0-build / -stage: the binaries are ozarchy-g3s0's M build (md5s.txt line M), staged in ozarchy-g3s0-stage/m-run.
+binaries = "m d3cba5e2 (node c2fda80f, build id 5c8e43a2, bench ff08433d); ozarchy-g3s0's M build, staged in ozarchy-g3s0-stage/m-run"
+
+[arms.m]
+meaning = "main d3cba5e2, je compiled in, checkpoint knob unset (15 s), oracle on, CLOID_SHARE=0"
+env = "CLOID_SHARE=0; je compiled in; in-flight tail commit"
+
+[arms.mperf]
+meaning = "main d3cba5e2 as m, perf sidecar on val1 (W1 cycles:u fp 35-80 s, W2 exec thread 5 events 82-102 s)"
+env = "CLOID_SHARE=0; je compiled in; perf sidecar on val1; in-flight tail commit"
+
+[cell_arms]
+"ozarchy-p4s0-300m-w0" = "m"
+
+[cell_roles]
+"*-mperf" = "profiled"
+"*-k1-m" = "soak"
+
+[cell_notes]
+"ozarchy-p4s0-300m-p1-mperf" = "perf W1 + W2 on val1, exec tid 78864"
+"ozarchy-p4s0-300m-p2-mperf" = "perf W1 + W2 on val1, exec tid 121714"
+
+[dirs]
+run = '''p4s0 campaign log, done marker, cells.tsv (per-cell step rows), cell-step/ (per-cell validation + analysis records), handoff.json / handoff-tables.txt, smoke/ (smoke campaign log, cells.tsv, cell-step), analyst/ (scripts/: stacks.py, step0.py, timeline.py, pool.py, pool2.py, allthreads.py, q.py, tree.py, blocks.py, attrib.py, phases.py; step0-table.txt, step0-shares.txt, p99-attribution.txt, p99-phases.txt, p99-causes.txt, p99-*.json, blocks-*-val1.csv; the perf script dumps p*-mperf-w1-all / -w1-exec / -w1-exec-inline / -w2 / -w2-inline .script.gz with their .err files; nm.txt (the node's symbol table); symfs/ (perf --symfs link to the staged node))'''
+tools = '''p4s0 campaign driver ozarchy-p4s0-campaign.sh (CAMP=P4S0, from the campaign template; config written by patch-p4s0.py), perf sidecar perf-sidecar.sh (= section 60's cloidprof-sidecar.sh byte for byte), analyst/a-cells.py (section 60's, not run), matched-bench tools copy (= d3cba5e2's `tools/matched-bench`, byte for byte; not archived)'''
+
+[index]
+dirs_summary = '''2 profiled cells p1, p2, 2 SAT cells u1, u2, the 600 s soak k1, the warm-up `w0`, 2 smoke cells `ozarchy-p4s0-smoke-300m-s0-m`, `ozarchy-p4s0-smoke-300m-s0-mperf`, `ozarchy-p4s0-run`, `-tools` (binaries: ozarchy-g3s0's stage)'''
+update = '''Item 6 Phase 4 step 0 re-profile (owner change of plan 18c: step 0 before Gate 3): one binary, main `d3cba5e2` (Phase 3 step 2 + merge-wait + step 6; node `c2fda80f`, build id `5c8e43a2`, bench `ff08433d`; ozarchy-g3s0's M build, staged in `ozarchy-g3s0-stage/m-run`, not rebuilt), jemalloc compiled in, `TORUS_CHECKPOINT_INTERVAL_MS` unset (15 s), oracle feed on, CLOID_SHARE=0, saturated (RATE 76000), commit tail; harness = the `d3cba5e2` worktree (`/home/oz/projects/wt/g3s0-d3cba5e2`); driver `ozarchy-p4s0-campaign.sh` CAMP=P4S0 (in `tools/ozarchy-p4s0-tools/` with the sidecar and the analyst scripts under `analyst/scripts/`). Cells: w0 (60 s); p1, p2 (120 s, `perf-sidecar.sh` on val1: W1 `cycles:u` fp 35-80 s, W2 exec thread 5 events 82-102 s); u1, u2 (120 s); k1 (600 s soak). Section 64 is built on the analyst outputs in `ozarchy-p4s0-run/analyst/` (`step0-table.txt`, `step0-shares.txt`, `p99-attribution.txt`, `p99-phases.txt`, `p99-causes.txt`, `p99-*.json`, `blocks-*-val1.csv`), `cells.tsv`, `cell-step/` and the cells' `summary.json`, `metrics-*`, `prof-*` window snapshots, `exec-tid.txt`, `cloidprof-sidecar.log`, `ckpt-samples.txt` and `rocksdb-LOG-val1.txt` (keep); u1, u2 and k1 also keep `val1.log.gz`, `sampler.csv` and `buckets.csv` (the p99 scripts read them). The raw profile (`perf.data`, `perf-w2.data`, the perf script dumps, `nm.txt`) is Tier A; the other node logs, `tasks.txt`, and `buckets.csv` / `sampler.csv` of w0, p1, p2 are Tier B.'''
+
+[cells]
+heading = '''Phase 4 step 0 re-profile + exec p99 on one binary, main `d3cba5e2` (node `c2fda80f`, bench `ff08433d`, ozarchy-g3s0's stage), jemalloc compiled in, `TORUS_CHECKPOINT_INTERVAL_MS` unset (15 s), oracle feed on, CLOID_SHARE=0, saturated (RATE 76000), commit tail, tw, Classic, shared NVMe; p1, p2 with perf on val1, u1, u2 120 s, k1 600 s soak; harness = the `d3cba5e2` worktree; all cells ACCEPT AGREE; warm-up w0 and the smoke cells excluded (section 64)'''
+
+[deletable]
+note = '''Campaign ozarchy-{camp} (results doc section {section}, plan row {plan_row}): Phase 4 step 0 re-profile and exec p99 causes on main `d3cba5e2`. Section {section} is built on `ozarchy-p4s0-run/analyst/` (`step0-table.txt`, `step0-shares.txt`, `p99-attribution.txt`, `p99-phases.txt`, `p99-causes.txt`, `p99-*.json`, `blocks-*-val1.csv`, `scripts/`), `ozarchy-p4s0-run/cells.tsv` / `cell-step/` and the cells' `summary.json`, `metrics-*-val*.txt`, `prof-metrics-w*-*.txt`, `prof-stat-w*-*.txt`, `prof-tasks-w*-*.txt`, `exec-tid.txt`, `cloidprof-sidecar.log`, `ckpt-samples.txt` and `rocksdb-LOG-val1.txt` (keep). u1, u2 and k1 also keep `val1.log.gz`, `sampler.csv` and `buckets.csv`: `blocks.py`, `attrib.py` and `phases.py` read them (Tier B there lists only the other files). Tier A = the raw profile: p1 / p2's `perf.data` (W1) and `perf-w2.data` (W2), the perf script dumps `ozarchy-p4s0-run/analyst/*.script.gz` made from them, and `nm.txt` (the node's symbol table, regenerable). They need the staged node for symbols, which is ozarchy-g3s0's (`ozarchy-g3s0-stage/m-run/release/torus-node`, md5 `c2fda80f`, build id `5c8e43a2`; `perf script --symfs ozarchy-p4s0-run/analyst/symfs`): keep it while the raw profile is kept (see ozarchy-g3s0's block once that campaign is archived).'''
+tier_a_keep = "keep while a re-analysis of the step 0 profile is possible: new stack tags, the typed-replacement cost after Phase 4 steps 2-5, a before/after against Phase 4"
+tier_a = [
+  "ozarchy-p4s0-300m-*/perf.data",
+  "ozarchy-p4s0-300m-*/perf-w2.data",
+  "ozarchy-p4s0-run/analyst/*.script.gz",
+  "ozarchy-p4s0-run/analyst/nm.txt",
+]
+tier_b_rules = [
+  ["ozarchy-p4s0-300m-u1-m", ["tasks.txt", "val0.log.gz", "val2.log.gz"]],
+  ["ozarchy-p4s0-300m-u2-m", ["tasks.txt", "val0.log.gz", "val2.log.gz"]],
+  ["ozarchy-p4s0-300m-k1-m", ["tasks.txt", "val0.log.gz", "val2.log.gz"]],
+]
+kept = ["summary.json", "metrics-*-val*.txt", "prof-metrics-w*-*.txt", "prof-stat-w*-*.txt", "prof-tasks-w*-*.txt", "exec-tid.txt", "cloidprof-sidecar.log", "ckpt-samples.txt", "rocksdb-LOG-val1.txt"]
+
+[checks]
+produced_by = { "step0-table.txt" = "assembled inline in the analyst session from step0.py / timeline.py outputs and the W1 metric deltas (section 64)", "step0-shares.txt" = "scripts/step0.py, one JSON line per cell and window, prefixed inline", "p99-attribution.txt" = "scripts/attrib.py stdout", "p99-phases.txt" = "scripts/phases.py stdout (phases part, before the attribution part was added)", "p99-causes.txt" = "scripts/phases.py stdout (attribution part)", "handoff-tables.txt" = "the campaign driver's handoff step", "p1-mperf-w1-inl.err" = "perf script --inline stderr", "p2-mperf-w1-inl.err" = "perf script --inline stderr", "nm.txt" = "nm of the staged node (symbol table for the analyst; Tier A, not copied)" }
+
+[tools]
+# matched-bench/ is byte for byte d3cba5e2's tools/matched-bench (top-level files checked against the git blobs) with pycache.
+# nm.txt is 15.8 MB (Tier A on ozarchy).
+exclude = ["matched-bench/*", "nm.txt"]
+# stacks.py has one line with a trailing blank (git diff --check).
+strip_trailing = ["analyst/scripts/stacks.py"]
+# The analyst's scripts live in analyst/scripts/ (not a-*.py), so the default copy misses them; the build md5s are g3s0's.
+extra = [
+  ["ozarchy-p4s0-run/analyst/scripts/stacks.py", "analyst/scripts/stacks.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/step0.py", "analyst/scripts/step0.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/timeline.py", "analyst/scripts/timeline.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/pool.py", "analyst/scripts/pool.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/pool2.py", "analyst/scripts/pool2.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/allthreads.py", "analyst/scripts/allthreads.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/q.py", "analyst/scripts/q.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/tree.py", "analyst/scripts/tree.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/blocks.py", "analyst/scripts/blocks.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/attrib.py", "analyst/scripts/attrib.py"],
+  ["ozarchy-p4s0-run/analyst/scripts/phases.py", "analyst/scripts/phases.py"],
+  ["ozarchy-g3s0-build/md5s.txt", "md5s-all.txt"],
+]
+
+# Smoke: phases.py on u1 (reads summary.json, sampler.csv and the run's p99-u1-m.json; writes nothing; ~1 s). The perf
+# scripts (step0.py, timeline.py, ...) are not smoke-run: they need the Tier A dumps and are heavy. attrib.py / blocks.py are
+# not smoke-run: attrib.py writes p99-<cell>.json into its input dir (the run's analyst dir).
+[[smoke]]
+name = "phases.py on u1 (phases + attribution)"
+script = "analyst/scripts/phases.py"
+args = ["{bench}/ozarchy-p4s0-300m-u1-m", "u1-m", "{bench}/ozarchy-p4s0-run/analyst"]
+timeout = 120
+[[smoke.compare]]
+want = "analyst/p99-phases.txt"
+select = "^(== u1-m |   h=  (439|440|441|442|463) )"
+[[smoke.compare]]
+want = "analyst/p99-causes.txt"
+select = "^(-- u1-m |   \\('(439|440|441|442|463)')"
