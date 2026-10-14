@@ -94,7 +94,8 @@ NOTES = [
     "torus_liquidation_acted_total (the budgeted actions) does not.",
     "Total-balance conservation is NOT computable from a cell dir: the state digest "
     "covers only the digest accounts (digest-accounts.txt, ~50 of 100k+) with available "
-    "and margin balances, no positions or unrealized PnL, and no fee or insurance "
+    "and margin balances, positions only for the liquidator vault and the two ADL "
+    "escrows (digest-position-accounts.txt), and no fee or insurance "
     "totals; summing available + order margin over them is not conservation. Only the "
     "vault's own deficit (vault-val<i>.json, torus_liquidator_vault_deficit) is shown.",
 ]

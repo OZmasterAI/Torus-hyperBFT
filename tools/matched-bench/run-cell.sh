@@ -230,7 +230,10 @@
 #                feed logs the wall-clock ms of round R (oracle-feed.log), which
 #                liq_stress.py maps to a block height. Recorded in .oracle_feed.
 #                With LIQ_THIN>0 or S>0 the liquidator vault
-#                (LIQUIDATOR_VAULT) joins the state digest accounts, each node's
+#                (LIQUIDATOR_VAULT) and both ADL escrows (ADL_ESCROW_LONG /
+#                ADL_ESCROW_SHORT) join the state digest: their balances and
+#                their position in every market (digest-position-accounts.txt,
+#                torus_getPosition; +3*MARKETS RPCs per node), each node's
 #                torus_getLiquidatorVault is saved as vault-val<i>.json, and
 #                torus_liquidations_triggered_total / torus_liquidator_vault_deficit
 #                and the liquidation telemetry (step timer _sum/_count, per-class /
@@ -338,6 +341,12 @@ ORACLE_SHOCK_BP=${ORACLE_SHOCK_BP:-0}
 ORACLE_SHOCK_ROUND=${ORACLE_SHOCK_ROUND:-0}
 # torus_core::liquidation::LIQUIDATOR_VAULT ("torus-liquidator-vlt").
 LIQUIDATOR_VAULT=0x746f7275732d6c697175696461746f722d766c74
+# torus_core::liquidation::ADL_ESCROW_LONG / ADL_ESCROW_SHORT
+# ("torus-adl-escrow-lng" / "torus-adl-escrow-sht"): the two fixed escrows that
+# take bankrupt positions in the ADL path (one per side; is_adl_escrow names
+# exactly these two). test_harness.py pins all three against the Rust source.
+ADL_ESCROW_LONG=0x746f7275732d61646c2d657363726f772d6c6e67
+ADL_ESCROW_SHORT=0x746f7275732d61646c2d657363726f772d736874
 ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"
 ORACLE_FRESH_TIMEOUT=90
 OUT="$RESULTS_ROOT/$LABEL"
@@ -729,7 +738,7 @@ log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$S
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 if liq_stress_on; then
-    log "liquidation stress ON: liq_thin=$LIQ_THIN liq_thin_avail=$LIQ_THIN_AVAIL shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND vault=$LIQUIDATOR_VAULT (in the digest; vault-val<i>.json; liquidation metrics sampled)"
+    log "liquidation stress ON: liq_thin=$LIQ_THIN liq_thin_avail=$LIQ_THIN_AVAIL shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND vault=$LIQUIDATOR_VAULT adl_escrows=$ADL_ESCROW_LONG,$ADL_ESCROW_SHORT (balances + positions in the digest; vault-val<i>.json; liquidation metrics sampled)"
     [ -z "$MPS" ] || log "WARNING: MPS=$MPS: the locality shape sets sides by owner rank, not (sender + market) parity, so the shock's 'even-index senders lose on every position' does not hold"
 fi
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
@@ -1162,13 +1171,21 @@ log "heights after drain: ${HGT[*]} (spread $((HMAX-HMIN))); comparing block $HC
 # At 300 markets the old serial loop was ~4 min/node (~12 min end to end) —
 # val0 and val2 were digested minutes apart (r6-base-300m-r1).
 "$BENCH" gen-accounts --offset 60 --count 50 2>/dev/null | awk '{print $2}' > "$OUT/digest-accounts.txt"
-# Liquidation stress: the vault's balance joins the digest (default cells keep
-# exactly the 50 load-sender accounts).
+# Liquidation stress: the protocol accounts (liquidator vault + both ADL
+# escrows) join the digest twice: their balances (digest-accounts.txt) and
+# their position in every market (digest-position-accounts.txt -> digest-node.sh
+# 7th argument, torus_getPosition). Default cells keep exactly the 50
+# load-sender accounts and no positions file: their digest stream (and so the
+# digest value) is byte-identical to tools without escrow support.
+DIG_POS=()
 if liq_stress_on; then
-    echo "$LIQUIDATOR_VAULT" >> "$OUT/digest-accounts.txt"
-    log "liquidation stress: liquidator vault $LIQUIDATOR_VAULT added to the state digest accounts"
+    printf '%s\n' "$LIQUIDATOR_VAULT" "$ADL_ESCROW_LONG" "$ADL_ESCROW_SHORT" >> "$OUT/digest-accounts.txt"
+    printf '%s\n' "$LIQUIDATOR_VAULT" "$ADL_ESCROW_LONG" "$ADL_ESCROW_SHORT" > "$OUT/digest-position-accounts.txt"
+    DIG_POS=("$OUT/digest-position-accounts.txt")
+    log "liquidation stress: liquidator vault $LIQUIDATOR_VAULT and ADL escrows $ADL_ESCROW_LONG $ADL_ESCROW_SHORT added to the state digest (balances + positions in all $MARKETS markets)"
 fi
 DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")
+if [ ${#DIG_POS[@]} -gt 0 ]; then DIG_POS_ACCTS=$(grep -c . "${DIG_POS[0]}"); else DIG_POS_ACCTS=0; fi
 funnel_counters() {
     # Missing/failed metrics are unavailable evidence, never fabricated zeros.
     python3 -c '
@@ -1205,12 +1222,13 @@ if Q_BEFORE=$(funnel_snapshot); then Q_BEFORE_OK=1; fi
 for i in 0 1 2; do
     h=$(scrape_one "${METS[$i]}" | mval torus_block_height); DHGT[$i]=${h%.*}
 done
-log "state digest: $MARKETS markets + $DIG_ACCTS accounts, 3 nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
+log "state digest: $MARKETS markets + $DIG_ACCTS accounts + $DIG_POS_ACCTS position accounts, 3 nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
 TDIG0=$(date +%s)
 DIG_PIDS=()
 for i in 0 1 2; do
     "$TOOLS_DIR/digest-node.sh" "${RPCS[$i]}" "$MARKETS" "$OUT/digest-accounts.txt" \
-        "$OUT/state-digest-val$i.txt" "$DIGEST_PAR" "$RPC_TIMEOUT" > "$OUT/digest-val$i.out" 2>>"$OUT/run.log" &
+        "$OUT/state-digest-val$i.txt" "$DIGEST_PAR" "$RPC_TIMEOUT" ${DIG_POS[@]+"${DIG_POS[@]}"} \
+        > "$OUT/digest-val$i.out" 2>>"$OUT/run.log" &
     DIG_PIDS+=($!)
 done
 # Only the digests: a bare `wait` would also wait on the (paused) oracle feed forever.

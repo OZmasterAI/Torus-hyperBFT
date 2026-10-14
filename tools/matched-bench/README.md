@@ -146,8 +146,9 @@ python3 tools/matched-bench/test_harness.py
    `ORACLE_SHOCK_ROUND=R` (need `ORACLE_FEED=1`) make the feed add +S bp to odd
    market ids and -S bp to even ones from round R on: on the uniform shape the
    even-index senders lose on every position (with `MPS` set, sides follow
-   owner rank instead; run-cell warns). With either set, the liquidator vault
-   joins the digest accounts, `vault-val<i>.json` holds each node's
+   owner rank instead; run-cell warns). With either set, the protocol accounts
+   join the state digest (see step 9): the liquidator vault and both ADL
+   escrows, `vault-val<i>.json` holds each node's
    `torus_getLiquidatorVault`, and `sampler.csv` gains the liquidation counter,
    vault deficit and (feat/liq-telemetry) the step timer, per-class / scanned /
    acted counters, the pending / deferred gauges, the post-engine tail `_count`
@@ -170,6 +171,21 @@ python3 tools/matched-bench/test_harness.py
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
    + `torus_getBalances` of 50 bench senders), matched/placed/resting/actions
    counters (must be identical), `panicked|FAIL-STOP` and `ERROR` line counts.
+   **Liquidation-stress cells only** (`LIQ_THIN>0` or `ORACLE_SHOCK_BP>0`): the
+   digest also covers the three protocol accounts of
+   `torus_core::liquidation` — `LIQUIDATOR_VAULT` (`0x746f...766c74`,
+   "torus-liquidator-vlt") and the two ADL escrows `ADL_ESCROW_LONG`
+   (`0x746f...6c6e67`, "torus-adl-escrow-lng") and `ADL_ESCROW_SHORT`
+   (`0x746f...736874`, "torus-adl-escrow-sht"; fixed addresses, one per side,
+   not per market or derived). Their `torus_getBalances` follow the 50 senders
+   (`digest-accounts.txt`), then their `torus_getPosition` in every market
+   (`digest-position-accounts.txt`, passed to `digest-node.sh` as a 7th
+   argument; account by account, markets in id order; +3 x MARKETS RPCs per
+   node, ~900 at 300 markets). `test_harness.py` pins the hex addresses against
+   the Rust constants. Default cells pass no positions file and append no
+   protocol accounts, so their digest stream and value are byte-identical to
+   tools without escrow support (old and new tools stay comparable); the
+   escrows hold nothing there, so including them would only cost RPCs.
    NOTE: the executed native state root is not exposed by RPC/metrics (headers
    carry the parent's root, 0x0 on this branch), so the RPC state digest is the
    determinism check.
