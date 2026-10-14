@@ -240,6 +240,8 @@ Consensus-adjacent read path. Codex torus-adversarial review before step 3.
 ### Step 5: open-order count (decision 2 b)
 
 Step 0's `open_order_counts` number goes to the owner before this step starts (decision 2).
+**Owner s119:** step 0 measured 1.45% (3.5 ms per native block), below decision 2's ~5% bar. Step 5 runs last and
+stays only if its own A/B (counter upkeep netted) shows a gain; otherwise it is dropped or moved to Phase 5.
 
 - Test first: `open_order_count_in_user_equals_book_scan`. After every block of random places, cancels,
   fills, stops and cancel-alls, each user's count equals `open_order_counts` over the books
@@ -281,7 +283,7 @@ Step 0's `open_order_counts` number goes to the owner before this step starts (d
    (a) Keep counting from the books per call (today).
    (b) A counter in `UserState`, step 5.
    Recommendation: a, unless step 0 shows `open_order_counts` at >= ~5% of exec time.
-   **Decided: b (step 5), confirmed by step 0's number.** The count serves the HL-style per-user cap
+   **Decided: b (step 5); s119: step 0 gave 1.45%, so step 5 is kept only on its own net A/B (see Step 5).** The count serves the HL-style per-user cap
    already on main (min(1000 + cumVolume / 5M, 5000) over all markets, merge `2567e56`; HL docs [O]).
    (a) walks every book for every sender per batch (`order_book.rs:47` on `c88d3073`), so it grows with
    markets x senders. Section 11 of the results doc (older build, 300 markets): 0.26-0.36 ms per 1k
