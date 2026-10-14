@@ -22,6 +22,21 @@ pub enum AtomicWriteOp<'a> {
     },
 }
 
+/// Item 6 Phase 4 step 4: what [`StateBackend::own_pending_row`] knows of a
+/// key (the typed loads' first step).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnPendingRow {
+    /// Not known here (no resident rows R for this CF, or a backend that
+    /// keeps no such split): read through `get_cf_raw`.
+    Unknown,
+    /// THIS block's own pending row: a write (`Some`, the bytes
+    /// `get_cf_raw` returns) or a tombstone (`None`).
+    Pending(Option<Vec<u8>>),
+    /// Nothing of the key pending in this block and R attached for the CF:
+    /// `get_cf_raw` returns R's row (a node-local typed copy of R may answer).
+    Resident,
+}
+
 pub trait StateBackend: Clone + Send + Sync {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError>;
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError>;
@@ -120,6 +135,15 @@ pub trait StateBackend: Clone + Send + Sync {
     /// Default `None` = not available (callers ask `layer_touches`).
     fn layer_keys(&self, _cf: &str) -> Option<Vec<Vec<u8>>> {
         None
+    }
+
+    /// Item 6 Phase 4 step 4: with resident rows attached and `cf` one of
+    /// their CFs, THIS block's own pending row of `key` ([`OwnPendingRow::Pending`])
+    /// or, when it has none, [`OwnPendingRow::Resident`]. Default
+    /// [`OwnPendingRow::Unknown`] (callers read `get_cf_raw`). A wrapper that
+    /// changes what `get_cf_raw` returns must not forward this.
+    fn own_pending_row(&self, _cf: &str, _key: &[u8]) -> OwnPendingRow {
+        OwnPendingRow::Unknown
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
@@ -2675,6 +2699,18 @@ impl StateBackend for NativeStateOverlay {
         let mut keys: Vec<Vec<u8>> = cfp.writes.keys().chain(cfp.deletes.iter()).cloned().collect();
         keys.sort_unstable();
         Some(keys)
+    }
+
+    /// The first step of `get_cf_raw` for R's CFs: own pending, then R.
+    fn own_pending_row(&self, cf: &str, key: &[u8]) -> OwnPendingRow {
+        let Some(id) = intern_cf(cf) else { return OwnPendingRow::Unknown };
+        if self.resident(id).is_none() {
+            return OwnPendingRow::Unknown;
+        }
+        match self.pending.read().unwrap().lookup(id, key) {
+            Some(hit) => OwnPendingRow::Pending(hit.map(<[u8]>::to_vec)),
+            None => OwnPendingRow::Resident,
+        }
     }
 
     fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<ResidentChange>> {

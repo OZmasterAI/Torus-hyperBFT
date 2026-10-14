@@ -146,16 +146,16 @@ fn balance_cache_repeated_updates_and_clean_reads_match_old_cache() {
     let mut old = OldBalanceCache::new();
     for n in 1..=100 {
         assert_eq!(
-            bytes(&new.load(&new_positions, &address(n)).unwrap()),
+            bytes(&new.load(&new_positions, None, &address(n)).unwrap()),
             bytes(&old.load(&old_positions, &address(n)).unwrap())
         );
     }
     // Load returns an independent clone, without implicitly dirtying it.
-    let mut loaded = new.load(&new_positions, &address(50)).unwrap();
+    let mut loaded = new.load(&new_positions, None, &address(50)).unwrap();
     loaded.available = FixedPoint::from_raw(999);
     assert_ne!(
         bytes(&loaded),
-        bytes(&new.load(&new_positions, &address(50)).unwrap())
+        bytes(&new.load(&new_positions, None, &address(50)).unwrap())
     );
     old.load(&old_positions, &address(50)).unwrap();
     old.load(&old_positions, &address(50)).unwrap();
@@ -198,7 +198,7 @@ fn balance_cache_disjoint_merge_matches_old_cache_in_both_orders() {
             let mut new_worker = BalanceCache::new();
             let mut old_worker = OldBalanceCache::new();
             new_worker
-                .load(&new_positions, &address(shard + 100))
+                .load(&new_positions, None, &address(shard + 100))
                 .unwrap();
             old_worker
                 .load(&old_positions, &address(shard + 100))
@@ -274,7 +274,7 @@ fn balance_cache_failed_load_is_not_cached_or_dirtied() {
         new_db.0.lock().unwrap().fail_read = fail;
         old_db.0.lock().unwrap().fail_read = fail;
         let got = new
-            .load(&new_positions, &address(1))
+            .load(&new_positions, None, &address(1))
             .map(|v| bytes(&v))
             .map_err(|e| e.to_string());
         let expected = old

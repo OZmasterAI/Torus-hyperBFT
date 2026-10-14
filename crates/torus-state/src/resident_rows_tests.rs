@@ -553,6 +553,96 @@ fn layer_keys_are_own_pending_keys_with_resident() {
     assert_eq!(overlay.layer_keys(CF_NATIVE_BALANCES), Some(vec![[4u8; 20].to_vec()]));
 }
 
+/// Item 6 Phase 4 step 4: `own_pending_row` (the typed loads' first step).
+/// The default (`StateDb`) and an overlay without R: `Unknown` (read through
+/// `get_cf_raw`). With R: the overlay's OWN pending write / tombstone as
+/// bytes (`Pending`, equal to `get_cf_raw`), else `Resident` (then
+/// `get_cf_raw` is R's row: a parent write is already in R and is not
+/// pending here). A CF R does not hold: `Unknown`. Then over random R /
+/// parent / pending states, every key of both CFs agrees with `get_cf_raw`.
+#[test]
+fn own_pending_row_matches_get_cf_raw() {
+    use crate::backend::OwnPendingRow;
+    let (db, _dir) = temp_db();
+    let p = CF_NATIVE_POSITIONS;
+    assert_eq!(db.own_pending_row(p, &pos_key(1, 1)), OwnPendingRow::Unknown, "StateDb");
+    db.put_cf_raw(p, &pos_key(5, 1), b"db").unwrap();
+    let parent = NativeStateOverlay::new(db.clone());
+    parent.put_cf_raw(p, &pos_key(1, 1), b"parent").unwrap();
+    let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+    overlay.put_cf_raw(p, &pos_key(2, 1), b"own-before-R").unwrap();
+    assert_eq!(overlay.own_pending_row(p, &pos_key(2, 1)), OwnPendingRow::Unknown, "no R");
+    overlay.attach_resident(Arc::new(ResidentRows::build(&overlay).unwrap()));
+    overlay.put_cf_raw(p, &pos_key(2, 1), b"own").unwrap();
+    overlay.delete_cf_raw(p, &pos_key(3, 1)).unwrap();
+    overlay.put_cf_raw(CF_NATIVE_ORDERS, &[1u8; 8], b"o").unwrap();
+    assert_eq!(overlay.own_pending_row(p, &pos_key(2, 1)), OwnPendingRow::Pending(Some(b"own".to_vec())));
+    assert_eq!(overlay.own_pending_row(p, &pos_key(3, 1)), OwnPendingRow::Pending(None), "own tombstone");
+    assert_eq!(overlay.own_pending_row(p, &pos_key(1, 1)), OwnPendingRow::Resident, "parent write: in R");
+    assert_eq!(overlay.get_cf_raw(p, &pos_key(1, 1)).unwrap(), Some(b"parent".to_vec()));
+    assert_eq!(overlay.own_pending_row(p, &pos_key(5, 1)), OwnPendingRow::Resident, "a DB row: in R");
+    assert_eq!(overlay.own_pending_row(p, &pos_key(4, 1)), OwnPendingRow::Resident, "absent");
+    assert_eq!(overlay.own_pending_row(CF_NATIVE_BALANCES, &pos_key(2, 1)), OwnPendingRow::Resident, "other CF");
+    assert_eq!(overlay.own_pending_row(CF_NATIVE_ORDERS, &[1u8; 8]), OwnPendingRow::Unknown, "not an R CF");
+
+    let mut seed: u64 = 0x0057_E940;
+    let mut rnd = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let (mut pending, mut resident) = (0usize, 0usize);
+    for _round in 0..30 {
+        let (db, _d) = temp_db();
+        let keys: Vec<Vec<u8>> = (0..12u8).map(|t| pos_key(t % 4, u64::from(t / 4))).chain(odd_keys()).collect();
+        for cf in [p, CF_NATIVE_BALANCES] {
+            for k in &keys {
+                if rnd(2) == 0 {
+                    db.put_cf_raw(cf, k, &[rnd(200) as u8; 3]).unwrap();
+                }
+            }
+        }
+        let parent = NativeStateOverlay::new(db.clone());
+        let mut overlay_ops = Vec::new();
+        for cf in [p, CF_NATIVE_BALANCES] {
+            for k in &keys {
+                match rnd(3) {
+                    1 => parent.put_cf_raw(cf, k, &[0xAA, rnd(200) as u8]).unwrap(),
+                    2 => parent.delete_cf_raw(cf, k).unwrap(),
+                    _ => {}
+                }
+                overlay_ops.push((cf, k.clone(), rnd(3)));
+            }
+        }
+        let mut overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.freeze(1)));
+        let rows = Arc::new(ResidentRows::build(&overlay).unwrap());
+        overlay.attach_resident(rows.clone());
+        for (cf, k, op) in &overlay_ops {
+            match op {
+                1 => overlay.put_cf_raw(cf, k, &[0xBB, rnd(200) as u8]).unwrap(),
+                2 => overlay.delete_cf_raw(cf, k).unwrap(),
+                _ => {}
+            }
+        }
+        for (cf, k, op) in &overlay_ops {
+            let now = overlay.get_cf_raw(cf, k).unwrap();
+            match overlay.own_pending_row(cf, k) {
+                OwnPendingRow::Pending(row) => {
+                    assert_ne!(*op, 0, "{cf} {k:?}: pending without an own write");
+                    assert_eq!(row, now, "{cf} {k:?}: pending bytes == get_cf_raw");
+                    pending += 1;
+                }
+                OwnPendingRow::Resident => {
+                    assert_eq!(*op, 0, "{cf} {k:?}: an own write reads as resident");
+                    assert_eq!(rows.rows(cf).unwrap().get(k).cloned(), now, "{cf} {k:?}: R's row == get_cf_raw");
+                    resident += 1;
+                }
+                OwnPendingRow::Unknown => panic!("{cf} {k:?}: unknown with R attached"),
+            }
+        }
+    }
+    assert!(pending > 100 && resident > 100, "both outcomes covered ({pending} / {resident})");
+}
+
 /// Item 6 E2-E4: R's column families — positions and balances (C1), the
 /// liquidation rows (E2: cooldown / pending / previous marks / cursor) and
 /// the oracle rows (E3: submissions, aggregates, signer index) and the market
