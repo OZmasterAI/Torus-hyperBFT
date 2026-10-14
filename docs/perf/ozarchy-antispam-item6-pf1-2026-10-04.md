@@ -9397,6 +9397,156 @@ Files: run dir `~/bench-results-matched/ozarchy-p4swap10-run/` (`campaign.log`, 
 `ozarchy-p4swap10-campaign.sh`, `analyst/swap.py`; re-run: `python3 -I analyst/swap.py ozarchy-p4swap10-10m OUT
 w0-bb:bb r1-aa:aa ...` in run order); stage `ozarchy-p4swap10-stage/` (read-only copies).
 
+### 70.5 Per-wave cycle, node A vs node B (18c's four items, from the existing cells)
+
+No new run. The 16 main cells were re-checked first: rc 0, AGREE / ACCEPT, node and bench md5 = the staged combo
+binaries, no CELL-FLAG. Node effects are the two-factor node main effect (B - A, pooled over both bench builds,
+rounds as blocks, residual df 9, 95% t CI) on per-cell wave means. Bench effects and interactions are all inside
+noise for the quantities below. "p50 / p90" are over all waves of a node arm (A n = 168, B n = 164).
+
+**Sources.**
+* Per block, from the three node logs (`val*.log.gz`): commit time (`on_committed_block: sending to execution
+  pipeline height=H native=N`), action count, exec start and end (`executing finalized block` / `block done`).
+* The bench's commit tail position: val2's `torus_getBlockBody` ok count at 1 Hz plus an offset. The offset is
+  committed height minus count at t0 + 1.5-5 s, after the tail has read the empty backlog up to the head.
+* `buckets.csv` order-age histograms (age = now - nonce, where the nonce is the bench's clock at signing).
+* val2 `torus_exec_cancel_all_total`; `proc_cpu_by_node`; `bench.log`.
+
+**Wave definition.** A wave runs from the exec start of one main segment to the next. A main segment is a val2
+exec busy segment, split at 0.25 s of exec idle, holding >= 8,000 actions. Each wave has:
+* a main segment of ~60 blocks, 45 of them full (the 400-action block cap);
+* then an "echo": 1-3 short segments (~2-3k actions);
+* then idle (no committed actions, a run of empty blocks).
+
+Wave lengths match 70.2's mempool-minimum waves: 13.26 s vs 13.55 s.
+
+**What node B does differently, per wave**
+
+| step (per wave) | node A mean (p50 / p90) | node B mean (p50 / p90) | node B - A [95% CI] |
+|---|---|---|---|
+| wave length | 13,258 ms (13,155 / 15,629) | 13,555 ms (13,484 / 15,479) | **+297 ms [+131, +464]** |
+| main segment, exec busy | 9,138 ms (9,139 / 10,640) | 8,800 ms (8,776 / 9,930) | **-338 ms [-543, -134]** |
+| main segment, first to last commit | 8,419 ms | 8,105 ms | -315 ms [-593, -36] |
+| exec idle after the main segment | 2,486 ms (2,471 / 3,590) | 3,008 ms (2,988 / 4,055) | **+523 ms [+422, +623]** |
+| echo exec busy | 1,295 ms | 1,449 ms | +154 ms [+3, +305] |
+| refill (main exec end -> next main start) | 3,781 ms (3,863 / 5,886) | 4,457 ms (4,621 / 6,206) | **+677 ms [+446, +907]** |
+| exec rate while busy (val2, whole window) | 1,939 act/s | 1,980 act/s | **+41 [+25, +57]** (+2.1%) |
+| exec time per full 400-action block | 209.9 ms | 206.4 ms | -3.5 ms [-5.3, -1.7] |
+| exec busy share of the window | 80.0% | 76.4% | -3.7 pp [-4.3, -3.0] |
+
+Node B executes faster but idles longer. The 3.7-point busy-share loss times the 2.1% faster busy rate gives val2's
+-35 act/s [-46, -25] (1,532 vs 1,497).
+
+**Item 1: budget hit -> cancel-all committed -> budget reset.** Not recoverable per sender: the bench logs no
+per-sender event, and the node keeps only histograms. Fleet-level proxies per wave, A vs B:
+* Release / sign -> admit (`order_age_admit`, 3 nodes):
+  * p50: 236 vs 215 ms, -21 [-42, +0];
+  * p90: 893 vs 878 ms.
+* Sign -> commit (`order_age_commit`, val2, all actions; a cancel-all's nonce is its budget-hit moment):
+  * p50: 2,136 vs 2,096 ms, -40 [-200, +119];
+  * p90: 5,012 vs 4,951 ms.
+* Commit -> the bench's tail reads the body (= budget reset):
+  * at the main segment's last block: 6,189 vs 6,401 ms, +212 [-102, +526]; p50 / p90 5,983 / 7,311 vs
+    6,416 / 7,389;
+  * action-weighted over the main segment: 4,939 vs 5,198 ms, +259 [-49, +568].
+* Tail read - val2 exec end: p50 per cell 4,004 vs 4,329 ms, +325 [+4, +646].
+
+**The tail never catches up during load in any cell.** It stays 3-11 heights behind at best (median 50-72). It is
+>= 5 heights behind in 99.9% of 1 s intervals in every cell. It reads ~11.3 bodies/s, one at a time, so it is busy
+throughout. Releases are therefore paced by the tail's read speed, and the chain idles while senders wait for it.
+
+**Correction to 70.2.** The "bistable" tail lag in 70.2 comes from its offset. That offset was taken at t0 + shift
+(+6-7 s), already 5-13 heights behind the tail, and then clipped at the head. With the start offset the lag is the
+same kind in all 16 cells.
+
+**Item 2: cancel-all status and timeouts.**
+* Status is present on every body the bench read. Every body was read after val2 executed it: 100% of actions,
+  except 0.47% in r2-aa and r3-bb. So the "missing status = executed" default practically never applied.
+* `torus_exec_cancel_all_total` equals the bench's accepted cancel-alls exactly in all 16 cells (169,323-177,400).
+* `torus_exec_action_failures` is 0. `torus_exec_action_rejections` is 143-360 per node per cell, all action kinds.
+* Bench in-flight releases: timeout = 0 in all cells; refused 0-41 per cell.
+* Cancel-alls executed per wave: 7,723 vs 7,736 (+13 [-65, +90]).
+  * In the main segment: 6,393 vs 6,148 (-246 [-400, -92]).
+  * In the echo: 1,330 vs 1,588 (+259 [+126, +391]).
+* Not recorded: the bench counts committed / refused / timeout, but not statuses other than "executed". A counter of
+  non-executed cancel-all statuses in `in_flight::Tracker::on_block` would record it.
+
+**Item 3: blocks per wave and actions per block** (val2 commits within the wave):
+
+| per wave | node A (p50 / p90) | node B (p50 / p90) | node B - A |
+|---|---|---|---|
+| actions | 20,163 (20,268 / 22,863) | 20,167 (20,157 / 22,293) | +4 [-180, +189] |
+| blocks | 149.6 (148.5 / 182.3) | 156.3 (153.5 / 187.5) | +6.6 [+0.7, +12.5] |
+| nonempty blocks | 73.4 | 72.8 | -0.6 [-2.8, +1.7] |
+| full (400) blocks | 45.0 | 45.1 | +0.2 [-0.5, +0.8] |
+| empty blocks | 76.3 (77.0 / 98.0) | 83.5 (82.5 / 104.0) | **+7.2 [+3.1, +11.3]** |
+| actions per nonempty block | 277.8 (274.3 / 315.8) | 279.9 (278.5 / 323.4) | +2.1 [-6.6, +10.8] |
+| main-segment blocks | 60.0 | 56.7 | -3.3 [-5.5, -1.1] |
+| main actions / echo actions | 17,523 / 2,674 | 17,087 / 3,114 | -436 [-791, -82] / +441 [+129, +752] |
+
+The extra blocks are the empty blocks made during the longer idle.
+
+**Item 4: which block each cancel-all lands in.** Not recoverable. Bodies were not kept: the val data dirs are
+reused per cell, and `--sweep-bodies` was off. The logs give only per-block counts, and a body carries no sender
+address. Proxies from the 1 Hz cancel-all counter, mapped onto the exec timeline:
+* The first half of the main segment's blocks holds 66.1% / 64.8% of its actions but only 49.8% / 46.9% of its
+  cancel-alls (-2.9 pp [-5.9, +0.0]). Cancel-alls land late in the wave, as the third fire.
+* Node B moves ~250 cancel-alls per wave from the main segment into the echo.
+
+Recording it would take one of:
+* a bench log line per release (sender, cancel-all nonce, height seen, tail read time, reset time);
+* a copy of val2's `CF_BLOCK_BODIES` at cell end, plus the bench's per-fire nonce log to map signer to sender.
+
+**Which step node B lengthens.** The refill, mostly its idle part:
+* refill +677 ms [+446, +907], of which idle +523 ms [+422, +623] per wave;
+* the main exec segment is 338 ms [134, 543] shorter;
+* net wave length +297 ms [+131, +464], i.e. -2.2% actions/s, as in 70.1.
+
+The refill ends when senders are released, and releases come from the bench tail reading val2's bodies.
+
+**Candidate cause, sized.** Serving `torus_getBlockBody` on val2, which is what the tail waits on. The handler reads
+the raw `CF_BLOCK_BODIES` row and re-serializes every action to JSON.
+* val2's CPU minus the mean of val0 / val1 (same consensus and exec work, no body serving) is 215 vs 221 s per cell.
+* Per 400 actions the tail released, that is **189.7 vs 198.8 ms, +9.1 ms [+5.6, +12.7]**. All 8 node-B cells are
+  at 193.9-205.2 ms. The 8 node-A cells are at 186.4-194.3 ms.
+* That cost is ~85% of the ~226 ms the tail spends per full body. Taken as fully serial, it could add up to +460 ms
+  [+280, +640] per wave (50.4 full-body equivalents), which covers the +297 ms.
+* Reading the +7 extra empty bodies adds only ~+30 ms per wave (~4 ms each).
+* A direct fit of tail read time per full body cannot resolve it: +2.5 ms [-2.6, +7.7].
+* The `getBlockBody` path (`torus-rpc`) is not in the Phase 4 diff. The production changes are in `torus-bridge`
+  (executor, `users.rs`), `torus-state` (`resident_rows.rs`, `backend.rs`), `torus-core` (`position.rs`) and
+  telemetry; the `app.rs` changes are test-only.
+* So any Phase 4 effect on serving would be indirect: contention on val2 between body serialization and B's
+  executor (CPU, cache or allocator). B's nodes use less CPU overall: val0 / val1 -40 s per cell. These data do not
+  single out a Phase 4 function.
+
+**Reading.** At 10 markets this load is bound by the bench's tail, not by the node:
+* Node B executes 2.1% faster per busy second, and its admit / commit / exec ages are equal or shorter (section 69).
+* The 10-market gap shows up as idle time while senders wait for the tail.
+* The gap may therefore be a harness artifact of a tail-bound cycle plus a small per-body serving cost, not a node
+  throughput regression.
+
+Confidence:
+* high that the extra time is in the idle refill and that B's exec is faster;
+* medium that val2 body serving is the cause (CPU differencing, no per-request timing);
+* low on any Phase 4 code link.
+
+**Next, to resolve.** Two short A/B pairs (120 s, 2 rounds, ~25 min), with a bench that logs per-body tail fetch
+time (height, actions, ms) and a node `torus_getBlockBody` duration histogram:
+* (a) as here, which isolates the serving cost;
+* (b) with the tail pointed at a non-validator `--rpc-only` node, or reading bodies faster, so that the cycle is no
+  longer tail-bound.
+
+If (b) closes the gap, the 10-market gap is not a node regression.
+
+Files: scripts and outputs in `~/bench-results-matched/ozarchy-p4swap10-tools/analyst/waves/`:
+* `blocks_extract.py` -> `blocks/<tag>.tsv`;
+* `waves.py` -> `waves.txt`, `waves.json`;
+* `tailrate.py`, `status.py`, `offset_check.py`, `busy.py`, `cpu.py` (`cpu-per-action.txt`).
+
+They sit in the tools dir rather than the run dir because the analyst gate keeps the run dir unchanged. Re-run:
+`python3 -I blocks_extract.py <cell> blocks/<tag>.tsv`, then `python3 -I waves.py > waves.txt` and the others.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
