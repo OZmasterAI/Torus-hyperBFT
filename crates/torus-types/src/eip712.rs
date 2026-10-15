@@ -1075,9 +1075,15 @@ fn check_network_chain_id(configured: u64) -> Result<(), Eip712Error> {
 /// NODE-LOCAL and PERFORMANCE-ONLY: every mode returns a byte-identical result
 /// vector (index order preserved by `collect`), so it can never change which
 /// senders resolve, which actions are rejected, the order of any downstream
-/// rejection log, or the trust-cache insert/lookup sequence (the cache pre-pass
-/// is always sequential). It therefore cannot fork the chain and needs no fleet
-/// coordination — a mixed fleet is safe.
+/// rejection log, or the trust-cache insert/lookup sequence (the cache lookups
+/// are always sequential, in input order). It therefore cannot fork the chain
+/// and needs no fleet coordination — a mixed fleet is safe.
+///
+/// With `TORUS_EXEC_PARALLEL_KEYS=1` (default off) the trust-cache KEY hashing
+/// of the pre-pass also runs on the pool this mode picks (never under `Serial`).
+/// Only the pure keccak moves; the lookups stay sequential and see the same key
+/// sequence, so the cache sequence, senders and drops are identical — also
+/// node-local, also safe on a mixed fleet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyMode {
     /// Unset / empty / unrecognized: today's exact behavior — the shared global
@@ -1111,6 +1117,32 @@ pub fn parse_parallel_verify(raw: Option<String>) -> VerifyMode {
 fn verify_mode() -> VerifyMode {
     static MODE: std::sync::OnceLock<VerifyMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| parse_parallel_verify(std::env::var("TORUS_PARALLEL_VERIFY").ok()))
+}
+
+/// Pure parse of `TORUS_EXEC_PARALLEL_KEYS` (no env / OnceLock, so it is unit
+/// testable). Only `"1"` (after trim) enables; unset, empty or anything else
+/// keeps today's sequential trust-cache key pre-pass.
+pub fn parse_exec_parallel_keys(raw: Option<String>) -> bool {
+    raw.as_deref().map(str::trim) == Some("1")
+}
+
+/// `TORUS_EXEC_PARALLEL_KEYS` read once per process (default off). When on, the
+/// live batch verify hashes the trust-cache keys on the verify pool; the
+/// lookups stay sequential (see [`batch_verify_native_actions_cached`]).
+fn exec_parallel_keys() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_exec_parallel_keys(std::env::var("TORUS_EXEC_PARALLEL_KEYS").ok()))
+}
+
+/// Below this many actions the parallel key pre-pass is not worth a rayon
+/// dispatch, so the sequential loop runs even with `TORUS_EXEC_PARALLEL_KEYS=1`.
+const PARALLEL_KEYS_MIN_ACTIONS: usize = 16;
+
+/// Whether [`batch_verify_impl`] hashes the trust-cache keys in parallel: the
+/// flag is on, the mode allows rayon (`Serial` means no rayon), and the block is
+/// large enough. Either answer yields the same keys, lookups and senders.
+fn use_parallel_keys(parallel_keys: bool, mode: VerifyMode, n_actions: usize) -> bool {
+    parallel_keys && mode != VerifyMode::Serial && n_actions >= PARALLEL_KEYS_MIN_ACTIONS
 }
 
 /// Live-path dedicated verify pool, built ONCE to the env-configured worker
@@ -1224,6 +1256,13 @@ pub fn batch_verify_native_actions(
 /// session resolution. Cache consultation is a sequential pre-pass, kept off the
 /// rayon workers exactly like `session_lookup` — so the trust-cache insert/lookup
 /// sequence is identical in every mode.
+///
+/// With `TORUS_EXEC_PARALLEL_KEYS=1` (read once per process, default off) and at
+/// least `PARALLEL_KEYS_MIN_ACTIONS` actions, the key HASHING (canonical bytes ||
+/// nonce || v || r || s, then keccak) runs order-preserving on the verify pool
+/// (not under `TORUS_PARALLEL_VERIFY=0|1`). `verified_lookup` is still called on
+/// this thread, in input order, with the same keys, so it needs no `Sync` bound
+/// and the cache sequence, senders and drops do not change.
 pub fn batch_verify_native_actions_cached(
     actions: &[SignedNativeAction],
     timestamp: u64,
@@ -1236,14 +1275,23 @@ pub fn batch_verify_native_actions_cached(
     } else {
         None
     };
-    batch_verify_impl(actions, timestamp, session_lookup, verified_lookup, mode, pool)
+    batch_verify_impl(
+        actions,
+        timestamp,
+        session_lookup,
+        verified_lookup,
+        mode,
+        pool,
+        exec_parallel_keys(),
+    )
 }
 
 /// [`batch_verify_native_actions_cached`] with an explicit [`VerifyMode`],
 /// bypassing the `TORUS_PARALLEL_VERIFY` env read. For `Pool(n)` it builds an
 /// EPHEMERAL n-thread pool per call (test/bench cost, not the live path). The
 /// differential suite and the µbench drive this to exercise every thread count
-/// in one process.
+/// in one process. It ignores `TORUS_EXEC_PARALLEL_KEYS`: the key pre-pass is
+/// always today's sequential loop here.
 pub fn batch_verify_native_actions_cached_with_mode(
     actions: &[SignedNativeAction],
     timestamp: u64,
@@ -1261,13 +1309,26 @@ pub fn batch_verify_native_actions_cached_with_mode(
                 verified_lookup,
                 mode,
                 pool.as_ref(),
+                false,
             )
         }
-        _ => batch_verify_impl(actions, timestamp, session_lookup, verified_lookup, mode, None),
+        _ => batch_verify_impl(
+            actions,
+            timestamp,
+            session_lookup,
+            verified_lookup,
+            mode,
+            None,
+            false,
+        ),
     }
 }
 
 /// Shared body for the env-driven and mode-pinned entrypoints.
+///
+/// `parallel_keys` (`TORUS_EXEC_PARALLEL_KEYS` on the live path, `false` on the
+/// mode-pinned one) moves only the trust-cache key hashing onto the pool `mode`
+/// picks; see [`use_parallel_keys`] for when it applies.
 fn batch_verify_impl(
     actions: &[SignedNativeAction],
     timestamp: u64,
@@ -1275,20 +1336,45 @@ fn batch_verify_impl(
     verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
     mode: VerifyMode,
     dedicated: Option<&rayon::ThreadPool>,
+    parallel_keys: bool,
 ) -> Vec<Option<Address>> {
-    // Pre-pass (sequential, mode-independent): consult the trust-cache. For a
+    // Pre-pass (mode-independent result): consult the trust-cache. For a
     // locally-verified EIP-712 action a HIT yields the sender a fresh recover
     // would produce, so the dominant ecrecover below is skipped.
     // `verified_cache_key` returns None for session / non-EIP-712 actions, which
     // are never short-circuited.
-    let mut cache_key_scratch = Vec::new();
-    let cache_hits: Vec<Option<Address>> = actions
-        .iter()
-        .map(|action| {
-            crate::verified_cache_key_with_scratch(action, &mut cache_key_scratch)
-                .and_then(|k| verified_lookup(&k))
-        })
-        .collect();
+    let parallel = use_parallel_keys(parallel_keys, mode, actions.len());
+    let cache_hits: Vec<Option<Address>> = if parallel {
+        // Hash the keys order-preserving on the same pool phase 1 uses (the
+        // dedicated pool for `Pool(_)`, else the global one); one scratch buffer
+        // per rayon split. Each key is a pure function of its action, so `keys`
+        // equals what the sequential loop below computes.
+        let hash_keys = || -> Vec<Option<B256>> {
+            use rayon::prelude::*;
+            actions
+                .par_iter()
+                .map_init(Vec::<u8>::new, |buf, action| {
+                    crate::verified_cache_key_with_scratch(action, buf)
+                })
+                .collect()
+        };
+        let keys = match (mode, dedicated) {
+            (VerifyMode::Pool(_), Some(pool)) => pool.install(hash_keys),
+            _ => hash_keys(),
+        };
+        // Lookups stay on this thread, in input order: `verified_lookup` sees the
+        // identical key sequence (no call for a session action's `None`).
+        keys.into_iter().map(|key| key.and_then(|k| verified_lookup(&k))).collect()
+    } else {
+        let mut cache_key_scratch = Vec::new();
+        actions
+            .iter()
+            .map(|action| {
+                crate::verified_cache_key_with_scratch(action, &mut cache_key_scratch)
+                    .and_then(|k| verified_lookup(&k))
+            })
+            .collect()
+    };
 
     // Phase 1: recover EIP-712 senders for cache MISSES only, under the chosen
     // mode. Each ecrecover is pure, independent crypto; the collect is
@@ -2693,6 +2779,323 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // TORUS_EXEC_PARALLEL_KEYS: trust-cache keys hashed in parallel, lookups
+    // kept sequential. The tests drive `batch_verify_impl` directly (no env).
+    // ========================================================================
+
+    #[test]
+    fn parse_exec_parallel_keys_only_one_enables() {
+        use super::parse_exec_parallel_keys as parse;
+        assert!(!parse(None), "unset stays off");
+        for off in ["", "   ", "0", "2", "01", "10", "1x", "true", "on", "yes"] {
+            assert!(!parse(Some(off.into())), "{off:?} must stay off");
+        }
+        for on in ["1", " 1", "1 ", "\t1\n"] {
+            assert!(parse(Some(on.into())), "{on:?} must enable");
+        }
+    }
+
+    #[test]
+    fn use_parallel_keys_gates_on_flag_mode_and_size() {
+        use super::{use_parallel_keys, VerifyMode, PARALLEL_KEYS_MIN_ACTIONS as MIN};
+        assert_eq!(MIN, 16);
+        for mode in [VerifyMode::Default, VerifyMode::Pool(2), VerifyMode::Pool(4)] {
+            assert!(use_parallel_keys(true, mode, MIN), "{mode:?}: MIN actions go parallel");
+            assert!(use_parallel_keys(true, mode, 400), "{mode:?}");
+            assert!(!use_parallel_keys(true, mode, MIN - 1), "{mode:?}: below MIN stays serial");
+            assert!(!use_parallel_keys(true, mode, 0), "{mode:?}: empty block stays serial");
+            assert!(!use_parallel_keys(false, mode, 400), "{mode:?}: flag off stays serial");
+        }
+        assert!(
+            !use_parallel_keys(true, VerifyMode::Serial, 400),
+            "TORUS_PARALLEL_VERIFY=0|1 (Serial) never uses rayon"
+        );
+    }
+
+    /// A `PlaceOrderBatch` of `n` orders; `salt` makes batches of the same size
+    /// differ, `cloids` sets a client order id on every order.
+    fn keys_order_batch(n: u64, cloids: bool, salt: u64) -> NativeAction {
+        NativeAction::PlaceOrderBatch(
+            (0..n)
+                .map(|i| PlaceOrderParams {
+                    market_id: (i + salt) % 7,
+                    is_buy: i % 2 == 0,
+                    price: FixedPoint::from_raw(6_500_000_000_000 + (i + salt) as i128 * 1000),
+                    quantity: FixedPoint::from_raw(10_000_000 + salt as i128),
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: cloids.then_some(u128::from(salt * 1_000 + i)),
+                })
+                .collect(),
+        )
+    }
+
+    /// Fixture for the parallel-keys differential: actions, the ground-truth
+    /// senders, the registered sessions and a pre-filled trust-cache.
+    struct KeysFixture {
+        actions: Vec<SignedNativeAction>,
+        expected: Vec<Option<Address>>,
+        sessions: std::collections::HashMap<[u8; 32], SessionData>,
+        cache: std::collections::HashMap<B256, Address>,
+    }
+
+    /// 74 actions: EIP-712 `PlaceOrderBatch` of 1 / 50 / 400 orders with and
+    /// without cloids, `ClaimRewards`, a tampered signature, a tampered body,
+    /// session actions (valid, expired, out of scope, on an EIP-712-only action,
+    /// unregistered key) and duplicates. Every 3rd valid EIP-712 action is warm in
+    /// the cache with its own sentinel sender, so a HIT shows in the result.
+    fn parallel_keys_fixture() -> KeysFixture {
+        let key = test_key();
+        let key2 = test_key_2();
+        let owner = Address::from([0x11; 20]);
+        let ed_valid = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let ed_expired = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let ed_transfers = ed25519_dalek::SigningKey::from_bytes(&[44u8; 32]);
+        let ed_unknown = ed25519_dalek::SigningKey::from_bytes(&[45u8; 32]);
+
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(ed_valid.verifying_key().to_bytes(), make_session(owner));
+        sessions.insert(
+            ed_expired.verifying_key().to_bytes(),
+            SessionData {
+                owner,
+                expiry: TEST_NONCE - 1, // the verify timestamp is TEST_NONCE
+                scope: SessionScope::Trading,
+                created_at: 0,
+            },
+        );
+        sessions.insert(
+            ed_transfers.verifying_key().to_bytes(),
+            SessionData {
+                owner,
+                expiry: u64::MAX,
+                scope: SessionScope::TransfersOnly, // allows no trading action
+                created_at: 0,
+            },
+        );
+
+        let mut actions = Vec::new();
+        let mut expected = Vec::new();
+        let mut cache = std::collections::HashMap::new();
+        let mut valid_eip712 = 0u8;
+        // A valid EIP-712 action: every 3rd one is warm in the cache.
+        let mut push_valid = |a: SignedNativeAction,
+                              signer: Address,
+                              actions: &mut Vec<SignedNativeAction>,
+                              expected: &mut Vec<Option<Address>>| {
+            valid_eip712 += 1;
+            if valid_eip712 % 3 == 0 {
+                let mut sentinel = [0xC0u8; 20];
+                sentinel[19] = valid_eip712;
+                let sentinel = Address::from(sentinel);
+                cache.insert(crate::verified_cache_key(&a).expect("eip712 is cacheable"), sentinel);
+                expected.push(Some(sentinel));
+            } else {
+                expected.push(Some(signer));
+            }
+            actions.push(a);
+        };
+
+        let batches =
+            [(1u64, true), (1, false), (50, true), (50, false), (400, true), (400, false)];
+        for round in 0..5u64 {
+            let nonce = |j: u64| TEST_NONCE + round * 100 + j;
+            for (j, &(n, cloids)) in batches.iter().enumerate() {
+                let j = j as u64;
+                let (k, signer) = if j % 2 == 0 {
+                    (&key, signer_address(&key))
+                } else {
+                    (&key2, signer_address(&key2))
+                };
+                let action = keys_order_batch(n, cloids, round * 10 + j);
+                let signed = sign_native_action(action, nonce(j), k);
+                push_valid(signed, signer, &mut actions, &mut expected);
+            }
+            let claim = sign_native_action(NativeAction::ClaimRewards, nonce(6), &key);
+            push_valid(claim, signer_address(&key), &mut actions, &mut expected);
+
+            // Tampered signature: ecrecover fails or yields another address.
+            let mut bad_sig =
+                sign_native_action(keys_order_batch(50, true, round + 900), nonce(7), &key);
+            if let ActionSignature::Eip712(ref mut sig) = bad_sig.signature {
+                sig.r[0] ^= 0xff;
+            }
+            let got = bad_sig.recover_sender().ok();
+            assert_ne!(
+                got,
+                Some(signer_address(&key)),
+                "tampered sig must not recover the signer"
+            );
+            expected.push(got);
+            actions.push(bad_sig);
+
+            // Tampered body after signing: recovers some other address.
+            let mut bad_body =
+                sign_native_action(keys_order_batch(50, false, round + 950), nonce(8), &key2);
+            if let NativeAction::PlaceOrderBatch(ref mut orders) = bad_body.action {
+                orders[3].price = FixedPoint::from_raw(1);
+            }
+            let got = bad_body.recover_sender().ok();
+            assert_ne!(
+                got,
+                Some(signer_address(&key2)),
+                "tampered body must not recover the signer"
+            );
+            expected.push(got);
+            actions.push(bad_body);
+
+            // Session actions: valid, expired, out of scope, EIP-712-only, unknown.
+            actions.push(sign_action_with_session(
+                keys_order_batch(50, true, round + 500),
+                nonce(9),
+                &ed_valid,
+            ));
+            expected.push(Some(owner));
+            actions.push(sign_action_with_session(
+                NativeAction::CancelOrder { order_id: u128::from(round) },
+                nonce(10),
+                &ed_expired,
+            ));
+            expected.push(None);
+            actions.push(sign_action_with_session(
+                keys_order_batch(1, false, round + 600),
+                nonce(11),
+                &ed_transfers,
+            ));
+            expected.push(None);
+            actions.push(sign_action_with_session(
+                NativeAction::Withdraw {
+                    amount: U256::from(100 + round),
+                    to: Address::ZERO,
+                },
+                nonce(12),
+                &ed_valid,
+            ));
+            expected.push(None);
+            actions.push(sign_action_with_session(
+                NativeAction::CancelOrder { order_id: u128::from(round + 7) },
+                nonce(13),
+                &ed_unknown,
+            ));
+            expected.push(None);
+        }
+
+        // Duplicates of a cold 1-order batch, a warm 400-order batch, a valid
+        // session action and the tampered signature, each resolving like the
+        // original.
+        for i in [0usize, 5, 9, 7] {
+            let (dup, dup_expected) = (actions[i].clone(), expected[i]);
+            actions.push(dup);
+            expected.push(dup_expected);
+        }
+        assert_eq!(actions.len(), 74);
+        assert_eq!(actions.len(), expected.len());
+        KeysFixture { actions, expected, sessions, cache }
+    }
+
+    /// Run `batch_verify_impl` with a session map and a cache-backed
+    /// `verified_lookup` that records every key it is asked for, in call order.
+    fn verify_recording_keys(
+        actions: &[SignedNativeAction],
+        sessions: &std::collections::HashMap<[u8; 32], SessionData>,
+        cache: &std::collections::HashMap<B256, Address>,
+        mode: VerifyMode,
+        pool: Option<&rayon::ThreadPool>,
+        parallel_keys: bool,
+    ) -> (Vec<Option<Address>>, Vec<B256>) {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let senders = batch_verify_impl(
+            actions,
+            TEST_NONCE,
+            |pk: &[u8; 32]| sessions.get(pk).cloned(),
+            |k: &B256| {
+                seen.borrow_mut().push(*k);
+                cache.get(k).copied()
+            },
+            mode,
+            pool,
+            parallel_keys,
+        );
+        (senders, seen.into_inner())
+    }
+
+    /// Core differential: with `parallel_keys` on, the resolved senders AND the
+    /// exact `verified_lookup` key sequence equal the sequential pre-pass in every
+    /// mode and thread count, across repeats.
+    #[test]
+    fn parallel_keys_identical_senders_and_lookup_sequence() {
+        let KeysFixture { actions, expected, sessions, cache } = parallel_keys_fixture();
+        assert!(actions.len() >= 64);
+        // Every EIP-712 action is looked up once, in input order; session
+        // actions (key `None`) make no call.
+        let expected_keys: Vec<B256> =
+            actions.iter().filter_map(crate::verified_cache_key).collect();
+        assert!(expected_keys.len() < actions.len(), "fixture has session actions");
+        assert!(!cache.is_empty(), "fixture has warm entries");
+
+        let (serial, serial_keys) =
+            verify_recording_keys(&actions, &sessions, &cache, VerifyMode::Serial, None, false);
+        assert_eq!(serial, expected, "sequential pre-pass ground truth");
+        assert_eq!(serial_keys, expected_keys);
+
+        let p2 = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let p4 = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let cases: [(VerifyMode, Option<&rayon::ThreadPool>); 5] = [
+            (VerifyMode::Serial, None),
+            (VerifyMode::Default, None),
+            (VerifyMode::Pool(2), Some(&p2)),
+            (VerifyMode::Pool(4), Some(&p4)),
+            // A pool that failed to build falls back to the global pool.
+            (VerifyMode::Pool(3), None),
+        ];
+        for (mode, pool) in cases {
+            for parallel_keys in [false, true] {
+                for rep in 0..3 {
+                    let (got, keys) = verify_recording_keys(
+                        &actions,
+                        &sessions,
+                        &cache,
+                        mode,
+                        pool,
+                        parallel_keys,
+                    );
+                    assert_eq!(
+                        got, serial,
+                        "{mode:?} parallel_keys={parallel_keys} rep {rep}: senders diverged"
+                    );
+                    assert_eq!(
+                        keys, serial_keys,
+                        "{mode:?} parallel_keys={parallel_keys} rep {rep}: lookup sequence diverged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Below `PARALLEL_KEYS_MIN_ACTIONS` the flag takes the sequential path; at
+    /// the threshold it goes parallel. Both give the same outputs.
+    #[test]
+    fn parallel_keys_small_block_takes_serial_path_with_same_outputs() {
+        use super::{use_parallel_keys, PARALLEL_KEYS_MIN_ACTIONS as MIN};
+        let KeysFixture { actions, expected, sessions, cache } = parallel_keys_fixture();
+        let p2 = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        for n in [0, 1, MIN - 1, MIN] {
+            let block = &actions[..n];
+            let expected_keys: Vec<B256> =
+                block.iter().filter_map(crate::verified_cache_key).collect();
+            for (mode, pool) in [(VerifyMode::Default, None), (VerifyMode::Pool(2), Some(&p2))] {
+                assert_eq!(use_parallel_keys(true, mode, n), n >= MIN, "{mode:?} n={n}");
+                let off = verify_recording_keys(block, &sessions, &cache, mode, pool, false);
+                let on = verify_recording_keys(block, &sessions, &cache, mode, pool, true);
+                assert_eq!(off.0, expected[..n], "{mode:?} n={n}: flag off senders");
+                assert_eq!(on, off, "{mode:?} n={n}: flag on must match flag off");
+                assert_eq!(on.1, expected_keys, "{mode:?} n={n}: lookup sequence");
+            }
+        }
+    }
+
     /// L3 acceptance (e): in-proc µbench — N=400 and N=25k mixed ed25519+eip712
     /// verifications, serial vs parallel wall time. `#[ignore]` (perf, not a gate);
     /// run with `cargo test -p torus-types --release parallel_verify_microbench
@@ -2719,12 +3122,21 @@ mod tests {
             ];
             println!("\n== parallel_verify µbench: N={n} ==");
             for (label, mode, pool) in cases {
-                // Warm once.
-                let _ = batch_verify_impl(&actions, TEST_NONCE, lookup, |_| None, mode, pool);
+                // Warm once. `parallel_keys = false`: today's sequential key pre-pass.
+                let _ =
+                    batch_verify_impl(&actions, TEST_NONCE, lookup, |_| None, mode, pool, false);
                 let iters = if n >= 25_000 { 5 } else { 50 };
                 let t = Instant::now();
                 for _ in 0..iters {
-                    let _ = batch_verify_impl(&actions, TEST_NONCE, lookup, |_| None, mode, pool);
+                    let _ = batch_verify_impl(
+                        &actions,
+                        TEST_NONCE,
+                        lookup,
+                        |_| None,
+                        mode,
+                        pool,
+                        false,
+                    );
                 }
                 let per = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
                 println!("  {label:8} {per:8.3} ms/batch");
