@@ -3815,6 +3815,710 @@ class BuildGuardTest(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("never bench while building", r.stderr)
 
+
+EVM_LOAD_PY = os.path.join(HERE, "evm_load.py")
+
+
+class EvmLoadHarnessTest(unittest.TestCase):
+    """EVM_LOAD_RATE (item 7): tools/tx-flood sends paced EVM transfers beside
+    the native load. Off (the default) the cell's command lines are exactly the
+    old ones; on, tx-flood starts with the bench and stops when it exits."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(RUN_CELL_SH) as f:
+            cls.src = f.read()
+
+    def fn(self, start, end_marker):
+        i = self.src.index(start)
+        return self.src[i : self.src.index(end_marker, i)]
+
+    def test_defaults_off_documented_and_allowlisted(self):
+        self.assertIn("EVM_LOAD_RATE=${EVM_LOAD_RATE:-0}", self.src)
+        self.assertIn("EVM_LOAD_SENDERS=${EVM_LOAD_SENDERS:-}", self.src)
+        self.assertIn(
+            "TX_FLOOD=${TX_FLOOD:-$TARGET_DIR/release/torus-tx-flood}", self.src
+        )
+        head = self.src[: self.src.index("set -uo pipefail")]
+        self.assertIn("#   EVM_LOAD_RATE=R", head)
+        self.assertIn("#   EVM_LOAD_SENDERS=S", head)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            rc = f.read()
+        self.assertIn('"EVM_LOAD_RATE",', rc)
+        self.assertIn('"EVM_LOAD_SENDERS",', rc)
+        with open(os.path.join(HERE, "README.md")) as f:
+            readme = f.read()
+        self.assertIn("## EVM load in a cell (`EVM_LOAD_RATE`)", readme)
+
+    def test_every_evm_load_step_is_gated(self):
+        """Off, no EVM-load step runs: each sits in an `if evm_load_on` block
+        (evm_load_stop in finish_fail is a no-op without a tx-flood pid)."""
+        for marker in (
+            "    if pgrep -x torus-tx-flood",
+            "then trap 'stop_oracle_feed; evm_load_stop' EXIT",
+            '    log "EVM load ON:',
+            '    EVM_KEYS="$RUN_DIR/evm-load-keys.txt"',
+            "then evm_load_start; fi",
+            "then evm_load_stop; fi",
+            '"$SELF_DIR/evm_load.py" scan',
+            '"$SELF_DIR/evm_load.py" summary',
+            "jq -e '.evm_load.ok == true'",
+        ):
+            i = self.src.index(marker)
+            gate = self.src.rindex("if evm_load_on", 0, i)
+            self.assertNotIn("\nfi\n", self.src[gate:i], marker)
+        self.assertEqual(self.src.count("evm_load_start() {"), 1, "defined once")
+        self.assertEqual(self.src.count("then evm_load_start; fi"), 1, "called once")
+        ff = self.fn("finish_fail() {", "\n}\n")
+        self.assertLess(ff.index("evm_load_stop"), ff.index("stop-3val.sh"))
+
+    def test_the_evm_load_window_is_the_bench_window(self):
+        """tx-flood starts right after the bench and stops right after it
+        exits (before the drain); the scan reads the chain after the digest,
+        before the nodes stop; the summary follows summarize.py."""
+        s = self.src
+        start = s.index("then evm_load_start; fi")
+        self.assertLess(s.index('"${BENCH_CMD[@]}" > "$OUT/bench.log"'), start)
+        self.assertLess(start, s.index("cpusampler & CPU_PID=$!"))
+        stop = s.index("then evm_load_stop; fi")
+        self.assertLess(s.index('log "bench exited rc='), stop)
+        self.assertLess(
+            stop,
+            s.index(
+                "# ---------------------------------------------------------------- 7. drain"
+            ),
+        )
+        scan = s.index('"$SELF_DIR/evm_load.py" scan')
+        self.assertLess(s.index('log "ingest: bench submitted='), scan)
+        self.assertLess(
+            scan,
+            s.index(
+                "# ---------------------------------------------------------------- 9. stop + collect logs"
+            ),
+        )
+        summ = s.index('"$SELF_DIR/evm_load.py" summary')
+        self.assertLess(s.index('python3 "$TOOLS_DIR/summarize.py"'), summ)
+        self.assertLess(summ, s.index('log "done -> $OUT/summary.json"'))
+        # the bench, oracle and node env are built without any EVM knob
+        for block in (
+            self.fn("BENCH_CMD=(", 'log "bench: ${BENCH_CMD[*]}"'),
+            self.fn("    ORACLE_CMD=(", '\n    log "oracle feed: ${ORACLE_CMD[*]}"'),
+            self.fn(
+                "for v in $(env | grep -oE '^TORUS_", 'log "node env: $NODE_ENV_JSON"'
+            ),
+        ):
+            self.assertNotIn("EVM_LOAD", block)
+            self.assertNotIn("TX_FLOOD", block)
+
+    def _flow(self, rate):
+        """The cell's bench start .. bench exit, from the real script, with a
+        stub bench (1 s) and a stub tx-flood (runs until SIGTERM). Returns
+        (events, bench argv, tx-flood argv or None, log, keys file left?, stdout)."""
+        tmp = tempfile.mkdtemp(prefix="evm-flow-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        ev = os.path.join(tmp, "events")
+        bench = os.path.join(tmp, "bench")
+        with open(bench, "w") as f:
+            f.write(
+                '#!/bin/bash\nprintf "%%s\\n" "$@" > "%s/bench.argv"\n'
+                'echo "bench_start $(date +%%s.%%N)" >> "%s"\nsleep 1\n'
+                'echo "bench_end $(date +%%s.%%N)" >> "%s"\n' % (tmp, ev, ev)
+            )
+        flood = os.path.join(tmp, "torus-tx-flood")
+        with open(flood, "w") as f:
+            f.write(
+                '#!/bin/bash\nprintf "%%s\\n" "$@" > "%s/flood.argv"\n'
+                'trap \'echo "flood_term $(date +%%s.%%N)" >> "%s"; exit 0\' TERM\n'
+                'echo "flood_start $(date +%%s.%%N)" >> "%s"\n'
+                "for _ in $(seq 1 300); do sleep 0.1; done\n" % (tmp, ev, ev)
+            )
+        for p in (bench, flood):
+            os.chmod(p, 0o755)
+        keys = os.path.join(tmp, "evm-load-keys.txt")
+        with open(keys, "w") as f:
+            f.write("20 0xabc 0xdef\n")
+        gate = next(l for l in self.src.splitlines() if l.startswith("evm_load_on() {"))
+        mval = next(l for l in self.src.splitlines() if l.startswith("mval() {"))
+        script = "\n".join(
+            [
+                "set -uo pipefail",
+                'OUT="%s"; DUR=1; RPCS=(u0 u1 u2); METS=(9161 9162 9163)' % tmp,
+                'TX_FLOOD="%s"; EVM_LOAD_RATE=%s; EVM_LOAD_SENDERS=4' % (flood, rate),
+                'BENCH_CMD=("%s" consensus --rate-total 100)' % bench,
+                'log() { echo "LOG $*" >> "%s/log"; }' % tmp,
+                'scrape_one() { echo "torus_block_height 123"; }',
+                "cpusampler() { :; }",
+                mval,
+                gate,
+                self.fn("alive() {", "\nstop_sampler() {"),
+                'EVM_KEYS="%s"; EVM_CHAIN_ID=7778' % keys,
+                self.fn("T_BENCH0=$(date +%s)\n", "cpusampler & CPU_PID=$!"),
+                'wait "$BENCH_PID"; BENCH_RC=$?',
+                'log "bench exited rc=$BENCH_RC"',
+                "if evm_load_on; then evm_load_stop; fi",
+                'echo "EVM_PID=[$EVM_PID] EVM_RC=[$EVM_RC] EVM_H0=[$EVM_H0] EVM_H1=[$EVM_H1]"',
+            ]
+        )
+        r = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        def read(name):
+            try:
+                with open(os.path.join(tmp, name)) as f:
+                    return f.read()
+            except OSError:
+                return None
+
+        def argv(name):
+            text = read(name)
+            return None if text is None else text.split("\n")[:-1]
+
+        events = {}
+        for line in (read("events") or "").splitlines():
+            k, t = line.split()
+            events[k] = float(t)
+        return (
+            events,
+            argv("bench.argv"),
+            argv("flood.argv"),
+            read("log") or "",
+            os.path.exists(keys),
+            r.stdout,
+        )
+
+    def test_knob_off_runs_no_tx_flood_and_the_same_bench(self):
+        _, bench0, flood0, log0, keys0, out0 = self._flow("0")
+        self.assertIsNone(flood0, "no tx-flood when off")
+        self.assertNotIn("EVM load", log0)
+        self.assertIn("EVM_PID=[] EVM_RC=[] EVM_H0=[] EVM_H1=[]", out0)
+        self.assertTrue(keys0, "nothing EVM-related touched")
+        _, bench1, flood1, _, _, _ = self._flow("2.5")
+        self.assertEqual(bench0, ["consensus", "--rate-total", "100"])
+        self.assertEqual(
+            bench1, bench0, "identical bench command line with the knob on"
+        )
+        self.assertIsNotNone(flood1)
+
+    def test_knob_on_starts_and_stops_tx_flood_with_the_load_window(self):
+        ev, _, flood, log, keys_left, out = self._flow("2.5")
+        keys_arg = flood[flood.index("--keys-file") + 1]
+        self.assertEqual(
+            flood[: flood.index("--rate")],
+            [
+                "--rpc-urls",
+                "u0,u1,u2",
+                "--fanout",
+                "pinned",
+                "--keys-file",
+                keys_arg,
+                "--chain-id",
+                "7778",
+            ],
+        )
+        self.assertTrue(keys_arg.endswith("/evm-load-keys.txt"))
+        self.assertEqual(flood[flood.index("--rate") + 1], "2.5")
+        self.assertEqual(flood[flood.index("--duration-secs") + 1], "1")
+        self.assertTrue(
+            flood[flood.index("--stats-file") + 1].endswith("/evm-load-stats.json")
+        )
+        # started right after the bench started; SIGTERMed right after it ended
+        self.assertLessEqual(ev["bench_start"] - 0.5, ev["flood_start"])
+        self.assertLess(ev["flood_start"], ev["bench_end"])
+        self.assertGreaterEqual(ev["flood_term"], ev["bench_end"])
+        self.assertLess(
+            ev["flood_term"] - ev["bench_end"], 5, "stopped when the bench exited"
+        )
+        self.assertIn("EVM_PID=[] EVM_RC=[0] EVM_H0=[123] EVM_H1=[123]", out)
+        self.assertIn("EVM load: tx-flood pid", log)
+        self.assertIn("(val0 committed height 123)", log)
+        self.assertFalse(keys_left, "the sender keys are deleted when tx-flood stops")
+
+    def test_a_cell_without_its_evm_load_is_not_accepted(self):
+        """Codex reviews: with the knob on, a cell whose .evm_load is not ok
+        is rejected by the canonical verdict (evm_load.py summary folded it
+        into .validity): the real health.py exits 2 as for any rejected cell.
+        No .evm_load at all: exit 1. Off: the old tail."""
+        s = self.src
+        gate = s.index("if evm_load_on && ! jq -e '.evm_load.ok == true'")
+        self.assertLess(s.index('[ "$rc" = 0 ] || exit "$rc"'), gate)
+        final = s.rindex('python3 "$TOOLS_DIR/health.py" accept "$OUT/summary.json"')
+        self.assertLess(gate, final)
+        tail = s[gate:]
+        line = next(l for l in s.splitlines() if l.startswith("evm_load_on() {"))
+        tmp = tempfile.mkdtemp(prefix="evm-accept-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        accepted = {"verdict": "ACCEPT", "accepted": True, "fail_reasons": []}
+        rejected = {"verdict": "REJECT", "accepted": False,
+                    "fail_reasons": ["EVM load failed: tx-flood rc=1"]}
+        for rate, evm_load, validity, rc, said in (
+            ("5", {"ok": False, "problems": ["tx-flood rc=1"]}, rejected, 2, '["tx-flood rc=1"]'),
+            ("5", None, accepted, 1, '["no .evm_load in summary.json"]'),
+            ("5", {"ok": True, "problems": []}, accepted, 0, None),
+            ("0", None, accepted, 0, None),
+        ):
+            d = {"label": "x", "validity": validity}
+            if evm_load is not None:
+                d["evm_load"] = evm_load
+            with open(os.path.join(tmp, "summary.json"), "w") as f:
+                json.dump(d, f)
+            script = "\n".join([
+                'OUT="%s"; TOOLS_DIR="%s"; EVM_LOAD_RATE=%s' % (tmp, HERE, rate),
+                'log() { echo "LOG $*"; }',
+                line,
+                tail,
+            ])
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, rc, (rate, evm_load, r.stdout, r.stderr))
+            if said is None:
+                self.assertNotIn("NOT accepted", r.stdout)
+            else:
+                self.assertIn("LOG EVM load: cell NOT accepted: " + said, r.stdout)
+
+    def test_bad_evm_load_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="evm-pre-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tgt = os.path.join(tmp, "release")
+        os.makedirs(tgt)
+        for b in ("torus-node", "bench-throughput"):
+            p = os.path.join(tgt, b)
+            with open(p, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(p, 0o755)
+        script, wt = sandbox_repo(tmp)
+        old_flood = os.path.join(tmp, "old-flood")
+        with open(old_flood, "w") as f:
+            f.write(
+                "#!/bin/sh\necho 'Usage: torus-tx-flood --rpc-urls <URLS> --accounts <N>'\n"
+            )
+        os.chmod(old_flood, 0o755)
+        for env, rc, msg in (
+            (dict(EVM_LOAD_RATE="fast"), 2, "EVM_LOAD_RATE must be"),
+            (dict(EVM_LOAD_RATE="-1"), 2, "EVM_LOAD_RATE must be"),
+            (
+                dict(EVM_LOAD_SENDERS="5"),
+                2,
+                "EVM_LOAD_SENDERS=5 needs EVM_LOAD_RATE > 0",
+            ),
+            (
+                dict(EVM_LOAD_RATE="0", EVM_LOAD_SENDERS="5"),
+                2,
+                "needs EVM_LOAD_RATE > 0",
+            ),
+            (
+                dict(EVM_LOAD_RATE="5", EVM_LOAD_SENDERS="41"),
+                2,
+                "EVM_LOAD_SENDERS must be",
+            ),
+            (
+                dict(EVM_LOAD_RATE="5", EVM_LOAD_SENDERS="0"),
+                2,
+                "EVM_LOAD_SENDERS must be",
+            ),
+            (dict(EVM_LOAD_RATE="5"), 1, "(cargo build --release -p torus-tx-flood"),
+            (dict(EVM_LOAD_RATE="5", TX_FLOOD=old_flood), 1, "has no --rate"),
+        ):
+            e = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith(("EVM_LOAD", "TX_FLOOD"))
+            }
+            e.update(
+                TARGET_DIR=tmp,
+                RESULTS_ROOT=tmp,
+                DATA_ROOT=tmp,
+                BENCH_ALLOW_UNDETACHED="1",
+                **env,
+            )
+            r = subprocess.run(
+                [script, wt, "evm-pre-x"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=e,
+            )
+            self.assertEqual(r.returncode, rc, (env, r.stderr))
+            self.assertIn(msg, r.stderr, env)
+            self.assertFalse(
+                os.path.exists(os.path.join(tmp, "evm-pre-x")),
+                "fails before any launch",
+            )
+
+
+class EvmRpcStub(BaseHTTPRequestHandler):
+    """eth_blockNumber (server.head(), may move), per-height executed EVM tx
+    counts and per-address nonces; JSON-RPC batches unless server.no_batch."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_a):
+        pass
+
+    def answer(self, req):
+        m, p = req.get("method"), req.get("params") or []
+        s = self.server
+        if m == "eth_blockNumber":
+            r = hex(s.head())
+        elif m == "eth_getBlockTransactionCountByNumber":
+            h = int(p[0], 16)
+            r = None if h > s.head() or h in s.unreadable else hex(s.counts.get(h, 0))
+        elif m == "eth_getTransactionCount":
+            r = hex(s.nonces.get(p[0].lower(), 0))
+        else:
+            return {
+                "jsonrpc": "2.0",
+                "id": req.get("id"),
+                "error": {"code": -32601, "message": "nope"},
+            }
+        return {"jsonrpc": "2.0", "id": req.get("id"), "result": r}
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        req = json.loads(self.rfile.read(n) or b"{}")
+        if isinstance(req, list):
+            self.server.batches += 1
+            out = (
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "batch disabled"},
+                }
+                if self.server.no_batch
+                else [self.answer(r) for r in req]
+            )
+        else:
+            self.server.singles += 1
+            out = self.answer(req)
+        body = json.dumps(out).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class EvmLoadScanTest(unittest.TestCase):
+    """evm_load.py: the chain-side record of an EVM_LOAD_RATE cell."""
+
+    def serve(self, head, counts, nonces=None, unreadable=(), no_batch=False):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), EvmRpcStub)
+        srv.head = head if callable(head) else (lambda: head)
+        srv.counts, srv.nonces, srv.unreadable = counts, nonces or {}, set(unreadable)
+        srv.no_batch, srv.batches, srv.singles = no_batch, 0, 0
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+
+    def run_py(self, *args):
+        return subprocess.run(
+            [sys.executable, EVM_LOAD_PY, *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def scan(self, url, h0, h1, interval="11", stats=None, wait_s="5"):
+        tmp = tempfile.mkdtemp(prefix="evm-scan-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out = os.path.join(tmp, "scan.json")
+        args = [
+            "scan",
+            "--rpc",
+            url,
+            "--from",
+            str(h0),
+            "--to",
+            str(h1),
+            "--interval",
+            interval,
+            "--wait-s",
+            wait_s,
+            "--out",
+            out,
+        ]
+        if stats is not None:
+            sp = os.path.join(tmp, "stats.json")
+            with open(sp, "w") as f:
+                json.dump(stats, f)
+            args += ["--stats", sp]
+        r = self.run_py(*args)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out) as f:
+            return json.load(f), r.stdout
+
+    def test_counts_executed_txs_and_flags_blocks_off_the_cadence(self):
+        srv, url = self.serve(200, {110: 3, 121: 2, 125: 1, 132: 1, 150: 9})
+        d, line = self.scan(url, 100, 140)
+        self.assertTrue(d["complete"])
+        self.assertEqual((d["blocks_scanned"], d["scanned_to"]), (41, 140))
+        self.assertEqual(
+            (d["evm_blocks"], d["evm_txs"], d["evm_txs_per_block_max"]), (4, 7, 3)
+        )
+        self.assertEqual(d["evm_block_txs"], [[110, 3], [121, 2], [125, 1], [132, 1]])
+        self.assertEqual((d["cadence_heights"], d["off_cadence_blocks"]), (3, 1))
+        self.assertEqual(d["off_cadence_heights"], [125])
+        self.assertEqual(d["read_errors"], 0)
+        self.assertGreater(srv.batches, 0, "heights are read in JSON-RPC batches")
+        self.assertIn(
+            "4 EVM blocks, 7 EVM txs executed, off-cadence blocks 1 (N=11)", line
+        )
+        d, _ = self.scan(url, 100, 140, interval="")
+        self.assertIsNone(d["off_cadence_blocks"], "no N, no cadence verdict")
+
+    def test_waits_for_the_served_head_then_reads(self):
+        t0 = time.monotonic()
+        _, url = self.serve(
+            lambda: 120 if time.monotonic() - t0 < 1.5 else 200, {121: 2, 132: 1}
+        )
+        d, _ = self.scan(url, 110, 140)
+        self.assertTrue(d["complete"])
+        self.assertGreaterEqual(d["waited_s"], 1.0)
+        self.assertEqual((d["evm_blocks"], d["evm_txs"]), (2, 3))
+        # a head that never gets there: scan what is served, complete=false
+        _, url2 = self.serve(130, {121: 2, 132: 1})
+        d, _ = self.scan(url2, 110, 140, wait_s="1")
+        self.assertFalse(d["complete"])
+        self.assertEqual((d["scanned_to"], d["evm_txs"]), (130, 2))
+
+    def test_unreadable_heights_and_a_refused_batch(self):
+        srv, url = self.serve(300, {110: 1, 121: 1}, unreadable={115}, no_batch=True)
+        d, _ = self.scan(url, 100, 250)
+        self.assertEqual(
+            (d["evm_txs"], d["read_errors"], d["unread_heights"]), (2, 1, [115])
+        )
+        self.assertEqual(srv.batches, 1, "a refused batch is not retried")
+        self.assertEqual(
+            srv.singles, 151 + 1, "every height singly, plus the head poll"
+        )
+
+    def test_landed_by_nonce_from_the_tx_flood_stats(self):
+        a, b = "0x" + "11" * 20, "0x" + "22" * 20
+        stats = {
+            "per_sender": [
+                {"address": a, "start_nonce": 0, "next_nonce": 10},
+                {"address": b, "start_nonce": 5, "next_nonce": 9},
+            ]
+        }
+        _, url = self.serve(200, {121: 12}, nonces={a: 8, b: 9})
+        d, line = self.scan(url, 110, 130, stats=stats)
+        self.assertEqual((d["landed_by_nonce"], d["accepted_not_landed"]), (12, 2))
+        self.assertEqual([s["chain_nonce"] for s in d["senders"]], [8, 9])
+        self.assertIn("landed by nonce 12, accepted not landed 2", line)
+
+    def test_summary_folds_an_evm_failure_into_the_canonical_verdict(self):
+        """Codex review 2: readers of summary.json (health.py accept,
+        ab-driver's benchmark_accepted, cell_step's validity) see a failed EVM
+        load as a rejected cell. Idempotent; an ok EVM load changes nothing."""
+        tmp = tempfile.mkdtemp(prefix="evm-fold-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        base = {"label": "x", "status": "OK", "headline": {"benchmark_accepted": True},
+                "validity": {"verdict": "ACCEPT", "accepted": True, "fail_reasons": [],
+                             "unverified_reasons": []}}
+        scan = {"evm_txs": 9, "evm_blocks": 3, "interval": 11, "off_cadence_blocks": 0,
+                "complete": True, "read_errors": 0}
+        for rc, want_ok in (("0", True), ("1", False)):
+            with open(os.path.join(tmp, "summary.json"), "w") as f:
+                json.dump(base, f)
+            with open(os.path.join(tmp, "evm-load-stats.json"), "w") as f:
+                json.dump({"accepted": 9, "elapsed_s": 3.0}, f)
+            with open(os.path.join(tmp, "evm-load-scan.json"), "w") as f:
+                json.dump(scan, f)
+            for _ in range(2):
+                r = self.run_py("summary", "--dir", tmp, "--rate", "3", "--senders", "4", "--rc", rc)
+                self.assertEqual(r.returncode, 0, r.stderr)
+            with open(os.path.join(tmp, "summary.json")) as f:
+                d = json.load(f)
+            self.assertIs(d["evm_load"]["ok"], want_ok)
+            if want_ok:
+                self.assertEqual((d["status"], d["validity"], d["headline"]),
+                                 (base["status"], base["validity"], base["headline"]))
+            else:
+                self.assertEqual(d["status"], "INVALID")
+                self.assertEqual((d["validity"]["verdict"], d["validity"]["accepted"]), ("REJECT", False))
+                self.assertEqual(d["validity"]["fail_reasons"], ["EVM load failed: tx-flood rc=1"],
+                                 "one EVM reason, however often it runs")
+                self.assertIs(d["headline"]["benchmark_accepted"], False)
+                rc_h = subprocess.run([sys.executable, os.path.join(HERE, "health.py"), "accept",
+                                       os.path.join(tmp, "summary.json")]).returncode
+                self.assertEqual(rc_h, 2, "health.py accept rejects it")
+
+    def test_resummarize_keeps_the_evm_load_and_its_verdict(self):
+        """Codex review 2: resummarize.sh rebuilds summary.json with
+        summarize.py, which knows nothing of .evm_load: it is re-derived from
+        the retained evm-load-* artifacts, verdict included."""
+        d = tempfile.mkdtemp(prefix="evm-resum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1000, 1000, dur=120)
+        write_agreement(d, ["0xaa"] * 3)
+        run_summarize(d, dur=120)
+        with open(os.path.join(d, "evm-load-stats.json"), "w") as f:
+            json.dump({"accepted": 30, "elapsed_s": 120.0, "fanout": "pinned"}, f)
+        with open(os.path.join(d, "evm-load-scan.json"), "w") as f:
+            json.dump({"evm_txs": 30, "evm_blocks": 10, "interval": 11, "off_cadence_blocks": 1,
+                       "complete": True, "read_errors": 0}, f)
+        r = self.run_py("summary", "--dir", d, "--rate", "0.25", "--senders", "40", "--rc", "0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), d],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(d, "summary.json")) as f:
+            s = json.load(f)
+        e = s["evm_load"]
+        self.assertEqual((e["rate"], e["senders"], e["rc"], e["landed"]), ("0.25", 40, 0, 30))
+        self.assertEqual(e["problems"], ["1 blocks carry EVM txs off the N=11 cadence"])
+        self.assertIn("EVM load failed: 1 blocks carry EVM txs off the N=11 cadence",
+                      s["validity"]["fail_reasons"])
+        self.assertIs(s["headline"]["benchmark_accepted"], False)
+
+    def test_funded_needs_every_sender_in_the_genesis_accounts(self):
+        tmp = tempfile.mkdtemp(prefix="evm-funded-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        g, k = os.path.join(tmp, "genesis.json"), os.path.join(tmp, "keys.txt")
+        a, b = "0x" + "aa" * 20, "0x" + "bb" * 20
+        with open(k, "w") as f:
+            f.write("20 %s 0x01\n21 %s 0x02\n" % (a, "0x" + "BB" * 20))
+        with open(g, "w") as f:
+            json.dump(
+                {
+                    "accounts": [
+                        {"address": a, "balance": "1000000000000000000000000"},
+                        {"address": b, "balance": "0x10"},
+                    ]
+                },
+                f,
+            )
+        r = self.run_py("funded", "--genesis", g, "--keys", k)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(
+            "2/2 EVM load senders funded in the genesis (min 16 wei)", r.stdout
+        )
+        with open(g, "w") as f:
+            json.dump(
+                {
+                    "accounts": [
+                        {"address": a, "balance": "5"},
+                        {"address": b, "balance": "0"},
+                    ]
+                },
+                f,
+            )
+        r = self.run_py("funded", "--genesis", g, "--keys", k)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("1 of 2 EVM load senders hold no EVM balance", r.stdout)
+
+    def test_summary_merges_stats_scan_and_exec_evm_seconds(self):
+        tmp = tempfile.mkdtemp(prefix="evm-summary-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+        def w(name, obj):
+            with open(os.path.join(tmp, name), "w") as f:
+                f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+        w("summary.json", {"label": "x", "status": "OK"})
+        w(
+            "evm-load-stats.json",
+            {
+                "fanout": "pinned",
+                "sender_offset": 20,
+                "stopped_by": "SIGTERM",
+                "elapsed_s": 60.0,
+                "sent": 130,
+                "accepted": 120,
+                "rejected": 10,
+                "reject_reasons": {"mempool_full": 10},
+                "throttled": 3,
+                "missed": 0,
+            },
+        )
+        w(
+            "evm-load-scan.json",
+            {
+                "evm_txs": 118,
+                "evm_blocks": 20,
+                "landed_by_nonce": 118,
+                "accepted_not_landed": 2,
+                "interval": 11,
+                "off_cadence_blocks": 0,
+                "cadence_heights": 22,
+                "from": 100,
+                "scanned_to": 340,
+                "complete": True,
+                "read_errors": 0,
+                "evm_txs_per_block_max": 9,
+            },
+        )
+        for i in range(3):
+            w(
+                "metrics-before-val%d.txt" % i,
+                "torus_exec_evm_seconds_sum 1.5\ntorus_exec_evm_seconds_count 100\n",
+            )
+            w(
+                "metrics-after-val%d.txt" % i,
+                "torus_exec_evm_seconds_sum %s\ntorus_exec_evm_seconds_count 340\n"
+                % (1.5 + 0.1 * (i + 1)),
+            )
+        r = self.run_py(
+            "summary", "--dir", tmp, "--rate", "2", "--senders", "40", "--rc", "0"
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(tmp, "summary.json")) as f:
+            d = json.load(f)
+        self.assertEqual(d["status"], "OK", "the rest of the summary is kept")
+        e = d["evm_load"]
+        self.assertEqual(
+            (e["rate"], e["senders"], e["rc"], e["fanout"]), ("2", 40, 0, "pinned")
+        )
+        self.assertEqual(
+            (e["sent"], e["accepted"], e["landed"], e["evm_blocks"]),
+            (130, 120, 118, 20),
+        )
+        self.assertEqual(
+            (e["off_cadence_blocks"], e["interval"], e["accepted_per_s"]), (0, 11, 2.0)
+        )
+        v1 = e["exec_evm_seconds"]["val1"]
+        self.assertAlmostEqual(v1["delta_sum"], 0.2)
+        self.assertEqual(v1["delta_count"], 240)
+        self.assertAlmostEqual(v1["ms_per_evm_block"], 10.0)
+        self.assertEqual((e["ok"], e["problems"]), (True, []))
+
+    def test_summary_lists_why_a_cell_got_no_evm_load(self):
+        """Codex review: a cell whose EVM load failed must not pass as a
+        normal cell. .evm_load.problems names why; ok is false."""
+        cases = (
+            ("137", None, {"evm_txs": 5, "evm_blocks": 1, "interval": 11, "off_cadence_blocks": 2,
+                           "complete": True, "read_errors": 0},
+             ["tx-flood rc=137", "no evm-load-stats.json",
+              "2 blocks carry EVM txs off the N=11 cadence"]),
+            ("0", {"accepted": 40, "elapsed_s": 10.0}, {"evm_txs": 0, "evm_blocks": 0, "interval": 11,
+                                                        "off_cadence_blocks": 0, "complete": False,
+                                                        "read_errors": 3},
+             ["scan incomplete: val0's eth head stayed below the committed head",
+              "3 heights unreadable", "no EVM tx landed"]),
+            ("0", {"accepted": 0, "elapsed_s": 10.0}, None,
+             ["no EVM tx accepted", "no evm-load-scan.json"]),
+            ("", {"accepted": 4, "elapsed_s": 2.0}, {"evm_txs": 4, "evm_blocks": 1, "interval": 11,
+                                                     "off_cadence_blocks": 0, "complete": True,
+                                                     "read_errors": 0},
+             ["tx-flood rc=None"]),
+        )
+        for rc, stats, scan, want in cases:
+            tmp = tempfile.mkdtemp(prefix="evm-problems-")
+            self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+            with open(os.path.join(tmp, "summary.json"), "w") as f:
+                json.dump({"label": "x"}, f)
+            for name, obj in (("evm-load-stats.json", stats), ("evm-load-scan.json", scan)):
+                if obj is not None:
+                    with open(os.path.join(tmp, name), "w") as f:
+                        json.dump(obj, f)
+            r = self.run_py("summary", "--dir", tmp, "--rate", "2", "--senders", "4", "--rc", rc)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            with open(os.path.join(tmp, "summary.json")) as f:
+                e = json.load(f)["evm_load"]
+            self.assertEqual(e["problems"], want, rc)
+            self.assertIs(e["ok"], False)
+
+
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):
         print("NOTE: %s missing — digest tests will fail" % DIGEST_SH)
