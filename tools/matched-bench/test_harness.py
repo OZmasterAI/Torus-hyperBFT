@@ -3776,10 +3776,6 @@ class DetachBuildLockTest(unittest.TestCase):
         self.assertIn(".cargo-heavy.lock", src)
         self.assertIn("flock -o", src)
 
-if __name__ == "__main__":
-    if not os.path.exists(DIGEST_SH):
-        print("NOTE: %s missing — digest tests will fail" % DIGEST_SH)
-    unittest.main(verbosity=2)
 
 
 class BuildGuardTest(unittest.TestCase):
@@ -3818,3 +3814,8 @@ class BuildGuardTest(unittest.TestCase):
             r = self._guard(tmp)
             self.assertEqual(r.returncode, 1)
             self.assertIn("never bench while building", r.stderr)
+
+if __name__ == "__main__":
+    if not os.path.exists(DIGEST_SH):
+        print("NOTE: %s missing — digest tests will fail" % DIGEST_SH)
+    unittest.main(verbosity=2)
