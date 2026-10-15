@@ -6,6 +6,10 @@ on one host, fixed load, matched/s from node counters) for two or more node buil
 scripts here drive it end to end; the per-cell runner and its `summary.json` are
 documented in `../README.md`.
 
+Campaigns of the template lineage (per-cell `run-cell.sh` units, env/md5 checks,
+`cells.tsv` step) are generated from a JSON spec by `make-driver.py` (+ `driver-body.sh`,
+example `driver-spec.example.json`): see `../README.md` "Campaign driver generator".
+
 > **WARNING: test keys only.** `devnet/wsl/env.sh` (validator consensus keys
 > `01..`, `02..`, `03..`) and `devnet/wsl/bench-validator-keys.json` (validator EVM
 > keys, hardhat/anvil mnemonic `test test ... junk`, indices 100-102) are publicly
@@ -215,6 +219,14 @@ change during the cell; N > 0 needs an arm whose `bench-throughput` has `--walk-
 the drain (`health.py drain --feed-live`), so oracle-only blocks execute with live marks;
 per-sample exec lag and ms per native block go to `drain-feed-live.tsv`, the summary to
 `drain.json .feed_live`. The feed is paused only before the after-snapshots and the digest.
+`LIQ_THIN=N` / `LIQ_THIN_AVAIL` (default 0 / 1000000.0) and `ORACLE_SHOCK_BP=S` /
+`ORACLE_SHOCK_ROUND=R` (default 0, need `ORACLE_FEED=1`) make a liquidation-stress cell
+(row 76): load senders 0..N-1 get `available` = LIQ_THIN_AVAIL in the genesis, and from
+feed round R on odd markets are priced +S bp and even markets -S bp, so even-index
+senders lose on every position (uniform shape only, MPS unset). The liquidator vault then
+joins the state digest, `vault-val<i>.json` holds each node's `torus_getLiquidatorVault`,
+and `sampler.csv` gains the liquidation counter and vault deficit. Report:
+`../liq_stress.py <results-dir>` (writes `liq-stress.json`, lists what it cannot measure).
 
 Requirements:
 - The arm's `bench-throughput` must have the `oracle-feed` subcommand. main does

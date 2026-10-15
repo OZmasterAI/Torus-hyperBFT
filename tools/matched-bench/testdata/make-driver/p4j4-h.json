@@ -1,0 +1,99 @@
+{
+  "campaign": "ozarchy-p4j4h",
+  "comment": "Job 4 part 1 horizon grid (golden spec for ozarchy-p4j4-h-campaign.sh): A, E20, E5, E2, W; warm-up w1, 3 rotated replicates, 120 s cells, 300 markets",
+  "results_root": "/home/oz/bench-results-matched",
+  "run_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-run/h",
+  "label_prefix": "ozarchy-p4j4h-300m",
+  "harness_worktree": "/home/oz/projects/wt/p4j4-bdd59888",
+  "tools_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-tools/tools/matched-bench",
+  "devnet_dir": "/home/oz/torus-wsl-devnet",
+  "binaries": {
+    "b": {
+      "stage_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-stage/b-run",
+      "node_md5": "03a2b75727727f972cf5e80865646f0d",
+      "bench_md5": "9b725823487b8ac7f42cfc556609e9aa"
+    }
+  },
+  "markets": 300,
+  "duration_s": 120,
+  "rate": 76000,
+  "replicates": 3,
+  "order": "rotate",
+  "baseline": "A",
+  "warmup": {
+    "arm": "A",
+    "tag": "w1"
+  },
+  "node_env": {
+    "TORUS_ROCKSDB_PIPELINED_WRITE": "",
+    "TORUS_RESIDENT_BOOKS": "",
+    "TORUS_NATIVE_ROOT_CACHE": "",
+    "TORUS_PARALLEL_SETTLE": "",
+    "TORUS_PARALLEL_BUCKET_HASH": "",
+    "TORUS_BUCKET_MEMBER_CACHE_MB": "",
+    "TORUS_BOOK_ROWS": "",
+    "TORUS_ROCKSDB_STATS": "2",
+    "TORUS_ROCKSDB_STATS_INTERVAL_SECS": "1"
+  },
+  "harness_env": {
+    "BLOCK_CAP": "400",
+    "OVERWRITE": "1",
+    "RETRY_BUSY": "1",
+    "MAX_IN_FLIGHT": "4",
+    "OPEN_ORDER_BUDGET": "900",
+    "ORACLE_FEED": "1",
+    "ORACLE_PRICE": "30000",
+    "ORACLE_INTERVAL_MS": "2000",
+    "ORACLE_WALK_BP": "0",
+    "IN_FLIGHT_TAIL": "commit",
+    "IN_FLIGHT_TAIL_DEPTH": "1",
+    "CLOID_SHARE": "0"
+  },
+  "expect": [
+    {
+      "file": "run.log",
+      "regex": "oracle feed pid [0-9]+;",
+      "min": 1
+    },
+    {
+      "file": "run.log",
+      "regex": "in_flight_tail_depth='1'",
+      "min": 1
+    }
+  ],
+  "absent_env": [
+    "MALLOC_CONF"
+  ],
+  "arms": [
+    {
+      "label": "A"
+    },
+    {
+      "label": "E20",
+      "env": {
+        "TORUS_ADMISSION_EXEC_AWARE": "1",
+        "TORUS_ADMISSION_HORIZON_MS": "20000"
+      }
+    },
+    {
+      "label": "E5",
+      "env": {
+        "TORUS_ADMISSION_EXEC_AWARE": "1",
+        "TORUS_ADMISSION_HORIZON_MS": "5000"
+      }
+    },
+    {
+      "label": "E2",
+      "env": {
+        "TORUS_ADMISSION_EXEC_AWARE": "1",
+        "TORUS_ADMISSION_HORIZON_MS": "2000"
+      }
+    },
+    {
+      "label": "W",
+      "env": {
+        "TORUS_EXEC_THROTTLE_WATERMARKS": "8,16,24"
+      }
+    }
+  ]
+}

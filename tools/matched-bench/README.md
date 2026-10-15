@@ -29,6 +29,11 @@ descendants of an agent's shell, each lost one process to an outside SIGKILL
 scope keeps the caller as parent. `BENCH_ALLOW_UNDETACHED=1` overrides for a
 deliberate one-off. Wait for the cell through its files (`summary.json`, a
 done marker), and stop it with `systemctl --user stop bench-NAME.service`.
+Started from outside a bench unit, detach.sh holds the shared build lock
+(`flock -o "$HOME/projects/wt/.cargo-heavy.lock"`, the one builders take with
+`flock -w 60 -o`) for the whole run, so wrapped builds wait; while a build holds
+it the log shows only `build lock: waiting`. Cells a campaign starts from inside
+its own bench unit take no lock (the campaign holds it); no `~/projects/wt`, no lock.
 
 Example (record-cell shape, 5 min, 10 markets):
 
@@ -63,12 +68,19 @@ python3 tools/matched-bench/test_harness.py
 2. Stages `$TARGET_DIR/release/torus-node` (default `$HOME/.cargo-target-matched`)
    into `<worktree>/target/release/torus-node` (`devnet/wsl/env.sh` hardcodes that
    path) and logs md5 of source and copy — abort on mismatch (stale-binary trap).
+   `EXPECT_NODE_MD5=H` / `EXPECT_BENCH_MD5=H` (full md5 or 8+ hex prefix, as
+   recorded by the build) abort when the node / bench binary differs, printing
+   both (s17: a reflink-seeded target dir kept a stale bench).
    Records the worktree commit + dirty count. NOTE: the runner cannot prove the
    binary was built from that commit — build first, then run.
 3. Generates a `MARKETS`-market genesis via `devnet/wsl/gen-3val-genesis.sh`
    (`MARKETS=N OUT=<worktree>/devnet/wsl/genesis-3val.json`) from THIS repo's
    weighted 100k-account genesis: first N pre-seeded markets (ids 1..N), or
    synthetic `S<k>-USD` rows past the base's 100. Funded accounts untouched.
+   The generator reuses an existing (gitignored) `testnet/genesis-weighted-full.json`
+   as-is, so the cell first refuses one with a non-`0x`+40-hex address or fewer
+   `bulk-test` rows than `SENDERS` (s17: a stub-bench test run left 61 rows with
+   address `oracle-feed`); move it away or set `FORCE=1` to rebuild it.
 4. `CLEAN=1 launch-3val.sh` with the RE-PROOF5 record-cell env
    (`TORUS_BOOK_ROWS=3 TORUS_RESIDENT_BOOKS=1 TORUS_NATIVE_ROOT_CACHE=1
    TORUS_PARALLEL_SETTLE=1 TORUS_PARALLEL_BUCKET_HASH=8
@@ -132,11 +144,53 @@ python3 tools/matched-bench/test_harness.py
    `drain.json .feed_live` its summary over the final quiet window. The feed
    is then paused and the default drain re-run (`feed-stop-settle/`, up to
    60 s), so this step can take `DRAIN_TIMEOUT` + ~60 s.
+   **Liquidation stress** (all off by default; default cells unchanged):
+   `LIQ_THIN=N` sets `available` to `LIQ_THIN_AVAIL` (default 1,000,000 TRS)
+   for genesis notes `bulk-test 60` .. `bulk-test 60+N-1` before the genesis
+   md5 (the cell fails unless exactly N rows match). `ORACLE_SHOCK_BP=S`
+   `ORACLE_SHOCK_ROUND=R` (need `ORACLE_FEED=1`) make the feed add +S bp to odd
+   market ids and -S bp to even ones from round R on: on the uniform shape the
+   even-index senders lose on every position (with `MPS` set, sides follow
+   owner rank instead; run-cell warns). With either set, the protocol accounts
+   join the state digest (see step 9): the liquidator vault and both ADL
+   escrows, `vault-val<i>.json` holds each node's
+   `torus_getLiquidatorVault`, and `sampler.csv` gains the liquidation counter,
+   vault deficit and (feat/liq-telemetry) the step timer, per-class / scanned /
+   acted counters, the pending / deferred gauges, the post-engine tail `_count`
+   and the ADL-budget gauges `torus_liquidation_adl_queue(_deficit)` (reported
+   only when the node exports them: max, last, drain blocks to queue 0).
+   `liq_stress.py <cell> [out.json]` writes `liq-stress.json` (or out.json;
+   every sampler column optional, the tail divisor falls back to
+   `torus_exec_engine_seconds_count`) (liquidations per node and per class, vault, shock
+   height, first / last liquidation, step ms per block (baseline, window,
+   window max), the pending timeline and `blocks_shock_to_pending_zero`, exec
+   lag around the shock). `torus_liquidation_pending` is an upper bound
+   (pending rows plus the scan-window candidates the act budget left
+   unclassified; see `docs/monitoring-setup.md`). On a binary without the
+   telemetry it falls back to the lower bound from the triggered counter.
+   ADL counterparties are in the node logs (info `liquidation: ADL to escrow`
+   per account and market, info `liquidation: ADL escrow pairing`; each escrow
+   close at debug, `liquidation: ADL close`), not parsed.
 9. Agreement (`agreement.jsonl`): heights, block hash + header stateRoot at
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
    + `torus_getBalances` of 50 bench senders), matched/placed/resting/actions
    counters (must be identical), `panicked|FAIL-STOP` and `ERROR` line counts.
+   **Liquidation-stress cells only** (`LIQ_THIN>0` or `ORACLE_SHOCK_BP>0`): the
+   digest also covers the three protocol accounts of
+   `torus_core::liquidation` — `LIQUIDATOR_VAULT` (`0x746f...766c74`,
+   "torus-liquidator-vlt") and the two ADL escrows `ADL_ESCROW_LONG`
+   (`0x746f...6c6e67`, "torus-adl-escrow-lng") and `ADL_ESCROW_SHORT`
+   (`0x746f...736874`, "torus-adl-escrow-sht"; fixed addresses, one per side,
+   not per market or derived). Their `torus_getBalances` follow the 50 senders
+   (`digest-accounts.txt`), then their `torus_getPosition` in every market
+   (`digest-position-accounts.txt`, passed to `digest-node.sh` as a 7th
+   argument; account by account, markets in id order; +3 x MARKETS RPCs per
+   node, ~900 at 300 markets). `test_harness.py` pins the hex addresses against
+   the Rust constants. Default cells pass no positions file and append no
+   protocol accounts, so their digest stream and value are byte-identical to
+   tools without escrow support (old and new tools stay comparable); the
+   escrows hold nothing there, so including them would only cost RPCs.
    NOTE: the executed native state root is not exposed by RPC/metrics (headers
    carry the parent's root, 0x0 on this branch), so the RPC state digest is the
    determinism check.
@@ -595,6 +649,135 @@ from `bench/inflight-commit-tail` or later; an older bench rejects the flag.
 Self-tests: `test_harness.py` (`test_in_flight_tail_*`,
 `test_commit_tail_cell_records_the_tail_mode`); bench crate
 `in_flight::tests` (`commit_tail_*`, `body_probe_*`, `tail_mode_*`).
+
+## Campaign driver generator (`campaign/make-driver.py`)
+
+A campaign driver is generated from a short JSON spec instead of being copied from an
+earlier ~1,000-line driver:
+
+```
+python3 -I tools/matched-bench/campaign/make-driver.py SPEC.json -o $T/ozarchy-<camp>-campaign.sh
+$T/ozarchy-<camp>-campaign.sh dry            # preflight: paths, tools, staged md5s; prints the cells
+$T/ozarchy-<camp>-campaign.sh show           # arms, node env, harness env, env checks, cells (tables)
+$T/ozarchy-<camp>-campaign.sh launch smoke   # one 60 s cell with every check (unit bench-<campaign>-smoke)
+$T/ozarchy-<camp>-campaign.sh launch         # the campaign (unit bench-<campaign>)
+```
+
+The driver = a generated config block + `campaign/driver-body.sh` (the standard parts,
+tested once in `test_make_driver.py`). Do not edit a generated driver: change the spec
+and regenerate (the spec is embedded in the driver header). Standard parts:
+
+- **Launch** through `campaign/detach.sh` (`launch`): the campaign runs in its own
+  `bench-<campaign>.service` unit, which holds the build lock for its whole run; `run`
+  refuses to start outside a bench unit. Each cell runs `run-cell.sh` in its own
+  `bench-<label>` unit. The exported env is scrubbed to the basics first (no `TORUS_*`,
+  `MALLOC_CONF`, `LD_PRELOAD` or run-cell.sh knob from the launching shell). Driver names
+  (`DRIVER_VARS`: `RUN`, `P`, `ARMS`, `BDIR`, ...) are owned by the driver: a caller that
+  exported one gets the driver's value, un-exported (the generated config `unset`s them
+  before assigning; `scrub_env` un-exports them and never unsets them).
+- **Per-cell records** once the bench runs, per node pid: `node-environ-trie.txt`
+  (`exe_md5` = md5 of `/proc/PID/exe`, the RUNNING exe: a wrapper script has exec'd the
+  real node by then), `node-env-all.txt` (`TORUS_*`), `node-preload.txt` (`LD_PRELOAD`,
+  `MALLOC_CONF` and every other non-`TORUS_` name the spec sets).
+- **Per-cell checks** (CHECK OK / CHECK FAIL lines; a failure flags the row `bad:check` and
+  stops the campaign): node exe md5 = the arm's staged md5 on all 3 nodes; the arm's node
+  env (`node_env` + arm `env`) on all 3 nodes and every other name the spec mentions
+  (any arm's env, `absent_env`) on none, `TORUS_*` read from `node-env-all.txt`, any other
+  name from `node-preload.txt`; `summary.json` `cell.markets`; the spec's `expect` lines.
+- **cells.tsv rows, CELL-FLAG lines, rerun queue**: `run_spec` + `cell-step.sh` as in the
+  template (below). Wrapper arms pass `--no-summary-md5` to the step (run-cell.sh hashes
+  the staged file, which is the wrapper).
+- **Preflight**: tools present, harness worktree present, the genesis inputs (below), each
+  binary's staged md5 (a
+  `wrapper` binary: the md5 of the absolute path its last `exec` line runs), bench md5,
+  analysis scripts; in `run`: no build, node, bench or other bench unit, no old attempt
+  (cells.tsv, rerun-queue.tsv, label dirs), 20 GB free.
+- **Done marker**: `$RUN/campaign.done` (`exit=<rc> <time>`) on every exit of `run`,
+  including a preflight failure; smoke: `$RUN/smoke/campaign.done`.
+
+**Spec** (JSON; any unknown key, a missing required key, a duplicate arm, a baseline that is
+not an arm, an env value with whitespace/quotes/`$`, or a harness key the driver sets
+itself is a `SPEC ERROR`, exit 2, nothing written). Required: `campaign` (unit name),
+`run_dir`, `label_prefix`, `harness_worktree` (run-cell.sh's `<worktree>`), `tools_dir` (the
+frozen tools copy: run-cell.sh, cell-step.sh, cell_step.py, campaign/detach.sh; its root
+`tools_dir/../..` must carry the genesis inputs, see below),
+`binaries`, `arms`, `baseline`, `duration_s`, `markets`, and `replicates` unless `order` is a
+list. Optional: `comment`, `results_root` (`~/bench-results-matched`), `devnet_dir`
+(`~/torus-wsl-devnet`), `rate` (76000), `order` (`"rotate"` default: replicate r starts at
+arm r-1, as Job 4; `"fixed"`; or a list `["r1:A", "r1:B", ...]`), `warmup` (`{arm, tag,
+duration_s}`, default baseline / `w1` / `duration_s`; `false` = none), `smoke` (`{arm,
+duration_s}`, default baseline / 60), `node_env` (node env for every arm), `harness_env`
+(run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`),
+`absent_env` (names that must be unset unless an arm sets them), `expect` (every arm),
+`analysis` (`{cmd, metric}` = `CELL_STEP_ANALYSIS_CMD` / `_METRIC`), `max_load` (2).
+`binaries.<key>`: `stage_dir` (holds `release/torus-node` [+ `release/bench-throughput`]),
+`node_md5` or `md5_file` + `node_row` (`"N bdd59888"`: the first two md5s.txt columns),
+optional `bench_md5` / `bench_row`, `wrapper` (true: `release/torus-node` is a script that
+execs the real node; `node_md5` is the real node's). `arms[]`: `label`, `binary` (required
+when there are several), `env` (node env: `TORUS_*` knobs and process env such as
+`MALLOC_CONF`), `harness_env` (overrides), `expect`, `note`. `expect[]`: `{file, regex, min=1,
+max}`: `grep -E -c regex <cell>/<file>` must be in `[min, max]`. Example:
+
+```json
+{"campaign": "ozarchy-p4j4d", "run_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-run/d",
+ "label_prefix": "ozarchy-p4j4d-300m", "harness_worktree": "/home/oz/projects/wt/p4j4-bdd59888",
+ "tools_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-tools/tools/matched-bench",
+ "binaries": {"b": {"stage_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-stage/b-run",
+   "md5_file": "/home/oz/bench-results-matched/ozarchy-p4j4-build/md5s.txt",
+   "node_row": "N bdd59888", "bench_row": "bench-F ff822b95"}},
+ "markets": 300, "duration_s": 120, "replicates": 3, "baseline": "J",
+ "harness_env": {"BLOCK_CAP": "400", "MAX_IN_FLIGHT": "4", "ORACLE_FEED": "1", "IN_FLIGHT_TAIL": "commit"},
+ "arms": [{"label": "J"},
+          {"label": "M1", "env": {"MALLOC_CONF": "dirty_decay_ms:1000,muzzy_decay_ms:1000"}},
+          {"label": "M0", "env": {"MALLOC_CONF": "dirty_decay_ms:0"}}]}
+```
+
+Full example: `campaign/driver-spec.example.json`; the Job 4 golden specs:
+`testdata/make-driver/p4j4-{h,d}.json`.
+
+**Genesis inputs beside the tools copy.** run-cell.sh generates each cell's genesis from
+ITS OWN repo root (`MAINREPO` = `<dir of run-cell.sh>/../..`), not from the harness worktree
+it is handed (that one only launches the nodes). In a standalone tools copy without them
+every cell dies at genesis (`gen-3val-genesis.sh` not found, exit 127).
+Freeze them as Job 4 did (`ozarchy-p4j4-tools/{devnet,testnet}` beside `tools/`):
+
+```
+T=$R/ozarchy-<camp>-tools; mkdir -p "$T/tools" "$T/devnet" "$T/testnet/lib"
+cp -r <harness-wt>/tools/matched-bench "$T/tools/"
+cp -a <harness-wt>/devnet/wsl "$T/devnet/"; cp <harness-wt>/devnet/genesis.json "$T/devnet/"
+cp <harness-wt>/testnet/gen-weighted-genesis.sh "$T/testnet/"; cp <harness-wt>/testnet/lib/cargo-bin.sh "$T/testnet/lib/"
+cp <the earlier cells' testnet/genesis-weighted-full.json> "$T/testnet/"   # untracked, ~29 MB
+```
+
+Preflight (`dry`, `launch`, `run`) fails unless `devnet/wsl/gen-3val-genesis.sh`
+(executable), `devnet/wsl/bench-validator-keys.json`, `devnet/genesis.json`,
+`testnet/lib/cargo-bin.sh`, `testnet/gen-weighted-genesis.sh` and a non-empty
+`testnet/genesis-weighted-full.json` are under `tools_dir/../..`, and unless `devnet/wsl`
+(except the per-cell output `genesis-3val.json`) and the other tracked inputs equal the
+harness worktree's. `PREFLIGHT OK` names the `genesis_root`.
+
+**Not supported** (hand-write the driver from the closest earlier one, as before, and say
+which shape did not fit): crash / restart cells (`CRASH_KILL_AT_S`, `KILL_*`: a SPEC
+ERROR); per-arm market count, duration or rate; per-cell samplers beyond the env/md5
+records (perf, soak sidecars, memory/fd/du samplers, RocksDB LOG copies); campaign-specific
+hard checks other than `expect` greps (sysctl, checkpoint deltas, codec/LSM, fd limits,
+mid-cell node death watch); more than 3 nodes; several campaigns in one unit (pilot + grid:
+generate one driver each and launch them in turn); post-campaign steps (off-CPU
+processing).
+
+Tests: `python3 tools/matched-bench/test_make_driver.py` (golden: the Job 4 horizon and
+decay specs give the arms, env, harness env, cell order and env checks of
+`ozarchy-p4j4-{h,d}-campaign.sh`, copied into `testdata/make-driver/`; env and md5 checks on
+fixture cells and a fake /proc; bad specs).
+
+**Why launchers copied old drivers instead of the template** (s1156): the template is the
+p3gate driver, and its CAMPAIGN-SPECIFIC blocks are most of the file (config, samplers,
+~20 hard checks, preflight helpers) built around one checkpoint KNOB per arm (`AKNOB`
+0/1), with no per-arm env table and no `MALLOC_CONF` handling; it calls tools that live
+in run dirs outside the repo (`$T/cpu-sampler.sh`, `$T3/io-sampler.sh`, the acc/acc3
+codec, LSM and restart scripts); and checks added by later campaigns (heap, sysctl, soak,
+depth, cloid) were never folded back. The newest driver was always the more complete
+start, so each launcher read and edited ~1,000 lines.
 
 ## New campaign from the template (per-cell write-up step, rerun queue)
 

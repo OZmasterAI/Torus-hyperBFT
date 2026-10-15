@@ -18,6 +18,11 @@
 # Optional env overrides:
 #   TARGET_DIR   cargo target dir holding torus-node + bench-throughput
 #                (default $HOME/.cargo-target-matched)
+#   EXPECT_NODE_MD5=H  EXPECT_BENCH_MD5=H  md5 (or its first 8+ hex chars) the
+#                build recorded for this cell's torus-node / bench-throughput.
+#                Step 1 refuses a binary whose md5 differs and prints both
+#                (s17: a reflink-seeded target dir kept a stale bench). Unset
+#                (default) = only logged, as before.
 #   RESULTS_ROOT (default $HOME/bench-results-matched)
 #   DATA_ROOT    devnet data root (default $HOME/torus-wsl-devnet)
 #   SENDERS      bench --senders (default 5000)   CONC  --concurrency (256)
@@ -201,6 +206,44 @@
 #                drain.json .feed_live and run.log. Then the feed is SIGSTOPped
 #                and the default quiet drain re-run (feed-stop-settle/, 60 s)
 #                before the after-snapshots and the state digest.
+#   ORACLE_FEED_DRAIN_MAX_LAG=N  with ORACLE_FEED_DRAIN=1 (else FATAL unless 2):
+#                the feed-live drain's exec-lag bound (health.py --max-lag),
+#                default 2. Only for cells whose timings are not read: a
+#                TORUS_LIQ_VALUE_SUM=1 node walks every balance and position
+#                each native block (~0.34 s at 300 markets), so the lag stays
+#                ~60 while the feed runs and the default bound never holds.
+#                The paused settle (feed-stop-settle/) keeps the idle bound.
+#   LIQ_THIN=N   liquidation stress (row 76): after the genesis is generated, set
+#                native `available` = LIQ_THIN_AVAIL (default 1000000.0 TRS, the
+#                genesis' decimal-string units; at most 8 decimals) on the
+#                balances noted "bulk-test 60" .. "bulk-test 60+N-1", i.e. load
+#                senders 0..N-1 (--sender-offset 60). N <= SENDERS; exactly N rows
+#                must match or the cell FAILS. 0 (default) = genesis untouched.
+#                Recorded as cell.liq_thin / cell.liq_thin_avail.
+#   ORACLE_SHOCK_BP=S  ORACLE_SHOCK_ROUND=R  with ORACLE_FEED=1 (else FATAL):
+#                `oracle-feed --shock-bp S --shock-round R`: from feed round R on
+#                (rounds count from 1, one per ORACLE_INTERVAL_MS) odd markets
+#                are priced +S bp and even markets -S bp off the walk. Under the
+#                uniform shape (MPS unset) a sender buys a market iff (local
+#                sender index + market id) is even, so EVEN-index senders lose on
+#                every position. S in 0..9999; 0 (default) = flags omitted. The
+#                feed logs the wall-clock ms of round R (oracle-feed.log), which
+#                liq_stress.py maps to a block height. Recorded in .oracle_feed.
+#                With LIQ_THIN>0 or S>0 the liquidator vault
+#                (LIQUIDATOR_VAULT) and both ADL escrows (ADL_ESCROW_LONG /
+#                ADL_ESCROW_SHORT) join the state digest: their balances and
+#                their position in every market (digest-position-accounts.txt,
+#                torus_getPosition; +3*MARKETS RPCs per node), each node's
+#                torus_getLiquidatorVault is saved as vault-val<i>.json, and
+#                torus_liquidations_triggered_total / torus_liquidator_vault_deficit
+#                and the liquidation telemetry (step timer _sum/_count, per-class /
+#                scanned / acted counters, pending / deferred gauges) are sampled
+#                at 1 Hz; otherwise the cell is unchanged. Analysis:
+#                tools/matched-bench/liq_stress.py <results-dir>. Either knob
+#                needs a summarizer with --liq-thin/--liq-thin-avail and a
+#                digest-node.sh whose --capabilities lists position-accounts:
+#                pre-flight refuses the cell when the selected ones (see
+#                TOOLS_FROM_WORKTREE; an older worktree's) lack them.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -253,6 +296,8 @@ if [ "${BENCH_ALLOW_UNDETACHED:-0}" != 1 ] && ! grep -qE "$BENCH_UNIT_RE" /proc/
     exit 2
 fi
 TARGET_DIR=${TARGET_DIR:-$HOME/.cargo-target-matched}
+EXPECT_NODE_MD5=${EXPECT_NODE_MD5:-}
+EXPECT_BENCH_MD5=${EXPECT_BENCH_MD5:-}
 RESULTS_ROOT=${RESULTS_ROOT:-$HOME/bench-results-matched}
 export DATA_ROOT=${DATA_ROOT:-$HOME/torus-wsl-devnet}
 SENDERS=${SENDERS:-5000}
@@ -290,6 +335,19 @@ ORACLE_PRICE=${ORACLE_PRICE:-30000}
 ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
 ORACLE_WALK_BP=${ORACLE_WALK_BP:-0}
 ORACLE_FEED_DRAIN=${ORACLE_FEED_DRAIN:-0}
+ORACLE_FEED_DRAIN_MAX_LAG=${ORACLE_FEED_DRAIN_MAX_LAG:-2}
+LIQ_THIN=${LIQ_THIN:-0}
+LIQ_THIN_AVAIL=${LIQ_THIN_AVAIL:-1000000.0}
+ORACLE_SHOCK_BP=${ORACLE_SHOCK_BP:-0}
+ORACLE_SHOCK_ROUND=${ORACLE_SHOCK_ROUND:-0}
+# torus_core::liquidation::LIQUIDATOR_VAULT ("torus-liquidator-vlt").
+LIQUIDATOR_VAULT=0x746f7275732d6c697175696461746f722d766c74
+# torus_core::liquidation::ADL_ESCROW_LONG / ADL_ESCROW_SHORT
+# ("torus-adl-escrow-lng" / "torus-adl-escrow-sht"): the two fixed escrows that
+# take bankrupt positions in the ADL path (one per side; is_adl_escrow names
+# exactly these two). test_harness.py pins all three against the Rust source.
+ADL_ESCROW_LONG=0x746f7275732d61646c2d657363726f772d6c6e67
+ADL_ESCROW_SHORT=0x746f7275732d61646c2d657363726f772d736874
 ORACLE_KEYS="$MAINREPO/devnet/wsl/bench-validator-keys.json"
 ORACLE_FRESH_TIMEOUT=90
 OUT="$RESULTS_ROOT/$LABEL"
@@ -475,15 +533,36 @@ for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
+for v in EXPECT_NODE_MD5 EXPECT_BENCH_MD5; do
+    [[ -z "${!v}" || "${!v}" =~ ^[0-9a-f]{8,32}$ ]] || { echo "FATAL: $v must be 8-32 lowercase hex chars of an md5 (got '${!v}')" >&2; exit 2; }
+done
 [[ "$ORACLE_WALK_BP" =~ ^[0-9]+$ ]] && [ "$ORACLE_WALK_BP" -lt 1250 ] \
     || { echo "FATAL: ORACLE_WALK_BP must be an integer in 0..1249 (got '$ORACLE_WALK_BP')" >&2; exit 2; }
+[[ "$LIQ_THIN" =~ ^[0-9]{1,9}$ ]] || { echo "FATAL: LIQ_THIN must be a non-negative integer (got '$LIQ_THIN')" >&2; exit 2; }
+LIQ_THIN=$((10#$LIQ_THIN))
+if [ "$LIQ_THIN" -gt 0 ]; then
+    [ "$LIQ_THIN" -le "$SENDERS" ] 2>/dev/null \
+        || { echo "FATAL: LIQ_THIN=$LIQ_THIN must not exceed SENDERS=$SENDERS (the thin senders are load senders 0..LIQ_THIN-1)" >&2; exit 2; }
+    [[ "$LIQ_THIN_AVAIL" =~ ^[0-9]+(\.[0-9]{1,8})?$ ]] && awk -v a="$LIQ_THIN_AVAIL" 'BEGIN{exit !(a>0)}' \
+        || { echo "FATAL: LIQ_THIN_AVAIL must be a positive TRS amount with at most 8 decimals (got '$LIQ_THIN_AVAIL')" >&2; exit 2; }
+fi
+[[ "$ORACLE_SHOCK_BP" =~ ^[0-9]{1,4}$ ]] || { echo "FATAL: ORACLE_SHOCK_BP must be an integer in 0..9999 (got '$ORACLE_SHOCK_BP')" >&2; exit 2; }
+[[ "$ORACLE_SHOCK_ROUND" =~ ^[0-9]{1,9}$ ]] || { echo "FATAL: ORACLE_SHOCK_ROUND must be a non-negative integer (got '$ORACLE_SHOCK_ROUND')" >&2; exit 2; }
+ORACLE_SHOCK_BP=$((10#$ORACLE_SHOCK_BP)); ORACLE_SHOCK_ROUND=$((10#$ORACLE_SHOCK_ROUND))
+[ "$ORACLE_SHOCK_ROUND" = 0 ] || [ "$ORACLE_SHOCK_BP" -gt 0 ] \
+    || { echo "FATAL: ORACLE_SHOCK_ROUND needs ORACLE_SHOCK_BP > 0" >&2; exit 2; }
 case "$ORACLE_FEED_DRAIN" in
     0) ;;
     1) [ "$ORACLE_FEED" = 1 ] || { echo "FATAL: ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1" >&2; exit 2; } ;;
     *) echo "FATAL: ORACLE_FEED_DRAIN must be 0 or 1 (got '$ORACLE_FEED_DRAIN')" >&2; exit 2 ;;
 esac
+[[ "$ORACLE_FEED_DRAIN_MAX_LAG" =~ ^[0-9]{1,6}$ ]] || { echo "FATAL: ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer (got '$ORACLE_FEED_DRAIN_MAX_LAG')" >&2; exit 2; }
+ORACLE_FEED_DRAIN_MAX_LAG=$((10#$ORACLE_FEED_DRAIN_MAX_LAG))
+[ "$ORACLE_FEED_DRAIN_MAX_LAG" = 2 ] || [ "$ORACLE_FEED_DRAIN" = 1 ] \
+    || { echo "FATAL: ORACLE_FEED_DRAIN_MAX_LAG=$ORACLE_FEED_DRAIN_MAX_LAG needs ORACLE_FEED_DRAIN=1" >&2; exit 2; }
 case "$ORACLE_FEED" in
-    0) [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1" >&2; exit 2; } ;;
+    0) [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1" >&2; exit 2; }
+       [ "$ORACLE_SHOCK_BP" = 0 ] || { echo "FATAL: ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP needs ORACLE_FEED=1" >&2; exit 2; } ;;
     1)
         [[ "$ORACLE_PRICE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v p="$ORACLE_PRICE" 'BEGIN{exit !(p>0)}' \
             || { echo "FATAL: ORACLE_PRICE must be a positive number (got '$ORACLE_PRICE')" >&2; exit 2; }
@@ -494,6 +573,8 @@ case "$ORACLE_FEED" in
         "$BENCH" oracle-feed --help >/dev/null 2>&1 || { echo "FATAL: ORACLE_FEED=1 but $BENCH has no oracle-feed subcommand" >&2; exit 1; }
         [ "$ORACLE_WALK_BP" = 0 ] || "$BENCH" oracle-feed --help 2>/dev/null | grep -q -- --walk-bp \
             || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP but $BENCH oracle-feed has no --walk-bp" >&2; exit 1; }
+        [ "$ORACLE_SHOCK_BP" = 0 ] || "$BENCH" oracle-feed --help 2>/dev/null | grep -q -- --shock-bp \
+            || { echo "FATAL: ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP but $BENCH oracle-feed has no --shock-bp" >&2; exit 1; }
         ;;
     *) echo "FATAL: ORACLE_FEED must be unset, 0 or 1 (got '$ORACLE_FEED')" >&2; exit 2 ;;
 esac
@@ -515,8 +596,105 @@ if [ -n "$CRASH_KILL_AT_S" ]; then
     IFS=, read -r -a CRASH_AT <<< "$CRASH_KILL_AT_S"
 fi
 
+# ---- liquidation stress (row 76) helpers
+# liq_stress_on: either knob set -> the vault digest/RPC and liquidation sampling.
+liq_stress_on() {
+    [ "$LIQ_THIN" -gt 0 ] || [ "$ORACLE_SHOCK_BP" -gt 0 ]
+}
+# summarizer_has_liq_opts: the selected summarize.py accepts --liq-thin and
+# --liq-thin-avail (asked through its own argparse --help). An older one (the
+# worktree's own under TOOLS_FROM_WORKTREE=1, e.g. main 46bb3a40 or the
+# Phase 4 build) exits on them as unrecognized arguments, after the run.
+summarizer_has_liq_opts() {
+    local h
+    h=$(python3 "$TOOLS_DIR/summarize.py" --help 2>/dev/null) || return 1
+    case "$h" in *--liq-thin-avail*) return 0 ;; esac
+    return 1
+}
+# digest_has_position_accounts: the selected digest-node.sh digests the
+# position accounts it is handed as 7th argument (`--capabilities` lists
+# `position-accounts`). An older one ignores that argument silently, so the
+# cell would report agreement without a single protocol position checked; asked
+# for capabilities it only prints its usage and exits 2.
+digest_has_position_accounts() {
+    local c
+    c=$("$TOOLS_DIR/digest-node.sh" --capabilities 2>/dev/null) || return 1
+    case $'\n'"$c"$'\n' in *$'\n'position-accounts$'\n'*) return 0 ;; esac
+    return 1
+}
+# Pre-flight: a liquidation cell passes the options, and refuses here (not after
+# the run) when the summarizer lacks them or the digest script would not cover
+# the protocol accounts' positions; any other cell passes none and asks neither
+# script anything, as before.
+SUMMARIZE_LIQ_ARGS=()
+DIGEST_HAS_POS=0
+if liq_stress_on; then
+    summarizer_has_liq_opts || {
+        echo "FATAL: liquidation stress (LIQ_THIN=$LIQ_THIN ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP) needs a summarizer" \
+            "that accepts --liq-thin/--liq-thin-avail, and $TOOLS_DIR/summarize.py does not" \
+            "(TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; score with this harness's own tools:" \
+            "TOOLS_FROM_WORKTREE=0, or point TOOLS_DIR= at a newer tools/matched-bench)" >&2
+        exit 1
+    }
+    digest_has_position_accounts || {
+        echo "FATAL: liquidation stress (LIQ_THIN=$LIQ_THIN ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP) needs a digest script" \
+            "that covers the protocol accounts' positions (digest-node.sh --capabilities lists position-accounts)," \
+            "and $TOOLS_DIR/digest-node.sh does not: it would ignore them and report agreement unchecked" \
+            "(TOOLS_FROM_WORKTREE=$TOOLS_FROM_WORKTREE; score with this harness's own tools:" \
+            "TOOLS_FROM_WORKTREE=0, or point TOOLS_DIR= at a newer tools/matched-bench)" >&2
+        exit 1
+    }
+    DIGEST_HAS_POS=1
+    SUMMARIZE_LIQ_ARGS=(--liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL")
+fi
+# liq_thin_patch <genesis> <n> <available>: native `available` = <available> on
+# the balances noted "bulk-test 60" .. "bulk-test 60+n-1" (load senders
+# 0..n-1). Prints the rows changed. rc 1, genesis untouched, unless exactly n
+# distinct notes match.
+liq_thin_patch() {
+    local g=$1 n=$2 avail=$3 tmp got
+    tmp="$g.liq-thin.tmp"
+    got=$(jq --argjson n "$n" '[.native_balances[] | (.note // "") | select(test("^bulk-test [0-9]+$"))
+        | ltrimstr("bulk-test ") | tonumber | select(. >= 60 and . < 60 + $n)]
+        | if length == (unique | length) then length else -1 end' "$g") || return 1
+    if [ "$got" != "$n" ]; then
+        echo "liq_thin_patch: $g has $got (wanted $n distinct) of the notes bulk-test 60..$((60 + n - 1))" >&2
+        return 1
+    fi
+    if ! jq --argjson n "$n" --arg av "$avail" '.native_balances |= map(
+            if ((.note // "") | test("^bulk-test [0-9]+$")) then
+                (if (.note | ltrimstr("bulk-test ") | tonumber) as $i | $i >= 60 and $i < 60 + $n
+                 then .available = $av else . end)
+            else . end)' "$g" > "$tmp" || ! mv -f "$tmp" "$g"; then
+        rm -f -- "${tmp:?}"
+        return 1
+    fi
+    echo "$got"
+}
+
+# weighted_full_check <file> <senders>: gen-3val-genesis.sh REUSES an existing
+# testnet/genesis-weighted-full.json (gitignored, never checked). Prints why and
+# returns 1 unless it parses, every native address is 0x + 40 hex, and at least
+# <senders> rows carry a "bulk-test N" note (the load senders). s17: a test run
+# with a stub bench left one with 61 balances and the address 'oracle-feed'.
+weighted_full_check() {
+    local f=$1 n=$2 why
+    [ -e "$f" ] || return 0
+    why=$(jq -r --argjson n "$n" '
+        [.native_balances[]?.address | select(type != "string" or (test("^0x[0-9a-f]{40}$") | not))] as $bad
+        | ([.native_balances[]? | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length) as $bulk
+        | if ($bad | length) > 0 then "\($bad | length) native address(es) not 0x + 40 hex, e.g. \($bad[0:3] | tojson)"
+          elif $bulk < $n then "\($bulk) bulk-test rows < SENDERS=\($n)"
+          else empty end' "$f" 2>&1) || why="jq cannot check it: ${why:0:200}"
+    [ -z "$why" ] && return 0
+    echo "$f is stale: $why. gen-3val-genesis.sh would reuse it as-is; move it away (it is rebuilt) or set FORCE=1"
+    return 1
+}
+
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
-if pgrep -f "cargo build" >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
+# by process name: a builder waiting on the campaign's build lock (flock ... cargo build)
+# or a shell that only mentions "cargo build" is not building (s1156)
+if pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
 # A stray feed (from a SIGKILLed oracle cell) would sign into THIS devnet too.
 if pgrep -f "bench-throughput oracle-feed" >/dev/null; then echo "FATAL: an oracle feed is already running" >&2; exit 1; fi
 if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/null; then
@@ -585,7 +763,11 @@ if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' cloid_share='${CLOID_SHARE:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
-[ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
+if liq_stress_on; then
+    log "liquidation stress ON: liq_thin=$LIQ_THIN liq_thin_avail=$LIQ_THIN_AVAIL shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND vault=$LIQUIDATOR_VAULT adl_escrows=$ADL_ESCROW_LONG,$ADL_ESCROW_SHORT (balances + positions in the digest; vault-val<i>.json; liquidation metrics sampled)"
+    [ -z "$MPS" ] || log "WARNING: MPS=$MPS: the locality shape sets sides by owner rank, not (sender + market) parity, so the shock's 'even-index senders lose on every position' does not hold"
+fi
+[ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
@@ -596,10 +778,14 @@ cp -f "$SRC_NODE" "$DST_NODE" || die "copy failed"
 MD5_SRC=$(md5sum "$SRC_NODE" | cut -d' ' -f1)
 MD5_DST=$(md5sum "$DST_NODE" | cut -d' ' -f1)
 MD5_BENCH=$(md5sum "$BENCH" | cut -d' ' -f1)
-log "torus-node md5 src=$MD5_SRC ($SRC_NODE, mtime $(date -r "$SRC_NODE" +%FT%T))"
+log "torus-node md5 src=$MD5_SRC ($SRC_NODE, mtime $(date -r "$SRC_NODE" +%FT%T))${EXPECT_NODE_MD5:+ expected $EXPECT_NODE_MD5}"
 log "torus-node md5 dst=$MD5_DST ($DST_NODE)"
 [ "$MD5_SRC" = "$MD5_DST" ] || die "md5 mismatch after copy (stale-binary trap)"
-log "bench-throughput md5=$MD5_BENCH ($BENCH, mtime $(date -r "$BENCH" +%FT%T))"
+log "bench-throughput md5=$MD5_BENCH ($BENCH, mtime $(date -r "$BENCH" +%FT%T))${EXPECT_BENCH_MD5:+ expected $EXPECT_BENCH_MD5}"
+[ "${MD5_SRC:0:${#EXPECT_NODE_MD5}}" = "$EXPECT_NODE_MD5" ] \
+    || die "torus-node md5 $MD5_SRC != EXPECT_NODE_MD5 $EXPECT_NODE_MD5 ($SRC_NODE is not the binary built for this cell: stale-binary trap)"
+[ "${MD5_BENCH:0:${#EXPECT_BENCH_MD5}}" = "$EXPECT_BENCH_MD5" ] \
+    || die "bench-throughput md5 $MD5_BENCH != EXPECT_BENCH_MD5 $EXPECT_BENCH_MD5 ($BENCH is not the binary built for this cell: stale-binary trap)"
 
 # ---------------------------------------------------------------- 2. genesis
 log "generating $MARKETS-market 3-val genesis -> $GENESIS"
@@ -608,9 +794,17 @@ log "generating $MARKETS-market 3-val genesis -> $GENESIS"
 # Absent => the generator's default.
 GEN_TIMEOUT_BASE_MS=""
 for kv in $EXTRA_ENV; do case $kv in TIMEOUT_BASE_MS=*) GEN_TIMEOUT_BASE_MS=${kv#*=} ;; esac; done
+if [ "${FORCE:-0}" != 1 ]; then
+    WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
+fi
 TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS MARKETS=$MARKETS OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
     || die "genesis generation failed (see run.log)"
 log "genesis timeout_base_ms=$(jq '.consensus.timeout_base_ms' "$GENESIS")"
+if [ "$LIQ_THIN" -gt 0 ]; then
+    LIQ_THIN_ROWS=$(liq_thin_patch "$GENESIS" "$LIQ_THIN" "$LIQ_THIN_AVAIL" 2>>"$OUT/run.log") \
+        || die "LIQ_THIN=$LIQ_THIN genesis patch failed (see run.log)"
+    log "LIQ_THIN=$LIQ_THIN: native available=$LIQ_THIN_AVAIL on $LIQ_THIN_ROWS genesis rows 'bulk-test 60'..'bulk-test $((60 + LIQ_THIN - 1))' (load senders 0..$((LIQ_THIN - 1)); under a shock the EVEN ones lose on every position)"
+fi
 GEN_MARKETS=$(jq '.markets|length' "$GENESIS")
 GEN_ACCTS=$(jq '.native_balances|length' "$GENESIS")
 GEN_MD5=$(md5sum "$GENESIS" | cut -d' ' -f1)
@@ -762,6 +956,7 @@ if [ "$ORACLE_FEED" = 1 ]; then
         --markets "$MARKETS" --price "$ORACLE_PRICE" --interval-ms "$ORACLE_INTERVAL_MS" \
         --stats-file "$OUT/oracle-feed-stats.json")
     [ "$ORACLE_WALK_BP" = 0 ] || ORACLE_CMD+=(--walk-bp "$ORACLE_WALK_BP")
+    [ "${ORACLE_SHOCK_BP:-0}" = 0 ] || ORACLE_CMD+=(--shock-bp "$ORACLE_SHOCK_BP" --shock-round "$ORACLE_SHOCK_ROUND")
     log "oracle feed: ${ORACLE_CMD[*]}"
     T_ORACLE0=$(date +%s)
     "${ORACLE_CMD[@]}" > "$OUT/oracle-feed.log" 2>&1 & ORACLE_PID=$!
@@ -794,6 +989,18 @@ WIDE_COLS="torus_blocks_committed_total torus_block_height torus_native_actions_
 # buckets.csv and gets None for every percentile.
 # s77: end-to-end order latency, age (now - nonce) at each stage.
 BUCKET_METRICS="torus_commit_interval_seconds_bucket torus_exec_chain_seconds_bucket torus_exec_handoff_wait_seconds_bucket torus_flush_worker_seconds_bucket torus_order_age_admit_seconds_bucket torus_order_age_commit_seconds_bucket torus_order_age_exec_seconds_bucket torus_order_age_durable_seconds_bucket torus_order_age_fills_visible_seconds_bucket torus_exec_end_resident_wait_seconds_bucket torus_exec_oracle_only_block_seconds_bucket torus_exec_checkpoint_settle_wait_seconds_bucket torus_exec_checkpoint_upkeep_seconds_bucket torus_exec_checkpoint_deferred_join_seconds_bucket"
+# Liquidation stress: per-sample liquidation counter and vault deficit (default
+# cells keep today's columns).
+if liq_stress_on; then
+    WIDE_COLS="$WIDE_COLS torus_liquidations_triggered_total torus_liquidator_vault_deficit"
+    # feat/liq-telemetry: step timer, per-class / scanned / acted counters,
+    # pending and deferred gauges (zeros on an older binary; liq_stress.py
+    # checks metrics-after-*.txt for the timer).
+    WIDE_COLS="$WIDE_COLS torus_liquidation_step_seconds_sum torus_liquidation_step_seconds_count torus_liquidations_stage1_total torus_liquidations_backstop_total torus_liquidations_adl_total torus_liquidation_scanned_total torus_liquidation_acted_total torus_liquidation_pending torus_liquidation_deferred"
+    # liq_stress.py: the post-engine tail per-block divisor, and the ADL-budget
+    # gauges (docs/plans/adl-budget.md; zeros until a node exports them).
+    WIDE_COLS="$WIDE_COLS torus_exec_post_engine_tail_seconds_count torus_liquidation_adl_queue torus_liquidation_adl_queue_deficit"
+fi
 WIDE_COLS="$WIDE_COLS scrape_valid"
 echo "ts,node,$(echo $WIDE_COLS | tr ' ' ',')" > "$OUT/sampler.csv"
 echo "ts,node,metric,le,count" > "$OUT/buckets.csv"
@@ -940,8 +1147,8 @@ DRAINED=0
 DRAIN_URLS=("http://127.0.0.1:${METS[0]}/metrics" "http://127.0.0.1:${METS[1]}/metrics" "http://127.0.0.1:${METS[2]}/metrics")
 FEED_DRAIN_ARGS=()
 if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
-    FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 6 * ((MARKETS + 255) / 256) )))
-    log "feed-live drain: ${FEED_DRAIN_ARGS[*]} (order counters quiet, exec lag <= 2; the feed's actions may move)"
+    FEED_DRAIN_ARGS=(--feed-live --feed-mempool-max $(( 6 * ((MARKETS + 255) / 256) )) --max-lag "$ORACLE_FEED_DRAIN_MAX_LAG")
+    log "feed-live drain: ${FEED_DRAIN_ARGS[*]} (order counters quiet, exec lag <= $ORACLE_FEED_DRAIN_MAX_LAG; the feed's actions may move)"
 fi
 if python3 "$TOOLS_DIR/health.py" drain --out "$OUT" --timeout "$DRAIN_TIMEOUT" --quiet "$QUIET_S" \
     --urls "${DRAIN_URLS[@]}" "${FEED_DRAIN_ARGS[@]}" \
@@ -1011,7 +1218,26 @@ log "heights after drain: ${HGT[*]} (spread $((HMAX-HMIN))); comparing block $HC
 # At 300 markets the old serial loop was ~4 min/node (~12 min end to end) —
 # val0 and val2 were digested minutes apart (r6-base-300m-r1).
 "$BENCH" gen-accounts --offset 60 --count 50 2>/dev/null | awk '{print $2}' > "$OUT/digest-accounts.txt"
+# Liquidation stress: the protocol accounts (liquidator vault + both ADL
+# escrows) join the digest twice: their balances (digest-accounts.txt) and
+# their position in every market (digest-position-accounts.txt -> digest-node.sh
+# 7th argument, torus_getPosition). Default cells keep exactly the 50
+# load-sender accounts and no positions file: their digest stream (and so the
+# digest value) is byte-identical to tools without escrow support.
+DIG_POS=()
+if liq_stress_on; then
+    printf '%s\n' "$LIQUIDATOR_VAULT" "$ADL_ESCROW_LONG" "$ADL_ESCROW_SHORT" >> "$OUT/digest-accounts.txt"
+    printf '%s\n' "$LIQUIDATOR_VAULT" "$ADL_ESCROW_LONG" "$ADL_ESCROW_SHORT" > "$OUT/digest-position-accounts.txt"
+    DIG_POS=("$OUT/digest-position-accounts.txt")
+    # Coverage is claimed only when pre-flight confirmed the digest script has it.
+    if [ "${DIGEST_HAS_POS:-0}" = 1 ]; then
+        log "liquidation stress: liquidator vault $LIQUIDATOR_VAULT and ADL escrows $ADL_ESCROW_LONG $ADL_ESCROW_SHORT added to the state digest (balances + positions in all $MARKETS markets)"
+    else
+        log "WARNING: liquidation stress: liquidator vault $LIQUIDATOR_VAULT and ADL escrows $ADL_ESCROW_LONG $ADL_ESCROW_SHORT added to the state digest balances; their positions are NOT confirmed covered ($TOOLS_DIR/digest-node.sh does not list position-accounts)"
+    fi
+fi
 DIG_ACCTS=$(grep -c . "$OUT/digest-accounts.txt")
+if [ ${#DIG_POS[@]} -gt 0 ]; then DIG_POS_ACCTS=$(grep -c . "${DIG_POS[0]}"); else DIG_POS_ACCTS=0; fi
 funnel_counters() {
     # Missing/failed metrics are unavailable evidence, never fabricated zeros.
     python3 -c '
@@ -1048,12 +1274,13 @@ if Q_BEFORE=$(funnel_snapshot); then Q_BEFORE_OK=1; fi
 for i in 0 1 2; do
     h=$(scrape_one "${METS[$i]}" | mval torus_block_height); DHGT[$i]=${h%.*}
 done
-log "state digest: $MARKETS markets + $DIG_ACCTS accounts, 3 nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
+log "state digest: $MARKETS markets + $DIG_ACCTS accounts + $DIG_POS_ACCTS position accounts, 3 nodes CONCURRENTLY (par=$DIGEST_PAR/node, rpc timeout ${RPC_TIMEOUT}s), heights ${DHGT[*]}"
 TDIG0=$(date +%s)
 DIG_PIDS=()
 for i in 0 1 2; do
     "$TOOLS_DIR/digest-node.sh" "${RPCS[$i]}" "$MARKETS" "$OUT/digest-accounts.txt" \
-        "$OUT/state-digest-val$i.txt" "$DIGEST_PAR" "$RPC_TIMEOUT" > "$OUT/digest-val$i.out" 2>>"$OUT/run.log" &
+        "$OUT/state-digest-val$i.txt" "$DIGEST_PAR" "$RPC_TIMEOUT" ${DIG_POS[@]+"${DIG_POS[@]}"} \
+        > "$OUT/digest-val$i.out" 2>>"$OUT/run.log" &
     DIG_PIDS+=($!)
 done
 # Only the digests: a bare `wait` would also wait on the (paused) oracle feed forever.
@@ -1061,6 +1288,15 @@ wait "${DIG_PIDS[@]}"
 TDIG1=$(date +%s)
 Q_AFTER_OK=0
 if Q_AFTER=$(funnel_snapshot); then Q_AFTER_OK=1; fi
+# Liquidation stress: each node's vault (cash, deficit, open positions) while
+# the chain is still quiet; "RPC_ERR" if a node did not answer.
+if liq_stress_on; then
+    for i in 0 1 2; do
+        rpc "${RPCS[$i]}" torus_getLiquidatorVault '[]' | jq -cS '.result // .error' > "$OUT/vault-val$i.json" 2>/dev/null
+        [ -s "$OUT/vault-val$i.json" ] || echo '"RPC_ERR"' > "$OUT/vault-val$i.json"
+    done
+    log "liquidator vault: $(for i in 0 1 2; do printf 'val%s=%s ' "$i" "$(cat "$OUT/vault-val$i.json")"; done)"
+fi
 if [ "$Q_BEFORE_OK" = 1 ] && [ "$Q_AFTER_OK" = 1 ] && [ -n "$Q_BEFORE" ] && [ "$Q_BEFORE" = "$Q_AFTER" ]; then DIGEST_QUIESCENT=1; else DIGEST_QUIESCENT=0; fi
 for i in 0 1 2; do
     sha=""; secs=""; read -r sha secs < "$OUT/digest-val$i.out" || true
@@ -1172,16 +1408,18 @@ python3 "$TOOLS_DIR/summarize.py" \
     --drain-timeout "$DRAIN_TIMEOUT" --markets-per-sender "${MPS:-}" \
     --max-in-flight "${MAX_IN_FLIGHT:-}" --open-order-budget "${OPEN_ORDER_BUDGET:-}" \
     --in-flight-tail "${IN_FLIGHT_TAIL:-}" \
+    "${SUMMARIZE_LIQ_ARGS[@]}" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}
 # summary.json .oracle_feed: feed stats + the marks the load ended with
 # (stale_marks_at_bench_end = markets whose mark was NOT usable at bench end).
 if [ "$ORACLE_FEED" = 1 ] && [ "$rc" = 0 ]; then
-    python3 - "$OUT" "$ORACLE_PRICE" "$ORACLE_INTERVAL_MS" "$ORACLE_RC" "$ORACLE_FRESH_S" "$ORACLE_ALIVE_END" "$ORACLE_WALK_BP" <<'PYS' \
+    python3 - "$OUT" "$ORACLE_PRICE" "$ORACLE_INTERVAL_MS" "$ORACLE_RC" "$ORACLE_FRESH_S" "$ORACLE_ALIVE_END" "$ORACLE_WALK_BP" \
+        "$ORACLE_SHOCK_BP" "$ORACLE_SHOCK_ROUND" <<'PYS' \
         || log "WARNING: summary.json .oracle_feed not written"
 import json, os, sys
-out, price, interval, rc, fresh_s, alive_end, walk_bp = sys.argv[1:8]
+out, price, interval, rc, fresh_s, alive_end, walk_bp, shock_bp, shock_round = sys.argv[1:10]
 def load(name):
     try:
         with open(os.path.join(out, name)) as f:
@@ -1191,6 +1429,7 @@ def load(name):
 stats = load('oracle-feed-stats.json') or {}
 marks = load('oracle-marks-bench-end.json') or {}
 o = {'oracle_feed': 1, 'price': price, 'walk_bp': int(walk_bp), 'interval_ms': int(interval),
+     'shock_bp': int(shock_bp), 'shock_round': int(shock_round),
      'rc': int(rc) if rc.lstrip('-').isdigit() else None,
      'stats_present': bool(stats),
      'sent': stats.get('sent'), 'accepted': stats.get('accepted'), 'rejected': stats.get('rejected'),

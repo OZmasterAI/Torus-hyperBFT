@@ -10798,6 +10798,515 @@ Artifacts: cells `~/bench-results-matched/ozarchy-liq2-300m-*`, run dir `ozarchy
 `ozarchy-liq2-stage/`, build `ozarchy-liq2-build/`. Per cell: `liq-stress.json`, `liq-lines-val*.txt`,
 `value-sum-val*.txt`, `metrics-1hz.txt.gz`.
 
+## 73. ozarchy-p4j4 job 4: exec-aware admission horizon sweep and jemalloc decay cost (main `bdd59888`, 300 markets, oracle on, commit tail depth 1, 120 s cells, campaign ozarchy-p4j4, archy, 2026-10-15)
+
+**No exec-aware horizon beats both A and W on latency without losing matched/s.** E20 (horizon 20 s) does nothing
+at this load: it sheds 0-863 actions in the window and equals A within noise on every metric (matched/s -1.0%
+[-3.3, +1.3]). E5 and E2 cut median latency and exec lag in seconds but lose a third and a half of matched/s
+(-33.1% [-40.0, -26.1], -51.1% [-58.3, -43.9]). They also almost double the commit-age p99 (38.0 / 36.1 s vs 19.5 s),
+because the wait moves into the bench's BUSY retries (admit-age p99 39.3 / 38.0 s vs 3.0 s). W (exec throttle
+8,16,24) loses -8.0% [-9.5, -6.5] matched/s. It has the best exec-age p50 (5.1 s vs 17.3 s) and the worst tails:
+commit p99 48.7 s, exec p99 50.3 s, 9,836 nonce evictions per cell. Exec lag in heights stays near the channel bound
+in every arm except W: A 61.6, E20 61.0, E5 52.1, E2 57.8, W 38.6 (bound 66). In seconds: A 14.0, E20 14.0, E5 9.1,
+E2 4.2, W 3.2. **jemalloc decay costs throughput at this exec-bound load:** `dirty_decay_ms:1000,muzzy_decay_ms:1000`
+(M1) gives -7.1% [-10.8, -3.4] matched/s, +3.7% CPU-s/1M and -21% RSS mean. `dirty_decay_ms:0` (M0) gives -30.7%
+[-32.8, -28.6] matched/s, +27.4% CPU-s/1M, -43% RSS mean and +80% commit-interval p95. Restart time after SIGKILL was
+**not measured** (no kill cells).
+
+Question (job 4 for archy). Part 1: does exec-aware native admission (`TORUS_ADMISSION_EXEC_AWARE=1`, merged opt-in in
+`e72a5021`) at `TORUS_ADMISSION_HORIZON_MS` 20000 / 5000 / 2000 beat the exec-throttle reference W and the defaults A on
+order latency without losing matched/s? What is the exec lag per arm in heights at steady state? Part 2: what do the
+jemalloc decay settings via `MALLOC_CONF` cost (matched/s, CPU-s/1M, RSS, block-time p99)? The stretch liq-stress pair
+was not run: it needs the liq2 harness branch and its own driver.
+
+Arms (one node build for all arms: origin/main `bdd59888`, node `03a2b757`, worktree `wt/p4j4-bdd59888`; it contains
+`e72a5021` (exec-aware admission) and the header-persist fix `46bb3a40`. Bench: the p4j3 build `ff822b95` (release
+timing + tail depth, not on main), bench `9b725823`. Node md5 `03a2b757` src = dst in every cell. The env was checked
+per cell in `node-env-all.txt` / `node-preload.txt` on all 3 nodes):
+
+| arm | env | cells (part, n) |
+|---|---|---|
+| A | defaults (no admission env) | part 1, n = 3 (+ warm-up w1) |
+| E20 | `TORUS_ADMISSION_EXEC_AWARE=1 TORUS_ADMISSION_HORIZON_MS=20000` | part 1, n = 3 |
+| E5 | `TORUS_ADMISSION_EXEC_AWARE=1 TORUS_ADMISSION_HORIZON_MS=5000` | part 1, n = 3 |
+| E2 | `TORUS_ADMISSION_EXEC_AWARE=1 TORUS_ADMISSION_HORIZON_MS=2000` | part 1, n = 3 |
+| W | `TORUS_EXEC_THROTTLE_WATERMARKS=8,16,24` | part 1, n = 3 |
+| J | `MALLOC_CONF` unset (jemalloc defaults) | part 2, n = 3 (+ warm-up w1) |
+| M1 | `MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000` | part 2, n = 3 |
+| M0 | `MALLOC_CONF=dirty_decay_ms:0` | part 2, n = 3 |
+
+Settings (every cell): 300 markets, 120 s, rate 76,000, 5,000 senders, BLOCK_CAP 400, MAX_IN_FLIGHT 4,
+OPEN_ORDER_BUDGET 900, RETRY_BUSY 1, commit tail depth 1, CLOID_SHARE 0, oracle feed on (30000, 2,000 ms, walk 0),
+jemalloc compiled in, 15 s checkpoint default, `TORUS_ROCKSDB_STATS=2` at 1 s. Dirty writeback was at the host values
+`vm.dirty_bytes` 256 MiB / `dirty_background_bytes` 64 MiB in every cell, not the job-3 phase-2 2 GiB / 512 MiB (sudo
+unavailable). Harness: the frozen p4j3 copy (`2a245321`). Drivers `ozarchy-p4j4-{pilot,h,d}-campaign.sh`. Part 1 cells
+ran 04:16-05:52 UTC in a rotated order (w1, r1-A, r1-E20, r1-E5, r1-E2, r1-W, r2-E20, r2-E5, r2-E2, r2-W, r2-A, r3-E5,
+r3-E2, r3-W, r3-A, r3-E20). Part 2 ran 06:08-07:04 (w1, r1-J, r1-M1, r1-M0, r2-M1, r2-M0, r2-J, r3-M0, r3-J, r3-M1).
+
+Checks (from the raw cell files, not the launcher tables): all 26 grid cells and both pilot cells have rc 0, ACCEPT,
+liveness PASS, AGREE, drained, bench_rc 0 and node md5 `03a2b757`. The node logs have no panic or fatal line. No
+`CELL-FLAG`, no rerun in the final logs. The first part 2 attempt stopped at r1-M1 on a harness check bug (it read
+`MALLOC_CONF` from `node-env-all.txt`, which holds `TORUS_*` only). Its 3 cells (`ozarchy-p4j4-run/d-attempt1-heapchk/`)
+are not data and are not used here. Part 2 was re-run as a clean 10-cell grid, and its `node-preload.txt` shows the
+arm's `MALLOC_CONF` on the 3 nodes (none on J). Pilot (`ozarchy-p4j4-run/pilot`, arm A, pa0 and w1): 220,197 and
+221,582 matched/s, exec queue mean 61.6 and 61.1, max 66, i.e. the exec backlog that this grid targets. The pilot
+is not in the stats.
+
+Definitions. matched/s = the summary headline (bench load window). Shed, exec lag, RSS and the commit-interval
+histogram p99 use the steady window `[t_bench0 + 10 s, t_bench1]`. Order age = node time minus the action's nonce,
+which the bench stamps at signing: it includes BUSY retry time (the bench resends the same payload every 50 ms for up
+to 30 s, `RETRY_BUSY_MAX_AGE`). Commit / exec / admit p50 are val0's; p99 is the max over the 3 nodes. Block p99 =
+commit-interval p99 from the 1 Hz histogram delta, max over nodes. The buckets step by a factor 2, so it is an upper
+bound (2048 means "between 1024 and 2048 ms"). Shed = `torus_rpc_submit_admit_rejects_total{reason="backlog_preverify"}`
+window delta, summed over the 3 nodes. It counts one per rejected signed action per attempt, retries included, so it
+counts rejects, not lost orders. Lost actions are `released_refused` (the bench gave up after 30 s or at its deadline).
+Expiries = node nonce evictions (sum over nodes) and bench in-flight slots released on timeout. CIs: 95%, difference
+of means, SE = sqrt(sd1^2/3 + sd2^2/3), t = 4.303 (df = 2, conservative); `*` = CI excludes 0.
+
+### 73.1 Part 1 cells (run order)
+
+| cell | arm | matched/s | incl drain | submit/s | placed/s | native blk/s | shed (window) | refused | exec queue mean |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 224,005 | 214,191 | 1,412 | 293,568 | 4.41 | 0 | 36 | 61.4 |
+| r1-A | A | 223,080 | 214,797 | 1,416 | 291,814 | 4.11 | 0 | 0 | 61.2 |
+| r1-E20 | E20 | 219,819 | 213,752 | 1,400 | 288,132 | 4.17 | 0 | 1 | 60.9 |
+| r1-E5 | E5 | 144,424 | 133,134 | 749 | 190,038 | 5.65 | 2,721,228 | 4,400 | 53.5 |
+| r1-E2 | E2 | 116,913 | 106,014 | 625 | 158,206 | 13.89 | 2,858,861 | 12,684 | 54.5 |
+| r1-W | W | 206,935 | 196,410 | 2,116 | 271,175 | 11.43 | 0 | 3 | 38.4 |
+| r2-E20 | E20 | 222,120 | 212,371 | 1,414 | 290,916 | 4.33 | 863 | 85 | 61.3 |
+| r2-E5 | E5 | 156,657 | 146,855 | 843 | 206,095 | 5.81 | 2,472,739 | 2,959 | 51.8 |
+| r2-E2 | E2 | 104,972 | 96,802 | 558 | 141,021 | 13.33 | 3,097,277 | 14,142 | 61.0 |
+| r2-W | W | 205,141 | 195,772 | 2,098 | 268,796 | 11.43 | 0 | 1 | 38.8 |
+| r2-A | A | 224,430 | 212,432 | 1,416 | 294,234 | 4.22 | 0 | 11 | 61.7 |
+| r3-E5 | E5 | 148,959 | 145,665 | 860 | 196,256 | 5.52 | 2,392,320 | 3,513 | 51.0 |
+| r3-E2 | E2 | 106,826 | 100,137 | 580 | 142,991 | 13.20 | 2,957,270 | 14,594 | 57.9 |
+| r3-W | W | 206,621 | 197,004 | 2,112 | 270,451 | 11.60 | 0 | 4 | 38.7 |
+| r3-A | A | 224,850 | 213,427 | 1,422 | 294,314 | 4.30 | 0 | 42 | 61.8 |
+| r3-E20 | E20 | 223,545 | 214,225 | 1,402 | 292,854 | 4.19 | 0 | 66 | 60.9 |
+
+submit/s = bench actions submitted per second. The load generator ran evenly within every arm: A 1,412-1,422,
+E20 1,400-1,414, W 2,098-2,116. E5 (749-860) and E2 (558-625) are lower by design, because shedding closes the bench's
+loop. A and E20 also shed (A 0-2,167 per node, E20 up to 6,252), but only in the first 10 s after bench start (the
+startup ramp), so the window counts 0. No drift over the campaign: A 223,080 -> 224,430 -> 224,850 at 04:22 / 05:16 /
+05:40 (+0.8%, inside the steps below). Same config in part 2 (J) gives 225,327, +0.5% vs A.
+
+### 73.2 Part 1 per arm (n = 3; mean, sd; difference vs A with 95% CI)
+
+| | A | E20 | E5 | E2 | W |
+|---|---|---|---|---|---|
+| matched/s | 224,120 (sd 924) | 221,828 (1,880); -1.0% [-3.3, +1.3] | 150,013 (6,184); **-33.1% [-40.0, -26.1]** * | 109,570 (6,426); **-51.1% [-58.3, -43.9]** * | 206,232 (958); **-8.0% [-9.5, -6.5]** * |
+| submit/s | 1,418 | 1,405; -0.9% [-2.4, +0.6] | 817; -42.4% * | 588; -58.6% * | 2,109; +48.7% * |
+| native blk/s | 4.21 | 4.23 | 5.66 * | 13.48 * | 11.49 * |
+| order age commit p50 / p99 (ms) | 3,597 / 19,500 | 3,562 / 19,414 | 2,256 / 38,048 | 1,128 / 36,128 | 2,673 / 48,707 |
+| diff commit p50 (ms) | | -34 [-877, +809] | -1,341 [-2,473, -209] * | -2,469 [-3,294, -1,644] * | -923 [-1,745, -102] * |
+| diff commit p99 (ms) | | -85 [-307, +136] | +18,548 [+18,090, +19,010] * | +16,630 [+15,240, +18,020] * | +29,210 [+18,240, +40,170] * |
+| order age exec p50 / p99 (ms) | 17,325 / 40,392 | 17,393 / 40,395 | 13,457 / 39,959 | 6,345 / 38,062 | 5,059 / 50,251 |
+| diff exec p50 (ms) | | +68 [-1,203, +1,340] | -3,868 [-5,405, -2,330] * | -10,980 [-14,250, -7,713] * | -12,270 [-12,990, -11,540] * |
+| diff exec p99 (ms) | | +3 [-68, +74] | -433 [-1,605, +740] | -2,330 [-3,490, -1,170] * | +9,859 [+3,831, +15,890] * |
+| order age admit p99 (ms) | 2,970 | 2,811 | 39,298 * | 38,017 * | 2,604 |
+| block p95 (headline, ms) | 922 | 909 | 888 | 381 * | 403 * |
+| block p99 (hist, upper bound, ms; 3 cells) | 2048, 2048, 2048 | 2048 x3 | 2048 x3 | 1024 x3 | 1024, 2048, 1024 |
+| expiries: nonce evictions / in-flight timeouts | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | **9,836 / 3,267** |
+| shed (window, 3 nodes) | 0 | 288 (0, 863, 0) | 2.53 M | 2.97 M | 0 |
+| refused (lost actions) | 18 | 51 | 3,624 | 13,807 | 3 |
+| CPU-s per 1M matched | 22.91 | 22.97 (+0.2%) | 41.13 (+79.5% *) | 56.49 (+146.6% *) | 25.42 (+10.9% [+8.5, +13.4] *) |
+| RSS mean / peak (MiB) | 5,134 / 6,656 | 5,036 / 6,610 | 3,368 / 4,754 | 2,606 / 3,281 | 4,253 / 5,641 |
+| RSS slope (MiB/min, 120 s window) | +937 | +801 | -56 | +41 | +456 |
+| consensus timeouts | 8.3 | 7.7 | 10.3 | 8.3 | **19.3** * |
+
+E2 and E5 against W (the throttle reference): matched/s -46.9% [-54.7, -39.0] and -27.3% [-34.8, -19.7]. E2's commit p50
+is -1,546 ms [-1,640, -1,452] vs W, its commit p99 -12,580 ms [-23,630, -1,528], its exec p99 -12,190 [-18,330, -6,050].
+Its exec p50 is not resolved vs W (+1,286 [-1,901, +4,472]).
+
+Why E5 / E2 lose matched/s: the exec thread is 97-99% busy in every arm, so matched/s is fills per exec-second. Shedding
+shrinks the blocks (fills per native block A 50,839, E5 21,145, E2 7,066). Per-fill engine cost rises 3.35 -> 5.11 / 6.26
+ms per 1k fills, and exec per block falls only 218 -> 136 / 63 ms. 1 s / 63 ms x 7,066 fills is about 112k per second
+for E2 vs 1 s / 218 ms x 50,839 = 233k for A: that ratio (0.48) covers the -51% step. W keeps 3.35 ms per 1k fills at
+17,332 fills per block. Why the per-fill cost rises under shedding was not traced. Exec-aware counters
+(`torus_mempool_native_committed_unexecuted`, mean over the window): E20 10,600-11,000, E5 4,300-4,600, E2 1,400-1,500.
+
+### 73.3 Exec lag per arm (heights and seconds)
+
+`torus_exec_queue_depth` is the exact committed-minus-executed lag in heights in these cells. Code at `bdd59888`
+(`crates/torus-consensus/src/app.rs`): the dispatch path does `exec_queue_depth.inc()` before the send (~8054) and the
+exec thread does `dec()` after executing the block (~4632). `TORUS_EXEC_NONBLOCKING_DISPATCH` (`nonblocking_exec_dispatch`,
+~805) is unset in every cell, so dispatch is the blocking `tx.send`. The `try_send` + park branch (~8058-8068, the only
+place that increments `torus_exec_dispatch_deferred_total`) never runs. The 1 Hz series agree: `parks_total` is 0 in
+every row of every `exec-lag-series.tsv` (grid and pilot). On a full channel the consensus thread blocks inside
+`send`, so no committed height sits outside the gauge. Its ceiling is 66 = 64 in the channel (`EXEC_QUEUE_DEPTH`,
+`torus-mempool/src/rate_limit.rs:363`) + 1 executing + 1 in the blocked send. `torus_block_height`,
+`torus_blocks_committed_total` and `torus_exec_block_seconds_count` are set in `execute_committed_block_with` (~4524-4536,
+exec thread), so they count executed height. Their 1 Hz rates are equal in every cell. Seconds = heights / executed
+native blk/s.
+
+| arm | queue mean (heights, window, 3 nodes x 3 cells) | p99 / max | lag seconds | 10 s bins from bench start (t = 10 .. 120 s), mean of 9 node-cells |
+|---|---|---|---|---|
+| A | 61.6 (cells 61.2-61.8) | 66 / 66 | 14.0 | 55 56 57 64 61 63 63 64 65 64 64 65 |
+| E20 | 61.0 (60.9-61.3) | 66 / 66 | 14.0 | 57 55 57 65 59 63 63 64 64 64 62 64 |
+| E5 | 52.1 (51.0-53.5) | 66 / 66 | 9.1 | 51 65 61 29 56 65 55 27 60 63 46 42 (sawtooth, shed on / off) |
+| E2 | 57.8 (54.5-61.0) | 66 / 66 | 4.2 | 56 57 58 58 58 59 56 59 58 58 58 28 |
+| W | 38.6 (38.4-38.8) | 66 / 66 | 3.2 | 41 39 39 40 39 36 37 37 39 38 38 35 |
+| J | 60.1 (58.9-61.6) | 66 / 66 | 12.8 | (20 s bins) 52 62 62 63 64 59 |
+| M1 | 57.7 (54.9-61.4) | 66 / 66 | 13.0 | 52 57 58 59 60 61 |
+| M0 | 57.5 (57.1-58.2) | 66 / 66 | 17.2 (+4.4 [+1.5, +7.4] vs J *) | 56 57 57 57 60 58 |
+
+Diff vs A in heights: E20 -0.5 [-1.6, +0.5], E5 -9.5 [-12.7, -6.2] *, E2 -3.8 [-11.9, +4.4] (not resolved), W -22.9
+[-23.9, -21.9] *. In seconds every arm except E20 is well below A (E5 -4.8 s, E2 -9.8 s, W -10.8 s, all *). The exec-aware
+arms bound the committed work in actions, not in heights: E2's lag stays at 58 heights, but of blocks 1/7 the size.
+
+### 73.4 Part 2: jemalloc decay (n = 3; difference vs J with 95% CI)
+
+| cell | arm | matched/s | incl drain | submit/s | placed/s | native blk/s | shed (window) |
+|---|---|---|---|---|---|---|---|
+| w1 | J | 230,635 | 211,565 | 1,334 | 302,760 | 5.20 | 0 |
+| r1-J | J | 225,590 | 212,204 | 1,363 | 296,222 | 4.90 | 0 |
+| r1-M1 | M1 | 212,671 | 198,856 | 1,325 | 278,628 | 4.69 | 0 |
+| r1-M0 | M0 | 156,686 | 147,403 | 1,003 | 205,437 | 3.35 | 0 |
+| r2-M1 | M1 | 207,848 | 203,698 | 1,358 | 272,416 | 3.97 | 0 |
+| r2-M0 | M0 | 155,775 | 146,989 | 1,007 | 203,879 | 3.30 | 523 |
+| r2-J | J | 223,386 | 213,603 | 1,414 | 292,690 | 4.30 | 0 |
+| r3-M0 | M0 | 155,943 | 146,912 | 1,012 | 204,424 | 3.29 | 0 |
+| r3-J | J | 227,005 | 214,014 | 1,416 | 297,474 | 4.35 | 0 |
+| r3-M1 | M1 | 207,755 | 199,431 | 1,340 | 272,164 | 4.46 | 0 |
+
+| | J | M1 (dirty 1000 / muzzy 1000 ms) | M0 (dirty 0) |
+|---|---|---|---|
+| matched/s | 225,327 (sd 1,823) | 209,425 (2,812); **-7.1% [-10.8, -3.4]** * | 156,134 (485); **-30.7% [-32.8, -28.6]** * |
+| CPU-s per 1M matched | 23.04 | 23.90; **+3.7% [+1.6, +5.9]** * | 29.36; **+27.4% [+26.8, +28.1]** * |
+| RSS mean (MiB, window, mean of 3 nodes) | 4,945 | 3,886; -1,060 [-1,578, -541] (-21.4%) * | 2,835; -2,110 [-2,491, -1,729] (-42.7%) * |
+| RSS peak (MiB, max over nodes) | 6,589 | 5,071; -1,518 [-2,352, -684] (-23.0%) * | 3,555; -3,034 [-3,849, -2,219] (-46.0%) * |
+| RSS slope (MiB/min, 120 s) | +664 (sd 221) | +558; -105 [-654, +444] | +360; -304 [-865, +257] |
+| block p95 (headline, ms) | 911 | 985; +74 [-119, +266] | 1,644; **+733 [+592, +874]** * |
+| block p99 (hist, upper bound, ms; 3 cells) | 2048 x3 | 2048 x3 | 2048, 4096, 4096 |
+| order age commit p50 / p99 (ms) | 3,500 / 18,412 | 3,901 / 19,164 | 4,926 (+1,427 [+287, +2,567] *) / 20,239 |
+| order age exec p50 / p99 (ms) | 15,962 / 39,953 | 16,309 / 40,294 | 19,244 / 41,981 (both not resolved) |
+| native blk/s | 4.52 | 4.37 | 3.32 (-1.20 [-2.04, -0.36] *) |
+| exec ms per block (`chain_ms`) / engine ms per 1k fills | 199.9 / 3.36 | 213.4 / 3.55 | 275.2 / 4.47 |
+
+The decay cost lands on the exec thread, the bottleneck. Exec per block is +6.8% (M1) and +38% (M0) at about the same
+fills per block (46.5k, 47.1k, 45.1k), and that covers the -7.1% / -30.7% matched/s. M1's block p99 is not changed at
+histogram resolution. M0 moves 2 of 3 cells into the 2-4 s bucket, and its p95 is +80%. Section 62 Part B
+(`background_thread:true,dirty_decay_ms:1000`, n = 1, 600 s, Phase 3 node) saw +4.6% CPU-s/1M and -2.5% matched/s. M1's
+CPU step here is similar (+3.7%), while its matched/s step is larger and resolved at n = 3.
+
+### 73.5 Verdict and recommendation
+
+* **Exec-aware admission: do not enable it at 2-5 s, and 20 s is inert at this load.** No horizon beats A and W on
+  latency without losing matched/s. E20 = A within noise (matched/s, latency, lag, CPU, RSS). E5 / E2 lower the median
+  ages (commit p50 -37% / -69%, exec p50 -22% / -63%), exec lag in seconds (9.1 / 4.2 s vs 14.0 s) and RSS (-34% / -49%).
+  They pay -33% / -51% matched/s, 1.8x / 2.5x the CPU-s/1M, a commit p99 near 2x A's (the retry wait), and 3.6k / 13.8k
+  refused actions per cell. Against W, E2 has the better commit p50 and p99 but less than half W's matched/s. Ranking
+  beyond this is not supported. A keeps the best matched/s and commit p99. W buys the lowest exec p50 and lag for -8%
+  matched/s and the worst tails plus nonce expiries.
+* **The useful horizon, if any, lies between 5 s and 20 s.** 20 s never triggers in steady state. 5 s already sheds
+  2.5 M rejects per window and oscillates (queue sawtooth 27-65). Next cells: E10 and E14 (and E7 if E10 still loses
+  matched/s), n = 3 each + A in rotation, 120 s, about 5.8 min per cell: ~1 h 10 min for 12 cells.
+* **jemalloc decay is not free at this load:** M1 -7.1% matched/s for -21% RSS mean and -23% peak. M0 -30.7%
+  matched/s, +27% CPU and +80% block p95 for -43% / -46%. Keep the defaults for throughput. If RSS matters more, M1 is
+  the only candidate, and it is a throughput regression outside noise.
+
+Confidence: **high** for the matched/s, CPU and RSS steps (all CIs exclude 0 by a wide margin, n = 3 per arm, flat A /
+J replicates, A and J agree across the two parts) and for E20 = A. **Medium** for the latency reading: the p99s
+include bench retry time by construction, the buckets are coarse, and the p50s come from val0 only. **Low** for any
+claim about block p99 (factor-2 buckets).
+
+### 73.6 Caveats
+
+- Node = origin/main `bdd59888`, which has the header-persist fix `46bb3a40`. The p4j3 numbers (node `2a245321`,
+  section 71) are a different baseline: do not compare absolute figures.
+- Bench = the p4j3 `ff822b95` build (release timing + tail depth), not on main. Harness = the frozen p4j3 copy
+  `2a245321` (`run-cell.sh` on main has 28 more lines, not used).
+- Dirty writeback at the host values 256 MiB / 64 MiB, not job 3's phase-2 2 GiB / 512 MiB (sudo unavailable). Same in
+  all arms.
+- 120 s cells. RSS slope is over a ~110 s window: A grows ~0.9 GiB/min in-window, E5 / E2 are flat. This is warm-up
+  growth, not a leak verdict. Long soaks would be needed for steady-state RSS.
+- The decay arms export `MALLOC_CONF` into the bench client process too. The bench binary has no jemalloc symbols
+  (`nm`: 0 `_rjem_`), so under glibc malloc it most likely ignores `MALLOC_CONF`. Not tested.
+- RETRY_BUSY 1: shed counts are rejects, retries included, not lost orders. Lost actions are the `refused` column.
+  Order ages include the retry time (nonce stamped at signing).
+- Exec lag = queue depth holds only with `TORUS_EXEC_NONBLOCKING_DISPATCH` unset (blocking send). With the rank-2 park
+  on, parked heights would sit outside the gauge.
+- matched/s is the summary headline (load window). Shed, lag, RSS and histogram p99 use `t_bench0 + 10 s .. t_bench1`.
+  The RSS figures here are from `mem-samples.txt` (VmRSS, window, MiB). The `rss_mean_GB` column of
+  `handoff-tables.txt` (a-cells) is a different window / unit and reads lower.
+- Restart time after SIGKILL was **not measured** (no kill cells in part 2).
+
+### 73.7 Files
+
+Run dir `~/bench-results-matched/ozarchy-p4j4-run/` (`handoff.json`, `handoff-tables.txt`, `campaign.log` = part 2
+final, `h/` and `d/` with `cells.tsv` and `cell-step/*.analysis.json`, `pilot/`. Part 1's campaign log is the chained
+`d-attempt1-heapchk/campaign-attempt1.log`. `d-attempt1-heapchk/` also holds the stopped decay attempt, not data).
+Cells `~/bench-results-matched/ozarchy-p4j4h-300m-*` (part 1), `ozarchy-p4j4d-300m-*` (part 2),
+`ozarchy-p4j4pilot-300m-*` (pilot). Per cell: `summary.json`, `metrics-1hz.txt.gz`, `exec-lag-series.tsv`,
+`mem-samples.txt`, `node-env-all.txt`, `node-preload.txt`. Tools `ozarchy-p4j4-tools/` (drivers, `analyst/handoff_tables.py`,
+`execlag.py`, `rss.py`, `a-cells.py`).
+
+## 74. 71.8 option A A/B: HotStuff store and DA store in their own RocksDB, 300 markets, 600 s cells (campaign ozarchy-hsdb, 2026-10-15)
+
+**Option A removes about 91% of the in-window DB write wait, but only about 31% of the in-window block-time step. The
+remaining wait is on the state DB, and part of it is now on the consensus thread's commit-time state writes.**
+* Across the fleet, in-window non-checkpoint DB write wait (above the out-of-window rate) falls from 2.27 to 0.21 s per
+  window-second: -90.6%, pairwise 88.0-92.0%, Welch 95% CI 75-100%.
+* All HotStuff-store and mempool-DA symptoms go away: vote-state write, follower insert-persist, RPC admission > 512 ms,
+  and state-DB write_other.
+* What is left (0.21 s/s) is on the **state DB**. The new consensus DB adds 0.002 s/s (not resolved from 0).
+* Block time p99 in the windows falls 1,575 -> 1,370 ms (-205 ms; CI [-415, +5]; step/sd 2.5). The out-of-window
+  p99 stays the same (946 vs 936 ms). So 434 of the 629 ms in-vs-out gap remains (69%).
+* `persist_committed_block_durably` does not pick up the wait (excess 1.8 s vs 1.4 s per cell, A vs B).
+  `on_committed_block` does: it holds the commit-manifest state-DB put. Its in-window cost per call goes from 10 ms
+  below its out-of-window mean in A to 12 ms above it in B (B - A in windows +25 ms, CI [+10, +40]).
+* **Verdict on slicing: warranted, confidence medium.** The rest of the window stall is in the state DB's write queue,
+  and the consensus thread still hits it. Slicing the checkpoint batch is the one fix that covers every state-DB
+  writer.
+
+Question (18c, follow-up to 71.8): with the HotStuff store and the DA store in their own RocksDB (arm B) instead of
+the shared state DB (arm A), how much of the in-window consensus (HotStuff `RocksKVStore`) and mempool (`mirror_to_da`)
+write wait goes away? Does the wait move to commit persistence on the state DB?
+
+Setup:
+* Arm A: origin/main `46428bfa`, node md5 `cac5d688` (one RocksDB).
+* Arm B: `perf/hs-da-own-db` `1ca719f1`, node md5 `6e05d40a`. This build adds `<data_dir>/consensus-db` with
+  `cf_consensus_meta`, `cf_native_pending` and `cf_native_shards`, its own WAL and write queue, a 64 MiB block cache
+  and a 256 MiB memtable budget. No flag or env.
+* Bench: `ff822b95`, md5 `9b725823`.
+* Workload: 300 markets, Classic, oracle on (30,000 / 2,000 ms), 15 s checkpoint default, commit tail depth 1,
+  BLOCK_CAP 400, MAX_IN_FLIGHT 4, budget 900, rate 76,000, 5,000 senders, jemalloc defaults, genesis md5 `b83180e1`.
+* RocksDB stats: `TORUS_ROCKSDB_STATS=2`, interval 1 s. Sampler at 1 Hz, `vmstat 1`.
+* Cells (run order): w1 (A, 60 s warm-up, not in the means), then r1-A, r1-B, r2-B, r2-A, r3-A, r3-B (600 s each,
+  ABBA).
+
+Differences from job 3 (section 71):
+* (a) perf is `context-switches:u` (user frames only), because this host has `perf_event_paranoid=2` and tracefs 700.
+  Job 3 p1 had kernel frames at paranoid -1. Recording covers only the write-path threads (106-116 tids per node:
+  hotstuff-algo, rpc-worker, gossip / ingress verify, flush worker, `rocksdb:high`), with 8-page rings, on all 3 nodes,
+  in the same window (bench +240 s, 45 s) in every measured cell. w1 has no perf.
+* (b) Perf post-processing is not in the driver. It was run after the campaign, against the staged binaries. **The
+  data turned out to carry no samples** (see 74.4), so there is no call-site table.
+* (c) In `sampler.csv`, arm A's `torus_rocksdb_consensus_*` and `*__consensus` columns are `nan` (absent); arm B's
+  are numeric. The per-CF `db="consensus"` alias columns are sampled every 60 s (handoff).
+* (d) Dirty limits are 256 MB / 64 MB (job 3 phase 1, as found; no sudo). Tail depth 1, 300 markets, 600 s cells.
+* (e) w1 is excluded from the per-arm means.
+* (f) `ozarchy-hsdb-300m-w1-attempt1`, `ozarchy-hsdb-300m-r1-A-attempt1` and `ozarchy-hsdb-run/campaign-attempt1`
+  (the summarizer dropped arm A rows; stopped at 07:42) are not data. The smoke cells are not grid cells.
+
+**Validity:** 7/7 cells rc 0, ACCEPT AGREE, liveness PASS, drained (29-31 s in the measured cells). Node md5 src = dst = the arm's staged
+md5 in every cell. 161 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, rerun pass empty. Every node reports
+`panic_or_failstop_lines` 0 and `error_lines` 0. Arm B's CHECK confirms the consensus DB (`LOG` on 3 nodes,
+`db_write_count` up to 39.6-40.5 k); arm A's confirms no consensus DB. `summary.json` `commit` reads `46428bfa` in the
+B cells too: that is the harness worktree's sha. The binary is B's (md5 `6e05d40a`).
+
+### 74.1 Cells (`[rates]` lines in `campaign.log`; `summary.json`; RSS = VmRSS from `mem-samples.txt`, bench window, GB; block time = commit-interval p99, mean of 3 nodes, `j3.py` method)
+
+| cell | arm | matched/s | incl. drain | native blk/s | placed/s | submit/s | CPU-s/1M | RSS mean / peak GB | exec queue mean | block p99 all / in / out ms | val0 out p99 ms | timeouts | refused |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 (60 s) | A | 223,299 | 203,609 | 4.683 | 293,374 | 1,532 | 22.40 | 4.24 / 5.46 | 53.1 | - | - | 7 | 3 |
+| r1-A | A | 225,067 | 221,736 | 3.061 | 292,518 | 1,160 | 23.54 | 5.72 / 6.69 | 59.8 | 1,327 / 1,556 / 926 | 1,226 | 22 | 133 |
+| r1-B | B | 226,894 | 223,497 | 3.121 | 295,119 | 1,175 | 23.40 | 5.68 / 6.51 | 60.1 | 1,155 / 1,376 / 941 | 1,239 | 12 | 35 |
+| r2-B | B | 228,495 | 224,279 | 3.086 | 296,959 | 1,171 | 23.34 | 5.79 / 6.60 | 59.7 | 1,183 / 1,408 / 908 | 1,202 | 10 | 15 |
+| r2-A | A | 226,400 | 223,835 | 3.158 | 294,443 | 1,172 | 23.55 | 5.72 / 6.53 | 59.9 | 1,244 / 1,479 / 965 | 1,272 | 15 | 20 |
+| r3-A | A | 226,516 | 222,921 | 3.119 | 294,436 | 1,166 | 23.54 | 6.02 / 7.08 | 60.3 | 1,350 / 1,690 / 946 | 1,174 | 22 | 42 |
+| r3-B | B | 227,010 | 223,127 | 3.091 | 294,997 | 1,167 | 23.39 | 5.74 / 6.54 | 59.5 | 1,170 / 1,326 / 958 | 1,212 | 12 | 2 |
+
+Per arm (n = 3; B - A with Welch 95% CI; step / pooled sd):
+
+| metric | A | B | B - A [95% CI] | step/sd | reading |
+|---|---|---|---|---|---|
+| matched/s | 225,994 | 227,466 | +1,472 (+0.65%) [-455, +3,399] | 1.7 | not resolved |
+| matched/s incl. drain | 222,831 | 223,634 | +804 [-1,411, +3,018] | 0.9 | not resolved |
+| native blk/s | 3.113 | 3.099 | -0.013 [-0.110, +0.083] | -0.4 | no step |
+| CPU-s/1M | 23.54 | 23.38 | -0.165 (-0.7%) [-0.249, -0.081] | -6.9 | small, resolved |
+| RSS mean / peak GB | 5.82 / 6.77 | 5.74 / 6.55 | -0.08 [-0.53, +0.36] / -0.22 [-0.92, +0.49] | -0.7 / -1.1 | not resolved; B's extra cache and memtable budget does not show |
+| state-DB memtable mean MB | 245 | 183 | -63 [-78, -48] | -9.5 | the consensus DB holds 73-76 MB mean (max 144-163) |
+| exec queue mean (heights) | 60.0 | 59.8 | -0.2 [-1.0, +0.5] | -0.7 | saturated in both (channel 64) |
+| **block p99 in windows ms** | **1,575** | **1,370** | **-205 [-415, +5]** | **-2.5** | large; CI just touches 0 |
+| block p99 out of windows ms | 946 | 936 | -10 [-62, +42] | -0.4 | no step |
+| block p99 all ms | 1,307 | 1,169 | -138 [-280, +5] | -3.4 | large; CI just touches 0 |
+| in-vs-out gap ms | 629 | 434 | -195 (-31%) | | 69% of the gap remains |
+| commit intervals > 1 s in windows (3 nodes) | 159 | 103 | -55 [-82, -28] | -5.4 | resolved |
+| tails (> out-p99) per 100 s in / out | 16.7 / 3.7 | 10.2 / 3.8 | -6.5 [-13.7, +0.7] / +0.1 | -3.2 / 0.6 | |
+| val0 out-of-window p99 ms (the floor) | 1,224 | 1,217 | -7 [-103, +90] | -0.2 | the floor stays; not checkpoint-related |
+| consensus timeouts | 19.7 | 11.3 | -8.3 | | not resolved (A 15-22, B 10-12) |
+
+There is no drift in run order: matched/s A 225.1k, 226.4k, 226.5k; B 226.9k, 228.5k, 227.0k. Block p99 in the
+windows: A 1,556, 1,479, 1,690; B 1,376, 1,408, 1,326. The checkpoint itself is the same in both arms: 193-201
+checkpoints per cell, DB write 0.596 vs 0.605 s, batch 201 vs 199 MB. Flush 0.838 vs 0.888 s is +0.05 s (step/sd 3.0).
+
+### 74.2 DB write wait in and out of the windows, by DB (`j3.py` windows and per-second fleet sums, extended inline to the `torus_rocksdb_consensus_*` series)
+
+The windows and skip are the same as 71.2: any node's checkpoint step, widened by the scrape period, first 20 s
+skipped. That gives 234-265 s in and 317-349 s out per cell. "Excess" means in-window write time above what the same
+number of writes would take at the cell's out-of-window mean. The checkpoint batch's own write is subtracted.
+
+| metric (fleet) | A (r1 / r2 / r3) | B (r1 / r2 / r3) |
+|---|---|---|
+| state-DB writes per s, in | 163 / 166 / 158 | 18.5 / 18.8 / 18.1 |
+| state-DB mean write ms, in / out | 17.9 / 16.5 / 18.8 and 1.44 / 1.46 / 1.37 | 38.6 / 33.6 / 34.7 and 3.65 / 4.01 / 3.88 |
+| p99 over seconds of the per-second mean, ms, in / out | 144 / 145 / 206 and 2.9 / 3.3 / 2.7 | 312 / 374 / 257 and 7.0 / 9.6 / 9.5 |
+| state-DB write_other per s, in / out | 1.04 / 1.12 / 1.13 and 0.09 / 0.13 / 0.08 | 0 / 0 / 0 and 0 / 0 / 0 |
+| consensus-DB writes per s, in | - | 147 / 151 / 146 |
+| consensus-DB mean write ms, in / out | - | 1.12 / 1.11 / 1.05 and 1.05 / 1.08 / 1.12 |
+| consensus-DB per-second-mean p99 ms, in / out | - | 3.5 / 3.4 / 2.5 and 3.0 / 2.6 / 3.8 |
+| stall micros, write_stall, write_stopped (both DBs) | 0, 0, 0 | 0, 0, 0 |
+| **state-DB excess wait, s per window-second** | **2.33 / 2.11 / 2.37** (mean 2.27) | **0.24 / 0.19 / 0.20** (mean 0.21) |
+| consensus-DB excess wait, s per window-second | - | 0.011 / 0.004 / -0.010 (mean 0.002) |
+| excess wait per cell, s (state + consensus) | 612 / 496 / 571 | 59.5 / 51.7 / 49.8 |
+
+* **Share removed: 90.6%** of the fleet's in-window non-checkpoint write wait (2.27 -> 0.21 s per window-second;
+  step/sd 20). The 9 A x B pairs give 88.0-92.0%, and the Welch CI on the difference gives 75-100%.
+* In B, the state-DB mean write is longer (35.6 vs 17.7 ms in, 3.8 vs 1.4 ms out). This is a mix effect, not a
+  regression: about 145 short writes per second left for the consensus DB. The state-DB excess wait fell 91%.
+* The consensus DB shows no window effect: mean 1.09 ms in vs 1.08 ms out, no stall, write_other 0.07 / 0.06 per s.
+  Its 0.002 s/s excess is not resolved from 0 (CI [-0.025, +0.028]).
+* The rocksdb `db_write_p99_micros` / `max_micros` gauges are cumulative since the DB opened, so they cannot be split
+  by window.
+  * Cell-end state-DB p99: 7.1-7.7 ms in A, 0.20-0.22 ms in B.
+  * Max: 1.02-1.30 s in both arms, which is the checkpoint batch itself.
+  * Consensus DB in B: p99 7.9-8.6 ms, max 50-79 ms.
+
+### 74.3 By writer (consensus-thread and admission timers, per-second deltas; `own` = the node's own checkpoint window)
+
+The sampler keeps no buckets for the consensus-thread histograms, so per-write p99 is not available. The table
+uses each timer's mean per call and node-seconds whose summed time exceeds 250 ms; a node-second over 250 ms holds at
+least one long wait. Admission keeps its 0.128-8.192 s buckets.
+
+| writer (DB in A -> B) | metric | A (r1 / r2 / r3) | B (r1 / r2 / r3) |
+|---|---|---|---|
+| HotStuff vote state `set_vote_state_atomic` (state -> consensus) | mean ms in / out | 0.87 / 0.99 / 2.75 and 0.12 / 0.14 / 0.12 | 0.13 / 0.11 / 0.15 and 0.12 / 0.15 / 0.14 |
+| | node-s > 250 ms in, max ms | 2 / 2 / 7, 637-872 | 0 / 0 / 0, 16-47 |
+| HotStuff follower insert-persist (validate + block-tree write) | mean ms in / out | 43.7 / 36.1 / 43.8 and 29.2 / 29.9 / 26.2 | 26.4 / 26.3 / 27.0 and 27.7 / 29.0 / 27.0 |
+| | node-s > 250 ms in / out | 42 / 34 / 42 and 2 / 1 / 1 | 2 / 0 / 1 and 2 / 1 / 0 |
+| mempool `mirror_to_da`, RPC path (admit_insert) (state -> consensus) | > 512 ms per 100 window-s | 41.4 / 24.7 / 32.0 (out 0) | 0 / 0 / 0 (out 0) |
+| | excess s per window-second | 0.50 / 0.34 / 0.52 | 0.04 / 0.09 / 0.06 |
+| submit_verify (RPC) | > 512 ms per 100 window-s | 61.2 / 5.1 / 48.1 | 0 / 2.6 / 0 |
+| DA mirror at block build (`flush_da_mirrors`) | node-s > 250 ms in, max ms | 2 / 2 / 1, 310-934 | 0 / 0 / 0, 75-106 |
+| **commit persistence `persist_committed_block_durably` WriteBatch (state in both)** | mean ms in / out | 8.38 / 8.19 / 9.38 and 7.86 / 7.92 / 7.54 | 8.27 / 7.68 / 8.91 and 7.66 / 7.83 / 7.48 |
+| | excess s per cell | 1.17 / 0.59 / 3.63 (mean 1.79) | 1.31 / -0.35 / 3.31 (mean 1.42) |
+| | node-s > 250 ms (own windows), max ms | 1 / 4 / 3, 676-928 | 1 / 1 / 4, 648-967 |
+| **`on_committed_block` (holds the commit-manifest state-DB put)** | mean ms in / out | 95.1 / 84.9 / 99.7 and 103.0 / 106.6 / 101.6 | 117.0 / 115.9 / 122.3 and 106.1 / 105.1 / 106.8 |
+| | excess s per window-second | -0.07 / -0.20 / -0.02 | +0.10 / +0.10 / +0.14 |
+| checkpoint batch (flush worker, state) | DB write s mean | 0.615 / 0.575 / 0.599 | 0.597 / 0.610 / 0.608 |
+
+Reading:
+* **HotStuff and DA writers: the wait is gone (high confidence).** Vote-state writes in windows are back at the
+  out-of-window cost, from 0.87-2.75 to 0.11-0.15 ms mean, with no node-second over 250 ms against 11 in A.
+  Follower insert-persist goes from 41.2 to 26.6 ms mean in windows, with 118 -> 3 long node-seconds. RPC admissions
+  over 512 ms go from 32.7 per 100 window-s to 0. State-DB write_other goes from 1.10 per s to 0.
+* **`persist_committed_block_durably`: no shift (medium-high).** Its in-window excess is 1.8 vs 1.4 s per cell, and
+  long node-seconds are 8 vs 6, with the same maxima (0.65-0.97 s). These rare full-batch waits occur in both arms.
+* **The commit-manifest put: a shift (medium).**
+  * In A, `on_committed_block` is cheaper in windows than outside (93 vs 104 ms per call). The consensus thread has
+    already queued behind the batch in a HotStuff write, so the next state write finds the queue clear (the 71.8
+    sequence).
+  * In B it is 12 ms dearer in windows (118 vs 106). B - A in windows is +25 ms per call, CI [+10, +40], step/sd 4.3.
+    Out of windows: 104 vs 106, no step.
+  * The cost: 0.10-0.14 s per window-second on the consensus thread, 23-36 s per cell, about 0.2 s per node-window.
+    That is 41-68% of B's remaining state-DB excess (0.19-0.24 s/s; 53% of the means). The rest is on other state-DB writers, which this data
+    cannot name. In B the state DB has about 19 writes per s fleet out of windows: commit persist about 9.5 per s,
+    the manifest about the same, plus the checkpoint and a few background batches.
+  * Attribution to the manifest put rests on two facts: `on_committed_block` writes only that put to the state DB, and
+    the consensus DB shows no window effect. A slower in-window read inside `on_committed_block` is not ruled out
+    without stacks.
+
+### 74.4 perf: no samples recorded (anomaly)
+
+`perf report --stats` on all 18 `perf-sched-val{0,1,2}.data` files (6 cells x 3 nodes; 26-32 MB each) shows only
+SWITCH events, 1.08-1.33 M per file. There are **0 SAMPLE records** and no LOST records. With `exclude_kernel`
+(`context-switches:u`), every context-switch sample is filtered out, because the switch fires in kernel mode. Only
+the `--switch-events` records survive. So:
+* There are no call chains. The 71.8 call-site table (`RocksKVStore::write`, `StateDb::write`,
+  `NativeDaStore::put_batch`, `mirror_to_da`, `persist_committed_block_durably`) cannot be rebuilt for this campaign
+  on either arm.
+* The symbol check did not matter in the end. In `nm -C`, both staged binaries carry `RocksKVStore` write (2),
+  `mirror_to_da` (3), `persist_committed_block_durably` (8) and `WriteThread::AwaitState` (2), but no standalone
+  `StateDb::write` or `NativeDaStore::put_batch` (inlined; they would need DWARF inline frames).
+* Switch records alone give off-CPU stretches by thread, without cause. hotstuff-algo is blocked 0.87-1.06 s per s in
+  its own windows vs 0.73-0.78 out, in both arms alike. Its stretches over 100 ms number 11-25 in vs 63-99 out per
+  45 s, also in both arms. Idle channel waits dominate, so this cannot separate a DB wait from waiting for a message.
+* **Fix for the next perf campaign:** a user-space off-CPU stack needs kernel sampling (`perf_event_paranoid` <= 1)
+  or an eBPF off-CPU tool. Alternatively, time the manifest put and export the consensus-thread timer buckets (see
+  74.6).
+
+### 74.5 Consensus-DB gauges (arm B, `sampler.csv`, per node, bench window)
+
+| gauge | r1-B | r2-B | r3-B |
+|---|---|---|---|
+| memtable MB mean / max | 73.7-75.5 / 145-163 | 73.1-74.6 / 144-155 | 73.0-75.2 / 145-161 |
+| per CF memtable mean MB (`cf_native_pending` / `cf_consensus_meta` / `cf_native_shards`) | 63-80 / 2.4-2.8 / 0 | 60-69 / 2.3-2.8 / 0 | 70-78 / 2.7-2.8 / 0 |
+| immutable memtables max, L0 files max (DB / per CF) | 1, 5 / 3-4 | 1, 5 / 3-4 | 1, 6 / 3-5 |
+| pending compaction max MB | 428-455 | 418-528 | 469-481 |
+| bytes written = WAL MB/s | 25.9-26.6 | 25.9-26.7 | 25.9-26.5 |
+| flushes / compactions per cell, compaction write GB | 124-127 / 40-42, 7.5-7.6 | 123-127 / 42-43, 7.4-7.7 | 124-127 / 41-42, 7.4-7.7 |
+| stall micros, write_stall, write_stopped | 0 | 0 | 0 |
+
+The state DB writes 34.0-34.8 MB/s in B vs 60.0-61.1 MB/s in A, so about 26 MB/s moved to the consensus DB. The
+consensus DB rewrites about 7.5 GB per node per 600 s in compaction (about 12.5 MB/s), with up to 0.5 GB pending, and
+never stalls. Its memtable (about 74 MB mean) almost equals the state-DB memtable drop (-63 MB), which is why RSS does
+not rise.
+
+### 74.6 Verdict
+
+1. **Option A removes about 91% of the in-window DB write wait (high confidence).** Fleet excess goes from 2.27 to
+   0.21 s per window-second (CI 75-100%). The HotStuff-store waits (vote state, follower insert) and mempool
+   `mirror_to_da` waits (RPC admissions > 512 ms, block-build DA flush) fall to their out-of-window level. The new
+   consensus DB has no window effect.
+2. **Block time improves less (medium).** The in-window p99 falls 205 ms (-13%), intervals > 1 s in windows -35%
+   (resolved), overall p99 -138 ms (-10.5%). Both p99 CIs just touch 0 at n = 3. 434 ms of the 629 ms in-vs-out gap
+   remains. The out-of-window floor (val0 about 1.22 s, fleet 936-946 ms) does not change.
+3. **Does the wait move to state-DB commit persistence? Partly (medium).**
+   * `persist_committed_block_durably` does not pick it up (excess 1.4 vs 1.8 s per cell).
+   * The commit-manifest put in `on_committed_block` does: +12 ms per call in windows in B against -10 ms in A
+     (B - A +25 ms, CI [+10, +40]). That is 0.10-0.14 s per window-second, about 0.2 s per node-window, on the
+     consensus thread.
+   * All of B's remaining wait (0.21 s/s) is on the state DB.
+4. **Throughput, CPU, RSS:** matched/s +0.65% (not resolved), CPU-s/1M -0.7% (resolved, small), RSS not resolved.
+   B's added cache and memtables do not show in RSS.
+5. **Slicing: yes, next (medium).** After option A, the consensus thread's remaining in-window wait is a state-DB write
+   queued behind the ~200 MB checkpoint batch. Slicing the batch covers it and every other state-DB writer. The narrower
+   alternative is to move the commit manifest off the state DB queue, but that leaves the other state writers (about
+   0.06-0.14 s/s) and changes the header / manifest crash ordering. Keep option A: it removes the mempool and HotStuff
+   share at no throughput, CPU or RSS cost.
+
+Next cells (not run):
+* Slicing prototype vs B (option A), 300 m, 600 s, n = 3 ABBA. Same driver, about 1 h 27 min with a warm-up.
+  * Success criterion: in-window block p99 within about 100 ms of the out-of-window p99, and `on_committed_block`
+    in-window = out.
+* Before that run, add a timer with buckets around `persist_commit_manifest`, and keep the buckets for the
+  consensus-thread timers in the sampler. That makes the per-writer split direct instead of inferred.
+* For stacks, fix perf (see 74.4). n = 3 leaves the block p99 CIs at the edge: n = 4-5 per arm would resolve a step
+  of about 200 ms.
+
+### 74.7 Caveats and anomalies
+
+* **perf has no samples** (74.4). All attribution here comes from the 1 Hz timers and RocksDB counters, not from
+  stacks. The 71.8 per-call-site split (QC / lock writes vs vote) cannot be repeated.
+* No per-write p99 by writer: the sampler drops the consensus-thread histogram buckets, and the rocksdb p99 / max
+  gauges are cumulative. Node-seconds over 250 ms stand in for the tail.
+* "Excess" uses the out-of-window per-call mean as the baseline. The windows are wide (any node, plus the scrape
+  period; 40-46% of seconds are "in"), so in-window rates are diluted, not inflated.
+* `on_committed_block` per-call cost also depends on block size. A's in-window value below its out-of-window mean
+  shows that this confound exists. The B - A difference in windows is the stronger evidence.
+* Refusals: r1-A refused 133 actions against 2-42 in the other cells. In-flight at end 2.6-5.6 k in all cells. No
+  restart. Digests AGREE in every cell (digest 3.1-10.9 s).
+* Tail lag at depth 1: grid lag p50 1, p99 46-51 heights in every cell. Commit -> seen p99 5.9-7.1 s. The first
+  window starts 340-510 heights behind, the same as job 3.
+* Dirty limits 256 MB / 64 MB; job 3 showed no writeback throttling at these limits (71.4).
+* The prep note said 71.8 was not on origin/main. It is: 71.8 is at the end of section 71, and section 73 is also on
+  main. This section follows 73.
+
+### 74.8 Files
+
+* Run dir `~/bench-results-matched/ozarchy-hsdb-run/campaign/` (`handoff.json`, `handoff-tables.txt`,
+  `campaign.log`, `cells.tsv`, `cell-step/`, `campaign.done`).
+* Cells `~/bench-results-matched/ozarchy-hsdb-300m-{w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}` (+ `.campaign.log`,
+  `.cell.rc`). Per cell: `metrics-1hz.txt.gz`, `sampler.csv`, `summary.json`, `mem-samples.txt`, `taillag.json`,
+  `perf-sched-val{0,1,2}.data`, `perf.log`, `rocksdb-LOG-val*.txt` (+ `rocksdb-consensus-LOG-val*.txt` in B).
+* Staged binaries `~/bench-results-matched/ozarchy-hsdb-stage/{a-run,b-run}/release/`.
+* Tools `ozarchy-hsdb-tools/` (`make-hsdb-driver.py`, `ozarchy-hsdb-campaign.sh`, `soak-sampler.py`). The analyst
+  scripts `analyst/{j3.py,a-cells.py,offcpu-sched.py,taillag.py}` are identical to job 3's and job 4's copies (diff
+  empty).
+* Analysis ran inline (gate 27: no new script files): `j3.py`, `a-cells.py` and `offcpu-sched.py` were imported
+  unchanged and extended to the consensus series and timers. Output: `ozarchy-hsdb-tools/analyst/out/hsdb-analysis.md`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

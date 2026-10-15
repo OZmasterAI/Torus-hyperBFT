@@ -31,8 +31,31 @@ cache rebuild per campaign).
 1. **Memory first**: `run_tool("memory", "search_knowledge", {"query": "<bench/campaign name> traps", "project": "<project>"})`.
 2. **Prepare**: build binaries, verify shas, set up dirs, run the smoke test. Short waits
    (a build, the smoke test) use the short-wait pattern below.
+   - Write or adapt the campaign script (the driver) when your prompt asks for one or none
+     exists. First write a spec (JSON, ~20-40 lines; format and supported shapes:
+     `tools/matched-bench/README.md` "Campaign driver generator", example
+     `tools/matched-bench/campaign/driver-spec.example.json`) and run
+     `python3 -I tools/matched-bench/campaign/make-driver.py SPEC -o DRIVER`, then
+     `DRIVER dry`, `DRIVER launch smoke` (read its CHECK lines), `DRIVER launch`. Do not
+     read the generated driver; `DRIVER show` prints its arms, env checks and cells.
+     A SPEC ERROR is your spec: fix it and rerun. Only when the campaign does not fit
+     the generator's shapes, hand-write the driver from the closest earlier one, and
+     say in your report which shape did not fit.
+     Run every check you add on the smoke cell before the launch: a check that cannot fail
+     (e.g. it reads the wrong file) or fails on a correct cell is a driver bug.
+   - Read scripts and logs in pieces: `grep -n` for what you need, then `sed -n 'A,Bp'`
+     those lines. Never read a whole script.
+   - A failed smoke test or CHECK FAIL (non-zero rc, REJECT, DISAGREE, no output): if the
+     cause is in your own driver or its checks, fix it and re-run, as often as needed. If the
+     cause is anywhere else (the binary, a build, a node, the harness tools, a worktree, the
+     host), never touch it: reply with its `tail -20` and the cause, and stop. That goes
+     back to the main session.
 3. **Quiet host**: no compile may run during a campaign (results get contaminated).
-   Finish every build first, and check: `pgrep -a 'cargo|rustc'` must be empty.
+   Finish every build first, and check: `pgrep -a 'cargo|rustc'` must be empty, and
+   `pgrep -a 'localsearch|tracker-miner'` must be empty too (a desktop indexer skews
+   cells: GNOME localsearch indexed bench-results in the s1153 g3 campaign; masked on
+   ozarchy, not elsewhere). If it is not empty, do not kill it:
+   report to the main session and stop.
    If the campaign has a per-cell step (validates each cell, appends a row to
    `<RUN_DIR>/cells.tsv`), it must run in sequence and finish before the next cell starts:
    never in the background while a cell is measuring.
@@ -46,13 +69,21 @@ cache rebuild per campaign).
    It names the unit `bench-<name>`, passes your exported environment and working directory,
    and writes no marker itself, hence the `echo` above. `run-cell.sh` refuses to run outside a
    `bench-*.service` unit. Stop a run with `systemctl --user stop bench-<name>.service`.
+   The campaign holds the shared build lock for its whole run: detach.sh prints
+   `build lock: waiting` to the log and runs the command under
+   `flock -o "$HOME/projects/wt/.cargo-heavy.lock"`, so wrapped builds (gate 26) wait
+   instead of skewing cells. Cells the campaign starts through detach.sh from inside its
+   unit take no lock (the campaign holds it); on a host without `~/projects/wt` no lock.
    Why: on 2026-10-06 three 300-market runs started from agent shells each lost one
    process to an outside SIGKILL (not OOM, not kill/tkill/tgkill).
-5. **Confirm it started**: one short wait until the log shows the first progress line,
+5. **Confirm it started**: one short wait until the log shows the first progress line
+   (only `build lock: waiting` = a build holds the lock; the campaign starts when it ends),
    then `tail -5` the log and, in the same Bash call, `systemctl --user is-active bench-<name>.service`.
    It must print `active`; if not, fix the unit name or launch before you wait (the step-6 wait
    would otherwise end at once). `remember_this` the launch (run dir, arms, shas, unit name).
-6. **Wait, by expected duration** (estimate it from the arms x cells x cell time):
+6. **Wait, by expected duration** (estimate it from the arms x cells x cell time).
+   Pick the wait mode once, from that estimate at launch: never switch modes mid-run yourself
+   (except the hook's switch to background after ~1.8h), and never read the log between waits.
    - **Under ~1.8h**: wait in the foreground with 270s keep-alive waits (cheapest: one
      cache read per 4.5 min; the hook switches you to background after ~1.8h):
      ```

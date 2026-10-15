@@ -1,0 +1,42 @@
+{
+  "campaign": "ozarchy-example",
+  "comment": "example: one node build, a defaults arm, a TORUS knob arm, a MALLOC_CONF arm and a wrapper (LD_PRELOAD) arm; warm-up, 3 rotated replicates of 120 s at 300 markets",
+  "results_root": "/home/oz/bench-results-matched",
+  "run_dir": "/home/oz/bench-results-matched/ozarchy-example-run",
+  "label_prefix": "ozarchy-example-300m",
+  "harness_worktree": "/home/oz/projects/wt/example-0123abcd",
+  "tools_dir": "/home/oz/bench-results-matched/ozarchy-example-tools/matched-bench",
+  "devnet_dir": "/home/oz/torus-wsl-devnet",
+  "binaries": {
+    "b": {"stage_dir": "/home/oz/bench-results-matched/ozarchy-example-stage/b-run",
+          "node_md5": "03a2b75727727f972cf5e80865646f0d", "bench_md5": "9b725823487b8ac7f42cfc556609e9aa"},
+    "bje": {"stage_dir": "/home/oz/bench-results-matched/ozarchy-example-stage/b-je",
+            "node_md5": "03a2b75727727f972cf5e80865646f0d", "bench_md5": "9b725823487b8ac7f42cfc556609e9aa",
+            "wrapper": true}
+  },
+  "markets": 300,
+  "duration_s": 120,
+  "rate": 76000,
+  "replicates": 3,
+  "order": "rotate",
+  "baseline": "A",
+  "warmup": {"arm": "A", "tag": "w1", "duration_s": 120},
+  "smoke": {"arm": "M1", "duration_s": 60},
+  "node_env": {"TORUS_ROCKSDB_STATS": "2", "TORUS_ROCKSDB_STATS_INTERVAL_SECS": "1"},
+  "harness_env": {"BLOCK_CAP": "400", "OVERWRITE": "1", "RETRY_BUSY": "1", "MAX_IN_FLIGHT": "4",
+                  "OPEN_ORDER_BUDGET": "900", "ORACLE_FEED": "1", "IN_FLIGHT_TAIL": "commit",
+                  "IN_FLIGHT_TAIL_DEPTH": "1", "CLOID_SHARE": "0"},
+  "absent_env": ["MALLOC_CONF"],
+  "expect": [
+    {"file": "run.log", "regex": "oracle feed pid [0-9]+;", "min": 1}
+  ],
+  "analysis": {"cmd": "python3 -I /home/oz/bench-results-matched/ozarchy-example-tools/analyst/a-cells.py {out} {prefix} {tag}:{arm}",
+               "metric": "ms"},
+  "arms": [
+    {"label": "A", "binary": "b", "note": "defaults"},
+    {"label": "E5", "binary": "b", "env": {"TORUS_ADMISSION_EXEC_AWARE": "1", "TORUS_ADMISSION_HORIZON_MS": "5000"}},
+    {"label": "M1", "binary": "b", "env": {"MALLOC_CONF": "dirty_decay_ms:1000,muzzy_decay_ms:1000"}},
+    {"label": "GJ", "binary": "bje", "note": "b-je/release/torus-node = '#!/bin/sh' + 'export LD_PRELOAD=...' + 'exec <b-run node> \"$@\"'",
+     "expect": [{"file": "node-preload.txt", "regex": "LD_PRELOAD=/usr/lib/libjemalloc.so.2 ", "min": 3, "max": 3}]}
+  ]
+}

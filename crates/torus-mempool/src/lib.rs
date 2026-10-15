@@ -225,17 +225,25 @@ pub struct Mempool {
 }
 
 impl Mempool {
-    /// Create a new mempool backed by the given state database.
+    /// Create a new mempool backed by the given state database. The DA store
+    /// shares the same RocksDB handle (tests, tools).
     pub fn new(state: StateDb, config: MempoolConfig) -> Self {
+        let da_store = NativeDaStore::new(state.clone());
+        Self::with_da_store(state, da_store, config)
+    }
+
+    /// [`Self::new`] with the DA store on its own DB (section 71.8 option A:
+    /// the node's consensus DB), so DA mirror writes do not queue behind the
+    /// state DB's checkpoint batch.
+    pub fn with_da_store(state: StateDb, da_store: NativeDaStore, config: MempoolConfig) -> Self {
         let mut native_pool = native_pool::NativePool::new(
             config.native_pool_max_size,
             config.native_per_sender_cap,
             config.native_per_block_cap,
         );
         native_pool.set_cancel_share_pct(config.native_cancel_block_share_pct);
-        // DA store shares the same RocksDB handle; every native-action body the
-        // mempool sees is mirrored here durably (decoupled from the nonce gate).
-        let da_store = NativeDaStore::new(state.clone());
+        // Every native-action body the mempool sees is mirrored to the DA
+        // store durably (decoupled from the nonce gate).
         let verified_cap = config.verified_sender_cache_cap;
         let initial_base_fee = config.initial_base_fee;
         let initial_evm_gas_limit = config.block_gas_limit;
@@ -1839,6 +1847,37 @@ mod tests {
         pool.mirror_to_da(&b);
         assert_eq!(pool.flush_da_mirrors(), 2);
         assert_eq!(pool.flush_da_mirrors(), 0, "nothing left buffered");
+    }
+
+    /// Section 71.8 option A: with a DA store over the node's own consensus
+    /// DB, every mirror path (buffered ingress flush, proposer batch) writes
+    /// the body there and never into the state DB, and reads find it there.
+    #[test]
+    fn da_mirrors_land_in_the_given_da_store_not_the_state_db() {
+        let (dir, state) = setup();
+        let cdb = StateDb::open_consensus(&torus_state::consensus_db_path(dir.path())).unwrap();
+        let pool = Mempool::with_da_store(
+            state.clone(),
+            NativeDaStore::new(cdb.clone()),
+            MempoolConfig::default(),
+        );
+        let a = gauge_test_action(1);
+        let b = gauge_test_action(2);
+        pool.mirror_to_da(&a);
+        assert_eq!(pool.flush_da_mirrors(), 1);
+        pool.mirror_native_to_da(std::slice::from_ref(&b)).unwrap();
+        for act in [&a, &b] {
+            let h = torus_types::compute_action_hash(act);
+            assert!(
+                pool.get_native_da(&h).is_some(),
+                "mempool read missed the body"
+            );
+            assert!(NativeDaStore::new(cdb.clone()).get(&h).unwrap().is_some());
+            assert!(
+                NativeDaStore::new(state.clone()).get(&h).unwrap().is_none(),
+                "DA body reached the state DB"
+            );
+        }
     }
 
     /// s76: the timed batch read does its ONE flush itself and reports it, so

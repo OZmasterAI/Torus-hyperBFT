@@ -52,7 +52,13 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    let db = match StateDb::open(&cli.data_dir) {
+    // Section 71.8 option A: the HotStuff store is `<data_dir>/consensus-db`.
+    let path = torus_state::consensus_db_path(&cli.data_dir);
+    if !path.is_dir() {
+        eprintln!("torus-wedge-inject: no consensus DB at {}", path.display());
+        return ExitCode::from(1);
+    }
+    let db = match StateDb::open_consensus(&path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("torus-wedge-inject: exclusive open (is the node stopped?): {e}");

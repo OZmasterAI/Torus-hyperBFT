@@ -33,7 +33,10 @@ pub use backend::{
 };
 pub use bg_writer::{BackgroundCfWriter, BgWriterPolicy, EncodeRows, PackedCfBatch, RawCfKv};
 pub use checkpoint_layer::{CheckpointLayer, DeferredLayer, LayerPart, DEFERRED_CFS};
-pub use db::{DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats, RocksdbTickers, StateDb};
+pub use db::{
+    consensus_db_path, DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats,
+    RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,
+};
 pub use error::StateError;
 pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;

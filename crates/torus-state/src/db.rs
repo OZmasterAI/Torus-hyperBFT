@@ -1,7 +1,7 @@
 //! RocksDB wrapper with column family layout and revm `DatabaseRef` implementation.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use alloy_primitives::{Address, Bytes, B256, U256};
 use revm::bytecode::Bytecode;
@@ -349,7 +349,35 @@ pub struct StateDb {
     /// 2 = tickers + histograms). Decides which parts of `runtime_stats` are
     /// meaningful.
     stats_level: u8,
+    /// Section 71.8 option A: the node's consensus DB, whose WAL
+    /// [`Self::sync_wal`] syncs before this DB's own (set once by
+    /// [`Self::attach_wal_peer`], shared by every clone).
+    wal_peer: Arc<OnceLock<Arc<DB>>>,
 }
+
+/// Section 71.8 option A: directory of the consensus DB inside the node's
+/// data dir. Inside, so wiping the data dir wipes both DBs.
+pub const CONSENSUS_DB_DIR: &str = "consensus-db";
+
+/// The consensus DB's column families: the HotStuff store (`RocksKVStore`,
+/// all of its traffic) and the DA store (`NativeDaStore`). The state DB
+/// keeps its own `cf_consensus_meta` for the state meta keys the
+/// checkpoint batch writes (applied marker, running hash, epoch plan, ...).
+pub const CONSENSUS_DB_CFS: [&str; 3] = [CF_CONSENSUS_META, CF_NATIVE_PENDING, CF_NATIVE_SHARDS];
+
+/// `<data_dir>/consensus-db`.
+pub fn consensus_db_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CONSENSUS_DB_DIR)
+}
+
+/// Block cache of the state DB (shared by its CFs).
+const STATE_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// Block cache of the consensus DB: its hot set is small (HotStuff keys,
+/// recent DA bodies, mostly still in memtables).
+const CONSENSUS_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// DB-wide memtable budget of the consensus DB: two full 128 MiB DA
+/// memtables. The state DB keeps [`db_write_buffer_bytes`].
+const CONSENSUS_DB_WRITE_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
 /// r3 exec-write-stall-attribution: node-local RocksDB tuning read once at DB
 /// open. Every default is EXACT-TODAY except `stats_level` (tickers on so the
@@ -636,6 +664,61 @@ impl StateDb {
         tuning: &DbTuning,
         book_cf_target_file: u64,
     ) -> Result<Self, StateError> {
+        Self::open_cfs(
+            path,
+            tuning,
+            book_cf_target_file,
+            ALL_CF_NAMES,
+            db_write_buffer_bytes(),
+            STATE_BLOCK_CACHE_BYTES,
+        )
+    }
+
+    /// Section 71.8 option A: open (or create) the node's consensus DB at
+    /// `path` ([`consensus_db_path`]) with only [`CONSENSUS_DB_CFS`], the
+    /// tuning read from the environment. Same per-CF options as in the state
+    /// DB, but its own WAL, write queue, memtable budget and block cache, so
+    /// HotStuff and DA writes never queue behind a state checkpoint batch.
+    pub fn open_consensus(path: &Path) -> Result<Self, StateError> {
+        Self::open_consensus_with_tuning(path, &DbTuning::from_env())
+    }
+
+    /// [`Self::open_consensus`] with explicit tuning (tests / tooling).
+    pub fn open_consensus_with_tuning(path: &Path, tuning: &DbTuning) -> Result<Self, StateError> {
+        Self::open_cfs(
+            path,
+            tuning,
+            book_cf_target_file_bytes(),
+            &CONSENSUS_DB_CFS,
+            CONSENSUS_DB_WRITE_BUFFER_BYTES,
+            CONSENSUS_BLOCK_CACHE_BYTES,
+        )
+    }
+
+    /// Open the consensus DB read-only (offline tooling, `torus-unwedge
+    /// --inspect`); as [`Self::open_read_only`], a live primary is seen as
+    /// of its last flush.
+    pub fn open_consensus_read_only(path: &Path) -> Result<Self, StateError> {
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = CONSENSUS_DB_CFS
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
+            .collect();
+        let db =
+            DB::open_cf_descriptors_read_only(&Options::default(), path, cf_descriptors, false)?;
+        Ok(Self::from_existing_db(db))
+    }
+
+    /// Open `cfs` at `path` with the shared per-CF tuning, a DB-wide memtable
+    /// budget of `write_buffer_budget` bytes and a block cache of
+    /// `block_cache_bytes`.
+    fn open_cfs(
+        path: &Path,
+        tuning: &DbTuning,
+        book_cf_target_file: u64,
+        cfs: &[&str],
+        write_buffer_budget: usize,
+        block_cache_bytes: usize,
+    ) -> Result<Self, StateError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -694,13 +777,13 @@ impl StateDb {
         // with the largest memtable instead of letting the sum keep growing.
         // Bounds the tail without reshaping steady state (see
         // `db_write_buffer_bytes` for the default and per-node-class guidance).
-        opts.set_db_write_buffer_size(db_write_buffer_bytes());
+        opts.set_db_write_buffer_size(write_buffer_budget);
 
         // Per-CF tuning, shared across every column family. RocksDB ships an
         // ~8 MiB block cache and NO bloom filters by default, which is poor for
         // this node's point-lookup-heavy access (account / code / native-action
         // -by-hash). A shared cache + bloom filters is the main read win here.
-        let cache = Cache::new_lru_cache(256 * 1024 * 1024); // 256 MiB shared block cache
+        let cache = Cache::new_lru_cache(block_cache_bytes); // shared by the DB's CFs
         let mut bbt = BlockBasedOptions::default();
         bbt.set_block_cache(&cache);
         bbt.set_bloom_filter(10.0, false); // ~1% false positives on point lookups
@@ -752,7 +835,7 @@ impl StateDb {
             name == CF_NATIVE_ORDER_BOOKS || name == CF_NATIVE_HASHED || name == CF_BOOK_ORDER_ROWS
         };
 
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = ALL_CF_NAMES
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = cfs
             .iter()
             .map(|name| {
                 let mut opts = if *name == CF_CONSENSUS_META {
@@ -787,6 +870,7 @@ impl StateDb {
             opts: (tuning.stats_level >= 1).then(|| Arc::new(opts)),
             stats_level: tuning.stats_level,
             range_compaction: Arc::default(),
+            wal_peer: Arc::default(),
         })
     }
 
@@ -797,6 +881,7 @@ impl StateDb {
             opts: None,
             stats_level: 0,
             range_compaction: Arc::default(),
+            wal_peer: Arc::default(),
         }
     }
 
@@ -873,12 +958,7 @@ impl StateDb {
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
             .collect();
         let db = DB::open_cf_descriptors_read_only(&opts, path, cf_descriptors, false)?;
-        Ok(Self {
-            db: Arc::new(db),
-            opts: None,
-            stats_level: 0,
-            range_compaction: Arc::default(),
-        })
+        Ok(Self::from_existing_db(db))
     }
 
     /// Destroy the database at the given path (for testing).
@@ -1094,18 +1174,43 @@ impl StateDb {
         Ok(())
     }
 
-    /// Fsync the shared write-ahead log, making every write issued so far
+    /// Fsync the write-ahead log, making every write issued so far
     /// crash-durable — surviving host power-loss / hard VM-stop, not just a
     /// process kill (which the OS page cache already covers).
     ///
-    /// Task B / Option C: `kv_store` (consensus-meta / commit-frontier) and
-    /// `native_da` (bodies) share this one `Arc<DB>` and therefore one WAL, so a
-    /// single `flush_wal(true)` at the commit boundary makes the whole committed
-    /// prefix (frontier + header + body) durable atomically-by-WAL-order. Call
-    /// it exactly ONCE per committed block — never per-write or per-action.
+    /// Task B / Option C: the commit boundary calls this ONCE per committed
+    /// block (never per-write or per-action) to make the committed prefix
+    /// (frontier + DA bodies + header + body) durable. Section 71.8 option A
+    /// moved the frontier (`kv_store`) and the bodies (`native_da`) into the
+    /// consensus DB, which has its own WAL: with a peer attached
+    /// ([`Self::attach_wal_peer`]) its WAL is synced FIRST, then this one, so
+    /// when this returns both are durable, and a durable state-DB write still
+    /// implies durable consensus-DB writes issued before it. Only power-loss
+    /// ordering between syncs (writes not yet covered by one) is weaker than
+    /// with one shared WAL.
     pub fn sync_wal(&self) -> Result<(), StateError> {
+        if let Some(peer) = self.wal_peer.get() {
+            peer.flush_wal(true)?;
+        }
         self.db.flush_wal(true)?;
         Ok(())
+    }
+
+    /// Section 71.8 option A: make [`Self::sync_wal`] (on this handle and
+    /// every clone) also sync `peer`'s WAL — the node's consensus DB. Set
+    /// once; a second attach is an error.
+    pub fn attach_wal_peer(&self, peer: &StateDb) -> Result<(), StateError> {
+        self.wal_peer
+            .set(peer.db_arc())
+            .map_err(|_| StateError::InvalidData("WAL peer already attached".into()))
+    }
+
+    /// `rocksdb.wal.synced` since open (WAL fsyncs), or `None` when the DB
+    /// was opened without statistics.
+    pub fn wal_sync_count(&self) -> Option<u64> {
+        self.opts
+            .as_ref()
+            .map(|o| o.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced))
     }
 
     // ---- Account operations (cf_accounts) ----
@@ -1698,6 +1803,10 @@ mod prefix_successor_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "consensus_db_tests.rs"]
+mod consensus_db_tests;
 
 #[cfg(test)]
 mod sync_wal_tests {

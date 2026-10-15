@@ -14,7 +14,7 @@
 //!
 //! Exit codes: 0 ok | 1 error | 2 apply refused (missing --yes).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -30,7 +30,7 @@ use torus_state::StateDb;
     about = "Offline consensus block-tree surgery for permanently wedged Torus nodes"
 )]
 struct Cli {
-    /// Node data directory (the RocksDB holding cf_consensus_meta).
+    /// Node data directory (the HotStuff store is its `consensus-db`).
     #[arg(long)]
     data_dir: PathBuf,
 
@@ -132,7 +132,7 @@ fn run(cli: Cli) -> Result<u8, String> {
             .map_err(|e| format!("decode {}: {e}", pc_path.display()))?;
 
         // Exclusive open: fails on RocksDB LOCK if the node is still running.
-        let db = StateDb::open(&cli.data_dir)
+        let db = StateDb::open_consensus(&consensus_db(&cli.data_dir)?)
             .map_err(|e| format!("exclusive open (is the node stopped?): {e}"))?;
         let kv = RocksKVStore::new(db.db_arc());
 
@@ -177,7 +177,7 @@ fn run(cli: Cli) -> Result<u8, String> {
     }
 
     // Read-only modes.
-    let db = StateDb::open_read_only(&cli.data_dir)
+    let db = StateDb::open_consensus_read_only(&consensus_db(&cli.data_dir)?)
         .map_err(|e| format!("read-only open: {e}"))?;
     let kv = RocksKVStore::new(db.db_arc());
     let report = recovery::inspect(kv).map_err(fmt_recovery_err)?;
@@ -202,6 +202,19 @@ fn run(cli: Cli) -> Result<u8, String> {
 
     print_report(&report, cli.json);
     Ok(0)
+}
+
+/// The HotStuff store's DB (section 71.8 option A: `<data_dir>/consensus-db`).
+fn consensus_db(data_dir: &Path) -> Result<PathBuf, String> {
+    let path = torus_state::consensus_db_path(data_dir);
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(format!(
+            "no consensus DB at {} (not a node data dir, or the layout before section 71.8 option A)",
+            path.display()
+        ))
+    }
 }
 
 fn fmt_recovery_err(e: RecoveryError) -> String {
