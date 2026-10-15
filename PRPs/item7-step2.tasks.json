@@ -69,15 +69,15 @@
     },
     {
       "id": "B9",
-      "name": "F3: epoch EVM gas row, next_base_fees at boundary execution from the parent header window, 1 gwei floor, add_block_evm_gas",
+      "name": "F3: epoch EVM gas row, next_base_fees at boundary execution from the parent header window, 1 gwei floor, add_block_evm_gas; calc_next_block_base_fee clamps gas used at the limit and saturates (Codex plan check s125)",
       "status": "pending",
-      "files": ["crates/torus-economics/src/epoch_plan.rs", "crates/torus-economics/src/lib.rs", "crates/torus-state/src/running_hash.rs", "crates/torus-bridge/src/native_executor.rs", "crates/torus-consensus/src/app.rs"],
-      "validate": "$L cargo nextest run $P $F -E 'test(next_base_fees_follow_the_epochs_gas_per_lane) or test(boundary_turns_the_epoch_gas_into_plan_fees) or test(f3_epoch_gas_sets_plan_fees) or test(running_hash_captures)'",
+      "files": ["crates/torus-types/src/eip1559.rs", "crates/torus-economics/src/epoch_plan.rs", "crates/torus-economics/src/lib.rs", "crates/torus-state/src/running_hash.rs", "crates/torus-bridge/src/native_executor.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(next_base_fees_follow_the_epochs_gas_per_lane) or test(boundary_turns_the_epoch_gas_into_plan_fees) or test(f3_epoch_gas_sets_plan_fees) or test(running_hash_captures) or test(base_fee_)'",
       "depends_on": ["B4", "B6", "B8"]
     },
     {
       "id": "B10",
-      "name": "pre-vote caps per height (N or M cadence, (small+big)/21000 txs, 768 KiB, small+big declared gas); o5 consensus message size test from the vote caps",
+      "name": "pre-vote caps per height (N or M cadence, (small+big)/21000 txs, 768 KiB, small+big declared gas); o5 consensus message size test from the vote caps (a structural guard, green before and after, Codex plan check s125)",
       "status": "pending",
       "files": ["crates/torus-consensus/src/app.rs", "crates/torus-integration-tests/tests/o5_feed_gates.rs"],
       "validate": "$L cargo nextest run $P $F -E 'test(evm_txs_at_a_big_height_off_the_small_cadence) or test(big_height_caps_count_bytes_and_gas) or test(worst_case_compact_proposal) or test(before_the_vote)'",
@@ -93,18 +93,18 @@
     },
     {
       "id": "B12",
-      "name": "proposer drains the small lane then the big lane at a big height; pools follow every committed header and the boot header",
+      "name": "proposer drains the small lane then the big lane at a big height, each at the proposed header's (planned) base fee (Codex plan check s125); pools follow every committed header and the boot header",
       "status": "pending",
-      "files": ["crates/torus-consensus/src/app.rs"],
-      "validate": "$L cargo nextest run $P $F -E 'test(big_height_drains_the_small_lane_then_the_big_lane) or test(committed_header_sets_the_mempool) or test(select_block_payload) or test(catch_up_gate) or test(deferred_exec_counts_toward_pacing)'",
-      "depends_on": ["B6", "B10", "B11"]
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-mempool/src/lib.rs", "crates/torus-integration-tests/tests/rate_limit_mev.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(big_height_drains_the_small_lane_then_the_big_lane) or test(committed_header_sets_the_mempool) or test(boundary_drain_uses_the_planned_fee) or test(select_block_payload) or test(catch_up_gate) or test(deferred_exec_counts_toward_pacing)'",
+      "depends_on": ["B6", "B9", "B10", "B11"]
     },
     {
       "id": "B13",
-      "name": "in-flight filter (decision 7): committed EVM txs leave every pool at commit, copies refused 256 blocks, per-sender committed nonce for pending_nonce",
+      "name": "in-flight filter (decision 7): committed EVM txs leave every pool at commit, copies refused 256 blocks, per-sender committed nonce for pending_nonce, also for this node's drained txs; released once the committed height executes (prune_committed_txs(executed_height)); owner (a): no ecrecover on commit (Codex plan check s125)",
       "status": "pending",
-      "files": ["crates/torus-mempool/src/lib.rs", "crates/torus-mempool/src/evm_pool.rs", "crates/torus-consensus/src/app.rs"],
-      "validate": "$L cargo nextest run $P $F -E 'test(committed_block_drops_its_pooled_evm_txs) or test(committed_evm_tx_is_not_readmitted_until_expiry) or test(lower_nonce_than_a_committed_one) or test(inflight_entry_drops_once_the_state_nonce) or test(commit_prunes_forwarded_copies) or test(lost_proposal)'",
+      "files": ["crates/torus-mempool/src/lib.rs", "crates/torus-mempool/src/evm_pool.rs", "crates/torus-consensus/src/app.rs", "crates/torus-node/src/main.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(committed_block_drops_its_pooled_evm_txs) or test(committed_evm_tx_is_not_readmitted_until_expiry) or test(lower_nonce_than_a_committed_one) or test(inflight_entry_drops_once_the_state_nonce) or test(own_drained_txs_reserve_their_nonces) or test(skipped_committed_tx_releases_its_nonce) or test(commit_prunes_forwarded_copies) or test(lost_proposal)'",
       "depends_on": ["B11"]
     },
     {
@@ -117,10 +117,10 @@
     },
     {
       "id": "B15",
-      "name": "CoreWriter: order kinds wait K (governance, default 10), others +1; 200-row cap applied at enqueue; existing tests pin K=1",
+      "name": "CoreWriter: order kinds wait K (governance, default 10), others +1; an order kind never targets before the last order-kind target (CF_FEE_CONFIG row, Codex plan check s125); 200-row cap applied at enqueue; existing tests pin K=1",
       "status": "pending",
       "files": ["crates/torus-core/src/precompiles.rs", "crates/torus-core/tests/precompile_tests.rs", "crates/torus-bridge/src/native_executor.rs", "crates/torus-evm/src/executor.rs", "crates/torus-bridge/tests/corewriter_cloid_tests.rs", "crates/torus-bridge/tests/corewriter_results_tests.rs", "crates/torus-integration-tests/tests/cross_vm_write.rs", "crates/torus-evm/tests/evm_tests.rs", "crates/torus-consensus/src/app.rs"],
-      "validate": "$L cargo nextest run $P $F -E 'test(order_actions_wait_k_blocks_others_one) or test(full_target_block_sends_later_rows) or test(corewriter_order_drains_k_blocks_later) or test(corewriter_evm_row_drains) or test(queue_) or test(core_writer_)'",
+      "validate": "$L cargo nextest run $P $F -E 'test(order_actions_wait_k_blocks_others_one) or test(full_target_block_sends_later_rows) or test(lowering_k_never_lets_a_cancel_overtake) or test(corewriter_order_drains_k_blocks_later) or test(corewriter_evm_row_drains) or test(queue_) or test(core_writer_)'",
       "depends_on": ["B1", "B5"]
     },
     {
@@ -149,7 +149,7 @@
     },
     {
       "id": "B19",
-      "name": "docs and the full run (workspace nextest, doc tests, -D warnings build, fmt/clippy counts, CI uniswap e2e); then devnet checks a-f and archy native-only A/B",
+      "name": "docs and the full run (workspace nextest, doc tests, -D warnings build, fmt/clippy counts, CI uniswap e2e); then devnet checks a-f and archy native-only A/B in two book shapes: mode 3 and Classic with 15 s checkpoints (Codex plan check s125)",
       "status": "pending",
       "files": ["docs/configuration-reference.md", "docs/api/corewriter-results.md", "docs/api/read-limits.md", "docs/perf/read-precompile-gas.md", "docs/plans/item7-evm-lanes.md", "docs/plans/item7-step2-design.md"],
       "validate": "$L cargo nextest run --workspace $F > /tmp/item7s2-nextest.log 2>&1 && $L cargo test --doc -q > /tmp/item7s2-doc.log 2>&1 && CARGO_TARGET_DIR=/home/18c/.cargo-target-item7s2-dw RUSTFLAGS='-D warnings' $L cargo build $P --all-targets",
