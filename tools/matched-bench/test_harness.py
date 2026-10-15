@@ -3605,11 +3605,15 @@ class DetachTest(unittest.TestCase):
             name,
             'echo "CG=$(cut -d: -f3 /proc/self/cgroup)"; '
             'echo "PARENT=$(ps -o comm= -p $PPID)"; '
+            'echo "GRANDPARENT=$(ps -o comm= -p $(ps -o ppid= -p $PPID))"; '
             'echo "PROBE=$DETACH_PROBE"; echo "PWD=$PWD"; echo DONE',
         )
         kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
         self.assertTrue(kv["CG"].endswith("/bench-%s.service" % name), kv["CG"])
-        self.assertEqual(kv["PARENT"], "systemd")
+        if kv["PARENT"] == "flock":  # build lock holder (~/projects/wt exists)
+            self.assertEqual(kv["GRANDPARENT"], "systemd")
+        else:
+            self.assertEqual(kv["PARENT"], "systemd")
         self.assertEqual(
             kv["PROBE"], "carried", "caller's exported env must carry over"
         )
@@ -3662,6 +3666,115 @@ class DetachTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("usage", r.stderr)
 
+
+FAKE_SYSTEMD_RUN = r"""#!/usr/bin/env bash
+printf '%s\0' "$@" > "$FAKE_ARGV"
+"""
+FAKE_SYSTEMCTL = "#!/usr/bin/env bash\nexit 3\n"  # is-active: unit not running
+
+
+class DetachBuildLockTest(unittest.TestCase):
+    """s1156: a campaign started through detach.sh holds the shared build lock
+    ($HOME/projects/wt/.cargo-heavy.lock, the one builders take with
+    `flock -w 60 -o`, gate 26) for its whole run, so wrapped builds wait instead
+    of skewing cells. Cells a campaign starts through detach.sh from inside its
+    own bench unit take no lock (the campaign holds it; locking again would
+    deadlock). No ~/projects/wt: no lock. Runs with a fake systemd-run (no unit
+    is started, safe on a bench host)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="detach-lock-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.bin = os.path.join(self.d, "bin")
+        os.makedirs(self.bin)
+        for name, body in (
+            ("systemd-run", FAKE_SYSTEMD_RUN),
+            ("systemctl", FAKE_SYSTEMCTL),
+        ):
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0o755)
+        self.home = os.path.join(self.d, "home")
+        os.makedirs(self.home)
+        self.argv_file = os.path.join(self.d, "argv")
+        self.cgroup = os.path.join(self.d, "cgroup")
+        with open(self.cgroup, "w") as f:  # an agent's shell, not a bench unit
+            f.write("0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n")
+        self.lock = os.path.join(self.home, "projects", "wt", ".cargo-heavy.lock")
+
+    def _env(self):
+        return dict(
+            os.environ,
+            PATH=self.bin + os.pathsep + os.environ["PATH"],
+            HOME=self.home,
+            FAKE_ARGV=self.argv_file,
+            DETACH_CGROUP_FILE=self.cgroup,
+        )
+
+    def _unit_cmd(self, *cmd):
+        """detach.sh's systemd-run argv after `--`: what the unit runs."""
+        r = subprocess.run(
+            ["bash", DETACH_SH, "camp", os.path.join(self.d, "c.log"), *cmd],
+            capture_output=True, text=True, timeout=30, env=self._env(), cwd=self.d,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(self.argv_file) as f:
+            argv = f.read().split("\0")[:-1]
+        self.assertIn("--unit=bench-camp", argv)
+        return argv[argv.index("--") + 1 :]
+
+    def _run_unit(self, unit_cmd):
+        return subprocess.run(
+            unit_cmd, capture_output=True, text=True, timeout=30, env=self._env()
+        )
+
+    def test_campaign_holds_the_build_lock_for_its_whole_run(self):
+        os.makedirs(os.path.dirname(self.lock))
+        probe = 'flock -n -E 9 "%s" true; echo "rc=$?"; printf "<%%s>" "$@"' % self.lock
+        cmd = self._unit_cmd("bash", "-c", probe, "x", "a b", "c")
+        self.assertIn(self.lock, cmd)
+        out = self._run_unit(cmd).stdout
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "build lock: waiting")
+        self.assertIn("rc=9", out, "lock must be held while the command runs")
+        self.assertIn("<a b><c>", out, "arguments must reach the command intact")
+        r = subprocess.run(["flock", "-n", "-E", "9", self.lock, "true"])
+        self.assertEqual(r.returncode, 0, "lock must be free after the run")
+
+    def test_campaign_waits_while_a_build_holds_the_lock(self):
+        os.makedirs(os.path.dirname(self.lock))
+        cmd = self._unit_cmd("bash", "-c", "echo STARTED")
+        with open(self.lock, "w") as held:
+            import fcntl
+
+            fcntl.flock(held, fcntl.LOCK_EX)
+            p = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, text=True, env=self._env()
+            )
+            time.sleep(0.5)
+            self.assertIsNone(p.poll(), "campaign must wait for the build")
+            fcntl.flock(held, fcntl.LOCK_UN)
+        out, _ = p.communicate(timeout=10)
+        self.assertEqual(out.splitlines(), ["build lock: waiting", "STARTED"])
+
+    def test_no_projects_wt_runs_without_the_lock(self):
+        cmd = self._unit_cmd("bash", "-c", "echo hi", "x")
+        self.assertEqual(cmd, ["bash", "-c", "echo hi", "x"])
+
+    def test_cell_started_inside_a_bench_unit_takes_no_lock(self):
+        os.makedirs(os.path.dirname(self.lock))
+        with open(self.cgroup, "w") as f:
+            f.write("0::/user.slice/user-1000.slice/user@1000.service/app.slice/bench-camp.service\n")
+        cmd = self._unit_cmd("bash", "-c", "echo cell")
+        self.assertEqual(cmd, ["bash", "-c", "echo cell"])
+
+    def test_global_and_detach_use_the_same_lock_file(self):
+        with open(DETACH_SH) as f:
+            src = f.read()
+        self.assertIn('"$HOME/projects/wt"', src)
+        self.assertIn(".cargo-heavy.lock", src)
+        self.assertIn("flock -o", src)
 
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):
