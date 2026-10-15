@@ -29,6 +29,11 @@ descendants of an agent's shell, each lost one process to an outside SIGKILL
 scope keeps the caller as parent. `BENCH_ALLOW_UNDETACHED=1` overrides for a
 deliberate one-off. Wait for the cell through its files (`summary.json`, a
 done marker), and stop it with `systemctl --user stop bench-NAME.service`.
+Started from outside a bench unit, detach.sh holds the shared build lock
+(`flock -o "$HOME/projects/wt/.cargo-heavy.lock"`, the one builders take with
+`flock -w 60 -o`) for the whole run, so wrapped builds wait; while a build holds
+it the log shows only `build lock: waiting`. Cells a campaign starts from inside
+its own bench unit take no lock (the campaign holds it); no `~/projects/wt`, no lock.
 
 Example (record-cell shape, 5 min, 10 markets):
 

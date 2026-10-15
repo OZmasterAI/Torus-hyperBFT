@@ -15,6 +15,15 @@
 # nohup keeps the process tree); a run started through this script is not.
 # `systemd-run --scope` would not do: a scope keeps the caller as parent.
 # run-cell.sh refuses to run outside a bench-*.service unit.
+#
+# Build lock (s1156): started from outside a bench unit (a campaign), the unit
+# prints `build lock: waiting` and runs CMD under `flock -o
+# "$HOME/projects/wt/.cargo-heavy.lock"`, the lock every builder takes with
+# `flock -w 60 -o` (framework gate 26): it holds the lock for its whole run, so
+# wrapped builds wait instead of skewing cells, and it waits while a build holds
+# it (only `build lock: waiting` in the log). Started from inside a bench-*.service
+# unit (a cell of that campaign) it takes no lock: the campaign holds it, and a
+# second flock would wait forever. No $HOME/projects/wt (or no flock): no lock.
 set -eu
 usage() { echo "usage: detach.sh NAME LOGFILE CMD [ARGS...]" >&2; exit 2; }
 [ $# -ge 3 ] || usage
@@ -35,7 +44,16 @@ ENV_ARGS=()
 while IFS= read -r v; do
     [[ $v =~ $SECRET_RE ]] || ENV_ARGS+=(-E "$v")
 done < <(compgen -e)
-echo "detach.sh: starting $UNIT.service (log $LOG; stop: systemctl --user stop $UNIT.service)"
+LOCK_DIR="$HOME/projects/wt"
+LOCK_NOTE=""
+if grep -qE '/bench-[^/]*\.service$' "${DETACH_CGROUP_FILE:-/proc/self/cgroup}"; then
+    LOCK_NOTE="; no build lock: started inside a bench unit, whose launch holds it"
+elif [ -d "$LOCK_DIR" ] && command -v flock >/dev/null; then
+    set -- bash -c 'echo "build lock: waiting"; lock=$1; shift; exec flock -o "$lock" "$@"' \
+        detach-lock "$LOCK_DIR/.cargo-heavy.lock" "$@"
+    LOCK_NOTE="; holds the build lock $LOCK_DIR/.cargo-heavy.lock"
+fi
+echo "detach.sh: starting $UNIT.service (log $LOG; stop: systemctl --user stop $UNIT.service$LOCK_NOTE)"
 exec systemd-run --user --quiet --collect --same-dir --unit="$UNIT" \
     -p StandardInput=null -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
     "${ENV_ARGS[@]}" -- "$@"
