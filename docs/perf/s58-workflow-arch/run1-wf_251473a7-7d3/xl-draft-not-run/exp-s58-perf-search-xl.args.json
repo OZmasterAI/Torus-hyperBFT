@@ -1,0 +1,28 @@
+{
+ "repo": "/home/oz/projects/torus-economy/Torus-hyperBFT",
+ "base_sha": "a44000e0",
+ "base_branch": "exp/archy-s58x-perf-search",
+ "wt_root": "/home/oz/projects/wt",
+ "results_doc": "docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md",
+ "state_file": "/home/oz/projects/torus-economy/.claude-state.json",
+ "s123_seed": "18c's s123 perf-experiments workflow (wf_443f7b55-fcb, 2026-10-15, base main c612dc7f; memories 13db18e4b126e788, 686c9ac32eed6242, 73ea4a840468f4fb): 21 candidates, 7 survived adversarial checks, 4 implemented as default-off env-flag branches (fetched here; notes in docs/plans/exp-s123-<slug>.md on each branch):\n1. exp/s123-parallel-cancel-all-book-pass (TORUS_PARALLEL_CANCEL_ALL=N): batched cancel-all book pass (native_executor.rs exec_cancel_all_run) on the exec worker pool, one job group per market (market_workers.rs). WIP, not building yet.\n2. exp/s123-propose-defer-on-exec-queue (TORUS_PROPOSE_EXEC_WATERMARK; control arm TORUS_EXEC_QUEUE_DEPTH): leader defers a fresh proposal while its exec queue is at a watermark (hotstuff_rs App::proposal_backpressure + torus-consensus app.rs). Two consensus-timing review fixes pending.\n3. exp/s123-exec-action-keys-parallel (TORUS_EXEC_PARALLEL_KEYS): exec trust-cache keys computed in an order-preserving parallel verify pre-pass (torus-types eip712.rs). The sort-key half was deferred, not refuted.\n4. exp/s123-defer-book-blobs-in-layer-merge (TORUS_CKPT_DEFER_BOOKS): Classic book blobs merged into the checkpoint layer in the deferred part (torus-state checkpoint_layer.rs).\nDropped or folded: phase2-sharded-prepare (replaced by the zero-code TORUS_PARALLEL_ENGINE=8 A/B, queued on archy), exec-prep-stage and exec-fused-keys (folded into 3).\nRefuted, known by name: consensus-reuse-action-hashes (mem 93695d41711b2545: seed follower PendingProposal from compact hashes, pass hashes into dispatch prune, pool hashes into mirror, skip sig attestation; hotstuff-thread Keccak only ~1% CPU), next-leader-parent-path-slim (mem 6544729f533865cb: same hash reuse plus parallel bincode decode in NativeDaStore::get_batch_timed), liq-scan-parallel-prevalue (mem 966f49e6b842cec8: parallel liq_view of the 2,048-trader liquidation window; gain below noise, Phase 5 rewrites that path). About 11 more refuted candidates are not yet recovered by name.\nOther 18c work: checkpoint slicing branch expected next (sec 74 conclusion); item 7 touches hotstuff_rs and consensus app.rs; item 6 Phase 5 (Users mutated in place, inline sums per fill) in flight; TORUS_PARALLEL_ENGINE=N exists (byte-identical) and is to be benched at 300m.",
+ "ns": "s58x",
+ "targets": [
+  "/home/oz/.cargo-target-exp-s58",
+  "/home/oz/.cargo-target-exp-s58x-2"
+ ],
+ "locks": [
+  "/home/oz/.cargo-exp-s58.lock",
+  "/home/oz/.cargo-exp-s58x-2.lock"
+ ],
+ "jobs_per_slot": 16,
+ "max_rounds": 4,
+ "verify_cap_r1": 20,
+ "verify_cap_later": 12,
+ "verify_cap_final": 12,
+ "max_new_lenses": 8,
+ "max_picks": 12,
+ "min_fresh": 3,
+ "sibling_glob": "exp/archy-s58-*",
+ "sibling": "A smaller sibling run of this same search (workflow run wf_251473a7-7d3, started 2026-10-15 10:08) runs in parallel on this machine: same base a44000e0, 3 prior-art agents, 10 round-1 lenses (match-core, exec-pipeline, state-write, consensus-cadence, ingress-verify, network-da, alloc-hash-serde, profile-mining, locks-threads-tail, per-block-background), up to 6 picks built on branches exp/archy-s58-<slug> (worktrees /home/oz/projects/wt/exp-s58-<slug>) and integrated on exp/archy-s58-perf-search; its planner and picker save memories tagged experiment-s58. Treat experiments it has picked or built as in-flight work: do not build the same change again (check git branch --list 'exp/archy-s58-*' and those memories). Ideas it only researched or verified are fair game. It shares cargo slot 1 (lock /home/oz/.cargo-exp-s58.lock)."
+}
