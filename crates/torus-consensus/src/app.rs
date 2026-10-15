@@ -36,7 +36,7 @@ use torus_bridge::{
     sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator, BundleState,
     NativeExecContext, NativeExecutor,
 };
-use torus_economics::{EpochManager, SlashReason, StakingManager};
+use torus_economics::{EpochManager, EpochRotationPlan, PlanEvm, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::Mempool;
 use torus_state::cf::{
@@ -51,7 +51,7 @@ use torus_types::{
 
 /// Consensus bug (b): this node's execution has not yet applied the epoch
 /// boundary whose plan the boundary being proposed / validated needs.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct EpochPlanNotReady;
 
 /// A datum-less proposal every honest `validate_block` rejects (`datums.len()
@@ -871,6 +871,10 @@ pub struct LeaderState {
     /// stale during timeout churn) and the REAL selection (reputation-aware
     /// when the fleet runs it, unlike the plain-IWRR fallback below).
     observed_leader: RwLock<Option<(u64, VerifyingKey)>>,
+    /// Item 7 step 1: `(view, Torus height)` of the newest observed proposal.
+    tip: RwLock<(u64, u64)>,
+    /// Item 7 step 1: the committed header's N (0 = unknown).
+    evm_block_interval: AtomicU64,
 }
 
 impl LeaderState {
@@ -879,6 +883,8 @@ impl LeaderState {
             view: AtomicU64::new(1),
             validators: RwLock::new(hotstuff_rs::types::validator_set::ValidatorSet::new()),
             observed_leader: RwLock::new(None),
+            tip: RwLock::new((0, 0)),
+            evm_block_interval: AtomicU64::new(0),
         }
     }
 
@@ -938,6 +944,65 @@ impl LeaderState {
             &vs,
         ))
     }
+
+    /// Item 7 step 1: record a proposal (own or received header) at hotstuff
+    /// height `hs_height` in `view`. Hotstuff numbers blocks from 0 and the
+    /// Torus header from 1 (the first block extends the genesis header, height
+    /// 0), so the tip keeps `hs_height + 1`, the height the EVM cadence counts.
+    ///
+    /// Ignored: a view older than the tip's (out-of-order delivery), and a
+    /// view beyond the pacemaker's next one. A header reaches this before its
+    /// justify is checked and its leader picks the view, so one far-future
+    /// header would otherwise pin the tip for good. The next view's leader can
+    /// propose before our StartView, so that view is taken.
+    pub fn observe_hotstuff_proposal(&self, view: u64, hs_height: u64) {
+        let Some(height) = hs_height.checked_add(1) else {
+            return;
+        };
+        if view > self.current_view().saturating_add(1) {
+            return;
+        }
+        let mut tip = self.tip.write().unwrap();
+        if view >= tip.0 {
+            *tip = (view, height);
+        }
+    }
+
+    fn set_evm_block_interval(&self, n: u64) {
+        self.evm_block_interval.store(n, Ordering::Relaxed);
+    }
+
+    /// Item 7 step 1: leader of the next EVM height. max(current view, tip
+    /// view + 1) proposes tip + 1, then one block per view (plain IWRR, like
+    /// the fallback above; reputation weighting is off). Checked arithmetic: a
+    /// leader picks its header's height and view, so overflowing values fall
+    /// back to the current leader instead of panicking.
+    pub fn next_evm_leader(&self) -> Option<VerifyingKey> {
+        let n = self.evm_block_interval.load(Ordering::Relaxed);
+        if n == 0 {
+            return self.current_leader();
+        }
+        let (tip_view, tip_height) = *self.tip.read().unwrap();
+        // h_e > tip_height, so `h_e - (tip_height + 1)` cannot underflow.
+        let view_e = (tip_height / n)
+            .checked_add(1)
+            .and_then(|k| k.checked_mul(n))
+            .and_then(|h_e| {
+                let first_view = self.current_view().max(tip_view.checked_add(1)?);
+                first_view.checked_add(h_e - (tip_height + 1))
+            });
+        let Some(view_e) = view_e else {
+            return self.current_leader();
+        };
+        let vs = self.validators.read().unwrap();
+        if vs.is_empty() {
+            return None;
+        }
+        Some(hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view_e),
+            &vs,
+        ))
+    }
 }
 
 struct ExecutionContext {
@@ -948,6 +1013,10 @@ struct ExecutionContext {
     max_validators: u32,
     treasury_address: Address,
     dev_pool_address: Address,
+    /// Item 7 step 1: the genesis parent header from the chain config (the
+    /// same value as `TorusApp::genesis_header`): crash replay starts from
+    /// it and execution links height 1 to it.
+    pub(crate) genesis_header: TorusBlockHeader,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
     /// Shared mempool handle for the exec trust-cache read path: a HIT lets the
     /// execution thread reuse a locally-verified sender and skip the secp256k1
@@ -1122,6 +1191,15 @@ struct ExecutionContext {
     /// metrics attached the liquidation step logs the value sum over all
     /// accounts. Never changes what a block writes.
     liq_value_sum: bool,
+    /// s124 epoch-boundary fast path (`TORUS_EPOCH_FAST_PATH=1`, node-local,
+    /// default off, read once at construction): an epoch-boundary block with
+    /// no EVM tx and no buffered slash takes the pipelined path instead of
+    /// [`Self::pipeline_barrier`] and the serial flush, and with a checkpoint
+    /// interval it checkpoints at its own height ([`Self::checkpoint_upkeep`])
+    /// so its plan for the next boundary is durable without later blocks.
+    /// State, roots and the running hash are identical; only timing changes.
+    /// No effect without W.
+    epoch_fast_path: bool,
 }
 
 /// See [`ExecutionContext::test_block_probe`].
@@ -1841,6 +1919,7 @@ enum ReplayGapOutcome {
 fn replay_gap<H, B, X>(
     applied: u64,
     committed: u64,
+    genesis: TorusBlockHeader,
     mut load_header: H,
     mut load_body: B,
     mut execute: X,
@@ -1850,7 +1929,7 @@ where
     B: FnMut(u64) -> Option<TorusBlockBody>,
     X: FnMut(&TorusBlock) -> bool,
 {
-    let mut last_good = torus_bridge::genesis_parent_header();
+    let mut last_good = genesis;
     for height in (applied + 1)..=committed {
         let header = match load_header(height) {
             Some(h) => h,
@@ -1923,10 +2002,10 @@ where
 /// parent — the parent is already final here.
 ///
 /// Genesis edge: the height-1 block's parent is the synthetic
-/// `genesis_parent_header` (never persisted), so its expected hash is computed
-/// directly. If the parent header cannot be resolved (missing/truncated) we
-/// cannot assert a conflict, so we allow — the same conservative stance as
-/// [`detect_conflicting_commit`].
+/// `genesis_parent_header` (never persisted; `genesis`, built from the chain
+/// config), so its expected hash is computed directly. If the parent header
+/// cannot be resolved (missing/truncated) we cannot assert a conflict, so we
+/// allow — the same conservative stance as [`detect_conflicting_commit`].
 ///
 /// On a genuine mismatch this SCREAMS with both hashes and latches the fail-stop
 /// (`exec_failed`), returning `true` so the caller aborts.
@@ -1940,13 +2019,14 @@ fn detect_parent_link_violation<B: StateBackend>(
     state_db: &B,
     height: u64,
     parent_hash: &alloy_primitives::B256,
+    genesis: &TorusBlockHeader,
     exec_failed: &std::sync::atomic::AtomicBool,
 ) -> bool {
     if height == 0 {
         return false;
     }
     let expected = if height == 1 {
-        alloy_primitives::keccak256(torus_bridge::genesis_parent_header().canonical_header_bytes())
+        alloy_primitives::keccak256(genesis.canonical_header_bytes())
     } else {
         match state_db.get_cf_raw(CF_BLOCK_HEADERS, &(height - 1).to_be_bytes()) {
             Ok(Some(d)) if d.len() >= 32 => alloy_primitives::B256::from_slice(&d[..32]),
@@ -2000,9 +2080,8 @@ fn parent_block_ms<B: StateBackend>(
     height: u64,
 ) -> Result<u64, torus_state::StateError> {
     if height <= 1 {
-        return Ok(torus_types::eip712::block_timestamp_ms(
-            torus_bridge::genesis_parent_header().timestamp,
-        ));
+        // The genesis parent header's timestamp.
+        return Ok(torus_types::eip712::block_timestamp_ms(0));
     }
     let parent = height - 1;
     let Some(row) = state.get_cf_raw(CF_BLOCK_HEADERS, &parent.to_be_bytes())? else {
@@ -2064,13 +2143,22 @@ fn tree_parent_header(
 /// Execution checks the same link against the committed header at height − 1
 /// (`detect_parent_link_violation`); the committed chain follows the justify
 /// links, so a certified block always passes it there.
+///
+/// Item 7 step 1: once the link holds, the header's EVM gas limit and N
+/// (`evm_block_interval`) equal the parent's, except at an epoch boundary,
+/// where they equal the epoch plan's values (`boundary`; an unset value or
+/// no plan: the parent's). A plan this node cannot read yet is `Missing`,
+/// like the validator-set plan in `finish_validate`. The base fee always
+/// equals the parent's.
 fn check_parent_link(
     header: &TorusBlockHeader,
     justify: &PhaseCertificate,
+    genesis: &TorusBlockHeader,
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
 ) -> BlockDataCheck {
     let parent = if justify.is_genesis_pc() {
-        torus_bridge::genesis_parent_header()
+        genesis.clone()
     } else {
         match parent(&justify.block) {
             ParentHeader::Header(header) => *header,
@@ -2091,37 +2179,46 @@ fn check_parent_link(
         );
         return BlockDataCheck::Invalid;
     }
-    // Item 7 step 0: the EVM gas limit and the base fee are the parent's (a
-    // pure header comparison, like the timestamp rule). Both start at the
-    // genesis parent header's values. Gas limit: when governance can change
-    // it, this becomes "equals the rule value". Base fee: fixed on purpose
-    // until the owner decides EIP-1559 vs a fixed fee
-    // (docs/plans/item7-evm-lanes.md, open question 4); the EIP-1559 check in
-    // `torus_bridge::validator` is not wired into consensus.
-    if header.evm_gas_limit != parent.evm_gas_limit
+    if header.height != parent.height + 1 || header.parent_hash != expected {
+        tracing::warn!(
+            height = header.height,
+            parent_height = parent.height,
+            claimed_parent = %header.parent_hash,
+            expected_parent = %expected,
+            "REJECTED -- header does not link to its parent block's header (ancestry violation)"
+        );
+        return BlockDataCheck::Invalid;
+    }
+    // Item 7: the EVM gas limit and N are the rule values. Off a boundary: the
+    // parent's. At a boundary: the plan's (unset or no plan: the parent's).
+    // The check runs after the link, so a header with a bogus height is
+    // Invalid and never waits on a plan. Base fee: fixed on purpose until the
+    // owner decides EIP-1559 vs a fixed fee (docs/plans/item7-evm-lanes.md,
+    // open question 4); the EIP-1559 check in `torus_bridge::validator` is
+    // not wired into consensus.
+    let plan = match boundary(header.height) {
+        Ok(plan) => plan.unwrap_or_default(),
+        Err(EpochPlanNotReady) => return BlockDataCheck::Missing,
+    };
+    let gas_limit = plan.gas_limit.unwrap_or(parent.evm_gas_limit);
+    let block_interval = plan.block_interval.unwrap_or(parent.evm_block_interval);
+    if header.evm_gas_limit != gas_limit
+        || header.evm_block_interval != block_interval
         || header.base_fee_per_gas != parent.base_fee_per_gas
     {
         tracing::warn!(
             height = header.height,
             evm_gas_limit = header.evm_gas_limit,
-            parent_evm_gas_limit = parent.evm_gas_limit,
+            gas_limit,
+            evm_block_interval = header.evm_block_interval,
+            block_interval,
             base_fee_per_gas = header.base_fee_per_gas,
             parent_base_fee_per_gas = parent.base_fee_per_gas,
-            "REJECTED -- block EVM gas limit or base fee differs from its parent's"
+            "REJECTED -- EVM gas limit, interval or base fee differs from the rule value"
         );
         return BlockDataCheck::Invalid;
     }
-    if header.height == parent.height + 1 && header.parent_hash == expected {
-        return BlockDataCheck::Held;
-    }
-    tracing::warn!(
-        height = header.height,
-        parent_height = parent.height,
-        claimed_parent = %header.parent_hash,
-        expected_parent = %expected,
-        "REJECTED -- header does not link to its parent block's header (ancestry violation)"
-    );
-    BlockDataCheck::Invalid
+    BlockDataCheck::Held
 }
 
 /// Item 7 step 0, pre-vote only (like the native action count): the EVM body
@@ -2130,9 +2227,15 @@ fn check_parent_link(
 /// declared gas limits sum to at most `evm_gas_limit`: gas used is unknown
 /// before execution, and execution fails the whole EVM section once the
 /// cumulative gas exceeds the limit. An honest proposer passes: `drain_evm`
-/// sums declared limits up to min(header limit, local budget). A tx that does
+/// sums declared limits up to min(header limit, local budget) and keeps the raw
+/// tx bytes within 256 KiB (item 7 step 1). A tx that does
 /// not decode counts no gas: execution skips it (D3 S392, s84 decision 1), it
 /// is never a reason to reject the block.
+///
+/// Item 7 step 1: EVM txs only at `height % evm_block_interval == 0`, at most
+/// `evm_gas_limit / 21,000` of them and at most 256 KiB of raw tx bytes. A
+/// header cannot pick its own N to dodge the cadence: `check_parent_link`
+/// pins N before the same vote.
 fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool {
     if evm_txs.len() != header.evm_tx_count as usize {
         tracing::warn!(
@@ -2140,6 +2243,27 @@ fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool 
             header_count = header.evm_tx_count,
             body_count = evm_txs.len(),
             "not voting -- header evm_tx_count != body"
+        );
+        return false;
+    }
+    if evm_txs.is_empty() {
+        return true;
+    }
+    // Item 7 step 1: only on the header's cadence, at most limit / 21,000 txs (undecodable txs
+    // declare no gas, so the gas rule alone does not bound them), at most 256 KiB of tx bytes.
+    let max_txs = header.evm_gas_limit / torus_types::EVM_MIN_TX_GAS;
+    let bytes: usize = evm_txs.iter().map(Vec::len).sum();
+    if header.height.checked_rem(header.evm_block_interval) != Some(0)
+        || evm_txs.len() as u64 > max_txs
+        || bytes > torus_types::MAX_EVM_BLOCK_TX_BYTES
+    {
+        tracing::warn!(
+            height = header.height,
+            n = header.evm_block_interval,
+            txs = evm_txs.len(),
+            max_txs,
+            bytes,
+            "not voting -- EVM txs off the cadence or over the count/byte cap"
         );
         return false;
     }
@@ -2372,8 +2496,9 @@ impl ExecutionContext {
 
     /// bl2: barrier — every path that writes the DB directly, reads it
     /// bypassing the overlay, or must see a settled marker (EVM blocks,
-    /// slashes, epoch boundaries, non-durable rows, replay) first waits for W
-    /// to drain. Returns `false` (after latching the fail-stop) if W failed.
+    /// slashes, epoch boundaries unless the epoch fast path is on,
+    /// non-durable rows, replay) first waits for W to drain. Returns `false`
+    /// (after latching the fail-stop) if W failed.
     fn pipeline_barrier(&self) -> bool {
         let Some(worker) = &self.flush_worker else {
             return true;
@@ -2544,8 +2669,9 @@ impl ExecutionContext {
     /// `height` (its frozen set is `last_job`). Folds the previous parent
     /// (n-1) into L off E, or, when a trigger fires, closes L + n-1 + n into
     /// a checkpoint at `height`. Triggers: attest height (`h % 100 == 0`),
-    /// the policy's interval / byte cap / block count. `false`: fail-stop
-    /// latched (the caller returns).
+    /// an epoch boundary under the epoch fast path (s124), the policy's
+    /// interval / byte cap / block count. `false`: fail-stop latched (the
+    /// caller returns).
     fn checkpoint_upkeep(&self, overlay: &mut NativeStateOverlay, height: u64) -> bool {
         let Some(policy) = self.checkpoint else {
             return true;
@@ -2623,7 +2749,16 @@ impl ExecutionContext {
                 + fold.as_ref().map_or(0, |p| p.state_bytes())
                 + current.as_ref().map_or(0, |c| c.state_bytes())) as u64
         };
+        // s124 epoch fast path: a pipelined boundary block wrote the plan for
+        // boundary `height + L` into this window. Consensus reads that plan
+        // only once the DURABLE marker reaches `height` (bug (b)), and these
+        // triggers run only when a block executes (no idle checkpoint): with
+        // L not a multiple of 100 the plan could stay in memory while
+        // consensus refuses `height + L` and execution idles, for good.
+        // Checkpoint the boundary at its own height (for L % 100 == 0 the
+        // attest term already does).
         let due = height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
+            || (self.epoch_fast_path && EpochManager::is_epoch_boundary(height, self.epoch_length))
             || policy
                 .every_blocks
                 .is_some_and(|n| height.saturating_sub(st.base) >= n)
@@ -2955,6 +3090,7 @@ impl ExecutionContext {
             &self.state_db,
             height,
             &torus_block.header.parent_hash,
+            &self.genesis_header,
             &self.exec_failed,
         ) {
             return;
@@ -3011,12 +3147,19 @@ impl ExecutionContext {
         // a BARRIER: wait for W to drain, then today's serial path verbatim.
         // Replay (`DurableRows::default()`) is therefore always serial, and W
         // does not even exist at replay time (F4).
+        // s124 epoch fast path (`TORUS_EPOCH_FAST_PATH=1`): an epoch boundary
+        // is pipelined too. F2: W resyncs the EVM accounts the boundary
+        // credited after its write / checkpoint, as for any block. F8 is gone
+        // since bug (b): consensus reads the plan from the DB only, once the
+        // durable marker reaches the previous boundary; the boundary's own
+        // checkpoint (`checkpoint_upkeep`) makes it durable without later blocks.
         let pipelined = self.flush_worker.is_some()
             && durable.header
             && durable.body
             && !has_evm
             && pending_slashes.is_empty()
-            && !EpochManager::is_epoch_boundary(height, self.epoch_length);
+            && (self.epoch_fast_path
+                || !EpochManager::is_epoch_boundary(height, self.epoch_length));
         if !pipelined && !self.pipeline_barrier() {
             tracing::error!(height, "FATAL: flush worker failed before barrier — fail-stop");
             return;
@@ -4728,6 +4871,10 @@ pub struct TorusApp {
     evm_executor: EvmExecutor,
     proposer_address: Address,
     last_header: TorusBlockHeader,
+    /// Item 7 step 1: the genesis parent header, built once in `try_new` from
+    /// the chain config (`evm_gas_limit`, `evm_block_interval`). Height 1 links
+    /// to it before the vote, at insertion and at execution.
+    pub(crate) genesis_header: TorusBlockHeader,
     staking: StakingManager,
     epoch_length: u64,
     last_validator_set: ValidatorSet,
@@ -4741,6 +4888,9 @@ pub struct TorusApp {
     test_applied_read_fault: bool,
     pending_slashes: Vec<PendingSlash>,
     pending_proposals: std::collections::HashMap<u64, PendingProposal>,
+    /// Item 7 step 1: EVM txs drained into our own proposals, by height, until a block commits
+    /// there (drain_evm is destructive and pending_proposals entries get overwritten).
+    own_evm_proposed: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
     in_flight_hashes: InFlightHashLedger,
     #[allow(dead_code)]
     treasury_address: Address,
@@ -5588,6 +5738,11 @@ impl TorusApp {
             config.dev_pool_address,
         );
         exec_validator.metrics = metrics.clone();
+        // Item 7 step 1: the genesis parent header from the genesis EVM values. Every
+        // user (vote, insertion, execution, crash replay) takes this one value, or
+        // block 1 fails to link.
+        let genesis_header =
+            torus_bridge::genesis_parent_header(config.evm_gas_limit, config.evm_block_interval);
         let mut exec_ctx = ExecutionContext {
             state_db: state_db.clone(),
             validator: exec_validator,
@@ -5596,6 +5751,7 @@ impl TorusApp {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            genesis_header: genesis_header.clone(),
             metrics: metrics.clone(),
             mempool: mempool.clone(),
             exec_trust_cache: config.exec_trust_cache,
@@ -5660,6 +5816,7 @@ impl TorusApp {
             #[cfg(test)]
             test_nonce_tombstones: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
+            epoch_fast_path: crate::exec_pipeline::epoch_fast_path_enabled(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -5751,6 +5908,22 @@ impl TorusApp {
                  the flush worker; every block is written as today"
             );
         }
+        // s124: the epoch fast path only changes which blocks take the
+        // pipelined path, so it needs W.
+        if exec_ctx.epoch_fast_path {
+            if exec_ctx.flush_worker.is_some() {
+                tracing::info!(
+                    epoch_length = config.epoch_length,
+                    "epoch fast path ON (TORUS_EPOCH_FAST_PATH=1): epoch-boundary blocks without \
+                     EVM txs or slashes run pipelined, no barrier"
+                );
+            } else {
+                tracing::warn!(
+                    "TORUS_EPOCH_FAST_PATH is set but the exec pipeline is off: no effect, every \
+                     epoch-boundary block runs serially"
+                );
+            }
+        }
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
         // The depth is shared with the mempool trust-cache sizing
@@ -5775,6 +5948,7 @@ impl TorusApp {
             .unwrap_or(genesis_validator_set);
         leader_state.sync_validators(&genesis_validator_set);
         leader_state.set_view(last_header.height.saturating_add(1));
+        leader_state.set_evm_block_interval(last_header.evm_block_interval);
 
         let mut app = Self {
             state_db,
@@ -5783,6 +5957,7 @@ impl TorusApp {
             evm_executor: EvmExecutor::new(config.chain_id),
             proposer_address,
             last_header,
+            genesis_header,
             staking,
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
@@ -5793,6 +5968,7 @@ impl TorusApp {
             test_applied_read_fault: false,
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
+            own_evm_proposed: std::collections::BTreeMap::new(),
             in_flight_hashes: InFlightHashLedger::default(),
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
@@ -6107,7 +6283,8 @@ impl TorusApp {
         let config = ChainConfig {
             chain_id: TORUS_CHAIN_ID,
             chain_name: "torus-test".to_string(),
-            evm_gas_limit: 30_000_000,
+            evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -6143,7 +6320,7 @@ impl TorusApp {
         state_db: &StateDb,
         exec_ctx: &ExecutionContext,
     ) -> (TorusBlockHeader, Option<u64>) {
-        let genesis = torus_bridge::genesis_parent_header();
+        let genesis = exec_ctx.genesis_header.clone();
 
         let committed = match find_last_committed_height(state_db) {
             Some(h) if h > 0 => h,
@@ -6182,6 +6359,7 @@ impl TorusApp {
         let outcome = replay_gap(
             applied,
             committed,
+            genesis,
             |height| load_replay_header(state_db, height),
             |height| load_replay_body(state_db, height),
             |block| {
@@ -6505,26 +6683,12 @@ impl TorusApp {
         hasher.finalize().into()
     }
 
-    /// Validator-set updates for block `height` (`None` off-boundary).
-    ///
-    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: at a
-    /// boundary they are READ from the plan the previous boundary stored at
-    /// execution (`None`: no plan — the first boundary — or an unchanged set);
-    /// no DB write, no read of timing-dependent state. `Err` = this node's
-    /// execution has not applied the previous boundary yet: refuse (validate ->
-    /// `MissingData`, propose -> no block) and retry, never guess.
-    fn epoch_validator_set_updates(
-        &mut self,
-        height: u64,
-    ) -> Result<Option<ValidatorSetUpdates>, EpochPlanNotReady> {
-        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
-            return Ok(None);
-        }
-        if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
-            if cached_height == height {
-                return Ok(cached_result.clone());
-            }
-        }
+    /// The epoch plan stored for boundary `height` by the execution of the
+    /// previous boundary (consensus bug (b) guard + read, shared by the
+    /// validator-set updates and the item 7 EVM values). `Err` = this node's
+    /// execution has not applied the previous boundary yet (or a read
+    /// failed): refuse and retry, never guess.
+    fn epoch_plan(&self, height: u64) -> Result<Option<EpochRotationPlan>, EpochPlanNotReady> {
         // R02: a read error refuses the boundary for now (liveness only),
         // never "applied = 0".
         let applied = match self.applied_height() {
@@ -6549,10 +6713,49 @@ impl TorusApp {
             );
             return Err(EpochPlanNotReady);
         }
-        let plan = self.staking.epoch_rotation_plan(height).map_err(|e| {
+        self.staking.epoch_rotation_plan(height).map_err(|e| {
             tracing::error!(%e, height, "failed to read the epoch rotation plan");
             EpochPlanNotReady
-        })?;
+        })
+    }
+
+    /// Item 7 step 1: the plan's EVM values for block `height` (`None` off a
+    /// boundary or at the first boundary, which has no plan).
+    fn boundary_evm(&self, height: u64) -> Result<Option<PlanEvm>, EpochPlanNotReady> {
+        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            return Ok(None);
+        }
+        match self.epoch_plan(height)? {
+            Some(plan) => Ok(Some(plan.evm)),
+            // From 2L on every boundary has a plan (written by the previous boundary's
+            // execution) until H + L executes and prunes it. None there means pruned:
+            // never read that as "no change".
+            None if height >= self.epoch_length.saturating_mul(2) => Err(EpochPlanNotReady),
+            None => Ok(None),
+        }
+    }
+
+    /// Validator-set updates for block `height` (`None` off-boundary).
+    ///
+    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: at a
+    /// boundary they are READ from the plan the previous boundary stored at
+    /// execution (`None`: no plan — the first boundary — or an unchanged set);
+    /// no DB write, no read of timing-dependent state. `Err` = this node's
+    /// execution has not applied the previous boundary yet: refuse (validate ->
+    /// `MissingData`, propose -> no block) and retry, never guess.
+    fn epoch_validator_set_updates(
+        &mut self,
+        height: u64,
+    ) -> Result<Option<ValidatorSetUpdates>, EpochPlanNotReady> {
+        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            return Ok(None);
+        }
+        if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
+            if cached_height == height {
+                return Ok(cached_result.clone());
+            }
+        }
+        let plan = self.epoch_plan(height)?;
         let updates = match plan {
             Some(plan) if plan.changed => {
                 let mut updates = ValidatorSetUpdates::new();
@@ -7013,9 +7216,11 @@ impl TorusApp {
     /// s84 (vote after body): a QC implies a quorum holds the block AND its
     /// out-of-band native-action bodies (compact proposals carry only hashes).
     /// Cheap: fail-stop, the one datum, its hash, decode, the header's action
-    /// count and EVM tx count and gas against the body (item 7 step 0,
+    /// count and EVM tx count and gas against the body (item 7 step 0; step 1
+    /// adds the EVM cadence and the count and byte caps,
     /// [`evm_body_fits_header`]), the header's link to its parent (s84 decision
-    /// 2, [`check_parent_link`], `parent` looks the parent up), then a
+    /// 2, [`check_parent_link`], `parent` looks the parent up; item 7 step 1:
+    /// at an epoch boundary also the plan's EVM values), then a
     /// presence-only DA read. No wait and no network pull here:
     /// `validate_block` (run right after on the same body) and its retries
     /// hand misses to the recovery worker.
@@ -7060,7 +7265,9 @@ impl TorusApp {
                 (compact.header.clone(), Some(compact))
             }
         };
-        let link = check_parent_link(&header, &block.justify, parent);
+        let link = check_parent_link(&header, &block.justify, &self.genesis_header, parent, |h| {
+            self.boundary_evm(h)
+        });
         if link != BlockDataCheck::Held {
             return link;
         }
@@ -7109,10 +7316,35 @@ impl TorusApp {
         // T0b: never below the parent (validators reject a regressing timestamp).
         let timestamp = unix_now_secs().max(parent_header.timestamp);
 
-        // Item 7 step 0: validators require the header limit to equal the parent's and
-        // the declared EVM gas to fit it, so select against exactly that limit (a 0
-        // limit selects no EVM txs instead of filling a default the header can't carry).
-        let gas_limit = parent_header.evm_gas_limit;
+        // Item 7 step 1: the new header's EVM values: the parent's, at a boundary the
+        // plan's (validators require exactly these, `check_parent_link`). The declared
+        // EVM gas must fit the limit, so select against exactly that limit.
+        let Ok(plan_evm) = self.boundary_evm(next_height) else {
+            return refused_proposal();
+        };
+        let plan_evm = plan_evm.unwrap_or_default();
+        let evm_gas_limit = plan_evm.gas_limit.unwrap_or(parent_header.evm_gas_limit);
+        let evm_block_interval = plan_evm
+            .block_interval
+            .unwrap_or(parent_header.evm_block_interval);
+        // Cadence: EVM txs only at height % N == 0. A 0 limit makes select_block_payload skip
+        // the destructive drain, so off-cadence txs stay pooled (N = 0 carries none).
+        let gas_limit = if next_height.checked_rem(evm_block_interval) == Some(0) {
+            evm_gas_limit
+        } else {
+            0
+        };
+        // Item 7 step 1: proposing a height again (our block there got no QC), first put the
+        // EVM txs of our earlier proposal back. The drain starts each sender at its lowest
+        // pooled nonce, so it would otherwise propose the next nonce without them: execution
+        // skips it (nonce gap), and if this block commits, the commit-time reinsert filters
+        // it out as committed. Either block can still commit, so the record stays.
+        if let (Some(mempool), Some(earlier)) = (
+            self.mempool.as_ref(),
+            self.own_evm_proposed.get(&next_height),
+        ) {
+            mempool.reinsert_evm(earlier.clone());
+        }
         let (native_with_senders, evm_txs) = {
             let _select_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_select_seconds);
@@ -7166,7 +7398,8 @@ impl TorusApp {
                 logs_bloom: Bloom::ZERO,
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
-                evm_gas_limit: parent_header.evm_gas_limit,
+                evm_gas_limit,
+                evm_block_interval,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: evm_txs.len() as u32,
                 base_fee_per_gas: parent_header.base_fee_per_gas,
@@ -7193,6 +7426,18 @@ impl TorusApp {
                 }) {
                     Ok(()) => tracing::info!(count, height, "pre-proposal push sent"),
                     Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
+                }
+            }
+        }
+
+        // Item 7 step 1: remember the EVM txs drained into this proposal, so
+        // they go back to the pool if another block commits at this height
+        // (once each: a re-proposal at this height drains them again).
+        if !block.evm_transactions.is_empty() {
+            let record = self.own_evm_proposed.entry(height).or_default();
+            for tx in &block.evm_transactions {
+                if !record.contains(tx) {
+                    record.push(tx.clone());
                 }
             }
         }
@@ -7314,9 +7559,13 @@ impl App<RocksKVStore> for TorusApp {
         // is inserted), so a block inserted by any path (full proposal, sync,
         // header + body) links to its parent's header.
         let link = match datum_header(datums[0].bytes()) {
-            Some(header) => check_parent_link(&header, &block.justify, |hash| {
-                tree_parent_header(request.block_tree(), hash)
-            }),
+            Some(header) => check_parent_link(
+                &header,
+                &block.justify,
+                &self.genesis_header,
+                |hash| tree_parent_header(request.block_tree(), hash),
+                |h| self.boundary_evm(h),
+            ),
             None => BlockDataCheck::Invalid,
         };
         match link {
@@ -7445,6 +7694,15 @@ impl App<RocksKVStore> for TorusApp {
 
         let height = header.height;
 
+        // Item 7 step 1: EVM txs of our own proposals that lost at this height
+        // go back to the pool.
+        let committed_evm: &[Vec<u8>] = match &source {
+            ExecSource::Ready(b) => &b.evm_transactions,
+            ExecSource::Compact(c) => &c.evm_transactions,
+            ExecSource::Durable(_) => &[],
+        };
+        self.reinsert_lost_evm(height, committed_evm);
+
         // S444 AT-LEAST-ONCE FEED GUARD: hotstuff's committed-block feed is
         // replayed from a durable frontier (the min-height exec-feed gap fix),
         // so heights the app ALREADY dispatched to execution may be re-delivered
@@ -7490,6 +7748,8 @@ impl App<RocksKVStore> for TorusApp {
         if height > self.last_header.height {
             self.last_header = header.clone();
             self.leader_state.set_view(height.saturating_add(1));
+            self.leader_state
+                .set_evm_block_interval(header.evm_block_interval);
             // Item 3: no async-validate invalidation here — a cached verdict
             // depends only on the datum bytes and the DA store (ancestry
             // re-runs live at hit time).
@@ -7582,6 +7842,30 @@ impl App<RocksKVStore> for TorusApp {
 }
 
 impl TorusApp {
+    /// Item 7 step 1: one block commits per height: our proposals at `height` that lost go
+    /// back to the pool, minus what the committed block carries. Lower heights are settled
+    /// (the commit feed is ordered). `reinsert_evm` re-validates each tx like `add_evm_tx`
+    /// (executed nonces drop as `NonceTooLow`, txs pooled again as `DuplicateTx`), and a
+    /// sender whose later nonces filled its slots meanwhile makes room for it.
+    fn reinsert_lost_evm(&mut self, height: u64, committed: &[Vec<u8>]) {
+        let lost: Vec<Vec<u8>> = self
+            .own_evm_proposed
+            .remove(&height)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tx| !committed.contains(tx))
+            .collect();
+        self.own_evm_proposed.retain(|&h, _| h > height);
+        if let (Some(mempool), false) = (self.mempool.as_ref(), lost.is_empty()) {
+            tracing::info!(
+                height,
+                txs = lost.len(),
+                "EVM txs of our lost proposal back to the pool"
+            );
+            mempool.reinsert_evm(lost);
+        }
+    }
+
     /// FIX 1 (S443) catch-up gate: propose EMPTY payloads while the local committed
     /// frontier lags the parent height by more than this. A just-rejoined leader
     /// learns the chain tip (`parent_height`) from the high-QC long before it has
@@ -7609,6 +7893,9 @@ impl TorusApp {
     /// liveness must not stall) but with an EMPTY payload, so it never re-proposes
     /// stale actions from an un-caught-up mempool. Once block-sync advances
     /// `last_header` back within the threshold, full selection resumes automatically.
+    ///
+    /// `gas_limit` 0 (item 7 step 1: off the EVM cadence) selects no EVM tx and
+    /// drains none from the pool.
     fn select_block_payload(
         &self,
         parent_height: u64,
@@ -7715,7 +8002,12 @@ impl TorusApp {
                 )
             }
         };
-        let evm = mempool.drain_evm(gas_limit, parent_state_root);
+        // Item 7 step 1: 0 = off cadence (or a 0 header limit): no destructive drain.
+        let evm = if gas_limit == 0 {
+            Vec::new()
+        } else {
+            mempool.drain_evm(gas_limit, parent_state_root)
+        };
         if !evm.is_empty() || !native.is_empty() {
             tracing::info!(
                 evm_txs = evm.len(),
@@ -8022,9 +8314,11 @@ impl TorusApp {
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
             // committed blocks actually charge (frozen at 1 gwei today; follows
-            // the header once the fee market unfreezes).
+            // the header once the fee market unfreezes). Item 7 step 1: the
+            // admission gas cap follows the committed header's EVM gas limit.
             if let Some(ref mempool) = self.mempool {
                 mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+                mempool.set_evm_gas_limit(torus_block.header.evm_gas_limit);
             }
 
             self.exec_prepared_height = Some(height);
@@ -8646,6 +8940,7 @@ mod exec_throttle_tests {
                 chain_id: torus_evm::TORUS_CHAIN_ID,
                 chain_name: "throttle-test".to_string(),
                 evm_gas_limit: 30_000_000,
+                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
                 base_fee_per_gas: 1_000_000_000,
                 epoch_length: 100,
                 max_validators: 4,
@@ -8816,6 +9111,7 @@ mod exec_dispatch_tests {
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
                 evm_gas_limit: 30_000_000,
+                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,
@@ -9892,6 +10188,105 @@ mod leader_state_tests {
         assert_eq!(ls.current_view(), 50);
         assert_eq!(ls.current_leader(), Some(vks[0]));
     }
+
+    /// Item 7 step 1 (E12): EVM txs go to the leader of the next EVM height
+    /// (`height % N == 0`), not the current-view leader. That height is
+    /// proposed one view per block after the newest observed proposal.
+    #[test]
+    fn next_evm_leader_is_the_leader_of_the_next_evm_height() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        // N unknown (0, before boot sets it): the current leader.
+        assert_eq!(ls.next_evm_leader(), ls.current_leader());
+
+        ls.set_evm_block_interval(5);
+        // Tip Torus 21 (hotstuff 20) at view 40: 22, 23, 24 in views 41-43, so 25 in view 44.
+        ls.observe_hotstuff_proposal(40, 20);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 44)));
+        // Views moved on to 43 without a new proposal: 22 in 43, 25 in 46.
+        ls.observe_start_view(43, plain_iwrr(&ls, 43));
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 46)));
+        // Tip 24 at view 50: 25 is the next block, in view 51.
+        ls.observe_start_view(50, plain_iwrr(&ls, 50));
+        ls.observe_hotstuff_proposal(50, 23);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 51)));
+        // Tip 25 at view 51 (an EVM height itself): the next one is 30, in 56.
+        ls.observe_hotstuff_proposal(51, 24);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 56)));
+    }
+
+    /// A leader picks its header's height, and the header event fires before
+    /// the justify check: extreme values must not overflow on the RPC path.
+    #[test]
+    fn next_evm_leader_falls_back_on_overflowing_tip_values() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        ls.set_evm_block_interval(1);
+        // Torus height u64::MAX: the next EVM height overflows.
+        ls.observe_hotstuff_proposal(40, u64::MAX - 1);
+        assert_eq!(*ls.tip.read().unwrap(), (40, u64::MAX));
+        assert_eq!(ls.next_evm_leader(), ls.current_leader());
+        // A hotstuff height whose Torus height overflows is ignored.
+        ls.observe_hotstuff_proposal(41, u64::MAX);
+        assert_eq!(*ls.tip.read().unwrap(), (40, u64::MAX));
+        // The pacemaker at view u64::MAX: the tip view + 1 overflows.
+        ls.observe_start_view(u64::MAX, plain_iwrr(&ls, u64::MAX));
+        ls.observe_hotstuff_proposal(u64::MAX, 7);
+        assert_eq!(*ls.tip.read().unwrap(), (u64::MAX, 8));
+        assert_eq!(ls.next_evm_leader(), ls.current_leader());
+    }
+
+    /// Hotstuff numbers blocks from 0 and the Torus header from 1 (the block
+    /// at hotstuff height 0 carries Torus height 1, see
+    /// `first_block_uses_the_configured_genesis_header`); the cadence is on
+    /// the Torus height, and the proposal events carry the hotstuff height.
+    /// RED before: the hotstuff height was taken as the Torus height, so every
+    /// prediction named the leader one view after the EVM height.
+    #[test]
+    fn next_evm_leader_converts_the_hotstuff_height() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.set_evm_block_interval(5);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        // Hotstuff 3 = Torus 4 in view 40: Torus 5 is the next block, in view 41.
+        ls.observe_hotstuff_proposal(40, 3);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 41)));
+        // Hotstuff 4 = Torus 5 (an EVM height) in view 41: Torus 10 in view 46.
+        ls.observe_start_view(41, plain_iwrr(&ls, 41));
+        ls.observe_hotstuff_proposal(41, 4);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 46)));
+    }
+
+    /// A proposal header reaches the tip before its justify is checked, and
+    /// its leader picks the view: one header for a far-future view must not
+    /// pin the prediction. Views above the pacemaker's next view are ignored;
+    /// the next view is taken (its leader can propose before our StartView).
+    /// RED before: the tip froze at that view for good.
+    #[test]
+    fn evm_routing_tip_ignores_views_beyond_the_next_one() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.set_evm_block_interval(5);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        ls.observe_hotstuff_proposal(40, 21);
+        let tip = *ls.tip.read().unwrap();
+        let leader = ls.next_evm_leader();
+        for view in [41 + 1_000_000, u64::MAX] {
+            ls.observe_hotstuff_proposal(view, 7);
+            assert_eq!(*ls.tip.read().unwrap(), tip, "view {view} ignored");
+            assert_eq!(ls.next_evm_leader(), leader, "view {view}");
+        }
+        // Hotstuff 22 = Torus 23 in view 41: 24 in view 42, 25 in view 43.
+        ls.observe_hotstuff_proposal(41, 22);
+        assert_eq!(*ls.tip.read().unwrap(), (41, 23));
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 43)));
+    }
 }
 
 #[cfg(test)]
@@ -9916,7 +10311,8 @@ mod crash_recovery_tests {
         let config = ChainConfig {
             chain_id: torus_evm::TORUS_CHAIN_ID,
             chain_name: "crash-test".to_string(),
-            evm_gas_limit: 30_000_000,
+            evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -9952,6 +10348,15 @@ mod crash_recovery_tests {
         torus_types::eip712::block_timestamp_ms(make_block(height, vec![]).header.timestamp)
     }
 
+    /// Item 7 step 1: the genesis parent header of the module's chain config
+    /// (`make_test_config_and_db`: the genesis default EVM values).
+    fn default_genesis_header() -> TorusBlockHeader {
+        torus_bridge::genesis_parent_header(
+            torus_types::DEFAULT_EVM_GAS_LIMIT,
+            torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+        )
+    }
+
     fn make_block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
         // Header-identity hardening: the commit-time ancestry check
         // (`detect_parent_link_violation`) compares a block's `parent_hash`
@@ -9965,9 +10370,7 @@ mod crash_recovery_tests {
         // explicitly (see `deferred_trades_*`, `duplicate_*`).
         let parent_hash = match height {
             0 => B256::ZERO,
-            1 => alloy_primitives::keccak256(
-                torus_bridge::genesis_parent_header().canonical_header_bytes(),
-            ),
+            1 => alloy_primitives::keccak256(default_genesis_header().canonical_header_bytes()),
             _ => alloy_primitives::keccak256(
                 make_block(height - 1, vec![]).header.canonical_header_bytes(),
             ),
@@ -9983,7 +10386,8 @@ mod crash_recovery_tests {
                 logs_bloom: Bloom::ZERO,
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
-                evm_gas_limit: 30_000_000,
+                evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,
@@ -10146,7 +10550,13 @@ mod crash_recovery_tests {
         // latch stays clear.
         let ef_ok = AtomicBool::new(false);
         assert!(
-            !detect_parent_link_violation(&state_db, 6, &correct_parent_hash, &ef_ok),
+            !detect_parent_link_violation(
+                &state_db,
+                6,
+                &correct_parent_hash,
+                &default_genesis_header(),
+                &ef_ok
+            ),
             "a child whose parent_hash matches the finalized parent must be accepted"
         );
         assert!(!ef_ok.load(Ordering::SeqCst), "no fail-stop on a valid link");
@@ -10156,7 +10566,7 @@ mod crash_recovery_tests {
         let ef_bad = AtomicBool::new(false);
         let bogus = torus_types::B256::repeat_byte(0xEE);
         assert!(
-            detect_parent_link_violation(&state_db, 6, &bogus, &ef_bad),
+            detect_parent_link_violation(&state_db, 6, &bogus, &default_genesis_header(), &ef_bad),
             "a child whose parent_hash mismatches the finalized parent must be rejected"
         );
         assert!(
@@ -10174,21 +10584,68 @@ mod crash_recovery_tests {
         use std::sync::atomic::AtomicBool;
         let (_config, state_db) = make_test_config_and_db();
 
-        let genesis_hash = alloy_primitives::keccak256(
-            torus_bridge::genesis_parent_header().canonical_header_bytes(),
-        );
+        let genesis = default_genesis_header();
+        let genesis_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
         let ef_ok = AtomicBool::new(false);
         assert!(
-            !detect_parent_link_violation(&state_db, 1, &genesis_hash, &ef_ok),
+            !detect_parent_link_violation(&state_db, 1, &genesis_hash, &genesis, &ef_ok),
             "height-1 block committing to the genesis header hash must be accepted"
         );
 
         let ef_bad = AtomicBool::new(false);
         assert!(
-            detect_parent_link_violation(&state_db, 1, &torus_types::B256::ZERO, &ef_bad),
+            detect_parent_link_violation(&state_db, 1, &torus_types::B256::ZERO, &genesis, &ef_bad),
             "height-1 block whose parent_hash is not the genesis header hash must be rejected"
         );
         assert!(ef_bad.load(Ordering::SeqCst));
+    }
+
+    /// Item 7 step 1: execution's genesis edge links height 1 to the
+    /// configured genesis header (`ExecutionContext::genesis_header`, built
+    /// from the chain config), so on a 3M chain a parent hash taken from a
+    /// 30M genesis is a violation. RED before: the expected hash came from
+    /// the hardcoded 30M header.
+    #[test]
+    fn parent_link_violation_uses_the_configured_genesis() {
+        use std::sync::atomic::AtomicBool;
+        let (mut config, state_db) = make_test_config_and_db();
+        config.evm_gas_limit = 3_000_000;
+        config.evm_block_interval = 5;
+        let genesis = torus_bridge::genesis_parent_header(3_000_000, 5);
+        let hash_3m = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        let hash_30m = alloy_primitives::keccak256(
+            torus_bridge::genesis_parent_header(30_000_000, 5).canonical_header_bytes(),
+        );
+        let latch = AtomicBool::new(false);
+        assert!(!detect_parent_link_violation(
+            &state_db, 1, &hash_3m, &genesis, &latch
+        ));
+        assert!(!latch.load(Ordering::SeqCst));
+        assert!(detect_parent_link_violation(
+            &state_db, 1, &hash_30m, &genesis, &latch
+        ));
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "a 30M genesis link latches the fail-stop"
+        );
+
+        // Wired: the execution context links block 1 to the configured header.
+        for (parent_hash, fails) in [(hash_3m, false), (hash_30m, true)] {
+            let (_, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            assert_eq!(
+                ctx.genesis_header.canonical_header_bytes(),
+                genesis.canonical_header_bytes()
+            );
+            let mut b1 = make_block(1, vec![]);
+            b1.header.parent_hash = parent_hash;
+            ctx.execute_committed_block(&b1, vec![]);
+            assert_eq!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                fails,
+                "fails={fails}"
+            );
+        }
     }
 
     /// T1.6 RED-first: crash-replay must still RUN after the pruner has
@@ -10275,6 +10732,7 @@ mod crash_recovery_tests {
         let outcome = replay_gap(
             0,
             3,
+            default_genesis_header(),
             |h| Some(blocks[h as usize - 1].header.clone()),
             |h| Some(blocks[h as usize - 1].body()),
             |block| {
@@ -10357,6 +10815,7 @@ mod crash_recovery_tests {
         let outcome = replay_gap(
             1,
             3,
+            default_genesis_header(),
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
             |block| {
@@ -10402,6 +10861,7 @@ mod crash_recovery_tests {
         let outcome = replay_gap(
             1,
             3,
+            default_genesis_header(),
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
             |block| {
@@ -13467,6 +13927,10 @@ mod crash_recovery_tests {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            genesis_header: torus_bridge::genesis_parent_header(
+                config.evm_gas_limit,
+                config.evm_block_interval,
+            ),
             metrics: None,
             mempool,
             exec_trust_cache,
@@ -13522,6 +13986,8 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_nonce_tombstones: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
+            // s124: the epoch fast path is off unless a test sets it.
+            epoch_fast_path: false,
         }
     }
 
@@ -13847,6 +14313,9 @@ mod crash_recovery_tests {
     /// path: the forged signature and the expired session fail
     /// `batch_verify_native_actions`; `decode_all_txs` fails on the garbage
     /// EVM tx), and execution writes no record.
+    ///
+    /// Item 7 step 1: the two blocks sit at heights 4 and 5 (on empty blocks
+    /// 1-3), so the EVM txs are on the N = 5 cadence the vote requires.
     #[test]
     fn invalid_actions_are_skipped_and_recorded_identically_on_three_replicas() {
         use torus_types::ActionSignature;
@@ -13857,7 +14326,8 @@ mod crash_recovery_tests {
 
         let first =
             torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 1, &key_a);
-        let block1 = make_block(1, vec![first.clone()]);
+        let parent3 = make_block(3, vec![]);
+        let block1 = make_block(4, vec![first.clone()]);
 
         let mut forged = torus_types::eip712::sign_native_action(
             NativeAction::ClaimRewards,
@@ -13876,7 +14346,7 @@ mod crash_recovery_tests {
         let valid =
             torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 9, &key_c);
         // Positions: 0 replay of block 1's action, 1 forged, 2 expired, 3 valid.
-        let mut block2 = make_block(2, vec![first, forged, expired, valid]);
+        let mut block2 = make_block(5, vec![first, forged, expired, valid]);
         block2.header.parent_hash =
             alloy_primitives::keccak256(block1.header.canonical_header_bytes());
         // EVM positions: 0 undecodable, 1 a valid contract creation.
@@ -13904,13 +14374,20 @@ mod crash_recovery_tests {
                 .unwrap();
             let mut app = TorusApp::new(state_db.clone(), &config, None, None, None);
             let ctx = make_exec_ctx(&config, &state_db);
-            let hs1 = hs_block(&block1, PhaseCertificate::genesis_pc());
+            for h in 1..=3 {
+                ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            }
+            let hs0 = hs_block(&parent3, PhaseCertificate::genesis_pc());
+            let hs1 = hs_block(&block1, justify_for(&hs0));
             let hs2 = hs_block(&block2, justify_for(&hs1));
             for (block, hs) in [(&block1, &hs1), (&block2, &hs2)] {
                 let datum = hs.data.vec()[0].bytes().clone();
                 let data_hash = hs.data_hash;
                 assert_eq!(
                     app.check_proposal_data(hs, |hash| {
+                        if *hash == hs0.hash {
+                            return ParentHeader::Header(Box::new(parent3.header.clone()));
+                        }
                         assert_eq!(*hash, hs1.hash);
                         ParentHeader::Header(Box::new(block1.header.clone()))
                     }),
@@ -13945,7 +14422,7 @@ mod crash_recovery_tests {
                 )
             };
             assert_eq!(
-                action_status(&state_db, 1),
+                action_status(&state_db, 4),
                 Some(torus_state::action_status::BlockActionStatus {
                     core_writer: vec![],
                     evm_skipped: vec![],
@@ -13954,7 +14431,7 @@ mod crash_recovery_tests {
                 })
             );
             assert_eq!(
-                action_status(&state_db, 2),
+                action_status(&state_db, 5),
                 Some(torus_state::action_status::BlockActionStatus {
                     core_writer: vec![],
                     evm_skipped: vec![true, false],
@@ -14746,7 +15223,7 @@ mod crash_recovery_tests {
             })
         };
 
-        let resp1 = app.build_proposal(torus_bridge::genesis_parent_header());
+        let resp1 = app.build_proposal(default_genesis_header());
         let hs1 = Block::new(
             hotstuff_rs::types::data_types::BlockHeight::new(0),
             PhaseCertificate::genesis_pc(),
@@ -14775,6 +15252,7 @@ mod crash_recovery_tests {
             &state_db,
             2,
             &block2.header.parent_hash,
+            &ctx.genesis_header,
             &latch
         ));
         ctx.execute_committed_block(&block2, vec![]);
@@ -14792,6 +15270,7 @@ mod crash_recovery_tests {
             &state_db,
             3,
             &forged.header.parent_hash,
+            &ctx.genesis_header,
             &AtomicBool::new(false)
         ));
         let hs2_block = Block::new(
@@ -20605,9 +21084,13 @@ mod crash_recovery_tests {
         let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
         let header = parent.header.clone();
         assert_eq!(
-            check_parent_link(&far.header, &justify_for(&hs_parent), move |_| {
-                ParentHeader::Header(Box::new(header))
-            }),
+            check_parent_link(
+                &far.header,
+                &justify_for(&hs_parent),
+                &app.genesis_header,
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None)
+            ),
             BlockDataCheck::Held
         );
         let datum = encode_proposal_datum(&far, false);
@@ -20646,9 +21129,13 @@ mod crash_recovery_tests {
         for (ts, want) in [(2_000, BlockDataCheck::Held), (1_999, BlockDataCheck::Invalid)] {
             let header = parent.header.clone();
             assert_eq!(
-                check_parent_link(&child_of(&parent, ts).header, &justify_for(&hs_parent), move |_| {
-                    ParentHeader::Header(Box::new(header))
-                }),
+                check_parent_link(
+                    &child_of(&parent, ts).header,
+                    &justify_for(&hs_parent),
+                    &app.genesis_header,
+                    move |_| ParentHeader::Header(Box::new(header)),
+                    |_| Ok(None)
+                ),
                 want,
                 "ts {ts}"
             );
@@ -20784,20 +21271,25 @@ mod crash_recovery_tests {
             );
             let header = parent.header.clone();
             assert_eq!(
-                check_parent_link(&b.header, &justify_for(&hs_parent), move |_| {
-                    ParentHeader::Header(Box::new(header))
-                }),
+                check_parent_link(
+                    &b.header,
+                    &justify_for(&hs_parent),
+                    &app.genesis_header,
+                    move |_| ParentHeader::Header(Box::new(header)),
+                    |_| Ok(None)
+                ),
                 BlockDataCheck::Invalid,
                 "{what}: parent link"
             );
         }
 
-        // First block: the parent is genesis_parent_header (30M, 1 gwei).
+        // First block: the parent is the genesis parent header (the config's
+        // genesis values: 3M, 1 gwei).
         let mut app = ts_app(1_700_000_000);
         let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
         let mut b1 = make_block(1, vec![]);
         b1.header.timestamp = 1_700_000_000;
-        let genesis = torus_bridge::genesis_parent_header();
+        let genesis = default_genesis_header();
         assert_eq!(b1.header.evm_gas_limit, genesis.evm_gas_limit);
         assert_eq!(b1.header.base_fee_per_gas, genesis.base_fee_per_gas);
         assert_eq!(
@@ -20807,6 +21299,49 @@ mod crash_recovery_tests {
         b1.header.evm_gas_limit = 60_000_000;
         assert_eq!(
             app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Invalid
+        );
+    }
+
+    /// Item 7 step 1: the genesis parent header comes from the chain config
+    /// (`evm.gas_limit`, `evm.block_interval`), built once in `try_new`. The
+    /// first block an honest leader builds carries those values and passes
+    /// the pre-vote check under a genesis justify; the same block built on a
+    /// 30M genesis header is refused. RED before: the genesis parent header
+    /// was hardcoded to 30M.
+    #[test]
+    fn first_block_uses_the_configured_genesis_header() {
+        let (mut config, db) = make_test_config_and_db();
+        config.evm_gas_limit = 3_000_000;
+        config.evm_block_interval = 5;
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        let genesis_hs = |resp: &ProduceBlockResponse| {
+            Block::new(
+                hotstuff_rs::types::data_types::BlockHeight::new(0),
+                PhaseCertificate::genesis_pc(),
+                resp.data_hash,
+                resp.data.clone(),
+            )
+        };
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+
+        let genesis = app.last_header.clone();
+        let resp = app.build_proposal(genesis);
+        let header = app.pending_proposals[&1].block.header.clone();
+        assert_eq!(header.evm_gas_limit, 3_000_000);
+        assert_eq!(header.evm_block_interval, 5);
+        assert_eq!(
+            app.check_proposal_data(&genesis_hs(&resp), no_lookup),
+            BlockDataCheck::Held
+        );
+
+        let resp = app.build_proposal(torus_bridge::genesis_parent_header(30_000_000, 5));
+        assert_eq!(
+            app.pending_proposals[&1].block.header.evm_gas_limit,
+            30_000_000
+        );
+        assert_eq!(
+            app.check_proposal_data(&genesis_hs(&resp), no_lookup),
             BlockDataCheck::Invalid
         );
     }
@@ -20899,24 +21434,22 @@ mod crash_recovery_tests {
                 ..torus_mempool::MempoolConfig::default()
             },
         ));
+        // Item 7 step 1: 1M-gas txs under the 3M genesis limit (was 10M under 30M),
+        // on the height-4 tip, so the child is at height 5 (on the N = 5 cadence).
         for nonce in 0..4 {
-            mempool.add_evm_tx(evm_tx_gas(nonce, 10_000_000)).unwrap();
+            mempool.add_evm_tx(evm_tx_gas(nonce, 1_000_000)).unwrap();
         }
         let mut app = TorusApp::new(db, &config, None, Some(mempool), None);
-        let parent = TorusBlock {
-            header: app.last_header.clone(),
-            native_actions: vec![],
-            evm_transactions: vec![],
-            core_writer_actions: vec![],
-        };
+        let parent = tip_2000();
+        let limit = parent.header.evm_gas_limit;
         let resp = app.build_proposal(parent.header.clone());
         let produced = app.pending_proposals[&(parent.header.height + 1)]
             .block
             .clone();
         assert_eq!(
-            produced.evm_transactions.len(),
-            3,
-            "30M header limit fits three 10M txs"
+            produced.evm_transactions.len() as u64,
+            limit / 1_000_000,
+            "the 3M header limit fits three 1M txs"
         );
         assert_eq!(produced.header.evm_tx_count, 3);
         assert_eq!(produced.header.evm_gas_limit, parent.header.evm_gas_limit);
@@ -20937,6 +21470,695 @@ mod crash_recovery_tests {
             app.check_proposal_data(&hs, move |_| ParentHeader::Header(Box::new(header))),
             BlockDataCheck::Held
         );
+    }
+
+    // ---- item 7 step 1: EVM header values at epoch boundaries, cadence ----
+
+    /// `check_parent_link` of `block` on `parent` (a non-genesis justify),
+    /// `boundary` looking up the epoch plan's EVM values.
+    fn link_on(
+        app: &TorusApp,
+        parent: &TorusBlock,
+        block: &TorusBlock,
+        boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
+    ) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        check_parent_link(
+            &block.header,
+            &justify_for(&hs_parent),
+            &app.genesis_header,
+            move |_| ParentHeader::Header(Box::new(header)),
+            boundary,
+        )
+    }
+
+    /// `child_of(parent)` with the header EVM gas limit `gas_limit` and N `n`.
+    fn evm_header_child(parent: &TorusBlock, gas_limit: u64, n: u64) -> TorusBlock {
+        let mut b = child_of(parent, parent.header.timestamp);
+        b.header.evm_gas_limit = gas_limit;
+        b.header.evm_block_interval = n;
+        b
+    }
+
+    /// An app on a fresh test DB with epoch length 4 and its clock at `now`,
+    /// plus the DB and the config (for an execution context on the same DB).
+    fn epoch4_app(now: u64) -> (TorusApp, StateDb, ChainConfig) {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        app.test_now_secs = Some(now);
+        (app, db, config)
+    }
+
+    /// Item 7 step 1: at an epoch boundary the header's EVM gas limit and N
+    /// equal the epoch plan's (an unset value: the parent's). A pure header
+    /// check, the plan lookup is a closure. RED before: `check_parent_link`
+    /// had no plan lookup and required the parent's gas limit.
+    #[test]
+    fn boundary_header_must_equal_the_plans_evm_params() {
+        let parent = tip_2000();
+        let app = ts_app(2_010);
+        let (pg, pn) = (
+            parent.header.evm_gas_limit,
+            parent.header.evm_block_interval,
+        );
+        let link = |gas_limit, n, plan: PlanEvm| {
+            let b = evm_header_child(&parent, gas_limit, n);
+            link_on(&app, &parent, &b, move |_| Ok(Some(plan)))
+        };
+        let full = PlanEvm {
+            gas_limit: Some(5_000_000),
+            block_interval: Some(10),
+        };
+        assert_eq!(link(5_000_000, 10, full), BlockDataCheck::Held);
+        for (gas_limit, n, what) in [
+            (pg, pn, "the parent's values"),
+            (5_000_000, pn, "the plan's gas limit, the parent's N"),
+            (pg, 10, "the parent's gas limit, the plan's N"),
+        ] {
+            assert_eq!(link(gas_limit, n, full), BlockDataCheck::Invalid, "{what}");
+        }
+        let gas_only = PlanEvm {
+            gas_limit: Some(5_000_000),
+            block_interval: None,
+        };
+        assert_eq!(
+            link(5_000_000, pn, gas_only),
+            BlockDataCheck::Held,
+            "N stays the parent's"
+        );
+        assert_eq!(link(5_000_000, 10, gas_only), BlockDataCheck::Invalid);
+        assert_eq!(link(pg, pn, gas_only), BlockDataCheck::Invalid);
+    }
+
+    /// Off a boundary the EVM gas limit and N equal the parent's, before the
+    /// vote and in `check_parent_link` (so also at insertion). RED before: N
+    /// was not checked.
+    #[test]
+    fn off_boundary_header_must_equal_the_parents_evm_params() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_010);
+        assert_eq!(app.boundary_evm(5), Ok(None), "5 is no boundary (L = 100)");
+        let honest = child_of(&parent, 2_000);
+        assert_eq!(pre_vote(&mut app, &parent, &honest), BlockDataCheck::Held);
+        assert_eq!(
+            link_on(&app, &parent, &honest, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        type Change = fn(&mut TorusBlockHeader);
+        let variants: [(&str, Change); 4] = [
+            ("N raised", |h| h.evm_block_interval += 1),
+            ("N lowered", |h| h.evm_block_interval -= 1),
+            ("gas limit raised", |h| h.evm_gas_limit += 1),
+            ("gas limit lowered", |h| h.evm_gas_limit -= 1),
+        ];
+        for (what, change) in variants {
+            let mut b = honest.clone();
+            change(&mut b.header);
+            assert_eq!(
+                pre_vote(&mut app, &parent, &b),
+                BlockDataCheck::Invalid,
+                "{what}"
+            );
+            assert_eq!(
+                link_on(&app, &parent, &b, |h| app.boundary_evm(h)),
+                BlockDataCheck::Invalid,
+                "{what}: parent link"
+            );
+        }
+    }
+
+    /// The first boundary (L) has no plan: its header keeps the parent's EVM
+    /// values, before the vote and at insertion.
+    #[test]
+    fn boundary_without_a_plan_keeps_the_parents_evm_params() {
+        let (mut app, _db, _config) = epoch4_app(1_010);
+        assert_eq!(app.boundary_evm(4), Ok(None), "first boundary: no plan");
+        let parent = make_block(3, vec![]);
+        let (pg, pn) = (
+            parent.header.evm_gas_limit,
+            parent.header.evm_block_interval,
+        );
+        for (gas_limit, n, want) in [
+            (pg, pn, BlockDataCheck::Held),
+            (5_000_000, pn, BlockDataCheck::Invalid),
+            (pg, 10, BlockDataCheck::Invalid),
+        ] {
+            let b = evm_header_child(&parent, gas_limit, n);
+            assert_eq!(b.header.height, 4);
+            assert_eq!(
+                pre_vote(&mut app, &parent, &b),
+                want,
+                "pre-vote {gas_limit} / {n}"
+            );
+            assert_eq!(
+                link_on(&app, &parent, &b, |h| app.boundary_evm(h)),
+                want,
+                "link {gas_limit} / {n}"
+            );
+        }
+    }
+
+    /// A boundary whose plan this node cannot read yet (execution has not
+    /// applied the previous boundary) is `Missing`, before the vote and at
+    /// insertion: never a guess. A header that does not link is `Invalid`
+    /// and never waits on the plan.
+    #[test]
+    fn boundary_plan_not_ready_is_missing_before_the_vote_and_at_insertion() {
+        let parent = tip_2000();
+        let app = ts_app(2_010);
+        let honest = child_of(&parent, 2_000);
+        assert_eq!(
+            link_on(&app, &parent, &honest, |_| Err(EpochPlanNotReady)),
+            BlockDataCheck::Missing
+        );
+        let mut unlinked = honest.clone();
+        unlinked.header.height += 1;
+        assert_eq!(
+            link_on(
+                &app,
+                &parent,
+                &unlinked,
+                |_| -> Result<Option<PlanEvm>, EpochPlanNotReady> {
+                    panic!("a header that does not link never reads the plan")
+                }
+            ),
+            BlockDataCheck::Invalid
+        );
+
+        let (mut app, db, config) = epoch4_app(1_010);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=3 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        assert_eq!(read_native_applied_height(&db), Some(3));
+        assert_eq!(app.boundary_evm(8), Err(EpochPlanNotReady), "applied 3 < 4");
+        let parent7 = make_block(7, vec![]);
+        let block8 = child_of(&parent7, parent7.header.timestamp);
+        assert_eq!(
+            pre_vote(&mut app, &parent7, &block8),
+            BlockDataCheck::Missing
+        );
+        assert_eq!(
+            link_on(&app, &parent7, &block8, |h| app.boundary_evm(h)),
+            BlockDataCheck::Missing
+        );
+        drop(ctx);
+    }
+
+    /// From 2L on every boundary has a plan until the next boundary's
+    /// execution prunes it. An absent plan there is `EpochPlanNotReady`,
+    /// never "no change": a replica must not judge the header against the
+    /// parent's values when the quorum used the plan's.
+    #[test]
+    fn pruned_boundary_plan_is_not_read_as_no_change() {
+        let (app, db, config) = epoch4_app(1_020);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=12 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(12));
+        assert_eq!(
+            app.staking.epoch_rotation_plan(8).unwrap(),
+            None,
+            "plan(8) pruned when 12 executed"
+        );
+        assert_eq!(app.boundary_evm(8), Err(EpochPlanNotReady));
+        assert_eq!(
+            app.boundary_evm(12),
+            Ok(Some(PlanEvm::default())),
+            "plan(12) kept until 16 executes"
+        );
+        drop(ctx);
+    }
+
+    /// The EVM signer with key bytes `[seed; 32]`, funded with 1 ETH in `db`.
+    fn funded_evm_signer(db: &StateDb, seed: u8) -> k256::ecdsa::SigningKey {
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        let sender = {
+            let pubkey = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+        };
+        db.put_account(
+            &sender,
+            &revm::state::AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        key
+    }
+
+    /// A pool holding txs of the funded `evm_tx_gas` sender (key 71), with no
+    /// proposer budget or sender-share cap.
+    fn funded_evm_mempool(db: &StateDb) -> Arc<Mempool> {
+        funded_evm_signer(db, 71);
+        Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig {
+                evm_block_gas_budget: u64::MAX,
+                evm_sender_share_pct: 0,
+                ..torus_mempool::MempoolConfig::default()
+            },
+        ))
+    }
+
+    /// Item 7 step 1: off the N = 5 cadence the leader drains no EVM tx
+    /// (`drain_evm` is destructive), so they stay pooled; the next EVM height
+    /// takes them. RED before: every height drained the pool.
+    #[test]
+    fn off_cadence_proposal_has_no_evm_txs_and_leaves_them_pooled() {
+        let (config, db) = make_test_config_and_db();
+        let mempool = funded_evm_mempool(&db);
+        for nonce in 0..2 {
+            mempool.add_evm_tx(evm_tx_gas(nonce, 100_000)).unwrap();
+        }
+        let mut app = TorusApp::new(db, &config, None, Some(mempool.clone()), None);
+
+        let _ = app.build_proposal(make_block(3, vec![]).header);
+        let off = &app.pending_proposals[&4].block;
+        assert!(
+            off.evm_transactions.is_empty(),
+            "height 4 is off the cadence"
+        );
+        assert_eq!(off.header.evm_tx_count, 0);
+        assert_eq!(mempool.evm_pool_size(), 2, "the txs stay pooled");
+
+        let _ = app.build_proposal(tip_2000().header);
+        let on = &app.pending_proposals[&5].block;
+        assert_eq!(on.evm_transactions.len(), 2, "height 5 takes both");
+        assert_eq!(on.header.evm_tx_count, 2);
+        assert_eq!(mempool.evm_pool_size(), 0);
+    }
+
+    /// Item 7 step 1 end to end (L = 4): governance rows present when
+    /// boundary 4 executes reach plan(8); the leader builds block 8 with
+    /// them, the link check accepts it and refuses other values; block 9
+    /// keeps them (off a boundary: the parent's). Rows that land after 4
+    /// executed (in block 5) leave plan(8) at "no change" and reach plan(12).
+    #[test]
+    fn governance_evm_params_reach_the_header_at_the_next_boundary_plus_l() {
+        use torus_state::cf::CF_FEE_CONFIG;
+        let changed = PlanEvm {
+            gas_limit: Some(5_000_000),
+            block_interval: Some(10),
+        };
+        let put_rows = |db: &StateDb| {
+            for (key, value) in [
+                (torus_types::EVM_BLOCK_GAS_LIMIT_PARAM, "5000000"),
+                (torus_types::EVM_BLOCK_INTERVAL_PARAM, "10"),
+            ] {
+                db.put_cf_raw(CF_FEE_CONFIG, key.as_bytes(), value.as_bytes())
+                    .unwrap();
+            }
+        };
+        let evm_values = |b: &TorusBlock| (b.header.evm_gas_limit, b.header.evm_block_interval);
+
+        let (mut app, db, config) = epoch4_app(1_010);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=3 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        put_rows(&db);
+        dispatch_and_execute(&ctx, &db, &make_block(4, vec![]));
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(app.boundary_evm(8), Ok(Some(changed)));
+
+        let parent7 = make_block(7, vec![]);
+        let _ = app.build_proposal(parent7.header.clone());
+        let block8 = app.pending_proposals[&8].block.clone();
+        assert_eq!(evm_values(&block8), (5_000_000, 10));
+        assert_eq!(
+            link_on(&app, &parent7, &block8, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        let mut at_30m = block8.clone();
+        at_30m.header.evm_gas_limit = 30_000_000;
+        assert_eq!(
+            link_on(&app, &parent7, &at_30m, |h| app.boundary_evm(h)),
+            BlockDataCheck::Invalid
+        );
+        let (pg, pn) = evm_values(&parent7);
+        let unchanged = evm_header_child(&parent7, pg, pn);
+        assert_eq!(
+            link_on(&app, &parent7, &unchanged, |h| app.boundary_evm(h)),
+            BlockDataCheck::Invalid,
+            "the parent's values at the boundary"
+        );
+
+        let _ = app.build_proposal(block8.header.clone());
+        let block9 = app.pending_proposals[&9].block.clone();
+        assert_eq!(evm_values(&block9), (5_000_000, 10));
+        assert_eq!(
+            link_on(&app, &block8, &block9, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        let reverted = evm_header_child(&block8, pg, pn);
+        assert_eq!(
+            link_on(&app, &block8, &reverted, |h| app.boundary_evm(h)),
+            BlockDataCheck::Invalid,
+            "block 9 keeps the boundary's values"
+        );
+        drop(ctx);
+
+        // Rows executed in block 5: plan(8) was written by 4 without them.
+        let (app, db, config) = epoch4_app(1_020);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=4 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        put_rows(&db);
+        for h in 5..=8 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(app.boundary_evm(8), Ok(Some(PlanEvm::default())));
+        assert_eq!(app.boundary_evm(12), Ok(Some(changed)));
+        drop(ctx);
+    }
+
+    /// Item 7 step 1: EVM txs only in blocks at `height % N == 0`, before the
+    /// vote (full and compact datums). Insertion does not enforce the cadence
+    /// (a certified block had f + 1 honest votes): `validate_datum` of the
+    /// off-cadence block stays `Valid`. A header N of 0 carries no EVM tx,
+    /// without a panic. RED before: off-cadence EVM txs were `Held`.
+    #[test]
+    fn evm_txs_off_the_cadence_are_refused_before_the_vote() {
+        let parent3 = make_block(3, vec![]);
+        let parent4 = tip_2000();
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            let off = evm_child_of(&parent3, vec![evm_tx_gas(0, 21_000)]);
+            assert_eq!(off.header.height, 4);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent3, &off, compact),
+                BlockDataCheck::Invalid,
+                "EVM at height 4 (compact={compact})"
+            );
+            assert_eq!(
+                pre_vote_as(&mut app, &parent3, &evm_child_of(&parent3, vec![]), compact),
+                BlockDataCheck::Held,
+                "no EVM at height 4 (compact={compact})"
+            );
+            let on = evm_child_of(&parent4, vec![evm_tx_gas(0, 21_000)]);
+            assert_eq!(on.header.height, 5);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent4, &on, compact),
+                BlockDataCheck::Held,
+                "EVM at height 5 (compact={compact})"
+            );
+
+            // N = 0 on parent and child: the link holds, only the cadence refuses.
+            let mut parent_n0 = tip_2000();
+            parent_n0.header.evm_block_interval = 0;
+            let mut n0 = evm_child_of(&parent_n0, vec![evm_tx_gas(0, 21_000)]);
+            n0.header.evm_block_interval = 0;
+            assert_eq!(
+                pre_vote_as(&mut app, &parent_n0, &n0, compact),
+                BlockDataCheck::Invalid,
+                "EVM under N = 0 (compact={compact})"
+            );
+            let mut n0_empty = evm_child_of(&parent_n0, vec![]);
+            n0_empty.header.evm_block_interval = 0;
+            assert_eq!(
+                pre_vote_as(&mut app, &parent_n0, &n0_empty, compact),
+                BlockDataCheck::Held,
+                "no EVM under N = 0 (compact={compact})"
+            );
+        }
+
+        let off = evm_child_of(&parent3, vec![evm_tx_gas(0, 21_000)]);
+        let datum = encode_proposal_datum(&off, false);
+        assert!(
+            matches!(
+                app.validate_datum(&datum, &data_hash_of(&datum)),
+                ValidateBlockResponse::Valid { .. }
+            ),
+            "insertion does not enforce the cadence"
+        );
+    }
+
+    /// Item 7 step 1: at most `evm_gas_limit / 21,000` EVM txs before the vote.
+    /// Undecodable txs declare no gas, so the gas rule alone does not bound
+    /// them. RED before: any count of garbage txs was `Held`.
+    #[test]
+    fn evm_tx_count_over_limit_per_21000_is_refused_before_the_vote() {
+        let parent = tip_2000();
+        let limit = parent.header.evm_gas_limit;
+        let max_txs = (limit / torus_types::EVM_MIN_TX_GAS) as usize;
+        assert_eq!(max_txs, 142, "3M / 21,000");
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            let at_cap = evm_child_of(&parent, vec![vec![0xff; 8]; max_txs]);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &at_cap, compact),
+                BlockDataCheck::Held,
+                "{max_txs} txs (compact={compact})"
+            );
+            let over = evm_child_of(&parent, vec![vec![0xff; 8]; max_txs + 1]);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &over, compact),
+                BlockDataCheck::Invalid,
+                "{} txs (compact={compact})",
+                max_txs + 1
+            );
+        }
+    }
+
+    /// Item 7 step 1: at most 256 KiB of raw EVM tx bytes per block before the
+    /// vote, one tx or several. RED before: the size was not checked.
+    #[test]
+    fn evm_tx_bytes_over_256_kib_are_refused_before_the_vote() {
+        let parent = tip_2000();
+        let max = torus_types::MAX_EVM_BLOCK_TX_BYTES;
+        assert_eq!(max, 262_144);
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            for (txs, want, what) in [
+                (
+                    vec![vec![0xff; max]],
+                    BlockDataCheck::Held,
+                    "one tx of 256 KiB",
+                ),
+                (
+                    vec![vec![0xff; max + 1]],
+                    BlockDataCheck::Invalid,
+                    "one tx of 256 KiB + 1",
+                ),
+                (
+                    vec![vec![0xff; max / 2], vec![0xff; max / 2 + 1]],
+                    BlockDataCheck::Invalid,
+                    "two halves + 1",
+                ),
+            ] {
+                let b = evm_child_of(&parent, txs);
+                assert_eq!(
+                    pre_vote_as(&mut app, &parent, &b, compact),
+                    want,
+                    "{what} (compact={compact})"
+                );
+            }
+        }
+    }
+
+    /// An app whose pool holds `n` txs of the funded `evm_tx_gas` sender
+    /// (nonces 0.., 100k gas each), with a recording exec channel. Returns the
+    /// app, the receiver, the pool and the txs.
+    fn evm_pool_app_with_recording_exec(
+        n: u64,
+    ) -> (
+        TorusApp,
+        std::sync::mpsc::Receiver<CommittedBlockMsg>,
+        Arc<Mempool>,
+        Vec<Vec<u8>>,
+    ) {
+        let (config, db) = make_test_config_and_db();
+        let mempool = funded_evm_mempool(&db);
+        let txs: Vec<Vec<u8>> = (0..n).map(|nonce| evm_tx_gas(nonce, 100_000)).collect();
+        for tx in &txs {
+            mempool.add_evm_tx(tx.clone()).unwrap();
+        }
+        let mut app = TorusApp::new(db, &config, None, Some(mempool.clone()), None);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
+        app.replace_exec_tx(tx);
+        (app, rx, mempool, txs)
+    }
+
+    fn sorted(mut txs: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        txs.sort();
+        txs
+    }
+
+    /// Item 7 step 1: a committed block's header EVM gas limit becomes the
+    /// mempool's admission cap once the block is dispatched to execution (the
+    /// limit can change at an epoch boundary by governance). RED before: the
+    /// cap stayed at the mempool config's limit (3M).
+    #[test]
+    fn committed_header_sets_mempool_gas_cap() {
+        let (mut app, rx, mempool, _) = evm_pool_app_with_recording_exec(0);
+        let x = 5_000_000;
+        assert!(
+            matches!(
+                mempool.add_evm_tx(evm_tx_gas(0, x)),
+                Err(torus_mempool::MempoolError::GasLimitExceeded { .. })
+            ),
+            "the 3M genesis limit caps admission before the commit"
+        );
+        let mut b5 = make_block(5, vec![]);
+        b5.header.evm_gas_limit = x;
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert!(
+            matches!(
+                mempool.add_evm_tx(evm_tx_gas(0, x + 1)),
+                Err(torus_mempool::MempoolError::GasLimitExceeded { tx_gas, block_gas })
+                    if tx_gas == x + 1 && block_gas == x
+            ),
+            "a tx above the committed header's limit fails admission"
+        );
+        mempool
+            .add_evm_tx(evm_tx_gas(0, x))
+            .expect("a tx at the committed header's limit is admitted");
+    }
+
+    /// Item 7 step 1: the EVM txs drained into our proposal at height 5 return
+    /// to the pool when another block commits there, minus the txs that block
+    /// carries. RED before: `drain_evm` is destructive and nothing reinserted
+    /// them, so the pool stayed empty.
+    #[test]
+    fn lost_proposal_evm_txs_return_to_the_pool_when_another_block_commits() {
+        let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(3);
+        let _ = app.build_proposal(tip_2000().header);
+        assert_eq!(app.pending_proposals[&5].block.evm_transactions.len(), 3);
+        assert_eq!(mempool.evm_pool_size(), 0, "drained into our proposal");
+
+        app.exec_next_height = Some(5);
+        let other = committed_compact_block(&evm_child_of(&tip_2000(), vec![txs[0].clone()]));
+        app.on_committed_block(&other, other.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert_eq!(
+            sorted(mempool.drain_evm(u64::MAX, B256::ZERO)),
+            sorted(vec![txs[1].clone(), txs[2].clone()]),
+            "the lost txs are pooled again, the committed one is not"
+        );
+    }
+
+    /// Our own proposal committed: its txs are in the chain, none goes back.
+    #[test]
+    fn own_committed_proposal_reinserts_nothing() {
+        let (mut app, rx, mempool, _) = evm_pool_app_with_recording_exec(3);
+        let _ = app.build_proposal(tip_2000().header);
+        let own = app.pending_proposals[&5].block.clone();
+        assert_eq!(own.evm_transactions.len(), 3);
+
+        app.exec_next_height = Some(5);
+        let committed = committed_compact_block(&own);
+        app.on_committed_block(&committed, committed.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert_eq!(mempool.evm_pool_size(), 0);
+        assert!(app.own_evm_proposed.is_empty(), "height 5 settled");
+    }
+
+    /// `pending_proposals[5]` is overwritten when another proposer's block at
+    /// 5 validates, so it cannot be the record of what we drained: the lost
+    /// txs still return when that block commits.
+    #[test]
+    fn lost_proposal_overwritten_by_another_validated_block_still_reinserts() {
+        let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(3);
+        let _ = app.build_proposal(tip_2000().header);
+        assert_eq!(mempool.evm_pool_size(), 0, "drained into our proposal");
+        let other = evm_child_of(&tip_2000(), vec![]);
+        assert!(matches!(
+            app.finish_validate(other.clone()),
+            ValidateBlockResponse::Valid { .. }
+        ));
+        assert!(
+            app.pending_proposals[&5].block.evm_transactions.is_empty(),
+            "our proposal's entry was overwritten"
+        );
+
+        app.exec_next_height = Some(5);
+        let committed = committed_compact_block(&other);
+        app.on_committed_block(&committed, committed.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert_eq!(sorted(mempool.drain_evm(u64::MAX, B256::ZERO)), sorted(txs));
+    }
+
+    /// The proposer keeps a block's EVM tx bytes within the 256 KiB vote cap.
+    /// Two 200 KiB zero-calldata calls from two senders fit the 3M limit
+    /// (2 x 1.2M gas) but not the cap: the block at height 5 carries one and
+    /// passes the pre-vote check, the other stays pooled. RED before: it
+    /// carried both, and every honest validator refused it.
+    #[test]
+    fn honest_proposal_keeps_evm_tx_bytes_within_the_vote_cap() {
+        let (config, db) = make_test_config_and_db();
+        let mempool = funded_evm_mempool(&db);
+        let keys = [
+            k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap(),
+            funded_evm_signer(&db, 72),
+        ];
+        let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
+        for key in &keys {
+            let tx = signed_eip1559_gas(key, 0, to, vec![0u8; 200 * 1024], U256::ZERO, 1_200_000);
+            mempool.add_evm_tx(tx).unwrap();
+        }
+        let mut app = TorusApp::new(db, &config, None, Some(mempool.clone()), None);
+        let parent = tip_2000();
+        let _ = app.build_proposal(parent.header.clone());
+        let produced = app.pending_proposals[&5].block.clone();
+        assert_eq!(produced.evm_transactions.len(), 1, "one 200 KiB tx fits");
+        assert_eq!(mempool.evm_pool_size(), 1, "the other stays pooled");
+        assert_eq!(pre_vote(&mut app, &parent, &produced), BlockDataCheck::Held);
+    }
+
+    /// Our proposal at 5 drained the sender's nonce 0, then nonce 1 arrived.
+    /// A re-proposal at 5 (the first got no QC) carries nonce 0 before nonce
+    /// 1: the txs of our earlier proposal at that height go back to the pool
+    /// first. Whichever of the two commits, nothing is lost. RED before: the
+    /// re-proposal carried nonce 1 alone, which execution skips (nonce gap),
+    /// and if it committed, the reinsert filtered nonce 1 out as committed.
+    #[test]
+    fn same_height_reproposal_keeps_the_senders_nonce_order() {
+        for first_commits in [false, true] {
+            let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(1);
+            let _ = app.build_proposal(tip_2000().header);
+            let first = app.pending_proposals[&5].block.clone();
+            assert_eq!(first.evm_transactions, txs);
+            let n1 = evm_tx_gas(1, 100_000);
+            mempool.add_evm_tx(n1.clone()).unwrap();
+
+            let _ = app.build_proposal(tip_2000().header);
+            let again = app.pending_proposals[&5].block.clone();
+            assert_eq!(
+                again.evm_transactions,
+                vec![txs[0].clone(), n1.clone()],
+                "nonce 0 before nonce 1"
+            );
+
+            let (winner, pooled) = if first_commits {
+                (first, vec![n1])
+            } else {
+                (again, vec![])
+            };
+            app.exec_next_height = Some(5);
+            let committed = committed_compact_block(&winner);
+            app.on_committed_block(&committed, committed.hash);
+            rx.try_recv().expect("height 5 must reach execution");
+            assert_eq!(
+                mempool.drain_evm(u64::MAX, B256::ZERO),
+                pooled,
+                "first_commits={first_commits}"
+            );
+            assert!(app.own_evm_proposed.is_empty(), "height 5 settled");
+        }
     }
 
     // ---- item 2: oracle helpers ----
@@ -23342,26 +24564,44 @@ mod crash_recovery_tests {
         let parent = alloy_primitives::B256::repeat_byte(0x22);
         let latch = AtomicBool::new(false);
         assert!(
-            detect_parent_link_violation(&R02FailHeaders(db.clone()), 6, &parent, &latch),
+            detect_parent_link_violation(
+                &R02FailHeaders(db.clone()),
+                6,
+                &parent,
+                &default_genesis_header(),
+                &latch
+            ),
             "a parent header read fault must fail-stop"
         );
         assert!(latch.load(Ordering::SeqCst), "fail-stop latched");
 
         // Control: no read at height 1; a missing / truncated parent allows.
         let latch = AtomicBool::new(false);
-        let genesis = alloy_primitives::keccak256(
-            torus_bridge::genesis_parent_header().canonical_header_bytes(),
-        );
+        let genesis_header = default_genesis_header();
+        let genesis = alloy_primitives::keccak256(genesis_header.canonical_header_bytes());
         assert!(!detect_parent_link_violation(
             &R02FailHeaders(db.clone()),
             1,
             &genesis,
+            &genesis_header,
             &latch
         ));
-        assert!(!detect_parent_link_violation(&db, 6, &parent, &latch));
+        assert!(!detect_parent_link_violation(
+            &db,
+            6,
+            &parent,
+            &genesis_header,
+            &latch
+        ));
         db.put_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes(), &[0u8; 8])
             .unwrap();
-        assert!(!detect_parent_link_violation(&db, 6, &parent, &latch));
+        assert!(!detect_parent_link_violation(
+            &db,
+            6,
+            &parent,
+            &genesis_header,
+            &latch
+        ));
         assert!(!latch.load(Ordering::SeqCst));
     }
 
@@ -23785,6 +25025,17 @@ mod crash_recovery_tests {
         app.cached_vs_updates = None;
         app.test_applied_read_fault = true;
         assert!(app.epoch_validator_set_updates(boundary).is_err());
+    }
+
+    /// R02, item 7 step 1: the boundary EVM values read the same marker; a
+    /// failed read is EpochPlanNotReady, never "applied = 0".
+    #[test]
+    fn r02_applied_height_read_fault_boundary_evm_not_ready() {
+        let mut app = TorusApp::stub();
+        let boundary = app.epoch_length;
+        assert_eq!(app.boundary_evm(boundary), Ok(None), "control");
+        app.test_applied_read_fault = true;
+        assert_eq!(app.boundary_evm(boundary), Err(EpochPlanNotReady));
     }
 
     /// R02 branch 3: a local fault recorded by a reader without `&mut ctx`
@@ -25809,6 +27060,264 @@ mod crash_recovery_tests {
             &dump_all_cfs(&db_ref),
             &dump_all_cfs(&db),
             "1-byte cap vs per-block",
+        );
+    }
+
+    // ---- s124 epoch-boundary fast path (TORUS_EPOCH_FAST_PATH) ----
+
+    /// One run of [`fast_path_run`].
+    struct FastPathRun {
+        db: StateDb,
+        /// Every hashed block's consensus write set.
+        captured: CapturedWrites,
+        /// The durable marker after each block (W idle).
+        markers: Vec<Option<u64>>,
+        /// The heights whose block took the pipelined path.
+        pipelined: Vec<u64>,
+        /// The persisted native root after shutdown.
+        root: torus_types::B256,
+    }
+
+    /// The permanent staker of [`fast_path_run`]: its reward credits an EVM
+    /// account at every boundary (`CF_ACCOUNTS`), so the boundary's dirty
+    /// EVM accounts are not empty and the mirror resync runs (F2).
+    fn fast_path_staker() -> Address {
+        Address::repeat_byte(0x55)
+    }
+
+    /// s124 epoch fast path: `pipeline_fixture_blocks` (13 blocks, epoch
+    /// length 4: boundaries 4 / 8 / 12) plus a permanent stake, with an EVM
+    /// tx in block `evm_at` and a buffered slash at `slash_at`, on a context
+    /// with W (`on`), checkpoint `policy` and `TORUS_EPOCH_FAST_PATH` =
+    /// `fast`. A block took the pipelined path iff `last_job` is its frozen
+    /// set right after it: a barrier clears `last_job` and the serial path
+    /// never sets it.
+    fn fast_path_run(
+        on: bool,
+        fast: bool,
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+        evm_at: Option<u64>,
+        slash_at: Option<u64>,
+    ) -> FastPathRun {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let validator = Address::repeat_byte(0x77);
+        let mut blocks = pipeline_fixture_blocks();
+        if let Some(h) = evm_at {
+            let b = &mut blocks[h as usize - 1];
+            b.evm_transactions = vec![signed_sstore_create(&key, 0)];
+            b.header.evm_tx_count = 1;
+        }
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        db.put_account(
+            &k256_address(&key),
+            &revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        register_proposer(&db, validator);
+        let stake = U256::from(10u128.pow(18));
+        fund_evm_balance(&db, fast_path_staker(), stake);
+        StakingManager::new(db.clone())
+            .permanent_stake(fast_path_staker(), stake, 0)
+            .unwrap();
+        // The EVM trie over the accounts written above, as the node builds it
+        // at boot: otherwise the first resync (the staker's reward at 4)
+        // starts a partial trie and the EVM block's incremental root fails
+        // its full-scan cross-check. With it, a resync W missed would too.
+        torus_state::incremental::ensure_trie_built(&db).unwrap();
+        torus_state::running_hash::capture_begin(&db);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = policy;
+        ctx.epoch_fast_path = fast;
+        if on {
+            ctx.attach_flush_worker(None);
+        }
+        let (mut markers, mut pipelined) = (Vec::new(), Vec::new());
+        for b in &blocks {
+            let h = b.header.height;
+            let durable = persist_committed_block_durably(&db, b);
+            let slashes = if slash_at == Some(h) {
+                vec![PendingSlash {
+                    validator,
+                    fraction_bps: 500,
+                    reason: SlashReason::DoubleSign,
+                    tombstone: false,
+                }]
+            } else {
+                vec![]
+            };
+            ctx.execute_committed_block_with(b, slashes, durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            let top = ctx.last_job.lock().unwrap().as_ref().map(|p| p.height());
+            if top == Some(h) {
+                pipelined.push(h);
+            }
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            markers.push(read_native_applied_height(&db));
+        }
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+        let root = torus_state::native_trie::persisted_native_root(&db).unwrap();
+        FastPathRun {
+            db,
+            captured,
+            markers,
+            pipelined,
+            root,
+        }
+    }
+
+    /// `run` equals `base`: every block's consensus write set, the running
+    /// hash, the persisted native root and every CF.
+    fn assert_fast_path_runs_equal(base: &FastPathRun, run: &FastPathRun, what: &str) {
+        assert_write_sets_equal(&base.captured, &run.captured, what);
+        assert_eq!(
+            torus_state::running_hash::read_running_hash(&base.db),
+            torus_state::running_hash::read_running_hash(&run.db),
+            "{what}: running hash"
+        );
+        assert_eq!(base.root, run.root, "{what}: persisted native root");
+        assert_dumps_equal(&dump_all_cfs(&base.db), &dump_all_cfs(&run.db), what);
+    }
+
+    /// s124 epoch fast path (a) + (b): flag off, the boundary blocks 4 / 8 /
+    /// 12 stay serial (barrier) as before; flag on, they (no EVM tx, no
+    /// slash) take the pipelined path, with a per-block flush and with
+    /// checkpoints (never by time; every 5 blocks), and the state equals the
+    /// serial run (no W) and the flag-off run per block and in every CF. The
+    /// boundaries credit the permanent staker's EVM account, so W runs the
+    /// mirror resync (F2) for them. A boundary checkpoints at its own height,
+    /// so the durable marker after each block equals the flag-off run's,
+    /// where the serial flush makes the boundary (and its plan) durable.
+    #[test]
+    fn epoch_fast_path_boundaries_pipelined_and_match_serial() {
+        let serial = fast_path_run(false, false, None, None, None);
+        assert!(serial.pipelined.is_empty(), "no W: every block is serial");
+        // Non-vacuous F2: the staker staked its whole balance before block 1.
+        let credited = serial
+            .db
+            .get_account(&fast_path_staker())
+            .unwrap()
+            .map(|a| a.balance)
+            .unwrap_or_default();
+        assert!(credited > U256::ZERO, "the boundaries credit the staker");
+        let all: Vec<u64> = (1..=13).collect();
+        let off_pipelined: Vec<u64> = (1..=13).filter(|h| h % 4 != 0).collect();
+        for (what, policy) in [
+            ("per-block", None),
+            ("never", Some(ckpt_never())),
+            ("every 5", Some(ckpt_every(5))),
+        ] {
+            let off = fast_path_run(true, false, policy, None, None);
+            assert_eq!(
+                off.pipelined, off_pipelined,
+                "{what}, flag off: boundaries serial"
+            );
+            let on = fast_path_run(true, true, policy, None, None);
+            assert_eq!(on.pipelined, all, "{what}, flag on: boundaries pipelined");
+            assert_fast_path_runs_equal(&serial, &on, &format!("{what}: flag on vs serial"));
+            assert_fast_path_runs_equal(&off, &on, &format!("{what}: flag on vs flag off"));
+            assert_eq!(
+                on.markers, off.markers,
+                "{what}: durable marker after each block (a boundary is durable at once)"
+            );
+        }
+    }
+
+    /// s124 epoch fast path (c), archy's liveness case: epoch length 4 (not a
+    /// multiple of the attest interval 100), checkpoints never by time, the
+    /// flag on. Boundary 4 runs pipelined and writes the plan for boundary 8.
+    /// Consensus reads that plan only once the DURABLE marker reaches 4 (bug
+    /// (b)), and checkpoint triggers run only when a block executes: had the
+    /// plan stayed in the in-memory window, blocks 5..=7 would commit and
+    /// execute, execution would idle and every leader would refuse block 8
+    /// for good. The boundary checkpoints at its own height instead: after
+    /// 5..=7 with W idle, validators read the set for 8 and the leader
+    /// proposes block 8.
+    #[test]
+    fn epoch_fast_path_plan_durable_before_next_boundary() {
+        let (mut app, db, config) = epoch4_app(1_010);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt_never());
+        ctx.epoch_fast_path = true;
+        ctx.attach_flush_worker(None);
+        let mut blocks: Vec<TorusBlock> = (1..=7).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            if b.header.height == 4 {
+                // Read before asserting: a failed assert holding the guard
+                // would poison `last_job` for the shutdown drain.
+                let top = ctx.last_job.lock().unwrap().as_ref().map(|p| p.height());
+                assert_eq!(top, Some(4), "boundary 4 took the pipelined path");
+            }
+        }
+        // Execution idles: W finishes what it was handed, nothing else runs.
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert!(
+            app.epoch_validator_set_updates(8).is_ok(),
+            "the plan for 8 is durable: validators do not refuse block 8"
+        );
+        let _ = app.build_proposal(blocks[6].header.clone());
+        assert!(
+            app.pending_proposals.contains_key(&8),
+            "the leader proposes block 8"
+        );
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(4),
+            "boundary 4 checkpointed at its own height"
+        );
+        drop(ctx);
+    }
+
+    /// s124 epoch fast path (d): with the flag on, a boundary block with an
+    /// EVM tx (8) or a buffered slash (12) still takes the barrier and the
+    /// serial path; only the plain boundary 4 is pipelined. The state equals
+    /// the serial run per block and in every CF, and the EVM tx and the
+    /// slash really landed.
+    #[test]
+    fn epoch_fast_path_evm_or_slash_boundary_stays_serial() {
+        let serial = fast_path_run(false, false, None, Some(8), Some(12));
+        let expected: Vec<u64> = (1..=13).filter(|h| *h != 8 && *h != 12).collect();
+        for (what, policy) in [("per-block", None), ("never", Some(ckpt_never()))] {
+            let on = fast_path_run(true, true, policy, Some(8), Some(12));
+            assert_eq!(
+                on.pipelined, expected,
+                "{what}: EVM boundary 8 and slash boundary 12 serial"
+            );
+            assert_fast_path_runs_equal(&serial, &on, &format!("{what}: flag on vs serial"));
+        }
+        let evm_sender = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        assert_eq!(
+            serial
+                .db
+                .get_account(&k256_address(&evm_sender))
+                .unwrap()
+                .unwrap()
+                .nonce,
+            1,
+            "the EVM tx executed"
+        );
+        let slashed = StakingManager::new(serial.db.clone())
+            .get_validator(&Address::repeat_byte(0x77))
+            .unwrap()
+            .unwrap();
+        assert!(
+            slashed.self_stake < torus_economics::MIN_SELF_DELEGATION,
+            "the slash landed"
         );
     }
 
@@ -28215,7 +29724,19 @@ mod crash_recovery_tests {
                     d12_block(3, 2061, vec![]),
                 ];
                 link_blocks(&mut blocks);
-                assert!(evm_body_fits_header(&blocks[1].header, &blocks[1].evm_transactions));
+                // Item 7 step 1: block 2's EVM tx is off the N = 5 cadence, so the
+                // vote refuses the block; execution does not enforce the cadence
+                // (an execution-only fixture). Count and gas still fit the header.
+                assert!(!evm_body_fits_header(
+                    &blocks[1].header,
+                    &blocks[1].evm_transactions
+                ));
+                let mut every_height = blocks[1].header.clone();
+                every_height.evm_block_interval = 1;
+                assert!(evm_body_fits_header(
+                    &every_height,
+                    &blocks[1].evm_transactions
+                ));
                 let mut ctx = pipeline_ctx(&db, on, None);
                 dispatch_and_execute(&ctx, &db, &blocks[0]);
                 assert!(ctx.pipeline_barrier(), "{what}");

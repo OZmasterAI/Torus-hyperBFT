@@ -1830,6 +1830,7 @@ fn put_block_with_slots(state: &StateDb, height: u64, slots: u32, executed: &[u3
         evm_gas_used: 0,
         evm_fee_revenue: 0,
         evm_gas_limit: 30_000_000,
+        evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
         native_action_count: 0,
         evm_tx_count: slots,
         base_fee_per_gas: 1,

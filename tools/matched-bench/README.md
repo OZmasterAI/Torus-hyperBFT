@@ -650,6 +650,172 @@ Self-tests: `test_harness.py` (`test_in_flight_tail_*`,
 `test_commit_tail_cell_records_the_tail_mode`); bench crate
 `in_flight::tests` (`commit_tail_*`, `body_probe_*`, `tail_mode_*`).
 
+## Campaign driver generator (`campaign/make-driver.py`)
+
+A campaign driver is generated from a short JSON spec instead of being copied from an
+earlier ~1,000-line driver:
+
+```
+python3 -I tools/matched-bench/campaign/make-driver.py SPEC.json -o $T/ozarchy-<camp>-campaign.sh
+$T/ozarchy-<camp>-campaign.sh dry            # preflight: paths, tools, staged md5s; prints the cells
+$T/ozarchy-<camp>-campaign.sh show           # arms, node env, harness env, env checks, cells (tables)
+$T/ozarchy-<camp>-campaign.sh launch smoke   # one 60 s cell with every check (unit bench-<campaign>-smoke)
+$T/ozarchy-<camp>-campaign.sh launch         # the campaign (unit bench-<campaign>)
+```
+
+The driver = a generated config block + `campaign/driver-body.sh` (the standard parts,
+tested once in `test_make_driver.py`). Do not edit a generated driver: change the spec
+and regenerate (the spec is embedded in the driver header). Standard parts:
+
+- **Launch** through `campaign/detach.sh` (`launch`): the campaign runs in its own
+  `bench-<campaign>.service` unit, which holds the build lock for its whole run; `run`
+  refuses to start outside a bench unit. Each cell runs `run-cell.sh` in its own
+  `bench-<label>` unit, with `OVERWRITE=1`, as Job 4: the driver's own records (`sysctl.txt`,
+  the samplers) are in the cell dir before run-cell.sh starts, and the driver itself refuses
+  an existing cell dir. A spec may only repeat `OVERWRITE=1`. The exported env is scrubbed
+  to the basics first (no `TORUS_*`, `MALLOC_CONF`, `LD_PRELOAD` or run-cell.sh knob from
+  the launching shell). Driver names
+  (`DRIVER_VARS`: `RUN`, `P`, `ARMS`, `BDIR`, ...) are owned by the driver: a caller that
+  exported one gets the driver's value, un-exported (the generated config `unset`s them
+  before assigning; `scrub_env` un-exports them and never unsets them).
+- **Per-cell records** once the bench runs, per node pid: `node-environ-trie.txt`
+  (`exe_md5` = md5 of `/proc/PID/exe`, the RUNNING exe: a wrapper script has exec'd the
+  real node by then), `node-env-all.txt` (`TORUS_*`), `node-preload.txt` (`LD_PRELOAD`,
+  `MALLOC_CONF` and every other non-`TORUS_` name the spec sets).
+- **Per-cell checks** (CHECK OK / CHECK FAIL lines; a failure flags the row `bad:check` and
+  stops the campaign): node exe md5 = the arm's staged md5 on all 3 nodes; the arm's node
+  env (`node_env` + arm `env`) on all 3 nodes and every other name the spec mentions
+  (any arm's env, `absent_env`) on none, `TORUS_*` read from `node-env-all.txt`, any other
+  name from `node-preload.txt`; `summary.json` `cell.markets`; the spec's `expect` lines.
+- **Runtime watchers** (every cell; copied verbatim from the hand-written Job 4 driver
+  `testdata/make-driver/ozarchy-p4j4-{h,d}-campaign.sh`, which the golden test compares).
+  Once the cell unit runs, the driver finds the harness pid (run-cell.sh, the child of the
+  unit's main process; none within 30 s = `ABORT`, `bad:abort-no-pid`) and starts
+  `watch_nodes` and `memguard`. `watch_nodes` polls the 3 node pids of run.log's `node pids:`
+  line, the load generator and the oracle feed every 0.5 s until the harness stop (`stopping
+  pid`). A death writes `<cell>/node-death.txt` (`DEATH node val1 comm=torus-node pid=<pid>
+  detected at <time> (0.5 s poll; ...); last val1 log line: ...`, also in `node-life.txt`) and
+  TERMs the harness (its trap stops the rest). Such a cell is a `CELL FAIL <label> rc=<rc>
+  death: ... -> continuing`: no checks run, cell_step flags its row `death` and queues a
+  rerun, and the campaign goes on. `memguard` stops the cell unit when MemAvailable < 6 GB.
+  After the checks, `hardscan` prints `HARD FINDING` lines for panic, fail-stop and state hash
+  mismatch lines logged at WARN or ERROR (it never fails a cell).
+- **Samplers** (spec `samplers`, default `true`): `data-du-samples.txt` (data dir sizes,
+  MemAvailable, /dev/shm; 2 s), `ckpt-samples.txt` (each node's checkpoint and reject metrics;
+  2 s), `mem-samples.txt` + `smaps/` (smaps_rollup, status and memory gauges every 5 s; val0's
+  full smaps every 30 s), `node-nofile.txt` + `fds.txt` (open fds; 5 s), `vmstat-1hz.txt`;
+  after the cell `rocksdb-LOG-val<i>.txt`, `data-du.txt`, a `[<label>] fds max/end ...` line and
+  a `CHECK SOAK` coverage line. A node that held more than 16384 open fds stops the campaign
+  after its cell (`STOP`, `bad:stop-fd`).
+- **Host checks** (spec `host_checks`, default on): the `run` preflight requires MemAvailable
+  >= `min_mem_avail_gb` (40) and every `sysctl` value the spec gives. The dirty limits
+  (`vm.dirty_bytes`, `vm.dirty_background_bytes`) that the spec does not give are pinned to the
+  host's values at that preflight. Each cell records the writeback and perf sysctls at its start
+  and end (`sysctl.txt`) and must still have those values: a change before the start aborts
+  (`bad:abort-sysctl`), a change before the end fails the checks (`bad:check`). `quiet()` also
+  waits for heavy analysis processes (perf, inferno, flamegraph, jeprof, addr2line).
+- **cells.tsv rows, CELL-FLAG lines, rerun queue**: `run_spec` + `cell-step.sh` as in the
+  template (below). Wrapper arms pass `--no-summary-md5` to the step (run-cell.sh hashes
+  the staged file, which is the wrapper).
+- **Preflight**: tools present, harness worktree present, the genesis inputs (below), each
+  binary's staged md5 (a
+  `wrapper` binary: the md5 of the absolute path its last `exec` line runs), bench md5,
+  analysis scripts; in `run`: no build, node, bench or other bench unit, no old attempt
+  (cells.tsv, rerun-queue.tsv, label dirs), 20 GB free.
+- **Done marker**: `$RUN/campaign.done` (`exit=<rc> <time>`) on every exit of `run`,
+  including a preflight failure; smoke: `$RUN/smoke/campaign.done`.
+
+**Spec** (JSON; any unknown key, a missing required key, a duplicate arm, a baseline that is
+not an arm, an env value with whitespace/quotes/`$`, or a harness key the driver sets
+itself is a `SPEC ERROR`, exit 2, nothing written). Required: `campaign` (unit name),
+`run_dir`, `label_prefix`, `harness_worktree` (run-cell.sh's `<worktree>`), `tools_dir` (the
+frozen tools copy: run-cell.sh, cell-step.sh, cell_step.py, campaign/detach.sh; its root
+`tools_dir/../..` must carry the genesis inputs, see below),
+`binaries`, `arms`, `baseline`, `duration_s`, `markets`, and `replicates` unless `order` is a
+list. Optional: `comment`, `results_root` (`~/bench-results-matched`), `devnet_dir`
+(`~/torus-wsl-devnet`), `rate` (76000), `order` (`"rotate"` default: replicate r starts at
+arm r-1, as Job 4; `"fixed"`; or a list `["r1:A", "r1:B", ...]`), `warmup` (`{arm, tag,
+duration_s}`, default baseline / `w1` / `duration_s`; `false` = none), `smoke` (`{arm,
+duration_s}`, default baseline / 60), `node_env` (node env for every arm), `harness_env`
+(run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`),
+`absent_env` (names that must be unset unless an arm sets them), `expect` (every arm),
+`analysis` (`{cmd, metric}` = `CELL_STEP_ANALYSIS_CMD` / `_METRIC`), `max_load` (2),
+`samplers` (`true` default, or `false`), `host_checks` (`true` default, `false`, or
+`{min_mem_avail_gb: 40, sysctl: {"vm.dirty_bytes": "268435456", ...}}`; unknown keys are a
+SPEC ERROR too). The runtime watchers have no switch.
+`binaries.<key>`: `stage_dir` (holds `release/torus-node` [+ `release/bench-throughput`]),
+`node_md5` or `md5_file` + `node_row` (`"N bdd59888"`: the first two md5s.txt columns),
+optional `bench_md5` / `bench_row`, `wrapper` (true: `release/torus-node` is a script that
+execs the real node; `node_md5` is the real node's). `arms[]`: `label`, `binary` (required
+when there are several), `env` (node env: `TORUS_*` knobs and process env such as
+`MALLOC_CONF`), `harness_env` (overrides), `expect`, `note`. `expect[]`: `{file, regex, min=1,
+max}`: `grep -E -c regex <cell>/<file>` must be in `[min, max]`. Example:
+
+```json
+{"campaign": "ozarchy-p4j4d", "run_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-run/d",
+ "label_prefix": "ozarchy-p4j4d-300m", "harness_worktree": "/home/oz/projects/wt/p4j4-bdd59888",
+ "tools_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-tools/tools/matched-bench",
+ "binaries": {"b": {"stage_dir": "/home/oz/bench-results-matched/ozarchy-p4j4-stage/b-run",
+   "md5_file": "/home/oz/bench-results-matched/ozarchy-p4j4-build/md5s.txt",
+   "node_row": "N bdd59888", "bench_row": "bench-F ff822b95"}},
+ "markets": 300, "duration_s": 120, "replicates": 3, "baseline": "J",
+ "harness_env": {"BLOCK_CAP": "400", "MAX_IN_FLIGHT": "4", "ORACLE_FEED": "1", "IN_FLIGHT_TAIL": "commit"},
+ "arms": [{"label": "J"},
+          {"label": "M1", "env": {"MALLOC_CONF": "dirty_decay_ms:1000,muzzy_decay_ms:1000"}},
+          {"label": "M0", "env": {"MALLOC_CONF": "dirty_decay_ms:0"}}]}
+```
+
+Full example: `campaign/driver-spec.example.json`; the Job 4 golden specs:
+`testdata/make-driver/p4j4-{h,d}.json`.
+
+**Genesis inputs beside the tools copy.** run-cell.sh generates each cell's genesis from
+ITS OWN repo root (`MAINREPO` = `<dir of run-cell.sh>/../..`), not from the harness worktree
+it is handed (that one only launches the nodes). In a standalone tools copy without them
+every cell dies at genesis (`gen-3val-genesis.sh` not found, exit 127).
+Freeze them as Job 4 did (`ozarchy-p4j4-tools/{devnet,testnet}` beside `tools/`):
+
+```
+T=$R/ozarchy-<camp>-tools; mkdir -p "$T/tools" "$T/devnet" "$T/testnet/lib"
+cp -r <harness-wt>/tools/matched-bench "$T/tools/"
+cp -a <harness-wt>/devnet/wsl "$T/devnet/"; cp <harness-wt>/devnet/genesis.json "$T/devnet/"
+cp <harness-wt>/testnet/gen-weighted-genesis.sh "$T/testnet/"; cp <harness-wt>/testnet/lib/cargo-bin.sh "$T/testnet/lib/"
+cp <the earlier cells' testnet/genesis-weighted-full.json> "$T/testnet/"   # untracked, ~29 MB
+```
+
+Preflight (`dry`, `launch`, `run`) fails unless `devnet/wsl/gen-3val-genesis.sh`
+(executable), `devnet/wsl/bench-validator-keys.json`, `devnet/genesis.json`,
+`testnet/lib/cargo-bin.sh`, `testnet/gen-weighted-genesis.sh` and a non-empty
+`testnet/genesis-weighted-full.json` are under `tools_dir/../..`, and unless `devnet/wsl`
+(except the per-cell output `genesis-3val.json`) and the other tracked inputs equal the
+harness worktree's. `PREFLIGHT OK` names the `genesis_root`.
+
+**Not supported** (hand-write the driver from the closest earlier one, as before, and say
+which shape did not fit): crash / restart cells (`CRASH_KILL_AT_S`, `KILL_*`: a SPEC
+ERROR); per-arm market count, duration or rate; samplers beyond the Job 4 driver's
+in-driver ones above (perf off-CPU windows, the soak sidecar `soak-sampler.py`, the cpu, io
+and task samplers: scripts outside tools/matched-bench); campaign-specific hard checks
+other than `expect` greps (checkpoint deltas, codec/LSM, data dir filesystem type, release
+timing); more than 3 nodes; several campaigns in one unit (pilot + grid: generate one
+driver each and launch them in turn); post-campaign steps (off-CPU processing).
+
+Tests: `python3 tools/matched-bench/test_make_driver.py` (golden: the Job 4 horizon and
+decay specs give the arms, env, harness env, cell order and env checks of
+`ozarchy-p4j4-{h,d}-campaign.sh`, copied into `testdata/make-driver/`, and their watcher
+and sampler functions verbatim, the cell() wiring in order, and their sysctl, MemAvailable
+and fd-stop values; env and md5 checks on fixture cells and a fake /proc; the generated
+cell() run for real against a fake detach.sh, systemctl and run-cell.sh: a stub node that
+exits gives node-death.txt and a `bad:...death` row, memguard stops the unit on a stubbed
+meminfo, samplers and host checks off leave no records; bad specs).
+
+**Why launchers copied old drivers instead of the template** (s1156): the template is the
+p3gate driver, and its CAMPAIGN-SPECIFIC blocks are most of the file (config, samplers,
+~20 hard checks, preflight helpers) built around one checkpoint KNOB per arm (`AKNOB`
+0/1), with no per-arm env table and no `MALLOC_CONF` handling; it calls tools that live
+in run dirs outside the repo (`$T/cpu-sampler.sh`, `$T3/io-sampler.sh`, the acc/acc3
+codec, LSM and restart scripts); and checks added by later campaigns (heap, sysctl, soak,
+depth, cloid) were never folded back. The newest driver was always the more complete
+start, so each launcher read and edited ~1,000 lines.
+
 ## New campaign from the template (per-cell write-up step, rerun queue)
 
 `campaign-template.sh` is the ozarchy-p3gate driver (`docs/perf/bench-archive/tools/`)

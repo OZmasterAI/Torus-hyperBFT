@@ -151,7 +151,10 @@ impl TestHarness {
             proposer: BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO),
             validator: BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO),
             executor: EvmExecutor::new(TORUS_CHAIN_ID),
-            parent_header: genesis_parent_header(),
+            parent_header: genesis_parent_header(
+                torus_types::DEFAULT_EVM_GAS_LIMIT,
+                torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+            ),
         }
     }
 
@@ -278,7 +281,10 @@ fn state_root_determinism_two_validators() {
     let (dir2, db2) = open_test_db();
     db2.put_account(&alice, &test_account(ten_eth)).unwrap();
 
-    let parent = genesis_parent_header();
+    let parent = genesis_parent_header(
+        torus_types::DEFAULT_EVM_GAS_LIMIT,
+        torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+    );
     let proposer = BlockProposer::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
     let executor = EvmExecutor::new(TORUS_CHAIN_ID);
     let validator = BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO);
@@ -492,6 +498,7 @@ fn block_hash_uses_canonical_encoding() {
         evm_gas_used: 21_000,
         evm_fee_revenue: 0,
         evm_gas_limit: 30_000_000,
+        evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
         native_action_count: 5,
         evm_tx_count: 3,
         base_fee_per_gas: 1_000_000_000,

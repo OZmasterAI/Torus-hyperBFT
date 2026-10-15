@@ -102,9 +102,10 @@ pub enum CoreError {
 
     /// R02 branch 3: consensus bytes that every validator holds identically
     /// and decodes alike fail to decode as the type a reader expects (the
-    /// classic getOrderBook reads a production whole-book blob as the legacy
-    /// `OrderBookSnapshot`). NOT a local fault. Prints exactly like `Borsh`,
-    /// so the EVM revert bytes are unchanged.
+    /// classic 0x0800 getOrderBook, removed in item 7 step 1, read a
+    /// production whole-book blob as the legacy `OrderBookSnapshot`). NOT a
+    /// local fault. Prints exactly like `Borsh`, so the EVM revert bytes are
+    /// unchanged.
     #[error("borsh error: {0}")]
     DeterministicDecode(String),
 
@@ -120,8 +121,8 @@ pub enum CoreError {
     PrecompileLocalFault(String),
 
     /// The persisted order-book layout is not one this read serves (unknown
-    /// mode marker, mixed layouts, a key shape this build cannot read,
-    /// getOrderBook under the order-row layout): the same on every validator
+    /// mode marker, mixed layouts, a key shape this build cannot read, a row
+    /// reader asked for the classic layout): the same on every validator
     /// with the same chain and build, so NOT a local fault (R02 owner s106).
     /// Readers MUST surface this instead of reporting an empty book — a
     /// silently empty book is indistinguishable from "no orders" and has
@@ -158,8 +159,8 @@ impl CoreError {
     /// is a validation, user, oracle or invariant error that every validator
     /// hits alike on the same state; halting on those would stop the chain.
     /// `BookLayout` is not one: it reports a read that does not serve the
-    /// chain's layout (`getOrderBook` under order rows), which every
-    /// validator hits alike; the book loaders fail-stop on it themselves.
+    /// chain's layout, which every validator hits alike; the book loaders
+    /// fail-stop on it themselves.
     /// `BookCorrupt` (a book row corrupt on this node) is one.
     pub fn is_local_fault(&self) -> bool {
         matches!(

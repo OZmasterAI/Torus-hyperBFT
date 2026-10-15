@@ -2225,6 +2225,7 @@ impl<N: Network> HotStuff<N> {
             timestamp: SystemTime::now(),
             origin: *origin,
             view: header.view,
+            height: header.height,
             block_hash: header.block_hash,
         })
         .publish(&self.event_publisher);
@@ -4227,6 +4228,24 @@ mod sync_recovery_tests {
                 Event::PhaseVote(event) => Some(event.vote), _ => None,
             }).collect()
         }
+    }
+
+    /// Item 7 step 1 (E12): the header event carries the block height, so a
+    /// follower can predict the leader of the next EVM height.
+    #[test]
+    fn receive_proposal_header_event_carries_the_height() {
+        let mut c = park_case(4);
+        c.receive();
+        let ev = c
+            .events
+            .try_iter()
+            .find_map(|event| match event {
+                Event::ReceiveProposalHeader(ev) => Some(ev),
+                _ => None,
+            })
+            .expect("header event");
+        assert_eq!((ev.view, ev.height), (c.header.view, c.header.height));
+        assert_eq!(ev.height, BlockHeight::new(1));
     }
 
     /// s74 bb-serial-r1 view 424: the header was dropped for an unknown

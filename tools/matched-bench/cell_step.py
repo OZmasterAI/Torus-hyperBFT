@@ -8,7 +8,7 @@ campaign's archived analysis on it, and appends one row to <RUN_DIR>/cells.tsv.
   cell_step.py record --run-dir RUN --cell-dir DIR --label LABEL --tag TAG --arm ARM --rep REP
                       --staged-md5 MD5 [--spec SPEC] [--rc-file F] [--campaign-log F]
                       [--analysis-cmd TEMPLATE] [--analysis-key TEMPLATE] [--analysis-metric KEY]
-                      [--analysis-timeout S] [--extra-reasons R1,R2]
+                      [--analysis-timeout S] [--extra-reasons R1,R2] [--no-summary-md5]
   cell_step.py pending-reruns --run-dir RUN
 
 cells.tsv (fixed contract): header written once, then one row per finished cell,
@@ -19,7 +19,8 @@ tab-separated:  label arm rep rc agree md5_ok metric flag
   md5_ok  yes iff every recorded node binary md5 of the cell equals the staged md5 of its arm:
           each running process's exe_md5 (node-environ-trie.txt, 3 nodes; node-restart-env.txt,
           a restarted node) — at least one process record is required — and summary.json
-          binaries.torus_node_md5 (full) when present (optional: a missing one is skipped)
+          binaries.torus_node_md5 (full) when present (optional: a missing one is skipped; not checked with
+          --no-summary-md5: run-cell.sh hashes the STAGED file, a wrapper script on wrapper arms)
   metric  matched/s: the analysis row's --analysis-metric value, else summary.json
           headline.matched_s_avg, else 0 (no summary); plain number
   flag    ok | bad:<reason>[,<reason>...]   reasons, in this order:
@@ -161,7 +162,7 @@ def load_json(path):
 # ---------------------------------------------------------------- md5
 
 
-def md5_check(cell, summary, staged):
+def md5_check(cell, summary, staged, use_summary=True):
     staged = staged.strip().lower()
     ev = {"staged": staged, "records": [], "problems": []}
     if not re.fullmatch(r"[0-9a-f]{8,32}", staged):
@@ -190,7 +191,9 @@ def md5_check(cell, summary, staged):
     if procs == 0:
         ev["problems"].append("no running-process md5 record (node-environ-trie.txt)")
     b = ((summary or {}).get("binaries") or {}).get("torus_node_md5")
-    if b:
+    if b and not use_summary:
+        ev["records"].append(["summary.json binaries.torus_node_md5 (not checked: --no-summary-md5)", b])
+    elif b:
         ev["records"].append(["summary.json binaries.torus_node_md5", b])
         if not same(b):
             ev["problems"].append("summary.json torus_node_md5=%s" % b)
@@ -558,7 +561,7 @@ def record(a):
     rc_file = a.rc_file or os.path.normpath(cell) + ".cell.rc"
     rc_txt, rc_num = read_rc(rc_file)
     summary = load_json(os.path.join(cell, "summary.json"))
-    md5ok, md5ev = md5_check(cell, summary, a.staged_md5)
+    md5ok, md5ev = md5_check(cell, summary, a.staged_md5, not a.no_summary_md5)
     reasons, artifacts, notes = judge(cell, summary, rc_num, md5ok)
     for x in extra_reasons(a.extra_reasons):
         if x not in reasons:
@@ -713,6 +716,7 @@ def main():
     r.add_argument("--analysis-metric", default="")
     r.add_argument("--analysis-timeout", type=float, default=600.0)
     r.add_argument("--extra-reasons", default="")
+    r.add_argument("--no-summary-md5", action="store_true")
     p = sub.add_parser("pending-reruns")
     p.add_argument("--run-dir", required=True)
     a = ap.parse_args()

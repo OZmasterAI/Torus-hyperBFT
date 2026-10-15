@@ -2,8 +2,7 @@
 //! - `CoreError::BookLayout` stays deterministic-only (NOT a local fault): a
 //!   layout / config mismatch every validator with the same chain and build
 //!   sees alike (unknown mode marker, mixed layouts, a key shape this build
-//!   cannot read, getOrderBook under the order-row layout, a caller asking a
-//!   row reader for the classic layout).
+//!   cannot read, a caller asking a row reader for the classic layout).
 //! - `CoreError::BookCorrupt` (a local fault, `is_local_fault`): a row that
 //!   fails to decode or contradicts another on THIS node (corrupt meta /
 //!   order / level / stop / classic row, missing meta row, ids or seqs that
@@ -19,7 +18,6 @@ use torus_core::book_reader::{self, BookLayout};
 use torus_core::book_rows::{book_meta_key, level_row_key_tagged, SIDE_TAG_BID};
 use torus_core::error::CoreError;
 use torus_core::position::NativeBalance;
-use torus_core::precompiles::{execute_precompile, precompile_address, ADDR_ORDER_BOOK_READER};
 use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
 use torus_state::{StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
@@ -255,28 +253,4 @@ fn r02_classic_layout_asked_of_a_row_reader_is_deterministic() {
         book_reader::depth_from_market_rows(&db, 1, BookLayout::Classic, &[]),
         "depth_from_market_rows classic",
     );
-}
-
-/// getOrderBook under the order-row layout: every validator reverts alike.
-/// A wrong-length level key under the level prefix is a corrupt row (local);
-/// the revert text is unchanged either way.
-#[test]
-fn r02_get_order_book_errors_split() {
-    let call = |db: &StateDb| {
-        let mut input = alloy_primitives::keccak256(b"getOrderBook(bytes32)")[..4].to_vec();
-        let mut word = [0u8; 32];
-        word[24..32].copy_from_slice(&1u64.to_be_bytes());
-        input.extend_from_slice(&word);
-        execute_precompile(&precompile_address(ADDR_ORDER_BOOK_READER), &input, &addr(0), db, 100, 0)
-    };
-    let (_d, db) = open_test_db();
-    seed(&db, BookMode::OrderRows);
-    assert_deterministic(call(&db), "getOrderBook under order rows");
-
-    let (_d, db) = open_test_db();
-    seed(&db, BookMode::LevelAuthority);
-    let mut key = level_row_key_tagged(1, SIDE_TAG_BID, 1).to_vec();
-    key.push(0);
-    db.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, b"junk").unwrap();
-    assert_local(call(&db), "wrong-length level key");
 }

@@ -584,6 +584,11 @@ Node-local (mixable per node, value-neutral by test gate §5.2-5):
    eventually ride level rows + `iterate_cf_bounded` (port of `39c74a1`'s
    read path — deliberately out of 3c scope). `margin_configs` empty ⇒
    zero margin reserved (existing debt, unchanged by 3c).
+   Update (item 7 step 1, s123): the precompile `getOrderBook` (0x0800)
+   is removed; its selector reverts as `UnknownSelector` for the base gas
+   (`docs/perf/read-precompile-gas.md`, last section). 0x0800 keeps
+   `getPosition`. The RPC `torus_getOrderBook` reads the row layouts
+   (`torus-rpc/src/scan.rs` `row_book_depth`).
 5. **Boot verify cost** O(depth) (~seconds at 1M): acceptable; do NOT add
    a skip flag (safety > boot latency); parallelize per market if it ever
    matters.

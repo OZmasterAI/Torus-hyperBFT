@@ -52,6 +52,8 @@ pub enum GenesisError {
     InvalidMarket(String),
     #[error("invalid fee_split: {0}")]
     InvalidFeeSplit(String),
+    #[error("invalid evm section: {0}")]
+    InvalidEvm(String),
     /// R19: two spellings of one canonical key (address case / 0x prefix,
     /// storage slot "0" vs "0x0"). Refused instead of letting HashMap order
     /// pick the value.
@@ -142,6 +144,14 @@ pub struct EvmConfig {
     pub gas_limit: u64,
     pub base_fee_initial: u64,
     pub chain_id: u64,
+    /// Item 7 step 1: N, EVM txs only in blocks with `height % N == 0` (the
+    /// genesis parent header's `evm_block_interval`). Absent = 5; 0 is refused.
+    #[serde(default = "default_evm_block_interval")]
+    pub block_interval: u64,
+}
+
+fn default_evm_block_interval() -> u64 {
+    torus_types::DEFAULT_EVM_BLOCK_INTERVAL
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -368,6 +378,11 @@ impl Genesis {
     pub fn from_json(json: &str) -> Result<Self, GenesisError> {
         let genesis: Self = serde_json::from_str(json)?;
         genesis.check_fee_split()?;
+        if genesis.evm.block_interval == 0 {
+            return Err(GenesisError::InvalidEvm(
+                "evm.block_interval must be >= 1".into(),
+            ));
+        }
         genesis.check_keys_and_hex()?;
         Ok(genesis)
     }
@@ -682,6 +697,7 @@ impl Genesis {
             chain_id: self.chain_id,
             chain_name: self.chain_name.clone(),
             evm_gas_limit: self.evm.gas_limit,
+            evm_block_interval: self.evm.block_interval,
             base_fee_per_gas: self.evm.base_fee_initial,
             epoch_length: self.consensus.epoch_length,
             max_validators: self.economics.validator.max_validators,
@@ -914,6 +930,62 @@ mod tests {
             let genesis = Genesis::from_json(json).unwrap_or_else(|e| panic!("{name}: {e:?}"));
             assert_eq!(genesis.consensus.timeout_base_ms, 1200, "{name}");
             assert_eq!(genesis.chain_config().timeout_base_ms, 1200, "{name}");
+        }
+    }
+
+    /// Item 7 step 1: `evm.block_interval` (N) defaults to 5 and feeds
+    /// `ChainConfig`; 0 is refused at load. Genesis may set N = 1 (the
+    /// 2..=100 range binds governance only).
+    #[test]
+    fn evm_block_interval_defaults_and_feeds_chain_config() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert_eq!(genesis.evm.block_interval, 5);
+        assert_eq!(genesis.chain_config().evm_block_interval, 5);
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["evm"]["block_interval"] = 7.into();
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_config().evm_block_interval, 7);
+        json["evm"]["block_interval"] = 1.into();
+        let genesis = Genesis::from_json(&json.to_string()).unwrap();
+        assert_eq!(genesis.chain_config().evm_block_interval, 1);
+        json["evm"]["block_interval"] = 0.into();
+        let err = Genesis::from_json(&json.to_string()).unwrap_err();
+        assert!(matches!(err, GenesisError::InvalidEvm(_)), "{err}");
+    }
+
+    /// Item 7 step 1: every tracked genesis file ships the 3M EVM budget and
+    /// N = 5, spelled out in the file (not left to the serde default).
+    #[test]
+    fn shipped_genesis_files_use_the_item7_evm_values() {
+        for (name, json) in [
+            (
+                "devnet/genesis.json",
+                include_str!("../../../devnet/genesis.json"),
+            ),
+            (
+                "devnet/ab-harness/devnet-genesis.json",
+                include_str!("../../../devnet/ab-harness/devnet-genesis.json"),
+            ),
+            (
+                "testnet/genesis-weighted-base.json",
+                include_str!("../../../testnet/genesis-weighted-base.json"),
+            ),
+            (
+                "testnet/genesis-weighted-base-setup2b.json",
+                include_str!("../../../testnet/genesis-weighted-base-setup2b.json"),
+            ),
+            (
+                "testnet/p3-testnet/devnet-ladder/genesis-10mkt.json",
+                include_str!("../../../testnet/p3-testnet/devnet-ladder/genesis-10mkt.json"),
+            ),
+        ] {
+            let genesis = Genesis::from_json(json).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(genesis.evm.gas_limit, 3_000_000, "{name}");
+            assert_eq!(genesis.evm.block_interval, 5, "{name}");
+            assert_eq!(genesis.chain_config().evm_gas_limit, 3_000_000, "{name}");
+            assert_eq!(genesis.chain_config().evm_block_interval, 5, "{name}");
+            let raw: serde_json::Value = serde_json::from_str(json).unwrap();
+            assert_eq!(raw["evm"]["block_interval"], 5, "{name}: field spelled out");
         }
     }
 

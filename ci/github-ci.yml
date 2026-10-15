@@ -39,8 +39,10 @@ jobs:
 
   # D6 (S392): full Uniswap-V2 proof — 1-node devnet, deploy Factory/Router/
   # tokens + canonical Multicall3 (Nick's method), add liquidity, swap, assert
-  # balances and receipts. The node runs with the 15M EVM gas budget override
-  # (the D1 bench setting) so contract deploys have headroom over the 5M debut.
+  # balances and receipts. Item 7 step 1: make-ci-genesis.py raises the genesis
+  # EVM block gas limit from the 3M default to 10M (the Router deploy needs
+  # ~4.2M) until step 2's big blocks; the 15M EVM gas budget override (the D1
+  # bench setting) keeps the local budget above it, so the 10M header limit binds.
   uniswap-e2e:
     runs-on: ubuntu-latest
     steps:

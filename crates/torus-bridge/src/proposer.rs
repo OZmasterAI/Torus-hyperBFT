@@ -2,9 +2,7 @@
 
 use alloy_primitives::{Address, Bloom, B256};
 
-use torus_evm::{
-    calc_next_block_base_fee, BlockEnvCfg, BlockExecResult, EvmExecutor, DEFAULT_BLOCK_GAS_LIMIT,
-};
+use torus_evm::{calc_next_block_base_fee, BlockEnvCfg, BlockExecResult, EvmExecutor};
 use torus_state::StateDb;
 use torus_types::{Receipt, SignedNativeAction, TorusBlock, TorusBlockHeader};
 
@@ -80,11 +78,8 @@ impl BlockProposer {
         );
 
         let block_height = parent.height + 1;
-        let gas_limit = if parent.evm_gas_limit == 0 {
-            DEFAULT_BLOCK_GAS_LIMIT
-        } else {
-            parent.evm_gas_limit
-        };
+        // Item 7 step 1: the parent's limit (the genesis parent carries the genesis value).
+        let gas_limit = parent.evm_gas_limit;
 
         // 2. Decode RLP transactions.
         let decoded_txs = decode_all_txs(&evm_transactions)?;
@@ -153,6 +148,7 @@ impl BlockProposer {
                 evm_gas_used: exec_result.gas_used,
                 evm_fee_revenue: compute_fee_revenue(&exec_result.receipts, next_base_fee),
                 evm_gas_limit: gas_limit,
+                evm_block_interval: parent.evm_block_interval,
                 native_action_count: 0,
                 evm_tx_count: evm_transactions.len() as u32,
                 base_fee_per_gas: next_base_fee,
@@ -185,13 +181,15 @@ pub(crate) fn compute_receipts_root(
     Ok(alloy_primitives::keccak256(&data))
 }
 
-/// Genesis-compatible default parent header (height 0).
-pub fn genesis_parent_header() -> TorusBlockHeader {
+/// Genesis-compatible parent header (height 0). Item 7 step 1: the EVM values
+/// come from the genesis (`evm.gas_limit`, `evm.block_interval`); `TorusApp::try_new`
+/// builds it once from the chain config, and every caller uses that header.
+pub fn genesis_parent_header(evm_gas_limit: u64, evm_block_interval: u64) -> TorusBlockHeader {
     TorusBlockHeader {
         height: 0,
         // Genesis is the ancestry root: no parent, so the parent commitment is
         // zero. The first real block (height 1) commits to
-        // keccak256(genesis_parent_header().canonical_header_bytes()).
+        // keccak256(genesis_parent_header(..).canonical_header_bytes()).
         parent_hash: B256::ZERO,
         timestamp: 0,
         proposer: Address::ZERO,
@@ -200,7 +198,8 @@ pub fn genesis_parent_header() -> TorusBlockHeader {
         logs_bloom: Bloom::ZERO,
         evm_gas_used: 0,
         evm_fee_revenue: 0,
-        evm_gas_limit: DEFAULT_BLOCK_GAS_LIMIT,
+        evm_gas_limit,
+        evm_block_interval,
         native_action_count: 0,
         evm_tx_count: 0,
         base_fee_per_gas: 1_000_000_000, // 1 gwei initial base fee
@@ -303,6 +302,18 @@ mod tests {
         assert_eq!(compute_fee_revenue(&receipts, base), 101_000u128 * base as u128);
         assert_eq!(compute_fee_revenue(&receipts, 0), 0, "base fee 0: all of it was tip");
         assert_eq!(compute_fee_revenue(&[], base), 0);
+    }
+
+    /// Item 7 step 1: the genesis parent header carries the genesis EVM
+    /// values (`evm.gas_limit`, `evm.block_interval`), not a hardcoded 30M.
+    #[test]
+    fn genesis_parent_header_carries_the_genesis_evm_values() {
+        let genesis = genesis_parent_header(3_000_000, 5);
+        assert_eq!(genesis.height, 0);
+        assert_eq!(genesis.parent_hash, B256::ZERO);
+        assert_eq!(genesis.evm_gas_limit, 3_000_000);
+        assert_eq!(genesis.evm_block_interval, 5);
+        assert_eq!(genesis.base_fee_per_gas, 1_000_000_000);
     }
 
     fn make_test_signed_action(nonce: u64) -> SignedNativeAction {

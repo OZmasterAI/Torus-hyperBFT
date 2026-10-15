@@ -202,6 +202,7 @@ mod tests {
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
                 evm_gas_limit: 0,
+                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
                 native_action_count: actions as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 0,

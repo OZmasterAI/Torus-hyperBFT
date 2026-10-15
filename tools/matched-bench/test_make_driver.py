@@ -1,0 +1,2116 @@
+#!/usr/bin/env python3
+"""test_make_driver.py — tests for campaign/make-driver.py (spec -> campaign driver) and its driver body.
+
+    python3 tools/matched-bench/test_make_driver.py
+
+Offline, no nodes, no cargo: drivers are generated into a tempdir, checked with `bash -n`, and their
+functions are run in "library mode" (DRIVER_LIB_ONLY=1 source DRIVER) against fixture cell dirs and a
+fake /proc (DRIVER_PROC). Pinned:
+
+1. golden: the Job 4 horizon and decay specs (testdata/make-driver/p4j4-{h,d}.json) give the same arms,
+   node env, harness env, cell order, replicates, markets, md5 and env checks as the hand-derived drivers
+   ozarchy-p4j4-{h,d}-campaign.sh (copied verbatim into testdata/make-driver/), compared as tables.
+2. the env check reads TORUS_* from node-env-all.txt and every other process env (MALLOC_CONF) from
+   node-preload.txt (Job 4's false STOP read MALLOC_CONF from node-env-all.txt).
+3. the md5 check hashes the running exe (/proc/PID/exe), never the staged file, which may be a wrapper
+   script (g3's 4 needless reruns hashed the g-je wrapper).
+4. a bad spec (unknown key, missing baseline arm, duplicate arm, ...) is a hard error.
+5. preflight fails when the frozen tools copy lacks the genesis inputs run-cell.sh reads from ITS OWN repo
+   root (tools_dir/../..), or when they differ from the harness worktree's (Codex P2: a standalone tools
+   copy passed preflight, then every cell died at genesis, exit 127).
+6. a caller-exported name (RUN, P, ARMS, ...) never deletes or overrides driver config: scrub_env un-exports
+   driver names and clears only the children's env (Codex P2: RUN exported -> scrub_env -> RUN unbound).
+7. the runtime watchers of the hand-written Job 4 driver are in every generated driver (s123: driver-body.sh had
+   none, so a node that died mid-cell was never flagged, the cell just looked slow): the golden check compares
+   the copied functions (watch_nodes, death, stopwin, memguard, hardscan, the samplers) with the Job 4 drivers
+   verbatim, and the cell() wiring (harness pid, watchers, samplers, the node-death branch) in order.
+8. a node that dies mid-cell (a stub pid that exits) gives <cell>/node-death.txt in the Job 4 format, a TERMed
+   harness, a "CELL FAIL ... death" line, and a cells.tsv row that cell_step flags death (+ a queued rerun);
+   the campaign goes on. Run for real: the generated cell() against a fake detach.sh / systemctl / run-cell.sh.
+9. memguard stops the cell unit when MemAvailable < 6 GB (a stubbed /proc/meminfo), and only then.
+10. the spec options samplers / host_checks (default on): sampler records, the fd stop, the sysctl record and
+   check (spec values, else pinned at the run's preflight), the MemAvailable preflight; off = none of them.
+"""
+
+import glob
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GEN = os.path.join(HERE, "campaign", "make-driver.py")
+EXAMPLE = os.path.join(HERE, "campaign", "driver-spec.example.json")
+FIX = os.path.join(HERE, "testdata", "make-driver")
+CELLFIX = os.path.join(HERE, "testdata", "cell-step")
+NODE_MD5_H = "03a2b75727727f972cf5e80865646f0d"
+
+
+def load_gen():
+    spec = importlib.util.spec_from_file_location("make_driver", GEN)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def md5_of(path):
+    import hashlib
+
+    return hashlib.md5(open(path, "rb").read()).hexdigest()
+
+
+# the genesis inputs run-cell.sh reads from its own repo root (MAINREPO = <tools_dir>/../..)
+GENESIS_FILES = {
+    "devnet/wsl/gen-3val-genesis.sh": "#!/bin/sh\necho fake gen-3val-genesis\n",
+    "devnet/wsl/bench-validator-keys.json": '{"keys": "fake"}\n',
+    "devnet/wsl/launch-3val.sh": "#!/bin/sh\necho fake launch\n",
+    "devnet/genesis.json": '{"genesis": "fake"}\n',
+    "testnet/lib/cargo-bin.sh": "cargo_bin() { echo fake; }\n",
+    "testnet/gen-weighted-genesis.sh": "#!/bin/sh\necho fake weighted\n",
+}
+TOOL_FILES = ["run-cell.sh", "cell-step.sh", "cell_step.py", "campaign/detach.sh"]
+
+
+def write_tree(root, files):
+    for rel, body in files.items():
+        f = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w") as fh:
+            fh.write(body)
+        if rel.endswith(".sh"):
+            os.chmod(f, 0o755)
+
+
+def frozen_fixture(tmp, complete=True):
+    """a fake harness worktree tmp/wt (its tracked genesis inputs) and a standalone frozen tools copy
+    tmp/ft/tools/matched-bench (copies of the tools the driver runs). complete: the frozen root tmp/ft also
+    carries the harness's genesis inputs + testnet/genesis-weighted-full.json, as Job 4's ozarchy-p4j4-tools
+    did. Returns (wt, tools)."""
+    wt = os.path.join(tmp, "wt")
+    if not os.path.exists(os.path.join(wt, "devnet")):
+        write_tree(wt, GENESIS_FILES)
+    ft = os.path.join(tmp, "ft")
+    tools = os.path.join(ft, "tools", "matched-bench")
+    for rel in TOOL_FILES:
+        dst = os.path.join(tools, rel)
+        if not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(HERE, rel), dst)
+    if complete:
+        write_tree(ft, GENESIS_FILES)
+        write_tree(
+            ft, {"testnet/genesis-weighted-full.json": '{"native_balances": []}\n'}
+        )
+    return wt, tools
+
+
+def minimal_spec(tmp, **over):
+    """a valid one-binary two-arm spec whose paths all live in tmp (the stage dir holds a fake node; the tools
+    are a complete frozen copy, frozen_fixture)"""
+    st = os.path.join(tmp, "stage", "b-run", "release")
+    os.makedirs(st, exist_ok=True)
+    node = os.path.join(st, "torus-node")
+    if not os.path.exists(node):
+        with open(node, "wb") as f:
+            f.write(b"\x7fELF fake node binary\x00\x01")
+        os.chmod(node, 0o755)
+        with open(os.path.join(st, "bench-throughput"), "wb") as f:
+            f.write(b"\x7fELF fake bench\x00")
+        os.chmod(os.path.join(st, "bench-throughput"), 0o755)
+    wt, tools = frozen_fixture(tmp)
+    s = {
+        "campaign": "test-camp",
+        "results_root": os.path.join(tmp, "res"),
+        "run_dir": os.path.join(tmp, "res", "test-camp-run"),
+        "label_prefix": "test-camp-10m",
+        "harness_worktree": wt,
+        "tools_dir": tools,
+        "devnet_dir": os.path.join(tmp, "devnet"),
+        "binaries": {"b": {"stage_dir": os.path.dirname(st), "node_md5": md5_of(node)}},
+        "markets": 10,
+        "duration_s": 120,
+        "replicates": 2,
+        "baseline": "A",
+        "arms": [
+            {"label": "A"},
+            {
+                "label": "M1",
+                "env": {"MALLOC_CONF": "dirty_decay_ms:1000", "TORUS_X_KNOB": "7"},
+            },
+        ],
+    }
+    s.update(over)
+    return s
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="make-driver-test-")
+        self.gen = load_gen()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write_spec(self, spec, name="spec.json"):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w") as f:
+            json.dump(spec, f)
+        return p
+
+    def generate(self, spec_path, name="driver.sh"):
+        out = os.path.join(self.tmp, name)
+        r = subprocess.run(
+            [sys.executable, "-I", GEN, spec_path, "-o", out],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return out
+
+    def lib(self, driver, script, env=None):
+        """run `script` after sourcing the driver in library mode (functions + config only)"""
+        e = dict(os.environ)
+        e.update(env or {})
+        src = "DRIVER_LIB_ONLY=1; source %s || exit 99\n%s" % (
+            shlex.quote(driver),
+            script,
+        )
+        return subprocess.run(
+            ["bash", "-c", src], capture_output=True, text=True, env=e, timeout=120
+        )
+
+    def plan(self, driver, smoke=False):
+        r = self.lib(driver, "show_plan%s" % (" smoke" if smoke else ""))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout.splitlines()
+
+
+# ---------------------------------------------------------------- golden (Job 4)
+
+
+def kv_dict(s):
+    d = {}
+    for kv in s.split():
+        k, _, v = kv.partition("=")
+        d[k] = v
+    return d
+
+
+def ref_tables(path):
+    """the arm / env / order tables of a hand-derived Job 4 driver (campaign-template lineage)"""
+    t = open(path).read()
+    aenv = dict(re.findall(r'^AENV\[(\w+)\]="([^"]*)"$', t, re.M))
+    arms = {}
+    for m in re.finditer(
+        r"^arm (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+)$", t, re.M
+    ):
+        a, b, tail, _knob, _prof, cloid, orc, mk = m.groups()
+        arms[a] = {"bin": b, "tail": tail, "cloid": cloid, "orc": orc, "mk": mk}
+    knobs = re.search(r'^KNOBS="([^"]*)"$', t, re.M).group(1)
+    cells_txt = re.search(r"^CELLS=\( (.*) \)$", t, re.M).group(1)
+    cells = [tuple(c.split(":")[:4]) for c in re.findall(r'"([^"]+)"', cells_txt)]
+    run, prefix = re.search(r"^RUN=\$R/(\S+); P=(\S+)$", t, re.M).groups()
+    budget = re.search(r"^BUDGET=(\d+)$", t, re.M).group(1)
+    depth = re.search(r"^DEPTH=(\d+)", t, re.M).group(1)
+    sha_b = re.search(r"^SHA_B=(\w+)$", t, re.M).group(1)
+    md5_row = re.search(
+        r'BMD5\[b\]=\$\(awk -v s="\$\{SHA_B:0:8\}" \'\$1=="(\w+)"', t
+    ).group(1)
+    # the harness env of cell(): E=(...) with the driver's per-arm values resolved (N = the launch arg 4)
+    e_txt = re.search(r"^    E=\((.*?)\)\n", t, re.M | re.S).group(1)
+    henv_tpl = dict(kv.split("=", 1) for kv in shlex.split(e_txt))
+    # env checks: armenvchk's absent list (node-env-all.txt) and heapchk's MALLOC_CONF
+    ae = re.search(r"^armenvchk\(\) \{.*?^\}\n", t, re.M | re.S).group(0)
+    absent_torus = re.search(r"for k in ([A-Z_ ]+); do", ae).group(1).split()
+    i = t.index('armenvchk "$label"')
+    assert "node-env-all.txt" in t[i : i + 120]
+    hc = re.search(r"^heapchk\(\) \{.*?^\}\n", t, re.M | re.S).group(0)
+    # the file heapchk reads MALLOC_CONF from: node-preload.txt in the fixed d driver; node-env-all.txt
+    # (TORUS_* only, so the check is vacuous) in the h driver, made before Job 4's false STOP fixed d
+    hc_files = set(re.findall(r'MALLOC_CONF=[^"]*" "\$o/(node-[a-z-]+\.txt)"', hc))
+    assert len(hc_files) == 1, hc
+    return {
+        "aenv": aenv,
+        "arms": arms,
+        "knobs": knobs,
+        "cells": cells,
+        "run": run,
+        "prefix": prefix,
+        "budget": budget,
+        "depth": depth,
+        "sha_b": sha_b,
+        "md5_row": md5_row,
+        "henv_tpl": henv_tpl,
+        "absent_torus": absent_torus,
+        "malloc_file": hc_files.pop(),
+    }
+
+
+def ref_harness_env(ref, arm):
+    a = ref["arms"][arm]
+    sub = {
+        "$mif": "4",
+        "$bud": ref["budget"],
+        "${AORC[$arm]}": a["orc"],
+        "$tail": a["tail"],
+        "$DEPTH": ref["depth"],
+        "${ACLOID[$arm]}": a["cloid"],
+    }
+    out = {}
+    for k, v in ref["henv_tpl"].items():
+        if k in ("TARGET_DIR", "TOOLS_DIR", "DATA_ROOT"):
+            continue  # paths: compared separately
+        out[k] = sub.get(v, v)
+    return out
+
+
+def ref_checks(ref, arm):
+    """(present, absent) env checks of the reference driver for one arm: name -> (value, file)"""
+    present = {}
+    for k, v in kv_dict(ref["knobs"]).items():
+        present[k] = (v, "node-env-all.txt")  # envok / knobok / statschk
+    for k, v in kv_dict(ref["aenv"][arm]).items():
+        present[k] = (
+            v,
+            ref["malloc_file"] if k == "MALLOC_CONF" else "node-env-all.txt",
+        )
+    absent = {k: "node-env-all.txt" for k in ref["absent_torus"] if k not in present}
+    if "MALLOC_CONF" not in present:
+        absent["MALLOC_CONF"] = ref["malloc_file"]
+    return present, absent
+
+
+def gen_tables(lines):
+    arms, henv, present, absent, cells = {}, {}, {}, {}, []
+    paths = {}
+    for ln in lines:
+        f = ln.split(" ")
+        if f[0] == "ARM":
+            arms[f[1]] = {
+                "bin": f[2],
+                "md5": f[3],
+                "xe": ln.split(" xe=", 1)[1] if " xe=" in ln else "",
+            }
+        elif f[0] == "HENV":
+            henv.setdefault(f[1], {})
+            if len(f) > 2:
+                k, _, v = f[2].partition("=")
+                henv[f[1]][k] = v
+        elif f[0] == "PRESENT":
+            k, _, v = f[2].partition("=")
+            present.setdefault(f[1], {})[k] = (v, f[3])
+        elif f[0] == "ABSENT":
+            absent.setdefault(f[1], {})[f[2]] = f[3]
+        elif f[0] == "CELL":
+            cells.append((f[1], f[2], f[3], f[4]))
+        elif f[0] == "PATH":
+            paths[f[1]] = f[2]
+    return arms, henv, present, absent, cells, paths
+
+
+# the Job 4 drivers' runtime watchers and samplers, copied verbatim into driver-body.sh. memguard reads
+# "$PROC/meminfo" (DRIVER_PROC: a test stubs it) where the hand driver read /proc/meminfo; watch_nodes keeps its
+# restart-cell branch (CRASHCELL=0 in the body: restart cells are a SPEC ERROR)
+VERBATIM_FUNCS = (
+    "stopbg",
+    "death",
+    "lastline",
+    "watch_nodes",
+    "stopwin",
+    "memguard",
+    "hardscan",
+    "dusamp",
+    "ckptsamp",
+    "memsamp",
+    "fdsampler",
+    "fdsum",
+    "dumeas",
+    "savelog",
+)
+FUNC_SUBST = {"memguard": ("/proc/meminfo", '"$PROC/meminfo"')}
+# cell(): the Job 4 drivers' watcher and sampler wiring, in their order (lines compared stripped)
+CELL_WIRING = [
+    'dusamp "$R/$label" & DP=$!',
+    'ckptsamp "$R/$label" & KP=$!',
+    'memsamp "$R/$label" & MP=$!',
+    'fdsampler "$R/$label" & FP=$!',
+    'timeout $((dur + 1200)) vmstat -n -t 1 > "$R/$label/vmstat-1hz.txt" 2>&1 & VMP=$!',
+    'until mp=$(systemctl --user show -p MainPID --value "$unit.service" 2>/dev/null) && [ -n "$mp" ] && [ "$mp" != 0 ] \\',
+    '&& HP=$(pgrep -P "$mp" | head -1) && [ -n "$HP" ]; do',
+    'watch_nodes "$R/$label" "$HP" & WP=$!',
+    'memguard "$unit" & GP=$!',
+    'until [ -e "$rcf" ] || ! systemctl --user is-active -q "$unit.service"; do sleep 2; done',
+    'wait "$WP"',
+    'savelog "$label"',
+    'if [ -e "$R/$label/node-death.txt" ]; then',
+    'hardscan "$label"',
+]
+# cell(): the Job 4 drivers' failure handling around them (substrings)
+CELL_HANDLING = [
+    'sysctlchk "$label" start || { CELL_FAIL=abort-sysctl; return 1; }',
+    "CELL_FAIL=abort-no-pid",
+    'CELL FAIL $label rc=$rc death: $(cat "$R/$label/node-death.txt") -> continuing',
+    "CELL_FAIL=abort-node-left",
+    'echo "[$label] $(fdsum "$label")" || true; fdsum "$label" > /dev/null || fdok=1',
+    'sysctlchk "$label" end',
+    "STOP: a node held > $FD_STOP open fds in $label",
+    "CELL_FAIL=stop-fd",
+]
+
+
+def func_text(text, name):
+    """the bash function `name() {...}` of a driver: its line (a one-line function), else from its first line to
+    the next line that is just '}'"""
+    m = re.search(r"^%s\(\) \{[^\n]*\n" % re.escape(name), text, re.M)
+    if not m:
+        return None
+    if m.group(0).rstrip().endswith("; }"):
+        return m.group(0)
+    return text[m.start() : text.index("\n}\n", m.start()) + 3]
+
+
+class GoldenTest(Base):
+    def assert_watchers(self, kind, drv):
+        """the regenerated Job 4 driver carries the hand driver's watcher blocks (s123: node-death.txt was never
+        written by a generated driver, so cell_step's death flag could not fire)"""
+        hand = open(os.path.join(FIX, "ozarchy-p4j4-%s-campaign.sh" % kind)).read()
+        gen = open(drv).read()
+        for name in VERBATIM_FUNCS:
+            h, g = func_text(hand, name), func_text(gen, name)
+            self.assertIsNotNone(h, "%s is not in the Job 4 %s driver" % (name, kind))
+            self.assertIsNotNone(g, "%s is missing from the generated driver" % name)
+            if name in FUNC_SUBST:
+                self.assertIn(FUNC_SUBST[name][0], h)
+                h = h.replace(*FUNC_SUBST[name])
+            self.assertEqual(
+                g, h, "%s differs from the Job 4 %s driver's" % (name, kind)
+            )
+        for who, txt in (("Job 4 " + kind, hand), ("generated", gen)):
+            body = func_text(txt, "cell")
+            lines = [ln.strip() for ln in body.splitlines()]
+            self.assertEqual(
+                [m for m in CELL_WIRING if m not in lines], [], "%s cell()" % who
+            )
+            idx = [lines.index(m) for m in CELL_WIRING]
+            self.assertEqual(idx, sorted(idx), "%s cell(): wiring order" % who)
+            for s in CELL_HANDLING:
+                self.assertIn(s, body, "%s cell()" % who)
+        # the values: the phase's dirty limits (sysctlchk), the preflight MemAvailable floor, the fd stop
+        plan = self.plan(drv)
+        phase = re.search(r"^PHASE=(\d+)$", hand, re.M).group(1)
+        dirty, dbg = re.search(
+            r"^\s*%s\) DIRTY_WANT=(\d+); DBG_WANT=(\d+) ;;$" % phase, hand, re.M
+        ).groups()
+        mem = re.search(
+            r"/proc/meminfo\)\" -ge (\d+) \] \|\| PF \"MemAvailable", hand
+        ).group(1)
+        fd = re.search(r"^FD_STOP=(\d+)$", hand, re.M).group(1)
+        self.assertIn("WATCH node-death memguard hardscan", plan)
+        self.assertIn(
+            "SAMPLERS on du mem metrics fd vmstat rocksdb-log fd_stop=%s" % fd, plan
+        )
+        self.assertIn("HOSTCHECK on min_mem_avail_kb=%s" % mem, plan)
+        self.assertIn("SYSCTL vm.dirty_bytes %s" % dirty, plan)
+        self.assertIn("SYSCTL vm.dirty_background_bytes %s" % dbg, plan)
+
+    def golden(self, kind):
+        ref = ref_tables(os.path.join(FIX, "ozarchy-p4j4-%s-campaign.sh" % kind))
+        # the one intended difference: MALLOC_CONF is read from node-preload.txt (the h driver read node-env-all.txt)
+        self.assertEqual(
+            ref["malloc_file"], {"h": "node-env-all.txt", "d": "node-preload.txt"}[kind]
+        )
+        ref["malloc_file"] = "node-preload.txt"
+        drv = self.generate(
+            os.path.join(FIX, "p4j4-%s.json" % kind), "p4j4-%s.sh" % kind
+        )
+        r = subprocess.run(["bash", "-n", drv], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        arms, henv, present, absent, cells, paths = gen_tables(self.plan(drv))
+        # arms, binary, md5 (the reference reads md5s.txt row N bdd59888 -> the Job 4 node md5)
+        self.assertEqual(sorted(arms), sorted(ref["aenv"]))
+        self.assertEqual(ref["md5_row"], "N")
+        for a in arms:
+            self.assertEqual(arms[a]["md5"], NODE_MD5_H, a)
+            # node env = KNOBS + the arm's AENV (the reference's xe), as a dict
+            want = kv_dict(ref["knobs"])
+            want.update(kv_dict(ref["aenv"][a]))
+            self.assertEqual(kv_dict(arms[a]["xe"]), want, a)
+            self.assertEqual(henv[a], ref_harness_env(ref, a), a)
+            rp, ra = ref_checks(ref, a)
+            self.assertEqual(present.get(a, {}), rp, a)
+            self.assertEqual(absent.get(a, {}), ra, a)
+        # order, replicates, durations, kinds, warm-up first
+        self.assertEqual(cells, ref["cells"])
+        self.assertEqual(paths["RUN"], "/home/oz/bench-results-matched/" + ref["run"])
+        self.assertEqual(paths["P"], ref["prefix"])
+        self.assertEqual(paths["MARKETS"], ref["arms"][cells[0][1]]["mk"])
+        self.assertEqual(paths["RATE"], "76000")
+        self.assert_watchers(kind, drv)
+        return ref, cells
+
+    def test_golden_horizon(self):
+        _, cells = self.golden("h")
+        self.assertEqual(len(cells), 16)
+
+    def test_golden_decay(self):
+        _, cells = self.golden("d")
+        self.assertEqual(len(cells), 10)
+
+    def test_example_spec_generates(self):
+        drv = self.generate(EXAMPLE, "example.sh")
+        r = subprocess.run(["bash", "-n", drv], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_rotation_and_fixed_order(self):
+        rot = self.gen.cell_list(["A", "B", "C"], 4, "rotate", 120, ("w1", "A", 60))
+        self.assertEqual(
+            [c[0] for c in rot],
+            [
+                "w1",
+                "r1-A",
+                "r1-B",
+                "r1-C",
+                "r2-B",
+                "r2-C",
+                "r2-A",
+                "r3-C",
+                "r3-A",
+                "r3-B",
+                "r4-A",
+                "r4-B",
+                "r4-C",
+            ],
+        )
+        fx = self.gen.cell_list(["A", "B"], 2, "fixed", 120, None)
+        self.assertEqual([c[0] for c in fx], ["r1-A", "r1-B", "r2-A", "r2-B"])
+        ex = self.gen.cell_list(
+            ["A", "B"], 2, ["r1:A", "r1:B", "r2:B", "r2:A"], 120, None
+        )
+        self.assertEqual(
+            [c[:2] for c in ex],
+            [("r1-A", "A"), ("r1-B", "B"), ("r2-B", "B"), ("r2-A", "A")],
+        )
+
+
+# ---------------------------------------------------------------- env check
+
+
+def node_files(cell, torus_lines, preload_lines):
+    os.makedirs(cell, exist_ok=True)
+    with open(os.path.join(cell, "node-env-all.txt"), "w") as f:
+        f.write(
+            "".join("pid=%d %s\n" % (100 + i, ln) for i, ln in enumerate(torus_lines))
+        )
+    with open(os.path.join(cell, "node-preload.txt"), "w") as f:
+        f.write(
+            "".join("pid=%d %s\n" % (100 + i, ln) for i, ln in enumerate(preload_lines))
+        )
+
+
+class EnvCheckTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        self.cell = os.path.join(self.tmp, "cell")
+
+    def chk(self, arm):
+        return self.lib(self.drv, "envchk %s %s" % (shlex.quote(self.cell), arm))
+
+    def test_malloc_conf_missing_from_preload_fails(self):
+        """M1's MALLOC_CONF is in node-env-all.txt (TORUS_* only in real cells) but not in node-preload.txt: FAIL"""
+        node_files(self.cell, ["TORUS_X_KNOB=7 "] * 3, ["", "", ""])
+        with open(os.path.join(self.cell, "node-env-all.txt"), "a") as f:
+            f.write(
+                ""
+            )  # node-env-all.txt never carries MALLOC_CONF; the check must not look there
+        r = self.chk("M1")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("CHECK FAIL", r.stdout)
+        self.assertIn("MALLOC_CONF", r.stdout)
+        self.assertIn("node-preload.txt", r.stdout)
+
+    def test_malloc_conf_present_in_preload_passes(self):
+        node_files(
+            self.cell, ["TORUS_X_KNOB=7 "] * 3, ["MALLOC_CONF=dirty_decay_ms:1000 "] * 3
+        )
+        r = self.chk("M1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("CHECK OK", r.stdout)
+
+    def test_malloc_conf_on_two_of_three_nodes_fails(self):
+        node_files(
+            self.cell,
+            ["TORUS_X_KNOB=7 "] * 3,
+            ["MALLOC_CONF=dirty_decay_ms:1000 "] * 2 + [""],
+        )
+        self.assertNotEqual(self.chk("M1").returncode, 0)
+
+    def test_baseline_with_malloc_conf_fails(self):
+        """an arm that does not set MALLOC_CONF must run without it (jemalloc defaults)"""
+        node_files(self.cell, [""] * 3, ["MALLOC_CONF=dirty_decay_ms:1000 "] * 3)
+        r = self.chk("A")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        node_files(self.cell, [""] * 3, [""] * 3)
+        r = self.chk("A")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_torus_knob_checked_in_node_env_all(self):
+        node_files(
+            self.cell,
+            ["TORUS_X_KNOB=7 "] * 2 + [""],
+            ["MALLOC_CONF=dirty_decay_ms:1000 "] * 3,
+        )
+        r = self.chk("M1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("TORUS_X_KNOB=7", r.stdout)
+        self.assertIn("node-env-all.txt", r.stdout)
+        # another arm's knob on the baseline: FAIL
+        node_files(self.cell, ["TORUS_X_KNOB=7 "] * 3, [""] * 3)
+        self.assertNotEqual(self.chk("A").returncode, 0)
+
+    def test_wrong_value_fails(self):
+        node_files(
+            self.cell, ["TORUS_X_KNOB=8 "] * 3, ["MALLOC_CONF=dirty_decay_ms:1000 "] * 3
+        )
+        self.assertNotEqual(self.chk("M1").returncode, 0)
+
+    def test_record_writes_preload_from_process_env(self):
+        """envrec_now: MALLOC_CONF from each node's environ goes to node-preload.txt, TORUS_* to node-env-all.txt"""
+        proc, dev = fake_proc(
+            self.tmp,
+            os.path.join(self.tmp, "stage", "b-run", "release", "torus-node"),
+            ["TORUS_X_KNOB=7", "MALLOC_CONF=dirty_decay_ms:1000", "HOME=/x"],
+        )
+        os.makedirs(self.cell, exist_ok=True)
+        r = self.lib(
+            self.drv,
+            "DEVNET=%s; envrec_now %s && envchk %s M1"
+            % (shlex.quote(dev), shlex.quote(self.cell), shlex.quote(self.cell)),
+            env={"DRIVER_PROC": proc},
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        pre = open(os.path.join(self.cell, "node-preload.txt")).read()
+        allv = open(os.path.join(self.cell, "node-env-all.txt")).read()
+        self.assertEqual(pre.count("MALLOC_CONF=dirty_decay_ms:1000"), 3, pre)
+        self.assertNotIn("MALLOC_CONF", allv)
+        self.assertEqual(allv.count("TORUS_X_KNOB=7"), 3)
+
+
+# ---------------------------------------------------------------- md5 check
+
+
+def fake_proc(tmp, exe, environ):
+    """a fake /proc with 3 node pids whose exe links to `exe`, and a devnet pids file"""
+    proc = os.path.join(tmp, "proc")
+    dev = os.path.join(tmp, "devnet")
+    os.makedirs(os.path.join(dev, "run"), exist_ok=True)
+    pids = [4101, 4102, 4103]
+    for p in pids:
+        d = os.path.join(proc, str(p))
+        os.makedirs(d, exist_ok=True)
+        if os.path.lexists(os.path.join(d, "exe")):
+            os.remove(os.path.join(d, "exe"))
+        os.symlink(exe, os.path.join(d, "exe"))
+        with open(os.path.join(d, "environ"), "wb") as f:
+            f.write(b"\0".join(x.encode() for x in environ) + b"\0")
+    with open(os.path.join(dev, "run", "pids"), "w") as f:
+        f.write("\n".join(map(str, pids)) + "\n")
+    return proc, dev
+
+
+class Md5Test(Base):
+    def setUp(self):
+        super().setUp()
+        rel = os.path.join(self.tmp, "real", "release")
+        os.makedirs(rel)
+        self.real = os.path.join(rel, "torus-node")
+        with open(self.real, "wb") as f:
+            f.write(b"\x7fELF the real node\x00")
+        os.chmod(self.real, 0o755)
+        wst = os.path.join(self.tmp, "stage", "w-run", "release")
+        os.makedirs(wst)
+        self.wrapper = os.path.join(wst, "torus-node")
+        with open(self.wrapper, "w") as f:
+            f.write(
+                '#!/bin/sh\nexport LD_PRELOAD=/usr/lib/libjemalloc.so.2\nexec %s "$@"\n'
+                % self.real
+            )
+        os.chmod(self.wrapper, 0o755)
+        self.assertNotEqual(md5_of(self.real), md5_of(self.wrapper))
+        spec = minimal_spec(self.tmp)
+        spec["binaries"]["w"] = {
+            "stage_dir": os.path.dirname(wst),
+            "node_md5": md5_of(self.real),
+            "wrapper": True,
+        }
+        for a in spec["arms"]:
+            a["binary"] = "b"
+        spec["arms"].append({"label": "GJ", "binary": "w"})
+        self.spec = spec
+        self.drv = self.generate(self.write_spec(spec))
+        self.cell = os.path.join(self.tmp, "cell")
+        os.makedirs(self.cell)
+
+    def test_md5_hashes_running_exe_not_wrapper(self):
+        """the wrapper arm's node runs the real exe (/proc/PID/exe): md5 = real node md5 -> OK"""
+        proc, dev = fake_proc(
+            self.tmp, self.real, ["LD_PRELOAD=/usr/lib/libjemalloc.so.2"]
+        )
+        r = self.lib(
+            self.drv,
+            "DEVNET=%s; envrec_now %s && md5chk %s GJ"
+            % (shlex.quote(dev), shlex.quote(self.cell), shlex.quote(self.cell)),
+            env={"DRIVER_PROC": proc},
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rec = open(os.path.join(self.cell, "node-environ-trie.txt")).read()
+        self.assertEqual(rec.count("exe_md5=" + md5_of(self.real)), 3, rec)
+        self.assertNotIn(md5_of(self.wrapper), rec)
+
+    def test_md5_mismatch_fails(self):
+        """a node that runs the wrapper file itself (not the real exe) does not match the arm md5"""
+        proc, dev = fake_proc(self.tmp, self.wrapper, [])
+        r = self.lib(
+            self.drv,
+            "DEVNET=%s; envrec_now %s && md5chk %s GJ"
+            % (shlex.quote(dev), shlex.quote(self.cell), shlex.quote(self.cell)),
+            env={"DRIVER_PROC": proc},
+        )
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("CHECK FAIL", r.stdout)
+
+    def test_preflight_resolves_wrapper_target(self):
+        """dry preflight: a wrapper binary's staged md5 is the md5 of the node it execs"""
+        r = subprocess.run(
+            ["bash", self.drv, "dry"], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PREFLIGHT OK", r.stdout)
+        # the same wrapper declared as a plain binary: its own md5 is not the node md5 -> PREFLIGHT FAIL
+        self.spec["binaries"]["w"]["wrapper"] = False
+        drv2 = self.generate(self.write_spec(self.spec, "spec2.json"), "driver2.sh")
+        r = subprocess.run(
+            ["bash", drv2, "dry"], capture_output=True, text=True, timeout=60
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("PREFLIGHT FAIL", r.stdout)
+
+    def test_wrapper_arm_skips_summary_md5_in_step(self):
+        """the step's summary.json md5 is run-cell.sh's hash of the staged file (the wrapper): off for wrapper arms"""
+        r = self.lib(self.drv, "step_summary_md5 GJ; step_summary_md5 A")
+        self.assertEqual(r.stdout.split(), ["0", "1"], r.stdout + r.stderr)
+
+
+class CellStepSummaryMd5Test(unittest.TestCase):
+    """cell_step.py --no-summary-md5: only the running-process records count"""
+
+    def test_flag(self):
+        tmp = tempfile.mkdtemp(prefix="make-driver-step-")
+        try:
+            lb = "ozarchy-p3gate-300m-r1-m"
+            cell = os.path.join(tmp, lb)
+            shutil.copytree(os.path.join(CELLFIX, lb), cell)
+            shutil.copy(os.path.join(CELLFIX, lb + ".cell.rc"), cell + ".cell.rc")
+            sp = os.path.join(cell, "summary.json")
+            s = json.load(open(sp))
+            s["binaries"]["torus_node_md5"] = (
+                "0123456789abcdef0123456789abcdef"  # a wrapper's md5
+            )
+            json.dump(s, open(sp, "w"))
+            base = [
+                sys.executable,
+                "-I",
+                os.path.join(HERE, "cell_step.py"),
+                "record",
+                "--cell-dir",
+                cell,
+                "--label",
+                lb,
+                "--tag",
+                "r1-m",
+                "--arm",
+                "m",
+                "--rep",
+                "r1",
+                "--staged-md5",
+                "f10815747be79f22f502b51a8cd466eb",
+            ]
+            run1 = os.path.join(tmp, "run1")
+            run2 = os.path.join(tmp, "run2")
+            os.makedirs(run1)
+            os.makedirs(run2)
+            r = subprocess.run(
+                base + ["--run-dir", run1], capture_output=True, text=True
+            )
+            self.assertIn(
+                "bad:md5",
+                open(os.path.join(run1, "cells.tsv")).read(),
+                r.stdout + r.stderr,
+            )
+            r = subprocess.run(
+                base + ["--run-dir", run2, "--no-summary-md5"],
+                capture_output=True,
+                text=True,
+            )
+            row = (
+                open(os.path.join(run2, "cells.tsv")).read().splitlines()[1].split("\t")
+            )
+            self.assertEqual(row[5], "yes", r.stdout + r.stderr)
+            self.assertEqual(row[7], "ok", row)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- cells.tsv, CELL-FLAG, smoke, done marker
+
+
+class DriverFlowTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.spec = minimal_spec(self.tmp)
+        self.drv = self.generate(self.write_spec(self.spec))
+        self.R = self.spec["results_root"]
+        self.RUN = self.spec["run_dir"]
+        os.makedirs(self.RUN, exist_ok=True)
+
+    def test_run_spec_rows_and_cell_flag(self):
+        """run_spec (generated body) with a stub cell(): clean cell -> ok row; failed check -> bad:check row,
+        CELL-FLAG line in campaign.log, queued rerun"""
+        lb = "ozarchy-p3gate-300m-r1-m"
+        stub = r"""
+source "$TOOLS/cell-step.sh"
+export CELL_STEP_LOG=$RUN/campaign.log
+BMD5[b]=f10815747be79f22f502b51a8cd466eb
+cell() { local label=$P-$1
+    cp -r %(fix)s "$R/$label"; echo rc=0 > "$R/$label.cell.rc"; STARTED_LABEL=$label
+    [ "$1" = r1-M1 ] && { echo "CHECK FAIL $label: x"; CELL_FAIL=check; return 1; }
+    return 0; }
+run_spec "r1-A:A:120:none:"; echo "a=$?"
+run_spec "r1-M1:M1:120:none:"; echo "m=$?"
+""" % {"fix": shlex.quote(os.path.join(CELLFIX, lb))}
+        r = self.lib(self.drv, stub)
+        self.assertIn("a=0", r.stdout, r.stdout + r.stderr)
+        self.assertIn("m=1", r.stdout, r.stdout + r.stderr)
+        rows = [
+            ln.split("\t")
+            for ln in open(os.path.join(self.RUN, "cells.tsv")).read().splitlines()
+        ]
+        self.assertEqual(rows[0], "label arm rep rc agree md5_ok metric flag".split())
+        self.assertEqual(
+            [(x[0], x[1], x[2], x[7]) for x in rows[1:]],
+            [
+                ("test-camp-10m-r1-A", "A", "r1", "ok"),
+                ("test-camp-10m-r1-M1", "M1", "r1", "bad:check"),
+            ],
+        )
+        log = open(os.path.join(self.RUN, "campaign.log")).read()
+        self.assertIn("CELL-FLAG test-camp-10m-r1-M1 check", log)
+        self.assertIn(
+            "test-camp-10m-r1-M1-rerun",
+            open(os.path.join(self.RUN, "rerun-queue.tsv")).read(),
+        )
+
+    def test_dry_lists_warmup_first_and_smoke_alone(self):
+        r = subprocess.run(
+            ["bash", self.drv, "dry"], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cells = self.plan(self.drv)
+        tags = [ln.split()[1] for ln in cells if ln.startswith("CELL ")]
+        self.assertEqual(tags, ["w1", "r1-A", "r1-M1", "r2-M1", "r2-A"])
+        sm = [ln for ln in self.plan(self.drv, smoke=True) if ln.startswith("CELL ")]
+        self.assertEqual(len(sm), 1)
+        self.assertEqual(sm[0].split()[1:4], ["s0", "A", "60"])
+        paths = gen_tables(self.plan(self.drv, smoke=True))[5]
+        self.assertEqual(paths["RUN"], self.RUN + "/smoke")
+        self.assertEqual(paths["P"], "test-camp-10m-smoke")
+
+    def test_run_outside_unit_refuses_and_writes_done(self):
+        """`run` outside a bench-*.service unit: PREFLIGHT FAIL (launch goes through detach.sh, which holds the
+        build lock), and campaign.done carries the exit code so the waiting session never hangs"""
+        r = subprocess.run(
+            ["bash", self.drv, "run"], capture_output=True, text=True, timeout=60
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("PREFLIGHT FAIL", r.stdout)
+        done = open(os.path.join(self.RUN, "campaign.done")).read()
+        self.assertTrue(done.startswith("exit=1"), done)
+
+    def test_launch_goes_through_detach(self):
+        """`launch` execs DETACH NAME RUN/campaign.log DRIVER run (detach.sh takes the build lock)"""
+        fake = os.path.join(self.tmp, "fake-detach.sh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/bash\necho "DETACH $*"\n')
+        os.chmod(fake, 0o755)
+        r = subprocess.run(
+            ["bash", self.drv, "launch"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=dict(os.environ, DRIVER_DETACH=fake),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(
+            "DETACH test-camp %s/campaign.log %s run"
+            % (self.RUN, os.path.realpath(self.drv)),
+            r.stdout,
+        )
+        r = subprocess.run(
+            ["bash", self.drv, "launch", "smoke"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=dict(os.environ, DRIVER_DETACH=fake),
+        )
+        self.assertIn(
+            "DETACH test-camp-smoke %s/smoke/campaign.log %s run smoke"
+            % (self.RUN, os.path.realpath(self.drv)),
+            r.stdout,
+        )
+
+    def test_body_wiring(self):
+        t = open(self.drv).read()
+        self.assertIn("cell_step_rerun_pass", t)
+        self.assertNotRegex(t, r"cell_step [^\n]*&\s*$")
+        self.assertIn("campaign.done", t)
+        self.assertIn('"$DETACH" "$label"', t)  # every cell in its own bench unit
+
+    def test_expect_and_market_checks(self):
+        spec = minimal_spec(
+            self.tmp,
+            expect=[{"file": "run.log", "regex": "oracle feed pid [0-9]+;", "min": 1}],
+        )
+        spec["arms"][1]["expect"] = [
+            {"file": "run.log", "regex": "admission horizon", "min": 0, "max": 0}
+        ]
+        drv = self.generate(self.write_spec(spec, "s3.json"), "d3.sh")
+        cell = os.path.join(self.tmp, "c3")
+        os.makedirs(cell)
+        with open(os.path.join(cell, "run.log"), "w") as f:
+            f.write("[x] oracle feed pid 123; ok\n")
+        with open(os.path.join(cell, "summary.json"), "w") as f:
+            json.dump({"cell": {"markets": 10}}, f)
+        q = shlex.quote(cell)
+        self.assertEqual(
+            self.lib(drv, "expectchk %s M1 && marketchk %s" % (q, q)).returncode, 0
+        )
+        with open(os.path.join(cell, "run.log"), "a") as f:
+            f.write("admission horizon 5000\n")
+        self.assertNotEqual(self.lib(drv, "expectchk %s M1" % q).returncode, 0)
+        self.assertEqual(self.lib(drv, "expectchk %s A" % q).returncode, 0)
+        with open(os.path.join(cell, "summary.json"), "w") as f:
+            json.dump({"cell": {"markets": 300}}, f)
+        self.assertNotEqual(self.lib(drv, "marketchk %s" % q).returncode, 0)
+
+
+# ---------------------------------------------------------------- bad specs
+
+
+class SpecValidationTest(Base):
+    def bad(self, spec, needle):
+        with self.assertRaises(self.gen.SpecError) as cm:
+            self.gen.validate(spec)
+        self.assertIn(needle, str(cm.exception))
+
+    def test_minimal_ok(self):
+        self.gen.validate(minimal_spec(self.tmp))
+
+    def test_unknown_top_key(self):
+        self.bad(minimal_spec(self.tmp, cell_secs=60), "cell_secs")
+
+    def test_unknown_arm_key(self):
+        s = minimal_spec(self.tmp)
+        s["arms"][0]["knob"] = "x"
+        self.bad(s, "knob")
+
+    def test_unknown_binary_key(self):
+        s = minimal_spec(self.tmp)
+        s["binaries"]["b"]["md5"] = "x"
+        self.bad(s, "md5")
+
+    def test_missing_baseline_arm(self):
+        self.bad(minimal_spec(self.tmp, baseline="Z"), "baseline")
+
+    def test_duplicate_arm(self):
+        s = minimal_spec(self.tmp)
+        s["arms"].append({"label": "A"})
+        self.bad(s, "duplicate")
+
+    def test_missing_required(self):
+        s = minimal_spec(self.tmp)
+        del s["replicates"]
+        self.bad(s, "replicates")
+
+    def test_unknown_binary_ref(self):
+        s = minimal_spec(self.tmp)
+        s["arms"][1]["binary"] = "nope"
+        self.bad(s, "nope")
+
+    def test_env_value_with_space(self):
+        s = minimal_spec(self.tmp)
+        s["arms"][1]["env"]["MALLOC_CONF"] = "a b"
+        self.bad(s, "MALLOC_CONF")
+
+    def test_reserved_harness_env(self):
+        self.bad(minimal_spec(self.tmp, harness_env={"TARGET_DIR": "/x"}), "TARGET_DIR")
+        self.bad(
+            minimal_spec(self.tmp, harness_env={"CRASH_KILL_AT_S": "40"}),
+            "CRASH_KILL_AT_S",
+        )
+
+    def test_bad_md5(self):
+        s = minimal_spec(self.tmp)
+        s["binaries"]["b"]["node_md5"] = "xyz"
+        self.bad(s, "node_md5")
+
+    def test_explicit_order_unknown_arm(self):
+        s = minimal_spec(self.tmp, order=["r1:A", "r1:Q"])
+        del s["replicates"]
+        self.bad(s, "Q")
+        s["order"] = ["r1:A", "r1:M1"]
+        self.gen.validate(s)
+        self.bad(minimal_spec(self.tmp, order=["r1:A", "r1:M1"]), "replicates")
+
+    def test_generator_cli_rejects_bad_spec(self):
+        p = self.write_spec(minimal_spec(self.tmp, baseline="Z"))
+        r = subprocess.run(
+            [sys.executable, "-I", GEN, p, "-o", os.path.join(self.tmp, "x.sh")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("SPEC ERROR", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "x.sh")))
+
+
+class Md5SourceTest(Base):
+    def test_md5_file_rows(self):
+        """node_row / bench_row read md5s.txt (last line whose first two columns match), as the Job 4 driver's awk"""
+        mf = os.path.join(self.tmp, "md5s.txt")
+        with open(mf, "w") as f:
+            f.write(
+                "# comment\nN bdd59888 %s\nbench-F ff822b95 %s\nN bdd59888 %s\n"
+                % ("1" * 32, "2" * 32, "3" * 32)
+            )
+        s = minimal_spec(self.tmp)
+        st = s["binaries"]["b"]["stage_dir"]
+        s["binaries"]["b"] = {
+            "stage_dir": st,
+            "md5_file": mf,
+            "node_row": "N bdd59888",
+            "bench_row": "bench-F ff822b95",
+        }
+        p = self.gen.validate(s)
+        self.assertEqual(p["binaries"]["b"]["node_md5"], "3" * 32)
+        self.assertEqual(p["binaries"]["b"]["bench_md5"], "2" * 32)
+        s["binaries"]["b"]["node_row"] = "N 00000000"
+        with self.assertRaises(self.gen.SpecError):
+            self.gen.validate(s)
+        s["binaries"]["b"] = {
+            "stage_dir": st,
+            "node_md5": "3" * 32,
+            "node_row": "N bdd59888",
+            "md5_file": mf,
+        }
+        with self.assertRaises(self.gen.SpecError):
+            self.gen.validate(s)
+
+    def test_md5chk_accepts_older_8_char_records(self):
+        """records of older drivers (exe_md5=<first 8>) are matched as a prefix; another md5 still fails"""
+        spec = minimal_spec(self.tmp)
+        drv = self.generate(self.write_spec(spec))
+        want = spec["binaries"]["b"]["node_md5"]
+        cell = os.path.join(self.tmp, "c8")
+        os.makedirs(cell)
+        with open(os.path.join(cell, "node-environ-trie.txt"), "w") as f:
+            f.write(
+                "".join(
+                    "pid=%d exe_md5=%s TRIE_VAR_MISSING\n" % (i, want[:8])
+                    for i in range(3)
+                )
+            )
+        self.assertEqual(self.lib(drv, "md5chk %s A" % shlex.quote(cell)).returncode, 0)
+        with open(os.path.join(cell, "node-environ-trie.txt"), "w") as f:
+            f.write("".join("pid=%d exe_md5=%s\n" % (i, "0" * 8) for i in range(3)))
+        self.assertNotEqual(
+            self.lib(drv, "md5chk %s A" % shlex.quote(cell)).returncode, 0
+        )
+
+
+class ExpectMissingFileTest(Base):
+    def test_missing_file_fails_even_for_zero_match(self):
+        """an expectation on a file the cell lacks is a CHECK FAIL, also for min 0 / max 0 (absence) expectations"""
+        spec = minimal_spec(
+            self.tmp,
+            expect=[{"file": "missing.log", "regex": "panic", "min": 0, "max": 0}],
+        )
+        drv = self.generate(self.write_spec(spec, "sx.json"), "dx.sh")
+        cell = os.path.join(self.tmp, "cx")
+        os.makedirs(cell)
+        r = self.lib(drv, "expectchk %s A" % shlex.quote(cell))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("CHECK FAIL", r.stdout)
+        self.assertIn("missing.log", r.stdout)
+        open(os.path.join(cell, "missing.log"), "w").write("all fine\n")
+        self.assertEqual(
+            self.lib(drv, "expectchk %s A" % shlex.quote(cell)).returncode, 0
+        )
+
+    def test_grep_error_fails(self):
+        """a regex grep -E rejects (Python accepted it) is a CHECK FAIL, not 0 matches"""
+        spec = minimal_spec(
+            self.tmp,
+            expect=[{"file": "run.log", "regex": "[[:foo:]]", "min": 0, "max": 0}],
+        )
+        drv = self.generate(self.write_spec(spec, "sg.json"), "dg.sh")
+        cell = os.path.join(self.tmp, "cg")
+        os.makedirs(cell)
+        open(os.path.join(cell, "run.log"), "w").write("x\n")
+        r = self.lib(drv, "expectchk %s A" % shlex.quote(cell))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+
+
+# ---------------------------------------------------------------- frozen tools: genesis inputs (Codex P2)
+
+
+class FrozenToolsTest(Base):
+    """run-cell.sh resolves its genesis inputs from its OWN location (MAINREPO = dir/../..), not from the
+    harness worktree it is handed: a frozen tools copy must carry them. Job 4 (ozarchy-p4j4-tools) froze
+    devnet/wsl, devnet/genesis.json, testnet/lib/cargo-bin.sh, testnet/gen-weighted-genesis.sh and
+    testnet/genesis-weighted-full.json next to tools/ and its driver diffed devnet/wsl against the harness."""
+
+    def dry(self, spec, name):
+        drv = self.generate(self.write_spec(spec, name + ".json"), name + ".sh")
+        return subprocess.run(
+            ["bash", drv, "dry"], capture_output=True, text=True, timeout=60
+        )
+
+    def test_run_cell_reads_genesis_from_its_own_root(self):
+        """the reviewer's case: a standalone frozen copy resolves MAINREPO to the frozen root, which has no
+        devnet/wsl/gen-3val-genesis.sh (the cell's genesis step: exit 127)"""
+        wt, tools = frozen_fixture(self.tmp, complete=False)
+        r = subprocess.run(
+            ["bash", os.path.join(tools, "run-cell.sh"), wt, "x"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=dict(os.environ, RUN_CELL_PRINT_PATHS="1", TOOLS_DIR=tools),
+        )
+        paths = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        self.assertEqual(
+            paths["MAINREPO"], os.path.join(self.tmp, "ft"), r.stdout + r.stderr
+        )
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(paths["MAINREPO"], "devnet/wsl/gen-3val-genesis.sh")
+            )
+        )
+
+    def test_standalone_copy_without_genesis_inputs_fails_preflight(self):
+        bare = os.path.join(self.tmp, "bare")
+        wt, tools = frozen_fixture(bare, complete=False)
+        r = self.dry(
+            minimal_spec(self.tmp, tools_dir=tools, harness_worktree=wt), "bare"
+        )
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PREFLIGHT FAIL", r.stdout)
+        self.assertIn(
+            os.path.join(bare, "ft", "devnet/wsl/gen-3val-genesis.sh"), r.stdout
+        )
+        self.assertNotIn("PREFLIGHT OK", r.stdout)
+
+    def test_each_missing_input_fails_preflight(self):
+        spec = minimal_spec(self.tmp)
+        ft = os.path.join(self.tmp, "ft")
+        required = sorted(
+            set(GENESIS_FILES) - {"devnet/wsl/launch-3val.sh"}
+        )  # launch-3val.sh: the diff
+        for i, rel in enumerate(required + ["testnet/genesis-weighted-full.json"]):
+            f = os.path.join(ft, rel)
+            keep = f + ".away"
+            os.rename(f, keep)
+            try:
+                r = self.dry(spec, "miss%d" % i)
+                self.assertNotEqual(r.returncode, 0, rel + ": " + r.stdout)
+                self.assertIn("PREFLIGHT FAIL", r.stdout, rel)
+                self.assertIn(rel, r.stdout)
+            finally:
+                os.rename(keep, f)
+
+    def test_empty_weighted_full_fails_preflight(self):
+        spec = minimal_spec(self.tmp)
+        open(
+            os.path.join(self.tmp, "ft", "testnet/genesis-weighted-full.json"), "w"
+        ).close()
+        r = self.dry(spec, "empty")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("genesis-weighted-full.json", r.stdout)
+
+    def test_genesis_script_not_executable_fails_preflight(self):
+        spec = minimal_spec(self.tmp)
+        os.chmod(os.path.join(self.tmp, "ft", "devnet/wsl/gen-3val-genesis.sh"), 0o644)
+        os.chmod(os.path.join(self.tmp, "wt", "devnet/wsl/gen-3val-genesis.sh"), 0o644)
+        r = self.dry(spec, "noexec")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("gen-3val-genesis.sh", r.stdout)
+
+    def test_frozen_inputs_differ_from_harness_fail_preflight(self):
+        spec = minimal_spec(self.tmp)
+        for rel in (
+            "devnet/wsl/gen-3val-genesis.sh",
+            "devnet/genesis.json",
+            "testnet/lib/cargo-bin.sh",
+        ):
+            f = os.path.join(self.tmp, "ft", rel)
+            orig = open(f).read()
+            with open(f, "a") as fh:
+                fh.write("# drift\n")
+            try:
+                r = self.dry(spec, "drift")
+                self.assertNotEqual(r.returncode, 0, rel + ": " + r.stdout)
+                self.assertIn("differ", r.stdout, rel)
+                self.assertIn(rel.split("/")[-1], r.stdout, rel)
+            finally:
+                with open(f, "w") as fh:
+                    fh.write(orig)
+        # a file only the harness has (a newer devnet/wsl script) is a difference too
+        write_tree(
+            os.path.join(self.tmp, "wt"), {"devnet/wsl/stop-3val.sh": "#!/bin/sh\n"}
+        )
+        r = self.dry(spec, "extra")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("stop-3val.sh", r.stdout)
+
+    def test_genesis_output_ignored_in_comparison(self):
+        """devnet/wsl/genesis-3val.json is each cell's OUTPUT (written into the harness worktree): no difference"""
+        spec = minimal_spec(self.tmp)
+        write_tree(
+            os.path.join(self.tmp, "wt"), {"devnet/wsl/genesis-3val.json": "{}\n"}
+        )
+        r = self.dry(spec, "out")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_complete_frozen_copy_passes_and_names_the_root(self):
+        r = self.dry(minimal_spec(self.tmp), "ok")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PREFLIGHT OK", r.stdout)
+        self.assertIn("genesis_root=%s" % os.path.join(self.tmp, "ft"), r.stdout)
+
+    def test_tools_inside_the_harness_worktree(self):
+        """tools_dir = <harness>/tools/matched-bench: the root IS the harness worktree; only the untracked
+        weighted-full genesis has to be there"""
+        wt, _ = frozen_fixture(self.tmp)
+        tools = os.path.join(wt, "tools", "matched-bench")
+        for rel in TOOL_FILES:
+            os.makedirs(os.path.dirname(os.path.join(tools, rel)), exist_ok=True)
+            shutil.copy2(os.path.join(HERE, rel), os.path.join(tools, rel))
+        spec = minimal_spec(self.tmp, tools_dir=tools)
+        r = self.dry(spec, "inwt")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("genesis-weighted-full.json", r.stdout)
+        write_tree(wt, {"testnet/genesis-weighted-full.json": "{}\n"})
+        r = self.dry(spec, "inwt2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------- env scrub vs caller exports (Codex P2)
+
+
+class ScrubEnvTest(Base):
+    BODY = os.path.join(HERE, "campaign", "driver-body.sh")
+
+    def test_reviewer_case_run_survives_scrub(self):
+        """RUN=/tmp/caller bash -c 'CAMPAIGN=c TOOLS=.; DRIVER_LIB_ONLY=1 source driver-body.sh; scrub_env;
+        echo "$RUN"' printed 'RUN: unbound variable'"""
+        r = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'CAMPAIGN=c TOOLS=.; DRIVER_LIB_ONLY=1 source "$1"; scrub_env; echo "RUN=$RUN";'
+                ' env | grep -c "^RUN=" || true',
+                "x",
+                self.BODY,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=dict(os.environ, RUN="/tmp/caller"),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(
+            r.stdout.split(), ["RUN=/tmp/caller", "0"], r.stdout + r.stderr
+        )
+
+    def caller_env(self):
+        return {
+            "RUN": "/tmp/caller-run",
+            "P": "caller-p",
+            "TOOLS": "/tmp/caller-tools",
+            "MARKETS": "999",
+            "ARMS": "caller-arm",
+            "CELLS": "caller-cell",
+            "BDIR": "caller-bdir",
+            "SMOKE": "1",
+            "HARNESS": "/tmp/caller-harness",
+            "TORUS_FOO": "1",
+            "MALLOC_CONF": "x",
+        }
+
+    def test_caller_exported_config_names_keep_driver_values(self):
+        spec = minimal_spec(self.tmp)
+        drv = self.generate(self.write_spec(spec))
+        r = self.lib(
+            drv,
+            'scrub_env; echo "RUN=$RUN"; echo "P=$P"; echo "TOOLS=$TOOLS"; echo "MARKETS=$MARKETS";'
+            ' echo "ARMS=${ARMS[*]}"; echo "NCELLS=${#CELLS[@]}"; echo "BDIR=${BDIR[b]}"; echo "SMOKE=[$SMOKE]";'
+            ' echo "HARNESS=$HARNESS";'
+            ' echo "CHILD=$(env | grep -E "^(RUN|P|TOOLS|MARKETS|ARMS|CELLS|BDIR|SMOKE|HARNESS|TORUS_FOO|MALLOC_CONF)=" | tr "\\n" " ")"',
+            env=self.caller_env(),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        self.assertEqual(got["RUN"], spec["run_dir"])
+        self.assertEqual(got["P"], spec["label_prefix"])
+        self.assertEqual(got["TOOLS"], spec["tools_dir"])
+        self.assertEqual(got["MARKETS"], "10")
+        self.assertEqual(got["ARMS"], "A M1")
+        self.assertEqual(got["NCELLS"], "5")
+        self.assertEqual(got["BDIR"], spec["binaries"]["b"]["stage_dir"])
+        self.assertEqual(got["SMOKE"], "[]")
+        self.assertEqual(got["HARNESS"], os.path.join(spec["tools_dir"], "run-cell.sh"))
+        self.assertEqual(got["CHILD"].strip(), "")
+
+    def test_caller_smoke_export_does_not_make_a_smoke_run(self):
+        """SMOKE=1 from the caller must not skip the rerun pass of a full run (the driver owns SMOKE)"""
+        drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        r = self.lib(
+            drv,
+            'echo "[${SMOKE}]"; apply_smoke; scrub_env; echo "[$SMOKE] $RUN"',
+            env={"SMOKE": "1"},
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], "[]")
+        self.assertTrue(
+            lines[1].startswith("[1] ") and lines[1].endswith("/smoke"), lines
+        )
+
+    def test_launch_with_caller_exports(self):
+        """`launch` with caller-exported config names: detach gets the driver's values, the unit env none of them"""
+        spec = minimal_spec(self.tmp)
+        drv = self.generate(self.write_spec(spec))
+        fake = os.path.join(self.tmp, "fake-detach.sh")
+        with open(fake, "w") as f:
+            f.write(
+                '#!/bin/bash\necho "DETACH $*"\n'
+                'echo "CHILD=$(env | grep -E "^(RUN|P|TOOLS|ARMS|TORUS_FOO|MALLOC_CONF)=" | tr "\\n" " ")"\n'
+            )
+        os.chmod(fake, 0o755)
+        r = subprocess.run(
+            ["bash", drv, "launch"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=dict(os.environ, DRIVER_DETACH=fake, **self.caller_env()),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(
+            "DETACH test-camp %s/campaign.log %s run"
+            % (spec["run_dir"], os.path.realpath(drv)),
+            r.stdout,
+        )
+        self.assertIn("CHILD=\n", r.stdout.replace("CHILD= \n", "CHILD=\n"))
+        self.assertFalse(os.path.exists("/tmp/caller-run/campaign.log"))
+
+    def test_driver_vars_cover_every_config_and_body_global(self):
+        """scrub_env keeps every driver name (DRIVER_VARS): each name the generated config or the body assigns
+        at top level is listed"""
+        drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        text = open(drv).read()
+        names = set()
+        for ln in text.splitlines():
+            m = re.match(r"^declare -A (.*?)\s*(#|$)", ln)
+            if m:
+                names.update(m.group(1).split())
+                continue
+            for m in re.finditer(r"(?:^|;\s*)([A-Z][A-Z0-9_]*)(?:\[[^]]*\])?=", ln):
+                names.add(m.group(1))
+        r = self.lib(drv, 'echo "$DRIVER_VARS"')
+        listed = set(r.stdout.split())
+        self.assertTrue(listed, r.stdout + r.stderr)
+        # names the driver only reads/exports for its children (not driver state)
+        child_env = {
+            "CELL_STEP_LOG",
+            "CELL_STEP_TIMEOUT",
+            "CELL_STEP_ANALYSIS_TIMEOUT",
+            "CELL_STEP_ANALYSIS_CMD",
+            "CELL_STEP_ANALYSIS_METRIC",
+            "CELL_STEP_SUMMARY_MD5",
+            "XDG_RUNTIME_DIR",
+            "DRIVER_LIB_ONLY",
+            "E",
+            "IFS",
+        }
+        self.assertEqual(sorted(names - listed - child_env), [])
+
+
+# ---------------------------------------------------------------- runtime watchers (s123: ported from Job 4)
+
+LB = "test-camp-10m-r1-A"  # minimal_spec's label of cell r1-A
+
+# fake `systemctl --user`: a unit is $FAKE_UNITS/<unit>.pid (its main pid, written by the fake detach.sh); active =
+# that process exists and is no zombie; stop = SIGTERM to its process group (what systemd does to the unit's cgroup)
+FAKE_SYSTEMCTL = r"""#!/bin/bash
+[ "$1" = --user ] && shift
+cmd=$1; shift
+echo "$cmd $*" >> "$FAKE_UNITS/systemctl.log"
+u=${!#}; u=${u%.service}; f=$FAKE_UNITS/$u.pid
+alive() { local p; p=$(cat "$f" 2>/dev/null); [ -n "$p" ] && [ -r "/proc/$p/status" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$p/status"; }
+case $cmd in
+    is-active) alive ;;
+    show) if alive; then cat "$f"; else echo 0; fi ;;
+    stop) echo "STOPPED $u.service" >> "$FAKE_UNITS/stops.log"; p=$(cat "$f" 2>/dev/null); [ -z "$p" ] || kill -TERM -- "-$p" 2>/dev/null; exit 0 ;;
+    *) exit 0 ;;
+esac
+"""
+# fake detach.sh NAME LOG CMD...: CMD in its own session (the "unit"); its pid is the unit's main pid
+FAKE_DETACH = r"""#!/bin/bash
+name=$1 log=$2; shift 2
+mkdir -p "$(dirname "$log")"
+setsid "$@" >> "$log" 2>&1 < /dev/null &
+echo "$!" > "$FAKE_UNITS/bench-$name.pid"
+echo "fake detach: bench-$name.service pid $!"
+"""
+# fake pgrep: the test host's own torus-node / bench-throughput processes stay invisible
+FAKE_PGREP = r"""#!/bin/bash
+for a in "$@"; do case $a in torus-node|*bench-throughput*) exit 1 ;; esac; done
+exec @PGREP@ "$@"
+"""
+# fake run-cell.sh WT LABEL MARKETS DUR RATE EXTRA_ENV: 3 stub "nodes" (sleep), the run.log lines the watchers read
+# (node pids, bench, stopping pid / stopped.), the devnet pids file, node logs, RocksDB LOGs, a fake /proc entry per
+# node (FAKE_PROC: exe = the staged node, environ = EXTRA_ENV), summary.json; FAKE_DIE=i: node i exits after 2 s.
+# TERM: stops the stubs as run-cell.sh's finish_fail does, exit 130. @GUARD@ = run-cell.sh's own output-dir guard
+# (run_cell_guard): the driver's records (sysctl.txt, the samplers) precede the harness in the cell dir (Codex P1)
+FAKE_HARNESS = r"""#!/bin/bash
+set -u
+label=$2 markets=$3 xe=${6:-}
+OUT=$RESULTS_ROOT/$label
+@GUARD@mkdir -p "$OUT" "$DATA_ROOT/run"
+: > "$OUT/run.log"
+log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
+PIDS=() W=
+for i in 0 1 2; do
+    if [ "$i" = "${FAKE_DIE:-}" ]; then sleep 2 & else sleep 600 & fi
+    PIDS+=("$!")
+    mkdir -p "$DATA_ROOT/data/val$i"; echo "rocksdb LOG val$i" > "$DATA_ROOT/data/val$i/LOG"
+    printf '\033[31mERROR\033[0m fake val%s last line\n' "$i" > "$DATA_ROOT/run/val$i.log"
+done
+printf '%s\n' "${PIDS[@]}" > "$DATA_ROOT/run/pids"
+if [ -n "${FAKE_PROC:-}" ]; then
+    for p in "${PIDS[@]}"; do
+        mkdir -p "$FAKE_PROC/$p"
+        ln -sfn "$TARGET_DIR/release/torus-node" "$FAKE_PROC/$p/exe"
+        printf '%s\0' $xe > "$FAKE_PROC/$p/environ"
+    done
+fi
+stopall() {
+    local p
+    for p in "${PIDS[@]}"; do
+        if kill -0 "$p" 2>/dev/null; then echo "stopping pid $p" >> "$OUT/run.log"; kill "$p" 2>/dev/null; fi
+    done
+    [ -z "$W" ] || kill "$W" 2>/dev/null
+    echo "stopped." >> "$OUT/run.log"
+}
+trap 'log "interrupted"; stopall; exit 130' INT TERM
+log "node pids: ${PIDS[*]}"
+log "bench: /fake/bench-throughput consensus --markets $markets"
+sleep "${FAKE_RUN_S:-3}" & W=$!
+wait "$W"; W=
+log "bench exited rc=0 after ${FAKE_RUN_S:-3}s"
+python3 -I -c 'import json, sys; json.dump({"cell": {"markets": int(sys.argv[2])}, "validity": {"verdict": "ACCEPT"}, "headline": {"agreement_verdict": "AGREE", "matched_s_avg": 1000.0}}, open(sys.argv[1], "w"))' "$OUT/summary.json" "$markets"
+for i in 0 1 2; do echo "2026-10-15T00:00:00.000Z  INFO torus_node: fake val$i" | gzip > "$OUT/val$i.log.gz"; done
+stopall
+exit 0
+"""
+# fake sysctl -n NAME: the value in $FAKE_SYSCTL/NAME
+FAKE_SYSCTL = r"""#!/bin/bash
+[ "$1" = -n ] && shift
+cat "$FAKE_SYSCTL/$1" 2>/dev/null || { echo "sysctl: cannot stat /proc/sys/${1//.//}" >&2; exit 255; }
+"""
+
+
+def run_cell_guard():
+    """run-cell.sh's output-dir guard, verbatim: a non-empty $OUT without OVERWRITE=1 is FATAL (exit 1)"""
+    t = open(os.path.join(HERE, "run-cell.sh")).read()
+    m = re.search(
+        r'^if \[ -d "\$OUT" \] && \[ -n "\$\(ls -A "\$OUT" 2>/dev/null\)" \].*?^fi\n',
+        t,
+        re.M | re.S,
+    )
+    assert m and "OVERWRITE" in m.group(0), "run-cell.sh's output-dir guard moved"
+    return m.group(0)
+
+
+SAMPLER_FILES = (
+    "data-du-samples.txt",
+    "ckpt-samples.txt",
+    "mem-samples.txt",
+    "node-nofile.txt",
+    "fds.txt",
+    "vmstat-1hz.txt",
+    "rocksdb-LOG-val0.txt",
+    "data-du.txt",
+)
+
+
+class FakeHostBase(Base):
+    """a fake bin dir (put first on PATH), a fake units dir and a fake /proc (DRIVER_PROC: meminfo, node pids)"""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = os.path.join(self.tmp, "fakebin")
+        self.units = os.path.join(self.tmp, "units")
+        self.proc = os.path.join(self.tmp, "fakeproc")
+        for d in (self.bin, self.units, self.proc):
+            os.makedirs(d)
+        fakes = {
+            "systemctl": FAKE_SYSTEMCTL,
+            "pgrep": FAKE_PGREP.replace("@PGREP@", shutil.which("pgrep")),
+            "detach.sh": FAKE_DETACH,
+            "run-cell.sh": FAKE_HARNESS.replace("@GUARD@", run_cell_guard()),
+        }
+        for name, body in fakes.items():
+            self.write_fake(name, body)
+        self.sysctl_dir = (
+            None  # set_sysctl() installs the fake sysctl; until then the host's answers
+        )
+        self.meminfo(50000000)
+        self.procs = []
+
+    def write_fake(self, name, body):
+        with open(os.path.join(self.bin, name), "w") as f:
+            f.write(body)
+        os.chmod(os.path.join(self.bin, name), 0o755)
+
+    def tearDown(self):
+        # every spawned process and every fake unit leads its own session: kill each whole group
+        pgids = [p.pid for p in self.procs]
+        for f in glob.glob(os.path.join(self.units, "*.pid")):
+            try:
+                pgids.append(int(open(f).read()))
+            except ValueError:
+                pass
+        for g in pgids:
+            try:
+                os.killpg(g, signal.SIGKILL)
+            except OSError:
+                pass
+        for p in self.procs:
+            p.wait()
+        super().tearDown()
+
+    def meminfo(self, kb):
+        with open(os.path.join(self.proc, "meminfo"), "w") as f:
+            f.write(
+                "MemTotal:       65000000 kB\nMemFree:         1000000 kB\nMemAvailable:   %d kB\n"
+                % kb
+            )
+
+    def set_sysctl(self, **vals):
+        """fake sysctl values (name with '__' for '.'): installs the fake sysctl on first use"""
+        if self.sysctl_dir is None:
+            self.sysctl_dir = os.path.join(self.tmp, "sysctl")
+            os.makedirs(self.sysctl_dir)
+            self.write_fake("sysctl", FAKE_SYSCTL)
+        for k, v in vals.items():
+            with open(os.path.join(self.sysctl_dir, k.replace("__", ".")), "w") as f:
+                f.write("%s\n" % v)
+
+    def env(self, **over):
+        e = {
+            "PATH": self.bin + os.pathsep + os.environ["PATH"],
+            "FAKE_UNITS": self.units,
+            "DRIVER_PROC": self.proc,
+        }
+        if self.sysctl_dir is not None:
+            e["FAKE_SYSCTL"] = self.sysctl_dir
+        e.update(over)
+        return e
+
+    def spawn(self, *args):
+        p = subprocess.Popen(
+            list(args),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.procs.append(p)
+        return p
+
+
+class WatchNodesTest(FakeHostBase):
+    """watch_nodes (library mode) on stub processes: the node-death.txt the step reads, and the harness TERM"""
+
+    def setUp(self):
+        super().setUp()
+        self.spec = minimal_spec(self.tmp)
+        self.drv = self.generate(self.write_spec(self.spec))
+        self.cell = os.path.join(self.spec["results_root"], LB)
+        os.makedirs(self.cell)
+        run = os.path.join(self.spec["devnet_dir"], "run")
+        os.makedirs(run, exist_ok=True)
+        for i in range(3):
+            with open(os.path.join(run, "val%d.log" % i), "w") as f:
+                f.write("first\n\x1b[31mERROR\x1b[0m val%d: thread panicked at x\n" % i)
+
+    def harness(self):
+        """a stub harness pid: TERM -> harness-term.txt, exit 130 (run-cell.sh's trap stops the nodes)"""
+        f = os.path.join(self.tmp, "harness-term.txt")
+        p = self.spawn(
+            "bash",
+            "-c",
+            "sleep 60 & s=$!; trap 'echo TERM > %s; kill $s; exit 130' TERM; echo > %s.ready; wait $s"
+            % (f, f),
+        )
+        self.wait_for(lambda: os.path.exists(f + ".ready"))  # its trap is set
+        return p, f
+
+    def wait_for(self, cond, what="condition"):
+        for _ in range(200):
+            if cond():
+                return
+            time.sleep(0.05)
+        self.fail("timed out waiting for " + what)
+
+    def nodes(self, die=None):
+        """3 stub node pids in the cell's run.log 'node pids:' line; node `die` exits after 1 s. The stubs are
+        children of a holder bash that reaps them (a zombie still answers kill -0, as a reaped pid does not)"""
+        pf = os.path.join(self.tmp, "node-pids")
+        starts = "; ".join(
+            "sleep %d & echo $! >> %s" % (1 if i == die else 60, pf) for i in range(3)
+        )
+        self.spawn("bash", "-c", "%s; wait" % starts)
+        self.wait_for(
+            lambda: os.path.exists(pf) and len(open(pf).read().split()) == 3,
+            "the 3 stub node pids",
+        )
+        pids = [int(x) for x in open(pf).read().split()]
+        with open(os.path.join(self.cell, "run.log"), "w") as f:
+            f.write("[12:00:00] node pids: %s\n" % " ".join(map(str, pids)))
+        return pids
+
+    def test_death_writes_node_death_and_terms_the_harness(self):
+        pids = self.nodes(die=1)
+        hp, term = self.harness()
+        r = self.lib(
+            self.drv,
+            'watch_nodes %s %d; echo "WN=$?"' % (shlex.quote(self.cell), hp.pid),
+            env=self.env(),
+        )
+        self.assertIn("WN=3", r.stdout, r.stdout + r.stderr)
+        death = open(os.path.join(self.cell, "node-death.txt")).read()
+        self.assertRegex(
+            death,
+            r"^DEATH node val1 comm=torus-node pid=%d detected at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} "
+            r"\(0\.5 s poll; previous check ok <= ~0\.6 s earlier\); "
+            r"last val1 log line: ERROR val1: thread panicked at x\n$" % pids[1],
+        )
+        life = open(os.path.join(self.cell, "node-life.txt")).read()
+        self.assertIn("watching node pids: %s" % " ".join(map(str, pids)), life)
+        self.assertIn(death, life)
+        self.assertIn("DEATH node val1 comm=torus-node pid=%d at " % pids[1], r.stdout)
+        self.assertIn("-> aborting cell (TERM harness %d)" % hp.pid, r.stdout)
+        self.assertEqual(hp.wait(timeout=10), 130)
+        self.assertEqual(open(term).read().strip(), "TERM")
+
+    def test_harness_stop_is_no_death(self):
+        """nodes stopped by the harness (stop-3val's 'stopping pid' lines first): a stop window, no death"""
+        pids = self.nodes()
+        hp, _ = self.harness()
+        runlog = shlex.quote(os.path.join(self.cell, "run.log"))
+        stop = (
+            '(sleep 1; for p in %s; do echo "stopping pid $p"; done >> %s; echo stopped. >> %s) &'
+            % (" ".join(map(str, pids)), runlog, runlog)
+        )
+        r = self.lib(
+            self.drv,
+            '%s\nwatch_nodes %s %d; echo "WN=$?"'
+            % (stop, shlex.quote(self.cell), hp.pid),
+            env=self.env(),
+        )
+        self.assertIn("WN=0", r.stdout, r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.cell, "node-death.txt")))
+        life = open(os.path.join(self.cell, "node-life.txt")).read()
+        self.assertIn("all 3 node pids alive at every 0.5 s check", life)
+        self.assertIn("stop-3val window", life)
+        self.assertIsNone(hp.poll())  # not TERMed
+
+    def test_step_flags_the_dead_cell(self):
+        """a clean fixture cell (rc 0, ACCEPT AGREE, md5 ok) whose node dies: its cells.tsv row is bad:death"""
+        fx = "ozarchy-p3gate-300m-r1-m"
+        shutil.rmtree(self.cell)
+        shutil.copytree(os.path.join(CELLFIX, fx), self.cell)
+        shutil.copy(os.path.join(CELLFIX, fx + ".cell.rc"), self.cell + ".cell.rc")
+        self.nodes(die=0)
+        hp, _ = self.harness()
+        os.makedirs(self.spec["run_dir"], exist_ok=True)
+        script = (
+            'source "$TOOLS/cell-step.sh"\nexport CELL_STEP_LOG=$RUN/campaign.log\n'
+            "BMD5[b]=f10815747be79f22f502b51a8cd466eb\n"
+            'cell() { STARTED_LABEL=$P-$1; watch_nodes "$R/$P-$1" %d; return 0; }\n'
+            'run_spec "r1-A:A:120:none:"; echo "RS=$?"\n' % hp.pid
+        )
+        r = self.lib(self.drv, script, env=self.env())
+        self.assertIn("RS=0", r.stdout, r.stdout + r.stderr)
+        rows = [
+            ln.split("\t")
+            for ln in open(os.path.join(self.spec["run_dir"], "cells.tsv"))
+            .read()
+            .splitlines()
+        ]
+        self.assertEqual(
+            [(x[0], x[3], x[4], x[5], x[7]) for x in rows[1:]],
+            [(LB, "0", "yes", "yes", "bad:death")],
+        )
+        log = open(os.path.join(self.spec["run_dir"], "campaign.log")).read()
+        self.assertIn("CELL-FLAG %s death" % LB, log)
+
+
+class MemguardTest(FakeHostBase):
+    """memguard UNIT: while the unit is active, MemAvailable < 6 GB (6000000 kB) stops it (stubbed meminfo)"""
+
+    def guard(self, kb, unit_life):
+        drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        unit = self.spawn("sleep", str(unit_life))
+        with open(os.path.join(self.units, "bench-x.pid"), "w") as f:
+            f.write("%d\n" % unit.pid)
+        self.meminfo(kb)
+        r = self.lib(drv, 'memguard bench-x; echo "MG=$?"', env=self.env())
+        return r, unit
+
+    def test_trips_below_6_gb(self):
+        r, unit = self.guard(5999999, 60)
+        self.assertIn("MG=0", r.stdout, r.stdout + r.stderr)
+        self.assertRegex(
+            r.stdout,
+            r"\[\d\d:\d\d:\d\d\] MEMGUARD: MemAvailable 5999999 kB < 6 GB -> stopping bench-x\n",
+        )
+        self.assertEqual(
+            open(os.path.join(self.units, "stops.log")).read(),
+            "STOPPED bench-x.service\n",
+        )
+        self.assertEqual(unit.wait(timeout=10), -signal.SIGTERM)
+
+    def test_quiet_at_6_gb_until_the_unit_ends(self):
+        r, unit = self.guard(6000000, 2)
+        self.assertIn("MG=0", r.stdout, r.stdout + r.stderr)
+        self.assertNotIn("MEMGUARD", r.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.units, "stops.log")))
+        self.assertEqual(unit.wait(timeout=10), 0)
+
+
+class CellRunTest(FakeHostBase):
+    """the generated cell() for real (library mode, run_spec) against the fakes: detach.sh starts the cell command
+    in its own session (the unit), systemctl --user answers for it, run-cell.sh runs 3 stub nodes. quiet() is
+    stubbed (the test host may be busy); the host's sysctls are read as they are (pinned first, as the run does)."""
+
+    def run_cell(self, spec, pre="sysctl_pin", **env):
+        drv = self.generate(self.write_spec(spec, "cellrun.json"), "cellrun.sh")
+        os.makedirs(spec["run_dir"], exist_ok=True)
+        script = "\n".join(
+            [
+                "DRIVER_LIB_ONLY=1; source %s || exit 99" % shlex.quote(drv),
+                "HARNESS=%s" % shlex.quote(os.path.join(self.bin, "run-cell.sh")),
+                "quiet() { return 0; }",
+                'source "$TOOLS/cell-step.sh" || exit 98',
+                "export CELL_STEP_LOG=$RUN/campaign.log",
+                pre,
+                'run_spec "r1-A:A:120:none:"; echo "RUN_SPEC_RC=$?"',
+            ]
+        )
+        e = dict(os.environ)
+        e.update(
+            self.env(
+                DRIVER_DETACH=os.path.join(self.bin, "detach.sh"),
+                FAKE_PROC=self.proc,
+                # the fake cell outlives cell()'s harness-pid lookup (0.2 s polls) on a loaded host
+                FAKE_RUN_S="5",
+            )
+        )
+        e.update(env)
+        out = os.path.join(self.tmp, "cellrun.out")
+        with open(out, "w") as fo:
+            subprocess.run(
+                ["bash", "-c", script],
+                stdout=fo,
+                stderr=subprocess.STDOUT,
+                env=e,
+                timeout=300,
+            )
+        self.cell = os.path.join(spec["results_root"], LB)
+        return open(out).read()
+
+    def cellfile(self, name):
+        return open(os.path.join(self.cell, name)).read()
+
+    def row(self, spec):
+        rows = [
+            ln.split("\t")
+            for ln in open(os.path.join(spec["run_dir"], "cells.tsv"))
+            .read()
+            .splitlines()
+        ]
+        self.assertEqual(len(rows), 2, rows)
+        self.assertEqual(rows[1][0], LB)
+        return rows[1]
+
+    def test_cell_starts_watchers_and_samplers(self):
+        spec = minimal_spec(self.tmp)
+        out = self.run_cell(spec)
+        self.assertIn("RUN_SPEC_RC=0", out, out)
+        self.assertRegex(
+            out, r"%s unit=bench-%s main_pid=\d+ harness_pid=\d+ " % (LB, LB)
+        )
+        life = self.cellfile("node-life.txt")
+        self.assertRegex(life, r"watching node pids: \d+ \d+ \d+\n")
+        self.assertIn(
+            "all 3 node pids alive at every 0.5 s check until the harness stop began",
+            life,
+        )
+        self.assertFalse(os.path.exists(os.path.join(self.cell, "node-death.txt")), out)
+        for f in SAMPLER_FILES + ("sysctl.txt",):
+            self.assertTrue(os.path.exists(os.path.join(self.cell, f)), f + "\n" + out)
+        self.assertEqual(
+            [ln.split()[0] for ln in self.cellfile("sysctl.txt").splitlines()],
+            ["start", "end"],
+        )
+        for s in (
+            "CHECK OK %s sysctl (start)" % LB,
+            "CHECK OK %s sysctl (end)" % LB,
+            "CHECK OK %s hardscan done" % LB,
+            "CHECK SOAK %s" % LB,
+            "[%s] fds max/end" % LB,
+        ):
+            self.assertIn(s, out)
+        self.assertEqual(self.row(spec)[7], "ok", out)
+
+    def test_node_death_mid_cell(self):
+        """val1 exits 2 s into the cell: node-death.txt, harness TERMed, CELL FAIL, row flagged death + rerun
+        queued, and the campaign goes on (run_spec 0)"""
+        spec = minimal_spec(self.tmp)
+        out = self.run_cell(spec, FAKE_DIE="1", FAKE_RUN_S="120")
+        self.assertIn("RUN_SPEC_RC=0", out, out)
+        pids = re.search(
+            r"node pids: (\d+) (\d+) (\d+)", self.cellfile("run.log")
+        ).groups()
+        death = self.cellfile("node-death.txt")
+        self.assertRegex(
+            death,
+            r"^DEATH node val1 comm=torus-node pid=%s detected at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} "
+            r"\(0\.5 s poll; previous check ok <= ~0\.6 s earlier\); last val1 log line: ERROR fake val1 last line\n$"
+            % pids[1],
+        )
+        self.assertIn("interrupted", self.cellfile("run.log"))  # the harness got TERM
+        self.assertIn("CELL FAIL %s rc=130 death: DEATH node val1 " % LB, out)
+        flag = self.row(spec)[7]
+        self.assertTrue(flag.startswith("bad:"), flag)
+        self.assertIn("death", flag[4:].split(","), flag)
+        self.assertIn(
+            "CELL-FLAG %s " % LB,
+            open(os.path.join(spec["run_dir"], "campaign.log")).read(),
+        )
+        self.assertIn(
+            LB + "-rerun",
+            open(os.path.join(spec["run_dir"], "rerun-queue.tsv")).read(),
+        )
+
+    def test_memguard_stops_the_cell_unit(self):
+        self.meminfo(5000000)
+        spec = minimal_spec(self.tmp)
+        out = self.run_cell(spec, FAKE_RUN_S="120")
+        self.assertIn(
+            "MEMGUARD: MemAvailable 5000000 kB < 6 GB -> stopping bench-%s" % LB, out
+        )
+        self.assertIn(
+            "STOPPED bench-%s.service" % LB,
+            open(os.path.join(self.units, "stops.log")).read(),
+        )
+        self.assertIn("rc=unit-ended-without-rc", out)
+        self.assertTrue(self.row(spec)[7].startswith("bad:"), out)
+
+    def test_samplers_and_host_checks_off(self):
+        spec = minimal_spec(self.tmp, samplers=False, host_checks=False)
+        out = self.run_cell(spec, pre="")
+        self.assertIn("RUN_SPEC_RC=0", out, out)
+        self.assertIn(
+            "watching node pids", self.cellfile("node-life.txt")
+        )  # the watchers always run
+        self.assertIn("CHECK OK %s hardscan done" % LB, out)
+        for f in SAMPLER_FILES + ("sysctl.txt",):
+            self.assertFalse(os.path.exists(os.path.join(self.cell, f)), f)
+        self.assertNotIn("CHECK SOAK", out)
+        self.assertNotIn(" sysctl (", out)
+        self.assertEqual(self.row(spec)[7], "ok", out)
+
+
+class HostChecksTest(FakeHostBase):
+    """host_checks: the sysctl record and check (spec values, else the dirty limits pinned at the run's
+    preflight), the MemAvailable preflight; a fake sysctl"""
+
+    HOST = {
+        "vm__dirty_bytes": 0,
+        "vm__dirty_background_bytes": 0,
+        "vm__dirty_ratio": 20,
+        "vm__dirty_background_ratio": 10,
+        "vm__dirty_expire_centisecs": 3000,
+        "vm__dirty_writeback_centisecs": 500,
+        "kernel__perf_event_paranoid": 2,
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.set_sysctl(**self.HOST)
+
+    def drv(self, **over):
+        return self.generate(
+            self.write_spec(minimal_spec(self.tmp, **over), "hc.json"), "hc.sh"
+        )
+
+    def test_pinned_dirty_limits_must_hold(self):
+        """no spec values: the dirty limits are pinned at the preflight; a change before a cell's end fails it"""
+        drv = self.drv()
+        r = self.lib(
+            drv,
+            'sysctl_pin; mkdir -p "$R/x"; sysctlchk x start; echo "S=$?"; echo 5 > %s; sysctlchk x end; echo "E=$?"'
+            % shlex.quote(os.path.join(self.sysctl_dir, "vm.dirty_bytes")),
+            env=self.env(),
+        )
+        self.assertIn("S=0", r.stdout, r.stdout + r.stderr)
+        self.assertIn("E=1", r.stdout, r.stdout + r.stderr)
+        self.assertIn("CHECK OK x sysctl (start):", r.stdout)
+        self.assertIn("CHECK FAIL x (end): sysctl vm.dirty_bytes=5 (want 0)", r.stdout)
+        rec = open(os.path.join(self.tmp, "res", "x", "sysctl.txt")).read().splitlines()
+        self.assertEqual([ln.split()[0] for ln in rec], ["start", "end"])
+        self.assertIn(
+            " dirty_bytes=0 dirty_background_bytes=0 dirty_ratio=20 dirty_background_ratio=10"
+            " dirty_expire_centisecs=3000 dirty_writeback_centisecs=500 perf_event_paranoid=2 ",
+            rec[0],
+        )
+        self.assertIn(" dirty_bytes=5 ", rec[1])
+
+    def test_spec_values_are_required_at_preflight(self):
+        drv = self.drv(host_checks={"sysctl": {"vm.dirty_bytes": 268435456}})
+        r = self.lib(drv, "sysctl_pin; echo PINNED", env=self.env())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("PREFLIGHT FAIL", r.stdout)
+        self.assertIn("vm.dirty_bytes=0 (want 268435456)", r.stdout)
+        self.assertNotIn("PINNED", r.stdout)
+        self.set_sysctl(vm__dirty_bytes=268435456)
+        r = self.lib(
+            drv,
+            'sysctl_pin; echo PINNED; mkdir -p "$R/x"; sysctlchk x start',
+            env=self.env(),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PINNED", r.stdout)
+        self.assertIn(
+            "CHECK OK x sysctl (start): vm.dirty_background_bytes=0 vm.dirty_bytes=268435456",
+            r.stdout,
+        )
+
+    def test_min_mem_avail_preflight(self):
+        drv = self.drv()
+        self.meminfo(39999999)
+        r = self.lib(drv, "preflight_mem; echo MEMOK", env=self.env())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(
+            "PREFLIGHT FAIL: MemAvailable 39999999 kB < 40000000 kB", r.stdout
+        )
+        self.meminfo(40000000)
+        r = self.lib(drv, "preflight_mem; echo MEMOK", env=self.env())
+        self.assertIn("MEMOK", r.stdout, r.stdout + r.stderr)
+        drv = self.drv(host_checks={"min_mem_avail_gb": 0.5})
+        self.meminfo(600000)
+        r = self.lib(drv, "preflight_mem; echo MEMOK", env=self.env())
+        self.assertIn("MEMOK", r.stdout, r.stdout + r.stderr)
+
+    def test_plan_rows(self):
+        on = self.plan(self.drv())
+        for ln in (
+            "WATCH node-death memguard hardscan",
+            "SAMPLERS on du mem metrics fd vmstat rocksdb-log fd_stop=16384",
+            "HOSTCHECK on min_mem_avail_kb=40000000",
+            "SYSCTL vm.dirty_background_bytes pinned",
+            "SYSCTL vm.dirty_bytes pinned",
+        ):
+            self.assertIn(ln, on)
+        off = self.plan(self.drv(samplers=False, host_checks=False))
+        self.assertIn("WATCH node-death memguard hardscan", off)
+        self.assertIn("SAMPLERS off", off)
+        self.assertIn("HOSTCHECK off", off)
+        self.assertEqual([ln for ln in off if ln.startswith("SYSCTL ")], [])
+
+
+class SamplerCheckTest(Base):
+    """fdsum (the fd stop) and hardscan on fixture cell files"""
+
+    def setUp(self):
+        super().setUp()
+        self.spec = minimal_spec(self.tmp)
+        self.drv = self.generate(self.write_spec(self.spec))
+        self.cell = os.path.join(self.spec["results_root"], LB)
+        os.makedirs(self.cell)
+
+    def test_fd_stop(self):
+        with open(os.path.join(self.cell, "node-nofile.txt"), "w") as f:
+            f.write(
+                "pid=1 Max open files            1048576              1048576              files\n"
+            )
+        with open(os.path.join(self.cell, "fds.txt"), "w") as f:
+            f.write("1700000000 100 200 300\n1700000005 16385 210 -\n")
+        r = self.lib(self.drv, 'fdsum %s; echo "FD=$?"' % LB)
+        self.assertIn(
+            "fds max/end val0 16385/16385 val1 210/210 val2 300/300 (limit soft/hard 1048576/1048576)",
+            r.stdout,
+        )
+        self.assertIn("FD=1", r.stdout)
+        with open(os.path.join(self.cell, "fds.txt"), "w") as f:
+            f.write("1700000000 100 16384 300\n")
+        r = self.lib(self.drv, 'fdsum %s; echo "FD=$?"' % LB)
+        self.assertIn("FD=0", r.stdout, r.stdout + r.stderr)
+
+    def test_hardscan_reports_warn_error_lines_only(self):
+        import gzip
+
+        logs = {
+            0: "2026 ERROR torus: thread 'exec' panicked at x.rs:1\n"
+            "2026  INFO torus: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false\n",
+            1: "2026  INFO torus: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false\n",
+            2: "2026  WARN torus: \x1b[31mSTATE HASH MISMATCH\x1b[0m at 7\n",
+        }
+        for v, txt in logs.items():
+            with gzip.open(os.path.join(self.cell, "val%d.log.gz" % v), "wt") as f:
+                f.write(txt)
+        r = self.lib(self.drv, "hardscan %s" % LB)
+        self.assertIn(
+            "HARD FINDING %s: val0 has 1 WARN/ERROR correctness lines: 2026 ERROR torus: thread 'exec' panicked"
+            % LB,
+            r.stdout,
+        )
+        self.assertIn(
+            "HARD FINDING %s: val2 has 1 WARN/ERROR correctness lines: 2026  WARN torus: STATE HASH MISMATCH at 7"
+            % LB,
+            r.stdout,
+        )
+        self.assertNotIn("val1 has", r.stdout)
+        self.assertIn("CHECK OK %s hardscan done" % LB, r.stdout)
+
+
+class WatcherSpecTest(Base):
+    """the spec options samplers / host_checks: strict like every other key"""
+
+    def bad(self, spec, needle):
+        with self.assertRaises(self.gen.SpecError) as cm:
+            self.gen.validate(spec)
+        self.assertIn(needle, str(cm.exception))
+
+    def test_defaults_on(self):
+        p = self.gen.validate(minimal_spec(self.tmp))
+        self.assertIs(p["samplers"], True)
+        self.assertEqual(p["host_checks"], {"min_mem_avail_kb": 40000000, "sysctl": {}})
+
+    def test_values(self):
+        p = self.gen.validate(
+            minimal_spec(
+                self.tmp,
+                samplers=False,
+                host_checks={
+                    "min_mem_avail_gb": 12,
+                    "sysctl": {
+                        "vm.dirty_bytes": 268435456,
+                        "kernel.numa_balancing": "0",
+                    },
+                },
+            )
+        )
+        self.assertIs(p["samplers"], False)
+        self.assertEqual(
+            p["host_checks"],
+            {
+                "min_mem_avail_kb": 12000000,
+                "sysctl": {"vm.dirty_bytes": "268435456", "kernel.numa_balancing": "0"},
+            },
+        )
+        self.assertIsNone(
+            self.gen.validate(minimal_spec(self.tmp, host_checks=False))["host_checks"]
+        )
+
+    def test_bad_values(self):
+        self.bad(minimal_spec(self.tmp, samplers="yes"), "samplers")
+        self.bad(minimal_spec(self.tmp, samplers=["du"]), "samplers")
+        self.bad(minimal_spec(self.tmp, host_checks="on"), "host_checks")
+        self.bad(minimal_spec(self.tmp, host_checks={"sysctls": {}}), "sysctls")
+        self.bad(
+            minimal_spec(self.tmp, host_checks={"min_mem_avail_gb": -1}),
+            "min_mem_avail_gb",
+        )
+        self.bad(
+            minimal_spec(self.tmp, host_checks={"min_mem_avail_gb": True}),
+            "min_mem_avail_gb",
+        )
+        self.bad(
+            minimal_spec(self.tmp, host_checks={"sysctl": {"dirty bytes": "1"}}),
+            "dirty bytes",
+        )
+        self.bad(
+            minimal_spec(self.tmp, host_checks={"sysctl": {"vm.dirty_bytes": "1 2"}}),
+            "vm.dirty_bytes",
+        )
+        self.bad(
+            minimal_spec(self.tmp, host_checks={"sysctl": {"vm.dirty_bytes": True}}),
+            "vm.dirty_bytes",
+        )
+        self.bad(
+            minimal_spec(self.tmp, host_checks={"sysctl": {"vm.dirty_bytes": ""}}),
+            "vm.dirty_bytes",
+        )
+
+    def test_rendered_config(self):
+        drv = self.generate(
+            self.write_spec(
+                minimal_spec(
+                    self.tmp,
+                    host_checks={"sysctl": {"vm.dirty_bytes": "268435456"}},
+                )
+            )
+        )
+        r = self.lib(
+            drv,
+            'echo "S=$SAMPLERS H=$HOST_CHECKS M=$MIN_MEM_AVAIL_KB W=${SYSCTL_WANT[vm.dirty_bytes]} N=${#SYSCTL_WANT[@]}"',
+        )
+        self.assertIn(
+            "S=1 H=1 M=40000000 W=268435456 N=1", r.stdout, r.stdout + r.stderr
+        )
+
+    def test_overwrite_is_the_drivers(self):
+        """run-cell.sh refuses a non-empty cell dir unless OVERWRITE=1, and the driver writes its records there
+        before the harness starts (it refuses an existing cell dir itself): every cell runs with OVERWRITE=1, as
+        Job 4's did; a spec may only repeat it (Codex P1)"""
+        self.gen.validate(minimal_spec(self.tmp, harness_env={"OVERWRITE": "1"}))
+        self.bad(minimal_spec(self.tmp, harness_env={"OVERWRITE": "0"}), "OVERWRITE")
+        s = minimal_spec(self.tmp)
+        s["arms"][1]["harness_env"] = {"OVERWRITE": ""}
+        self.bad(s, "OVERWRITE")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

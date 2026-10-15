@@ -6,6 +6,10 @@ on one host, fixed load, matched/s from node counters) for two or more node buil
 scripts here drive it end to end; the per-cell runner and its `summary.json` are
 documented in `../README.md`.
 
+Campaigns of the template lineage (per-cell `run-cell.sh` units, env/md5 checks,
+`cells.tsv` step) are generated from a JSON spec by `make-driver.py` (+ `driver-body.sh`,
+example `driver-spec.example.json`): see `../README.md` "Campaign driver generator".
+
 > **WARNING: test keys only.** `devnet/wsl/env.sh` (validator consensus keys
 > `01..`, `02..`, `03..`) and `devnet/wsl/bench-validator-keys.json` (validator EVM
 > keys, hardhat/anvil mnemonic `test test ... junk`, indices 100-102) are publicly

@@ -32,7 +32,15 @@ cache rebuild per campaign).
 2. **Prepare**: build binaries, verify shas, set up dirs, run the smoke test. Short waits
    (a build, the smoke test) use the short-wait pattern below.
    - Write or adapt the campaign script (the driver) when your prompt asks for one or none
-     exists: arms, cell order, checks, log lines. Start from the closest earlier driver.
+     exists. First write a spec (JSON, ~20-40 lines; format and supported shapes:
+     `tools/matched-bench/README.md` "Campaign driver generator", example
+     `tools/matched-bench/campaign/driver-spec.example.json`) and run
+     `python3 -I tools/matched-bench/campaign/make-driver.py SPEC -o DRIVER`, then
+     `DRIVER dry`, `DRIVER launch smoke` (read its CHECK lines), `DRIVER launch`. Do not
+     read the generated driver; `DRIVER show` prints its arms, env checks and cells.
+     A SPEC ERROR is your spec: fix it and rerun. Only when the campaign does not fit
+     the generator's shapes, hand-write the driver from the closest earlier one, and
+     say in your report which shape did not fit.
      Run every check you add on the smoke cell before the launch: a check that cannot fail
      (e.g. it reads the wrong file) or fails on a correct cell is a driver bug.
    - Read scripts and logs in pieces: `grep -n` for what you need, then `sed -n 'A,Bp'`

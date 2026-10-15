@@ -52,6 +52,7 @@
 | `TORUS_ALL_MARKET_TRADES` | Allows all-markets `newTrades` WebSocket subscriptions (no `marketId`). Unset: allowed only on `--rpc-only` nodes, rejected with `-32602` on validators. `1`: allowed. `0`: rejected. Any other value logs a warning and uses the default. Read once at startup. Per-market `newTrades` and `userFills` are always allowed. See `docs/api/streams.md`. |
 | `TORUS_CHECKPOINT_INTERVAL_MS` | Item 6 Phase 3 coalesced state checkpoints: execution time (milliseconds) between checkpoints; executed state reaches disk once per interval and at every 100th block, barrier and shutdown, not every block. Unset or empty: the role default, 15000 (15 s) on validators, 0 on `--rpc-only` nodes (step 6). `0`: per-block flush. Not a whole number: a warning and the per-block flush. With a deferred book mode (`TORUS_BOOK_ROWS=2` or `3`) an explicit value above 0 refuses to start, and the unset default is off (per-block flush, a warning). Needs the exec pipeline (`TORUS_EXEC_PIPELINE` not `0`). Node-local. Validator RPC reads other than the submit checks lag by up to one interval (`docs/validator-home-network.md`). Read once at startup. |
 | `TORUS_CHECKPOINT_MAX_BYTES` | Item 6 Phase 3: also checkpoint when the since-checkpoint layer reaches this many bytes. Unset, `0` or not a number (warned): no byte cap. Only with checkpoints on. |
+| `TORUS_EPOCH_FAST_PATH` | s124 epoch-boundary fast path, opt-in. By default every epoch-boundary block (height a multiple of the epoch length) first drains the exec pipeline (a forced checkpoint of everything not yet on disk, then a wait for the flush worker) and then runs and writes its state on the execution thread. With this on, a boundary block with no EVM tx and no buffered slash skips that drain and takes the pipelined path like any other block. With checkpoints on (`TORUS_CHECKPOINT_INTERVAL_MS`) such a boundary is also checkpointed at its own height, so the next epoch's validator-set plan it computes reaches disk without waiting for later blocks (consensus reads that plan only from disk). A boundary with an EVM tx or a slash still drains first. State, roots and the running state hash are identical either way; only timing changes. `1` or `true`: on. Unset, empty, `0` or `false`: off. Any other value: off, with a warning. Needs the exec pipeline (`TORUS_EXEC_PIPELINE` not `0`); without it the setting has no effect (warned at startup). Node-local. Read once at startup; when on, the node logs `epoch fast path ON` at startup and boundary blocks log `pipelined=true` in `executing finalized block`. |
 | `TORUS_ADMISSION_EXEC_AWARE` | Exec-aware native admission, opt-in. RPC ingress sheds non-cancel native actions with a retryable "busy" before signature checks once the pooled normal actions reach the admission limit (recent 10 s commit rate x `TORUS_ADMISSION_HORIZON_MS`, default 20000, never below 4 full blocks). With this on, the normal actions of committed blocks that were handed to execution but have not executed yet (they left the pool at dispatch; up to 64 queued blocks plus parked ones) count toward that limit too, so ingress also sheds while execution lags. Cancels and oracle submissions are never counted and never shed by this check. `1` or `true`: on. Unset, empty, `0` or `false`: off (admission exactly as before). Any other value: off, with a warning. No effect when `TORUS_ADMISSION_HORIZON_MS=0` (admission limit off). Node-local. Read once at startup. Gauge: `torus_mempool_native_committed_unexecuted` (always 0 when off). |
 
 ## Port Assignments
@@ -64,13 +65,15 @@
 
 ## ChainConfig Fields
 
-Set via genesis.json. Cannot be changed after genesis initialization.
+Set via genesis.json. Cannot be changed after genesis initialization, except the two EVM block
+values, which governance can change (see "EVM blocks" below).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `chain_id` | u64 | 7777 | EVM chain ID |
 | `chain_name` | string | `"torus"` | Human-readable chain name |
-| `evm_gas_limit` | u64 | 30,000,000 | Maximum gas per block |
+| `evm_gas_limit` | u64 | 3,000,000 | EVM gas budget per EVM block: the genesis header's `evm_gas_limit`. Genesis key `evm.gas_limit` (required). |
+| `evm_block_interval` | u64 | 5 | N: EVM transactions only in blocks with `height % N == 0`. The genesis header's `evm_block_interval`. Genesis key `evm.block_interval` (absent = 5; 0 is refused; 1 = EVM in every block). |
 | `base_fee_per_gas` | u64 | 1,000,000,000 | Initial base fee (1 gwei) |
 | `epoch_length` | u64 | 100,000 | Blocks per validator epoch |
 | `max_validators` | u32 | 21 | Maximum active validator set size |
@@ -79,6 +82,52 @@ Set via genesis.json. Cannot be changed after genesis initialization.
 | `fee_validator_bps` | u16 | 0 | Fee to block proposer (basis points) |
 | `fee_treasury_bps` | u16 | 4500 | Fee to treasury (basis points) |
 | `fee_dev_pool_bps` | u16 | 4500 | Fee to dev pool (basis points) |
+
+## EVM blocks (item 7 step 1)
+
+The block header carries `evm_gas_limit` (the EVM gas budget of an EVM block) and
+`evm_block_interval` (N). Both start at the genesis values above. Every shipped genesis file uses
+3M / 5; the CI Uniswap genesis (`devnet/uniswap/make-ci-genesis.py`) uses a 10M budget, because
+the Router deploy needs about 4.2M gas.
+
+A header must carry its parent's values, except at an epoch boundary, where it carries the epoch
+plan's values (unset in the plan = the parent's). Validators check this before voting and at
+block insertion. Execution of boundary H copies the governance values into the plan for H + L
+(L = `epoch_length`), so a change reaches the header between L and 2L blocks after it executes.
+
+| Governance key (`ParameterChange`) | Range | Header field |
+|---|---|---|
+| `evm_block_gas_limit` | 1,000,000..=10,000,000 | `evm_gas_limit` |
+| `evm_block_interval` | 2..=100 | `evm_block_interval` |
+
+Values outside the range are refused at submission and at execution. A stored value that is
+absent or invalid leaves the chain's value unchanged.
+
+A node fills an EVM block, and admits a transaction, only up to `min(evm_gas_limit,
+TORUS_EVM_BLOCK_GAS_BUDGET)`; the budget is node-local and defaults to 5,000,000. So an
+`evm_block_gas_limit` above a node's budget changes neither that node's blocks nor its admission
+cap, while `eth_estimateGas` still searches up to the header limit and can quote gas that the
+same node's admission refuses. Raise `TORUS_EVM_BLOCK_GAS_BUDGET` on every node together with
+such a governance change.
+
+Per block, checked before voting (a block that breaks one gets no vote):
+
+* EVM transactions only when `height % N == 0`; an honest proposer leaves them pooled in the other
+  blocks.
+* At most `evm_gas_limit / 21,000` EVM transactions.
+* At most 256 KiB (262,144 bytes) of raw EVM transaction bytes; an honest proposer leaves the
+  transactions that would go over pooled.
+* Declared gas of the EVM transactions at most `evm_gas_limit` (step 0).
+
+Admission to the EVM pool refuses a transaction above 256 KiB (`TxTooLarge`) or with a gas
+limit above the `evm_gas_limit` of the last committed header handed to execution (or
+`TORUS_EVM_BLOCK_GAS_BUDGET`, if lower). When a committed header lowers that limit, pooled
+transactions above it are evicted (they could never be selected). `eth_call` and
+`eth_estimateGas` use the head header's `evm_gas_limit` as their default gas and clamp a larger
+`gas` to it.
+
+Constants: `DEFAULT_EVM_GAS_LIMIT`, `DEFAULT_EVM_BLOCK_INTERVAL`, `MAX_EVM_BLOCK_TX_BYTES`,
+`EVM_MIN_TX_GAS` and the two key names and ranges, in `crates/torus-types/src/lib.rs`.
 
 ## Economic Constants
 

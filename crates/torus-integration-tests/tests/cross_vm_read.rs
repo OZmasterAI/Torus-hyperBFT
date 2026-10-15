@@ -6,12 +6,11 @@
 mod common;
 
 use alloy_primitives::Address;
-use torus_bridge::native_executor::NativeExecutor;
 use torus_core::precompiles::{
-    abi, execute_precompile, precompile_address, OrderBookSnapshot, PriceLevel,
-    ADDR_BALANCE_READER, ADDR_ORACLE_READER, ADDR_ORDER_BOOK_READER, ADDR_STAKING_READER,
+    abi, execute_precompile, precompile_address, ADDR_BALANCE_READER, ADDR_ORACLE_READER,
+    ADDR_ORDER_BOOK_READER, ADDR_STAKING_READER,
 };
-use torus_types::{FixedPoint, NativeAction, OrderType, PlaceOrderParams, TimeInForce, U256};
+use torus_types::{FixedPoint, U256};
 
 use crate::common::TestHarness;
 
@@ -33,44 +32,6 @@ fn call_data(signature: &str, words: &[[u8; 32]]) -> Vec<u8> {
 // ============================================================================
 // OrderBookReader (0x0800) tests
 // ============================================================================
-
-/// Read order book after persisting a snapshot — precompile output matches state.
-#[test]
-fn test_order_book_reader_with_snapshot() {
-    let h = TestHarness::new();
-    let market_id = 1u64;
-
-    let bid_price = TestHarness::fp(49000);
-    let bid_qty = TestHarness::fp(5);
-    let ask_price = TestHarness::fp(51000);
-    let ask_qty = TestHarness::fp(3);
-
-    let snapshot = TestHarness::snapshot(&[(bid_price, bid_qty)], &[(ask_price, ask_qty)]);
-    h.persist_order_book(market_id, &snapshot);
-
-    // Call OrderBookReader: getOrderBook(bytes32)
-    let addr = precompile_address(ADDR_ORDER_BOOK_READER);
-    let input = call_data("getOrderBook(bytes32)", &[abi::encode_market_id(market_id)]);
-    let caller = Address::ZERO;
-    let result = execute_precompile(&addr, &input, &caller, &h.state_db, 1, 0).unwrap();
-
-    // Response: (uint128[] bid_prices, uint128[] bid_qtys, uint128[] ask_prices, uint128[] ask_qtys)
-    // Head: 4 offset words, then each array is [length, elements...]
-    assert!(!result.is_empty(), "precompile should return data");
-
-    // Decode the first array — bid_prices. Offsets are in the first 4 words (32 bytes each).
-    // The bid_prices array starts at the offset in word 0.
-    let offset0 = u32::from_be_bytes(result[28..32].try_into().unwrap()) as usize;
-    let bid_count =
-        u32::from_be_bytes(result[offset0 + 28..offset0 + 32].try_into().unwrap()) as usize;
-    assert_eq!(bid_count, 1, "should have 1 bid level");
-
-    // Read the bid price value (the element after the length word)
-    let bp_start = offset0 + 32;
-    let bid_price_raw =
-        u128::from_be_bytes(result[bp_start + 16..bp_start + 32].try_into().unwrap());
-    assert_eq!(bid_price_raw, bid_price.raw() as u128);
-}
 
 /// Read position through OrderBookReader getPosition(address,bytes32).
 #[test]
@@ -245,54 +206,4 @@ fn test_staking_reader_via_delegation() {
 
     let delegated = u128::from_be_bytes(result[16..32].try_into().unwrap());
     assert_eq!(delegated, 1_000_000_000_000u128);
-}
-
-// ============================================================================
-// Cross-consistency: native action → precompile read
-// ============================================================================
-
-/// Place orders via NativeExecutor, persist snapshot, verify via OrderBookReader.
-#[test]
-fn test_cross_consistency_order_then_read() {
-    let h = TestHarness::new();
-    let mut ctx = h.exec_context(1);
-    let trader = TestHarness::addr(1);
-    let market_id = 1u64;
-
-    h.fund_native(&trader, TestHarness::fp(1_000_000));
-
-    // Place a resting buy order (no matching sell, so it stays on book)
-    let action = NativeAction::PlaceOrder(PlaceOrderParams {
-        market_id,
-        is_buy: true,
-        price: TestHarness::fp(48000),
-        quantity: TestHarness::fp(3),
-        order_type: OrderType::Limit,
-        time_in_force: TimeInForce::GTC,
-        reduce_only: false,
-        client_order_id: None,
-    });
-    let r = NativeExecutor::execute(&mut ctx, &trader, &action);
-    assert!(r.success);
-
-    // Manually snapshot the in-memory book and persist it
-    let snapshot = OrderBookSnapshot {
-        bids: vec![PriceLevel {
-            price: TestHarness::fp(48000),
-            quantity: TestHarness::fp(3),
-        }],
-        asks: vec![],
-    };
-    h.persist_order_book(market_id, &snapshot);
-
-    // Now read via precompile
-    let addr = precompile_address(ADDR_ORDER_BOOK_READER);
-    let input = call_data("getOrderBook(bytes32)", &[abi::encode_market_id(market_id)]);
-    let result = execute_precompile(&addr, &input, &Address::ZERO, &h.state_db, 1, 0).unwrap();
-
-    // Verify bid count = 1
-    let offset0 = u32::from_be_bytes(result[28..32].try_into().unwrap()) as usize;
-    let bid_count =
-        u32::from_be_bytes(result[offset0 + 28..offset0 + 32].try_into().unwrap()) as usize;
-    assert_eq!(bid_count, 1);
 }
