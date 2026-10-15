@@ -313,10 +313,13 @@ impl MarketWorkerPool {
     /// Run one market's matching with panic containment: a panic becomes a
     /// typed [`MarketWorkerPanic`] carrying the market id and panic payload,
     /// so the caller can fail-stop loudly instead of dying silently.
-    fn run_contained(
+    /// Generic over the result so the executor's parallel cancel-all book
+    /// pass (`TORUS_PARALLEL_CANCEL_ALL`) contains its per-market jobs the
+    /// same way.
+    pub(crate) fn run_contained<R>(
         market_id: MarketId,
-        f: impl FnOnce() -> MarketBatchResult,
-    ) -> Result<MarketBatchResult, MarketWorkerPanic> {
+        f: impl FnOnce() -> R,
+    ) -> Result<R, MarketWorkerPanic> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
             let message = if let Some(s) = payload.downcast_ref::<&'static str>() {
                 (*s).to_string()
