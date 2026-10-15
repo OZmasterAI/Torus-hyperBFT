@@ -5,6 +5,7 @@
 //!   0x0801 — BalanceReader (read)
 //!   0x0802 — OracleReader (read)
 //!   0x0803 — StakingReader (read)
+//!   0x080e — BboReader (read: best bid / ask, item 7 step 2, HL's bbo address)
 //!   0x0810 — CoreWriter (write: orders, delayed)
 //!   0x0811 — CoreWriterStaking (write: staking, delayed)
 //!   0x0820 — Lockbox (write: EVM <-> native transfers, native leg delayed)
@@ -31,13 +32,15 @@ pub const ADDR_ORDER_BOOK_READER: u16 = 0x0800;
 pub const ADDR_BALANCE_READER: u16 = 0x0801;
 pub const ADDR_ORACLE_READER: u16 = 0x0802;
 pub const ADDR_STAKING_READER: u16 = 0x0803;
+/// Item 7 step 2 (owner decision 3): best bid / ask per market, at HL's bbo address.
+pub const ADDR_BBO_READER: u16 = 0x080e;
 pub const ADDR_CORE_WRITER: u16 = 0x0810;
 pub const ADDR_CORE_WRITER_STAKING: u16 = 0x0811;
 pub const ADDR_LOCKBOX: u16 = 0x0820;
 
 /// FIX EVM-PF-10: Gas costs for Torus precompiles.
 ///
-/// Base gas of every reader call (0x0800-0x0803). s99 owner decision (item6
+/// Base gas of every reader call (0x0800-0x0803, 0x080e). s99 owner decision (item6
 /// plan 9.16, revisit later): single reads at Hyperliquid level, ~16,500 gas
 /// per position read. getPosition = this base + its 5 answer words = 16,500;
 /// a 30M-gas block of cold getPosition calls (ozarchy, block cache cold) runs
@@ -55,7 +58,7 @@ pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
 pub const GAS_PRECOMPILE_COMPLEX: u64 = 50_000;
 
-/// Gas of a reader call (0x0800-0x0803) whose meter used `used` gas above
+/// Gas of a reader call (0x0800-0x0803, 0x080e) whose meter used `used` gas above
 /// the base ([`ReadMeter::used`]): [`GAS_PRECOMPILE_READ`] + `used`.
 /// Charged by the EVM provider after the call, on success and on revert.
 pub const fn reader_gas(used: u64) -> u64 {
@@ -212,7 +215,7 @@ fn scan_prefix_metered(
 /// [`reader_gas`] of the gas its [`ReadMeter`] used).
 pub const fn precompile_gas(id: u16) -> u64 {
     match id {
-        0x0800..=0x0803 => GAS_PRECOMPILE_READ,
+        0x0800..=0x0803 | ADDR_BBO_READER => GAS_PRECOMPILE_READ,
         0x0810..=0x0811 => GAS_PRECOMPILE_WRITE,
         0x0820 => GAS_PRECOMPILE_WRITE,
         _ => 0,
@@ -228,11 +231,12 @@ pub const fn precompile_address(id: u16) -> Address {
 }
 
 /// All Torus precompile addresses (for EVM warm-address injection).
-pub const ALL_PRECOMPILE_ADDRESSES: [Address; 7] = [
+pub const ALL_PRECOMPILE_ADDRESSES: [Address; 8] = [
     precompile_address(ADDR_ORDER_BOOK_READER),
     precompile_address(ADDR_BALANCE_READER),
     precompile_address(ADDR_ORACLE_READER),
     precompile_address(ADDR_STAKING_READER),
+    precompile_address(ADDR_BBO_READER),
     precompile_address(ADDR_CORE_WRITER),
     precompile_address(ADDR_CORE_WRITER_STAKING),
     precompile_address(ADDR_LOCKBOX),
@@ -243,15 +247,18 @@ pub fn is_precompile(address: &Address) -> bool {
     let bytes = address.as_slice();
     bytes[..18].iter().all(|&b| b == 0) && {
         let id = u16::from_be_bytes([bytes[18], bytes[19]]);
-        matches!(id, 0x0800..=0x0803 | 0x0810..=0x0811 | 0x0820)
+        matches!(id, 0x0800..=0x0803 | ADDR_BBO_READER | 0x0810..=0x0811 | 0x0820)
     }
 }
 
-/// Whether a precompile id is a read-only reader (0x0800–0x0803), safe to run in an
+/// Whether a precompile id is a read-only reader (0x0800–0x0803, 0x080e), safe to run in an
 /// eth_call / eth_estimateGas simulation. The writer precompiles (CoreWriter 0x0810,
 /// CoreWriterStaking 0x0811, Lockbox 0x0820) mutate shared state and must be denied there.
 pub const fn is_reader_precompile(id: u16) -> bool {
-    matches!(id, ADDR_ORDER_BOOK_READER..=ADDR_STAKING_READER)
+    matches!(
+        id,
+        ADDR_ORDER_BOOK_READER..=ADDR_STAKING_READER | ADDR_BBO_READER
+    )
 }
 
 // ============================================================================
@@ -591,6 +598,7 @@ fn execute_precompile_inner(
         ADDR_BALANCE_READER => read(balance_reader(input, state_db, meter), meter),
         ADDR_ORACLE_READER => read(oracle_reader(input, state_db, current_timestamp, meter), meter),
         ADDR_STAKING_READER => read(staking_reader(input, state_db, meter), meter),
+        ADDR_BBO_READER => read(bbo_reader(input, state_db), meter),
         ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block),
         ADDR_CORE_WRITER_STAKING => core_writer_staking(input, caller, state_db, current_block),
         ADDR_LOCKBOX => lockbox_precompile(input, caller, call_value, state_db, current_block),
@@ -865,6 +873,51 @@ fn get_oracle_price_fp(
         Some((price, _, false)) if price > FixedPoint::ZERO => Ok(price),
         _ => Err(CoreError::NoOraclePrice(market_id)),
     }
+}
+
+// ============================================================================
+// BboReader (0x080e) — item 7 step 2 (HL's bbo address)
+// ============================================================================
+
+/// `bbo(bytes32 marketId) -> (uint128 bid, uint128 ask)`: the market's best
+/// bid and ask (FixedPoint raw) as of the last block that changed its book
+/// (`cf_native_bbo`), 0 for an empty side or an unknown market. Owner
+/// decision 3, our metering, priced like the other point readers (the point
+/// read is in the base, owner s125): 16,400 + 2 x 20 = 16,440 gas.
+///
+/// The row is node-written and unhashed: a row that is not 32 bytes, or a
+/// failed read, is this node's fault (R02 branch 5): `PrecompileLocalFault`
+/// (the node fail-stops), never zeros and never a revert.
+fn bbo_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
+    let sel = abi::selector(input)?;
+    if sel != selector_for("bbo(bytes32)") {
+        return Err(CoreError::UnknownSelector(sel));
+    }
+    let market_id = abi::decode_market_id(&abi::word(input, 0)?);
+    let row = state_db
+        .get_cf_raw(CF_NATIVE_BBO, &market_id.to_be_bytes())
+        .map_err(|e| {
+            CoreError::PrecompileLocalFault(format!("bbo read (market {market_id}): {e}"))
+        })?;
+    let (bid, ask) = match row {
+        None => (0i128, 0i128),
+        Some(r) => match <[u8; 32]>::try_from(r.as_slice()) {
+            Ok(r) => (
+                i128::from_be_bytes(r[..16].try_into().expect("16 bytes")),
+                i128::from_be_bytes(r[16..].try_into().expect("16 bytes")),
+            ),
+            Err(_) => {
+                return Err(CoreError::PrecompileLocalFault(format!(
+                    "bbo row of market {market_id}: {} bytes, not 32",
+                    r.len()
+                )))
+            }
+        },
+    };
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&abi::encode_u128(bid as u128));
+    out.extend_from_slice(&abi::encode_u128(ask as u128));
+    Ok(out)
 }
 
 // ============================================================================

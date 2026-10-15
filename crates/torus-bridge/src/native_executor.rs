@@ -6318,6 +6318,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
+        // Item 7 step 2: the bbo row of every dirty market (every mode).
+        self.write_bbo_rows();
+
         // Persist the counter only when it moved (or was never stored), so
         // blocks without order flow write nothing at all.
         if self.loaded_next_global_order_id != Some(self.next_global_order_id) {
@@ -6356,6 +6359,41 @@ impl<T: StateBackend> NativeExecContext<T> {
         let _ = acc;
 
         written
+    }
+
+    /// Item 7 step 2 (owner decision 3): the bbo row of every dirty market
+    /// (`CF_NATIVE_BBO`), written only when the top of its book moved since
+    /// this book's last write; an emptied book deletes it. One overlay point
+    /// put (or delete) per moved market: no read, no Borsh, nothing per fill.
+    /// Unhashed, so a node whose book was just loaded (`saved_bbo` = `None`)
+    /// writes the same bytes again. Delist has no hook: `DelistMarket`
+    /// executes nothing today; a delist must empty the book through the
+    /// dirty-marking path or delete the row. A failed write latches the
+    /// block's fail-stop like any book write.
+    fn write_bbo_rows(&mut self) {
+        use torus_state::cf::CF_NATIVE_BBO;
+        for &market_id in &self.dirty_books {
+            let Some(book) = self.order_books.get_mut(&market_id) else {
+                continue;
+            };
+            let row = book.bbo_row();
+            if book.saved_bbo() == Some(row) {
+                continue;
+            }
+            let key = market_id.to_be_bytes();
+            let res = if row == [0u8; 32] {
+                self.state.delete_cf_raw(CF_NATIVE_BBO, &key)
+            } else {
+                self.state.put_cf_raw(CF_NATIVE_BBO, &key, &row)
+            };
+            match res {
+                Ok(()) => book.set_saved_bbo(row),
+                Err(e) => latch_save_fault(
+                    &mut self.fatal_error,
+                    format!("book save: bbo row (market {market_id}): {e}"),
+                ),
+            }
+        }
     }
 
     /// Mode 2 (LevelAuthority) save, two passes:
@@ -6516,6 +6554,11 @@ impl<T: StateBackend> NativeExecContext<T> {
                 })
             })
             .collect();
+
+        // Item 7 step 2: the bbo rows, as in `save_order_books`: point puts
+        // into this block's overlay on the exec thread (never the worker's
+        // sidecar), from the live books' post-state.
+        self.write_bbo_rows();
 
         // Counter + mode marker: same condition, same bytes, same placement
         // (this overlay) as the `save_order_books` tail.

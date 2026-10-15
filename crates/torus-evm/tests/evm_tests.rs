@@ -689,6 +689,56 @@ fn removed_get_order_book_reverts_for_exactly_the_base() {
     assert_eq!(r.gas_used, intrinsic + GAS_PRECOMPILE_READ);
 }
 
+/// Item 7 step 2 (owner decision 3, s125): a `bbo(bytes32)` call at 0x080e
+/// costs the reader base (its point read inside) + 2 returned words =
+/// 16,440 gas on top of the intrinsic gas, and returns the row's prices.
+#[test]
+fn bbo_call_costs_exactly_16440_gas() {
+    let (_dir, db) = open_test_db();
+    db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19))))
+        .unwrap();
+    let (bid, ask) = (99i128 * 10i128.pow(18), 101i128 * 10i128.pow(18));
+    let mut row = bid.to_be_bytes().to_vec();
+    row.extend_from_slice(&ask.to_be_bytes());
+    db.put_cf_raw(torus_state::cf::CF_NATIVE_BBO, &1u64.to_be_bytes(), &row)
+        .unwrap();
+    let mut data = alloy_primitives::keccak256("bbo(bytes32)".as_bytes())[..4].to_vec();
+    data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+    let intrinsic: u64 = 21_000
+        + data
+            .iter()
+            .map(|&b| if b == 0 { 4 } else { 16 })
+            .sum::<u64>();
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        // BboReader precompile at 0x080e.
+        kind: TxKind::Call(Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x0e,
+        ])),
+        data: Bytes::from(data),
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_tx(&db, &block_cfg, tx)
+        .unwrap()
+        .0;
+    assert!(r.success, "bbo answers");
+    assert_eq!(r.gas_used, intrinsic + 16_440);
+    assert_eq!(r.output.len(), 64);
+    assert_eq!(
+        u128::from_be_bytes(r.output[16..32].try_into().unwrap()),
+        bid as u128
+    );
+    assert_eq!(
+        u128::from_be_bytes(r.output[48..64].try_into().unwrap()),
+        ask as u128
+    );
+}
+
 /// HL-parity: a reader precompile's gas scales with its work, not a flat
 /// base: 500 per row read plus 20 per 32-byte word returned (s99).
 /// `getMarkets()` reads 1 row and returns 2 words per market: 200 markets cost

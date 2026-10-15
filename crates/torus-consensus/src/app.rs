@@ -25910,6 +25910,9 @@ mod crash_recovery_tests {
         // Non-vacuous (the warm replica; the others equal it).
         let pm = torus_core::position::PositionManager::new(warm.db.clone());
         let fills = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap().len();
+        // Item 7 step 2 (B16): the dumps compared above cover the bbo rows.
+        let bbo_rows = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_BBO, None).unwrap().len();
+        assert!(bbo_rows >= 1, "{what}: bbo rows {bbo_rows}");
         let liquidations = warm.metrics.liquidations_triggered.get();
         let top_ups = warm.metrics.sell_top_ups_full.get() + warm.metrics.sell_top_ups_partial.get();
         let v1 = signed_pos_of(&warm.db, &oracle_addr(C5_V1));

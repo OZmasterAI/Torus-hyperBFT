@@ -279,6 +279,13 @@ pub const CF_NATIVE_HASHED: &str = "cf_native_hashed";
 ///   the step due, review M2)
 pub const CF_NATIVE_LIQUIDATION: &str = "cf_native_liquidation";
 
+/// Item 7 step 2 (owner decision 3): the best bid / ask per market the 0x080e precompile reads.
+/// Key: market id (8 BE). Value: best bid raw (i128 BE) ‖ best ask raw (i128 BE), 0 for an empty
+/// side; no row while the book is empty. Written at block end for every market whose book changed.
+/// Derived from the book rows: neither hashed nor in the native root (an EVM read of a wrong row
+/// would change the hashed EVM state, so a divergence is still caught).
+pub const CF_NATIVE_BBO: &str = "cf_native_bbo";
+
 /// All column family names. RocksDB requires these at open time.
 pub const ALL_CF_NAMES: &[&str] = &[
     CF_ACCOUNTS,
@@ -329,6 +336,8 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_BLOCK_ACTION_STATUS,
     CF_NATIVE_LIQUIDATION,
     CF_CORE_WRITER_TX,
+    // Append only: `intern_cf` ids are positional.
+    CF_NATIVE_BBO,
 ];
 
 #[cfg(test)]

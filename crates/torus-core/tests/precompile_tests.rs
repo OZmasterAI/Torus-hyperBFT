@@ -1263,3 +1263,116 @@ fn cloid_queue_rows_round_trip() {
         }
     }
 }
+
+// ============================================================================
+// BboReader (0x080e) — item 7 step 2 B17
+// ============================================================================
+
+/// A `cf_native_bbo` row: bid raw ‖ ask raw (i128 BE).
+fn put_bbo_row(db: &StateDb, market_id: MarketId, bid: i128, ask: i128) {
+    let mut row = bid.to_be_bytes().to_vec();
+    row.extend_from_slice(&ask.to_be_bytes());
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_BBO,
+        &market_id.to_be_bytes(),
+        &row,
+    )
+    .unwrap();
+}
+
+/// `bbo(bytes32)` answers the row's bid and ask as two uint128 words (0 for
+/// an empty side or an unknown market); anything but that call is an error.
+#[test]
+fn bbo_reads_the_rows_bid_and_ask() {
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_BBO_READER);
+    let call = |market: MarketId| {
+        let input = build_input("bbo(bytes32)", &[encode_market_id(market)]);
+        execute_precompile(&address, &input, &addr(0), &db, 100, 0)
+    };
+    let words = |bid: i128, ask: i128| {
+        let mut out = abi::encode_u128(bid as u128).to_vec();
+        out.extend_from_slice(&abi::encode_u128(ask as u128));
+        out
+    };
+
+    put_bbo_row(&db, 1, fp(99).raw(), fp(101).raw());
+    put_bbo_row(&db, 2, fp(7).raw(), 0);
+    assert_eq!(call(1).unwrap(), words(fp(99).raw(), fp(101).raw()));
+    assert_eq!(
+        call(2).unwrap(),
+        words(fp(7).raw(), 0),
+        "an empty ask side is 0"
+    );
+    assert_eq!(call(3).unwrap(), words(0, 0), "no row: both sides 0");
+
+    // Another selector.
+    let input = build_input("getPrice(bytes32)", &[encode_market_id(1)]);
+    let sel = u32::from_be_bytes(input[..4].try_into().unwrap());
+    let r = execute_precompile(&address, &input, &addr(0), &db, 100, 0);
+    assert!(
+        matches!(r, Err(CoreError::UnknownSelector(s)) if s == sel),
+        "{r:?}"
+    );
+
+    // Shorter than selector + one word.
+    let full = build_input("bbo(bytes32)", &[encode_market_id(1)]);
+    for len in [0, 3, 4, 35] {
+        let r = execute_precompile(&address, &full[..len], &addr(0), &db, 100, 0);
+        assert!(
+            matches!(r, Err(CoreError::InvalidPrecompileInput(_))),
+            "len {len}: {r:?}"
+        );
+    }
+
+    // A row of the wrong length is this node's corruption (the CF is
+    // unhashed): a local fault, never zeros.
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_BBO,
+        &4u64.to_be_bytes(),
+        &[1u8; 31],
+    )
+    .unwrap();
+    let r = call(4);
+    assert!(
+        matches!(&r, Err(CoreError::PrecompileLocalFault(_))),
+        "{r:?}"
+    );
+}
+
+/// 0x080e is a reader: known, eth_call-safe, priced like the other point
+/// readers (base 16,400 with the point read inside, + 20 per returned word).
+#[test]
+fn bbo_is_a_reader_at_0x080e() {
+    let (_dir, db) = setup();
+    assert_eq!(ADDR_BBO_READER, 0x080e);
+    let address = precompile_address(ADDR_BBO_READER);
+    assert!(is_precompile(&address));
+    assert!(is_reader_precompile(ADDR_BBO_READER));
+    assert_eq!(precompile_gas(ADDR_BBO_READER), GAS_PRECOMPILE_READ);
+    assert!(ALL_PRECOMPILE_ADDRESSES.contains(&address));
+    for id in [0x0804u16, 0x080d, 0x080f] {
+        assert!(!is_precompile(&precompile_address(id)), "0x{id:04x}");
+        assert!(!is_reader_precompile(id), "0x{id:04x}");
+    }
+
+    put_bbo_row(&db, 1, fp(99).raw(), fp(101).raw());
+    let input = build_input("bbo(bytes32)", &[encode_market_id(1)]);
+    let mut meter = ReadMeter::unlimited();
+    let out = execute_precompile_metered(
+        &address,
+        &input,
+        &addr(0),
+        U256::ZERO,
+        &db,
+        100,
+        0,
+        true,
+        &mut meter,
+    )
+    .expect("a reader runs in a read-only (eth_call) context");
+    assert_eq!(out.len(), 64);
+    // Owner s125: no row charge; two words.
+    assert_eq!(meter.used(), 2 * GAS_PRECOMPILE_READ_PER_WORD);
+    assert_eq!(reader_gas(meter.used()), 16_440);
+}
