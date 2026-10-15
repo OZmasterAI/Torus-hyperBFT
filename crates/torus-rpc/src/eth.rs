@@ -37,7 +37,7 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::PendingSubscriptionSink;
 
-use torus_evm::{BlockEnvCfg, TxEnv, DEFAULT_BLOCK_GAS_LIMIT};
+use torus_evm::{BlockEnvCfg, TxEnv};
 use torus_state::cf::{
     CF_BLOCK_BODIES, CF_BLOCK_HASH_TO_NUMBER, CF_BLOCK_HEADERS, CF_RECEIPTS, CF_TX_HASH_TO_LOCATION,
 };
@@ -316,7 +316,13 @@ fn call_tx_type(call: &CallRequest) -> Result<u8, RpcError> {
     Ok(t as u8)
 }
 
-fn build_call_tx_env(call: &CallRequest, chain_id: u64) -> Result<TxEnv, RpcError> {
+/// `block_gas_limit` is the block env's limit: it is the default call gas and
+/// caps a larger request (item 7 step 1; revm refuses a call above it).
+fn build_call_tx_env(
+    call: &CallRequest,
+    chain_id: u64,
+    block_gas_limit: u64,
+) -> Result<TxEnv, RpcError> {
     let caller = match &call.from {
         Some(f) => parse_address(f)?,
         None => Address::ZERO,
@@ -335,8 +341,8 @@ fn build_call_tx_env(call: &CallRequest, chain_id: u64) -> Result<TxEnv, RpcErro
         None => Bytes::new(),
     };
     let gas_limit = match &call.gas {
-        Some(g) => parse_u64(g)?,
-        None => DEFAULT_BLOCK_GAS_LIMIT,
+        Some(g) => parse_u64(g)?.min(block_gas_limit),
+        None => block_gas_limit,
     };
     let tx_type = call_tx_type(call)?;
     // Fee fields as decode.rs sets them for the same envelope: legacy/2930 pay
@@ -1071,7 +1077,7 @@ impl EthApiServer for RpcState {
         } else {
             BlockEnvCfg::default()
         };
-        let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
+        let mut tx_env = build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce, not 0.
         if tx.nonce.is_none() {
             let caller = tx_env.caller;
@@ -1120,8 +1126,8 @@ impl EthApiServer for RpcState {
         // intrinsic gas every tx fails, so 20999 is the failing bound and
         // 21000 itself is tried (a plain transfer estimates exactly 21000).
         let mut lo: u64 = 21_000 - 1;
-        let mut hi: u64 = DEFAULT_BLOCK_GAS_LIMIT;
-        let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
+        let mut hi: u64 = block_env.gas_limit;
+        let mut tx_env = build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce.
         if tx.nonce.is_none() {
             let caller = tx_env.caller;
@@ -1152,7 +1158,8 @@ impl EthApiServer for RpcState {
         }
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            let mut tx_env = build_call_tx_env(&tx, self.chain_id).map_err(err)?;
+            let mut tx_env =
+                build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
             tx_env.gas_limit = mid;
             match self.executor.execute_call(&self.state, &block_env, tx_env) {
                 Ok((r, _)) if r.success => hi = mid,
@@ -1426,7 +1433,7 @@ mod call_typing_tests {
     }
 
     fn env(v: serde_json::Value) -> Result<TxEnv, RpcError> {
-        build_call_tx_env(&req(v), 7)
+        build_call_tx_env(&req(v), 7, 30_000_000)
     }
 
     fn one_entry_list() -> serde_json::Value {
@@ -1502,6 +1509,22 @@ mod call_typing_tests {
         let t2_no_tip = env(serde_json::json!({ "to": TO, "maxFeePerGas": "0x9" })).unwrap();
         assert_eq!(t2_no_tip.gas_priority_fee, Some(0));
         assert_eq!(t2_no_tip.gas_price, 9);
+    }
+
+    /// Item 7 step 1: no gas means the block's gas limit, and gas above it is
+    /// clamped to it (revm refuses a call above the block's limit).
+    #[test]
+    fn call_gas_defaults_and_caps_at_the_block_limit() {
+        let gas_at_3m = |v| build_call_tx_env(&req(v), 7, 3_000_000).unwrap().gas_limit;
+        assert_eq!(gas_at_3m(serde_json::json!({ "to": TO })), 3_000_000);
+        assert_eq!(
+            gas_at_3m(serde_json::json!({ "to": TO, "gas": "0x1c9c380" })),
+            3_000_000
+        );
+        assert_eq!(
+            gas_at_3m(serde_json::json!({ "to": TO, "gas": "0x5208" })),
+            21_000
+        );
     }
 
     /// A plain call is built exactly as before typing: legacy, price 0, no tip,
