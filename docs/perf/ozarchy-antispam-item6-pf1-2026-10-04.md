@@ -11307,6 +11307,103 @@ Next cells (not run):
 * Analysis ran inline (gate 27: no new script files): `j3.py`, `a-cells.py` and `offcpu-sched.py` were imported
   unchanged and extended to the consensus series and timers. Output: `ozarchy-hsdb-tools/analyst/out/hsdb-analysis.md`.
 
+## 75. s58 pilot: all five s58 perf experiments plus the epoch fast path on (ALL) vs off (C), 300 markets, 300 s cells, n = 1 (campaign ozarchy-s58pilot, 2026-10-15)
+
+**With all six flags on, matched/s rose 8.6% in one pair of 300 s cells (225,391 -> 244,823). But blocks came 2.2x as
+often at half the size, consensus timeouts rose from 12 to 34, and CPU per fill rose 6.3%. Per fill, exec time fell
+8.2%, short of the plan's 13-18%. Indicative only: n = 1 per arm, fixed order C then ALL.**
+* matched/s +8.6% in the load window (+7.2% including drain). The warm-up w1 was also an arm-C cell: its matched/s was
+  within 0.5% of r1-C.
+* Block shape: native blk/s 4.12 -> 8.97, fills per native block 53,649 -> 25,422 (-53%). Exec ms per native block
+  234.3 -> 101.9 mostly reflects the smaller blocks. Per 1k fills it is 4.37 -> 4.01 ms (-8.2%), about -19 ms per
+  block at C's block size. The plan expected -41 to -59 ms (sum of the arms in `docs/plans/exp-archy-s58-perf-search.md`).
+* Biggest per-fill cuts: save_books -63%, residual_untimed -35%, phase_match -28%, settle_pass_b -12%. The grain gave
+  nothing (settle_pass_a +3%; with match setup on, matching ignores the grain). Every epoch boundary block ran pipelined
+  (29/29 on val0, vs 0/15 in C), and the gap before a boundary block went from 628 ms to 0.3 ms.
+* Costs: consensus timeouts 12 -> 34 (per node 6-9 -> 26-30, mostly `no_proposal`). Commit-interval p99, mean of
+  nodes, 1,078 -> 1,265 ms. CPU-s per 1M fills 23.18 -> 24.64 (+6.3%). HotStuff run-queue wait 4.8 -> 8.1 s per node
+  (+69%). RSS fell (mean 4.99 -> 4.52 GB).
+* **Verdict: promising but not mergeable as a bundle.** The plan's reject rule (consensus timeouts outside C's range)
+  flags ALL. Single-flag arms vs C are needed to find which flags carry the gain and which carry the timeouts and CPU.
+
+Question (archy s58 perf search): before the full campaign, does the bundle move matched/s at 300 markets, and does
+anything break?
+
+Setup:
+* Node: `exp/archy-s58-perf-search` `6452fa31` = origin/main `5e0fbbfa` + 5 s58 experiments (default off). Arm E's flag
+  is main's own epoch fast path (`efe9aa47`); the s58 copy was reverted in `78373203`. Bench build:
+  `RUSTFLAGS="-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes"`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`,
+  node md5 `753312e5`. Bench `ff822b95`, md5 `9b725823`.
+* Arm C: no experiment flag set. Arm ALL: `TORUS_SETTLE_DEFER_RESULTS=1 TORUS_EPOCH_FAST_PATH=1
+  TORUS_PARALLEL_MATCH_SETUP=1 TORUS_FAST_SELL_TOP_UPS=1 TORUS_EXEC_POOL_GRAIN=4 TORUS_PARALLEL_BOOK_SAVE=1` on all 3
+  validators.
+* Workload: 300 markets, oracle on (30,000 / 2,000 ms), commit tail, BLOCK_CAP 400, MAX_IN_FLIGHT 4, budget 900,
+  cloid share 0, the ozarchy-hsdb cell shape at 300 s instead of 600 s. No perf (`perf_event_paranoid=2`).
+* Cells (run order): s1 (ALL, short smoke, not data), w1 (C, warm-up, not in the comparison), r1-C, r1-ALL.
+
+**Validity:** all cells rc 0, ACCEPT AGREE, liveness PASS. Node md5 `753312e5` on all 3 nodes in every cell; 0 panic or
+fail-stop lines, 0 error lines. Each flag's took-effect line reads on in ALL and off in C on all 3 nodes;
+`epoch fast path ON` appears once per node with no warnings. The save_books drain sums are 6.16-6.55 s per node in ALL
+and 0 in C.
+
+### 75.1 Cells (`s58pilot-C-vs-ALL.txt`; block p99 = commit-interval p99)
+
+| metric | C (r1-C) | ALL (r1-ALL) | ALL vs C |
+|---|---|---|---|
+| matched/s (load window) | 225,391 | 244,823 | +8.6% |
+| matched/s incl. drain | 219,592 | 235,497 | +7.2% |
+| native blk/s | 4.116 | 8.974 | +118% |
+| fills per native block | 53,649 | 25,422 | -52.6% |
+| exec block_ms per native block | 234.3 | 101.9 | -56.5% |
+| exec ms per 1k fills | 4.37 | 4.01 | -8.2% |
+| commit interval p50 ms | 154.3 | 16.5 | |
+| block p99 ms, mean of nodes | 1,077.5 | 1,264.8 | +17.4% |
+| block p99 ms, val0 / val1 / val2 | 1,300 / 926 / 994 | 1,257 / 1,275 / 1,208 | |
+| commit interval max ms | 2,564.6 | 2,969.1 | |
+| consensus timeouts | 12 | 34 | +22 |
+| CPU-s per 1M fills | 23.18 | 24.64 | +6.3% |
+| CPU-s per node, whole run | 1,694.8 | 1,827.8 | +7.8% |
+| RSS peak / mean GB | 6.10 / 4.99 | 5.62 / 4.52 | -8% / -9% |
+
+### 75.2 Where the exec time went (ms per native block, mean of 3 validators; per 1k fills in the last column)
+
+| phase | C | ALL | per 1k fills, ALL vs C |
+|---|---|---|---|
+| save_books | 13.69 | 2.37 | -63% |
+| residual_untimed | 19.40 | 5.94 | -35% |
+| phase_match | 22.94 | 7.86 | -28% |
+| settle_pass_b | 33.79 | 14.06 | -12% |
+| engine_untimed | 9.89 | 4.16 | -11% |
+| phase_margin | 45.49 | 20.92 | -3% |
+| settle_pass_a | 8.09 | 3.94 | +3% |
+
+* save_books per observation 12.92 -> 2.33 ms; in the late 60 s, 24.07 -> 2.53 ms per native block.
+* Epoch boundaries (h % 100 == 0): pipelined / serial on val0 0/15 -> 29/0; mean gap 'block done' at h-1 ->
+  'executing' at h 627.9 -> 0.3 ms; boundary block run time (native > 0) 443 -> 226 ms;
+  `torus_exec_flush_seconds_count` 17 -> 0 per node.
+
+### 75.3 Costs
+
+* View timeouts per node (`VIEW_TIMEOUTS`, load window): C 6 / 9 / 8 of about 1,310 views; ALL 29 / 26 / 30 of about
+  2,750 views. `no_proposal` is the main cause in ALL (19 / 15 / 19). Each timeout fired after about 1.6 s (C) or
+  1.7-1.8 s (ALL).
+* `schedstat`, mean per node: hotstuff-algo CPU 62.6 -> 70.8 s, run-queue wait 4.8 -> 8.1 s; torus-execution CPU
+  246.8 -> 233.5 s, run-queue wait 8.2 -> 9.9 s. Process CPU rose by about 133 s per node, so most of the extra CPU is
+  in the worker pools, not in these two threads.
+* Side finding, not from the flags: `skipping duplicate/replayed native action` warnings per node were 117 in r1-C and
+  192 in r1-ALL, vs 8 in ozarchy-hsdb r2-A (main `a44000e0`). Both arms show it, so it is new on main `5e0fbbfa` or in
+  this harness. Open.
+
+### 75.4 Next
+
+* Single-flag arms vs C (D, M, T, G, B; arm E is bench-queue item 1), then the winners together; ABBA, n >= 4, 300
+  markets, watching consensus timeouts and HotStuff run-queue wait per arm. Consider dropping G: it gave no gain here,
+  and match setup bypasses it.
+* Data: `~/bench-results-matched/ozarchy-s58pilot-300m-{w1,r1-C,r1-ALL}`; analysis in
+  `ozarchy-s58pilot-tools/analyst/out/` (`s58pilot-C-vs-ALL.{txt,json}`, `j3-s58pilot.txt`); driver and checks in
+  `ozarchy-s58pilot-tools/`. Search artifacts (both workflow journals, Codex reviews) are in
+  `~/bench-results-matched/exp-s58-perf-search-artifacts/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
