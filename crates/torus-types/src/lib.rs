@@ -688,7 +688,9 @@ pub fn batch_len_within_cap(len: usize) -> bool {
 /// Item 7 step 1: genesis default EVM gas budget per EVM block (header `evm_gas_limit`).
 pub const DEFAULT_EVM_GAS_LIMIT: u64 = 3_000_000;
 /// Item 7 step 1: genesis default N; EVM txs only in blocks with `height % N == 0`.
-pub const DEFAULT_EVM_BLOCK_INTERVAL: u64 = 5;
+/// s123 owner: 11 for benches and testing (was 5): prime, so it shares no factor with any
+/// validator count below 11; retune before testnet.
+pub const DEFAULT_EVM_BLOCK_INTERVAL: u64 = 11;
 /// Item 7 step 1: most raw EVM tx bytes per block (vote rule), so also per tx (admission).
 pub const MAX_EVM_BLOCK_TX_BYTES: usize = 256 * 1024;
 /// Cheapest tx's intrinsic gas: `evm_gas_limit / EVM_MIN_TX_GAS` caps a block's EVM tx count.
@@ -1463,7 +1465,8 @@ pub struct ChainConfig {
     pub chain_name: String,
     pub evm_gas_limit: u64,
     /// Item 7 step 1: genesis N (`evm.block_interval`), the genesis parent
-    /// header's `evm_block_interval`. Absent in a legacy config = 5.
+    /// header's `evm_block_interval`. Absent in a legacy config = 11
+    /// ([`DEFAULT_EVM_BLOCK_INTERVAL`]).
     #[serde(default = "default_evm_block_interval")]
     pub evm_block_interval: u64,
     pub base_fee_per_gas: u64,
@@ -1692,6 +1695,29 @@ mod tests {
         }"#;
         let config: ChainConfig = serde_json::from_str(json).expect("legacy config must parse");
         assert_eq!(config.timeout_base_ms, 1200);
+    }
+
+    /// s123 owner: N = 11 for benches and testing (was 5). A ChainConfig
+    /// without `evm_block_interval` gets it; the gas default stays 3M.
+    #[test]
+    fn chain_config_evm_block_interval_defaults_to_11() {
+        let json = r#"{
+            "chain_id": 1,
+            "chain_name": "t",
+            "evm_gas_limit": 1,
+            "base_fee_per_gas": 1,
+            "epoch_length": 1,
+            "max_validators": 1,
+            "min_stake": "0x0",
+            "fee_burn_bps": 0,
+            "fee_validator_bps": 0,
+            "fee_treasury_bps": 0,
+            "fee_dev_pool_bps": 0
+        }"#;
+        let config: ChainConfig = serde_json::from_str(json).expect("legacy config must parse");
+        assert_eq!(config.evm_block_interval, 11);
+        assert_eq!(DEFAULT_EVM_BLOCK_INTERVAL, 11);
+        assert_eq!(DEFAULT_EVM_GAS_LIMIT, 3_000_000);
     }
 
     /// Item 7 step 1: a stored governance value counts only when it is a

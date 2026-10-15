@@ -145,7 +145,8 @@ pub struct EvmConfig {
     pub base_fee_initial: u64,
     pub chain_id: u64,
     /// Item 7 step 1: N, EVM txs only in blocks with `height % N == 0` (the
-    /// genesis parent header's `evm_block_interval`). Absent = 5; 0 is refused.
+    /// genesis parent header's `evm_block_interval`). Absent = 11
+    /// (`DEFAULT_EVM_BLOCK_INTERVAL`); 0 is refused.
     #[serde(default = "default_evm_block_interval")]
     pub block_interval: u64,
 }
@@ -933,14 +934,14 @@ mod tests {
         }
     }
 
-    /// Item 7 step 1: `evm.block_interval` (N) defaults to 5 and feeds
-    /// `ChainConfig`; 0 is refused at load. Genesis may set N = 1 (the
-    /// 2..=100 range binds governance only).
+    /// Item 7 step 1: `evm.block_interval` (N) defaults to 11 (s123 owner,
+    /// was 5) and feeds `ChainConfig`; 0 is refused at load. Genesis may set
+    /// N = 1 (the 2..=100 range binds governance only).
     #[test]
     fn evm_block_interval_defaults_and_feeds_chain_config() {
         let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
-        assert_eq!(genesis.evm.block_interval, 5);
-        assert_eq!(genesis.chain_config().evm_block_interval, 5);
+        assert_eq!(genesis.evm.block_interval, 11);
+        assert_eq!(genesis.chain_config().evm_block_interval, 11);
         let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
         json["evm"]["block_interval"] = 7.into();
         let genesis = Genesis::from_json(&json.to_string()).unwrap();
@@ -954,7 +955,8 @@ mod tests {
     }
 
     /// Item 7 step 1: every tracked genesis file ships the 3M EVM budget and
-    /// N = 5, spelled out in the file (not left to the serde default).
+    /// N = 11 (s123 owner, was 5), spelled out in the file (not left to the
+    /// serde default).
     #[test]
     fn shipped_genesis_files_use_the_item7_evm_values() {
         for (name, json) in [
@@ -981,11 +983,14 @@ mod tests {
         ] {
             let genesis = Genesis::from_json(json).unwrap_or_else(|e| panic!("{name}: {e:?}"));
             assert_eq!(genesis.evm.gas_limit, 3_000_000, "{name}");
-            assert_eq!(genesis.evm.block_interval, 5, "{name}");
+            assert_eq!(genesis.evm.block_interval, 11, "{name}");
             assert_eq!(genesis.chain_config().evm_gas_limit, 3_000_000, "{name}");
-            assert_eq!(genesis.chain_config().evm_block_interval, 5, "{name}");
+            assert_eq!(genesis.chain_config().evm_block_interval, 11, "{name}");
             let raw: serde_json::Value = serde_json::from_str(json).unwrap();
-            assert_eq!(raw["evm"]["block_interval"], 5, "{name}: field spelled out");
+            assert_eq!(
+                raw["evm"]["block_interval"], 11,
+                "{name}: field spelled out"
+            );
         }
     }
 
