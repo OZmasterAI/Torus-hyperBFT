@@ -19,6 +19,42 @@ Start with HL's EVM throughput: small blocks 3M gas every second, big blocks 30M
 minute (about 3.5M gas/s in total). Step 0 (vote-side EVM header checks) is approved and being
 built now on `fix/evm-vote-checks`, ahead of the rest of item 7.
 
+**Owner decisions (s122), step 1 (A + B):**
+- Cadence: height based, EVM txs only when `height % N == 0`. **N = 5 for now** (~1.55 s between EVM blocks at
+  ~3.2 blocks/s, 300 markets, section 71). Time based like HL needs whole-second header timestamps changed; not now.
+- Budget: **3M gas per EVM block for now** (~1.9M gas/s at N = 5, about 0.6x HL's small blocks). The rule is step 0's
+  vote check (declared tx gas limits sum <= header `evm_gas_limit`, which equals the parent's, from genesis); step 1
+  sets the genesis value to the budget. A tx above 3M (a 24 KB contract deploy, ~5M+) waits for step 2's big blocks.
+- N and the budget: genesis values plus a governance key (like `price_band_bps`); step 0's "equals the parent" rule
+  gains "unless governance changed it at this height".
+- Base fee: fixed (1 gwei, as step 0 enforces) in step 1; EIP-1559 per block type in step 2 (HL parity).
+- Per EVM block caps: tx count <= budget / 21,000 (never binds an honest block) and EVM tx bytes <= 256 KB
+  (>= the 48 KB initcode limit).
+- Read precompiles: `getOrderBook` (0x0800) is removed in step 1 (Classic, the testnet layout, reverts on a real book
+  today, so no user loses a working read; `getOpenOrders` was already removed in s99). Step 2 adds an HL-style best
+  bid / ask read (HL `bbo`, 0x080e: two numbers, no depth), which needs a small best-price row per market for Classic.
+- Values are provisional: the D1 mixed-load bench (section 4, step 2) re-tunes N and the budget on the step 1 binary.
+- Step 1 keeps the budget, cadence and cap checks independent of the execution order (EVM first today), so step 3
+  only changes execution.
+
+**Step 3 (open, owner s122): isolate trading from EVM, chosen after D1.** Step 1 rations EVM; each EVM block still
+runs serial (no pipelining) because revm and the precompile journal read and write RocksDB directly. If D1 shows the
+serial EVM block costs real blocks/s at N = 5, pick ONE of (both keep A + B, both need EVM reads and writes through the
+overlay / state layers first, both after item 6 Phase 5, which shares the EVM write path via its decision 4):
+- **HL style:** trading first, then the EVM part in the same block, then EVM -> native transfers and CoreWriter
+  actions (HL's order: L1 block, EVM block, EVM -> Core transfers, CoreWriter actions). Contracts read this block's
+  post-trade state. Est. blocks/s ~3.1-3.2 at heavy EVM load (EVM run time on the exec thread, unmeasured), matched/s
+  ~-1-2%. Size L + M. HL parity.
+- **C, parallel:** EVM on its own thread over a block-start snapshot while trading runs; results merged at freeze
+  in a fixed order. Contracts keep today's block-start reads; native -> EVM transfers wait for the next EVM block.
+  Est. blocks/s ~0 loss, matched/s ~0, +1 core in EVM blocks. Size XL, highest risk (concurrency inside deterministic
+  execution; every EVM <-> native write path audited first).
+- Either changes EVM-visible results: free at a fresh genesis before testnet; after testnet it needs activation-height
+  gating (roadmap P0.0, not built). So decide before testnet if D1 says it is needed. Not both in sequence (contract
+  behaviour would change twice).
+- Also for step 2: HL delays CoreWriter order actions a few seconds so contracts cannot bypass the L1 mempool; ours
+  wait one block (~0.3 s).
+
 ## 1. Problem
 
 EVM transactions and native trading share every block, and EVM work slows the trading in it.
@@ -124,10 +160,11 @@ Do it in steps; each step stands on its own.
 
 1. ~~Step 0 now or with item 7~~: now (s99).
 2. ~~Target EVM share~~: HL's numbers to start (s99): 3M gas/s small + 30M per minute big.
-3. Cadence: every Nth block (simple) or time-based like HL?
-4. Base fee: wire EIP-1559, or keep a fixed fee on purpose?
-5. Scan reads: the owner leans to removing `getOrderBook` / `getOpenOrders` after item 7 (9.16);
-   decide together with step 1.
+3. ~~Cadence~~: height based, N = 5 for now (s122).
+4. ~~Base fee~~: fixed in step 1, EIP-1559 per block type in step 2 (s122).
+5. ~~Scan reads~~: `getOrderBook` removed in step 1, best bid / ask read added in step 2 (s122;
+   `getOpenOrders` already removed s99).
+6. Step 3 (trading isolated from EVM): HL style or C, after D1 (s122, open).
 
 ## 6. Unknowns
 
