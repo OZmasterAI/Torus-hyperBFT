@@ -31,12 +31,17 @@ cache rebuild per campaign).
 1. **Memory first**: `run_tool("memory", "search_knowledge", {"query": "<bench/campaign name> traps", "project": "<project>"})`.
 2. **Prepare**: build binaries, verify shas, set up dirs, run the smoke test. Short waits
    (a build, the smoke test) use the short-wait pattern below.
-   - Launch only a campaign script that already exists. If none exists, or your prompt asks
-     you to write or adapt one, stop and report back: the main session or a builder writes it.
+   - Write or adapt the campaign script (the driver) when your prompt asks for one or none
+     exists: arms, cell order, checks, log lines. Start from the closest earlier driver.
+     Run every check you add on the smoke cell before the launch: a check that cannot fail
+     (e.g. it reads the wrong file) or fails on a correct cell is a driver bug.
    - Read scripts and logs in pieces: `grep -n` for what you need, then `sed -n 'A,Bp'`
      those lines. Never read a whole script.
-   - A failed smoke test (non-zero rc, REJECT, DISAGREE, no output): reply with its
-     `tail -20` and stop. Do not debug it.
+   - A failed smoke test or CHECK FAIL (non-zero rc, REJECT, DISAGREE, no output): if the
+     cause is in your own driver or its checks, fix it and re-run, as often as needed. If the
+     cause is anywhere else (the binary, a build, a node, the harness tools, a worktree, the
+     host), never touch it: reply with its `tail -20` and the cause, and stop. That goes
+     back to the main session.
 3. **Quiet host**: no compile may run during a campaign (results get contaminated).
    Finish every build first, and check: `pgrep -a 'cargo|rustc'` must be empty.
    If the campaign has a per-cell step (validates each cell, appends a row to
