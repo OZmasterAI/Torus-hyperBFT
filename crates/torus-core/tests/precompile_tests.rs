@@ -174,11 +174,14 @@ fn lockbox_insufficient_native_balance() {
 // OrderBookReader Precompile Tests
 // ============================================================================
 
+/// Item 7 step 1 (owner s122): getOrderBook is removed from 0x0800 like
+/// getOpenOrders (s99). Its selector reverts exactly like any unknown
+/// selector, even when the market has a book.
 #[test]
-fn order_book_reader_get_order_book() {
+fn order_book_reader_get_order_book_is_an_unknown_selector() {
     let (_dir, db) = setup();
 
-    // Populate order book snapshot
+    // A book the removed selector must not read.
     let snapshot = OrderBookSnapshot {
         bids: vec![
             PriceLevel {
@@ -197,13 +200,14 @@ fn order_book_reader_get_order_book() {
     };
     write_order_book_snapshot(&db, 1, &snapshot).unwrap();
 
-    // Call precompile
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
     let input = build_input("getOrderBook(bytes32)", &[encode_market_id(1)]);
-    let output = execute_precompile(&address, &input, &addr(0), &db, 100, 0).unwrap();
-
-    // Decode: 4 offsets + arrays. Verify we got data back.
-    assert!(output.len() > 128); // At least 4 offset words
+    let sel = u32::from_be_bytes(input[..4].try_into().unwrap());
+    let result = execute_precompile(&address, &input, &addr(0), &db, 100, 0);
+    assert!(
+        matches!(result, Err(CoreError::UnknownSelector(s)) if s == sel),
+        "{result:?}"
+    );
 }
 
 #[test]
@@ -1126,7 +1130,10 @@ fn read_only_is_transparent_for_reader_precompiles() {
     let (_dir, db) = setup();
     // The guard must not affect reader precompiles: same result on both paths.
     let address = precompile_address(ADDR_ORDER_BOOK_READER);
-    let input = build_input("getOrderBook(bytes32)", &[encode_market_id(1)]);
+    let input = build_input(
+        "getPosition(address,bytes32)",
+        &[encode_addr(&addr(1)), encode_market_id(1)],
+    );
 
     let ro = execute_precompile_read_only(&address, &input, &addr(0), &db, 100, 0);
     let normal = execute_precompile(&address, &input, &addr(0), &db, 100, 0);

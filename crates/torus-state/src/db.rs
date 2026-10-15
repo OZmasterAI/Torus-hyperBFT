@@ -82,8 +82,8 @@ struct JobState {
     /// widens its range.
     pending: PendingRanges,
     /// s99 (c): deletes not yet compacted per `(CF, market prefix)` of the
-    /// rows the reader precompiles scan: `(count, first key, last key)`,
-    /// summed across flushes until the count reaches
+    /// book rows the RPC `torus_getOrderBook` scans: `(count, first key,
+    /// last key)`, summed across flushes until the count reaches
     /// [`crate::cf::SCANNED_DELETES_COMPACTION_THRESHOLD`]. In memory only
     /// (node-local; a restart forgets it, RocksDB's own compactions remain).
     uncompacted: DeleteCounts,
@@ -95,7 +95,7 @@ struct JobState {
 /// s89 fix B (generalized for s99 (c)): the background compaction of key
 /// ranges whose rows flushes deleted — the pruned oracle submissions
 /// (`[ORACLE_SUBMISSION_PREFIX, successor)` of `CF_NATIVE_ORACLE`) and, per
-/// market, the book rows the reader precompiles scan (see
+/// market, the book rows the RPC `torus_getOrderBook` scans (see
 /// [`StateDb::compact_range_in_background`], [`StateDb::note_scanned_deletes`]).
 /// One long-lived worker thread, parked on `work` between runs.
 #[derive(Default)]
@@ -930,7 +930,9 @@ impl StateDb {
     }
 
     /// s99 (c): a flush deleted `n` rows in `[first, last]` under `prefix` of
-    /// `cf` (one market's book rows, which getOrderBook scans). The count is
+    /// `cf` (one market's book rows, which the RPC `torus_getOrderBook` reads
+    /// in full under the row layouts; kept in item 7 step 1, owner s123, when
+    /// the 0x0800 getOrderBook precompile was removed). The count is
     /// summed per `(cf, prefix)` across flushes; once it reaches
     /// [`crate::cf::SCANNED_DELETES_COMPACTION_THRESHOLD`] the market's span of
     /// uncompacted deletes is compacted in the background
@@ -1468,9 +1470,10 @@ pub fn churny_cf_write_buffer_bytes() -> Option<usize> {
 /// `target_file_size_base` of `cf_native_order_books` only, in bytes (every
 /// other CF keeps RocksDB's 64 MiB). Default 4 MiB (owner s100): smaller SST
 /// files make the per-market tombstone compaction (`note_scanned_deletes`)
-/// rewrite less of the bottommost level per run (bench: 30M-gas getOrderBook
-/// block 131 -> 62 ms median, no write stalls). 1-2 MiB measured better but
-/// need ~2-4x the open files, and the DB keeps every SST open
+/// rewrite less of the bottommost level per run (bench: a 30M-gas block of the
+/// since-removed getOrderBook precompile, 131 -> 62 ms median, no write
+/// stalls). 1-2 MiB measured better but need ~2-4x the open files, and the DB
+/// keeps every SST open
 /// (`max_open_files` -1): only with a raised `LimitNOFILE` or a bounded
 /// `max_open_files`. `TORUS_BOOK_CF_TARGET_FILE_MB` (>=1, whole MiB)
 /// overrides. Node-local, no format or consensus impact. Read once at DB open.

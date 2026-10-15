@@ -43,18 +43,13 @@ pub const ADDR_LOCKBOX: u16 = 0x0820;
 /// a 30M-gas block of cold getPosition calls (ozarchy, block cache cold) runs
 /// in ~32-37 ms (`docs/perf/read-precompile-gas.md`, section s99). The base
 /// pays for a reader's point reads (getPosition, getBalances, getPrice, the
-/// staking point rows, the classic blob probe) and a scan's fixed cost.
+/// staking point rows) and a scan's fixed cost.
 pub const GAS_PRECOMPILE_READ: u64 = 16_400;
 /// Gas per hashed row a reader's prefix scan returned (s99: scans 500 gas per
-/// scanned row + 20 per returned word or blob chunk).
+/// scanned row + 20 per returned word).
 pub const GAS_PRECOMPILE_READ_PER_ROW: u64 = 500;
-/// Gas per 32-byte word a reader returned, and per 32 bytes of a classic
-/// whole-book blob it read (sized and charged before it is read).
+/// Gas per 32-byte word a reader returned.
 pub const GAS_PRECOMPILE_READ_PER_WORD: u64 = 20;
-/// Most price levels per side one getOrderBook call answers (s99 owner
-/// decision, final): the 64 best bids and the 64 best asks of a mode 2 / 3
-/// market (level rows), no revert past the cap (see [`book_levels`]).
-pub const READER_MAX_LEVELS_PER_SIDE: u64 = 64;
 /// State-mutating writes (SSTORE equivalent range).
 pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
@@ -74,14 +69,13 @@ pub const fn reader_budget(gas_limit: u64) -> u64 {
 }
 
 /// Work meter of one reader call, in gas above the base: 500 per row read
-/// ([`GAS_PRECOMPILE_READ_PER_ROW`]) and 20 per word returned or 32 blob bytes
-/// read ([`GAS_PRECOMPILE_READ_PER_WORD`]), capped at what the caller's gas
-/// pays for. A reader charges BEFORE it does the work it charges for where it
-/// can (scans stop at the budget, a classic blob is charged before it is
-/// decoded), so the node's work per call is bounded by the call's gas, not
-/// only its price. RocksDB deletion markers a scan steps over are never
-/// charged: their count is node-local (flush / compaction history), and gas
-/// is a block result.
+/// ([`GAS_PRECOMPILE_READ_PER_ROW`]) and 20 per word returned
+/// ([`GAS_PRECOMPILE_READ_PER_WORD`]), capped at what the caller's gas pays
+/// for. A reader charges BEFORE it does the work it charges for where it can
+/// (scans stop at the budget), so the node's work per call is bounded by the
+/// call's gas, not only its price. RocksDB deletion markers a scan steps over
+/// are never charged: their count is node-local (flush / compaction history),
+/// and gas is a block result.
 #[derive(Clone, Copy, Debug)]
 pub struct ReadMeter {
     max: u64,
@@ -130,17 +124,9 @@ impl ReadMeter {
         self.charge(rows.saturating_mul(GAS_PRECOMPILE_READ_PER_ROW))
     }
 
-    /// Words returned, or 32-byte blob chunks read.
+    /// Words returned.
     fn charge_words(&mut self, words: u64) -> Result<(), CoreError> {
         self.charge(words.saturating_mul(GAS_PRECOMPILE_READ_PER_WORD))
-    }
-
-    /// Out of gas unless `words` more would still fit (a check, no charge).
-    fn require_words(&self, words: u64) -> Result<(), CoreError> {
-        if words.saturating_mul(GAS_PRECOMPILE_READ_PER_WORD) > self.remaining() {
-            return Err(CoreError::PrecompileOutOfGas);
-        }
-        Ok(())
     }
 }
 
@@ -161,10 +147,9 @@ impl ReadMeter {
 /// allows; out of gas as soon as the charged rows exceed the budget. A scan
 /// therefore reads at most `min(rows paid + 1, max_rows)` rows, plus the
 /// node-local rows it skips, plus the RocksDB deletion markers inside the
-/// prefix that the iterator steps over uncharged (node-local; bounded by the
-/// background compaction a delete flush schedules for the order ranges,
-/// `StateDb::compact_range_in_background`). Unlimited and uncapped: one
-/// `iterate_cf` (the pre-existing read). A missing CF reads as empty.
+/// prefix that the iterator steps over uncharged (node-local). Unlimited and
+/// uncapped: one `iterate_cf` (the pre-existing read). A missing CF reads as
+/// empty.
 fn scan_prefix_metered(
     state: &impl StateBackend,
     cf: &'static str,
@@ -600,7 +585,9 @@ fn execute_precompile_inner(
         Ok(out)
     };
     match id {
-        ADDR_ORDER_BOOK_READER => read(order_book_reader(input, state_db, current_timestamp, meter), meter),
+        ADDR_ORDER_BOOK_READER => {
+            read(order_book_reader(input, state_db, current_timestamp), meter)
+        }
         ADDR_BALANCE_READER => read(balance_reader(input, state_db, meter), meter),
         ADDR_ORACLE_READER => read(oracle_reader(input, state_db, current_timestamp, meter), meter),
         ADDR_STAKING_READER => read(staking_reader(input, state_db, meter), meter),
@@ -621,154 +608,17 @@ fn order_book_reader(
     input: &[u8],
     state_db: &impl StateBackend,
     now: u64,
-    meter: &mut ReadMeter,
 ) -> Result<Vec<u8>, CoreError> {
     let sel = abi::selector(input)?;
-
-    if sel == selector_for("getOrderBook(bytes32)") {
-        let market_id = abi::decode_market_id(&abi::word(input, 0)?);
-        read_order_book(state_db, market_id, meter)
-    } else if sel == selector_for("getPosition(address,bytes32)") {
+    // Item 7 step 1 (owner s122): getOrderBook is removed (like getOpenOrders
+    // in s99); its selector reverts as `UnknownSelector`.
+    if sel == selector_for("getPosition(address,bytes32)") {
         let trader = abi::decode_address(&abi::word(input, 0)?);
         let market_id = abi::decode_market_id(&abi::word(input, 1)?);
         read_position(state_db, &trader, market_id, now)
     } else {
         Err(CoreError::UnknownSelector(sel))
     }
-}
-
-/// `(price, quantity)` per aggregated price level, best-first.
-type PriceQtyLevels = Vec<(FixedPoint, FixedPoint)>;
-
-/// getOrderBook → (uint128[] bid_prices, uint128[] bid_qtys, uint128[] ask_prices, uint128[] ask_qtys)
-///
-/// EVM-VISIBLE / CONSENSUS-RELEVANT. Layout handling is deliberately
-/// asymmetric:
-///
-/// * **Row layouts (`TORUS_BOOK_ROWS` 1 / 2)** — this reader used to look only
-///   for the classic 8-byte key, find nothing, and hand contracts an EMPTY
-///   book. It now serves the real depth (mode 2 straight from the ROOT-CF
-///   level rows, i.e. the consensus aggregate). Those layouts require a fresh
-///   genesis, so no already-deployed chain observes a change here.
-/// * **Classic** — UNCHANGED on purpose. It still decodes only the legacy
-///   `OrderBookSnapshot`, so a production whole-book blob still makes this
-///   precompile revert. Changing that alters EVM-visible output for an
-///   already-deployed layout: a consensus decision, not a refactor. Pinned by
-///   `torus-bridge/tests/book_read_modes_tests.rs::
-///   classic_precompile_behaviour_is_unchanged`.
-///
-/// GAS / WORK: metered by `meter` ([`ReadMeter`]): 500 per book row read
-/// (20 per 32 bytes of a classic blob, sized and charged before it is read)
-/// and 20 per word returned; the market's rows are scanned only up to the
-/// budget and the 64-levels-per-side cap ([`READER_MAX_LEVELS_PER_SIDE`]),
-/// and only this market's hashed rows are read (see [`book_levels`]).
-fn read_order_book(
-    state_db: &impl StateBackend,
-    market_id: MarketId,
-    meter: &mut ReadMeter,
-) -> Result<Vec<u8>, CoreError> {
-    // The answer has at least its 8-word head: a budget below it reads nothing.
-    meter.require_words(8)?;
-    // (price, quantity) per level, best-first.
-    let (bids, asks) = book_levels(state_db, market_id, meter)?;
-
-    let bid_prices: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
-    let bid_qtys: Vec<[u8; 32]> = bids.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
-    let ask_prices: Vec<[u8; 32]> = asks.iter().map(|l| abi::encode_fp_as_u128(l.0)).collect();
-    let ask_qtys: Vec<[u8; 32]> = asks.iter().map(|l| abi::encode_fp_as_u128(l.1)).collect();
-
-    Ok(abi::encode_arrays_response(&[
-        &bid_prices,
-        &bid_qtys,
-        &ask_prices,
-        &ask_qtys,
-    ]))
-}
-
-/// Classic arm: decode only the legacy `OrderBookSnapshot` (a production
-/// whole-book blob reverts — pre-existing, pinned by
-/// `classic_precompile_behaviour_is_unchanged`).
-fn classic_levels(data: &[u8]) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
-    // R02: every validator decodes the same consensus blob alike (a
-    // production `OrderBook` blob is not a snapshot): deterministic, not a
-    // local fault; same revert text as before (`borsh error: ...`).
-    let snapshot = OrderBookSnapshot::try_from_slice(data)
-        .map_err(|e| CoreError::DeterministicDecode(e.to_string()))?;
-    let pairs = |levels: &[PriceLevel]| levels.iter().map(|l| (l.price, l.quantity)).collect::<Vec<_>>();
-    Ok((pairs(&snapshot.bids), pairs(&snapshot.asks)))
-}
-
-/// The levels getOrderBook answers. Everything read and charged is a hashed
-/// consensus row of THIS market, so the charge is the same on every node —
-/// never the node-local `__book_mode__` marker or a DB-wide sniff. Every
-/// caller (metered or not) gets the same answer.
-///
-/// * Classic iff the market's 8-byte whole-book key exists: sized with a
-///   length probe and charged (20 gas per 32 bytes) BEFORE it is read, then
-///   decoded whole (a blob cannot be read in part; no cap).
-/// * Modes 2 / 3 (level rows, `market ‖ 0x03 ‖ side ‖ price`, 26-byte keys):
-///   the [`READER_MAX_LEVELS_PER_SIDE`] (64) best levels per side, best-first
-///   (two bounded scans, bids then asks: at most 128 rows). A key of another
-///   length under those prefixes is a corrupt row store: revert.
-/// * Mode 1 (order rows `market ‖ 0x01 ‖ order_id`, no price index): not
-///   served (s99 owner decision, final). When the market has no level row, one
-///   order row is probed (charged, 500 gas); if there is one, the call reverts
-///   as an unsupported layout (16,400 + 500 = 16,900 gas through the EVM).
-///
-/// Meta and stop rows are not read. A market with neither level nor order
-/// rows is an empty book. Not checked here (owner s100: it would cost an
-/// extra read per call): a market holding both level and order rows, or rows
-/// without a meta row. The writers never produce either (one mode per
-/// process, the meta row saved with every book; a DB of another mode
-/// fail-stops at load; test `row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market`),
-/// and the RPC readers (`book_reader::read_book_depth`) still reject both.
-fn book_levels(
-    state_db: &impl StateBackend,
-    market_id: MarketId,
-    meter: &mut ReadMeter,
-) -> Result<(PriceQtyLevels, PriceQtyLevels), CoreError> {
-    use crate::book_reader::{depth_from_rows, BookLayout};
-    use crate::book_rows::{ROW_TAG_LEVEL, ROW_TAG_ORDER, SIDE_TAG_ASK, SIDE_TAG_BID};
-
-    let key = market_id.to_be_bytes();
-    if let Some(len) = state_db.get_cf_len(CF_NATIVE_ORDER_BOOKS, &key)? {
-        meter.charge_words((len as u64).div_ceil(32))?;
-        let data = state_db.get_cf_raw(CF_NATIVE_ORDER_BOOKS, &key)?.unwrap_or_default();
-        return classic_levels(&data);
-    }
-    let sub = |tags: &[u8]| [&key[..], tags].concat();
-    let side = |tag: u8, meter: &mut ReadMeter| {
-        let prefix = sub(&[ROW_TAG_LEVEL, tag]);
-        let max = Some(READER_MAX_LEVELS_PER_SIDE);
-        scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &prefix, max, meter)
-    };
-    let mut rows = side(SIDE_TAG_BID, meter)?;
-    rows.extend(side(SIDE_TAG_ASK, meter)?);
-    if let Some((k, _)) = rows.iter().find(|(k, _)| k.len() != 26) {
-        return Err(CoreError::BookCorrupt(format!(
-            "market {market_id}: level row key of {} bytes (corrupt row store)",
-            k.len()
-        )));
-    }
-    if rows.is_empty() {
-        let orders = sub(&[ROW_TAG_ORDER]);
-        if !scan_prefix_metered(state_db, CF_NATIVE_ORDER_BOOKS, &orders, Some(1), meter)?
-            .is_empty()
-        {
-            return Err(CoreError::BookLayout(format!(
-                "market {market_id}: getOrderBook does not serve the order-row layout \
-                 (TORUS_BOOK_ROWS=1)"
-            )));
-        }
-    }
-    let depth = depth_from_rows(market_id, BookLayout::LevelAuthority, &rows)?;
-    let pairs = |levels: Vec<crate::book_reader::DepthLevel>| {
-        levels
-            .into_iter()
-            .map(|l| (l.price, l.quantity))
-            .collect::<Vec<_>>()
-    };
-    Ok((pairs(depth.bids), pairs(depth.asks)))
 }
 
 /// getPosition → (int128 size, uint128 entry_price, int128 unrealized_pnl, int128 realized_pnl, uint128 margin)

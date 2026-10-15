@@ -91,18 +91,23 @@ pub const CF_NATIVE_ORACLE: &str = "cf_native_oracle";
 /// that deletes rows under it (the submission prune) schedules a background
 /// compaction of the range (s89 fix B, [`crate::StateDb::compact_pruned_submissions_in_background`]).
 pub const ORACLE_SUBMISSION_PREFIX: &[u8] = b"sub";
-/// s99 (c): the rows the reader precompiles scan, as `(CF, market prefix
-/// length)`: getOrderBook's level rows in `CF_NATIVE_ORDER_BOOKS`, grouped by
-/// the 8-byte market id. A flush that deletes such rows counts them per market
-/// ([`crate::StateDb::note_scanned_deletes`]), and a market whose uncompacted
-/// deletes reach [`SCANNED_DELETES_COMPACTION_THRESHOLD`] has their span
-/// compacted in the background, so the tombstones do not slow every later scan
-/// until RocksDB's own compaction.
+/// s99 (c), kept in item 7 step 1 (owner s123): the rows read by scanning a
+/// whole market, as `(CF, market prefix length)`: the book rows in
+/// `CF_NATIVE_ORDER_BOOKS`, grouped by the 8-byte market id. The RPC
+/// `torus_getOrderBook` reads every row of the market under the row layouts
+/// (torus-rpc `scan::row_book_depth`); the 0x0800 getOrderBook precompile
+/// that also scanned them is gone (item 7 step 1). A flush that deletes such
+/// rows counts them per market ([`crate::StateDb::note_scanned_deletes`]),
+/// and a market whose uncompacted deletes reach
+/// [`SCANNED_DELETES_COMPACTION_THRESHOLD`] has their span compacted in the
+/// background, so the tombstones do not slow every later scan until RocksDB's
+/// own compaction.
 pub const READER_SCANNED_CFS: [(&str, usize); 1] = [(CF_NATIVE_ORDER_BOOKS, 8)];
 /// Uncompacted deletes per market that trigger its background compaction.
-/// 64: at most 63 tombstones linger in a market below it, ~130 ns each, so an
-/// empty-answer getOrderBook (16,560 gas) pays at most ~8 us extra, a 30M-gas
-/// block of them ~15 ms more (`docs/perf/read-precompile-gas.md`, s99).
+/// 64: at most 63 tombstones linger in a market below it, ~130 ns each
+/// (measured on the removed getOrderBook precompile's scan,
+/// `docs/perf/read-precompile-gas.md`, s99), so a scan of the market steps
+/// over at most ~8 us of them.
 pub const SCANNED_DELETES_COMPACTION_THRESHOLD: u64 = 64;
 /// Node-local trade history, packed rows (layout: `trade_rows`).
 pub const CF_NATIVE_TRADES: &str = "cf_native_trades";
