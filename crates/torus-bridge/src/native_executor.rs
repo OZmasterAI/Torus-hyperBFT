@@ -838,6 +838,185 @@ fn parallel_engine_min_fills() -> usize {
     })
 }
 
+// ============================================================================
+// exp/archy-s58 parallel-match-setup — TORUS_PARALLEL_MATCH_SETUP: build each
+// market's Phase 3 match inputs (reduce-only positions, account margins,
+// match requests) inside its pool match job instead of serially on the exec
+// thread. The setup only reads frozen state (the backend is frozen from the
+// Phase 2 reader to the cache flush), so results are identical either way.
+// ============================================================================
+
+/// Pure parse of `TORUS_PARALLEL_MATCH_SETUP`: only `1` (trimmed) enables;
+/// unset and anything else keep today's serial setup.
+fn parse_parallel_match_setup(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+thread_local! {
+    /// [`with_parallel_match_setup`]'s pin on this thread (`None`: the env).
+    static PARALLEL_MATCH_SETUP_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with TORUS_PARALLEL_MATCH_SETUP pinned to `on` on this thread
+/// (the executor reads the flag on the calling thread), restoring the
+/// previous pin afterwards, also on unwind. For the flag-on / flag-off
+/// differential tests and benches (per-process env vars race across test
+/// threads; this does not). Not an API.
+#[doc(hidden)]
+pub fn with_parallel_match_setup<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PARALLEL_MATCH_SETUP_PIN.with(|p| p.set(self.0));
+        }
+    }
+    let _restore = Restore(PARALLEL_MATCH_SETUP_PIN.with(|p| p.replace(Some(on))));
+    f()
+}
+
+/// TORUS_PARALLEL_MATCH_SETUP=1 (node-local, default off): this thread's
+/// pin, else the env var, read once per process and logged once.
+fn parallel_match_setup_enabled() -> bool {
+    if let Some(on) = PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_parallel_match_setup(std::env::var("TORUS_PARALLEL_MATCH_SETUP").ok());
+        tracing::info!(
+            enabled = on,
+            "TORUS_PARALLEL_MATCH_SETUP: per-market match setup in the pool match jobs"
+        );
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Phase 3 calls on this thread that built the match inputs in the pool
+    /// jobs ([`MarketWorkerPool::match_parallel_setup_with`]).
+    static MATCH_SETUP_IN_JOBS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod parallel_match_setup_flag_tests {
+    use super::*;
+
+    #[test]
+    fn only_trimmed_one_enables() {
+        assert!(parse_parallel_match_setup(Some("1".to_string())));
+        assert!(parse_parallel_match_setup(Some(" 1\n".to_string())));
+        assert!(!parse_parallel_match_setup(None));
+        for v in ["0", "", "true", "on", "yes", "2", "01", "1x"] {
+            assert!(!parse_parallel_match_setup(Some(v.to_string())), "{v}");
+        }
+    }
+
+    /// The pin overrides the env, nests, and is restored on return.
+    #[test]
+    fn pin_overrides_nests_and_restores() {
+        let outer = parallel_match_setup_enabled();
+        with_parallel_match_setup(true, || {
+            assert!(parallel_match_setup_enabled());
+            with_parallel_match_setup(false, || assert!(!parallel_match_setup_enabled()));
+            assert!(parallel_match_setup_enabled());
+        });
+        assert_eq!(parallel_match_setup_enabled(), outer);
+        assert_eq!(PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()), None);
+    }
+
+    /// A panic inside the pinned closure still restores the pin.
+    #[test]
+    fn pin_restored_on_unwind() {
+        let r = std::panic::catch_unwind(|| {
+            with_parallel_match_setup(true, || panic!("inside the pin"))
+        });
+        assert!(r.is_err());
+        assert_eq!(PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()), None);
+    }
+
+    /// The pin is this thread's only.
+    #[test]
+    fn pin_is_per_thread() {
+        with_parallel_match_setup(true, || {
+            let other = std::thread::spawn(|| PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()))
+                .join()
+                .unwrap();
+            assert_eq!(other, None);
+        });
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn gtc(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> (Address, NativeAction) {
+        let sender = Address::new([if is_buy { 1 } else { 2 }; 20]);
+        let p = PlaceOrderParams {
+            market_id,
+            is_buy,
+            price: fp(price),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        (sender, NativeAction::PlaceOrder(p))
+    }
+
+    /// Phase 3 calls of a batch on this thread that built inputs in the jobs.
+    fn in_jobs_calls(pin: bool, block: &[(Address, NativeAction)]) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = torus_state::StateDb::open(dir.path()).unwrap();
+        let mut ctx = NativeExecContext::new(
+            db,
+            1,
+            1000,
+            0,
+            100,
+            10,
+            Address::new([99; 20]),
+            Address::new([100; 20]),
+            Address::new([101; 20]),
+        );
+        for n in [1u8, 2] {
+            let bal = torus_core::position::NativeBalance {
+                available: fp(1_000_000),
+                order_margin: FixedPoint::ZERO,
+            };
+            ctx.positions
+                .put_native_balance(&Address::new([n; 20]), &bal)
+                .unwrap();
+        }
+        let before = MATCH_SETUP_IN_JOBS.with(|c| c.get());
+        for threads in [0usize, 4] {
+            with_parallel_match_setup(pin, || {
+                NativeExecutor::execute_batch_engine_mode(&mut ctx, block, threads)
+            });
+            assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        }
+        MATCH_SETUP_IN_JOBS.with(|c| c.get()) - before
+    }
+
+    /// Flag on: a block with >= 2 markets builds its inputs in the jobs (the
+    /// equivalence tests are not vacuous); one market keeps the inline path;
+    /// flag off never takes the in-jobs path.
+    #[test]
+    fn flag_on_multi_market_sets_up_in_jobs() {
+        let two = [
+            gtc(1, false, 100, 2),
+            gtc(2, false, 100, 2),
+            gtc(1, true, 100, 1),
+            gtc(2, true, 100, 1),
+        ];
+        let one = [gtc(1, false, 100, 2), gtc(1, true, 100, 1)];
+        assert_eq!(in_jobs_calls(true, &two), 2);
+        assert_eq!(in_jobs_calls(true, &one), 0);
+        assert_eq!(in_jobs_calls(false, &two), 0);
+    }
+}
+
 /// How the engine (Phase-2 prepare) path is chosen.
 #[derive(Clone, Copy)]
 enum EngineMode {
@@ -7778,6 +7957,11 @@ impl NativeExecutor {
         let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
             HashMap::default();
 
+        // TORUS_PARALLEL_MATCH_SETUP: with >= 2 markets, each market's
+        // inputs are built inside its pool match job (single-market blocks
+        // keep the inline path). Taking or creating the book stays here.
+        let setup_in_jobs = parallel_match_setup_enabled() && market_batches.len() >= 2;
+        let mut setup_items = Vec::new();
         for (&market_id, prepared) in &market_batches {
             // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
             // checked against (`shapes` holds every batch market).
@@ -7793,87 +7977,22 @@ impl NativeExecutor {
                 OrderBook::new(market_id, tick, lot)
             });
 
-            // s515 (BUG 2): police reduce-only orders. Positions are loaded
-            // as of this point (all Phase-1 effects, none of this batch's
-            // fills); the book then advances them through every fill of the
-            // batch in this market (positions are keyed per market, and only
-            // this worker fills this market), so every order is checked
-            // against the position left by the block's earlier orders.
-            // Review 5: checked takers are tracked the same way — their
-            // closing fills are free at match time — so every path frees
-            // exactly the position the single path would read. F1 (s517):
-            // EVERY sender of the batch in this market is tracked (checked
-            // takers value their position; maker checks need in-batch
-            // positions).
-            // Item 6 M1: a sender whose position Phase 2 read (`pre_pos`,
-            // same reader, nothing written in between) is not read again.
-            if !prepared.is_empty() || book.has_reduce_only_orders() {
-                let mut known = ReduceOnlyPositions::new();
-                for p in prepared {
-                    if let Some((signed, _)) = p.pre_pos {
-                        known.insert(p.sender, signed);
-                    }
-                }
-                let ro = Self::reduce_only_positions_for(
-                    &reader,
-                    &book,
-                    market_id,
-                    prepared.iter().filter(|p| p.pre_pos.is_none()).map(|p| p.sender),
-                    known,
-                );
-                book.set_reduce_only_positions(ro);
+            if setup_in_jobs {
+                // TORUS_PARALLEL_MATCH_SETUP: the market's job builds its
+                // inputs ([`Self::match_setup`]); the LPT weight is its
+                // request count, as in `match_parallel_with`.
+                setup_items.push((market_id, book, prepared.as_slice(), prepared.len()));
+                continue;
             }
-
-            // s515 review 4: one shared copy of the market's tiers for the
-            // checked takers' match-time margin limits.
-            let tiers = Self::margin_tiers(ctx.margin_configs.get(&market_id));
-            // F1 (s517, D2): each checked sender's exclusive pool (0 outside
-            // the market of its first checked taker) and valuation price.
-            let mut am = AccountMargins::new(tiers.clone());
-            // s94 option 1: every fill's loss against the mark is charged.
-            // An unchecked taker (GTC buy, reduce-only) pays a charge from
-            // its pool here, else its snapshot — the pre-batch state, which
-            // still holds its own reservation (the book takes it off).
-            am.set_mark(markets.get(&market_id).and_then(|m| m.band).map(|b| b.reference));
-            am.set_pre_batch_snapshots(true);
-            for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
-                if am.get(&p.sender).is_none() {
-                    // Item 6 M1: Phase 2's `position_px` (every checked
-                    // taker passed an account check, so it has `pre_pos`).
-                    let px = match p.pre_pos {
-                        Some((_, px)) => px,
-                        None => Self::d2_taker_px(&reader, &p.sender, market_id),
-                    };
-                    #[cfg(test)]
-                    if let Some(s) = reader.sums.filter(|s| s.shadow) {
-                        let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
-                        if want != px || p.pre_pos.is_none() {
-                            s.shadow_mismatches.lock().unwrap().push(format!(
-                                "M1 px {} {market_id}: reused {px:?}, position_px {want:?}, pre_pos {:?}",
-                                p.sender, p.pre_pos
-                            ));
-                        }
-                    }
-                    // Review fix 4 (s517): only the pool market's entry is
-                    // the sender's account (shared with its makers there).
-                    match pools.get(&(p.sender, market_id)) {
-                        Some(&pool) => am.insert(p.sender, pool, px),
-                        None => am.insert_taker_only(p.sender, px),
-                    }
-                }
-            }
-            book.set_account_margins(am);
-            let requests: Vec<MatchRequest<'_>> = prepared
-                .iter()
-                .map(|p| MatchRequest {
-                    sender: p.sender,
-                    params: p.params,
-                    order_id: p.order_id,
-                    margin: p
-                        .checked_pos_net
-                        .map(|_| Self::taker_margin_limit(&tiers, p.params, p.margin_reserved)),
-                })
-                .collect();
+            let requests = Self::match_setup(
+                &reader,
+                &markets,
+                &pools,
+                &ctx.margin_configs,
+                market_id,
+                &mut book,
+                prepared,
+            );
 
             worker_batches.insert(market_id, (book, requests));
         }
@@ -7888,12 +8007,39 @@ impl NativeExecutor {
         // order in a book (Phase 2 only reserves; a worker adds only its
         // own requests, whose cloids differ by the claimed set; fired stops
         // are placed after settlement), so the books skip their re-check.
-        let mut market_results = match MarketWorkerPool::match_parallel_with(
-            worker_batches,
-            ctx.timestamp,
-            Some(&reader),
-            true,
-        ) {
+        let matched = if setup_in_jobs {
+            #[cfg(test)]
+            MATCH_SETUP_IN_JOBS.with(|c| c.set(c.get() + 1));
+            // The setup only reads `reader`, `markets`, `pools` and the
+            // configs (all frozen / immutable here) and writes its own
+            // book; a panic in it is that market's `MarketWorkerPanic`.
+            MarketWorkerPool::match_parallel_setup_with(
+                setup_items,
+                ctx.timestamp,
+                MarketWorkerPool::resolve_worker_cap_named(None),
+                Some(&reader),
+                true,
+                &|m, book, prepared| {
+                    Self::match_setup(
+                        &reader,
+                        &markets,
+                        &pools,
+                        &ctx.margin_configs,
+                        m,
+                        book,
+                        prepared,
+                    )
+                },
+            )
+        } else {
+            MarketWorkerPool::match_parallel_with(
+                worker_batches,
+                ctx.timestamp,
+                Some(&reader),
+                true,
+            )
+        };
+        let mut market_results = match matched {
             Ok(r) => r,
             Err(panic) => {
                 // T1.5 FAIL-STOP: the panicking worker consumed its market's
@@ -10223,6 +10369,108 @@ impl NativeExecutor {
         } else {
             None
         }
+    }
+
+    /// Phase 3 setup of one market (s515 / review 4 / F1 / item 6 M1): the
+    /// reduce-only positions `book` polices, its checked takers' account
+    /// margins (D2 pool or taker-only), and its match requests. Only READS
+    /// (`reader` over the frozen backend, the call's immutable `markets`,
+    /// `pools` and configs) and writes `book`, so it runs on the exec thread
+    /// or, TORUS_PARALLEL_MATCH_SETUP=1, inside the market's pool match job
+    /// with the same result. Never iterates `ReduceOnlyPositions` or
+    /// `AccountMargins`.
+    fn match_setup<'a, T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        pools: &HashMap<(Address, MarketId), FixedPoint>,
+        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        market_id: MarketId,
+        book: &mut OrderBook,
+        prepared: &[PreparedOrder<'a>],
+    ) -> Vec<MatchRequest<'a>> {
+        // s515 (BUG 2): police reduce-only orders. Positions are loaded
+        // as of this point (all Phase-1 effects, none of this batch's
+        // fills); the book then advances them through every fill of the
+        // batch in this market (positions are keyed per market, and only
+        // this worker fills this market), so every order is checked
+        // against the position left by the block's earlier orders.
+        // Review 5: checked takers are tracked the same way — their
+        // closing fills are free at match time — so every path frees
+        // exactly the position the single path would read. F1 (s517):
+        // EVERY sender of the batch in this market is tracked (checked
+        // takers value their position; maker checks need in-batch
+        // positions).
+        // Item 6 M1: a sender whose position Phase 2 read (`pre_pos`,
+        // same reader, nothing written in between) is not read again.
+        if !prepared.is_empty() || book.has_reduce_only_orders() {
+            let mut known = ReduceOnlyPositions::new();
+            for p in prepared {
+                if let Some((signed, _)) = p.pre_pos {
+                    known.insert(p.sender, signed);
+                }
+            }
+            let ro = Self::reduce_only_positions_for(
+                reader,
+                book,
+                market_id,
+                prepared.iter().filter(|p| p.pre_pos.is_none()).map(|p| p.sender),
+                known,
+            );
+            book.set_reduce_only_positions(ro);
+        }
+
+        // s515 review 4: one shared copy of the market's tiers for the
+        // checked takers' match-time margin limits.
+        let tiers = Self::margin_tiers(margin_configs.get(&market_id));
+        // F1 (s517, D2): each checked sender's exclusive pool (0 outside
+        // the market of its first checked taker) and valuation price.
+        let mut am = AccountMargins::new(tiers.clone());
+        // s94 option 1: every fill's loss against the mark is charged.
+        // An unchecked taker (GTC buy, reduce-only) pays a charge from
+        // its pool here, else its snapshot — the pre-batch state, which
+        // still holds its own reservation (the book takes it off).
+        am.set_mark(markets.get(&market_id).and_then(|m| m.band).map(|b| b.reference));
+        am.set_pre_batch_snapshots(true);
+        for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
+            if am.get(&p.sender).is_none() {
+                // Item 6 M1: Phase 2's `position_px` (every checked
+                // taker passed an account check, so it has `pre_pos`).
+                let px = match p.pre_pos {
+                    Some((_, px)) => px,
+                    None => Self::d2_taker_px(reader, &p.sender, market_id),
+                };
+                #[cfg(test)]
+                if let Some(s) = reader.sums.filter(|s| s.shadow) {
+                    let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
+                    if want != px || p.pre_pos.is_none() {
+                        s.shadow_mismatches.lock().unwrap().push(format!(
+                            "M1 px {} {market_id}: reused {px:?}, position_px {want:?}, pre_pos {:?}",
+                            p.sender, p.pre_pos
+                        ));
+                    }
+                }
+                // Review fix 4 (s517): only the pool market's entry is
+                // the sender's account (shared with its makers there).
+                match pools.get(&(p.sender, market_id)) {
+                    Some(&pool) => am.insert(p.sender, pool, px),
+                    None => am.insert_taker_only(p.sender, px),
+                }
+            }
+        }
+        book.set_account_margins(am);
+        let requests: Vec<MatchRequest<'_>> = prepared
+            .iter()
+            .map(|p| MatchRequest {
+                sender: p.sender,
+                params: p.params,
+                order_id: p.order_id,
+                margin: p
+                    .checked_pos_net
+                    .map(|_| Self::taker_margin_limit(&tiers, p.params, p.margin_reserved)),
+            })
+            .collect();
+
+        requests
     }
 
     /// s515 (BUG 2): the positions `book` must police — every trader with a
