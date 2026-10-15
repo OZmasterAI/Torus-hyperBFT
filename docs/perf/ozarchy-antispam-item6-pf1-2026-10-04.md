@@ -11041,6 +11041,272 @@ Cells `~/bench-results-matched/ozarchy-p4j4h-300m-*` (part 1), `ozarchy-p4j4d-30
 `mem-samples.txt`, `node-env-all.txt`, `node-preload.txt`. Tools `ozarchy-p4j4-tools/` (drivers, `analyst/handoff_tables.py`,
 `execlag.py`, `rss.py`, `a-cells.py`).
 
+## 74. 71.8 option A A/B: HotStuff store and DA store in their own RocksDB, 300 markets, 600 s cells (campaign ozarchy-hsdb, 2026-10-15)
+
+**Option A removes about 91% of the in-window DB write wait, but only about 31% of the in-window block-time step. The
+remaining wait is on the state DB, and part of it is now on the consensus thread's commit-time state writes.**
+* Across the fleet, in-window non-checkpoint DB write wait (above the out-of-window rate) falls from 2.27 to 0.21 s per
+  window-second: -90.6%, pairwise 88.0-92.0%, Welch 95% CI 75-100%.
+* All HotStuff-store and mempool-DA symptoms go away: vote-state write, follower insert-persist, RPC admission > 512 ms,
+  and state-DB write_other.
+* What is left (0.21 s/s) is on the **state DB**. The new consensus DB adds 0.002 s/s (not resolved from 0).
+* Block time p99 in the windows falls 1,575 -> 1,370 ms (-205 ms; CI [-415, +5]; step/sd 2.5). The out-of-window
+  p99 stays the same (946 vs 936 ms). So 434 of the 629 ms in-vs-out gap remains (69%).
+* `persist_committed_block_durably` does not pick up the wait (excess 1.8 s vs 1.4 s per cell, A vs B).
+  `on_committed_block` does: it holds the commit-manifest state-DB put. Its in-window cost per call goes from 10 ms
+  below its out-of-window mean in A to 12 ms above it in B (B - A in windows +25 ms, CI [+10, +40]).
+* **Verdict on slicing: warranted, confidence medium.** The rest of the window stall is in the state DB's write queue,
+  and the consensus thread still hits it. Slicing the checkpoint batch is the one fix that covers every state-DB
+  writer.
+
+Question (18c, follow-up to 71.8): with the HotStuff store and the DA store in their own RocksDB (arm B) instead of
+the shared state DB (arm A), how much of the in-window consensus (HotStuff `RocksKVStore`) and mempool (`mirror_to_da`)
+write wait goes away? Does the wait move to commit persistence on the state DB?
+
+Setup:
+* Arm A: origin/main `46428bfa`, node md5 `cac5d688` (one RocksDB).
+* Arm B: `perf/hs-da-own-db` `1ca719f1`, node md5 `6e05d40a`. This build adds `<data_dir>/consensus-db` with
+  `cf_consensus_meta`, `cf_native_pending` and `cf_native_shards`, its own WAL and write queue, a 64 MiB block cache
+  and a 256 MiB memtable budget. No flag or env.
+* Bench: `ff822b95`, md5 `9b725823`.
+* Workload: 300 markets, Classic, oracle on (30,000 / 2,000 ms), 15 s checkpoint default, commit tail depth 1,
+  BLOCK_CAP 400, MAX_IN_FLIGHT 4, budget 900, rate 76,000, 5,000 senders, jemalloc defaults, genesis md5 `b83180e1`.
+* RocksDB stats: `TORUS_ROCKSDB_STATS=2`, interval 1 s. Sampler at 1 Hz, `vmstat 1`.
+* Cells (run order): w1 (A, 60 s warm-up, not in the means), then r1-A, r1-B, r2-B, r2-A, r3-A, r3-B (600 s each,
+  ABBA).
+
+Differences from job 3 (section 71):
+* (a) perf is `context-switches:u` (user frames only), because this host has `perf_event_paranoid=2` and tracefs 700.
+  Job 3 p1 had kernel frames at paranoid -1. Recording covers only the write-path threads (106-116 tids per node:
+  hotstuff-algo, rpc-worker, gossip / ingress verify, flush worker, `rocksdb:high`), with 8-page rings, on all 3 nodes,
+  in the same window (bench +240 s, 45 s) in every measured cell. w1 has no perf.
+* (b) Perf post-processing is not in the driver. It was run after the campaign, against the staged binaries. **The
+  data turned out to carry no samples** (see 74.4), so there is no call-site table.
+* (c) In `sampler.csv`, arm A's `torus_rocksdb_consensus_*` and `*__consensus` columns are `nan` (absent); arm B's
+  are numeric. The per-CF `db="consensus"` alias columns are sampled every 60 s (handoff).
+* (d) Dirty limits are 256 MB / 64 MB (job 3 phase 1, as found; no sudo). Tail depth 1, 300 markets, 600 s cells.
+* (e) w1 is excluded from the per-arm means.
+* (f) `ozarchy-hsdb-300m-w1-attempt1`, `ozarchy-hsdb-300m-r1-A-attempt1` and `ozarchy-hsdb-run/campaign-attempt1`
+  (the summarizer dropped arm A rows; stopped at 07:42) are not data. The smoke cells are not grid cells.
+
+**Validity:** 7/7 cells rc 0, ACCEPT AGREE, liveness PASS, drained (29-31 s in the measured cells). Node md5 src = dst = the arm's staged
+md5 in every cell. 161 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, rerun pass empty. Every node reports
+`panic_or_failstop_lines` 0 and `error_lines` 0. Arm B's CHECK confirms the consensus DB (`LOG` on 3 nodes,
+`db_write_count` up to 39.6-40.5 k); arm A's confirms no consensus DB. `summary.json` `commit` reads `46428bfa` in the
+B cells too: that is the harness worktree's sha. The binary is B's (md5 `6e05d40a`).
+
+### 74.1 Cells (`[rates]` lines in `campaign.log`; `summary.json`; RSS = VmRSS from `mem-samples.txt`, bench window, GB; block time = commit-interval p99, mean of 3 nodes, `j3.py` method)
+
+| cell | arm | matched/s | incl. drain | native blk/s | placed/s | submit/s | CPU-s/1M | RSS mean / peak GB | exec queue mean | block p99 all / in / out ms | val0 out p99 ms | timeouts | refused |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 (60 s) | A | 223,299 | 203,609 | 4.683 | 293,374 | 1,532 | 22.40 | 4.24 / 5.46 | 53.1 | - | - | 7 | 3 |
+| r1-A | A | 225,067 | 221,736 | 3.061 | 292,518 | 1,160 | 23.54 | 5.72 / 6.69 | 59.8 | 1,327 / 1,556 / 926 | 1,226 | 22 | 133 |
+| r1-B | B | 226,894 | 223,497 | 3.121 | 295,119 | 1,175 | 23.40 | 5.68 / 6.51 | 60.1 | 1,155 / 1,376 / 941 | 1,239 | 12 | 35 |
+| r2-B | B | 228,495 | 224,279 | 3.086 | 296,959 | 1,171 | 23.34 | 5.79 / 6.60 | 59.7 | 1,183 / 1,408 / 908 | 1,202 | 10 | 15 |
+| r2-A | A | 226,400 | 223,835 | 3.158 | 294,443 | 1,172 | 23.55 | 5.72 / 6.53 | 59.9 | 1,244 / 1,479 / 965 | 1,272 | 15 | 20 |
+| r3-A | A | 226,516 | 222,921 | 3.119 | 294,436 | 1,166 | 23.54 | 6.02 / 7.08 | 60.3 | 1,350 / 1,690 / 946 | 1,174 | 22 | 42 |
+| r3-B | B | 227,010 | 223,127 | 3.091 | 294,997 | 1,167 | 23.39 | 5.74 / 6.54 | 59.5 | 1,170 / 1,326 / 958 | 1,212 | 12 | 2 |
+
+Per arm (n = 3; B - A with Welch 95% CI; step / pooled sd):
+
+| metric | A | B | B - A [95% CI] | step/sd | reading |
+|---|---|---|---|---|---|
+| matched/s | 225,994 | 227,466 | +1,472 (+0.65%) [-455, +3,399] | 1.7 | not resolved |
+| matched/s incl. drain | 222,831 | 223,634 | +804 [-1,411, +3,018] | 0.9 | not resolved |
+| native blk/s | 3.113 | 3.099 | -0.013 [-0.110, +0.083] | -0.4 | no step |
+| CPU-s/1M | 23.54 | 23.38 | -0.165 (-0.7%) [-0.249, -0.081] | -6.9 | small, resolved |
+| RSS mean / peak GB | 5.82 / 6.77 | 5.74 / 6.55 | -0.08 [-0.53, +0.36] / -0.22 [-0.92, +0.49] | -0.7 / -1.1 | not resolved; B's extra cache and memtable budget does not show |
+| state-DB memtable mean MB | 245 | 183 | -63 [-78, -48] | -9.5 | the consensus DB holds 73-76 MB mean (max 144-163) |
+| exec queue mean (heights) | 60.0 | 59.8 | -0.2 [-1.0, +0.5] | -0.7 | saturated in both (channel 64) |
+| **block p99 in windows ms** | **1,575** | **1,370** | **-205 [-415, +5]** | **-2.5** | large; CI just touches 0 |
+| block p99 out of windows ms | 946 | 936 | -10 [-62, +42] | -0.4 | no step |
+| block p99 all ms | 1,307 | 1,169 | -138 [-280, +5] | -3.4 | large; CI just touches 0 |
+| in-vs-out gap ms | 629 | 434 | -195 (-31%) | | 69% of the gap remains |
+| commit intervals > 1 s in windows (3 nodes) | 159 | 103 | -55 [-82, -28] | -5.4 | resolved |
+| tails (> out-p99) per 100 s in / out | 16.7 / 3.7 | 10.2 / 3.8 | -6.5 [-13.7, +0.7] / +0.1 | -3.2 / 0.6 | |
+| val0 out-of-window p99 ms (the floor) | 1,224 | 1,217 | -7 [-103, +90] | -0.2 | the floor stays; not checkpoint-related |
+| consensus timeouts | 19.7 | 11.3 | -8.3 | | not resolved (A 15-22, B 10-12) |
+
+There is no drift in run order: matched/s A 225.1k, 226.4k, 226.5k; B 226.9k, 228.5k, 227.0k. Block p99 in the
+windows: A 1,556, 1,479, 1,690; B 1,376, 1,408, 1,326. The checkpoint itself is the same in both arms: 193-201
+checkpoints per cell, DB write 0.596 vs 0.605 s, batch 201 vs 199 MB. Flush 0.838 vs 0.888 s is +0.05 s (step/sd 3.0).
+
+### 74.2 DB write wait in and out of the windows, by DB (`j3.py` windows and per-second fleet sums, extended inline to the `torus_rocksdb_consensus_*` series)
+
+The windows and skip are the same as 71.2: any node's checkpoint step, widened by the scrape period, first 20 s
+skipped. That gives 234-265 s in and 317-349 s out per cell. "Excess" means in-window write time above what the same
+number of writes would take at the cell's out-of-window mean. The checkpoint batch's own write is subtracted.
+
+| metric (fleet) | A (r1 / r2 / r3) | B (r1 / r2 / r3) |
+|---|---|---|
+| state-DB writes per s, in | 163 / 166 / 158 | 18.5 / 18.8 / 18.1 |
+| state-DB mean write ms, in / out | 17.9 / 16.5 / 18.8 and 1.44 / 1.46 / 1.37 | 38.6 / 33.6 / 34.7 and 3.65 / 4.01 / 3.88 |
+| p99 over seconds of the per-second mean, ms, in / out | 144 / 145 / 206 and 2.9 / 3.3 / 2.7 | 312 / 374 / 257 and 7.0 / 9.6 / 9.5 |
+| state-DB write_other per s, in / out | 1.04 / 1.12 / 1.13 and 0.09 / 0.13 / 0.08 | 0 / 0 / 0 and 0 / 0 / 0 |
+| consensus-DB writes per s, in | - | 147 / 151 / 146 |
+| consensus-DB mean write ms, in / out | - | 1.12 / 1.11 / 1.05 and 1.05 / 1.08 / 1.12 |
+| consensus-DB per-second-mean p99 ms, in / out | - | 3.5 / 3.4 / 2.5 and 3.0 / 2.6 / 3.8 |
+| stall micros, write_stall, write_stopped (both DBs) | 0, 0, 0 | 0, 0, 0 |
+| **state-DB excess wait, s per window-second** | **2.33 / 2.11 / 2.37** (mean 2.27) | **0.24 / 0.19 / 0.20** (mean 0.21) |
+| consensus-DB excess wait, s per window-second | - | 0.011 / 0.004 / -0.010 (mean 0.002) |
+| excess wait per cell, s (state + consensus) | 612 / 496 / 571 | 59.5 / 51.7 / 49.8 |
+
+* **Share removed: 90.6%** of the fleet's in-window non-checkpoint write wait (2.27 -> 0.21 s per window-second;
+  step/sd 20). The 9 A x B pairs give 88.0-92.0%, and the Welch CI on the difference gives 75-100%.
+* In B, the state-DB mean write is longer (35.6 vs 17.7 ms in, 3.8 vs 1.4 ms out). This is a mix effect, not a
+  regression: about 145 short writes per second left for the consensus DB. The state-DB excess wait fell 91%.
+* The consensus DB shows no window effect: mean 1.09 ms in vs 1.08 ms out, no stall, write_other 0.07 / 0.06 per s.
+  Its 0.002 s/s excess is not resolved from 0 (CI [-0.025, +0.028]).
+* The rocksdb `db_write_p99_micros` / `max_micros` gauges are cumulative since the DB opened, so they cannot be split
+  by window.
+  * Cell-end state-DB p99: 7.1-7.7 ms in A, 0.20-0.22 ms in B.
+  * Max: 1.02-1.30 s in both arms, which is the checkpoint batch itself.
+  * Consensus DB in B: p99 7.9-8.6 ms, max 50-79 ms.
+
+### 74.3 By writer (consensus-thread and admission timers, per-second deltas; `own` = the node's own checkpoint window)
+
+The sampler keeps no buckets for the consensus-thread histograms, so per-write p99 is not available. The table
+uses each timer's mean per call and node-seconds whose summed time exceeds 250 ms; a node-second over 250 ms holds at
+least one long wait. Admission keeps its 0.128-8.192 s buckets.
+
+| writer (DB in A -> B) | metric | A (r1 / r2 / r3) | B (r1 / r2 / r3) |
+|---|---|---|---|
+| HotStuff vote state `set_vote_state_atomic` (state -> consensus) | mean ms in / out | 0.87 / 0.99 / 2.75 and 0.12 / 0.14 / 0.12 | 0.13 / 0.11 / 0.15 and 0.12 / 0.15 / 0.14 |
+| | node-s > 250 ms in, max ms | 2 / 2 / 7, 637-872 | 0 / 0 / 0, 16-47 |
+| HotStuff follower insert-persist (validate + block-tree write) | mean ms in / out | 43.7 / 36.1 / 43.8 and 29.2 / 29.9 / 26.2 | 26.4 / 26.3 / 27.0 and 27.7 / 29.0 / 27.0 |
+| | node-s > 250 ms in / out | 42 / 34 / 42 and 2 / 1 / 1 | 2 / 0 / 1 and 2 / 1 / 0 |
+| mempool `mirror_to_da`, RPC path (admit_insert) (state -> consensus) | > 512 ms per 100 window-s | 41.4 / 24.7 / 32.0 (out 0) | 0 / 0 / 0 (out 0) |
+| | excess s per window-second | 0.50 / 0.34 / 0.52 | 0.04 / 0.09 / 0.06 |
+| submit_verify (RPC) | > 512 ms per 100 window-s | 61.2 / 5.1 / 48.1 | 0 / 2.6 / 0 |
+| DA mirror at block build (`flush_da_mirrors`) | node-s > 250 ms in, max ms | 2 / 2 / 1, 310-934 | 0 / 0 / 0, 75-106 |
+| **commit persistence `persist_committed_block_durably` WriteBatch (state in both)** | mean ms in / out | 8.38 / 8.19 / 9.38 and 7.86 / 7.92 / 7.54 | 8.27 / 7.68 / 8.91 and 7.66 / 7.83 / 7.48 |
+| | excess s per cell | 1.17 / 0.59 / 3.63 (mean 1.79) | 1.31 / -0.35 / 3.31 (mean 1.42) |
+| | node-s > 250 ms (own windows), max ms | 1 / 4 / 3, 676-928 | 1 / 1 / 4, 648-967 |
+| **`on_committed_block` (holds the commit-manifest state-DB put)** | mean ms in / out | 95.1 / 84.9 / 99.7 and 103.0 / 106.6 / 101.6 | 117.0 / 115.9 / 122.3 and 106.1 / 105.1 / 106.8 |
+| | excess s per window-second | -0.07 / -0.20 / -0.02 | +0.10 / +0.10 / +0.14 |
+| checkpoint batch (flush worker, state) | DB write s mean | 0.615 / 0.575 / 0.599 | 0.597 / 0.610 / 0.608 |
+
+Reading:
+* **HotStuff and DA writers: the wait is gone (high confidence).** Vote-state writes in windows are back at the
+  out-of-window cost, from 0.87-2.75 to 0.11-0.15 ms mean, with no node-second over 250 ms against 11 in A.
+  Follower insert-persist goes from 41.2 to 26.6 ms mean in windows, with 118 -> 3 long node-seconds. RPC admissions
+  over 512 ms go from 32.7 per 100 window-s to 0. State-DB write_other goes from 1.10 per s to 0.
+* **`persist_committed_block_durably`: no shift (medium-high).** Its in-window excess is 1.8 vs 1.4 s per cell, and
+  long node-seconds are 8 vs 6, with the same maxima (0.65-0.97 s). These rare full-batch waits occur in both arms.
+* **The commit-manifest put: a shift (medium).**
+  * In A, `on_committed_block` is cheaper in windows than outside (93 vs 104 ms per call). The consensus thread has
+    already queued behind the batch in a HotStuff write, so the next state write finds the queue clear (the 71.8
+    sequence).
+  * In B it is 12 ms dearer in windows (118 vs 106). B - A in windows is +25 ms per call, CI [+10, +40], step/sd 4.3.
+    Out of windows: 104 vs 106, no step.
+  * The cost: 0.10-0.14 s per window-second on the consensus thread, 23-36 s per cell, about 0.2 s per node-window.
+    That is 41-68% of B's remaining state-DB excess (0.19-0.24 s/s; 53% of the means). The rest is on other state-DB writers, which this data
+    cannot name. In B the state DB has about 19 writes per s fleet out of windows: commit persist about 9.5 per s,
+    the manifest about the same, plus the checkpoint and a few background batches.
+  * Attribution to the manifest put rests on two facts: `on_committed_block` writes only that put to the state DB, and
+    the consensus DB shows no window effect. A slower in-window read inside `on_committed_block` is not ruled out
+    without stacks.
+
+### 74.4 perf: no samples recorded (anomaly)
+
+`perf report --stats` on all 18 `perf-sched-val{0,1,2}.data` files (6 cells x 3 nodes; 26-32 MB each) shows only
+SWITCH events, 1.08-1.33 M per file. There are **0 SAMPLE records** and no LOST records. With `exclude_kernel`
+(`context-switches:u`), every context-switch sample is filtered out, because the switch fires in kernel mode. Only
+the `--switch-events` records survive. So:
+* There are no call chains. The 71.8 call-site table (`RocksKVStore::write`, `StateDb::write`,
+  `NativeDaStore::put_batch`, `mirror_to_da`, `persist_committed_block_durably`) cannot be rebuilt for this campaign
+  on either arm.
+* The symbol check did not matter in the end. In `nm -C`, both staged binaries carry `RocksKVStore` write (2),
+  `mirror_to_da` (3), `persist_committed_block_durably` (8) and `WriteThread::AwaitState` (2), but no standalone
+  `StateDb::write` or `NativeDaStore::put_batch` (inlined; they would need DWARF inline frames).
+* Switch records alone give off-CPU stretches by thread, without cause. hotstuff-algo is blocked 0.87-1.06 s per s in
+  its own windows vs 0.73-0.78 out, in both arms alike. Its stretches over 100 ms number 11-25 in vs 63-99 out per
+  45 s, also in both arms. Idle channel waits dominate, so this cannot separate a DB wait from waiting for a message.
+* **Fix for the next perf campaign:** a user-space off-CPU stack needs kernel sampling (`perf_event_paranoid` <= 1)
+  or an eBPF off-CPU tool. Alternatively, time the manifest put and export the consensus-thread timer buckets (see
+  74.6).
+
+### 74.5 Consensus-DB gauges (arm B, `sampler.csv`, per node, bench window)
+
+| gauge | r1-B | r2-B | r3-B |
+|---|---|---|---|
+| memtable MB mean / max | 73.7-75.5 / 145-163 | 73.1-74.6 / 144-155 | 73.0-75.2 / 145-161 |
+| per CF memtable mean MB (`cf_native_pending` / `cf_consensus_meta` / `cf_native_shards`) | 63-80 / 2.4-2.8 / 0 | 60-69 / 2.3-2.8 / 0 | 70-78 / 2.7-2.8 / 0 |
+| immutable memtables max, L0 files max (DB / per CF) | 1, 5 / 3-4 | 1, 5 / 3-4 | 1, 6 / 3-5 |
+| pending compaction max MB | 428-455 | 418-528 | 469-481 |
+| bytes written = WAL MB/s | 25.9-26.6 | 25.9-26.7 | 25.9-26.5 |
+| flushes / compactions per cell, compaction write GB | 124-127 / 40-42, 7.5-7.6 | 123-127 / 42-43, 7.4-7.7 | 124-127 / 41-42, 7.4-7.7 |
+| stall micros, write_stall, write_stopped | 0 | 0 | 0 |
+
+The state DB writes 34.0-34.8 MB/s in B vs 60.0-61.1 MB/s in A, so about 26 MB/s moved to the consensus DB. The
+consensus DB rewrites about 7.5 GB per node per 600 s in compaction (about 12.5 MB/s), with up to 0.5 GB pending, and
+never stalls. Its memtable (about 74 MB mean) almost equals the state-DB memtable drop (-63 MB), which is why RSS does
+not rise.
+
+### 74.6 Verdict
+
+1. **Option A removes about 91% of the in-window DB write wait (high confidence).** Fleet excess goes from 2.27 to
+   0.21 s per window-second (CI 75-100%). The HotStuff-store waits (vote state, follower insert) and mempool
+   `mirror_to_da` waits (RPC admissions > 512 ms, block-build DA flush) fall to their out-of-window level. The new
+   consensus DB has no window effect.
+2. **Block time improves less (medium).** The in-window p99 falls 205 ms (-13%), intervals > 1 s in windows -35%
+   (resolved), overall p99 -138 ms (-10.5%). Both p99 CIs just touch 0 at n = 3. 434 ms of the 629 ms in-vs-out gap
+   remains. The out-of-window floor (val0 about 1.22 s, fleet 936-946 ms) does not change.
+3. **Does the wait move to state-DB commit persistence? Partly (medium).**
+   * `persist_committed_block_durably` does not pick it up (excess 1.4 vs 1.8 s per cell).
+   * The commit-manifest put in `on_committed_block` does: +12 ms per call in windows in B against -10 ms in A
+     (B - A +25 ms, CI [+10, +40]). That is 0.10-0.14 s per window-second, about 0.2 s per node-window, on the
+     consensus thread.
+   * All of B's remaining wait (0.21 s/s) is on the state DB.
+4. **Throughput, CPU, RSS:** matched/s +0.65% (not resolved), CPU-s/1M -0.7% (resolved, small), RSS not resolved.
+   B's added cache and memtables do not show in RSS.
+5. **Slicing: yes, next (medium).** After option A, the consensus thread's remaining in-window wait is a state-DB write
+   queued behind the ~200 MB checkpoint batch. Slicing the batch covers it and every other state-DB writer. The narrower
+   alternative is to move the commit manifest off the state DB queue, but that leaves the other state writers (about
+   0.06-0.14 s/s) and changes the header / manifest crash ordering. Keep option A: it removes the mempool and HotStuff
+   share at no throughput, CPU or RSS cost.
+
+Next cells (not run):
+* Slicing prototype vs B (option A), 300 m, 600 s, n = 3 ABBA. Same driver, about 1 h 27 min with a warm-up.
+  * Success criterion: in-window block p99 within about 100 ms of the out-of-window p99, and `on_committed_block`
+    in-window = out.
+* Before that run, add a timer with buckets around `persist_commit_manifest`, and keep the buckets for the
+  consensus-thread timers in the sampler. That makes the per-writer split direct instead of inferred.
+* For stacks, fix perf (see 74.4). n = 3 leaves the block p99 CIs at the edge: n = 4-5 per arm would resolve a step
+  of about 200 ms.
+
+### 74.7 Caveats and anomalies
+
+* **perf has no samples** (74.4). All attribution here comes from the 1 Hz timers and RocksDB counters, not from
+  stacks. The 71.8 per-call-site split (QC / lock writes vs vote) cannot be repeated.
+* No per-write p99 by writer: the sampler drops the consensus-thread histogram buckets, and the rocksdb p99 / max
+  gauges are cumulative. Node-seconds over 250 ms stand in for the tail.
+* "Excess" uses the out-of-window per-call mean as the baseline. The windows are wide (any node, plus the scrape
+  period; 40-46% of seconds are "in"), so in-window rates are diluted, not inflated.
+* `on_committed_block` per-call cost also depends on block size. A's in-window value below its out-of-window mean
+  shows that this confound exists. The B - A difference in windows is the stronger evidence.
+* Refusals: r1-A refused 133 actions against 2-42 in the other cells. In-flight at end 2.6-5.6 k in all cells. No
+  restart. Digests AGREE in every cell (digest 3.1-10.9 s).
+* Tail lag at depth 1: grid lag p50 1, p99 46-51 heights in every cell. Commit -> seen p99 5.9-7.1 s. The first
+  window starts 340-510 heights behind, the same as job 3.
+* Dirty limits 256 MB / 64 MB; job 3 showed no writeback throttling at these limits (71.4).
+* The prep note said 71.8 was not on origin/main. It is: 71.8 is at the end of section 71, and section 73 is also on
+  main. This section follows 73.
+
+### 74.8 Files
+
+* Run dir `~/bench-results-matched/ozarchy-hsdb-run/campaign/` (`handoff.json`, `handoff-tables.txt`,
+  `campaign.log`, `cells.tsv`, `cell-step/`, `campaign.done`).
+* Cells `~/bench-results-matched/ozarchy-hsdb-300m-{w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}` (+ `.campaign.log`,
+  `.cell.rc`). Per cell: `metrics-1hz.txt.gz`, `sampler.csv`, `summary.json`, `mem-samples.txt`, `taillag.json`,
+  `perf-sched-val{0,1,2}.data`, `perf.log`, `rocksdb-LOG-val*.txt` (+ `rocksdb-consensus-LOG-val*.txt` in B).
+* Staged binaries `~/bench-results-matched/ozarchy-hsdb-stage/{a-run,b-run}/release/`.
+* Tools `ozarchy-hsdb-tools/` (`make-hsdb-driver.py`, `ozarchy-hsdb-campaign.sh`, `soak-sampler.py`). The analyst
+  scripts `analyst/{j3.py,a-cells.py,offcpu-sched.py,taillag.py}` are identical to job 3's and job 4's copies (diff
+  empty).
+* Analysis ran inline (gate 27: no new script files): `j3.py`, `a-cells.py` and `offcpu-sched.py` were imported
+  unchanged and extended to the consensus series and timers. Output: `ozarchy-hsdb-tools/analyst/out/hsdb-analysis.md`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
