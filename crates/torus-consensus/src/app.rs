@@ -829,29 +829,6 @@ fn async_post_flush_enabled() -> bool {
     parse_async_post_flush_toggle(std::env::var("TORUS_ASYNC_POST_FLUSH").ok())
 }
 
-/// Experiment s58 (epoch-boundary fast path): `TORUS_EPOCH_FAST_PATH`. Only
-/// `"1"` (trimmed) turns it on; unset / anything else = off, today's
-/// behavior: every epoch-boundary block is a pipeline barrier.
-fn parse_epoch_fast_path(v: Option<String>) -> bool {
-    v.as_deref().map(str::trim) == Some("1")
-}
-
-/// Effective epoch-boundary fast-path mode: node-local, read once per
-/// process (logged once) and copied into [`ExecutionContext::epoch_fast_path`]
-/// when the execution context is built.
-fn epoch_fast_path_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let on = parse_epoch_fast_path(std::env::var("TORUS_EPOCH_FAST_PATH").ok());
-        tracing::info!(
-            enabled = on,
-            "TORUS_EPOCH_FAST_PATH: no-EVM, no-slash epoch-boundary blocks take the pipelined \
-             fast path (boundary checkpoint forced) when enabled"
-        );
-        on
-    })
-}
-
 /// Rank 2 memory bound: total bincode bytes of `ExecSource::Ready` bodies the
 /// `deferred_exec` park may hold before further Ready parks DEMOTE to
 /// `ExecSource::Compact` (hash references, rematerialized from the durable DA
@@ -968,13 +945,6 @@ struct ExecutionContext {
     validator: BlockValidator,
     evm_executor: EvmExecutor,
     epoch_length: u64,
-    /// Experiment s58 (`TORUS_EPOCH_FAST_PATH=1`, node-local, read once at
-    /// construction; default off): a no-EVM, no-slash epoch-boundary block
-    /// takes the pipelined fast path instead of a barrier, and with a
-    /// checkpoint policy every boundary forces a checkpoint (so the
-    /// validator-set plan it writes becomes durable without waiting for a
-    /// later trigger). Off = every boundary is a barrier, exactly today.
-    epoch_fast_path: bool,
     max_validators: u32,
     treasury_address: Address,
     dev_pool_address: Address,
@@ -1087,10 +1057,6 @@ struct ExecutionContext {
     /// every native context in `mode` with the resident holder attached.
     #[cfg(test)]
     test_book_mode: Option<torus_bridge::native_executor::BookMode>,
-    /// Test-only: pipeline barriers run with a flush worker attached
-    /// (`pipeline_barrier` past its no-worker early return).
-    #[cfg(test)]
-    test_barriers: AtomicU64,
     /// Test-only: with `test_book_mode` set, build the contexts WITHOUT the
     /// resident holder (the per-block reload, `TORUS_RESIDENT_BOOKS=0`).
     #[cfg(test)]
@@ -2412,8 +2378,6 @@ impl ExecutionContext {
         let Some(worker) = &self.flush_worker else {
             return true;
         };
-        #[cfg(test)]
-        self.test_barriers.fetch_add(1, Ordering::SeqCst);
         // Item 6 Phase 3: a barrier first closes the window (L + the last
         // digested block) into a checkpoint, so after it everything handed
         // to W is durable and the serial path runs on the DB as today.
@@ -2659,14 +2623,7 @@ impl ExecutionContext {
                 + fold.as_ref().map_or(0, |p| p.state_bytes())
                 + current.as_ref().map_or(0, |c| c.state_bytes())) as u64
         };
-        // Experiment s58: with the epoch-boundary fast path a boundary block
-        // gets here instead of a barrier; its checkpoint is REQUIRED (not an
-        // optimization). The plan it wrote for the next boundary must become
-        // durable: consensus refuses that boundary until the durable marker
-        // reaches this height, and nothing else would close the window once
-        // an epoch length that 100 does not divide leaves the exec idle.
         let due = height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
-            || (self.epoch_fast_path && EpochManager::is_epoch_boundary(height, self.epoch_length))
             || policy
                 .every_blocks
                 .is_some_and(|n| height.saturating_sub(st.base) >= n)
@@ -3054,19 +3011,12 @@ impl ExecutionContext {
         // a BARRIER: wait for W to drain, then today's serial path verbatim.
         // Replay (`DurableRows::default()`) is therefore always serial, and W
         // does not even exist at replay time (F4).
-        // Experiment s58 (`epoch_fast_path`, default off): a boundary that
-        // passes every other term takes the fast path too. F2 is W's EVM
-        // resync after the checkpoint (Digest `evm_addrs`); F8 is gone since
-        // bug (b) (the consensus thread only reads the plan once the durable
-        // marker reaches it). With a checkpoint policy the boundary forces a
-        // checkpoint (`checkpoint_upkeep_with`), so its plan becomes durable.
         let pipelined = self.flush_worker.is_some()
             && durable.header
             && durable.body
             && !has_evm
             && pending_slashes.is_empty()
-            && (self.epoch_fast_path
-                || !EpochManager::is_epoch_boundary(height, self.epoch_length));
+            && !EpochManager::is_epoch_boundary(height, self.epoch_length);
         if !pipelined && !self.pipeline_barrier() {
             tracing::error!(height, "FATAL: flush worker failed before barrier — fail-stop");
             return;
@@ -5643,7 +5593,6 @@ impl TorusApp {
             validator: exec_validator,
             evm_executor: EvmExecutor::new(config.chain_id),
             epoch_length: config.epoch_length,
-            epoch_fast_path: epoch_fast_path_enabled(),
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
@@ -5686,8 +5635,6 @@ impl TorusApp {
             ckpt: Default::default(),
             #[cfg(test)]
             test_book_mode: None,
-            #[cfg(test)]
-            test_barriers: AtomicU64::new(0),
             #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
@@ -11434,31 +11381,6 @@ mod crash_recovery_tests {
     /// Hotstuff updates in canonical order: (sorted inserts, sorted deletes).
     type CanonicalUpdates = Option<(Vec<([u8; 32], u64)>, Vec<[u8; 32]>)>;
 
-    /// Experiment s58 (c): how a bug (b) epoch test node executes. `None`:
-    /// serial (the context as built, no flush worker); `Some(policy)`:
-    /// pipelined with the epoch-boundary fast path on, under checkpoint
-    /// `policy` (`None`: per block).
-    type FastExec = Option<Option<crate::exec_pipeline::CheckpointPolicy>>;
-
-    fn epoch_exec_ctx(config: &ChainConfig, db: &StateDb, exec: FastExec) -> ExecutionContext {
-        let mut ctx = make_exec_ctx(config, db);
-        if let Some(policy) = exec {
-            ctx.epoch_fast_path = true;
-            ctx.checkpoint = policy;
-            ctx.attach_flush_worker(None);
-        }
-        ctx
-    }
-
-    /// Pipelined: wait until everything E handed off is durable (the
-    /// consensus thread reads the plan from the DB; a live node refuses
-    /// the boundary until then and retries). Serial: nothing to wait for.
-    fn settle_exec(ctx: &ExecutionContext) {
-        if let Some(w) = ctx.flush_worker.as_ref() {
-            assert!(w.wait_idle(), "flush worker failed");
-        }
-    }
-
     fn canonical_updates(updates: Option<ValidatorSetUpdates>) -> CanonicalUpdates {
         updates.map(|u| {
             let mut ins: Vec<_> = u.inserts().map(|(k, p)| (k.to_bytes(), p.int())).collect();
@@ -11502,7 +11424,7 @@ mod crash_recovery_tests {
             .collect();
         link_blocks(&mut blocks);
 
-        let node = |lag: u64, exec: FastExec| {
+        let node = |lag: u64| {
             let (mut config, db) = make_test_config_and_db();
             config.epoch_length = 4;
             let staking = StakingManager::new(db.clone());
@@ -11522,7 +11444,7 @@ mod crash_recovery_tests {
                 staking.put_validator(&addr, &row).unwrap();
             }
             let mut app = TorusApp::new(db.clone(), &config, None, None, None);
-            let ctx = epoch_exec_ctx(&config, &db, exec);
+            let ctx = make_exec_ctx(&config, &db);
             let mut next = 1u64;
             let mut seen = Vec::new();
             for boundary in [4u64, 8] {
@@ -11530,7 +11452,6 @@ mod crash_recovery_tests {
                     dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
                     next += 1;
                 }
-                settle_exec(&ctx);
                 let before = dump_all_cfs(&db);
                 let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
                 assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
@@ -11558,26 +11479,10 @@ mod crash_recovery_tests {
                 .pubkey;
             (seen, rows, rotations, pubkey0)
         };
-        let (near, far) = (node(1, None), node(3, None));
+        let (near, far) = (node(1), node(3));
         assert_eq!(near.0, far.0, "hotstuff validator-set updates per boundary");
         assert_eq!(near.1, far.1, "staking validator rows");
         assert_eq!(near.2, far.2, "pending key rotations");
-        // Experiment s58 (c): with the epoch-boundary fast path on
-        // (pipelined, per block and checkpoints never by time), the same
-        // updates, rows, pending rotations and rotated key.
-        for exec in [Some(None), Some(Some(ckpt_never()))] {
-            for lag in [1, 3] {
-                let fast = node(lag, exec);
-                let what = format!("fast path {exec:?} lag {lag}");
-                assert_eq!(
-                    fast.0, near.0,
-                    "{what}: hotstuff validator-set updates per boundary"
-                );
-                assert_eq!(fast.1, near.1, "{what}: staking validator rows");
-                assert_eq!(fast.2, near.2, "{what}: pending key rotations");
-                assert_eq!(fast.3, near.3, "{what}: validator 0 key");
-            }
-        }
 
         // The rotation really happened: none at 4 (first planned boundary, no
         // plan), the rotated key installed / the old one removed at 8, the row
@@ -13559,9 +13464,6 @@ mod crash_recovery_tests {
             ),
             evm_executor: EvmExecutor::new(config.chain_id),
             epoch_length: config.epoch_length,
-            // Off unless the env sets it: an env rerun covers every test
-            // context; unit tests set the field explicitly.
-            epoch_fast_path: epoch_fast_path_enabled(),
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
@@ -13595,8 +13497,6 @@ mod crash_recovery_tests {
             ckpt: Default::default(),
             #[cfg(test)]
             test_book_mode: None,
-            #[cfg(test)]
-            test_barriers: AtomicU64::new(0),
             #[cfg(test)]
             test_no_resident: false,
             #[cfg(test)]
@@ -19712,10 +19612,6 @@ mod crash_recovery_tests {
             ctx.attach_flush_worker(None);
         }
         run_empty_blocks(&ctx, &state_db, 1, 100);
-        // Block 100 is an epoch boundary (epoch length 100): a barrier, so
-        // its row is durable here, unless the epoch-boundary fast path
-        // (`TORUS_EPOCH_FAST_PATH=1` env rerun) handed it to W.
-        settle_exec(&ctx);
         let local = torus_state::running_hash::read_checkpoint(&state_db, 100).unwrap();
         (ctx, state_db, metrics, B256::from(local))
     }
@@ -19989,14 +19885,14 @@ mod crash_recovery_tests {
         use torus_state::running_hash::{hashed_cf_id, read_running_hash};
         let vals = epoch_fixture_validators();
         let (blocks, rotated_key) = epoch_fixture_blocks(&vals);
-        let node = |lag: u64, exec: FastExec| {
+        let node = |lag: u64| {
             let (mut config, db) = make_test_config_and_db();
             config.epoch_length = 4;
             config.max_validators = 4;
             seed_epoch_fixture(&db, &vals);
             let mut app = TorusApp::new(db.clone(), &config, None, None, None);
             torus_state::running_hash::capture_begin(&db);
-            let ctx = epoch_exec_ctx(&config, &db, exec);
+            let ctx = make_exec_ctx(&config, &db);
             let mut next = 1u64;
             let mut seen = Vec::new();
             for boundary in [4u64, 8] {
@@ -20004,7 +19900,6 @@ mod crash_recovery_tests {
                     dispatch_and_execute(&ctx, &db, &blocks[next as usize - 1]);
                     next += 1;
                 }
-                settle_exec(&ctx);
                 let before = dump_all_cfs(&db);
                 let updates = app.epoch_validator_set_updates(boundary).expect("plan ready");
                 assert!(before == dump_all_cfs(&db), "consensus thread wrote the DB at {boundary}");
@@ -20020,28 +19915,11 @@ mod crash_recovery_tests {
             let captured = torus_state::running_hash::capture_take(&db);
             (seen, captured, read_running_hash(&db), db)
         };
-        let mut nodes: Vec<_> = [1u64, 2, 4]
-            .into_iter()
-            .map(|lag| node(lag, None))
-            .collect();
-        // Experiment s58 (c): the same with the epoch-boundary fast path on
-        // (pipelined, per block and checkpoints never by time).
-        for exec in [Some(None), Some(Some(ckpt_never()))] {
-            for lag in [1u64, 2, 4] {
-                nodes.push(node(lag, exec));
-            }
-        }
+        let nodes: Vec<_> = [1u64, 2, 4].into_iter().map(node).collect();
         for (i, n) in nodes.iter().enumerate().skip(1) {
             assert_eq!(n.0, nodes[0].0, "node {i}: hotstuff updates per boundary");
             assert_eq!(n.1, nodes[0].1, "node {i}: per-height hashed write sets");
             assert_eq!(n.2, nodes[0].2, "node {i}: running hash");
-            let rows =
-                |db: &StateDb| StateBackend::iterate_cf(db, CF_STAKING_VALIDATORS, None).unwrap();
-            assert_eq!(
-                rows(&n.3),
-                rows(&nodes[0].3),
-                "node {i}: staking validator rows"
-            );
         }
         let (seen, captured, hash, db) = &nodes[0];
         assert_eq!(*hash, Some(fold_captured(captured)));
@@ -25263,50 +25141,6 @@ mod crash_recovery_tests {
         no_r: bool,
         probe: Option<&BlockProbe>,
     ) -> P2Run {
-        p2_run_full(
-            blocks, pipelined, mode, reference, fault, ckpt, seed, no_r, probe, None,
-        )
-    }
-
-    /// Experiment s58: [`p2_run_with`] (production paths) with the
-    /// epoch-boundary fast path set to `fast` on every context (`None`:
-    /// the env's).
-    fn p2_run_fast(
-        blocks: &[TorusBlock],
-        pipelined: bool,
-        mode: Option<torus_bridge::native_executor::BookMode>,
-        fault: &P2Fault,
-        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
-        fast: Option<bool>,
-    ) -> P2Run {
-        p2_run_full(
-            blocks,
-            pipelined,
-            mode,
-            false,
-            fault,
-            ckpt,
-            &|_| {},
-            false,
-            None,
-            fast,
-        )
-    }
-
-    /// [`p2_run_seeded`] with `fast` (see [`p2_run_fast`]).
-    #[allow(clippy::too_many_arguments)]
-    fn p2_run_full(
-        blocks: &[TorusBlock],
-        pipelined: bool,
-        mode: Option<torus_bridge::native_executor::BookMode>,
-        reference: bool,
-        fault: &P2Fault,
-        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
-        seed: &dyn Fn(&StateDb),
-        no_r: bool,
-        probe: Option<&BlockProbe>,
-        fast: Option<bool>,
-    ) -> P2Run {
         let (config, db) = p2_fixture();
         seed(&db);
         torus_state::running_hash::capture_begin(&db);
@@ -25329,9 +25163,6 @@ mod crash_recovery_tests {
             }
             ctx.metrics = Some(metrics.clone());
             ctx.checkpoint = ckpt;
-            if let Some(fast) = fast {
-                ctx.epoch_fast_path = fast;
-            }
             if pipelined && attach {
                 ctx.attach_flush_worker(Some(gate.clone()));
                 if let P2Fault::DeferredGate(g) = fault {
@@ -25797,59 +25628,11 @@ mod crash_recovery_tests {
         on: bool,
         policy: Option<crate::exec_pipeline::CheckpointPolicy>,
     ) -> (StateDb, CapturedWrites, Vec<Option<u64>>) {
-        let run = ckpt_barrier_run_with(on, policy, BarrierFixture::default());
-        (run.db, run.captured, run.markers)
-    }
-
-    /// Experiment s58: what [`ckpt_barrier_run_with`] varies.
-    #[derive(Clone, Copy)]
-    struct BarrierFixture {
-        /// The block carrying the EVM tx (6 by default).
-        evm_at: u64,
-        /// The block executed with the buffered slash (10 by default).
-        slash_at: u64,
-        /// `Some(b)` sets the context's `epoch_fast_path` to `b`; `None`
-        /// keeps what the context was built with (the env, off when unset).
-        fast: Option<bool>,
-    }
-
-    impl Default for BarrierFixture {
-        fn default() -> Self {
-            Self {
-                evm_at: 6,
-                slash_at: 10,
-                fast: None,
-            }
-        }
-    }
-
-    /// One [`ckpt_barrier_run_with`] run.
-    struct BarrierRun {
-        db: StateDb,
-        captured: CapturedWrites,
-        /// The durable marker after each block (W drained).
-        markers: Vec<Option<u64>>,
-        /// The heights whose block ran a pipeline barrier.
-        barriers: Vec<u64>,
-        /// After each block (W drained): the EVM accounts and their hashed
-        /// copies (CF_ACCOUNTS, CF_HASHED_ACCOUNTS; W resyncs the latter
-        /// after a checkpoint, F2).
-        accounts: Vec<Vec<CfDump>>,
-    }
-
-    /// [`ckpt_barrier_run`] with the EVM tx / slash heights and the
-    /// epoch-boundary fast path of `fx`.
-    fn ckpt_barrier_run_with(
-        on: bool,
-        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
-        fx: BarrierFixture,
-    ) -> BarrierRun {
         let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
         let validator = Address::repeat_byte(0x77);
         let mut blocks = pipeline_fixture_blocks();
-        let evm = (fx.evm_at - 1) as usize;
-        blocks[evm].evm_transactions = vec![signed_sstore_create(&key, 0)];
-        blocks[evm].header.evm_tx_count = 1;
+        blocks[5].evm_transactions = vec![signed_sstore_create(&key, 0)];
+        blocks[5].header.evm_tx_count = 1;
         link_blocks(&mut blocks);
         let (mut config, db) = make_test_config_and_db();
         config.epoch_length = 4;
@@ -25869,19 +25652,14 @@ mod crash_recovery_tests {
         torus_state::running_hash::capture_begin(&db);
         let mut ctx = make_exec_ctx(&config, &db);
         ctx.checkpoint = policy;
-        if let Some(fast) = fx.fast {
-            ctx.epoch_fast_path = fast;
-        }
         if on {
             ctx.attach_flush_worker(None);
         }
         let mut markers = Vec::new();
-        let mut barriers = Vec::new();
-        let mut accounts = Vec::new();
         for b in &blocks {
             let h = b.header.height;
             let durable = persist_committed_block_durably(&db, b);
-            let slashes = if h == fx.slash_at {
+            let slashes = if h == 10 {
                 vec![PendingSlash {
                     validator,
                     fraction_bps: 500,
@@ -25891,35 +25669,16 @@ mod crash_recovery_tests {
             } else {
                 vec![]
             };
-            let before = ctx.test_barriers.load(Ordering::SeqCst);
             ctx.execute_committed_block_with(b, slashes, durable);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
-            if ctx.test_barriers.load(Ordering::SeqCst) != before {
-                barriers.push(h);
-            }
             if let Some(w) = ctx.flush_worker.as_ref() {
                 assert!(w.wait_idle());
             }
             markers.push(read_native_applied_height(&db));
-            accounts.push(
-                [
-                    torus_state::cf::CF_ACCOUNTS,
-                    torus_state::cf::CF_HASHED_ACCOUNTS,
-                ]
-                .iter()
-                .map(|cf| (*cf, StateBackend::iterate_cf(&db, cf, None).unwrap()))
-                .collect(),
-            );
         }
         drop(ctx);
         let captured = torus_state::running_hash::capture_take(&db);
-        BarrierRun {
-            db,
-            captured,
-            markers,
-            barriers,
-            accounts,
-        }
+        (db, captured, markers)
     }
 
     /// Barrier blocks (EVM 6, slash 10, epoch boundaries 4 / 8 / 12) drain
@@ -26010,286 +25769,6 @@ mod crash_recovery_tests {
             &dump_all_cfs(&db),
             "never vs per-block",
         );
-    }
-
-    // ---- Experiment s58: epoch-boundary fast path (TORUS_EPOCH_FAST_PATH) ----
-
-    /// The durable marker after each block of the barrier fixture when the
-    /// window closes exactly at `closes` (and nowhere else before shutdown).
-    fn markers_closing_at(closes: &[u64]) -> Vec<Option<u64>> {
-        (1..=13u64)
-            .map(|h| closes.iter().copied().filter(|c| *c <= h).max())
-            .collect()
-    }
-
-    /// (a) Flag on, checkpoints never by time: the epoch boundaries 4 / 8 /
-    /// 12 take the fast path (only the EVM block 6 and the slash block 10
-    /// barrier), and the forced boundary checkpoint keeps the durable marker
-    /// after every block where the flag-off barriers put it. The epoch length
-    /// (4) is not a multiple of the attest interval (100): without the forced
-    /// checkpoint the plan written at a boundary would stay above the marker
-    /// until the next trigger, which an idle node never reaches (consensus
-    /// refuses the next boundary until the plan is durable: a halt).
-    #[test]
-    fn epoch_fast_path_skips_boundary_barriers_and_checkpoints_boundaries() {
-        let policy = Some(ckpt_never());
-        let off = ckpt_barrier_run_with(
-            true,
-            policy,
-            BarrierFixture {
-                fast: Some(false),
-                ..Default::default()
-            },
-        );
-        let fast = ckpt_barrier_run_with(
-            true,
-            policy,
-            BarrierFixture {
-                fast: Some(true),
-                ..Default::default()
-            },
-        );
-        let expected = markers_closing_at(&[4, 6, 8, 10, 12]);
-        assert_eq!(
-            off.markers, expected,
-            "flag off: durable marker after each block"
-        );
-        assert_eq!(
-            fast.markers, expected,
-            "flag on: durable marker after each block"
-        );
-        assert_eq!(
-            off.barriers,
-            vec![4, 6, 8, 10, 12],
-            "flag off: every boundary barriers"
-        );
-        assert_eq!(
-            fast.barriers,
-            vec![6, 10],
-            "flag on: only the EVM and slash blocks barrier"
-        );
-        assert_eq!(
-            read_native_applied_height(&fast.db),
-            Some(13),
-            "shutdown checkpoint"
-        );
-    }
-
-    /// (b) Flag on vs flag off on the barrier fixture, per block, every 5
-    /// blocks and never by time: the same per-height write sets, running
-    /// hash and full CF dump, the same durable marker and the same EVM
-    /// accounts (and their hashed copies) after every block once W drained.
-    /// Both equal the serial run.
-    #[test]
-    fn epoch_fast_path_state_identical_to_flag_off() {
-        let serial = ckpt_barrier_run_with(
-            false,
-            None,
-            BarrierFixture {
-                fast: Some(true),
-                ..Default::default()
-            },
-        );
-        assert!(serial.barriers.is_empty(), "no worker: no barrier");
-        for (name, policy) in [
-            ("per-block", None),
-            ("every 5", Some(ckpt_every(5))),
-            ("never", Some(ckpt_never())),
-        ] {
-            let run = |fast: bool| {
-                ckpt_barrier_run_with(
-                    true,
-                    policy,
-                    BarrierFixture {
-                        fast: Some(fast),
-                        ..Default::default()
-                    },
-                )
-            };
-            let (off, fast) = (run(false), run(true));
-            assert_eq!(off.barriers, vec![4, 6, 8, 10, 12], "{name}: flag off");
-            assert_eq!(fast.barriers, vec![6, 10], "{name}: flag on");
-            assert_eq!(
-                off.markers, fast.markers,
-                "{name}: durable marker after each block"
-            );
-            for (i, (a, b)) in off.accounts.iter().zip(&fast.accounts).enumerate() {
-                assert_dumps_equal(a, b, &format!("{name}: EVM accounts after block {}", i + 1));
-            }
-            for (what, base) in [("flag off", &off), ("serial", &serial)] {
-                assert_write_sets_equal(
-                    &base.captured,
-                    &fast.captured,
-                    &format!("{name}: flag on vs {what}"),
-                );
-                assert_eq!(
-                    torus_state::running_hash::read_running_hash(&base.db),
-                    torus_state::running_hash::read_running_hash(&fast.db),
-                    "{name}: flag on vs {what}: running hash"
-                );
-                assert_dumps_equal(
-                    &dump_all_cfs(&base.db),
-                    &dump_all_cfs(&fast.db),
-                    &format!("{name}: flag on vs {what}"),
-                );
-            }
-        }
-    }
-
-    /// The flag relaxes only the boundary term: a boundary that carries an
-    /// EVM tx (8) or a buffered slash (12) still barriers with the flag on,
-    /// and the plain boundary 4 does not. Same markers, write sets, running
-    /// hash and dump as flag off, never by time and per block.
-    #[test]
-    fn epoch_fast_path_keeps_evm_and_slash_boundaries_serial() {
-        for (name, policy) in [("never", Some(ckpt_never())), ("per-block", None)] {
-            let run = |fast: bool| {
-                ckpt_barrier_run_with(
-                    true,
-                    policy,
-                    BarrierFixture {
-                        evm_at: 8,
-                        slash_at: 12,
-                        fast: Some(fast),
-                    },
-                )
-            };
-            let (off, fast) = (run(false), run(true));
-            assert_eq!(off.barriers, vec![4, 8, 12], "{name}: flag off");
-            assert_eq!(fast.barriers, vec![8, 12], "{name}: flag on");
-            if policy.is_some() {
-                assert_eq!(fast.markers, markers_closing_at(&[4, 8, 12]), "{name}");
-            }
-            assert_eq!(
-                off.markers, fast.markers,
-                "{name}: durable marker after each block"
-            );
-            assert_write_sets_equal(&off.captured, &fast.captured, &format!("{name}: on vs off"));
-            assert_eq!(
-                torus_state::running_hash::read_running_hash(&off.db),
-                torus_state::running_hash::read_running_hash(&fast.db),
-                "{name}: running hash"
-            );
-            assert_dumps_equal(
-                &dump_all_cfs(&off.db),
-                &dump_all_cfs(&fast.db),
-                &format!("{name}: on vs off"),
-            );
-        }
-    }
-
-    /// (d) Flag on, checkpoints never by time, W parked on the boundary's
-    /// checkpoint: E is not held at boundary 4 (no barrier), the plan 4
-    /// wrote for boundary 8 is not durable yet, so the consensus thread
-    /// refuses 8 (`EpochPlanNotReady`: liveness only). Once W lands the
-    /// checkpoint, it reads the same validator-set updates as flag off.
-    #[test]
-    fn epoch_fast_path_plan_not_ready_until_boundary_checkpoint_lands() {
-        let vals = epoch_fixture_validators();
-        let (blocks, rotated_key) = epoch_fixture_blocks(&vals);
-        let node = |fast: bool| {
-            let (mut config, db) = make_test_config_and_db();
-            config.epoch_length = 4;
-            config.max_validators = 4;
-            seed_epoch_fixture(&db, &vals);
-            let mut app = TorusApp::new(db.clone(), &config, None, None, None);
-            let gate = crate::exec_pipeline::WorkerGate::new();
-            let mut ctx = make_exec_ctx(&config, &db);
-            ctx.epoch_fast_path = fast;
-            ctx.checkpoint = Some(ckpt_never());
-            ctx.attach_flush_worker(Some(gate.clone()));
-            for b in &blocks[..3] {
-                dispatch_and_execute(&ctx, &db, b);
-            }
-            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
-            assert_eq!(
-                read_native_applied_height(&db),
-                None,
-                "fast={fast}: nothing checkpointed"
-            );
-            if fast {
-                gate.hold_checkpoints();
-            }
-            let (db_t, b4) = (db.clone(), blocks[3].clone());
-            let t = std::thread::spawn(move || {
-                dispatch_and_execute(&ctx, &db_t, &b4);
-                ctx
-            });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !(t.is_finished() && (!fast || gate.parked_checkpoint().is_some()))
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            let (finished, parked) = (t.is_finished(), gate.parked_checkpoint());
-            let not_ready = fast.then(|| app.epoch_validator_set_updates(8).is_err());
-            let marker_parked = read_native_applied_height(&db);
-            gate.release();
-            let ctx = t.join().unwrap();
-            assert!(finished, "fast={fast}: E waited for W at boundary 4");
-            if fast {
-                assert_eq!(parked, Some(4), "W holds the boundary checkpoint 4");
-                assert_eq!(marker_parked, None, "the plan for 8 is not durable");
-                assert_eq!(
-                    not_ready,
-                    Some(true),
-                    "boundary 8 refused while the plan is not durable"
-                );
-            }
-            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
-            assert_eq!(read_native_applied_height(&db), Some(4), "fast={fast}");
-            let updates = app.epoch_validator_set_updates(8).expect("plan ready");
-            drop(ctx);
-            drop(app);
-            canonical_updates(updates)
-        };
-        let off = node(false);
-        let (ins, _) = off.clone().expect("plan for 8 changes the set");
-        assert!(ins.iter().any(|(k, _)| *k == rotated_key), "{ins:?}");
-        assert_eq!(node(true), off, "flag on: same updates for 8 once durable");
-    }
-
-    /// (e) Item 6 Phase 3 crash replay with the flag on: the crashed run
-    /// (checkpoint every 5 blocks) adds two crashes whose blocks run an
-    /// epoch boundary on the fast path (P2's epoch length is 50): at 49
-    /// with the boundary's checkpoint 50 in flight, and at 99 with W parked
-    /// on 99's digest while E runs boundary 100. Flag off those crashes
-    /// cannot run (the boundary's barrier waits for the parked W). Same
-    /// per-block write sets, running hash and CF dump as the uncrashed
-    /// flag-off per-block run.
-    #[test]
-    fn epoch_fast_path_checkpoint_crash_replay_matches_uncrashed() {
-        let (blocks, _) = p2_blocks(false);
-        let crashes = [
-            (12, false),
-            (23, true),
-            (37, false),
-            (49, true),
-            (61, true),
-            (78, true),
-            (99, false),
-            (112, false),
-        ];
-        ckpt_crash_replay_with(
-            torus_bridge::native_executor::BookMode::Classic,
-            &blocks,
-            "epoch fast path checkpoint crashes",
-            &crashes,
-            Some(true),
-        );
-    }
-
-    /// (f) `TORUS_EPOCH_FAST_PATH`: only a trimmed `1` turns it on.
-    #[test]
-    fn epoch_fast_path_flag_parses_trimmed_one_only() {
-        assert!(!parse_epoch_fast_path(None), "unset = off");
-        for on in ["1", " 1", "1\n", "\t1 "] {
-            assert!(parse_epoch_fast_path(Some(on.into())), "{on:?}");
-        }
-        for off in ["", " ", "0", "01", "11", "2", "true", "on", "yes", "-1"] {
-            assert!(!parse_epoch_fast_path(Some(off.into())), "{off:?}");
-        }
     }
 
     /// The byte cap counts the blocks a checkpoint at `n` would close (L +
@@ -26695,30 +26174,10 @@ mod crash_recovery_tests {
         blocks: &[TorusBlock],
         what: &str,
     ) -> (P2Run, P2Run) {
-        ckpt_crash_replay_with(mode, blocks, what, &CKPT_CRASHES, None)
-    }
-
-    /// [`ckpt_crash_replay_on`] with the crash points `crashes` and, for
-    /// `fast: Some(_)`, the epoch-boundary fast path set to it on the
-    /// crashed run and off on the reference (`None`: both keep the env's).
-    fn ckpt_crash_replay_with(
-        mode: torus_bridge::native_executor::BookMode,
-        blocks: &[TorusBlock],
-        what: &str,
-        crashes: &[(u64, bool)],
-        fast: Option<bool>,
-    ) -> (P2Run, P2Run) {
-        let reference = p2_run_fast(
-            blocks,
-            true,
-            Some(mode),
-            &P2Fault::None,
-            None,
-            fast.map(|_| false),
-        );
-        let fault = P2Fault::CkptCrash(crashes.to_vec());
-        let run = p2_run_fast(blocks, true, Some(mode), &fault, Some(ckpt_every(5)), fast);
-        assert_eq!(run.faults, crashes.len() as u64, "{what}");
+        let reference = p2_run(blocks, true, Some(mode), false, &P2Fault::None);
+        let fault = P2Fault::CkptCrash(CKPT_CRASHES.to_vec());
+        let run = p2_run_with(blocks, true, Some(mode), false, &fault, Some(ckpt_every(5)));
+        assert_eq!(run.faults, CKPT_CRASHES.len() as u64, "{what}");
         let captured = dedup_captured(&run.captured, what);
         assert_eq!(
             captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
@@ -26731,7 +26190,7 @@ mod crash_recovery_tests {
         assert_dumps_equal(&reference.dump, &run.dump, what);
         assert_eq!(
             run.metrics.exec_resident_rebuilds.get(),
-            1 + crashes.len() as u64,
+            1 + CKPT_CRASHES.len() as u64,
             "{what}: one guard rebuild per crash"
         );
         (reference, run)
