@@ -186,6 +186,9 @@ pub struct Mempool {
     /// Current base fee in wei — the D4 admission/drain fee floor. Written from
     /// committed block headers; read on every add_evm_tx and drain.
     current_base_fee: std::sync::atomic::AtomicU64,
+    /// Item 7 step 1: the committed header's EVM gas limit, the admission cap
+    /// on tx gas (with the drain budget). Starts at `config.block_gas_limit`.
+    current_evm_gas_limit: std::sync::atomic::AtomicU64,
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
     memory_used: std::sync::atomic::AtomicUsize,
     /// Outbound native action gossip channel (set once at startup).
@@ -235,6 +238,7 @@ impl Mempool {
         let da_store = NativeDaStore::new(state.clone());
         let verified_cap = config.verified_sender_cache_cap;
         let initial_base_fee = config.initial_base_fee;
+        let initial_evm_gas_limit = config.block_gas_limit;
         Self {
             evm: RwLock::new(evm_pool::EvmPool::new(initial_base_fee)),
             native: RwLock::new(native_pool),
@@ -250,6 +254,7 @@ impl Mempool {
             fail_stop: std::sync::OnceLock::new(),
             config,
             current_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
+            current_evm_gas_limit: std::sync::atomic::AtomicU64::new(initial_evm_gas_limit),
             memory_used: std::sync::atomic::AtomicUsize::new(0),
             native_gossip_tx: std::sync::OnceLock::new(),
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -599,12 +604,21 @@ impl Mempool {
     /// Submit a raw RLP-encoded EVM transaction.
     /// Decodes, validates, checks rate limit, and inserts. Returns the tx hash.
     pub fn add_evm_tx(&self, raw_rlp: Vec<u8>) -> Result<B256, MempoolError> {
+        // Item 7 step 1: a block carries at most 256 KiB of EVM tx bytes (vote
+        // rule), so a bigger tx could never be selected.
+        if raw_rlp.len() > torus_types::MAX_EVM_BLOCK_TX_BYTES {
+            return Err(MempoolError::TxTooLarge {
+                size: raw_rlp.len(),
+                max: torus_types::MAX_EVM_BLOCK_TX_BYTES,
+            });
+        }
         // D1 (S392): bound tx gas by the EVM budget, not just the block gas
         // limit — a tx above the budget would pass a bare block-limit check
-        // yet sit unselectable in the pool forever (stuck nonce).
+        // yet sit unselectable in the pool forever (stuck nonce). Item 7 step
+        // 1: the block gas limit is the committed header's (`set_evm_gas_limit`).
         let max_tx_gas = self
-            .config
-            .block_gas_limit
+            .current_evm_gas_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
             .min(self.config.evm_block_gas_budget);
         let entry = validate::validate_evm_tx(
             &raw_rlp,
@@ -701,6 +715,13 @@ impl Mempool {
         self.current_base_fee
             .store(base_fee, std::sync::atomic::Ordering::Relaxed);
         pool.set_base_fee(base_fee);
+    }
+
+    /// Item 7 step 1: the committed header's EVM gas limit caps admission (it
+    /// can change at an epoch boundary by governance).
+    pub fn set_evm_gas_limit(&self, gas_limit: u64) {
+        self.current_evm_gas_limit
+            .store(gas_limit, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Current D4 fee floor in wei.
@@ -4438,6 +4459,70 @@ mod tests {
             Default::default(),
         ))
         .expect("large calldata on a call is not initcode");
+    }
+
+    // ---- item 7 step 1: admission follows the committed header, 256 KiB cap ----
+
+    /// Admission caps tx gas at the committed header's EVM gas limit
+    /// (`set_evm_gas_limit`, fed from every committed block), not at the
+    /// configured block limit. RED before: the config's limit was the cap.
+    #[test]
+    fn admission_caps_gas_at_the_committed_header_limit() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(
+            state.clone(),
+            MempoolConfig {
+                block_gas_limit: 30_000_000,
+                evm_block_gas_budget: u64::MAX,
+                ..MempoolConfig::default()
+            },
+        );
+        pool.set_evm_gas_limit(3_000_000);
+        let k = intrinsic_case(&state, 208);
+        let tx = |gas| create_eip1559_tx(&k, 0, 2_000_000_000, 1, gas, U256::ZERO);
+        let err = pool.add_evm_tx(tx(3_000_001)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MempoolError::GasLimitExceeded {
+                    tx_gas: 3_000_001,
+                    block_gas: 3_000_000
+                }
+            ),
+            "expected GasLimitExceeded, got: {err}"
+        );
+        pool.add_evm_tx(tx(3_000_000))
+            .expect("a tx at the header limit is admitted");
+    }
+
+    /// A tx above 256 KiB could never fit a block (the vote caps a block's EVM
+    /// tx bytes at 256 KiB), so admission refuses it. RED before: a 256 KiB
+    /// zero-calldata call at 1.2M gas was admitted.
+    #[test]
+    fn admission_rejects_tx_above_256_kib() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let max = torus_types::MAX_EVM_BLOCK_TX_BYTES;
+        let k = intrinsic_case(&state, 209);
+        let call = |signer: &SigningKey, calldata: usize| {
+            eip1559_with(
+                signer,
+                1_200_000,
+                TxKind::Call(Address::ZERO),
+                vec![0u8; calldata],
+                Default::default(),
+            )
+        };
+        let too_big = call(&k, 256 * 1024);
+        let size = too_big.len();
+        assert!(size > max);
+        let err = pool.add_evm_tx(too_big).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::TxTooLarge { size: s, max: m } if s == size && m == max),
+            "expected TxTooLarge, got: {err}"
+        );
+        pool.add_evm_tx(call(&k, 200 * 1024))
+            .expect("a 200 KiB tx is admitted");
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----

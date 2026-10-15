@@ -2154,6 +2154,11 @@ fn check_parent_link(
 /// sums declared limits up to min(header limit, local budget). A tx that does
 /// not decode counts no gas: execution skips it (D3 S392, s84 decision 1), it
 /// is never a reason to reject the block.
+///
+/// Item 7 step 1: EVM txs only at `height % evm_block_interval == 0`, at most
+/// `evm_gas_limit / 21,000` of them and at most 256 KiB of raw tx bytes. A
+/// header cannot pick its own N to dodge the cadence: `check_parent_link`
+/// pins N before the same vote.
 fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool {
     if evm_txs.len() != header.evm_tx_count as usize {
         tracing::warn!(
@@ -2161,6 +2166,27 @@ fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool 
             header_count = header.evm_tx_count,
             body_count = evm_txs.len(),
             "not voting -- header evm_tx_count != body"
+        );
+        return false;
+    }
+    if evm_txs.is_empty() {
+        return true;
+    }
+    // Item 7 step 1: only on the header's cadence, at most limit / 21,000 txs (undecodable txs
+    // declare no gas, so the gas rule alone does not bound them), at most 256 KiB of tx bytes.
+    let max_txs = header.evm_gas_limit / torus_types::EVM_MIN_TX_GAS;
+    let bytes: usize = evm_txs.iter().map(Vec::len).sum();
+    if header.height.checked_rem(header.evm_block_interval) != Some(0)
+        || evm_txs.len() as u64 > max_txs
+        || bytes > torus_types::MAX_EVM_BLOCK_TX_BYTES
+    {
+        tracing::warn!(
+            height = header.height,
+            n = header.evm_block_interval,
+            txs = evm_txs.len(),
+            max_txs,
+            bytes,
+            "not voting -- EVM txs off the cadence or over the count/byte cap"
         );
         return false;
     }
@@ -4767,6 +4793,9 @@ pub struct TorusApp {
     test_applied_read_fault: bool,
     pending_slashes: Vec<PendingSlash>,
     pending_proposals: std::collections::HashMap<u64, PendingProposal>,
+    /// Item 7 step 1: EVM txs drained into our own proposals, by height, until a block commits
+    /// there (drain_evm is destructive and pending_proposals entries get overwritten).
+    own_evm_proposed: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
     in_flight_hashes: InFlightHashLedger,
     #[allow(dead_code)]
     treasury_address: Address,
@@ -5826,6 +5855,7 @@ impl TorusApp {
             test_applied_read_fault: false,
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
+            own_evm_proposed: std::collections::BTreeMap::new(),
             in_flight_hashes: InFlightHashLedger::default(),
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
@@ -7073,7 +7103,8 @@ impl TorusApp {
     /// s84 (vote after body): a QC implies a quorum holds the block AND its
     /// out-of-band native-action bodies (compact proposals carry only hashes).
     /// Cheap: fail-stop, the one datum, its hash, decode, the header's action
-    /// count and EVM tx count and gas against the body (item 7 step 0,
+    /// count and EVM tx count and gas against the body (item 7 step 0; step 1
+    /// adds the EVM cadence and the count and byte caps,
     /// [`evm_body_fits_header`]), the header's link to its parent (s84 decision
     /// 2, [`check_parent_link`], `parent` looks the parent up; item 7 step 1:
     /// at an epoch boundary also the plan's EVM values), then a
@@ -7273,6 +7304,15 @@ impl TorusApp {
                     Err(e) => tracing::warn!(count, height, %e, "pre-proposal push failed"),
                 }
             }
+        }
+
+        // Item 7 step 1: remember the EVM txs drained into this proposal, so
+        // they go back to the pool if another block commits at this height.
+        if !block.evm_transactions.is_empty() {
+            self.own_evm_proposed
+                .entry(height)
+                .or_default()
+                .extend(block.evm_transactions.iter().cloned());
         }
 
         // Note our own block's hashes too: a same-height re-proposal would
@@ -7527,6 +7567,15 @@ impl App<RocksKVStore> for TorusApp {
 
         let height = header.height;
 
+        // Item 7 step 1: EVM txs of our own proposals that lost at this height
+        // go back to the pool.
+        let committed_evm: &[Vec<u8>] = match &source {
+            ExecSource::Ready(b) => &b.evm_transactions,
+            ExecSource::Compact(c) => &c.evm_transactions,
+            ExecSource::Durable(_) => &[],
+        };
+        self.reinsert_lost_evm(height, committed_evm);
+
         // S444 AT-LEAST-ONCE FEED GUARD: hotstuff's committed-block feed is
         // replayed from a durable frontier (the min-height exec-feed gap fix),
         // so heights the app ALREADY dispatched to execution may be re-delivered
@@ -7664,6 +7713,29 @@ impl App<RocksKVStore> for TorusApp {
 }
 
 impl TorusApp {
+    /// Item 7 step 1: one block commits per height: our proposals at `height` that lost go
+    /// back to the pool, minus what the committed block carries. Lower heights are settled
+    /// (the commit feed is ordered). `reinsert_evm` re-validates each tx (`add_evm_tx`):
+    /// executed nonces drop as `NonceTooLow`, txs pooled again as `DuplicateTx`.
+    fn reinsert_lost_evm(&mut self, height: u64, committed: &[Vec<u8>]) {
+        let lost: Vec<Vec<u8>> = self
+            .own_evm_proposed
+            .remove(&height)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tx| !committed.contains(tx))
+            .collect();
+        self.own_evm_proposed.retain(|&h, _| h > height);
+        if let (Some(mempool), false) = (self.mempool.as_ref(), lost.is_empty()) {
+            tracing::info!(
+                height,
+                txs = lost.len(),
+                "EVM txs of our lost proposal back to the pool"
+            );
+            mempool.reinsert_evm(lost);
+        }
+    }
+
     /// FIX 1 (S443) catch-up gate: propose EMPTY payloads while the local committed
     /// frontier lags the parent height by more than this. A just-rejoined leader
     /// learns the chain tip (`parent_height`) from the high-QC long before it has
@@ -8112,9 +8184,11 @@ impl TorusApp {
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
             // committed blocks actually charge (frozen at 1 gwei today; follows
-            // the header once the fee market unfreezes).
+            // the header once the fee market unfreezes). Item 7 step 1: the
+            // admission gas cap follows the committed header's EVM gas limit.
             if let Some(ref mempool) = self.mempool {
                 mempool.set_base_fee(torus_block.header.base_fee_per_gas);
+                mempool.set_evm_gas_limit(torus_block.header.evm_gas_limit);
             }
 
             self.exec_prepared_height = Some(height);
@@ -14008,6 +14082,9 @@ mod crash_recovery_tests {
     /// path: the forged signature and the expired session fail
     /// `batch_verify_native_actions`; `decode_all_txs` fails on the garbage
     /// EVM tx), and execution writes no record.
+    ///
+    /// Item 7 step 1: the two blocks sit at heights 4 and 5 (on empty blocks
+    /// 1-3), so the EVM txs are on the N = 5 cadence the vote requires.
     #[test]
     fn invalid_actions_are_skipped_and_recorded_identically_on_three_replicas() {
         use torus_types::ActionSignature;
@@ -14018,7 +14095,8 @@ mod crash_recovery_tests {
 
         let first =
             torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 1, &key_a);
-        let block1 = make_block(1, vec![first.clone()]);
+        let parent3 = make_block(3, vec![]);
+        let block1 = make_block(4, vec![first.clone()]);
 
         let mut forged = torus_types::eip712::sign_native_action(
             NativeAction::ClaimRewards,
@@ -14037,7 +14115,7 @@ mod crash_recovery_tests {
         let valid =
             torus_types::eip712::sign_native_action(NativeAction::ClaimRewards, NONCE_BASE + 9, &key_c);
         // Positions: 0 replay of block 1's action, 1 forged, 2 expired, 3 valid.
-        let mut block2 = make_block(2, vec![first, forged, expired, valid]);
+        let mut block2 = make_block(5, vec![first, forged, expired, valid]);
         block2.header.parent_hash =
             alloy_primitives::keccak256(block1.header.canonical_header_bytes());
         // EVM positions: 0 undecodable, 1 a valid contract creation.
@@ -14065,13 +14143,20 @@ mod crash_recovery_tests {
                 .unwrap();
             let mut app = TorusApp::new(state_db.clone(), &config, None, None, None);
             let ctx = make_exec_ctx(&config, &state_db);
-            let hs1 = hs_block(&block1, PhaseCertificate::genesis_pc());
+            for h in 1..=3 {
+                ctx.execute_committed_block(&make_block(h, vec![]), vec![]);
+            }
+            let hs0 = hs_block(&parent3, PhaseCertificate::genesis_pc());
+            let hs1 = hs_block(&block1, justify_for(&hs0));
             let hs2 = hs_block(&block2, justify_for(&hs1));
             for (block, hs) in [(&block1, &hs1), (&block2, &hs2)] {
                 let datum = hs.data.vec()[0].bytes().clone();
                 let data_hash = hs.data_hash;
                 assert_eq!(
                     app.check_proposal_data(hs, |hash| {
+                        if *hash == hs0.hash {
+                            return ParentHeader::Header(Box::new(parent3.header.clone()));
+                        }
                         assert_eq!(*hash, hs1.hash);
                         ParentHeader::Header(Box::new(block1.header.clone()))
                     }),
@@ -14106,7 +14191,7 @@ mod crash_recovery_tests {
                 )
             };
             assert_eq!(
-                action_status(&state_db, 1),
+                action_status(&state_db, 4),
                 Some(torus_state::action_status::BlockActionStatus {
                     core_writer: vec![],
                     evm_skipped: vec![],
@@ -14115,7 +14200,7 @@ mod crash_recovery_tests {
                 })
             );
             assert_eq!(
-                action_status(&state_db, 2),
+                action_status(&state_db, 5),
                 Some(torus_state::action_status::BlockActionStatus {
                     core_writer: vec![],
                     evm_skipped: vec![true, false],
@@ -21521,6 +21606,255 @@ mod crash_recovery_tests {
         drop(ctx);
     }
 
+    /// Item 7 step 1: EVM txs only in blocks at `height % N == 0`, before the
+    /// vote (full and compact datums). Insertion does not enforce the cadence
+    /// (a certified block had f + 1 honest votes): `validate_datum` of the
+    /// off-cadence block stays `Valid`. A header N of 0 carries no EVM tx,
+    /// without a panic. RED before: off-cadence EVM txs were `Held`.
+    #[test]
+    fn evm_txs_off_the_cadence_are_refused_before_the_vote() {
+        let parent3 = make_block(3, vec![]);
+        let parent4 = tip_2000();
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            let off = evm_child_of(&parent3, vec![evm_tx_gas(0, 21_000)]);
+            assert_eq!(off.header.height, 4);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent3, &off, compact),
+                BlockDataCheck::Invalid,
+                "EVM at height 4 (compact={compact})"
+            );
+            assert_eq!(
+                pre_vote_as(&mut app, &parent3, &evm_child_of(&parent3, vec![]), compact),
+                BlockDataCheck::Held,
+                "no EVM at height 4 (compact={compact})"
+            );
+            let on = evm_child_of(&parent4, vec![evm_tx_gas(0, 21_000)]);
+            assert_eq!(on.header.height, 5);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent4, &on, compact),
+                BlockDataCheck::Held,
+                "EVM at height 5 (compact={compact})"
+            );
+
+            // N = 0 on parent and child: the link holds, only the cadence refuses.
+            let mut parent_n0 = tip_2000();
+            parent_n0.header.evm_block_interval = 0;
+            let mut n0 = evm_child_of(&parent_n0, vec![evm_tx_gas(0, 21_000)]);
+            n0.header.evm_block_interval = 0;
+            assert_eq!(
+                pre_vote_as(&mut app, &parent_n0, &n0, compact),
+                BlockDataCheck::Invalid,
+                "EVM under N = 0 (compact={compact})"
+            );
+            let mut n0_empty = evm_child_of(&parent_n0, vec![]);
+            n0_empty.header.evm_block_interval = 0;
+            assert_eq!(
+                pre_vote_as(&mut app, &parent_n0, &n0_empty, compact),
+                BlockDataCheck::Held,
+                "no EVM under N = 0 (compact={compact})"
+            );
+        }
+
+        let off = evm_child_of(&parent3, vec![evm_tx_gas(0, 21_000)]);
+        let datum = encode_proposal_datum(&off, false);
+        assert!(
+            matches!(
+                app.validate_datum(&datum, &data_hash_of(&datum)),
+                ValidateBlockResponse::Valid { .. }
+            ),
+            "insertion does not enforce the cadence"
+        );
+    }
+
+    /// Item 7 step 1: at most `evm_gas_limit / 21,000` EVM txs before the vote.
+    /// Undecodable txs declare no gas, so the gas rule alone does not bound
+    /// them. RED before: any count of garbage txs was `Held`.
+    #[test]
+    fn evm_tx_count_over_limit_per_21000_is_refused_before_the_vote() {
+        let parent = tip_2000();
+        let limit = parent.header.evm_gas_limit;
+        let max_txs = (limit / torus_types::EVM_MIN_TX_GAS) as usize;
+        assert_eq!(max_txs, 142, "3M / 21,000");
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            let at_cap = evm_child_of(&parent, vec![vec![0xff; 8]; max_txs]);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &at_cap, compact),
+                BlockDataCheck::Held,
+                "{max_txs} txs (compact={compact})"
+            );
+            let over = evm_child_of(&parent, vec![vec![0xff; 8]; max_txs + 1]);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent, &over, compact),
+                BlockDataCheck::Invalid,
+                "{} txs (compact={compact})",
+                max_txs + 1
+            );
+        }
+    }
+
+    /// Item 7 step 1: at most 256 KiB of raw EVM tx bytes per block before the
+    /// vote, one tx or several. RED before: the size was not checked.
+    #[test]
+    fn evm_tx_bytes_over_256_kib_are_refused_before_the_vote() {
+        let parent = tip_2000();
+        let max = torus_types::MAX_EVM_BLOCK_TX_BYTES;
+        assert_eq!(max, 262_144);
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            for (txs, want, what) in [
+                (
+                    vec![vec![0xff; max]],
+                    BlockDataCheck::Held,
+                    "one tx of 256 KiB",
+                ),
+                (
+                    vec![vec![0xff; max + 1]],
+                    BlockDataCheck::Invalid,
+                    "one tx of 256 KiB + 1",
+                ),
+                (
+                    vec![vec![0xff; max / 2], vec![0xff; max / 2 + 1]],
+                    BlockDataCheck::Invalid,
+                    "two halves + 1",
+                ),
+            ] {
+                let b = evm_child_of(&parent, txs);
+                assert_eq!(
+                    pre_vote_as(&mut app, &parent, &b, compact),
+                    want,
+                    "{what} (compact={compact})"
+                );
+            }
+        }
+    }
+
+    /// An app whose pool holds `n` txs of the funded `evm_tx_gas` sender
+    /// (nonces 0.., 100k gas each), with a recording exec channel. Returns the
+    /// app, the receiver, the pool and the txs.
+    fn evm_pool_app_with_recording_exec(
+        n: u64,
+    ) -> (
+        TorusApp,
+        std::sync::mpsc::Receiver<CommittedBlockMsg>,
+        Arc<Mempool>,
+        Vec<Vec<u8>>,
+    ) {
+        let (config, db) = make_test_config_and_db();
+        let mempool = funded_evm_mempool(&db);
+        let txs: Vec<Vec<u8>> = (0..n).map(|nonce| evm_tx_gas(nonce, 100_000)).collect();
+        for tx in &txs {
+            mempool.add_evm_tx(tx.clone()).unwrap();
+        }
+        let mut app = TorusApp::new(db, &config, None, Some(mempool.clone()), None);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
+        app.replace_exec_tx(tx);
+        (app, rx, mempool, txs)
+    }
+
+    fn sorted(mut txs: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        txs.sort();
+        txs
+    }
+
+    /// Item 7 step 1: a committed block's header EVM gas limit becomes the
+    /// mempool's admission cap once the block is dispatched to execution (the
+    /// limit can change at an epoch boundary by governance). RED before: the
+    /// cap stayed at the mempool config's limit (3M).
+    #[test]
+    fn committed_header_sets_mempool_gas_cap() {
+        let (mut app, rx, mempool, _) = evm_pool_app_with_recording_exec(0);
+        let x = 5_000_000;
+        assert!(
+            matches!(
+                mempool.add_evm_tx(evm_tx_gas(0, x)),
+                Err(torus_mempool::MempoolError::GasLimitExceeded { .. })
+            ),
+            "the 3M genesis limit caps admission before the commit"
+        );
+        let mut b5 = make_block(5, vec![]);
+        b5.header.evm_gas_limit = x;
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert!(
+            matches!(
+                mempool.add_evm_tx(evm_tx_gas(0, x + 1)),
+                Err(torus_mempool::MempoolError::GasLimitExceeded { tx_gas, block_gas })
+                    if tx_gas == x + 1 && block_gas == x
+            ),
+            "a tx above the committed header's limit fails admission"
+        );
+        mempool
+            .add_evm_tx(evm_tx_gas(0, x))
+            .expect("a tx at the committed header's limit is admitted");
+    }
+
+    /// Item 7 step 1: the EVM txs drained into our proposal at height 5 return
+    /// to the pool when another block commits there, minus the txs that block
+    /// carries. RED before: `drain_evm` is destructive and nothing reinserted
+    /// them, so the pool stayed empty.
+    #[test]
+    fn lost_proposal_evm_txs_return_to_the_pool_when_another_block_commits() {
+        let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(3);
+        let _ = app.build_proposal(tip_2000().header);
+        assert_eq!(app.pending_proposals[&5].block.evm_transactions.len(), 3);
+        assert_eq!(mempool.evm_pool_size(), 0, "drained into our proposal");
+
+        app.exec_next_height = Some(5);
+        let other = committed_compact_block(&evm_child_of(&tip_2000(), vec![txs[0].clone()]));
+        app.on_committed_block(&other, other.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert_eq!(
+            sorted(mempool.drain_evm(u64::MAX, B256::ZERO)),
+            sorted(vec![txs[1].clone(), txs[2].clone()]),
+            "the lost txs are pooled again, the committed one is not"
+        );
+    }
+
+    /// Our own proposal committed: its txs are in the chain, none goes back.
+    #[test]
+    fn own_committed_proposal_reinserts_nothing() {
+        let (mut app, rx, mempool, _) = evm_pool_app_with_recording_exec(3);
+        let _ = app.build_proposal(tip_2000().header);
+        let own = app.pending_proposals[&5].block.clone();
+        assert_eq!(own.evm_transactions.len(), 3);
+
+        app.exec_next_height = Some(5);
+        let committed = committed_compact_block(&own);
+        app.on_committed_block(&committed, committed.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert_eq!(mempool.evm_pool_size(), 0);
+        assert!(app.own_evm_proposed.is_empty(), "height 5 settled");
+    }
+
+    /// `pending_proposals[5]` is overwritten when another proposer's block at
+    /// 5 validates, so it cannot be the record of what we drained: the lost
+    /// txs still return when that block commits.
+    #[test]
+    fn lost_proposal_overwritten_by_another_validated_block_still_reinserts() {
+        let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(3);
+        let _ = app.build_proposal(tip_2000().header);
+        assert_eq!(mempool.evm_pool_size(), 0, "drained into our proposal");
+        let other = evm_child_of(&tip_2000(), vec![]);
+        assert!(matches!(
+            app.finish_validate(other.clone()),
+            ValidateBlockResponse::Valid { .. }
+        ));
+        assert!(
+            app.pending_proposals[&5].block.evm_transactions.is_empty(),
+            "our proposal's entry was overwritten"
+        );
+
+        app.exec_next_height = Some(5);
+        let committed = committed_compact_block(&other);
+        app.on_committed_block(&committed, committed.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        assert_eq!(sorted(mempool.drain_evm(u64::MAX, B256::ZERO)), sorted(txs));
+    }
+
     // ---- item 2: oracle helpers ----
 
     const ORACLE_MARKET: u64 = 1;
@@ -28826,7 +29160,19 @@ mod crash_recovery_tests {
                     d12_block(3, 2061, vec![]),
                 ];
                 link_blocks(&mut blocks);
-                assert!(evm_body_fits_header(&blocks[1].header, &blocks[1].evm_transactions));
+                // Item 7 step 1: block 2's EVM tx is off the N = 5 cadence, so the
+                // vote refuses the block; execution does not enforce the cadence
+                // (an execution-only fixture). Count and gas still fit the header.
+                assert!(!evm_body_fits_header(
+                    &blocks[1].header,
+                    &blocks[1].evm_transactions
+                ));
+                let mut every_height = blocks[1].header.clone();
+                every_height.evm_block_interval = 1;
+                assert!(evm_body_fits_header(
+                    &every_height,
+                    &blocks[1].evm_transactions
+                ));
                 let mut ctx = pipeline_ctx(&db, on, None);
                 dispatch_and_execute(&ctx, &db, &blocks[0]);
                 assert!(ctx.pipeline_barrier(), "{what}");
