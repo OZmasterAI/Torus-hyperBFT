@@ -1,7 +1,7 @@
 {
   "prp": "item7-step1",
   "created": "2026-10-15T00:00:00",
-  "notes": "Plan: docs/plans/item7-step1-impl.md (design docs/plans/item7-step1-design.md, option A + owner decisions s123). Branch feat/item7-step1-evm-lanes, worktree /home/18c/projects/wt/item7-step1. Env: cd /home/18c/projects/wt/item7-step1; CARGO_TARGET_DIR=/home/18c/.cargo-target-item7; L='flock -w 60 -o $HOME/projects/wt/.cargo-heavy.lock'; P='-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-economics -p torus-mempool -p torus-rpc -p torus-core -p torus-evm -p hotstuff_rs -p torus-node -p torus-state -p torus-integration-tests'. Commit groups: C1=E1-E4, C2=E5-E8, C3=E9-E11, C4=E12, C5=E13, C6=E14, C7=E15. E13 and E14 are independent of E1-E12.",
+  "notes": "Plan: docs/plans/item7-step1-impl.md (design docs/plans/item7-step1-design.md, option A + owner decisions s123). Branch feat/item7-step1-evm-lanes, worktree /home/18c/projects/wt/item7-step1. Env: cd /home/18c/projects/wt/item7-step1; CARGO_TARGET_DIR=/home/18c/.cargo-target-item7; L='flock -w 60 -o /home/18c/projects/wt/.cargo-heavy.lock'; P='-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-economics -p torus-mempool -p torus-rpc -p torus-core -p torus-evm -p hotstuff_rs -p torus-node -p torus-state -p torus-integration-tests'. Commit groups: C1=E1-E4, C2=E5-E8, C3=E9-E11, C4=E12, C5=E13, C6=E14, C7=E15. E13 and E14 are independent of E1-E12.",
   "tasks": [
     {
       "id": "E1",

@@ -201,8 +201,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
       g["evm"]["gas_limit"] = 10_000_000
   ```
   and update the comment at `ci/github-ci.yml:40-43`.
-- **Verify:** `$L cargo test $P -p torus-genesis evm_block_interval shipped_genesis_files` (run the two filters
-  separately if cargo rejects two)
+- **Verify:** `$L cargo test $P -p torus-genesis -- evm_block_interval shipped_genesis_files`
 - **Depends on:** E1
 
 ### E4: genesis parent header from the genesis values
@@ -250,8 +249,8 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   - The remaining 30M defaults follow the genesis value: `make_block` (app.rs ~9984) and `stub_on` (~6108) use
     `torus_types::DEFAULT_EVM_GAS_LIMIT` and the new field; `torus-mempool/src/lib.rs:122` uses
     `DEFAULT_EVM_GAS_LIMIT`; `proposer.rs:83-87` becomes `let gas_limit = parent.evm_gas_limit;`.
-- **Verify:** `$L cargo test $P genesis_parent_header first_block_uses_the_configured parent_link_violation`
-  (separately if needed), then `$L cargo test $P -p torus-consensus`
+- **Verify:** `$L cargo test $P -- genesis_parent_header first_block_uses_the_configured parent_link_violation`
+  then `$L cargo test $P -p torus-consensus`
 - **Depends on:** E2, E3
 
 ### E5: the epoch plan carries the EVM values
@@ -294,7 +293,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   (`torus-economics/src/lib.rs:25`). A read fault returns `Err`, which reaches `latch_local_fault`
   (`native_executor.rs:12570`) and fail-stops, as for the validator set. One plan row keeps one write, one read and one
   prune per boundary; the row is hashed (`EPOCH_VSET_PREFIX`), and its new bytes are deterministic.
-- **Verify:** `$L cargo test $P plan_carries_governance_evm_params plan_without_or_with_invalid_evm_params`
+- **Verify:** `$L cargo test $P -- plan_carries_governance_evm_params plan_without_or_with_invalid_evm_params`
 - **Depends on:** E1
 
 ### E6: governance accepts the two keys
@@ -413,7 +412,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   `&self.genesis_header, parent, |h| self.boundary_evm(h)`; `Missing` already maps to `MissingData` at insertion
   (~7322). Tests at ~20606, ~20647, ~20785 pass `|_| Ok(None)`. `detect_parent_link_violation` compares only the
   parent hash and needs no change.
-- **Verify:** `$L cargo test $P boundary_ off_boundary_header pruned_boundary_plan evm_gas_limit_and_base_fee`
+- **Verify:** `$L cargo test $P -- boundary_ off_boundary_header pruned_boundary_plan evm_gas_limit_and_base_fee`
   (separately if needed)
 - **Depends on:** E4, E5
 
@@ -453,7 +452,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
           };
   ```
   The signature stays, so the 8 tests that pass 30M (8699, 8710, 8757, 8762, 11949, 11959, 13142, 13150) keep working.
-- **Verify:** `$L cargo test $P off_cadence_proposal governance_evm_params_reach_the_header`
+- **Verify:** `$L cargo test $P -- off_cadence_proposal governance_evm_params_reach_the_header`
 - **Depends on:** E7
 
 ### E9: cadence, count and byte caps before the vote
@@ -496,7 +495,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   ```
   Pre-vote only, like step 0: a certified block had >= f + 1 honest votes. A dishonest header N cannot sneak EVM off
   cadence: `check_parent_link` (E7) runs before the same vote and pins N.
-- **Verify:** `$L cargo test $P before_the_vote invalid_actions_are_skipped honest_proposal_with_evm_txs`
+- **Verify:** `$L cargo test $P -- before_the_vote invalid_actions_are_skipped honest_proposal_with_evm_txs`
 - **Depends on:** E2, E7
 
 ### E10: mempool admission follows the committed header and caps tx size
@@ -540,7 +539,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   ```
   `add_evm_tx` is the only way into the EVM pool (RPC eth.rs:803, network forward main.rs:876, `reinsert_evm`), so both
   caps cover every path.
-- **Verify:** `$L cargo test $P admission_caps_gas admission_rejects_tx_above committed_header_sets_mempool`
+- **Verify:** `$L cargo test $P -- admission_caps_gas admission_rejects_tx_above committed_header_sets_mempool`
 - **Depends on:** E1, E4
 
 ### E11: EVM txs of a lost proposal go back to the pool
@@ -598,7 +597,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   keeps each tx once. A reinserted tx skips the memory budget and, when its sender's slots or the pool are full,
   evicts the sender's highest pooled nonce above it (`EvmPool::reinsert`); other refusals log at warn. Not covered:
   our proposal at H off the parent's chain while we build a later EVM height before H commits.
-- **Verify:** `$L cargo test $P lost_proposal own_committed_proposal_reinserts_nothing`
+- **Verify:** `$L cargo test $P -- lost_proposal own_committed_proposal_reinserts_nothing`
 - **Depends on:** E8
 
 ### E12: forward EVM txs to the leader of the next EVM height
@@ -659,7 +658,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
     `(self.evm_leader_vk_fn.as_ref().or(self.leader_vk_fn.as_ref()), self.own_vk.as_ref(), self.forward_evm_tx.as_ref())`.
   N comes from the committed header, so it is briefly stale after a boundary change (the tx then waits one EVM
   height longer). A validator RPC node already keeps its own copy (eth.rs:801-809), as today.
-- **Verify:** `$L cargo test $P next_evm_leader evm_tx_forwarded_to_the_next_evm_height_leader set_leader_forwarding`
+- **Verify:** `$L cargo test $P -- next_evm_leader evm_tx_forwarded_to_the_next_evm_height_leader set_leader_forwarding`
 - **Depends on:** E2
 
 ### E13: RPC gas defaults follow the header limit (independent of E1-E12)
@@ -685,7 +684,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   ```
   Before block 1 (no header) both paths keep `BlockEnvCfg::default()` (30M in both the call and the block env), which
   stays consistent.
-- **Verify:** `$L cargo test $P bare_call_and_estimate_work eth_call_gas_above call_gas_defaults_and_caps`
+- **Verify:** `$L cargo test $P -- bare_call_and_estimate_work eth_call_gas_above call_gas_defaults_and_caps`
 - **Depends on:** none
 
 ### E14: remove the getOrderBook selector (independent of E1-E12)
@@ -727,7 +726,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   `COLD_BOOK_MARKET` (:118-119), their calls at :1695-1734 and the related env knobs.
   **Tombstone compaction stays** (owner point 1): rewrite its comments (`cf.rs:94-106`, `db.rs:919-968`) to say it
   serves the RPC `torus_getOrderBook` row scans (`scan.rs:745-768`), not the precompile.
-- **Verify:** `$L cargo test $P removed_get_order_book order_book_reader_ book_read_modes precompile_work_bound`
+- **Verify:** `$L cargo test $P -- removed_get_order_book order_book_reader_ book_read_modes precompile_work_bound`
 - **Depends on:** none
 
 ### E15: docs and the full run
