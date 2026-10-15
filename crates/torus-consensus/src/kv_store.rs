@@ -26,10 +26,11 @@ pub struct RocksKVStore {
 }
 
 impl RocksKVStore {
-    /// Create from a shared database handle (production use).
+    /// Create from a database handle (production use).
     ///
-    /// The database must already have the `cf_consensus_meta` column family
-    /// (e.g., opened via `torus_state::StateDb`).
+    /// The database must already have the `cf_consensus_meta` column family.
+    /// The node passes its consensus DB (`torus_state::StateDb::open_consensus`,
+    /// section 71.8 option A), not the state DB.
     pub fn new(db: Arc<DB>) -> Self {
         Self { db, metrics: None }
     }

@@ -720,6 +720,9 @@ pub struct Metrics {
     /// r3: DB-wide RocksDB runtime state + statistics (unlabelled, sampled every
     /// few seconds; the per-CF labelled families above stay for the deep dive).
     pub rocksdb: RocksdbStatMetrics,
+    /// Section 71.8 option A: the same DB-wide gauges for the node's consensus
+    /// DB (HotStuff store + DA store), as `torus_rocksdb_consensus_*`.
+    pub rocksdb_consensus: RocksdbStatMetrics,
     /// Process allocator (jemalloc) stats; 0 on a system-allocator build.
     pub jemalloc: JemallocMetrics,
     /// L3 level-hash sponge cache (`TORUS_LEVEL_HASH_CACHE`, default-off): cumulative
@@ -999,9 +1002,46 @@ impl RocksdbStatMetrics {
         "torus_rocksdb_compaction_sum_micros",
     ];
 
+    /// Name prefix of the consensus DB's copy (section 71.8 option A): each
+    /// [`Self::NAMES`] entry with `torus_rocksdb_` replaced by this.
+    pub const CONSENSUS_PREFIX: &'static str = "torus_rocksdb_consensus_";
+
+    /// The consensus DB's metric names, in [`Self::NAMES`] order.
+    pub fn consensus_names() -> Vec<String> {
+        Self::NAMES
+            .iter()
+            .map(|n| Self::consensus_name(n))
+            .collect()
+    }
+
+    fn consensus_name(state_name: &str) -> String {
+        let rest = state_name
+            .strip_prefix("torus_rocksdb_")
+            .expect("every NAMES entry starts with torus_rocksdb_");
+        format!("{}{rest}", Self::CONSENSUS_PREFIX)
+    }
+
     fn register(registry: &mut Registry) -> Self {
+        Self::register_named(registry, |name, help| (name.to_string(), help.to_string()))
+    }
+
+    /// The consensus DB's copy: same gauges, `torus_rocksdb_consensus_*`.
+    fn register_consensus(registry: &mut Registry) -> Self {
+        Self::register_named(registry, |name, help| {
+            (
+                Self::consensus_name(name),
+                format!("Consensus DB (HotStuff + DA store): {help}"),
+            )
+        })
+    }
+
+    fn register_named(
+        registry: &mut Registry,
+        name_help: impl Fn(&str, &str) -> (String, String),
+    ) -> Self {
         let mk = |registry: &mut Registry, name: &'static str, help: &str| -> Gauge {
             let g = Gauge::default();
+            let (name, help) = name_help(name, help);
             registry.register(name, help, g.clone());
             g
         };
@@ -2500,6 +2540,7 @@ impl Metrics {
         );
 
         let rocksdb = RocksdbStatMetrics::register(&mut registry);
+        let rocksdb_consensus = RocksdbStatMetrics::register_consensus(&mut registry);
         let jemalloc = JemallocMetrics::register(&mut registry);
 
         let exec_level_hash_cache_hits = Gauge::default();
@@ -2995,6 +3036,7 @@ impl Metrics {
             exec_save_books_write_seconds,
             exec_native_blocks,
             rocksdb,
+            rocksdb_consensus,
             jemalloc,
             exec_level_hash_cache_hits,
             exec_level_hash_cache_misses,
@@ -3786,6 +3828,41 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+    }
+
+    /// Section 71.8 option A: the consensus DB (HotStuff + DA store) exports
+    /// the same 29 DB-wide gauges, unlabelled, under `torus_rocksdb_consensus_*`
+    /// so a `$1==name` scraper attributes writes per DB; the state DB keeps
+    /// the `torus_rocksdb_*` names unchanged.
+    #[test]
+    fn consensus_db_stat_metrics_register_unlabelled_with_their_own_names() {
+        let m = Metrics::new();
+        m.rocksdb.write_other.set(7);
+        m.rocksdb_consensus.write_other.set(11);
+        m.rocksdb_consensus.stall_micros.set(5);
+        let text = m.encode();
+        let names = RocksdbStatMetrics::consensus_names();
+        assert_eq!(names.len(), RocksdbStatMetrics::NAMES.len());
+        for (state, consensus) in RocksdbStatMetrics::NAMES.iter().zip(&names) {
+            assert_eq!(
+                consensus.strip_prefix("torus_rocksdb_consensus_"),
+                state.strip_prefix("torus_rocksdb_"),
+                "{consensus} does not mirror {state}"
+            );
+            assert!(
+                text.contains(consensus.as_str()),
+                "{consensus} not registered:\n{text}"
+            );
+        }
+        assert!(text.contains("\ntorus_rocksdb_write_other 7\n"), "{text}");
+        assert!(
+            text.contains("\ntorus_rocksdb_consensus_write_other 11\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\ntorus_rocksdb_consensus_stall_micros 5\n"),
+            "{text}"
+        );
     }
 
     /// r7 state-write-build-vs-db-split: `torus_exec_state_write_seconds` lumps

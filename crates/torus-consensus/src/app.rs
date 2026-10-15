@@ -1582,10 +1582,12 @@ fn persist_committed_block_durably_timed(
     DurableRows { header, body }
 }
 
-/// Task B (Option C): fsync the shared RocksDB WAL at the commit boundary, iff
-/// the per-node toggle (`enabled`) is on. `kv_store` (consensus-meta / frontier)
-/// and `native_da` (bodies) share one `Arc<DB>` / WAL, so a single flush makes
-/// the whole committed prefix crash-durable. Returns whether a flush was issued
+/// Task B (Option C): fsync the RocksDB WAL at the commit boundary, iff
+/// the per-node toggle (`enabled`) is on. Since section 71.8 option A,
+/// `kv_store` (consensus-meta / frontier) and `native_da` (bodies) are in the
+/// node's consensus DB; `StateDb::sync_wal` syncs its WAL (the attached peer)
+/// first, then the state DB's, so the whole committed prefix is crash-durable
+/// when it returns. Returns whether a flush was issued
 /// — the per-commit "count" the tests assert. Best-effort like the header/body/
 /// manifest writes: a flush error is loud but never aborts the commit.
 fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {

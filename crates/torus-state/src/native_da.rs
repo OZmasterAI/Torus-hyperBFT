@@ -46,7 +46,9 @@ fn arrivals() -> &'static ArrivalNotifier {
 ///
 /// CF-backed (survives restart). Cheap to clone — it shares the underlying
 /// [`StateDb`] handle (an `Arc<DB>`), so every consensus / mempool / network
-/// site can hold its own `NativeDaStore` over the one database.
+/// site can hold its own `NativeDaStore` over the one database. In the node
+/// that is the consensus DB ([`StateDb::open_consensus`], section 71.8
+/// option A), not the state DB.
 /// Wall time of one [`NativeDaStore::get_batch_timed`] read, split into the
 /// RocksDB `MultiGet` and the body decode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
