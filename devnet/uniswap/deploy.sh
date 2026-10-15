@@ -21,8 +21,22 @@ echo ""
 # Check RPC
 CHAIN=$(cast chain-id --rpc-url "$RPC" 2>/dev/null) || { echo "ERROR: RPC unreachable at $RPC"; exit 1; }
 echo "Chain ID: $CHAIN"
-BLOCK=$(cast block-number --rpc-url "$RPC" 2>/dev/null)
-echo "Block:    $BLOCK"
+# Wait for a block above 0. A validator's RPC reads lag to its last checkpoint
+# (every 15 s or 100th block, item 6 Phase 3), so a fresh node reports block 0
+# for its first seconds; forge then asks for block 0, the node answers null and
+# forge logs an error for it. BLOCK_WAIT_S (default 120) bounds the wait.
+BLOCK_WAIT_S="${BLOCK_WAIT_S:-120}"
+WAIT_START=$SECONDS
+while :; do
+    BLOCK=$(cast block-number --rpc-url "$RPC" 2>/dev/null) || BLOCK=""
+    [[ "$BLOCK" =~ ^[0-9]+$ ]] && [ "$BLOCK" -gt 0 ] && break
+    if [ $((SECONDS - WAIT_START)) -ge "$BLOCK_WAIT_S" ]; then
+        echo "ERROR: eth_blockNumber at $RPC is still '${BLOCK:-unreadable}' after ${BLOCK_WAIT_S}s (need > 0)"
+        exit 1
+    fi
+    sleep 1
+done
+echo "Block:    $BLOCK (after $((SECONDS - WAIT_START))s)"
 echo ""
 
 deploy() {
@@ -34,8 +48,12 @@ deploy() {
     # Progress goes to stderr: callers capture stdout for the address alone
     # (D6 fix — the old version leaked the progress line into $(deploy ...)).
     echo -n "Deploying $NAME... " >&2
-    local RESULT
-    RESULT=$(forge create \
+    # forge prints its JSON on stdout and its logs on stderr. Keep the logs
+    # out of the capture: one alloy ERROR line in it made jq fail and left the
+    # address empty (CI since Phase 3 step 6). They are shown on failure.
+    local RESULT ERR_LOG
+    ERR_LOG=$(mktemp "${TMPDIR:-/tmp}/forge-create.XXXXXX")
+    if ! RESULT=$(forge create \
         --broadcast \
         --rpc-url "$RPC" \
         --private-key "$DEPLOYER_KEY" \
@@ -44,10 +62,24 @@ deploy() {
         --json \
         --root "$SCRIPT_DIR" \
         "$BYTECODE" \
-        "${ARGS[@]}" 2>&1) || { echo "FAILED: $RESULT" >&2; exit 1; }
+        "${ARGS[@]}" 2>"$ERR_LOG"); then
+        echo "FAILED: $RESULT" >&2
+        echo "forge stderr:" >&2
+        cat "$ERR_LOG" >&2
+        rm -f -- "${ERR_LOG:?}"
+        exit 1
+    fi
 
     local ADDR
-    ADDR=$(echo "$RESULT" | jq -r '.deployedTo')
+    ADDR=$(printf '%s\n' "$RESULT" | jq -r '.deployedTo // empty' 2>/dev/null) || ADDR=""
+    if [[ ! "$ADDR" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+        echo "FAILED: no deployedTo address in forge's JSON: $RESULT" >&2
+        echo "forge stderr:" >&2
+        cat "$ERR_LOG" >&2
+        rm -f -- "${ERR_LOG:?}"
+        exit 1
+    fi
+    rm -f -- "${ERR_LOG:?}"
     echo "$ADDR" >&2
     echo "$ADDR"
 }
