@@ -9994,6 +9994,63 @@ Next, for the owner (not run):
   `ozarchy-p4j3-tools/analyst/out/`: `j3.txt`, `j3.json`, `j3-<cell>-sec.tsv`, `acells.json`,
   `offcpu-wt-callers.txt`.
 
+### 71.8 Note: which DB the consensus-thread waits target (18c follow-up; same p1 `perf-sched.data`, val1, 45 s)
+
+Question: would giving the HotStuff store and the DA store their own RocksDB remove most of the in-window consensus
+wait? Or do the commit-persistence writes to the state DB also queue behind the checkpoint batch?
+
+Method: one new `perf script` pass (run under `nice -n 19` after `ozarchy-liq2-run/campaign.done`), parsed inline with
+`offcpu-sched.py`'s parser and window rules. A stretch counts when any user frame is in the rocksdb write path. Its
+target DB is the first DB wrapper frame from the leaf: `RocksKVStore::write` is the HotStuff store, `StateDb::*` is the
+state DB. At node `2a245321` all three stores are one RocksDB: `main.rs:642` `RocksKVStore::new(state_db.db_arc())`, and
+`NativeDaStore` holds a `StateDb`. `persist_committed_block_durably` (called from `dispatch_to_exec`) and
+`persist_commit_manifest` (called from `on_committed_block`) are inlined, so they show up as `StateDb::write` and
+`StateDb::put_cf_raw` under those callers. Outputs: `analyst/out/offcpu-wsites{.txt,.json,-stretches.tsv,-hs-db.txt,-next-state.txt}`.
+
+Consensus thread (hotstuff-algo). In-window write-path waits total 2.008 s, which is 23.1% of the thread's 8.691 s
+in-window off-CPU time:
+
+| call site | DB | in: s (n > 100 ms, sum, max) | out: s (max) |
+|---|---|---|---|
+| 1. vote saves outside `vote_if_body` | HotStuff | 0 (no stretches) | 0 |
+| 2. QC / lock writes: `advance_highest_pc_from_remote` <- `on_receive_msg` | HotStuff | **1.085 (3, 1.082 s, 476 ms)** | 0.017 (6 ms) |
+| 2. `update_locks_only` <- `on_receive_proposal_header` | HotStuff | **0.653 (2, 0.646 s, 349 ms)** | 0.002 |
+| 2. other inserts / updates (`update`, `insert`, `set_leader_reputation`) | HotStuff | 0.019 (0, 7.5 ms) | 0.020 |
+| 3. `vote_if_body_held` -> `set_vote_state_atomic` | HotStuff | **0.228 (1, 0.223 s, 223 ms)** | 0.005 (2.5 ms) |
+| HotStuff commit (`advance_app_fed_block_height`) | HotStuff | 0.004 (0, 3.9 ms) | 0.022 |
+| 4. `persist_committed_block_durably` (`dispatch_to_exec`) | **state** | 0.013 (0, 4.1 ms) | 0.076 (15 ms) |
+| 4. `persist_commit_manifest` (`on_committed_block`) | **state** | 0 | 0.015 (4.7 ms) |
+| `flush_da_mirrors` (block build) | DA | 0 | 0.052 (40 ms) |
+| unattributed (stack cut) | ? | 0.006 | 0.005 |
+
+Mempool `mirror_to_da` -> `NativeDaStore::put_batch`:
+
+| path | in: s (n > 100 ms, sum, max) | out: s (n > 100 ms, max) |
+|---|---|---|
+| gossip (`add_native_action_from_gossip`, verify) | **12.554 (40, 11.851 s, 615 ms)** | 1.331 (4, 138 ms) |
+| RPC (`add_native_action_presigned`, rpc-worker) | **3.242 (10, 3.205 s, 493 ms)** | 0.177 (0, 38 ms) |
+
+**Reading.**
+* As measured, 99.1% of the in-window consensus write wait (1.989 of 2.008 s) is writes to the HotStuff store, and
+  0.6% (0.013 s) is state-DB commit persistence. None of the 6 long waits is a state-DB write.
+* This split understates the state DB's exposure. The consensus thread writes one at a time: the commit persistence for a
+  block runs right after the QC / vote write that took the wait.
+  * After 3 of the 6 long waits (223, 476 and 227 ms; 0.926 s, 47% of the long-wait time), a state-DB write from the same
+    thread followed within 17-25 ms (`-next-state.txt`).
+  * With a separate HotStuff DB, those commit writes would reach the shared queue while the checkpoint batch is still in
+    it, and the wait would move to them.
+  * After the other 3 waits (378, 349 and 297 ms), the next state-DB write came 0.45-1.16 s later, probably after the
+    batch had finished.
+* **Verdict, confidence medium.** Separate HotStuff and DA DBs address 99% of the measured in-window consensus wait,
+  and all of the mempool `mirror_to_da` wait (gossip 12.55 s, RPC 3.24 s). Expect them to remove only about 50-99% of
+  the consensus stall, because up to about 47% of the long-wait time can move to `persist_committed_block_durably` on
+  the state DB.
+  * To close it fully, keep the commit-persistence writes out of the checkpoint batch's queue as well: write the
+    checkpoint batch in slices, or move commit persistence off the shared write group (or onto its own DB or thread).
+  * Slicing the checkpoint batch is the one fix that covers all three writers.
+* Limits: one node (val1), 5 windows, 6 long waits, one cell. The migration estimate depends on when the batch ends,
+  and that is not in the trace.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
