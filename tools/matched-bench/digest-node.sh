@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # digest-node.sh — ONE validator's RPC state digest, fanned out but ORDER-STABLE.
 #
-#   digest-node.sh <rpc-url> <markets> <accounts-file> <out-file> [PAR=8] [TIMEOUT=60]
+#   digest-node.sh <rpc-url> <markets> <accounts-file> <out-file> [PAR=8] [TIMEOUT=60] [POS-ACCOUNTS-FILE]
 #
 # Writes the digest STREAM to <out-file> and prints "<sha256> <wall_seconds>".
 #
@@ -13,6 +13,23 @@
 #     market N  torus_getOpenInterest
 #     account 1 torus_getBalances
 #     ...
+#
+# With POS-ACCOUNTS-FILE (liquidation-stress cells: the liquidator vault and
+# both ADL escrows) the stream then continues, account by account in file
+# order, with every market's position in id order:
+#
+#     pos-account 1 market 1  torus_getPosition [addr, market]
+#     ...
+#     pos-account K market N  torus_getPosition
+#
+# Without it (or with an empty 7th argument) the stream is unchanged.
+#
+#   digest-node.sh --capabilities
+#
+# prints one capability per line and exits 0: `position-accounts` (the 7th
+# argument above). run-cell.sh asks before a liquidation-stress cell: an older
+# script (TOOLS_FROM_WORKTREE=1 against an older worktree) ignores the 7th
+# argument without a word, and only prints its usage (rc 2) here.
 #
 # WHY THIS FILE EXISTS: at 300 markets the serial loop is 650 `curl -m 10` round
 # trips and takes ~4 min per node, so val0's digest was taken ~8 min before
@@ -26,6 +43,7 @@
 # unit test in test_harness.py answers high market ids first on purpose).
 set -uo pipefail
 
+if [ "${1:-}" = --capabilities ]; then echo position-accounts; exit 0; fi
 [ $# -ge 4 ] || { sed -n '2,6p' "$0" >&2; exit 2; }
 URL=$1
 MARKETS=$2
@@ -33,10 +51,13 @@ ACCOUNTS=$3
 OUTFILE=$4
 PAR=${5:-8}
 TIMEOUT=${6:-60}
+POS_ACCOUNTS=${7:-}
 
 [[ "$MARKETS" =~ ^[0-9]+$ && "$PAR" =~ ^[0-9]+$ && "$PAR" -ge 1 ]] || {
     echo "digest-node.sh: bad MARKETS/PAR" >&2; exit 2; }
 [ -r "$ACCOUNTS" ] || { echo "digest-node.sh: cannot read accounts file $ACCOUNTS" >&2; exit 2; }
+[ -z "$POS_ACCOUNTS" ] || [ -r "$POS_ACCOUNTS" ] || {
+    echo "digest-node.sh: cannot read position accounts file $POS_ACCOUNTS" >&2; exit 2; }
 command -v jq >/dev/null || { echo "digest-node.sh: need jq" >&2; exit 2; }
 
 export DIGEST_TIMEOUT=$TIMEOUT
@@ -67,6 +88,14 @@ digest_account() { # $1=url $2=partdir $3=ordinal $4=address
 }
 export -f digest_account
 
+# One part per (position account, market): p<ordinal 4><market 8>, so glob
+# order is account order then market-id order.
+digest_position() { # $1=url $2=partdir $3=ordinal $4=address $5=market-id
+    digest_call "$1" torus_getPosition "[\"$4\",\"$(printf '0x%x' "$5")\"]" \
+        > "$2/p$(printf '%04d%08d' "$3" "$5")"
+}
+export -f digest_position
+
 PARTS=$(mktemp -d "${TMPDIR:-/tmp}/digest-parts-XXXXXX") || exit 1
 trap 'rm -rf "$PARTS"' EXIT
 
@@ -78,12 +107,20 @@ fi
 # `nl` numbers the accounts so the balance parts keep the file's own order.
 grep -v '^[[:space:]]*$' "$ACCOUNTS" | nl -ba -w1 -s' ' \
     | xargs -r -P "$PAR" -n2 bash -c 'digest_account "$0" "$1" "$2" "$3"' "$URL" "$PARTS"
+if [ -n "$POS_ACCOUNTS" ] && [ "$MARKETS" -gt 0 ]; then
+    grep -v '^[[:space:]]*$' "$POS_ACCOUNTS" | nl -ba -w1 -s' ' \
+        | while read -r ord addr; do
+            seq 1 "$MARKETS" | sed "s/^/$ord $addr /"
+        done \
+        | xargs -r -P "$PAR" -n3 bash -c 'digest_position "$0" "$1" "$2" "$3" "$4"' "$URL" "$PARTS"
+fi
 T1=$(date +%s.%N)
 
-# Glob order == id order (zero padded), markets before accounts. NEVER completion order.
+# Glob order == id order (zero padded): markets, account balances, then
+# position accounts. NEVER completion order.
 : > "$OUTFILE"
 shopt -s nullglob
-for f in "$PARTS"/m* "$PARTS"/z*; do cat "$f" >> "$OUTFILE"; done
+for f in "$PARTS"/m* "$PARTS"/z* "$PARTS"/p*; do cat "$f" >> "$OUTFILE"; done
 shopt -u nullglob
 
 SHA=$(sha256sum "$OUTFILE" | cut -d' ' -f1)

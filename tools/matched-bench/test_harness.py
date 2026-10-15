@@ -41,6 +41,8 @@ DIGEST_SH = os.path.join(HERE, "digest-node.sh")
 CRASH_KILL_SH = os.path.join(HERE, "crash-kill.sh")
 SUMMARIZE = os.path.join(HERE, "summarize.py")
 RUN_CELL_SH = os.path.join(HERE, "run-cell.sh")
+REPO = os.path.dirname(os.path.dirname(HERE))
+WEIGHTED_FULL = os.path.join(REPO, "testnet", "genesis-weighted-full.json")
 
 
 def jq_compact(obj):
@@ -63,18 +65,25 @@ class StubRpc(BaseHTTPRequestHandler):
         method, params = req.get("method", ""), req.get("params", [])
         arg = params[0] if params else ""
         # Skew: high market ids answer FIRST, so completion order != id order.
+        # The market id is the LAST param (torus_getPosition is [addr, market]).
+        key = params[-1] if params else ""
         try:
-            skew = max(0, 40 - int(str(arg), 16)) if str(arg).startswith("0x") else 5
+            skew = max(0, 40 - int(str(key), 16)) if str(key).startswith("0x") else 5
         except ValueError:
             skew = 5
         import time
 
         time.sleep(skew / 1000.0)
+        result = {"m": method, "a": str(arg)}
+        if len(params) > 1:
+            result["b"] = str(params[1])
+            # Optional per-(account, market) position state (PositionDigestTest).
+            result["s"] = self.server.positions.get((str(arg), str(params[1])))
         body = json.dumps(
             {
                 "jsonrpc": "2.0",
                 "id": req.get("id", 1),
-                "result": {"m": method, "a": str(arg)},
+                "result": result,
             }
         ).encode()
         self.send_response(200)
@@ -88,6 +97,7 @@ class DigestOrderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), StubRpc)
+        cls.srv.positions = {}
         cls.url = "http://127.0.0.1:%d" % cls.srv.server_address[1]
         cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
         cls.t.start()
@@ -96,7 +106,8 @@ class DigestOrderTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown()
 
-    def expected_stream(self, markets, accounts):
+    def expected_stream(self, markets, accounts, pos_accounts=(), positions=None):
+        positions = positions or {}
         lines = []
         for m in range(1, markets + 1):
             hx = "0x%x" % m
@@ -104,17 +115,42 @@ class DigestOrderTest(unittest.TestCase):
             lines.append(jq_compact({"m": "torus_getOpenInterest", "a": hx}))
         for a in accounts:
             lines.append(jq_compact({"m": "torus_getBalances", "a": a}))
+        # Positions last: account by account (file order), markets in id order.
+        for a in pos_accounts:
+            for m in range(1, markets + 1):
+                hx = "0x%x" % m
+                lines.append(
+                    jq_compact(
+                        {
+                            "m": "torus_getPosition",
+                            "a": a,
+                            "b": hx,
+                            "s": positions.get((a, hx)),
+                        }
+                    )
+                )
         return "".join(line + "\n" for line in lines)
 
-    def run_digest(self, markets, accounts, par):
+    def run_digest(self, markets, accounts, par, pos_accounts=None):
+        """pos_accounts: None = the 6-argument call (no positions file);
+        a list = written to a file passed as the 7th argument; "" = an
+        explicit empty 7th argument."""
         d = tempfile.mkdtemp(prefix="digest-test-")
         try:
             acct = os.path.join(d, "accounts.txt")
             with open(acct, "w") as f:
                 f.write("".join(a + "\n" for a in accounts))
             out = os.path.join(d, "state-digest.txt")
+            argv = ["bash", DIGEST_SH, self.url, str(markets), acct, out, str(par), "10"]
+            if pos_accounts == "":
+                argv.append("")
+            elif pos_accounts is not None:
+                pos = os.path.join(d, "position-accounts.txt")
+                with open(pos, "w") as f:
+                    f.write("".join(a + "\n" for a in pos_accounts))
+                argv.append(pos)
             r = subprocess.run(
-                ["bash", DIGEST_SH, self.url, str(markets), acct, out, str(par), "10"],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=180,
@@ -151,6 +187,61 @@ class DigestOrderTest(unittest.TestCase):
         self.assertEqual(len(parts), 2, "stdout must be '<sha256> <wall_seconds>'")
         self.assertEqual(len(parts[0]), 64)
         float(parts[1])
+
+    # --- liquidation stress: positions of the protocol accounts (vault + ADL
+    # escrows) via torus_getPosition per market, after the balances.
+    def test_position_accounts_follow_balances_in_order(self):
+        accounts = ["0xaa01", "0xaa02"]
+        pos = ["0xee01", "0xee02", "0xee03"]
+        want = self.expected_stream(30, accounts, pos)
+        serial, out1 = self.run_digest(30, accounts, 1, pos)
+        self.assertEqual(serial, want, "positions: account order, then market order")
+        par, out8 = self.run_digest(30, accounts, 8, pos)
+        self.assertEqual(par, serial, "-P 8 must not reorder the position parts")
+        sha = hashlib.sha256(want.encode()).hexdigest()
+        self.assertIn(sha, out1)
+        self.assertIn(sha, out8)
+
+    def test_no_or_empty_position_file_leaves_stream_unchanged(self):
+        accounts = ["0xaa01", "0xaa02"]
+        want = self.expected_stream(9, accounts)
+        self.assertEqual(self.run_digest(9, accounts, 4)[0], want)
+        self.assertEqual(self.run_digest(9, accounts, 4, "")[0], want)
+
+    def test_escrow_position_changes_the_digest(self):
+        esc = "0x746f7275732d61646c2d657363726f772d6c6e67"
+        accounts = ["0xaa01", esc]
+        try:
+            self.srv.positions = {}
+            flat, sflat = self.run_digest(5, accounts, 4, [esc])
+            base, sbase = self.run_digest(5, accounts, 4)
+            self.srv.positions = {(esc, "0x3"): {"side": "long", "size": "2.5"}}
+            held, sheld = self.run_digest(5, accounts, 4, [esc])
+            base2, sbase2 = self.run_digest(5, accounts, 4)
+        finally:
+            self.srv.positions = {}
+        self.assertNotEqual(sflat.split()[0], sheld.split()[0])
+        self.assertIn('"size":"2.5"', held)
+        # Without the positions file the escrow position is invisible.
+        self.assertEqual(sbase.split()[0], sbase2.split()[0])
+
+    def test_unreadable_position_file_is_refused(self):
+        d = tempfile.mkdtemp(prefix="digest-test-")
+        try:
+            acct = os.path.join(d, "a.txt")
+            with open(acct, "w") as f:
+                f.write("0xaa01\n")
+            r = subprocess.run(
+                ["bash", DIGEST_SH, self.url, "2", acct, os.path.join(d, "o"),
+                 "2", "10", os.path.join(d, "missing.txt")],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("position accounts", r.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ summarize.py
@@ -326,7 +417,9 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail=commit\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED.replace("missed=1\n", "missed=1 | tail=commit\n")
+            )
         s, _ = run_summarize(
             self.d, extra=["--max-in-flight", "1", "--in-flight-tail", "commit"]
         )
@@ -368,13 +461,26 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED + (
-                "Cancel-by-id (load-gen): cancel sent 900 accepted 880 | modify sent 450 "
-                "accepted 440 | lookups 700 errors 3 | no own order 25\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED
+                + (
+                    "Cancel-by-id (load-gen): cancel sent 900 accepted 880 | modify sent 450 "
+                    "accepted 440 | lookups 700 errors 3 | no own order 25\n"
+                )
+            )
         s, _ = run_summarize(self.d)
-        self.assertEqual(s["ingest"]["cancel_by_id"], {
-            "cancel_sent": 900, "cancel_accepted": 880, "modify_sent": 450,
-            "modify_accepted": 440, "lookups": 700, "lookup_errors": 3, "no_own_order": 25})
+        self.assertEqual(
+            s["ingest"]["cancel_by_id"],
+            {
+                "cancel_sent": 900,
+                "cancel_accepted": 880,
+                "modify_sent": 450,
+                "modify_accepted": 440,
+                "lookups": 700,
+                "lookup_errors": 3,
+                "no_own_order": 25,
+            },
+        )
         write_cell(self.d, 1_000, 1_000)
         s, _ = run_summarize(self.d)
         self.assertIsNone(s["ingest"]["cancel_by_id"])
@@ -383,11 +489,16 @@ class SummarizeTest(unittest.TestCase):
         write_cell(self.d, 1_000, 1_000)
         write_agreement(self.d, ["same"] * 3)
         with open(os.path.join(self.d, "bench.log"), "w") as f:
-            f.write(self.BENCH_LOG_CAPPED + (
-                "Cloids (load-gen generated): 4521 of 9040 orders (50.0%) | --cloid-share 50%\n"))
+            f.write(
+                self.BENCH_LOG_CAPPED
+                + (
+                    "Cloids (load-gen generated): 4521 of 9040 orders (50.0%) | --cloid-share 50%\n"
+                )
+            )
         s, _ = run_summarize(self.d)
-        self.assertEqual(s["ingest"]["cloids"], {
-            "share_pct": 50, "stamped": 4521, "placed": 9040})
+        self.assertEqual(
+            s["ingest"]["cloids"], {"share_pct": 50, "stamped": 4521, "placed": 9040}
+        )
         # A bench before --cloid-share prints no line: None, not 0%.
         write_cell(self.d, 1_000, 1_000)
         s, _ = run_summarize(self.d)
@@ -971,7 +1082,9 @@ class CrashKillGuardTest(unittest.TestCase):
         for mode in ("head", "commit"):
             r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=mode)
             self.assertEqual(
-                (r.returncode, r.stdout.strip()), (0, f"--in-flight-tail {mode}"), r.stderr
+                (r.returncode, r.stdout.strip()),
+                (0, f"--in-flight-tail {mode}"),
+                r.stderr,
             )
         for bad in ("x", "applied", "1"):
             r = run(MAX_IN_FLIGHT="4", IN_FLIGHT_TAIL=bad)
@@ -1069,22 +1182,35 @@ class CrashKillGuardTest(unittest.TestCase):
         for v in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION"):
             self.assertIn(f"{v}=${{{v}:-}}", src)
             self.assertIn(f"'${{{v}:-unset}}'", src)
-        lines = [l for l in src.splitlines()
-                 if ("CANCEL_BY_ID_FRACTION" in l or "MODIFY_FRACTION" in l)
-                 and not l.lstrip().startswith(("#", "log "))]
+        lines = [
+            l
+            for l in src.splitlines()
+            if ("CANCEL_BY_ID_FRACTION" in l or "MODIFY_FRACTION" in l)
+            and not l.lstrip().startswith(("#", "log "))
+        ]
         snippet = "BENCH_CMD=()\n" + "\n".join(lines) + '\necho "${BENCH_CMD[*]}"'
 
         def run(**env):
-            base = {k: v for k, v in os.environ.items()
-                    if k not in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION")}
-            return subprocess.run(["bash", "-c", snippet], capture_output=True,
-                                  text=True, env=dict(base, **env))
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("CANCEL_BY_ID_FRACTION", "MODIFY_FRACTION")
+            }
+            return subprocess.run(
+                ["bash", "-c", snippet],
+                capture_output=True,
+                text=True,
+                env=dict(base, **env),
+            )
 
         r = run()
         self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
         r = run(CANCEL_BY_ID_FRACTION="0.1", MODIFY_FRACTION="0.05")
-        self.assertEqual(r.stdout.strip(),
-                         "--cancel-by-id-fraction 0.1 --modify-fraction 0.05", r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "--cancel-by-id-fraction 0.1 --modify-fraction 0.05",
+            r.stderr,
+        )
         for bad in ({"CANCEL_BY_ID_FRACTION": "2"}, {"MODIFY_FRACTION": "x"}):
             r = run(**bad)
             self.assertEqual(r.returncode, 2, (bad, r.stdout, r.stderr))
@@ -2116,7 +2242,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("#!/bin/sh\nexit 0\n")
                 os.chmod(p, 0o755)
-            wt = os.path.dirname(os.path.dirname(HERE))
+            script, wt = sandbox_repo(tmp)
             for env, msg in (
                 (dict(ORACLE_FEED="yes"), "ORACLE_FEED must be"),
                 (dict(ORACLE_FEED="1", ORACLE_PRICE="-5"), "ORACLE_PRICE must be"),
@@ -2126,7 +2252,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 ),
             ):
                 r = subprocess.run(
-                    [RUN_CELL_SH, wt, "oracle-pre-x"],
+                    [script, wt, "oracle-pre-x"],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -2134,6 +2260,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                         os.environ,
                         TARGET_DIR=tmp,
                         RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
                         BENCH_ALLOW_UNDETACHED="1",
                         **env,
                     ),
@@ -2180,8 +2307,14 @@ class OracleFeedHarnessTest(unittest.TestCase):
         doc = self.src.index("#   ORACLE_FEED_DRAIN=1")
         self.assertLess(self.src.index("#   ORACLE_FEED=1"), doc)
         self.assertLess(doc, self.src.index("set -uo pipefail"))
+        self.assertIn(
+            "ORACLE_FEED_DRAIN_MAX_LAG=${ORACLE_FEED_DRAIN_MAX_LAG:-2}", self.src
+        )
+        self.assertLess(doc, self.src.index("#   ORACLE_FEED_DRAIN_MAX_LAG=N"))
         with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
-            self.assertIn('"ORACLE_FEED_DRAIN",', f.read())
+            allow = f.read()
+        self.assertIn('"ORACLE_FEED_DRAIN",', allow)
+        self.assertIn('"ORACLE_FEED_DRAIN_MAX_LAG",', allow)
         tmp = tempfile.mkdtemp(prefix="oracle-drain-pre-")
         try:
             tgt = os.path.join(tmp, "release")
@@ -2191,7 +2324,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 with open(p, "w") as f:
                     f.write("#!/bin/sh\nexit 0\n")
                 os.chmod(p, 0o755)
-            wt = os.path.dirname(os.path.dirname(HERE))
+            script, wt = sandbox_repo(tmp)
             for env, msg in (
                 (dict(ORACLE_FEED_DRAIN="2"), "ORACLE_FEED_DRAIN must be 0 or 1"),
                 (
@@ -2206,9 +2339,29 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     dict(ORACLE_FEED="0", ORACLE_FEED_DRAIN="1"),
                     "ORACLE_FEED_DRAIN=1 needs ORACLE_FEED=1",
                 ),
+                (
+                    dict(
+                        ORACLE_FEED="1",
+                        ORACLE_FEED_DRAIN="1",
+                        ORACLE_FEED_DRAIN_MAX_LAG="x",
+                    ),
+                    "ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer",
+                ),
+                (
+                    dict(
+                        ORACLE_FEED="1",
+                        ORACLE_FEED_DRAIN="1",
+                        ORACLE_FEED_DRAIN_MAX_LAG="-1",
+                    ),
+                    "ORACLE_FEED_DRAIN_MAX_LAG must be a non-negative integer",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN_MAX_LAG="100"),
+                    "ORACLE_FEED_DRAIN_MAX_LAG=100 needs ORACLE_FEED_DRAIN=1",
+                ),
             ):
                 r = subprocess.run(
-                    [RUN_CELL_SH, wt, "oracle-drain-pre-x"],
+                    [script, wt, "oracle-drain-pre-x"],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -2216,6 +2369,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                         os.environ,
                         TARGET_DIR=tmp,
                         RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
                         BENCH_ALLOW_UNDETACHED="1",
                         **env,
                     ),
@@ -2229,7 +2383,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
-    def _run_drain_flow(self, mode):
+    def _run_drain_flow(self, mode, max_lag="2"):
         """Run run-cell.sh's real bench-end pause block and drain block with
         python3 stubbed: each health.py call prints the feed's process state
         (T = SIGSTOPped) and its argv."""
@@ -2271,8 +2425,8 @@ class OracleFeedHarnessTest(unittest.TestCase):
             + "sleep 300 & ORACLE_PID=$!; FEED=$ORACLE_PID\n"
             + "trap 'kill -KILL $FEED 2>/dev/null' EXIT\n"
             + "OUT=%s TOOLS_DIR=/tools DRAIN_TIMEOUT=780 MARKETS=300 ORACLE_H0=7 "
-            "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s T_BENCH1=$(date +%%s)\n"
-            % (tmp, mode)
+            "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s ORACLE_FEED_DRAIN_MAX_LAG=%s T_BENCH1=$(date +%%s)\n"
+            % (tmp, mode, max_lag)
             + "METS=(9161 9162 9163)\n"
             + pause
             + "\n"
@@ -2303,6 +2457,19 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertNotIn("FEED_STILL_ALIVE", out)
         self.assertIn("STOPPED rc=143", out)
 
+    def test_feed_drain_max_lag_reaches_the_feed_live_drain_only(self):
+        """ORACLE_FEED_DRAIN_MAX_LAG (value-sum proof cells: exec ~0.34 s per
+        block keeps the lag at ~60 while the feed runs) widens only the
+        feed-live exec-lag bound; the paused settle keeps the idle criterion."""
+        out_dir, out = self._run_drain_flow("1", "100")
+        py = [l for l in out.splitlines() if l.startswith("PY ")]
+        self.assertEqual(len(py), 2, out)
+        self.assertTrue(
+            py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 100"), py[0]
+        )
+        self.assertNotIn("--max-lag", py[1])
+        self.assertIn("exec lag <= 100", out)
+
     def test_feed_drain_keeps_the_feed_live_then_pauses_and_settles(self):
         out_dir, out = self._run_drain_flow("1")
         py = [l for l in out.splitlines() if l.startswith("PY ")]
@@ -2312,7 +2479,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertTrue(
             py[0].startswith("PY S /tools/health.py drain --out %s " % out_dir), py[0]
         )
-        self.assertTrue(py[0].endswith(" --feed-live --feed-mempool-max 12"), py[0])
+        self.assertTrue(
+            py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 2"), py[0]
+        )
         # paused right after it, then a legacy quiet settle before the digest
         self.assertTrue(
             py[1].startswith(
@@ -2356,7 +2525,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                     # an oracle-feed without --walk-bp (an older binary)
                     f.write("#!/bin/sh\necho 'Usage: oracle-feed --price <PRICE>'\n")
                 os.chmod(p, 0o755)
-            wt = os.path.dirname(os.path.dirname(HERE))
+            script, wt = sandbox_repo(tmp)
             for env, rc, msg in (
                 (
                     dict(ORACLE_FEED="1", ORACLE_WALK_BP="x"),
@@ -2372,7 +2541,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 (dict(ORACLE_FEED="1", ORACLE_WALK_BP="10"), 1, "has no --walk-bp"),
             ):
                 r = subprocess.run(
-                    [RUN_CELL_SH, wt, "oracle-walk-pre-x"],
+                    [script, wt, "oracle-walk-pre-x"],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -2380,6 +2549,7 @@ class OracleFeedHarnessTest(unittest.TestCase):
                         os.environ,
                         TARGET_DIR=tmp,
                         RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
                         BENCH_ALLOW_UNDETACHED="1",
                         **env,
                     ),
@@ -2392,6 +2562,966 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 )
         finally:
             shutil.rmtree(tmp)
+
+
+LIQUIDATOR_VAULT = "0x746f7275732d6c697175696461746f722d766c74"
+# torus_core::liquidation::ADL_ESCROW_LONG / ADL_ESCROW_SHORT.
+ADL_ESCROW_LONG = "0x746f7275732d61646c2d657363726f772d6c6e67"
+ADL_ESCROW_SHORT = "0x746f7275732d61646c2d657363726f772d736874"
+PROTOCOL_ACCOUNTS = [LIQUIDATOR_VAULT, ADL_ESCROW_LONG, ADL_ESCROW_SHORT]
+
+
+def sandbox_repo(tmp):
+    """A throwaway harness tree for running run-cell.sh: (run-cell.sh, worktree).
+
+    run-cell.sh resolves MAINREPO from its own path, so a copy started from
+    THIS checkout writes testnet/genesis-weighted-full.json (through
+    gen-3val-genesis.sh) and target/release/torus-node here as soon as a
+    preflight lets it through. s17: a red test-first run did, with a stub
+    bench, and the stale file (61 balances, address 'oracle-feed') broke a
+    later cell's genesis. Preflight tests therefore run a copy in `tmp`."""
+    repo = os.path.join(tmp, "repo")
+    tools = os.path.join(repo, "tools", "matched-bench")
+    wsl = os.path.join(repo, "devnet", "wsl")
+    os.makedirs(tools)
+    os.makedirs(wsl)
+    shutil.copy2(RUN_CELL_SH, tools)
+    shutil.copy2(os.path.join(REPO, "devnet", "wsl", "bench-validator-keys.json"), wsl)
+    for p in (
+        os.path.join(tools, "digest-node.sh"),
+        os.path.join(wsl, "launch-3val.sh"),
+    ):
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(p, 0o755)
+    return os.path.join(tools, "run-cell.sh"), repo
+
+
+def fake_target(tmp, help_text="Usage: oracle-feed --price <PRICE> --walk-bp <N>"):
+    """TARGET_DIR with stub torus-node / bench-throughput binaries."""
+    tgt = os.path.join(tmp, "release")
+    os.makedirs(tgt)
+    for b in ("torus-node", "bench-throughput"):
+        p = os.path.join(tgt, b)
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\necho '%s'\n" % help_text)
+        os.chmod(p, 0o755)
+
+
+def _stat(path):
+    try:
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
+    except FileNotFoundError:
+        return None
+
+
+class StaleArtifactGuardTest(unittest.TestCase):
+    """run-cell.sh refuses stale artifacts before it generates a genesis:
+    an untracked testnet/genesis-weighted-full.json that gen-3val-genesis.sh
+    would reuse as-is (s17: a stub-bench test left one with 61 balances and
+    the address 'oracle-feed'), and a node / bench binary whose md5 is not
+    the one recorded for the cell (EXPECT_NODE_MD5 / EXPECT_BENCH_MD5; s17: a
+    reflink-seeded target dir kept a stale bench). Runs a sandbox copy whose
+    gen-3val-genesis.sh only records that it was called."""
+
+    def setUp(self):
+        self.real_full = _stat(WEIGHTED_FULL)
+        self.tmp = tempfile.mkdtemp(prefix="stale-guard-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        fake_target(
+            self.tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>"
+        )
+        self.script, self.wt = sandbox_repo(self.tmp)
+        self.called = os.path.join(self.tmp, "generator-called")
+        gen = os.path.join(self.wt, "devnet", "wsl", "gen-3val-genesis.sh")
+        with open(gen, "w") as f:
+            f.write("#!/bin/sh\ntouch '%s'\n" % self.called)
+        os.chmod(gen, 0o755)
+        self.full = os.path.join(self.wt, "testnet", "genesis-weighted-full.json")
+        os.makedirs(os.path.dirname(self.full))
+        # pgrep finds nothing: a cargo build or bench elsewhere on the host
+        # must not end the sandbox cell before the step under test.
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "pgrep"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(self.bin, "pgrep"), 0o755)
+
+    def tearDown(self):
+        self.assertEqual(
+            _stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched"
+        )
+
+    def write_full(self, rows):
+        base = [
+            {
+                "address": "0x%040x" % i,
+                "available": "1.0",
+                "note": "bench sender %d" % i,
+            }
+            for i in range(3)
+        ]
+        with open(self.full, "w") as f:
+            json.dump({"native_balances": base + rows, "accounts": []}, f)
+
+    @staticmethod
+    def bulk(n):
+        return [
+            {
+                "address": "0x%040x" % (60 + i),
+                "available": "100000000.0",
+                "note": "bulk-test %d" % (60 + i),
+            }
+            for i in range(n)
+        ]
+
+    def run_cell(self, **env):
+        e = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("LIQ_", "ORACLE_", "EXPECT_"))
+            and k not in ("FORCE", "SENDERS")
+        }
+        e.update(
+            PATH=self.bin + os.pathsep + os.environ["PATH"],
+            TARGET_DIR=self.tmp,
+            RESULTS_ROOT=os.path.join(self.tmp, "results"),
+            DATA_ROOT=os.path.join(self.tmp, "data"),
+            BENCH_ALLOW_UNDETACHED="1",
+            SENDERS="5",
+            **env,
+        )
+        r = subprocess.run(
+            [self.script, self.wt, "guard-x"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=e,
+        )
+        try:
+            with open(os.path.join(self.tmp, "results", "guard-x", "run.log")) as f:
+                log = f.read()
+        except OSError:
+            log = ""
+        return r, log
+
+    def test_stale_weighted_full_genesis_fails_before_the_generator(self):
+        # the s17 file: the stub bench's help line became one "bulk" row
+        self.write_full(
+            [
+                {
+                    "address": "oracle-feed",
+                    "available": "100000000.0",
+                    "note": "bulk-test Usage:",
+                }
+            ]
+        )
+        r, log = self.run_cell()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("FATAL", log)
+        self.assertIn(self.full, log)
+        self.assertIn("oracle-feed", log)
+        self.assertFalse(os.path.exists(self.called), "generator must not run")
+
+    def test_weighted_full_with_too_few_bulk_senders_fails(self):
+        self.write_full(self.bulk(3))
+        r, log = self.run_cell()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("3 bulk-test rows < SENDERS=5", log)
+        self.assertFalse(os.path.exists(self.called))
+
+    def test_unparsable_weighted_full_fails(self):
+        with open(self.full, "w") as f:
+            f.write("{truncated")
+        r, log = self.run_cell()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(self.full, log)
+        self.assertFalse(os.path.exists(self.called))
+
+    def test_good_or_absent_weighted_full_reaches_the_generator(self):
+        for rows in (self.bulk(5), None):
+            with self.subTest(rows=rows is not None):
+                if rows is None:
+                    os.remove(self.full)
+                else:
+                    self.write_full(rows)
+                r, log = self.run_cell(OVERWRITE="1")
+                self.assertTrue(os.path.exists(self.called), r.stdout + r.stderr)
+                self.assertNotIn("genesis-weighted-full.json is stale", log)
+                os.remove(self.called)
+
+    def test_force_regenerates_instead_of_failing(self):
+        self.write_full([{"address": "oracle-feed", "note": "bulk-test Usage:"}])
+        r, _ = self.run_cell(FORCE="1")
+        self.assertTrue(os.path.exists(self.called), r.stdout + r.stderr)
+
+    def md5(self, name):
+        with open(os.path.join(self.tmp, "release", name), "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+
+    def test_expected_md5_mismatch_refuses_and_prints_both(self):
+        self.write_full(self.bulk(5))
+        for var, name in (
+            ("EXPECT_BENCH_MD5", "bench-throughput"),
+            ("EXPECT_NODE_MD5", "torus-node"),
+        ):
+            with self.subTest(var=var):
+                r, log = self.run_cell(OVERWRITE="1", **{var: "0123abcd"})
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                fatal = [l for l in log.splitlines() if "FATAL" in l]
+                self.assertEqual(len(fatal), 1, log)
+                self.assertIn(name, fatal[0])
+                self.assertIn(self.md5(name), fatal[0])
+                self.assertIn("0123abcd", fatal[0])
+                self.assertFalse(
+                    os.path.exists(self.called), "must stop before the genesis"
+                )
+
+    def test_expected_md5_match_proceeds(self):
+        self.write_full(self.bulk(5))
+        r, log = self.run_cell(
+            EXPECT_BENCH_MD5=self.md5("bench-throughput")[:8],
+            EXPECT_NODE_MD5=self.md5("torus-node"),
+        )
+        self.assertTrue(os.path.exists(self.called), r.stdout + r.stderr + log)
+        self.assertIn("bench-throughput md5=%s" % self.md5("bench-throughput"), log)
+        self.assertIn("expected %s" % self.md5("bench-throughput")[:8], log)
+
+    def test_bad_expected_md5_fails_preflight(self):
+        for v in ("xyz", "0123abc", "0123ABCD"):
+            with self.subTest(v=v):
+                r, _ = self.run_cell(EXPECT_BENCH_MD5=v)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("EXPECT_BENCH_MD5 must be", r.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
+
+    def test_expected_md5_knobs_documented_and_allowlisted(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        head = src[: src.index("set -uo pipefail")]
+        self.assertIn("#   EXPECT_NODE_MD5", head)
+        self.assertIn("EXPECT_BENCH_MD5", head)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            allow = f.read()
+        for k in ("EXPECT_NODE_MD5", "EXPECT_BENCH_MD5"):
+            self.assertIn('"%s",' % k, allow)
+
+
+class LiqStressHarnessTest(unittest.TestCase):
+    """Row 76 liquidation-stress cell: LIQ_THIN thin-seeds the first N load
+    senders in the genesis, ORACLE_SHOCK_BP/ROUND pass a parity-signed price
+    shock to the oracle feed, and the liquidator vault joins the digest (and
+    is read per node) only when either is on. Defaults leave the cell as it
+    was."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(RUN_CELL_SH) as f:
+            cls.src = f.read()
+
+    def fn(self, start, end_marker):
+        i = self.src.index(start)
+        return self.src[i : self.src.index(end_marker, i) + len(end_marker)]
+
+    def test_defaults_docs_and_allowlist(self):
+        for var, default in (
+            ("LIQ_THIN", "0"),
+            ("LIQ_THIN_AVAIL", "1000000.0"),
+            ("ORACLE_SHOCK_BP", "0"),
+            ("ORACLE_SHOCK_ROUND", "0"),
+        ):
+            self.assertIn(f"{var}=${{{var}:-{default}}}", self.src)
+        head = self.src[: self.src.index("set -uo pipefail")]
+        for doc in ("#   LIQ_THIN=N", "#   ORACLE_SHOCK_BP=S"):
+            self.assertIn(doc, head)
+        self.assertIn(f"LIQUIDATOR_VAULT={LIQUIDATOR_VAULT}", self.src)
+        self.assertIn(f"ADL_ESCROW_LONG={ADL_ESCROW_LONG}", self.src)
+        self.assertIn(f"ADL_ESCROW_SHORT={ADL_ESCROW_SHORT}", self.src)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            allow = f.read()
+        for k in (
+            "LIQ_THIN",
+            "LIQ_THIN_AVAIL",
+            "ORACLE_SHOCK_BP",
+            "ORACLE_SHOCK_ROUND",
+        ):
+            self.assertIn(f'"{k}",', allow)
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            res = f.read()
+        self.assertIn('--liq-thin "$(j \'.cell.liq_thin // ""\')"', res)
+        self.assertIn('--liq-thin-avail "$(j \'.cell.liq_thin_avail // ""\')"', res)
+
+    def _genesis(self, d):
+        nb = [
+            {"address": "0xbase%d" % i, "available": "5.0", "note": "hardhat %d" % i}
+            for i in range(3)
+        ]
+        nb.append({"address": "0xnonote", "available": "7.0"})
+        nb += [
+            {
+                "address": "0x%040x" % i,
+                "available": "100000000.0",
+                "note": "bulk-test %d" % i,
+            }
+            for i in range(58, 70)
+        ]
+        g = {
+            "markets": [{"market_id": 1}],
+            "native_balances": nb,
+            "accounts": [{"note": "bulk-test 60", "balance": "1"}],
+        }
+        p = os.path.join(d, "genesis.json")
+        with open(p, "w") as f:
+            json.dump(g, f)
+        return p, g
+
+    def test_liq_thin_patch_sets_available_on_exactly_the_first_n_load_senders(self):
+        fn = self.fn("liq_thin_patch() {", "\n}\n")
+        tmp = tempfile.mkdtemp(prefix="liq-thin-")
+        try:
+            p, before = self._genesis(tmp)
+            r = subprocess.run(
+                ["bash", "-c", fn + 'liq_thin_patch "$1" 4 1000000.0', "x", p],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "4"), r.stderr)
+            with open(p) as f:
+                after = json.load(f)
+            thin = {"bulk-test %d" % i for i in range(60, 64)}
+            for b, a in zip(before["native_balances"], after["native_balances"]):
+                want = dict(b, available="1000000.0") if b.get("note") in thin else b
+                self.assertEqual(a, want)
+            self.assertEqual(
+                after["accounts"], before["accounts"], "EVM balances untouched"
+            )
+            self.assertEqual(after["markets"], before["markets"])
+            # More thin senders than the genesis funds: FATAL, genesis untouched.
+            with open(p) as f:
+                ok = f.read()
+            r = subprocess.run(
+                ["bash", "-c", fn + 'liq_thin_patch "$1" 11 1.0', "x", p],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(r.returncode, 0)
+            with open(p) as f:
+                self.assertEqual(f.read(), ok)
+            self.assertEqual(
+                sorted(os.listdir(tmp)), ["genesis.json"], "no temp file left"
+            )
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_liq_thin_patch_runs_before_the_genesis_md5_and_only_when_set(self):
+        call = self.src.index('liq_thin_patch "$GENESIS" "$LIQ_THIN" "$LIQ_THIN_AVAIL"')
+        self.assertLess(
+            self.src.index('"$MAINREPO/devnet/wsl/gen-3val-genesis.sh"'), call
+        )
+        self.assertLess(call, self.src.index('GEN_MD5=$(md5sum "$GENESIS"'))
+        gate = self.src.rindex('if [ "$LIQ_THIN" -gt 0 ]; then', 0, call)
+        self.assertNotIn("\nfi\n", self.src[gate:call])
+
+    def test_shock_reaches_the_feed_only_when_set(self):
+        block = self.fn("    ORACLE_CMD=(", '\n    log "oracle feed: ${ORACLE_CMD[*]}"')
+        for bp, rnd, want in (
+            ("0", "0", []),
+            ("400", "30", ["--shock-bp", "400", "--shock-round", "30"]),
+        ):
+            script = (
+                "BENCH=bt RPCS=(r0 r1) ORACLE_KEYS=k MARKETS=3 ORACLE_PRICE=30000 "
+                "ORACLE_INTERVAL_MS=2000 OUT=o ORACLE_WALK_BP=10 ORACLE_SHOCK_BP=%s ORACLE_SHOCK_ROUND=%s\n"
+                % (bp, rnd)
+                + block.rsplit("\n", 1)[0]
+                + '\nprintf "%s\\n" "${ORACLE_CMD[@]}"\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            argv = r.stdout.split("\n")[:-1]
+            self.assertEqual(
+                argv[-len(want) :] if want else argv[-2:],
+                want or ["--walk-bp", "10"],
+                argv,
+            )
+            self.assertEqual(argv.count("--shock-bp"), len(want) // 4, argv)
+        self.assertIn("'shock_bp': int(shock_bp)", self.src)
+        self.assertIn("'shock_round': int(shock_round)", self.src)
+
+    def test_bad_liq_env_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="liq-pre-")
+        try:
+            fake_target(tmp)  # an oracle-feed without --shock-bp (an older binary)
+            script, wt = sandbox_repo(tmp)
+            for env, rc, msg in (
+                (dict(LIQ_THIN="x"), 2, "LIQ_THIN must be"),
+                (dict(LIQ_THIN="-1"), 2, "LIQ_THIN must be"),
+                (dict(LIQ_THIN="6", SENDERS="5"), 2, "must not exceed SENDERS"),
+                (dict(LIQ_THIN="5", LIQ_THIN_AVAIL="0"), 2, "LIQ_THIN_AVAIL must be"),
+                (dict(LIQ_THIN="5", LIQ_THIN_AVAIL="abc"), 2, "LIQ_THIN_AVAIL must be"),
+                (
+                    dict(LIQ_THIN="5", LIQ_THIN_AVAIL="1.123456789"),
+                    2,
+                    "LIQ_THIN_AVAIL must be",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="x"),
+                    2,
+                    "ORACLE_SHOCK_BP must be",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="10000"),
+                    2,
+                    "ORACLE_SHOCK_BP must be",
+                ),
+                (
+                    dict(
+                        ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="r"
+                    ),
+                    2,
+                    "ORACLE_SHOCK_ROUND must be",
+                ),
+                (
+                    dict(ORACLE_FEED="1", ORACLE_SHOCK_ROUND="30"),
+                    2,
+                    "ORACLE_SHOCK_ROUND needs ORACLE_SHOCK_BP",
+                ),
+                (dict(ORACLE_SHOCK_BP="400"), 2, "needs ORACLE_FEED=1"),
+                (
+                    dict(
+                        ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="30"
+                    ),
+                    1,
+                    "has no --shock-bp",
+                ),
+            ):
+                r = subprocess.run(
+                    [script, wt, "liq-pre-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        os.environ,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
+                    ),
+                )
+                self.assertEqual(r.returncode, rc, (env, r.stderr))
+                self.assertIn(msg, r.stderr, env)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "liq-pre-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
+
+    def _run(self, script, **env):
+        base = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("LIQ_", "ORACLE_SHOCK"))
+        }
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=dict(base, **env),
+        )
+
+    def test_protocol_addresses_match_the_rust_constants(self):
+        """The run-cell.sh hex addresses are the 20-byte ASCII names in
+        torus_core::liquidation (a renamed constant must fail here, not
+        silently digest an empty account)."""
+        import re
+
+        with open(
+            os.path.join(REPO, "crates", "torus-core", "src", "liquidation.rs")
+        ) as f:
+            rs = f.read()
+        for name in ("LIQUIDATOR_VAULT", "ADL_ESCROW_LONG", "ADL_ESCROW_SHORT"):
+            m = re.search(
+                r"pub const %s: Address = Address::new\(\*b\"([^\"]{20})\"\);" % name,
+                rs,
+            )
+            self.assertIsNotNone(m, name)
+            want = "0x" + m.group(1).encode().hex()
+            self.assertIn(f"\n{name}={want}\n", self.src, name)
+        self.assertIn(
+            "*a == ADL_ESCROW_LONG || *a == ADL_ESCROW_SHORT", rs,
+            "is_adl_escrow no longer names exactly the two escrows: update the digest",
+        )
+
+    def test_vault_joins_the_digest_only_when_enabled(self):
+        """Liquidation stress: the vault and both ADL escrows join the
+        balance accounts AND the position accounts (torus_getPosition per
+        market); default cells digest exactly the 50 load senders, no
+        positions file."""
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        block = self.fn(
+            '"$BENCH" gen-accounts --offset 60 --count 50',
+            "DIG_POS_ACCTS=",
+        )
+        block = block + self.src[
+            self.src.index("DIG_POS_ACCTS=", self.src.index(block)) + len("DIG_POS_ACCTS=") :
+        ].split("\n", 1)[0] + "\n"
+        tmp = tempfile.mkdtemp(prefix="liq-dig-")
+        try:
+            bench = os.path.join(tmp, "bt")
+            with open(bench, "w") as f:
+                f.write("#!/bin/sh\necho '60 0xaaa'\necho '61 0xbbb'\n")
+            os.chmod(bench, 0o755)
+            script = (
+                'log() { echo "$*" >&2; }\nLIQUIDATOR_VAULT=%s\nADL_ESCROW_LONG=%s\n'
+                "ADL_ESCROW_SHORT=%s\nBENCH=%s\nOUT=%s\n"
+                % (LIQUIDATOR_VAULT, ADL_ESCROW_LONG, ADL_ESCROW_SHORT, bench, tmp)
+                + on
+                + block
+                + '\necho "$DIG_ACCTS $DIG_POS_ACCTS ${#DIG_POS[@]} ${DIG_POS[*]-}"\n'
+            )
+            posf = os.path.join(tmp, "digest-position-accounts.txt")
+            for env, accts, pos in (
+                (dict(LIQ_THIN="0", ORACLE_SHOCK_BP="0"), ["0xaaa", "0xbbb"], None),
+                (
+                    dict(LIQ_THIN="5", ORACLE_SHOCK_BP="0"),
+                    ["0xaaa", "0xbbb"] + PROTOCOL_ACCOUNTS,
+                    PROTOCOL_ACCOUNTS,
+                ),
+                (
+                    dict(LIQ_THIN="0", ORACLE_SHOCK_BP="400"),
+                    ["0xaaa", "0xbbb"] + PROTOCOL_ACCOUNTS,
+                    PROTOCOL_ACCOUNTS,
+                ),
+            ):
+                if os.path.exists(posf):
+                    os.unlink(posf)
+                r = self._run(script, **env)
+                want = (
+                    "%d 0 0" % len(accts)
+                    if pos is None
+                    else "%d %d 1 %s" % (len(accts), len(pos), posf)
+                )
+                self.assertEqual(
+                    (r.returncode, r.stdout.strip()), (0, want), (env, r.stderr)
+                )
+                with open(os.path.join(tmp, "digest-accounts.txt")) as f:
+                    self.assertEqual(f.read().split(), accts, env)
+                if pos is None:
+                    self.assertFalse(os.path.exists(posf), env)
+                else:
+                    with open(posf) as f:
+                        self.assertEqual(f.read().split(), pos, env)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_digest_nodes_get_the_positions_file_only_when_enabled(self):
+        loop = self.fn("DIG_PIDS=()\n", 'wait "${DIG_PIDS[@]}"')
+        tmp = tempfile.mkdtemp(prefix="liq-dign-")
+        try:
+            stub = os.path.join(tmp, "digest-node.sh")
+            with open(stub, "w") as f:
+                f.write('#!/bin/sh\necho "$# ${7-}"\n')
+            os.chmod(stub, 0o755)
+            for pos, want in (
+                ("DIG_POS=()", "6"),
+                ('DIG_POS=("%s/p.txt")' % tmp, "7 %s/p.txt" % tmp),
+            ):
+                script = (
+                    "set -u\nTOOLS_DIR=%s\nOUT=%s\nRPCS=(u0 u1 u2)\nMARKETS=3\n"
+                    "DIGEST_PAR=2\nRPC_TIMEOUT=5\n%s\n" % (tmp, tmp, pos)
+                    + loop
+                    + "\n"
+                )
+                r = self._run(script)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for i in range(3):
+                    with open(os.path.join(tmp, "digest-val%d.out" % i)) as f:
+                        self.assertEqual(f.read().strip(), want, pos)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_vault_is_read_per_node_only_when_enabled(self):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        block = self.fn(
+            "if liq_stress_on; then\n    for i in 0 1 2; do\n        rpc ", "\nfi\n"
+        )
+        self.assertIn("torus_getLiquidatorVault", block)
+        # After the digests and their quiescence snapshot.
+        at = self.src.index(block)
+        self.assertLess(self.src.index('wait "${DIG_PIDS[@]}"'), at)
+        self.assertLess(self.src.index("if Q_AFTER=$(funnel_snapshot)"), at)
+        tmp = tempfile.mkdtemp(prefix="liq-vault-")
+        try:
+            script = (
+                'log() { echo "$*" >&2; }\nRPCS=(u0 u1 u2)\nOUT=%s\n'
+                'rpc() { [ "$1" = u1 ] && return 7; echo \'{"result":{"address":"0x74","deficit":"5.0","openPositions":3}}\'; }\n'
+                % tmp
+                + on
+                + block
+            )
+            r = self._run(script, LIQ_THIN="0", ORACLE_SHOCK_BP="0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(os.listdir(tmp), [])
+            r = self._run(script, LIQ_THIN="3", ORACLE_SHOCK_BP="0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(
+                sorted(os.listdir(tmp)),
+                ["vault-val0.json", "vault-val1.json", "vault-val2.json"],
+            )
+            with open(os.path.join(tmp, "vault-val0.json")) as f:
+                self.assertEqual(
+                    json.load(f),
+                    {"address": "0x74", "deficit": "5.0", "openPositions": 3},
+                )
+            with open(os.path.join(tmp, "vault-val1.json")) as f:
+                self.assertEqual(json.load(f), "RPC_ERR")
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_liquidation_metrics_are_sampled_only_when_enabled(self):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        i = self.src.index("if liq_stress_on; then\n    WIDE_COLS=")
+        block = self.src[i : self.src.index("\nfi\n", i) + 4]
+        self.assertLess(i, self.src.index('WIDE_COLS="$WIDE_COLS scrape_valid"'))
+        script = "WIDE_COLS='a b'\n" + on + block + 'echo "$WIDE_COLS"\n'
+        r = self._run(script, LIQ_THIN="0", ORACLE_SHOCK_BP="0")
+        self.assertEqual(r.stdout.strip(), "a b", r.stderr)
+        r = self._run(script, LIQ_THIN="0", ORACLE_SHOCK_BP="400")
+        self.assertEqual(
+            r.stdout.strip(),
+            "a b torus_liquidations_triggered_total torus_liquidator_vault_deficit"
+            " torus_liquidation_step_seconds_sum torus_liquidation_step_seconds_count"
+            " torus_liquidations_stage1_total torus_liquidations_backstop_total"
+            " torus_liquidations_adl_total torus_liquidation_scanned_total"
+            " torus_liquidation_acted_total torus_liquidation_pending"
+            " torus_liquidation_deferred"
+            " torus_exec_post_engine_tail_seconds_count"
+            " torus_liquidation_adl_queue torus_liquidation_adl_queue_deficit",
+            r.stderr,
+        )
+
+    # Codex P2: the summarizer of an older worktree (TOOLS_FROM_WORKTREE=1, e.g.
+    # main 46bb3a40 or the Phase 4 build) rejects --liq-thin/--liq-thin-avail as
+    # unrecognized, so passing them unconditionally lost every summary.
+    OLD_SUMMARIZER = (
+        "import argparse\nap = argparse.ArgumentParser()\n"
+        "for a in ['out', 'label', 'in-flight-tail']:\n"
+        "    ap.add_argument('--' + a, default='')\nap.parse_args()\n"
+    )
+
+    def _liq_args(self, tools_dir, **env):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        i = self.src.index("summarizer_has_liq_opts() {")
+        j = self.src.index("SUMMARIZE_LIQ_ARGS=()", i)
+        block = self.src[i : self.src.index("\nfi\n", j) + 4]
+        script = (
+            "TOOLS_DIR=%s\nTOOLS_FROM_WORKTREE=1\n" % tools_dir
+            + on
+            + block
+            + 'printf "<%s>\\n" "${SUMMARIZE_LIQ_ARGS[@]}"\n'
+        )
+        return self._run(script, **env)
+
+    def test_summarizer_liq_options_only_when_enabled_and_supported(self):
+        tmp = tempfile.mkdtemp(prefix="liq-sumopt-")
+        try:
+            old = os.path.join(tmp, "old")
+            broken = os.path.join(tmp, "broken")
+            for d, body in (
+                (old, self.OLD_SUMMARIZER),
+                (broken, "import sys\nsys.exit(1)\n"),
+            ):
+                os.makedirs(d)
+                with open(os.path.join(d, "summarize.py"), "w") as f:
+                    f.write(body)
+            off = dict(LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="0")
+            thin = dict(LIQ_THIN="5", LIQ_THIN_AVAIL="2.5", ORACLE_SHOCK_BP="0")
+            shock = dict(
+                LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="400"
+            )
+            # Off: nothing passed, whatever the summarizer (exactly as on main).
+            for d in (HERE, old, broken):
+                r = self._liq_args(d, **off)
+                self.assertEqual((r.returncode, r.stdout), (0, "<>\n"), (d, r.stderr))
+            # On + a summarizer that knows the options: both passed.
+            r = self._liq_args(HERE, **thin)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(
+                r.stdout.split(), ["<--liq-thin>", "<5>", "<--liq-thin-avail>", "<2.5>"]
+            )
+            r = self._liq_args(HERE, **shock)
+            self.assertEqual(
+                r.stdout.split(),
+                ["<--liq-thin>", "<0>", "<--liq-thin-avail>", "<1000000.0>"],
+                r.stderr,
+            )
+            # On + an older (or broken) summarizer: FATAL, rc 1, names the fix.
+            for d in (old, broken):
+                for env in (thin, shock):
+                    r = self._liq_args(d, **env)
+                    self.assertEqual(r.returncode, 1, (d, env, r.stdout, r.stderr))
+                    self.assertIn("FATAL", r.stderr)
+                    self.assertIn(os.path.join(d, "summarize.py"), r.stderr)
+                    self.assertIn("--liq-thin", r.stderr)
+                    self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_summarizer_liq_options_checked_in_preflight(self):
+        # Before the results dir exists and before anything is launched.
+        at = self.src.index("SUMMARIZE_LIQ_ARGS=()")
+        self.assertLess(self.src.index("liq_stress_on() {"), at)
+        self.assertLess(at, self.src.index('mkdir -p "$OUT"'))
+        # The summarizer call passes them only through the gated array.
+        call = self.fn(
+            'python3 "$TOOLS_DIR/summarize.py" \\', '| tee -a "$OUT/run.log"'
+        )
+        self.assertNotIn("--liq-thin", call)
+        self.assertIn('"${SUMMARIZE_LIQ_ARGS[@]}"', call)
+
+    def test_stress_cell_with_an_older_worktree_summarizer_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="liq-oldsum-")
+        try:
+            fake_target(
+                tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>"
+            )
+            script, wt = sandbox_repo(tmp)
+            # The sandbox worktree IS the repo: its summarize.py is the one that
+            # TOOLS_FROM_WORKTREE=1 selects.
+            with open(
+                os.path.join(wt, "tools", "matched-bench", "summarize.py"), "w"
+            ) as f:
+                f.write(self.OLD_SUMMARIZER)
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith(("LIQ_", "ORACLE_", "TOOLS_"))
+            }
+            for env in (
+                dict(LIQ_THIN="5", SENDERS="5"),
+                dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="30"),
+            ):
+                r = subprocess.run(
+                    [script, wt, "liq-oldsum-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        base,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
+                    ),
+                )
+                self.assertEqual(r.returncode, 1, (env, r.stdout, r.stderr))
+                self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr, env)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "liq-oldsum-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
+
+    # Codex P2 (62898e32): under TOOLS_FROM_WORKTREE=1 an older worktree's
+    # digest-node.sh silently ignores the 7th argument (the position accounts),
+    # so a stress cell would report agreement without having digested a single
+    # protocol position. Pre-flight therefore also asks the selected digest
+    # script for its capabilities (`digest-node.sh --capabilities` must list
+    # `position-accounts`); an older one only prints its usage and exits 2.
+    NEW_SUMMARIZER = (
+        "import argparse\nap = argparse.ArgumentParser()\n"
+        "for a in ['out', 'label', 'in-flight-tail', 'liq-thin', 'liq-thin-avail']:\n"
+        "    ap.add_argument('--' + a, default='')\nap.parse_args()\n"
+    )
+
+    def _tools(self, root, name, digest):
+        """<root>/<name>/{summarize.py (new), digest-node.sh} -> the dir and
+        the marker file the digest stub touches whenever it is invoked."""
+        d = os.path.join(root, name)
+        os.makedirs(d)
+        with open(os.path.join(d, "summarize.py"), "w") as f:
+            f.write(self.NEW_SUMMARIZER)
+        marker = os.path.join(d, "digest-called")
+        dig = os.path.join(d, "digest-node.sh")
+        if digest == "new":
+            shutil.copy2(DIGEST_SH, dig)
+        else:
+            body = {
+                # The pre-62898e32 script: fewer than 4 arguments -> usage, rc 2.
+                "old": "[ $# -ge 4 ] || { echo 'usage: digest-node.sh <rpc-url> ...' >&2; exit 2; }\n",
+                # The sandbox stub: rc 0 but no capability listed.
+                "noop": "exit 0\n",
+                "other": "echo 'some-other-capability'\n",
+            }[digest]
+            with open(dig, "w") as f:
+                f.write("#!/bin/sh\ntouch '%s'\n%s" % (marker, body))
+            os.chmod(dig, 0o755)
+        return d, marker
+
+    def _preflight(self, tools_dir, **env):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        i = self.src.index("summarizer_has_liq_opts() {")
+        j = self.src.index("SUMMARIZE_LIQ_ARGS=()", i)
+        block = self.src[i : self.src.index("\nfi\n", j) + 4]
+        script = (
+            "TOOLS_DIR=%s\nTOOLS_FROM_WORKTREE=1\n" % tools_dir
+            + on
+            + block
+            + 'echo "args=${SUMMARIZE_LIQ_ARGS[*]-} pos=${DIGEST_HAS_POS-unset}"\n'
+        )
+        return self._run(script, **env)
+
+    def test_real_digest_script_lists_position_accounts(self):
+        r = subprocess.run(
+            [DIGEST_SH, "--capabilities"], capture_output=True, text=True, timeout=10
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("position-accounts", r.stdout.split("\n"))
+
+    def test_stress_cell_needs_a_digest_script_that_covers_positions(self):
+        tmp = tempfile.mkdtemp(prefix="liq-digcap-")
+        try:
+            off = dict(LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="0")
+            thin = dict(LIQ_THIN="5", LIQ_THIN_AVAIL="2.5", ORACLE_SHOCK_BP="0")
+            shock = dict(
+                LIQ_THIN="0", LIQ_THIN_AVAIL="1000000.0", ORACLE_SHOCK_BP="400"
+            )
+            for kind in ("old", "noop", "other"):
+                d, marker = self._tools(tmp, kind, kind)
+                # Stress cell + digest script without the capability: FATAL rc 1.
+                for env in (thin, shock):
+                    r = self._preflight(d, **env)
+                    self.assertEqual(r.returncode, 1, (kind, env, r.stdout, r.stderr))
+                    self.assertIn("FATAL", r.stderr)
+                    self.assertIn(os.path.join(d, "digest-node.sh"), r.stderr)
+                    self.assertIn("position", r.stderr)
+                    self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr)
+                # Normal cell: unchanged, the digest script is not even asked.
+                os.path.exists(marker) and os.unlink(marker)
+                r = self._preflight(d, **off)
+                self.assertEqual(
+                    (r.returncode, r.stdout), (0, "args= pos=0\n"), (kind, r.stderr)
+                )
+                self.assertFalse(os.path.exists(marker), kind)
+            # A digest script that covers positions: accepted, both cell kinds.
+            d, _ = self._tools(tmp, "new", "new")
+            r = self._preflight(d, **thin)
+            self.assertEqual(
+                (r.returncode, r.stdout),
+                (0, "args=--liq-thin 5 --liq-thin-avail 2.5 pos=1\n"),
+                r.stderr,
+            )
+            r = self._preflight(d, **shock)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(r.stdout.endswith(" pos=1\n"), r.stdout)
+            r = self._preflight(d, **off)
+            self.assertEqual((r.returncode, r.stdout), (0, "args= pos=0\n"), r.stderr)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_digest_capability_checked_before_launch(self):
+        at = self.src.index("digest_has_position_accounts ||")
+        self.assertLess(self.src.index('[ -x "$TOOLS_DIR/digest-node.sh" ]'), at)
+        self.assertLess(at, self.src.index('mkdir -p "$OUT"'))
+
+    def test_stress_cell_with_an_older_worktree_digest_fails_preflight(self):
+        tmp = tempfile.mkdtemp(prefix="liq-olddig-")
+        try:
+            fake_target(
+                tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N> --shock-bp <BP>"
+            )
+            script, wt = sandbox_repo(tmp)
+            tools = os.path.join(wt, "tools", "matched-bench")
+            # A summarizer that passes its own check, so only the digest
+            # script (the sandbox stub: no capabilities) can refuse the cell.
+            with open(os.path.join(tools, "summarize.py"), "w") as f:
+                f.write(self.NEW_SUMMARIZER)
+            base = {
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith(("LIQ_", "ORACLE_", "TOOLS_"))
+            }
+            for env in (
+                dict(LIQ_THIN="5", SENDERS="5"),
+                dict(ORACLE_FEED="1", ORACLE_SHOCK_BP="400", ORACLE_SHOCK_ROUND="30"),
+            ):
+                r = subprocess.run(
+                    [script, wt, "liq-olddig-x"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=dict(
+                        base,
+                        TARGET_DIR=tmp,
+                        RESULTS_ROOT=tmp,
+                        DATA_ROOT=tmp,
+                        BENCH_ALLOW_UNDETACHED="1",
+                        **env,
+                    ),
+                )
+                self.assertEqual(r.returncode, 1, (env, r.stdout, r.stderr))
+                self.assertIn(os.path.join(tools, "digest-node.sh"), r.stderr, env)
+                self.assertIn("TOOLS_FROM_WORKTREE=0", r.stderr, env)
+                self.assertFalse(
+                    os.path.exists(os.path.join(tmp, "liq-olddig-x")),
+                    "must fail before any launch",
+                )
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_digest_log_claims_positions_only_when_covered(self):
+        on = self.fn("liq_stress_on() {", "\n}\n")
+        block = self.fn("DIG_POS=()\nif liq_stress_on; then", "\nfi\n")
+        tmp = tempfile.mkdtemp(prefix="liq-diglog-")
+        try:
+            script = (
+                'log() { echo "$*" >&2; }\nLIQUIDATOR_VAULT=0x1\nADL_ESCROW_LONG=0x2\n'
+                "ADL_ESCROW_SHORT=0x3\nMARKETS=4\nOUT=%s\n" % tmp
+                + on
+                + block
+            )
+            stress = dict(LIQ_THIN="5", ORACLE_SHOCK_BP="0")
+            r = self._run(script, DIGEST_HAS_POS="1", **stress)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("positions in all 4 markets", r.stderr)
+            for has in ("0", ""):
+                r = self._run(script, DIGEST_HAS_POS=has, **stress)
+                self.assertNotIn("positions in all", r.stderr, has)
+                self.assertIn("NOT", r.stderr, has)
+            r = self._run(script, DIGEST_HAS_POS="1", LIQ_THIN="0", ORACLE_SHOCK_BP="0")
+            self.assertEqual((r.returncode, r.stderr), (0, ""))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_summary_records_liq_thin(self):
+        d = tempfile.mkdtemp(prefix="liq-sum-")
+        try:
+            write_cell(d, 1000, 1000)
+            write_agreement(d, ["same"] * 3)
+            s, _ = run_summarize(d)
+            self.assertEqual(
+                (s["cell"]["liq_thin"], s["cell"]["liq_thin_avail"]), (0, None)
+            )
+            s, _ = run_summarize(
+                d, extra=("--liq-thin", "200", "--liq-thin-avail", "1000000.0")
+            )
+            self.assertEqual(
+                (s["cell"]["liq_thin"], s["cell"]["liq_thin_avail"]), (200, "1000000.0")
+            )
+        finally:
+            shutil.rmtree(d)
+        self.assertIn(
+            '--liq-thin "$LIQ_THIN" --liq-thin-avail "$LIQ_THIN_AVAIL"', self.src
+        )
 
 
 # ----------------------------------- cells run detached from the caller's shell
