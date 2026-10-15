@@ -8669,8 +8669,12 @@ impl NativeExecutor {
                 })
             };
 
-            let chunks =
-                crate::market_workers::MarketWorkerPool::chunk_indices(&weights, max_workers);
+            // s58: `TORUS_EXEC_POOL_GRAIN=K` makes K x cap chunks (cap >= 2
+            // only; cap 1 stays the inline serial path below).
+            let chunks = crate::market_workers::MarketWorkerPool::chunk_indices(
+                &weights,
+                crate::market_workers::grain_chunk_cap(max_workers),
+            );
 
             if chunks.len() <= 1 {
                 // One worker (cap 1, or a single market): no scope, no spawn.
