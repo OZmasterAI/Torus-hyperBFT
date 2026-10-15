@@ -19,19 +19,20 @@ use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
-use torus_consensus::{NativeDaFetcher, RocksKVStore, TorusApp};
+use torus_consensus::{NativeDaFetcher, TorusApp};
 use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
 use torus_rpc::{find_latest_height, BlockNotifier, RpcServer};
 use torus_state::cf::CF_BLOCK_HEADERS;
-use torus_state::{NativeDaStore, PrunerConfig, StateDb, StatePruner};
+use torus_state::{PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
 mod allocator;
 mod forward_batcher;
 mod keystore;
+mod node_dbs;
 
 // Process allocator (default feature `jemalloc`, Linux): jemalloc for the Rust
 // heap and, unprefixed, for C/C++ malloc (RocksDB). Only this binary; the
@@ -620,10 +621,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // 3. Open StateDb
-    std::fs::create_dir_all(&cli.data_dir)?;
-    let state_db = StateDb::open(&cli.data_dir)?;
-    info!("state database opened");
+    // 3. Open the state DB and (section 71.8 option A) the consensus DB at
+    // <data_dir>/consensus-db: all HotStuff store traffic and the DA store,
+    // with their own WAL and write queue. Refuses an old-layout data dir.
+    let dbs = node_dbs::open_node_dbs(&cli.data_dir)?;
+    let state_db = dbs.state.clone();
+    info!(
+        consensus_db = %torus_state::consensus_db_path(&cli.data_dir).display(),
+        "state database and consensus database (HotStuff + DA store) opened"
+    );
 
     // 4. Genesis initialization
     let mut chain_config = if let Some(genesis_path) = &cli.genesis {
@@ -639,8 +645,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Initialize hotstuff_rs replica
             let (app_state, vs_state) = genesis.to_hotstuff_genesis()?;
-            let init_kv = RocksKVStore::new(state_db.db_arc());
-            Replica::initialize(init_kv, app_state, vs_state);
+            Replica::initialize(dbs.kv_store(), app_state, vs_state);
             info!("consensus replica initialized with genesis validator set");
         } else {
             info!("database already initialized, skipping genesis");
@@ -692,7 +697,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         cancel_block_share_pct = mempool_config.native_cancel_block_share_pct,
         "native pool: cancels take at most this share of a selected block ahead of orders (TORUS_CANCEL_BLOCK_SHARE_PCT, 100 = old cancel priority; proposer-local)"
     );
-    let mempool = Arc::new(Mempool::new(state_db.clone(), mempool_config));
+    let mempool = Arc::new(Mempool::with_da_store(
+        state_db.clone(),
+        dbs.da_store(),
+        mempool_config,
+    ));
     // r4: log the effective native block-selection bundle + direct-push floor
     // once at startup so a bench/ops snapshot (`nodeenv-*.txt`, journal) shows
     // the caps this proposer actually runs. All of these are proposer-local
@@ -743,7 +752,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(mempool.clone()),
         signing_key_for_app,
     )?;
-    let kv_store = RocksKVStore::new(state_db.db_arc()).with_metrics(metrics.clone());
+    let kv_store = dbs.kv_store().with_metrics(metrics.clone());
 
     // EVM executor
     let executor = Arc::new(EvmExecutor::new(chain_config.chain_id));
@@ -783,7 +792,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     // Attach the durable DA store so the swarm can SERVE native-action bodies
     // by-hash on /torus/native-da/1.0 (Phase C Task 5 — RARE pull-fallback).
-    network.set_native_da_store(NativeDaStore::new(state_db.clone()));
+    network.set_native_da_store(dbs.da_store());
     // Wire the erasure-shard recovery pull to the network (T8-integration inc 3):
     // an ADDITIVE pre-step to the whole-body pull — on a reconstruction miss it
     // gathers erasure shards spread across DISTINCT peers before the single-source
@@ -1355,27 +1364,36 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let data_dir = cli.data_dir.clone();
         let m = metrics.clone();
         let db = state_db.db_arc();
+        let consensus_db = dbs.consensus.db_arc();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 let size = torus_state::dir_size_bytes(&data_dir);
                 m.db_size_bytes.set(size as i64);
-                for cf_name in torus_state::cf::ALL_CF_NAMES {
-                    let Some(cf) = db.cf_handle(cf_name) else {
-                        continue;
-                    };
-                    let label = vec![("cf".to_string(), (*cf_name).to_string())];
-                    for (prop, fam) in [
-                        ("rocksdb.num-files-at-level0", &m.rocksdb_l0_files),
-                        ("rocksdb.cur-size-all-mem-tables", &m.rocksdb_memtable_bytes),
-                        (
-                            "rocksdb.estimate-pending-compaction-bytes",
-                            &m.rocksdb_pending_compaction_bytes,
-                        ),
-                    ] {
-                        if let Ok(Some(v)) = db.property_int_value_cf(cf, prop) {
-                            fam.get_or_create(&label).set(v as i64);
+                // Section 71.8 option A: the consensus DB's CFs carry a
+                // `db="consensus"` label (its cf_consensus_meta would
+                // otherwise collide with the state DB's).
+                for (cf_db, db_label) in [(&db, None), (&consensus_db, Some("consensus"))] {
+                    for cf_name in torus_state::cf::ALL_CF_NAMES {
+                        let Some(cf) = cf_db.cf_handle(cf_name) else {
+                            continue;
+                        };
+                        let mut label = vec![("cf".to_string(), (*cf_name).to_string())];
+                        if let Some(l) = db_label {
+                            label.push(("db".to_string(), l.to_string()));
+                        }
+                        for (prop, fam) in [
+                            ("rocksdb.num-files-at-level0", &m.rocksdb_l0_files),
+                            ("rocksdb.cur-size-all-mem-tables", &m.rocksdb_memtable_bytes),
+                            (
+                                "rocksdb.estimate-pending-compaction-bytes",
+                                &m.rocksdb_pending_compaction_bytes,
+                            ),
+                        ] {
+                            if let Ok(Some(v)) = cf_db.property_int_value_cf(cf, prop) {
+                                fam.get_or_create(&label).set(v as i64);
+                            }
                         }
                     }
                 }
@@ -1393,6 +1411,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     {
         let m = metrics.clone();
         let sdb = state_db.clone();
+        let cdb = dbs.consensus.clone();
         let every = rocksdb_stats_interval_secs(std::env::var("TORUS_ROCKSDB_STATS_INTERVAL_SECS").ok());
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(every));
@@ -1400,6 +1419,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 interval.tick().await;
                 let snap = sdb.runtime_stats();
                 publish_rocksdb_stats(&m.rocksdb, &snap);
+                // Section 71.8 option A: the consensus DB, as torus_rocksdb_consensus_*.
+                publish_rocksdb_stats(&m.rocksdb_consensus, &cdb.runtime_stats());
             }
         });
     }
@@ -1446,11 +1467,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     let limit = shutdown_timeout(std::env::var("TORUS_SHUTDOWN_TIMEOUT_SECS").ok());
     let started = std::time::Instant::now();
-    let db = state_db.clone();
     let stop = move || {
         drop(replica);
         info!("consensus stopped, execution queue drained");
-        flush_for_shutdown(&db)?;
+        flush_for_shutdown(&dbs)?;
         info!("memtables flushed, WAL synced");
         Ok(())
     };
@@ -1661,19 +1681,26 @@ async fn bounded_stop(
 
 /// Flush every column family's memtables to SST and fsync the WAL, so a
 /// restart does not replay the WAL. Run after consensus and execution stop.
-fn flush_for_shutdown(state_db: &StateDb) -> Result<(), String> {
-    let db = state_db.db_arc();
+/// Covers both DBs (section 71.8 option A): the consensus DB's CFs are
+/// flushed first, and the state DB's `sync_wal` syncs the consensus DB's
+/// WAL (its attached peer) before its own.
+fn flush_for_shutdown(dbs: &node_dbs::NodeDbs) -> Result<(), String> {
     flush_then_sync(
         || {
-            for cf_name in torus_state::cf::ALL_CF_NAMES {
-                if let Some(cf) = db.cf_handle(cf_name) {
-                    db.flush_cf(cf)
-                        .map_err(|e| format!("flush {cf_name}: {e}"))?;
+            for (db, what) in [
+                (dbs.consensus.db_arc(), "consensus DB "),
+                (dbs.state.db_arc(), ""),
+            ] {
+                for cf_name in torus_state::cf::ALL_CF_NAMES {
+                    if let Some(cf) = db.cf_handle(cf_name) {
+                        db.flush_cf(cf)
+                            .map_err(|e| format!("flush {what}{cf_name}: {e}"))?;
+                    }
                 }
             }
             Ok(())
         },
-        || state_db.sync_wal().map_err(|e| e.to_string()),
+        || dbs.state.sync_wal().map_err(|e| e.to_string()),
     )
 }
 
@@ -1881,6 +1908,44 @@ mod tests {
         let err = res.unwrap_err();
         assert!(err.contains('f') && err.contains('s'), "{err}");
         assert_eq!(flush_then_sync(|| Ok(()), || Ok(())), Ok(()));
+    }
+
+    /// Section 71.8 option A: the graceful stop flushes the consensus DB's
+    /// memtables as well as the state DB's, and syncs both WALs, so a
+    /// restart replays neither.
+    #[test]
+    fn shutdown_flush_covers_the_consensus_db() {
+        use torus_state::cf::{ALL_CF_NAMES, CF_CONSENSUS_META, CF_NATIVE_PENDING};
+        let dir = tempfile::tempdir().unwrap();
+        let dbs = node_dbs::open_node_dbs(dir.path()).unwrap();
+        dbs.state
+            .put_cf_raw(CF_BLOCK_HEADERS, &1u64.to_be_bytes(), b"hdr")
+            .unwrap();
+        dbs.consensus
+            .put_cf_raw(CF_CONSENSUS_META, &[9], b"pc")
+            .unwrap();
+        dbs.consensus
+            .put_cf_raw(CF_NATIVE_PENDING, &[1u8; 32], b"body")
+            .unwrap();
+        let state_syncs = dbs.state.wal_sync_count().unwrap();
+        let consensus_syncs = dbs.consensus.wal_sync_count().unwrap();
+        flush_for_shutdown(&dbs).unwrap();
+        for (db, cfs) in [
+            (&dbs.state, &ALL_CF_NAMES[..]),
+            (&dbs.consensus, &torus_state::CONSENSUS_DB_CFS[..]),
+        ] {
+            for cf in cfs {
+                let h = db.cf_handle(cf).unwrap();
+                let live = db
+                    .inner()
+                    .property_int_value_cf(h, "rocksdb.num-entries-active-mem-table")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(live, 0, "{cf} memtable not flushed at shutdown");
+            }
+        }
+        assert!(dbs.state.wal_sync_count().unwrap() > state_syncs);
+        assert!(dbs.consensus.wal_sync_count().unwrap() > consensus_syncs);
     }
 
     /// Codex P2: a second SIGTERM that arrives while the first is being

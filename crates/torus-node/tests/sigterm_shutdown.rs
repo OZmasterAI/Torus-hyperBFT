@@ -372,6 +372,117 @@ fn sigterm_with_checkpoints_restarts_with_zero_replay() {
     assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
 }
 
+/// Section 71.8 option A on the real binary: after a run (15 s checkpoints,
+/// so the applied marker is written by the final checkpoint batch), the
+/// HotStuff state is in `<data>/consensus-db` and not in the state DB, and the
+/// checkpoint's state meta key is in the state DB and not in the consensus
+/// DB. A restart resumes from that HotStuff state: no genesis re-init, the
+/// chain grows, and the highest voted view does not go backwards.
+#[test]
+fn hotstuff_state_lives_in_the_consensus_db_and_restart_resumes_from_it() {
+    use hotstuff_rs::block_tree::variables::{
+        APP_FED_BLOCK_HEIGHT, COMMITTED_VALIDATOR_SET, HIGHEST_COMMITTED_BLOCK,
+        HIGHEST_VIEW_PHASE_VOTED,
+    };
+    use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+    const CKPT: &[(&str, &str)] = &[("TORUS_CHECKPOINT_INTERVAL_MS", "15000")];
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis(work.path());
+    let data = work.path().join("data");
+    let voted_view = |cdb: &StateDb| -> u64 {
+        let raw = cdb
+            .get_cf_raw(CF_CONSENSUS_META, &HIGHEST_VIEW_PHASE_VOTED)
+            .unwrap()
+            .expect("the validator voted");
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+
+    let mut node = Node::start_env(work.path(), &genesis, "a", CKPT);
+    node.wait_executed_above(MIN_BLOCKS);
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
+    let executed = node.executed_height().unwrap();
+    drop(node);
+    let voted = {
+        let state = StateDb::open(&data).unwrap();
+        let cdb = StateDb::open_consensus(&torus_state::consensus_db_path(&data)).unwrap();
+        for key in [
+            COMMITTED_VALIDATOR_SET,
+            HIGHEST_COMMITTED_BLOCK,
+            HIGHEST_VIEW_PHASE_VOTED,
+            APP_FED_BLOCK_HEIGHT,
+        ] {
+            assert!(
+                cdb.get_cf_raw(CF_CONSENSUS_META, &key).unwrap().is_some(),
+                "HotStuff key {key:?} missing in consensus-db"
+            );
+            assert!(
+                state.get_cf_raw(CF_CONSENSUS_META, &key).unwrap().is_none(),
+                "HotStuff key {key:?} found in the state DB"
+            );
+        }
+        assert!(
+            state
+                .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .unwrap()
+                .is_some(),
+            "applied marker missing in the state DB"
+        );
+        assert!(
+            cdb.get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .unwrap()
+                .is_none(),
+            "applied marker found in consensus-db"
+        );
+        voted_view(&cdb)
+    };
+    assert_eq!(durable_marker(&data), executed);
+
+    let mut node = Node::start_env(work.path(), &genesis, "b", CKPT);
+    node.wait_executed_above(executed);
+    assert!(
+        !node.log_text().contains("initializing from genesis"),
+        "restart re-ran genesis:\n{}",
+        node.tail()
+    );
+    assert_graceful_stop(&mut node, libc::SIGTERM, "SIGTERM");
+    drop(node);
+    let cdb = StateDb::open_consensus(&torus_state::consensus_db_path(&data)).unwrap();
+    assert!(
+        voted_view(&cdb) > voted,
+        "highest voted view did not advance from the restored vote state"
+    );
+}
+
+/// Section 71.8 option A, restart rule on the real binary: an old-layout
+/// data dir (HotStuff state in the state DB) is refused with a clear error
+/// and a non-zero exit, and `consensus-db` is not created.
+#[test]
+fn old_layout_data_dir_refuses_to_start() {
+    use hotstuff_rs::block_tree::variables::COMMITTED_VALIDATOR_SET;
+    use torus_state::cf::CF_CONSENSUS_META;
+    let work = tempfile::tempdir().unwrap();
+    let genesis = write_genesis(work.path());
+    let data = work.path().join("data");
+    {
+        let db = StateDb::open(&data).unwrap();
+        db.put_cf_raw(CF_CONSENSUS_META, &COMMITTED_VALIDATOR_SET, b"old-layout")
+            .unwrap();
+    }
+    let mut node = Node::start(work.path(), &genesis, "old");
+    let (status, _) = node.wait_exit(STOP_BOUND);
+    let log = node.log_text();
+    assert!(!status.success(), "old layout started:\n{}", node.tail());
+    assert!(
+        log.contains("refusing to start") && log.contains("before section 71.8 option A"),
+        "no clear old-layout error:\n{}",
+        node.tail()
+    );
+    assert!(
+        !data.join("consensus-db").exists(),
+        "old-layout dir was changed"
+    );
+}
+
 /// Item 6 Phase 3 step 6: the compiled default. A validator started with
 /// `TORUS_CHECKPOINT_INTERVAL_MS` unset runs coalesced checkpoints every 15 s
 /// (the gate's interval); before step 6 unset meant the per-block flush.
