@@ -17,6 +17,8 @@
 #   CELL_STEP_ANALYSIS_METRIC   the row's matched/s field (a-cells.py: ms); unset = metric from summary.json
 #   CELL_STEP_LOG               campaign log for CELL-FLAG lines (default RUN_DIR/campaign.log)
 #   CELL_STEP_PY                cell_step.py path (default: next to this file)
+#   CELL_STEP_SUMMARY_MD5       0 = do not check summary.json torus_node_md5 (--no-summary-md5): the staged file is a
+#                               wrapper script; the running-exe md5 records are checked as always (default 1)
 #
 # EXTRA_REASONS (optional, comma-separated, e.g. "check"): the campaign's own failures of this cell (a failed hard
 # check, a STOP site). They make the row bad:<reasons> (CELL-FLAG + rerun) even when the run itself was clean.
@@ -47,6 +49,7 @@ cell_step() { # RUN_DIR CELL_DIR LABEL TAG ARM REP STAGED_MD5 SPEC [EXTRA_REASON
     [ -n "${CELL_STEP_ANALYSIS_KEY:-}" ] && a+=(--analysis-key "$CELL_STEP_ANALYSIS_KEY")
     [ -n "${CELL_STEP_ANALYSIS_METRIC:-}" ] && a+=(--analysis-metric "$CELL_STEP_ANALYSIS_METRIC")
     [ -n "${CELL_STEP_LOG:-}" ] && a+=(--campaign-log "$CELL_STEP_LOG")
+    [ "${CELL_STEP_SUMMARY_MD5:-1}" = 0 ] && a+=(--no-summary-md5)
     xr=$(printf '%s' "$xr" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9,]+/-/g; s/(^|,)-+/\1/g; s/-+(,|$)/\1/g; s/,+/,/g; s/^,//; s/,$//')
     [ -n "$xr" ] && { a+=(--extra-reasons "$xr"); pre=$xr,; }
     timeout -k 15 "$t" python3 -I "$CELL_STEP_PY" "${a[@]}" < /dev/null
