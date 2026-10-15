@@ -120,7 +120,8 @@ executed state.
    tops out at 30M (HL's size), so growing to it takes a vote, not a release; D1 sets the actual values.
 3. bbo (and any new read precompile) uses our existing metering: 16,400 base + 500 per row read + 20 per 32-byte word,
    priced to our measured RocksDB read cost (~7 ns/gas cold). **HL alternative kept for the future:**
-   `2000 + 65 * (input_len + output_len)` (a bbo call: ~8,500 gas vs ~16,940 with ours). Switch only if our read
+   `2000 + 65 * (input_len + output_len)` (a bbo call: ~8,240 gas vs 16,440 with ours; owner s125: the row is
+   priced like the other point readers, inside the base). Switch only if our read
    cost falls (e.g. resident rows) enough that HL's flat price no longer under-prices the exec thread's time.
 4. CoreWriter: **D2**, order actions and vault transfers wait K = 10 blocks (~3 s at 3.2 blocks/s; genesis value plus
    governance key), everything else keeps block + 1; a per-block drain cap of 200 moves any excess to the next block.

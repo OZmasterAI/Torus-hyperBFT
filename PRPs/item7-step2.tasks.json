@@ -133,7 +133,7 @@
     },
     {
       "id": "B17",
-      "name": "bbo read precompile at 0x080e: bbo(bytes32) -> (uint128 bid, uint128 ask), 16,940 gas, reader address checks widened",
+      "name": "bbo read precompile at 0x080e: bbo(bytes32) -> (uint128 bid, uint128 ask), 16,440 gas, reader address checks widened",
       "status": "pending",
       "files": ["crates/torus-core/src/precompiles.rs", "crates/torus-core/tests/precompile_tests.rs", "crates/torus-evm/tests/evm_tests.rs"],
       "validate": "$L cargo nextest run $P $F -E 'test(bbo_)'",

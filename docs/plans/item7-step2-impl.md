@@ -95,7 +95,7 @@ questions.
   `OrderBook::saved_bbo` skips the put when the top of the book did not move; safe because the CF is unhashed (a cold
   node's extra put writes the same bytes). Written for every dirty market in `save_order_books` and
   `save_order_books_deferred`, every book mode. Precompile 0x080e `bbo(bytes32) -> (uint128 bid, uint128 ask)`:
-  16,400 base + 500 (the row) + 2 x 20 (two words) = 16,940 gas, the number in decision 3.
+  16,400 base (the point read included, like `getPrice`) + 2 x 20 (two words) = 16,440 gas (owner s125, open question 1).
 - **RPC (design item 7):** `eth_call` / `eth_estimateGas` run in the caller's lane (limit and base fee);
   `eth_gasPrice` = small lane; `torus_bigBlockGasPrice`; `eth_feeHistory` optional 4th param `blockType`
   (`"small"` default, `"big"`); `torus_usingBigBlocks(address)`; `eth_getBlockByNumber` `gasLimit` = the height's cap.
@@ -131,7 +131,7 @@ questions.
    drains more than 200 rows; the excess drains in the next block, in queue order, also with the pipeline and a
    checkpoint interval on.
 9. After every block, `cf_native_bbo` holds (best bid, best ask) for every market whose book changed, in all four
-   book modes and both save paths. `bbo(bytes32)` at 0x080e returns it for exactly 16,940 gas, also in `eth_call`.
+   book modes and both save paths. `bbo(bytes32)` at 0x080e returns it for exactly 16,440 gas, also in `eth_call`.
 10. `eth_call` / `eth_estimateGas` use the caller's lane limit and fee; `torus_bigBlockGasPrice`, `eth_feeHistory`
     with `blockType`, `torus_usingBigBlocks` answer; `gasLimit` is the height's cap.
 11. The o5 test shows the worst compact proposal at a big height fits the 1 MiB consensus accept gate.
@@ -1814,8 +1814,8 @@ error, or a wrong value). Tests never rely on the default N or M.
     wrong length -> an error, never zeros) and `bbo_is_a_reader_at_0x080e` (`is_precompile`, `is_reader_precompile`,
     `precompile_gas == GAS_PRECOMPILE_READ`, `ALL_PRECOMPILE_ADDRESSES` holds it, `execute_precompile_metered` with
     `read_only = true` succeeds).
-  - `evm_tests.rs`, `bbo_call_costs_exactly_16940_gas`: a tx calling 0x080e with `bbo(bytes32)` for a market with a
-    row succeeds with `gas_used == intrinsic + 16_940` (intrinsic as in
+  - `evm_tests.rs`, `bbo_call_costs_exactly_16440_gas`: a tx calling 0x080e with `bbo(bytes32)` for a market with a
+    row succeeds with `gas_used == intrinsic + 16_440` (intrinsic as in
     `removed_get_open_orders_reverts_for_exactly_the_base` ~618) and returns the row's prices.
 - **Implementation** (`torus-core/src/precompiles.rs`): `pub const ADDR_BBO_READER: u16 = 0x080e;` (36);
   `precompile_gas` (215) `0x0800..=0x0803 | ADDR_BBO_READER => GAS_PRECOMPILE_READ`; `ALL_PRECOMPILE_ADDRESSES`
@@ -1829,15 +1829,14 @@ error, or a wrong value). Tests never rely on the default N or M.
 
   /// `bbo(bytes32 marketId) -> (uint128 bid, uint128 ask)`: the market's best bid and ask as of the
   /// last block that changed its book (`cf_native_bbo`), 0 for an empty side or an unknown market.
-  /// Owner decision 3, our metering: the base, the row like a scanned row, two words:
-  /// 16,400 + 500 + 2 x 20 = 16,940 gas.
+  /// Owner decision 3, our metering, priced like the other point readers (the point read is in the
+  /// base, owner s125): 16,400 + 2 x 20 = 16,440 gas.
   fn bbo_reader(input: &[u8], state_db: &impl StateBackend, meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
       let sel = abi::selector(input)?;
       if sel != selector_for("bbo(bytes32)") {
           return Err(CoreError::UnknownSelector(sel));
       }
       let market_id = abi::decode_market_id(&abi::word(input, 0)?);
-      meter.charge_rows(1)?;
       let (bid, ask) = match state_db.get_cf_raw(CF_NATIVE_BBO, &market_id.to_be_bytes())? {
           None => (0i128, 0i128),
           Some(r) if r.len() == 32 => (
@@ -1930,7 +1929,7 @@ error, or a wrong value). Tests never rely on the default N or M.
   (decision 6), CoreWriter delay and cap, the bbo precompile, routing (re-send, upcoming N, in-flight filter), the RPC
   methods, and the limit `TORUS_NATIVE_TOTAL_BLOCK_CAP` <= 7,203 while big blocks are on.
   `docs/api/corewriter-results.md` (line 46: the rows of block N come from N - 1, N - K and full earlier targets).
-  `docs/perf/read-precompile-gas.md` and `docs/api/read-limits.md`: bbo at 0x080e, 16,940 gas. Status lines of
+  `docs/perf/read-precompile-gas.md` and `docs/api/read-limits.md`: bbo at 0x080e, 16,440 gas. Status lines of
   `docs/plans/item7-evm-lanes.md` and `docs/plans/item7-step2-design.md`.
 - **Verify:** the Verification block below.
 - **Depends on:** B1-B18
@@ -2028,13 +2027,16 @@ is not built either. No conflict blocks step 2, which lands first. Phase 5 must 
    25f7770c). If item 7 step 3 or Phase 5 ever pipelines EVM blocks, it must read through the overlay.
 Phase 5's step 0 re-profile will then include the bbo writes.
 
-## Open questions (owner)
+## Open questions (owner): answered s125
+
+Owner s125: 1 = 16,440; 2-9 = the plan's answer as written; M stays 0 at genesis (decision 1).
 
 1. **bbo gas.** Decision 3 says ~16,940 (the row charged like a scanned row); our point readers (`getPrice`,
-   `getPosition`) pay their point read inside the 16,400 base, which would give 16,440. Plan: 16,940
-   (`meter.charge_rows(1)` in B17; 16,440 = delete that line).
+   `getPosition`) pay their point read inside the 16,400 base, which would give 16,440. Plan was 16,940
+   (`meter.charge_rows(1)` in B17). **Owner s125: 16,440** (the line is deleted from B17).
 2. **bbo call shape.** Plan: our convention, `bbo(bytes32 marketId) -> (uint128 bid, uint128 ask)` (FixedPoint raw, 0
-   = empty side). HL's 0x080e takes `abi.encode(uint32 asset)` with no selector and returns uint64 prices; HL
+   = empty side). HL's 0x080e takes `abi.encode(uint64 asset)` with no selector and returns `(uint64 bid, uint64 ask)` (hyper-evm-lib
+   PrecompileLib, checked s125); HL
    contracts need porting either way (ids and price units differ).
 3. **"Order actions and vault transfers".** Plan: `PlaceOrder` and all three cancels wait K (one delay, so a
    contract's cancel cannot overtake its order). Torus has no vault kind; lockbox deposit and withdraw (HL's spot send
