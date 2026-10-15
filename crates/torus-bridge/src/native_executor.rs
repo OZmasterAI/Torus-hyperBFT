@@ -712,6 +712,111 @@ struct PrepPass {
     excess_im: FixedPoint,
 }
 
+/// s58 (perf experiment sell-top-up-stitch-list; node-local, default off):
+/// `TORUS_FAST_SELL_TOP_UPS=1` takes the B-blind top-ups from a candidate
+/// list the Phase-2 stitch records ([`NativeExecutor::sell_top_ups_fast`])
+/// instead of a scan of every prepared order, with a per-sender run cache,
+/// and batches the s92 counter loop
+/// ([`NativeExecutor::record_margin_cuts_batched`]). State and counters are
+/// identical either way. Pure parse: only a trimmed `"1"` enables.
+fn parse_fast_sell_top_ups(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+thread_local! {
+    /// s58: this thread's pin of [`fast_sell_top_ups_enabled`]
+    /// ([`with_fast_sell_top_ups`]); `None` = the env.
+    static FAST_SELL_TOP_UPS_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// s58 (tests): calls on this thread of `sell_top_ups_fast` (`.0`) and
+    /// of the batched s92 counter loop (`.1`).
+    static FAST_TOP_UP_PATHS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// s58: runs `f` with `TORUS_FAST_SELL_TOP_UPS` pinned to `on` on this
+/// thread (the env is ignored; the previous pin comes back after `f`, also
+/// on unwind). Not an API: the flag-on vs flag-off differential tests.
+#[doc(hidden)]
+pub fn with_fast_sell_top_ups<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FAST_SELL_TOP_UPS_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FAST_SELL_TOP_UPS_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// s58: whether an `execute_batch` call takes the fast top-ups (read once
+/// per call): this thread's pin, else `TORUS_FAST_SELL_TOP_UPS` (read once
+/// per process, logged once).
+fn fast_sell_top_ups_enabled() -> bool {
+    if let Some(on) = FAST_SELL_TOP_UPS_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = parse_fast_sell_top_ups(std::env::var("TORUS_FAST_SELL_TOP_UPS").ok());
+        tracing::info!(
+            enabled = on,
+            "TORUS_FAST_SELL_TOP_UPS (s58): B-blind top-ups from the stitch list"
+        );
+        on
+    })
+}
+
+/// s58: one B-blind top-up candidate ([`PreparedOrder::top_up_candidate`])
+/// as the Phase-2 stitch records it ([`TopUpCand::record`]): the top-up
+/// pass needs no scan, and no load from the (cold) prepared order before a
+/// grant stores to it.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct TopUpCand {
+    /// Flat batch index ([`PreparedOrder::index`]).
+    index: usize,
+    market: MarketId,
+    /// Position in its market's prepared batch.
+    k: usize,
+    sender: Address,
+    /// `margin_reserved` at the push (Phase 2's reservation).
+    reserved: FixedPoint,
+    /// The Phase-2 reservation quantity (`prepare_one`'s basis rule).
+    res_qty: FixedPoint,
+}
+
+impl TopUpCand {
+    /// Pushes `stitched` ([`NativeExecutor::stitch_outcome`]'s return for
+    /// the PlaceOrder at flat index `i`) when the list is on (`Some`).
+    /// The stitch runs in flat order, so the list is in flat order.
+    #[inline]
+    fn record(
+        cands: &mut Option<Vec<TopUpCand>>,
+        stitched: Option<(usize, FixedPoint)>,
+        i: usize,
+        sender: &Address,
+        params: &PlaceOrderParams,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+    ) {
+        if let (Some(c), Some((k, reserved))) = (cands.as_mut(), stitched) {
+            c.push(TopUpCand {
+                index: i,
+                market: params.market_id,
+                k,
+                sender: *sender,
+                reserved,
+                res_qty: basis.get(&i).map_or(params.quantity, |b| b.1),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "sell_top_up_stitch_tests.rs"]
+mod sell_top_up_stitch_tests;
+
 /// Open-order count work (trader probes + stops) per worker thread: below
 /// 2x this the count stays on the exec thread. Every count a 300-market block
 /// can carry (at most 400 senders x 300 books = 120k probes) stays serial:
@@ -7502,6 +7607,12 @@ impl NativeExecutor {
             }
         }
 
+        // s58 (`TORUS_FAST_SELL_TOP_UPS=1`, read once per call): the stitch
+        // records the B-blind top-up candidates, in flat order, for
+        // `sell_top_ups_fast`. Off: nothing is recorded (`None`).
+        let fast_top_ups = fast_sell_top_ups_enabled();
+        let mut top_up_cands: Option<Vec<TopUpCand>> =
+            fast_top_ups.then(|| Vec::with_capacity(place_order_indices.len()));
         if let Some(mut outcomes) = prep_outcomes {
             // Serial stitch in flat order: ids go to passing orders exactly
             // as the serial loop assigns them.
@@ -7513,7 +7624,7 @@ impl NativeExecutor {
                 let Some(outcome) = outcomes[i].take() else {
                     unreachable!("every place index has a worker outcome");
                 };
-                Self::stitch_outcome(
+                let stitched = Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
                     &markets,
@@ -7524,6 +7635,7 @@ impl NativeExecutor {
                     params,
                     outcome,
                 );
+                TopUpCand::record(&mut top_up_cands, stitched, i, sender, params, &basis);
             }
         } else {
             // L3-ENG: the serial loop runs literally the sharded workers'
@@ -7546,7 +7658,7 @@ impl NativeExecutor {
                     params,
                     split_margin_label,
                 );
-                Self::stitch_outcome(
+                let stitched = Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
                     &markets,
@@ -7557,6 +7669,7 @@ impl NativeExecutor {
                     params,
                     outcome,
                 );
+                TopUpCand::record(&mut top_up_cands, stitched, i, sender, params, &basis);
             }
             fold_out = Some(fold.finish());
         }
@@ -7574,18 +7687,32 @@ impl NativeExecutor {
         // need comes off their sender's pool (exact integer sum, the fold's
         // `excess_unchecked`).
         // B-blind (s92): top-ups come off what is left for the pools, so
-        // they run before the pools are read.
-        let [full, partial, none] = Self::sell_top_ups(
-            &ctx.positions,
-            ctx.typed_rows(),
-            &ctx.reader_fault,
-            &markets,
-            &basis,
-            &pool_takers,
-            &excess_by_sender,
-            &mut market_batches,
-            &mut bal_cache,
-        );
+        // they run before the pools are read. s58: from the stitch's list
+        // when it was recorded (nothing touched the batches since).
+        let [full, partial, none] = match top_up_cands {
+            Some(cands) => Self::sell_top_ups_fast(
+                &ctx.positions,
+                ctx.typed_rows(),
+                &ctx.reader_fault,
+                &markets,
+                &pool_takers,
+                &excess_by_sender,
+                &mut market_batches,
+                &mut bal_cache,
+                cands,
+            ),
+            None => Self::sell_top_ups(
+                &ctx.positions,
+                ctx.typed_rows(),
+                &ctx.reader_fault,
+                &markets,
+                &basis,
+                &pool_takers,
+                &excess_by_sender,
+                &mut market_batches,
+                &mut bal_cache,
+            ),
+        };
         ctx.phase_accum.sell_top_ups += full + partial;
         if let Some(ref m) = ctx.metrics {
             m.sell_top_ups_full.inc_by(full);
@@ -7789,8 +7916,20 @@ impl NativeExecutor {
             }
             // s92 counters (aligned with the market's prepared orders).
             if let (Some(m), Some(prepared)) = (ctx.metrics.as_deref(), market_batches.get(&mbr.market_id)) {
-                for (r, p) in mbr.results.iter().zip(prepared) {
-                    Self::record_margin_cuts(m, p.params.is_buy, &r.result, p.res_price, mbr.book.tick_size, p.top_up_candidate);
+                if fast_top_ups {
+                    // s58: the same counts, batched.
+                    Self::record_margin_cuts_batched(m, &mbr.results, prepared, mbr.book.tick_size);
+                } else {
+                    for (r, p) in mbr.results.iter().zip(prepared) {
+                        Self::record_margin_cuts(
+                            m,
+                            p.params.is_buy,
+                            &r.result,
+                            p.res_price,
+                            mbr.book.tick_size,
+                            p.top_up_candidate,
+                        );
+                    }
                 }
             }
         }
@@ -8186,6 +8325,8 @@ impl NativeExecutor {
     /// next global order id and joins its market's batch; a reject records
     /// its funnel counter (`orders_rejected_margin` vs `_other`) and error.
     /// Field-level borrows, so it coexists with an [`AccountReader`].
+    /// s58: returns a B-blind top-up candidate's position in its market's
+    /// batch and its reservation ([`TopUpCand::record`]); `None` otherwise.
     #[allow(clippy::too_many_arguments)]
     fn stitch_outcome<'a>(
         next_id: &mut u128,
@@ -8197,25 +8338,29 @@ impl NativeExecutor {
         sender: &Address,
         params: &'a PlaceOrderParams,
         outcome: PrepOutcome,
-    ) {
+    ) -> Option<(usize, FixedPoint)> {
         match outcome {
             PrepOutcome::Pass(pass) => {
                 let order_id = *next_id;
                 *next_id += 1;
-                market_batches
-                    .entry(params.market_id)
-                    .or_insert_with(|| Vec::with_capacity(markets.get(&params.market_id).map_or(0, |m| m.orders)))
-                    .push(PreparedOrder {
-                        index: i,
-                        sender: *sender,
-                        params,
-                        order_id,
-                        margin_reserved: pass.required,
-                        checked_pos_net: pass.checked_pos_net,
-                        pre_pos: pass.pre_pos,
-                        top_up_candidate: pass.top_up_candidate,
-                        res_price: pass.res_price,
-                    });
+                let batch = market_batches.entry(params.market_id).or_insert_with(|| {
+                    Vec::with_capacity(markets.get(&params.market_id).map_or(0, |m| m.orders))
+                });
+                let stitched = pass
+                    .top_up_candidate
+                    .then_some((batch.len(), pass.required));
+                batch.push(PreparedOrder {
+                    index: i,
+                    sender: *sender,
+                    params,
+                    order_id,
+                    margin_reserved: pass.required,
+                    checked_pos_net: pass.checked_pos_net,
+                    pre_pos: pass.pre_pos,
+                    top_up_candidate: pass.top_up_candidate,
+                    res_price: pass.res_price,
+                });
+                stitched
             }
             PrepOutcome::Reject { funnel, reason, msg } => {
                 // Funnel (perf A1): died pre-book.
@@ -8223,6 +8368,7 @@ impl NativeExecutor {
                     funnel.count(m, reason);
                 }
                 results[i] = NativeActionResult::rejected("place_order", (reason, msg));
+                None
             }
         }
     }
@@ -9152,6 +9298,46 @@ impl NativeExecutor {
         }
     }
 
+    /// s58 (`TORUS_FAST_SELL_TOP_UPS=1`): [`record_margin_cuts`] over one
+    /// market's book outcomes and prepared orders (zipped, as the per-order
+    /// loop), with the maker margin cancels and reduce-only cuts summed into
+    /// one `inc_by` each, and an order's (cold) `params.is_buy` read only
+    /// when its taker was cut. Leaves every counter where the per-order loop
+    /// leaves it (`sell_top_up_stitch_tests`).
+    fn record_margin_cuts_batched(
+        m: &torus_telemetry::Metrics,
+        results: &[crate::market_workers::MatchResult],
+        prepared: &[PreparedOrder<'_>],
+        tick: FixedPoint,
+    ) {
+        #[cfg(test)]
+        FAST_TOP_UP_PATHS.with(|c| c.set((c.get().0, c.get().1 + 1)));
+        let (mut cancels, mut cuts) = (0u64, 0u64);
+        for (r, p) in results.iter().zip(prepared) {
+            let result = &r.result;
+            cancels += result.margin_cancels.len() as u64;
+            cuts += result.reduce_only_cuts.len() as u64;
+            let Some(hit) = result.margin_cut_price else {
+                continue;
+            };
+            if p.params.is_buy {
+                continue;
+            }
+            let d = hit.raw().saturating_sub(p.res_price.raw());
+            let ticks = if d <= 0 {
+                0
+            } else {
+                (d - 1) / tick.raw().max(1) + 1
+            };
+            let bucket = torus_telemetry::margin_cut_tick_bucket(ticks);
+            m.sell_margin_cuts[usize::from(p.top_up_candidate)]
+                [usize::from(!result.fills.is_empty())][bucket]
+                .inc();
+        }
+        m.maker_margin_cancels.inc_by(cancels);
+        m.reduce_only_cuts.inc_by(cuts);
+    }
+
     /// A5 (maker-fill margin leak): THE reserve/release formula.
     ///
     /// Margin reserved for `qty` of a limit order at `price` in `market_id`:
@@ -9911,6 +10097,124 @@ impl NativeExecutor {
             } else {
                 counts[1] += 1;
             }
+        }
+        counts
+    }
+
+    /// s58 (`TORUS_FAST_SELL_TOP_UPS=1`): [`sell_top_ups`] from the
+    /// candidates the Phase-2 stitch recorded ([`TopUpCand`]; flat order,
+    /// which is the scan's sort) instead of a scan of every prepared order.
+    /// The top-up price is taken once per market; a candidate's reservation
+    /// and quantity come from the list, so a prepared order is only stored
+    /// to (on a grant). A run of one sender's consecutive candidates holds
+    /// one balance: loaded at the run's first candidate that needs a top-up
+    /// (the scan's reads, the same skip on a read fault, retried by the next
+    /// candidate), written back once at the run's end and only if the run
+    /// granted ([`BalanceCache::set`] marks an entry dirty once, so the
+    /// dirty flags and list are the scan's). Each grant is the scan's
+    /// expression, per candidate. Same orders, counts, cache and reader
+    /// fault as the scan (`sell_top_up_stitch_tests`).
+    #[allow(clippy::too_many_arguments)]
+    fn sell_top_ups_fast<T: StateBackend>(
+        positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
+        fault: &std::sync::OnceLock<String>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        pools: &HashMap<Address, (MarketId, FixedPoint)>,
+        excess_by_sender: &HashMap<Address, FixedPoint>,
+        market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        bal_cache: &mut BalanceCache,
+        cands: Vec<TopUpCand>,
+    ) -> [u64; 3] {
+        #[cfg(test)]
+        FAST_TOP_UP_PATHS.with(|c| c.set((c.get().0 + 1, c.get().1)));
+        debug_assert!(
+            cands.windows(2).all(|w| w[0].index < w[1].index),
+            "top-up candidates out of flat order"
+        );
+        let mut counts = [0u64; 3];
+        // Per market: (top-up price, margin config); `None` = no top-up.
+        let mut prices: HashMap<MarketId, Option<(FixedPoint, Option<&MarketMarginConfig>)>> =
+            HashMap::with_capacity_and_hasher(markets.len(), Default::default());
+        // The current run: its sender; once read, its balance, pos_net and
+        // excess; whether it granted.
+        let mut run: Option<Address> = None;
+        let mut acct: Option<(NativeBalance, FixedPoint, FixedPoint)> = None;
+        let mut granted = false;
+        for c in &cands {
+            if run != Some(c.sender) {
+                if let (true, Some(sender), Some((bal, _, _))) = (granted, run, acct.take()) {
+                    bal_cache.set(&sender, bal);
+                }
+                run = Some(c.sender);
+                granted = false;
+            }
+            let Some((price, cfg)) = *prices.entry(c.market).or_insert_with(|| {
+                markets.get(&c.market).and_then(|m| {
+                    m.bid_floor
+                        .and_then(Self::sell_top_up_price)
+                        .map(|price| (price, m.cfg))
+                })
+            }) else {
+                continue;
+            };
+            let Some(p) = market_batches
+                .get_mut(&c.market)
+                .and_then(|b| b.get_mut(c.k))
+            else {
+                continue;
+            };
+            let Ok(target) = Self::try_reserve_for_qty_cfg(cfg, price, c.res_qty) else {
+                continue;
+            };
+            let extra = target - c.reserved;
+            if extra <= FixedPoint::ZERO {
+                continue;
+            }
+            if acct.is_none() {
+                // R02: a local fault fail-stops (`fault`: the reader fault
+                // channel); no top-up meanwhile.
+                match bal_cache.load(positions, typed, &c.sender) {
+                    Ok(bal) => {
+                        let pos_net = pools.get(&c.sender).map_or(FixedPoint::ZERO, |v| v.1);
+                        let excess = excess_by_sender
+                            .get(&c.sender)
+                            .copied()
+                            .unwrap_or(FixedPoint::ZERO);
+                        acct = Some((bal, pos_net, excess));
+                    }
+                    Err(e) => {
+                        note_reader_fault(fault, "sell top-up balance read", &e);
+                        continue;
+                    }
+                }
+            }
+            let Some((bal, pos_net, excess)) = acct.as_mut() else {
+                continue;
+            };
+            let grant = extra.min(bal.available + *pos_net - *excess);
+            if grant <= FixedPoint::ZERO {
+                counts[2] += 1;
+                continue;
+            }
+            bal.available -= grant;
+            bal.order_margin += grant;
+            granted = true;
+            debug_assert_eq!(
+                (p.index, p.margin_reserved),
+                (c.index, c.reserved),
+                "stale top-up candidate"
+            );
+            p.margin_reserved = c.reserved + grant;
+            if grant == extra {
+                p.res_price = price;
+                counts[0] += 1;
+            } else {
+                counts[1] += 1;
+            }
+        }
+        if let (true, Some(sender), Some((bal, _, _))) = (granted, run, acct) {
+            bal_cache.set(&sender, bal);
         }
         counts
     }
