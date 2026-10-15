@@ -12,16 +12,12 @@
 //!      per-trader orders come from the node-local `CF_BOOK_ORDER_ROWS`.
 //!   4. Never silently empty: a layout the reader cannot decode (mixed
 //!      layouts, missing meta, split-brain node-local store) is an ERROR.
-//!   5. Precompile 0x0800 `getOrderBook` serves modes 1/2 instead of handing
-//!      an empty book to EVM contracts. The Classic arm is asserted UNCHANGED
-//!      (see `classic_precompile_behaviour_is_unchanged`).
 
 use alloy_primitives::Address;
 
 use torus_bridge::native_executor::{BookMode, NativeExecContext, NativeExecutor};
 use torus_core::book_reader::{self, BookLayout};
 use torus_core::position::NativeBalance;
-use torus_core::precompiles::{execute_precompile, precompile_address, ADDR_ORDER_BOOK_READER};
 use torus_state::cf::{CF_BOOK_ORDER_ROWS, CF_NATIVE_ORDER_BOOKS};
 use torus_state::{StateBackend, StateDb};
 use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParams, TimeInForce};
@@ -151,32 +147,6 @@ fn depth_tuples(levels: &[book_reader::DepthLevel]) -> Vec<(FixedPoint, FixedPoi
         .iter()
         .map(|l| (l.price, l.quantity, l.order_count as usize))
         .collect()
-}
-
-/// Decode `n` ABI `uint128[]` arrays out of a precompile response.
-fn decode_u128_arrays(out: &[u8], n: usize) -> Vec<Vec<u128>> {
-    let word =
-        |at: usize| -> u128 { u128::from_be_bytes(out[at + 16..at + 32].try_into().expect("word")) };
-    let mut arrays = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = word(i * 32) as usize;
-        let len = word(off) as usize;
-        arrays.push((0..len).map(|j| word(off + 32 + j * 32)).collect());
-    }
-    arrays
-}
-
-fn call_get_order_book(db: &StateDb, market_id: MarketId) -> Result<Vec<Vec<u128>>, String> {
-    let address = precompile_address(ADDR_ORDER_BOOK_READER);
-    let mut input = Vec::with_capacity(36);
-    let sel = alloy_primitives::keccak256(b"getOrderBook(bytes32)");
-    input.extend_from_slice(&sel[..4]);
-    let mut word = [0u8; 32];
-    word[24..32].copy_from_slice(&market_id.to_be_bytes());
-    input.extend_from_slice(&word);
-    execute_precompile(&address, &input, &addr(0), db, 100, 0)
-        .map(|out| decode_u128_arrays(&out, 4))
-        .map_err(|e| e.to_string())
 }
 
 // ---- 1. Layout detection ---------------------------------------------------
@@ -406,9 +376,9 @@ fn a_corrupt_book_mode_marker_is_an_error() {
     assert!(book_reader::detect_layout(&db).is_err());
 }
 
-/// Owner s100: the EVM getOrderBook does not check the book layout (it would
-/// cost a read per call); the writers guarantee it instead. Every row-mode
-/// save, serial or deferred (modes 2 / 3), across a reload, a market emptied
+/// Owner s100: the writers guarantee the book layout (the RPC readers reject
+/// any other, see `mixed_layouts_are_an_error`). Every row-mode save, serial
+/// or deferred (modes 2 / 3), across a reload, a market emptied
 /// by a fill and a market first saved by the deferred path, leaves each market in cf_native_order_books with (1)
 /// order rows or level rows, never both, and only the kind of its mode, and
 /// (2) a meta row whenever it has any order, level or stop row. Any other
@@ -487,64 +457,3 @@ fn row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market() {
         }
     }
 }
-
-// ---- 6. Precompile 0x0800 --------------------------------------------------
-
-/// s99 owner decision (final): the 0x0800 reader serves the level-row
-/// layouts (modes 2 / 3); a mode-1 (order-row) market reverts as unsupported.
-#[test]
-fn precompile_get_order_book_reverts_on_mode1() {
-    let (_dir, db) = open_test_db();
-    seed(&db, BookMode::OrderRows);
-    let err = call_get_order_book(&db, 1).expect_err("mode 1 is not served");
-    assert!(err.contains("order-row layout"), "{err}");
-}
-
-#[test]
-fn precompile_get_order_book_serves_row_modes() {
-    for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
-        let (_dir, db) = open_test_db();
-        let exp = seed(&db, mode);
-        let arrays = call_get_order_book(&db, 1).expect("precompile must decode row modes");
-        let (bid_px, bid_qty, ask_px, ask_qty) = (&arrays[0], &arrays[1], &arrays[2], &arrays[3]);
-
-        let want_bid_px: Vec<u128> = exp.m1_bids.iter().map(|(p, ..)| p.raw() as u128).collect();
-        let want_bid_qty: Vec<u128> = exp.m1_bids.iter().map(|(_, q, _)| q.raw() as u128).collect();
-        let want_ask_px: Vec<u128> = exp.m1_asks.iter().map(|(p, ..)| p.raw() as u128).collect();
-        let want_ask_qty: Vec<u128> = exp.m1_asks.iter().map(|(_, q, _)| q.raw() as u128).collect();
-
-        assert_eq!(bid_px, &want_bid_px, "{mode:?} bid prices");
-        assert_eq!(bid_qty, &want_bid_qty, "{mode:?} bid quantities");
-        assert_eq!(ask_px, &want_ask_px, "{mode:?} ask prices");
-        assert_eq!(ask_qty, &want_ask_qty, "{mode:?} ask quantities");
-        assert!(!bid_px.is_empty(), "{mode:?}: EVM must not get an empty book");
-    }
-}
-
-#[test]
-fn classic_precompile_behaviour_is_unchanged() {
-    // PRE-EXISTING, CONSENSUS-VISIBLE: under Classic the 0x0800 reader decodes
-    // ONLY the legacy `OrderBookSnapshot`, so a production whole-book blob
-    // makes it REVERT (it has never returned an empty book here). Changing
-    // that changes EVM-visible output for an already-deployed layout, so this
-    // test PINS today's behaviour until that decision is made explicitly.
-    let (_dir, db) = open_test_db();
-    seed(&db, BookMode::Classic);
-    let err = call_get_order_book(&db, 1)
-        .expect_err("classic arm still rejects the production blob (unchanged)");
-    assert!(err.contains("borsh"), "{err}");
-    // R02 branch 3: the revert bytes (`format!("{e}")` in the EVM provider)
-    // are byte-identical to main, and the error is deterministic (every
-    // validator decodes the same consensus bytes alike), not a local fault.
-    assert_eq!(err, R02_CLASSIC_REVERT_TEXT);
-    let address = precompile_address(ADDR_ORDER_BOOK_READER);
-    let mut input = alloy_primitives::keccak256(b"getOrderBook(bytes32)")[..4].to_vec();
-    let mut word = [0u8; 32];
-    word[24..32].copy_from_slice(&1u64.to_be_bytes());
-    input.extend_from_slice(&word);
-    let e = execute_precompile(&address, &input, &addr(0), &db, 100, 0).expect_err("reverts");
-    assert!(!e.is_local_fault(), "r02: a deterministic decode failure is not a local fault: {e}");
-}
-
-/// The classic getOrderBook revert text on main 3efff0d6 (captured there).
-const R02_CLASSIC_REVERT_TEXT: &str = "borsh error: Not all bytes read";

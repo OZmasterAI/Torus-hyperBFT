@@ -90,7 +90,7 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 | `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`, `eth_getTransactionCount` | Constant: account, code and storage point reads at the head. | none needed |
 | `eth_getTransactionByHash`, `eth_getTransactionReceipt` | Budget. The hash index, one body and the tx's receipt are constant; its eth index (and the receipt's log offset) reads one receipt slot per earlier body position, each charged as one row. | `block_lookups_charge_every_receipt_slot_to_the_scan_budget` (receipt) |
 | `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getBlockTransactionCountByNumber`, `eth_getBlockTransactionCountByHash`, `eth_getTransactionByBlockNumberAndIndex`, `eth_getTransactionByBlockHashAndIndex` | Budget. The header and body are constant; the receipt lookup reads one slot per submitted transaction of the block, undecodable ones included (the gas limit does not bound them), and each slot read is one row, charged before it is made. A by-index lookup still reads every slot (as before) before it answers. | `block_lookups_charge_every_receipt_slot_to_the_scan_budget` |
-| `eth_call`, `eth_estimateGas` | The gas limit bounds the EVM's work (state point reads). | none needed |
+| `eth_call`, `eth_estimateGas` | The gas limit bounds the EVM's work (state point reads). It is the head header's `evm_gas_limit` (3M at genesis; item 7 step 1): a call without `gas` gets that limit, a larger `gas` is clamped to it, and `eth_estimateGas` searches up to it. Before block 1 (no header) it is 30M. | `call_gas_defaults_and_caps_at_the_block_limit` (`eth.rs`), `bare_call_and_estimate_work_under_a_3m_header`, `eth_call_gas_above_the_header_limit_is_capped` (`tests/eth_compliance_tests.rs`) |
 | `eth_getLogs` | Budget, plus its own limits: a range of at most 10,000 blocks and at most 10,000 logs. Every receipt slot of every block in the range with EVM transactions is read and charged as one row, even when the filter keeps none of its logs (s121); blocks without EVM transactions read no receipt. | `get_logs_charges_every_receipt_slot_to_the_scan_budget`, `lib.rs` getLogs tests |
 | `eth_feeHistory` | Its own limit: at most 1024 headers. | none needed |
 | `eth_subscribe` | No DB reads: items are pushed from execution. | none needed |
@@ -98,7 +98,11 @@ means the method counts rows toward `TORUS_RPC_MAX_SCAN_ROWS` and stops with
 
 `torus_submitNativeAction`, `torus_submitNativeActions`,
 `torus_submitNativeActionsBin` and `eth_sendRawTransaction` are writes, not
-reads; their ingress checks read a fixed number of rows per action.
+reads; their ingress checks read a fixed number of rows per action. Since item
+7 step 1 the EVM pool refuses a transaction above 256 KiB of raw bytes
+(`TxTooLarge`) or with a gas limit above the `evm_gas_limit` of the last
+committed header handed to execution (or `TORUS_EVM_BLOCK_GAS_BUDGET`, if
+lower).
 
 ## Same answer as before
 

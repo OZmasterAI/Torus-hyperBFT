@@ -69,6 +69,9 @@ pub enum MempoolError {
     /// EIP-3860: contract-creation initcode above the size limit (revm
     /// rejects it at execution).
     InitCodeTooLarge { size: usize, max: usize },
+    /// Item 7 step 1: raw tx above the per-block EVM byte cap (256 KiB), so
+    /// it could never be selected into a block.
+    TxTooLarge { size: usize, max: usize },
 }
 
 impl fmt::Display for MempoolError {
@@ -152,6 +155,9 @@ impl fmt::Display for MempoolError {
                     f,
                     "max initcode size exceeded: code size {size}, limit {max}"
                 )
+            }
+            Self::TxTooLarge { size, max } => {
+                write!(f, "oversized data: tx size {size}, limit {max}")
             }
         }
     }

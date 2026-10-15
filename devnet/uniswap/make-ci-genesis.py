@@ -17,6 +17,9 @@ def main() -> None:
     # Quorum of one: the CI devnet runs a single validator.
     g["validators"] = g["validators"][:1]
 
+    # Item 7 step 1: the Router deploy needs ~4.2M gas, above the 3M default, until step 2's big blocks.
+    g["evm"]["gas_limit"] = 10_000_000
+
     # Fund the hardhat accounts deploy.sh / ci-swap-check.sh sign with.
     hardhat = [
         "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",  # deployer (account 0)

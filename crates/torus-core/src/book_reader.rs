@@ -439,8 +439,7 @@ pub fn depth_from_market_rows<S: StateBackend>(
 /// The depth of `rows` of one market under a row `layout`: its level rows
 /// (mode 2: forward key order = best-first per side, bids before asks) or its
 /// order rows aggregated per price (mode 1); other row kinds are ignored and
-/// no meta row is needed. The reader precompile (0x0800 getOrderBook) passes
-/// its bounded level-row scans (64 best levels per side).
+/// no meta row is needed.
 pub fn depth_from_rows(
     market_id: MarketId,
     layout: BookLayout,

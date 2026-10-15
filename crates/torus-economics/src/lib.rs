@@ -22,7 +22,7 @@ pub mod types;
 
 pub use dev_pool::DevPool;
 pub use epoch::EpochManager;
-pub use epoch_plan::{EpochRotationPlan, PlanMember, EPOCH_VSET_PREFIX};
+pub use epoch_plan::{EpochRotationPlan, PlanEvm, PlanMember, EPOCH_VSET_PREFIX};
 pub use error::EconomicsError;
 pub use governance::{GovernanceManager, GovernanceParams};
 pub use queries::*;

@@ -305,6 +305,7 @@ fn compact_block_hash_order_matches_frozen_encoder() {
             evm_gas_used: 0,
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
+            evm_block_interval: crate::DEFAULT_EVM_BLOCK_INTERVAL,
             native_action_count: 3,
             evm_tx_count: 1,
             base_fee_per_gas: 1,

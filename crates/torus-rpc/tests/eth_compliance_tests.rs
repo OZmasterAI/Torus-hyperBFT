@@ -98,6 +98,7 @@ async fn bare_eth_call_succeeds_at_height_with_base_fee() {
         evm_gas_used: 0,
         evm_fee_revenue: 0,
         evm_gas_limit: 30_000_000,
+        evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
         native_action_count: 0,
         evm_tx_count: 0,
         base_fee_per_gas: 1_000_000_000,
@@ -355,9 +356,9 @@ async fn unknown_method_returns_method_not_found() {
     handle.stop().unwrap();
 }
 
-/// Commit a header at height 1 with `base_fee` and mark it executed, so
-/// `latest` is that header (same layout as the D2 test above).
-fn store_head_with_base_fee(state: &StateDb, base_fee: u64) {
+/// Commit a header at height 1 with `base_fee` and `evm_gas_limit` and mark it
+/// executed, so `latest` is that header (same layout as the D2 test above).
+fn store_head_with_base_fee(state: &StateDb, base_fee: u64, evm_gas_limit: u64) {
     let header = torus_types::TorusBlockHeader {
         height: 1,
         parent_hash: alloy_primitives::B256::ZERO,
@@ -368,7 +369,8 @@ fn store_head_with_base_fee(state: &StateDb, base_fee: u64) {
         logs_bloom: alloy_primitives::Bloom::ZERO,
         evm_gas_used: 0,
         evm_fee_revenue: 0,
-        evm_gas_limit: 30_000_000,
+        evm_gas_limit,
+        evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
         native_action_count: 0,
         evm_tx_count: 0,
         base_fee_per_gas: base_fee,
@@ -526,7 +528,7 @@ async fn eth_call_rejects_unsupported_tx_type() {
 #[tokio::test]
 async fn typed_1559_call_below_base_fee_still_runs() {
     let (_dir, state, mempool, executor) = setup();
-    store_head_with_base_fee(&state, 1_000_000_000);
+    store_head_with_base_fee(&state, 1_000_000_000, 30_000_000);
     let sender = alloy_primitives::Address::repeat_byte(0xee);
     state
         .put_account(
@@ -561,5 +563,61 @@ async fn typed_1559_call_below_base_fee_still_runs() {
         .request("eth_call", rpc_params![bare, "latest"])
         .await;
     assert!(r.is_ok(), "bare call: {:?}", r.err());
+    handle.stop().unwrap();
+}
+
+/// Item 7 step 1: under a 3M header, a bare eth_call (no gas) and
+/// eth_estimateGas use the header's limit, not 30M, which revm refuses as
+/// above the block's gas limit.
+#[tokio::test]
+async fn bare_call_and_estimate_work_under_a_3m_header() {
+    let (_dir, state, mempool, executor) = setup();
+    store_head_with_base_fee(&state, 1_000_000_000, 3_000_000);
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    let bare = serde_json::json!({
+        "from": "0x00000000000000000000000000000000000000ee",
+        "to": "0x00000000000000000000000000000000000000bb"
+    });
+    let r: Result<String, _> = client
+        .request("eth_call", rpc_params![bare.clone(), "latest"])
+        .await;
+    assert!(r.is_ok(), "bare eth_call under a 3M header: {:?}", r.err());
+    let est: Result<String, _> = client.request("eth_estimateGas", rpc_params![bare]).await;
+    assert_eq!(
+        est.as_deref().map_err(|e| e.to_string()),
+        Ok("0x5208"),
+        "eth_estimateGas under a 3M header"
+    );
+    handle.stop().unwrap();
+}
+
+/// Item 7 step 1 (owner s123): call gas above the header's limit is clamped to
+/// the limit, so a 30M request still runs under a 3M header.
+#[tokio::test]
+async fn eth_call_gas_above_the_header_limit_is_capped() {
+    let (_dir, state, mempool, executor) = setup();
+    store_head_with_base_fee(&state, 1_000_000_000, 3_000_000);
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    let call = serde_json::json!({
+        "from": "0x00000000000000000000000000000000000000ee",
+        "to": "0x00000000000000000000000000000000000000bb",
+        "gas": "0x1c9c380"
+    });
+    let r: Result<String, _> = client
+        .request("eth_call", rpc_params![call.clone(), "latest"])
+        .await;
+    assert!(r.is_ok(), "30M eth_call under a 3M header: {:?}", r.err());
+    let est: Result<String, _> = client.request("eth_estimateGas", rpc_params![call]).await;
+    assert!(
+        est.is_ok(),
+        "30M eth_estimateGas under a 3M header: {:?}",
+        est.err()
+    );
     handle.stop().unwrap();
 }

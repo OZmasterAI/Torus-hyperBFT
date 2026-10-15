@@ -1,0 +1,127 @@
+{
+  "prp": "item7-step1",
+  "created": "2026-10-15T00:00:00",
+  "notes": "Plan: docs/plans/item7-step1-impl.md (design docs/plans/item7-step1-design.md, option A + owner decisions s123). Branch feat/item7-step1-evm-lanes, worktree /home/18c/projects/wt/item7-step1. Env: cd /home/18c/projects/wt/item7-step1; CARGO_TARGET_DIR=/home/18c/.cargo-target-item7; L='flock -w 60 -o $HOME/projects/wt/.cargo-heavy.lock'; P='-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-economics -p torus-mempool -p torus-rpc -p torus-core -p torus-evm -p hotstuff_rs -p torus-node -p torus-state -p torus-integration-tests'. Commit groups: C1=E1-E4, C2=E5-E8, C3=E9-E11, C4=E12, C5=E13, C6=E14, C7=E15. E13 and E14 are independent of E1-E12.",
+  "tasks": [
+    {
+      "id": "E1",
+      "name": "torus-types: EVM constants, governance keys and gov_u64_in",
+      "status": "done",
+      "files": ["crates/torus-types/src/lib.rs"],
+      "validate": "$L cargo test $P gov_u64_in_parses_in_range_else_none",
+      "depends_on": []
+    },
+    {
+      "id": "E2",
+      "name": "header field evm_block_interval in struct, canonical bytes and the 24 literals",
+      "status": "done",
+      "files": ["crates/torus-types/src/lib.rs", "crates/torus-bridge/src/proposer.rs", "crates/torus-consensus/src/app.rs", "crates/torus-types/tests/action_hash_scratch_tests.rs", "crates/torus-state/src/block_body.rs", "crates/torus-rpc/src/lib.rs", "crates/torus-rpc/src/scan_tests.rs", "crates/torus-rpc/tests/eth_compliance_tests.rs", "crates/torus-bridge/tests/bridge_tests.rs", "crates/torus-bridge/tests/state_root_once_tests.rs", "crates/torus-bridge/tests/exec_isolation_tests.rs", "crates/torus-integration-tests"],
+      "validate": "$L cargo test $P evm_block_interval",
+      "depends_on": ["E1"]
+    },
+    {
+      "id": "E3",
+      "name": "genesis evm.block_interval, ChainConfig field, genesis files 3M/5, CI genesis 10M",
+      "status": "done",
+      "files": ["crates/torus-genesis/src/lib.rs", "crates/torus-types/src/lib.rs", "crates/torus-node/src/main.rs", "crates/torus-consensus/src/app.rs", "devnet/genesis.json", "devnet/ab-harness/devnet-genesis.json", "testnet/genesis-weighted-base.json", "testnet/genesis-weighted-base-setup2b.json", "testnet/p3-testnet/devnet-ladder/genesis-10mkt.json", "devnet/uniswap/make-ci-genesis.py", "ci/github-ci.yml"],
+      "validate": "$L cargo test $P evm_block_interval_defaults_and_feeds_chain_config && $L cargo test $P shipped_genesis_files_use_the_item7_evm_values",
+      "depends_on": ["E1"]
+    },
+    {
+      "id": "E4",
+      "name": "genesis_parent_header(gas, N) built once in try_new and used by every caller",
+      "status": "done",
+      "files": ["crates/torus-bridge/src/proposer.rs", "crates/torus-consensus/src/app.rs", "crates/torus-mempool/src/lib.rs", "crates/torus-bridge/tests/bridge_tests.rs"],
+      "validate": "$L cargo test $P genesis_parent_header_carries_the_genesis_evm_values && $L cargo test $P first_block_uses_the_configured_genesis_header && $L cargo test $P parent_link_violation_uses_the_configured_genesis",
+      "depends_on": ["E2", "E3"]
+    },
+    {
+      "id": "E5",
+      "name": "epoch plan carries PlanEvm from the governance rows",
+      "status": "done",
+      "files": ["crates/torus-economics/src/epoch_plan.rs", "crates/torus-economics/src/lib.rs"],
+      "validate": "$L cargo test $P plan_carries_governance_evm_params && $L cargo test $P plan_without_or_with_invalid_evm_params_keeps_the_chain_values",
+      "depends_on": ["E1"]
+    },
+    {
+      "id": "E6",
+      "name": "governance allowlist: evm_block_gas_limit 1M..=10M, evm_block_interval 2..=100",
+      "status": "done",
+      "files": ["crates/torus-economics/src/governance.rs", "crates/torus-economics/tests/governance_tests.rs"],
+      "validate": "$L cargo test $P evm_block_param_changes_are_range_checked_and_execute_into_fee_config",
+      "depends_on": ["E1"]
+    },
+    {
+      "id": "E7",
+      "name": "boundary rule: epoch_plan/boundary_evm helpers, check_parent_link boundary closure at vote and insertion",
+      "status": "done",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo test $P boundary_ && $L cargo test $P off_boundary_header && $L cargo test $P pruned_boundary_plan && $L cargo test $P evm_gas_limit_and_base_fee",
+      "depends_on": ["E4", "E5"]
+    },
+    {
+      "id": "E8",
+      "name": "proposer: plan values at a boundary, EVM drain only on cadence",
+      "status": "done",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo test $P off_cadence_proposal_has_no_evm_txs_and_leaves_them_pooled && $L cargo test $P governance_evm_params_reach_the_header",
+      "depends_on": ["E7"]
+    },
+    {
+      "id": "E9",
+      "name": "pre-vote cadence, count and 256 KiB byte caps; update the two affected tests",
+      "status": "done",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo test $P before_the_vote && $L cargo test $P invalid_actions_are_skipped && $L cargo test $P honest_proposal_with_evm_txs",
+      "depends_on": ["E2", "E7"]
+    },
+    {
+      "id": "E10",
+      "name": "mempool admission: committed header gas cap and 256 KiB tx cap",
+      "status": "done",
+      "files": ["crates/torus-mempool/src/lib.rs", "crates/torus-mempool/src/error.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo test $P admission_caps_gas && $L cargo test $P admission_rejects_tx_above && $L cargo test $P committed_header_sets_mempool",
+      "depends_on": ["E1", "E4"]
+    },
+    {
+      "id": "E11",
+      "name": "reinsert EVM txs of our lost proposals on commit",
+      "status": "done",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo test $P lost_proposal && $L cargo test $P own_committed_proposal_reinserts_nothing",
+      "depends_on": ["E8"]
+    },
+    {
+      "id": "E12",
+      "name": "forward EVM txs to the next EVM height's leader (hotstuff_rs event height, LeaderState, RPC hook)",
+      "status": "done",
+      "files": ["crates/hotstuff_rs/src/events.rs", "crates/hotstuff_rs/src/hotstuff/implementation.rs", "crates/torus-consensus/src/app.rs", "crates/torus-node/src/main.rs", "crates/torus-rpc/src/lib.rs", "crates/torus-rpc/src/torus.rs"],
+      "validate": "$L cargo test $P next_evm_leader && $L cargo test $P evm_tx_forwarded_to_the_next_evm_height_leader && $L cargo test $P set_leader_forwarding",
+      "depends_on": ["E2"]
+    },
+    {
+      "id": "E13",
+      "name": "RPC eth_call / eth_estimateGas default and cap gas at the header limit",
+      "status": "done",
+      "files": ["crates/torus-rpc/src/eth.rs", "crates/torus-rpc/tests/eth_compliance_tests.rs"],
+      "validate": "$L cargo test $P bare_call_and_estimate_work && $L cargo test $P eth_call_gas_above && $L cargo test $P call_gas_defaults_and_caps",
+      "depends_on": []
+    },
+    {
+      "id": "E14",
+      "name": "remove the getOrderBook selector, its helpers and tests; keep and re-document the tombstone compaction",
+      "status": "done",
+      "files": ["crates/torus-core/src/precompiles.rs", "crates/torus-evm/tests/evm_tests.rs", "crates/torus-core/tests/precompile_tests.rs", "crates/torus-bridge/tests/book_read_modes_tests.rs", "crates/torus-bridge/tests/precompile_work_bound_tests.rs", "crates/torus-bridge/tests/r02_book_corrupt_tests.rs", "crates/torus-bridge/tests/cross_vm_read.rs", "crates/torus-bridge/tests/ubench_read_precompile_gas.rs", "crates/torus-state/src/cf.rs", "crates/torus-state/src/db.rs"],
+      "validate": "$L cargo test $P removed_get_order_book && $L cargo test $P order_book_reader_ && $L cargo test $P book_read_modes && $L cargo test $P precompile_work_bound",
+      "depends_on": []
+    },
+    {
+      "id": "E15",
+      "name": "docs and the full run (tests, fmt, clippy -D warnings, CI uniswap e2e)",
+      "status": "done",
+      "files": ["docs/api/read-limits.md", "docs/perf/read-precompile-gas.md", "docs/design-level-rows-authority.md", "docs/configuration-reference.md", "docs/plans/item7-evm-lanes.md"],
+      "validate": "$L cargo test $P && cargo fmt --all --check && RUSTFLAGS='-D warnings' $L cargo clippy $P --all-targets",
+      "depends_on": ["E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10", "E11", "E12", "E13", "E14"]
+    }
+  ]
+}

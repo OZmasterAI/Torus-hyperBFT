@@ -523,7 +523,7 @@ pub struct TorusBlockHeader {
     /// DIFFERENT parents now hash differently, so a hash-vs-hash fork check at a
     /// height is sound. Genesis (`genesis_parent_header`, height 0) uses
     /// `B256::ZERO`; the first real block (height 1) commits to
-    /// `keccak256(genesis_parent_header().canonical_header_bytes())`.
+    /// `keccak256(genesis_parent_header(..).canonical_header_bytes())`.
     ///
     /// NOTE: this is the keccak canonical header hash (what RPC `parentHash` and
     /// the fork checker compare), which is DISTINCT from the hotstuff consensus
@@ -567,6 +567,9 @@ pub struct TorusBlockHeader {
     pub evm_fee_revenue: u128,
     /// Gas limit for EVM transactions in this block.
     pub evm_gas_limit: u64,
+    /// Item 7 step 1: N. EVM txs only in blocks with `height % N == 0`. Equals the parent's,
+    /// except at an epoch boundary, where the epoch plan may change it.
+    pub evm_block_interval: u64,
     /// Native action count.
     pub native_action_count: u32,
     /// EVM transaction count.
@@ -604,6 +607,7 @@ impl TorusBlockHeader {
         buf.extend_from_slice(&self.evm_gas_used.to_be_bytes());
         buf.extend_from_slice(&self.evm_fee_revenue.to_be_bytes());
         buf.extend_from_slice(&self.evm_gas_limit.to_be_bytes());
+        buf.extend_from_slice(&self.evm_block_interval.to_be_bytes());
         buf.extend_from_slice(&self.native_action_count.to_be_bytes());
         buf.extend_from_slice(&self.evm_tx_count.to_be_bytes());
         buf.extend_from_slice(&self.base_fee_per_gas.to_be_bytes());
@@ -681,6 +685,15 @@ pub fn batch_len_within_cap(len: usize) -> bool {
     (1..=NATIVE_ORDERS_PER_BATCH_CAP).contains(&len)
 }
 
+/// Item 7 step 1: genesis default EVM gas budget per EVM block (header `evm_gas_limit`).
+pub const DEFAULT_EVM_GAS_LIMIT: u64 = 3_000_000;
+/// Item 7 step 1: genesis default N; EVM txs only in blocks with `height % N == 0`.
+pub const DEFAULT_EVM_BLOCK_INTERVAL: u64 = 5;
+/// Item 7 step 1: most raw EVM tx bytes per block (vote rule), so also per tx (admission).
+pub const MAX_EVM_BLOCK_TX_BYTES: usize = 256 * 1024;
+/// Cheapest tx's intrinsic gas: `evm_gas_limit / EVM_MIN_TX_GAS` caps a block's EVM tx count.
+pub const EVM_MIN_TX_GAS: u64 = 21_000;
+
 /// s94 option 2 (HL "Order price too far from oracle"): the governance key
 /// (`CF_FEE_CONFIG`, a decimal string, `ParameterChange`) of the chain-wide
 /// placement price band, in basis points of the market's reference price.
@@ -702,6 +715,21 @@ pub fn price_band_bps(stored: Option<&[u8]>) -> u64 {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|v| PRICE_BAND_BPS_RANGE.contains(v))
         .unwrap_or(PRICE_BAND_DEFAULT_BPS)
+}
+
+/// Item 7 step 1: governance keys (`CF_FEE_CONFIG`, decimal, `ParameterChange`). Execution of
+/// boundary H copies them into the plan for H + L; absent or invalid = the chain keeps its value.
+pub const EVM_BLOCK_GAS_LIMIT_PARAM: &str = "evm_block_gas_limit";
+pub const EVM_BLOCK_GAS_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 1_000_000..=10_000_000;
+pub const EVM_BLOCK_INTERVAL_PARAM: &str = "evm_block_interval";
+pub const EVM_BLOCK_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 2..=100;
+
+/// A stored governance value: the decimal when it is in `range`, else `None`.
+pub fn gov_u64_in(stored: Option<&[u8]>, range: &std::ops::RangeInclusive<u64>) -> Option<u64> {
+    stored
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| range.contains(v))
 }
 
 /// All native (non-EVM) actions processed by torus-core.
@@ -1434,6 +1462,10 @@ pub struct ChainConfig {
     pub chain_id: u64,
     pub chain_name: String,
     pub evm_gas_limit: u64,
+    /// Item 7 step 1: genesis N (`evm.block_interval`), the genesis parent
+    /// header's `evm_block_interval`. Absent in a legacy config = 5.
+    #[serde(default = "default_evm_block_interval")]
+    pub evm_block_interval: u64,
     pub base_fee_per_gas: u64,
     pub epoch_length: u64,
     pub max_validators: u32,
@@ -1499,6 +1531,10 @@ pub struct ChainConfig {
 
 fn default_timeout_base_ms() -> u64 {
     1200
+}
+
+fn default_evm_block_interval() -> u64 {
+    DEFAULT_EVM_BLOCK_INTERVAL
 }
 
 fn default_backoff_factor() -> u32 {
@@ -1656,6 +1692,18 @@ mod tests {
         }"#;
         let config: ChainConfig = serde_json::from_str(json).expect("legacy config must parse");
         assert_eq!(config.timeout_base_ms, 1200);
+    }
+
+    /// Item 7 step 1: a stored governance value counts only when it is a
+    /// decimal inside the key's range.
+    #[test]
+    fn gov_u64_in_parses_in_range_else_none() {
+        let r = 2..=100u64;
+        assert_eq!(gov_u64_in(None, &r), None);
+        assert_eq!(gov_u64_in(Some(b"abc"), &r), None);
+        assert_eq!(gov_u64_in(Some(b"1"), &r), None);
+        assert_eq!(gov_u64_in(Some(b"101"), &r), None);
+        assert_eq!(gov_u64_in(Some(b"5"), &r), Some(5));
     }
 
     #[test]
@@ -1946,6 +1994,7 @@ mod tests {
             evm_gas_used: 0,
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
+            evm_block_interval: DEFAULT_EVM_BLOCK_INTERVAL,
             native_action_count: 0,
             evm_tx_count: 0,
             base_fee_per_gas: 1_000_000_000,
@@ -1961,7 +2010,7 @@ mod tests {
 
     #[test]
     fn header_without_attestation_defaults_to_zero() {
-        let json = br#"{"height":1,"timestamp":1000,"proposer":"0x0000000000000000000000000000000000000000","state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","receipts_root":"0x0000000000000000000000000000000000000000000000000000000000000000","logs_bloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","evm_gas_used":0,"evm_fee_revenue":0,"evm_gas_limit":30000000,"native_action_count":0,"evm_tx_count":0,"base_fee_per_gas":1000000000,"epoch":0,"validator_set_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let json = br#"{"height":1,"timestamp":1000,"proposer":"0x0000000000000000000000000000000000000000","state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","receipts_root":"0x0000000000000000000000000000000000000000000000000000000000000000","logs_bloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","evm_gas_used":0,"evm_fee_revenue":0,"evm_gas_limit":30000000,"evm_block_interval":5,"native_action_count":0,"evm_tx_count":0,"base_fee_per_gas":1000000000,"epoch":0,"validator_set_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
         let decoded: TorusBlockHeader = serde_json::from_slice(json).unwrap();
         assert_eq!(decoded.sig_attestation, [0u8; 64]);
     }
@@ -1978,6 +2027,7 @@ mod tests {
             evm_gas_used: 0,
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
+            evm_block_interval: DEFAULT_EVM_BLOCK_INTERVAL,
             native_action_count: 0,
             evm_tx_count: 0,
             base_fee_per_gas: 1_000_000_000,
@@ -2242,6 +2292,7 @@ mod tests {
             evm_gas_used: 0,
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
+            evm_block_interval: DEFAULT_EVM_BLOCK_INTERVAL,
             native_action_count: 0,
             evm_tx_count: 0,
             base_fee_per_gas: 1_000_000_000,
@@ -2274,6 +2325,27 @@ mod tests {
             alloy_primitives::keccak256(h1.canonical_header_bytes()),
             alloy_primitives::keccak256(h2.canonical_header_bytes()),
         );
+    }
+
+    /// Item 7 step 1: N is part of the block identity, so two headers that
+    /// differ only in it hash differently.
+    #[test]
+    fn evm_block_interval_in_canonical_bytes() {
+        let a = test_header();
+        let mut b = a.clone();
+        b.evm_block_interval += 1;
+        assert_ne!(a.canonical_header_bytes(), b.canonical_header_bytes());
+    }
+
+    /// Item 7 step 1: bincode 1 is the header wire format (proposal datums,
+    /// `datum_header`); N survives a round trip.
+    #[test]
+    fn header_bincode_round_trip_keeps_evm_block_interval() {
+        let mut header = test_header();
+        header.evm_block_interval = 7;
+        let bytes = bincode::serialize(&header).unwrap();
+        let back: TorusBlockHeader = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.evm_block_interval, 7);
     }
 
     /// Genesis zero-parent case: `genesis_parent_header`-style header (height 0)

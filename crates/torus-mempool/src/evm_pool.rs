@@ -267,6 +267,70 @@ impl EvmPool {
         Ok((replaced, freed_bytes))
     }
 
+    /// Item 7 step 1: put back a tx drained into one of our own proposals (it
+    /// lost at its height, or we propose that height again). While it was
+    /// out, the sender's later nonces may have taken its slots, or other txs
+    /// the pool. Refusing it would leave a gap the drain proposes into (it
+    /// starts each sender at its lowest pooled nonce), and execution skips the
+    /// txs after a gap. So when the sender's slots or the pool are full, the
+    /// sender's highest pooled nonce above this one makes room; then `insert`
+    /// cannot fail. Otherwise (a duplicate, a taken nonce, no higher nonce)
+    /// the `insert` rules apply unchanged.
+    pub fn reinsert(
+        &mut self,
+        entry: EvmPoolEntry,
+        max_pool_size: usize,
+        max_per_sender: usize,
+        replacement_bump_pct: u64,
+    ) -> Result<(Option<B256>, usize), MempoolError> {
+        let duplicate = self.by_hash.contains_key(&entry.hash);
+        let pool_full = self.size >= max_pool_size;
+        let highest = self
+            .by_sender
+            .get(&entry.sender)
+            .filter(|txs| {
+                !duplicate
+                    && (pool_full || txs.len() >= max_per_sender)
+                    && !txs.contains_key(&entry.nonce)
+            })
+            .and_then(|txs| txs.last_key_value())
+            .filter(|(&nonce, _)| nonce > entry.nonce)
+            .map(|(_, top)| top.hash);
+        let mut freed_bytes = 0;
+        if let Some(hash) = highest {
+            if let Some(evicted) = self.remove_by_hash(&hash) {
+                tracing::info!(
+                    sender = %entry.sender,
+                    evicted_nonce = evicted.nonce,
+                    nonce = entry.nonce,
+                    "EVM pool: a reinserted tx evicted its sender's highest nonce"
+                );
+                freed_bytes = evicted.raw_rlp.len();
+            }
+        }
+        let (replaced, freed) =
+            self.insert(entry, max_pool_size, max_per_sender, replacement_bump_pct)?;
+        Ok((replaced, freed_bytes + freed))
+    }
+
+    /// Item 7 step 1: remove every tx declaring more gas than `max_gas` (the
+    /// EVM gas limit dropped below it). Returns (count, freed raw bytes).
+    pub fn evict_gas_above(&mut self, max_gas: u64) -> (usize, usize) {
+        let over: Vec<B256> = self
+            .by_sender
+            .values()
+            .flat_map(|txs| txs.values())
+            .filter(|e| e.gas_limit > max_gas)
+            .map(|e| e.hash)
+            .collect();
+        let freed = over
+            .iter()
+            .filter_map(|hash| self.remove_by_hash(hash))
+            .map(|e| e.raw_rlp.len())
+            .sum();
+        (over.len(), freed)
+    }
+
     /// Remove a transaction by hash.
     pub fn remove_by_hash(&mut self, hash: &B256) -> Option<EvmPoolEntry> {
         let (sender, nonce) = self.by_hash.remove(hash)?;
@@ -327,13 +391,17 @@ impl EvmPool {
     /// effective tip at `min_base_fee` across all senders, advances that
     /// sender's pointer, repeats until gas budget is exhausted. Returns raw RLP bytes for inclusion in `TorusBlock`.
     ///
-    /// D1 (S392): selection is bounded by `gas_budget` alone (count caps
-    /// deleted); `sender_gas_cap` optionally caps one sender's share of it.
+    /// D1 (S392): selection is bounded by `gas_budget` (count caps deleted);
+    /// `sender_gas_cap` optionally caps one sender's share of it. Item 7 step
+    /// 1: and by `byte_budget` raw tx bytes (the vote refuses a block over
+    /// 256 KiB of EVM tx bytes). A tx over either budget is skipped and stays
+    /// pooled, and so do its sender's later nonces.
     /// Task 3.1.5: `parent_hash` seeds deterministic same-tip shuffling (anti-MEV).
     /// D4 (S392): `min_base_fee` re-checks the fee floor at selection time.
     pub fn drain(
         &mut self,
         gas_budget: u64,
+        byte_budget: usize,
         sender_gas_cap: Option<u64>,
         parent_hash: &B256,
         min_base_fee: u128,
@@ -347,6 +415,7 @@ impl EvmPool {
 
         let mut result = Vec::new();
         let mut gas_used: u64 = 0;
+        let mut bytes_used: usize = 0;
         let mut to_remove = Vec::new();
         let mut sender_gas: HashMap<Address, u64> = HashMap::new();
 
@@ -382,11 +451,15 @@ impl EvmPool {
                 .get(&top.sender)
                 .and_then(|m| m.get(&top.nonce))
             {
+                // Item 7 step 1: over the byte budget, skipped like a tx over
+                // the gas budget (the sender's next nonce is not pushed).
+                Some(e) if bytes_used.saturating_add(e.raw_rlp.len()) > byte_budget => continue,
                 Some(e) => e.raw_rlp.clone(),
                 None => continue,
             };
 
             gas_used += top.gas_limit;
+            bytes_used += raw.len();
             to_remove.push(
                 self.by_sender
                     .get(&top.sender)
@@ -452,9 +525,9 @@ mod tests {
     #[test]
     fn drain_orders_by_effective_tip_not_max_fee() {
         let mut pool = pool_with(10, &[entry(0xA, 0, 100, 1), entry(0xB, 0, 20, 9)], 100);
-        let first = pool.drain(21_000, None, &B256::ZERO, 10);
+        let first = pool.drain(21_000, usize::MAX, None, &B256::ZERO, 10);
         assert_eq!(senders_of(&first), vec![0xB]);
-        let rest = pool.drain(21_000, None, &B256::ZERO, 10);
+        let rest = pool.drain(21_000, usize::MAX, None, &B256::ZERO, 10);
         assert_eq!(senders_of(&rest), vec![0xA]);
     }
 
@@ -464,7 +537,7 @@ mod tests {
         // A: legacy-style (gas price 15, tip 15) -> effective 5 at base 10.
         // B: tip 6 under max 50 -> effective 6.
         let mut pool = pool_with(10, &[entry(0xA, 0, 15, 15), entry(0xB, 0, 50, 6)], 100);
-        let drained = pool.drain(42_000, None, &B256::ZERO, 10);
+        let drained = pool.drain(42_000, usize::MAX, None, &B256::ZERO, 10);
         assert_eq!(senders_of(&drained), vec![0xB, 0xA]);
     }
 
@@ -486,7 +559,10 @@ mod tests {
                 vec![0xB, 0xA]
             };
             let mut pool = pool_with(10, &[a.clone(), b.clone()], 100);
-            assert_eq!(senders_of(&pool.drain(42_000, None, &parent, 10)), want);
+            assert_eq!(
+                senders_of(&pool.drain(42_000, usize::MAX, None, &parent, 10)),
+                want
+            );
             seen_a_first |= ka > kb;
             seen_b_first |= kb > ka;
         }
@@ -501,10 +577,93 @@ mod tests {
     #[test]
     fn below_floor_tx_not_drained_and_stays_pooled() {
         let mut pool = pool_with(5, &[entry(0xA, 0, 9, 9), entry(0xB, 0, 11, 1)], 100);
-        let drained = pool.drain(1_000_000, None, &B256::ZERO, 10);
+        let drained = pool.drain(1_000_000, usize::MAX, None, &B256::ZERO, 10);
         assert_eq!(senders_of(&drained), vec![0xB]);
         assert_eq!(pool.size(), 1);
         assert!(pool.contains(&entry(0xA, 0, 9, 9).hash));
+    }
+
+    /// Item 7 step 1: the drain keeps the selected raw bytes within the byte
+    /// budget. A tx that would go over is skipped and stays pooled, like one
+    /// over the gas budget: its sender's later nonce waits behind it, and a
+    /// smaller tx of another sender still fits.
+    #[test]
+    fn drain_keeps_selected_bytes_within_the_byte_budget() {
+        let big = |sender: u8, tip: u128| EvmPoolEntry {
+            gas_limit: 621_000,
+            raw_rlp: vec![sender; 150_000],
+            ..entry(sender, 0, 100, tip)
+        };
+        let entries = [
+            big(0xA, 6),
+            big(0xB, 5),
+            entry(0xB, 1, 100, 9),
+            entry(0xC, 0, 100, 1),
+        ];
+        let mut pool = pool_with(10, &entries, 100);
+        let first = pool.drain(3_000_000, 262_144, None, &B256::ZERO, 10);
+        assert_eq!(senders_of(&first), vec![0xA, 0xC]);
+        assert_eq!(pool.size(), 2);
+        let second = pool.drain(3_000_000, 262_144, None, &B256::ZERO, 10);
+        assert_eq!(senders_of(&second), vec![0xB, 0xB]);
+        assert_eq!(pool.size(), 0);
+    }
+
+    /// Item 7 step 1: a reinserted tx makes room under a full per-sender or
+    /// pool cap by evicting its sender's highest pooled nonce above it. With
+    /// no higher nonce of its own sender, the normal rules apply.
+    #[test]
+    fn reinsert_evicts_the_senders_highest_nonce_when_full() {
+        // Per-sender cap 2: A holds nonces 1 and 2, nonce 0 comes back.
+        let mut pool = pool_with(10, &[entry(0xA, 1, 100, 5), entry(0xA, 2, 100, 5)], 100);
+        assert!(matches!(
+            pool.insert(entry(0xA, 0, 100, 5), 100, 2, BUMP),
+            Err(MempoolError::PoolFull)
+        ));
+        let (_, freed) = pool.reinsert(entry(0xA, 0, 100, 5), 100, 2, BUMP).unwrap();
+        assert_eq!(freed, entry(0xA, 2, 100, 5).raw_rlp.len());
+        assert!(!pool.contains(&entry(0xA, 2, 100, 5).hash));
+        assert_eq!(pool.size(), 2);
+
+        // Pool cap 3, full: B's nonce 0 evicts B's nonce 1, not the lowest tip (C).
+        let mut pool = pool_with(
+            10,
+            &[
+                entry(0xB, 1, 100, 9),
+                entry(0xC, 0, 100, 1),
+                entry(0xD, 0, 100, 2),
+            ],
+            3,
+        );
+        pool.reinsert(entry(0xB, 0, 100, 9), 3, 16, BUMP).unwrap();
+        assert!(!pool.contains(&entry(0xB, 1, 100, 9).hash));
+        assert!(pool.contains(&entry(0xC, 0, 100, 1).hash));
+        assert_eq!(pool.size(), 3);
+
+        // No higher nonce of its own: the normal tip rule (C has tip 1 < 3).
+        pool.reinsert(entry(0xE, 0, 100, 3), 3, 16, BUMP).unwrap();
+        assert!(
+            !pool.contains(&entry(0xC, 0, 100, 1).hash),
+            "lowest tip evicted"
+        );
+        assert!(matches!(
+            pool.reinsert(entry(0xF, 0, 100, 1), 3, 16, BUMP),
+            Err(MempoolError::PoolFull)
+        ));
+    }
+
+    /// Item 7 step 1: a lower EVM gas limit removes the txs declaring more.
+    #[test]
+    fn evict_gas_above_removes_only_txs_over_the_limit() {
+        let heavy = EvmPoolEntry {
+            gas_limit: 2_500_000,
+            ..entry(0xA, 0, 100, 5)
+        };
+        let mut pool = pool_with(10, &[heavy.clone(), entry(0xA, 1, 100, 5)], 100);
+        assert_eq!(pool.evict_gas_above(1_000_000), (1, heavy.raw_rlp.len()));
+        assert!(!pool.contains(&heavy.hash));
+        assert_eq!(pool.size(), 1);
+        assert_eq!(pool.evict_gas_above(1_000_000), (0, 0));
     }
 
     /// Fix (a) replacement: geth rule, both the max fee and the tip must rise
@@ -633,7 +792,7 @@ mod tests {
             (1, entries[0].raw_rlp.len())
         );
         pool.set_base_fee(10);
-        pool.drain(1_000_000, None, &B256::ZERO, 10);
+        pool.drain(1_000_000, usize::MAX, None, &B256::ZERO, 10);
         assert_eq!(pool.size(), 0);
         assert!(pool.by_price.is_empty(), "no stale keys left in by_price");
         assert!(pool.by_hash.is_empty());

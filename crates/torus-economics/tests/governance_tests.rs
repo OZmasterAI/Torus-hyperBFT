@@ -664,6 +664,44 @@ fn execute_price_band_parameter_change() {
     assert_eq!(torus_types::price_band_bps(Some(&data)), 1_000);
 }
 
+/// Item 7 step 1: the EVM block gas limit (1M..=10M) and the EVM block
+/// interval N (2..=100) are ParameterChange keys. Out of range or not a
+/// number is refused at submission; a valid value executes into its own
+/// CF_FEE_CONFIG row (the next epoch plan copies it). RED before: both keys
+/// were not modifiable.
+#[test]
+fn evm_block_param_changes_are_range_checked_and_execute_into_fee_config() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let keys = [
+        torus_types::EVM_BLOCK_GAS_LIMIT_PARAM,
+        torus_types::EVM_BLOCK_INTERVAL_PARAM,
+    ];
+    for key in keys {
+        for bad in ["999999", "10000001", "1", "101", "x"] {
+            let payload = ExecutionPayload::ParameterChange {
+                param_key: key.into(),
+                new_value: bad.into(),
+            };
+            let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+            assert!(
+                matches!(&r, Err(EconomicsError::InvalidParameterValue { key: k, .. }) if k == key),
+                "{key} = {bad}: {r:?}"
+            );
+        }
+    }
+    for (block, (key, value)) in [(0, (keys[0], "3000000")), (200, (keys[1], "5"))] {
+        pass_param(&gov, key, value, &[2], block);
+        let data = gov
+            .state()
+            .get_cf_raw(CF_FEE_CONFIG, key.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, value.as_bytes(), "{key}");
+    }
+}
+
 #[test]
 fn execute_treasury_spend() {
     let (_dir, gov, staking) = setup();

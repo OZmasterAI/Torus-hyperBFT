@@ -216,6 +216,7 @@ pub struct ReceiveProposalHeaderEvent {
     pub timestamp: SystemTime,
     pub origin: VerifyingKey,
     pub view: ViewNumber,
+    pub height: BlockHeight,
     pub block_hash: CryptoHash,
 }
 
