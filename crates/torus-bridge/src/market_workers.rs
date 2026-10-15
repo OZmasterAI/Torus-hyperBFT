@@ -194,6 +194,96 @@ impl MarketWorkerPool {
         Ok(out)
     }
 
+    /// TORUS_PARALLEL_MATCH_SETUP: [`Self::match_parallel_capped_with`] where
+    /// each market's job first builds its requests: `setup(market_id, &mut
+    /// book, input)` runs on the job, then the market is matched. `items` are
+    /// `(market_id, book, setup input, LPT weight)`; the weight is the
+    /// market's request count, so the chunk layout is the one
+    /// `match_parallel_capped_with` would pick. A panic in `setup` is
+    /// contained like a matching panic: that market's [`MarketWorkerPanic`]
+    /// (the block's fatal path), never a skip or a retry.
+    pub(crate) fn match_parallel_setup_with<'a, W: Send, S>(
+        items: Vec<(MarketId, OrderBook, W, usize)>,
+        timestamp: u64,
+        max_workers: usize,
+        makers: Option<&dyn MakerAccountSource>,
+        cloids_checked: bool,
+        setup: &S,
+    ) -> Result<Vec<MarketBatchResult>, MarketWorkerPanic>
+    where
+        S: Fn(MarketId, &mut OrderBook, W) -> Vec<MatchRequest<'a>> + Sync,
+    {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One market's setup + matching, contained (the job's unit of work).
+        let run_one = move |market_id: MarketId, book: OrderBook, w: W| {
+            Self::run_contained(market_id, move || {
+                let mut book = book;
+                let requests = setup(market_id, &mut book, w);
+                Self::match_market(market_id, book, requests, timestamp, makers, cloids_checked)
+            })
+        };
+
+        // Single market — no job, as in `match_parallel_capped_with`.
+        if items.len() == 1 {
+            let (market_id, book, w, _) = items.into_iter().next().unwrap();
+            return run_one(market_id, book, w).map(|r| vec![r]);
+        }
+
+        // Multiple markets — LPT-chunk them across at most `max_workers`
+        // pool jobs, exactly as `match_parallel_capped_with` does.
+        let n = items.len();
+        let workers = max_workers.max(1).min(n);
+        let weights: Vec<(MarketId, usize)> = items
+            .iter()
+            .map(|(id, _, _, weight)| (*id, *weight))
+            .collect();
+        let assignment = Self::assign_chunks(&weights, workers);
+        let mut chunks: Vec<Vec<(MarketId, OrderBook, W)>> =
+            (0..workers).map(|_| Vec::new()).collect();
+        for (i, (id, book, w, _)) in items.into_iter().enumerate() {
+            chunks[assignment[i]].push((id, book, w));
+        }
+        chunks.retain(|c| !c.is_empty());
+
+        // Each job runs its markets in order and stops at its first `Err`
+        // (`process_chunk` semantics: the block is fatal anyway).
+        let reps: Vec<MarketId> = chunks.iter().map(|chunk| chunk[0].0).collect();
+        let run_one = &run_one;
+        let jobs: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (market_id, book, w) in chunk {
+                        let r = run_one(market_id, book, w);
+                        let stop = r.is_err();
+                        out.push(r);
+                        if stop {
+                            break;
+                        }
+                    }
+                    out
+                }
+            })
+            .collect();
+
+        let mut out = Vec::with_capacity(n);
+        for (rep, joined) in reps.into_iter().zip(crate::exec_pool::run_jobs(jobs)) {
+            let chunk_results = joined.unwrap_or_else(|_| {
+                vec![Err(MarketWorkerPanic {
+                    market_id: rep,
+                    message: "worker thread died outside contained matching".to_string(),
+                })]
+            });
+            for r in chunk_results {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Resolve the worker cap: `TORUS_MATCH_WORKERS` (clamped to >= 1) if set and
     /// parseable, else the host parallelism, else 1.
     fn resolve_worker_cap() -> usize {
@@ -663,5 +753,343 @@ mod chunk_indices_tests {
     fn named_cap_falls_back_and_clamps() {
         assert!(MarketWorkerPool::resolve_worker_cap_named(None) >= 1);
         assert!(MarketWorkerPool::resolve_worker_cap_named(Some("TORUS_NO_SUCH_VAR_XYZ")) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod setup_in_jobs_tests {
+    //! TORUS_PARALLEL_MATCH_SETUP: [`MarketWorkerPool::match_parallel_setup_with`]
+    //! builds each market's match inputs inside its pool match job. Whatever
+    //! the cap, it returns what matching the same pre-built batches returns,
+    //! and a setup panic is contained as that market's typed
+    //! [`MarketWorkerPanic`] (the block's fatal path), never skipped.
+    use super::*;
+    use torus_core::order_book::ReduceOnlyPositions;
+    use torus_types::{FixedPoint, OrderType, TimeInForce};
+
+    const TS: u64 = 1000;
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn trader(n: u8) -> Address {
+        Address::new([n; 20])
+    }
+
+    fn limit(
+        m: MarketId,
+        is_buy: bool,
+        px: i64,
+        qty: i64,
+        tif: TimeInForce,
+        reduce_only: bool,
+    ) -> PlaceOrderParams {
+        PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: fp(px),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: tif,
+            reduce_only,
+            client_order_id: None,
+        }
+    }
+
+    /// One market's match input: its orders in submission order and the
+    /// reduce-only positions its book polices (what the executor's setup
+    /// installs on the book before matching).
+    struct MarketInput {
+        id: MarketId,
+        orders: Vec<(Address, PlaceOrderParams, OrderId)>,
+        ro: Vec<(Address, i64)>,
+    }
+
+    /// `markets` markets with uneven loads (LPT has real choices to make):
+    /// crossing buys and sells, IOC / FOK takers, and a reduce-only sell of
+    /// trader 9 (long 2: clamped to 2 only if the setup installed it).
+    fn inputs(markets: u64) -> Vec<MarketInput> {
+        (1..=markets)
+            .map(|m| {
+                let n = 2 + (m * 3 % 7);
+                let mut orders = Vec::new();
+                for k in 0..n {
+                    let sender = trader(20 + (k % 5) as u8);
+                    let tif = match k % 4 {
+                        1 => TimeInForce::IOC,
+                        3 => TimeInForce::FOK,
+                        _ => TimeInForce::GTC,
+                    };
+                    let p = if k % 2 == 0 {
+                        limit(
+                            m,
+                            true,
+                            101 + (k % 3) as i64,
+                            1 + (k % 3) as i64,
+                            tif,
+                            false,
+                        )
+                    } else {
+                        limit(
+                            m,
+                            false,
+                            99 - (k % 3) as i64,
+                            1 + (k % 2) as i64,
+                            tif,
+                            false,
+                        )
+                    };
+                    orders.push((sender, p, 1000 + 100 * m as OrderId + k as OrderId));
+                }
+                orders.push((
+                    trader(9),
+                    limit(m, false, 97, 3, TimeInForce::GTC, true),
+                    1099 + 100 * m as OrderId,
+                ));
+                MarketInput {
+                    id: m,
+                    orders,
+                    ro: vec![(trader(9), 2)],
+                }
+            })
+            .collect()
+    }
+
+    /// The market's book with its makers' ladder (identical on every call).
+    fn seeded_book(m: MarketId) -> OrderBook {
+        let mut b = OrderBook::new(m, fp(1), fp(1));
+        let ladder = [
+            (1u8, false, 101),
+            (2, false, 102),
+            (3, false, 103),
+            (4, true, 99),
+            (5, true, 98),
+            (6, true, 97),
+        ];
+        for (i, &(k, is_buy, px)) in ladder.iter().enumerate() {
+            b.set_next_order_id(1 + i as OrderId);
+            b.place_order(
+                limit(m, is_buy, px, 2, TimeInForce::GTC, false),
+                trader(k),
+                TS,
+            );
+        }
+        b
+    }
+
+    fn ro_positions(input: &MarketInput) -> ReduceOnlyPositions {
+        let mut ro = ReduceOnlyPositions::new();
+        for &(t, s) in &input.ro {
+            ro.insert(t, fp(s));
+        }
+        ro
+    }
+
+    fn requests(input: &MarketInput) -> Vec<MatchRequest<'_>> {
+        input
+            .orders
+            .iter()
+            .map(|(sender, params, order_id)| MatchRequest {
+                sender: *sender,
+                params,
+                order_id: *order_id,
+                margin: None,
+            })
+            .collect()
+    }
+
+    /// What the executor's setup does, on the job: install the policed
+    /// positions, then build the requests.
+    fn setup<'a>(
+        m: MarketId,
+        book: &mut OrderBook,
+        input: &'a MarketInput,
+    ) -> Vec<MatchRequest<'a>> {
+        assert_eq!(m, input.id);
+        book.set_reduce_only_positions(ro_positions(input));
+        requests(input)
+    }
+
+    /// [`setup`] without the policed positions (reduce-only polices as flat).
+    fn setup_without_positions<'a>(
+        _m: MarketId,
+        _book: &mut OrderBook,
+        input: &'a MarketInput,
+    ) -> Vec<MatchRequest<'a>> {
+        requests(input)
+    }
+
+    /// [`setup`] that panics for market 3.
+    fn setup_panics_in_3<'a>(
+        m: MarketId,
+        book: &mut OrderBook,
+        input: &'a MarketInput,
+    ) -> Vec<MatchRequest<'a>> {
+        if m == 3 {
+            panic!("setup boom in market {m}");
+        }
+        setup(m, book, input)
+    }
+
+    type Digest = Vec<(MarketId, OrderId, Vec<(Address, OrderId, String)>, Vec<u8>)>;
+
+    /// Everything a result carries, market-id sorted (the caller sorts).
+    fn digest(mut rs: Vec<MarketBatchResult>) -> Digest {
+        rs.sort_by_key(|r| r.market_id);
+        rs.into_iter()
+            .map(|r| {
+                let results = r
+                    .results
+                    .iter()
+                    .map(|x| (x.sender, x.order_id, format!("{:?}", x.result)))
+                    .collect();
+                (
+                    r.market_id,
+                    r.next_order_id,
+                    results,
+                    borsh::to_vec(&r.book).expect("book encodes"),
+                )
+            })
+            .collect()
+    }
+
+    fn reference(inputs: &[MarketInput], cap: usize) -> Digest {
+        let mut batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> = HashMap::default();
+        for input in inputs {
+            let mut book = seeded_book(input.id);
+            book.set_reduce_only_positions(ro_positions(input));
+            batches.insert(input.id, (book, requests(input)));
+        }
+        digest(
+            MarketWorkerPool::match_parallel_capped_with(batches, TS, cap, None, true)
+                .expect("no panic"),
+        )
+    }
+
+    fn in_jobs(inputs: &[MarketInput], cap: usize) -> Digest {
+        let items: Vec<(MarketId, OrderBook, &MarketInput, usize)> = inputs
+            .iter()
+            .map(|i| (i.id, seeded_book(i.id), i, i.orders.len()))
+            .collect();
+        digest(
+            MarketWorkerPool::match_parallel_setup_with(items, TS, cap, None, true, &setup)
+                .expect("no panic"),
+        )
+    }
+
+    /// (a) Same results as the pre-built batches for every cap, and for a
+    /// single market (the inline path).
+    #[test]
+    fn setup_in_jobs_matches_prebuilt_batches() {
+        let many = inputs(7);
+        for cap in [1usize, 2, 3, 32] {
+            let want = reference(&many, cap);
+            assert_eq!(want.len(), 7);
+            assert_eq!(in_jobs(&many, cap), want, "cap {cap}");
+        }
+        let one = inputs(1);
+        assert_eq!(in_jobs(&one, 4), reference(&one, 4), "single market");
+    }
+
+    /// The reduce-only sell (qty 3) is clamped to the installed position
+    /// (long 2) in every market, so the job's setup ran before its matching;
+    /// without the setup's positions the book does not police it (all 3).
+    #[test]
+    fn setup_runs_before_matching() {
+        let ins = inputs(4);
+        let run = |install: bool| -> Vec<(MarketId, FixedPoint)> {
+            let items: Vec<(MarketId, OrderBook, &MarketInput, usize)> = ins
+                .iter()
+                .map(|i| (i.id, seeded_book(i.id), i, i.orders.len()))
+                .collect();
+            let out = if install {
+                MarketWorkerPool::match_parallel_setup_with(items, TS, 2, None, true, &setup)
+            } else {
+                MarketWorkerPool::match_parallel_setup_with(
+                    items,
+                    TS,
+                    2,
+                    None,
+                    true,
+                    &setup_without_positions,
+                )
+            }
+            .expect("no panic");
+            let mut v: Vec<(MarketId, FixedPoint)> = out
+                .iter()
+                .map(|r| {
+                    let ro = r.results.last().expect("the reduce-only order is last");
+                    assert_eq!(ro.sender, trader(9));
+                    let filled = ro
+                        .result
+                        .fills
+                        .iter()
+                        .fold(FixedPoint::ZERO, |a, f| a + f.quantity);
+                    (r.market_id, filled + ro.result.rested_qty)
+                })
+                .collect();
+            v.sort_by_key(|x| x.0);
+            v
+        };
+        assert_eq!(run(true), (1..=4).map(|m| (m, fp(2))).collect::<Vec<_>>());
+        assert_eq!(run(false), (1..=4).map(|m| (m, fp(3))).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn empty_input_is_ok_empty() {
+        let items: Vec<(MarketId, OrderBook, &MarketInput, usize)> = Vec::new();
+        let out = MarketWorkerPool::match_parallel_setup_with(items, TS, 4, None, true, &setup)
+            .expect("no panic");
+        assert!(out.is_empty());
+    }
+
+    /// (b) A setup panic is that market's `MarketWorkerPanic` (payload kept),
+    /// multi-market at every cap and single-market.
+    #[test]
+    fn setup_panic_is_a_contained_market_worker_panic() {
+        let many = inputs(5);
+        for cap in [1usize, 2, 32] {
+            let items: Vec<(MarketId, OrderBook, &MarketInput, usize)> = many
+                .iter()
+                .map(|i| (i.id, seeded_book(i.id), i, i.orders.len()))
+                .collect();
+            let err = match MarketWorkerPool::match_parallel_setup_with(
+                items,
+                TS,
+                cap,
+                None,
+                true,
+                &setup_panics_in_3,
+            ) {
+                Err(e) => e,
+                Ok(_) => panic!("cap {cap}: a setup panic must surface as MarketWorkerPanic"),
+            };
+            assert_eq!(err.market_id, 3, "cap {cap}");
+            assert!(
+                err.message.contains("setup boom in market 3"),
+                "cap {cap}: {}",
+                err.message
+            );
+        }
+        let single: Vec<(MarketId, OrderBook, &MarketInput, usize)> =
+            vec![(3, seeded_book(3), &many[2], many[2].orders.len())];
+        let err = match MarketWorkerPool::match_parallel_setup_with(
+            single,
+            TS,
+            4,
+            None,
+            true,
+            &setup_panics_in_3,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("single market: a setup panic must surface as MarketWorkerPanic"),
+        };
+        assert_eq!(err.market_id, 3);
+        assert!(
+            err.message.contains("setup boom in market 3"),
+            "{}",
+            err.message
+        );
     }
 }
