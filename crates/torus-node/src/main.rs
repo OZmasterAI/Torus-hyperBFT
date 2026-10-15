@@ -1055,8 +1055,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .on_propose(move |ev: &ProposeEvent| {
+            // Item 7 step 1: hotstuff heights; LeaderState converts them to Torus heights.
             leader_state_for_propose
-                .observe_proposal(ev.proposal.view.int(), ev.proposal.block.height.int());
+                .observe_hotstuff_proposal(ev.proposal.view.int(), ev.proposal.block.height.int());
             rec_propose.propose(ev.timestamp, ev.proposal.block.hash.bytes())
         })
         .on_update_highest_pc(move |ev: &UpdateHighestPCEvent| {
@@ -1066,7 +1067,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rec_receive.receive_proposal(ev.timestamp);
         })
         .on_receive_proposal_header(move |ev: &ReceiveProposalHeaderEvent| {
-            leader_state_for_header.observe_proposal(ev.view.int(), ev.height.int());
+            leader_state_for_header.observe_hotstuff_proposal(ev.view.int(), ev.height.int());
             if ev.origin != own_hotstuff_vk {
                 rec_header.receive_proposal(ev.timestamp);
             }

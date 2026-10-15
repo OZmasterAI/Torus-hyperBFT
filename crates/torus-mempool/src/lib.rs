@@ -604,6 +604,23 @@ impl Mempool {
     /// Submit a raw RLP-encoded EVM transaction.
     /// Decodes, validates, checks rate limit, and inserts. Returns the tx hash.
     pub fn add_evm_tx(&self, raw_rlp: Vec<u8>) -> Result<B256, MempoolError> {
+        self.admit_evm_tx(raw_rlp, false)
+    }
+
+    /// D1 (S392): bound tx gas by the EVM budget, not just the block gas
+    /// limit — a tx above the budget would pass a bare block-limit check yet
+    /// sit unselectable in the pool forever (stuck nonce). Item 7 step 1: the
+    /// block gas limit is the committed header's (`set_evm_gas_limit`).
+    fn max_evm_tx_gas(&self) -> u64 {
+        self.current_evm_gas_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(self.config.evm_block_gas_budget)
+    }
+
+    /// [`Self::add_evm_tx`]. With `reinsert` (item 7 step 1: a tx drained into
+    /// our own proposal comes back) the tx skips the memory budget, and a full
+    /// per-sender or pool cap makes room ([`evm_pool::EvmPool::reinsert`]).
+    fn admit_evm_tx(&self, raw_rlp: Vec<u8>, reinsert: bool) -> Result<B256, MempoolError> {
         // Item 7 step 1: a block carries at most 256 KiB of EVM tx bytes (vote
         // rule), so a bigger tx could never be selected.
         if raw_rlp.len() > torus_types::MAX_EVM_BLOCK_TX_BYTES {
@@ -612,19 +629,11 @@ impl Mempool {
                 max: torus_types::MAX_EVM_BLOCK_TX_BYTES,
             });
         }
-        // D1 (S392): bound tx gas by the EVM budget, not just the block gas
-        // limit — a tx above the budget would pass a bare block-limit check
-        // yet sit unselectable in the pool forever (stuck nonce). Item 7 step
-        // 1: the block gas limit is the committed header's (`set_evm_gas_limit`).
-        let max_tx_gas = self
-            .current_evm_gas_limit
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .min(self.config.evm_block_gas_budget);
         let entry = validate::validate_evm_tx(
             &raw_rlp,
             &self.ingress_state(),
             self.config.chain_id,
-            max_tx_gas,
+            self.max_evm_tx_gas(),
             self.current_base_fee
                 .load(std::sync::atomic::Ordering::Relaxed),
         )?;
@@ -632,8 +641,10 @@ impl Mempool {
         let hash = entry.hash;
         let tx_size = raw_rlp.len();
 
-        // Memory budget check (Phase 3: 3.1.7).
-        if self.config.max_memory_bytes > 0 {
+        // Memory budget check (Phase 3: 3.1.7). A reinserted tx skips it: its
+        // bytes left the budget when it was drained, so putting it back
+        // overshoots by at most what our pending proposals drained.
+        if self.config.max_memory_bytes > 0 && !reinsert {
             let current = self.memory_used.load(std::sync::atomic::Ordering::Relaxed);
             if current + tx_size > self.config.max_memory_bytes {
                 return Err(MempoolError::PoolFull);
@@ -645,13 +656,26 @@ impl Mempool {
         if pool.contains(&hash) {
             return Err(MempoolError::DuplicateTx(hash));
         }
+        // Item 7 step 1: re-check under the lock: `set_evm_gas_limit` may have
+        // lowered the cap, and evicted the pool above it, since validation.
+        let max_tx_gas = self.max_evm_tx_gas();
+        if entry.gas_limit > max_tx_gas {
+            return Err(MempoolError::GasLimitExceeded {
+                tx_gas: entry.gas_limit,
+                block_gas: max_tx_gas,
+            });
+        }
 
-        let (_replaced, freed_bytes) = pool.insert(
-            entry,
+        let (max_pool_size, max_per_sender, bump_pct) = (
             self.config.max_pool_size,
             self.config.max_per_sender,
             self.config.replacement_bump_pct,
-        )?;
+        );
+        let (_replaced, freed_bytes) = if reinsert {
+            pool.reinsert(entry, max_pool_size, max_per_sender, bump_pct)?
+        } else {
+            pool.insert(entry, max_pool_size, max_per_sender, bump_pct)?
+        };
 
         // Track memory usage (Phase 3: 3.1.7)
         self.memory_used
@@ -666,11 +690,19 @@ impl Mempool {
         Ok(hash)
     }
 
-    /// Re-insert previously drained EVM transactions (e.g., after block reorg).
+    /// Re-insert previously drained EVM transactions: item 7 step 1, the txs
+    /// of our own proposals that lost at their height, or that we propose
+    /// again. Each is re-validated like a new tx: executed nonces drop as
+    /// `NonceTooLow`, txs pooled again as `DuplicateTx`. A full per-sender or
+    /// pool cap makes room for it (see [`evm_pool::EvmPool::reinsert`]); any
+    /// other refusal loses the tx, so it is logged at warn.
     pub fn reinsert_evm(&self, raw_txs: Vec<Vec<u8>>) {
         for raw in raw_txs {
-            if let Err(e) = self.add_evm_tx(raw) {
-                tracing::trace!("reinsert skipped: {e}");
+            match self.admit_evm_tx(raw, true) {
+                Ok(_)
+                | Err(MempoolError::NonceTooLow { .. })
+                | Err(MempoolError::DuplicateTx(_)) => {}
+                Err(e) => tracing::warn!("drained EVM tx not reinserted: {e}"),
             }
         }
     }
@@ -680,7 +712,10 @@ impl Mempool {
     /// D1 (S392): selection is bounded by the block's EVM gas budget —
     /// min(block gas limit, configured budget; 5M debut default,
     /// `TORUS_EVM_BLOCK_GAS_BUDGET` override) — with an optional per-sender
-    /// share cap. Count caps deleted. Respects per-sender nonce ordering and
+    /// share cap. Count caps deleted. Item 7 step 1: and by
+    /// `MAX_EVM_BLOCK_TX_BYTES` (256 KiB) of raw tx bytes, the vote's cap; the
+    /// count cap (limit / 21,000) needs no check, as admission requires at
+    /// least 21,000 gas per tx. Respects per-sender nonce ordering and
     /// removes selected txs from the pool.
     ///
     /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
@@ -696,7 +731,13 @@ impl Mempool {
             .current_base_fee
             .load(std::sync::atomic::Ordering::Relaxed) as u128;
         let mut pool = self.evm.write().unwrap();
-        let drained = pool.drain(budget, sender_gas_cap, &parent_hash, min_base_fee);
+        let drained = pool.drain(
+            budget,
+            torus_types::MAX_EVM_BLOCK_TX_BYTES,
+            sender_gas_cap,
+            &parent_hash,
+            min_base_fee,
+        );
         // FIX EVM-FIND-02: Decrement memory for drained transactions.
         let drained_bytes: usize = drained.iter().map(|tx| tx.len()).sum();
         if drained_bytes > 0 {
@@ -718,10 +759,29 @@ impl Mempool {
     }
 
     /// Item 7 step 1: the committed header's EVM gas limit caps admission (it
-    /// can change at an epoch boundary by governance).
+    /// can change at an epoch boundary by governance). When the cap drops,
+    /// pooled txs above it are evicted: the drain could never select them,
+    /// and each would hold its sender's later nonces back for good (the D1
+    /// stuck nonce, see [`Self::max_evm_tx_gas`]). Stored under the EVM lock,
+    /// like the base fee, so admission re-checks against the latest value.
     pub fn set_evm_gas_limit(&self, gas_limit: u64) {
-        self.current_evm_gas_limit
-            .store(gas_limit, std::sync::atomic::Ordering::Relaxed);
+        let mut pool = self.evm.write().unwrap();
+        let old = self
+            .current_evm_gas_limit
+            .swap(gas_limit, std::sync::atomic::Ordering::Relaxed);
+        let budget = self.config.evm_block_gas_budget;
+        if gas_limit.min(budget) < old.min(budget) {
+            let (evicted, freed_bytes) = pool.evict_gas_above(gas_limit.min(budget));
+            if evicted > 0 {
+                self.memory_used
+                    .fetch_sub(freed_bytes, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    evicted,
+                    gas_limit,
+                    "evicted pooled EVM txs above the lower EVM gas limit"
+                );
+            }
+        }
     }
 
     /// Current D4 fee floor in wei.
@@ -4523,6 +4583,104 @@ mod tests {
         );
         pool.add_evm_tx(call(&k, 200 * 1024))
             .expect("a 200 KiB tx is admitted");
+    }
+
+    /// The drain keeps a block's raw EVM tx bytes within the 256 KiB vote cap.
+    /// Two ~140 KB zero-calldata calls fit the 3M gas limit together (~1.2M
+    /// gas) but not the byte cap: one is selected, the other stays pooled for
+    /// the next EVM height. RED before: both were drained, into a block every
+    /// honest validator refuses.
+    #[test]
+    fn drain_keeps_evm_tx_bytes_within_the_block_cap() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        for seed in [210, 211] {
+            let k = intrinsic_case(&state, seed);
+            pool.add_evm_tx(eip1559_with(
+                &k,
+                600_000,
+                TxKind::Call(Address::ZERO),
+                vec![0u8; 140_000],
+                Default::default(),
+            ))
+            .unwrap();
+        }
+        let first = pool.drain_evm(3_000_000, B256::ZERO);
+        assert_eq!(first.len(), 1, "two ~140 KB txs would pass 256 KiB");
+        assert_eq!(pool.evm_pool_size(), 1, "the other tx stays pooled");
+        assert_eq!(pool.drain_evm(3_000_000, B256::ZERO).len(), 1);
+        assert_eq!(pool.evm_pool_size(), 0);
+    }
+
+    /// A lower committed limit (a governance cut) evicts pooled txs above it:
+    /// the drain could never select them, and they would hold the sender's
+    /// later nonces back for good. RED before: the 2.5M tx stayed pooled,
+    /// nonce 0 stayed taken and nothing of the sender drained.
+    #[test]
+    fn lower_committed_gas_limit_evicts_pooled_txs_above_it() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(
+            state.clone(),
+            MempoolConfig {
+                evm_block_gas_budget: u64::MAX,
+                ..MempoolConfig::default()
+            },
+        );
+        pool.set_evm_gas_limit(3_000_000);
+        let k = intrinsic_case(&state, 212);
+        let tx = |nonce, gas| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, gas, U256::ZERO);
+        pool.add_evm_tx(tx(0, 2_500_000)).unwrap();
+        pool.add_evm_tx(tx(1, 21_000)).unwrap();
+        let before = pool.memory_used();
+
+        pool.set_evm_gas_limit(1_000_000);
+        assert_eq!(pool.evm_pool_size(), 1, "the 2.5M tx is evicted");
+        assert_eq!(pool.memory_used(), before - tx(0, 2_500_000).len());
+        assert_eq!(pool.pending_nonce(&address_from_key(&k)), 0);
+        pool.add_evm_tx(tx(0, 21_000))
+            .expect("nonce 0 is free again under the new limit");
+        assert_eq!(
+            pool.drain_evm(1_000_000, B256::ZERO),
+            vec![tx(0, 21_000), tx(1, 21_000)]
+        );
+    }
+
+    /// A drained tx that comes back (our proposal lost) is not refused
+    /// because its sender filled its slots with later nonces meanwhile: the
+    /// sender's highest nonce makes room, so the queue starts at the lowest
+    /// nonce again. A new tx still waits for a slot. RED before: the reinsert
+    /// was refused (PoolFull, logged at trace) and nonces 1-4 drained into a
+    /// nonce gap, which execution skips.
+    #[test]
+    fn reinsert_makes_room_by_evicting_the_senders_highest_nonce() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(
+            state.clone(),
+            MempoolConfig {
+                max_per_sender: 4,
+                ..MempoolConfig::default()
+            },
+        );
+        let k = intrinsic_case(&state, 213);
+        let tx = |nonce| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, 21_000, U256::ZERO);
+        pool.add_evm_tx(tx(0)).unwrap();
+        let drained = pool.drain_evm(21_000, B256::ZERO);
+        assert_eq!(drained, vec![tx(0)]);
+        for nonce in 1..=4 {
+            pool.add_evm_tx(tx(nonce)).unwrap();
+        }
+        assert!(
+            matches!(pool.add_evm_tx(tx(0)), Err(MempoolError::PoolFull)),
+            "admission keeps the per-sender cap"
+        );
+
+        pool.reinsert_evm(drained);
+        assert_eq!(pool.evm_pool_size(), 4);
+        assert_eq!(
+            pool.drain_evm(3_000_000, B256::ZERO),
+            (0..4).map(tx).collect::<Vec<_>>(),
+            "nonce 0 is back at the head; nonce 4 made room"
+        );
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----

@@ -29,9 +29,11 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
 - **Cadence and caps:** pre-vote only, in `evm_body_fits_header`: EVM txs only at `height % N == 0`, count <=
   `evm_gas_limit / 21_000`, raw bytes <= 256 KiB.
 - **Proposer:** at a boundary it uses the plan's values; it drains EVM only on cadence (otherwise txs stay pooled).
+  Review fix: the drain also keeps the raw EVM tx bytes within 256 KiB (a tx over it stays pooled).
 - **Governance:** keys `evm_block_gas_limit` (1M..=10M) and `evm_block_interval` (2..=100), range-checked at
   submission and execution. A change lands at boundary + L, 100-199 blocks after it executes.
-- **Mempool:** admission caps tx gas at the committed header's limit and tx size at 256 KiB.
+- **Mempool:** admission caps tx gas at the committed header's limit and tx size at 256 KiB. Review fix: a lower
+  committed limit evicts pooled txs above it.
 - **Lost txs:** EVM txs drained into our own proposal go back to the pool when another block commits at that height.
 - **Routing:** RPC forwards EVM txs to the leader of the next EVM height, not the current-view leader.
 - **RPC:** `eth_call` / `eth_estimateGas` default and cap gas at the header limit (today 30M, which revm rejects above
@@ -591,6 +593,11 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
   `DuplicateTx`), and each sender's queue is nonce-ordered, so order survives. Rare gap: a tx committed in a later,
   not yet executed block can be re-pooled and is then skipped at execution (same class as "prune uses executed
   nonces").
+  Review fix (cadence-2): order survives only with two more rules. A re-proposal at a height we already proposed
+  first reinserts that proposal's txs (the drain starts each sender at its lowest pooled nonce), and the record
+  keeps each tx once. A reinserted tx skips the memory budget and, when its sender's slots or the pool are full,
+  evicts the sender's highest pooled nonce above it (`EvmPool::reinsert`); other refusals log at warn. Not covered:
+  our proposal at H off the parent's chain while we build a later EVM height before H commits.
 - **Verify:** `$L cargo test $P lost_proposal own_committed_proposal_reinserts_nothing`
 - **Depends on:** E8
 
@@ -640,8 +647,11 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
         }
     ```
     `set_evm_block_interval(header.evm_block_interval)` at ~5775 (boot) and ~7489 (commit).
-  - main.rs: `on_propose` calls `observe_proposal(ev.proposal.view.int(), ev.proposal.block.height.int())`;
-    `on_receive_proposal_header` calls `observe_proposal(ev.view.int(), ev.height.int())`; then
+  - main.rs: `on_propose` calls `observe_hotstuff_proposal(ev.proposal.view.int(), ev.proposal.block.height.int())`;
+    `on_receive_proposal_header` calls `observe_hotstuff_proposal(ev.view.int(), ev.height.int())`. Review fix
+    (routing-1/2): the events carry the hotstuff height (the first block is 0, its Torus header 1), so the tip keeps
+    `hs_height + 1`; a view above `current_view() + 1` is ignored (a header reaches the event before its justify
+    is checked, and its leader picks the view). Then
     `rpc_server.set_evm_leader_fn(Arc::new(move || ls.next_evm_leader().map(|vk| vk.to_bytes())))`.
   - torus-rpc: field `evm_leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>` (init `None` near
     lib.rs:366), `pub fn set_evm_leader_fn(&mut self, f: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>)`, and in

@@ -102,18 +102,28 @@ block insertion. Execution of boundary H copies the governance values into the p
 Values outside the range are refused at submission and at execution. A stored value that is
 absent or invalid leaves the chain's value unchanged.
 
+A node fills an EVM block, and admits a transaction, only up to `min(evm_gas_limit,
+TORUS_EVM_BLOCK_GAS_BUDGET)`; the budget is node-local and defaults to 5,000,000. So an
+`evm_block_gas_limit` above a node's budget changes neither that node's blocks nor its admission
+cap, while `eth_estimateGas` still searches up to the header limit and can quote gas that the
+same node's admission refuses. Raise `TORUS_EVM_BLOCK_GAS_BUDGET` on every node together with
+such a governance change.
+
 Per block, checked before voting (a block that breaks one gets no vote):
 
 * EVM transactions only when `height % N == 0`; an honest proposer leaves them pooled in the other
   blocks.
 * At most `evm_gas_limit / 21,000` EVM transactions.
-* At most 256 KiB (262,144 bytes) of raw EVM transaction bytes.
+* At most 256 KiB (262,144 bytes) of raw EVM transaction bytes; an honest proposer leaves the
+  transactions that would go over pooled.
 * Declared gas of the EVM transactions at most `evm_gas_limit` (step 0).
 
 Admission to the EVM pool refuses a transaction above 256 KiB (`TxTooLarge`) or with a gas
 limit above the `evm_gas_limit` of the last committed header handed to execution (or
-`TORUS_EVM_BLOCK_GAS_BUDGET`, if lower). `eth_call` and `eth_estimateGas` use the head header's
-`evm_gas_limit` as their default gas and clamp a larger `gas` to it.
+`TORUS_EVM_BLOCK_GAS_BUDGET`, if lower). When a committed header lowers that limit, pooled
+transactions above it are evicted (they could never be selected). `eth_call` and
+`eth_estimateGas` use the head header's `evm_gas_limit` as their default gas and clamp a larger
+`gas` to it.
 
 Constants: `DEFAULT_EVM_GAS_LIMIT`, `DEFAULT_EVM_BLOCK_INTERVAL`, `MAX_EVM_BLOCK_TX_BYTES`,
 `EVM_MIN_TX_GAS` and the two key names and ranges, in `crates/torus-types/src/lib.rs`.

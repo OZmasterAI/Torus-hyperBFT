@@ -871,7 +871,7 @@ pub struct LeaderState {
     /// stale during timeout churn) and the REAL selection (reputation-aware
     /// when the fleet runs it, unlike the plain-IWRR fallback below).
     observed_leader: RwLock<Option<(u64, VerifyingKey)>>,
-    /// Item 7 step 1: `(view, height)` of the newest observed proposal.
+    /// Item 7 step 1: `(view, Torus height)` of the newest observed proposal.
     tip: RwLock<(u64, u64)>,
     /// Item 7 step 1: the committed header's N (0 = unknown).
     evm_block_interval: AtomicU64,
@@ -945,9 +945,23 @@ impl LeaderState {
         ))
     }
 
-    /// Item 7 step 1: record a proposal (own or received header) for
-    /// `height` in `view`. Out-of-order delivery for an older view is ignored.
-    pub fn observe_proposal(&self, view: u64, height: u64) {
+    /// Item 7 step 1: record a proposal (own or received header) at hotstuff
+    /// height `hs_height` in `view`. Hotstuff numbers blocks from 0 and the
+    /// Torus header from 1 (the first block extends the genesis header, height
+    /// 0), so the tip keeps `hs_height + 1`, the height the EVM cadence counts.
+    ///
+    /// Ignored: a view older than the tip's (out-of-order delivery), and a
+    /// view beyond the pacemaker's next one. A header reaches this before its
+    /// justify is checked and its leader picks the view, so one far-future
+    /// header would otherwise pin the tip for good. The next view's leader can
+    /// propose before our StartView, so that view is taken.
+    pub fn observe_hotstuff_proposal(&self, view: u64, hs_height: u64) {
+        let Some(height) = hs_height.checked_add(1) else {
+            return;
+        };
+        if view > self.current_view().saturating_add(1) {
+            return;
+        }
         let mut tip = self.tip.write().unwrap();
         if view >= tip.0 {
             *tip = (view, height);
@@ -2202,7 +2216,8 @@ fn check_parent_link(
 /// declared gas limits sum to at most `evm_gas_limit`: gas used is unknown
 /// before execution, and execution fails the whole EVM section once the
 /// cumulative gas exceeds the limit. An honest proposer passes: `drain_evm`
-/// sums declared limits up to min(header limit, local budget). A tx that does
+/// sums declared limits up to min(header limit, local budget) and keeps the raw
+/// tx bytes within 256 KiB (item 7 step 1). A tx that does
 /// not decode counts no gas: execution skips it (D3 S392, s84 decision 1), it
 /// is never a reason to reject the block.
 ///
@@ -7273,6 +7288,17 @@ impl TorusApp {
         } else {
             0
         };
+        // Item 7 step 1: proposing a height again (our block there got no QC), first put the
+        // EVM txs of our earlier proposal back. The drain starts each sender at its lowest
+        // pooled nonce, so it would otherwise propose the next nonce without them: execution
+        // skips it (nonce gap), and if this block commits, the commit-time reinsert filters
+        // it out as committed. Either block can still commit, so the record stays.
+        if let (Some(mempool), Some(earlier)) = (
+            self.mempool.as_ref(),
+            self.own_evm_proposed.get(&next_height),
+        ) {
+            mempool.reinsert_evm(earlier.clone());
+        }
         let (native_with_senders, evm_txs) = {
             let _select_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_select_seconds);
@@ -7359,12 +7385,15 @@ impl TorusApp {
         }
 
         // Item 7 step 1: remember the EVM txs drained into this proposal, so
-        // they go back to the pool if another block commits at this height.
+        // they go back to the pool if another block commits at this height
+        // (once each: a re-proposal at this height drains them again).
         if !block.evm_transactions.is_empty() {
-            self.own_evm_proposed
-                .entry(height)
-                .or_default()
-                .extend(block.evm_transactions.iter().cloned());
+            let record = self.own_evm_proposed.entry(height).or_default();
+            for tx in &block.evm_transactions {
+                if !record.contains(tx) {
+                    record.push(tx.clone());
+                }
+            }
         }
 
         // Note our own block's hashes too: a same-height re-proposal would
@@ -7769,8 +7798,9 @@ impl App<RocksKVStore> for TorusApp {
 impl TorusApp {
     /// Item 7 step 1: one block commits per height: our proposals at `height` that lost go
     /// back to the pool, minus what the committed block carries. Lower heights are settled
-    /// (the commit feed is ordered). `reinsert_evm` re-validates each tx (`add_evm_tx`):
-    /// executed nonces drop as `NonceTooLow`, txs pooled again as `DuplicateTx`.
+    /// (the commit feed is ordered). `reinsert_evm` re-validates each tx like `add_evm_tx`
+    /// (executed nonces drop as `NonceTooLow`, txs pooled again as `DuplicateTx`), and a
+    /// sender whose later nonces filled its slots meanwhile makes room for it.
     fn reinsert_lost_evm(&mut self, height: u64, committed: &[Vec<u8>]) {
         let lost: Vec<Vec<u8>> = self
             .own_evm_proposed
@@ -10126,17 +10156,18 @@ mod leader_state_tests {
         assert_eq!(ls.next_evm_leader(), ls.current_leader());
 
         ls.set_evm_block_interval(5);
-        // Tip 21 at view 40: 22, 23, 24 in views 41-43, so 25 in view 44.
-        ls.observe_proposal(40, 21);
+        // Tip Torus 21 (hotstuff 20) at view 40: 22, 23, 24 in views 41-43, so 25 in view 44.
+        ls.observe_hotstuff_proposal(40, 20);
         assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 44)));
         // Views moved on to 43 without a new proposal: 22 in 43, 25 in 46.
         ls.observe_start_view(43, plain_iwrr(&ls, 43));
         assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 46)));
         // Tip 24 at view 50: 25 is the next block, in view 51.
-        ls.observe_proposal(50, 24);
+        ls.observe_start_view(50, plain_iwrr(&ls, 50));
+        ls.observe_hotstuff_proposal(50, 23);
         assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 51)));
         // Tip 25 at view 51 (an EVM height itself): the next one is 30, in 56.
-        ls.observe_proposal(51, 25);
+        ls.observe_hotstuff_proposal(51, 24);
         assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 56)));
     }
 
@@ -10149,10 +10180,66 @@ mod leader_state_tests {
         ls.sync_validators(&set);
         ls.observe_start_view(40, plain_iwrr(&ls, 40));
         ls.set_evm_block_interval(1);
-        ls.observe_proposal(40, u64::MAX);
+        // Torus height u64::MAX: the next EVM height overflows.
+        ls.observe_hotstuff_proposal(40, u64::MAX - 1);
+        assert_eq!(*ls.tip.read().unwrap(), (40, u64::MAX));
         assert_eq!(ls.next_evm_leader(), ls.current_leader());
-        ls.observe_proposal(u64::MAX, 7);
+        // A hotstuff height whose Torus height overflows is ignored.
+        ls.observe_hotstuff_proposal(41, u64::MAX);
+        assert_eq!(*ls.tip.read().unwrap(), (40, u64::MAX));
+        // The pacemaker at view u64::MAX: the tip view + 1 overflows.
+        ls.observe_start_view(u64::MAX, plain_iwrr(&ls, u64::MAX));
+        ls.observe_hotstuff_proposal(u64::MAX, 7);
+        assert_eq!(*ls.tip.read().unwrap(), (u64::MAX, 8));
         assert_eq!(ls.next_evm_leader(), ls.current_leader());
+    }
+
+    /// Hotstuff numbers blocks from 0 and the Torus header from 1 (the block
+    /// at hotstuff height 0 carries Torus height 1, see
+    /// `first_block_uses_the_configured_genesis_header`); the cadence is on
+    /// the Torus height, and the proposal events carry the hotstuff height.
+    /// RED before: the hotstuff height was taken as the Torus height, so every
+    /// prediction named the leader one view after the EVM height.
+    #[test]
+    fn next_evm_leader_converts_the_hotstuff_height() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.set_evm_block_interval(5);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        // Hotstuff 3 = Torus 4 in view 40: Torus 5 is the next block, in view 41.
+        ls.observe_hotstuff_proposal(40, 3);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 41)));
+        // Hotstuff 4 = Torus 5 (an EVM height) in view 41: Torus 10 in view 46.
+        ls.observe_start_view(41, plain_iwrr(&ls, 41));
+        ls.observe_hotstuff_proposal(41, 4);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 46)));
+    }
+
+    /// A proposal header reaches the tip before its justify is checked, and
+    /// its leader picks the view: one header for a far-future view must not
+    /// pin the prediction. Views above the pacemaker's next view are ignored;
+    /// the next view is taken (its leader can propose before our StartView).
+    /// RED before: the tip froze at that view for good.
+    #[test]
+    fn evm_routing_tip_ignores_views_beyond_the_next_one() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.set_evm_block_interval(5);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        ls.observe_hotstuff_proposal(40, 21);
+        let tip = *ls.tip.read().unwrap();
+        let leader = ls.next_evm_leader();
+        for view in [41 + 1_000_000, u64::MAX] {
+            ls.observe_hotstuff_proposal(view, 7);
+            assert_eq!(*ls.tip.read().unwrap(), tip, "view {view} ignored");
+            assert_eq!(ls.next_evm_leader(), leader, "view {view}");
+        }
+        // Hotstuff 22 = Torus 23 in view 41: 24 in view 42, 25 in view 43.
+        ls.observe_hotstuff_proposal(41, 22);
+        assert_eq!(*ls.tip.read().unwrap(), (41, 23));
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 43)));
     }
 }
 
@@ -21559,10 +21646,9 @@ mod crash_recovery_tests {
         drop(ctx);
     }
 
-    /// A pool holding txs of the funded `evm_tx_gas` sender (key 71), with no
-    /// proposer budget or sender-share cap.
-    fn funded_evm_mempool(db: &StateDb) -> Arc<Mempool> {
-        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+    /// The EVM signer with key bytes `[seed; 32]`, funded with 1 ETH in `db`.
+    fn funded_evm_signer(db: &StateDb, seed: u8) -> k256::ecdsa::SigningKey {
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
         let sender = {
             let pubkey = key.verifying_key().to_encoded_point(false);
             Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
@@ -21578,6 +21664,13 @@ mod crash_recovery_tests {
             },
         )
         .unwrap();
+        key
+    }
+
+    /// A pool holding txs of the funded `evm_tx_gas` sender (key 71), with no
+    /// proposer budget or sender-share cap.
+    fn funded_evm_mempool(db: &StateDb) -> Arc<Mempool> {
+        funded_evm_signer(db, 71);
         Arc::new(Mempool::new(
             db.clone(),
             torus_mempool::MempoolConfig {
@@ -21949,6 +22042,75 @@ mod crash_recovery_tests {
         app.on_committed_block(&committed, committed.hash);
         rx.try_recv().expect("height 5 must reach execution");
         assert_eq!(sorted(mempool.drain_evm(u64::MAX, B256::ZERO)), sorted(txs));
+    }
+
+    /// The proposer keeps a block's EVM tx bytes within the 256 KiB vote cap.
+    /// Two 200 KiB zero-calldata calls from two senders fit the 3M limit
+    /// (2 x 1.2M gas) but not the cap: the block at height 5 carries one and
+    /// passes the pre-vote check, the other stays pooled. RED before: it
+    /// carried both, and every honest validator refused it.
+    #[test]
+    fn honest_proposal_keeps_evm_tx_bytes_within_the_vote_cap() {
+        let (config, db) = make_test_config_and_db();
+        let mempool = funded_evm_mempool(&db);
+        let keys = [
+            k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap(),
+            funded_evm_signer(&db, 72),
+        ];
+        let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
+        for key in &keys {
+            let tx = signed_eip1559_gas(key, 0, to, vec![0u8; 200 * 1024], U256::ZERO, 1_200_000);
+            mempool.add_evm_tx(tx).unwrap();
+        }
+        let mut app = TorusApp::new(db, &config, None, Some(mempool.clone()), None);
+        let parent = tip_2000();
+        let _ = app.build_proposal(parent.header.clone());
+        let produced = app.pending_proposals[&5].block.clone();
+        assert_eq!(produced.evm_transactions.len(), 1, "one 200 KiB tx fits");
+        assert_eq!(mempool.evm_pool_size(), 1, "the other stays pooled");
+        assert_eq!(pre_vote(&mut app, &parent, &produced), BlockDataCheck::Held);
+    }
+
+    /// Our proposal at 5 drained the sender's nonce 0, then nonce 1 arrived.
+    /// A re-proposal at 5 (the first got no QC) carries nonce 0 before nonce
+    /// 1: the txs of our earlier proposal at that height go back to the pool
+    /// first. Whichever of the two commits, nothing is lost. RED before: the
+    /// re-proposal carried nonce 1 alone, which execution skips (nonce gap),
+    /// and if it committed, the reinsert filtered nonce 1 out as committed.
+    #[test]
+    fn same_height_reproposal_keeps_the_senders_nonce_order() {
+        for first_commits in [false, true] {
+            let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(1);
+            let _ = app.build_proposal(tip_2000().header);
+            let first = app.pending_proposals[&5].block.clone();
+            assert_eq!(first.evm_transactions, txs);
+            let n1 = evm_tx_gas(1, 100_000);
+            mempool.add_evm_tx(n1.clone()).unwrap();
+
+            let _ = app.build_proposal(tip_2000().header);
+            let again = app.pending_proposals[&5].block.clone();
+            assert_eq!(
+                again.evm_transactions,
+                vec![txs[0].clone(), n1.clone()],
+                "nonce 0 before nonce 1"
+            );
+
+            let (winner, pooled) = if first_commits {
+                (first, vec![n1])
+            } else {
+                (again, vec![])
+            };
+            app.exec_next_height = Some(5);
+            let committed = committed_compact_block(&winner);
+            app.on_committed_block(&committed, committed.hash);
+            rx.try_recv().expect("height 5 must reach execution");
+            assert_eq!(
+                mempool.drain_evm(u64::MAX, B256::ZERO),
+                pooled,
+                "first_commits={first_commits}"
+            );
+            assert!(app.own_evm_proposed.is_empty(), "height 5 settled");
+        }
     }
 
     // ---- item 2: oracle helpers ----
