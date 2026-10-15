@@ -1,7 +1,11 @@
 # Read precompile gas per unit (sizing the 50-gas placeholder)
 
 > Superseded by the s99 owner decisions (section "s99 owner decisions: implemented and measured")
-> and the s100 decisions (last section, "Decisions (owner s100)").
+> and the s100 decisions (section "Decisions (owner s100)").
+>
+> Item 7 step 1 (owner s122, built s123) removed `getOrderBook` from 0x0800: its selector reverts
+> for the base gas, like `getOpenOrders`. The getOrderBook measurements below are history. See
+> the last section, "Item 7 step 1: getOrderBook removed".
 
 ozarchy, 2026-10-07. Bench `crates/torus-bridge/tests/ubench_read_precompile_gas.rs`
 (branch `bench/read-precompile-gas`, base `98f035ee`). Release, `-C force-frame-pointers=yes`,
@@ -517,3 +521,32 @@ Built on `fix/read-gas-followup` (ozarchy).
   any block executes. Pinned by `book_read_modes_tests::row_mode_writers_keep_one_row_kind_and_a_meta_row_per_market`
   (modes 1-3, serial and deferred save, reload, a market emptied by a fill). The RPC readers
   still reject both corruptions.
+
+## Item 7 step 1: getOrderBook removed (owner s122, built s123)
+
+Branch `feat/item7-step1-evm-lanes`, plan `docs/plans/item7-step1-impl.md` task E14 (model: the
+s99 removal of getOpenOrders).
+
+* **0x0800 answers only `getPosition(address,bytes32)`**, unchanged (16,500 gas).
+  `getOrderBook(bytes32)` reverts as `UnknownSelector`, for exactly the base: intrinsic + 16,400
+  gas through the EVM (an empty book answered for 16,560 before). Pinned by
+  `crates/torus-evm/tests/evm_tests.rs` `removed_get_order_book_reverts_for_exactly_the_base` and
+  `crates/torus-core/tests/precompile_tests.rs` `order_book_reader_get_order_book_is_an_unknown_selector`.
+* **Removed with it** (`crates/torus-core/src/precompiles.rs`): `READER_MAX_LEVELS_PER_SIDE`,
+  `ReadMeter::require_words`, `read_order_book`, `classic_levels` and `book_levels`; the
+  getOrderBook tests in `book_read_modes_tests.rs`, `precompile_work_bound_tests.rs`,
+  `r02_book_corrupt_tests.rs` and `cross_vm_read.rs`; the book, deletion-marker and churn parts of
+  `ubench_read_precompile_gas.rs` with their knobs (`UB_RG_ONLY`, `UB_RG_SCANS`, `UB_RG_TOMBS`,
+  `UB_RG_CHURN_*`, `UB_RG_MCHURN_*`, `UB_RG_BOOK_MB`). The bench commands in the sections above
+  that use those knobs only run on older code.
+* **Kept:** the other readers and their pricing (base 16,400; 500 gas per scanned row and 20 per
+  returned word), `scan_prefix_metered`, `charge_words`, `OrderBookSnapshot` /
+  `write_order_book_snapshot`, and `CoreError::BookLayout` / `BookCorrupt`.
+* **The per-market tombstone compaction stays** (owner s123; the step 1 design would have deleted
+  it if nothing else range-scanned the book column family). RPC `torus_getOrderBook` under the row
+  layouts reads every row of the market (`crates/torus-rpc/src/scan.rs`, `row_book_depth`), so
+  the deletion markers above still cost that read time. The comments in `cf.rs` and `db.rs` now
+  name that reader. The 4 MiB SST target of `cf_native_order_books` is unchanged.
+* The s100 decision "before mainnet: getOrderBook answers from the in-memory book" no longer
+  concerns the precompile. Step 2 adds an HL-style best bid / ask read instead
+  (`docs/plans/item7-evm-lanes.md`, owner decisions s122).

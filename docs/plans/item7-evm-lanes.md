@@ -1,8 +1,8 @@
 # Item 7: EVM lanes (design, s99)
 
-Status: design only. Owner decision s99: item 7 is its own item; design now, build after item 6
-Phase 2 (before Phase 3 and before testnet; a block-format change needs a fresh genesis, which is
-free before testnet). Context: `item6-phase1-impl.md` 9.16.
+Status: step 1 built (s123, see below); the rest is design. Owner decision s99: item 7 is its own
+item; design now, build after item 6 Phase 2 (before Phase 3 and before testnet; a block-format
+change needs a fresh genesis, which is free before testnet). Context: `item6-phase1-impl.md` 9.16.
 
 **Status s121: overdue.** Steps 1-2 were not built after Phase 2 as decided; item 6 Phases 3 and 4 went
 ahead without them (no recorded decision moved item 7). No damage yet: no testnet exists (fresh genesis
@@ -10,6 +10,13 @@ still free) and the Phase 3/4 benches were native-only. Order from here (owner s
 step 2, built now while archy runs liq-stress, job 4 and Phase 5 step 0; then item 6 Phase 5 build steps;
 then roadmap Tier 5 (block cadence and p99 floor). Step 1's open details (N for "EVM every Nth block",
 the per-block EVM gas budget) go to the owner before building.
+
+**Status s123: step 1 built** on `feat/item7-step1-evm-lanes` (commits C1-C7), not merged yet. Design
+`item7-step1-design.md` (option A, owner decisions s123), plan `item7-step1-impl.md`. Header field
+`evm_block_interval`, genesis 3M / N = 5, governance keys `evm_block_gas_limit` (1M..=10M) and
+`evm_block_interval` (2..=100) switching at epoch boundaries, pre-vote cadence / count / 256 KiB caps,
+admission caps, lost-proposal reinsert, routing to the next EVM height's leader, RPC gas at the header
+limit, `getOrderBook` removed. Next: step 2.
 
 **Owner decisions (s99):** the target is **option C** (HL-style small and big EVM blocks), built in
 two steps: step 1 = A + B (consensus EVM budget per block, EVM only every Nth block), then step 2 =

@@ -64,13 +64,15 @@
 
 ## ChainConfig Fields
 
-Set via genesis.json. Cannot be changed after genesis initialization.
+Set via genesis.json. Cannot be changed after genesis initialization, except the two EVM block
+values, which governance can change (see "EVM blocks" below).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `chain_id` | u64 | 7777 | EVM chain ID |
 | `chain_name` | string | `"torus"` | Human-readable chain name |
-| `evm_gas_limit` | u64 | 30,000,000 | Maximum gas per block |
+| `evm_gas_limit` | u64 | 3,000,000 | EVM gas budget per EVM block: the genesis header's `evm_gas_limit`. Genesis key `evm.gas_limit` (required). |
+| `evm_block_interval` | u64 | 5 | N: EVM transactions only in blocks with `height % N == 0`. The genesis header's `evm_block_interval`. Genesis key `evm.block_interval` (absent = 5; 0 is refused; 1 = EVM in every block). |
 | `base_fee_per_gas` | u64 | 1,000,000,000 | Initial base fee (1 gwei) |
 | `epoch_length` | u64 | 100,000 | Blocks per validator epoch |
 | `max_validators` | u32 | 21 | Maximum active validator set size |
@@ -79,6 +81,42 @@ Set via genesis.json. Cannot be changed after genesis initialization.
 | `fee_validator_bps` | u16 | 0 | Fee to block proposer (basis points) |
 | `fee_treasury_bps` | u16 | 4500 | Fee to treasury (basis points) |
 | `fee_dev_pool_bps` | u16 | 4500 | Fee to dev pool (basis points) |
+
+## EVM blocks (item 7 step 1)
+
+The block header carries `evm_gas_limit` (the EVM gas budget of an EVM block) and
+`evm_block_interval` (N). Both start at the genesis values above. Every shipped genesis file uses
+3M / 5; the CI Uniswap genesis (`devnet/uniswap/make-ci-genesis.py`) uses a 10M budget, because
+the Router deploy needs about 4.2M gas.
+
+A header must carry its parent's values, except at an epoch boundary, where it carries the epoch
+plan's values (unset in the plan = the parent's). Validators check this before voting and at
+block insertion. Execution of boundary H copies the governance values into the plan for H + L
+(L = `epoch_length`), so a change reaches the header between L and 2L blocks after it executes.
+
+| Governance key (`ParameterChange`) | Range | Header field |
+|---|---|---|
+| `evm_block_gas_limit` | 1,000,000..=10,000,000 | `evm_gas_limit` |
+| `evm_block_interval` | 2..=100 | `evm_block_interval` |
+
+Values outside the range are refused at submission and at execution. A stored value that is
+absent or invalid leaves the chain's value unchanged.
+
+Per block, checked before voting (a block that breaks one gets no vote):
+
+* EVM transactions only when `height % N == 0`; an honest proposer leaves them pooled in the other
+  blocks.
+* At most `evm_gas_limit / 21,000` EVM transactions.
+* At most 256 KiB (262,144 bytes) of raw EVM transaction bytes.
+* Declared gas of the EVM transactions at most `evm_gas_limit` (step 0).
+
+Admission to the EVM pool refuses a transaction above 256 KiB (`TxTooLarge`) or with a gas
+limit above the `evm_gas_limit` of the last committed header handed to execution (or
+`TORUS_EVM_BLOCK_GAS_BUDGET`, if lower). `eth_call` and `eth_estimateGas` use the head header's
+`evm_gas_limit` as their default gas and clamp a larger `gas` to it.
+
+Constants: `DEFAULT_EVM_GAS_LIMIT`, `DEFAULT_EVM_BLOCK_INTERVAL`, `MAX_EVM_BLOCK_TX_BYTES`,
+`EVM_MIN_TX_GAS` and the two key names and ranges, in `crates/torus-types/src/lib.rs`.
 
 ## Economic Constants
 
