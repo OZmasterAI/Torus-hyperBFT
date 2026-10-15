@@ -652,7 +652,9 @@ impl<T: StateBackend> GovernanceManager<T> {
     ///
     /// s99: every allowed key has a reader. The six [`GovernanceParams`] keys
     /// change that record ([`Self::with_governance_param`]); `price_band_bps`
-    /// is its own `CF_FEE_CONFIG` row. `maintenance_margin_bps`,
+    /// is its own `CF_FEE_CONFIG` row, and so are the item 7 step 1 EVM keys
+    /// `evm_block_gas_limit` and `evm_block_interval` (the epoch plan reads
+    /// them). `maintenance_margin_bps`,
     /// `max_leverage` and `liquidation_penalty_bps` were allowed but never
     /// read (MM is half the IM, leverage is per market, no liquidation
     /// penalty by design), so a vote changed nothing; they are now refused
@@ -758,6 +760,26 @@ impl<T: StateBackend> GovernanceManager<T> {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: "must be between 100 and 9000 (1% - 90%)".to_string(),
+                    });
+                }
+            }
+            // Item 7 step 1: copied into the next epoch plan (torus_economics::epoch_plan).
+            torus_types::EVM_BLOCK_GAS_LIMIT_PARAM | torus_types::EVM_BLOCK_INTERVAL_PARAM => {
+                let range = if key == torus_types::EVM_BLOCK_GAS_LIMIT_PARAM {
+                    torus_types::EVM_BLOCK_GAS_LIMIT_RANGE
+                } else {
+                    torus_types::EVM_BLOCK_INTERVAL_RANGE
+                };
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
+                if !range.contains(&v) {
+                    return Err(EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: format!("must be between {} and {}", range.start(), range.end()),
                     });
                 }
             }

@@ -17,7 +17,7 @@
 
 use alloy_primitives::Address;
 use borsh::{BorshDeserialize, BorshSerialize};
-use torus_state::cf::CF_CONSENSUS_META;
+use torus_state::cf::{CF_CONSENSUS_META, CF_FEE_CONFIG};
 use torus_state::StateBackend;
 use torus_types::{PublicKey, ValidatorInfo, ValidatorSet};
 
@@ -40,6 +40,13 @@ pub struct PlanMember {
     pub commission_bps: u16,
 }
 
+/// Item 7 step 1: EVM header values from `boundary` on (`None` = keep the parent's).
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanEvm {
+    pub gas_limit: Option<u64>,
+    pub block_interval: Option<u64>,
+}
+
 /// The validator set that takes effect at `boundary`, computed by the
 /// execution of the previous boundary.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
@@ -56,6 +63,10 @@ pub struct EpochRotationPlan {
     pub rotations: Vec<([u8; 20], [u8; 32])>,
     /// `false` = keep the installed set (no hotstuff update at `boundary`).
     pub changed: bool,
+    /// Item 7 step 1: the governance EVM values (header `evm_gas_limit`,
+    /// `evm_block_interval`) from `boundary` on, set by
+    /// [`EpochManager::execute_planned_rotation`].
+    pub evm: PlanEvm,
 }
 
 impl EpochRotationPlan {
@@ -198,6 +209,7 @@ impl EpochManager {
                 deletes: Vec::new(),
                 rotations: Vec::new(),
                 changed: false,
+                evm: PlanEvm::default(),
             });
         }
 
@@ -210,6 +222,7 @@ impl EpochManager {
                 deletes: Vec::new(),
                 rotations: Vec::new(),
                 changed,
+                evm: PlanEvm::default(),
             });
         }
         let member_keys: std::collections::BTreeSet<[u8; 32]> =
@@ -227,6 +240,7 @@ impl EpochManager {
             deletes: deletes.into_iter().collect(),
             rotations,
             changed,
+            evm: PlanEvm::default(),
         })
     }
 
@@ -258,7 +272,8 @@ impl EpochManager {
     }
 
     /// Execution of boundary `height`: apply the plan for
-    /// `height` if one exists, then store the plan for `height + epoch_length`.
+    /// `height` if one exists, then store the plan for `height + epoch_length`
+    /// (item 7 step 1: with the governance EVM values of this post-state).
     /// The plan of the PREVIOUS boundary is pruned here, not the one just
     /// applied: consensus may still re-read `plan(height)` (re-validation of
     /// that boundary) until the next boundary executes.
@@ -286,12 +301,26 @@ impl EpochManager {
                 installed = Some(plan.validator_set(Self::epoch_for_block(height, epoch_length)));
             }
         }
-        let next = Self::plan_rotation(
+        let mut next = Self::plan_rotation(
             staking,
             max_validators,
             height.saturating_add(epoch_length),
             epoch_length,
         )?;
+        let gov = |key: &str, range: &std::ops::RangeInclusive<u64>| -> Result<Option<u64>> {
+            let stored = staking.state().get_cf_raw(CF_FEE_CONFIG, key.as_bytes())?;
+            Ok(torus_types::gov_u64_in(stored.as_deref(), range))
+        };
+        next.evm = PlanEvm {
+            gas_limit: gov(
+                torus_types::EVM_BLOCK_GAS_LIMIT_PARAM,
+                &torus_types::EVM_BLOCK_GAS_LIMIT_RANGE,
+            )?,
+            block_interval: gov(
+                torus_types::EVM_BLOCK_INTERVAL_PARAM,
+                &torus_types::EVM_BLOCK_INTERVAL_RANGE,
+            )?,
+        };
         staking.put_epoch_rotation_plan(&next)?;
         Ok(installed)
     }
@@ -420,6 +449,81 @@ mod tests {
             None,
             "pruned one boundary later"
         );
+    }
+
+    /// Write the two EVM governance rows (`CF_FEE_CONFIG`, decimal).
+    fn put_evm_params(mgr: &StakingManager, gas_limit: &[u8], block_interval: &[u8]) {
+        let state = mgr.state();
+        state
+            .put_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::EVM_BLOCK_GAS_LIMIT_PARAM.as_bytes(),
+                gas_limit,
+            )
+            .unwrap();
+        state
+            .put_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::EVM_BLOCK_INTERVAL_PARAM.as_bytes(),
+                block_interval,
+            )
+            .unwrap();
+    }
+
+    /// Item 7 step 1: execution of boundary H copies the governance EVM rows
+    /// into plan(H + L). They do not touch the validator set. RED before: the
+    /// plan had no EVM values.
+    #[test]
+    fn plan_carries_governance_evm_params() {
+        let (_d, mgr) = setup();
+        for n in 1..=4 {
+            put(&mgr, n, 100, ValidatorStatus::Active);
+        }
+        let genesis = EpochManager::compute_new_validator_set(&mgr, u32::MAX, 0).unwrap();
+        mgr.record_genesis_epoch_set(&genesis).unwrap();
+        put_evm_params(&mgr, b"5000000", b"10");
+        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4).unwrap();
+        let plan8 = mgr
+            .epoch_rotation_plan(8)
+            .unwrap()
+            .expect("plan for 8 stored");
+        assert_eq!(
+            plan8.evm,
+            PlanEvm {
+                gas_limit: Some(5_000_000),
+                block_interval: Some(10),
+            }
+        );
+        assert!(!plan8.changed, "EVM values leave the validator set alone");
+    }
+
+    /// No row, or a row outside its governance range (1M..=10M, 2..=100) or
+    /// not a number: the plan keeps the chain's values (`None`).
+    #[test]
+    fn plan_without_or_with_invalid_evm_params_keeps_the_chain_values() {
+        let stored = [
+            None,
+            Some("999999"),
+            Some("10000001"),
+            Some("1"),
+            Some("101"),
+            Some("oops"),
+        ];
+        for stored in stored {
+            let (_d, mgr) = setup();
+            for n in 1..=4 {
+                put(&mgr, n, 100, ValidatorStatus::Active);
+            }
+            if let Some(v) = stored {
+                put_evm_params(&mgr, v.as_bytes(), v.as_bytes());
+            }
+            EpochManager::execute_planned_rotation(&mgr, 4, 4, 4).unwrap();
+            let plan8 = mgr
+                .epoch_rotation_plan(8)
+                .unwrap()
+                .expect("plan for 8 stored");
+            assert_eq!(plan8.evm, PlanEvm::default(), "{stored:?}");
+        }
     }
 
     #[test]

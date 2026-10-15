@@ -36,7 +36,7 @@ use torus_bridge::{
     sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator, BundleState,
     NativeExecContext, NativeExecutor,
 };
-use torus_economics::{EpochManager, SlashReason, StakingManager};
+use torus_economics::{EpochManager, EpochRotationPlan, PlanEvm, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
 use torus_mempool::Mempool;
 use torus_state::cf::{
@@ -51,7 +51,7 @@ use torus_types::{
 
 /// Consensus bug (b): this node's execution has not yet applied the epoch
 /// boundary whose plan the boundary being proposed / validated needs.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct EpochPlanNotReady;
 
 /// A datum-less proposal every honest `validate_block` rejects (`datums.len()
@@ -2067,11 +2067,19 @@ fn tree_parent_header(
 /// Execution checks the same link against the committed header at height − 1
 /// (`detect_parent_link_violation`); the committed chain follows the justify
 /// links, so a certified block always passes it there.
+///
+/// Item 7 step 1: once the link holds, the header's EVM gas limit and N
+/// (`evm_block_interval`) equal the parent's, except at an epoch boundary,
+/// where they equal the epoch plan's values (`boundary`; an unset value or
+/// no plan: the parent's). A plan this node cannot read yet is `Missing`,
+/// like the validator-set plan in `finish_validate`. The base fee always
+/// equals the parent's.
 fn check_parent_link(
     header: &TorusBlockHeader,
     justify: &PhaseCertificate,
     genesis: &TorusBlockHeader,
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
+    boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
 ) -> BlockDataCheck {
     let parent = if justify.is_genesis_pc() {
         genesis.clone()
@@ -2095,37 +2103,46 @@ fn check_parent_link(
         );
         return BlockDataCheck::Invalid;
     }
-    // Item 7 step 0: the EVM gas limit and the base fee are the parent's (a
-    // pure header comparison, like the timestamp rule). Both start at the
-    // genesis parent header's values. Gas limit: when governance can change
-    // it, this becomes "equals the rule value". Base fee: fixed on purpose
-    // until the owner decides EIP-1559 vs a fixed fee
-    // (docs/plans/item7-evm-lanes.md, open question 4); the EIP-1559 check in
-    // `torus_bridge::validator` is not wired into consensus.
-    if header.evm_gas_limit != parent.evm_gas_limit
+    if header.height != parent.height + 1 || header.parent_hash != expected {
+        tracing::warn!(
+            height = header.height,
+            parent_height = parent.height,
+            claimed_parent = %header.parent_hash,
+            expected_parent = %expected,
+            "REJECTED -- header does not link to its parent block's header (ancestry violation)"
+        );
+        return BlockDataCheck::Invalid;
+    }
+    // Item 7: the EVM gas limit and N are the rule values. Off a boundary: the
+    // parent's. At a boundary: the plan's (unset or no plan: the parent's).
+    // The check runs after the link, so a header with a bogus height is
+    // Invalid and never waits on a plan. Base fee: fixed on purpose until the
+    // owner decides EIP-1559 vs a fixed fee (docs/plans/item7-evm-lanes.md,
+    // open question 4); the EIP-1559 check in `torus_bridge::validator` is
+    // not wired into consensus.
+    let plan = match boundary(header.height) {
+        Ok(plan) => plan.unwrap_or_default(),
+        Err(EpochPlanNotReady) => return BlockDataCheck::Missing,
+    };
+    let gas_limit = plan.gas_limit.unwrap_or(parent.evm_gas_limit);
+    let block_interval = plan.block_interval.unwrap_or(parent.evm_block_interval);
+    if header.evm_gas_limit != gas_limit
+        || header.evm_block_interval != block_interval
         || header.base_fee_per_gas != parent.base_fee_per_gas
     {
         tracing::warn!(
             height = header.height,
             evm_gas_limit = header.evm_gas_limit,
-            parent_evm_gas_limit = parent.evm_gas_limit,
+            gas_limit,
+            evm_block_interval = header.evm_block_interval,
+            block_interval,
             base_fee_per_gas = header.base_fee_per_gas,
             parent_base_fee_per_gas = parent.base_fee_per_gas,
-            "REJECTED -- block EVM gas limit or base fee differs from its parent's"
+            "REJECTED -- EVM gas limit, interval or base fee differs from the rule value"
         );
         return BlockDataCheck::Invalid;
     }
-    if header.height == parent.height + 1 && header.parent_hash == expected {
-        return BlockDataCheck::Held;
-    }
-    tracing::warn!(
-        height = header.height,
-        parent_height = parent.height,
-        claimed_parent = %header.parent_hash,
-        expected_parent = %expected,
-        "REJECTED -- header does not link to its parent block's header (ancestry violation)"
-    );
-    BlockDataCheck::Invalid
+    BlockDataCheck::Held
 }
 
 /// Item 7 step 0, pre-vote only (like the native action count): the EVM body
@@ -6523,26 +6540,12 @@ impl TorusApp {
         hasher.finalize().into()
     }
 
-    /// Validator-set updates for block `height` (`None` off-boundary).
-    ///
-    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: at a
-    /// boundary they are READ from the plan the previous boundary stored at
-    /// execution (`None`: no plan — the first boundary — or an unchanged set);
-    /// no DB write, no read of timing-dependent state. `Err` = this node's
-    /// execution has not applied the previous boundary yet: refuse (validate ->
-    /// `MissingData`, propose -> no block) and retry, never guess.
-    fn epoch_validator_set_updates(
-        &mut self,
-        height: u64,
-    ) -> Result<Option<ValidatorSetUpdates>, EpochPlanNotReady> {
-        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
-            return Ok(None);
-        }
-        if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
-            if cached_height == height {
-                return Ok(cached_result.clone());
-            }
-        }
+    /// The epoch plan stored for boundary `height` by the execution of the
+    /// previous boundary (consensus bug (b) guard + read, shared by the
+    /// validator-set updates and the item 7 EVM values). `Err` = this node's
+    /// execution has not applied the previous boundary yet (or a read
+    /// failed): refuse and retry, never guess.
+    fn epoch_plan(&self, height: u64) -> Result<Option<EpochRotationPlan>, EpochPlanNotReady> {
         // R02: a read error refuses the boundary for now (liveness only),
         // never "applied = 0".
         let applied = match self.applied_height() {
@@ -6567,10 +6570,49 @@ impl TorusApp {
             );
             return Err(EpochPlanNotReady);
         }
-        let plan = self.staking.epoch_rotation_plan(height).map_err(|e| {
+        self.staking.epoch_rotation_plan(height).map_err(|e| {
             tracing::error!(%e, height, "failed to read the epoch rotation plan");
             EpochPlanNotReady
-        })?;
+        })
+    }
+
+    /// Item 7 step 1: the plan's EVM values for block `height` (`None` off a
+    /// boundary or at the first boundary, which has no plan).
+    fn boundary_evm(&self, height: u64) -> Result<Option<PlanEvm>, EpochPlanNotReady> {
+        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            return Ok(None);
+        }
+        match self.epoch_plan(height)? {
+            Some(plan) => Ok(Some(plan.evm)),
+            // From 2L on every boundary has a plan (written by the previous boundary's
+            // execution) until H + L executes and prunes it. None there means pruned:
+            // never read that as "no change".
+            None if height >= self.epoch_length.saturating_mul(2) => Err(EpochPlanNotReady),
+            None => Ok(None),
+        }
+    }
+
+    /// Validator-set updates for block `height` (`None` off-boundary).
+    ///
+    /// Consensus bug (b), docs/plans/consensus-bug-b-epoch-race.md: at a
+    /// boundary they are READ from the plan the previous boundary stored at
+    /// execution (`None`: no plan — the first boundary — or an unchanged set);
+    /// no DB write, no read of timing-dependent state. `Err` = this node's
+    /// execution has not applied the previous boundary yet: refuse (validate ->
+    /// `MissingData`, propose -> no block) and retry, never guess.
+    fn epoch_validator_set_updates(
+        &mut self,
+        height: u64,
+    ) -> Result<Option<ValidatorSetUpdates>, EpochPlanNotReady> {
+        if !EpochManager::is_epoch_boundary(height, self.epoch_length) {
+            return Ok(None);
+        }
+        if let Some((cached_height, ref cached_result)) = self.cached_vs_updates {
+            if cached_height == height {
+                return Ok(cached_result.clone());
+            }
+        }
+        let plan = self.epoch_plan(height)?;
         let updates = match plan {
             Some(plan) if plan.changed => {
                 let mut updates = ValidatorSetUpdates::new();
@@ -7033,7 +7075,8 @@ impl TorusApp {
     /// Cheap: fail-stop, the one datum, its hash, decode, the header's action
     /// count and EVM tx count and gas against the body (item 7 step 0,
     /// [`evm_body_fits_header`]), the header's link to its parent (s84 decision
-    /// 2, [`check_parent_link`], `parent` looks the parent up), then a
+    /// 2, [`check_parent_link`], `parent` looks the parent up; item 7 step 1:
+    /// at an epoch boundary also the plan's EVM values), then a
     /// presence-only DA read. No wait and no network pull here:
     /// `validate_block` (run right after on the same body) and its retries
     /// hand misses to the recovery worker.
@@ -7078,7 +7121,9 @@ impl TorusApp {
                 (compact.header.clone(), Some(compact))
             }
         };
-        let link = check_parent_link(&header, &block.justify, &self.genesis_header, parent);
+        let link = check_parent_link(&header, &block.justify, &self.genesis_header, parent, |h| {
+            self.boundary_evm(h)
+        });
         if link != BlockDataCheck::Held {
             return link;
         }
@@ -7127,10 +7172,24 @@ impl TorusApp {
         // T0b: never below the parent (validators reject a regressing timestamp).
         let timestamp = unix_now_secs().max(parent_header.timestamp);
 
-        // Item 7 step 0: validators require the header limit to equal the parent's and
-        // the declared EVM gas to fit it, so select against exactly that limit (a 0
-        // limit selects no EVM txs instead of filling a default the header can't carry).
-        let gas_limit = parent_header.evm_gas_limit;
+        // Item 7 step 1: the new header's EVM values: the parent's, at a boundary the
+        // plan's (validators require exactly these, `check_parent_link`). The declared
+        // EVM gas must fit the limit, so select against exactly that limit.
+        let Ok(plan_evm) = self.boundary_evm(next_height) else {
+            return refused_proposal();
+        };
+        let plan_evm = plan_evm.unwrap_or_default();
+        let evm_gas_limit = plan_evm.gas_limit.unwrap_or(parent_header.evm_gas_limit);
+        let evm_block_interval = plan_evm
+            .block_interval
+            .unwrap_or(parent_header.evm_block_interval);
+        // Cadence: EVM txs only at height % N == 0. A 0 limit makes select_block_payload skip
+        // the destructive drain, so off-cadence txs stay pooled (N = 0 carries none).
+        let gas_limit = if next_height.checked_rem(evm_block_interval) == Some(0) {
+            evm_gas_limit
+        } else {
+            0
+        };
         let (native_with_senders, evm_txs) = {
             let _select_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_select_seconds);
@@ -7184,8 +7243,8 @@ impl TorusApp {
                 logs_bloom: Bloom::ZERO,
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
-                evm_gas_limit: parent_header.evm_gas_limit,
-                evm_block_interval: parent_header.evm_block_interval,
+                evm_gas_limit,
+                evm_block_interval,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: evm_txs.len() as u32,
                 base_fee_per_gas: parent_header.base_fee_per_gas,
@@ -7333,11 +7392,13 @@ impl App<RocksKVStore> for TorusApp {
         // is inserted), so a block inserted by any path (full proposal, sync,
         // header + body) links to its parent's header.
         let link = match datum_header(datums[0].bytes()) {
-            Some(header) => {
-                check_parent_link(&header, &block.justify, &self.genesis_header, |hash| {
-                    tree_parent_header(request.block_tree(), hash)
-                })
-            }
+            Some(header) => check_parent_link(
+                &header,
+                &block.justify,
+                &self.genesis_header,
+                |hash| tree_parent_header(request.block_tree(), hash),
+                |h| self.boundary_evm(h),
+            ),
             None => BlockDataCheck::Invalid,
         };
         match link {
@@ -7630,6 +7691,9 @@ impl TorusApp {
     /// liveness must not stall) but with an EMPTY payload, so it never re-proposes
     /// stale actions from an un-caught-up mempool. Once block-sync advances
     /// `last_header` back within the threshold, full selection resumes automatically.
+    ///
+    /// `gas_limit` 0 (item 7 step 1: off the EVM cadence) selects no EVM tx and
+    /// drains none from the pool.
     fn select_block_payload(
         &self,
         parent_height: u64,
@@ -7736,7 +7800,12 @@ impl TorusApp {
                 )
             }
         };
-        let evm = mempool.drain_evm(gas_limit, parent_state_root);
+        // Item 7 step 1: 0 = off cadence (or a 0 header limit): no destructive drain.
+        let evm = if gas_limit == 0 {
+            Vec::new()
+        } else {
+            mempool.drain_evm(gas_limit, parent_state_root)
+        };
         if !evm.is_empty() || !native.is_empty() {
             tracing::info!(
                 evm_txs = evm.len(),
@@ -20703,7 +20772,8 @@ mod crash_recovery_tests {
                 &far.header,
                 &justify_for(&hs_parent),
                 &app.genesis_header,
-                move |_| ParentHeader::Header(Box::new(header))
+                move |_| ParentHeader::Header(Box::new(header)),
+                |_| Ok(None)
             ),
             BlockDataCheck::Held
         );
@@ -20747,7 +20817,8 @@ mod crash_recovery_tests {
                     &child_of(&parent, ts).header,
                     &justify_for(&hs_parent),
                     &app.genesis_header,
-                    move |_| ParentHeader::Header(Box::new(header))
+                    move |_| ParentHeader::Header(Box::new(header)),
+                    |_| Ok(None)
                 ),
                 want,
                 "ts {ts}"
@@ -20888,7 +20959,8 @@ mod crash_recovery_tests {
                     &b.header,
                     &justify_for(&hs_parent),
                     &app.genesis_header,
-                    move |_| ParentHeader::Header(Box::new(header))
+                    move |_| ParentHeader::Header(Box::new(header)),
+                    |_| Ok(None)
                 ),
                 BlockDataCheck::Invalid,
                 "{what}: parent link"
@@ -21082,6 +21154,371 @@ mod crash_recovery_tests {
             app.check_proposal_data(&hs, move |_| ParentHeader::Header(Box::new(header))),
             BlockDataCheck::Held
         );
+    }
+
+    // ---- item 7 step 1: EVM header values at epoch boundaries, cadence ----
+
+    /// `check_parent_link` of `block` on `parent` (a non-genesis justify),
+    /// `boundary` looking up the epoch plan's EVM values.
+    fn link_on(
+        app: &TorusApp,
+        parent: &TorusBlock,
+        block: &TorusBlock,
+        boundary: impl FnOnce(u64) -> Result<Option<PlanEvm>, EpochPlanNotReady>,
+    ) -> BlockDataCheck {
+        let hs_parent = hs_block(parent, PhaseCertificate::genesis_pc());
+        let header = parent.header.clone();
+        check_parent_link(
+            &block.header,
+            &justify_for(&hs_parent),
+            &app.genesis_header,
+            move |_| ParentHeader::Header(Box::new(header)),
+            boundary,
+        )
+    }
+
+    /// `child_of(parent)` with the header EVM gas limit `gas_limit` and N `n`.
+    fn evm_header_child(parent: &TorusBlock, gas_limit: u64, n: u64) -> TorusBlock {
+        let mut b = child_of(parent, parent.header.timestamp);
+        b.header.evm_gas_limit = gas_limit;
+        b.header.evm_block_interval = n;
+        b
+    }
+
+    /// An app on a fresh test DB with epoch length 4 and its clock at `now`,
+    /// plus the DB and the config (for an execution context on the same DB).
+    fn epoch4_app(now: u64) -> (TorusApp, StateDb, ChainConfig) {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let mut app = TorusApp::new(db.clone(), &config, None, None, None);
+        app.test_now_secs = Some(now);
+        (app, db, config)
+    }
+
+    /// Item 7 step 1: at an epoch boundary the header's EVM gas limit and N
+    /// equal the epoch plan's (an unset value: the parent's). A pure header
+    /// check, the plan lookup is a closure. RED before: `check_parent_link`
+    /// had no plan lookup and required the parent's gas limit.
+    #[test]
+    fn boundary_header_must_equal_the_plans_evm_params() {
+        let parent = tip_2000();
+        let app = ts_app(2_010);
+        let (pg, pn) = (
+            parent.header.evm_gas_limit,
+            parent.header.evm_block_interval,
+        );
+        let link = |gas_limit, n, plan: PlanEvm| {
+            let b = evm_header_child(&parent, gas_limit, n);
+            link_on(&app, &parent, &b, move |_| Ok(Some(plan)))
+        };
+        let full = PlanEvm {
+            gas_limit: Some(5_000_000),
+            block_interval: Some(10),
+        };
+        assert_eq!(link(5_000_000, 10, full), BlockDataCheck::Held);
+        for (gas_limit, n, what) in [
+            (pg, pn, "the parent's values"),
+            (5_000_000, pn, "the plan's gas limit, the parent's N"),
+            (pg, 10, "the parent's gas limit, the plan's N"),
+        ] {
+            assert_eq!(link(gas_limit, n, full), BlockDataCheck::Invalid, "{what}");
+        }
+        let gas_only = PlanEvm {
+            gas_limit: Some(5_000_000),
+            block_interval: None,
+        };
+        assert_eq!(
+            link(5_000_000, pn, gas_only),
+            BlockDataCheck::Held,
+            "N stays the parent's"
+        );
+        assert_eq!(link(5_000_000, 10, gas_only), BlockDataCheck::Invalid);
+        assert_eq!(link(pg, pn, gas_only), BlockDataCheck::Invalid);
+    }
+
+    /// Off a boundary the EVM gas limit and N equal the parent's, before the
+    /// vote and in `check_parent_link` (so also at insertion). RED before: N
+    /// was not checked.
+    #[test]
+    fn off_boundary_header_must_equal_the_parents_evm_params() {
+        let parent = tip_2000();
+        let mut app = ts_app(2_010);
+        assert_eq!(app.boundary_evm(5), Ok(None), "5 is no boundary (L = 100)");
+        let honest = child_of(&parent, 2_000);
+        assert_eq!(pre_vote(&mut app, &parent, &honest), BlockDataCheck::Held);
+        assert_eq!(
+            link_on(&app, &parent, &honest, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        type Change = fn(&mut TorusBlockHeader);
+        let variants: [(&str, Change); 4] = [
+            ("N raised", |h| h.evm_block_interval += 1),
+            ("N lowered", |h| h.evm_block_interval -= 1),
+            ("gas limit raised", |h| h.evm_gas_limit += 1),
+            ("gas limit lowered", |h| h.evm_gas_limit -= 1),
+        ];
+        for (what, change) in variants {
+            let mut b = honest.clone();
+            change(&mut b.header);
+            assert_eq!(
+                pre_vote(&mut app, &parent, &b),
+                BlockDataCheck::Invalid,
+                "{what}"
+            );
+            assert_eq!(
+                link_on(&app, &parent, &b, |h| app.boundary_evm(h)),
+                BlockDataCheck::Invalid,
+                "{what}: parent link"
+            );
+        }
+    }
+
+    /// The first boundary (L) has no plan: its header keeps the parent's EVM
+    /// values, before the vote and at insertion.
+    #[test]
+    fn boundary_without_a_plan_keeps_the_parents_evm_params() {
+        let (mut app, _db, _config) = epoch4_app(1_010);
+        assert_eq!(app.boundary_evm(4), Ok(None), "first boundary: no plan");
+        let parent = make_block(3, vec![]);
+        let (pg, pn) = (
+            parent.header.evm_gas_limit,
+            parent.header.evm_block_interval,
+        );
+        for (gas_limit, n, want) in [
+            (pg, pn, BlockDataCheck::Held),
+            (5_000_000, pn, BlockDataCheck::Invalid),
+            (pg, 10, BlockDataCheck::Invalid),
+        ] {
+            let b = evm_header_child(&parent, gas_limit, n);
+            assert_eq!(b.header.height, 4);
+            assert_eq!(
+                pre_vote(&mut app, &parent, &b),
+                want,
+                "pre-vote {gas_limit} / {n}"
+            );
+            assert_eq!(
+                link_on(&app, &parent, &b, |h| app.boundary_evm(h)),
+                want,
+                "link {gas_limit} / {n}"
+            );
+        }
+    }
+
+    /// A boundary whose plan this node cannot read yet (execution has not
+    /// applied the previous boundary) is `Missing`, before the vote and at
+    /// insertion: never a guess. A header that does not link is `Invalid`
+    /// and never waits on the plan.
+    #[test]
+    fn boundary_plan_not_ready_is_missing_before_the_vote_and_at_insertion() {
+        let parent = tip_2000();
+        let app = ts_app(2_010);
+        let honest = child_of(&parent, 2_000);
+        assert_eq!(
+            link_on(&app, &parent, &honest, |_| Err(EpochPlanNotReady)),
+            BlockDataCheck::Missing
+        );
+        let mut unlinked = honest.clone();
+        unlinked.header.height += 1;
+        assert_eq!(
+            link_on(
+                &app,
+                &parent,
+                &unlinked,
+                |_| -> Result<Option<PlanEvm>, EpochPlanNotReady> {
+                    panic!("a header that does not link never reads the plan")
+                }
+            ),
+            BlockDataCheck::Invalid
+        );
+
+        let (mut app, db, config) = epoch4_app(1_010);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=3 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        assert_eq!(read_native_applied_height(&db), Some(3));
+        assert_eq!(app.boundary_evm(8), Err(EpochPlanNotReady), "applied 3 < 4");
+        let parent7 = make_block(7, vec![]);
+        let block8 = child_of(&parent7, parent7.header.timestamp);
+        assert_eq!(
+            pre_vote(&mut app, &parent7, &block8),
+            BlockDataCheck::Missing
+        );
+        assert_eq!(
+            link_on(&app, &parent7, &block8, |h| app.boundary_evm(h)),
+            BlockDataCheck::Missing
+        );
+        drop(ctx);
+    }
+
+    /// From 2L on every boundary has a plan until the next boundary's
+    /// execution prunes it. An absent plan there is `EpochPlanNotReady`,
+    /// never "no change": a replica must not judge the header against the
+    /// parent's values when the quorum used the plan's.
+    #[test]
+    fn pruned_boundary_plan_is_not_read_as_no_change() {
+        let (app, db, config) = epoch4_app(1_020);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=12 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(read_native_applied_height(&db), Some(12));
+        assert_eq!(
+            app.staking.epoch_rotation_plan(8).unwrap(),
+            None,
+            "plan(8) pruned when 12 executed"
+        );
+        assert_eq!(app.boundary_evm(8), Err(EpochPlanNotReady));
+        assert_eq!(
+            app.boundary_evm(12),
+            Ok(Some(PlanEvm::default())),
+            "plan(12) kept until 16 executes"
+        );
+        drop(ctx);
+    }
+
+    /// A pool holding txs of the funded `evm_tx_gas` sender (key 71), with no
+    /// proposer budget or sender-share cap.
+    fn funded_evm_mempool(db: &StateDb) -> Arc<Mempool> {
+        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        let sender = {
+            let pubkey = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pubkey.as_bytes()[1..])[12..])
+        };
+        db.put_account(
+            &sender,
+            &revm::state::AccountInfo {
+                balance: U256::from(1_000_000_000_000_000_000u128),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        Arc::new(Mempool::new(
+            db.clone(),
+            torus_mempool::MempoolConfig {
+                evm_block_gas_budget: u64::MAX,
+                evm_sender_share_pct: 0,
+                ..torus_mempool::MempoolConfig::default()
+            },
+        ))
+    }
+
+    /// Item 7 step 1: off the N = 5 cadence the leader drains no EVM tx
+    /// (`drain_evm` is destructive), so they stay pooled; the next EVM height
+    /// takes them. RED before: every height drained the pool.
+    #[test]
+    fn off_cadence_proposal_has_no_evm_txs_and_leaves_them_pooled() {
+        let (config, db) = make_test_config_and_db();
+        let mempool = funded_evm_mempool(&db);
+        for nonce in 0..2 {
+            mempool.add_evm_tx(evm_tx_gas(nonce, 100_000)).unwrap();
+        }
+        let mut app = TorusApp::new(db, &config, None, Some(mempool.clone()), None);
+
+        let _ = app.build_proposal(make_block(3, vec![]).header);
+        let off = &app.pending_proposals[&4].block;
+        assert!(
+            off.evm_transactions.is_empty(),
+            "height 4 is off the cadence"
+        );
+        assert_eq!(off.header.evm_tx_count, 0);
+        assert_eq!(mempool.evm_pool_size(), 2, "the txs stay pooled");
+
+        let _ = app.build_proposal(tip_2000().header);
+        let on = &app.pending_proposals[&5].block;
+        assert_eq!(on.evm_transactions.len(), 2, "height 5 takes both");
+        assert_eq!(on.header.evm_tx_count, 2);
+        assert_eq!(mempool.evm_pool_size(), 0);
+    }
+
+    /// Item 7 step 1 end to end (L = 4): governance rows present when
+    /// boundary 4 executes reach plan(8); the leader builds block 8 with
+    /// them, the link check accepts it and refuses other values; block 9
+    /// keeps them (off a boundary: the parent's). Rows that land after 4
+    /// executed (in block 5) leave plan(8) at "no change" and reach plan(12).
+    #[test]
+    fn governance_evm_params_reach_the_header_at_the_next_boundary_plus_l() {
+        use torus_state::cf::CF_FEE_CONFIG;
+        let changed = PlanEvm {
+            gas_limit: Some(5_000_000),
+            block_interval: Some(10),
+        };
+        let put_rows = |db: &StateDb| {
+            for (key, value) in [
+                (torus_types::EVM_BLOCK_GAS_LIMIT_PARAM, "5000000"),
+                (torus_types::EVM_BLOCK_INTERVAL_PARAM, "10"),
+            ] {
+                db.put_cf_raw(CF_FEE_CONFIG, key.as_bytes(), value.as_bytes())
+                    .unwrap();
+            }
+        };
+        let evm_values = |b: &TorusBlock| (b.header.evm_gas_limit, b.header.evm_block_interval);
+
+        let (mut app, db, config) = epoch4_app(1_010);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=3 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        put_rows(&db);
+        dispatch_and_execute(&ctx, &db, &make_block(4, vec![]));
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(app.boundary_evm(8), Ok(Some(changed)));
+
+        let parent7 = make_block(7, vec![]);
+        let _ = app.build_proposal(parent7.header.clone());
+        let block8 = app.pending_proposals[&8].block.clone();
+        assert_eq!(evm_values(&block8), (5_000_000, 10));
+        assert_eq!(
+            link_on(&app, &parent7, &block8, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        let mut at_30m = block8.clone();
+        at_30m.header.evm_gas_limit = 30_000_000;
+        assert_eq!(
+            link_on(&app, &parent7, &at_30m, |h| app.boundary_evm(h)),
+            BlockDataCheck::Invalid
+        );
+        let (pg, pn) = evm_values(&parent7);
+        let unchanged = evm_header_child(&parent7, pg, pn);
+        assert_eq!(
+            link_on(&app, &parent7, &unchanged, |h| app.boundary_evm(h)),
+            BlockDataCheck::Invalid,
+            "the parent's values at the boundary"
+        );
+
+        let _ = app.build_proposal(block8.header.clone());
+        let block9 = app.pending_proposals[&9].block.clone();
+        assert_eq!(evm_values(&block9), (5_000_000, 10));
+        assert_eq!(
+            link_on(&app, &block8, &block9, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        let reverted = evm_header_child(&block8, pg, pn);
+        assert_eq!(
+            link_on(&app, &block8, &reverted, |h| app.boundary_evm(h)),
+            BlockDataCheck::Invalid,
+            "block 9 keeps the boundary's values"
+        );
+        drop(ctx);
+
+        // Rows executed in block 5: plan(8) was written by 4 without them.
+        let (app, db, config) = epoch4_app(1_020);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=4 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        put_rows(&db);
+        for h in 5..=8 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(app.boundary_evm(8), Ok(Some(PlanEvm::default())));
+        assert_eq!(app.boundary_evm(12), Ok(Some(changed)));
+        drop(ctx);
     }
 
     // ---- item 2: oracle helpers ----
@@ -23948,6 +24385,17 @@ mod crash_recovery_tests {
         app.cached_vs_updates = None;
         app.test_applied_read_fault = true;
         assert!(app.epoch_validator_set_updates(boundary).is_err());
+    }
+
+    /// R02, item 7 step 1: the boundary EVM values read the same marker; a
+    /// failed read is EpochPlanNotReady, never "applied = 0".
+    #[test]
+    fn r02_applied_height_read_fault_boundary_evm_not_ready() {
+        let mut app = TorusApp::stub();
+        let boundary = app.epoch_length;
+        assert_eq!(app.boundary_evm(boundary), Ok(None), "control");
+        app.test_applied_read_fault = true;
+        assert_eq!(app.boundary_evm(boundary), Err(EpochPlanNotReady));
     }
 
     /// R02 branch 3: a local fault recorded by a reader without `&mut ctx`
