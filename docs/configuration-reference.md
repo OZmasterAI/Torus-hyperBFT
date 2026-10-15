@@ -73,7 +73,7 @@ values, which governance can change (see "EVM blocks" below).
 | `chain_id` | u64 | 7777 | EVM chain ID |
 | `chain_name` | string | `"torus"` | Human-readable chain name |
 | `evm_gas_limit` | u64 | 3,000,000 | EVM gas budget per EVM block: the genesis header's `evm_gas_limit`. Genesis key `evm.gas_limit` (required). |
-| `evm_block_interval` | u64 | 5 | N: EVM transactions only in blocks with `height % N == 0`. The genesis header's `evm_block_interval`. Genesis key `evm.block_interval` (absent = 5; 0 is refused; 1 = EVM in every block). |
+| `evm_block_interval` | u64 | 11 | N: EVM transactions only in blocks with `height % N == 0`. The genesis header's `evm_block_interval`. Genesis key `evm.block_interval` (absent = 11; 0 is refused; 1 = EVM in every block). |
 | `base_fee_per_gas` | u64 | 1,000,000,000 | Initial base fee (1 gwei) |
 | `epoch_length` | u64 | 100,000 | Blocks per validator epoch |
 | `max_validators` | u32 | 21 | Maximum active validator set size |
@@ -87,8 +87,17 @@ values, which governance can change (see "EVM blocks" below).
 
 The block header carries `evm_gas_limit` (the EVM gas budget of an EVM block) and
 `evm_block_interval` (N). Both start at the genesis values above. Every shipped genesis file uses
-3M / 5; the CI Uniswap genesis (`devnet/uniswap/make-ci-genesis.py`) uses a 10M budget, because
-the Router deploy needs about 4.2M gas.
+3M / 11; the CI Uniswap genesis (`devnet/uniswap/make-ci-genesis.py`) uses a 10M budget, because
+the Router deploy needs about 4.2M gas, and keeps N = 11. The bench genesis generators
+(`testnet/gen-weighted-genesis.sh`, `devnet/wsl/gen-3val-genesis.sh`) copy the EVM section of
+`testnet/genesis-weighted-base.json`, so bench cells run at 3M / 11 too (an untracked
+`testnet/genesis-weighted-full.json` generated before the change keeps N = 5:
+`gen-3val-genesis.sh` reuses it until it is rebuilt with `FORCE=1`).
+
+N = 11 is the s123 owner value for benches and testing (it was 5). It is prime, so it shares no
+factor with any validator count below 11: with round-robin leaders (one view per height), every
+validator leads some EVM heights. At 3.2 blocks/s an EVM block comes every ~3.4 s, which at 3M
+gas is ~0.9M EVM gas/s. Retune before testnet.
 
 A header must carry its parent's values, except at an epoch boundary, where it carries the epoch
 plan's values (unset in the plan = the parent's). Validators check this before voting and at

@@ -116,3 +116,7 @@ Option A, with these answers to the open questions:
    writing-plans).
 6. The per-market tombstone compaction (`cf.rs:94-106`, `db.rs:940`) is deleted with `getOrderBook`, once
    writing-plans confirms nothing else range-scans that column family.
+
+Note (s123 owner, after the step 1 merge): N = 11 for benches and testing (prime, so no shared factor with any
+validator count below 11; ~3.4 s between EVM blocks at 3.2 blocks/s; ~0.9M gas/s at 3M); retune before testnet.
+`DEFAULT_EVM_BLOCK_INTERVAL` and every shipped genesis file use 11; the gas limit stays 3M.

@@ -244,6 +244,26 @@
 #                digest-node.sh whose --capabilities lists position-accounts:
 #                pre-flight refuses the cell when the selected ones (see
 #                TOOLS_FROM_WORKTREE; an older worktree's) lack them.
+#   EVM_LOAD_RATE=R  EVM load (item 7): R EIP-1559 transfers/s in aggregate (a
+#                number > 0) from tools/tx-flood (`torus-tx-flood --rate R
+#                --fanout pinned`), started right after the bench and stopped
+#                (SIGTERM) when the bench exits; --duration-secs DUR bounds it
+#                too. Senders: the genesis-funded "bench sender 20" ..
+#                "bench sender 20+S-1" accounts (`bench-throughput gen-accounts
+#                --offset 20 --secret-keys`; the load senders start at 60);
+#                the k-th sender sends only to val k % 3, like a wallet. After
+#                the agreement step evm_load.py (next to this script) counts the
+#                executed EVM txs of every height on val0 from the EVM load's
+#                start to the head. Artifacts: evm-load.log, evm-load-stats.json
+#                (sent / accepted / refused by reason), evm-load-scan.json
+#                (landed, EVM blocks, blocks off the genesis N cadence),
+#                summary.json .evm_load (also each node's torus_exec_evm_seconds
+#                delta). A cell that did not get its EVM load (.evm_load.problems)
+#                is REJECTed in .validity. Needs $TARGET_DIR/release/torus-tx-flood with --rate
+#                (TX_FLOOD=<path> overrides). Unset or 0 (default) = off: no
+#                tx-flood, no extra file or log line.
+#   EVM_LOAD_SENDERS=S  with EVM_LOAD_RATE > 0 (else FATAL): senders 1..40
+#                (default 40).
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -340,6 +360,13 @@ LIQ_THIN=${LIQ_THIN:-0}
 LIQ_THIN_AVAIL=${LIQ_THIN_AVAIL:-1000000.0}
 ORACLE_SHOCK_BP=${ORACLE_SHOCK_BP:-0}
 ORACLE_SHOCK_ROUND=${ORACLE_SHOCK_ROUND:-0}
+EVM_LOAD_RATE=${EVM_LOAD_RATE:-0}
+EVM_LOAD_SENDERS=${EVM_LOAD_SENDERS:-}
+# EVM load senders: "bench sender 20..59" in testnet/genesis-weighted-base.json
+# (1M TRS of EVM balance each), below the load senders (--sender-offset 60) and
+# the funded spam keys (the top of the bulk range).
+EVM_LOAD_OFFSET=20
+EVM_LOAD_MAX_SENDERS=40
 # torus_core::liquidation::LIQUIDATOR_VAULT ("torus-liquidator-vlt").
 LIQUIDATOR_VAULT=0x746f7275732d6c697175696461746f722d766c74
 # torus_core::liquidation::ADL_ESCROW_LONG / ADL_ESCROW_SHORT
@@ -354,6 +381,7 @@ OUT="$RESULTS_ROOT/$LABEL"
 
 SRC_NODE="$TARGET_DIR/release/torus-node"
 BENCH="$TARGET_DIR/release/bench-throughput"
+TX_FLOOD=${TX_FLOOD:-$TARGET_DIR/release/torus-tx-flood}
 DST_NODE="$WT/target/release/torus-node"
 GENESIS="$WT/devnet/wsl/genesis-3val.json"
 WSL="$WT/devnet/wsl"
@@ -579,6 +607,25 @@ case "$ORACLE_FEED" in
     *) echo "FATAL: ORACLE_FEED must be unset, 0 or 1 (got '$ORACLE_FEED')" >&2; exit 2 ;;
 esac
 
+# ---- EVM load (EVM_LOAD_RATE) pre-flight. Every EVM-load step below sits in an
+# `if evm_load_on` block: off (the default), the cell runs exactly as before.
+[[ "$EVM_LOAD_RATE" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+    || { echo "FATAL: EVM_LOAD_RATE must be a non-negative number of tx/s (got '$EVM_LOAD_RATE')" >&2; exit 2; }
+evm_load_on() { awk -v r="$EVM_LOAD_RATE" 'BEGIN{exit !(r>0)}'; }
+if evm_load_on; then
+    EVM_LOAD_SENDERS=${EVM_LOAD_SENDERS:-$EVM_LOAD_MAX_SENDERS}
+    [[ "$EVM_LOAD_SENDERS" =~ ^[1-9][0-9]?$ ]] && [ "$EVM_LOAD_SENDERS" -le "$EVM_LOAD_MAX_SENDERS" ] \
+        || { echo "FATAL: EVM_LOAD_SENDERS must be an integer in 1..$EVM_LOAD_MAX_SENDERS (got '$EVM_LOAD_SENDERS')" >&2; exit 2; }
+    [ -x "$TX_FLOOD" ] || { echo "FATAL: EVM_LOAD_RATE=$EVM_LOAD_RATE needs $TX_FLOOD (cargo build --release -p torus-tx-flood, or TX_FLOOD=<path>)" >&2; exit 1; }
+    TX_FLOOD_HELP=$("$TX_FLOOD" --help 2>/dev/null) || TX_FLOOD_HELP=""
+    for f in --rate --fanout --keys-file --chain-id --duration-secs --stats-file; do
+        case "$TX_FLOOD_HELP" in *"$f"*) ;; *) echo "FATAL: EVM_LOAD_RATE=$EVM_LOAD_RATE but $TX_FLOOD has no $f (rebuild torus-tx-flood)" >&2; exit 1 ;; esac
+    done
+    [ -f "$SELF_DIR/evm_load.py" ] || { echo "FATAL: $SELF_DIR/evm_load.py missing" >&2; exit 1; }
+elif [ -n "$EVM_LOAD_SENDERS" ]; then
+    echo "FATAL: EVM_LOAD_SENDERS=$EVM_LOAD_SENDERS needs EVM_LOAD_RATE > 0" >&2; exit 2
+fi
+
 # ---- crash gate (bl3) pre-flight: validated HERE, before anything is launched,
 # so a bad kill window can never be discovered mid-cell.
 KILL_IDX=""
@@ -697,6 +744,10 @@ if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench i
 if pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
 # A stray feed (from a SIGKILLed oracle cell) would sign into THIS devnet too.
 if pgrep -f "bench-throughput oracle-feed" >/dev/null; then echo "FATAL: an oracle feed is already running" >&2; exit 1; fi
+# Same for a stray EVM load (by process name: a driver's `env TX_FLOOD=...` argv must not match).
+if evm_load_on; then
+    if pgrep -x torus-tx-flood >/dev/null; then echo "FATAL: a torus-tx-flood is already running" >&2; exit 1; fi
+fi
 if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/null; then
     echo "FATAL: a devnet is already running ($RUN_DIR/pids) — run $WSL/stop-3val.sh first" >&2; exit 1
 fi
@@ -726,6 +777,37 @@ stop_oracle_feed() {
     wait "$pid" 2>/dev/null; ORACLE_RC=$?
     log "oracle feed pid $pid stopped rc=$ORACLE_RC"
 }
+# ---- EVM load (EVM_LOAD_RATE > 0): tx-flood runs beside the bench.
+EVM_PID=""; EVM_RC=""; EVM_H0=""; EVM_H1=""; T_EVM0=""; EVM_KEYS=""; EVM_CHAIN_ID=""; EVM_N=""
+# evm_load_start: tx-flood in the background, from val0's committed height EVM_H0.
+evm_load_start() {
+    local h
+    h=$(scrape_one "${METS[0]}" | mval torus_block_height); EVM_H0=${h%.*}
+    EVM_LOAD_CMD=("$TX_FLOOD" --rpc-urls "$(IFS=,; printf '%s' "${RPCS[*]}")" --fanout pinned \
+        --keys-file "$EVM_KEYS" --chain-id "$EVM_CHAIN_ID" --rate "$EVM_LOAD_RATE" \
+        --duration-secs "$DUR" --stats-file "$OUT/evm-load-stats.json")
+    log "EVM load: ${EVM_LOAD_CMD[*]} (val0 committed height $EVM_H0)"
+    T_EVM0=$(date +%s)
+    "${EVM_LOAD_CMD[@]}" > "$OUT/evm-load.log" 2>&1 & EVM_PID=$!
+}
+# evm_load_stop: idempotent, safe on every exit path. TERM (tx-flood stops
+# sending and writes its stats), 20 s grace (tx-flood drains for up to 15 s: 12 s send timeout + 3 s), then KILL; EVM_H1 = val0's
+# committed height when it stopped.
+evm_load_stop() {
+    [ -n "$EVM_PID" ] || return 0
+    local pid=$EVM_PID _t h
+    EVM_PID=""
+    kill -TERM "$pid" 2>/dev/null
+    for _t in $(seq 1 100); do alive "$pid" || break; sleep 0.2; done
+    if alive "$pid"; then
+        kill -KILL "$pid" 2>/dev/null
+        log "WARNING: tx-flood pid $pid ignored SIGTERM for 20 s — SIGKILLed (stats may be missing)"
+    fi
+    wait "$pid" 2>/dev/null; EVM_RC=$?
+    h=$(scrape_one "${METS[0]}" | mval torus_block_height); EVM_H1=${h%.*}
+    [ -z "$EVM_KEYS" ] || rm -f -- "${EVM_KEYS:?}"
+    log "EVM load: tx-flood pid $pid stopped rc=$EVM_RC after $(( $(date +%s) - T_EVM0 ))s (val0 committed height $EVM_H1)"
+}
 stop_sampler() {
     [ -n "$SAMPLER_PID" ] || return 0
     local pid="$SAMPLER_PID" rc=0
@@ -742,6 +824,7 @@ finish_fail() {
     [ -n "$BENCH_PID" ] && kill "$BENCH_PID" 2>/dev/null
     [ -n "$CRASH_PID" ] && kill "$CRASH_PID" 2>/dev/null
     stop_oracle_feed
+    evm_load_stop
     "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1 || true
     python3 - "$OUT" <<'PY' 2>/dev/null || true
 import json,sys,os,time
@@ -759,6 +842,8 @@ PY
 trap 'log "interrupted"; finish_fail; exit 130' INT TERM
 # Exit paths that bypass finish_fail (plain `exit`) must not leave a feed behind.
 if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
+# ... nor a tx-flood (stop_oracle_feed is a no-op without a feed).
+if evm_load_on; then trap 'stop_oracle_feed; evm_load_stop' EXIT; fi
 
 log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' cloid_share='${CLOID_SHARE:-unset}' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
@@ -768,6 +853,12 @@ if liq_stress_on; then
     [ -z "$MPS" ] || log "WARNING: MPS=$MPS: the locality shape sets sides by owner rank, not (sender + market) parity, so the shock's 'even-index senders lose on every position' does not hold"
 fi
 [ "$ORACLE_FEED" = 1 ] && log "oracle feed ON: price=$ORACLE_PRICE walk_bp=$ORACLE_WALK_BP shock_bp=$ORACLE_SHOCK_BP shock_round=$ORACLE_SHOCK_ROUND interval=${ORACLE_INTERVAL_MS}ms markets=$MARKETS keys=$ORACLE_KEYS fresh_timeout=${ORACLE_FRESH_TIMEOUT}s"
+if evm_load_on; then
+    log "EVM load ON: rate=$EVM_LOAD_RATE tx/s senders=$EVM_LOAD_SENDERS (bench senders $EVM_LOAD_OFFSET..$((EVM_LOAD_OFFSET + EVM_LOAD_SENDERS - 1)), the k-th sender -> val k % 3 only) tx_flood=$TX_FLOOD md5=$(md5sum "$TX_FLOOD" | cut -d' ' -f1)"
+    if awk -v r="$EVM_LOAD_RATE" -v s="$EVM_LOAD_SENDERS" 'BEGIN{exit !(r / s > 2)}'; then
+        log "WARNING: EVM_LOAD_RATE / EVM_LOAD_SENDERS > 2 tx/s per sender: the node's per-sender limits (16 pooled, 50 per 10 s at the RPC, nonce <= executed + 64) will refuse some txs"
+    fi
+fi
 WT_COMMIT=$(git -C "$WT" rev-parse HEAD)
 WT_DIRTY=$(git -C "$WT" status --porcelain --untracked-files=no | wc -l)
 log "worktree commit=$WT_COMMIT dirty_files=$WT_DIRTY"
@@ -810,6 +901,19 @@ GEN_ACCTS=$(jq '.native_balances|length' "$GENESIS")
 GEN_MD5=$(md5sum "$GENESIS" | cut -d' ' -f1)
 [ "$GEN_MARKETS" = "$MARKETS" ] || die "genesis has $GEN_MARKETS markets, wanted $MARKETS"
 log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS md5=$GEN_MD5"
+if evm_load_on; then
+    # Sender keys (deterministic bench keys) live beside the devnet's pids and
+    # logs, never in the results dir; evm_load_stop deletes them.
+    mkdir -p "$RUN_DIR"
+    EVM_KEYS="$RUN_DIR/evm-load-keys.txt"
+    "$BENCH" gen-accounts --offset "$EVM_LOAD_OFFSET" --count "$EVM_LOAD_SENDERS" --secret-keys > "$EVM_KEYS" 2>>"$OUT/run.log" \
+        || die "EVM load: bench-throughput gen-accounts --secret-keys failed (see run.log)"
+    EVM_FUNDED=$(python3 "$SELF_DIR/evm_load.py" funded --genesis "$GENESIS" --keys "$EVM_KEYS" 2>&1) || die "EVM load: $EVM_FUNDED"
+    EVM_CHAIN_ID=$(jq -r '.evm.chain_id // empty' "$GENESIS")
+    EVM_N=$(jq -r '.evm.block_interval // empty' "$GENESIS")
+    [[ "$EVM_CHAIN_ID" =~ ^[0-9]+$ ]] || die "EVM load: $GENESIS has no evm.chain_id"
+    log "EVM load: $EVM_FUNDED; evm.chain_id=$EVM_CHAIN_ID evm.block_interval=${EVM_N:-absent (node default)}"
+fi
 
 # ---------------------------------------------------------------- 3. launch
 # start from a clean TORUS_* env: only the record env + EXTRA_ENV reach the nodes
@@ -1012,7 +1116,7 @@ cpusampler() {
     echo "ts,load1,load5,ncpu,pid,comm,pcpu,rss_kb" > "$OUT/cpu.csv"
     while true; do
         ts=$(date +%s); read -r l1 l5 _ < /proc/loadavg
-        ps -o pid=,comm=,pcpu=,rss= -p "$(tr '\n' ',' < "$RUN_DIR/pids" | sed 's/,$//')${BENCH_PID:+,$BENCH_PID}" 2>/dev/null \
+        ps -o pid=,comm=,pcpu=,rss= -p "$(tr '\n' ',' < "$RUN_DIR/pids" | sed 's/,$//')${BENCH_PID:+,$BENCH_PID}${EVM_PID:+,$EVM_PID}" 2>/dev/null \
             | awk -v ts="$ts" -v l1="$l1" -v l5="$l5" -v n="$(nproc)" '{printf "%s,%s,%s,%s,%s,%s,%s,%s\n",ts,l1,l5,n,$1,$2,$3,$4}' >> "$OUT/cpu.csv"
         sleep 10
     done
@@ -1049,6 +1153,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!
+if evm_load_on; then evm_load_start; fi
 cpusampler & CPU_PID=$!
 # bl3 crash gate: SIGKILL + restart one validator CRASH_KILL_AT_S into the load
 # window. Off unless CRASH_KILL_AT_S is set; the target guard lives in
@@ -1116,6 +1221,8 @@ BENCH_PID=""
 # a SIGKILLed+restarted node has a new pid: re-read so the snapshot follows the live process
 mapfile -t PIDS_NOW < "$RUN_DIR/pids"; schedstat_snapshot bench_end "${PIDS_NOW[@]}"
 log "bench exited rc=$BENCH_RC after $((T_BENCH1 - T_BENCH0))s"
+# EVM load: the load window is over, stop the EVM senders too (before the drain).
+if evm_load_on; then evm_load_stop; fi
 # Oracle feed: record the marks the load ended with, then PAUSE the feed. Its
 # SubmitOraclePrices are native actions: running, they bump
 # torus_native_actions_processed_total and the native mempool gauge every
@@ -1346,6 +1453,19 @@ EVICTED=$(for i in 0 1 2; do sed -E 's/\x1b\[[0-9;]*m//g' "$RUN_DIR/val$i.log" |
 BENCH_SUBMITTED=$(grep -oE 'Submitted \(load-gen accepted\): [0-9,]+' "$OUT/bench.log" | grep -oE '[0-9,]+$' | tr -d ,)
 log "ingest: bench submitted=${BENCH_SUBMITTED:-?} actions; mempool nonce-expired evictions per node: $EVICTED"
 
+# EVM load: what landed, read from val0 after the digest (read-only RPCs, so
+# they cannot disturb it): executed EVM txs per height from the EVM load's start
+# to the committed head, once val0's eth view (applied marker, written at
+# checkpoints) reaches that head (at most 60 s).
+if evm_load_on; then
+    EVM_HEAD=$(scrape_one "${METS[0]}" | mval torus_block_height); EVM_HEAD=${EVM_HEAD%.*}
+    EVM_SCAN=$(python3 "$SELF_DIR/evm_load.py" scan --rpc "${RPCS[0]}" --from "${EVM_H0:-0}" --to "${EVM_HEAD:-0}" \
+        --interval "$EVM_N" --stats "$OUT/evm-load-stats.json" --wait-s 60 --out "$OUT/evm-load-scan.json" 2>&1) \
+        || EVM_SCAN="WARNING: evm_load.py scan failed: $(tail -c 400 <<<"$EVM_SCAN")"
+    log "EVM load: $EVM_SCAN"
+    log "EVM load: tx-flood $(jq -c '{sent,accepted,rejected,throttled,missed,reject_reasons,stopped_by,elapsed_s}' "$OUT/evm-load-stats.json" 2>/dev/null || echo 'stats=MISSING')"
+fi
+
 # ---------------------------------------------------------------- 9. stop + collect logs
 "$WSL/stop-3val.sh" >>"$OUT/run.log" 2>&1
 # Body-dissemination / exec-pacing accounting per node (block-cap-raise sweep:
@@ -1446,8 +1566,23 @@ with open(p, 'w') as f:
     json.dump(d, f, indent=1)
 PYS
 fi
+# summary.json .evm_load: tx-flood stats + the scan + per-node torus_exec_evm_seconds deltas.
+if evm_load_on && [ "$rc" = 0 ]; then
+    python3 "$SELF_DIR/evm_load.py" summary --dir "$OUT" --rate "$EVM_LOAD_RATE" --senders "$EVM_LOAD_SENDERS" --rc "$EVM_RC" \
+        || log "WARNING: summary.json .evm_load not written"
+fi
 log "done -> $OUT/summary.json"
 [ "$rc" = 0 ] || exit "$rc"
+# EVM load: a cell that asked for EVM load and did not get it (tx-flood failed,
+# stats or scan missing or incomplete, nothing accepted or landed, EVM txs off
+# the cadence: .evm_load.problems) is rejected, whatever the native verdict:
+# evm_load.py summary folded the problems into .validity (REJECT), .status and
+# .headline.benchmark_accepted, so health.py below exits 2 as for any rejected
+# cell. Without .evm_load at all nothing was folded: fail here.
+if evm_load_on && ! jq -e '.evm_load.ok == true' "$OUT/summary.json" >/dev/null 2>&1; then
+    log "EVM load: cell NOT accepted: $(jq -c '.evm_load.problems // ["no .evm_load in summary.json"]' "$OUT/summary.json" 2>/dev/null || echo '["summary.json unreadable"]')"
+    jq -e '.evm_load' "$OUT/summary.json" >/dev/null 2>&1 || exit 1
+fi
 # A successful report write is not benchmark acceptance. Preserve artifacts and
 # return nonzero for stalled, undrained, inconsistent or unverified cells.
 python3 "$TOOLS_DIR/health.py" accept "$OUT/summary.json"

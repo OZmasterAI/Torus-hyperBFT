@@ -11,7 +11,7 @@
     "evm": {
         "spec_id": "cancun",
         "gas_limit": 3000000,
-        "block_interval": 5,
+        "block_interval": 11,
         "base_fee_initial": 1000000000,
         "chain_id": 7778
     },

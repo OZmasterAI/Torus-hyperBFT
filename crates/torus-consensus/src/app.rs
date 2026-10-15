@@ -254,6 +254,13 @@ impl CkptState {
     }
 }
 
+/// Item 7 step 1: the EVM cadence N of `TorusApp::stub` and the consensus
+/// test fixtures (the test modules' `make_block`s and chain configs). The EVM
+/// tests put EVM txs at heights 5, 10, ... (a height-4 tip), so the fixtures
+/// keep N = 5 when `DEFAULT_EVM_BLOCK_INTERVAL` moves (11 since s123): they
+/// pin the cadence rules, not the default.
+const TEST_EVM_BLOCK_INTERVAL: u64 = 5;
+
 /// p3 merge wait test seam: the deferred half of each layer merge waits
 /// until E reaches a point that may need it (the end-of-block upkeep, a
 /// drain) or a read blocks on it, all of which release it. A hold that
@@ -6284,7 +6291,7 @@ impl TorusApp {
             chain_id: TORUS_CHAIN_ID,
             chain_name: "torus-test".to_string(),
             evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
-            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -8940,7 +8947,7 @@ mod exec_throttle_tests {
                 chain_id: torus_evm::TORUS_CHAIN_ID,
                 chain_name: "throttle-test".to_string(),
                 evm_gas_limit: 30_000_000,
-                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+                evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
                 base_fee_per_gas: 1_000_000_000,
                 epoch_length: 100,
                 max_validators: 4,
@@ -9111,7 +9118,7 @@ mod exec_dispatch_tests {
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
                 evm_gas_limit: 30_000_000,
-                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+                evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,
@@ -10312,7 +10319,7 @@ mod crash_recovery_tests {
             chain_id: torus_evm::TORUS_CHAIN_ID,
             chain_name: "crash-test".to_string(),
             evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
-            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -10349,11 +10356,12 @@ mod crash_recovery_tests {
     }
 
     /// Item 7 step 1: the genesis parent header of the module's chain config
-    /// (`make_test_config_and_db`: the genesis default EVM values).
+    /// (`make_test_config_and_db`: the default gas limit, N =
+    /// `TEST_EVM_BLOCK_INTERVAL`).
     fn default_genesis_header() -> TorusBlockHeader {
         torus_bridge::genesis_parent_header(
             torus_types::DEFAULT_EVM_GAS_LIMIT,
-            torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+            TEST_EVM_BLOCK_INTERVAL,
         )
     }
 
@@ -10387,7 +10395,7 @@ mod crash_recovery_tests {
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
                 evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
-                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+                evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,

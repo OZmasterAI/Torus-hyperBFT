@@ -907,3 +907,76 @@ and the queued reruns stay in the queue unrun.
 
 Self-test: `python3 tools/matched-bench/test_cell_step.py` (fixtures: trimmed
 copies of three real p3gate cells in `testdata/cell-step/`).
+
+## EVM load in a cell (`EVM_LOAD_RATE`)
+
+`EVM_LOAD_RATE=R` (transfers/s, default 0 = off) runs `tools/tx-flood` beside the native
+load for the cell's load window: R EIP-1559 transfers per second in aggregate (1 TRS each,
+21,000 gas, 100 gwei). Off, the cell is unchanged: no tx-flood, no extra file or log line, and
+the same bench, oracle-feed and node command lines (pinned in `test_harness.py`).
+
+How it runs:
+
+- **Senders.** `EVM_LOAD_SENDERS=S` (1..40, default 40) of the genesis accounts
+  "bench sender 20" .. "bench sender 59" (`testnet/genesis-weighted-base.json`, 1M TRS of EVM
+  balance each). Their keys come from `bench-throughput gen-accounts --offset 20 --count S
+  --secret-keys`, are written beside the devnet's pids (`$DATA_ROOT/run/evm-load-keys.txt`)
+  and are deleted when tx-flood stops. They are none of the load senders (`--sender-offset
+  60`), the funded spam keys (the top of the bulk range) or the digest accounts. Pre-flight
+  (`evm_load.py funded`) fails the cell unless the genesis funds every sender.
+- **One validator per sender, like a wallet.** The k-th sender sends only to val `k % 3`
+  (`--fanout pinned`); that node pools the tx and forwards it to the next EVM leader.
+  tx-flood's default (`--fanout all`, every tx to every RPC) is not used.
+- **Paced.** `--rate R` ticks every 1/R s, round-robin over the senders, one tx in flight per
+  sender. A refused tx is sent again with the same nonce after a back-off (1 s for `mempool
+  full`, `nonce too far` and HTTP errors; 2 s for the RPC's per-sender rate limit; 5 s for
+  anything else), so a sender never leaves a nonce gap. A tick that finds every sender busy or
+  backing off counts as `throttled`; a scheduler more than 1 s late skips ticks (`missed`).
+  The recipient is another sender, chosen by nonce, so repeated cells send the same txs.
+- **Window.** tx-flood starts right after the bench and is stopped (SIGTERM) right after the
+  bench exits, before the drain; `--duration-secs DUR` also bounds it.
+- **Node limits.** Per sender, a node's RPC admits 50 txs per 10 s, its pool holds 16, and a
+  nonce may run at most 64 ahead of the executed one (which a validator reads at its last
+  checkpoint). Keep R / S at or below ~2 tx/s. An EVM block holds at most 3M / 21,000 = 142
+  transfers, and comes every N = 11 heights: ~41 transfers/s at 3.2 blocks/s.
+
+What it records:
+
+| file / field | content |
+|---|---|
+| `evm-load.log` | tx-flood's output (a progress line every 10 s) |
+| `evm-load-stats.json` | tx-flood `--stats-file`: `sent`, `accepted`, `rejected`, `reject_reasons` (`timeout` = a send unanswered for 12 s), `throttled`, `missed`, `unfinished` (sends still running at the end: aborted, outcome unknown), `per_rpc`, `per_sender` (address, RPC, start and next nonce) |
+| `evm-load-scan.json` | `evm_load.py scan` on val0 after the digest: the executed EVM txs of every height from the EVM load's start to the committed head (`eth_getBlockTransactionCountByNumber`; it first waits up to 60 s for val0's eth head, which moves at checkpoints). `evm_txs` (landed), `evm_blocks`, `evm_block_txs` (`[height, txs]`), `off_cadence_blocks` / `off_cadence_heights` (EVM txs at a height with `height % N != 0`, N = the genesis `evm.block_interval`; must be 0), `cadence_heights`, and per sender `landed_by_nonce` / `accepted_not_landed` (`eth_getTransactionCount` latest) |
+| `summary.json` `.evm_load` | the above, plus per node `exec_evm_seconds`: the `torus_exec_evm_seconds` sum and count deltas (metrics-before to metrics-after) and ms per EVM block, and `ok` / `problems` (below) |
+| `run.log` | `EVM load ON: ...`, the tx-flood command, its stop (rc, height), the scan line and the stats line |
+
+`torus_exec_evm_seconds_sum` is also sampled at 1 Hz in `sampler.csv`, as before (the `evm`
+phase in `summarize.py`).
+
+A cell that asked for EVM load and did not get it is rejected, whatever the native verdict:
+`.evm_load.problems` lists why (tx-flood rc != 0, stats or scan missing, scan incomplete or with
+unreadable heights, nothing accepted, nothing landed, EVM txs off the cadence) and is folded into
+`.validity` (REJECT, reason `EVM load failed: ...`), `.status` (INVALID) and
+`.headline.benchmark_accepted` (false), so `health.py accept` exits 2 as for any rejected cell.
+`resummarize.sh` re-derives `.evm_load` (and the fold) from the retained `evm-load-*` files.
+
+The cell runs at the N of its genesis. `gen-3val-genesis.sh` reuses an existing
+`testnet/genesis-weighted-full.json` (untracked), so one generated before N = 11 keeps N = 5:
+regenerate it once (`FORCE=1`) and check `jq .evm devnet/wsl/genesis-3val.json` and
+`.evm_load.interval` in summary.json.
+
+Build `cargo build --release -p torus-tx-flood`; run-cell.sh reads
+`$TARGET_DIR/release/torus-tx-flood`, or `TX_FLOOD=<path>`. Generated campaign drivers pass the
+knob in `harness_env` (`"EVM_LOAD_RATE": "20"`, plus `TX_FLOOD` when the stage dir has no
+tx-flood); `campaign/run_cell.py` takes `--runner-env EVM_LOAD_RATE=20` and
+`--runner-env EVM_LOAD_SENDERS=40`. One cell:
+
+```
+EVM_LOAD_RATE=20 TARGET_DIR=<dir with release/{torus-node,bench-throughput,torus-tx-flood}> \
+    tools/matched-bench/campaign/detach.sh evm-smoke /tmp/evm-smoke.log \
+    tools/matched-bench/run-cell.sh <worktree> evm-smoke 10 60 20000
+jq .evm_load ~/bench-results-matched/evm-smoke/summary.json
+```
+
+Self-tests: `test_harness.py` (`EvmLoadHarnessTest`, `EvmLoadScanTest`) and the tx-flood crate
+(`cargo nextest run -p torus-tx-flood`: rate, pinning, re-send with the same nonce, key file).
