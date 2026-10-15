@@ -3776,6 +3776,45 @@ class DetachBuildLockTest(unittest.TestCase):
         self.assertIn(".cargo-heavy.lock", src)
         self.assertIn("flock -o", src)
 
+
+
+class BuildGuardTest(unittest.TestCase):
+    """run-cell.sh's "never bench while building" guard (s1156 Codex review of
+    40266a79): a builder waiting on the campaign's build lock
+    (`flock -w 60 -o LOCK cargo build`) has "cargo build" in its argv but is not
+    building; only a running cargo/rustc process may abort a cell."""
+
+    def _guard(self, tmp):
+        with open(RUN_CELL_SH) as f:
+            line = next(l for l in f if "never bench while building" in l)
+        script = os.path.join(tmp, "guard.sh")
+        with open(script, "w") as f:
+            f.write(line)  # a file, so the guard's own argv holds no "cargo build"
+        return subprocess.run(["bash", script], capture_output=True, text=True)
+
+    def _spawn(self, argv):
+        p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        time.sleep(0.2)
+        return p
+
+    def test_lock_waiter_does_not_abort_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._spawn([sys.executable, "-c", "import time; time.sleep(30)",
+                         "flock", "-w", "60", "-o", "/tmp/x.lock", "cargo", "build"])
+            r = self._guard(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_running_cargo_aborts_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "cargo")
+            os.symlink(shutil.which("sleep"), fake)
+            self._spawn([fake, "30"])
+            r = self._guard(tmp)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("never bench while building", r.stderr)
+
 if __name__ == "__main__":
     if not os.path.exists(DIGEST_SH):
         print("NOTE: %s missing — digest tests will fail" % DIGEST_SH)
