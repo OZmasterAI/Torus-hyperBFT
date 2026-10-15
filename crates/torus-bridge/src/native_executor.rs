@@ -2695,6 +2695,460 @@ fn parse_save_books_min_ops(v: Option<String>) -> usize {
         .unwrap_or(DEFAULT_SAVE_BOOKS_MIN_OPS)
 }
 
+// ============================================================================
+// Classic save: parallel per-book blob encode (`TORUS_PARALLEL_BOOK_SAVE`)
+// — node-local, default OFF (exp/archy-s58-parallel-classic-book-save)
+// ============================================================================
+//
+// The Classic (`BookMode::Classic`) save writes one whole-book borsh blob per
+// dirty book. Encoding those blobs (plus the journal discard) is all on-CPU
+// and serial on the exec thread today, while the exec pool is idle (only
+// matching and settle pass A use it). With the flag on, each dirty book's
+// blob is encoded into a presized buffer as its OWN exec-pool job (heaviest
+// first, rayon stealing balances the tail); the puts then run back on the exec
+// thread, SERIALLY in market-ascending order, with today's latch / log / skip
+// behaviour. A job panic fail-stops through `latch_save_fault`, never a skip.
+// Bytes are borsh::to_vec's by construction (`encode_classic_book_into`).
+// Not `TORUS_SAVE_BOOKS_WORKERS`: unset, that one defaults to host parallelism.
+
+/// Work gate of the Classic parallel save: total resting orders over the
+/// dirty books (present in `order_books`) below this keep the serial loop.
+const CLASSIC_PARALLEL_SAVE_MIN_ORDERS: usize = 16_384;
+
+/// Upper bound on one Classic blob's presize (the hint only feeds
+/// `Vec::with_capacity`; a bigger book simply grows its buffer).
+const CLASSIC_BLOB_CAPACITY_CAP: usize = 256 << 20;
+
+/// Pure parse for `TORUS_PARALLEL_BOOK_SAVE`: ON only for a trimmed `1`;
+/// unset, empty or anything else is OFF (never a third behaviour).
+fn parse_parallel_book_save(v: Option<String>) -> bool {
+    v.as_deref().map(str::trim) == Some("1")
+}
+
+thread_local! {
+    /// Test / µbench pin for [`parallel_book_save`] on this thread
+    /// (`Some((on, min_orders))`); `None` = read the env.
+    static PARALLEL_BOOK_SAVE_PIN: std::cell::Cell<Option<(bool, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with the Classic parallel save pinned on this thread to `on`
+/// with work gate `min_orders` (total resting orders over the dirty books),
+/// ignoring `TORUS_PARALLEL_BOOK_SAVE`. Restores the previous pin, also on
+/// unwind. Tests and µbenches only.
+#[doc(hidden)]
+pub fn with_parallel_book_save<R>(on: bool, min_orders: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<(bool, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PARALLEL_BOOK_SAVE_PIN.with(|p| p.set(self.0));
+        }
+    }
+    let prev = PARALLEL_BOOK_SAVE_PIN.with(|p| p.replace(Some((on, min_orders))));
+    let _restore = Restore(prev);
+    f()
+}
+
+/// `Some(min_orders)` when the Classic parallel save is on for this thread:
+/// the pin of [`with_parallel_book_save`], else `TORUS_PARALLEL_BOOK_SAVE`
+/// (read once per process, logged once) with
+/// [`CLASSIC_PARALLEL_SAVE_MIN_ORDERS`]. `None` = the serial loop.
+fn parallel_book_save() -> Option<usize> {
+    if let Some((on, min_orders)) = PARALLEL_BOOK_SAVE_PIN.with(std::cell::Cell::get) {
+        return on.then_some(min_orders);
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = parse_parallel_book_save(std::env::var("TORUS_PARALLEL_BOOK_SAVE").ok());
+        tracing::info!(
+            enabled = on,
+            min_orders = CLASSIC_PARALLEL_SAVE_MIN_ORDERS,
+            "TORUS_PARALLEL_BOOK_SAVE: Classic book blobs encoded as exec-pool jobs \
+             (puts stay serial, market ascending)"
+        );
+        on
+    });
+    on.then_some(CLASSIC_PARALLEL_SAVE_MIN_ORDERS)
+}
+
+/// Presize for one Classic blob: header + 97 B per resting order (a bench
+/// order; a cloid order is 113 B, so a buffer grows at most once) + 145 B per
+/// pending stop. Saturating, capped at [`CLASSIC_BLOB_CAPACITY_CAP`]. Feeds
+/// `Vec::with_capacity` only: a wrong hint costs a realloc, never a byte.
+fn classic_blob_capacity_hint(orders: usize, stops: usize) -> usize {
+    128usize
+        .saturating_add(orders.saturating_mul(97))
+        .saturating_add(stops.saturating_mul(145))
+        .min(CLASSIC_BLOB_CAPACITY_CAP)
+}
+
+/// Encode one Classic whole-book blob into `buf` (cleared first; its
+/// capacity is the presize). Bytes == `borsh::to_vec(book)`, which is
+/// `Vec::with_capacity` plus this same `serialize` call. Pure: reads only
+/// `book` (no state, metrics or logging), so it may run on any thread — the
+/// exec-pool save jobs here, and a later Classic freeze (item 6 Phase 5).
+pub(crate) fn encode_classic_book_into(
+    book: &OrderBook,
+    mut buf: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    buf.clear();
+    borsh::BorshSerialize::serialize(book, &mut buf)?;
+    Ok(buf)
+}
+
+/// Test-only planted fault for one market's Classic encode job.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlantedEncodeFault {
+    /// The job panics before encoding.
+    Panic,
+    /// The job returns an encode error (unreachable with a `Vec` writer).
+    Err,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Read on the exec (test) thread when the jobs are built.
+    static PLANTED_ENCODE_FAULT: std::cell::Cell<Option<(MarketId, PlantedEncodeFault)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+mod parallel_book_save_toggle_tests {
+    use super::*;
+    use torus_state::cf::{CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS};
+
+    fn addr(n: u8) -> Address {
+        Address::new([n; 20])
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn classic_ctx(db: StateDb, mode: BookMode) -> NativeExecContext<StateDb> {
+        NativeExecContext::new_with_mode(
+            db,
+            1,
+            1001,
+            0,
+            100,
+            10,
+            addr(99),
+            addr(100),
+            addr(101),
+            mode,
+            None,
+        )
+    }
+
+    /// A book of `orders` resting GTC bids (prices below 1000, never
+    /// crossing) from rotating traders, plus one pending stop when `stop`.
+    fn book_with(market: MarketId, orders: usize, stop: bool) -> OrderBook {
+        let mut book = OrderBook::new(market, fp(1), fp(1));
+        for i in 0..orders {
+            let p = PlaceOrderParams {
+                market_id: market,
+                is_buy: true,
+                price: fp(500 + (i % 50) as i64),
+                quantity: fp(1 + (i % 3) as i64),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: (i % 4 == 0).then_some(i as u128 + 1),
+            };
+            let r = book.place_order(p, addr(1 + (i % 7) as u8), 1_000);
+            assert!(!matches!(r.status, OrderStatus::Rejected), "{market} #{i}");
+        }
+        if stop {
+            let p = PlaceOrderParams {
+                market_id: market,
+                is_buy: true,
+                price: fp(2_000),
+                quantity: fp(1),
+                order_type: OrderType::StopLimit {
+                    trigger: fp(1_500),
+                    limit: fp(2_000),
+                },
+                time_in_force: TimeInForce::GTC,
+                reduce_only: false,
+                client_order_id: None,
+            };
+            book.place_order(p, addr(9), 1_000);
+            assert_eq!(book.pending_stop_count(), 1);
+        }
+        book
+    }
+
+    /// `(market, orders)` books inserted and marked dirty.
+    fn ctx_with_books(
+        db: StateDb,
+        mode: BookMode,
+        books: &[(MarketId, usize)],
+    ) -> NativeExecContext<StateDb> {
+        let mut ctx = classic_ctx(db, mode);
+        for &(m, n) in books {
+            ctx.insert_order_book(m, book_with(m, n, m % 2 == 0));
+            ctx.dirty_books.insert(m);
+        }
+        ctx
+    }
+
+    fn blob(ctx: &NativeExecContext<StateDb>, m: MarketId) -> Option<Vec<u8>> {
+        ctx.state
+            .get_cf_raw(CF_NATIVE_ORDER_BOOKS, &m.to_be_bytes())
+            .unwrap()
+    }
+
+    fn journals_empty(ctx: &NativeExecContext<StateDb>, m: MarketId) -> bool {
+        let b = &ctx.order_books()[&m];
+        b.journaled_rows() == 0 && b.journaled_levels() == 0
+    }
+
+    /// RAII planted encode fault for this thread's next saves.
+    struct Plant;
+    impl Plant {
+        fn new(m: MarketId, f: PlantedEncodeFault) -> Self {
+            PLANTED_ENCODE_FAULT.with(|c| c.set(Some((m, f))));
+            Plant
+        }
+    }
+    impl Drop for Plant {
+        fn drop(&mut self) {
+            PLANTED_ENCODE_FAULT.with(|c| c.set(None));
+        }
+    }
+
+    #[test]
+    fn parse_table() {
+        assert!(!parse_parallel_book_save(None), "unset = off");
+        for v in ["1", " 1", "1 ", "1\n", "\t1\t"] {
+            assert!(parse_parallel_book_save(Some(v.to_string())), "{v:?}");
+        }
+        for v in ["", "0", "2", "01", "true", "on", "yes", "1.0", "-1", "11"] {
+            assert!(!parse_parallel_book_save(Some(v.to_string())), "{v:?}");
+        }
+    }
+
+    /// The pin overrides the env on this thread, nests and restores (also
+    /// on unwind).
+    #[test]
+    fn pin_overrides_nests_and_restores() {
+        let unpinned = parallel_book_save();
+        assert_eq!(
+            with_parallel_book_save(true, 7, parallel_book_save),
+            Some(7)
+        );
+        assert_eq!(with_parallel_book_save(false, 7, parallel_book_save), None);
+        with_parallel_book_save(true, 0, || {
+            assert_eq!(parallel_book_save(), Some(0));
+            assert_eq!(with_parallel_book_save(false, 0, parallel_book_save), None);
+            assert_eq!(parallel_book_save(), Some(0), "inner pin restored");
+        });
+        let r = std::panic::catch_unwind(|| {
+            with_parallel_book_save(true, 3, || panic!("unwind through the pin (test)"))
+        });
+        assert!(r.is_err());
+        assert_eq!(parallel_book_save(), unpinned, "pin restored after unwind");
+        if let Some(min) = unpinned {
+            assert_eq!(min, CLASSIC_PARALLEL_SAVE_MIN_ORDERS);
+        }
+    }
+
+    #[test]
+    fn capacity_hint_saturates_and_caps() {
+        assert_eq!(classic_blob_capacity_hint(0, 0), 128);
+        assert_eq!(classic_blob_capacity_hint(10, 2), 128 + 970 + 290);
+        assert_eq!(
+            classic_blob_capacity_hint(usize::MAX, usize::MAX),
+            CLASSIC_BLOB_CAPACITY_CAP
+        );
+        assert_eq!(
+            classic_blob_capacity_hint(10_000_000, 0),
+            CLASSIC_BLOB_CAPACITY_CAP
+        );
+    }
+
+    /// The encode helper's bytes are `borsh::to_vec`'s for any presize,
+    /// and a non-empty input buffer is cleared first.
+    #[test]
+    fn encode_into_equals_to_vec() {
+        for (n, stop) in [(0usize, false), (1, true), (300, false), (2_000, true)] {
+            let book = book_with(3, n, stop);
+            let want = borsh::to_vec(&book).unwrap();
+            for cap in [0usize, 1, 64, want.len(), want.len() * 3] {
+                let got = encode_classic_book_into(&book, Vec::with_capacity(cap)).unwrap();
+                assert_eq!(got, want, "n={n} cap={cap}");
+            }
+            let dirty = encode_classic_book_into(&book, vec![0xAB; 17]).unwrap();
+            assert_eq!(dirty, want, "a used buffer is cleared");
+            let hinted = Vec::with_capacity(classic_blob_capacity_hint(
+                book.order_count(),
+                book.pending_stop_count(),
+            ));
+            assert_eq!(encode_classic_book_into(&book, hinted).unwrap(), want);
+        }
+    }
+
+    /// Gate: one dirty book, or a total below the minimum, keeps the serial
+    /// loop (`last_save_workers == 1`); the minimum itself engages.
+    #[test]
+    fn gate_single_book_or_below_min_is_serial() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+
+        let mut one = ctx_with_books(db.clone(), BookMode::Classic, &[(1, 40)]);
+        let w = with_parallel_book_save(true, 0, || one.save_order_books());
+        assert_eq!(w, 1);
+        assert_eq!(one.last_save_workers(), 1, "one dirty book is serial");
+
+        let books = [(2u64, 30usize), (3, 20), (4, 10)];
+        let total: usize = 60;
+        let mut below = ctx_with_books(db.clone(), BookMode::Classic, &books);
+        with_parallel_book_save(true, total + 1, || below.save_order_books());
+        assert_eq!(below.last_save_workers(), 1, "total below min is serial");
+
+        let mut at = ctx_with_books(db.clone(), BookMode::Classic, &books);
+        let w = with_parallel_book_save(true, total, || at.save_order_books());
+        assert_eq!(w, 3);
+        assert_eq!(
+            at.last_save_workers(),
+            3,
+            "total == min engages, one job per book"
+        );
+
+        let mut off = ctx_with_books(db, BookMode::Classic, &books);
+        with_parallel_book_save(false, 0, || off.save_order_books());
+        assert_eq!(off.last_save_workers(), 1, "flag off is serial");
+    }
+
+    /// Dirty ids without a book count toward neither the book count nor
+    /// the order total (they are skipped, as today).
+    #[test]
+    fn gate_counts_only_present_books() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut ctx = ctx_with_books(db.clone(), BookMode::Classic, &[(5, 25)]);
+        ctx.dirty_books.insert(77);
+        let w = with_parallel_book_save(true, 0, || ctx.save_order_books());
+        assert_eq!((w, ctx.last_save_workers()), (1, 1));
+
+        let mut two = ctx_with_books(db, BookMode::Classic, &[(5, 25), (6, 5)]);
+        two.dirty_books.insert(77);
+        let w = with_parallel_book_save(true, 0, || two.save_order_books());
+        assert_eq!((w, two.last_save_workers()), (2, 2));
+        assert!(blob(&two, 77).is_none());
+    }
+
+    /// Only the Classic arm changes: OrderRows with the flag pinned on keeps
+    /// its per-market loop.
+    #[test]
+    fn order_rows_mode_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut ctx = ctx_with_books(db, BookMode::OrderRows, &[(1, 20), (2, 20)]);
+        with_parallel_book_save(true, 0, || ctx.save_order_books());
+        assert_eq!(ctx.last_save_workers(), 1);
+        assert!(blob(&ctx, 1).is_none(), "no whole-book blob in mode 1");
+    }
+
+    /// The parallel save writes today's bytes and counts, and leaves every
+    /// journal empty, exactly as the serial loop.
+    #[test]
+    fn parallel_save_matches_serial_rows() {
+        let books = [(1u64, 300usize), (2, 0), (3, 1_000), (4, 7), (9, 64)];
+        let dir_s = tempfile::tempdir().unwrap();
+        let mut s = ctx_with_books(
+            StateDb::open(dir_s.path()).unwrap(),
+            BookMode::Classic,
+            &books,
+        );
+        let dir_p = tempfile::tempdir().unwrap();
+        let mut p = ctx_with_books(
+            StateDb::open(dir_p.path()).unwrap(),
+            BookMode::Classic,
+            &books,
+        );
+        assert!(
+            books.iter().any(|&(m, _)| !journals_empty(&s, m)),
+            "the fixture journals something, so the discard check bites"
+        );
+        let ws = with_parallel_book_save(false, 0, || s.save_order_books());
+        let wp = with_parallel_book_save(true, 0, || p.save_order_books());
+        assert_eq!(ws, wp);
+        assert_eq!(p.last_save_workers(), books.len());
+        for &(m, _) in &books {
+            let want = borsh::to_vec(&p.order_books()[&m]).unwrap();
+            assert_eq!(blob(&s, m).as_deref(), Some(want.as_slice()), "serial {m}");
+            assert_eq!(
+                blob(&p, m).as_deref(),
+                Some(want.as_slice()),
+                "parallel {m}"
+            );
+            assert!(journals_empty(&s, m) && journals_empty(&p, m), "{m}");
+        }
+        for key in [
+            NativeExecContext::<StateDb>::NEXT_GLOBAL_ORDER_ID_KEY,
+            NativeExecContext::<StateDb>::BOOK_MODE_MARKER_KEY,
+        ] {
+            assert_eq!(
+                s.state.get_cf_raw(CF_NATIVE_MARKETS, key).unwrap(),
+                p.state.get_cf_raw(CF_NATIVE_MARKETS, key).unwrap()
+            );
+        }
+        assert!(s.fatal_error.is_none() && p.fatal_error.is_none());
+        assert!(p.save_split.drain_ns > 0, "encode wall time recorded");
+    }
+
+    /// A panicking encode job fail-stops through `latch_save_fault` and
+    /// writes no blob for its market; never a silent skip.
+    #[test]
+    fn panicking_encode_job_latches_and_writes_no_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut ctx = ctx_with_books(db, BookMode::Classic, &[(1, 30), (2, 30), (3, 30)]);
+        let _plant = Plant::new(2, PlantedEncodeFault::Panic);
+        let w = with_parallel_book_save(true, 0, || ctx.save_order_books());
+        let fatal = ctx.fatal_error.clone().expect("a job panic must latch");
+        assert!(
+            fatal.starts_with("book save: encode job panicked (market 2)"),
+            "{fatal}"
+        );
+        assert!(blob(&ctx, 2).is_none(), "no blob for the panicked market");
+        assert_eq!(w, 2, "the other books are still written");
+        assert!(blob(&ctx, 1).is_some() && blob(&ctx, 3).is_some());
+        assert_eq!(ctx.last_save_workers(), 3);
+    }
+
+    /// The first latched fault wins: a panic on the lowest market keeps its
+    /// reason even when a later market panics too (ascending put loop).
+    #[test]
+    fn panic_latch_keeps_the_first_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut ctx = ctx_with_books(db, BookMode::Classic, &[(4, 10), (8, 10)]);
+        ctx.fatal_error = Some("earlier fault".into());
+        let _plant = Plant::new(4, PlantedEncodeFault::Panic);
+        with_parallel_book_save(true, 0, || ctx.save_order_books());
+        assert_eq!(ctx.fatal_error.as_deref(), Some("earlier fault"));
+    }
+
+    /// An encode `Err` keeps today's behaviour: logged, skipped, no latch;
+    /// its journals are still discarded.
+    #[test]
+    fn encode_err_is_logged_and_skipped_as_today() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut ctx = ctx_with_books(db, BookMode::Classic, &[(1, 30), (2, 30), (3, 30)]);
+        let _plant = Plant::new(3, PlantedEncodeFault::Err);
+        let w = with_parallel_book_save(true, 0, || ctx.save_order_books());
+        assert_eq!(w, 2);
+        assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        assert!(blob(&ctx, 3).is_none());
+        assert!(journals_empty(&ctx, 3));
+    }
+}
+
 #[cfg(test)]
 mod save_books_workers_toggle_tests {
     use super::{
@@ -4704,7 +5158,9 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// workers. Perf-only; tests may override per ctx.
     pub save_books_min_ops: usize,
     /// Worker threads the LAST `save_order_books` drained on (1 = serial
-    /// path, including modes 0/1 and gated-out blocks). Test/metrics hook.
+    /// path, including modes 0/1 and gated-out blocks; the Classic
+    /// `TORUS_PARALLEL_BOOK_SAVE` path records its encode job count, one per
+    /// dirty book). Test/metrics hook.
     last_save_workers: usize,
     /// L3 save-books attribution (µbench-only, feature `save-timings`): when
     /// set, the mode-2 `save_order_books` arm accumulates per-sub-step
@@ -4753,7 +5209,9 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
 }
 
 /// bl1 exec-chain-sub-100-attribution: per-block nanosecond split of
-/// `save_order_books` (two-pass / level-authority path only).
+/// `save_order_books` (two-pass / level-authority path, and the Classic
+/// `TORUS_PARALLEL_BOOK_SAVE` path: drain = the parallel blob encode,
+/// write = the serial puts; both 0 on the serial Classic loop).
 ///
 /// The two spans are DISJOINT and together cover the whole two-pass save, so
 /// `drain_ns + write_ns` is bounded by `exec_save_books_seconds`. Only pass 2
@@ -6245,6 +6703,11 @@ impl<T: StateBackend> NativeExecContext<T> {
         let dirty = if self.book_mode.is_level_authority() {
             written += self.save_level_authority(&dirty, level_cache_per_book, timed, &mut acc);
             Vec::new()
+        } else if matches!(self.book_mode, BookMode::Classic) && self.classic_parallel_save_gate() {
+            // TORUS_PARALLEL_BOOK_SAVE: blobs encoded as exec-pool jobs, puts
+            // serial and market-ascending (`save_classic_parallel`).
+            written += self.save_classic_parallel();
+            Vec::new()
         } else {
             self.last_save_workers = 1;
             dirty
@@ -6355,6 +6818,133 @@ impl<T: StateBackend> NativeExecContext<T> {
         #[cfg(not(feature = "save-timings"))]
         let _ = acc;
 
+        written
+    }
+
+    /// Gate of the Classic parallel save (`TORUS_PARALLEL_BOOK_SAVE`): the
+    /// flag is on, at least two dirty books are present in `order_books`,
+    /// and their resting orders total at least the flag's minimum. Flag off:
+    /// `false` before any book is looked at (and the exec pool is never
+    /// touched).
+    fn classic_parallel_save_gate(&self) -> bool {
+        let Some(min_orders) = parallel_book_save() else {
+            return false;
+        };
+        let (mut books, mut orders) = (0usize, 0usize);
+        for id in &self.dirty_books {
+            if let Some(book) = self.order_books.get(id) {
+                books += 1;
+                orders = orders.saturating_add(book.order_count());
+            }
+        }
+        books >= 2 && orders >= min_orders
+    }
+
+    /// Classic save with `TORUS_PARALLEL_BOOK_SAVE`: every dirty book's blob
+    /// is encoded ([`encode_classic_book_into`], into a buffer presized here
+    /// on the exec thread) and its journals discarded as ONE exec-pool job,
+    /// heaviest book first (rayon stealing balances the tail). Fork-join:
+    /// every job has ended before the puts, which run here SERIALLY in
+    /// market-ascending order with the serial loop's behaviour — a put
+    /// error latches today's reason, an encode error is logged and skipped
+    /// (today's), and a job panic fail-stops through `latch_save_fault`
+    /// (never a skip: a stale blob would fork the node after a restart).
+    /// Jobs are pure (one book each; no state, metrics or logging). Returns
+    /// the blobs written; records the job count in `last_save_workers` and
+    /// the encode / put wall times in `save_split` (drain / write).
+    fn save_classic_parallel(&mut self) -> usize {
+        use torus_state::cf::CF_NATIVE_ORDER_BOOKS;
+
+        let dirty_set = &self.dirty_books;
+        let mut books: Vec<(MarketId, &mut OrderBook)> = self
+            .order_books
+            .iter_mut()
+            .filter(|(id, _)| dirty_set.contains(id))
+            .map(|(id, b)| (*id, b))
+            .collect();
+        // Heaviest first (ties by market id): the job ORDER only schedules.
+        books.sort_unstable_by_key(|(id, b)| (std::cmp::Reverse(b.order_count()), *id));
+        let ids: Vec<MarketId> = books.iter().map(|(id, _)| *id).collect();
+        #[cfg(test)]
+        let planted = PLANTED_ENCODE_FAULT.with(std::cell::Cell::get);
+        let jobs: Vec<_> = books
+            .into_iter()
+            .map(|(_id, book)| {
+                // Presized on the exec thread (its allocator arena); the hint
+                // only sizes the buffer, the bytes are borsh's.
+                let buf = Vec::with_capacity(classic_blob_capacity_hint(
+                    book.order_count(),
+                    book.pending_stop_count(),
+                ));
+                #[cfg(test)]
+                let plant = planted.and_then(|(m, f)| (m == _id).then_some(f));
+                move || {
+                    #[cfg(test)]
+                    match plant {
+                        Some(PlantedEncodeFault::Panic) => {
+                            panic!("planted Classic encode panic (test)")
+                        }
+                        Some(PlantedEncodeFault::Err) => {
+                            book.discard_row_ops();
+                            book.discard_level_ops();
+                            return Err(std::io::Error::other(
+                                "planted Classic encode error (test)",
+                            ));
+                        }
+                        None => {}
+                    }
+                    let r = encode_classic_book_into(book, buf);
+                    // Classic never drains the journals — cap their memory.
+                    book.discard_row_ops();
+                    book.discard_level_ops();
+                    r
+                }
+            })
+            .collect();
+        let n_jobs = jobs.len();
+        let encode_timer = std::time::Instant::now();
+        let results = crate::exec_pool::run_jobs(jobs);
+        self.save_split.drain_ns += encode_timer.elapsed().as_nanos();
+
+        let mut results: Vec<(MarketId, std::thread::Result<std::io::Result<Vec<u8>>>)> =
+            ids.into_iter().zip(results).collect();
+        results.sort_unstable_by_key(|(id, _)| *id);
+        let write_timer = std::time::Instant::now();
+        let mut written = 0usize;
+        for (market_id, result) in results {
+            match result {
+                Ok(Ok(data)) => {
+                    let key = market_id.to_be_bytes();
+                    if let Err(e) = self
+                        .state
+                        .put_cf_raw_owned(CF_NATIVE_ORDER_BOOKS, &key, data)
+                    {
+                        latch_save_fault(
+                            &mut self.fatal_error,
+                            format!("book save: order book put (market {market_id}): {e}"),
+                        );
+                    } else {
+                        written += 1;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(market_id, %e, "failed to serialize order book");
+                }
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    latch_save_fault(
+                        &mut self.fatal_error,
+                        format!("book save: encode job panicked (market {market_id}): {msg}"),
+                    );
+                }
+            }
+        }
+        self.save_split.write_ns += write_timer.elapsed().as_nanos();
+        self.last_save_workers = n_jobs;
         written
     }
 
