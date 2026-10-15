@@ -1,6 +1,6 @@
 # Implementation Plan: item 6 Phase 5 (full in-memory execution)
 
-Status: DRAFT, numbers pending Gate 3 (2026-10-14, s119). Nothing built. Section 7 open for the owner.
+Status: DRAFT, numbers pending Gate 3 (2026-10-14, s119). Nothing built. Section 7 decided (owner s122: 1 a, 2 a, 3 a, 4 a, 5 b, 6 a, 7 a, 8 a, 9 build for the gain).
 Parent design: `market-scaling-in-memory-design.md` Phase 5, section 4 (memory budget), section 5 rules 1, 2, 4, 5, 6,
 8, 9, D7 c, D10, D11 a, D12 b, D16. Short form: `item6-phases-2-5-plans.md` Phase 5. Format and base:
 `item6-phase4-impl.md` (and `item6-phase3-impl.md`).
@@ -338,7 +338,7 @@ roll back one at a time; no data migration.
    (c) `Users` only, books keep the diff.
    Recommendation: a. (b) adds cold structures that no profile shows on the exec thread; (c) leaves `save_books`
    (13.2 ms per native block in section 59.3) in place.
-   **Decided:**
+   **Decided: a** (owner s122).
 2. **Nonces (D12 b said "before Phase 5"; not built).**
    (a) Nonce rows unchanged (raw, check reads the overlay); no consensus change.
    (b) D12 b at a fresh genesis before Phase 5 (bundle with L3), then a typed live-nonce set.
@@ -354,36 +354,36 @@ roll back one at a time; no data migration.
    (b) Move every writer (lockbox, liquidation, ADL, `margin.rs`'s balance writes) to `UsersMut`.
    Recommendation: a. One hook covers every writer, so rule 5 holds by construction; per-writer moves follow only
    where step 0 shows cost.
-   **Decided:**
+   **Decided: a** (owner s122).
 4. **EVM blocks.**
    (a) Raw journalled writes during EVM txs, folded into `Users` after the EVM part and at freeze (task 2.3).
    (b) Write-through during EVM txs with a typed undo log mirroring revm frame checkpoints.
    Recommendation: a. EVM blocks are serial and rare (EVM 0.0 ms in the s84 cells); the overlay journal already
    handles reverts.
-   **Decided:**
+   **Decided: a** (owner s122).
 5. **Open-order counter (if Phase 4 step 5 is not kept).**
    (a) Drop it; keep counting from the books.
    (b) Optional step 4, sharing step 3's dirty sites, kept only on its own net A/B.
    Recommendation: b if Phase 4 step 5 failed only on upkeep cost (step 3 removes part of it); a if step 0 shows
    `open_order_counts` well under 1.45%.
-   **Decided:**
+   **Decided: b** (owner s122).
 6. **Crab overhead gate ("<= +15% per fill vs the same phase without crab").**
    (a) Proxy: engine ms per 1k fills oracle on vs oracle off, same binary and campaign (Gate 3 already runs both).
    (b) Build a crab-free binary of the Phase 5 head (no longer a clean cut: crab is merged into main).
    (c) Drop the gate; final Gate 3 (1.4x) with the as-shipped arm covers it.
    Recommendation: a.
-   **Decided:**
+   **Decided: a** (owner s122).
 7. **Own snapshot format (D7 c: "own canonical format with Phase 5").**
    (a) Not in Phase 5; the RocksDB checkpoint stays.
    (b) In Phase 5 as an extra step (sorted canonical file, +1x state RAM while it serializes, section 4).
    Recommendation: a. No gate needs it; it pairs with D8 b and D9 b before public bootstrap.
-   **Decided:**
+   **Decided: a** (owner s122).
 8. **RAM follow-up (Phase 4 decision 5 b).**
    (a) Not in Phase 5.
    (b) A persistent `Users` map pinned by the view, so the view drops its positions / balances slices.
    Recommendation: a. Only ingress reads the view (RPC reads the DB); judge after the Phase 3 RAM decision and step 7's
    soak.
-   **Decided:**
+   **Decided: a** (owner s122).
 9. **Scope by the Gate 3 gap (after Gate 3).** Pick the row of section 1's scope table.
    Gate 3 (section 65): `d3cba5e2` / `199bdc97` = 1.931x [1.877, 1.985] oracle off, 1.835x as shipped, so the
    >= 1.36 row applies: Phase 5 is not needed for the gate.
