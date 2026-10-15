@@ -4,7 +4,9 @@
     python3 -I tools/matched-bench/campaign/make-driver.py SPEC.json -o DRIVER.sh
 
 The driver = a generated config block (arms, env, cells, md5s from the spec) + driver-body.sh (the standard
-parts, built and tested once: tools/matched-bench/test_make_driver.py). Then:
+parts, built and tested once: tools/matched-bench/test_make_driver.py), which carries the Job 4 driver's runtime
+watchers (mid-cell node death -> node-death.txt + CELL FAIL, memguard, hardscan) on every cell, and its samplers
+and host checks unless the spec turns them off ("samplers": false, "host_checks": false). Then:
 
     DRIVER.sh dry            preflight only (paths, staged md5s), prints the cell list
     DRIVER.sh show           the plan as tables (paste into the report)
@@ -54,6 +56,8 @@ TOP_OPTIONAL = {
     "expect",
     "analysis",
     "max_load",
+    "samplers",
+    "host_checks",
 }
 ARM_KEYS = {"label", "binary", "env", "harness_env", "expect", "note"}
 BIN_KEYS = {
@@ -69,6 +73,8 @@ EXPECT_KEYS = {"file", "regex", "min", "max"}
 WARMUP_KEYS = {"arm", "duration_s", "tag"}
 SMOKE_KEYS = {"arm", "duration_s"}
 ANALYSIS_KEYS = {"cmd", "metric"}
+HOST_KEYS = {"min_mem_avail_gb", "sysctl"}
+MIN_MEM_AVAIL_GB = 40  # the Job 4 driver's preflight floor
 # set by the driver itself (paths, md5 guards)
 RESERVED_HARNESS = {
     "TARGET_DIR",
@@ -83,7 +89,7 @@ RESERVED_HARNESS = {
 CONFIG_VARS = (
     "CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP ABIN AENV AXE"
     " AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL ANALYSIS_CMD"
-    " ANALYSIS_METRIC"
+    " ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT"
 ).split()
 # restart / crash cells: not a supported shape (hand-write the driver)
 UNSUPPORTED_HARNESS = {"CRASH_KILL_AT_S", "KILL_SIG", "KILL_WAIT", "KILL_NODE"}
@@ -94,6 +100,7 @@ CAMP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 TAG_RE = re.compile(r"^[a-z][a-z0-9]*$")
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 BAD_VALUE_RE = re.compile(r"[\s'\"\\$`]")
+SYSCTL_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[A-Za-z0-9_-]+)+$")
 
 
 class SpecError(Exception):
@@ -156,6 +163,13 @@ def env_obj(d, where, harness=False):
                 "%s: %s = crash/restart cells, not supported by the generator (hand-write the driver)"
                 % (where, k),
             )
+            # run-cell.sh refuses a non-empty cell dir unless OVERWRITE=1; the driver writes its records there
+            # first and refuses an existing cell dir itself, so it runs every cell with OVERWRITE=1 (as Job 4)
+            need(
+                k != "OVERWRITE" or v == "1",
+                "%s: OVERWRITE=%r: the driver runs every cell with OVERWRITE=1 (its records precede run-cell.sh"
+                ' in the cell dir); drop the key or set it to "1"' % (where, v),
+            )
     return dict(d)
 
 
@@ -215,6 +229,46 @@ def read_md5_row(path, row, where):
     return hits[-1]
 
 
+def host_checks(hc):
+    """spec host_checks: true (default) / false / {min_mem_avail_gb, sysctl}. Returns None (off) or
+    {"min_mem_avail_kb": int, "sysctl": {name: value}}"""
+    need(
+        isinstance(hc, (bool, dict)),
+        "host_checks must be true, false or an object {min_mem_avail_gb, sysctl} (got %r)"
+        % (hc,),
+    )
+    if hc is False:
+        return None
+    if hc is True:
+        hc = {}
+    keys_ok(hc, HOST_KEYS, "host_checks")
+    mm = hc.get("min_mem_avail_gb", MIN_MEM_AVAIL_GB)
+    need(
+        isinstance(mm, (int, float)) and not isinstance(mm, bool) and mm >= 0,
+        "host_checks.min_mem_avail_gb must be a number >= 0 (got %r)" % (mm,),
+    )
+    sc = hc.get("sysctl", {})
+    need(
+        isinstance(sc, dict),
+        'host_checks.sysctl must be an object NAME: "value" (e.g. "vm.dirty_bytes": "268435456")',
+    )
+    out = {}
+    for k, v in sc.items():
+        need(
+            SYSCTL_RE.match(k),
+            "host_checks.sysctl: bad sysctl name %r (e.g. vm.dirty_bytes)" % (k,),
+        )
+        if isinstance(v, int) and not isinstance(v, bool):
+            v = str(v)
+        need(
+            isinstance(v, str) and v and not BAD_VALUE_RE.search(v),
+            "host_checks.sysctl: %s value must be a non-empty string or integer without whitespace, quotes,"
+            " backslash or $ (got %r)" % (k, v),
+        )
+        out[k] = v
+    return {"min_mem_avail_kb": int(round(mm * 1000000)), "sysctl": out}
+
+
 def cell_list(arms, replicates, order, duration_s, warmup):
     """[(tag, arm, dur, kind)]: warm-up first (if any), then the replicates.
     rotate: replicate r (1-based) starts at arm (r-1) mod n, so every arm sits in several positions (Job 4).
@@ -269,6 +323,11 @@ def validate(spec):
         "max_load must be a number > 0",
     )
     p["max_load"] = ml
+    # the Job 4 driver's samplers and host checks (default on); its watchers run on every cell regardless
+    sp = spec.get("samplers", True)
+    need(isinstance(sp, bool), "samplers must be true or false (got %r)" % (sp,))
+    p["samplers"] = sp
+    p["host_checks"] = host_checks(spec.get("host_checks", True))
 
     # binaries
     bins = spec["binaries"]
@@ -555,6 +614,21 @@ def render(p, spec, spec_path):
     L.append("SMOKE_CELL=%s" % q("%s:%s:%d:none:" % p["smoke"]))
     L.append("ANALYSIS_CMD=%s" % q(p["analysis_cmd"]))
     L.append("ANALYSIS_METRIC=%s" % q(p["analysis_metric"]))
+    hc = p["host_checks"]
+    L.append(
+        "SAMPLERS=%d   # per-cell du/memory/metrics/fd/vmstat samplers, RocksDB LOG copies, the fd stop"
+        % (1 if p["samplers"] else 0)
+    )
+    L.append(
+        "HOST_CHECKS=%d   # MemAvailable preflight, sysctls at each cell's start and end, analysis-process quiet"
+        % (0 if hc is None else 1)
+    )
+    L.append("MIN_MEM_AVAIL_KB=%d" % (0 if hc is None else hc["min_mem_avail_kb"]))
+    L.append(
+        "declare -A SYSCTL_WANT   # required sysctl values; the dirty limits not given here are pinned at the run's preflight"
+    )
+    for k, v in sorted((hc or {}).get("sysctl", {}).items()):
+        L.append("SYSCTL_WANT[%s]=%s" % (k, q(v)))
     L.append("# <<< GENERATED CONFIG")
     return "\n".join(L) + "\n" + open(BODY).read()
 

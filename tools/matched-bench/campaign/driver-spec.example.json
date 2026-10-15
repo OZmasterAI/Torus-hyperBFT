@@ -32,6 +32,8 @@
   ],
   "analysis": {"cmd": "python3 -I /home/oz/bench-results-matched/ozarchy-example-tools/analyst/a-cells.py {out} {prefix} {tag}:{arm}",
                "metric": "ms"},
+  "samplers": true,
+  "host_checks": {"min_mem_avail_gb": 40, "sysctl": {}},
   "arms": [
     {"label": "A", "binary": "b", "note": "defaults"},
     {"label": "E5", "binary": "b", "env": {"TORUS_ADMISSION_EXEC_AWARE": "1", "TORUS_ADMISSION_HORIZON_MS": "5000"}},

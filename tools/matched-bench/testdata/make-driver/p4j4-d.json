@@ -24,6 +24,12 @@
     "arm": "J",
     "tag": "w1"
   },
+  "host_checks": {
+    "sysctl": {
+      "vm.dirty_bytes": "268435456",
+      "vm.dirty_background_bytes": "67108864"
+    }
+  },
   "node_env": {
     "TORUS_ROCKSDB_PIPELINED_WRITE": "",
     "TORUS_RESIDENT_BOOKS": "",
