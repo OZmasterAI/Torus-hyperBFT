@@ -142,8 +142,9 @@ impl MarketWorkerPool {
             .collect();
         let n = batches_vec.len();
 
-        // Never more workers than markets; at least one.
-        let workers = max_workers.max(1).min(n);
+        // Never more workers than markets; at least one. s58: with
+        // `TORUS_EXEC_POOL_GRAIN=K`, K x cap chunks (cap >= 2 only).
+        let workers = grain_chunk_cap(max_workers.max(1)).min(n);
         let counts: Vec<(MarketId, usize)> = batches_vec
             .iter()
             .map(|(id, _, reqs)| (*id, reqs.len()))
@@ -471,6 +472,220 @@ impl MarketWorkerPool {
             results,
             next_order_id,
         }
+    }
+}
+
+// ---- s58 exp `exec-pool-fine-grain-jobs`: `TORUS_EXEC_POOL_GRAIN=K` ----
+//
+// Matching and settle pass A each make `min(cap, markets)` LPT chunks, one
+// exec-pool job per chunk (32 at 300 markets on archy). With three nodes on
+// one 32-thread host, pool threads start their chunk 1-9 ms apart and most
+// of them are descheduled mid-chunk, so ~20% of the match work runs after
+// the median thread has finished. K splits those two sites into `K x cap`
+// smaller LPT chunks: a rayon scope job can be stolen until it starts, so
+// threads that finish early take chunks a late starter has not begun.
+// Scheduling only: match results are sorted by market id and pass-A plans
+// are scattered back by input index, so state is identical for every K.
+// Plan: `docs/plans/exp-archy-s58-exec-pool-fine-grain-jobs.md`.
+
+/// Largest accepted grain (more chunks than this buys nothing and costs
+/// LPT packing time: `markets x K x cap` comparisons per call).
+const EXEC_POOL_GRAIN_MAX: usize = 16;
+
+/// Clamp a grain to `1..=EXEC_POOL_GRAIN_MAX`, where anything below 2 is off.
+fn clamp_exec_pool_grain(k: usize) -> usize {
+    if k < 2 {
+        1
+    } else {
+        k.min(EXEC_POOL_GRAIN_MAX)
+    }
+}
+
+/// Parse `TORUS_EXEC_POOL_GRAIN`: a trimmed integer; unset, garbage, 0 or 1
+/// give 1 (today's chunking); above 16 (or past `usize`) gives 16.
+fn parse_exec_pool_grain(v: Option<String>) -> usize {
+    match v.as_deref().map(str::trim).map(str::parse::<usize>) {
+        Some(Ok(k)) => clamp_exec_pool_grain(k),
+        Some(Err(e)) if *e.kind() == std::num::IntErrorKind::PosOverflow => EXEC_POOL_GRAIN_MAX,
+        _ => 1,
+    }
+}
+
+thread_local! {
+    /// Per-thread grain override for tests (env vars race across test
+    /// threads; this does not). `None` = the process env value.
+    static EXEC_POOL_GRAIN_PIN: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with this thread's exec-pool grain pinned to `k` (clamped like the
+/// env value; 1 pins it off). The previous pin is restored on return and on
+/// unwind. Test and bench seam: production reads `TORUS_EXEC_POOL_GRAIN`.
+#[doc(hidden)]
+pub fn with_exec_pool_grain<R>(k: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXEC_POOL_GRAIN_PIN.with(|p| p.set(self.0));
+        }
+    }
+    let _restore = Restore(EXEC_POOL_GRAIN_PIN.with(|p| p.replace(Some(clamp_exec_pool_grain(k)))));
+    f()
+}
+
+/// The grain K: this thread's pin if set, else `TORUS_EXEC_POOL_GRAIN` read
+/// once per process (logged once).
+fn exec_pool_grain() -> usize {
+    if let Some(k) = EXEC_POOL_GRAIN_PIN.with(|p| p.get()) {
+        return k;
+    }
+    static GRAIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GRAIN.get_or_init(|| {
+        let k = parse_exec_pool_grain(std::env::var("TORUS_EXEC_POOL_GRAIN").ok());
+        tracing::info!(
+            grain = k,
+            "TORUS_EXEC_POOL_GRAIN: match and settle pass A use K x worker-cap chunks (1 = off)"
+        );
+        k
+    })
+}
+
+/// The chunk cap for the exec-pool sites (matching, settle pass A): `cap`
+/// itself when the grain is off or `cap < 2` (a cap-1 site stays one serial
+/// chunk), else `K x cap` (saturating). The callers still clamp to the
+/// market count.
+pub(crate) fn grain_chunk_cap(cap: usize) -> usize {
+    let k = exec_pool_grain();
+    if k <= 1 || cap < 2 {
+        cap
+    } else {
+        cap.saturating_mul(k)
+    }
+}
+
+#[cfg(test)]
+mod exec_pool_grain_tests {
+    use super::*;
+
+    fn pin() -> Option<usize> {
+        EXEC_POOL_GRAIN_PIN.with(|p| p.get())
+    }
+
+    /// Unset, garbage, 0 and 1 all mean today's chunking (K = 1).
+    #[test]
+    fn parse_unset_garbage_zero_and_one_are_off() {
+        for v in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("abc"),
+            Some("4x"),
+            Some("1.5"),
+            Some("-4"),
+            Some("0"),
+            Some("1"),
+            Some(" 1 "),
+        ] {
+            assert_eq!(parse_exec_pool_grain(v.map(String::from)), 1, "{v:?}");
+        }
+    }
+
+    /// In-range values pass through (trimmed); above 16 clamps to 16,
+    /// including integers too large for `usize`.
+    #[test]
+    fn parse_in_range_and_clamped() {
+        for (v, want) in [
+            ("2", 2usize),
+            ("4", 4),
+            (" 4\n", 4),
+            ("16", 16),
+            ("17", 16),
+            ("99", 16),
+            ("340282366920938463463374607431768211456", 16),
+        ] {
+            assert_eq!(parse_exec_pool_grain(Some(v.to_string())), want, "{v:?}");
+        }
+    }
+
+    /// Cap 1 (and the clamped cap 0) stays as is for every K: the serial
+    /// contract of a cap-1 site never changes.
+    #[test]
+    fn grain_never_splits_cap_one() {
+        for k in [1usize, 2, 4, 16, 99] {
+            with_exec_pool_grain(k, || {
+                assert_eq!(grain_chunk_cap(1), 1, "K={k}");
+                assert_eq!(grain_chunk_cap(0), 0, "K={k}");
+            });
+        }
+    }
+
+    /// K multiplies caps >= 2; K = 1 leaves them; the product saturates.
+    #[test]
+    fn grain_multiplies_and_saturates() {
+        with_exec_pool_grain(4, || {
+            assert_eq!(grain_chunk_cap(32), 128);
+            assert_eq!(grain_chunk_cap(2), 8);
+            assert_eq!(grain_chunk_cap(usize::MAX / 2), usize::MAX);
+        });
+        with_exec_pool_grain(16, || assert_eq!(grain_chunk_cap(usize::MAX), usize::MAX));
+        with_exec_pool_grain(1, || assert_eq!(grain_chunk_cap(32), 32));
+        with_exec_pool_grain(0, || assert_eq!(grain_chunk_cap(32), 32));
+    }
+
+    /// The pin clamps like the env value does.
+    #[test]
+    fn pin_clamps_to_one_through_sixteen() {
+        for (k, want) in [
+            (0usize, 1usize),
+            (1, 1),
+            (2, 2),
+            (16, 16),
+            (17, 16),
+            (usize::MAX, 16),
+        ] {
+            assert_eq!(with_exec_pool_grain(k, exec_pool_grain), want, "K={k}");
+        }
+    }
+
+    /// The pin nests, is restored on return and on unwind, and is per thread.
+    #[test]
+    fn pin_nests_restores_and_is_thread_local() {
+        assert_eq!(pin(), None);
+        with_exec_pool_grain(4, || {
+            assert_eq!(exec_pool_grain(), 4);
+            with_exec_pool_grain(2, || assert_eq!(exec_pool_grain(), 2));
+            assert_eq!(exec_pool_grain(), 4);
+            let other = std::thread::spawn(|| EXEC_POOL_GRAIN_PIN.with(|p| p.get()))
+                .join()
+                .unwrap();
+            assert_eq!(other, None, "the pin must not leak to other threads");
+        });
+        assert_eq!(pin(), None);
+        let r = std::panic::catch_unwind(|| with_exec_pool_grain(8, || panic!("planted (test)")));
+        assert!(r.is_err());
+        assert_eq!(pin(), None, "the pin must be restored on unwind");
+    }
+
+    /// The two call sites' composition: `chunk_indices(.., grain_chunk_cap(cap))`
+    /// gives min(K x cap, markets) chunks at cap >= 2, and exactly today's
+    /// count at K = 1 or cap 1.
+    #[test]
+    fn chunk_count_follows_grain() {
+        let markets: Vec<(MarketId, usize)> = (1..=10u64)
+            .map(|i| (i as MarketId, 1 + (i as usize * 7) % 5))
+            .collect();
+        let count = |k: usize, cap: usize| {
+            with_exec_pool_grain(k, || {
+                MarketWorkerPool::chunk_indices(&markets, grain_chunk_cap(cap)).len()
+            })
+        };
+        assert_eq!(count(1, 2), 2);
+        assert_eq!(count(4, 2), 8);
+        assert_eq!(count(16, 2), 10);
+        assert_eq!(count(4, 3), 10);
+        assert_eq!(count(4, 1), 1);
+        assert_eq!(count(16, 1), 1);
+        assert_eq!(count(1, 32), 10);
     }
 }
 
