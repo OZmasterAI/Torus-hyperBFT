@@ -791,17 +791,17 @@ evm_load_start() {
     "${EVM_LOAD_CMD[@]}" > "$OUT/evm-load.log" 2>&1 & EVM_PID=$!
 }
 # evm_load_stop: idempotent, safe on every exit path. TERM (tx-flood stops
-# sending and writes its stats), 10 s grace, then KILL; EVM_H1 = val0's
+# sending and writes its stats), 20 s grace (tx-flood drains for up to 15 s: 12 s send timeout + 3 s), then KILL; EVM_H1 = val0's
 # committed height when it stopped.
 evm_load_stop() {
     [ -n "$EVM_PID" ] || return 0
     local pid=$EVM_PID _t h
     EVM_PID=""
     kill -TERM "$pid" 2>/dev/null
-    for _t in $(seq 1 50); do alive "$pid" || break; sleep 0.2; done
+    for _t in $(seq 1 100); do alive "$pid" || break; sleep 0.2; done
     if alive "$pid"; then
         kill -KILL "$pid" 2>/dev/null
-        log "WARNING: tx-flood pid $pid ignored SIGTERM for 10 s — SIGKILLed (stats may be missing)"
+        log "WARNING: tx-flood pid $pid ignored SIGTERM for 20 s — SIGKILLed (stats may be missing)"
     fi
     wait "$pid" 2>/dev/null; EVM_RC=$?
     h=$(scrape_one "${METS[0]}" | mval torus_block_height); EVM_H1=${h%.*}
