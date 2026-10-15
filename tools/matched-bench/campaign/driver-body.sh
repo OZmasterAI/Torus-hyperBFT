@@ -17,6 +17,19 @@ DETACH=${DRIVER_DETACH:-$TOOLS/campaign/detach.sh}
 UNIT_NAME=$CAMPAIGN
 MIN_FREE_MB=${MIN_FREE_MB:-20000}
 QUIET_WAIT_S=${QUIET_WAIT_S:-3600}
+SMOKE=          # 1 = the smoke run (apply_smoke); the driver's own, never the caller's
+GENESIS_ROOT=   # run-cell.sh's MAINREPO = $TOOLS/../.. (preflight_genesis)
+# Every name the driver keeps state in (generated config + this body). scrub_env un-exports these and never
+# unsets them: a caller that exported RUN, ARMS, ... must not delete (or, exported, leak) driver config.
+# test_make_driver.py checks that each name the config or the body assigns at top level is listed.
+DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP
+ ABIN AENV AXE AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL
+ ANALYSIS_CMD ANALYSIS_METRIC SELF PROC HARNESS DETACH UNIT_NAME MIN_FREE_MB QUIET_WAIT_S SMOKE GENESIS_ROOT
+ GENESIS_INPUTS MODE SM TAGS STARTED_LABEL CELL_FAIL DRIVER_VARS"
+# run-cell.sh generates each cell's genesis from ITS OWN repo root ($TOOLS/../..), not from the harness worktree
+# it is handed (which only launches the nodes): a frozen tools copy must carry these, equal to the harness's
+GENESIS_INPUTS="devnet/wsl/gen-3val-genesis.sh devnet/wsl/bench-validator-keys.json devnet/genesis.json
+ testnet/lib/cargo-bin.sh testnet/gen-weighted-genesis.sh"
 
 log() { echo "[$(date +%T)] $*"; }
 
@@ -219,10 +232,29 @@ wrapper_target() { # FILE: the absolute path a wrapper script execs (its last `e
     echo "$t"
 }
 
-preflight_static() { # paths, tools, staged md5s (a wrapper's md5 = the md5 of the node it execs)
+preflight_genesis() { # the genesis inputs under run-cell.sh's repo root GENESIS_ROOT = $TOOLS/../.. (its MAINREPO):
+    # present, and equal to the harness worktree's (genesis from one tree, nodes launched from another = a mixed
+    # cell). Job 4 froze them beside its tools copy (ozarchy-p4j4-tools/{devnet,testnet}) and diffed devnet/wsl.
+    # testnet/genesis-weighted-full.json is untracked: required (else the first cell builds it), not compared.
+    local f d
+    GENESIS_ROOT=$(cd "$TOOLS/../.." 2>/dev/null && pwd) || PF "cannot resolve $TOOLS/../.. (run-cell.sh's repo root)"
+    for f in $GENESIS_INPUTS testnet/genesis-weighted-full.json; do
+        [ -s "$GENESIS_ROOT/$f" ] || PF "genesis input $GENESIS_ROOT/$f missing or empty: run-cell.sh reads its genesis inputs from its own repo root (tools_dir/../..), not from harness_worktree; freeze them beside the tools copy (README: Campaign driver generator)"
+    done
+    [ -x "$GENESIS_ROOT/devnet/wsl/gen-3val-genesis.sh" ] || PF "$GENESIS_ROOT/devnet/wsl/gen-3val-genesis.sh not executable"
+    d=$(diff -rq -x genesis-3val.json "$WT_H/devnet/wsl" "$GENESIS_ROOT/devnet/wsl" 2>&1
+        for f in $GENESIS_INPUTS; do
+            case $f in devnet/wsl/*) ;; *) cmp -s "$WT_H/$f" "$GENESIS_ROOT/$f" || echo "$f differs";; esac
+        done)
+    [ -z "$d" ] || PF "genesis inputs under $GENESIS_ROOT differ from the harness worktree $WT_H (run-cell.sh generates genesis from the first, launches nodes from the second): $(echo $d | head -c 600)"
+    return 0
+}
+
+preflight_static() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
     local f b node m tgt
     for f in "$HARNESS" "$DETACH" "$TOOLS/cell-step.sh" "$TOOLS/cell_step.py"; do [ -f "$f" ] || PF "$f missing"; done
     [ -d "$WT_H" ] || PF "harness worktree $WT_H missing"
+    preflight_genesis
     for b in "${!BDIR[@]}"; do
         node=${BDIR[$b]}/release/torus-node
         [ -x "$node" ] || PF "binary $b: $node missing or not executable"
@@ -259,11 +291,14 @@ preflight_host() { # run mode only: inside a bench unit, nothing else running, n
     [ "$(df --output=avail -BM "$R" | tail -1 | tr -dc 0-9)" -ge "$MIN_FREE_MB" ] || PF "< $MIN_FREE_MB MB free under $R"
 }
 
-scrub_env() { # the units get this process's exported env (detach.sh): drop everything but the basics, so no
-    # TORUS_*, MALLOC_CONF, LD_PRELOAD or run-cell.sh knob from the launching shell reaches a cell
-    local v
-    for v in $(compgen -e); do
-        case $v in PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_*|TZ|TMPDIR|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS) ;; *) unset "$v" ;; esac
+scrub_env() { # the units get this process's EXPORTED env (detach.sh): only the basics stay exported, so no
+    # TORUS_*, MALLOC_CONF, LD_PRELOAD or run-cell.sh knob from the launching shell reaches a cell. A driver name
+    # (DRIVER_VARS) the caller happened to export keeps the driver's value and is only un-exported: unsetting it
+    # would delete driver config (RUN exported by the caller -> RUN unbound under set -u)
+    local _sv
+    for _sv in $(compgen -e); do
+        case $_sv in PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_*|TZ|TMPDIR|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS) continue ;; esac
+        if [[ " ${DRIVER_VARS//$'\n'/ } " == *" $_sv "* ]]; then export -n "$_sv"; else unset "$_sv"; fi
     done
     export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 }
@@ -283,7 +318,7 @@ TAGS=$(for c in "${CELLS[@]}"; do printf '%s ' "${c%%:*}"; done)
 case $MODE in
 dry)
     preflight_static
-    echo "PREFLIGHT OK (dry: host state not checked) CAMPAIGN=$UNIT_NAME RUN=$RUN P=$P arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE cells=${#CELLS[@]}: $TAGS"
+    echo "PREFLIGHT OK (dry: host state not checked) CAMPAIGN=$UNIT_NAME RUN=$RUN P=$P genesis_root=$GENESIS_ROOT arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE cells=${#CELLS[@]}: $TAGS"
     exit 0 ;;
 launch)
     preflight_static
@@ -306,7 +341,7 @@ export CELL_STEP_TIMEOUT=${CELL_STEP_TIMEOUT:-900} CELL_STEP_ANALYSIS_TIMEOUT=${
 [ -z "$ANALYSIS_METRIC" ] || export CELL_STEP_ANALYSIS_METRIC=$ANALYSIS_METRIC
 # shellcheck source=../cell-step.sh
 source "$TOOLS/cell-step.sh" || PF "cannot source $TOOLS/cell-step.sh"
-log "PREFLIGHT OK CAMPAIGN=$UNIT_NAME driver=$SELF RUN=$RUN P=$P arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE cells=${#CELLS[@]}: $TAGS"
+log "PREFLIGHT OK CAMPAIGN=$UNIT_NAME driver=$SELF RUN=$RUN P=$P genesis_root=$GENESIS_ROOT arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE cells=${#CELLS[@]}: $TAGS"
 for c in "${CELLS[@]}"; do
     run_spec "$c" || { log "CAMPAIGN STOP at ${c%%:*} (queued reruns not run: $RUN/rerun-queue.tsv)"; exit 1; }
 done

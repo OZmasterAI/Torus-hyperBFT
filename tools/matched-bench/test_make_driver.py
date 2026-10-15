@@ -15,6 +15,11 @@ fake /proc (DRIVER_PROC). Pinned:
 3. the md5 check hashes the running exe (/proc/PID/exe), never the staged file, which may be a wrapper
    script (g3's 4 needless reruns hashed the g-je wrapper).
 4. a bad spec (unknown key, missing baseline arm, duplicate arm, ...) is a hard error.
+5. preflight fails when the frozen tools copy lacks the genesis inputs run-cell.sh reads from ITS OWN repo
+   root (tools_dir/../..), or when they differ from the harness worktree's (Codex P2: a standalone tools
+   copy passed preflight, then every cell died at genesis, exit 127).
+6. a caller-exported name (RUN, P, ARMS, ...) never deletes or overrides driver config: scrub_env un-exports
+   driver names and clears only the children's env (Codex P2: RUN exported -> scrub_env -> RUN unbound).
 """
 
 import importlib.util
@@ -49,8 +54,52 @@ def md5_of(path):
     return hashlib.md5(open(path, "rb").read()).hexdigest()
 
 
+# the genesis inputs run-cell.sh reads from its own repo root (MAINREPO = <tools_dir>/../..)
+GENESIS_FILES = {
+    "devnet/wsl/gen-3val-genesis.sh": "#!/bin/sh\necho fake gen-3val-genesis\n",
+    "devnet/wsl/bench-validator-keys.json": '{"keys": "fake"}\n',
+    "devnet/wsl/launch-3val.sh": "#!/bin/sh\necho fake launch\n",
+    "devnet/genesis.json": '{"genesis": "fake"}\n',
+    "testnet/lib/cargo-bin.sh": "cargo_bin() { echo fake; }\n",
+    "testnet/gen-weighted-genesis.sh": "#!/bin/sh\necho fake weighted\n",
+}
+TOOL_FILES = ["run-cell.sh", "cell-step.sh", "cell_step.py", "campaign/detach.sh"]
+
+
+def write_tree(root, files):
+    for rel, body in files.items():
+        f = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w") as fh:
+            fh.write(body)
+        if rel.endswith(".sh"):
+            os.chmod(f, 0o755)
+
+
+def frozen_fixture(tmp, complete=True):
+    """a fake harness worktree tmp/wt (its tracked genesis inputs) and a standalone frozen tools copy
+    tmp/ft/tools/matched-bench (copies of the tools the driver runs). complete: the frozen root tmp/ft also
+    carries the harness's genesis inputs + testnet/genesis-weighted-full.json, as Job 4's ozarchy-p4j4-tools
+    did. Returns (wt, tools)."""
+    wt = os.path.join(tmp, "wt")
+    if not os.path.exists(os.path.join(wt, "devnet")):
+        write_tree(wt, GENESIS_FILES)
+    ft = os.path.join(tmp, "ft")
+    tools = os.path.join(ft, "tools", "matched-bench")
+    for rel in TOOL_FILES:
+        dst = os.path.join(tools, rel)
+        if not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(HERE, rel), dst)
+    if complete:
+        write_tree(ft, GENESIS_FILES)
+        write_tree(ft, {"testnet/genesis-weighted-full.json": '{"native_balances": []}\n'})
+    return wt, tools
+
+
 def minimal_spec(tmp, **over):
-    """a valid one-binary two-arm spec whose paths all live in tmp (the stage dir holds a fake node)"""
+    """a valid one-binary two-arm spec whose paths all live in tmp (the stage dir holds a fake node; the tools
+    are a complete frozen copy, frozen_fixture)"""
     st = os.path.join(tmp, "stage", "b-run", "release")
     os.makedirs(st, exist_ok=True)
     node = os.path.join(st, "torus-node")
@@ -61,15 +110,14 @@ def minimal_spec(tmp, **over):
         with open(os.path.join(st, "bench-throughput"), "wb") as f:
             f.write(b"\x7fELF fake bench\x00")
         os.chmod(os.path.join(st, "bench-throughput"), 0o755)
-    wt = os.path.join(tmp, "wt")
-    os.makedirs(wt, exist_ok=True)
+    wt, tools = frozen_fixture(tmp)
     s = {
         "campaign": "test-camp",
         "results_root": os.path.join(tmp, "res"),
         "run_dir": os.path.join(tmp, "res", "test-camp-run"),
         "label_prefix": "test-camp-10m",
         "harness_worktree": wt,
-        "tools_dir": HERE,
+        "tools_dir": tools,
         "devnet_dir": os.path.join(tmp, "devnet"),
         "binaries": {"b": {"stage_dir": os.path.dirname(st), "node_md5": md5_of(node)}},
         "markets": 10,
@@ -879,6 +927,219 @@ class ExpectMissingFileTest(Base):
         open(os.path.join(cell, "run.log"), "w").write("x\n")
         r = self.lib(drv, "expectchk %s A" % shlex.quote(cell))
         self.assertNotEqual(r.returncode, 0, r.stdout)
+
+
+# ---------------------------------------------------------------- frozen tools: genesis inputs (Codex P2)
+
+
+class FrozenToolsTest(Base):
+    """run-cell.sh resolves its genesis inputs from its OWN location (MAINREPO = dir/../..), not from the
+    harness worktree it is handed: a frozen tools copy must carry them. Job 4 (ozarchy-p4j4-tools) froze
+    devnet/wsl, devnet/genesis.json, testnet/lib/cargo-bin.sh, testnet/gen-weighted-genesis.sh and
+    testnet/genesis-weighted-full.json next to tools/ and its driver diffed devnet/wsl against the harness."""
+
+    def dry(self, spec, name):
+        drv = self.generate(self.write_spec(spec, name + ".json"), name + ".sh")
+        return subprocess.run(["bash", drv, "dry"], capture_output=True, text=True, timeout=60)
+
+    def test_run_cell_reads_genesis_from_its_own_root(self):
+        """the reviewer's case: a standalone frozen copy resolves MAINREPO to the frozen root, which has no
+        devnet/wsl/gen-3val-genesis.sh (the cell's genesis step: exit 127)"""
+        wt, tools = frozen_fixture(self.tmp, complete=False)
+        r = subprocess.run(
+            ["bash", os.path.join(tools, "run-cell.sh"), wt, "x"],
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, RUN_CELL_PRINT_PATHS="1", TOOLS_DIR=tools),
+        )
+        paths = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        self.assertEqual(paths["MAINREPO"], os.path.join(self.tmp, "ft"), r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(paths["MAINREPO"], "devnet/wsl/gen-3val-genesis.sh")))
+
+    def test_standalone_copy_without_genesis_inputs_fails_preflight(self):
+        bare = os.path.join(self.tmp, "bare")
+        wt, tools = frozen_fixture(bare, complete=False)
+        r = self.dry(minimal_spec(self.tmp, tools_dir=tools, harness_worktree=wt), "bare")
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PREFLIGHT FAIL", r.stdout)
+        self.assertIn(os.path.join(bare, "ft", "devnet/wsl/gen-3val-genesis.sh"), r.stdout)
+        self.assertNotIn("PREFLIGHT OK", r.stdout)
+
+    def test_each_missing_input_fails_preflight(self):
+        spec = minimal_spec(self.tmp)
+        ft = os.path.join(self.tmp, "ft")
+        required = sorted(set(GENESIS_FILES) - {"devnet/wsl/launch-3val.sh"})  # launch-3val.sh: the diff
+        for i, rel in enumerate(required + ["testnet/genesis-weighted-full.json"]):
+            f = os.path.join(ft, rel)
+            keep = f + ".away"
+            os.rename(f, keep)
+            try:
+                r = self.dry(spec, "miss%d" % i)
+                self.assertNotEqual(r.returncode, 0, rel + ": " + r.stdout)
+                self.assertIn("PREFLIGHT FAIL", r.stdout, rel)
+                self.assertIn(rel, r.stdout)
+            finally:
+                os.rename(keep, f)
+
+    def test_empty_weighted_full_fails_preflight(self):
+        spec = minimal_spec(self.tmp)
+        open(os.path.join(self.tmp, "ft", "testnet/genesis-weighted-full.json"), "w").close()
+        r = self.dry(spec, "empty")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("genesis-weighted-full.json", r.stdout)
+
+    def test_genesis_script_not_executable_fails_preflight(self):
+        spec = minimal_spec(self.tmp)
+        os.chmod(os.path.join(self.tmp, "ft", "devnet/wsl/gen-3val-genesis.sh"), 0o644)
+        os.chmod(os.path.join(self.tmp, "wt", "devnet/wsl/gen-3val-genesis.sh"), 0o644)
+        r = self.dry(spec, "noexec")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("gen-3val-genesis.sh", r.stdout)
+
+    def test_frozen_inputs_differ_from_harness_fail_preflight(self):
+        spec = minimal_spec(self.tmp)
+        for rel in ("devnet/wsl/gen-3val-genesis.sh", "devnet/genesis.json", "testnet/lib/cargo-bin.sh"):
+            f = os.path.join(self.tmp, "ft", rel)
+            orig = open(f).read()
+            with open(f, "a") as fh:
+                fh.write("# drift\n")
+            try:
+                r = self.dry(spec, "drift")
+                self.assertNotEqual(r.returncode, 0, rel + ": " + r.stdout)
+                self.assertIn("differ", r.stdout, rel)
+                self.assertIn(rel.split("/")[-1], r.stdout, rel)
+            finally:
+                with open(f, "w") as fh:
+                    fh.write(orig)
+        # a file only the harness has (a newer devnet/wsl script) is a difference too
+        write_tree(os.path.join(self.tmp, "wt"), {"devnet/wsl/stop-3val.sh": "#!/bin/sh\n"})
+        r = self.dry(spec, "extra")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("stop-3val.sh", r.stdout)
+
+    def test_genesis_output_ignored_in_comparison(self):
+        """devnet/wsl/genesis-3val.json is each cell's OUTPUT (written into the harness worktree): no difference"""
+        spec = minimal_spec(self.tmp)
+        write_tree(os.path.join(self.tmp, "wt"), {"devnet/wsl/genesis-3val.json": "{}\n"})
+        r = self.dry(spec, "out")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_complete_frozen_copy_passes_and_names_the_root(self):
+        r = self.dry(minimal_spec(self.tmp), "ok")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PREFLIGHT OK", r.stdout)
+        self.assertIn("genesis_root=%s" % os.path.join(self.tmp, "ft"), r.stdout)
+
+    def test_tools_inside_the_harness_worktree(self):
+        """tools_dir = <harness>/tools/matched-bench: the root IS the harness worktree; only the untracked
+        weighted-full genesis has to be there"""
+        wt, _ = frozen_fixture(self.tmp)
+        tools = os.path.join(wt, "tools", "matched-bench")
+        for rel in TOOL_FILES:
+            os.makedirs(os.path.dirname(os.path.join(tools, rel)), exist_ok=True)
+            shutil.copy2(os.path.join(HERE, rel), os.path.join(tools, rel))
+        spec = minimal_spec(self.tmp, tools_dir=tools)
+        r = self.dry(spec, "inwt")
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("genesis-weighted-full.json", r.stdout)
+        write_tree(wt, {"testnet/genesis-weighted-full.json": "{}\n"})
+        r = self.dry(spec, "inwt2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------- env scrub vs caller exports (Codex P2)
+
+
+class ScrubEnvTest(Base):
+    BODY = os.path.join(HERE, "campaign", "driver-body.sh")
+
+    def test_reviewer_case_run_survives_scrub(self):
+        """RUN=/tmp/caller bash -c 'CAMPAIGN=c TOOLS=.; DRIVER_LIB_ONLY=1 source driver-body.sh; scrub_env;
+        echo "$RUN"' printed 'RUN: unbound variable'"""
+        r = subprocess.run(
+            ["bash", "-c", 'CAMPAIGN=c TOOLS=.; DRIVER_LIB_ONLY=1 source "$1"; scrub_env; echo "RUN=$RUN";'
+             ' env | grep -c "^RUN=" || true', "x", self.BODY],
+            capture_output=True, text=True, timeout=60, env=dict(os.environ, RUN="/tmp/caller"),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["RUN=/tmp/caller", "0"], r.stdout + r.stderr)
+
+    def caller_env(self):
+        return {"RUN": "/tmp/caller-run", "P": "caller-p", "TOOLS": "/tmp/caller-tools",
+                "MARKETS": "999", "ARMS": "caller-arm", "CELLS": "caller-cell", "BDIR": "caller-bdir",
+                "SMOKE": "1", "HARNESS": "/tmp/caller-harness", "TORUS_FOO": "1", "MALLOC_CONF": "x"}
+
+    def test_caller_exported_config_names_keep_driver_values(self):
+        spec = minimal_spec(self.tmp)
+        drv = self.generate(self.write_spec(spec))
+        r = self.lib(
+            drv,
+            'scrub_env; echo "RUN=$RUN"; echo "P=$P"; echo "TOOLS=$TOOLS"; echo "MARKETS=$MARKETS";'
+            ' echo "ARMS=${ARMS[*]}"; echo "NCELLS=${#CELLS[@]}"; echo "BDIR=${BDIR[b]}"; echo "SMOKE=[$SMOKE]";'
+            ' echo "HARNESS=$HARNESS";'
+            ' echo "CHILD=$(env | grep -E "^(RUN|P|TOOLS|MARKETS|ARMS|CELLS|BDIR|SMOKE|HARNESS|TORUS_FOO|MALLOC_CONF)=" | tr "\\n" " ")"',
+            env=self.caller_env(),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+        self.assertEqual(got["RUN"], spec["run_dir"])
+        self.assertEqual(got["P"], spec["label_prefix"])
+        self.assertEqual(got["TOOLS"], spec["tools_dir"])
+        self.assertEqual(got["MARKETS"], "10")
+        self.assertEqual(got["ARMS"], "A M1")
+        self.assertEqual(got["NCELLS"], "5")
+        self.assertEqual(got["BDIR"], spec["binaries"]["b"]["stage_dir"])
+        self.assertEqual(got["SMOKE"], "[]")
+        self.assertEqual(got["HARNESS"], os.path.join(spec["tools_dir"], "run-cell.sh"))
+        self.assertEqual(got["CHILD"].strip(), "")
+
+    def test_caller_smoke_export_does_not_make_a_smoke_run(self):
+        """SMOKE=1 from the caller must not skip the rerun pass of a full run (the driver owns SMOKE)"""
+        drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        r = self.lib(drv, 'echo "[${SMOKE}]"; apply_smoke; scrub_env; echo "[$SMOKE] $RUN"', env={"SMOKE": "1"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], "[]")
+        self.assertTrue(lines[1].startswith("[1] ") and lines[1].endswith("/smoke"), lines)
+
+    def test_launch_with_caller_exports(self):
+        """`launch` with caller-exported config names: detach gets the driver's values, the unit env none of them"""
+        spec = minimal_spec(self.tmp)
+        drv = self.generate(self.write_spec(spec))
+        fake = os.path.join(self.tmp, "fake-detach.sh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/bash\necho "DETACH $*"\n'
+                    'echo "CHILD=$(env | grep -E "^(RUN|P|TOOLS|ARMS|TORUS_FOO|MALLOC_CONF)=" | tr "\\n" " ")"\n')
+        os.chmod(fake, 0o755)
+        r = subprocess.run(
+            ["bash", drv, "launch"], capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, DRIVER_DETACH=fake, **self.caller_env()),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("DETACH test-camp %s/campaign.log %s run" % (spec["run_dir"], os.path.realpath(drv)), r.stdout)
+        self.assertIn("CHILD=\n", r.stdout.replace("CHILD= \n", "CHILD=\n"))
+        self.assertFalse(os.path.exists("/tmp/caller-run/campaign.log"))
+
+    def test_driver_vars_cover_every_config_and_body_global(self):
+        """scrub_env keeps every driver name (DRIVER_VARS): each name the generated config or the body assigns
+        at top level is listed"""
+        drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        text = open(drv).read()
+        names = set()
+        for ln in text.splitlines():
+            m = re.match(r"^declare -A (.*?)\s*(#|$)", ln)
+            if m:
+                names.update(m.group(1).split())
+                continue
+            for m in re.finditer(r"(?:^|;\s*)([A-Z][A-Z0-9_]*)(?:\[[^]]*\])?=", ln):
+                names.add(m.group(1))
+        r = self.lib(drv, 'echo "$DRIVER_VARS"')
+        listed = set(r.stdout.split())
+        self.assertTrue(listed, r.stdout + r.stderr)
+        # names the driver only reads/exports for its children (not driver state)
+        child_env = {"CELL_STEP_LOG", "CELL_STEP_TIMEOUT", "CELL_STEP_ANALYSIS_TIMEOUT", "CELL_STEP_ANALYSIS_CMD",
+                     "CELL_STEP_ANALYSIS_METRIC", "CELL_STEP_SUMMARY_MD5", "XDG_RUNTIME_DIR", "DRIVER_LIB_ONLY",
+                     "E", "IFS"}
+        self.assertEqual(sorted(names - listed - child_env), [])
 
 
 if __name__ == "__main__":

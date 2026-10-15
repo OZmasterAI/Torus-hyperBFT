@@ -79,6 +79,12 @@ RESERVED_HARNESS = {
     "EXPECT_BENCH_MD5",
     "BENCH_ALLOW_UNDETACHED",
 }
+# every name the generated config assigns (render() unsets them first; driver-body.sh DRIVER_VARS lists them)
+CONFIG_VARS = (
+    "CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP ABIN AENV AXE"
+    " AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL ANALYSIS_CMD"
+    " ANALYSIS_METRIC"
+).split()
 # restart / crash cells: not a supported shape (hand-write the driver)
 UNSUPPORTED_HARNESS = {"CRASH_KILL_AT_S", "KILL_SIG", "KILL_WAIT", "KILL_NODE"}
 
@@ -484,6 +490,9 @@ def render(p, spec, spec_path):
     L += ["#   " + ln for ln in raw.splitlines()]
     L += [
         "# >>> GENERATED CONFIG",
+        "# a caller-exported name must not survive into the config (export attribute, or a stray key: an exported",
+        "# string BDIR=x would become BDIR[0]=x under declare -A); scrub_env un-exports these names, never unsets them",
+        "unset -v %s" % " ".join(CONFIG_VARS),
         "CAMPAIGN=%s" % q(p["campaign"]),
         "R=%s" % q(p["results_root"]),
         "RUN=%s" % q(p["run_dir"]),

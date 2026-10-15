@@ -671,7 +671,10 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   `bench-<campaign>.service` unit, which holds the build lock for its whole run; `run`
   refuses to start outside a bench unit. Each cell runs `run-cell.sh` in its own
   `bench-<label>` unit. The exported env is scrubbed to the basics first (no `TORUS_*`,
-  `MALLOC_CONF`, `LD_PRELOAD` or run-cell.sh knob from the launching shell).
+  `MALLOC_CONF`, `LD_PRELOAD` or run-cell.sh knob from the launching shell). Driver names
+  (`DRIVER_VARS`: `RUN`, `P`, `ARMS`, `BDIR`, ...) are owned by the driver: a caller that
+  exported one gets the driver's value, un-exported (the generated config `unset`s them
+  before assigning; `scrub_env` un-exports them and never unsets them).
 - **Per-cell records** once the bench runs, per node pid: `node-environ-trie.txt`
   (`exe_md5` = md5 of `/proc/PID/exe`, the RUNNING exe: a wrapper script has exec'd the
   real node by then), `node-env-all.txt` (`TORUS_*`), `node-preload.txt` (`LD_PRELOAD`,
@@ -684,7 +687,8 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
 - **cells.tsv rows, CELL-FLAG lines, rerun queue**: `run_spec` + `cell-step.sh` as in the
   template (below). Wrapper arms pass `--no-summary-md5` to the step (run-cell.sh hashes
   the staged file, which is the wrapper).
-- **Preflight**: tools present, harness worktree present, each binary's staged md5 (a
+- **Preflight**: tools present, harness worktree present, the genesis inputs (below), each
+  binary's staged md5 (a
   `wrapper` binary: the md5 of the absolute path its last `exec` line runs), bench md5,
   analysis scripts; in `run`: no build, node, bench or other bench unit, no old attempt
   (cells.tsv, rerun-queue.tsv, label dirs), 20 GB free.
@@ -695,7 +699,8 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
 not an arm, an env value with whitespace/quotes/`$`, or a harness key the driver sets
 itself is a `SPEC ERROR`, exit 2, nothing written). Required: `campaign` (unit name),
 `run_dir`, `label_prefix`, `harness_worktree` (run-cell.sh's `<worktree>`), `tools_dir` (the
-frozen tools copy: run-cell.sh, cell-step.sh, cell_step.py, campaign/detach.sh),
+frozen tools copy: run-cell.sh, cell-step.sh, cell_step.py, campaign/detach.sh; its root
+`tools_dir/../..` must carry the genesis inputs, see below),
 `binaries`, `arms`, `baseline`, `duration_s`, `markets`, and `replicates` unless `order` is a
 list. Optional: `comment`, `results_root` (`~/bench-results-matched`), `devnet_dir`
 (`~/torus-wsl-devnet`), `rate` (76000), `order` (`"rotate"` default: replicate r starts at
@@ -729,6 +734,27 @@ max}`: `grep -E -c regex <cell>/<file>` must be in `[min, max]`. Example:
 
 Full example: `campaign/driver-spec.example.json`; the Job 4 golden specs:
 `testdata/make-driver/p4j4-{h,d}.json`.
+
+**Genesis inputs beside the tools copy.** run-cell.sh generates each cell's genesis from
+ITS OWN repo root (`MAINREPO` = `<dir of run-cell.sh>/../..`), not from the harness worktree
+it is handed (that one only launches the nodes). In a standalone tools copy without them
+every cell dies at genesis (`gen-3val-genesis.sh` not found, exit 127).
+Freeze them as Job 4 did (`ozarchy-p4j4-tools/{devnet,testnet}` beside `tools/`):
+
+```
+T=$R/ozarchy-<camp>-tools; mkdir -p "$T/tools" "$T/devnet" "$T/testnet/lib"
+cp -r <harness-wt>/tools/matched-bench "$T/tools/"
+cp -a <harness-wt>/devnet/wsl "$T/devnet/"; cp <harness-wt>/devnet/genesis.json "$T/devnet/"
+cp <harness-wt>/testnet/gen-weighted-genesis.sh "$T/testnet/"; cp <harness-wt>/testnet/lib/cargo-bin.sh "$T/testnet/lib/"
+cp <the earlier cells' testnet/genesis-weighted-full.json> "$T/testnet/"   # untracked, ~29 MB
+```
+
+Preflight (`dry`, `launch`, `run`) fails unless `devnet/wsl/gen-3val-genesis.sh`
+(executable), `devnet/wsl/bench-validator-keys.json`, `devnet/genesis.json`,
+`testnet/lib/cargo-bin.sh`, `testnet/gen-weighted-genesis.sh` and a non-empty
+`testnet/genesis-weighted-full.json` are under `tools_dir/../..`, and unless `devnet/wsl`
+(except the per-cell output `genesis-3val.json`) and the other tracked inputs equal the
+harness worktree's. `PREFLIGHT OK` names the `genesis_root`.
 
 **Not supported** (hand-write the driver from the closest earlier one, as before, and say
 which shape did not fit): crash / restart cells (`CRASH_KILL_AT_S`, `KILL_*`: a SPEC
