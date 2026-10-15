@@ -3,8 +3,7 @@
 Branch `exp/s123-defer-book-blobs-in-layer-merge` in worktree
 `/home/18c/projects/Torus-hyperBFT/.claude/worktrees/wf_443f7b55-fcb-32`, based on main `c612dc7f`.
 Patch: `/home/18c/projects/wt/exp-s123/defer-book-blobs-in-layer-merge.patch` (staged, not committed).
-Nothing was built or run: no cargo, no nodes, no LSP. Only `rustfmt --edition 2021` was run, on the two files
-(HEAD's `checkpoint_layer.rs` was already rustfmt-clean, so formatting adds no extra hunks).
+Rebased onto main `2bc88bcf`, built and unit-tested (see "Build and test results" at the end). Not benched.
 
 ## What changed
 
@@ -178,3 +177,16 @@ The change is node-local scheduling only, and the layer's contents are unchanged
 - Edition 2021: `std::env::set_var` / `remove_var` are safe functions.
 - The main things to watch on first build are type inference on the tuple `assert_eq!`s and
   `Some(&[u8; N])` coercions. Both follow patterns already used in checkpoint_layer.rs's tests.
+
+## Build and test results (s123 builder, on `2bc88bcf`)
+
+- Built as written; no code change was needed (only the env-assumption comment in `checkpoint_layer.rs` grew).
+- Flag off: `-p torus-state` 344/344; `cargo nextest run --workspace` 3870/3870 (0 flaky), doc tests pass. That
+  includes `tests/ckpt_defer_books.rs`, which sets the flag in its own process.
+- Flag on (`TORUS_CKPT_DEFER_BOOKS=1` exported), `-p torus-consensus -p torus-state --no-fail-fast`: 762 run,
+  759 passed, 3 failed. All three hard-code a book row as a main-part (non-deferred) CF, so they fail by design
+  under the flag, not because of a bug: torus-state `split_merge_equals_whole_merge_random` and
+  `deferred_part_blocks_only_deferred_reads` (predicted above), and torus-consensus
+  `layer_merge_hands_l_back_before_the_slice` ("main part: the book", left 0, right 1). Owner decision: leave them
+  env-sensitive like the other knobs' tests, or rewrite them to route by the live table.
+- `cargo clippy --workspace --all-targets`: no new warnings vs main.

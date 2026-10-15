@@ -918,8 +918,10 @@ mod tests {
     // read from the env once per process): a shell exporting
     // TORUS_CKPT_DEFER_BOOKS=1 breaks `split_merge_equals_whole_merge_random`
     // and `deferred_part_blocks_only_deferred_reads` (books are their
-    // non-deferred CF), as with the other env knobs. The flag-on behaviour
-    // is tested in its own process: `tests/ckpt_defer_books.rs`.
+    // non-deferred CF), as with the other env knobs; so does torus-consensus
+    // `layer_merge_hands_l_back_before_the_slice` (a book row as the main
+    // part). The flag-on behaviour is tested in its own process:
+    // `tests/ckpt_defer_books.rs`.
 
     /// The CFs of the split tests: two deferred (R's) and four others.
     const SPLIT_CFS: [&str; 6] = [
