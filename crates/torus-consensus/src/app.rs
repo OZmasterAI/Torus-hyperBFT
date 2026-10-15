@@ -1191,6 +1191,15 @@ struct ExecutionContext {
     /// metrics attached the liquidation step logs the value sum over all
     /// accounts. Never changes what a block writes.
     liq_value_sum: bool,
+    /// s124 epoch-boundary fast path (`TORUS_EPOCH_FAST_PATH=1`, node-local,
+    /// default off, read once at construction): an epoch-boundary block with
+    /// no EVM tx and no buffered slash takes the pipelined path instead of
+    /// [`Self::pipeline_barrier`] and the serial flush, and with a checkpoint
+    /// interval it checkpoints at its own height ([`Self::checkpoint_upkeep`])
+    /// so its plan for the next boundary is durable without later blocks.
+    /// State, roots and the running hash are identical; only timing changes.
+    /// No effect without W.
+    epoch_fast_path: bool,
 }
 
 /// See [`ExecutionContext::test_block_probe`].
@@ -2487,8 +2496,9 @@ impl ExecutionContext {
 
     /// bl2: barrier — every path that writes the DB directly, reads it
     /// bypassing the overlay, or must see a settled marker (EVM blocks,
-    /// slashes, epoch boundaries, non-durable rows, replay) first waits for W
-    /// to drain. Returns `false` (after latching the fail-stop) if W failed.
+    /// slashes, epoch boundaries unless the epoch fast path is on,
+    /// non-durable rows, replay) first waits for W to drain. Returns `false`
+    /// (after latching the fail-stop) if W failed.
     fn pipeline_barrier(&self) -> bool {
         let Some(worker) = &self.flush_worker else {
             return true;
@@ -2659,8 +2669,9 @@ impl ExecutionContext {
     /// `height` (its frozen set is `last_job`). Folds the previous parent
     /// (n-1) into L off E, or, when a trigger fires, closes L + n-1 + n into
     /// a checkpoint at `height`. Triggers: attest height (`h % 100 == 0`),
-    /// the policy's interval / byte cap / block count. `false`: fail-stop
-    /// latched (the caller returns).
+    /// an epoch boundary under the epoch fast path (s124), the policy's
+    /// interval / byte cap / block count. `false`: fail-stop latched (the
+    /// caller returns).
     fn checkpoint_upkeep(&self, overlay: &mut NativeStateOverlay, height: u64) -> bool {
         let Some(policy) = self.checkpoint else {
             return true;
@@ -2738,7 +2749,16 @@ impl ExecutionContext {
                 + fold.as_ref().map_or(0, |p| p.state_bytes())
                 + current.as_ref().map_or(0, |c| c.state_bytes())) as u64
         };
+        // s124 epoch fast path: a pipelined boundary block wrote the plan for
+        // boundary `height + L` into this window. Consensus reads that plan
+        // only once the DURABLE marker reaches `height` (bug (b)), and these
+        // triggers run only when a block executes (no idle checkpoint): with
+        // L not a multiple of 100 the plan could stay in memory while
+        // consensus refuses `height + L` and execution idles, for good.
+        // Checkpoint the boundary at its own height (for L % 100 == 0 the
+        // attest term already does).
         let due = height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL)
+            || (self.epoch_fast_path && EpochManager::is_epoch_boundary(height, self.epoch_length))
             || policy
                 .every_blocks
                 .is_some_and(|n| height.saturating_sub(st.base) >= n)
@@ -3127,12 +3147,19 @@ impl ExecutionContext {
         // a BARRIER: wait for W to drain, then today's serial path verbatim.
         // Replay (`DurableRows::default()`) is therefore always serial, and W
         // does not even exist at replay time (F4).
+        // s124 epoch fast path (`TORUS_EPOCH_FAST_PATH=1`): an epoch boundary
+        // is pipelined too. F2: W resyncs the EVM accounts the boundary
+        // credited after its write / checkpoint, as for any block. F8 is gone
+        // since bug (b): consensus reads the plan from the DB only, once the
+        // durable marker reaches the previous boundary; the boundary's own
+        // checkpoint (`checkpoint_upkeep`) makes it durable without later blocks.
         let pipelined = self.flush_worker.is_some()
             && durable.header
             && durable.body
             && !has_evm
             && pending_slashes.is_empty()
-            && !EpochManager::is_epoch_boundary(height, self.epoch_length);
+            && (self.epoch_fast_path
+                || !EpochManager::is_epoch_boundary(height, self.epoch_length));
         if !pipelined && !self.pipeline_barrier() {
             tracing::error!(height, "FATAL: flush worker failed before barrier — fail-stop");
             return;
@@ -5789,6 +5816,7 @@ impl TorusApp {
             #[cfg(test)]
             test_nonce_tombstones: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
+            epoch_fast_path: crate::exec_pipeline::epoch_fast_path_enabled(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -5879,6 +5907,22 @@ impl TorusApp {
                 "TORUS_CHECKPOINT_INTERVAL_MS is set but TORUS_EXEC_PIPELINE=0: checkpoints need \
                  the flush worker; every block is written as today"
             );
+        }
+        // s124: the epoch fast path only changes which blocks take the
+        // pipelined path, so it needs W.
+        if exec_ctx.epoch_fast_path {
+            if exec_ctx.flush_worker.is_some() {
+                tracing::info!(
+                    epoch_length = config.epoch_length,
+                    "epoch fast path ON (TORUS_EPOCH_FAST_PATH=1): epoch-boundary blocks without \
+                     EVM txs or slashes run pipelined, no barrier"
+                );
+            } else {
+                tracing::warn!(
+                    "TORUS_EPOCH_FAST_PATH is set but the exec pipeline is off: no effect, every \
+                     epoch-boundary block runs serially"
+                );
+            }
         }
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
@@ -13942,6 +13986,8 @@ mod crash_recovery_tests {
             #[cfg(test)]
             test_nonce_tombstones: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
+            // s124: the epoch fast path is off unless a test sets it.
+            epoch_fast_path: false,
         }
     }
 
@@ -27014,6 +27060,264 @@ mod crash_recovery_tests {
             &dump_all_cfs(&db_ref),
             &dump_all_cfs(&db),
             "1-byte cap vs per-block",
+        );
+    }
+
+    // ---- s124 epoch-boundary fast path (TORUS_EPOCH_FAST_PATH) ----
+
+    /// One run of [`fast_path_run`].
+    struct FastPathRun {
+        db: StateDb,
+        /// Every hashed block's consensus write set.
+        captured: CapturedWrites,
+        /// The durable marker after each block (W idle).
+        markers: Vec<Option<u64>>,
+        /// The heights whose block took the pipelined path.
+        pipelined: Vec<u64>,
+        /// The persisted native root after shutdown.
+        root: torus_types::B256,
+    }
+
+    /// The permanent staker of [`fast_path_run`]: its reward credits an EVM
+    /// account at every boundary (`CF_ACCOUNTS`), so the boundary's dirty
+    /// EVM accounts are not empty and the mirror resync runs (F2).
+    fn fast_path_staker() -> Address {
+        Address::repeat_byte(0x55)
+    }
+
+    /// s124 epoch fast path: `pipeline_fixture_blocks` (13 blocks, epoch
+    /// length 4: boundaries 4 / 8 / 12) plus a permanent stake, with an EVM
+    /// tx in block `evm_at` and a buffered slash at `slash_at`, on a context
+    /// with W (`on`), checkpoint `policy` and `TORUS_EPOCH_FAST_PATH` =
+    /// `fast`. A block took the pipelined path iff `last_job` is its frozen
+    /// set right after it: a barrier clears `last_job` and the serial path
+    /// never sets it.
+    fn fast_path_run(
+        on: bool,
+        fast: bool,
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+        evm_at: Option<u64>,
+        slash_at: Option<u64>,
+    ) -> FastPathRun {
+        torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+        let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        let validator = Address::repeat_byte(0x77);
+        let mut blocks = pipeline_fixture_blocks();
+        if let Some(h) = evm_at {
+            let b = &mut blocks[h as usize - 1];
+            b.evm_transactions = vec![signed_sstore_create(&key, 0)];
+            b.header.evm_tx_count = 1;
+        }
+        link_blocks(&mut blocks);
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        fund_pipeline_fixture(&db);
+        db.put_account(
+            &k256_address(&key),
+            &revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY_CODE,
+                code: None,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        register_proposer(&db, validator);
+        let stake = U256::from(10u128.pow(18));
+        fund_evm_balance(&db, fast_path_staker(), stake);
+        StakingManager::new(db.clone())
+            .permanent_stake(fast_path_staker(), stake, 0)
+            .unwrap();
+        // The EVM trie over the accounts written above, as the node builds it
+        // at boot: otherwise the first resync (the staker's reward at 4)
+        // starts a partial trie and the EVM block's incremental root fails
+        // its full-scan cross-check. With it, a resync W missed would too.
+        torus_state::incremental::ensure_trie_built(&db).unwrap();
+        torus_state::running_hash::capture_begin(&db);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = policy;
+        ctx.epoch_fast_path = fast;
+        if on {
+            ctx.attach_flush_worker(None);
+        }
+        let (mut markers, mut pipelined) = (Vec::new(), Vec::new());
+        for b in &blocks {
+            let h = b.header.height;
+            let durable = persist_committed_block_durably(&db, b);
+            let slashes = if slash_at == Some(h) {
+                vec![PendingSlash {
+                    validator,
+                    fraction_bps: 500,
+                    reason: SlashReason::DoubleSign,
+                    tombstone: false,
+                }]
+            } else {
+                vec![]
+            };
+            ctx.execute_committed_block_with(b, slashes, durable);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fail-stop at {h}");
+            let top = ctx.last_job.lock().unwrap().as_ref().map(|p| p.height());
+            if top == Some(h) {
+                pipelined.push(h);
+            }
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            markers.push(read_native_applied_height(&db));
+        }
+        drop(ctx);
+        let captured = torus_state::running_hash::capture_take(&db);
+        let root = torus_state::native_trie::persisted_native_root(&db).unwrap();
+        FastPathRun {
+            db,
+            captured,
+            markers,
+            pipelined,
+            root,
+        }
+    }
+
+    /// `run` equals `base`: every block's consensus write set, the running
+    /// hash, the persisted native root and every CF.
+    fn assert_fast_path_runs_equal(base: &FastPathRun, run: &FastPathRun, what: &str) {
+        assert_write_sets_equal(&base.captured, &run.captured, what);
+        assert_eq!(
+            torus_state::running_hash::read_running_hash(&base.db),
+            torus_state::running_hash::read_running_hash(&run.db),
+            "{what}: running hash"
+        );
+        assert_eq!(base.root, run.root, "{what}: persisted native root");
+        assert_dumps_equal(&dump_all_cfs(&base.db), &dump_all_cfs(&run.db), what);
+    }
+
+    /// s124 epoch fast path (a) + (b): flag off, the boundary blocks 4 / 8 /
+    /// 12 stay serial (barrier) as before; flag on, they (no EVM tx, no
+    /// slash) take the pipelined path, with a per-block flush and with
+    /// checkpoints (never by time; every 5 blocks), and the state equals the
+    /// serial run (no W) and the flag-off run per block and in every CF. The
+    /// boundaries credit the permanent staker's EVM account, so W runs the
+    /// mirror resync (F2) for them. A boundary checkpoints at its own height,
+    /// so the durable marker after each block equals the flag-off run's,
+    /// where the serial flush makes the boundary (and its plan) durable.
+    #[test]
+    fn epoch_fast_path_boundaries_pipelined_and_match_serial() {
+        let serial = fast_path_run(false, false, None, None, None);
+        assert!(serial.pipelined.is_empty(), "no W: every block is serial");
+        // Non-vacuous F2: the staker staked its whole balance before block 1.
+        let credited = serial
+            .db
+            .get_account(&fast_path_staker())
+            .unwrap()
+            .map(|a| a.balance)
+            .unwrap_or_default();
+        assert!(credited > U256::ZERO, "the boundaries credit the staker");
+        let all: Vec<u64> = (1..=13).collect();
+        let off_pipelined: Vec<u64> = (1..=13).filter(|h| h % 4 != 0).collect();
+        for (what, policy) in [
+            ("per-block", None),
+            ("never", Some(ckpt_never())),
+            ("every 5", Some(ckpt_every(5))),
+        ] {
+            let off = fast_path_run(true, false, policy, None, None);
+            assert_eq!(
+                off.pipelined, off_pipelined,
+                "{what}, flag off: boundaries serial"
+            );
+            let on = fast_path_run(true, true, policy, None, None);
+            assert_eq!(on.pipelined, all, "{what}, flag on: boundaries pipelined");
+            assert_fast_path_runs_equal(&serial, &on, &format!("{what}: flag on vs serial"));
+            assert_fast_path_runs_equal(&off, &on, &format!("{what}: flag on vs flag off"));
+            assert_eq!(
+                on.markers, off.markers,
+                "{what}: durable marker after each block (a boundary is durable at once)"
+            );
+        }
+    }
+
+    /// s124 epoch fast path (c), archy's liveness case: epoch length 4 (not a
+    /// multiple of the attest interval 100), checkpoints never by time, the
+    /// flag on. Boundary 4 runs pipelined and writes the plan for boundary 8.
+    /// Consensus reads that plan only once the DURABLE marker reaches 4 (bug
+    /// (b)), and checkpoint triggers run only when a block executes: had the
+    /// plan stayed in the in-memory window, blocks 5..=7 would commit and
+    /// execute, execution would idle and every leader would refuse block 8
+    /// for good. The boundary checkpoints at its own height instead: after
+    /// 5..=7 with W idle, validators read the set for 8 and the leader
+    /// proposes block 8.
+    #[test]
+    fn epoch_fast_path_plan_durable_before_next_boundary() {
+        let (mut app, db, config) = epoch4_app(1_010);
+        let mut ctx = make_exec_ctx(&config, &db);
+        ctx.checkpoint = Some(ckpt_never());
+        ctx.epoch_fast_path = true;
+        ctx.attach_flush_worker(None);
+        let mut blocks: Vec<TorusBlock> = (1..=7).map(|h| make_block(h, vec![])).collect();
+        link_blocks(&mut blocks);
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            if b.header.height == 4 {
+                // Read before asserting: a failed assert holding the guard
+                // would poison `last_job` for the shutdown drain.
+                let top = ctx.last_job.lock().unwrap().as_ref().map(|p| p.height());
+                assert_eq!(top, Some(4), "boundary 4 took the pipelined path");
+            }
+        }
+        // Execution idles: W finishes what it was handed, nothing else runs.
+        assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+        assert!(
+            app.epoch_validator_set_updates(8).is_ok(),
+            "the plan for 8 is durable: validators do not refuse block 8"
+        );
+        let _ = app.build_proposal(blocks[6].header.clone());
+        assert!(
+            app.pending_proposals.contains_key(&8),
+            "the leader proposes block 8"
+        );
+        assert_eq!(
+            read_native_applied_height(&db),
+            Some(4),
+            "boundary 4 checkpointed at its own height"
+        );
+        drop(ctx);
+    }
+
+    /// s124 epoch fast path (d): with the flag on, a boundary block with an
+    /// EVM tx (8) or a buffered slash (12) still takes the barrier and the
+    /// serial path; only the plain boundary 4 is pipelined. The state equals
+    /// the serial run per block and in every CF, and the EVM tx and the
+    /// slash really landed.
+    #[test]
+    fn epoch_fast_path_evm_or_slash_boundary_stays_serial() {
+        let serial = fast_path_run(false, false, None, Some(8), Some(12));
+        let expected: Vec<u64> = (1..=13).filter(|h| *h != 8 && *h != 12).collect();
+        for (what, policy) in [("per-block", None), ("never", Some(ckpt_never()))] {
+            let on = fast_path_run(true, true, policy, Some(8), Some(12));
+            assert_eq!(
+                on.pipelined, expected,
+                "{what}: EVM boundary 8 and slash boundary 12 serial"
+            );
+            assert_fast_path_runs_equal(&serial, &on, &format!("{what}: flag on vs serial"));
+        }
+        let evm_sender = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
+        assert_eq!(
+            serial
+                .db
+                .get_account(&k256_address(&evm_sender))
+                .unwrap()
+                .unwrap()
+                .nonce,
+            1,
+            "the EVM tx executed"
+        );
+        let slashed = StakingManager::new(serial.db.clone())
+            .get_validator(&Address::repeat_byte(0x77))
+            .unwrap()
+            .unwrap();
+        assert!(
+            slashed.self_stake < torus_economics::MIN_SELF_DELEGATION,
+            "the slash landed"
         );
     }
 
