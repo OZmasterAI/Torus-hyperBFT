@@ -1528,8 +1528,11 @@ fn run_par(
         &mut |ctx: &NativeExecContext| {
             assert_cloid_index_covers_books(ctx, &what);
             let a = ctx.phase_accum;
-            obs.counters
-                .push((a.cancel_alls, a.cancel_all_books_visited, a.cancel_all_books_hit));
+            obs.counters.push((
+                a.cancel_alls,
+                a.cancel_all_books_visited,
+                a.cancel_all_books_hit,
+            ));
             obs.parallel_runs = ctx.test_cancel_all_parallel_runs;
         },
     );
@@ -1554,7 +1557,10 @@ fn parallel_cancel_all_matches_serial_mixed_blocks() {
         let mut blocks = setup_blocks();
         blocks.extend(mixed_blocks(seed, &resting));
         let (serial, serial_obs) = run_par(&blocks, mode, 1);
-        assert_eq!(serial_obs.parallel_runs, 0, "{mode:?}: 1 job is the serial loop");
+        assert_eq!(
+            serial_obs.parallel_runs, 0,
+            "{mode:?}: 1 job is the serial loop"
+        );
         let flat: Vec<_> = serial.results.iter().flatten().collect();
         assert!(flat.iter().filter(|r| r.0 == "cancel_all").count() > 60);
         assert!(serial.trade_index > 10, "{mode:?}: scenario must fill");
@@ -1577,7 +1583,10 @@ fn parallel_cancel_all_matches_serial_long_run_emptying_books() {
         for workers in [2, 4, 64] {
             let what = format!("{mode:?} workers={workers}");
             let (par, par_obs) = run_par(&blocks, mode, workers);
-            assert_eq!(par_obs.parallel_runs, 1, "{what}: the one run used the pool");
+            assert_eq!(
+                par_obs.parallel_runs, 1,
+                "{what}: the one run used the pool"
+            );
             assert_eq!(par_obs.counters, serial_obs.counters, "{what}: counters");
             assert_eq!(par, serial, "{what}: parallel cancel-all diverged");
         }
@@ -1592,7 +1601,7 @@ fn parallel_cancel_all_of_stop_only_senders_matches_serial() {
     let mut setup = Vec::new();
     for s in 1..=6u8 {
         for m in MARKETS {
-            if (s as u64 + m) % 3 != 0 {
+            if !(s as u64 + m).is_multiple_of(3) {
                 setup.push((addr(s), stop_buy(m, 200 + s as i64)));
             }
         }
@@ -1652,7 +1661,11 @@ fn parallel_cancel_all_counts_visited_and_hit_books() {
         ];
         let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true);
         let what = format!("{mode:?}");
-        assert!(r.results.iter().all(|r| r.success), "{what}: {:?}", r.results);
+        assert!(
+            r.results.iter().all(|r| r.success),
+            "{what}: {:?}",
+            r.results
+        );
         assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
         assert_eq!(ctx.test_cancel_all_parallel_runs, 1, "{what}");
         let a = ctx.phase_accum;
@@ -1686,8 +1699,13 @@ fn gtc_cloid(market_id: MarketId, is_buy: bool, price: i64, cloid: u128) -> Nati
 fn parallel_cancel_all_then_cloid_reuse_matches_serial() {
     let cloid = |s: u8, m: MarketId| 0xC0_0000 + (s as u128) * 16 + m as u128;
     let place = |s: u8, m: MarketId, away: i64| {
-        let buy = s % 2 == 0;
-        gtc_cloid(m, buy, if buy { 97 - away } else { 113 + away }, cloid(s, m))
+        let buy = s.is_multiple_of(2);
+        gtc_cloid(
+            m,
+            buy,
+            if buy { 97 - away } else { 113 + away },
+            cloid(s, m),
+        )
     };
     let mut blocks = setup_blocks();
     blocks.push(
@@ -1701,10 +1719,21 @@ fn parallel_cancel_all_then_cloid_reuse_matches_serial() {
     for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
         let (serial, serial_obs) = run_par(&blocks, mode, 1);
         let last = serial.results.last().expect("blocks");
-        assert!(last[..20].iter().all(|r| r.0 == "cancel_all" && r.1), "{mode:?}");
+        assert!(
+            last[..20].iter().all(|r| r.0 == "cancel_all" && r.1),
+            "{mode:?}"
+        );
         let places = &last[20..];
-        assert_eq!(places.iter().filter(|r| r.1).count(), 20 * 4, "{mode:?}: reused");
-        assert_eq!(places.iter().filter(|r| !r.1).count(), 4 * 4, "{mode:?}: duplicates");
+        assert_eq!(
+            places.iter().filter(|r| r.1).count(),
+            20 * 4,
+            "{mode:?}: reused"
+        );
+        assert_eq!(
+            places.iter().filter(|r| !r.1).count(),
+            4 * 4,
+            "{mode:?}: duplicates"
+        );
         for workers in [2, 4] {
             let what = format!("{mode:?} workers={workers}");
             let (par, par_obs) = run_par(&blocks, mode, workers);
@@ -1757,7 +1786,11 @@ fn parallel_cancel_all_worker_panic_fail_stops_before_phase_2() {
             if serial {
                 assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
                 assert_eq!(ctx.test_cancel_all_parallel_runs, 0, "{what}");
-                assert!(r.results.iter().all(|r| r.success), "{what}: {:?}", r.results);
+                assert!(
+                    r.results.iter().all(|r| r.success),
+                    "{what}: {:?}",
+                    r.results
+                );
                 assert!(ctx.trade_index > fills, "{what}: the crossing buy filled");
                 assert!(ctx.next_global_order_id > next_id, "{what}");
                 continue;
@@ -1802,7 +1835,11 @@ fn parallel_cancel_all_worker_panic_fail_stops_before_phase_2() {
                 NativeExecutor::execute_batch_cancel_mode(&mut ctx, &second, true)
             }))
             .unwrap_or_else(|_| panic!("{what}: the second batch unwound"));
-            assert_eq!(ctx.fatal_error.as_deref(), Some(fatal.as_str()), "{what}: latch kept");
+            assert_eq!(
+                ctx.fatal_error.as_deref(),
+                Some(fatal.as_str()),
+                "{what}: latch kept"
+            );
         }
     }
 }

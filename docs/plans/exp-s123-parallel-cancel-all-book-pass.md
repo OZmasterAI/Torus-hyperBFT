@@ -2,8 +2,9 @@
 
 Branch `exp/s123-parallel-cancel-all-book-pass` in worktree
 `/home/18c/projects/Torus-hyperBFT/.claude/worktrees/wf_443f7b55-fcb-29`, based on main `c612dc7f`.
-Patch: `/home/18c/projects/wt/exp-s123/parallel-cancel-all-book-pass.patch` (staged diff, not committed).
-Not compiled and not tested: no cargo of any kind, no LSP, per the run rules.
+Patch: `/home/18c/projects/wt/exp-s123/parallel-cancel-all-book-pass.patch` (the first commit, `d2a7562c`).
+`d2a7562c` was written without compiling. The follow-up commit builds it and runs its tests. Results are in
+"Build and test results" at the end.
 
 ## What changed
 
@@ -57,7 +58,7 @@ visits per run.
    single-action `exec_cancel_all`, the by-id cancels, liquidation cancels, any torus-core edit, metrics in
    app.rs/telemetry, exec_pool.rs, and default-on.
 
-## Tests written first (in `cancel_batch_exec_tests.rs`, not run)
+## Tests written first (in `cancel_batch_exec_tests.rs`; all pass, see the end)
 
 - Helpers:
   - `run_observed_par` (:252) is `run_observed_in` plus `par: Option<(workers, min_visits)>`; `run_observed_in`
@@ -114,7 +115,13 @@ visits per run.
 - phase1_actions ~26 -> ~8-12 ms per native block at N=8. The serial part left is the index take, the visits sort,
   the per-action release loop, and the other Phase 1 actions (by-id cancels, modifies).
 - That is ~13-19 ms off block_ms (-6 to -9%). Using the sec 67.4 conversion (block_ms -10% -> native blk/s +9.5%,
-  matched/s +3%), expect native blk/s +6-8% and matched/s +2-4%.
+  matched/s +3%), expect native blk/s +6-8% and matched/s about +1.8 to +2.7%. (The first draft said +2-4%. That
+  was too high at the top of the range, per the static review.)
+- The 8-12 ms target is plausible, not assured. Sec 25.1's split (about 27 of 30 ms per-book work) was measured on
+  `707f132f`, before P2-1, Phase 3 and Phase 4. Sec 68's 25.98 ms `phase1_actions` row covers all log upkeep
+  (cancels, cancel-alls, modifies), and only the cancel-all book work moves to the pool. The jobs also compete for
+  cores with end_resident, flush, checkpoint and ingress threads. Re-profiling phase 1 on head is the gate before
+  the A/B (see "How to measure").
 - This is specific to the bench shape: every bench cancel is `CancelAllOrders{None}`.
 - At 10 markets, expect little or nothing: few groups per run, and exec is not the limit there (busy 0.77-0.80).
 
@@ -126,8 +133,9 @@ visits per run.
   timeouts per cell. Require AGREE on every cell (block_hash + state digest).
 - Optional sweep: N in {4, 8, 16} and `TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS` in {64, 512}.
 - Re-profile phase 1 on head first: sec 25.1's per-book share was measured before P2-1, Phase 3 and Phase 4.
-- Before benching, run the tests: `cargo nextest run -p torus-bridge -E 'test(parallel_cancel_all) | test(cancel_batch) | test(cancel_all) | test(worker_panic)'`
-  plus a full `rdeps(torus-bridge)` run.
+- Before benching, run the tests: `cargo nextest run $P $F -E 'package(torus-bridge) and (test(parallel_cancel_all) or test(cancel_batch) or test(cancel_all) or test(worker_panic))'`
+  plus a full `rdeps(torus-bridge)` run. (Write the filter with `or`, not `|`: the test-output hook reads `|` as
+  a pipe.) Both were run in s123, see below.
 
 ## Risks
 
@@ -149,15 +157,58 @@ visits per run.
   If its cancel-site dirty marks live in ctx rather than in the book, `cancel_all_group` must return each market's
   marks, and the caller must merge them in market order after the jobs. Book-local marks need no change.
 
-## Untested / confidence
+## Build and test results (s123 builder)
 
-- Nothing was compiled or run.
-- Compile confidence: medium-high. The borrows follow existing patterns: disjoint `iter_mut` books, as at
-  save_order_books :6548. Field-disjoint ctx borrows are used as in the old loop. Pool jobs borrow non-'static data,
-  as `jobs_borrow_caller_data` in exec_pool.rs does. `#[cfg(test)] if` statements are used as at :1788.
-- Spots most likely to need a touch-up:
-  - the deref coercion `mids.binary_search(m)` with `m: &&MarketId`;
-  - closure type inference in `jobs.push(move || ..)`;
-  - the `()` fallback for R in market_workers' existing `run_contained(7, || panic!(..))` test (edition 2021).
-- Test-side uncertainty: (e) assumes a cloid re-place after a cancel-all in the same block succeeds on the serial
-  path. That follows from the cloid pre-pass running after Phase 1 (:7448-7460), but has not been run.
+Run in this worktree with `CARGO_TARGET_DIR=/home/18c/.cargo-target-exp` and the shared -p set
+(`P` = torus-types, torus-genesis, torus-bridge, torus-consensus, torus-economics, torus-mempool, torus-rpc,
+torus-core, torus-evm, hotstuff_rs, torus-node, torus-state, torus-integration-tests).
+`F="--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar"`.
+
+Compile: `d2a7562c` built as written. `cargo nextest run $P --no-run` passed on a fresh target dir with no errors
+and no warnings. None of the three touch-up spots the draft listed needed a change.
+
+Changes in the follow-up commit (no change to behaviour):
+- `cancel_batch_exec_tests.rs`: two clippy `manual_is_multiple_of` warnings in the new tests
+  (`(s as u64 + m) % 3 != 0` and `s % 2 == 0`) now use `.is_multiple_of()`.
+- `native_executor.rs` and `cancel_batch_exec_tests.rs`: the new hunks are in rustfmt layout (assert and chain
+  line breaks). Only lines this experiment added were reformatted. The rest of each file is as on main, so main's
+  own fmt diffs stay. `rustfmt --check` now shows no diff that overlaps the experiment's hunks.
+- This notes file: the matched/s estimate (static review, medium) and this section.
+
+Tests:
+- New and related tests:
+  `-E 'package(torus-bridge) and (test(parallel_cancel_all) or test(run_contained) or test(cancel_batch) or test(cancel_all) or test(worker_panic))'`:
+  36 run, 36 passed. That covers the 6 new `parallel_cancel_all_*` tests, the 3 parse tests in
+  `parallel_cancel_all_toggle_tests`, and the existing cancel-batch, cancel-all and worker-panic tests
+  (including market_workers' `worker_panic_is_contained_as_typed_error` on the now generic `run_contained`).
+- The tests fail when the code is broken. Two temporary mutations were applied together and then reverted:
+  (1) the parallel path drops each market's margin and stop reservation (adds ZERO); (2) the phase-1 caller
+  does not return early on `Err`. Result: 13 run, 8 passed, 5 failed. The failures were (a) mixed blocks,
+  (b) long run, (c) stop-only, and (e) cloid reuse, each on `RunFingerprint` (the balance CF differs), plus
+  (f) worker panic (Phase 2 ran: `trade_index` 2 vs 0). (d) counters and the parse tests do not cover these
+  mutations, so they stayed green, as expected.
+- Flag off (env unset), `-E 'rdeps(torus-bridge) or package(torus-consensus)'`: 1784 run, 1784 passed
+  (18 slow), 16 skipped. torus-consensus is in rdeps(torus-bridge), and torus-bridge is the only crate the
+  experiment touches.
+- Flag on for every context (`TORUS_PARALLEL_CANCEL_ALL=4 TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS=0`),
+  `-E 'rdeps(torus-bridge)'`: 1784 run, 1784 passed (19 slow), 16 skipped. With these values, any batched
+  cancel-all run on resident books that touches 2 or more books takes the pool path, unless a test pins the
+  context fields. Which existing tests reach that path was not counted.
+- After the formatting and clippy changes, flag off, `-E 'package(torus-bridge)'`: 977 run, 977 passed, 11 skipped.
+- Warnings: none in the build logs. `cargo clippy $P --all-targets` reports nothing new in the changed files.
+  The warnings left there are on main's lines: `cancel_batch_exec_tests.rs:64,148` and
+  `native_executor.rs:13100` (blame `07d43688`).
+- The draft's test-side doubt about (e) is settled: on the serial path, the 20 senders' cloids are reused in the
+  same block (80 accepted, 16 duplicates rejected), and the parallel arms match it.
+
+Re-run after the rebase onto main `2bc88bcf` (no conflicts; main did not touch native_executor.rs or
+market_workers.rs since `c612dc7f`):
+- New and related tests (same filter): 36 run, 36 passed.
+- Flag on (`TORUS_PARALLEL_CANCEL_ALL=4 TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS=0`), `-E 'rdeps(torus-bridge)'`:
+  1984 run, 1984 passed, 16 skipped.
+- Flag off, `cargo nextest run --workspace`: 3873 run, 3873 passed (0 flaky), 38 skipped; doc tests pass.
+- `cargo clippy --workspace --all-targets`: no new warnings vs main (242 unique warnings on both).
+
+Still open (needs a bench, out of scope here): the gain itself (phase1_actions, block_ms, blk/s, matched/s), and
+AGREE across nodes at 300 markets with `TORUS_PARALLEL_CANCEL_ALL=8`. The pool size caps the useful N
+(exec_pool.rs sizes the pool from the host, TORUS_MATCH_WORKERS and TORUS_SETTLE_WORKERS).

@@ -4383,7 +4383,11 @@ fn parallel_cancel_all_workers_env() -> usize {
 
 /// Pure parse for [`parallel_cancel_all_workers_env`].
 fn parse_parallel_cancel_all_workers(v: Option<String>) -> usize {
-    match v.as_deref().map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+    match v
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         Some(n) if n >= 2 => n.min(MAX_PARALLEL_CANCEL_ALL_WORKERS),
         _ => 1,
     }
@@ -4423,14 +4427,21 @@ mod parallel_cancel_all_toggle_tests {
     fn default_and_low_values_are_serial() {
         assert_eq!(parse_parallel_cancel_all_workers(None), 1);
         for v in ["0", "1", " 1 ", "", "on", "true", "-3", "2.5", "eight"] {
-            assert_eq!(parse_parallel_cancel_all_workers(Some(v.to_string())), 1, "{v:?}");
+            assert_eq!(
+                parse_parallel_cancel_all_workers(Some(v.to_string())),
+                1,
+                "{v:?}"
+            );
         }
     }
 
     #[test]
     fn two_or_more_is_that_many_capped() {
         assert_eq!(parse_parallel_cancel_all_workers(Some("2".to_string())), 2);
-        assert_eq!(parse_parallel_cancel_all_workers(Some(" 8 ".to_string())), 8);
+        assert_eq!(
+            parse_parallel_cancel_all_workers(Some(" 8 ".to_string())),
+            8
+        );
         assert_eq!(
             parse_parallel_cancel_all_workers(Some("64".to_string())),
             MAX_PARALLEL_CANCEL_ALL_WORKERS
@@ -4445,10 +4456,22 @@ mod parallel_cancel_all_toggle_tests {
     fn min_visits_default_and_override() {
         assert_eq!(DEFAULT_PARALLEL_CANCEL_ALL_MIN_VISITS, 64);
         assert_eq!(parse_parallel_cancel_all_min_visits(None), 64);
-        assert_eq!(parse_parallel_cancel_all_min_visits(Some("junk".to_string())), 64);
-        assert_eq!(parse_parallel_cancel_all_min_visits(Some("-1".to_string())), 64);
-        assert_eq!(parse_parallel_cancel_all_min_visits(Some("0".to_string())), 0);
-        assert_eq!(parse_parallel_cancel_all_min_visits(Some(" 500 ".to_string())), 500);
+        assert_eq!(
+            parse_parallel_cancel_all_min_visits(Some("junk".to_string())),
+            64
+        );
+        assert_eq!(
+            parse_parallel_cancel_all_min_visits(Some("-1".to_string())),
+            64
+        );
+        assert_eq!(
+            parse_parallel_cancel_all_min_visits(Some("0".to_string())),
+            0
+        );
+        assert_eq!(
+            parse_parallel_cancel_all_min_visits(Some(" 500 ".to_string())),
+            500
+        );
     }
 }
 
@@ -11215,9 +11238,7 @@ impl NativeExecutor {
         }
         let cancelled = book.cancel_all_many(&senders);
         let mut hits = Vec::new();
-        for ((&(_, k), &(took_stops, stops)), orders) in
-            group.iter().zip(&stops_k).zip(cancelled)
-        {
+        for ((&(_, k), &(took_stops, stops)), orders) in group.iter().zip(&stops_k).zip(cancelled) {
             if took_stops || !orders.is_empty() {
                 hits.push((k, Self::cancelled_orders_margin(cfg, &orders), stops));
             }
@@ -11275,8 +11296,10 @@ impl NativeExecutor {
                 items.push((mid, group, book, configs.get(&mid)));
             }
         }
-        let members: Vec<(MarketId, usize)> =
-            items.iter().map(|(mid, group, _, _)| (*mid, group.len())).collect();
+        let members: Vec<(MarketId, usize)> = items
+            .iter()
+            .map(|(mid, group, _, _)| (*mid, group.len()))
+            .collect();
         let weights: Vec<(MarketId, usize)> = members
             .iter()
             .map(|&(mid, n)| (mid, n + GROUP_BASE_WEIGHT))
@@ -11289,7 +11312,14 @@ impl NativeExecutor {
         for chunk in &chunks {
             let mine: Vec<_> = chunk
                 .iter()
-                .map(|&i| (i, slots[i].take().expect("chunk_indices lists every item once")))
+                .map(|&i| {
+                    (
+                        i,
+                        slots[i]
+                            .take()
+                            .expect("chunk_indices lists every item once"),
+                    )
+                })
                 .collect();
             chunk_mids.push(mine.iter().map(|(_, item)| item.0).collect());
             jobs.push(move || {
@@ -11337,8 +11367,7 @@ impl NativeExecutor {
                     if failed.is_none() {
                         failed = Some(crate::market_workers::MarketWorkerPanic {
                             market_id: job_mids[0],
-                            message: "cancel-all job died outside contained book work"
-                                .to_string(),
+                            message: "cancel-all job died outside contained book work".to_string(),
                         });
                     }
                     poisoned.extend(job_mids);
@@ -11352,7 +11381,11 @@ impl NativeExecutor {
             .into_iter()
             .zip(per_item)
             .map(|((mid, n), group_hits)| {
-                (mid, n, group_hits.expect("a job without a panic ran all its markets"))
+                (
+                    mid,
+                    n,
+                    group_hits.expect("a job without a panic ran all its markets"),
+                )
             })
             .collect())
     }
