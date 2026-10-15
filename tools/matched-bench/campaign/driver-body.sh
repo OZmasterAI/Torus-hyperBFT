@@ -135,7 +135,12 @@ expectchk() { # o arm: the spec's expectations for every arm (EXP_ARM '*') and f
     local o=$1 arm=$2 i n rc=0
     for i in "${!EXP_ARM[@]}"; do
         [ "${EXP_ARM[$i]}" = '*' ] || [ "${EXP_ARM[$i]}" = "$arm" ] || continue
-        n=$(grep -E -c -- "${EXP_RE[$i]}" "$o/${EXP_FILE[$i]}" 2>/dev/null); n=${n:-0}
+        # a missing or unreadable file proves nothing, also for an absence (max 0) expectation
+        [ -f "$o/${EXP_FILE[$i]}" ] && [ -r "$o/${EXP_FILE[$i]}" ] \
+            || { echo "CHECK FAIL $(basename "$o"): ${EXP_FILE[$i]} missing or unreadable (expectation '${EXP_RE[$i]}'; arm $arm)"; rc=1; continue; }
+        n=$(grep -E -c -- "${EXP_RE[$i]}" "$o/${EXP_FILE[$i]}" 2>/dev/null)
+        [ $? -le 1 ] && [[ "$n" =~ ^[0-9]+$ ]] \
+            || { echo "CHECK FAIL $(basename "$o"): grep -E error on '${EXP_RE[$i]}' in ${EXP_FILE[$i]} (arm $arm)"; rc=1; continue; }
         if [ "$n" -lt "${EXP_MIN[$i]}" ] || { [ -n "${EXP_MAX[$i]}" ] && [ "$n" -gt "${EXP_MAX[$i]}" ]; }; then
             echo "CHECK FAIL $(basename "$o"): ${EXP_FILE[$i]} has $n lines matching '${EXP_RE[$i]}' (want ${EXP_MIN[$i]}..${EXP_MAX[$i]:-any}; arm $arm)"; rc=1
         else

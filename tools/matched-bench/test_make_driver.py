@@ -855,5 +855,31 @@ class Md5SourceTest(Base):
         self.assertNotEqual(self.lib(drv, "md5chk %s A" % shlex.quote(cell)).returncode, 0)
 
 
+
+class ExpectMissingFileTest(Base):
+    def test_missing_file_fails_even_for_zero_match(self):
+        """an expectation on a file the cell lacks is a CHECK FAIL, also for min 0 / max 0 (absence) expectations"""
+        spec = minimal_spec(self.tmp, expect=[{"file": "missing.log", "regex": "panic", "min": 0, "max": 0}])
+        drv = self.generate(self.write_spec(spec, "sx.json"), "dx.sh")
+        cell = os.path.join(self.tmp, "cx")
+        os.makedirs(cell)
+        r = self.lib(drv, "expectchk %s A" % shlex.quote(cell))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("CHECK FAIL", r.stdout)
+        self.assertIn("missing.log", r.stdout)
+        open(os.path.join(cell, "missing.log"), "w").write("all fine\n")
+        self.assertEqual(self.lib(drv, "expectchk %s A" % shlex.quote(cell)).returncode, 0)
+
+    def test_grep_error_fails(self):
+        """a regex grep -E rejects (Python accepted it) is a CHECK FAIL, not 0 matches"""
+        spec = minimal_spec(self.tmp, expect=[{"file": "run.log", "regex": "[[:foo:]]", "min": 0, "max": 0}])
+        drv = self.generate(self.write_spec(spec, "sg.json"), "dg.sh")
+        cell = os.path.join(self.tmp, "cg")
+        os.makedirs(cell)
+        open(os.path.join(cell, "run.log"), "w").write("x\n")
+        r = self.lib(drv, "expectchk %s A" % shlex.quote(cell))
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
