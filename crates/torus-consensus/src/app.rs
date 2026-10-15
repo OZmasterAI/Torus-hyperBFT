@@ -948,6 +948,10 @@ struct ExecutionContext {
     max_validators: u32,
     treasury_address: Address,
     dev_pool_address: Address,
+    /// Item 7 step 1: the genesis parent header from the chain config (the
+    /// same value as `TorusApp::genesis_header`): crash replay starts from
+    /// it and execution links height 1 to it.
+    pub(crate) genesis_header: TorusBlockHeader,
     metrics: Option<Arc<torus_telemetry::Metrics>>,
     /// Shared mempool handle for the exec trust-cache read path: a HIT lets the
     /// execution thread reuse a locally-verified sender and skip the secp256k1
@@ -1839,6 +1843,7 @@ enum ReplayGapOutcome {
 fn replay_gap<H, B, X>(
     applied: u64,
     committed: u64,
+    genesis: TorusBlockHeader,
     mut load_header: H,
     mut load_body: B,
     mut execute: X,
@@ -1848,7 +1853,7 @@ where
     B: FnMut(u64) -> Option<TorusBlockBody>,
     X: FnMut(&TorusBlock) -> bool,
 {
-    let mut last_good = torus_bridge::genesis_parent_header();
+    let mut last_good = genesis;
     for height in (applied + 1)..=committed {
         let header = match load_header(height) {
             Some(h) => h,
@@ -1921,10 +1926,10 @@ where
 /// parent — the parent is already final here.
 ///
 /// Genesis edge: the height-1 block's parent is the synthetic
-/// `genesis_parent_header` (never persisted), so its expected hash is computed
-/// directly. If the parent header cannot be resolved (missing/truncated) we
-/// cannot assert a conflict, so we allow — the same conservative stance as
-/// [`detect_conflicting_commit`].
+/// `genesis_parent_header` (never persisted; `genesis`, built from the chain
+/// config), so its expected hash is computed directly. If the parent header
+/// cannot be resolved (missing/truncated) we cannot assert a conflict, so we
+/// allow — the same conservative stance as [`detect_conflicting_commit`].
 ///
 /// On a genuine mismatch this SCREAMS with both hashes and latches the fail-stop
 /// (`exec_failed`), returning `true` so the caller aborts.
@@ -1938,13 +1943,14 @@ fn detect_parent_link_violation<B: StateBackend>(
     state_db: &B,
     height: u64,
     parent_hash: &alloy_primitives::B256,
+    genesis: &TorusBlockHeader,
     exec_failed: &std::sync::atomic::AtomicBool,
 ) -> bool {
     if height == 0 {
         return false;
     }
     let expected = if height == 1 {
-        alloy_primitives::keccak256(torus_bridge::genesis_parent_header().canonical_header_bytes())
+        alloy_primitives::keccak256(genesis.canonical_header_bytes())
     } else {
         match state_db.get_cf_raw(CF_BLOCK_HEADERS, &(height - 1).to_be_bytes()) {
             Ok(Some(d)) if d.len() >= 32 => alloy_primitives::B256::from_slice(&d[..32]),
@@ -1998,9 +2004,8 @@ fn parent_block_ms<B: StateBackend>(
     height: u64,
 ) -> Result<u64, torus_state::StateError> {
     if height <= 1 {
-        return Ok(torus_types::eip712::block_timestamp_ms(
-            torus_bridge::genesis_parent_header().timestamp,
-        ));
+        // The genesis parent header's timestamp.
+        return Ok(torus_types::eip712::block_timestamp_ms(0));
     }
     let parent = height - 1;
     let Some(row) = state.get_cf_raw(CF_BLOCK_HEADERS, &parent.to_be_bytes())? else {
@@ -2065,10 +2070,11 @@ fn tree_parent_header(
 fn check_parent_link(
     header: &TorusBlockHeader,
     justify: &PhaseCertificate,
+    genesis: &TorusBlockHeader,
     parent: impl FnOnce(&CryptoHash) -> ParentHeader,
 ) -> BlockDataCheck {
     let parent = if justify.is_genesis_pc() {
-        torus_bridge::genesis_parent_header()
+        genesis.clone()
     } else {
         match parent(&justify.block) {
             ParentHeader::Header(header) => *header,
@@ -2953,6 +2959,7 @@ impl ExecutionContext {
             &self.state_db,
             height,
             &torus_block.header.parent_hash,
+            &self.genesis_header,
             &self.exec_failed,
         ) {
             return;
@@ -4726,6 +4733,10 @@ pub struct TorusApp {
     evm_executor: EvmExecutor,
     proposer_address: Address,
     last_header: TorusBlockHeader,
+    /// Item 7 step 1: the genesis parent header, built once in `try_new` from
+    /// the chain config (`evm_gas_limit`, `evm_block_interval`). Height 1 links
+    /// to it before the vote, at insertion and at execution.
+    pub(crate) genesis_header: TorusBlockHeader,
     staking: StakingManager,
     epoch_length: u64,
     last_validator_set: ValidatorSet,
@@ -5586,6 +5597,11 @@ impl TorusApp {
             config.dev_pool_address,
         );
         exec_validator.metrics = metrics.clone();
+        // Item 7 step 1: the genesis parent header from the genesis EVM values. Every
+        // user (vote, insertion, execution, crash replay) takes this one value, or
+        // block 1 fails to link.
+        let genesis_header =
+            torus_bridge::genesis_parent_header(config.evm_gas_limit, config.evm_block_interval);
         let mut exec_ctx = ExecutionContext {
             state_db: state_db.clone(),
             validator: exec_validator,
@@ -5594,6 +5610,7 @@ impl TorusApp {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            genesis_header: genesis_header.clone(),
             metrics: metrics.clone(),
             mempool: mempool.clone(),
             exec_trust_cache: config.exec_trust_cache,
@@ -5781,6 +5798,7 @@ impl TorusApp {
             evm_executor: EvmExecutor::new(config.chain_id),
             proposer_address,
             last_header,
+            genesis_header,
             staking,
             epoch_length: config.epoch_length,
             last_validator_set: genesis_validator_set,
@@ -6105,7 +6123,8 @@ impl TorusApp {
         let config = ChainConfig {
             chain_id: TORUS_CHAIN_ID,
             chain_name: "torus-test".to_string(),
-            evm_gas_limit: 30_000_000,
+            evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -6141,7 +6160,7 @@ impl TorusApp {
         state_db: &StateDb,
         exec_ctx: &ExecutionContext,
     ) -> (TorusBlockHeader, Option<u64>) {
-        let genesis = torus_bridge::genesis_parent_header();
+        let genesis = exec_ctx.genesis_header.clone();
 
         let committed = match find_last_committed_height(state_db) {
             Some(h) if h > 0 => h,
@@ -6180,6 +6199,7 @@ impl TorusApp {
         let outcome = replay_gap(
             applied,
             committed,
+            genesis,
             |height| load_replay_header(state_db, height),
             |height| load_replay_body(state_db, height),
             |block| {
@@ -7058,7 +7078,7 @@ impl TorusApp {
                 (compact.header.clone(), Some(compact))
             }
         };
-        let link = check_parent_link(&header, &block.justify, parent);
+        let link = check_parent_link(&header, &block.justify, &self.genesis_header, parent);
         if link != BlockDataCheck::Held {
             return link;
         }
@@ -7165,6 +7185,7 @@ impl TorusApp {
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
                 evm_gas_limit: parent_header.evm_gas_limit,
+                evm_block_interval: parent_header.evm_block_interval,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: evm_txs.len() as u32,
                 base_fee_per_gas: parent_header.base_fee_per_gas,
@@ -7312,9 +7333,11 @@ impl App<RocksKVStore> for TorusApp {
         // is inserted), so a block inserted by any path (full proposal, sync,
         // header + body) links to its parent's header.
         let link = match datum_header(datums[0].bytes()) {
-            Some(header) => check_parent_link(&header, &block.justify, |hash| {
-                tree_parent_header(request.block_tree(), hash)
-            }),
+            Some(header) => {
+                check_parent_link(&header, &block.justify, &self.genesis_header, |hash| {
+                    tree_parent_header(request.block_tree(), hash)
+                })
+            }
             None => BlockDataCheck::Invalid,
         };
         match link {
@@ -8644,6 +8667,7 @@ mod exec_throttle_tests {
                 chain_id: torus_evm::TORUS_CHAIN_ID,
                 chain_name: "throttle-test".to_string(),
                 evm_gas_limit: 30_000_000,
+                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
                 base_fee_per_gas: 1_000_000_000,
                 epoch_length: 100,
                 max_validators: 4,
@@ -8814,6 +8838,7 @@ mod exec_dispatch_tests {
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
                 evm_gas_limit: 30_000_000,
+                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,
@@ -9914,7 +9939,8 @@ mod crash_recovery_tests {
         let config = ChainConfig {
             chain_id: torus_evm::TORUS_CHAIN_ID,
             chain_name: "crash-test".to_string(),
-            evm_gas_limit: 30_000_000,
+            evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -9950,6 +9976,15 @@ mod crash_recovery_tests {
         torus_types::eip712::block_timestamp_ms(make_block(height, vec![]).header.timestamp)
     }
 
+    /// Item 7 step 1: the genesis parent header of the module's chain config
+    /// (`make_test_config_and_db`: the genesis default EVM values).
+    fn default_genesis_header() -> TorusBlockHeader {
+        torus_bridge::genesis_parent_header(
+            torus_types::DEFAULT_EVM_GAS_LIMIT,
+            torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+        )
+    }
+
     fn make_block(height: u64, native_actions: Vec<SignedNativeAction>) -> TorusBlock {
         // Header-identity hardening: the commit-time ancestry check
         // (`detect_parent_link_violation`) compares a block's `parent_hash`
@@ -9963,9 +9998,7 @@ mod crash_recovery_tests {
         // explicitly (see `deferred_trades_*`, `duplicate_*`).
         let parent_hash = match height {
             0 => B256::ZERO,
-            1 => alloy_primitives::keccak256(
-                torus_bridge::genesis_parent_header().canonical_header_bytes(),
-            ),
+            1 => alloy_primitives::keccak256(default_genesis_header().canonical_header_bytes()),
             _ => alloy_primitives::keccak256(
                 make_block(height - 1, vec![]).header.canonical_header_bytes(),
             ),
@@ -9981,7 +10014,8 @@ mod crash_recovery_tests {
                 logs_bloom: Bloom::ZERO,
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
-                evm_gas_limit: 30_000_000,
+                evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+                evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,
@@ -10144,7 +10178,13 @@ mod crash_recovery_tests {
         // latch stays clear.
         let ef_ok = AtomicBool::new(false);
         assert!(
-            !detect_parent_link_violation(&state_db, 6, &correct_parent_hash, &ef_ok),
+            !detect_parent_link_violation(
+                &state_db,
+                6,
+                &correct_parent_hash,
+                &default_genesis_header(),
+                &ef_ok
+            ),
             "a child whose parent_hash matches the finalized parent must be accepted"
         );
         assert!(!ef_ok.load(Ordering::SeqCst), "no fail-stop on a valid link");
@@ -10154,7 +10194,7 @@ mod crash_recovery_tests {
         let ef_bad = AtomicBool::new(false);
         let bogus = torus_types::B256::repeat_byte(0xEE);
         assert!(
-            detect_parent_link_violation(&state_db, 6, &bogus, &ef_bad),
+            detect_parent_link_violation(&state_db, 6, &bogus, &default_genesis_header(), &ef_bad),
             "a child whose parent_hash mismatches the finalized parent must be rejected"
         );
         assert!(
@@ -10172,21 +10212,68 @@ mod crash_recovery_tests {
         use std::sync::atomic::AtomicBool;
         let (_config, state_db) = make_test_config_and_db();
 
-        let genesis_hash = alloy_primitives::keccak256(
-            torus_bridge::genesis_parent_header().canonical_header_bytes(),
-        );
+        let genesis = default_genesis_header();
+        let genesis_hash = alloy_primitives::keccak256(genesis.canonical_header_bytes());
         let ef_ok = AtomicBool::new(false);
         assert!(
-            !detect_parent_link_violation(&state_db, 1, &genesis_hash, &ef_ok),
+            !detect_parent_link_violation(&state_db, 1, &genesis_hash, &genesis, &ef_ok),
             "height-1 block committing to the genesis header hash must be accepted"
         );
 
         let ef_bad = AtomicBool::new(false);
         assert!(
-            detect_parent_link_violation(&state_db, 1, &torus_types::B256::ZERO, &ef_bad),
+            detect_parent_link_violation(&state_db, 1, &torus_types::B256::ZERO, &genesis, &ef_bad),
             "height-1 block whose parent_hash is not the genesis header hash must be rejected"
         );
         assert!(ef_bad.load(Ordering::SeqCst));
+    }
+
+    /// Item 7 step 1: execution's genesis edge links height 1 to the
+    /// configured genesis header (`ExecutionContext::genesis_header`, built
+    /// from the chain config), so on a 3M chain a parent hash taken from a
+    /// 30M genesis is a violation. RED before: the expected hash came from
+    /// the hardcoded 30M header.
+    #[test]
+    fn parent_link_violation_uses_the_configured_genesis() {
+        use std::sync::atomic::AtomicBool;
+        let (mut config, state_db) = make_test_config_and_db();
+        config.evm_gas_limit = 3_000_000;
+        config.evm_block_interval = 5;
+        let genesis = torus_bridge::genesis_parent_header(3_000_000, 5);
+        let hash_3m = alloy_primitives::keccak256(genesis.canonical_header_bytes());
+        let hash_30m = alloy_primitives::keccak256(
+            torus_bridge::genesis_parent_header(30_000_000, 5).canonical_header_bytes(),
+        );
+        let latch = AtomicBool::new(false);
+        assert!(!detect_parent_link_violation(
+            &state_db, 1, &hash_3m, &genesis, &latch
+        ));
+        assert!(!latch.load(Ordering::SeqCst));
+        assert!(detect_parent_link_violation(
+            &state_db, 1, &hash_30m, &genesis, &latch
+        ));
+        assert!(
+            latch.load(Ordering::SeqCst),
+            "a 30M genesis link latches the fail-stop"
+        );
+
+        // Wired: the execution context links block 1 to the configured header.
+        for (parent_hash, fails) in [(hash_3m, false), (hash_30m, true)] {
+            let (_, db) = make_test_config_and_db();
+            let ctx = make_exec_ctx(&config, &db);
+            assert_eq!(
+                ctx.genesis_header.canonical_header_bytes(),
+                genesis.canonical_header_bytes()
+            );
+            let mut b1 = make_block(1, vec![]);
+            b1.header.parent_hash = parent_hash;
+            ctx.execute_committed_block(&b1, vec![]);
+            assert_eq!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                fails,
+                "fails={fails}"
+            );
+        }
     }
 
     /// T1.6 RED-first: crash-replay must still RUN after the pruner has
@@ -10273,6 +10360,7 @@ mod crash_recovery_tests {
         let outcome = replay_gap(
             0,
             3,
+            default_genesis_header(),
             |h| Some(blocks[h as usize - 1].header.clone()),
             |h| Some(blocks[h as usize - 1].body()),
             |block| {
@@ -10355,6 +10443,7 @@ mod crash_recovery_tests {
         let outcome = replay_gap(
             1,
             3,
+            default_genesis_header(),
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
             |block| {
@@ -10400,6 +10489,7 @@ mod crash_recovery_tests {
         let outcome = replay_gap(
             1,
             3,
+            default_genesis_header(),
             |h| headers.get(&h).cloned(),
             |h| bodies.get(&h).cloned(),
             |block| {
@@ -13465,6 +13555,10 @@ mod crash_recovery_tests {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
+            genesis_header: torus_bridge::genesis_parent_header(
+                config.evm_gas_limit,
+                config.evm_block_interval,
+            ),
             metrics: None,
             mempool,
             exec_trust_cache,
@@ -14744,7 +14838,7 @@ mod crash_recovery_tests {
             })
         };
 
-        let resp1 = app.build_proposal(torus_bridge::genesis_parent_header());
+        let resp1 = app.build_proposal(default_genesis_header());
         let hs1 = Block::new(
             hotstuff_rs::types::data_types::BlockHeight::new(0),
             PhaseCertificate::genesis_pc(),
@@ -14773,6 +14867,7 @@ mod crash_recovery_tests {
             &state_db,
             2,
             &block2.header.parent_hash,
+            &ctx.genesis_header,
             &latch
         ));
         ctx.execute_committed_block(&block2, vec![]);
@@ -14790,6 +14885,7 @@ mod crash_recovery_tests {
             &state_db,
             3,
             &forged.header.parent_hash,
+            &ctx.genesis_header,
             &AtomicBool::new(false)
         ));
         let hs2_block = Block::new(
@@ -20603,9 +20699,12 @@ mod crash_recovery_tests {
         let hs_parent = hs_block(&parent, PhaseCertificate::genesis_pc());
         let header = parent.header.clone();
         assert_eq!(
-            check_parent_link(&far.header, &justify_for(&hs_parent), move |_| {
-                ParentHeader::Header(Box::new(header))
-            }),
+            check_parent_link(
+                &far.header,
+                &justify_for(&hs_parent),
+                &app.genesis_header,
+                move |_| ParentHeader::Header(Box::new(header))
+            ),
             BlockDataCheck::Held
         );
         let datum = encode_proposal_datum(&far, false);
@@ -20644,9 +20743,12 @@ mod crash_recovery_tests {
         for (ts, want) in [(2_000, BlockDataCheck::Held), (1_999, BlockDataCheck::Invalid)] {
             let header = parent.header.clone();
             assert_eq!(
-                check_parent_link(&child_of(&parent, ts).header, &justify_for(&hs_parent), move |_| {
-                    ParentHeader::Header(Box::new(header))
-                }),
+                check_parent_link(
+                    &child_of(&parent, ts).header,
+                    &justify_for(&hs_parent),
+                    &app.genesis_header,
+                    move |_| ParentHeader::Header(Box::new(header))
+                ),
                 want,
                 "ts {ts}"
             );
@@ -20782,20 +20884,24 @@ mod crash_recovery_tests {
             );
             let header = parent.header.clone();
             assert_eq!(
-                check_parent_link(&b.header, &justify_for(&hs_parent), move |_| {
-                    ParentHeader::Header(Box::new(header))
-                }),
+                check_parent_link(
+                    &b.header,
+                    &justify_for(&hs_parent),
+                    &app.genesis_header,
+                    move |_| ParentHeader::Header(Box::new(header))
+                ),
                 BlockDataCheck::Invalid,
                 "{what}: parent link"
             );
         }
 
-        // First block: the parent is genesis_parent_header (30M, 1 gwei).
+        // First block: the parent is the genesis parent header (the config's
+        // genesis values: 3M, 1 gwei).
         let mut app = ts_app(1_700_000_000);
         let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
         let mut b1 = make_block(1, vec![]);
         b1.header.timestamp = 1_700_000_000;
-        let genesis = torus_bridge::genesis_parent_header();
+        let genesis = default_genesis_header();
         assert_eq!(b1.header.evm_gas_limit, genesis.evm_gas_limit);
         assert_eq!(b1.header.base_fee_per_gas, genesis.base_fee_per_gas);
         assert_eq!(
@@ -20805,6 +20911,49 @@ mod crash_recovery_tests {
         b1.header.evm_gas_limit = 60_000_000;
         assert_eq!(
             app.check_proposal_data(&hs_block(&b1, PhaseCertificate::genesis_pc()), no_lookup),
+            BlockDataCheck::Invalid
+        );
+    }
+
+    /// Item 7 step 1: the genesis parent header comes from the chain config
+    /// (`evm.gas_limit`, `evm.block_interval`), built once in `try_new`. The
+    /// first block an honest leader builds carries those values and passes
+    /// the pre-vote check under a genesis justify; the same block built on a
+    /// 30M genesis header is refused. RED before: the genesis parent header
+    /// was hardcoded to 30M.
+    #[test]
+    fn first_block_uses_the_configured_genesis_header() {
+        let (mut config, db) = make_test_config_and_db();
+        config.evm_gas_limit = 3_000_000;
+        config.evm_block_interval = 5;
+        let mut app = TorusApp::new(db, &config, None, None, None);
+        let genesis_hs = |resp: &ProduceBlockResponse| {
+            Block::new(
+                hotstuff_rs::types::data_types::BlockHeight::new(0),
+                PhaseCertificate::genesis_pc(),
+                resp.data_hash,
+                resp.data.clone(),
+            )
+        };
+        let no_lookup = |_: &CryptoHash| -> ParentHeader { panic!("genesis justify") };
+
+        let genesis = app.last_header.clone();
+        let resp = app.build_proposal(genesis);
+        let header = app.pending_proposals[&1].block.header.clone();
+        assert_eq!(header.evm_gas_limit, 3_000_000);
+        assert_eq!(header.evm_block_interval, 5);
+        assert_eq!(
+            app.check_proposal_data(&genesis_hs(&resp), no_lookup),
+            BlockDataCheck::Held
+        );
+
+        let resp = app.build_proposal(torus_bridge::genesis_parent_header(30_000_000, 5));
+        assert_eq!(
+            app.pending_proposals[&1].block.header.evm_gas_limit,
+            30_000_000
+        );
+        assert_eq!(
+            app.check_proposal_data(&genesis_hs(&resp), no_lookup),
             BlockDataCheck::Invalid
         );
     }
@@ -20897,24 +21046,22 @@ mod crash_recovery_tests {
                 ..torus_mempool::MempoolConfig::default()
             },
         ));
+        // Item 7 step 1: 1M-gas txs under the 3M genesis limit (was 10M under 30M),
+        // on the height-4 tip, so the child is at height 5 (on the N = 5 cadence).
         for nonce in 0..4 {
-            mempool.add_evm_tx(evm_tx_gas(nonce, 10_000_000)).unwrap();
+            mempool.add_evm_tx(evm_tx_gas(nonce, 1_000_000)).unwrap();
         }
         let mut app = TorusApp::new(db, &config, None, Some(mempool), None);
-        let parent = TorusBlock {
-            header: app.last_header.clone(),
-            native_actions: vec![],
-            evm_transactions: vec![],
-            core_writer_actions: vec![],
-        };
+        let parent = tip_2000();
+        let limit = parent.header.evm_gas_limit;
         let resp = app.build_proposal(parent.header.clone());
         let produced = app.pending_proposals[&(parent.header.height + 1)]
             .block
             .clone();
         assert_eq!(
-            produced.evm_transactions.len(),
-            3,
-            "30M header limit fits three 10M txs"
+            produced.evm_transactions.len() as u64,
+            limit / 1_000_000,
+            "the 3M header limit fits three 1M txs"
         );
         assert_eq!(produced.header.evm_tx_count, 3);
         assert_eq!(produced.header.evm_gas_limit, parent.header.evm_gas_limit);
@@ -23340,26 +23487,44 @@ mod crash_recovery_tests {
         let parent = alloy_primitives::B256::repeat_byte(0x22);
         let latch = AtomicBool::new(false);
         assert!(
-            detect_parent_link_violation(&R02FailHeaders(db.clone()), 6, &parent, &latch),
+            detect_parent_link_violation(
+                &R02FailHeaders(db.clone()),
+                6,
+                &parent,
+                &default_genesis_header(),
+                &latch
+            ),
             "a parent header read fault must fail-stop"
         );
         assert!(latch.load(Ordering::SeqCst), "fail-stop latched");
 
         // Control: no read at height 1; a missing / truncated parent allows.
         let latch = AtomicBool::new(false);
-        let genesis = alloy_primitives::keccak256(
-            torus_bridge::genesis_parent_header().canonical_header_bytes(),
-        );
+        let genesis_header = default_genesis_header();
+        let genesis = alloy_primitives::keccak256(genesis_header.canonical_header_bytes());
         assert!(!detect_parent_link_violation(
             &R02FailHeaders(db.clone()),
             1,
             &genesis,
+            &genesis_header,
             &latch
         ));
-        assert!(!detect_parent_link_violation(&db, 6, &parent, &latch));
+        assert!(!detect_parent_link_violation(
+            &db,
+            6,
+            &parent,
+            &genesis_header,
+            &latch
+        ));
         db.put_cf_raw(CF_BLOCK_HEADERS, &5u64.to_be_bytes(), &[0u8; 8])
             .unwrap();
-        assert!(!detect_parent_link_violation(&db, 6, &parent, &latch));
+        assert!(!detect_parent_link_violation(
+            &db,
+            6,
+            &parent,
+            &genesis_header,
+            &latch
+        ));
         assert!(!latch.load(Ordering::SeqCst));
     }
 

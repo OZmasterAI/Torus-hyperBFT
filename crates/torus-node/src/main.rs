@@ -384,7 +384,8 @@ fn default_chain_config() -> ChainConfig {
     ChainConfig {
         chain_id: torus_evm::TORUS_CHAIN_ID,
         chain_name: "torus".to_string(),
-        evm_gas_limit: 30_000_000,
+        evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
+        evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
         base_fee_per_gas: 1_000_000_000,
         epoch_length: 100_000,
         max_validators: 21,

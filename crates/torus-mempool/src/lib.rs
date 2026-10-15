@@ -119,7 +119,7 @@ impl Default for MempoolConfig {
             max_per_sender: 16,
             replacement_bump_pct: 10,
             chain_id: torus_types::eip712::TORUS_CHAIN_ID,
-            block_gas_limit: 30_000_000,
+            block_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
             initial_base_fee: 1_000_000_000,
             evm_block_gas_budget: rate_limit::evm_block_gas_budget(),
             evm_sender_share_pct: rate_limit::evm_sender_share_pct(),

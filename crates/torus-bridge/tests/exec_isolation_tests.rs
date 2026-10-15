@@ -90,6 +90,7 @@ fn block_with_txs(evm_transactions: Vec<Vec<u8>>) -> TorusBlock {
             evm_gas_used: 0,
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
+            evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
             native_action_count: 0,
             evm_tx_count: evm_transactions.len() as u32,
             base_fee_per_gas: 1_000_000_000,
