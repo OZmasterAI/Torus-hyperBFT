@@ -10798,6 +10798,249 @@ Artifacts: cells `~/bench-results-matched/ozarchy-liq2-300m-*`, run dir `ozarchy
 `ozarchy-liq2-stage/`, build `ozarchy-liq2-build/`. Per cell: `liq-stress.json`, `liq-lines-val*.txt`,
 `value-sum-val*.txt`, `metrics-1hz.txt.gz`.
 
+## 73. ozarchy-p4j4 job 4: exec-aware admission horizon sweep and jemalloc decay cost (main `bdd59888`, 300 markets, oracle on, commit tail depth 1, 120 s cells, campaign ozarchy-p4j4, archy, 2026-10-15)
+
+**No exec-aware horizon beats both A and W on latency without losing matched/s.** E20 (horizon 20 s) does nothing
+at this load: it sheds 0-863 actions in the window and equals A within noise on every metric (matched/s -1.0%
+[-3.3, +1.3]). E5 and E2 cut median latency and exec lag in seconds but lose a third and a half of matched/s
+(-33.1% [-40.0, -26.1], -51.1% [-58.3, -43.9]). They also almost double the commit-age p99 (38.0 / 36.1 s vs 19.5 s),
+because the wait moves into the bench's BUSY retries (admit-age p99 39.3 / 38.0 s vs 3.0 s). W (exec throttle
+8,16,24) loses -8.0% [-9.5, -6.5] matched/s. It has the best exec-age p50 (5.1 s vs 17.3 s) and the worst tails:
+commit p99 48.7 s, exec p99 50.3 s, 9,836 nonce evictions per cell. Exec lag in heights stays near the channel bound
+in every arm except W: A 61.6, E20 61.0, E5 52.1, E2 57.8, W 38.6 (bound 66). In seconds: A 14.0, E20 14.0, E5 9.1,
+E2 4.2, W 3.2. **jemalloc decay costs throughput at this exec-bound load:** `dirty_decay_ms:1000,muzzy_decay_ms:1000`
+(M1) gives -7.1% [-10.8, -3.4] matched/s, +3.7% CPU-s/1M and -21% RSS mean. `dirty_decay_ms:0` (M0) gives -30.7%
+[-32.8, -28.6] matched/s, +27.4% CPU-s/1M, -43% RSS mean and +80% commit-interval p95. Restart time after SIGKILL was
+**not measured** (no kill cells).
+
+Question (job 4 for archy). Part 1: does exec-aware native admission (`TORUS_ADMISSION_EXEC_AWARE=1`, merged opt-in in
+`e72a5021`) at `TORUS_ADMISSION_HORIZON_MS` 20000 / 5000 / 2000 beat the exec-throttle reference W and the defaults A on
+order latency without losing matched/s? What is the exec lag per arm in heights at steady state? Part 2: what do the
+jemalloc decay settings via `MALLOC_CONF` cost (matched/s, CPU-s/1M, RSS, block-time p99)? The stretch liq-stress pair
+was not run: it needs the liq2 harness branch and its own driver.
+
+Arms (one node build for all arms: origin/main `bdd59888`, node `03a2b757`, worktree `wt/p4j4-bdd59888`; it contains
+`e72a5021` (exec-aware admission) and the header-persist fix `46bb3a40`. Bench: the p4j3 build `ff822b95` (release
+timing + tail depth, not on main), bench `9b725823`. Node md5 `03a2b757` src = dst in every cell. The env was checked
+per cell in `node-env-all.txt` / `node-preload.txt` on all 3 nodes):
+
+| arm | env | cells (part, n) |
+|---|---|---|
+| A | defaults (no admission env) | part 1, n = 3 (+ warm-up w1) |
+| E20 | `TORUS_ADMISSION_EXEC_AWARE=1 TORUS_ADMISSION_HORIZON_MS=20000` | part 1, n = 3 |
+| E5 | `TORUS_ADMISSION_EXEC_AWARE=1 TORUS_ADMISSION_HORIZON_MS=5000` | part 1, n = 3 |
+| E2 | `TORUS_ADMISSION_EXEC_AWARE=1 TORUS_ADMISSION_HORIZON_MS=2000` | part 1, n = 3 |
+| W | `TORUS_EXEC_THROTTLE_WATERMARKS=8,16,24` | part 1, n = 3 |
+| J | `MALLOC_CONF` unset (jemalloc defaults) | part 2, n = 3 (+ warm-up w1) |
+| M1 | `MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000` | part 2, n = 3 |
+| M0 | `MALLOC_CONF=dirty_decay_ms:0` | part 2, n = 3 |
+
+Settings (every cell): 300 markets, 120 s, rate 76,000, 5,000 senders, BLOCK_CAP 400, MAX_IN_FLIGHT 4,
+OPEN_ORDER_BUDGET 900, RETRY_BUSY 1, commit tail depth 1, CLOID_SHARE 0, oracle feed on (30000, 2,000 ms, walk 0),
+jemalloc compiled in, 15 s checkpoint default, `TORUS_ROCKSDB_STATS=2` at 1 s. Dirty writeback was at the host values
+`vm.dirty_bytes` 256 MiB / `dirty_background_bytes` 64 MiB in every cell, not the job-3 phase-2 2 GiB / 512 MiB (sudo
+unavailable). Harness: the frozen p4j3 copy (`2a245321`). Drivers `ozarchy-p4j4-{pilot,h,d}-campaign.sh`. Part 1 cells
+ran 04:16-05:52 UTC in a rotated order (w1, r1-A, r1-E20, r1-E5, r1-E2, r1-W, r2-E20, r2-E5, r2-E2, r2-W, r2-A, r3-E5,
+r3-E2, r3-W, r3-A, r3-E20). Part 2 ran 06:08-07:04 (w1, r1-J, r1-M1, r1-M0, r2-M1, r2-M0, r2-J, r3-M0, r3-J, r3-M1).
+
+Checks (from the raw cell files, not the launcher tables): all 26 grid cells and both pilot cells have rc 0, ACCEPT,
+liveness PASS, AGREE, drained, bench_rc 0 and node md5 `03a2b757`. The node logs have no panic or fatal line. No
+`CELL-FLAG`, no rerun in the final logs. The first part 2 attempt stopped at r1-M1 on a harness check bug (it read
+`MALLOC_CONF` from `node-env-all.txt`, which holds `TORUS_*` only). Its 3 cells (`ozarchy-p4j4-run/d-attempt1-heapchk/`)
+are not data and are not used here. Part 2 was re-run as a clean 10-cell grid, and its `node-preload.txt` shows the
+arm's `MALLOC_CONF` on the 3 nodes (none on J). Pilot (`ozarchy-p4j4-run/pilot`, arm A, pa0 and w1): 220,197 and
+221,582 matched/s, exec queue mean 61.6 and 61.1, max 66, i.e. the exec backlog that this grid targets. The pilot
+is not in the stats.
+
+Definitions. matched/s = the summary headline (bench load window). Shed, exec lag, RSS and the commit-interval
+histogram p99 use the steady window `[t_bench0 + 10 s, t_bench1]`. Order age = node time minus the action's nonce,
+which the bench stamps at signing: it includes BUSY retry time (the bench resends the same payload every 50 ms for up
+to 30 s, `RETRY_BUSY_MAX_AGE`). Commit / exec / admit p50 are val0's; p99 is the max over the 3 nodes. Block p99 =
+commit-interval p99 from the 1 Hz histogram delta, max over nodes. The buckets step by a factor 2, so it is an upper
+bound (2048 means "between 1024 and 2048 ms"). Shed = `torus_rpc_submit_admit_rejects_total{reason="backlog_preverify"}`
+window delta, summed over the 3 nodes. It counts one per rejected signed action per attempt, retries included, so it
+counts rejects, not lost orders. Lost actions are `released_refused` (the bench gave up after 30 s or at its deadline).
+Expiries = node nonce evictions (sum over nodes) and bench in-flight slots released on timeout. CIs: 95%, difference
+of means, SE = sqrt(sd1^2/3 + sd2^2/3), t = 4.303 (df = 2, conservative); `*` = CI excludes 0.
+
+### 73.1 Part 1 cells (run order)
+
+| cell | arm | matched/s | incl drain | submit/s | placed/s | native blk/s | shed (window) | refused | exec queue mean |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 224,005 | 214,191 | 1,412 | 293,568 | 4.41 | 0 | 36 | 61.4 |
+| r1-A | A | 223,080 | 214,797 | 1,416 | 291,814 | 4.11 | 0 | 0 | 61.2 |
+| r1-E20 | E20 | 219,819 | 213,752 | 1,400 | 288,132 | 4.17 | 0 | 1 | 60.9 |
+| r1-E5 | E5 | 144,424 | 133,134 | 749 | 190,038 | 5.65 | 2,721,228 | 4,400 | 53.5 |
+| r1-E2 | E2 | 116,913 | 106,014 | 625 | 158,206 | 13.89 | 2,858,861 | 12,684 | 54.5 |
+| r1-W | W | 206,935 | 196,410 | 2,116 | 271,175 | 11.43 | 0 | 3 | 38.4 |
+| r2-E20 | E20 | 222,120 | 212,371 | 1,414 | 290,916 | 4.33 | 863 | 85 | 61.3 |
+| r2-E5 | E5 | 156,657 | 146,855 | 843 | 206,095 | 5.81 | 2,472,739 | 2,959 | 51.8 |
+| r2-E2 | E2 | 104,972 | 96,802 | 558 | 141,021 | 13.33 | 3,097,277 | 14,142 | 61.0 |
+| r2-W | W | 205,141 | 195,772 | 2,098 | 268,796 | 11.43 | 0 | 1 | 38.8 |
+| r2-A | A | 224,430 | 212,432 | 1,416 | 294,234 | 4.22 | 0 | 11 | 61.7 |
+| r3-E5 | E5 | 148,959 | 145,665 | 860 | 196,256 | 5.52 | 2,392,320 | 3,513 | 51.0 |
+| r3-E2 | E2 | 106,826 | 100,137 | 580 | 142,991 | 13.20 | 2,957,270 | 14,594 | 57.9 |
+| r3-W | W | 206,621 | 197,004 | 2,112 | 270,451 | 11.60 | 0 | 4 | 38.7 |
+| r3-A | A | 224,850 | 213,427 | 1,422 | 294,314 | 4.30 | 0 | 42 | 61.8 |
+| r3-E20 | E20 | 223,545 | 214,225 | 1,402 | 292,854 | 4.19 | 0 | 66 | 60.9 |
+
+submit/s = bench actions submitted per second. The load generator ran evenly within every arm: A 1,412-1,422,
+E20 1,400-1,414, W 2,098-2,116. E5 (749-860) and E2 (558-625) are lower by design, because shedding closes the bench's
+loop. A and E20 also shed (A 0-2,167 per node, E20 up to 6,252), but only in the first 10 s after bench start (the
+startup ramp), so the window counts 0. No drift over the campaign: A 223,080 -> 224,430 -> 224,850 at 04:22 / 05:16 /
+05:40 (+0.8%, inside the steps below). Same config in part 2 (J) gives 225,327, +0.5% vs A.
+
+### 73.2 Part 1 per arm (n = 3; mean, sd; difference vs A with 95% CI)
+
+| | A | E20 | E5 | E2 | W |
+|---|---|---|---|---|---|
+| matched/s | 224,120 (sd 924) | 221,828 (1,880); -1.0% [-3.3, +1.3] | 150,013 (6,184); **-33.1% [-40.0, -26.1]** * | 109,570 (6,426); **-51.1% [-58.3, -43.9]** * | 206,232 (958); **-8.0% [-9.5, -6.5]** * |
+| submit/s | 1,418 | 1,405; -0.9% [-2.4, +0.6] | 817; -42.4% * | 588; -58.6% * | 2,109; +48.7% * |
+| native blk/s | 4.21 | 4.23 | 5.66 * | 13.48 * | 11.49 * |
+| order age commit p50 / p99 (ms) | 3,597 / 19,500 | 3,562 / 19,414 | 2,256 / 38,048 | 1,128 / 36,128 | 2,673 / 48,707 |
+| diff commit p50 (ms) | | -34 [-877, +809] | -1,341 [-2,473, -209] * | -2,469 [-3,294, -1,644] * | -923 [-1,745, -102] * |
+| diff commit p99 (ms) | | -85 [-307, +136] | +18,548 [+18,090, +19,010] * | +16,630 [+15,240, +18,020] * | +29,210 [+18,240, +40,170] * |
+| order age exec p50 / p99 (ms) | 17,325 / 40,392 | 17,393 / 40,395 | 13,457 / 39,959 | 6,345 / 38,062 | 5,059 / 50,251 |
+| diff exec p50 (ms) | | +68 [-1,203, +1,340] | -3,868 [-5,405, -2,330] * | -10,980 [-14,250, -7,713] * | -12,270 [-12,990, -11,540] * |
+| diff exec p99 (ms) | | +3 [-68, +74] | -433 [-1,605, +740] | -2,330 [-3,490, -1,170] * | +9,859 [+3,831, +15,890] * |
+| order age admit p99 (ms) | 2,970 | 2,811 | 39,298 * | 38,017 * | 2,604 |
+| block p95 (headline, ms) | 922 | 909 | 888 | 381 * | 403 * |
+| block p99 (hist, upper bound, ms; 3 cells) | 2048, 2048, 2048 | 2048 x3 | 2048 x3 | 1024 x3 | 1024, 2048, 1024 |
+| expiries: nonce evictions / in-flight timeouts | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | **9,836 / 3,267** |
+| shed (window, 3 nodes) | 0 | 288 (0, 863, 0) | 2.53 M | 2.97 M | 0 |
+| refused (lost actions) | 18 | 51 | 3,624 | 13,807 | 3 |
+| CPU-s per 1M matched | 22.91 | 22.97 (+0.2%) | 41.13 (+79.5% *) | 56.49 (+146.6% *) | 25.42 (+10.9% [+8.5, +13.4] *) |
+| RSS mean / peak (MiB) | 5,134 / 6,656 | 5,036 / 6,610 | 3,368 / 4,754 | 2,606 / 3,281 | 4,253 / 5,641 |
+| RSS slope (MiB/min, 120 s window) | +937 | +801 | -56 | +41 | +456 |
+| consensus timeouts | 8.3 | 7.7 | 10.3 | 8.3 | **19.3** * |
+
+E2 and E5 against W (the throttle reference): matched/s -46.9% [-54.7, -39.0] and -27.3% [-34.8, -19.7]. E2's commit p50
+is -1,546 ms [-1,640, -1,452] vs W, its commit p99 -12,580 ms [-23,630, -1,528], its exec p99 -12,190 [-18,330, -6,050].
+Its exec p50 is not resolved vs W (+1,286 [-1,901, +4,472]).
+
+Why E5 / E2 lose matched/s: the exec thread is 97-99% busy in every arm, so matched/s is fills per exec-second. Shedding
+shrinks the blocks (fills per native block A 50,839, E5 21,145, E2 7,066). Per-fill engine cost rises 3.35 -> 5.11 / 6.26
+ms per 1k fills, and exec per block falls only 218 -> 136 / 63 ms. 1 s / 63 ms x 7,066 fills is about 112k per second
+for E2 vs 1 s / 218 ms x 50,839 = 233k for A: that ratio (0.48) covers the -51% step. W keeps 3.35 ms per 1k fills at
+17,332 fills per block. Why the per-fill cost rises under shedding was not traced. Exec-aware counters
+(`torus_mempool_native_committed_unexecuted`, mean over the window): E20 10,600-11,000, E5 4,300-4,600, E2 1,400-1,500.
+
+### 73.3 Exec lag per arm (heights and seconds)
+
+`torus_exec_queue_depth` is the exact committed-minus-executed lag in heights in these cells. Code at `bdd59888`
+(`crates/torus-consensus/src/app.rs`): the dispatch path does `exec_queue_depth.inc()` before the send (~8054) and the
+exec thread does `dec()` after executing the block (~4632). `TORUS_EXEC_NONBLOCKING_DISPATCH` (`nonblocking_exec_dispatch`,
+~805) is unset in every cell, so dispatch is the blocking `tx.send`. The `try_send` + park branch (~8058-8068, the only
+place that increments `torus_exec_dispatch_deferred_total`) never runs. The 1 Hz series agree: `parks_total` is 0 in
+every row of every `exec-lag-series.tsv` (grid and pilot). On a full channel the consensus thread blocks inside
+`send`, so no committed height sits outside the gauge. Its ceiling is 66 = 64 in the channel (`EXEC_QUEUE_DEPTH`,
+`torus-mempool/src/rate_limit.rs:363`) + 1 executing + 1 in the blocked send. `torus_block_height`,
+`torus_blocks_committed_total` and `torus_exec_block_seconds_count` are set in `execute_committed_block_with` (~4524-4536,
+exec thread), so they count executed height. Their 1 Hz rates are equal in every cell. Seconds = heights / executed
+native blk/s.
+
+| arm | queue mean (heights, window, 3 nodes x 3 cells) | p99 / max | lag seconds | 10 s bins from bench start (t = 10 .. 120 s), mean of 9 node-cells |
+|---|---|---|---|---|
+| A | 61.6 (cells 61.2-61.8) | 66 / 66 | 14.0 | 55 56 57 64 61 63 63 64 65 64 64 65 |
+| E20 | 61.0 (60.9-61.3) | 66 / 66 | 14.0 | 57 55 57 65 59 63 63 64 64 64 62 64 |
+| E5 | 52.1 (51.0-53.5) | 66 / 66 | 9.1 | 51 65 61 29 56 65 55 27 60 63 46 42 (sawtooth, shed on / off) |
+| E2 | 57.8 (54.5-61.0) | 66 / 66 | 4.2 | 56 57 58 58 58 59 56 59 58 58 58 28 |
+| W | 38.6 (38.4-38.8) | 66 / 66 | 3.2 | 41 39 39 40 39 36 37 37 39 38 38 35 |
+| J | 60.1 (58.9-61.6) | 66 / 66 | 12.8 | (20 s bins) 52 62 62 63 64 59 |
+| M1 | 57.7 (54.9-61.4) | 66 / 66 | 13.0 | 52 57 58 59 60 61 |
+| M0 | 57.5 (57.1-58.2) | 66 / 66 | 17.2 (+4.4 [+1.5, +7.4] vs J *) | 56 57 57 57 60 58 |
+
+Diff vs A in heights: E20 -0.5 [-1.6, +0.5], E5 -9.5 [-12.7, -6.2] *, E2 -3.8 [-11.9, +4.4] (not resolved), W -22.9
+[-23.9, -21.9] *. In seconds every arm except E20 is well below A (E5 -4.8 s, E2 -9.8 s, W -10.8 s, all *). The exec-aware
+arms bound the committed work in actions, not in heights: E2's lag stays at 58 heights, but of blocks 1/7 the size.
+
+### 73.4 Part 2: jemalloc decay (n = 3; difference vs J with 95% CI)
+
+| cell | arm | matched/s | incl drain | submit/s | placed/s | native blk/s | shed (window) |
+|---|---|---|---|---|---|---|---|
+| w1 | J | 230,635 | 211,565 | 1,334 | 302,760 | 5.20 | 0 |
+| r1-J | J | 225,590 | 212,204 | 1,363 | 296,222 | 4.90 | 0 |
+| r1-M1 | M1 | 212,671 | 198,856 | 1,325 | 278,628 | 4.69 | 0 |
+| r1-M0 | M0 | 156,686 | 147,403 | 1,003 | 205,437 | 3.35 | 0 |
+| r2-M1 | M1 | 207,848 | 203,698 | 1,358 | 272,416 | 3.97 | 0 |
+| r2-M0 | M0 | 155,775 | 146,989 | 1,007 | 203,879 | 3.30 | 523 |
+| r2-J | J | 223,386 | 213,603 | 1,414 | 292,690 | 4.30 | 0 |
+| r3-M0 | M0 | 155,943 | 146,912 | 1,012 | 204,424 | 3.29 | 0 |
+| r3-J | J | 227,005 | 214,014 | 1,416 | 297,474 | 4.35 | 0 |
+| r3-M1 | M1 | 207,755 | 199,431 | 1,340 | 272,164 | 4.46 | 0 |
+
+| | J | M1 (dirty 1000 / muzzy 1000 ms) | M0 (dirty 0) |
+|---|---|---|---|
+| matched/s | 225,327 (sd 1,823) | 209,425 (2,812); **-7.1% [-10.8, -3.4]** * | 156,134 (485); **-30.7% [-32.8, -28.6]** * |
+| CPU-s per 1M matched | 23.04 | 23.90; **+3.7% [+1.6, +5.9]** * | 29.36; **+27.4% [+26.8, +28.1]** * |
+| RSS mean (MiB, window, mean of 3 nodes) | 4,945 | 3,886; -1,060 [-1,578, -541] (-21.4%) * | 2,835; -2,110 [-2,491, -1,729] (-42.7%) * |
+| RSS peak (MiB, max over nodes) | 6,589 | 5,071; -1,518 [-2,352, -684] (-23.0%) * | 3,555; -3,034 [-3,849, -2,219] (-46.0%) * |
+| RSS slope (MiB/min, 120 s) | +664 (sd 221) | +558; -105 [-654, +444] | +360; -304 [-865, +257] |
+| block p95 (headline, ms) | 911 | 985; +74 [-119, +266] | 1,644; **+733 [+592, +874]** * |
+| block p99 (hist, upper bound, ms; 3 cells) | 2048 x3 | 2048 x3 | 2048, 4096, 4096 |
+| order age commit p50 / p99 (ms) | 3,500 / 18,412 | 3,901 / 19,164 | 4,926 (+1,427 [+287, +2,567] *) / 20,239 |
+| order age exec p50 / p99 (ms) | 15,962 / 39,953 | 16,309 / 40,294 | 19,244 / 41,981 (both not resolved) |
+| native blk/s | 4.52 | 4.37 | 3.32 (-1.20 [-2.04, -0.36] *) |
+| exec ms per block (`chain_ms`) / engine ms per 1k fills | 199.9 / 3.36 | 213.4 / 3.55 | 275.2 / 4.47 |
+
+The decay cost lands on the exec thread, the bottleneck. Exec per block is +6.8% (M1) and +38% (M0) at about the same
+fills per block (46.5k, 47.1k, 45.1k), and that covers the -7.1% / -30.7% matched/s. M1's block p99 is not changed at
+histogram resolution. M0 moves 2 of 3 cells into the 2-4 s bucket, and its p95 is +80%. Section 62 Part B
+(`background_thread:true,dirty_decay_ms:1000`, n = 1, 600 s, Phase 3 node) saw +4.6% CPU-s/1M and -2.5% matched/s. M1's
+CPU step here is similar (+3.7%), while its matched/s step is larger and resolved at n = 3.
+
+### 73.5 Verdict and recommendation
+
+* **Exec-aware admission: do not enable it at 2-5 s, and 20 s is inert at this load.** No horizon beats A and W on
+  latency without losing matched/s. E20 = A within noise (matched/s, latency, lag, CPU, RSS). E5 / E2 lower the median
+  ages (commit p50 -37% / -69%, exec p50 -22% / -63%), exec lag in seconds (9.1 / 4.2 s vs 14.0 s) and RSS (-34% / -49%).
+  They pay -33% / -51% matched/s, 1.8x / 2.5x the CPU-s/1M, a commit p99 near 2x A's (the retry wait), and 3.6k / 13.8k
+  refused actions per cell. Against W, E2 has the better commit p50 and p99 but less than half W's matched/s. Ranking
+  beyond this is not supported. A keeps the best matched/s and commit p99. W buys the lowest exec p50 and lag for -8%
+  matched/s and the worst tails plus nonce expiries.
+* **The useful horizon, if any, lies between 5 s and 20 s.** 20 s never triggers in steady state. 5 s already sheds
+  2.5 M rejects per window and oscillates (queue sawtooth 27-65). Next cells: E10 and E14 (and E7 if E10 still loses
+  matched/s), n = 3 each + A in rotation, 120 s, about 5.8 min per cell: ~1 h 10 min for 12 cells.
+* **jemalloc decay is not free at this load:** M1 -7.1% matched/s for -21% RSS mean and -23% peak. M0 -30.7%
+  matched/s, +27% CPU and +80% block p95 for -43% / -46%. Keep the defaults for throughput. If RSS matters more, M1 is
+  the only candidate, and it is a throughput regression outside noise.
+
+Confidence: **high** for the matched/s, CPU and RSS steps (all CIs exclude 0 by a wide margin, n = 3 per arm, flat A /
+J replicates, A and J agree across the two parts) and for E20 = A. **Medium** for the latency reading: the p99s
+include bench retry time by construction, the buckets are coarse, and the p50s come from val0 only. **Low** for any
+claim about block p99 (factor-2 buckets).
+
+### 73.6 Caveats
+
+- Node = origin/main `bdd59888`, which has the header-persist fix `46bb3a40`. The p4j3 numbers (node `2a245321`,
+  section 71) are a different baseline: do not compare absolute figures.
+- Bench = the p4j3 `ff822b95` build (release timing + tail depth), not on main. Harness = the frozen p4j3 copy
+  `2a245321` (`run-cell.sh` on main has 28 more lines, not used).
+- Dirty writeback at the host values 256 MiB / 64 MiB, not job 3's phase-2 2 GiB / 512 MiB (sudo unavailable). Same in
+  all arms.
+- 120 s cells. RSS slope is over a ~110 s window: A grows ~0.9 GiB/min in-window, E5 / E2 are flat. This is warm-up
+  growth, not a leak verdict. Long soaks would be needed for steady-state RSS.
+- The decay arms export `MALLOC_CONF` into the bench client process too. The bench binary has no jemalloc symbols
+  (`nm`: 0 `_rjem_`), so under glibc malloc it most likely ignores `MALLOC_CONF`. Not tested.
+- RETRY_BUSY 1: shed counts are rejects, retries included, not lost orders. Lost actions are the `refused` column.
+  Order ages include the retry time (nonce stamped at signing).
+- Exec lag = queue depth holds only with `TORUS_EXEC_NONBLOCKING_DISPATCH` unset (blocking send). With the rank-2 park
+  on, parked heights would sit outside the gauge.
+- matched/s is the summary headline (load window). Shed, lag, RSS and histogram p99 use `t_bench0 + 10 s .. t_bench1`.
+  The RSS figures here are from `mem-samples.txt` (VmRSS, window, MiB). The `rss_mean_GB` column of
+  `handoff-tables.txt` (a-cells) is a different window / unit and reads lower.
+- Restart time after SIGKILL was **not measured** (no kill cells in part 2).
+
+### 73.7 Files
+
+Run dir `~/bench-results-matched/ozarchy-p4j4-run/` (`handoff.json`, `handoff-tables.txt`, `campaign.log` = part 2
+final, `h/` and `d/` with `cells.tsv` and `cell-step/*.analysis.json`, `pilot/`. Part 1's campaign log is the chained
+`d-attempt1-heapchk/campaign-attempt1.log`. `d-attempt1-heapchk/` also holds the stopped decay attempt, not data).
+Cells `~/bench-results-matched/ozarchy-p4j4h-300m-*` (part 1), `ozarchy-p4j4d-300m-*` (part 2),
+`ozarchy-p4j4pilot-300m-*` (pilot). Per cell: `summary.json`, `metrics-1hz.txt.gz`, `exec-lag-series.tsv`,
+`mem-samples.txt`, `node-env-all.txt`, `node-preload.txt`. Tools `ozarchy-p4j4-tools/` (drivers, `analyst/handoff_tables.py`,
+`execlag.py`, `rss.py`, `a-cells.py`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
