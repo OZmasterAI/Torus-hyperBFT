@@ -5747,9 +5747,8 @@ impl TorusApp {
         exec_validator.metrics = metrics.clone();
         // Item 7 step 1: the genesis parent header from the genesis EVM values. Every
         // user (vote, insertion, execution, crash replay) takes this one value, or
-        // block 1 fails to link.
-        let genesis_header =
-            torus_bridge::genesis_parent_header(config.evm_gas_limit, config.evm_block_interval);
+        // block 1 fails to link. Item 7 step 2: M and the big limit too.
+        let genesis_header = torus_bridge::genesis_parent_header_for(config);
         let mut exec_ctx = ExecutionContext {
             state_db: state_db.clone(),
             validator: exec_validator,
@@ -6292,6 +6291,8 @@ impl TorusApp {
             chain_name: "torus-test".to_string(),
             evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
             evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+            evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -7407,9 +7408,14 @@ impl TorusApp {
                 evm_fee_revenue: 0,
                 evm_gas_limit,
                 evm_block_interval,
+                // Item 7 step 2: the parent's big-lane values until the six-value
+                // boundary rule (B6) resolves them from the epoch plan.
+                evm_big_block_interval: parent_header.evm_big_block_interval,
+                evm_big_gas_limit: parent_header.evm_big_gas_limit,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: evm_txs.len() as u32,
                 base_fee_per_gas: parent_header.base_fee_per_gas,
+                big_base_fee_per_gas: parent_header.big_base_fee_per_gas,
                 epoch: parent_header.epoch,
                 validator_set_hash: parent_header.validator_set_hash,
                 sig_attestation,
@@ -8948,6 +8954,8 @@ mod exec_throttle_tests {
                 chain_name: "throttle-test".to_string(),
                 evm_gas_limit: 30_000_000,
                 evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
+                evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+                evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
                 base_fee_per_gas: 1_000_000_000,
                 epoch_length: 100,
                 max_validators: 4,
@@ -9119,9 +9127,12 @@ mod exec_dispatch_tests {
                 evm_fee_revenue: 0,
                 evm_gas_limit: 30_000_000,
                 evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
+                evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+                evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,
+                big_base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
                 sig_attestation: [0u8; 64],
@@ -10320,6 +10331,8 @@ mod crash_recovery_tests {
             chain_name: "crash-test".to_string(),
             evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
             evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+            evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
             base_fee_per_gas: 1_000_000_000,
             epoch_length: 100,
             max_validators: 4,
@@ -10396,9 +10409,12 @@ mod crash_recovery_tests {
                 evm_fee_revenue: 0,
                 evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
                 evm_block_interval: TEST_EVM_BLOCK_INTERVAL,
+                evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+                evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: 0,
                 base_fee_per_gas: 1_000_000_000,
+                big_base_fee_per_gas: 1_000_000_000,
                 epoch: 0,
                 validator_set_hash: B256::ZERO,
                 sig_attestation: [0u8; 64],
@@ -13935,10 +13951,7 @@ mod crash_recovery_tests {
             max_validators: config.max_validators,
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
-            genesis_header: torus_bridge::genesis_parent_header(
-                config.evm_gas_limit,
-                config.evm_block_interval,
-            ),
+            genesis_header: torus_bridge::genesis_parent_header_for(config),
             metrics: None,
             mempool,
             exec_trust_cache,
