@@ -122,7 +122,15 @@ impl NativeActionResult {
     /// filled with the rest cancelled (HL: filled), pending trigger. Either
     /// way it costs the executed order's gas: the label changes no total.
     fn placed(result: &PlaceResult) -> Self {
-        match result.reject {
+        Self::placed_reject(result.reject)
+    }
+
+    /// [`Self::placed`] from the book's reject alone, all it reads: the one
+    /// value builder of pass B's inline write and of its s58 deferred write
+    /// (`TORUS_SETTLE_DEFER_RESULTS`).
+    #[inline]
+    fn placed_reject(reject: Option<FailureReason>) -> Self {
+        match reject {
             None => Self::ok("place_order", PLACE_ORDER_GAS),
             // The message is the reason's canonical one (torus-state, one
             // table for the executor and the action status record).
@@ -580,6 +588,163 @@ fn settle_worker_cap() -> usize {
     crate::market_workers::MarketWorkerPool::resolve_worker_cap_named(Some(
         "TORUS_SETTLE_WORKERS",
     ))
+}
+
+/// s58 settle-passb-deferred-results-scatter: pure parse of
+/// `TORUS_SETTLE_DEFER_RESULTS`. Only the trimmed value `1` turns it on;
+/// unset (or anything else) keeps pass B's inline results write.
+fn parse_settle_defer_results(v: Option<String>) -> bool {
+    matches!(v.as_deref().map(str::trim), Some("1"))
+}
+
+thread_local! {
+    /// s58: [`with_settle_defer_results`]'s per-thread pin; `None` = the env.
+    static SETTLE_DEFER_RESULTS_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// s58: runs `f` with the deferred-results flag pinned to `on` on this
+/// thread (tests and differential runs: env vars are per process and race
+/// across test threads). Pass B runs on the calling thread, so the pin
+/// reaches it. The previous pin comes back when `f` returns or unwinds.
+#[doc(hidden)]
+pub fn with_settle_defer_results<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SETTLE_DEFER_RESULTS_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SETTLE_DEFER_RESULTS_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// s58 (`TORUS_SETTLE_DEFER_RESULTS=1`, node-local, default off): the
+/// parallel settle's pass B records each placed order's book reject (1 byte
+/// per flat action) and writes every placed result in ONE sequential pass
+/// after its market loop, instead of one 56-byte write per order at a stride
+/// of about a market's slots (markets ascend; the bench draws a market per
+/// order), where the old slot's drop-glue load missed on every write. Same
+/// values, same slots: only the write order changes. The thread's pin if
+/// set, else the env read once per process.
+fn settle_defer_results_enabled() -> bool {
+    if let Some(on) = SETTLE_DEFER_RESULTS_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok());
+        tracing::info!(
+            on,
+            "TORUS_SETTLE_DEFER_RESULTS: settle pass B deferred results write"
+        );
+        on
+    })
+}
+
+#[cfg(test)]
+mod settle_defer_results_flag_tests {
+    use super::{
+        parse_settle_defer_results, settle_defer_results_enabled, with_settle_defer_results,
+        FailureReason, FixedPoint, NativeActionResult, OrderStatus, PlaceResult,
+        SETTLE_DEFER_RESULTS_PIN,
+    };
+
+    fn pin() -> Option<bool> {
+        SETTLE_DEFER_RESULTS_PIN.with(|c| c.get())
+    }
+
+    /// Only the trimmed value `1` turns the flag on; unset is today's code.
+    #[test]
+    fn parse_only_trimmed_one_is_on() {
+        assert!(!parse_settle_defer_results(None));
+        for off in ["", " ", "0", "true", "on", "yes", "2", "01", "1x", "-1"] {
+            assert!(
+                !parse_settle_defer_results(Some(off.to_string())),
+                "{off:?}"
+            );
+        }
+        for on in ["1", " 1", "1 ", " 1 ", "\t1\n"] {
+            assert!(parse_settle_defer_results(Some(on.to_string())), "{on:?}");
+        }
+    }
+
+    /// Unpinned, the flag is the env's (read once per process).
+    #[test]
+    fn unpinned_follows_env() {
+        assert_eq!(pin(), None);
+        assert_eq!(
+            settle_defer_results_enabled(),
+            parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok())
+        );
+    }
+
+    /// The pin wins over the env, nests, restores the previous pin on the
+    /// way out (a panic included) and stays on its own thread.
+    #[test]
+    fn pin_overrides_nests_and_restores() {
+        assert_eq!(pin(), None);
+        with_settle_defer_results(true, || {
+            assert!(settle_defer_results_enabled());
+            with_settle_defer_results(false, || {
+                assert!(!settle_defer_results_enabled());
+                assert_eq!(pin(), Some(false));
+            });
+            assert_eq!(pin(), Some(true));
+            std::thread::spawn(|| assert_eq!(pin(), None))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(pin(), None);
+
+        let caught = std::panic::catch_unwind(|| {
+            with_settle_defer_results(true, || -> () { panic!("inside the pin") })
+        });
+        assert!(caught.is_err());
+        assert_eq!(pin(), None, "a panic must not leak the pin");
+    }
+
+    /// The deferred record is 1 byte per flat action (~90 KB at 300 markets
+    /// x 600 s: an L2-sized side buffer next to the result slots).
+    #[test]
+    fn deferred_record_is_one_byte() {
+        assert_eq!(std::mem::size_of::<Option<Option<FailureReason>>>(), 1);
+    }
+
+    /// The deferred write and the inline write build the same value:
+    /// `placed_reject(r)` == `placed(&PlaceResult { reject: r, .. })`, field
+    /// by field, for `None` and every `FailureReason`.
+    #[test]
+    fn placed_reject_equals_placed() {
+        let every: Vec<FailureReason> = (0..=15u8).map(FailureReason::from_u8).collect();
+        for (code, r) in every.iter().enumerate() {
+            assert_eq!(*r as u8 as usize, code, "from_u8 must cover all 16 codes");
+        }
+        for reject in std::iter::once(None).chain(every.into_iter().map(Some)) {
+            let result = PlaceResult {
+                order_id: 7,
+                status: if reject.is_some() {
+                    OrderStatus::Rejected
+                } else {
+                    OrderStatus::Filled
+                },
+                fills: vec![],
+                self_trade_cancels: vec![],
+                rested_qty: FixedPoint::ZERO,
+                reduce_only_cuts: vec![],
+                triggered_stops: vec![],
+                margin_cancels: vec![],
+                margin_cut_price: None,
+                reject,
+            };
+            let row =
+                |a: NativeActionResult| (a.action_type, a.success, a.error, a.gas_used, a.reason);
+            assert_eq!(
+                row(NativeActionResult::placed(&result)),
+                row(NativeActionResult::placed_reject(reject)),
+                "{reject:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8772,6 +8937,16 @@ impl NativeExecutor {
         // caches into an unreserved map rehashes it at each doubling
         // (capacity only; ubench_position_cache: ~1.2 -> ~0.7 us/entry).
         pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum());
+        // s58 (`TORUS_SETTLE_DEFER_RESULTS=1`): each placed order's book
+        // reject, by flat index (`Some` = placed here, written after the
+        // market loop). 1 byte per action (`FailureReason` is a Copy u8
+        // enum), fresh per call: `execute_batch` runs twice per block.
+        let defer = settle_defer_results_enabled();
+        let mut deferred: Vec<Option<Option<FailureReason>>> = if defer {
+            vec![None; results.len()]
+        } else {
+            Vec::new()
+        };
         for (mbr, plan) in market_results.into_iter().zip(plans) {
             let market_id = mbr.market_id;
 
@@ -8901,7 +9076,11 @@ impl NativeExecutor {
                 }
 
                 *total_gas += PLACE_ORDER_GAS;
-                results[prep.index] = NativeActionResult::placed(result);
+                if defer {
+                    deferred[prep.index] = Some(result.reject);
+                } else {
+                    results[prep.index] = NativeActionResult::placed(result);
+                }
             }
 
             // cum_volume: the worker's per-trader sums when every order ran
@@ -8933,6 +9112,16 @@ impl NativeExecutor {
                     }
                     // R02: a local fault fail-stops (nothing released meanwhile).
                     Err(e) => Self::latch_core_fault(ctx, "settle maker release balance read", &e),
+                }
+            }
+        }
+        // s58: the deferred placed results, in one ascending pass (inside
+        // the pass-B timer). A fill-failed order was written inline above
+        // and never recorded, so its `None` leaves it alone.
+        if defer {
+            for (slot, d) in results.iter_mut().zip(deferred) {
+                if let Some(reject) = d {
+                    *slot = NativeActionResult::placed_reject(reject);
                 }
             }
         }
