@@ -35,6 +35,12 @@ cache rebuild per campaign).
 1. **Memory first**: `run_tool("memory", "search_knowledge", {"query": "<bench/campaign name> traps", "project": "<project>"})`.
 2. **Prepare**: build binaries, verify shas, set up dirs, run the smoke test. Short waits
    (a build, the smoke test) use the short-wait pattern below.
+   - Launch only a campaign script that already exists. If none exists, or your prompt asks
+     you to write or adapt one, stop and report back: the main session or a builder writes it.
+   - Read scripts and logs in pieces: `grep -n` for what you need, then `sed -n 'A,Bp'`
+     those lines. Never read a whole script.
+   - A failed smoke test (non-zero rc, REJECT, DISAGREE, no output): reply with its
+     `tail -20` and stop. Do not debug it.
 3. **Quiet host**: no compile may run during a campaign (results get contaminated).
    Finish every build first, and check: `pgrep -a 'cargo|rustc'` must be empty.
    If the campaign has a per-cell step (validates each cell, appends a row to
@@ -56,7 +62,9 @@ cache rebuild per campaign).
    then `tail -5` the log and, in the same Bash call, `systemctl --user is-active bench-<name>.service`.
    It must print `active`; if not, fix the unit name or launch before you wait (the step-6 wait
    would otherwise end at once). `remember_this` the launch (run dir, arms, shas, unit name).
-6. **Wait, by expected duration** (estimate it from the arms x cells x cell time):
+6. **Wait, by expected duration** (estimate it from the arms x cells x cell time).
+   Pick the wait mode once, from that estimate at launch: never switch modes mid-run, and
+   never read the log between waits.
    - **Under ~1.8h**: wait in the foreground with 270s keep-alive waits (cheapest: one
      cache read per 4.5 min; the hook switches you to background after ~1.8h):
      ```
