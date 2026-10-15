@@ -9,7 +9,7 @@ Last archy bench: `ozarchy-hsdb`, 71.8 option A A/B (section 74 of `ozarchy-anti
 Every campaign uses the N = 11 bench genesis (rebuilt once with `FORCE=1`, step 1). Arms that compare against main
 share one binary and one all-off baseline inside a campaign.
 
-**Now, on current main** (code = origin/main `bb9eb20f`; the Q4 experiments are still being finished on 18c):
+**Now, on current main** (s125: main carries KP and DB, flags off; PC and propose-defer are getting review fixes on 18c):
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
    cell and its checks (Q5 below). Gates every later campaign.
@@ -19,12 +19,27 @@ share one binary and one all-off baseline inside a campaign.
 
 **After 18c merges the Q4 experiments** (flags off; rebuild M' = main + Q4):
 
-4. **Campaign A:** one shared all-off baseline + Q1 (`TORUS_EPOCH_FAST_PATH=1`) + Q2 (`TORUS_PARALLEL_ENGINE=1`) +
-   Q4 `TORUS_PARALLEL_CANCEL_ALL=1`, `TORUS_EXEC_PARALLEL_KEYS=1`, `TORUS_CKPT_DEFER_BOOKS=1`: 6 arms, 300 markets,
-   600 s, 3 replicates, rotating order, native load only.
+4. **Campaign A:** 6 arms on one binary, 300 markets, 600 s, 3 replicates, rotating order, native load only.
+   **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
+   `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
+
+   | arm | env |
+   |---|---|
+   | base | all flags absent (list them in `absent_env`) |
+   | F (Q1) | `TORUS_EPOCH_FAST_PATH=1` |
+   | PE (Q2) | `TORUS_PARALLEL_ENGINE=4` (N >= 2 workers; 0, 1 or anything else = off) |
+   | PC (Q4) | `TORUS_PARALLEL_CANCEL_ALL=8` (unset, 0, 1 or garbage = the serial loop) |
+   | KP (Q4) | `TORUS_EXEC_PARALLEL_KEYS=1` (only "1" turns it on) |
+   | DB (Q4) | `TORUS_CKPT_DEFER_BOOKS=1`; check its `defer_books=true` info line in each node's log (it logs `false` if gated off) |
+
+   Fallback: if PC is not merged when archy reaches this step, run the other 5 arms, and give PC its own
+   base vs PC pair later on the same shape.
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
-6. **Campaign B, Q4 propose-defer** (`TORUS_PROPOSE_EXEC_WATERMARK`): off vs on, its own campaign (consensus timing:
-   watch view timeouts and exec lag).
+6. **Campaign B, Q4 propose-defer**, its own campaign (consensus timing: watch view timeouts and exec lag), same shape,
+   3 arms: (a) base (`TORUS_EXEC_QUEUE_DEPTH` and `TORUS_PROPOSE_EXEC_WATERMARK` absent); (b) control
+   `TORUS_EXEC_QUEUE_DEPTH=16` (the same short exec queue, still a blocking send); (c)
+   `TORUS_PROPOSE_EXEC_WATERMARK=16`. Without (b), a gain cannot be split between the deferral and the shorter
+   queue. Metrics in the branch notes (`torus_exec_queue_depth` mean and max, view timeouts, exec lag, matched/s).
 
 **When 18c delivers the code:**
 
@@ -51,8 +66,12 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
 - **Q4. The four s123 experiments**, one flag each, default off: `exp/s123-parallel-cancel-all-book-pass`
   (`TORUS_PARALLEL_CANCEL_ALL`), `exp/s123-propose-defer-on-exec-queue` (`TORUS_PROPOSE_EXEC_WATERMARK`),
   `exp/s123-exec-action-keys-parallel` (`TORUS_EXEC_PARALLEL_KEYS`), `exp/s123-defer-book-blobs-in-layer-merge`
-  (`TORUS_CKPT_DEFER_BOOKS`). Waiting on 18c: rebase, finish, test, merge with the flags off (in progress s125).
-  Three run in campaign A, the winners together in step 5, propose-defer in campaign B.
+  (`TORUS_CKPT_DEFER_BOOKS`). Status s125: exec-action-keys and defer-book-blobs are merged into main with the flags
+  off (Codex torus review: no findings); parallel-cancel-all (a flag-off allocation regression and a flag-on
+  all-books scan) and propose-defer (repeated store reads while deferring, flag-wiring tests) get fixes and a
+  re-review before they merge. Three run in campaign A, the winners together in step 5, propose-defer in campaign B.
+  Arm values and the shape: step 4 and step 6 above; branch notes in `/home/18c/projects/wt/exp-s123/<name>.md`
+  (18c).
 - **Q5. Native vs native + EVM transfers** at N = 11 (main `639ab185` and later; `EVM_LOAD_RATE` and
   `EVM_LOAD_SENDERS`, off by default). Shows what EVM blocks cost native matched/s.
   - Rebuild the bench genesis with `FORCE=1`: an existing `testnet/genesis-weighted-full.json` keeps N = 5.
@@ -78,3 +97,5 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
 ## Later
 
 - Big-block sizing with mixed load (native + swaps), only when big blocks are switched on (item 7 step 2 decision 1).
+- Q5 rerun on the item 7 step 2 build (native vs native + EVM load): step 2 adds a lane-row read per EVM tx and the
+  per-epoch fee rows. Only if Q7 shows a cost.
