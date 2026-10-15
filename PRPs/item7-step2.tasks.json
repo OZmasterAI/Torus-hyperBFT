@@ -1,0 +1,159 @@
+{
+  "prp": "item7-step2",
+  "created": "2026-10-15T00:00:00",
+  "notes": "Plan: docs/plans/item7-step2-impl.md (design docs/plans/item7-step2-design.md, option A + owner decisions 1-8, s123). Start after chore/evm-n11-bench-evm-load, perf/epoch-boundary-fast-path and fix/driver-generator-watchers merge (app.rs refs shift). Branch feat/item7-step2-big-blocks, worktree /home/18c/projects/wt/item7-step2. Env: cd /home/18c/projects/wt/item7-step2; CARGO_TARGET_DIR=/home/18c/.cargo-target-item7s2; L='flock -w 60 -o /home/18c/projects/wt/.cargo-heavy.lock'; F='--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar'; P='-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-economics -p torus-mempool -p torus-rpc -p torus-core -p torus-evm -p hotstuff_rs -p torus-node -p torus-state -p torus-integration-tests -p torus-wallet'. Commit groups: C1=B1-B3, C2=B4-B6, C3=B7-B8, C4=B9, C5=B10-B12, C6=B13-B14, C7=B15, C8=B16-B17, C9=B18, C10=B19. C7 and C8 can be built beside C2-C6. Before every commit: cargo nextest run --workspace $F and the TESTING.md doc-test command.",
+  "tasks": [
+    {
+      "id": "B1",
+      "name": "torus-types: step 2 constants, governance keys, height rules; calc_next_block_base_fee moves to torus-types",
+      "status": "pending",
+      "files": ["crates/torus-types/src/lib.rs", "crates/torus-types/src/eip1559.rs", "crates/torus-evm/src/eip1559.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(evm_height_rules_cover_the_small_and_big_cadence) or test(big_block_interval_is_zero_or_in_range) or test(base_fee_)'",
+      "depends_on": []
+    },
+    {
+      "id": "B2",
+      "name": "header fields evm_big_block_interval, evm_big_gas_limit, big_base_fee_per_gas; height caps; EvmHeaderValues; the 28 literals",
+      "status": "pending",
+      "files": ["crates/torus-types/src/lib.rs", "crates/torus-types/src/action_hash_scratch_tests.rs", "crates/torus-bridge/src/proposer.rs", "crates/torus-consensus/src/app.rs", "crates/torus-state/src/block_body.rs", "crates/torus-rpc/src/lib.rs", "crates/torus-rpc/src/scan_tests.rs", "crates/torus-rpc/tests/eth_compliance_tests.rs", "crates/torus-bridge/tests/bridge_tests.rs", "crates/torus-bridge/tests/exec_isolation_tests.rs", "crates/torus-bridge/tests/state_root_once_tests.rs", "crates/torus-integration-tests/tests/native_da_pull_fallback.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(big_lane_fields_in_canonical_bytes) or test(header_caps_add_the_big_lane_at_big_heights) or test(header_bincode_round_trip) or test(header_without_attestation_defaults_to_zero)'",
+      "depends_on": ["B1"]
+    },
+    {
+      "id": "B3",
+      "name": "genesis evm.big_block_interval / evm.big_gas_limit, ChainConfig fields, genesis_parent_header_for, genesis files",
+      "status": "pending",
+      "files": ["crates/torus-genesis/src/lib.rs", "crates/torus-types/src/lib.rs", "crates/torus-bridge/src/proposer.rs", "crates/torus-bridge/src/lib.rs", "crates/torus-consensus/src/app.rs", "crates/torus-node/src/main.rs", "crates/torus-integration-tests/tests/native_da_pull_fallback.rs", "devnet/genesis.json", "devnet/ab-harness/devnet-genesis.json", "testnet/genesis-weighted-base.json", "testnet/genesis-weighted-base-setup2b.json", "testnet/p3-testnet/devnet-ladder/genesis-10mkt.json"],
+      "validate": "$L cargo nextest run $P $F -E 'test(big_block_values_default_off_and_feed_chain_config) or test(shipped_genesis_files) or test(genesis_parent_header)'",
+      "depends_on": ["B2"]
+    },
+    {
+      "id": "B4",
+      "name": "epoch plan: PlanEvm big lane and fee fields, PlanEvm::resolve, governance copy of M and the big limit",
+      "status": "pending",
+      "files": ["crates/torus-economics/src/epoch_plan.rs", "crates/torus-economics/src/lib.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(plan_carries_governance_big_lane_params) or test(plan_big_lane_values_outside_their_range) or test(plan_resolve_takes_set_values) or test(plan_carries_governance_evm_params)'",
+      "depends_on": ["B1", "B2"]
+    },
+    {
+      "id": "B5",
+      "name": "governance allowlist: evm_big_block_interval (0 or 30..=10000), evm_big_block_gas_limit (1M..=30M), core_writer_order_delay (1..=100)",
+      "status": "pending",
+      "files": ["crates/torus-economics/src/governance.rs", "crates/torus-economics/tests/governance_tests.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(big_lane_and_corewriter_param_changes_are_range_checked) or test(evm_block_param_changes_are_range_checked)'",
+      "depends_on": ["B1"]
+    },
+    {
+      "id": "B6",
+      "name": "boundary rule over the six EVM header values (vote and insertion); proposer copies them",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(boundary_header_must_equal_the_plans_big_lane_and_fees) or test(off_boundary_header_must_equal_the_parents_big_lane_and_fees) or test(governance_big_lane_params_reach_the_header) or test(boundary_) or test(evm_gas_limit_and_base_fee)'",
+      "depends_on": ["B3", "B4"]
+    },
+    {
+      "id": "B7",
+      "name": "NativeAction::EvmUserModify (bincode/canonical tag 30, EIP-712), lane row \"lan\"||addr in CF_NATIVE_ORACLE, executor, RPC variant list, wallet command",
+      "status": "pending",
+      "files": ["crates/torus-types/src/lib.rs", "crates/torus-types/src/eip712.rs", "crates/torus-types/src/action_hash_scratch_tests.rs", "crates/torus-types/tests/eip712_vectors.rs", "crates/torus-state/src/cf.rs", "crates/torus-bridge/src/native_executor.rs", "crates/torus-bridge/tests/evm_user_modify_tests.rs", "crates/torus-rpc/src/torus.rs", "tools/wallet/src/main.rs", "tools/wallet/src/commands/transfer.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(evm_user_modify) or test(evm_lane_key_layout) or test(fixture_file_matches_current_implementation)'",
+      "depends_on": ["B1"]
+    },
+    {
+      "id": "B8",
+      "name": "execution per lane: BigLane + execute_block_lanes (per-tx base fee, big gas, fee revenue), validator reads lane rows, block gas limit = height cap",
+      "status": "pending",
+      "files": ["crates/torus-evm/src/executor.rs", "crates/torus-evm/src/lib.rs", "crates/torus-evm/tests/evm_tests.rs", "crates/torus-bridge/src/validator.rs", "crates/torus-bridge/tests/evm_lanes_tests.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(big_lane_sender_pays_the_big_base_fee) or test(big_lane_tx_below_the_big_base_fee_is_skipped) or test(charges_each_sender_its_lane) or test(runs_only_at_a_big_height)'",
+      "depends_on": ["B2", "B7"]
+    },
+    {
+      "id": "B9",
+      "name": "F3: epoch EVM gas row, next_base_fees at boundary execution from the parent header window, 1 gwei floor, add_block_evm_gas",
+      "status": "pending",
+      "files": ["crates/torus-economics/src/epoch_plan.rs", "crates/torus-economics/src/lib.rs", "crates/torus-state/src/running_hash.rs", "crates/torus-bridge/src/native_executor.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(next_base_fees_follow_the_epochs_gas_per_lane) or test(boundary_turns_the_epoch_gas_into_plan_fees) or test(f3_epoch_gas_sets_plan_fees) or test(running_hash_captures)'",
+      "depends_on": ["B4", "B6", "B8"]
+    },
+    {
+      "id": "B10",
+      "name": "pre-vote caps per height (N or M cadence, (small+big)/21000 txs, 768 KiB, small+big declared gas); o5 consensus message size test from the vote caps",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-integration-tests/tests/o5_feed_gates.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(evm_txs_at_a_big_height_off_the_small_cadence) or test(big_height_caps_count_bytes_and_gas) or test(worst_case_compact_proposal) or test(before_the_vote)'",
+      "depends_on": ["B2", "B6"]
+    },
+    {
+      "id": "B11",
+      "name": "mempool: EvmLanes (two pools, one lock), lane admission and switch refusal, per-lane caps and fee floors, drain_evm_big, set_big_lane, set_evm_header; TORUS_EVM_BLOCK_GAS_BUDGET loses its default (decision 6)",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/lib.rs", "crates/torus-mempool/src/evm_pool.rs", "crates/torus-mempool/src/rate_limit.rs", "crates/torus-mempool/src/error.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(big_lane_sender_goes_to_the_big_pool) or test(switching_lanes_waits) or test(big_lane_admission_caps) or test(big_lane_fee_floor) or test(node_budget_caps_only_the_small_lane) or test(gas_budget_has_no_default) or test(big_blocks_switched_off_move) or test(lower_big_limit_evicts) or test(pending_nonce_spans_both_lanes) or test(admission_)'",
+      "depends_on": ["B2", "B7"]
+    },
+    {
+      "id": "B12",
+      "name": "proposer drains the small lane then the big lane at a big height; pools follow every committed header and the boot header",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(big_height_drains_the_small_lane_then_the_big_lane) or test(committed_header_sets_the_mempool) or test(select_block_payload) or test(catch_up_gate) or test(deferred_exec_counts_toward_pacing)'",
+      "depends_on": ["B6", "B10", "B11"]
+    },
+    {
+      "id": "B13",
+      "name": "in-flight filter (decision 7): committed EVM txs leave every pool at commit, copies refused 256 blocks, per-sender committed nonce for pending_nonce",
+      "status": "pending",
+      "files": ["crates/torus-mempool/src/lib.rs", "crates/torus-mempool/src/evm_pool.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(committed_block_drops_its_pooled_evm_txs) or test(committed_evm_tx_is_not_readmitted_until_expiry) or test(lower_nonce_than_a_committed_one) or test(inflight_entry_drops_once_the_state_nonce) or test(commit_prunes_forwarded_copies) or test(lost_proposal)'",
+      "depends_on": ["B11"]
+    },
+    {
+      "id": "B14",
+      "name": "routing (decision 7): LeaderState::next_evm_targets per lane with upcoming N/M, two big leaders, RPC forward + tracking, commit-path re-send, main.rs wiring",
+      "status": "pending",
+      "files": ["crates/torus-consensus/src/app.rs", "crates/torus-mempool/src/lib.rs", "crates/torus-mempool/src/evm_pool.rs", "crates/torus-rpc/src/lib.rs", "crates/torus-rpc/src/torus.rs", "crates/torus-rpc/src/eth.rs", "crates/torus-node/src/main.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(evm_targets_follow_the_upcoming_interval) or test(big_lane_targets_the_next_two_big_heights) or test(due_resends_are_the_tracked_txs_still_pooled) or test(forwarded_to_the_leaders_of_its_lane) or test(commits_without_the_tx_resends_it) or test(lost_proposal_txs_are_tracked) or test(next_evm_leader) or test(evm_routing_tip)'",
+      "depends_on": ["B12", "B13"]
+    },
+    {
+      "id": "B15",
+      "name": "CoreWriter: order kinds wait K (governance, default 10), others +1; 200-row cap applied at enqueue; existing tests pin K=1",
+      "status": "pending",
+      "files": ["crates/torus-core/src/precompiles.rs", "crates/torus-core/tests/precompile_tests.rs", "crates/torus-bridge/src/native_executor.rs", "crates/torus-evm/src/executor.rs", "crates/torus-bridge/tests/corewriter_cloid_tests.rs", "crates/torus-bridge/tests/corewriter_results_tests.rs", "crates/torus-integration-tests/tests/cross_vm_write.rs", "crates/torus-evm/tests/evm_tests.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(order_actions_wait_k_blocks_others_one) or test(full_target_block_sends_later_rows) or test(corewriter_order_drains_k_blocks_later) or test(corewriter_evm_row_drains) or test(queue_) or test(core_writer_)'",
+      "depends_on": ["B1", "B5"]
+    },
+    {
+      "id": "B16",
+      "name": "bbo rows: unhashed cf_native_bbo, OrderBook::bbo_row / saved_bbo, write_bbo_rows in save_order_books and save_order_books_deferred",
+      "status": "pending",
+      "files": ["crates/torus-state/src/cf.rs", "crates/torus-core/src/order_book.rs", "crates/torus-bridge/src/native_executor.rs", "crates/torus-bridge/tests/bbo_rows_tests.rs", "crates/torus-consensus/src/app.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(dirty_market_bbo_row_follows_the_book) or test(unchanged_top_of_book_writes_no_bbo_row) or test(bbo_cf_is_neither_hashed) or test(warm_equals_cold_every_block)'",
+      "depends_on": []
+    },
+    {
+      "id": "B17",
+      "name": "bbo read precompile at 0x080e: bbo(bytes32) -> (uint128 bid, uint128 ask), 16,940 gas, reader address checks widened",
+      "status": "pending",
+      "files": ["crates/torus-core/src/precompiles.rs", "crates/torus-core/tests/precompile_tests.rs", "crates/torus-evm/tests/evm_tests.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(bbo_)'",
+      "depends_on": ["B16"]
+    },
+    {
+      "id": "B18",
+      "name": "RPC per lane: eth_call/eth_estimateGas lane env, torus_bigBlockGasPrice, eth_feeHistory blockType, torus_usingBigBlocks, gasLimit = height cap",
+      "status": "pending",
+      "files": ["crates/torus-rpc/src/eth.rs", "crates/torus-rpc/src/torus.rs", "crates/torus-rpc/tests/eth_compliance_tests.rs"],
+      "validate": "$L cargo nextest run $P $F -E 'test(estimate_gas_caps_at_the_callers_lane_limit) or test(big_block_gas_price_and_fee_history_per_lane) or test(using_big_blocks_reads_the_lane_row) or test(block_gas_limit_is_the_heights_cap) or test(bare_call_and_estimate)'",
+      "depends_on": ["B2", "B7"]
+    },
+    {
+      "id": "B19",
+      "name": "docs and the full run (workspace nextest, doc tests, -D warnings build, fmt/clippy counts, CI uniswap e2e); then devnet checks a-f and archy native-only A/B",
+      "status": "pending",
+      "files": ["docs/configuration-reference.md", "docs/api/corewriter-results.md", "docs/api/read-limits.md", "docs/perf/read-precompile-gas.md", "docs/plans/item7-evm-lanes.md", "docs/plans/item7-step2-design.md"],
+      "validate": "$L cargo nextest run --workspace $F > /tmp/item7s2-nextest.log 2>&1 && $L cargo test --doc -q > /tmp/item7s2-doc.log 2>&1 && CARGO_TARGET_DIR=/home/18c/.cargo-target-item7s2-dw RUSTFLAGS='-D warnings' $L cargo build $P --all-targets",
+      "depends_on": ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9", "B10", "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18"]
+    }
+  ]
+}

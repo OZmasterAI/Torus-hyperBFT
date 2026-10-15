@@ -127,7 +127,7 @@ executed state.
    Alternatives kept for a revisit: D1 (keep one block for all; our drain already runs after the block's native
    batches, so no in-block jump) and D3 (wall-clock S seconds by header timestamps; exact at any block rate, but
    whole-second timestamps, up to 5 s proposer skew, and a time-ordered queue with a range drain).
-5. Fees: leaning F3 (not final).
+5. Fees: F3 (final), EIP-1559 per epoch from executed gas.
 6. Node budget (step 1 review finding gov-2, option a): `TORUS_EVM_BLOCK_GAS_BUDGET` loses its 5M default, so the
    header limits alone size both lanes; the variable stays as an optional per-node cap for A/B tests. The small lane
    keeps step 1's range 1M..=10M (default 3M): a 30M ceiling there would allow ~19M gas/s of serial EVM at N = 5,
@@ -147,6 +147,7 @@ executed state.
    Test: step 1's 4-validator devnet traffic check, expecting every tx within about one extra EVM height. A validator
    count that shares a factor with N still concentrates EVM leadership (n = 4, N = 10: 2 of 4 validators led the EVM
    heights); with the re-send it no longer strands txs (revisit before mainnet, step 1 decision 3).
+8. Big-block byte cap: 768 KiB of raw EVM tx bytes, under the 1 MiB consensus message cap, which stays as it is.
 
 **How HL produces EVM blocks (correction s123):** HL's EVM blocks are a separate EVM chain (own numbers and hashes),
 but they are built while executing L1 blocks: EVM txs enter as onchain state (the "onchain mempool") through the same
@@ -169,8 +170,5 @@ precompile gas: `2000 + 65 * (input_len + output_len)`.
 
 ## Open Questions (owner)
 
-3. Fees: F1, F2 or F3?
-4. CoreWriter delay: which actions (orders and vault transfers like HL, or all), and K (HL's "few seconds" is about
-   6-16 blocks at ~3.2 blocks/s)? And the per-block drain cap (proposed 200)?
-5. Big-block byte cap (proposed 768 KiB, under the 1 MiB consensus message), or raise the message cap?
-6. bbo gas: our metering (16,400 base + per row/word) or HL's formula (2,000 + 65 x bytes)?
+None: fees (decision 5), CoreWriter delay (decision 4), big-block byte cap (decision 8) and bbo gas (decision 3) are
+answered.
