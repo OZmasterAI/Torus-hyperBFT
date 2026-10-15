@@ -54,6 +54,36 @@ pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
     !matches!(v.as_deref().map(str::trim), Some("0"))
 }
 
+/// s124 epoch-boundary fast path (`TORUS_EPOCH_FAST_PATH`, node-local, default
+/// off, read once at startup by `TorusApp::try_new`): an
+/// epoch-boundary block with no EVM tx and no buffered slash takes the
+/// pipelined path instead of the barrier (forced checkpoint drain + W drain)
+/// and the serial flush; with a checkpoint interval it checkpoints at its own
+/// height. Same state, roots and running hash; only timing changes. No
+/// effect without W (`TORUS_EXEC_PIPELINE=0`).
+pub fn epoch_fast_path_enabled() -> bool {
+    parse_epoch_fast_path(std::env::var("TORUS_EPOCH_FAST_PATH").ok())
+}
+
+/// Pure parse of `TORUS_EPOCH_FAST_PATH`: `1` or `true` = on; unset, empty,
+/// `0` or `false` = off; anything else = off with a warning.
+pub fn parse_epoch_fast_path(raw: Option<String>) -> bool {
+    let Some(raw) = raw else {
+        return false;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" => false,
+        "1" | "true" => true,
+        other => {
+            tracing::warn!(
+                value = other,
+                "TORUS_EPOCH_FAST_PATH: not 0/1/true/false — epoch fast path OFF"
+            );
+            false
+        }
+    }
+}
+
 /// Item 6 Phase 3 step 6: the compiled default interval on validators (owner
 /// s109, the gate's 15 s). `--rpc-only` nodes default to 0 (per-block flush).
 pub const VALIDATOR_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -197,9 +227,10 @@ pub fn parse_checkpoint_max_bytes(v: Option<String>) -> Option<u64> {
 
 /// Item 6 Phase 3: when E closes the since-checkpoint layer into a
 /// checkpoint (checked at the end of every pipelined block). Attest heights
-/// (`h % 100 == 0`), barriers and shutdown always checkpoint; these are the
-/// node-local extra triggers. `CheckpointPolicy::default()` = only those
-/// ("never by time").
+/// (`h % 100 == 0`), barriers and shutdown always checkpoint, and so does a
+/// pipelined epoch boundary under the epoch fast path
+/// ([`epoch_fast_path_enabled`]); these are the node-local extra triggers.
+/// `CheckpointPolicy::default()` = only those ("never by time").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CheckpointPolicy {
     /// Wall time on E since the last checkpoint (`TORUS_CHECKPOINT_INTERVAL_MS`).
@@ -1042,6 +1073,22 @@ mod tests {
         }
         assert!(!parse_exec_pipeline_toggle(Some("0".to_string())));
         assert!(!parse_exec_pipeline_toggle(Some(" 0 ".to_string())));
+    }
+
+    /// s124: `TORUS_EPOCH_FAST_PATH` is opt-in. `1` / `true` (any case,
+    /// trimmed) turn it on; unset, empty, `0`, `false` and anything else
+    /// (warned) leave it off.
+    #[test]
+    fn epoch_fast_path_parse_default_off() {
+        assert!(!parse_epoch_fast_path(None));
+        for v in [
+            "", " ", "0", " 0 ", "false", "FALSE", "off", "on", "yes", "2",
+        ] {
+            assert!(!parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
+        }
+        for v in ["1", " 1 ", "true", "TRUE", "True"] {
+            assert!(parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
+        }
     }
 
     #[test]
