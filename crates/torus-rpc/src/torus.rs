@@ -942,10 +942,17 @@ impl RpcState {
     ///
     /// Takes the RLP by value (the caller already owns a clone, since `add_evm_tx` consumes the
     /// original): moving it into the channel avoids a second copy of the body on the hot path.
+    ///
+    /// Item 7 step 1: the target is the leader of the next EVM height (`evm_leader_vk_fn`), since
+    /// EVM txs land only at `height % N == 0`; the current leader when that hook is unset.
     pub(crate) fn forward_evm_to_leader(&self, raw_rlp: Vec<u8>) {
-        if let (Some(ref leader_fn), Some(ref own_vk), Some(ref fwd_tx)) =
-            (&self.leader_vk_fn, &self.own_vk, &self.forward_evm_tx)
-        {
+        if let (Some(leader_fn), Some(own_vk), Some(fwd_tx)) = (
+            self.evm_leader_vk_fn
+                .as_ref()
+                .or(self.leader_vk_fn.as_ref()),
+            self.own_vk.as_ref(),
+            self.forward_evm_tx.as_ref(),
+        ) {
             if let Some(leader_vk) = leader_fn() {
                 if leader_vk != *own_vk {
                     let _ = fwd_tx.send((leader_vk, raw_rlp));

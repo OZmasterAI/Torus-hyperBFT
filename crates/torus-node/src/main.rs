@@ -1026,6 +1026,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let own_hotstuff_vk = verifying_key;
     let timeout_counter = metrics.consensus_timeout_total.clone();
     let leader_state_for_view = leader_state.clone();
+    // Item 7 step 1: proposals (own and received headers) feed the next EVM
+    // height's leader prediction for the RPC EVM forward.
+    let leader_state_for_propose = leader_state.clone();
+    let leader_state_for_header = leader_state.clone();
     // The shutdown thread exists before consensus starts, so stopping never
     // needs a new thread.
     let shutdown_worker = ShutdownWorker::spawn()?;
@@ -1051,6 +1055,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .on_propose(move |ev: &ProposeEvent| {
+            leader_state_for_propose
+                .observe_proposal(ev.proposal.view.int(), ev.proposal.block.height.int());
             rec_propose.propose(ev.timestamp, ev.proposal.block.hash.bytes())
         })
         .on_update_highest_pc(move |ev: &UpdateHighestPCEvent| {
@@ -1060,6 +1066,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             rec_receive.receive_proposal(ev.timestamp);
         })
         .on_receive_proposal_header(move |ev: &ReceiveProposalHeaderEvent| {
+            leader_state_for_header.observe_proposal(ev.view.int(), ev.height.int());
             if ev.origin != own_hotstuff_vk {
                 rec_header.receive_proposal(ev.timestamp);
             }
@@ -1202,6 +1209,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         evm_fwd_tx,
         !cli.native_gossip,
     );
+    // Item 7 step 1: EVM txs go to the leader of the next EVM height.
+    let leader_state_for_evm = leader_state.clone();
+    rpc_server.set_evm_leader_fn(Arc::new(move || {
+        leader_state_for_evm
+            .next_evm_leader()
+            .map(|vk| vk.to_bytes())
+    }));
 
     // Extract shared handles before start() consumes the server
     let latest_height_handle = rpc_server.latest_height();

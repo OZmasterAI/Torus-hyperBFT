@@ -871,6 +871,10 @@ pub struct LeaderState {
     /// stale during timeout churn) and the REAL selection (reputation-aware
     /// when the fleet runs it, unlike the plain-IWRR fallback below).
     observed_leader: RwLock<Option<(u64, VerifyingKey)>>,
+    /// Item 7 step 1: `(view, height)` of the newest observed proposal.
+    tip: RwLock<(u64, u64)>,
+    /// Item 7 step 1: the committed header's N (0 = unknown).
+    evm_block_interval: AtomicU64,
 }
 
 impl LeaderState {
@@ -879,6 +883,8 @@ impl LeaderState {
             view: AtomicU64::new(1),
             validators: RwLock::new(hotstuff_rs::types::validator_set::ValidatorSet::new()),
             observed_leader: RwLock::new(None),
+            tip: RwLock::new((0, 0)),
+            evm_block_interval: AtomicU64::new(0),
         }
     }
 
@@ -935,6 +941,51 @@ impl LeaderState {
         }
         Some(hotstuff_rs::pacemaker::select_leader(
             hotstuff_rs::types::data_types::ViewNumber::new(view),
+            &vs,
+        ))
+    }
+
+    /// Item 7 step 1: record a proposal (own or received header) for
+    /// `height` in `view`. Out-of-order delivery for an older view is ignored.
+    pub fn observe_proposal(&self, view: u64, height: u64) {
+        let mut tip = self.tip.write().unwrap();
+        if view >= tip.0 {
+            *tip = (view, height);
+        }
+    }
+
+    fn set_evm_block_interval(&self, n: u64) {
+        self.evm_block_interval.store(n, Ordering::Relaxed);
+    }
+
+    /// Item 7 step 1: leader of the next EVM height. max(current view, tip
+    /// view + 1) proposes tip + 1, then one block per view (plain IWRR, like
+    /// the fallback above; reputation weighting is off). Checked arithmetic: a
+    /// leader picks its header's height and view, so overflowing values fall
+    /// back to the current leader instead of panicking.
+    pub fn next_evm_leader(&self) -> Option<VerifyingKey> {
+        let n = self.evm_block_interval.load(Ordering::Relaxed);
+        if n == 0 {
+            return self.current_leader();
+        }
+        let (tip_view, tip_height) = *self.tip.read().unwrap();
+        // h_e > tip_height, so `h_e - (tip_height + 1)` cannot underflow.
+        let view_e = (tip_height / n)
+            .checked_add(1)
+            .and_then(|k| k.checked_mul(n))
+            .and_then(|h_e| {
+                let first_view = self.current_view().max(tip_view.checked_add(1)?);
+                first_view.checked_add(h_e - (tip_height + 1))
+            });
+        let Some(view_e) = view_e else {
+            return self.current_leader();
+        };
+        let vs = self.validators.read().unwrap();
+        if vs.is_empty() {
+            return None;
+        }
+        Some(hotstuff_rs::pacemaker::select_leader(
+            hotstuff_rs::types::data_types::ViewNumber::new(view_e),
             &vs,
         ))
     }
@@ -5836,6 +5887,7 @@ impl TorusApp {
             .unwrap_or(genesis_validator_set);
         leader_state.sync_validators(&genesis_validator_set);
         leader_state.set_view(last_header.height.saturating_add(1));
+        leader_state.set_evm_block_interval(last_header.evm_block_interval);
 
         let mut app = Self {
             state_db,
@@ -7621,6 +7673,8 @@ impl App<RocksKVStore> for TorusApp {
         if height > self.last_header.height {
             self.last_header = header.clone();
             self.leader_state.set_view(height.saturating_add(1));
+            self.leader_state
+                .set_evm_block_interval(header.evm_block_interval);
             // Item 3: no async-validate invalidation here — a cached verdict
             // depends only on the datum bytes and the DA store (ancestry
             // re-runs live at hit time).
@@ -10057,6 +10111,48 @@ mod leader_state_tests {
         ls.observe_start_view(49, vks[1]);
         assert_eq!(ls.current_view(), 50);
         assert_eq!(ls.current_leader(), Some(vks[0]));
+    }
+
+    /// Item 7 step 1 (E12): EVM txs go to the leader of the next EVM height
+    /// (`height % N == 0`), not the current-view leader. That height is
+    /// proposed one view per block after the newest observed proposal.
+    #[test]
+    fn next_evm_leader_is_the_leader_of_the_next_evm_height() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        // N unknown (0, before boot sets it): the current leader.
+        assert_eq!(ls.next_evm_leader(), ls.current_leader());
+
+        ls.set_evm_block_interval(5);
+        // Tip 21 at view 40: 22, 23, 24 in views 41-43, so 25 in view 44.
+        ls.observe_proposal(40, 21);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 44)));
+        // Views moved on to 43 without a new proposal: 22 in 43, 25 in 46.
+        ls.observe_start_view(43, plain_iwrr(&ls, 43));
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 46)));
+        // Tip 24 at view 50: 25 is the next block, in view 51.
+        ls.observe_proposal(50, 24);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 51)));
+        // Tip 25 at view 51 (an EVM height itself): the next one is 30, in 56.
+        ls.observe_proposal(51, 25);
+        assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 56)));
+    }
+
+    /// A leader picks its header's height, and the header event fires before
+    /// the justify check: extreme values must not overflow on the RPC path.
+    #[test]
+    fn next_evm_leader_falls_back_on_overflowing_tip_values() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        ls.set_evm_block_interval(1);
+        ls.observe_proposal(40, u64::MAX);
+        assert_eq!(ls.next_evm_leader(), ls.current_leader());
+        ls.observe_proposal(u64::MAX, 7);
+        assert_eq!(ls.next_evm_leader(), ls.current_leader());
     }
 }
 

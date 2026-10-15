@@ -271,6 +271,9 @@ pub struct RpcState {
     pub(crate) own_vk: Option<[u8; 32]>,
     /// Returns the current leader's verifying key bytes.
     pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
+    /// Item 7 step 1: returns the verifying key bytes of the next EVM height's
+    /// leader; EVM forwards fall back to `leader_vk_fn` when unset.
+    pub(crate) evm_leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
     /// Channel to forward native actions to the leader (B1): structured
     /// (leader vk hint, verified sender, parsed action) tuples — no JSON
     /// re-encode — BOUNDED ([`FORWARD_CHANNEL_CAP`]); overflow drops the
@@ -364,6 +367,7 @@ impl RpcServer {
                 metrics: None,
                 own_vk: None,
                 leader_vk_fn: None,
+                evm_leader_vk_fn: None,
                 forward_action_tx: None,
                 forward_evm_tx: None,
                 forward_bodies: false,
@@ -419,6 +423,13 @@ impl RpcServer {
         self.state.forward_action_tx = Some(forward_tx);
         self.state.forward_evm_tx = Some(evm_forward_tx);
         self.state.forward_bodies = forward_bodies;
+    }
+
+    /// Item 7 step 1: EVM txs land only in blocks with `height % N == 0`, so
+    /// EVM forwards go to the leader of the next EVM height returned by `f`
+    /// (instead of the current leader from [`Self::set_leader_forwarding`]).
+    pub fn set_evm_leader_fn(&mut self, f: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>) {
+        self.state.evm_leader_vk_fn = Some(f);
     }
 
     /// Use an externally-created height counter (shared with the commit handler).
@@ -3467,6 +3478,102 @@ mod tests {
             "no forward when this node is itself the leader"
         );
         handle2.stop().unwrap();
+    }
+
+    /// Item 7 step 1 (E12): EVM txs land only at `height % N == 0`, so with an
+    /// EVM leader hook wired the tx goes to the leader of the next EVM height,
+    /// not to the current-view leader (which stays the fallback).
+    #[tokio::test]
+    async fn evm_tx_forwarded_to_the_next_evm_height_leader() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_primitives::{Bytes, Signature as AlloySig, TxKind};
+        use alloy_rlp::Encodable;
+        use jsonrpsee::core::client::ClientT;
+
+        fn evm_addr(key: &k256::ecdsa::SigningKey) -> Address {
+            let pt = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pt.as_bytes()[1..]).as_slice()[12..])
+        }
+        fn signed_eip1559(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+            let tx = TxEip1559 {
+                chain_id: TORUS_CHAIN_ID,
+                nonce,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+                access_list: Default::default(),
+            };
+            let sig_hash = tx.signature_hash();
+            let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+            let r = U256::from_be_slice(sig.r().to_bytes().as_slice());
+            let s = U256::from_be_slice(sig.s().to_bytes().as_slice());
+            let signature = AlloySig::new(r, s, recid.is_y_odd());
+            let mut buf = Vec::new();
+            TxEnvelope::Eip1559(tx.into_signed(signature)).encode(&mut buf);
+            buf
+        }
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let sender = evm_addr(&key);
+        let own = [1u8; 32];
+        let leader = [2u8; 32];
+        let evm_leader = [3u8; 32];
+
+        let (_dir, state, mempool, executor) = setup();
+        state
+            .put_account(
+                &sender,
+                &AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    nonce: 0,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        let raw = signed_eip1559(&key, 0);
+        let mut server = RpcServer::new(
+            state,
+            mempool,
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
+        let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(
+            own,
+            Arc::new(move || Some(leader)),
+            fwd_tx,
+            evm_fwd_tx,
+            false,
+        );
+        server.set_evm_leader_fn(Arc::new(move || Some(evm_leader)));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let _: String = client
+            .request(
+                "eth_sendRawTransaction",
+                jsonrpsee::rpc_params![format!("0x{}", hex::encode(&raw))],
+            )
+            .await
+            .unwrap();
+        let (vk, payload) = evm_fwd_rx.try_recv().expect("EVM tx must be forwarded");
+        assert_eq!(vk, evm_leader, "forwarded to the next EVM height's leader");
+        assert_eq!(payload, raw);
+        assert!(evm_fwd_rx.try_recv().is_err(), "forwarded once");
+        handle.stop().unwrap();
     }
 
     #[tokio::test]
