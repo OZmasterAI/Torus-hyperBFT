@@ -63,8 +63,8 @@ cache rebuild per campaign).
    It must print `active`; if not, fix the unit name or launch before you wait (the step-6 wait
    would otherwise end at once). `remember_this` the launch (run dir, arms, shas, unit name).
 6. **Wait, by expected duration** (estimate it from the arms x cells x cell time).
-   Pick the wait mode once, from that estimate at launch: never switch modes mid-run, and
-   never read the log between waits.
+   Pick the wait mode once, from that estimate at launch: never switch modes mid-run yourself
+   (except the hook's switch to background after ~1.8h), and never read the log between waits.
    - **Under ~1.8h**: wait in the foreground with 270s keep-alive waits (cheapest: one
      cache read per 4.5 min; the hook switches you to background after ~1.8h):
      ```
