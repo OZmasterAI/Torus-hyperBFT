@@ -31,18 +31,75 @@ use crate::{StateDb, StateError};
 /// read that does reach them through L (no R attached: R's rebuild, a
 /// block without R) waits for their merge, so the choice only moves time,
 /// never what a read returns.
+///
+/// The deferred part is these two CFs plus the book CF with
+/// `TORUS_CKPT_DEFER_BOOKS=1` (Classic, resident books; see
+/// `parse_defer_books`); this constant stays the pair every process defers.
 pub const DEFERRED_CFS: [&str; 2] = [
     crate::cf::CF_NATIVE_POSITIONS,
     crate::cf::CF_NATIVE_BALANCES,
 ];
 
-/// Whether CF slot `i` (the overlay's CF index) is one of [`DEFERRED_CFS`].
+/// `TORUS_CKPT_DEFER_BOOKS=1`: also defer `CF_NATIVE_ORDER_BOOKS` (Classic
+/// whole-book blobs: ~77% of a block's state bytes, ~199 x ~44 KB per
+/// block at 300 markets, results doc 41.1), so the exec thread no longer
+/// waits at block start for their copy into L. On only if `flag` trims to
+/// `1`, the book mode is Classic (`book_rows` is not 1 / 2 / 3, as
+/// `parse_book_rows_mode` in torus-bridge) and resident books are on
+/// (`resident_books` is not 0, as `parse_resident_books_toggle`). There a
+/// native block never reads the book CF through L: the Classic save only
+/// writes whole blobs and the books stay in memory between blocks. Modes
+/// 1 / 2 / 3 and `TORUS_RESIDENT_BOOKS=0` read it every block, so deferring
+/// would only move the wait.
+///
+/// Performance only: every split, merge and read of L routes by the same
+/// table ([`is_deferred_slot`]), and a read that reaches a deferred CF
+/// through L waits for its part and gets the answer the whole layer gives.
+/// A gate that disagrees with the executor's real mode can only add waits
+/// (counted in `torus_exec_checkpoint_deferred_read_waits`), never change
+/// what a read returns or what a checkpoint writes.
+pub(crate) fn parse_defer_books(
+    flag: Option<&str>,
+    book_rows: Option<&str>,
+    resident_books: Option<&str>,
+) -> bool {
+    let on = flag.map(str::trim) == Some("1");
+    let classic = !matches!(book_rows.map(str::trim), Some("1" | "2" | "3"));
+    let resident = !matches!(resident_books.map(str::trim), Some("0"));
+    on && classic && resident
+}
+
+/// Which CF slots are deferred: [`DEFERRED_CFS`], plus the book CF if
+/// `defer_books`.
+fn deferred_slot_table(defer_books: bool) -> [bool; NUM_CFS] {
+    std::array::from_fn(|i| {
+        let name = crate::cf::ALL_CF_NAMES[i];
+        DEFERRED_CFS.contains(&name) || (defer_books && name == crate::cf::CF_NATIVE_ORDER_BOOKS)
+    })
+}
+
+/// Whether CF slot `i` (the overlay's CF index) is in L's deferred part:
+/// one of [`DEFERRED_CFS`], or the book CF with `TORUS_CKPT_DEFER_BOOKS=1`
+/// ([`parse_defer_books`]; the env is read once per process).
 #[inline]
 pub(crate) fn is_deferred_slot(i: usize) -> bool {
     static SLOTS: OnceLock<[bool; NUM_CFS]> = OnceLock::new();
-    SLOTS
-        .get_or_init(|| std::array::from_fn(|i| DEFERRED_CFS.contains(&crate::cf::ALL_CF_NAMES[i])))
-        [i]
+    SLOTS.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).ok();
+        let flag = var("TORUS_CKPT_DEFER_BOOKS");
+        let defer_books = parse_defer_books(
+            flag.as_deref(),
+            var("TORUS_BOOK_ROWS").as_deref(),
+            var("TORUS_RESIDENT_BOOKS").as_deref(),
+        );
+        if flag.is_some() {
+            tracing::info!(
+                defer_books,
+                "TORUS_CKPT_DEFER_BOOKS: book CF in the deferred part of L (on only for 1, Classic books, resident books)"
+            );
+        }
+        deferred_slot_table(defer_books)
+    })[i]
 }
 
 /// Which CFs of a layer an operation covers.
@@ -50,9 +107,11 @@ pub(crate) fn is_deferred_slot(i: usize) -> bool {
 pub enum LayerPart {
     /// Every CF.
     All,
-    /// Every CF except [`DEFERRED_CFS`].
+    /// Every CF except [`DEFERRED_CFS`] (and the book CF with
+    /// `TORUS_CKPT_DEFER_BOOKS=1`).
     Main,
-    /// Only [`DEFERRED_CFS`].
+    /// Only [`DEFERRED_CFS`], plus the book CF with
+    /// `TORUS_CKPT_DEFER_BOOKS=1`.
     Deferred,
 }
 
@@ -173,9 +232,10 @@ impl CheckpointLayer {
         }
     }
 
-    /// p3 merge wait: move the [`DEFERRED_CFS`] out into a layer of their
-    /// own (same top), leaving this one without them. O(number of CFs): the
-    /// maps move, nothing is copied. [`Self::absorb`] puts them back.
+    /// p3 merge wait: move the [`DEFERRED_CFS`] (plus the book CF with
+    /// `TORUS_CKPT_DEFER_BOOKS=1`) out into a layer of their own (same
+    /// top), leaving this one without them. O(number of CFs): the maps
+    /// move, nothing is copied. [`Self::absorb`] puts them back.
     pub fn split_deferred(&mut self) -> CheckpointLayer {
         let mut out = CheckpointLayer::new();
         for i in (0..NUM_CFS).filter(|i| is_deferred_slot(*i)) {
@@ -767,7 +827,99 @@ mod tests {
         }
     }
 
+    // ---- TORUS_CKPT_DEFER_BOOKS: the routing table ----
+
+    fn slot_of(cf: &str) -> usize {
+        crate::cf::ALL_CF_NAMES
+            .iter()
+            .position(|n| *n == cf)
+            .unwrap()
+    }
+
+    /// The gate is on only for a trimmed `1`, in Classic (`TORUS_BOOK_ROWS`
+    /// not 1 / 2 / 3, as `parse_book_rows_mode`) with resident books
+    /// (`TORUS_RESIDENT_BOOKS` not 0, as `parse_resident_books_toggle`).
+    /// All unset is off (today's table).
+    #[test]
+    fn parse_defer_books_table() {
+        type Case = (
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+            bool,
+        );
+        let cases: &[Case] = &[
+            (None, None, None, false),
+            (Some("1"), None, None, true),
+            (Some(" 1\n"), None, None, true),
+            (Some("0"), None, None, false),
+            (Some(""), None, None, false),
+            (Some("true"), None, None, false),
+            (Some("11"), None, None, false),
+            // Book mode: only 1 / 2 / 3 leave Classic.
+            (Some("1"), Some("0"), None, true),
+            (Some("1"), Some(""), None, true),
+            (Some("1"), Some("4"), None, true),
+            (Some("1"), Some("1"), None, false),
+            (Some("1"), Some(" 2 "), None, false),
+            (Some("1"), Some("3"), None, false),
+            // Resident books: only 0 turns them off.
+            (Some("1"), None, Some("1"), true),
+            (Some("1"), None, Some(""), true),
+            (Some("1"), None, Some("no"), true),
+            (Some("1"), None, Some("0"), false),
+            (Some("1"), None, Some(" 0 "), false),
+            (Some("1"), Some("2"), Some("0"), false),
+            (None, Some("0"), Some("1"), false),
+        ];
+        for &(flag, rows, resident, want) in cases {
+            assert_eq!(
+                parse_defer_books(flag, rows, resident),
+                want,
+                "flag {flag:?}, TORUS_BOOK_ROWS {rows:?}, TORUS_RESIDENT_BOOKS {resident:?}"
+            );
+        }
+    }
+
+    /// Flag off: the deferred slots are exactly [`DEFERRED_CFS`] (positions
+    /// and balances), today's table.
+    #[test]
+    fn deferred_slot_table_off_is_todays() {
+        let t = deferred_slot_table(false);
+        let mut want: Vec<usize> = DEFERRED_CFS.iter().map(|cf| slot_of(cf)).collect();
+        want.sort_unstable();
+        let got: Vec<usize> = (0..NUM_CFS).filter(|i| t[*i]).collect();
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 2);
+        assert!(!t[slot_of(crate::cf::CF_NATIVE_ORDER_BOOKS)]);
+    }
+
+    /// Flag on: today's table plus exactly the book slot.
+    #[test]
+    fn deferred_slot_table_on_adds_only_the_book_slot() {
+        let off = deferred_slot_table(false);
+        let on = deferred_slot_table(true);
+        let books = slot_of(crate::cf::CF_NATIVE_ORDER_BOOKS);
+        for i in 0..NUM_CFS {
+            assert_eq!(
+                on[i],
+                off[i] || i == books,
+                "slot {i} ({})",
+                crate::cf::ALL_CF_NAMES[i]
+            );
+        }
+        assert!(on[books]);
+        assert_eq!(on.iter().filter(|d| **d).count(), 3);
+    }
+
     // ---- p3 merge wait: L split into a main and a deferred part ----
+    //
+    // These tests assume TORUS_CKPT_DEFER_BOOKS unset (the routing table is
+    // read from the env once per process): a shell exporting
+    // TORUS_CKPT_DEFER_BOOKS=1 breaks `split_merge_equals_whole_merge_random`
+    // and `deferred_part_blocks_only_deferred_reads` (books are their
+    // non-deferred CF), as with the other env knobs. The flag-on behaviour
+    // is tested in its own process: `tests/ckpt_defer_books.rs`.
 
     /// The CFs of the split tests: two deferred (R's) and four others.
     const SPLIT_CFS: [&str; 6] = [
