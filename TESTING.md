@@ -51,5 +51,9 @@ cargo test --workspace -q > full.log 2>&1; echo "rc=$?"; grep -E -A6 'panicked a
 
 ## Benches
 
-Not covered here. Bench and perf runs keep full output (`SLOW` lines, timings)
-and go to the `bench-runner` agent.
+Bench and perf runs keep full output (`SLOW` lines, timings) and go to the bench
+agents (`bench-runner`, or `bench-launcher` in split mode). New campaign drivers come
+from `tools/matched-bench/campaign/make-driver.py` (JSON spec -> driver; see
+tools/matched-bench/README.md): in a launcher prompt, describe the campaign (arms,
+knobs, baseline, replicates, durations, doc target), not an old driver to copy.
+Campaign shapes it does not support are hand-written, as before.
