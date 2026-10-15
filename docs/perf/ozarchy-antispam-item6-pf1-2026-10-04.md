@@ -11404,6 +11404,103 @@ and 0 in C.
   `ozarchy-s58pilot-tools/`. Search artifacts (both workflow journals, Codex reviews) are in
   `~/bench-results-matched/exp-s58-perf-search-artifacts/`.
 
+## 76. s58 single-flag screen: D, M, T, G, B each alone vs C (twice) and ALL, 300 markets, 300 s cells, n = 1 (campaign ozarchy-s58flags, 2026-10-15)
+
+**No single flag reproduces the timeouts. In the core window (load window minus its first minute), every single-flag
+arm has 2-6 consensus timeouts and 0 `no_proposal`, the same as C (2 and 3). ALL has 30, 16 of them `no_proposal` and
+10 `leader`. Only ALL changes the block cadence (native blk/s +80%), and its timeouts come with that cadence. So the
+cause is the epoch fast path alone, or an interaction between flags; this campaign tests neither. M (+3.1%) and T
+(+2.0%) carry most of the single-flag matched/s gain, and B carries the CPU (+7.5% CPU-s per 1M fills). Indicative
+only: n = 1 per arm, and the only noise estimate is C1 vs C2 (0.8% matched/s).**
+* Timeouts: the five single flags add no `no_proposal` or `leader` timeouts. T (5) and G (6) are above C's 2-3, but
+  all of theirs are `after_vote`. The pilot's r1-C also had 4 of those, so this is not resolved at n = 1.
+* matched/s vs the C mean (228,815; C1 to C2 range 1,770 = 0.77%): M +3.05%, T +1.97%, G +0.58%, B -0.20%, D -0.50%.
+  Only M and T are outside the C range. The single-flag steps add up to +4.9%, while ALL is +9.4%, so about half of
+  ALL's gain needs the epoch fast path or the combination.
+* Exec cuts per flag (ms per native block, vs C1 / C2) match their targets. M: phase_match 28.1 / 28.5 -> 16.9. T:
+  phase_margin 56.0 / 57.3 -> 46.4, and engine_untimed 11.5 -> 7.9. D: settle_pass_b 38.2 / 38.7 -> 30.7. B:
+  save_books 17.8 / 18.5 -> 6.5. G: settle_pass_a 9.9 / 9.8 -> 8.7. Per 1k fills, only M (4.20) and T (4.16) are
+  clearly below C (4.27 / 4.29). D, G and B are flat (4.25 / 4.29 / 4.31). D's and B's cuts do not turn into matched/s.
+* **Verdict: keep M and T as the gain candidates. B costs CPU and gives no throughput alone. D and G show no gain.
+  The timeout regression is not in any of the five s58 flags alone.** Next: an epoch-only arm (E), and E + M + T.
+
+Question (archy s58 perf search, after section 75): which single flag carries ALL's consensus-timeout regression, and
+which carry the matched/s gain and the CPU cost?
+
+Setup:
+* Same node and bench as section 75: `exp/archy-s58-perf-search` `6452fa31`, node md5 `753312e5`, bench md5
+  `9b725823`, one binary for every arm. The arms differ only in their env on all 3 validators. C: none.
+  D `TORUS_SETTLE_DEFER_RESULTS=1`. M `TORUS_PARALLEL_MATCH_SETUP=1`. T `TORUS_FAST_SELL_TOP_UPS=1`.
+  G `TORUS_EXEC_POOL_GRAIN=4`. B `TORUS_PARALLEL_BOOK_SAVE=1`. ALL: all five plus `TORUS_EPOCH_FAST_PATH=1`, the
+  section 75 arm. No arm sets the epoch fast path alone.
+* Workload as in section 75: 300 markets, oracle on, commit tail depth 1, BLOCK_CAP 400, MAX_IN_FLIGHT 4,
+  budget 900, 300 s cells.
+* Cells in run order: w1 (C, 60 s warm-up, not scored), c1-C, d1-D, m1-M, t1-T, g1-G, b1-B, all1-ALL, c2-C
+  (22:04-23:13). C was run first and last, which brackets drift: C2 vs C1 is -0.77% matched/s and +0.38% CPU-s per
+  1M fills.
+
+**Validity:** all 9 cells rc 0, ACCEPT AGREE, liveness PASS. Node md5 `753312e5` on all 3 nodes in every cell; 0
+panic or fail-stop lines, 0 error lines. No `CELL-FLAG` lines, no rerun. Each flag's took-effect line reads on only in
+its own arm and in ALL, on all 3 nodes. `epoch fast path ON` appears only in ALL, once per node, with no warnings.
+
+### 76.1 Cells (`s58flags-all.txt`, `s58flags-timeouts.txt`)
+
+Timeout window: summed over the 3 nodes, counter deltas from `metrics-1hz`, core = [t_bench0 + 60 s, t_bench1].
+Minute 0 holds 7-11 timeouts in every C and single-flag cell (18 in ALL), and the drain holds 10-13. Both are excluded.
+Run-queue wait is from `schedstat` (before -> bench end), mean per node.
+
+| arm | matched/s | vs C mean | native blk/s | CPU-s / 1M fills | timeouts core (no_proposal) | timeouts load window | hotstuff-algo rq wait s | hotstuff CPU s | block p99 ms | exec lag p50 / p90 heights |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C1 | 229,699 | +0.39% | 3.370 | 22.830 | 2 (0) | 10 | 4.26 | 59.7 | 1,147 | 1 / 11 |
+| C2 | 227,930 | -0.39% | 3.307 | 22.917 | 3 (0) | 11 | 4.54 | 59.9 | 1,094 | 1 / 11.2 |
+| D | 227,680 | -0.50% | 3.373 | 22.900 | 2 (0) | 10 | 4.46 | 60.5 | 1,106 | 1 / 10 |
+| M | 235,794 | +3.05% | 3.583 | 22.991 | 2 (0) | 10 | 5.37 | 62.1 | 1,159 | 1 / 21 |
+| T | 233,311 | +1.97% | 3.614 | 22.854 | 5 (0) | 16 | 4.86 | 61.8 | 1,066 | 1 / 13.1 |
+| G | 230,132 | +0.58% | 3.414 | 23.086 | 6 (0) | 14 | 4.80 | 60.1 | 1,117 | 1 / 12 |
+| B | 228,348 | -0.20% | 3.556 | 24.587 | 3 (0) | 10 | 4.65 | 60.6 | 1,160 | 1 / 24.2 |
+| ALL | 250,387 | +9.43% | 6.003 | 24.061 | 30 (16) | 48 | 7.11 | 69.4 | 1,258 | 26 / 61 |
+
+* Block p99 = commit-interval p99, mean of nodes. Exec lag = committed minus applied height (`CHECK LAG` in
+  `campaign.log`). torus-execution run-queue wait: C 7.69 / 7.58 s, single flags 7.81-8.39 s, ALL 10.46 s.
+* `skipping duplicate/replayed native action` warnings per node: C1 1, C2 2, D 50, M 55, T 12, G 4, B 1, ALL 115.
+  The pilot's r1-C had 117 with no flag on, so this count moves from run to run and does not point to a flag.
+
+### 76.2 The timeouts go with ALL's block cadence
+
+* Consensus timeouts per minute (sum of nodes) and val0 native blocks per minute. ALL: 18 / 14 / 13 / 3 / 0
+  timeouts against 370 / 379 / 354 / 372 / 299 blocks. C1: 8 / 1 / 0 / 1 / 0 against 282 / 213 / 170 / 170 / 170.
+  Pilot r1-ALL: 17 / 20 / 17 / 13 / 18 against 464-569 blocks per minute, with 68 core timeouts. In both ALL cells,
+  timeouts persist while the cadence stays high. This run's ALL slowed down (6.0 native blk/s vs 8.97 in the pilot),
+  and its timeouts stopped in minute 4.
+* Per 1k committed blocks (core window, sum of nodes): C 0.9-1.4, single flags 0.9-2.7, ALL 7.1, pilot ALL 10.2.
+  So ALL's extra timeouts are not just more views at the same rate per view: the rate per block is about 6x C's.
+* No single flag moves the cadence by more than +8% (T 3.61, M 3.58 native blk/s, vs C 3.31-3.37). ALL's +80% needs
+  the epoch fast path or the combination, which also put 21 of 21 epoch boundaries on the pipeline (val0). The exec
+  pipeline also falls behind in ALL (lag p50 26 heights vs 1). The `no_proposal` / `leader` timeouts are consistent
+  with a proposer that is waiting at the high cadence, but this run cannot say which flag causes that.
+
+### 76.3 Costs
+
+* CPU: B is the only single flag outside C's range (+7.5% CPU-s per 1M fills; +117 s CPU per node over the whole
+  run vs the C mean). ALL is +5.2%; it has 7% more fills (79.2M vs 74.3M per node) to spread its extra CPU over. G is +0.9%, M +0.5%, D and T are within
+  0.2%.
+* HotStuff run-queue wait: M 5.37 s (+22% vs the C mean of 4.40 s; C range 4.26-4.54 s) is the only clear single-flag
+  rise, but M has 0 `no_proposal` timeouts. T and G are +9-10%, B +6%, D +1%. ALL is +62%, close to the pilot's +69%.
+
+### 76.4 Next
+
+* Epoch-only arm E (`TORUS_EPOCH_FAST_PATH=1`) and E + M + T vs C, ABBA, n >= 4, 300 s cells: about 4 arms x 4 reps
+  x ~8.5 min, or ~2.3 h. If E alone shows the cadence jump and the `no_proposal` timeouts, that settles the
+  timeout question. If not, the interaction needs E + B and E + M + T + B.
+* Confirm M and T before merging: ABBA n >= 4 for each vs C. Their +3.1% and +2.0% are 4x and 2.6x the single
+  C1 to C2 spread, but that is one pair. Keep B only if an E or bundle arm shows it pays for its CPU. D and G can be
+  dropped from the bundle.
+* Data: `~/bench-results-matched/ozarchy-s58flags-300m-{w1,c1-C,d1-D,m1-M,t1-T,g1-G,b1-B,all1-ALL,c2-C}`; campaign
+  `ozarchy-s58flags-run/campaign/` (`handoff.json`, `cells.tsv`, `campaign.log`). Analysis in
+  `ozarchy-s58flags-tools/analyst/out/` (`s58flags-all.{txt,json}` from `s58pilot.py`, and
+  `s58flags-timeouts.{txt,json}` from `s58flags_to.py`, which covers the timeout windows, minute bins, `schedstat`
+  and duplicate warnings, with the pilot cells as `pC` / `pALL`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
