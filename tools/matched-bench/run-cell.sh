@@ -692,7 +692,9 @@ weighted_full_check() {
 }
 
 if pgrep -f "bench-throughput consensus" >/dev/null; then echo "FATAL: a bench is already running" >&2; exit 1; fi
-if pgrep -f "cargo build" >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
+# by process name: a builder waiting on the campaign's build lock (flock ... cargo build)
+# or a shell that only mentions "cargo build" is not building (s1156)
+if pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null; then echo "FATAL: a cargo build is running — never bench while building" >&2; exit 1; fi
 # A stray feed (from a SIGKILLed oracle cell) would sign into THIS devnet too.
 if pgrep -f "bench-throughput oracle-feed" >/dev/null; then echo "FATAL: an oracle feed is already running" >&2; exit 1; fi
 if [ -f "$RUN_DIR/pids" ] && xargs -a "$RUN_DIR/pids" -r -I{} kill -0 {} 2>/dev/null; then
