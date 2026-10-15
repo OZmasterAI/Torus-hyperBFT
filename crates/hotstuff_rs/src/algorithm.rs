@@ -87,6 +87,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             pacemaker_config.epoch_length,
         );
 
+        let max_view_time = pacemaker_config.max_view_time;
         let pacemaker = Pacemaker::new(
             pacemaker_config,
             msg_sender.clone(),
@@ -113,7 +114,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             v => ViewInfo::new(ViewNumber::new(v - 1), init_view_info.deadline),
         };
 
-        let hotstuff = HotStuff::new(
+        let mut hotstuff = HotStuff::new(
             hotstuff_config,
             hotstuff_view_info,
             msg_sender.clone(),
@@ -123,6 +124,11 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                 .expect("Cannot retrieve the validator set state!")
                 .clone(),
             event_publisher.clone(),
+        );
+        // s123 rank 2 review fix (a): cap an app backpressure deferral at
+        // half a view after entry, whatever this node's own deadline says.
+        hotstuff.set_app_backpressure_max_hold(
+            crate::hotstuff::implementation::app_backpressure_max_hold(max_view_time),
         );
 
         let block_sync_client = BlockSyncClient::new(

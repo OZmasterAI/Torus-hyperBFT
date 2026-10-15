@@ -1,9 +1,22 @@
 # s123 rank 2: propose-defer-on-exec-queue
 
-Branch `exp/s123-propose-defer-on-exec-queue` in worktree
-`/home/18c/projects/Torus-hyperBFT/.claude/worktrees/wf_443f7b55-fcb-30`, base main `c612dc7f`.
-Not committed. Patch: `/home/18c/projects/wt/exp-s123/propose-defer-on-exec-queue.patch`
-(`git apply` on `c612dc7f`). Nothing was built or run: no cargo, no LSP, no nodes.
+Branch `exp/s123-propose-defer-on-exec-queue`, rebased onto main `2bc88bcf`. Built and unit-tested
+(hotstuff_rs and torus-consensus suites, workspace nextest), not benched.
+
+## Review fixes (after the static review of the first commit)
+
+- (a) The hold is also capped by the time since view ENTRY: the leader proposes at
+  `min(deadline - 300 ms, entry + max_view_time / 2)`. Entry times are roughly in step across nodes, deadlines are
+  not (a fast run banks up to 2x `max_view_time` of surplus before the S395 rebase), so a leader can no longer
+  outwait a follower's timeout on its own deadline alone. `HotStuff::view_entered_at` is set on every view change
+  (not on a same-view retry); `app_backpressure_max_hold` is wired by `Algorithm::new` from the pacemaker's
+  `max_view_time` (default 600 ms before wiring = half of the node's 1.2 s view time).
+- (b) No deferral in the view right after a timeout (`highest_tc.view + 1 == view`): there a fresh proposal means
+  the TC path found nothing to re-propose (or started RECOVER), and holding it could cascade one timeout into the
+  next. A `highest_tc` read error also proposes at once (main's behaviour).
+- Tests (written first; RED shown: compile failure for (a), and with the TC guard disabled the (b) test fails):
+  `hold_is_capped_by_time_since_view_entry`, `max_hold_is_half_the_view_time`,
+  `fresh_proposal_right_after_tc_is_not_deferred`, `older_tc_does_not_lift_deferral`.
 
 ## What changed
 
@@ -112,16 +125,11 @@ timeouts.
 
 ## Risks
 
-- **Late proposals near the escape.** If exec stalls for longer than (deadline - 300 ms), the leader proposes with
-  only ~300 ms left. Each node computes its deadlines on its own schedule, so a follower can time out first and
-  cause a TC. Normally the deadline is 1.2-2.4 s ahead at entry: the schedule builds up slack until the S395
-  rebase at 2x `max_view_time` (pacemaker `update_view` 2b). Exec frees a slot every ~0.25 s, so the escape
-  should be rare. Watch view timeouts in arm (c). If they rise, try a larger escape or skip deferral right after a
-  TC; both are follow-ups.
-- **A fresh proposal after a TC is still gated** (only the high-tip re-propose is TC-based, implementation.rs
-  `create_proposal_based_on_tc` returns `None` otherwise). This is bounded by the escape. In a backed-off view
-  (`stall_multiplier`) the deadline is further away, so a deferral can last longer, but only while exec is not
-  draining.
+- **Late proposals near the escape.** Bounded by review fix (a): the hold ends at most `max_view_time / 2` after
+  view entry (or 300 ms before this node's deadline, whichever is first), so followers keep at least about half a
+  view to vote. Watch view timeouts in arm (c).
+- **A fresh proposal after a TC** is never deferred (review fix (b)). In a backed-off view (`stall_multiplier`)
+  the hold is still `max_view_time / 2` from entry, not scaled.
 - **A slower follower can still fill its channel.** Each leader paces on its own queue only. A follower whose exec
   is slower than the others' can still reach 64 and block on its send, exactly as today. Its own leader views drain
   it back to W.
@@ -139,7 +147,7 @@ timeouts.
 
 ## Untested / open
 
-- Nothing was compiled or run (owner rule). All 5 hotstuff tests and 6 torus-consensus tests have not been run.
+- Built and tested after the rebase onto `2bc88bcf` (9 hotstuff tests, 6 torus-consensus tests); no bench yet.
 - The debug line's once-per-view behaviour has no test (it would need a log capture).
 - How the TC test fixture's `SignatureSet::genesis()` behaves with `highest_tc` round-trip (borsh) is inferred
   from `implementation.rs` test `view_skip_refused_for_tc_nec_voted_current_or_disabled`, which builds the same
@@ -149,15 +157,6 @@ timeouts.
   hunks are at :806-933 (new section after `nonblocking_exec_dispatch`), :5877-5895, :6108-6125 and :7731-7743.
   Phase 5 and hs-da-own-db (comment at :1582) edit other hunks. Expect textual offsets only, but check on rebase.
 
-## Compile confidence: medium-high
+## Compile status
 
-The risky spots, all checked by reading, not compiled:
-- `self.app_defers_proposal::<K, _>(&*app)`: explicit generics on the callee, `_` for the caller's APIT type.
-- `App::<OrderKV>::proposal_backpressure(&app)` and `App::proposal_backpressure(&app)` (single impl, so K is inferred).
-- `Option::is_some_and` (already used in hotstuff_rs `messages.rs:195`).
-- `tracing::info!(exec_queue_depth, propose_exec_watermark = ?..., "...")`.
-- The test fixture types: TC and TipInfo fields are all `pub`; BlockHeight, CryptoHash and ViewNumber are `Copy`;
-  ViewInfo is `Clone`.
-- There is no other `impl App` in production code to forward the new method through (the only one is
-  `torus-consensus/src/app.rs` `impl App<RocksKVStore> for TorusApp`; the replica takes it directly,
-  `torus-node/src/main.rs:1032`).
+Builds and passes its tests on `2bc88bcf` (see the commit message for counts).

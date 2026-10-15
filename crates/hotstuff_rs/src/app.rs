@@ -302,8 +302,11 @@ pub trait App<K: KVStore>: Send {
     ///   never gated.
     /// - The deferral is retried on the algorithm loop's short (~10 ms) poll,
     ///   so the proposal goes out as soon as this returns `false`.
-    /// - HotStuff proposes anyway when the view deadline is close, so a hint
-    ///   that never clears costs at most a late proposal, never a lost view.
+    /// - HotStuff proposes anyway when the view deadline is close or half a
+    ///   view (`max_view_time / 2`) after it entered the view, whichever is
+    ///   first, and never defers in the view right after a timeout (TC), so
+    ///   a hint that never clears costs at most a late proposal, never a lost
+    ///   view.
     /// - It runs on the algorithm thread, up to every ~10 ms while a proposal
     ///   is deferred: implementations MUST be cheap and non-blocking, and MUST
     ///   NOT touch consensus state. Its value must never feed into anything

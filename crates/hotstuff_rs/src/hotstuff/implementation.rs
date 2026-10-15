@@ -172,6 +172,14 @@ pub(crate) struct HotStuff<N: Network> {
     /// [`App::proposal_backpressure`]; keeps that debug line to once per view
     /// instead of once per ~10 ms retry poll.
     app_backpressure_logged_view: Option<ViewNumber>,
+    /// s123 rank 2 review fix (a): when this replica entered its current view
+    /// (set by `enter_view` on a view change, never by a same-view retry).
+    /// Entry times are roughly in step across nodes, deadlines are not.
+    view_entered_at: Instant,
+    /// s123 rank 2 review fix (a): the longest an app backpressure deferral
+    /// may hold a fresh proposal after view entry (`max_view_time / 2`,
+    /// wired by the algorithm thread from the pacemaker config).
+    app_backpressure_max_hold: Duration,
     /// S432 follower body-starvation heal: throttles [`tick_missing_pc_block_fetch`]
     /// (which does a `block_tree.contains` DB read) to at most one evaluation per
     /// [`BODY_RETRY_INTERVAL`] on the hot algorithm loop.
@@ -258,6 +266,8 @@ impl<N: Network> HotStuff<N> {
             deferred_sync_refresh: false,
             proposal_deferred: false,
             app_backpressure_logged_view: None,
+            view_entered_at: Instant::now(),
+            app_backpressure_max_hold: APP_BACKPRESSURE_DEFAULT_MAX_HOLD,
             last_missing_pc_check: Instant::now(),
             body_push_max_bytes: body_push_max_bytes_from_env(),
             defer_commit_feed: defer_commit_feed_from_env(),
@@ -506,20 +516,42 @@ impl<N: Network> HotStuff<N> {
     /// full queue and parking the HotStuff thread on the blocking exec send.
     /// Node-local and always safe: a deferring leader looks like a slow one.
     ///
-    /// Escape: once the view deadline is within [`APP_BACKPRESSURE_ESCAPE`]
-    /// the leader proposes anyway. The deadline read is `self.view_info`'s,
-    /// which a retry never refreshes; the pacemaker only ever extends a
-    /// view's deadline, so a stale value can only release the proposal
-    /// EARLIER, never hold it past the real deadline.
+    /// Escape: the leader proposes anyway at
+    /// `min(deadline - APP_BACKPRESSURE_ESCAPE, view entry + max hold)`.
+    /// The deadline read is `self.view_info`'s, which a retry never
+    /// refreshes; the pacemaker only ever extends a view's deadline, so a
+    /// stale value can only release the proposal EARLIER, never hold it past
+    /// the real deadline. The entry cap (review fix (a)) bounds the hold
+    /// independently of this node's own deadline, which a fast run can push
+    /// up to 2x `max_view_time` past its followers' deadlines.
+    ///
+    /// Never defers in the view right after a timeout
+    /// (`highest_tc.view + 1 == view`, review fix (b)): a fresh proposal
+    /// there means the TC path found nothing to re-propose, and holding it
+    /// could let one timeout cascade into the next.
     ///
     /// Default app (no override): always `false`, behavior identical to today.
-    fn app_defers_proposal<K: KVStore, A: App<K>>(&mut self, app: &A) -> bool {
+    fn app_defers_proposal<K: KVStore, A: App<K>>(
+        &mut self,
+        app: &A,
+        block_tree: &BlockTreeSingleton<K>,
+    ) -> bool {
         if !app.proposal_backpressure() {
             return false;
         }
-        let slack = self.view_info.deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let slack = self.view_info.deadline.saturating_duration_since(now);
         if slack <= APP_BACKPRESSURE_ESCAPE {
             return false;
+        }
+        if now.saturating_duration_since(self.view_entered_at) >= self.app_backpressure_max_hold {
+            return false;
+        }
+        // A TC read error proposes at once, which is main's behavior.
+        match block_tree.highest_tc() {
+            Ok(Some(tc)) if tc.view + 1 == self.view_info.view => return false,
+            Ok(_) => {}
+            Err(_) => return false,
         }
         if self.app_backpressure_logged_view != Some(self.view_info.view) {
             self.app_backpressure_logged_view = Some(self.view_info.view);
@@ -532,6 +564,12 @@ impl<N: Network> HotStuff<N> {
             );
         }
         true
+    }
+
+    /// s123 rank 2 review fix (a): set the app backpressure hold cap (see
+    /// [`app_backpressure_max_hold`]).
+    pub(crate) fn set_app_backpressure_max_hold(&mut self, max_hold: Duration) {
+        self.app_backpressure_max_hold = max_hold;
     }
 
     /// T1.3 metric accessor: how many times this replica phase-voted on a proposal header whose
@@ -628,7 +666,7 @@ impl<N: Network> HotStuff<N> {
                     // s123 rank 2: same for app backpressure (local exec
                     // queue), until it clears or the deadline escape fires.
                     if self.should_yield_proposal_for_exec_backpressure()
-                        || self.app_defers_proposal::<K, _>(&*app)
+                        || self.app_defers_proposal::<K, _>(&*app, block_tree)
                     {
                         self.proposal_deferred = true;
                         return Ok(());
@@ -732,6 +770,7 @@ impl<N: Network> HotStuff<N> {
         // 2. Update the struct's internal view info, proposal status, and vote collectors to collect
         //    votes for the new view.
         self.view_info = new_view_info;
+        self.view_entered_at = Instant::now();
         self.proposal_status = ProposalStatus::WaitingForProposal;
         self.awaiting_body_vote = None;
         // MonadBFT B2: Cancel any pending recovery when entering a new view.
@@ -848,7 +887,7 @@ impl<N: Network> HotStuff<N> {
                     // ungated on purpose: they carry no new work for the
                     // executor and are what keeps a stalled view live.
                     if self.should_yield_proposal_for_exec_backpressure()
-                        || self.app_defers_proposal::<K, _>(&*app)
+                        || self.app_defers_proposal::<K, _>(&*app, block_tree)
                     {
                         self.proposal_deferred = true;
                         return Ok(());
@@ -3660,6 +3699,17 @@ pub(crate) const MISSING_DATA_RETRY_CAP: usize = 64;
 /// left for the header, the votes and the next leader's QC — so an app hint
 /// that never clears costs a late proposal, not a timed-out view.
 pub(crate) const APP_BACKPRESSURE_ESCAPE: Duration = Duration::from_millis(300);
+
+/// s123 rank 2 review fix (a): the longest an app backpressure deferral may
+/// hold a fresh proposal after view entry, as a function of the pacemaker's
+/// `max_view_time`: half of it.
+pub(crate) fn app_backpressure_max_hold(max_view_time: Duration) -> Duration {
+    max_view_time / 2
+}
+
+/// The hold before the algorithm thread wires the configured one: half of
+/// the node's 1.2 s view time (`timeout_base_ms`, torus-node main.rs).
+pub(crate) const APP_BACKPRESSURE_DEFAULT_MAX_HOLD: Duration = Duration::from_millis(600);
 
 /// L3 v2 (body push): hard cap on the effective push threshold, enforced at
 /// the decision point regardless of the env value. Transport safety: a legacy

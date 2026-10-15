@@ -2,9 +2,11 @@
 //! [`App::proposal_backpressure`] defers its FRESH proposal — no
 //! `produce_block`, nothing broadcast, `has_deferred_proposal()` set — and
 //! the algorithm loop's re-entry (same view) sends it as soon as the hint
-//! clears. Within [`APP_BACKPRESSURE_ESCAPE`] of the view deadline it
-//! proposes anyway. TC-based proposals are never gated, and an app without
-//! the override proposes at view entry exactly as before.
+//! clears. Within [`APP_BACKPRESSURE_ESCAPE`] of the view deadline, or once
+//! the max hold has passed since view entry, it proposes anyway. TC-based
+//! proposals are never gated, nor is any fresh proposal in the view right
+//! after a TC, and an app without the override proposes at view entry exactly
+//! as before.
 //!
 //! Setup (the chain of `leader_feed_order_test`): grandparent `g` (height 0)
 //! and parent `p` (height 1, justified by a QC on `g` in view 1) are in the
@@ -24,7 +26,9 @@ use crate::app::{
 };
 use crate::block_tree::accessors::internal::{BlockTreeSingleton, BlockTreeWriteBatch};
 use crate::hotstuff::header_fast_path_regression_test::{generic_pc, proposer_for};
-use crate::hotstuff::implementation::{HotStuff, APP_BACKPRESSURE_ESCAPE};
+use crate::hotstuff::implementation::{
+    app_backpressure_max_hold, HotStuff, APP_BACKPRESSURE_DEFAULT_MAX_HOLD, APP_BACKPRESSURE_ESCAPE,
+};
 use crate::hotstuff::types::PhaseCertificate;
 use crate::hotstuff::vote_persist_order_test::{
     base_tree, replica, OrderKV, OrderLog, OrderNetwork, BROADCAST_HEADER, CHAIN_ID,
@@ -178,8 +182,15 @@ fn backpressure_defers_fresh_proposal() {
     };
     let info = ViewInfo::new(lead.view, Instant::now() + FAR);
     enter(&mut lead, &info, &mut app);
-    assert_eq!(app.produced, 0, "a deferred leader must not call produce_block");
-    assert_eq!(headers(&lead.log), 0, "nothing may be broadcast while deferred");
+    assert_eq!(
+        app.produced, 0,
+        "a deferred leader must not call produce_block"
+    );
+    assert_eq!(
+        headers(&lead.log),
+        0,
+        "nothing may be broadcast while deferred"
+    );
     assert!(
         lead.leader.has_deferred_proposal(),
         "the proposal must be deferred (retried by the loop), not abandoned"
@@ -208,7 +219,10 @@ fn deferred_proposal_goes_out_once_backpressure_clears() {
     // The executor caught up: the next poll proposes.
     app.backpressure = false;
     enter(&mut lead, &info, &mut app);
-    assert_eq!(app.produced, 1, "exactly one block once backpressure clears");
+    assert_eq!(
+        app.produced, 1,
+        "exactly one block once backpressure clears"
+    );
     assert_eq!(headers(&lead.log), 1, "exactly one proposal header");
     assert!(!lead.leader.has_deferred_proposal());
 }
@@ -218,7 +232,10 @@ fn deferred_proposal_goes_out_once_backpressure_clears() {
 #[test]
 fn near_deadline_proposes_despite_backpressure() {
     let near = Duration::from_millis(100);
-    assert!(near < APP_BACKPRESSURE_ESCAPE, "the case must sit inside the escape");
+    assert!(
+        near < APP_BACKPRESSURE_ESCAPE,
+        "the case must sit inside the escape"
+    );
     let mut lead = leader_of_view_3();
     let mut app = PacedApp {
         backpressure: true,
@@ -236,7 +253,10 @@ fn near_deadline_proposes_despite_backpressure() {
 fn default_app_never_defers() {
     let mut lead = leader_of_view_3();
     let mut app = PlainApp { produced: 0 };
-    assert!(!App::<OrderKV>::proposal_backpressure(&app), "trait default is false");
+    assert!(
+        !App::<OrderKV>::proposal_backpressure(&app),
+        "trait default is false"
+    );
     let info = ViewInfo::new(lead.view, Instant::now() + FAR);
     enter(&mut lead, &info, &mut app);
     assert_eq!(app.produced, 1);
@@ -276,4 +296,99 @@ fn tc_based_proposal_is_not_gated() {
     assert_eq!(headers(&lead.log), 1, "the TC re-proposal must go out");
     assert_eq!(app.produced, 0, "a TC re-proposal builds no new block");
     assert!(!lead.leader.has_deferred_proposal());
+}
+
+/// Review fix (a): the hold is capped by the time since this node ENTERED the
+/// view, not only by its own deadline. Deadlines differ across nodes (a fast
+/// run banks up to 2x `max_view_time` of surplus), entry times do not, so a
+/// leader can no longer outwait its followers' timeouts.
+#[test]
+fn hold_is_capped_by_time_since_view_entry() {
+    let mut lead = leader_of_view_3();
+    lead.leader
+        .set_app_backpressure_max_hold(Duration::from_millis(40));
+    let mut app = PacedApp {
+        backpressure: true,
+        produced: 0,
+    };
+    // The deadline is far: only the entry-time cap can release the proposal.
+    let info = ViewInfo::new(lead.view, Instant::now() + FAR);
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(app.produced, 0, "inside the hold: still deferred");
+    assert!(lead.leader.has_deferred_proposal());
+
+    std::thread::sleep(Duration::from_millis(60));
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(
+        app.produced, 1,
+        "past entry + max hold the leader must propose"
+    );
+    assert_eq!(headers(&lead.log), 1);
+    assert!(!lead.leader.has_deferred_proposal());
+}
+
+/// The hold is half of `max_view_time` (the node wires it from its pacemaker
+/// config); the default before wiring matches the node's 1.2 s view time.
+#[test]
+fn max_hold_is_half_the_view_time() {
+    assert_eq!(
+        app_backpressure_max_hold(Duration::from_millis(1200)),
+        Duration::from_millis(600)
+    );
+    assert_eq!(
+        APP_BACKPRESSURE_DEFAULT_MAX_HOLD,
+        Duration::from_millis(600)
+    );
+}
+
+fn losing_tc(view: ViewNumber) -> TimeoutCertificate {
+    TimeoutCertificate {
+        chain_id: CHAIN_ID,
+        view,
+        signatures: SignatureSet::genesis(),
+        high_tip: None,
+        high_qc: None,
+        high_tip_is_winner: false,
+        voter_metadata: vec![],
+    }
+}
+
+/// Review fix (b): in the view right after a timeout (`highest_tc.view + 1 ==
+/// view`), a fresh proposal (the TC path returned `None`) is never deferred,
+/// so one timeout cannot cascade into the next view.
+#[test]
+fn fresh_proposal_right_after_tc_is_not_deferred() {
+    let mut lead = leader_of_view_3();
+    let tc = losing_tc(ViewNumber::new(lead.view.int() - 1));
+    lead.block_tree.set_highest_tc(&tc).expect("set highest_tc");
+    lead.log.lock().unwrap().clear();
+
+    let mut app = PacedApp {
+        backpressure: true,
+        produced: 0,
+    };
+    let info = ViewInfo::new(lead.view, Instant::now() + FAR);
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(app.produced, 1, "the view after a TC must propose at once");
+    assert_eq!(headers(&lead.log), 1);
+    assert!(!lead.leader.has_deferred_proposal());
+}
+
+/// An older TC (not the previous view) does not lift the deferral.
+#[test]
+fn older_tc_does_not_lift_deferral() {
+    let mut lead = leader_of_view_3();
+    let tc = losing_tc(ViewNumber::new(lead.view.int() - 2));
+    lead.block_tree.set_highest_tc(&tc).expect("set highest_tc");
+    lead.log.lock().unwrap().clear();
+
+    let mut app = PacedApp {
+        backpressure: true,
+        produced: 0,
+    };
+    let info = ViewInfo::new(lead.view, Instant::now() + FAR);
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(app.produced, 0);
+    assert_eq!(headers(&lead.log), 0);
+    assert!(lead.leader.has_deferred_proposal());
 }
