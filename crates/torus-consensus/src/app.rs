@@ -2151,12 +2151,12 @@ fn tree_parent_header(
 /// (`detect_parent_link_violation`); the committed chain follows the justify
 /// links, so a certified block always passes it there.
 ///
-/// Item 7 step 1: once the link holds, the header's EVM gas limit and N
-/// (`evm_block_interval`) equal the parent's, except at an epoch boundary,
-/// where they equal the epoch plan's values (`boundary`; an unset value or
-/// no plan: the parent's). A plan this node cannot read yet is `Missing`,
-/// like the validator-set plan in `finish_validate`. The base fee always
-/// equals the parent's.
+/// Item 7 steps 1-2: once the link holds, the header's six EVM values (gas
+/// limit, N = `evm_block_interval`, M = `evm_big_block_interval`, big gas
+/// limit, both base fees) equal the parent's, except at an epoch boundary,
+/// where they equal the epoch plan's values (`boundary`, `PlanEvm::resolve`;
+/// an unset value or no plan: the parent's). A plan this node cannot read yet
+/// is `Missing`, like the validator-set plan in `finish_validate`.
 fn check_parent_link(
     header: &TorusBlockHeader,
     justify: &PhaseCertificate,
@@ -2196,32 +2196,20 @@ fn check_parent_link(
         );
         return BlockDataCheck::Invalid;
     }
-    // Item 7: the EVM gas limit and N are the rule values. Off a boundary: the
-    // parent's. At a boundary: the plan's (unset or no plan: the parent's).
-    // The check runs after the link, so a header with a bogus height is
-    // Invalid and never waits on a plan. Base fee: fixed on purpose until the
-    // owner decides EIP-1559 vs a fixed fee (docs/plans/item7-evm-lanes.md,
-    // open question 4); the EIP-1559 check in `torus_bridge::validator` is
-    // not wired into consensus.
-    let plan = match boundary(header.height) {
-        Ok(plan) => plan.unwrap_or_default(),
+    // Item 7 steps 1-2: the six EVM values (gas limit, N, M, big gas limit, both base fees) are the
+    // rule values. Off a boundary: the parent's. At a boundary: the plan's (unset or no plan: the
+    // parent's). After the link check, so a bogus height is Invalid and never waits on a plan.
+    let rule = match boundary(header.height) {
+        Ok(plan) => plan.unwrap_or_default().resolve(&parent),
         Err(EpochPlanNotReady) => return BlockDataCheck::Missing,
     };
-    let gas_limit = plan.gas_limit.unwrap_or(parent.evm_gas_limit);
-    let block_interval = plan.block_interval.unwrap_or(parent.evm_block_interval);
-    if header.evm_gas_limit != gas_limit
-        || header.evm_block_interval != block_interval
-        || header.base_fee_per_gas != parent.base_fee_per_gas
-    {
+    let got = torus_types::EvmHeaderValues::of(header);
+    if got != rule {
         tracing::warn!(
             height = header.height,
-            evm_gas_limit = header.evm_gas_limit,
-            gas_limit,
-            evm_block_interval = header.evm_block_interval,
-            block_interval,
-            base_fee_per_gas = header.base_fee_per_gas,
-            parent_base_fee_per_gas = parent.base_fee_per_gas,
-            "REJECTED -- EVM gas limit, interval or base fee differs from the rule value"
+            ?got,
+            ?rule,
+            "REJECTED -- EVM header values differ from the rule values"
         );
         return BlockDataCheck::Invalid;
     }
@@ -7330,15 +7318,11 @@ impl TorusApp {
         let Ok(plan_evm) = self.boundary_evm(next_height) else {
             return refused_proposal();
         };
-        let plan_evm = plan_evm.unwrap_or_default();
-        let evm_gas_limit = plan_evm.gas_limit.unwrap_or(parent_header.evm_gas_limit);
-        let evm_block_interval = plan_evm
-            .block_interval
-            .unwrap_or(parent_header.evm_block_interval);
+        let evm = plan_evm.unwrap_or_default().resolve(&parent_header);
         // Cadence: EVM txs only at height % N == 0. A 0 limit makes select_block_payload skip
         // the destructive drain, so off-cadence txs stay pooled (N = 0 carries none).
-        let gas_limit = if next_height.checked_rem(evm_block_interval) == Some(0) {
-            evm_gas_limit
+        let gas_limit = if next_height.checked_rem(evm.block_interval) == Some(0) {
+            evm.gas_limit
         } else {
             0
         };
@@ -7406,16 +7390,15 @@ impl TorusApp {
                 logs_bloom: Bloom::ZERO,
                 evm_gas_used: 0,
                 evm_fee_revenue: 0,
-                evm_gas_limit,
-                evm_block_interval,
-                // Item 7 step 2: the parent's big-lane values until the six-value
-                // boundary rule (B6) resolves them from the epoch plan.
-                evm_big_block_interval: parent_header.evm_big_block_interval,
-                evm_big_gas_limit: parent_header.evm_big_gas_limit,
+                // Item 7 steps 1-2: the six values of the boundary rule.
+                evm_gas_limit: evm.gas_limit,
+                evm_block_interval: evm.block_interval,
+                evm_big_block_interval: evm.big_block_interval,
+                evm_big_gas_limit: evm.big_gas_limit,
                 native_action_count: native_actions.len() as u32,
                 evm_tx_count: evm_txs.len() as u32,
-                base_fee_per_gas: parent_header.base_fee_per_gas,
-                big_base_fee_per_gas: parent_header.big_base_fee_per_gas,
+                base_fee_per_gas: evm.base_fee,
+                big_base_fee_per_gas: evm.big_base_fee,
                 epoch: parent_header.epoch,
                 validator_set_hash: parent_header.validator_set_hash,
                 sig_attestation,
@@ -21551,6 +21534,7 @@ mod crash_recovery_tests {
         let full = PlanEvm {
             gas_limit: Some(5_000_000),
             block_interval: Some(10),
+            ..PlanEvm::default()
         };
         assert_eq!(link(5_000_000, 10, full), BlockDataCheck::Held);
         for (gas_limit, n, what) in [
@@ -21563,6 +21547,7 @@ mod crash_recovery_tests {
         let gas_only = PlanEvm {
             gas_limit: Some(5_000_000),
             block_interval: None,
+            ..PlanEvm::default()
         };
         assert_eq!(
             link(5_000_000, pn, gas_only),
@@ -21593,6 +21578,105 @@ mod crash_recovery_tests {
             ("N lowered", |h| h.evm_block_interval -= 1),
             ("gas limit raised", |h| h.evm_gas_limit += 1),
             ("gas limit lowered", |h| h.evm_gas_limit -= 1),
+        ];
+        for (what, change) in variants {
+            let mut b = honest.clone();
+            change(&mut b.header);
+            assert_eq!(
+                pre_vote(&mut app, &parent, &b),
+                BlockDataCheck::Invalid,
+                "{what}"
+            );
+            assert_eq!(
+                link_on(&app, &parent, &b, |h| app.boundary_evm(h)),
+                BlockDataCheck::Invalid,
+                "{what}: parent link"
+            );
+        }
+    }
+
+    /// Item 7 step 2: at an epoch boundary M, the big gas limit and both base
+    /// fees equal the plan's too (the six-value rule). The child carrying
+    /// exactly the plan's four (and the parent's small limit and N) is `Held`;
+    /// each variant with one of them at the parent's value is `Invalid`. RED
+    /// before: the plan had no big-lane or fee values and the header's big-lane
+    /// values were not checked.
+    #[test]
+    fn boundary_header_must_equal_the_plans_big_lane_and_fees() {
+        let parent = tip_2000();
+        let app = ts_app(2_010);
+        let plan = PlanEvm {
+            big_block_interval: Some(190),
+            big_gas_limit: Some(15_000_000),
+            base_fee: Some(1_100_000_000),
+            big_base_fee: Some(1_200_000_000),
+            ..Default::default()
+        };
+        let p = parent.header.clone();
+        assert_ne!(p.evm_big_block_interval, 190);
+        assert_ne!(p.evm_big_gas_limit, 15_000_000);
+        assert_ne!(p.base_fee_per_gas, 1_100_000_000);
+        assert_ne!(p.big_base_fee_per_gas, 1_200_000_000);
+        let mut honest = evm_header_child(&parent, p.evm_gas_limit, p.evm_block_interval);
+        honest.header.evm_big_block_interval = 190;
+        honest.header.evm_big_gas_limit = 15_000_000;
+        honest.header.base_fee_per_gas = 1_100_000_000;
+        honest.header.big_base_fee_per_gas = 1_200_000_000;
+        assert_eq!(
+            link_on(&app, &parent, &honest, move |_| Ok(Some(plan))),
+            BlockDataCheck::Held
+        );
+        type Revert = fn(&mut TorusBlockHeader, &TorusBlockHeader);
+        let variants: [(&str, Revert); 4] = [
+            ("the parent's M", |h, p| {
+                h.evm_big_block_interval = p.evm_big_block_interval
+            }),
+            ("the parent's big limit", |h, p| {
+                h.evm_big_gas_limit = p.evm_big_gas_limit
+            }),
+            ("the parent's base fee", |h, p| {
+                h.base_fee_per_gas = p.base_fee_per_gas
+            }),
+            ("the parent's big base fee", |h, p| {
+                h.big_base_fee_per_gas = p.big_base_fee_per_gas
+            }),
+        ];
+        for (what, revert) in variants {
+            let mut b = honest.clone();
+            revert(&mut b.header, &p);
+            assert_eq!(
+                link_on(&app, &parent, &b, move |_| Ok(Some(plan))),
+                BlockDataCheck::Invalid,
+                "{what}"
+            );
+        }
+    }
+
+    /// Item 7 step 2: off a boundary M, the big gas limit and the big base fee
+    /// equal the parent's, before the vote and in `check_parent_link`. RED
+    /// before: none of the three was checked.
+    #[test]
+    fn off_boundary_header_must_equal_the_parents_big_lane_and_fees() {
+        let mut parent = tip_2000();
+        // A parent with big blocks on (M = 50), so -1 stays a valid u64.
+        parent.header.evm_big_block_interval = 50;
+        let mut app = ts_app(2_010);
+        assert_eq!(app.boundary_evm(5), Ok(None), "5 is no boundary (L = 100)");
+        let mut honest = child_of(&parent, 2_000);
+        honest.header.evm_big_block_interval = 50;
+        assert_eq!(pre_vote(&mut app, &parent, &honest), BlockDataCheck::Held);
+        assert_eq!(
+            link_on(&app, &parent, &honest, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        type Change = fn(&mut TorusBlockHeader);
+        let variants: [(&str, Change); 6] = [
+            ("M raised", |h| h.evm_big_block_interval += 1),
+            ("M lowered", |h| h.evm_big_block_interval -= 1),
+            ("big limit raised", |h| h.evm_big_gas_limit += 1),
+            ("big limit lowered", |h| h.evm_big_gas_limit -= 1),
+            ("big base fee raised", |h| h.big_base_fee_per_gas += 1),
+            ("big base fee lowered", |h| h.big_base_fee_per_gas -= 1),
         ];
         for (what, change) in variants {
             let mut b = honest.clone();
@@ -21789,6 +21873,7 @@ mod crash_recovery_tests {
         let changed = PlanEvm {
             gas_limit: Some(5_000_000),
             block_interval: Some(10),
+            ..PlanEvm::default()
         };
         let put_rows = |db: &StateDb| {
             for (key, value) in [
@@ -21861,6 +21946,67 @@ mod crash_recovery_tests {
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
         assert_eq!(app.boundary_evm(8), Ok(Some(PlanEvm::default())));
         assert_eq!(app.boundary_evm(12), Ok(Some(changed)));
+        drop(ctx);
+    }
+
+    /// Item 7 step 2 end to end (L = 4): the governance M and big gas limit
+    /// rows present when boundary 4 executes reach plan(8); the leader builds
+    /// block 8 with them, the link check accepts it and refuses the parent's
+    /// values; block 9 keeps them. RED before: the plan and the proposer
+    /// ignored both rows.
+    #[test]
+    fn governance_big_lane_params_reach_the_header_at_the_next_boundary_plus_l() {
+        use torus_state::cf::CF_FEE_CONFIG;
+        let changed = PlanEvm {
+            big_block_interval: Some(190),
+            big_gas_limit: Some(15_000_000),
+            ..PlanEvm::default()
+        };
+        let big_values =
+            |b: &TorusBlock| (b.header.evm_big_block_interval, b.header.evm_big_gas_limit);
+
+        let (mut app, db, config) = epoch4_app(1_010);
+        let ctx = make_exec_ctx(&config, &db);
+        for h in 1..=3 {
+            dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
+        }
+        for (key, value) in [
+            (torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM, "190"),
+            (torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM, "15000000"),
+        ] {
+            db.put_cf_raw(CF_FEE_CONFIG, key.as_bytes(), value.as_bytes())
+                .unwrap();
+        }
+        dispatch_and_execute(&ctx, &db, &make_block(4, vec![]));
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        assert_eq!(app.boundary_evm(8), Ok(Some(changed)));
+
+        let parent7 = make_block(7, vec![]);
+        let _ = app.build_proposal(parent7.header.clone());
+        let block8 = app.pending_proposals[&8].block.clone();
+        assert_eq!(big_values(&block8), (190, 15_000_000));
+        assert_eq!(
+            link_on(&app, &parent7, &block8, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
+        let mut unchanged = block8.clone();
+        (
+            unchanged.header.evm_big_block_interval,
+            unchanged.header.evm_big_gas_limit,
+        ) = big_values(&parent7);
+        assert_eq!(
+            link_on(&app, &parent7, &unchanged, |h| app.boundary_evm(h)),
+            BlockDataCheck::Invalid,
+            "the parent's big-lane values at the boundary"
+        );
+
+        let _ = app.build_proposal(block8.header.clone());
+        let block9 = app.pending_proposals[&9].block.clone();
+        assert_eq!(big_values(&block9), (190, 15_000_000));
+        assert_eq!(
+            link_on(&app, &block8, &block9, |h| app.boundary_evm(h)),
+            BlockDataCheck::Held
+        );
         drop(ctx);
     }
 

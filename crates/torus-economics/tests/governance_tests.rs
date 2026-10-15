@@ -702,6 +702,54 @@ fn evm_block_param_changes_are_range_checked_and_execute_into_fee_config() {
     }
 }
 
+/// Item 7 step 2: M (0 = off, or 30..=10,000), the big gas limit (1M..=30M)
+/// and the CoreWriter order delay K (1..=100) are ParameterChange keys. Out
+/// of range or not a number is refused at submission; a valid value executes
+/// into its own CF_FEE_CONFIG row. RED before: the three keys were not
+/// modifiable.
+#[test]
+fn big_lane_and_corewriter_param_changes_are_range_checked_and_execute_into_fee_config() {
+    let (_dir, gov, staking) = setup();
+    let validator = setup_validator(&staking, 1);
+    setup_voter(&staking, 2, validator, wei(500), U256::ZERO);
+    let m = torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM;
+    let big = torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM;
+    let k = torus_types::CORE_WRITER_ORDER_DELAY_PARAM;
+    let refused: [(&str, &[&str]); 3] = [
+        (m, &["1", "29", "10001", "x"]),
+        (big, &["999999", "30000001", "x"]),
+        (k, &["0", "101", "x"]),
+    ];
+    for (key, bads) in refused {
+        for bad in bads {
+            let payload = ExecutionPayload::ParameterChange {
+                param_key: key.into(),
+                new_value: (*bad).into(),
+            };
+            let r = gov.submit_proposal(addr(2), "P".into(), "D".into(), Some(payload), 0);
+            assert!(
+                matches!(&r, Err(EconomicsError::InvalidParameterValue { key: kk, .. }) if kk == key),
+                "{key} = {bad}: {r:?}"
+            );
+        }
+    }
+    let passed = [
+        (0, m, "0"),
+        (200, m, "190"),
+        (400, big, "15000000"),
+        (600, k, "10"),
+    ];
+    for (block, key, value) in passed {
+        pass_param(&gov, key, value, &[2], block);
+        let data = gov
+            .state()
+            .get_cf_raw(CF_FEE_CONFIG, key.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, value.as_bytes(), "{key}");
+    }
+}
+
 #[test]
 fn execute_treasury_spend() {
     let (_dir, gov, staking) = setup();

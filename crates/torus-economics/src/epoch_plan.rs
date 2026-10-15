@@ -40,11 +40,33 @@ pub struct PlanMember {
     pub commission_bps: u16,
 }
 
-/// Item 7 step 1: EVM header values from `boundary` on (`None` = keep the parent's).
+/// Item 7 steps 1-2: EVM header values from `boundary` on (`None` = keep the parent's).
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlanEvm {
     pub gas_limit: Option<u64>,
     pub block_interval: Option<u64>,
+    /// Item 7 step 2: M and the big lane's gas limit (governance), and both base fees (F3,
+    /// set by the previous boundary's execution, B9).
+    pub big_block_interval: Option<u64>,
+    pub big_gas_limit: Option<u64>,
+    pub base_fee: Option<u64>,
+    pub big_base_fee: Option<u64>,
+}
+
+impl PlanEvm {
+    /// The header values from this boundary on: each set value, else the parent's.
+    pub fn resolve(&self, parent: &torus_types::TorusBlockHeader) -> torus_types::EvmHeaderValues {
+        torus_types::EvmHeaderValues {
+            gas_limit: self.gas_limit.unwrap_or(parent.evm_gas_limit),
+            block_interval: self.block_interval.unwrap_or(parent.evm_block_interval),
+            big_block_interval: self
+                .big_block_interval
+                .unwrap_or(parent.evm_big_block_interval),
+            big_gas_limit: self.big_gas_limit.unwrap_or(parent.evm_big_gas_limit),
+            base_fee: self.base_fee.unwrap_or(parent.base_fee_per_gas),
+            big_base_fee: self.big_base_fee.unwrap_or(parent.big_base_fee_per_gas),
+        }
+    }
 }
 
 /// The validator set that takes effect at `boundary`, computed by the
@@ -320,6 +342,15 @@ impl EpochManager {
                 torus_types::EVM_BLOCK_INTERVAL_PARAM,
                 &torus_types::EVM_BLOCK_INTERVAL_RANGE,
             )?,
+            // Item 7 step 2: M is 0 (off) or in its range, so the range check is a predicate.
+            big_block_interval: gov(torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM, &(0..=u64::MAX))?
+                .filter(|&m| torus_types::evm_big_block_interval_ok(m)),
+            big_gas_limit: gov(
+                torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM,
+                &torus_types::EVM_BIG_BLOCK_GAS_LIMIT_RANGE,
+            )?,
+            base_fee: None,     // F3, B9
+            big_base_fee: None, // F3, B9
         };
         staking.put_epoch_rotation_plan(&next)?;
         Ok(installed)
@@ -492,6 +523,7 @@ mod tests {
             PlanEvm {
                 gas_limit: Some(5_000_000),
                 block_interval: Some(10),
+                ..PlanEvm::default()
             }
         );
         assert!(!plan8.changed, "EVM values leave the validator set alone");
@@ -524,6 +556,151 @@ mod tests {
                 .expect("plan for 8 stored");
             assert_eq!(plan8.evm, PlanEvm::default(), "{stored:?}");
         }
+    }
+
+    /// Write the two big-lane governance rows (`CF_FEE_CONFIG`, decimal).
+    fn put_big_params(mgr: &StakingManager, big_block_interval: &[u8], big_gas_limit: &[u8]) {
+        let state = mgr.state();
+        state
+            .put_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM.as_bytes(),
+                big_block_interval,
+            )
+            .unwrap();
+        state
+            .put_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM.as_bytes(),
+                big_gas_limit,
+            )
+            .unwrap();
+    }
+
+    /// Execute boundary 4 with both big-lane rows set (any may be unparsable)
+    /// and return plan(8)'s EVM values.
+    fn plan8_evm_with_big_params(big_block_interval: &str, big_gas_limit: &str) -> PlanEvm {
+        let (_d, mgr) = setup();
+        for n in 1..=4 {
+            put(&mgr, n, 100, ValidatorStatus::Active);
+        }
+        put_big_params(
+            &mgr,
+            big_block_interval.as_bytes(),
+            big_gas_limit.as_bytes(),
+        );
+        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4).unwrap();
+        mgr.epoch_rotation_plan(8)
+            .unwrap()
+            .expect("plan for 8 stored")
+            .evm
+    }
+
+    /// Item 7 step 2: execution of boundary H copies the governance big-lane
+    /// rows (M, big gas limit) into plan(H + L). RED before: the plan had no
+    /// big-lane values.
+    #[test]
+    fn plan_carries_governance_big_lane_params() {
+        let (_d, mgr) = setup();
+        for n in 1..=4 {
+            put(&mgr, n, 100, ValidatorStatus::Active);
+        }
+        let genesis = EpochManager::compute_new_validator_set(&mgr, u32::MAX, 0).unwrap();
+        mgr.record_genesis_epoch_set(&genesis).unwrap();
+        put_big_params(&mgr, b"190", b"15000000");
+        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4).unwrap();
+        let plan8 = mgr
+            .epoch_rotation_plan(8)
+            .unwrap()
+            .expect("plan for 8 stored");
+        assert_eq!(plan8.evm.big_block_interval, Some(190));
+        assert_eq!(plan8.evm.big_gas_limit, Some(15_000_000));
+        assert_eq!(plan8.evm.gas_limit, None);
+        assert_eq!(plan8.evm.block_interval, None);
+        assert_eq!(plan8.evm.base_fee, None, "F3 (B9) sets the fees");
+        assert_eq!(plan8.evm.big_base_fee, None, "F3 (B9) sets the fees");
+        assert!(!plan8.changed, "EVM values leave the validator set alone");
+    }
+
+    /// M: 0 switches big blocks off (a value); 1..=29, above 10,000 or not a
+    /// number keep the chain's M. Big limit: outside 1M..=30M or not a number
+    /// keeps the chain's limit.
+    #[test]
+    fn plan_big_lane_values_outside_their_range_keep_the_chain_values() {
+        let m_cases = [
+            ("0", Some(0)),
+            ("30", Some(30)),
+            ("10000", Some(10_000)),
+            ("1", None),
+            ("29", None),
+            ("10001", None),
+            ("x", None),
+        ];
+        for (stored, want) in m_cases {
+            let evm = plan8_evm_with_big_params(stored, "x");
+            assert_eq!(evm.big_block_interval, want, "M {stored:?}");
+            assert_eq!(evm.big_gas_limit, None, "M {stored:?}");
+        }
+        let limit_cases = [
+            ("999999", None),
+            ("30000001", None),
+            ("x", None),
+            ("1000000", Some(1_000_000)),
+            ("30000000", Some(30_000_000)),
+        ];
+        for (stored, want) in limit_cases {
+            let evm = plan8_evm_with_big_params("x", stored);
+            assert_eq!(evm.big_gas_limit, want, "big limit {stored:?}");
+            assert_eq!(evm.big_block_interval, None, "big limit {stored:?}");
+        }
+    }
+
+    /// `PlanEvm::resolve` takes each set value, else the parent's.
+    #[test]
+    fn plan_resolve_takes_set_values_else_the_parents() {
+        let parent = torus_types::TorusBlockHeader {
+            height: 7,
+            parent_hash: alloy_primitives::B256::ZERO,
+            timestamp: 0,
+            proposer: Address::ZERO,
+            state_root: alloy_primitives::B256::ZERO,
+            receipts_root: alloy_primitives::B256::ZERO,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            evm_gas_used: 0,
+            evm_fee_revenue: 0,
+            evm_gas_limit: 3_000_000,
+            evm_block_interval: 11,
+            evm_big_block_interval: 50,
+            evm_big_gas_limit: 10_000_000,
+            native_action_count: 0,
+            evm_tx_count: 0,
+            base_fee_per_gas: 1_000_000_000,
+            big_base_fee_per_gas: 1_500_000_000,
+            epoch: 0,
+            validator_set_hash: alloy_primitives::B256::ZERO,
+            sig_attestation: [0u8; 64],
+        };
+        let plan = PlanEvm {
+            big_block_interval: Some(190),
+            base_fee: Some(2_000_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan.resolve(&parent),
+            torus_types::EvmHeaderValues {
+                gas_limit: 3_000_000,
+                block_interval: 11,
+                big_block_interval: 190,
+                big_gas_limit: 10_000_000,
+                base_fee: 2_000_000_000,
+                big_base_fee: 1_500_000_000,
+            }
+        );
+        assert_eq!(
+            PlanEvm::default().resolve(&parent),
+            torus_types::EvmHeaderValues::of(&parent),
+            "an empty plan keeps every parent value"
+        );
     }
 
     #[test]
