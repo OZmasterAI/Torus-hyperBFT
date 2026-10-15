@@ -1364,7 +1364,9 @@ fn batch_verify_impl(
         };
         // Lookups stay on this thread, in input order: `verified_lookup` sees the
         // identical key sequence (no call for a session action's `None`).
-        keys.into_iter().map(|key| key.and_then(|k| verified_lookup(&k))).collect()
+        keys.into_iter()
+            .map(|key| key.and_then(|k| verified_lookup(&k)))
+            .collect()
     } else {
         let mut cache_key_scratch = Vec::new();
         actions
@@ -2800,12 +2802,28 @@ mod tests {
     fn use_parallel_keys_gates_on_flag_mode_and_size() {
         use super::{use_parallel_keys, VerifyMode, PARALLEL_KEYS_MIN_ACTIONS as MIN};
         assert_eq!(MIN, 16);
-        for mode in [VerifyMode::Default, VerifyMode::Pool(2), VerifyMode::Pool(4)] {
-            assert!(use_parallel_keys(true, mode, MIN), "{mode:?}: MIN actions go parallel");
+        for mode in [
+            VerifyMode::Default,
+            VerifyMode::Pool(2),
+            VerifyMode::Pool(4),
+        ] {
+            assert!(
+                use_parallel_keys(true, mode, MIN),
+                "{mode:?}: MIN actions go parallel"
+            );
             assert!(use_parallel_keys(true, mode, 400), "{mode:?}");
-            assert!(!use_parallel_keys(true, mode, MIN - 1), "{mode:?}: below MIN stays serial");
-            assert!(!use_parallel_keys(true, mode, 0), "{mode:?}: empty block stays serial");
-            assert!(!use_parallel_keys(false, mode, 400), "{mode:?}: flag off stays serial");
+            assert!(
+                !use_parallel_keys(true, mode, MIN - 1),
+                "{mode:?}: below MIN stays serial"
+            );
+            assert!(
+                !use_parallel_keys(true, mode, 0),
+                "{mode:?}: empty block stays serial"
+            );
+            assert!(
+                !use_parallel_keys(false, mode, 400),
+                "{mode:?}: flag off stays serial"
+            );
         }
         assert!(
             !use_parallel_keys(true, VerifyMode::Serial, 400),
@@ -2886,11 +2904,14 @@ mod tests {
                               actions: &mut Vec<SignedNativeAction>,
                               expected: &mut Vec<Option<Address>>| {
             valid_eip712 += 1;
-            if valid_eip712 % 3 == 0 {
+            if valid_eip712.is_multiple_of(3) {
                 let mut sentinel = [0xC0u8; 20];
                 sentinel[19] = valid_eip712;
                 let sentinel = Address::from(sentinel);
-                cache.insert(crate::verified_cache_key(&a).expect("eip712 is cacheable"), sentinel);
+                cache.insert(
+                    crate::verified_cache_key(&a).expect("eip712 is cacheable"),
+                    sentinel,
+                );
                 expected.push(Some(sentinel));
             } else {
                 expected.push(Some(signer));
@@ -2898,13 +2919,19 @@ mod tests {
             actions.push(a);
         };
 
-        let batches =
-            [(1u64, true), (1, false), (50, true), (50, false), (400, true), (400, false)];
+        let batches = [
+            (1u64, true),
+            (1, false),
+            (50, true),
+            (50, false),
+            (400, true),
+            (400, false),
+        ];
         for round in 0..5u64 {
             let nonce = |j: u64| TEST_NONCE + round * 100 + j;
             for (j, &(n, cloids)) in batches.iter().enumerate() {
                 let j = j as u64;
-                let (k, signer) = if j % 2 == 0 {
+                let (k, signer) = if j.is_multiple_of(2) {
                     (&key, signer_address(&key))
                 } else {
                     (&key2, signer_address(&key2))
@@ -2954,7 +2981,9 @@ mod tests {
             ));
             expected.push(Some(owner));
             actions.push(sign_action_with_session(
-                NativeAction::CancelOrder { order_id: u128::from(round) },
+                NativeAction::CancelOrder {
+                    order_id: u128::from(round),
+                },
                 nonce(10),
                 &ed_expired,
             ));
@@ -2975,7 +3004,9 @@ mod tests {
             ));
             expected.push(None);
             actions.push(sign_action_with_session(
-                NativeAction::CancelOrder { order_id: u128::from(round + 7) },
+                NativeAction::CancelOrder {
+                    order_id: u128::from(round + 7),
+                },
                 nonce(13),
                 &ed_unknown,
             ));
@@ -2992,7 +3023,12 @@ mod tests {
         }
         assert_eq!(actions.len(), 74);
         assert_eq!(actions.len(), expected.len());
-        KeysFixture { actions, expected, sessions, cache }
+        KeysFixture {
+            actions,
+            expected,
+            sessions,
+            cache,
+        }
     }
 
     /// Run `batch_verify_impl` with a session map and a cache-backed
@@ -3026,13 +3062,23 @@ mod tests {
     /// mode and thread count, across repeats.
     #[test]
     fn parallel_keys_identical_senders_and_lookup_sequence() {
-        let KeysFixture { actions, expected, sessions, cache } = parallel_keys_fixture();
+        let KeysFixture {
+            actions,
+            expected,
+            sessions,
+            cache,
+        } = parallel_keys_fixture();
         assert!(actions.len() >= 64);
         // Every EIP-712 action is looked up once, in input order; session
         // actions (key `None`) make no call.
-        let expected_keys: Vec<B256> =
-            actions.iter().filter_map(crate::verified_cache_key).collect();
-        assert!(expected_keys.len() < actions.len(), "fixture has session actions");
+        let expected_keys: Vec<B256> = actions
+            .iter()
+            .filter_map(crate::verified_cache_key)
+            .collect();
+        assert!(
+            expected_keys.len() < actions.len(),
+            "fixture has session actions"
+        );
         assert!(!cache.is_empty(), "fixture has warm entries");
 
         let (serial, serial_keys) =
@@ -3040,8 +3086,14 @@ mod tests {
         assert_eq!(serial, expected, "sequential pre-pass ground truth");
         assert_eq!(serial_keys, expected_keys);
 
-        let p2 = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
-        let p4 = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let p2 = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let p4 = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
         let cases: [(VerifyMode, Option<&rayon::ThreadPool>); 5] = [
             (VerifyMode::Serial, None),
             (VerifyMode::Default, None),
@@ -3079,13 +3131,24 @@ mod tests {
     #[test]
     fn parallel_keys_small_block_takes_serial_path_with_same_outputs() {
         use super::{use_parallel_keys, PARALLEL_KEYS_MIN_ACTIONS as MIN};
-        let KeysFixture { actions, expected, sessions, cache } = parallel_keys_fixture();
-        let p2 = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let KeysFixture {
+            actions,
+            expected,
+            sessions,
+            cache,
+        } = parallel_keys_fixture();
+        let p2 = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
         for n in [0, 1, MIN - 1, MIN] {
             let block = &actions[..n];
             let expected_keys: Vec<B256> =
                 block.iter().filter_map(crate::verified_cache_key).collect();
-            for (mode, pool) in [(VerifyMode::Default, None), (VerifyMode::Pool(2), Some(&p2))] {
+            for (mode, pool) in [
+                (VerifyMode::Default, None),
+                (VerifyMode::Pool(2), Some(&p2)),
+            ] {
                 assert_eq!(use_parallel_keys(true, mode, n), n >= MIN, "{mode:?} n={n}");
                 let off = verify_recording_keys(block, &sessions, &cache, mode, pool, false);
                 let on = verify_recording_keys(block, &sessions, &cache, mode, pool, true);

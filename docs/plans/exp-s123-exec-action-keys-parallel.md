@@ -5,7 +5,7 @@ Branch: exp/s123-exec-action-keys-parallel (not committed, not pushed)
 Patch: /home/18c/projects/wt/exp-s123/exec-action-keys-parallel.patch (one file, +430 / -18)
 Flag: `TORUS_EXEC_PARALLEL_KEYS=1` (default off; only "1" after trim turns it on)
 
-Nothing was built or run: no cargo, no LSP, no nodes, no benches.
+Rebased onto main `2bc88bcf`, built and unit-tested (see "Build and test results" at the end). Not benched.
 
 ## What changed (crates/torus-types/src/eip712.rs only)
 
@@ -77,7 +77,7 @@ Nothing was built or run: no cargo, no LSP, no nodes, no benches.
 - Optional 10 m pair to confirm about 0 there.
 - Unit tests to run first: `cargo test -p torus-types parallel_keys` and `cargo test -p torus-types parse_exec_parallel_keys`. Also re-run the existing `parallel_verify_*` and `batch_verify_*` tests in the same module.
 
-## Tests added (inline `mod tests`, not run)
+## Tests added (inline `mod tests`; all pass)
 
 - `parse_exec_parallel_keys_only_one_enables`: the parse table. On: "1", " 1", "1 ", "\t1\n". Off: unset, "", spaces, "0", "2", "01", "10", "1x", "true", "on", "yes".
 - `use_parallel_keys_gates_on_flag_mode_and_size`: MIN == 16. Below MIN, flag off and `Serial` all stay serial. `Default`, `Pool(2)` and `Pool(4)` with n >= MIN go parallel.
@@ -124,3 +124,13 @@ Nothing was built or run: no cargo, no LSP, no nodes, no benches.
   - The test fixture closure `push_valid` with annotated `&mut Vec<_>` parameters, called several times with fresh `&mut` borrows. This is higher-ranked because the types are annotated.
   - `assert_eq!(Vec<T>, [T])` in the small-block test, through `PartialEq<[U]> for Vec<T>`.
 - If anything fails, it should be a one-line inference fix: e.g. turning `push_valid` into a fn.
+
+## Build and test results (s123 builder, on `2bc88bcf`)
+
+- Built as written. Follow-up commit: two clippy `manual_is_multiple_of` warnings in the new tests now use
+  `.is_multiple_of()`, and only the experiment's own hunks are in rustfmt layout (main's lines untouched).
+- Flag off: `-p torus-types` 103/103; `cargo nextest run --workspace` 3868/3868 (0 flaky), doc tests pass.
+- Flag on (`TORUS_EXEC_PARALLEL_KEYS=1`): `-p torus-types -p torus-consensus` 521/521.
+- `cargo clippy --workspace --all-targets`: no new warnings vs main.
+- Still open (bench, archy): the review asks for the `end_resident_wait` distribution (not just the mean) in
+  both the ABBA and the soak, and `verified_sender_cache` hits/misses per arm.
