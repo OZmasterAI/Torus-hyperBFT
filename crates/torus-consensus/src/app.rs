@@ -813,6 +813,133 @@ fn nonblocking_exec_dispatch() -> bool {
     parse_nonblocking_dispatch_toggle(std::env::var("TORUS_EXEC_NONBLOCKING_DISPATCH").ok())
 }
 
+// ============================================================================
+// s123 rank 2 — defer the leader's fresh proposal on the exec channel depth
+// ============================================================================
+
+/// Parse `TORUS_PROPOSE_EXEC_WATERMARK`: the exec channel depth (queued +
+/// in-flight blocks, `exec_queue_len`) at or above which this node, as leader,
+/// asks HotStuff to defer its FRESH proposal (`App::proposal_backpressure`).
+/// Whitespace tolerated. Unset, empty, unparsable or `0` ⇒ `None` = OFF: never
+/// defers, bit-identical to today. Proposer-local pacing: blocks stay full,
+/// nothing consensus-visible changes, heterogeneous settings cannot fork.
+fn parse_propose_exec_watermark(raw: Option<String>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok().filter(|w| *w > 0)
+}
+
+/// Effective propose watermark, read ONCE: it is consulted on the HotStuff
+/// thread up to every ~10 ms while a proposal is deferred, so no env read per
+/// call. Tests pin the value through `TorusApp::proposal_backpressure_at`.
+fn propose_exec_watermark() -> Option<u64> {
+    static WATERMARK: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *WATERMARK.get_or_init(|| {
+        parse_propose_exec_watermark(std::env::var("TORUS_PROPOSE_EXEC_WATERMARK").ok())
+    })
+}
+
+/// Parse `TORUS_EXEC_QUEUE_DEPTH` (s123 control arm): the exec channel's
+/// `sync_channel` bound. `N` in `1..=EXEC_QUEUE_DEPTH` (64) gives `N`; anything
+/// else — unset, malformed, `0` (a rendezvous channel) or above 64 — gives
+/// `EXEC_QUEUE_DEPTH`, today's depth. Only shrinking is allowed: the mempool
+/// trust-cache floor (`verified_sender_cache_in_flight_floor` = 64 * block cap)
+/// assumes at most 64 queued blocks, and a smaller channel merely over-sizes it.
+fn parse_exec_queue_depth(raw: Option<String>) -> usize {
+    const MAX: usize = torus_mempool::rate_limit::EXEC_QUEUE_DEPTH;
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=MAX).contains(n))
+        .unwrap_or(MAX)
+}
+
+#[cfg(test)]
+mod propose_backpressure_tests {
+    use super::*;
+
+    #[test]
+    fn propose_watermark_parse_keeps_only_positive_integers() {
+        assert_eq!(parse_propose_exec_watermark(None), None);
+        for off in ["", "  ", "0", " 0 ", "-4", "16x", "1.5", "sixteen"] {
+            assert_eq!(parse_propose_exec_watermark(Some(off.into())), None, "{off:?}");
+        }
+        assert_eq!(parse_propose_exec_watermark(Some("1".into())), Some(1));
+        assert_eq!(parse_propose_exec_watermark(Some("16".into())), Some(16));
+        assert_eq!(parse_propose_exec_watermark(Some(" 24 ".into())), Some(24));
+    }
+
+    #[test]
+    fn exec_queue_depth_parse_only_shrinks_the_channel() {
+        let today = torus_mempool::rate_limit::EXEC_QUEUE_DEPTH;
+        assert_eq!(today, 64, "the trust-cache floor assumes 64");
+        assert_eq!(parse_exec_queue_depth(None), today);
+        for refused in ["", "  ", "0", "-1", "65", "1000", "16x", "sixteen"] {
+            assert_eq!(parse_exec_queue_depth(Some(refused.into())), today, "{refused:?}");
+        }
+        assert_eq!(parse_exec_queue_depth(Some("1".into())), 1);
+        assert_eq!(parse_exec_queue_depth(Some("16".into())), 16);
+        assert_eq!(parse_exec_queue_depth(Some(" 32 ".into())), 32);
+        assert_eq!(parse_exec_queue_depth(Some("64".into())), 64);
+    }
+
+    /// Knob unset: never backpressure, whatever the queue holds.
+    #[test]
+    fn no_backpressure_without_watermark() {
+        let app = TorusApp::stub();
+        for depth in [0u64, 1, 16, 64, 66, u64::MAX] {
+            app.exec_queue_len.store(depth, Ordering::Relaxed);
+            assert!(!app.proposal_backpressure_at(None), "depth {depth}");
+        }
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+        // The trait hook reads the process-wide knob, which no test sets.
+        if std::env::var_os("TORUS_PROPOSE_EXEC_WATERMARK").is_none() {
+            app.exec_queue_len.store(66, Ordering::Relaxed);
+            assert!(!App::proposal_backpressure(&app), "env unset: hook is off");
+            app.exec_queue_len.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn backpressure_iff_queue_at_or_above_watermark() {
+        let app = TorusApp::stub();
+        for (depth, want) in [(0u64, false), (15, false), (16, true), (17, true), (66, true)] {
+            app.exec_queue_len.store(depth, Ordering::Relaxed);
+            assert_eq!(app.proposal_backpressure_at(Some(16)), want, "depth {depth}");
+        }
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+    }
+
+    /// A dead pipeline never drains its queue: the leader must not wait on it
+    /// (the fail-stop path in `produce_block` has to run instead).
+    #[test]
+    fn no_backpressure_once_exec_failed() {
+        let app = TorusApp::stub();
+        app.exec_queue_len.store(64, Ordering::Relaxed);
+        assert!(app.proposal_backpressure_at(Some(16)));
+        app.exec_failed.store(true, Ordering::SeqCst);
+        assert!(!app.proposal_backpressure_at(Some(16)));
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+    }
+
+    /// Only channel blocks count. In blocking dispatch, `deferred_exec` holes
+    /// drain on commits only, so counting them would hold the leader (and so
+    /// the commits that drain them) until the deadline escape in every view.
+    #[test]
+    fn deferred_exec_alone_never_backpressures() {
+        let mut app = TorusApp::stub();
+        app.exec_queue_len.store(0, Ordering::Relaxed);
+        for h in 1..=32u64 {
+            app.deferred_exec.insert(
+                h,
+                DeferredExecBlock {
+                    source: ExecSource::Durable(h),
+                    slashes: Vec::new(),
+                    ready_bytes: 0,
+                },
+            );
+        }
+        assert!(!app.proposal_backpressure_at(Some(16)));
+        app.deferred_exec.clear();
+    }
+}
+
 /// L3 flush-pipe (b): `TORUS_ASYNC_POST_FLUSH`. Unset / empty / `"0"` ⇒ FALSE =
 /// the exec-time block-body write (CF_BLOCK_BODIES) stays SYNCHRONOUS on the exec
 /// critical chain, byte-identical to today. Any other non-empty value (`"1"`,
@@ -5932,12 +6059,22 @@ impl TorusApp {
             }
         }
 
-        // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
-        // The depth is shared with the mempool trust-cache sizing
+        // Spawn execution pipeline: bounded channel for backpressure, 64 blocks
+        // by default. That depth is shared with the mempool trust-cache sizing
         // (`verified_sender_cache_in_flight_floor` = depth * block cap) so the
-        // two cannot drift apart.
-        let (exec_tx, exec_rx) =
-            std::sync::mpsc::sync_channel(torus_mempool::rate_limit::EXEC_QUEUE_DEPTH);
+        // two cannot drift apart. s123 control arm: `TORUS_EXEC_QUEUE_DEPTH`
+        // may only SHRINK it (1..=64; see `parse_exec_queue_depth`), which
+        // merely over-sizes the cache floor. Both s123 knobs are logged once
+        // here so a bench cell's arm is visible in the node log.
+        let exec_queue_depth =
+            parse_exec_queue_depth(std::env::var("TORUS_EXEC_QUEUE_DEPTH").ok());
+        tracing::info!(
+            exec_queue_depth,
+            propose_exec_watermark = ?propose_exec_watermark(),
+            "exec channel depth (TORUS_EXEC_QUEUE_DEPTH) and propose watermark \
+             (TORUS_PROPOSE_EXEC_WATERMARK) resolved at startup"
+        );
+        let (exec_tx, exec_rx) = std::sync::mpsc::sync_channel(exec_queue_depth);
         let exec_handle = std::thread::Builder::new()
             .name("torus-execution".into())
             .spawn(move || execution_loop(exec_rx, exec_ctx))
@@ -6154,6 +6291,23 @@ impl TorusApp {
     /// or finalize.
     fn is_exec_failed(&self) -> bool {
         self.exec_failed.load(Ordering::SeqCst)
+    }
+
+    /// s123 rank 2: the proposal-backpressure decision for `watermark` (split
+    /// from the read-once env knob so tests can pin it). Counts exec CHANNEL
+    /// blocks only — `exec_queue_len`, incremented before the send and
+    /// decremented after execution (queued + in-flight), drained by the exec
+    /// thread on its own. `deferred_exec` is deliberately NOT added (unlike
+    /// rank 1's pacing sum): with blocking dispatch its holes drain only on
+    /// commits (`on_reconcile_tick` returns early unless dispatch is
+    /// nonblocking), so a hole-only backlog would hold the leader — and with
+    /// it the commits that drain the holes — until the deadline escape in
+    /// every view. Never defers once execution has failed: a dead pipeline
+    /// never drains, and the fail-stop path in `produce_block` must run.
+    fn proposal_backpressure_at(&self, watermark: Option<u64>) -> bool {
+        watermark.is_some_and(|w| {
+            !self.is_exec_failed() && self.exec_queue_len.load(Ordering::Relaxed) >= w
+        })
     }
 
     /// T1.5: shared fail-stop latch for the node binary to watch (terminate or
@@ -7845,6 +7999,16 @@ impl App<RocksKVStore> for TorusApp {
             return;
         }
         self.drain_exec_queue();
+    }
+
+    /// s123 rank 2 (propose-defer-on-exec-queue): ask HotStuff to defer this
+    /// leader's FRESH proposal while the exec channel holds
+    /// `TORUS_PROPOSE_EXEC_WATERMARK` blocks or more. Blocks stay full; the
+    /// leader waits for its executor instead of committing into a full queue
+    /// and parking the HotStuff thread on the blocking exec send. Unset ⇒
+    /// always `false` (today). At most two atomic loads; no consensus state.
+    fn proposal_backpressure(&self) -> bool {
+        self.proposal_backpressure_at(propose_exec_watermark())
     }
 }
 
