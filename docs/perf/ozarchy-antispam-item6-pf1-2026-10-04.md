@@ -11412,6 +11412,12 @@ arm has 2-6 consensus timeouts and 0 `no_proposal`, the same as C (2 and 3). ALL
 cause is the epoch fast path alone, or an interaction between flags; this campaign tests neither. M (+3.1%) and T
 (+2.0%) carry most of the single-flag matched/s gain, and B carries the CPU (+7.5% CPU-s per 1M fills). Indicative
 only: n = 1 per arm, and the only noise estimate is C1 vs C2 (0.8% matched/s).**
+
+**Update (76.5-76.6, campaigns ozarchy-s58e and ozarchy-s58loo): the epoch fast path alone (E) is also the same as
+C (1 core timeout, 3.46 native blk/s). Leaving one flag out of ALL at a time shows no single culprit: the timeouts
+track the block cadence and appear above about 5 native blk/s. Removing any of D, M, T or B drops the cadence to
+4.1-4.9 blk/s and the `no_proposal` timeouts to 0-1; removing G changes almost nothing. ALL minus B (D + M + T + G + E)
+keeps +8.5% matched/s vs C with 4 core timeouts and +1.4% CPU-s per 1M fills (ALL: +9.4%, 30, +5.2%). n = 1 per arm.**
 * Timeouts: the five single flags add no `no_proposal` or `leader` timeouts. T (5) and G (6) are above C's 2-3, but
   all of theirs are `after_vote`. The pilot's r1-C also had 4 of those, so this is not resolved at n = 1.
 * matched/s vs the C mean (228,815; C1 to C2 range 1,770 = 0.77%): M +3.05%, T +1.97%, G +0.58%, B -0.20%, D -0.50%.
@@ -11500,6 +11506,69 @@ Run-queue wait is from `schedstat` (before -> bench end), mean per node.
   `ozarchy-s58flags-tools/analyst/out/` (`s58flags-all.{txt,json}` from `s58pilot.py`, and
   `s58flags-timeouts.{txt,json}` from `s58flags_to.py`, which covers the timeout windows, minute bins, `schedstat`
   and duplicate warnings, with the pilot cells as `pC` / `pALL`).
+
+### 76.5 Epoch fast path alone (campaign ozarchy-s58e, 2026-10-16)
+
+* Same binary, harness, genesis and workload as 76.1. Cells: w1 (C, 300 s warm-up, 23:58) and e1-E (300 s, 00:07),
+  E = `TORUS_EPOCH_FAST_PATH=1` only, the other five flags absent. 60 s smoke on E first (all checks OK). Both cells
+  rc 0, AGREE, md5 ok; `epoch fast path ON` once per node in e1-E only.
+
+| cell | matched/s | vs C mean | native blk/s | exec ms / native block | CPU-s / 1M fills | timeouts core (no_proposal) | hotstuff-algo rq wait s | block p99 ms |
+|---|---|---|---|---|---|---|---|---|
+| w1 (C) | 229,852 | +0.45% | 3.479 | 272.7 | 22.889 | 4 (0) | 4.61 | 1,091 |
+| e1-E | 231,285 | +1.08% | 3.457 | 274.3 | 23.005 | 1 (0) | 4.67 | 1,095 |
+
+* E is inside the C range on every row (C mean here and below: 76.1's C1 / C2, 228,815 matched/s, 22.874 CPU-s per
+  1M fills). Its timeouts per 30 s were 2 then 0 for the rest of the load, like C1. So the cadence jump and the
+  `no_proposal` timeouts are not from the epoch fast path alone.
+* `skipping duplicate/replayed native action` per node: w1 5, e1-E 26.
+
+### 76.6 Leave one out: ALL minus each flag (campaign ozarchy-s58loo, 2026-10-16)
+
+Question: which flags does ALL need for its cadence and timeouts? Each arm sets five of the six flags (D, M, T, G, B,
+E) on all 3 validators; the dropped flag is absent. Cells in run order: w1 (C, 300 s warm-up, 00:32), d1-xD, m1-xM,
+t1-xT, g1-xG, b1-xB, e1-xE (300 s each, 00:40-01:31). 60 s smoke on xE first (25 CHECK OK). All 7 cells rc 0,
+AGREE, md5 ok; node environs show exactly the arm's five flags on all 3 nodes (checked per flag); `epoch fast path ON`
+once per node in every arm except xE (0). The warm-up w1 (C) gave 228,198 matched/s (-0.27% vs C mean), 3.364
+native blk/s, 22.877 CPU-s per 1M fills and 2 core timeouts (0 `no_proposal`), so the host had not drifted since 76.1.
+
+Sorted by native blk/s; ALL and C from 76.1; windows as in 76.1:
+
+| arm | dropped | matched/s | vs C mean | native blk/s | exec ms / native block | CPU-s / 1M fills | vs C mean | timeouts core | no_proposal | leader | after_vote | hotstuff-algo rq wait s | block p99 ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ALL | none | 250,387 | +9.43% | 6.003 | 158.7 | 24.061 | +5.2% | 30 | 16 | 10 | 2 | 7.11 | 1,258 |
+| xG | G | 250,123 | +9.31% | 5.789 | 163.4 | 24.050 | +5.1% | 17 | 8 | 4 | 5 | 7.11 | 1,079 |
+| xE | E | 246,120 | +7.56% | 5.043 | 191.1 | 24.197 | +5.8% | 12 | 5 | 2 | 4 | 6.99 | 1,213 |
+| xD | D | 245,331 | +7.22% | 4.884 | 197.1 | 24.224 | +5.9% | 4 | 0 | 0 | 4 | 7.12 | 1,043 |
+| xB | B | 248,365 | +8.54% | 4.561 | 210.3 | 23.199 | +1.4% | 4 | 0 | 0 | 3 | 6.37 | 1,057 |
+| xM | M | 243,625 | +6.47% | 4.288 | 222.2 | 24.521 | +7.2% | 0 | 0 | 0 | 0 | 6.61 | 1,022 |
+| xT | T | 240,422 | +5.07% | 4.136 | 231.2 | 24.537 | +7.3% | 8 | 1 | 1 | 6 | 6.92 | 1,129 |
+| C1 / C2 | all | 229,699 / 227,930 | +0.39 / -0.39% | 3.370 / 3.307 | 280.2 / 283.3 | 22.830 / 22.917 | | 2 / 3 | 0 | 0 | 2 / 3 | 4.26 / 4.54 | 1,147 / 1,094 |
+
+* **Timeouts track the cadence, not a flag.** In cadence order the core timeouts are 30, 17, 12, 4, 4, 0 (and xT's 8,
+  six of them `after_vote`, the type C also has). `no_proposal` and `leader` timeouts appear only above about 5
+  native blk/s (ALL, xG, xE). No single flag is necessary for them except in the sense that each of D, M, T and B is
+  needed to reach that cadence.
+* **D, M, T and B matter only together.** Alone each moved the cadence by at most +8% (76.1); dropping any one of them
+  from ALL costs 1.1-1.9 native blk/s. Dropping E costs 1.0 blk/s and halves the timeouts but leaves 12. Dropping G
+  costs 0.2 blk/s and 0.1% matched/s: G is not needed (as section 75 suggested).
+* **B carries the bundle's CPU.** Every arm with B is +5.1 to +7.3% CPU-s per 1M fills; xB is +1.4% at -0.8%
+  matched/s vs ALL. xB also has the lowest hotstuff-algo run-queue wait of the bundles (6.37 s vs 6.61-7.12 s).
+* Block p99 does not separate the arms at n = 1 (1,022-1,258 ms vs C 1,094-1,147 ms); only ALL and xE are above C.
+* Exec lag and the `skipping duplicate/replayed native action` counts (per node: xD 64, xM 19, xT 67, xG 140,
+  xB 21, xE 139) move with the bundle arms but are not resolved at n = 1 (pilot C had 117).
+
+### 76.7 Next (after 76.5-76.6)
+
+* **Candidate bundle: xB (D + M + T + G + E, without B).** Confirm xB vs C vs ALL, ABBA, n = 4 per arm, 600 s cells
+  (about 2.5 h): does xB keep about +8.5% matched/s with C's timeout level and CPU, and do ALL's timeouts persist over
+  600 s (in 76.2 they stopped in minute 4; in the pilot they did not). Optional: xB minus G, since G is not needed.
+* Owner question: are ALL's extra `no_proposal` / `leader` timeouts a cost in themselves, given ALL's block p99 is
+  only about +10% vs C? If not, the choice between ALL and xB is +0.9% matched/s for +3.8% CPU-s per 1M fills.
+* Data: `~/bench-results-matched/ozarchy-s58e-300m-{w1,e1-E}`, `~/bench-results-matched/ozarchy-s58loo-300m-{w1,d1-xD,
+  m1-xM,t1-xT,g1-xG,b1-xB,e1-xE}`; campaigns `ozarchy-s58e-run/campaign/`, `ozarchy-s58loo-run/campaign/`. Analysis
+  (76.1's `s58pilot.py` and `s58flags_to.py`, the C1 / C2 / ALL cells as reference) in
+  `ozarchy-s58e-tools/analyst/out/s58e*.txt` and `ozarchy-s58loo-tools/analyst/out/s58loo*.txt`.
 
 ## Open
 
