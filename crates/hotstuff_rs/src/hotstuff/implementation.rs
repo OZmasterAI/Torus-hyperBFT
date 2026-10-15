@@ -168,6 +168,10 @@ pub(crate) struct HotStuff<N: Network> {
     /// True when enter_view succeeded but proposal production failed (parent block not yet in tree).
     /// The algorithm loop should retry the proposal after polling messages.
     proposal_deferred: bool,
+    /// s123 rank 2: the last view whose fresh proposal was deferred on
+    /// [`App::proposal_backpressure`]; keeps that debug line to once per view
+    /// instead of once per ~10 ms retry poll.
+    app_backpressure_logged_view: Option<ViewNumber>,
     /// S432 follower body-starvation heal: throttles [`tick_missing_pc_block_fetch`]
     /// (which does a `block_tree.contains` DB read) to at most one evaluation per
     /// [`BODY_RETRY_INTERVAL`] on the hot algorithm loop.
@@ -253,6 +257,7 @@ impl<N: Network> HotStuff<N> {
             deferred_sync_retries: VecDeque::new(),
             deferred_sync_refresh: false,
             proposal_deferred: false,
+            app_backpressure_logged_view: None,
             last_missing_pc_check: Instant::now(),
             body_push_max_bytes: body_push_max_bytes_from_env(),
             defer_commit_feed: defer_commit_feed_from_env(),
@@ -490,6 +495,45 @@ impl<N: Network> HotStuff<N> {
         }
     }
 
+    /// s123 rank 2 (propose-defer-on-exec-queue): whether this leader should
+    /// defer its FRESH proposal because the app reports local backpressure
+    /// ([`App::proposal_backpressure`], e.g. torus-consensus's exec channel at
+    /// `TORUS_PROPOSE_EXEC_WATERMARK`).
+    ///
+    /// Unlike thinning blocks, this keeps blocks full and paces their number:
+    /// the leader waits (polled every ~10 ms, same deferral as S470 Piece 2)
+    /// until its executor has room, instead of committing more blocks into a
+    /// full queue and parking the HotStuff thread on the blocking exec send.
+    /// Node-local and always safe: a deferring leader looks like a slow one.
+    ///
+    /// Escape: once the view deadline is within [`APP_BACKPRESSURE_ESCAPE`]
+    /// the leader proposes anyway. The deadline read is `self.view_info`'s,
+    /// which a retry never refreshes; the pacemaker only ever extends a
+    /// view's deadline, so a stale value can only release the proposal
+    /// EARLIER, never hold it past the real deadline.
+    ///
+    /// Default app (no override): always `false`, behavior identical to today.
+    fn app_defers_proposal<K: KVStore, A: App<K>>(&mut self, app: &A) -> bool {
+        if !app.proposal_backpressure() {
+            return false;
+        }
+        let slack = self.view_info.deadline.saturating_duration_since(Instant::now());
+        if slack <= APP_BACKPRESSURE_ESCAPE {
+            return false;
+        }
+        if self.app_backpressure_logged_view != Some(self.view_info.view) {
+            self.app_backpressure_logged_view = Some(self.view_info.view);
+            log::debug!(
+                "s123 app backpressure: deferring fresh proposal at view={} \
+                 ({} ms to the view deadline, escape at {} ms)",
+                self.view_info.view.int(),
+                slack.as_millis(),
+                APP_BACKPRESSURE_ESCAPE.as_millis(),
+            );
+        }
+        true
+    }
+
     /// T1.3 metric accessor: how many times this replica phase-voted on a proposal header whose
     /// body was later found invalid by `app.validate_block`. A non-zero value is observable
     /// evidence that the header-first fast-path relaxation (vote before validation) fired.
@@ -581,7 +625,11 @@ impl<N: Network> HotStuff<N> {
                 ) {
                     // S470 Piece 2: still over the exec watermark — keep the
                     // proposal deferred (re-checked next loop iteration).
-                    if self.should_yield_proposal_for_exec_backpressure() {
+                    // s123 rank 2: same for app backpressure (local exec
+                    // queue), until it clears or the deadline escape fires.
+                    if self.should_yield_proposal_for_exec_backpressure()
+                        || self.app_defers_proposal::<K, _>(&*app)
+                    {
                         self.proposal_deferred = true;
                         return Ok(());
                     }
@@ -793,7 +841,15 @@ impl<N: Network> HotStuff<N> {
                     // so the proposal fires as soon as the backlog drains
                     // (yield-not-starve). Default OFF — see
                     // `should_yield_proposal_for_exec_backpressure`.
-                    if self.should_yield_proposal_for_exec_backpressure() {
+                    // s123 rank 2: the app's local backpressure hint (exec
+                    // queue at a watermark) defers the same way — blocks
+                    // stay full, the leader only waits — with a deadline
+                    // escape. The repropose and TC paths above stay
+                    // ungated on purpose: they carry no new work for the
+                    // executor and are what keeps a stalled view live.
+                    if self.should_yield_proposal_for_exec_backpressure()
+                        || self.app_defers_proposal::<K, _>(&*app)
+                    {
                         self.proposal_deferred = true;
                         return Ok(());
                     }
@@ -3596,6 +3652,13 @@ pub(crate) const MISSING_DATA_RETRY_DEADLINE: Duration = Duration::from_secs(3);
 /// s63: bound on tracked `MissingData` retries (entries are two `Instant`s;
 /// bodies themselves live in `deferred_bodies`).
 pub(crate) const MISSING_DATA_RETRY_CAP: usize = 64;
+
+/// s123 rank 2 (propose-defer-on-exec-queue): a fresh proposal deferred on
+/// [`App::proposal_backpressure`] goes out anyway once the view deadline is
+/// this close — a quarter of the 1.2 s base view time (`timeout_base_ms`),
+/// left for the header, the votes and the next leader's QC — so an app hint
+/// that never clears costs a late proposal, not a timed-out view.
+pub(crate) const APP_BACKPRESSURE_ESCAPE: Duration = Duration::from_millis(300);
 
 /// L3 v2 (body push): hard cap on the effective push threshold, enforced at
 /// the decision point regardless of the env value. Transport safety: a legacy

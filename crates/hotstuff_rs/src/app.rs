@@ -288,6 +288,32 @@ pub trait App<K: KVStore>: Send {
     fn on_reconcile_tick(&mut self) {
         // Default no-op for backward compatibility.
     }
+
+    /// Proposer-local pacing hint (s123 rank 2, propose-defer-on-exec-queue):
+    /// `true` asks this replica, when it is the leader, to hold back a FRESH
+    /// proposal for now — e.g. because the host's local execution queue is at
+    /// a watermark, so producing another block now would only deepen the exec
+    /// lag (the block would wait in the queue, not execute sooner).
+    ///
+    /// Contract:
+    /// - Only a fresh proposal (the `Generic`/`Decide` highest-PC path that
+    ///   calls [`produce_block`](Self::produce_block)) is deferred. A TC-based
+    ///   proposal, a validator-set re-proposal, a `Nudge` and every vote are
+    ///   never gated.
+    /// - The deferral is retried on the algorithm loop's short (~10 ms) poll,
+    ///   so the proposal goes out as soon as this returns `false`.
+    /// - HotStuff proposes anyway when the view deadline is close, so a hint
+    ///   that never clears costs at most a late proposal, never a lost view.
+    /// - It runs on the algorithm thread, up to every ~10 ms while a proposal
+    ///   is deferred: implementations MUST be cheap and non-blocking, and MUST
+    ///   NOT touch consensus state. Its value must never feed into anything
+    ///   consensus-visible (block contents, validation, votes).
+    ///
+    /// Default implementation returns `false` (never defers), the behavior
+    /// before this hook existed.
+    fn proposal_backpressure(&self) -> bool {
+        false
+    }
 }
 
 /// Request for an `App` to produce a new block extending a specific `parent_block`.
