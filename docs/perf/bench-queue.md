@@ -9,6 +9,16 @@ Last archy bench: `ozarchy-hsdb`, 71.8 option A A/B (section 74 of `ozarchy-anti
 Every campaign uses the N = 11 bench genesis (rebuilt once with `FORCE=1`, step 1). Arms that compare against main
 share one binary and one all-off baseline inside a campaign.
 
+**Driver generator update (s126, main `d280a8fd`, merged from `feat/driver-warmgate-checks` 771ff8f8):** warm-up gate
+(default on; `"gate": false` restores the old behaviour), per-cell campaign checks, the 1 Hz soak sampler on every
+cell. Codex fix on top of the e3316799 you froze for `ozarchy-s58dmt`: a campaign check now sees only its own checks
+file's variables (as sourced at preflight) and the driver's globals, never a driver function's local (`$dur`, `$rc`,
+`$label`, `$t`, ...). Campaigns already running on a frozen copy are unaffected. Before the next campaign with a
+checks file (e.g. `s58dmt-checks.sh`): freeze the new tools, regenerate the driver, run `DRIVER dry` and `DRIVER run
+smoke`. A check that read a driver local now fails (CHECK FAIL, or unbound variable under `set -u`); use the check's
+arguments (`$1` label, `$2` arm) or driver globals (`R`, `AENV`, `AXE`, ...). `_DRV_` is reserved: any mention in a
+checks file fails preflight.
+
 **Now, on current main** (s125: main carries KP, DB and PC, flags off; s126: propose-defer is PARKED, campaign B dropped, see step 6):
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
