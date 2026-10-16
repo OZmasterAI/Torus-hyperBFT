@@ -11736,6 +11736,202 @@ Steps vs noise (the only replicate pairs: C1 / C2 in 76.1, matched/s +-0.39% aro
   tables and scripts: `/tmp/s58-timeouts/{ALL,c1,c2}-table.txt`, `timeouts.py`, `viewgaps.py`, `parse1hz.py` (in
   `/tmp`, not kept).
 
+## 78. s58 bundle pick at 600 s: C vs ALL-G vs ALL-G-B, all with the 250 ms header re-send, 300 markets, 600 s cells, n = 1 (campaign ozarchy-s58b600, 2026-10-16), and the owner's bundle decision
+
+**Both bundles give the same matched/s: ALL-G (D M T B E) and ALL-G-B (D M T E) are each +8.3% vs C, 0.09% apart.
+B costs +3.5% CPU-s per 1M fills at that equal throughput (ALL-G +4.7%, ALL-G-B +1.1% vs C), about 7-9x the
+C replicate spread. With `TORUS_HEADER_RESEND_MS=250` on every arm there were 0 `no_proposal` timeouts over the
+whole 600 s cell in every arm, startup included. Core timeouts were C 8, ALL-G 15, ALL-G-B 4, all `after_vote`,
+`no_vote` or `leader`. What B buys only shows under saturation: lower exec lag (7.4 vs 13.3 s; C 18.9 s), a faster
+book save (3.9 vs 13.7 ms per save) and 0.5 GB less RSS. Owner decision (s62): bundle = ALL-G-B = D, M, T, E, plus the
+250 ms re-send. Indicative only: n = 1 per arm, fixed order, one host.**
+* matched/s is flat across the 10 minutes in every arm. The native block rate is not: in both bundles it was still
+  falling, or had only just levelled, at 600 s. C levels off after minute 3.
+* This is the first campaign driven by main's generator `tools/matched-bench/campaign/make-driver.py`. It found four
+  generator gaps (78.1).
+
+Question (after 77.6): at 600 s, with the re-send fixing the lost headers, which bundle (ALL minus G, or ALL minus G
+and B) is worth porting? Does B's CPU cost (76.6) buy anything?
+
+### 78.1 Setup and validity
+
+Setup:
+* Node: `857b9770` (77.2: ALL `6452fa31` + the drop counter), md5 `5480e116`, bench `ff822b95` (md5 `9b725823`), harness worktree
+  `s58pilot-h-5e0fbbfa`, frozen s58rl `run-cell.sh`. Genesis md5 `b83180e1` and workload as in 76.1 / 77.2: 300
+  markets, oracle on, commit tail depth 1, MAX_IN_FLIGHT 4, budget 900. Cells are 600 s instead of 300 s.
+* Arms. Every arm sets `TORUS_HEADER_RESEND_MS=250` on all 3 validators (spec `node_env`). G
+  (`TORUS_EXEC_POOL_GRAIN`) is absent everywhere.
+  * Crs: the six s58 flags off.
+  * ALLmGrs (ALL-G): `TORUS_SETTLE_DEFER_RESULTS=1` (D), `TORUS_PARALLEL_MATCH_SETUP=1` (M),
+    `TORUS_FAST_SELL_TOP_UPS=1` (T), `TORUS_PARALLEL_BOOK_SAVE=1` (B), `TORUS_EPOCH_FAST_PATH=1` (E).
+  * ALLmGBrs (ALL-G-B): the same without B.
+* Fixed order: smoke s0 (ALLmGrs, 60 s, 15:42), then w1 (Crs, 600 s warm-up, 15:46), r1-Crs (16:00), r1-ALLmGrs
+  (16:13), r1-ALLmGBrs (16:27-16:39).
+* Driver: generated from `s58b600-spec.json` by an unedited copy of main `19fd0c28`'s `make-driver.py` (same md5
+  as `git show 19fd0c28:...`). The generator gaps:
+  * **No warm-up gate.** The w1 gate (rc 0, ACCEPT, AGREE, liveness PASS, no panic) ran in the analysis step.
+  * **No hook for campaign-specific hard checks.** The s58rl checks `s58chk` (flags took effect per validator log,
+    book-save engagement) and `rlchk` (rl knobs, drop counter, re-send lines) ran in the per-cell analysis step
+    `s58b600-step.sh`. A failure there flags the row and does not stop the campaign.
+  * **No soak sampler, so no `metrics-1hz`.** `analyst/csv2m1hz.py` rebuilds a `metrics-1hz` shadow from the cell's
+    1 Hz `sampler.csv`. The drop counter is not in it, so drops exist only as cell totals.
+  * **Genesis preflight.** The generator's preflight requires the tools-root `devnet/genesis.json` to be byte-equal
+    to the harness copy. s58rl's frozen copy differed only in `gas_limit` / `block_interval`, fields
+    `gen-3val-genesis.sh` does not read (`scratch/NOTE-genesis.txt`). It was replaced by the harness copy (md5
+    `f4dcc6fa`). The cells' generated genesis is unchanged (md5 `b83180e1`).
+
+**Validity:** all 4 cells and the smoke are rc 0, ACCEPT AGREE, liveness PASS, node md5 `5480e116` on 3 nodes, and
+have 0 panic or fail-stop lines and 0 error lines. `campaign.log` has 60 `CHECK OK` lines, 4 `CHECK SOAK` lines and no
+failed CHECK. There are no `CELL-FLAG` lines and no reruns ("RERUN PASS: nothing queued"); `cells.tsv` has 4 rows, 0
+bad. The node env check shows exactly the arm's flags on all 3 nodes. Every `s58chk` / `rlchk` is OK with
+`checks_rc=0`:
+* took-effect lines: D, M and T true in both bundles; B true only in ALLmGrs; G = 1 in all arms; `epoch fast path
+  ON` once per node in both bundles;
+* the book-save drain is engaged only in ALLmGrs (3.60-3.62 ms per save);
+* `fan_sent` is 0 everywhere, and every node logged re-sends.
+
+### 78.2 Cells (`s58b600-pilot.txt`, `s58b600-timeouts.txt`, `s58b600-execlag.txt`)
+
+Windows as in 76.1 / 77.3: load window for matched/s; core = [t_bench0 + 60 s, t_bench1], summed over the 3 nodes
+for timeouts. Exec lag = exec queue mean / native blk/s, mean of nodes (a lower bound, seconds). RSS = mean of nodes
+over the whole cell.
+
+| cell | arm | matched/s | vs Crs | native blk/s | CPU-s / 1M fills | vs Crs | timeouts core | no_proposal | leader | after_vote | no_vote | exec queue mean / p99 | exec lag s | save_books ms per save | RSS mean GB | hotstuff-algo rq wait s | block p99 ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | Crs (warm-up) | 227,651 | -0.2% | 3.136 | 23.455 | -0.2% | 9 | 0 | 1 | 8 | 0 | 63.5 / 66 | 20.3 | 19.72 | 5.52 | 8.86 | 1,144 |
+| r1-Crs | Crs | 228,142 | | 3.197 | 23.494 | | 8 | 0 | 0 | 8 | 0 | 60.2 / 66 | 18.9 | 19.38 | 5.73 | 8.54 | 1,137 |
+| r1-ALLmGrs | ALL-G | 247,187 | +8.3% | 5.700 | 24.603 | +4.7% | 15 | 0 | 1 | 12 | 2 | 42.6 / 66 | 7.4 | 3.92 | 4.64 | 13.83 | 1,034 |
+| r1-ALLmGBrs | ALL-G-B | 246,967 | +8.3% | 4.388 | 23.763 | +1.1% | 4 | 0 | 0 | 4 | 0 | 58.6 / 66 | 13.3 | 13.71 | 5.11 | 12.55 | 1,020 |
+
+* **No `no_proposal` timeouts anywhere, over the whole cell.** The full-cell count (startup and drain included) is 0
+  in every arm. In s58rl without the re-send, C had 18 (6 of them in the load window, 0 in core) and w1 had 16: the
+  startup burst. Whole-cell timeouts: Crs 9, ALL-G 18 (14 `after_vote`, 3 `no_vote`, 1 `leader`), ALL-G-B 4.
+* Per committed block, ALL-G's timeouts are at C's rate: 15 per 9,114 core blocks (sum of nodes) vs C's 8 per 4,848,
+  1.6 per 1k each. ALL-G-B has 4 per 6,758 (0.6 per 1k). Of ALL-G's 18 node-increments, 12 fall in minutes 7-10.
+* Drops per node, whole cell: Crs 90 / 89 / 91, ALL-G 139 / 145 / 134, ALL-G-B 84 / 82 / 78, w1 90 / 89 / 87.
+  Header re-sends per node: Crs 666 / 125 / 101, ALL-G 115 / 429 / 166, ALL-G-B 534 / 113 / 110. As in 77.4, the
+  drops go on and the re-send covers them.
+* The exec queue is at its cap (66) at p99 in every arm, so all three arms ran saturated. Below capacity the queue
+  is about 0 and exec lag is about 0 with or without B.
+* The bench client's commit-to-seen latency (`s58b600-taillag.jsonl`) does not order the arms like exec lag does.
+  Its p50 is C 312 ms, ALL-G 5,096 ms, ALL-G-B 3,170 ms (lag p50 in heights 1 / 19 / 8). ALL-G's tail fetch ran in
+  6 rounds over the window (max 2,918 heights per round), against ALL-G-B's 90 and C's 505. This was not followed up.
+* `skipping duplicate/replayed native action` per node: w1 1, Crs 41, ALL-G 103, ALL-G-B 153.
+* This run's C vs 76.1's C mean at 300 s (228,815; 22.874): -0.3% matched/s and +2.7% CPU-s per 1M fills, at twice
+  the cell length.
+
+### 78.3 Over the 10 minutes (`s58b600-minutes.txt`, `s58b600-timeouts.txt`)
+
+| arm | matched/s, minutes 1-5 / 6-10 mean | change | native blocks per minute (val0), minutes 1 / 5 / 10 | core timeouts per minute (sum of nodes), minutes 1-10 |
+|---|---|---|---|---|
+| w1 (Crs) | 227,638 / 227,341 | -0.1% | 298 / 168 / 168 | 0 2 0 0 0 0 2 2 1 2 |
+| Crs | 227,759 / 228,076 | +0.1% | 307 / 173 / 165 | 1 1 2 0 0 1 0 2 1 1 |
+| ALL-G | 246,379 / 247,844 | +0.6% | 405 / 355 / 254 | 3 0 2 0 1 0 5 2 4 1 |
+| ALL-G-B | 248,228 / 245,102 | -1.3% | 388 / 283 / 180 | 0 0 1 0 1 0 0 2 0 0 |
+
+* matched/s is flat in every arm (the per-minute values span 237-254k in the bundles, 220-234k in C).
+* The native block rate is not steady by 600 s in the bundles. ALL-G falls minute by minute (311, 279, 297, 254 in
+  minutes 7-10). ALL-G-B falls to 179-180 in minutes 8-10, where it may be levelling. C is steady from minute 3 at
+  165-173. Over the last 60 s of load, native blocks per validator were C 178, ALL-G 269, ALL-G-B 196. The bundles'
+  blocks/s gain over C shrinks as the books grow, while their matched/s gain does not.
+* Drift: w1 vs r1-Crs is -0.2% matched/s and -0.2% CPU-s per 1M fills, so the host did not drift between the two C
+  cells. (In s58rl the warm-up was -6.0%.) Drift across the two bundle cells, which ran 14 min apart, is not
+  measured.
+
+### 78.4 Steps vs noise
+
+Reference spreads: 76.1's C1 / C2 (matched/s +-0.39% around their mean, CPU-s per 1M fills 0.38% apart), s58rl's
+ALL a1 / a2 (0.14% and 0.53%), and here w1 vs Crs (0.2% and 0.2%).
+
+| step | matched/s | CPU-s / 1M fills | core timeouts | resolved at n = 1? |
+|---|---|---|---|---|
+| ALL-G vs Crs | +8.3% | +4.7% | 8 -> 15 | matched/s and CPU yes (about 20x and 9-12x the C spread; 76.6's xG was +9.3% / +5.1% at 300 s); timeouts no (C's rate per block) |
+| ALL-G-B vs Crs | +8.3% | +1.1% | 8 -> 4 | matched/s yes; CPU indicative (about 3x the C spread; 76.6's xB was +1.4%) |
+| B: ALL-G vs ALL-G-B | +0.09% | +3.5% | 4 -> 15 | CPU yes (about 7-9x the C and ALL spreads); matched/s no (inside noise); timeouts no (one cell each, 1.6 vs 0.6 per 1k blocks) |
+| B: exec lag / save_books / RSS | 13.3 -> 7.4 s; 13.7 -> 3.9 ms; 5.11 -> 4.64 GB | | | indicative: well outside w1 vs Crs (20.3 vs 18.9 s, 19.7 vs 19.4 ms, 5.52 vs 5.73 GB), one cell per arm |
+
+* B's mechanism, sized. In ALL-G, save_books falls from 14.25 to 4.05 ms per native block (bench + drain window).
+  That is 10 of the 55 ms by which ALL-G's exec block is shorter than ALL-G-B's (168 vs 223 ms). The rest comes from
+  the engine (171 -> 134 ms). With shorter blocks ALL-G runs 30% more native blocks (5.70 vs 4.39 per s), each with
+  fewer fills (42k vs 55k). So B adds blocks and lowers the queue, but not fills per second. The extra CPU follows the
+  extra blocks: CPU-s per node over the whole run is 3,748 vs 3,633.
+* Unresolved at n = 1: the 0.09% matched/s gap between the bundles, the 15 vs 4 core timeouts, and whether ALL-G-B's
+  block rate has levelled at 600 s.
+
+### 78.5 Owner decision (s62)
+
+**Bundle = ALL-G-B = D, M, T, E, with `TORUS_HEADER_RESEND_MS=250` as the timeout fix.** ALL-G-B has the same
+matched/s as ALL-G (+8.3% vs C) at +1.1% instead of +4.7% CPU-s per 1M fills, and the fewest timeouts. B's gains
+(lower exec lag, faster book save, less RSS) matter only under sustained saturation, and the bench queue is at its
+cap in every arm only because the bench saturates it.
+
+### 78.6 Parked options (not taken, kept for later)
+
+* **B, parallel Classic book save.** Branch `exp/archy-s58-parallel-classic-book-save` `8525822b` (on main
+  `a44000e0`, pushed to origin); merged into ALL `6452fa31`. Flag `TORUS_PARALLEL_BOOK_SAVE=1` (bench value 1),
+  node-local, default off.
+  * What it does (plan doc `docs/plans/exp-archy-s58-parallel-classic-book-save.md`): in Classic book mode,
+    `save_order_books` encodes each dirty book's blob as one exec-pool job, heaviest first, into a presized buffer.
+    The puts then run serially in ascending market order on the exec thread. A job panic latches a save fault. The
+    gate needs at least 2 dirty books and at least 16,384 resting orders. Otherwise the serial loop runs unchanged.
+  * Measured: alone, 76.1. Dropping it from ALL (xB, 76.6) cost 1.4 native blk/s and 0.8% matched/s at -3.8 points
+    of CPU. Here (78.4) it gives +3.5% CPU-s per 1M fills at equal matched/s, exec lag 7.4 vs 13.3 s, save_books 3.9
+    vs 13.7 ms per save, and RSS -0.5 GB.
+  * Not taken: its CPU buys no matched/s.
+  * Revisit if state freshness under sustained saturation (exec lag) or RSS matters.
+* **G, fine-grained exec-pool jobs.** Branch `exp/archy-s58-exec-pool-fine-grain-jobs` `aaf0b804` (on `a44000e0`,
+  pushed to origin; the plan doc's "Not pushed" line is stale). Flag `TORUS_EXEC_POOL_GRAIN=K`, K 2-16 (bench value
+  4); unset, 0 or 1 = today.
+  * What it does (plan doc `docs/plans/exp-archy-s58-exec-pool-fine-grain-jobs.md`): it splits matching and settle
+    pass A into K x cap LPT chunks instead of cap chunks. Idle pool threads can then steal chunks that late-starting
+    threads have not begun. Pool threads were measured to start their chunk 1-8.6 ms apart.
+  * Measured (75, 76.5-76.6): dropping it from ALL costs 0.2 native blk/s and 0.1% matched/s.
+  * Not taken: not needed.
+  * Revisit if exec-pool job granularity becomes the bottleneck (more markets per thread, or skewed per-market
+    work).
+* **Direct fan.** `TORUS_CONSENSUS_DIRECT_FAN=1` (bench value 1), on main since `fcc49b54` (B2 consensus
+  isolation). The gossip mirror (`TORUS_CONSENSUS_GOSSIP_MIRROR`) was left at its default, on.
+  * What it does: consensus broadcasts go over the `/torus/direct` fan, which is not rate-limited.
+  * Measured (77.3-77.5): core timeouts 5 (vs ALL 33 / 47), -1.1% matched/s and +3.1% CPU-s per 1M fills vs ALL on
+    one host. The gossip mirror copies doubled the traffic (about 14.1k limiter drops per node, all duplicates), and
+    the cell committed 2.2x ALL's blocks, nearly all of them in the drain.
+  * Not taken: the re-send fixes the timeouts at no measured cost.
+  * Revisit on a multi-host testnet, where the fan is 1 hop vs gossip's 2, possibly with the mirror off.
+* **Limiter exemption for validator proposals, or a higher `consensus_rate_limit_per_peer`.** Code change.
+  * The limit is hardcoded at 50 per s (burst 50) in `crates/torus-network/src/config.rs:280` (main `19fd0c28`).
+  * This is the root fix: the re-send only recovers headers that the limiter already dropped.
+  * Not measured. It needs a design, because the message type is decoded after the limit check. It also needs tests
+    and a review.
+  * Before mainnet, informed by a multi-host testnet run with the drop counter
+    `torus_consensus_rate_limited_dropped_total`.
+* **E's duplicate.** Arm E uses 18c's epoch fast path on main (`efe9aa47`, `TORUS_EPOCH_FAST_PATH`; in the ALL stack
+  through main `5e0fbbfa`). Archy's own version, `exp/archy-s58-epoch-boundary-fast-path` `bb62bab1`, was reverted
+  from ALL (`78373203`) and is not to be merged. It carries one test that main lacks and that is worth porting:
+  `epoch_fast_path_checkpoint_crash_replay_matches_uncrashed`, with its helper `ckpt_crash_replay_with`.
+
+### 78.7 Next
+
+* **Port D, M, T and the drop counter onto main `19fd0c28`.**
+  * Branches (origin): D `exp/archy-s58-settle-passb-deferred-results-scatter` `95e2d48e`, M
+    `exp/archy-s58-parallel-match-setup` `6954e735`, T `exp/archy-s58-sell-top-up-stitch-list` `6d1100b8`.
+  * The drop counter is `857b9770` on `exp/archy-s58-consensus-ratelimit-drops`. That branch is local only, not on
+    origin: push it first.
+  * E is already on main: `TORUS_EPOCH_FAST_PATH` is read at `crates/torus-consensus/src/exec_pipeline.rs:65` at
+    `19fd0c28`.
+  * Make the 250 ms re-send the default. Decide where: the env default at
+    `crates/hotstuff_rs/src/hotstuff/implementation.rs:121` (today 3 s), or genesis / config.
+  * Tests, then a Codex review.
+* **Generator gaps (78.1) to a builder:** a warm-up gate, a per-cell custom-check hook, the soak sampler's
+  `metrics-1hz` (with the drop counter per second), and the genesis preflight.
+* Confirm the bundle at n >= 2, ABBA: does ALL-G-B's block rate level off after 600 s, and are its timeouts at or
+  below C's per block?
+* Data: `~/bench-results-matched/ozarchy-s58b600-300m-{w1,r1-Crs,r1-ALLmGrs,r1-ALLmGBrs,smoke-s0}`. Campaign files in
+  `ozarchy-s58b600-run/campaign/`: `campaign.log`, `cells.tsv`, `cell-step/*.s58chk.txt`, `smoke/`. Spec, driver and
+  step in `ozarchy-s58b600-tools/`: `s58b600-spec.json`, `ozarchy-s58b600-campaign.sh`, `s58b600-step.sh`. Analysis
+  in `ozarchy-s58b600-tools/analyst/out/`: `s58b600-pilot.txt` (`s58pilot.py`), `s58b600-timeouts.txt`
+  (`s58flags_to.py` on the `csv2m1hz.py` shadows), `s58b600-minutes.txt`, `s58b600-execlag.txt`,
+  `s58b600-taillag.jsonl`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
