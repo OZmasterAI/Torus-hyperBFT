@@ -41,6 +41,8 @@ services:
       - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
       - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
+      # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
+      - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -81,6 +83,8 @@ services:
       - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
       - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
+      # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
+      - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -120,6 +124,8 @@ services:
       - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
       - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
+      # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
+      - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -159,6 +165,8 @@ services:
       - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
       - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
+      # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
+      - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
@@ -197,6 +205,8 @@ services:
       - TORUS_INGRESS_MIN_COLLATERAL=${TORUS_INGRESS_MIN_COLLATERAL:-0}
       - TORUS_ADDR_RATE_LIMIT=${TORUS_ADDR_RATE_LIMIT:-0}
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
+      # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
+      - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - rpc-node-data:/data
