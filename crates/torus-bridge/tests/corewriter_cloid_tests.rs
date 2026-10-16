@@ -108,6 +108,13 @@ fn core_writer_places_and_cancels_by_cloid() {
     use torus_core::precompiles::QueuedActionKind;
     use torus_state::action_status::CoreWriterKind;
     let (_d, db) = open_test_db();
+    // Item 7 step 2: CoreWriter order delay K = 1 (the rows are filed under block 2).
+    db.put_cf_raw(
+        torus_state::cf::CF_FEE_CONFIG,
+        b"core_writer_order_delay",
+        b"1",
+    )
+    .unwrap();
     let t = addr(5);
     let pre = make_ctx(db.clone(), 2, BookMode::Classic);
     fund(&pre, &t);

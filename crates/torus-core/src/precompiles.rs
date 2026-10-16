@@ -1115,7 +1115,7 @@ fn core_writer(
 
         CoreWriterQueue::enqueue(state_db, &action)?;
         // HL-parity: no order id. The executor assigns the real one from the
-        // global counter when the queue drains next block, so it cannot be known
+        // global counter when the queue drains (K blocks later), so it cannot be known
         // here (the old `(block + 1) << 64 | seq` never matched it).
         Ok([0u8; 32].to_vec())
     } else if sel == selector_for("cancelOrder(bytes32)") {
@@ -1343,26 +1343,80 @@ fn lockbox_precompile(
 
 pub struct CoreWriterQueue;
 
+/// Item 7 step 2 (owner answer 3): `CF_FEE_CONFIG` row holding the last order-kind target
+/// block (u64 BE). Not a governance key (not in the allowlist, no proposal sets it), and not
+/// in `CF_CORE_WRITER_QUEUE`, whose drain takes every row under the target prefix. Hashed
+/// state, written only by EVM blocks (like the queue rows), the same on every node.
+pub const CORE_WRITER_LAST_ORDER_TARGET_KEY: &[u8] = b"core_writer_last_order_target";
+
+/// Queue key: target block (8 BE) ‖ seq (8 BE).
+fn queue_key(target_block: u64, seq: u64) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&target_block.to_be_bytes());
+    key[8..].copy_from_slice(&seq.to_be_bytes());
+    key
+}
+
 impl CoreWriterQueue {
-    /// Enqueue a CoreWriter action for execution in the next block.
-    /// Returns the sequence number assigned to this action.
+    /// Enqueue a CoreWriter action. Returns the row's sequence in its target block.
+    ///
+    /// Item 7 step 2 (owner decision 4): an order action ([`QueuedActionKind::is_order`])
+    /// targets `block_queued + K` (governance `core_writer_order_delay`, absent or invalid =
+    /// [`torus_types::DEFAULT_CORE_WRITER_ORDER_DELAY`]), never a block before the last order
+    /// action's target ([`CORE_WRITER_LAST_ORDER_TARGET_KEY`], owner answer 3: lowering K
+    /// cannot let a cancel overtake its order); any other kind targets `block_queued + 1`. A
+    /// target that already holds [`torus_types::CORE_WRITER_DRAIN_CAP`] rows sends the row on
+    /// to the next block with room, so no block drains more than the cap and rows keep queue
+    /// order. Rows are queued only by EVM blocks (serial barriers), so each is in the raw DB
+    /// before its target's due-check (`NativeExecutor::core_writer_due`).
     ///
     /// T4.4: takes any [`StateBackend`] so EVM execution can enqueue into a per-tx
     /// journaled overlay (durable only if the calling tx succeeds).
     pub fn enqueue(state_db: &impl StateBackend, action: &QueuedAction) -> Result<u64, CoreError> {
-        let target_block = action.block_queued + 1; // anti-frontrunning: execute next block
+        let order = action.kind.is_order();
+        let mut target_block = if order {
+            let stored = state_db.get_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
+            )?;
+            let delay = torus_types::gov_u64_in(
+                stored.as_deref(),
+                &torus_types::CORE_WRITER_ORDER_DELAY_RANGE,
+            )
+            .unwrap_or(torus_types::DEFAULT_CORE_WRITER_ORDER_DELAY);
+            let last = state_db
+                .get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_LAST_ORDER_TARGET_KEY)?
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map_or(0, u64::from_be_bytes);
+            action.block_queued.saturating_add(delay).max(last)
+        } else {
+            action.block_queued.saturating_add(1) // anti-frontrunning: execute next block
+        };
+        // A target's seqs are dense from 0 (rows leave only when the whole target drains),
+        // so it is full iff its last slot is taken: one point read per full block skipped.
+        while state_db
+            .get_cf_len(
+                CF_CORE_WRITER_QUEUE,
+                &queue_key(target_block, torus_types::CORE_WRITER_DRAIN_CAP - 1),
+            )?
+            .is_some()
+        {
+            target_block = target_block
+                .checked_add(1)
+                .ok_or_else(|| CoreError::Overflow("CoreWriter target block".into()))?;
+        }
 
-        // Determine next sequence number for this target block
         let seq = Self::next_sequence(state_db, target_block)?;
-
-        // Key: target_block(8 BE) + sequence(8 BE)
-        let mut key = [0u8; 16];
-        key[..8].copy_from_slice(&target_block.to_be_bytes());
-        key[8..16].copy_from_slice(&seq.to_be_bytes());
-
         let data = borsh::to_vec(action).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &data)?;
-
+        state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(target_block, seq), &data)?;
+        if order {
+            // The target after the cap: a later order action never lands before this row.
+            state_db.put_cf_raw(
+                CF_FEE_CONFIG,
+                CORE_WRITER_LAST_ORDER_TARGET_KEY,
+                &target_block.to_be_bytes(),
+            )?;
+        }
         Ok(seq)
     }
 
@@ -1445,8 +1499,8 @@ impl CoreWriterQueue {
     /// T4.4: goes through [`StateBackend::iterate_cf`] (instead of the FIX EVM-PF-16 raw
     /// reverse seek) so pending journal writes from earlier calls in the SAME tx/block are
     /// visible (read-your-writes — two placeOrder calls in one tx must get seq 0 then 1).
-    /// The scan is bounded to a single target-block prefix (only actions queued for the
-    /// next block), so it stays small.
+    /// The scan is bounded to a single target-block prefix, which holds at most
+    /// [`torus_types::CORE_WRITER_DRAIN_CAP`] rows (item 7 step 2).
     fn next_sequence(state_db: &impl StateBackend, target_block: u64) -> Result<u64, CoreError> {
         let prefix = target_block.to_be_bytes();
         let entries = state_db.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?;
@@ -1566,6 +1620,21 @@ pub enum QueuedActionKind {
     LockboxWithdraw {
         amount: FixedPoint,
     },
+}
+
+impl QueuedActionKind {
+    /// Item 7 step 2 (owner decision 4): order actions (the placement and every cancel, so a
+    /// contract's cancel never overtakes its order) wait K blocks; staking and lockbox kinds
+    /// one.
+    pub fn is_order(&self) -> bool {
+        matches!(
+            self,
+            Self::PlaceOrder { .. }
+                | Self::CancelOrder { .. }
+                | Self::CancelAll { .. }
+                | Self::CancelByCloid { .. }
+        )
+    }
 }
 
 /// Borsh tags of the lockbox kinds. Kept clear of the dense 0.. range used by the

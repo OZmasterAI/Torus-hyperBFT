@@ -12263,10 +12263,13 @@ impl NativeExecutor {
     /// Whether CoreWriter / lockbox actions are queued for `height` — the block
     /// pipeline must then run the native path (and so [`Self::drain_core_writer`]) even
     /// for a block with no native actions and no fees. Queue entries for `height` are
-    /// buffered by block `height - 1`'s EVM execution and committed in the SAME atomic
-    /// batch as that block's EVM bundle (s515 F1), which lands before this block runs
-    /// — so a DB read is authoritative here. R02 (C4): a read error is a local
-    /// fault and propagates; the caller fail-stops the block (never "assume due").
+    /// buffered by an earlier block's EVM execution (`height - 1`, or `height - K` and
+    /// earlier for order kinds and rows a full block moved on, item 7 step 2) and
+    /// committed in the SAME atomic batch as that block's EVM bundle (s515 F1), which
+    /// lands before this block runs; no later block rewrites them before their drain
+    /// (EVM blocks are serial barriers) — so a DB read is authoritative here. R02 (C4): a
+    /// read error is a local fault and propagates; the caller fail-stops the block (never
+    /// "assume due").
     pub fn core_writer_due(state_db: &StateDb, height: u64) -> Result<bool, CoreError> {
         Ok(CoreWriterQueue::pending_count(state_db, height)? > 0)
     }
@@ -12280,9 +12283,11 @@ impl NativeExecutor {
         OracleManager::new(state.clone(), OracleConfig::default()).has_submissions()
     }
 
-    /// Drain and execute CoreWriter actions queued from the previous block.
+    /// Drain and execute the CoreWriter actions that target this block: queued one
+    /// block earlier, or K blocks earlier for order kinds (item 7 step 2), at most
+    /// `CORE_WRITER_DRAIN_CAP` rows (the cap is applied at enqueue).
     ///
-    /// Task 3.1.5 (anti-MEV): Asserts the one-block delay is enforced — all
+    /// Task 3.1.5 (anti-MEV): Asserts the delay is enforced — all
     /// drained actions must have been queued in a strictly earlier block.
     ///
     /// FIX EVM-FIND-12: Propagates drain errors instead of silently returning empty vec.

@@ -35,6 +35,19 @@ fn open_test_db() -> (tempfile::TempDir, StateDb) {
     (dir, db)
 }
 
+/// [`open_test_db`] with the CoreWriter order delay K pinned to 1 (item 7 step 2): for the
+/// writer-precompile tests that read the order rows at `block + 1`.
+fn open_test_db_k1() -> (tempfile::TempDir, StateDb) {
+    let (dir, db) = open_test_db();
+    db.put_cf_raw(
+        torus_state::cf::CF_FEE_CONFIG,
+        b"core_writer_order_delay",
+        b"1",
+    )
+    .expect("pin K = 1");
+    (dir, db)
+}
+
 fn default_block_cfg() -> BlockEnvCfg {
     BlockEnvCfg {
         number: 1,
@@ -1088,7 +1101,7 @@ fn cancel_order_calldata(order_id: u128) -> Vec<u8> {
 /// (pending_count == 1); with the per-tx journal it is discarded (== 0).
 #[test]
 fn reverting_tx_discards_writer_precompile_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1127,7 +1140,7 @@ fn reverting_tx_discards_writer_precompile_side_effects() {
 /// both before and after the journal change, pinning state-root determinism).
 #[test]
 fn successful_tx_persists_writer_precompile_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1163,7 +1176,7 @@ fn successful_tx_persists_writer_precompile_side_effects() {
 /// one successful writer-precompile tx, only the successful tx's action survives.
 #[test]
 fn block_execution_journals_writer_precompiles_per_tx() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1261,7 +1274,7 @@ fn call_and_swallow_revert_code(callee: &Address) -> Vec<u8> {
 /// checkpoint/revert it is discarded (== 0). This is the test that would have caught the bug.
 #[test]
 fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1310,7 +1323,7 @@ fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
 #[test]
 fn block_execution_reports_the_tx_and_call_of_each_queued_row() {
     use torus_evm::CoreWriterOrigin;
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1735,7 +1748,7 @@ fn lockbox_deposit_in_reverted_subcall_enqueues_nothing_and_loses_nothing() {
 /// Wrong-context / malformed lockbox calls revert and leave no trace.
 #[test]
 fn lockbox_rejects_bad_calls_without_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let e0 = tokens_wei(1_000);
     db.put_account(&ALICE, &test_account(e0)).unwrap();
     seed_native(&db, &ALICE, 50 * 100_000_000);
@@ -1878,7 +1891,7 @@ fn writer_precompiles_reject_delegatecall_and_callcode() {
     ];
     for (name, target, data) in cases {
         for (opcode, op_name, ok) in [(0xf4, "DELEGATECALL", false), (0xf2, "CALLCODE", false), (0xf1, "CALL", true)] {
-            let (_dir, db) = open_test_db();
+            let (_dir, db) = open_test_db_k1();
             db.put_account(&ALICE, &test_account(tokens_wei(10))).unwrap();
             let proxy = Address::new([0xD2; 20]);
             install_contract(&db, &proxy, &forwarding_code(&target, opcode));

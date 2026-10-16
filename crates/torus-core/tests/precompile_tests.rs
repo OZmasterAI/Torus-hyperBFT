@@ -18,6 +18,19 @@ fn setup() -> (tempfile::TempDir, StateDb) {
     (dir, db)
 }
 
+/// [`setup`] with the CoreWriter order delay K pinned to 1 (item 7 step 2): for the tests
+/// whose subject is not the delay and that expect an order kind at `block_queued + 1`.
+fn setup_k1() -> (tempfile::TempDir, StateDb) {
+    let (dir, db) = setup();
+    db.put_cf_raw(
+        torus_state::cf::CF_FEE_CONFIG,
+        b"core_writer_order_delay",
+        b"1",
+    )
+    .unwrap();
+    (dir, db)
+}
+
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
@@ -484,7 +497,7 @@ fn staking_reader_get_staking_info() {
 
 #[test]
 fn core_writer_place_order_queues_action() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
 
     let address = precompile_address(ADDR_CORE_WRITER);
@@ -535,7 +548,7 @@ fn place_order_input(order_type: u8) -> Vec<u8> {
 /// zero: no id (the 0x0800 getOpenOrders reader was removed in s99).
 #[test]
 fn core_writer_place_order_returns_no_synthetic_order_id() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     let output = execute_precompile(&address, &place_order_input(0), &addr(1), &db, 100, 0).unwrap();
     assert_eq!(output, vec![0u8; 32], "no fabricated order id");
@@ -547,7 +560,7 @@ fn core_writer_place_order_returns_no_synthetic_order_id() {
 /// Limit orders. They are rejected (the EVM call reverts) and nothing queues.
 #[test]
 fn core_writer_rejects_stop_order_types() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     for order_type in [2u8, 3] {
         let err = execute_precompile(&address, &place_order_input(order_type), &addr(1), &db, 100, 0);
@@ -558,7 +571,7 @@ fn core_writer_rejects_stop_order_types() {
 
 #[test]
 fn core_writer_cancel_order_queues_action() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
 
     let address = precompile_address(ADDR_CORE_WRITER);
@@ -607,7 +620,7 @@ fn core_writer_staking_delegate_queues_action() {
 /// and the overlay had no `commit_tx`.)
 #[test]
 fn writer_precompile_journals_through_overlay() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
     let overlay = NativeStateOverlay::new(db.clone());
 
@@ -658,7 +671,7 @@ fn writer_precompile_journals_through_overlay() {
 
 #[test]
 fn queue_enqueue_and_drain() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
 
     let action1 = QueuedAction {
         trader: addr(1),
@@ -808,6 +821,174 @@ fn queue_drain_reports_an_undecodable_row_in_place_and_deletes_it() {
     assert_eq!(again[0].as_ref().unwrap_err().error, bad.error);
 }
 
+/// Item 7 step 2 (owner decision 4): order actions wait K blocks (default 10, governance
+/// `core_writer_order_delay`), other kinds one; an invalid stored K keeps 10. RED before: all +1.
+#[test]
+fn order_actions_wait_k_blocks_others_one() {
+    use torus_state::cf::CF_FEE_CONFIG;
+    let (_dir, db) = setup();
+    let queue = |kind| {
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind,
+                block_queued: 100,
+            },
+        )
+        .unwrap()
+    };
+    queue(QueuedActionKind::PlaceOrder {
+        market_id: 1,
+        side: 0,
+        order_type: 0,
+        price: fp(50_000),
+        quantity: fp(5),
+        time_in_force: 0,
+        cloid: None,
+    });
+    queue(QueuedActionKind::CancelOrder { order_id: 1 });
+    queue(QueuedActionKind::CancelAll { market_id: 1 });
+    queue(QueuedActionKind::CancelByCloid {
+        market_id: 1,
+        cloid: 7,
+    });
+    queue(QueuedActionKind::ClaimRewards);
+    queue(QueuedActionKind::LockboxDeposit { amount: fp(1) });
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 2);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 110).unwrap(), 4);
+    for (stored, target) in [("3", 103), ("0", 110), ("101", 110), ("x", 110)] {
+        let (_dir, db) = setup();
+        db.put_cf_raw(
+            CF_FEE_CONFIG,
+            torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
+            stored.as_bytes(),
+        )
+        .unwrap();
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind: QueuedActionKind::CancelOrder { order_id: 1 },
+                block_queued: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CoreWriterQueue::pending_count(&db, target).unwrap(),
+            1,
+            "{stored}"
+        );
+    }
+}
+
+/// Item 7 step 2 (owner decision 4, cap at enqueue): a target block already holding 200
+/// rows sends the next row to the following block, in queue order. RED before: one block
+/// took every row (and all at +1).
+#[test]
+fn a_full_target_block_sends_later_rows_to_the_next_block() {
+    let (_dir, db) = setup();
+    let enqueue = |kind, block_queued| {
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind,
+                block_queued,
+            },
+        )
+        .unwrap()
+    };
+    let seqs: Vec<u64> = (0..=200)
+        .map(|order_id| enqueue(QueuedActionKind::CancelOrder { order_id }, 100))
+        .collect();
+    assert_eq!(seqs[..200], (0..200).collect::<Vec<u64>>()[..]);
+    assert_eq!(seqs[200], 0, "the 201st row opens block 111");
+    assert_eq!(CoreWriterQueue::pending_count(&db, 110).unwrap(), 200);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 111).unwrap(), 1);
+    // A ClaimRewards queued at 109 targets 110, which is full: 111, after the cancel.
+    assert_eq!(enqueue(QueuedActionKind::ClaimRewards, 109), 1);
+    let drained = drain_ok(&db, 111);
+    assert_eq!(drained.len(), 2);
+    assert!(matches!(
+        drained[0].kind,
+        QueuedActionKind::CancelOrder { order_id: 200 }
+    ));
+    assert!(matches!(drained[1].kind, QueuedActionKind::ClaimRewards));
+}
+
+/// Item 7 step 2 (owner answer 3, Codex plan check s125): K is read at enqueue and the drain
+/// takes a target prefix, so lowering K must not let a later cancel drain before an earlier
+/// order: an order kind never targets a block before the last order kind's target. Other
+/// kinds ignore it. RED before: all +1 (and without the last-target row the cancel drains
+/// at 103).
+#[test]
+fn lowering_k_never_lets_a_cancel_overtake_an_earlier_order() {
+    use torus_state::cf::CF_FEE_CONFIG;
+    let (_dir, db) = setup();
+    let enqueue = |kind, block_queued| {
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind,
+                block_queued,
+            },
+        )
+        .unwrap()
+    };
+    enqueue(
+        QueuedActionKind::PlaceOrder {
+            market_id: 1,
+            side: 0,
+            order_type: 0,
+            price: fp(50_000),
+            quantity: fp(5),
+            time_in_force: 0,
+            cloid: None,
+        },
+        100,
+    );
+    assert_eq!(CoreWriterQueue::pending_count(&db, 110).unwrap(), 1);
+    db.put_cf_raw(
+        CF_FEE_CONFIG,
+        torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
+        b"1",
+    )
+    .unwrap();
+    assert_eq!(
+        enqueue(QueuedActionKind::CancelOrder { order_id: 1 }, 102),
+        1
+    );
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, 103).unwrap(),
+        0,
+        "the cancel waits for the order's target"
+    );
+    // Other kinds ignore the last order target: K = 1 does not apply, + 1 does.
+    assert_eq!(enqueue(QueuedActionKind::ClaimRewards, 102), 0);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 103).unwrap(), 1);
+    let drained = drain_ok(&db, 110);
+    assert_eq!(drained.len(), 2);
+    assert!(matches!(
+        drained[0].kind,
+        QueuedActionKind::PlaceOrder { market_id: 1, .. }
+    ));
+    assert!(matches!(
+        drained[1].kind,
+        QueuedActionKind::CancelOrder { order_id: 1 }
+    ));
+    // Once the last target has passed, the delay is K again.
+    enqueue(QueuedActionKind::CancelOrder { order_id: 2 }, 115);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 116).unwrap(), 1);
+    // The row is hashed state in CF_FEE_CONFIG (u64 BE), not a queue row.
+    assert_eq!(
+        db.get_cf_raw(CF_FEE_CONFIG, b"core_writer_last_order_target")
+            .unwrap(),
+        Some(116u64.to_be_bytes().to_vec())
+    );
+}
+
 // ============================================================================
 // ABI Encoding Roundtrip Tests
 // ============================================================================
@@ -917,7 +1098,7 @@ fn lockbox_precompile_deposit() {
 
 #[test]
 fn lockbox_precompile_deposit_rejects_bad_value() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let trader = addr(5);
     let address = precompile_address(ADDR_LOCKBOX);
     let deposit = |amount: U256| {
@@ -1084,7 +1265,7 @@ fn read_only_denies_lockbox_deposit_no_state_change() {
 
 #[test]
 fn read_only_denies_core_writer_no_enqueue() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
     let address = precompile_address(ADDR_CORE_WRITER);
     let input = build_input(
@@ -1164,7 +1345,7 @@ fn queued(db: &StateDb, block: u64) -> Vec<QueuedAction> {
 /// queues an order without one.
 #[test]
 fn core_writer_place_order_with_cloid_queues_it() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     let words = |cloid: u128| {
         build_input(
@@ -1196,7 +1377,7 @@ fn core_writer_place_order_with_cloid_queues_it() {
 
 #[test]
 fn core_writer_cancel_by_cloid_queues_it() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     let input = build_input(
         "cancelByCloid(bytes32,uint128)",

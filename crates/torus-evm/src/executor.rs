@@ -141,7 +141,8 @@ pub struct BlockExecResult {
 /// s114: the tx that queued one CoreWriter / lockbox queue row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoreWriterOrigin {
-    /// The row's target (drain) block: this block + 1.
+    /// The row's target (drain) block, the key's high 8 bytes. Item 7 step 2: K blocks
+    /// after this one for an order kind, one for any other, later if a block was full.
     pub target_block: u64,
     /// The row's sequence in the target block's queue.
     pub seq: u64,
