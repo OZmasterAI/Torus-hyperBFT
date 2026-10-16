@@ -2239,6 +2239,12 @@ fn check_parent_link(
 /// `evm_gas_limit / 21,000` of them and at most 256 KiB of raw tx bytes. A
 /// header cannot pick its own N to dodge the cadence: `check_parent_link`
 /// pins N before the same vote.
+///
+/// Item 7 step 2: a big height (`height % M == 0`, M > 0) also carries EVM
+/// txs; there the gas cap is the small plus the big limit (count cap = gas
+/// cap / 21,000, declared gas <= gas cap) and the byte cap 768 KiB
+/// (`TorusBlockHeader::evm_block_gas_cap`, `evm_block_byte_cap`).
+/// `check_parent_link` pins M and the big limit before the same vote.
 fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool {
     if evm_txs.len() != header.evm_tx_count as usize {
         tracing::warn!(
@@ -2252,20 +2258,23 @@ fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool 
     if evm_txs.is_empty() {
         return true;
     }
-    // Item 7 step 1: only on the header's cadence, at most limit / 21,000 txs (undecodable txs
-    // declare no gas, so the gas rule alone does not bound them), at most 256 KiB of tx bytes.
-    let max_txs = header.evm_gas_limit / torus_types::EVM_MIN_TX_GAS;
+    // Item 7 steps 1-2: only on an EVM height (h % N == 0, or a big height), at most cap / 21,000
+    // txs (undecodable txs declare no gas, so the gas rule alone does not bound them), at most the
+    // height's byte cap (256 KiB, 768 KiB at a big height); the cap is the small limit, plus the big
+    // limit at a big height.
+    let gas_cap = header.evm_block_gas_cap();
+    let max_txs = gas_cap / torus_types::EVM_MIN_TX_GAS;
+    let byte_cap = header.evm_block_byte_cap();
     let bytes: usize = evm_txs.iter().map(Vec::len).sum();
-    if header.height.checked_rem(header.evm_block_interval) != Some(0)
-        || evm_txs.len() as u64 > max_txs
-        || bytes > torus_types::MAX_EVM_BLOCK_TX_BYTES
-    {
+    if !header.is_evm_height() || evm_txs.len() as u64 > max_txs || bytes > byte_cap {
         tracing::warn!(
             height = header.height,
             n = header.evm_block_interval,
+            m = header.evm_big_block_interval,
             txs = evm_txs.len(),
             max_txs,
             bytes,
+            byte_cap,
             "not voting -- EVM txs off the cadence or over the count/byte cap"
         );
         return false;
@@ -2274,12 +2283,12 @@ fn evm_body_fits_header(header: &TorusBlockHeader, evm_txs: &[Vec<u8>]) -> bool 
         .iter()
         .filter_map(|tx| torus_bridge::declared_gas_limit(tx))
         .fold(0u64, u64::saturating_add);
-    if declared > header.evm_gas_limit {
+    if declared > gas_cap {
         tracing::warn!(
             height = header.height,
             declared,
-            evm_gas_limit = header.evm_gas_limit,
-            "not voting -- EVM txs declare more gas than the block's limit"
+            gas_cap,
+            "not voting -- EVM txs declare more gas than the block's cap"
         );
         return false;
     }
@@ -22303,6 +22312,120 @@ mod crash_recovery_tests {
                     "{what} (compact={compact})"
                 );
             }
+        }
+    }
+
+    /// Item 7 step 2: `make_block(height)` with N = 5 and M = `m` (header values, not the genesis
+    /// default N, which the n11 branch moves to 11).
+    fn lane_block(height: u64, m: u64) -> TorusBlock {
+        let mut b = make_block(height, vec![]);
+        b.header.evm_block_interval = 5;
+        b.header.evm_big_block_interval = m;
+        b
+    }
+
+    /// `evm_child_of(parent)` keeping the parent's six EVM header values (the off-boundary rule).
+    fn lane_child_of(parent: &TorusBlock, evm: Vec<Vec<u8>>) -> TorusBlock {
+        let mut b = evm_child_of(parent, evm);
+        let p = &parent.header;
+        b.header.evm_gas_limit = p.evm_gas_limit;
+        b.header.evm_block_interval = p.evm_block_interval;
+        b.header.evm_big_block_interval = p.evm_big_block_interval;
+        b.header.evm_big_gas_limit = p.evm_big_gas_limit;
+        b.header.base_fee_per_gas = p.base_fee_per_gas;
+        b.header.big_base_fee_per_gas = p.big_base_fee_per_gas;
+        b
+    }
+
+    /// Item 7 step 2: a big height carries EVM txs off the small cadence (N = 5, M = 7: height 7
+    /// is big); height 8 is on neither cadence and is refused before the vote. Full and compact
+    /// datums. RED before: height 7 was off the N = 5 cadence, so `Invalid`.
+    #[test]
+    fn evm_txs_at_a_big_height_off_the_small_cadence_are_held() {
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            let parent6 = lane_block(6, 7);
+            let big = lane_child_of(&parent6, vec![evm_tx_gas(0, 21_000)]);
+            assert_eq!(big.header.height, 7);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent6, &big, compact),
+                BlockDataCheck::Held,
+                "EVM at big height 7 (compact={compact})"
+            );
+            let parent7 = lane_block(7, 7);
+            let off = lane_child_of(&parent7, vec![evm_tx_gas(0, 21_000)]);
+            assert_eq!(off.header.height, 8);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent7, &off, compact),
+                BlockDataCheck::Invalid,
+                "EVM at height 8, neither cadence (compact={compact})"
+            );
+        }
+    }
+
+    /// Item 7 step 2: at a big height the vote caps count, bytes and declared gas at the small
+    /// plus the big limit (3M + 10M): 619 txs, 768 KiB, 13M gas; one more of each is refused.
+    /// With M = 0 the same height keeps the 256 KiB cap. Full and compact datums. RED before:
+    /// the caps were the small lane's alone (142 txs, 256 KiB, 3M).
+    #[test]
+    fn big_height_caps_count_bytes_and_gas_at_small_plus_big() {
+        let parent = lane_block(49, 50);
+        assert_eq!(
+            (parent.header.evm_gas_limit, parent.header.evm_big_gas_limit),
+            (3_000_000, 10_000_000)
+        );
+        let max_txs = (13_000_000 / torus_types::EVM_MIN_TX_GAS) as usize;
+        assert_eq!(max_txs, 619);
+        let max_bytes = torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES;
+        let mut app = ts_app(2_010);
+        for compact in [false, true] {
+            for (txs, want, what) in [
+                (
+                    vec![vec![0xff; 8]; max_txs],
+                    BlockDataCheck::Held,
+                    "619 txs",
+                ),
+                (
+                    vec![vec![0xff; 8]; max_txs + 1],
+                    BlockDataCheck::Invalid,
+                    "620 txs",
+                ),
+                (
+                    vec![vec![0xff; max_bytes]],
+                    BlockDataCheck::Held,
+                    "one 768 KiB tx",
+                ),
+                (
+                    vec![vec![0xff; max_bytes + 1]],
+                    BlockDataCheck::Invalid,
+                    "768 KiB + 1",
+                ),
+                (
+                    vec![evm_tx_gas(0, 13_000_000)],
+                    BlockDataCheck::Held,
+                    "13M gas",
+                ),
+                (
+                    vec![evm_tx_gas(0, 13_000_001)],
+                    BlockDataCheck::Invalid,
+                    "13M + 1 gas",
+                ),
+            ] {
+                let b = lane_child_of(&parent, txs);
+                assert_eq!(b.header.height, 50);
+                assert_eq!(
+                    pre_vote_as(&mut app, &parent, &b, compact),
+                    want,
+                    "{what} (compact={compact})"
+                );
+            }
+            let parent_m0 = lane_block(49, 0);
+            let b = lane_child_of(&parent_m0, vec![vec![0xff; 300 * 1024]]);
+            assert_eq!(
+                pre_vote_as(&mut app, &parent_m0, &b, compact),
+                BlockDataCheck::Invalid,
+                "300 KiB at height 50 with M = 0 (compact={compact})"
+            );
         }
     }
 
