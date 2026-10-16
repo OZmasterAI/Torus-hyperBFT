@@ -468,6 +468,20 @@ fn rpc_access_list(al: &alloy_eips::eip2930::AccessList) -> Vec<RpcAccessListIte
 fn decode_envelope_and_sender(raw: &[u8]) -> Result<(TxEnvelope, Address), RpcError> {
     let envelope = TxEnvelope::decode(&mut &raw[..])
         .map_err(|e| RpcError::Internal(format!("tx rlp decode: {e}")))?;
+    with_sender(envelope)
+}
+
+/// Item 7 step 2 (owner s126): a submitted tx decodes like admission
+/// ([`torus_mempool::validate::decode_tx_exact`]), so one with bytes after it is refused before
+/// the rate limiter counts its sender. Committed bodies, which may carry such bytes, decode
+/// with [`decode_envelope_and_sender`].
+fn decode_submitted_tx(raw: &[u8]) -> Result<(TxEnvelope, Address), RpcError> {
+    let envelope = torus_mempool::validate::decode_tx_exact(raw)
+        .map_err(|e| RpcError::Mempool(e.to_string()))?;
+    with_sender(envelope)
+}
+
+fn with_sender(envelope: TxEnvelope) -> Result<(TxEnvelope, Address), RpcError> {
     let sender = envelope
         .recover_signer()
         .map_err(|e| RpcError::Internal(format!("signer recovery: {e}")))?;
@@ -854,8 +868,9 @@ impl EthApiServer for RpcState {
 
     async fn send_raw_transaction(&self, data: String) -> RpcResult<String> {
         let bytes = parse_bytes(&data).map_err(err)?;
-        // FIX 14 (EVM-FIND-19): Rate-limit at submission time, not commit time.
-        let (_, sender) = decode_envelope_and_sender(&bytes).map_err(err)?;
+        // FIX 14 (EVM-FIND-19): Rate-limit at submission time, not commit time. Item 7 step 2
+        // (owner s126): trailing bytes are refused here first, as `add_evm_tx` refuses them.
+        let (_, sender) = decode_submitted_tx(&bytes).map_err(err)?;
         if !self.tx_submit_limiter.check_sender(&sender) {
             return Err(err(RpcError::TxSubmitRateLimit));
         }

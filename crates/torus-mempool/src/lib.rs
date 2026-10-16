@@ -62,8 +62,9 @@ pub struct EvmResend {
 /// Item 7 step 2 (decision 7): the hash a pool keys raw EVM tx bytes by (the tx hash), `None`
 /// when they do not decode (no pool holds such a tx). Decoded, not the keccak of the bytes:
 /// `decode_tx` takes the EIP-2718 bytes and alloy's network form (an RLP string header
-/// before them, what its `Encodable` writes) alike, and ignores trailing bytes, so one tx
-/// can arrive as different byte strings. No signature recovery.
+/// before them, what its `Encodable` writes) alike, and ignores trailing bytes (admission
+/// refuses them, owner s126, but a block may carry them), so one tx can arrive as different
+/// byte strings. No signature recovery.
 pub fn evm_tx_hash(raw: &[u8]) -> Option<B256> {
     validate::decode_tx(raw).ok().map(|tx| *tx.tx_hash())
 }
@@ -5877,6 +5878,70 @@ mod tests {
             ..due
         };
         assert_eq!(pool.evm_due_resends(12), vec![last]);
+    }
+
+    // ---- item 7 step 2: one byte form per tx at admission (owner s126) ----
+
+    /// Item 7 step 2 (owner s126): admission (`add_evm_tx`: RPC submissions and txs forwarded
+    /// by peers) refuses an EVM tx with bytes after it (`Decode`, "trailing bytes") in each
+    /// accepted encoding: alloy's network form (an RLP string header before the EIP-2718
+    /// bytes), the bare EIP-2718 bytes, a legacy list. The same txs without them are admitted.
+    /// A block's padded copy still hashes like the pooled tx: blocks and the vote take
+    /// padding, the in-flight filter decodes. RED before: decoding ignored trailing bytes, so
+    /// the padded txs were admitted.
+    #[test]
+    fn evm_txs_with_trailing_bytes_are_refused_at_admission() {
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_rlp::Decodable;
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = intrinsic_case(&state, 249);
+        let network = inflight_tx(&k, 0);
+        let eip2718 = TxEnvelope::decode(&mut &inflight_tx(&k, 1)[..])
+            .unwrap()
+            .encoded_2718();
+        let legacy = sign_envelope(
+            &k,
+            alloy_consensus::TxLegacy {
+                chain_id: Some(torus_types::eip712::TORUS_CHAIN_ID),
+                nonce: 2,
+                gas_price: 2_000_000_000,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+        );
+        assert!(
+            (0x81..0xc0).contains(&network[0]) && eip2718[0] == 0x02 && legacy[0] >= 0xc0,
+            "the three byte forms"
+        );
+
+        for (form, raw) in [
+            ("network form", network),
+            ("EIP-2718", eip2718),
+            ("legacy", legacy),
+        ] {
+            let pads: [&[u8]; 3] = [&[0], &[0xc0], &raw];
+            for pad in pads {
+                let padded = [&raw[..], pad].concat();
+                let err = pool.add_evm_tx(padded.clone()).unwrap_err();
+                assert!(
+                    matches!(&err, MempoolError::Decode(m) if m.contains("trailing bytes")),
+                    "{form} + {} bytes: refused for them, got: {err}",
+                    pad.len()
+                );
+            }
+            let hash = pool
+                .add_evm_tx(raw.clone())
+                .unwrap_or_else(|e| panic!("{form} without trailing bytes: {e}"));
+            assert_eq!(
+                evm_tx_hash(&[&raw[..], &[0]].concat()),
+                Some(hash),
+                "{form}: a padded block copy hashes like the pooled tx"
+            );
+        }
+        assert_eq!(pool.evm_pool_size(), 3);
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----

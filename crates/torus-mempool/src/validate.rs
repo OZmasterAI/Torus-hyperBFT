@@ -11,9 +11,26 @@ use torus_state::backend::StateBackend;
 use crate::error::MempoolError;
 use crate::evm_pool::EvmPoolEntry;
 
-/// Decode raw bytes into a signed transaction envelope (EIP-2718).
+/// Decode raw bytes into a signed transaction envelope (EIP-2718). Bytes after the tx are
+/// ignored: blocks and the vote take them ([`decode_tx_exact`] refuses them at admission).
 pub fn decode_tx(raw: &[u8]) -> Result<TxEnvelope, MempoolError> {
     TxEnvelope::decode(&mut &raw[..]).map_err(|e| MempoolError::Decode(format!("{e}")))
+}
+
+/// Item 7 step 2 (owner s126): [`decode_tx`] for admission. Bytes after the tx are refused
+/// (`Decode`, "trailing bytes"), so an admitted tx has one byte form per accepted encoding:
+/// the EIP-2718 bytes, or alloy's network form (an RLP string header before them). Blocks
+/// and the vote are unchanged and still take such bytes.
+pub fn decode_tx_exact(raw: &[u8]) -> Result<TxEnvelope, MempoolError> {
+    let mut rest = raw;
+    let tx = TxEnvelope::decode(&mut rest).map_err(|e| MempoolError::Decode(format!("{e}")))?;
+    if !rest.is_empty() {
+        return Err(MempoolError::Decode(format!(
+            "trailing bytes after the tx ({} bytes)",
+            rest.len()
+        )));
+    }
+    Ok(tx)
 }
 
 /// Recover the sender address from a decoded transaction.
@@ -31,8 +48,8 @@ fn extract_gas_price(tx: &TxEnvelope) -> (u128, u128) {
 
 /// Decode, validate, and extract metadata from a raw EVM transaction.
 ///
-/// Checks: RLP decode, tx type, chain ID, gas limit, initcode size, intrinsic
-/// gas, fee floor, signature recovery, nonce, balance.
+/// Checks: RLP decode (no trailing bytes, [`decode_tx_exact`]), tx type, chain ID, gas
+/// limit, initcode size, intrinsic gas, fee floor, signature recovery, nonce, balance.
 pub fn validate_evm_tx<S: StateBackend>(
     raw_rlp: &[u8],
     state: &S,
@@ -40,7 +57,7 @@ pub fn validate_evm_tx<S: StateBackend>(
     block_gas_limit: u64,
     base_fee: u64,
 ) -> Result<EvmPoolEntry, MempoolError> {
-    let tx = decode_tx(raw_rlp)?;
+    let tx = decode_tx_exact(raw_rlp)?;
 
     // D3 (S392): only Legacy/EIP-2930/EIP-1559 execute on Torus. Blob (type 3)
     // and set-code (type 4) envelopes are rejected before signature recovery so

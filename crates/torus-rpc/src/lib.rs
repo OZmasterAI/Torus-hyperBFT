@@ -3589,6 +3589,119 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// Item 7 step 2 (owner s126): `eth_sendRawTransaction` refuses a tx with bytes after it,
+    /// in alloy's network form (an RLP string header before the EIP-2718 bytes) and in the
+    /// bare EIP-2718 bytes, before it reaches the pool or a leader; the same txs without them
+    /// are accepted and forwarded. RED before: decoding ignored trailing bytes, so the padded
+    /// txs were pooled and forwarded.
+    #[tokio::test]
+    async fn send_raw_transaction_refuses_trailing_bytes() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_primitives::{Bytes, Signature as AlloySig, TxKind};
+        use jsonrpsee::core::client::ClientT;
+
+        fn evm_addr(key: &k256::ecdsa::SigningKey) -> Address {
+            let pt = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pt.as_bytes()[1..]).as_slice()[12..])
+        }
+        fn signed_eip1559(key: &k256::ecdsa::SigningKey, nonce: u64) -> TxEnvelope {
+            let tx = TxEip1559 {
+                chain_id: TORUS_CHAIN_ID,
+                nonce,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+                access_list: Default::default(),
+            };
+            let sig_hash = tx.signature_hash();
+            let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+            let r = U256::from_be_slice(sig.r().to_bytes().as_slice());
+            let s = U256::from_be_slice(sig.s().to_bytes().as_slice());
+            TxEnvelope::Eip1559(tx.into_signed(AlloySig::new(r, s, recid.is_y_odd())))
+        }
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let (_dir, state, mempool, executor) = setup();
+        state
+            .put_account(
+                &evm_addr(&key),
+                &AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    nonce: 0,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        let network = alloy_rlp::encode(signed_eip1559(&key, 0));
+        let eip2718 = signed_eip1559(&key, 1).encoded_2718();
+        assert!(
+            network[0] > 0x80 && eip2718[0] == 0x02,
+            "the two byte forms"
+        );
+
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
+        let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(
+            [1u8; 32],
+            Arc::new(move || Some([2u8; 32])),
+            fwd_tx,
+            evm_fwd_tx,
+            false,
+        );
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let send = |raw: Vec<u8>| {
+            let client = &client;
+            async move {
+                client
+                    .request::<String, _>(
+                        "eth_sendRawTransaction",
+                        jsonrpsee::rpc_params![format!("0x{}", hex::encode(raw))],
+                    )
+                    .await
+            }
+        };
+
+        for (form, raw) in [("network form", &network), ("EIP-2718", &eip2718)] {
+            let err = send([raw.clone(), vec![0]].concat()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("trailing bytes"),
+                "{form}: refused for its trailing byte, got: {err}"
+            );
+            assert_eq!(mempool.evm_pool_size(), 0, "{form}: not pooled");
+            assert!(evm_fwd_rx.try_recv().is_err(), "{form}: not forwarded");
+        }
+        for (form, raw) in [("network form", &network), ("EIP-2718", &eip2718)] {
+            send(raw.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{form} without trailing bytes: {e}"));
+            let (_, payload) = evm_fwd_rx.try_recv().expect("forwarded");
+            assert_eq!(&payload, raw, "{form}: forwarded as submitted");
+        }
+        assert_eq!(mempool.evm_pool_size(), 2);
+        handle.stop().unwrap();
+    }
+
     /// Item 7 step 2 (decision 7): with the lane-aware hook wired, a big-lane tx goes to the
     /// leaders of its lane's targets (the next two big heights), never to this node's own
     /// key, and the mempool tracks it at the last target (25) for a re-send. RED before: one
