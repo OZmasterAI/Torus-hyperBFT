@@ -19,10 +19,27 @@ smoke`. A check that read a driver local now fails (CHECK FAIL, or unbound varia
 arguments (`$1` label, `$2` arm) or driver globals (`R`, `AENV`, `AXE`, ...). `_DRV_` is reserved: any mention in a
 checks file fails preflight.
 
-**Now, on current main** (s125: main carries KP, DB and PC, flags off; s126: propose-defer is PARKED, campaign B dropped, see step 6):
+**s58 bundle (owner s126):** `exp/archy-s58-bundle-dmt` (bfe47982, D `TORUS_SETTLE_DEFER_RESULTS`, M
+`TORUS_PARALLEL_MATCH_SETUP`, T `TORUS_FAST_SELL_TOP_UPS`, all ON by default) merges into main BEFORE campaign A and
+Q7, after 18c's Codex torus + adversarial reviews (running); docs branch `docs/s58flags` (sections 77-79) merges with
+it. 18c says when it is on main. Effects on this queue:
+- D, M and T ship on and are already measured off vs on (sections 78, 79): no re-bench, no DMT/DMTE arms, no =0
+  arm. Every arm of every campaign runs main as it ships: D, M, T unset (= on).
+- The bundle sets `TORUS_HEADER_RESEND_MS=${...:-250}` in `devnet/wsl/env.sh` and `devnet/docker-compose.yml`, so
+  every cell gets 250 ms (code default stays 3 s). Comparisons inside a campaign stay valid; comparisons with
+  results from before the resend change do not (fewer lost-proposal timeouts move block rate and matched/s).
+- Block rate from cells shorter than about 5 min is indicative only: under sustained load it falls to exec pace
+  (5.9 -> 3.0 blocks/s by minute 5) while matched/s stays flat (section 79). matched/s stays the primary metric.
+- Watch `no_proposal` in every replicate (1 in the s58dmt check cell, 1 in the s58safe soak).
+- Soaks longer than about 20 min need account-margin top-ups or a lower load (the s58safe load ran out of margin).
+- Parked: B (`TORUS_PARALLEL_BOOK_SAVE`), G (`TORUS_EXEC_POOL_GRAIN`) (78.6). Archy's E duplicate (bb62bab1) is not
+  merged; E is main's `TORUS_EPOCH_FAST_PATH`.
+
+**Now, on current main** (s125: main carries KP, DB and PC, flags off; s126: propose-defer is PARKED, campaign B dropped, see step 6; the s58 bundle merges first, see above):
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
-   cell and its checks (Q5 below). Gates every later campaign.
+   cell and its checks (Q5 below). Gates every later campaign. Build M after the s58 bundle is on main.
+1b. **Q9. Data-dir growth on main** (soak, right after setup, before campaign A; see Items, Q9).
 2. **Q8. Item 6 Phase 5 step 0 profile** (campaign P, profile only, no A/B). Sent to archy directly (s125); it decides
    whether and how much of Phase 5 gets built.
 3. **Q5. Native vs native + EVM transfers** (campaign C): 2 arms on M.
@@ -35,7 +52,7 @@ checks file fails preflight.
 
    | arm | env |
    |---|---|
-   | base | all flags absent (list them in `absent_env`) |
+   | base | all flags absent (list them in `absent_env`); D, M, T unset = on, as shipped (no =0) |
    | F (Q1) | `TORUS_EPOCH_FAST_PATH=1` |
    | PE (Q2) | `TORUS_PARALLEL_ENGINE=4` (N >= 2 workers; 0, 1 or anything else = off) |
    | PC (Q4) | `TORUS_PARALLEL_CANCEL_ALL=8` (unset, 0, 1 or garbage = the serial loop) |
@@ -125,6 +142,14 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   - Pass, both shapes: paired B/A matched/s 95% CI includes 1.0 or lies above it, and save_books rises by at most
     0.3 ms per native block. A fail blocks the step 2 merge (follow-up: B16's `saved_bbo` hit rate).
   - Doc target: `docs/perf/item7-step2-native-ab.md`.
+- **Q9. Data-dir growth on main** (s126, from s58safe, section 79): in archy's 60 min soak each node's data dir grew
+  about 0.19-0.2 GB/min (about 48 MB per 15 s checkpoint), also in a no-load phase with empty blocks; open files
+  rose from 351 to 667. Cause inferred (checkpoint data not reclaimed), not confirmed; 18c investigates the code.
+  Confirm on main (with the s58 bundle): one 60 min soak, 300 markets, hsdb-300m shape (Classic, 15 s checkpoints),
+  with a no-load phase of at least 10 min; sample per node every 60 s: data-dir size (`du -sb`), RocksDB SST count
+  and size per CF, open fds of the node (`ls /proc/PID/fd | wc -l`), and the checkpoint metrics. Margin top-ups or a
+  lower load (see the s58 bundle notes). Report the growth rate with and without load and what grows (which
+  CF/dir). The same soak re-runs later to verify 18c's fix.
 - **Q8. Item 6 Phase 5 step 0 profile:** see the message sent to archy (s125) and
   `docs/plans/item6-phase5-impl.md` "Step 0" on `origin/docs/item6-phase5-plan`.
 

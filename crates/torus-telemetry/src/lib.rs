@@ -840,6 +840,12 @@ pub struct Metrics {
     /// the direct fan and the gossip mirror. Expected to track the mirror's
     /// delivery rate while both paths are on; zero cost, never a loss signal.
     pub consensus_dedup_dropped: Counter,
+    /// s58: inbound consensus-topic gossip dropped by the per-AUTHOR token
+    /// bucket (`ConsensusRateLimiter`, `consensus_rate_limit_per_peer`).
+    /// Previously debug-log only; a leader's proposal header lost here shows
+    /// up as a `no_proposal` view timeout on the follower. Exported as
+    /// `torus_consensus_rate_limited_dropped_total`.
+    pub consensus_rate_limited_dropped: Counter,
 
     // B1 batched direct-to-leader forward (design §1).
     /// RPC-admitted actions whose leader-forward was shed because the BOUNDED
@@ -2781,6 +2787,13 @@ impl Metrics {
             consensus_dedup_dropped.clone(),
         );
 
+        let consensus_rate_limited_dropped = Counter::default();
+        registry.register(
+            "torus_consensus_rate_limited_dropped",
+            "Inbound consensus gossip dropped by the per-author consensus rate limiter",
+            consensus_rate_limited_dropped.clone(),
+        );
+
         let rpc_forward_dropped_full = Counter::default();
         registry.register(
             "torus_rpc_forward_dropped_full",
@@ -3077,6 +3090,7 @@ impl Metrics {
             consensus_direct_fan_sent,
             consensus_direct_fan_buffered,
             consensus_dedup_dropped,
+            consensus_rate_limited_dropped,
             rpc_forward_dropped_full,
             d2l_envelopes_sent,
             d2l_envelopes_retried,
@@ -3976,6 +3990,22 @@ mod tests {
     /// climb with block production while `consensus_timeout_total` stays flat,
     /// and `consensus_dedup_dropped` confirms the gossip mirror's duplicates
     /// are being swallowed rather than double-processed.
+    /// s58: per-author consensus gossip rate-limit drops (swarm.rs gate,
+    /// `ConsensusRateLimiter`) were debug-log only, so a leader header
+    /// silently dropped by a follower's token bucket could not be confirmed
+    /// from a bench. The counter must be on /metrics as a `_total` counter.
+    #[test]
+    fn consensus_rate_limited_dropped_registers() {
+        let m = Metrics::new();
+        m.consensus_rate_limited_dropped.inc();
+        m.consensus_rate_limited_dropped.inc();
+        let text = m.encode();
+        assert!(
+            text.contains("torus_consensus_rate_limited_dropped_total 2"),
+            "consensus rate-limit drop counter not exported:\n{text}"
+        );
+    }
+
     #[test]
     fn consensus_isolation_metrics_register() {
         let m = Metrics::new();

@@ -11307,6 +11307,871 @@ Next cells (not run):
 * Analysis ran inline (gate 27: no new script files): `j3.py`, `a-cells.py` and `offcpu-sched.py` were imported
   unchanged and extended to the consensus series and timers. Output: `ozarchy-hsdb-tools/analyst/out/hsdb-analysis.md`.
 
+## 75. s58 pilot: all five s58 perf experiments plus the epoch fast path on (ALL) vs off (C), 300 markets, 300 s cells, n = 1 (campaign ozarchy-s58pilot, 2026-10-15)
+
+**With all six flags on, matched/s rose 8.6% in one pair of 300 s cells (225,391 -> 244,823). But blocks came 2.2x as
+often at half the size, consensus timeouts rose from 12 to 34, and CPU per fill rose 6.3%. Per fill, exec time fell
+8.2%, short of the plan's 13-18%. Indicative only: n = 1 per arm, fixed order C then ALL.**
+* matched/s +8.6% in the load window (+7.2% including drain). The warm-up w1 was also an arm-C cell: its matched/s was
+  within 0.5% of r1-C.
+* Block shape: native blk/s 4.12 -> 8.97, fills per native block 53,649 -> 25,422 (-53%). Exec ms per native block
+  234.3 -> 101.9 mostly reflects the smaller blocks. Per 1k fills it is 4.37 -> 4.01 ms (-8.2%), about -19 ms per
+  block at C's block size. The plan expected -41 to -59 ms (sum of the arms in `docs/plans/exp-archy-s58-perf-search.md`).
+* Biggest per-fill cuts: save_books -63%, residual_untimed -35%, phase_match -28%, settle_pass_b -12%. The grain gave
+  nothing (settle_pass_a +3%; with match setup on, matching ignores the grain). Every epoch boundary block ran pipelined
+  (29/29 on val0, vs 0/15 in C), and the gap before a boundary block went from 628 ms to 0.3 ms.
+* Costs: consensus timeouts 12 -> 34 (per node 6-9 -> 26-30, mostly `no_proposal`). Commit-interval p99, mean of
+  nodes, 1,078 -> 1,265 ms. CPU-s per 1M fills 23.18 -> 24.64 (+6.3%). HotStuff run-queue wait 4.8 -> 8.1 s per node
+  (+69%). RSS fell (mean 4.99 -> 4.52 GB).
+* **Verdict: promising but not mergeable as a bundle.** The plan's reject rule (consensus timeouts outside C's range)
+  flags ALL. Single-flag arms vs C are needed to find which flags carry the gain and which carry the timeouts and CPU.
+
+Question (archy s58 perf search): before the full campaign, does the bundle move matched/s at 300 markets, and does
+anything break?
+
+Setup:
+* Node: `exp/archy-s58-perf-search` `6452fa31` = origin/main `5e0fbbfa` + 5 s58 experiments (default off). Arm E's flag
+  is main's own epoch fast path (`efe9aa47`); the s58 copy was reverted in `78373203`. Bench build:
+  `RUSTFLAGS="-C link-arg=-fuse-ld=mold -C force-frame-pointers=yes"`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`,
+  node md5 `753312e5`. Bench `ff822b95`, md5 `9b725823`.
+* Arm C: no experiment flag set. Arm ALL: `TORUS_SETTLE_DEFER_RESULTS=1 TORUS_EPOCH_FAST_PATH=1
+  TORUS_PARALLEL_MATCH_SETUP=1 TORUS_FAST_SELL_TOP_UPS=1 TORUS_EXEC_POOL_GRAIN=4 TORUS_PARALLEL_BOOK_SAVE=1` on all 3
+  validators.
+* Workload: 300 markets, oracle on (30,000 / 2,000 ms), commit tail, BLOCK_CAP 400, MAX_IN_FLIGHT 4, budget 900,
+  cloid share 0, the ozarchy-hsdb cell shape at 300 s instead of 600 s. No perf (`perf_event_paranoid=2`).
+* Cells (run order): s1 (ALL, short smoke, not data), w1 (C, warm-up, not in the comparison), r1-C, r1-ALL.
+
+**Validity:** all cells rc 0, ACCEPT AGREE, liveness PASS. Node md5 `753312e5` on all 3 nodes in every cell; 0 panic or
+fail-stop lines, 0 error lines. Each flag's took-effect line reads on in ALL and off in C on all 3 nodes;
+`epoch fast path ON` appears once per node with no warnings. The save_books drain sums are 6.16-6.55 s per node in ALL
+and 0 in C.
+
+### 75.1 Cells (`s58pilot-C-vs-ALL.txt`; block p99 = commit-interval p99)
+
+| metric | C (r1-C) | ALL (r1-ALL) | ALL vs C |
+|---|---|---|---|
+| matched/s (load window) | 225,391 | 244,823 | +8.6% |
+| matched/s incl. drain | 219,592 | 235,497 | +7.2% |
+| native blk/s | 4.116 | 8.974 | +118% |
+| fills per native block | 53,649 | 25,422 | -52.6% |
+| exec block_ms per native block | 234.3 | 101.9 | -56.5% |
+| exec ms per 1k fills | 4.37 | 4.01 | -8.2% |
+| commit interval p50 ms | 154.3 | 16.5 | |
+| block p99 ms, mean of nodes | 1,077.5 | 1,264.8 | +17.4% |
+| block p99 ms, val0 / val1 / val2 | 1,300 / 926 / 994 | 1,257 / 1,275 / 1,208 | |
+| commit interval max ms | 2,564.6 | 2,969.1 | |
+| consensus timeouts | 12 | 34 | +22 |
+| CPU-s per 1M fills | 23.18 | 24.64 | +6.3% |
+| CPU-s per node, whole run | 1,694.8 | 1,827.8 | +7.8% |
+| RSS peak / mean GB | 6.10 / 4.99 | 5.62 / 4.52 | -8% / -9% |
+
+### 75.2 Where the exec time went (ms per native block, mean of 3 validators; per 1k fills in the last column)
+
+| phase | C | ALL | per 1k fills, ALL vs C |
+|---|---|---|---|
+| save_books | 13.69 | 2.37 | -63% |
+| residual_untimed | 19.40 | 5.94 | -35% |
+| phase_match | 22.94 | 7.86 | -28% |
+| settle_pass_b | 33.79 | 14.06 | -12% |
+| engine_untimed | 9.89 | 4.16 | -11% |
+| phase_margin | 45.49 | 20.92 | -3% |
+| settle_pass_a | 8.09 | 3.94 | +3% |
+
+* save_books per observation 12.92 -> 2.33 ms; in the late 60 s, 24.07 -> 2.53 ms per native block.
+* Epoch boundaries (h % 100 == 0): pipelined / serial on val0 0/15 -> 29/0; mean gap 'block done' at h-1 ->
+  'executing' at h 627.9 -> 0.3 ms; boundary block run time (native > 0) 443 -> 226 ms;
+  `torus_exec_flush_seconds_count` 17 -> 0 per node.
+
+### 75.3 Costs
+
+* View timeouts per node (`VIEW_TIMEOUTS`, load window): C 6 / 9 / 8 of about 1,310 views; ALL 29 / 26 / 30 of about
+  2,750 views. `no_proposal` is the main cause in ALL (19 / 15 / 19). Each timeout fired after about 1.6 s (C) or
+  1.7-1.8 s (ALL).
+* `schedstat`, mean per node: hotstuff-algo CPU 62.6 -> 70.8 s, run-queue wait 4.8 -> 8.1 s; torus-execution CPU
+  246.8 -> 233.5 s, run-queue wait 8.2 -> 9.9 s. Process CPU rose by about 133 s per node, so most of the extra CPU is
+  in the worker pools, not in these two threads.
+* Side finding, not from the flags: `skipping duplicate/replayed native action` warnings per node were 117 in r1-C and
+  192 in r1-ALL, vs 8 in ozarchy-hsdb r2-A (main `a44000e0`). Both arms show it, so it is new on main `5e0fbbfa` or in
+  this harness. Open.
+
+### 75.4 Next
+
+* Single-flag arms vs C (D, M, T, G, B; arm E is bench-queue item 1), then the winners together; ABBA, n >= 4, 300
+  markets, watching consensus timeouts and HotStuff run-queue wait per arm. Consider dropping G: it gave no gain here,
+  and match setup bypasses it.
+* Data: `~/bench-results-matched/ozarchy-s58pilot-300m-{w1,r1-C,r1-ALL}`; analysis in
+  `ozarchy-s58pilot-tools/analyst/out/` (`s58pilot-C-vs-ALL.{txt,json}`, `j3-s58pilot.txt`); driver and checks in
+  `ozarchy-s58pilot-tools/`. Search artifacts (both workflow journals, Codex reviews) are in
+  `~/bench-results-matched/exp-s58-perf-search-artifacts/`.
+
+## 76. s58 single-flag screen: D, M, T, G, B each alone vs C (twice) and ALL, 300 markets, 300 s cells, n = 1 (campaign ozarchy-s58flags, 2026-10-15)
+
+**No single flag reproduces the timeouts. In the core window (load window minus its first minute), every single-flag
+arm has 2-6 consensus timeouts and 0 `no_proposal`, the same as C (2 and 3). ALL has 30, 16 of them `no_proposal` and
+10 `leader`. Only ALL changes the block cadence (native blk/s +80%), and its timeouts come with that cadence. So the
+cause is the epoch fast path alone, or an interaction between flags; this campaign tests neither. M (+3.1%) and T
+(+2.0%) carry most of the single-flag matched/s gain, and B carries the CPU (+7.5% CPU-s per 1M fills). Indicative
+only: n = 1 per arm, and the only noise estimate is C1 vs C2 (0.8% matched/s).**
+
+**Update (76.5-76.6, campaigns ozarchy-s58e and ozarchy-s58loo): the epoch fast path alone (E) is also the same as
+C (1 core timeout, 3.46 native blk/s). Leaving one flag out of ALL at a time shows no single culprit: the timeouts
+track the block cadence and appear above about 5 native blk/s. Removing any of D, M, T or B drops the cadence to
+4.1-4.9 blk/s and the `no_proposal` timeouts to 0-1; removing G changes almost nothing. ALL minus B (D + M + T + G + E)
+keeps +8.5% matched/s vs C with 4 core timeouts and +1.4% CPU-s per 1M fills (ALL: +9.4%, 30, +5.2%). n = 1 per arm.**
+* Timeouts: the five single flags add no `no_proposal` or `leader` timeouts. T (5) and G (6) are above C's 2-3, but
+  all of theirs are `after_vote`. The pilot's r1-C also had 4 of those, so this is not resolved at n = 1.
+* matched/s vs the C mean (228,815; C1 to C2 range 1,770 = 0.77%): M +3.05%, T +1.97%, G +0.58%, B -0.20%, D -0.50%.
+  Only M and T are outside the C range. The single-flag steps add up to +4.9%, while ALL is +9.4%, so about half of
+  ALL's gain needs the epoch fast path or the combination.
+* Exec cuts per flag (ms per native block, vs C1 / C2) match their targets. M: phase_match 28.1 / 28.5 -> 16.9. T:
+  phase_margin 56.0 / 57.3 -> 46.4, and engine_untimed 11.5 -> 7.9. D: settle_pass_b 38.2 / 38.7 -> 30.7. B:
+  save_books 17.8 / 18.5 -> 6.5. G: settle_pass_a 9.9 / 9.8 -> 8.7. Per 1k fills, only M (4.20) and T (4.16) are
+  clearly below C (4.27 / 4.29). D, G and B are flat (4.25 / 4.29 / 4.31). D's and B's cuts do not turn into matched/s.
+* **Verdict: keep M and T as the gain candidates. B costs CPU and gives no throughput alone. D and G show no gain.
+  The timeout regression is not in any of the five s58 flags alone.** Next: an epoch-only arm (E), and E + M + T.
+
+Question (archy s58 perf search, after section 75): which single flag carries ALL's consensus-timeout regression, and
+which carry the matched/s gain and the CPU cost?
+
+Setup:
+* Same node and bench as section 75: `exp/archy-s58-perf-search` `6452fa31`, node md5 `753312e5`, bench md5
+  `9b725823`, one binary for every arm. The arms differ only in their env on all 3 validators. C: none.
+  D `TORUS_SETTLE_DEFER_RESULTS=1`. M `TORUS_PARALLEL_MATCH_SETUP=1`. T `TORUS_FAST_SELL_TOP_UPS=1`.
+  G `TORUS_EXEC_POOL_GRAIN=4`. B `TORUS_PARALLEL_BOOK_SAVE=1`. ALL: all five plus `TORUS_EPOCH_FAST_PATH=1`, the
+  section 75 arm. No arm sets the epoch fast path alone.
+* Workload as in section 75: 300 markets, oracle on, commit tail depth 1, BLOCK_CAP 400, MAX_IN_FLIGHT 4,
+  budget 900, 300 s cells.
+* Cells in run order: w1 (C, 60 s warm-up, not scored), c1-C, d1-D, m1-M, t1-T, g1-G, b1-B, all1-ALL, c2-C
+  (22:04-23:13). C was run first and last, which brackets drift: C2 vs C1 is -0.77% matched/s and +0.38% CPU-s per
+  1M fills.
+
+**Validity:** all 9 cells rc 0, ACCEPT AGREE, liveness PASS. Node md5 `753312e5` on all 3 nodes in every cell; 0
+panic or fail-stop lines, 0 error lines. No `CELL-FLAG` lines, no rerun. Each flag's took-effect line reads on only in
+its own arm and in ALL, on all 3 nodes. `epoch fast path ON` appears only in ALL, once per node, with no warnings.
+
+### 76.1 Cells (`s58flags-all.txt`, `s58flags-timeouts.txt`)
+
+Timeout window: summed over the 3 nodes, counter deltas from `metrics-1hz`, core = [t_bench0 + 60 s, t_bench1].
+Minute 0 holds 7-11 timeouts in every C and single-flag cell (18 in ALL), and the drain holds 10-13. Both are excluded.
+Run-queue wait is from `schedstat` (before -> bench end), mean per node.
+
+| arm | matched/s | vs C mean | native blk/s | CPU-s / 1M fills | timeouts core (no_proposal) | timeouts load window | hotstuff-algo rq wait s | hotstuff CPU s | block p99 ms | exec lag p50 / p90 heights |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C1 | 229,699 | +0.39% | 3.370 | 22.830 | 2 (0) | 10 | 4.26 | 59.7 | 1,147 | 1 / 11 |
+| C2 | 227,930 | -0.39% | 3.307 | 22.917 | 3 (0) | 11 | 4.54 | 59.9 | 1,094 | 1 / 11.2 |
+| D | 227,680 | -0.50% | 3.373 | 22.900 | 2 (0) | 10 | 4.46 | 60.5 | 1,106 | 1 / 10 |
+| M | 235,794 | +3.05% | 3.583 | 22.991 | 2 (0) | 10 | 5.37 | 62.1 | 1,159 | 1 / 21 |
+| T | 233,311 | +1.97% | 3.614 | 22.854 | 5 (0) | 16 | 4.86 | 61.8 | 1,066 | 1 / 13.1 |
+| G | 230,132 | +0.58% | 3.414 | 23.086 | 6 (0) | 14 | 4.80 | 60.1 | 1,117 | 1 / 12 |
+| B | 228,348 | -0.20% | 3.556 | 24.587 | 3 (0) | 10 | 4.65 | 60.6 | 1,160 | 1 / 24.2 |
+| ALL | 250,387 | +9.43% | 6.003 | 24.061 | 30 (16) | 48 | 7.11 | 69.4 | 1,258 | 26 / 61 |
+
+* Block p99 = commit-interval p99, mean of nodes. Exec lag = committed minus applied height (`CHECK LAG` in
+  `campaign.log`). torus-execution run-queue wait: C 7.69 / 7.58 s, single flags 7.81-8.39 s, ALL 10.46 s.
+* `skipping duplicate/replayed native action` warnings per node: C1 1, C2 2, D 50, M 55, T 12, G 4, B 1, ALL 115.
+  The pilot's r1-C had 117 with no flag on, so this count moves from run to run and does not point to a flag.
+
+### 76.2 The timeouts go with ALL's block cadence
+
+* Consensus timeouts per minute (sum of nodes) and val0 native blocks per minute. ALL: 18 / 14 / 13 / 3 / 0
+  timeouts against 370 / 379 / 354 / 372 / 299 blocks. C1: 8 / 1 / 0 / 1 / 0 against 282 / 213 / 170 / 170 / 170.
+  Pilot r1-ALL: 17 / 20 / 17 / 13 / 18 against 464-569 blocks per minute, with 68 core timeouts. In both ALL cells,
+  timeouts persist while the cadence stays high. This run's ALL slowed down (6.0 native blk/s vs 8.97 in the pilot),
+  and its timeouts stopped in minute 4.
+* Per 1k committed blocks (core window, sum of nodes): C 0.9-1.4, single flags 0.9-2.7, ALL 7.1, pilot ALL 10.2.
+  So ALL's extra timeouts are not just more views at the same rate per view: the rate per block is about 6x C's.
+* No single flag moves the cadence by more than +8% (T 3.61, M 3.58 native blk/s, vs C 3.31-3.37). ALL's +80% needs
+  the epoch fast path or the combination, which also put 21 of 21 epoch boundaries on the pipeline (val0). The exec
+  pipeline also falls behind in ALL (lag p50 26 heights vs 1). The `no_proposal` / `leader` timeouts are consistent
+  with a proposer that is waiting at the high cadence, but this run cannot say which flag causes that.
+
+### 76.3 Costs
+
+* CPU: B is the only single flag outside C's range (+7.5% CPU-s per 1M fills; +117 s CPU per node over the whole
+  run vs the C mean). ALL is +5.2%; it has 7% more fills (79.2M vs 74.3M per node) to spread its extra CPU over. G is +0.9%, M +0.5%, D and T are within
+  0.2%.
+* HotStuff run-queue wait: M 5.37 s (+22% vs the C mean of 4.40 s; C range 4.26-4.54 s) is the only clear single-flag
+  rise, but M has 0 `no_proposal` timeouts. T and G are +9-10%, B +6%, D +1%. ALL is +62%, close to the pilot's +69%.
+
+### 76.4 Next
+
+* Epoch-only arm E (`TORUS_EPOCH_FAST_PATH=1`) and E + M + T vs C, ABBA, n >= 4, 300 s cells: about 4 arms x 4 reps
+  x ~8.5 min, or ~2.3 h. If E alone shows the cadence jump and the `no_proposal` timeouts, that settles the
+  timeout question. If not, the interaction needs E + B and E + M + T + B.
+* Confirm M and T before merging: ABBA n >= 4 for each vs C. Their +3.1% and +2.0% are 4x and 2.6x the single
+  C1 to C2 spread, but that is one pair. Keep B only if an E or bundle arm shows it pays for its CPU. D and G can be
+  dropped from the bundle.
+* Data: `~/bench-results-matched/ozarchy-s58flags-300m-{w1,c1-C,d1-D,m1-M,t1-T,g1-G,b1-B,all1-ALL,c2-C}`; campaign
+  `ozarchy-s58flags-run/campaign/` (`handoff.json`, `cells.tsv`, `campaign.log`). Analysis in
+  `ozarchy-s58flags-tools/analyst/out/` (`s58flags-all.{txt,json}` from `s58pilot.py`, and
+  `s58flags-timeouts.{txt,json}` from `s58flags_to.py`, which covers the timeout windows, minute bins, `schedstat`
+  and duplicate warnings, with the pilot cells as `pC` / `pALL`).
+
+### 76.5 Epoch fast path alone (campaign ozarchy-s58e, 2026-10-16)
+
+* Same binary, harness, genesis and workload as 76.1. Cells: w1 (C, 300 s warm-up, 23:58) and e1-E (300 s, 00:07),
+  E = `TORUS_EPOCH_FAST_PATH=1` only, the other five flags absent. 60 s smoke on E first (all checks OK). Both cells
+  rc 0, AGREE, md5 ok; `epoch fast path ON` once per node in e1-E only.
+
+| cell | matched/s | vs C mean | native blk/s | exec ms / native block | CPU-s / 1M fills | timeouts core (no_proposal) | hotstuff-algo rq wait s | block p99 ms |
+|---|---|---|---|---|---|---|---|---|
+| w1 (C) | 229,852 | +0.45% | 3.479 | 272.7 | 22.889 | 4 (0) | 4.61 | 1,091 |
+| e1-E | 231,285 | +1.08% | 3.457 | 274.3 | 23.005 | 1 (0) | 4.67 | 1,095 |
+
+* E is inside the C range on every row (C mean here and below: 76.1's C1 / C2, 228,815 matched/s, 22.874 CPU-s per
+  1M fills). Its timeouts per 30 s were 2 then 0 for the rest of the load, like C1. So the cadence jump and the
+  `no_proposal` timeouts are not from the epoch fast path alone.
+* `skipping duplicate/replayed native action` per node: w1 5, e1-E 26.
+
+### 76.6 Leave one out: ALL minus each flag (campaign ozarchy-s58loo, 2026-10-16)
+
+Question: which flags does ALL need for its cadence and timeouts? Each arm sets five of the six flags (D, M, T, G, B,
+E) on all 3 validators; the dropped flag is absent. Cells in run order: w1 (C, 300 s warm-up, 00:32), d1-xD, m1-xM,
+t1-xT, g1-xG, b1-xB, e1-xE (300 s each, 00:40-01:31). 60 s smoke on xE first (25 CHECK OK). All 7 cells rc 0,
+AGREE, md5 ok; node environs show exactly the arm's five flags on all 3 nodes (checked per flag); `epoch fast path ON`
+once per node in every arm except xE (0). The warm-up w1 (C) gave 228,198 matched/s (-0.27% vs C mean), 3.364
+native blk/s, 22.877 CPU-s per 1M fills and 2 core timeouts (0 `no_proposal`), so the host had not drifted since 76.1.
+
+Sorted by native blk/s; ALL and C from 76.1; windows as in 76.1:
+
+| arm | dropped | matched/s | vs C mean | native blk/s | exec ms / native block | CPU-s / 1M fills | vs C mean | timeouts core | no_proposal | leader | after_vote | hotstuff-algo rq wait s | block p99 ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ALL | none | 250,387 | +9.43% | 6.003 | 158.7 | 24.061 | +5.2% | 30 | 16 | 10 | 2 | 7.11 | 1,258 |
+| xG | G | 250,123 | +9.31% | 5.789 | 163.4 | 24.050 | +5.1% | 17 | 8 | 4 | 5 | 7.11 | 1,079 |
+| xE | E | 246,120 | +7.56% | 5.043 | 191.1 | 24.197 | +5.8% | 12 | 5 | 2 | 4 | 6.99 | 1,213 |
+| xD | D | 245,331 | +7.22% | 4.884 | 197.1 | 24.224 | +5.9% | 4 | 0 | 0 | 4 | 7.12 | 1,043 |
+| xB | B | 248,365 | +8.54% | 4.561 | 210.3 | 23.199 | +1.4% | 4 | 0 | 0 | 3 | 6.37 | 1,057 |
+| xM | M | 243,625 | +6.47% | 4.288 | 222.2 | 24.521 | +7.2% | 0 | 0 | 0 | 0 | 6.61 | 1,022 |
+| xT | T | 240,422 | +5.07% | 4.136 | 231.2 | 24.537 | +7.3% | 8 | 1 | 1 | 6 | 6.92 | 1,129 |
+| C1 / C2 | all | 229,699 / 227,930 | +0.39 / -0.39% | 3.370 / 3.307 | 280.2 / 283.3 | 22.830 / 22.917 | | 2 / 3 | 0 | 0 | 2 / 3 | 4.26 / 4.54 | 1,147 / 1,094 |
+
+* **Timeouts track the cadence, not a flag.** In cadence order the core timeouts are 30, 17, 12, 4, 4, 0 (and xT's 8,
+  six of them `after_vote`, the type C also has). `no_proposal` and `leader` timeouts appear only above about 5
+  native blk/s (ALL, xG, xE). No single flag is necessary for them except in the sense that each of D, M, T and B is
+  needed to reach that cadence.
+* **D, M, T and B matter only together.** Alone each moved the cadence by at most +8% (76.1); dropping any one of them
+  from ALL costs 1.1-1.9 native blk/s. Dropping E costs 1.0 blk/s and halves the timeouts but leaves 12. Dropping G
+  costs 0.2 blk/s and 0.1% matched/s: G is not needed (as section 75 suggested).
+* **B carries the bundle's CPU.** Every arm with B is +5.1 to +7.3% CPU-s per 1M fills; xB is +1.4% at -0.8%
+  matched/s vs ALL. xB also has the lowest hotstuff-algo run-queue wait of the bundles (6.37 s vs 6.61-7.12 s).
+* Block p99 does not separate the arms at n = 1 (1,022-1,258 ms vs C 1,094-1,147 ms); only ALL and xE are above C.
+* Exec lag and the `skipping duplicate/replayed native action` counts (per node: xD 64, xM 19, xT 67, xG 140,
+  xB 21, xE 139) move with the bundle arms but are not resolved at n = 1 (pilot C had 117).
+
+### 76.7 Next (after 76.5-76.6)
+
+* **Candidate bundle: xB (D + M + T + G + E, without B).** Confirm xB vs C vs ALL, ABBA, n = 4 per arm, 600 s cells
+  (about 2.5 h): does xB keep about +8.5% matched/s with C's timeout level and CPU, and do ALL's timeouts persist over
+  600 s (in 76.2 they stopped in minute 4; in the pilot they did not). Optional: xB minus G, since G is not needed.
+* Owner question: are ALL's extra `no_proposal` / `leader` timeouts a cost in themselves, given ALL's block p99 is
+  only about +10% vs C? If not, the choice between ALL and xB is +0.9% matched/s for +3.8% CPU-s per 1M fills.
+* Data: `~/bench-results-matched/ozarchy-s58e-300m-{w1,e1-E}`, `~/bench-results-matched/ozarchy-s58loo-300m-{w1,d1-xD,
+  m1-xM,t1-xT,g1-xG,b1-xB,e1-xE}`; campaigns `ozarchy-s58e-run/campaign/`, `ozarchy-s58loo-run/campaign/`. Analysis
+  (76.1's `s58pilot.py` and `s58flags_to.py`, the C1 / C2 / ALL cells as reference) in
+  `ozarchy-s58e-tools/analyst/out/s58e*.txt` and `ozarchy-s58loo-tools/analyst/out/s58loo*.txt`.
+
+## 77. s58 ALL's extra timeouts: lost proposal headers at the consensus gossip rate limiter, and two env fixes (ALLfan, ALLrs), 300 markets, 300 s cells, n = 1 (s62 log reading of 76's cells; campaign ozarchy-s58rl, 2026-10-16)
+
+**ALL's extra consensus timeouts are lost leader proposals. The followers drop the leader's header at the per-author
+consensus gossip rate limiter (50 per s, burst 50) after a burst of fast empty views. With a drop counter on the node,
+the followers that time out with `no_proposal` dropped messages in the 4 s before 9 of 10 (a1) and 16 of 16 (a2)
+lost-proposal events, and no drop came without a timeout in either ALL cell. Two env-only fixes bring the core
+timeouts to C's level: the direct fan (ALLfan, 5) and a 250 ms header re-send (ALLrs, 3), vs ALL 33 / 47 and C 6.
+ALLrs keeps ALL's matched/s (+10.0% vs C) and CPU; ALLfan costs about 1% matched/s and 3% CPU-s per 1M fills vs ALL.
+Indicative only: n = 1 per arm (ALL twice), one host.**
+* Step 1 (s62, logs only, 76.1's all1-ALL vs c1-C / c2-C): ALL's excess over C is one class of stall, the leader's
+  header lost at both followers after 37-41 views in the previous second (13 in ALL vs 2 and 2 in C). Idle stalls every
+  27-28 views (11 vs 10-12) and slow-vote stalls (7 vs 7 and 7) are the same in both arms.
+* The leader does not wait on its own exec: it builds in 0.1-1.2 ms before each lost header. The limiter drop was
+  debug-only with no metric, so `857b9770` adds `torus_consensus_rate_limited_dropped_total`.
+* matched/s vs C: ALL +9.3% and +9.5%, ALLfan +8.2%, ALLrs +10.0%. CPU-s per 1M fills vs C: ALL +5.5% / +4.9%,
+  ALLfan +8.4%, ALLrs +5.5%. Block p99, mean of nodes: C 1,102 ms, ALL 1,105 / 1,310, ALLfan 931, ALLrs 971.
+* ALLfan has a side effect: about 14.1k mirror-copy drops per node, and 2.2x ALL's committed blocks, nearly all of them
+  in the drain. ALLrs sends 90-164 header re-sends per node and still drops 106-120 messages per node; the re-send
+  covers the lost header.
+* **Verdict: the cause is found (high confidence on the mechanism; the drop / timeout alignment is exact in 2 of 2 ALL
+  cells). The fix is not chosen: n = 1 cannot separate ALLrs from ALL on matched/s (+0.6%, inside C's noise).**
+
+Question (archy s58 perf search, after 76.7): are ALL's extra `no_proposal` / `leader` timeouts proposals dropped by
+the per-author consensus gossip rate limiter, and does an env-only fix remove them?
+
+### 77.1 Step 1: per-timeout reading of 76's ALL and C cells (s62, no bench)
+
+Input: the node logs and `metrics-1hz` of `ozarchy-s58flags-300m-{all1-ALL,c1-C,c2-C}`, binary `6452fa31`. One row
+per stall, a view that starts at least 1.1 s after the previous view start on any node. The row gives the leader,
+its build-to-own-header time, the header and body messages each follower logged in that view, the views in the
+previous 1 s and 250 ms, the exec queue depth and the vmstat run queue. Classes in the metrics window:
+
+| class | what the table shows | ALL | C1 | C2 |
+|---|---|---|---|---|
+| lost header, under load | leader known and built in 0.1-1.2 ms; its own header logged; 0 headers at both followers; 37-41 views in the previous 1 s (ALL); exec queue 16-64 | 13 | 2 | 2 |
+| lost header, idle | the same, with exec queue 0, before and after load, every 27-28 views (one timeout, 1.20 or 2.40 s) | 11 | 10 | 12 |
+| slow vote / missing body | header at the followers but a late vote, or no leader produced; exec queue mostly near full | 7 | 7 | 7 |
+
+* The leader does not wait on its own exec. `TORUS_PROPOSER_EXEC_WATERMARK` is off when unset
+  (`crates/hotstuff_rs/src/hotstuff/implementation.rs:450-495`), and `produce_block`
+  (`crates/torus-consensus/src/app.rs:7479-7522`, `6452fa31`) has no exec wait. So the exec backlog
+  (ALL's lag p50 26 heights, 76.1) does not explain the stalls.
+* Suspected cause: the per-author consensus gossip token bucket `ConsensusRateLimiter`.
+  `consensus_rate_limit_per_peer: 50` is hardcoded (`crates/torus-network/src/config.rs:280`), and the bucket holds
+  50 tokens (burst 50). The drop (`swarm.rs:1494` at `6452fa31`) logs at debug only and has no metric. Votes go
+  direct; headers go over gossip (`TORUS_CONSENSUS_DIRECT_FAN` off). At about 2 gossip messages per author per view,
+  a run of fast empty views empties the bucket after about 27 views, which matches the idle 28-view cadence.
+* The header re-send would recover a lost header, but its default interval is 3 s
+  (`implementation.rs:121`), longer than the 1.2 s view timeout. Next: count the drops (77.2).
+
+### 77.2 Campaign ozarchy-s58rl: setup and validity
+
+Setup:
+* Node: `exp/archy-s58-consensus-ratelimit-drops` `857b9770` = `6452fa31` (sections 75-76) + the counter
+  `torus_consensus_rate_limited_dropped_total` (no behaviour change). Node md5 `5480e116`, bench `9b725823`, harness
+  `5e0fbbfa`, same genesis (md5 `b83180e1`) and workload as 76.1: 300 markets, oracle on, commit tail depth 1,
+  MAX_IN_FLIGHT 4, budget 900, 300 s cells.
+* Arms (env on all 3 validators): C none; ALL the six s58 flags (76.1); ALLfan = ALL + `TORUS_CONSENSUS_DIRECT_FAN=1`
+  (gossip mirror on by default); ALLrs = ALL + `TORUS_HEADER_RESEND_MS=250`.
+* Cells in run order: w1 (C, 300 s warm-up, not scored), c1-C, a1-ALL, f1-ALLfan, r1-ALLrs, a2-ALL (13:31-14:22).
+  ALL ran before and after the two fix arms, which brackets drift between them. 60 s smokes first: s1 ALLfan and
+  s2 ALLrs, rc 0, AGREE, md5 ok.
+
+**Validity:** all 6 cells rc 0, ACCEPT AGREE, liveness PASS. Node md5 `5480e116` on all 3 nodes in every cell; 0 panic
+or fail-stop lines, 0 error lines. Every cell has 25 `CHECK OK` lines plus one `CHECK LAG` and one `CHECK SOAK` (w1 26,
+with the warm-up gate), and no failed CHECK. No `CELL-FLAG` lines, no rerun. The per-node TORUS env digest is one
+value per cell (C `946d4cc0`, ALL `efdaf8e3` in both ALL cells, ALLfan `b28f4f8e`, ALLrs `1cdb454e`). The flags'
+took-effect lines read on in the four ALL-based cells and off in C, on all 3 nodes. The `rl knobs` check shows
+`fan_sent` > 0 only in ALLfan and re-sends only in ALLrs.
+
+### 77.3 Cells (`s58rl.txt`, `s58rl-to.txt`, `s58rl-align.txt`)
+
+Windows as in 76.1: core = [t_bench0 + 60 s, t_bench1], summed over the 3 nodes. Drops = deltas of
+`torus_consensus_rate_limited_dropped_total` in the core window, sum of nodes. Exec lag = `CHECK LAG` grid heights.
+
+| cell | arm | matched/s | vs C | native blk/s | CPU-s / 1M fills | vs C | timeouts core | no_proposal | leader | after_vote | drops core | hotstuff-algo rq wait s | block p99 ms | exec lag p50 / p90 heights |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | C (warm-up) | 213,497 | -6.0% | 3.267 | 23.935 | +3.4% | 6 | 0 | 1 | 5 | 0 | 4.56 | 1,182 | 1 / 13 |
+| c1-C | C | 227,035 | | 3.472 | 23.150 | | 6 | 0 | 0 | 6 | 0 | 4.82 | 1,102 | 1 / 16 |
+| a1-ALL | ALL | 248,217 | +9.3% | 6.026 | 24.419 | +5.5% | 33 | 19 | 9 | 4 | 40 | 7.35 | 1,105 | 31 / 60 |
+| f1-ALLfan | ALLfan | 245,591 | +8.2% | 6.380 | 25.104 | +8.4% | 5 | 0 | 0 | 5 | 418 | 6.96 | 931 | 24 / 65 |
+| r1-ALLrs | ALLrs | 249,831 | +10.0% | 6.159 | 24.423 | +5.5% | 3 | 0 | 1 | 2 | 55 | 6.84 | 971 | 24 / 64 |
+| a2-ALL | ALL | 248,554 | +9.5% | 6.651 | 24.289 | +4.9% | 47 | 28 | 17 | 2 | 90 | 7.30 | 1,310 | 43 / 68 |
+
+* a1-ALL also has 1 `no_vote` timeout. Load-window timeouts: C 15, ALL 47 / 64, ALLfan 5, ALLrs 3. Per minute (sum of
+  nodes): ALL 14 / 12 / 15 / 3 / 3 and 17 / 11 / 14 / 11 / 11; ALLfan 0 / 3 / 0 / 2 / 0; ALLrs 0 / 1 / 0 / 1 / 1.
+* Drops per node, whole run: C 21-27 and w1 26-30, none of them in the core window; ALL 31-35 and 62-70;
+  ALLfan 14,083-14,106; ALLrs 106-120. Header re-sends per node (ALLrs): 161 / 164 / 90.
+* This run's C is -0.8% matched/s and +1.2% CPU-s per 1M fills vs 76.1's C mean (228,815; 22.874). The warm-up w1
+  is -6.0% vs c1-C, where 76.6's warm-up was -0.3%. w1 was the first cell after the node build and is not scored.
+
+### 77.4 Drops line up with the lost proposals (`s58rl-align.txt`, `s58rl-align-w8.txt`)
+
+An event is a core-window second with a timeout on any node. It is "lost" if at least one node timed out with
+`no_proposal`. The check looks for drops on those nodes in the 4 s before the event.
+
+| cell | events | lost | lost with drops on every `no_proposal` node | lost with no drop anywhere | drops with no timeout in the next 4 s |
+|---|---|---|---|---|---|
+| c1-C | 5 | 0 | | | 0 |
+| a1-ALL | 12 | 10 | 9 | 1 (t+149 s, one `no_proposal` on val2) | 0 |
+| a2-ALL | 18 | 16 | 16 | 0 | 0 |
+| f1-ALLfan | 4 | 0 | | | 418 drops in 27 node-seconds |
+| r1-ALLrs | 3 | 0 | | | 55 drops in 21 node-seconds |
+
+* Each `no_proposal` node in a lost event shows 1-4 drops before it. In most lost events the third node times out as
+  `leader`, so one lost header gives a `no_proposal` on each follower and a `leader` timeout on the proposer. The 8 s
+  window gives the same counts.
+* In both ALL cells every drop is followed by a timeout. In ALLfan and ALLrs the drops continue but no timeout
+  follows, so the fix recovers the header and does not stop the drops.
+* The per-timeout tables (`s58rl-timeouts-{a1-ALL,a2-ALL}.txt`) repeat 77.1's pattern. Under load, 0 headers reach
+  the followers after 32-44 views in the previous 1 s. Before and after load, idle stalls come every 26-29 views.
+  ALLfan's and ALLrs's tables hold only 3 and 5 stalls, with no fast-view burst before them (1-5 views in the previous
+  1 s).
+
+### 77.5 Why the two fixes work, and what they cost
+
+* **Header re-send (ALLrs).** The re-send is a direct send to each validator (`implementation.rs:355` ->
+  `NetworkCommand::Send` -> `send_direct`, `swarm.rs:2432` at `857b9770`). It does not go through gossip, so the
+  limiter does not see it. At 250 ms it lands inside the 1.2 s view timeout; at the 3 s default it cannot.
+* **Direct fan (ALLfan).** The `/torus/direct` receive path (`swarm.rs:1746` -> `handle_consensus_direct_traced`,
+  `:3390` at `857b9770`) never rate-limits. The gossip mirror copies still pass the limiter. That accounts for the
+  ~14.1k drops per node (`fan_sent` 23,832-23,842 per node), all of them duplicates of messages that also came direct.
+* ALLfan's other anomalies: committed blocks over the whole run 13,987 vs ALL 6,378 / 6,944. In the drain minute
+  it committed 2,637 blocks on val0 vs 373 / 342, with 854 native vs 244 / 229. Checkpoints were 71-73 per node vs
+  35-36 / 31, and native exec blocks 3,624-3,626 per node vs 2,069-2,070 / 2,273-2,274. The core window is normal
+  (4,362 committed vs 4,397 / 4,823). Its fills per native block (28,236) and exec ms per native block (113.6) are
+  therefore not comparable with the other cells. The same holds for block p99 (931 ms), which comes from 2.2x the
+  blocks. Why the fan makes the drain commit faster is open.
+
+Steps vs noise (the only replicate pairs: C1 / C2 in 76.1, matched/s +-0.39% around their mean, CPU-s per 1M fills
+0.38% apart; ALL a1 / a2 here, matched/s 0.14% apart, CPU 0.53% apart):
+
+| step | matched/s | CPU-s / 1M fills | core timeouts | resolved at n = 1? |
+|---|---|---|---|---|
+| ALL vs C | +9.3 / +9.5% | +5.5 / +4.9% | 6 -> 33 / 47 | yes (about 24x the C noise; the same as 76.1's +9.4% and +5.2%) |
+| ALLrs vs ALL mean (248,386; 24.354) | +0.6% | +0.3% | 33 / 47 -> 3 | timeouts yes; matched/s and CPU no (inside the C noise) |
+| ALLfan vs ALL mean | -1.1% | +3.1% | 33 / 47 -> 5 | timeouts yes; matched/s and CPU indicative (about 3x and 6-8x the noise, one cell) |
+| ALLrs vs C (block p99) | 1,102 -> 971 ms | | | no: ALL alone spans 1,105-1,310, and 76.1's C1 / C2 span 1,094-1,147 |
+
+* What n = 1 cannot resolve: ALL's own spread is 33 vs 47 core timeouts (and 6.03 vs 6.65 native blk/s, exec lag p50
+  31 vs 43). One ALLrs or ALLfan cell can show that the timeouts fall to C's level (3 and 5 vs C 6, a step of 28-44).
+  It cannot show whether ALLrs's +0.6% matched/s or its lower block p99 is real. Nor can it rank ALLrs vs ALLfan on
+  matched/s beyond ALLfan's -1.1%.
+* hotstuff-algo run-queue wait is the same in all four ALL-based cells (6.84-7.35 s vs C 4.82 s). Removing the
+  timeouts does not remove ALL's scheduler pressure.
+* Block p99 is not resolved: ALL a1 and a2 differ by 205 ms at the same matched/s.
+
+### 77.6 Next (open owner decisions)
+
+* **Bundle: ALL vs xB (and drop G).** 76.7's case for xB was C's timeout level at +1.4% CPU-s per 1M fills.
+  ALLrs reaches C's timeout level with B on (CPU +5.5% vs C). The remaining difference is ALL's +0.9% matched/s for
+  +3.8% CPU-s per 1M fills (76.6), not measured here with the re-send. G is not needed (76.6).
+* **Fix: re-send default 250 ms vs a limiter exemption for validator proposals vs the direct fan.** The re-send
+  (env only) is the one measured without a throughput or CPU cost at n = 1. An exemption (or a higher
+  `consensus_rate_limit_per_peer`, today hardcoded) is a code change and was not measured. The fan cost about 1%
+  matched/s and 3% CPU here and changed the drain. On one host the fan and the limiter see loopback latencies,
+  so both need a multi-host testnet before they are judged.
+* **Port:** the chosen bundle plus the drop counter onto main `19fd0c28`; `exp/archy-s58-consensus-ratelimit-drops`
+  is on `6452fa31` (main `5e0fbbfa`).
+* Data: `~/bench-results-matched/ozarchy-s58rl-300m-{w1,c1-C,a1-ALL,f1-ALLfan,r1-ALLrs,a2-ALL}` and smokes
+  `ozarchy-s58rl-smoke-300m-{s1,s2}`; campaign `ozarchy-s58rl-run/campaign/` (`campaign.log`, `cells.tsv`). Analysis in
+  `ozarchy-s58rl-tools/analyst/out/`: `s58rl.txt` (`s58pilot.py`), `s58rl-to.txt` (`s58flags_to.py`),
+  `s58rl-align{,-w8}.txt` (`rl_align.py`), `s58rl-timeouts-*.txt` (`timeouts.py`), `s58rl-execlag.txt`. Step 1 (77.1)
+  tables and scripts: `/tmp/s58-timeouts/{ALL,c1,c2}-table.txt`, `timeouts.py`, `viewgaps.py`, `parse1hz.py` (in
+  `/tmp`, not kept).
+
+## 78. s58 bundle pick at 600 s: C vs ALL-G vs ALL-G-B, all with the 250 ms header re-send, 300 markets, 600 s cells, n = 1 (campaign ozarchy-s58b600, 2026-10-16), and the owner's bundle decision
+
+**Both bundles give the same matched/s: ALL-G (D M T B E) and ALL-G-B (D M T E) are each +8.3% vs C, 0.09% apart.
+B costs +3.5% CPU-s per 1M fills at that equal throughput (ALL-G +4.7%, ALL-G-B +1.1% vs C), about 7-9x the
+C replicate spread. With `TORUS_HEADER_RESEND_MS=250` on every arm there were 0 `no_proposal` timeouts over the
+whole 600 s cell in every arm, startup included. Core timeouts were C 8, ALL-G 15, ALL-G-B 4, all `after_vote`,
+`no_vote` or `leader`. What B buys only shows under saturation: lower exec lag (7.4 vs 13.3 s; C 18.9 s), a faster
+book save (3.9 vs 13.7 ms per save) and 0.5 GB less RSS. Owner decision (s62): bundle = ALL-G-B = D, M, T, E, plus the
+250 ms re-send. Indicative only: n = 1 per arm, fixed order, one host.**
+* matched/s is flat across the 10 minutes in every arm. The native block rate is not: in both bundles it was still
+  falling, or had only just levelled, at 600 s. C levels off after minute 3.
+* This is the first campaign driven by main's generator `tools/matched-bench/campaign/make-driver.py`. It found four
+  generator gaps (78.1).
+
+Question (after 77.6): at 600 s, with the re-send fixing the lost headers, which bundle (ALL minus G, or ALL minus G
+and B) is worth porting? Does B's CPU cost (76.6) buy anything?
+
+### 78.1 Setup and validity
+
+Setup:
+* Node: `857b9770` (77.2: ALL `6452fa31` + the drop counter), md5 `5480e116`, bench `ff822b95` (md5 `9b725823`), harness worktree
+  `s58pilot-h-5e0fbbfa`, frozen s58rl `run-cell.sh`. Genesis md5 `b83180e1` and workload as in 76.1 / 77.2: 300
+  markets, oracle on, commit tail depth 1, MAX_IN_FLIGHT 4, budget 900. Cells are 600 s instead of 300 s.
+* Arms. Every arm sets `TORUS_HEADER_RESEND_MS=250` on all 3 validators (spec `node_env`). G
+  (`TORUS_EXEC_POOL_GRAIN`) is absent everywhere.
+  * Crs: the six s58 flags off.
+  * ALLmGrs (ALL-G): `TORUS_SETTLE_DEFER_RESULTS=1` (D), `TORUS_PARALLEL_MATCH_SETUP=1` (M),
+    `TORUS_FAST_SELL_TOP_UPS=1` (T), `TORUS_PARALLEL_BOOK_SAVE=1` (B), `TORUS_EPOCH_FAST_PATH=1` (E).
+  * ALLmGBrs (ALL-G-B): the same without B.
+* Fixed order: smoke s0 (ALLmGrs, 60 s, 15:42), then w1 (Crs, 600 s warm-up, 15:46), r1-Crs (16:00), r1-ALLmGrs
+  (16:13), r1-ALLmGBrs (16:27-16:39).
+* Driver: generated from `s58b600-spec.json` by an unedited copy of main `19fd0c28`'s `make-driver.py` (same md5
+  as `git show 19fd0c28:...`). The generator gaps:
+  * **No warm-up gate.** The w1 gate (rc 0, ACCEPT, AGREE, liveness PASS, no panic) ran in the analysis step.
+  * **No hook for campaign-specific hard checks.** The s58rl checks `s58chk` (flags took effect per validator log,
+    book-save engagement) and `rlchk` (rl knobs, drop counter, re-send lines) ran in the per-cell analysis step
+    `s58b600-step.sh`. A failure there flags the row and does not stop the campaign.
+  * **No soak sampler, so no `metrics-1hz`.** `analyst/csv2m1hz.py` rebuilds a `metrics-1hz` shadow from the cell's
+    1 Hz `sampler.csv`. The drop counter is not in it, so drops exist only as cell totals.
+  * **Genesis preflight.** The generator's preflight requires the tools-root `devnet/genesis.json` to be byte-equal
+    to the harness copy. s58rl's frozen copy differed only in `gas_limit` / `block_interval`, fields
+    `gen-3val-genesis.sh` does not read (`scratch/NOTE-genesis.txt`). It was replaced by the harness copy (md5
+    `f4dcc6fa`). The cells' generated genesis is unchanged (md5 `b83180e1`).
+
+**Validity:** all 4 cells and the smoke are rc 0, ACCEPT AGREE, liveness PASS, node md5 `5480e116` on 3 nodes, and
+have 0 panic or fail-stop lines and 0 error lines. `campaign.log` has 60 `CHECK OK` lines, 4 `CHECK SOAK` lines and no
+failed CHECK. There are no `CELL-FLAG` lines and no reruns ("RERUN PASS: nothing queued"); `cells.tsv` has 4 rows, 0
+bad. The node env check shows exactly the arm's flags on all 3 nodes. Every `s58chk` / `rlchk` is OK with
+`checks_rc=0`:
+* took-effect lines: D, M and T true in both bundles; B true only in ALLmGrs; G = 1 in all arms; `epoch fast path
+  ON` once per node in both bundles;
+* the book-save drain is engaged only in ALLmGrs (3.60-3.62 ms per save);
+* `fan_sent` is 0 everywhere, and every node logged re-sends.
+
+### 78.2 Cells (`s58b600-pilot.txt`, `s58b600-timeouts.txt`, `s58b600-execlag.txt`)
+
+Windows as in 76.1 / 77.3: load window for matched/s; core = [t_bench0 + 60 s, t_bench1], summed over the 3 nodes
+for timeouts. Exec lag = exec queue mean / native blk/s, mean of nodes (a lower bound, seconds). RSS = mean of nodes
+over the whole cell.
+
+| cell | arm | matched/s | vs Crs | native blk/s | CPU-s / 1M fills | vs Crs | timeouts core | no_proposal | leader | after_vote | no_vote | exec queue mean / p99 | exec lag s | save_books ms per save | RSS mean GB | hotstuff-algo rq wait s | block p99 ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | Crs (warm-up) | 227,651 | -0.2% | 3.136 | 23.455 | -0.2% | 9 | 0 | 1 | 8 | 0 | 63.5 / 66 | 20.3 | 19.72 | 5.52 | 8.86 | 1,144 |
+| r1-Crs | Crs | 228,142 | | 3.197 | 23.494 | | 8 | 0 | 0 | 8 | 0 | 60.2 / 66 | 18.9 | 19.38 | 5.73 | 8.54 | 1,137 |
+| r1-ALLmGrs | ALL-G | 247,187 | +8.3% | 5.700 | 24.603 | +4.7% | 15 | 0 | 1 | 12 | 2 | 42.6 / 66 | 7.4 | 3.92 | 4.64 | 13.83 | 1,034 |
+| r1-ALLmGBrs | ALL-G-B | 246,967 | +8.3% | 4.388 | 23.763 | +1.1% | 4 | 0 | 0 | 4 | 0 | 58.6 / 66 | 13.3 | 13.71 | 5.11 | 12.55 | 1,020 |
+
+* **No `no_proposal` timeouts anywhere, over the whole cell.** The full-cell count (startup and drain included) is 0
+  in every arm. In s58rl without the re-send, C had 18 (6 of them in the load window, 0 in core) and w1 had 16: the
+  startup burst. Whole-cell timeouts: Crs 9, ALL-G 18 (14 `after_vote`, 3 `no_vote`, 1 `leader`), ALL-G-B 4.
+* Per committed block, ALL-G's timeouts are at C's rate: 15 per 9,114 core blocks (sum of nodes) vs C's 8 per 4,848,
+  1.6 per 1k each. ALL-G-B has 4 per 6,758 (0.6 per 1k). Of ALL-G's 18 node-increments, 12 fall in minutes 7-10.
+* Drops per node, whole cell: Crs 90 / 89 / 91, ALL-G 139 / 145 / 134, ALL-G-B 84 / 82 / 78, w1 90 / 89 / 87.
+  Header re-sends per node: Crs 666 / 125 / 101, ALL-G 115 / 429 / 166, ALL-G-B 534 / 113 / 110. As in 77.4, the
+  drops go on and the re-send covers them.
+* The exec queue is at its cap (66) at p99 in every arm, so all three arms ran saturated. Below capacity the queue
+  is about 0 and exec lag is about 0 with or without B.
+* The bench client's commit-to-seen latency (`s58b600-taillag.jsonl`) does not order the arms like exec lag does.
+  Its p50 is C 312 ms, ALL-G 5,096 ms, ALL-G-B 3,170 ms (lag p50 in heights 1 / 19 / 8). ALL-G's tail fetch ran in
+  6 rounds over the window (max 2,918 heights per round), against ALL-G-B's 90 and C's 505. This was not followed up.
+* `skipping duplicate/replayed native action` per node: w1 1, Crs 41, ALL-G 103, ALL-G-B 153.
+* This run's C vs 76.1's C mean at 300 s (228,815; 22.874): -0.3% matched/s and +2.7% CPU-s per 1M fills, at twice
+  the cell length.
+
+### 78.3 Over the 10 minutes (`s58b600-minutes.txt`, `s58b600-timeouts.txt`)
+
+| arm | matched/s, minutes 1-5 / 6-10 mean | change | native blocks per minute (val0), minutes 1 / 5 / 10 | core timeouts per minute (sum of nodes), minutes 1-10 |
+|---|---|---|---|---|
+| w1 (Crs) | 227,638 / 227,341 | -0.1% | 298 / 168 / 168 | 0 2 0 0 0 0 2 2 1 2 |
+| Crs | 227,759 / 228,076 | +0.1% | 307 / 173 / 165 | 1 1 2 0 0 1 0 2 1 1 |
+| ALL-G | 246,379 / 247,844 | +0.6% | 405 / 355 / 254 | 3 0 2 0 1 0 5 2 4 1 |
+| ALL-G-B | 248,228 / 245,102 | -1.3% | 388 / 283 / 180 | 0 0 1 0 1 0 0 2 0 0 |
+
+* matched/s is flat in every arm (the per-minute values span 237-254k in the bundles, 220-234k in C).
+* The native block rate is not steady by 600 s in the bundles. ALL-G falls minute by minute (311, 279, 297, 254 in
+  minutes 7-10). ALL-G-B falls to 179-180 in minutes 8-10, where it may be levelling. C is steady from minute 3 at
+  165-173. Over the last 60 s of load, native blocks per validator were C 178, ALL-G 269, ALL-G-B 196. The bundles'
+  blocks/s gain over C shrinks as the books grow, while their matched/s gain does not.
+* Drift: w1 vs r1-Crs is -0.2% matched/s and -0.2% CPU-s per 1M fills, so the host did not drift between the two C
+  cells. (In s58rl the warm-up was -6.0%.) Drift across the two bundle cells, which ran 14 min apart, is not
+  measured.
+
+### 78.4 Steps vs noise
+
+Reference spreads: 76.1's C1 / C2 (matched/s +-0.39% around their mean, CPU-s per 1M fills 0.38% apart), s58rl's
+ALL a1 / a2 (0.14% and 0.53%), and here w1 vs Crs (0.2% and 0.2%).
+
+| step | matched/s | CPU-s / 1M fills | core timeouts | resolved at n = 1? |
+|---|---|---|---|---|
+| ALL-G vs Crs | +8.3% | +4.7% | 8 -> 15 | matched/s and CPU yes (about 20x and 9-12x the C spread; 76.6's xG was +9.3% / +5.1% at 300 s); timeouts no (C's rate per block) |
+| ALL-G-B vs Crs | +8.3% | +1.1% | 8 -> 4 | matched/s yes; CPU indicative (about 3x the C spread; 76.6's xB was +1.4%) |
+| B: ALL-G vs ALL-G-B | +0.09% | +3.5% | 4 -> 15 | CPU yes (about 7-9x the C and ALL spreads); matched/s no (inside noise); timeouts no (one cell each, 1.6 vs 0.6 per 1k blocks) |
+| B: exec lag / save_books / RSS | 13.3 -> 7.4 s; 13.7 -> 3.9 ms; 5.11 -> 4.64 GB | | | indicative: well outside w1 vs Crs (20.3 vs 18.9 s, 19.7 vs 19.4 ms, 5.52 vs 5.73 GB), one cell per arm |
+
+* B's mechanism, sized. In ALL-G, save_books falls from 14.25 to 4.05 ms per native block (bench + drain window).
+  That is 10 of the 55 ms by which ALL-G's exec block is shorter than ALL-G-B's (168 vs 223 ms). The rest comes from
+  the engine (171 -> 134 ms). With shorter blocks ALL-G runs 30% more native blocks (5.70 vs 4.39 per s), each with
+  fewer fills (42k vs 55k). So B adds blocks and lowers the queue, but not fills per second. The extra CPU follows the
+  extra blocks: CPU-s per node over the whole run is 3,748 vs 3,633.
+* Unresolved at n = 1: the 0.09% matched/s gap between the bundles, the 15 vs 4 core timeouts, and whether ALL-G-B's
+  block rate has levelled at 600 s.
+
+### 78.5 Owner decision (s62)
+
+**Bundle = ALL-G-B = D, M, T, E, with `TORUS_HEADER_RESEND_MS=250` as the timeout fix.** ALL-G-B has the same
+matched/s as ALL-G (+8.3% vs C) at +1.1% instead of +4.7% CPU-s per 1M fills, and the fewest timeouts. B's gains
+(lower exec lag, faster book save, less RSS) matter only under sustained saturation, and the bench queue is at its
+cap in every arm only because the bench saturates it.
+
+### 78.6 Parked options (not taken, kept for later)
+
+* **B, parallel Classic book save.** Branch `exp/archy-s58-parallel-classic-book-save` `8525822b` (on main
+  `a44000e0`, pushed to origin); merged into ALL `6452fa31`. Flag `TORUS_PARALLEL_BOOK_SAVE=1` (bench value 1),
+  node-local, default off.
+  * What it does (plan doc `docs/plans/exp-archy-s58-parallel-classic-book-save.md`): in Classic book mode,
+    `save_order_books` encodes each dirty book's blob as one exec-pool job, heaviest first, into a presized buffer.
+    The puts then run serially in ascending market order on the exec thread. A job panic latches a save fault. The
+    gate needs at least 2 dirty books and at least 16,384 resting orders. Otherwise the serial loop runs unchanged.
+  * Measured: alone, 76.1. Dropping it from ALL (xB, 76.6) cost 1.4 native blk/s and 0.8% matched/s at -3.8 points
+    of CPU. Here (78.4) it gives +3.5% CPU-s per 1M fills at equal matched/s, exec lag 7.4 vs 13.3 s, save_books 3.9
+    vs 13.7 ms per save, and RSS -0.5 GB.
+  * Not taken: its CPU buys no matched/s.
+  * Revisit if state freshness under sustained saturation (exec lag) or RSS matters.
+* **G, fine-grained exec-pool jobs.** Branch `exp/archy-s58-exec-pool-fine-grain-jobs` `aaf0b804` (on `a44000e0`,
+  pushed to origin; the plan doc's "Not pushed" line is stale). Flag `TORUS_EXEC_POOL_GRAIN=K`, K 2-16 (bench value
+  4); unset, 0 or 1 = today.
+  * What it does (plan doc `docs/plans/exp-archy-s58-exec-pool-fine-grain-jobs.md`): it splits matching and settle
+    pass A into K x cap LPT chunks instead of cap chunks. Idle pool threads can then steal chunks that late-starting
+    threads have not begun. Pool threads were measured to start their chunk 1-8.6 ms apart.
+  * Measured (75, 76.5-76.6): dropping it from ALL costs 0.2 native blk/s and 0.1% matched/s.
+  * Not taken: not needed.
+  * Revisit if exec-pool job granularity becomes the bottleneck (more markets per thread, or skewed per-market
+    work).
+* **Direct fan.** `TORUS_CONSENSUS_DIRECT_FAN=1` (bench value 1), on main since `fcc49b54` (B2 consensus
+  isolation). The gossip mirror (`TORUS_CONSENSUS_GOSSIP_MIRROR`) was left at its default, on.
+  * What it does: consensus broadcasts go over the `/torus/direct` fan, which is not rate-limited.
+  * Measured (77.3-77.5): core timeouts 5 (vs ALL 33 / 47), -1.1% matched/s and +3.1% CPU-s per 1M fills vs ALL on
+    one host. The gossip mirror copies doubled the traffic (about 14.1k limiter drops per node, all duplicates), and
+    the cell committed 2.2x ALL's blocks, nearly all of them in the drain.
+  * Not taken: the re-send fixes the timeouts at no measured cost.
+  * Revisit on a multi-host testnet, where the fan is 1 hop vs gossip's 2, possibly with the mirror off.
+* **Limiter exemption for validator proposals, or a higher `consensus_rate_limit_per_peer`.** Code change.
+  * The limit is hardcoded at 50 per s (burst 50) in `crates/torus-network/src/config.rs:280` (main `19fd0c28`).
+  * This is the root fix: the re-send only recovers headers that the limiter already dropped.
+  * Not measured. It needs a design, because the message type is decoded after the limit check. It also needs tests
+    and a review.
+  * Before mainnet, informed by a multi-host testnet run with the drop counter
+    `torus_consensus_rate_limited_dropped_total`.
+* **E's duplicate.** Arm E uses 18c's epoch fast path on main (`efe9aa47`, `TORUS_EPOCH_FAST_PATH`; in the ALL stack
+  through main `5e0fbbfa`). Archy's own version, `exp/archy-s58-epoch-boundary-fast-path` `bb62bab1`, was reverted
+  from ALL (`78373203`) and is not to be merged. It carries one test that main lacks and that is worth porting:
+  `epoch_fast_path_checkpoint_crash_replay_matches_uncrashed`, with its helper `ckpt_crash_replay_with`.
+
+### 78.7 Next
+
+* **Port D, M, T and the drop counter onto main `19fd0c28`.**
+  * Branches (origin): D `exp/archy-s58-settle-passb-deferred-results-scatter` `95e2d48e`, M
+    `exp/archy-s58-parallel-match-setup` `6954e735`, T `exp/archy-s58-sell-top-up-stitch-list` `6d1100b8`.
+  * The drop counter is `857b9770` on `exp/archy-s58-consensus-ratelimit-drops`. That branch is local only, not on
+    origin: push it first.
+  * E is already on main: `TORUS_EPOCH_FAST_PATH` is read at `crates/torus-consensus/src/exec_pipeline.rs:65` at
+    `19fd0c28`.
+  * Make the 250 ms re-send the default. Decide where: the env default at
+    `crates/hotstuff_rs/src/hotstuff/implementation.rs:121` (today 3 s), or genesis / config.
+  * Tests, then a Codex review.
+* **Generator gaps (78.1) to a builder:** a warm-up gate, a per-cell custom-check hook, the soak sampler's
+  `metrics-1hz` (with the drop counter per second), and the genesis preflight.
+* Confirm the bundle at n >= 2, ABBA: does ALL-G-B's block rate level off after 600 s, and are its timeouts at or
+  below C's per block?
+* Data: `~/bench-results-matched/ozarchy-s58b600-300m-{w1,r1-Crs,r1-ALLmGrs,r1-ALLmGBrs,smoke-s0}`. Campaign files in
+  `ozarchy-s58b600-run/campaign/`: `campaign.log`, `cells.tsv`, `cell-step/*.s58chk.txt`, `smoke/`. Spec, driver and
+  step in `ozarchy-s58b600-tools/`: `s58b600-spec.json`, `ozarchy-s58b600-campaign.sh`, `s58b600-step.sh`. Analysis
+  in `ozarchy-s58b600-tools/analyst/out/`: `s58b600-pilot.txt` (`s58pilot.py`), `s58b600-timeouts.txt`
+  (`s58flags_to.py` on the `csv2m1hz.py` shadows), `s58b600-minutes.txt`, `s58b600-execlag.txt`,
+  `s58b600-taillag.jsonl`.
+
+## 79. s58 bundle D, M, T on main (branch exp/archy-s58-bundle-dmt), its check campaign (ozarchy-s58dmt) and safety campaign (ozarchy-s58safe: mixed flags, kill-restart, 60 min soak), 300 markets, n = 1 (2026-10-16), and the owner's default-on decision
+
+**The bundle on main `5e6f331a` gives what the s58 stack gave: DMTE +9.1% matched/s vs C (247.6k vs 226.9k) at
+-0.5% CPU-s per 1M fills (inside the 0.5% w1-vs-C spread, so CPU-neutral), block p99 -10.9%, exec lag 9.8 vs 15.3 s.
+Safety (default-on binary): a 2-on / 1-off validator mix agrees (AGREE, one digest per cell), a validator
+SIGKILLed twice replays 113 / 135 blocks and agrees (`c507fa1c`), and a 60 min soak has no death, ACCEPT AGREE and 0
+panics. Two findings for main, not from the bundle: under sustained overload the block rate falls to exec pace
+(5.9 -> 3.0 blk/s by minute 5, while matched/s stays at ~240k), so 300 s cells overstate the blk/s gain; and the data
+dir grows ~0.19-0.21 GB per minute per node whether there is load or not (INFERRED cause: checkpoint data not
+reclaimed). Owner decision (s62): D, M, T on by default. Indicative only: n = 1 per cell, one host, fixed order.**
+* The soak's load stopped at minute 21-23: the bench senders ran out of account margin. Minutes 24-60 are a
+  reject-only load (0 matched/s, ~17 empty blk/s). The soak is a 21 min load soak plus a 37 min idle-chain soak.
+* First real-cell use of the generator's warm-up gate and checks hook (`feat/driver-warmgate-checks`): both
+  worked, including the failure path (79.5).
+
+Question (after 78.7): does the D, M, T port onto main keep the s58 numbers, and is it safe (validators with mixed
+flags, crash and replay, long run) to turn on by default?
+
+### 79.1 The bundle branch (s62)
+
+Branch `exp/archy-s58-bundle-dmt`, pushed, head `bfe47982` (= `origin/exp/archy-s58-bundle-dmt`), on main `5e6f331a`.
+It merges clean into today's main `999c6ad6` (`git merge-tree`, no conflicts). Plan doc
+`docs/plans/exp-archy-s58-bundle-dmt.md` (its "Not pushed" line and "Codex review not done here" bullet are stale).
+
+| commit | what |
+|---|---|
+| `9c550e1e` / `bcdef6f7` / `b787d4a4` | `--no-ff` merges of D `95e2d48e`, M `6954e735`, T `6d1100b8`; no conflicts. The D+M+T `crates/torus-bridge/src` change (2,631 lines) is identical line for line to the stack benched in 75-78 (ALL `6452fa31`'s D+M+T) |
+| `0af69a76` | drop counter `torus_consensus_rate_limited_dropped_total` (cherry-pick of `857b9770`, 77.2) |
+| `6d1dbb1e` | port of `epoch_fast_path_checkpoint_crash_replay_matches_uncrashed` (+ `ckpt_crash_replay_with`) from `bb62bab1` onto main's E (78.6) |
+| `b710f976` | state-equality tests: D+M+T and D+M+T+E vs all off (3 bridge files + 1 consensus test on 130 P2 blocks) |
+| `87bbdd22` | `TORUS_HEADER_RESEND_MS="${TORUS_HEADER_RESEND_MS:-250}"` in `devnet/wsl/env.sh` and `devnet/docker-compose.yml` (all 5 validators); `HEADER_RESEND_UNSET=1` = campaign-wide opt-out; code default stays 3 s |
+| `3c4bb127` | rustfmt of two asserts (format only); flag-off head, the s58dmt binary |
+| `45c104d8` | plan doc |
+| `26f45c81` + `23df02d2` | owner decision: D, M, T on by default, `=0` turns each off; doc |
+| `bfe47982` | parse follow-up: trimmed, any case; unset, empty, `1`, `true` = on; `0`, `false` = off; anything else warns once and stays on. E unchanged (default off). The s58safe binary |
+
+Verification (plan doc "Build and test results"; Codex outputs in the s62 scratch):
+* `cargo nextest run --workspace`: 3922 / 3922 at the flag-off head `3c4bb127` (flags unset, and again with D, M, T,
+  E = 1); 3923 / 3923 at default-on (unset = on, and all three `=0`); 3923 / 3923 at `bfe47982`. 0 flaky in those runs.
+  Earlier runs hit the known "crash at N latched" race in `checkpoint_crash_replay_with_cloids_*` (main
+  `exec_pipeline.rs:754-763`, not touched here), and passed on rerun.
+* Clippy: 345 warnings at 259 sites at `3c4bb127`, identical to main `5e6f331a`; warning set unchanged through
+  `bfe47982`; 0 on added lines.
+* Codex torus review: "No findings." three times (at `45c104d8`, `23df02d2`, `bfe47982`).
+* Release `torus-node`: `3c4bb127` md5 `4574bcbf`, `bfe47982` md5 `325b37f9`.
+
+Why default-on (owner s62): benches should measure what production runs (Q8 sizes Phase 5 on main), and the
+evidence agrees across 76-78 and 79.2. Benches that need the old baseline now set D, M, T to `0`; `absent_env` no
+longer means off for them.
+
+### 79.2 Check campaign ozarchy-s58dmt (`s58dmt-pilot.txt`, `s58dmt-timeouts.txt`, `s58dmt-execlag.txt`)
+
+Setup: campaign A shape (hsdb-300m: Classic, 15 s checkpoints, oracle on, 300 markets), genesis N = 11 md5
+`d694b81b`, rate 76,000, 300 s cells. Binary `3c4bb127` (md5 `4574bcbf`, flag-off head), one binary for both arms;
+arms differ by env on all 3 validators: C = no flag; DMTE = D, M, T, E = 1. Re-send 250 ms on both arms (from
+env.sh; `rlchk`: `TORUS_HEADER_RESEND_MS=250 x3`). Driver generated by the frozen `feat/driver-warmgate-checks`
+`e3316799`; checks `s58chk`, `rlchk`, `ckptchk`. Order: smoke s0 (DMTE, 60 s; 2 attempts, 79.5), w1 (C, gated
+warm-up, 18:54), r1-C (19:03), r1-DMTE (19:12-19:18).
+
+**Validity:** 3 cells rc 0, ACCEPT AGREE, liveness PASS, node md5 `4574bcbf` on 3 nodes, 0 panic or fail-stop lines
+and 0 error lines; the w1 warm-up gate passed (`CHECK OK ... warm-up gate`); 46 `CHECK OK` and 0 `CHECK FAIL` in the
+main campaign; no `CELL-FLAG`, "RERUN PASS: nothing queued", `cells.tsv` 3 rows, 0 bad. Took-effect lines: D, M, T
+`true` once per node in DMTE, `false` in C and w1; `epoch fast path ON` once per node in DMTE only.
+
+Windows as in 78.2 (timeouts: sum of nodes, whole cell = load = core here; exec lag = queue mean / blk/s, lower
+bound).
+
+| cell | arm | matched/s | vs C | native blk/s | fills / block | CPU-s / 1M fills | vs C | CPU-s per node | block p99 ms (mean of nodes) | timeouts | no_proposal | after_vote | leader | exec queue mean / p99 | exec lag s | RSS mean GB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | C (warm-up) | 224,517 | -1.1% | 4.533 | 48,703 | 23.421 | +0.5% | 1,707.6 | 1,119.8 | 9 | 0 | 8 | 1 | 59.9 / 66 | 13.1 | 4.33 |
+| r1-C | C | 226,934 | | 3.954 | 55,854 | 23.308 | | 1,708.1 | 1,121.7 | 6 | 0 | 6 | 0 | 60.7 / 66 | 15.3 | 4.88 |
+| r1-DMTE | DMTE | 247,640 | +9.1% | 5.403 | 42,482 | 23.196 | -0.5% | 1,817.1 | 1,000.0 (-10.9%) | 7 | 1 | 6 | 0 | 53.8 / 66 | 9.8 | 4.64 |
+
+* Including the drain, DMTE is +9.2% (241,782 vs 221,393).
+* Per native block (bench + drain, mean of nodes), DMTE's exec block is 168.6 vs 242.8 ms (-30.5%). Engine 130.8 vs
+  186.9 ms: match -49%, settle pass B -37%, margin -30%. E pipelines all 21 epoch boundaries on val0 (C: 0 of 16;
+  boundary gap 1.0 vs 474.5 ms).
+* The one `no_proposal` timeout is on val1. Per-node timeouts: C 5 / 0 / 1, DMTE 1 / 3 / 3. Drops per node: C 92 / 87
+  / 89, DMTE 105 / 107 / 106; header re-sends C 273 / 153 / 86, DMTE 255 / 108 / 80. Drops are cell totals only (no
+  1 Hz drop series in this generator version), so the `no_proposal` cannot be tied to a drop. 78's ALL-G-B had 0 over
+  600 s.
+* The pilot table's "consensus timeouts" row (C 5, DMTE 1, w1 1) is a different counter from the per-kind sums above;
+  the table uses `s58dmt-timeouts.txt`.
+* Native blocks per minute on val0, minutes 1-5: C 319, 315, 213, 170, 170; DMTE 397, 369, 295, 300, 265; w1 331,
+  338, 265, 253, 176. Both arms are still falling at 300 s (79.3c: the soak reaches exec pace by minute 5).
+* Compared with 78: ALL-G-B was +8.3% matched/s at +1.1% CPU-s per 1M fills vs C at 600 s, on the s58 stack. C
+  here is -0.5% vs 78's Crs (226,934 vs 228,142).
+
+Steps vs noise. Reference: w1 vs r1-C (same arm, back to back): -1.1% matched/s, +0.5% CPU-s per 1M fills, +14.6%
+native blk/s, -0.2% block p99 (mean of nodes; val0 alone -13.8%), exec lag 2.2 s apart. This w1 spread is wider than
+78's (0.2%).
+
+| step DMTE vs C | size | w1-vs-C spread | resolved at n = 1? |
+|---|---|---|---|
+| matched/s | +9.1% | 1.1% | yes (about 8x; matches 76-78) |
+| CPU-s / 1M fills | -0.5% | 0.5% | no: CPU-neutral, not a measured decrease |
+| block p99 (mean of nodes) | -10.9% | 0.2% (val0 13.8%) | indicative: the per-node p99 swings as much as the step |
+| native blk/s | +36.6% | 14.6% | indicative (2.5x); a start-of-run effect, see 79.3c |
+| exec lag | 15.3 -> 9.8 s | 2.2 s | indicative (2.5x) |
+| timeouts | 6 -> 7 (1 `no_proposal`) | 6 vs 9 | no |
+
+### 79.3 Safety campaign ozarchy-s58safe
+
+Setup: binary `bfe47982` (md5 `325b37f9`, D, M, T on by default, E absent), bench `bfe47982` (md5 `556e7df9`). Same
+shape and genesis as 79.2 (`d694b81b`; `CHECK OK ... shape: Classic, ckpt 15 s ... genesis N=11 markets=300`), re-send
+250 ms. Drivers generated by the frozen generator `4f825ab0` (adds the 1 Hz soak sampler); checks
+`s58safe-checks.sh` (`s58chk`, `safechk`, `rlchk`, `ckptchk`). The master unit ran mix, crash and soak in sequence,
+20:33-22:02 (`MASTER END mix=0 crash=0 soak=0`). 55 `CHECK OK`, 0 `CHECK FAIL` or `CELL-FLAG` in the master log.
+
+**(a) Mixed flags (cells w1 and r1-MIX, 300 s).** Arm MIX: val0 and val1 run the defaults (D, M, T on); val2 runs a
+wrapper binary (the generator's `wrapper` option) that execs the same node with D, M, T = 0. The took-effect lines
+confirm it per node: `on=true` / `enabled=true` once on val0 and val1, `false` once on val2, in both cells.
+
+| cell | matched/s | native blk/s | timeouts (summary) | validity | state digest, 3 nodes |
+|---|---|---|---|---|---|
+| w1 (MIX, gated warm-up) | 240,760 | 4.0 | 4 | ACCEPT AGREE, liveness PASS | `adc6a064` x3 |
+| r1-MIX | 242,600 | 3.7 | 1 | ACCEPT AGREE, liveness PASS | `f51df7c5` x3 |
+
+* A validator with D, M, T off computes the same state as two with them on, over 2 x 300 s of the full load.
+* matched/s is between 79.2's C and DMTE (+6.9% vs C, -2.0% vs DMTE; other binary, other campaign, E off here).
+
+**(b) Kill-restart (cell k1-DEF, 300 s, defaults).** Hand script `crash-cell.sh` through `run-cell.sh`
+`CRASH_KILL_AT_S=60,180 KILL_NODE=val1` (SIGKILL, restart from the same data dir after 1.01 s). From `crash.json`,
+`crash-2.json` and the two `crash-restart-tail*.log`:
+
+| kill | at | exec queue at kill | durable marker / committed | replay | kill -> DB opened | replay time (gap line -> block done) | restart -> first new commit |
+|---|---|---|---|---|---|---|---|
+| 1 | +60 s | 39 | 800 / 913 | 113 blocks | 7.9 s (process start -> open 6.9 s) | 23.2 s | 30.7 s (height 914) |
+| 2 | +180 s | 63 | 1,400 / 1,535 | 135 blocks | 4.9 s (3.9 s) | 20.5 s | 24.8 s (height 1,536) |
+
+* AGREE: state digest `c507fa1c` on all 3 nodes (heights 2,659 / 2,658 / 2,659). 0 `panicked at` in any node log.
+  matched/s 206,258 over the cell, with the two outages; 17 timeouts.
+* With n = 3 and one node down the chain halts, so val1 is at the tip once its replay ends.
+* **run-cell's crash verdict FAIL is a false alarm.** The cell ends rc 2 with:
+  `VALIDITY ozarchy-s58safe-300m-k1-DEF: REJECT liveness=UNKNOWN reasons=['crash gate failed', 'liveness unverified']`
+  and `CRASH kill 1: verdict=FAIL at=60s down=1.01s rewind=113 blk (beyond_queue=74) panics=1 errors=0 reasons=['rewind
+  74 blocks beyond the exec queue (max 2)', 'panic/fail-stop after the restart']` (kill 2: `rewind=135 blk
+  (beyond_queue=72)`). Both reasons are wrong for this shape:
+  * "panic/fail-stop": the only match after each restart is the startup INFO line
+    `torus_consensus::state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false` (val1 has 3, one
+    per start; val0 and val2 1 each).
+  * "rewind beyond the exec queue (max 2)": the rewind is to the last durable marker, which with 15 s checkpoints is
+    the last checkpoint (800, 1,400). 74 / 72 = the 113 / 135 blocks since that checkpoint minus the 39 / 63 still
+    queued. The gate's max 2 assumes the per-block flush of the shapes it was written for.
+
+**(c) 60 min soak (cell 3600s-k1-DEF, defaults).** 30 min was requested after launch; the cell ran 3,603 s.
+ACCEPT AGREE, liveness PASS, digest `42a5b28c` x3, 0 panic, drained. From `analyst/soak-minutes.tsv` (`soak_minutes.py`
+on the 1 Hz metrics; per-minute; RSS / fds / DB = val0; drops = sum of 3 nodes; fills per block = matched/s / blk/s,
+lag = queue mean / blk/s):
+
+| minute | matched/s | native blk/s | exec queue mean | fills / block | lag s | RSS GiB | fds | DB GiB (`torus_db_size_bytes`) | timeouts (sum) | drops / min |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 228,955 | 5.9 | 46.1 | 38.8k | 7.8 | 5.42 | 351 | 2.50 | 0 | 54 |
+| 2 | 248,767 | 5.5 | 61.8 | 45.2k | 11.2 | 5.90 | 376 | 2.23 | 0 | 2 |
+| 5 | 239,978 | 3.1 | 63.3 | 77.4k | 20.4 | 6.61 | 418 | 3.98 | 2 | 0 |
+| 10 | 242,562 | 2.9 | 62.2 | 83.6k | 21.4 | 7.15 | 436 | 5.12 | 0 | 0 |
+| 15 | 246,293 | 3.0 | 62.3 | 82.1k | 20.8 | 6.82 | 456 | 5.64 | 2 | 0 |
+| 20 | 237,230 | 2.9 | 57.9 | 81.8k | 20.0 | 6.32 | 476 | 6.05 | 2 | 0 |
+| 21 | 206,904 | 3.1 | 56.2 | | | 6.36 | 491 | 5.49 | 2 | 0 |
+| 22 | 154,370 | 6.2 | 45.3 | | | 5.34 | 495 | 7.06 | 1 | 8 |
+| 23 | 41,746 | 16.5 | 7.4 | | | 3.72 | 487 | 6.37 | 0 | 316 |
+| 24 | 12,521 | 17.6 | 2.6 | | | 3.35 | 475 | 7.44 | 0 | 320 |
+| 30 | 0 | 17.8 | 0.8 | | | 3.11 | 524 | 8.70 | 0 | 314 |
+| 40 | 0 | 18.0 | 0.8 | | | 2.86 | 567 | 11.22 | 0 | 322 |
+| 50 | 0 | 17.4 | 1.5 | | | 3.30 | 625 | 12.57 | 0 | 317 |
+| 60 | 0 | 16.5 | 0.8 | | | 3.35 | 667 | 13.72 | 0 | 276 |
+
+* **Minutes 1-20, under load:** matched/s is flat: mean 240,385, range 226,869-253,750. The block rate falls from
+  5.9 to 3.0-3.1 by minute 5 and stays at 2.8-3.0, with the exec queue at 62-63 of 66 and fills per block up from
+  ~39k to ~84k. Once the queue is full, consensus is paced by exec, and lag is ~20 s. RSS rises over minutes 1-9
+  (val0 5.4 -> 7.0 GiB) and is then flat (6.3-7.3 GiB) to minute 21.
+* **Minutes 21-23, the load runs out:** `margin_position` rejects on val0 go 0 (minute 20) -> 7k/s (21) -> 181k/s
+  (22) -> ~360k/s (minutes 26-30). The senders had no account margin left. This is the bench load, not the node.
+* **Minutes 24-60, no matching:** matched/s 0 from minute 28 (12.5k, 1.2k, 49, 0.6 in 24-27); ~17 blk/s of light
+  blocks; ~300 drops per minute summed over nodes (276-438); no timeouts after minute 22, so no lost-proposal
+  timeouts at 17 blk/s.
+* Timeouts by kind over the cell (sum of nodes, per-minute deltas): 2 `no_proposal` (both in minute 11), 1
+  `no_vote`, 33 `after_vote`, 3 `leader`. The summary's own counter says 12.
+* **Data dir growth.** Data dir (du, all 3 nodes) 1.17 / 2.90 / 1.19 GB at the start -> 13.18 / 14.09 / 13.98 GB at
+  the end. Linear fit: 0.193-0.195 GB/min per node over minutes 0-21 (load) and 0.203-0.212 GB/min over minutes
+  24-60 (no matching). At the end the RocksDB split is SST 5.54-5.56 GB (222-224 files), WAL 1.07-1.89 GB, and
+  ~6.5 GB the harness does not split. fds 351 -> 667 (val0), likely DB files (SST count at the end 222-224, not sampled per minute).
+  * The rate is the same with and without load, so the growth is time-based, not per fill.
+  * INFERRED, not shown: 15 s checkpoint data that is not reclaimed. At 4 timed checkpoints per minute that is ~48
+    MB per checkpoint per node. But `torus_exec_checkpoints_total` on val0 rose 5.5 per minute under load (5 -> 110
+    by minute 20) and 10.3 per minute idle (203 -> 507, minutes 30-59; 100-block epoch boundaries at 17 blk/s), at
+    the same GB per minute. So it is not a fixed size per checkpoint counted there. The mechanism is open.
+  * Not attributed to the bundle (inferred): D, M and T act only in matching and settlement, which are idle in
+    minutes 24-60, where the growth goes on unchanged. There was no flags-off soak control.
+
+### 79.4 Findings for main (not from the bundle)
+
+* **Disk growth (79.3c):** ~0.2 GB per minute per node with or without load, ~12 GB per node per hour. Cause not
+  established. To investigate on main (RocksDB LOG / SST and WAL split over time, checkpoint retention).
+* **Block rate under sustained overload converges to exec pace.** 300 s cells catch the start-of-run block rate
+  (79.2: still falling at minute 5 in both arms), so they overstate the blk/s gain. The matched/s gain persists
+  (79.3c minutes 1-20, E off: 240,385, 2.9% below 79.2's DMTE).
+* **Lag under overload is the cost:** ~20 s with the queue full (79.3c). Candidates:
+  * a shorter exec queue / propose watermark (propose-defer, `TORUS_PROPOSE_EXEC_WATERMARK`; owner s126: parked,
+    campaign B dropped, revisit after item 6 Phase 5 by exec queue depth and lag, bench queue `3a8c363f`);
+  * exec-aware admission (`e72a5021`, `TORUS_ADMISSION_EXEC_AWARE`, opt-in, default off);
+  * more exec capacity (Phase 5; parked option B, 78.6).
+* **Soaks need a load that does not exhaust account margin:** top-ups or a lower rate. This soak measured 21 min of
+  load.
+
+### 79.5 Generator notes (`e3316799` for s58dmt, `4f825ab0` for s58safe)
+
+* Warm-up gate and checks hook worked on real cells (79.2 w1 gate, 79.3 w1 gate; 46 + 55 `CHECK OK` lines in the two
+  main campaign logs).
+* The failure path ran for real in the s58dmt smoke, attempt 1 (`smoke-attempt1/campaign.log`): `CHECK FAIL
+  ozarchy-s58dmt-300m-smoke-s0: val0 checkpoint 15 s lines interval=0 policy=0` -> `CELL-FLAG
+  ozarchy-s58dmt-300m-smoke-s0 check` (rerun queued) -> `CAMPAIGN STOP at s0`. The check grepped colored log lines;
+  the checks file now strips ANSI before matching, and attempt 2 passed.
+* Gaps:
+  * no smoke-attempt option (attempt 1 was kept by renaming the dir and cell to `smoke-s0-attempt1`);
+  * no decolored-log helper for checks (each check strips ANSI itself);
+  * `expect` lines cannot read `.gz` logs;
+  * genesis inputs set by hand;
+  * no kill / crash support: `CRASH_KILL_AT_S` is a spec error (its node watch would stop the harness at the kill),
+    so 79.3b ran through the hand `crash-cell.sh` and `run-cell.sh`;
+  * per-node env only through the wrapper-binary option (79.3a).
+
+### 79.6 Next
+
+* 18c merges `exp/archy-s58-bundle-dmt` `bfe47982` (D, M, T default-on) into main.
+* Campaign A: base arm sets D, M, T = 0 (E absent); optional DMT / DMTE arms. Watch `no_proposal` (1 in 79.2) with the
+  drop counter.
+* Investigate the checkpoint / data-dir growth on main: a flags-off soak control, and a soak whose load does not
+  run out of margin.
+* Lag under overload: propose-defer is parked (s126); exec-aware admission and Phase 5 capacity are the other
+  candidates (79.4).
+* Data: `~/bench-results-matched/ozarchy-s58dmt-300m-{w1,r1-C,r1-DMTE,smoke-s0,smoke-s0-attempt1}`, campaign files
+  `ozarchy-s58dmt-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`, `smoke-attempt1/`), spec / driver / checks
+  in `ozarchy-s58dmt-tools/` (`s58dmt-spec.json`, `ozarchy-s58dmt-campaign.sh`, `s58dmt-checks.sh`), analysis in
+  `ozarchy-s58dmt-tools/analyst/out/s58dmt-{pilot,timeouts,execlag}.txt`.
+  `~/bench-results-matched/ozarchy-s58safe-{300m-w1,300m-r1-MIX,300m-k1-DEF,3600s-k1-DEF,120s-ksmoke}`, campaign files
+  `ozarchy-s58safe-run/{master,mix,ksmoke,soak}/`, tools `ozarchy-s58safe-tools/` (`s58safe-{mix,soak}-spec.json`,
+  the two drivers, `s58safe-checks.sh`, `crash-cell.sh`), analysis `ozarchy-s58safe-tools/analyst/soak_minutes.py`,
+  `soak-minutes.tsv`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

@@ -1414,6 +1414,25 @@ pub async fn run_swarm_with_config(
     }
 }
 
+/// Per-author consensus gossip rate-limit gate. Same decision as
+/// `ConsensusRateLimiter::check_and_increment`; a drop is debug-logged and
+/// counted on `torus_consensus_rate_limited_dropped` (s58: the drop was
+/// debug-log only, so lost leader headers could not be confirmed).
+fn consensus_rate_limit_admit(
+    limiter: &mut ConsensusRateLimiter,
+    metrics: Option<&torus_telemetry::Metrics>,
+    author: &PeerId,
+) -> bool {
+    if limiter.check_and_increment(author) {
+        return true;
+    }
+    if let Some(m) = metrics {
+        m.consensus_rate_limited_dropped.inc();
+    }
+    debug!(%author, "consensus rate limit exceeded, dropping message");
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_event(
     event: SwarmEvent<TorusBehaviourEvent>,
@@ -1491,8 +1510,11 @@ fn handle_event(
 
                 // Rate-limit by cryptographic author, not forwarder — prevents
                 // a banned node from consuming honest relayers' rate-limit tokens.
-                if !consensus_rate_limiter.check_and_increment(&author) {
-                    debug!(%author, "consensus rate limit exceeded, dropping message");
+                if !consensus_rate_limit_admit(
+                    consensus_rate_limiter,
+                    shared.metrics.as_deref(),
+                    &author,
+                ) {
                     return;
                 }
                 handle_consensus_gossip(&message.data, shared, peer_scoring, &author);
@@ -3456,6 +3478,44 @@ mod tests {
     /// peer could stall the whole cluster. Per-peer zstd survives only on the
     /// request_response body paths (`/torus/{native-da,block-data,direct}/2.0`),
     /// which negotiate compression per peer; gossip carries raw v1 only.
+    /// s58: the per-author consensus gossip rate-limit gate must count every
+    /// drop on `torus_consensus_rate_limited_dropped` (previously debug-log
+    /// only) and keep the same admit/drop decision as the bare limiter.
+    #[test]
+    fn consensus_rate_limit_drops_are_counted() {
+        let metrics = torus_telemetry::Metrics::new();
+        let mut limiter = ConsensusRateLimiter::new(5);
+        let author = PeerId::random();
+        let other = PeerId::random();
+        // Burst of 5 admitted, nothing counted.
+        for i in 0..5 {
+            assert!(
+                consensus_rate_limit_admit(&mut limiter, Some(&metrics), &author),
+                "message {i} within burst was dropped"
+            );
+        }
+        assert_eq!(metrics.consensus_rate_limited_dropped.get(), 0);
+        // Past the burst: dropped and counted once per drop.
+        for _ in 0..3 {
+            assert!(!consensus_rate_limit_admit(
+                &mut limiter,
+                Some(&metrics),
+                &author
+            ));
+        }
+        assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
+        // Another author has its own bucket: admitted, not counted.
+        assert!(consensus_rate_limit_admit(
+            &mut limiter,
+            Some(&metrics),
+            &other
+        ));
+        assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
+        // No metrics registry (tests/tools): same decision, no panic.
+        assert!(!consensus_rate_limit_admit(&mut limiter, None, &author));
+        assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
+    }
+
     #[test]
     fn no_node_subscribes_to_v2_gossip_topic() {
         let key = libp2p::identity::Keypair::generate_ed25519();
