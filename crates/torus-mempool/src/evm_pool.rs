@@ -121,6 +121,64 @@ fn compute_shuffle_key(parent_hash: &B256, sender: &Address, nonce: u64) -> u64 
     u64::from_be_bytes(hash.as_slice()[..8].try_into().unwrap())
 }
 
+/// Item 7 step 2: the EVM lane of a pooled tx.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EvmLane {
+    Small,
+    Big,
+}
+
+impl EvmLane {
+    /// The lane a sender may not also hold txs in (one lane per sender).
+    pub fn other(self) -> Self {
+        match self {
+            EvmLane::Small => EvmLane::Big,
+            EvmLane::Big => EvmLane::Small,
+        }
+    }
+}
+
+/// Item 7 step 2: both EVM pools (and, B13, the in-flight filter) under one lock.
+pub(crate) struct EvmLanes {
+    pub small: EvmPool,
+    pub big: EvmPool,
+}
+
+impl EvmLanes {
+    pub fn new(base_fee: u64) -> Self {
+        Self {
+            small: EvmPool::new(base_fee),
+            big: EvmPool::new(base_fee),
+        }
+    }
+
+    pub fn pool(&self, lane: EvmLane) -> &EvmPool {
+        match lane {
+            EvmLane::Small => &self.small,
+            EvmLane::Big => &self.big,
+        }
+    }
+
+    pub fn pool_mut(&mut self, lane: EvmLane) -> &mut EvmPool {
+        match lane {
+            EvmLane::Small => &mut self.small,
+            EvmLane::Big => &mut self.big,
+        }
+    }
+
+    pub fn lane_of(&self, hash: &B256) -> Option<EvmLane> {
+        if self.small.contains(hash) {
+            Some(EvmLane::Small)
+        } else {
+            self.big.contains(hash).then_some(EvmLane::Big)
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.small.size() + self.big.size()
+    }
+}
+
 /// Inner EVM transaction pool (not thread-safe — wrapped by Mempool).
 pub(crate) struct EvmPool {
     /// Per-sender nonce-ordered transaction queues.
@@ -178,6 +236,23 @@ impl EvmPool {
 
     pub fn all_senders(&self) -> Vec<Address> {
         self.by_sender.keys().cloned().collect()
+    }
+
+    /// Item 7 step 2: the sender has a pooled tx here (one lane per sender).
+    pub fn has_sender(&self, sender: &Address) -> bool {
+        self.by_sender.contains_key(sender)
+    }
+
+    /// Item 7 step 2: remove and return every pooled raw tx (each sender's in nonce order),
+    /// leaving every index empty.
+    pub fn take_all(&mut self) -> Vec<Vec<u8>> {
+        self.by_hash.clear();
+        self.by_price.clear();
+        self.size = 0;
+        std::mem::take(&mut self.by_sender)
+            .into_values()
+            .flat_map(|txs| txs.into_values().map(|e| e.raw_rlp))
+            .collect()
     }
 
     /// Insert a validated transaction.
@@ -664,6 +739,32 @@ mod tests {
         assert!(!pool.contains(&heavy.hash));
         assert_eq!(pool.size(), 1);
         assert_eq!(pool.evict_gas_above(1_000_000), (0, 0));
+    }
+
+    /// Item 7 step 2: `take_all` empties every index and returns each sender's txs in nonce
+    /// order; `has_sender` follows.
+    #[test]
+    fn take_all_empties_the_pool_in_nonce_order() {
+        let entries = [
+            entry(0xA, 1, 100, 5),
+            entry(0xA, 0, 100, 5),
+            entry(0xB, 0, 100, 5),
+        ];
+        let mut pool = pool_with(10, &entries, 100);
+        assert!(pool.has_sender(&Address::repeat_byte(0xA)));
+        let mut taken = pool.take_all();
+        assert_eq!(pool.size(), 0);
+        assert!(pool.by_hash.is_empty() && pool.by_price.is_empty());
+        assert!(!pool.has_sender(&Address::repeat_byte(0xA)));
+        let a: Vec<_> = taken.iter().filter(|raw| raw[0] == 0xA).cloned().collect();
+        assert_eq!(
+            a,
+            vec![entries[1].raw_rlp.clone(), entries[0].raw_rlp.clone()]
+        );
+        taken.sort();
+        let mut want: Vec<_> = entries.iter().map(|e| e.raw_rlp.clone()).collect();
+        want.sort();
+        assert_eq!(taken, want);
     }
 
     /// Fix (a) replacement: geth rule, both the max fee and the tip must rise

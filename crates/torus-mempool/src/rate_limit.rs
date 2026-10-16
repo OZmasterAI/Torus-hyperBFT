@@ -11,34 +11,26 @@ use torus_types::NativeAction;
 // Block-space limits
 // ============================================================================
 
-/// Per-block EVM gas budget (D1, S392) — replaces the deleted count caps
-/// (EVM_TOTAL_BLOCK_CAP=20 / EVM_PER_BLOCK_CAP=4). Gas is the correct unit
-/// for the guarantee those caps existed for: bounding worst-case EVM
-/// execution time on the commit path. 5M is the conservative debut (~1/6 of
-/// the 30M block gas limit); the acceptance bench runs with the env override
-/// at 15M (half the block) and only a passing mixed-load bench promotes that
-/// to the default — see docs/plans/evm-blocker-set-decisions.md D1.
-pub const EVM_BLOCK_GAS_BUDGET: u64 = 5_000_000;
-
 /// Per-sender share of the EVM gas budget, in percent (D1) — a faucet-era
 /// spam guard, ON for testnet. 0 disables it (mainnet = pure gas budget,
 /// Ethereum-style).
 pub const EVM_SENDER_SHARE_PCT: u32 = 25;
 
-/// Effective EVM gas budget: `TORUS_EVM_BLOCK_GAS_BUDGET` overrides the
-/// compiled default PER NODE, read once at first use (same operational
-/// pattern as `TORUS_HASH_ONLY_PUSH_THRESHOLD`). Proposer-local selection
-/// policy — validators execute whatever the committed block carries — so it
-/// can be A/B'd on one validator without coordination and can never split
+/// Per-node gas budget of the SMALL EVM lane (D1, S392; item 7 step 2 decision 6): unset = no cap,
+/// the header limits alone size both lanes. `TORUS_EVM_BLOCK_GAS_BUDGET` stays as an optional
+/// per-node cap for A/B tests; it never caps the big lane. Read once. Proposer-local selection
+/// policy (validators execute whatever the committed block carries), so it can never split
 /// consensus.
 pub fn evm_block_gas_budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
-        std::env::var("TORUS_EVM_BLOCK_GAS_BUDGET")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(EVM_BLOCK_GAS_BUDGET)
+        parse_evm_block_gas_budget(std::env::var("TORUS_EVM_BLOCK_GAS_BUDGET").ok())
     })
+}
+
+/// `TORUS_EVM_BLOCK_GAS_BUDGET`: a whole number of gas, else no cap (`u64::MAX`).
+pub fn parse_evm_block_gas_budget(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.trim().parse().ok()).unwrap_or(u64::MAX)
 }
 
 /// Effective per-sender share percent: `TORUS_EVM_SENDER_SHARE_PCT` overrides
@@ -456,6 +448,18 @@ pub fn validate_batch_size(action: &NativeAction) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 7 step 2 (decision 6): `TORUS_EVM_BLOCK_GAS_BUDGET` has no default: unset or not a
+    /// whole number = no cap. RED before: the 5M default (and no parser).
+    #[test]
+    fn evm_block_gas_budget_has_no_default() {
+        assert_eq!(parse_evm_block_gas_budget(None), u64::MAX);
+        assert_eq!(parse_evm_block_gas_budget(Some("abc".into())), u64::MAX);
+        assert_eq!(
+            parse_evm_block_gas_budget(Some(" 7000000 ".into())),
+            7_000_000
+        );
+    }
 
     #[test]
     fn admission_horizon_parse_defaults_on() {

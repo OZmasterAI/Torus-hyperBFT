@@ -35,7 +35,7 @@ fn now_ms() -> u64 {
 }
 
 pub use crate::error::MempoolError;
-pub use crate::evm_pool::EvmPoolEntry;
+pub use crate::evm_pool::{EvmLane, EvmPoolEntry};
 pub use crate::native_pool::{is_cancel, is_oracle_submission, is_priority};
 
 /// Timing of one [`Mempool::get_native_da_batch_timed`] call (s76).
@@ -67,9 +67,10 @@ pub struct MempoolConfig {
     /// via [`Mempool::set_base_fee`]; 1 gwei matches the frozen chain base fee.
     pub initial_base_fee: u64,
     // ---- Block-space budgets (D1, S392) ----
-    /// Per-block EVM gas budget for drain selection. 5M debut default;
-    /// `TORUS_EVM_BLOCK_GAS_BUDGET` env override. The acceptance bench at 15M
-    /// earns the raise (docs/plans/evm-blocker-set-decisions.md D1).
+    /// Per-node gas budget of the SMALL EVM lane (drain and admission). Item 7
+    /// step 2 (decision 6): no default (`u64::MAX`, the header limits alone
+    /// size both lanes); `TORUS_EVM_BLOCK_GAS_BUDGET` sets it per node for A/B
+    /// tests. It never caps the big lane.
     pub evm_block_gas_budget: u64,
     /// Per-sender share of the EVM gas budget, in percent. 0 disables
     /// (mainnet = pure gas budget); `TORUS_EVM_SENDER_SHARE_PCT` env override.
@@ -155,7 +156,8 @@ struct PendingDaMirrors {
 
 /// Thread-safe transaction mempool combining EVM and native action pools.
 pub struct Mempool {
-    evm: RwLock<evm_pool::EvmPool>,
+    /// Item 7 step 2: the small and the big EVM pool under one lock.
+    evm: RwLock<evm_pool::EvmLanes>,
     native: RwLock<native_pool::NativePool>,
     state: StateDb,
     /// Item 6 Phase 3 step 2: the exec thread's published read view (blocks
@@ -189,6 +191,15 @@ pub struct Mempool {
     /// Item 7 step 1: the committed header's EVM gas limit, the admission cap
     /// on tx gas (with the drain budget). Starts at `config.block_gas_limit`.
     current_evm_gas_limit: std::sync::atomic::AtomicU64,
+    /// Item 7 step 2: the committed header's M (`evm_big_block_interval`); 0 =
+    /// big blocks off, every sender is in the small lane.
+    current_big_interval: std::sync::atomic::AtomicU64,
+    /// Item 7 step 2: the committed header's big limit, the big lane's tx gas
+    /// cap (0 until the first committed header).
+    current_big_gas_limit: std::sync::atomic::AtomicU64,
+    /// Item 7 step 2: the committed header's big base fee, the big lane's
+    /// admission fee floor.
+    current_big_base_fee: std::sync::atomic::AtomicU64,
     /// Approximate total memory used by pooled transactions (Phase 3: 3.1.7).
     memory_used: std::sync::atomic::AtomicUsize,
     /// Outbound native action gossip channel (set once at startup).
@@ -248,7 +259,7 @@ impl Mempool {
         let initial_base_fee = config.initial_base_fee;
         let initial_evm_gas_limit = config.block_gas_limit;
         Self {
-            evm: RwLock::new(evm_pool::EvmPool::new(initial_base_fee)),
+            evm: RwLock::new(evm_pool::EvmLanes::new(initial_base_fee)),
             native: RwLock::new(native_pool),
             state,
             read_view: RwLock::new(None),
@@ -263,6 +274,9 @@ impl Mempool {
             config,
             current_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
             current_evm_gas_limit: std::sync::atomic::AtomicU64::new(initial_evm_gas_limit),
+            current_big_interval: std::sync::atomic::AtomicU64::new(0),
+            current_big_gas_limit: std::sync::atomic::AtomicU64::new(0),
+            current_big_base_fee: std::sync::atomic::AtomicU64::new(initial_base_fee),
             memory_used: std::sync::atomic::AtomicUsize::new(0),
             native_gossip_tx: std::sync::OnceLock::new(),
             native_gossip_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -618,33 +632,118 @@ impl Mempool {
     /// D1 (S392): bound tx gas by the EVM budget, not just the block gas
     /// limit — a tx above the budget would pass a bare block-limit check yet
     /// sit unselectable in the pool forever (stuck nonce). Item 7 step 1: the
-    /// block gas limit is the committed header's (`set_evm_gas_limit`).
+    /// block gas limit is the committed header's (`set_evm_gas_limit`). Item 7
+    /// step 2: the small lane's cap (the budget never caps the big lane).
     fn max_evm_tx_gas(&self) -> u64 {
         self.current_evm_gas_limit
             .load(std::sync::atomic::Ordering::Relaxed)
             .min(self.config.evm_block_gas_budget)
     }
 
+    /// Item 7 step 2: big blocks are on (the last committed header's M > 0).
+    fn big_blocks_on(&self) -> bool {
+        self.current_big_interval
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
+    /// Item 7 step 2: a sender's lane for admission: big iff big blocks are on (the last committed
+    /// header's M > 0) and its `EvmUserModify` row says so, read from the ingress view. A read error
+    /// reads as small (admission is node-local; execution charges the lane its row says).
+    fn evm_lane(&self, sender: &Address) -> EvmLane {
+        if !self.big_blocks_on() {
+            return EvmLane::Small;
+        }
+        match self.ingress_state().get_cf_raw(
+            torus_state::cf::CF_NATIVE_ORACLE,
+            &torus_state::cf::evm_lane_key(sender),
+        ) {
+            Ok(Some(_)) => EvmLane::Big,
+            _ => EvmLane::Small,
+        }
+    }
+
+    /// Item 7 step 2: a lane's admission caps: (tx gas, tx bytes, fee floor).
+    fn lane_caps(&self, lane: EvmLane) -> (u64, usize, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match lane {
+            EvmLane::Small => (
+                self.max_evm_tx_gas(),
+                torus_types::MAX_EVM_BLOCK_TX_BYTES,
+                self.current_base_fee.load(Relaxed),
+            ),
+            EvmLane::Big => (
+                self.current_big_gas_limit.load(Relaxed),
+                torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES,
+                self.current_big_base_fee.load(Relaxed),
+            ),
+        }
+    }
+
+    /// Item 7 step 2: refuse a validated tx its lane could never carry: bytes over the lane's
+    /// cap (`TxTooLarge`), gas over it (`GasLimitExceeded`), max fee under its floor (`FeeTooLow`).
+    fn check_lane_caps(
+        entry: &EvmPoolEntry,
+        (max_gas, max_bytes, fee_floor): (u64, usize, u64),
+    ) -> Result<(), MempoolError> {
+        if entry.raw_rlp.len() > max_bytes {
+            return Err(MempoolError::TxTooLarge {
+                size: entry.raw_rlp.len(),
+                max: max_bytes,
+            });
+        }
+        if entry.gas_limit > max_gas {
+            return Err(MempoolError::GasLimitExceeded {
+                tx_gas: entry.gas_limit,
+                block_gas: max_gas,
+            });
+        }
+        if entry.max_fee_per_gas < fee_floor as u128 {
+            return Err(MempoolError::FeeTooLow {
+                max_fee: entry.max_fee_per_gas,
+                base_fee: fee_floor,
+            });
+        }
+        Ok(())
+    }
+
     /// [`Self::add_evm_tx`]. With `reinsert` (item 7 step 1: a tx drained into
     /// our own proposal comes back) the tx skips the memory budget, and a full
     /// per-sender or pool cap makes room ([`evm_pool::EvmPool::reinsert`]).
+    ///
+    /// Item 7 step 2: the tx enters its sender's lane ([`Self::evm_lane`]) under
+    /// that lane's caps ([`Self::lane_caps`]). A new tx of a sender that still
+    /// has pooled txs in the other lane is refused (`EvmLaneSwitchPending`); a
+    /// reinserted one joins them there instead, so it never leaves a nonce gap.
     fn admit_evm_tx(&self, raw_rlp: Vec<u8>, reinsert: bool) -> Result<B256, MempoolError> {
-        // Item 7 step 1: a block carries at most 256 KiB of EVM tx bytes (vote
-        // rule), so a bigger tx could never be selected.
-        if raw_rlp.len() > torus_types::MAX_EVM_BLOCK_TX_BYTES {
+        // Item 7 steps 1-2: a block carries at most 256 KiB of EVM tx bytes, 768 KiB at a big
+        // height (vote rule), so a bigger tx could never be selected. Checked before decoding.
+        let big_on = self.big_blocks_on();
+        let small = self.lane_caps(EvmLane::Small);
+        let big = self.lane_caps(EvmLane::Big);
+        let max_bytes = if big_on { small.1.max(big.1) } else { small.1 };
+        if raw_rlp.len() > max_bytes {
             return Err(MempoolError::TxTooLarge {
                 size: raw_rlp.len(),
-                max: torus_types::MAX_EVM_BLOCK_TX_BYTES,
+                max: max_bytes,
             });
         }
+        // The sender, so its lane, is known only after recovery: validate under the loosest
+        // caps of the lanes in use, then refuse per lane.
+        let (max_gas, fee_floor) = if big_on {
+            (small.0.max(big.0), small.2.min(big.2))
+        } else {
+            (small.0, small.2)
+        };
         let entry = validate::validate_evm_tx(
             &raw_rlp,
             &self.ingress_state(),
             self.config.chain_id,
-            self.max_evm_tx_gas(),
-            self.current_base_fee
-                .load(std::sync::atomic::Ordering::Relaxed),
+            max_gas,
+            fee_floor,
         )?;
+        let lane = self.evm_lane(&entry.sender);
+        Self::check_lane_caps(&entry, self.lane_caps(lane))?;
 
         let hash = entry.hash;
         let tx_size = raw_rlp.len();
@@ -659,26 +758,35 @@ impl Mempool {
             }
         }
 
-        let mut pool = self.evm.write().unwrap();
+        let mut lanes = self.evm.write().unwrap();
 
-        if pool.contains(&hash) {
+        if lanes.lane_of(&hash).is_some() {
             return Err(MempoolError::DuplicateTx(hash));
         }
-        // Item 7 step 1: re-check under the lock: `set_evm_gas_limit` may have
-        // lowered the cap, and evicted the pool above it, since validation.
-        let max_tx_gas = self.max_evm_tx_gas();
-        if entry.gas_limit > max_tx_gas {
-            return Err(MempoolError::GasLimitExceeded {
-                tx_gas: entry.gas_limit,
-                block_gas: max_tx_gas,
-            });
+        // Item 7 step 2: one lane per sender. If nonce n waited in one pool and n + 1 in the
+        // other, the other drain could take n + 1 first; execution skips it (nonce too high).
+        let mut lane = lane;
+        if lanes.pool(lane.other()).has_sender(&entry.sender) {
+            if !reinsert {
+                return Err(MempoolError::EvmLaneSwitchPending {
+                    sender: entry.sender,
+                });
+            }
+            lane = lane.other();
         }
+        // Re-check under the lock: `set_evm_gas_limit` / `set_big_lane` may have lowered a cap
+        // (and evicted the pool above it), or switched big blocks off, since validation.
+        if lane == EvmLane::Big && !self.big_blocks_on() {
+            lane = EvmLane::Small;
+        }
+        Self::check_lane_caps(&entry, self.lane_caps(lane))?;
 
         let (max_pool_size, max_per_sender, bump_pct) = (
             self.config.max_pool_size,
             self.config.max_per_sender,
             self.config.replacement_bump_pct,
         );
+        let pool = lanes.pool_mut(lane);
         let (_replaced, freed_bytes) = if reinsert {
             pool.reinsert(entry, max_pool_size, max_per_sender, bump_pct)?
         } else {
@@ -694,7 +802,7 @@ impl Mempool {
                 .fetch_sub(freed_bytes, std::sync::atomic::Ordering::Relaxed);
         }
 
-        tracing::debug!(tx_hash = %hash, "evm tx added to mempool");
+        tracing::debug!(tx_hash = %hash, ?lane, "evm tx added to mempool");
         Ok(hash)
     }
 
@@ -715,11 +823,12 @@ impl Mempool {
         }
     }
 
-    /// Drain EVM transactions for a block proposal.
+    /// Drain the SMALL lane's EVM transactions for a block proposal (item 7
+    /// step 2: the big lane drains through [`Self::drain_evm_big`]).
     ///
     /// D1 (S392): selection is bounded by the block's EVM gas budget —
-    /// min(block gas limit, configured budget; 5M debut default,
-    /// `TORUS_EVM_BLOCK_GAS_BUDGET` override) — with an optional per-sender
+    /// min(block gas limit, the node budget; item 7 step 2: no budget unless
+    /// `TORUS_EVM_BLOCK_GAS_BUDGET` is set) — with an optional per-sender
     /// share cap. Count caps deleted. Item 7 step 1: and by
     /// `MAX_EVM_BLOCK_TX_BYTES` (256 KiB) of raw tx bytes, the vote's cap; the
     /// count cap (limit / 21,000) needs no check, as admission requires at
@@ -738,8 +847,7 @@ impl Mempool {
         let min_base_fee = self
             .current_base_fee
             .load(std::sync::atomic::Ordering::Relaxed) as u128;
-        let mut pool = self.evm.write().unwrap();
-        let drained = pool.drain(
+        let drained = self.evm.write().unwrap().small.drain(
             budget,
             torus_types::MAX_EVM_BLOCK_TX_BYTES,
             sender_gas_cap,
@@ -760,10 +868,10 @@ impl Mempool {
     /// ranks by effective tip, which depends on the base fee). Stored under
     /// the EVM lock so the floor and the pool's index never disagree.
     pub fn set_base_fee(&self, base_fee: u64) {
-        let mut pool = self.evm.write().unwrap();
+        let mut lanes = self.evm.write().unwrap();
         self.current_base_fee
             .store(base_fee, std::sync::atomic::Ordering::Relaxed);
-        pool.set_base_fee(base_fee);
+        lanes.small.set_base_fee(base_fee);
     }
 
     /// Item 7 step 1: the committed header's EVM gas limit caps admission (it
@@ -773,13 +881,13 @@ impl Mempool {
     /// stuck nonce, see [`Self::max_evm_tx_gas`]). Stored under the EVM lock,
     /// like the base fee, so admission re-checks against the latest value.
     pub fn set_evm_gas_limit(&self, gas_limit: u64) {
-        let mut pool = self.evm.write().unwrap();
+        let mut lanes = self.evm.write().unwrap();
         let old = self
             .current_evm_gas_limit
             .swap(gas_limit, std::sync::atomic::Ordering::Relaxed);
         let budget = self.config.evm_block_gas_budget;
         if gas_limit.min(budget) < old.min(budget) {
-            let (evicted, freed_bytes) = pool.evict_gas_above(gas_limit.min(budget));
+            let (evicted, freed_bytes) = lanes.small.evict_gas_above(gas_limit.min(budget));
             if evicted > 0 {
                 self.memory_used
                     .fetch_sub(freed_bytes, std::sync::atomic::Ordering::Relaxed);
@@ -798,9 +906,94 @@ impl Mempool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Current EVM pool size.
+    /// Current EVM pool size (item 7 step 2: both lanes).
     pub fn evm_pool_size(&self) -> usize {
         self.evm.read().unwrap().size()
+    }
+
+    /// Item 7 step 2: the pool lane of a pooled tx (routing).
+    pub fn evm_lane_of(&self, hash: &B256) -> Option<EvmLane> {
+        self.evm.read().unwrap().lane_of(hash)
+    }
+
+    /// Item 7 step 2: the big lane's part of a big height: up to the header's big limit (the node
+    /// budget never caps it) and `byte_budget` (768 KiB minus the small lane's bytes), with the
+    /// per-sender share of the big limit, at the proposed header's big base fee (B12).
+    pub fn drain_evm_big(
+        &self,
+        gas_limit: u64,
+        byte_budget: usize,
+        big_base_fee: u64,
+        parent_hash: B256,
+    ) -> Vec<Vec<u8>> {
+        let sender_gas_cap = match self.config.evm_sender_share_pct {
+            0 => None,
+            pct => Some(gas_limit.saturating_mul(pct as u64) / 100),
+        };
+        let min_base_fee = big_base_fee as u128;
+        let drained = self.evm.write().unwrap().big.drain(
+            gas_limit,
+            byte_budget,
+            sender_gas_cap,
+            &parent_hash,
+            min_base_fee,
+        );
+        let bytes: usize = drained.iter().map(Vec::len).sum();
+        if bytes > 0 {
+            self.memory_used
+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        drained
+    }
+
+    /// Item 7 step 2: the committed header's big lane. M back to 0 moves the big pool to the small
+    /// lane (its rules apply; a tx they refuse is dropped with a warning). A lower big limit evicts
+    /// the big-pool txs above it, as `set_evm_gas_limit` does for the small lane.
+    pub fn set_big_lane(&self, interval: u64, gas_limit: u64, base_fee: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let moved = {
+            let mut lanes = self.evm.write().unwrap();
+            self.current_big_interval.store(interval, Relaxed);
+            let old_limit = self.current_big_gas_limit.swap(gas_limit, Relaxed);
+            self.current_big_base_fee.store(base_fee, Relaxed);
+            lanes.big.set_base_fee(base_fee);
+            if gas_limit < old_limit {
+                let (evicted, freed) = lanes.big.evict_gas_above(gas_limit);
+                if evicted > 0 {
+                    self.memory_used.fetch_sub(freed, Relaxed);
+                    tracing::info!(
+                        evicted,
+                        gas_limit,
+                        "evicted big-lane EVM txs above the lower big limit"
+                    );
+                }
+            }
+            if interval == 0 && lanes.big.size() > 0 {
+                lanes.big.take_all()
+            } else {
+                Vec::new()
+            }
+        };
+        if !moved.is_empty() {
+            tracing::info!(
+                txs = moved.len(),
+                "big blocks off: moving the big pool to the small lane"
+            );
+            self.memory_used
+                .fetch_sub(moved.iter().map(Vec::len).sum(), Relaxed);
+            self.reinsert_evm(moved);
+        }
+    }
+
+    /// Item 7 step 2: every EVM value of a committed header the pools follow.
+    pub fn set_evm_header(&self, header: &torus_types::TorusBlockHeader) {
+        self.set_base_fee(header.base_fee_per_gas);
+        self.set_evm_gas_limit(header.evm_gas_limit);
+        self.set_big_lane(
+            header.evm_big_block_interval,
+            header.evm_big_gas_limit,
+            header.big_base_fee_per_gas,
+        );
     }
 
     /// Submit a signed native action. Full EIP-712 validation: signature, chain ID, nonce freshness.
@@ -1686,8 +1879,11 @@ impl Mempool {
     pub fn pending_nonce(&self, sender: &alloy_primitives::Address) -> u64 {
         let account = self.ingress_state().get_account(sender).ok().flatten();
         let state_nonce = account.map(|a| a.nonce).unwrap_or(0);
-        let pool = self.evm.read().unwrap();
-        pool.pending_nonce(sender, state_nonce)
+        // Item 7 step 2: the small pool, then the big pool from where it stopped (a sender holds
+        // one lane at a time; this also covers one caught between the two).
+        let lanes = self.evm.read().unwrap();
+        let after_small = lanes.small.pending_nonce(sender, state_nonce);
+        lanes.big.pending_nonce(sender, after_small)
     }
 
     /// Prune stale transactions from senders included in a committed block —
@@ -1696,7 +1892,8 @@ impl Mempool {
     /// deleted; its feed was test-only.)
     pub fn notify_block_committed(&self, evm_senders: &[alloy_primitives::Address]) {
         if !evm_senders.is_empty() {
-            let mut pool = self.evm.write().unwrap();
+            let mut guard = self.evm.write().unwrap();
+            let lanes = &mut *guard;
             let mut total_pruned = 0usize;
             let mut total_freed = 0usize;
             for sender in evm_senders {
@@ -1707,9 +1904,11 @@ impl Mempool {
                     .flatten()
                     .map(|a| a.nonce)
                     .unwrap_or(0);
-                let (pruned, freed) = pool.prune_confirmed(sender, state_nonce);
-                total_pruned += pruned;
-                total_freed += freed;
+                for pool in [&mut lanes.small, &mut lanes.big] {
+                    let (pruned, freed) = pool.prune_confirmed(sender, state_nonce);
+                    total_pruned += pruned;
+                    total_freed += freed;
+                }
             }
             if total_freed > 0 {
                 self.memory_used
@@ -1726,13 +1925,17 @@ impl Mempool {
     /// txs that were included by other validators' blocks.
     pub fn prune_committed_txs(&self) {
         let senders: Vec<alloy_primitives::Address> = {
-            let pool = self.evm.read().unwrap();
-            pool.all_senders()
+            // Item 7 step 2: both lanes (a sender is in one at a time).
+            let lanes = self.evm.read().unwrap();
+            let mut senders = lanes.small.all_senders();
+            senders.extend(lanes.big.all_senders());
+            senders
         };
         if senders.is_empty() {
             return;
         }
-        let mut pool = self.evm.write().unwrap();
+        let mut guard = self.evm.write().unwrap();
+        let lanes = &mut *guard;
         let mut total_pruned = 0usize;
         let mut total_freed = 0usize;
         for sender in &senders {
@@ -1743,9 +1946,11 @@ impl Mempool {
                 .flatten()
                 .map(|a| a.nonce)
                 .unwrap_or(0);
-            let (pruned, freed) = pool.prune_confirmed(sender, state_nonce);
-            total_pruned += pruned;
-            total_freed += freed;
+            for pool in [&mut lanes.small, &mut lanes.big] {
+                let (pruned, freed) = pool.prune_confirmed(sender, state_nonce);
+                total_pruned += pruned;
+                total_freed += freed;
+            }
         }
         if total_freed > 0 {
             self.memory_used
@@ -4720,6 +4925,326 @@ mod tests {
             (0..4).map(tx).collect::<Vec<_>>(),
             "nonce 0 is back at the head; nonce 4 made room"
         );
+    }
+
+    // ---- item 7 step 2: two pools, one lane per sender (B11) ----
+
+    /// Item 7 step 2: `k`'s `EvmUserModify` row (the big lane), as execution writes it.
+    fn set_lane_row(state: &StateDb, k: &SigningKey) {
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::evm_lane_key(&address_from_key(k)),
+                &[1],
+            )
+            .unwrap();
+    }
+
+    /// A pool with no node budget and no per-sender share cap.
+    fn lane_pool(state: &StateDb) -> Mempool {
+        Mempool::new(
+            state.clone(),
+            MempoolConfig {
+                evm_block_gas_budget: u64::MAX,
+                evm_sender_share_pct: 0,
+                ..MempoolConfig::default()
+            },
+        )
+    }
+
+    /// An EIP-1559 call to 0x0 from `k` at `nonce` with `calldata` zero bytes.
+    fn lane_call(k: &SigningKey, nonce: u64, gas_limit: u64, calldata: usize) -> Vec<u8> {
+        sign_envelope(
+            k,
+            TxEip1559 {
+                chain_id: torus_types::eip712::TORUS_CHAIN_ID,
+                nonce,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                gas_limit,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::ZERO,
+                input: vec![0u8; calldata].into(),
+                access_list: Default::default(),
+            },
+        )
+    }
+
+    /// Item 7 step 2: with M = 0 a sender's lane row is ignored (small lane). Once big blocks
+    /// are on, its next tx enters the big pool: the small drain skips it, the big drain takes
+    /// it. RED before: no big lane (compile error).
+    #[test]
+    fn big_lane_sender_goes_to_the_big_pool_only_while_big_blocks_are_on() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let k = intrinsic_case(&state, 220);
+        set_lane_row(&state, &k);
+        let tx = |nonce| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, 21_000, U256::ZERO);
+        let h0 = pool.add_evm_tx(tx(0)).unwrap();
+        assert_eq!(
+            pool.evm_lane_of(&h0),
+            Some(EvmLane::Small),
+            "M = 0: the row is ignored"
+        );
+        assert_eq!(pool.drain_evm(3_000_000, B256::ZERO), vec![tx(0)]);
+
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let h1 = pool.add_evm_tx(tx(1)).unwrap();
+        assert_eq!(pool.evm_lane_of(&h1), Some(EvmLane::Big));
+        assert!(
+            pool.drain_evm(3_000_000, B256::ZERO).is_empty(),
+            "the small drain skips the big lane"
+        );
+        assert_eq!(
+            pool.drain_evm_big(
+                10_000_000,
+                torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES,
+                1_000_000_000,
+                B256::ZERO
+            ),
+            vec![tx(1)]
+        );
+        assert_eq!(pool.evm_pool_size(), 0);
+    }
+
+    /// Item 7 step 2: one lane per sender. A sender whose row is set while it has a pooled
+    /// small-lane tx gets `EvmLaneSwitchPending` until the small pool holds none of its txs.
+    /// RED before: no lanes (compile error).
+    #[test]
+    fn sender_switching_lanes_waits_until_its_other_lane_drains() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let k = intrinsic_case(&state, 221);
+        let tx = |nonce| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, 21_000, U256::ZERO);
+        let h0 = pool.add_evm_tx(tx(0)).unwrap();
+        assert_eq!(pool.evm_lane_of(&h0), Some(EvmLane::Small));
+
+        set_lane_row(&state, &k);
+        let err = pool.add_evm_tx(tx(1)).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::EvmLaneSwitchPending { sender } if sender == address_from_key(&k)),
+            "expected EvmLaneSwitchPending, got: {err}"
+        );
+        assert_eq!(pool.drain_evm(3_000_000, B256::ZERO), vec![tx(0)]);
+        let h1 = pool
+            .add_evm_tx(tx(1))
+            .expect("the small pool holds none of its txs any more");
+        assert_eq!(pool.evm_lane_of(&h1), Some(EvmLane::Big));
+    }
+
+    /// Item 7 step 2: the big lane caps tx gas at the committed big limit and tx bytes at
+    /// 768 KiB; the small lane keeps 256 KiB. Above 768 KiB no lane takes a tx. RED before: no
+    /// big lane (compile error).
+    #[test]
+    fn big_lane_admission_caps_gas_at_the_big_limit_and_bytes_at_768_kib() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let [big_a, big_b, small] = [222, 223, 224].map(|seed| intrinsic_case(&state, seed));
+        set_lane_row(&state, &big_a);
+        set_lane_row(&state, &big_b);
+
+        let gas_tx = |gas| create_eip1559_tx(&big_a, 0, 2_000_000_000, 1, gas, U256::ZERO);
+        let err = pool.add_evm_tx(gas_tx(10_000_001)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MempoolError::GasLimitExceeded {
+                    tx_gas: 10_000_001,
+                    block_gas: 10_000_000
+                }
+            ),
+            "expected GasLimitExceeded, got: {err}"
+        );
+        pool.add_evm_tx(gas_tx(10_000_000))
+            .expect("a big-lane tx at the big limit is admitted");
+
+        let kib600 = 600 * 1024;
+        let h = pool
+            .add_evm_tx(lane_call(&big_b, 0, 2_500_000, kib600))
+            .expect("a 600 KiB call is admitted in the big lane");
+        assert_eq!(pool.evm_lane_of(&h), Some(EvmLane::Big));
+        let small_600 = lane_call(&small, 0, 2_500_000, kib600);
+        let size = small_600.len();
+        let err = pool.add_evm_tx(small_600).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::TxTooLarge { size: s, max } if s == size && max == torus_types::MAX_EVM_BLOCK_TX_BYTES),
+            "expected TxTooLarge at 256 KiB, got: {err}"
+        );
+
+        let big_max = torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES;
+        for k in [&big_b, &small] {
+            let over = lane_call(k, 1, 3_200_000, big_max);
+            assert!(over.len() > big_max);
+            let err = pool.add_evm_tx(over).unwrap_err();
+            assert!(
+                matches!(err, MempoolError::TxTooLarge { max, .. } if max == big_max),
+                "expected TxTooLarge at 768 KiB, got: {err}"
+            );
+        }
+    }
+
+    /// Item 7 step 2: the big lane's fee floor is the committed big base fee; the small lane
+    /// keeps its own. RED before: no big lane (compile error).
+    #[test]
+    fn big_lane_fee_floor_is_the_big_base_fee() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        pool.set_big_lane(50, 10_000_000, 3_000_000_000);
+        let big = intrinsic_case(&state, 225);
+        set_lane_row(&state, &big);
+        let small = intrinsic_case(&state, 226);
+        let tx = |k| create_eip1559_tx(k, 0, 2_000_000_000, 1, 21_000, U256::ZERO);
+        let err = pool.add_evm_tx(tx(&big)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MempoolError::FeeTooLow {
+                    max_fee: 2_000_000_000,
+                    base_fee: 3_000_000_000
+                }
+            ),
+            "expected FeeTooLow, got: {err}"
+        );
+        pool.add_evm_tx(tx(&small))
+            .expect("the small lane's floor is 1 gwei");
+    }
+
+    /// Item 7 step 2 (decision 6): the node budget caps the small lane only, in admission and
+    /// drain. RED before: no big lane (compile error).
+    #[test]
+    fn node_budget_caps_only_the_small_lane() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(
+            state.clone(),
+            MempoolConfig {
+                evm_block_gas_budget: 1_000_000,
+                evm_sender_share_pct: 0,
+                ..MempoolConfig::default()
+            },
+        );
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let small = intrinsic_case(&state, 227);
+        let big = intrinsic_case(&state, 228);
+        set_lane_row(&state, &big);
+        let tx = |k, gas| create_eip1559_tx(k, 0, 2_000_000_000, 1, gas, U256::ZERO);
+        let err = pool.add_evm_tx(tx(&small, 1_500_000)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MempoolError::GasLimitExceeded {
+                    tx_gas: 1_500_000,
+                    block_gas: 1_000_000
+                }
+            ),
+            "expected GasLimitExceeded, got: {err}"
+        );
+        pool.add_evm_tx(tx(&big, 5_000_000))
+            .expect("the budget never caps the big lane");
+        assert_eq!(
+            pool.drain_evm_big(
+                10_000_000,
+                torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES,
+                1_000_000_000,
+                B256::ZERO
+            ),
+            vec![tx(&big, 5_000_000)]
+        );
+    }
+
+    /// Item 7 step 2: M back to 0 moves the big pool to the small lane, under its rules: a
+    /// 600 KiB tx does not fit the small lane and is dropped (logged); memory follows. RED
+    /// before: no big lane (compile error).
+    #[test]
+    fn big_blocks_switched_off_move_the_big_pool_to_the_small_lane() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let a = intrinsic_case(&state, 229);
+        let b = intrinsic_case(&state, 230);
+        set_lane_row(&state, &a);
+        set_lane_row(&state, &b);
+        let small_tx = create_eip1559_tx(&a, 0, 2_000_000_000, 1, 21_000, U256::ZERO);
+        let ha = pool.add_evm_tx(small_tx.clone()).unwrap();
+        let hb = pool
+            .add_evm_tx(lane_call(&b, 0, 2_500_000, 600 * 1024))
+            .unwrap();
+        assert_eq!(pool.evm_lane_of(&ha), Some(EvmLane::Big));
+        assert_eq!(pool.evm_lane_of(&hb), Some(EvmLane::Big));
+
+        pool.set_big_lane(0, 10_000_000, 1_000_000_000);
+        assert_eq!(pool.evm_lane_of(&ha), Some(EvmLane::Small));
+        assert_eq!(
+            pool.evm_lane_of(&hb),
+            None,
+            "600 KiB does not fit the small lane"
+        );
+        assert_eq!(pool.evm_pool_size(), 1);
+        assert_eq!(pool.memory_used(), small_tx.len());
+    }
+
+    /// Item 7 step 2: a lower big limit evicts the big-pool txs above it, as a lower small
+    /// limit does in the small pool. RED before: no big lane (compile error).
+    #[test]
+    fn lower_big_limit_evicts_big_pool_txs_above_it() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let k = intrinsic_case(&state, 231);
+        set_lane_row(&state, &k);
+        let tx = |nonce, gas| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, gas, U256::ZERO);
+        let heavy = pool.add_evm_tx(tx(0, 8_000_000)).unwrap();
+        let light = pool.add_evm_tx(tx(1, 21_000)).unwrap();
+
+        pool.set_big_lane(50, 5_000_000, 1_000_000_000);
+        assert_eq!(pool.evm_lane_of(&heavy), None, "the 8M tx is evicted");
+        assert_eq!(pool.evm_lane_of(&light), Some(EvmLane::Big));
+        assert_eq!(pool.evm_pool_size(), 1);
+        assert_eq!(pool.memory_used(), tx(1, 21_000).len());
+    }
+
+    /// Item 7 step 2: `pending_nonce` walks the small pool, then the big pool from where it
+    /// stopped (a sender holds one lane at a time; this covers a sender caught in both), and
+    /// the commit prune covers both pools. RED before: one pool (compile error).
+    #[test]
+    fn pending_nonce_spans_both_lanes() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let k = intrinsic_case(&state, 232);
+        let addr = address_from_key(&k);
+        let tx = |nonce| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, 21_000, U256::ZERO);
+        pool.add_evm_tx(tx(0)).unwrap();
+        for nonce in [1, 2] {
+            let entry = validate::validate_evm_tx(
+                &tx(nonce),
+                &state,
+                torus_types::eip712::TORUS_CHAIN_ID,
+                u64::MAX,
+                0,
+            )
+            .unwrap();
+            let bytes = entry.raw_rlp.len();
+            pool.evm
+                .write()
+                .unwrap()
+                .big
+                .insert(entry, 4096, 16, 10)
+                .unwrap();
+            pool.memory_used
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(pool.evm_pool_size(), 3);
+        assert_eq!(pool.pending_nonce(&addr), 3);
+
+        fund(&state, &addr, U256::from(10u64.pow(18)), 2);
+        pool.prune_committed_txs();
+        assert_eq!(
+            pool.evm_pool_size(),
+            1,
+            "nonces 0 and 1 pruned from both pools"
+        );
+        assert_eq!(pool.pending_nonce(&addr), 3);
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----
