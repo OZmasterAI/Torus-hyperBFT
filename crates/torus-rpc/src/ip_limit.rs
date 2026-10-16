@@ -65,6 +65,9 @@ pub const CHEAP_READS: &[&str] = &[
     "torus_getEpoch",
     "torus_getStateHash",
     "torus_getOrderBook",
+    // Item 7 step 2: one header read (as eth_gasPrice), one lane row.
+    "torus_bigBlockGasPrice",
+    "torus_usingBigBlocks",
 ];
 
 /// The client IP of the connection a request arrived on. Inserted into every
@@ -326,6 +329,8 @@ mod tests {
         assert_eq!(method_weight("eth_blockNumber", None), 2);
         assert_eq!(method_weight("torus_getBalances", Some(r#"["0x1"]"#)), 2);
         assert_eq!(method_weight("torus_getLiquidatorVault", None), 2);
+        assert_eq!(method_weight("torus_bigBlockGasPrice", None), 2);
+        assert_eq!(method_weight("torus_usingBigBlocks", Some(r#"["0x1"]"#)), 2);
         assert_eq!(method_weight("torus_getTradeHistory", None), 20);
         assert_eq!(method_weight("eth_getLogs", None), 20);
         assert_eq!(method_weight("torus_subscribe", None), 20);

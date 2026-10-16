@@ -253,6 +253,17 @@ pub trait TorusApi {
         limit: Option<u32>,
     ) -> RpcResult<Vec<RpcUserTrade>>;
 
+    // --- Item 7 step 2: EVM lanes ---
+    /// The big lane's base fee in the last committed header (HL `bigBlockGasPrice`);
+    /// `eth_gasPrice` is the small lane's.
+    #[method(name = "bigBlockGasPrice")]
+    async fn big_block_gas_price(&self) -> RpcResult<String>;
+
+    /// `address`'s stored lane choice (`EvmUserModify`): true = big blocks. Its txs use the big
+    /// lane only while big blocks are on (header `evm_big_block_interval` > 0).
+    #[method(name = "usingBigBlocks")]
+    async fn using_big_blocks(&self, address: String) -> RpcResult<bool>;
+
     // --- Phase 7B: Trade streaming subscription ---
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = serde_json::Value)]
     async fn subscribe(
@@ -2214,6 +2225,39 @@ impl TorusApiServer for RpcState {
 
             Ok(trades)
         })
+    }
+
+    // === Item 7 step 2: EVM lanes ===
+
+    /// Mirrors `eth_gasPrice` with the big lane's base fee.
+    async fn big_block_gas_price(&self) -> RpcResult<String> {
+        let latest = self.latest_height.load(Relaxed);
+        if latest > 0 {
+            if let Some((header, _, _)) =
+                crate::eth::get_header_with_hash(self, latest).map_err(ErrorObjectOwned::from)?
+            {
+                if header.big_base_fee_per_gas > 0 {
+                    return Ok(hex_u64(header.big_base_fee_per_gas));
+                }
+            }
+        }
+        Ok(hex_u64(torus_types::EVM_MIN_BASE_FEE))
+    }
+
+    /// Reads the lane row through the ingress view (the state admission reads lanes from): a
+    /// choice executed in a block not yet checkpointed is already reported.
+    async fn using_big_blocks(&self, address: String) -> RpcResult<bool> {
+        let addr = parse_address(&address).map_err(ErrorObjectOwned::from)?;
+        let row = self
+            .mempool
+            .ingress_state()
+            .get_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::evm_lane_key(&addr),
+            )
+            .map_err(RpcError::from)
+            .map_err(ErrorObjectOwned::from)?;
+        Ok(row.is_some())
     }
 
     // === Phase 7B: Trade streaming subscription ===
