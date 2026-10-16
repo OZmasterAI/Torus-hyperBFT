@@ -30,6 +30,12 @@ fake /proc (DRIVER_PROC). Pinned:
 9. memguard stops the cell unit when MemAvailable < 6 GB (a stubbed /proc/meminfo), and only then.
 10. the spec options samplers / host_checks (default on): sampler records, the fd stop, the sysctl record and
    check (spec values, else pinned at the run's preflight), the MemAvailable preflight; off = none of them.
+11. the warm-up gate (spec warmup.gate, default on): a warm-up or smoke cell that is not run-cell rc 0, validity
+   ACCEPT, agreement AGREE, liveness PASS and 0 panic/fail-stop lines stops the campaign before any measured cell
+   (s58 warmgate; before, a failed warm-up was a row and the measured cells ran anyway). gate false = a row only.
+12. campaign checks (spec checks {source, per_cell}): the source file is sourced at preflight (each function must
+   be defined, no driver function or name redefined), each function runs after every cell as `fn <label> <arm>`
+   with the driver's R / AENV / ...; non-zero = CHECK FAIL, the cell's row bad:check, the campaign stops.
 """
 
 import glob
@@ -1396,7 +1402,8 @@ exec @PGREP@ "$@"
 """
 # fake run-cell.sh WT LABEL MARKETS DUR RATE EXTRA_ENV: 3 stub "nodes" (sleep), the run.log lines the watchers read
 # (node pids, bench, stopping pid / stopped.), the devnet pids file, node logs, RocksDB LOGs, a fake /proc entry per
-# node (FAKE_PROC: exe = the staged node, environ = EXTRA_ENV), summary.json; FAKE_DIE=i: node i exits after 2 s.
+# node (FAKE_PROC: exe = the staged node, environ = EXTRA_ENV), summary.json (a passing warm-up gate; FAKE_SUMMARY = a
+# JSON object whose sections update it), exit FAKE_RC (0); FAKE_DIE=i: node i exits after 2 s.
 # TERM: stops the stubs as run-cell.sh's finish_fail does, exit 130. @GUARD@ = run-cell.sh's own output-dir guard
 # (run_cell_guard): the driver's records (sysctl.txt, the samplers) precede the harness in the cell dir (Codex P1)
 FAKE_HARNESS = r"""#!/bin/bash
@@ -1435,10 +1442,15 @@ log "bench: /fake/bench-throughput consensus --markets $markets"
 sleep "${FAKE_RUN_S:-3}" & W=$!
 wait "$W"; W=
 log "bench exited rc=0 after ${FAKE_RUN_S:-3}s"
-python3 -I -c 'import json, sys; json.dump({"cell": {"markets": int(sys.argv[2])}, "validity": {"verdict": "ACCEPT"}, "headline": {"agreement_verdict": "AGREE", "matched_s_avg": 1000.0}}, open(sys.argv[1], "w"))' "$OUT/summary.json" "$markets"
+python3 -I -c 'import json, os, sys
+s = {"cell": {"markets": int(sys.argv[2])}, "validity": {"verdict": "ACCEPT"}, "liveness": {"verdict": "PASS"},
+     "agreement": {"panic_or_failstop_lines": 0}, "headline": {"agreement_verdict": "AGREE", "matched_s_avg": 1000.0}}
+for k, v in json.loads(os.environ.get("FAKE_SUMMARY") or "{}").items():
+    s.setdefault(k, {}).update(v)
+json.dump(s, open(sys.argv[1], "w"))' "$OUT/summary.json" "$markets"
 for i in 0 1 2; do echo "2026-10-15T00:00:00.000Z  INFO torus_node: fake val$i" | gzip > "$OUT/val$i.log.gz"; done
 stopall
-exit 0
+exit "${FAKE_RC:-0}"
 """
 # fake sysctl -n NAME: the value in $FAKE_SYSCTL/NAME
 FAKE_SYSCTL = r"""#!/bin/bash
@@ -2110,6 +2122,363 @@ class WatcherSpecTest(Base):
         s = minimal_spec(self.tmp)
         s["arms"][1]["harness_env"] = {"OVERWRITE": ""}
         self.bad(s, "OVERWRITE")
+
+
+# ---------------------------------------------------------------- warm-up gate, campaign checks
+
+CHECKS_SH = r"""# campaign checks for the tests: each call appends "<fn> <label> <arm> ..." to $R/checks.log
+okchk() { echo "okchk $1 $2 R=$R aenv=${AENV[$2]:-none} cell=$([ -d "$R/$1" ] && echo yes)" >> "$R/checks.log"; echo "CHECK OK $1 okchk"; }
+alsochk() { echo "alsochk $1 $2" >> "$R/checks.log"; }
+badchk() { echo "badchk $1 $2" >> "$R/checks.log"; echo "CHECK FAIL $1: badchk says no"; return 1; }
+"""
+
+
+class WarmGateChecksSpecTest(Base):
+    """spec warmup.gate and checks: strict like every other key"""
+
+    def bad(self, spec, needle):
+        with self.assertRaises(self.gen.SpecError) as cm:
+            self.gen.validate(spec)
+        self.assertIn(needle, str(cm.exception))
+
+    def checks_file(self):
+        f = os.path.join(self.tmp, "checks.sh")
+        with open(f, "w") as fh:
+            fh.write(CHECKS_SH)
+        return f
+
+    def test_gate_default_on_and_false_accepted(self):
+        self.assertIs(self.gen.validate(minimal_spec(self.tmp))["warmup_gate"], True)
+        p = self.gen.validate(
+            minimal_spec(self.tmp, warmup={"arm": "A", "gate": False})
+        )
+        self.assertIs(p["warmup_gate"], False)
+        self.assertEqual(p["cells"][0][:2], ("w1", "A"))  # the warm-up still runs
+        p = self.gen.validate(minimal_spec(self.tmp, warmup={"gate": True}))
+        self.assertIs(p["warmup_gate"], True)
+
+    def test_gate_bad_values(self):
+        self.bad(minimal_spec(self.tmp, warmup={"gate": "no"}), "warmup.gate")
+        self.bad(minimal_spec(self.tmp, warmup={"gate": 0}), "warmup.gate")
+        self.bad(minimal_spec(self.tmp, warmup={"gates": False}), "gates")
+
+    def test_checks_ok(self):
+        f = self.checks_file()
+        p = self.gen.validate(
+            minimal_spec(
+                self.tmp, checks={"source": f, "per_cell": ["okchk", "alsochk"]}
+            )
+        )
+        self.assertEqual(p["checks"], {"source": f, "per_cell": ["okchk", "alsochk"]})
+        self.assertIsNone(self.gen.validate(minimal_spec(self.tmp))["checks"])
+
+    def test_checks_bad(self):
+        f = self.checks_file()
+
+        def ck(**c):
+            return minimal_spec(self.tmp, checks=c)
+
+        self.bad(ck(source="checks.sh", per_cell=["okchk"]), "checks.source")
+        self.bad(ck(source=f + " x", per_cell=["okchk"]), "checks.source")
+        self.bad(ck(per_cell=["okchk"]), "source")
+        self.bad(ck(source=f), "per_cell")
+        self.bad(ck(source=f, per_cell=[]), "per_cell")
+        self.bad(ck(source=f, per_cell="okchk"), "per_cell")
+        for name in ("OkChk", "1chk", "ok-chk", "ok chk", "", "ok;rm", 7):
+            self.bad(ck(source=f, per_cell=[name]), "checks.per_cell")
+        self.bad(ck(source=f, per_cell=["okchk", "okchk"]), "twice")
+        self.bad(ck(source=f, per_cell=["okchk"], post=[]), "post")
+        self.bad(minimal_spec(self.tmp, checks=["okchk"]), "checks")
+        # a driver function name: the driver would call itself (cell) or the check would replace it
+        for name in (
+            "cell",
+            "log",
+            "md5chk",
+            "cell_step",
+            "warmgatechk",
+            "load_checks",
+        ):
+            self.bad(ck(source=f, per_cell=[name]), name)
+
+    def test_cli_spec_error(self):
+        p = self.write_spec(
+            minimal_spec(self.tmp, checks={"source": "rel.sh", "per_cell": ["okchk"]})
+        )
+        r = subprocess.run(
+            [sys.executable, "-I", GEN, p, "-o", os.path.join(self.tmp, "x.sh")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("SPEC ERROR: checks.source", r.stderr)
+
+    def test_show_lists_gate_and_checks(self):
+        f = self.checks_file()
+        drv = self.generate(
+            self.write_spec(
+                minimal_spec(
+                    self.tmp, checks={"source": f, "per_cell": ["okchk", "alsochk"]}
+                )
+            )
+        )
+        plan = self.plan(drv)
+        self.assertIn("WARMGATE on w1 s0", plan)
+        self.assertIn("CHECKS %s okchk alsochk" % f, plan)
+        self.assertIn("WARMGATE on w1 s0", self.plan(drv, smoke=True))
+        drv = self.generate(
+            self.write_spec(minimal_spec(self.tmp, warmup={"gate": False}), "s2.json"),
+            "d2.sh",
+        )
+        plan = self.plan(drv)
+        self.assertIn("WARMGATE off", plan)
+        self.assertIn("CHECKS none", plan)
+        drv = self.generate(
+            self.write_spec(minimal_spec(self.tmp, warmup=False), "s3.json"), "d3.sh"
+        )
+        self.assertIn("WARMGATE on s0", self.plan(drv))
+
+    def test_preflight_loads_checks(self):
+        f = self.checks_file()
+        drv = self.generate(
+            self.write_spec(
+                minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]})
+            )
+        )
+        r = subprocess.run(
+            ["bash", drv, "dry"], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("checks=okchk", r.stdout)
+        self.assertIn("warmgate=w1,s0", r.stdout)
+
+    def dry_fail(self, spec, needle):
+        drv = self.generate(self.write_spec(spec, "pf.json"), "pf.sh")
+        r = subprocess.run(
+            ["bash", drv, "dry"], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("PREFLIGHT FAIL", r.stdout)
+        self.assertIn(needle, r.stdout)
+
+    def test_preflight_missing_function(self):
+        f = self.checks_file()
+        self.dry_fail(
+            minimal_spec(
+                self.tmp, checks={"source": f, "per_cell": ["okchk", "nochk"]}
+            ),
+            "nochk",
+        )
+
+    def test_preflight_missing_or_failing_source(self):
+        none = os.path.join(self.tmp, "none.sh")
+        self.dry_fail(
+            minimal_spec(self.tmp, checks={"source": none, "per_cell": ["okchk"]}),
+            "none.sh",
+        )
+        f = os.path.join(self.tmp, "fails.sh")
+        with open(f, "w") as fh:
+            fh.write("okchk() { :; }\nfalse\n")
+        self.dry_fail(
+            minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]}),
+            "cannot source",
+        )
+
+    def test_preflight_source_must_not_redefine_driver_state(self):
+        f = os.path.join(self.tmp, "clobber.sh")
+        for body in ("log() { :; }\n", "RUN=/tmp/elsewhere\n", "AENV[A]=X=1\n"):
+            with open(f, "w") as fh:
+                fh.write("okchk() { :; }\n" + body)
+            self.dry_fail(
+                minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]}),
+                "redefines",
+            )
+
+
+class WarmGateRunTest(FakeHostBase):
+    """the generated campaign loop (run_cells) for real against the fakes (as CellRunTest): the warm-up gate and
+    the campaign checks"""
+
+    W, M = "w1:A:120:none:", "r1-A:A:120:none:"
+
+    def run_cells(self, spec, cells, smoke=False, **env):
+        drv = self.generate(self.write_spec(spec, "gate.json"), "gate.sh")
+        os.makedirs(spec["run_dir"], exist_ok=True)
+        script = "\n".join(
+            [
+                "DRIVER_LIB_ONLY=1; source %s || exit 99" % shlex.quote(drv),
+                "HARNESS=%s" % shlex.quote(os.path.join(self.bin, "run-cell.sh")),
+                "quiet() { return 0; }",
+                "apply_smoke" if smoke else "",
+                "mkdir -p $RUN",
+                "CELLS=(%s)" % " ".join(shlex.quote(c) for c in cells),
+                'source "$TOOLS/cell-step.sh" || exit 98',
+                "export CELL_STEP_LOG=$RUN/campaign.log",
+                "load_checks",
+                "sysctl_pin",
+                'run_cells; echo "RUN_CELLS_RC=$?"',
+            ]
+        )
+        e = dict(os.environ)
+        e.update(
+            self.env(
+                DRIVER_DETACH=os.path.join(self.bin, "detach.sh"),
+                FAKE_PROC=self.proc,
+                FAKE_RUN_S="4",
+            )
+        )
+        e.update(env)
+        out = os.path.join(self.tmp, "gate.out")
+        with open(out, "w") as fo:
+            subprocess.run(
+                ["bash", "-c", script],
+                stdout=fo,
+                stderr=subprocess.STDOUT,
+                env=e,
+                timeout=300,
+            )
+        return open(out).read()
+
+    def rows(self, spec, smoke=False):
+        f = os.path.join(spec["run_dir"], "smoke" if smoke else "", "cells.tsv")
+        return [ln.split("\t") for ln in open(f).read().splitlines()[1:]]
+
+    def started(self, spec, label):
+        return os.path.exists(os.path.join(spec["results_root"], label))
+
+    def test_failing_warmup_stops_before_measured_cells(self):
+        spec = minimal_spec(self.tmp)
+        out = self.run_cells(
+            spec, [self.W, self.M], FAKE_SUMMARY='{"validity": {"verdict": "REJECT"}}'
+        )
+        self.assertIn("RUN_CELLS_RC=1", out, out)
+        self.assertIn(
+            "CHECK FAIL test-camp-10m-w1: warm-up gate: validity=REJECT agreement=AGREE liveness=PASS",
+            out,
+        )
+        self.assertIn("CAMPAIGN STOP at w1", out)
+        self.assertFalse(self.started(spec, "test-camp-10m-r1-A"), out)
+        # cell_step adds its own reason (verdict-reject) to the driver's check
+        self.assertEqual(
+            [(r[0], r[7]) for r in self.rows(spec)],
+            [("test-camp-10m-w1", "bad:verdict-reject,check")],
+        )
+
+    def test_each_gate_condition(self):
+        cases = [
+            ('{"liveness": {"verdict": "FAIL"}}', "0", "liveness=FAIL"),
+            (
+                '{"headline": {"agreement_verdict": "DISAGREE"}}',
+                "0",
+                "agreement=DISAGREE",
+            ),
+            (
+                '{"agreement": {"panic_or_failstop_lines": 2}}',
+                "0",
+                "panic_or_failstop_lines=2",
+            ),
+            ("{}", "3", "warm-up gate: run-cell rc=3"),
+        ]
+        for i, (summ, rc, needle) in enumerate(cases):
+            spec = minimal_spec(
+                self.tmp,
+                campaign="g%d" % i,
+                run_dir=os.path.join(self.tmp, "res", "g%d" % i),
+                label_prefix="g%d" % i,
+            )
+            out = self.run_cells(spec, [self.W, self.M], FAKE_SUMMARY=summ, FAKE_RC=rc)
+            self.assertIn("RUN_CELLS_RC=1", out, out)
+            self.assertIn("CHECK FAIL g%d-w1: " % i, out)
+            self.assertIn(needle, out)
+            self.assertFalse(self.started(spec, "g%d-r1-A" % i), out)
+
+    def test_gate_false_lets_the_campaign_go_on(self):
+        spec = minimal_spec(self.tmp, warmup={"gate": False})
+        out = self.run_cells(
+            spec, [self.W, self.M], FAKE_SUMMARY='{"validity": {"verdict": "REJECT"}}'
+        )
+        self.assertIn("RUN_CELLS_RC=0", out, out)
+        self.assertNotIn("warm-up gate", out)
+        self.assertTrue(self.started(spec, "test-camp-10m-r1-A"), out)
+        self.assertEqual(
+            [r[0] for r in self.rows(spec)], ["test-camp-10m-w1", "test-camp-10m-r1-A"]
+        )
+
+    def test_passing_gate_and_checks_on_every_cell(self):
+        f = os.path.join(self.tmp, "checks.sh")
+        with open(f, "w") as fh:
+            fh.write(CHECKS_SH)
+        spec = minimal_spec(
+            self.tmp, checks={"source": f, "per_cell": ["okchk", "alsochk"]}
+        )
+        out = self.run_cells(spec, [self.W, "r1-M1:M1:120:none:"])
+        self.assertIn("RUN_CELLS_RC=0", out, out)
+        self.assertIn(
+            "CHECK OK test-camp-10m-w1 warm-up gate: validity=ACCEPT agreement=AGREE liveness=PASS"
+            " panic_or_failstop_lines=0",
+            out,
+        )
+        # measured cells are not gated
+        self.assertNotIn("CHECK OK test-camp-10m-r1-M1 warm-up gate", out)
+        R = spec["results_root"]
+        self.assertEqual(
+            open(os.path.join(R, "checks.log")).read().splitlines(),
+            [
+                "okchk test-camp-10m-w1 A R=%s aenv=none cell=yes" % R,
+                "alsochk test-camp-10m-w1 A",
+                "okchk test-camp-10m-r1-M1 M1 R=%s aenv=MALLOC_CONF=dirty_decay_ms:1000"
+                " TORUS_X_KNOB=7 cell=yes" % R,
+                "alsochk test-camp-10m-r1-M1 M1",
+            ],
+        )
+        self.assertEqual([r[7] for r in self.rows(spec)], ["ok", "ok"])
+
+    def test_failing_check_is_a_check_fail(self):
+        f = os.path.join(self.tmp, "checks.sh")
+        with open(f, "w") as fh:
+            fh.write(CHECKS_SH)
+        spec = minimal_spec(
+            self.tmp,
+            warmup=False,
+            checks={"source": f, "per_cell": ["badchk", "okchk"]},
+        )
+        out = self.run_cells(spec, [self.M, "r1-M1:M1:120:none:"])
+        self.assertIn("RUN_CELLS_RC=1", out, out)
+        self.assertIn("CHECK FAIL test-camp-10m-r1-A: badchk says no", out)
+        self.assertIn(
+            "CHECK FAIL test-camp-10m-r1-A: campaign check badchk returned 1 (arm A)",
+            out,
+        )
+        self.assertIn("CAMPAIGN STOP at r1-A", out)
+        # every check runs (one cell shows every failure), as the standard checks
+        self.assertIn(
+            "okchk test-camp-10m-r1-A A",
+            open(os.path.join(spec["results_root"], "checks.log")).read(),
+        )
+        self.assertEqual(
+            [(r[0], r[7]) for r in self.rows(spec)],
+            [("test-camp-10m-r1-A", "bad:check")],
+        )
+        self.assertFalse(self.started(spec, "test-camp-10m-r1-M1"), out)
+
+    def test_smoke_cell_is_gated(self):
+        spec = minimal_spec(self.tmp)
+        out = self.run_cells(
+            spec,
+            ["s0:A:60:none:"],
+            smoke=True,
+            FAKE_SUMMARY='{"validity": {"verdict": "REJECT"}}',
+        )
+        self.assertIn("RUN_CELLS_RC=1", out, out)
+        self.assertIn(
+            "CHECK FAIL test-camp-10m-smoke-s0: warm-up gate: validity=REJECT", out
+        )
+
+    def test_death_in_gated_warmup_stops(self):
+        spec = minimal_spec(self.tmp)
+        out = self.run_cells(spec, [self.W, self.M], FAKE_DIE="1", FAKE_RUN_S="120")
+        self.assertIn("RUN_CELLS_RC=1", out, out)
+        self.assertIn("CHECK FAIL test-camp-10m-w1: warm-up gate: node death", out)
+        self.assertFalse(self.started(spec, "test-camp-10m-r1-A"), out)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,10 @@
 # run preflight MemAvailable >= MIN_MEM_AVAIL_KB; the writeback sysctls recorded at each cell's start and end
 # (sysctl.txt) and held to SYSCTL_WANT (the spec's values; the dirty limits it does not give are pinned at the run's
 # preflight); heavy analysis processes (perf, flamegraph, jeprof, ...) keep quiet() waiting.
+# Warm-up gate (spec warmup.gate, default on): a GATE_TAGS cell (the warm-up, the smoke cell) must end run-cell rc 0,
+# validity ACCEPT, agreement AGREE, liveness PASS, 0 panic/fail-stop lines (warmgatechk), else CHECK FAIL and the
+# campaign stops before any measured cell. Campaign checks (spec checks): CHECKS_SOURCE is sourced at preflight
+# (load_checks), each CHECK_FNS function runs after every cell as FN LABEL ARM; non-zero = CHECK FAIL (bad:check, stop).
 # Test-only overrides: DRIVER_PROC (a fake /proc: node exe/environ, meminfo), DRIVER_DETACH (a fake detach.sh).
 set -u
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -45,7 +49,7 @@ DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASE
  ABIN AENV AXE AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL
  ANALYSIS_CMD ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT SELF PROC HARNESS DETACH UNIT_NAME
  MIN_FREE_MB QUIET_WAIT_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
- TAGS STARTED_LABEL CELL_FAIL DRIVER_VARS"
+ TAGS STARTED_LABEL CELL_FAIL GATE_TAGS CHECKS_SOURCE CHECK_FNS DRIVER_VARS"
 # run-cell.sh generates each cell's genesis from ITS OWN repo root ($TOOLS/../..), not from the harness worktree
 # it is handed (which only launches the nodes): a frozen tools copy must carry these, equal to the harness's
 GENESIS_INPUTS="devnet/wsl/gen-3val-genesis.sh devnet/wsl/bench-validator-keys.json devnet/genesis.json
@@ -83,6 +87,8 @@ show_plan() { # [smoke]: the plan as tables (make-driver tests compare these wit
     echo "PATH TOOLS $TOOLS"; echo "PATH WT_H $WT_H"; echo "PATH DEVNET $DEVNET"; echo "PATH BASELINE $BASELINE"
     echo "WATCH node-death memguard hardscan"
     if [ "$SAMPLERS" = 1 ]; then echo "SAMPLERS on du mem metrics fd vmstat rocksdb-log fd_stop=$FD_STOP"; else echo "SAMPLERS off"; fi
+    if [ -n "$GATE_TAGS" ]; then echo "WARMGATE on $GATE_TAGS"; else echo "WARMGATE off"; fi
+    if [ -n "$CHECKS_SOURCE" ]; then echo "CHECKS $CHECKS_SOURCE $CHECK_FNS"; else echo "CHECKS none"; fi
     if [ "$HOST_CHECKS" = 1 ]; then
         echo "HOSTCHECK on min_mem_avail_kb=$MIN_MEM_AVAIL_KB"
         for k in $(sysctl_names); do echo "SYSCTL $k ${SYSCTL_WANT[$k]:-pinned}"; done
@@ -451,6 +457,43 @@ expectchk() { # o arm: the spec's expectations for every arm (EXP_ARM '*') and f
     return $rc
 }
 
+gated() { # tag: 0 = the cell is a warm-up gate cell (GATE_TAGS; its rerun too)
+    local g
+    for g in $GATE_TAGS; do [ "$1" = "$g" ] || [ "$1" = "$g-rerun" ] && return 0; done
+    return 1
+}
+
+warmgatechk() { # label rc: the warm-up gate: run-cell rc 0, summary.json validity ACCEPT, agreement AGREE, liveness
+    # PASS, agreement.panic_or_failstop_lines 0. rc 1 = CHECK FAIL (the campaign stops)
+    local label=$1 rc=$2 r
+    [ "$rc" = 0 ] || { echo "CHECK FAIL $label: warm-up gate: run-cell rc=$rc"; return 1; }
+    r=$(python3 -I -c '
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as ex:
+    print("cannot read %s: %s" % (sys.argv[1], ex)); sys.exit(1)
+a, h = s.get("agreement") or {}, s.get("headline") or {}
+v = (s.get("validity") or {}).get("verdict")
+lv = (s.get("liveness") or {}).get("verdict")
+ag = h.get("agreement_verdict")
+pf = a.get("panic_or_failstop_lines")
+print("validity=%s agreement=%s liveness=%s panic_or_failstop_lines=%s consensus_timeouts=%s matched/s=%s" % (v, ag, lv, pf, h.get("consensus_timeouts"), h.get("matched_s_avg")))
+sys.exit(0 if (v == "ACCEPT" and ag == "AGREE" and lv == "PASS" and pf == 0) else 1)
+' "$R/$label/summary.json" 2>&1) || { echo "CHECK FAIL $label: warm-up gate: $r"; return 1; }
+    echo "CHECK OK $label warm-up gate: $r"
+}
+
+campaignchecks() { # label arm: each spec checks.per_cell function (CHECK_FNS) as FN LABEL ARM, in a subshell (it sees
+    # every driver name: R, AENV, AXE, ...; it cannot change them); all run, so one cell shows every failure
+    local fn r rc=0
+    for fn in $CHECK_FNS; do
+        ( "$fn" "$1" "$2" ); r=$?
+        [ "$r" = 0 ] || { echo "CHECK FAIL $1: campaign check $fn returned $r (arm $2)"; rc=1; }
+    done
+    return $rc
+}
+
 cellchecks() { # o arm: every standard check (all run, so one cell shows every failure)
     local rc=0
     md5chk "$1" "$2" || rc=1
@@ -515,6 +558,11 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     # a mid-cell death (watch_nodes): CELL FAIL, no checks; the step flags the row death and queues a rerun
     if [ -e "$R/$label/node-death.txt" ]; then
         stopbg "$EP" "$FP"
+        if gated "$tg"; then   # a warm-up gate cell that lost a node: the campaign stops
+            echo "CHECK FAIL $label: warm-up gate: node death ($(head -1 "$R/$label/node-death.txt"))"
+            sleep 5; [ -z "$(pgrep -x torus-node)" ] || log "WARN: torus-node left running after $label"
+            CELL_FAIL=check; return 1
+        fi
         log "CELL FAIL $label rc=$rc death: $(cat "$R/$label/node-death.txt") -> continuing"
         sleep 5; [ -z "$(pgrep -x torus-node)" ] || { log "ABORT: torus-node left running after $label"; CELL_FAIL=abort-node-left; return 1; }
         return 0
@@ -530,8 +578,12 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
         echo "[$label] $(fdsum "$label")" || true; fdsum "$label" > /dev/null || fdok=1
     fi
     cellchecks "$R/$label" "$arm" || crc=1
+    campaignchecks "$label" "$arm" || crc=1
     if [ "$HOST_CHECKS" = 1 ]; then
         sysctlchk "$label" end || crc=1
+    fi
+    if gated "$tg"; then
+        warmgatechk "$label" "$rc" || crc=1
     fi
     [ "$crc" = 0 ] || { CELL_FAIL=check; return 1; }
     hardscan "$label"
@@ -560,8 +612,31 @@ run_spec() { # SPEC [SUFFIX]: one cell, then its write-up step (cells.tsv row, C
     return $crc
 }
 
+run_cells() { # the campaign: each of CELLS through run_spec in order; 1 = stopped (a cell said stop)
+    local c
+    for c in "${CELLS[@]}"; do
+        run_spec "$c" || { log "CAMPAIGN STOP at ${c%%:*} (queued reruns not run: $RUN/rerun-queue.tsv)"; return 1; }
+    done
+}
+
 # ---- preflight ----
 PF() { echo "PREFLIGHT FAIL: $*"; exit 1; }
+
+load_checks() { # the spec checks: source CHECKS_SOURCE (bash sources it inside this function: a top-level declare in
+    # it needs -g), then every CHECK_FNS function must be defined, and no driver function or name may have changed
+    local fns before after f
+    [ -n "$CHECKS_SOURCE" ] || return 0
+    [ -f "$CHECKS_SOURCE" ] && [ -r "$CHECKS_SOURCE" ] || PF "checks source $CHECKS_SOURCE missing or unreadable (spec checks.source)"
+    fns=$(compgen -A function)
+    before=$( { for f in $fns; do declare -f "$f"; done; declare -p ${DRIVER_VARS//$'\n'/ } 2>/dev/null; } | md5sum)
+    # shellcheck disable=SC1090
+    source "$CHECKS_SOURCE" || PF "cannot source $CHECKS_SOURCE (spec checks.source): it returned $?"
+    after=$( { for f in $fns; do declare -f "$f"; done; declare -p ${DRIVER_VARS//$'\n'/ } 2>/dev/null; } | md5sum)
+    [ "$before" = "$after" ] || PF "$CHECKS_SOURCE redefines a driver function or driver variable (DRIVER_VARS); rename it there"
+    for f in $CHECK_FNS; do
+        declare -F "$f" > /dev/null || PF "check function $f is not defined by $CHECKS_SOURCE (spec checks.per_cell)"
+    done
+}
 
 wrapper_target() { # FILE: the absolute path a wrapper script execs (its last `exec PATH` line); fails on a binary
     local t
@@ -616,6 +691,7 @@ preflight_static() { # paths, tools, genesis inputs, staged md5s (a wrapper's md
         fi
     done
     for f in $ANALYSIS_CMD; do case $f in */*.py|*/*.sh) [ -f "$f" ] || PF "analysis script $f missing";; esac; done
+    load_checks
     return 0
 }
 
@@ -639,9 +715,9 @@ preflight_host() { # run mode only: inside a bench unit, nothing else running, n
     fi
 }
 
-host_str() { # the PREFLIGHT OK line's samplers / host checks part
-    local k
-    printf 'samplers=%s host_checks=%s' "$SAMPLERS" "$HOST_CHECKS"
+host_str() { # the PREFLIGHT OK line's warm-up gate / campaign checks / samplers / host checks part
+    local k g=${GATE_TAGS// /,} c=${CHECK_FNS// /,}
+    printf 'warmgate=%s checks=%s samplers=%s host_checks=%s' "${g:-off}" "${c:-none}" "$SAMPLERS" "$HOST_CHECKS"
     [ "$HOST_CHECKS" = 1 ] || return 0
     printf ' min_mem_avail_kb=%s' "$MIN_MEM_AVAIL_KB"
     for k in $(sysctl_names); do printf ' %s=%s' "$k" "${SYSCTL_WANT[$k]:-pinned}"; done
@@ -698,9 +774,7 @@ export CELL_STEP_TIMEOUT=${CELL_STEP_TIMEOUT:-900} CELL_STEP_ANALYSIS_TIMEOUT=${
 # shellcheck source=../cell-step.sh
 source "$TOOLS/cell-step.sh" || PF "cannot source $TOOLS/cell-step.sh"
 log "PREFLIGHT OK CAMPAIGN=$UNIT_NAME driver=$SELF RUN=$RUN P=$P genesis_root=$GENESIS_ROOT arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE $(host_str) cells=${#CELLS[@]}: $TAGS"
-for c in "${CELLS[@]}"; do
-    run_spec "$c" || { log "CAMPAIGN STOP at ${c%%:*} (queued reruns not run: $RUN/rerun-queue.tsv)"; exit 1; }
-done
+run_cells || exit 1
 log "MAIN CELLS END"
 if [ "${SMOKE:-0}" != 1 ]; then
     cell_step_rerun_pass "$RUN" run_spec || { log "CAMPAIGN STOP in the rerun pass"; exit 1; }

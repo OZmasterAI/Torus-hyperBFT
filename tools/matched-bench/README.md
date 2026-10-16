@@ -714,6 +714,34 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   and end (`sysctl.txt`) and must still have those values: a change before the start aborts
   (`bad:abort-sysctl`), a change before the end fails the checks (`bad:check`). `quiet()` also
   waits for heavy analysis processes (perf, inferno, flamegraph, jeprof, addr2line).
+- **Warm-up gate** (spec `warmup.gate`, default `true`): the warm-up cell and the smoke cell
+  (`DRIVER show`: `WARMGATE on w1 s0`) must end with run-cell rc 0 and a summary.json with
+  `validity.verdict` ACCEPT, `headline.agreement_verdict` AGREE, `liveness.verdict` PASS and
+  `agreement.panic_or_failstop_lines` 0, and no node may die in it; then `CHECK OK <label>
+  warm-up gate: validity=... agreement=... liveness=... panic_or_failstop_lines=...`. Else
+  `CHECK FAIL <label>: warm-up gate: ...`, its row is `bad:...check`, and the campaign stops
+  (`CAMPAIGN STOP at w1`, exit 1) before any measured cell. `"warmup": {..., "gate": false}`
+  turns it off for both (`WARMGATE off`): a failed warm-up is then only a bad row and the
+  measured cells run. `"warmup": false` keeps the gate on the smoke cell.
+- **Campaign checks** (spec `checks`, optional): hard checks that do not fit an `expect`
+  grep (metric deltas, took-effect lines per arm, ...), as bash functions in a file you
+  write: `"checks": {"source": "/abs/path/checks.sh", "per_cell": ["flagchk", "fanchk"]}`
+  (function names `^[a-z_][a-z0-9_]*$`, not a driver function; else SPEC ERROR). Preflight
+  (`dry`, `launch`, `run`) sources the file (missing, unreadable or a non-zero return =
+  `PREFLIGHT FAIL`), requires each function defined (`declare -F`), and fails when the file
+  redefines a driver function or a driver variable (`DRIVER_VARS`). The file is sourced
+  inside a function: a top-level `declare -A` in it needs `-g`. After every cell (warm-up,
+  smoke, measured; after the standard checks, before the gate) each function is called as
+  `fn <label> <arm>` (label = `<label_prefix>-<tag>`, the cell dir is `$R/<label>`), in a
+  subshell, with the driver's variables available: `R` (results root), `AENV[arm]` (the
+  arm's own node env, `K=V K=V`), `AXE[arm]` (node_env + arm env, run-cell.sh EXTRA_ENV),
+  `AHENV[arm]` (harness env), `ABIN[arm]` / `BMD5[bin]`, `RUN`, `P`, `MARKETS`, `RATE`,
+  `NODES`, `BASELINE`. It prints its own `CHECK OK` / `CHECK FAIL` lines; a non-zero return
+  adds `CHECK FAIL <label>: campaign check <fn> returned <rc> (arm <arm>)` and is a hard
+  failure like a failing `expect`: every check still runs, the row is `bad:check`, the
+  campaign stops. `DRIVER show` lists them (`CHECKS <source> <fn>...`), `PREFLIGHT OK`
+  carries `checks=<fn>,...`. Keep the file beside the frozen tools so it is part of the
+  campaign record.
 - **cells.tsv rows, CELL-FLAG lines, rerun queue**: `run_spec` + `cell-step.sh` as in the
   template (below). Wrapper arms pass `--no-summary-md5` to the step (run-cell.sh hashes
   the staged file, which is the wrapper).
@@ -735,12 +763,12 @@ frozen tools copy: run-cell.sh, cell-step.sh, cell_step.py, campaign/detach.sh; 
 list. Optional: `comment`, `results_root` (`~/bench-results-matched`), `devnet_dir`
 (`~/torus-wsl-devnet`), `rate` (76000), `order` (`"rotate"` default: replicate r starts at
 arm r-1, as Job 4; `"fixed"`; or a list `["r1:A", "r1:B", ...]`), `warmup` (`{arm, tag,
-duration_s}`, default baseline / `w1` / `duration_s`; `false` = none), `smoke` (`{arm,
+duration_s, gate}`, default baseline / `w1` / `duration_s` / `true`; `false` = none), `smoke` (`{arm,
 duration_s}`, default baseline / 60), `node_env` (node env for every arm), `harness_env`
 (run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`),
 `absent_env` (names that must be unset unless an arm sets them), `expect` (every arm),
 `analysis` (`{cmd, metric}` = `CELL_STEP_ANALYSIS_CMD` / `_METRIC`), `max_load` (2),
-`samplers` (`true` default, or `false`), `host_checks` (`true` default, `false`, or
+`checks` (`{source, per_cell}`, campaign checks, below), `samplers` (`true` default, or `false`), `host_checks` (`true` default, `false`, or
 `{min_mem_avail_gb: 40, sysctl: {"vm.dirty_bytes": "268435456", ...}}`; unknown keys are a
 SPEC ERROR too). The runtime watchers have no switch.
 `binaries.<key>`: `stage_dir` (holds `release/torus-node` [+ `release/bench-throughput`]),
@@ -768,6 +796,31 @@ max}`: `grep -E -c regex <cell>/<file>` must be in `[min, max]`. Example:
 Full example: `campaign/driver-spec.example.json`; the Job 4 golden specs:
 `testdata/make-driver/p4j4-{h,d}.json`.
 
+**Against a frozen or pilot harness.** The generator does not need the current tools: point
+`harness_worktree` at the pilot worktree (it launches the nodes) and `tools_dir` at the
+frozen copy's `tools/matched-bench` (its run-cell.sh, cell-step.sh, cell_step.py and
+campaign/detach.sh run the cells; its root `tools_dir/../..` must carry the genesis inputs,
+next paragraph). The campaign-specific hard checks of a hand-written pilot driver go into
+`checks`, the warm-up gate is on by default:
+
+```json
+{"campaign": "ozarchy-s58x", "run_dir": "/home/oz/bench-results-matched/ozarchy-s58x-run",
+ "label_prefix": "ozarchy-s58x-300m",
+ "harness_worktree": "/home/oz/projects/wt/s58-pilot-857b9770",
+ "tools_dir": "/home/oz/bench-results-matched/ozarchy-s58x-tools/tools/matched-bench",
+ "binaries": {"b": {"stage_dir": "/home/oz/bench-results-matched/ozarchy-s58x-stage/b-run",
+   "node_md5": "5480e116...", "bench_md5": "..."}},
+ "markets": 300, "duration_s": 120, "replicates": 3, "baseline": "C",
+ "warmup": {"arm": "C", "gate": true},
+ "checks": {"source": "/home/oz/bench-results-matched/ozarchy-s58x-tools/s58-checks.sh",
+            "per_cell": ["s58chk", "rlchk"]},
+ "arms": [{"label": "C"}, {"label": "ALLfan", "env": {"TORUS_CONSENSUS_DIRECT_FAN": "1"}}]}
+```
+
+Then `DRIVER dry` (preflight: the frozen tools, the genesis inputs equal to the pilot
+worktree's, the staged md5s, the checks file and its functions) and `DRIVER show` (the
+`WARMGATE` and `CHECKS` lines) before `DRIVER launch smoke`.
+
 **Genesis inputs beside the tools copy.** run-cell.sh generates each cell's genesis from
 ITS OWN repo root (`MAINREPO` = `<dir of run-cell.sh>/../..`), not from the harness worktree
 it is handed (that one only launches the nodes). In a standalone tools copy without them
@@ -794,8 +847,8 @@ which shape did not fit): crash / restart cells (`CRASH_KILL_AT_S`, `KILL_*`: a 
 ERROR); per-arm market count, duration or rate; samplers beyond the Job 4 driver's
 in-driver ones above (perf off-CPU windows, the soak sidecar `soak-sampler.py`, the cpu, io
 and task samplers: scripts outside tools/matched-bench); campaign-specific hard checks
-other than `expect` greps (checkpoint deltas, codec/LSM, data dir filesystem type, release
-timing); more than 3 nodes; several campaigns in one unit (pilot + grid: generate one
+that need more than `fn <label> <arm>` after a cell (checks that run during a cell or
+compare cells); more than 3 nodes; several campaigns in one unit (pilot + grid: generate one
 driver each and launch them in turn); post-campaign steps (off-CPU processing).
 
 Tests: `python3 tools/matched-bench/test_make_driver.py` (golden: the Job 4 horizon and
@@ -805,7 +858,11 @@ and sampler functions verbatim, the cell() wiring in order, and their sysctl, Me
 and fd-stop values; env and md5 checks on fixture cells and a fake /proc; the generated
 cell() run for real against a fake detach.sh, systemctl and run-cell.sh: a stub node that
 exits gives node-death.txt and a `bad:...death` row, memguard stops the unit on a stubbed
-meminfo, samplers and host checks off leave no records; bad specs).
+meminfo, samplers and host checks off leave no records; the campaign loop against the same
+fakes: a failing warm-up gate (each condition, a node death, the smoke cell) stops before the
+measured cells, `gate: false` goes on, campaign checks run on every cell with label, arm, `R`
+and `AENV`, a failing one is `bad:check` + stop, a missing function or source fails preflight;
+bad specs).
 
 **Why launchers copied old drivers instead of the template** (s1156): the template is the
 p3gate driver, and its CAMPAIGN-SPECIFIC blocks are most of the file (config, samplers,
