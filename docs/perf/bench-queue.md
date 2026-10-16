@@ -39,7 +39,7 @@ it. 18c says when it is on main. Effects on this queue:
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
    cell and its checks (Q5 below). Gates every later campaign. Build M after the s58 bundle is on main.
-1b. **Q9. Data-dir growth on main** (soak, right after setup, before campaign A; see Items, Q9).
+1b. **Q9. Data-dir growth: main vs main + RH4** (soak, after setup, once 18c's RH4 branch is ready; see Items, Q9).
 2. **Q8. Item 6 Phase 5 step 0 profile** (campaign P, profile only, no A/B). Sent to archy directly (s125); it decides
    whether and how much of Phase 5 gets built.
 3. **Q5. Native vs native + EVM transfers** (campaign C): 2 arms on M.
@@ -142,14 +142,25 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   - Pass, both shapes: paired B/A matched/s 95% CI includes 1.0 or lies above it, and save_books rises by at most
     0.3 ms per native block. A fail blocks the step 2 merge (follow-up: B16's `saved_bbo` hit rate).
   - Doc target: `docs/perf/item7-step2-native-ab.md`.
-- **Q9. Data-dir growth on main** (s126, from s58safe, section 79): in archy's 60 min soak each node's data dir grew
-  about 0.19-0.2 GB/min (about 48 MB per 15 s checkpoint), also in a no-load phase with empty blocks; open files
-  rose from 351 to 667. Cause inferred (checkpoint data not reclaimed), not confirmed; 18c investigates the code.
-  Confirm on main (with the s58 bundle): one 60 min soak, 300 markets, hsdb-300m shape (Classic, 15 s checkpoints),
-  with a no-load phase of at least 10 min; sample per node every 60 s: data-dir size (`du -sb`), RocksDB SST count
-  and size per CF, open fds of the node (`ls /proc/PID/fd | wc -l`), and the checkpoint metrics. Margin top-ups or a
-  lower load (see the s58 bundle notes). Report the growth rate with and without load and what grows (which
-  CF/dir). The same soak re-runs later to verify 18c's fix.
+- **Q9. Data-dir growth: main vs main + RH4** (s126, from s58safe, section 79): in archy's 60 min soak each node's data
+  dir grew about 0.19-0.2 GB/min; open files 351 -> 667. 18c's code read (not measured): committed action bodies are
+  kept twice and never deleted: DA bodies in `<data_dir>/consensus-db` (`cf_native_pending`, no production delete) and
+  full block bodies in the state DB (pruned only with `--retention-blocks`, which the harness doesn't pass). Your
+  "no-load" phase still committed blocks full of margin-rejected orders (rejects are counted inside execution), so it
+  was not idle. Open files follow the SST count (`max_open_files` unset). 18c ports the old RH4 DA body GC
+  (`perf/rh4-da-body-gc`, `TORUS_DA_BODY_RETENTION`, default 128) and wires an optional block retention env var into
+  `devnet/wsl/start-node.sh`; 18c says when the branch is ready (names and SHA then).
+  - Arms (two binaries, plus one env cell): (a) main; (b) main + RH4; (c) main + RH4 with the block retention env
+    var set (`--retention-blocks`, e.g. 1000). 60 min each, 300 markets, hsdb-300m shape (Classic, 15 s
+    checkpoints), margin top-ups or a lower load; then a TRULY idle phase of at least 10 min (load generator stopped).
+  - Sample per node every 60 s: `du -sb` of `<data_dir>/consensus-db` and of the state DB separately (the split's
+    `find -maxdepth 1` misses `consensus-db`), SST count per DB, per-CF sizes from each RocksDB `LOG`'s Compaction
+    Stats (`cf_native_pending`, block bodies), `torus_rocksdb_pending_compaction_bytes`, L0 file counts, open fds
+    (`ls /proc/PID/fd | wc -l`) and deleted-but-open fds (`ls -l /proc/PID/fd | grep -c deleted`, expect 0),
+    `torus_da_bodies_gc_deleted` (b, c).
+  - Also report per arm: matched/s, block rate, commit latency p50/p99 (the GC runs on the commit path).
+  - Pass: (b) holds `consensus-db` flat after the window and (c) also the state DB, with matched/s and block rate
+    within noise of (a). Then validators prune by default (owner s126: only if Q9 proves it).
 - **Q8. Item 6 Phase 5 step 0 profile:** see the message sent to archy (s125) and
   `docs/plans/item6-phase5-impl.md` "Step 0" on `origin/docs/item6-phase5-plan`.
 
