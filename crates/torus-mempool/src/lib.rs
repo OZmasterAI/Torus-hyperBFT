@@ -836,17 +836,18 @@ impl Mempool {
     /// removes selected txs from the pool.
     ///
     /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
-    pub fn drain_evm(&self, gas_limit: u64, parent_hash: B256) -> Vec<Vec<u8>> {
+    /// Item 7 step 2: `base_fee` is the base fee of the header being proposed
+    /// (`PlanEvm::resolve`, which differs from the committed one at a boundary).
+    pub fn drain_evm(&self, gas_limit: u64, base_fee: u64, parent_hash: B256) -> Vec<Vec<u8>> {
         let budget = gas_limit.min(self.config.evm_block_gas_budget);
         // Per-sender share cap (testnet spam guard; 0 = off for mainnet).
         let sender_gas_cap = match self.config.evm_sender_share_pct {
             0 => None,
             pct => Some(budget.saturating_mul(pct as u64) / 100),
         };
-        // D4 re-check: the floor may have moved since admission.
-        let min_base_fee = self
-            .current_base_fee
-            .load(std::sync::atomic::Ordering::Relaxed) as u128;
+        // D4 re-check at the proposed header's fee (item 7 step 2): a tx below it would be
+        // skipped at execution. Admission keeps the committed floor.
+        let min_base_fee = base_fee as u128;
         let drained = self.evm.write().unwrap().small.drain(
             budget,
             torus_types::MAX_EVM_BLOCK_TX_BYTES,
@@ -1867,7 +1868,7 @@ impl Mempool {
         parent_hash: B256,
     ) -> (Vec<SignedNativeAction>, Vec<Vec<u8>>) {
         let native = self.drain_native(native_limit);
-        let evm = self.drain_evm(evm_gas_limit, parent_hash);
+        let evm = self.drain_evm(evm_gas_limit, self.base_fee(), parent_hash);
         (native, evm)
     }
 
@@ -3266,7 +3267,7 @@ mod tests {
         .unwrap();
         assert_eq!(pool.evm_pool_size(), 3);
 
-        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        let drained = pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained.len(), 3);
         assert_eq!(pool.evm_pool_size(), 0);
     }
@@ -3839,7 +3840,7 @@ mod tests {
             .unwrap();
         }
 
-        let drained = pool.drain_evm(42_000, B256::ZERO);
+        let drained = pool.drain_evm(42_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained.len(), 2);
         assert_eq!(pool.evm_pool_size(), 1);
     }
@@ -3873,11 +3874,11 @@ mod tests {
         ))
         .unwrap();
 
-        let drained = pool.drain_evm(21_000, B256::ZERO);
+        let drained = pool.drain_evm(21_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained.len(), 1);
         assert_eq!(pool.evm_pool_size(), 1);
 
-        let rest = pool.drain_evm(30_000_000, B256::ZERO);
+        let rest = pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(rest.len(), 1);
     }
 
@@ -3951,7 +3952,7 @@ mod tests {
         ))
         .unwrap();
 
-        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        let drained = pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(pool.evm_pool_size(), 0);
 
         pool.reinsert_evm(drained);
@@ -4027,7 +4028,7 @@ mod tests {
         }
         assert_eq!(pool.evm_pool_size(), 5);
 
-        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        let drained = pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained.len(), 2, "sender capped at 25% of the EVM budget");
         assert_eq!(pool.evm_pool_size(), 3, "excess stays pooled");
     }
@@ -4057,7 +4058,7 @@ mod tests {
             .unwrap();
         }
 
-        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        let drained = pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained.len(), 5, "5 x 21k = 105k fills the whole budget");
     }
 
@@ -4087,7 +4088,7 @@ mod tests {
             .unwrap();
         }
 
-        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        let drained = pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained.len(), 3, "63k budget admits exactly three 21k txs");
         assert_eq!(pool.evm_pool_size(), 2);
     }
@@ -4150,8 +4151,8 @@ mod tests {
 
         // Same parent hash → same ordering (deterministic).
         let hash_a = B256::repeat_byte(0x11);
-        let d1 = pool1.drain_evm(30_000_000, hash_a);
-        let d2 = pool2.drain_evm(30_000_000, hash_a);
+        let d1 = pool1.drain_evm(30_000_000, pool1.base_fee(), hash_a);
+        let d2 = pool2.drain_evm(30_000_000, pool2.base_fee(), hash_a);
         assert_eq!(d1.len(), 2);
         assert_eq!(d1, d2, "same parent hash must give same order");
     }
@@ -4188,7 +4189,7 @@ mod tests {
         assert!(mem_after_add > 0, "memory should be tracked after adds");
 
         // Drain all
-        let drained = pool.drain_evm(30_000_000, B256::ZERO);
+        let drained = pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained.len(), 3);
 
         let mem_after_drain = pool.memory_used();
@@ -4511,7 +4512,8 @@ mod tests {
         // Floor rises after admission: the tx must NOT be selected, but stays pooled.
         pool.set_base_fee(2_000_000_000);
         assert!(
-            pool.drain_evm(30_000_000, B256::ZERO).is_empty(),
+            pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO)
+                .is_empty(),
             "below-floor tx must not be drained into a block"
         );
         assert_eq!(
@@ -4522,7 +4524,11 @@ mod tests {
 
         // Floor falls back: the tx becomes selectable again.
         pool.set_base_fee(1_000_000_000);
-        assert_eq!(pool.drain_evm(30_000_000, B256::ZERO).len(), 1);
+        assert_eq!(
+            pool.drain_evm(30_000_000, pool.base_fee(), B256::ZERO)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -4849,10 +4855,13 @@ mod tests {
             ))
             .unwrap();
         }
-        let first = pool.drain_evm(3_000_000, B256::ZERO);
+        let first = pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO);
         assert_eq!(first.len(), 1, "two ~140 KB txs would pass 256 KiB");
         assert_eq!(pool.evm_pool_size(), 1, "the other tx stays pooled");
-        assert_eq!(pool.drain_evm(3_000_000, B256::ZERO).len(), 1);
+        assert_eq!(
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO).len(),
+            1
+        );
         assert_eq!(pool.evm_pool_size(), 0);
     }
 
@@ -4884,7 +4893,7 @@ mod tests {
         pool.add_evm_tx(tx(0, 21_000))
             .expect("nonce 0 is free again under the new limit");
         assert_eq!(
-            pool.drain_evm(1_000_000, B256::ZERO),
+            pool.drain_evm(1_000_000, pool.base_fee(), B256::ZERO),
             vec![tx(0, 21_000), tx(1, 21_000)]
         );
     }
@@ -4908,7 +4917,7 @@ mod tests {
         let k = intrinsic_case(&state, 213);
         let tx = |nonce| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, 21_000, U256::ZERO);
         pool.add_evm_tx(tx(0)).unwrap();
-        let drained = pool.drain_evm(21_000, B256::ZERO);
+        let drained = pool.drain_evm(21_000, pool.base_fee(), B256::ZERO);
         assert_eq!(drained, vec![tx(0)]);
         for nonce in 1..=4 {
             pool.add_evm_tx(tx(nonce)).unwrap();
@@ -4921,7 +4930,7 @@ mod tests {
         pool.reinsert_evm(drained);
         assert_eq!(pool.evm_pool_size(), 4);
         assert_eq!(
-            pool.drain_evm(3_000_000, B256::ZERO),
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO),
             (0..4).map(tx).collect::<Vec<_>>(),
             "nonce 0 is back at the head; nonce 4 made room"
         );
@@ -4986,13 +4995,17 @@ mod tests {
             Some(EvmLane::Small),
             "M = 0: the row is ignored"
         );
-        assert_eq!(pool.drain_evm(3_000_000, B256::ZERO), vec![tx(0)]);
+        assert_eq!(
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO),
+            vec![tx(0)]
+        );
 
         pool.set_big_lane(50, 10_000_000, 1_000_000_000);
         let h1 = pool.add_evm_tx(tx(1)).unwrap();
         assert_eq!(pool.evm_lane_of(&h1), Some(EvmLane::Big));
         assert!(
-            pool.drain_evm(3_000_000, B256::ZERO).is_empty(),
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO)
+                .is_empty(),
             "the small drain skips the big lane"
         );
         assert_eq!(
@@ -5026,7 +5039,10 @@ mod tests {
             matches!(err, MempoolError::EvmLaneSwitchPending { sender } if sender == address_from_key(&k)),
             "expected EvmLaneSwitchPending, got: {err}"
         );
-        assert_eq!(pool.drain_evm(3_000_000, B256::ZERO), vec![tx(0)]);
+        assert_eq!(
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO),
+            vec![tx(0)]
+        );
         let h1 = pool
             .add_evm_tx(tx(1))
             .expect("the small pool holds none of its txs any more");

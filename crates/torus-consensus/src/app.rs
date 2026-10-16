@@ -5992,6 +5992,11 @@ impl TorusApp {
         leader_state.sync_validators(&genesis_validator_set);
         leader_state.set_view(last_header.height.saturating_add(1));
         leader_state.set_evm_block_interval(last_header.evm_block_interval);
+        // Item 7 step 2: the pools follow the last committed header at boot too, so a restarted
+        // node admits by the current lanes and fees before its first commit.
+        if let Some(ref m) = mempool {
+            m.set_evm_header(&last_header);
+        }
 
         let mut app = Self {
             state_db,
@@ -7368,13 +7373,15 @@ impl TorusApp {
             return refused_proposal();
         };
         let evm = plan_evm.unwrap_or_default().resolve(&parent_header);
-        // Cadence: EVM txs only at height % N == 0. A 0 limit makes select_block_payload skip
-        // the destructive drain, so off-cadence txs stay pooled (N = 0 carries none).
-        let gas_limit = if next_height.checked_rem(evm.block_interval) == Some(0) {
+        // Item 7 steps 1-2: the small lane at h % N == 0 and at a big height, the big lane at a big
+        // height. 0 = no destructive drain (the txs stay pooled; N = 0 carries none).
+        let big = torus_types::is_big_evm_height(next_height, evm.big_block_interval);
+        let gas_limit = if big || next_height.checked_rem(evm.block_interval) == Some(0) {
             evm.gas_limit
         } else {
             0
         };
+        let big_gas_limit = if big { evm.big_gas_limit } else { 0 };
         // Item 7 step 1: proposing a height again (our block there got no QC), first put the
         // EVM txs of our earlier proposal back. The drain starts each sender at its lowest
         // pooled nonce, so it would otherwise propose the next nonce without them: execution
@@ -7389,7 +7396,15 @@ impl TorusApp {
         let (native_with_senders, evm_txs) = {
             let _select_span =
                 ObserveOnDrop::new(self.metrics.clone(), |m| &m.block_build_select_seconds);
-            self.select_block_payload(parent_header.height, gas_limit, parent_header.state_root)
+            // The fees of the header being proposed (the resolved plan), not the committed ones.
+            self.select_block_payload(
+                parent_header.height,
+                gas_limit,
+                big_gas_limit,
+                evm.base_fee,
+                evm.big_base_fee,
+                parent_header.state_root,
+            )
         };
 
         // Proposer guarantee (S459): durably mirror every referenced body to THIS
@@ -7940,11 +7955,17 @@ impl TorusApp {
     /// `last_header` back within the threshold, full selection resumes automatically.
     ///
     /// `gas_limit` 0 (item 7 step 1: off the EVM cadence) selects no EVM tx and
-    /// drains none from the pool.
+    /// drains none from the pool. Item 7 step 2: `big_gas_limit` > 0 (a big
+    /// height) also drains the big lane, after the small one, in the bytes left
+    /// of 768 KiB. Both drains floor at the proposed header's base fees
+    /// (`base_fee`, `big_base_fee`), not the committed ones.
     fn select_block_payload(
         &self,
         parent_height: u64,
         gas_limit: u64,
+        big_gas_limit: u64,
+        base_fee: u64,
+        big_base_fee: u64,
         parent_state_root: torus_types::B256,
     ) -> (
         Vec<(torus_types::Address, torus_types::SignedNativeAction)>,
@@ -8047,12 +8068,23 @@ impl TorusApp {
                 )
             }
         };
-        // Item 7 step 1: 0 = off cadence (or a 0 header limit): no destructive drain.
-        let evm = if gas_limit == 0 {
+        // Item 7 steps 1-2: the small lane first (its limit, 256 KiB), then at a big height the big
+        // lane in the bytes left of 768 KiB, each at the proposed header's base fee. 0 = no
+        // destructive drain.
+        let mut evm = if gas_limit == 0 {
             Vec::new()
         } else {
-            mempool.drain_evm(gas_limit, parent_state_root)
+            mempool.drain_evm(gas_limit, base_fee, parent_state_root)
         };
+        if big_gas_limit > 0 {
+            let used: usize = evm.iter().map(Vec::len).sum();
+            evm.extend(mempool.drain_evm_big(
+                big_gas_limit,
+                torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES.saturating_sub(used),
+                big_base_fee,
+                parent_state_root,
+            ));
+        }
         if !evm.is_empty() || !native.is_empty() {
             tracing::info!(
                 evm_txs = evm.len(),
@@ -8358,12 +8390,11 @@ impl TorusApp {
             }
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
-            // committed blocks actually charge (frozen at 1 gwei today; follows
-            // the header once the fee market unfreezes). Item 7 step 1: the
-            // admission gas cap follows the committed header's EVM gas limit.
+            // committed blocks actually charge. Item 7 step 1: the admission gas
+            // cap follows the committed header's EVM gas limit. Item 7 step 2:
+            // and the big lane (M, big limit, big base fee).
             if let Some(ref mempool) = self.mempool {
-                mempool.set_base_fee(torus_block.header.base_fee_per_gas);
-                mempool.set_evm_gas_limit(torus_block.header.evm_gas_limit);
+                mempool.set_evm_header(&torus_block.header);
             }
 
             self.exec_prepared_height = Some(height);
@@ -9040,7 +9071,8 @@ mod exec_throttle_tests {
 
         // Deep backlog (>= w3): cancels-only.
         app.exec_queue_len.store(12, Ordering::Relaxed);
-        let (paced, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        let (paced, _evm) =
+            app.select_block_payload(0, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert_eq!(paced.len(), 2, "cancels-only tier selects exactly the cancels");
         assert!(
             paced
@@ -9051,7 +9083,8 @@ mod exec_throttle_tests {
 
         // Backlog cleared: the SAME pooled actions all select — nothing was shed.
         app.exec_queue_len.store(0, Ordering::Relaxed);
-        let (full, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        let (full, _evm) =
+            app.select_block_payload(0, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert_eq!(
             full.len(),
             5,
@@ -9098,12 +9131,14 @@ mod exec_throttle_tests {
                 },
             );
         }
-        let (paced, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        let (paced, _evm) =
+            app.select_block_payload(0, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert_eq!(paced.len(), 1, "deep deferred buffer alone must pace to cancels-only");
         assert!(torus_mempool::is_cancel(&paced[0].1.action));
 
         app.deferred_exec.clear();
-        let (full, _evm) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        let (full, _evm) =
+            app.select_block_payload(0, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert_eq!(full.len(), 2, "clearing the buffer restores full selection");
 
         std::env::remove_var("TORUS_EXEC_THROTTLE_WATERMARKS");
@@ -12464,7 +12499,8 @@ mod crash_recovery_tests {
         ));
         let missing_hash = torus_types::compute_action_hash(&actions[1]);
         app.in_flight_hashes.note(6, [missing_hash]);
-        let (selected, _) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        let (selected, _) =
+            app.select_block_payload(0, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert_eq!(selected.len(), 1);
         assert_eq!(
             torus_types::compute_action_hash(&selected[0].1),
@@ -12474,7 +12510,8 @@ mod crash_recovery_tests {
         // Cleanup releases the body and its cache together; the independent
         // missing-body ledger continues to exclude its action.
         app.pending_proposals.remove(&5);
-        let (selected, _) = app.select_block_payload(0, 30_000_000, B256::ZERO);
+        let (selected, _) =
+            app.select_block_payload(0, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert_eq!(selected.len(), 2);
         assert!(selected
             .iter()
@@ -13657,7 +13694,8 @@ mod crash_recovery_tests {
         assert_eq!(app.last_header.height, 0, "precondition: fresh/stale local frontier");
 
         // Parent height far ahead of our applied frontier → EMPTY payload.
-        let (native_lag, _evm) = app.select_block_payload(918, 30_000_000, B256::ZERO);
+        let (native_lag, _evm) =
+            app.select_block_payload(918, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert!(
             native_lag.is_empty(),
             "lagging leader must propose an EMPTY payload, got {}",
@@ -13665,7 +13703,8 @@ mod crash_recovery_tests {
         );
 
         // Parent within the catch-up threshold → normal full selection resumes.
-        let (native_ok, _) = app.select_block_payload(1, 30_000_000, B256::ZERO);
+        let (native_ok, _) =
+            app.select_block_payload(1, 30_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
         assert!(
             !native_ok.is_empty(),
             "a caught-up leader must select from its mempool"
@@ -22491,6 +22530,136 @@ mod crash_recovery_tests {
             .expect("a tx at the committed header's limit is admitted");
     }
 
+    /// Item 7 step 2: the leader drains the small lane off a big height (the big-lane tx stays
+    /// pooled), and at a big height the small lane first, then the big lane, in one block that
+    /// passes the pre-vote check (N = 5, M = 10: height 5 small only, height 10 big). RED
+    /// before: the leader drained the small lane alone, at the small limit.
+    #[test]
+    fn big_height_drains_the_small_lane_then_the_big_lane() {
+        let (config, db) = make_test_config_and_db();
+        assert_eq!(config.evm_big_gas_limit, 10_000_000);
+        let mempool = funded_evm_mempool(&db);
+        let big_key = funded_evm_signer(&db, 72);
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_ORACLE,
+            &torus_state::cf::evm_lane_key(&k256_address(&big_key)),
+            &[1],
+        )
+        .unwrap();
+        // After the app: its boot syncs the pools to the genesis header (M = 0).
+        let mut app = TorusApp::new(db, &config, None, Some(mempool.clone()), None);
+        mempool.set_big_lane(10, 10_000_000, 1_000_000_000);
+        let small0 = evm_tx_gas(0, 1_000_000);
+        let to = alloy_primitives::TxKind::Call(Address::repeat_byte(0x42));
+        let big = signed_eip1559_gas(&big_key, 0, to, vec![], U256::ZERO, 6_000_000);
+        mempool.add_evm_tx(small0.clone()).unwrap();
+        let big_hash = mempool.add_evm_tx(big.clone()).unwrap();
+        assert_eq!(
+            mempool.evm_lane_of(&big_hash),
+            Some(torus_mempool::EvmLane::Big)
+        );
+
+        let _ = app.build_proposal(lane_block(4, 10).header);
+        let at5 = &app.pending_proposals[&5].block;
+        assert_eq!(
+            at5.evm_transactions,
+            vec![small0],
+            "height 5: the small lane only"
+        );
+        assert_eq!(mempool.evm_pool_size(), 1, "the big tx stays pooled");
+
+        let small1 = evm_tx_gas(1, 1_000_000);
+        mempool.add_evm_tx(small1.clone()).unwrap();
+        let parent9 = lane_block(9, 10);
+        let _ = app.build_proposal(parent9.header.clone());
+        let at10 = app.pending_proposals[&10].block.clone();
+        assert_eq!(
+            at10.evm_transactions,
+            vec![small1, big],
+            "height 10: the small lane, then the big lane"
+        );
+        assert_eq!(at10.header.evm_tx_count, 2);
+        assert_eq!(mempool.evm_pool_size(), 0);
+        assert_eq!(pre_vote(&mut app, &parent9, &at10), BlockDataCheck::Held);
+    }
+
+    /// Item 7 step 2: a committed header's M and big limit reach the mempool once the block is
+    /// dispatched to execution: a lane-row sender's next tx enters the big pool, up to the big
+    /// limit. RED before: the pools followed only the small limit and fee (a 6M tx was over the
+    /// 3M small cap).
+    #[test]
+    fn committed_header_sets_the_mempool_big_lane() {
+        let (mut app, rx, mempool, _) = evm_pool_app_with_recording_exec(0);
+        let key = k256::ecdsa::SigningKey::from_slice(&[71u8; 32]).unwrap();
+        app.state_db
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::evm_lane_key(&k256_address(&key)),
+                &[1],
+            )
+            .unwrap();
+        let mut b5 = make_block(5, vec![]);
+        b5.header.evm_big_block_interval = 50;
+        b5.header.evm_big_gas_limit = 10_000_000;
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+        let h = mempool
+            .add_evm_tx(evm_tx_gas(0, 6_000_000))
+            .expect("a 6M tx fits the committed big limit");
+        assert_eq!(mempool.evm_lane_of(&h), Some(torus_mempool::EvmLane::Big));
+    }
+
+    /// Item 7 step 2 (Codex plan check s125): the leader drains at the fee of the header it
+    /// proposes, not the committed one. Epoch 4, N = 1: 9M small gas in the F3 row sets plan(8)'s
+    /// small fee to 1.125 gwei; a pooled tx with a 1 gwei max fee (admitted at the committed
+    /// 1 gwei) cannot pay block 8's fee, so block 8 carries no EVM tx and the tx stays pooled.
+    /// Control: a drain at 1 gwei takes it. RED before: the drain floored at the committed 1 gwei
+    /// and put the tx into block 8, where execution skips it.
+    #[test]
+    fn boundary_drain_uses_the_planned_fee() {
+        let (mut config, db) = make_test_config_and_db();
+        config.epoch_length = 4;
+        let mempool = funded_evm_mempool(&db);
+        let mut app = TorusApp::new(db.clone(), &config, None, Some(mempool.clone()), None);
+        let ctx = make_exec_ctx(&config, &db);
+        let mut blocks: Vec<TorusBlock> = (1..=4).map(|h| make_block(h, vec![])).collect();
+        for b in &mut blocks {
+            b.header.evm_block_interval = 1;
+            b.header.evm_big_block_interval = 0;
+        }
+        link_blocks(&mut blocks);
+        torus_economics::add_epoch_evm_gas(&db, 9_000_000, 0).unwrap();
+        for b in &blocks {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        let plan8 = StakingManager::new(db.clone())
+            .epoch_rotation_plan(8)
+            .unwrap()
+            .expect("plan(8) stored at boundary 4");
+        assert_eq!(plan8.evm.base_fee, Some(1_125_000_000));
+
+        let tx = evm_tx_gas(0, 21_000);
+        mempool.add_evm_tx(tx.clone()).unwrap();
+        let mut parent7 = make_block(7, vec![]);
+        parent7.header.evm_block_interval = 1;
+        let _ = app.build_proposal(parent7.header.clone());
+        let b8 = &app.pending_proposals[&8].block;
+        assert_eq!(b8.header.base_fee_per_gas, 1_125_000_000);
+        assert!(
+            b8.evm_transactions.is_empty(),
+            "a 1 gwei max fee cannot pay block 8's 1.125 gwei"
+        );
+        assert_eq!(mempool.evm_pool_size(), 1);
+
+        let (_, evm) =
+            app.select_block_payload(7, 3_000_000, 0, 1_000_000_000, 1_000_000_000, B256::ZERO);
+        assert_eq!(evm, vec![tx], "control: a drain at 1 gwei takes it");
+    }
+
     /// Item 7 step 1: the EVM txs drained into our proposal at height 5 return
     /// to the pool when another block commits there, minus the txs that block
     /// carries. RED before: `drain_evm` is destructive and nothing reinserted
@@ -22507,7 +22676,7 @@ mod crash_recovery_tests {
         app.on_committed_block(&other, other.hash);
         rx.try_recv().expect("height 5 must reach execution");
         assert_eq!(
-            sorted(mempool.drain_evm(u64::MAX, B256::ZERO)),
+            sorted(mempool.drain_evm(u64::MAX, mempool.base_fee(), B256::ZERO)),
             sorted(vec![txs[1].clone(), txs[2].clone()]),
             "the lost txs are pooled again, the committed one is not"
         );
@@ -22551,7 +22720,10 @@ mod crash_recovery_tests {
         let committed = committed_compact_block(&other);
         app.on_committed_block(&committed, committed.hash);
         rx.try_recv().expect("height 5 must reach execution");
-        assert_eq!(sorted(mempool.drain_evm(u64::MAX, B256::ZERO)), sorted(txs));
+        assert_eq!(
+            sorted(mempool.drain_evm(u64::MAX, mempool.base_fee(), B256::ZERO)),
+            sorted(txs)
+        );
     }
 
     /// The proposer keeps a block's EVM tx bytes within the 256 KiB vote cap.
@@ -22615,7 +22787,7 @@ mod crash_recovery_tests {
             app.on_committed_block(&committed, committed.hash);
             rx.try_recv().expect("height 5 must reach execution");
             assert_eq!(
-                mempool.drain_evm(u64::MAX, B256::ZERO),
+                mempool.drain_evm(u64::MAX, mempool.base_fee(), B256::ZERO),
                 pooled,
                 "first_commits={first_commits}"
             );

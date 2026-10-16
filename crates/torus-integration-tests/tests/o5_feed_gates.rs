@@ -22,7 +22,7 @@ use torus_types::{
 /// penalizes the proposer while the next leader re-selects the same mempool (livelock).
 #[test]
 fn worst_case_compact_proposal_fits_consensus_accept_gate() {
-    assert!(MAX_EVM_BIG_BLOCK_TX_BYTES >= MAX_EVM_BLOCK_TX_BYTES);
+    const { assert!(MAX_EVM_BIG_BLOCK_TX_BYTES >= MAX_EVM_BLOCK_TX_BYTES) };
     let max_txs = ((*EVM_BLOCK_GAS_LIMIT_RANGE.end() + *EVM_BIG_BLOCK_GAS_LIMIT_RANGE.end())
         / EVM_MIN_TX_GAS) as usize; // 1,904
     let evm_worst = MAX_EVM_BIG_BLOCK_TX_BYTES + 8 * max_txs + 8; // 801,672
