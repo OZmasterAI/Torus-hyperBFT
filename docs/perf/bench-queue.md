@@ -50,9 +50,9 @@ share one binary and one all-off baseline inside a campaign.
 
 7. **Q6. 71.8 checkpoint slicing** vs M. Run after step 4 has settled the Q1 / Q4 defaults (both touch checkpoint
    code, so they move slicing's baseline).
-8. **Q7. Item 7 step 2** vs M. Status s126: C1-C4, C7, C8 built and Codex-clean on `feat/item7-step2`; C9 built
-   and Codex-clean (`feat/item7-step2-rpc`, merges after C5); C5 building; C6, C10 (incl. the 18c devnet check)
-   still to build.
+8. **Q7. Item 7 step 2** vs M. Status s126: C1-C5, C7, C8, C9 built and Codex-clean on `feat/item7-step2`
+   (workspace 3931/3931 at 85612558); C6 built (3944/3944), in Codex review; then C10 (docs, gates, the 18c 4-validator
+   devnet check). 18c says when the step 2 head is ready; spec under Items, Q7.
 
 If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and save-books rows of the Q8 profile
 (a short re-run, not a full profile).
@@ -96,9 +96,23 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   markets, 600 s, n = 3 ABBA (4-5 per arm resolves a ~200 ms step). Success: in-window block p99 within ~100 ms of the
   out-of-window p99, and `on_committed_block` in-window = out. 18c adds a timer around `persist_commit_manifest` first.
   Waiting on 18c code.
-- **Q7. Item 7 step 2**, native load only, main vs step 2 (after the step 2 build): the best bid/ask rows add up to
-  one write per dirty market per block; two book shapes: mode 3 (harness default) and Classic with 15 s checkpoints
-  (the shipped shape). Waiting on 18c code.
+- **Q7. Item 7 step 2**, native load only, main vs step 2 (after the step 2 build and the 18c devnet check): the best
+  bid/ask rows add up to one write per dirty market per block. Full spec: `docs/plans/item7-step2-impl.md`,
+  "Archy native-only A/B". Two binaries (commit vs commit, no flag): arm A = main at the step 2 merge base, arm B =
+  the step 2 head (18c gives both SHAs).
+  - Genesis: the 300-market weighted genesis; arm B with the new step 2 keys absent (M = 0, big blocks off). EVM
+    load off.
+  - Shape 1, mode 3 (harness default, `TORUS_BOOK_ROWS=3`, `BLOCK_CAP=200`): warm-up cell, n = 4 ABBA rounds of
+    120 s cells at 300 markets; one 10-market pair as a secondary.
+  - Shape 2, Classic (the shipped shape): both arms `EXTRA_ENV='TORUS_BOOK_ROWS='`, 15 s checkpoints
+    (`KNOB=TORUS_CHECKPOINT_INTERVAL_MS=15000`, as `tools/matched-bench/campaign-template.sh`; its `envok` Classic
+    check), 300 markets, n = 4 ABBA. Mode 3 turns checkpoints off, so it alone would miss the bbo writes in
+    `save_order_books`.
+  - Report per shape: matched/s (primary), native blocks/s, `torus_exec_save_books_seconds` per native block, exec
+    `block_ms`, block time p50/p99, CPU-s/1M.
+  - Pass, both shapes: paired B/A matched/s 95% CI includes 1.0 or lies above it, and save_books rises by at most
+    0.3 ms per native block. A fail blocks the step 2 merge (follow-up: B16's `saved_bbo` hit rate).
+  - Doc target: `docs/perf/item7-step2-native-ab.md`.
 - **Q8. Item 6 Phase 5 step 0 profile:** see the message sent to archy (s125) and
   `docs/plans/item6-phase5-impl.md` "Step 0" on `origin/docs/item6-phase5-plan`.
 
