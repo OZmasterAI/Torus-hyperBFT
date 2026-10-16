@@ -2114,7 +2114,7 @@ poller.py, analyze.py, drained.sh, gov.sh; `govtool/`); `/tmp/item7-devnet-check
 `tools/matched-bench/campaign/make-driver.py`: arm A = main at the step 2 merge base, arm B = the step 2 head; one
 genesis shape (300-market weighted genesis; arm B with the new keys absent, so M = 0); EVM load off (native only);
 harness defaults (`TORUS_BOOK_ROWS=3`, so the deferred save path that writes the bbo rows; `BLOCK_CAP=200`); warm-up
-cell, n = 4 ABBA rounds of 120 s cells; one 10-market pair as a secondary. Plus a Classic pair (Codex plan check
+cell, n = 4 ABBA rounds of 120 s cells (owner s126: no 10-market secondary; 300 markets is the worst case for the bbo writes). Plus a Classic pair (Codex plan check
 s125): mode 3 turns checkpoints off (`resolve_checkpoint_interval`, exec_pipeline.rs:134-160, run-cell.sh:412
 `TORUS_BOOK_ROWS=3`), while shipped validators run Classic with 15 s checkpoints, where the bbo puts go through
 `save_order_books`. Both arms `EXTRA_ENV='TORUS_BOOK_ROWS='` (Classic, the validator default
@@ -2188,6 +2188,63 @@ ecrecover on commit).
 
 Not blockers: the consensus message fits (830,864 B <= 1 MiB); the Phase 5 overlap has no ordering conflict; nothing
 found contradicts the design.
+
+## Owner decisions during the build (s126), with the alternatives kept
+
+None of these changes block speed or matched/s; they are correctness and UX choices.
+
+1. **C9: where `eth_call` / `eth_estimateGas` read the sender's lane.** Chosen: **B**, the lane row from the ingress
+   view (latest executed state), dropped before the call. The call itself still runs on the durable DB (c89ab290).
+   Lane answers now agree with admission, routing and `torus_usingBigBlocks`.
+   - Alt A (as first built, 1d9e9bfa): the lane from the durable DB, one consistent snapshot, but up to one
+     checkpoint (~15 s) after `EvmUserModify` estimates stay capped at the small limit.
+   - Alt "HL way": all RPC reads from the latest executed state. Parked for a decision at item 6 Phase 5 (RAM: the
+     view holds 6 CFs); see `item6-phase5-impl.md`, "Parked for a decision at Phase 5".
+2. **C5 deviation 2: a tx returning to the pool** (own lost proposal, re-proposal, M -> 0 move) joins the lane that
+   already holds its sender's txs; brand-new lane-switching txs still get `EvmLaneSwitchPending`.
+   - Alt (the plan's literal text): refuse returning txs with `EvmLaneSwitchPending`. Rejected: it drops an
+     accepted tx and leaves a nonce gap.
+3. **A tx no lane can take** after a limit drop or M -> 0 is dropped with a warning; the sender's later nonces stay
+   pooled and wait until the gap is re-sent (as step 1's gas-limit eviction, Ethereum pools, and HL, which keeps the
+   next 8 nonces and prunes after 1 day).
+   - Alt: drop the sender's later nonces too. Rejected: the user must re-send everything instead of one tx.
+4. **C6: EVM txs with trailing bytes.** Chosen: **reject at admission only**, so each tx has one canonical byte
+   form. The C6 in-flight filter already decodes txs (`evm_tx_hash`), so it is correct either way.
+   - Alt keep: accept trailing bytes (one tx, several byte strings; harmless with the decoding filter).
+   - Alt admission + vote: validators also refuse blocks carrying such txs. Rejected for now: it blocks padding
+     by a malicious leader, which gains nothing (same tx hash), but if admission and the vote ever disagree, honest
+     proposals are refused and views time out. Revisit only if padding becomes a real problem.
+5. **C6: txs from a lost proposal.** Chosen: **track them** (back into the pool, re-sent at the next commit if
+   still pending), as the plan says; the RPC node's own re-send covers its txs as well.
+   - Alt: forward them to the next leader at once. Gains up to one commit (~0.3 s) in a rare case and adds
+     duplicate sends. Revisit if the devnet's routing check (d) shows lost-proposal txs waiting more than 2 EVM
+     heights.
+6. **C6 fix round (47e3f60f): decode errors, re-delivered blocks, two encodings.**
+   - A tx that fails to decode at `eth_sendRawTransaction` returns "mempool error: tx decode failed: ..." (code
+     still -32603) instead of "internal error: tx rlp decode: ...". Alt: keep the old text (it wrongly calls a bad
+     tx an internal error).
+   - A block delivered again below the execution frontier skips the lost-proposal reinsert, like the re-send
+     already did (those heights are settled at the first delivery). Alt: reinsert anyway (would re-track txs of a
+     settled height).
+   - Admission keeps accepting both encodings of a tx, the bare EIP-2718 bytes and alloy's network form; both
+     decode to one tx and one hash (`evm_tx_hash`), and trailing bytes are refused in both. Alt: refuse the network
+     form (breaks our RPC tests and clients using alloy's `encode`, gains nothing).
+7. **C10 devnet (RESULTS.md in `/tmp/item7s2-devnet-check/`), checks d and e:** accepted on the plan's main
+   criterion, "every tx lands at most one EVM height after its target" (100%). On the literal "`EVM heights waited`
+   <= 2 for 100%", 566/600 passed: every tx that waited 3 had a view timeout in its window (routing aims at the next
+   EVM height above the latest proposal; the timeout moved that height's leader and the re-send landed it one height
+   later). None lost; worst wait 24 blocks (step 1: 661).
+   - Alt: hold the merge until routing also covers a moved leader (for example re-send on every view change, or
+     route to one more leader). Revisit if Q7 or a testnet shows waits above 2 EVM heights without timeouts.
+8. **Big lane after a view timeout:** a timeout before a big-lane tx's first target moves both predicted big
+   leaders, so the tx waits two big intervals instead of one (about 15 s at M = 50). Accepted and documented: big
+   blocks are off at genesis (M = 0), and the onchain mempool parked for Phase 5 removes routing entirely.
+   - Alt: route big-lane txs to a third leader, or re-send on a view change.
+9. **Before the merge (owner s126):** the EVM drain skips txs already in pending proposals, as the native drain does.
+   The C10 devnet showed the same tx at two adjacent EVM heights with big blocks on (second copy skipped at execution,
+   about 1% of block entries). And main is merged into `feat/item7-step2` before Q7, so the A/B benches what lands.
+10. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
+   Phase 5 (rules in `item6-phase5-impl.md`, `item7-step2-design.md` and `docs/perf/bench-queue.md`).
 
 ## Effort (one builder)
 

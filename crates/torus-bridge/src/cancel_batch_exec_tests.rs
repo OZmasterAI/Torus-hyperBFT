@@ -7,8 +7,8 @@ use crate::state_root::compute_native_state_root;
 use alloy_primitives::U256;
 use torus_core::position::NativeBalance;
 use torus_state::cf::{
-    CF_BOOK_ORDER_ROWS, CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
+    CF_BOOK_ORDER_ROWS, CF_NATIVE_BALANCES, CF_NATIVE_BBO, CF_NATIVE_MARKETS,
+    CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
 };
 use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
 
@@ -242,9 +242,29 @@ fn run_observed_in(
     resident: bool,
     observe: &mut dyn FnMut(&NativeExecContext),
 ) -> RunFingerprint {
+    run_observed_par(blocks, mode, batch, full_scan, resident, None, observe)
+}
+
+/// [`run_observed_in`] with the parallel cancel-all book pass pinned
+/// (`TORUS_PARALLEL_CANCEL_ALL`): `par = Some((workers, min_visits))` sets
+/// the context's `cancel_all_workers` / `cancel_all_min_visits` (`None`:
+/// the env defaults, i.e. what every other test runs).
+fn run_observed_par(
+    blocks: &[Vec<(Address, NativeAction)>],
+    mode: BookMode,
+    batch: bool,
+    full_scan: bool,
+    resident: bool,
+    par: Option<(usize, usize)>,
+    observe: &mut dyn FnMut(&NativeExecContext),
+) -> RunFingerprint {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut ctx = new_ctx_with(&dir, mode, resident);
     ctx.test_cancel_all_full_scan = full_scan;
+    if let Some((workers, min_visits)) = par {
+        ctx.cancel_all_workers = workers;
+        ctx.cancel_all_min_visits = min_visits;
+    }
     let mut results = Vec::new();
     let mut total_gas = Vec::new();
     let mut dirty = Vec::new();
@@ -295,6 +315,8 @@ fn run_observed_in(
         CF_NATIVE_TRADES,
         CF_NATIVE_USER_TRADES,
         CF_BOOK_ORDER_ROWS,
+        // Item 7 step 2 B16: the bbo row of every dirty market.
+        CF_NATIVE_BBO,
     ] {
         for (k, v) in ctx.state.iterate_cf(cf, None).expect("iterate cf") {
             cf_dump.push((cf.to_string(), k, v));
@@ -338,10 +360,10 @@ fn cancel_batch_flag_on_matches_off_mixed_blocks() {
     }
 }
 
-/// One long run: every sender cancels everything, twice, with places mixed
-/// in — books empty out, then the run's places rest on fresh levels.
-#[test]
-fn cancel_batch_flag_on_matches_off_long_run_emptying_books() {
+/// The setup, then one long run: every sender cancels everything, twice,
+/// with places mixed in — books empty out, then the run's places rest on
+/// fresh levels.
+fn long_emptying_run_blocks() -> Vec<Vec<(Address, NativeAction)>> {
     let mut blocks = setup_blocks();
     let mut block = Vec::new();
     for s in (1..=SENDERS + 2).rev() {
@@ -354,6 +376,14 @@ fn cancel_batch_flag_on_matches_off_long_run_emptying_books() {
         block.push((addr(s), cancel_all(Some(MARKETS[s as usize % 4]))));
     }
     blocks.push(block);
+    blocks
+}
+
+/// One long run: every sender cancels everything, twice, with places mixed
+/// in — books empty out, then the run's places rest on fresh levels.
+#[test]
+fn cancel_batch_flag_on_matches_off_long_run_emptying_books() {
+    let blocks = long_emptying_run_blocks();
     for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
         let off = run(&blocks, mode, false);
         let on = run(&blocks, mode, true);
@@ -1447,5 +1477,629 @@ fn cancel_all_index_rebuilt_at_load_equals_the_carried_one() {
             outcome[0] == outcome[1],
             "{what}: carried and rebuilt index diverged"
         );
+    }
+}
+
+// ---- `TORUS_PARALLEL_CANCEL_ALL`: a batched cancel-all run's book pass on
+// the exec pool, one job group per market (`cancel_all_groups_parallel`).
+// Every job count must give the serial loop's results, gas, dirty marks,
+// books, stops, CF dumps, state roots and counters; a job panic must
+// fail-stop the block before Phase 2.
+
+/// What a [`run_par`] run observed after every block.
+#[derive(Default)]
+struct ParObs {
+    /// Cumulative `(cancel_alls, books visited, books hit)` after each block.
+    counters: Vec<(u64, u64, u64)>,
+    /// Runs that took the parallel book pass, after the last block.
+    parallel_runs: u64,
+}
+
+/// The cross-market cloid index, once built, holds every live cloid of the
+/// books at its market and id (removes may still wait in a book's log, so
+/// the carried index may hold more).
+fn assert_cloid_index_covers_books(ctx: &NativeExecContext, what: &str) {
+    let (carried, rebuilt) = ctx.cloid_index();
+    if let Some(carried) = carried {
+        for (key, slot) in &rebuilt {
+            assert_eq!(carried.get(key), Some(slot), "{what}: cloid {key:?}");
+        }
+    }
+}
+
+/// `blocks` on batched runs and resident books (the parallel pass is on the
+/// P2-1 path only) with the parallel cancel-all pinned to `workers` jobs
+/// (1 = the serial loop, whatever the env says) and the work gate off
+/// (MARKETS has 4 books: every run is below the default 64 visits). Both
+/// indexes are checked after every block (the trader index in
+/// `run_observed_par`, the cloid index here).
+fn run_par(
+    blocks: &[Vec<(Address, NativeAction)>],
+    mode: BookMode,
+    workers: usize,
+) -> (RunFingerprint, ParObs) {
+    let mut obs = ParObs::default();
+    let what = format!("{mode:?} workers={workers}");
+    let print = run_observed_par(
+        blocks,
+        mode,
+        true,
+        false,
+        true,
+        Some((workers, 0)),
+        &mut |ctx: &NativeExecContext| {
+            assert_cloid_index_covers_books(ctx, &what);
+            let a = ctx.phase_accum;
+            obs.counters.push((
+                a.cancel_alls,
+                a.cancel_all_books_visited,
+                a.cancel_all_books_hit,
+            ));
+            obs.parallel_runs = ctx.test_cancel_all_parallel_runs;
+        },
+    );
+    (print, obs)
+}
+
+/// (a) The mixed blocks of `cancel_batch_flag_on_matches_off_mixed_blocks`
+/// (runs of `None` / `Some(m)` / unknown-market / repeated cancel-alls,
+/// places inside runs, run-breaking cancels, modifies and transfers), plus
+/// OrderRows: 2, 3, 4 and 64 jobs equal the serial loop, and (d) count the
+/// same visits and hits after every block.
+#[test]
+fn parallel_cancel_all_matches_serial_mixed_blocks() {
+    let resting = resting_after_setup();
+    for (seed, mode) in [
+        (1u64, BookMode::Classic),
+        (2, BookMode::LevelAuthority),
+        (3, BookMode::LevelAuthorityChunked),
+        (4, BookMode::Classic),
+        (6, BookMode::OrderRows),
+    ] {
+        let mut blocks = setup_blocks();
+        blocks.extend(mixed_blocks(seed, &resting));
+        let (serial, serial_obs) = run_par(&blocks, mode, 1);
+        assert_eq!(
+            serial_obs.parallel_runs, 0,
+            "{mode:?}: 1 job is the serial loop"
+        );
+        let flat: Vec<_> = serial.results.iter().flatten().collect();
+        assert!(flat.iter().filter(|r| r.0 == "cancel_all").count() > 60);
+        assert!(serial.trade_index > 10, "{mode:?}: scenario must fill");
+        for workers in [2, 3, 4, 64] {
+            let what = format!("{mode:?} seed {seed} workers={workers}");
+            let (par, par_obs) = run_par(&blocks, mode, workers);
+            assert!(par_obs.parallel_runs > 0, "{what}: the pool was never used");
+            assert_eq!(par_obs.counters, serial_obs.counters, "{what}: counters");
+            assert_eq!(par, serial, "{what}: parallel cancel-all diverged");
+        }
+    }
+}
+
+/// (b) One long run that empties the books, then rests the run's places.
+#[test]
+fn parallel_cancel_all_matches_serial_long_run_emptying_books() {
+    let blocks = long_emptying_run_blocks();
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        let (serial, serial_obs) = run_par(&blocks, mode, 1);
+        for workers in [2, 4, 64] {
+            let what = format!("{mode:?} workers={workers}");
+            let (par, par_obs) = run_par(&blocks, mode, workers);
+            assert_eq!(
+                par_obs.parallel_runs, 1,
+                "{what}: the one run used the pool"
+            );
+            assert_eq!(par_obs.counters, serial_obs.counters, "{what}: counters");
+            assert_eq!(par, serial, "{what}: parallel cancel-all diverged");
+        }
+    }
+}
+
+/// (c) Senders with only pending stops, in several books: the parallel pass
+/// takes their stops, releases the same reservations, marks the same books
+/// dirty and persists the same rows as the serial loop, in all four modes.
+#[test]
+fn parallel_cancel_all_of_stop_only_senders_matches_serial() {
+    let mut setup = Vec::new();
+    for s in 1..=6u8 {
+        for m in MARKETS {
+            if !(s as u64 + m).is_multiple_of(3) {
+                setup.push((addr(s), stop_buy(m, 200 + s as i64)));
+            }
+        }
+    }
+    let placed = setup.len();
+    for m in MARKETS {
+        setup.push((addr(7), gtc(m, true, 99, 1)));
+        setup.push((addr(8), gtc(m, false, 110, 1)));
+    }
+    let block = vec![
+        (addr(1), cancel_all(None)),
+        (addr(2), cancel_all(None)),
+        (addr(3), cancel_all(Some(2))),
+        (addr(4), cancel_all(Some(3))),
+        (addr(5), cancel_all(None)),
+        (addr(7), cancel_all(None)),
+        (addr(6), cancel_all(Some(77))),
+    ];
+    let blocks = vec![setup, block];
+    for mode in [
+        BookMode::Classic,
+        BookMode::OrderRows,
+        BookMode::LevelAuthority,
+        BookMode::LevelAuthorityChunked,
+    ] {
+        let (serial, serial_obs) = run_par(&blocks, mode, 1);
+        assert!(
+            serial.pending_stops > 0 && serial.pending_stops < placed,
+            "{mode:?}: {} of {placed} stops left",
+            serial.pending_stops
+        );
+        assert!(serial.results[1].iter().all(|r| r.1), "{mode:?}");
+        for workers in [2, 4] {
+            let what = format!("{mode:?} workers={workers}");
+            let (par, par_obs) = run_par(&blocks, mode, workers);
+            assert_eq!(par_obs.parallel_runs, 1, "{what}: the run used the pool");
+            assert_eq!(par_obs.counters, serial_obs.counters, "{what}: counters");
+            assert_eq!(par, serial, "{what}: stop-only cancel-alls diverged");
+        }
+    }
+}
+
+/// (d) The counter scenario of `cancel_all_counters_count_visited_and_hit_books`
+/// on the parallel pass: 3 books visited, 3 hit, the same dirty marks.
+#[test]
+fn parallel_cancel_all_counts_visited_and_hit_books() {
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        let (_dir, mut ctx) = counter_setup(mode, true);
+        ctx.cancel_all_workers = 4;
+        ctx.cancel_all_min_visits = 0;
+        let block = vec![
+            (addr(1), cancel_all(None)),
+            (addr(2), cancel_all(None)),
+            (addr(3), cancel_all(Some(4))),
+            (addr(1), cancel_all(None)),
+            (addr(3), cancel_all(Some(77))),
+        ];
+        let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true);
+        let what = format!("{mode:?}");
+        assert!(
+            r.results.iter().all(|r| r.success),
+            "{what}: {:?}",
+            r.results
+        );
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        assert_eq!(ctx.test_cancel_all_parallel_runs, 1, "{what}");
+        let a = ctx.phase_accum;
+        assert_eq!(a.cancel_alls, 5, "{what}");
+        assert_eq!(a.cancel_all_books_visited, 3, "{what}");
+        assert_eq!(a.cancel_all_books_hit, 3, "{what}");
+        let mut dirty: Vec<_> = ctx.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        assert_eq!(dirty, vec![1, 2, 3], "{what}");
+        assert_eq!(ctx.order_books[&1].open_order_count(&addr(1)), 0, "{what}");
+        assert_eq!(ctx.order_books[&2].open_order_count(&addr(1)), 0, "{what}");
+        assert_eq!(ctx.order_books[&3].pending_stop_count(), 0, "{what}");
+        assert!(assert_index_covers_books(&ctx, &what));
+    }
+}
+
+/// Merge of main (parallel cancel-all) into item 7 step 2 (B16): the books a parallel
+/// cancel-all run empties get their bbo rows deleted at the save, the books it leaves
+/// non-empty carry their new top of book, exactly as the dirty marks of the serial pass
+/// (the differential tests above also compare `CF_NATIVE_BBO`, serial vs parallel).
+#[test]
+fn parallel_cancel_all_writes_the_bbo_rows_of_its_books() {
+    let bbo_rows = |ctx: &NativeExecContext| -> Vec<(Vec<u8>, Vec<u8>)> {
+        ctx.state
+            .iterate_cf(CF_NATIVE_BBO, None)
+            .expect("iterate bbo")
+    };
+    let blocks = long_emptying_run_blocks();
+    assert_eq!(blocks.len(), 2, "setup + one emptying run");
+    for mode in [
+        BookMode::Classic,
+        BookMode::OrderRows,
+        BookMode::LevelAuthority,
+        BookMode::LevelAuthorityChunked,
+    ] {
+        let what = format!("{mode:?}");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ctx = new_ctx(&dir, mode);
+        ctx.cancel_all_workers = 4;
+        ctx.cancel_all_min_visits = 0;
+
+        NativeExecutor::execute_batch_cancel_mode(&mut ctx, &blocks[0], true);
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        ctx.save_order_books();
+        ctx.dirty_books.clear();
+        let keys: Vec<Vec<u8>> = bbo_rows(&ctx).into_iter().map(|(k, _)| k).collect();
+        let want: Vec<Vec<u8>> = MARKETS.iter().map(|m| m.to_be_bytes().to_vec()).collect();
+        assert_eq!(keys, want, "{what}: every setup book has a bbo row");
+
+        NativeExecutor::execute_batch_cancel_mode(&mut ctx, &blocks[1], true);
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        assert_eq!(
+            ctx.test_cancel_all_parallel_runs, 1,
+            "{what}: the run used the pool"
+        );
+        let mut dirty: Vec<_> = ctx.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        assert_eq!(dirty, MARKETS.to_vec(), "{what}: every book was hit");
+        ctx.save_order_books();
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        // The row of each book as its top now stands; an empty book has none.
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = ctx
+            .order_books
+            .iter()
+            .map(|(m, b)| (*m, b.bbo_row()))
+            .filter(|(_, r)| *r != [0u8; 32])
+            .map(|(m, r)| (m.to_be_bytes().to_vec(), r.to_vec()))
+            .collect();
+        want.sort_unstable();
+        let got = bbo_rows(&ctx);
+        assert_eq!(got, want, "{what}: bbo rows follow the books");
+        for m in [1u64, 3, 4] {
+            assert!(
+                !got.iter().any(|(k, _)| *k == m.to_be_bytes()),
+                "{what}: emptied book {m} keeps no bbo row"
+            );
+        }
+    }
+}
+
+fn gtc_cloid(market_id: MarketId, is_buy: bool, price: i64, cloid: u128) -> NativeAction {
+    let NativeAction::PlaceOrder(mut p) = gtc(market_id, is_buy, price, 1) else {
+        unreachable!()
+    };
+    p.client_order_id = Some(cloid);
+    NativeAction::PlaceOrder(p)
+}
+
+/// (e) Cloids freed by a parallel run are reusable in the same block: the
+/// cloid pre-pass after Phase 1 sees the books the jobs left. Senders 1-20
+/// cancel everything, then (places do not break a run) senders 1-24 place
+/// their cloids again: 1-20 reuse them, 21-24 are duplicates. Equal to the
+/// serial loop; both indexes cover the books after every block.
+#[test]
+fn parallel_cancel_all_then_cloid_reuse_matches_serial() {
+    let cloid = |s: u8, m: MarketId| 0xC0_0000 + (s as u128) * 16 + m as u128;
+    let place = |s: u8, m: MarketId, away: i64| {
+        let buy = s.is_multiple_of(2);
+        gtc_cloid(
+            m,
+            buy,
+            if buy { 97 - away } else { 113 + away },
+            cloid(s, m),
+        )
+    };
+    let mut blocks = setup_blocks();
+    blocks.push(
+        (1..=24u8)
+            .flat_map(|s| MARKETS.map(|m| (addr(s), place(s, m, 0))))
+            .collect(),
+    );
+    let mut block: Vec<_> = (1..=20u8).map(|s| (addr(s), cancel_all(None))).collect();
+    block.extend((1..=24u8).flat_map(|s| MARKETS.map(|m| (addr(s), place(s, m, 1)))));
+    blocks.push(block);
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        let (serial, serial_obs) = run_par(&blocks, mode, 1);
+        let last = serial.results.last().expect("blocks");
+        assert!(
+            last[..20].iter().all(|r| r.0 == "cancel_all" && r.1),
+            "{mode:?}"
+        );
+        let places = &last[20..];
+        assert_eq!(
+            places.iter().filter(|r| r.1).count(),
+            20 * 4,
+            "{mode:?}: reused"
+        );
+        assert_eq!(
+            places.iter().filter(|r| !r.1).count(),
+            4 * 4,
+            "{mode:?}: duplicates"
+        );
+        for workers in [2, 4] {
+            let what = format!("{mode:?} workers={workers}");
+            let (par, par_obs) = run_par(&blocks, mode, workers);
+            assert_eq!(par_obs.parallel_runs, 1, "{what}: the run used the pool");
+            assert_eq!(par_obs.counters, serial_obs.counters, "{what}: counters");
+            assert_eq!(par, serial, "{what}: cloid reuse after cancel-all diverged");
+        }
+    }
+}
+
+/// (f) A panicking job fail-stops the block: `fatal_error` names the market,
+/// Phase 2 never runs (no fill, no order id taken, nothing new rests), the
+/// panicking book leaves the context, the test thread does not unwind and a
+/// second batch on the context (as the post-EVM batch) runs without
+/// panicking. The same block with the work gate shut (`min_visits =
+/// usize::MAX`: the serial loop, where the plant never fires) runs clean.
+/// A context that already carries a fault (e.g. a load error) still stops
+/// at the panic, and keeps its first fault.
+#[test]
+fn parallel_cancel_all_worker_panic_fail_stops_before_phase_2() {
+    const PLANT: MarketId = 3;
+    let mut block: Vec<_> = (1..=10u8).map(|s| (addr(s), cancel_all(None))).collect();
+    // Places inside the run: a crossing buy (fills against the setup's asks)
+    // and a resting bid, from senders with nothing on the books.
+    block.push((addr(SENDERS + 1), gtc(1, true, 111, 2)));
+    block.push((addr(SENDERS + 2), gtc(2, true, 95, 1)));
+    let preexisting = "margin configs: planted load error (test)";
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        for (serial, prior_fault) in [(false, false), (true, false), (false, true)] {
+            let what = format!("{mode:?} serial={serial} prior_fault={prior_fault}");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut ctx = new_ctx(&dir, mode);
+            NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup_blocks()[0], true);
+            ctx.save_order_books();
+            ctx.dirty_books.clear();
+            assert!(ctx.fatal_error.is_none(), "{what}");
+            ctx.cancel_all_workers = 4;
+            ctx.cancel_all_min_visits = if serial { usize::MAX } else { 0 };
+            ctx.test_cancel_all_panic_market = Some(PLANT);
+            if prior_fault {
+                ctx.fatal_error = Some(preexisting.to_string());
+            }
+            let (fills, next_id) = (ctx.trade_index, ctx.next_global_order_id);
+
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true)
+            }))
+            .unwrap_or_else(|_| panic!("{what}: the executing thread unwound"));
+
+            if serial {
+                assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+                assert_eq!(ctx.test_cancel_all_parallel_runs, 0, "{what}");
+                assert!(
+                    r.results.iter().all(|r| r.success),
+                    "{what}: {:?}",
+                    r.results
+                );
+                assert!(ctx.trade_index > fills, "{what}: the crossing buy filled");
+                assert!(ctx.next_global_order_id > next_id, "{what}");
+                continue;
+            }
+            assert_eq!(ctx.test_cancel_all_parallel_runs, 1, "{what}");
+            let fatal = ctx.fatal_error.clone().expect("fatal latched");
+            if prior_fault {
+                assert_eq!(fatal, preexisting, "{what}: the first fault is kept");
+            } else {
+                assert!(
+                    fatal.contains(&format!("market {PLANT}"))
+                        && fatal.contains("planted cancel-all worker panic"),
+                    "{what}: {fatal}"
+                );
+            }
+            for r in &r.results[..10] {
+                assert!(r.action_type == "cancel_all" && !r.success, "{what}: {r:?}");
+            }
+            // Phase 2 never ran: no fill, no order id assigned, nothing new rests.
+            assert_eq!(ctx.trade_index, fills, "{what}");
+            assert_eq!(ctx.next_global_order_id, next_id, "{what}");
+            for id in next_id..next_id + block.len() as u128 {
+                assert!(
+                    ctx.order_books.values().all(|b| b.get_order(id).is_none()),
+                    "{what}: order {id} rests"
+                );
+            }
+            // The panicking book left the context; the others stayed.
+            assert!(ctx.order_book(PLANT).is_none(), "{what}");
+            for m in MARKETS.into_iter().filter(|&m| m != PLANT) {
+                assert!(ctx.order_book(m).is_some(), "{what}: book {m}");
+            }
+
+            // A second batch on the fatal context (the post-EVM batch runs
+            // before the committer's check) does not panic either.
+            let second = vec![
+                (addr(11), cancel_all(None)),
+                (addr(12), cancel_all(None)),
+                (addr(SENDERS + 3), gtc(PLANT, true, 95, 1)),
+            ];
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                NativeExecutor::execute_batch_cancel_mode(&mut ctx, &second, true)
+            }))
+            .unwrap_or_else(|_| panic!("{what}: the second batch unwound"));
+            assert_eq!(
+                ctx.fatal_error.as_deref(),
+                Some(fatal.as_str()),
+                "{what}: latch kept"
+            );
+        }
+    }
+}
+
+/// Thread-scoped allocation counters for the Codex s123 flag-off witness
+/// below (as torus-state's `native_trie` alloc witness: installed only in
+/// this crate's `cfg(test)` lib binary, per THREAD so the harness's other
+/// tests do not disturb the count).
+mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    #[inline]
+    fn bump() {
+        let _ = ALLOCS.try_with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    // SAFETY: every method forwards to `System` unchanged; the counter is a
+    // thread-local `Cell` with a const initialiser, so it never allocates and
+    // never re-enters the allocator.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc_zeroed(l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            bump();
+            unsafe { System.realloc(p, l, new) }
+        }
+    }
+
+    /// Allocations (alloc, alloc_zeroed, realloc) `f` performs ON THIS THREAD.
+    pub fn measure<R>(f: impl FnOnce() -> R) -> (u64, R) {
+        let a0 = ALLOCS.with(Cell::get);
+        let r = f();
+        (ALLOCS.with(Cell::get) - a0, r)
+    }
+}
+
+#[global_allocator]
+static COUNTING_ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
+
+/// `books` books where addr(1) and addr(2) each rested one order that has
+/// since left the book without the cancel-all index hearing of it (a
+/// supported stale entry: the index is a superset), so a run of their two
+/// cancel-alls visits every book and removes nothing ("empty hits").
+fn stale_index_ctx(dir: &tempfile::TempDir, mode: BookMode, books: u64) -> NativeExecContext {
+    let mut ctx = new_ctx(dir, mode);
+    let setup: Vec<_> = (1..=books)
+        .flat_map(|m| {
+            [
+                (addr(1), gtc(m, true, 98, 1)),
+                (addr(2), gtc(m, false, 110, 1)),
+            ]
+        })
+        .collect();
+    NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup, true);
+    ctx.save_order_books();
+    ctx.dirty_books.clear();
+    let _ = ctx.cancel_index();
+    for book in ctx.order_books.values_mut() {
+        assert_eq!(book.cancel_all_many(&[addr(1), addr(2)]).concat().len(), 2);
+    }
+    ctx.phase_accum = ExecPhaseAccum::default();
+    ctx
+}
+
+/// The run's own allocations on the flag-OFF serial path, beyond those of
+/// the book calls it makes (`take_pending_stops` per member, one
+/// `cancel_all_many` per book), measured on a twin context.
+fn serial_run_overhead_allocs(mode: BookMode, books: u64) -> u64 {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut ctx = stale_index_ctx(&dir_a, mode, books);
+    let mut twin = stale_index_ctx(&dir_b, mode, books);
+    ctx.cancel_all_workers = 1;
+    let run = [(0, addr(1), None), (1, addr(2), None)];
+    let (run_allocs, results) =
+        alloc_count::measure(|| NativeExecutor::exec_cancel_all_run(&mut ctx, &run));
+    let what = format!("{mode:?} books={books}");
+    let results = results.unwrap_or_else(|_| panic!("{what}: the serial run failed"));
+    assert!(results.iter().all(|r| r.success), "{what}");
+    assert_eq!(ctx.test_cancel_all_parallel_runs, 0, "{what}: serial path");
+    assert_eq!(
+        ctx.phase_accum.cancel_all_books_visited,
+        2 * books,
+        "{what}"
+    );
+    assert_eq!(ctx.phase_accum.cancel_all_books_hit, 0, "{what}");
+
+    let mut mids: Vec<MarketId> = twin.order_books.keys().copied().collect();
+    mids.sort_unstable();
+    let senders = [addr(1), addr(2)];
+    let (book_allocs, ()) = alloc_count::measure(|| {
+        for m in &mids {
+            let book = twin.order_books.get_mut(m).unwrap();
+            for s in &senders {
+                drop(book.take_pending_stops(s));
+            }
+            drop(book.cancel_all_many(&senders));
+        }
+    });
+    run_allocs - book_allocs
+}
+
+/// Codex s123 review P2 (flag OFF, `TORUS_PARALLEL_CANCEL_ALL` unset): the
+/// serial cancel-all run allocates exactly as main — its two scratch
+/// buffers once per run, groups walked in place — so its own allocations
+/// do not grow with the markets it visits (the flag-off branch allocated
+/// two buffers per visited market plus the group list: 300 markets, main
+/// 1202 allocations, branch 1808).
+#[test]
+fn serial_cancel_all_run_allocations_do_not_grow_with_markets() {
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        let small = serial_run_overhead_allocs(mode, 60);
+        let large = serial_run_overhead_allocs(mode, 300);
+        assert_eq!(
+            small, large,
+            "{mode:?}: the serial run's own allocations grew with its markets (60 books: \
+             {small}, 300 books: {large})"
+        );
+    }
+}
+
+/// Codex s123 review P2 (flag ON): the parallel book pass lends the run's
+/// books without walking every resident book: 2 targeted markets among
+/// 1000 resident books examine 2 map entries (was all 1000).
+#[test]
+fn parallel_cancel_all_examines_only_the_runs_books() {
+    // A sender rests at most 1000 orders per block height.
+    const BOOKS: u64 = 1000;
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ctx = new_ctx(&dir, mode);
+        let mut setup: Vec<_> = (1..=BOOKS)
+            .map(|m| (addr(2), gtc(m, true, 98, 1)))
+            .collect();
+        setup.extend([
+            (addr(1), gtc(7, true, 99, 1)),
+            (addr(1), gtc(900, false, 110, 1)),
+        ]);
+        NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup, true);
+        ctx.save_order_books();
+        ctx.dirty_books.clear();
+        ctx.phase_accum = ExecPhaseAccum::default();
+        ctx.cancel_all_workers = 4;
+        ctx.cancel_all_min_visits = 0;
+        let block = vec![(addr(1), cancel_all(None)), (addr(3), cancel_all(None))];
+        let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true);
+        let what = format!("{mode:?}");
+        assert!(
+            r.results.iter().all(|r| r.success),
+            "{what}: {:?}",
+            r.results
+        );
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        assert_eq!(
+            ctx.test_cancel_all_parallel_runs, 1,
+            "{what}: the run used the pool"
+        );
+        assert_eq!(
+            ctx.test_cancel_all_parallel_books_examined, 2,
+            "{what}: books examined to lend the run's 2 books"
+        );
+        assert_eq!(ctx.phase_accum.cancel_all_books_visited, 2, "{what}");
+        assert_eq!(ctx.phase_accum.cancel_all_books_hit, 2, "{what}");
+        assert_eq!(
+            ctx.order_books.len() as u64,
+            BOOKS,
+            "{what}: every book stays"
+        );
+        assert!(ctx
+            .order_books
+            .values()
+            .all(|b| b.open_order_count(&addr(1)) == 0));
+        assert!(ctx
+            .order_books
+            .values()
+            .all(|b| b.open_order_count(&addr(2)) == 1));
+        let mut dirty: Vec<_> = ctx.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        assert_eq!(dirty, vec![7, 900], "{what}");
+        assert!(assert_index_covers_books(&ctx, &what));
     }
 }

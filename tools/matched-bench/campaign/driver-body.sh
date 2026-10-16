@@ -14,23 +14,35 @@
 # is a CELL FAIL, cell_step flags its row death and queues a rerun, the campaign goes on), memguard (MemAvailable
 # < 6 GB stops the cell unit), hardscan (HARD FINDING lines: panic / fail-stop / state hash mismatch at WARN/ERROR).
 # SAMPLERS=1 (spec "samplers", default on): du, memory, metrics, fd (a node above FD_STOP open fds stops the
-# campaign after its cell), vmstat 1 Hz, the RocksDB LOG copies. HOST_CHECKS=1 (spec "host_checks", default on):
+# campaign after its cell), the 1 Hz soak sampler (SOAKPY: metrics-1hz.txt.gz + host-1hz.tsv), vmstat 1 Hz, the
+# RocksDB LOG copies. HOST_CHECKS=1 (spec "host_checks", default on):
 # run preflight MemAvailable >= MIN_MEM_AVAIL_KB; the writeback sysctls recorded at each cell's start and end
 # (sysctl.txt) and held to SYSCTL_WANT (the spec's values; the dirty limits it does not give are pinned at the run's
 # preflight); heavy analysis processes (perf, flamegraph, jeprof, ...) keep quiet() waiting.
+# Warm-up gate (spec warmup.gate, default on): a GATE_TAGS cell (the warm-up, the smoke cell) must end run-cell rc 0,
+# validity ACCEPT, agreement AGREE, liveness PASS, 0 panic/fail-stop lines (warmgatechk), else CHECK FAIL and the
+# campaign stops before any measured cell. Campaign checks (spec checks): CHECKS_SOURCE is sourced at preflight
+# (load_checks), each CHECK_FNS function runs after every cell as FN LABEL ARM; non-zero = CHECK FAIL (bad:check, stop).
+# Check scoping (Codex P2: bash variables are dynamic, so a check saw every calling function's locals, rc=0 for its
+# own rc=1): a check sees its file's top-level variables as sourced at preflight, the driver globals (DRIVER_VARS),
+# the environment and the shell's own variables, and no driver function's local, in both directions: the file is
+# sourced from frames without locals and its variables kept (load_checks); each check runs through _run_check,
+# which unsets every other visible name and re-declares the file's. The prefix _DRV_ is the driver's (preflight
+# refuses a checks file that uses it). Limits: load_checks' header.
 # Test-only overrides: DRIVER_PROC (a fake /proc: node exe/environ, meminfo), DRIVER_DETACH (a fake detach.sh).
 set -u
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 PROC=${DRIVER_PROC:-/proc}
 HARNESS=$TOOLS/run-cell.sh
 DETACH=${DRIVER_DETACH:-$TOOLS/campaign/detach.sh}
+SOAKPY=$TOOLS/soak-sampler.py   # samplers: the hand drivers' 1 Hz sidecar (tools/matched-bench/soak-sampler.py)
 UNIT_NAME=$CAMPAIGN
 MIN_FREE_MB=${MIN_FREE_MB:-20000}
 QUIET_WAIT_S=${QUIET_WAIT_S:-3600}
 SMOKE=          # 1 = the smoke run (apply_smoke); the driver's own, never the caller's
 GENESIS_ROOT=   # run-cell.sh's MAINREPO = $TOOLS/../.. (preflight_genesis)
 DD=${DEVNET:-}          # the devnet data root (data/val<i>, run/pids, run/val<i>.log), the Job 4 helpers' name for it
-METS=(9161 9162 9163)   # the devnet nodes' metrics ports (run-cell.sh METS): memsamp and ckptsamp scrape them
+METS=(9161 9162 9163)   # the devnet nodes' metrics ports (run-cell.sh METS): memsamp, ckptsamp and SOAKPY scrape them
 FD_STOP=16384           # samplers: a node that held more open fds in a cell stops the campaign after it (stop-fd)
 CRASHCELL=0             # restart cells are not a generator shape (CRASH_KILL_AT_S is a SPEC ERROR): watch_nodes' restart branch never runs
 # host checks: the sysctls each cell's sysctl.txt line records (the Job 4 set); the dirty limits are held to the
@@ -43,9 +55,9 @@ SYSCTL_PIN="vm.dirty_bytes vm.dirty_background_bytes"
 # test_make_driver.py checks that each name the config or the body assigns at top level is listed.
 DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP
  ABIN AENV AXE AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL
- ANALYSIS_CMD ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT SELF PROC HARNESS DETACH UNIT_NAME
- MIN_FREE_MB QUIET_WAIT_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
- TAGS STARTED_LABEL CELL_FAIL DRIVER_VARS"
+ ANALYSIS_CMD ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT SELF PROC HARNESS DETACH SOAKPY
+ UNIT_NAME MIN_FREE_MB QUIET_WAIT_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
+ TAGS STARTED_LABEL CELL_FAIL GATE_TAGS CHECKS_SOURCE CHECK_FNS DRIVER_VARS"
 # run-cell.sh generates each cell's genesis from ITS OWN repo root ($TOOLS/../..), not from the harness worktree
 # it is handed (which only launches the nodes): a frozen tools copy must carry these, equal to the harness's
 GENESIS_INPUTS="devnet/wsl/gen-3val-genesis.sh devnet/wsl/bench-validator-keys.json devnet/genesis.json
@@ -82,7 +94,14 @@ show_plan() { # [smoke]: the plan as tables (make-driver tests compare these wit
     echo "PATH RUN $RUN"; echo "PATH P $P"; echo "PATH MARKETS $MARKETS"; echo "PATH RATE $RATE"
     echo "PATH TOOLS $TOOLS"; echo "PATH WT_H $WT_H"; echo "PATH DEVNET $DEVNET"; echo "PATH BASELINE $BASELINE"
     echo "WATCH node-death memguard hardscan"
-    if [ "$SAMPLERS" = 1 ]; then echo "SAMPLERS on du mem metrics fd vmstat rocksdb-log fd_stop=$FD_STOP"; else echo "SAMPLERS off"; fi
+    if [ "$SAMPLERS" = 1 ]; then
+        echo "SAMPLERS on du mem metrics fd soak-1hz vmstat rocksdb-log fd_stop=$FD_STOP"
+        echo "SOAK on $SOAKPY metrics-1hz.txt.gz host-1hz.tsv"
+    else
+        echo "SAMPLERS off"
+    fi
+    if [ -n "$GATE_TAGS" ]; then echo "WARMGATE on $GATE_TAGS"; else echo "WARMGATE off"; fi
+    if [ -n "$CHECKS_SOURCE" ]; then echo "CHECKS $CHECKS_SOURCE $CHECK_FNS"; else echo "CHECKS none"; fi
     if [ "$HOST_CHECKS" = 1 ]; then
         echo "HOSTCHECK on min_mem_avail_kb=$MIN_MEM_AVAIL_KB"
         for k in $(sysctl_names); do echo "SYSCTL $k ${SYSCTL_WANT[$k]:-pinned}"; done
@@ -342,13 +361,17 @@ savelog() { # label: copy each validator's RocksDB LOG (+ LOG.old.* rotated duri
     echo "[$(date +%T)] saved RocksDB LOG for $label: $(ls "$R/$label"/rocksdb-LOG* 2>/dev/null | wc -l) files"
     dumeas "$label"
 }
-soakchk() { # label dur: sampler coverage, recorded, never fails (after the Job 4 driver's soakchk, whose soak sidecar
-    # metrics-1hz / host-1hz is not ported)
-    local o=$R/$1 v m s f d k
+soakchk() { # label dur: sampler coverage, recorded, never fails (after the Job 4 driver's soakchk): the soak sidecar's
+    # metrics-1hz ok scrapes (3 nodes x dur expected) and host-1hz rows (dur expected) below that are a CHECK WARN
+    local o=$R/$1 v m s f d k n h
     v=$(grep -c -E ':[0-9]{2}$' "$o/vmstat-1hz.txt" 2>/dev/null); m=$(grep -c '^M ' "$o/mem-samples.txt" 2>/dev/null)
     s=$(ls "$o"/smaps 2>/dev/null | wc -l); f=$(cat "$o/fds.txt" 2>/dev/null | wc -l)
     d=$(cat "$o/data-du-samples.txt" 2>/dev/null | wc -l); k=$(grep -c '^T .* ok$' "$o/ckpt-samples.txt" 2>/dev/null)
-    echo "CHECK SOAK $1: vmstat rows ${v:-0} (cell $2 s), mem samples ${m:-0}, smaps snapshots $s, fd rows $f, du rows $d, metrics ok scrapes ${k:-0}"
+    n=$(zcat "$o/metrics-1hz.txt.gz" 2>/dev/null | grep -c '^T .* ok '); h=$(($(cat "$o/host-1hz.tsv" 2>/dev/null | wc -l) - 1))
+    [ "$h" -ge 0 ] || h=0
+    echo "CHECK SOAK $1: vmstat rows ${v:-0} (cell $2 s), mem samples ${m:-0}, smaps snapshots $s, fd rows $f, du rows $d, metrics ok scrapes ${k:-0}, metrics-1hz ok scrapes ${n:-0}, host-1hz rows $h"
+    [ "${n:-0}" -ge $(($2 * 3)) ] || echo "CHECK WARN $1: metrics-1hz has ${n:-0} ok scrapes (< 3 x $2)"
+    [ "$h" -ge "$2" ] || echo "CHECK WARN $1: host-1hz has $h rows (< $2)"
 }
 
 # ---- host checks (HOST_CHECKS=1) ----
@@ -451,6 +474,67 @@ expectchk() { # o arm: the spec's expectations for every arm (EXP_ARM '*') and f
     return $rc
 }
 
+gated() { # tag: 0 = the cell is a warm-up gate cell (GATE_TAGS; its rerun too)
+    local g
+    for g in $GATE_TAGS; do [ "$1" = "$g" ] || [ "$1" = "$g-rerun" ] && return 0; done
+    return 1
+}
+
+warmgatechk() { # label rc: the warm-up gate: run-cell rc 0, summary.json validity ACCEPT, agreement AGREE, liveness
+    # PASS, agreement.panic_or_failstop_lines 0. rc 1 = CHECK FAIL (the campaign stops)
+    local label=$1 rc=$2 r
+    [ "$rc" = 0 ] || { echo "CHECK FAIL $label: warm-up gate: run-cell rc=$rc"; return 1; }
+    r=$(python3 -I -c '
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as ex:
+    print("cannot read %s: %s" % (sys.argv[1], ex)); sys.exit(1)
+a, h = s.get("agreement") or {}, s.get("headline") or {}
+v = (s.get("validity") or {}).get("verdict")
+lv = (s.get("liveness") or {}).get("verdict")
+ag = h.get("agreement_verdict")
+pf = a.get("panic_or_failstop_lines")
+print("validity=%s agreement=%s liveness=%s panic_or_failstop_lines=%s consensus_timeouts=%s matched/s=%s" % (v, ag, lv, pf, h.get("consensus_timeouts"), h.get("matched_s_avg")))
+sys.exit(0 if (v == "ACCEPT" and ag == "AGREE" and lv == "PASS" and pf == 0) else 1)
+' "$R/$label/summary.json" 2>&1) || { echo "CHECK FAIL $label: warm-up gate: $r"; return 1; }
+    echo "CHECK OK $label warm-up gate: $r"
+}
+
+_run_check() { # FN LABEL ARM: one campaign check, in campaignchecks' subshell. Bash variables are dynamically
+    # scoped (a subshell too): FN would see the locals of every function on the stack (campaignchecks, cell,
+    # run_spec, run_cells or cell_step_rerun_pass), e.g. campaignchecks' rc=0 for its file's rc=1 (Codex P2). So:
+    # unset every visible variable that is not the shell's own, exported, a driver global (DRIVER_VARS) or one the
+    # checks file set (_DRV_KEEP, load_checks), each unset peeling one calling frame's local until none is left;
+    # then the file's variables as sourced (_DRV_DECL: declare inside a function = a local of this one, so no
+    # caller's local can shadow them; FN's helpers see them too); then FN LABEL ARM (no variable holds FN's name)
+    [ -n "${_DRV_KEEP:-}" ] || { echo "CHECK FAIL $2: campaign check $1: the checks are not loaded (load_checks)"; return 2; }
+    _DRV_KEEP+="$(compgen -e | tr '\n' ' ') "
+    for _DRV_N in $(declare -p | sed -n -E 's/^declare -[^ ]* ([A-Za-z_][A-Za-z0-9_]*)(=.*)?$/\1/p'); do
+        case $_DRV_N in BASH*|_DRV_*) continue ;; esac
+        case $_DRV_KEEP in *" $_DRV_N "*) continue ;; esac
+        _DRV_I=0
+        while [ $((_DRV_I += 1)) -le 64 ] && declare -p "$_DRV_N" > /dev/null 2>&1; do
+            unset -v "$_DRV_N" 2>/dev/null || break
+        done
+    done
+    eval "$_DRV_DECL"
+    unset -v "${!_DRV_@}"
+    "$@"
+}
+
+campaignchecks() { # label arm: each spec checks.per_cell function (CHECK_FNS) as FN LABEL ARM, in a subshell through
+    # _run_check: it sees its checks file's variables as sourced at preflight and the driver's globals (R, AENV,
+    # AXE, ...), never a local of a driver function; it cannot change driver state. All run, so one cell shows
+    # every failure
+    local fn r rc=0
+    for fn in $CHECK_FNS; do
+        ( _run_check "$fn" "$1" "$2" ); r=$?
+        [ "$r" = 0 ] || { echo "CHECK FAIL $1: campaign check $fn returned $r (arm $2)"; rc=1; }
+    done
+    return $rc
+}
+
 cellchecks() { # o arm: every standard check (all run, so one cell shows every failure)
     local rc=0
     md5chk "$1" "$2" || rc=1
@@ -463,7 +547,7 @@ cellchecks() { # o arm: every standard check (all run, so one cell shows every f
 # ---- one cell ----
 cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a started cell sets CELL_FAIL)
     local tg=$1 arm=$2 dur=$3 b label rcf unit EP= t=0 rc nt=0 kv crc=0 fdok=0
-    local WP= GP= DP= KP= MP= FP= VMP= mp= HP=
+    local WP= GP= DP= KP= MP= FP= SKP= VMP= mp= HP=
     local -a E
     b=${ABIN[$arm]:-}
     [ -n "$b" ] || { log "ABORT: unknown arm $arm"; return 1; }
@@ -482,6 +566,7 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
         ckptsamp "$R/$label" & KP=$!
         memsamp "$R/$label" & MP=$!
         fdsampler "$R/$label" & FP=$!
+        python3 -I "$SOAKPY" "$R/$label" "${METS[@]}" & SKP=$!
         timeout $((dur + 1200)) vmstat -n -t 1 > "$R/$label/vmstat-1hz.txt" 2>&1 & VMP=$!
     fi
     # OVERWRITE=1 (as Job 4): sysctl.txt and the samplers' files are in the cell dir before run-cell.sh, which refuses
@@ -492,12 +577,12 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     [ -z "${BBMD5[$b]}" ] || E+=(EXPECT_BENCH_MD5="${BBMD5[$b]}")
     "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
         "${E[@]}" "$HARNESS" "$WT_H" "$label" "$MARKETS" "$dur" "$RATE" "${AXE[$arm]}" \
-        || { stopbg "$EP" "$DP" "$KP" "$MP" "$FP" "$VMP"; CELL_FAIL=abort-detach; return 1; }
+        || { stopbg "$EP" "$DP" "$KP" "$MP" "$FP" "$SKP" "$VMP"; CELL_FAIL=abort-detach; return 1; }
     # the harness pid: run-cell.sh, the child of the unit's main process (the cellwrap bash); watch_nodes TERMs it
     until mp=$(systemctl --user show -p MainPID --value "$unit.service" 2>/dev/null) && [ -n "$mp" ] && [ "$mp" != 0 ] \
           && HP=$(pgrep -P "$mp" | head -1) && [ -n "$HP" ]; do
         sleep 0.2; t=$((t+1))
-        [ $t -gt 150 ] && { log "ABORT: no run-cell.sh pid in $unit"; systemctl --user stop "$unit.service"; stopbg "$EP" "$DP" "$KP" "$MP" "$FP" "$VMP"; CELL_FAIL=abort-no-pid; return 1; }
+        [ $t -gt 150 ] && { log "ABORT: no run-cell.sh pid in $unit"; systemctl --user stop "$unit.service"; stopbg "$EP" "$DP" "$KP" "$MP" "$FP" "$SKP" "$VMP"; CELL_FAIL=abort-no-pid; return 1; }
     done
     log "$label unit=$unit main_pid=$mp harness_pid=$HP ($(cat /proc/$HP/comm 2>/dev/null))"
     watch_nodes "$R/$label" "$HP" & WP=$!
@@ -508,13 +593,18 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     wait "$WP"
     while [ -n "$(pgrep -x torus-node)" ] && [ $nt -lt 60 ]; do sleep 1; nt=$((nt+1)); done
     [ -z "$(pgrep -x torus-node)" ] || log "WARN $label: torus-node still running at LOG copy"
-    stopbg "$DP" "$KP" "$MP" "$GP" "$VMP"; wait "$DP" "$KP" "$MP" "$VMP" 2>/dev/null
+    stopbg "$DP" "$KP" "$MP" "$GP" "$SKP" "$VMP"; wait "$DP" "$KP" "$MP" "$SKP" "$VMP" 2>/dev/null
     if [ "$SAMPLERS" = 1 ]; then
         savelog "$label"
     fi
     # a mid-cell death (watch_nodes): CELL FAIL, no checks; the step flags the row death and queues a rerun
     if [ -e "$R/$label/node-death.txt" ]; then
         stopbg "$EP" "$FP"
+        if gated "$tg"; then   # a warm-up gate cell that lost a node: the campaign stops
+            echo "CHECK FAIL $label: warm-up gate: node death ($(head -1 "$R/$label/node-death.txt"))"
+            sleep 5; [ -z "$(pgrep -x torus-node)" ] || log "WARN: torus-node left running after $label"
+            CELL_FAIL=check; return 1
+        fi
         log "CELL FAIL $label rc=$rc death: $(cat "$R/$label/node-death.txt") -> continuing"
         sleep 5; [ -z "$(pgrep -x torus-node)" ] || { log "ABORT: torus-node left running after $label"; CELL_FAIL=abort-node-left; return 1; }
         return 0
@@ -530,8 +620,12 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
         echo "[$label] $(fdsum "$label")" || true; fdsum "$label" > /dev/null || fdok=1
     fi
     cellchecks "$R/$label" "$arm" || crc=1
+    campaignchecks "$label" "$arm" || crc=1
     if [ "$HOST_CHECKS" = 1 ]; then
         sysctlchk "$label" end || crc=1
+    fi
+    if gated "$tg"; then
+        warmgatechk "$label" "$rc" || crc=1
     fi
     [ "$crc" = 0 ] || { CELL_FAIL=check; return 1; }
     hardscan "$label"
@@ -560,8 +654,65 @@ run_spec() { # SPEC [SUFFIX]: one cell, then its write-up step (cells.tsv row, C
     return $crc
 }
 
+run_cells() { # the campaign: each of CELLS through run_spec in order; 1 = stopped (a cell said stop)
+    local c
+    for c in "${CELLS[@]}"; do
+        run_spec "$c" || { log "CAMPAIGN STOP at ${c%%:*} (queued reruns not run: $RUN/rerun-queue.tsv)"; return 1; }
+    done
+}
+
 # ---- preflight ----
 PF() { echo "PREFLIGHT FAIL: $*"; exit 1; }
+
+decl_warn() { # FILE: PREFLIGHT WARN for each top-level (column 0) `declare -A|-a` without -g: sourced inside
+    # load_checks, bash makes it a local of that function (load_checks keeps it for the checks, no other driver code
+    # sees it), without any error
+    awk -v f="$1" '/^declare[ \t]/ { o = ""; for (i = 2; i <= NF && $i ~ /^-/; i++) o = o $i
+        if (o ~ /[aA]/ && o !~ /g/) printf "PREFLIGHT WARN: %s:%d: %s: top-level declare -A/-a without -g is a local of load_checks (the checks still get it, as sourced; nothing else does): use declare -g%s\n", f, NR, $0, (o ~ /A/ ? "A" : "a") }' "$1"
+}
+
+drv_state() { # load_checks: md5 of every driver function (_DRV_FNS) and of every DRIVER_VARS value
+    { for _DRV_F in $_DRV_FNS; do declare -f "$_DRV_F"; done; declare -p ${DRIVER_VARS//$'\n'/ } 2>/dev/null; } | md5sum
+}
+
+load_checks() { # the spec checks: source CHECKS_SOURCE, then every CHECK_FNS function must be defined, and no driver
+    # function or name may have changed. Scoping (Codex P2; bash variables are dynamic): this function has no
+    # locals (its state is in _DRV_ names, a prefix the checks file may not use) and preflight_static calls it from a
+    # frame without locals, so the file sees only driver globals at source time and each variable its top level
+    # sets is a global or a local of this function (declare without -g, local). _DRV_DECL keeps `declare -p` of each
+    # (the new or changed lines of declare -p across the source, minus the shell's own names, DRIVER_VARS and _DRV_*),
+    # _DRV_KEEP the names _run_check leaves visible. Limits: a top-level assignment that leaves a variable exactly
+    # as it was is not seen (only possible for a pre-existing non-driver global: an env name stays visible anyway);
+    # the snapshot is the preflight's (a check never sees a later change, as before: it runs in a subshell); a
+    # readonly global (readonly NAME at top level) is not in _DRV_DECL (no function can shadow it); the file's
+    # functions are not isolated (it must not redefine a driver function: the md5 below)
+    [ -n "$CHECKS_SOURCE" ] || return 0
+    [ -f "$CHECKS_SOURCE" ] && [ -r "$CHECKS_SOURCE" ] || PF "checks source $CHECKS_SOURCE missing or unreadable (spec checks.source)"
+    _DRV_L=$(grep -n -m1 '_DRV_' "$CHECKS_SOURCE") && PF "$CHECKS_SOURCE:${_DRV_L%%:*}: uses the reserved prefix _DRV_ (the driver keeps its check state in _DRV_ names, comments count too); rename it there"
+    decl_warn "$CHECKS_SOURCE"
+    _DRV_FNS=$(compgen -A function)
+    _DRV_SUM=$(drv_state)
+    _DRV_PRE=$(declare -p)
+    # shellcheck disable=SC1090
+    source "$CHECKS_SOURCE" || PF "cannot source $CHECKS_SOURCE (spec checks.source): it returned $?"
+    _DRV_POST=$(declare -p)
+    _DRV_LOC=$(local)
+    [ "$_DRV_SUM" = "$(drv_state)" ] || PF "$CHECKS_SOURCE redefines a driver function or driver variable (DRIVER_VARS); rename it there"
+    _DRV_KEEP=" $(env -i "$BASH" --norc --noprofile -c 'compgen -v' | tr '\n' ' ')FUNCNAME PIPESTATUS OPTARG COPROC COLUMNS LINES OLDPWD PS1 PS2 PS3 TIMEFORMAT ${DRIVER_VARS//$'\n'/ } "
+    _DRV_DECL=
+    for _DRV_N in $(grep -Fxv -f <(printf '%s\n' "$_DRV_PRE") <<< "$_DRV_POST" | sed -n -E 's/^declare -[^ ]* ([A-Za-z_][A-Za-z0-9_]*)(=.*)?$/\1/p'); do
+        case $_DRV_N in BASH*|_DRV_*) continue ;; esac
+        case $_DRV_KEEP in *" $_DRV_N "*) continue ;; esac
+        _DRV_KEEP+="$_DRV_N "
+        _DRV_L=$(declare -p "$_DRV_N")
+        _DRV_F=${_DRV_L#declare }; _DRV_F=${_DRV_F%% *}
+        if [[ $_DRV_F == *r* ]] && ! grep -q -E "^declare -[^ ]* $_DRV_N(=|\$)" <<< "$_DRV_LOC"; then continue; fi
+        _DRV_DECL+=$_DRV_L$'\n'
+    done
+    for _DRV_N in $CHECK_FNS; do
+        declare -F "$_DRV_N" > /dev/null || PF "check function $_DRV_N is not defined by $CHECKS_SOURCE (spec checks.per_cell)"
+    done
+}
 
 wrapper_target() { # FILE: the absolute path a wrapper script execs (its last `exec PATH` line); fails on a binary
     local t
@@ -589,12 +740,21 @@ preflight_genesis() { # the genesis inputs under run-cell.sh's repo root GENESIS
     return 0
 }
 
-preflight_static() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
+preflight_static() { # preflight_paths, then the spec checks (load_checks), from this frame: it has no locals, which
+    # the checks file would see at source time or set instead of its own variables (load_checks)
+    preflight_paths
+    load_checks
+}
+
+preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
     local f b node m tgt
     for f in "$HARNESS" "$DETACH" "$TOOLS/cell-step.sh" "$TOOLS/cell_step.py"; do [ -f "$f" ] || PF "$f missing"; done
     for f in pgrep zcat timeout; do command -v "$f" > /dev/null || PF "$f missing (the watchers use it)"; done
     if [ "$SAMPLERS" = 1 ]; then
-        for f in vmstat curl gzip du; do command -v "$f" > /dev/null || PF "$f missing (the samplers use it; spec \"samplers\": false runs without them)"; done
+        for f in vmstat curl gzip du python3; do command -v "$f" > /dev/null || PF "$f missing (the samplers use it; spec \"samplers\": false runs without them)"; done
+        [ -f "$SOAKPY" ] || PF "$SOAKPY missing (the 1 Hz soak sampler: copy tools/matched-bench/soak-sampler.py into tools_dir; spec \"samplers\": false runs without it)"
+        python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$SOAKPY" 2>/dev/null || PF "$SOAKPY does not compile"
+        grep -q torus_rpc_submit_admit_seconds_bucket "$SOAKPY" && grep -q torus_commit_interval_seconds_bucket "$SOAKPY" || PF "$SOAKPY lacks the slow-tail buckets (an old soak sampler: copy tools/matched-bench/soak-sampler.py)"
     fi
     [ -d "$WT_H" ] || PF "harness worktree $WT_H missing"
     preflight_genesis
@@ -621,7 +781,7 @@ preflight_static() { # paths, tools, genesis inputs, staged md5s (a wrapper's md
 
 preflight_host() { # run mode only: inside a bench unit, nothing else running, no old attempt; host checks: memory,
     # sysctls (the dirty limits pinned for the whole run)
-    local c g self other
+    local c g self other f x
     self=$(grep -oE 'bench-[^/]*\.service' /proc/self/cgroup | tail -1)
     [ -n "$self" ] || PF "not inside a bench-*.service unit: start it with: $SELF launch${SMOKE:+ smoke} (detach.sh holds the build lock)"
     other=$(systemctl --user list-units 'bench-*.service' --state=active --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -vxF "$self")
@@ -639,9 +799,9 @@ preflight_host() { # run mode only: inside a bench unit, nothing else running, n
     fi
 }
 
-host_str() { # the PREFLIGHT OK line's samplers / host checks part
-    local k
-    printf 'samplers=%s host_checks=%s' "$SAMPLERS" "$HOST_CHECKS"
+host_str() { # the PREFLIGHT OK line's warm-up gate / campaign checks / samplers / host checks part
+    local k g=${GATE_TAGS// /,} c=${CHECK_FNS// /,}
+    printf 'warmgate=%s checks=%s samplers=%s host_checks=%s' "${g:-off}" "${c:-none}" "$SAMPLERS" "$HOST_CHECKS"
     [ "$HOST_CHECKS" = 1 ] || return 0
     printf ' min_mem_avail_kb=%s' "$MIN_MEM_AVAIL_KB"
     for k in $(sysctl_names); do printf ' %s=%s' "$k" "${SYSCTL_WANT[$k]:-pinned}"; done
@@ -698,9 +858,7 @@ export CELL_STEP_TIMEOUT=${CELL_STEP_TIMEOUT:-900} CELL_STEP_ANALYSIS_TIMEOUT=${
 # shellcheck source=../cell-step.sh
 source "$TOOLS/cell-step.sh" || PF "cannot source $TOOLS/cell-step.sh"
 log "PREFLIGHT OK CAMPAIGN=$UNIT_NAME driver=$SELF RUN=$RUN P=$P genesis_root=$GENESIS_ROOT arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE $(host_str) cells=${#CELLS[@]}: $TAGS"
-for c in "${CELLS[@]}"; do
-    run_spec "$c" || { log "CAMPAIGN STOP at ${c%%:*} (queued reruns not run: $RUN/rerun-queue.tsv)"; exit 1; }
-done
+run_cells || exit 1
 log "MAIN CELLS END"
 if [ "${SMOKE:-0}" != 1 ]; then
     cell_step_rerun_pass "$RUN" run_spec || { log "CAMPAIGN STOP in the rerun pass"; exit 1; }

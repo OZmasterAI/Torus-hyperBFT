@@ -9,7 +9,17 @@ Last archy bench: `ozarchy-hsdb`, 71.8 option A A/B (section 74 of `ozarchy-anti
 Every campaign uses the N = 11 bench genesis (rebuilt once with `FORCE=1`, step 1). Arms that compare against main
 share one binary and one all-off baseline inside a campaign.
 
-**Now, on current main** (code = origin/main `bb9eb20f`; the Q4 experiments are still being finished on 18c):
+**Driver generator update (s126, main `d280a8fd`, merged from `feat/driver-warmgate-checks` 771ff8f8):** warm-up gate
+(default on; `"gate": false` restores the old behaviour), per-cell campaign checks, the 1 Hz soak sampler on every
+cell. Codex fix on top of the e3316799 you froze for `ozarchy-s58dmt`: a campaign check now sees only its own checks
+file's variables (as sourced at preflight) and the driver's globals, never a driver function's local (`$dur`, `$rc`,
+`$label`, `$t`, ...). Campaigns already running on a frozen copy are unaffected. Before the next campaign with a
+checks file (e.g. `s58dmt-checks.sh`): freeze the new tools, regenerate the driver, run `DRIVER dry` and `DRIVER run
+smoke`. A check that read a driver local now fails (CHECK FAIL, or unbound variable under `set -u`); use the check's
+arguments (`$1` label, `$2` arm) or driver globals (`R`, `AENV`, `AXE`, ...). `_DRV_` is reserved: any mention in a
+checks file fails preflight.
+
+**Now, on current main** (s125: main carries KP, DB and PC, flags off; s126: propose-defer is PARKED, campaign B dropped, see step 6):
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
    cell and its checks (Q5 below). Gates every later campaign.
@@ -19,18 +29,40 @@ share one binary and one all-off baseline inside a campaign.
 
 **After 18c merges the Q4 experiments** (flags off; rebuild M' = main + Q4):
 
-4. **Campaign A:** one shared all-off baseline + Q1 (`TORUS_EPOCH_FAST_PATH=1`) + Q2 (`TORUS_PARALLEL_ENGINE=1`) +
-   Q4 `TORUS_PARALLEL_CANCEL_ALL=1`, `TORUS_EXEC_PARALLEL_KEYS=1`, `TORUS_CKPT_DEFER_BOOKS=1`: 6 arms, 300 markets,
-   600 s, 3 replicates, rotating order, native load only.
+4. **Campaign A:** 6 arms on one binary, 300 markets, 600 s, 3 replicates, rotating order, native load only.
+   **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
+   `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
+
+   | arm | env |
+   |---|---|
+   | base | all flags absent (list them in `absent_env`) |
+   | F (Q1) | `TORUS_EPOCH_FAST_PATH=1` |
+   | PE (Q2) | `TORUS_PARALLEL_ENGINE=4` (N >= 2 workers; 0, 1 or anything else = off) |
+   | PC (Q4) | `TORUS_PARALLEL_CANCEL_ALL=8` (unset, 0, 1 or garbage = the serial loop) |
+   | KP (Q4) | `TORUS_EXEC_PARALLEL_KEYS=1` (only "1" turns it on) |
+   | DB (Q4) | `TORUS_CKPT_DEFER_BOOKS=1`; check its `defer_books=true` info line in each node's log (it logs `false` if gated off) |
+
+   Fallback: if PC is not merged when archy reaches this step, run the other 5 arms, and give PC its own
+   base vs PC pair later on the same shape.
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
-6. **Campaign B, Q4 propose-defer** (`TORUS_PROPOSE_EXEC_WATERMARK`): off vs on, its own campaign (consensus timing:
-   watch view timeouts and exec lag).
+6. **Campaign B, Q4 propose-defer: DROPPED, do not run** (owner s126: the branch is parked after its second Codex
+   re-review found an equivocation and a delayed Nudge with the flag on). **Revisit rule:** after item 6 Phase 5
+   lands, read `torus_exec_queue_depth` and exec lag in Phase 5's first bench at this shape. Queue well under 64 and
+   lag a few seconds: execution keeps up, drop the branch for good. Queue still about 64 and lag over about 5 s:
+   18c revives it (fix round, third Codex review), then this campaign runs on top of Phase 5. If revived:
+   its own campaign (consensus timing: watch view timeouts and exec lag), same shape,
+   3 arms: (a) base (`TORUS_EXEC_QUEUE_DEPTH` and `TORUS_PROPOSE_EXEC_WATERMARK` absent); (b) control
+   `TORUS_EXEC_QUEUE_DEPTH=16` (the same short exec queue, still a blocking send); (c)
+   `TORUS_PROPOSE_EXEC_WATERMARK=16`. Without (b), a gain cannot be split between the deferral and the shorter
+   queue. Metrics in the branch notes (`torus_exec_queue_depth` mean and max, view timeouts, exec lag, matched/s).
 
 **When 18c delivers the code:**
 
 7. **Q6. 71.8 checkpoint slicing** vs M. Run after step 4 has settled the Q1 / Q4 defaults (both touch checkpoint
    code, so they move slicing's baseline).
-8. **Q7. Item 7 step 2** vs M.
+8. **Q7. Item 7 step 2** vs M. Status s126: C1-C5, C7, C8, C9 built and Codex-clean on `feat/item7-step2`
+   (workspace 3931/3931 at 85612558); C6 built (3944/3944), in Codex review; then C10 (docs, gates, the 18c 4-validator
+   devnet check). 18c says when the step 2 head is ready; spec under Items, Q7.
 
 If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and save-books rows of the Q8 profile
 (a short re-run, not a full profile).
@@ -51,8 +83,13 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
 - **Q4. The four s123 experiments**, one flag each, default off: `exp/s123-parallel-cancel-all-book-pass`
   (`TORUS_PARALLEL_CANCEL_ALL`), `exp/s123-propose-defer-on-exec-queue` (`TORUS_PROPOSE_EXEC_WATERMARK`),
   `exp/s123-exec-action-keys-parallel` (`TORUS_EXEC_PARALLEL_KEYS`), `exp/s123-defer-book-blobs-in-layer-merge`
-  (`TORUS_CKPT_DEFER_BOOKS`). Waiting on 18c: rebase, finish, test, merge with the flags off (in progress s125).
-  Three run in campaign A, the winners together in step 5, propose-defer in campaign B.
+  (`TORUS_CKPT_DEFER_BOOKS`). Status s125: exec-action-keys, defer-book-blobs and parallel-cancel-all (after its Codex fixes:
+  flag-off allocations = main, flag on looks up only targeted books; re-review clean, merge `7f9bb3a9`) are merged
+  into main with the flags off, so campaign A has all 6 arms; propose-defer (repeated store reads while deferring,
+  flag-wiring tests, then a winning-TC re-proposal fix) is still unmerged: its second re-review found an equivocation
+  when a late winning TC's block body is missing and a delayed Nudge (flag on only); owner s126: parked, revisit after item 6 Phase 5 (rule in step 6). Three run in campaign A, the winners together in step 5; campaign B is dropped.
+  Arm values and the shape: step 4 and step 6 above; branch notes in `/home/18c/projects/wt/exp-s123/<name>.md`
+  (18c).
 - **Q5. Native vs native + EVM transfers** at N = 11 (main `639ab185` and later; `EVM_LOAD_RATE` and
   `EVM_LOAD_SENDERS`, off by default). Shows what EVM blocks cost native matched/s.
   - Rebuild the bench genesis with `FORCE=1`: an existing `testnet/genesis-weighted-full.json` keeps N = 5.
@@ -69,12 +106,30 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   markets, 600 s, n = 3 ABBA (4-5 per arm resolves a ~200 ms step). Success: in-window block p99 within ~100 ms of the
   out-of-window p99, and `on_committed_block` in-window = out. 18c adds a timer around `persist_commit_manifest` first.
   Waiting on 18c code.
-- **Q7. Item 7 step 2**, native load only, main vs step 2 (after the step 2 build): the best bid/ask rows add up to
-  one write per dirty market per block; two book shapes: mode 3 (harness default) and Classic with 15 s checkpoints
-  (the shipped shape). Waiting on 18c code.
+- **Q7. Item 7 step 2**, native load only, main vs step 2 (after the step 2 build and the 18c devnet check): the best
+  bid/ask rows add up to one write per dirty market per block. Full spec: `docs/plans/item7-step2-impl.md`,
+  "Archy native-only A/B". Two binaries (commit vs commit, no flag): arm A = main at the step 2 merge base, arm B =
+  the step 2 head (18c gives both SHAs).
+  - Genesis: the 300-market weighted genesis; arm B with the new step 2 keys absent (M = 0, big blocks off). EVM
+    load off.
+  - Build each binary once and use one genesis for both shapes.
+  - Shape 1, mode 3 (harness default, `TORUS_BOOK_ROWS=3`, `BLOCK_CAP=200`): warm-up cell, n = 4 ABBA rounds of
+    120 s cells at 300 markets. No 10-market secondary (owner s126: step 2 adds one bbo write per dirty market per
+    block, so 300 markets is the worst case; saves about 1.5-2 h, Q7 about 7 h).
+  - Shape 2, Classic (the shipped shape): both arms `EXTRA_ENV='TORUS_BOOK_ROWS='`, 15 s checkpoints
+    (`KNOB=TORUS_CHECKPOINT_INTERVAL_MS=15000`, as `tools/matched-bench/campaign-template.sh`; its `envok` Classic
+    check), 300 markets, n = 4 ABBA. Mode 3 turns checkpoints off, so it alone would miss the bbo writes in
+    `save_order_books`.
+  - Report per shape: matched/s (primary), native blocks/s, `torus_exec_save_books_seconds` per native block, exec
+    `block_ms`, block time p50/p99, CPU-s/1M.
+  - Pass, both shapes: paired B/A matched/s 95% CI includes 1.0 or lies above it, and save_books rises by at most
+    0.3 ms per native block. A fail blocks the step 2 merge (follow-up: B16's `saved_bbo` hit rate).
+  - Doc target: `docs/perf/item7-step2-native-ab.md`.
 - **Q8. Item 6 Phase 5 step 0 profile:** see the message sent to archy (s125) and
   `docs/plans/item6-phase5-impl.md` "Step 0" on `origin/docs/item6-phase5-plan`.
 
 ## Later
 
 - Big-block sizing with mixed load (native + swaps), only when big blocks are switched on (item 7 step 2 decision 1).
+- Q5 rerun on the item 7 step 2 build (native vs native + EVM load): step 2 adds a lane-row read per EVM tx and the
+  per-epoch fee rows. Only if Q7 shows a cost.

@@ -703,10 +703,23 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
 - **Samplers** (spec `samplers`, default `true`): `data-du-samples.txt` (data dir sizes,
   MemAvailable, /dev/shm; 2 s), `ckpt-samples.txt` (each node's checkpoint and reject metrics;
   2 s), `mem-samples.txt` + `smaps/` (smaps_rollup, status and memory gauges every 5 s; val0's
-  full smaps every 30 s), `node-nofile.txt` + `fds.txt` (open fds; 5 s), `vmstat-1hz.txt`;
-  after the cell `rocksdb-LOG-val<i>.txt`, `data-du.txt`, a `[<label>] fds max/end ...` line and
-  a `CHECK SOAK` coverage line. A node that held more than 16384 open fds stops the campaign
-  after its cell (`STOP`, `bad:stop-fd`).
+  full smaps every 30 s), `node-nofile.txt` + `fds.txt` (open fds; 5 s), `vmstat-1hz.txt`,
+  and the hand drivers' 1 Hz soak sidecar `python3 -I $TOOLS/soak-sampler.py <cell> 9161 9162
+  9163` (`tools/matched-bench/soak-sampler.py`, copied unchanged from the s58rl / p4soak10
+  tools): `metrics-1hz.txt.gz` (per node and second `T <epoch> val<i> ok <scrape_s>|ERR` + the
+  /metrics lines without comments or buckets, except the slow-tail buckets le >= 0.128 of its
+  latency families: per-second consensus drops and timeouts) and `host-1hz.tsv` (meminfo
+  Dirty / Writeback / MemAvailable / Cached and per node RSS, context switches, CPU ticks). It
+  starts with the other samplers, waits for run.log's `node pids:` line, ends when the nodes
+  are gone and is stopped with them. A frozen `tools_dir` must carry `soak-sampler.py` (else
+  `PREFLIGHT FAIL ... soak-sampler.py missing`; also when it does not compile or lacks the
+  slow-tail buckets). After the cell `rocksdb-LOG-val<i>.txt`, `data-du.txt`, a `[<label>] fds
+  max/end ...` line and a `CHECK SOAK` coverage line, which adds `CHECK WARN <label>:
+  metrics-1hz has N ok scrapes (< 3 x dur)` / `host-1hz has N rows (< dur)` when the 1 Hz
+  sidecar fell short (recorded, never a failure, as in the hand drivers). A node that held
+  more than 16384 open fds stops the campaign after its cell (`STOP`, `bad:stop-fd`).
+  `DRIVER show`: `SAMPLERS on du mem metrics fd soak-1hz vmstat rocksdb-log fd_stop=16384` and
+  `SOAK on <path> metrics-1hz.txt.gz host-1hz.tsv`; `"samplers": false` turns all of them off.
 - **Host checks** (spec `host_checks`, default on): the `run` preflight requires MemAvailable
   >= `min_mem_avail_gb` (40) and every `sysctl` value the spec gives. The dirty limits
   (`vm.dirty_bytes`, `vm.dirty_background_bytes`) that the spec does not give are pinned to the
@@ -714,6 +727,50 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   and end (`sysctl.txt`) and must still have those values: a change before the start aborts
   (`bad:abort-sysctl`), a change before the end fails the checks (`bad:check`). `quiet()` also
   waits for heavy analysis processes (perf, inferno, flamegraph, jeprof, addr2line).
+- **Warm-up gate** (spec `warmup.gate`, default `true`): the warm-up cell and the smoke cell
+  (`DRIVER show`: `WARMGATE on w1 s0`) must end with run-cell rc 0 and a summary.json with
+  `validity.verdict` ACCEPT, `headline.agreement_verdict` AGREE, `liveness.verdict` PASS and
+  `agreement.panic_or_failstop_lines` 0, and no node may die in it; then `CHECK OK <label>
+  warm-up gate: validity=... agreement=... liveness=... panic_or_failstop_lines=...`. Else
+  `CHECK FAIL <label>: warm-up gate: ...`, its row is `bad:...check`, and the campaign stops
+  (`CAMPAIGN STOP at w1`, exit 1) before any measured cell. `"warmup": {..., "gate": false}`
+  turns it off for both (`WARMGATE off`): a failed warm-up is then only a bad row and the
+  measured cells run. `"warmup": false` keeps the gate on the smoke cell.
+- **Campaign checks** (spec `checks`, optional): hard checks that do not fit an `expect`
+  grep (metric deltas, took-effect lines per arm, ...), as bash functions in a file you
+  write: `"checks": {"source": "/abs/path/checks.sh", "per_cell": ["flagchk", "fanchk"]}`
+  (function names `^[a-z_][a-z0-9_]*$`, not a driver function; else SPEC ERROR). Preflight
+  (`dry`, `launch`, `run`) sources the file (missing, unreadable or a non-zero return =
+  `PREFLIGHT FAIL`), requires each function defined (`declare -F`), and fails when the file
+  redefines a driver function or a driver variable (`DRIVER_VARS`), or uses the prefix
+  `_DRV_` anywhere (the driver's own check state; comments count too). The file is sourced
+  inside a function: a top-level `declare -A` / `declare -a` without `-g` is a local of that
+  function, which the checks still get (below) but no other driver code does; preflight prints
+  `PREFLIGHT WARN: <file>:<line>: ...` for each one without `-g` (column 0 only) and goes on. After every cell (warm-up,
+  smoke, measured; after the standard checks, before the gate) each function is called as
+  `fn <label> <arm>` (label = `<label_prefix>-<tag>`, the cell dir is `$R/<label>`), in a
+  subshell, with the driver's variables available: `R` (results root), `AENV[arm]` (the
+  arm's own node env, `K=V K=V`), `AXE[arm]` (node_env + arm env, run-cell.sh EXTRA_ENV),
+  `AHENV[arm]` (harness env), `ABIN[arm]` / `BMD5[bin]`, `RUN`, `P`, `MARKETS`, `RATE`,
+  `NODES`, `BASELINE`. **Scope:** a check sees exactly the file's own top-level variables
+  as sourced at preflight, the driver globals (`DRIVER_VARS`), the environment and the
+  shell's own variables (`PATH`, `IFS`, `BASH*`, ...). It never sees a local of a driver
+  function: bash variables are dynamically scoped, so before this a check saw the locals of
+  every function on the stack (`rc=1; guardchk() { return "$rc"; }` read the driver's
+  `rc=0` and passed; Codex P2). The file is sourced from frames without locals (it sees only
+  driver globals at source time) and `load_checks` keeps `declare -p` of every variable its
+  top level sets; each check runs through `_run_check`, which unsets every other visible
+  name and re-declares the file's, so `arm`, `label`, `t`, `rc`, `f`, ... are the file's own,
+  and a name the file never set is unset (`set -u`: reading it is an error, so a CHECK FAIL).
+  Limits: values are the preflight's (a check's own changes end with its subshell, as
+  before); a top-level assignment that leaves a pre-existing non-driver global exactly as it
+  was is not seen; a `readonly` global stays visible as is; functions are not isolated (a
+  check may call driver functions; redefining one fails preflight). It prints its own `CHECK OK` / `CHECK FAIL` lines; a non-zero return
+  adds `CHECK FAIL <label>: campaign check <fn> returned <rc> (arm <arm>)` and is a hard
+  failure like a failing `expect`: every check still runs, the row is `bad:check`, the
+  campaign stops. `DRIVER show` lists them (`CHECKS <source> <fn>...`), `PREFLIGHT OK`
+  carries `checks=<fn>,...`. Keep the file beside the frozen tools so it is part of the
+  campaign record.
 - **cells.tsv rows, CELL-FLAG lines, rerun queue**: `run_spec` + `cell-step.sh` as in the
   template (below). Wrapper arms pass `--no-summary-md5` to the step (run-cell.sh hashes
   the staged file, which is the wrapper).
@@ -735,12 +792,12 @@ frozen tools copy: run-cell.sh, cell-step.sh, cell_step.py, campaign/detach.sh; 
 list. Optional: `comment`, `results_root` (`~/bench-results-matched`), `devnet_dir`
 (`~/torus-wsl-devnet`), `rate` (76000), `order` (`"rotate"` default: replicate r starts at
 arm r-1, as Job 4; `"fixed"`; or a list `["r1:A", "r1:B", ...]`), `warmup` (`{arm, tag,
-duration_s}`, default baseline / `w1` / `duration_s`; `false` = none), `smoke` (`{arm,
+duration_s, gate}`, default baseline / `w1` / `duration_s` / `true`; `false` = none), `smoke` (`{arm,
 duration_s}`, default baseline / 60), `node_env` (node env for every arm), `harness_env`
 (run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`),
 `absent_env` (names that must be unset unless an arm sets them), `expect` (every arm),
 `analysis` (`{cmd, metric}` = `CELL_STEP_ANALYSIS_CMD` / `_METRIC`), `max_load` (2),
-`samplers` (`true` default, or `false`), `host_checks` (`true` default, `false`, or
+`checks` (`{source, per_cell}`, campaign checks, below), `samplers` (`true` default, or `false`), `host_checks` (`true` default, `false`, or
 `{min_mem_avail_gb: 40, sysctl: {"vm.dirty_bytes": "268435456", ...}}`; unknown keys are a
 SPEC ERROR too). The runtime watchers have no switch.
 `binaries.<key>`: `stage_dir` (holds `release/torus-node` [+ `release/bench-throughput`]),
@@ -768,6 +825,31 @@ max}`: `grep -E -c regex <cell>/<file>` must be in `[min, max]`. Example:
 Full example: `campaign/driver-spec.example.json`; the Job 4 golden specs:
 `testdata/make-driver/p4j4-{h,d}.json`.
 
+**Against a frozen or pilot harness.** The generator does not need the current tools: point
+`harness_worktree` at the pilot worktree (it launches the nodes) and `tools_dir` at the
+frozen copy's `tools/matched-bench` (its run-cell.sh, cell-step.sh, cell_step.py and
+campaign/detach.sh run the cells; its root `tools_dir/../..` must carry the genesis inputs,
+next paragraph). The campaign-specific hard checks of a hand-written pilot driver go into
+`checks`, the warm-up gate is on by default:
+
+```json
+{"campaign": "ozarchy-s58x", "run_dir": "/home/oz/bench-results-matched/ozarchy-s58x-run",
+ "label_prefix": "ozarchy-s58x-300m",
+ "harness_worktree": "/home/oz/projects/wt/s58-pilot-857b9770",
+ "tools_dir": "/home/oz/bench-results-matched/ozarchy-s58x-tools/tools/matched-bench",
+ "binaries": {"b": {"stage_dir": "/home/oz/bench-results-matched/ozarchy-s58x-stage/b-run",
+   "node_md5": "5480e116...", "bench_md5": "..."}},
+ "markets": 300, "duration_s": 120, "replicates": 3, "baseline": "C",
+ "warmup": {"arm": "C", "gate": true},
+ "checks": {"source": "/home/oz/bench-results-matched/ozarchy-s58x-tools/s58-checks.sh",
+            "per_cell": ["s58chk", "rlchk"]},
+ "arms": [{"label": "C"}, {"label": "ALLfan", "env": {"TORUS_CONSENSUS_DIRECT_FAN": "1"}}]}
+```
+
+Then `DRIVER dry` (preflight: the frozen tools, the genesis inputs equal to the pilot
+worktree's, the staged md5s, the checks file and its functions) and `DRIVER show` (the
+`WARMGATE` and `CHECKS` lines) before `DRIVER launch smoke`.
+
 **Genesis inputs beside the tools copy.** run-cell.sh generates each cell's genesis from
 ITS OWN repo root (`MAINREPO` = `<dir of run-cell.sh>/../..`), not from the harness worktree
 it is handed (that one only launches the nodes). In a standalone tools copy without them
@@ -792,10 +874,10 @@ harness worktree's. `PREFLIGHT OK` names the `genesis_root`.
 **Not supported** (hand-write the driver from the closest earlier one, as before, and say
 which shape did not fit): crash / restart cells (`CRASH_KILL_AT_S`, `KILL_*`: a SPEC
 ERROR); per-arm market count, duration or rate; samplers beyond the Job 4 driver's
-in-driver ones above (perf off-CPU windows, the soak sidecar `soak-sampler.py`, the cpu, io
-and task samplers: scripts outside tools/matched-bench); campaign-specific hard checks
-other than `expect` greps (checkpoint deltas, codec/LSM, data dir filesystem type, release
-timing); more than 3 nodes; several campaigns in one unit (pilot + grid: generate one
+in-driver ones above (perf off-CPU windows, the cpu, io and task samplers: scripts outside
+tools/matched-bench); campaign-specific hard checks
+that need more than `fn <label> <arm>` after a cell (checks that run during a cell or
+compare cells); more than 3 nodes; several campaigns in one unit (pilot + grid: generate one
 driver each and launch them in turn); post-campaign steps (off-CPU processing).
 
 Tests: `python3 tools/matched-bench/test_make_driver.py` (golden: the Job 4 horizon and
@@ -805,7 +887,13 @@ and sampler functions verbatim, the cell() wiring in order, and their sysctl, Me
 and fd-stop values; env and md5 checks on fixture cells and a fake /proc; the generated
 cell() run for real against a fake detach.sh, systemctl and run-cell.sh: a stub node that
 exits gives node-death.txt and a `bad:...death` row, memguard stops the unit on a stubbed
-meminfo, samplers and host checks off leave no records; bad specs).
+meminfo, the soak sampler scrapes fake /metrics servers in the hand drivers' format and is gone
+when the cell ends, samplers and host checks off leave no records; the campaign loop against the same
+fakes: a failing warm-up gate (each condition, a node death, the smoke cell) stops before the
+measured cells, `gate: false` goes on, campaign checks run on every cell with label, arm, `R`
+and `AENV`, a failing one is `bad:check` + stop, a check sees its own variables (also under
+driver-local names, at dispatch and at load) and no driver local, a missing function or source fails preflight;
+bad specs).
 
 **Why launchers copied old drivers instead of the template** (s1156): the template is the
 p3gate driver, and its CAMPAIGN-SPECIFIC blocks are most of the file (config, samplers,
