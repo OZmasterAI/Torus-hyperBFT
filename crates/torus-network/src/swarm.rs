@@ -3497,11 +3497,19 @@ mod tests {
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 0);
         // Past the burst: dropped and counted once per drop.
         for _ in 0..3 {
-            assert!(!consensus_rate_limit_admit(&mut limiter, Some(&metrics), &author));
+            assert!(!consensus_rate_limit_admit(
+                &mut limiter,
+                Some(&metrics),
+                &author
+            ));
         }
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
         // Another author has its own bucket: admitted, not counted.
-        assert!(consensus_rate_limit_admit(&mut limiter, Some(&metrics), &other));
+        assert!(consensus_rate_limit_admit(
+            &mut limiter,
+            Some(&metrics),
+            &other
+        ));
         assert_eq!(metrics.consensus_rate_limited_dropped.get(), 3);
         // No metrics registry (tests/tools): same decision, no panic.
         assert!(!consensus_rate_limit_admit(&mut limiter, None, &author));
