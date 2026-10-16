@@ -6325,6 +6325,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
+        // Item 7 step 2: the bbo row of every dirty market (every mode).
+        self.write_bbo_rows();
+
         // Persist the counter only when it moved (or was never stored), so
         // blocks without order flow write nothing at all.
         if self.loaded_next_global_order_id != Some(self.next_global_order_id) {
@@ -6363,6 +6366,41 @@ impl<T: StateBackend> NativeExecContext<T> {
         let _ = acc;
 
         written
+    }
+
+    /// Item 7 step 2 (owner decision 3): the bbo row of every dirty market
+    /// (`CF_NATIVE_BBO`), written only when the top of its book moved since
+    /// this book's last write; an emptied book deletes it. One overlay point
+    /// put (or delete) per moved market: no read, no Borsh, nothing per fill.
+    /// Unhashed, so a node whose book was just loaded (`saved_bbo` = `None`)
+    /// writes the same bytes again. Delist has no hook: `DelistMarket`
+    /// executes nothing today; a delist must empty the book through the
+    /// dirty-marking path or delete the row. A failed write latches the
+    /// block's fail-stop like any book write.
+    fn write_bbo_rows(&mut self) {
+        use torus_state::cf::CF_NATIVE_BBO;
+        for &market_id in &self.dirty_books {
+            let Some(book) = self.order_books.get_mut(&market_id) else {
+                continue;
+            };
+            let row = book.bbo_row();
+            if book.saved_bbo() == Some(row) {
+                continue;
+            }
+            let key = market_id.to_be_bytes();
+            let res = if row == [0u8; 32] {
+                self.state.delete_cf_raw(CF_NATIVE_BBO, &key)
+            } else {
+                self.state.put_cf_raw(CF_NATIVE_BBO, &key, &row)
+            };
+            match res {
+                Ok(()) => book.set_saved_bbo(row),
+                Err(e) => latch_save_fault(
+                    &mut self.fatal_error,
+                    format!("book save: bbo row (market {market_id}): {e}"),
+                ),
+            }
+        }
     }
 
     /// Mode 2 (LevelAuthority) save, two passes:
@@ -6523,6 +6561,11 @@ impl<T: StateBackend> NativeExecContext<T> {
                 })
             })
             .collect();
+
+        // Item 7 step 2: the bbo rows, as in `save_order_books`: point puts
+        // into this block's overlay on the exec thread (never the worker's
+        // sidecar), from the live books' post-state.
+        self.write_bbo_rows();
 
         // Counter + mode marker: same condition, same bytes, same placement
         // (this overlay) as the `save_order_books` tail.
@@ -12260,10 +12303,13 @@ impl NativeExecutor {
     /// Whether CoreWriter / lockbox actions are queued for `height` — the block
     /// pipeline must then run the native path (and so [`Self::drain_core_writer`]) even
     /// for a block with no native actions and no fees. Queue entries for `height` are
-    /// buffered by block `height - 1`'s EVM execution and committed in the SAME atomic
-    /// batch as that block's EVM bundle (s515 F1), which lands before this block runs
-    /// — so a DB read is authoritative here. R02 (C4): a read error is a local
-    /// fault and propagates; the caller fail-stops the block (never "assume due").
+    /// buffered by an earlier block's EVM execution (`height - 1`, or `height - K` and
+    /// earlier for order kinds and rows a full block moved on, item 7 step 2) and
+    /// committed in the SAME atomic batch as that block's EVM bundle (s515 F1), which
+    /// lands before this block runs; no later block rewrites them before their drain
+    /// (EVM blocks are serial barriers) — so a DB read is authoritative here. R02 (C4): a
+    /// read error is a local fault and propagates; the caller fail-stops the block (never
+    /// "assume due").
     pub fn core_writer_due(state_db: &StateDb, height: u64) -> Result<bool, CoreError> {
         Ok(CoreWriterQueue::pending_count(state_db, height)? > 0)
     }
@@ -12277,9 +12323,11 @@ impl NativeExecutor {
         OracleManager::new(state.clone(), OracleConfig::default()).has_submissions()
     }
 
-    /// Drain and execute CoreWriter actions queued from the previous block.
+    /// Drain and execute the CoreWriter actions that target this block: queued one
+    /// block earlier, or K blocks earlier for order kinds (item 7 step 2), at most
+    /// `CORE_WRITER_DRAIN_CAP` rows (the cap is applied at enqueue).
     ///
-    /// Task 3.1.5 (anti-MEV): Asserts the one-block delay is enforced — all
+    /// Task 3.1.5 (anti-MEV): Asserts the delay is enforced — all
     /// drained actions must have been queued in a strictly earlier block.
     ///
     /// FIX EVM-FIND-12: Propagates drain errors instead of silently returning empty vec.

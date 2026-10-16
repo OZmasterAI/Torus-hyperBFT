@@ -70,7 +70,8 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   out-of-window p99, and `on_committed_block` in-window = out. 18c adds a timer around `persist_commit_manifest` first.
   Waiting on 18c code.
 - **Q7. Item 7 step 2**, native load only, main vs step 2 (after the step 2 build): the best bid/ask rows add up to
-  one write per dirty market per block. Waiting on 18c code.
+  one write per dirty market per block; two book shapes: mode 3 (harness default) and Classic with 15 s checkpoints
+  (the shipped shape). Waiting on 18c code.
 - **Q8. Item 6 Phase 5 step 0 profile:** see the message sent to archy (s125) and
   `docs/plans/item6-phase5-impl.md` "Step 0" on `origin/docs/item6-phase5-plan`.
 

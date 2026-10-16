@@ -667,6 +667,7 @@ mod tests {
             CF_NATIVE_HASHED,
             CF_HASHED_ACCOUNTS,
             CF_TRIE_ACCOUNTS,
+            CF_NATIVE_BBO,
         ] {
             assert_eq!(hashed_cf_id(derived), None, "{derived} must not be hashed");
         }

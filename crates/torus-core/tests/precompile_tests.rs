@@ -18,6 +18,19 @@ fn setup() -> (tempfile::TempDir, StateDb) {
     (dir, db)
 }
 
+/// [`setup`] with the CoreWriter order delay K pinned to 1 (item 7 step 2): for the tests
+/// whose subject is not the delay and that expect an order kind at `block_queued + 1`.
+fn setup_k1() -> (tempfile::TempDir, StateDb) {
+    let (dir, db) = setup();
+    db.put_cf_raw(
+        torus_state::cf::CF_FEE_CONFIG,
+        b"core_writer_order_delay",
+        b"1",
+    )
+    .unwrap();
+    (dir, db)
+}
+
 fn addr(n: u8) -> Address {
     Address::new([n; 20])
 }
@@ -484,7 +497,7 @@ fn staking_reader_get_staking_info() {
 
 #[test]
 fn core_writer_place_order_queues_action() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
 
     let address = precompile_address(ADDR_CORE_WRITER);
@@ -535,7 +548,7 @@ fn place_order_input(order_type: u8) -> Vec<u8> {
 /// zero: no id (the 0x0800 getOpenOrders reader was removed in s99).
 #[test]
 fn core_writer_place_order_returns_no_synthetic_order_id() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     let output = execute_precompile(&address, &place_order_input(0), &addr(1), &db, 100, 0).unwrap();
     assert_eq!(output, vec![0u8; 32], "no fabricated order id");
@@ -547,7 +560,7 @@ fn core_writer_place_order_returns_no_synthetic_order_id() {
 /// Limit orders. They are rejected (the EVM call reverts) and nothing queues.
 #[test]
 fn core_writer_rejects_stop_order_types() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     for order_type in [2u8, 3] {
         let err = execute_precompile(&address, &place_order_input(order_type), &addr(1), &db, 100, 0);
@@ -558,7 +571,7 @@ fn core_writer_rejects_stop_order_types() {
 
 #[test]
 fn core_writer_cancel_order_queues_action() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
 
     let address = precompile_address(ADDR_CORE_WRITER);
@@ -607,7 +620,7 @@ fn core_writer_staking_delegate_queues_action() {
 /// and the overlay had no `commit_tx`.)
 #[test]
 fn writer_precompile_journals_through_overlay() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
     let overlay = NativeStateOverlay::new(db.clone());
 
@@ -658,7 +671,7 @@ fn writer_precompile_journals_through_overlay() {
 
 #[test]
 fn queue_enqueue_and_drain() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
 
     let action1 = QueuedAction {
         trader: addr(1),
@@ -808,6 +821,542 @@ fn queue_drain_reports_an_undecodable_row_in_place_and_deletes_it() {
     assert_eq!(again[0].as_ref().unwrap_err().error, bad.error);
 }
 
+/// Item 7 step 2 (owner decision 4): order actions wait K blocks (default 10, governance
+/// `core_writer_order_delay`), other kinds one; an invalid stored K keeps 10. RED before: all +1.
+#[test]
+fn order_actions_wait_k_blocks_others_one() {
+    use torus_state::cf::CF_FEE_CONFIG;
+    let (_dir, db) = setup();
+    let queue = |kind| {
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind,
+                block_queued: 100,
+            },
+        )
+        .unwrap()
+    };
+    queue(QueuedActionKind::PlaceOrder {
+        market_id: 1,
+        side: 0,
+        order_type: 0,
+        price: fp(50_000),
+        quantity: fp(5),
+        time_in_force: 0,
+        cloid: None,
+    });
+    queue(QueuedActionKind::CancelOrder { order_id: 1 });
+    queue(QueuedActionKind::CancelAll { market_id: 1 });
+    queue(QueuedActionKind::CancelByCloid {
+        market_id: 1,
+        cloid: 7,
+    });
+    queue(QueuedActionKind::ClaimRewards);
+    queue(QueuedActionKind::LockboxDeposit { amount: fp(1) });
+    assert_eq!(CoreWriterQueue::pending_count(&db, 101).unwrap(), 2);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 110).unwrap(), 4);
+    for (stored, target) in [("3", 103), ("0", 110), ("101", 110), ("x", 110)] {
+        let (_dir, db) = setup();
+        db.put_cf_raw(
+            CF_FEE_CONFIG,
+            torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
+            stored.as_bytes(),
+        )
+        .unwrap();
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind: QueuedActionKind::CancelOrder { order_id: 1 },
+                block_queued: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CoreWriterQueue::pending_count(&db, target).unwrap(),
+            1,
+            "{stored}"
+        );
+    }
+}
+
+/// Item 7 step 2 (owner decision 4, cap at enqueue): a target block already holding 200
+/// rows sends the next row to the following block, in queue order. RED before: one block
+/// took every row (and all at +1).
+#[test]
+fn a_full_target_block_sends_later_rows_to_the_next_block() {
+    let (_dir, db) = setup();
+    let enqueue = |kind, block_queued| {
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind,
+                block_queued,
+            },
+        )
+        .unwrap()
+    };
+    let seqs: Vec<u64> = (0..=200)
+        .map(|order_id| enqueue(QueuedActionKind::CancelOrder { order_id }, 100))
+        .collect();
+    assert_eq!(seqs[..200], (0..200).collect::<Vec<u64>>()[..]);
+    assert_eq!(seqs[200], 0, "the 201st row opens block 111");
+    assert_eq!(CoreWriterQueue::pending_count(&db, 110).unwrap(), 200);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 111).unwrap(), 1);
+    // A ClaimRewards queued at 109 targets 110, which is full: 111, after the cancel.
+    assert_eq!(enqueue(QueuedActionKind::ClaimRewards, 109), 1);
+    let drained = drain_ok(&db, 111);
+    assert_eq!(drained.len(), 2);
+    assert!(matches!(
+        drained[0].kind,
+        QueuedActionKind::CancelOrder { order_id: 200 }
+    ));
+    assert!(matches!(drained[1].kind, QueuedActionKind::ClaimRewards));
+}
+
+/// Item 7 step 2 (owner answer 3, Codex plan check s125): K is read at enqueue and the drain
+/// takes a target prefix, so lowering K must not let a later cancel drain before an earlier
+/// order: an order kind never targets a block before the last order kind's target. Other
+/// kinds ignore it. RED before: all +1 (and without the last-target row the cancel drains
+/// at 103).
+#[test]
+fn lowering_k_never_lets_a_cancel_overtake_an_earlier_order() {
+    use torus_state::cf::CF_FEE_CONFIG;
+    let (_dir, db) = setup();
+    let enqueue = |kind, block_queued| {
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind,
+                block_queued,
+            },
+        )
+        .unwrap()
+    };
+    enqueue(
+        QueuedActionKind::PlaceOrder {
+            market_id: 1,
+            side: 0,
+            order_type: 0,
+            price: fp(50_000),
+            quantity: fp(5),
+            time_in_force: 0,
+            cloid: None,
+        },
+        100,
+    );
+    assert_eq!(CoreWriterQueue::pending_count(&db, 110).unwrap(), 1);
+    db.put_cf_raw(
+        CF_FEE_CONFIG,
+        torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
+        b"1",
+    )
+    .unwrap();
+    assert_eq!(
+        enqueue(QueuedActionKind::CancelOrder { order_id: 1 }, 102),
+        1
+    );
+    assert_eq!(
+        CoreWriterQueue::pending_count(&db, 103).unwrap(),
+        0,
+        "the cancel waits for the order's target"
+    );
+    // Other kinds ignore the last order target: K = 1 does not apply, + 1 does.
+    assert_eq!(enqueue(QueuedActionKind::ClaimRewards, 102), 0);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 103).unwrap(), 1);
+    let drained = drain_ok(&db, 110);
+    assert_eq!(drained.len(), 2);
+    assert!(matches!(
+        drained[0].kind,
+        QueuedActionKind::PlaceOrder { market_id: 1, .. }
+    ));
+    assert!(matches!(
+        drained[1].kind,
+        QueuedActionKind::CancelOrder { order_id: 1 }
+    ));
+    // Once the last target has passed, the delay is K again.
+    enqueue(QueuedActionKind::CancelOrder { order_id: 2 }, 115);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 116).unwrap(), 1);
+    // The row is hashed state in CF_FEE_CONFIG (u64 BE), not a queue row.
+    assert_eq!(
+        db.get_cf_raw(CF_FEE_CONFIG, b"core_writer_last_order_target")
+            .unwrap(),
+        Some(116u64.to_be_bytes().to_vec())
+    );
+}
+
+/// Point reads (`get_cf_raw` + `get_cf_len`, any CF) through a backend; every other call
+/// is delegated as is.
+#[derive(Clone)]
+struct PointReads<T> {
+    inner: T,
+    n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<T> PointReads<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            n: Default::default(),
+        }
+    }
+    fn count(&self) -> usize {
+        self.n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn bump(&self) {
+        self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl<T: torus_state::StateBackend> torus_state::StateBackend for PointReads<T> {
+    fn get_cf_raw(
+        &self,
+        cf: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, torus_state::error::StateError> {
+        self.bump();
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn get_cf_len(
+        &self,
+        cf: &str,
+        key: &[u8],
+    ) -> Result<Option<usize>, torus_state::error::StateError> {
+        self.bump();
+        self.inner.get_cf_len(cf, key)
+    }
+    fn put_cf_raw(
+        &self,
+        cf: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), torus_state::error::StateError> {
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), torus_state::error::StateError> {
+        self.inner.delete_cf_raw(cf, key)
+    }
+    #[allow(clippy::type_complexity)]
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::error::StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    #[allow(clippy::type_complexity)]
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::error::StateError> {
+        self.inner.iterate_cf_from(cf, start, limit)
+    }
+    #[allow(clippy::type_complexity)]
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, torus_state::error::StateError> {
+        self.inner.iterate_cf_prefix_from(cf, prefix, start, limit)
+    }
+    fn prefix_exists(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+    ) -> Result<bool, torus_state::error::StateError> {
+        self.inner.prefix_exists(cf, prefix)
+    }
+    fn atomic_write(
+        &self,
+        ops: &[torus_state::AtomicWriteOp<'_>],
+    ) -> Result<(), torus_state::error::StateError> {
+        self.inner.atomic_write(ops)
+    }
+}
+
+/// The queue row count of each target in `from..to`.
+fn queue_counts(db: &StateDb, from: u64, to: u64) -> Vec<usize> {
+    (from..to)
+        .map(|t| CoreWriterQueue::pending_count(db, t).unwrap())
+        .collect()
+}
+
+fn claim(block_queued: u64) -> QueuedAction {
+    QueuedAction {
+        trader: addr(1),
+        kind: QueuedActionKind::ClaimRewards,
+        block_queued,
+    }
+}
+
+/// Codex P2 on C7: an enqueue skipped every full target with one point read each, so with
+/// intake above the cap the reads per enqueue grew with the backlog (for a fixed gas). With
+/// the first-open-target cursor a backlog of full targets costs the same reads as none.
+/// RED before: `full + 1` probe reads (6 and 26).
+#[test]
+fn enqueue_point_reads_do_not_grow_with_a_full_target_backlog() {
+    let cap = torus_types::CORE_WRITER_DRAIN_CAP;
+    let mut reads = Vec::new();
+    for full in [5u64, 25] {
+        let (_dir, db) = setup();
+        for _ in 0..cap * full {
+            CoreWriterQueue::enqueue(&db, &claim(100)).unwrap();
+        }
+        assert_eq!(
+            queue_counts(&db, 101, 101 + full),
+            vec![cap as usize; full as usize]
+        );
+        let counted = PointReads::new(db.clone());
+        assert_eq!(CoreWriterQueue::enqueue(&counted, &claim(100)).unwrap(), 0);
+        assert_eq!(
+            CoreWriterQueue::pending_count(&db, 101 + full).unwrap(),
+            1,
+            "the first open target, after the {full} full ones"
+        );
+        reads.push(counted.count());
+    }
+    eprintln!("point reads per enqueue (5 full targets, 25 full targets): {reads:?}");
+    assert_eq!(reads[0], reads[1], "reads do not grow with the backlog");
+    assert!(reads[1] <= 3, "constant reads per enqueue: {reads:?}");
+}
+
+/// The full targets may be order kinds' (K blocks ahead, beyond the non-order cursor) and
+/// the enqueue that walks over them may revert, dropping any cursor it wrote: the order
+/// kinds' run row still bounds the walk. RED before: `full + 1` probes on every call.
+#[test]
+fn a_reverted_enqueue_over_an_order_run_reads_a_constant() {
+    let cap = torus_types::CORE_WRITER_DRAIN_CAP;
+    let full = 20u64;
+    let (_dir, db) = setup();
+    for order_id in 0..u128::from(cap * full) {
+        CoreWriterQueue::enqueue(
+            &db,
+            &QueuedAction {
+                trader: addr(1),
+                kind: QueuedActionKind::CancelOrder { order_id },
+                block_queued: 100,
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        queue_counts(&db, 110, 110 + full),
+        vec![cap as usize; full as usize]
+    );
+    // One ClaimRewards at 100 lands at 101: the non-order side has no backlog.
+    CoreWriterQueue::enqueue(&db, &claim(100)).unwrap();
+    for _ in 0..2 {
+        // Queued at 109: + 1 = 110, the order run's first target; the tx reverts.
+        let counted = PointReads::new(NativeStateOverlay::new(db.clone()));
+        assert_eq!(CoreWriterQueue::enqueue(&counted, &claim(109)).unwrap(), 0);
+        let landed = torus_state::StateBackend::iterate_cf(
+            &counted.inner,
+            torus_state::cf::CF_CORE_WRITER_QUEUE,
+            Some(&(110 + full).to_be_bytes()),
+        )
+        .unwrap();
+        assert_eq!(landed.len(), 1, "lands after the run");
+        assert!(counted.count() <= 4, "reads: {}", counted.count());
+        drop(counted); // revert: nothing durable
+    }
+    assert_eq!(CoreWriterQueue::pending_count(&db, 110 + full).unwrap(), 0);
+    // A later order kind continues the run (queue order kept).
+    CoreWriterQueue::enqueue(
+        &db,
+        &QueuedAction {
+            trader: addr(1),
+            kind: QueuedActionKind::CancelOrder { order_id: 9_999 },
+            block_queued: 105,
+        },
+    )
+    .unwrap();
+    let drained = drain_ok(&db, 110 + full);
+    assert!(matches!(
+        drained[..],
+        [QueuedAction {
+            kind: QueuedActionKind::CancelOrder { order_id: 9_999 },
+            ..
+        }]
+    ));
+}
+
+/// Cursor stale-high and stale-low: a full backlog, an enqueue from a later block still
+/// lands after it (the targets below the cursor are full), and once the backlog has
+/// drained an enqueue lands at block + 1 again, in queue order.
+#[test]
+fn the_cursor_is_right_while_the_backlog_drains_and_after() {
+    let cap = torus_types::CORE_WRITER_DRAIN_CAP;
+    let (_dir, db) = setup();
+    for _ in 0..cap * 30 {
+        CoreWriterQueue::enqueue(&db, &claim(100)).unwrap();
+    }
+    assert_eq!(CoreWriterQueue::enqueue(&db, &claim(100)).unwrap(), 0);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 131).unwrap(), 1);
+    // The cursor is hashed state in CF_FEE_CONFIG (u64 BE): 131, written when 130 filled.
+    assert_eq!(
+        db.get_cf_raw(
+            torus_state::cf::CF_FEE_CONFIG,
+            CORE_WRITER_FIRST_OPEN_TARGET_KEY
+        )
+        .unwrap(),
+        Some(131u64.to_be_bytes().to_vec())
+    );
+    for block in 101..=105 {
+        assert_eq!(drain_ok(&db, block).len(), cap as usize);
+    }
+    // Queued at 105: 106..=130 are still full, so 131, after the earlier row.
+    assert_eq!(CoreWriterQueue::enqueue(&db, &claim(105)).unwrap(), 1);
+    for block in 106..=131 {
+        drain_ok(&db, block);
+    }
+    // The cursor (131 or 132) is behind block + 1 now: the row lands at 141.
+    assert_eq!(CoreWriterQueue::enqueue(&db, &claim(140)).unwrap(), 0);
+    assert_eq!(CoreWriterQueue::pending_count(&db, 141).unwrap(), 1);
+    // And with no backlog a row queued below the cursor's block still lands at + 1.
+    let (_dir2, db2) = setup();
+    for _ in 0..cap * 3 {
+        CoreWriterQueue::enqueue(&db2, &claim(100)).unwrap();
+    }
+    for block in 101..=103 {
+        drain_ok(&db2, block);
+    }
+    assert_eq!(CoreWriterQueue::enqueue(&db2, &claim(103)).unwrap(), 0);
+    assert_eq!(CoreWriterQueue::pending_count(&db2, 104).unwrap(), 1);
+}
+
+/// Differential check of the cursor and the order run row against the plain walk (probe
+/// every target from the candidate): random block loads above and below the cap, order
+/// and non-order kinds, K changes, txs that revert (overlay dropped) or commit several
+/// enqueues, and the drain of each block. Every row's target, seq and drain position must
+/// match the model.
+#[test]
+fn enqueue_places_rows_exactly_like_the_plain_walk() {
+    use std::collections::BTreeMap;
+    use torus_state::cf::CF_FEE_CONFIG;
+    let cap = torus_types::CORE_WRITER_DRAIN_CAP as usize;
+
+    #[derive(Clone, Default)]
+    struct Model {
+        targets: BTreeMap<u64, Vec<u64>>,
+        last_order: u64,
+    }
+    impl Model {
+        fn place(&mut self, id: u64, order: bool, block: u64, k: u64, cap: usize) -> (u64, u64) {
+            let mut t = if order {
+                (block + k).max(self.last_order)
+            } else {
+                block + 1
+            };
+            while self.targets.get(&t).map_or(0, Vec::len) == cap {
+                t += 1;
+            }
+            let rows = self.targets.entry(t).or_default();
+            rows.push(id);
+            if order {
+                self.last_order = t;
+            }
+            (t, rows.len() as u64 - 1)
+        }
+    }
+
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    let (_dir, db) = setup();
+    let mut model = Model::default();
+    let mut k = 10u64;
+    let mut id = 0u64;
+    let mut max_reads = 0usize;
+    let id_of = |a: &QueuedAction| match a.kind {
+        QueuedActionKind::CancelOrder { order_id } => order_id as u64,
+        QueuedActionKind::LockboxWithdraw { amount } => amount.raw() as u64,
+        _ => unreachable!(),
+    };
+    for block in 100..160u64 {
+        let drained: Vec<u64> = drain_ok(&db, block).iter().map(id_of).collect();
+        assert_eq!(
+            drained,
+            model.targets.remove(&block).unwrap_or_default(),
+            "drain of {block}"
+        );
+        if next(6) == 0 {
+            k = 1 + next(12);
+            db.put_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
+                k.to_string().as_bytes(),
+            )
+            .unwrap();
+        }
+        // Heavy blocks (above the cap) and light ones; orders-only or non-orders-only
+        // stretches too, so either side builds a backlog.
+        let txs = [0, 40, 150, 400][next(4) as usize];
+        let order_share = [0, 50, 100][next(3) as usize];
+        for _ in 0..txs {
+            let overlay = NativeStateOverlay::new(db.clone());
+            let mut tentative = model.clone();
+            for _ in 0..1 + next(3) {
+                id += 1;
+                let order = next(100) < order_share;
+                let kind = if order {
+                    QueuedActionKind::CancelOrder {
+                        order_id: u128::from(id),
+                    }
+                } else {
+                    QueuedActionKind::LockboxWithdraw {
+                        amount: FixedPoint::from_raw(id as i128),
+                    }
+                };
+                let counted = PointReads::new(overlay.clone());
+                let seq = CoreWriterQueue::enqueue(
+                    &counted,
+                    &QueuedAction {
+                        trader: addr(1),
+                        kind,
+                        block_queued: block,
+                    },
+                )
+                .unwrap();
+                max_reads = max_reads.max(counted.count());
+                let (target, want) = tentative.place(id, order, block, k, cap);
+                assert_eq!(seq, want, "row {id} at {target}");
+                assert!(torus_state::StateBackend::get_cf_raw(
+                    &overlay,
+                    torus_state::cf::CF_CORE_WRITER_QUEUE,
+                    &queue_key(target, seq),
+                )
+                .unwrap()
+                .is_some());
+            }
+            if next(4) == 0 {
+                drop(overlay); // reverted
+            } else {
+                overlay.commit_tx(&db).unwrap();
+                model = tentative;
+            }
+        }
+    }
+    assert!(id > 10_000, "enough rows to fill targets: {id}");
+    // Uncovered full targets lie below block + K (K <= 12 here): reads stay bounded.
+    eprintln!("max point reads per enqueue: {max_reads}");
+    assert!(
+        max_reads <= 12 + 6,
+        "max point reads per enqueue: {max_reads}"
+    );
+}
+
 // ============================================================================
 // ABI Encoding Roundtrip Tests
 // ============================================================================
@@ -917,7 +1466,7 @@ fn lockbox_precompile_deposit() {
 
 #[test]
 fn lockbox_precompile_deposit_rejects_bad_value() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let trader = addr(5);
     let address = precompile_address(ADDR_LOCKBOX);
     let deposit = |amount: U256| {
@@ -1084,7 +1633,7 @@ fn read_only_denies_lockbox_deposit_no_state_change() {
 
 #[test]
 fn read_only_denies_core_writer_no_enqueue() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let caller = addr(1);
     let address = precompile_address(ADDR_CORE_WRITER);
     let input = build_input(
@@ -1164,7 +1713,7 @@ fn queued(db: &StateDb, block: u64) -> Vec<QueuedAction> {
 /// queues an order without one.
 #[test]
 fn core_writer_place_order_with_cloid_queues_it() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     let words = |cloid: u128| {
         build_input(
@@ -1196,7 +1745,7 @@ fn core_writer_place_order_with_cloid_queues_it() {
 
 #[test]
 fn core_writer_cancel_by_cloid_queues_it() {
-    let (_dir, db) = setup();
+    let (_dir, db) = setup_k1();
     let address = precompile_address(ADDR_CORE_WRITER);
     let input = build_input(
         "cancelByCloid(bytes32,uint128)",
@@ -1262,4 +1811,117 @@ fn cloid_queue_rows_round_trip() {
             _ => unreachable!(),
         }
     }
+}
+
+// ============================================================================
+// BboReader (0x080e) — item 7 step 2 B17
+// ============================================================================
+
+/// A `cf_native_bbo` row: bid raw ‖ ask raw (i128 BE).
+fn put_bbo_row(db: &StateDb, market_id: MarketId, bid: i128, ask: i128) {
+    let mut row = bid.to_be_bytes().to_vec();
+    row.extend_from_slice(&ask.to_be_bytes());
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_BBO,
+        &market_id.to_be_bytes(),
+        &row,
+    )
+    .unwrap();
+}
+
+/// `bbo(bytes32)` answers the row's bid and ask as two uint128 words (0 for
+/// an empty side or an unknown market); anything but that call is an error.
+#[test]
+fn bbo_reads_the_rows_bid_and_ask() {
+    let (_dir, db) = setup();
+    let address = precompile_address(ADDR_BBO_READER);
+    let call = |market: MarketId| {
+        let input = build_input("bbo(bytes32)", &[encode_market_id(market)]);
+        execute_precompile(&address, &input, &addr(0), &db, 100, 0)
+    };
+    let words = |bid: i128, ask: i128| {
+        let mut out = abi::encode_u128(bid as u128).to_vec();
+        out.extend_from_slice(&abi::encode_u128(ask as u128));
+        out
+    };
+
+    put_bbo_row(&db, 1, fp(99).raw(), fp(101).raw());
+    put_bbo_row(&db, 2, fp(7).raw(), 0);
+    assert_eq!(call(1).unwrap(), words(fp(99).raw(), fp(101).raw()));
+    assert_eq!(
+        call(2).unwrap(),
+        words(fp(7).raw(), 0),
+        "an empty ask side is 0"
+    );
+    assert_eq!(call(3).unwrap(), words(0, 0), "no row: both sides 0");
+
+    // Another selector.
+    let input = build_input("getPrice(bytes32)", &[encode_market_id(1)]);
+    let sel = u32::from_be_bytes(input[..4].try_into().unwrap());
+    let r = execute_precompile(&address, &input, &addr(0), &db, 100, 0);
+    assert!(
+        matches!(r, Err(CoreError::UnknownSelector(s)) if s == sel),
+        "{r:?}"
+    );
+
+    // Shorter than selector + one word.
+    let full = build_input("bbo(bytes32)", &[encode_market_id(1)]);
+    for len in [0, 3, 4, 35] {
+        let r = execute_precompile(&address, &full[..len], &addr(0), &db, 100, 0);
+        assert!(
+            matches!(r, Err(CoreError::InvalidPrecompileInput(_))),
+            "len {len}: {r:?}"
+        );
+    }
+
+    // A row of the wrong length is this node's corruption (the CF is
+    // unhashed): a local fault, never zeros.
+    db.put_cf_raw(
+        torus_state::cf::CF_NATIVE_BBO,
+        &4u64.to_be_bytes(),
+        &[1u8; 31],
+    )
+    .unwrap();
+    let r = call(4);
+    assert!(
+        matches!(&r, Err(CoreError::PrecompileLocalFault(_))),
+        "{r:?}"
+    );
+}
+
+/// 0x080e is a reader: known, eth_call-safe, priced like the other point
+/// readers (base 16,400 with the point read inside, + 20 per returned word).
+#[test]
+fn bbo_is_a_reader_at_0x080e() {
+    let (_dir, db) = setup();
+    assert_eq!(ADDR_BBO_READER, 0x080e);
+    let address = precompile_address(ADDR_BBO_READER);
+    assert!(is_precompile(&address));
+    assert!(is_reader_precompile(ADDR_BBO_READER));
+    assert_eq!(precompile_gas(ADDR_BBO_READER), GAS_PRECOMPILE_READ);
+    assert!(ALL_PRECOMPILE_ADDRESSES.contains(&address));
+    for id in [0x0804u16, 0x080d, 0x080f] {
+        assert!(!is_precompile(&precompile_address(id)), "0x{id:04x}");
+        assert!(!is_reader_precompile(id), "0x{id:04x}");
+    }
+
+    put_bbo_row(&db, 1, fp(99).raw(), fp(101).raw());
+    let input = build_input("bbo(bytes32)", &[encode_market_id(1)]);
+    let mut meter = ReadMeter::unlimited();
+    let out = execute_precompile_metered(
+        &address,
+        &input,
+        &addr(0),
+        U256::ZERO,
+        &db,
+        100,
+        0,
+        true,
+        &mut meter,
+    )
+    .expect("a reader runs in a read-only (eth_call) context");
+    assert_eq!(out.len(), 64);
+    // Owner s125: no row charge; two words.
+    assert_eq!(meter.used(), 2 * GAS_PRECOMPILE_READ_PER_WORD);
+    assert_eq!(reader_gas(meter.used()), 16_440);
 }

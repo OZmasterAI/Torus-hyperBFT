@@ -29,6 +29,20 @@ fn call_data(signature: &str, words: &[[u8; 32]]) -> Vec<u8> {
     data
 }
 
+/// [`TestHarness::new`] with the CoreWriter order delay K pinned to 1 (item 7 step 2): these
+/// tests are about the drain, not the delay, and expect orders in the next block.
+fn harness_k1() -> TestHarness {
+    let h = TestHarness::new();
+    h.state_db
+        .put_cf_raw(
+            torus_state::cf::CF_FEE_CONFIG,
+            b"core_writer_order_delay",
+            b"1",
+        )
+        .unwrap();
+    h
+}
+
 // ============================================================================
 // CoreWriter (0x0810) — delayed order execution
 // ============================================================================
@@ -36,7 +50,7 @@ fn call_data(signature: &str, words: &[[u8; 32]]) -> Vec<u8> {
 /// CoreWriter queues order for next block, not current block.
 #[test]
 fn test_core_writer_delayed_execution() {
-    let h = TestHarness::new();
+    let h = harness_k1();
     let trader = TestHarness::addr(1);
     let market_id = 1u64;
     let current_block = 10u64;
@@ -80,7 +94,7 @@ fn test_core_writer_delayed_execution() {
 /// CoreWriter placeOrder via precompile call.
 #[test]
 fn test_core_writer_precompile_call() {
-    let h = TestHarness::new();
+    let h = harness_k1();
     let caller = TestHarness::addr(5);
     let market_id = 1u64;
     let current_block = 20u64;
@@ -156,7 +170,7 @@ fn test_core_writer_staking_delayed_delegation() {
 /// Native orders execute in current block; CoreWriter orders execute in next block.
 #[test]
 fn test_execution_ordering_native_vs_core_writer() {
-    let h = TestHarness::new();
+    let h = harness_k1();
     let native_trader = TestHarness::addr(1);
     let evm_trader = TestHarness::addr(2);
     let market_id = 1u64;
@@ -229,7 +243,7 @@ fn test_execution_ordering_native_vs_core_writer() {
 /// Limit order; the order after it still executes.
 #[test]
 fn drained_stop_order_types_are_rejected_not_run_as_limit() {
-    let h = TestHarness::new();
+    let h = harness_k1();
     let trader = TestHarness::addr(3);
     let current_block = 40u64;
     h.fund_native(&trader, TestHarness::fp(1_000_000));
@@ -262,7 +276,7 @@ fn drained_stop_order_types_are_rejected_not_run_as_limit() {
 /// Invalid CoreWriter action fails without affecting other queued actions.
 #[test]
 fn test_invalid_core_writer_action_isolation() {
-    let h = TestHarness::new();
+    let h = harness_k1();
     let trader_a = TestHarness::addr(1);
     let trader_b = TestHarness::addr(2);
     let current_block = 30u64;

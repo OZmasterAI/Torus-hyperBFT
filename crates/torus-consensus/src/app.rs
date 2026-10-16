@@ -20711,6 +20711,23 @@ mod crash_recovery_tests {
             vec![&(queue, queue_rows[0].0.clone(), Some(queue_rows[0].1.clone()))],
             "the precompile's queue row is in D(1)"
         );
+        // Item 7 step 2 (owner answer 3): an order kind also writes the last order
+        // target (1 + K = 11) into hashed CF_FEE_CONFIG, in the same D(1).
+        let fee = hashed_cf_id(torus_state::cf::CF_FEE_CONFIG).unwrap();
+        let last_target: Vec<_> = captured[0]
+            .1
+            .iter()
+            .filter(|e| e.0 == fee && e.1 == b"core_writer_last_order_target")
+            .collect();
+        assert_eq!(
+            last_target,
+            vec![&(
+                fee,
+                b"core_writer_last_order_target".to_vec(),
+                Some(11u64.to_be_bytes().to_vec())
+            )],
+            "the last order target row is in D(1)"
+        );
         assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)));
     }
 
@@ -20883,6 +20900,13 @@ mod crash_recovery_tests {
             (true, Some(ckpt_never())),
         ] {
             let (_cfg, db) = make_test_config_and_db();
+            // Item 7 step 2: CoreWriter order delay K = 1 (rows drain at the next block).
+            db.put_cf_raw(
+                torus_state::cf::CF_FEE_CONFIG,
+                b"core_writer_order_delay",
+                b"1",
+            )
+            .unwrap();
             db.put_account(
                 &k256_address(&key),
                 &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))),
@@ -24356,6 +24380,142 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Item 7 step 2 (owner decision 4): block 2 carries a lockbox deposit and a
+    /// CoreWriter (0x0810) `cancelAll(bytes32)`; blocks 3-12 are empty. The deposit
+    /// (not an order kind) drains at 3, the cancel (an order kind, default K = 10) at
+    /// 12: its row stays in the raw DB through 3-11 (no later EVM block, so nothing
+    /// rewrites it) and the raw-DB due-check finds it at 12. Pipeline off, interval 0,
+    /// 15000, never: same final state. RED before: both rows targeted 3.
+    #[test]
+    fn corewriter_order_drains_k_blocks_later_with_the_pipeline_and_interval() {
+        use torus_core::precompiles::CoreWriterQueue;
+        use torus_state::action_status::CoreWriterKind;
+        use torus_state::cf::CF_CORE_WRITER_QUEUE;
+        let (key, trader, mut blocks) = cw_due_blocks();
+        let mut cancel_all =
+            alloy_primitives::keccak256("cancelAll(bytes32)".as_bytes())[..4].to_vec();
+        cancel_all.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+        let core_writer =
+            torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_CORE_WRITER);
+        blocks[1].evm_transactions.push(signed_eip1559(
+            &key,
+            1,
+            alloy_primitives::TxKind::Call(core_writer),
+            cancel_all,
+        ));
+        blocks[1].header.evm_tx_count = 2;
+        blocks.extend((4..=12).map(|h| make_block(h, vec![])));
+        link_blocks(&mut blocks);
+        let queue_key = |block: u64, seq: u64| {
+            let mut k = block.to_be_bytes().to_vec();
+            k.extend_from_slice(&seq.to_be_bytes());
+            k
+        };
+        let queue_keys = |db: &StateDb| -> Vec<Vec<u8>> {
+            StateBackend::iterate_cf(db, CF_CORE_WRITER_QUEUE, None)
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        let ckpt_15000 = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(15_000)),
+            ..Default::default()
+        };
+        let configs: [(&str, bool, Option<crate::exec_pipeline::CheckpointPolicy>); 4] = [
+            ("pipeline off", false, None),
+            ("interval 0", true, None),
+            ("interval 15000", true, Some(ckpt_15000)),
+            ("interval never", true, Some(ckpt_never())),
+        ];
+        let mut dumps = Vec::new();
+        for (what, on, ckpt) in configs {
+            let (_cfg, db) = make_test_config_and_db();
+            db.put_account(
+                &trader,
+                &revm::state::AccountInfo {
+                    balance: U256::from(10u128.pow(22)),
+                    nonce: 0,
+                    code_hash: KECCAK_EMPTY_CODE,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+            let (mut config, _) = make_test_config_and_db();
+            config.epoch_length = 4;
+            let mut ctx = make_exec_ctx(&config, &db);
+            ctx.checkpoint = ckpt;
+            if on {
+                ctx.attach_flush_worker(None);
+            }
+            let deposited = |db: &StateDb| {
+                let bal = torus_core::position::PositionManager::new(db.clone())
+                    .get_native_balance(&trader)
+                    .unwrap();
+                bal.available + bal.order_margin
+            };
+
+            dispatch_and_execute(&ctx, &db, &blocks[0]);
+            dispatch_and_execute(&ctx, &db, &blocks[1]);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 2");
+            assert_eq!(
+                queue_keys(&db),
+                vec![queue_key(3, 0), queue_key(12, 0)],
+                "{what}: deposit at 3, cancelAll at 2 + K = 12, in the raw DB"
+            );
+            dispatch_and_execute(&ctx, &db, &blocks[2]);
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            assert_eq!(
+                CoreWriterQueue::pending_count(&db, 12).unwrap(),
+                1,
+                "{what}: after 3 the cancel still waits"
+            );
+            for b in &blocks[3..] {
+                dispatch_and_execute(&ctx, &db, b);
+            }
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "{what}: blocks 3-12"
+            );
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(12), "{what}");
+            assert_eq!(
+                deposited(&db),
+                FixedPoint::from_raw(1_000 * FixedPoint::SCALE),
+                "{what}: block 3 credited the deposit"
+            );
+            assert!(
+                queue_keys(&db).is_empty(),
+                "{what}: queue CF empty after 12"
+            );
+            let status = action_status(&db, 12).expect("block 12 drained the cancel");
+            let kinds: Vec<_> = status
+                .core_writer
+                .iter()
+                .map(|r| (r.seq, r.kind, r.queued_block))
+                .collect();
+            assert_eq!(kinds, vec![(0, CoreWriterKind::CancelAll, 2)], "{what}");
+            let drained_3: Vec<_> = action_status(&db, 3)
+                .expect("block 3 drained the deposit")
+                .core_writer
+                .iter()
+                .map(|r| r.kind)
+                .collect();
+            assert_eq!(drained_3, vec![CoreWriterKind::LockboxDeposit], "{what}");
+            dumps.push((what, dump_all_cfs(&db)));
+        }
+        for (what, d) in &dumps[1..] {
+            assert_dumps_equal(
+                &dumps[0].1,
+                d,
+                &format!("CoreWriter K: pipeline off vs {what}"),
+            );
+        }
+    }
+
     /// R02 (audit option A, branch 1; APP:2409): a block whose CoreWriter
     /// queue read fails fail-stops — `exec_failed`, applied marker unchanged,
     /// nothing of the block flushed (every CF as before it ran; the queued
@@ -24566,6 +24726,13 @@ mod crash_recovery_tests {
         link_blocks(&mut blocks);
         let replica = |on: bool| {
             let (_cfg, db) = make_test_config_and_db();
+            // Item 7 step 2: CoreWriter order delay K = 1 (rows drain at the next block).
+            db.put_cf_raw(
+                torus_state::cf::CF_FEE_CONFIG,
+                b"core_writer_order_delay",
+                b"1",
+            )
+            .unwrap();
             let enqueue = |trader: u8, kind, block_queued| {
                 CoreWriterQueue::enqueue(
                     &db,
@@ -24594,6 +24761,14 @@ mod crash_recovery_tests {
             db.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0)).unwrap();
             db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, 2), &bytes)
                 .unwrap();
+            // Item 7 step 2: the moved row's target is 2, so the last order target is too
+            // (else the order kinds below would be held at 3, never before it).
+            db.put_cf_raw(
+                torus_state::cf::CF_FEE_CONFIG,
+                torus_core::precompiles::CORE_WRITER_LAST_ORDER_TARGET_KEY,
+                &2u64.to_be_bytes(),
+            )
+            .unwrap();
             let stop = QueuedActionKind::PlaceOrder {
                 market_id: 1,
                 side: 0,
@@ -24709,6 +24884,13 @@ mod crash_recovery_tests {
             (true, Some(ckpt_never())),
         ] {
             let (_cfg, db) = make_test_config_and_db();
+            // Item 7 step 2: CoreWriter order delay K = 1 (rows drain at the next block).
+            db.put_cf_raw(
+                torus_state::cf::CF_FEE_CONFIG,
+                b"core_writer_order_delay",
+                b"1",
+            )
+            .unwrap();
             let pm = torus_core::position::PositionManager::new(db.clone());
             for t in [0x31, 0x32, 0x33] {
                 pm.put_native_balance(
@@ -26058,6 +26240,9 @@ mod crash_recovery_tests {
         // Non-vacuous (the warm replica; the others equal it).
         let pm = torus_core::position::PositionManager::new(warm.db.clone());
         let fills = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_TRADES, None).unwrap().len();
+        // Item 7 step 2 (B16): the dumps compared above cover the bbo rows.
+        let bbo_rows = StateBackend::iterate_cf(&warm.db, torus_state::cf::CF_NATIVE_BBO, None).unwrap().len();
+        assert!(bbo_rows >= 1, "{what}: bbo rows {bbo_rows}");
         let liquidations = warm.metrics.liquidations_triggered.get();
         let top_ups = warm.metrics.sell_top_ups_full.get() + warm.metrics.sell_top_ups_partial.get();
         let v1 = signed_pos_of(&warm.db, &oracle_addr(C5_V1));

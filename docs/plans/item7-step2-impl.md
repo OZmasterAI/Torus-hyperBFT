@@ -82,8 +82,9 @@ questions.
   (`pending_nonce`); then each tracked tx whose target has committed and that is still pooled is re-sent to the next
   predicted leader(s), at most 8 times.
 - **CoreWriter (decision 4):** at enqueue, order kinds (`PlaceOrder`, `CancelOrder`, `CancelAll`, `CancelByCloid`)
-  target `block_queued + K`, every other kind `+ 1`; a target block that already holds 200 rows sends the row on to
-  the next block with room **(plan: the cap applied at enqueue)**. Same rule as the decision (at most 200 drained per
+  target `block_queued + K` (never before the previous order kind's target, B15), every other kind `+ 1`; a target
+  block that already holds 200 rows sends the row on to the next block with room **(plan: the cap applied at
+  enqueue)**. Same rule as the decision (at most 200 drained per
   block, excess in the next block, queue order), and rows are still written only by EVM blocks, which are serial
   barriers, so `core_writer_due`'s raw-DB read stays valid (memory 25f7770c) and the `(drain height, seq)` key of the
   v5 status record and of the RPC tx links stays exact. A drain-time cap would rewrite rows in pipelined blocks,
@@ -142,7 +143,8 @@ questions.
 ## Tasks
 
 Test names are the RED tests each task adds; every one fails before its implementation (missing item = compile
-error, or a wrong value). Tests never rely on the default N or M.
+error, or a wrong value), except a test marked a structural guard (B10's o5 test), which passes before and must stay
+green after. Tests never rely on the default N or M.
 
 ### B1: torus-types constants, keys, height rules; EIP-1559 moves to torus-types
 - **Test first** (`crates/torus-types/src/lib.rs` `mod tests`):
@@ -812,20 +814,48 @@ error, or a wrong value). Tests never rely on the default N or M.
         // M = 7, N = 5 over [1, 15): EVM heights 5, 7, 10, 14 (4), big 7, 14 (2).
         let mixed = torus_types::EvmHeaderValues { big_block_interval: 7, ..w };
         assert_eq!(next_base_fees(&mixed, 1, 15, 6_000_000, 10_000_000), (2_000_000_000, 2_000_000_000));
+        // Gas over a lane's window limit (60M small, 20M big) counts as the limit: exactly +12.5%
+        // (unclamped: 2,500,000,000 and 2,375,000,000).
+        assert_eq!(next_base_fees(&w, 100, 200, 90_000_000, 25_000_000), (2_250_000_000, 2_250_000_000));
+        assert_eq!(next_base_fees(&w, 100, 200, u64::MAX, u64::MAX), (2_250_000_000, 2_250_000_000));
+        let top = torus_types::EvmHeaderValues { base_fee: u64::MAX - 1, big_base_fee: u64::MAX - 1, ..w };
+        assert_eq!(next_base_fees(&top, 100, 200, 60_000_000, 20_000_000), (u64::MAX, u64::MAX), "saturates");
     }
     ```
-    and `boundary_turns_the_epoch_gas_into_plan_fees_and_resets_the_row` (setup as `plan_carries_governance_evm_params`;
-    `add_epoch_evm_gas(mgr.state(), 9_000_000, 0)`; `execute_planned_rotation(&mgr, 4, 4, 4, Some(window))` with N = 1,
+    The last three asserts are the clamp (Codex plan check s125): lanes come from the sender's row and the vote
+    does not check lanes, so one lane's executed gas can exceed its limit x heights (a big height's cap is small +
+    big), and `calc_next_block_base_fee` has no clamp; `top` panics on overflow in a debug build today.
+  - `crates/torus-types/src/eip1559.rs` tests: `base_fee_clamps_gas_used_at_the_limit`
+    (`calc_next_block_base_fee(45_000_000, 30_000_000, 1_000_000_000) == 1_125_000_000`, and the same with
+    `u64::MAX` used; unclamped: 1,250,000,000) and `base_fee_saturates_at_u64_max`
+    (`calc_next_block_base_fee(30_000_000, 30_000_000, u64::MAX) == u64::MAX`, no panic).
+  - epoch_plan.rs, `boundary_turns_the_epoch_gas_into_plan_fees_and_resets_the_row` (setup as
+    `plan_carries_governance_evm_params`; `add_epoch_evm_gas(mgr.state(), 9_000_000, 0)`; `execute_planned_rotation(&mgr, 4, 4, 4, Some(window))` with N = 1,
     M = 0, 3M, 10M, 2 gwei both: `plan(8).evm.base_fee == Some(2_250_000_000)` (3 EVM heights, target 4.5M, used 2x),
     `big_base_fee == Some(2_000_000_000)`, `epoch_evm_gas == (0, 0)`; with `None`: fees `None`, row still reset).
   - app.rs, `f3_epoch_gas_sets_plan_fees_serial_and_pipelined`: config `epoch_length = 4`,
-    `evm_block_interval = 1`; blocks 1-4 (`make_block` + `link_blocks`), an EVM transfer in block 2 and in block 4,
-    the row seeded to `9_000_000` small gas before block 4 (`db.put_cf_raw`); for `on` in `[false, true]`
+    `evm_block_interval = 1`; blocks 1-4 (`make_block`; on all four headers `evm_block_interval = 1` and
+    `evm_big_block_interval = 0`, as B10's `lane_block` sets them, then `link_blocks`: `make_block` pins
+    `TEST_EVM_BLOCK_INTERVAL` = 5 (app.rs:262, header ~10398), and with N = 5 the window [1, 4) has no EVM height,
+    so the fee would stay 1 gwei for the wrong reason (Codex plan check s125)), an EVM transfer in block 2 and in
+    block 4, the row seeded to `9_000_000` small gas before block 4 (`db.put_cf_raw`); for `on` in `[false, true]`
     (`pipeline_ctx(&db, on, None)`): `plan(8).evm.base_fee == Some(1_125_000_000)` (1 gwei, 9M + 21k over a 4.5M
-    target, capped at +12.5%), the row after block 4 is `(21_000, 0)` (block 4's own gas), dumps equal across `on`.
+    target; used is clamped at the 9M window limit, so exactly +12.5%; unclamped it would be 1,125,583,333), the row
+    after block 4 is `(21_000, 0)` (block 4's own gas), dumps equal across `on`.
     After `perf/epoch-boundary-fast-path` merges: a third run with `ctx.epoch_fast_path = true` and an EVM-free block
     4 (pipelined boundary) gives the same plan fees.
 - **Implementation:**
+  `calc_next_block_base_fee` (`crates/torus-types/src/eip1559.rs`, C1): clamp and saturate.
+  ```rust
+  pub fn calc_next_block_base_fee(gas_used: u64, gas_limit: u64, base_fee: u64) -> u64 {
+      // Item 7 step 2 (F3): gas above the limit counts as the limit (at most +12.5% per step): a
+      // lane's executed gas can exceed its window limit (lanes are not part of the vote).
+      let gas_used = gas_used.min(gas_limit);
+      // .. unchanged, except the over-target return:
+          base_fee.saturating_add(fee_delta.max(1))
+  ```
+  The bridge callers (proposer.rs:74, validator.rs:122) pass the parent header's `evm_gas_used`, which is at most
+  its limit (0 in consensus headers): no change for them.
   ```rust
   // epoch_plan.rs
   /// Item 7 step 2 (F3): `CF_CONSENSUS_META` row of the gas the EVM blocks since the last boundary
@@ -954,7 +984,7 @@ error, or a wrong value). Tests never rely on the default N or M.
   `evm_epoch_gas` row to their expectation.
   Fast path: a pipelined boundary reads the row and the parent header through its overlay (parent layer, L, C), so
   the result equals the barrier path.
-- **Verify:** `$L cargo nextest run $P $F -E 'test(next_base_fees_follow_the_epochs_gas_per_lane) or test(boundary_turns_the_epoch_gas_into_plan_fees) or test(f3_epoch_gas_sets_plan_fees) or test(running_hash_captures)'`
+- **Verify:** `$L cargo nextest run $P $F -E 'test(next_base_fees_follow_the_epochs_gas_per_lane) or test(boundary_turns_the_epoch_gas_into_plan_fees) or test(f3_epoch_gas_sets_plan_fees) or test(running_hash_captures) or test(base_fee_)'`
 - **Depends on:** B4, B6, B8
 
 ### B10: per-height caps before the vote; the consensus message size test
@@ -990,8 +1020,9 @@ error, or a wrong value). Tests never rely on the default N or M.
     byte more `Invalid`; `evm_tx_gas(0, 13_000_000)` `Held`, `13_000_001` `Invalid`; with M = 0 (parent
     `lane_block(49, 0)`), a 300 KiB blob at 50 is `Invalid`.
   - `crates/torus-integration-tests/tests/o5_feed_gates.rs`, `worst_case_compact_proposal_fits_consensus_accept_gate`
-    rewritten from the vote caps (RED before: it sizes from `evm_block_gas_budget() / 16`, 312.5 KB, which B11 turns
-    into `u64::MAX / 16`):
+    (:23) rewritten from the vote caps. A structural guard, not a RED test (Codex plan check s125): its constants landed in
+    C1 and it calls no vote code, so it passes before B10; it must stay green through B11, which turns the old
+    version's `evm_block_gas_budget() / 16` (312.5 KB) into `u64::MAX / 16`:
     ```rust
     use torus_mempool::rate_limit::{native_total_block_cap, NATIVE_ORDERS_PER_BATCH_CAP};
     use torus_types::{
@@ -1066,7 +1097,7 @@ error, or a wrong value). Tests never rely on the default N or M.
   - `big_lane_fee_floor_is_the_big_base_fee`: big fee 3 gwei: max fee 2 gwei `FeeTooLow` in the big lane, admitted in
     the small lane.
   - `node_budget_caps_only_the_small_lane`: `evm_block_gas_budget: 1_000_000`: a 1.5M small-lane tx refused, a 5M
-    big-lane tx admitted, `drain_evm_big(10M, ..)` takes it.
+    big-lane tx admitted, `drain_evm_big(10M, .., 1 gwei, ..)` takes it.
   - `rate_limit` tests, `evm_block_gas_budget_has_no_default`: `parse_evm_block_gas_budget(None) == u64::MAX`,
     `(Some("abc")) == u64::MAX`, `(Some(" 7000000 ")) == 7_000_000`.
   - `big_blocks_switched_off_move_the_big_pool_to_the_small_lane`: `set_big_lane(0, ..)` after M was 50: the big
@@ -1186,14 +1217,19 @@ error, or a wrong value). Tests never rely on the default N or M.
 
         /// Item 7 step 2: the big lane's part of a big height: up to the header's big limit (the node
         /// budget never caps it) and `byte_budget` (768 KiB minus the small lane's bytes), with the
-        /// per-sender share of the big limit, at the big base fee.
-        pub fn drain_evm_big(&self, gas_limit: u64, byte_budget: usize, parent_hash: B256) -> Vec<Vec<u8>> {
+        /// per-sender share of the big limit, at the proposed header's big base fee (B12).
+        pub fn drain_evm_big(
+            &self,
+            gas_limit: u64,
+            byte_budget: usize,
+            big_base_fee: u64,
+            parent_hash: B256,
+        ) -> Vec<Vec<u8>> {
             let sender_gas_cap = match self.config.evm_sender_share_pct {
                 0 => None,
                 pct => Some(gas_limit.saturating_mul(pct as u64) / 100),
             };
-            let min_base_fee =
-                self.current_big_base_fee.load(std::sync::atomic::Ordering::Relaxed) as u128;
+            let min_base_fee = big_base_fee as u128;
             let drained = self.evm.write().unwrap().big.drain(
                 gas_limit,
                 byte_budget,
@@ -1256,8 +1292,17 @@ error, or a wrong value). Tests never rely on the default N or M.
     pool empty, and `pre_vote` of the produced block is `Held`.
   - `committed_header_sets_the_mempool_big_lane` (copy of `committed_header_sets_mempool_gas_cap` 21957): dispatching
     a committed block whose header has M = 50 and big limit 10M routes a lane-row sender's next tx to the big pool.
+  - `boundary_drain_uses_the_planned_fee` (Codex plan check s125: `drain_evm` floors at the committed
+    `current_base_fee`, mempool lib.rs:737-740, and B11's `drain_evm_big` did the same with the big fee, while the
+    header carries `PlanEvm::resolve(parent)`; the two differ at a boundary from C4 on): `epoch4_app`, blocks 1-4
+    with N = 1 and M = 0 in their headers and the F3 row seeded to 9M small gas before block 4 (as B9's f3 test), so
+    `plan(8).evm.base_fee == Some(1_125_000_000)`; `funded_evm_mempool` holds a `signed_eip1559_gas` tx (max fee 1
+    gwei: admitted at the committed 1 gwei, any max fee in [1, 1.125) gwei shows it). `build_proposal` on
+    `make_block(7)` with N = 1 (base fee 1 gwei): block 8's header base fee is 1,125,000,000, it carries no EVM tx,
+    `evm_pool_size() == 1`. Control: `select_block_payload(.., 1_000_000_000, ..)` drains it.
   - The 8 `select_block_payload` test calls (app.rs 8952, 8963, 9010, 9015, 12367, 12377, 13560, 13568) pass a `0`
-    big limit.
+    big limit and both fees `1_000_000_000`; the `drain_evm` test calls (mempool lib.rs, 19; app.rs ~22056-22164, 3;
+    `rate_limit_mev.rs:282`) pass `mempool.base_fee()` (or the 1 gwei they were admitted at).
 - **Implementation:** `build_proposal` (after B6's `evm`):
   ```rust
           // Item 7 steps 1-2: the small lane at h % N == 0 and at a big height, the big lane at a big
@@ -1270,21 +1315,26 @@ error, or a wrong value). Tests never rely on the default N or M.
           };
           let big_gas_limit = if big { evm.big_gas_limit } else { 0 };
   ```
-  and `self.select_block_payload(parent_header.height, gas_limit, big_gas_limit, parent_header.state_root)`.
-  `select_block_payload` (7855) gets `big_gas_limit: u64`; its drain (7961-7966):
+  and `self.select_block_payload(parent_header.height, gas_limit, big_gas_limit, evm.base_fee, evm.big_base_fee,
+  parent_header.state_root)`: the fees of the header being proposed (the resolved plan), not the committed ones.
+  `select_block_payload` (7855; 7906 on main 7615bb89) gets `big_gas_limit: u64, base_fee: u64, big_base_fee: u64`;
+  `drain_evm` becomes `drain_evm(gas_limit, base_fee, parent_hash)` (`min_base_fee = base_fee as u128` replaces the
+  `current_base_fee` load, lib.rs:737-740; admission keeps the committed floor); its drain (7961-7966):
   ```rust
           // Item 7 steps 1-2: the small lane first (its limit, 256 KiB), then at a big height the big
-          // lane in the bytes left of 768 KiB. 0 = no destructive drain.
+          // lane in the bytes left of 768 KiB, each at the proposed header's base fee. 0 = no
+          // destructive drain.
           let mut evm = if gas_limit == 0 {
               Vec::new()
           } else {
-              mempool.drain_evm(gas_limit, parent_state_root)
+              mempool.drain_evm(gas_limit, base_fee, parent_state_root)
           };
           if big_gas_limit > 0 {
               let used: usize = evm.iter().map(Vec::len).sum();
               evm.extend(mempool.drain_evm_big(
                   big_gas_limit,
                   torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES.saturating_sub(used),
+                  big_base_fee,
                   parent_state_root,
               ));
           }
@@ -1293,8 +1343,8 @@ error, or a wrong value). Tests never rely on the default N or M.
   `leader_state.set_evm_block_interval(last_header.evm_block_interval)` (5907): the mempool follows `last_header`
   at boot too (`set_evm_header(&last_header)` on the mempool `try_new` holds), so a restarted node admits by the
   current lanes before its first commit.
-- **Verify:** `$L cargo nextest run $P $F -E 'test(big_height_drains_the_small_lane_then_the_big_lane) or test(committed_header_sets_the_mempool) or test(select_block_payload) or test(catch_up_gate) or test(deferred_exec_counts_toward_pacing)'`
-- **Depends on:** B6, B10, B11
+- **Verify:** `$L cargo nextest run $P $F -E 'test(big_height_drains_the_small_lane_then_the_big_lane) or test(committed_header_sets_the_mempool) or test(boundary_drain_uses_the_planned_fee) or test(select_block_payload) or test(catch_up_gate) or test(deferred_exec_counts_toward_pacing)'`
+- **Depends on:** B6, B9 (the boundary fee test), B10, B11
 
 ### B13: the in-flight filter (decision 7)
 - **Test first:**
@@ -1307,7 +1357,21 @@ error, or a wrong value). Tests never rely on the default N or M.
     - `lower_nonce_than_a_committed_one_is_refused`: a replacement of nonce 1 (higher fee, new hash) is
       `NonceTooLow { minimum: 2 }`.
     - `inflight_entry_drops_once_the_state_nonce_catches_up`: the account's state nonce set to 2,
-      `prune_committed_txs()`: the entry is gone (`pending_nonce` = state nonce + pooled).
+      `prune_committed_txs(9)` (below the entry's height, so the nonce rule alone): the entry is gone
+      (`pending_nonce` = state nonce + pooled).
+    - `own_drained_txs_reserve_their_nonces_at_commit` (Codex plan check s125: the proposer's own txs left the pool
+      at drain, lib.rs:741-748, and `own_evm_proposed`, app.rs:7857-7865, keeps only raw bytes, so the
+      `remove_by_hash` hit never fires for them): S pools nonces 0 and 1, `drain_evm` takes both;
+      `pending_nonce(S) == 0` (no reservation at drain); `remove_committed_evm(10, &[raw0, raw1])` returns 0 (none
+      pooled); `pending_nonce(S) == 2` with state nonce 0 (starts at `committed_next` = 1 + 1, nothing pooled from
+      2); a replacement of nonce 1 is `NonceTooLow { minimum: 2 }`. A second case drains 0 and 1, then
+      `reinsert_evm([raw0, raw1])` (lost proposal): both pooled again, `drained` empty, a commit of neither leaves
+      `pending_nonce(S) == 2` from the pool.
+    - `skipped_committed_tx_releases_its_nonce_once_its_height_executes` (Codex plan check s125: a committed tx
+      that execution skips, executor.rs:328-332, never moves the state nonce, so the entry held the sender ~80 s
+      (256 blocks)): S pools nonce 0; `remove_committed_evm(10, &[raw0])`; state nonce stays 0 (fee too low at
+      execution); a re-signed nonce-0 tx (higher fee, new hash) is `NonceTooLow { minimum: 1 }` after
+      `prune_committed_txs(9)` and admitted after `prune_committed_txs(10)`.
   - app.rs, `commit_prunes_forwarded_copies_from_a_non_proposer_pool`: a node that holds a forwarded tx (not its own
     proposal) runs `on_committed_block` for a compact block carrying it: `evm_pool_size() == 0` before any execution.
 - **Implementation:** `EvmLanes` (B11) gains
@@ -1315,12 +1379,20 @@ error, or a wrong value). Tests never rely on the default N or M.
       /// Decision 7: EVM txs a committed block carried, with that height; admission refuses them
       /// (`DuplicateTx`) for `EVM_INFLIGHT_KEEP_BLOCKS`.
       pub committed: HashMap<B256, u64>,
-      /// Decision 7: per sender, the nonce after its highest pooled tx a committed block carried, with
+      /// Decision 7: per sender, the nonce after its highest pooled or drained tx a committed block carried, with
       /// that height: admission refuses lower nonces and `pending_nonce` starts there, until the state
       /// nonce reaches it or the entry expires.
       pub committed_next: HashMap<Address, (u64, u64)>,
+      /// Decision 7: this node's drained txs (its own proposals), hash -> (sender, nonce), until a
+      /// committed block carries them or they are reinserted. No reservation at drain: a lost
+      /// proposal's txs would be refused `NonceTooLow` by `reinsert_evm`.
+      pub drained: HashMap<B256, (Address, u64)>,
   ```
-  and `EvmLanes::remove_by_hash` (either pool). Mempool:
+  and `EvmLanes::remove_by_hash` (either pool). `EvmPool::drain` gains `drained: &mut HashMap<B256, (Address, u64)>`
+  and inserts each selected tx (`drain_evm` / `drain_evm_big` pass `&mut lanes.drained`, a field borrow beside
+  `lanes.small` / `lanes.big`); `reinsert_evm` removes each tx's hash from it, also when re-admission refuses the tx;
+  `prune_committed_txs` drops `drained` entries whose nonce is below the sender's state nonce (a leak bound: each
+  drained tx normally settles at its height through `remove_committed_evm` or `reinsert_lost_evm`). Mempool:
   ```rust
   /// Decision 7: how long (blocks) a committed EVM tx is remembered: above the exec channel (64) plus
   /// parked blocks, so a late copy is refused until execution has confirmed (or skipped) it.
@@ -1339,11 +1411,18 @@ error, or a wrong value). Tests never rely on the default N or M.
               lanes.committed_next.retain(|_, (_, h)| *h >= keep_from);
               for hash in hashes {
                   lanes.committed.insert(hash, height);
-                  if let Some(e) = lanes.remove_by_hash(&hash) {
-                      let next = lanes.committed_next.entry(e.sender).or_insert((0, height));
-                      *next = (next.0.max(e.nonce + 1), height);
-                      removed += 1;
-                      freed += e.raw_rlp.len();
+                  let hit = match lanes.remove_by_hash(&hash) {
+                      Some(e) => {
+                          removed += 1;
+                          freed += e.raw_rlp.len();
+                          Some((e.sender, e.nonce))
+                      }
+                      // Our own proposal's txs left the pool at drain.
+                      None => lanes.drained.remove(&hash),
+                  };
+                  if let Some((sender, nonce)) = hit {
+                      let next = lanes.committed_next.entry(sender).or_insert((0, height));
+                      *next = (next.0.max(nonce + 1), height);
                   }
               }
           }
@@ -1355,9 +1434,19 @@ error, or a wrong value). Tests never rely on the default N or M.
   ```
   `admit_evm_tx`, under the lock after the duplicate check: `lanes.committed.contains_key(&hash)` -> `DuplicateTx`;
   `nonce < committed_next[sender].0` -> `NonceTooLow { sender, have, minimum }` (`reinsert_evm` already treats both as
-  done). `pending_nonce` starts at `max(state_nonce, committed_next[sender].0)`. `prune_committed_txs` (1727) also
-  drops `committed_next` entries whose state nonce reached them. app.rs `on_committed_block` (7653-7660), before
-  `reinsert_lost_evm`:
+  done). `pending_nonce` starts at `max(state_nonce, committed_next[sender].0)`. `prune_committed_txs` (1727) becomes
+  `prune_committed_txs(executed_height: u64)` and also drops `committed_next` entries whose state nonce reached them
+  or whose height is `<= executed_height` (the state nonce is authoritative there: a tx skipped at execution
+  releases its nonce then, not after 256 blocks). Its caller (torus-node main.rs:1109) passes the raw DB's applied
+  marker (`CF_CONSENSUS_META` `META_NATIVE_APPLIED_HEIGHT`, cf.rs:200, read as app.rs:1229 `native_applied_height`
+  does; absent = 0), the same raw DB `prune_committed_txs` reads the state nonces from. Not the handler's `height`:
+  that is `find_latest_height`, the newest `CF_BLOCK_HEADERS` row, which `persist_committed_block_durably` writes at
+  commit, before execution (app.rs:1593). With checkpoints on, the raw marker lags up to one interval (15 s), still
+  far below 256 blocks. Owner decision s125, option (a): a node that never pooled or drained a committed tx does
+  NOT ecrecover its sender on the consensus thread; its `pending_nonce` for that sender lags until execution (~14 s
+  at load); worst case a different tx with a used nonce is pooled, then skipped at execution and pruned; the
+  `committed` hash filter (`DuplicateTx`) still blocks the same tx. Reason: no hot-path cost. app.rs
+  `on_committed_block` (7653-7660), before `reinsert_lost_evm`:
   ```rust
           // Item 7 step 2 (decision 7): the in-flight filter (every commit, also to expire entries).
           if let Some(ref mempool) = self.mempool {
@@ -1365,7 +1454,7 @@ error, or a wrong value). Tests never rely on the default N or M.
           }
   ```
   Cost on the consensus thread: one keccak over each committed EVM tx (~1.5 ms for a full 768 KiB big height).
-- **Verify:** `$L cargo nextest run $P $F -E 'test(committed_block_drops_its_pooled_evm_txs) or test(committed_evm_tx_is_not_readmitted_until_expiry) or test(lower_nonce_than_a_committed_one) or test(inflight_entry_drops_once_the_state_nonce) or test(commit_prunes_forwarded_copies) or test(lost_proposal)'`
+- **Verify:** `$L cargo nextest run $P $F -E 'test(committed_block_drops_its_pooled_evm_txs) or test(committed_evm_tx_is_not_readmitted_until_expiry) or test(lower_nonce_than_a_committed_one) or test(inflight_entry_drops_once_the_state_nonce) or test(own_drained_txs_reserve_their_nonces) or test(skipped_committed_tx_releases_its_nonce) or test(commit_prunes_forwarded_copies) or test(lost_proposal)'`
 - **Depends on:** B11
 
 ### B14: routing per lane: upcoming N/M, two big leaders, re-send (decision 7)
@@ -1660,6 +1749,13 @@ error, or a wrong value). Tests never rely on the default N or M.
     and `a_full_target_block_sends_later_rows_to_the_next_block`: 201 `CancelOrder` rows queued at block 100 give
     200 at 110 (seqs 0-199) and 1 at 111 (seq 0); a `ClaimRewards` queued at 109 (target 110, full) gets 111 seq 1;
     `drain_ok(&db, 111)` is `[CancelOrder { order_id: 200 }, ClaimRewards]`.
+  - `lowering_k_never_lets_a_cancel_overtake_an_earlier_order` (Codex plan check s125: K is read at enqueue and the
+    drain is strictly by target prefix, precompiles.rs:1341-1342, so K 10 -> 1 would drain a cancel queued at 102 at
+    103, before a place queued at 100 drains at 110, against owner answer 3): `PlaceOrder` queued at 100 with K = 10
+    (target 110); the K row set to `"1"`; `CancelOrder` queued at 102 (target max(103, 110) = 110):
+    `pending_count(&db, 103) == 0` and `drain_ok(&db, 110)` is `[PlaceOrder { .. }, CancelOrder { .. }]` in that
+    order. Then a `CancelOrder` queued at 115 targets 116 (the delay is back to K once the last target is passed),
+    and a `ClaimRewards` queued at 102 still targets 103 (other kinds ignore the row).
   - app.rs, `corewriter_order_drains_k_blocks_later_with_the_pipeline_and_interval` (fixture modelled on
     `cw_due_blocks` 23745, configs of `corewriter_evm_row_drains_in_empty_next_block_with_interval` 23881: pipeline off,
     interval 0, 15000, never): block 2 carries a lockbox deposit and a CoreWriter (0x0810) `cancelAll(bytes32)` call;
@@ -1709,6 +1805,14 @@ error, or a wrong value). Tests never rely on the default N or M.
               1
           };
           let mut target_block = action.block_queued.saturating_add(delay);
+          // Owner answer 3: an order kind never targets a block before the previous order kind's
+          // target, so lowering K cannot let a cancel overtake its order.
+          let order = action.kind.is_order();
+          if order {
+              let last = state_db.get_cf_raw(CF_FEE_CONFIG, LAST_ORDER_TARGET_KEY)?;
+              let last = last.as_deref().and_then(|v| <[u8; 8]>::try_from(v).ok()).map_or(0, u64::from_be_bytes);
+              target_block = target_block.max(last);
+          }
           // A target's seqs are dense from 0 (rows leave only when the whole target drains), so it is
           // full iff its last slot is taken: one point read per full block skipped.
           while state_db
@@ -1720,13 +1824,29 @@ error, or a wrong value). Tests never rely on the default N or M.
           let seq = Self::next_sequence(state_db, target_block)?;
           let data = borsh::to_vec(action).map_err(|e| CoreError::Borsh(e.to_string()))?;
           state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(target_block, seq), &data)?;
+          if order {
+              // The target after the cap: a later order kind never lands before this row.
+              state_db.put_cf_raw(CF_FEE_CONFIG, LAST_ORDER_TARGET_KEY, &target_block.to_be_bytes())?;
+          }
           Ok(seq)
       }
+
+  /// Item 7 step 2 (owner answer 3): `CF_FEE_CONFIG` row of the last order-kind target (u64 BE).
+  /// Not a governance key (not in the allowlist, no proposal sets it), and not in
+  /// `CF_CORE_WRITER_QUEUE`, whose drain takes every row under the target prefix.
+  const LAST_ORDER_TARGET_KEY: &[u8] = b"core_writer_last_order_target";
   ```
+  Order-kind target = max(`block_queued + K`, last order-kind target), then the 200 cap on top (see the test
+  above). Deterministic: the row is written at execution into hashed state (`CF_FEE_CONFIG`,
+  running hash id 14, running_hash.rs:49), the same on every node, and only by EVM blocks (serial barriers), like
+  the queue rows. Cost: one extra point read and one put per order-kind CoreWriter action (not per fill, not per
+  native block). A lowered K takes full effect once the old last target has passed (at most the old K blocks; the
+  rollback lever `core_writer_order_delay` 1 included). Tests that dump `CF_FEE_CONFIG` or pin a
+  CoreWriter block's hashed write set add the row.
   `next_sequence` scans at most 200 rows now (today a 30M block could put ~1,500 rows under one target and every
   enqueue rescans them). Docs to fix: `CoreWriterOrigin::target_block` (torus-evm executor.rs:144, "this block + 1"),
   `NativeExecutor::core_writer_due` (12219-12226) and `drain_core_writer` (12238).
-- **Verify:** `$L cargo nextest run $P $F -E 'test(order_actions_wait_k_blocks_others_one) or test(full_target_block_sends_later_rows) or test(corewriter_order_drains_k_blocks_later) or test(corewriter_evm_row_drains) or test(queue_) or test(core_writer_)'`
+- **Verify:** `$L cargo nextest run $P $F -E 'test(order_actions_wait_k_blocks_others_one) or test(full_target_block_sends_later_rows) or test(lowering_k_never_lets_a_cancel_overtake) or test(corewriter_order_drains_k_blocks_later) or test(corewriter_evm_row_drains) or test(queue_) or test(core_writer_)'`
 - **Depends on:** B1, B5
 
 ### B16: bbo rows per dirty market in both save paths
@@ -1994,10 +2114,17 @@ poller.py, analyze.py, drained.sh, gov.sh; `govtool/`); `/tmp/item7-devnet-check
 `tools/matched-bench/campaign/make-driver.py`: arm A = main at the step 2 merge base, arm B = the step 2 head; one
 genesis shape (300-market weighted genesis; arm B with the new keys absent, so M = 0); EVM load off (native only);
 harness defaults (`TORUS_BOOK_ROWS=3`, so the deferred save path that writes the bbo rows; `BLOCK_CAP=200`); warm-up
-cell, n = 4 ABBA rounds of 120 s cells; one 10-market pair as a secondary. Report matched/s (primary), native
+cell, n = 4 ABBA rounds of 120 s cells; one 10-market pair as a secondary. Plus a Classic pair (Codex plan check
+s125): mode 3 turns checkpoints off (`resolve_checkpoint_interval`, exec_pipeline.rs:134-160, run-cell.sh:412
+`TORUS_BOOK_ROWS=3`), while shipped validators run Classic with 15 s checkpoints, where the bbo puts go through
+`save_order_books`. Both arms `EXTRA_ENV='TORUS_BOOK_ROWS='` (Classic, the validator default
+`VALIDATOR_CHECKPOINT_INTERVAL` 15 s, exec_pipeline.rs:89), 300 markets, n = 4 ABBA, same pass rule; the shape
+`tools/matched-bench/campaign-template.sh` already runs (`KNOB=TORUS_CHECKPOINT_INTERVAL_MS=15000` at :38,
+`TORUS_BOOK_ROWS=` in `KNOBS` at :65, the `envok` Classic check at :317). Report matched/s (primary), native
 blocks/s, `torus_exec_save_books_seconds` per native block (the bbo writes land there), exec `block_ms`, block time
-p50/p99, CPU-s/1M. Pass: the paired B/A matched/s 95% CI includes 1.0 or lies above it, and save_books rises by at
-most 0.3 ms per native block. A failure blocks the merge; the follow-up is in B16 (measure the `saved_bbo` hit rate).
+p50/p99, CPU-s/1M, per book shape. Pass, in both shapes: the paired B/A matched/s 95% CI includes 1.0 or lies above
+it, and save_books rises by at most 0.3 ms per native block. A failure blocks the merge; the follow-up is in B16
+(measure the `saved_bbo` hit rate).
 Doc target: `docs/perf/item7-step2-native-ab.md`.
 
 ## Rollback
@@ -2031,6 +2158,9 @@ Phase 5's step 0 re-profile will then include the bbo writes.
 
 Owner s125: 1 = 16,440; 2-9 = the plan's answer as written; M stays 0 at genesis (decision 1).
 
+Codex plan check (s125): 8 findings folded into B9, B10, B12, B13, B15 and Verification; owner chose (a) for B13 (no
+ecrecover on commit).
+
 1. **bbo gas.** Decision 3 says ~16,940 (the row charged like a scanned row); our point readers (`getPrice`,
    `getPosition`) pay their point read inside the 16,400 base, which would give 16,440. Plan was 16,940
    (`meter.charge_rows(1)` in B17). **Owner s125: 16,440** (the line is deleted from B17).
@@ -2061,6 +2191,8 @@ found contradicts the design.
 
 ## Effort (one builder)
 
-C1 4-6 h, C2 4-6 h, C3 6-8 h, C4 4-6 h, C5 8-12 h (the pool split is the largest task), C6 8-10 h, C7 4-6 h (mostly
-pinning K = 1 in existing tests), C8 5-7 h, C9 3-4 h, C10 3-4 h plus the devnet (~3 h) and the A/B (bench agent, ~5 h
-wall). About 50-70 builder hours; ~5-6 days wall with C7 and C8 built in parallel.
+C1 4-6 h, C2 4-6 h, C3 6-8 h, C4 5-7 h (with the fee clamp), C5 9-13 h (the pool split is the largest task; the
+planned drain fee), C6 10-13 h (with `drained` and the executed-height release), C7 5-7 h (mostly pinning K = 1 in
+existing tests; the last-target row), C8 5-7 h, C9 3-4 h, C10 3-4 h plus the devnet (~3 h) and the A/B (bench agent,
+~9 h wall: two book shapes). About 55-75 builder hours; ~5-6 days wall with C7 and C8 built in parallel. (Codex plan
+check s125 added ~6 h.)
