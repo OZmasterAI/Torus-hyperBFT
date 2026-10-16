@@ -162,6 +162,15 @@ That is also why HL can run per-block EIP-1559 on real gas used: the EVM block i
 - **Onchain mempool (noted for step 3):** EVM txs as L1 actions into a pool in state, EVM blocks built by execution.
   Would give exact per-block fees, no lost txs on failed proposals, no leader routing, and smaller proposals; but it
   redesigns step 1's lanes, writes every EVM tx to state twice, and adds inclusion latency.
+- **Parked until item 6 Phase 5 (owner s126): the onchain mempool together with HL-style per-block fees (F4).**
+  Together, the fee costs no block speed or matched/s: execution builds the EVM block and prices it, consensus
+  never waits on the fee, and an underpriced tx stays pooled instead of being dropped. The only throughput cost is
+  the pool's state writes on the exec thread (insert at inclusion, remove at execution). Consensus is exec-bound, so
+  that cost lowers the block rate in proportion to EVM tx volume (not measured). Phase 5 makes those writes cheap,
+  so revisit both together there, and size the cost with an archy bench. Signatures must be verified and cached
+  before consensus, not ecrecovered at pool entry. Without an onchain mempool, per-block fees lose either way: F2
+  can be griefed, F4 drops txs at our exec lag, and having the proposer know the real fee stalls consensus at every
+  EVM height. Step 2 keeps F3 and the node pools.
 
 HL facts checked s123 (official docs): fast blocks 1 s / 3M gas, slow 1 min / 30M; `evmUserModify{usingBigBlocks}`
 at the user level; two independent onchain mempools; next 8 nonces per address; mempool txs pruned after 1 day;
