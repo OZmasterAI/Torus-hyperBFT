@@ -5,7 +5,7 @@ use revm::context::TxEnv;
 use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 use torus_core::precompiles::CoreWriterQueue;
-use torus_evm::{calc_next_block_base_fee, BlockEnvCfg, EvmExecutor, TORUS_CHAIN_ID};
+use torus_evm::{calc_next_block_base_fee, BigLane, BlockEnvCfg, EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
 
 /// Keccak256 of empty bytes.
@@ -345,6 +345,100 @@ fn block_execution_multiple_txs() {
 
     // Bundle should contain state changes.
     assert!(!result.bundle.state.is_empty());
+}
+
+/// Item 7 step 2: an EIP-1559 transfer at max fee `max_fee`, tip 1 wei.
+fn transfer_1559(from: Address, to: Address, nonce: u64, max_fee: u128) -> TxEnv {
+    TxEnv {
+        tx_type: 2,
+        gas_priority_fee: Some(1),
+        ..transfer_tx(from, to, U256::from(1u64), nonce, max_fee)
+    }
+}
+
+/// Item 7 step 2: a big-lane sender's tx runs at the big base fee, the other at the block's;
+/// the result splits the gas and sums the fee revenue per lane. RED before: one base fee.
+#[test]
+fn big_lane_sender_pays_the_big_base_fee() {
+    let (_dir, db) = open_test_db();
+    let balance = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(balance)).unwrap();
+    db.put_account(&BOB, &test_account(balance)).unwrap();
+    // A and B funded; transfers at max fee 5 gwei, tip 1 wei; block base fee 1 gwei.
+    let cfg = BlockEnvCfg {
+        base_fee: 1_000_000_000,
+        ..default_block_cfg()
+    };
+    let big = BigLane {
+        base_fee: 3_000_000_000,
+        senders: [BOB].into_iter().collect(),
+    };
+    let txs = vec![
+        transfer_1559(ALICE, CAROL, 0, 5_000_000_000),
+        transfer_1559(BOB, CAROL, 0, 5_000_000_000),
+    ];
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block_lanes(&db, &cfg, txs, false, &big)
+        .unwrap();
+    assert_eq!(r.receipts[0].effective_gas_price, 1_000_000_001);
+    assert_eq!(r.receipts[1].effective_gas_price, 3_000_000_001);
+    assert_eq!(r.gas_used, 42_000);
+    assert_eq!(r.big_gas_used, 21_000);
+    assert_eq!(
+        r.fee_revenue,
+        21_000 * 1_000_000_000 + 21_000 * 3_000_000_000
+    );
+    // B paid the big fee: 21k x (3 gwei + 1 wei) + the 1 wei value.
+    let paid = |a: &Address| balance - r.bundle.state[a].info.as_ref().unwrap().balance;
+    assert_eq!(paid(&BOB), U256::from(21_000u64 * 3_000_000_001 + 1));
+    assert_eq!(paid(&ALICE), U256::from(21_000u64 * 1_000_000_001 + 1));
+    // One lane (the default): both at the block's fee, no big gas.
+    let one = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block(
+            &db,
+            &cfg,
+            vec![
+                transfer_1559(ALICE, CAROL, 0, 5_000_000_000),
+                transfer_1559(BOB, CAROL, 0, 5_000_000_000),
+            ],
+            false,
+        )
+        .unwrap();
+    assert_eq!(one.receipts[1].effective_gas_price, 1_000_000_001);
+    assert_eq!(
+        (one.big_gas_used, one.fee_revenue),
+        (0, 42_000 * 1_000_000_000)
+    );
+}
+
+/// Item 7 step 2: a big-lane tx whose max fee is under the big base fee is invalid: with
+/// `skip_invalid` it gets no receipt and the small-lane tx still runs.
+#[test]
+fn big_lane_tx_below_the_big_base_fee_is_skipped() {
+    let (_dir, db) = open_test_db();
+    let balance = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(balance)).unwrap();
+    db.put_account(&BOB, &test_account(balance)).unwrap();
+    let cfg = BlockEnvCfg {
+        base_fee: 1_000_000_000,
+        ..default_block_cfg()
+    };
+    let big = BigLane {
+        base_fee: 3_000_000_000,
+        senders: [BOB].into_iter().collect(),
+    };
+    let txs = vec![
+        transfer_1559(BOB, CAROL, 0, 2_000_000_000),
+        transfer_1559(ALICE, CAROL, 0, 2_000_000_000),
+    ];
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block_lanes(&db, &cfg, txs, true, &big)
+        .unwrap();
+    assert_eq!(r.included_indices, vec![1]);
+    assert_eq!(r.receipts.len(), 1);
+    assert_eq!(r.receipts[0].effective_gas_price, 1_000_000_001);
+    assert_eq!((r.gas_used, r.big_gas_used), (21_000, 0));
+    assert_eq!(r.fee_revenue, 21_000 * 1_000_000_000);
 }
 
 // ---------------------------------------------------------------------------

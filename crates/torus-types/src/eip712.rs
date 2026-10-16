@@ -299,6 +299,9 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         NativeAction::CancelByCloid { market_id, cloid } => {
             hash_cancel_by_cloid(*market_id, *cloid, nonce)
         }
+        NativeAction::EvmUserModify { using_big_blocks } => {
+            hash_evm_user_modify(*using_big_blocks, nonce)
+        }
     }
 }
 
@@ -529,6 +532,18 @@ fn hash_set_oracle_signer(signer: &Address, proof: Option<&crate::OracleSignerPr
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(signer));
     buf.extend_from_slice(&encode_bytes32(&proof_hash));
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+// ---------- EVM ----------
+
+/// Item 7 step 2: `EvmUserModify(bool usingBigBlocks,uint64 nonce)`.
+fn hash_evm_user_modify(using_big_blocks: bool, nonce: u64) -> B256 {
+    let th = keccak256("EvmUserModify(bool usingBigBlocks,uint64 nonce)");
+    let mut buf = Vec::with_capacity(3 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_bool(using_big_blocks));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }
@@ -1430,7 +1445,7 @@ mod tests {
             NativeAction::CancelAllOrders { market_id: None },
             NativeAction::ModifyOrder { order_id: 1, new_price: Some(FixedPoint::ONE), new_qty: None },
         ];
-        let families: [(&str, Vec<NativeAction>); 6] = [
+        let families: [(&str, Vec<NativeAction>); 7] = [
             (
                 "transfer",
                 vec![
@@ -1510,6 +1525,17 @@ mod tests {
                         scope: SessionScope::Trading,
                     },
                     NativeAction::RevokeSession { session_pubkey: [3; 32] },
+                ],
+            ),
+            (
+                "evm",
+                vec![
+                    NativeAction::EvmUserModify {
+                        using_big_blocks: true,
+                    },
+                    NativeAction::EvmUserModify {
+                        using_big_blocks: false,
+                    },
                 ],
             ),
         ];
@@ -1592,6 +1618,35 @@ mod tests {
             TEST_NONCE,
             &key,
         );
+        assert_eq!(signed.recover_sender().unwrap(), signer_address(&key));
+    }
+
+    /// Item 7 step 2: `EvmUserModify(bool usingBigBlocks,uint64 nonce)` binds the flag and the
+    /// nonce.
+    #[test]
+    fn evm_user_modify_struct_hash_binds_the_flag_and_nonce() {
+        let on = NativeAction::EvmUserModify {
+            using_big_blocks: true,
+        };
+        let off = NativeAction::EvmUserModify {
+            using_big_blocks: false,
+        };
+        let th = keccak256("EvmUserModify(bool usingBigBlocks,uint64 nonce)");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&th.0);
+        buf.extend_from_slice(&encode_bool(true));
+        buf.extend_from_slice(&encode_u64(TEST_NONCE));
+        assert_eq!(eip712_struct_hash(&on, TEST_NONCE), keccak256(&buf));
+        assert_ne!(
+            eip712_struct_hash(&on, TEST_NONCE),
+            eip712_struct_hash(&off, TEST_NONCE)
+        );
+        assert_ne!(
+            eip712_struct_hash(&on, TEST_NONCE),
+            eip712_struct_hash(&on, TEST_NONCE + 1)
+        );
+        let key = test_key();
+        let signed = sign_native_action(on, TEST_NONCE, &key);
         assert_eq!(signed.recover_sender().unwrap(), signer_address(&key));
     }
 
@@ -1825,6 +1880,9 @@ mod tests {
             }),
             NativeAction::DelistMarket { market_id: 99 },
             NativeAction::ClaimUnbonded,
+            NativeAction::EvmUserModify {
+                using_big_blocks: true,
+            },
         ];
 
         for (i, action) in actions.into_iter().enumerate() {

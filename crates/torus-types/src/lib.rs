@@ -985,6 +985,14 @@ pub enum NativeAction {
         #[serde(with = "cloid_serde")]
         cloid: Cloid,
     },
+
+    // === EVM (appended: item 7 step 2) ===
+    /// HL `evmUserModify`: the sender's EVM lane. `true` = big blocks: while they are on (header
+    /// M > 0) its EVM txs go to the big pool and pay the big base fee. EIP-712 only (not a trading
+    /// action, so no session key). Lanes are proposer routing and fees, never a vote rule.
+    EvmUserModify {
+        using_big_blocks: bool,
+    },
 }
 
 impl NativeAction {
@@ -1290,6 +1298,10 @@ impl NativeAction {
                         buf.extend_from_slice(&p.signature.s);
                     }
                 }
+            }
+            NativeAction::EvmUserModify { using_big_blocks } => {
+                buf.push(30);
+                buf.push(u8::from(*using_big_blocks));
             }
         }
     }
@@ -1804,6 +1816,38 @@ mod tests {
         assert_eq!(b[30], 27);
         let back: NativeAction = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back.canonical_bytes(), b);
+    }
+
+    /// Item 7 step 2: `EvmUserModify` is canonical tag 30 + the flag byte, bincode variant 30
+    /// (appended last), EIP-712 only (no session scope allows it) and survives serde JSON.
+    #[test]
+    fn evm_user_modify_is_canonical_tag_30_and_eip712_only() {
+        let on = NativeAction::EvmUserModify {
+            using_big_blocks: true,
+        };
+        let off = NativeAction::EvmUserModify {
+            using_big_blocks: false,
+        };
+        assert_eq!(on.canonical_bytes(), vec![30, 1]);
+        assert_eq!(off.canonical_bytes(), vec![30, 0]);
+        for a in [&on, &off] {
+            assert!(!a.is_trading());
+            assert!(crate::eip712::requires_eip712(a));
+            for scope in [
+                SessionScope::Trading,
+                SessionScope::TransfersOnly,
+                SessionScope::Full,
+            ] {
+                assert!(!scope.allows(a), "{scope:?} must not allow EvmUserModify");
+            }
+            let bytes = bincode::serialize(a).unwrap();
+            assert_eq!(&bytes[..4], &30u32.to_le_bytes());
+            let back: NativeAction = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back.canonical_bytes(), a.canonical_bytes());
+            let json = serde_json::to_string(a).unwrap();
+            let back: NativeAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.canonical_bytes(), a.canonical_bytes());
+        }
     }
 
     /// S470 knob default: a ChainConfig serialized before the field existed

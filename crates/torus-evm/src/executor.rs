@@ -95,6 +95,14 @@ impl Default for BlockEnvCfg {
     }
 }
 
+/// Item 7 step 2: a block's big lane: its base fee and the senders that pay it (their
+/// `EvmUserModify` rows, read by the caller while big blocks are on). Default = one lane.
+#[derive(Clone, Debug, Default)]
+pub struct BigLane {
+    pub base_fee: u64,
+    pub senders: std::collections::HashSet<Address>,
+}
+
 /// Result of executing a single EVM transaction.
 #[derive(Clone, Debug)]
 pub struct TxExecResult {
@@ -119,6 +127,11 @@ pub struct BlockExecResult {
     pub bundle: BundleState,
     /// Total gas consumed by all transactions in the block.
     pub gas_used: u64,
+    /// Item 7 step 2: gas used by big-lane txs (the rest is the small lane's).
+    pub big_gas_used: u64,
+    /// Item 7 step 2: the base-fee part of the fees, each tx at its lane's base fee:
+    /// `sum(gas_used * min(effective_gas_price, lane base fee))`.
+    pub fee_revenue: u128,
     /// Aggregate logs bloom for the block.
     pub logs_bloom: Bloom,
     /// Indices of input txs that were included (only differs from 0..N when
@@ -279,6 +292,25 @@ impl EvmExecutor {
         transactions: Vec<TxEnv>,
         skip_invalid: bool,
     ) -> Result<BlockExecResult, EvmError> {
+        self.execute_block_lanes(
+            state_db,
+            block_cfg,
+            transactions,
+            skip_invalid,
+            &BigLane::default(),
+        )
+    }
+
+    /// [`Self::execute_block`] with a big lane (item 7 step 2): a tx from `big.senders` runs at
+    /// `big.base_fee`, every other tx at `block_cfg.base_fee`.
+    pub fn execute_block_lanes(
+        &self,
+        state_db: &StateDb,
+        block_cfg: &BlockEnvCfg,
+        transactions: Vec<TxEnv>,
+        skip_invalid: bool,
+        big: &BigLane,
+    ) -> Result<BlockExecResult, EvmError> {
         let state = State::builder()
             .with_database_ref(state_db)
             .with_bundle_update()
@@ -317,10 +349,22 @@ impl EvmExecutor {
         let mut included_indices = Vec::with_capacity(transactions.len());
         let mut receipt_idx: usize = 0;
         let mut core_writer_origins = Vec::new();
+        let mut big_gas_used: u64 = 0;
+        let mut fee_revenue: u128 = 0;
 
         for (idx, tx) in transactions.into_iter().enumerate() {
             let max_fee = tx.gas_price;
             let priority_fee = tx.gas_priority_fee;
+            // Item 7 step 2: the tx runs at its lane's base fee (revm's per-tx block env).
+            let in_big_lane = big.senders.contains(&tx.caller);
+            let lane_base_fee = if in_big_lane {
+                big.base_fee
+            } else {
+                block_cfg.base_fee
+            };
+            if !big.senders.is_empty() {
+                evm.ctx.modify_block(|b| b.basefee = lane_base_fee);
+            }
 
             // T4.4: inspector path so writer-precompile side effects are checkpointed
             // per call frame (caught inner-frame reverts roll back their native writes).
@@ -336,6 +380,9 @@ impl EvmExecutor {
             };
             included_indices.push(idx);
             let gas_used = result.gas().used();
+            if in_big_lane {
+                big_gas_used += gas_used;
+            }
 
             cumulative_gas =
                 cumulative_gas
@@ -384,7 +431,9 @@ impl EvmExecutor {
             };
 
             let effective_gas_price =
-                calc_effective_gas_price(block_cfg.base_fee, max_fee, priority_fee);
+                calc_effective_gas_price(lane_base_fee, max_fee, priority_fee);
+            fee_revenue +=
+                u128::from(gas_used) * u128::from(effective_gas_price.min(lane_base_fee));
 
             receipts.push(Receipt {
                 tx_hash: B256::ZERO,
@@ -413,6 +462,8 @@ impl EvmExecutor {
             receipts,
             bundle,
             gas_used: cumulative_gas,
+            big_gas_used,
+            fee_revenue,
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,
@@ -464,6 +515,7 @@ impl EvmExecutor {
         let mut included_indices = Vec::with_capacity(transactions.len());
         let mut receipt_idx: usize = 0;
         let mut core_writer_origins = Vec::new();
+        let mut fee_revenue: u128 = 0;
 
         for (idx, tx) in transactions.into_iter().enumerate() {
             let max_fee = tx.gas_price;
@@ -531,6 +583,8 @@ impl EvmExecutor {
 
             let effective_gas_price =
                 calc_effective_gas_price(block_cfg.base_fee, max_fee, priority_fee);
+            fee_revenue +=
+                u128::from(gas_used) * u128::from(effective_gas_price.min(block_cfg.base_fee));
 
             receipts.push(Receipt {
                 tx_hash: B256::ZERO,
@@ -558,6 +612,8 @@ impl EvmExecutor {
             receipts,
             bundle,
             gas_used: cumulative_gas,
+            big_gas_used: 0,
+            fee_revenue,
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,

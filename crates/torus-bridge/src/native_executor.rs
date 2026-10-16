@@ -7005,6 +7005,9 @@ impl NativeExecutor {
             NativeAction::SetOracleSigner { signer, proof } => {
                 Self::exec_set_oracle_signer(ctx, sender, *signer, proof.as_ref())
             }
+            NativeAction::EvmUserModify { using_big_blocks } => {
+                Self::exec_evm_user_modify(ctx, sender, *using_big_blocks)
+            }
 
             // ---- Session Keys ----
             NativeAction::CreateSession {
@@ -11930,6 +11933,36 @@ impl NativeExecutor {
             }
         }
         Err(NotReporter)
+    }
+
+    /// Item 7 step 2: `EvmUserModify` sets (`true`) or clears the sender's lane row. An unchanged
+    /// lane writes nothing. A read or write fault fail-stops (R02 branch 6b, as SetOracleSigner).
+    fn exec_evm_user_modify<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        using_big_blocks: bool,
+    ) -> NativeActionResult {
+        use torus_state::cf::{evm_lane_key, CF_NATIVE_ORACLE};
+        let key = evm_lane_key(sender);
+        let current = match ctx.state.get_cf_raw(CF_NATIVE_ORACLE, &key) {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                let m = Self::latch_state_fault(ctx, "evm user modify read", e);
+                return NativeActionResult::err("evm_user_modify", m);
+            }
+        };
+        if current != using_big_blocks {
+            let res = if using_big_blocks {
+                ctx.state.put_cf_raw(CF_NATIVE_ORACLE, &key, &[1])
+            } else {
+                ctx.state.delete_cf_raw(CF_NATIVE_ORACLE, &key)
+            };
+            if let Err(e) = res {
+                let m = Self::latch_state_fault(ctx, "evm user modify write", e);
+                return NativeActionResult::err("evm_user_modify", m);
+            }
+        }
+        NativeActionResult::ok("evm_user_modify", 1000)
     }
 
     /// `SetOracleSigner` (s517): set, rotate or (with `Address::ZERO`) clear

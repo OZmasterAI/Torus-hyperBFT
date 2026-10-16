@@ -288,7 +288,7 @@ type PeekFn = fn(&str) -> Option<u32>;
 
 /// `NativeAction` variant count: bincode tags are `0..NATIVE_ACTION_TAGS`
 /// (declaration order; variants are only ever appended).
-const NATIVE_ACTION_TAGS: u32 = 30;
+const NATIVE_ACTION_TAGS: u32 = 31;
 /// bincode tags of the actions that pass the pre-verify shed
 /// (`torus_mempool::is_cancel` / `is_oracle_submission`).
 const TAG_CANCEL_ORDER: u32 = 2;
@@ -3305,6 +3305,7 @@ mod shed_peek_tests {
             NativeAction::ClaimUnbonded => 27,
             NativeAction::SetOracleSigner { .. } => 28,
             NativeAction::CancelByCloid { .. } => 29,
+            NativeAction::EvmUserModify { .. } => 30,
         }
     }
 
@@ -3349,6 +3350,9 @@ mod shed_peek_tests {
             NativeAction::CancelByCloid {
                 market_id: 3,
                 cloid: u128::MAX,
+            },
+            NativeAction::EvmUserModify {
+                using_big_blocks: true,
             },
             NativeAction::ModifyOrder {
                 order_id: 7,
