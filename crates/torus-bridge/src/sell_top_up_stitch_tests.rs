@@ -1111,8 +1111,8 @@ fn batched_margin_cut_counters_equal_record_margin_cuts() {
     );
 }
 
-/// s58 bundle: on by default; `0` or `false` turns it off; an invalid value
-/// is the default (on).
+/// s58 bundle: on by default (unset or empty); `0` or `false` (any case)
+/// turns it off; an invalid value is the default (on).
 #[test]
 fn fast_sell_top_ups_toggle_parse() {
     use crate::native_executor::settle_defer_results_flag_tests::{INVALID, OFF, ON};

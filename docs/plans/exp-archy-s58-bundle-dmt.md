@@ -25,6 +25,7 @@ devnet / bench node env. Not merged: B (parallel-classic-book-save), G (exec-poo
 | `87bbdd22` | `TORUS_HEADER_RESEND_MS=250` in `devnet/wsl/env.sh` and `devnet/docker-compose.yml` |
 | `3c4bb127` | rustfmt of the drop counter test's two asserts (formatting only) |
 | `26f45c81` | D, M, T on by default; `=0` turns each off ("Default on" below) |
+| (this commit) | D / M / T parse ignores case; empty = unset (on, no warning) ("Default on" below) |
 
 Conflicts: none. All three merges and the cherry-pick were clean. D, M and T were written on main `a44000e0`; main
 has since gained the parallel cancel-all pass (`7f9bb3a9`: `run_contained` made generic, the cancel-all pass in
@@ -42,13 +43,15 @@ identical, line for line (2631 lines), to the D+M+T stack on `exp/archy-s58-perf
 
 All node-local, read on the executing thread (a thread pin, else the env read once per process and logged once).
 D, M and T share one parse (`on_by_default_value` / `on_by_default_flag`, `crates/torus-bridge/src/native_executor.rs`):
-values are trimmed and case-sensitive (`TRUE`, `False`, `on`, `off`, `""` are invalid).
+values are trimmed and matched in any case (`TRUE`, `False` are valid); an empty value (`VAR=`, whitespace only) is
+the same as unset: on, no warning (drivers blank a knob with `VAR=` to mean "not set"; unlike E, where `""` is off).
+`on`, `off`, `yes`, `2`, ... are invalid.
 
 | name | values | default | took-effect log line (once per node) |
 |---|---|---|---|
-| `TORUS_SETTLE_DEFER_RESULTS` (D) | unset, `1` or `true` on; `0` or `false` off; anything else warns once and stays on | **on** (unset) | `TORUS_SETTLE_DEFER_RESULTS: settle pass B deferred results write on=true` (`on=false` at `0`) |
-| `TORUS_PARALLEL_MATCH_SETUP` (M) | unset, `1` or `true` on; `0` or `false` off; anything else warns once and stays on | **on** (unset) | `TORUS_PARALLEL_MATCH_SETUP: per-market match setup in the pool match jobs enabled=true` (`enabled=false` at `0`) |
-| `TORUS_FAST_SELL_TOP_UPS` (T) | unset, `1` or `true` on; `0` or `false` off; anything else warns once and stays on | **on** (unset) | `TORUS_FAST_SELL_TOP_UPS (s58): B-blind top-ups from the stitch list enabled=true` (`enabled=false` at `0`) |
+| `TORUS_SETTLE_DEFER_RESULTS` (D) | unset, empty, `1` or `true` (any case) on; `0` or `false` (any case) off; anything else warns once and stays on | **on** (unset) | `TORUS_SETTLE_DEFER_RESULTS: settle pass B deferred results write on=true` (`on=false` at `0`) |
+| `TORUS_PARALLEL_MATCH_SETUP` (M) | unset, empty, `1` or `true` (any case) on; `0` or `false` (any case) off; anything else warns once and stays on | **on** (unset) | `TORUS_PARALLEL_MATCH_SETUP: per-market match setup in the pool match jobs enabled=true` (`enabled=false` at `0`) |
+| `TORUS_FAST_SELL_TOP_UPS` (T) | unset, empty, `1` or `true` (any case) on; `0` or `false` (any case) off; anything else warns once and stays on | **on** (unset) | `TORUS_FAST_SELL_TOP_UPS (s58): B-blind top-ups from the stitch list enabled=true` (`enabled=false` at `0`) |
 | `TORUS_EPOCH_FAST_PATH` (E, main's) | `1` or `true` (any case) on; `0`, `false` or unset off; anything else warns and stays off | off | `epoch fast path ON (TORUS_EPOCH_FAST_PATH=1)` at startup (needs the exec pipeline) |
 | `TORUS_HEADER_RESEND_MS` | ms; `0` = off; unparsable = 3000 | code 3000 (unchanged); devnet / bench env 250 | none |
 
@@ -65,15 +68,20 @@ Flag off (`=0`) = main:
 
 D, M and T were benched at +8-9% matched/s at neutral CPU (sections 76-78, check campaign ozarchy-s58dmt), so they
 are on by default; benches that need the old baseline set each to `0`.
-* Parse (`crates/torus-bridge/src/native_executor.rs`): `on_by_default_value` (`None` = invalid) and
-  `on_by_default_flag` (an invalid value: `tracing::warn!` "`<NAME>`: not 1, true, 0 or false; using the default
-  (on)", then on). The env is read once per process (OnceLock), so the warning is logged once. The per-flag parses
+* Parse (`crates/torus-bridge/src/native_executor.rs`): `on_by_default_value` (trim, then ASCII-lowercase as E's
+  `parse_epoch_fast_path` does; unset, `""`, `1`, `true` = on; `0`, `false` = off; `None` = invalid) and
+  `on_by_default_flag` (an invalid value: `tracing::warn!` "`<NAME>`: not empty, 1, true, 0 or false (any case);
+  using the default (on)", then on). Case and empty handling owner-approved after `26f45c81` (that commit was
+  case-sensitive and warned on `""`). The env is read once per process (OnceLock), so the warning is logged once. The per-flag parses
   `parse_settle_defer_results`, `parse_parallel_match_setup`, `parse_fast_sell_top_ups` take `Option<&str>` and are
   `pub`, `#[doc(hidden)]` (the tests below use them). Pins (`with_*`) and the info lines are unchanged.
 * E (`TORUS_EPOCH_FAST_PATH`) is unchanged: default off.
 * Tests: `on_by_default_value_classifies`, `parse_on_by_default_zero_or_false_turns_off` (D and M, in
   `native_executor.rs`), `fast_sell_top_ups_toggle_parse` (T, `sell_top_up_stitch_tests.rs`): unset, `1`, `true`
-  (trimmed) on; `0`, `false` off; 14 invalid values (`""`, `2`, `01`, `on`, `off`, `TRUE`, `False`, ...) on. The four
+  (trimmed, any case: `TRUE`, `True`, `tRuE`, `" TRUE "`) and empty / whitespace only (`""`, `" "`, `"   "`, `"\t"`,
+  ...; classified valid, so no warning) on; `0`, `false` (`FALSE`, `False`, `fAlSe`, `" FALSE "`, `" false "`) off;
+  15 invalid values (`2`, `01`, `on`, `off`, `yes`, `f`, `t`, `truee`, `1 0`, ...) on. The case / empty extension
+  failed first: all 4 parse tests failed on the old parse (`"FALSE"` read as on; `""` classified invalid). The four
   bundle state-equality tests now pin each flag to its parse of the unset env (on) vs its parse of `0` (off), with a
   guard that those are `[true; 3]` and `[false; 3]`. All 8 failed against the old parse (kept behind the new
   signature) before the change: the parse tests on their assertions, the 4 bundle tests on the guard.
@@ -168,7 +176,7 @@ Shape as campaign A (hsdb-300m: Classic, 15 s checkpoints, oracle on; NOT the ha
   re-send itself, add an arm with `TORUS_HEADER_RESEND_MS=3000`, or run with `HEADER_RESEND_UNSET=1` and list it in
   `absent_env`.
 * Took-effect checks: the D / M / T log lines in the flags table, 1 per node in every arm (`on=true` /
-  `enabled=true` in DMT and DMTE, `false` in base); no `not 1, true, 0 or false` warning; for E
+  `enabled=true` in DMT and DMTE, `false` in base); no `not empty, 1, true, 0 or false` warning; for E
   also `executing finalized block height=..00 ... pipelined=true` (bench-queue Q1).
 * Watch: `torus_consensus_rate_limited_dropped_total` per node (new counter), consensus timeouts by kind, AGREE.
 
@@ -186,9 +194,7 @@ Per-flag plans: `docs/plans/exp-archy-s58-settle-passb-deferred-results-scatter.
 
 ## Open questions
 
-* Default on: the D / M / T parse is case-sensitive and treats an empty value as invalid (`TRUE`, `False`, `""`:
-  warned, then on). E's parse (`exec_pipeline.rs`) lowercases and treats `""` as off. Say if D / M / T should match
-  E.
+* Resolved (owner): D / M / T ignore case like E; an empty value is unset (on, no warning), not E's off.
 * Default on: `tools/matched-bench` has no D / M / T specific defaults (`run-cell.sh`, `make-driver.py`,
   `README.md`: `absent_env` is a generic "unset" list). Any campaign spec or doc that lists D / M / T in `absent_env`
   for a flags-off baseline now gets them on; for this binary use `=0`. `docs/perf/bench-queue.md` campaign A
@@ -203,6 +209,18 @@ Per-flag plans: `docs/plans/exp-archy-s58-settle-passb-deferred-results-scatter.
 ## Build and test results
 
 All on this branch, target `/home/oz/projects/.cargo-target-s58dmt`, ozarchy, 2026-10-16.
+
+Case-insensitive parse, empty = unset (the commit after `23df02d2`):
+
+| check | result |
+|---|---|
+| parse tests before the change (new values in `ON` / `OFF`, `""` / whitespace classified valid) | 4 / 4 failed (`"FALSE"` read as on; `""` classified invalid) |
+| after: the 4 parse tests + the 4 bundle state-equality tests | 8 / 8 passed |
+| `cargo nextest run --workspace`, D, M, T unset (= on) | 3923 / 3923 passed, 38 skipped, 0 flaky |
+| `cargo test --doc` | 1 passed, 0 failed |
+| `cargo clippy --workspace --all-targets --locked` | warning set identical to `23df02d2`'s sources (A/B in the same target dir, normalized diff: only cargo's "N duplicates" attribution in unrelated test targets differs); none in the touched lines |
+| `rustfmt --check` (stdin, edition 2021) on the 2 touched .rs files | `native_executor.rs` 169 hunks (= `23df02d2`), `sell_top_up_stitch_tests.rs` 0; none in the changed lines |
+| release `torus-node` (recipe below, incremental on the `26f45c81` release dir) | **md5 `325b37f961526364ff614f6e3b76fcd7`**, 588,020,960 bytes, rustc 1.98.1 |
 
 Default on (`26f45c81`, D, M, T on when unset):
 
@@ -236,8 +254,9 @@ Seen on the M branch before (memory, 2026-10-15). Not touched here: candidate fi
 Release build (same recipe as `~/bench-results-matched/ozarchy-s58rl-stage/build/build.sh`: `cargo build --release
 --locked -p torus-node`, default features (jemalloc), `RUSTFLAGS="-C link-arg=-fuse-ld=mold -C
 force-frame-pointers=yes"`, `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`):
-* Default on: head `26f45c81`, **md5 `6fbbb1a81f085357703f21b508593fc8`** (the current
+* Case-insensitive parse, empty = unset: **md5 `325b37f961526364ff614f6e3b76fcd7`** (the current
   `/home/oz/projects/.cargo-target-s58dmt/release/torus-node`; table above).
+* Default on: head `26f45c81`, **md5 `6fbbb1a81f085357703f21b508593fc8`** (overwritten by the build above).
 * Before default on: head `3c4bb127` (later commits docs only), rustc 1.98.1, fresh release dir (537 crates compiled).
 * `/home/oz/projects/.cargo-target-s58dmt/release/torus-node` at `3c4bb127` (overwritten by the default-on build): **md5 `4574bcbf26a40459e0d6c993cd005889`**,
   588,015,960 bytes (s58rl's same-recipe binary: 587,521,600), linked by mold 2.42.0.

@@ -590,14 +590,19 @@ fn settle_worker_cap() -> usize {
     ))
 }
 
-/// s58 bundle (D, M, T): an on-by-default flag's value, trimmed. Unset, `1`
-/// or `true` = on; `0` or `false` = off; anything else = `None`, not a valid
-/// value ([`on_by_default_flag`] warns and uses the default, on).
+/// s58 bundle (D, M, T): an on-by-default flag's value, trimmed, any case.
+/// Unset, empty (`VAR=`, whitespace only: drivers blank a knob that way to
+/// mean "not set"), `1` or `true` = on; `0` or `false` = off; anything else
+/// = `None`, not a valid value ([`on_by_default_flag`] warns and uses the
+/// default, on).
 fn on_by_default_value(v: Option<&str>) -> Option<bool> {
-    match v.map(str::trim) {
-        None | Some("1" | "true") => Some(true),
-        Some("0" | "false") => Some(false),
-        Some(_) => None,
+    let Some(v) = v else {
+        return Some(true);
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -608,7 +613,7 @@ fn on_by_default_flag(name: &str, v: Option<&str>) -> bool {
     on_by_default_value(v).unwrap_or_else(|| {
         tracing::warn!(
             value = v.unwrap_or_default(),
-            "{name}: not 1, true, 0 or false; using the default (on)"
+            "{name}: not empty, 1, true, 0 or false (any case); using the default (on)"
         );
         true
     })
@@ -680,18 +685,29 @@ mod settle_defer_results_flag_tests {
     }
 
     /// Values the s58 bundle's on-by-default flags (D, M, T) are tested on.
-    pub(super) const ON: [&str; 6] = ["1", " 1", "1 ", "\t1\n", "true", " true "];
-    pub(super) const OFF: [&str; 6] = ["0", " 0", "0 ", "\t0\n", "false", " false "];
-    pub(super) const INVALID: [&str; 14] = [
-        "", " ", "2", "01", "1x", "-1", "00", "on", "off", "yes", "no", "TRUE", "False", "f",
+    /// `1` / `true` / `0` / `false` match in any case, trimmed; empty or
+    /// whitespace only (`VAR=`) is unset: on, valid (no warning).
+    pub(super) const ON: [&str; 16] = [
+        "1", " 1", "1 ", "\t1\n", "true", " true ", "TRUE", "True", "tRuE", " TRUE ", "", " ",
+        "   ", "\t", "\n", " \t\n ",
+    ];
+    pub(super) const OFF: [&str; 10] = [
+        "0", " 0", "0 ", "\t0\n", "false", " false ", "FALSE", "False", "fAlSe", " FALSE ",
+    ];
+    pub(super) const INVALID: [&str; 15] = [
+        "2", "01", "1x", "-1", "00", "on", "off", "yes", "no", "f", "t", "truee", "true1",
+        "false0", "1 0",
     ];
 
-    /// The shared parse: unset, `1` or `true` = on; `0` or `false` = off
-    /// (trimmed); anything else is invalid (`None`: warned, then the
-    /// default).
+    /// The shared parse: unset, empty, `1` or `true` = on; `0` or `false` =
+    /// off (trimmed, any case); anything else is invalid (`None`: warned,
+    /// then the default).
     #[test]
     fn on_by_default_value_classifies() {
         assert_eq!(on_by_default_value(None), Some(true));
+        for v in ["", " ", "   ", "\t\n"] {
+            assert_eq!(on_by_default_value(Some(v)), Some(true), "empty {v:?}");
+        }
         for v in ON {
             assert_eq!(on_by_default_value(Some(v)), Some(true), "{v:?}");
         }
@@ -703,8 +719,8 @@ mod settle_defer_results_flag_tests {
         }
     }
 
-    /// s58 bundle: on by default; `0` or `false` turns it off; an invalid
-    /// value is the default (on).
+    /// s58 bundle: on by default (unset or empty); `0` or `false` (any case)
+    /// turns it off; an invalid value is the default (on).
     #[test]
     fn parse_on_by_default_zero_or_false_turns_off() {
         assert!(parse_settle_defer_results(None));
@@ -953,8 +969,8 @@ thread_local! {
 mod parallel_match_setup_flag_tests {
     use super::*;
 
-    /// s58 bundle: on by default; `0` or `false` turns it off; an invalid
-    /// value is the default (on).
+    /// s58 bundle: on by default (unset or empty); `0` or `false` (any case)
+    /// turns it off; an invalid value is the default (on).
     #[test]
     fn parse_on_by_default_zero_or_false_turns_off() {
         use super::settle_defer_results_flag_tests::{INVALID, OFF, ON};
