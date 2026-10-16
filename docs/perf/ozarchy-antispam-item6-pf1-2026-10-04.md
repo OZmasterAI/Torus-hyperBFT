@@ -11932,6 +11932,246 @@ cap in every arm only because the bench saturates it.
   (`s58flags_to.py` on the `csv2m1hz.py` shadows), `s58b600-minutes.txt`, `s58b600-execlag.txt`,
   `s58b600-taillag.jsonl`.
 
+## 79. s58 bundle D, M, T on main (branch exp/archy-s58-bundle-dmt), its check campaign (ozarchy-s58dmt) and safety campaign (ozarchy-s58safe: mixed flags, kill-restart, 60 min soak), 300 markets, n = 1 (2026-10-16), and the owner's default-on decision
+
+**The bundle on main `5e6f331a` gives what the s58 stack gave: DMTE +9.1% matched/s vs C (247.6k vs 226.9k) at
+-0.5% CPU-s per 1M fills (inside the 0.5% w1-vs-C spread, so CPU-neutral), block p99 -10.9%, exec lag 9.8 vs 15.3 s.
+Safety (default-on binary): a 2-on / 1-off validator mix agrees (AGREE, one digest per cell), a validator
+SIGKILLed twice replays 113 / 135 blocks and agrees (`c507fa1c`), and a 60 min soak has no death, ACCEPT AGREE and 0
+panics. Two findings for main, not from the bundle: under sustained overload the block rate falls to exec pace
+(5.9 -> 3.0 blk/s by minute 5, while matched/s stays at ~240k), so 300 s cells overstate the blk/s gain; and the data
+dir grows ~0.19-0.21 GB per minute per node whether there is load or not (INFERRED cause: checkpoint data not
+reclaimed). Owner decision (s62): D, M, T on by default. Indicative only: n = 1 per cell, one host, fixed order.**
+* The soak's load stopped at minute 21-23: the bench senders ran out of account margin. Minutes 24-60 are a
+  reject-only load (0 matched/s, ~17 empty blk/s). The soak is a 21 min load soak plus a 37 min idle-chain soak.
+* First real-cell use of the generator's warm-up gate and checks hook (`feat/driver-warmgate-checks`): both
+  worked, including the failure path (79.5).
+
+Question (after 78.7): does the D, M, T port onto main keep the s58 numbers, and is it safe (validators with mixed
+flags, crash and replay, long run) to turn on by default?
+
+### 79.1 The bundle branch (s62)
+
+Branch `exp/archy-s58-bundle-dmt`, pushed, head `bfe47982` (= `origin/exp/archy-s58-bundle-dmt`), on main `5e6f331a`.
+It merges clean into today's main `999c6ad6` (`git merge-tree`, no conflicts). Plan doc
+`docs/plans/exp-archy-s58-bundle-dmt.md` (its "Not pushed" line and "Codex review not done here" bullet are stale).
+
+| commit | what |
+|---|---|
+| `9c550e1e` / `bcdef6f7` / `b787d4a4` | `--no-ff` merges of D `95e2d48e`, M `6954e735`, T `6d1100b8`; no conflicts. The D+M+T `crates/torus-bridge/src` change (2,631 lines) is identical line for line to the stack benched in 75-78 (ALL `6452fa31`'s D+M+T) |
+| `0af69a76` | drop counter `torus_consensus_rate_limited_dropped_total` (cherry-pick of `857b9770`, 77.2) |
+| `6d1dbb1e` | port of `epoch_fast_path_checkpoint_crash_replay_matches_uncrashed` (+ `ckpt_crash_replay_with`) from `bb62bab1` onto main's E (78.6) |
+| `b710f976` | state-equality tests: D+M+T and D+M+T+E vs all off (3 bridge files + 1 consensus test on 130 P2 blocks) |
+| `87bbdd22` | `TORUS_HEADER_RESEND_MS="${TORUS_HEADER_RESEND_MS:-250}"` in `devnet/wsl/env.sh` and `devnet/docker-compose.yml` (all 5 validators); `HEADER_RESEND_UNSET=1` = campaign-wide opt-out; code default stays 3 s |
+| `3c4bb127` | rustfmt of two asserts (format only); flag-off head, the s58dmt binary |
+| `45c104d8` | plan doc |
+| `26f45c81` + `23df02d2` | owner decision: D, M, T on by default, `=0` turns each off; doc |
+| `bfe47982` | parse follow-up: trimmed, any case; unset, empty, `1`, `true` = on; `0`, `false` = off; anything else warns once and stays on. E unchanged (default off). The s58safe binary |
+
+Verification (plan doc "Build and test results"; Codex outputs in the s62 scratch):
+* `cargo nextest run --workspace`: 3922 / 3922 at the flag-off head `3c4bb127` (flags unset, and again with D, M, T,
+  E = 1); 3923 / 3923 at default-on (unset = on, and all three `=0`); 3923 / 3923 at `bfe47982`. 0 flaky in those runs.
+  Earlier runs hit the known "crash at N latched" race in `checkpoint_crash_replay_with_cloids_*` (main
+  `exec_pipeline.rs:754-763`, not touched here), and passed on rerun.
+* Clippy: 345 warnings at 259 sites at `3c4bb127`, identical to main `5e6f331a`; warning set unchanged through
+  `bfe47982`; 0 on added lines.
+* Codex torus review: "No findings." three times (at `45c104d8`, `23df02d2`, `bfe47982`).
+* Release `torus-node`: `3c4bb127` md5 `4574bcbf`, `bfe47982` md5 `325b37f9`.
+
+Why default-on (owner s62): benches should measure what production runs (Q8 sizes Phase 5 on main), and the
+evidence agrees across 76-78 and 79.2. Benches that need the old baseline now set D, M, T to `0`; `absent_env` no
+longer means off for them.
+
+### 79.2 Check campaign ozarchy-s58dmt (`s58dmt-pilot.txt`, `s58dmt-timeouts.txt`, `s58dmt-execlag.txt`)
+
+Setup: campaign A shape (hsdb-300m: Classic, 15 s checkpoints, oracle on, 300 markets), genesis N = 11 md5
+`d694b81b`, rate 76,000, 300 s cells. Binary `3c4bb127` (md5 `4574bcbf`, flag-off head), one binary for both arms;
+arms differ by env on all 3 validators: C = no flag; DMTE = D, M, T, E = 1. Re-send 250 ms on both arms (from
+env.sh; `rlchk`: `TORUS_HEADER_RESEND_MS=250 x3`). Driver generated by the frozen `feat/driver-warmgate-checks`
+`e3316799`; checks `s58chk`, `rlchk`, `ckptchk`. Order: smoke s0 (DMTE, 60 s; 2 attempts, 79.5), w1 (C, gated
+warm-up, 18:54), r1-C (19:03), r1-DMTE (19:12-19:18).
+
+**Validity:** 3 cells rc 0, ACCEPT AGREE, liveness PASS, node md5 `4574bcbf` on 3 nodes, 0 panic or fail-stop lines
+and 0 error lines; the w1 warm-up gate passed (`CHECK OK ... warm-up gate`); 46 `CHECK OK` and 0 `CHECK FAIL` in the
+main campaign; no `CELL-FLAG`, "RERUN PASS: nothing queued", `cells.tsv` 3 rows, 0 bad. Took-effect lines: D, M, T
+`true` once per node in DMTE, `false` in C and w1; `epoch fast path ON` once per node in DMTE only.
+
+Windows as in 78.2 (timeouts: sum of nodes, whole cell = load = core here; exec lag = queue mean / blk/s, lower
+bound).
+
+| cell | arm | matched/s | vs C | native blk/s | fills / block | CPU-s / 1M fills | vs C | CPU-s per node | block p99 ms (mean of nodes) | timeouts | no_proposal | after_vote | leader | exec queue mean / p99 | exec lag s | RSS mean GB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | C (warm-up) | 224,517 | -1.1% | 4.533 | 48,703 | 23.421 | +0.5% | 1,707.6 | 1,119.8 | 9 | 0 | 8 | 1 | 59.9 / 66 | 13.1 | 4.33 |
+| r1-C | C | 226,934 | | 3.954 | 55,854 | 23.308 | | 1,708.1 | 1,121.7 | 6 | 0 | 6 | 0 | 60.7 / 66 | 15.3 | 4.88 |
+| r1-DMTE | DMTE | 247,640 | +9.1% | 5.403 | 42,482 | 23.196 | -0.5% | 1,817.1 | 1,000.0 (-10.9%) | 7 | 1 | 6 | 0 | 53.8 / 66 | 9.8 | 4.64 |
+
+* Including the drain, DMTE is +9.2% (241,782 vs 221,393).
+* Per native block (bench + drain, mean of nodes), DMTE's exec block is 168.6 vs 242.8 ms (-30.5%). Engine 130.8 vs
+  186.9 ms: match -49%, settle pass B -37%, margin -30%. E pipelines all 21 epoch boundaries on val0 (C: 0 of 16;
+  boundary gap 1.0 vs 474.5 ms).
+* The one `no_proposal` timeout is on val1. Per-node timeouts: C 5 / 0 / 1, DMTE 1 / 3 / 3. Drops per node: C 92 / 87
+  / 89, DMTE 105 / 107 / 106; header re-sends C 273 / 153 / 86, DMTE 255 / 108 / 80. Drops are cell totals only (no
+  1 Hz drop series in this generator version), so the `no_proposal` cannot be tied to a drop. 78's ALL-G-B had 0 over
+  600 s.
+* The pilot table's "consensus timeouts" row (C 5, DMTE 1, w1 1) is a different counter from the per-kind sums above;
+  the table uses `s58dmt-timeouts.txt`.
+* Native blocks per minute on val0, minutes 1-5: C 319, 315, 213, 170, 170; DMTE 397, 369, 295, 300, 265; w1 331,
+  338, 265, 253, 176. Both arms are still falling at 300 s (79.3c: the soak reaches exec pace by minute 5).
+* Compared with 78: ALL-G-B was +8.3% matched/s at +1.1% CPU-s per 1M fills vs C at 600 s, on the s58 stack. C
+  here is -0.5% vs 78's Crs (226,934 vs 228,142).
+
+Steps vs noise. Reference: w1 vs r1-C (same arm, back to back): -1.1% matched/s, +0.5% CPU-s per 1M fills, +14.6%
+native blk/s, -0.2% block p99 (mean of nodes; val0 alone -13.8%), exec lag 2.2 s apart. This w1 spread is wider than
+78's (0.2%).
+
+| step DMTE vs C | size | w1-vs-C spread | resolved at n = 1? |
+|---|---|---|---|
+| matched/s | +9.1% | 1.1% | yes (about 8x; matches 76-78) |
+| CPU-s / 1M fills | -0.5% | 0.5% | no: CPU-neutral, not a measured decrease |
+| block p99 (mean of nodes) | -10.9% | 0.2% (val0 13.8%) | indicative: the per-node p99 swings as much as the step |
+| native blk/s | +36.6% | 14.6% | indicative (2.5x); a start-of-run effect, see 79.3c |
+| exec lag | 15.3 -> 9.8 s | 2.2 s | indicative (2.5x) |
+| timeouts | 6 -> 7 (1 `no_proposal`) | 6 vs 9 | no |
+
+### 79.3 Safety campaign ozarchy-s58safe
+
+Setup: binary `bfe47982` (md5 `325b37f9`, D, M, T on by default, E absent), bench `bfe47982` (md5 `556e7df9`). Same
+shape and genesis as 79.2 (`d694b81b`; `CHECK OK ... shape: Classic, ckpt 15 s ... genesis N=11 markets=300`), re-send
+250 ms. Drivers generated by the frozen generator `4f825ab0` (adds the 1 Hz soak sampler); checks
+`s58safe-checks.sh` (`s58chk`, `safechk`, `rlchk`, `ckptchk`). The master unit ran mix, crash and soak in sequence,
+20:33-22:02 (`MASTER END mix=0 crash=0 soak=0`). 55 `CHECK OK`, 0 `CHECK FAIL` or `CELL-FLAG` in the master log.
+
+**(a) Mixed flags (cells w1 and r1-MIX, 300 s).** Arm MIX: val0 and val1 run the defaults (D, M, T on); val2 runs a
+wrapper binary (the generator's `wrapper` option) that execs the same node with D, M, T = 0. The took-effect lines
+confirm it per node: `on=true` / `enabled=true` once on val0 and val1, `false` once on val2, in both cells.
+
+| cell | matched/s | native blk/s | timeouts (summary) | validity | state digest, 3 nodes |
+|---|---|---|---|---|---|
+| w1 (MIX, gated warm-up) | 240,760 | 4.0 | 4 | ACCEPT AGREE, liveness PASS | `adc6a064` x3 |
+| r1-MIX | 242,600 | 3.7 | 1 | ACCEPT AGREE, liveness PASS | `f51df7c5` x3 |
+
+* A validator with D, M, T off computes the same state as two with them on, over 2 x 300 s of the full load.
+* matched/s is between 79.2's C and DMTE (+6.9% vs C, -2.0% vs DMTE; other binary, other campaign, E off here).
+
+**(b) Kill-restart (cell k1-DEF, 300 s, defaults).** Hand script `crash-cell.sh` through `run-cell.sh`
+`CRASH_KILL_AT_S=60,180 KILL_NODE=val1` (SIGKILL, restart from the same data dir after 1.01 s). From `crash.json`,
+`crash-2.json` and the two `crash-restart-tail*.log`:
+
+| kill | at | exec queue at kill | durable marker / committed | replay | kill -> DB opened | replay time (gap line -> block done) | restart -> first new commit |
+|---|---|---|---|---|---|---|---|
+| 1 | +60 s | 39 | 800 / 913 | 113 blocks | 7.9 s (process start -> open 6.9 s) | 23.2 s | 30.7 s (height 914) |
+| 2 | +180 s | 63 | 1,400 / 1,535 | 135 blocks | 4.9 s (3.9 s) | 20.5 s | 24.8 s (height 1,536) |
+
+* AGREE: state digest `c507fa1c` on all 3 nodes (heights 2,659 / 2,658 / 2,659). 0 `panicked at` in any node log.
+  matched/s 206,258 over the cell, with the two outages; 17 timeouts.
+* With n = 3 and one node down the chain halts, so val1 is at the tip once its replay ends.
+* **run-cell's crash verdict FAIL is a false alarm.** The cell ends rc 2 with:
+  `VALIDITY ozarchy-s58safe-300m-k1-DEF: REJECT liveness=UNKNOWN reasons=['crash gate failed', 'liveness unverified']`
+  and `CRASH kill 1: verdict=FAIL at=60s down=1.01s rewind=113 blk (beyond_queue=74) panics=1 errors=0 reasons=['rewind
+  74 blocks beyond the exec queue (max 2)', 'panic/fail-stop after the restart']` (kill 2: `rewind=135 blk
+  (beyond_queue=72)`). Both reasons are wrong for this shape:
+  * "panic/fail-stop": the only match after each restart is the startup INFO line
+    `torus_consensus::state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false` (val1 has 3, one
+    per start; val0 and val2 1 each).
+  * "rewind beyond the exec queue (max 2)": the rewind is to the last durable marker, which with 15 s checkpoints is
+    the last checkpoint (800, 1,400). 74 / 72 = the 113 / 135 blocks since that checkpoint minus the 39 / 63 still
+    queued. The gate's max 2 assumes the per-block flush of the shapes it was written for.
+
+**(c) 60 min soak (cell 3600s-k1-DEF, defaults).** 30 min was requested after launch; the cell ran 3,603 s.
+ACCEPT AGREE, liveness PASS, digest `42a5b28c` x3, 0 panic, drained. From `analyst/soak-minutes.tsv` (`soak_minutes.py`
+on the 1 Hz metrics; per-minute; RSS / fds / DB = val0; drops = sum of 3 nodes; fills per block = matched/s / blk/s,
+lag = queue mean / blk/s):
+
+| minute | matched/s | native blk/s | exec queue mean | fills / block | lag s | RSS GiB | fds | DB GiB (`torus_db_size_bytes`) | timeouts (sum) | drops / min |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 228,955 | 5.9 | 46.1 | 38.8k | 7.8 | 5.42 | 351 | 2.50 | 0 | 54 |
+| 2 | 248,767 | 5.5 | 61.8 | 45.2k | 11.2 | 5.90 | 376 | 2.23 | 0 | 2 |
+| 5 | 239,978 | 3.1 | 63.3 | 77.4k | 20.4 | 6.61 | 418 | 3.98 | 2 | 0 |
+| 10 | 242,562 | 2.9 | 62.2 | 83.6k | 21.4 | 7.15 | 436 | 5.12 | 0 | 0 |
+| 15 | 246,293 | 3.0 | 62.3 | 82.1k | 20.8 | 6.82 | 456 | 5.64 | 2 | 0 |
+| 20 | 237,230 | 2.9 | 57.9 | 81.8k | 20.0 | 6.32 | 476 | 6.05 | 2 | 0 |
+| 21 | 206,904 | 3.1 | 56.2 | | | 6.36 | 491 | 5.49 | 2 | 0 |
+| 22 | 154,370 | 6.2 | 45.3 | | | 5.34 | 495 | 7.06 | 1 | 8 |
+| 23 | 41,746 | 16.5 | 7.4 | | | 3.72 | 487 | 6.37 | 0 | 316 |
+| 24 | 12,521 | 17.6 | 2.6 | | | 3.35 | 475 | 7.44 | 0 | 320 |
+| 30 | 0 | 17.8 | 0.8 | | | 3.11 | 524 | 8.70 | 0 | 314 |
+| 40 | 0 | 18.0 | 0.8 | | | 2.86 | 567 | 11.22 | 0 | 322 |
+| 50 | 0 | 17.4 | 1.5 | | | 3.30 | 625 | 12.57 | 0 | 317 |
+| 60 | 0 | 16.5 | 0.8 | | | 3.35 | 667 | 13.72 | 0 | 276 |
+
+* **Minutes 1-20, under load:** matched/s is flat: mean 240,385, range 226,869-253,750. The block rate falls from
+  5.9 to 3.0-3.1 by minute 5 and stays at 2.8-3.0, with the exec queue at 62-63 of 66 and fills per block up from
+  ~39k to ~84k. Once the queue is full, consensus is paced by exec, and lag is ~20 s. RSS rises over minutes 1-9
+  (val0 5.4 -> 7.0 GiB) and is then flat (6.3-7.3 GiB) to minute 21.
+* **Minutes 21-23, the load runs out:** `margin_position` rejects on val0 go 0 (minute 20) -> 7k/s (21) -> 181k/s
+  (22) -> ~360k/s (minutes 26-30). The senders had no account margin left. This is the bench load, not the node.
+* **Minutes 24-60, no matching:** matched/s 0 from minute 28 (12.5k, 1.2k, 49, 0.6 in 24-27); ~17 blk/s of light
+  blocks; ~300 drops per minute summed over nodes (276-438); no timeouts after minute 22, so no lost-proposal
+  timeouts at 17 blk/s.
+* Timeouts by kind over the cell (sum of nodes, per-minute deltas): 2 `no_proposal` (both in minute 11), 1
+  `no_vote`, 33 `after_vote`, 3 `leader`. The summary's own counter says 12.
+* **Data dir growth.** Data dir (du, all 3 nodes) 1.17 / 2.90 / 1.19 GB at the start -> 13.18 / 14.09 / 13.98 GB at
+  the end. Linear fit: 0.193-0.195 GB/min per node over minutes 0-21 (load) and 0.203-0.212 GB/min over minutes
+  24-60 (no matching). At the end the RocksDB split is SST 5.54-5.56 GB (222-224 files), WAL 1.07-1.89 GB, and
+  ~6.5 GB the harness does not split. fds 351 -> 667 (val0), likely DB files (SST count at the end 222-224, not sampled per minute).
+  * The rate is the same with and without load, so the growth is time-based, not per fill.
+  * INFERRED, not shown: 15 s checkpoint data that is not reclaimed. At 4 timed checkpoints per minute that is ~48
+    MB per checkpoint per node. But `torus_exec_checkpoints_total` on val0 rose 5.5 per minute under load (5 -> 110
+    by minute 20) and 10.3 per minute idle (203 -> 507, minutes 30-59; 100-block epoch boundaries at 17 blk/s), at
+    the same GB per minute. So it is not a fixed size per checkpoint counted there. The mechanism is open.
+  * Not attributed to the bundle (inferred): D, M and T act only in matching and settlement, which are idle in
+    minutes 24-60, where the growth goes on unchanged. There was no flags-off soak control.
+
+### 79.4 Findings for main (not from the bundle)
+
+* **Disk growth (79.3c):** ~0.2 GB per minute per node with or without load, ~12 GB per node per hour. Cause not
+  established. To investigate on main (RocksDB LOG / SST and WAL split over time, checkpoint retention).
+* **Block rate under sustained overload converges to exec pace.** 300 s cells catch the start-of-run block rate
+  (79.2: still falling at minute 5 in both arms), so they overstate the blk/s gain. The matched/s gain persists
+  (79.3c minutes 1-20, E off: 240,385, 2.9% below 79.2's DMTE).
+* **Lag under overload is the cost:** ~20 s with the queue full (79.3c). Candidates:
+  * a shorter exec queue / propose watermark (propose-defer, `TORUS_PROPOSE_EXEC_WATERMARK`; owner s126: parked,
+    campaign B dropped, revisit after item 6 Phase 5 by exec queue depth and lag, bench queue `3a8c363f`);
+  * exec-aware admission (`e72a5021`, `TORUS_ADMISSION_EXEC_AWARE`, opt-in, default off);
+  * more exec capacity (Phase 5; parked option B, 78.6).
+* **Soaks need a load that does not exhaust account margin:** top-ups or a lower rate. This soak measured 21 min of
+  load.
+
+### 79.5 Generator notes (`e3316799` for s58dmt, `4f825ab0` for s58safe)
+
+* Warm-up gate and checks hook worked on real cells (79.2 w1 gate, 79.3 w1 gate; 46 + 55 `CHECK OK` lines in the two
+  main campaign logs).
+* The failure path ran for real in the s58dmt smoke, attempt 1 (`smoke-attempt1/campaign.log`): `CHECK FAIL
+  ozarchy-s58dmt-300m-smoke-s0: val0 checkpoint 15 s lines interval=0 policy=0` -> `CELL-FLAG
+  ozarchy-s58dmt-300m-smoke-s0 check` (rerun queued) -> `CAMPAIGN STOP at s0`. The check grepped colored log lines;
+  the checks file now strips ANSI before matching, and attempt 2 passed.
+* Gaps:
+  * no smoke-attempt option (attempt 1 was kept by renaming the dir and cell to `smoke-s0-attempt1`);
+  * no decolored-log helper for checks (each check strips ANSI itself);
+  * `expect` lines cannot read `.gz` logs;
+  * genesis inputs set by hand;
+  * no kill / crash support: `CRASH_KILL_AT_S` is a spec error (its node watch would stop the harness at the kill),
+    so 79.3b ran through the hand `crash-cell.sh` and `run-cell.sh`;
+  * per-node env only through the wrapper-binary option (79.3a).
+
+### 79.6 Next
+
+* 18c merges `exp/archy-s58-bundle-dmt` `bfe47982` (D, M, T default-on) into main.
+* Campaign A: base arm sets D, M, T = 0 (E absent); optional DMT / DMTE arms. Watch `no_proposal` (1 in 79.2) with the
+  drop counter.
+* Investigate the checkpoint / data-dir growth on main: a flags-off soak control, and a soak whose load does not
+  run out of margin.
+* Lag under overload: propose-defer is parked (s126); exec-aware admission and Phase 5 capacity are the other
+  candidates (79.4).
+* Data: `~/bench-results-matched/ozarchy-s58dmt-300m-{w1,r1-C,r1-DMTE,smoke-s0,smoke-s0-attempt1}`, campaign files
+  `ozarchy-s58dmt-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`, `smoke-attempt1/`), spec / driver / checks
+  in `ozarchy-s58dmt-tools/` (`s58dmt-spec.json`, `ozarchy-s58dmt-campaign.sh`, `s58dmt-checks.sh`), analysis in
+  `ozarchy-s58dmt-tools/analyst/out/s58dmt-{pilot,timeouts,execlag}.txt`.
+  `~/bench-results-matched/ozarchy-s58safe-{300m-w1,300m-r1-MIX,300m-k1-DEF,3600s-k1-DEF,120s-ksmoke}`, campaign files
+  `ozarchy-s58safe-run/{master,mix,ksmoke,soak}/`, tools `ozarchy-s58safe-tools/` (`s58safe-{mix,soak}-spec.json`,
+  the two drivers, `s58safe-checks.sh`, `crash-cell.sh`), analysis `ozarchy-s58safe-tools/analyst/soak_minutes.py`,
+  `soak-minutes.tsv`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
