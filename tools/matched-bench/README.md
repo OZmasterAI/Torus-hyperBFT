@@ -742,16 +742,30 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   (function names `^[a-z_][a-z0-9_]*$`, not a driver function; else SPEC ERROR). Preflight
   (`dry`, `launch`, `run`) sources the file (missing, unreadable or a non-zero return =
   `PREFLIGHT FAIL`), requires each function defined (`declare -F`), and fails when the file
-  redefines a driver function or a driver variable (`DRIVER_VARS`). The file is sourced
-  inside a function: a top-level `declare -A` / `declare -a` in it needs `-g` (else it is a
-  local of that function, gone after the preflight, with no error from bash); preflight prints
+  redefines a driver function or a driver variable (`DRIVER_VARS`), or uses the prefix
+  `_DRV_` anywhere (the driver's own check state; comments count too). The file is sourced
+  inside a function: a top-level `declare -A` / `declare -a` without `-g` is a local of that
+  function, which the checks still get (below) but no other driver code does; preflight prints
   `PREFLIGHT WARN: <file>:<line>: ...` for each one without `-g` (column 0 only) and goes on. After every cell (warm-up,
   smoke, measured; after the standard checks, before the gate) each function is called as
   `fn <label> <arm>` (label = `<label_prefix>-<tag>`, the cell dir is `$R/<label>`), in a
   subshell, with the driver's variables available: `R` (results root), `AENV[arm]` (the
   arm's own node env, `K=V K=V`), `AXE[arm]` (node_env + arm env, run-cell.sh EXTRA_ENV),
   `AHENV[arm]` (harness env), `ABIN[arm]` / `BMD5[bin]`, `RUN`, `P`, `MARKETS`, `RATE`,
-  `NODES`, `BASELINE`. It prints its own `CHECK OK` / `CHECK FAIL` lines; a non-zero return
+  `NODES`, `BASELINE`. **Scope:** a check sees exactly the file's own top-level variables
+  as sourced at preflight, the driver globals (`DRIVER_VARS`), the environment and the
+  shell's own variables (`PATH`, `IFS`, `BASH*`, ...). It never sees a local of a driver
+  function: bash variables are dynamically scoped, so before this a check saw the locals of
+  every function on the stack (`rc=1; guardchk() { return "$rc"; }` read the driver's
+  `rc=0` and passed; Codex P2). The file is sourced from frames without locals (it sees only
+  driver globals at source time) and `load_checks` keeps `declare -p` of every variable its
+  top level sets; each check runs through `_run_check`, which unsets every other visible
+  name and re-declares the file's, so `arm`, `label`, `t`, `rc`, `f`, ... are the file's own,
+  and a name the file never set is unset (`set -u`: reading it is an error, so a CHECK FAIL).
+  Limits: values are the preflight's (a check's own changes end with its subshell, as
+  before); a top-level assignment that leaves a pre-existing non-driver global exactly as it
+  was is not seen; a `readonly` global stays visible as is; functions are not isolated (a
+  check may call driver functions; redefining one fails preflight). It prints its own `CHECK OK` / `CHECK FAIL` lines; a non-zero return
   adds `CHECK FAIL <label>: campaign check <fn> returned <rc> (arm <arm>)` and is a hard
   failure like a failing `expect`: every check still runs, the row is `bad:check`, the
   campaign stops. `DRIVER show` lists them (`CHECKS <source> <fn>...`), `PREFLIGHT OK`
@@ -877,7 +891,8 @@ meminfo, the soak sampler scrapes fake /metrics servers in the hand drivers' for
 when the cell ends, samplers and host checks off leave no records; the campaign loop against the same
 fakes: a failing warm-up gate (each condition, a node death, the smoke cell) stops before the
 measured cells, `gate: false` goes on, campaign checks run on every cell with label, arm, `R`
-and `AENV`, a failing one is `bad:check` + stop, a missing function or source fails preflight;
+and `AENV`, a failing one is `bad:check` + stop, a check sees its own variables (also under
+driver-local names, at dispatch and at load) and no driver local, a missing function or source fails preflight;
 bad specs).
 
 **Why launchers copied old drivers instead of the template** (s1156): the template is the

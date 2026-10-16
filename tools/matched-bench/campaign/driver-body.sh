@@ -23,6 +23,12 @@
 # validity ACCEPT, agreement AGREE, liveness PASS, 0 panic/fail-stop lines (warmgatechk), else CHECK FAIL and the
 # campaign stops before any measured cell. Campaign checks (spec checks): CHECKS_SOURCE is sourced at preflight
 # (load_checks), each CHECK_FNS function runs after every cell as FN LABEL ARM; non-zero = CHECK FAIL (bad:check, stop).
+# Check scoping (Codex P2: bash variables are dynamic, so a check saw every calling function's locals, rc=0 for its
+# own rc=1): a check sees its file's top-level variables as sourced at preflight, the driver globals (DRIVER_VARS),
+# the environment and the shell's own variables, and no driver function's local, in both directions: the file is
+# sourced from frames without locals and its variables kept (load_checks); each check runs through _run_check,
+# which unsets every other visible name and re-declares the file's. The prefix _DRV_ is the driver's (preflight
+# refuses a checks file that uses it). Limits: load_checks' header.
 # Test-only overrides: DRIVER_PROC (a fake /proc: node exe/environ, meminfo), DRIVER_DETACH (a fake detach.sh).
 set -u
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -495,11 +501,35 @@ sys.exit(0 if (v == "ACCEPT" and ag == "AGREE" and lv == "PASS" and pf == 0) els
     echo "CHECK OK $label warm-up gate: $r"
 }
 
-campaignchecks() { # label arm: each spec checks.per_cell function (CHECK_FNS) as FN LABEL ARM, in a subshell (it sees
-    # every driver name: R, AENV, AXE, ...; it cannot change them); all run, so one cell shows every failure
+_run_check() { # FN LABEL ARM: one campaign check, in campaignchecks' subshell. Bash variables are dynamically
+    # scoped (a subshell too): FN would see the locals of every function on the stack (campaignchecks, cell,
+    # run_spec, run_cells or cell_step_rerun_pass), e.g. campaignchecks' rc=0 for its file's rc=1 (Codex P2). So:
+    # unset every visible variable that is not the shell's own, exported, a driver global (DRIVER_VARS) or one the
+    # checks file set (_DRV_KEEP, load_checks), each unset peeling one calling frame's local until none is left;
+    # then the file's variables as sourced (_DRV_DECL: declare inside a function = a local of this one, so no
+    # caller's local can shadow them; FN's helpers see them too); then FN LABEL ARM (no variable holds FN's name)
+    [ -n "${_DRV_KEEP:-}" ] || { echo "CHECK FAIL $2: campaign check $1: the checks are not loaded (load_checks)"; return 2; }
+    _DRV_KEEP+="$(compgen -e | tr '\n' ' ') "
+    for _DRV_N in $(declare -p | sed -n -E 's/^declare -[^ ]* ([A-Za-z_][A-Za-z0-9_]*)(=.*)?$/\1/p'); do
+        case $_DRV_N in BASH*|_DRV_*) continue ;; esac
+        case $_DRV_KEEP in *" $_DRV_N "*) continue ;; esac
+        _DRV_I=0
+        while [ $((_DRV_I += 1)) -le 64 ] && declare -p "$_DRV_N" > /dev/null 2>&1; do
+            unset -v "$_DRV_N" 2>/dev/null || break
+        done
+    done
+    eval "$_DRV_DECL"
+    unset -v "${!_DRV_@}"
+    "$@"
+}
+
+campaignchecks() { # label arm: each spec checks.per_cell function (CHECK_FNS) as FN LABEL ARM, in a subshell through
+    # _run_check: it sees its checks file's variables as sourced at preflight and the driver's globals (R, AENV,
+    # AXE, ...), never a local of a driver function; it cannot change driver state. All run, so one cell shows
+    # every failure
     local fn r rc=0
     for fn in $CHECK_FNS; do
-        ( "$fn" "$1" "$2" ); r=$?
+        ( _run_check "$fn" "$1" "$2" ); r=$?
         [ "$r" = 0 ] || { echo "CHECK FAIL $1: campaign check $fn returned $r (arm $2)"; rc=1; }
     done
     return $rc
@@ -635,25 +665,52 @@ run_cells() { # the campaign: each of CELLS through run_spec in order; 1 = stopp
 PF() { echo "PREFLIGHT FAIL: $*"; exit 1; }
 
 decl_warn() { # FILE: PREFLIGHT WARN for each top-level (column 0) `declare -A|-a` without -g: sourced inside
-    # load_checks, bash makes it a local of that function, gone after the preflight, without any error
+    # load_checks, bash makes it a local of that function (load_checks keeps it for the checks, no other driver code
+    # sees it), without any error
     awk -v f="$1" '/^declare[ \t]/ { o = ""; for (i = 2; i <= NF && $i ~ /^-/; i++) o = o $i
-        if (o ~ /[aA]/ && o !~ /g/) printf "PREFLIGHT WARN: %s:%d: %s: top-level declare -A/-a without -g is local to load_checks (gone after the preflight): use declare -g%s\n", f, NR, $0, (o ~ /A/ ? "A" : "a") }' "$1"
+        if (o ~ /[aA]/ && o !~ /g/) printf "PREFLIGHT WARN: %s:%d: %s: top-level declare -A/-a without -g is a local of load_checks (the checks still get it, as sourced; nothing else does): use declare -g%s\n", f, NR, $0, (o ~ /A/ ? "A" : "a") }' "$1"
 }
 
-load_checks() { # the spec checks: source CHECKS_SOURCE (bash sources it inside this function: a top-level declare in
-    # it needs -g), then every CHECK_FNS function must be defined, and no driver function or name may have changed
-    local fns before after f
+drv_state() { # load_checks: md5 of every driver function (_DRV_FNS) and of every DRIVER_VARS value
+    { for _DRV_F in $_DRV_FNS; do declare -f "$_DRV_F"; done; declare -p ${DRIVER_VARS//$'\n'/ } 2>/dev/null; } | md5sum
+}
+
+load_checks() { # the spec checks: source CHECKS_SOURCE, then every CHECK_FNS function must be defined, and no driver
+    # function or name may have changed. Scoping (Codex P2; bash variables are dynamic): this function has no
+    # locals (its state is in _DRV_ names, a prefix the checks file may not use) and preflight_static calls it from a
+    # frame without locals, so the file sees only driver globals at source time and each variable its top level
+    # sets is a global or a local of this function (declare without -g, local). _DRV_DECL keeps `declare -p` of each
+    # (the new or changed lines of declare -p across the source, minus the shell's own names, DRIVER_VARS and _DRV_*),
+    # _DRV_KEEP the names _run_check leaves visible. Limits: a top-level assignment that leaves a variable exactly
+    # as it was is not seen (only possible for a pre-existing non-driver global: an env name stays visible anyway);
+    # the snapshot is the preflight's (a check never sees a later change, as before: it runs in a subshell); a
+    # readonly global (readonly NAME at top level) is not in _DRV_DECL (no function can shadow it); the file's
+    # functions are not isolated (it must not redefine a driver function: the md5 below)
     [ -n "$CHECKS_SOURCE" ] || return 0
     [ -f "$CHECKS_SOURCE" ] && [ -r "$CHECKS_SOURCE" ] || PF "checks source $CHECKS_SOURCE missing or unreadable (spec checks.source)"
+    _DRV_L=$(grep -n -m1 '_DRV_' "$CHECKS_SOURCE") && PF "$CHECKS_SOURCE:${_DRV_L%%:*}: uses the reserved prefix _DRV_ (the driver keeps its check state in _DRV_ names, comments count too); rename it there"
     decl_warn "$CHECKS_SOURCE"
-    fns=$(compgen -A function)
-    before=$( { for f in $fns; do declare -f "$f"; done; declare -p ${DRIVER_VARS//$'\n'/ } 2>/dev/null; } | md5sum)
+    _DRV_FNS=$(compgen -A function)
+    _DRV_SUM=$(drv_state)
+    _DRV_PRE=$(declare -p)
     # shellcheck disable=SC1090
     source "$CHECKS_SOURCE" || PF "cannot source $CHECKS_SOURCE (spec checks.source): it returned $?"
-    after=$( { for f in $fns; do declare -f "$f"; done; declare -p ${DRIVER_VARS//$'\n'/ } 2>/dev/null; } | md5sum)
-    [ "$before" = "$after" ] || PF "$CHECKS_SOURCE redefines a driver function or driver variable (DRIVER_VARS); rename it there"
-    for f in $CHECK_FNS; do
-        declare -F "$f" > /dev/null || PF "check function $f is not defined by $CHECKS_SOURCE (spec checks.per_cell)"
+    _DRV_POST=$(declare -p)
+    _DRV_LOC=$(local)
+    [ "$_DRV_SUM" = "$(drv_state)" ] || PF "$CHECKS_SOURCE redefines a driver function or driver variable (DRIVER_VARS); rename it there"
+    _DRV_KEEP=" $(env -i "$BASH" --norc --noprofile -c 'compgen -v' | tr '\n' ' ')FUNCNAME PIPESTATUS OPTARG COPROC COLUMNS LINES OLDPWD PS1 PS2 PS3 TIMEFORMAT ${DRIVER_VARS//$'\n'/ } "
+    _DRV_DECL=
+    for _DRV_N in $(grep -Fxv -f <(printf '%s\n' "$_DRV_PRE") <<< "$_DRV_POST" | sed -n -E 's/^declare -[^ ]* ([A-Za-z_][A-Za-z0-9_]*)(=.*)?$/\1/p'); do
+        case $_DRV_N in BASH*|_DRV_*) continue ;; esac
+        case $_DRV_KEEP in *" $_DRV_N "*) continue ;; esac
+        _DRV_KEEP+="$_DRV_N "
+        _DRV_L=$(declare -p "$_DRV_N")
+        _DRV_F=${_DRV_L#declare }; _DRV_F=${_DRV_F%% *}
+        if [[ $_DRV_F == *r* ]] && ! grep -q -E "^declare -[^ ]* $_DRV_N(=|\$)" <<< "$_DRV_LOC"; then continue; fi
+        _DRV_DECL+=$_DRV_L$'\n'
+    done
+    for _DRV_N in $CHECK_FNS; do
+        declare -F "$_DRV_N" > /dev/null || PF "check function $_DRV_N is not defined by $CHECKS_SOURCE (spec checks.per_cell)"
     done
 }
 
@@ -683,7 +740,13 @@ preflight_genesis() { # the genesis inputs under run-cell.sh's repo root GENESIS
     return 0
 }
 
-preflight_static() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
+preflight_static() { # preflight_paths, then the spec checks (load_checks), from this frame: it has no locals, which
+    # the checks file would see at source time or set instead of its own variables (load_checks)
+    preflight_paths
+    load_checks
+}
+
+preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
     local f b node m tgt
     for f in "$HARNESS" "$DETACH" "$TOOLS/cell-step.sh" "$TOOLS/cell_step.py"; do [ -f "$f" ] || PF "$f missing"; done
     for f in pgrep zcat timeout; do command -v "$f" > /dev/null || PF "$f missing (the watchers use it)"; done
@@ -713,13 +776,12 @@ preflight_static() { # paths, tools, genesis inputs, staged md5s (a wrapper's md
         fi
     done
     for f in $ANALYSIS_CMD; do case $f in */*.py|*/*.sh) [ -f "$f" ] || PF "analysis script $f missing";; esac; done
-    load_checks
     return 0
 }
 
 preflight_host() { # run mode only: inside a bench unit, nothing else running, no old attempt; host checks: memory,
     # sysctls (the dirty limits pinned for the whole run)
-    local c g self other
+    local c g self other f x
     self=$(grep -oE 'bench-[^/]*\.service' /proc/self/cgroup | tail -1)
     [ -n "$self" ] || PF "not inside a bench-*.service unit: start it with: $SELF launch${SMOKE:+ smoke} (detach.sh holds the build lock)"
     other=$(systemctl --user list-units 'bench-*.service' --state=active --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -vxF "$self")

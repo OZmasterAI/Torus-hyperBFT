@@ -33,7 +33,11 @@ fake /proc (DRIVER_PROC). Pinned:
    few samples), the fd stop, the sysctl record and check (spec values, else pinned at the run's preflight), the
    MemAvailable preflight; off = none of them.
 13. a top-level declare -A / -a without -g in the checks file is a PREFLIGHT WARN (sourced inside a function it
-   would be a local, gone after the preflight); the preflight goes on.
+   is a local of load_checks: the checks still get it, nothing else does); the preflight goes on.
+14. check scoping (Codex P2: bash variables are dynamic, so `rc=1; guardchk() { return "$rc"; }` read
+   campaignchecks' rc=0 and passed): a check sees its file's top-level values (also under names that are locals of
+   cell / run_spec / run_cells / campaignchecks, or of the preflight frames the file is sourced from), none of the
+   driver locals the file never set, still the driver globals and its label / arm; the _DRV_ prefix is refused.
 11. the warm-up gate (spec warmup.gate, default on): a warm-up or smoke cell that is not run-cell rc 0, validity
    ACCEPT, agreement AGREE, liveness PASS and 0 panic/fail-stop lines stops the campaign before any measured cell
    (s58 warmgate; before, a failed warm-up was a row and the measured cells ran anyway). gate false = a row only.
@@ -2344,6 +2348,53 @@ alsochk() { echo "alsochk $1 $2" >> "$R/checks.log"; }
 badchk() { echo "badchk $1 $2" >> "$R/checks.log"; echo "CHECK FAIL $1: badchk says no"; return 1; }
 """
 
+# Codex P2: bash variables are dynamically scoped, so a check called from campaignchecks saw campaignchecks'
+# rc=0 (and every other local of cell / run_spec / run_cells) instead of its own top-level rc=1
+CHECKS_RC_SH = r"""rc=1
+guardchk() { return "$rc"; }
+"""
+
+# dispatch: each name is a local of a driver function on the stack when a check runs (campaignchecks: fn r rc;
+# cell: tg arm dur label t rc kv crc E ...; run_spec: spec tg arm dur label crc ...; run_cells: c). The check must
+# see the file's own values, never the driver's, and must not see the driver locals the file never set.
+CHECKS_OWN_SH = r"""arm=own-arm label=own-label t=own-t crc=own-crc tg=own-tg kv=own-kv rc=own-rc fn=own-fn r=own-r
+dur=own-dur
+E=(own-e0 own-e1)
+declare -gA OWNMAP=([k]=own-k)
+readonly ROLIM=own-rolim
+ownchk() {
+    local n bad=
+    for n in arm label t crc tg kv rc fn r dur ROLIM; do [ "${!n-}" = "own-${n,,}" ] || bad+=" $n=${!n-UNSET}"; done
+    [ "${E[*]-}" = "own-e0 own-e1" ] || bad+=" E=${E[*]-UNSET}"
+    [ "${OWNMAP[k]-}" = own-k ] || bad+=" OWNMAP"
+    echo "ownchk $1 $2${bad:+ BAD$bad}" >> "$R/checks.log"
+    [ -z "$bad" ]
+}
+hidechk() {
+    local n seen=
+    for n in spec sfx kind killat rcf unit b nt fdok mp HP EP WP DP c xr; do [ -z "${!n+x}" ] || seen+=" $n=${!n}"; done
+    echo "hidechk $1 $2${seen:+ SEEN$seen}" >> "$R/checks.log"
+    [ -z "$seen" ]
+}
+globchk() { echo "globchk $1 $2 R=$R aenv=${AENV[$2]:-none} axe=${AXE[$2]:-none} arms=${ARMS[*]}" >> "$R/checks.log"; }
+"""
+
+# load: each name is a local of preflight_static (f b node m tgt) or of the old load_checks (fns before after f),
+# the frames the file used to be sourced in: a top-level assignment landed in that local and was gone after the
+# preflight, and the file saw the loader's values at source time. LOCMAP (declare -A without -g) is a local of
+# load_checks (PREFLIGHT WARN), and the checks still see it.
+CHECKS_LOAD_SH = r"""SRC_SEEN="f=${f-UNSET} m=${m-UNSET} b=${b-UNSET} node=${node-UNSET} tgt=${tgt-UNSET} fns=${fns-UNSET} before=${before-UNSET} after=${after-UNSET}"
+f=own-f m=own-m b=own-b node=own-node tgt=own-tgt fns=own-fns before=own-before after=own-after
+declare -A LOCMAP=([k]=own-k)
+minechk() {
+    local n bad=
+    for n in f m b node tgt fns before after; do [ "${!n-}" = "own-$n" ] || bad+=" $n=${!n-UNSET}"; done
+    [ "${LOCMAP[k]-}" = own-k ] || bad+=" LOCMAP"
+    echo "minechk $1 $2 src[$SRC_SEEN]${bad:+ BAD$bad}" >> "$R/checks.log"
+    [ -z "$bad" ]
+}
+"""
+
 
 class WarmGateChecksSpecTest(Base):
     """spec warmup.gate and checks: strict like every other key"""
@@ -2526,7 +2577,7 @@ class WarmGateChecksSpecTest(Base):
 
     def test_preflight_warns_on_top_level_declare_without_g(self):
         """the checks file is sourced inside load_checks: a top-level declare -A / -a without -g makes a
-        function-local array that is gone after the preflight (no error from bash), so preflight warns"""
+        function-local array (no error from bash; load_checks keeps it for the checks only), so preflight warns"""
         out = self.dry_ok(
             "okchk() { :; }\ndeclare -A WANT=([a]=1)\ndeclare -a LIST=(x y)\ndeclare -r -A RO=([b]=2)\n"
         )
@@ -2545,6 +2596,22 @@ class WarmGateChecksSpecTest(Base):
         )
         self.assertNotIn("PREFLIGHT WARN", out)
 
+    def test_preflight_refuses_the_reserved_prefix(self):
+        """the driver keeps its check state (load_checks, _run_check) in _DRV_ names: a checks file that uses one
+        could clobber the snapshot its checks run with, so preflight refuses it (any mention, comments too)"""
+        f = os.path.join(self.tmp, "reserved.sh")
+        for body in (
+            "_DRV_DECL=x\n",
+            'okchk2() { echo "$_DRV_KEEP"; }\n',
+            "# see _DRV_NAMES\n",
+        ):
+            with open(f, "w") as fh:
+                fh.write("okchk() { :; }\n" + body)
+            self.dry_fail(
+                minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]}),
+                "reserved.sh:2: uses the reserved prefix _DRV_",
+            )
+
 
 class WarmGateRunTest(FakeHostBase):
     """the generated campaign loop (run_cells) for real against the fakes (as CellRunTest): the warm-up gate and
@@ -2552,7 +2619,9 @@ class WarmGateRunTest(FakeHostBase):
 
     W, M = "w1:A:120:none:", "r1-A:A:120:none:"
 
-    def run_cells(self, spec, cells, smoke=False, **env):
+    def run_cells(self, spec, cells, smoke=False, loader="load_checks", **env):
+        """loader: what loads the checks file (load_checks, or the whole preflight_static, whose locals the
+        file must not see or land in)"""
         drv = self.generate(self.write_spec(spec, "gate.json"), "gate.sh")
         os.makedirs(spec["run_dir"], exist_ok=True)
         script = "\n".join(
@@ -2565,7 +2634,7 @@ class WarmGateRunTest(FakeHostBase):
                 "CELLS=(%s)" % " ".join(shlex.quote(c) for c in cells),
                 'source "$TOOLS/cell-step.sh" || exit 98',
                 "export CELL_STEP_LOG=$RUN/campaign.log",
-                "load_checks",
+                loader,
                 "sysctl_pin",
                 'run_cells; echo "RUN_CELLS_RC=$?"',
             ]
@@ -2731,6 +2800,71 @@ class WarmGateRunTest(FakeHostBase):
         self.assertIn("RUN_CELLS_RC=1", out, out)
         self.assertIn("CHECK FAIL test-camp-10m-w1: warm-up gate: node death", out)
         self.assertFalse(self.started(spec, "test-camp-10m-r1-A"), out)
+
+    def checks_spec(self, body, fns, **over):
+        f = os.path.join(self.tmp, "scope-checks.sh")
+        with open(f, "w") as fh:
+            fh.write(body)
+        return minimal_spec(
+            self.tmp, warmup=False, checks={"source": f, "per_cell": fns}, **over
+        )
+
+    def test_check_sees_its_own_rc_not_campaignchecks(self):
+        """Codex P2: `rc=1; guardchk() { return "$rc"; }` passed because the check read campaignchecks' rc=0
+        (dynamic scoping through the subshell); it must fail the cell and stop the campaign"""
+        spec = self.checks_spec(CHECKS_RC_SH, ["guardchk"])
+        out = self.run_cells(spec, [self.M, "r1-M1:M1:120:none:"])
+        self.assertIn("RUN_CELLS_RC=1", out, out)
+        self.assertIn(
+            "CHECK FAIL test-camp-10m-r1-A: campaign check guardchk returned 1 (arm A)",
+            out,
+        )
+        self.assertIn("CAMPAIGN STOP at r1-A", out)
+        self.assertEqual(
+            [(r[0], r[7]) for r in self.rows(spec)],
+            [("test-camp-10m-r1-A", "bad:check")],
+        )
+        self.assertFalse(self.started(spec, "test-camp-10m-r1-M1"), out)
+
+    def test_check_sees_its_own_values_and_no_driver_local(self):
+        """a check sees its file's top-level values under the names cell / run_spec / run_cells / campaignchecks
+        use as locals (scalars, an array, an assoc array, a readonly), none of the driver locals the file never
+        set, and still the driver globals and its label / arm arguments"""
+        spec = self.checks_spec(CHECKS_OWN_SH, ["ownchk", "hidechk", "globchk"])
+        out = self.run_cells(spec, ["r1-M1:M1:120:none:"])
+        self.assertIn("RUN_CELLS_RC=0", out, out)
+        self.assertNotIn("readonly variable", out)
+        R = spec["results_root"]
+        drv = os.path.join(self.tmp, "gate.sh")
+        axe = self.lib(drv, 'echo "${AXE[M1]}"').stdout.strip()
+        self.assertTrue(axe, "AXE[M1] empty")
+        self.assertEqual(
+            open(os.path.join(R, "checks.log")).read().splitlines(),
+            [
+                "ownchk test-camp-10m-r1-M1 M1",
+                "hidechk test-camp-10m-r1-M1 M1",
+                "globchk test-camp-10m-r1-M1 M1 R=%s aenv=MALLOC_CONF=dirty_decay_ms:1000"
+                " TORUS_X_KNOB=7 axe=%s arms=A M1" % (R, axe),
+            ],
+        )
+        self.assertEqual([r[7] for r in self.rows(spec)], ["ok"])
+
+    def test_check_sees_names_that_are_loader_locals(self):
+        """load-time mirror: loaded by the whole preflight_static, a checks file that sets f m b node tgt fns
+        before after (locals of the frames it used to be sourced in) keeps its values for its checks, saw none
+        of the loader's at source time, and a top-level declare -A without -g still reaches the checks"""
+        spec = self.checks_spec(CHECKS_LOAD_SH, ["minechk"])
+        out = self.run_cells(spec, [self.M], loader="preflight_static")
+        self.assertNotIn("PREFLIGHT FAIL", out)
+        self.assertIn("RUN_CELLS_RC=0", out, out)
+        self.assertEqual(
+            open(os.path.join(spec["results_root"], "checks.log")).read().splitlines(),
+            [
+                "minechk test-camp-10m-r1-A A src[f=UNSET m=UNSET b=UNSET node=UNSET tgt=UNSET"
+                " fns=UNSET before=UNSET after=UNSET]"
+            ],
+        )
+        self.assertEqual([r[7] for r in self.rows(spec)], ["ok"])
 
 
 if __name__ == "__main__":
