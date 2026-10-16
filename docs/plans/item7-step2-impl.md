@@ -2219,7 +2219,17 @@ None of these changes block speed or matched/s; they are correctness and UX choi
    - Alt: forward them to the next leader at once. Gains up to one commit (~0.3 s) in a rare case and adds
      duplicate sends. Revisit if the devnet's routing check (d) shows lost-proposal txs waiting more than 2 EVM
      heights.
-6. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
+6. **C6 fix round (47e3f60f): decode errors, re-delivered blocks, two encodings.**
+   - A tx that fails to decode at `eth_sendRawTransaction` returns "mempool error: tx decode failed: ..." (code
+     still -32603) instead of "internal error: tx rlp decode: ...". Alt: keep the old text (it wrongly calls a bad
+     tx an internal error).
+   - A block delivered again below the execution frontier skips the lost-proposal reinsert, like the re-send
+     already did (those heights are settled at the first delivery). Alt: reinsert anyway (would re-track txs of a
+     settled height).
+   - Admission keeps accepting both encodings of a tx, the bare EIP-2718 bytes and alloy's network form; both
+     decode to one tx and one hash (`evm_tx_hash`), and trailing bytes are refused in both. Alt: refuse the network
+     form (breaks our RPC tests and clients using alloy's `encode`, gains nothing).
+7. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
    Phase 5 (rules in `item6-phase5-impl.md`, `item7-step2-design.md` and `docs/perf/bench-queue.md`).
 
 ## Effort (one builder)
