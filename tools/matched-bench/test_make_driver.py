@@ -28,8 +28,12 @@ fake /proc (DRIVER_PROC). Pinned:
    harness, a "CELL FAIL ... death" line, and a cells.tsv row that cell_step flags death (+ a queued rerun);
    the campaign goes on. Run for real: the generated cell() against a fake detach.sh / systemctl / run-cell.sh.
 9. memguard stops the cell unit when MemAvailable < 6 GB (a stubbed /proc/meminfo), and only then.
-10. the spec options samplers / host_checks (default on): sampler records, the fd stop, the sysctl record and
-   check (spec values, else pinned at the run's preflight), the MemAvailable preflight; off = none of them.
+10. the spec options samplers / host_checks (default on): sampler records (with the hand drivers' 1 Hz soak
+   sampler: metrics-1hz.txt.gz + host-1hz.tsv, started and stopped with every cell, soakchk's CHECK WARN on too
+   few samples), the fd stop, the sysctl record and check (spec values, else pinned at the run's preflight), the
+   MemAvailable preflight; off = none of them.
+13. a top-level declare -A / -a without -g in the checks file is a PREFLIGHT WARN (sourced inside a function it
+   would be a local, gone after the preflight); the preflight goes on.
 11. the warm-up gate (spec warmup.gate, default on): a warm-up or smoke cell that is not run-cell rc 0, validity
    ACCEPT, agreement AGREE, liveness PASS and 0 panic/fail-stop lines stops the campaign before any measured cell
    (s58 warmgate; before, a failed warm-up was a row and the measured cells ran anyway). gate false = a row only.
@@ -39,6 +43,8 @@ fake /proc (DRIVER_PROC). Pinned:
 """
 
 import glob
+import gzip
+import http.server
 import importlib.util
 import json
 import os
@@ -49,6 +55,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -82,7 +89,13 @@ GENESIS_FILES = {
     "testnet/lib/cargo-bin.sh": "cargo_bin() { echo fake; }\n",
     "testnet/gen-weighted-genesis.sh": "#!/bin/sh\necho fake weighted\n",
 }
-TOOL_FILES = ["run-cell.sh", "cell-step.sh", "cell_step.py", "campaign/detach.sh"]
+TOOL_FILES = [
+    "run-cell.sh",
+    "cell-step.sh",
+    "cell_step.py",
+    "campaign/detach.sh",
+    "soak-sampler.py",
+]
 
 
 def write_tree(root, files):
@@ -348,6 +361,7 @@ CELL_WIRING = [
     'ckptsamp "$R/$label" & KP=$!',
     'memsamp "$R/$label" & MP=$!',
     'fdsampler "$R/$label" & FP=$!',
+    'python3 -I "$SOAKPY" "$R/$label" "${METS[@]}" & SKP=$!',
     'timeout $((dur + 1200)) vmstat -n -t 1 > "$R/$label/vmstat-1hz.txt" 2>&1 & VMP=$!',
     'until mp=$(systemctl --user show -p MainPID --value "$unit.service" 2>/dev/null) && [ -n "$mp" ] && [ "$mp" != 0 ] \\',
     '&& HP=$(pgrep -P "$mp" | head -1) && [ -n "$HP" ]; do',
@@ -421,7 +435,13 @@ class GoldenTest(Base):
         fd = re.search(r"^FD_STOP=(\d+)$", hand, re.M).group(1)
         self.assertIn("WATCH node-death memguard hardscan", plan)
         self.assertIn(
-            "SAMPLERS on du mem metrics fd vmstat rocksdb-log fd_stop=%s" % fd, plan
+            "SAMPLERS on du mem metrics fd soak-1hz vmstat rocksdb-log fd_stop=%s" % fd,
+            plan,
+        )
+        self.assertIn(
+            "SOAK on %s/soak-sampler.py metrics-1hz.txt.gz host-1hz.tsv"
+            % json.load(open(os.path.join(FIX, "p4j4-%s.json" % kind)))["tools_dir"],
+            plan,
         )
         self.assertIn("HOSTCHECK on min_mem_avail_kb=%s" % mem, plan)
         self.assertIn("SYSCTL vm.dirty_bytes %s" % dirty, plan)
@@ -1478,6 +1498,8 @@ SAMPLER_FILES = (
     "node-nofile.txt",
     "fds.txt",
     "vmstat-1hz.txt",
+    "metrics-1hz.txt.gz",
+    "host-1hz.tsv",
     "rocksdb-LOG-val0.txt",
     "data-du.txt",
 )
@@ -1814,6 +1836,63 @@ class CellRunTest(FakeHostBase):
         ):
             self.assertIn(s, out)
         self.assertEqual(self.row(spec)[7], "ok", out)
+        self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
+
+    def metrics_servers(self, n=3):
+        body = (
+            "# HELP torus_x x\n# TYPE torus_x counter\n"
+            "torus_consensus_rate_limited_dropped_total 7\n"
+            'torus_commit_interval_seconds_bucket{le="0.064"} 1\n'
+            'torus_commit_interval_seconds_bucket{le="0.256"} 2\n'
+            'torus_commit_interval_seconds_bucket{le="+Inf"} 3\n'
+            'torus_other_seconds_bucket{le="1"} 4\n'
+        ).encode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        ports = []
+        for _ in range(n):
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.server_close)
+            self.addCleanup(srv.shutdown)
+            ports.append(srv.server_address[1])
+        return ports
+
+    def test_soak_sampler_every_cell(self):
+        """the 1 Hz soak sampler starts with the cell, scrapes the METS ports (here 3 fake /metrics servers) in the
+        hand drivers' format, and is stopped (gone) when cell() returns"""
+        ports = self.metrics_servers()
+        spec = minimal_spec(self.tmp)
+        out = self.run_cell(spec, pre="sysctl_pin\nMETS=(%d %d %d)" % tuple(ports))
+        self.assertIn("RUN_SPEC_RC=0", out, out)
+        with gzip.open(os.path.join(self.cell, "metrics-1hz.txt.gz"), "rt") as z:
+            m = z.read()
+        for i in range(3):
+            self.assertRegex(m, r"(?m)^T \d+\.\d{3} val%d ok \d+\.\d{4}$" % i)
+        self.assertIn("torus_consensus_rate_limited_dropped_total 7\n", m)
+        self.assertIn('torus_commit_interval_seconds_bucket{le="0.256"} 2\n', m)
+        self.assertNotIn('le="0.064"', m)
+        self.assertNotIn("torus_other_seconds_bucket", m)
+        self.assertNotIn("# HELP", m)
+        host = self.cellfile("host-1hz.tsv").splitlines()
+        self.assertEqual(host[0], HOST_1HZ_HEADER)
+        self.assertGreaterEqual(len(host), 2, host)
+        self.assertEqual(len(host[1].split("\t")), 23, host[1])
+        self.assertRegex(
+            out,
+            r"CHECK SOAK %s: .*metrics-1hz ok scrapes [1-9]\d*, host-1hz rows [1-9]"
+            % LB,
+        )
+        self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
 
     def test_node_death_mid_cell(self):
         """val1 exits 2 s into the cell: node-death.txt, harness TERMed, CELL FAIL, row flagged death + rerun
@@ -1833,6 +1912,7 @@ class CellRunTest(FakeHostBase):
         )
         self.assertIn("interrupted", self.cellfile("run.log"))  # the harness got TERM
         self.assertIn("CELL FAIL %s rc=130 death: DEATH node val1 " % LB, out)
+        self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
         flag = self.row(spec)[7]
         self.assertTrue(flag.startswith("bad:"), flag)
         self.assertIn("death", flag[4:].split(","), flag)
@@ -1959,7 +2039,7 @@ class HostChecksTest(FakeHostBase):
         on = self.plan(self.drv())
         for ln in (
             "WATCH node-death memguard hardscan",
-            "SAMPLERS on du mem metrics fd vmstat rocksdb-log fd_stop=16384",
+            "SAMPLERS on du mem metrics fd soak-1hz vmstat rocksdb-log fd_stop=16384",
             "HOSTCHECK on min_mem_avail_kb=40000000",
             "SYSCTL vm.dirty_background_bytes pinned",
             "SYSCTL vm.dirty_bytes pinned",
@@ -2025,6 +2105,138 @@ class SamplerCheckTest(Base):
         )
         self.assertNotIn("val1 has", r.stdout)
         self.assertIn("CHECK OK %s hardscan done" % LB, r.stdout)
+
+
+SOAK_MD5 = "f147d7c657b2d71f9bc2934825845695"  # the s58rl / p4soak10 hand drivers' soak-sampler.py
+HOST_1HZ_HEADER = "\t".join(
+    ["ts", "Dirty_kB", "Writeback_kB", "MemAvailable_kB", "Cached_kB"]
+    + [
+        "val%d_%s" % (i, k)
+        for i in range(3)
+        for k in (
+            "VmRSS",
+            "RssAnon",
+            "RssFile",
+            "voluntary_ctxt_switches",
+            "nonvoluntary_ctxt_switches",
+            "cpu_ticks",
+        )
+    ]
+)
+
+
+def sampler_procs(cell):
+    """pids of soak-sampler.py processes still running for this cell dir"""
+    out = []
+    for f in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            c = open(f, "rb").read()
+        except OSError:
+            continue
+        if b"soak-sampler.py" in c and cell.encode() in c:
+            out.append(f.split("/")[2])
+    return out
+
+
+class SoakSamplerTest(Base):
+    """the 1 Hz soak sampler (samplers on): metrics-1hz.txt.gz + host-1hz.tsv, the hand drivers' sampler copied
+    unchanged; soakchk's sample counts; its preflight; show"""
+
+    def setUp(self):
+        super().setUp()
+        self.spec = minimal_spec(self.tmp)
+        self.drv = self.generate(self.write_spec(self.spec))
+        self.cell = os.path.join(self.spec["results_root"], LB)
+        os.makedirs(self.cell)
+
+    def test_sampler_is_the_hand_drivers_copy(self):
+        self.assertEqual(md5_of(os.path.join(HERE, "soak-sampler.py")), SOAK_MD5)
+
+    def soak(self, scrapes, rows, dur=10):
+        if scrapes is not None:
+            with gzip.open(os.path.join(self.cell, "metrics-1hz.txt.gz"), "wt") as z:
+                z.write("T 1700000000.000 val0 ERR URLError\n")
+                for i in range(scrapes):
+                    z.write(
+                        "T 1700000%03d.000 val%d ok 0.0012\nx_total 1\n" % (i, i % 3)
+                    )
+        if rows is not None:
+            with open(os.path.join(self.cell, "host-1hz.tsv"), "w") as f:
+                f.write(HOST_1HZ_HEADER + "\n")
+                for i in range(rows):
+                    f.write("%d.000\t1\n" % (1700000000 + i))
+        r = self.lib(self.drv, "soakchk %s %d" % (LB, dur))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)  # recorded, never fails
+        return r.stdout
+
+    def test_soakchk_counts_enough(self):
+        out = self.soak(30, 10)
+        self.assertIn("metrics-1hz ok scrapes 30, host-1hz rows 10", out)
+        self.assertNotIn("CHECK WARN", out)
+
+    def test_soakchk_too_few_samples(self):
+        out = self.soak(29, 9)
+        self.assertIn(
+            "CHECK WARN %s: metrics-1hz has 29 ok scrapes (< 3 x 10)" % LB, out
+        )
+        self.assertIn("CHECK WARN %s: host-1hz has 9 rows (< 10)" % LB, out)
+        os.remove(os.path.join(self.cell, "metrics-1hz.txt.gz"))
+        os.remove(os.path.join(self.cell, "host-1hz.tsv"))
+        out = self.soak(None, None)
+        self.assertIn("metrics-1hz ok scrapes 0, host-1hz rows 0", out)
+        self.assertIn("CHECK WARN %s: metrics-1hz has 0 ok scrapes" % LB, out)
+        self.assertIn("CHECK WARN %s: host-1hz has 0 rows" % LB, out)
+
+    def test_show(self):
+        plan = self.plan(self.drv)
+        self.assertIn(
+            "SOAK on %s/soak-sampler.py metrics-1hz.txt.gz host-1hz.tsv"
+            % self.spec["tools_dir"],
+            plan,
+        )
+        self.assertTrue(
+            any(ln.startswith("SAMPLERS on ") and " soak-1hz " in ln for ln in plan),
+            plan,
+        )
+        drv = self.generate(
+            self.write_spec(minimal_spec(self.tmp, samplers=False), "off.json"),
+            "off.sh",
+        )
+        plan = self.plan(drv)
+        self.assertIn("SAMPLERS off", plan)
+        self.assertFalse([ln for ln in plan if ln.startswith("SOAK")], plan)
+
+    def dry(self, drv):
+        return subprocess.run(
+            ["bash", drv, "dry"], capture_output=True, text=True, timeout=60
+        )
+
+    def test_preflight_needs_the_sampler(self):
+        sp = os.path.join(self.spec["tools_dir"], "soak-sampler.py")
+        r = self.dry(self.drv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(sp, "w") as f:
+            f.write("import sys\n")  # compiles, lacks the slow-tail buckets
+        r = self.dry(self.drv)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("PREFLIGHT FAIL", r.stdout)
+        self.assertIn("slow-tail", r.stdout)
+        with open(sp, "w") as f:
+            f.write("def (:\n")
+        r = self.dry(self.drv)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("does not compile", r.stdout)
+        os.remove(sp)
+        r = self.dry(self.drv)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("soak-sampler.py missing", r.stdout)
+        # samplers off: no sampler needed
+        drv = self.generate(
+            self.write_spec(minimal_spec(self.tmp, samplers=False), "off.json"),
+            "off.sh",
+        )
+        r = self.dry(drv)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 class WatcherSpecTest(Base):
@@ -2292,6 +2504,46 @@ class WarmGateChecksSpecTest(Base):
                 minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]}),
                 "redefines",
             )
+
+    def dry_ok(self, body):
+        f = os.path.join(self.tmp, "decl.sh")
+        with open(f, "w") as fh:
+            fh.write(body)
+        drv = self.generate(
+            self.write_spec(
+                minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]}),
+                "decl.json",
+            ),
+            "decl-drv.sh",
+        )
+        r = subprocess.run(
+            ["bash", drv, "dry"], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("PREFLIGHT FAIL", r.stdout)
+        self.assertIn("checks=okchk", r.stdout)  # the preflight still runs to the end
+        return r.stdout
+
+    def test_preflight_warns_on_top_level_declare_without_g(self):
+        """the checks file is sourced inside load_checks: a top-level declare -A / -a without -g makes a
+        function-local array that is gone after the preflight (no error from bash), so preflight warns"""
+        out = self.dry_ok(
+            "okchk() { :; }\ndeclare -A WANT=([a]=1)\ndeclare -a LIST=(x y)\ndeclare -r -A RO=([b]=2)\n"
+        )
+        warns = [ln for ln in out.splitlines() if ln.startswith("PREFLIGHT WARN")]
+        self.assertEqual(len(warns), 3, out)
+        for w, (n, name) in zip(warns, ((2, "WANT"), (3, "LIST"), (4, "RO"))):
+            self.assertIn("decl.sh:%d" % n, w)
+            self.assertIn(name, w)
+            self.assertIn("-g", w)
+
+    def test_preflight_silent_on_declare_with_g(self):
+        out = self.dry_ok(
+            "okchk() {\n    declare -A loc=([a]=1)\n    local -a l2\n}\n"
+            "declare -gA WANT=([a]=1)\ndeclare -g -a LIST=(x)\ndeclare -Ag M2\ndeclare -r RO=1\n"
+            "# declare -A COMMENTED\n"
+        )
+        self.assertNotIn("PREFLIGHT WARN", out)
 
 
 class WarmGateRunTest(FakeHostBase):

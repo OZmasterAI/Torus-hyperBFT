@@ -661,7 +661,7 @@ def render(p, spec, spec_path):
     L.append("ANALYSIS_METRIC=%s" % q(p["analysis_metric"]))
     hc = p["host_checks"]
     L.append(
-        "SAMPLERS=%d   # per-cell du/memory/metrics/fd/vmstat samplers, RocksDB LOG copies, the fd stop"
+        "SAMPLERS=%d   # per-cell du/memory/metrics/fd/soak-1hz/vmstat samplers, RocksDB LOG copies, the fd stop"
         % (1 if p["samplers"] else 0)
     )
     L.append(

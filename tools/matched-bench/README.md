@@ -703,10 +703,23 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
 - **Samplers** (spec `samplers`, default `true`): `data-du-samples.txt` (data dir sizes,
   MemAvailable, /dev/shm; 2 s), `ckpt-samples.txt` (each node's checkpoint and reject metrics;
   2 s), `mem-samples.txt` + `smaps/` (smaps_rollup, status and memory gauges every 5 s; val0's
-  full smaps every 30 s), `node-nofile.txt` + `fds.txt` (open fds; 5 s), `vmstat-1hz.txt`;
-  after the cell `rocksdb-LOG-val<i>.txt`, `data-du.txt`, a `[<label>] fds max/end ...` line and
-  a `CHECK SOAK` coverage line. A node that held more than 16384 open fds stops the campaign
-  after its cell (`STOP`, `bad:stop-fd`).
+  full smaps every 30 s), `node-nofile.txt` + `fds.txt` (open fds; 5 s), `vmstat-1hz.txt`,
+  and the hand drivers' 1 Hz soak sidecar `python3 -I $TOOLS/soak-sampler.py <cell> 9161 9162
+  9163` (`tools/matched-bench/soak-sampler.py`, copied unchanged from the s58rl / p4soak10
+  tools): `metrics-1hz.txt.gz` (per node and second `T <epoch> val<i> ok <scrape_s>|ERR` + the
+  /metrics lines without comments or buckets, except the slow-tail buckets le >= 0.128 of its
+  latency families: per-second consensus drops and timeouts) and `host-1hz.tsv` (meminfo
+  Dirty / Writeback / MemAvailable / Cached and per node RSS, context switches, CPU ticks). It
+  starts with the other samplers, waits for run.log's `node pids:` line, ends when the nodes
+  are gone and is stopped with them. A frozen `tools_dir` must carry `soak-sampler.py` (else
+  `PREFLIGHT FAIL ... soak-sampler.py missing`; also when it does not compile or lacks the
+  slow-tail buckets). After the cell `rocksdb-LOG-val<i>.txt`, `data-du.txt`, a `[<label>] fds
+  max/end ...` line and a `CHECK SOAK` coverage line, which adds `CHECK WARN <label>:
+  metrics-1hz has N ok scrapes (< 3 x dur)` / `host-1hz has N rows (< dur)` when the 1 Hz
+  sidecar fell short (recorded, never a failure, as in the hand drivers). A node that held
+  more than 16384 open fds stops the campaign after its cell (`STOP`, `bad:stop-fd`).
+  `DRIVER show`: `SAMPLERS on du mem metrics fd soak-1hz vmstat rocksdb-log fd_stop=16384` and
+  `SOAK on <path> metrics-1hz.txt.gz host-1hz.tsv`; `"samplers": false` turns all of them off.
 - **Host checks** (spec `host_checks`, default on): the `run` preflight requires MemAvailable
   >= `min_mem_avail_gb` (40) and every `sysctl` value the spec gives. The dirty limits
   (`vm.dirty_bytes`, `vm.dirty_background_bytes`) that the spec does not give are pinned to the
@@ -730,7 +743,9 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   (`dry`, `launch`, `run`) sources the file (missing, unreadable or a non-zero return =
   `PREFLIGHT FAIL`), requires each function defined (`declare -F`), and fails when the file
   redefines a driver function or a driver variable (`DRIVER_VARS`). The file is sourced
-  inside a function: a top-level `declare -A` in it needs `-g`. After every cell (warm-up,
+  inside a function: a top-level `declare -A` / `declare -a` in it needs `-g` (else it is a
+  local of that function, gone after the preflight, with no error from bash); preflight prints
+  `PREFLIGHT WARN: <file>:<line>: ...` for each one without `-g` (column 0 only) and goes on. After every cell (warm-up,
   smoke, measured; after the standard checks, before the gate) each function is called as
   `fn <label> <arm>` (label = `<label_prefix>-<tag>`, the cell dir is `$R/<label>`), in a
   subshell, with the driver's variables available: `R` (results root), `AENV[arm]` (the
@@ -845,8 +860,8 @@ harness worktree's. `PREFLIGHT OK` names the `genesis_root`.
 **Not supported** (hand-write the driver from the closest earlier one, as before, and say
 which shape did not fit): crash / restart cells (`CRASH_KILL_AT_S`, `KILL_*`: a SPEC
 ERROR); per-arm market count, duration or rate; samplers beyond the Job 4 driver's
-in-driver ones above (perf off-CPU windows, the soak sidecar `soak-sampler.py`, the cpu, io
-and task samplers: scripts outside tools/matched-bench); campaign-specific hard checks
+in-driver ones above (perf off-CPU windows, the cpu, io and task samplers: scripts outside
+tools/matched-bench); campaign-specific hard checks
 that need more than `fn <label> <arm>` after a cell (checks that run during a cell or
 compare cells); more than 3 nodes; several campaigns in one unit (pilot + grid: generate one
 driver each and launch them in turn); post-campaign steps (off-CPU processing).
@@ -858,7 +873,8 @@ and sampler functions verbatim, the cell() wiring in order, and their sysctl, Me
 and fd-stop values; env and md5 checks on fixture cells and a fake /proc; the generated
 cell() run for real against a fake detach.sh, systemctl and run-cell.sh: a stub node that
 exits gives node-death.txt and a `bad:...death` row, memguard stops the unit on a stubbed
-meminfo, samplers and host checks off leave no records; the campaign loop against the same
+meminfo, the soak sampler scrapes fake /metrics servers in the hand drivers' format and is gone
+when the cell ends, samplers and host checks off leave no records; the campaign loop against the same
 fakes: a failing warm-up gate (each condition, a node death, the smoke cell) stops before the
 measured cells, `gate: false` goes on, campaign checks run on every cell with label, arm, `R`
 and `AENV`, a failing one is `bad:check` + stop, a missing function or source fails preflight;
