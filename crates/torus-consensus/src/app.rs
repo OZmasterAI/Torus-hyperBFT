@@ -7865,10 +7865,11 @@ impl App<RocksKVStore> for TorusApp {
             ExecSource::Durable(_) => &[],
         };
         // Item 7 step 2 (decision 7): the in-flight filter (every commit, also to expire entries).
+        // The lost-proposal reinsert and the re-send follow below, once this header's N and M
+        // are in the prediction.
         if let Some(ref mempool) = self.mempool {
             mempool.remove_committed_evm(height, committed_evm);
         }
-        self.reinsert_lost_evm(height, committed_evm);
 
         // S444 AT-LEAST-ONCE FEED GUARD: hotstuff's committed-block feed is
         // replayed from a durable frontier (the min-height exec-feed gap fix),
@@ -7925,8 +7926,12 @@ impl App<RocksKVStore> for TorusApp {
             // re-runs live at hit time).
         }
 
-        // Item 7 step 2 (decision 7): after the in-flight filter and the lost-proposal
-        // reinsert above, and with this header's N and M in the prediction.
+        // Item 7 step 2 (decision 7): after the in-flight filter above, the lost-proposal
+        // reinsert, then the re-send, both predicting with this header's N and M (Codex P2 on
+        // C6: tracking before the update targeted a boundary's lost txs under the old N). A
+        // re-delivery below the exec frontier returned above: that height was settled at its
+        // first delivery.
+        self.reinsert_lost_evm(height, committed_evm);
         self.resend_due_evm(height);
 
         // Slashes detected during THIS commit ride with THIS block into the
@@ -23041,6 +23046,100 @@ mod crash_recovery_tests {
             .map(|tx| (tx, 0))
             .collect();
         assert_eq!(due, want, "the lost txs, tracked at 10");
+    }
+
+    /// Item 7 step 2 (decision 7, Codex P2 on C6): a boundary block that lowers N (100 -> 5,
+    /// no upcoming N cached) and where our proposal lost: its txs are tracked at the next
+    /// height under the new N, 105, not under the old one, 200. RED before: the lost-proposal
+    /// tracking ran before the committed header set N, so it targeted 200.
+    #[test]
+    fn lost_proposal_txs_are_tracked_under_the_committed_boundarys_interval() {
+        let (mut app, rx, pool, txs) = evm_pool_app_with_recording_exec(1);
+        let (ls, sent) = evm_resend_rig(&mut app);
+        app.epoch_length = 50;
+        app.last_header = make_block(99, vec![]).header;
+        app.last_header.evm_block_interval = 100;
+        ls.set_evm_block_interval(100);
+        *ls.upcoming.write().unwrap() = None;
+        *ls.tip.write().unwrap() = (40, 102);
+        let plan = EpochRotationPlan {
+            boundary: 100,
+            members: vec![],
+            deletes: vec![],
+            rotations: vec![],
+            changed: false,
+            evm: PlanEvm {
+                block_interval: Some(5),
+                ..Default::default()
+            },
+        };
+        let mut key = b"epoch_vset:plan:".to_vec();
+        key.extend_from_slice(&100u64.to_be_bytes());
+        app.state_db
+            .put_cf_raw(CF_CONSENSUS_META, &key, &borsh::to_vec(&plan).unwrap())
+            .unwrap();
+        app.state_db
+            .put_cf_raw(
+                CF_CONSENSUS_META,
+                META_NATIVE_APPLIED_HEIGHT,
+                &50u64.to_be_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO),
+            txs,
+            "drained into our proposal at 100"
+        );
+        app.own_evm_proposed.insert(100, txs.clone());
+
+        app.exec_next_height = Some(100);
+        let mut block = make_block(100, vec![]);
+        block.header.evm_block_interval = 5;
+        let committed = committed_compact_block(&block);
+        app.on_committed_block(&committed, committed.hash);
+        rx.try_recv().expect("height 100 must reach execution");
+
+        assert_eq!(ls.next_evm_targets(torus_mempool::EvmLane::Small).0, 105);
+        assert!(sent.lock().unwrap().is_empty(), "tracked, not sent");
+        assert!(pool.evm_due_resends(104).is_empty());
+        let hash = torus_mempool::evm_tx_hash(&txs[0]).unwrap();
+        assert_eq!(
+            pool.evm_due_resends(105)
+                .iter()
+                .map(|r| (r.hash, r.sends))
+                .collect::<Vec<_>>(),
+            vec![(hash, 0)],
+            "tracked at 105, the new N's next height"
+        );
+        assert!(
+            pool.evm_due_resends(200).is_empty(),
+            "not at the old N's 200"
+        );
+    }
+
+    /// Item 7 step 2 (decision 7, Codex P3 on C6): a forwarded tx whose target heights keep
+    /// committing without it is re-sent exactly `EVM_RESEND_MAX` times, then only waits in
+    /// the pool. RED before: the inclusive guard re-tracked it at `EVM_RESEND_MAX` sends, so a
+    /// ninth re-send followed.
+    #[test]
+    fn a_tracked_tx_is_resent_at_most_evm_resend_max_times() {
+        let (mut app, _rx, pool, txs) = evm_pool_app_with_recording_exec(1);
+        let (ls, sent) = evm_resend_rig(&mut app);
+        ls.set_evm_block_interval(5);
+        pool.track_evm_forward(torus_mempool::evm_tx_hash(&txs[0]).unwrap(), 5, 0);
+        for height in (5..=100).step_by(5) {
+            *ls.tip.write().unwrap() = (40, height + 2);
+            app.resend_due_evm(height);
+        }
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            usize::from(torus_mempool::EVM_RESEND_MAX),
+            "one forward per re-send, one leader per small-lane target"
+        );
+        assert!(
+            pool.evm_due_resends(u64::MAX).is_empty(),
+            "no longer tracked"
+        );
     }
 
     /// `pending_proposals[5]` is overwritten when another proposer's block at

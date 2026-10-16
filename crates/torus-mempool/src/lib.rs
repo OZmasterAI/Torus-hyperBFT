@@ -933,9 +933,10 @@ impl Mempool {
     }
 
     /// Item 7 step 2 (decision 7): remember a forwarded tx and the EVM height it targets, with
-    /// its sends so far (above `EVM_RESEND_MAX` it is not tracked).
+    /// its re-sends so far (at `EVM_RESEND_MAX` none is left: it is not tracked, so a tx is
+    /// re-sent at most `EVM_RESEND_MAX` times).
     pub fn track_evm_forward(&self, hash: B256, target: u64, sends: u8) {
-        if sends <= EVM_RESEND_MAX {
+        if sends < EVM_RESEND_MAX {
             self.evm_resend
                 .lock()
                 .unwrap()
@@ -5837,8 +5838,8 @@ mod tests {
 
     /// Item 7 step 2 (decision 7): the tracked txs whose target height has committed and that
     /// are still pooled come back once, with their bytes, lane and send count; the committed
-    /// one does not. A tx tracked past `EVM_RESEND_MAX` sends never comes back. RED before: no
-    /// tracker (compile error).
+    /// one does not. A tx tracked with `EVM_RESEND_MAX` sends never comes back. RED before: no
+    /// tracker (compile error); then (Codex P3) one tracked at `EVM_RESEND_MAX` came back.
     #[test]
     fn due_resends_are_the_tracked_txs_still_pooled_past_their_target() {
         let (_dir, state) = setup();
@@ -5864,14 +5865,15 @@ mod tests {
         assert_eq!(pool.evm_due_resends(10), vec![due.clone()]);
         assert!(pool.evm_due_resends(10).is_empty(), "left the tracker");
 
-        pool.track_evm_forward(ht, 11, EVM_RESEND_MAX + 1);
-        pool.track_evm_forward(ht, 12, EVM_RESEND_MAX);
+        // Codex P3 on C6: `sends` re-sends done; at `EVM_RESEND_MAX` none is left.
+        pool.track_evm_forward(ht, 11, EVM_RESEND_MAX);
+        pool.track_evm_forward(ht, 12, EVM_RESEND_MAX - 1);
         assert!(
             pool.evm_due_resends(11).is_empty(),
-            "past the cap: never tracked"
+            "at the cap: never tracked"
         );
         let last = EvmResend {
-            sends: EVM_RESEND_MAX,
+            sends: EVM_RESEND_MAX - 1,
             ..due
         };
         assert_eq!(pool.evm_due_resends(12), vec![last]);
