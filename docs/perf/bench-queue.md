@@ -9,7 +9,7 @@ Last archy bench: `ozarchy-hsdb`, 71.8 option A A/B (section 74 of `ozarchy-anti
 Every campaign uses the N = 11 bench genesis (rebuilt once with `FORCE=1`, step 1). Arms that compare against main
 share one binary and one all-off baseline inside a campaign.
 
-**Now, on current main** (s125: main carries KP, DB and PC, flags off; propose-defer is getting review fixes on 18c):
+**Now, on current main** (s125: main carries KP, DB and PC, flags off; propose-defer is ON HOLD, see step 6):
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
    cell and its checks (Q5 below). Gates every later campaign.
@@ -35,7 +35,9 @@ share one binary and one all-off baseline inside a campaign.
    Fallback: if PC is not merged when archy reaches this step, run the other 5 arms, and give PC its own
    base vs PC pair later on the same shape.
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
-6. **Campaign B, Q4 propose-defer**, its own campaign (consensus timing: watch view timeouts and exec lag), same shape,
+6. **Campaign B, Q4 propose-defer: ON HOLD, do not run** (s125: its second Codex re-review found an equivocation
+   and a delayed Nudge with the flag on; the owner decides between one more fix round and parking it). If it
+   merges: its own campaign (consensus timing: watch view timeouts and exec lag), same shape,
    3 arms: (a) base (`TORUS_EXEC_QUEUE_DEPTH` and `TORUS_PROPOSE_EXEC_WATERMARK` absent); (b) control
    `TORUS_EXEC_QUEUE_DEPTH=16` (the same short exec queue, still a blocking send); (c)
    `TORUS_PROPOSE_EXEC_WATERMARK=16`. Without (b), a gain cannot be split between the deferral and the shorter
@@ -45,7 +47,8 @@ share one binary and one all-off baseline inside a campaign.
 
 7. **Q6. 71.8 checkpoint slicing** vs M. Run after step 4 has settled the Q1 / Q4 defaults (both touch checkpoint
    code, so they move slicing's baseline).
-8. **Q7. Item 7 step 2** vs M.
+8. **Q7. Item 7 step 2** vs M. Status s125: C1-C4, C7, C8 built and Codex-clean on `feat/item7-step2`; C5, C6,
+   C9, C10 (incl. the 18c devnet check) still to build.
 
 If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and save-books rows of the Q8 profile
 (a short re-run, not a full profile).
@@ -69,7 +72,8 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   (`TORUS_CKPT_DEFER_BOOKS`). Status s125: exec-action-keys, defer-book-blobs and parallel-cancel-all (after its Codex fixes:
   flag-off allocations = main, flag on looks up only targeted books; re-review clean, merge `7f9bb3a9`) are merged
   into main with the flags off, so campaign A has all 6 arms; propose-defer (repeated store reads while deferring,
-  flag-wiring tests) gets its fixes and a re-review before it merges (campaign B waits for it). Three run in campaign A, the winners together in step 5, propose-defer in campaign B.
+  flag-wiring tests, then a winning-TC re-proposal fix) is still unmerged: its second re-review found an equivocation
+  when a late winning TC's block body is missing and a delayed Nudge (flag on only); on hold for an owner decision. Three run in campaign A, the winners together in step 5, propose-defer in campaign B.
   Arm values and the shape: step 4 and step 6 above; branch notes in `/home/18c/projects/wt/exp-s123/<name>.md`
   (18c).
 - **Q5. Native vs native + EVM transfers** at N = 11 (main `639ab185` and later; `EVM_LOAD_RATE` and
