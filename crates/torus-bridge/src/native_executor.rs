@@ -4660,6 +4660,11 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// also walks all balances and positions for the value-sum gauge and log
     /// line. Never read by execution. Default false.
     pub liq_value_sum: bool,
+    /// Item 7 step 2 (F3): at an epoch boundary, the EVM header values of the closing epoch (the
+    /// boundary's parent header); `None` off a boundary. Set by the block pipeline.
+    pub evm_fee_window: Option<torus_types::EvmHeaderValues>,
+    /// Item 7 step 2 (F3): this block's EVM gas, `(small lane, big lane)`.
+    pub evm_gas: (u64, u64),
 
     /// T1.5: set (never cleared) when a market worker panicked mid-matching.
     /// The panicking worker consumed its market's `OrderBook`, so this block's
@@ -5230,6 +5235,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             fill_effects_scratch: Vec::new(),
             metrics: None,
             liq_value_sum: false,
+            evm_fee_window: None,
+            evm_gas: (0, 0),
             fatal_error: load_error,
             reader_fault: std::sync::OnceLock::new(),
             book_mode,
@@ -12583,6 +12590,7 @@ impl NativeExecutor {
                 ctx.max_validators,
                 ctx.block_height,
                 ctx.epoch_length,
+                ctx.evm_fee_window,
             ) {
                 Ok(new_set) => {
                     if let Some(ref m) = ctx.metrics {
@@ -12608,6 +12616,19 @@ impl NativeExecutor {
                 }
             },
         )
+    }
+
+    /// Item 7 step 2 (F3): add this block's EVM gas to the epoch row, after `process_epoch_boundary`
+    /// (a boundary's own gas starts the next epoch). No EVM gas: no read, no write.
+    pub fn add_block_evm_gas<T: StateBackend>(ctx: &mut NativeExecContext<T>) {
+        let (gas, big_gas) = ctx.evm_gas;
+        if (gas, big_gas) == (0, 0) {
+            return;
+        }
+        if let Err(e) = torus_economics::add_epoch_evm_gas(&ctx.state, gas, big_gas) {
+            tracing::error!(%e, height = ctx.block_height, "epoch EVM gas write failed");
+            Self::latch_local_fault(ctx, "epoch EVM gas", &e);
+        }
     }
 
     /// Process pending governance proposals: one result per proposal outcome.

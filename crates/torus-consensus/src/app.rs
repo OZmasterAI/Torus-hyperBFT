@@ -2090,18 +2090,26 @@ fn parent_block_ms<B: StateBackend>(
         // The genesis parent header's timestamp.
         return Ok(torus_types::eip712::block_timestamp_ms(0));
     }
-    let parent = height - 1;
-    let Some(row) = state.get_cf_raw(CF_BLOCK_HEADERS, &parent.to_be_bytes())? else {
+    let parent = header_at(state, height - 1)?;
+    Ok(torus_types::eip712::block_timestamp_ms(parent.timestamp))
+}
+
+/// The committed header at `height` (its `CF_BLOCK_HEADERS` row: 32-byte hash ‖ JSON). An absent
+/// or undecodable row is a local fault (`Err`): the caller fail-stops.
+fn header_at<B: StateBackend>(
+    state: &B,
+    height: u64,
+) -> Result<TorusBlockHeader, torus_state::StateError> {
+    let Some(row) = state.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes())? else {
         return Err(torus_state::StateError::InvalidData(format!(
-            "D12: parent header {parent} missing"
+            "D12: parent header {height} missing"
         )));
     };
     row.get(32..)
         .and_then(|json| serde_json::from_slice::<TorusBlockHeader>(json).ok())
-        .map(|parent| torus_types::eip712::block_timestamp_ms(parent.timestamp))
         .ok_or_else(|| {
             torus_state::StateError::InvalidData(format!(
-                "D12: parent header {parent} does not decode"
+                "D12: parent header {height} does not decode"
             ))
         })
 }
@@ -3236,6 +3244,8 @@ impl ExecutionContext {
         let mut bundle = BundleState::default();
         let mut bundle_extras = torus_state::HashExtras::new();
         let mut computed_fee_revenue: u128 = 0;
+        // Item 7 step 2 (F3): this block's EVM gas `(small lane, big lane)`, added to the epoch row.
+        let mut evm_gas = (0u64, 0u64);
         // Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
         // the EVM block's consensus writes (bundle, hashed mirror, incremental
         // trie nodes, writer-precompile queue rows) are BUILT here and written
@@ -3273,6 +3283,10 @@ impl ExecutionContext {
                     }
                     // Item 7 step 2: each tx at its lane's base fee (`validate_block_inner`).
                     computed_fee_revenue = validated.fee_revenue;
+                    evm_gas = (
+                        validated.gas_used.saturating_sub(validated.big_gas_used),
+                        validated.big_gas_used,
+                    );
                     // T4.1: reuse the validation-time (root, TrieUpdates) pair — computed by the
                     // ONE StateRoot run inside validate_block_for_catchup over this same committed
                     // base — so the commit never recomputes the EVM root for this block.
@@ -3461,6 +3475,7 @@ impl ExecutionContext {
         // Bug (b): every boundary block runs it too (validator-set plans).
         let run_native = if has_native
             || computed_fee_revenue > 0
+            || evm_gas != (0, 0)
             || core_writer_due
             || EpochManager::is_epoch_boundary(height, self.epoch_length)
         {
@@ -3750,6 +3765,31 @@ impl ExecutionContext {
                 );
                 return;
             }
+            // Item 7 step 2 (F3): at a boundary, the closing epoch's values (its parent header) set
+            // the next base fees. A read fault fail-stops, as the nonce window's parent read. One
+            // header read per epoch boundary (through the overlay: a pipelined boundary on the
+            // epoch fast path reads what the barrier path reads).
+            let fee_window = if EpochManager::is_epoch_boundary(height, self.epoch_length) {
+                let parent = if height <= 1 {
+                    Ok(self.genesis_header.clone())
+                } else {
+                    header_at(&overlay, height - 1)
+                };
+                match parent {
+                    Ok(p) => Some(torus_types::EvmHeaderValues::of(&p)),
+                    Err(e) => {
+                        self.fail_stop_on_fault(
+                            torus_block,
+                            fold_header,
+                            "F3 parent header read",
+                            &e,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             // PROFILER (s470): with the resident holder cold or disabled, the
             // context constructor scans cf_native_order_books and rebuilds
             // EVERY resting order into memory — O(total resting depth) per
@@ -3825,6 +3865,8 @@ impl ExecutionContext {
                 }
             }
             ctx.metrics = self.metrics.clone();
+            ctx.evm_fee_window = fee_window;
+            ctx.evm_gas = evm_gas;
             // Plan 9.8: the test-only reference paths (bridge feature
             // `test-reference-paths`, enabled by this crate's dev-dependency).
             #[cfg(test)]
@@ -3973,6 +4015,7 @@ impl ExecutionContext {
             NativeExecutor::process_governance(&mut ctx);
             NativeExecutor::distribute_fees(&mut ctx, computed_fee_revenue);
             NativeExecutor::process_epoch_boundary(&mut ctx);
+            NativeExecutor::add_block_evm_gas(&mut ctx);
             // Row 74: a local storage fault in governance, staking (the
             // batches' handlers latch too, caught above), fees or the epoch
             // boundary fail-stops exactly like the checks above.
@@ -20671,6 +20714,97 @@ mod crash_recovery_tests {
         assert_eq!(read_running_hash(&db), Some(fold_captured(&captured)));
     }
 
+    /// Item 7 step 2 (F3): blocks 1-4 at N = 1, M = 0, epoch 4 (Codex plan check s125: the
+    /// headers set N = 1, else the window [1, 4) has no EVM height at `make_block`'s N = 5).
+    /// 9M small gas sits in the epoch row before block 1 and block 2 adds its 21k: boundary 4
+    /// sets plan(8)'s small fee to exactly 1.125 gwei (9,021,000 over the 9M window limit counts
+    /// as 9M = 2x the 4.5M target: +12.5%; unclamped 1,125,583,333), the big fee stays 1 gwei
+    /// (no big height), and the row then holds only block 4's own gas. Serial and pipelined
+    /// leave identical state; an EVM-free block 4 on the epoch fast path (a pipelined boundary)
+    /// sets the same fees as the serial path.
+    #[test]
+    fn f3_epoch_gas_sets_plan_fees_serial_and_pipelined() {
+        use torus_economics::epoch_evm_gas;
+        let key = k256::ecdsa::SigningKey::from_slice(&[64u8; 32]).unwrap();
+        let blocks = |evm_at_4: bool| {
+            let mut blocks: Vec<TorusBlock> = (1..=4).map(|h| make_block(h, vec![])).collect();
+            for b in &mut blocks {
+                b.header.evm_block_interval = 1;
+                b.header.evm_big_block_interval = 0;
+            }
+            let transfer = |nonce| {
+                signed_eip1559_gas(
+                    &key,
+                    nonce,
+                    alloy_primitives::TxKind::Call(Address::repeat_byte(0x42)),
+                    vec![],
+                    U256::from(1u64),
+                    21_000,
+                )
+            };
+            blocks[1].evm_transactions = vec![transfer(0)];
+            blocks[1].header.evm_tx_count = 1;
+            if evm_at_4 {
+                blocks[3].evm_transactions = vec![transfer(1)];
+                blocks[3].header.evm_tx_count = 1;
+            }
+            link_blocks(&mut blocks);
+            blocks
+        };
+        let run = |on: bool, fast: bool, evm_at_4: bool| {
+            let (_cfg, db) = make_test_config_and_db();
+            db.put_account(
+                &k256_address(&key),
+                &revm::state::AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    nonce: 0,
+                    code_hash: KECCAK_EMPTY_CODE,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+            torus_economics::add_epoch_evm_gas(&db, 9_000_000, 0).unwrap();
+            let mut ctx = pipeline_ctx(&db, on, None);
+            ctx.epoch_fast_path = fast;
+            for b in &blocks(evm_at_4) {
+                dispatch_and_execute(&ctx, &db, b);
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "on={on} fast={fast}"
+                );
+            }
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle());
+            }
+            drop(ctx);
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(4),
+                "on={on} fast={fast}"
+            );
+            let plan8 = StakingManager::new(db.clone())
+                .epoch_rotation_plan(8)
+                .unwrap()
+                .expect("plan(8) stored at boundary 4");
+            let fees = (plan8.evm.base_fee, plan8.evm.big_base_fee);
+            (fees, epoch_evm_gas(&db).unwrap(), dump_all_cfs(&db))
+        };
+        let want = (Some(1_125_000_000), Some(1_000_000_000));
+        let (fees, row, serial) = run(false, false, true);
+        assert_eq!(fees, want);
+        assert_eq!(row, (21_000, 0), "block 4's own gas starts the next epoch");
+        let (fees, row, piped) = run(true, false, true);
+        assert_eq!((fees, row), (want, (21_000, 0)));
+        assert_dumps_equal(&serial, &piped, "F3 serial vs pipelined");
+        // EVM-free boundary: serial vs the epoch fast path (pipelined boundary).
+        let (fees, row, serial) = run(false, false, false);
+        assert_eq!((fees, row), (want, (0, 0)));
+        let (fees, row, fast) = run(true, true, false);
+        assert_eq!((fees, row), (want, (0, 0)));
+        assert_dumps_equal(&serial, &fast, "F3 serial vs epoch fast path");
+    }
+
     /// s114 (CoreWriter follow-up 1): block 1's EVM txs queue CoreWriter rows
     /// for block 2 (one call, a reverted call, two calls in one tx); the
     /// committed-block path writes one `CF_CORE_WRITER_TX` row per queued
@@ -21788,9 +21922,15 @@ mod crash_recovery_tests {
             "plan(8) pruned when 12 executed"
         );
         assert_eq!(app.boundary_evm(8), Err(EpochPlanNotReady));
+        // Item 7 step 2 (F3): every boundary sets both plan fees; an idle epoch at 1 gwei stays
+        // at the floor.
         assert_eq!(
             app.boundary_evm(12),
-            Ok(Some(PlanEvm::default())),
+            Ok(Some(PlanEvm {
+                base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
+                big_base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
+                ..PlanEvm::default()
+            })),
             "plan(12) kept until 16 executes"
         );
         drop(ctx);
@@ -21870,6 +22010,9 @@ mod crash_recovery_tests {
         let changed = PlanEvm {
             gas_limit: Some(5_000_000),
             block_interval: Some(10),
+            // Item 7 step 2 (F3): every boundary's execution sets both fees (idle: the floor).
+            base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
+            big_base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
             ..PlanEvm::default()
         };
         let put_rows = |db: &StateDb| {
@@ -21941,7 +22084,12 @@ mod crash_recovery_tests {
             dispatch_and_execute(&ctx, &db, &make_block(h, vec![]));
         }
         assert!(!ctx.exec_failed.load(Ordering::SeqCst));
-        assert_eq!(app.boundary_evm(8), Ok(Some(PlanEvm::default())));
+        let fees_only = PlanEvm {
+            base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
+            big_base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
+            ..PlanEvm::default()
+        };
+        assert_eq!(app.boundary_evm(8), Ok(Some(fees_only)));
         assert_eq!(app.boundary_evm(12), Ok(Some(changed)));
         drop(ctx);
     }
@@ -21957,6 +22105,9 @@ mod crash_recovery_tests {
         let changed = PlanEvm {
             big_block_interval: Some(190),
             big_gas_limit: Some(15_000_000),
+            // Item 7 step 2 (F3): every boundary's execution sets both fees (idle: the floor).
+            base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
+            big_base_fee: Some(torus_types::EVM_MIN_BASE_FEE),
             ..PlanEvm::default()
         };
         let big_values =

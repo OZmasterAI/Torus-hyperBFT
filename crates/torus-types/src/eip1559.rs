@@ -16,6 +16,9 @@ const BASE_FEE_MAX_CHANGE_DENOMINATOR: u64 = 8;
 /// The minimum increase is 1 wei when the block is over-target,
 /// ensuring the base fee always rises under sustained congestion.
 pub fn calc_next_block_base_fee(gas_used: u64, gas_limit: u64, base_fee: u64) -> u64 {
+    // Item 7 step 2 (F3): gas above the limit counts as the limit (at most +12.5% per step): a
+    // lane's executed gas can exceed its window limit (lanes are not part of the vote).
+    let gas_used = gas_used.min(gas_limit);
     let gas_target = gas_limit / ELASTICITY_MULTIPLIER;
 
     // If gas_limit is 0 or 1 (uninitialised parent), no adjustment is possible.
@@ -32,8 +35,8 @@ pub fn calc_next_block_base_fee(gas_used: u64, gas_limit: u64, base_fee: u64) ->
         let fee_delta = (base_fee as u128 * delta as u128
             / gas_target as u128
             / BASE_FEE_MAX_CHANGE_DENOMINATOR as u128) as u64;
-        // Must increase by at least 1 when over-target.
-        base_fee + fee_delta.max(1)
+        // Must increase by at least 1 when over-target; saturates at u64::MAX.
+        base_fee.saturating_add(fee_delta.max(1))
     } else {
         let delta = gas_target - gas_used;
         let fee_delta = (base_fee as u128 * delta as u128
@@ -46,6 +49,33 @@ pub fn calc_next_block_base_fee(gas_used: u64, gas_limit: u64, base_fee: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 7 step 2 (F3, Codex plan check s125): gas above the limit counts as the limit, so
+    /// one step is at most +12.5% (a lane's executed gas can exceed its window limit).
+    #[test]
+    fn base_fee_clamps_gas_used_at_the_limit() {
+        assert_eq!(
+            calc_next_block_base_fee(45_000_000, 30_000_000, 1_000_000_000),
+            1_125_000_000
+        );
+        assert_eq!(
+            calc_next_block_base_fee(u64::MAX, 30_000_000, 1_000_000_000),
+            1_125_000_000
+        );
+    }
+
+    /// Item 7 step 2 (F3): the increase saturates at `u64::MAX` (no overflow panic).
+    #[test]
+    fn base_fee_saturates_at_u64_max() {
+        assert_eq!(
+            calc_next_block_base_fee(30_000_000, 30_000_000, u64::MAX),
+            u64::MAX
+        );
+        assert_eq!(
+            calc_next_block_base_fee(30_000_000, 30_000_000, u64::MAX - 1),
+            u64::MAX
+        );
+    }
 
     #[test]
     fn base_fee_unchanged_at_target() {
