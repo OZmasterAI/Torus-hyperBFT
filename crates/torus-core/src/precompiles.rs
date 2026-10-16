@@ -1349,6 +1349,43 @@ pub struct CoreWriterQueue;
 /// state, written only by EVM blocks (like the queue rows), the same on every node.
 pub const CORE_WRITER_LAST_ORDER_TARGET_KEY: &[u8] = b"core_writer_last_order_target";
 
+/// Codex P2 on C7: `CF_FEE_CONFIG` row (u64 BE) holding the first-open-target cursor `C`:
+/// for an enqueue in block `B`, every target in `B + 1 .. C` is full (a target loses rows
+/// only when its own block drains them, after which no enqueue targets it). An enqueue
+/// skips those targets without reading them; one whose walk covered every target from
+/// `B + 1` moves `C` past the full targets it found or filled. Hashed state like
+/// [`CORE_WRITER_LAST_ORDER_TARGET_KEY`], written only when it moves.
+pub const CORE_WRITER_FIRST_OPEN_TARGET_KEY: &[u8] = b"core_writer_first_open_target";
+
+/// Codex P2 on C7: `CF_FEE_CONFIG` row `start (8 BE) ‖ end (8 BE)`: every target in
+/// `start .. end` is full. Kept by the order kinds that land beyond `C` (K blocks ahead,
+/// where `C` cannot speak for the targets in between), so a later walk jumps the order
+/// kinds' run of full targets instead of reading each one. Hashed state, written only
+/// when it grows or restarts.
+pub const CORE_WRITER_FULL_ORDER_RUN_KEY: &[u8] = b"core_writer_full_order_run";
+
+/// A `CF_FEE_CONFIG` u64 BE row; absent or not 8 bytes = `None`.
+fn read_u64_row(state_db: &impl StateBackend, key: &[u8]) -> Result<Option<u64>, CoreError> {
+    Ok(state_db
+        .get_cf_raw(CF_FEE_CONFIG, key)?
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map(u64::from_be_bytes))
+}
+
+/// [`CORE_WRITER_FULL_ORDER_RUN_KEY`]: `Some((start, end))`; absent or not 16 bytes = `None`.
+fn read_order_run(state_db: &impl StateBackend) -> Result<Option<(u64, u64)>, CoreError> {
+    Ok(state_db
+        .get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_FULL_ORDER_RUN_KEY)?
+        .and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok())
+        .map(|v| {
+            let (start, end) = v.split_at(8);
+            (
+                u64::from_be_bytes(start.try_into().expect("8 bytes")),
+                u64::from_be_bytes(end.try_into().expect("8 bytes")),
+            )
+        }))
+}
+
 /// Queue key: target block (8 BE) ‖ seq (8 BE).
 fn queue_key(target_block: u64, seq: u64) -> [u8; 16] {
     let mut key = [0u8; 16];
@@ -1370,11 +1407,20 @@ impl CoreWriterQueue {
     /// order. Rows are queued only by EVM blocks (serial barriers), so each is in the raw DB
     /// before its target's due-check (`NativeExecutor::core_writer_due`).
     ///
+    /// Codex P2: the walk skips the targets [`CORE_WRITER_FIRST_OPEN_TARGET_KEY`] and
+    /// [`CORE_WRITER_FULL_ORDER_RUN_KEY`] know are full, so a backlog of full targets costs
+    /// no reads (the target placed is the same as probing every one). A full target neither
+    /// row covers was filled by an order kind before its run restarted, which happens only
+    /// when `block + K` passed the run's end: such targets lie below `block + K` (K <= 100),
+    /// and each is read once by the walk that then moves the cursor past it.
+    ///
     /// T4.4: takes any [`StateBackend`] so EVM execution can enqueue into a per-tx
     /// journaled overlay (durable only if the calling tx succeeds).
     pub fn enqueue(state_db: &impl StateBackend, action: &QueuedAction) -> Result<u64, CoreError> {
+        const CAP: u64 = torus_types::CORE_WRITER_DRAIN_CAP;
         let order = action.kind.is_order();
-        let mut target_block = if order {
+        let next_block = action.block_queued.saturating_add(1);
+        let candidate = if order {
             let stored = state_db.get_cf_raw(
                 CF_FEE_CONFIG,
                 torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
@@ -1384,23 +1430,35 @@ impl CoreWriterQueue {
                 &torus_types::CORE_WRITER_ORDER_DELAY_RANGE,
             )
             .unwrap_or(torus_types::DEFAULT_CORE_WRITER_ORDER_DELAY);
-            let last = state_db
-                .get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_LAST_ORDER_TARGET_KEY)?
-                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-                .map_or(0, u64::from_be_bytes);
+            let last = read_u64_row(state_db, CORE_WRITER_LAST_ORDER_TARGET_KEY)?.unwrap_or(0);
             action.block_queued.saturating_add(delay).max(last)
         } else {
-            action.block_queued.saturating_add(1) // anti-frontrunning: execute next block
+            next_block // anti-frontrunning: execute next block
         };
-        // A target's seqs are dense from 0 (rows leave only when the whole target drains),
-        // so it is full iff its last slot is taken: one point read per full block skipped.
-        while state_db
-            .get_cf_len(
-                CF_CORE_WRITER_QUEUE,
-                &queue_key(target_block, torus_types::CORE_WRITER_DRAIN_CAP - 1),
-            )?
-            .is_some()
-        {
+        // Codex P2: the walk to the first target with room skips the targets the two
+        // cursor rows know are full instead of reading each one. K >= 1, so
+        // `candidate >= next_block` and every target in `next_block .. cursor` is full.
+        let cursor = read_u64_row(state_db, CORE_WRITER_FIRST_OPEN_TARGET_KEY)?.unwrap_or(0);
+        let mut run: Option<Option<(u64, u64)>> = None; // read at the first full probe
+        let mut target_block = candidate.max(cursor);
+        loop {
+            if let Some(Some((start, end))) = run {
+                if (start..end).contains(&target_block) {
+                    target_block = end.max(cursor);
+                    continue;
+                }
+            }
+            // A target's seqs are dense from 0 (rows leave only when the whole target
+            // drains), so it is full iff its last slot is taken.
+            if state_db
+                .get_cf_len(CF_CORE_WRITER_QUEUE, &queue_key(target_block, CAP - 1))?
+                .is_none()
+            {
+                break;
+            }
+            if run.is_none() {
+                run = Some(read_order_run(state_db)?);
+            }
             target_block = target_block
                 .checked_add(1)
                 .ok_or_else(|| CoreError::Overflow("CoreWriter target block".into()))?;
@@ -1409,6 +1467,45 @@ impl CoreWriterQueue {
         let seq = Self::next_sequence(state_db, target_block)?;
         let data = borsh::to_vec(action).map_err(|e| CoreError::Borsh(e.to_string()))?;
         state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(target_block, seq), &data)?;
+
+        // Every target in `candidate .. full_end` is full now (the walk's, and this row's
+        // target if the row took its last slot).
+        let full_end = if seq == CAP - 1 {
+            target_block.saturating_add(1)
+        } else {
+            target_block
+        };
+        let known_from = cursor.max(next_block);
+        if candidate <= known_from {
+            // `next_block .. candidate` was known full too: the cursor may move.
+            if full_end > known_from {
+                state_db.put_cf_raw(
+                    CF_FEE_CONFIG,
+                    CORE_WRITER_FIRST_OPEN_TARGET_KEY,
+                    &full_end.to_be_bytes(),
+                )?;
+            }
+        } else if order && full_end > candidate {
+            // An order kind beyond the cursor: the targets between are unknown, so keep
+            // what it learnt in the run row. Order targets never move earlier, so the
+            // run either continues (`candidate` inside it) or restarts at `candidate`.
+            let old = match run {
+                Some(r) => r,
+                None => read_order_run(state_db)?,
+            };
+            let new = match old {
+                Some((start, end)) if (start..=end).contains(&candidate) => {
+                    (start, end.max(full_end))
+                }
+                _ => (candidate, full_end),
+            };
+            if old != Some(new) {
+                let mut row = [0u8; 16];
+                row[..8].copy_from_slice(&new.0.to_be_bytes());
+                row[8..].copy_from_slice(&new.1.to_be_bytes());
+                state_db.put_cf_raw(CF_FEE_CONFIG, CORE_WRITER_FULL_ORDER_RUN_KEY, &row)?;
+            }
+        }
         if order {
             // The target after the cap: a later order action never lands before this row.
             state_db.put_cf_raw(
