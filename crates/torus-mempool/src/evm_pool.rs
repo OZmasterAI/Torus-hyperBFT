@@ -138,10 +138,21 @@ impl EvmLane {
     }
 }
 
-/// Item 7 step 2: both EVM pools (and, B13, the in-flight filter) under one lock.
+/// Item 7 step 2: both EVM pools and the in-flight filter (B13) under one lock.
 pub(crate) struct EvmLanes {
     pub small: EvmPool,
     pub big: EvmPool,
+    /// Decision 7: EVM txs a committed block carried, with that height; admission refuses them
+    /// (`DuplicateTx`) for `EVM_INFLIGHT_KEEP_BLOCKS`.
+    pub committed: HashMap<B256, u64>,
+    /// Decision 7: per sender, the nonce after its highest pooled or drained tx a committed
+    /// block carried, with that height: admission refuses lower nonces and `pending_nonce`
+    /// starts there, until the state nonce reaches it, its height executes, or it expires.
+    pub committed_next: HashMap<Address, (u64, u64)>,
+    /// Decision 7: this node's drained txs (its own proposals), hash -> (sender, nonce), until
+    /// a committed block carries them or they are reinserted. No reservation at drain: a lost
+    /// proposal's txs would be refused `NonceTooLow` by `reinsert_evm`.
+    pub drained: HashMap<B256, (Address, u64)>,
 }
 
 impl EvmLanes {
@@ -149,7 +160,17 @@ impl EvmLanes {
         Self {
             small: EvmPool::new(base_fee),
             big: EvmPool::new(base_fee),
+            committed: HashMap::new(),
+            committed_next: HashMap::new(),
+            drained: HashMap::new(),
         }
+    }
+
+    /// Decision 7: remove a pooled tx from whichever pool holds it.
+    pub fn remove_by_hash(&mut self, hash: &B256) -> Option<EvmPoolEntry> {
+        self.small
+            .remove_by_hash(hash)
+            .or_else(|| self.big.remove_by_hash(hash))
     }
 
     pub fn pool(&self, lane: EvmLane) -> &EvmPool {
@@ -561,6 +582,8 @@ impl EvmPool {
     /// pooled, and so do its sender's later nonces.
     /// Task 3.1.5: `parent_hash` seeds deterministic same-tip shuffling (anti-MEV).
     /// D4 (S392): `min_base_fee` re-checks the fee floor at selection time.
+    /// Item 7 step 2 (decision 7): each selected tx goes into `drained` (hash -> sender,
+    /// nonce), so the in-flight filter finds our own proposal's txs at commit.
     pub fn drain(
         &mut self,
         gas_budget: u64,
@@ -568,6 +591,7 @@ impl EvmPool {
         sender_gas_cap: Option<u64>,
         parent_hash: &B256,
         min_base_fee: u128,
+        drained: &mut HashMap<B256, (Address, u64)>,
     ) -> Vec<Vec<u8>> {
         let mut heap = BinaryHeap::new();
         for txs in self.by_sender.values() {
@@ -623,13 +647,14 @@ impl EvmPool {
 
             gas_used += top.gas_limit;
             bytes_used += raw.len();
-            to_remove.push(
-                self.by_sender
-                    .get(&top.sender)
-                    .and_then(|m| m.get(&top.nonce))
-                    .map(|e| e.hash)
-                    .unwrap(),
-            );
+            let hash = self
+                .by_sender
+                .get(&top.sender)
+                .and_then(|m| m.get(&top.nonce))
+                .map(|e| e.hash)
+                .unwrap();
+            to_remove.push(hash);
+            drained.insert(hash, (top.sender, top.nonce));
             result.push(raw);
             *sender_gas.entry(top.sender).or_insert(0) += top.gas_limit;
 
@@ -679,6 +704,11 @@ mod tests {
         pool
     }
 
+    /// [`EvmPool::drain`] at base fee 10 with no share cap (the drained record is dropped).
+    fn drain_at(pool: &mut EvmPool, gas: u64, bytes: usize, parent: &B256) -> Vec<Vec<u8>> {
+        pool.drain(gas, bytes, None, parent, 10, &mut HashMap::new())
+    }
+
     fn senders_of(drained: &[Vec<u8>]) -> Vec<u8> {
         drained.iter().map(|raw| raw[0]).collect()
     }
@@ -688,9 +718,9 @@ mod tests {
     #[test]
     fn drain_orders_by_effective_tip_not_max_fee() {
         let mut pool = pool_with(10, &[entry(0xA, 0, 100, 1), entry(0xB, 0, 20, 9)], 100);
-        let first = pool.drain(21_000, usize::MAX, None, &B256::ZERO, 10);
+        let first = drain_at(&mut pool, 21_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&first), vec![0xB]);
-        let rest = pool.drain(21_000, usize::MAX, None, &B256::ZERO, 10);
+        let rest = drain_at(&mut pool, 21_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&rest), vec![0xA]);
     }
 
@@ -700,7 +730,7 @@ mod tests {
         // A: legacy-style (gas price 15, tip 15) -> effective 5 at base 10.
         // B: tip 6 under max 50 -> effective 6.
         let mut pool = pool_with(10, &[entry(0xA, 0, 15, 15), entry(0xB, 0, 50, 6)], 100);
-        let drained = pool.drain(42_000, usize::MAX, None, &B256::ZERO, 10);
+        let drained = drain_at(&mut pool, 42_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&drained), vec![0xB, 0xA]);
     }
 
@@ -723,7 +753,7 @@ mod tests {
             };
             let mut pool = pool_with(10, &[a.clone(), b.clone()], 100);
             assert_eq!(
-                senders_of(&pool.drain(42_000, usize::MAX, None, &parent, 10)),
+                senders_of(&drain_at(&mut pool, 42_000, usize::MAX, &parent)),
                 want
             );
             seen_a_first |= ka > kb;
@@ -740,7 +770,7 @@ mod tests {
     #[test]
     fn below_floor_tx_not_drained_and_stays_pooled() {
         let mut pool = pool_with(5, &[entry(0xA, 0, 9, 9), entry(0xB, 0, 11, 1)], 100);
-        let drained = pool.drain(1_000_000, usize::MAX, None, &B256::ZERO, 10);
+        let drained = drain_at(&mut pool, 1_000_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&drained), vec![0xB]);
         assert_eq!(pool.size(), 1);
         assert!(pool.contains(&entry(0xA, 0, 9, 9).hash));
@@ -764,10 +794,10 @@ mod tests {
             entry(0xC, 0, 100, 1),
         ];
         let mut pool = pool_with(10, &entries, 100);
-        let first = pool.drain(3_000_000, 262_144, None, &B256::ZERO, 10);
+        let first = drain_at(&mut pool, 3_000_000, 262_144, &B256::ZERO);
         assert_eq!(senders_of(&first), vec![0xA, 0xC]);
         assert_eq!(pool.size(), 2);
-        let second = pool.drain(3_000_000, 262_144, None, &B256::ZERO, 10);
+        let second = drain_at(&mut pool, 3_000_000, 262_144, &B256::ZERO);
         assert_eq!(senders_of(&second), vec![0xB, 0xB]);
         assert_eq!(pool.size(), 0);
     }
@@ -981,7 +1011,7 @@ mod tests {
             (1, entries[0].raw_rlp.len())
         );
         pool.set_base_fee(10);
-        pool.drain(1_000_000, usize::MAX, None, &B256::ZERO, 10);
+        drain_at(&mut pool, 1_000_000, usize::MAX, &B256::ZERO);
         assert_eq!(pool.size(), 0);
         assert!(pool.by_price.is_empty(), "no stale keys left in by_price");
         assert!(pool.by_hash.is_empty());

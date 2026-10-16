@@ -38,6 +38,20 @@ pub use crate::error::MempoolError;
 pub use crate::evm_pool::{EvmLane, EvmPoolEntry};
 pub use crate::native_pool::{is_cancel, is_oracle_submission, is_priority};
 
+/// Decision 7 (item 7 step 2): how long (blocks) a committed EVM tx is remembered: above the
+/// exec channel (64) plus parked blocks, so a late copy is refused until execution has
+/// confirmed (or skipped) it.
+pub const EVM_INFLIGHT_KEEP_BLOCKS: u64 = 256;
+
+/// Item 7 step 2 (decision 7): the hash a pool keys raw EVM tx bytes by (the tx hash), `None`
+/// when they do not decode (no pool holds such a tx). Decoded, not the keccak of the bytes:
+/// `decode_tx` takes the EIP-2718 bytes and alloy's network form (an RLP string header
+/// before them, what its `Encodable` writes) alike, and ignores trailing bytes, so one tx
+/// can arrive as different byte strings. No signature recovery.
+pub fn evm_tx_hash(raw: &[u8]) -> Option<B256> {
+    validate::decode_tx(raw).ok().map(|tx| *tx.tx_hash())
+}
+
 /// Timing of one [`Mempool::get_native_da_batch_timed`] call (s76).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DaBatchTiming {
@@ -768,8 +782,19 @@ impl Mempool {
 
         let mut lanes = self.evm.write().unwrap();
 
-        if lanes.lane_of(&hash).is_some() {
+        // Decision 7: a committed block carried this tx, or a nonce at or above this one of its
+        // sender, and execution may not have moved the state nonce yet.
+        if lanes.lane_of(&hash).is_some() || lanes.committed.contains_key(&hash) {
             return Err(MempoolError::DuplicateTx(hash));
+        }
+        if let Some(&(minimum, _)) = lanes.committed_next.get(&entry.sender) {
+            if entry.nonce < minimum {
+                return Err(MempoolError::NonceTooLow {
+                    sender: entry.sender,
+                    have: entry.nonce,
+                    minimum,
+                });
+            }
         }
         // Item 7 step 2: one lane per sender. If nonce n waited in one pool and n + 1 in the
         // other, the other drain could take n + 1 first; execution skips it (nonce too high).
@@ -823,7 +848,18 @@ impl Mempool {
     /// `NonceTooLow`, txs pooled again as `DuplicateTx`. A full per-sender or
     /// pool cap makes room for it (see [`evm_pool::EvmPool::reinsert`]); any
     /// other refusal loses the tx, so it is logged at warn.
+    ///
+    /// Item 7 step 2 (decision 7): each tx leaves `drained` (pooled again or lost), also when
+    /// re-admission refuses it; a committed copy is `DuplicateTx`, a committed nonce
+    /// `NonceTooLow` (both done).
     pub fn reinsert_evm(&self, raw_txs: Vec<Vec<u8>>) {
+        if !self.evm.read().unwrap().drained.is_empty() {
+            let hashes: Vec<B256> = raw_txs.iter().filter_map(|raw| evm_tx_hash(raw)).collect();
+            let mut lanes = self.evm.write().unwrap();
+            for hash in &hashes {
+                lanes.drained.remove(hash);
+            }
+        }
         for raw in raw_txs {
             match self.admit_evm_tx(raw, true) {
                 Ok(_)
@@ -832,6 +868,48 @@ impl Mempool {
                 Err(e) => tracing::warn!("drained EVM tx not reinserted: {e}"),
             }
         }
+    }
+
+    /// Item 7 step 2 (decision 7, in-flight filter): the EVM txs committed block `height`
+    /// carries leave every pool now, not when execution confirms their nonces (the exec lag
+    /// is ~14 s at load), so a re-sent or late-forwarded copy is not proposed twice. Their
+    /// copies are refused for `EVM_INFLIGHT_KEEP_BLOCKS` and each sender's next nonce
+    /// counts them, from a pooled tx or our own drained one. A tx this node never held
+    /// reserves no nonce (owner s125: no signature recovery on the consensus thread).
+    /// Called on every commit, also to expire entries. Returns the txs removed from a pool.
+    pub fn remove_committed_evm(&self, height: u64, committed: &[Vec<u8>]) -> usize {
+        let hashes: Vec<B256> = committed
+            .iter()
+            .filter_map(|raw| evm_tx_hash(raw))
+            .collect();
+        let keep_from = height.saturating_sub(EVM_INFLIGHT_KEEP_BLOCKS);
+        let (mut removed, mut freed) = (0usize, 0usize);
+        {
+            let mut lanes = self.evm.write().unwrap();
+            lanes.committed.retain(|_, h| *h >= keep_from);
+            lanes.committed_next.retain(|_, (_, h)| *h >= keep_from);
+            for hash in hashes {
+                lanes.committed.insert(hash, height);
+                let hit = match lanes.remove_by_hash(&hash) {
+                    Some(e) => {
+                        removed += 1;
+                        freed += e.raw_rlp.len();
+                        Some((e.sender, e.nonce))
+                    }
+                    // Our own proposal's txs left the pool at drain.
+                    None => lanes.drained.remove(&hash),
+                };
+                if let Some((sender, nonce)) = hit {
+                    let next = lanes.committed_next.entry(sender).or_insert((0, height));
+                    *next = (next.0.max(nonce.saturating_add(1)), height);
+                }
+            }
+        }
+        if freed > 0 {
+            self.memory_used
+                .fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Drain the SMALL lane's EVM transactions for a block proposal (item 7
@@ -859,13 +937,18 @@ impl Mempool {
         // D4 re-check at the proposed header's fee (item 7 step 2): a tx below it would be
         // skipped at execution. Admission keeps the committed floor.
         let min_base_fee = base_fee as u128;
-        let drained = self.evm.write().unwrap().small.drain(
-            budget,
-            torus_types::MAX_EVM_BLOCK_TX_BYTES,
-            sender_gas_cap,
-            &parent_hash,
-            min_base_fee,
-        );
+        let drained = {
+            let mut guard = self.evm.write().unwrap();
+            let lanes = &mut *guard;
+            lanes.small.drain(
+                budget,
+                torus_types::MAX_EVM_BLOCK_TX_BYTES,
+                sender_gas_cap,
+                &parent_hash,
+                min_base_fee,
+                &mut lanes.drained,
+            )
+        };
         // FIX EVM-FIND-02: Decrement memory for drained transactions.
         let drained_bytes: usize = drained.iter().map(|tx| tx.len()).sum();
         if drained_bytes > 0 {
@@ -943,13 +1026,18 @@ impl Mempool {
             pct => Some(gas_limit.saturating_mul(pct as u64) / 100),
         };
         let min_base_fee = big_base_fee as u128;
-        let drained = self.evm.write().unwrap().big.drain(
-            gas_limit,
-            byte_budget,
-            sender_gas_cap,
-            &parent_hash,
-            min_base_fee,
-        );
+        let drained = {
+            let mut guard = self.evm.write().unwrap();
+            let lanes = &mut *guard;
+            lanes.big.drain(
+                gas_limit,
+                byte_budget,
+                sender_gas_cap,
+                &parent_hash,
+                min_base_fee,
+                &mut lanes.drained,
+            )
+        };
         let bytes: usize = drained.iter().map(Vec::len).sum();
         if bytes > 0 {
             self.memory_used
@@ -1894,9 +1982,14 @@ impl Mempool {
         let account = self.ingress_state().get_account(sender).ok().flatten();
         let state_nonce = account.map(|a| a.nonce).unwrap_or(0);
         // Item 7 step 2: the small pool, then the big pool from where it stopped (a sender holds
-        // one lane at a time; this also covers one caught between the two).
+        // one lane at a time; this also covers one caught between the two). Decision 7: from
+        // the nonce after the sender's committed, not yet executed txs.
         let lanes = self.evm.read().unwrap();
-        let after_small = lanes.small.pending_nonce(sender, state_nonce);
+        let start = lanes
+            .committed_next
+            .get(sender)
+            .map_or(state_nonce, |&(next, _)| next.max(state_nonce));
+        let after_small = lanes.small.pending_nonce(sender, start);
         lanes.big.pending_nonce(sender, after_small)
     }
 
@@ -1937,35 +2030,52 @@ impl Mempool {
     /// Prune all senders in the EVM pool against current state nonces.
     /// Call this on every block commit so non-proposing validators clean up
     /// txs that were included by other validators' blocks.
-    pub fn prune_committed_txs(&self) {
+    ///
+    /// Item 7 step 2 (decision 7): `executed_height` is the applied marker of the DB the state
+    /// nonces are read from (read before them). A sender's in-flight entry ends once its state
+    /// nonce reaches it or its height is at or below `executed_height`: the state nonce is
+    /// authoritative there, so a tx execution skipped releases its nonce then, not after
+    /// `EVM_INFLIGHT_KEEP_BLOCKS`. A `drained` entry below its sender's state nonce goes too
+    /// (a leak bound: each normally settles at its height, committed or reinserted).
+    pub fn prune_committed_txs(&self, executed_height: u64) {
         let senders: Vec<alloy_primitives::Address> = {
-            // Item 7 step 2: both lanes (a sender is in one at a time).
+            // Item 7 step 2: both lanes (a sender is in one at a time) and the in-flight filter.
             let lanes = self.evm.read().unwrap();
-            let mut senders = lanes.small.all_senders();
+            let mut senders: std::collections::HashSet<Address> =
+                lanes.small.all_senders().into_iter().collect();
             senders.extend(lanes.big.all_senders());
-            senders
+            senders.extend(lanes.committed_next.keys().copied());
+            senders.extend(lanes.drained.values().map(|&(sender, _)| sender));
+            senders.into_iter().collect()
         };
         if senders.is_empty() {
             return;
         }
+        // One raw-DB read per sender, outside the pool lock.
+        let state_nonces: std::collections::HashMap<Address, u64> = senders
+            .iter()
+            .map(|sender| {
+                let account = self.state.get_account(sender).ok().flatten();
+                (*sender, account.map(|a| a.nonce).unwrap_or(0))
+            })
+            .collect();
         let mut guard = self.evm.write().unwrap();
         let lanes = &mut *guard;
         let mut total_pruned = 0usize;
         let mut total_freed = 0usize;
-        for sender in &senders {
-            let state_nonce = self
-                .state
-                .get_account(sender)
-                .ok()
-                .flatten()
-                .map(|a| a.nonce)
-                .unwrap_or(0);
+        for (sender, &state_nonce) in &state_nonces {
             for pool in [&mut lanes.small, &mut lanes.big] {
                 let (pruned, freed) = pool.prune_confirmed(sender, state_nonce);
                 total_pruned += pruned;
                 total_freed += freed;
             }
         }
+        lanes.committed_next.retain(|sender, &mut (next, height)| {
+            height > executed_height && state_nonces.get(sender).is_none_or(|&n| n < next)
+        });
+        lanes.drained.retain(|_, &mut (sender, nonce)| {
+            state_nonces.get(&sender).is_none_or(|&n| nonce >= n)
+        });
         if total_freed > 0 {
             self.memory_used
                 .fetch_sub(total_freed, std::sync::atomic::Ordering::Relaxed);
@@ -5267,7 +5377,7 @@ mod tests {
         assert_eq!(pool.pending_nonce(&addr), 3);
 
         fund(&state, &addr, U256::from(10u64.pow(18)), 2);
-        pool.prune_committed_txs();
+        pool.prune_committed_txs(0);
         assert_eq!(
             pool.evm_pool_size(),
             1,
@@ -5439,6 +5549,214 @@ mod tests {
             pool.drain_evm_big(10_000_000, big_bytes, 1_000_000_000, B256::ZERO),
             vec![tx(&b, 0)]
         );
+    }
+
+    // ---- item 7 step 2: the in-flight filter (B13, decision 7) ----
+
+    /// A 21,000-gas call from `k` at `nonce` (2 gwei max fee, tip 1 wei).
+    fn inflight_tx(k: &SigningKey, nonce: u64) -> Vec<u8> {
+        create_eip1559_tx(k, nonce, 2_000_000_000, 1, 21_000, U256::ZERO)
+    }
+
+    /// `k`'s tx at `nonce` re-signed with higher fees (a new hash).
+    fn inflight_resigned(k: &SigningKey, nonce: u64) -> Vec<u8> {
+        create_eip1559_tx(k, nonce, 4_000_000_000, 2, 21_000, U256::ZERO)
+    }
+
+    fn assert_nonce_too_low(err: MempoolError, want_sender: Address, want: (u64, u64)) {
+        assert!(
+            matches!(err, MempoolError::NonceTooLow { sender, have, minimum }
+                if sender == want_sender && (have, minimum) == want),
+            "expected NonceTooLow {{ have: {}, minimum: {} }}, got: {err}",
+            want.0,
+            want.1
+        );
+    }
+
+    /// Item 7 step 2 (decision 7): the EVM txs a committed block carries leave every pool at
+    /// commit, before execution moves the state nonce, and the sender's next nonce counts
+    /// them. The filter's hash is the pooled entry's (alloy's `Encodable` adds an RLP string
+    /// header, so not the keccak of the raw bytes). RED before: no in-flight filter (compile
+    /// error).
+    #[test]
+    fn committed_block_drops_its_pooled_evm_txs_before_execution() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let [s, t] = [240, 241].map(|seed| intrinsic_case(&state, seed));
+        let raws = [
+            inflight_tx(&s, 0),
+            inflight_tx(&s, 1),
+            inflight_tx(&s, 2),
+            inflight_tx(&t, 0),
+        ];
+        for raw in &raws {
+            let hash = pool.add_evm_tx(raw.clone()).unwrap();
+            assert_eq!(
+                evm_tx_hash(raw),
+                Some(hash),
+                "the filter hashes like the pool"
+            );
+        }
+        assert_ne!(
+            Some(alloy_primitives::keccak256(&raws[0])),
+            evm_tx_hash(&raws[0]),
+            "the network form's header is not hashed"
+        );
+
+        assert_eq!(pool.remove_committed_evm(10, &raws[..2]), 2);
+        assert_eq!(pool.evm_pool_size(), 2, "S's nonce 2 and T's tx stay");
+        assert_eq!(pool.memory_used(), raws[2].len() + raws[3].len());
+        assert_eq!(
+            pool.pending_nonce(&address_from_key(&s)),
+            3,
+            "state nonce 0"
+        );
+        assert_eq!(pool.pending_nonce(&address_from_key(&t)), 1);
+    }
+
+    /// Item 7 step 2 (decision 7): a copy of a committed tx (a re-send, a late forward) is
+    /// `DuplicateTx` for `EVM_INFLIGHT_KEEP_BLOCKS` blocks, then admitted again. RED before: no
+    /// in-flight filter (compile error).
+    #[test]
+    fn committed_evm_tx_is_not_readmitted_until_expiry() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let s = intrinsic_case(&state, 242);
+        let raw0 = inflight_tx(&s, 0);
+        let hash0 = pool.add_evm_tx(raw0.clone()).unwrap();
+        assert_eq!(
+            pool.remove_committed_evm(10, std::slice::from_ref(&raw0)),
+            1
+        );
+        for height in [10, 11, 10 + EVM_INFLIGHT_KEEP_BLOCKS] {
+            pool.remove_committed_evm(height, &[]);
+            let err = pool.add_evm_tx(raw0.clone()).unwrap_err();
+            assert!(
+                matches!(err, MempoolError::DuplicateTx(h) if h == hash0),
+                "height {height}: expected DuplicateTx, got: {err}"
+            );
+        }
+        pool.remove_committed_evm(10 + EVM_INFLIGHT_KEEP_BLOCKS + 1, &[]);
+        assert_eq!(
+            pool.add_evm_tx(raw0).expect("expired: admitted again"),
+            hash0
+        );
+    }
+
+    /// Item 7 step 2 (decision 7): a tx below a nonce a committed block used (a replacement
+    /// with a new hash) is `NonceTooLow` while that block executes. RED before: no in-flight
+    /// filter (compile error).
+    #[test]
+    fn lower_nonce_than_a_committed_one_is_refused() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let s = intrinsic_case(&state, 243);
+        let raws = [0, 1].map(|nonce| inflight_tx(&s, nonce));
+        for raw in &raws {
+            pool.add_evm_tx(raw.clone()).unwrap();
+        }
+        assert_eq!(pool.remove_committed_evm(10, &raws), 2);
+        let err = pool.add_evm_tx(inflight_resigned(&s, 1)).unwrap_err();
+        assert_nonce_too_low(err, address_from_key(&s), (1, 2));
+        pool.add_evm_tx(inflight_tx(&s, 2))
+            .expect("the next nonce is admitted");
+    }
+
+    /// Item 7 step 2 (decision 7): a sender's in-flight entry goes once its state nonce
+    /// reaches it, also before its height executes (`prune_committed_txs(9)` for height 10:
+    /// the nonce rule alone). RED before: no in-flight filter (compile error).
+    #[test]
+    fn inflight_entry_drops_once_the_state_nonce_catches_up() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let s = intrinsic_case(&state, 244);
+        let addr = address_from_key(&s);
+        let raws = [0, 1].map(|nonce| inflight_tx(&s, nonce));
+        for raw in &raws {
+            pool.add_evm_tx(raw.clone()).unwrap();
+        }
+        pool.remove_committed_evm(10, &raws);
+        pool.prune_committed_txs(9);
+        assert_eq!(
+            pool.evm.read().unwrap().committed_next.get(&addr),
+            Some(&(2, 10)),
+            "state nonce 0 is below the entry"
+        );
+        assert_eq!(pool.pending_nonce(&addr), 2);
+
+        fund(&state, &addr, U256::from(10u64.pow(18)), 2);
+        pool.prune_committed_txs(9);
+        assert!(
+            pool.evm.read().unwrap().committed_next.is_empty(),
+            "the state nonce reached the entry"
+        );
+        pool.add_evm_tx(inflight_tx(&s, 2)).unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 3, "state nonce + pooled");
+    }
+
+    /// Item 7 step 2 (Codex plan check s125): our own proposal's txs left the pool at drain,
+    /// so the commit finds them in `drained`, not pooled: their nonces are reserved at commit
+    /// (none at drain, where a lost proposal's reinsert would be refused `NonceTooLow`). A
+    /// lost proposal's txs return to the pool and leave `drained`. RED before: no in-flight
+    /// filter (compile error).
+    #[test]
+    fn own_drained_txs_reserve_their_nonces_at_commit() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let s = intrinsic_case(&state, 245);
+        let addr = address_from_key(&s);
+        let raws = [0, 1].map(|nonce| inflight_tx(&s, nonce));
+        for raw in &raws {
+            pool.add_evm_tx(raw.clone()).unwrap();
+        }
+        assert_eq!(
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO),
+            raws.to_vec()
+        );
+        assert_eq!(pool.pending_nonce(&addr), 0, "no reservation at drain");
+        assert_eq!(pool.remove_committed_evm(10, &raws), 0, "none pooled");
+        assert_eq!(pool.pending_nonce(&addr), 2, "state nonce 0");
+        let err = pool.add_evm_tx(inflight_resigned(&s, 1)).unwrap_err();
+        assert_nonce_too_low(err, addr, (1, 2));
+        assert!(
+            pool.evm.read().unwrap().drained.is_empty(),
+            "settled at commit"
+        );
+
+        // A lost proposal: both txs return to the pool and leave `drained`; a commit of
+        // neither leaves the pool's count.
+        let (_dir2, state2) = setup();
+        let pool2 = lane_pool(&state2);
+        intrinsic_case(&state2, 245);
+        for raw in &raws {
+            pool2.add_evm_tx(raw.clone()).unwrap();
+        }
+        let drained = pool2.drain_evm(3_000_000, pool2.base_fee(), B256::ZERO);
+        assert_eq!(pool2.evm.read().unwrap().drained.len(), 2);
+        pool2.reinsert_evm(drained);
+        assert_eq!(pool2.evm_pool_size(), 2);
+        assert!(pool2.evm.read().unwrap().drained.is_empty());
+        assert_eq!(pool2.remove_committed_evm(10, &[]), 0);
+        assert_eq!(pool2.pending_nonce(&addr), 2, "from the pool");
+    }
+
+    /// Item 7 step 2 (Codex plan check s125): a committed tx that execution skips (fee too low)
+    /// never moves the state nonce; its reservation ends once its height has executed, not
+    /// after 256 blocks. RED before: no in-flight filter (compile error).
+    #[test]
+    fn skipped_committed_tx_releases_its_nonce_once_its_height_executes() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let s = intrinsic_case(&state, 246);
+        let raw0 = inflight_tx(&s, 0);
+        pool.add_evm_tx(raw0.clone()).unwrap();
+        pool.remove_committed_evm(10, std::slice::from_ref(&raw0));
+        pool.prune_committed_txs(9);
+        let err = pool.add_evm_tx(inflight_resigned(&s, 0)).unwrap_err();
+        assert_nonce_too_low(err, address_from_key(&s), (0, 1));
+        pool.prune_committed_txs(10);
+        pool.add_evm_tx(inflight_resigned(&s, 0))
+            .expect("height 10 executed without moving the nonce: released");
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----

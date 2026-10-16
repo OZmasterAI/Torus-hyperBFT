@@ -7761,6 +7761,10 @@ impl App<RocksKVStore> for TorusApp {
             ExecSource::Compact(c) => &c.evm_transactions,
             ExecSource::Durable(_) => &[],
         };
+        // Item 7 step 2 (decision 7): the in-flight filter (every commit, also to expire entries).
+        if let Some(ref mempool) = self.mempool {
+            mempool.remove_committed_evm(height, committed_evm);
+        }
         self.reinsert_lost_evm(height, committed_evm);
 
         // S444 AT-LEAST-ONCE FEED GUARD: hotstuff's committed-block feed is
@@ -22696,6 +22700,21 @@ mod crash_recovery_tests {
         rx.try_recv().expect("height 5 must reach execution");
         assert_eq!(mempool.evm_pool_size(), 0);
         assert!(app.own_evm_proposed.is_empty(), "height 5 settled");
+    }
+
+    /// Item 7 step 2 (decision 7, in-flight filter): a node holding forwarded txs (not its own
+    /// proposal) drops them from its pool when a block carrying them commits, before any
+    /// execution (the exec channel only records), so a re-send cannot propose them twice. RED
+    /// before: they stayed pooled until execution moved the sender's nonce.
+    #[test]
+    fn commit_prunes_forwarded_copies_from_a_non_proposer_pool() {
+        let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(2);
+        assert_eq!(mempool.evm_pool_size(), 2);
+        app.exec_next_height = Some(5);
+        let other = committed_compact_block(&evm_child_of(&tip_2000(), txs));
+        app.on_committed_block(&other, other.hash);
+        assert_eq!(mempool.evm_pool_size(), 0, "gone at commit");
+        rx.try_recv().expect("height 5 must reach execution");
     }
 
     /// `pending_proposals[5]` is overwritten when another proposer's block at

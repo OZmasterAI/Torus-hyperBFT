@@ -25,7 +25,7 @@ use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
 use torus_rpc::{find_latest_height, BlockNotifier, RpcServer};
-use torus_state::cf::CF_BLOCK_HEADERS;
+use torus_state::cf::{CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
 use torus_state::{PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
@@ -1108,7 +1108,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if height == 0 {
                 return;
             }
-            mempool_for_handler.prune_committed_txs();
+            // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read before
+            // the state nonces the prune reads from the same DB. Not `height`: the header row
+            // is written at commit, before execution.
+            let executed = state_db_for_handler
+                .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .ok()
+                .flatten()
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map_or(0, u64::from_be_bytes);
+            mempool_for_handler.prune_committed_txs(executed);
             latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
             match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
                 Ok(Some(data)) if data.len() > 32 => {
