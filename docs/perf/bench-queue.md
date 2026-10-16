@@ -9,7 +9,7 @@ Last archy bench: `ozarchy-hsdb`, 71.8 option A A/B (section 74 of `ozarchy-anti
 Every campaign uses the N = 11 bench genesis (rebuilt once with `FORCE=1`, step 1). Arms that compare against main
 share one binary and one all-off baseline inside a campaign.
 
-**Now, on current main** (s125: main carries KP and DB, flags off; PC and propose-defer are getting review fixes on 18c):
+**Now, on current main** (s125: main carries KP, DB and PC, flags off; propose-defer is getting review fixes on 18c):
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
    cell and its checks (Q5 below). Gates every later campaign.
@@ -66,10 +66,10 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
 - **Q4. The four s123 experiments**, one flag each, default off: `exp/s123-parallel-cancel-all-book-pass`
   (`TORUS_PARALLEL_CANCEL_ALL`), `exp/s123-propose-defer-on-exec-queue` (`TORUS_PROPOSE_EXEC_WATERMARK`),
   `exp/s123-exec-action-keys-parallel` (`TORUS_EXEC_PARALLEL_KEYS`), `exp/s123-defer-book-blobs-in-layer-merge`
-  (`TORUS_CKPT_DEFER_BOOKS`). Status s125: exec-action-keys and defer-book-blobs are merged into main with the flags
-  off (Codex torus review: no findings); parallel-cancel-all (a flag-off allocation regression and a flag-on
-  all-books scan) and propose-defer (repeated store reads while deferring, flag-wiring tests) get fixes and a
-  re-review before they merge. Three run in campaign A, the winners together in step 5, propose-defer in campaign B.
+  (`TORUS_CKPT_DEFER_BOOKS`). Status s125: exec-action-keys, defer-book-blobs and parallel-cancel-all (after its Codex fixes:
+  flag-off allocations = main, flag on looks up only targeted books; re-review clean, merge `7f9bb3a9`) are merged
+  into main with the flags off, so campaign A has all 6 arms; propose-defer (repeated store reads while deferring,
+  flag-wiring tests) gets its fixes and a re-review before it merges (campaign B waits for it). Three run in campaign A, the winners together in step 5, propose-defer in campaign B.
   Arm values and the shape: step 4 and step 6 above; branch notes in `/home/18c/projects/wt/exp-s123/<name>.md`
   (18c).
 - **Q5. Native vs native + EVM transfers** at N = 11 (main `639ab185` and later; `EVM_LOAD_RATE` and
