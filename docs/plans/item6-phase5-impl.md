@@ -324,6 +324,25 @@ tables following their rows (rows stay raw writes; the table follows like Phase 
 - Book rows from dirty sets in modes 2/3 (Classic on testnet; mode 3 revisit before mainnet).
 - The remaining cloid exec-thread sites (0.364 ms per 1k fills at 100% share, section 63.8): not item 6.
 
+### Parked for a decision at Phase 5 (owner s126)
+
+Not built by Phase 5. Decide each one once Phase 5's state model and first bench are known:
+
+1. **RPC freshness, the HL way:** serve all RPC reads (balances, nonces, code, `eth_call`, `eth_blockNumber`, books)
+   from the latest executed state instead of the durable DB, which lags execution by up to one checkpoint (~15 s).
+   HL appears to serve RPC from its latest in-memory state (inferred, not documented). Today only ingress reads use
+   the published view, and it holds 6 CFs (owner s112: about 150-200 MB vs about 885 MB for all frozen sets, s111),
+   so full freshness costs RAM and touches every handler (it reverses the "RPC stays on the DB" line above, Phase 3
+   D10 c). Item 7 step 2 C9 already takes the sender's EVM lane from the view (owner s126, option B), so lane
+   answers agree with admission.
+2. **Onchain EVM mempool plus HL-style per-block fees:** see `item7-step2-design.md`. The fee costs no block speed
+   or matched/s once execution builds and prices EVM blocks. The cost is the pool's state writes on the exec thread,
+   which Phase 5 makes cheap. Size it with an archy bench.
+3. **Propose-defer** (`exp/s123-propose-defer-on-exec-queue`, parked): read `torus_exec_queue_depth` and exec lag in
+   Phase 5's first bench (hsdb-300m shape). Queue well under 64 with a lag of a few seconds: delete the branch. Queue
+   still about 64 with a lag over about 5 s: revive it (fix the two P2s, third Codex review, campaign B). Rule
+   also in `docs/perf/bench-queue.md` step 6.
+
 ## 6. Rollback
 
 No runtime switch (D16). Rollback = redeploy the Phase 4 binary. Nothing is persisted in a new form: rows, `h_n` and
