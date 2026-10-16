@@ -26400,6 +26400,50 @@ mod crash_recovery_tests {
         no_r: bool,
         probe: Option<&BlockProbe>,
     ) -> P2Run {
+        p2_run_full(
+            blocks, pipelined, mode, reference, fault, ckpt, seed, no_r, probe, None,
+        )
+    }
+
+    /// s58 (ported from bb62bab1 onto main's s124 `TORUS_EPOCH_FAST_PATH`):
+    /// [`p2_run_with`] (production paths) with the epoch-boundary fast path
+    /// set to `fast` on every context (`None`: the env's).
+    fn p2_run_fast(
+        blocks: &[TorusBlock],
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        fault: &P2Fault,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        fast: Option<bool>,
+    ) -> P2Run {
+        p2_run_full(
+            blocks,
+            pipelined,
+            mode,
+            false,
+            fault,
+            ckpt,
+            &|_| {},
+            false,
+            None,
+            fast,
+        )
+    }
+
+    /// [`p2_run_seeded`] with `fast` (see [`p2_run_fast`]).
+    #[allow(clippy::too_many_arguments)]
+    fn p2_run_full(
+        blocks: &[TorusBlock],
+        pipelined: bool,
+        mode: Option<torus_bridge::native_executor::BookMode>,
+        reference: bool,
+        fault: &P2Fault,
+        ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+        seed: &dyn Fn(&StateDb),
+        no_r: bool,
+        probe: Option<&BlockProbe>,
+        fast: Option<bool>,
+    ) -> P2Run {
         let (config, db) = p2_fixture();
         seed(&db);
         torus_state::running_hash::capture_begin(&db);
@@ -26422,6 +26466,9 @@ mod crash_recovery_tests {
             }
             ctx.metrics = Some(metrics.clone());
             ctx.checkpoint = ckpt;
+            if let Some(fast) = fast {
+                ctx.epoch_fast_path = fast;
+            }
             if pipelined && attach {
                 ctx.attach_flush_worker(Some(gate.clone()));
                 if let P2Fault::DeferredGate(g) = fault {
@@ -27329,6 +27376,37 @@ mod crash_recovery_tests {
         );
     }
 
+    /// s124 epoch fast path (e), ported from s58 bb62bab1: item 6 Phase 3
+    /// crash replay with the flag on. The crashed run (checkpoint every 5
+    /// blocks) adds two crashes whose blocks run an epoch boundary on the
+    /// fast path (P2's epoch length is 50): at 49 with W parked on the
+    /// checkpoint that boundary 50 hands off, and at 99 with W parked on
+    /// 99's digest while E runs boundary 100. Flag off those crashes cannot
+    /// run (the boundary's barrier waits for the parked W: "E blocked").
+    /// Same per-block write sets, running hash and CF dump as the uncrashed
+    /// flag-off per-block run, one guard rebuild per crash.
+    #[test]
+    fn epoch_fast_path_checkpoint_crash_replay_matches_uncrashed() {
+        let (blocks, _) = p2_blocks(false);
+        let crashes = [
+            (12, false),
+            (23, true),
+            (37, false),
+            (49, true),
+            (61, true),
+            (78, true),
+            (99, false),
+            (112, false),
+        ];
+        ckpt_crash_replay_with(
+            torus_bridge::native_executor::BookMode::Classic,
+            &blocks,
+            "epoch fast path checkpoint crashes",
+            &crashes,
+            Some(true),
+        );
+    }
+
     /// The resident staleness guards read the applied marker through the
     /// overlay (parent layer first), never the DB: over the 130 P2 blocks
     /// with checkpoints never by time, R and the books are built once, as
@@ -27691,10 +27769,30 @@ mod crash_recovery_tests {
         blocks: &[TorusBlock],
         what: &str,
     ) -> (P2Run, P2Run) {
-        let reference = p2_run(blocks, true, Some(mode), false, &P2Fault::None);
-        let fault = P2Fault::CkptCrash(CKPT_CRASHES.to_vec());
-        let run = p2_run_with(blocks, true, Some(mode), false, &fault, Some(ckpt_every(5)));
-        assert_eq!(run.faults, CKPT_CRASHES.len() as u64, "{what}");
+        ckpt_crash_replay_with(mode, blocks, what, &CKPT_CRASHES, None)
+    }
+
+    /// [`ckpt_crash_replay_on`] with the crash points `crashes` and, for
+    /// `fast: Some(_)`, the epoch-boundary fast path set to it on the
+    /// crashed run and off on the reference (`None`: both keep the env's).
+    fn ckpt_crash_replay_with(
+        mode: torus_bridge::native_executor::BookMode,
+        blocks: &[TorusBlock],
+        what: &str,
+        crashes: &[(u64, bool)],
+        fast: Option<bool>,
+    ) -> (P2Run, P2Run) {
+        let reference = p2_run_fast(
+            blocks,
+            true,
+            Some(mode),
+            &P2Fault::None,
+            None,
+            fast.map(|_| false),
+        );
+        let fault = P2Fault::CkptCrash(crashes.to_vec());
+        let run = p2_run_fast(blocks, true, Some(mode), &fault, Some(ckpt_every(5)), fast);
+        assert_eq!(run.faults, crashes.len() as u64, "{what}");
         let captured = dedup_captured(&run.captured, what);
         assert_eq!(
             captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
@@ -27707,7 +27805,7 @@ mod crash_recovery_tests {
         assert_dumps_equal(&reference.dump, &run.dump, what);
         assert_eq!(
             run.metrics.exec_resident_rebuilds.get(),
-            1 + CKPT_CRASHES.len() as u64,
+            1 + crashes.len() as u64,
             "{what}: one guard rebuild per crash"
         );
         (reference, run)
