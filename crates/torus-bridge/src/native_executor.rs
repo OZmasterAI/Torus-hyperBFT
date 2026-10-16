@@ -4886,6 +4886,11 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// differential tests prove the pool was used, not just the serial loop).
     #[cfg(test)]
     pub test_cancel_all_parallel_runs: u64,
+    /// Test-only: `order_books` entries the parallel cancel-all book pass
+    /// examined to lend the run's books (Codex s123 P2: must scale with the
+    /// run's markets, not with every resident book).
+    #[cfg(test)]
+    pub test_cancel_all_parallel_books_examined: u64,
 }
 
 /// bl1 exec-chain-sub-100-attribution: per-block nanosecond split of
@@ -5393,6 +5398,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             test_cancel_all_panic_market: None,
             #[cfg(test)]
             test_cancel_all_parallel_runs: 0,
+            #[cfg(test)]
+            test_cancel_all_parallel_books_examined: 0,
         }
     }
 
@@ -11138,44 +11145,53 @@ impl NativeExecutor {
             }
         }
         visits.sort_unstable();
-        let groups: Vec<&[(MarketId, usize)]> = visits.chunk_by(|a, b| a.0 == b.0).collect();
-        // (action, market, its cancelled orders' margin, its stops'
-        // reservations) for every visit that removed something, markets
-        // ascending.
-        let mut hits: Vec<(usize, MarketId, FixedPoint, FixedPoint)> = Vec::new();
-        let parallel = ctx.cancel_all_workers >= 2
-            && groups.len() >= 2
-            && visits.len() >= ctx.cancel_all_min_visits;
-        if parallel {
-            #[cfg(test)]
+        // `TORUS_PARALLEL_CANCEL_ALL` (default off): off is this one compare,
+        // then main's serial pass below, unchanged (Codex s123 P2: the same
+        // two scratch buffers per run, groups walked in place, the same
+        // allocations). On: >= `cancel_all_min_visits` visits over >= 2
+        // markets (`visits` is sorted: first and last market differ).
+        if ctx.cancel_all_workers >= 2
+            && visits.len() >= ctx.cancel_all_min_visits
+            && visits.first().map(|v| v.0) != visits.last().map(|v| v.0)
+        {
+            return Self::exec_cancel_all_run_parallel(ctx, run, &visits);
+        }
+        // (action, market, its cancelled orders, its stops' reservations) for
+        // every visit that removed something, markets ascending.
+        let mut hits: Vec<(
+            usize,
+            MarketId,
+            Vec<torus_core::order_book::Order>,
+            FixedPoint,
+        )> = Vec::new();
+        let mut senders: Vec<Address> = Vec::with_capacity(run.len());
+        let mut stops_k: Vec<(bool, FixedPoint)> = Vec::with_capacity(run.len());
+        for group in visits.chunk_by(|a, b| a.0 == b.0) {
+            let mid = group[0].0;
+            let Some(book) = ctx.order_books.get_mut(&mid) else {
+                continue;
+            };
+            ctx.phase_accum.cancel_all_books_visited += group.len() as u64;
+            let cfg = ctx.margin_configs.get(&mid);
+            senders.clear();
+            stops_k.clear();
+            // C4: each member's stops first, in run order.
+            for &(_, k) in group {
+                let sender = run[k].1;
+                let mut took = (false, FixedPoint::ZERO);
+                for (price, qty) in book.take_pending_stops(&sender) {
+                    took.0 = true;
+                    took.1 += Self::stop_reservation(cfg, price, qty);
+                }
+                stops_k.push(took);
+                senders.push(sender);
+            }
+            let cancelled = book.cancel_all_many(&senders);
+            for ((&(_, k), &(took_stops, stops)), orders) in
+                group.iter().zip(&stops_k).zip(cancelled)
             {
-                ctx.test_cancel_all_parallel_runs += 1;
-            }
-            match Self::cancel_all_groups_parallel(ctx, &groups, run) {
-                Ok(done) => {
-                    for (mid, members, group_hits) in done {
-                        ctx.phase_accum.cancel_all_books_visited += members as u64;
-                        hits.extend(
-                            group_hits
-                                .into_iter()
-                                .map(|(k, margin, stops)| (k, mid, margin, stops)),
-                        );
-                    }
-                }
-                Err((panic, poisoned)) => {
-                    return Err(Self::cancel_all_worker_failed(ctx, run, panic, &poisoned));
-                }
-            }
-        } else {
-            for &group in &groups {
-                let mid = group[0].0;
-                let Some(book) = ctx.order_books.get_mut(&mid) else {
-                    continue;
-                };
-                ctx.phase_accum.cancel_all_books_visited += group.len() as u64;
-                let cfg = ctx.margin_configs.get(&mid);
-                for (k, margin, stops) in Self::cancel_all_group(book, cfg, group, run) {
-                    hits.push((k, mid, margin, stops));
+                if took_stops || !orders.is_empty() {
+                    hits.push((k, mid, orders, stops));
                 }
             }
         }
@@ -11189,10 +11205,64 @@ impl NativeExecutor {
             // FIX 2 (ECON-FIND-05): same release as `exec_cancel_all`, summed
             // in ascending market order like it (P2-1; was the book map's
             // order: the terms are non-negative, so the sum and whether the
-            // `checked_add` overflows do not depend on the order). Each
-            // market's term is the same per-market sum as before (computed
-            // with its book's work in [`Self::cancel_all_group`]), added in
-            // the same order: margin, then stops.
+            // `checked_add` overflows do not depend on the order).
+            let mut total_margin_release = FixedPoint::ZERO;
+            while let Some((_, mid, orders, stops)) = hits.next_if(|h| h.0 == k) {
+                ctx.phase_accum.cancel_all_books_hit += 1;
+                ctx.dirty_books.insert(mid);
+                let cfg = ctx.margin_configs.get(&mid);
+                total_margin_release += Self::cancelled_orders_margin(cfg, &orders);
+                total_margin_release += stops;
+            }
+            Self::release_order_margin(ctx, sender, total_margin_release);
+            results.push(NativeActionResult::ok("cancel_all", 500));
+        }
+        Ok(results)
+    }
+
+    /// `TORUS_PARALLEL_CANCEL_ALL`: [`Self::exec_cancel_all_run`]'s book pass
+    /// on the exec pool ([`Self::cancel_all_groups_parallel`], one job group
+    /// per market), then the same per-action bookkeeping as the serial pass.
+    /// Each market's margin term is the per-market sum the serial pass takes
+    /// (computed with its book's work in [`Self::cancel_all_group`]), added in
+    /// the same order: margin, then stops. `visits`: sorted, >= 2 markets.
+    fn exec_cancel_all_run_parallel<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        run: &[(usize, Address, Option<MarketId>)],
+        visits: &[(MarketId, usize)],
+    ) -> Result<Vec<NativeActionResult>, Vec<NativeActionResult>> {
+        #[cfg(test)]
+        {
+            ctx.test_cancel_all_parallel_runs += 1;
+        }
+        let groups: Vec<&[(MarketId, usize)]> = visits.chunk_by(|a, b| a.0 == b.0).collect();
+        // (action, market, its cancelled orders' margin, its stops'
+        // reservations) for every visit that removed something, markets
+        // ascending.
+        let mut hits: Vec<(usize, MarketId, FixedPoint, FixedPoint)> = Vec::new();
+        match Self::cancel_all_groups_parallel(ctx, &groups, run) {
+            Ok(done) => {
+                for (mid, members, group_hits) in done {
+                    ctx.phase_accum.cancel_all_books_visited += members as u64;
+                    hits.extend(
+                        group_hits
+                            .into_iter()
+                            .map(|(k, margin, stops)| (k, mid, margin, stops)),
+                    );
+                }
+            }
+            Err((panic, poisoned)) => {
+                return Err(Self::cancel_all_worker_failed(ctx, run, panic, &poisoned));
+            }
+        }
+        // Per action in run order, its markets ascending (stable sort).
+        hits.sort_by_key(|h| h.0);
+
+        let mut results = Vec::with_capacity(run.len());
+        ctx.phase_accum.cancel_alls += run.len() as u64;
+        let mut hits = hits.into_iter().peekable();
+        for (k, (_, sender, _)) in run.iter().enumerate() {
+            // FIX 2 (ECON-FIND-05): as the serial pass, markets ascending.
             let mut total_margin_release = FixedPoint::ZERO;
             while let Some((_, mid, margin, stops)) = hits.next_if(|h| h.0 == k) {
                 ctx.phase_accum.cancel_all_books_hit += 1;
@@ -11214,17 +11284,20 @@ impl NativeExecutor {
     /// reservations)` for every member that removed an order or a stop.
     ///
     /// Touches only `book`; the margin terms are pure functions of `cfg` and
-    /// the removed orders (the same sums the per-action loop used to take),
-    /// so this may run on an exec pool thread (`TORUS_PARALLEL_CANCEL_ALL`)
-    /// and the cancelled orders are freed there.
+    /// the removed orders (the same sums the serial pass takes), so this runs
+    /// on an exec pool thread (`TORUS_PARALLEL_CANCEL_ALL`) and the cancelled
+    /// orders are freed there. `senders` / `stops_k`: the job's scratch,
+    /// reused across its markets.
     fn cancel_all_group(
         book: &mut OrderBook,
         cfg: Option<&MarketMarginConfig>,
         group: &[(MarketId, usize)],
         run: &[(usize, Address, Option<MarketId>)],
+        senders: &mut Vec<Address>,
+        stops_k: &mut Vec<(bool, FixedPoint)>,
     ) -> Vec<(usize, FixedPoint, FixedPoint)> {
-        let mut senders: Vec<Address> = Vec::with_capacity(group.len());
-        let mut stops_k: Vec<(bool, FixedPoint)> = Vec::with_capacity(group.len());
+        senders.clear();
+        stops_k.clear();
         // C4: each member's stops first, in run order.
         for &(_, k) in group {
             let sender = run[k].1;
@@ -11236,9 +11309,11 @@ impl NativeExecutor {
             stops_k.push(took);
             senders.push(sender);
         }
-        let cancelled = book.cancel_all_many(&senders);
+        let cancelled = book.cancel_all_many(senders);
         let mut hits = Vec::new();
-        for ((&(_, k), &(took_stops, stops)), orders) in group.iter().zip(&stops_k).zip(cancelled) {
+        for ((&(_, k), &(took_stops, stops)), orders) in
+            group.iter().zip(stops_k.iter()).zip(cancelled)
+        {
             if took_stops || !orders.is_empty() {
                 hits.push((k, Self::cancelled_orders_margin(cfg, &orders), stops));
             }
@@ -11248,9 +11323,13 @@ impl NativeExecutor {
 
     /// `TORUS_PARALLEL_CANCEL_ALL`: [`Self::cancel_all_group`] for every
     /// group (`groups`: one per market, markets ascending) whose market has
-    /// a book, as jobs on the exec pool. Books are lent as disjoint `&mut`
-    /// from ONE `iter_mut` pass (no book leaves the map, so the s120 index
-    /// rules hold; no ctx method runs while they are lent). Markets are
+    /// a book, as jobs on the exec pool. The run's books are taken out of the
+    /// map by key — O(the run's markets), never a walk over the other
+    /// resident books (Codex s123 P2) — lent as disjoint `&mut`, and put back
+    /// after the jobs: the move batch matching makes
+    /// (`take_book_for_matching`). The indexes keep their entries and each
+    /// book keeps its logs, as on the serial pass; no ctx method runs while
+    /// the books are out. Markets are
     /// packed into at most `ctx.cancel_all_workers` jobs by
     /// [`MarketWorkerPool::chunk_indices`] (weight: members + a fixed
     /// per-book cost); each job walks its markets ascending, each contained
@@ -11276,19 +11355,22 @@ impl NativeExecutor {
         #[cfg(test)]
         let plant = ctx.test_cancel_all_panic_market;
 
-        // Disjoint `&mut` books of the groups' markets (ascending, distinct).
-        let mids: Vec<MarketId> = groups.iter().map(|g| g[0].0).collect();
-        let mut books: Vec<(MarketId, &mut OrderBook)> = ctx
-            .order_books
-            .iter_mut()
-            .filter(|(m, _)| mids.binary_search(m).is_ok())
-            .map(|(&m, book)| (m, book))
-            .collect();
-        books.sort_unstable_by_key(|(m, _)| *m);
+        // The groups' books, by key (markets ascending, distinct).
+        let mut taken: Vec<(MarketId, OrderBook)> = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mid = group[0].0;
+            #[cfg(test)]
+            {
+                ctx.test_cancel_all_parallel_books_examined += 1;
+            }
+            if let Some(book) = ctx.order_books.remove(&mid) {
+                taken.push((mid, book));
+            }
+        }
         let configs = &ctx.margin_configs;
         // Merge-walk: a group whose market has no book is skipped, as the
         // serial loop's `continue`.
-        let mut books = books.into_iter().peekable();
+        let mut books = taken.iter_mut().map(|(m, book)| (*m, book)).peekable();
         let mut items = Vec::with_capacity(groups.len());
         for &group in groups {
             let mid = group[0].0;
@@ -11324,13 +11406,14 @@ impl NativeExecutor {
             chunk_mids.push(mine.iter().map(|(_, item)| item.0).collect());
             jobs.push(move || {
                 let mut out = Vec::with_capacity(mine.len());
+                let (mut senders, mut stops_k) = (Vec::new(), Vec::new());
                 for (i, (mid, group, book, cfg)) in mine {
                     let r = MarketWorkerPool::run_contained(mid, || {
                         #[cfg(test)]
                         if plant == Some(mid) {
                             panic!("planted cancel-all worker panic (test)");
                         }
-                        Self::cancel_all_group(book, cfg, group, run)
+                        Self::cancel_all_group(book, cfg, group, run, &mut senders, &mut stops_k)
                     });
                     let stop = r.is_err();
                     out.push((i, r));
@@ -11373,6 +11456,11 @@ impl NativeExecutor {
                     poisoned.extend(job_mids);
                 }
             }
+        }
+        // Every lent book goes back (a poisoned one too: the failure path
+        // takes those out again, `cancel_all_worker_failed`).
+        for (mid, book) in taken {
+            ctx.order_books.insert(mid, book);
         }
         if let Some(panic) = failed {
             return Err((panic, poisoned));

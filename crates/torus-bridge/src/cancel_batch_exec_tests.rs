@@ -1843,3 +1843,197 @@ fn parallel_cancel_all_worker_panic_fail_stops_before_phase_2() {
         }
     }
 }
+
+/// Thread-scoped allocation counters for the Codex s123 flag-off witness
+/// below (as torus-state's `native_trie` alloc witness: installed only in
+/// this crate's `cfg(test)` lib binary, per THREAD so the harness's other
+/// tests do not disturb the count).
+mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    #[inline]
+    fn bump() {
+        let _ = ALLOCS.try_with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    // SAFETY: every method forwards to `System` unchanged; the counter is a
+    // thread-local `Cell` with a const initialiser, so it never allocates and
+    // never re-enters the allocator.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc_zeroed(l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            bump();
+            unsafe { System.realloc(p, l, new) }
+        }
+    }
+
+    /// Allocations (alloc, alloc_zeroed, realloc) `f` performs ON THIS THREAD.
+    pub fn measure<R>(f: impl FnOnce() -> R) -> (u64, R) {
+        let a0 = ALLOCS.with(Cell::get);
+        let r = f();
+        (ALLOCS.with(Cell::get) - a0, r)
+    }
+}
+
+#[global_allocator]
+static COUNTING_ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
+
+/// `books` books where addr(1) and addr(2) each rested one order that has
+/// since left the book without the cancel-all index hearing of it (a
+/// supported stale entry: the index is a superset), so a run of their two
+/// cancel-alls visits every book and removes nothing ("empty hits").
+fn stale_index_ctx(dir: &tempfile::TempDir, mode: BookMode, books: u64) -> NativeExecContext {
+    let mut ctx = new_ctx(dir, mode);
+    let setup: Vec<_> = (1..=books)
+        .flat_map(|m| {
+            [
+                (addr(1), gtc(m, true, 98, 1)),
+                (addr(2), gtc(m, false, 110, 1)),
+            ]
+        })
+        .collect();
+    NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup, true);
+    ctx.save_order_books();
+    ctx.dirty_books.clear();
+    let _ = ctx.cancel_index();
+    for book in ctx.order_books.values_mut() {
+        assert_eq!(book.cancel_all_many(&[addr(1), addr(2)]).concat().len(), 2);
+    }
+    ctx.phase_accum = ExecPhaseAccum::default();
+    ctx
+}
+
+/// The run's own allocations on the flag-OFF serial path, beyond those of
+/// the book calls it makes (`take_pending_stops` per member, one
+/// `cancel_all_many` per book), measured on a twin context.
+fn serial_run_overhead_allocs(mode: BookMode, books: u64) -> u64 {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut ctx = stale_index_ctx(&dir_a, mode, books);
+    let mut twin = stale_index_ctx(&dir_b, mode, books);
+    ctx.cancel_all_workers = 1;
+    let run = [(0, addr(1), None), (1, addr(2), None)];
+    let (run_allocs, results) =
+        alloc_count::measure(|| NativeExecutor::exec_cancel_all_run(&mut ctx, &run));
+    let what = format!("{mode:?} books={books}");
+    let results = results.unwrap_or_else(|_| panic!("{what}: the serial run failed"));
+    assert!(results.iter().all(|r| r.success), "{what}");
+    assert_eq!(ctx.test_cancel_all_parallel_runs, 0, "{what}: serial path");
+    assert_eq!(
+        ctx.phase_accum.cancel_all_books_visited,
+        2 * books,
+        "{what}"
+    );
+    assert_eq!(ctx.phase_accum.cancel_all_books_hit, 0, "{what}");
+
+    let mut mids: Vec<MarketId> = twin.order_books.keys().copied().collect();
+    mids.sort_unstable();
+    let senders = [addr(1), addr(2)];
+    let (book_allocs, ()) = alloc_count::measure(|| {
+        for m in &mids {
+            let book = twin.order_books.get_mut(m).unwrap();
+            for s in &senders {
+                drop(book.take_pending_stops(s));
+            }
+            drop(book.cancel_all_many(&senders));
+        }
+    });
+    run_allocs - book_allocs
+}
+
+/// Codex s123 review P2 (flag OFF, `TORUS_PARALLEL_CANCEL_ALL` unset): the
+/// serial cancel-all run allocates exactly as main — its two scratch
+/// buffers once per run, groups walked in place — so its own allocations
+/// do not grow with the markets it visits (the flag-off branch allocated
+/// two buffers per visited market plus the group list: 300 markets, main
+/// 1202 allocations, branch 1808).
+#[test]
+fn serial_cancel_all_run_allocations_do_not_grow_with_markets() {
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        let small = serial_run_overhead_allocs(mode, 60);
+        let large = serial_run_overhead_allocs(mode, 300);
+        assert_eq!(
+            small, large,
+            "{mode:?}: the serial run's own allocations grew with its markets (60 books: \
+             {small}, 300 books: {large})"
+        );
+    }
+}
+
+/// Codex s123 review P2 (flag ON): the parallel book pass lends the run's
+/// books without walking every resident book: 2 targeted markets among
+/// 1000 resident books examine 2 map entries (was all 1000).
+#[test]
+fn parallel_cancel_all_examines_only_the_runs_books() {
+    // A sender rests at most 1000 orders per block height.
+    const BOOKS: u64 = 1000;
+    for mode in [BookMode::Classic, BookMode::LevelAuthorityChunked] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ctx = new_ctx(&dir, mode);
+        let mut setup: Vec<_> = (1..=BOOKS)
+            .map(|m| (addr(2), gtc(m, true, 98, 1)))
+            .collect();
+        setup.extend([
+            (addr(1), gtc(7, true, 99, 1)),
+            (addr(1), gtc(900, false, 110, 1)),
+        ]);
+        NativeExecutor::execute_batch_cancel_mode(&mut ctx, &setup, true);
+        ctx.save_order_books();
+        ctx.dirty_books.clear();
+        ctx.phase_accum = ExecPhaseAccum::default();
+        ctx.cancel_all_workers = 4;
+        ctx.cancel_all_min_visits = 0;
+        let block = vec![(addr(1), cancel_all(None)), (addr(3), cancel_all(None))];
+        let r = NativeExecutor::execute_batch_cancel_mode(&mut ctx, &block, true);
+        let what = format!("{mode:?}");
+        assert!(
+            r.results.iter().all(|r| r.success),
+            "{what}: {:?}",
+            r.results
+        );
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        assert_eq!(
+            ctx.test_cancel_all_parallel_runs, 1,
+            "{what}: the run used the pool"
+        );
+        assert_eq!(
+            ctx.test_cancel_all_parallel_books_examined, 2,
+            "{what}: books examined to lend the run's 2 books"
+        );
+        assert_eq!(ctx.phase_accum.cancel_all_books_visited, 2, "{what}");
+        assert_eq!(ctx.phase_accum.cancel_all_books_hit, 2, "{what}");
+        assert_eq!(
+            ctx.order_books.len() as u64,
+            BOOKS,
+            "{what}: every book stays"
+        );
+        assert!(ctx
+            .order_books
+            .values()
+            .all(|b| b.open_order_count(&addr(1)) == 0));
+        assert!(ctx
+            .order_books
+            .values()
+            .all(|b| b.open_order_count(&addr(2)) == 1));
+        let mut dirty: Vec<_> = ctx.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        assert_eq!(dirty, vec![7, 900], "{what}");
+        assert!(assert_index_covers_books(&ctx, &what));
+    }
+}
