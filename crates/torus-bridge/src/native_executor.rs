@@ -590,11 +590,36 @@ fn settle_worker_cap() -> usize {
     ))
 }
 
+/// s58 bundle (D, M, T): an on-by-default flag's value, trimmed. Unset, `1`
+/// or `true` = on; `0` or `false` = off; anything else = `None`, not a valid
+/// value ([`on_by_default_flag`] warns and uses the default, on).
+fn on_by_default_value(v: Option<&str>) -> Option<bool> {
+    match v.map(str::trim) {
+        None | Some("1" | "true") => Some(true),
+        Some("0" | "false") => Some(false),
+        Some(_) => None,
+    }
+}
+
+/// s58 bundle (D, M, T): [`on_by_default_value`], an invalid value logged as
+/// a warning and taken as the default (on). The flags read their env once
+/// per process, so the warning is logged once.
+fn on_by_default_flag(name: &str, v: Option<&str>) -> bool {
+    on_by_default_value(v).unwrap_or_else(|| {
+        tracing::warn!(
+            value = v.unwrap_or_default(),
+            "{name}: not 1, true, 0 or false; using the default (on)"
+        );
+        true
+    })
+}
+
 /// s58 settle-passb-deferred-results-scatter: pure parse of
-/// `TORUS_SETTLE_DEFER_RESULTS`. Only the trimmed value `1` turns it on;
-/// unset (or anything else) keeps pass B's inline results write.
-fn parse_settle_defer_results(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+/// `TORUS_SETTLE_DEFER_RESULTS` (`on_by_default_flag`). On by default:
+/// `0` or `false` keeps pass B's inline results write.
+#[doc(hidden)]
+pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
+    on_by_default_flag("TORUS_SETTLE_DEFER_RESULTS", v)
 }
 
 thread_local! {
@@ -618,21 +643,22 @@ pub fn with_settle_defer_results<R>(on: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// s58 (`TORUS_SETTLE_DEFER_RESULTS=1`, node-local, default off): the
-/// parallel settle's pass B records each placed order's book reject (1 byte
-/// per flat action) and writes every placed result in ONE sequential pass
-/// after its market loop, instead of one 56-byte write per order at a stride
-/// of about a market's slots (markets ascend; the bench draws a market per
-/// order), where the old slot's drop-glue load missed on every write. Same
-/// values, same slots: only the write order changes. The thread's pin if
-/// set, else the env read once per process.
+/// s58 (`TORUS_SETTLE_DEFER_RESULTS`, node-local, on by default; `0` turns
+/// it off): the parallel settle's pass B records each placed order's book
+/// reject (1 byte per flat action) and writes every placed result in ONE
+/// sequential pass after its market loop, instead of one 56-byte write per
+/// order at a stride of about a market's slots (markets ascend; the bench
+/// draws a market per order), where the old slot's drop-glue load missed on
+/// every write. Same values, same slots: only the write order changes. The
+/// thread's pin if set, else the env read once per process.
 fn settle_defer_results_enabled() -> bool {
     if let Some(on) = SETTLE_DEFER_RESULTS_PIN.with(std::cell::Cell::get) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok());
+        let on =
+            parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok().as_deref());
         tracing::info!(
             on,
             "TORUS_SETTLE_DEFER_RESULTS: settle pass B deferred results write"
@@ -644,27 +670,49 @@ fn settle_defer_results_enabled() -> bool {
 #[cfg(test)]
 mod settle_defer_results_flag_tests {
     use super::{
-        parse_settle_defer_results, settle_defer_results_enabled, with_settle_defer_results,
-        FailureReason, FixedPoint, NativeActionResult, OrderStatus, PlaceResult,
-        SETTLE_DEFER_RESULTS_PIN,
+        on_by_default_value, parse_settle_defer_results, settle_defer_results_enabled,
+        with_settle_defer_results, FailureReason, FixedPoint, NativeActionResult, OrderStatus,
+        PlaceResult, SETTLE_DEFER_RESULTS_PIN,
     };
 
     fn pin() -> Option<bool> {
         SETTLE_DEFER_RESULTS_PIN.with(|c| c.get())
     }
 
-    /// Only the trimmed value `1` turns the flag on; unset is today's code.
+    /// Values the s58 bundle's on-by-default flags (D, M, T) are tested on.
+    pub(super) const ON: [&str; 6] = ["1", " 1", "1 ", "\t1\n", "true", " true "];
+    pub(super) const OFF: [&str; 6] = ["0", " 0", "0 ", "\t0\n", "false", " false "];
+    pub(super) const INVALID: [&str; 14] = [
+        "", " ", "2", "01", "1x", "-1", "00", "on", "off", "yes", "no", "TRUE", "False", "f",
+    ];
+
+    /// The shared parse: unset, `1` or `true` = on; `0` or `false` = off
+    /// (trimmed); anything else is invalid (`None`: warned, then the
+    /// default).
     #[test]
-    fn parse_only_trimmed_one_is_on() {
-        assert!(!parse_settle_defer_results(None));
-        for off in ["", " ", "0", "true", "on", "yes", "2", "01", "1x", "-1"] {
-            assert!(
-                !parse_settle_defer_results(Some(off.to_string())),
-                "{off:?}"
-            );
+    fn on_by_default_value_classifies() {
+        assert_eq!(on_by_default_value(None), Some(true));
+        for v in ON {
+            assert_eq!(on_by_default_value(Some(v)), Some(true), "{v:?}");
         }
-        for on in ["1", " 1", "1 ", " 1 ", "\t1\n"] {
-            assert!(parse_settle_defer_results(Some(on.to_string())), "{on:?}");
+        for v in OFF {
+            assert_eq!(on_by_default_value(Some(v)), Some(false), "{v:?}");
+        }
+        for v in INVALID {
+            assert_eq!(on_by_default_value(Some(v)), None, "{v:?}");
+        }
+    }
+
+    /// s58 bundle: on by default; `0` or `false` turns it off; an invalid
+    /// value is the default (on).
+    #[test]
+    fn parse_on_by_default_zero_or_false_turns_off() {
+        assert!(parse_settle_defer_results(None));
+        for v in ON.into_iter().chain(INVALID) {
+            assert!(parse_settle_defer_results(Some(v)), "{v:?}");
+        }
+        for v in OFF {
+            assert!(!parse_settle_defer_results(Some(v)), "{v:?}");
         }
     }
 
@@ -674,7 +722,7 @@ mod settle_defer_results_flag_tests {
         assert_eq!(pin(), None);
         assert_eq!(
             settle_defer_results_enabled(),
-            parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok())
+            parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok().as_deref())
         );
     }
 
@@ -846,10 +894,11 @@ fn parallel_engine_min_fills() -> usize {
 // Phase 2 reader to the cache flush), so results are identical either way.
 // ============================================================================
 
-/// Pure parse of `TORUS_PARALLEL_MATCH_SETUP`: only `1` (trimmed) enables;
-/// unset and anything else keep today's serial setup.
-fn parse_parallel_match_setup(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+/// Pure parse of `TORUS_PARALLEL_MATCH_SETUP` (`on_by_default_flag`). On
+/// by default: `0` or `false` keeps the serial setup on the exec thread.
+#[doc(hidden)]
+pub fn parse_parallel_match_setup(v: Option<&str>) -> bool {
+    on_by_default_flag("TORUS_PARALLEL_MATCH_SETUP", v)
 }
 
 thread_local! {
@@ -874,15 +923,17 @@ pub fn with_parallel_match_setup<R>(on: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// TORUS_PARALLEL_MATCH_SETUP=1 (node-local, default off): this thread's
-/// pin, else the env var, read once per process and logged once.
+/// TORUS_PARALLEL_MATCH_SETUP (node-local, on by default; `0` turns it off):
+/// this thread's pin, else the env var, read once per process and logged
+/// once.
 fn parallel_match_setup_enabled() -> bool {
     if let Some(on) = PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = parse_parallel_match_setup(std::env::var("TORUS_PARALLEL_MATCH_SETUP").ok());
+        let on =
+            parse_parallel_match_setup(std::env::var("TORUS_PARALLEL_MATCH_SETUP").ok().as_deref());
         tracing::info!(
             enabled = on,
             "TORUS_PARALLEL_MATCH_SETUP: per-market match setup in the pool match jobs"
@@ -902,13 +953,17 @@ thread_local! {
 mod parallel_match_setup_flag_tests {
     use super::*;
 
+    /// s58 bundle: on by default; `0` or `false` turns it off; an invalid
+    /// value is the default (on).
     #[test]
-    fn only_trimmed_one_enables() {
-        assert!(parse_parallel_match_setup(Some("1".to_string())));
-        assert!(parse_parallel_match_setup(Some(" 1\n".to_string())));
-        assert!(!parse_parallel_match_setup(None));
-        for v in ["0", "", "true", "on", "yes", "2", "01", "1x"] {
-            assert!(!parse_parallel_match_setup(Some(v.to_string())), "{v}");
+    fn parse_on_by_default_zero_or_false_turns_off() {
+        use super::settle_defer_results_flag_tests::{INVALID, OFF, ON};
+        assert!(parse_parallel_match_setup(None));
+        for v in ON.into_iter().chain(INVALID) {
+            assert!(parse_parallel_match_setup(Some(v)), "{v:?}");
+        }
+        for v in OFF {
+            assert!(!parse_parallel_match_setup(Some(v)), "{v:?}");
         }
     }
 
@@ -1056,15 +1111,17 @@ struct PrepPass {
     excess_im: FixedPoint,
 }
 
-/// s58 (perf experiment sell-top-up-stitch-list; node-local, default off):
-/// `TORUS_FAST_SELL_TOP_UPS=1` takes the B-blind top-ups from a candidate
-/// list the Phase-2 stitch records ([`NativeExecutor::sell_top_ups_fast`])
-/// instead of a scan of every prepared order, with a per-sender run cache,
-/// and batches the s92 counter loop
-/// ([`NativeExecutor::record_margin_cuts_batched`]). State and counters are
-/// identical either way. Pure parse: only a trimmed `"1"` enables.
-fn parse_fast_sell_top_ups(v: Option<String>) -> bool {
-    matches!(v.as_deref().map(str::trim), Some("1"))
+/// s58 (perf experiment sell-top-up-stitch-list; node-local, on by default):
+/// `TORUS_FAST_SELL_TOP_UPS` (unset, `1` or `true`) takes the B-blind
+/// top-ups from a candidate list the Phase-2 stitch records
+/// ([`NativeExecutor::sell_top_ups_fast`]) instead of a scan of every
+/// prepared order, with a per-sender run cache, and batches the s92 counter
+/// loop ([`NativeExecutor::record_margin_cuts_batched`]). State and counters are
+/// identical either way. Pure parse (`on_by_default_flag`): on by default,
+/// `0` or `false` keeps the scan and the per-order counter loop.
+#[doc(hidden)]
+pub fn parse_fast_sell_top_ups(v: Option<&str>) -> bool {
+    on_by_default_flag("TORUS_FAST_SELL_TOP_UPS", v)
 }
 
 thread_local! {
@@ -1104,7 +1161,7 @@ fn fast_sell_top_ups_enabled() -> bool {
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = parse_fast_sell_top_ups(std::env::var("TORUS_FAST_SELL_TOP_UPS").ok());
+        let on = parse_fast_sell_top_ups(std::env::var("TORUS_FAST_SELL_TOP_UPS").ok().as_deref());
         tracing::info!(
             enabled = on,
             "TORUS_FAST_SELL_TOP_UPS (s58): B-blind top-ups from the stitch list"

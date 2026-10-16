@@ -16,6 +16,7 @@ use std::sync::Arc;
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{
+    parse_fast_sell_top_ups, parse_parallel_match_setup, parse_settle_defer_results,
     with_fast_sell_top_ups, with_parallel_match_setup, with_settle_defer_results,
     NativeExecContext, NativeExecutor,
 };
@@ -501,22 +502,37 @@ fn fast_top_ups_identical_on_b_blind_shapes() {
 
 /// exp/archy-s58-bundle-dmt: the bundle's three bridge flags (D
 /// `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T
-/// `TORUS_FAST_SELL_TOP_UPS`) on together equal all three off on this
-/// file's fuzzed top-up scenarios, in every mode (state, results, gas,
-/// counters, state root). `run` pins T; D and M are pinned around it.
+/// `TORUS_FAST_SELL_TOP_UPS`) at their default (unset: on) equal all three
+/// at `0` (off) on this file's fuzzed top-up scenarios, in every mode
+/// (state, results, gas, counters, state root). Each flag is pinned to its
+/// parse of the env value: `run` pins T; D and M are pinned around it.
 #[test]
 fn s58_bundle_dmt_identical_to_flags_off() {
+    // On by default (unset), all off at "0": else the comparison is vacuous.
+    for (env, want) in [(None, true), (Some("0"), false)] {
+        assert_eq!(
+            [
+                parse_settle_defer_results(env),
+                parse_parallel_match_setup(env),
+                parse_fast_sell_top_ups(env),
+            ],
+            [want; 3],
+            "D, M, T at {env:?}"
+        );
+    }
     let mut top_ups = 0;
     for seed in 0..4u64 {
         let s = fuzz_scenario(0xB1_1D00 + seed);
         for mode in MODES {
-            let dm = |on: bool| {
-                with_settle_defer_results(on, || {
-                    with_parallel_match_setup(on, || run(&s, mode, on))
+            let dmt = |env: Option<&str>| {
+                with_settle_defer_results(parse_settle_defer_results(env), || {
+                    with_parallel_match_setup(parse_parallel_match_setup(env), || {
+                        run(&s, mode, parse_fast_sell_top_ups(env))
+                    })
                 })
             };
-            let off = dm(false);
-            let on = dm(true);
+            let off = dmt(Some("0"));
+            let on = dmt(None);
             assert_eq!(on, off, "seed {seed} {mode:?}: D+M+T vs flags off");
             top_ups += off.top_ups;
         }

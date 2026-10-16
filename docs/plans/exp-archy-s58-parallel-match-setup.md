@@ -1,6 +1,11 @@
 # exp/archy-s58-parallel-match-setup
 
 Branch: `exp/archy-s58-parallel-match-setup` (base `exp/archy-s58-perf-search` = main `a44000e0`). Not pushed.
+
+On `exp/archy-s58-bundle-dmt` (s62 owner decision) this flag is ON by default: unset, `1` or `true` = on;
+`0` or `false` = off; anything else logs a warning once and stays on. See
+`docs/plans/exp-archy-s58-bundle-dmt.md`. The text below describes the flag branch (default off).
+
 Flag: `TORUS_PARALLEL_MATCH_SETUP=1`. Node-local and default off. Only `1` (after trim) turns it on. It is read
 once per process and logged once (`tracing::info!`, `enabled = ...`). Tests pin it per thread with
 `with_parallel_match_setup(on, || ..)`.

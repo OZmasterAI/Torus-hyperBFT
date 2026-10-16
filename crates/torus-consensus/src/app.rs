@@ -27410,24 +27410,39 @@ mod crash_recovery_tests {
     /// exp/archy-s58-bundle-dmt: the bundle's node-local flags together
     /// leave the state of all flags off. D (`TORUS_SETTLE_DEFER_RESULTS`), M
     /// (`TORUS_PARALLEL_MATCH_SETUP`) and T (`TORUS_FAST_SELL_TOP_UPS`) are
-    /// pinned per thread (the executor reads them on the calling thread, E
-    /// here), E (`TORUS_EPOCH_FAST_PATH`) is the context field. Over the 130
-    /// P2 blocks (boundaries 50 / 100), pipelined with a checkpoint every 5
-    /// blocks: D+M+T and D+M+T+E each equal the all-off run per block (write
-    /// sets), in the running hash, every CF and the persisted native root.
+    /// on by default: the on run pins each per thread to its parse of the
+    /// unset env, the off run to its parse of `0` (the executor reads them on
+    /// the calling thread, E here). E (`TORUS_EPOCH_FAST_PATH`, default off)
+    /// is the context field. Over the 130 P2 blocks (boundaries 50 / 100),
+    /// pipelined with a checkpoint every 5 blocks: D+M+T and D+M+T+E each
+    /// equal the all-off run per block (write sets), in the running hash,
+    /// every CF and the persisted native root.
     /// The per-flag differentials are the bridge's
     /// `settle_defer_results_tests`, `parallel_match_setup_tests`,
     /// `sell_top_up_stitch_diff_tests` and the epoch fast path tests above.
     #[test]
     fn s58_bundle_dmt_and_epoch_fast_path_state_equals_flags_off() {
         use torus_bridge::native_executor::{
+            parse_fast_sell_top_ups, parse_parallel_match_setup, parse_settle_defer_results,
             with_fast_sell_top_ups, with_parallel_match_setup, with_settle_defer_results, BookMode,
         };
+        // On by default (unset), all off at "0": else the comparison is vacuous.
+        for (env, want) in [(None, true), (Some("0"), false)] {
+            assert_eq!(
+                [
+                    parse_settle_defer_results(env),
+                    parse_parallel_match_setup(env),
+                    parse_fast_sell_top_ups(env),
+                ],
+                [want; 3],
+                "D, M, T at {env:?}"
+            );
+        }
         let (blocks, _) = p2_blocks(false);
-        let run = |dmt: bool, fast: bool| {
-            with_settle_defer_results(dmt, || {
-                with_parallel_match_setup(dmt, || {
-                    with_fast_sell_top_ups(dmt, || {
+        let run = |dmt: Option<&str>, fast: bool| {
+            with_settle_defer_results(parse_settle_defer_results(dmt), || {
+                with_parallel_match_setup(parse_parallel_match_setup(dmt), || {
+                    with_fast_sell_top_ups(parse_fast_sell_top_ups(dmt), || {
                         p2_run_fast(
                             &blocks,
                             true,
@@ -27440,10 +27455,10 @@ mod crash_recovery_tests {
                 })
             })
         };
-        let off = run(false, false);
+        let off = run(Some("0"), false);
         let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
         for (what, fast) in [("D+M+T", false), ("D+M+T+E", true)] {
-            let on = run(true, fast);
+            let on = run(None, fast);
             assert_write_sets_equal(&off.captured, &on.captured, what);
             assert!(on.hash.is_some());
             assert_eq!(off.hash, on.hash, "{what}: running hash");

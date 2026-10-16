@@ -22,6 +22,7 @@
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{
+    parse_fast_sell_top_ups, parse_parallel_match_setup, parse_settle_defer_results,
     with_fast_sell_top_ups, with_parallel_match_setup, with_settle_defer_results,
     NativeActionResult, NativeExecContext, NativeExecutor,
 };
@@ -428,22 +429,37 @@ fn settle_defer_results_flag_flip_between_calls() {
 
 /// exp/archy-s58-bundle-dmt: the bundle's three bridge flags (D
 /// `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T
-/// `TORUS_FAST_SELL_TOP_UPS`) pinned on together equal all three pinned off
-/// on this file's pass-B scenarios (every result field, gas, CFs, fills,
-/// counters, state root), at every pass-A cap.
+/// `TORUS_FAST_SELL_TOP_UPS`) at their default (unset: on) equal all three
+/// at `0` (off) on this file's pass-B scenarios (every result field, gas,
+/// CFs, fills, counters, state root), at every pass-A cap. Each flag is
+/// pinned to its parse of the env value (env vars race across test threads).
 #[test]
 fn s58_bundle_dmt_identical_to_flags_off() {
-    let all = |on: bool, f: &dyn Fn() -> Fingerprint| {
-        with_settle_defer_results(on, || {
-            with_parallel_match_setup(on, || with_fast_sell_top_ups(on, f))
+    // On by default (unset), all off at "0": else the comparison is vacuous.
+    for (env, want) in [(None, true), (Some("0"), false)] {
+        assert_eq!(
+            [
+                parse_settle_defer_results(env),
+                parse_parallel_match_setup(env),
+                parse_fast_sell_top_ups(env),
+            ],
+            [want; 3],
+            "D, M, T at {env:?}"
+        );
+    }
+    let all = |env: Option<&str>, f: &dyn Fn() -> Fingerprint| {
+        with_settle_defer_results(parse_settle_defer_results(env), || {
+            with_parallel_match_setup(parse_parallel_match_setup(env), || {
+                with_fast_sell_top_ups(parse_fast_sell_top_ups(env), f)
+            })
         })
     };
     for (seed, markets, storm) in [(0xC3C3_5EED, 6, 200), (0x5E77_1E00_0058, 24, 600)] {
         let batches = fuzz_batches(seed, markets, storm);
         for record_fills in [true, false] {
             for cap in [1usize, 2, 8] {
-                let off = all(false, &|| run(&batches, cap, record_fills));
-                let on = all(true, &|| run(&batches, cap, record_fills));
+                let off = all(Some("0"), &|| run(&batches, cap, record_fills));
+                let on = all(None, &|| run(&batches, cap, record_fills));
                 assert_eq!(
                     off, on,
                     "D+M+T diverged (seed {seed:#x}, {markets} markets, cap {cap}, record_fills {record_fills})"

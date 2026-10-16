@@ -4,6 +4,10 @@ Branch `exp/archy-s58-sell-top-up-stitch-list`, worktree
 `/home/oz/projects/wt/exp-s58-sell-top-up-stitch-list`, based on
 `exp/archy-s58-perf-search` = main `a44000e0`. Built and tested on ozarchy. No bench run yet.
 
+On `exp/archy-s58-bundle-dmt` (s62 owner decision) this flag is ON by default: unset, `1` or `true` = on;
+`0` or `false` = off; anything else logs a warning once and stays on. See
+`docs/plans/exp-archy-s58-bundle-dmt.md`. The text below describes the flag branch (default off).
+
 Flag: `TORUS_FAST_SELL_TOP_UPS=1`. It is node-local and off by default. Unset (or any value other than a
 trimmed `1`) runs today's code: nothing is recorded, and today's `sell_top_ups` call and the per-order s92
 counter loop run. The env var is read once per process (OnceLock) and logged once with `tracing::info!`.

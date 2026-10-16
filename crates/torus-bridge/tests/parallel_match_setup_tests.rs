@@ -19,6 +19,7 @@
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{
+    parse_fast_sell_top_ups, parse_parallel_match_setup, parse_settle_defer_results,
     with_fast_sell_top_ups, with_parallel_match_setup, with_settle_defer_results,
     NativeExecContext, NativeExecutor,
 };
@@ -495,20 +496,35 @@ fn flag_on_is_byte_identical_second_seed() {
 
 /// exp/archy-s58-bundle-dmt: the bundle's three bridge flags (D
 /// `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T
-/// `TORUS_FAST_SELL_TOP_UPS`) pinned on together equal all three pinned off
-/// on this file's match-setup scenarios, on every batch path.
+/// `TORUS_FAST_SELL_TOP_UPS`) at their default (unset: on) equal all three
+/// at `0` (off) on this file's match-setup scenarios, on every batch path.
+/// Each flag is pinned to its parse of the env value.
 #[test]
 fn s58_bundle_dmt_identical_to_flags_off() {
-    let all = |on: bool, f: &dyn Fn() -> Fingerprint| {
-        with_settle_defer_results(on, || {
-            with_parallel_match_setup(on, || with_fast_sell_top_ups(on, f))
+    // On by default (unset), all off at "0": else the comparison is vacuous.
+    for (env, want) in [(None, true), (Some("0"), false)] {
+        assert_eq!(
+            [
+                parse_settle_defer_results(env),
+                parse_parallel_match_setup(env),
+                parse_fast_sell_top_ups(env),
+            ],
+            [want; 3],
+            "D, M, T at {env:?}"
+        );
+    }
+    let all = |env: Option<&str>, f: &dyn Fn() -> Fingerprint| {
+        with_settle_defer_results(parse_settle_defer_results(env), || {
+            with_parallel_match_setup(parse_parallel_match_setup(env), || {
+                with_fast_sell_top_ups(parse_fast_sell_top_ups(env), f)
+            })
         })
     };
     for seed in [0x5E7_0B5E7u64, 0xD15C_0BAD] {
         let batches = scenario(seed);
         for path in PATHS {
-            let off = all(false, &|| run_once(&batches, path));
-            let on = all(true, &|| run_once(&batches, path));
+            let off = all(Some("0"), &|| run_once(&batches, path));
+            let on = all(None, &|| run_once(&batches, path));
             assert_eq!(off, on, "seed {seed:#x} {path:?}: D+M+T vs flags off");
         }
     }

@@ -1111,15 +1111,17 @@ fn batched_margin_cut_counters_equal_record_margin_cuts() {
     );
 }
 
-/// The toggle: only a trimmed "1" turns it on.
+/// s58 bundle: on by default; `0` or `false` turns it off; an invalid value
+/// is the default (on).
 #[test]
 fn fast_sell_top_ups_toggle_parse() {
-    assert!(!parse_fast_sell_top_ups(None));
-    for v in ["1", " 1 ", "1\n"] {
-        assert!(parse_fast_sell_top_ups(Some(v.to_string())), "{v:?}");
+    use crate::native_executor::settle_defer_results_flag_tests::{INVALID, OFF, ON};
+    assert!(parse_fast_sell_top_ups(None));
+    for v in ON.into_iter().chain(INVALID) {
+        assert!(parse_fast_sell_top_ups(Some(v)), "{v:?}");
     }
-    for v in ["0", "", "true", "on", "yes", "2", "11"] {
-        assert!(!parse_fast_sell_top_ups(Some(v.to_string())), "{v:?}");
+    for v in OFF {
+        assert!(!parse_fast_sell_top_ups(Some(v)), "{v:?}");
     }
 }
 
