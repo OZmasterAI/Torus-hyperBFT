@@ -2229,7 +2229,21 @@ None of these changes block speed or matched/s; they are correctness and UX choi
    - Admission keeps accepting both encodings of a tx, the bare EIP-2718 bytes and alloy's network form; both
      decode to one tx and one hash (`evm_tx_hash`), and trailing bytes are refused in both. Alt: refuse the network
      form (breaks our RPC tests and clients using alloy's `encode`, gains nothing).
-7. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
+7. **C10 devnet (RESULTS.md in `/tmp/item7s2-devnet-check/`), checks d and e:** accepted on the plan's main
+   criterion, "every tx lands at most one EVM height after its target" (100%). On the literal "`EVM heights waited`
+   <= 2 for 100%", 566/600 passed: every tx that waited 3 had a view timeout in its window (routing aims at the next
+   EVM height above the latest proposal; the timeout moved that height's leader and the re-send landed it one height
+   later). None lost; worst wait 24 blocks (step 1: 661).
+   - Alt: hold the merge until routing also covers a moved leader (for example re-send on every view change, or
+     route to one more leader). Revisit if Q7 or a testnet shows waits above 2 EVM heights without timeouts.
+8. **Big lane after a view timeout:** a timeout before a big-lane tx's first target moves both predicted big
+   leaders, so the tx waits two big intervals instead of one (about 15 s at M = 50). Accepted and documented: big
+   blocks are off at genesis (M = 0), and the onchain mempool parked for Phase 5 removes routing entirely.
+   - Alt: route big-lane txs to a third leader, or re-send on a view change.
+9. **Before the merge (owner s126):** the EVM drain skips txs already in pending proposals, as the native drain does.
+   The C10 devnet showed the same tx at two adjacent EVM heights with big blocks on (second copy skipped at execution,
+   about 1% of block entries). And main is merged into `feat/item7-step2` before Q7, so the A/B benches what lands.
+10. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
    Phase 5 (rules in `item6-phase5-impl.md`, `item7-step2-design.md` and `docs/perf/bench-queue.md`).
 
 ## Effort (one builder)
