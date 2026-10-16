@@ -122,7 +122,15 @@ impl NativeActionResult {
     /// filled with the rest cancelled (HL: filled), pending trigger. Either
     /// way it costs the executed order's gas: the label changes no total.
     fn placed(result: &PlaceResult) -> Self {
-        match result.reject {
+        Self::placed_reject(result.reject)
+    }
+
+    /// [`Self::placed`] from the book's reject alone, all it reads: the one
+    /// value builder of pass B's inline write and of its s58 deferred write
+    /// (`TORUS_SETTLE_DEFER_RESULTS`).
+    #[inline]
+    fn placed_reject(reject: Option<FailureReason>) -> Self {
+        match reject {
             None => Self::ok("place_order", PLACE_ORDER_GAS),
             // The message is the reason's canonical one (torus-state, one
             // table for the executor and the action status record).
@@ -582,6 +590,227 @@ fn settle_worker_cap() -> usize {
     ))
 }
 
+/// s58 bundle (D, M, T): an on-by-default flag's value, trimmed, any case.
+/// Unset, empty (`VAR=`, whitespace only: drivers blank a knob that way to
+/// mean "not set"), `1` or `true` = on; `0` or `false` = off; anything else
+/// = `None`, not a valid value ([`on_by_default_flag`] warns and uses the
+/// default, on).
+fn on_by_default_value(v: Option<&str>) -> Option<bool> {
+    let Some(v) = v else {
+        return Some(true);
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// s58 bundle (D, M, T): [`on_by_default_value`], an invalid value logged as
+/// a warning and taken as the default (on). The flags read their env once
+/// per process, so the warning is logged once.
+fn on_by_default_flag(name: &str, v: Option<&str>) -> bool {
+    on_by_default_value(v).unwrap_or_else(|| {
+        tracing::warn!(
+            value = v.unwrap_or_default(),
+            "{name}: not empty, 1, true, 0 or false (any case); using the default (on)"
+        );
+        true
+    })
+}
+
+/// s58 settle-passb-deferred-results-scatter: pure parse of
+/// `TORUS_SETTLE_DEFER_RESULTS` (`on_by_default_flag`). On by default:
+/// `0` or `false` keeps pass B's inline results write.
+#[doc(hidden)]
+pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
+    on_by_default_flag("TORUS_SETTLE_DEFER_RESULTS", v)
+}
+
+thread_local! {
+    /// s58: [`with_settle_defer_results`]'s per-thread pin; `None` = the env.
+    static SETTLE_DEFER_RESULTS_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// s58: runs `f` with the deferred-results flag pinned to `on` on this
+/// thread (tests and differential runs: env vars are per process and race
+/// across test threads). Pass B runs on the calling thread, so the pin
+/// reaches it. The previous pin comes back when `f` returns or unwinds.
+#[doc(hidden)]
+pub fn with_settle_defer_results<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SETTLE_DEFER_RESULTS_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SETTLE_DEFER_RESULTS_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// s58 (`TORUS_SETTLE_DEFER_RESULTS`, node-local, on by default; `0` turns
+/// it off): the parallel settle's pass B records each placed order's book
+/// reject (1 byte per flat action) and writes every placed result in ONE
+/// sequential pass after its market loop, instead of one 56-byte write per
+/// order at a stride of about a market's slots (markets ascend; the bench
+/// draws a market per order), where the old slot's drop-glue load missed on
+/// every write. Same values, same slots: only the write order changes. The
+/// thread's pin if set, else the env read once per process.
+fn settle_defer_results_enabled() -> bool {
+    if let Some(on) = SETTLE_DEFER_RESULTS_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on =
+            parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok().as_deref());
+        tracing::info!(
+            on,
+            "TORUS_SETTLE_DEFER_RESULTS: settle pass B deferred results write"
+        );
+        on
+    })
+}
+
+#[cfg(test)]
+mod settle_defer_results_flag_tests {
+    use super::{
+        on_by_default_value, parse_settle_defer_results, settle_defer_results_enabled,
+        with_settle_defer_results, FailureReason, FixedPoint, NativeActionResult, OrderStatus,
+        PlaceResult, SETTLE_DEFER_RESULTS_PIN,
+    };
+
+    fn pin() -> Option<bool> {
+        SETTLE_DEFER_RESULTS_PIN.with(|c| c.get())
+    }
+
+    /// Values the s58 bundle's on-by-default flags (D, M, T) are tested on.
+    /// `1` / `true` / `0` / `false` match in any case, trimmed; empty or
+    /// whitespace only (`VAR=`) is unset: on, valid (no warning).
+    pub(super) const ON: [&str; 16] = [
+        "1", " 1", "1 ", "\t1\n", "true", " true ", "TRUE", "True", "tRuE", " TRUE ", "", " ",
+        "   ", "\t", "\n", " \t\n ",
+    ];
+    pub(super) const OFF: [&str; 10] = [
+        "0", " 0", "0 ", "\t0\n", "false", " false ", "FALSE", "False", "fAlSe", " FALSE ",
+    ];
+    pub(super) const INVALID: [&str; 15] = [
+        "2", "01", "1x", "-1", "00", "on", "off", "yes", "no", "f", "t", "truee", "true1",
+        "false0", "1 0",
+    ];
+
+    /// The shared parse: unset, empty, `1` or `true` = on; `0` or `false` =
+    /// off (trimmed, any case); anything else is invalid (`None`: warned,
+    /// then the default).
+    #[test]
+    fn on_by_default_value_classifies() {
+        assert_eq!(on_by_default_value(None), Some(true));
+        for v in ["", " ", "   ", "\t\n"] {
+            assert_eq!(on_by_default_value(Some(v)), Some(true), "empty {v:?}");
+        }
+        for v in ON {
+            assert_eq!(on_by_default_value(Some(v)), Some(true), "{v:?}");
+        }
+        for v in OFF {
+            assert_eq!(on_by_default_value(Some(v)), Some(false), "{v:?}");
+        }
+        for v in INVALID {
+            assert_eq!(on_by_default_value(Some(v)), None, "{v:?}");
+        }
+    }
+
+    /// s58 bundle: on by default (unset or empty); `0` or `false` (any case)
+    /// turns it off; an invalid value is the default (on).
+    #[test]
+    fn parse_on_by_default_zero_or_false_turns_off() {
+        assert!(parse_settle_defer_results(None));
+        for v in ON.into_iter().chain(INVALID) {
+            assert!(parse_settle_defer_results(Some(v)), "{v:?}");
+        }
+        for v in OFF {
+            assert!(!parse_settle_defer_results(Some(v)), "{v:?}");
+        }
+    }
+
+    /// Unpinned, the flag is the env's (read once per process).
+    #[test]
+    fn unpinned_follows_env() {
+        assert_eq!(pin(), None);
+        assert_eq!(
+            settle_defer_results_enabled(),
+            parse_settle_defer_results(std::env::var("TORUS_SETTLE_DEFER_RESULTS").ok().as_deref())
+        );
+    }
+
+    /// The pin wins over the env, nests, restores the previous pin on the
+    /// way out (a panic included) and stays on its own thread.
+    #[test]
+    fn pin_overrides_nests_and_restores() {
+        assert_eq!(pin(), None);
+        with_settle_defer_results(true, || {
+            assert!(settle_defer_results_enabled());
+            with_settle_defer_results(false, || {
+                assert!(!settle_defer_results_enabled());
+                assert_eq!(pin(), Some(false));
+            });
+            assert_eq!(pin(), Some(true));
+            std::thread::spawn(|| assert_eq!(pin(), None))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(pin(), None);
+
+        let caught = std::panic::catch_unwind(|| {
+            with_settle_defer_results(true, || -> () { panic!("inside the pin") })
+        });
+        assert!(caught.is_err());
+        assert_eq!(pin(), None, "a panic must not leak the pin");
+    }
+
+    /// The deferred record is 1 byte per flat action (~90 KB at 300 markets
+    /// x 600 s: an L2-sized side buffer next to the result slots).
+    #[test]
+    fn deferred_record_is_one_byte() {
+        assert_eq!(std::mem::size_of::<Option<Option<FailureReason>>>(), 1);
+    }
+
+    /// The deferred write and the inline write build the same value:
+    /// `placed_reject(r)` == `placed(&PlaceResult { reject: r, .. })`, field
+    /// by field, for `None` and every `FailureReason`.
+    #[test]
+    fn placed_reject_equals_placed() {
+        let every: Vec<FailureReason> = (0..=15u8).map(FailureReason::from_u8).collect();
+        for (code, r) in every.iter().enumerate() {
+            assert_eq!(*r as u8 as usize, code, "from_u8 must cover all 16 codes");
+        }
+        for reject in std::iter::once(None).chain(every.into_iter().map(Some)) {
+            let result = PlaceResult {
+                order_id: 7,
+                status: if reject.is_some() {
+                    OrderStatus::Rejected
+                } else {
+                    OrderStatus::Filled
+                },
+                fills: vec![],
+                self_trade_cancels: vec![],
+                rested_qty: FixedPoint::ZERO,
+                reduce_only_cuts: vec![],
+                triggered_stops: vec![],
+                margin_cancels: vec![],
+                margin_cut_price: None,
+                reject,
+            };
+            let row =
+                |a: NativeActionResult| (a.action_type, a.success, a.error, a.gas_used, a.reason);
+            assert_eq!(
+                row(NativeActionResult::placed(&result)),
+                row(NativeActionResult::placed_reject(reject)),
+                "{reject:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod parallel_settle_toggle_tests {
     use super::parse_parallel_settle_toggle;
@@ -673,6 +902,192 @@ fn parallel_engine_min_fills() -> usize {
     })
 }
 
+// ============================================================================
+// exp/archy-s58 parallel-match-setup — TORUS_PARALLEL_MATCH_SETUP: build each
+// market's Phase 3 match inputs (reduce-only positions, account margins,
+// match requests) inside its pool match job instead of serially on the exec
+// thread. The setup only reads frozen state (the backend is frozen from the
+// Phase 2 reader to the cache flush), so results are identical either way.
+// ============================================================================
+
+/// Pure parse of `TORUS_PARALLEL_MATCH_SETUP` (`on_by_default_flag`). On
+/// by default: `0` or `false` keeps the serial setup on the exec thread.
+#[doc(hidden)]
+pub fn parse_parallel_match_setup(v: Option<&str>) -> bool {
+    on_by_default_flag("TORUS_PARALLEL_MATCH_SETUP", v)
+}
+
+thread_local! {
+    /// [`with_parallel_match_setup`]'s pin on this thread (`None`: the env).
+    static PARALLEL_MATCH_SETUP_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with TORUS_PARALLEL_MATCH_SETUP pinned to `on` on this thread
+/// (the executor reads the flag on the calling thread), restoring the
+/// previous pin afterwards, also on unwind. For the flag-on / flag-off
+/// differential tests and benches (per-process env vars race across test
+/// threads; this does not). Not an API.
+#[doc(hidden)]
+pub fn with_parallel_match_setup<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PARALLEL_MATCH_SETUP_PIN.with(|p| p.set(self.0));
+        }
+    }
+    let _restore = Restore(PARALLEL_MATCH_SETUP_PIN.with(|p| p.replace(Some(on))));
+    f()
+}
+
+/// TORUS_PARALLEL_MATCH_SETUP (node-local, on by default; `0` turns it off):
+/// this thread's pin, else the env var, read once per process and logged
+/// once.
+fn parallel_match_setup_enabled() -> bool {
+    if let Some(on) = PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on =
+            parse_parallel_match_setup(std::env::var("TORUS_PARALLEL_MATCH_SETUP").ok().as_deref());
+        tracing::info!(
+            enabled = on,
+            "TORUS_PARALLEL_MATCH_SETUP: per-market match setup in the pool match jobs"
+        );
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Phase 3 calls on this thread that built the match inputs in the pool
+    /// jobs ([`MarketWorkerPool::match_parallel_setup_with`]).
+    static MATCH_SETUP_IN_JOBS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod parallel_match_setup_flag_tests {
+    use super::*;
+
+    /// s58 bundle: on by default (unset or empty); `0` or `false` (any case)
+    /// turns it off; an invalid value is the default (on).
+    #[test]
+    fn parse_on_by_default_zero_or_false_turns_off() {
+        use super::settle_defer_results_flag_tests::{INVALID, OFF, ON};
+        assert!(parse_parallel_match_setup(None));
+        for v in ON.into_iter().chain(INVALID) {
+            assert!(parse_parallel_match_setup(Some(v)), "{v:?}");
+        }
+        for v in OFF {
+            assert!(!parse_parallel_match_setup(Some(v)), "{v:?}");
+        }
+    }
+
+    /// The pin overrides the env, nests, and is restored on return.
+    #[test]
+    fn pin_overrides_nests_and_restores() {
+        let outer = parallel_match_setup_enabled();
+        with_parallel_match_setup(true, || {
+            assert!(parallel_match_setup_enabled());
+            with_parallel_match_setup(false, || assert!(!parallel_match_setup_enabled()));
+            assert!(parallel_match_setup_enabled());
+        });
+        assert_eq!(parallel_match_setup_enabled(), outer);
+        assert_eq!(PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()), None);
+    }
+
+    /// A panic inside the pinned closure still restores the pin.
+    #[test]
+    fn pin_restored_on_unwind() {
+        let r = std::panic::catch_unwind(|| {
+            with_parallel_match_setup(true, || panic!("inside the pin"))
+        });
+        assert!(r.is_err());
+        assert_eq!(PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()), None);
+    }
+
+    /// The pin is this thread's only.
+    #[test]
+    fn pin_is_per_thread() {
+        with_parallel_match_setup(true, || {
+            let other = std::thread::spawn(|| PARALLEL_MATCH_SETUP_PIN.with(|p| p.get()))
+                .join()
+                .unwrap();
+            assert_eq!(other, None);
+        });
+    }
+
+    fn fp(v: i64) -> FixedPoint {
+        FixedPoint::from_raw(v as i128 * FixedPoint::SCALE)
+    }
+
+    fn gtc(market_id: MarketId, is_buy: bool, price: i64, qty: i64) -> (Address, NativeAction) {
+        let sender = Address::new([if is_buy { 1 } else { 2 }; 20]);
+        let p = PlaceOrderParams {
+            market_id,
+            is_buy,
+            price: fp(price),
+            quantity: fp(qty),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        (sender, NativeAction::PlaceOrder(p))
+    }
+
+    /// Phase 3 calls of a batch on this thread that built inputs in the jobs.
+    fn in_jobs_calls(pin: bool, block: &[(Address, NativeAction)]) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = torus_state::StateDb::open(dir.path()).unwrap();
+        let mut ctx = NativeExecContext::new(
+            db,
+            1,
+            1000,
+            0,
+            100,
+            10,
+            Address::new([99; 20]),
+            Address::new([100; 20]),
+            Address::new([101; 20]),
+        );
+        for n in [1u8, 2] {
+            let bal = torus_core::position::NativeBalance {
+                available: fp(1_000_000),
+                order_margin: FixedPoint::ZERO,
+            };
+            ctx.positions
+                .put_native_balance(&Address::new([n; 20]), &bal)
+                .unwrap();
+        }
+        let before = MATCH_SETUP_IN_JOBS.with(|c| c.get());
+        for threads in [0usize, 4] {
+            with_parallel_match_setup(pin, || {
+                NativeExecutor::execute_batch_engine_mode(&mut ctx, block, threads)
+            });
+            assert!(ctx.fatal_error.is_none(), "{:?}", ctx.fatal_error);
+        }
+        MATCH_SETUP_IN_JOBS.with(|c| c.get()) - before
+    }
+
+    /// Flag on: a block with >= 2 markets builds its inputs in the jobs (the
+    /// equivalence tests are not vacuous); one market keeps the inline path;
+    /// flag off never takes the in-jobs path.
+    #[test]
+    fn flag_on_multi_market_sets_up_in_jobs() {
+        let two = [
+            gtc(1, false, 100, 2),
+            gtc(2, false, 100, 2),
+            gtc(1, true, 100, 1),
+            gtc(2, true, 100, 1),
+        ];
+        let one = [gtc(1, false, 100, 2), gtc(1, true, 100, 1)];
+        assert_eq!(in_jobs_calls(true, &two), 2);
+        assert_eq!(in_jobs_calls(true, &one), 0);
+        assert_eq!(in_jobs_calls(false, &two), 0);
+    }
+}
+
 /// How the engine (Phase-2 prepare) path is chosen.
 #[derive(Clone, Copy)]
 enum EngineMode {
@@ -711,6 +1126,113 @@ struct PrepPass {
     #[cfg(test)]
     excess_im: FixedPoint,
 }
+
+/// s58 (perf experiment sell-top-up-stitch-list; node-local, on by default):
+/// `TORUS_FAST_SELL_TOP_UPS` (unset, `1` or `true`) takes the B-blind
+/// top-ups from a candidate list the Phase-2 stitch records
+/// ([`NativeExecutor::sell_top_ups_fast`]) instead of a scan of every
+/// prepared order, with a per-sender run cache, and batches the s92 counter
+/// loop ([`NativeExecutor::record_margin_cuts_batched`]). State and counters are
+/// identical either way. Pure parse (`on_by_default_flag`): on by default,
+/// `0` or `false` keeps the scan and the per-order counter loop.
+#[doc(hidden)]
+pub fn parse_fast_sell_top_ups(v: Option<&str>) -> bool {
+    on_by_default_flag("TORUS_FAST_SELL_TOP_UPS", v)
+}
+
+thread_local! {
+    /// s58: this thread's pin of [`fast_sell_top_ups_enabled`]
+    /// ([`with_fast_sell_top_ups`]); `None` = the env.
+    static FAST_SELL_TOP_UPS_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// s58 (tests): calls on this thread of `sell_top_ups_fast` (`.0`) and
+    /// of the batched s92 counter loop (`.1`).
+    static FAST_TOP_UP_PATHS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// s58: runs `f` with `TORUS_FAST_SELL_TOP_UPS` pinned to `on` on this
+/// thread (the env is ignored; the previous pin comes back after `f`, also
+/// on unwind). Not an API: the flag-on vs flag-off differential tests.
+#[doc(hidden)]
+pub fn with_fast_sell_top_ups<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FAST_SELL_TOP_UPS_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FAST_SELL_TOP_UPS_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// s58: whether an `execute_batch` call takes the fast top-ups (read once
+/// per call): this thread's pin, else `TORUS_FAST_SELL_TOP_UPS` (read once
+/// per process, logged once).
+fn fast_sell_top_ups_enabled() -> bool {
+    if let Some(on) = FAST_SELL_TOP_UPS_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = parse_fast_sell_top_ups(std::env::var("TORUS_FAST_SELL_TOP_UPS").ok().as_deref());
+        tracing::info!(
+            enabled = on,
+            "TORUS_FAST_SELL_TOP_UPS (s58): B-blind top-ups from the stitch list"
+        );
+        on
+    })
+}
+
+/// s58: one B-blind top-up candidate ([`PreparedOrder::top_up_candidate`])
+/// as the Phase-2 stitch records it ([`TopUpCand::record`]): the top-up
+/// pass needs no scan, and no load from the (cold) prepared order before a
+/// grant stores to it.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct TopUpCand {
+    /// Flat batch index ([`PreparedOrder::index`]).
+    index: usize,
+    market: MarketId,
+    /// Position in its market's prepared batch.
+    k: usize,
+    sender: Address,
+    /// `margin_reserved` at the push (Phase 2's reservation).
+    reserved: FixedPoint,
+    /// The Phase-2 reservation quantity (`prepare_one`'s basis rule).
+    res_qty: FixedPoint,
+}
+
+impl TopUpCand {
+    /// Pushes `stitched` ([`NativeExecutor::stitch_outcome`]'s return for
+    /// the PlaceOrder at flat index `i`) when the list is on (`Some`).
+    /// The stitch runs in flat order, so the list is in flat order.
+    #[inline]
+    fn record(
+        cands: &mut Option<Vec<TopUpCand>>,
+        stitched: Option<(usize, FixedPoint)>,
+        i: usize,
+        sender: &Address,
+        params: &PlaceOrderParams,
+        basis: &HashMap<usize, (FixedPoint, FixedPoint)>,
+    ) {
+        if let (Some(c), Some((k, reserved))) = (cands.as_mut(), stitched) {
+            c.push(TopUpCand {
+                index: i,
+                market: params.market_id,
+                k,
+                sender: *sender,
+                reserved,
+                res_qty: basis.get(&i).map_or(params.quantity, |b| b.1),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "sell_top_up_stitch_tests.rs"]
+mod sell_top_up_stitch_tests;
 
 /// Open-order count work (trader probes + stops) per worker thread: below
 /// 2x this the count stays on the exec thread. Every count a 300-market block
@@ -7665,6 +8187,12 @@ impl NativeExecutor {
             }
         }
 
+        // s58 (`TORUS_FAST_SELL_TOP_UPS=1`, read once per call): the stitch
+        // records the B-blind top-up candidates, in flat order, for
+        // `sell_top_ups_fast`. Off: nothing is recorded (`None`).
+        let fast_top_ups = fast_sell_top_ups_enabled();
+        let mut top_up_cands: Option<Vec<TopUpCand>> =
+            fast_top_ups.then(|| Vec::with_capacity(place_order_indices.len()));
         if let Some(mut outcomes) = prep_outcomes {
             // Serial stitch in flat order: ids go to passing orders exactly
             // as the serial loop assigns them.
@@ -7676,7 +8204,7 @@ impl NativeExecutor {
                 let Some(outcome) = outcomes[i].take() else {
                     unreachable!("every place index has a worker outcome");
                 };
-                Self::stitch_outcome(
+                let stitched = Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
                     &markets,
@@ -7687,6 +8215,7 @@ impl NativeExecutor {
                     params,
                     outcome,
                 );
+                TopUpCand::record(&mut top_up_cands, stitched, i, sender, params, &basis);
             }
         } else {
             // L3-ENG: the serial loop runs literally the sharded workers'
@@ -7709,7 +8238,7 @@ impl NativeExecutor {
                     params,
                     split_margin_label,
                 );
-                Self::stitch_outcome(
+                let stitched = Self::stitch_outcome(
                     &mut ctx.next_global_order_id,
                     &ctx.metrics,
                     &markets,
@@ -7720,6 +8249,7 @@ impl NativeExecutor {
                     params,
                     outcome,
                 );
+                TopUpCand::record(&mut top_up_cands, stitched, i, sender, params, &basis);
             }
             fold_out = Some(fold.finish());
         }
@@ -7737,18 +8267,32 @@ impl NativeExecutor {
         // need comes off their sender's pool (exact integer sum, the fold's
         // `excess_unchecked`).
         // B-blind (s92): top-ups come off what is left for the pools, so
-        // they run before the pools are read.
-        let [full, partial, none] = Self::sell_top_ups(
-            &ctx.positions,
-            ctx.typed_rows(),
-            &ctx.reader_fault,
-            &markets,
-            &basis,
-            &pool_takers,
-            &excess_by_sender,
-            &mut market_batches,
-            &mut bal_cache,
-        );
+        // they run before the pools are read. s58: from the stitch's list
+        // when it was recorded (nothing touched the batches since).
+        let [full, partial, none] = match top_up_cands {
+            Some(cands) => Self::sell_top_ups_fast(
+                &ctx.positions,
+                ctx.typed_rows(),
+                &ctx.reader_fault,
+                &markets,
+                &pool_takers,
+                &excess_by_sender,
+                &mut market_batches,
+                &mut bal_cache,
+                cands,
+            ),
+            None => Self::sell_top_ups(
+                &ctx.positions,
+                ctx.typed_rows(),
+                &ctx.reader_fault,
+                &markets,
+                &basis,
+                &pool_takers,
+                &excess_by_sender,
+                &mut market_batches,
+                &mut bal_cache,
+            ),
+        };
         ctx.phase_accum.sell_top_ups += full + partial;
         if let Some(ref m) = ctx.metrics {
             m.sell_top_ups_full.inc_by(full);
@@ -7776,6 +8320,11 @@ impl NativeExecutor {
         let mut worker_batches: HashMap<MarketId, (OrderBook, Vec<MatchRequest<'_>>)> =
             HashMap::default();
 
+        // TORUS_PARALLEL_MATCH_SETUP: with >= 2 markets, each market's
+        // inputs are built inside its pool match job (single-market blocks
+        // keep the inline path). Taking or creating the book stays here.
+        let setup_in_jobs = parallel_match_setup_enabled() && market_batches.len() >= 2;
+        let mut setup_items = Vec::new();
         for (&market_id, prepared) in &market_batches {
             // Item 6 M1 (row 42): a missing book gets the tick / lot Phase 2
             // checked against (`shapes` holds every batch market).
@@ -7791,87 +8340,22 @@ impl NativeExecutor {
                 OrderBook::new(market_id, tick, lot)
             });
 
-            // s515 (BUG 2): police reduce-only orders. Positions are loaded
-            // as of this point (all Phase-1 effects, none of this batch's
-            // fills); the book then advances them through every fill of the
-            // batch in this market (positions are keyed per market, and only
-            // this worker fills this market), so every order is checked
-            // against the position left by the block's earlier orders.
-            // Review 5: checked takers are tracked the same way — their
-            // closing fills are free at match time — so every path frees
-            // exactly the position the single path would read. F1 (s517):
-            // EVERY sender of the batch in this market is tracked (checked
-            // takers value their position; maker checks need in-batch
-            // positions).
-            // Item 6 M1: a sender whose position Phase 2 read (`pre_pos`,
-            // same reader, nothing written in between) is not read again.
-            if !prepared.is_empty() || book.has_reduce_only_orders() {
-                let mut known = ReduceOnlyPositions::new();
-                for p in prepared {
-                    if let Some((signed, _)) = p.pre_pos {
-                        known.insert(p.sender, signed);
-                    }
-                }
-                let ro = Self::reduce_only_positions_for(
-                    &reader,
-                    &book,
-                    market_id,
-                    prepared.iter().filter(|p| p.pre_pos.is_none()).map(|p| p.sender),
-                    known,
-                );
-                book.set_reduce_only_positions(ro);
+            if setup_in_jobs {
+                // TORUS_PARALLEL_MATCH_SETUP: the market's job builds its
+                // inputs ([`Self::match_setup`]); the LPT weight is its
+                // request count, as in `match_parallel_with`.
+                setup_items.push((market_id, book, prepared.as_slice(), prepared.len()));
+                continue;
             }
-
-            // s515 review 4: one shared copy of the market's tiers for the
-            // checked takers' match-time margin limits.
-            let tiers = Self::margin_tiers(ctx.margin_configs.get(&market_id));
-            // F1 (s517, D2): each checked sender's exclusive pool (0 outside
-            // the market of its first checked taker) and valuation price.
-            let mut am = AccountMargins::new(tiers.clone());
-            // s94 option 1: every fill's loss against the mark is charged.
-            // An unchecked taker (GTC buy, reduce-only) pays a charge from
-            // its pool here, else its snapshot — the pre-batch state, which
-            // still holds its own reservation (the book takes it off).
-            am.set_mark(markets.get(&market_id).and_then(|m| m.band).map(|b| b.reference));
-            am.set_pre_batch_snapshots(true);
-            for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
-                if am.get(&p.sender).is_none() {
-                    // Item 6 M1: Phase 2's `position_px` (every checked
-                    // taker passed an account check, so it has `pre_pos`).
-                    let px = match p.pre_pos {
-                        Some((_, px)) => px,
-                        None => Self::d2_taker_px(&reader, &p.sender, market_id),
-                    };
-                    #[cfg(test)]
-                    if let Some(s) = reader.sums.filter(|s| s.shadow) {
-                        let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
-                        if want != px || p.pre_pos.is_none() {
-                            s.shadow_mismatches.lock().unwrap().push(format!(
-                                "M1 px {} {market_id}: reused {px:?}, position_px {want:?}, pre_pos {:?}",
-                                p.sender, p.pre_pos
-                            ));
-                        }
-                    }
-                    // Review fix 4 (s517): only the pool market's entry is
-                    // the sender's account (shared with its makers there).
-                    match pools.get(&(p.sender, market_id)) {
-                        Some(&pool) => am.insert(p.sender, pool, px),
-                        None => am.insert_taker_only(p.sender, px),
-                    }
-                }
-            }
-            book.set_account_margins(am);
-            let requests: Vec<MatchRequest<'_>> = prepared
-                .iter()
-                .map(|p| MatchRequest {
-                    sender: p.sender,
-                    params: p.params,
-                    order_id: p.order_id,
-                    margin: p
-                        .checked_pos_net
-                        .map(|_| Self::taker_margin_limit(&tiers, p.params, p.margin_reserved)),
-                })
-                .collect();
+            let requests = Self::match_setup(
+                &reader,
+                &markets,
+                &pools,
+                &ctx.margin_configs,
+                market_id,
+                &mut book,
+                prepared,
+            );
 
             worker_batches.insert(market_id, (book, requests));
         }
@@ -7886,12 +8370,39 @@ impl NativeExecutor {
         // order in a book (Phase 2 only reserves; a worker adds only its
         // own requests, whose cloids differ by the claimed set; fired stops
         // are placed after settlement), so the books skip their re-check.
-        let mut market_results = match MarketWorkerPool::match_parallel_with(
-            worker_batches,
-            ctx.timestamp,
-            Some(&reader),
-            true,
-        ) {
+        let matched = if setup_in_jobs {
+            #[cfg(test)]
+            MATCH_SETUP_IN_JOBS.with(|c| c.set(c.get() + 1));
+            // The setup only reads `reader`, `markets`, `pools` and the
+            // configs (all frozen / immutable here) and writes its own
+            // book; a panic in it is that market's `MarketWorkerPanic`.
+            MarketWorkerPool::match_parallel_setup_with(
+                setup_items,
+                ctx.timestamp,
+                MarketWorkerPool::resolve_worker_cap_named(None),
+                Some(&reader),
+                true,
+                &|m, book, prepared| {
+                    Self::match_setup(
+                        &reader,
+                        &markets,
+                        &pools,
+                        &ctx.margin_configs,
+                        m,
+                        book,
+                        prepared,
+                    )
+                },
+            )
+        } else {
+            MarketWorkerPool::match_parallel_with(
+                worker_batches,
+                ctx.timestamp,
+                Some(&reader),
+                true,
+            )
+        };
+        let mut market_results = match matched {
             Ok(r) => r,
             Err(panic) => {
                 // T1.5 FAIL-STOP: the panicking worker consumed its market's
@@ -7952,8 +8463,20 @@ impl NativeExecutor {
             }
             // s92 counters (aligned with the market's prepared orders).
             if let (Some(m), Some(prepared)) = (ctx.metrics.as_deref(), market_batches.get(&mbr.market_id)) {
-                for (r, p) in mbr.results.iter().zip(prepared) {
-                    Self::record_margin_cuts(m, p.params.is_buy, &r.result, p.res_price, mbr.book.tick_size, p.top_up_candidate);
+                if fast_top_ups {
+                    // s58: the same counts, batched.
+                    Self::record_margin_cuts_batched(m, &mbr.results, prepared, mbr.book.tick_size);
+                } else {
+                    for (r, p) in mbr.results.iter().zip(prepared) {
+                        Self::record_margin_cuts(
+                            m,
+                            p.params.is_buy,
+                            &r.result,
+                            p.res_price,
+                            mbr.book.tick_size,
+                            p.top_up_candidate,
+                        );
+                    }
                 }
             }
         }
@@ -8349,6 +8872,8 @@ impl NativeExecutor {
     /// next global order id and joins its market's batch; a reject records
     /// its funnel counter (`orders_rejected_margin` vs `_other`) and error.
     /// Field-level borrows, so it coexists with an [`AccountReader`].
+    /// s58: returns a B-blind top-up candidate's position in its market's
+    /// batch and its reservation ([`TopUpCand::record`]); `None` otherwise.
     #[allow(clippy::too_many_arguments)]
     fn stitch_outcome<'a>(
         next_id: &mut u128,
@@ -8360,25 +8885,29 @@ impl NativeExecutor {
         sender: &Address,
         params: &'a PlaceOrderParams,
         outcome: PrepOutcome,
-    ) {
+    ) -> Option<(usize, FixedPoint)> {
         match outcome {
             PrepOutcome::Pass(pass) => {
                 let order_id = *next_id;
                 *next_id += 1;
-                market_batches
-                    .entry(params.market_id)
-                    .or_insert_with(|| Vec::with_capacity(markets.get(&params.market_id).map_or(0, |m| m.orders)))
-                    .push(PreparedOrder {
-                        index: i,
-                        sender: *sender,
-                        params,
-                        order_id,
-                        margin_reserved: pass.required,
-                        checked_pos_net: pass.checked_pos_net,
-                        pre_pos: pass.pre_pos,
-                        top_up_candidate: pass.top_up_candidate,
-                        res_price: pass.res_price,
-                    });
+                let batch = market_batches.entry(params.market_id).or_insert_with(|| {
+                    Vec::with_capacity(markets.get(&params.market_id).map_or(0, |m| m.orders))
+                });
+                let stitched = pass
+                    .top_up_candidate
+                    .then_some((batch.len(), pass.required));
+                batch.push(PreparedOrder {
+                    index: i,
+                    sender: *sender,
+                    params,
+                    order_id,
+                    margin_reserved: pass.required,
+                    checked_pos_net: pass.checked_pos_net,
+                    pre_pos: pass.pre_pos,
+                    top_up_candidate: pass.top_up_candidate,
+                    res_price: pass.res_price,
+                });
+                stitched
             }
             PrepOutcome::Reject { funnel, reason, msg } => {
                 // Funnel (perf A1): died pre-book.
@@ -8386,6 +8915,7 @@ impl NativeExecutor {
                     funnel.count(m, reason);
                 }
                 results[i] = NativeActionResult::rejected("place_order", (reason, msg));
+                None
             }
         }
     }
@@ -8935,6 +9465,16 @@ impl NativeExecutor {
         // caches into an unreserved map rehashes it at each doubling
         // (capacity only; ubench_position_cache: ~1.2 -> ~0.7 us/entry).
         pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum());
+        // s58 (`TORUS_SETTLE_DEFER_RESULTS=1`): each placed order's book
+        // reject, by flat index (`Some` = placed here, written after the
+        // market loop). 1 byte per action (`FailureReason` is a Copy u8
+        // enum), fresh per call: `execute_batch` runs twice per block.
+        let defer = settle_defer_results_enabled();
+        let mut deferred: Vec<Option<Option<FailureReason>>> = if defer {
+            vec![None; results.len()]
+        } else {
+            Vec::new()
+        };
         for (mbr, plan) in market_results.into_iter().zip(plans) {
             let market_id = mbr.market_id;
 
@@ -9064,7 +9604,11 @@ impl NativeExecutor {
                 }
 
                 *total_gas += PLACE_ORDER_GAS;
-                results[prep.index] = NativeActionResult::placed(result);
+                if defer {
+                    deferred[prep.index] = Some(result.reject);
+                } else {
+                    results[prep.index] = NativeActionResult::placed(result);
+                }
             }
 
             // cum_volume: the worker's per-trader sums when every order ran
@@ -9096,6 +9640,16 @@ impl NativeExecutor {
                     }
                     // R02: a local fault fail-stops (nothing released meanwhile).
                     Err(e) => Self::latch_core_fault(ctx, "settle maker release balance read", &e),
+                }
+            }
+        }
+        // s58: the deferred placed results, in one ascending pass (inside
+        // the pass-B timer). A fill-failed order was written inline above
+        // and never recorded, so its `None` leaves it alone.
+        if defer {
+            for (slot, d) in results.iter_mut().zip(deferred) {
+                if let Some(reject) = d {
+                    *slot = NativeActionResult::placed_reject(reject);
                 }
             }
         }
@@ -9313,6 +9867,46 @@ impl NativeExecutor {
             let bucket = torus_telemetry::margin_cut_tick_bucket(ticks);
             m.sell_margin_cuts[usize::from(non_pool)][usize::from(!result.fills.is_empty())][bucket].inc();
         }
+    }
+
+    /// s58 (`TORUS_FAST_SELL_TOP_UPS=1`): [`record_margin_cuts`] over one
+    /// market's book outcomes and prepared orders (zipped, as the per-order
+    /// loop), with the maker margin cancels and reduce-only cuts summed into
+    /// one `inc_by` each, and an order's (cold) `params.is_buy` read only
+    /// when its taker was cut. Leaves every counter where the per-order loop
+    /// leaves it (`sell_top_up_stitch_tests`).
+    fn record_margin_cuts_batched(
+        m: &torus_telemetry::Metrics,
+        results: &[crate::market_workers::MatchResult],
+        prepared: &[PreparedOrder<'_>],
+        tick: FixedPoint,
+    ) {
+        #[cfg(test)]
+        FAST_TOP_UP_PATHS.with(|c| c.set((c.get().0, c.get().1 + 1)));
+        let (mut cancels, mut cuts) = (0u64, 0u64);
+        for (r, p) in results.iter().zip(prepared) {
+            let result = &r.result;
+            cancels += result.margin_cancels.len() as u64;
+            cuts += result.reduce_only_cuts.len() as u64;
+            let Some(hit) = result.margin_cut_price else {
+                continue;
+            };
+            if p.params.is_buy {
+                continue;
+            }
+            let d = hit.raw().saturating_sub(p.res_price.raw());
+            let ticks = if d <= 0 {
+                0
+            } else {
+                (d - 1) / tick.raw().max(1) + 1
+            };
+            let bucket = torus_telemetry::margin_cut_tick_bucket(ticks);
+            m.sell_margin_cuts[usize::from(p.top_up_candidate)]
+                [usize::from(!result.fills.is_empty())][bucket]
+                .inc();
+        }
+        m.maker_margin_cancels.inc_by(cancels);
+        m.reduce_only_cuts.inc_by(cuts);
     }
 
     /// A5 (maker-fill margin leak): THE reserve/release formula.
@@ -10078,6 +10672,124 @@ impl NativeExecutor {
         counts
     }
 
+    /// s58 (`TORUS_FAST_SELL_TOP_UPS=1`): [`sell_top_ups`] from the
+    /// candidates the Phase-2 stitch recorded ([`TopUpCand`]; flat order,
+    /// which is the scan's sort) instead of a scan of every prepared order.
+    /// The top-up price is taken once per market; a candidate's reservation
+    /// and quantity come from the list, so a prepared order is only stored
+    /// to (on a grant). A run of one sender's consecutive candidates holds
+    /// one balance: loaded at the run's first candidate that needs a top-up
+    /// (the scan's reads, the same skip on a read fault, retried by the next
+    /// candidate), written back once at the run's end and only if the run
+    /// granted ([`BalanceCache::set`] marks an entry dirty once, so the
+    /// dirty flags and list are the scan's). Each grant is the scan's
+    /// expression, per candidate. Same orders, counts, cache and reader
+    /// fault as the scan (`sell_top_up_stitch_tests`).
+    #[allow(clippy::too_many_arguments)]
+    fn sell_top_ups_fast<T: StateBackend>(
+        positions: &PositionManager<T>,
+        typed: Option<&dyn TypedRows>,
+        fault: &std::sync::OnceLock<String>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        pools: &HashMap<Address, (MarketId, FixedPoint)>,
+        excess_by_sender: &HashMap<Address, FixedPoint>,
+        market_batches: &mut HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        bal_cache: &mut BalanceCache,
+        cands: Vec<TopUpCand>,
+    ) -> [u64; 3] {
+        #[cfg(test)]
+        FAST_TOP_UP_PATHS.with(|c| c.set((c.get().0 + 1, c.get().1)));
+        debug_assert!(
+            cands.windows(2).all(|w| w[0].index < w[1].index),
+            "top-up candidates out of flat order"
+        );
+        let mut counts = [0u64; 3];
+        // Per market: (top-up price, margin config); `None` = no top-up.
+        let mut prices: HashMap<MarketId, Option<(FixedPoint, Option<&MarketMarginConfig>)>> =
+            HashMap::with_capacity_and_hasher(markets.len(), Default::default());
+        // The current run: its sender; once read, its balance, pos_net and
+        // excess; whether it granted.
+        let mut run: Option<Address> = None;
+        let mut acct: Option<(NativeBalance, FixedPoint, FixedPoint)> = None;
+        let mut granted = false;
+        for c in &cands {
+            if run != Some(c.sender) {
+                if let (true, Some(sender), Some((bal, _, _))) = (granted, run, acct.take()) {
+                    bal_cache.set(&sender, bal);
+                }
+                run = Some(c.sender);
+                granted = false;
+            }
+            let Some((price, cfg)) = *prices.entry(c.market).or_insert_with(|| {
+                markets.get(&c.market).and_then(|m| {
+                    m.bid_floor
+                        .and_then(Self::sell_top_up_price)
+                        .map(|price| (price, m.cfg))
+                })
+            }) else {
+                continue;
+            };
+            let Some(p) = market_batches
+                .get_mut(&c.market)
+                .and_then(|b| b.get_mut(c.k))
+            else {
+                continue;
+            };
+            let Ok(target) = Self::try_reserve_for_qty_cfg(cfg, price, c.res_qty) else {
+                continue;
+            };
+            let extra = target - c.reserved;
+            if extra <= FixedPoint::ZERO {
+                continue;
+            }
+            if acct.is_none() {
+                // R02: a local fault fail-stops (`fault`: the reader fault
+                // channel); no top-up meanwhile.
+                match bal_cache.load(positions, typed, &c.sender) {
+                    Ok(bal) => {
+                        let pos_net = pools.get(&c.sender).map_or(FixedPoint::ZERO, |v| v.1);
+                        let excess = excess_by_sender
+                            .get(&c.sender)
+                            .copied()
+                            .unwrap_or(FixedPoint::ZERO);
+                        acct = Some((bal, pos_net, excess));
+                    }
+                    Err(e) => {
+                        note_reader_fault(fault, "sell top-up balance read", &e);
+                        continue;
+                    }
+                }
+            }
+            let Some((bal, pos_net, excess)) = acct.as_mut() else {
+                continue;
+            };
+            let grant = extra.min(bal.available + *pos_net - *excess);
+            if grant <= FixedPoint::ZERO {
+                counts[2] += 1;
+                continue;
+            }
+            bal.available -= grant;
+            bal.order_margin += grant;
+            granted = true;
+            debug_assert_eq!(
+                (p.index, p.margin_reserved),
+                (c.index, c.reserved),
+                "stale top-up candidate"
+            );
+            p.margin_reserved = c.reserved + grant;
+            if grant == extra {
+                p.res_price = price;
+                counts[0] += 1;
+            } else {
+                counts[1] += 1;
+            }
+        }
+        if let (true, Some(sender), Some((bal, _, _))) = (granted, run, acct) {
+            bal_cache.set(&sender, bal);
+        }
+        counts
+    }
+
     /// B-blind (s92): the top-up price `B0 x (1 + SELL_TOP_UP_BPS / 10,000)`
     /// in exact integer math on the raw value, rounded down; `None` on
     /// overflow (no top-up).
@@ -10197,6 +10909,108 @@ impl NativeExecutor {
         } else {
             None
         }
+    }
+
+    /// Phase 3 setup of one market (s515 / review 4 / F1 / item 6 M1): the
+    /// reduce-only positions `book` polices, its checked takers' account
+    /// margins (D2 pool or taker-only), and its match requests. Only READS
+    /// (`reader` over the frozen backend, the call's immutable `markets`,
+    /// `pools` and configs) and writes `book`, so it runs on the exec thread
+    /// or, TORUS_PARALLEL_MATCH_SETUP=1, inside the market's pool match job
+    /// with the same result. Never iterates `ReduceOnlyPositions` or
+    /// `AccountMargins`.
+    fn match_setup<'a, T: StateBackend>(
+        reader: &AccountReader<'_, T>,
+        markets: &HashMap<MarketId, Phase2Market<'_>>,
+        pools: &HashMap<(Address, MarketId), FixedPoint>,
+        margin_configs: &HashMap<MarketId, MarketMarginConfig>,
+        market_id: MarketId,
+        book: &mut OrderBook,
+        prepared: &[PreparedOrder<'a>],
+    ) -> Vec<MatchRequest<'a>> {
+        // s515 (BUG 2): police reduce-only orders. Positions are loaded
+        // as of this point (all Phase-1 effects, none of this batch's
+        // fills); the book then advances them through every fill of the
+        // batch in this market (positions are keyed per market, and only
+        // this worker fills this market), so every order is checked
+        // against the position left by the block's earlier orders.
+        // Review 5: checked takers are tracked the same way — their
+        // closing fills are free at match time — so every path frees
+        // exactly the position the single path would read. F1 (s517):
+        // EVERY sender of the batch in this market is tracked (checked
+        // takers value their position; maker checks need in-batch
+        // positions).
+        // Item 6 M1: a sender whose position Phase 2 read (`pre_pos`,
+        // same reader, nothing written in between) is not read again.
+        if !prepared.is_empty() || book.has_reduce_only_orders() {
+            let mut known = ReduceOnlyPositions::new();
+            for p in prepared {
+                if let Some((signed, _)) = p.pre_pos {
+                    known.insert(p.sender, signed);
+                }
+            }
+            let ro = Self::reduce_only_positions_for(
+                reader,
+                book,
+                market_id,
+                prepared.iter().filter(|p| p.pre_pos.is_none()).map(|p| p.sender),
+                known,
+            );
+            book.set_reduce_only_positions(ro);
+        }
+
+        // s515 review 4: one shared copy of the market's tiers for the
+        // checked takers' match-time margin limits.
+        let tiers = Self::margin_tiers(margin_configs.get(&market_id));
+        // F1 (s517, D2): each checked sender's exclusive pool (0 outside
+        // the market of its first checked taker) and valuation price.
+        let mut am = AccountMargins::new(tiers.clone());
+        // s94 option 1: every fill's loss against the mark is charged.
+        // An unchecked taker (GTC buy, reduce-only) pays a charge from
+        // its pool here, else its snapshot — the pre-batch state, which
+        // still holds its own reservation (the book takes it off).
+        am.set_mark(markets.get(&market_id).and_then(|m| m.band).map(|b| b.reference));
+        am.set_pre_batch_snapshots(true);
+        for p in prepared.iter().filter(|p| p.checked_pos_net.is_some()) {
+            if am.get(&p.sender).is_none() {
+                // Item 6 M1: Phase 2's `position_px` (every checked
+                // taker passed an account check, so it has `pre_pos`).
+                let px = match p.pre_pos {
+                    Some((_, px)) => px,
+                    None => Self::d2_taker_px(reader, &p.sender, market_id),
+                };
+                #[cfg(test)]
+                if let Some(s) = reader.sums.filter(|s| s.shadow) {
+                    let want = reader.position_px(&p.sender, market_id).map_or(FixedPoint::ZERO, |(_, px)| px);
+                    if want != px || p.pre_pos.is_none() {
+                        s.shadow_mismatches.lock().unwrap().push(format!(
+                            "M1 px {} {market_id}: reused {px:?}, position_px {want:?}, pre_pos {:?}",
+                            p.sender, p.pre_pos
+                        ));
+                    }
+                }
+                // Review fix 4 (s517): only the pool market's entry is
+                // the sender's account (shared with its makers there).
+                match pools.get(&(p.sender, market_id)) {
+                    Some(&pool) => am.insert(p.sender, pool, px),
+                    None => am.insert_taker_only(p.sender, px),
+                }
+            }
+        }
+        book.set_account_margins(am);
+        let requests: Vec<MatchRequest<'_>> = prepared
+            .iter()
+            .map(|p| MatchRequest {
+                sender: p.sender,
+                params: p.params,
+                order_id: p.order_id,
+                margin: p
+                    .checked_pos_net
+                    .map(|_| Self::taker_margin_limit(&tiers, p.params, p.margin_reserved)),
+            })
+            .collect();
+
+        requests
     }
 
     /// s515 (BUG 2): the positions `book` must police — every trader with a
