@@ -58,6 +58,7 @@ TOP_OPTIONAL = {
     "max_load",
     "samplers",
     "host_checks",
+    "checks",
 }
 ARM_KEYS = {"label", "binary", "env", "harness_env", "expect", "note"}
 BIN_KEYS = {
@@ -70,7 +71,8 @@ BIN_KEYS = {
     "wrapper",
 }
 EXPECT_KEYS = {"file", "regex", "min", "max"}
-WARMUP_KEYS = {"arm", "duration_s", "tag"}
+WARMUP_KEYS = {"arm", "duration_s", "tag", "gate"}
+CHECKS_KEYS = {"source", "per_cell"}
 SMOKE_KEYS = {"arm", "duration_s"}
 ANALYSIS_KEYS = {"cmd", "metric"}
 HOST_KEYS = {"min_mem_avail_gb", "sysctl"}
@@ -89,7 +91,7 @@ RESERVED_HARNESS = {
 CONFIG_VARS = (
     "CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP ABIN AENV AXE"
     " AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL ANALYSIS_CMD"
-    " ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT"
+    " ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT GATE_TAGS CHECKS_SOURCE CHECK_FNS"
 ).split()
 # restart / crash cells: not a supported shape (hand-write the driver)
 UNSUPPORTED_HARNESS = {"CRASH_KILL_AT_S", "KILL_SIG", "KILL_WAIT", "KILL_NODE"}
@@ -101,6 +103,17 @@ TAG_RE = re.compile(r"^[a-z][a-z0-9]*$")
 MD5_RE = re.compile(r"^[0-9a-f]{32}$")
 BAD_VALUE_RE = re.compile(r"[\s'\"\\$`]")
 SYSCTL_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[A-Za-z0-9_-]+)+$")
+FN_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+SMOKE_TAG = "s0"
+
+
+def driver_functions():
+    """every function the driver defines (its body and the cell-step.sh it sources): a campaign check must not
+    take one of these names"""
+    names = set()
+    for f in (BODY, os.path.join(HERE, "..", "cell-step.sh")):
+        names.update(re.findall(r"^([a-z_][a-z0-9_]*)\(\)", open(f).read(), re.M))
+    return names
 
 
 class SpecError(Exception):
@@ -267,6 +280,31 @@ def host_checks(hc):
         )
         out[k] = v
     return {"min_mem_avail_kb": int(round(mm * 1000000)), "sysctl": out}
+
+
+def checks_spec(ck):
+    """spec checks {source: /abs/file.sh, per_cell: [fn, ...]} -> {"source", "per_cell"} (None when absent)"""
+    if ck is None:
+        return None
+    keys_ok(ck, CHECKS_KEYS - {"source", "per_cell"}, "checks", required=("source", "per_cell"))
+    src = abs_path(ck["source"], "checks.source")
+    fns = ck["per_cell"]
+    need(
+        isinstance(fns, list) and fns,
+        "checks.per_cell must be a non-empty list of function names (got %r)" % (fns,),
+    )
+    taken = driver_functions()
+    for fn in fns:
+        need(
+            isinstance(fn, str) and FN_RE.match(fn),
+            "checks.per_cell: %r is not a function name (^[a-z_][a-z0-9_]*$)" % (fn,),
+        )
+        need(fns.count(fn) == 1, "checks.per_cell: %s appears twice" % fn)
+        need(
+            fn not in taken,
+            "checks.per_cell: %s is a driver function (name the check something else)" % fn,
+        )
+    return {"source": src, "per_cell": list(fns)}
 
 
 def cell_list(arms, replicates, order, duration_s, warmup):
@@ -477,10 +515,16 @@ def validate(spec):
         p["replicates"] = int_ge(spec["replicates"], 1, "replicates")
     p["order"] = order
     wu = spec.get("warmup", {})
+    p["warmup_gate"] = True
     if wu is False:
         p["warmup"] = None
     else:
         keys_ok(wu, WARMUP_KEYS, "warmup")
+        p["warmup_gate"] = wu.get("gate", True)
+        need(
+            isinstance(p["warmup_gate"], bool),
+            "warmup.gate must be true or false (got %r)" % (p["warmup_gate"],),
+        )
         wa = wu.get("arm", p["baseline"])
         need(wa in labels, "warmup.arm %r is not an arm" % wa)
         wt = wu.get("tag", "w1")
@@ -501,7 +545,7 @@ def validate(spec):
     keys_ok(sm, SMOKE_KEYS, "smoke")
     sa = sm.get("arm", p["baseline"])
     need(sa in labels, "smoke.arm %r is not an arm" % sa)
-    p["smoke"] = ("s0", sa, int_ge(sm.get("duration_s", 60), 10, "smoke.duration_s"))
+    p["smoke"] = (SMOKE_TAG, sa, int_ge(sm.get("duration_s", 60), 10, "smoke.duration_s"))
     an = spec.get("analysis", {})
     keys_ok(an, ANALYSIS_KEYS, "analysis")
     if an:
@@ -512,6 +556,7 @@ def validate(spec):
     p["analysis_cmd"] = an.get("cmd", "")
     p["analysis_metric"] = an.get("metric", "")
     need(isinstance(p["analysis_metric"], str), "analysis.metric must be a string")
+    p["checks"] = checks_spec(spec.get("checks"))
     p["cells"] = cell_list(labels, p["replicates"], order, p["duration_s"], p["warmup"])
     return p
 
@@ -616,7 +661,7 @@ def render(p, spec, spec_path):
     L.append("ANALYSIS_METRIC=%s" % q(p["analysis_metric"]))
     hc = p["host_checks"]
     L.append(
-        "SAMPLERS=%d   # per-cell du/memory/metrics/fd/vmstat samplers, RocksDB LOG copies, the fd stop"
+        "SAMPLERS=%d   # per-cell du/memory/metrics/fd/soak-1hz/vmstat samplers, RocksDB LOG copies, the fd stop"
         % (1 if p["samplers"] else 0)
     )
     L.append(
@@ -629,6 +674,19 @@ def render(p, spec, spec_path):
     )
     for k, v in sorted((hc or {}).get("sysctl", {}).items()):
         L.append("SYSCTL_WANT[%s]=%s" % (k, q(v)))
+    gate = []
+    if p["warmup_gate"]:
+        gate = ([p["warmup"][0]] if p["warmup"] else []) + [SMOKE_TAG]
+    L.append(
+        "GATE_TAGS=%s   # warm-up gate (spec warmup.gate): these cells must pass it or the campaign stops"
+        % q(" ".join(gate))
+    )
+    ck = p["checks"] or {"source": "", "per_cell": []}
+    L.append("CHECKS_SOURCE=%s   # spec checks.source (sourced at preflight)" % q(ck["source"]))
+    L.append(
+        "CHECK_FNS=%s   # spec checks.per_cell: each runs after every cell as FN LABEL ARM"
+        % q(" ".join(ck["per_cell"]))
+    )
     L.append("# <<< GENERATED CONFIG")
     return "\n".join(L) + "\n" + open(BODY).read()
 

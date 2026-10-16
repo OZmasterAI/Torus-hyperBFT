@@ -1,6 +1,6 @@
 {
   "campaign": "ozarchy-example",
-  "comment": "example: one node build, a defaults arm, a TORUS knob arm, a MALLOC_CONF arm and a wrapper (LD_PRELOAD) arm; warm-up, 3 rotated replicates of 120 s at 300 markets",
+  "comment": "example: one node build, a defaults arm, a TORUS knob arm, a MALLOC_CONF arm and a wrapper (LD_PRELOAD) arm; warm-up (gated), 3 rotated replicates of 120 s at 300 markets; examplechk (a campaign check in a file beside the frozen tools) runs after every cell",
   "results_root": "/home/oz/bench-results-matched",
   "run_dir": "/home/oz/bench-results-matched/ozarchy-example-run",
   "label_prefix": "ozarchy-example-300m",
@@ -20,7 +20,7 @@
   "replicates": 3,
   "order": "rotate",
   "baseline": "A",
-  "warmup": {"arm": "A", "tag": "w1", "duration_s": 120},
+  "warmup": {"arm": "A", "tag": "w1", "duration_s": 120, "gate": true},
   "smoke": {"arm": "M1", "duration_s": 60},
   "node_env": {"TORUS_ROCKSDB_STATS": "2", "TORUS_ROCKSDB_STATS_INTERVAL_SECS": "1"},
   "harness_env": {"BLOCK_CAP": "400", "OVERWRITE": "1", "RETRY_BUSY": "1", "MAX_IN_FLIGHT": "4",
@@ -32,6 +32,7 @@
   ],
   "analysis": {"cmd": "python3 -I /home/oz/bench-results-matched/ozarchy-example-tools/analyst/a-cells.py {out} {prefix} {tag}:{arm}",
                "metric": "ms"},
+  "checks": {"source": "/home/oz/bench-results-matched/ozarchy-example-tools/example-checks.sh", "per_cell": ["examplechk"]},
   "samplers": true,
   "host_checks": {"min_mem_avail_gb": 40, "sysctl": {}},
   "arms": [
