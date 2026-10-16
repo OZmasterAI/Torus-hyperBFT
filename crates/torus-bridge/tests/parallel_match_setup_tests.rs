@@ -18,7 +18,10 @@
 
 use alloy_primitives::{Address, B256};
 
-use torus_bridge::native_executor::{with_parallel_match_setup, NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{
+    with_fast_sell_top_ups, with_parallel_match_setup, with_settle_defer_results,
+    NativeExecContext, NativeExecutor,
+};
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::margin::{MarginTier, MarketMarginConfig};
 use torus_core::position::NativeBalance;
@@ -488,4 +491,25 @@ fn flag_on_is_byte_identical_second_seed() {
         "scenario too weak: {} trades",
         golden.trade_index
     );
+}
+
+/// exp/archy-s58-bundle-dmt: the bundle's three bridge flags (D
+/// `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T
+/// `TORUS_FAST_SELL_TOP_UPS`) pinned on together equal all three pinned off
+/// on this file's match-setup scenarios, on every batch path.
+#[test]
+fn s58_bundle_dmt_identical_to_flags_off() {
+    let all = |on: bool, f: &dyn Fn() -> Fingerprint| {
+        with_settle_defer_results(on, || {
+            with_parallel_match_setup(on, || with_fast_sell_top_ups(on, f))
+        })
+    };
+    for seed in [0x5E7_0B5E7u64, 0xD15C_0BAD] {
+        let batches = scenario(seed);
+        for path in PATHS {
+            let off = all(false, &|| run_once(&batches, path));
+            let on = all(true, &|| run_once(&batches, path));
+            assert_eq!(off, on, "seed {seed:#x} {path:?}: D+M+T vs flags off");
+        }
+    }
 }

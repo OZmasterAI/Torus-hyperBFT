@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 
-use torus_bridge::native_executor::{with_fast_sell_top_ups, NativeExecContext, NativeExecutor};
+use torus_bridge::native_executor::{
+    with_fast_sell_top_ups, with_parallel_match_setup, with_settle_defer_results,
+    NativeExecContext, NativeExecutor,
+};
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::NativeBalance;
 use torus_state::cf::{
@@ -494,4 +497,29 @@ fn fast_top_ups_identical_on_b_blind_shapes() {
         "non-vacuous: {:?}",
         golden.top_up_counts()
     );
+}
+
+/// exp/archy-s58-bundle-dmt: the bundle's three bridge flags (D
+/// `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T
+/// `TORUS_FAST_SELL_TOP_UPS`) on together equal all three off on this
+/// file's fuzzed top-up scenarios, in every mode (state, results, gas,
+/// counters, state root). `run` pins T; D and M are pinned around it.
+#[test]
+fn s58_bundle_dmt_identical_to_flags_off() {
+    let mut top_ups = 0;
+    for seed in 0..4u64 {
+        let s = fuzz_scenario(0xB1_1D00 + seed);
+        for mode in MODES {
+            let dm = |on: bool| {
+                with_settle_defer_results(on, || {
+                    with_parallel_match_setup(on, || run(&s, mode, on))
+                })
+            };
+            let off = dm(false);
+            let on = dm(true);
+            assert_eq!(on, off, "seed {seed} {mode:?}: D+M+T vs flags off");
+            top_ups += off.top_ups;
+        }
+    }
+    assert!(top_ups > 0, "non-vacuous: no sell top-ups");
 }

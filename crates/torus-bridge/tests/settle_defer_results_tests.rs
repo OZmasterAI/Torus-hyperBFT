@@ -22,7 +22,8 @@
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{
-    with_settle_defer_results, NativeActionResult, NativeExecContext, NativeExecutor,
+    with_fast_sell_top_ups, with_parallel_match_setup, with_settle_defer_results,
+    NativeActionResult, NativeExecContext, NativeExecutor,
 };
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::NativeBalance;
@@ -423,4 +424,31 @@ fn settle_defer_results_flag_flip_between_calls() {
     }
     assert_eq!(off.results, results);
     assert_eq!(off.total_gas, total_gas);
+}
+
+/// exp/archy-s58-bundle-dmt: the bundle's three bridge flags (D
+/// `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T
+/// `TORUS_FAST_SELL_TOP_UPS`) pinned on together equal all three pinned off
+/// on this file's pass-B scenarios (every result field, gas, CFs, fills,
+/// counters, state root), at every pass-A cap.
+#[test]
+fn s58_bundle_dmt_identical_to_flags_off() {
+    let all = |on: bool, f: &dyn Fn() -> Fingerprint| {
+        with_settle_defer_results(on, || {
+            with_parallel_match_setup(on, || with_fast_sell_top_ups(on, f))
+        })
+    };
+    for (seed, markets, storm) in [(0xC3C3_5EED, 6, 200), (0x5E77_1E00_0058, 24, 600)] {
+        let batches = fuzz_batches(seed, markets, storm);
+        for record_fills in [true, false] {
+            for cap in [1usize, 2, 8] {
+                let off = all(false, &|| run(&batches, cap, record_fills));
+                let on = all(true, &|| run(&batches, cap, record_fills));
+                assert_eq!(
+                    off, on,
+                    "D+M+T diverged (seed {seed:#x}, {markets} markets, cap {cap}, record_fills {record_fills})"
+                );
+            }
+        }
+    }
 }
