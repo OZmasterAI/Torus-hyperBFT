@@ -11570,6 +11570,172 @@ Sorted by native blk/s; ALL and C from 76.1; windows as in 76.1:
   (76.1's `s58pilot.py` and `s58flags_to.py`, the C1 / C2 / ALL cells as reference) in
   `ozarchy-s58e-tools/analyst/out/s58e*.txt` and `ozarchy-s58loo-tools/analyst/out/s58loo*.txt`.
 
+## 77. s58 ALL's extra timeouts: lost proposal headers at the consensus gossip rate limiter, and two env fixes (ALLfan, ALLrs), 300 markets, 300 s cells, n = 1 (s62 log reading of 76's cells; campaign ozarchy-s58rl, 2026-10-16)
+
+**ALL's extra consensus timeouts are lost leader proposals. The followers drop the leader's header at the per-author
+consensus gossip rate limiter (50 per s, burst 50) after a burst of fast empty views. With a drop counter on the node,
+the followers that time out with `no_proposal` dropped messages in the 4 s before 9 of 10 (a1) and 16 of 16 (a2)
+lost-proposal events, and no drop came without a timeout in either ALL cell. Two env-only fixes bring the core
+timeouts to C's level: the direct fan (ALLfan, 5) and a 250 ms header re-send (ALLrs, 3), vs ALL 33 / 47 and C 6.
+ALLrs keeps ALL's matched/s (+10.0% vs C) and CPU; ALLfan costs about 1% matched/s and 3% CPU-s per 1M fills vs ALL.
+Indicative only: n = 1 per arm (ALL twice), one host.**
+* Step 1 (s62, logs only, 76.1's all1-ALL vs c1-C / c2-C): ALL's excess over C is one class of stall, the leader's
+  header lost at both followers after 37-41 views in the previous second (13 in ALL vs 2 and 2 in C). Idle stalls every
+  27-28 views (11 vs 10-12) and slow-vote stalls (7 vs 7 and 7) are the same in both arms.
+* The leader does not wait on its own exec: it builds in 0.1-1.2 ms before each lost header. The limiter drop was
+  debug-only with no metric, so `857b9770` adds `torus_consensus_rate_limited_dropped_total`.
+* matched/s vs C: ALL +9.3% and +9.5%, ALLfan +8.2%, ALLrs +10.0%. CPU-s per 1M fills vs C: ALL +5.5% / +4.9%,
+  ALLfan +8.4%, ALLrs +5.5%. Block p99, mean of nodes: C 1,102 ms, ALL 1,105 / 1,310, ALLfan 931, ALLrs 971.
+* ALLfan has a side effect: about 14.1k mirror-copy drops per node, and 2.2x ALL's committed blocks, nearly all of them
+  in the drain. ALLrs sends 90-164 header re-sends per node and still drops 106-120 messages per node; the re-send
+  covers the lost header.
+* **Verdict: the cause is found (high confidence on the mechanism; the drop / timeout alignment is exact in 2 of 2 ALL
+  cells). The fix is not chosen: n = 1 cannot separate ALLrs from ALL on matched/s (+0.6%, inside C's noise).**
+
+Question (archy s58 perf search, after 76.7): are ALL's extra `no_proposal` / `leader` timeouts proposals dropped by
+the per-author consensus gossip rate limiter, and does an env-only fix remove them?
+
+### 77.1 Step 1: per-timeout reading of 76's ALL and C cells (s62, no bench)
+
+Input: the node logs and `metrics-1hz` of `ozarchy-s58flags-300m-{all1-ALL,c1-C,c2-C}`, binary `6452fa31`. One row
+per stall, a view that starts at least 1.1 s after the previous view start on any node. The row gives the leader,
+its build-to-own-header time, the header and body messages each follower logged in that view, the views in the
+previous 1 s and 250 ms, the exec queue depth and the vmstat run queue. Classes in the metrics window:
+
+| class | what the table shows | ALL | C1 | C2 |
+|---|---|---|---|---|
+| lost header, under load | leader known and built in 0.1-1.2 ms; its own header logged; 0 headers at both followers; 37-41 views in the previous 1 s (ALL); exec queue 16-64 | 13 | 2 | 2 |
+| lost header, idle | the same, with exec queue 0, before and after load, every 27-28 views (one timeout, 1.20 or 2.40 s) | 11 | 10 | 12 |
+| slow vote / missing body | header at the followers but a late vote, or no leader produced; exec queue mostly near full | 7 | 7 | 7 |
+
+* The leader does not wait on its own exec. `TORUS_PROPOSER_EXEC_WATERMARK` is off when unset
+  (`crates/hotstuff_rs/src/hotstuff/implementation.rs:450-495`), and `produce_block`
+  (`crates/torus-consensus/src/app.rs:7479-7522`, `6452fa31`) has no exec wait. So the exec backlog
+  (ALL's lag p50 26 heights, 76.1) does not explain the stalls.
+* Suspected cause: the per-author consensus gossip token bucket `ConsensusRateLimiter`.
+  `consensus_rate_limit_per_peer: 50` is hardcoded (`crates/torus-network/src/config.rs:280`), and the bucket holds
+  50 tokens (burst 50). The drop (`swarm.rs:1494` at `6452fa31`) logs at debug only and has no metric. Votes go
+  direct; headers go over gossip (`TORUS_CONSENSUS_DIRECT_FAN` off). At about 2 gossip messages per author per view,
+  a run of fast empty views empties the bucket after about 27 views, which matches the idle 28-view cadence.
+* The header re-send would recover a lost header, but its default interval is 3 s
+  (`implementation.rs:121`), longer than the 1.2 s view timeout. Next: count the drops (77.2).
+
+### 77.2 Campaign ozarchy-s58rl: setup and validity
+
+Setup:
+* Node: `exp/archy-s58-consensus-ratelimit-drops` `857b9770` = `6452fa31` (sections 75-76) + the counter
+  `torus_consensus_rate_limited_dropped_total` (no behaviour change). Node md5 `5480e116`, bench `9b725823`, harness
+  `5e0fbbfa`, same genesis (md5 `b83180e1`) and workload as 76.1: 300 markets, oracle on, commit tail depth 1,
+  MAX_IN_FLIGHT 4, budget 900, 300 s cells.
+* Arms (env on all 3 validators): C none; ALL the six s58 flags (76.1); ALLfan = ALL + `TORUS_CONSENSUS_DIRECT_FAN=1`
+  (gossip mirror on by default); ALLrs = ALL + `TORUS_HEADER_RESEND_MS=250`.
+* Cells in run order: w1 (C, 300 s warm-up, not scored), c1-C, a1-ALL, f1-ALLfan, r1-ALLrs, a2-ALL (13:31-14:22).
+  ALL ran before and after the two fix arms, which brackets drift between them. 60 s smokes first: s1 ALLfan and
+  s2 ALLrs, rc 0, AGREE, md5 ok.
+
+**Validity:** all 6 cells rc 0, ACCEPT AGREE, liveness PASS. Node md5 `5480e116` on all 3 nodes in every cell; 0 panic
+or fail-stop lines, 0 error lines. Every cell has 25 `CHECK OK` lines plus one `CHECK LAG` and one `CHECK SOAK` (w1 26,
+with the warm-up gate), and no failed CHECK. No `CELL-FLAG` lines, no rerun. The per-node TORUS env digest is one
+value per cell (C `946d4cc0`, ALL `efdaf8e3` in both ALL cells, ALLfan `b28f4f8e`, ALLrs `1cdb454e`). The flags'
+took-effect lines read on in the four ALL-based cells and off in C, on all 3 nodes. The `rl knobs` check shows
+`fan_sent` > 0 only in ALLfan and re-sends only in ALLrs.
+
+### 77.3 Cells (`s58rl.txt`, `s58rl-to.txt`, `s58rl-align.txt`)
+
+Windows as in 76.1: core = [t_bench0 + 60 s, t_bench1], summed over the 3 nodes. Drops = deltas of
+`torus_consensus_rate_limited_dropped_total` in the core window, sum of nodes. Exec lag = `CHECK LAG` grid heights.
+
+| cell | arm | matched/s | vs C | native blk/s | CPU-s / 1M fills | vs C | timeouts core | no_proposal | leader | after_vote | drops core | hotstuff-algo rq wait s | block p99 ms | exec lag p50 / p90 heights |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | C (warm-up) | 213,497 | -6.0% | 3.267 | 23.935 | +3.4% | 6 | 0 | 1 | 5 | 0 | 4.56 | 1,182 | 1 / 13 |
+| c1-C | C | 227,035 | | 3.472 | 23.150 | | 6 | 0 | 0 | 6 | 0 | 4.82 | 1,102 | 1 / 16 |
+| a1-ALL | ALL | 248,217 | +9.3% | 6.026 | 24.419 | +5.5% | 33 | 19 | 9 | 4 | 40 | 7.35 | 1,105 | 31 / 60 |
+| f1-ALLfan | ALLfan | 245,591 | +8.2% | 6.380 | 25.104 | +8.4% | 5 | 0 | 0 | 5 | 418 | 6.96 | 931 | 24 / 65 |
+| r1-ALLrs | ALLrs | 249,831 | +10.0% | 6.159 | 24.423 | +5.5% | 3 | 0 | 1 | 2 | 55 | 6.84 | 971 | 24 / 64 |
+| a2-ALL | ALL | 248,554 | +9.5% | 6.651 | 24.289 | +4.9% | 47 | 28 | 17 | 2 | 90 | 7.30 | 1,310 | 43 / 68 |
+
+* a1-ALL also has 1 `no_vote` timeout. Load-window timeouts: C 15, ALL 47 / 64, ALLfan 5, ALLrs 3. Per minute (sum of
+  nodes): ALL 14 / 12 / 15 / 3 / 3 and 17 / 11 / 14 / 11 / 11; ALLfan 0 / 3 / 0 / 2 / 0; ALLrs 0 / 1 / 0 / 1 / 1.
+* Drops per node, whole run: C 21-27 and w1 26-30, none of them in the core window; ALL 31-35 and 62-70;
+  ALLfan 14,083-14,106; ALLrs 106-120. Header re-sends per node (ALLrs): 161 / 164 / 90.
+* This run's C is -0.8% matched/s and +1.2% CPU-s per 1M fills vs 76.1's C mean (228,815; 22.874). The warm-up w1
+  is -6.0% vs c1-C, where 76.6's warm-up was -0.3%. w1 was the first cell after the node build and is not scored.
+
+### 77.4 Drops line up with the lost proposals (`s58rl-align.txt`, `s58rl-align-w8.txt`)
+
+An event is a core-window second with a timeout on any node. It is "lost" if at least one node timed out with
+`no_proposal`. The check looks for drops on those nodes in the 4 s before the event.
+
+| cell | events | lost | lost with drops on every `no_proposal` node | lost with no drop anywhere | drops with no timeout in the next 4 s |
+|---|---|---|---|---|---|
+| c1-C | 5 | 0 | | | 0 |
+| a1-ALL | 12 | 10 | 9 | 1 (t+149 s, one `no_proposal` on val2) | 0 |
+| a2-ALL | 18 | 16 | 16 | 0 | 0 |
+| f1-ALLfan | 4 | 0 | | | 418 drops in 27 node-seconds |
+| r1-ALLrs | 3 | 0 | | | 55 drops in 21 node-seconds |
+
+* Each `no_proposal` node in a lost event shows 1-4 drops before it. In most lost events the third node times out as
+  `leader`, so one lost header gives a `no_proposal` on each follower and a `leader` timeout on the proposer. The 8 s
+  window gives the same counts.
+* In both ALL cells every drop is followed by a timeout. In ALLfan and ALLrs the drops continue but no timeout
+  follows, so the fix recovers the header and does not stop the drops.
+* The per-timeout tables (`s58rl-timeouts-{a1-ALL,a2-ALL}.txt`) repeat 77.1's pattern. Under load, 0 headers reach
+  the followers after 32-44 views in the previous 1 s. Before and after load, idle stalls come every 26-29 views.
+  ALLfan's and ALLrs's tables hold only 3 and 5 stalls, with no fast-view burst before them (1-5 views in the previous
+  1 s).
+
+### 77.5 Why the two fixes work, and what they cost
+
+* **Header re-send (ALLrs).** The re-send is a direct send to each validator (`implementation.rs:355` ->
+  `NetworkCommand::Send` -> `send_direct`, `swarm.rs:2432` at `857b9770`). It does not go through gossip, so the
+  limiter does not see it. At 250 ms it lands inside the 1.2 s view timeout; at the 3 s default it cannot.
+* **Direct fan (ALLfan).** The `/torus/direct` receive path (`swarm.rs:1746` -> `handle_consensus_direct_traced`,
+  `:3390` at `857b9770`) never rate-limits. The gossip mirror copies still pass the limiter. That accounts for the
+  ~14.1k drops per node (`fan_sent` 23,832-23,842 per node), all of them duplicates of messages that also came direct.
+* ALLfan's other anomalies: committed blocks over the whole run 13,987 vs ALL 6,378 / 6,944. In the drain minute
+  it committed 2,637 blocks on val0 vs 373 / 342, with 854 native vs 244 / 229. Checkpoints were 71-73 per node vs
+  35-36 / 31, and native exec blocks 3,624-3,626 per node vs 2,069-2,070 / 2,273-2,274. The core window is normal
+  (4,362 committed vs 4,397 / 4,823). Its fills per native block (28,236) and exec ms per native block (113.6) are
+  therefore not comparable with the other cells. The same holds for block p99 (931 ms), which comes from 2.2x the
+  blocks. Why the fan makes the drain commit faster is open.
+
+Steps vs noise (the only replicate pairs: C1 / C2 in 76.1, matched/s +-0.39% around their mean, CPU-s per 1M fills
+0.38% apart; ALL a1 / a2 here, matched/s 0.14% apart, CPU 0.53% apart):
+
+| step | matched/s | CPU-s / 1M fills | core timeouts | resolved at n = 1? |
+|---|---|---|---|---|
+| ALL vs C | +9.3 / +9.5% | +5.5 / +4.9% | 6 -> 33 / 47 | yes (about 24x the C noise; the same as 76.1's +9.4% and +5.2%) |
+| ALLrs vs ALL mean (248,386; 24.354) | +0.6% | +0.3% | 33 / 47 -> 3 | timeouts yes; matched/s and CPU no (inside the C noise) |
+| ALLfan vs ALL mean | -1.1% | +3.1% | 33 / 47 -> 5 | timeouts yes; matched/s and CPU indicative (about 3x and 6-8x the noise, one cell) |
+| ALLrs vs C (block p99) | 1,102 -> 971 ms | | | no: ALL alone spans 1,105-1,310, and 76.1's C1 / C2 span 1,094-1,147 |
+
+* What n = 1 cannot resolve: ALL's own spread is 33 vs 47 core timeouts (and 6.03 vs 6.65 native blk/s, exec lag p50
+  31 vs 43). One ALLrs or ALLfan cell can show that the timeouts fall to C's level (3 and 5 vs C 6, a step of 28-44).
+  It cannot show whether ALLrs's +0.6% matched/s or its lower block p99 is real. Nor can it rank ALLrs vs ALLfan on
+  matched/s beyond ALLfan's -1.1%.
+* hotstuff-algo run-queue wait is the same in all four ALL-based cells (6.84-7.35 s vs C 4.82 s). Removing the
+  timeouts does not remove ALL's scheduler pressure.
+* Block p99 is not resolved: ALL a1 and a2 differ by 205 ms at the same matched/s.
+
+### 77.6 Next (open owner decisions)
+
+* **Bundle: ALL vs xB (and drop G).** 76.7's case for xB was C's timeout level at +1.4% CPU-s per 1M fills.
+  ALLrs reaches C's timeout level with B on (CPU +5.5% vs C). The remaining difference is ALL's +0.9% matched/s for
+  +3.8% CPU-s per 1M fills (76.6), not measured here with the re-send. G is not needed (76.6).
+* **Fix: re-send default 250 ms vs a limiter exemption for validator proposals vs the direct fan.** The re-send
+  (env only) is the one measured without a throughput or CPU cost at n = 1. An exemption (or a higher
+  `consensus_rate_limit_per_peer`, today hardcoded) is a code change and was not measured. The fan cost about 1%
+  matched/s and 3% CPU here and changed the drain. On one host the fan and the limiter see loopback latencies,
+  so both need a multi-host testnet before they are judged.
+* **Port:** the chosen bundle plus the drop counter onto main `19fd0c28`; `exp/archy-s58-consensus-ratelimit-drops`
+  is on `6452fa31` (main `5e0fbbfa`).
+* Data: `~/bench-results-matched/ozarchy-s58rl-300m-{w1,c1-C,a1-ALL,f1-ALLfan,r1-ALLrs,a2-ALL}` and smokes
+  `ozarchy-s58rl-smoke-300m-{s1,s2}`; campaign `ozarchy-s58rl-run/campaign/` (`campaign.log`, `cells.tsv`). Analysis in
+  `ozarchy-s58rl-tools/analyst/out/`: `s58rl.txt` (`s58pilot.py`), `s58rl-to.txt` (`s58flags_to.py`),
+  `s58rl-align{,-w8}.txt` (`rl_align.py`), `s58rl-timeouts-*.txt` (`timeouts.py`), `s58rl-execlag.txt`. Step 1 (77.1)
+  tables and scripts: `/tmp/s58-timeouts/{ALL,c1,c2}-table.txt`, `timeouts.py`, `viewgaps.py`, `parse1hz.py` (in
+  `/tmp`, not kept).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
