@@ -52,7 +52,9 @@ pub struct DaBatchTiming {
 /// Mempool configuration.
 #[derive(Clone, Debug)]
 pub struct MempoolConfig {
-    /// Maximum total EVM transactions in the pool.
+    /// Maximum total EVM transactions in the pool. Item 7 step 2: both lanes
+    /// together; at the cap a new tx must outbid the lowest effective tip of
+    /// either lane (each lane ranks at its own base fee), which it evicts.
     pub max_pool_size: usize,
     /// Maximum pending EVM transactions per sender.
     pub max_per_sender: usize,
@@ -714,7 +716,8 @@ impl Mempool {
     /// Item 7 step 2: the tx enters its sender's lane ([`Self::evm_lane`]) under
     /// that lane's caps ([`Self::lane_caps`]). A new tx of a sender that still
     /// has pooled txs in the other lane is refused (`EvmLaneSwitchPending`); a
-    /// reinserted one joins them there instead, so it never leaves a nonce gap.
+    /// reinserted one joins them there instead, under that lane's caps, so it
+    /// never leaves a nonce gap. `max_pool_size` counts both lanes.
     fn admit_evm_tx(&self, raw_rlp: Vec<u8>, reinsert: bool) -> Result<B256, MempoolError> {
         // Item 7 steps 1-2: a block carries at most 256 KiB of EVM tx bytes, 768 KiB at a big
         // height (vote rule), so a bigger tx could never be selected. Checked before decoding.
@@ -743,7 +746,12 @@ impl Mempool {
             fee_floor,
         )?;
         let lane = self.evm_lane(&entry.sender);
-        Self::check_lane_caps(&entry, self.lane_caps(lane))?;
+        // A reinserted tx may join the other lane (below), so its caps are checked only once
+        // its lane is known: a tx the lane holding its sender's txs can carry must not be
+        // dropped against the caps of the lane its sender switched to (a nonce gap).
+        if !reinsert {
+            Self::check_lane_caps(&entry, self.lane_caps(lane))?;
+        }
 
         let hash = entry.hash;
         let tx_size = raw_rlp.len();
@@ -786,12 +794,15 @@ impl Mempool {
             self.config.max_per_sender,
             self.config.replacement_bump_pct,
         );
-        let pool = lanes.pool_mut(lane);
-        let (_replaced, freed_bytes) = if reinsert {
-            pool.reinsert(entry, max_pool_size, max_per_sender, bump_pct)?
-        } else {
-            pool.insert(entry, max_pool_size, max_per_sender, bump_pct)?
-        };
+        // One `max_pool_size` for both lanes (see `EvmLanes::insert`).
+        let (_replaced, freed_bytes) = lanes.insert(
+            lane,
+            entry,
+            reinsert,
+            max_pool_size,
+            max_per_sender,
+            bump_pct,
+        )?;
 
         // Track memory usage (Phase 3: 3.1.7)
         self.memory_used
@@ -949,7 +960,9 @@ impl Mempool {
 
     /// Item 7 step 2: the committed header's big lane. M back to 0 moves the big pool to the small
     /// lane (its rules apply; a tx they refuse is dropped with a warning). A lower big limit evicts
-    /// the big-pool txs above it, as `set_evm_gas_limit` does for the small lane.
+    /// the big-pool txs above it, as `set_evm_gas_limit` does for the small lane, but only while
+    /// M > 0: with M = 0 the big limit binds no tx, so the move alone decides (under the small
+    /// lane's limits) which txs stay.
     pub fn set_big_lane(&self, interval: u64, gas_limit: u64, base_fee: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let moved = {
@@ -958,7 +971,7 @@ impl Mempool {
             let old_limit = self.current_big_gas_limit.swap(gas_limit, Relaxed);
             self.current_big_base_fee.store(base_fee, Relaxed);
             lanes.big.set_base_fee(base_fee);
-            if gas_limit < old_limit {
+            if interval > 0 && gas_limit < old_limit {
                 let (evicted, freed) = lanes.big.evict_gas_above(gas_limit);
                 if evicted > 0 {
                     self.memory_used.fetch_sub(freed, Relaxed);
@@ -5261,6 +5274,171 @@ mod tests {
             "nonces 0 and 1 pruned from both pools"
         );
         assert_eq!(pool.pending_nonce(&addr), 3);
+    }
+
+    // ---- item 7 step 2: C5 Codex review fixes ----
+
+    /// Item 7 step 2 (Codex C5 P2): a reinserted tx joins the lane holding its sender's txs and
+    /// is checked against THAT lane's caps. The sender left the big lane while its nonce 0 (6M
+    /// gas) was out in our proposal and nonce 1 waited in the big pool: nonce 0 goes back to the
+    /// big pool (10M), so the next big drain starts at nonce 0. A new tx of the sender still
+    /// waits (`EvmLaneSwitchPending`). RED before: nonce 0 was checked against the small lane's
+    /// 3M and dropped, and the next big drain held nonce 1 alone (a nonce gap).
+    #[test]
+    fn reinserted_tx_takes_the_caps_of_the_lane_holding_its_sender() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let k = intrinsic_case(&state, 233);
+        set_lane_row(&state, &k);
+        let tx = |nonce, gas| create_eip1559_tx(&k, nonce, 2_000_000_000, 1, gas, U256::ZERO);
+        let big_bytes = torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES;
+        let h0 = pool.add_evm_tx(tx(0, 6_000_000)).unwrap();
+        let h1 = pool.add_evm_tx(tx(1, 21_000)).unwrap();
+        let drained = pool.drain_evm_big(6_000_000, big_bytes, 1_000_000_000, B256::ZERO);
+        assert_eq!(drained, vec![tx(0, 6_000_000)]);
+
+        state
+            .delete_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::evm_lane_key(&address_from_key(&k)),
+            )
+            .unwrap();
+        pool.reinsert_evm(drained);
+        assert_eq!(
+            pool.evm_lane_of(&h0),
+            Some(EvmLane::Big),
+            "nonce 0 rejoins nonce 1 in the big pool"
+        );
+        assert_eq!(pool.evm_lane_of(&h1), Some(EvmLane::Big));
+        assert_eq!(
+            pool.memory_used(),
+            tx(0, 6_000_000).len() + tx(1, 21_000).len()
+        );
+        let err = pool.add_evm_tx(tx(2, 21_000)).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::EvmLaneSwitchPending { .. }),
+            "a new tx still waits for the big pool to drain, got: {err}"
+        );
+        assert_eq!(
+            pool.drain_evm_big(10_000_000, big_bytes, 1_000_000_000, B256::ZERO),
+            vec![tx(0, 6_000_000), tx(1, 21_000)],
+            "the next big drain starts at nonce 0"
+        );
+    }
+
+    /// Item 7 step 2 (Codex C5 P2): M back to 0 moves the big pool under the SMALL lane's
+    /// limits, even when the same header lowers the big limit: a 2M-gas tx fits the small
+    /// lane's 3M and moves, though it is above the new 1M big limit. RED before: the big-limit
+    /// eviction ran before the move and dropped it.
+    #[test]
+    fn big_blocks_off_move_the_big_pool_before_any_big_limit_eviction() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let k = intrinsic_case(&state, 234);
+        set_lane_row(&state, &k);
+        let raw = create_eip1559_tx(&k, 0, 2_000_000_000, 1, 2_000_000, U256::ZERO);
+        let h = pool.add_evm_tx(raw.clone()).unwrap();
+        assert_eq!(pool.evm_lane_of(&h), Some(EvmLane::Big));
+
+        pool.set_big_lane(0, 1_000_000, 1_000_000_000);
+        assert_eq!(
+            pool.evm_lane_of(&h),
+            Some(EvmLane::Small),
+            "the small lane's 3M takes the 2M tx"
+        );
+        assert_eq!(pool.memory_used(), raw.len());
+        assert_eq!(
+            pool.drain_evm(3_000_000, pool.base_fee(), B256::ZERO),
+            vec![raw]
+        );
+    }
+
+    /// A pool holding at most `max_pool_size` EVM txs, with no node budget and no share cap.
+    fn lane_pool_of(state: &StateDb, max_pool_size: usize) -> Mempool {
+        Mempool::new(
+            state.clone(),
+            MempoolConfig {
+                max_pool_size,
+                evm_block_gas_budget: u64::MAX,
+                evm_sender_share_pct: 0,
+                ..MempoolConfig::default()
+            },
+        )
+    }
+
+    /// Item 7 step 2 (Codex C5 P3): `max_pool_size` caps both lanes together. At the cap a new
+    /// tx must outbid the lowest effective tip of EITHER lane, which it then evicts. RED
+    /// before: each lane had its own cap, so a big-lane tx entered beside a full small lane
+    /// (3 pooled under a cap of 2).
+    #[test]
+    fn max_pool_size_caps_both_lanes_together() {
+        let (_dir, state) = setup();
+        let pool = lane_pool_of(&state, 2);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let [a, b, c] = [235, 236, 237].map(|seed| intrinsic_case(&state, seed));
+        set_lane_row(&state, &b);
+        set_lane_row(&state, &c);
+        let tx = |k, tip| create_eip1559_tx(k, 0, 2_000_000_000, tip, 21_000, U256::ZERO);
+        let ha = pool.add_evm_tx(tx(&a, 1)).unwrap();
+        let hb = pool.add_evm_tx(tx(&b, 3)).unwrap();
+        assert_eq!(pool.evm_lane_of(&ha), Some(EvmLane::Small));
+        assert_eq!(pool.evm_lane_of(&hb), Some(EvmLane::Big));
+
+        let err = pool.add_evm_tx(tx(&c, 1)).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::PoolFull),
+            "a tip of 1 does not outbid the small lane's lowest (1), got: {err}"
+        );
+        assert_eq!(pool.evm_pool_size(), 2);
+
+        let hc = pool
+            .add_evm_tx(tx(&c, 2))
+            .expect("a tip of 2 outbids the small lane's 1");
+        assert_eq!(pool.evm_lane_of(&hc), Some(EvmLane::Big));
+        assert_eq!(
+            pool.evm_lane_of(&ha),
+            None,
+            "the lowest tip of either lane is evicted"
+        );
+        assert_eq!(pool.evm_lane_of(&hb), Some(EvmLane::Big));
+        assert_eq!(pool.evm_pool_size(), 2);
+        assert_eq!(pool.memory_used(), tx(&b, 3).len() + tx(&c, 2).len());
+    }
+
+    /// Item 7 step 2 (Codex C5 P3 sibling): a reinserted tx finds the pool full by the total of
+    /// both lanes, so its sender's highest nonce makes room. RED before: the big lane alone
+    /// was below the cap, so the tx went in beside it (3 pooled under a cap of 2).
+    #[test]
+    fn reinsert_makes_room_against_the_total_of_both_lanes() {
+        let (_dir, state) = setup();
+        let pool = lane_pool_of(&state, 2);
+        pool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let [a, b] = [238, 239].map(|seed| intrinsic_case(&state, seed));
+        set_lane_row(&state, &b);
+        let tx = |k, nonce| create_eip1559_tx(k, nonce, 2_000_000_000, 1, 21_000, U256::ZERO);
+        let big_bytes = torus_types::MAX_EVM_BIG_BLOCK_TX_BYTES;
+        pool.add_evm_tx(tx(&b, 0)).unwrap();
+        let drained = pool.drain_evm_big(10_000_000, big_bytes, 1_000_000_000, B256::ZERO);
+        assert_eq!(drained, vec![tx(&b, 0)]);
+        let hb1 = pool.add_evm_tx(tx(&b, 1)).unwrap();
+        let ha = pool.add_evm_tx(tx(&a, 0)).unwrap();
+        assert_eq!(pool.evm_lane_of(&ha), Some(EvmLane::Small));
+
+        pool.reinsert_evm(drained);
+        assert_eq!(pool.evm_pool_size(), 2);
+        assert_eq!(
+            pool.evm_lane_of(&hb1),
+            None,
+            "the sender's highest nonce made room"
+        );
+        assert_eq!(pool.evm_lane_of(&ha), Some(EvmLane::Small));
+        assert_eq!(pool.memory_used(), tx(&b, 0).len() + tx(&a, 0).len());
+        assert_eq!(
+            pool.drain_evm_big(10_000_000, big_bytes, 1_000_000_000, B256::ZERO),
+            vec![tx(&b, 0)]
+        );
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----

@@ -159,13 +159,6 @@ impl EvmLanes {
         }
     }
 
-    pub fn pool_mut(&mut self, lane: EvmLane) -> &mut EvmPool {
-        match lane {
-            EvmLane::Small => &mut self.small,
-            EvmLane::Big => &mut self.big,
-        }
-    }
-
     pub fn lane_of(&self, hash: &B256) -> Option<EvmLane> {
         if self.small.contains(hash) {
             Some(EvmLane::Small)
@@ -176,6 +169,42 @@ impl EvmLanes {
 
     pub fn size(&self) -> usize {
         self.small.size() + self.big.size()
+    }
+
+    /// Insert a validated tx into `lane`'s pool ([`EvmPool::insert_sharing`], or with
+    /// `reinsert` [`EvmPool::reinsert_sharing`]). `max_pool_size` caps BOTH pools together
+    /// (`MempoolConfig::max_pool_size` is the total): at the cap the new tx must outbid the
+    /// lowest effective tip of either lane, which it evicts, as in one pool.
+    pub fn insert(
+        &mut self,
+        lane: EvmLane,
+        entry: EvmPoolEntry,
+        reinsert: bool,
+        max_pool_size: usize,
+        max_per_sender: usize,
+        replacement_bump_pct: u64,
+    ) -> Result<(Option<B256>, usize), MempoolError> {
+        let (pool, other) = match lane {
+            EvmLane::Small => (&mut self.small, &mut self.big),
+            EvmLane::Big => (&mut self.big, &mut self.small),
+        };
+        if reinsert {
+            pool.reinsert_sharing(
+                entry,
+                Some(other),
+                max_pool_size,
+                max_per_sender,
+                replacement_bump_pct,
+            )
+        } else {
+            pool.insert_sharing(
+                entry,
+                Some(other),
+                max_pool_size,
+                max_per_sender,
+                replacement_bump_pct,
+            )
+        }
     }
 }
 
@@ -255,12 +284,35 @@ impl EvmPool {
             .collect()
     }
 
-    /// Insert a validated transaction.
-    /// Returns (replaced_hash, freed_bytes) — freed_bytes is the total raw RLP size
-    /// of any evicted or replaced transactions (FIX EVM-FIND-02).
+    /// [`Self::insert_sharing`] with this pool alone under `max_pool_size`.
+    #[cfg(test)]
     pub fn insert(
         &mut self,
         entry: EvmPoolEntry,
+        max_pool_size: usize,
+        max_per_sender: usize,
+        replacement_bump_pct: u64,
+    ) -> Result<(Option<B256>, usize), MempoolError> {
+        self.insert_sharing(
+            entry,
+            None,
+            max_pool_size,
+            max_per_sender,
+            replacement_bump_pct,
+        )
+    }
+
+    /// Insert a validated transaction.
+    /// Returns (replaced_hash, freed_bytes) — freed_bytes is the total raw RLP size
+    /// of any evicted or replaced transactions (FIX EVM-FIND-02).
+    ///
+    /// Item 7 step 2: `max_pool_size` caps this pool and `other` (the other lane's pool)
+    /// together. At the cap the eviction candidate is the lowest effective tip of both pools,
+    /// each ranked at its own base fee (what the proposer earns per gas in that lane).
+    pub fn insert_sharing(
+        &mut self,
+        entry: EvmPoolEntry,
+        other: Option<&mut EvmPool>,
         max_pool_size: usize,
         max_per_sender: usize,
         replacement_bump_pct: u64,
@@ -316,17 +368,27 @@ impl EvmPool {
 
         // Pool-wide size limit: evict the lowest effective tip at the
         // current base fee (what the proposer would earn least from).
+        // Item 7 step 2: of both lanes' pools (the greatest in `TxPriority` order).
         let key = TxPriority::new(&entry, self.base_fee);
-        if replaced.is_none() && self.size >= max_pool_size {
-            if let Some(lowest) = self.by_price.iter().next_back().cloned() {
-                if key.tip <= lowest.tip {
-                    return Err(MempoolError::PoolFull);
-                }
-                if let Some(evicted) = self.remove_by_hash(&lowest.hash) {
-                    freed_bytes += evicted.raw_rlp.len();
-                }
-            } else {
+        let others = other.as_ref().map_or(0, |o| o.size);
+        if replaced.is_none() && self.size + others >= max_pool_size {
+            let own = self.by_price.last().cloned();
+            let theirs = other.as_ref().and_then(|o| o.by_price.last().cloned());
+            let (lowest, in_other) = match (own, theirs) {
+                (Some(own), Some(theirs)) if theirs > own => (theirs, true),
+                (Some(own), _) => (own, false),
+                (None, Some(theirs)) => (theirs, true),
+                (None, None) => return Err(MempoolError::PoolFull),
+            };
+            if key.tip <= lowest.tip {
                 return Err(MempoolError::PoolFull);
+            }
+            let evicted = match other {
+                Some(other) if in_other => other.remove_by_hash(&lowest.hash),
+                _ => self.remove_by_hash(&lowest.hash),
+            };
+            if let Some(evicted) = evicted {
+                freed_bytes += evicted.raw_rlp.len();
             }
         }
 
@@ -351,6 +413,7 @@ impl EvmPool {
     /// sender's highest pooled nonce above this one makes room; then `insert`
     /// cannot fail. Otherwise (a duplicate, a taken nonce, no higher nonce)
     /// the `insert` rules apply unchanged.
+    #[cfg(test)]
     pub fn reinsert(
         &mut self,
         entry: EvmPoolEntry,
@@ -358,8 +421,28 @@ impl EvmPool {
         max_per_sender: usize,
         replacement_bump_pct: u64,
     ) -> Result<(Option<B256>, usize), MempoolError> {
+        self.reinsert_sharing(
+            entry,
+            None,
+            max_pool_size,
+            max_per_sender,
+            replacement_bump_pct,
+        )
+    }
+
+    /// [`Self::reinsert`] under one `max_pool_size` for this pool and `other` (item 7 step 2:
+    /// the other lane's pool, see [`Self::insert_sharing`]): the pool is full when both
+    /// together are.
+    pub fn reinsert_sharing(
+        &mut self,
+        entry: EvmPoolEntry,
+        other: Option<&mut EvmPool>,
+        max_pool_size: usize,
+        max_per_sender: usize,
+        replacement_bump_pct: u64,
+    ) -> Result<(Option<B256>, usize), MempoolError> {
         let duplicate = self.by_hash.contains_key(&entry.hash);
-        let pool_full = self.size >= max_pool_size;
+        let pool_full = self.size + other.as_ref().map_or(0, |o| o.size) >= max_pool_size;
         let highest = self
             .by_sender
             .get(&entry.sender)
@@ -383,8 +466,13 @@ impl EvmPool {
                 freed_bytes = evicted.raw_rlp.len();
             }
         }
-        let (replaced, freed) =
-            self.insert(entry, max_pool_size, max_per_sender, replacement_bump_pct)?;
+        let (replaced, freed) = self.insert_sharing(
+            entry,
+            other,
+            max_pool_size,
+            max_per_sender,
+            replacement_bump_pct,
+        )?;
         Ok((replaced, freed_bytes + freed))
     }
 
@@ -897,5 +985,43 @@ mod tests {
         assert_eq!(pool.size(), 0);
         assert!(pool.by_price.is_empty(), "no stale keys left in by_price");
         assert!(pool.by_hash.is_empty());
+    }
+
+    /// Item 7 step 2 (Codex C5 P3): one size cap for both lanes, and each lane ranks its txs at
+    /// its own base fee. Small base fee 10, big 50: A (small, max 100, tip 30) earns 30, B (big,
+    /// max 70, tip 30) earns 20. At the cap of 2 a small-lane C earning 25 evicts B from the
+    /// big pool; D earning 20 outbids neither. A replacement needs no room. RED before: no
+    /// shared cap (compile error).
+    #[test]
+    fn lanes_share_one_size_cap_ranked_at_each_lanes_base_fee() {
+        let mut lanes = EvmLanes::new(10);
+        lanes.big.set_base_fee(50);
+        let (a, b) = (entry(0xA, 0, 100, 30), entry(0xB, 0, 70, 30));
+        lanes
+            .insert(EvmLane::Small, a.clone(), false, 2, 16, BUMP)
+            .unwrap();
+        lanes
+            .insert(EvmLane::Big, b.clone(), false, 2, 16, BUMP)
+            .unwrap();
+
+        let c = entry(0xC, 0, 100, 25);
+        let (_, freed) = lanes
+            .insert(EvmLane::Small, c.clone(), false, 2, 16, BUMP)
+            .unwrap();
+        assert_eq!(freed, b.raw_rlp.len(), "B (20 at the big fee) evicted");
+        assert_eq!(lanes.lane_of(&b.hash), None);
+        assert_eq!(lanes.lane_of(&c.hash), Some(EvmLane::Small));
+        assert_eq!(lanes.size(), 2);
+        assert!(matches!(
+            lanes.insert(EvmLane::Big, entry(0xD, 0, 100, 20), false, 2, 16, BUMP),
+            Err(MempoolError::PoolFull)
+        ));
+
+        let a2 = entry(0xA, 0, 110, 33);
+        let (replaced, _) = lanes
+            .insert(EvmLane::Small, a2, false, 2, 16, BUMP)
+            .unwrap();
+        assert_eq!(replaced, Some(a.hash));
+        assert_eq!(lanes.size(), 2);
     }
 }
