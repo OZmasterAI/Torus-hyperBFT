@@ -888,12 +888,94 @@ mod propose_backpressure_tests {
             assert!(!app.proposal_backpressure_at(None), "depth {depth}");
         }
         app.exec_queue_len.store(0, Ordering::Relaxed);
-        // The trait hook reads the process-wide knob, which no test sets.
-        if std::env::var_os("TORUS_PROPOSE_EXEC_WATERMARK").is_none() {
-            app.exec_queue_len.store(66, Ordering::Relaxed);
-            assert!(!App::proposal_backpressure(&app), "env unset: hook is off");
-            app.exec_queue_len.store(0, Ordering::Relaxed);
+        // The production hook (env + OnceLock) is pinned in child processes
+        // by `production_hook_*` below, isolated from this process's env.
+    }
+
+    /// Child of the `production_hook_*` tests: calls the PRODUCTION hook
+    /// (`App::proposal_backpressure` → the read-once
+    /// `TORUS_PROPOSE_EXEC_WATERMARK`) in a fresh process whose env the parent
+    /// set, so no other test (or the runner's env) can have resolved the
+    /// OnceLock first. `TORUS_TEST_PROPOSE_HOOK_EXPECT`: `on16` = defers iff
+    /// the exec queue is >= 16 (never once exec failed); `off` = never defers.
+    #[test]
+    #[ignore = "child process of the production_hook_* tests"]
+    fn production_hook_child() {
+        let expect = std::env::var("TORUS_TEST_PROPOSE_HOOK_EXPECT")
+            .expect("run by a production_hook_* parent test");
+        let app = TorusApp::stub();
+        let hook = |depth: u64| {
+            app.exec_queue_len.store(depth, Ordering::Relaxed);
+            App::proposal_backpressure(&app)
+        };
+        match expect.as_str() {
+            "on16" => {
+                for (depth, want) in [
+                    (0u64, false),
+                    (1, false),
+                    (15, false),
+                    (16, true),
+                    (17, true),
+                    (64, true),
+                    (66, true),
+                ] {
+                    assert_eq!(hook(depth), want, "watermark 16, depth {depth}");
+                }
+                app.exec_failed.store(true, Ordering::SeqCst);
+                assert!(!hook(64), "exec failed: never defers");
+            }
+            "off" => {
+                for depth in [0u64, 1, 15, 16, 64, 66, u64::MAX] {
+                    assert!(!hook(depth), "knob off, depth {depth}");
+                }
+            }
+            other => panic!("unknown expectation {other:?}"),
         }
+        println!("PROPOSE_HOOK_CHILD_OK {expect}");
+    }
+
+    /// Run [`production_hook_child`] in a fresh process with the watermark
+    /// env set to `watermark` (`None` = removed).
+    fn run_production_hook_child(watermark: Option<&str>, expect: &str) {
+        const CHILD: &str = "app::propose_backpressure_tests::production_hook_child";
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            CHILD,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("TORUS_TEST_PROPOSE_HOOK_EXPECT", expect);
+        match watermark {
+            Some(w) => cmd.env("TORUS_PROPOSE_EXEC_WATERMARK", w),
+            None => cmd.env_remove("TORUS_PROPOSE_EXEC_WATERMARK"),
+        };
+        let out = cmd.output().expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(&format!("PROPOSE_HOOK_CHILD_OK {expect}")),
+            "child (watermark {watermark:?}, expect {expect}) failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Codex s123 review P3: flag ON through the production hook —
+    /// `TORUS_PROPOSE_EXEC_WATERMARK=16` never defers below depth 16, always
+    /// at or above it (never once exec failed).
+    #[test]
+    fn production_hook_flag_on_defers_at_the_watermark() {
+        run_production_hook_child(Some("16"), "on16");
+        run_production_hook_child(Some(" 16 "), "on16");
+    }
+
+    /// Codex s123 review P3: flag OFF through the production hook — unset,
+    /// `0` or garbage never defer, at any depth.
+    #[test]
+    fn production_hook_flag_off_never_defers() {
+        run_production_hook_child(None, "off");
+        run_production_hook_child(Some("0"), "off");
+        run_production_hook_child(Some("sixteen"), "off");
     }
 
     #[test]

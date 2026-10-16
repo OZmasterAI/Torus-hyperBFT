@@ -88,14 +88,32 @@ impl WriteBatch for OrderWb {
     }
 }
 
+std::thread_local! {
+    /// Store reads (`OrderKV` and its snapshots) on this thread: s123
+    /// `proposal_backpressure_test` asserts a deferring leader's retries
+    /// read nothing.
+    static KV_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Store reads this thread made through any `OrderKV` (or its snapshots).
+pub(crate) fn kv_reads() -> u64 {
+    KV_READS.with(std::cell::Cell::get)
+}
+
+fn count_read() {
+    KV_READS.with(|c| c.set(c.get() + 1));
+}
+
 impl KVGet for OrderKV {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        count_read();
         self.map.get(key).cloned()
     }
 }
 
 impl KVGet for OrderSnap {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        count_read();
         self.0.get(key).cloned()
     }
 }

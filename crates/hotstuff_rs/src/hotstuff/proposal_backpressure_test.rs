@@ -31,7 +31,7 @@ use crate::hotstuff::implementation::{
 };
 use crate::hotstuff::types::PhaseCertificate;
 use crate::hotstuff::vote_persist_order_test::{
-    base_tree, replica, OrderKV, OrderLog, OrderNetwork, BROADCAST_HEADER, CHAIN_ID,
+    base_tree, kv_reads, replica, OrderKV, OrderLog, OrderNetwork, BROADCAST_HEADER, CHAIN_ID,
 };
 use crate::pacemaker::implementation::ViewInfo;
 use crate::pacemaker::types::{TimeoutCertificate, TipInfo};
@@ -391,4 +391,95 @@ fn older_tc_does_not_lift_deferral() {
     assert_eq!(app.produced, 0);
     assert_eq!(headers(&lead.log), 0);
     assert!(lead.leader.has_deferred_proposal());
+}
+
+/// Codex s123 review P2: while the app hint holds, the algorithm loop's
+/// ~10 ms retries keep the proposal deferred WITHOUT rebuilding the proposal
+/// context: no `highest_pc`, validator-set, reputation or `highest_tc` read
+/// per retry (was 1 TC + 8 validator-set reads per retry on the consensus
+/// thread). The view's first deferral pays them once; the release still
+/// builds the proposal from fresh reads.
+#[test]
+fn deferring_leader_retries_read_nothing_from_the_store() {
+    let mut lead = leader_of_view_3();
+    let mut app = PacedApp {
+        backpressure: true,
+        produced: 0,
+    };
+    let info = ViewInfo::new(lead.view, Instant::now() + FAR);
+    enter(&mut lead, &info, &mut app);
+    assert!(lead.leader.has_deferred_proposal());
+
+    let before = kv_reads();
+    for _ in 0..9 {
+        enter(&mut lead, &info, &mut app);
+        assert!(lead.leader.has_deferred_proposal());
+    }
+    assert_eq!(
+        kv_reads() - before,
+        0,
+        "a deferring leader's retries must not read the store"
+    );
+    assert_eq!(app.produced, 0);
+    assert_eq!(headers(&lead.log), 0);
+
+    app.backpressure = false;
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(app.produced, 1, "the release proposes once");
+    assert_eq!(headers(&lead.log), 1);
+    assert!(!lead.leader.has_deferred_proposal());
+}
+
+/// The deadline escape still fires on a retry (the cheap retry path checks
+/// the same pacing as the full one): entered 500 ms before the deadline
+/// (deferred: more than the 300 ms escape), a retry 250 ms later (inside the
+/// escape, before the 600 ms hold) proposes.
+#[test]
+fn retry_inside_the_escape_proposes() {
+    let mut lead = leader_of_view_3();
+    let mut app = PacedApp {
+        backpressure: true,
+        produced: 0,
+    };
+    let info = ViewInfo::new(lead.view, Instant::now() + Duration::from_millis(500));
+    enter(&mut lead, &info, &mut app);
+    assert!(
+        lead.leader.has_deferred_proposal(),
+        "outside the escape: deferred"
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(app.produced, 1, "inside the escape the retry must propose");
+    assert_eq!(headers(&lead.log), 1);
+    assert!(!lead.leader.has_deferred_proposal());
+}
+
+/// The cheap retry path is invalidated by a pacemaker message, the only
+/// writer of `highest_tc` mid-view: a TC for `view - 1` stored while the
+/// leader defers (a late TC after a QC entry) lifts the deferral at the next
+/// retry once the loop reports the message, as the full checks do (review
+/// fix (b)). Without the message the retry stays on the cheap path.
+#[test]
+fn tc_stored_mid_deferral_lifts_it_after_the_pacemaker_message() {
+    let mut lead = leader_of_view_3();
+    let mut app = PacedApp {
+        backpressure: true,
+        produced: 0,
+    };
+    let info = ViewInfo::new(lead.view, Instant::now() + FAR);
+    enter(&mut lead, &info, &mut app);
+    assert!(lead.leader.has_deferred_proposal());
+
+    let tc = losing_tc(ViewNumber::new(lead.view.int() - 1));
+    lead.block_tree.set_highest_tc(&tc).expect("set highest_tc");
+    lead.log.lock().unwrap().clear();
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(app.produced, 0, "no pacemaker message yet: still deferred");
+    assert!(lead.leader.has_deferred_proposal());
+
+    lead.leader.invalidate_app_deferral();
+    enter(&mut lead, &info, &mut app);
+    assert_eq!(app.produced, 1, "the view after a TC must propose at once");
+    assert_eq!(headers(&lead.log), 1);
+    assert!(!lead.leader.has_deferred_proposal());
 }

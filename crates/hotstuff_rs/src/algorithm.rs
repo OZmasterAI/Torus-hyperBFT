@@ -390,6 +390,9 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                             e
                         );
                     }
+                    // s123: the pacemaker may have stored a new highest TC;
+                    // a deferring leader re-runs its full checks next retry.
+                    self.hotstuff.invalidate_app_deferral();
                 }
                 ProgressMessage::BlockSyncAdvertiseMessage(msg) => {
                     if let Err(e) = self.block_sync_client.on_receive_msg(

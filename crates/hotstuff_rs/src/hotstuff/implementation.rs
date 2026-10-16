@@ -172,6 +172,16 @@ pub(crate) struct HotStuff<N: Network> {
     /// [`App::proposal_backpressure`]; keeps that debug line to once per view
     /// instead of once per ~10 ms retry poll.
     app_backpressure_logged_view: Option<ViewNumber>,
+    /// Codex s123 review P2: the view whose fresh proposal this leader is
+    /// deferring on [`App::proposal_backpressure`] after the full checks
+    /// passed (proposer, phase, the TC rule). While it is the current view,
+    /// a retry re-checks only the app hint and the time caps
+    /// ([`Self::app_pacing_defers`]) and skips the proposal context (no store
+    /// read, no validator-set decode on the consensus thread). Cleared on a
+    /// view change, when the cheap check lets the proposal go, and on every
+    /// pacemaker message ([`Self::invalidate_app_deferral`]: the only writer
+    /// of `highest_tc` mid-view), so the next retry re-runs the full checks.
+    app_deferral_view: Option<ViewNumber>,
     /// s123 rank 2 review fix (a): when this replica entered its current view
     /// (set by `enter_view` on a view change, never by a same-view retry).
     /// Entry times are roughly in step across nodes, deadlines are not.
@@ -266,6 +276,7 @@ impl<N: Network> HotStuff<N> {
             deferred_sync_refresh: false,
             proposal_deferred: false,
             app_backpressure_logged_view: None,
+            app_deferral_view: None,
             view_entered_at: Instant::now(),
             app_backpressure_max_hold: APP_BACKPRESSURE_DEFAULT_MAX_HOLD,
             last_missing_pc_check: Instant::now(),
@@ -536,15 +547,7 @@ impl<N: Network> HotStuff<N> {
         app: &A,
         block_tree: &BlockTreeSingleton<K>,
     ) -> bool {
-        if !app.proposal_backpressure() {
-            return false;
-        }
-        let now = Instant::now();
-        let slack = self.view_info.deadline.saturating_duration_since(now);
-        if slack <= APP_BACKPRESSURE_ESCAPE {
-            return false;
-        }
-        if now.saturating_duration_since(self.view_entered_at) >= self.app_backpressure_max_hold {
+        if !self.app_pacing_defers(app) {
             return false;
         }
         // A TC read error proposes at once, which is main's behavior.
@@ -559,11 +562,37 @@ impl<N: Network> HotStuff<N> {
                 "s123 app backpressure: deferring fresh proposal at view={} \
                  ({} ms to the view deadline, escape at {} ms)",
                 self.view_info.view.int(),
-                slack.as_millis(),
+                self.view_info
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
                 APP_BACKPRESSURE_ESCAPE.as_millis(),
             );
         }
+        self.app_deferral_view = Some(self.view_info.view);
         true
+    }
+
+    /// The store-free part of [`Self::app_defers_proposal`]: the app hint and
+    /// both time caps (the deadline escape, the hold since view entry). An
+    /// app without the override answers `false` at once.
+    fn app_pacing_defers<K: KVStore, A: App<K>>(&self, app: &A) -> bool {
+        if !app.proposal_backpressure() {
+            return false;
+        }
+        let now = Instant::now();
+        let slack = self.view_info.deadline.saturating_duration_since(now);
+        if slack <= APP_BACKPRESSURE_ESCAPE {
+            return false;
+        }
+        now.saturating_duration_since(self.view_entered_at) < self.app_backpressure_max_hold
+    }
+
+    /// Codex s123 review P2: forget the app deferral's full checks (see
+    /// `app_deferral_view`). The algorithm loop calls this after every
+    /// pacemaker message, which may have stored a new `highest_tc`.
+    pub(crate) fn invalidate_app_deferral(&mut self) {
+        self.app_deferral_view = None;
     }
 
     /// s123 rank 2 review fix (a): set the app backpressure hold cap (see
@@ -650,6 +679,15 @@ impl<N: Network> HotStuff<N> {
     ) -> Result<(), HotStuffError> {
         // Retry deferred proposal: parent body has now arrived, skip view transition.
         if self.proposal_deferred && new_view_info.view == self.view_info.view {
+            // Codex s123 review P2: still deferring this view on app
+            // backpressure (the full checks passed, nothing invalidated
+            // them): stay deferred without rebuilding the proposal context.
+            if self.app_deferral_view == Some(self.view_info.view)
+                && self.app_pacing_defers::<K, _>(&*app)
+            {
+                return Ok(());
+            }
+            self.app_deferral_view = None;
             self.proposal_deferred = false;
             let highest_pc = block_tree.highest_pc()?;
             if matches!(highest_pc.phase, Phase::Generic | Phase::Decide) {
@@ -771,6 +809,7 @@ impl<N: Network> HotStuff<N> {
         //    votes for the new view.
         self.view_info = new_view_info;
         self.view_entered_at = Instant::now();
+        self.app_deferral_view = None;
         self.proposal_status = ProposalStatus::WaitingForProposal;
         self.awaiting_body_vote = None;
         // MonadBFT B2: Cancel any pending recovery when entering a new view.
