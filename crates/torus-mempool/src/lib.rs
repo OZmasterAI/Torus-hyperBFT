@@ -21,7 +21,10 @@ use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
 use torus_state::backend::StateBackend as _;
-use torus_state::{DaReadTiming, ErasureParams, NativeDaStore, StateDb, StateError, StoredShard};
+use torus_state::{
+    DaGcLimits, DaGcOutcome, DaReadTiming, ErasureParams, NativeDaStore, StateDb, StateError,
+    StoredShard,
+};
 use torus_types::SignedNativeAction;
 
 use crate::verified_cache::FifoCache;
@@ -1323,6 +1326,30 @@ impl Mempool {
     /// shards a proposer OR a validating peer custodied.
     pub fn get_shard(&self, hash: &B256, index: u16) -> Option<StoredShard> {
         self.da_store.get_shard(&hash.0, index).ok().flatten()
+    }
+
+    /// RH4: one durable DA body GC pass for a dispatched committed height,
+    /// see [`NativeDaStore::gc_committed`]. Best effort: a store error is
+    /// logged and reads as nothing done. The aged rows stay and the next pass
+    /// retries them; a `height` whose row was not written keeps its bodies.
+    pub fn gc_committed_native_da(
+        &self,
+        height: u64,
+        hashes: &[B256],
+        shard_count: u16,
+        retention: u64,
+        limits: DaGcLimits,
+    ) -> DaGcOutcome {
+        match self
+            .da_store
+            .gc_committed(height, hashes, shard_count, retention, limits)
+        {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!(height, "native DA body GC pass failed: {e}");
+                DaGcOutcome::default()
+            }
+        }
     }
 
     /// Mirror native-action bodies into the durable DA store (proposer guarantee:

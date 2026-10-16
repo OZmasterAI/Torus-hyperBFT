@@ -11,6 +11,10 @@
 //! ingest / produce / receive path, and the rare pull-fallback
 //! (`/torus/native-da/1.0`) serves them by-hash on a miss. Bodies use the same
 //! `bincode` encoding as the native-action network wire format.
+//!
+//! RH4: committed bodies (and their shards) are deleted a retention window
+//! after their block dispatched ([`NativeDaStore::gc_committed`]; the window
+//! policy is `torus_consensus::da_gc`). Bodies of uncommitted actions stay.
 
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -60,6 +64,67 @@ pub struct DaReadTiming {
 #[derive(Clone)]
 pub struct NativeDaStore {
     db: StateDb,
+}
+
+/// RH4 body GC: the retention row of one committed height lives in
+/// [`CF_NATIVE_PENDING`] under `DA_GC_ROW_PREFIX ++ height (8 BE)`, next to
+/// the bodies it lists, so ONE `WriteBatch` deletes the bodies, their shards
+/// and the row. Body keys are always 32 bytes (an action hash); these keys
+/// are 15 bytes, so they can never be read or served as a body.
+const DA_GC_ROW_PREFIX: &[u8; 7] = b"\xffda-gc/";
+const DA_GC_ROW_KEY_LEN: usize = DA_GC_ROW_PREFIX.len() + 8;
+/// Lowest height whose row may still exist (rows below it were deleted).
+/// Only a seek start: it keeps each pass from walking old row tombstones.
+/// Outside the row prefix (`-` sorts before `/`), so no row scan meets it.
+const DA_GC_FRONTIER_KEY: &[u8] = b"\xffda-gc-frontier";
+
+fn da_gc_row_key(height: u64) -> [u8; DA_GC_ROW_KEY_LEN] {
+    let mut key = [0u8; DA_GC_ROW_KEY_LEN];
+    key[..DA_GC_ROW_PREFIX.len()].copy_from_slice(DA_GC_ROW_PREFIX);
+    key[DA_GC_ROW_PREFIX.len()..].copy_from_slice(&height.to_be_bytes());
+    key
+}
+
+/// Row value: `shard_count (u16 BE) ++ hash_0 ++ .. ++ hash_n` (32 bytes each).
+fn encode_da_gc_row(shard_count: u16, hashes: &[B256]) -> Vec<u8> {
+    let mut row = Vec::with_capacity(2 + 32 * hashes.len());
+    row.extend_from_slice(&shard_count.to_be_bytes());
+    for hash in hashes {
+        row.extend_from_slice(hash.as_slice());
+    }
+    row
+}
+
+/// `(shard_count, concatenated hashes)`, `None` when malformed.
+fn decode_da_gc_row(row: &[u8]) -> Option<(u16, &[u8])> {
+    if row.len() < 2 || !(row.len() - 2).is_multiple_of(32) {
+        return None;
+    }
+    Some((u16::from_be_bytes([row[0], row[1]]), &row[2..]))
+}
+
+/// Per-pass bounds of [`NativeDaStore::gc_committed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaGcLimits {
+    /// Most retention rows (committed heights) one pass deletes.
+    pub max_rows: usize,
+    /// Most delete operations (bodies + shard keys) one pass issues. The first
+    /// row is always taken whole, so a pass always progresses.
+    pub max_deletes: usize,
+}
+
+/// What one [`NativeDaStore::gc_committed`] pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DaGcOutcome {
+    /// Body delete operations issued (one per hash of each deleted row).
+    pub bodies_deleted: u64,
+    /// Shard-key delete operations issued.
+    pub shard_keys_deleted: u64,
+    /// Retention rows (committed heights) deleted.
+    pub rows_deleted: u64,
+    /// A bound stopped the pass while aged rows remained; the next pass
+    /// continues from there.
+    pub backlog: bool,
 }
 
 impl NativeDaStore {
@@ -260,6 +325,127 @@ impl NativeDaStore {
     /// multi-KB value copy just to test existence.
     pub fn contains(&self, hash: &[u8; 32]) -> Result<bool, StateError> {
         self.db.exists_cf_raw(CF_NATIVE_PENDING, hash.as_slice())
+    }
+
+    /// RH4 durable body GC: one pass per dispatched committed height.
+    ///
+    /// Records `hashes` (the committed block's action hashes; `shard_count`
+    /// erasure shards were custodied per body, 0 = none) as the retention row
+    /// of `height`, then deletes the bodies, the shards and the row of every
+    /// recorded height `h` with `h + retention <= height`, so a body survives
+    /// `retention` heights past its own. The additive form keeps everything
+    /// while `height < retention` (`height - retention` floored at 0 deleted
+    /// height 0: the July RH4 bug). Bodies no row lists (never committed, or
+    /// expired: pool expiry is local-clock and a skewed peer may still include
+    /// them) are never touched.
+    ///
+    /// One atomic `WriteBatch` per pass, bounded by `limits`; the first due row
+    /// is always taken whole, so the GC always progresses. The rows live next
+    /// to the bodies (non-32-byte keys), so a crash never splits a row from its
+    /// bodies and a restart leaves none behind. Empty `hashes` records nothing;
+    /// a `retention` of 0 counts as 1.
+    pub fn gc_committed(
+        &self,
+        height: u64,
+        hashes: &[B256],
+        shard_count: u16,
+        retention: u64,
+        limits: DaGcLimits,
+    ) -> Result<DaGcOutcome, StateError> {
+        let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        if !hashes.is_empty() {
+            batch.put_cf(
+                cf,
+                da_gc_row_key(height),
+                encode_da_gc_row(shard_count, hashes),
+            );
+        }
+        let mut out = DaGcOutcome::default();
+        // Rows at or below `last_due` are due: `h + retention <= height`.
+        if let Some(last_due) = height.checked_sub(retention.max(1)) {
+            let frontier = match self.db.get_cf_raw(CF_NATIVE_PENDING, DA_GC_FRONTIER_KEY)? {
+                Some(bytes) if bytes.len() == 8 => {
+                    u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"))
+                }
+                _ => 0,
+            };
+            if frontier <= last_due {
+                self.gc_due_rows(&mut batch, frontier, last_due, limits, &mut out)?;
+            }
+        }
+        if !batch.is_empty() {
+            self.db.write(batch)?;
+        }
+        Ok(out)
+    }
+
+    /// Add the deletes of the rows in `[frontier, last_due]` to `batch`, within
+    /// `limits`, plus the new frontier when any row went.
+    fn gc_due_rows(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        frontier: u64,
+        last_due: u64,
+        limits: DaGcLimits,
+        out: &mut DaGcOutcome,
+    ) -> Result<(), StateError> {
+        let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
+        let mut shards_cf = None;
+        let start = da_gc_row_key(frontier);
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_lower_bound(start.to_vec());
+        // `last_due < height <= u64::MAX`, so `last_due + 1` cannot overflow.
+        opts.set_iterate_upper_bound(da_gc_row_key(last_due + 1).to_vec());
+        let mut it = self.db.inner().raw_iterator_cf_opt(cf, opts);
+        it.seek(start);
+        let mut next_frontier = last_due + 1;
+        let mut deletes = 0usize;
+        while let (Some(key), Some(value)) = (it.key(), it.value()) {
+            // A 32-byte body key can share the 7-byte prefix (p = 2^-56):
+            // never treat it as a row.
+            if key.len() != DA_GC_ROW_KEY_LEN || !key.starts_with(DA_GC_ROW_PREFIX) {
+                it.next();
+                continue;
+            }
+            let h = u64::from_be_bytes(key[DA_GC_ROW_PREFIX.len()..].try_into().expect("8 bytes"));
+            let (row_shards, row_hashes) = decode_da_gc_row(value).unwrap_or_else(|| {
+                tracing::warn!(height = h, len = value.len(), "malformed DA GC row dropped");
+                (0, &[][..])
+            });
+            let bodies = row_hashes.len() / 32;
+            let row_deletes = bodies * (1 + usize::from(row_shards));
+            if out.rows_deleted as usize >= limits.max_rows.max(1)
+                || (out.rows_deleted > 0 && deletes + row_deletes > limits.max_deletes)
+            {
+                next_frontier = h;
+                out.backlog = true;
+                break;
+            }
+            if row_shards > 0 && shards_cf.is_none() {
+                shards_cf = Some(self.db.cf_handle(CF_NATIVE_SHARDS)?);
+            }
+            for hash in row_hashes.chunks_exact(32) {
+                batch.delete_cf(cf, hash);
+                if let Some(shards) = shards_cf {
+                    let hash: &[u8; 32] = hash.try_into().expect("32-byte chunk");
+                    for i in 0..row_shards {
+                        batch.delete_cf(shards, shard_key(hash, i));
+                    }
+                }
+            }
+            batch.delete_cf(cf, key);
+            deletes += row_deletes;
+            out.rows_deleted += 1;
+            out.bodies_deleted += bodies as u64;
+            out.shard_keys_deleted += (bodies * usize::from(row_shards)) as u64;
+            it.next();
+        }
+        it.status()?;
+        if out.rows_deleted > 0 {
+            batch.put_cf(cf, DA_GC_FRONTIER_KEY, next_frontier.to_be_bytes());
+        }
+        Ok(())
     }
 
     /// Erasure-encode each body under `params` and persist all `n` shards into
@@ -671,5 +857,252 @@ mod tests {
             store.get(&hash).expect("get").is_some(),
             "whole body still present after shard encode"
         );
+    }
+
+    // ---- RH4 durable body GC ----
+
+    const LIMITS: DaGcLimits = DaGcLimits {
+        max_rows: 64,
+        max_deletes: 1 << 20,
+    };
+
+    fn present(store: &NativeDaStore, action: &SignedNativeAction) -> bool {
+        store.contains(&compute_action_hash(action).0).unwrap()
+    }
+
+    fn bookkeeping_keys(store: &NativeDaStore) -> usize {
+        use crate::StateBackend;
+        store
+            .db
+            .iterate_cf(CF_NATIVE_PENDING, None)
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.len() != 32)
+            .count()
+    }
+
+    /// A committed body survives `retention` dispatched heights past its commit
+    /// height and goes on the pass where `commit height + retention == height`.
+    #[test]
+    fn gc_deletes_committed_bodies_after_the_window_not_before() {
+        let (_dir, store) = temp_store();
+        let (a, b) = (dummy_action(1), dummy_action(2));
+        store.put_batch(&[a.clone(), b.clone()]).unwrap();
+        let (ha, hb) = (compute_action_hash(&a), compute_action_hash(&b));
+        // Retention 4: committed at 10 -> deletable from height 14.
+        store.gc_committed(10, &[ha], 0, 4, LIMITS).unwrap();
+        store.gc_committed(11, &[hb], 0, 4, LIMITS).unwrap();
+        for height in 12..=13 {
+            assert_eq!(
+                store.gc_committed(height, &[], 0, 4, LIMITS).unwrap(),
+                DaGcOutcome::default()
+            );
+        }
+        assert!(
+            present(&store, &a) && present(&store, &b),
+            "both inside the window at 13"
+        );
+
+        let out = store.gc_committed(14, &[], 0, 4, LIMITS).unwrap();
+        assert_eq!(
+            (out.rows_deleted, out.bodies_deleted, out.backlog),
+            (1, 1, false)
+        );
+        assert!(!present(&store, &a), "height 10 aged out at 14");
+        assert!(
+            present(&store, &b),
+            "height 11 is still inside the window at 14"
+        );
+
+        let out = store.gc_committed(15, &[], 0, 4, LIMITS).unwrap();
+        assert_eq!((out.rows_deleted, out.bodies_deleted), (1, 1));
+        assert!(!present(&store, &b), "height 11 aged out at 15");
+        assert_eq!(
+            store.gc_committed(16, &[], 0, 4, LIMITS).unwrap(),
+            DaGcOutcome::default()
+        );
+        // Every row went with its bodies; only the frontier key remains.
+        assert_eq!(bookkeeping_keys(&store), 1);
+    }
+
+    /// The July RH4 windowing bug (memory a70717bb): `cutoff = tip -
+    /// retention` (saturating) with `h <= cutoff` deleted the height-0 body
+    /// while `tip < retention`. Nothing may go before `h + retention <= tip`.
+    #[test]
+    fn gc_never_deletes_inside_the_window_near_genesis() {
+        let (_dir, store) = temp_store();
+        let genesis = dummy_action(7);
+        store.put(&genesis).unwrap();
+        store
+            .gc_committed(0, &[compute_action_hash(&genesis)], 0, 4, LIMITS)
+            .unwrap();
+        for tip in 1..4 {
+            let out = store.gc_committed(tip, &[], 0, 4, LIMITS).unwrap();
+            assert_eq!(out.bodies_deleted, 0, "tip {tip} < retention 4");
+            assert!(
+                present(&store, &genesis),
+                "height-0 body must survive tip {tip}"
+            );
+        }
+        assert_eq!(
+            store
+                .gc_committed(4, &[], 0, 4, LIMITS)
+                .unwrap()
+                .bodies_deleted,
+            1
+        );
+        assert!(!present(&store, &genesis));
+    }
+
+    /// Only bodies a committed row lists are deleted. A body no committed
+    /// block references (expired, or a losing proposal's) stays: pool expiry
+    /// is local-clock, a skewed peer may still include it.
+    #[test]
+    fn gc_keeps_uncommitted_bodies() {
+        let (_dir, store) = temp_store();
+        let (committed, uncommitted) = (dummy_action(1), dummy_action(2));
+        store
+            .put_batch(&[committed.clone(), uncommitted.clone()])
+            .unwrap();
+        store
+            .gc_committed(1, &[compute_action_hash(&committed)], 0, 2, LIMITS)
+            .unwrap();
+        for height in 2..200 {
+            store.gc_committed(height, &[], 0, 2, LIMITS).unwrap();
+        }
+        assert!(!present(&store, &committed));
+        assert!(
+            present(&store, &uncommitted),
+            "an uncommitted body is never GC'd"
+        );
+    }
+
+    /// The shards of a GC'd body go with it (every index below the row's
+    /// shard count); the shards of an uncommitted body stay.
+    #[test]
+    fn gc_deletes_the_shards_of_gcd_bodies() {
+        let (_dir, store) = temp_store();
+        let params = ErasureParams::new(2, 3);
+        let (c, u) = (dummy_action(1), dummy_action(2));
+        store.put_batch(&[c.clone(), u.clone()]).unwrap();
+        store
+            .put_shards_batch(&[c.clone(), u.clone()], params)
+            .unwrap();
+        let (hc, hu) = (compute_action_hash(&c), compute_action_hash(&u));
+        store
+            .gc_committed(5, &[hc], params.n as u16, 1, LIMITS)
+            .unwrap();
+        let out = store.gc_committed(6, &[], 0, 1, LIMITS).unwrap();
+        assert_eq!((out.bodies_deleted, out.shard_keys_deleted), (1, 3));
+        for i in 0..params.n as u16 {
+            assert!(
+                store.get_shard(&hc.0, i).unwrap().is_none(),
+                "shard {i} of the GC'd body"
+            );
+            assert!(
+                store.get_shard(&hu.0, i).unwrap().is_some(),
+                "shard {i} of the uncommitted body"
+            );
+        }
+    }
+
+    /// One pass deletes at most `max_rows` rows and `max_deletes` operations
+    /// (the first row whole), reports the backlog, and later passes drain it.
+    #[test]
+    fn gc_pass_is_bounded_and_drains_the_backlog() {
+        let (_dir, store) = temp_store();
+        let actions: Vec<_> = (1..=30).map(dummy_action).collect();
+        store.put_batch(&actions).unwrap();
+        // Heights 100..=109, three bodies each, recorded under a wide window...
+        for (i, chunk) in actions.chunks(3).enumerate() {
+            let hashes: Vec<_> = chunk.iter().map(compute_action_hash).collect();
+            store
+                .gc_committed(100 + i as u64, &hashes, 0, 1000, LIMITS)
+                .unwrap();
+        }
+        assert!(actions.iter().all(|a| present(&store, a)));
+        // ...then a restart with retention 1: all ten rows are due at once.
+        let ops = DaGcLimits {
+            max_rows: 8,
+            max_deletes: 7,
+        };
+        let out = store.gc_committed(110, &[], 0, 1, ops).unwrap();
+        assert_eq!(
+            (out.rows_deleted, out.bodies_deleted, out.backlog),
+            (2, 6, true)
+        );
+        let rows = DaGcLimits {
+            max_rows: 3,
+            max_deletes: 1000,
+        };
+        let out = store.gc_committed(111, &[], 0, 1, rows).unwrap();
+        assert_eq!((out.rows_deleted, out.backlog), (3, true));
+        let tiny = DaGcLimits {
+            max_rows: 8,
+            max_deletes: 1,
+        };
+        let out = store.gc_committed(112, &[], 0, 1, tiny).unwrap();
+        assert_eq!(
+            (out.rows_deleted, out.bodies_deleted, out.backlog),
+            (1, 3, true),
+            "a row above max_deletes is still taken whole"
+        );
+        let mut deleted = 2 + 3 + 1;
+        for tip in 113.. {
+            let out = store.gc_committed(tip, &[], 0, 1, rows).unwrap();
+            deleted += out.rows_deleted;
+            if !out.backlog {
+                break;
+            }
+        }
+        assert_eq!(deleted, 10);
+        assert!(actions.iter().all(|a| !present(&store, a)));
+    }
+
+    /// Rows are durable: a restart between the record and the GC leaves no
+    /// residue, and re-dispatching a height after it is harmless.
+    #[test]
+    fn gc_rows_survive_a_restart() {
+        let (dir, store) = temp_store();
+        let a = dummy_action(1);
+        store.put(&a).unwrap();
+        let ha = compute_action_hash(&a);
+        store.gc_committed(20, &[ha], 0, 8, LIMITS).unwrap();
+        drop(store);
+        let reopened = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+        assert!(present(&reopened, &a));
+        reopened.gc_committed(20, &[ha], 0, 8, LIMITS).unwrap();
+        assert_eq!(
+            reopened
+                .gc_committed(28, &[], 0, 8, LIMITS)
+                .unwrap()
+                .bodies_deleted,
+            1
+        );
+        assert!(!present(&reopened, &a));
+    }
+
+    /// The GC rows share `CF_NATIVE_PENDING` with the bodies but can never be
+    /// mistaken for one: body keys are exactly 32 bytes, row keys are not.
+    #[test]
+    fn gc_bookkeeping_keys_are_never_body_keys() {
+        assert_ne!(DA_GC_ROW_KEY_LEN, 32);
+        assert_ne!(DA_GC_FRONTIER_KEY.len(), 32);
+        let (_dir, store) = temp_store();
+        let a = dummy_action(1);
+        store.put(&a).unwrap();
+        store
+            .gc_committed(3, &[compute_action_hash(&a)], 0, 9, LIMITS)
+            .unwrap();
+        assert_eq!(bookkeeping_keys(&store), 1, "the row of height 3");
+        use crate::StateBackend;
+        for (key, value) in store.db.iterate_cf(CF_NATIVE_PENDING, None).unwrap() {
+            if key.len() == 32 {
+                assert!(bincode::deserialize::<SignedNativeAction>(&value).is_ok());
+            }
+        }
+        // A native-empty height records nothing.
+        store.gc_committed(4, &[], 0, 9, LIMITS).unwrap();
+        assert_eq!(bookkeeping_keys(&store), 1);
     }
 }

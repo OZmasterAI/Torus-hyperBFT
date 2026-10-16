@@ -4937,6 +4937,11 @@ pub struct TorusApp {
     /// when the mempool or fetcher is absent (consensus-only tests) — a miss
     /// then fails the view without a handoff, same as before BS-4a.
     da_recovery: Option<DaRecoveryWorker>,
+    /// RH4 durable DA body GC window, in dispatched heights. `None` = off,
+    /// the default: every committed body stays (an archive node, or a test).
+    /// The node sets it from `TORUS_DA_BODY_RETENTION` / the block-tree
+    /// retention ([`crate::da_gc::resolve_da_body_retention`]).
+    da_body_retention: Option<u64>,
     /// Item 3 (`TORUS_ASYNC_VALIDATE=1`): speculative body validation off the
     /// hotstuff-algo thread. `None` with the flag off (the default) — the
     /// validate path then runs synchronously; cost parity still needs measurement.
@@ -5991,6 +5996,7 @@ impl TorusApp {
             da_fetcher: None,
             shard_fetcher: None,
             da_recovery: None,
+            da_body_retention: None,
             async_validate: None,
             exec_next_height: None,
             deferred_exec: std::collections::BTreeMap::new(),
@@ -6173,6 +6179,85 @@ impl TorusApp {
 
     pub fn set_pre_proposal_tx(&mut self, tx: std::sync::mpsc::SyncSender<PreProposalBundle>) {
         self.pre_proposal_tx = Some(tx);
+    }
+
+    /// RH4: durable DA body GC window in dispatched heights, `None` = off.
+    /// Call before the replica starts; see [`crate::da_gc`] for the policy
+    /// ([`crate::da_gc::resolve_da_body_retention`]).
+    pub fn set_da_body_retention(&mut self, retention: Option<u64>) {
+        self.da_body_retention = retention;
+    }
+
+    /// RH4: one durable DA body GC pass for the committed `height` that
+    /// dispatch just made durable. Records `hashes` for deletion
+    /// `da_body_retention` dispatched heights later and deletes the bodies (and
+    /// shards) of the heights that aged out. A height is recorded only when its
+    /// body row landed in `CF_BLOCK_BODIES` (`body_durable`): otherwise crash
+    /// replay could still need the DA copy, so its bodies stay for good (the
+    /// pass still runs for older heights).
+    ///
+    /// Runs on the consensus thread, bounded: one point read (the frontier),
+    /// one iterator over at most [`crate::da_gc::DA_GC_LIMITS`] aged rows and
+    /// one `WriteBatch` to the consensus DB. Timed by `torus_da_gc_seconds`.
+    /// To move it off this thread, send `(height, hashes, shard_count)` over a
+    /// channel to one dedicated thread that runs the same pass, in order:
+    /// a late pass only lengthens the window; a lost one leaves that height's
+    /// bodies behind, never deletes early.
+    fn gc_da_bodies_after_dispatch(
+        &self,
+        height: u64,
+        hashes: &[torus_types::B256],
+        body_durable: bool,
+    ) {
+        let (Some(retention), Some(mempool)) = (self.da_body_retention, self.mempool.as_ref())
+        else {
+            return;
+        };
+        let record: &[torus_types::B256] = if body_durable {
+            hashes
+        } else {
+            if !hashes.is_empty() {
+                tracing::warn!(
+                    height,
+                    bodies = hashes.len(),
+                    "DA body GC: body row not durable at dispatch, keeping this height's DA bodies"
+                );
+            }
+            &[]
+        };
+        // The shards custodied per body (`custody_native_shards_core`): none with
+        // custody off, else `n` of the current set's erasure params.
+        let shard_count = if shard_custody_enabled() {
+            let params = torus_state::ErasureParams::for_validator_set(
+                self.last_validator_set.validators.len(),
+            );
+            if params.validate().is_ok() {
+                params.n as u16
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let started = std::time::Instant::now();
+        let out = mempool.gc_committed_native_da(
+            height,
+            record,
+            shard_count,
+            retention,
+            crate::da_gc::DA_GC_LIMITS,
+        );
+        if let Some(ref m) = self.metrics {
+            m.da_gc_seconds.observe(started.elapsed().as_secs_f64());
+            m.da_bodies_gc_deleted.inc_by(out.bodies_deleted);
+        }
+        if out.backlog {
+            tracing::debug!(
+                height,
+                rows = out.rows_deleted,
+                "DA body GC: backlog left for the next pass"
+            );
+        }
     }
 
     /// s80: install the stream sink for executed blocks' fills. The execution
@@ -8302,13 +8387,16 @@ impl TorusApp {
                 );
             }
 
+            let mut hashes: Vec<torus_types::B256> = Vec::new();
             if !torus_block.native_actions.is_empty() {
                 if let Some(ref mempool) = self.mempool {
                     let mut scratch = Vec::new();
-                    let hashes: Vec<torus_types::B256> = torus_block
+                    hashes = torus_block
                         .native_actions
                         .iter()
-                        .map(|action| torus_types::compute_action_hash_with_scratch(action, &mut scratch))
+                        .map(|action| {
+                            torus_types::compute_action_hash_with_scratch(action, &mut scratch)
+                        })
                         .collect();
                     let prune_timer = std::time::Instant::now();
                     mempool.remove_committed_native(&hashes);
@@ -8318,6 +8406,9 @@ impl TorusApp {
                     }
                 }
             }
+            // RH4: record this height's bodies for the DA body GC and delete
+            // the bodies that aged out (one bounded batch, see `da_gc`).
+            self.gc_da_bodies_after_dispatch(height, &hashes, durable.body);
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
             // committed blocks actually charge (frozen at 1 gwei today; follows
@@ -29966,6 +30057,223 @@ mod crash_recovery_tests {
                 assert_eq!(parked, None, "{what}");
                 assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
             }
+        }
+    }
+
+    // ---- RH4 durable DA body GC on the commit dispatch ----
+
+    type DaGcFixture = (
+        TorusApp,
+        Arc<torus_mempool::Mempool>,
+        Arc<torus_telemetry::Metrics>,
+        std::sync::mpsc::Receiver<CommittedBlockMsg>,
+    );
+
+    /// An app over a mempool (whose DA store is the test DB) with a capture
+    /// channel standing in for the execution thread.
+    fn da_gc_app(state_db: &StateDb, config: &ChainConfig, retention: Option<u64>) -> DaGcFixture {
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1024);
+        app.replace_exec_tx(tx);
+        app.set_da_body_retention(retention);
+        (app, mempool, metrics, rx)
+    }
+
+    fn da_gc_commit(app: &mut TorusApp, height: u64, actions: Vec<SignedNativeAction>) {
+        let committed = committed_compact_block(&make_block(height, actions));
+        app.on_committed_block(&committed, committed.hash);
+    }
+
+    fn da_has(mempool: &torus_mempool::Mempool, action: &SignedNativeAction) -> bool {
+        mempool
+            .get_native_da(&torus_types::compute_action_hash(action))
+            .is_some()
+    }
+
+    /// The bodies of a dispatched committed height go once `window` more
+    /// heights have dispatched, not before; a body no committed block lists
+    /// stays; the counter counts every deleted body.
+    #[test]
+    fn da_gc_deletes_dispatched_bodies_after_the_window() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let committed: Vec<_> = (1..=8u64).map(sign_claim_rewards).collect();
+        let stray = sign_claim_rewards(99);
+        mempool.mirror_native_to_da(&committed).unwrap();
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&stray))
+            .unwrap();
+        for tip in 1..=8u64 {
+            da_gc_commit(&mut app, tip, vec![committed[tip as usize - 1].clone()]);
+            for (i, action) in committed[..tip as usize].iter().enumerate() {
+                let at = i as u64 + 1;
+                assert_eq!(
+                    da_has(&mempool, action),
+                    at + 4 > tip,
+                    "tip {tip}: body committed at {at}"
+                );
+            }
+        }
+        assert!(
+            da_has(&mempool, &stray),
+            "a body no committed block lists is never GC'd"
+        );
+        assert_eq!(
+            metrics.da_bodies_gc_deleted.get(),
+            4,
+            "heights 1..=4 GC'd by tip 8"
+        );
+    }
+
+    /// The window counts DISPATCHED heights, not commits: a committed block
+    /// parked behind an execution hole is re-read from the DA store when the
+    /// hole heals, so nothing may go while dispatch is stalled.
+    #[test]
+    fn da_gc_counts_dispatched_heights_not_commits() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(2));
+        let actions: Vec<_> = (1..=10u64).map(sign_claim_rewards).collect();
+        // Every body but height 3's: height 3 becomes a hole.
+        for (i, action) in actions.iter().enumerate() {
+            if i != 2 {
+                mempool
+                    .mirror_native_to_da(std::slice::from_ref(action))
+                    .unwrap();
+            }
+        }
+        for tip in 1..=10u64 {
+            da_gc_commit(&mut app, tip, vec![actions[tip as usize - 1].clone()]);
+        }
+        assert_eq!(
+            app.exec_next_height,
+            Some(3),
+            "heights 4..=10 parked behind the hole"
+        );
+        for (i, action) in actions.iter().enumerate() {
+            if i != 2 {
+                assert!(
+                    da_has(&mempool, action),
+                    "height {} kept while dispatch is stalled",
+                    i + 1
+                );
+            }
+        }
+        // The hole heals: 3..=10 dispatch, and the window slides to tip 10.
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&actions[2]))
+            .unwrap();
+        app.drain_exec_queue();
+        assert_eq!(app.exec_next_height, Some(11));
+        for (i, action) in actions.iter().enumerate() {
+            let at = i as u64 + 1;
+            assert_eq!(
+                da_has(&mempool, action),
+                at + 2 > 10,
+                "body committed at {at}"
+            );
+        }
+    }
+
+    /// Off unless enabled: the default app deletes nothing.
+    #[test]
+    fn da_gc_is_off_unless_enabled() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, None);
+        let actions: Vec<_> = (1..=20u64).map(sign_claim_rewards).collect();
+        mempool.mirror_native_to_da(&actions).unwrap();
+        for tip in 1..=20u64 {
+            da_gc_commit(&mut app, tip, vec![actions[tip as usize - 1].clone()]);
+        }
+        assert!(actions.iter().all(|a| da_has(&mempool, a)));
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
+    }
+
+    /// The GC rows are durable: bodies recorded before a restart still go on
+    /// schedule after it (no residue per restart).
+    #[test]
+    fn da_gc_rows_survive_an_app_restart() {
+        let (config, state_db) = make_test_config_and_db();
+        let actions: Vec<_> = (1..=8u64).map(sign_claim_rewards).collect();
+        // A genuinely linked chain: the restart's boot replay checks ancestry.
+        let mut blocks: Vec<TorusBlock> = actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| make_block(i as u64 + 1, vec![a.clone()]))
+            .collect();
+        link_blocks(&mut blocks);
+        let commit = |app: &mut TorusApp, block: &TorusBlock| {
+            let committed = committed_compact_block(block);
+            app.on_committed_block(&committed, committed.hash);
+        };
+        {
+            let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+            mempool.mirror_native_to_da(&actions).unwrap();
+            for block in &blocks[..4] {
+                commit(&mut app, block);
+            }
+            assert_eq!(app.exec_next_height, Some(5));
+            assert!(
+                actions.iter().all(|a| da_has(&mempool, a)),
+                "nothing aged by tip 4"
+            );
+        }
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        assert!(!app.is_exec_failed(), "restarted app fail-stopped at boot");
+        for block in &blocks[4..] {
+            commit(&mut app, block);
+        }
+        assert_eq!(
+            app.exec_next_height,
+            Some(9),
+            "5..=8 dispatched after the restart"
+        );
+        for (i, action) in actions.iter().enumerate() {
+            assert_eq!(
+                da_has(&mempool, action),
+                i >= 4,
+                "body committed at {}",
+                i + 1
+            );
+        }
+    }
+
+    /// With shard custody on (the production default) a GC'd body's shards
+    /// go with it.
+    #[test]
+    fn da_gc_deletes_custodied_shards_with_the_body() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(1));
+        // One validator cannot encode shards (k = n = 1): use a 4-validator set.
+        app.last_validator_set = make_validator_set(4);
+        let params = torus_state::ErasureParams::for_validator_set(4);
+        let action = sign_claim_rewards(1);
+        let hash = torus_types::compute_action_hash(&action);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&action))
+            .unwrap();
+        mempool
+            .mirror_native_shards(std::slice::from_ref(&action), params)
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![action.clone()]);
+        da_gc_commit(&mut app, 2, vec![]);
+        assert!(!da_has(&mempool, &action));
+        for i in 0..params.n as u16 {
+            assert_eq!(
+                mempool.get_shard(&hash, i).is_none(),
+                shard_custody_enabled(),
+                "shard {i} (custody on: deleted with the body)"
+            );
         }
     }
 }

@@ -9,6 +9,7 @@
 
 pub mod action_results;
 pub mod app;
+pub mod da_gc;
 pub mod exec_pipeline;
 pub mod genesis;
 pub mod kv_store;

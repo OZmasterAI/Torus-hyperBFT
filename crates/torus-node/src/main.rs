@@ -962,6 +962,34 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "block-tree pruner enabled (cf_consensus_meta)"
         );
     }
+    // RH4 durable DA body GC: committed bodies (and their shards) stay as long
+    // as block sync can still hand their block to a lagging peer, so the
+    // window follows the block-tree window just set (archive: no GC);
+    // TORUS_DA_BODY_RETENTION overrides (0 = off). See torus_consensus::da_gc.
+    let tree_retention = hotstuff_rs::block_tree::block_tree_retention();
+    let da_retention_env = std::env::var("TORUS_DA_BODY_RETENTION").ok();
+    let da_retention = torus_consensus::da_gc::resolve_da_body_retention(
+        da_retention_env.as_deref(),
+        tree_retention,
+    );
+    app.set_da_body_retention(da_retention);
+    match (da_retention, tree_retention) {
+        (None, _) => info!(
+            env = ?da_retention_env,
+            "DA body GC off: every committed body is kept (archive or TORUS_DA_BODY_RETENTION=0)"
+        ),
+        (Some(window), tree) if tree.is_none_or(|t| window <= t) => warn!(
+            window,
+            block_tree_retention = ?tree,
+            "DA body GC window does not cover the block-tree window: a peer lagging more than \
+             {window} blocks cannot get bodies from this node (TORUS_DA_BODY_RETENTION)"
+        ),
+        (Some(window), tree) => info!(
+            window,
+            block_tree_retention = ?tree,
+            "DA body GC on: committed bodies deleted {window} dispatched blocks after commit"
+        ),
+    }
 
     // S470: commit-lag backoff cap — genesis-sourced, env-overridable for
     // devnets (TORUS_COMMIT_LAG_BACKOFF_CAP). Fleet-uniform: see

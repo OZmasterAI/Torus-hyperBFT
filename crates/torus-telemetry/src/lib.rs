@@ -499,6 +499,13 @@ pub struct Metrics {
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
+    /// RH4: committed native-action bodies deleted from the DA store
+    /// (`cf_native_pending`) after leaving the retention window. Without the
+    /// GC the store only grew.
+    pub da_bodies_gc_deleted: Counter,
+    /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
+    /// (record the height's row, delete aged bodies and shards: one batch).
+    pub da_gc_seconds: Histogram,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -2182,6 +2189,18 @@ impl Metrics {
             "Consensus thread: remove_committed_native inside the commit dispatch",
             mempool_remove_committed_seconds.clone(),
         );
+        let da_bodies_gc_deleted = Counter::default();
+        registry.register(
+            "torus_da_bodies_gc_deleted",
+            "Committed native-action bodies deleted from the DA store after the retention window (RH4)",
+            da_bodies_gc_deleted.clone(),
+        );
+        let da_gc_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 14));
+        registry.register(
+            "torus_da_gc_seconds",
+            "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
+            da_gc_seconds.clone(),
+        );
 
         let exec_resting_orders = Gauge::default();
         registry.register(
@@ -2994,6 +3013,8 @@ impl Metrics {
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
             mempool_remove_committed_seconds,
+            da_bodies_gc_deleted,
+            da_gc_seconds,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_resident_rows,
@@ -3665,6 +3686,8 @@ mod tests {
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
             "torus_mempool_remove_committed_seconds",
+            "torus_da_bodies_gc_deleted_total",
+            "torus_da_gc_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
