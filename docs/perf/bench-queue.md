@@ -20,9 +20,9 @@ arguments (`$1` label, `$2` arm) or driver globals (`R`, `AENV`, `AXE`, ...). `_
 checks file fails preflight.
 
 **s58 bundle (owner s126):** `exp/archy-s58-bundle-dmt` (bfe47982, D `TORUS_SETTLE_DEFER_RESULTS`, M
-`TORUS_PARALLEL_MATCH_SETUP`, T `TORUS_FAST_SELL_TOP_UPS`, all ON by default) merges into main BEFORE campaign A and
-Q7, after 18c's Codex torus + adversarial reviews (running); docs branch `docs/s58flags` (sections 77-79) merges with
-it. 18c says when it is on main. Effects on this queue:
+`TORUS_PARALLEL_MATCH_SETUP`, T `TORUS_FAST_SELL_TOP_UPS`, all ON by default) is ON MAIN (merge 4156a83b, docs
+`docs/s58flags` at db84a1ad; pushed 50d2316c): 18c's Codex torus review no findings, torus-adversarial approve; main
+gate nextest --workspace 3923/3923. Build M for setup from main at or after 50d2316c. Effects on this queue:
 - D, M and T ship on and are already measured off vs on (sections 78, 79): no re-bench, no DMT/DMTE arms, no =0
   arm. Every arm of every campaign runs main as it ships: D, M, T unset (= on).
 - The bundle sets `TORUS_HEADER_RESEND_MS=${...:-250}` in `devnet/wsl/env.sh` and `devnet/docker-compose.yml`, so
@@ -38,7 +38,7 @@ it. 18c says when it is on main. Effects on this queue:
 **Now, on current main** (s125: main carries KP, DB and PC, flags off; s126: propose-defer is PARKED, campaign B dropped, see step 6; the s58 bundle merges first, see above):
 
 1. **Setup:** build binary M from current main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke
-   cell and its checks (Q5 below). Gates every later campaign. Build M after the s58 bundle is on main.
+   cell and its checks (Q5 below). Gates every later campaign. M includes the s58 bundle (main >= 50d2316c).
 1b. **Q9. Data-dir growth: main vs main + RH4** (soak, after setup, once 18c's RH4 branch is ready; see Items, Q9).
 2. **Q8. Item 6 Phase 5 step 0 profile** (campaign P, profile only, no A/B). Sent to archy directly (s125); it decides
    whether and how much of Phase 5 gets built.
