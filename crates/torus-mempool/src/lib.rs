@@ -43,6 +43,22 @@ pub use crate::native_pool::{is_cancel, is_oracle_submission, is_priority};
 /// confirmed (or skipped) it.
 pub const EVM_INFLIGHT_KEEP_BLOCKS: u64 = 256;
 
+/// Decision 7 (item 7 step 2): a forwarded tx is re-sent at most this many times; then it
+/// waits in the pool for this node's own EVM turn.
+pub const EVM_RESEND_MAX: u8 = 8;
+
+/// Decision 7 (item 7 step 2): one tracked EVM tx due for a re-send
+/// ([`Mempool::evm_due_resends`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmResend {
+    pub hash: B256,
+    pub raw: Vec<u8>,
+    /// The pool lane it waits in now.
+    pub lane: EvmLane,
+    /// Sends so far (the first forward is 0).
+    pub sends: u8,
+}
+
 /// Item 7 step 2 (decision 7): the hash a pool keys raw EVM tx bytes by (the tx hash), `None`
 /// when they do not decode (no pool holds such a tx). Decoded, not the keccak of the bytes:
 /// `decode_tx` takes the EIP-2718 bytes and alloy's network form (an RLP string header
@@ -174,6 +190,9 @@ struct PendingDaMirrors {
 pub struct Mempool {
     /// Item 7 step 2: the small and the big EVM pool under one lock.
     evm: RwLock<evm_pool::EvmLanes>,
+    /// Item 7 step 2 (decision 7): forwarded EVM txs by the EVM height they target, with their
+    /// sends so far, re-sent when that height commits without them.
+    evm_resend: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<(B256, u8)>>>,
     native: RwLock<native_pool::NativePool>,
     state: StateDb,
     /// Item 6 Phase 3 step 2: the exec thread's published read view (blocks
@@ -276,6 +295,7 @@ impl Mempool {
         let initial_evm_gas_limit = config.block_gas_limit;
         Self {
             evm: RwLock::new(evm_pool::EvmLanes::new(initial_base_fee)),
+            evm_resend: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             native: RwLock::new(native_pool),
             state,
             read_view: RwLock::new(None),
@@ -910,6 +930,60 @@ impl Mempool {
                 .fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
         }
         removed
+    }
+
+    /// Item 7 step 2 (decision 7): remember a forwarded tx and the EVM height it targets, with
+    /// its sends so far (above `EVM_RESEND_MAX` it is not tracked).
+    pub fn track_evm_forward(&self, hash: B256, target: u64, sends: u8) {
+        if sends <= EVM_RESEND_MAX {
+            self.evm_resend
+                .lock()
+                .unwrap()
+                .entry(target)
+                .or_default()
+                .push((hash, sends));
+        }
+    }
+
+    /// Item 7 step 2 (decision 7): the tracked txs whose target is at or below the committed
+    /// `height` and that are still pooled (the in-flight filter removed the committed ones),
+    /// with their bytes and current lane, once each (a tx tracked twice keeps its higher send
+    /// count). They leave the tracker; the caller re-sends and re-tracks them.
+    pub fn evm_due_resends(&self, height: u64) -> Vec<EvmResend> {
+        let due: Vec<(B256, u8)> = {
+            let mut tracked = self.evm_resend.lock().unwrap();
+            let later = tracked.split_off(&height.saturating_add(1));
+            std::mem::replace(&mut *tracked, later)
+                .into_values()
+                .flatten()
+                .collect()
+        };
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let mut sends: std::collections::HashMap<B256, u8> = std::collections::HashMap::new();
+        let mut order = Vec::with_capacity(due.len());
+        for (hash, n) in due {
+            let seen = sends.entry(hash).or_insert_with(|| {
+                order.push(hash);
+                n
+            });
+            *seen = (*seen).max(n);
+        }
+        let lanes = self.evm.read().unwrap();
+        order
+            .into_iter()
+            .filter_map(|hash| {
+                let lane = lanes.lane_of(&hash)?;
+                let raw = lanes.pool(lane).raw_of(&hash)?;
+                Some(EvmResend {
+                    hash,
+                    raw,
+                    lane,
+                    sends: sends[&hash],
+                })
+            })
+            .collect()
     }
 
     /// Drain the SMALL lane's EVM transactions for a block proposal (item 7
@@ -5757,6 +5831,50 @@ mod tests {
         pool.prune_committed_txs(10);
         pool.add_evm_tx(inflight_resigned(&s, 0))
             .expect("height 10 executed without moving the nonce: released");
+    }
+
+    // ---- item 7 step 2: re-send tracking (B14, decision 7) ----
+
+    /// Item 7 step 2 (decision 7): the tracked txs whose target height has committed and that
+    /// are still pooled come back once, with their bytes, lane and send count; the committed
+    /// one does not. A tx tracked past `EVM_RESEND_MAX` sends never comes back. RED before: no
+    /// tracker (compile error).
+    #[test]
+    fn due_resends_are_the_tracked_txs_still_pooled_past_their_target() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let [s, t] = [247, 248].map(|seed| intrinsic_case(&state, seed));
+        let (raw_s, raw_t) = (inflight_tx(&s, 0), inflight_tx(&t, 0));
+        let hs = pool.add_evm_tx(raw_s.clone()).unwrap();
+        let ht = pool.add_evm_tx(raw_t.clone()).unwrap();
+        pool.track_evm_forward(hs, 10, 0);
+        pool.track_evm_forward(ht, 10, 2);
+        pool.remove_committed_evm(10, std::slice::from_ref(&raw_s));
+
+        assert!(
+            pool.evm_due_resends(9).is_empty(),
+            "target 10 not committed"
+        );
+        let due = EvmResend {
+            hash: ht,
+            raw: raw_t,
+            lane: EvmLane::Small,
+            sends: 2,
+        };
+        assert_eq!(pool.evm_due_resends(10), vec![due.clone()]);
+        assert!(pool.evm_due_resends(10).is_empty(), "left the tracker");
+
+        pool.track_evm_forward(ht, 11, EVM_RESEND_MAX + 1);
+        pool.track_evm_forward(ht, 12, EVM_RESEND_MAX);
+        assert!(
+            pool.evm_due_resends(11).is_empty(),
+            "past the cap: never tracked"
+        );
+        let last = EvmResend {
+            sends: EVM_RESEND_MAX,
+            ..due
+        };
+        assert_eq!(pool.evm_due_resends(12), vec![last]);
     }
 
     // ---- s517 oracle feeder M2/M4: oracle admission gate + per-validator cap ----

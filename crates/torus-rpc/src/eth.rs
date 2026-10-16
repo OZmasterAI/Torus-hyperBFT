@@ -869,7 +869,7 @@ impl EthApiServer for RpcState {
         // reaches the block producer even when this node is not the proposer (fixes the EVM
         // dead-end where a tx was mined only by the node it was submitted to). No-op if we are
         // the leader. The leader independently re-validates via add_evm_tx.
-        self.forward_evm_to_leader(raw_for_forward);
+        self.forward_evm_to_leader(raw_for_forward, hash);
         let _ = self.notifier.pending_txs.send(hash);
         Ok(hex_b256(hash))
     }

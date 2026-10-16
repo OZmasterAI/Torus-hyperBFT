@@ -284,6 +284,15 @@ impl EvmPool {
         self.by_hash.contains_key(hash)
     }
 
+    /// Item 7 step 2 (decision 7): a pooled tx's raw bytes (a re-send).
+    pub fn raw_of(&self, hash: &B256) -> Option<Vec<u8>> {
+        let (sender, nonce) = self.by_hash.get(hash)?;
+        self.by_sender
+            .get(sender)?
+            .get(nonce)
+            .map(|e| e.raw_rlp.clone())
+    }
+
     pub fn all_senders(&self) -> Vec<Address> {
         self.by_sender.keys().cloned().collect()
     }

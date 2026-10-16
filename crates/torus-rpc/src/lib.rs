@@ -242,6 +242,10 @@ pub type ForwardedAction = ([u8; 32], torus_types::Address, torus_types::SignedN
 /// latency (healed by the re-forward sweep), never the action.
 pub const FORWARD_CHANNEL_CAP: usize = 65_536;
 
+/// Item 7 step 2 (decision 7): for an EVM tx's lane, `(last target height, the verifying key
+/// bytes of each target's leader)` ([`RpcServer::set_evm_targets_fn`]).
+pub type EvmTargetsFn = Arc<dyn Fn(torus_mempool::EvmLane) -> (u64, Vec<[u8; 32]>) + Send + Sync>;
+
 /// Shared state for all RPC handlers.
 #[derive(Clone)]
 pub struct RpcState {
@@ -271,9 +275,9 @@ pub struct RpcState {
     pub(crate) own_vk: Option<[u8; 32]>,
     /// Returns the current leader's verifying key bytes.
     pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
-    /// Item 7 step 1: returns the verifying key bytes of the next EVM height's
-    /// leader; EVM forwards fall back to `leader_vk_fn` when unset.
-    pub(crate) evm_leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
+    /// Item 7 steps 1-2: the next EVM height(s) of a tx's lane and their leaders' verifying
+    /// key bytes; EVM forwards fall back to `leader_vk_fn` (no re-send tracking) when unset.
+    pub(crate) evm_targets_fn: Option<EvmTargetsFn>,
     /// Channel to forward native actions to the leader (B1): structured
     /// (leader vk hint, verified sender, parsed action) tuples — no JSON
     /// re-encode — BOUNDED ([`FORWARD_CHANNEL_CAP`]); overflow drops the
@@ -367,7 +371,7 @@ impl RpcServer {
                 metrics: None,
                 own_vk: None,
                 leader_vk_fn: None,
-                evm_leader_vk_fn: None,
+                evm_targets_fn: None,
                 forward_action_tx: None,
                 forward_evm_tx: None,
                 forward_bodies: false,
@@ -425,11 +429,13 @@ impl RpcServer {
         self.state.forward_bodies = forward_bodies;
     }
 
-    /// Item 7 step 1: EVM txs land only in blocks with `height % N == 0`, so
-    /// EVM forwards go to the leader of the next EVM height returned by `f`
-    /// (instead of the current leader from [`Self::set_leader_forwarding`]).
-    pub fn set_evm_leader_fn(&mut self, f: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>) {
-        self.state.evm_leader_vk_fn = Some(f);
+    /// Item 7 steps 1-2: EVM txs land only at EVM heights (`height % N == 0`, or a big height
+    /// for the big lane), so an EVM forward goes to the leaders of the next EVM height(s) of
+    /// the tx's lane returned by `f` (instead of the current leader from
+    /// [`Self::set_leader_forwarding`]), and the mempool tracks the last target for a re-send
+    /// (decision 7).
+    pub fn set_evm_targets_fn(&mut self, f: EvmTargetsFn) {
+        self.state.evm_targets_fn = Some(f);
     }
 
     /// Use an externally-created height counter (shared with the commit handler).
@@ -3485,7 +3491,8 @@ mod tests {
 
     /// Item 7 step 1 (E12): EVM txs land only at `height % N == 0`, so with an
     /// EVM leader hook wired the tx goes to the leader of the next EVM height,
-    /// not to the current-view leader (which stays the fallback).
+    /// not to the current-view leader (which stays the fallback). Item 7 step 2:
+    /// the hook is lane-aware (`set_evm_targets_fn`); a small-lane tx here.
     #[tokio::test]
     async fn evm_tx_forwarded_to_the_next_evm_height_leader() {
         use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
@@ -3560,7 +3567,10 @@ mod tests {
             evm_fwd_tx,
             false,
         );
-        server.set_evm_leader_fn(Arc::new(move || Some(evm_leader)));
+        server.set_evm_targets_fn(Arc::new(move |lane| {
+            assert_eq!(lane, torus_mempool::EvmLane::Small);
+            (10, vec![evm_leader])
+        }));
         let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
             .build(format!("http://{addr}"))
@@ -3576,6 +3586,133 @@ mod tests {
         assert_eq!(vk, evm_leader, "forwarded to the next EVM height's leader");
         assert_eq!(payload, raw);
         assert!(evm_fwd_rx.try_recv().is_err(), "forwarded once");
+        handle.stop().unwrap();
+    }
+
+    /// Item 7 step 2 (decision 7): with the lane-aware hook wired, a big-lane tx goes to the
+    /// leaders of its lane's targets (the next two big heights), never to this node's own
+    /// key, and the mempool tracks it at the last target (25) for a re-send. RED before: one
+    /// leader for every tx, no tracking (compile error).
+    #[tokio::test]
+    async fn evm_tx_forwarded_to_the_leaders_of_its_lane_and_tracked() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_primitives::{Bytes, Signature as AlloySig, TxKind};
+        use alloy_rlp::Encodable;
+        use jsonrpsee::core::client::ClientT;
+        use torus_mempool::EvmLane;
+
+        fn evm_addr(key: &k256::ecdsa::SigningKey) -> Address {
+            let pt = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pt.as_bytes()[1..]).as_slice()[12..])
+        }
+        fn signed_eip1559(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+            let tx = TxEip1559 {
+                chain_id: TORUS_CHAIN_ID,
+                nonce,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+                access_list: Default::default(),
+            };
+            let sig_hash = tx.signature_hash();
+            let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+            let r = U256::from_be_slice(sig.r().to_bytes().as_slice());
+            let s = U256::from_be_slice(sig.s().to_bytes().as_slice());
+            let signature = AlloySig::new(r, s, recid.is_y_odd());
+            let mut buf = Vec::new();
+            TxEnvelope::Eip1559(tx.into_signed(signature)).encode(&mut buf);
+            buf
+        }
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let sender = evm_addr(&key);
+        let (own, a, b) = ([1u8; 32], [4u8; 32], [5u8; 32]);
+
+        let (_dir, state, mempool, executor) = setup();
+        state
+            .put_account(
+                &sender,
+                &AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    nonce: 0,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        // The sender's `EvmUserModify` row, with big blocks on: the big lane.
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::evm_lane_key(&sender),
+                &[1],
+            )
+            .unwrap();
+        mempool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let raw = signed_eip1559(&key, 0);
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
+        let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(
+            own,
+            Arc::new(move || Some([2u8; 32])),
+            fwd_tx,
+            evm_fwd_tx,
+            false,
+        );
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = asked.clone();
+        server.set_evm_targets_fn(Arc::new(move |lane| {
+            record.lock().unwrap().push(lane);
+            match lane {
+                EvmLane::Big => (25, vec![a, own, b]),
+                EvmLane::Small => (5, vec![[6u8; 32]]),
+            }
+        }));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let _: String = client
+            .request(
+                "eth_sendRawTransaction",
+                jsonrpsee::rpc_params![format!("0x{}", hex::encode(&raw))],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*asked.lock().unwrap(), vec![EvmLane::Big]);
+        let sent: Vec<([u8; 32], Vec<u8>)> =
+            std::iter::from_fn(|| evm_fwd_rx.try_recv().ok()).collect();
+        assert_eq!(
+            sent,
+            vec![(a, raw.clone()), (b, raw.clone())],
+            "both big-height leaders, not this node"
+        );
+        assert!(mempool.evm_due_resends(24).is_empty());
+        let due = mempool.evm_due_resends(25);
+        assert_eq!(
+            due.iter()
+                .map(|r| (r.raw.clone(), r.lane, r.sends))
+                .collect::<Vec<_>>(),
+            vec![(raw, EvmLane::Big, 0)],
+            "tracked at the last target"
+        );
         handle.stop().unwrap();
     }
 

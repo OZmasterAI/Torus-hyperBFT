@@ -869,6 +869,10 @@ enum DispatchOutcome {
     Failed,
 }
 
+/// Item 7 step 2 (decision 7): sends raw EVM tx bytes to the validator with these verifying
+/// key bytes ([`TorusApp::set_evm_forward`]).
+pub type EvmForward = Arc<dyn Fn([u8; 32], Vec<u8>) + Send + Sync>;
+
 /// Shared consensus state for leader discovery by non-consensus components (RPC).
 pub struct LeaderState {
     view: AtomicU64,
@@ -882,6 +886,11 @@ pub struct LeaderState {
     tip: RwLock<(u64, u64)>,
     /// Item 7 step 1: the committed header's N (0 = unknown).
     evm_block_interval: AtomicU64,
+    /// Item 7 step 2: the committed header's M (0 = big blocks off).
+    evm_big_block_interval: AtomicU64,
+    /// Item 7 step 2 (decision 7): `(boundary, N, M)` of the next boundary from its epoch plan,
+    /// once this node can read it; heights from the boundary on are predicted with them.
+    upcoming: RwLock<Option<(u64, u64, u64)>>,
 }
 
 impl LeaderState {
@@ -892,6 +901,8 @@ impl LeaderState {
             observed_leader: RwLock::new(None),
             tip: RwLock::new((0, 0)),
             evm_block_interval: AtomicU64::new(0),
+            evm_big_block_interval: AtomicU64::new(0),
+            upcoming: RwLock::new(None),
         }
     }
 
@@ -979,36 +990,116 @@ impl LeaderState {
         self.evm_block_interval.store(n, Ordering::Relaxed);
     }
 
-    /// Item 7 step 1: leader of the next EVM height. max(current view, tip
-    /// view + 1) proposes tip + 1, then one block per view (plain IWRR, like
-    /// the fallback above; reputation weighting is off). Checked arithmetic: a
-    /// leader picks its header's height and view, so overflowing values fall
-    /// back to the current leader instead of panicking.
-    pub fn next_evm_leader(&self) -> Option<VerifyingKey> {
-        let n = self.evm_block_interval.load(Ordering::Relaxed);
-        if n == 0 {
-            return self.current_leader();
-        }
-        let (tip_view, tip_height) = *self.tip.read().unwrap();
-        // h_e > tip_height, so `h_e - (tip_height + 1)` cannot underflow.
-        let view_e = (tip_height / n)
-            .checked_add(1)
-            .and_then(|k| k.checked_mul(n))
-            .and_then(|h_e| {
-                let first_view = self.current_view().max(tip_view.checked_add(1)?);
-                first_view.checked_add(h_e - (tip_height + 1))
-            });
-        let Some(view_e) = view_e else {
-            return self.current_leader();
+    fn set_evm_big_block_interval(&self, m: u64) {
+        self.evm_big_block_interval.store(m, Ordering::Relaxed);
+    }
+
+    fn set_upcoming(&self, boundary: u64, n: u64, m: u64) {
+        *self.upcoming.write().unwrap() = Some((boundary, n, m));
+    }
+
+    fn upcoming_boundary(&self) -> Option<u64> {
+        self.upcoming.read().unwrap().map(|(b, _, _)| b)
+    }
+
+    /// Item 7 step 2: the first height above `after` that carries `lane`'s EVM txs under N =
+    /// `n`, M = `m`: a multiple of N or of M for the small lane (a big height drains the small
+    /// lane too), of M for the big lane. `None`: none below `u64::MAX` (or N = M = 0).
+    fn next_lane_height(after: u64, n: u64, m: u64, lane: torus_mempool::EvmLane) -> Option<u64> {
+        let next_multiple = |k: u64| match k {
+            0 => None,
+            k => (after / k).checked_add(1)?.checked_mul(k),
         };
-        let vs = self.validators.read().unwrap();
-        if vs.is_empty() {
-            return None;
+        let big = next_multiple(m);
+        match lane {
+            torus_mempool::EvmLane::Big => big,
+            torus_mempool::EvmLane::Small => match (next_multiple(n), big) {
+                (Some(small), Some(big)) => Some(small.min(big)),
+                (small, big) => small.or(big),
+            },
         }
-        Some(hotstuff_rs::pacemaker::select_leader(
-            hotstuff_rs::types::data_types::ViewNumber::new(view_e),
-            &vs,
-        ))
+    }
+
+    /// Item 7 step 2 (decision 7): where an EVM tx of `lane` goes: the next EVM height for a
+    /// small-lane tx (a big height drains the small lane too), the next two big heights for a
+    /// big-lane tx (one view timeout must not cost a whole big interval). Heights from the
+    /// next boundary on use its N and M once its plan is readable ([`Self::set_upcoming`]),
+    /// the committed ones before. Returns the last target (the re-send deadline) and one
+    /// leader per target: max(current view, tip view + 1) proposes tip + 1, then one block per
+    /// view (plain IWRR, as step 1; reputation weighting is off). No target, no validator set,
+    /// or overflowing tip values (a leader picks its header's height and view): the current
+    /// leader.
+    pub fn next_evm_targets(&self, lane: torus_mempool::EvmLane) -> (u64, Vec<VerifyingKey>) {
+        let (tip_view, tip_height) = *self.tip.read().unwrap();
+        let (n, m) = (
+            self.evm_block_interval.load(Ordering::Relaxed),
+            self.evm_big_block_interval.load(Ordering::Relaxed),
+        );
+        let upcoming = *self.upcoming.read().unwrap();
+        let next_after = |after: u64| match upcoming {
+            // Every height above `after` is at or past the boundary.
+            Some((boundary, n1, m1)) if after.saturating_add(1) >= boundary => {
+                Self::next_lane_height(after, n1, m1, lane)
+            }
+            // `after + 1 < boundary`, so `boundary - 1` cannot underflow.
+            Some((boundary, n1, m1)) => match Self::next_lane_height(after, n, m, lane) {
+                Some(h) if h < boundary => Some(h),
+                _ => Self::next_lane_height(boundary - 1, n1, m1, lane),
+            },
+            None => Self::next_lane_height(after, n, m, lane),
+        };
+        let want = if lane == torus_mempool::EvmLane::Big {
+            2
+        } else {
+            1
+        };
+        let mut targets: Vec<u64> = Vec::with_capacity(want);
+        while targets.len() < want {
+            match next_after(targets.last().copied().unwrap_or(tip_height)) {
+                Some(h) => targets.push(h),
+                None => break,
+            }
+        }
+        let fallback = || {
+            let leader = self.current_leader().into_iter().collect();
+            (tip_height.saturating_add(1), leader)
+        };
+        let Some(&last) = targets.last() else {
+            return fallback();
+        };
+        let Some(first_view) = tip_view.checked_add(1).map(|v| self.current_view().max(v)) else {
+            return fallback();
+        };
+        let leaders: Vec<VerifyingKey> = {
+            let vs = self.validators.read().unwrap();
+            if vs.is_empty() {
+                Vec::new()
+            } else {
+                // Every target is above `tip_height`: `h - (tip_height + 1)` cannot underflow.
+                targets
+                    .iter()
+                    .filter_map(|&h| first_view.checked_add(h - (tip_height + 1)))
+                    .map(|view| {
+                        hotstuff_rs::pacemaker::select_leader(
+                            hotstuff_rs::types::data_types::ViewNumber::new(view),
+                            &vs,
+                        )
+                    })
+                    .collect()
+            }
+        };
+        if leaders.is_empty() {
+            return fallback();
+        }
+        (last, leaders)
+    }
+
+    /// Item 7 step 1: the leader of the next small-lane EVM height ([`Self::next_evm_targets`]).
+    pub fn next_evm_leader(&self) -> Option<VerifyingKey> {
+        self.next_evm_targets(torus_mempool::EvmLane::Small)
+            .1
+            .first()
+            .copied()
     }
 }
 
@@ -4935,6 +5026,10 @@ pub struct TorusApp {
     /// Item 7 step 1: EVM txs drained into our own proposals, by height, until a block commits
     /// there (drain_evm is destructive and pending_proposals entries get overwritten).
     own_evm_proposed: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
+    /// Item 7 step 2 (decision 7): sends a raw EVM tx to a validator key (the RPC's EVM
+    /// forward channel; the node's own key is skipped there), for the commit-time re-sends.
+    /// `None` (tests, library users): no re-send.
+    evm_forward: Option<EvmForward>,
     in_flight_hashes: InFlightHashLedger,
     #[allow(dead_code)]
     treasury_address: Address,
@@ -5992,6 +6087,7 @@ impl TorusApp {
         leader_state.sync_validators(&genesis_validator_set);
         leader_state.set_view(last_header.height.saturating_add(1));
         leader_state.set_evm_block_interval(last_header.evm_block_interval);
+        leader_state.set_evm_big_block_interval(last_header.evm_big_block_interval);
         // Item 7 step 2: the pools follow the last committed header at boot too, so a restarted
         // node admits by the current lanes and fees before its first commit.
         if let Some(ref m) = mempool {
@@ -6017,6 +6113,7 @@ impl TorusApp {
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
             own_evm_proposed: std::collections::BTreeMap::new(),
+            evm_forward: None,
             in_flight_hashes: InFlightHashLedger::default(),
             treasury_address: config.treasury_address,
             dev_pool_address: config.dev_pool_address,
@@ -6233,6 +6330,12 @@ impl TorusApp {
         if self.fill_sink.set(sink).is_err() {
             tracing::warn!("fill sink already set; ignoring the second one");
         }
+    }
+
+    /// Item 7 step 2 (decision 7): the EVM forward the commit path re-sends with (set once at
+    /// startup, before consensus starts).
+    pub fn set_evm_forward(&mut self, forward: EvmForward) {
+        self.evm_forward = Some(forward);
     }
 
     /// Attach the RARE pull-fallback transport (Task 6). Called once at startup with
@@ -7814,10 +7917,17 @@ impl App<RocksKVStore> for TorusApp {
             self.leader_state.set_view(height.saturating_add(1));
             self.leader_state
                 .set_evm_block_interval(header.evm_block_interval);
+            self.leader_state
+                .set_evm_big_block_interval(header.evm_big_block_interval);
+            self.refresh_upcoming_evm(&header);
             // Item 3: no async-validate invalidation here — a cached verdict
             // depends only on the datum bytes and the DA store (ancestry
             // re-runs live at hit time).
         }
+
+        // Item 7 step 2 (decision 7): after the in-flight filter and the lost-proposal
+        // reinsert above, and with this header's N and M in the prediction.
+        self.resend_due_evm(height);
 
         // Slashes detected during THIS commit ride with THIS block into the
         // strict-order queue (applied when the block executes, in order).
@@ -7926,7 +8036,69 @@ impl TorusApp {
                 txs = lost.len(),
                 "EVM txs of our lost proposal back to the pool"
             );
+            let hashes: Vec<alloy_primitives::B256> = lost
+                .iter()
+                .filter_map(|raw| torus_mempool::evm_tx_hash(raw))
+                .collect();
             mempool.reinsert_evm(lost);
+            // Item 7 step 2 (decision 7): each one pooled again is tracked at its lane's next
+            // EVM height, and re-sent if that height commits without it.
+            for hash in hashes {
+                if let Some(lane) = mempool.evm_lane_of(&hash) {
+                    let (target, _) = self.leader_state.next_evm_targets(lane);
+                    mempool.track_evm_forward(hash, target, 0);
+                }
+            }
+        }
+    }
+
+    /// Item 7 step 2 (decision 7): the tracked txs whose target EVM height `height` (or one
+    /// below) has committed without them (still pooled) go to the next predicted leader(s)
+    /// and are tracked again, at most `EVM_RESEND_MAX` times. Without an EVM forward the
+    /// tracker only empties.
+    fn resend_due_evm(&self, height: u64) {
+        let Some(mempool) = self.mempool.as_ref() else {
+            return;
+        };
+        let due = mempool.evm_due_resends(height);
+        let (Some(forward), false) = (self.evm_forward.as_ref(), due.is_empty()) else {
+            return;
+        };
+        for r in &due {
+            let (target, leaders) = self.leader_state.next_evm_targets(r.lane);
+            for vk in leaders {
+                forward(vk.to_bytes(), r.raw.clone());
+            }
+            mempool.track_evm_forward(r.hash, target, r.sends.saturating_add(1));
+        }
+        tracing::info!(
+            height,
+            txs = due.len(),
+            "EVM tx re-sent: its target EVM height committed without it"
+        );
+    }
+
+    /// Item 7 step 2 (decision 7): hand the routing prediction the next boundary's N and M once
+    /// its plan is readable (quietly; until then the committed values predict). Readable as
+    /// in [`Self::epoch_plan`]: execution has applied the previous boundary.
+    fn refresh_upcoming_evm(&self, header: &TorusBlockHeader) {
+        if self.epoch_length == 0 {
+            return;
+        }
+        let boundary = (header.height / self.epoch_length)
+            .saturating_add(1)
+            .saturating_mul(self.epoch_length);
+        if self.leader_state.upcoming_boundary() == Some(boundary) {
+            return;
+        }
+        let needed = boundary.saturating_sub(self.epoch_length);
+        if !matches!(self.applied_height(), Ok(applied) if applied.unwrap_or(0) >= needed) {
+            return;
+        }
+        if let Ok(plan) = self.staking.epoch_rotation_plan(boundary) {
+            let v = plan.map(|p| p.evm).unwrap_or_default().resolve(header);
+            self.leader_state
+                .set_upcoming(boundary, v.block_interval, v.big_block_interval);
         }
     }
 
@@ -10179,10 +10351,11 @@ mod in_flight_ledger_tests {
 #[cfg(test)]
 mod leader_state_tests {
     use super::*;
+    use torus_mempool::EvmLane;
 
     /// Real ed25519 keys: `sync_validators` silently skips pubkey byte patterns
     /// that are not valid curve points, so the set must come from generated keys.
-    fn make_set(n: u8) -> (torus_types::ValidatorSet, Vec<VerifyingKey>) {
+    pub(super) fn make_set(n: u8) -> (torus_types::ValidatorSet, Vec<VerifyingKey>) {
         let mut validators = Vec::new();
         let mut vks = Vec::new();
         for i in 0..n {
@@ -10207,7 +10380,7 @@ mod leader_state_tests {
 
     /// Plain IWRR over the LeaderState's synced validator set — the pre-fix
     /// selection `current_leader()` always used.
-    fn plain_iwrr(ls: &LeaderState, view: u64) -> VerifyingKey {
+    pub(super) fn plain_iwrr(ls: &LeaderState, view: u64) -> VerifyingKey {
         let vs = ls.validators.read().unwrap();
         hotstuff_rs::pacemaker::select_leader(
             hotstuff_rs::types::data_types::ViewNumber::new(view),
@@ -10375,6 +10548,76 @@ mod leader_state_tests {
         ls.observe_hotstuff_proposal(41, 22);
         assert_eq!(*ls.tip.read().unwrap(), (41, 23));
         assert_eq!(ls.next_evm_leader(), Some(plain_iwrr(&ls, 43)));
+    }
+
+    /// Item 7 step 2 (decision 7): a small-lane tx targets the next EVM height (a big height
+    /// counts), with the next boundary's N / M from that boundary on. RED before: no lanes, no
+    /// upcoming N (compile error).
+    #[test]
+    fn evm_targets_follow_the_upcoming_interval_and_big_heights() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        ls.set_evm_block_interval(5);
+        // Tip Torus 98 (hotstuff 97) in view 40; boundary 100 switches N to 10.
+        ls.observe_hotstuff_proposal(40, 97);
+        ls.set_upcoming(100, 10, 0);
+        assert_eq!(
+            ls.next_evm_targets(EvmLane::Small),
+            (100, vec![plain_iwrr(&ls, 42)])
+        );
+        // Tip 101 in view 41: N = 10 from 100 on, so 110 (not 105), 8 views after 102's.
+        ls.observe_hotstuff_proposal(41, 100);
+        assert_eq!(
+            ls.next_evm_targets(EvmLane::Small),
+            (110, vec![plain_iwrr(&ls, 50)])
+        );
+        // Before the boundary the committed N still holds: tip 91 -> 95, not 100.
+        let ls1 = LeaderState::new();
+        ls1.sync_validators(&set);
+        ls1.observe_start_view(40, plain_iwrr(&ls1, 40));
+        ls1.set_evm_block_interval(5);
+        ls1.set_upcoming(100, 10, 0);
+        ls1.observe_hotstuff_proposal(40, 90); // tip 91
+        assert_eq!(ls1.next_evm_targets(EvmLane::Small).0, 95);
+        // M = 7 before the boundary: the big height 7 is the small lane's next EVM height too.
+        let ls2 = LeaderState::new();
+        ls2.sync_validators(&set);
+        ls2.observe_start_view(40, plain_iwrr(&ls2, 40));
+        ls2.set_evm_block_interval(5);
+        ls2.set_evm_big_block_interval(7);
+        ls2.observe_hotstuff_proposal(40, 4); // tip 5
+        assert_eq!(ls2.next_evm_targets(EvmLane::Small).0, 7);
+    }
+
+    /// Item 7 step 2 (decision 7): a big-lane tx goes to the leaders of the next two big
+    /// heights, so one view timeout does not cost a whole big interval. With M = 0 (no big
+    /// height) the current leader. RED before: no lanes (compile error).
+    #[test]
+    fn big_lane_targets_the_next_two_big_heights() {
+        let ls = LeaderState::new();
+        let (set, _) = make_set(3);
+        ls.sync_validators(&set);
+        ls.observe_start_view(40, plain_iwrr(&ls, 40));
+        ls.set_evm_block_interval(5);
+        assert_eq!(
+            ls.next_evm_targets(EvmLane::Big).1,
+            ls.current_leader().into_iter().collect::<Vec<_>>(),
+            "M = 0: the current leader"
+        );
+        // N = 5, M = 50, tip 60 in view 40: 100 in view 80, 150 in view 130.
+        ls.set_evm_big_block_interval(50);
+        ls.observe_hotstuff_proposal(40, 59);
+        assert_eq!(
+            ls.next_evm_targets(EvmLane::Big),
+            (150, vec![plain_iwrr(&ls, 80), plain_iwrr(&ls, 130)])
+        );
+        // The small lane: 65 in view 45 (a big height would count, none comes first).
+        assert_eq!(
+            ls.next_evm_targets(EvmLane::Small),
+            (65, vec![plain_iwrr(&ls, 45)])
+        );
     }
 }
 
@@ -22715,6 +22958,89 @@ mod crash_recovery_tests {
         app.on_committed_block(&other, other.hash);
         assert_eq!(mempool.evm_pool_size(), 0, "gone at commit");
         rx.try_recv().expect("height 5 must reach execution");
+    }
+
+    /// The `(validator key, raw tx)` pairs a recording `evm_forward` was called with.
+    type SentEvm = Arc<std::sync::Mutex<Vec<([u8; 32], Vec<u8>)>>>;
+
+    /// A recording `evm_forward` installed on `app`, and its leader state with three
+    /// validators, the pacemaker in view 40 and the tip at Torus 7 (hotstuff 6) in view 40:
+    /// with N = 5 the next EVM height is 10, in view 43.
+    fn evm_resend_rig(app: &mut TorusApp) -> (Arc<LeaderState>, SentEvm) {
+        let sent = SentEvm::default();
+        let record = sent.clone();
+        app.set_evm_forward(Arc::new(move |vk, raw| {
+            record.lock().unwrap().push((vk, raw))
+        }));
+        let ls = app.leader_state();
+        ls.sync_validators(&super::leader_state_tests::make_set(3).0);
+        ls.observe_start_view(40, super::leader_state_tests::plain_iwrr(&ls, 40));
+        ls.observe_hotstuff_proposal(40, 6);
+        (ls, sent)
+    }
+
+    /// Item 7 step 2 (decision 7, re-send): a tracked tx whose target height 5 commits without
+    /// it (still pooled) goes to the leader of the next EVM height, 10, and is tracked there
+    /// with one more send. RED before: no re-send (compile error).
+    #[test]
+    fn target_height_that_commits_without_the_tx_resends_it() {
+        let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(1);
+        let (ls, sent) = evm_resend_rig(&mut app);
+        let hash = torus_mempool::evm_tx_hash(&txs[0]).unwrap();
+        mempool.track_evm_forward(hash, 5, 0);
+
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&evm_child_of(&tip_2000(), vec![]));
+        app.on_committed_block(&c5, c5.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+
+        let leader = super::leader_state_tests::plain_iwrr(&ls, 43);
+        assert_eq!(
+            ls.next_evm_targets(torus_mempool::EvmLane::Small),
+            (10, vec![leader])
+        );
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![(leader.to_bytes(), txs[0].clone())],
+            "one forward, to the leader of height 10"
+        );
+        assert!(mempool.evm_due_resends(9).is_empty());
+        let due = mempool.evm_due_resends(10);
+        assert_eq!(
+            due.iter().map(|r| (r.hash, r.sends)).collect::<Vec<_>>(),
+            vec![(hash, 1)],
+            "re-tracked at 10 with one more send"
+        );
+    }
+
+    /// Item 7 step 2 (decision 7): our lost proposal's txs go back to the pool and are tracked
+    /// at their lane's next EVM height (10), so a re-send follows if that height commits
+    /// without them; nothing is sent at once. RED before: no tracker (compile error).
+    #[test]
+    fn lost_proposal_txs_are_tracked_for_resend() {
+        let (mut app, rx, mempool, txs) = evm_pool_app_with_recording_exec(3);
+        let (_ls, sent) = evm_resend_rig(&mut app);
+        let _ = app.build_proposal(tip_2000().header);
+        assert_eq!(mempool.evm_pool_size(), 0, "drained into our proposal");
+
+        app.exec_next_height = Some(5);
+        let other = committed_compact_block(&evm_child_of(&tip_2000(), vec![txs[0].clone()]));
+        app.on_committed_block(&other, other.hash);
+        rx.try_recv().expect("height 5 must reach execution");
+
+        assert!(sent.lock().unwrap().is_empty(), "tracked, not sent");
+        assert!(mempool.evm_due_resends(9).is_empty());
+        let mut due: Vec<(Vec<u8>, u8)> = mempool
+            .evm_due_resends(10)
+            .into_iter()
+            .map(|r| (r.raw, r.sends))
+            .collect();
+        due.sort();
+        let want: Vec<(Vec<u8>, u8)> = sorted(txs[1..].to_vec())
+            .into_iter()
+            .map(|tx| (tx, 0))
+            .collect();
+        assert_eq!(due, want, "the lost txs, tracked at 10");
     }
 
     /// `pending_proposals[5]` is overwritten when another proposer's block at

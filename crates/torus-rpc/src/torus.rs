@@ -954,19 +954,34 @@ impl RpcState {
     /// Takes the RLP by value (the caller already owns a clone, since `add_evm_tx` consumes the
     /// original): moving it into the channel avoids a second copy of the body on the hot path.
     ///
-    /// Item 7 step 1: the target is the leader of the next EVM height (`evm_leader_vk_fn`), since
-    /// EVM txs land only at `height % N == 0`; the current leader when that hook is unset.
-    pub(crate) fn forward_evm_to_leader(&self, raw_rlp: Vec<u8>) {
-        if let (Some(leader_fn), Some(own_vk), Some(fwd_tx)) = (
-            self.evm_leader_vk_fn
-                .as_ref()
-                .or(self.leader_vk_fn.as_ref()),
-            self.own_vk.as_ref(),
-            self.forward_evm_tx.as_ref(),
-        ) {
-            if let Some(leader_vk) = leader_fn() {
-                if leader_vk != *own_vk {
-                    let _ = fwd_tx.send((leader_vk, raw_rlp));
+    /// Item 7 steps 1-2: the targets are the leaders of the next EVM height(s) of the tx's lane
+    /// (`evm_targets_fn`: the next EVM height for the small lane, the next two big heights for
+    /// the big lane), since EVM txs land only at EVM heights, and the mempool tracks the last
+    /// target so the commit path re-sends the tx if that height commits without it (decision
+    /// 7). The current leader, untracked, when that hook is unset.
+    pub(crate) fn forward_evm_to_leader(&self, raw_rlp: Vec<u8>, hash: alloy_primitives::B256) {
+        let (Some(own_vk), Some(fwd_tx)) = (self.own_vk.as_ref(), self.forward_evm_tx.as_ref())
+        else {
+            return;
+        };
+        match self.evm_targets_fn.as_ref() {
+            Some(targets) => {
+                let lane = self
+                    .mempool
+                    .evm_lane_of(&hash)
+                    .unwrap_or(torus_mempool::EvmLane::Small);
+                let (target, leaders) = targets(lane);
+                for vk in leaders.into_iter().filter(|vk| vk != own_vk) {
+                    let _ = fwd_tx.send((vk, raw_rlp.clone()));
+                }
+                self.mempool.track_evm_forward(hash, target, 0);
+            }
+            // No consensus attached: the current leader, as before item 7.
+            None => {
+                if let Some(vk) = self.leader_vk_fn.as_ref().and_then(|f| f()) {
+                    if vk != *own_vk {
+                        let _ = fwd_tx.send((vk, raw_rlp));
+                    }
                 }
             }
         }
