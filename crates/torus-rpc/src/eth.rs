@@ -279,16 +279,22 @@ fn block_env_from_header(header: &TorusBlockHeader) -> BlockEnvCfg {
 }
 
 /// Item 7 step 2: the env of a call from `caller` on `header`: its lane's gas limit and base fee
-/// (the big lane while big blocks are on and its `EvmUserModify` row says so). The row is read
-/// from the DB, the state the call runs on (the eth head's).
-fn lane_block_env(
-    state: &torus_state::StateDb,
+/// (the big lane while big blocks are on and its `EvmUserModify` row says so).
+///
+/// `lanes` is where the row is read: the mempool's ingress view (owner s126, option B), the exec
+/// thread's latest executed state. Admission, routing and `torus_usingBigBlocks` read the lane
+/// there too, so a lane choice executed but not yet checkpointed (up to one checkpoint, ~15 s)
+/// counts here as it does there; the DB would still hold the old lane. Only the row comes from
+/// the view: the call itself runs on the DB state at the eth head, under `header`'s limits and
+/// base fees.
+fn lane_block_env<S: torus_state::backend::StateBackend>(
+    lanes: &S,
     header: &TorusBlockHeader,
     caller: &Address,
 ) -> Result<BlockEnvCfg, RpcError> {
     let mut env = block_env_from_header(header);
     let big = header.evm_big_block_interval > 0
-        && state
+        && lanes
             .get_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(caller))?
             .is_some();
     if big {
@@ -299,7 +305,8 @@ fn lane_block_env(
 }
 
 /// The block env of an eth_call / eth_estimateGas at the eth head `head`: the head header in the
-/// caller's lane (`call.from`, else the zero address), or the default env before the first block.
+/// caller's lane (`call.from`, else the zero address; the lane from the ingress view, see
+/// [`lane_block_env`]), or the default env before the first block.
 fn call_block_env(
     state: &RpcState,
     head: u64,
@@ -315,7 +322,12 @@ fn call_block_env(
         Some(f) => parse_address(f)?,
         None => Address::ZERO,
     };
-    lane_block_env(&state.state, &header, &caller)
+    // A fresh view for the one row, dropped before the call runs: a live view keeps its
+    // layers and counts in the exec context's live read views.
+    let lanes = state.mempool.ingress_state();
+    let env = lane_block_env(&lanes, &header, &caller);
+    drop(lanes);
+    env
 }
 
 /// EIP-2718 type of an eth_call / eth_estimateGas request (s104 follow-up c).

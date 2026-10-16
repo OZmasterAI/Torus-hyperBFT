@@ -934,6 +934,139 @@ async fn using_big_blocks_reads_the_lane_row() {
     handle.stop().unwrap();
 }
 
+/// Callers whose lane choice changed in a block not yet checkpointed
+/// ([`serve_lanes_only_in_the_ingress_view`]).
+const JOINED_BIG: alloy_primitives::Address = alloy_primitives::Address::repeat_byte(0xa1);
+const LEFT_BIG: alloy_primitives::Address = alloy_primitives::Address::repeat_byte(0xa2);
+const BURNER: alloy_primitives::Address = alloy_primitives::Address::repeat_byte(0x10);
+
+/// Item 7 step 2 (owner s126, option B) fixture: a head with big blocks on
+/// (M = 50, small 3M, big 10M) and the gas burner. Block 2 executed but is not
+/// checkpointed: its lane changes are only in the published ingress view.
+/// [`JOINED_BIG`]'s row is put there (absent from the DB); [`LEFT_BIG`]'s row is
+/// in the DB and deleted there.
+async fn serve_lanes_only_in_the_ingress_view() -> (TempDir, ServerHandle, SocketAddr) {
+    let (dir, state, mempool, executor) = setup();
+    store_head(
+        &state,
+        Head {
+            height: 1,
+            evm_gas_limit: 3_000_000,
+            base_fee: GWEI,
+            big_interval: 50,
+            big_gas_limit: 10_000_000,
+            big_base_fee: 2 * GWEI,
+        },
+    );
+    deploy_gas_burner(&state, BURNER);
+    set_big_lane(&state, LEFT_BIG);
+    let block_2 = torus_state::NativeStateOverlay::new(state.clone());
+    torus_state::backend::StateBackend::put_cf_raw(
+        &block_2,
+        torus_state::cf::CF_NATIVE_ORACLE,
+        &torus_state::cf::evm_lane_key(&JOINED_BIG),
+        &[1],
+    )
+    .unwrap();
+    torus_state::backend::StateBackend::delete_cf_raw(
+        &block_2,
+        torus_state::cf::CF_NATIVE_ORACLE,
+        &torus_state::cf::evm_lane_key(&LEFT_BIG),
+    )
+    .unwrap();
+    mempool.publish_read_view(Some(torus_state::ReadView::new(
+        state.clone(),
+        2,
+        vec![block_2.freeze(2)],
+        None,
+    )));
+    let (handle, addr) = start_server(state, mempool, executor).await;
+    (dir, handle, addr)
+}
+
+/// Item 7 step 2 (owner s126, option B): eth_estimateGas takes the caller's
+/// lane from the ingress view, as admission and `torus_usingBigBlocks` do, so a
+/// lane choice counts before its checkpoint: a caller that joined the big lane
+/// estimates above the 3M small limit, up to the 10M big one; a caller that
+/// left it is capped at 3M again.
+#[tokio::test]
+async fn estimate_gas_reads_the_callers_lane_from_the_ingress_view() {
+    let (_dir, handle, addr) = serve_lanes_only_in_the_ingress_view().await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    let estimate = |from| {
+        let client = &client;
+        async move {
+            let req = serde_json::json!({ "from": hex_address(from), "to": hex_address(BURNER) });
+            client
+                .request::<String, _>("eth_estimateGas", rpc_params![req])
+                .await
+                .map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap())
+                .map_err(|e| e.to_string())
+        }
+    };
+    let using = |who| {
+        let client = &client;
+        async move {
+            client
+                .request::<bool, _>("torus_usingBigBlocks", rpc_params![hex_address(who)])
+                .await
+                .unwrap()
+        }
+    };
+    assert!(using(JOINED_BIG).await, "usingBigBlocks: joined");
+    assert!(!using(LEFT_BIG).await, "usingBigBlocks: left");
+    assert_eq!(
+        estimate(JOINED_BIG).await,
+        Ok(BURN_GAS),
+        "joined the big lane in block 2: estimates above 3M, under 10M"
+    );
+    let left = estimate(LEFT_BIG).await;
+    assert!(
+        left.is_err(),
+        "left the big lane in block 2: capped at 3M: {left:?}"
+    );
+    handle.stop().unwrap();
+}
+
+/// Item 7 step 2 (owner s126, option B): eth_call's gas cap is the caller's lane
+/// limit from the ingress view: a 5.3M call from a caller that joined the big
+/// lane in a block not yet checkpointed runs; from one that left it, the call
+/// is capped at 3M and runs out of gas.
+#[tokio::test]
+async fn eth_call_gas_cap_reads_the_callers_lane_from_the_ingress_view() {
+    let (_dir, handle, addr) = serve_lanes_only_in_the_ingress_view().await;
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{addr}"))
+        .unwrap();
+    let call_5m = |from| {
+        let client = &client;
+        async move {
+            let req = serde_json::json!({
+                "from": hex_address(from),
+                "to": hex_address(BURNER),
+                "gas": hex_u64(5_300_000),
+            });
+            client
+                .request::<String, _>("eth_call", rpc_params![req, "latest"])
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    assert_eq!(
+        call_5m(JOINED_BIG).await,
+        Ok("0x".to_string()),
+        "joined the big lane in block 2: a 5.3M call runs"
+    );
+    let left = call_5m(LEFT_BIG).await;
+    assert!(
+        left.is_err(),
+        "left the big lane in block 2: capped at 3M: {left:?}"
+    );
+    handle.stop().unwrap();
+}
+
 /// Item 7 step 2 (B18): a block's `gasLimit` is the height's EVM gas cap: the
 /// small limit plus the big one at a big height (M = 50: height 100 = 3M + 10M),
 /// the small limit elsewhere (105).
