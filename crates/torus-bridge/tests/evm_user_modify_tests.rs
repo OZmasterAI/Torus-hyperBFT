@@ -21,14 +21,26 @@ fn addr(n: u8) -> Address {
 }
 
 fn ctx_at<T: StateBackend>(state: T, height: u64) -> NativeExecContext<T> {
-    NativeExecContext::new(state, height, 1_000 + height, 0, 1_000, 10, addr(99), addr(100), addr(101))
+    NativeExecContext::new(
+        state,
+        height,
+        1_000 + height,
+        0,
+        1_000,
+        10,
+        addr(99),
+        addr(100),
+        addr(101),
+    )
 }
 
 /// Run one `EvmUserModify` from `sender` in a fresh overlay over `db`; returns the result and
 /// the overlay's pending write count, then flushes the overlay into `db`.
 fn modify(db: &StateDb, height: u64, sender: Address, big: bool) -> (NativeActionResult, usize) {
     let overlay = NativeStateOverlay::new(db.clone());
-    let action = NativeAction::EvmUserModify { using_big_blocks: big };
+    let action = NativeAction::EvmUserModify {
+        using_big_blocks: big,
+    };
     let r = NativeExecutor::execute(&mut ctx_at(overlay.clone(), height), &sender, &action);
     let writes = overlay.pending_write_count();
     overlay.flush(db).unwrap();

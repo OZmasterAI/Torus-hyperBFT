@@ -122,16 +122,28 @@ fn catchup_validation_charges_each_sender_its_lane_while_big_blocks_are_on() {
         let (_dir, db) = open_test_db();
         fund(&db, &a);
         fund(&db, &b);
-        db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&b), &[1]).unwrap();
-        let txs = vec![signed_transfer(&ka, 0, 21_000), signed_transfer(&kb, 0, 21_000)];
+        db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&b), &[1])
+            .unwrap();
+        let txs = vec![
+            signed_transfer(&ka, 0, 21_000),
+            signed_transfer(&kb, 0, 21_000),
+        ];
         let v = validator()
             .validate_block_for_catchup(&block(100, m, txs), &db, &EvmExecutor::new(TORUS_CHAIN_ID))
             .unwrap();
         assert_eq!(v.receipts.len(), 2);
-        (v.fee_revenue, v.gas_used, v.big_gas_used, v.receipts[1].effective_gas_price)
+        (
+            v.fee_revenue,
+            v.gas_used,
+            v.big_gas_used,
+            v.receipts[1].effective_gas_price,
+        )
     };
     let g = u128::from(GWEI);
-    assert_eq!(run(50), (21_000 * g + 21_000 * 3 * g, 42_000, 21_000, 3 * GWEI));
+    assert_eq!(
+        run(50),
+        (21_000 * g + 21_000 * 3 * g, 42_000, 21_000, 3 * GWEI)
+    );
     // M = 0: big blocks off, the row is ignored; both pay the small fee.
     assert_eq!(run(0), (42_000 * g, 42_000, 0, GWEI));
 }
