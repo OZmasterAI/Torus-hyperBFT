@@ -104,6 +104,18 @@ fn count_read() {
     KV_READS.with(|c| c.set(c.get() + 1));
 }
 
+std::thread_local! {
+    /// Proposal headers any `OrderNetwork` broadcast on this thread: s123
+    /// `proposal_backpressure_test` checks what a leader proposed.
+    static HEADERS: std::cell::RefCell<Vec<ProposalHeader>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the proposal headers this thread's `OrderNetwork`s broadcast.
+pub(crate) fn take_broadcast_headers() -> Vec<ProposalHeader> {
+    HEADERS.with(|h| std::mem::take(&mut *h.borrow_mut()))
+}
+
 impl KVGet for OrderKV {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         count_read();
@@ -154,9 +166,10 @@ impl Network for OrderNetwork {
     fn update_validator_set(&mut self, _updates: ValidatorSetUpdates) {}
     fn broadcast(&mut self, message: Message) {
         if let Message::ProgressMessage(ProgressMessage::HotStuffMessage(
-            HotStuffMessage::ProposalHeader(_),
+            HotStuffMessage::ProposalHeader(header),
         )) = message
         {
+            HEADERS.with(|h| h.borrow_mut().push(header));
             self.log.lock().unwrap().push(BROADCAST_HEADER);
         }
     }

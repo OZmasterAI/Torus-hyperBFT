@@ -21,6 +21,8 @@
 
 use std::time::{Duration, Instant};
 
+use borsh::BorshSerialize;
+
 use crate::app::{
     App, ProduceBlockRequest, ProduceBlockResponse, ValidateBlockRequest, ValidateBlockResponse,
 };
@@ -31,12 +33,16 @@ use crate::hotstuff::implementation::{
 };
 use crate::hotstuff::types::PhaseCertificate;
 use crate::hotstuff::vote_persist_order_test::{
-    base_tree, kv_reads, replica, OrderKV, OrderLog, OrderNetwork, BROADCAST_HEADER, CHAIN_ID,
+    base_tree, kv_reads, replica, take_broadcast_headers, OrderKV, OrderLog, OrderNetwork,
+    BROADCAST_HEADER, CHAIN_ID,
 };
 use crate::pacemaker::implementation::ViewInfo;
 use crate::pacemaker::types::{TimeoutCertificate, TipInfo};
 use crate::types::block::Block;
+use crate::types::crypto_primitives::{Keypair, SigningKey};
 use crate::types::data_types::{BlockHeight, CryptoHash, Data, SignatureSet, ViewNumber};
+use crate::types::signed_messages::Certificate;
+use crate::types::validator_set::ValidatorSet;
 
 /// Far enough that the escape never fires on its own in a test.
 const FAR: Duration = Duration::from_secs(3600);
@@ -112,6 +118,8 @@ struct Lead {
     view: ViewNumber,
     /// The parent of the leader's fresh block (the TC case re-proposes it).
     p: Block,
+    keys: Vec<SigningKey>,
+    set: ValidatorSet,
 }
 
 fn leader_of_view_3() -> Lead {
@@ -153,6 +161,8 @@ fn leader_of_view_3() -> Lead {
         log,
         view,
         p,
+        keys,
+        set,
     }
 }
 
@@ -482,4 +492,129 @@ fn tc_stored_mid_deferral_lifts_it_after_the_pacemaker_message() {
     assert_eq!(app.produced, 1, "the view after a TC must propose at once");
     assert_eq!(headers(&lead.log), 1);
     assert!(!lead.leader.has_deferred_proposal());
+}
+
+/// A TC for `view` signed by a quorum (3 of the 4 fixture validators, every
+/// voter reporting `p` as its tip), as the pacemaker collects and checks it,
+/// whose high tip `p` wins.
+fn winning_tc(lead: &Lead, view: ViewNumber) -> TimeoutCertificate {
+    let mut message = (CHAIN_ID, view).try_to_vec().unwrap();
+    message.extend_from_slice(&lead.p.hash.bytes());
+    let mut signatures = SignatureSet::new(lead.set.len());
+    for sk in &lead.keys[..3] {
+        let pos = lead
+            .set
+            .position(&sk.verifying_key())
+            .expect("signer in set");
+        signatures.set(pos, Some(Keypair::new(sk.clone()).sign(&message)));
+    }
+    let tc = TimeoutCertificate {
+        chain_id: CHAIN_ID,
+        view,
+        signatures,
+        high_tip: Some(TipInfo {
+            block_hash: lead.p.hash,
+            block_height: lead.p.height,
+            block_justify: lead.p.justify.clone(),
+            block_data_hash: lead.p.data_hash,
+            view: ViewNumber::new(2),
+        }),
+        high_qc: None,
+        high_tip_is_winner: true,
+        voter_metadata: vec![(Some(lead.p.hash), None); lead.set.len()],
+    };
+    assert!(
+        tc.is_correct(&lead.block_tree).expect("TC check"),
+        "the fixture TC must be quorum-signed"
+    );
+    tc
+}
+
+/// What a leader of view 3 under app backpressure proposes in its view when
+/// `make_tc` (a TC for view 2) is stored at view entry (`mid_deferral` false)
+/// or while it already defers, followed by the pacemaker-message hook and the
+/// loop's next retry (`mid_deferral` true): blocks produced, the headers it
+/// broadcast (block hash, TC view), and whether a proposal is still deferred.
+fn tc_outcome(
+    mid_deferral: bool,
+    make_tc: fn(&Lead, ViewNumber) -> TimeoutCertificate,
+) -> (
+    usize,
+    Vec<(CryptoHash, Option<ViewNumber>)>,
+    bool,
+    CryptoHash,
+) {
+    let mut lead = leader_of_view_3();
+    let tc = make_tc(&lead, ViewNumber::new(lead.view.int() - 1));
+    let mut app = PacedApp {
+        backpressure: true,
+        produced: 0,
+    };
+    let info = ViewInfo::new(lead.view, Instant::now() + FAR);
+    if !mid_deferral {
+        lead.block_tree.set_highest_tc(&tc).expect("set highest_tc");
+    }
+    let _ = take_broadcast_headers();
+    enter(&mut lead, &info, &mut app);
+    if mid_deferral {
+        assert!(lead.leader.has_deferred_proposal(), "no TC yet: deferred");
+        assert!(take_broadcast_headers().is_empty());
+        // The pacemaker stores the TC, then the loop reports its message.
+        lead.block_tree.set_highest_tc(&tc).expect("set highest_tc");
+        lead.leader.invalidate_app_deferral();
+        enter(&mut lead, &info, &mut app);
+    }
+    let headers = take_broadcast_headers()
+        .into_iter()
+        .map(|h| (h.block_hash, h.tc.map(|tc| tc.view)))
+        .collect();
+    (
+        app.produced,
+        headers,
+        lead.leader.has_deferred_proposal(),
+        lead.p.hash,
+    )
+}
+
+/// Codex s123 re-review P2: a winning TC for `view - 1` that reaches a leader
+/// while it defers on app backpressure must be handled as if it had been
+/// there at view entry: the leader re-proposes the winning tip `p` with the
+/// TC in the header and builds no fresh (conflicting) block.
+#[test]
+fn winning_tc_mid_deferral_reproposes_the_tip_like_at_entry() {
+    let at_entry = tc_outcome(false, winning_tc);
+    let (produced, headers, deferred, p) = at_entry.clone();
+    assert_eq!(produced, 0, "at entry: a TC re-proposal builds no block");
+    assert_eq!(headers, vec![(p, Some(ViewNumber::new(2)))]);
+    assert!(!deferred);
+
+    let mid = tc_outcome(true, winning_tc);
+    let (produced, headers, deferred, p) = mid.clone();
+    assert_eq!(
+        produced, 0,
+        "a winning TC mid-deferral must not produce a fresh conflicting block"
+    );
+    assert_eq!(
+        headers,
+        vec![(p, Some(ViewNumber::new(2)))],
+        "the leader must re-propose the winning tip with the TC in the header"
+    );
+    assert!(!deferred);
+    assert_eq!(mid, at_entry, "a mid-deferral TC must act as at view entry");
+}
+
+/// The losing-TC counterpart: the TC path finds nothing to re-propose, so
+/// the leader proposes one fresh block at once without a TC in the header,
+/// whether the TC was there at view entry or arrived mid-deferral.
+#[test]
+fn losing_tc_mid_deferral_proposes_fresh_like_at_entry() {
+    let losing = |_: &Lead, view: ViewNumber| losing_tc(view);
+    let at_entry = tc_outcome(false, losing);
+    let (produced, headers, deferred, p) = at_entry.clone();
+    assert_eq!(produced, 1);
+    assert_eq!(headers.len(), 1);
+    assert_ne!(headers[0].0, p, "a fresh block, not a re-proposal");
+    assert_eq!(headers[0].1, None, "a fresh proposal carries no TC");
+    assert!(!deferred);
+    assert_eq!(tc_outcome(true, losing), at_entry);
 }

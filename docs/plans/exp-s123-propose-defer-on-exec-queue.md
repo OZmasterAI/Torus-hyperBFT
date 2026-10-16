@@ -17,6 +17,13 @@ Branch `exp/s123-propose-defer-on-exec-queue`, rebased onto main `2bc88bcf`. Bui
 - Tests (written first; RED shown: compile failure for (a), and with the TC guard disabled the (b) test fails):
   `hold_is_capped_by_time_since_view_entry`, `max_hold_is_half_the_view_time`,
   `fresh_proposal_right_after_tc_is_not_deferred`, `older_tc_does_not_lift_deferral`.
+- (c) Codex re-review P2: a TC stored while the leader defers (it arrives in a pacemaker message) is handled as a
+  TC at view entry. The retry after an app deferral that leaves the cheap path re-runs the whole leader decision of
+  view entry (`propose_in_view`: validator-set re-proposal, `create_proposal_based_on_tc`, then fresh/Nudge), so a
+  winning TC re-proposes its tip with the TC in the header instead of a conflicting fresh block. Only retries in a
+  view with an app deferral (`app_deferred_retry_view`) take it; other retries (S470, missing parent) keep main's
+  path, and cheap retries still read nothing. Tests (RED on `72a4cf5d`: produced 1 fresh block):
+  `winning_tc_mid_deferral_reproposes_the_tip_like_at_entry`, `losing_tc_mid_deferral_proposes_fresh_like_at_entry`.
 
 ## What changed
 

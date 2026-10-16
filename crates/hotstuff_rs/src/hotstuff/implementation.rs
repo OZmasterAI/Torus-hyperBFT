@@ -182,6 +182,14 @@ pub(crate) struct HotStuff<N: Network> {
     /// pacemaker message ([`Self::invalidate_app_deferral`]: the only writer
     /// of `highest_tc` mid-view), so the next retry re-runs the full checks.
     app_deferral_view: Option<ViewNumber>,
+    /// Codex s123 re-review P2: the view in which this leader last deferred a
+    /// fresh proposal on [`App::proposal_backpressure`]. Unlike
+    /// `app_deferral_view`, a pacemaker message does not clear it: the next
+    /// retry that leaves the cheap path takes it and re-runs the whole
+    /// leader decision of view entry ([`Self::propose_in_view`]: re-proposal,
+    /// the TC path, then fresh/Nudge), so a TC that arrived mid-deferral is
+    /// re-proposed exactly as one present at entry. Cleared on a view change.
+    app_deferred_retry_view: Option<ViewNumber>,
     /// s123 rank 2 review fix (a): when this replica entered its current view
     /// (set by `enter_view` on a view change, never by a same-view retry).
     /// Entry times are roughly in step across nodes, deadlines are not.
@@ -277,6 +285,7 @@ impl<N: Network> HotStuff<N> {
             proposal_deferred: false,
             app_backpressure_logged_view: None,
             app_deferral_view: None,
+            app_deferred_retry_view: None,
             view_entered_at: Instant::now(),
             app_backpressure_max_hold: APP_BACKPRESSURE_DEFAULT_MAX_HOLD,
             last_missing_pc_check: Instant::now(),
@@ -570,6 +579,7 @@ impl<N: Network> HotStuff<N> {
             );
         }
         self.app_deferral_view = Some(self.view_info.view);
+        self.app_deferred_retry_view = Some(self.view_info.view);
         true
     }
 
@@ -689,6 +699,22 @@ impl<N: Network> HotStuff<N> {
             }
             self.app_deferral_view = None;
             self.proposal_deferred = false;
+            // Codex s123 re-review P2: after an app deferral, re-run the
+            // leader decision of view entry (re-proposal, TC path, then
+            // fresh/Nudge) rather than going straight to fresh production,
+            // so a winning TC stored mid-deferral re-proposes its tip (TC in
+            // the header) instead of a conflicting fresh block. Never set
+            // with the app hint off, so other retries keep main's path.
+            if self.app_deferred_retry_view.take() == Some(self.view_info.view) {
+                let validator_set_state = block_tree.validator_set_state()?;
+                let reputation = block_tree.leader_reputation().ok();
+                return self.propose_in_view(
+                    &validator_set_state,
+                    reputation.as_ref(),
+                    block_tree,
+                    app,
+                );
+            }
             let highest_pc = block_tree.highest_pc()?;
             if matches!(highest_pc.phase, Phase::Generic | Phase::Decide) {
                 let validator_set_state = block_tree.validator_set_state()?;
@@ -810,6 +836,7 @@ impl<N: Network> HotStuff<N> {
         self.view_info = new_view_info;
         self.view_entered_at = Instant::now();
         self.app_deferral_view = None;
+        self.app_deferred_retry_view = None;
         self.proposal_status = ProposalStatus::WaitingForProposal;
         self.awaiting_body_vote = None;
         // MonadBFT B2: Cancel any pending recovery when entering a new view.
@@ -857,11 +884,27 @@ impl<N: Network> HotStuff<N> {
         //    If the parent block isn't in the tree yet (body fetch in progress),
         //    defer the proposal and retry after message polling.
         self.proposal_deferred = false;
+        self.propose_in_view(&validator_set_state, reputation.as_ref(), block_tree, app)
+    }
+
+    /// Step 4 of [`Self::enter_view`]: if this replica is a proposer for the
+    /// current view, re-propose a block (validator-set chain or a winning
+    /// TC's tip, or start RECOVER) or else propose a fresh block / `Nudge`.
+    /// Codex s123 re-review P2: a retry after an app backpressure deferral
+    /// runs this again, so a TC that arrived mid-deferral is handled exactly
+    /// as one present at view entry.
+    fn propose_in_view<K: KVStore>(
+        &mut self,
+        validator_set_state: &ValidatorSetState,
+        reputation: Option<&super::types::LeaderReputation>,
+        block_tree: &mut BlockTreeSingleton<K>,
+        app: &mut impl App<K>,
+    ) -> Result<(), HotStuffError> {
         let am_proposer = is_proposer_with_reputation(
             &self.config.keypair.public(),
             self.view_info.view,
-            &validator_set_state,
-            reputation.as_ref(),
+            validator_set_state,
+            reputation,
         );
         if am_proposer {
             // If a chain of consecutive views of voting for a validator-set-updating block has been interrupted, then
@@ -942,7 +985,7 @@ impl<N: Network> HotStuff<N> {
                                 self.request_missing_parent(
                                     highest_pc.block,
                                     highest_pc.view,
-                                    &validator_set_state,
+                                    validator_set_state,
                                 );
                                 self.proposal_deferred = true;
                                 return Ok(());
