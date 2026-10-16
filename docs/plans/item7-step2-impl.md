@@ -2189,6 +2189,39 @@ ecrecover on commit).
 Not blockers: the consensus message fits (830,864 B <= 1 MiB); the Phase 5 overlap has no ordering conflict; nothing
 found contradicts the design.
 
+## Owner decisions during the build (s126), with the alternatives kept
+
+None of these changes block speed or matched/s; they are correctness and UX choices.
+
+1. **C9: where `eth_call` / `eth_estimateGas` read the sender's lane.** Chosen: **B**, the lane row from the ingress
+   view (latest executed state), dropped before the call. The call itself still runs on the durable DB (c89ab290).
+   Lane answers now agree with admission, routing and `torus_usingBigBlocks`.
+   - Alt A (as first built, 1d9e9bfa): the lane from the durable DB, one consistent snapshot, but up to one
+     checkpoint (~15 s) after `EvmUserModify` estimates stay capped at the small limit.
+   - Alt "HL way": all RPC reads from the latest executed state. Parked for a decision at item 6 Phase 5 (RAM: the
+     view holds 6 CFs); see `item6-phase5-impl.md`, "Parked for a decision at Phase 5".
+2. **C5 deviation 2: a tx returning to the pool** (own lost proposal, re-proposal, M -> 0 move) joins the lane that
+   already holds its sender's txs; brand-new lane-switching txs still get `EvmLaneSwitchPending`.
+   - Alt (the plan's literal text): refuse returning txs with `EvmLaneSwitchPending`. Rejected: it drops an
+     accepted tx and leaves a nonce gap.
+3. **A tx no lane can take** after a limit drop or M -> 0 is dropped with a warning; the sender's later nonces stay
+   pooled and wait until the gap is re-sent (as step 1's gas-limit eviction, Ethereum pools, and HL, which keeps the
+   next 8 nonces and prunes after 1 day).
+   - Alt: drop the sender's later nonces too. Rejected: the user must re-send everything instead of one tx.
+4. **C6: EVM txs with trailing bytes.** Chosen: **reject at admission only**, so each tx has one canonical byte
+   form. The C6 in-flight filter already decodes txs (`evm_tx_hash`), so it is correct either way.
+   - Alt keep: accept trailing bytes (one tx, several byte strings; harmless with the decoding filter).
+   - Alt admission + vote: validators also refuse blocks carrying such txs. Rejected for now: it blocks padding
+     by a malicious leader, which gains nothing (same tx hash), but if admission and the vote ever disagree, honest
+     proposals are refused and views time out. Revisit only if padding becomes a real problem.
+5. **C6: txs from a lost proposal.** Chosen: **track them** (back into the pool, re-sent at the next commit if
+   still pending), as the plan says; the RPC node's own re-send covers its txs as well.
+   - Alt: forward them to the next leader at once. Gains up to one commit (~0.3 s) in a rare case and adds
+     duplicate sends. Revisit if the devnet's routing check (d) shows lost-proposal txs waiting more than 2 EVM
+     heights.
+6. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
+   Phase 5 (rules in `item6-phase5-impl.md`, `item7-step2-design.md` and `docs/perf/bench-queue.md`).
+
 ## Effort (one builder)
 
 C1 4-6 h, C2 4-6 h, C3 6-8 h, C4 5-7 h (with the fee clamp), C5 9-13 h (the pool split is the largest task; the
