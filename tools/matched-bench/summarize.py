@@ -173,6 +173,91 @@ END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions", "end_resident
 CHECKPOINT_UPKEEP_SUB = ["checkpoint_wait"]
 # Q6 step 0: torus_exec_checkpoint_db_<stage>_seconds (W's checkpoint DB write, per checkpoint; not exec-thread phases).
 CHECKPOINT_DB_STAGES = ["write", "wal", "memtable", "delay", "pre_post", "mutex", "cond_wait", "residual"]
+# Q6 step 0, second bullet: the consensus thread's two state-DB writes per commit and their wall histogram
+# (torus_<write>_db_<stage>_seconds; the wall is the write's existing timer, observed on the same call).
+COMMIT_DB_WRITES = {
+    "commit_manifest": "commit_manifest",
+    "commit_persist": "commit_persist_write",
+}
+COMMIT_DB_STAGES = [
+    "wal",
+    "memtable",
+    "delay",
+    "pre_post",
+    "mutex",
+    "cond_wait",
+    "residual",
+]
+
+
+def checkpoint_spans(rs):
+    """Every checkpoint DB-write span (s, unix) a node's rows show: the start / end gauges hold the LAST write, and
+    at 1 Hz sampling each write (one per 5-15 s) is seen. Unique (start, end) pairs, sorted."""
+    out = set()
+    for r in rs:
+        s, e = (
+            m(r, "exec_checkpoint_db_write_start_ms"),
+            m(r, "exec_checkpoint_db_write_end_ms"),
+        )
+        if s > 0 and e >= s:
+            out.add((s / 1000.0, e / 1000.0))
+    return sorted(out)
+
+
+ALL_CHECKPOINT_SPANS = sorted(
+    {sp for rs in rows.values() for sp in checkpoint_spans(rs)}
+)
+
+
+def _commit_db_add(d, r0, r1, w, wall):
+    """Add one sample interval's calls, wall and stage sums of commit write `w` to the accumulator `d`."""
+    c = m(r1, w + "_db_wal_seconds_count") - m(r0, w + "_db_wal_seconds_count")
+    if c <= 0:
+        return  # no call (or a restart's counter reset)
+    d["calls"] += c
+    d["write"] += m(r1, wall + "_seconds_sum") - m(r0, wall + "_seconds_sum")
+    for k in COMMIT_DB_STAGES:
+        key = "%s_db_%s_seconds_sum" % (w, k)
+        d[k] += m(r1, key) - m(r0, key)
+
+
+def _commit_db_per_call(d):
+    n = d["calls"]
+    out = {"calls": int(n)}
+    for k in ["write"] + COMMIT_DB_STAGES:
+        out[k + "_ms_per_call"] = round(d[k] / n * 1000, 3) if n else None
+    return out
+
+
+def commit_db_split(sel, spans):
+    """The consensus-thread commit writes over the rows `sel`, split by sample interval: a 1 s interval (ts_prev,
+    ts] is `in` if it touches a checkpoint DB-write span (s <= ts and e > ts_prev; 1 s resolution: ts is the
+    scrape's completion second), else `out`. Per side and write: calls, wall and stage ms per call (None without
+    calls). checkpoint_db_writes counts the spans touching the window."""
+    acc = {
+        w: {side: {"calls": 0.0, "write": 0.0, **{k: 0.0 for k in COMMIT_DB_STAGES}} for side in ("in", "out")}
+        for w in COMMIT_DB_WRITES
+    }
+    secs = {"in": 0, "out": 0}
+    for r0, r1 in zip(sel, sel[1:], strict=False):
+        lo, hi = r0["ts"], r1["ts"]
+        if hi <= lo:
+            continue
+        side = "in" if any(s <= hi and e > lo for s, e in spans) else "out"
+        secs[side] += hi - lo
+        for w, wall in COMMIT_DB_WRITES.items():
+            _commit_db_add(acc[w][side], r0, r1, w, wall)
+    lo_all, hi_all = (sel[0]["ts"], sel[-1]["ts"]) if sel else (0, 0)
+    out = {
+        "checkpoint_db_writes": sum(1 for s, e in spans if s <= hi_all and e > lo_all),
+        "in_s": int(secs["in"]),
+        "out_s": int(secs["out"]),
+    }
+    for w in COMMIT_DB_WRITES:
+        out[w] = {side: _commit_db_per_call(d) for side, d in acc[w].items()}
+    return out
+
+
 # r7 state-write-build-vs-db-split: state_write is reported alongside its two
 # halves — state_write_build (serializing the pending maps into the WriteBatch)
 # and state_write_db (the atomic rocksdb write: WAL + memtable). build + db ==
@@ -612,6 +697,20 @@ def node_phase(node, rs, hi, buckets, window):
                                     - m(a, "exec_checkpoint_db_write_seconds_count"))
     for k in CHECKPOINT_DB_STAGES:
         p["checkpoint_db_%s_ms_per_call" % k] = per_call("exec_checkpoint_db_" + k)
+    # Q6 step 0, second bullet: the consensus thread's two state-DB writes (commit-manifest put, commit-persist
+    # WriteBatch write) and RocksDB's stage split of each, ms per call (3 decimals: tens of us out of windows), over
+    # the window and split in / out of checkpoint DB-write spans: `own` = this node's W, `any` = any node's. The
+    # walls are commit_manifest_ms_per_call and commit_persist_write_ms_per_call. None on an older binary.
+    def per_call_3(k):
+        c = m(b, k + "_seconds_count") - m(a, k + "_seconds_count")
+        return round((m(b, k + "_seconds_sum") - m(a, k + "_seconds_sum")) / c * 1000, 3) if c else None
+    p["commit_persist_write_ms_per_call"] = per_call_3("commit_persist_write")
+    for w in COMMIT_DB_WRITES:
+        for k in COMMIT_DB_STAGES:
+            p["%s_db_%s_ms_per_call" % (w, k)] = per_call_3("%s_db_%s" % (w, k))
+    p["commit_db_split"] = {"window": window + "; 1 s sample intervals touching a checkpoint DB-write span",
+                            "own": commit_db_split(sel, checkpoint_spans(rs)),
+                            "any": commit_db_split(sel, ALL_CHECKPOINT_SPANS)}
     def rk(k):
         return (m(b, "rocksdb_" + k) - m(a, "rocksdb_" + k)) / span if span else 0.0
     def gstat(k, scale=1.0):

@@ -2,11 +2,13 @@
 //! stage split of ONE write, read from the calling thread's perf context.
 //!
 //! Used only around the flush worker's checkpoint write
-//! ([`crate::CheckpointLayer::flush_checkpoint`]). The perf level is
-//! thread-local: it is raised for that one call and set back to RocksDB's
-//! default (`kEnableCount`) right after, also on unwind, so every other
-//! write and read (other threads, and W's own other work) keeps today's
-//! count-only cost.
+//! ([`crate::CheckpointLayer::flush_checkpoint`]) and the consensus thread's
+//! two state-DB writes per commit (torus-consensus `app.rs`: the
+//! commit-manifest put and the commit-persist WriteBatch write). The perf
+//! level is thread-local: it is raised for that one call and set back to
+//! RocksDB's default (`kEnableCount`) right after, also on unwind, so every
+//! other write and read (other threads, and the caller's own other work)
+//! keeps today's count-only cost.
 //!
 //! What the timers cover with pipelined write (RocksDB 10.4.2,
 //! `DBImpl::PipelinedWriteImpl`, db_impl_write.cc:970-1160):
@@ -102,7 +104,9 @@ fn unix_ms() -> u64 {
 /// (~70 counters) plus one clock read per timer start / stop inside the
 /// write (a few per stage, a few hundred for a ~200 MB WAL record's buffered
 /// appends) -- microseconds per call. No per-key timers on the insert path.
-pub(crate) fn measure<R>(f: impl FnOnce() -> R) -> (R, WriteStageSplit) {
+/// `f` must be one write on THIS thread (the perf context is thread-local);
+/// the split is meaningless for anything else.
+pub fn measure<R>(f: impl FnOnce() -> R) -> (R, WriteStageSplit) {
     let mut ctx = PerfContext::default();
     set_perf_stats(ROCKSDB_ENABLE_TIME);
     let restore = RestoreDefaultLevel;

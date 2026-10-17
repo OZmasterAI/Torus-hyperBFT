@@ -498,6 +498,14 @@ pub struct Metrics {
     pub on_committed_block_seconds: Histogram,
     /// Consensus thread: the commit-manifest state-DB put inside `on_committed_block`.
     pub commit_manifest_seconds: Histogram,
+    /// Q6 step 0, second bullet: RocksDB's perf-context stage split of the
+    /// commit-manifest put (`torus_commit_manifest_db_<stage>_seconds`), one
+    /// observation per put; its wall is `commit_manifest_seconds`.
+    pub commit_manifest_db: DbWriteStageHistograms,
+    /// Q6 step 0, second bullet: the same split of the commit-persist
+    /// WriteBatch write (`torus_commit_persist_db_<stage>_seconds`); its wall
+    /// is `commit_persist_write_seconds`.
+    pub commit_persist_db: DbWriteStageHistograms,
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
@@ -887,6 +895,75 @@ pub struct Metrics {
     /// `TORUS_D2L_BATCH_MAX_BYTES` cap against real traffic (design §7 flags
     /// the per-order bincode size as unmeasured).
     pub d2l_envelope_bytes: Histogram,
+}
+
+/// Q6 step 0, second bullet: RocksDB's perf-context stage split of one
+/// consensus-thread state-DB write (`torus_state::WriteStageSplit`), one
+/// observation per call in each histogram. The write's wall is its existing
+/// timer, observed on the same call, so WAL + memtable + delay + pre/post +
+/// residual = wall; mutex / condition wait overlap the stages (the memtable
+/// switch signal), they are not stages.
+#[derive(Clone)]
+pub struct DbWriteStageHistograms {
+    /// `write_wal_time`.
+    pub wal: Histogram,
+    /// `write_memtable_time` (the insert).
+    pub memtable: Histogram,
+    /// `write_delay_time` (write controller delay / stop).
+    pub delay: Histogram,
+    /// `write_pre_and_post_process_time` (includes the WAL-group join wait).
+    pub pre_post: Histogram,
+    /// `db_mutex_lock_nanos` (overlaps the stages).
+    pub mutex: Histogram,
+    /// `db_condition_wait_nanos` (overlaps the stages).
+    pub cond_wait: Histogram,
+    /// wall - (WAL + memtable + delay + pre/post): memtable-leader wait,
+    /// `PreprocessWrite` (memtable switch), the WriteBatch drop, untimed glue.
+    pub residual: Histogram,
+}
+
+impl DbWriteStageHistograms {
+    /// Registers `torus_<write>_db_<stage>_seconds` for the seven stages:
+    /// 10 us .. ~5 s buckets (out of checkpoint windows these writes take tens
+    /// of us; behind a checkpoint batch, up to ~1 s).
+    fn register(registry: &mut Registry, write: &str, what: &str) -> Self {
+        let mut one = |stage: &str, help: &str| {
+            let h = Histogram::new(exponential_buckets(0.000_01, 2.0, 20));
+            registry.register(
+                format!("torus_{write}_db_{stage}_seconds"),
+                format!("Q6 step 0: consensus thread, {what}: {help}"),
+                h.clone(),
+            );
+            h
+        };
+        Self {
+            wal: one("wal", "RocksDB perf context write_wal_time"),
+            memtable: one(
+                "memtable",
+                "RocksDB perf context write_memtable_time (insert)",
+            ),
+            delay: one(
+                "delay",
+                "RocksDB perf context write_delay_time (write controller)",
+            ),
+            pre_post: one(
+                "pre_post",
+                "RocksDB perf context write_pre_and_post_process_time (includes the WAL-group join wait)",
+            ),
+            mutex: one(
+                "mutex",
+                "RocksDB perf context db_mutex_lock_nanos (overlaps the stages)",
+            ),
+            cond_wait: one(
+                "cond_wait",
+                "RocksDB perf context db_condition_wait_nanos (overlaps the stages)",
+            ),
+            residual: one(
+                "residual",
+                "wall - (WAL + memtable + delay + pre/post): memtable-leader wait, PreprocessWrite (memtable switch), WriteBatch drop, untimed",
+            ),
+        }
+    }
 }
 
 /// Process allocator (jemalloc) statistics, unlabelled `torus_jemalloc_*_bytes`
@@ -2200,6 +2277,16 @@ impl Metrics {
             "Consensus thread: commit-manifest state-DB put inside on_committed_block (section 74: queues behind the checkpoint batch)",
             commit_manifest_seconds.clone(),
         );
+        let commit_manifest_db = DbWriteStageHistograms::register(
+            &mut registry,
+            "commit_manifest",
+            "commit-manifest put (wall: torus_commit_manifest_seconds)",
+        );
+        let commit_persist_db = DbWriteStageHistograms::register(
+            &mut registry,
+            "commit_persist",
+            "commit-persist WriteBatch write (wall: torus_commit_persist_write_seconds)",
+        );
         let mempool_remove_committed_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_mempool_remove_committed_seconds",
@@ -3076,6 +3163,8 @@ impl Metrics {
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
             commit_manifest_seconds,
+            commit_manifest_db,
+            commit_persist_db,
             mempool_remove_committed_seconds,
             exec_resting_orders,
             exec_resident_rebuilds,
@@ -3861,6 +3950,40 @@ mod tests {
                 text.contains(&format!("\n{name} 0\n")),
                 "{name} not registered (0):\n{text}"
             );
+        }
+    }
+
+    /// Q6 step 0, second bullet: RocksDB's perf-context stage split of the
+    /// consensus thread's two state-DB writes (the commit-manifest put and the
+    /// commit-persist WriteBatch write), one observation per call each, empty
+    /// until the first commit. Their walls are the existing
+    /// `torus_commit_manifest_seconds` / `torus_commit_persist_write_seconds`.
+    #[test]
+    fn commit_db_write_stage_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for write in ["commit_manifest", "commit_persist"] {
+            for stage in [
+                "wal",
+                "memtable",
+                "delay",
+                "pre_post",
+                "mutex",
+                "cond_wait",
+                "residual",
+            ] {
+                let name = format!("torus_{write}_db_{stage}_seconds");
+                assert!(
+                    text.contains(&format!("\n{name}_count 0\n")),
+                    "{name} not registered (empty):\n{text}"
+                );
+            }
+        }
+        for wall in [
+            "torus_commit_manifest_seconds",
+            "torus_commit_persist_write_seconds",
+        ] {
+            assert!(text.contains(&format!("\n{wall}_count 0\n")), "{wall}");
         }
     }
 

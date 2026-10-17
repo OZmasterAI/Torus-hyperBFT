@@ -1638,8 +1638,19 @@ fn persist_committed_block_durably_timed(
         }
     }
 
-    let write_timer = std::time::Instant::now();
-    if let Err(e) = state_db.write(batch) {
+    // Q6 step 0: with metrics, the write runs under RocksDB's perf context
+    // (`torus_state::write_stages::measure`, this thread only, reset right
+    // after); its wall is `torus_commit_persist_write_seconds`.
+    let write_result = match metrics {
+        Some(m) => {
+            let (result, split) = torus_state::write_stages::measure(|| state_db.write(batch));
+            m.commit_persist_write_seconds.observe(split.wall_seconds);
+            observe_db_write_stages(&m.commit_persist_db, &split);
+            result
+        }
+        None => state_db.write(batch),
+    };
+    if let Err(e) = write_result {
         header = false;
         body = false;
         tracing::error!(
@@ -1647,10 +1658,6 @@ fn persist_committed_block_durably_timed(
             height = block.header.height,
             "FIX1a: failed to persist committed block header+body at commit time (crash-recovery may hole here)"
         );
-    }
-    if let Some(m) = metrics {
-        m.commit_persist_write_seconds
-            .observe(write_timer.elapsed().as_secs_f64());
     }
 
     // Task B (Option C): now that this block's header+body are in the shared WAL
@@ -1665,6 +1672,21 @@ fn persist_committed_block_durably_timed(
             .observe(persist_timer.elapsed().as_secs_f64());
     }
     DurableRows { header, body }
+}
+
+/// Q6 step 0, second bullet: one consensus-thread state-DB write's RocksDB
+/// stage split, one observation per histogram (the caller observes the wall).
+fn observe_db_write_stages(
+    h: &torus_telemetry::DbWriteStageHistograms,
+    s: &torus_state::WriteStageSplit,
+) {
+    h.wal.observe(s.wal_seconds);
+    h.memtable.observe(s.memtable_seconds);
+    h.delay.observe(s.delay_seconds);
+    h.pre_post.observe(s.pre_post_seconds);
+    h.mutex.observe(s.mutex_seconds);
+    h.cond_wait.observe(s.cond_wait_seconds);
+    h.residual.observe(s.residual_seconds());
 }
 
 /// Task B (Option C): fsync the RocksDB WAL at the commit boundary, iff
@@ -1706,8 +1728,33 @@ fn sync_committed_wal(state_db: &StateDb, enabled: bool) -> bool {
 /// [`recovery_exec_source`]). Best-effort: a write failure is loud but never
 /// aborts the commit (it degrades to the same un-healable-but-loud hole, never a
 /// silent state loss).
+#[cfg(test)]
 fn persist_commit_manifest(state_db: &StateDb, height: u64, datum_bytes: &[u8]) {
-    if let Err(e) = state_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes) {
+    persist_commit_manifest_timed(state_db, height, datum_bytes, None);
+}
+
+/// [`persist_commit_manifest`] with the consensus-thread timers: with metrics
+/// the put runs under RocksDB's perf context (Q6 step 0,
+/// `torus_state::write_stages::measure`, this thread only, reset right after)
+/// and observes its wall (`torus_commit_manifest_seconds`) and stage split
+/// (`torus_commit_manifest_db_<stage>_seconds`).
+fn persist_commit_manifest_timed(
+    state_db: &StateDb,
+    height: u64,
+    datum_bytes: &[u8],
+    metrics: Option<&torus_telemetry::Metrics>,
+) {
+    let put = || state_db.put_cf_raw(CF_COMMIT_MANIFEST, &height.to_be_bytes(), datum_bytes);
+    let put_result = match metrics {
+        Some(m) => {
+            let (result, split) = torus_state::write_stages::measure(put);
+            m.commit_manifest_seconds.observe(split.wall_seconds);
+            observe_db_write_stages(&m.commit_manifest_db, &split);
+            result
+        }
+        None => put(),
+    };
+    if let Err(e) = put_result {
         tracing::error!(
             %e,
             height,
@@ -7742,11 +7789,8 @@ impl App<RocksKVStore> for TorusApp {
         // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
         // commit->persist window strands the hole with no way to pull bodies
         // (`missing=0`, t12-r3-full h1165).
-        {
-            let _manifest_span =
-                ObserveOnDrop::new(self.metrics.clone(), |m| &m.commit_manifest_seconds);
-            persist_commit_manifest(&self.state_db, height, datum_bytes);
-        }
+        // Timed inside (wall + the Q6 step 0 RocksDB stage split).
+        persist_commit_manifest_timed(&self.state_db, height, datum_bytes, self.metrics.as_deref());
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
         // them via `remove_committed_native` when the block actually executes.
@@ -17062,6 +17106,86 @@ mod crash_recovery_tests {
             text.contains("torus_commit_manifest_seconds_count 1"),
             "one manifest-put observation per commit:\n{text}"
         );
+    }
+
+    /// Q6 step 0, second bullet: the consensus thread's two state-DB writes
+    /// per commit (the commit-manifest put and the commit-persist WriteBatch
+    /// write) each observe RocksDB's perf-context stage split once, on a real
+    /// StateDb: WAL time is timed, and WAL + memtable + delay + pre/post +
+    /// residual adds up to that write's own wall histogram. Afterwards the
+    /// thread is back at RocksDB's default count-only level: a later write
+    /// on it is not timed.
+    #[test]
+    fn commit_writes_observe_their_db_stage_split_once_per_commit() {
+        use rocksdb::perf::{PerfContext, PerfMetric};
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, rx, mempool) = app_with_recording_exec(&config, &state_db);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        app.metrics = Some(metrics.clone());
+
+        let a5 = vec![sign_claim_rewards(5)];
+        let a6 = vec![sign_claim_rewards(6)];
+        let _ = mempool.mirror_native_to_da(&a5);
+        let _ = mempool.mirror_native_to_da(&a6);
+        let b5 = make_block(5, a5);
+        let b6 = make_block(6, a6);
+        app.exec_next_height = Some(5);
+        let c5 = committed_compact_block(&b5);
+        app.on_committed_block(&c5, c5.hash);
+        let c6 = committed_compact_block(&b6);
+        app.on_committed_block(&c6, c6.hash);
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 5);
+        assert_eq!(rx.try_recv().unwrap().torus_block.header.height, 6);
+
+        let text = metrics.encode();
+        let value = |name: &str| -> f64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let stages = [
+            "wal",
+            "memtable",
+            "delay",
+            "pre_post",
+            "mutex",
+            "cond_wait",
+            "residual",
+        ];
+        for (write, wall) in [
+            ("commit_manifest", "torus_commit_manifest_seconds"),
+            ("commit_persist", "torus_commit_persist_write_seconds"),
+        ] {
+            assert_eq!(value(&format!("{wall}_count")), 2.0, "{wall}");
+            for stage in stages {
+                assert_eq!(
+                    value(&format!("torus_{write}_db_{stage}_seconds_count")),
+                    2.0,
+                    "one {write} {stage} observation per commit"
+                );
+            }
+            let sum = |stage: &str| value(&format!("torus_{write}_db_{stage}_seconds_sum"));
+            assert!(sum("wal") > 0.0, "{write}: WAL timed");
+            let split =
+                sum("wal") + sum("memtable") + sum("delay") + sum("pre_post") + sum("residual");
+            let wall_sum = value(&format!("{wall}_sum"));
+            assert!(
+                wall_sum > 0.0 && (split - wall_sum).abs() < 1e-6,
+                "{write}: WAL + memtable + delay + pre/post + residual = wall: {split} vs {wall_sum}"
+            );
+        }
+
+        let mut ctx = PerfContext::default();
+        ctx.reset();
+        state_db
+            .put_cf_raw(CF_COMMIT_MANIFEST, &99u64.to_be_bytes(), b"after")
+            .unwrap();
+        assert_eq!(ctx.metric(PerfMetric::WriteWalTime), 0, "WAL not timed");
+        assert_eq!(ctx.metric(PerfMetric::WriteMemtableTime), 0);
+        assert_eq!(ctx.metric(PerfMetric::WritePreAndPostProcessTime), 0);
     }
 
     #[test]

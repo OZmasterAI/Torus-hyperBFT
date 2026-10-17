@@ -836,6 +836,226 @@ def test_checkpoint_db_write_split():
         assert g in wide, g
 
 
+# Q6 step 0, second bullet: the consensus thread's two state-DB writes per
+# commit (commit-manifest put, commit-persist WriteBatch write) and RocksDB's
+# stage split of each, per call (s). Inside a checkpoint DB-write window of the
+# node's own W the write queues (pre/post holds the WAL-group join wait);
+# outside it is a plain small write. wall = wal + memtable + delay + pre_post +
+# residual; mutex / cond_wait are overlapping signals. The persist write costs
+# COMMIT_DB_PERSIST_X times the manifest put.
+COMMIT_DB_IN = {
+    "write": 0.030,
+    "wal": 0.002,
+    "memtable": 0.001,
+    "delay": 0.0,
+    "pre_post": 0.020,
+    "mutex": 0.004,
+    "cond_wait": 0.003,
+    "residual": 0.007,
+}
+COMMIT_DB_OUT = {
+    "write": 0.0004,
+    "wal": 0.0002,
+    "memtable": 0.0001,
+    "delay": 0.0,
+    "pre_post": 0.00005,
+    "mutex": 0.0,
+    "cond_wait": 0.0,
+    "residual": 0.00005,
+}
+COMMIT_DB_PERSIST_X = 2.0
+COMMIT_DB_PER_S = 4
+# Each node's checkpoint DB-write spans (unix ms). val0's touch the 1 s sample
+# intervals ending at 1004, 1005 and 1009; val1's the one ending at 1007.
+COMMIT_DB_SPANS = {
+    "val0": [(1003200, 1004600), (1008100, 1008300)],
+    "val1": [(1006500, 1006900)],
+    "val2": [],
+}
+COMMIT_DB_STAGES = [
+    "wal",
+    "memtable",
+    "delay",
+    "pre_post",
+    "mutex",
+    "cond_wait",
+    "residual",
+]
+
+
+def add_commit_db_rows(out):
+    """Rewrite write_fixture's two-row sampler.csv as 1 Hz rows (ts 1000 ..
+    1000 + SPAN, every existing column linear in between) and add the
+    consensus-thread write columns (cumulative, per interval in / out of the
+    node's own checkpoint spans) and the checkpoint start / end gauges (the
+    last span that ended before the sample)."""
+    path = os.path.join(out, "sampler.csv")
+    with open(path) as f:
+        lines = f.read().splitlines()
+    header = lines[0].split(",")
+    two = {}
+    for line in lines[1:]:
+        f = line.split(",")
+        two.setdefault(f[1], []).append([float(x) for x in f[2:]])
+    walls = {
+        "commit_manifest": "torus_commit_manifest_seconds",
+        "commit_persist": "torus_commit_persist_write_seconds",
+    }
+    new_cols = [
+        "torus_exec_checkpoint_db_write_start_ms",
+        "torus_exec_checkpoint_db_write_end_ms",
+    ]
+    for w, wall in walls.items():
+        new_cols += [wall + "_sum", wall + "_count"]
+        for k in COMMIT_DB_STAGES:
+            new_cols += [
+                "torus_%s_db_%s_seconds_sum" % (w, k),
+                "torus_%s_db_%s_seconds_count" % (w, k),
+            ]
+    with open(path, "w") as f:
+        f.write(",".join(header + new_cols) + "\n")
+        for node in ("val0", "val1", "val2"):
+            a, b = two[node]
+            spans = COMMIT_DB_SPANS[node]
+            acc = {c: 0.0 for c in new_cols[2:]}
+            for i in range(SPAN + 1):
+                ts = 1000 + i
+                if i > 0:
+                    inside = any(
+                        s / 1000.0 <= ts and e / 1000.0 > ts - 1 for s, e in spans
+                    )
+                    per = COMMIT_DB_IN if inside else COMMIT_DB_OUT
+                    for w, wall in walls.items():
+                        x = COMMIT_DB_PERSIST_X if w == "commit_persist" else 1.0
+                        acc[wall + "_sum"] += per["write"] * x * COMMIT_DB_PER_S
+                        acc[wall + "_count"] += COMMIT_DB_PER_S
+                        for k in COMMIT_DB_STAGES:
+                            acc["torus_%s_db_%s_seconds_sum" % (w, k)] += (
+                                per[k] * x * COMMIT_DB_PER_S
+                            )
+                            acc["torus_%s_db_%s_seconds_count" % (w, k)] += (
+                                COMMIT_DB_PER_S
+                            )
+                done = [sp for sp in spans if sp[1] / 1000.0 < ts]
+                gauges = list(done[-1]) if done else [0, 0]
+                base = [x + (y - x) * i / SPAN for x, y in zip(a, b)]
+                vals = (
+                    base + [float(g) for g in gauges] + [acc[c] for c in new_cols[2:]]
+                )
+                f.write("%d,%s,%s\n" % (ts, node, ",".join("%r" % v for v in vals)))
+
+
+def test_commit_db_write_split_in_vs_out():
+    """Q6 step 0, second bullet: summarize.py reports the consensus thread's
+    two state-DB writes and their RocksDB stage split per call over the phase
+    window, and split by whether each 1 s sample interval touches a checkpoint
+    DB-write span of the node's own W (`own`) or of any node (`any`). None on
+    an older binary; run-cell.sh samples every series' sum and count."""
+
+    def side(calls, per_in, per_out, n_in, x):
+        # n_in of `calls` calls at per_in cost, the rest at per_out.
+        return {
+            k: (per_in[k] * n_in + per_out[k] * (calls - n_in)) * x / calls * 1000
+            for k in per_in
+        }
+
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(
+            out,
+            include_r6=True,
+            bl1="pipelined",
+            end_resident=True,
+            end_resident_worker=True,
+            checkpoint=True,
+        )
+        add_commit_db_rows(out)
+        p0 = run(out)["phase_by_node"]["val0"]
+        total = SPAN * COMMIT_DB_PER_S
+        n_in = 3 * COMMIT_DB_PER_S
+        for w, x in (("commit_manifest", 1.0), ("commit_persist", COMMIT_DB_PERSIST_X)):
+            whole = side(total, COMMIT_DB_IN, COMMIT_DB_OUT, n_in, x)
+            for k in COMMIT_DB_STAGES:
+                close(
+                    p0["%s_db_%s_ms_per_call" % (w, k)],
+                    whole[k],
+                    "%s whole-window %s" % (w, k),
+                )
+        close(
+            p0["commit_persist_write_ms_per_call"],
+            side(total, COMMIT_DB_IN, COMMIT_DB_OUT, n_in, COMMIT_DB_PERSIST_X)[
+                "write"
+            ],
+            "persist wall",
+        )
+        split = p0["commit_db_split"]
+        own, anyn = split["own"], split["any"]
+        assert own["checkpoint_db_writes"] == 2, own
+        assert (own["in_s"], own["out_s"]) == (3, 7), own
+        assert anyn["checkpoint_db_writes"] == 3, anyn
+        assert (anyn["in_s"], anyn["out_s"]) == (4, 6), anyn
+        for w, x in (("commit_manifest", 1.0), ("commit_persist", COMMIT_DB_PERSIST_X)):
+            assert (
+                own[w]["in"]["calls"] == n_in and own[w]["out"]["calls"] == total - n_in
+            ), own[w]
+            for k in ["write"] + COMMIT_DB_STAGES:
+                close(
+                    own[w]["in"][k + "_ms_per_call"],
+                    COMMIT_DB_IN[k] * x * 1000,
+                    "%s own in %s" % (w, k),
+                )
+                close(
+                    own[w]["out"][k + "_ms_per_call"],
+                    COMMIT_DB_OUT[k] * x * 1000,
+                    "%s own out %s" % (w, k),
+                )
+            # val1's span adds one interval of out-cost calls to val0's `any` in side.
+            a_in = side(n_in + COMMIT_DB_PER_S, COMMIT_DB_IN, COMMIT_DB_OUT, n_in, x)
+            assert anyn[w]["in"]["calls"] == n_in + COMMIT_DB_PER_S, anyn[w]
+            for k in ["write"] + COMMIT_DB_STAGES:
+                close(
+                    anyn[w]["in"][k + "_ms_per_call"], a_in[k], "%s any in %s" % (w, k)
+                )
+                close(
+                    anyn[w]["out"][k + "_ms_per_call"],
+                    COMMIT_DB_OUT[k] * x * 1000,
+                    "%s any out %s" % (w, k),
+                )
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(
+            out,
+            include_r6=True,
+            bl1="pipelined",
+            end_resident=True,
+            end_resident_worker=True,
+            checkpoint=True,
+        )
+        p0 = run(out)["phase_by_node"]["val0"]
+        for w in ("commit_manifest", "commit_persist"):
+            for k in COMMIT_DB_STAGES:
+                assert p0["%s_db_%s_ms_per_call" % (w, k)] is None, (w, k)
+            assert p0["commit_db_split"]["own"][w]["in"]["calls"] == 0
+            assert p0["commit_db_split"]["own"][w]["in"]["write_ms_per_call"] is None
+        assert p0["commit_db_split"]["own"]["checkpoint_db_writes"] == 0
+    with open(os.path.join(HERE, "run-cell.sh")) as f:
+        src = f.read()
+    wide = []
+    for line in src.splitlines():
+        line = line.strip()
+        if line.startswith("WIDE_COLS="):
+            wide += line.split("=", 1)[1].replace('"', " ").split()
+    for w in ("commit_manifest", "commit_persist"):
+        for k in COMMIT_DB_STAGES:
+            for suf in ("_sum", "_count"):
+                assert ("torus_%s_db_%s_seconds%s" % (w, k, suf)) in wide, (w, k, suf)
+    for c in (
+        "torus_commit_manifest_seconds_sum",
+        "torus_commit_manifest_seconds_count",
+        "torus_commit_persist_write_seconds_sum",
+        "torus_commit_persist_write_seconds_count",
+    ):
+        assert c in wide, c
+
+
 def add_oracle_drain(out, blocks, secs):
     """ORACLE_FEED_DRAIN=1 shape: after the load window, the live feed keeps
     producing ORACLE-ONLY native blocks through the drain — every per-block
