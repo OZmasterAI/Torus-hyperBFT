@@ -4737,6 +4737,75 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// A refund can bring the gas the run at the cap used BELOW the
+    /// intrinsic gas: 40 warm access-list keys (intrinsic 21000 + 2400 +
+    /// 40 * 1900 = 99400) and, only when `gasleft() > 50000`, an SSTORE
+    /// that clears a set slot (4800 refunded). The cap run's gas used is
+    /// ~97.5k, so the search tries limits below 99400, which revm rejects
+    /// before execution (`CallGasCostMoreThanGasLimit`). geth takes that
+    /// (`core.ErrIntrinsicGas`, `gasestimator.execute`: "Special case,
+    /// raise gas limit") as a FAILED try that raises the lower bound, and
+    /// never starts the search below the intrinsic gas. The estimate is the
+    /// least succeeding gas (the STOP path, ~99421). RED before: the
+    /// estimate returned the invalid-transaction error.
+    #[tokio::test]
+    async fn estimate_gas_refund_below_intrinsic_raises_lower_bound() {
+        let (_dir, state, mempool, executor) = setup();
+        let contract = Address::from([0xC6; 20]);
+        // GAS PUSH3 50000 LT PUSH1 10 JUMPI STOP
+        // JUMPDEST PUSH1 0 PUSH1 0 SSTORE STOP
+        estgas_deploy(
+            &state,
+            contract,
+            &[
+                0x5a, 0x62, 0x00, 0xc3, 0x50, 0x10, 0x60, 0x0a, 0x57, 0x00, 0x5b, 0x60, 0x00,
+                0x60, 0x00, 0x55, 0x00,
+            ],
+        );
+        state
+            .put_storage(&contract, &U256::ZERO, &U256::from(1u64))
+            .unwrap();
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let keys: Vec<String> = (0u64..40).map(|k| format!("0x{k:064x}")).collect();
+        let call = serde_json::json!({
+            "from": hex_address(Address::from([0x11; 20])),
+            "to": hex_address(contract),
+            "accessList": [{ "address": hex_address(contract), "storageKeys": keys }],
+        });
+        let est = estgas_u64(
+            &client
+                .request::<String, _>(
+                    "eth_estimateGas",
+                    jsonrpsee::rpc_params![call.clone(), "latest"],
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(est >= 99_400, "below the intrinsic gas: {est}");
+        let at = |gas: u64| {
+            let mut c = call.clone();
+            c["gas"] = serde_json::json!(format!("0x{gas:x}"));
+            c
+        };
+        client
+            .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est), "latest"])
+            .await
+            .unwrap_or_else(|e| panic!("fails at the estimate {est}: {e}"));
+        assert!(
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est - 1), "latest"])
+                .await
+                .is_err(),
+            "{est} is not the least gas"
+        );
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn eth_get_logs_with_filter() {
         let (_dir, state, mempool, executor) = setup();
