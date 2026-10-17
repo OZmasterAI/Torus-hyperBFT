@@ -340,8 +340,12 @@ Not built by Phase 5. Decide each one once Phase 5's state model and first bench
    which Phase 5 makes cheap. Size it with an archy bench.
 3. **Propose-defer** (`exp/s123-propose-defer-on-exec-queue`, parked): read `torus_exec_queue_depth` and exec lag in
    Phase 5's first bench (hsdb-300m shape). Queue well under 64 with a lag of a few seconds: delete the branch. Queue
-   still about 64 with a lag over about 5 s: revive it (fix the two P2s, third Codex review, campaign B). Rule
-   also in `docs/perf/bench-queue.md` step 6.
+   still about 64 with a lag over about 5 s: revive it (fix the two P2s, third Codex review, campaign B). Campaign B
+   if revived (archy): its own campaign at the hsdb-300m shape on top of Phase 5, 3 arms: (a) base
+   (`TORUS_EXEC_QUEUE_DEPTH` and `TORUS_PROPOSE_EXEC_WATERMARK` absent); (b) control `TORUS_EXEC_QUEUE_DEPTH=16` (the
+   same short exec queue, still a blocking send); (c) `TORUS_PROPOSE_EXEC_WATERMARK=16`. Without (b), a gain cannot be
+   split between the deferral and the shorter queue. Metrics: `torus_exec_queue_depth` mean and max, view timeouts,
+   exec lag, matched/s (branch notes `/home/18c/projects/wt/exp-s123/propose-defer-on-exec-queue.md`).
 
 ## 6. Rollback
 
