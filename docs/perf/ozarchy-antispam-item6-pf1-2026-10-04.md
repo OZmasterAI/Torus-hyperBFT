@@ -12177,8 +12177,8 @@ lag = queue mean / blk/s):
 **10 EVM transfers/s cost 12.4% of native matched/s: E 211.6k vs N 241.6k (E/N 0.876; paired r1 0.870, r2 0.882).
 The effect is ~10x the replicate spread (N 0.2%, E 1.5%; n = 2, no formal CI). CPU-s per 1M fills +1.8%. Every EVM
 height is executed serially (pipelined 0% vs 99% for other blocks) and the exec thread sits idle ~0.5 s before each
-EVM block (~13% of the window). Lead for 18c: why the EVM block is never pipelined (hypothesis: it waits for the
-blocks before it to drain; not checked in code).**
+EVM block (~13% of the window). By design (18c, s126): `pipeline_barrier` closes the checkpoint window and drains the
+flush worker before every EVM block, which then runs serially (80.4). The fix is item 7 step 3, after Q7.**
 
 Question (bench queue Q5): what do EVM blocks cost native matched/s at N = 11?
 
@@ -12224,8 +12224,11 @@ fills 2.84 vs 3.05). Net -12.4% matched/s at 10 EVM tx/s.
 
 ### 80.4 Next
 
-* 18c: find in code why EVM heights are not pipelined and what the exec thread waits for before them; a fix is
-  measured with the same 2 arms.
+* Cause (18c s126, checked in code s66): by design. Before an EVM block, `pipeline_barrier`
+  (`crates/torus-consensus/src/app.rs:2509`) closes the checkpoint window into a checkpoint (`checkpoint_drain`),
+  waits for the flush worker to drain (`wait_idle`) and hands the block to the serial path on the DB. That is the
+  ~0.5 s idle and the slower serial run above. Fix: item 7 step 3 (EVM blocks that can run pipelined), after Q7;
+  any fix is measured with the same 2 arms.
 * Q5 rerun on the item 7 step 2 build (bench queue).
 * Data: `~/bench-results-matched/ozarchy-q5c-300m-{w1,r1-N,r1-E,r2-E,r2-N,smoke-s0}`, campaign files
   `ozarchy-q5c-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`), spec / driver / checks in `ozarchy-q5c-tools/`
