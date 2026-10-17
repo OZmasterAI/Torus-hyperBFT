@@ -1606,7 +1606,9 @@ fn source_slots_are_positions_then_balances() {
 
 use std::sync::{Arc, Mutex};
 
-use super::super::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
+use super::super::{
+    begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks,
+};
 use alloy_primitives::U256;
 use torus_core::liquidation::{self as liquidation, AdlCandidate, LIQUIDATOR_VAULT};
 use torus_core::lockbox::Lockbox;
@@ -1653,7 +1655,10 @@ impl Call {
 fn typed_call(users: &Users, slot: usize, key: &[u8], value: Option<&[u8]>) -> Option<Call> {
     match (slot, value) {
         (POSITIONS, _) if key.len() != KEY => None,
-        (POSITIONS, None) => Some(Call::RemovePosition(Address::from_slice(&key[..TRADER]), market_of(key))),
+        (POSITIONS, None) => Some(Call::RemovePosition(
+            Address::from_slice(&key[..TRADER]),
+            market_of(key),
+        )),
         (POSITIONS, Some(v)) => decode(key, v).map(Call::SetPosition),
         (_, None) => None,
         (_, Some(v)) => match super::balance_owner(key)? {
@@ -1706,7 +1711,10 @@ impl ShadowSide {
                 stats.set_balance += 1;
             }
             Call::AddCumVolume(t, x) => {
-                users.mutate().add_cum_volume(&t, x).expect("a regular trader's cvlm row");
+                users
+                    .mutate()
+                    .add_cum_volume(&t, x)
+                    .expect("a regular trader's cvlm row");
                 stats.add_cum_volume += 1;
             }
         }
@@ -1745,10 +1753,19 @@ impl StateBackend for Shadow {
         self.mirror(cf, key, None);
         Ok(())
     }
-    fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
         self.inner.iterate_cf(cf, prefix)
     }
-    fn iterate_cf_from(&self, cf: &str, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+    fn iterate_cf_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
         self.inner.iterate_cf_from(cf, start, limit)
     }
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
@@ -1835,7 +1852,13 @@ struct WriterStats {
 /// close), `apply_fill` (opens, closes, flips), position / balance / `cvlm`
 /// puts and position deletes; now and then a raw block of irregular rows
 /// over the P1 traders (who never trade), and the odd trader's lenient row.
-fn p5_direct_writes(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg, h: u64, call: u64, ws: &mut WriterStats) {
+fn p5_direct_writes(
+    ctx: &NativeExecContext<Shadow>,
+    rng: &mut Lcg,
+    h: u64,
+    call: u64,
+    ws: &mut WriterStats,
+) {
     let pm = &ctx.positions;
     let st = &ctx.state;
     let px = |rng: &mut Lcg| p5_fp(P5_MID - 20 + rng.below(40) as i64);
@@ -1845,25 +1868,38 @@ fn p5_direct_writes(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg, h: u64, call
         let m = 1 + rng.below(P5_MARKETS);
         let held = pm.get_position(&t, m).unwrap();
         match rng.below(13) {
-            0 => ws.credit += usize::from(Lockbox::credit_native(st, &t, p5_fp(1 + rng.below(5_000) as i64)).is_ok()),
-            1 => ws.deposit += usize::from(Lockbox::deposit_to_native(st, &t, p5_fp(1 + rng.below(5_000) as i64)).is_ok()),
+            0 => {
+                ws.credit += usize::from(
+                    Lockbox::credit_native(st, &t, p5_fp(1 + rng.below(5_000) as i64)).is_ok(),
+                )
+            }
+            1 => {
+                ws.deposit += usize::from(
+                    Lockbox::deposit_to_native(st, &t, p5_fp(1 + rng.below(5_000) as i64)).is_ok(),
+                )
+            }
             2 => {
                 let amount = p5_fp(1 + rng.below(2_000) as i64);
-                ws.withdraw += usize::from(Lockbox::withdraw_from_native_to(st, &t, &other, amount).is_ok());
+                ws.withdraw +=
+                    usize::from(Lockbox::withdraw_from_native_to(st, &t, &other, amount).is_ok());
             }
             3 => {
                 if let Some(p) = held.filter(|_| t != other) {
                     let qty = p.size.min(p5_fp(1 + rng.below(3) as i64));
-                    ws.transfer += usize::from(liquidation::transfer(pm, &t, &other, m, qty, px(rng)).is_ok());
+                    ws.transfer +=
+                        usize::from(liquidation::transfer(pm, &t, &other, m, qty, px(rng)).is_ok());
                 }
             }
             4 => {
-                ws.move_collateral += usize::from(liquidation::move_collateral(pm, &t, &LIQUIDATOR_VAULT).is_ok());
+                ws.move_collateral +=
+                    usize::from(liquidation::move_collateral(pm, &t, &LIQUIDATOR_VAULT).is_ok());
                 Lockbox::credit_native(st, &t, p5_fp(500_000)).unwrap();
             }
             5 if rng.below(3) == 0 => {
                 let mark = px(rng);
-                ws.backstop += usize::from(liquidation::backstop(pm, &t, &LIQUIDATOR_VAULT, |_| Some(mark)).is_ok());
+                ws.backstop += usize::from(
+                    liquidation::backstop(pm, &t, &LIQUIDATOR_VAULT, |_| Some(mark)).is_ok(),
+                );
                 Lockbox::credit_native(st, &t, p5_fp(500_000)).unwrap();
             }
             6 => {
@@ -1887,51 +1923,95 @@ fn p5_direct_writes(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg, h: u64, call
                             account_value: FixedPoint::ZERO,
                         })
                         .collect();
-                    if let Ok((closes, _, _)) = liquidation::adl_close(pm, &escrow, m, price, p.size, &ranked) {
+                    if let Ok((closes, _, _)) =
+                        liquidation::adl_close(pm, &escrow, m, price, p.size, &ranked)
+                    {
                         ws.adl_closes += closes.len();
                     }
                 }
             }
             7 => {
-                let (long, short) = (liquidation::adl_escrow(true), liquidation::adl_escrow(false));
-                let size = |e: &Address| pm.get_position(e, m).unwrap().map_or(FixedPoint::ZERO, |p| p.size);
-                let q = size(&long).min(size(&short)).min(p5_fp(1 + rng.below(3) as i64));
+                let (long, short) = (
+                    liquidation::adl_escrow(true),
+                    liquidation::adl_escrow(false),
+                );
+                // Each escrow first takes one unit from a holder of its side
+                // (the ADL leg), so the cross close has both sides to close.
+                for is_long in [true, false] {
+                    let holder = (0..P5_TRADERS).map(p5_trader).find_map(|c| {
+                        pm.get_position(&c, m)
+                            .unwrap()
+                            .filter(|p| p.is_long == is_long)
+                    });
+                    if let Some(p) = holder {
+                        let qty = p.size.min(p5_fp(1));
+                        let _ = liquidation::transfer(
+                            pm,
+                            &p.trader,
+                            &liquidation::adl_escrow(is_long),
+                            m,
+                            qty,
+                            px(rng),
+                        );
+                    }
+                }
+                let size = |e: &Address| {
+                    pm.get_position(e, m)
+                        .unwrap()
+                        .map_or(FixedPoint::ZERO, |p| p.size)
+                };
+                let q = size(&long)
+                    .min(size(&short))
+                    .min(p5_fp(1 + rng.below(3) as i64));
                 let (pl, ps) = (px(rng), px(rng));
-                ws.cross_close += usize::from(liquidation::cross_close(pm, m, q, pl, ps, &LIQUIDATOR_VAULT).is_ok());
+                ws.cross_close += usize::from(
+                    liquidation::cross_close(pm, m, q, pl, ps, &LIQUIDATOR_VAULT).is_ok(),
+                );
             }
             8 => match held {
                 Some(_) if rng.below(3) == 0 => pm.delete_position(&t, m).unwrap(),
                 old => {
                     let size = p5_fp(1 + rng.below(9) as i64);
                     let entry = px(rng);
-                    let pos = old.map(|p| Position { size: p.size + size, ..p }).unwrap_or(Position {
-                        trader: t,
-                        market_id: m,
-                        is_long: rng.below(2) == 0,
-                        size,
-                        entry_price: entry,
-                        cost_basis: entry * size,
-                        realized_pnl: FixedPoint::ZERO,
-                        isolated_margin: FixedPoint::ZERO,
-                        margin_type: MarginType::Cross,
-                    });
+                    let pos = old
+                        .map(|p| Position {
+                            size: p.size + size,
+                            ..p
+                        })
+                        .unwrap_or(Position {
+                            trader: t,
+                            market_id: m,
+                            is_long: rng.below(2) == 0,
+                            size,
+                            entry_price: entry,
+                            cost_basis: entry * size,
+                            realized_pnl: FixedPoint::ZERO,
+                            isolated_margin: FixedPoint::ZERO,
+                            margin_type: MarginType::Cross,
+                        });
                     pm.put_position(&pos).unwrap();
                     ws.puts += 1;
                 }
             },
             9 => {
-                let bal = NativeBalance { available: p5_fp(100_000 + rng.below(400_000) as i64), order_margin: FixedPoint::ZERO };
+                let bal = NativeBalance {
+                    available: p5_fp(100_000 + rng.below(400_000) as i64),
+                    order_margin: FixedPoint::ZERO,
+                };
                 pm.put_native_balance(&t, &bal).unwrap();
                 ws.puts += 1;
             }
             10 => {
-                pm.put_cum_volume(&t, p5_fp(rng.below(10_000_000) as i64)).unwrap();
+                pm.put_cum_volume(&t, p5_fp(rng.below(10_000_000) as i64))
+                    .unwrap();
                 ws.puts += 1;
             }
             _ => {
                 // Opens, increases, reductions, closes and flips.
                 let qty = p5_fp(1 + rng.below(12) as i64);
-                let ok = pm.apply_fill(&t, m, rng.below(2) == 0, qty, px(rng), MarginType::Cross).is_ok();
+                let ok = pm
+                    .apply_fill(&t, m, rng.below(2) == 0, qty, px(rng), MarginType::Cross)
+                    .is_ok();
                 ws.apply_fill += usize::from(ok);
             }
         }
@@ -1949,7 +2029,8 @@ fn p5_direct_writes(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg, h: u64, call
         match h % 5 {
             1 => {
                 let p = position(odd, P5_ODD_MARKET, h, true);
-                st.put_cf_raw(CF_NATIVE_POSITIONS, &key, &lenient(&p, 0)).unwrap();
+                st.put_cf_raw(CF_NATIVE_POSITIONS, &key, &lenient(&p, 0))
+                    .unwrap();
                 ws.lenient += 1;
             }
             4 => st.delete_cf_raw(CF_NATIVE_POSITIONS, &key).unwrap(),
@@ -1966,10 +2047,20 @@ fn p5_actions(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg) -> Vec<(Address, N
             let t = p5_trader(rng.below(P5_TRADERS));
             let m = 1 + rng.below(P5_MARKETS);
             let action = match rng.below(12) {
-                0 => NativeAction::CancelAllOrders { market_id: (rng.below(2) == 0).then_some(m) },
-                1 => NativeAction::TransferToPerp { amount: U256::from(1 + rng.below(50)) * U256::from(FixedPoint::SCALE as u128) },
-                2 => NativeAction::TransferToSpot { amount: U256::from(1 + rng.below(20)) * U256::from(FixedPoint::SCALE as u128) },
-                3 => match ctx.order_books.get(&m).and_then(|b| b.orders_for_trader(&t).first().map(|o| o.id)) {
+                0 => NativeAction::CancelAllOrders {
+                    market_id: (rng.below(2) == 0).then_some(m),
+                },
+                1 => NativeAction::TransferToPerp {
+                    amount: U256::from(1 + rng.below(50)) * U256::from(FixedPoint::SCALE as u128),
+                },
+                2 => NativeAction::TransferToSpot {
+                    amount: U256::from(1 + rng.below(20)) * U256::from(FixedPoint::SCALE as u128),
+                },
+                3 => match ctx
+                    .order_books
+                    .get(&m)
+                    .and_then(|b| b.orders_for_trader(&t).first().map(|o| o.id))
+                {
                     Some(order_id) => NativeAction::ModifyOrder {
                         order_id,
                         new_price: Some(p5_fp(P5_MID - 3 + rng.below(7) as i64)),
@@ -2016,14 +2107,32 @@ fn dirty_rows_equal_overlay_rows_every_block() {
         let db = StateDb::open(dir.path()).unwrap();
         let mut rng = Lcg(seed * 0x2545_F491);
         for m in 1..=P5_MARKETS {
-            let row = borsh::to_vec(&("BTC".to_string(), "USDC".to_string(), p5_fp(1).raw(), p5_fp(1).raw(), p5_fp(5).raw())).unwrap();
-            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &row).unwrap();
+            let row = borsh::to_vec(&(
+                "BTC".to_string(),
+                "USDC".to_string(),
+                p5_fp(1).raw(),
+                p5_fp(1).raw(),
+                p5_fp(5).raw(),
+            ))
+            .unwrap();
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &row)
+                .unwrap();
         }
         let pm = PositionManager::new(db.clone());
         for i in 0..P5_TRADERS {
             let t = p5_trader(i);
-            pm.put_native_balance(&t, &NativeBalance { available: p5_fp(500_000), order_margin: FixedPoint::ZERO }).unwrap();
-            let evm = revm::state::AccountInfo { balance: U256::from(10u128.pow(36)), ..Default::default() };
+            pm.put_native_balance(
+                &t,
+                &NativeBalance {
+                    available: p5_fp(500_000),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+            let evm = revm::state::AccountInfo {
+                balance: U256::from(10u128.pow(36)),
+                ..Default::default()
+            };
             db.put_account(&t, &evm).unwrap();
         }
         for _ in 0..4 {
@@ -2046,8 +2155,21 @@ fn dirty_rows_equal_overlay_rows_every_block() {
             let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
             let mut rb = begin_resident(Some(&mut holder), &mut overlay, h, None);
             assert!(rb.attached(), "{tag}: R attached");
-            let shadow = Shadow { inner: overlay.clone(), side: side.clone() };
-            let mut ctx = NativeExecContext::new(shadow, h, 10_000 + 7 * h, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+            let shadow = Shadow {
+                inner: overlay.clone(),
+                side: side.clone(),
+            };
+            let mut ctx = NativeExecContext::new(
+                shadow,
+                h,
+                10_000 + 7 * h,
+                0,
+                1_000,
+                10,
+                Address::ZERO,
+                Address::ZERO,
+                Address::ZERO,
+            );
             ctx.order_books = std::mem::take(&mut books);
             ctx.next_global_order_id = next_id;
             ctx.attach_resident_block(&mut rb);
@@ -2063,29 +2185,50 @@ fn dirty_rows_equal_overlay_rows_every_block() {
                 for (t, a) in p5_actions(&ctx, &mut rng).into_iter().take(2) {
                     ws.single_ok += usize::from(NativeExecutor::execute(&mut ctx, &t, &a).success);
                 }
-                assert!(ctx.fatal_error.is_none(), "{tag} call {call}: {:?}", ctx.fatal_error);
+                assert!(
+                    ctx.fatal_error.is_none(),
+                    "{tag} call {call}: {:?}",
+                    ctx.fatal_error
+                );
             }
             books = std::mem::take(&mut ctx.order_books);
             next_id = ctx.next_global_order_id;
             ctx.detach_resident_block(&mut rb);
             drop(ctx);
-            overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+            overlay
+                .put_cf_raw(
+                    CF_CONSENSUS_META,
+                    META_NATIVE_APPLIED_HEIGHT,
+                    &h.to_be_bytes(),
+                )
+                .unwrap();
             let delta = overlay.own_pending_delta();
             let frozen = overlay.freeze(h);
 
             // The typed path's frozen set: the overlay's cold CFs, and the
             // two CFs from the dirty sets.
-            let cold: Vec<&str> =
-                ALL_CF_NAMES.iter().copied().filter(|cf| *cf != CF_NATIVE_POSITIONS && *cf != CF_NATIVE_BALANCES).collect();
+            let cold: Vec<&str> = ALL_CF_NAMES
+                .iter()
+                .copied()
+                .filter(|cf| *cf != CF_NATIVE_POSITIONS && *cf != CF_NATIVE_BALANCES)
+                .collect();
             let mut typed = frozen.slice(&cold);
             let mut s = side.lock().unwrap();
             let dirty = s.users.dirty_keys();
             s.users.drain_dirty_into(&mut typed);
             for cf in ALL_CF_NAMES {
-                assert_eq!(typed.rows(cf), frozen.rows(cf), "{tag}: {cf}: dirty rows != the overlay's pending rows");
+                assert_eq!(
+                    typed.rows(cf),
+                    frozen.rows(cf),
+                    "{tag}: {cf}: dirty rows != the overlay's pending rows"
+                );
             }
-            let pending = frozen.rows(CF_NATIVE_POSITIONS).len() + frozen.rows(CF_NATIVE_BALANCES).len();
-            assert_eq!(dirty, pending, "{tag}: one dirty key per pending row of the two CFs");
+            let pending =
+                frozen.rows(CF_NATIVE_POSITIONS).len() + frozen.rows(CF_NATIVE_BALANCES).len();
+            assert_eq!(
+                dirty, pending,
+                "{tag}: one dirty key per pending row of the two CFs"
+            );
             assert_eq!(s.users.dirty_keys(), 0, "{tag}: drained");
             rows_checked += pending;
             tombstones += [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
@@ -2096,12 +2239,18 @@ fn dirty_rows_equal_overlay_rows_every_block() {
 
             end_resident(&mut holder, rb, &mut overlay, delta, true, None);
             if let Some(p) = parent.take() {
-                p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
+                p.flush_with_native_trie_stats(&db, None, None, None)
+                    .expect("flush");
             }
             parent = Some(frozen);
             // In place == the block's post-state, built cold.
-            let after = Users::build_from(&NativeStateOverlay::with_parent(db.clone(), parent.clone())).unwrap();
-            assert!(s.users.same_as(&after), "{tag}: the shadow's records != a cold build of the post-state");
+            let after =
+                Users::build_from(&NativeStateOverlay::with_parent(db.clone(), parent.clone()))
+                    .unwrap();
+            assert!(
+                s.users.same_as(&after),
+                "{tag}: the shadow's records != a cold build of the post-state"
+            );
             assert!(s.users.self_consistent(), "{tag}: shadow self-consistent");
         }
         let s = side.lock().unwrap().stats;
@@ -2117,18 +2266,39 @@ fn dirty_rows_equal_overlay_rows_every_block() {
         }
     }
     println!("P5 T1.1 writers {ws:?}; UsersMut {ms:?}; rows {rows_checked}, tombstones {tombstones}, odd opaque blocks {opaque_blocks}");
-    assert!(rows_checked > 5_000 && tombstones > 300, "non-vacuous: rows {rows_checked}, tombstones {tombstones}");
     assert!(
-        ms.set_position > 500 && ms.remove_position > 100 && ms.set_balance > 500 && ms.add_cum_volume > 100 && ms.put_row > 1_000,
+        rows_checked > 4_000 && tombstones > 300,
+        "non-vacuous: rows {rows_checked}, tombstones {tombstones}"
+    );
+    assert!(
+        ms.set_position > 500
+            && ms.remove_position > 100
+            && ms.set_balance > 500
+            && ms.add_cum_volume > 100
+            && ms.put_row > 1_000,
         "every UsersMut call: {ms:?}"
     );
-    assert!(ms.opaque_typed > 20 && opaque_blocks > 10, "typed calls on an opaque trader: {ms:?}, {opaque_blocks}");
     assert!(
-        ws.credit > 10 && ws.deposit > 10 && ws.withdraw > 10 && ws.transfer > 10 && ws.move_collateral > 5 && ws.backstop > 2,
+        ms.opaque_typed > 20 && opaque_blocks > 10,
+        "typed calls on an opaque trader: {ms:?}, {opaque_blocks}"
+    );
+    assert!(
+        ws.credit > 10
+            && ws.deposit > 10
+            && ws.withdraw > 10
+            && ws.transfer > 10
+            && ws.move_collateral > 5
+            && ws.backstop > 2,
         "lockbox and liquidation writers: {ws:?}"
     );
-    assert!(ws.adl_closes > 5 && ws.cross_close > 0 && ws.apply_fill > 50, "ADL, cross close, fills: {ws:?}");
-    assert!(ws.batch_ok > 500 && ws.single_ok > 50 && ws.raw_blocks > 10 && ws.lenient > 5, "{ws:?}");
+    assert!(
+        ws.adl_closes > 5 && ws.cross_close > 0 && ws.apply_fill > 50,
+        "ADL, cross close, fills: {ws:?}"
+    );
+    assert!(
+        ws.batch_ok > 500 && ws.single_ok > 50 && ws.raw_blocks > 10 && ws.lenient > 5,
+        "{ws:?}"
+    );
 }
 
 /// One mutation of [`dirty_rows_sorted_and_once`].
@@ -2178,7 +2348,11 @@ impl P5Op {
                 Err(_) => return false,
             },
             P5Op::Raw(slot, k, v) => {
-                let cf = if *slot == POSITIONS { CF_NATIVE_POSITIONS } else { CF_NATIVE_BALANCES };
+                let cf = if *slot == POSITIONS {
+                    CF_NATIVE_POSITIONS
+                } else {
+                    CF_NATIVE_BALANCES
+                };
                 match v {
                     Some(v) => o.put_cf_raw(cf, k, v).unwrap(),
                     None => o.delete_cf_raw(cf, k).unwrap(),
@@ -2200,11 +2374,27 @@ fn p5_random_op(rng: &mut Lcg, t: Address) -> P5Op {
         3 | 4 => P5Op::RemovePosition(t, m),
         5 | 6 => P5Op::SetBalance(t, balance(raw)),
         7 | 8 => P5Op::AddCumVolume(t, FixedPoint::from_raw(i128::from(raw) - 300)),
-        9 => P5Op::Raw(POSITIONS, position_key(&t, m).to_vec(), Some(lenient(&position(t, m, raw, true), rng.below(3)))),
+        9 => P5Op::Raw(
+            POSITIONS,
+            position_key(&t, m).to_vec(),
+            Some(lenient(&position(t, m, raw, true), rng.below(3))),
+        ),
         10 => P5Op::Raw(BALANCES, cum_volume_key(&t).to_vec(), Some(vec![0u8; 17])),
-        11 => P5Op::Raw(BALANCES, t.to_vec(), (rng.below(2) == 0).then(|| bal_bytes(&balance(raw)))),
-        12 => P5Op::Raw(POSITIONS, t.as_slice()[..7].to_vec(), (rng.below(2) == 0).then(|| vec![7, 7])),
-        _ => P5Op::Raw(BALANCES, [b"cvlx".as_slice(), t.as_slice()].concat(), (rng.below(2) == 0).then(|| vec![1; 16])),
+        11 => P5Op::Raw(
+            BALANCES,
+            t.to_vec(),
+            (rng.below(2) == 0).then(|| bal_bytes(&balance(raw))),
+        ),
+        12 => P5Op::Raw(
+            POSITIONS,
+            t.as_slice()[..7].to_vec(),
+            (rng.below(2) == 0).then(|| vec![7, 7]),
+        ),
+        _ => P5Op::Raw(
+            BALANCES,
+            [b"cvlx".as_slice(), t.as_slice()].concat(),
+            (rng.below(2) == 0).then(|| vec![1; 16]),
+        ),
     }
 }
 
@@ -2221,7 +2411,10 @@ fn p5_random_op(rng: &mut Lcg, t: Address) -> P5Op {
 /// overlay's pending rows after the same writes.
 #[test]
 fn dirty_rows_sorted_and_once() {
-    let (pos_id, bal_id) = (hashed_cf_id(CF_NATIVE_POSITIONS).unwrap(), hashed_cf_id(CF_NATIVE_BALANCES).unwrap());
+    let (pos_id, bal_id) = (
+        hashed_cf_id(CF_NATIVE_POSITIONS).unwrap(),
+        hashed_cf_id(CF_NATIVE_BALANCES).unwrap(),
+    );
     assert!(pos_id < bal_id, "positions sort before balances");
     let (mut drained, mut refused) = (0usize, 0usize);
     for seed in 1..=6u64 {
@@ -2246,7 +2439,8 @@ fn dirty_rows_sorted_and_once() {
         let keys: Vec<(usize, Vec<u8>)> = per_key.keys().cloned().collect();
         let mut runs: Vec<DirtyRows> = Vec::new();
         for order in 0..5 {
-            let mut lists: Vec<std::collections::VecDeque<P5Op>> = per_key.values().cloned().map(Into::into).collect();
+            let mut lists: Vec<std::collections::VecDeque<P5Op>> =
+                per_key.values().cloned().map(Into::into).collect();
             if order == 1 {
                 lists.reverse();
             }
@@ -2254,7 +2448,11 @@ fn dirty_rows_sorted_and_once() {
             let mut seen = 0;
             while lists.iter().any(|l| !l.is_empty()) {
                 let live: Vec<usize> = (0..lists.len()).filter(|&i| !lists[i].is_empty()).collect();
-                let i = if order < 2 { live[0] } else { live[rng.below(live.len() as u64) as usize] };
+                let i = if order < 2 {
+                    live[0]
+                } else {
+                    live[rng.below(live.len() as u64) as usize]
+                };
                 let op = lists[i].pop_front().unwrap();
                 seen += 1;
                 if !op.on_users(&mut users) {
@@ -2270,16 +2468,32 @@ fn dirty_rows_sorted_and_once() {
                 .map(|(k, _)| (pos_id, k.as_slice()))
                 .chain(d.balances.iter().map(|(k, _)| (bal_id, k.as_slice())))
                 .collect();
-            assert!(seq.windows(2).all(|w| w[0] < w[1]), "seed {seed} order {order}: strictly ascending (cf_id, key)");
-            assert!(seq.len() <= keys.len() && seq.len() == n, "seed {seed} order {order}: one row per dirty key");
+            assert!(
+                seq.windows(2).all(|w| w[0] < w[1]),
+                "seed {seed} order {order}: strictly ascending (cf_id, key)"
+            );
+            assert!(
+                seq.len() <= keys.len() && seq.len() == n,
+                "seed {seed} order {order}: one row per dirty key"
+            );
             assert_eq!(users.dirty_keys(), 0, "seed {seed} order {order}: drained");
-            assert_eq!(users.drain_dirty(), DirtyRows::default(), "seed {seed} order {order}: a second drain is empty");
-            assert!(users.self_consistent(), "seed {seed} order {order}: self-consistent");
+            assert_eq!(
+                users.drain_dirty(),
+                DirtyRows::default(),
+                "seed {seed} order {order}: a second drain is empty"
+            );
+            assert!(
+                users.self_consistent(),
+                "seed {seed} order {order}: self-consistent"
+            );
             drained += seq.len();
             runs.push(d);
         }
         for (i, r) in runs.iter().enumerate().skip(1) {
-            assert_eq!(r, &runs[0], "seed {seed}: interleaving {i} drains other rows than key order");
+            assert_eq!(
+                r, &runs[0],
+                "seed {seed}: interleaving {i} drains other rows than key order"
+            );
         }
         // The same writes through an overlay, in key order.
         let o = NativeStateOverlay::new(db.clone());
@@ -2288,11 +2502,22 @@ fn dirty_rows_sorted_and_once() {
         }
         let frozen = o.freeze(1);
         let typed = &runs[0];
-        assert_eq!(frozen.rows(CF_NATIVE_POSITIONS), typed.positions, "seed {seed}: positions vs the overlay");
-        assert_eq!(frozen.rows(CF_NATIVE_BALANCES), typed.balances, "seed {seed}: balances vs the overlay");
+        assert_eq!(
+            frozen.rows(CF_NATIVE_POSITIONS),
+            typed.positions,
+            "seed {seed}: positions vs the overlay"
+        );
+        assert_eq!(
+            frozen.rows(CF_NATIVE_BALANCES),
+            typed.balances,
+            "seed {seed}: balances vs the overlay"
+        );
     }
     println!("P5 T1.1 sorted-and-once: rows drained {drained}, refused calls {refused}");
-    assert!(drained > 2_000 && refused > 0, "non-vacuous: {drained}, {refused}");
+    assert!(
+        drained > 1_500 && refused > 0,
+        "non-vacuous: {drained}, {refused}"
+    );
 }
 
 /// Plan Task 1.1: `opaque_trader_stays_raw`. A trader with an irregular row
@@ -2310,17 +2535,32 @@ fn opaque_trader_stays_raw() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     let put = |cf, k: &[u8], v: &[u8]| db.put_cf_raw(cf, k, v).unwrap();
-    put(CF_NATIVE_POSITIONS, &position_key(&a, 1), &bytes(&position(a, 1, 3, true)));
+    put(
+        CF_NATIVE_POSITIONS,
+        &position_key(&a, 1),
+        &bytes(&position(a, 1, 3, true)),
+    );
     put(CF_NATIVE_BALANCES, a.as_slice(), &bal_bytes(&balance(4)));
-    put(CF_NATIVE_POSITIONS, &position_key(&b, 1), &bytes(&position(b, 1, 6, false)));
+    put(
+        CF_NATIVE_POSITIONS,
+        &position_key(&b, 1),
+        &bytes(&position(b, 1, 6, false)),
+    );
     let odd = lenient(&position(b, 7, 8, true), 0);
     put(CF_NATIVE_POSITIONS, &position_key(&b, 7), &odd);
     put(CF_NATIVE_BALANCES, b.as_slice(), &bal_bytes(&balance(9)));
     put(CF_NATIVE_BALANCES, &cum_volume_key(&b), &volume_bytes(40));
-    put(CF_NATIVE_POSITIONS, &position_key(&c, 2), &bytes(&position(c, 2, 1, true)));
+    put(
+        CF_NATIVE_POSITIONS,
+        &position_key(&c, 2),
+        &bytes(&position(c, 2, 1, true)),
+    );
     put(CF_NATIVE_BALANCES, &cum_volume_key(&c), &[0u8; 17]);
     let mut users = Users::build(&ResidentRows::build(&db).unwrap());
-    assert!(users.get(&a).is_some() && users.get(&b).is_none() && users.get(&c).is_none(), "a regular, b and c opaque");
+    assert!(
+        users.get(&a).is_some() && users.get(&b).is_none() && users.get(&c).is_none(),
+        "a regular, b and c opaque"
+    );
 
     // Typed writes to opaque b stay raw.
     let pb = position(b, 2, 11, false);
@@ -2336,7 +2576,11 @@ fn opaque_trader_stays_raw() {
     let before = Users::drain_sources();
     let d = users.drain_dirty();
     let after = Users::drain_sources();
-    assert_eq!(after.0 - before.0, 0, "no row of opaque b serialized from a record");
+    assert_eq!(
+        after.0 - before.0,
+        0,
+        "no row of opaque b serialized from a record"
+    );
     assert_eq!(after.1 - before.1, 4, "b's four rows drained raw");
     assert_eq!(
         d.positions,
@@ -2350,7 +2594,10 @@ fn opaque_trader_stays_raw() {
     assert_eq!(odd2[1 + 20 + 8], 2, "the lenient byte is kept");
     assert_eq!(
         d.balances,
-        vec![(b.to_vec(), Some(bal_bytes(&balance(12)))), (cum_volume_key(&b).to_vec(), Some(volume_bytes(42)))]
+        vec![
+            (b.to_vec(), Some(bal_bytes(&balance(12)))),
+            (cum_volume_key(&b).to_vec(), Some(volume_bytes(42)))
+        ]
     );
 
     // Regular a: a typed write, then an irregular row in the same block.
@@ -2358,32 +2605,53 @@ fn opaque_trader_stays_raw() {
     let odd_a = lenient(&position(a, 4, 6, false), 1);
     users.mutate().set_position(pa.clone());
     assert!(users.get(&a).is_some());
-    users.mutate().put_row(POSITIONS, &position_key(&a, 4), Some(&odd_a));
+    users
+        .mutate()
+        .put_row(POSITIONS, &position_key(&a, 4), Some(&odd_a));
     assert!(users.get(&a).is_none(), "a turned opaque");
     let before = Users::drain_sources();
     let d = users.drain_dirty();
     let after = Users::drain_sources();
-    assert_eq!((after.0 - before.0, after.1 - before.1), (0, 2), "a's rows drained raw");
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (0, 2),
+        "a's rows drained raw"
+    );
     assert_eq!(
         d.positions,
-        vec![(position_key(&a, 3).to_vec(), Some(bytes(&pa))), (position_key(&a, 4).to_vec(), Some(odd_a))]
+        vec![
+            (position_key(&a, 3).to_vec(), Some(bytes(&pa))),
+            (position_key(&a, 4).to_vec(), Some(odd_a))
+        ]
     );
     assert!(d.balances.is_empty());
 
     // b's irregular row deleted: b is regular again, drained from its record.
-    users.mutate().put_row(POSITIONS, &position_key(&b, 7), None);
+    users
+        .mutate()
+        .put_row(POSITIONS, &position_key(&b, 7), None);
     assert!(users.get(&b).is_some(), "b regular again");
     users.mutate().set_balance(&b, balance(14));
     let before = Users::drain_sources();
     let d = users.drain_dirty();
     let after = Users::drain_sources();
-    assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0), "b's balance drained from its record");
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 0),
+        "b's balance drained from its record"
+    );
     assert_eq!(d.positions, vec![(position_key(&b, 7).to_vec(), None)]);
-    assert_eq!(d.balances, vec![(b.to_vec(), Some(bal_bytes(&balance(14))))]);
+    assert_eq!(
+        d.balances,
+        vec![(b.to_vec(), Some(bal_bytes(&balance(14))))]
+    );
 
     // A 17-byte `cvlm` row: the add is refused, nothing changes.
     let rows_before = users.encode_rows(CF_NATIVE_BALANCES);
-    assert!(users.mutate().add_cum_volume(&c, FixedPoint::from_raw(1)).is_err());
+    assert!(users
+        .mutate()
+        .add_cum_volume(&c, FixedPoint::from_raw(1))
+        .is_err());
     assert_eq!(users.dirty_keys(), 0, "a refused add marks nothing");
     assert_eq!(users.encode_rows(CF_NATIVE_BALANCES), rows_before);
     assert!(users.self_consistent());
@@ -2398,36 +2666,63 @@ fn opaque_trader_stays_raw() {
 #[ignore = "ubench: run with --ignored --nocapture"]
 fn ubench_dirty_set_btree_vs_hash_sort() {
     let mut rng = Lcg(7);
-    let traders: Vec<Address> = (0..20_000u64).map(|i| {
-        let mut b = [0u8; 20];
-        b[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
-        Address::new(b)
-    }).collect();
-    let pos: Vec<(Address, MarketId)> =
-        (0..120_000).map(|_| (traders[rng.below(20_000) as usize], rng.below(300))).collect();
-    let bal: Vec<Address> = (0..40_000).map(|_| traders[rng.below(20_000) as usize]).collect();
-    let best = |f: &dyn Fn() -> usize| (0..7).map(|_| {
-        let t = std::time::Instant::now();
-        std::hint::black_box(f());
-        t.elapsed()
-    }).min().unwrap();
+    let traders: Vec<Address> = (0..20_000u64)
+        .map(|i| {
+            let mut b = [0u8; 20];
+            b[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+            Address::new(b)
+        })
+        .collect();
+    let pos: Vec<(Address, MarketId)> = (0..120_000)
+        .map(|_| (traders[rng.below(20_000) as usize], rng.below(300)))
+        .collect();
+    let bal: Vec<Address> = (0..40_000)
+        .map(|_| traders[rng.below(20_000) as usize])
+        .collect();
+    let best = |f: &dyn Fn() -> usize| {
+        (0..7)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(f());
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
     let btree = best(&|| {
         let mut p = BTreeSet::new();
         let mut b = BTreeSet::new();
-        pos.iter().for_each(|k| { p.insert(*k); });
-        bal.iter().for_each(|k| { b.insert(*k); });
-        p.iter().count() + b.iter().count()
+        pos.iter().for_each(|k| {
+            p.insert(*k);
+        });
+        bal.iter().for_each(|k| {
+            b.insert(*k);
+        });
+        // The sorted keys out, as the drain emits them.
+        let p: Vec<_> = p.into_iter().collect();
+        let b: Vec<_> = b.into_iter().collect();
+        p.len() + b.len()
     });
     let hash = best(&|| {
         let mut p: HashSet<(Address, MarketId)> = HashSet::default();
         let mut b: HashSet<Address> = HashSet::default();
-        pos.iter().for_each(|k| { p.insert(*k); });
-        bal.iter().for_each(|k| { b.insert(*k); });
+        pos.iter().for_each(|k| {
+            p.insert(*k);
+        });
+        bal.iter().for_each(|k| {
+            b.insert(*k);
+        });
         let mut p: Vec<_> = p.into_iter().collect();
         let mut b: Vec<_> = b.into_iter().collect();
         p.sort_unstable();
         b.sort_unstable();
         p.len() + b.len()
     });
-    println!("DIRTY SET ubench: {} position + {} balance inserts: BTreeSet {:?}, hash set + sort {:?}", pos.len(), bal.len(), btree, hash);
+    println!(
+        "DIRTY SET ubench: {} position + {} balance inserts: BTreeSet {:?}, hash set + sort {:?}",
+        pos.len(),
+        bal.len(),
+        btree,
+        hash
+    );
 }

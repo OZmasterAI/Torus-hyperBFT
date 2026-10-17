@@ -1139,8 +1139,25 @@ impl FrozenPending {
     /// dirty sets' rows serialized at freeze (`Users::drain_dirty_into` in
     /// torus-bridge). Panics on an unregistered CF (a code bug, as in
     /// [`Self::with_deletes`]).
-    pub fn put_rows(&mut self, cf: &str, rows: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>) {
-        let _ = (cf, rows.into_iter().count());
+    pub fn put_rows(
+        &mut self,
+        cf: &str,
+        rows: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
+    ) {
+        let id = intern_cf(cf).expect("put_rows: CF is registered");
+        let cfp = self.state.cf_mut(id);
+        for (key, value) in rows {
+            match value {
+                Some(value) => {
+                    cfp.deletes.remove(key.as_slice());
+                    cfp.writes.insert(key, value);
+                }
+                None => {
+                    cfp.writes.remove(key.as_slice());
+                    cfp.deletes.insert(key);
+                }
+            }
+        }
     }
 
     /// Item 6 Phase 5 (tests): the set's writes (`Some`) and tombstones
@@ -1149,7 +1166,9 @@ impl FrozenPending {
     #[cfg(any(test, feature = "test-reference-paths"))]
     pub fn rows(&self, cf: &str) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         intern_cf(cf).map_or_else(Vec::new, |id| {
-            cf_stream(self.state.cf(id)).map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect()
+            cf_stream(self.state.cf(id))
+                .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
+                .collect()
         })
     }
 
@@ -4258,10 +4277,10 @@ mod tests {
         StateBackend::delete_cf_raw(&reference, CF_NATIVE_POSITIONS, b"p-c").unwrap();
         StateBackend::put_cf_raw(&reference, CF_NATIVE_MARKETS, b"m", b"cold").unwrap();
         let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
-            (b"p-a".to_vec(), None),          // write -> tombstone
+            (b"p-a".to_vec(), None),                // write -> tombstone
             (b"p-c".to_vec(), Some(b"3".to_vec())), // tombstone -> write
             (b"p-d".to_vec(), Some(b"4".to_vec())),
-            (b"p-old".to_vec(), None),        // a durable row deleted
+            (b"p-old".to_vec(), None), // a durable row deleted
         ];
         for (k, v) in &rows {
             match v {
@@ -4291,15 +4310,32 @@ mod tests {
         let frozen = Arc::new(frozen);
         let child = NativeStateOverlay::with_parent(db.clone(), Some(frozen.clone()));
         let read = |k: &[u8]| StateBackend::get_cf_raw(&child, CF_NATIVE_POSITIONS, k).unwrap();
-        assert_eq!((read(b"p-a"), read(b"p-c"), read(b"p-old")), (None, Some(b"3".to_vec()), None));
-        assert_eq!(StateBackend::iterate_cf(&child, CF_NATIVE_POSITIONS, None).unwrap().len(), 3);
-        frozen.flush_with_native_trie_stats(&db, Some(7), None, None).unwrap();
+        assert_eq!(
+            (read(b"p-a"), read(b"p-c"), read(b"p-old")),
+            (None, Some(b"3".to_vec()), None)
+        );
+        assert_eq!(
+            StateBackend::iterate_cf(&child, CF_NATIVE_POSITIONS, None)
+                .unwrap()
+                .len(),
+            3
+        );
+        frozen
+            .flush_with_native_trie_stats(&db, Some(7), None, None)
+            .unwrap();
         let durable = |cf| StateBackend::iterate_cf(&db, cf, None).unwrap();
         assert_eq!(
             durable(CF_NATIVE_POSITIONS),
-            vec![(b"p-b".to_vec(), b"2".to_vec()), (b"p-c".to_vec(), b"3".to_vec()), (b"p-d".to_vec(), b"4".to_vec())]
+            vec![
+                (b"p-b".to_vec(), b"2".to_vec()),
+                (b"p-c".to_vec(), b"3".to_vec()),
+                (b"p-d".to_vec(), b"4".to_vec())
+            ]
         );
-        assert_eq!(durable(CF_NATIVE_BALANCES), vec![(b"b".to_vec(), b"5".to_vec())]);
+        assert_eq!(
+            durable(CF_NATIVE_BALANCES),
+            vec![(b"b".to_vec(), b"5".to_vec())]
+        );
     }
 
     /// s63 (port of item 6a, 4298728): flushing a frozen set WITH a sidecar
