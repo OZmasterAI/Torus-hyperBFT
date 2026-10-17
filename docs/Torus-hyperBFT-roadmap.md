@@ -344,6 +344,18 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 ### Trading UI *(parallel, not on the critical path)*
 - The `torus-trading-app` repo planned in `research/writing-plan-trading-app.md` exists on crab (`/home/crab/projects/torus-trading-app`, last commit 2026-09-28; this line said "never created" until s94). Its proposal status type lacks `"Failed"`, which the RPC can return since `e439982`: add it (plan row 79). Phase 1 (limit and market orders, book, positions) can start once P0 has landed. The leverage slider, cross/isolated toggle and TP/SL panels are blocked on P2 and P3.
 
+### Pre-testnet decisions *(owner revisits these before the testnet launch; added s126)*
+- **Header re-send code default (`TORUS_HEADER_RESEND_MS`).** Benches and the devnet run 250 ms (`devnet/wsl/env.sh`,
+  `devnet/docker-compose.yml`, from archy's s58 bundle), but the code default is still 3 s, so a testnet or validator
+  node started without the variable re-sends a lost proposal header after 3 s and hits the lost-proposal timeouts the
+  benches no longer see (section 77: 33-47 timeouts per 300 s cell at 3 s vs 3 at 250 ms; cost about 100-160 header
+  re-sends per node per 300 s). Options: (a) code default 250 ms (one constant + test; 18c recommendation), (b) set
+  250 ms in the testnet/validator configs only, (c) keep 3 s and rely on the rate-limiter fix (per-validator header
+  budget, archy's follow-up), which makes the re-send a backup. Owner s126: decide pre-testnet.
+- **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
+  with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
+  100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.
+
 ---
 
 ## Dependency graph (the ordering *is* the deliverable)
