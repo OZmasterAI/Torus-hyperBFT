@@ -6212,9 +6212,10 @@ impl TorusApp {
     /// Runs on the consensus thread, bounded: two point reads (the tree's
     /// prune pointer, the GC state), two `MultiGet`s over this block's hashes
     /// (body presence, latest references), one iterator over at most
-    /// [`crate::da_gc::DA_GC_LIMITS`] aged rows and one `WriteBatch` to the
-    /// consensus DB (plus a body write on a restore). Timed by
-    /// `torus_da_gc_seconds`.
+    /// [`crate::da_gc::DA_GC_LIMITS`] aged rows (and one over their
+    /// re-inclusion markers, normally none) and one `WriteBatch` to the
+    /// consensus DB (plus a body write on a restore), all linear in this
+    /// block's hashes and the aged rows. Timed by `torus_da_gc_seconds`.
     /// To move it off this thread, send `(height, hashes, shard_count)` over a
     /// channel to one dedicated thread that runs the same pass, in order:
     /// a late pass only lengthens the window; a lost one leaves that height's

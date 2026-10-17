@@ -17,7 +17,7 @@
 //! ([`NativeDaStore::gc_committed`]; the window policy is
 //! `torus_consensus::da_gc`). Bodies of uncommitted actions stay.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use alloy_primitives::B256;
@@ -78,19 +78,54 @@ const DA_GC_ROW_KEY_LEN: usize = DA_GC_ROW_PREFIX.len() + 8;
 /// GC state, `frontier (8 BE) ++ next_record (8 BE)` ([`DaGcState`]).
 /// Outside the row prefix (`-` sorts before `/`), so no row scan meets it.
 const DA_GC_STATE_KEY: &[u8] = b"\xffda-gc-state";
-/// Latest reference of a committed hash: `DA_GC_REF_PREFIX ++ hash` -> the
-/// highest recorded height whose row lists it (8 BE). Codex P1: a hash that
-/// two committed heights reference (a re-inclusion) is moved out of the
-/// earlier, still pending row when the later one is recorded, so each hash is
-/// listed by exactly one row, its latest, and its body goes when that
-/// reference expires. 43-byte keys, outside the row prefix like the state key.
+/// Latest reference of a committed hash: `DA_GC_REF_PREFIX ++ hash` ->
+/// `height (8 BE) ++ shard_count (u16 BE)` of the highest recorded row that
+/// lists it. Codex P1: a hash that two committed heights reference (a
+/// re-inclusion) is moved out of the earlier, still pending row when the
+/// later one is recorded (a [`DA_GC_MOVED_PREFIX`] marker), so only its
+/// latest row deletes it, when that reference expires. 43-byte keys, outside
+/// the row prefix like the state key.
 const DA_GC_REF_PREFIX: &[u8; 11] = b"\xffda-gc-ref/";
 const DA_GC_REF_KEY_LEN: usize = DA_GC_REF_PREFIX.len() + 32;
+/// A hash moved out of an earlier row: `DA_GC_MOVED_PREFIX ++ height (8 BE)
+/// ++ hash` -> empty, `height` being the earlier row's. The earlier row is
+/// never rewritten (Codex P2: a block re-including one hash from each of
+/// many pending rows would rewrite all of them on the consensus thread): its
+/// GC skips the hashes its markers name and deletes the markers with it.
+/// 51-byte keys, outside the row prefix (`-` sorts before `/`).
+const DA_GC_MOVED_PREFIX: &[u8; 11] = b"\xffda-gc-mov/";
+const DA_GC_MOVED_KEY_LEN: usize = DA_GC_MOVED_PREFIX.len() + 8 + 32;
 
 fn da_gc_ref_key(hash: &[u8]) -> [u8; DA_GC_REF_KEY_LEN] {
     let mut key = [0u8; DA_GC_REF_KEY_LEN];
     key[..DA_GC_REF_PREFIX.len()].copy_from_slice(DA_GC_REF_PREFIX);
     key[DA_GC_REF_PREFIX.len()..].copy_from_slice(hash);
+    key
+}
+
+fn encode_da_gc_ref(height: u64, shard_count: u16) -> [u8; 10] {
+    let mut value = [0u8; 10];
+    value[..8].copy_from_slice(&height.to_be_bytes());
+    value[8..].copy_from_slice(&shard_count.to_be_bytes());
+    value
+}
+
+/// `(height, shard_count)`, `None` when malformed.
+fn decode_da_gc_ref(value: &[u8]) -> Option<(u64, u16)> {
+    let value: &[u8; 10] = value.try_into().ok()?;
+    Some((
+        u64::from_be_bytes(value[..8].try_into().expect("8 bytes")),
+        u16::from_be_bytes([value[8], value[9]]),
+    ))
+}
+
+/// The marker of `hash` moved out of the row of `height`; with an empty
+/// `hash`, the lower bound of the markers of the rows at or above `height`.
+fn da_gc_moved_key(height: u64, hash: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(DA_GC_MOVED_KEY_LEN);
+    key.extend_from_slice(DA_GC_MOVED_PREFIX);
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(hash);
     key
 }
 
@@ -151,6 +186,37 @@ fn decode_da_gc_row(row: &[u8]) -> Option<(u16, &[u8])> {
         return None;
     }
     Some((u16::from_be_bytes([row[0], row[1]]), &row[2..]))
+}
+
+/// Walk `markers` (ascending, bounded to the marker keys) through the
+/// markers at or below `through`, deleting each in `batch`; `marked` ends up
+/// holding the hashes of those AT `through`. One below it has no row left
+/// (none in a consistent store) and just goes.
+fn take_da_gc_markers(
+    markers: &mut rocksdb::DBRawIterator<'_>,
+    batch: &mut rocksdb::WriteBatch,
+    cf: &rocksdb::ColumnFamily,
+    through: u64,
+    marked: &mut HashSet<[u8; 32]>,
+) -> Result<(), StateError> {
+    marked.clear();
+    let at = DA_GC_MOVED_PREFIX.len();
+    while let Some(key) = markers.key() {
+        // A 32-byte body key can share the prefix: never treat it as a marker.
+        if key.len() == DA_GC_MOVED_KEY_LEN {
+            let h = u64::from_be_bytes(key[at..at + 8].try_into().expect("8 bytes"));
+            if h > through {
+                break;
+            }
+            if h == through {
+                marked.insert(key[at + 8..].try_into().expect("32 bytes"));
+            }
+            batch.delete_cf(cf, key);
+        }
+        markers.next();
+    }
+    markers.status()?;
+    Ok(())
 }
 
 /// Per-pass bounds of [`NativeDaStore::gc_committed`].
@@ -399,25 +465,26 @@ impl NativeDaStore {
     /// retention runs ahead of the pruner, which removes at most 64 heights
     /// per commit). `u64::MAX` = no bound, `0` = delete nothing.
     ///
-    /// A hash can be committed again at a later height (a re-inclusion). Each
-    /// hash is listed only by the row of its LATEST recorded height: a durable
-    /// per-hash reference ([`DA_GC_REF_PREFIX`]) finds the earlier row, which
-    /// loses the hash in the same batch, so the body and its shards go when
-    /// the latest reference expires (Codex P1), every index written under
-    /// any of its rows (the later row keeps the larger shard count, Codex
-    /// P2). A `height` below one already recorded is a replay and records
-    /// nothing.
+    /// A hash can be committed again at a later height (a re-inclusion). Only
+    /// the row of its LATEST recorded height deletes it: a durable per-hash
+    /// reference ([`DA_GC_REF_PREFIX`]) finds the earlier row, and a marker
+    /// written in the same batch makes that row's GC skip the hash, so the
+    /// body and every shard written for it go when the latest reference
+    /// expires (Codex P1, P2). A `height` below one already recorded is a
+    /// replay and records nothing.
     ///
-    /// One atomic `WriteBatch` per pass (the row, the references, any earlier
-    /// row a re-inclusion rewrites, the deletes and the GC state), bounded by
-    /// `limits`; the first due row is always taken whole, so the GC always
-    /// progresses. The rows live next to the bodies (non-32-byte keys), so a
-    /// crash never splits a row from its bodies and a restart leaves none
-    /// behind. Empty `hashes` records nothing; a `retention` of 0 counts as 1.
+    /// One atomic `WriteBatch` per pass (the row, the references, the markers
+    /// of a re-inclusion, the deletes and the GC state), bounded by `limits`;
+    /// the first due row is always taken whole, so the GC always progresses.
+    /// The rows live next to the bodies (non-32-byte keys), so a crash never
+    /// splits a row from its bodies and a restart leaves none behind. Empty
+    /// `hashes` records nothing; a `retention` of 0 counts as 1.
     ///
     /// Cost per pass: one point read (the GC state), one `MultiGet` of the
     /// recorded hashes' reference keys (normally all bloom-filter misses), a
-    /// bounded iterator over the due rows, one batch.
+    /// bounded iterator over the due rows and one over their markers (normally
+    /// none), one batch. The record is linear in `hashes` whatever earlier
+    /// rows they come from (Codex P2).
     pub fn gc_committed(
         &self,
         height: u64,
@@ -481,17 +548,16 @@ impl NativeDaStore {
 
     /// Add the row of `height` and the latest-reference keys of `hashes` to
     /// `batch`. A hash whose reference names an earlier row still pending (at
-    /// or above `frontier`) is a re-inclusion: that row is rewritten without
-    /// it (deleted when it empties) and the hash goes to `moved`. The rewrite
-    /// is a read-modify-write of one row per earlier height, only on a
-    /// re-inclusion; the membership tests are set lookups (Codex P2).
+    /// or above `frontier`) is a re-inclusion: a marker moves it out of that
+    /// row and it goes to `moved`. Linear in `hashes`: no earlier row is read
+    /// or rewritten (Codex P2).
     ///
     /// The new row takes the largest shard count of the rows it took hashes
-    /// from (Codex P2): a moved hash's shards were custodied under that count
-    /// (a larger validator set, say), and its latest expiry must delete every
-    /// index written. The new row's other hashes then also get deletes for
-    /// indices they never had: tombstones, only on a re-inclusion after a set
-    /// shrink.
+    /// from (each reference carries its row's, Codex P2): a moved hash's
+    /// shards were custodied under that count (a larger validator set, say),
+    /// and its latest expiry must delete every index written. The new row's
+    /// other hashes then also get deletes for indices they never had:
+    /// tombstones, only on a re-inclusion after a set shrink.
     fn record_row(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -504,7 +570,6 @@ impl NativeDaStore {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let ref_keys: Vec<[u8; DA_GC_REF_KEY_LEN]> =
             hashes.iter().map(|h| da_gc_ref_key(h.as_slice())).collect();
-        let mut earlier: BTreeMap<u64, HashSet<[u8; 32]>> = BTreeMap::new();
         let mut row_shard_count = shard_count;
         let refs =
             self.db
@@ -512,50 +577,32 @@ impl NativeDaStore {
                 .batched_multi_get_cf(cf, ref_keys.iter().map(|k| k.as_slice()), false);
         for (hash, slot) in hashes.iter().zip(refs) {
             let Some(value) = slot? else { continue };
-            let Ok(prev) = <[u8; 8]>::try_from(&value[..]).map(u64::from_be_bytes) else {
+            let Some((prev, prev_shards)) = decode_da_gc_ref(&value) else {
                 continue;
             };
             if (frontier..height).contains(&prev) {
-                earlier.entry(prev).or_default().insert(hash.0);
-            }
-        }
-        for (prev, detach) in earlier {
-            let key = da_gc_row_key(prev);
-            if let Some(row) = self.db.get_cf_raw(CF_NATIVE_PENDING, &key)? {
-                if let Some((row_shards, listed)) = decode_da_gc_row(&row) {
-                    let kept: Vec<B256> = listed
-                        .chunks_exact(32)
-                        .filter(|h| !detach.contains(*h))
-                        .map(B256::from_slice)
-                        .collect();
-                    if kept.len() < listed.len() / 32 {
-                        row_shard_count = row_shard_count.max(row_shards);
-                    }
-                    if kept.is_empty() {
-                        batch.delete_cf(cf, key);
-                    } else {
-                        batch.put_cf(cf, key, encode_da_gc_row(row_shards, &kept));
-                    }
+                row_shard_count = row_shard_count.max(prev_shards);
+                if moved.insert(hash.0) {
+                    batch.put_cf(cf, da_gc_moved_key(prev, hash.as_slice()), []);
                 }
             }
-            moved.extend(detach);
         }
         batch.put_cf(
             cf,
             da_gc_row_key(height),
             encode_da_gc_row(row_shard_count, hashes),
         );
-        let at = height.to_be_bytes();
+        let reference = encode_da_gc_ref(height, row_shard_count);
         for key in &ref_keys {
-            batch.put_cf(cf, key, at);
+            batch.put_cf(cf, key, reference);
         }
         Ok(())
     }
 
     /// Add the deletes of the rows in `[frontier, last_due]` to `batch`, within
     /// `limits`: each listed body, its reference and its shards (bar the
-    /// hashes in `moved`), and the row. Returns the new frontier when any row
-    /// went.
+    /// hashes in `moved` and those the row's markers name), the row and its
+    /// markers. Returns the new frontier when any row went.
     fn gc_due_rows(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -574,6 +621,14 @@ impl NativeDaStore {
         opts.set_iterate_upper_bound(da_gc_row_key(last_due + 1).to_vec());
         let mut it = self.db.inner().raw_iterator_cf_opt(cf, opts);
         it.seek(start);
+        // The markers of the same heights, walked in step with the rows.
+        let markers_start = da_gc_moved_key(frontier, &[]);
+        let mut opts = rocksdb::ReadOptions::default();
+        opts.set_iterate_lower_bound(markers_start.clone());
+        opts.set_iterate_upper_bound(da_gc_moved_key(last_due + 1, &[]));
+        let mut markers = self.db.inner().raw_iterator_cf_opt(cf, opts);
+        markers.seek(markers_start);
+        let mut marked: HashSet<[u8; 32]> = HashSet::new();
         let mut next_frontier = last_due + 1;
         let mut deletes = 0usize;
         while let (Some(key), Some(value)) = (it.key(), it.value()) {
@@ -600,9 +655,16 @@ impl NativeDaStore {
             if row_shards > 0 && shards_cf.is_none() {
                 shards_cf = Some(self.db.cf_handle(CF_NATIVE_SHARDS)?);
             }
+            take_da_gc_markers(&mut markers, batch, cf, h, &mut marked)?;
             for hash in row_hashes.chunks_exact(32) {
-                // Re-included at this pass's height: the new row owns it.
+                // Re-included at this pass's height: the new row owns it (and
+                // the marker this pass wrote for this row goes with the row).
                 if moved.contains(hash) {
+                    batch.delete_cf(cf, da_gc_moved_key(h, hash));
+                    continue;
+                }
+                // Re-included at a later, still pending height.
+                if marked.contains(hash) {
                     continue;
                 }
                 batch.delete_cf(cf, hash);
@@ -622,6 +684,10 @@ impl NativeDaStore {
             it.next();
         }
         it.status()?;
+        if !out.backlog {
+            // Every row up to `last_due` went: a marker left there has no row.
+            take_da_gc_markers(&mut markers, batch, cf, last_due, &mut marked)?;
+        }
         Ok((out.rows_deleted > 0).then_some(next_frontier))
     }
 
@@ -1290,6 +1356,7 @@ mod tests {
         assert_ne!(DA_GC_ROW_KEY_LEN, 32);
         assert_ne!(DA_GC_STATE_KEY.len(), 32);
         assert_ne!(DA_GC_REF_KEY_LEN, 32);
+        assert_ne!(DA_GC_MOVED_KEY_LEN, 32);
         let (_dir, store) = temp_store();
         let a = dummy_action(1);
         store.put(&a).unwrap();
@@ -1460,10 +1527,10 @@ mod tests {
     /// consensus thread, so moving the hashes out of the earlier row, and
     /// skipping them when that row ages out in the same pass, must stay
     /// linear. Self-calibrated against recording the same hashes fresh (the
-    /// same `MultiGet`, row and references): the linear pass costs under 2x
-    /// that, the quadratic membership scans (16,000^2 hash compares, twice)
-    /// over 20x (debug build; 6x splits them). Three tries, so one
-    /// scheduling stall cannot fail it.
+    /// same `MultiGet`, row and references): the linear pass costs 2-3x
+    /// that (a marker per moved hash), the quadratic membership scans
+    /// (16,000^2 hash compares, twice) over 20x (debug build; 8x splits
+    /// them). Three tries, so one scheduling stall cannot fail it.
     #[test]
     fn gc_reinclusion_of_a_large_block_stays_linear() {
         const N: u64 = 16_000;
@@ -1490,7 +1557,7 @@ mod tests {
                 (N, 1, 0)
             );
             let ratio = reinclude.as_secs_f64() / fresh.as_secs_f64().max(1e-6);
-            if ratio < 6.0 {
+            if ratio < 8.0 {
                 return;
             }
             ratios.push(ratio);
@@ -1560,6 +1627,128 @@ mod tests {
         for hash in [ha, hb, hc] {
             assert_eq!(shard_indices(&store, &hash, 7), Vec::<u16>::new());
         }
+        assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
+    }
+
+    /// Codex P2 sibling (finding 1's class): a block that re-includes one
+    /// hash from each of many pending rows (a Byzantine proposer can build
+    /// one) must cost what recording its own hashes costs, not what reading
+    /// and rewriting every row they came from costs. 64 rows of 2,000 hashes,
+    /// one re-included from each, self-calibrated against the mean cost of
+    /// recording one hash in the setup: the re-inclusion costs under 2x
+    /// that per re-included hash, rewriting the 64 rows (128,000 hashes) over
+    /// 100 times (debug build; 15x splits them). Then the re-included bodies
+    /// stay until their latest reference expires and nothing is left behind.
+    #[test]
+    fn gc_reinclusion_across_many_rows_stays_linear() {
+        const ROWS: u64 = 64;
+        const PER_ROW: u64 = 2_000;
+        const W: u64 = 4;
+        let actions: Vec<_> = (0..ROWS).map(dummy_action).collect();
+        let reincluded: Vec<B256> = actions.iter().map(compute_action_hash).collect();
+        let filler = |row: u64, i: u64| {
+            let mut seed = [0u8; 16];
+            seed[..8].copy_from_slice(&row.to_be_bytes());
+            seed[8..].copy_from_slice(&i.to_be_bytes());
+            alloy_primitives::keccak256(seed)
+        };
+        let mut ratios = Vec::new();
+        for _ in 0..3 {
+            let (_dir, store) = temp_store();
+            store.put_batch(&actions).unwrap();
+            // Heights 10..10 + ROWS; keep_from 0, so nothing is due yet.
+            let started = std::time::Instant::now();
+            for row in 0..ROWS {
+                let mut hashes: Vec<B256> = (1..PER_ROW).map(|i| filler(row, i)).collect();
+                hashes.push(reincluded[row as usize]);
+                store
+                    .gc_committed(10 + row, &hashes, 0, W, 0, LIMITS)
+                    .unwrap();
+            }
+            let per_hash = started.elapsed().as_secs_f64() / (ROWS * PER_ROW) as f64;
+            let at = 10 + ROWS;
+            let started = std::time::Instant::now();
+            let out = store
+                .gc_committed(at, &reincluded, 0, W, 0, LIMITS)
+                .unwrap();
+            let ratio = started.elapsed().as_secs_f64() / (per_hash * ROWS as f64).max(1e-9);
+            assert_eq!(out.references_moved, ROWS);
+            if ratio >= 15.0 {
+                ratios.push(ratio);
+                continue;
+            }
+            // Every earlier row ages out on the first pass; the re-included
+            // bodies go with row `at`.
+            for tip in at + 1..=at + W {
+                store
+                    .gc_committed(tip, &[], 0, W, UNCAPPED, LIMITS)
+                    .unwrap();
+                for (i, a) in actions.iter().enumerate() {
+                    assert_eq!(present(&store, a), tip < at + W, "body {i} at tip {tip}");
+                }
+            }
+            assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
+            return;
+        }
+        panic!("re-including {ROWS} hashes from {ROWS} rows cost {ratios:.1?} x recording them");
+    }
+
+    /// Markers across a bounded pass: a pass stopped by its row limit leaves
+    /// the next row's markers for the next pass (its moved hash stays), and a
+    /// marker without a row (none in a consistent store) goes once the GC
+    /// passes its height.
+    #[test]
+    fn gc_markers_survive_a_backlog_and_orphans_go() {
+        const W: u64 = 4;
+        let one_row = DaGcLimits {
+            max_rows: 1,
+            max_deletes: 1 << 20,
+        };
+        let (_dir, store) = temp_store();
+        let actions: Vec<_> = (1..=4).map(dummy_action).collect();
+        let h: Vec<B256> = actions.iter().map(compute_action_hash).collect();
+        store.put_batch(&actions).unwrap();
+        // Rows 10 [x, y] and 11 [x', y']; 12 re-includes x and x'.
+        store
+            .gc_committed(10, &[h[0], h[1]], 0, W, 0, LIMITS)
+            .unwrap();
+        store
+            .gc_committed(11, &[h[2], h[3]], 0, W, 0, LIMITS)
+            .unwrap();
+        let out = store
+            .gc_committed(12, &[h[0], h[2]], 0, W, 0, LIMITS)
+            .unwrap();
+        assert_eq!(out.references_moved, 2);
+        // Orphan markers: below every row, and above every row (height 13).
+        for (height, hash) in [(3, h[1]), (13, h[3])] {
+            store
+                .db
+                .put_cf_raw(
+                    CF_NATIVE_PENDING,
+                    &da_gc_moved_key(height, hash.as_slice()),
+                    &[],
+                )
+                .unwrap();
+        }
+        let live = |store: &NativeDaStore| -> Vec<bool> {
+            actions.iter().map(|a| present(store, a)).collect()
+        };
+        // 15: rows 10 and 11 are due, the limit takes 10 only.
+        let out = store
+            .gc_committed(15, &[], 0, W, UNCAPPED, one_row)
+            .unwrap();
+        assert_eq!((out.rows_deleted, out.backlog), (1, true));
+        assert_eq!(live(&store), [true, false, true, true]);
+        // 16: row 11 (its marker kept x'), then the limit stops before 12.
+        let out = store
+            .gc_committed(16, &[], 0, W, UNCAPPED, one_row)
+            .unwrap();
+        assert_eq!((out.rows_deleted, out.backlog), (1, true));
+        assert_eq!(live(&store), [true, false, true, false]);
+        // 17: row 12 takes x and x', and the pass drains the marker at 13.
+        let out = store.gc_committed(17, &[], 0, W, UNCAPPED, LIMITS).unwrap();
+        assert_eq!((out.rows_deleted, out.backlog), (1, false));
+        assert_eq!(live(&store), [false; 4]);
         assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
     }
 }
