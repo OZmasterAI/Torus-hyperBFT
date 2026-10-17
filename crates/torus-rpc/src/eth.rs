@@ -1154,27 +1154,34 @@ impl EthApiServer for RpcState {
         }
         // Binary search, as geth's `eth/gasestimator` `Estimate`. Invariant:
         // `lo` fails, `hi` succeeds. The gas the run at the cap used
-        // lower-bounds the limit (geth `lo = result.UsedGas - 1`; it covers
-        // the intrinsic gas, so no tried limit fails pre-execution): a plain
-        // transfer estimates exactly 21000. A run that FAILS at a tried limit
-        // (out of gas, or a revert that only happens with less gas, e.g. an
-        // inner call starved by the 63/64 rule) raises `lo`; an ERROR (a DB
-        // read error, an internal error: not about gas) returns at once,
-        // never a gas value. Every try is the cap's tx with only the limit
-        // changed (same defaulted nonce).
-        let mut lo: u64 = result.gas_used.saturating_sub(1).max(21_000 - 1);
+        // lower-bounds the limit (geth `lo = result.UsedGas - 1`): a plain
+        // transfer estimates exactly 21000. That gas is AFTER the refund, so
+        // it can be below the intrinsic gas (a cleared slot refunds up to a
+        // fifth of the gas spent): `lo` never starts below the least limit
+        // revm accepts (`intrinsic_gas`, the intrinsic gas and, from Prague,
+        // the EIP-7623 floor; geth's `UsedGas` is at least that floor) less
+        // one. A try that FAILS raises `lo`: out of gas, a revert that only
+        // happens with less gas (e.g. an inner call starved by the 63/64
+        // rule), or a limit below the intrinsic gas / floor (geth
+        // `gasestimator.execute`: `if errors.Is(err, core.ErrIntrinsicGas)
+        // { return true, nil, nil // Special case, raise gas limit }`, and
+        // `core.ErrFloorDataGas` alike). Any other ERROR (a DB read error,
+        // an internal error: not about gas) returns at once, never a gas
+        // value (geth: `if err != nil { return 0, nil, err }`). Every try is
+        // the cap's tx with only the limit changed (same defaulted nonce).
+        let mut lo: u64 = result
+            .gas_used
+            .max(torus_evm::intrinsic_gas(&tx_env))
+            .max(21_000)
+            - 1;
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
             let mut try_env = tx_env.clone();
             try_env.gas_limit = mid;
-            let (r, _) = self
-                .executor
-                .execute_call(&self.state, &block_env, try_env)
-                .map_err(|e| err(RpcError::Evm(e.to_string())))?;
-            if r.success {
-                hi = mid;
-            } else {
-                lo = mid;
+            match self.executor.execute_call(&self.state, &block_env, try_env) {
+                Ok((r, _)) if r.success => hi = mid,
+                Ok(_) | Err(torus_evm::EvmError::IntrinsicGasTooLow(_)) => lo = mid,
+                Err(e) => return Err(err(RpcError::Evm(e.to_string()))),
             }
         }
         Ok(hex_u64(hi))
