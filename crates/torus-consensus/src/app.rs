@@ -3339,8 +3339,24 @@ impl ExecutionContext {
                             return;
                         }
                     }
-                    if let Err(e) = self.commit_block_metadata(torus_block, &validated.receipts) {
-                        tracing::error!(%e, height, "failed to commit block metadata");
+                    // Receipts / logs / tx indices are written only here, so a
+                    // storage fault (RocksDB, a missing CF) fail-stops BEFORE the
+                    // flush: the marker stays below the block and the restart's
+                    // replay rewrites them (an applied block is never re-executed).
+                    // A serialization error is deterministic (same block and
+                    // receipts on every node): only logged, as before.
+                    match self.commit_block_metadata(torus_block, &validated.receipts) {
+                        Ok(_) => {}
+                        Err(torus_bridge::BridgeError::State(e)) => {
+                            self.fail_stop_on_fault(
+                                torus_block,
+                                fold_header,
+                                "EVM block metadata (receipts) write",
+                                &e,
+                            );
+                            return;
+                        }
+                        Err(e) => tracing::error!(%e, height, "failed to commit block metadata"),
                     }
                     bundle = validated.bundle;
                 }
@@ -3372,7 +3388,8 @@ impl ExecutionContext {
         // (`header_record` above): folded into the native overlay below, or
         // the prefix of the marker-only flush. `commit_block_metadata` above
         // (EVM success) still writes the same bytes in its own batch, with the
-        // receipts; the marker no longer depends on that write landing.
+        // receipts; the header in the marker batch does not depend on that
+        // write (a failed one fail-stops the block above, for its receipts).
         debug_assert!(!(pipelined && fold_header), "a pipelined block's header is dispatch-durable");
         if let Some(ref m) = self.metrics {
             m.exec_evm_seconds
@@ -29566,7 +29583,11 @@ mod crash_recovery_tests {
     /// rides the marker's batch. Serial and pipelined. RED before for the
     /// empty block (standalone put), the empty epoch-boundary block
     /// (standalone put, native phase) and the EVM-success blocks (header only
-    /// in `commit_block_metadata`'s separate batch).
+    /// in `commit_block_metadata`'s separate batch). An EVM-success block
+    /// whose `commit_block_metadata` fails now fail-stops before its flush
+    /// (its receipts are written nowhere else;
+    /// `evm_block_metadata_write_fault_fail_stops_block`): not applied, the
+    /// marker stays on the prefix, which keeps its headers.
     #[test]
     fn applied_block_header_rides_the_marker_batch_on_every_path() {
         let key = k256::ecdsa::SigningKey::from_slice(&[0x68; 32]).unwrap();
@@ -29578,7 +29599,8 @@ mod crash_recovery_tests {
             b
         };
         let ms = block_time_ms(1);
-        // (what, blocks: the last one runs with the seam, EVM tx expected to run)
+        // (what, blocks: the last one runs with the seam, EVM-success block:
+        // the failed metadata write fail-stops it)
         let cases: Vec<(&str, Vec<TorusBlock>, bool)> = vec![
             ("empty block (marker-only flush)", vec![make_block(1, vec![]), make_block(2, vec![])], false),
             (
@@ -29604,7 +29626,7 @@ mod crash_recovery_tests {
             ),
         ];
         let mut failures = Vec::new();
-        for (what, mut blocks, evm_ran) in cases {
+        for (what, mut blocks, evm_fail_stops) in cases {
             link_blocks(&mut blocks);
             let (last, prefix) = blocks.split_last().unwrap();
             for on in [false, true] {
@@ -29619,13 +29641,26 @@ mod crash_recovery_tests {
                 ctx.execute_committed_block_with(last, vec![], DurableRows::default());
                 ctx.test_replay_fault = None;
                 assert!(ctx.pipeline_barrier(), "{what} on={on}");
-                assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what} on={on}: no fail-stop");
+                assert_eq!(
+                    ctx.exec_failed.load(Ordering::SeqCst),
+                    evm_fail_stops,
+                    "{what} on={on}: fail-stop"
+                );
+                let applied = if evm_fail_stops {
+                    prefix.last().unwrap()
+                } else {
+                    last
+                };
                 assert_eq!(
                     read_native_applied_height(&db),
-                    Some(last.header.height),
+                    Some(applied.header.height),
                     "{what} on={on}"
                 );
-                assert_eq!(r02_evm_nonce(&db, &key), u64::from(evm_ran), "{what} on={on}: EVM tx ran");
+                assert_eq!(
+                    r02_evm_nonce(&db, &key),
+                    0,
+                    "{what} on={on}: no EVM tx applied"
+                );
                 let missing = hdr_missing_headers(&db, &blocks);
                 if !missing.is_empty() {
                     failures.push(format!("{what} on={on}: applied, header(s) {missing:?} missing"));
