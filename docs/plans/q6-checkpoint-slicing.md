@@ -387,6 +387,38 @@ Small branch commit on `perf/q6-ckpt-slicing`, no behaviour change:
   Dirty, Writeback, per-node ctx switches) in every step 0 / Z / A/B cell; add a 10 Hz option (tooling only),
   since a window is ~1 s.
 - Per-slice, redo-write and fence histograms come with A1 (they have nothing to time before).
+- **Built (s127, branch `perf/q6-ckpt-slicing`), W's checkpoint write only.** The consensus-thread perf context of
+  the second bullet is NOT built (the step 0 build was scoped to W); the consensus-thread waits keep their wall
+  timers (`torus_commit_manifest_seconds`, `torus_commit_persist_write_seconds`).
+  - `torus_state::write_stages::measure` (`WriteStageSplit`) wraps the one `target.write` of `flush_checkpoint`
+    (backend.rs, the flush with `ChainSrc::Rows`); block and marker flushes are not measured. Level: RocksDB
+    `kEnableTime` = 6, which in rust-rocksdb 0.24 is `PerfStatsLevel::OutOfBound` (its enum predates
+    `kEnableWait`, so its `EnableTime` = 5 = C++ `kEnableTimeAndCPUTimeExceptForMutex`, no mutex timers; pinned by
+    `measure_times_the_db_mutex`). Set back to RocksDB's default `kEnableCount` right after (also on unwind).
+  - Histograms (one observation per checkpoint, 50 us .. 6.5 s buckets): `torus_exec_checkpoint_db_write_seconds`
+    (the write wall; equals that flush's `write_db_seconds`), `torus_exec_checkpoint_db_{wal,memtable,delay,pre_post}_seconds`,
+    `torus_exec_checkpoint_db_residual_seconds` (wall - WAL - memtable - delay - pre/post), and the overlapping
+    signals `torus_exec_checkpoint_db_{mutex,cond_wait}_seconds`.
+  - Gauges `torus_exec_checkpoint_db_write_start_ms` / `_end_ms` (unix ms of the last checkpoint DB write), plus one
+    info line per checkpoint on W, `checkpoint db write`, with height, start_ms, end_ms, batch_bytes and the split
+    in ms. The line is exact even when two checkpoints fall between two scrapes.
+  - What the stages hold with pipelined write (verified in db_impl_write.cc:970-1160, write_thread.cc:765-845):
+    pre/post runs through `JoinBatchGroup`, so it CONTAINS the WAL-stage queue wait. The residual holds the wait
+    for memtable-writer leadership (`AwaitState` in `ExitAsBatchGroupLeader`), `PreprocessWrite`'s
+    `write_scheduling_flushes_compactions_time` (memtable switch, `WaitForPendingWrites`; neither is in the C API)
+    and, on W, rust-rocksdb's drop of the consumed `WriteBatch` (`write_opt` takes it by value). That drop runs
+    after RocksDB has released the queue. Measured on 18c for an uncontended 200 MB batch: wall 1.92-1.94 s, WAL
+    1.08-1.31 s, memtable 0.58-0.81 s, pre/post < 0.1 ms, residual 37-55 ms, and a separate drop of the same batch
+    46-60 ms. So W's residual is mostly the free, and the end timestamp is ~50 ms later than the queue release.
+  - Overhead: clock reads only at the timers inside this one call (no per-key timers on the insert path), a
+    perf-context create / reset and 7 reads. Scratch probe on a loaded 18c: +~10 us per measured call (1-key
+    writes 40 -> 50 us); a 20 MB write was inside the noise. One call per checkpoint, so ~10 us per 5-15 s. Zero
+    elsewhere (the level is thread-local).
+  - Harness: `run-cell.sh` samples every series' `_sum` / `_count` and both gauges (WIDE_COLS). `summarize.py`
+    reports `checkpoint_db_writes` and `checkpoint_db_<stage>_ms_per_call` per node over the phase window.
+    `ckpt-samples.txt` (2 s) and `metrics-1hz.txt.gz` pick up the `torus_exec_checkpoint_*` lines unchanged.
+    `soak-sampler.py` with `SOAK_DIRTY_HZ=10` in the driver's environment adds `host-dirty-10hz.tsv` (epoch,
+    Dirty and Writeback kB).
 - Bench: rides along step Z's control arm (no separate campaign). Output: the WAL / insert / switch / residual split
   of the consensus-thread waits in windows. If the switch dominates, slicing helps less than estimated (each switch
   still waits for one slice) and the memtable sizes are a cheaper lever; if WAL + insert dominate, slicing is aimed
