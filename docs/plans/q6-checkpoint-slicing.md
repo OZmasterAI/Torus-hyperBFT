@@ -387,9 +387,8 @@ Small branch commit on `perf/q6-ckpt-slicing`, no behaviour change:
   Dirty, Writeback, per-node ctx switches) in every step 0 / Z / A/B cell; add a 10 Hz option (tooling only),
   since a window is ~1 s.
 - Per-slice, redo-write and fence histograms come with A1 (they have nothing to time before).
-- **Built (s127, branch `perf/q6-ckpt-slicing`), W's checkpoint write only.** The consensus-thread perf context of
-  the second bullet is NOT built (the step 0 build was scoped to W); the consensus-thread waits keep their wall
-  timers (`torus_commit_manifest_seconds`, `torus_commit_persist_write_seconds`).
+- **Built (s127, branch `perf/q6-ckpt-slicing`), both bullets.** W's checkpoint write first (8401e65c, sub-bullets
+  below up to "Harness"), then the consensus thread's two state-DB writes (last sub-bullet, "Consensus thread").
   - `torus_state::write_stages::measure` (`WriteStageSplit`) wraps the one `target.write` of `flush_checkpoint`
     (backend.rs, the flush with `ChainSrc::Rows`); block and marker flushes are not measured. Level: RocksDB
     `kEnableTime` = 6, which in rust-rocksdb 0.24 is `PerfStatsLevel::OutOfBound` (its enum predates
@@ -418,9 +417,33 @@ Small branch commit on `perf/q6-ckpt-slicing`, no behaviour change:
     reports `checkpoint_db_writes` and `checkpoint_db_<stage>_ms_per_call` per node over the phase window.
     `ckpt-samples.txt` (2 s) and `metrics-1hz.txt.gz` pick up the `torus_exec_checkpoint_*` lines unchanged.
     `soak-sampler.py` with `SOAK_DIRTY_HZ=10` in the driver's environment adds `host-dirty-10hz.tsv` (epoch,
-    Dirty and Writeback kB).
+    Dirty and Writeback kB). The generated campaign driver's `scrub_env` keeps `SOAK_DIRTY_HZ` exported through
+    launch and run (Codex P2 on 04b7be2d: it was unset, so no 10 Hz file), and `cell()` keeps it out of the cell's env.
+  - **Consensus thread** (second bullet): the same `write_stages::measure` (now `pub`) wraps the commit-manifest
+    put (`persist_commit_manifest_timed`, the `put_cf_raw` in `on_committed_block`) and the commit-persist
+    WriteBatch write (`persist_committed_block_durably_timed`, in `dispatch_to_exec`), on hotstuff-algo, only when
+    metrics are attached. The level goes back to `kEnableCount` right after each, also on an error or unwind.
+    Histograms, one observation per call (10 us .. 5 s buckets): `torus_commit_manifest_db_<stage>_seconds` and
+    `torus_commit_persist_db_<stage>_seconds`, stage in {wal, memtable, delay, pre_post, residual} plus the
+    overlapping signals {mutex, cond_wait} (telemetry `DbWriteStageHistograms`). Names: the existing wall timer's
+    family (`torus_commit_manifest_*`, `torus_commit_persist_*`) + W's `_db_<stage>` suffix. No `_db_write`
+    histogram: the walls stay `torus_commit_manifest_seconds` and `torus_commit_persist_write_seconds`, which now
+    observe the measured call's own wall. So WAL + memtable + delay + pre/post + residual = wall per call, and
+    older cells stay comparable. The manifest wall no longer includes the error log on a failed put, and neither
+    does the persist wall. The residual here holds the memtable-leader wait, `PreprocessWrite` and, for the
+    persist write, the (small) batch drop.
+    Overhead (release scratch probe on a loaded 18c, load 14-29, 2 runs, interleaved plain vs measured on a real
+    StateDb): a 400 B put went from 5.7-5.8 to 8.3-8.4 us at p50 (+2.6 us; p90 +3 us), and a header + 64 KiB
+    body + delete batch went from 241-251 to 248-259 us (+6-8 us, inside its p90 noise). So it costs ~10 us per
+    committed block on hotstuff-algo, and nothing elsewhere (thread-local level).
+    Harness: `run-cell.sh` samples the 14 series' `_sum` / `_count` plus `torus_commit_persist_write_seconds_count`
+    (WIDE_COLS). `summarize.py` reports per node `commit_{manifest,persist}_db_<stage>_ms_per_call` and
+    `commit_persist_write_ms_per_call` over the phase window, and `commit_db_split`, the in-vs-out split. A 1 s
+    sample interval is `in` if it touches a checkpoint DB-write span (the start / end gauges, 1 s resolution):
+    `own` uses this node's W, `any` uses any node's. For each it gives checkpoint_db_writes, in_s / out_s and, per
+    write and side, calls, `write_ms_per_call` (the wall) and `<stage>_ms_per_call`.
 - Bench: rides along step Z's control arm (no separate campaign). Output: the WAL / insert / switch / residual split
-  of the consensus-thread waits in windows. If the switch dominates, slicing helps less than estimated (each switch
+  of the consensus-thread waits in windows (`commit_db_split.own`, per write: in vs out). If the switch dominates, slicing helps less than estimated (each switch
   still waits for one slice) and the memtable sizes are a cheaper lever; if WAL + insert dominate, slicing is aimed
   right.
 
@@ -435,9 +458,13 @@ Small branch commit on `perf/q6-ckpt-slicing`, no behaviour change:
   minute RISE (more WAL, flush, compaction). Windows are 3x as frequent, so overall p99 is not comparable: compare
   the in-vs-out gap, with windows cut from the step 0 timestamps (DB-write span, any node) so enough out-of-window
   time remains (3 nodes x ~0.3 s per 5 s ~ 20-30% busy; scrape-widened windows would cover nearly all of it).
-- Measured per arm: batch bytes mean / max and checkpoint DB write s (W_db); manifest put (`torus_commit_manifest_seconds`)
-  and persist wait p99 / max and > 250 ms counts in vs out (X); in-vs-out block p99 gap (G); block p99 overall;
-  matched/s; state-DB bytes written per s; Dirty / Writeback max in windows.
+- Measured per arm: batch bytes mean / max and checkpoint DB write s (W_db) with its stage split
+  (`checkpoint_db_<stage>_ms_per_call`); manifest put (`torus_commit_manifest_seconds`)
+  and persist wait p99 / max and > 250 ms counts in vs out (X); the in-vs-out stage split of both consensus-thread
+  writes (`commit_db_split`, `own` windows: WAL / memtable / delay / pre-post / residual, mutex and cond-wait), which
+  says WHY X waits (WAL or insert = the batch in flight; residual / cond-wait = the memtable switch or the leader
+  queue); in-vs-out block p99 gap (G); block p99 overall; matched/s; state-DB bytes written per s; Dirty / Writeback
+  max in windows (`host-dirty-10hz.tsv` with `SOAK_DIRTY_HZ=10`).
 - **Go / no-go for A1:**
   - GO if W_db falls by >= 40% and X and G each fall by at least half as much in relative terms (e.g. W_db -50% ->
     X and G -25% or more): the waits scale with the batch, A1 is aimed right.
