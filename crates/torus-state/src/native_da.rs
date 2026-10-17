@@ -332,12 +332,19 @@ impl NativeDaStore {
     /// Records `hashes` (the committed block's action hashes; `shard_count`
     /// erasure shards were custodied per body, 0 = none) as the retention row
     /// of `height`, then deletes the bodies, the shards and the row of every
-    /// recorded height `h` with `h + retention <= height`, so a body survives
-    /// `retention` heights past its own. The additive form keeps everything
+    /// recorded height `h` with `h + retention <= height` AND `h < keep_from`,
+    /// so a body survives `retention` heights past its own and is never
+    /// deleted at or above `keep_from`. The additive form keeps everything
     /// while `height < retention` (`height - retention` floored at 0 deleted
     /// height 0: the July RH4 bug). Bodies no row lists (never committed, or
     /// expired: pool expiry is local-clock and a skewed peer may still include
     /// them) are never touched.
+    ///
+    /// `keep_from` is the caller's bound from what the node can still serve:
+    /// the consensus app passes the block tree's durable prune pointer minus a
+    /// margin (Codex P1: a window derived from the configured block-tree
+    /// retention runs ahead of the pruner, which removes at most 64 heights
+    /// per commit). `u64::MAX` = no bound, `0` = delete nothing.
     ///
     /// One atomic `WriteBatch` per pass, bounded by `limits`; the first due row
     /// is always taken whole, so the GC always progresses. The rows live next
@@ -350,6 +357,7 @@ impl NativeDaStore {
         hashes: &[B256],
         shard_count: u16,
         retention: u64,
+        keep_from: u64,
         limits: DaGcLimits,
     ) -> Result<DaGcOutcome, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
@@ -362,8 +370,13 @@ impl NativeDaStore {
             );
         }
         let mut out = DaGcOutcome::default();
-        // Rows at or below `last_due` are due: `h + retention <= height`.
-        if let Some(last_due) = height.checked_sub(retention.max(1)) {
+        // Rows at or below `last_due` are due: `h + retention <= height` and
+        // `h < keep_from`.
+        let last_due = height
+            .checked_sub(retention.max(1))
+            .zip(keep_from.checked_sub(1))
+            .map(|(window, served)| window.min(served));
+        if let Some(last_due) = last_due {
             let frontier = match self.db.get_cf_raw(CF_NATIVE_PENDING, DA_GC_FRONTIER_KEY)? {
                 Some(bytes) if bytes.len() == 8 => {
                     u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes"))
@@ -866,6 +879,9 @@ mod tests {
         max_deletes: 1 << 20,
     };
 
+    /// No `keep_from` bound: the window alone decides.
+    const UNCAPPED: u64 = u64::MAX;
+
     fn present(store: &NativeDaStore, action: &SignedNativeAction) -> bool {
         store.contains(&compute_action_hash(action).0).unwrap()
     }
@@ -890,11 +906,17 @@ mod tests {
         store.put_batch(&[a.clone(), b.clone()]).unwrap();
         let (ha, hb) = (compute_action_hash(&a), compute_action_hash(&b));
         // Retention 4: committed at 10 -> deletable from height 14.
-        store.gc_committed(10, &[ha], 0, 4, LIMITS).unwrap();
-        store.gc_committed(11, &[hb], 0, 4, LIMITS).unwrap();
+        store
+            .gc_committed(10, &[ha], 0, 4, UNCAPPED, LIMITS)
+            .unwrap();
+        store
+            .gc_committed(11, &[hb], 0, 4, UNCAPPED, LIMITS)
+            .unwrap();
         for height in 12..=13 {
             assert_eq!(
-                store.gc_committed(height, &[], 0, 4, LIMITS).unwrap(),
+                store
+                    .gc_committed(height, &[], 0, 4, UNCAPPED, LIMITS)
+                    .unwrap(),
                 DaGcOutcome::default()
             );
         }
@@ -903,7 +925,7 @@ mod tests {
             "both inside the window at 13"
         );
 
-        let out = store.gc_committed(14, &[], 0, 4, LIMITS).unwrap();
+        let out = store.gc_committed(14, &[], 0, 4, UNCAPPED, LIMITS).unwrap();
         assert_eq!(
             (out.rows_deleted, out.bodies_deleted, out.backlog),
             (1, 1, false)
@@ -914,11 +936,11 @@ mod tests {
             "height 11 is still inside the window at 14"
         );
 
-        let out = store.gc_committed(15, &[], 0, 4, LIMITS).unwrap();
+        let out = store.gc_committed(15, &[], 0, 4, UNCAPPED, LIMITS).unwrap();
         assert_eq!((out.rows_deleted, out.bodies_deleted), (1, 1));
         assert!(!present(&store, &b), "height 11 aged out at 15");
         assert_eq!(
-            store.gc_committed(16, &[], 0, 4, LIMITS).unwrap(),
+            store.gc_committed(16, &[], 0, 4, UNCAPPED, LIMITS).unwrap(),
             DaGcOutcome::default()
         );
         // Every row went with its bodies; only the frontier key remains.
@@ -934,10 +956,12 @@ mod tests {
         let genesis = dummy_action(7);
         store.put(&genesis).unwrap();
         store
-            .gc_committed(0, &[compute_action_hash(&genesis)], 0, 4, LIMITS)
+            .gc_committed(0, &[compute_action_hash(&genesis)], 0, 4, UNCAPPED, LIMITS)
             .unwrap();
         for tip in 1..4 {
-            let out = store.gc_committed(tip, &[], 0, 4, LIMITS).unwrap();
+            let out = store
+                .gc_committed(tip, &[], 0, 4, UNCAPPED, LIMITS)
+                .unwrap();
             assert_eq!(out.bodies_deleted, 0, "tip {tip} < retention 4");
             assert!(
                 present(&store, &genesis),
@@ -946,7 +970,7 @@ mod tests {
         }
         assert_eq!(
             store
-                .gc_committed(4, &[], 0, 4, LIMITS)
+                .gc_committed(4, &[], 0, 4, UNCAPPED, LIMITS)
                 .unwrap()
                 .bodies_deleted,
             1
@@ -965,10 +989,19 @@ mod tests {
             .put_batch(&[committed.clone(), uncommitted.clone()])
             .unwrap();
         store
-            .gc_committed(1, &[compute_action_hash(&committed)], 0, 2, LIMITS)
+            .gc_committed(
+                1,
+                &[compute_action_hash(&committed)],
+                0,
+                2,
+                UNCAPPED,
+                LIMITS,
+            )
             .unwrap();
         for height in 2..200 {
-            store.gc_committed(height, &[], 0, 2, LIMITS).unwrap();
+            store
+                .gc_committed(height, &[], 0, 2, UNCAPPED, LIMITS)
+                .unwrap();
         }
         assert!(!present(&store, &committed));
         assert!(
@@ -990,9 +1023,9 @@ mod tests {
             .unwrap();
         let (hc, hu) = (compute_action_hash(&c), compute_action_hash(&u));
         store
-            .gc_committed(5, &[hc], params.n as u16, 1, LIMITS)
+            .gc_committed(5, &[hc], params.n as u16, 1, UNCAPPED, LIMITS)
             .unwrap();
-        let out = store.gc_committed(6, &[], 0, 1, LIMITS).unwrap();
+        let out = store.gc_committed(6, &[], 0, 1, UNCAPPED, LIMITS).unwrap();
         assert_eq!((out.bodies_deleted, out.shard_keys_deleted), (1, 3));
         for i in 0..params.n as u16 {
             assert!(
@@ -1017,7 +1050,7 @@ mod tests {
         for (i, chunk) in actions.chunks(3).enumerate() {
             let hashes: Vec<_> = chunk.iter().map(compute_action_hash).collect();
             store
-                .gc_committed(100 + i as u64, &hashes, 0, 1000, LIMITS)
+                .gc_committed(100 + i as u64, &hashes, 0, 1000, UNCAPPED, LIMITS)
                 .unwrap();
         }
         assert!(actions.iter().all(|a| present(&store, a)));
@@ -1026,7 +1059,7 @@ mod tests {
             max_rows: 8,
             max_deletes: 7,
         };
-        let out = store.gc_committed(110, &[], 0, 1, ops).unwrap();
+        let out = store.gc_committed(110, &[], 0, 1, UNCAPPED, ops).unwrap();
         assert_eq!(
             (out.rows_deleted, out.bodies_deleted, out.backlog),
             (2, 6, true)
@@ -1035,13 +1068,13 @@ mod tests {
             max_rows: 3,
             max_deletes: 1000,
         };
-        let out = store.gc_committed(111, &[], 0, 1, rows).unwrap();
+        let out = store.gc_committed(111, &[], 0, 1, UNCAPPED, rows).unwrap();
         assert_eq!((out.rows_deleted, out.backlog), (3, true));
         let tiny = DaGcLimits {
             max_rows: 8,
             max_deletes: 1,
         };
-        let out = store.gc_committed(112, &[], 0, 1, tiny).unwrap();
+        let out = store.gc_committed(112, &[], 0, 1, UNCAPPED, tiny).unwrap();
         assert_eq!(
             (out.rows_deleted, out.bodies_deleted, out.backlog),
             (1, 3, true),
@@ -1049,7 +1082,7 @@ mod tests {
         );
         let mut deleted = 2 + 3 + 1;
         for tip in 113.. {
-            let out = store.gc_committed(tip, &[], 0, 1, rows).unwrap();
+            let out = store.gc_committed(tip, &[], 0, 1, UNCAPPED, rows).unwrap();
             deleted += out.rows_deleted;
             if !out.backlog {
                 break;
@@ -1067,14 +1100,18 @@ mod tests {
         let a = dummy_action(1);
         store.put(&a).unwrap();
         let ha = compute_action_hash(&a);
-        store.gc_committed(20, &[ha], 0, 8, LIMITS).unwrap();
+        store
+            .gc_committed(20, &[ha], 0, 8, UNCAPPED, LIMITS)
+            .unwrap();
         drop(store);
         let reopened = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
         assert!(present(&reopened, &a));
-        reopened.gc_committed(20, &[ha], 0, 8, LIMITS).unwrap();
+        reopened
+            .gc_committed(20, &[ha], 0, 8, UNCAPPED, LIMITS)
+            .unwrap();
         assert_eq!(
             reopened
-                .gc_committed(28, &[], 0, 8, LIMITS)
+                .gc_committed(28, &[], 0, 8, UNCAPPED, LIMITS)
                 .unwrap()
                 .bodies_deleted,
             1
@@ -1092,7 +1129,7 @@ mod tests {
         let a = dummy_action(1);
         store.put(&a).unwrap();
         store
-            .gc_committed(3, &[compute_action_hash(&a)], 0, 9, LIMITS)
+            .gc_committed(3, &[compute_action_hash(&a)], 0, 9, UNCAPPED, LIMITS)
             .unwrap();
         assert_eq!(bookkeeping_keys(&store), 1, "the row of height 3");
         use crate::StateBackend;
@@ -1102,7 +1139,38 @@ mod tests {
             }
         }
         // A native-empty height records nothing.
-        store.gc_committed(4, &[], 0, 9, LIMITS).unwrap();
+        store.gc_committed(4, &[], 0, 9, UNCAPPED, LIMITS).unwrap();
+        assert_eq!(bookkeeping_keys(&store), 1);
+    }
+
+    /// Codex P1 (finding 1): `keep_from` bounds the window. A row at or above
+    /// it stays however old, goes on the first pass after the bound passes
+    /// it, and the frontier never skips a row the bound held back.
+    #[test]
+    fn gc_never_deletes_at_or_above_keep_from() {
+        let (_dir, store) = temp_store();
+        let actions: Vec<_> = (1..=3).map(dummy_action).collect();
+        store.put_batch(&actions).unwrap();
+        for (i, a) in actions.iter().enumerate() {
+            let h = 10 + i as u64;
+            store
+                .gc_committed(h, &[compute_action_hash(a)], 0, 1, 0, LIMITS)
+                .unwrap();
+        }
+        assert!(actions.iter().all(|a| present(&store, a)), "keep_from 0");
+        // Every row aged out of window 1 by 100; keep_from 11 frees height 10.
+        let out = store.gc_committed(100, &[], 0, 1, 11, LIMITS).unwrap();
+        assert_eq!((out.rows_deleted, out.backlog), (1, false));
+        assert!(!present(&store, &actions[0]));
+        assert!(present(&store, &actions[1]) && present(&store, &actions[2]));
+        assert_eq!(
+            store.gc_committed(101, &[], 0, 1, 0, LIMITS).unwrap(),
+            DaGcOutcome::default(),
+            "keep_from 0 deletes nothing"
+        );
+        let out = store.gc_committed(102, &[], 0, 1, 13, LIMITS).unwrap();
+        assert_eq!(out.rows_deleted, 2, "the bound passed 11 and 12");
+        assert!(actions.iter().all(|a| !present(&store, a)));
         assert_eq!(bookkeeping_keys(&store), 1);
     }
 }

@@ -1329,20 +1329,22 @@ impl Mempool {
     }
 
     /// RH4: one durable DA body GC pass for a dispatched committed height,
-    /// see [`NativeDaStore::gc_committed`]. Best effort: a store error is
-    /// logged and reads as nothing done. The aged rows stay and the next pass
-    /// retries them; a `height` whose row was not written keeps its bodies.
+    /// see [`NativeDaStore::gc_committed`] (`keep_from`: no row at or above
+    /// it is deleted). Best effort: a store error is logged and reads as
+    /// nothing done. The aged rows stay and the next pass retries them; a
+    /// `height` whose row was not written keeps its bodies.
     pub fn gc_committed_native_da(
         &self,
         height: u64,
         hashes: &[B256],
         shard_count: u16,
         retention: u64,
+        keep_from: u64,
         limits: DaGcLimits,
     ) -> DaGcOutcome {
         match self
             .da_store
-            .gc_committed(height, hashes, shard_count, retention, limits)
+            .gc_committed(height, hashes, shard_count, retention, keep_from, limits)
         {
             Ok(out) => out,
             Err(e) => {

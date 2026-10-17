@@ -4373,7 +4373,14 @@ mod tests {
         // Heights 1..=6, one action each, window 3: at tip 6 heights 1..=3 aged out.
         for (i, hash) in hashes.iter().enumerate() {
             store
-                .gc_committed(i as u64 + 1, &[(*hash).into()], params.n as u16, 3, limits)
+                .gc_committed(
+                    i as u64 + 1,
+                    &[(*hash).into()],
+                    params.n as u16,
+                    3,
+                    u64::MAX,
+                    limits,
+                )
                 .unwrap();
         }
         let served = serve_native_da_bodies(Some(&store), &hashes);

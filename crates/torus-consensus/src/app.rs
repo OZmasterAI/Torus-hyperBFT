@@ -4937,11 +4937,12 @@ pub struct TorusApp {
     /// when the mempool or fetcher is absent (consensus-only tests) — a miss
     /// then fails the view without a handoff, same as before BS-4a.
     da_recovery: Option<DaRecoveryWorker>,
-    /// RH4 durable DA body GC window, in dispatched heights. `None` = off,
-    /// the default: every committed body stays (an archive node, or a test).
-    /// The node sets it from `TORUS_DA_BODY_RETENTION` / the block-tree
-    /// retention ([`crate::da_gc::resolve_da_body_retention`]).
-    da_body_retention: Option<u64>,
+    /// RH4 durable DA body GC: the window in dispatched heights and the
+    /// block tree whose prune pointer bounds it. `None` = off, the default:
+    /// every committed body stays (an archive node, or a test). The node sets
+    /// it from `TORUS_DA_BODY_RETENTION` / the block-tree retention
+    /// ([`crate::da_gc::resolve_da_body_retention`]).
+    da_body_gc: Option<crate::da_gc::DaBodyGc>,
     /// Item 3 (`TORUS_ASYNC_VALIDATE=1`): speculative body validation off the
     /// hotstuff-algo thread. `None` with the flag off (the default) — the
     /// validate path then runs synchronously; cost parity still needs measurement.
@@ -5996,7 +5997,7 @@ impl TorusApp {
             da_fetcher: None,
             shard_fetcher: None,
             da_recovery: None,
-            da_body_retention: None,
+            da_body_gc: None,
             async_validate: None,
             exec_next_height: None,
             deferred_exec: std::collections::BTreeMap::new(),
@@ -6181,24 +6182,28 @@ impl TorusApp {
         self.pre_proposal_tx = Some(tx);
     }
 
-    /// RH4: durable DA body GC window in dispatched heights, `None` = off.
-    /// Call before the replica starts; see [`crate::da_gc`] for the policy
+    /// RH4: durable DA body GC settings, `None` = off. Call before the
+    /// replica starts; see [`crate::da_gc`] for the policy
     /// ([`crate::da_gc::resolve_da_body_retention`]).
-    pub fn set_da_body_retention(&mut self, retention: Option<u64>) {
-        self.da_body_retention = retention;
+    pub fn set_da_body_gc(&mut self, gc: Option<crate::da_gc::DaBodyGc>) {
+        self.da_body_gc = gc;
     }
 
     /// RH4: one durable DA body GC pass for the committed `height` that
     /// dispatch just made durable. Records `hashes` for deletion
-    /// `da_body_retention` dispatched heights later and deletes the bodies (and
-    /// shards) of the heights that aged out. A height is recorded only when its
+    /// `retention` dispatched heights later and deletes the bodies (and
+    /// shards) of the heights that aged out AND whose blocks the block tree
+    /// pruned at least [`crate::da_gc::DA_GC_MARGIN_BLOCKS`] heights ago
+    /// (its durable prune pointer, read each pass; unreadable = delete
+    /// nothing). A height is recorded only when its
     /// body row landed in `CF_BLOCK_BODIES` (`body_durable`): otherwise crash
     /// replay could still need the DA copy, so its bodies stay for good (the
     /// pass still runs for older heights).
     ///
-    /// Runs on the consensus thread, bounded: one point read (the frontier),
-    /// one iterator over at most [`crate::da_gc::DA_GC_LIMITS`] aged rows and
-    /// one `WriteBatch` to the consensus DB. Timed by `torus_da_gc_seconds`.
+    /// Runs on the consensus thread, bounded: two point reads (the tree's
+    /// prune pointer, the GC frontier), one iterator over at most
+    /// [`crate::da_gc::DA_GC_LIMITS`] aged rows and one `WriteBatch` to the
+    /// consensus DB. Timed by `torus_da_gc_seconds`.
     /// To move it off this thread, send `(height, hashes, shard_count)` over a
     /// channel to one dedicated thread that runs the same pass, in order:
     /// a late pass only lengthens the window; a lost one leaves that height's
@@ -6209,8 +6214,7 @@ impl TorusApp {
         hashes: &[torus_types::B256],
         body_durable: bool,
     ) {
-        let (Some(retention), Some(mempool)) = (self.da_body_retention, self.mempool.as_ref())
-        else {
+        let (Some(gc), Some(mempool)) = (self.da_body_gc.as_ref(), self.mempool.as_ref()) else {
             return;
         };
         let record: &[torus_types::B256] = if body_durable {
@@ -6240,11 +6244,19 @@ impl TorusApp {
             0
         };
         let started = std::time::Instant::now();
+        let keep_from = gc.keep_from().unwrap_or_else(|e| {
+            tracing::warn!(
+                height,
+                "DA body GC: block-tree prune pointer unreadable, deleting nothing this pass: {e}"
+            );
+            0
+        });
         let out = mempool.gc_committed_native_da(
             height,
             record,
             shard_count,
-            retention,
+            gc.retention,
+            keep_from,
             crate::da_gc::DA_GC_LIMITS,
         );
         if let Some(ref m) = self.metrics {
@@ -30069,8 +30081,24 @@ mod crash_recovery_tests {
         std::sync::mpsc::Receiver<CommittedBlockMsg>,
     );
 
+    /// Persist the hotstuff block tree's prune pointer in `db` the way the
+    /// pruner does.
+    fn set_tree_frontier(db: &StateDb, frontier: u64) {
+        use hotstuff_rs::block_tree::accessors::internal::{
+            BlockTreeSingleton, BlockTreeWriteBatch,
+        };
+        // SAFETY: test-only direct tree access, no replica runs on this store.
+        let mut bt = unsafe { BlockTreeSingleton::new_unsafe(RocksKVStore::new(db.db_arc())) };
+        let mut wb = BlockTreeWriteBatch::new_unsafe();
+        wb.set_block_tree_pruned_height(hotstuff_rs::types::data_types::BlockHeight::new(frontier))
+            .unwrap();
+        bt.write(wb);
+    }
+
     /// An app over a mempool (whose DA store is the test DB) with a capture
-    /// channel standing in for the execution thread.
+    /// channel standing in for the execution thread. With a window, the test
+    /// DB doubles as the block tree's DB, its pointer far ahead (the window
+    /// alone decides) unless the test moves it.
     fn da_gc_app(state_db: &StateDb, config: &ChainConfig, retention: Option<u64>) -> DaGcFixture {
         let mempool = Arc::new(torus_mempool::Mempool::new(
             state_db.clone(),
@@ -30086,7 +30114,13 @@ mod crash_recovery_tests {
         );
         let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1024);
         app.replace_exec_tx(tx);
-        app.set_da_body_retention(retention);
+        if retention.is_some() {
+            set_tree_frontier(state_db, u64::MAX);
+        }
+        app.set_da_body_gc(retention.map(|retention| crate::da_gc::DaBodyGc {
+            retention,
+            block_tree_db: state_db.clone(),
+        }));
         (app, mempool, metrics, rx)
     }
 
@@ -30275,5 +30309,49 @@ mod crash_recovery_tests {
                 "shard {i} (custody on: deleted with the body)"
             );
         }
+    }
+
+    /// Codex P1 (finding 1) through the dispatch path: a body goes only once
+    /// the block tree's durable prune pointer is DA_GC_MARGIN_BLOCKS past its
+    /// height, however far the window says; an unreadable pointer deletes
+    /// nothing.
+    #[test]
+    fn da_gc_waits_for_the_block_tree_to_prune() {
+        use crate::da_gc::DA_GC_MARGIN_BLOCKS as M;
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let actions: Vec<_> = (1..=16u64).map(sign_claim_rewards).collect();
+        mempool.mirror_native_to_da(&actions).unwrap();
+        // Committed heights (1..=tip) whose body is still in the DA store.
+        let kept = |mempool: &torus_mempool::Mempool, tip: u64| -> Vec<u64> {
+            (1..=tip)
+                .filter(|&h| da_has(mempool, &actions[h as usize - 1]))
+                .collect()
+        };
+        // The tree pruned nothing yet: the window ages 1..=8 out by tip 12,
+        // nothing goes.
+        set_tree_frontier(&state_db, 0);
+        for tip in 1..=12u64 {
+            da_gc_commit(&mut app, tip, vec![actions[tip as usize - 1].clone()]);
+        }
+        assert_eq!(kept(&mempool, 12), (1..=12).collect::<Vec<_>>());
+        // The tree pruned below M + 3: heights 1..=3 may go (h + M <= M + 3).
+        set_tree_frontier(&state_db, M + 3);
+        da_gc_commit(&mut app, 13, vec![actions[12].clone()]);
+        assert_eq!(kept(&mempool, 13), (4..=13).collect::<Vec<_>>());
+        // An unreadable pointer is never read as "pruned".
+        state_db
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                &hotstuff_rs::block_tree::variables::BLOCK_TREE_PRUNED_HEIGHT,
+                b"bad",
+            )
+            .unwrap();
+        da_gc_commit(&mut app, 14, vec![actions[13].clone()]);
+        assert_eq!(kept(&mempool, 14), (4..=14).collect::<Vec<_>>());
+        // The tree caught up: the window decides again (h + 4 <= 15).
+        set_tree_frontier(&state_db, u64::MAX);
+        da_gc_commit(&mut app, 15, vec![actions[14].clone()]);
+        assert_eq!(kept(&mempool, 15), (12..=15).collect::<Vec<_>>());
     }
 }
