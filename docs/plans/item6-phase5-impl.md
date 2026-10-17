@@ -19,7 +19,9 @@ and steps 1-4 before the merge; those anchors are re-checked against main before
 (`feat/item7-step2` `c567b1b3`) merges to main. This plan's `file:line` anchors are re-checked against main after that
 merge, before step 1 (not before: the merge moves them).
 
-**Code references are `file:line` on main `21d238e0`** (= origin/main). Crate paths are under `crates/`.
+**Code references are `file:line` on main `cfa35ed1`** (re-checked before step 1, s128: item 7 step 2 merged; they
+were written on `21d238e0`, before Phase 4 merged). Crate paths are under `crates/`. What moved, what changed meaning
+and what item 7 step 2 means for steps 1-3: section 2 "Anchor re-check on `cfa35ed1`".
 
 Every number below is from the results doc (`docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md`, "section N"), from
 the code or from the Phase 4 plan, unless marked **(estimate)**. The former **TBD (Gate 3)** placeholders are filled
@@ -31,11 +33,11 @@ Proposed (decision 1): **hot state typed and mutated in place; cold state stays 
 - Typed in memory, mutated in place by the executor, one dirty set per structure:
   - `Users` (Phase 4's record: balance, `cum_volume`, positions, sums; plus the open-order count if optional step 4 is
     kept);
-  - books (already typed in `ResidentInner`, `native_executor.rs:3170`). Their rows come from a dirty set instead of
+  - books (already typed in `ResidentInner`, `native_executor.rs:3737`). Their rows come from a dirty set instead of
     `save_order_books`' diff.
 - The per-block change set is the same logical rows as today. At freeze, the typed dirty sets serialize each changed
   row once, and the result is merged with the overlay's pending rows of the cold CFs into the same `FrozenPending`
-  (`backend.rs:951`). The digest, `L`, the published view and the checkpoint keep reading `FrozenPending` unchanged.
+  (`backend.rs:975`). The digest, `L`, the published view and the checkpoint keep reading `FrozenPending` unchanged.
   No consensus change, no state format change, no `h_n` change (D4 a, section 5 "Running state hash").
 - Cold CFs stay on the overlay and R, raw, as today: staking, governance, sessions, oracle, markets, liquidation,
   nonces (decision 2), EVM accounts.
@@ -44,7 +46,7 @@ Proposed (decision 1): **hot state typed and mutated in place; cold state stays 
   set.
 - EVM blocks (serial barriers) keep raw, journalled writes and fold them into `Users` once the journal can no longer
   revert them (decision 4).
-- RPC needs no adapter: validator RPC reads the durable DB (`torus-rpc/src/lib.rs:248`, Phase 3 D10 c), and ingress
+- RPC needs no adapter: validator RPC reads the durable DB (`torus-rpc/src/lib.rs:252`, Phase 3 D10 c), and ingress
   reads the `ReadView` (`torus-state/src/read_view.rs:88`). Both are fed from `FrozenPending`.
 
 No runtime switch (D16). Each step keeps a test-only reference path (today's overlay writes, i.e. the Phase 4 path)
@@ -127,22 +129,72 @@ The `r` rows were examples, not predictions. **Gate 3 reported `r` = 1.931 (sect
 - Not in the plan and as big (section 81.5): Keccak 10-11% of exec (callers lost, asm without frame pointers) and
   malloc / free 6%.
 
-## 2. What changes vs the design doc (code check on main `21d238e0`)
+## 2. What changes vs the design doc (code check on main `21d238e0`, anchors re-checked on `cfa35ed1`)
 
-| # | design says | code on `21d238e0` (and the Phase 4 plan) | consequence |
+| # | design says | code on `cfa35ed1` (and the Phase 4 plan) | consequence |
 |---|---|---|---|
-| 1 | all native consensus state typed in memory | 49 CFs in `ALL_CF_NAMES` (`torus-state/src/cf.rs:266`). Exec-thread write cost sits in positions / balances (cache flush) and book rows; staking, governance, sessions, oracle, markets are written rarely | type the hot state only; decision 1 |
-| 2 | overlay off the hot path | after Phase 4 the reads of the two CFs come from `Users`. Writes still go `put_cf_raw` / `_owned`: RwLock write lock + `key.to_vec()` (+ `value.to_vec()`) + `BTreeMap` insert per row (`backend.rs:2419-2443`), Borsh on the caller (`put_position`, `torus-core/src/position.rs:292-298`), via `PositionCache::flush_all` (`position.rs:757`) and `BalanceCache::flush_all` (`native_executor.rs:396`), timed at `native_executor.rs:7490-7513` | steps 1-2 |
-| 3 | change set produced from typed dirty sets; freeze copy removed | `freeze` is already a move (`mem::replace` under the write lock, `backend.rs:1476`). The digest (`block_digest` :1857 over `for_each_consensus_write` :762; `digest_on_worker` :1213), `L` (`checkpoint_layer.rs:106`), R's delta (`resident_delta_of` :960) and the view all read `FrozenPending` | Phase 5 fills `FrozenPending`'s typed CFs from dirty sets; its consumers are untouched |
-| 4 | RPC through a `StateBackend` adapter over typed state | RPC reads `StateDb` (`torus-rpc/src/lib.rs:248`; `get_position` `torus.rs:1075`, `get_balances` :1155, `get_user_limits` :1234). Ingress reads `ReadView` (`read_view.rs:88`, `publish_ingress_view` `app.rs:2565`). Both are fed from frozen rows | no RPC adapter. `getUserLimits` O(1) from `UserState` is a separate RPC task (not building) |
-| 5 | EVM precompiles through an adapter | precompiles take `&impl StateBackend` over `TorusPrecompiles.journal: NativeStateOverlay` (`torus-evm/src/precompile_provider.rs:34`). Lockbox writes `CF_NATIVE_BALANCES` (`credit_native`, `lockbox.rs:113-125`). EVM reverts use the overlay journal (`begin_tx` / `revert_tx` / `revert_to_checkpoint`, `backend.rs:1542-1633`; `torus-evm/src/executor.rs:327-510`). EVM, slash and epoch blocks run serial (`app.rs:2834-2840`) | keep raw journalled writes at EVM blocks; fold into `Users` after (decision 4) |
-| 6 | windowed nonce set (needs D12 b, "before Phase 5") | D12 is not built. One nonce row per action: check `app.rs:3303-3307`, write `app.rs:3841-3846` | nonces stay raw unless D12 lands; decision 2 |
-| 7 | books done | books are typed (`ResidentInner.books`, `native_executor.rs:3171`). Rows come from a diff: `save_order_books` :5840, `diff_stop_rows` :6281; the deferred modes use `save_order_books_deferred` :6120 | step 3 for Classic. Modes 2/3 keep the diff (Phase 3 refuses an interval with them) |
-| 8 | crab: summary updated inline per fill | `SumsCache` (:1148, moving into `UserState` in Phase 4 step 3), `BlockSums` memo (:1169), `sums_with_changes` (:1033). The mark version moves most blocks with the oracle on (Phase 4 row 5) | inline update is valid within one mark version (step 5). The gate's "same phase without crab" has no binary; decision 6 |
+| 1 | all native consensus state typed in memory | 49 CFs in `ALL_CF_NAMES` (`torus-state/src/cf.rs:301`; incl. item 7 step 2's unhashed `CF_NATIVE_BBO`, 48 on `21d238e0`). Exec-thread write cost sits in positions / balances (cache flush) and book rows; staking, governance, sessions, oracle, markets are written rarely | type the hot state only; decision 1 |
+| 2 | overlay off the hot path | after Phase 4 the reads of the two CFs come from `Users`. Writes still go `put_cf_raw` / `_owned`: RwLock write lock + `key.to_vec()` (+ `value.to_vec()`) + `BTreeMap` insert per row (`backend.rs:2463-2500`), Borsh on the caller (`put_position`, `torus-core/src/position.rs:349-357`), via `PositionCache::flush_all` (`position.rs:883`) and `BalanceCache::flush_all` (`native_executor.rs:407`), timed at `native_executor.rs:8598-8621` | steps 1-2 |
+| 3 | change set produced from typed dirty sets; freeze copy removed | `freeze` is already a move (`mem::replace` under the write lock, `backend.rs:1519-1521`). The digest (`block_digest` :1900 over `for_each_consensus_write` :786; `digest_on_worker` :1254), `L` (`CheckpointLayer` `checkpoint_layer.rs:165`, `merge` :206), R's delta (`resident_delta_of` :984) and the view all read `FrozenPending` | Phase 5 fills `FrozenPending`'s typed CFs from dirty sets; its consumers are untouched |
+| 4 | RPC through a `StateBackend` adapter over typed state | RPC reads `StateDb` (`torus-rpc/src/lib.rs:252`; `get_position` `torus.rs:1112`, `get_balances` :1192, `get_user_limits` :1271). Ingress reads `ReadView` (`read_view.rs:88`, `publish_ingress_view` `app.rs:3066`). Both are fed from frozen rows | no RPC adapter. `getUserLimits` O(1) from `UserState` is a separate RPC task (not building) |
+| 5 | EVM precompiles through an adapter | precompiles take `&impl StateBackend` over `TorusPrecompiles.journal: NativeStateOverlay` (`torus-evm/src/precompile_provider.rs:34`). Lockbox writes `CF_NATIVE_BALANCES` (`credit_native`, `lockbox.rs:113-125`). EVM reverts use the overlay journal (`begin_tx` / `revert_tx` / `revert_to_checkpoint`, `backend.rs:1585-1690`; `torus-evm/src/executor.rs:326-600`, item 7 step 2: `execute_block_lanes` :326 and `execute_block_with_overlay` :497, each with the per-tx journal). EVM and slash blocks run serial, epoch boundaries too unless `TORUS_EPOCH_FAST_PATH` (`app.rs:3391-3397`) | keep raw journalled writes at EVM blocks; fold into `Users` after (decision 4) |
+| 6 | windowed nonce set (needs D12 b, "before Phase 5") | D12 is built (merge `b7b5bd04`, s121): time-major nonce key, every block prunes below block_ms - 60 s. One nonce row per action: check `app.rs:3902-3918` (`check_nonce_window`, then the consumed read), write `app.rs:4485-4490`, prune `app.rs:3775` / `with_deletes` :4898, :4931 | nonces stay raw (decision 2 a); no typed nonce set |
+| 7 | books done | books are typed (`ResidentInner.books`, `native_executor.rs:3738`). Rows come from a diff: `save_order_books` :6884, `diff_stop_rows` :7368; the deferred modes use `save_order_books_deferred` :7202. Item 7 step 2: both save paths end with `write_bbo_rows` (:7000, :7239; fn :7051), one unhashed `CF_NATIVE_BBO` row per dirty market whose top moved (from `dirty_books` + `saved_bbo`) | step 3 for Classic. Modes 2/3 keep the diff (Phase 3 refuses an interval with them) |
+| 8 | crab: summary updated inline per fill | `SumsCache` (moved into `UserState.sums` in Phase 4 step 3, `users.rs:116`), `BlockSums` memo (:1682), `sums_with_changes` (:1561). The mark version moves most blocks with the oracle on (Phase 4 row 5) | inline update is valid within one mark version (step 5). The gate's "same phase without crab" has no binary; decision 6 |
 | 9 | target = 10-market engine cost per fill (~6 µs) at any market count; up to +60-90% vs main | 300-market engine cost is already 3.42-3.47 ms per 1k fills (section 64.1); the estimate predates Phases 1-3 | superseded by the Gate 3 budget (section 1) |
-| 10 | `open_order_count` in `UserState` | counted from the books per call (`order_book.rs:54`, wrapper `native_executor.rs:8997`, `open_at_start` :7019 / :9762); Phase 4 step 5 is conditional (s119) | optional step 4 |
-| 11 | (not in design) | a native batch stages writes in the caches and flushes them at the batch end (`native_executor.rs:7490-7513`); a flush error sets `fatal_error`. Whether any action path writes before its last failure check is not audited | task 2.1 audits it and pins "a rejected action leaves `Users` untouched" |
+| 10 | `open_order_count` in `UserState` | counted from the books per call (`order_book.rs:54`, wrapper `native_executor.rs:10186`, `open_at_start` :8123 / :11174); Phase 4 step 5 is conditional (s119) | optional step 4 |
+| 11 | (not in design) | a native batch stages writes in the caches and flushes them at the batch end (`native_executor.rs:8590-8621`); a flush error sets `fatal_error`. Whether any action path writes before its last failure check is not audited | task 2.1 audits it and pins "a rejected action leaves `Users` untouched" |
 | 12 | (not in design) | `torus-state` cannot name `Position` / `NativeBalance` (Phase 4 row 12) | the write-through goes through Phase 4's byte-level `ResidentSource`, extended with writes |
+
+### Anchor re-check on `cfa35ed1` (s128, before step 1)
+
+Every `file:line` in this plan now points at `cfa35ed1`. Most anchors only moved (Phase 4, D12 and item 7 step 2 added
+code above them). These changed meaning, or were wrong:
+- **Row 6:** D12 is built (it was "not built"). Nonce rows are windowed and pruned every block; decision 2 a holds.
+- **Row 8 / step 2:** `SumsCache` is gone; sums live in `UserState.sums`. `EndResidentJob::run` (`native_executor.rs:4787`)
+  feeds the sums carry from `Users::apply`'s per-trader report (each changed position before / after,
+  `SumsCarry::trader`). Once step 2 mutates `Users` in place there is no delta for `apply` to derive that report
+  from. Step 2 must keep each dirty position's before-image (first touch) or clear the written traders' sums.
+- **Task 2.2 writer list:** `margin.rs:635-701` was wrong on `21d238e0` too: those lines are test-module setup
+  writes. `margin.rs` has no production writer. The production writers are listed below.
+- **Row 5 / task 2.3:** an EVM block now runs two lanes (`execute_block_lanes` `torus-evm/src/executor.rs:326`, item
+  7 step 2), each tx under the overlay journal as before. "After the block's EVM part" now means after both lanes. EVM
+  and slash blocks are still serial barriers (`!has_evm`, `app.rs:3391-3397`). Epoch boundaries are pipelined only
+  with `TORUS_EPOCH_FAST_PATH` (s124, new since `21d238e0`).
+- **Step 4:** the `~10133` call site is now the wrapper `open_order_counts` (`native_executor.rs:10186`), and
+  `open_at_start` is at :8123 and :11174.
+
+**Writers of the two typed CFs on `cfa35ed1`.** These are production writes into the block's overlay. Genesis
+writes the DB directly (`torus-genesis/src/lib.rs:683`).
+- Positions: `PositionCache::flush_all` (`torus-core/src/position.rs:883`, put / delete :891-892; settle batch
+  end `native_executor.rs:8598-8608`; `flush_all_per_row` :906 is the test reference). `PositionManager::apply_fill`
+  (position.rs put :488, delete :491). It runs from the single-action placement fills (`place_order_inner`
+  `native_executor.rs:11564`, :11594) and from liquidation `transfer` / `cross_close` (`liquidation.rs:310-311`,
+  :422-423). Those come from `liquidation_step.rs` backstop :485, the ADL legs :997 and :1114, and the cross close
+  :1201.
+- Balance rows: `BalanceCache::flush_all` (`native_executor.rs:407`, put :414). The order-margin moves
+  `release_order_margin` :11143, `place_order_inner` :11425 and `exec_modify_order` :12669. The close leg of
+  `apply_fill` (position.rs:586). Liquidation `move_collateral` (`liquidation.rs:332-333`, from `liquidation_step.rs`
+  :1016 and :1152, and `backstop`) and `cross_close` :431. Lockbox `deposit_to_native` (`atomic_write`
+  `lockbox.rs:91`, native action `native_executor.rs:13508`), `withdraw_from_native(_to)` (`atomic_write` :181,
+  :13528 and :13548) and `credit_native` (:125, CoreWriter `LockboxDeposit` drain `native_executor.rs:13743`).
+- `cvlm` rows: `add_cum_volume` (`native_executor.rs:10208` -> `put_cum_volume` position.rs:454). It runs at the
+  batch end (:8614-8619) and per single-action fill (:11573, :11603).
+- No production code deletes a balance or `cvlm` row. Only tests do.
+
+**What item 7 step 2 changed that steps 1-3 must account for.**
+- It adds no writer of positions or balances. `EvmUserModify` writes lane rows into `CF_NATIVE_ORACLE`
+  (`evm_lane_key`, `native_executor.rs:13283-13308`). That CF is cold and raw, and lives in R slot 3 and the ingress
+  view. A lockbox deposit queued through CoreWriter is still credited by `credit_native` in a later native block.
+  That makes it a cold writer for task 2.2, not a write inside an EVM tx scope.
+- **bbo rows (step 3):** `save_order_books` and `save_order_books_deferred` both end with `write_bbo_rows`
+  (:7000, :7239). That writes one `CF_NATIVE_BBO` row per market in `dirty_books` whose top moved since
+  `saved_bbo`. Step 3's book dirty set must keep every market whose top can move in `dirty_books`, or emit the bbo
+  rows itself. The CF is unhashed (`running_hash.rs:670`), so `h_n` misses a lost bbo row. The differential compares
+  CF dumps, and the C5 test pins at least one bbo row.
+- The two EVM pools, the lane rows and the per-lane base fees touch no typed CF. The ingress view (`INGRESS_CFS`,
+  `read_view.rs:58`) also answers the EVM lane now (C9). It is fed from `FrozenPending`, which Phase 5 keeps
+  row-identical.
 
 ## 3. Shape of the core
 
@@ -192,12 +244,12 @@ On the Phase 4 head + D12, 300 markets uniform, oracle on and off, interval 15 s
 the exec-thread share and ms per native block of:
 - overlay writes to the two typed CFs: `put_cf_raw` / `put_cf_raw_owned` / `delete_cf_raw` incl. the lock, the key and
   value copies and the `BTreeMap` insert, plus the callers' Borsh encode;
-- `torus_exec_cache_flush_seconds`, settle pass B `merge_disjoint` (`position.rs:729`, `native_executor.rs:388`);
+- `torus_exec_cache_flush_seconds`, settle pass B `merge_disjoint` (`position.rs:855`, `native_executor.rs:399`);
 - `torus_exec_save_books_seconds` and `diff_stop_rows`;
 - `end_resident` rows / users ms and the exec wait; checkpoint settle wait and upkeep; residual untimed;
 - overlay reads of the cold R slots (oracle, markets, liquidation) and sessions on the exec thread (step 6's trigger:
   >= ~1% of exec wall **(estimate)**);
-- the per-fill sums work (`BlockSums::base` :1337, `sums_with_changes`), oracle on vs off (step 5, decision 6);
+- the per-fill sums work (`BlockSums::base` :1904, `sums_with_changes`), oracle on vs off (step 5, decision 6);
 - `open_order_counts` if Phase 4 step 5 was dropped (optional step 4);
 - 10-market cells for engine ms per 1k fills.
 
@@ -235,7 +287,7 @@ The overlay still takes every write. The new path runs next to it in tests and i
 **Task 1.1: `UsersMut` and the dirty sets**
 - Test first (`torus-bridge`, `users_tests.rs` from Phase 4 step 1):
   - `dirty_rows_equal_overlay_rows_every_block`: random blocks over every writer of the two CFs (fills,
-    liquidation, ADL, lockbox credit, `margin.rs` balance writes, `cvlm`, opens / closes / flips, irregular rows, deletes). After each block, the
+    liquidation, ADL, lockbox credit and transfers, order-margin balance writes, `cvlm`, opens / closes / flips, irregular rows, deletes). After each block, the
     rows serialized from the dirty sets equal the overlay's pending rows for positions and balances, byte for byte,
     deletes included.
   - `dirty_rows_sorted_and_once`: each changed key appears once, in `(cf_id, key)` order, whatever the order of
@@ -247,7 +299,7 @@ The overlay still takes every write. The new path runs next to it in tests and i
 
 **Task 1.2: long differential harness (reused by every later step)**
 - Test first: `phase5_differential_long_random` (`torus-consensus`, next to `warm_equals_cold_every_block_serial`
-  `app.rs:24168`). Two nodes on the same random block stream, one on the reference path (overlay writes,
+  `app.rs:28136`). Two nodes on the same random block stream, one on the reference path (overlay writes,
   `test-reference-paths`), one on the typed path. Per block: CF dumps, `h_n`, action results. Covers serial and
   pipelined, interval 0 / every 5 blocks / never, all BookModes, EVM / slash / epoch blocks, a fatal block.
   ~10k blocks in an ignored long variant, ~300 in the default run **(estimate)**.
@@ -261,22 +313,22 @@ Consensus-adjacent write path. Codex torus-adversarial review before step 3.
 
 **Task 2.1: settle, balances and volume on `UsersMut`**
 - Test first:
-  - `rejected_action_leaves_users_untouched`: every rejection path of `execute_batch` (`native_executor.rs:6682`;
+  - `rejected_action_leaves_users_untouched`: every rejection path of `execute_batch` (`native_executor.rs:7772`;
     every rejection reason the batch can return) leaves `Users` and its dirty set equal to before. This also
     audits row 11 of section 2.
   - `phase5_differential_long_random` with the typed path on.
   - P1 / P3 on the in-place record: `sums_cache_equals_reference_on_seeded_sequences`, the liquidation and ADL walk
     tests from Phase 4 step 1.
-  - Goldens A and B (`tests/perf_equivalence_golden.rs:847-889`) unchanged, serial and engine-forced.
+  - Goldens A and B (`tests/perf_equivalence_golden.rs:846-889`) unchanged, serial and engine-forced.
 - Code: settle pass B applies its per-market deltas to `UsersMut` in market order (rule 2); pass A keeps reading
   `Users` immutably. `PositionCache` / `BalanceCache` and their `flush_all` / `merge_disjoint` leave the production
   path (kept for the reference path). `add_cum_volume` goes to `UsersMut`. `freeze` fills the typed CFs from the dirty
-  sets. `EndResidentJob::run` (:4095) no longer applies the two CFs.
+  sets. `EndResidentJob::run` (:4787) no longer applies the two CFs.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`, then `cargo nextest run --workspace $F`.
 
 **Task 2.2: write-through for cold writers (decision 3)**
 - Test first: `cold_raw_write_reaches_users_and_change_set`. A raw `put_cf_raw` / `delete_cf_raw` to positions or
-  balances from a writer outside the settle path (lockbox `credit_native`, `lockbox.rs:113`; liquidation / ADL, `torus-core/src/liquidation.rs`, `liquidation_step.rs`; the balance writes in `margin.rs:635-701`; test writers) is visible to the
+  balances from a writer outside the settle path (lockbox `credit_native`, `lockbox.rs:113`, and the two lockbox `atomic_write`s :91, :181; liquidation / ADL, `torus-core/src/liquidation.rs`, `liquidation_step.rs`; the order-margin balance writes in `native_executor.rs` :11143, :11425, :12669; test writers. `margin.rs:635-701` was wrong: those are test-module setup writes, `margin.rs` has no production writer; full list in "Anchor re-check") is visible to the
   next typed read, lands in the dirty set and is emitted once at freeze.
 - Code: the overlay's write to a typed CF calls the `ResidentSource` write hook (decode, apply, mark dirty) instead of
   the pending map. Opaque rows stay raw.
@@ -298,8 +350,8 @@ Consensus-adjacent write path. Codex torus-adversarial review before step 3.
 - Verify: `cargo nextest run -p torus-evm $F`, `cargo nextest run -E 'rdeps(torus-state)' $F`.
 
 **Task 2.4: guards and warm == cold**
-- Test first: `warm_equals_cold_every_block_{serial,pipelined,...}` (`app.rs:24168-24183`); the R == DB dump test
-  `resident_rows_equal_db_scan_after_every_block_serial_and_pipelined` (`app.rs:21853`), with the two CFs read from
+- Test first: `warm_equals_cold_every_block_{serial,pipelined,...}` (`app.rs:28136-28153`); the R == DB dump test
+  `resident_rows_equal_db_scan_after_every_block_serial_and_pipelined` (`app.rs:25318`), with the two CFs read from
   `Users`; Phase 4's guard tests (marker mismatch, skipped height, fatal block); `users_reads_never_reach_the_deferred_part`.
 - Code: fatal block invalidates `Users`; a rebuild is cold from DB + layers.
 - Verify: `cargo nextest run --workspace $F`.
@@ -326,13 +378,12 @@ Same keep rule as s119: kept only on its own net A/B (counter upkeep netted). De
 **Moved here (owner s120):** Phase 4 step 5 (`6288ebe8`) had no net gain (section 68: walk saved -2.76 ms per 1k fills,
 counter read ~3.7 ms per native block); revisit after step 0, needs a cheaper counter read; drop if still no net gain.
 
-Why it matters: today's `open_order_counts` (`torus-core/src/order_book.rs:54`, called from `native_executor.rs`
-~10133) walks every book for the batch's senders, so its cost grows with markets x senders (1.1% at 300 markets,
+Why it matters: today's `open_order_counts` (`torus-core/src/order_book.rs:54`, called from the wrapper `native_executor.rs:10186`) walks every book for the batch's senders, so its cost grows with markets x senders (1.1% at 300 markets,
 section 81).
 
 **Option a: stored counter in `UserState`** (Phase 4 step 5, `6288ebe8`; section 68: no net gain).
 - Test first: `open_order_count_in_user_equals_book_scan` (Phase 4 step 5's test), serial and with match workers.
-- Code: count deltas from the book dirty sites of step 3 (shared upkeep); `open_at_start` (:7019, :9762) reads the
+- Code: count deltas from the book dirty sites of step 3 (shared upkeep); `open_at_start` (:8123, :11174) reads the
   record; a cold rebuild recounts from the books.
 
 **Option b (s127): no stored counter; count via `TraderMarkets`.** The existing trader -> markets index
