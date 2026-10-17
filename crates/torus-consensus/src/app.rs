@@ -3359,6 +3359,22 @@ impl ExecutionContext {
                     self.exec_failed.store(true, Ordering::SeqCst);
                     return;
                 }
+                // The same local fault after a successful EVM execution: on
+                // this path `BridgeError::State` comes only from the
+                // post-bundle state-root compute of
+                // `validate_block_for_catchup` (validator.rs), a read of THIS
+                // node's DB (RocksDB / missing CF / undecodable local row /
+                // the incremental-vs-full-scan oracle). Never a block outcome:
+                // fail-stop exactly as the arm above.
+                Err(torus_bridge::BridgeError::State(e)) => {
+                    tracing::error!(
+                        height,
+                        %e,
+                        "FATAL: local state fault computing the EVM post-bundle state root — halting execution pipeline (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
+                }
                 Err(e) => {
                     tracing::error!(%e, height, "EVM execution failed for committed block");
                 }
@@ -20768,6 +20784,11 @@ mod crash_recovery_tests {
                 db.put_account(addr, &account(code_hash, U256::ZERO))
                     .unwrap();
             }
+            // The boot-time trie build over the seeded state (as
+            // `TorusApp::new`): without it block 1's commit leaves a partial
+            // EVM trie (the untouched contracts missing), the debug oracle
+            // fails block 2's root compute and the block fail-stops.
+            torus_state::incremental::ensure_trie_built(&db).unwrap();
             let mut ctx = pipeline_ctx(&db, on, None);
             ctx.checkpoint = ckpt;
             dispatch_and_execute(&ctx, &db, &blocks[0]);
@@ -20801,6 +20822,13 @@ mod crash_recovery_tests {
                 StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
                 want,
                 "on={on} ckpt={ckpt:?}: block 2 queued nothing, linked nothing"
+            );
+            assert_eq!(
+                db.get_account(&k256_address(&key))
+                    .unwrap()
+                    .map(|a| a.nonce),
+                Some(4),
+                "on={on} ckpt={ckpt:?}: block 2's EVM transfer ran"
             );
             let status = action_status(&db, 2).expect("block 2 drained rows: a record");
             let seqs: Vec<u64> = status.core_writer.iter().map(|r| r.seq).collect();
@@ -25338,13 +25366,43 @@ mod crash_recovery_tests {
     /// the EVM nonce not consumed): a divergence.
     #[test]
     fn evm_db_read_fault_fail_stops_block() {
-        use torus_state::cf::CF_STORAGE;
-        let key = k256::ecdsa::SigningKey::from_slice(&[0x57; 32]).unwrap();
-        let (blocks, b) = r02_evm_blocks(
-            &key,
+        assert_storage_cf_fault_fail_stops_then_replays(
+            0x57,
             alloy_primitives::TxKind::Call(EVM_DB_FAULT_READER),
-            vec![],
+            "a revm DB read fault",
         );
+    }
+
+    /// The same local fault one step later: the block's EVM tx is a plain
+    /// value transfer (revm never reads CF_STORAGE), so execution succeeds
+    /// and the post-bundle state-root compute of `validate_block_for_catchup`
+    /// is the first read of the missing CF (`account_storage`, full scan:
+    /// `StateError::MissingColumnFamily`, `BridgeError::State`; no test
+    /// seam). A local fault: the block fail-stops exactly as above (marker,
+    /// every CF unchanged; the restart replay equals a run without the fault).
+    /// Serial and pipelined. RED before: `BridgeError::State` took the app's
+    /// generic EVM arm (logged), so the block ran without its EVM writes on
+    /// this node only (native part applied, EVM nonce not consumed).
+    #[test]
+    fn evm_state_root_compute_fault_fail_stops_block() {
+        assert_storage_cf_fault_fail_stops_then_replays(
+            0x58,
+            alloy_primitives::TxKind::Call(alloy_primitives::Address::new([0xD0; 20])),
+            "a state-root compute read fault",
+        );
+    }
+
+    /// Body of [`evm_db_read_fault_fail_stops_block`] /
+    /// [`evm_state_root_compute_fault_fail_stops_block`]: block 2's one EVM
+    /// tx (key `seed`, to `to`) runs on a DB opened without CF_STORAGE.
+    fn assert_storage_cf_fault_fail_stops_then_replays(
+        seed: u8,
+        to: alloy_primitives::TxKind,
+        what: &str,
+    ) {
+        use torus_state::cf::CF_STORAGE;
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        let (blocks, b) = r02_evm_blocks(&key, to, vec![]);
         let (last, prefix) = blocks.split_last().unwrap();
         for on in [false, true] {
             // Control: a healthy DB.
@@ -25391,7 +25449,7 @@ mod crash_recovery_tests {
             ctx.pipeline_barrier();
             assert!(
                 ctx.exec_failed.load(Ordering::SeqCst),
-                "on={on}: a revm DB read fault must fail-stop"
+                "on={on}: {what} must fail-stop"
             );
             drop(ctx);
             assert_eq!(
