@@ -25426,6 +25426,150 @@ mod crash_recovery_tests {
         }
     }
 
+    /// A contract that emits one log (`PUSH1 0x2a PUSH1 0 PUSH1 0 LOG1 STOP`).
+    const RECEIPTS_FAULT_LOGGER: alloy_primitives::Address =
+        alloy_primitives::Address::new([0xC1; 20]);
+
+    /// Fund `key` and deploy [`RECEIPTS_FAULT_LOGGER`].
+    fn receipts_fault_setup(db: &StateDb, key: &k256::ecdsa::SigningKey) {
+        r02_fund(db, key);
+        let code = [0x60, 0x2a, 0x60, 0x00, 0x60, 0x00, 0xa1, 0x00];
+        let code_hash = alloy_primitives::keccak256(code);
+        db.put_code(&code_hash, &code).unwrap();
+        let contract = revm::state::AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        db.put_account(&RECEIPTS_FAULT_LOGGER, &contract).unwrap();
+    }
+
+    /// The block-metadata write of an EVM block (`commit_block_metadata`:
+    /// header, body, receipts with their logs, tx indices; its own batch,
+    /// written before the block's flush) fails on this node — here a real
+    /// fault: the DB has no CF_TX_HASH_TO_LOCATION, so the batch is never
+    /// written (`StateError::MissingColumnFamily`; no test seam). A local
+    /// write fault: the block fail-stops (exec_failed, applied marker
+    /// unchanged, nothing of the block flushed). Restart (reopen with every
+    /// CF) replays the block, which writes the receipts again: every CF
+    /// (receipts, logs, tx indices included) equals a run without the fault.
+    /// Serial and pipelined (an EVM block is always a barrier). RED before:
+    /// the error was only logged, the block was applied without receipts,
+    /// and the replay skipped the applied block: a permanent hole on this
+    /// node only (RPC served no receipt / logs for the tx).
+    #[test]
+    fn evm_block_metadata_write_fault_fail_stops_block() {
+        use torus_state::cf::{CF_RECEIPTS, CF_TX_HASH_TO_LOCATION};
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x58; 32]).unwrap();
+        let (blocks, b) = r02_evm_blocks(
+            &key,
+            alloy_primitives::TxKind::Call(RECEIPTS_FAULT_LOGGER),
+            vec![],
+        );
+        let (last, prefix) = blocks.split_last().unwrap();
+        for on in [false, true] {
+            // Control: a healthy DB.
+            let (_c, db_ref) = make_test_config_and_db();
+            receipts_fault_setup(&db_ref, &key);
+            let ctx = pipeline_ctx(&db_ref, on, None);
+            for blk in &blocks {
+                dispatch_and_execute(&ctx, &db_ref, blk);
+            }
+            assert!(ctx.pipeline_barrier(), "on={on}");
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: control");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db_ref), Some(2), "on={on}");
+            assert_eq!(r02_evm_nonce(&db_ref, &key), 1, "on={on}: the EVM tx ran");
+            assert_eq!(r02_receipt_status(&db_ref, 2), Some(true), "on={on}");
+            let receipt_key = [2u64.to_be_bytes().as_slice(), &0u32.to_be_bytes()].concat();
+            let receipt: torus_types::Receipt = serde_json::from_slice(
+                &db_ref
+                    .get_cf_raw(CF_RECEIPTS, &receipt_key)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt.logs.len(), 1, "on={on}: the tx's log");
+            assert!(
+                db_ref
+                    .get_cf_raw(CF_TX_HASH_TO_LOCATION, receipt.tx_hash.as_slice())
+                    .unwrap()
+                    .is_some(),
+                "on={on}: tx index"
+            );
+
+            // Fault: this node's DB has no CF_TX_HASH_TO_LOCATION.
+            torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+            let dir = scratch_db_dir("torus-receipts-write-fault");
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let cfs = torus_state::cf::ALL_CF_NAMES
+                .iter()
+                .copied()
+                .filter(|cf| *cf != CF_TX_HASH_TO_LOCATION);
+            let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, &dir, cfs).unwrap());
+            torus_state::running_hash::configure_activation(&db, Some(1))
+                .expect("configure running hash activation");
+            receipts_fault_setup(&db, &key);
+            let ctx = pipeline_ctx(&db, on, None);
+            for blk in prefix {
+                dispatch_and_execute(&ctx, &db, blk);
+            }
+            assert!(ctx.pipeline_barrier(), "on={on}");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: the prefix writes no block metadata"
+            );
+            let durable = persist_committed_block_durably(&db, last);
+            let before = dump_cfs_except(&db, CF_TX_HASH_TO_LOCATION);
+            ctx.execute_committed_block_with(last, vec![], durable);
+            ctx.pipeline_barrier();
+            assert!(
+                ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: a block-metadata write fault must fail-stop"
+            );
+            drop(ctx);
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(1),
+                "on={on}: block 2 not applied"
+            );
+            assert!(
+                !r02_nonce_consumed(&db, &b),
+                "on={on}: native part not applied"
+            );
+            assert_eq!(r02_evm_nonce(&db, &key), 0, "on={on}: EVM part not applied");
+            assert_dumps_equal(
+                &before,
+                &dump_cfs_except(&db, CF_TX_HASH_TO_LOCATION),
+                "nothing of the block flushed",
+            );
+
+            // Restart: reopen with every CF, replay the faulted height.
+            drop(db);
+            let db = StateDb::open(&dir).expect("reopen");
+            let ctx = pipeline_ctx(&db, false, None);
+            let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+            assert_eq!(parked, None);
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: replay");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            assert_eq!(
+                r02_receipt_status(&db, 2),
+                Some(true),
+                "on={on}: receipt rewritten"
+            );
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                "restart replay vs no fault",
+            );
+        }
+    }
+
     /// Item 6 C1, P6: crash between E's hand-off and W's write with R on —
     /// block 3 ran on R carried from block 1 (advanced over the empty 2) on
     /// top of pending(2); W's write of 2 fails, nothing of 2/3 is durable,
