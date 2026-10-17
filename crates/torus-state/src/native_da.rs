@@ -17,6 +17,7 @@
 //! ([`NativeDaStore::gc_committed`]; the window policy is
 //! `torus_consensus::da_gc`). Bodies of uncommitted actions stay.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use alloy_primitives::B256;
@@ -434,8 +435,9 @@ impl NativeDaStore {
         let mut batch = rocksdb::WriteBatch::default();
         let mut out = DaGcOutcome::default();
         // Hashes this record moved out of an earlier row: if that row ages out
-        // in this same pass, its read-back copy still lists them.
-        let mut moved: Vec<[u8; 32]> = Vec::new();
+        // in this same pass, its read-back copy still lists them. A set: the
+        // membership tests below run once per listed hash (Codex P2).
+        let mut moved: HashSet<[u8; 32]> = HashSet::new();
         if !hashes.is_empty() && height >= state.next_record.max(state.frontier) {
             self.record_row(
                 &mut batch,
@@ -489,12 +491,12 @@ impl NativeDaStore {
         hashes: &[B256],
         shard_count: u16,
         frontier: u64,
-        moved: &mut Vec<[u8; 32]>,
+        moved: &mut HashSet<[u8; 32]>,
     ) -> Result<(), StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let ref_keys: Vec<[u8; DA_GC_REF_KEY_LEN]> =
             hashes.iter().map(|h| da_gc_ref_key(h.as_slice())).collect();
-        let mut earlier: std::collections::BTreeMap<u64, Vec<[u8; 32]>> = Default::default();
+        let mut earlier: BTreeMap<u64, HashSet<[u8; 32]>> = BTreeMap::new();
         let refs =
             self.db
                 .inner()
@@ -505,7 +507,7 @@ impl NativeDaStore {
                 continue;
             };
             if (frontier..height).contains(&prev) {
-                earlier.entry(prev).or_default().push(hash.0);
+                earlier.entry(prev).or_default().insert(hash.0);
             }
         }
         for (prev, detach) in earlier {
@@ -514,7 +516,7 @@ impl NativeDaStore {
                 if let Some((row_shards, listed)) = decode_da_gc_row(&row) {
                     let kept: Vec<B256> = listed
                         .chunks_exact(32)
-                        .filter(|h| !detach.iter().any(|d| d[..] == h[..]))
+                        .filter(|h| !detach.contains(*h))
                         .map(B256::from_slice)
                         .collect();
                     if kept.is_empty() {
@@ -548,7 +550,7 @@ impl NativeDaStore {
         frontier: u64,
         last_due: u64,
         limits: DaGcLimits,
-        moved: &[[u8; 32]],
+        moved: &HashSet<[u8; 32]>,
         out: &mut DaGcOutcome,
     ) -> Result<Option<u64>, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
@@ -588,7 +590,7 @@ impl NativeDaStore {
             }
             for hash in row_hashes.chunks_exact(32) {
                 // Re-included at this pass's height: the new row owns it.
-                if moved.iter().any(|m| m[..] == *hash) {
+                if moved.contains(hash) {
                     continue;
                 }
                 batch.delete_cf(cf, hash);
@@ -1439,5 +1441,48 @@ mod tests {
             assert_eq!(present(&store, &x), tip < 20, "tip {tip}: x (last at 16)");
         }
         assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
+    }
+
+    /// Codex P2 (finding 1): re-including a whole earlier block (16,000
+    /// hashes, a manifest the default message cap admits) runs on the
+    /// consensus thread, so moving the hashes out of the earlier row, and
+    /// skipping them when that row ages out in the same pass, must stay
+    /// linear. Self-calibrated against recording the same hashes fresh (the
+    /// same `MultiGet`, row and references): the linear pass costs under 2x
+    /// that, the quadratic membership scans (16,000^2 hash compares, twice)
+    /// over 20x (debug build; 6x splits them). Three tries, so one
+    /// scheduling stall cannot fail it.
+    #[test]
+    fn gc_reinclusion_of_a_large_block_stays_linear() {
+        const N: u64 = 16_000;
+        const W: u64 = 4;
+        let hashes: Vec<B256> = (0..N)
+            .map(|i| alloy_primitives::keccak256(i.to_be_bytes()))
+            .collect();
+        let mut ratios = Vec::new();
+        for _ in 0..3 {
+            let (_dir, store) = temp_store();
+            let started = std::time::Instant::now();
+            store
+                .gc_committed(10, &hashes, 0, W, UNCAPPED, LIMITS)
+                .unwrap();
+            let fresh = started.elapsed();
+            // 10 + W: this pass re-includes every hash of row 10 AND ages it out.
+            let started = std::time::Instant::now();
+            let out = store
+                .gc_committed(10 + W, &hashes, 0, W, UNCAPPED, LIMITS)
+                .unwrap();
+            let reinclude = started.elapsed();
+            assert_eq!(
+                (out.references_moved, out.rows_deleted, out.bodies_deleted),
+                (N, 1, 0)
+            );
+            let ratio = reinclude.as_secs_f64() / fresh.as_secs_f64().max(1e-6);
+            if ratio < 6.0 {
+                return;
+            }
+            ratios.push(ratio);
+        }
+        panic!("re-including {N} hashes cost {ratios:.1?} x a fresh record: not linear");
     }
 }
