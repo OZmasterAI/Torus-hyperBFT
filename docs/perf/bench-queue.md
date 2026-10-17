@@ -2,8 +2,8 @@
 
 Benches run on archy only. 18c keeps this list current; archy reads it on pull. IDs (Q1, Q2, ...) stay fixed when an
 item moves between sections.
-Last archy benches: `ozarchy-q8p2` (Q8, section 81) and `ozarchy-q5c` (Q5, section 80) of
-`ozarchy-antispam-item6-pf1-2026-10-04.md`, 2026-10-17; before them `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
+Last archy benches: `ozarchy-q7m3` + `ozarchy-q7cl` (Q7, `item7-step2-native-ab.md`), `ozarchy-q8p2` (Q8, section 81)
+and `ozarchy-q5c` (Q5, section 80) of `ozarchy-antispam-item6-pf1-2026-10-04.md`, 2026-10-17; before them `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
 
 ## Order (owner s125, updated s127)
 
@@ -48,6 +48,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    behaviour-neutral exec-failed latch order fix, so arm A stays db84a1ad.) Both arms are fixed SHAs: campaign A
    does not move it. Moved ahead of campaign A (s127): Q7 gates the step 2 merge, the last item before the item 6
    Phase 5 build (roadmap order s121; item 7 step 3 comes after Phase 5, `item7-evm-lanes.md`).
+   **Done s66 (BLOCK_CAP 400, owner; `item7-step2-native-ab.md`): matched/s B/A mode 3 1.0082 [0.9646, 1.0538], Classic
+   0.9963 [0.9896, 1.0031], both pass; save_books Classic -0.22 ms pass, mode 3 +0.52 ms [-0.92, +1.96] fails the 0.3 ms
+   bound by point estimate (CI unresolved): owner / 18c decide before the merge.**
 4. **Campaign A** (~4 h 40): 7 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
    **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
    `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
