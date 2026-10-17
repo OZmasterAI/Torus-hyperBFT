@@ -670,6 +670,8 @@ Revision 2 status of the revision 1 picks: questions 1, 2, 5, 6, 7 keep their pi
 "T is independent of P2 and can go first" (revision 1, 4.1 P3) is **obsolete**. Revision 1's 4.3 item 2 (R / `Users`
 attachable to the journal) is **obsolete**. Questions 8-11 are new.
 
+**Decided (owner s127): every revision 2 pick below is accepted (1-11), including 11: the revm read-error gap is fixed now, as its own fix on main, ahead of step 3.**
+
 1. **Build option 0?**
    (a) Yes, behind `TORUS_EVM_FAST_PATH`, default on after Q11.
    (b) Yes, no flag.
