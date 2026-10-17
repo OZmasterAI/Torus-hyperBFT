@@ -61,9 +61,11 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
 
 7. **Q6. 71.8 checkpoint slicing** vs M. Run after step 4 has settled the Q1 / Q4 defaults (both touch checkpoint
    code, so they move slicing's baseline).
-8. **Q7. Item 7 step 2** vs M. Status s126: C1-C10 built and Codex-clean, devnet check done; main (with the s58
-   bundle) merged into `feat/item7-step2` and the EVM double-inclusion fix in (head 2cdc3ac7, merge base db84a1ad,
-   gates 4017/4017), in Codex review. 18c says when the step 2 head is ready and gives both SHAs; spec under Items, Q7.
+8. **Q7. Item 7 step 2: READY (s126).** Arm A = main at the merge base **db84a1ad**; arm B = `feat/item7-step2` head
+   **c567b1b3** (origin). C1-C10 built and Codex-clean, 4-validator devnet check done, main with the s58 bundle merged
+   in, EVM double-inclusion fix and its follow-ups Codex-clean; gates nextest --workspace 4021/4021, full cargo test
+   4022. Spec under Items, Q7. (Main after db84a1ad adds only docs and the behaviour-neutral exec-failed latch order
+   fix, so arm A stays db84a1ad.)
 
 If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and save-books rows of the Q8 profile
 (a short re-run, not a full profile).
