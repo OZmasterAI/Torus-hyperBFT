@@ -1003,7 +1003,28 @@ impl Mempool {
     /// `parent_hash` seeds deterministic same-price shuffling (anti-MEV, Task 3.1.5).
     /// Item 7 step 2: `base_fee` is the base fee of the header being proposed
     /// (`PlanEvm::resolve`, which differs from the committed one at a boundary).
+    /// Nothing in flight: see [`Self::drain_evm_excluding`] (the proposer's call).
     pub fn drain_evm(&self, gas_limit: u64, base_fee: u64, parent_hash: B256) -> Vec<Vec<u8>> {
+        self.drain_evm_excluding(
+            gas_limit,
+            base_fee,
+            parent_hash,
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    /// [`Self::drain_evm`] leaving the txs in `in_flight` pooled (item 7 step 2, owner s126,
+    /// decision 9): the hashes ([`evm_tx_hash`]) of the txs carried by the uncommitted blocks
+    /// the proposal extends. Such a tx executes before the proposal, so it is not proposed
+    /// again (execution would skip the copy), spends no budget, and its sender's next nonce
+    /// can still be selected; the commit of its block removes it from the pool.
+    pub fn drain_evm_excluding(
+        &self,
+        gas_limit: u64,
+        base_fee: u64,
+        parent_hash: B256,
+        in_flight: &std::collections::HashSet<B256>,
+    ) -> Vec<Vec<u8>> {
         let budget = gas_limit.min(self.config.evm_block_gas_budget);
         // Per-sender share cap (testnet spam guard; 0 = off for mainnet).
         let sender_gas_cap = match self.config.evm_sender_share_pct {
@@ -1023,6 +1044,7 @@ impl Mempool {
                 &parent_hash,
                 min_base_fee,
                 &mut lanes.drained,
+                in_flight,
             )
         };
         // FIX EVM-FIND-02: Decrement memory for drained transactions.
@@ -1090,12 +1112,32 @@ impl Mempool {
     /// Item 7 step 2: the big lane's part of a big height: up to the header's big limit (the node
     /// budget never caps it) and `byte_budget` (768 KiB minus the small lane's bytes), with the
     /// per-sender share of the big limit, at the proposed header's big base fee (B12).
+    /// Nothing in flight: see [`Self::drain_evm_big_excluding`] (the proposer's call).
     pub fn drain_evm_big(
         &self,
         gas_limit: u64,
         byte_budget: usize,
         big_base_fee: u64,
         parent_hash: B256,
+    ) -> Vec<Vec<u8>> {
+        self.drain_evm_big_excluding(
+            gas_limit,
+            byte_budget,
+            big_base_fee,
+            parent_hash,
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    /// [`Self::drain_evm_big`] leaving the txs in `in_flight` pooled, as
+    /// [`Self::drain_evm_excluding`] (decision 9).
+    pub fn drain_evm_big_excluding(
+        &self,
+        gas_limit: u64,
+        byte_budget: usize,
+        big_base_fee: u64,
+        parent_hash: B256,
+        in_flight: &std::collections::HashSet<B256>,
     ) -> Vec<Vec<u8>> {
         let sender_gas_cap = match self.config.evm_sender_share_pct {
             0 => None,
@@ -1112,6 +1154,7 @@ impl Mempool {
                 &parent_hash,
                 min_base_fee,
                 &mut lanes.drained,
+                in_flight,
             )
         };
         let bytes: usize = drained.iter().map(Vec::len).sum();
@@ -4156,6 +4199,36 @@ mod tests {
 
         pool.reinsert_evm(drained);
         assert_eq!(pool.evm_pool_size(), 1);
+    }
+
+    /// Item 7 step 2 (decision 9): `drain_evm_excluding` leaves an in-flight tx pooled and
+    /// spends none of the budget on it: the gas of one tx buys the sender's next nonce. A
+    /// later drain without it in flight takes it.
+    #[test]
+    fn drain_evm_excluding_keeps_in_flight_txs_pooled() {
+        let (_dir, state) = setup();
+        let pool = Mempool::new(state.clone(), MempoolConfig::default());
+        let k = key(51);
+        fund(&state, &address_from_key(&k), U256::from(10u64.pow(18)), 0);
+        let txs: Vec<Vec<u8>> = (0..2)
+            .map(|nonce| {
+                create_eip1559_tx(&k, nonce, 1_000_000_000, 100_000_000, 21_000, U256::ZERO)
+            })
+            .collect();
+        let hashes: Vec<B256> = txs
+            .iter()
+            .map(|tx| pool.add_evm_tx(tx.clone()).unwrap())
+            .collect();
+        assert_eq!(hashes[0], evm_tx_hash(&txs[0]).unwrap());
+        let in_flight: std::collections::HashSet<B256> = [hashes[0]].into_iter().collect();
+
+        let got = pool.drain_evm_excluding(21_000, pool.base_fee(), B256::ZERO, &in_flight);
+        assert_eq!(got, vec![txs[1].clone()], "nonce 1 takes the one tx of gas");
+        assert_eq!(pool.evm_pool_size(), 1, "the in-flight tx stays pooled");
+        assert_eq!(
+            pool.drain_evm(u64::MAX, pool.base_fee(), B256::ZERO),
+            vec![txs[0].clone()]
+        );
     }
 
     #[test]

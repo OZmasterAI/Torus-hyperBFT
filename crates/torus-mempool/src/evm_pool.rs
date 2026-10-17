@@ -1,6 +1,6 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use crate::error::MempoolError;
 
@@ -593,6 +593,12 @@ impl EvmPool {
     /// D4 (S392): `min_base_fee` re-checks the fee floor at selection time.
     /// Item 7 step 2 (decision 7): each selected tx goes into `drained` (hash -> sender,
     /// nonce), so the in-flight filter finds our own proposal's txs at commit.
+    /// Item 7 step 2 (owner s126, decision 9): a tx whose hash is in `in_flight` (carried by an
+    /// uncommitted block this proposal extends, so it executes first) is not selected, spends
+    /// no budget and stays pooled (the commit removes it); its sender's next nonce is still a
+    /// candidate. It never enters the heap, so it cannot stop the drain at the fee floor (its
+    /// fee may be below a base fee that rose since its block, Codex review s126).
+    #[allow(clippy::too_many_arguments)]
     pub fn drain(
         &mut self,
         gas_budget: u64,
@@ -601,11 +607,22 @@ impl EvmPool {
         parent_hash: &B256,
         min_base_fee: u128,
         drained: &mut HashMap<B256, (Address, u64)>,
+        in_flight: &HashSet<B256>,
     ) -> Vec<Vec<u8>> {
+        // Decision 9: a sender's candidate from `nonce` on, past its in-flight txs (they
+        // execute before this block, in the blocks it extends).
+        let candidate = |txs: &BTreeMap<u64, EvmPoolEntry>, mut nonce: u64| {
+            let mut entry = txs.get(&nonce)?;
+            while in_flight.contains(&entry.hash) {
+                nonce += 1;
+                entry = txs.get(&nonce)?;
+            }
+            Some(DrainEntry::new(entry, min_base_fee, parent_hash))
+        };
         let mut heap = BinaryHeap::new();
         for txs in self.by_sender.values() {
-            if let Some(entry) = txs.values().next() {
-                heap.push(DrainEntry::new(entry, min_base_fee, parent_hash));
+            if let Some(entry) = txs.values().next().and_then(|e| candidate(txs, e.nonce)) {
+                heap.push(entry);
             }
         }
 
@@ -667,14 +684,13 @@ impl EvmPool {
             result.push(raw);
             *sender_gas.entry(top.sender).or_insert(0) += top.gas_limit;
 
-            // Advance: push next nonce for this sender.
-            let next_nonce = top.nonce + 1;
+            // Advance: push next nonce for this sender (past its in-flight txs, decision 9).
             if let Some(next) = self
                 .by_sender
                 .get(&top.sender)
-                .and_then(|m| m.get(&next_nonce))
+                .and_then(|m| candidate(m, top.nonce + 1))
             {
-                heap.push(DrainEntry::new(next, min_base_fee, parent_hash));
+                heap.push(next);
             }
         }
 
@@ -715,11 +731,88 @@ mod tests {
 
     /// [`EvmPool::drain`] at base fee 10 with no share cap (the drained record is dropped).
     fn drain_at(pool: &mut EvmPool, gas: u64, bytes: usize, parent: &B256) -> Vec<Vec<u8>> {
-        pool.drain(gas, bytes, None, parent, 10, &mut HashMap::new())
+        pool.drain(
+            gas,
+            bytes,
+            None,
+            parent,
+            10,
+            &mut HashMap::new(),
+            &HashSet::new(),
+        )
     }
 
     fn senders_of(drained: &[Vec<u8>]) -> Vec<u8> {
         drained.iter().map(|raw| raw[0]).collect()
+    }
+
+    /// Item 7 step 2 (decision 9, Codex review s126): the base fee rose to 50 after A's nonce 0
+    /// (max fee 20) went into a pending block; A's nonce 1 (max fee 100) pays it. The
+    /// in-flight tx must not stop the drain at the fee floor, alone or behind B's below-floor
+    /// nonce 0 (max fee 45: it ranks above A's nonce 0 and is not in flight): A's nonce 1
+    /// drains, nothing below the floor does, both stay pooled.
+    #[test]
+    fn in_flight_tx_below_a_raised_fee_does_not_hold_its_next_nonce_back() {
+        let (a0, a1, b0) = (
+            entry(0xA, 0, 20, 2),
+            entry(0xA, 1, 100, 5),
+            entry(0xB, 0, 45, 2),
+        );
+        for with_b in [false, true] {
+            let mut entries = vec![a0.clone(), a1.clone()];
+            if with_b {
+                entries.push(b0.clone());
+            }
+            let mut pool = pool_with(10, &entries, 100);
+            let in_flight: HashSet<B256> = [a0.hash].into_iter().collect();
+            let mut drained = HashMap::new();
+            let got = pool.drain(
+                u64::MAX,
+                usize::MAX,
+                None,
+                &B256::ZERO,
+                50,
+                &mut drained,
+                &in_flight,
+            );
+            assert_eq!(got, vec![a1.raw_rlp.clone()], "with_b={with_b}");
+            assert_eq!(
+                pool.size(),
+                entries.len() - 1,
+                "with_b={with_b}: the below-floor txs stay pooled"
+            );
+        }
+    }
+
+    /// Item 7 step 2 (decision 9): an in-flight tx (A's nonce 0) is not selected, spends none
+    /// of the budget (two txs' gas buys A's nonce 1 and B's nonce 0), is not recorded as
+    /// drained and stays pooled; once not in flight it drains.
+    #[test]
+    fn drain_skips_in_flight_txs_and_advances_their_sender() {
+        let (a0, a1, b0) = (
+            entry(0xA, 0, 100, 5),
+            entry(0xA, 1, 100, 5),
+            entry(0xB, 0, 100, 1),
+        );
+        let mut pool = pool_with(10, &[a0.clone(), a1.clone(), b0.clone()], 100);
+        let in_flight: HashSet<B256> = [a0.hash].into_iter().collect();
+        let mut drained = HashMap::new();
+        let got = pool.drain(
+            42_000,
+            usize::MAX,
+            None,
+            &B256::ZERO,
+            10,
+            &mut drained,
+            &in_flight,
+        );
+        assert_eq!(got, vec![a1.raw_rlp.clone(), b0.raw_rlp.clone()]);
+        assert!(!drained.contains_key(&a0.hash), "not drained by us");
+        assert_eq!(pool.size(), 1, "the in-flight tx stays pooled");
+        assert_eq!(
+            drain_at(&mut pool, u64::MAX, usize::MAX, &B256::ZERO),
+            vec![a0.raw_rlp]
+        );
     }
 
     /// Fix (a): at base fee 10, A (max 100, tip 1) pays the proposer 1 and
