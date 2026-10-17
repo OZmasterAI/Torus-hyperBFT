@@ -279,6 +279,19 @@
 #                tx-flood, no extra file or log line.
 #   EVM_LOAD_SENDERS=S  with EVM_LOAD_RATE > 0 (else FATAL): senders 1..40
 #                (default 40).
+#   EXTRA_ENV='EVM_BLOCK_INTERVAL=N'  genesis EVM cadence N of this cell (bench
+#                Q12): EVM txs only at heights with height % N == 0. A genesis
+#                field (like TIMEOUT_BASE_MS), so it is lifted out of EXTRA_ENV
+#                and handed to gen-3val-genesis.sh, which sets .evm.block_interval
+#                in this cell's genesis only (never in the reused
+#                testnet/genesis-weighted-full.json). N in 2..=100 (governance's
+#                range), else FATAL at preflight. Unset = the field stays absent
+#                (node default 11; genesis byte-identical). Either way the cell
+#                refuses a genesis whose N is not the one it asked for (a
+#                hand-patched weighted-full genesis), logs N, uses it for the
+#                EVM load's cadence check and records it as
+#                summary.json .genesis.evm_block_interval. An ambient
+#                EVM_BLOCK_INTERVAL is ignored: only EXTRA_ENV sets it.
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -400,6 +413,9 @@ BENCH="$TARGET_DIR/release/bench-throughput"
 TX_FLOOD=${TX_FLOOD:-$TARGET_DIR/release/torus-tx-flood}
 DST_NODE="$WT/target/release/torus-node"
 GENESIS="$WT/devnet/wsl/genesis-3val.json"
+# torus_types::DEFAULT_EVM_BLOCK_INTERVAL (crates/torus-types/src/lib.rs): the
+# N of a genesis without .evm.block_interval.
+DEFAULT_EVM_N=11
 WSL="$WT/devnet/wsl"
 RUN_DIR="$DATA_ROOT/run"
 
@@ -577,6 +593,15 @@ for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
+# EVM_BLOCK_INTERVAL (genesis EVM cadence N) comes from EXTRA_ENV only; checked
+# here so a bad N fails before anything is staged. Same range as
+# gen-3val-genesis.sh (torus_types::EVM_BLOCK_INTERVAL_RANGE = 2..=100).
+GEN_EVM_BLOCK_INTERVAL=""; GEN_EVM_BLOCK_INTERVAL_SET=0
+for kv in $EXTRA_ENV; do case $kv in EVM_BLOCK_INTERVAL=*) GEN_EVM_BLOCK_INTERVAL=${kv#*=}; GEN_EVM_BLOCK_INTERVAL_SET=1 ;; esac; done
+if [ "$GEN_EVM_BLOCK_INTERVAL_SET" = 1 ]; then
+    [[ "$GEN_EVM_BLOCK_INTERVAL" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$GEN_EVM_BLOCK_INTERVAL" -ge 2 ] && [ "$GEN_EVM_BLOCK_INTERVAL" -le 100 ] \
+        || { echo "FATAL: EVM_BLOCK_INTERVAL must be an integer in 2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE) (got '$GEN_EVM_BLOCK_INTERVAL')" >&2; exit 2; }
+fi
 for v in EXPECT_NODE_MD5 EXPECT_BENCH_MD5; do
     [[ -z "${!v}" || "${!v}" =~ ^[0-9a-f]{8,32}$ ]] || { echo "FATAL: $v must be 8-32 lowercase hex chars of an md5 (got '${!v}')" >&2; exit 2; }
 done
@@ -738,6 +763,18 @@ liq_thin_patch() {
         return 1
     fi
     echo "$got"
+}
+
+# record_genesis_evm_n <summary.json> <n>: .genesis.evm_block_interval = n (the
+# genesis EVM cadence N; summarize.py, possibly the candidate's older copy,
+# knows nothing of it). rc 1, file untouched, on failure.
+record_genesis_evm_n() {
+    local p=$1 n=$2 tmp
+    tmp="$p.evm-n.tmp"
+    if ! jq --argjson n "$n" '.genesis.evm_block_interval = $n' "$p" > "$tmp" || ! mv -f "$tmp" "$p"; then
+        rm -f -- "${tmp:?}"
+        return 1
+    fi
 }
 
 # weighted_full_check <file> <senders>: gen-3val-genesis.sh REUSES an existing
@@ -909,9 +946,20 @@ for kv in $EXTRA_ENV; do case $kv in TIMEOUT_BASE_MS=*) GEN_TIMEOUT_BASE_MS=${kv
 if [ "${FORCE:-0}" != 1 ]; then
     WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
 fi
-TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS MARKETS=$MARKETS OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
+TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL MARKETS=$MARKETS OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
     || die "genesis generation failed (see run.log)"
 log "genesis timeout_base_ms=$(jq '.consensus.timeout_base_ms' "$GENESIS")"
+# The genesis EVM cadence N must be the cell's: EVM_BLOCK_INTERVAL, else the
+# node default. A mismatch = a hand-patched weighted-full genesis carried over.
+GEN_EVM_N=$(jq -r ".evm.block_interval // $DEFAULT_EVM_N" "$GENESIS")
+WANT_EVM_N=${GEN_EVM_BLOCK_INTERVAL:-$DEFAULT_EVM_N}
+[ "$GEN_EVM_N" = "$WANT_EVM_N" ] \
+    || die "genesis evm.block_interval=$GEN_EVM_N, wanted $WANT_EVM_N (EVM_BLOCK_INTERVAL='$GEN_EVM_BLOCK_INTERVAL'): gen-3val-genesis.sh copies .evm from $MAINREPO/testnet/genesis-weighted-full.json; remove a hand patch there (set N per cell with EXTRA_ENV EVM_BLOCK_INTERVAL=N)"
+if [ -n "$GEN_EVM_BLOCK_INTERVAL" ]; then
+    log "genesis evm.block_interval=$GEN_EVM_N (EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL)"
+else
+    log "genesis evm.block_interval=$GEN_EVM_N (absent: node default)"
+fi
 if [ "$LIQ_THIN" -gt 0 ]; then
     LIQ_THIN_ROWS=$(liq_thin_patch "$GENESIS" "$LIQ_THIN" "$LIQ_THIN_AVAIL" 2>>"$OUT/run.log") \
         || die "LIQ_THIN=$LIQ_THIN genesis patch failed (see run.log)"
@@ -931,9 +979,9 @@ if evm_load_on; then
         || die "EVM load: bench-throughput gen-accounts --secret-keys failed (see run.log)"
     EVM_FUNDED=$(python3 "$SELF_DIR/evm_load.py" funded --genesis "$GENESIS" --keys "$EVM_KEYS" 2>&1) || die "EVM load: $EVM_FUNDED"
     EVM_CHAIN_ID=$(jq -r '.evm.chain_id // empty' "$GENESIS")
-    EVM_N=$(jq -r '.evm.block_interval // empty' "$GENESIS")
+    EVM_N=$GEN_EVM_N
     [[ "$EVM_CHAIN_ID" =~ ^[0-9]+$ ]] || die "EVM load: $GENESIS has no evm.chain_id"
-    log "EVM load: $EVM_FUNDED; evm.chain_id=$EVM_CHAIN_ID evm.block_interval=${EVM_N:-absent (node default)}"
+    log "EVM load: $EVM_FUNDED; evm.chain_id=$EVM_CHAIN_ID evm.block_interval=$EVM_N"
 fi
 
 # ---------------------------------------------------------------- 3. launch
@@ -1570,6 +1618,9 @@ python3 "$TOOLS_DIR/summarize.py" \
     --digest-quiescent "$DIGEST_QUIESCENT" --digest-secs "${DIGSECS[*]}" --digest-heights "${DHGT[*]}" \
     | tee -a "$OUT/run.log"
 rc=${PIPESTATUS[0]}
+if [ "$rc" = 0 ]; then
+    record_genesis_evm_n "$OUT/summary.json" "$GEN_EVM_N" || log "WARNING: summary.json .genesis.evm_block_interval not written"
+fi
 # summary.json .oracle_feed: feed stats + the marks the load ended with
 # (stale_marks_at_bench_end = markets whose mark was NOT usable at bench end).
 if [ "$ORACLE_FEED" = 1 ] && [ "$rc" = 0 ]; then
