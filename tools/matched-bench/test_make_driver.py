@@ -1360,6 +1360,45 @@ class ScrubEnvTest(Base):
         self.assertIn("CHILD=\n", r.stdout.replace("CHILD= \n", "CHILD=\n"))
         self.assertFalse(os.path.exists("/tmp/caller-run/campaign.log"))
 
+    def test_soak_dirty_hz_survives_scrub(self):
+        """Codex P2 (review of 04b7be2d): SOAK_DIRTY_HZ=10 in the launching shell must reach the soak sampler
+        through launch (detach gets the scrubbed env) and run (scrubbed again): scrub_env keeps it exported.
+        The reviewer's case printed "unset"."""
+        r = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'TOOLS=.; CAMPAIGN=x; DRIVER_LIB_ONLY=1 source "$1"; export SOAK_DIRTY_HZ=10; scrub_env;'
+                ' echo "${SOAK_DIRTY_HZ-unset}"; env | grep -c "^SOAK_DIRTY_HZ=10$" || true',
+                "x",
+                self.BODY,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), ["10", "1"], r.stdout + r.stderr)
+
+    def test_launch_passes_soak_dirty_hz_to_the_unit(self):
+        spec = minimal_spec(self.tmp)
+        drv = self.generate(self.write_spec(spec))
+        fake = os.path.join(self.tmp, "fake-detach.sh")
+        with open(fake, "w") as f:
+            f.write(
+                '#!/bin/bash\necho "CHILD=$(env | grep -E "^SOAK_DIRTY_HZ=" | tr "\\n" " ")"\n'
+            )
+        os.chmod(fake, 0o755)
+        r = subprocess.run(
+            ["bash", drv, "launch"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=dict(os.environ, DRIVER_DETACH=fake, SOAK_DIRTY_HZ="10"),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("CHILD=SOAK_DIRTY_HZ=10 \n", r.stdout)
+
     def test_driver_vars_cover_every_config_and_body_global(self):
         """scrub_env keeps every driver name (DRIVER_VARS): each name the generated config or the body assigns
         at top level is listed"""
@@ -1896,6 +1935,28 @@ class CellRunTest(FakeHostBase):
             r"CHECK SOAK %s: .*metrics-1hz ok scrapes [1-9]\d*, host-1hz rows [1-9]"
             % LB,
         )
+        self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
+
+    def test_soak_dirty_hz_through_the_driver(self):
+        """Codex P2 (review of 04b7be2d): with SOAK_DIRTY_HZ=10 in the driver's environment, a cell started after
+        the driver's own scrub_env (as `run` does) writes host-dirty-10hz.tsv beside host-1hz.tsv. The fakes'
+        FAKE_* and CELL_STEP_LOG are re-exported after the scrub (a real run exports CELL_STEP_LOG after it)."""
+        ports = self.metrics_servers()
+        spec = minimal_spec(self.tmp)
+        pre = "\n".join(
+            [
+                "sysctl_pin",
+                "METS=(%d %d %d)" % tuple(ports),
+                "_keep=$(export -p | grep -E '^declare -x (FAKE_[A-Z_]*|CELL_STEP_LOG)=')",
+                "scrub_env",
+                'eval "$_keep"',
+            ]
+        )
+        out = self.run_cell(spec, pre=pre, SOAK_DIRTY_HZ="10")
+        self.assertIn("RUN_SPEC_RC=0", out, out)
+        dirty = self.cellfile("host-dirty-10hz.tsv").splitlines()
+        self.assertEqual(dirty[0], "ts\tDirty_kB\tWriteback_kB", dirty[:2])
+        self.assertGreaterEqual(len(dirty), 2, dirty)
         self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
 
     def test_node_death_mid_cell(self):

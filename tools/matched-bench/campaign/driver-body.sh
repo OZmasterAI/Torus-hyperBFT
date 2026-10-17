@@ -96,7 +96,7 @@ show_plan() { # [smoke]: the plan as tables (make-driver tests compare these wit
     echo "WATCH node-death memguard hardscan"
     if [ "$SAMPLERS" = 1 ]; then
         echo "SAMPLERS on du mem metrics fd soak-1hz vmstat rocksdb-log fd_stop=$FD_STOP"
-        echo "SOAK on $SOAKPY metrics-1hz.txt.gz host-1hz.tsv"
+        echo "SOAK on $SOAKPY metrics-1hz.txt.gz host-1hz.tsv${SOAK_DIRTY_HZ:+ (SOAK_DIRTY_HZ=$SOAK_DIRTY_HZ: + host-dirty-${SOAK_DIRTY_HZ}hz.tsv if 2..100)}"
     else
         echo "SAMPLERS off"
     fi
@@ -575,7 +575,7 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     for kv in ${AHENV[$arm]}; do E+=("$kv"); done
     [ "${BWRAP[$b]}" = 1 ] || E+=(EXPECT_NODE_MD5="${BMD5[$b]}")
     [ -z "${BBMD5[$b]}" ] || E+=(EXPECT_BENCH_MD5="${BBMD5[$b]}")
-    "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
+    "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env -u SOAK_DIRTY_HZ "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
         "${E[@]}" "$HARNESS" "$WT_H" "$label" "$MARKETS" "$dur" "$RATE" "${AXE[$arm]}" \
         || { stopbg "$EP" "$DP" "$KP" "$MP" "$FP" "$SKP" "$VMP"; CELL_FAIL=abort-detach; return 1; }
     # the harness pid: run-cell.sh, the child of the unit's main process (the cellwrap bash); watch_nodes TERMs it
@@ -810,10 +810,12 @@ host_str() { # the PREFLIGHT OK line's warm-up gate / campaign checks / samplers
 scrub_env() { # the units get this process's EXPORTED env (detach.sh): only the basics stay exported, so no
     # TORUS_*, MALLOC_CONF, LD_PRELOAD or run-cell.sh knob from the launching shell reaches a cell. A driver name
     # (DRIVER_VARS) the caller happened to export keeps the driver's value and is only un-exported: unsetting it
-    # would delete driver config (RUN exported by the caller -> RUN unbound under set -u)
+    # would delete driver config (RUN exported by the caller -> RUN unbound under set -u). SOAK_DIRTY_HZ (Q6 step 0,
+    # the soak sampler's 10 Hz Dirty / Writeback option) stays exported: the sampler is the driver's own child, in
+    # launch and in run; cell() keeps it out of the cell's env (env -u)
     local _sv
     for _sv in $(compgen -e); do
-        case $_sv in PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_*|TZ|TMPDIR|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS) continue ;; esac
+        case $_sv in PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_*|TZ|TMPDIR|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|SOAK_DIRTY_HZ) continue ;; esac
         if [[ " ${DRIVER_VARS//$'\n'/ } " == *" $_sv "* ]]; then export -n "$_sv"; else unset "$_sv"; fi
     done
     export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
