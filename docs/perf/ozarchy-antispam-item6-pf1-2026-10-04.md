@@ -12352,6 +12352,128 @@ per window is INFERRED to be the epoch boundary (every 100 heights; `TORUS_EPOCH
   `phase-val0.txt`, per-window `*-w{1,2,3}.{txt,json}`), scripts `ozarchy-q8p2-analyst/`. The stopped s64 attempt
   (`ozarchy-q8p-*`) is kept; its smoke passed (236.2k matched/s).
 
+## 82. Campaign A: F, PE, PC, KP, DB and Q10's custody arm C vs base on main as shipped, standard load, 300 markets, 600 s cells, n = 3 (campaign ozarchy-campA, main `e3d11cb9`, archy, 2026-10-17/18)
+
+**PC wins clearly (+4.51% matched/s [1.0392, 1.0511]; exec block_ms -45%, native blocks/s +75%, block p50 192 -> 55 ms,
+p99 -16%). F wins (+1.50% [1.0019, 1.0283]; every epoch boundary block pipelined, exec block_ms -7%). PE is a marginal
+win (+1.03% [1.0025, 1.0182]) at +2.0% CPU per fill. KP (+1.03% [0.9970, 1.0238], CPU per fill +2.1%) and DB (+0.95%
+[1.0003, 1.0189]) are within noise. Custody (C, Q10) costs 21.6% matched/s ([0.7794, 0.7884]): 140 ms per follower
+validate, 95 ms per leader mirror, native blocks/s -36%, block p99 +41%. Step 5 candidates: PC + F (PE owner's call);
+Q10's 10-market pair (step 6) is not triggered. Rule: win = 95% CI above 1 and gain >= 1% (about 2x the largest arm
+replicate CV, 0.58%); loss = CI below 1; else within noise. n = 3, one host, rotating order.**
+
+Question (bench queue step 4, Items Q1, Q2, Q4, Q10): which of the flags on main help at the standard load, and what
+does shard custody cost?
+
+### 82.1 Setup
+
+Binary M = main `e3d11cb9` (node md5 `bf720f9f`, staged `ozarchy-s64-stage/m-run`, = staged on all 3 nodes). All six
+env vars exist on M and parse as the bench-queue table says. Tools frozen from main `5c6c82f8` (`ozarchy-campA-tools/
+FROZEN.txt`; `devnet/wsl/gen-3val-genesis.sh` kept at its e3d11cb9 version because the driver preflight requires genesis
+inputs equal to the harness worktree; main's adds only the unused `EVM_BLOCK_INTERVAL` knob; 3val genesis md5 `d694b81b`
+matched). Genesis N = 11 (`01168566`). Standard load (bench queue "Standard load"): Classic, 15 s checkpoints, oracle
+on, 300 markets, rate 76,000, `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1
+IN_FLIGHT_TAIL=commit CLOID_SHARE=0` (`IN_FLIGHT_TAIL_DEPTH` not set: nothing reads it), native only. D, M, T unset (on),
+resend 250.
+
+| arm | env |
+|---|---|
+| base | all flags absent (`absent_env`); custody pinned 0 by `env.sh` |
+| F (Q1) | `TORUS_EPOCH_FAST_PATH=1` |
+| PE (Q2) | `TORUS_PARALLEL_ENGINE=4` |
+| PC (Q4) | `TORUS_PARALLEL_CANCEL_ALL=8` |
+| KP (Q4) | `TORUS_EXEC_PARALLEL_KEYS=1` |
+| DB (Q4) | `TORUS_CKPT_DEFER_BOOKS=1` |
+| C (Q10) | `TORUS_SHARD_CUSTODY=1` (overrides `env.sh`'s 0) |
+
+Smoke (C arm) and warm-up w1 (base, 300 s), then 3 rotating rounds of 7 arms, 600 s cells; 20:55-01:55. Fresh data dirs
+for every cell (`CLEAN=1`); each C cell's data dirs deleted after its sizes were recorded (free disk 124-125 GB; refuse
+margin 80 GB).
+
+Validity: smoke + 22 / 22 cells rc 0, ACCEPT AGREE PASS, md5 `bf720f9f` on 3 nodes (re-checked from raw files); the
+standard-load `cell=` check passed on every cell; 375 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, 0 HARD FINDING, no reruns.
+Each arm's flag was seen on all 3 nodes, custody 0 on every non-C arm; DB logged `defer_books=true` once per node; F
+logged `epoch fast path ON` once per node and all 38 boundary blocks ran pipelined (base 0).
+
+### 82.2 Arm means vs base (n = 3 each; `campA.txt`)
+
+| arm | matched/s (diff, %) | native blk/s | block p50 / p99 ms | CPU-s / 1M | exec block_ms | hotstuff-algo ms / blk | timeouts / no_proposal (sum of 3) |
+|---|---|---|---|---|---|---|---|
+| base | 243,018 | 3.720 | 192 / 1,253 | 23.95 | 260.4 | 56.6 | 13 / 2 |
+| F | 246,672 (+3,654, +1.50%) | 4.002 | 167 / 1,193 | 23.98 | 242.7 | 53.7 | 9 / 0 |
+| PE | 245,531 (+2,512, +1.03%) | 4.061 | 163 / 1,259 | 24.43 | 239.4 | 53.6 | 13 / 2 |
+| PC | 253,980 (+10,962, +4.51%) | 6.513 | 55 / 1,051 | 24.09 | 143.8 | 35.3 | 15 / 2 |
+| KP | 245,529 (+2,511, +1.03%) | 3.948 | 169 / 1,277 | 24.46 | 246.1 | 54.6 | 15 / 0 |
+| DB | 245,335 (+2,316, +0.95%) | 3.838 | 188 / 1,242 | 24.06 | 253.1 | 55.5 | 11 / 2 |
+| C | 190,502 (-52,516, -21.61%) | 2.377 | 349 / 1,766 | 25.93 | 248.3 | 195.0 | 5 / 0 |
+
+Replicate CV of matched/s: base 0.05%, F 0.56%, PE 0.34%, PC 0.21%, KP 0.58%, DB 0.41%, C 0.28%.
+
+### 82.3 Paired vs base (geomean of per-round ratios, 95% CI, 2 df)
+
+| arm | matched/s | native blk/s | CPU-s / 1M | exec block_ms | block p99 | call |
+|---|---|---|---|---|---|---|
+| F | 1.0150 [1.0019, 1.0283] | 1.0755 [1.0168, 1.1376] | 1.0010 [0.9909, 1.0112] | 0.9316 [0.8843, 0.9814] | 0.9518 [0.8677, 1.0441] | win |
+| PE | 1.0103 [1.0025, 1.0182] | 1.0917 [1.0506, 1.1343] | 1.0198 [1.0176, 1.0220] | 0.9191 [0.8817, 0.9581] | 1.0048 [0.8643, 1.1682] | marginal win, +2% CPU per fill |
+| PC | 1.0451 [1.0392, 1.0511] | 1.7508 [1.6574, 1.8495] | 1.0056 [0.9977, 1.0134] | 0.5521 [0.5271, 0.5783] | 0.8385 [0.7454, 0.9433] | clear win |
+| KP | 1.0103 [0.9970, 1.0238] | 1.0612 [0.9666, 1.1651] | 1.0212 [1.0070, 1.0356] | 0.9448 [0.8642, 1.0329] | 1.0192 [0.9735, 1.0670] | within noise, +2% CPU per fill |
+| DB | 1.0095 [1.0003, 1.0189] | 1.0317 [0.9935, 1.0714] | 1.0044 [0.9974, 1.0113] | 0.9717 [0.9337, 1.0111] | 0.9910 [0.8725, 1.1256] | within noise (CI just above 1, gain < 1%) |
+| C | 0.7839 [0.7794, 0.7884] | 0.6391 [0.6255, 0.6530] | 1.0824 [1.0803, 1.0845] | 0.9519 [0.8247, 1.0988] | 1.4102 [1.3155, 1.5116] | loss |
+
+### 82.4 C: shard custody on (Q10)
+
+| | base | C |
+|---|---|---|
+| `torus_validate_block_custody_seconds` per follower validate | 0.00 ms | 139.7 ms (139.1 / 140.2 / 139.7) |
+| `torus_block_build_mirror_seconds` per leader block | 14.1 ms | 95.5 ms |
+| hotstuff-algo on-CPU per block | 56.6 ms | 195.0 ms |
+| consensus-DB written per node per cell | 17.0 GB | 24.7 GB |
+| `cf_native_shards` per node per cell | 0 | 1.70 / 1.73 / 1.75 GB |
+| peak node data per node | 6.3-6.8 GB | 6.3-7.0 GB |
+| `torus_native_da_shard_recovered` | 0 | 0 |
+
+Custody runs on hotstuff-algo before the vote, so it slows consensus, not exec (exec block_ms is unchanged within
+noise; native blocks/s -36%). The disk estimate (20+ GB per node per 600 s cell) was about 10x high: shards are
+~1.7 GB per node per cell. M has no per-CF size metric; `cf_native_shards` is from the RocksDB LOG file-creation events
+plus the SSTs on disk (`shards_by_cf.py`). Q10 decision rule (bench queue): a real cost -> custody OFF by default until
+the validator set is large (roadmap T3.1), and the RH4 shard-count fix waits for T3.1. Owner decides.
+
+### 82.5 Next
+
+* Step 5 (Q4 winners together): PC + F; PE is marginal (owner's call). KP and DB do not qualify.
+* Step 6 (Q10 10-market pair): not triggered (C is a clear loss at 300 markets).
+* Data: `~/bench-results-matched/ozarchy-campA-300m-{smoke-s0,w1,r1-*,r2-*,r3-*}` (C cells also `campA-disk.txt`),
+  campaign files `ozarchy-campA-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`), tools `ozarchy-campA-tools/`
+  (`campA-spec.json`, `campA-checks.sh`, `shards_by_cf.py`, the driver, `FROZEN.txt`), analysis
+  `ozarchy-campA-run/analyst/` (`campA.txt`, `campA-analyse.py`).
+
+### 82.6 Cells (`campA.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | flag | matched/s | native blk/s | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | no_proposal | hotstuff-algo ms/blk | custody ms/obs | mirror ms/leader blk | cdb written GB/node | shards GB/node | peak data GB/node |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | base | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,317.4 | 4.462 | 215.9 | 128 / 1,245 | 23.87 | 1.0 | 0 | 49.2 | 0.00 | 10.00 | 8.9 | 0.00 | 5.3 |
+| r1 | base | 0/0 | ACCEPT/AGREE/PASS | True | ok | 242,981.2 | 3.721 | 260.2 | 191 / 1,225 | 23.97 | 3.0 | 0 | 56.5 | 0.00 | 13.98 | 17.0 | 0.00 | 6.3 |
+| r1 | F | 0/0 | ACCEPT/AGREE/PASS | True | ok | 247,355.0 | 3.925 | 246.6 | 183 / 1,137 | 23.90 | 2.0 | 0 | 54.4 | 0.00 | 13.64 | 17.4 | 0.00 | 6.8 |
+| r1 | PE | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,057.0 | 4.002 | 243.0 | 171 / 1,319 | 24.45 | 4.0 | 1.0 | 54.5 | 0.00 | 13.91 | 17.2 | 0.00 | 6.4 |
+| r1 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 254,604.6 | 6.446 | 144.2 | 56 / 1,016 | 24.09 | 7.0 | 0 | 35.7 | 0.00 | 10.29 | 17.5 | 0.00 | 6.3 |
+| r1 | KP | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,756.5 | 3.962 | 245.1 | 161 / 1,257 | 24.41 | 5.0 | 0 | 54.6 | 0.00 | 13.75 | 17.2 | 0.00 | 6.5 |
+| r1 | DB | 0/0 | ACCEPT/AGREE/PASS | True | ok | 244,516.5 | 3.773 | 257.3 | 194 / 1,284 | 24.11 | 9.0 | 2.0 | 56.0 | 0.00 | 14.05 | 17.0 | 0.00 | 6.3 |
+| r1 | C | 0/0 | ACCEPT/AGREE/PASS | True | ok | 190,399.2 | 2.380 | 237.7 | 346 / 1,776 | 25.92 | 0.0 | 0 | 194.7 | 139.13 | 94.87 | 24.6 | 1.70 | 6.3 |
+| r2 | F | 0/0 | ACCEPT/AGREE/PASS | True | ok | 247,569.2 | 4.140 | 235.1 | 158 / 1,170 | 23.99 | 4.0 | 0 | 52.4 | 0.00 | 13.57 | 17.3 | 0.00 | 6.4 |
+| r2 | PE | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,966.8 | 4.095 | 237.7 | 160 / 1,224 | 24.42 | 3.0 | 0 | 53.3 | 0.00 | 13.86 | 17.2 | 0.00 | 6.3 |
+| r2 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 253,678.9 | 6.478 | 145.0 | 56 / 1,105 | 24.19 | 4.0 | 0 | 35.5 | 0.00 | 10.16 | 17.5 | 0.00 | 6.4 |
+| r2 | KP | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,818.0 | 3.832 | 253.3 | 191 / 1,249 | 24.39 | 6.0 | 0 | 55.8 | 0.00 | 13.91 | 17.1 | 0.00 | 6.3 |
+| r2 | DB | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,465.1 | 3.917 | 247.6 | 181 / 1,226 | 24.00 | 1.0 | 0 | 54.5 | 0.00 | 13.57 | 17.2 | 0.00 | 6.4 |
+| r2 | C | 0/0 | ACCEPT/AGREE/PASS | True | ok | 191,071.7 | 2.378 | 239.8 | 341 / 1,764 | 25.95 | 2.0 | 0 | 195.5 | 140.19 | 95.92 | 24.7 | 1.73 | 7.0 |
+| r2 | base | 0/0 | ACCEPT/AGREE/PASS | True | ok | 243,147.4 | 3.755 | 258.3 | 188 / 1,251 | 23.97 | 5.0 | 2.0 | 55.8 | 0.00 | 13.83 | 16.9 | 0.00 | 6.8 |
+| r3 | PE | 0/0 | ACCEPT/AGREE/PASS | True | ok | 244,568.4 | 4.085 | 237.4 | 157 / 1,234 | 24.42 | 6.0 | 1.0 | 53.0 | 0.00 | 13.41 | 17.1 | 0.00 | 6.5 |
+| r3 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 253,656.8 | 6.614 | 142.2 | 54 / 1,032 | 23.99 | 4.0 | 2.0 | 34.6 | 0.00 | 10.04 | 17.5 | 0.00 | 6.5 |
+| r3 | KP | 0/0 | ACCEPT/AGREE/PASS | True | ok | 244,012.6 | 4.051 | 240.0 | 155 / 1,325 | 24.59 | 4.0 | 0 | 53.3 | 0.00 | 13.34 | 17.1 | 0.00 | 6.4 |
+| r3 | DB | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,022.8 | 3.824 | 254.3 | 189 / 1,215 | 24.07 | 1.0 | 0 | 56.0 | 0.00 | 13.84 | 17.0 | 0.00 | 6.5 |
+| r3 | C | 0/0 | ACCEPT/AGREE/PASS | True | ok | 190,035.1 | 2.373 | 267.3 | 359 / 1,758 | 25.91 | 3.0 | 0 | 194.7 | 139.69 | 95.59 | 25.0 | 1.75 | 6.7 |
+| r3 | base | 0/0 | ACCEPT/AGREE/PASS | True | ok | 242,926.8 | 3.683 | 262.9 | 197 / 1,282 | 23.92 | 5.0 | 0 | 57.4 | 0.00 | 14.46 | 17.0 | 0.00 | 6.5 |
+| r3 | F | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,092.5 | 3.940 | 246.3 | 161 / 1,274 | 24.05 | 3.0 | 0 | 54.2 | 0.00 | 13.72 | 17.1 | 0.00 | 6.4 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

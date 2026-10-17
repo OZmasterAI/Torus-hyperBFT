@@ -2,7 +2,7 @@
 
 Benches run on archy only. 18c keeps this list current; archy reads it on pull. IDs (Q1, Q2, ...) stay fixed when an
 item moves between sections.
-Last archy benches: `ozarchy-q7m3s` + `ozarchy-q7cls` (Q7 run 2; run 1 `ozarchy-q7m3` + `ozarchy-q7cl`;
+Last archy benches: `ozarchy-campA` (campaign A + Q10 arm C, section 82), 2026-10-18; `ozarchy-q7m3s` + `ozarchy-q7cls` (Q7 run 2; run 1 `ozarchy-q7m3` + `ozarchy-q7cl`;
 `item7-step2-native-ab.md`), `ozarchy-q8p2` (Q8, section 81)
 and `ozarchy-q5c` (Q5, section 80) of `ozarchy-antispam-item6-pf1-2026-10-04.md`, 2026-10-17; before them `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
 
@@ -83,6 +83,11 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    | KP (Q4) | `TORUS_EXEC_PARALLEL_KEYS=1` (only "1" turns it on) |
    | DB (Q4) | `TORUS_CKPT_DEFER_BOOKS=1`; check its `defer_books=true` info line in each node's log (it logs `false` if gated off) |
    | C (Q10) | `TORUS_SHARD_CUSTODY=1` (overrides `env.sh`'s pinned 0); fresh data dirs per cell and a free-disk check first (Items, Q10) |
+
+   **Done s66 (ozarchy-campA, 22 / 22 valid, section 82): PC +4.51% [1.0392, 1.0511] clear win; F +1.50% [1.0019,
+   1.0283] win; PE +1.03% [1.0025, 1.0182] marginal (+2% CPU per fill); KP +1.03% [0.9970, 1.0238] and DB +0.95%
+   within noise; C (custody) -21.61% [0.7794, 0.7884] loss (140 ms per validate, shards ~1.7 GB per node per cell, not
+   20 GB). Step 5 candidates PC + F (PE owner's call); step 6 not triggered.**
 
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10).
