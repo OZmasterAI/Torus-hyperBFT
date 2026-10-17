@@ -403,8 +403,10 @@ impl NativeDaStore {
     /// hash is listed only by the row of its LATEST recorded height: a durable
     /// per-hash reference ([`DA_GC_REF_PREFIX`]) finds the earlier row, which
     /// loses the hash in the same batch, so the body and its shards go when
-    /// the latest reference expires (Codex P1). A `height` below one already
-    /// recorded is a replay and records nothing.
+    /// the latest reference expires (Codex P1), every index written under
+    /// any of its rows (the later row keeps the larger shard count, Codex
+    /// P2). A `height` below one already recorded is a replay and records
+    /// nothing.
     ///
     /// One atomic `WriteBatch` per pass (the row, the references, any earlier
     /// row a re-inclusion rewrites, the deletes and the GC state), bounded by
@@ -482,8 +484,14 @@ impl NativeDaStore {
     /// or above `frontier`) is a re-inclusion: that row is rewritten without
     /// it (deleted when it empties) and the hash goes to `moved`. The rewrite
     /// is a read-modify-write of one row per earlier height, only on a
-    /// re-inclusion. An earlier row's larger shard count is not carried over:
-    /// shards past the later row's count stay (kept, never early).
+    /// re-inclusion; the membership tests are set lookups (Codex P2).
+    ///
+    /// The new row takes the largest shard count of the rows it took hashes
+    /// from (Codex P2): a moved hash's shards were custodied under that count
+    /// (a larger validator set, say), and its latest expiry must delete every
+    /// index written. The new row's other hashes then also get deletes for
+    /// indices they never had: tombstones, only on a re-inclusion after a set
+    /// shrink.
     fn record_row(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -497,6 +505,7 @@ impl NativeDaStore {
         let ref_keys: Vec<[u8; DA_GC_REF_KEY_LEN]> =
             hashes.iter().map(|h| da_gc_ref_key(h.as_slice())).collect();
         let mut earlier: BTreeMap<u64, HashSet<[u8; 32]>> = BTreeMap::new();
+        let mut row_shard_count = shard_count;
         let refs =
             self.db
                 .inner()
@@ -519,6 +528,9 @@ impl NativeDaStore {
                         .filter(|h| !detach.contains(*h))
                         .map(B256::from_slice)
                         .collect();
+                    if kept.len() < listed.len() / 32 {
+                        row_shard_count = row_shard_count.max(row_shards);
+                    }
                     if kept.is_empty() {
                         batch.delete_cf(cf, key);
                     } else {
@@ -531,7 +543,7 @@ impl NativeDaStore {
         batch.put_cf(
             cf,
             da_gc_row_key(height),
-            encode_da_gc_row(shard_count, hashes),
+            encode_da_gc_row(row_shard_count, hashes),
         );
         let at = height.to_be_bytes();
         for key in &ref_keys {
@@ -1484,5 +1496,70 @@ mod tests {
             ratios.push(ratio);
         }
         panic!("re-including {N} hashes cost {ratios:.1?} x a fresh record: not linear");
+    }
+
+    /// The shard indices of `hash` present among the first `upto`.
+    fn shard_indices(store: &NativeDaStore, hash: &B256, upto: u16) -> Vec<u16> {
+        (0..upto)
+            .filter(|&i| store.get_shard(&hash.0, i).unwrap().is_some())
+            .collect()
+    }
+
+    /// Codex P2 (finding 2): a hash re-included after a validator-set shrink
+    /// moves from a 7-shard row to a 4-shard one. Its shards 4..7 (custodied
+    /// under the larger set) must still go at its latest expiry, across
+    /// restarts: the later row keeps the larger count. Both moves: `a` while
+    /// the earlier row is pending, `c` in the very pass that ages it out;
+    /// the earlier row's other hash `b` goes on time with all 7 shards.
+    #[test]
+    fn gc_reinclusion_after_a_set_shrink_deletes_every_shard() {
+        const W: u64 = 4;
+        let (wide, narrow) = (ErasureParams::new(3, 7), ErasureParams::new(2, 4));
+        let (dir, mut store) = temp_store();
+        let actions: Vec<_> = (1..=3).map(dummy_action).collect();
+        let [ha, hb, hc] = [0, 1, 2].map(|i| compute_action_hash(&actions[i]));
+        store.put_batch(&actions).unwrap();
+        store.put_shards_batch(&actions, wide).unwrap();
+        // (action index, latest reference height)
+        let latest = [(0, 12), (1, 10), (2, 14)];
+        for tip in 10..=20u64 {
+            // The re-including block's custody runs under the shrunk set.
+            let (hashes, n) = match tip {
+                10 => (vec![ha, hb, hc], wide.n as u16),
+                12 => (vec![ha], narrow.n as u16),
+                14 => (vec![hc], narrow.n as u16),
+                _ => (vec![], narrow.n as u16),
+            };
+            if tip == 12 || tip == 14 {
+                let i = if tip == 12 { 0 } else { 2 };
+                store
+                    .put_shards_batch(std::slice::from_ref(&actions[i]), narrow)
+                    .unwrap();
+            }
+            store
+                .gc_committed(tip, &hashes, n, W, UNCAPPED, LIMITS)
+                .unwrap();
+            if tip == 13 {
+                drop(store);
+                store = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+            }
+            for (i, last) in latest {
+                let live = tip < last + W;
+                let hash = compute_action_hash(&actions[i]);
+                assert_eq!(present(&store, &actions[i]), live, "body {i} at tip {tip}");
+                let expected: Vec<u16> = if live { (0..7).collect() } else { vec![] };
+                assert_eq!(
+                    shard_indices(&store, &hash, 7),
+                    expected,
+                    "shards of body {i} at tip {tip}"
+                );
+            }
+        }
+        drop(store);
+        let store = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+        for hash in [ha, hb, hc] {
+            assert_eq!(shard_indices(&store, &hash, 7), Vec::<u16>::new());
+        }
+        assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
     }
 }
