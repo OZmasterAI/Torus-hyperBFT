@@ -5,7 +5,7 @@ use revm::context::TxEnv;
 use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 use torus_core::precompiles::CoreWriterQueue;
-use torus_evm::{calc_next_block_base_fee, BlockEnvCfg, EvmExecutor, TORUS_CHAIN_ID};
+use torus_evm::{calc_next_block_base_fee, BigLane, BlockEnvCfg, EvmExecutor, TORUS_CHAIN_ID};
 use torus_state::StateDb;
 
 /// Keccak256 of empty bytes.
@@ -32,6 +32,19 @@ fn test_account(balance: U256) -> AccountInfo {
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    (dir, db)
+}
+
+/// [`open_test_db`] with the CoreWriter order delay K pinned to 1 (item 7 step 2): for the
+/// writer-precompile tests that read the order rows at `block + 1`.
+fn open_test_db_k1() -> (tempfile::TempDir, StateDb) {
+    let (dir, db) = open_test_db();
+    db.put_cf_raw(
+        torus_state::cf::CF_FEE_CONFIG,
+        b"core_writer_order_delay",
+        b"1",
+    )
+    .expect("pin K = 1");
     (dir, db)
 }
 
@@ -345,6 +358,100 @@ fn block_execution_multiple_txs() {
 
     // Bundle should contain state changes.
     assert!(!result.bundle.state.is_empty());
+}
+
+/// Item 7 step 2: an EIP-1559 transfer at max fee `max_fee`, tip 1 wei.
+fn transfer_1559(from: Address, to: Address, nonce: u64, max_fee: u128) -> TxEnv {
+    TxEnv {
+        tx_type: 2,
+        gas_priority_fee: Some(1),
+        ..transfer_tx(from, to, U256::from(1u64), nonce, max_fee)
+    }
+}
+
+/// Item 7 step 2: a big-lane sender's tx runs at the big base fee, the other at the block's;
+/// the result splits the gas and sums the fee revenue per lane. RED before: one base fee.
+#[test]
+fn big_lane_sender_pays_the_big_base_fee() {
+    let (_dir, db) = open_test_db();
+    let balance = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(balance)).unwrap();
+    db.put_account(&BOB, &test_account(balance)).unwrap();
+    // A and B funded; transfers at max fee 5 gwei, tip 1 wei; block base fee 1 gwei.
+    let cfg = BlockEnvCfg {
+        base_fee: 1_000_000_000,
+        ..default_block_cfg()
+    };
+    let big = BigLane {
+        base_fee: 3_000_000_000,
+        senders: [BOB].into_iter().collect(),
+    };
+    let txs = vec![
+        transfer_1559(ALICE, CAROL, 0, 5_000_000_000),
+        transfer_1559(BOB, CAROL, 0, 5_000_000_000),
+    ];
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block_lanes(&db, &cfg, txs, false, &big)
+        .unwrap();
+    assert_eq!(r.receipts[0].effective_gas_price, 1_000_000_001);
+    assert_eq!(r.receipts[1].effective_gas_price, 3_000_000_001);
+    assert_eq!(r.gas_used, 42_000);
+    assert_eq!(r.big_gas_used, 21_000);
+    assert_eq!(
+        r.fee_revenue,
+        21_000 * 1_000_000_000 + 21_000 * 3_000_000_000
+    );
+    // B paid the big fee: 21k x (3 gwei + 1 wei) + the 1 wei value.
+    let paid = |a: &Address| balance - r.bundle.state[a].info.as_ref().unwrap().balance;
+    assert_eq!(paid(&BOB), U256::from(21_000u64 * 3_000_000_001 + 1));
+    assert_eq!(paid(&ALICE), U256::from(21_000u64 * 1_000_000_001 + 1));
+    // One lane (the default): both at the block's fee, no big gas.
+    let one = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block(
+            &db,
+            &cfg,
+            vec![
+                transfer_1559(ALICE, CAROL, 0, 5_000_000_000),
+                transfer_1559(BOB, CAROL, 0, 5_000_000_000),
+            ],
+            false,
+        )
+        .unwrap();
+    assert_eq!(one.receipts[1].effective_gas_price, 1_000_000_001);
+    assert_eq!(
+        (one.big_gas_used, one.fee_revenue),
+        (0, 42_000 * 1_000_000_000)
+    );
+}
+
+/// Item 7 step 2: a big-lane tx whose max fee is under the big base fee is invalid: with
+/// `skip_invalid` it gets no receipt and the small-lane tx still runs.
+#[test]
+fn big_lane_tx_below_the_big_base_fee_is_skipped() {
+    let (_dir, db) = open_test_db();
+    let balance = U256::from(10_000_000_000_000_000_000u128);
+    db.put_account(&ALICE, &test_account(balance)).unwrap();
+    db.put_account(&BOB, &test_account(balance)).unwrap();
+    let cfg = BlockEnvCfg {
+        base_fee: 1_000_000_000,
+        ..default_block_cfg()
+    };
+    let big = BigLane {
+        base_fee: 3_000_000_000,
+        senders: [BOB].into_iter().collect(),
+    };
+    let txs = vec![
+        transfer_1559(BOB, CAROL, 0, 2_000_000_000),
+        transfer_1559(ALICE, CAROL, 0, 2_000_000_000),
+    ];
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_block_lanes(&db, &cfg, txs, true, &big)
+        .unwrap();
+    assert_eq!(r.included_indices, vec![1]);
+    assert_eq!(r.receipts.len(), 1);
+    assert_eq!(r.receipts[0].effective_gas_price, 1_000_000_001);
+    assert_eq!((r.gas_used, r.big_gas_used), (21_000, 0));
+    assert_eq!(r.fee_revenue, 21_000 * 1_000_000_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +794,56 @@ fn removed_get_order_book_reverts_for_exactly_the_base() {
         .0;
     assert!(!r.success, "the removed selector reverts");
     assert_eq!(r.gas_used, intrinsic + GAS_PRECOMPILE_READ);
+}
+
+/// Item 7 step 2 (owner decision 3, s125): a `bbo(bytes32)` call at 0x080e
+/// costs the reader base (its point read inside) + 2 returned words =
+/// 16,440 gas on top of the intrinsic gas, and returns the row's prices.
+#[test]
+fn bbo_call_costs_exactly_16440_gas() {
+    let (_dir, db) = open_test_db();
+    db.put_account(&ALICE, &test_account(U256::from(10u128.pow(19))))
+        .unwrap();
+    let (bid, ask) = (99i128 * 10i128.pow(18), 101i128 * 10i128.pow(18));
+    let mut row = bid.to_be_bytes().to_vec();
+    row.extend_from_slice(&ask.to_be_bytes());
+    db.put_cf_raw(torus_state::cf::CF_NATIVE_BBO, &1u64.to_be_bytes(), &row)
+        .unwrap();
+    let mut data = alloy_primitives::keccak256("bbo(bytes32)".as_bytes())[..4].to_vec();
+    data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+    let intrinsic: u64 = 21_000
+        + data
+            .iter()
+            .map(|&b| if b == 0 { 4 } else { 16 })
+            .sum::<u64>();
+    let block_cfg = default_block_cfg();
+    let tx = TxEnv {
+        caller: ALICE,
+        gas_limit: 100_000,
+        gas_price: block_cfg.base_fee as u128,
+        // BboReader precompile at 0x080e.
+        kind: TxKind::Call(Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0x0e,
+        ])),
+        data: Bytes::from(data),
+        chain_id: Some(TORUS_CHAIN_ID),
+        ..Default::default()
+    };
+    let r = EvmExecutor::new(TORUS_CHAIN_ID)
+        .execute_tx(&db, &block_cfg, tx)
+        .unwrap()
+        .0;
+    assert!(r.success, "bbo answers");
+    assert_eq!(r.gas_used, intrinsic + 16_440);
+    assert_eq!(r.output.len(), 64);
+    assert_eq!(
+        u128::from_be_bytes(r.output[16..32].try_into().unwrap()),
+        bid as u128
+    );
+    assert_eq!(
+        u128::from_be_bytes(r.output[48..64].try_into().unwrap()),
+        ask as u128
+    );
 }
 
 /// HL-parity: a reader precompile's gas scales with its work, not a flat
@@ -1038,7 +1195,7 @@ fn cancel_order_calldata(order_id: u128) -> Vec<u8> {
 /// (pending_count == 1); with the per-tx journal it is discarded (== 0).
 #[test]
 fn reverting_tx_discards_writer_precompile_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1077,7 +1234,7 @@ fn reverting_tx_discards_writer_precompile_side_effects() {
 /// both before and after the journal change, pinning state-root determinism).
 #[test]
 fn successful_tx_persists_writer_precompile_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1113,7 +1270,7 @@ fn successful_tx_persists_writer_precompile_side_effects() {
 /// one successful writer-precompile tx, only the successful tx's action survives.
 #[test]
 fn block_execution_journals_writer_precompiles_per_tx() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1211,7 +1368,7 @@ fn call_and_swallow_revert_code(callee: &Address) -> Vec<u8> {
 /// checkpoint/revert it is discarded (== 0). This is the test that would have caught the bug.
 #[test]
 fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1260,7 +1417,7 @@ fn caught_inner_frame_revert_discards_writer_precompile_side_effects() {
 #[test]
 fn block_execution_reports_the_tx_and_call_of_each_queued_row() {
     use torus_evm::CoreWriterOrigin;
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let ten_eth = U256::from(10_000_000_000_000_000_000u128);
     db.put_account(&ALICE, &test_account(ten_eth)).unwrap();
 
@@ -1685,7 +1842,7 @@ fn lockbox_deposit_in_reverted_subcall_enqueues_nothing_and_loses_nothing() {
 /// Wrong-context / malformed lockbox calls revert and leave no trace.
 #[test]
 fn lockbox_rejects_bad_calls_without_side_effects() {
-    let (_dir, db) = open_test_db();
+    let (_dir, db) = open_test_db_k1();
     let e0 = tokens_wei(1_000);
     db.put_account(&ALICE, &test_account(e0)).unwrap();
     seed_native(&db, &ALICE, 50 * 100_000_000);
@@ -1828,7 +1985,7 @@ fn writer_precompiles_reject_delegatecall_and_callcode() {
     ];
     for (name, target, data) in cases {
         for (opcode, op_name, ok) in [(0xf4, "DELEGATECALL", false), (0xf2, "CALLCODE", false), (0xf1, "CALL", true)] {
-            let (_dir, db) = open_test_db();
+            let (_dir, db) = open_test_db_k1();
             db.put_account(&ALICE, &test_account(tokens_wei(10))).unwrap();
             let proxy = Address::new([0xD2; 20]);
             install_contract(&db, &proxy, &forwarding_code(&target, opcode));

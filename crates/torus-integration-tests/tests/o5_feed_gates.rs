@@ -8,23 +8,27 @@
 //! drops the message AND penalizes the author (swarm.rs oversized-consensus
 //! path), so a proposer that legally exceeds a cap livelocks the view.
 
-use torus_mempool::rate_limit::{
-    evm_block_gas_budget, native_total_block_cap, NATIVE_ORDERS_PER_BATCH_CAP,
-};
+use torus_mempool::rate_limit::{native_total_block_cap, NATIVE_ORDERS_PER_BATCH_CAP};
 use torus_network::config::NetworkConfig;
+use torus_types::{
+    EVM_BIG_BLOCK_GAS_LIMIT_RANGE, EVM_BLOCK_GAS_LIMIT_RANGE, EVM_MIN_TX_GAS,
+    MAX_EVM_BIG_BLOCK_TX_BYTES, MAX_EVM_BLOCK_TX_BYTES,
+};
 
-/// EVM calldata costs >= 16 gas/byte (EIP-2028 non-zero floor), so the
-/// per-block gas budget bounds selectable EVM bytes. A compact proposal
-/// carries those bytes INLINE (`CompactBlock.evm_transactions`) — the worst
-/// legal selection must fit the consensus accept gate, or every receiver
-/// drops the proposal and penalizes the proposer while the next leader
-/// re-selects the same mempool: a livelock by construction.
+/// The vote caps a block's EVM txs (item 7): at most 768 KiB of raw tx bytes at a big height
+/// (256 KiB otherwise) and at most (small + big limit) / 21,000 txs, each framed by a u64
+/// length in bincode. A compact proposal carries them INLINE (`CompactBlock.evm_transactions`):
+/// the worst legal proposal must fit the consensus accept gate, or every receiver drops it and
+/// penalizes the proposer while the next leader re-selects the same mempool (livelock).
 #[test]
 fn worst_case_compact_proposal_fits_consensus_accept_gate() {
-    let evm_worst = (evm_block_gas_budget() / 16) as usize; // 5M gas / 16 = 312.5 KB
-    let manifest = native_total_block_cap() * 32; // 32B action hashes
-    let header_slack = 4 * 1024; // header + bincode framing margin
-    let worst = evm_worst + manifest + header_slack;
+    const { assert!(MAX_EVM_BIG_BLOCK_TX_BYTES >= MAX_EVM_BLOCK_TX_BYTES) };
+    let max_txs = ((*EVM_BLOCK_GAS_LIMIT_RANGE.end() + *EVM_BIG_BLOCK_GAS_LIMIT_RANGE.end())
+        / EVM_MIN_TX_GAS) as usize; // 1,904
+    let evm_worst = MAX_EVM_BIG_BLOCK_TX_BYTES + 8 * max_txs + 8; // 801,672
+    let manifest = native_total_block_cap() * 32 + 8; // 12,808 at the compiled cap
+    let header_slack = 16 * 1024; // header, justify QC signatures, Proposal framing
+    let worst = evm_worst + manifest + header_slack; // 830,864
     let accept = NetworkConfig::default().max_consensus_message_size;
     assert!(
         worst <= accept,

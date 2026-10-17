@@ -1,6 +1,8 @@
 # Design: item 7 step 2, HL-style small and big EVM blocks
 
-Status: brainstorm (s123), for owner review before writing-plans. Builds on step 1 (`item7-step1-design.md`,
+Status: **built (s126)** on `feat/item7-step2` (commit groups C1-C10, plan `item7-step2-impl.md` with the owner's
+build decisions s126), option A with the s123 decisions below; not merged yet (the merge waits for the 4-validator
+devnet check and archy's native-only A/B, bench queue Q7). Was: brainstorm (s123). Builds on step 1 (`item7-step1-design.md`,
 `item7-step1-impl.md`, branch `feat/item7-step1-evm-lanes`). Step 2 scope (s99, s122): block types with their own
 limits and cadence, two EVM pools, big-block opt-in, RPC and fees (EIP-1559 per block type), the best bid/ask read
 precompile, and the CoreWriter delay. Code facts from a read-only scout on main `2308da3d` and the step 1 branch

@@ -94,6 +94,19 @@ pub(crate) async fn cmd_withdraw(
     .await
 }
 
+/// Item 7 step 2: the `EvmUserModify` action of `evm-user-modify`.
+pub(crate) fn build_evm_user_modify(using_big_blocks: bool) -> NativeAction {
+    NativeAction::EvmUserModify { using_big_blocks }
+}
+
+pub(crate) async fn cmd_evm_user_modify(
+    cli: &Cli,
+    rpc: &RpcClient,
+    using_big_blocks: bool,
+) -> Result<(), String> {
+    submit_native_action(cli, rpc, build_evm_user_modify(using_big_blocks)).await
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, U256};
@@ -141,5 +154,40 @@ mod tests {
             &key,
         );
         assert_eq!(signed.recover_sender().unwrap(), address_from_key(&key));
+    }
+
+    /// Item 7 step 2: `evm-user-modify --using-big-blocks true|false` parses and builds
+    /// `EvmUserModify`, which survives serde JSON and signs with the owner key (EIP-712 only).
+    #[test]
+    fn evm_user_modify_action() {
+        use clap::Parser;
+        for (arg, want) in [("true", true), ("false", false)] {
+            let cli = crate::Cli::try_parse_from([
+                "torus-wallet",
+                "evm-user-modify",
+                "--using-big-blocks",
+                arg,
+            ])
+            .unwrap();
+            let crate::Command::EvmUserModify { using_big_blocks } = cli.command else {
+                panic!("{arg}: wrong command");
+            };
+            assert_eq!(using_big_blocks, want);
+            let a = super::build_evm_user_modify(using_big_blocks);
+            assert!(
+                matches!(a, NativeAction::EvmUserModify { using_big_blocks } if using_big_blocks == want)
+            );
+            let back: NativeAction =
+                serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+            assert_eq!(back.canonical_bytes(), a.canonical_bytes());
+            assert!(torus_types::eip712::requires_eip712(&a));
+            let key = test_signing_key();
+            let signed = sign_native_action(a, 1_700_000_000_003u64, &key);
+            assert_eq!(signed.recover_sender().unwrap(), address_from_key(&key));
+        }
+        assert!(
+            crate::Cli::try_parse_from(["torus-wallet", "evm-user-modify"]).is_err(),
+            "flag required"
+        );
     }
 }

@@ -39,7 +39,8 @@ use jsonrpsee::PendingSubscriptionSink;
 
 use torus_evm::{BlockEnvCfg, TxEnv};
 use torus_state::cf::{
-    CF_BLOCK_BODIES, CF_BLOCK_HASH_TO_NUMBER, CF_BLOCK_HEADERS, CF_RECEIPTS, CF_TX_HASH_TO_LOCATION,
+    evm_lane_key, CF_BLOCK_BODIES, CF_BLOCK_HASH_TO_NUMBER, CF_BLOCK_HEADERS, CF_NATIVE_ORACLE,
+    CF_RECEIPTS, CF_TX_HASH_TO_LOCATION,
 };
 use torus_types::{Receipt, TorusBlockBody, TorusBlockHeader};
 
@@ -106,12 +107,15 @@ pub trait EthApi {
     async fn estimate_gas(&self, tx: CallRequest, block: Option<String>) -> RpcResult<String>;
     #[method(name = "getLogs")]
     async fn get_logs(&self, filter: LogFilter) -> RpcResult<Vec<RpcLog>>;
+    /// `block_type` (item 7 step 2): `"small"` (default) or `"big"`, the lane whose base fees
+    /// are listed. `gasUsedRatio` is the header's either way.
     #[method(name = "feeHistory")]
     async fn fee_history(
         &self,
         block_count: String,
         newest_block: String,
         reward_percentiles: Option<Vec<f64>>,
+        block_type: Option<String>,
     ) -> RpcResult<FeeHistory>;
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = serde_json::Value)]
     async fn subscribe(
@@ -274,6 +278,58 @@ fn block_env_from_header(header: &TorusBlockHeader) -> BlockEnvCfg {
     }
 }
 
+/// Item 7 step 2: the env of a call from `caller` on `header`: its lane's gas limit and base fee
+/// (the big lane while big blocks are on and its `EvmUserModify` row says so).
+///
+/// `lanes` is where the row is read: the mempool's ingress view (owner s126, option B), the exec
+/// thread's latest executed state. Admission, routing and `torus_usingBigBlocks` read the lane
+/// there too, so a lane choice executed but not yet checkpointed (up to one checkpoint, ~15 s)
+/// counts here as it does there; the DB would still hold the old lane. Only the row comes from
+/// the view: the call itself runs on the DB state at the eth head, under `header`'s limits and
+/// base fees.
+fn lane_block_env<S: torus_state::backend::StateBackend>(
+    lanes: &S,
+    header: &TorusBlockHeader,
+    caller: &Address,
+) -> Result<BlockEnvCfg, RpcError> {
+    let mut env = block_env_from_header(header);
+    let big = header.evm_big_block_interval > 0
+        && lanes
+            .get_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(caller))?
+            .is_some();
+    if big {
+        env.gas_limit = header.evm_big_gas_limit;
+        env.base_fee = header.big_base_fee_per_gas;
+    }
+    Ok(env)
+}
+
+/// The block env of an eth_call / eth_estimateGas at the eth head `head`: the head header in the
+/// caller's lane (`call.from`, else the zero address; the lane from the ingress view, see
+/// [`lane_block_env`]), or the default env before the first block.
+fn call_block_env(
+    state: &RpcState,
+    head: u64,
+    call: &CallRequest,
+) -> Result<BlockEnvCfg, RpcError> {
+    if head == 0 {
+        return Ok(BlockEnvCfg::default());
+    }
+    let Some((header, _, _)) = get_header_with_hash(state, head)? else {
+        return Ok(BlockEnvCfg::default());
+    };
+    let caller = match &call.from {
+        Some(f) => parse_address(f)?,
+        None => Address::ZERO,
+    };
+    // A fresh view for the one row, dropped before the call runs: a live view keeps its
+    // layers and counts in the exec context's live read views.
+    let lanes = state.mempool.ingress_state();
+    let env = lane_block_env(&lanes, &header, &caller);
+    drop(lanes);
+    env
+}
+
 /// EIP-2718 type of an eth_call / eth_estimateGas request (s104 follow-up c).
 /// Without `type` it is inferred as geth does: a 1559 fee field => 2, else an
 /// access list => 1, else 0. Only 0, 1 and 2 execute (decode.rs and the
@@ -412,6 +468,20 @@ fn rpc_access_list(al: &alloy_eips::eip2930::AccessList) -> Vec<RpcAccessListIte
 fn decode_envelope_and_sender(raw: &[u8]) -> Result<(TxEnvelope, Address), RpcError> {
     let envelope = TxEnvelope::decode(&mut &raw[..])
         .map_err(|e| RpcError::Internal(format!("tx rlp decode: {e}")))?;
+    with_sender(envelope)
+}
+
+/// Item 7 step 2 (owner s126): a submitted tx decodes like admission
+/// ([`torus_mempool::validate::decode_tx_exact`]), so one with bytes after it is refused before
+/// the rate limiter counts its sender. Committed bodies, which may carry such bytes, decode
+/// with [`decode_envelope_and_sender`].
+fn decode_submitted_tx(raw: &[u8]) -> Result<(TxEnvelope, Address), RpcError> {
+    let envelope = torus_mempool::validate::decode_tx_exact(raw)
+        .map_err(|e| RpcError::Mempool(e.to_string()))?;
+    with_sender(envelope)
+}
+
+fn with_sender(envelope: TxEnvelope) -> Result<(TxEnvelope, Address), RpcError> {
     let sender = envelope
         .recover_signer()
         .map_err(|e| RpcError::Internal(format!("signer recovery: {e}")))?;
@@ -609,7 +679,8 @@ fn build_rpc_block(
         total_difficulty: "0x0".into(),
         extra_data: "0x".into(),
         size: hex_u64(size_estimate),
-        gas_limit: hex_u64(header.evm_gas_limit),
+        // Item 7 step 2: the height's EVM gas cap (+ the big limit at a big height).
+        gas_limit: hex_u64(header.evm_block_gas_cap()),
         gas_used: hex_u64(header.evm_gas_used),
         timestamp: hex_u64(header.timestamp),
         transactions,
@@ -797,8 +868,9 @@ impl EthApiServer for RpcState {
 
     async fn send_raw_transaction(&self, data: String) -> RpcResult<String> {
         let bytes = parse_bytes(&data).map_err(err)?;
-        // FIX 14 (EVM-FIND-19): Rate-limit at submission time, not commit time.
-        let (_, sender) = decode_envelope_and_sender(&bytes).map_err(err)?;
+        // FIX 14 (EVM-FIND-19): Rate-limit at submission time, not commit time. Item 7 step 2
+        // (owner s126): trailing bytes are refused here first, as `add_evm_tx` refuses them.
+        let (_, sender) = decode_submitted_tx(&bytes).map_err(err)?;
         if !self.tx_submit_limiter.check_sender(&sender) {
             return Err(err(RpcError::TxSubmitRateLimit));
         }
@@ -812,7 +884,7 @@ impl EthApiServer for RpcState {
         // reaches the block producer even when this node is not the proposer (fixes the EVM
         // dead-end where a tx was mined only by the node it was submitted to). No-op if we are
         // the leader. The leader independently re-validates via add_evm_tx.
-        self.forward_evm_to_leader(raw_for_forward);
+        self.forward_evm_to_leader(raw_for_forward, hash);
         let _ = self.notifier.pending_txs.send(hash);
         Ok(hex_b256(hash))
     }
@@ -1069,14 +1141,8 @@ impl EthApiServer for RpcState {
         // FIX 7 (EVM-PF-14): We only support latest state — return a clear
         // error for historical queries.
         let latest = head_state_block(self, &block).map_err(err)?;
-        let block_env = if latest > 0 {
-            match get_header_with_hash(self, latest).map_err(err)? {
-                Some((h, _, _)) => block_env_from_header(&h),
-                None => BlockEnvCfg::default(),
-            }
-        } else {
-            BlockEnvCfg::default()
-        };
+        // Item 7 step 2: the caller's lane (limit and base fee).
+        let block_env = call_block_env(self, latest, &tx).map_err(err)?;
         let mut tx_env = build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce, not 0.
         if tx.nonce.is_none() {
@@ -1114,14 +1180,8 @@ impl EthApiServer for RpcState {
             Some(b) => head_state_block(self, &b).map_err(err)?,
             None => eth_head(self),
         };
-        let block_env = if latest > 0 {
-            match get_header_with_hash(self, latest).map_err(err)? {
-                Some((h, _, _)) => block_env_from_header(&h),
-                None => BlockEnvCfg::default(),
-            }
-        } else {
-            BlockEnvCfg::default()
-        };
+        // Item 7 step 2: the caller's lane caps the search (`hi`).
+        let block_env = call_block_env(self, latest, &tx).map_err(err)?;
         let mut hi: u64 = block_env.gas_limit;
         let mut tx_env = build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce.
@@ -1263,8 +1323,27 @@ impl EthApiServer for RpcState {
         block_count: String,
         newest_block: String,
         reward_percentiles: Option<Vec<f64>>,
+        block_type: Option<String>,
     ) -> RpcResult<FeeHistory> {
         const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
+
+        // Item 7 step 2: "big" = the big lane's base fees; absent or "small" = the small lane's.
+        let big = match block_type.as_deref() {
+            None | Some("small") => false,
+            Some("big") => true,
+            Some(other) => {
+                return Err(err(RpcError::InvalidParams(format!(
+                    "blockType must be \"small\" or \"big\", got {other:?}"
+                ))))
+            }
+        };
+        let fee_of = |h: &TorusBlockHeader| {
+            if big {
+                h.big_base_fee_per_gas
+            } else {
+                h.base_fee_per_gas
+            }
+        };
 
         let latest = eth_head(self);
         let count = parse_u64(&block_count)
@@ -1278,7 +1357,8 @@ impl EthApiServer for RpcState {
         for height in oldest..=newest {
             match get_header_with_hash(self, height).map_err(err)? {
                 Some((header, _, _)) => {
-                    base_fees.push(hex_u64(header.base_fee_per_gas));
+                    base_fees.push(hex_u64(fee_of(&header)));
+                    // Per-lane gas used is not stored per block: the ratio stays the header's.
                     gas_ratios.push(if header.evm_gas_limit > 0 {
                         header.evm_gas_used as f64 / header.evm_gas_limit as f64
                     } else {
@@ -1312,7 +1392,7 @@ impl EthApiServer for RpcState {
             }
         }
         if let Some((header, _, _)) = get_header_with_hash(self, newest + 1).map_err(err)? {
-            base_fees.push(hex_u64(header.base_fee_per_gas));
+            base_fees.push(hex_u64(fee_of(&header)));
         } else if let Some(last_fee) = base_fees.last().cloned() {
             base_fees.push(last_fee);
         }

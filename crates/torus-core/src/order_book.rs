@@ -1300,6 +1300,12 @@ pub struct OrderBook {
     /// hold every change since the mark was read. In-RAM only, as
     /// `instance`.
     log_drains: u64,
+
+    // ---- Item 7 step 2: bbo row skip (in-RAM only) ----
+    /// The bbo row last written for this book ([`Self::bbo_row`]). Never
+    /// serialized; `None` after a load (the next save writes the row again;
+    /// the CF is unhashed, so a repeated put changes nothing).
+    saved_bbo: Option<[u8; 32]>,
 }
 
 /// s120 (Codex r2): [`OrderBook::log_mark`]: which in-memory book, and how
@@ -1404,6 +1410,7 @@ impl OrderBook {
             new_traders: Vec::new(),
             instance: BookInstance::fresh(),
             log_drains: 0,
+            saved_bbo: None,
         }
     }
 
@@ -2331,6 +2338,26 @@ impl OrderBook {
     /// Best (lowest) ask price.
     pub fn best_ask(&self) -> Option<FixedPoint> {
         self.asks.keys().next().copied()
+    }
+
+    /// Item 7 step 2: this book's bbo row: best bid raw ‖ best ask raw
+    /// (i128 BE, 0 = empty side). Two map-end lookups, no allocation.
+    pub fn bbo_row(&self) -> [u8; 32] {
+        let mut row = [0u8; 32];
+        row[..16].copy_from_slice(&self.best_bid().map_or(0, |p| p.raw()).to_be_bytes());
+        row[16..].copy_from_slice(&self.best_ask().map_or(0, |p| p.raw()).to_be_bytes());
+        row
+    }
+
+    /// Item 7 step 2: the bbo row last written for this book (`None` since
+    /// its load or construction).
+    pub fn saved_bbo(&self) -> Option<[u8; 32]> {
+        self.saved_bbo
+    }
+
+    /// Item 7 step 2: record the bbo row just written for this book.
+    pub fn set_saved_bbo(&mut self, row: [u8; 32]) {
+        self.saved_bbo = Some(row);
     }
 
     /// Spread = best_ask - best_bid.
@@ -4675,6 +4702,7 @@ impl BorshDeserialize for OrderBook {
             new_traders: Vec::new(),
             instance: BookInstance::fresh(),
             log_drains: 0,
+            saved_bbo: None,
         };
 
         for _ in 0..order_count {

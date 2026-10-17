@@ -19,6 +19,13 @@ use torus_types::FixedPoint;
 fn open_test_db() -> (tempfile::TempDir, StateDb) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
+    // Item 7 step 2: CoreWriter order delay K = 1 (these rows are filed under block 2).
+    db.put_cf_raw(
+        torus_state::cf::CF_FEE_CONFIG,
+        b"core_writer_order_delay",
+        b"1",
+    )
+    .unwrap();
     (dir, db)
 }
 
@@ -72,6 +79,14 @@ fn seed(db: &StateDb) {
     db.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0)).unwrap();
     db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(2, 2), &bytes)
         .unwrap();
+    // Item 7 step 2: the moved row's target is 2, so the last order target is too
+    // (else the order kinds below would be held at 3, never before it).
+    db.put_cf_raw(
+        torus_state::cf::CF_FEE_CONFIG,
+        torus_core::precompiles::CORE_WRITER_LAST_ORDER_TARGET_KEY,
+        &2u64.to_be_bytes(),
+    )
+    .unwrap();
     let stop = QueuedActionKind::PlaceOrder {
         market_id: 1,
         side: 0,

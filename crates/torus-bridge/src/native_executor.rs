@@ -5299,6 +5299,11 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// also walks all balances and positions for the value-sum gauge and log
     /// line. Never read by execution. Default false.
     pub liq_value_sum: bool,
+    /// Item 7 step 2 (F3): at an epoch boundary, the EVM header values of the closing epoch (the
+    /// boundary's parent header); `None` off a boundary. Set by the block pipeline.
+    pub evm_fee_window: Option<torus_types::EvmHeaderValues>,
+    /// Item 7 step 2 (F3): this block's EVM gas, `(small lane, big lane)`.
+    pub evm_gas: (u64, u64),
 
     /// T1.5: set (never cleared) when a market worker panicked mid-matching.
     /// The panicking worker consumed its market's `OrderBook`, so this block's
@@ -5893,6 +5898,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             fill_effects_scratch: Vec::new(),
             metrics: None,
             liq_value_sum: false,
+            evm_fee_window: None,
+            evm_gas: (0, 0),
             fatal_error: load_error,
             reader_fault: std::sync::OnceLock::new(),
             book_mode,
@@ -6989,6 +6996,9 @@ impl<T: StateBackend> NativeExecContext<T> {
             }
         }
 
+        // Item 7 step 2: the bbo row of every dirty market (every mode).
+        self.write_bbo_rows();
+
         // Persist the counter only when it moved (or was never stored), so
         // blocks without order flow write nothing at all.
         if self.loaded_next_global_order_id != Some(self.next_global_order_id) {
@@ -7027,6 +7037,41 @@ impl<T: StateBackend> NativeExecContext<T> {
         let _ = acc;
 
         written
+    }
+
+    /// Item 7 step 2 (owner decision 3): the bbo row of every dirty market
+    /// (`CF_NATIVE_BBO`), written only when the top of its book moved since
+    /// this book's last write; an emptied book deletes it. One overlay point
+    /// put (or delete) per moved market: no read, no Borsh, nothing per fill.
+    /// Unhashed, so a node whose book was just loaded (`saved_bbo` = `None`)
+    /// writes the same bytes again. Delist has no hook: `DelistMarket`
+    /// executes nothing today; a delist must empty the book through the
+    /// dirty-marking path or delete the row. A failed write latches the
+    /// block's fail-stop like any book write.
+    fn write_bbo_rows(&mut self) {
+        use torus_state::cf::CF_NATIVE_BBO;
+        for &market_id in &self.dirty_books {
+            let Some(book) = self.order_books.get_mut(&market_id) else {
+                continue;
+            };
+            let row = book.bbo_row();
+            if book.saved_bbo() == Some(row) {
+                continue;
+            }
+            let key = market_id.to_be_bytes();
+            let res = if row == [0u8; 32] {
+                self.state.delete_cf_raw(CF_NATIVE_BBO, &key)
+            } else {
+                self.state.put_cf_raw(CF_NATIVE_BBO, &key, &row)
+            };
+            match res {
+                Ok(()) => book.set_saved_bbo(row),
+                Err(e) => latch_save_fault(
+                    &mut self.fatal_error,
+                    format!("book save: bbo row (market {market_id}): {e}"),
+                ),
+            }
+        }
     }
 
     /// Mode 2 (LevelAuthority) save, two passes:
@@ -7187,6 +7232,11 @@ impl<T: StateBackend> NativeExecContext<T> {
                 })
             })
             .collect();
+
+        // Item 7 step 2: the bbo rows, as in `save_order_books`: point puts
+        // into this block's overlay on the exec thread (never the worker's
+        // sidecar), from the live books' post-state.
+        self.write_bbo_rows();
 
         // Counter + mode marker: same condition, same bytes, same placement
         // (this overlay) as the `save_order_books` tail.
@@ -7675,6 +7725,9 @@ impl NativeExecutor {
             }
             NativeAction::SetOracleSigner { signer, proof } => {
                 Self::exec_set_oracle_signer(ctx, sender, *signer, proof.as_ref())
+            }
+            NativeAction::EvmUserModify { using_big_blocks } => {
+                Self::exec_evm_user_modify(ctx, sender, *using_big_blocks)
             }
 
             // ---- Session Keys ----
@@ -13225,6 +13278,36 @@ impl NativeExecutor {
         Err(NotReporter)
     }
 
+    /// Item 7 step 2: `EvmUserModify` sets (`true`) or clears the sender's lane row. An unchanged
+    /// lane writes nothing. A read or write fault fail-stops (R02 branch 6b, as SetOracleSigner).
+    fn exec_evm_user_modify<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        sender: &Address,
+        using_big_blocks: bool,
+    ) -> NativeActionResult {
+        use torus_state::cf::{evm_lane_key, CF_NATIVE_ORACLE};
+        let key = evm_lane_key(sender);
+        let current = match ctx.state.get_cf_raw(CF_NATIVE_ORACLE, &key) {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                let m = Self::latch_state_fault(ctx, "evm user modify read", e);
+                return NativeActionResult::err("evm_user_modify", m);
+            }
+        };
+        if current != using_big_blocks {
+            let res = if using_big_blocks {
+                ctx.state.put_cf_raw(CF_NATIVE_ORACLE, &key, &[1])
+            } else {
+                ctx.state.delete_cf_raw(CF_NATIVE_ORACLE, &key)
+            };
+            if let Err(e) = res {
+                let m = Self::latch_state_fault(ctx, "evm user modify write", e);
+                return NativeActionResult::err("evm_user_modify", m);
+            }
+        }
+        NativeActionResult::ok("evm_user_modify", 1000)
+    }
+
     /// `SetOracleSigner` (s517): set, rotate or (with `Address::ZERO`) clear
     /// the sender validator's hot oracle signer. Every check runs before the
     /// first write (no per-action rollback). Writes: the old index entry is
@@ -13513,10 +13596,13 @@ impl NativeExecutor {
     /// Whether CoreWriter / lockbox actions are queued for `height` — the block
     /// pipeline must then run the native path (and so [`Self::drain_core_writer`]) even
     /// for a block with no native actions and no fees. Queue entries for `height` are
-    /// buffered by block `height - 1`'s EVM execution and committed in the SAME atomic
-    /// batch as that block's EVM bundle (s515 F1), which lands before this block runs
-    /// — so a DB read is authoritative here. R02 (C4): a read error is a local
-    /// fault and propagates; the caller fail-stops the block (never "assume due").
+    /// buffered by an earlier block's EVM execution (`height - 1`, or `height - K` and
+    /// earlier for order kinds and rows a full block moved on, item 7 step 2) and
+    /// committed in the SAME atomic batch as that block's EVM bundle (s515 F1), which
+    /// lands before this block runs; no later block rewrites them before their drain
+    /// (EVM blocks are serial barriers) — so a DB read is authoritative here. R02 (C4): a
+    /// read error is a local fault and propagates; the caller fail-stops the block (never
+    /// "assume due").
     pub fn core_writer_due(state_db: &StateDb, height: u64) -> Result<bool, CoreError> {
         Ok(CoreWriterQueue::pending_count(state_db, height)? > 0)
     }
@@ -13530,9 +13616,11 @@ impl NativeExecutor {
         OracleManager::new(state.clone(), OracleConfig::default()).has_submissions()
     }
 
-    /// Drain and execute CoreWriter actions queued from the previous block.
+    /// Drain and execute the CoreWriter actions that target this block: queued one
+    /// block earlier, or K blocks earlier for order kinds (item 7 step 2), at most
+    /// `CORE_WRITER_DRAIN_CAP` rows (the cap is applied at enqueue).
     ///
-    /// Task 3.1.5 (anti-MEV): Asserts the one-block delay is enforced — all
+    /// Task 3.1.5 (anti-MEV): Asserts the delay is enforced — all
     /// drained actions must have been queued in a strictly earlier block.
     ///
     /// FIX EVM-FIND-12: Propagates drain errors instead of silently returning empty vec.
@@ -13843,6 +13931,7 @@ impl NativeExecutor {
                 ctx.max_validators,
                 ctx.block_height,
                 ctx.epoch_length,
+                ctx.evm_fee_window,
             ) {
                 Ok(new_set) => {
                     if let Some(ref m) = ctx.metrics {
@@ -13868,6 +13957,19 @@ impl NativeExecutor {
                 }
             },
         )
+    }
+
+    /// Item 7 step 2 (F3): add this block's EVM gas to the epoch row, after `process_epoch_boundary`
+    /// (a boundary's own gas starts the next epoch). No EVM gas: no read, no write.
+    pub fn add_block_evm_gas<T: StateBackend>(ctx: &mut NativeExecContext<T>) {
+        let (gas, big_gas) = ctx.evm_gas;
+        if (gas, big_gas) == (0, 0) {
+            return;
+        }
+        if let Err(e) = torus_economics::add_epoch_evm_gas(&ctx.state, gas, big_gas) {
+            tracing::error!(%e, height = ctx.block_height, "epoch EVM gas write failed");
+            Self::latch_local_fault(ctx, "epoch EVM gas", &e);
+        }
     }
 
     /// Process pending governance proposals: one result per proposal outcome.

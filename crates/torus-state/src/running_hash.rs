@@ -78,9 +78,14 @@ pub const NODE_LOCAL_MARKET_KEYS: &[&[u8]] = &[b"__book_mode__"];
 /// (`staking.rs` `pending_rotation_key`) and the validator whitelist
 /// (`governance.rs` `whitelist_key`), and the execution-computed
 /// validator-set plans `epoch_vset:` (consensus bug (b),
-/// `torus_economics::EPOCH_VSET_PREFIX`). All are written only by execution.
-pub const META_CONSENSUS_PREFIXES: &[&[u8]] =
-    &[b"pending_rotation:", b"validator_whitelist:", b"epoch_vset:"];
+/// `torus_economics::EPOCH_VSET_PREFIX`), and item 7 step 2's epoch EVM gas row
+/// (`torus_economics::EVM_EPOCH_GAS_KEY`, F3). All are written only by execution.
+pub const META_CONSENSUS_PREFIXES: &[&[u8]] = &[
+    b"pending_rotation:",
+    b"validator_whitelist:",
+    b"epoch_vset:",
+    b"evm_epoch_gas",
+];
 
 /// Hash `cf_id` of a column family, `None` if the CF is never hashed.
 pub fn hashed_cf_id(cf: &str) -> Option<u8> {
@@ -662,6 +667,7 @@ mod tests {
             CF_NATIVE_HASHED,
             CF_HASHED_ACCOUNTS,
             CF_TRIE_ACCOUNTS,
+            CF_NATIVE_BBO,
         ] {
             assert_eq!(hashed_cf_id(derived), None, "{derived} must not be hashed");
         }

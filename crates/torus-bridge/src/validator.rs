@@ -39,6 +39,12 @@ pub struct ValidatedBlock {
     pub evm_root_updates: Option<(B256, TrieUpdates)>,
     /// Recovered (sender, action) pairs for post-commit native execution.
     pub native_sender_actions: Vec<(Address, NativeAction)>,
+    /// Item 7 step 2: gas the block's EVM txs used, all lanes.
+    pub gas_used: u64,
+    /// Item 7 step 2: of `gas_used`, the big lane's (F3 counts each lane's gas per epoch).
+    pub big_gas_used: u64,
+    /// Item 7 step 2: the base-fee part of the fees, each tx at its lane's base fee.
+    pub fee_revenue: u128,
 }
 
 /// Validates proposed blocks by re-executing EVM transactions and verifying the state root.
@@ -145,16 +151,48 @@ impl BlockValidator {
         };
         let tx_envs: Vec<_> = decoded_txs.iter().map(|(_, d)| d.tx_env.clone()).collect();
 
+        // Item 7 step 2: while big blocks are on (M > 0) a sender whose `EvmUserModify` row says big
+        // pays the big base fee (owner answer 7: the row when the block executes). An EVM block
+        // runs after a barrier, so the DB is current. A read fault is a local fault (fail-stop),
+        // never "small".
+        let mut big_lane = torus_evm::BigLane {
+            base_fee: block.header.big_base_fee_per_gas,
+            ..Default::default()
+        };
+        if block.header.evm_big_block_interval > 0 {
+            let callers: std::collections::HashSet<Address> =
+                decoded_txs.iter().map(|(_, d)| d.tx_env.caller).collect();
+            for caller in callers {
+                let row = state_db
+                    .get_cf_raw(
+                        torus_state::cf::CF_NATIVE_ORACLE,
+                        &torus_state::cf::evm_lane_key(&caller),
+                    )
+                    .map_err(|e| {
+                        BridgeError::Evm(torus_evm::EvmError::LocalFault(format!(
+                            "EVM lane read: {e}"
+                        )))
+                    })?;
+                if row.is_some() {
+                    big_lane.senders.insert(caller);
+                }
+            }
+        }
         let block_cfg = BlockEnvCfg {
             number: block.header.height,
             timestamp: block.header.timestamp,
             beneficiary: block.header.proposer,
-            gas_limit: block.header.evm_gas_limit,
+            gas_limit: block.header.evm_block_gas_cap(),
             base_fee: block.header.base_fee_per_gas,
         };
 
-        let mut exec_result =
-            evm_executor.execute_block(state_db, &block_cfg, tx_envs, skip_state_root_check)?;
+        let mut exec_result = evm_executor.execute_block_lanes(
+            state_db,
+            &block_cfg,
+            tx_envs,
+            skip_state_root_check,
+            &big_lane,
+        )?;
 
         align_receipts(&mut exec_result, &decoded_txs, block.header.height);
 
@@ -166,10 +204,7 @@ impl BlockValidator {
                 )));
             }
 
-            let computed_fee_revenue = crate::proposer::compute_fee_revenue(
-                &exec_result.receipts,
-                block.header.base_fee_per_gas,
-            );
+            let computed_fee_revenue = exec_result.fee_revenue;
             if computed_fee_revenue != block.header.evm_fee_revenue {
                 return Err(BridgeError::InvalidBlock(format!(
                     "fee revenue mismatch: header={}, computed={}",
@@ -219,6 +254,9 @@ impl BlockValidator {
             state_root: computed_root,
             evm_root_updates,
             native_sender_actions: vec![],
+            gas_used: exec_result.gas_used,
+            big_gas_used: exec_result.big_gas_used,
+            fee_revenue: exec_result.fee_revenue,
         })
     }
 
@@ -328,6 +366,9 @@ impl BlockValidator {
             // reusable for a single-block commit.
             evm_root_updates: None,
             native_sender_actions: vec![],
+            gas_used: exec_result.gas_used,
+            big_gas_used: exec_result.big_gas_used,
+            fee_revenue: exec_result.fee_revenue,
         })
     }
 }

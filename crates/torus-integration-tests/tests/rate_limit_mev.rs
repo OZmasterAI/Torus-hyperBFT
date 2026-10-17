@@ -279,7 +279,7 @@ fn same_gas_price_ordering_deterministic_by_parent_hash() {
     assert_eq!(pool.evm_pool_size(), 0);
 
     // The drain with any parent_hash on an empty pool returns empty.
-    let drained = pool.drain_evm(30_000_000, B256::repeat_byte(0x42));
+    let drained = pool.drain_evm(30_000_000, pool.base_fee(), B256::repeat_byte(0x42));
     assert!(drained.is_empty());
 }
 

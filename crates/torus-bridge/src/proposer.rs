@@ -149,9 +149,14 @@ impl BlockProposer {
                 evm_fee_revenue: compute_fee_revenue(&exec_result.receipts, next_base_fee),
                 evm_gas_limit: gas_limit,
                 evm_block_interval: parent.evm_block_interval,
+                // Item 7 step 2: the big lane's values are the parent's here (the
+                // boundary rule and F3 set them in torus-consensus).
+                evm_big_block_interval: parent.evm_big_block_interval,
+                evm_big_gas_limit: parent.evm_big_gas_limit,
                 native_action_count: 0,
                 evm_tx_count: evm_transactions.len() as u32,
                 base_fee_per_gas: next_base_fee,
+                big_base_fee_per_gas: parent.big_base_fee_per_gas,
                 epoch: torus_economics::EpochManager::epoch_for_block(
                     block_height,
                     self.epoch_length,
@@ -200,13 +205,27 @@ pub fn genesis_parent_header(evm_gas_limit: u64, evm_block_interval: u64) -> Tor
         evm_fee_revenue: 0,
         evm_gas_limit,
         evm_block_interval,
+        // Item 7 step 2: big blocks off and the default big limit; a chain config's
+        // values come in through `genesis_parent_header_for`.
+        evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+        evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
         native_action_count: 0,
         evm_tx_count: 0,
         base_fee_per_gas: 1_000_000_000, // 1 gwei initial base fee
+        big_base_fee_per_gas: torus_types::EVM_MIN_BASE_FEE, // 1 gwei, like the small lane
         epoch: 0,
         validator_set_hash: B256::ZERO,
         sig_attestation: [0u8; 64],
     }
+}
+
+/// Item 7 step 2: the genesis parent header of a chain config (small limit, N, M and the big limit
+/// from genesis; both base fees 1 gwei). One value for every user, or block 1 fails to link.
+pub fn genesis_parent_header_for(config: &torus_types::ChainConfig) -> TorusBlockHeader {
+    let mut header = genesis_parent_header(config.evm_gas_limit, config.evm_block_interval);
+    header.evm_big_block_interval = config.evm_big_block_interval;
+    header.evm_big_gas_limit = config.evm_big_gas_limit;
+    header
 }
 
 // ============================================================================
@@ -314,6 +333,47 @@ mod tests {
         assert_eq!(genesis.evm_gas_limit, 3_000_000);
         assert_eq!(genesis.evm_block_interval, 5);
         assert_eq!(genesis.base_fee_per_gas, 1_000_000_000);
+    }
+
+    /// Item 7 step 2: the genesis parent header of a chain config carries the
+    /// config's small limit, N, M and big limit, and 1 gwei for both base fees.
+    #[test]
+    fn genesis_parent_header_for_takes_the_big_lane_from_the_config() {
+        let json = r#"{
+            "chain_id": 1,
+            "chain_name": "t",
+            "evm_gas_limit": 3000000,
+            "evm_block_interval": 7,
+            "evm_big_block_interval": 190,
+            "evm_big_gas_limit": 15000000,
+            "base_fee_per_gas": 1,
+            "epoch_length": 1,
+            "max_validators": 1,
+            "min_stake": "0x0",
+            "fee_burn_bps": 0,
+            "fee_validator_bps": 0,
+            "fee_treasury_bps": 0,
+            "fee_dev_pool_bps": 0
+        }"#;
+        let config: torus_types::ChainConfig = serde_json::from_str(json).unwrap();
+        let h = genesis_parent_header_for(&config);
+        assert_eq!((h.height, h.parent_hash), (0, B256::ZERO));
+        assert_eq!((h.evm_gas_limit, h.evm_block_interval), (3_000_000, 7));
+        assert_eq!(
+            (h.evm_big_block_interval, h.evm_big_gas_limit),
+            (190, 15_000_000)
+        );
+        assert_eq!(
+            (h.base_fee_per_gas, h.big_base_fee_per_gas),
+            (1_000_000_000, 1_000_000_000)
+        );
+        // The two-argument form: big blocks off, the default big limit.
+        let plain = genesis_parent_header(3_000_000, 7);
+        assert_eq!(
+            (plain.evm_big_block_interval, plain.evm_big_gas_limit),
+            (0, 10_000_000)
+        );
+        assert_eq!(plain.big_base_fee_per_gas, 1_000_000_000);
     }
 
     fn make_test_signed_action(nonce: u64) -> SignedNativeAction {

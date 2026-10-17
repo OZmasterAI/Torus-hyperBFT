@@ -127,6 +127,16 @@ fn actions() -> Vec<NativeAction> {
                 signature: Signature { v: 28, r: [3; 32], s: [4; 32] },
             }),
         },
+        NativeAction::CancelByCloid {
+            market_id: u64::MAX,
+            cloid: u128::MAX,
+        },
+        NativeAction::EvmUserModify {
+            using_big_blocks: true,
+        },
+        NativeAction::EvmUserModify {
+            using_big_blocks: false,
+        },
     ]);
     for new_price in [None, Some(FixedPoint::MIN)] {
         for new_qty in [None, Some(FixedPoint::MAX)] {
@@ -215,8 +225,8 @@ fn append_canonical_bytes_matches_frozen_encoder_for_all_variants() {
     }
     assert_eq!(
         tags,
-        (0u8..=28).collect(),
-        "all action tags must be covered (28 = SetOracleSigner, s517)"
+        (0u8..=30).collect(),
+        "all action tags must be covered (29 = CancelByCloid, 30 = EvmUserModify)"
     );
 }
 
@@ -306,9 +316,12 @@ fn compact_block_hash_order_matches_frozen_encoder() {
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
             evm_block_interval: crate::DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+            evm_big_gas_limit: DEFAULT_EVM_BIG_GAS_LIMIT,
             native_action_count: 3,
             evm_tx_count: 1,
             base_fee_per_gas: 1,
+            big_base_fee_per_gas: 1,
             epoch: 0,
             validator_set_hash: B256::ZERO,
             sig_attestation: [0; 64],
@@ -619,6 +632,10 @@ fn legacy_canonical_bytes(action: &NativeAction) -> Vec<u8> {
                     buf.extend_from_slice(&p.signature.s);
                 }
             }
+        }
+        NativeAction::EvmUserModify { using_big_blocks } => {
+            buf.push(30);
+            buf.push(u8::from(*using_big_blocks));
         }
     }
     buf

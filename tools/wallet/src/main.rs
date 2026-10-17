@@ -131,6 +131,13 @@ pub(crate) enum Command {
     ClaimRewards,
     /// Claim undelegated stake whose unbonding period has elapsed
     ClaimUnbonded,
+    /// Choose this address's EVM lane (HL `evmUserModify`): `true` = big blocks (its EVM txs go
+    /// to the big pool and pay the big base fee while big blocks are on), `false` = small blocks.
+    EvmUserModify {
+        /// true = big blocks, false = small blocks
+        #[arg(long, action = clap::ArgAction::Set)]
+        using_big_blocks: bool,
+    },
     /// View order book for a market
     Orderbook {
         /// Market ID
@@ -400,6 +407,9 @@ async fn main() {
         }
         Command::ClaimRewards => commands::staking::cmd_claim_rewards(&cli, &rpc).await,
         Command::ClaimUnbonded => commands::staking::cmd_claim_unbonded(&cli, &rpc).await,
+        Command::EvmUserModify { using_big_blocks } => {
+            commands::transfer::cmd_evm_user_modify(&cli, &rpc, *using_big_blocks).await
+        }
         Command::Orderbook { market_id } => {
             commands::query::cmd_orderbook(&rpc, market_id, cli.json).await
         }

@@ -5,6 +5,7 @@
 //!   0x0801 — BalanceReader (read)
 //!   0x0802 — OracleReader (read)
 //!   0x0803 — StakingReader (read)
+//!   0x080e — BboReader (read: best bid / ask, item 7 step 2, HL's bbo address)
 //!   0x0810 — CoreWriter (write: orders, delayed)
 //!   0x0811 — CoreWriterStaking (write: staking, delayed)
 //!   0x0820 — Lockbox (write: EVM <-> native transfers, native leg delayed)
@@ -31,13 +32,15 @@ pub const ADDR_ORDER_BOOK_READER: u16 = 0x0800;
 pub const ADDR_BALANCE_READER: u16 = 0x0801;
 pub const ADDR_ORACLE_READER: u16 = 0x0802;
 pub const ADDR_STAKING_READER: u16 = 0x0803;
+/// Item 7 step 2 (owner decision 3): best bid / ask per market, at HL's bbo address.
+pub const ADDR_BBO_READER: u16 = 0x080e;
 pub const ADDR_CORE_WRITER: u16 = 0x0810;
 pub const ADDR_CORE_WRITER_STAKING: u16 = 0x0811;
 pub const ADDR_LOCKBOX: u16 = 0x0820;
 
 /// FIX EVM-PF-10: Gas costs for Torus precompiles.
 ///
-/// Base gas of every reader call (0x0800-0x0803). s99 owner decision (item6
+/// Base gas of every reader call (0x0800-0x0803, 0x080e). s99 owner decision (item6
 /// plan 9.16, revisit later): single reads at Hyperliquid level, ~16,500 gas
 /// per position read. getPosition = this base + its 5 answer words = 16,500;
 /// a 30M-gas block of cold getPosition calls (ozarchy, block cache cold) runs
@@ -55,7 +58,7 @@ pub const GAS_PRECOMPILE_WRITE: u64 = 20_000;
 /// Complex operations (governance, liquidation).
 pub const GAS_PRECOMPILE_COMPLEX: u64 = 50_000;
 
-/// Gas of a reader call (0x0800-0x0803) whose meter used `used` gas above
+/// Gas of a reader call (0x0800-0x0803, 0x080e) whose meter used `used` gas above
 /// the base ([`ReadMeter::used`]): [`GAS_PRECOMPILE_READ`] + `used`.
 /// Charged by the EVM provider after the call, on success and on revert.
 pub const fn reader_gas(used: u64) -> u64 {
@@ -212,7 +215,7 @@ fn scan_prefix_metered(
 /// [`reader_gas`] of the gas its [`ReadMeter`] used).
 pub const fn precompile_gas(id: u16) -> u64 {
     match id {
-        0x0800..=0x0803 => GAS_PRECOMPILE_READ,
+        0x0800..=0x0803 | ADDR_BBO_READER => GAS_PRECOMPILE_READ,
         0x0810..=0x0811 => GAS_PRECOMPILE_WRITE,
         0x0820 => GAS_PRECOMPILE_WRITE,
         _ => 0,
@@ -228,11 +231,12 @@ pub const fn precompile_address(id: u16) -> Address {
 }
 
 /// All Torus precompile addresses (for EVM warm-address injection).
-pub const ALL_PRECOMPILE_ADDRESSES: [Address; 7] = [
+pub const ALL_PRECOMPILE_ADDRESSES: [Address; 8] = [
     precompile_address(ADDR_ORDER_BOOK_READER),
     precompile_address(ADDR_BALANCE_READER),
     precompile_address(ADDR_ORACLE_READER),
     precompile_address(ADDR_STAKING_READER),
+    precompile_address(ADDR_BBO_READER),
     precompile_address(ADDR_CORE_WRITER),
     precompile_address(ADDR_CORE_WRITER_STAKING),
     precompile_address(ADDR_LOCKBOX),
@@ -243,15 +247,18 @@ pub fn is_precompile(address: &Address) -> bool {
     let bytes = address.as_slice();
     bytes[..18].iter().all(|&b| b == 0) && {
         let id = u16::from_be_bytes([bytes[18], bytes[19]]);
-        matches!(id, 0x0800..=0x0803 | 0x0810..=0x0811 | 0x0820)
+        matches!(id, 0x0800..=0x0803 | ADDR_BBO_READER | 0x0810..=0x0811 | 0x0820)
     }
 }
 
-/// Whether a precompile id is a read-only reader (0x0800–0x0803), safe to run in an
+/// Whether a precompile id is a read-only reader (0x0800–0x0803, 0x080e), safe to run in an
 /// eth_call / eth_estimateGas simulation. The writer precompiles (CoreWriter 0x0810,
 /// CoreWriterStaking 0x0811, Lockbox 0x0820) mutate shared state and must be denied there.
 pub const fn is_reader_precompile(id: u16) -> bool {
-    matches!(id, ADDR_ORDER_BOOK_READER..=ADDR_STAKING_READER)
+    matches!(
+        id,
+        ADDR_ORDER_BOOK_READER..=ADDR_STAKING_READER | ADDR_BBO_READER
+    )
 }
 
 // ============================================================================
@@ -591,6 +598,7 @@ fn execute_precompile_inner(
         ADDR_BALANCE_READER => read(balance_reader(input, state_db, meter), meter),
         ADDR_ORACLE_READER => read(oracle_reader(input, state_db, current_timestamp, meter), meter),
         ADDR_STAKING_READER => read(staking_reader(input, state_db, meter), meter),
+        ADDR_BBO_READER => read(bbo_reader(input, state_db), meter),
         ADDR_CORE_WRITER => core_writer(input, caller, state_db, current_block),
         ADDR_CORE_WRITER_STAKING => core_writer_staking(input, caller, state_db, current_block),
         ADDR_LOCKBOX => lockbox_precompile(input, caller, call_value, state_db, current_block),
@@ -868,6 +876,51 @@ fn get_oracle_price_fp(
 }
 
 // ============================================================================
+// BboReader (0x080e) — item 7 step 2 (HL's bbo address)
+// ============================================================================
+
+/// `bbo(bytes32 marketId) -> (uint128 bid, uint128 ask)`: the market's best
+/// bid and ask (FixedPoint raw) as of the last block that changed its book
+/// (`cf_native_bbo`), 0 for an empty side or an unknown market. Owner
+/// decision 3, our metering, priced like the other point readers (the point
+/// read is in the base, owner s125): 16,400 + 2 x 20 = 16,440 gas.
+///
+/// The row is node-written and unhashed: a row that is not 32 bytes, or a
+/// failed read, is this node's fault (R02 branch 5): `PrecompileLocalFault`
+/// (the node fail-stops), never zeros and never a revert.
+fn bbo_reader(input: &[u8], state_db: &impl StateBackend) -> Result<Vec<u8>, CoreError> {
+    let sel = abi::selector(input)?;
+    if sel != selector_for("bbo(bytes32)") {
+        return Err(CoreError::UnknownSelector(sel));
+    }
+    let market_id = abi::decode_market_id(&abi::word(input, 0)?);
+    let row = state_db
+        .get_cf_raw(CF_NATIVE_BBO, &market_id.to_be_bytes())
+        .map_err(|e| {
+            CoreError::PrecompileLocalFault(format!("bbo read (market {market_id}): {e}"))
+        })?;
+    let (bid, ask) = match row {
+        None => (0i128, 0i128),
+        Some(r) => match <[u8; 32]>::try_from(r.as_slice()) {
+            Ok(r) => (
+                i128::from_be_bytes(r[..16].try_into().expect("16 bytes")),
+                i128::from_be_bytes(r[16..].try_into().expect("16 bytes")),
+            ),
+            Err(_) => {
+                return Err(CoreError::PrecompileLocalFault(format!(
+                    "bbo row of market {market_id}: {} bytes, not 32",
+                    r.len()
+                )))
+            }
+        },
+    };
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&abi::encode_u128(bid as u128));
+    out.extend_from_slice(&abi::encode_u128(ask as u128));
+    Ok(out)
+}
+
+// ============================================================================
 // StakingReader (0x0803) — tasks 2.4.2
 // ============================================================================
 
@@ -1062,7 +1115,7 @@ fn core_writer(
 
         CoreWriterQueue::enqueue(state_db, &action)?;
         // HL-parity: no order id. The executor assigns the real one from the
-        // global counter when the queue drains next block, so it cannot be known
+        // global counter when the queue drains (K blocks later), so it cannot be known
         // here (the old `(block + 1) << 64 | seq` never matched it).
         Ok([0u8; 32].to_vec())
     } else if sel == selector_for("cancelOrder(bytes32)") {
@@ -1290,26 +1343,177 @@ fn lockbox_precompile(
 
 pub struct CoreWriterQueue;
 
+/// Item 7 step 2 (owner answer 3): `CF_FEE_CONFIG` row holding the last order-kind target
+/// block (u64 BE). Not a governance key (not in the allowlist, no proposal sets it), and not
+/// in `CF_CORE_WRITER_QUEUE`, whose drain takes every row under the target prefix. Hashed
+/// state, written only by EVM blocks (like the queue rows), the same on every node.
+pub const CORE_WRITER_LAST_ORDER_TARGET_KEY: &[u8] = b"core_writer_last_order_target";
+
+/// Codex P2 on C7: `CF_FEE_CONFIG` row (u64 BE) holding the first-open-target cursor `C`:
+/// for an enqueue in block `B`, every target in `B + 1 .. C` is full (a target loses rows
+/// only when its own block drains them, after which no enqueue targets it). An enqueue
+/// skips those targets without reading them; one whose walk covered every target from
+/// `B + 1` moves `C` past the full targets it found or filled. Hashed state like
+/// [`CORE_WRITER_LAST_ORDER_TARGET_KEY`], written only when it moves.
+pub const CORE_WRITER_FIRST_OPEN_TARGET_KEY: &[u8] = b"core_writer_first_open_target";
+
+/// Codex P2 on C7: `CF_FEE_CONFIG` row `start (8 BE) ‖ end (8 BE)`: every target in
+/// `start .. end` is full. Kept by the order kinds that land beyond `C` (K blocks ahead,
+/// where `C` cannot speak for the targets in between), so a later walk jumps the order
+/// kinds' run of full targets instead of reading each one. Hashed state, written only
+/// when it grows or restarts.
+pub const CORE_WRITER_FULL_ORDER_RUN_KEY: &[u8] = b"core_writer_full_order_run";
+
+/// A `CF_FEE_CONFIG` u64 BE row; absent or not 8 bytes = `None`.
+fn read_u64_row(state_db: &impl StateBackend, key: &[u8]) -> Result<Option<u64>, CoreError> {
+    Ok(state_db
+        .get_cf_raw(CF_FEE_CONFIG, key)?
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map(u64::from_be_bytes))
+}
+
+/// [`CORE_WRITER_FULL_ORDER_RUN_KEY`]: `Some((start, end))`; absent or not 16 bytes = `None`.
+fn read_order_run(state_db: &impl StateBackend) -> Result<Option<(u64, u64)>, CoreError> {
+    Ok(state_db
+        .get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_FULL_ORDER_RUN_KEY)?
+        .and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok())
+        .map(|v| {
+            let (start, end) = v.split_at(8);
+            (
+                u64::from_be_bytes(start.try_into().expect("8 bytes")),
+                u64::from_be_bytes(end.try_into().expect("8 bytes")),
+            )
+        }))
+}
+
+/// Queue key: target block (8 BE) ‖ seq (8 BE).
+fn queue_key(target_block: u64, seq: u64) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&target_block.to_be_bytes());
+    key[8..].copy_from_slice(&seq.to_be_bytes());
+    key
+}
+
 impl CoreWriterQueue {
-    /// Enqueue a CoreWriter action for execution in the next block.
-    /// Returns the sequence number assigned to this action.
+    /// Enqueue a CoreWriter action. Returns the row's sequence in its target block.
+    ///
+    /// Item 7 step 2 (owner decision 4): an order action ([`QueuedActionKind::is_order`])
+    /// targets `block_queued + K` (governance `core_writer_order_delay`, absent or invalid =
+    /// [`torus_types::DEFAULT_CORE_WRITER_ORDER_DELAY`]), never a block before the last order
+    /// action's target ([`CORE_WRITER_LAST_ORDER_TARGET_KEY`], owner answer 3: lowering K
+    /// cannot let a cancel overtake its order); any other kind targets `block_queued + 1`. A
+    /// target that already holds [`torus_types::CORE_WRITER_DRAIN_CAP`] rows sends the row on
+    /// to the next block with room, so no block drains more than the cap and rows keep queue
+    /// order. Rows are queued only by EVM blocks (serial barriers), so each is in the raw DB
+    /// before its target's due-check (`NativeExecutor::core_writer_due`).
+    ///
+    /// Codex P2: the walk skips the targets [`CORE_WRITER_FIRST_OPEN_TARGET_KEY`] and
+    /// [`CORE_WRITER_FULL_ORDER_RUN_KEY`] know are full, so a backlog of full targets costs
+    /// no reads (the target placed is the same as probing every one). A full target neither
+    /// row covers was filled by an order kind before its run restarted, which happens only
+    /// when `block + K` passed the run's end: such targets lie below `block + K` (K <= 100),
+    /// and each is read once by the walk that then moves the cursor past it.
     ///
     /// T4.4: takes any [`StateBackend`] so EVM execution can enqueue into a per-tx
     /// journaled overlay (durable only if the calling tx succeeds).
     pub fn enqueue(state_db: &impl StateBackend, action: &QueuedAction) -> Result<u64, CoreError> {
-        let target_block = action.block_queued + 1; // anti-frontrunning: execute next block
+        const CAP: u64 = torus_types::CORE_WRITER_DRAIN_CAP;
+        let order = action.kind.is_order();
+        let next_block = action.block_queued.saturating_add(1);
+        let candidate = if order {
+            let stored = state_db.get_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::CORE_WRITER_ORDER_DELAY_PARAM.as_bytes(),
+            )?;
+            let delay = torus_types::gov_u64_in(
+                stored.as_deref(),
+                &torus_types::CORE_WRITER_ORDER_DELAY_RANGE,
+            )
+            .unwrap_or(torus_types::DEFAULT_CORE_WRITER_ORDER_DELAY);
+            let last = read_u64_row(state_db, CORE_WRITER_LAST_ORDER_TARGET_KEY)?.unwrap_or(0);
+            action.block_queued.saturating_add(delay).max(last)
+        } else {
+            next_block // anti-frontrunning: execute next block
+        };
+        // Codex P2: the walk to the first target with room skips the targets the two
+        // cursor rows know are full instead of reading each one. K >= 1, so
+        // `candidate >= next_block` and every target in `next_block .. cursor` is full.
+        let cursor = read_u64_row(state_db, CORE_WRITER_FIRST_OPEN_TARGET_KEY)?.unwrap_or(0);
+        let mut run: Option<Option<(u64, u64)>> = None; // read at the first full probe
+        let mut target_block = candidate.max(cursor);
+        loop {
+            if let Some(Some((start, end))) = run {
+                if (start..end).contains(&target_block) {
+                    target_block = end.max(cursor);
+                    continue;
+                }
+            }
+            // A target's seqs are dense from 0 (rows leave only when the whole target
+            // drains), so it is full iff its last slot is taken.
+            if state_db
+                .get_cf_len(CF_CORE_WRITER_QUEUE, &queue_key(target_block, CAP - 1))?
+                .is_none()
+            {
+                break;
+            }
+            if run.is_none() {
+                run = Some(read_order_run(state_db)?);
+            }
+            target_block = target_block
+                .checked_add(1)
+                .ok_or_else(|| CoreError::Overflow("CoreWriter target block".into()))?;
+        }
 
-        // Determine next sequence number for this target block
         let seq = Self::next_sequence(state_db, target_block)?;
-
-        // Key: target_block(8 BE) + sequence(8 BE)
-        let mut key = [0u8; 16];
-        key[..8].copy_from_slice(&target_block.to_be_bytes());
-        key[8..16].copy_from_slice(&seq.to_be_bytes());
-
         let data = borsh::to_vec(action).map_err(|e| CoreError::Borsh(e.to_string()))?;
-        state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &data)?;
+        state_db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(target_block, seq), &data)?;
 
+        // Every target in `candidate .. full_end` is full now (the walk's, and this row's
+        // target if the row took its last slot).
+        let full_end = if seq == CAP - 1 {
+            target_block.saturating_add(1)
+        } else {
+            target_block
+        };
+        let known_from = cursor.max(next_block);
+        if candidate <= known_from {
+            // `next_block .. candidate` was known full too: the cursor may move.
+            if full_end > known_from {
+                state_db.put_cf_raw(
+                    CF_FEE_CONFIG,
+                    CORE_WRITER_FIRST_OPEN_TARGET_KEY,
+                    &full_end.to_be_bytes(),
+                )?;
+            }
+        } else if order && full_end > candidate {
+            // An order kind beyond the cursor: the targets between are unknown, so keep
+            // what it learnt in the run row. Order targets never move earlier, so the
+            // run either continues (`candidate` inside it) or restarts at `candidate`.
+            let old = match run {
+                Some(r) => r,
+                None => read_order_run(state_db)?,
+            };
+            let new = match old {
+                Some((start, end)) if (start..=end).contains(&candidate) => {
+                    (start, end.max(full_end))
+                }
+                _ => (candidate, full_end),
+            };
+            if old != Some(new) {
+                let mut row = [0u8; 16];
+                row[..8].copy_from_slice(&new.0.to_be_bytes());
+                row[8..].copy_from_slice(&new.1.to_be_bytes());
+                state_db.put_cf_raw(CF_FEE_CONFIG, CORE_WRITER_FULL_ORDER_RUN_KEY, &row)?;
+            }
+        }
+        if order {
+            // The target after the cap: a later order action never lands before this row.
+            state_db.put_cf_raw(
+                CF_FEE_CONFIG,
+                CORE_WRITER_LAST_ORDER_TARGET_KEY,
+                &target_block.to_be_bytes(),
+            )?;
+        }
         Ok(seq)
     }
 
@@ -1392,8 +1596,8 @@ impl CoreWriterQueue {
     /// T4.4: goes through [`StateBackend::iterate_cf`] (instead of the FIX EVM-PF-16 raw
     /// reverse seek) so pending journal writes from earlier calls in the SAME tx/block are
     /// visible (read-your-writes — two placeOrder calls in one tx must get seq 0 then 1).
-    /// The scan is bounded to a single target-block prefix (only actions queued for the
-    /// next block), so it stays small.
+    /// The scan is bounded to a single target-block prefix, which holds at most
+    /// [`torus_types::CORE_WRITER_DRAIN_CAP`] rows (item 7 step 2).
     fn next_sequence(state_db: &impl StateBackend, target_block: u64) -> Result<u64, CoreError> {
         let prefix = target_block.to_be_bytes();
         let entries = state_db.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?;
@@ -1513,6 +1717,21 @@ pub enum QueuedActionKind {
     LockboxWithdraw {
         amount: FixedPoint,
     },
+}
+
+impl QueuedActionKind {
+    /// Item 7 step 2 (owner decision 4): order actions (the placement and every cancel, so a
+    /// contract's cancel never overtakes its order) wait K blocks; staking and lockbox kinds
+    /// one.
+    pub fn is_order(&self) -> bool {
+        matches!(
+            self,
+            Self::PlaceOrder { .. }
+                | Self::CancelOrder { .. }
+                | Self::CancelAll { .. }
+                | Self::CancelByCloid { .. }
+        )
+    }
 }
 
 /// Borsh tags of the lockbox kinds. Kept clear of the dense 0.. range used by the

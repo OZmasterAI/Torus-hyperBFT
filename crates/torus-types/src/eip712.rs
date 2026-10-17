@@ -299,6 +299,9 @@ pub fn eip712_struct_hash(action: &NativeAction, nonce: u64) -> B256 {
         NativeAction::CancelByCloid { market_id, cloid } => {
             hash_cancel_by_cloid(*market_id, *cloid, nonce)
         }
+        NativeAction::EvmUserModify { using_big_blocks } => {
+            hash_evm_user_modify(*using_big_blocks, nonce)
+        }
     }
 }
 
@@ -529,6 +532,18 @@ fn hash_set_oracle_signer(signer: &Address, proof: Option<&crate::OracleSignerPr
     buf.extend_from_slice(&th.0);
     buf.extend_from_slice(&encode_address(signer));
     buf.extend_from_slice(&encode_bytes32(&proof_hash));
+    buf.extend_from_slice(&encode_u64(nonce));
+    keccak256(&buf)
+}
+
+// ---------- EVM ----------
+
+/// Item 7 step 2: `EvmUserModify(bool usingBigBlocks,uint64 nonce)`.
+fn hash_evm_user_modify(using_big_blocks: bool, nonce: u64) -> B256 {
+    let th = keccak256("EvmUserModify(bool usingBigBlocks,uint64 nonce)");
+    let mut buf = Vec::with_capacity(3 * 32);
+    buf.extend_from_slice(&th.0);
+    buf.extend_from_slice(&encode_bool(using_big_blocks));
     buf.extend_from_slice(&encode_u64(nonce));
     keccak256(&buf)
 }
@@ -1518,7 +1533,7 @@ mod tests {
             NativeAction::CancelAllOrders { market_id: None },
             NativeAction::ModifyOrder { order_id: 1, new_price: Some(FixedPoint::ONE), new_qty: None },
         ];
-        let families: [(&str, Vec<NativeAction>); 6] = [
+        let families: [(&str, Vec<NativeAction>); 7] = [
             (
                 "transfer",
                 vec![
@@ -1598,6 +1613,17 @@ mod tests {
                         scope: SessionScope::Trading,
                     },
                     NativeAction::RevokeSession { session_pubkey: [3; 32] },
+                ],
+            ),
+            (
+                "evm",
+                vec![
+                    NativeAction::EvmUserModify {
+                        using_big_blocks: true,
+                    },
+                    NativeAction::EvmUserModify {
+                        using_big_blocks: false,
+                    },
                 ],
             ),
         ];
@@ -1680,6 +1706,35 @@ mod tests {
             TEST_NONCE,
             &key,
         );
+        assert_eq!(signed.recover_sender().unwrap(), signer_address(&key));
+    }
+
+    /// Item 7 step 2: `EvmUserModify(bool usingBigBlocks,uint64 nonce)` binds the flag and the
+    /// nonce.
+    #[test]
+    fn evm_user_modify_struct_hash_binds_the_flag_and_nonce() {
+        let on = NativeAction::EvmUserModify {
+            using_big_blocks: true,
+        };
+        let off = NativeAction::EvmUserModify {
+            using_big_blocks: false,
+        };
+        let th = keccak256("EvmUserModify(bool usingBigBlocks,uint64 nonce)");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&th.0);
+        buf.extend_from_slice(&encode_bool(true));
+        buf.extend_from_slice(&encode_u64(TEST_NONCE));
+        assert_eq!(eip712_struct_hash(&on, TEST_NONCE), keccak256(&buf));
+        assert_ne!(
+            eip712_struct_hash(&on, TEST_NONCE),
+            eip712_struct_hash(&off, TEST_NONCE)
+        );
+        assert_ne!(
+            eip712_struct_hash(&on, TEST_NONCE),
+            eip712_struct_hash(&on, TEST_NONCE + 1)
+        );
+        let key = test_key();
+        let signed = sign_native_action(on, TEST_NONCE, &key);
         assert_eq!(signed.recover_sender().unwrap(), signer_address(&key));
     }
 
@@ -1913,6 +1968,9 @@ mod tests {
             }),
             NativeAction::DelistMarket { market_id: 99 },
             NativeAction::ClaimUnbonded,
+            NativeAction::EvmUserModify {
+                using_big_blocks: true,
+            },
         ];
 
         for (i, action) in actions.into_iter().enumerate() {
@@ -3156,6 +3214,117 @@ mod tests {
                 assert_eq!(on, off, "{mode:?} n={n}: flag on must match flag off");
                 assert_eq!(on.1, expected_keys, "{mode:?} n={n}: lookup sequence");
             }
+        }
+    }
+
+    /// Merge of main (exec-action-keys) into item 7 step 2: `EvmUserModify` (tag 30) through
+    /// the parallel key pre-pass. Its trust-cache key covers the flag byte (canonical tag 30 +
+    /// flag), so the same nonce and signature with the flag flipped is another key (a warm
+    /// `true` entry is never a hit for `false`); with `parallel_keys` on, senders and the
+    /// lookup sequence equal the sequential pre-pass; a session-signed `EvmUserModify` (no
+    /// scope allows it) never resolves and makes no lookup.
+    #[test]
+    fn parallel_keys_evm_user_modify_resolves_like_serial() {
+        let key = test_key();
+        let key2 = test_key_2();
+        let owner = Address::from([0x11; 20]);
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(ed.verifying_key().to_bytes(), make_session(owner));
+
+        // Same nonce and signature, flag flipped: another key, another recovered address.
+        let on = sign_native_action(
+            NativeAction::EvmUserModify {
+                using_big_blocks: true,
+            },
+            TEST_NONCE,
+            &key,
+        );
+        let mut flipped = on.clone();
+        flipped.action = NativeAction::EvmUserModify {
+            using_big_blocks: false,
+        };
+        let on_key = crate::verified_cache_key(&on).expect("eip712 is cacheable");
+        let flipped_key = crate::verified_cache_key(&flipped).expect("eip712 is cacheable");
+        assert_ne!(on_key, flipped_key, "the flag byte is part of the key");
+        assert_ne!(
+            flipped.recover_sender().ok(),
+            Some(signer_address(&key)),
+            "a flipped flag must not recover the signer"
+        );
+
+        let mut actions = Vec::new();
+        let mut expected = Vec::new();
+        let mut cache = std::collections::HashMap::new();
+        for i in 0..24u64 {
+            let (k, signer) = if i.is_multiple_of(2) {
+                (&key, signer_address(&key))
+            } else {
+                (&key2, signer_address(&key2))
+            };
+            let action = NativeAction::EvmUserModify {
+                using_big_blocks: i % 4 < 2,
+            };
+            let signed = sign_native_action(action, TEST_NONCE + 1 + i, k);
+            if i.is_multiple_of(3) {
+                // Warm: a sentinel sender shows the hit.
+                let sentinel = Address::from([0xA0 + i as u8; 20]);
+                cache.insert(crate::verified_cache_key(&signed).unwrap(), sentinel);
+                expected.push(Some(sentinel));
+            } else {
+                expected.push(Some(signer));
+            }
+            actions.push(signed);
+            if i == 5 {
+                // An order batch between the lane actions.
+                actions.push(sign_native_action(
+                    keys_order_batch(50, true, 77),
+                    TEST_NONCE + 100,
+                    &key2,
+                ));
+                expected.push(Some(signer_address(&key2)));
+            }
+        }
+        // `on` warm, `flipped` cold: the flipped copy misses and recovers another address.
+        cache.insert(on_key, signer_address(&key));
+        actions.push(on.clone());
+        expected.push(Some(signer_address(&key)));
+        expected.push(flipped.recover_sender().ok());
+        actions.push(flipped);
+        // A session-signed lane change: no scope allows it, no lookup.
+        actions.push(sign_action_with_session(
+            NativeAction::EvmUserModify {
+                using_big_blocks: true,
+            },
+            TEST_NONCE + 200,
+            &ed,
+        ));
+        expected.push(None);
+        assert!(actions.len() >= super::PARALLEL_KEYS_MIN_ACTIONS);
+
+        let expected_keys: Vec<B256> = actions
+            .iter()
+            .filter_map(crate::verified_cache_key)
+            .collect();
+        assert_eq!(expected_keys.len(), actions.len() - 1, "one session action");
+        let (serial, serial_keys) =
+            verify_recording_keys(&actions, &sessions, &cache, VerifyMode::Serial, None, false);
+        assert_eq!(serial, expected, "sequential pre-pass ground truth");
+        assert_eq!(serial_keys, expected_keys);
+
+        let p2 = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for (mode, pool) in [
+            (VerifyMode::Default, None),
+            (VerifyMode::Pool(2), Some(&p2)),
+            (VerifyMode::Pool(3), None),
+        ] {
+            assert!(super::use_parallel_keys(true, mode, actions.len()));
+            let got = verify_recording_keys(&actions, &sessions, &cache, mode, pool, true);
+            assert_eq!(got.0, serial, "{mode:?}: senders diverged");
+            assert_eq!(got.1, serial_keys, "{mode:?}: lookup sequence diverged");
         }
     }
 

@@ -65,8 +65,9 @@
 
 ## ChainConfig Fields
 
-Set via genesis.json. Cannot be changed after genesis initialization, except the two EVM block
-values, which governance can change (see "EVM blocks" below).
+Set via genesis.json. Cannot be changed after genesis initialization, except the four EVM block
+values (`evm_gas_limit`, `evm_block_interval`, `evm_big_block_interval`, `evm_big_gas_limit`),
+which governance can change (see the two "EVM blocks" sections below).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -74,7 +75,9 @@ values, which governance can change (see "EVM blocks" below).
 | `chain_name` | string | `"torus"` | Human-readable chain name |
 | `evm_gas_limit` | u64 | 3,000,000 | EVM gas budget per EVM block: the genesis header's `evm_gas_limit`. Genesis key `evm.gas_limit` (required). |
 | `evm_block_interval` | u64 | 11 | N: EVM transactions only in blocks with `height % N == 0`. The genesis header's `evm_block_interval`. Genesis key `evm.block_interval` (absent = 11; 0 is refused; 1 = EVM in every block). |
-| `base_fee_per_gas` | u64 | 1,000,000,000 | Initial base fee (1 gwei) |
+| `evm_big_block_interval` | u64 | 0 | Item 7 step 2, M: with M > 0, a block with `height % M == 0` is a big EVM block (0 = big blocks off). The genesis header's `evm_big_block_interval`. Genesis key `evm.big_block_interval` (absent = 0). Not range-checked at genesis; governance takes only 0 or 30..=10,000. |
+| `evm_big_gas_limit` | u64 | 10,000,000 | Item 7 step 2: the big lane's gas limit, added to `evm_gas_limit` at a big height. The genesis header's `evm_big_gas_limit`. Genesis key `evm.big_gas_limit` (absent = 10,000,000). Not range-checked at genesis; governance takes 1,000,000..=30,000,000. |
+| `base_fee_per_gas` | u64 | 1,000,000,000 | Initial base fee (1 gwei). Item 7 step 2: the genesis parent header carries 1 gwei for both lanes (`base_fee_per_gas`, `big_base_fee_per_gas`); from there each lane's fee follows F3 (see "EVM blocks (item 7 step 2)"). |
 | `epoch_length` | u64 | 100,000 | Blocks per validator epoch |
 | `max_validators` | u32 | 21 | Maximum active validator set size |
 | `min_stake` | U256 | 10,000 TRS | Minimum self-delegation to register |
@@ -112,14 +115,17 @@ block insertion. Execution of boundary H copies the governance values into the p
 Values outside the range are refused at submission and at execution. A stored value that is
 absent or invalid leaves the chain's value unchanged.
 
-A node fills an EVM block, and admits a transaction, only up to `min(evm_gas_limit,
-TORUS_EVM_BLOCK_GAS_BUDGET)`; the budget is node-local and defaults to 5,000,000. So an
-`evm_block_gas_limit` above a node's budget changes neither that node's blocks nor its admission
-cap, while `eth_estimateGas` still searches up to the header limit and can quote gas that the
-same node's admission refuses. Raise `TORUS_EVM_BLOCK_GAS_BUDGET` on every node together with
-such a governance change.
+`TORUS_EVM_BLOCK_GAS_BUDGET` (item 7 step 2, owner decision 6) is node-local and has **no
+default**: unset, empty or not a whole number means no cap, and the header limits alone size
+both lanes. Set, it caps only the small lane: that node fills the small lane of a block, and
+admits a small-lane transaction, only up to `min(evm_gas_limit, TORUS_EVM_BLOCK_GAS_BUDGET)`. It
+never caps the big lane (drain or admission). It is an A/B knob; leave it unset on validators.
+With it set below `evm_gas_limit`, `eth_estimateGas` still searches up to the header limit and
+can quote gas that the same node's admission refuses. (Until step 2 it defaulted to 5,000,000
+and capped every EVM block.)
 
-Per block, checked before voting (a block that breaks one gets no vote):
+Per block, checked before voting (a block that breaks one gets no vote; at a big height the
+caps are larger, see "EVM blocks (item 7 step 2)"):
 
 * EVM transactions only when `height % N == 0`; an honest proposer leaves them pooled in the other
   blocks.
@@ -133,10 +139,184 @@ limit above the `evm_gas_limit` of the last committed header handed to execution
 `TORUS_EVM_BLOCK_GAS_BUDGET`, if lower). When a committed header lowers that limit, pooled
 transactions above it are evicted (they could never be selected). `eth_call` and
 `eth_estimateGas` use the head header's `evm_gas_limit` as their default gas and clamp a larger
-`gas` to it.
+`gas` to it. Step 2 makes all of this per lane: a big-lane sender gets the big lane's limit, byte
+cap and fee (next section).
 
 Constants: `DEFAULT_EVM_GAS_LIMIT`, `DEFAULT_EVM_BLOCK_INTERVAL`, `MAX_EVM_BLOCK_TX_BYTES`,
 `EVM_MIN_TX_GAS` and the two key names and ranges, in `crates/torus-types/src/lib.rs`.
+
+## EVM blocks (item 7 step 2)
+
+Step 2 adds HL-style big EVM blocks: a second, slower EVM lane with its own gas limit and base
+fee, which an address opts into. Design `docs/plans/item7-step2-design.md` (owner decisions
+s123), plan `docs/plans/item7-step2-impl.md` (with the owner's build decisions, s126).
+
+### Big heights and per-height caps
+
+The header carries three more values, all in the canonical header bytes:
+`evm_big_block_interval` (M), `evm_big_gas_limit` and `big_base_fee_per_gas`. A height is
+**big** when M > 0 and `height % M == 0`. EVM transactions may ride a height when
+`height % N == 0` or when it is big; a big height carries both lanes. Genesis
+`evm.big_block_interval` defaults to 0 (big blocks off) and `evm.big_gas_limit` to 10,000,000;
+every shipped genesis file spells out 0 and 10M. Big blocks start only when governance sets M
+(owner decision 1).
+
+Per height, checked before voting (off a big height, or with M = 0, these are step 1's caps):
+
+| Cap | Not big (`height % N == 0`) | Big height |
+|---|---|---|
+| Gas: declared gas of the EVM transactions, and the execution gas limit | `evm_gas_limit` | `evm_gas_limit + evm_big_gas_limit` |
+| EVM transaction count | gas cap / 21,000 | gas cap / 21,000 |
+| Raw EVM transaction bytes | 256 KiB | 768 KiB (786,432 bytes, owner decision 8) |
+
+`eth_getBlockByNumber` / `eth_getBlockByHash` report the height's gas cap as `gasLimit`.
+
+Step 1's boundary rule covers all six EVM header values (`evm_gas_limit`, N, M,
+`evm_big_gas_limit`, `base_fee_per_gas`, `big_base_fee_per_gas`): a header carries its parent's
+values, at an epoch boundary the epoch plan's (unset = the parent's). Validators check this
+before voting and at block insertion.
+
+### Governance keys
+
+| Governance key (`ParameterChange`) | Range | Effect |
+|---|---|---|
+| `evm_big_block_interval` | 0 (off) or 30..=10,000 | Header `evm_big_block_interval` (M), through the epoch plan like N |
+| `evm_big_block_gas_limit` | 1,000,000..=30,000,000 | Header `evm_big_gas_limit`, through the epoch plan |
+| `core_writer_order_delay` | 1..=100 | K, the CoreWriter order delay (below); read when a row is queued, no header field |
+
+Values outside the range are refused at submission and at execution. A stored value that is
+absent or invalid leaves the chain's value unchanged (for K: the default, 10). M and the big
+limit reach the header between L and 2L blocks after the vote executes, like N. At 3.2 blocks/s,
+M = 30 is a big block every ~9 s; M = 190 about once a minute (HL's cadence). Setting M back to 0
+switches big blocks off: the pools move the big lane's transactions to the small lane.
+
+### Lanes and `EvmUserModify`
+
+`NativeAction::EvmUserModify { using_big_blocks }` (HL `evmUserModify`; canonical tag 30,
+EIP-712 `EvmUserModify(bool usingBigBlocks,uint64 nonce)`) sets (`true`) or clears (`false`)
+the sender's lane row, `"lan" ‖ address` in `CF_NATIVE_ORACLE` (hashed state). It is not a
+trading action, so a session key cannot sign it. Wallet: `torus-wallet evm-user-modify
+--using-big-blocks true|false`. An address is in the **big lane** while its row exists and the
+header's M > 0; otherwise in the small lane. Lanes are proposer routing and fees, never a vote
+rule.
+
+* **Admission** reads the sender's lane from the ingress view (the latest executed state) and
+  the last committed header, and applies that lane's caps: small = `evm_gas_limit` (and
+  `TORUS_EVM_BLOCK_GAS_BUDGET`, if set), 256 KiB, the small base fee; big =
+  `evm_big_gas_limit`, 768 KiB, the big base fee. Gas above the lane's limit is
+  `GasLimitExceeded`, bytes above its cap `TxTooLarge`, a max fee below its base fee
+  `FeeTooLow`. A small-lane address cannot send a transaction above the small limit; it opts
+  into the big lane first.
+* **One lane per sender.** A new transaction of a sender that still has transactions pooled in
+  its other lane is refused (`EvmLaneSwitchPending`) until they leave the pool. A transaction
+  returning to the pool (this node's lost proposal, a re-proposal, the move when M goes to 0)
+  joins the lane that already holds its sender's transactions, so it never leaves a nonce gap
+  (owner s126).
+* A pooled transaction that no lane can take after a limit drop or after M goes to 0 is dropped
+  with a warning. The sender's later nonces stay pooled and wait until the missing nonce is sent
+  again (owner s126, as step 1's gas-limit eviction).
+* One `max_pool_size` covers both lanes: at the cap, a new transaction must outbid the lowest
+  effective tip of either lane (each ranked at its own base fee).
+* **Proposer:** at a big height an honest proposer drains the small lane first (small limit,
+  256 KiB), then the big lane (big limit, the bytes left of 768 KiB), each at the base fee of the
+  header it proposes.
+* **Execution** charges each transaction the base fee of its sender's lane when the block
+  executes (the row at that time, not the transaction's place in the block). A sender that
+  switches lanes while a transaction waits under the old lane may pay the new lane's fee, or see
+  it skipped if its max fee is below that fee.
+
+### Fees per lane (F3)
+
+Each lane has its own EIP-1559 base fee (`base_fee_per_gas`, `big_base_fee_per_gas`), changed
+once per epoch from executed gas: headers are built before execution, so no per-block gas signal
+exists at vote time. The native phase adds each EVM block's gas used, split by lane, to the
+hashed `CF_CONSENSUS_META` row `evm_epoch_gas`. Execution of boundary H computes each lane's next
+fee with `calc_next_block_base_fee`, counting the epoch `[H - L, H)` as one block whose gas limit
+is the lane's limit times its EVM heights in that window (small lane: every EVM height, big ones
+included; big lane: the big heights), and writes both fees into the plan for H + L. So a fee
+moves at most +/-12.5% per epoch, reaches the headers at boundary H + L, and never drops below
+`EVM_MIN_BASE_FEE` = 1 gwei (an idle chain stays at 1 gwei, today's fixed fee).
+
+### CoreWriter delay and cap (owner decision 4)
+
+CoreWriter order actions (0x0810 `placeOrder`, `cancelOrder`, `cancelAll`, `cancelByCloid`)
+queued by block B's EVM drain in block B + K (K = `core_writer_order_delay`, default 10, about
+3 s at 3.2 blocks/s), so a contract cannot jump the native mempool. An order action never
+targets a block before the previous order action's target, so lowering K cannot let a cancel
+drain before an earlier order. Every other kind (staking 0x0811, lockbox 0x0820) drains in
+B + 1, as before. At most `CORE_WRITER_DRAIN_CAP` = 200 rows drain per block: the cap is applied
+when a row is queued, and a target block that already holds 200 rows sends the row on to the
+next block with room, in queue order. Rows are still written only by EVM blocks. Results:
+`docs/api/corewriter-results.md`.
+
+### Best bid / ask precompile (owner decision 3)
+
+0x080e (HL's bbo address), `bbo(bytes32 marketId) -> (uint128 bid, uint128 ask)`: the market's
+best bid and ask (FixedPoint raw; 0 for an empty side or an unknown market) as of the last block
+that changed its book. **16,440 gas**: the reader base 16,400 (the point read included, as for
+`getPrice`) + 2 answer words x 20 (owner s125). It reads `cf_native_bbo`, one row per market with
+a non-empty book, written at block end for every market whose book changed, in every book mode
+and both save paths, with M = 0 too; an emptied book deletes its row. The column family is
+node-written and not hashed (derived from the hashed book rows). The call shape is ours, not
+HL's (HL takes `abi.encode(uint64 asset)` and returns two `uint64`), so HL contracts need
+porting. Pricing: `docs/perf/read-precompile-gas.md`.
+
+### Routing (owner decision 7)
+
+EVM transactions are not gossiped: the RPC node that receives one forwards it to the leaders
+expected to carry it.
+
+* **Targets:** a small-lane transaction goes to the leader of the next EVM height (a big height
+  counts); a big-lane transaction to the leaders of the next two big heights.
+* **Upcoming N and M:** heights from the next epoch boundary on are predicted with that
+  boundary's N and M from its epoch plan, once this node can read the plan (its execution has
+  applied the previous boundary); until then with the committed values.
+* **In-flight filter:** on every commit, the committed block's EVM transactions leave every
+  pool at once (they execute up to ~14 s later under load). Their copies are refused as
+  `DuplicateTx` for 256 blocks (`EVM_INFLIGHT_KEEP_BLOCKS`), and the sender's next pool nonce
+  counts them (a lower nonce is `NonceTooLow`) until its state nonce catches up or the height
+  executes.
+* **Re-send:** the node tracks each forwarded transaction with its target height. When the
+  target commits without it and it is still pooled, it is re-sent to the next predicted
+  leader(s), at most `EVM_RESEND_MAX` = 8 times (log line `EVM tx re-sent: its target EVM
+  height committed without it`); after that it waits for this node's own EVM turn. The
+  transactions of this node's lost proposal go back to the pool and are tracked at their lane's
+  next EVM height.
+
+### RPC
+
+* `eth_gasPrice`: the small lane's base fee. `torus_bigBlockGasPrice`: the big lane's (HL
+  `bigBlockGasPrice`), from the last committed header.
+* `torus_usingBigBlocks(address)`: `true` when the address's lane row exists (its choice; the
+  big lane applies only while M > 0). Read through the ingress view, so a choice shows as soon
+  as it executes.
+* `eth_feeHistory(blockCount, newestBlock, rewardPercentiles, blockType?)`: `blockType`
+  `"small"` (default) or `"big"` selects the lane's base fees; any other value is `-32602`.
+  `gasUsedRatio` stays the header's (always 0: headers are built before execution).
+* `eth_call` / `eth_estimateGas` run in the caller's lane (`from`, else the zero address): its
+  gas limit (the default gas, the clamp, the estimate's search bound) and its base fee. The lane
+  row comes from the ingress view, as for admission, routing and `torus_usingBigBlocks` (owner
+  s126, option B); the call itself runs on the DB state at the eth head.
+* `eth_sendRawTransaction` refuses a transaction with bytes after it (`mempool error: tx decode
+  failed: trailing bytes after the tx (N bytes)`, code -32603), so every admitted transaction
+  has one byte form (owner s126). Both accepted encodings, the bare EIP-2718 bytes and alloy's
+  network form, still pass. Any decode failure now reads `mempool error: tx decode failed: ...`
+  (was `internal error: tx rlp decode: ...`). Blocks and execution still take trailing bytes;
+  it is not a vote rule.
+
+### Limit: `TORUS_NATIVE_TOTAL_BLOCK_CAP` <= 7,203 while big blocks are on
+
+The worst compact proposal at a big height is 768 KiB of EVM bytes + 8 bytes of length per
+transaction (1,904 transactions at the 10M + 30M governance ceilings) + 32 bytes per native
+action hash + 16 KiB of header, QC and framing. At the compiled native cap (400) that is
+830,864 bytes, under the 1 MiB consensus accept gate (`o5_feed_gates.rs`). A
+`TORUS_NATIVE_TOTAL_BLOCK_CAP` above 7,203 would let a worst big height exceed 1 MiB: every
+receiver drops the proposal and penalizes its proposer. Keep it at or below 7,203 while M > 0.
+
+Constants: `MAX_EVM_BIG_BLOCK_TX_BYTES`, `DEFAULT_EVM_BIG_BLOCK_INTERVAL`,
+`DEFAULT_EVM_BIG_GAS_LIMIT`, `EVM_MIN_BASE_FEE`, `DEFAULT_CORE_WRITER_ORDER_DELAY`,
+`CORE_WRITER_DRAIN_CAP` and the three key names and ranges in `crates/torus-types/src/lib.rs`;
+`EVM_INFLIGHT_KEEP_BLOCKS` and `EVM_RESEND_MAX` in `crates/torus-mempool/src/lib.rs`.
 
 ## Economic Constants
 
