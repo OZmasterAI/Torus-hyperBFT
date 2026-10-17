@@ -64,12 +64,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
 
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10).
-7. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
+7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
+   on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
+8. **Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15000 vs 5000 ms** (n = 2 per arm ABBA, ~45 min plus
+   setup; step 0 binary from `perf/q6-ckpt-slicing`, SHA given by 18c after review; Items, Q6). Decides GO / NO-GO /
+   SHIP-Z for building checkpoint slicing (A1).
+9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
    **NOT READY: waits on Q10 and the owner's custody decision** (Items, Q9, "Arm b depends on Q10"). Moved here in
    s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls (prune by
    default, validator retention N) and the RH4 merge wait on it.
-8. **Q6. 71.8 checkpoint slicing** vs M, when 18c delivers the code (not built yet; 18c adds the
-   `persist_commit_manifest` timer first). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
+10. **Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
 Done / dropped: **Q5** native vs native + EVM (campaign C, done s64: E/N 0.876, -12.4% matched/s; EVM heights never
@@ -110,7 +114,21 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
 - **Q6. 71.8 checkpoint slicing** vs option A (= main), after the slicing build (section 74.6 next cells): 300
   markets, 600 s, n = 3 ABBA (4-5 per arm resolves a ~200 ms step). Success: in-window block p99 within ~100 ms of the
   out-of-window p99, and `on_committed_block` in-window = out. 18c adds a timer around `persist_commit_manifest` first.
-  Waiting on 18c code.
+  - s127 plan (design `docs/plans/q6-checkpoint-slicing.md` on `perf/q6-ckpt-slicing`, revision 2 after two adversarial
+    reviews; owner accepted all picks): measure first. Step 0 (built, under review): per-checkpoint DB-write stage
+    histograms `torus_exec_checkpoint_db_{write,wal,memtable,delay,pre_post,residual}_seconds` (+ `mutex`,
+    `cond_wait`), start / end gauges `torus_exec_checkpoint_db_write_{start,end}_ms` and a `checkpoint db write` log
+    line, the 1 Hz / 10 Hz Dirty-Writeback sampler (`SOAK_DIRTY_HZ=10`), and `torus_commit_manifest_seconds`.
+  - Step Z (queue step 8): one step 0 binary, arms `"env": {"TORUS_CHECKPOINT_INTERVAL_MS": "15000"}` vs `"5000"`, ABBA,
+    n = 2 (extend to 4 if ambiguous), hsdb-300m shape, other flags at the campaign A / Q4 defaults. Cut windows from the
+    start / end gauges (DB-write span), not the scrape-widened windows. Report per arm: checkpoint batch bytes and
+    DB-write s (W_db), manifest put and persist-wait p99 / max and > 250 ms counts in vs out (X), in-vs-out block p99
+    gap (G), overall block p99, matched/s, state-DB bytes/s, Dirty / Writeback max in windows, the stage split.
+    Rule (design section 5): GO if W_db falls >= 40% and X and G fall by at least half as much in relative terms;
+    NO-GO if W_db falls >= 40% but X and G move < 10% or stay in the noise; SHIP-Z if Z alone meets the Q6 criterion
+    with matched/s in the noise; otherwise extend or decide with 18c.
+  - The A/B (queue step 10) runs only after GO and the A1 build: flag A/B on one binary (`TORUS_CKPT_SLICE_MB` 0 vs 4),
+    n = 4 ABBA.
 - **Q7. Item 7 step 2**, native load only, main vs step 2 (after the step 2 build and the 18c devnet check): the best
   bid/ask rows add up to one write per dirty market per block. Full spec: `docs/plans/item7-step2-impl.md`,
   "Archy native-only A/B". Two binaries (commit vs commit, no flag): arm A = main at the step 2 merge base, arm B =
@@ -180,6 +198,58 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
     Within noise at 300 and 10 -> keep it on, 18c builds the RH4 shard-count fix (option d: max of the old and new
     set's n for 64 blocks after a set change, kept in the GC's own batch), benches switch to custody on, and Q9's
     arm (b) runs custody on (Items, Q9).
+
+- **Q12. Option S: does a larger EVM cadence N recover Q5's loss?** (item 7 step 3, `docs/plans/item7-step3-design.md`
+  sections 3 S and 6.2; no node code). Q5 (section 80): -12.4% matched/s at N = 11, from the barrier before every EVM
+  block. Raising N (genesis `evm.block_interval`, governance 2..=100) is the zero-code alternative to option 0.
+  - Binary: M (the Q5 binary `e3d11cb9`, or the campaign's M), unchanged.
+  - Genesis change: the per-cell `devnet/wsl/genesis-3val.json` with `.evm.block_interval = N` (`EvmConfig.block_interval`,
+    `crates/torus-genesis/src/lib.rs:141-156`; absent = `torus_types::DEFAULT_EVM_BLOCK_INTERVAL` = 11; 0 refused,
+    lib.rs:382).
+    - Prerequisite (tooling, ~15 lines + a test, 18c): `devnet/wsl/gen-3val-genesis.sh` applies `EVM_BLOCK_INTERVAL`
+      with a jq patch like its `TIMEOUT_BASE_MS` step. `tools/matched-bench/run-cell.sh` lifts it from `EXTRA_ENV` like
+      `TIMEOUT_BASE_MS` (run-cell.sh:906-908) and logs it. `evm_load.py` already takes N from the genesis
+      (run-cell.sh:934).
+    - Without the knob: patch `testnet/genesis-weighted-full.json` per cell (`jq '.evm.block_interval = N'`; the
+      staleness check ignores `evm`, run-cell.sh:748-760) and restore 11 after.
+    - Either way, check `.evm_load.interval` in every `summary.json`.
+  - Arms (one binary, one genesis base):
+    - N11: native only at N = 11 (no EVM load).
+    - E11 / E22 / E33: native + `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40` at N = 11 / 22 / 33.
+    - No native arm per N: a height without EVM txs never barriers (`has_evm = !evm_transactions.is_empty()`,
+      `app.rs:3110`; the predicate needs `!has_evm`, 3166), so native-only is the same at every N.
+    - 33 is the top: at 10 tx/s an N = 44 block would carry ~130 txs (nominal), close to the 142-tx cap of a 3M block
+      (`app.rs:2261`).
+  - Shape: hsdb-300m as Q5 (Classic, 15 s checkpoints, oracle on, 300 markets, 600 s, BLOCK_CAP 400, MAX_IN_FLIGHT 4,
+    commit tail, rate 76,000); D, M, T unset; header re-send 250 ms.
+  - Cell order: warm-up w1 (N11, 300 s), then r1 N11, E11, E22, E33 and r2 E33, E22, E11, N11 (n = 2, rotating):
+    8 cells of ~10 min, ~1 h 45 in all. If the queue is tight, n = 1 is a ~55 min screen. Extend to n = 3 if a rule
+    below sits within 1.5 points of its threshold.
+  - Checks per E cell (Q5's): `.evm_load.ok` true, `interval` = the cell's N, `off_cadence_blocks` 0, landed =
+    accepted, `[.evm_block_txs[][0] % N] | unique` = `[0]`, `health.py accept`.
+    - New: max txs per EVM block < 142; a cell at the cap is flagged (the cap, not the load, then sets the EVM rate).
+    - Q5 reported 58.8 txs per EVM block, but 6,000 txs / 161 blocks = 37. Check which count the gaps script uses
+      before reading the cap margin.
+  - Report per arm:
+    - matched/s (primary), and E/N = matched/s divided by N11's, paired by replicate;
+    - blocks/s and native blocks/s (indicative);
+    - EVM blocks per minute, txs per EVM block (mean, max);
+    - EVM latency: the EVM height interval in s (p50, p99) and commit -> exec lag p50, giving the inclusion latency
+      (interval / 2 + lag; a per-tx latency needs tx-flood send timestamps, not built);
+    - exec idle before EVM blocks (mean, p50) and exec ms at EVM heights vs others (q5-gaps view);
+    - `torus_exec_checkpoints` per minute and mean `torus_exec_checkpoint_layer_bytes` (does the forced checkpoint
+      grow with N?);
+    - `torus_exec_evm_seconds` per EVM block, CPU-s / 1M, timeouts, `no_proposal`.
+  - Decision. L(N) = 1 - E/N(N); L11 comes from this campaign (Q5: 0.124).
+    - **S-INTERIM** if L(22) <= 0.03 or L(33) <= 0.03: raising N recovers the loss at 2-3x the EVM latency. The owner
+      may set that N for devnet / testnet until P2 (no code), and P2's slot may wait (question 2).
+    - **STOPGAP** if L(33) <= L11 / 2 but above 0.03: record N = 33 (or 22) as the no-code fallback in case EVM traffic
+      arrives before P2. Plan unchanged.
+    - **REJECT** if L(33) > L11 / 2: S does not halve the loss even at 3x the latency. Dropped with data.
+    - Either way, read the mechanism: the per-EVM-block cost (idle + extra exec ms) against the bytes per forced
+      checkpoint. A cost flat in N means the barrier is not bound by the window (this doc's inference is wrong), and
+      S then scales ~1/N.
+  - Doc target: the next results-doc section; 18c copies the outcome into `item7-step3-design.md` section 3 S.
 
 ## Later
 
