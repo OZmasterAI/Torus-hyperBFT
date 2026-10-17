@@ -7,7 +7,10 @@ wall-clock second) until every node pid is gone (or SIGTERM):
     without histogram buckets, except the buckets with le >= 0.128 of the latency families in KEEP_BUCKETS (slow-tail
     counts: count - bucket(le=0.512) = events over 0.512 s);
   * host-1hz.tsv: epoch, /proc/meminfo Dirty / Writeback / MemAvailable / Cached kB, and per node VmRSS / RssAnon /
-    RssFile kB, voluntary / nonvoluntary context switches, utime+stime ticks (/proc/<pid>/stat).
+    RssFile kB, voluntary / nonvoluntary context switches, utime+stime ticks (/proc/<pid>/stat);
+  * Q6 step 0, only with SOAK_DIRTY_HZ=<n> (an integer 2..100; unset, 1 or anything else: off) in the environment:
+    host-dirty-<n>hz.tsv, epoch + /proc/meminfo Dirty / Writeback kB, n times per second (aligned to 1/n s) on its own
+    thread, so a ~1 s checkpoint window gets more than one sample. The 1 Hz files above are unchanged.
 """
 
 import gzip
@@ -15,6 +18,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import urllib.request
 
@@ -85,6 +89,36 @@ def proc(pid):
     return out
 
 
+def dirty_hz():
+    """SOAK_DIRTY_HZ as an int in 2..100, else None (off)."""
+    try:
+        hz = int(os.environ.get("SOAK_DIRTY_HZ", ""))
+    except ValueError:
+        return None
+    return hz if 2 <= hz <= 100 else None
+
+
+def dirty_loop(path, hz, done):
+    """host-dirty-<hz>hz.tsv until `done` is set: epoch, Dirty kB, Writeback kB, every 1/hz s (aligned)."""
+    step = 1.0 / hz
+    with open(path, "w") as f:
+        f.write("ts\tDirty_kB\tWriteback_kB\n")
+        n = 0
+        while not done.is_set():
+            now = time.time()
+            if done.wait(max(0.0, step - (now % step))):
+                break
+            ts = time.time()
+            try:
+                mi = meminfo()
+            except OSError:
+                mi = {}
+            f.write("%.3f\t%s\t%s\n" % (ts, mi.get("Dirty", ""), mi.get("Writeback", "")))
+            n += 1
+            if n % hz == 0:
+                f.flush()
+
+
 def main():
     o, ports = sys.argv[1], sys.argv[2:5]
     signal.signal(signal.SIGTERM, on_term)
@@ -103,6 +137,23 @@ def main():
         time.sleep(1)
     if not pids:
         return
+    hz = dirty_hz()
+    done = threading.Event()
+    fast = None
+    if hz:
+        fast = threading.Thread(
+            target=dirty_loop, args=(os.path.join(o, "host-dirty-%dhz.tsv" % hz), hz, done), daemon=True
+        )
+        fast.start()
+    try:
+        sample(o, ports, pids)
+    finally:
+        done.set()
+        if fast:
+            fast.join(timeout=5)
+
+
+def sample(o, ports, pids):
     pk = (
         "VmRSS",
         "RssAnon",

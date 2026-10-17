@@ -715,7 +715,10 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   tools): `metrics-1hz.txt.gz` (per node and second `T <epoch> val<i> ok <scrape_s>|ERR` + the
   /metrics lines without comments or buckets, except the slow-tail buckets le >= 0.128 of its
   latency families: per-second consensus drops and timeouts) and `host-1hz.tsv` (meminfo
-  Dirty / Writeback / MemAvailable / Cached and per node RSS, context switches, CPU ticks). It
+  Dirty / Writeback / MemAvailable / Cached and per node RSS, context switches, CPU ticks).
+  Q6 step 0: with `SOAK_DIRTY_HZ=10` exported where the driver starts (detach.sh passes the
+  caller's environment; integer 2..100, else off) it also writes `host-dirty-10hz.tsv` (epoch,
+  Dirty kB, Writeback kB, 10 rows per second), the 1 Hz files unchanged. It
   starts with the other samplers, waits for run.log's `node pids:` line, ends when the nodes
   are gone and is stopped with them. A frozen `tools_dir` must carry `soak-sampler.py` (else
   `PREFLIGHT FAIL ... soak-sampler.py missing`; also when it does not compile or lacks the

@@ -26,6 +26,7 @@ pub mod spawn_count;
 pub mod trade_rows;
 pub mod trie;
 pub mod trie_cursor;
+pub mod write_stages;
 
 pub use backend::{
     AtomicWriteOp, FrozenPending, HashExtras, NativeFlushStats, NativeStateOverlay,
@@ -38,6 +39,7 @@ pub use db::{
     RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,
 };
 pub use error::StateError;
+pub use write_stages::WriteStageSplit;
 pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};

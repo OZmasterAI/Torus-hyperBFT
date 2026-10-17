@@ -158,8 +158,17 @@ CKPT_BUCKETS = {
 }
 
 
+# Q6 step 0: the flush worker's checkpoint DB write and its RocksDB perf-context
+# stage split, CKPT_DB_N writes over the window; per write (s): wall 0.600 =
+# WAL 0.150 + memtable 0.300 + delay 0 + pre/post 0.050 + residual 0.100;
+# mutex 0.020, condition wait 0.005 (signals, not stages).
+CKPT_DB = {"write": 0.600, "wal": 0.150, "memtable": 0.300, "delay": 0.0, "pre_post": 0.050,
+           "mutex": 0.020, "cond_wait": 0.005, "residual": 0.100}
+CKPT_DB_N = 4
+
+
 def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_resident_worker=False,
-                  checkpoint=False):
+                  checkpoint=False, checkpoint_db=False):
     """bl1: 'serial' | 'pipelined' | 'none' (a pre-bl1 node binary).
     end_resident: the binary times end_resident (item 6 step 1); "users":
     a Phase 4 step 1 binary (users sub in place of positions);
@@ -203,6 +212,11 @@ def write_fixture(out, include_r6=True, bl1="serial", end_resident=False, end_re
         cols += ["torus_" + k + "_sum", "torus_" + k + "_count"]
         vals_a += [0.0, 0.0]
         vals_b += [per * BLOCKS, float(count)]
+    if checkpoint_db:
+        for k, per in CKPT_DB.items():
+            cols += ["torus_exec_checkpoint_db_%s_seconds_sum" % k, "torus_exec_checkpoint_db_%s_seconds_count" % k]
+            vals_a += [0.0, 0.0]
+            vals_b += [per * CKPT_DB_N, float(CKPT_DB_N)]
 
     with open(os.path.join(out, "sampler.csv"), "w") as f:
         f.write("ts,node," + ",".join(cols) + "\n")
@@ -787,6 +801,39 @@ def main_checkpoint_timers():
 
 def test_checkpoint_timers():
     main_checkpoint_timers()
+
+
+def test_checkpoint_db_write_split():
+    """Q6 step 0: summarize.py reports the checkpoint DB write and its stage
+    split per write over the phase window (None on an older binary), and
+    run-cell.sh samples every series' sum and count plus the write's start /
+    end gauges (any WIDE_COLS line)."""
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True, end_resident_worker=True,
+                      checkpoint=True, checkpoint_db=True)
+        p0 = run(out)["phase_by_node"]["val0"]
+        assert p0["checkpoint_db_writes"] == CKPT_DB_N, p0.get("checkpoint_db_writes")
+        for k, per in CKPT_DB.items():
+            close(p0["checkpoint_db_%s_ms_per_call" % k], per * 1000, "checkpoint_db " + k)
+    with tempfile.TemporaryDirectory() as out:
+        write_fixture(out, include_r6=True, bl1="pipelined", end_resident=True, end_resident_worker=True,
+                      checkpoint=True)
+        p0 = run(out)["phase_by_node"]["val0"]
+        assert p0["checkpoint_db_writes"] == 0, p0.get("checkpoint_db_writes")
+        for k in CKPT_DB:
+            assert p0["checkpoint_db_%s_ms_per_call" % k] is None, k
+    with open(os.path.join(HERE, "run-cell.sh")) as f:
+        src = f.read()
+    wide = []
+    for line in src.splitlines():
+        line = line.strip()
+        if line.startswith("WIDE_COLS="):
+            wide += line.split("=", 1)[1].replace('"', " ").split()
+    for k in CKPT_DB:
+        for suf in ("_sum", "_count"):
+            assert ("torus_exec_checkpoint_db_%s_seconds%s" % (k, suf)) in wide, (k, suf)
+    for g in ("torus_exec_checkpoint_db_write_start_ms", "torus_exec_checkpoint_db_write_end_ms"):
+        assert g in wide, g
 
 
 def add_oracle_drain(out, blocks, secs):

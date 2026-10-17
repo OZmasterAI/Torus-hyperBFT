@@ -695,6 +695,22 @@ pub struct Metrics {
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
+    /// Q6 step 0: the flush worker's checkpoint DB write (`write` wall) and
+    /// RocksDB's perf-context stage split of it, one observation per
+    /// checkpoint (`torus_state::WriteStageSplit`; residual = wall - WAL -
+    /// memtable - delay - pre/post; mutex / condition wait overlap the stages).
+    pub exec_checkpoint_db_write_seconds: Histogram,
+    pub exec_checkpoint_db_wal_seconds: Histogram,
+    pub exec_checkpoint_db_memtable_seconds: Histogram,
+    pub exec_checkpoint_db_delay_seconds: Histogram,
+    pub exec_checkpoint_db_pre_post_seconds: Histogram,
+    pub exec_checkpoint_db_mutex_seconds: Histogram,
+    pub exec_checkpoint_db_cond_wait_seconds: Histogram,
+    pub exec_checkpoint_db_residual_seconds: Histogram,
+    /// Q6 step 0: unix ms at the start / end of the last checkpoint DB write
+    /// (cut checkpoint windows to the DB write itself).
+    pub exec_checkpoint_db_write_start_ms: Gauge,
+    pub exec_checkpoint_db_write_end_ms: Gauge,
     /// s77 order latency: age `now - nonce` of every native action at each
     /// stage (see [`OrderStage`]). The bench stamps `nonce = now_ms` when it
     /// signs, so on the bench this is time since submission.
@@ -2491,6 +2507,64 @@ impl Metrics {
             "Item 6 Phase 3: flush worker wall time per checkpoint job",
             flush_worker_checkpoint_seconds.clone(),
         );
+        // Q6 step 0: 50 us .. ~6.5 s (a ~270 MB checkpoint write is ~1 s).
+        let ckpt_db = |registry: &mut Registry, name: &str, help: &str| {
+            let h = Histogram::new(exponential_buckets(0.000_05, 2.0, 18));
+            registry.register(name, help, h.clone());
+            h
+        };
+        let exec_checkpoint_db_write_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_write_seconds",
+            "Q6 step 0: flush worker checkpoint batch, the RocksDB write call alone (wall)",
+        );
+        let exec_checkpoint_db_wal_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_wal_seconds",
+            "Q6 step 0: checkpoint write, RocksDB perf context write_wal_time",
+        );
+        let exec_checkpoint_db_memtable_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_memtable_seconds",
+            "Q6 step 0: checkpoint write, RocksDB perf context write_memtable_time (insert)",
+        );
+        let exec_checkpoint_db_delay_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_delay_seconds",
+            "Q6 step 0: checkpoint write, RocksDB perf context write_delay_time (write controller)",
+        );
+        let exec_checkpoint_db_pre_post_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_pre_post_seconds",
+            "Q6 step 0: checkpoint write, RocksDB perf context write_pre_and_post_process_time (includes the WAL-group join wait)",
+        );
+        let exec_checkpoint_db_mutex_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_mutex_seconds",
+            "Q6 step 0: checkpoint write, RocksDB perf context db_mutex_lock_nanos (overlaps the stages)",
+        );
+        let exec_checkpoint_db_cond_wait_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_cond_wait_seconds",
+            "Q6 step 0: checkpoint write, RocksDB perf context db_condition_wait_nanos (overlaps the stages)",
+        );
+        let exec_checkpoint_db_residual_seconds = ckpt_db(
+            &mut registry,
+            "torus_exec_checkpoint_db_residual_seconds",
+            "Q6 step 0: checkpoint write, wall - (WAL + memtable + delay + pre/post): memtable-leader wait, PreprocessWrite (memtable switch), WriteBatch drop, untimed",
+        );
+        let exec_checkpoint_db_write_start_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_start_ms",
+            "Q6 step 0: unix ms at the start of the last checkpoint DB write (0 before the first)",
+            exec_checkpoint_db_write_start_ms.clone(),
+        );
+        let exec_checkpoint_db_write_end_ms = Gauge::default();
+        registry.register(
+            "torus_exec_checkpoint_db_write_end_ms",
+            "Q6 step 0: unix ms at the end of the last checkpoint DB write (0 before the first)",
+            exec_checkpoint_db_write_end_ms.clone(),
+        );
 
         // s77 order latency: 5 ms .. ~11 min. Under overload an order can wait
         // well past the 60 s nonce window (s77 cell: exec queue pinned at 64
@@ -3048,6 +3122,16 @@ impl Metrics {
             exec_checkpoint_read_views_live,
             exec_checkpoint_oldest_live_age_blocks,
             flush_worker_checkpoint_seconds,
+            exec_checkpoint_db_write_seconds,
+            exec_checkpoint_db_wal_seconds,
+            exec_checkpoint_db_memtable_seconds,
+            exec_checkpoint_db_delay_seconds,
+            exec_checkpoint_db_pre_post_seconds,
+            exec_checkpoint_db_mutex_seconds,
+            exec_checkpoint_db_cond_wait_seconds,
+            exec_checkpoint_db_residual_seconds,
+            exec_checkpoint_db_write_start_ms,
+            exec_checkpoint_db_write_end_ms,
             order_age_admit_seconds,
             order_age_commit_seconds,
             order_age_exec_seconds,
@@ -3744,6 +3828,40 @@ mod tests {
             text.contains("torus_flush_worker_depth 0"),
             "flush_worker_depth must start at 0:\n{text}",
         );
+    }
+
+    /// Q6 step 0: the flush worker's checkpoint DB write, its RocksDB
+    /// perf-context stage split (histograms, one observation per checkpoint)
+    /// and the write's start / end wall clock (gauges, unix ms) are
+    /// registered, empty / 0 until the first checkpoint.
+    #[test]
+    fn checkpoint_db_write_stage_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_exec_checkpoint_db_write_seconds",
+            "torus_exec_checkpoint_db_wal_seconds",
+            "torus_exec_checkpoint_db_memtable_seconds",
+            "torus_exec_checkpoint_db_delay_seconds",
+            "torus_exec_checkpoint_db_pre_post_seconds",
+            "torus_exec_checkpoint_db_mutex_seconds",
+            "torus_exec_checkpoint_db_cond_wait_seconds",
+            "torus_exec_checkpoint_db_residual_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("{name}_count 0")),
+                "{name} not registered (empty):\n{text}"
+            );
+        }
+        for name in [
+            "torus_exec_checkpoint_db_write_start_ms",
+            "torus_exec_checkpoint_db_write_end_ms",
+        ] {
+            assert!(
+                text.contains(&format!("\n{name} 0\n")),
+                "{name} not registered (0):\n{text}"
+            );
+        }
     }
 
     /// r6 engine-untimed-attribution: the six sub-timers that decompose the

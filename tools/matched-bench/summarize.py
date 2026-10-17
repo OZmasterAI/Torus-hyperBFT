@@ -171,6 +171,8 @@ END_RESIDENT_SUB = ["end_resident_rows", "end_resident_positions", "end_resident
 # in residual_untimed. Not in the chain identity's e_phases (where they fall
 # relative to the chain timer is not pinned here).
 CHECKPOINT_UPKEEP_SUB = ["checkpoint_wait"]
+# Q6 step 0: torus_exec_checkpoint_db_<stage>_seconds (W's checkpoint DB write, per checkpoint; not exec-thread phases).
+CHECKPOINT_DB_STAGES = ["write", "wal", "memtable", "delay", "pre_post", "mutex", "cond_wait", "residual"]
 # r7 state-write-build-vs-db-split: state_write is reported alongside its two
 # halves — state_write_build (serializing the pending maps into the WriteBatch)
 # and state_write_db (the atomic rocksdb write: WAL + memtable). build + db ==
@@ -603,6 +605,13 @@ def node_phase(node, rs, hi, buckets, window):
     p["exec_body_persist_put_ms_per_call"] = per_call("exec_body_persist_write")
     p["commit_persist_ms_per_call"] = per_call("commit_persist")
     p["commit_manifest_ms_per_call"] = per_call("commit_manifest")
+    # Q6 step 0: the flush worker's checkpoint DB write and its RocksDB perf-context stage split, ms per checkpoint
+    # (residual = write - wal - memtable - delay - pre_post; mutex / cond_wait overlap the stages). None on an older
+    # binary or a window without a checkpoint.
+    p["checkpoint_db_writes"] = int(m(b, "exec_checkpoint_db_write_seconds_count")
+                                    - m(a, "exec_checkpoint_db_write_seconds_count"))
+    for k in CHECKPOINT_DB_STAGES:
+        p["checkpoint_db_%s_ms_per_call" % k] = per_call("exec_checkpoint_db_" + k)
     def rk(k):
         return (m(b, "rocksdb_" + k) - m(a, "rocksdb_" + k)) / span if span else 0.0
     def gstat(k, scale=1.0):

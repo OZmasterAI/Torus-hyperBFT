@@ -2111,7 +2111,9 @@ class SamplerCheckTest(Base):
         self.assertIn("CHECK OK %s hardscan done" % LB, r.stdout)
 
 
-SOAK_MD5 = "f147d7c657b2d71f9bc2934825845695"  # the s58rl / p4soak10 hand drivers' soak-sampler.py
+# the s58rl / p4soak10 hand drivers' soak-sampler.py (f147d7c6...) + Q6 step 0's opt-in SOAK_DIRTY_HZ fast
+# Dirty / Writeback file (default output unchanged; test_soak_sampler.py)
+SOAK_MD5 = "287fb2701becf578b876ed9a0765439c"
 HOST_1HZ_HEADER = "\t".join(
     ["ts", "Dirty_kB", "Writeback_kB", "MemAvailable_kB", "Cached_kB"]
     + [

@@ -2087,6 +2087,7 @@ fn flush_pending_after_batch(
             dirty_entries_by_cf: [0; 7],
             state_hash_seconds: 0.0,
             state_hash_entries: 0,
+            checkpoint_write: None,
         };
         // 3c funnel attribution: dirty-entry composition per cf_tag.
         match &dirty {
@@ -2190,9 +2191,19 @@ fn flush_pending_after_batch(
         // Measured AFTER the trie/mirror puts and the applied-height marker were
         // appended: this is the batch RocksDB actually gets.
         stats.batch_bytes = batch.size_in_bytes();
-        let write_timer = std::time::Instant::now();
-        let write_result = target.write(batch);
-        stats.write_db_seconds = write_timer.elapsed().as_secs_f64();
+        // Q6 step 0: the checkpoint write (the only flush with `rows`) also
+        // reports RocksDB's stage split; its wall IS `write_db_seconds`.
+        let write_result = if rows.is_some() {
+            let (result, split) = crate::write_stages::measure(|| target.write(batch));
+            stats.write_db_seconds = split.wall_seconds;
+            stats.checkpoint_write = Some(split);
+            result
+        } else {
+            let write_timer = std::time::Instant::now();
+            let result = target.write(batch);
+            stats.write_db_seconds = write_timer.elapsed().as_secs_f64();
+            result
+        };
         // Legacy total kept intact so `torus_exec_state_write_seconds` stays
         // comparable across the split.
         stats.write_seconds = stats.write_build_seconds + stats.write_db_seconds;
@@ -2307,6 +2318,10 @@ pub struct NativeFlushStats {
     pub state_hash_seconds: f64,
     /// Running state hash: hashed entries this flush.
     pub state_hash_entries: usize,
+    /// Q6 step 0: RocksDB's stage split of the batch write, measured only
+    /// on the checkpoint write (`flush_checkpoint`); `None` on every other
+    /// flush.
+    pub checkpoint_write: Option<crate::WriteStageSplit>,
 }
 
 /// A layer's pending-write keys starting with `prefix`, in key order.

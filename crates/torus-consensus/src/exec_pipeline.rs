@@ -932,6 +932,7 @@ fn run_job(
             let landed = match flush_result {
                 Ok(stats) => {
                     observe_flush_stats(env, &stats);
+                    observe_checkpoint_write(env, *height, &stats);
                     Ok(())
                 }
                 Err(e) if marker_is(env, *height) => Err(JobError::TrieStale(e.to_string())),
@@ -1077,6 +1078,50 @@ fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
         m.exec_evm_resync_seconds
             .observe(resync_timer.elapsed().as_secs_f64());
     }
+}
+
+/// Q6 step 0: the checkpoint DB write's RocksDB stage split (histograms),
+/// its start / end wall clock (gauges) and one info line per checkpoint, so
+/// windows can be cut to the DB write itself even when two checkpoints fall
+/// between two scrapes.
+fn observe_checkpoint_write(env: &WorkerEnv, height: u64, stats: &torus_state::NativeFlushStats) {
+    let Some(s) = stats.checkpoint_write else {
+        return;
+    };
+    if let Some(m) = &env.metrics {
+        m.exec_checkpoint_db_write_seconds.observe(s.wall_seconds);
+        m.exec_checkpoint_db_wal_seconds.observe(s.wal_seconds);
+        m.exec_checkpoint_db_memtable_seconds
+            .observe(s.memtable_seconds);
+        m.exec_checkpoint_db_delay_seconds.observe(s.delay_seconds);
+        m.exec_checkpoint_db_pre_post_seconds
+            .observe(s.pre_post_seconds);
+        m.exec_checkpoint_db_mutex_seconds.observe(s.mutex_seconds);
+        m.exec_checkpoint_db_cond_wait_seconds
+            .observe(s.cond_wait_seconds);
+        m.exec_checkpoint_db_residual_seconds
+            .observe(s.residual_seconds());
+        m.exec_checkpoint_db_write_start_ms
+            .set(i64::try_from(s.start_unix_ms).unwrap_or(i64::MAX));
+        m.exec_checkpoint_db_write_end_ms
+            .set(i64::try_from(s.end_unix_ms).unwrap_or(i64::MAX));
+    }
+    let ms = |x: f64| (x * 1e4).round() / 10.0;
+    tracing::info!(
+        height,
+        start_ms = s.start_unix_ms,
+        end_ms = s.end_unix_ms,
+        batch_bytes = stats.batch_bytes,
+        write_ms = ms(s.wall_seconds),
+        wal_ms = ms(s.wal_seconds),
+        memtable_ms = ms(s.memtable_seconds),
+        delay_ms = ms(s.delay_seconds),
+        pre_post_ms = ms(s.pre_post_seconds),
+        residual_ms = ms(s.residual_seconds()),
+        mutex_ms = ms(s.mutex_seconds),
+        cond_wait_ms = ms(s.cond_wait_seconds),
+        "checkpoint db write"
+    );
 }
 
 fn observe_flush_stats(env: &WorkerEnv, stats: &torus_state::NativeFlushStats) {
@@ -1625,6 +1670,100 @@ mod tests {
         assert!(worker.wait_idle());
         let (ref120, _r2) = reference_db(81..=120, 81);
         assert_dumps_eq(&dump_all(&db), &dump_all(&ref120), "checkpoint at 120");
+    }
+
+    /// Q6 step 0: each checkpoint observes the DB write and its RocksDB stage
+    /// split once (digests observe nothing), and sets the write's start / end
+    /// wall clock (unix ms) gauges; the second checkpoint moves them forward.
+    #[test]
+    fn checkpoint_observes_the_db_write_stage_split_once() {
+        let (mut env, _dir) = temp_env(None);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        env.metrics = Some(metrics.clone());
+        let db = env.state_db.clone();
+        torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+        let worker = FlushWorker::spawn_checkpointing(env, 0);
+        let hists = [
+            "torus_exec_checkpoint_db_write_seconds",
+            "torus_exec_checkpoint_db_wal_seconds",
+            "torus_exec_checkpoint_db_memtable_seconds",
+            "torus_exec_checkpoint_db_delay_seconds",
+            "torus_exec_checkpoint_db_pre_post_seconds",
+            "torus_exec_checkpoint_db_mutex_seconds",
+            "torus_exec_checkpoint_db_cond_wait_seconds",
+            "torus_exec_checkpoint_db_residual_seconds",
+        ];
+        let value = |text: &str, name: &str| -> f64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing:\n{text}"))
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+
+        let layer = digest_window(&worker, &db, 1..=10);
+        assert!(worker.wait_idle());
+        let text = metrics.encode();
+        for h in hists {
+            assert_eq!(value(&text, &format!("{h}_count")), 0.0, "digests: {h}");
+        }
+        worker
+            .submit(Job::Checkpoint {
+                height: 10,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        let text = metrics.encode();
+        for h in hists {
+            assert_eq!(
+                value(&text, &format!("{h}_count")),
+                1.0,
+                "one checkpoint: {h}"
+            );
+        }
+        let write = value(&text, "torus_exec_checkpoint_db_write_seconds_sum");
+        assert!(write > 0.0, "write wall timed");
+        let stages: f64 = hists[1..5]
+            .iter()
+            .map(|h| value(&text, &format!("{h}_sum")))
+            .sum::<f64>()
+            + value(&text, "torus_exec_checkpoint_db_residual_seconds_sum");
+        assert!(
+            (stages - write).abs() < 1e-6,
+            "WAL + memtable + delay + pre/post + residual = wall: {stages} vs {write}"
+        );
+        let start = value(&text, "torus_exec_checkpoint_db_write_start_ms");
+        let end = value(&text, "torus_exec_checkpoint_db_write_end_ms");
+        assert!(
+            before_ms <= start && start <= end,
+            "span [{start}, {end}] after {before_ms}"
+        );
+
+        let layer = digest_window(&worker, &db, 11..=20);
+        assert!(worker.wait_idle());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        worker
+            .submit(Job::Checkpoint {
+                height: 20,
+                layer: Arc::new(layer),
+            })
+            .unwrap();
+        assert!(worker.wait_idle());
+        let text = metrics.encode();
+        for h in hists {
+            assert_eq!(
+                value(&text, &format!("{h}_count")),
+                2.0,
+                "two checkpoints: {h}"
+            );
+        }
+        assert!(value(&text, "torus_exec_checkpoint_db_write_start_ms") > end);
     }
 
     /// A failed checkpoint write latches W and the shared fail-stop; nothing

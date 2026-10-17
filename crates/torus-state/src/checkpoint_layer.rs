@@ -646,6 +646,55 @@ mod tests {
         }
     }
 
+    /// Q6 step 0: the checkpoint write carries RocksDB's stage split (its
+    /// wall is the `write_db_seconds` timer itself); a block flush of the
+    /// same rows does not measure one.
+    #[test]
+    fn checkpoint_flush_reports_the_db_write_stage_split() {
+        let cf = crate::cf::CF_NATIVE_ORDERS;
+        let fill = |o: &NativeStateOverlay| {
+            for i in 0..5_000u32 {
+                o.put_cf_raw(cf, &i.to_be_bytes(), &[7u8; 512]).unwrap();
+            }
+        };
+        let (db, _dir) = temp_db();
+        let o = NativeStateOverlay::new(db.clone());
+        fill(&o);
+        let mut layer = CheckpointLayer::new();
+        layer.merge(&o.freeze(1));
+        let stats = layer
+            .flush_checkpoint(
+                None,
+                &crate::running_hash::ChainRows::default(),
+                &db,
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+        let s = stats.checkpoint_write.expect("checkpoint write split");
+        assert_eq!(s.wall_seconds, stats.write_db_seconds, "{s:?}");
+        assert!(s.wal_seconds > 0.0 && s.memtable_seconds > 0.0, "{s:?}");
+        assert!(
+            s.start_unix_ms > 0 && s.start_unix_ms <= s.end_unix_ms,
+            "{s:?}"
+        );
+        assert!(StateDb::get_cf_raw(&db, cf, &7u32.to_be_bytes())
+            .unwrap()
+            .is_some());
+
+        let (db2, _dir2) = temp_db();
+        let o2 = NativeStateOverlay::new(db2.clone());
+        fill(&o2);
+        let block = o2
+            .flush_with_native_trie_stats(&db2, Some(1), None, None)
+            .unwrap();
+        assert!(
+            block.checkpoint_write.is_none(),
+            "block flushes are not split"
+        );
+    }
+
     /// 500 random blocks of writes and tombstones over 8 CFs, merged into L
     /// one by one: reading through L (point, prefix, from-scans) equals the
     /// block-by-block `BTreeMap` model, and `append_to_batch` written to the
