@@ -2271,8 +2271,9 @@ fn tree_parent_header(
     }
 }
 
-/// Item 7 step 2 (decision 9, Codex P2 on 2cdc3ac7): one uncommitted block a proposal extends,
-/// named by consensus ids that bind its contents: the hotstuff block id and the block's data
+/// Item 7 step 2 (decision 9, Codex P2 on 2cdc3ac7): one block a proposal extends whose txs the
+/// pool can still hold (uncommitted, or committed and not fed to the app yet), named by
+/// consensus ids that bind its contents: the hotstuff block id and the block's data
 /// hash (sha256 of its one datum, so of its body). The canonical torus header is not such a
 /// name: it does not bind the EVM body, so two blocks can share it and carry different txs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2285,20 +2286,23 @@ struct QcAncestor {
 /// them in the block tree ([`TorusApp::evm_in_flight`]).
 trait ProposalAncestry {
     /// The parent (the block the proposal's justify certifies) and its ancestors by justify
-    /// links, parent first, down to the highest committed block (not included).
-    fn uncommitted(&self) -> Vec<QcAncestor>;
+    /// links, parent first, down to the last block the app was fed (not included): its
+    /// `on_committed_block` removed its txs from the pool. Codex P2 on 6bcbec7e: not the tree's
+    /// highest committed block, which can be ahead of the feed (a committed block not fed yet
+    /// still has its txs pooled).
+    fn unpruned(&self) -> Vec<QcAncestor>;
     /// The datum of `block` in the tree (one per torus block).
     fn datum(&self, block: &CryptoHash) -> Option<Vec<u8>>;
 }
 
-/// Tests: no uncommitted ancestor (what [`TreeAncestry`] yields on the genesis justify or for a
-/// parent the tree cannot show).
+/// Tests: no ancestor the pool can still hold (what [`TreeAncestry`] yields on the genesis
+/// justify, on a fed parent, or for a parent the tree cannot show).
 #[cfg(test)]
 struct NoAncestry;
 
 #[cfg(test)]
 impl ProposalAncestry for NoAncestry {
-    fn uncommitted(&self) -> Vec<QcAncestor> {
+    fn unpruned(&self) -> Vec<QcAncestor> {
         Vec::new()
     }
 
@@ -2308,25 +2312,21 @@ impl ProposalAncestry for NoAncestry {
 }
 
 /// [`ProposalAncestry`] read from the block tree `produce_block` sees, from `parent` (the
-/// request's parent block) down. The same walk as hotstuff's `app_view`: justify links until
-/// the genesis justify or the highest committed block, in the tree's own heights (the torus
-/// header heights are numbered differently, so none is compared with them).
+/// request's parent block) down. Hotstuff's `app_view` walk, by justify links, until the
+/// genesis justify or the block at height `fed`, in the tree's own heights (the torus header
+/// heights are numbered differently, so none is compared with them).
 struct TreeAncestry<'t, 'a> {
     tree: &'t AppBlockTreeView<'a, RocksKVStore>,
     parent: Option<CryptoHash>,
+    /// The hotstuff height of the last block the app was fed ([`TorusApp::fed_hotstuff_height`]):
+    /// that block and its ancestors left the pool. The committed blocks above it are walked like
+    /// uncommitted ones. `None` (nothing fed since boot): down to the genesis justify or the cap.
+    fed: Option<u64>,
 }
 
 impl ProposalAncestry for TreeAncestry<'_, '_> {
-    fn uncommitted(&self) -> Vec<QcAncestor> {
-        let committed = match self.tree.highest_committed_block() {
-            Ok(Some(block)) => match self.tree.block_height(&block) {
-                Ok(Some(height)) => Some(height.int()),
-                _ => return Vec::new(),
-            },
-            Ok(None) => None,
-            Err(_) => return Vec::new(),
-        };
-        // The catch-up gate already refused a parent further above the committed height
+    fn unpruned(&self) -> Vec<QcAncestor> {
+        // The catch-up gate already refused a parent further above the app's committed height
         // (`select_block_payload`); the cap only bounds the reads.
         let cap = TorusApp::CATCH_UP_LAG_THRESHOLD as usize + 1;
         let mut out = Vec::new();
@@ -2338,7 +2338,7 @@ impl ProposalAncestry for TreeAncestry<'_, '_> {
             };
             let height = height.int();
             // Each justify link lowers the height: a link that does not ends the walk.
-            if committed.is_some_and(|c| height <= c) || height >= below {
+            if self.fed.is_some_and(|fed| height <= fed) || height >= below {
                 break;
             }
             let Ok(Some(data_hash)) = self.tree.block_data_hash(&block) else {
@@ -5158,6 +5158,13 @@ pub struct TorusApp {
     /// Item 7 step 1: EVM txs drained into our own proposals, by height, until a block commits
     /// there (drain_evm is destructive and pending_proposals entries get overwritten).
     own_evm_proposed: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
+    /// Item 7 step 2 (decision 9, Codex P2 on 6bcbec7e): the hotstuff height of the highest
+    /// block `on_committed_block` has taken, where its EVM txs left the pool
+    /// (`remove_committed_evm`). The tree's committed frontier can run ahead of it (a commit
+    /// whose feed `TORUS_DEFER_PARENT_FEED` puts after the retried proposal, a feed paused or
+    /// failed on a read), so [`TreeAncestry`] walks down to this block instead. `None`: nothing
+    /// fed since boot. Hotstuff heights: the torus header's are numbered differently.
+    fed_hotstuff_height: Option<u64>,
     /// Item 7 step 2 (decision 7): sends a raw EVM tx to a validator key (the RPC's EVM
     /// forward channel; the node's own key is skipped there), for the commit-time re-sends.
     /// `None` (tests, library users): no re-send.
@@ -6245,6 +6252,7 @@ impl TorusApp {
             pending_slashes: Vec::new(),
             pending_proposals: std::collections::HashMap::new(),
             own_evm_proposed: std::collections::BTreeMap::new(),
+            fed_hotstuff_height: None,
             evm_forward: None,
             in_flight_hashes: InFlightHashLedger::default(),
             treasury_address: config.treasury_address,
@@ -7588,8 +7596,8 @@ impl TorusApp {
         }
     }
 
-    /// Tests: [`Self::build_proposal_on`] with no uncommitted ancestor known (nothing held
-    /// back from the EVM drains; the decision 9 tests pass their chain).
+    /// Tests: [`Self::build_proposal_on`] with no ancestor known (nothing held back from the
+    /// EVM drains; the decision 9 tests pass their chain).
     #[cfg(test)]
     fn build_proposal(&mut self, parent_header: TorusBlockHeader) -> ProduceBlockResponse {
         self.build_proposal_on(parent_header, &NoAncestry)
@@ -7598,8 +7606,8 @@ impl TorusApp {
     /// Everything `produce_block` does after resolving the parent header, split
     /// out so tests can drive it (`ProduceBlockRequest::new` is crate-private to
     /// hotstuff_rs). Each phase has its own `torus_block_build_*_seconds` timer
-    /// nested inside `block_build_seconds` (s68). `ancestry`: the uncommitted blocks
-    /// the proposal extends, as the block tree links them (decision 9).
+    /// nested inside `block_build_seconds` (s68). `ancestry`: the blocks the proposal
+    /// extends whose txs the pool can still hold, as the block tree links them (decision 9).
     fn build_proposal_on(
         &mut self,
         parent_header: TorusBlockHeader,
@@ -7834,10 +7842,7 @@ impl App<RocksKVStore> for TorusApp {
             local_height = self.last_header.height,
             "produce_block called (CTE)"
         );
-        let ancestry = TreeAncestry {
-            tree: request.block_tree(),
-            parent: request.parent_block(),
-        };
+        let ancestry = self.tree_ancestry(request.block_tree(), request.parent_block());
         self.build_proposal_on(parent_header, &ancestry)
     }
 
@@ -8026,6 +8031,9 @@ impl App<RocksKVStore> for TorusApp {
         if let Some(ref mempool) = self.mempool {
             mempool.remove_committed_evm(height, committed_evm);
         }
+        // Decision 9 (Codex P2 on 6bcbec7e): this block's txs are out of the pool now, so the
+        // proposal walk ([`TreeAncestry`]) can stop here (re-deliveries come in ascending order).
+        self.fed_hotstuff_height = self.fed_hotstuff_height.max(Some(block.height.int()));
 
         // S444 AT-LEAST-ONCE FEED GUARD: hotstuff's committed-block feed is
         // replayed from a durable frontier (the min-height exec-feed gap fix),
@@ -8283,14 +8291,29 @@ impl TorusApp {
     /// high costs nothing but a little rejoin-window throughput.
     const CATCH_UP_LAG_THRESHOLD: u64 = 64;
 
+    /// The [`TreeAncestry`] `produce_block` passes for a proposal on `parent`: down to the last
+    /// block this app was fed ([`Self::fed_hotstuff_height`]).
+    fn tree_ancestry<'t, 'a>(
+        &self,
+        tree: &'t AppBlockTreeView<'a, RocksKVStore>,
+        parent: Option<CryptoHash>,
+    ) -> TreeAncestry<'t, 'a> {
+        TreeAncestry {
+            tree,
+            parent,
+            fed: self.fed_hotstuff_height,
+        }
+    }
+
     /// Item 7 step 2 (owner s126, decision 9): the EVM txs ([`torus_mempool::evm_tx_hash`]) of
-    /// the uncommitted blocks a proposal extends: its parent and the parent's ancestors by
-    /// justify QCs down to the highest committed block, as the block tree links them
-    /// (`ancestry`). They execute before the proposal, so its EVM drains leave them pooled
-    /// (their commit removes them) and may take their senders' next nonces. Natives exclude
-    /// every pending proposal's actions; an EVM tx sits in a nonce chain, so only the chain
-    /// being extended holds a tx back: a block off it (another view's block at a height, our
-    /// own earlier block at the height proposed again) does not.
+    /// the blocks a proposal extends whose txs the pool can still hold: its parent and the
+    /// parent's ancestors by justify QCs down to the last block the app was fed (Codex P2 on
+    /// 6bcbec7e: not the tree's committed frontier, which can be ahead of the feed), as the
+    /// block tree links them (`ancestry`). They execute before the proposal, so its EVM drains
+    /// leave them pooled (the commit callback removes them) and may take their senders' next
+    /// nonces. Natives exclude every pending proposal's actions; an EVM tx sits in a nonce
+    /// chain, so only the chain being extended holds a tx back: a block off it (another view's
+    /// block at a height, our own earlier block at the height proposed again) does not.
     ///
     /// Codex P2 on 2cdc3ac7: each ancestor is named by its consensus data hash, which binds its
     /// body; its txs come from the pending proposal with that data hash, else from its datum in
@@ -8303,7 +8326,7 @@ impl TorusApp {
         ancestry: &dyn ProposalAncestry,
     ) -> std::collections::HashSet<torus_types::B256> {
         let mut out = std::collections::HashSet::new();
-        for ancestor in ancestry.uncommitted() {
+        for ancestor in ancestry.unpruned() {
             let cached = self
                 .pending_proposals
                 .values()
@@ -8333,8 +8356,8 @@ impl TorusApp {
     /// height) also drains the big lane, after the small one, in the bytes left
     /// of 768 KiB. Both drains floor at the proposed header's base fees
     /// (`base_fee`, `big_base_fee`), not the committed ones, and leave the txs of
-    /// the uncommitted blocks the proposal extends (`ancestry`) pooled
-    /// ([`Self::evm_in_flight`]).
+    /// the blocks the proposal extends that the pool still holds (`ancestry`)
+    /// pooled ([`Self::evm_in_flight`]).
     fn select_block_payload(
         &self,
         parent: &TorusBlockHeader,
@@ -23406,8 +23429,8 @@ mod crash_recovery_tests {
         assert_eq!(mempool.evm_pool_size(), 0);
     }
 
-    /// Item 7 step 2 (decision 9): a proposal's uncommitted ancestors as a block tree links
-    /// them, parent first, each by its datum (data hash: sha256 of the datum).
+    /// Item 7 step 2 (decision 9): a proposal's ancestors the pool can still hold, as a block
+    /// tree links them, parent first, each by its datum (data hash: sha256 of the datum).
     struct TestChain(Vec<(QcAncestor, Vec<u8>)>);
 
     impl TestChain {
@@ -23428,7 +23451,7 @@ mod crash_recovery_tests {
     }
 
     impl ProposalAncestry for TestChain {
-        fn uncommitted(&self) -> Vec<QcAncestor> {
+        fn unpruned(&self) -> Vec<QcAncestor> {
             self.0.iter().map(|(ancestor, _)| *ancestor).collect()
         }
 
@@ -23547,13 +23570,87 @@ mod crash_recovery_tests {
         );
     }
 
-    /// Item 7 step 2 (decision 9, Codex P2): `produce_block`'s ancestry, read from a real block
-    /// tree: from the parent down the justify links to the highest committed block (not
-    /// included), parent first, each with the data hash and datum the tree holds; a fork
-    /// sibling is not on the chain. With nothing committed the walk ends at the genesis
-    /// justify; with no parent it is empty.
+    /// Item 7 step 2 (decision 9, Codex P2 on 6bcbec7e): a committed block keeps its EVM txs in
+    /// the pool until its `on_committed_block` prunes them, so `produce_block`'s ancestry goes
+    /// down to the last block the app was fed, not to the tree's committed frontier. Two ways
+    /// the tree commits ahead of the feed: with `TORUS_DEFER_PARENT_FEED=1` a parent-body
+    /// insert commits and the retried proposal runs before the feed (Codex's proof: committed
+    /// 5, fed 4, parent 7); with the flag off, a feed paused at an unreadable height or failed
+    /// on a read leaves committed blocks unfed until it heals (here committed 7, the parent).
+    /// Block 5 carries A0, 6 carries B0: height 8 takes A1 only, the copies of A0 and B0 stay
+    /// pooled; once 5 is fed (A0 pruned) the walk stops at 5. RED before: the walk ended at the
+    /// committed block, so A0 (and at committed 7, B0) went in a second time (with a one-tx
+    /// budget, displacing A1).
     #[test]
-    fn tree_ancestry_follows_justify_links_down_to_the_committed_block() {
+    fn committed_blocks_not_yet_fed_to_the_app_hold_their_evm_txs_back() {
+        use hotstuff_rs::block_tree::accessors::internal::{
+            BlockTreeSingleton, BlockTreeWriteBatch,
+        };
+        use hotstuff_rs::block_tree::pluggables::KVStore;
+        for committed_at in [5usize, 7] {
+            let (mut app, mempool, [a0, a1, b0], b4) = two_sender_evm_app();
+            let (exec_tx, _exec_rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(64);
+            app.replace_exec_tx(exec_tx);
+            let b5 = lane_child_of(&b4, vec![a0.clone()]);
+            let b6 = lane_child_of(&b5, vec![b0.clone()]);
+            let b7 = lane_child_of(&b6, vec![]);
+            let h4 = hs_block(&b4, PhaseCertificate::genesis_pc());
+            let h5 = hs_block(&b5, justify_for(&h4));
+            let h6 = hs_block(&b6, justify_for(&h5));
+            let h7 = hs_block(&b7, justify_for(&h6));
+            let dir = tempfile::tempdir().unwrap();
+            // SAFETY: a fresh store only this test writes.
+            let mut tree =
+                unsafe { BlockTreeSingleton::new_unsafe(RocksKVStore::open(dir.path())) };
+            let mut wb = BlockTreeWriteBatch::<<RocksKVStore as KVStore>::WriteBatch>::new_unsafe();
+            for b in [&h4, &h5, &h6, &h7] {
+                wb.set_block(b).unwrap();
+            }
+            let committed = [&h4, &h5, &h6, &h7][committed_at - 4];
+            wb.set_highest_committed_block(&committed.hash).unwrap();
+            tree.write(wb);
+            // The app was fed 4; the commit callbacks of 5 and up have not run.
+            app.exec_next_height = Some(4);
+            app.on_committed_block(&h4, h4.hash);
+            for tx in [&a0, &a1, &b0] {
+                mempool.add_evm_tx(tx.clone()).unwrap();
+            }
+
+            let view = tree.app_view(Some(&h7.hash)).unwrap();
+            let _ =
+                app.build_proposal_on(b7.header.clone(), &app.tree_ancestry(&view, Some(h7.hash)));
+            assert_eq!(
+                app.pending_proposals[&8].block.evm_transactions,
+                vec![a1.clone()],
+                "A0 (at 5) and B0 (at 6) execute before 8 (committed {committed_at}, fed 4)"
+            );
+            assert_eq!(mempool.evm_pool_size(), 2, "A0 and B0 stay pooled");
+
+            app.on_committed_block(&h5, h5.hash);
+            assert_eq!(mempool.evm_pool_size(), 1, "5's callback pruned A0");
+            let walk: Vec<CryptoHash> = app
+                .tree_ancestry(&view, Some(h7.hash))
+                .unpruned()
+                .iter()
+                .map(|a| a.block)
+                .collect();
+            assert_eq!(
+                walk,
+                vec![h7.hash, h6.hash],
+                "5 is fed: the walk stops there"
+            );
+        }
+    }
+
+    /// Item 7 step 2 (decision 9, Codex P2): `produce_block`'s ancestry, read from a real block
+    /// tree: from the parent down the justify links to the last block the app was fed (not
+    /// included), parent first, each with the data hash and datum the tree holds; a fork
+    /// sibling is not on the chain. With nothing fed the walk ends at the genesis justify; with
+    /// no parent it is empty. Codex P2 on 6bcbec7e: the tree's committed frontier does not end
+    /// the walk (a committed block not fed yet still has its txs pooled). RED before: the walk
+    /// stopped at the committed block.
+    #[test]
+    fn tree_ancestry_follows_justify_links_down_to_the_fed_block() {
         use hotstuff_rs::block_tree::accessors::internal::{
             BlockTreeSingleton, BlockTreeWriteBatch,
         };
@@ -23574,34 +23671,39 @@ mod crash_recovery_tests {
             wb.set_block(b).unwrap();
         }
         tree.write(wb);
+        let commit = |tree: &mut BlockTreeSingleton<RocksKVStore>, b: &Block| {
+            let mut wb = BlockTreeWriteBatch::<<RocksKVStore as KVStore>::WriteBatch>::new_unsafe();
+            wb.set_highest_committed_block(&b.hash).unwrap();
+            tree.write(wb);
+        };
         let link = |b: &Block| QcAncestor {
             block: b.hash,
             data_hash: b.data_hash,
         };
-        let walk = |tree: &BlockTreeSingleton<RocksKVStore>, parent: Option<CryptoHash>| {
+        let walk = |tree: &BlockTreeSingleton<RocksKVStore>,
+                    parent: Option<CryptoHash>,
+                    fed: Option<&Block>| {
             let view = tree.app_view(parent.as_ref()).unwrap();
             let ancestry = TreeAncestry {
                 tree: &view,
                 parent,
+                fed: fed.map(|b| b.height.int()),
             };
-            let chain = ancestry.uncommitted();
+            let chain = ancestry.unpruned();
             let datums: Vec<Option<Vec<u8>>> =
                 chain.iter().map(|a| ancestry.datum(&a.block)).collect();
             (chain, datums)
         };
+        let all = vec![link(&b4), link(&b3), link(&b2), link(&b1)];
 
-        let (chain, _) = walk(&tree, Some(b4.hash));
-        assert_eq!(
-            chain,
-            vec![link(&b4), link(&b3), link(&b2), link(&b1)],
-            "nothing committed: down to the genesis justify"
-        );
+        let (chain, _) = walk(&tree, Some(b4.hash), None);
+        assert_eq!(chain, all, "nothing fed: down to the genesis justify");
+        commit(&mut tree, &b2);
+        let (chain, _) = walk(&tree, Some(b4.hash), None);
+        assert_eq!(chain, all, "2 is committed, nothing fed since boot");
 
-        let mut wb = BlockTreeWriteBatch::<<RocksKVStore as KVStore>::WriteBatch>::new_unsafe();
-        wb.set_highest_committed_block(&b2.hash).unwrap();
-        tree.write(wb);
-        let (chain, datums) = walk(&tree, Some(b4.hash));
-        assert_eq!(chain, vec![link(&b4), link(&b3)], "2 is committed");
+        let (chain, datums) = walk(&tree, Some(b4.hash), Some(&b2));
+        assert_eq!(chain, vec![link(&b4), link(&b3)], "2 is fed");
         assert_eq!(
             datums,
             vec![
@@ -23609,11 +23711,20 @@ mod crash_recovery_tests {
                 Some(b3.data.vec()[0].bytes().to_vec())
             ]
         );
-        let (chain, _) = walk(&tree, Some(fork3.hash));
+        let (chain, _) = walk(&tree, Some(fork3.hash), Some(&b2));
         assert_eq!(chain, vec![link(&fork3)], "a fork block's chain is its own");
-        let (chain, _) = walk(&tree, Some(b2.hash));
-        assert!(chain.is_empty(), "a committed parent holds nothing back");
-        let (chain, _) = walk(&tree, None);
+        commit(&mut tree, &b3);
+        let (chain, _) = walk(&tree, Some(b4.hash), Some(&b2));
+        assert_eq!(
+            chain,
+            vec![link(&b4), link(&b3)],
+            "3 is committed, not fed: still walked"
+        );
+        let (chain, _) = walk(&tree, Some(b4.hash), Some(&b1));
+        assert_eq!(chain, all[..3], "fed 1: 3 and 2 are committed, not fed");
+        let (chain, _) = walk(&tree, Some(b2.hash), Some(&b2));
+        assert!(chain.is_empty(), "a fed parent holds nothing back");
+        let (chain, _) = walk(&tree, None, Some(&b2));
         assert!(chain.is_empty());
     }
 

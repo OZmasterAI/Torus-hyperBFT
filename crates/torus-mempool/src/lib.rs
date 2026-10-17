@@ -1014,8 +1014,9 @@ impl Mempool {
     }
 
     /// [`Self::drain_evm`] leaving the txs in `in_flight` pooled (item 7 step 2, owner s126,
-    /// decision 9): the hashes ([`evm_tx_hash`]) of the txs carried by the uncommitted blocks
-    /// the proposal extends. Such a tx executes before the proposal, so it is not proposed
+    /// decision 9): the hashes ([`evm_tx_hash`]) of the txs carried by the blocks the proposal
+    /// extends that [`Self::remove_committed_evm`] has not seen yet (uncommitted, or committed
+    /// and not fed to the app). Such a tx executes before the proposal, so it is not proposed
     /// again (execution would skip the copy), spends no budget, and its sender's next nonce
     /// can still be selected; the commit of its block removes it from the pool.
     pub fn drain_evm_excluding(
