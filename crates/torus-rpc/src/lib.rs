@@ -4503,7 +4503,8 @@ mod tests {
             .iter()
             .copied()
             .filter(|cf| *cf != torus_state::cf::CF_STORAGE);
-        let state = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        let state =
+            StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
         let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
         let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
         let sender = Address::from([0x11; 20]);
@@ -4534,13 +4535,17 @@ mod tests {
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
             .build(format!("http://{addr}"))
             .unwrap();
-        let faulting = serde_json::json!({ "from": hex_address(sender), "to": hex_address(reader) });
+        let faulting =
+            serde_json::json!({ "from": hex_address(sender), "to": hex_address(reader) });
         for method in ["eth_call", "eth_estimateGas"] {
             let e = client
                 .request::<String, _>(method, jsonrpsee::rpc_params![faulting.clone(), "latest"])
                 .await
                 .unwrap_err();
-            assert!(e.to_string().contains("local storage fault"), "{method}: {e}");
+            assert!(
+                e.to_string().contains("local storage fault"),
+                "{method}: {e}"
+            );
         }
         let plain = serde_json::json!({ "from": hex_address(sender), "to": hex_address(Address::from([0x22; 20])), "value": "0x0" });
         assert_eq!(

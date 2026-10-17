@@ -109,15 +109,29 @@ fn assert_db_local_fault(r: Result<impl std::fmt::Debug, EvmError>, what: &str) 
 fn evm_db_read_fault_is_local_fault_on_every_path() {
     let (_d, db) = faulty_db();
     let ex = EvmExecutor::new(TORUS_CHAIN_ID);
-    assert_db_local_fault(ex.execute_block(&db, &block_cfg(), vec![tx(0, READER)], true), "block skip_invalid");
-    assert_db_local_fault(ex.execute_block(&db, &block_cfg(), vec![tx(0, READER)], false), "block strict");
+    assert_db_local_fault(
+        ex.execute_block(&db, &block_cfg(), vec![tx(0, READER)], true),
+        "block skip_invalid",
+    );
+    assert_db_local_fault(
+        ex.execute_block(&db, &block_cfg(), vec![tx(0, READER)], false),
+        "block strict",
+    );
     let overlay = StateOverlay::new(db.clone());
     assert_db_local_fault(
         ex.execute_block_with_overlay(&overlay, &block_cfg(), vec![tx(0, READER)], false),
         "overlay",
     );
-    assert_db_local_fault(ex.execute_tx(&db, &block_cfg(), tx(0, READER)).map(|(r, _)| r), "tx");
-    assert_db_local_fault(ex.execute_call(&db, &block_cfg(), tx(0, READER)).map(|(r, _)| r), "call");
+    assert_db_local_fault(
+        ex.execute_tx(&db, &block_cfg(), tx(0, READER))
+            .map(|(r, _)| r),
+        "tx",
+    );
+    assert_db_local_fault(
+        ex.execute_call(&db, &block_cfg(), tx(0, READER))
+            .map(|(r, _)| r),
+        "call",
+    );
 }
 
 /// A fault in a later tx aborts the whole block (no partial result): a
@@ -126,7 +140,10 @@ fn evm_db_read_fault_is_local_fault_on_every_path() {
 fn evm_db_read_fault_in_a_later_tx_aborts_the_block() {
     let (_d, db) = faulty_db();
     let txs = vec![tx(0, BOB), tx(1, READER)];
-    assert_db_local_fault(EvmExecutor::new(TORUS_CHAIN_ID).execute_block(&db, &block_cfg(), txs, true), "block");
+    assert_db_local_fault(
+        EvmExecutor::new(TORUS_CHAIN_ID).execute_block(&db, &block_cfg(), txs, true),
+        "block",
+    );
 }
 
 /// No false positives: on the faulty DB a tx that never reads storage runs
@@ -135,10 +152,14 @@ fn evm_db_read_fault_in_a_later_tx_aborts_the_block() {
 fn evm_without_a_failed_read_is_unchanged() {
     let ex = EvmExecutor::new(TORUS_CHAIN_ID);
     let (_d, db) = faulty_db();
-    let b = ex.execute_block(&db, &block_cfg(), vec![tx(0, BOB)], true).unwrap();
+    let b = ex
+        .execute_block(&db, &block_cfg(), vec![tx(0, BOB)], true)
+        .unwrap();
     assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true));
     let (_d2, db2) = healthy_db();
-    let b = ex.execute_block(&db2, &block_cfg(), vec![tx(0, READER)], true).unwrap();
+    let b = ex
+        .execute_block(&db2, &block_cfg(), vec![tx(0, READER)], true)
+        .unwrap();
     assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true));
 }
 
@@ -150,14 +171,21 @@ fn evm_deterministic_errors_unchanged() {
     let ex = EvmExecutor::new(TORUS_CHAIN_ID);
     for (what, (_d, db)) in [("healthy", healthy_db()), ("faulty", faulty_db())] {
         match ex.execute_block(&db, &block_cfg(), vec![tx(7, BOB)], false) {
-            Err(EvmError::InvalidTransaction(m)) => assert!(m.contains("NonceTooHigh"), "{what}: {m}"),
+            Err(EvmError::InvalidTransaction(m)) => {
+                assert!(m.contains("NonceTooHigh"), "{what}: {m}")
+            }
             other => panic!("{what}: expected InvalidTransaction, got {other:?}"),
         }
-        let b = ex.execute_block(&db, &block_cfg(), vec![tx(7, BOB)], true).unwrap();
+        let b = ex
+            .execute_block(&db, &block_cfg(), vec![tx(7, BOB)], true)
+            .unwrap();
         assert!(b.receipts.is_empty(), "{what}: invalid tx skipped");
         let mut cfg = block_cfg();
         cfg.gas_limit = 30_000;
-        let transfer = |nonce| TxEnv { gas_limit: 21_000, ..tx(nonce, BOB) };
+        let transfer = |nonce| TxEnv {
+            gas_limit: 21_000,
+            ..tx(nonce, BOB)
+        };
         match ex.execute_block(&db, &cfg, vec![transfer(0), transfer(1)], true) {
             Err(EvmError::BlockGasLimitExceeded { cumulative, limit }) => {
                 assert_eq!((cumulative, limit), (42_000, 30_000), "{what}")

@@ -670,10 +670,20 @@ fn local_fault_or<DB: core::fmt::Debug, TX: core::fmt::Debug>(
 }
 
 /// Map a revm [`EVMError`] into our [`EvmError`].
+///
+/// `EVMError::Database` is a read of THIS node's DB that failed inside revm:
+/// `DatabaseRef for StateDb` / `StateOverlay` only err on a RocksDB error or
+/// an undecodable local row (a missing block hash reads as zero). That is a
+/// local fault, never an outcome of the block: `EvmError::LocalFault`, so the
+/// consensus app fail-stops instead of running the block without its EVM
+/// writes on this node only. Every other revm error is deterministic and
+/// keeps its mapping.
 fn map_evm_err<DB: core::fmt::Debug, TX: core::fmt::Debug>(err: EVMError<DB, TX>) -> EvmError {
     match err {
         EVMError::Transaction(tx_err) => EvmError::InvalidTransaction(format!("{tx_err:?}")),
-        EVMError::Database(db_err) => EvmError::Internal(format!("database: {db_err:?}")),
+        EVMError::Database(db_err) => {
+            EvmError::LocalFault(format!("evm database read: {db_err:?}"))
+        }
         EVMError::Header(h_err) => EvmError::Internal(format!("header: {h_err:?}")),
         EVMError::Custom(msg) => EvmError::Internal(msg),
     }
@@ -740,9 +750,13 @@ mod tests {
         }
         // No precompile fault recorded: the same through `local_fault_or`.
         let cell = std::sync::OnceLock::new();
-        let err: RevmErr =
-            EVMError::Database(torus_state::StateError::InvalidData("account data len 3 != 72".into()));
-        assert!(matches!(local_fault_or(&cell, err), EvmError::LocalFault(_)));
+        let err: RevmErr = EVMError::Database(torus_state::StateError::InvalidData(
+            "account data len 3 != 72".into(),
+        ));
+        assert!(matches!(
+            local_fault_or(&cell, err),
+            EvmError::LocalFault(_)
+        ));
     }
 
     /// Deterministic revm errors keep their mapping exactly (every validator
@@ -750,12 +764,16 @@ mod tests {
     /// `InvalidTransaction`, header and custom errors stay `Internal`.
     #[test]
     fn deterministic_revm_errors_keep_their_mapping() {
-        let tx: RevmErr = EVMError::Transaction(revm::context::result::InvalidTransaction::NonceTooHigh {
-            tx: 5,
-            state: 0,
-        });
-        assert!(matches!(map_evm_err(tx), EvmError::InvalidTransaction(m) if m.contains("NonceTooHigh")));
-        let header: RevmErr = EVMError::Header(revm::context::result::InvalidHeader::PrevrandaoNotSet);
+        let tx: RevmErr =
+            EVMError::Transaction(revm::context::result::InvalidTransaction::NonceTooHigh {
+                tx: 5,
+                state: 0,
+            });
+        assert!(
+            matches!(map_evm_err(tx), EvmError::InvalidTransaction(m) if m.contains("NonceTooHigh"))
+        );
+        let header: RevmErr =
+            EVMError::Header(revm::context::result::InvalidHeader::PrevrandaoNotSet);
         assert!(matches!(map_evm_err(header), EvmError::Internal(m) if m.starts_with("header: ")));
         let custom: RevmErr = EVMError::Custom("precompile failed".into());
         assert!(matches!(map_evm_err(custom), EvmError::Internal(m) if m == "precompile failed"));
@@ -763,6 +781,8 @@ mod tests {
         let cell = std::sync::OnceLock::new();
         cell.set("getPosition oracle read: x".to_string()).unwrap();
         let custom: RevmErr = EVMError::Custom("precompile failed".into());
-        assert!(matches!(local_fault_or(&cell, custom), EvmError::LocalFault(m) if m.starts_with("getPosition")));
+        assert!(
+            matches!(local_fault_or(&cell, custom), EvmError::LocalFault(m) if m.starts_with("getPosition"))
+        );
     }
 }

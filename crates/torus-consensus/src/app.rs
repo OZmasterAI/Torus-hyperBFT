@@ -3346,7 +3346,8 @@ impl ExecutionContext {
                 }
                 // R02 branch 5 (owner option A): a precompile hit a LOCAL
                 // storage fault (it aborted the execution instead of answering
-                // around it). Fail-stop: nothing of the block is flushed, the
+                // around it), or a DB read inside revm failed on this node
+                // (`EVMError::Database`, torus-evm `map_evm_err`). Fail-stop: nothing of the block is flushed, the
                 // applied marker stays below it, the restart replays it. Only
                 // this variant: every other EVM error keeps the arm below.
                 Err(torus_bridge::BridgeError::Evm(torus_evm::EvmError::LocalFault(reason))) => {
@@ -25295,7 +25296,8 @@ mod crash_recovery_tests {
     }
 
     /// A contract that reads its storage slot 0 (`PUSH1 0 SLOAD STOP`).
-    const EVM_DB_FAULT_READER: alloy_primitives::Address = alloy_primitives::Address::new([0xC0; 20]);
+    const EVM_DB_FAULT_READER: alloy_primitives::Address =
+        alloy_primitives::Address::new([0xC0; 20]);
 
     /// Fund `key` and deploy [`EVM_DB_FAULT_READER`] (code in CF_CODE; no
     /// storage rows).
@@ -25338,8 +25340,11 @@ mod crash_recovery_tests {
     fn evm_db_read_fault_fail_stops_block() {
         use torus_state::cf::CF_STORAGE;
         let key = k256::ecdsa::SigningKey::from_slice(&[0x57; 32]).unwrap();
-        let (blocks, b) =
-            r02_evm_blocks(&key, alloy_primitives::TxKind::Call(EVM_DB_FAULT_READER), vec![]);
+        let (blocks, b) = r02_evm_blocks(
+            &key,
+            alloy_primitives::TxKind::Call(EVM_DB_FAULT_READER),
+            vec![],
+        );
         let (last, prefix) = blocks.split_last().unwrap();
         for on in [false, true] {
             // Control: a healthy DB.
@@ -25363,7 +25368,10 @@ mod crash_recovery_tests {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             opts.create_missing_column_families(true);
-            let cfs = torus_state::cf::ALL_CF_NAMES.iter().copied().filter(|cf| *cf != CF_STORAGE);
+            let cfs = torus_state::cf::ALL_CF_NAMES
+                .iter()
+                .copied()
+                .filter(|cf| *cf != CF_STORAGE);
             let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, &dir, cfs).unwrap());
             torus_state::running_hash::configure_activation(&db, Some(1))
                 .expect("configure running hash activation");
@@ -25373,7 +25381,10 @@ mod crash_recovery_tests {
                 dispatch_and_execute(&ctx, &db, blk);
             }
             assert!(ctx.pipeline_barrier(), "on={on}");
-            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: prefix never reads storage");
+            assert!(
+                !ctx.exec_failed.load(Ordering::SeqCst),
+                "on={on}: prefix never reads storage"
+            );
             let durable = persist_committed_block_durably(&db, last);
             let before = dump_cfs_except(&db, CF_STORAGE);
             ctx.execute_committed_block_with(last, vec![], durable);
@@ -25383,9 +25394,20 @@ mod crash_recovery_tests {
                 "on={on}: a revm DB read fault must fail-stop"
             );
             drop(ctx);
-            assert_eq!(read_native_applied_height(&db), Some(1), "on={on}: block 2 not applied");
-            assert!(!r02_nonce_consumed(&db, &b), "on={on}: native part not applied");
-            assert_dumps_equal(&before, &dump_cfs_except(&db, CF_STORAGE), "nothing of the block flushed");
+            assert_eq!(
+                read_native_applied_height(&db),
+                Some(1),
+                "on={on}: block 2 not applied"
+            );
+            assert!(
+                !r02_nonce_consumed(&db, &b),
+                "on={on}: native part not applied"
+            );
+            assert_dumps_equal(
+                &before,
+                &dump_cfs_except(&db, CF_STORAGE),
+                "nothing of the block flushed",
+            );
 
             // Restart: reopen with every CF, replay the faulted height.
             drop(db);
@@ -25396,7 +25418,11 @@ mod crash_recovery_tests {
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: replay");
             drop(ctx);
             assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
-            assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "restart replay vs no fault");
+            assert_dumps_equal(
+                &dump_all_cfs(&db_ref),
+                &dump_all_cfs(&db),
+                "restart replay vs no fault",
+            );
         }
     }
 
