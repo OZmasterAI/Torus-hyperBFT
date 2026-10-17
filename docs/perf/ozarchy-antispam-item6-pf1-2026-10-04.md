@@ -12172,6 +12172,69 @@ lag = queue mean / blk/s):
   the two drivers, `s58safe-checks.sh`, `crash-cell.sh`), analysis `ozarchy-s58safe-tools/analyst/soak_minutes.py`,
   `soak-minutes.tsv`.
 
+## 80. Q5: native vs native + EVM transfers, 300 markets, 600 s cells, n = 2 (campaign ozarchy-q5c, main `e3d11cb9`, archy, 2026-10-17)
+
+**10 EVM transfers/s cost 12.4% of native matched/s: E 211.6k vs N 241.6k (E/N 0.876; paired r1 0.870, r2 0.882).
+The effect is ~10x the replicate spread (N 0.2%, E 1.5%; n = 2, no formal CI). CPU-s per 1M fills +1.8%. Every EVM
+height is executed serially (pipelined 0% vs 99% for other blocks) and the exec thread sits idle ~0.5 s before each
+EVM block (~13% of the window). By design (18c, s126): `pipeline_barrier` closes the checkpoint window and drains the
+flush worker before every EVM block, which then runs serially (80.4). The fix is item 7 step 3, after Q7.**
+
+Question (bench queue Q5): what do EVM blocks cost native matched/s at N = 11?
+
+### 80.1 Setup
+
+Binary M = main `e3d11cb9`: node md5 `bf720f9f`, bench `675ae4a9`, tx-flood `789eb101` (staged, md5 = staged on all 3
+nodes). Shape hsdb-300m as s58dmt (Classic, 15 s checkpoints, oracle on, 300 markets, 600 s, BLOCK_CAP 400,
+MAX_IN_FLIGHT 4, commit tail, rate 76,000); genesis N = 11 (weighted-full `01168566`, 3val 300m `d694b81b`). D, M, T
+unset (= on), header re-send 250 ms (env.sh). Arms: N = native only; E = N + `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`.
+Rotating order (r1 N, E; r2 E, N), warm-up w1 N 300 s. Campaign 05:25-06:29, exit 0.
+
+Validity: 5 / 5 cells + smoke rc 0, ACCEPT AGREE, 0 CELL-FLAG, 0 CHECK FAIL, 0 HARD FINDING. EVM checks (E cells): ok,
+interval 11, off_cadence 0, accepted = landed = 6000, rejected 0, mod-11 heights `[0]`.
+
+### 80.2 Cells (`q5-cells.txt`)
+
+| cell | arm | matched/s | first 120 s | blk/s | native blk/s | fills / native blk | CPU-s / 1M | timeouts | no_proposal (v0,v1,v2) | val1 commit interval p50 / p99 ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| r1-N | N | 241,354 | 238,260 | 5.10 | 5.07 | 47,149 | 23.74 | 7 | 1,0,0 | 119.7 / 955.6 |
+| r1-E | E | 210,072 | 218,881 | 2.90 | 2.94 | 69,846 | 24.14 | 16 | 2,0,0 | 281.6 / 1396.6 |
+| r2-E | E | 213,227 | 215,657 | 2.90 | 2.93 | 70,777 | 24.08 | 8 | 0,0,0 | 283.8 / 1424.1 |
+| r2-N | N | 241,867 | 239,705 | 4.40 | 4.37 | 54,496 | 23.66 | 3 | 0,0,0 | 212.3 / 934.3 |
+
+Means: N 241,611, E 211,649 matched/s (-12.4%); CPU-s / 1M 23.70 vs 24.11 (+1.8%). Block rate is indicative only: in
+N the 600 s cells fall to exec pace (409 -> 177 blocks/min); E locks at ~155 blocks/min from minute 3 (`q5-minutes.txt`).
+Exec busy share: N 0.955 / 0.971, E 0.847 / 0.851.
+
+### 80.3 EVM heights (val1, bench window; `q5-gaps.txt`)
+
+| | E r1 / r2 |
+|---|---|
+| EVM blocks in window | 161 / 161, 58.8 / 59.0 EVM txs per block; every h % 11 height carries EVM txs |
+| exec ms, EVM + native blocks (149 / 149) | mean 479 / 496, p50 499 / 513, p99 734 / 821; pipelined 0% |
+| exec ms, other native blocks | mean 294 / 293, p99 519 / 529; pipelined 99% |
+| EVM-only blocks / EVM exec per EVM block | 8-10 ms / 34-36 ms |
+| exec idle before an EVM block | mean 483 / 508 ms, p50 542 / 588 ms = 12.9% / 13.6% of the window (other blocks 0.2 ms p50) |
+| commit interval ending at an EVM height | p50 264 / 249, p99 879 / 866 ms (rest 286 / 287, 1436 / 1437: not worse) |
+| commit -> exec lag p50 | E ~24 s, N ~10-12.5 s; exec queue peak 66 in all cells |
+
+Reading: each EVM height costs ~0.5 s of exec idle plus ~190 ms of longer serial execution. ~0.27 EVM blocks/s x
+~0.7 s = ~18% of exec time, partly recovered by bigger native blocks (fills per native block +38%, engine ms per 1k
+fills 2.84 vs 3.05). Net -12.4% matched/s at 10 EVM tx/s.
+
+### 80.4 Next
+
+* Cause (18c s126, checked in code s66): by design. Before an EVM block, `pipeline_barrier`
+  (`crates/torus-consensus/src/app.rs:2509`) closes the checkpoint window into a checkpoint (`checkpoint_drain`),
+  waits for the flush worker to drain (`wait_idle`) and hands the block to the serial path on the DB. That is the
+  ~0.5 s idle and the slower serial run above. Fix: item 7 step 3 (EVM blocks that can run pipelined), after Q7;
+  any fix is measured with the same 2 arms.
+* Q5 rerun on the item 7 step 2 build (bench queue).
+* Data: `~/bench-results-matched/ozarchy-q5c-300m-{w1,r1-N,r1-E,r2-E,r2-N,smoke-s0}`, campaign files
+  `ozarchy-q5c-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`), spec / driver / checks in `ozarchy-q5c-tools/`
+  (`q5c-spec.json`, `ozarchy-q5c-campaign.sh`, `q5c-checks.sh`), analysis `ozarchy-q5c-run/analysis/`
+  (`q5-analysis.txt`, `q5-cells.{txt,json}`, `q5-minutes.txt`, `q5-gaps.txt`; scripts `ozarchy-q5c-tools/analyst/`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

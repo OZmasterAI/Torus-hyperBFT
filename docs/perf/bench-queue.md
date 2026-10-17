@@ -2,8 +2,8 @@
 
 Benches run on archy only. 18c keeps this list current; archy reads it on pull. IDs (Q1, Q2, ...) stay fixed when an
 item moves between sections.
-Last archy benches: `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79 of
-`ozarchy-antispam-item6-pf1-2026-10-04.md`), 2026-10-16.
+Last archy benches: `ozarchy-q5c` (Q5, section 80 of `ozarchy-antispam-item6-pf1-2026-10-04.md`), 2026-10-17;
+before it `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
 
 ## Order (owner s125, updated s126)
 
@@ -39,7 +39,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
 1b. **Q9. Data-dir growth: main vs main + RH4** (soak, after setup, once 18c's RH4 branch is ready; see Items, Q9).
 2. **Q8. Item 6 Phase 5 step 0 profile** (campaign P, profile only, no A/B). Sent to archy directly (s125); it decides
    whether and how much of Phase 5 gets built.
-3. **Q5. Native vs native + EVM transfers** (campaign C): 2 arms on M.
+3. **Q5. Native vs native + EVM transfers** (campaign C): 2 arms on M. **Done s64 (setup PASS, M = e3d11cb9):
+   E/N 0.876, -12.4% matched/s; EVM heights never pipelined, ~0.5 s exec idle before each (section 80).**
 4. **Campaign A:** 6 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
    **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
    `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
