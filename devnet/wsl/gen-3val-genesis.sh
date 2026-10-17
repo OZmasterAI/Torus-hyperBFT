@@ -23,6 +23,13 @@
 #               following the existing row schema (lot/tick 1.0, im 5.0).
 #               The 100k funded accounts are untouched either way.
 #   OUT=/path   where to write the 3-val genesis.
+#   EVM_BLOCK_INTERVAL=N  genesis EVM cadence N (.evm.block_interval: EVM txs
+#               only at heights with height % N == 0; bench Q12). Integer in
+#               2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE, what governance
+#               can set), else FATAL before anything is written. Patches only
+#               OUT, never the reused weighted-full genesis. Unset or empty =
+#               the field stays absent (node default 11) and OUT is
+#               byte-identical to a run without the knob.
 #   BENCH_BIN=  bench-throughput binary (default: cargo-bin resolution, which
 #               honours CARGO_TARGET_DIR, then <repo>/target/release).
 set -euo pipefail
@@ -36,6 +43,10 @@ OUT="${OUT:-$REPO/devnet/wsl/genesis-3val.json}"
 
 [ -x "$BIN" ] || { echo "FATAL: missing $BIN — build first: cargo build --release -p bench-throughput" >&2; exit 1; }
 command -v jq >/dev/null || { echo "FATAL: jq not installed" >&2; exit 1; }
+if [ -n "${EVM_BLOCK_INTERVAL:-}" ]; then
+    [[ "$EVM_BLOCK_INTERVAL" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$EVM_BLOCK_INTERVAL" -ge 2 ] && [ "$EVM_BLOCK_INTERVAL" -le 100 ] \
+        || { echo "FATAL: EVM_BLOCK_INTERVAL must be an integer in 2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE) (got '$EVM_BLOCK_INTERVAL')" >&2; exit 1; }
+fi
 
 # 1. Materialise the weighted 100k-account genesis (adds ~100k bulk senders).
 if [ "${FORCE:-0}" = 1 ] || [ ! -f "$FULL" ]; then
@@ -98,6 +109,12 @@ if [ -n "${TIMEOUT_BASE_MS:-}" ]; then
     tmp=$(mktemp) && jq --argjson t "$TIMEOUT_BASE_MS" '.consensus.timeout_base_ms = $t' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
 fi
 
+# 4b. Optional genesis EVM cadence N (bench Q12; EvmConfig.block_interval,
+#     absent = 11). Validated at the top; chain-wide, so all validators agree.
+if [ -n "${EVM_BLOCK_INTERVAL:-}" ]; then
+    tmp=$(mktemp) && jq --argjson n "$EVM_BLOCK_INTERVAL" '.evm.block_interval = $n' "$OUT" > "$tmp" && mv "$tmp" "$OUT"
+fi
+
 # 5. Optional running state hash activation (docs/plans/running-state-hash-impl.md).
 #    CHAIN-WIDE genesis field: every node hashes from this height; absent = off.
 if [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
@@ -108,6 +125,7 @@ fi
 
 echo "wrote $OUT"
 echo "  timeout_ms = $(jq '.consensus.timeout_base_ms' "$OUT")"
+echo "  evm_block_interval = $(jq '.evm.block_interval // "absent (node default 11)"' "$OUT")"
 echo "  state_hash_activation = $(jq '.consensus.state_hash_activation_height // "off"' "$OUT")"
 echo "  chain_id   = $(jq '.chain_id' "$OUT")"
 echo "  validators = $(jq '.validators|length' "$OUT")  ($(jq -r '.validators[].address' "$OUT" | tr '\n' ' '))"
