@@ -2113,7 +2113,7 @@ poller.py, analyze.py, drained.sh, gov.sh; `govtool/`); `/tmp/item7-devnet-check
 **Archy native-only A/B** (after the devnet passes; a bench agent per the boot `bench:` line). Campaign spec for
 `tools/matched-bench/campaign/make-driver.py`: arm A = main at the step 2 merge base, arm B = the step 2 head; one
 genesis shape (300-market weighted genesis; arm B with the new keys absent, so M = 0); EVM load off (native only);
-harness defaults (`TORUS_BOOK_ROWS=3`, so the deferred save path that writes the bbo rows; `BLOCK_CAP=200`); warm-up
+the standard bench load (`docs/perf/bench-queue.md`, "Standard load": the hsdb-300m load, `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit IN_FLIGHT_TAIL_DEPTH=1 CLOID_SHARE=0`, 76,000/s, 5,000 senders) with `TORUS_BOOK_ROWS=3` (the deferred save path that writes the bbo rows). s127 correction: "harness defaults" here never meant `run-cell.sh`'s bare defaults, which Q7 run 1 used; warm-up
 cell, n = 4 ABBA rounds of 120 s cells (owner s126: no 10-market secondary; 300 markets is the worst case for the bbo writes). Plus a Classic pair (Codex plan check
 s125): mode 3 turns checkpoints off (`resolve_checkpoint_interval`, exec_pipeline.rs:134-160, run-cell.sh:412
 `TORUS_BOOK_ROWS=3`), while shipped validators run Classic with 15 s checkpoints, where the bbo puts go through
@@ -2243,7 +2243,16 @@ None of these changes block speed or matched/s; they are correctness and UX choi
 9. **Before the merge (owner s126):** the EVM drain skips txs already in pending proposals, as the native drain does.
    The C10 devnet showed the same tx at two adjacent EVM heights with big blocks on (second copy skipped at execution,
    about 1% of block entries). And main is merged into `feat/item7-step2` before Q7, so the A/B benches what lands.
-10. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
+10. **EVM double inclusion fix (2cdc3ac7), as built:** the EVM drain (both lanes) skips txs carried by the
+    uncommitted ANCESTOR blocks of the proposal (`evm_tx_hash`, no ecrecover), not by every pending proposal. Skipped
+    txs stay pooled; the sender's next nonce can still go in. Also fixed: an in-flight or another sender's below-floor
+    tx can no longer stop the drain (fee floor checked after the skip).
+    - Alt (decision 9's wording): skip txs in all pending proposals, as natives do. Rejected: EVM txs are nonce-ordered,
+      so skipping a tx from a losing fork block could strand its sender's next nonce, and skipping our own earlier
+      block at a re-proposed height would break re-proposal.
+    - Accepted limit: if an ancestor is not in our pending proposals (replaced by a fork, or after a restart), a
+      duplicate is possible as before; execution skips it (one wasted slot), rare.
+11. **Propose-defer, the onchain mempool + per-block fees, and RPC freshness the HL way:** parked for item 6
    Phase 5 (rules in `item6-phase5-impl.md`, `item7-step2-design.md` and `docs/perf/bench-queue.md`).
 
 ## Effort (one builder)

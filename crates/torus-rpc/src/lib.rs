@@ -4740,6 +4740,325 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// eth_call / eth_estimateGas whose revm read fails on this node (a DB
+    /// without CF_STORAGE: the contract's SLOAD fails): the request returns
+    /// the local storage fault as an error, and nothing is latched: RPC has
+    /// no fail-stop (only block execution does), so the server keeps serving
+    /// and a following call that reads no storage succeeds. RED before: the
+    /// error named an internal EVM error, not the local fault.
+    #[tokio::test]
+    async fn eth_call_db_read_fault_returns_error_and_keeps_serving() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .copied()
+            .filter(|cf| *cf != torus_state::cf::CF_STORAGE);
+        let state =
+            StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let sender = Address::from([0x11; 20]);
+        let funded = AccountInfo {
+            balance: U256::from(10u64.pow(18)),
+            nonce: 0,
+            code_hash: B256::ZERO,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&sender, &funded).unwrap();
+        // `PUSH1 0 SLOAD STOP`.
+        let reader = Address::from([0xC0; 20]);
+        let code = [0x60, 0x00, 0x54, 0x00];
+        let code_hash = alloy_primitives::keccak256(code);
+        state.put_code(&code_hash, &code).unwrap();
+        let contract = AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&reader, &contract).unwrap();
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let faulting =
+            serde_json::json!({ "from": hex_address(sender), "to": hex_address(reader) });
+        for method in ["eth_call", "eth_estimateGas"] {
+            let e = client
+                .request::<String, _>(method, jsonrpsee::rpc_params![faulting.clone(), "latest"])
+                .await
+                .unwrap_err();
+            assert!(
+                e.to_string().contains("local storage fault"),
+                "{method}: {e}"
+            );
+        }
+        let plain = serde_json::json!({ "from": hex_address(sender), "to": hex_address(Address::from([0x22; 20])), "value": "0x0" });
+        assert_eq!(
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![plain, "latest"])
+                .await
+                .unwrap(),
+            "0x",
+            "the server keeps serving"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Deploy `code` at `at` (nonce 1, no balance, no storage rows).
+    fn estgas_deploy(state: &StateDb, at: Address, code: &[u8]) {
+        let code_hash = alloy_primitives::keccak256(code);
+        state.put_code(&code_hash, code).unwrap();
+        let contract = AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&at, &contract).unwrap();
+    }
+
+    /// `gasleft() < 100_000` at entry jumps to `low` (bytes 10..), else STOP:
+    /// `GAS PUSH3 100000 GT PUSH1 10 JUMPI STOP JUMPDEST <low>`.
+    fn estgas_gas_branch(low: &[u8]) -> Vec<u8> {
+        let mut code = vec![
+            0x5a, 0x62, 0x01, 0x86, 0xa0, 0x11, 0x60, 0x0a, 0x57, 0x00, 0x5b,
+        ];
+        code.extend_from_slice(low);
+        code
+    }
+
+    fn estgas_u64(s: &str) -> u64 {
+        u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
+    }
+
+    /// eth_estimateGas whose run at the cap succeeds but whose run at a
+    /// lower tried gas hits a read error of this node's DB (the contract
+    /// SLOADs only when `gasleft() < 100_000`; the DB has no CF_STORAGE):
+    /// the estimate returns that error at once, as geth's binary search
+    /// does for any non-gas error (`gasestimator.Estimate`: `if err != nil
+    /// { return 0, nil, err }`), never a gas value. RPC has no fail-stop:
+    /// the server keeps serving. RED before: every error at a tried gas
+    /// was taken as "gas too low", and the search returned a gas value.
+    #[tokio::test]
+    async fn estimate_gas_db_read_fault_below_cap_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .copied()
+            .filter(|cf| *cf != torus_state::cf::CF_STORAGE);
+        let state =
+            StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let contract = Address::from([0xC2; 20]);
+        // low: PUSH1 0 SLOAD STOP.
+        estgas_deploy(
+            &state,
+            contract,
+            &estgas_gas_branch(&[0x60, 0x00, 0x54, 0x00]),
+        );
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let from = hex_address(Address::from([0x11; 20]));
+        let call = serde_json::json!({ "from": from, "to": hex_address(contract) });
+        let at_cap: String = client
+            .request("eth_call", jsonrpsee::rpc_params![call.clone(), "latest"])
+            .await
+            .unwrap();
+        assert_eq!(at_cap, "0x", "the run at the cap reads no storage");
+        let e = client
+            .request::<String, _>("eth_estimateGas", jsonrpsee::rpc_params![call, "latest"])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("local storage fault"), "{e}");
+        let plain =
+            serde_json::json!({ "from": from, "to": hex_address(Address::from([0x22; 20])) });
+        assert_eq!(
+            client
+                .request::<String, _>("eth_estimateGas", jsonrpsee::rpc_params![plain, "latest"])
+                .await
+                .unwrap(),
+            "0x5208",
+            "the server keeps serving"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// geth parity of the search (`gasestimator.Estimate`): a run that
+    /// FAILS at a tried gas below the cap — out of gas, or a revert that
+    /// only happens with less gas (the 63/64 rule makes that common) —
+    /// raises the lower bound; the estimate is the least gas at which the
+    /// tx succeeds (it succeeds there, one less fails). A tx that reverts
+    /// at the cap returns the revert (code 3 + revert data) at once.
+    #[tokio::test]
+    async fn estimate_gas_search_raises_on_failure_and_returns_revert_at_cap() {
+        let (_dir, state, mempool, executor) = setup();
+        // low: REVERT(0, 0).
+        let reverts_low = Address::from([0xC3; 20]);
+        estgas_deploy(
+            &state,
+            reverts_low,
+            &estgas_gas_branch(&[0x60, 0x00, 0x60, 0x00, 0xfd]),
+        );
+        // KECCAK256 over 64 KiB of memory (~26.5k gas), then STOP: runs
+        // out of gas below its cost.
+        let burns = Address::from([0xC4; 20]);
+        estgas_deploy(
+            &state,
+            burns,
+            &[0x62, 0x01, 0x00, 0x00, 0x60, 0x00, 0x20, 0x00],
+        );
+        // MSTORE(0, 0x2a) REVERT(0, 32): reverts with data at any gas.
+        let always_reverts = Address::from([0xC5; 20]);
+        estgas_deploy(
+            &state,
+            always_reverts,
+            &[0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xfd],
+        );
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let from = hex_address(Address::from([0x11; 20]));
+        for (what, to, floor) in [
+            ("reverts below 100k gasleft", reverts_low, 121_000),
+            ("out of gas", burns, 21_000 + 26_000),
+        ] {
+            let call = serde_json::json!({ "from": from, "to": hex_address(to) });
+            let est = estgas_u64(
+                &client
+                    .request::<String, _>(
+                        "eth_estimateGas",
+                        jsonrpsee::rpc_params![call.clone(), "latest"],
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert!(est > floor, "{what}: {est}");
+            let at = |gas: u64| {
+                let mut c = call.clone();
+                c["gas"] = serde_json::json!(format!("0x{gas:x}"));
+                c
+            };
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est), "latest"])
+                .await
+                .unwrap_or_else(|e| panic!("{what}: fails at the estimate {est}: {e}"));
+            assert!(
+                client
+                    .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est - 1), "latest"])
+                    .await
+                    .is_err(),
+                "{what}: {est} is not the least gas"
+            );
+        }
+        let call = serde_json::json!({ "from": from, "to": hex_address(always_reverts) });
+        match client
+            .request::<String, _>("eth_estimateGas", jsonrpsee::rpc_params![call, "latest"])
+            .await
+            .unwrap_err()
+        {
+            jsonrpsee::core::client::Error::Call(obj) => {
+                assert_eq!(obj.code(), 3, "{obj:?}");
+                assert!(obj.message().contains("execution reverted"), "{obj:?}");
+                assert_eq!(
+                    obj.data().map(|d| d.get()),
+                    Some(format!("\"0x{:064x}\"", 0x2a).as_str()),
+                    "revert data"
+                );
+            }
+            other => panic!("not a call error: {other}"),
+        }
+        handle.stop().unwrap();
+    }
+
+    /// A refund can bring the gas the run at the cap used BELOW the
+    /// intrinsic gas: 40 warm access-list keys (intrinsic 21000 + 2400 +
+    /// 40 * 1900 = 99400) and, only when `gasleft() > 50000`, an SSTORE
+    /// that clears a set slot (4800 refunded). The cap run's gas used is
+    /// ~97.5k, so the search tries limits below 99400, which revm rejects
+    /// before execution (`CallGasCostMoreThanGasLimit`). geth takes that
+    /// (`core.ErrIntrinsicGas`, `gasestimator.execute`: "Special case,
+    /// raise gas limit") as a FAILED try that raises the lower bound, and
+    /// never starts the search below the intrinsic gas. The estimate is the
+    /// least succeeding gas (the STOP path, ~99421). RED before: the
+    /// estimate returned the invalid-transaction error.
+    #[tokio::test]
+    async fn estimate_gas_refund_below_intrinsic_raises_lower_bound() {
+        let (_dir, state, mempool, executor) = setup();
+        let contract = Address::from([0xC6; 20]);
+        // GAS PUSH3 50000 LT PUSH1 10 JUMPI STOP
+        // JUMPDEST PUSH1 0 PUSH1 0 SSTORE STOP
+        estgas_deploy(
+            &state,
+            contract,
+            &[
+                0x5a, 0x62, 0x00, 0xc3, 0x50, 0x10, 0x60, 0x0a, 0x57, 0x00, 0x5b, 0x60, 0x00, 0x60,
+                0x00, 0x55, 0x00,
+            ],
+        );
+        state
+            .put_storage(&contract, &U256::ZERO, &U256::from(1u64))
+            .unwrap();
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let keys: Vec<String> = (0u64..40).map(|k| format!("0x{k:064x}")).collect();
+        let call = serde_json::json!({
+            "from": hex_address(Address::from([0x11; 20])),
+            "to": hex_address(contract),
+            "accessList": [{ "address": hex_address(contract), "storageKeys": keys }],
+        });
+        let est = estgas_u64(
+            &client
+                .request::<String, _>(
+                    "eth_estimateGas",
+                    jsonrpsee::rpc_params![call.clone(), "latest"],
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(est >= 99_400, "below the intrinsic gas: {est}");
+        let at = |gas: u64| {
+            let mut c = call.clone();
+            c["gas"] = serde_json::json!(format!("0x{gas:x}"));
+            c
+        };
+        client
+            .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est), "latest"])
+            .await
+            .unwrap_or_else(|e| panic!("fails at the estimate {est}: {e}"));
+        assert!(
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est - 1), "latest"])
+                .await
+                .is_err(),
+            "{est} is not the least gas"
+        );
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn eth_get_logs_with_filter() {
         let (_dir, state, mempool, executor) = setup();

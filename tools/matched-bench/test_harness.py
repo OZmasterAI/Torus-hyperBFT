@@ -27,6 +27,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -356,6 +357,23 @@ class SummarizeTest(unittest.TestCase):
         self.assertAlmostEqual(
             s["funnel_by_node"]["val1"]["matched_s_first120"], 50_000, delta=500
         )
+
+    def test_nan_column_keeps_the_row(self):
+        """s64 (memory e20da0cb): an arm without the consensus DB gauges writes
+        'nan' in those sampler.csv columns. The loader must keep the row: an
+        empty value raised ValueError there and dropped every sample."""
+        write_cell(self.d, 50_000, 10_000, dur=300)
+        write_agreement(self.d, ["same"] * 3)
+        path = os.path.join(self.d, "sampler.csv")
+        with open(path) as f:
+            lines = f.read().splitlines()
+        cols = ",torus_rocksdb_consensus_write_other,torus_rocksdb_l0_files__cf_native_shards__consensus"
+        with open(path, "w") as f:
+            f.write(lines[0] + cols + "\n")
+            f.writelines(l + ",nan,nan\n" for l in lines[1:])
+        s, _ = run_summarize(self.d)
+        self.assertAlmostEqual(s["headline"]["matched_s_avg"], 26_000, delta=500)
+        self.assertAlmostEqual(s["headline"]["matched_s_first120"], 50_000, delta=500)
 
     def test_open_limit_rejects_are_in_the_node_funnel(self):
         write_cell(self.d, 50_000, 10_000, dur=300)
@@ -2383,10 +2401,11 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
-    def _run_drain_flow(self, mode, max_lag="2"):
+    def _run_drain_flow(self, mode, max_lag="2", settle_max="600", settle_rc=0, settle=None):
         """Run run-cell.sh's real bench-end pause block and drain block with
         python3 stubbed: each health.py call prints the feed's process state
-        (T = SIGSTOPped) and its argv."""
+        (T = SIGSTOPped) and its argv; the feed-stop-settle call returns
+        settle_rc and leaves `settle` as its drain.json."""
         pause = self.fn(
             'ORACLE_ALIVE_END=""\n',
             "\n# ------------------------------------------------"
@@ -2415,18 +2434,28 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 f,
             )
         with open(os.path.join(tmp, "feed-stop-settle", "drain.json"), "w") as f:
-            json.dump({"drained": True, "elapsed_s": 12.7}, f)
+            json.dump(
+                settle
+                or {
+                    "drained": True,
+                    "elapsed_s": 12.7,
+                    "target_height": 4321,
+                    "target_reached": True,
+                    "exec_heights": {"val0": 4330, "val1": 4329, "val2": 4330},
+                },
+                f,
+            )
         script = (
             self.fn("alive() {", "\nstop_sampler() {")
             + '\nlog() { echo "LOG $*"; }\n'
             + 'oracle_marks() { echo \'{"markets":300,"usable":300}\'; }\n'
-            + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; }\n'
-            % tmp
+            + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; '
+            'case "$*" in *feed-stop-settle*) return %d;; esac; }\n' % (tmp, settle_rc)
             + "sleep 300 & ORACLE_PID=$!; FEED=$ORACLE_PID\n"
             + "trap 'kill -KILL $FEED 2>/dev/null' EXIT\n"
             + "OUT=%s TOOLS_DIR=/tools DRAIN_TIMEOUT=780 MARKETS=300 ORACLE_H0=7 "
-            "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s ORACLE_FEED_DRAIN_MAX_LAG=%s T_BENCH1=$(date +%%s)\n"
-            % (tmp, mode, max_lag)
+            "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s ORACLE_FEED_DRAIN_MAX_LAG=%s "
+            "FEED_STOP_SETTLE_MAX_S=%s T_BENCH1=$(date +%%s)\n" % (tmp, mode, max_lag, settle_max)
             + "METS=(9161 9162 9163)\n"
             + pause
             + "\n"
@@ -2483,10 +2512,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
             py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 2"), py[0]
         )
         # paused right after it, then a legacy quiet settle before the digest
+        # that also waits until every node executed the highest committed
+        # height at the pause (s64: was a fixed 60 s)
         self.assertTrue(
             py[1].startswith(
-                "PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 60 "
-                "--quiet 10 --urls " % out_dir
+                "PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 600 "
+                "--quiet 10 --to-height auto --urls " % out_dir
             ),
             py[1],
         )
@@ -2500,7 +2531,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
             if "feed-stop-settle" in l and l.startswith("LOG ")
         ]
         self.assertEqual(len(settle), 1, out)
-        self.assertRegex(settle[0], r"settle drained=1 after 12s")
+        self.assertRegex(
+            settle[0], r"settle drained=1 rc=0 after 12s: every node executed target height 4321"
+        )
         self.assertIn(
             "quiet_window_native_block_exec_ms (oracle-only proxy) p50=50.0 p95=200.0 "
             "max=200.0 native_blocks=5 single_block_intervals=3/4",
@@ -2513,6 +2546,78 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertIn(
             'kill -TERM "$pid" 2>/dev/null; kill -CONT "$pid" 2>/dev/null', self.src
         )
+
+    def test_feed_stop_settle_max_reaches_the_settle_and_a_miss_is_logged(self):
+        """FEED_STOP_SETTLE_MAX_S bounds the paused settle; a settle that does
+        not reach its height target (health.py rc 3) is logged as such and the
+        cell carries on (the digest quiescence check decides, as before)."""
+        out_dir, out = self._run_drain_flow(
+            "1",
+            settle_max="1500",
+            settle_rc=3,
+            settle={
+                "drained": False,
+                "elapsed_s": 1500.2,
+                "reason": "height target 9000 not reached (val1 at 8800)",
+                "target_height": 9000,
+                "target_reached": False,
+                "exec_heights": {"val0": 9001, "val1": 8800, "val2": 9001},
+            },
+        )
+        py = [l for l in out.splitlines() if l.startswith("PY ")]
+        self.assertIn(" --timeout 1500 --quiet 10 --to-height auto ", py[1])
+        settle = [l for l in out.splitlines() if "feed-stop-settle" in l and l.startswith("LOG ")]
+        self.assertEqual(len(settle), 1, out)
+        self.assertIn("settle drained=0 rc=3 after 1500s", settle[0])
+        self.assertIn(
+            "WARNING: target height 9000 NOT reached within FEED_STOP_SETTLE_MAX_S=1500 s "
+            "(exec heights val0=9001 val1=8800 val2=9001)",
+            settle[0],
+        )
+        self.assertIn("the digest quiescence check decides", settle[0])
+        self.assertIn("END T", out)
+
+    def test_feed_stop_settle_max_env(self):
+        self.assertIn("FEED_STOP_SETTLE_MAX_S=${FEED_STOP_SETTLE_MAX_S:-600}", self.src)
+        doc = self.src.index("#   FEED_STOP_SETTLE_MAX_S=N")
+        self.assertLess(self.src.index("#   ORACLE_FEED_DRAIN=1"), doc)
+        self.assertLess(doc, self.src.index("set -uo pipefail"))
+        self.assertNotIn("--timeout 60 ", self.src)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"FEED_STOP_SETTLE_MAX_S",', f.read())
+        tmp = tempfile.mkdtemp(prefix="settle-max-pre-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tgt = os.path.join(tmp, "release")
+        os.makedirs(tgt)
+        for b in ("torus-node", "bench-throughput"):
+            p = os.path.join(tgt, b)
+            with open(p, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(p, 0o755)
+        script, wt = sandbox_repo(tmp)
+        drain_on = dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="1")
+        for env, msg in (
+            (dict(drain_on, FEED_STOP_SETTLE_MAX_S="x"), "FEED_STOP_SETTLE_MAX_S must be a positive integer"),
+            (dict(drain_on, FEED_STOP_SETTLE_MAX_S="0"), "FEED_STOP_SETTLE_MAX_S must be a positive integer"),
+            (dict(ORACLE_FEED="1", FEED_STOP_SETTLE_MAX_S="900"), "FEED_STOP_SETTLE_MAX_S=900 needs ORACLE_FEED_DRAIN=1"),
+        ):
+            r = subprocess.run(
+                [script, wt, "settle-max-pre-x"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=dict(
+                    os.environ,
+                    TARGET_DIR=tmp,
+                    RESULTS_ROOT=tmp,
+                    DATA_ROOT=tmp,
+                    BENCH_ALLOW_UNDETACHED="1",
+                    **env,
+                ),
+            )
+            self.assertEqual(r.returncode, 2, (env, r.stderr))
+            self.assertIn(msg, r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "settle-max-pre-x")))
 
     def test_bad_walk_env_fails_preflight(self):
         tmp = tempfile.mkdtemp(prefix="oracle-walk-pre-")
@@ -2806,6 +2911,75 @@ class StaleArtifactGuardTest(unittest.TestCase):
             allow = f.read()
         for k in ("EXPECT_NODE_MD5", "EXPECT_BENCH_MD5"):
             self.assertIn('"%s",' % k, allow)
+
+
+class ConsensusWideColsTest(unittest.TestCase):
+    """Section 71.8 option A (frozen ozarchy-hsdb copy, upstreamed s64): every
+    cell samples the consensus DB's 29 DB-wide gauges
+    (torus_rocksdb_consensus_*, the Rust RocksdbStatMetrics::NAMES with the
+    consensus prefix) and its 3 per-CF families x 3 CFs as CSV-safe
+    <family>__<cf>__consensus alias columns (sample_metrics.py)."""
+
+    TELEMETRY = os.path.join(REPO, "crates", "torus-telemetry", "src", "lib.rs")
+    CFS = ("cf_consensus_meta", "cf_native_pending", "cf_native_shards")
+    FAMILIES = (
+        "torus_rocksdb_l0_files",
+        "torus_rocksdb_memtable_bytes",
+        "torus_rocksdb_pending_compaction_bytes",
+    )
+
+    def wide_cols(self, liq=False):
+        """The effective WIDE_COLS of a cell (run-cell.sh's real block in bash)."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i = src.index('WIDE_COLS="torus_blocks_committed_total')
+        end = 'WIDE_COLS="$WIDE_COLS scrape_valid"\n'
+        block = src[i : src.index(end, i) + len(end)]
+        script = (
+            "liq_stress_on() { %s; }\n" % ("true" if liq else "false")
+            + block
+            + 'echo "$WIDE_COLS"\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.split()
+
+    def rust_names(self):
+        with open(self.TELEMETRY) as f:
+            src = f.read()
+        i = src.index("pub const NAMES: [&'static str; 29] = [")
+        names = re.findall(r'"(torus_rocksdb_[a-z0-9_]+)"', src[i : src.index("];", i)])
+        self.assertEqual(len(names), 29)
+        return ["torus_rocksdb_consensus_" + n[len("torus_rocksdb_") :] for n in names]
+
+    def test_wide_cols_carry_the_consensus_db_series(self):
+        cols = self.wide_cols()
+        aliases = [
+            "%s__%s__consensus" % (f, c) for f in self.FAMILIES for c in self.CFS
+        ]
+        for name in self.rust_names() + aliases:
+            self.assertIn(name, cols)
+        consensus = [c for c in cols if "consensus" in c]
+        # 29 + 9 new, plus the two consensus-thread series main already had
+        self.assertEqual(len(consensus), 40, consensus)
+        self.assertEqual(len(cols), len(set(cols)), "duplicate WIDE_COLS")
+        self.assertEqual(cols[-1], "scrape_valid")
+        # liq cells keep them too, and every column stays CSV-safe
+        self.assertTrue(set(consensus) <= set(self.wide_cols(liq=True)))
+        for c in cols:
+            self.assertRegex(c, r"^[A-Za-z0-9_]+$")
+
+    def test_absent_consensus_columns_are_nan_in_the_sampler(self):
+        sys.path.insert(0, HERE)
+        import sample_metrics
+
+        for name in self.wide_cols():
+            want = (
+                "nan"
+                if "rocksdb_consensus_" in name or name.endswith("__consensus")
+                else "0"
+            )
+            self.assertEqual(sample_metrics.absent_value(name), want, name)
 
 
 class LiqStressHarnessTest(unittest.TestCase):
@@ -3817,6 +3991,181 @@ class BuildGuardTest(unittest.TestCase):
 
 
 EVM_LOAD_PY = os.path.join(HERE, "evm_load.py")
+
+
+class EvmBlockIntervalKnobTest(unittest.TestCase):
+    """EVM_BLOCK_INTERVAL in EXTRA_ENV (bench Q12): the genesis EVM cadence N
+    of one cell. Like TIMEOUT_BASE_MS it is a genesis field, so run-cell.sh
+    lifts it out of EXTRA_ENV for gen-3val-genesis.sh (which patches only the
+    per-cell genesis, never testnet/genesis-weighted-full.json), logs the N
+    the genesis carries and records it in summary.json. Runs a sandbox copy
+    whose generator writes a minimal genesis and whose launch fails, so the
+    cell stops right after its genesis step."""
+
+    def setUp(self):
+        self.real_full = _stat(WEIGHTED_FULL)
+        self.tmp = tempfile.mkdtemp(prefix="evm-n-knob-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        fake_target(self.tmp)
+        self.script, self.wt = sandbox_repo(self.tmp)
+        self.seen = os.path.join(self.tmp, "generator-env")
+        self.gen = os.path.join(self.wt, "devnet", "wsl", "gen-3val-genesis.sh")
+        self.write_generator("")
+        launch = os.path.join(self.wt, "devnet", "wsl", "launch-3val.sh")
+        with open(launch, "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(launch, 0o755)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "pgrep"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(self.bin, "pgrep"), 0o755)
+
+    def tearDown(self):
+        self.assertEqual(
+            _stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched"
+        )
+
+    def write_generator(self, stale_n):
+        """A generator that records the EVM_BLOCK_INTERVAL it was given and
+        writes a MARKETS-market genesis with that N (or with `stale_n`, the
+        hand-patched weighted base case, when the knob is unset)."""
+        with open(self.gen, "w") as f:
+            f.write(
+                "#!/usr/bin/env bash\n"
+                "printf '%%s\\n' \"${EVM_BLOCK_INTERVAL-<unset>}\" >> '%s'\n"
+                "n=${EVM_BLOCK_INTERVAL:-%s}\n"
+                "jq -n --argjson m \"$MARKETS\" --arg n \"$n\" '{markets: [range($m)], native_balances: [],"
+                " consensus: {timeout_base_ms: 500}, evm: ({chain_id: 7778}"
+                " + (if $n == \"\" then {} else {block_interval: ($n|tonumber)} end))}' > \"$OUT\"\n"
+                % (self.seen, stale_n)
+            )
+        os.chmod(self.gen, 0o755)
+
+    def run_cell(self, extra_env="", **env):
+        e = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("LIQ_", "ORACLE_", "EXPECT_", "EVM_"))
+            and k not in ("FORCE", "SENDERS")
+        }
+        e.update(
+            PATH=self.bin + os.pathsep + os.environ["PATH"],
+            TARGET_DIR=self.tmp,
+            RESULTS_ROOT=os.path.join(self.tmp, "results"),
+            DATA_ROOT=os.path.join(self.tmp, "data"),
+            BENCH_ALLOW_UNDETACHED="1",
+            SENDERS="5",
+            OVERWRITE="1",
+            **env,
+        )
+        r = subprocess.run(
+            [self.script, self.wt, "knob-x", "4", "60", "1000", extra_env],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=e,
+        )
+        try:
+            with open(os.path.join(self.tmp, "results", "knob-x", "run.log")) as f:
+                log = f.read()
+        except OSError:
+            log = ""
+        return r, log
+
+    def generator_saw(self):
+        try:
+            with open(self.seen) as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+
+    def test_extra_env_sets_n_and_the_next_cell_gets_the_default_back(self):
+        r, log = self.run_cell("TORUS_X=1 EVM_BLOCK_INTERVAL=22 TIMEOUT_BASE_MS=1200")
+        self.assertEqual(self.generator_saw(), ["22"], r.stdout + r.stderr + log)
+        self.assertIn("genesis evm.block_interval=22 (EVM_BLOCK_INTERVAL=22)", log)
+        self.assertIn("launch-3val.sh failed", log, "stops at the launch, after the genesis checks")
+        # next cell, knob unset (an ambient EVM_BLOCK_INTERVAL must not leak in)
+        r, log = self.run_cell("TORUS_X=1", EVM_BLOCK_INTERVAL="33")
+        self.assertEqual(self.generator_saw(), ["22", ""], r.stdout + r.stderr + log)
+        self.assertIn("genesis evm.block_interval=11 (absent: node default)", log)
+        self.assertIn("launch-3val.sh failed", log)
+
+    def test_a_genesis_whose_n_is_not_the_cells_fails(self):
+        """The knob unset but the genesis carries another N (a hand-patched
+        testnet/genesis-weighted-full.json, the no-knob route of the Q12
+        spec, left behind): the cell refuses to run on it."""
+        self.write_generator("22")
+        r, log = self.run_cell("")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        fatal = [l for l in log.splitlines() if "FATAL" in l]
+        self.assertEqual(len(fatal), 1, log)
+        self.assertIn("evm.block_interval=22", fatal[0])
+        self.assertIn("wanted 11", fatal[0])
+        self.assertIn("genesis-weighted-full.json", fatal[0])
+        self.assertNotIn("launch-3val.sh failed", log)
+
+    def test_bad_extra_env_n_fails_preflight(self):
+        for v in ("0", "1", "101", "x", "-3", ""):
+            with self.subTest(v=v):
+                r, _ = self.run_cell("EVM_BLOCK_INTERVAL=%s" % v)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("EVM_BLOCK_INTERVAL must be an integer in 2..=100", r.stderr)
+                self.assertEqual(self.generator_saw(), [])
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
+
+    def test_n_is_the_evm_loads_cadence_and_is_recorded_in_the_summary(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        # the scan always checks the cadence: N defaults to the node's 11
+        self.assertIn("EVM_N=$GEN_EVM_N", src)
+        self.assertNotIn("EVM_N=$(jq -r '.evm.block_interval // empty'", src)
+        # recorded after summarize.py (which rewrites summary.json), before "done"
+        rec = src.index('record_genesis_evm_n "$OUT/summary.json" "$GEN_EVM_N"')
+        self.assertLess(src.index('python3 "$TOOLS_DIR/summarize.py"'), rec)
+        self.assertLess(rec, src.index('log "done -> $OUT/summary.json"'))
+        head = src[: src.index("set -uo pipefail")]
+        self.assertIn("EVM_BLOCK_INTERVAL=N", head)
+        # the default is the node's
+        with open(os.path.join(REPO, "crates", "torus-types", "src", "lib.rs")) as f:
+            self.assertIn("pub const DEFAULT_EVM_BLOCK_INTERVAL: u64 = 11;", f.read())
+        self.assertIn("DEFAULT_EVM_N=11", src)
+
+    def test_record_genesis_evm_n_patches_only_that_field(self):
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i = src.index("record_genesis_evm_n() {")
+        fn = src[i : src.index("\n}\n", i) + 3]
+        d = tempfile.mkdtemp(prefix="evm-n-rec-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        p = os.path.join(d, "summary.json")
+        with open(p, "w") as f:
+            json.dump({"genesis": {"md5": "ab", "markets": 300}, "label": "x"}, f)
+        r = subprocess.run(["bash", "-c", fn + '\nrecord_genesis_evm_n "$1" 33', "_", p],
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(p) as f:
+            self.assertEqual(json.load(f), {"genesis": {"md5": "ab", "markets": 300,
+                                                        "evm_block_interval": 33}, "label": "x"})
+        self.assertEqual(sorted(os.listdir(d)), ["summary.json"], "no temp file left")
+
+    def test_resummarize_keeps_the_genesis_n(self):
+        d = tempfile.mkdtemp(prefix="evm-n-resum-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        write_cell(d, 1000, 1000, dur=120)
+        write_agreement(d, ["0xaa"] * 3)
+        run_summarize(d, dur=120)
+        p = os.path.join(d, "summary.json")
+        with open(p) as f:
+            s = json.load(f)
+        s["genesis"]["evm_block_interval"] = 22
+        with open(p, "w") as f:
+            json.dump(s, f)
+        r = subprocess.run(["bash", os.path.join(HERE, "resummarize.sh"), d],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(p) as f:
+            self.assertEqual(json.load(f)["genesis"]["evm_block_interval"], 22)
 
 
 class EvmLoadHarnessTest(unittest.TestCase):

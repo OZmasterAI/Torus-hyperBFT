@@ -1182,10 +1182,6 @@ impl EthApiServer for RpcState {
         };
         // Item 7 step 2: the caller's lane caps the search (`hi`).
         let block_env = call_block_env(self, latest, &tx).map_err(err)?;
-        // Binary search invariant: `lo` fails, `hi` succeeds. Below the 21000
-        // intrinsic gas every tx fails, so 20999 is the failing bound and
-        // 21000 itself is tried (a plain transfer estimates exactly 21000).
-        let mut lo: u64 = 21_000 - 1;
         let mut hi: u64 = block_env.gas_limit;
         let mut tx_env = build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce.
@@ -1203,7 +1199,7 @@ impl EthApiServer for RpcState {
         // D2 (S392): call-simulation mode — see `call` above.
         let (result, _) = self
             .executor
-            .execute_call(&self.state, &block_env, tx_env)
+            .execute_call(&self.state, &block_env, tx_env.clone())
             .map_err(|e| err(RpcError::Evm(e.to_string())))?;
         // FIX 8 (EVM-FIND-10): Return error on revert instead of gas used.
         // FIX 15: Include revert reason in error data.
@@ -1216,14 +1212,36 @@ impl EthApiServer for RpcState {
                 },
             }));
         }
+        // Binary search, as geth's `eth/gasestimator` `Estimate`. Invariant:
+        // `lo` fails, `hi` succeeds. The gas the run at the cap used
+        // lower-bounds the limit (geth `lo = result.UsedGas - 1`): a plain
+        // transfer estimates exactly 21000. That gas is AFTER the refund, so
+        // it can be below the intrinsic gas (a cleared slot refunds up to a
+        // fifth of the gas spent): `lo` never starts below the least limit
+        // revm accepts (`intrinsic_gas`, the intrinsic gas and, from Prague,
+        // the EIP-7623 floor; geth's `UsedGas` is at least that floor) less
+        // one. A try that FAILS raises `lo`: out of gas, a revert that only
+        // happens with less gas (e.g. an inner call starved by the 63/64
+        // rule), or a limit below the intrinsic gas / floor (geth
+        // `gasestimator.execute`: `if errors.Is(err, core.ErrIntrinsicGas)
+        // { return true, nil, nil // Special case, raise gas limit }`, and
+        // `core.ErrFloorDataGas` alike). Any other ERROR (a DB read error,
+        // an internal error: not about gas) returns at once, never a gas
+        // value (geth: `if err != nil { return 0, nil, err }`). Every try is
+        // the cap's tx with only the limit changed (same defaulted nonce).
+        let mut lo: u64 = result
+            .gas_used
+            .max(torus_evm::intrinsic_gas(&tx_env))
+            .max(21_000)
+            - 1;
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            let mut tx_env =
-                build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
-            tx_env.gas_limit = mid;
-            match self.executor.execute_call(&self.state, &block_env, tx_env) {
+            let mut try_env = tx_env.clone();
+            try_env.gas_limit = mid;
+            match self.executor.execute_call(&self.state, &block_env, try_env) {
                 Ok((r, _)) if r.success => hi = mid,
-                _ => lo = mid,
+                Ok(_) | Err(torus_evm::EvmError::IntrinsicGasTooLow(_)) => lo = mid,
+                Err(e) => return Err(err(RpcError::Evm(e.to_string()))),
             }
         }
         Ok(hex_u64(hi))

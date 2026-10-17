@@ -84,6 +84,84 @@ class ParserTests(unittest.TestCase):
             self.assertEqual([int(row[0]) for row in rows], [102, 102, 105])
 
 
+class ConsensusDbColumnsTest(unittest.TestCase):
+    """Section 71.8 option A (ozarchy-hsdb, upstreamed s64): the consensus DB's series land as CSV-safe columns;
+    absent (a build without the consensus DB) they read "nan", never "" or 0."""
+
+    def test_labelled_consensus_series_get_csv_safe_alias(self):
+        text = (
+            "torus_rocksdb_consensus_write_other 11\n"
+            'torus_rocksdb_l0_files{cf="cf_consensus_meta",db="consensus"} 3\n'
+            'torus_rocksdb_l0_files{cf="cf_consensus_meta"} 9\n'
+        )
+        values, _ = sampler.parse_metrics(text, set())
+        self.assertEqual(values["torus_rocksdb_consensus_write_other"], "11")
+        self.assertEqual(
+            values["torus_rocksdb_l0_files__cf_consensus_meta__consensus"], "3"
+        )
+        # the state DB's per-CF series (no db label) gets no alias
+        self.assertEqual(
+            sorted(k for k in values if k.endswith("__consensus")),
+            ["torus_rocksdb_l0_files__cf_consensus_meta__consensus"],
+        )
+
+    def test_absent_consensus_columns_are_nan_and_state_columns_stay_zero(self):
+        self.assertEqual(
+            sampler.absent_value("torus_rocksdb_consensus_write_other"), "nan"
+        )
+        self.assertEqual(
+            sampler.absent_value("torus_rocksdb_l0_files__cf_native_shards__consensus"),
+            "nan",
+        )
+        self.assertEqual(sampler.absent_value("torus_rocksdb_write_other"), "0")
+        self.assertEqual(sampler.absent_value("optional_missing"), "0")
+
+    def test_absent_value_survives_the_summarizer_loader(self):
+        # summarize.py: r = {k: float(v) ...} and `except (TypeError, ValueError): continue`; '' would drop arm A's whole row
+        for name in (
+            "torus_rocksdb_consensus_write_other",
+            "torus_rocksdb_l0_files__cf_native_shards__consensus",
+        ):
+            self.assertTrue(
+                float(sampler.absent_value(name)) != float(sampler.absent_value(name))
+            )  # NaN, and it parses
+
+    def test_alias_names_are_csv_safe(self):
+        for name in (
+            "torus_rocksdb_l0_files__cf_consensus_meta__consensus",
+            "torus_rocksdb_pending_compaction_bytes__cf_native_pending__consensus",
+        ):
+            self.assertRegex(name, r"^[A-Za-z0-9_]+$")
+
+    def test_sink_writes_nan_for_an_absent_consensus_column_and_the_alias_when_present(
+        self,
+    ):
+        cons = [
+            "torus_rocksdb_consensus_write_other",
+            "torus_rocksdb_l0_files__cf_consensus_meta__consensus",
+        ]
+        wide = [*sampler.REQUIRED, *cons, "optional_missing", "scrape_valid"]
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            with sampler.CsvSink(out, wide, [], [], [], ["val0"]) as sink:
+                sink.emit("val0", response(BODY))  # arm A: no consensus DB
+                sink.emit(
+                    "val0",
+                    response(
+                        BODY + "torus_rocksdb_consensus_write_other 4\n"
+                        'torus_rocksdb_l0_files{cf="cf_consensus_meta",db="consensus"} 2\n',
+                        end=104.0,
+                    ),
+                )
+            rows = list(csv.reader(io.StringIO((out / "sampler.csv").read_text())))
+            n = len(sampler.REQUIRED) + 2
+            self.assertEqual(rows[0][n:], ["nan", "nan", "0", "1"])
+            self.assertEqual(rows[1][n:], ["4", "2", "0", "1"])
+            # every field of both rows parses as float (summarize.py drops a row on ValueError)
+            for r in rows:
+                [float(v) for v in r[2:]]
+
+
 class CollectorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.connections = set()
