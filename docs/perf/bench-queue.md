@@ -32,16 +32,19 @@ file (e.g. `s58dmt-checks.sh`): freeze the new tools, regenerate the driver, run
 check that read a driver local now fails (use `$1` label, `$2` arm, or globals `R`, `AENV`, `AXE`, ...). `_DRV_` is
 reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour); 1 Hz soak sampler on every cell.
 
-**Now:**
+**Now (owner s127 order):**
 
 1. **Setup:** build binary M from main, rebuild the bench genesis with `FORCE=1` (N = 11), run the Q5 smoke cell and
-   its checks (Q5 below). Gates every later campaign.
-1b. **Q9. Data-dir growth: main vs main + RH4** (soak, after setup, once 18c's RH4 branch is ready; see Items, Q9).
-2. **Q8. Item 6 Phase 5 step 0 profile** (campaign P, profile only, no A/B). Sent to archy directly (s125); it decides
-   whether and how much of Phase 5 gets built.
-3. **Q5. Native vs native + EVM transfers** (campaign C): 2 arms on M. **Done s64 (setup PASS, M = e3d11cb9):
-   E/N 0.876, -12.4% matched/s; EVM heights never pipelined, ~0.5 s exec idle before each (section 80).**
-4. **Campaign A:** 7 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
+   its checks (Q5 below). Gates every later campaign. **Done s64 (setup PASS, M = e3d11cb9).**
+2. **Q8. Item 6 Phase 5 step 0 profile** (campaign P, profile only, no A/B, ~1.5 h, `perf_event_paranoid=1` for this
+   run only). Sent to archy directly (s125); it decides whether and how much of Phase 5 gets built.
+3. **Q7. Item 7 step 2: READY (s126), ~2.5 h.** Arm A = main at the merge base **db84a1ad**; arm B =
+   `feat/item7-step2` head **c567b1b3** (origin). C1-C10 built and Codex-clean, 4-validator devnet check done, main
+   with the s58 bundle merged in, EVM double-inclusion fix and its follow-ups Codex-clean; gates nextest --workspace
+   4021/4021, full cargo test 4022. Spec under Items, Q7. (Main after db84a1ad adds only docs, harness fixes and the
+   behaviour-neutral exec-failed latch order fix, so arm A stays db84a1ad.) Both arms are fixed SHAs: campaign A
+   does not move it. Moved ahead of campaign A (s127): Q7 gates the step 2 merge and item 7 step 3.
+4. **Campaign A** (~4 h 40): 7 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
    **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
    `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
 
@@ -56,19 +59,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    | C (Q10) | `TORUS_SHARD_CUSTODY=1` (overrides `env.sh`'s pinned 0); fresh data dirs per cell and a free-disk check first (Items, Q10) |
 
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
-6. **Campaign B (propose-defer): dropped** (owner s126; branch parked). Revisit rule and the arms if revived:
-   `docs/plans/item6-phase5-impl.md`, "Parked for a decision at Phase 5", item 3.
+6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10).
+7. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9). Moved
+   here in s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls
+   (prune by default, validator retention N) and the RH4 merge wait on it. Any long idle slot (overnight) also works.
+8. **Q6. 71.8 checkpoint slicing** vs M, when 18c delivers the code (not built yet; 18c adds the
+   `persist_commit_manifest` timer first). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
+   checkpoint code, so they move slicing's baseline).
 
-**When 18c delivers the code:**
-
-7. **Q6. 71.8 checkpoint slicing** vs M. Run after step 4 has settled the Q1 / Q4 defaults (both touch checkpoint
-   code, so they move slicing's baseline).
-8. **Q7. Item 7 step 2: READY (s126).** Arm A = main at the merge base **db84a1ad**; arm B = `feat/item7-step2` head
-   **c567b1b3** (origin). C1-C10 built and Codex-clean, 4-validator devnet check done, main with the s58 bundle merged
-   in, EVM double-inclusion fix and its follow-ups Codex-clean; gates nextest --workspace 4021/4021, full cargo test
-   4022. Spec under Items, Q7. (Main after db84a1ad adds only docs and the behaviour-neutral exec-failed latch order
-   fix, so arm A stays db84a1ad.)
-8b. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10).
+Done / dropped: **Q5** native vs native + EVM (campaign C, done s64: E/N 0.876, -12.4% matched/s; EVM heights never
+pipelined, ~0.5 s exec idle before each, section 80). **Campaign B** (propose-defer) dropped (owner s126; branch
+parked); revisit rule and arms: `docs/plans/item6-phase5-impl.md`, "Parked for a decision at Phase 5", item 3.
 
 If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and save-books rows of the Q8 profile
 (a short re-run, not a full profile).
@@ -157,7 +158,7 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   model (n = 3, not measured): ~95-145 ms per block per node, 0 to -25% matched/s at 300 markets, worse at 10. At
   N = 11 (k = 4) the per-shard proof work grows about n^2/k, so expect more.
   - 300 markets: arm C of campaign A (same binary, genesis and base arm). 10 markets: one ABBA pair base vs C
-    (n = 3, 600 s) after Q7, only if arm C is within noise at 300.
+    (n = 3, 600 s) after the Q4 winners round (step 6), only if arm C is within noise at 300.
   - DISK: main never deletes shards (`cf_native_shards` in `<data_dir>/consensus-db`). Each body writes n shards of
     ~body/k plus proofs, about 2.75x the body bytes at N = 11: rough estimate 20+ GB per node per 600 s cell (x 11 if
     all nodes share a host). Fresh data dirs per cell, delete them after, check free disk before each C cell.
