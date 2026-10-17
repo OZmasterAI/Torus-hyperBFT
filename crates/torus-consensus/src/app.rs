@@ -25338,13 +25338,43 @@ mod crash_recovery_tests {
     /// the EVM nonce not consumed): a divergence.
     #[test]
     fn evm_db_read_fault_fail_stops_block() {
-        use torus_state::cf::CF_STORAGE;
-        let key = k256::ecdsa::SigningKey::from_slice(&[0x57; 32]).unwrap();
-        let (blocks, b) = r02_evm_blocks(
-            &key,
+        assert_storage_cf_fault_fail_stops_then_replays(
+            0x57,
             alloy_primitives::TxKind::Call(EVM_DB_FAULT_READER),
-            vec![],
+            "a revm DB read fault",
         );
+    }
+
+    /// The same local fault one step later: the block's EVM tx is a plain
+    /// value transfer (revm never reads CF_STORAGE), so execution succeeds
+    /// and the post-bundle state-root compute of `validate_block_for_catchup`
+    /// is the first read of the missing CF (`account_storage`, full scan:
+    /// `StateError::MissingColumnFamily`, `BridgeError::State`; no test
+    /// seam). A local fault: the block fail-stops exactly as above (marker,
+    /// every CF unchanged; the restart replay equals a run without the fault).
+    /// Serial and pipelined. RED before: `BridgeError::State` took the app's
+    /// generic EVM arm (logged), so the block ran without its EVM writes on
+    /// this node only (native part applied, EVM nonce not consumed).
+    #[test]
+    fn evm_state_root_compute_fault_fail_stops_block() {
+        assert_storage_cf_fault_fail_stops_then_replays(
+            0x58,
+            alloy_primitives::TxKind::Call(alloy_primitives::Address::new([0xD0; 20])),
+            "a state-root compute read fault",
+        );
+    }
+
+    /// Body of [`evm_db_read_fault_fail_stops_block`] /
+    /// [`evm_state_root_compute_fault_fail_stops_block`]: block 2's one EVM
+    /// tx (key `seed`, to `to`) runs on a DB opened without CF_STORAGE.
+    fn assert_storage_cf_fault_fail_stops_then_replays(
+        seed: u8,
+        to: alloy_primitives::TxKind,
+        what: &str,
+    ) {
+        use torus_state::cf::CF_STORAGE;
+        let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+        let (blocks, b) = r02_evm_blocks(&key, to, vec![]);
         let (last, prefix) = blocks.split_last().unwrap();
         for on in [false, true] {
             // Control: a healthy DB.
@@ -25391,7 +25421,7 @@ mod crash_recovery_tests {
             ctx.pipeline_barrier();
             assert!(
                 ctx.exec_failed.load(Ordering::SeqCst),
-                "on={on}: a revm DB read fault must fail-stop"
+                "on={on}: {what} must fail-stop"
             );
             drop(ctx);
             assert_eq!(
