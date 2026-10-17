@@ -61,6 +61,10 @@ overlay / state layers first, both after item 6 Phase 5, which shares the EVM wr
   behaviour would change twice).
 - Also for step 2: HL delays CoreWriter order actions a few seconds so contracts cannot bypass the L1 mempool; ours
   wait one block (~0.3 s).
+- **Design s127: `item7-step3-design.md`** (after Q5, section 80: -12.4% matched/s from the barrier). The overlay step
+  alone ("option 0") removes the barrier and changes nothing EVM-visible (no genesis); HL order is a parity-only
+  choice; C can be semantics-neutral (C0). Recommended: 0, plus same-block EVM -> native timing (T) at genesis, C0
+  parked. Owner questions in its section 7.
 
 ## 1. Problem
 
