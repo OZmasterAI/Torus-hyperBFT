@@ -6200,10 +6200,21 @@ impl TorusApp {
     /// replay could still need the DA copy, so its bodies stay for good (the
     /// pass still runs for older heights).
     ///
+    /// A hash this block re-includes moves to this height
+    /// ([`torus_state::NativeDaStore::gc_committed`]), so its body goes when
+    /// this block's window ends, not the earlier one's. And a body the block
+    /// references that is already gone (a re-inclusion validated while the
+    /// action's earlier row was pending, that row aging out before this
+    /// dispatch) is restored from `actions` first, so the block stays
+    /// servable for its own window (Codex P1 sibling). The body only, not its
+    /// shards: a shard miss falls back to the whole-body pull.
+    ///
     /// Runs on the consensus thread, bounded: two point reads (the tree's
-    /// prune pointer, the GC frontier), one iterator over at most
+    /// prune pointer, the GC state), two `MultiGet`s over this block's hashes
+    /// (body presence, latest references), one iterator over at most
     /// [`crate::da_gc::DA_GC_LIMITS`] aged rows and one `WriteBatch` to the
-    /// consensus DB. Timed by `torus_da_gc_seconds`.
+    /// consensus DB (plus a body write on a restore). Timed by
+    /// `torus_da_gc_seconds`.
     /// To move it off this thread, send `(height, hashes, shard_count)` over a
     /// channel to one dedicated thread that runs the same pass, in order:
     /// a late pass only lengthens the window; a lost one leaves that height's
@@ -6211,6 +6222,7 @@ impl TorusApp {
     fn gc_da_bodies_after_dispatch(
         &self,
         height: u64,
+        actions: &[torus_types::SignedNativeAction],
         hashes: &[torus_types::B256],
         body_durable: bool,
     ) {
@@ -6244,6 +6256,21 @@ impl TorusApp {
             0
         };
         let started = std::time::Instant::now();
+        if !record.is_empty() {
+            match mempool.mirror_missing_native_to_da(actions, record) {
+                Ok(0) => {}
+                Ok(restored) => tracing::info!(
+                    height,
+                    restored,
+                    "DA body GC: restored bodies a dispatched block references (re-included after \
+                     an earlier row aged out)"
+                ),
+                Err(e) => tracing::warn!(
+                    height,
+                    "DA body GC: restoring a dispatched block's missing bodies failed: {e}"
+                ),
+            }
+        }
         let keep_from = gc.keep_from().unwrap_or_else(|e| {
             tracing::warn!(
                 height,
@@ -8420,7 +8447,12 @@ impl TorusApp {
             }
             // RH4: record this height's bodies for the DA body GC and delete
             // the bodies that aged out (one bounded batch, see `da_gc`).
-            self.gc_da_bodies_after_dispatch(height, &hashes, durable.body);
+            self.gc_da_bodies_after_dispatch(
+                height,
+                &torus_block.native_actions,
+                &hashes,
+                durable.body,
+            );
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
             // committed blocks actually charge (frozen at 1 gwei today; follows
@@ -30353,5 +30385,70 @@ mod crash_recovery_tests {
         set_tree_frontier(&state_db, u64::MAX);
         da_gc_commit(&mut app, 15, vec![actions[14].clone()]);
         assert_eq!(kept(&mempool, 15), (12..=15).collect::<Vec<_>>());
+    }
+
+    /// Codex P1 (finding 2) through the dispatch path: an action committed at
+    /// height 2 and re-included at height 6 keeps its body until height 6's
+    /// window ends. At tip 6 row 2 ages out in the same pass that records
+    /// height 6, so the later reference must win inside one batch too.
+    #[test]
+    fn da_gc_keeps_a_reincluded_body_until_its_later_block_expires() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let x = sign_claim_rewards(1);
+        let fillers: Vec<_> = (2..=13u64).map(sign_claim_rewards).collect();
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        mempool.mirror_native_to_da(&fillers).unwrap();
+        for tip in 1..=12u64 {
+            let mut actions = vec![fillers[tip as usize - 1].clone()];
+            if tip == 2 || tip == 6 {
+                actions.push(x.clone());
+            }
+            da_gc_commit(&mut app, tip, actions);
+            assert_eq!(da_has(&mempool, &x), tip < 6 + 4, "tip {tip}");
+        }
+    }
+
+    /// Sibling of finding 2: a block re-includes an action AFTER the action's
+    /// earlier row aged out (validated while the body was still there,
+    /// dispatched after the GC took it). Dispatch restores the body from the
+    /// block, so the new block stays servable for its own window.
+    #[test]
+    fn da_gc_dispatch_restores_a_body_its_block_still_needs() {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![x.clone()]);
+        for tip in 2..=5u64 {
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "row 1 aged out at tip 5");
+        // Height 6 re-includes x and carries the body (a full datum here, as
+        // a proposal this node validated and cached).
+        let datum = encode_proposal_datum(&make_block(6, vec![x.clone()]), false);
+        let committed = hotstuff_rs::types::block::Block::new(
+            BlockHeight::new(6),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new(TorusApp::hash_datum(&datum)),
+            Data::new(vec![Datum::new(datum)]),
+        );
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(7), "height 6 dispatched");
+        for tip in 7..=10u64 {
+            assert!(
+                da_has(&mempool, &x),
+                "tip {}: block 6 still needs it",
+                tip - 1
+            );
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "block 6's window ended at tip 10");
     }
 }
