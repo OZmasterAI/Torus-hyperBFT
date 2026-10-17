@@ -5,12 +5,24 @@
 #   validator-2: 0300000000000000000000000000000000000000000000000000000000000000
 #   validator-3: 0400000000000000000000000000000000000000000000000000000000000000
 
+# Optional history retention (Q9 data-dir growth soak): with TORUS_RETENTION_BLOCKS
+# set and non-empty, each validator gets --retention-blocks=$TORUS_RETENTION_BLOCKS
+# (state pruner + block-tree pruner; the DA body GC window derives from it, see
+# torus_consensus::da_gc). Unset or empty = archive, exactly as before. A compose
+# command list cannot drop an item, so the flag is appended by this entrypoint.
+x-node-entrypoint: &node-entrypoint
+  - /bin/sh
+  - -c
+  - exec torus-node "$$@" $${TORUS_RETENTION_BLOCKS:+--retention-blocks=$$TORUS_RETENTION_BLOCKS}
+  - torus-node
+
 services:
   validator-0:
     build:
       context: ..
       dockerfile: devnet/Dockerfile
     image: torus-devnet-node:local
+    entrypoint: *node-entrypoint
     command:
       - --genesis=/genesis/genesis.json
       - --data-dir=/data
@@ -43,6 +55,9 @@ services:
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
       # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
       - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
+      - TORUS_RETENTION_BLOCKS=${TORUS_RETENTION_BLOCKS:-}
+      # DA body GC window alone (RH4; empty = derived from the line above, 0 = off).
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-0-data:/data
@@ -59,6 +74,7 @@ services:
 
   validator-1:
     image: torus-devnet-node:local
+    entrypoint: *node-entrypoint
     command:
       - --genesis=/genesis/genesis.json
       - --data-dir=/data
@@ -85,6 +101,9 @@ services:
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
       # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
       - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
+      - TORUS_RETENTION_BLOCKS=${TORUS_RETENTION_BLOCKS:-}
+      # DA body GC window alone (RH4; empty = derived from the line above, 0 = off).
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-1-data:/data
@@ -100,6 +119,7 @@ services:
 
   validator-2:
     image: torus-devnet-node:local
+    entrypoint: *node-entrypoint
     command:
       - --genesis=/genesis/genesis.json
       - --data-dir=/data
@@ -126,6 +146,9 @@ services:
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
       # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
       - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
+      - TORUS_RETENTION_BLOCKS=${TORUS_RETENTION_BLOCKS:-}
+      # DA body GC window alone (RH4; empty = derived from the line above, 0 = off).
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-2-data:/data
@@ -141,6 +164,7 @@ services:
 
   validator-3:
     image: torus-devnet-node:local
+    entrypoint: *node-entrypoint
     command:
       - --genesis=/genesis/genesis.json
       - --data-dir=/data
@@ -167,6 +191,9 @@ services:
       - TORUS_RPC_IP_WEIGHT_PER_MIN=${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}
       # s58: stuck-leader header re-send 250 ms on the devnet (node default 3000).
       - TORUS_HEADER_RESEND_MS=${TORUS_HEADER_RESEND_MS:-250}
+      - TORUS_RETENTION_BLOCKS=${TORUS_RETENTION_BLOCKS:-}
+      # DA body GC window alone (RH4; empty = derived from the line above, 0 = off).
+      - TORUS_DA_BODY_RETENTION=${TORUS_DA_BODY_RETENTION:-}
     volumes:
       - ./genesis.json:/genesis/genesis.json:ro
       - validator-3-data:/data
