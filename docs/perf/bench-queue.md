@@ -10,6 +10,17 @@ and `ozarchy-q5c` (Q5, section 80) of `ozarchy-antispam-item6-pf1-2026-10-04.md`
 Every campaign uses the N = 11 bench genesis (rebuilt once with `FORCE=1` in setup). Arms that compare against main
 share one binary and one all-off baseline inside a campaign.
 
+**Standard load (s127, every cell unless its item says otherwise): the `hsdb-300m` shape.** 300 markets, rate 76,000,
+SENDERS 5,000, BAND 5, CROSS_FRACTION 0.5, CANCEL_FRACTION 0.05, and the harness env of
+`tools/matched-bench/campaign/driver-spec.example.json`: `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4
+OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit IN_FLIGHT_TAIL_DEPTH=1 CLOID_SHARE=0`; Classic book rows,
+15 s checkpoints, oracle on. "Harness defaults" in any item means this load, NEVER `run-cell.sh`'s bare defaults (its
+load settings are unset there). An item that changes one setting (e.g. `TORUS_BOOK_ROWS=3`, oracle off, a cell
+length) keeps every other setting of this load. Check each cell's `cell=` log line against it before analysis.
+Why: Q7 run 1 (s66) ran the bare defaults (MAX_IN_FLIGHT, IN_FLIGHT_TAIL, OPEN_ORDER_BUDGET, RETRY_BUSY, CLOID_SHARE
+unset): ~140-156k matched/s instead of ~240-250k, deeper books, ~76k fills per block vs ~50k, ~4.9 vs ~2.9 ms exec per
+1k fills. The A/B stayed fair but not at the load every other bench uses.
+
 **Main as benched (s126):** main carries the three merged s123 experiments (KP, DB, PC; flags off) and archy's s58
 bundle (merge 4156a83b: D `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T `TORUS_FAST_SELL_TOP_UPS`,
 all ON by default; 18c Codex torus review no findings, torus-adversarial approve; main gate 3923/3923). Build M from
@@ -48,9 +59,11 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    behaviour-neutral exec-failed latch order fix, so arm A stays db84a1ad.) Both arms are fixed SHAs: campaign A
    does not move it. Moved ahead of campaign A (s127): Q7 gates the step 2 merge, the last item before the item 6
    Phase 5 build (roadmap order s121; item 7 step 3 comes after Phase 5, `item7-evm-lanes.md`).
-   **Done s66 (BLOCK_CAP 400, owner; `item7-step2-native-ab.md`): matched/s B/A mode 3 1.0082 [0.9646, 1.0538], Classic
-   0.9963 [0.9896, 1.0031], both pass; save_books Classic -0.22 ms pass, mode 3 +0.52 ms [-0.92, +1.96] fails the 0.3 ms
-   bound by point estimate (CI unresolved): owner / 18c decide before the merge.**
+   Run 1 (s66, `item7-step2-native-ab.md`): matched/s B/A mode 3 1.0082 [0.9646, 1.0538], Classic 0.9963 [0.9896,
+   1.0031]; save_books Classic -0.22 ms, mode 3 +0.52 ms [-0.92, +1.96] (point estimate over the 0.3 ms bound, CI
+   unresolved). It ran `run-cell.sh`'s bare load defaults, not the standard load (see above), so it does not decide the
+   merge. **RERUN (owner s127): both shapes at the standard load, same binaries (A db84a1ad, B c567b1b3), same
+   rounds, before campaign A (~2 h). The rerun decides the merge.**
 4. **Campaign A** (~4 h 40): 7 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
    **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
    `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
@@ -139,7 +152,8 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   - Genesis: the 300-market weighted genesis; arm B with the new step 2 keys absent (M = 0, big blocks off). EVM
     load off.
   - Build each binary once and use one genesis for both shapes.
-  - Shape 1, mode 3 (harness default, `TORUS_BOOK_ROWS=3`, `BLOCK_CAP=200`): warm-up cell, n = 4 ABBA rounds of
+  - Load: the standard load (Order, "Standard load"), in both shapes; only the book-rows mode differs.
+  - Shape 1, mode 3 (the standard load with `TORUS_BOOK_ROWS=3`): warm-up cell, n = 4 ABBA rounds of
     120 s cells at 300 markets. No 10-market secondary (owner s126: step 2 adds one bbo write per dirty market per
     block, so 300 markets is the worst case).
   - Shape 2, Classic (the shipped shape): both arms `EXTRA_ENV='TORUS_BOOK_ROWS='`, 15 s checkpoints
