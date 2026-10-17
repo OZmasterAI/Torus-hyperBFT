@@ -1133,6 +1133,26 @@ impl FrozenPending {
         self
     }
 
+    /// Item 6 Phase 5 step 1 (`docs/plans/item6-phase5-impl.md` Task 1.1):
+    /// put `rows` of `cf` into this set, each a write (`Some`) or a tombstone
+    /// (`None`) that replaces whatever the set held for its key — the typed
+    /// dirty sets' rows serialized at freeze (`Users::drain_dirty_into` in
+    /// torus-bridge). Panics on an unregistered CF (a code bug, as in
+    /// [`Self::with_deletes`]).
+    pub fn put_rows(&mut self, cf: &str, rows: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>) {
+        let _ = (cf, rows.into_iter().count());
+    }
+
+    /// Item 6 Phase 5 (tests): the set's writes (`Some`) and tombstones
+    /// (`None`) of `cf`, key-sorted (empty for an unregistered CF; hash
+    /// extras excluded).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn rows(&self, cf: &str) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        intern_cf(cf).map_or_else(Vec::new, |id| {
+            cf_stream(self.state.cf(id)).map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec))).collect()
+        })
+    }
+
     /// Number of pending writes + tombstones in this set.
     pub fn entry_count(&self) -> usize {
         self.state
@@ -4211,6 +4231,75 @@ mod tests {
             StateDb::get_cf_raw(&db, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT).unwrap(),
             Some(42u64.to_be_bytes().to_vec())
         );
+    }
+
+    /// Item 6 Phase 5 step 1: `put_rows` makes a frozen set hold exactly the
+    /// rows a block overlay would have pending after the same writes and
+    /// deletes: a write replaces a tombstone of its key and the reverse, the
+    /// set's other keys and CFs are untouched (`entry_count`, `rows` of every
+    /// CF), and the result layers under a child overlay and flushes as such.
+    #[test]
+    fn put_rows_equals_the_same_writes_through_an_overlay() {
+        use crate::cf::{CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_POSITIONS};
+        let (db, _dir) = temp_db();
+        db.put_cf_raw(CF_NATIVE_POSITIONS, b"p-old", b"0").unwrap();
+        let o = NativeStateOverlay::new(db.clone());
+        // The set the rows are put into: a cold write, and a write and a
+        // tombstone of positions keys the rows below override.
+        for (k, v) in [(b"p-a".as_slice(), b"1".as_slice()), (b"p-b", b"2")] {
+            StateBackend::put_cf_raw(&o, CF_NATIVE_POSITIONS, k, v).unwrap();
+        }
+        StateBackend::delete_cf_raw(&o, CF_NATIVE_POSITIONS, b"p-c").unwrap();
+        StateBackend::put_cf_raw(&o, CF_NATIVE_MARKETS, b"m", b"cold").unwrap();
+        let reference = NativeStateOverlay::new(db.clone());
+        for (k, v) in [(b"p-a".as_slice(), b"1".as_slice()), (b"p-b", b"2")] {
+            StateBackend::put_cf_raw(&reference, CF_NATIVE_POSITIONS, k, v).unwrap();
+        }
+        StateBackend::delete_cf_raw(&reference, CF_NATIVE_POSITIONS, b"p-c").unwrap();
+        StateBackend::put_cf_raw(&reference, CF_NATIVE_MARKETS, b"m", b"cold").unwrap();
+        let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
+            (b"p-a".to_vec(), None),          // write -> tombstone
+            (b"p-c".to_vec(), Some(b"3".to_vec())), // tombstone -> write
+            (b"p-d".to_vec(), Some(b"4".to_vec())),
+            (b"p-old".to_vec(), None),        // a durable row deleted
+        ];
+        for (k, v) in &rows {
+            match v {
+                Some(v) => StateBackend::put_cf_raw(&reference, CF_NATIVE_POSITIONS, k, v).unwrap(),
+                None => StateBackend::delete_cf_raw(&reference, CF_NATIVE_POSITIONS, k).unwrap(),
+            }
+        }
+        StateBackend::put_cf_raw(&reference, CF_NATIVE_BALANCES, b"b", b"5").unwrap();
+        let mut frozen = Arc::try_unwrap(o.freeze(7)).ok().expect("one owner");
+        frozen.put_rows(CF_NATIVE_POSITIONS, rows);
+        frozen.put_rows(CF_NATIVE_BALANCES, [(b"b".to_vec(), Some(b"5".to_vec()))]);
+        let want = reference.freeze(7);
+        assert_eq!(frozen.entry_count(), want.entry_count());
+        for cf in crate::cf::ALL_CF_NAMES {
+            assert_eq!(frozen.rows(cf), want.rows(cf), "{cf}");
+        }
+        assert_eq!(
+            frozen.rows(CF_NATIVE_POSITIONS),
+            vec![
+                (b"p-a".to_vec(), None),
+                (b"p-b".to_vec(), Some(b"2".to_vec())),
+                (b"p-c".to_vec(), Some(b"3".to_vec())),
+                (b"p-d".to_vec(), Some(b"4".to_vec())),
+                (b"p-old".to_vec(), None),
+            ]
+        );
+        let frozen = Arc::new(frozen);
+        let child = NativeStateOverlay::with_parent(db.clone(), Some(frozen.clone()));
+        let read = |k: &[u8]| StateBackend::get_cf_raw(&child, CF_NATIVE_POSITIONS, k).unwrap();
+        assert_eq!((read(b"p-a"), read(b"p-c"), read(b"p-old")), (None, Some(b"3".to_vec()), None));
+        assert_eq!(StateBackend::iterate_cf(&child, CF_NATIVE_POSITIONS, None).unwrap().len(), 3);
+        frozen.flush_with_native_trie_stats(&db, Some(7), None, None).unwrap();
+        let durable = |cf| StateBackend::iterate_cf(&db, cf, None).unwrap();
+        assert_eq!(
+            durable(CF_NATIVE_POSITIONS),
+            vec![(b"p-b".to_vec(), b"2".to_vec()), (b"p-c".to_vec(), b"3".to_vec()), (b"p-d".to_vec(), b"4".to_vec())]
+        );
+        assert_eq!(durable(CF_NATIVE_BALANCES), vec![(b"b".to_vec(), b"5".to_vec())]);
     }
 
     /// s63 (port of item 6a, 4298728): flushing a frozen set WITH a sidecar

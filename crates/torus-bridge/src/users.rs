@@ -61,7 +61,8 @@ use torus_state::error::StateError;
 use torus_state::resident_rows::{ResidentRow, ResidentRowIter, ResidentSource};
 #[cfg(test)]
 use torus_state::ResidentRows;
-use torus_state::{ResidentDelta, StateBackend};
+use torus_core::error::CoreError;
+use torus_state::{FrozenPending, ResidentDelta, StateBackend};
 use torus_types::{FixedPoint, MarketId};
 
 use super::SumsResult;
@@ -186,6 +187,8 @@ pub(crate) struct Users {
     /// (position, balance, volume), and declined (an opaque trader).
     #[cfg(test)]
     typed: ([std::sync::atomic::AtomicUsize; 3], std::sync::atomic::AtomicUsize),
+    /// Phase 5 step 1: the keys [`UsersMut`] changed since the last drain.
+    dirty: Dirty,
 }
 
 type Holders = HashMap<MarketId, HashSet<Address>>;
@@ -820,6 +823,119 @@ impl Users {
         let rows = |cf| self.encode_rows(cf);
         let cold = Self::build_maps(&rows(CF_NATIVE_POSITIONS), &rows(CF_NATIVE_BALANCES));
         self.same_as(&cold) && (self.rows, self.bytes) == self.recount() && (cold.rows, cold.bytes) == (self.rows, self.bytes)
+    }
+}
+
+/// Item 6 Phase 5 step 1 (`docs/plans/item6-phase5-impl.md` Task 1.1): the
+/// keys of both CFs changed since the last drain, by key shape. A key is in
+/// at most one set (the shapes are disjoint); its row is read from the
+/// record set at the drain, so a key written many times is emitted once.
+#[derive(Debug, Default)]
+struct Dirty {
+    /// 28-byte positions keys `t ‖ m`.
+    positions: HashSet<(Address, MarketId)>,
+    /// 20-byte balance keys.
+    balances: HashSet<Address>,
+    /// 24-byte `cvlm ‖ t` keys.
+    volumes: HashSet<Address>,
+    /// Every other key, per slot ([`POSITIONS`], [`BALANCES`]).
+    raw: [BTreeSet<Vec<u8>>; 2],
+}
+
+// Phase 5 step 1 (tests): rows the drains serialized from a record / as raw
+// bytes (an opaque trader's, a row under no trader).
+#[cfg(test)]
+thread_local! {
+    static DRAIN_SOURCES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// One drained row: a write (`Some`) or a tombstone (`None`).
+pub(crate) type DirtyRow = (Vec<u8>, Option<Vec<u8>>);
+
+/// Phase 5 step 1: a drain's rows per CF, each CF key-sorted, each key once.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DirtyRows {
+    pub(crate) positions: Vec<DirtyRow>,
+    pub(crate) balances: Vec<DirtyRow>,
+}
+
+/// Phase 5 step 1: the typed write API of the record set. Every call
+/// changes the rows in place (records, or the raw rows of an opaque trader)
+/// and marks the key dirty; [`Users::drain_dirty_into`] serializes each
+/// dirty key's row once at freeze. Shadow only in step 1 (tests are its only
+/// callers; step 2 moves the hot writers onto it).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct UsersMut<'a> {
+    users: &'a mut Users,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Users {
+    /// Phase 5 step 1: the typed write handle.
+    pub(crate) fn mutate(&mut self) -> UsersMut<'_> {
+        UsersMut { users: self }
+    }
+
+    /// Phase 5 step 1: keys marked dirty since the last drain.
+    pub(crate) fn dirty_keys(&self) -> usize {
+        0
+    }
+
+    /// Phase 5 step 1: every dirty key's row as the record set holds it now
+    /// (a regular trader's encoded from its record, an opaque trader's and a
+    /// row under no trader as bytes; absent: a tombstone), per CF in key
+    /// order; the dirty sets are left empty.
+    pub(crate) fn drain_dirty(&mut self) -> DirtyRows {
+        DirtyRows::default()
+    }
+
+    /// Phase 5 step 1 (tests): rows this thread's drains serialized from a
+    /// record and as raw bytes, so far.
+    #[cfg(test)]
+    pub(crate) fn drain_sources() -> (usize, usize) {
+        DRAIN_SOURCES.with(std::cell::Cell::get)
+    }
+
+    /// Phase 5 step 1: [`Self::drain_dirty`] into `out` (the block's frozen
+    /// set: its rows of the two CFs replaced key by key).
+    pub(crate) fn drain_dirty_into(&mut self, out: &mut FrozenPending) {
+        let rows = self.drain_dirty();
+        out.put_rows(CF_NATIVE_POSITIONS, rows.positions);
+        out.put_rows(CF_NATIVE_BALANCES, rows.balances);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl UsersMut<'_> {
+    /// `p`'s row (key `p.trader ‖ p.market_id`) = `p`.
+    pub(crate) fn set_position(&mut self, p: Position) {
+        let _ = (p, &self.users);
+    }
+
+    /// No row at `t ‖ m` (a tombstone even if there was none).
+    pub(crate) fn remove_position(&mut self, t: &Address, m: MarketId) {
+        let _ = (t, m);
+    }
+
+    /// `t`'s balance row = `b`.
+    pub(crate) fn set_balance(&mut self, t: &Address, b: NativeBalance) {
+        let _ = (t, b);
+    }
+
+    /// `t`'s `cvlm` row = its volume (zero without a row) + `amount`, as
+    /// `add_cum_volume` reads and writes it (`Err`: an opaque trader's `cvlm`
+    /// row is not 16 bytes, the read's error; nothing changes).
+    pub(crate) fn add_cum_volume(&mut self, t: &Address, amount: FixedPoint) -> Result<(), CoreError> {
+        let _ = (t, amount);
+        Ok(())
+    }
+
+    /// Decision 3's write-through: any raw write (`Some`) or tombstone
+    /// (`None`) of `key` in `slot` ([`POSITIONS`] / [`BALANCES`]), exactly
+    /// as `apply` follows it from a delta (a regular row of a regular trader
+    /// in place, any other change re-decodes the trader).
+    pub(crate) fn put_row(&mut self, slot: usize, key: &[u8], value: Option<&[u8]>) {
+        let _ = (slot, key, value);
     }
 }
 

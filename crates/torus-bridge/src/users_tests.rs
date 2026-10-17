@@ -294,7 +294,7 @@ fn random_block(o: &NativeStateOverlay, rng: &mut Lcg) {
 }
 
 /// [`random_block`] over `traders` (same draws for [`test_traders`]).
-fn random_block_over(o: &NativeStateOverlay, rng: &mut Lcg, traders: &[Address]) {
+fn random_block_over(o: &impl StateBackend, rng: &mut Lcg, traders: &[Address]) {
     let n = traders.len() as u64;
     // Irregular rows are written in about one block of six (they stay until
     // their own key is rewritten or deleted); removals happen in any block.
@@ -347,7 +347,7 @@ fn random_balance_block(o: &NativeStateOverlay, rng: &mut Lcg) {
 }
 
 /// [`random_balance_block`] over `traders` (same draws for [`test_traders`]).
-fn random_balance_block_over(o: &NativeStateOverlay, rng: &mut Lcg, traders: &[Address]) {
+fn random_balance_block_over(o: &impl StateBackend, rng: &mut Lcg, traders: &[Address]) {
     let n = traders.len() as u64;
     let wild = rng.below(6) == 0;
     for _ in 0..1 + rng.below(10) {
@@ -1593,4 +1593,841 @@ fn source_slots_are_positions_then_balances() {
     assert_eq!(resident_slot(CF_NATIVE_POSITIONS), Some(POSITIONS));
     assert_eq!(resident_slot(CF_NATIVE_BALANCES), Some(BALANCES));
     assert_eq!(SOURCE_SLOTS, 2);
+}
+
+// ======================================================================
+// Item 6 Phase 5 step 1 (`docs/plans/item6-phase5-impl.md` Task 1.1):
+// `UsersMut` and the dirty sets, shadow only. The overlay still takes every
+// write; a `Users` next to it takes the same writes through `UsersMut`
+// (typed calls, or the write-through `put_row`), and the rows its dirty sets
+// serialize at the end of the block must equal the overlay's pending rows of
+// the two CFs, byte for byte, deletes included.
+// ======================================================================
+
+use std::sync::{Arc, Mutex};
+
+use super::super::{begin_resident, end_resident, NativeExecContext, NativeExecutor, ResidentBooks};
+use alloy_primitives::U256;
+use torus_core::liquidation::{self as liquidation, AdlCandidate, LIQUIDATOR_VAULT};
+use torus_core::lockbox::Lockbox;
+use torus_state::cf::{ALL_CF_NAMES, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+use torus_state::resident_rows::ResidentChange;
+use torus_state::running_hash::hashed_cf_id;
+use torus_state::{AtomicWriteOp, OwnPendingRow};
+use torus_types::{NativeAction, OrderType, PlaceOrderParams, TimeInForce};
+
+/// What the shadow made per kind of `UsersMut` call.
+#[derive(Debug, Default, Clone, Copy)]
+struct MutStats {
+    set_position: usize,
+    remove_position: usize,
+    set_balance: usize,
+    add_cum_volume: usize,
+    put_row: usize,
+    /// Typed calls on an opaque trader (its rows stay raw).
+    opaque_typed: usize,
+}
+
+/// One typed call a raw write stands for.
+enum Call {
+    SetPosition(Position),
+    RemovePosition(Address, MarketId),
+    SetBalance(Address, NativeBalance),
+    AddCumVolume(Address, FixedPoint),
+}
+
+impl Call {
+    fn owner(&self) -> Address {
+        match self {
+            Call::SetPosition(p) => p.trader,
+            Call::RemovePosition(t, _) | Call::SetBalance(t, _) | Call::AddCumVolume(t, _) => *t,
+        }
+    }
+}
+
+/// The typed call for a write (`Some`) / tombstone (`None`) of `key` in
+/// `slot`, if there is one: a regular position row or a positions key's
+/// tombstone, a regular balance row, a 16-byte `cvlm` row of a regular
+/// trader (as the volume added to its row). Any other write goes through
+/// `put_row` (no production code deletes a balance or `cvlm` row).
+fn typed_call(users: &Users, slot: usize, key: &[u8], value: Option<&[u8]>) -> Option<Call> {
+    match (slot, value) {
+        (POSITIONS, _) if key.len() != KEY => None,
+        (POSITIONS, None) => Some(Call::RemovePosition(Address::from_slice(&key[..TRADER]), market_of(key))),
+        (POSITIONS, Some(v)) => decode(key, v).map(Call::SetPosition),
+        (_, None) => None,
+        (_, Some(v)) => match super::balance_owner(key)? {
+            (t, BalanceRow::Balance) => decode_balance(v).map(|b| Call::SetBalance(t, b)),
+            (t, BalanceRow::Volume) => {
+                let new = decode_volume(v)?;
+                let cur = TypedRows::cum_volume(users, &t)?.unwrap_or(FixedPoint::ZERO);
+                Some(Call::AddCumVolume(t, new - cur))
+            }
+        },
+    }
+}
+
+/// The shadow's `Users` and its draws.
+struct ShadowSide {
+    users: Users,
+    rng: Lcg,
+    stats: MutStats,
+}
+
+impl ShadowSide {
+    /// One write / tombstone of `key` in `cf` (other CFs: nothing), on the
+    /// shadow's `Users`: a typed call one time in two when there is one, else
+    /// the write-through.
+    fn mirror(&mut self, cf: &str, key: &[u8], value: Option<&[u8]>) {
+        let slot = match cf {
+            CF_NATIVE_POSITIONS => POSITIONS,
+            CF_NATIVE_BALANCES => BALANCES,
+            _ => return,
+        };
+        let typed = self.rng.below(2) == 0;
+        let Self { users, stats, .. } = self;
+        let Some(call) = typed.then(|| typed_call(users, slot, key, value)).flatten() else {
+            users.mutate().put_row(slot, key, value);
+            stats.put_row += 1;
+            return;
+        };
+        stats.opaque_typed += usize::from(users.get(&call.owner()).is_none());
+        match call {
+            Call::SetPosition(p) => {
+                users.mutate().set_position(p);
+                stats.set_position += 1;
+            }
+            Call::RemovePosition(t, m) => {
+                users.mutate().remove_position(&t, m);
+                stats.remove_position += 1;
+            }
+            Call::SetBalance(t, b) => {
+                users.mutate().set_balance(&t, b);
+                stats.set_balance += 1;
+            }
+            Call::AddCumVolume(t, x) => {
+                users.mutate().add_cum_volume(&t, x).expect("a regular trader's cvlm row");
+                stats.add_cum_volume += 1;
+            }
+        }
+    }
+}
+
+/// A block overlay with a shadow: every call goes to the overlay, and every
+/// write of the two CFs is also made on the shadow's `Users`.
+#[derive(Clone)]
+struct Shadow {
+    inner: NativeStateOverlay,
+    side: Arc<Mutex<ShadowSide>>,
+}
+
+impl Shadow {
+    fn mirror(&self, cf: &str, key: &[u8], value: Option<&[u8]>) {
+        self.side.lock().unwrap().mirror(cf, key, value);
+    }
+}
+
+impl StateBackend for Shadow {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        self.inner.put_cf_raw(cf, key, value)?;
+        self.mirror(cf, key, Some(value));
+        Ok(())
+    }
+    fn put_cf_raw_owned(&self, cf: &str, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
+        self.mirror(cf, key, Some(&value));
+        self.inner.put_cf_raw_owned(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.inner.delete_cf_raw(cf, key)?;
+        self.mirror(cf, key, None);
+        Ok(())
+    }
+    fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    fn iterate_cf_from(&self, cf: &str, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf_from(cf, start, limit)
+    }
+    fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        self.inner.get_cf_len(cf, key)
+    }
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf_prefix_from(cf, prefix, start, limit)
+    }
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        self.inner.prefix_exists(cf, prefix)
+    }
+    fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
+        self.inner.layer_touches(cf, prefix)
+    }
+    fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<ResidentChange>> {
+        self.inner.resident_changes(cf, prefix)
+    }
+    fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
+        self.inner.layer_keys(cf)
+    }
+    fn own_pending_row(&self, cf: &str, key: &[u8]) -> OwnPendingRow {
+        self.inner.own_pending_row(cf, key)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        self.inner.atomic_write(ops)?;
+        for op in ops {
+            match op {
+                AtomicWriteOp::Put { cf, key, value } => self.mirror(cf, key, Some(value)),
+                AtomicWriteOp::Delete { cf, key } => self.mirror(cf, key, None),
+            }
+        }
+        Ok(())
+    }
+}
+
+const P5_TRADERS: u64 = 8;
+const P5_MARKETS: u64 = 3;
+const P5_BLOCKS: u64 = 40;
+const P5_CALLS: u64 = 3;
+const P5_MID: i64 = 1_000;
+/// The trader that holds an irregular row now and then (opaque) and trades.
+const P5_ODD: u64 = P5_TRADERS - 1;
+/// The irregular row's market (no book: no fill touches it).
+const P5_ODD_MARKET: MarketId = 99;
+
+fn p5_fp(v: i64) -> FixedPoint {
+    FixedPoint::from_raw(i128::from(v) * FixedPoint::SCALE)
+}
+
+fn p5_trader(i: u64) -> Address {
+    let mut b = [0x5Au8; 20];
+    b[12..].copy_from_slice(&(i + 1).to_be_bytes());
+    Address::new(b)
+}
+
+/// What the direct writers did (`Ok` calls per writer; ADL closes made).
+#[derive(Debug, Default)]
+struct WriterStats {
+    credit: usize,
+    deposit: usize,
+    withdraw: usize,
+    transfer: usize,
+    move_collateral: usize,
+    backstop: usize,
+    adl_closes: usize,
+    cross_close: usize,
+    apply_fill: usize,
+    puts: usize,
+    raw_blocks: usize,
+    lenient: usize,
+    batch_ok: usize,
+    single_ok: usize,
+}
+
+/// The writers outside `execute_batch`, on the block's context: lockbox
+/// credit / deposit / withdrawal, the liquidation legs (transfer, collateral
+/// move, backstop, ADL to the escrow and its closes, the escrows' cross
+/// close), `apply_fill` (opens, closes, flips), position / balance / `cvlm`
+/// puts and position deletes; now and then a raw block of irregular rows
+/// over the P1 traders (who never trade), and the odd trader's lenient row.
+fn p5_direct_writes(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg, h: u64, call: u64, ws: &mut WriterStats) {
+    let pm = &ctx.positions;
+    let st = &ctx.state;
+    let px = |rng: &mut Lcg| p5_fp(P5_MID - 20 + rng.below(40) as i64);
+    for _ in 0..1 + rng.below(4) {
+        let t = p5_trader(rng.below(P5_TRADERS));
+        let other = p5_trader(rng.below(P5_TRADERS));
+        let m = 1 + rng.below(P5_MARKETS);
+        let held = pm.get_position(&t, m).unwrap();
+        match rng.below(13) {
+            0 => ws.credit += usize::from(Lockbox::credit_native(st, &t, p5_fp(1 + rng.below(5_000) as i64)).is_ok()),
+            1 => ws.deposit += usize::from(Lockbox::deposit_to_native(st, &t, p5_fp(1 + rng.below(5_000) as i64)).is_ok()),
+            2 => {
+                let amount = p5_fp(1 + rng.below(2_000) as i64);
+                ws.withdraw += usize::from(Lockbox::withdraw_from_native_to(st, &t, &other, amount).is_ok());
+            }
+            3 => {
+                if let Some(p) = held.filter(|_| t != other) {
+                    let qty = p.size.min(p5_fp(1 + rng.below(3) as i64));
+                    ws.transfer += usize::from(liquidation::transfer(pm, &t, &other, m, qty, px(rng)).is_ok());
+                }
+            }
+            4 => {
+                ws.move_collateral += usize::from(liquidation::move_collateral(pm, &t, &LIQUIDATOR_VAULT).is_ok());
+                Lockbox::credit_native(st, &t, p5_fp(500_000)).unwrap();
+            }
+            5 if rng.below(3) == 0 => {
+                let mark = px(rng);
+                ws.backstop += usize::from(liquidation::backstop(pm, &t, &LIQUIDATOR_VAULT, |_| Some(mark)).is_ok());
+                Lockbox::credit_native(st, &t, p5_fp(500_000)).unwrap();
+            }
+            6 => {
+                // ADL: the position to its escrow, then the escrow's closes
+                // against the holders of the other side.
+                if let Some(p) = held {
+                    let escrow = liquidation::adl_escrow(p.is_long);
+                    let price = px(rng);
+                    if liquidation::transfer(pm, &t, &escrow, m, p.size, price).is_err() {
+                        continue;
+                    }
+                    let ranked: Vec<AdlCandidate> = (0..P5_TRADERS)
+                        .map(p5_trader)
+                        .filter_map(|c| pm.get_position(&c, m).unwrap())
+                        .filter(|c| c.is_long != p.is_long)
+                        .map(|c| AdlCandidate {
+                            trader: c.trader,
+                            is_long: c.is_long,
+                            size: c.size,
+                            entry_price: c.entry_price,
+                            account_value: FixedPoint::ZERO,
+                        })
+                        .collect();
+                    if let Ok((closes, _, _)) = liquidation::adl_close(pm, &escrow, m, price, p.size, &ranked) {
+                        ws.adl_closes += closes.len();
+                    }
+                }
+            }
+            7 => {
+                let (long, short) = (liquidation::adl_escrow(true), liquidation::adl_escrow(false));
+                let size = |e: &Address| pm.get_position(e, m).unwrap().map_or(FixedPoint::ZERO, |p| p.size);
+                let q = size(&long).min(size(&short)).min(p5_fp(1 + rng.below(3) as i64));
+                let (pl, ps) = (px(rng), px(rng));
+                ws.cross_close += usize::from(liquidation::cross_close(pm, m, q, pl, ps, &LIQUIDATOR_VAULT).is_ok());
+            }
+            8 => match held {
+                Some(_) if rng.below(3) == 0 => pm.delete_position(&t, m).unwrap(),
+                old => {
+                    let size = p5_fp(1 + rng.below(9) as i64);
+                    let entry = px(rng);
+                    let pos = old.map(|p| Position { size: p.size + size, ..p }).unwrap_or(Position {
+                        trader: t,
+                        market_id: m,
+                        is_long: rng.below(2) == 0,
+                        size,
+                        entry_price: entry,
+                        cost_basis: entry * size,
+                        realized_pnl: FixedPoint::ZERO,
+                        isolated_margin: FixedPoint::ZERO,
+                        margin_type: MarginType::Cross,
+                    });
+                    pm.put_position(&pos).unwrap();
+                    ws.puts += 1;
+                }
+            },
+            9 => {
+                let bal = NativeBalance { available: p5_fp(100_000 + rng.below(400_000) as i64), order_margin: FixedPoint::ZERO };
+                pm.put_native_balance(&t, &bal).unwrap();
+                ws.puts += 1;
+            }
+            10 => {
+                pm.put_cum_volume(&t, p5_fp(rng.below(10_000_000) as i64)).unwrap();
+                ws.puts += 1;
+            }
+            _ => {
+                // Opens, increases, reductions, closes and flips.
+                let qty = p5_fp(1 + rng.below(12) as i64);
+                let ok = pm.apply_fill(&t, m, rng.below(2) == 0, qty, px(rng), MarginType::Cross).is_ok();
+                ws.apply_fill += usize::from(ok);
+            }
+        }
+    }
+    if rng.below(4) == 0 {
+        random_block_over(st, rng, &test_traders());
+        random_balance_block_over(st, rng, &test_traders());
+        ws.raw_blocks += 1;
+    }
+    // The odd trader's position in a market without a book, `is_long`
+    // byte 2: decodes, does not re-encode to itself (opaque while it lasts).
+    if call == 0 {
+        let odd = p5_trader(P5_ODD);
+        let key = position_key(&odd, P5_ODD_MARKET);
+        match h % 5 {
+            1 => {
+                let p = position(odd, P5_ODD_MARKET, h, true);
+                st.put_cf_raw(CF_NATIVE_POSITIONS, &key, &lenient(&p, 0)).unwrap();
+                ws.lenient += 1;
+            }
+            4 => st.delete_cf_raw(CF_NATIVE_POSITIONS, &key).unwrap(),
+            _ => {}
+        }
+    }
+}
+
+/// One call's actions: crossing and resting limits around the mid, cancel-
+/// alls, a modify of a resting order, transfers EVM <-> perp.
+fn p5_actions(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg) -> Vec<(Address, NativeAction)> {
+    (0..6 + rng.below(10))
+        .map(|_| {
+            let t = p5_trader(rng.below(P5_TRADERS));
+            let m = 1 + rng.below(P5_MARKETS);
+            let action = match rng.below(12) {
+                0 => NativeAction::CancelAllOrders { market_id: (rng.below(2) == 0).then_some(m) },
+                1 => NativeAction::TransferToPerp { amount: U256::from(1 + rng.below(50)) * U256::from(FixedPoint::SCALE as u128) },
+                2 => NativeAction::TransferToSpot { amount: U256::from(1 + rng.below(20)) * U256::from(FixedPoint::SCALE as u128) },
+                3 => match ctx.order_books.get(&m).and_then(|b| b.orders_for_trader(&t).first().map(|o| o.id)) {
+                    Some(order_id) => NativeAction::ModifyOrder {
+                        order_id,
+                        new_price: Some(p5_fp(P5_MID - 3 + rng.below(7) as i64)),
+                        new_qty: None,
+                    },
+                    None => NativeAction::CancelAllOrders { market_id: None },
+                },
+                _ => NativeAction::PlaceOrder(PlaceOrderParams {
+                    market_id: m,
+                    is_buy: rng.below(2) == 0,
+                    price: p5_fp(P5_MID - 2 + rng.below(5) as i64),
+                    quantity: p5_fp(1 + rng.below(6) as i64),
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                    reduce_only: false,
+                    client_order_id: None,
+                }),
+            };
+            (t, action)
+        })
+        .collect()
+}
+
+/// Plan Task 1.1: `dirty_rows_equal_overlay_rows_every_block`. Seeded blocks
+/// through the node's lifecycle (R attached, the block's overlay over the
+/// previous block's frozen set, flushed one block later) with every writer
+/// of the two CFs on the block's context: `execute_batch` (engine forced,
+/// sequential and parallel settle: the cache flushes, order-margin writes,
+/// `cvlm`), single actions (`place_order_inner`'s fills), cancel-alls,
+/// modifies, EVM <-> perp transfers, and [`p5_direct_writes`]. The context's
+/// backend is a [`Shadow`]: every write of the two CFs is also made on a
+/// `Users` through `UsersMut`. After every block the rows drained from its
+/// dirty sets, put into the block's frozen set without the two CFs, give
+/// exactly the overlay's frozen set (every CF, byte for byte, tombstones
+/// included), each pending row from one dirty key; and the shadow's records
+/// equal a cold build of the block's post-state.
+#[test]
+fn dirty_rows_equal_overlay_rows_every_block() {
+    let mut ws = WriterStats::default();
+    let mut ms = MutStats::default();
+    let (mut rows_checked, mut tombstones, mut opaque_blocks) = (0usize, 0usize, 0usize);
+    for seed in 1..=3u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x2545_F491);
+        for m in 1..=P5_MARKETS {
+            let row = borsh::to_vec(&("BTC".to_string(), "USDC".to_string(), p5_fp(1).raw(), p5_fp(1).raw(), p5_fp(5).raw())).unwrap();
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &row).unwrap();
+        }
+        let pm = PositionManager::new(db.clone());
+        for i in 0..P5_TRADERS {
+            let t = p5_trader(i);
+            pm.put_native_balance(&t, &NativeBalance { available: p5_fp(500_000), order_margin: FixedPoint::ZERO }).unwrap();
+            let evm = revm::state::AccountInfo { balance: U256::from(10u128.pow(36)), ..Default::default() };
+            db.put_account(&t, &evm).unwrap();
+        }
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block(&o, &mut rng);
+            random_balance_block(&o, &mut rng);
+            o.flush(&db).unwrap();
+        }
+        let side = Arc::new(Mutex::new(ShadowSide {
+            users: Users::build_from(&NativeStateOverlay::new(db.clone())).unwrap(),
+            rng: Lcg(seed),
+            stats: MutStats::default(),
+        }));
+        let mut holder = ResidentBooks::default();
+        let mut parent: Option<Arc<FrozenPending>> = None;
+        let mut books = Default::default();
+        let mut next_id: u128 = 1;
+        for h in 1..=P5_BLOCKS {
+            let tag = format!("seed {seed} block {h}");
+            let mut overlay = NativeStateOverlay::with_parent(db.clone(), parent.clone());
+            let mut rb = begin_resident(Some(&mut holder), &mut overlay, h, None);
+            assert!(rb.attached(), "{tag}: R attached");
+            let shadow = Shadow { inner: overlay.clone(), side: side.clone() };
+            let mut ctx = NativeExecContext::new(shadow, h, 10_000 + 7 * h, 0, 1_000, 10, Address::ZERO, Address::ZERO, Address::ZERO);
+            ctx.order_books = std::mem::take(&mut books);
+            ctx.next_global_order_id = next_id;
+            ctx.attach_resident_block(&mut rb);
+            for call in 0..P5_CALLS {
+                p5_direct_writes(&ctx, &mut rng, h, call, &mut ws);
+                let actions = p5_actions(&ctx, &mut rng);
+                let r = match (h + call) % 3 {
+                    0 => NativeExecutor::execute_batch_engine_mode(&mut ctx, &actions, 4),
+                    1 => NativeExecutor::execute_batch_settle_mode(&mut ctx, &actions, false),
+                    _ => NativeExecutor::execute_batch_settle_mode(&mut ctx, &actions, true),
+                };
+                ws.batch_ok += r.results.iter().filter(|x| x.success).count();
+                for (t, a) in p5_actions(&ctx, &mut rng).into_iter().take(2) {
+                    ws.single_ok += usize::from(NativeExecutor::execute(&mut ctx, &t, &a).success);
+                }
+                assert!(ctx.fatal_error.is_none(), "{tag} call {call}: {:?}", ctx.fatal_error);
+            }
+            books = std::mem::take(&mut ctx.order_books);
+            next_id = ctx.next_global_order_id;
+            ctx.detach_resident_block(&mut rb);
+            drop(ctx);
+            overlay.put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes()).unwrap();
+            let delta = overlay.own_pending_delta();
+            let frozen = overlay.freeze(h);
+
+            // The typed path's frozen set: the overlay's cold CFs, and the
+            // two CFs from the dirty sets.
+            let cold: Vec<&str> =
+                ALL_CF_NAMES.iter().copied().filter(|cf| *cf != CF_NATIVE_POSITIONS && *cf != CF_NATIVE_BALANCES).collect();
+            let mut typed = frozen.slice(&cold);
+            let mut s = side.lock().unwrap();
+            let dirty = s.users.dirty_keys();
+            s.users.drain_dirty_into(&mut typed);
+            for cf in ALL_CF_NAMES {
+                assert_eq!(typed.rows(cf), frozen.rows(cf), "{tag}: {cf}: dirty rows != the overlay's pending rows");
+            }
+            let pending = frozen.rows(CF_NATIVE_POSITIONS).len() + frozen.rows(CF_NATIVE_BALANCES).len();
+            assert_eq!(dirty, pending, "{tag}: one dirty key per pending row of the two CFs");
+            assert_eq!(s.users.dirty_keys(), 0, "{tag}: drained");
+            rows_checked += pending;
+            tombstones += [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
+                .iter()
+                .map(|cf| frozen.rows(cf).iter().filter(|(_, v)| v.is_none()).count())
+                .sum::<usize>();
+            opaque_blocks += usize::from(s.users.get(&p5_trader(P5_ODD)).is_none());
+
+            end_resident(&mut holder, rb, &mut overlay, delta, true, None);
+            if let Some(p) = parent.take() {
+                p.flush_with_native_trie_stats(&db, None, None, None).expect("flush");
+            }
+            parent = Some(frozen);
+            // In place == the block's post-state, built cold.
+            let after = Users::build_from(&NativeStateOverlay::with_parent(db.clone(), parent.clone())).unwrap();
+            assert!(s.users.same_as(&after), "{tag}: the shadow's records != a cold build of the post-state");
+            assert!(s.users.self_consistent(), "{tag}: shadow self-consistent");
+        }
+        let s = side.lock().unwrap().stats;
+        for (a, b) in [
+            (&mut ms.set_position, s.set_position),
+            (&mut ms.remove_position, s.remove_position),
+            (&mut ms.set_balance, s.set_balance),
+            (&mut ms.add_cum_volume, s.add_cum_volume),
+            (&mut ms.put_row, s.put_row),
+            (&mut ms.opaque_typed, s.opaque_typed),
+        ] {
+            *a += b;
+        }
+    }
+    println!("P5 T1.1 writers {ws:?}; UsersMut {ms:?}; rows {rows_checked}, tombstones {tombstones}, odd opaque blocks {opaque_blocks}");
+    assert!(rows_checked > 5_000 && tombstones > 300, "non-vacuous: rows {rows_checked}, tombstones {tombstones}");
+    assert!(
+        ms.set_position > 500 && ms.remove_position > 100 && ms.set_balance > 500 && ms.add_cum_volume > 100 && ms.put_row > 1_000,
+        "every UsersMut call: {ms:?}"
+    );
+    assert!(ms.opaque_typed > 20 && opaque_blocks > 10, "typed calls on an opaque trader: {ms:?}, {opaque_blocks}");
+    assert!(
+        ws.credit > 10 && ws.deposit > 10 && ws.withdraw > 10 && ws.transfer > 10 && ws.move_collateral > 5 && ws.backstop > 2,
+        "lockbox and liquidation writers: {ws:?}"
+    );
+    assert!(ws.adl_closes > 5 && ws.cross_close > 0 && ws.apply_fill > 50, "ADL, cross close, fills: {ws:?}");
+    assert!(ws.batch_ok > 500 && ws.single_ok > 50 && ws.raw_blocks > 10 && ws.lenient > 5, "{ws:?}");
+}
+
+/// One mutation of [`dirty_rows_sorted_and_once`].
+#[derive(Clone, Debug)]
+enum P5Op {
+    SetPosition(Position),
+    RemovePosition(Address, MarketId),
+    SetBalance(Address, NativeBalance),
+    AddCumVolume(Address, FixedPoint),
+    Raw(usize, Vec<u8>, Option<Vec<u8>>),
+}
+
+impl P5Op {
+    /// The CF slot and key it writes.
+    fn key(&self) -> (usize, Vec<u8>) {
+        match self {
+            P5Op::SetPosition(p) => (POSITIONS, position_key(&p.trader, p.market_id).to_vec()),
+            P5Op::RemovePosition(t, m) => (POSITIONS, position_key(t, *m).to_vec()),
+            P5Op::SetBalance(t, _) => (BALANCES, t.to_vec()),
+            P5Op::AddCumVolume(t, _) => (BALANCES, cum_volume_key(t).to_vec()),
+            P5Op::Raw(slot, k, _) => (*slot, k.clone()),
+        }
+    }
+
+    /// On the record set (`false`: the call was refused, nothing changed).
+    fn on_users(&self, u: &mut Users) -> bool {
+        let mut w = u.mutate();
+        match self {
+            P5Op::SetPosition(p) => w.set_position(p.clone()),
+            P5Op::RemovePosition(t, m) => w.remove_position(t, *m),
+            P5Op::SetBalance(t, b) => w.set_balance(t, b.clone()),
+            P5Op::AddCumVolume(t, x) => return w.add_cum_volume(t, *x).is_ok(),
+            P5Op::Raw(slot, k, v) => w.put_row(*slot, k, v.as_deref()),
+        }
+        true
+    }
+
+    /// The same write through an overlay (`false`: refused, as above).
+    fn on_overlay(&self, o: &NativeStateOverlay) -> bool {
+        let pm = PositionManager::new(o.clone());
+        match self {
+            P5Op::SetPosition(p) => pm.put_position(p).unwrap(),
+            P5Op::RemovePosition(t, m) => pm.delete_position(t, *m).unwrap(),
+            P5Op::SetBalance(t, b) => pm.put_native_balance(t, b).unwrap(),
+            P5Op::AddCumVolume(t, x) => match pm.get_cum_volume(t) {
+                Ok(v) => pm.put_cum_volume(t, v + *x).unwrap(),
+                Err(_) => return false,
+            },
+            P5Op::Raw(slot, k, v) => {
+                let cf = if *slot == POSITIONS { CF_NATIVE_POSITIONS } else { CF_NATIVE_BALANCES };
+                match v {
+                    Some(v) => o.put_cf_raw(cf, k, v).unwrap(),
+                    None => o.delete_cf_raw(cf, k).unwrap(),
+                }
+            }
+        }
+        true
+    }
+}
+
+/// A random mutation of trader `t` (the P1 rows' traders): typed calls and
+/// raw rows of every shape (irregular position / balance / `cvlm` rows,
+/// keys under no trader).
+fn p5_random_op(rng: &mut Lcg, t: Address) -> P5Op {
+    let m = 1 + rng.below(MARKETS);
+    let raw = rng.below(1_000);
+    match rng.below(14) {
+        0..=2 => P5Op::SetPosition(position(t, m, raw, rng.below(2) == 0)),
+        3 | 4 => P5Op::RemovePosition(t, m),
+        5 | 6 => P5Op::SetBalance(t, balance(raw)),
+        7 | 8 => P5Op::AddCumVolume(t, FixedPoint::from_raw(i128::from(raw) - 300)),
+        9 => P5Op::Raw(POSITIONS, position_key(&t, m).to_vec(), Some(lenient(&position(t, m, raw, true), rng.below(3)))),
+        10 => P5Op::Raw(BALANCES, cum_volume_key(&t).to_vec(), Some(vec![0u8; 17])),
+        11 => P5Op::Raw(BALANCES, t.to_vec(), (rng.below(2) == 0).then(|| bal_bytes(&balance(raw)))),
+        12 => P5Op::Raw(POSITIONS, t.as_slice()[..7].to_vec(), (rng.below(2) == 0).then(|| vec![7, 7])),
+        _ => P5Op::Raw(BALANCES, [b"cvlx".as_slice(), t.as_slice()].concat(), (rng.below(2) == 0).then(|| vec![1; 16])),
+    }
+}
+
+/// Plan Task 1.1: `dirty_rows_sorted_and_once`. From P1-like rows (every
+/// kind of row, opaque traders), a set of mutations — typed calls and raw
+/// rows of every shape, many keys written several times — is applied in
+/// several interleavings (each key's own mutations keep their order, the
+/// keys' are interleaved: key order, reverse key order, random). Every
+/// interleaving drains the same rows; each changed key appears once, in
+/// strictly ascending `(cf_id, key)` order (positions before balances, keys
+/// byte-wise: a `cvlm ‖ t` row among the 20-byte balance rows); one row per
+/// dirty key; the record set is left self-consistent and equal to a cold
+/// build of its rows; a second drain is empty; and the rows equal an
+/// overlay's pending rows after the same writes.
+#[test]
+fn dirty_rows_sorted_and_once() {
+    let (pos_id, bal_id) = (hashed_cf_id(CF_NATIVE_POSITIONS).unwrap(), hashed_cf_id(CF_NATIVE_BALANCES).unwrap());
+    assert!(pos_id < bal_id, "positions sort before balances");
+    let (mut drained, mut refused) = (0usize, 0usize);
+    for seed in 1..=6u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let mut rng = Lcg(seed * 0x9E37_79B9);
+        for _ in 0..4 {
+            let o = NativeStateOverlay::new(db.clone());
+            random_block_over(&o, &mut rng, &step2_traders());
+            random_balance_block_over(&o, &mut rng, &step2_traders());
+            o.flush(&db).unwrap();
+        }
+        let rows = ResidentRows::build(&db).unwrap();
+        // Per key, its mutations in order.
+        let mut per_key: BTreeMap<(usize, Vec<u8>), Vec<P5Op>> = BTreeMap::new();
+        let traders = step2_traders();
+        for _ in 0..120 {
+            let t = traders[rng.below(traders.len() as u64) as usize];
+            let op = p5_random_op(&mut rng, t);
+            per_key.entry(op.key()).or_default().push(op);
+        }
+        let keys: Vec<(usize, Vec<u8>)> = per_key.keys().cloned().collect();
+        let mut runs: Vec<DirtyRows> = Vec::new();
+        for order in 0..5 {
+            let mut lists: Vec<std::collections::VecDeque<P5Op>> = per_key.values().cloned().map(Into::into).collect();
+            if order == 1 {
+                lists.reverse();
+            }
+            let mut users = Users::build(&rows);
+            let mut seen = 0;
+            while lists.iter().any(|l| !l.is_empty()) {
+                let live: Vec<usize> = (0..lists.len()).filter(|&i| !lists[i].is_empty()).collect();
+                let i = if order < 2 { live[0] } else { live[rng.below(live.len() as u64) as usize] };
+                let op = lists[i].pop_front().unwrap();
+                seen += 1;
+                if !op.on_users(&mut users) {
+                    refused += 1;
+                }
+            }
+            assert_eq!(seen, 120);
+            let n = users.dirty_keys();
+            let d = users.drain_dirty();
+            let seq: Vec<(u8, &[u8])> = d
+                .positions
+                .iter()
+                .map(|(k, _)| (pos_id, k.as_slice()))
+                .chain(d.balances.iter().map(|(k, _)| (bal_id, k.as_slice())))
+                .collect();
+            assert!(seq.windows(2).all(|w| w[0] < w[1]), "seed {seed} order {order}: strictly ascending (cf_id, key)");
+            assert!(seq.len() <= keys.len() && seq.len() == n, "seed {seed} order {order}: one row per dirty key");
+            assert_eq!(users.dirty_keys(), 0, "seed {seed} order {order}: drained");
+            assert_eq!(users.drain_dirty(), DirtyRows::default(), "seed {seed} order {order}: a second drain is empty");
+            assert!(users.self_consistent(), "seed {seed} order {order}: self-consistent");
+            drained += seq.len();
+            runs.push(d);
+        }
+        for (i, r) in runs.iter().enumerate().skip(1) {
+            assert_eq!(r, &runs[0], "seed {seed}: interleaving {i} drains other rows than key order");
+        }
+        // The same writes through an overlay, in key order.
+        let o = NativeStateOverlay::new(db.clone());
+        for op in per_key.values().flatten() {
+            op.on_overlay(&o);
+        }
+        let frozen = o.freeze(1);
+        let typed = &runs[0];
+        assert_eq!(frozen.rows(CF_NATIVE_POSITIONS), typed.positions, "seed {seed}: positions vs the overlay");
+        assert_eq!(frozen.rows(CF_NATIVE_BALANCES), typed.balances, "seed {seed}: balances vs the overlay");
+    }
+    println!("P5 T1.1 sorted-and-once: rows drained {drained}, refused calls {refused}");
+    assert!(drained > 2_000 && refused > 0, "non-vacuous: {drained}, {refused}");
+}
+
+/// Plan Task 1.1: `opaque_trader_stays_raw`. A trader with an irregular row
+/// keeps its rows raw: typed writes to it (position set and removed,
+/// balance, `cvlm` added) change its raw rows, and the drain serializes none
+/// of its rows from a record (its lenient row comes out byte for byte, `is_long`
+/// byte 2 kept). A regular trader written typed and then given an irregular
+/// row in the same block turns opaque: its earlier typed rows drain raw too.
+/// Once its irregular row is gone the trader is regular again and drains
+/// from its record. `add_cum_volume` on a 17-byte `cvlm` row is refused and
+/// changes nothing.
+#[test]
+fn opaque_trader_stays_raw() {
+    let (a, b, c) = (trader(0), trader(1), trader(2));
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    let put = |cf, k: &[u8], v: &[u8]| db.put_cf_raw(cf, k, v).unwrap();
+    put(CF_NATIVE_POSITIONS, &position_key(&a, 1), &bytes(&position(a, 1, 3, true)));
+    put(CF_NATIVE_BALANCES, a.as_slice(), &bal_bytes(&balance(4)));
+    put(CF_NATIVE_POSITIONS, &position_key(&b, 1), &bytes(&position(b, 1, 6, false)));
+    let odd = lenient(&position(b, 7, 8, true), 0);
+    put(CF_NATIVE_POSITIONS, &position_key(&b, 7), &odd);
+    put(CF_NATIVE_BALANCES, b.as_slice(), &bal_bytes(&balance(9)));
+    put(CF_NATIVE_BALANCES, &cum_volume_key(&b), &volume_bytes(40));
+    put(CF_NATIVE_POSITIONS, &position_key(&c, 2), &bytes(&position(c, 2, 1, true)));
+    put(CF_NATIVE_BALANCES, &cum_volume_key(&c), &[0u8; 17]);
+    let mut users = Users::build(&ResidentRows::build(&db).unwrap());
+    assert!(users.get(&a).is_some() && users.get(&b).is_none() && users.get(&c).is_none(), "a regular, b and c opaque");
+
+    // Typed writes to opaque b stay raw.
+    let pb = position(b, 2, 11, false);
+    let mut w = users.mutate();
+    w.set_position(pb.clone());
+    w.remove_position(&b, 1);
+    w.remove_position(&b, 5); // no row: a tombstone all the same
+    w.set_balance(&b, balance(12));
+    w.add_cum_volume(&b, FixedPoint::from_raw(2)).unwrap();
+    let odd2 = lenient(&position(b, 7, 13, true), 0);
+    w.put_row(POSITIONS, &position_key(&b, 7), Some(&odd2));
+    assert!(users.get(&b).is_none(), "b stays opaque");
+    let before = Users::drain_sources();
+    let d = users.drain_dirty();
+    let after = Users::drain_sources();
+    assert_eq!(after.0 - before.0, 0, "no row of opaque b serialized from a record");
+    assert_eq!(after.1 - before.1, 4, "b's four rows drained raw");
+    assert_eq!(
+        d.positions,
+        vec![
+            (position_key(&b, 1).to_vec(), None),
+            (position_key(&b, 2).to_vec(), Some(bytes(&pb))),
+            (position_key(&b, 5).to_vec(), None),
+            (position_key(&b, 7).to_vec(), Some(odd2.clone())),
+        ]
+    );
+    assert_eq!(odd2[1 + 20 + 8], 2, "the lenient byte is kept");
+    assert_eq!(
+        d.balances,
+        vec![(b.to_vec(), Some(bal_bytes(&balance(12)))), (cum_volume_key(&b).to_vec(), Some(volume_bytes(42)))]
+    );
+
+    // Regular a: a typed write, then an irregular row in the same block.
+    let pa = position(a, 3, 5, true);
+    let odd_a = lenient(&position(a, 4, 6, false), 1);
+    users.mutate().set_position(pa.clone());
+    assert!(users.get(&a).is_some());
+    users.mutate().put_row(POSITIONS, &position_key(&a, 4), Some(&odd_a));
+    assert!(users.get(&a).is_none(), "a turned opaque");
+    let before = Users::drain_sources();
+    let d = users.drain_dirty();
+    let after = Users::drain_sources();
+    assert_eq!((after.0 - before.0, after.1 - before.1), (0, 2), "a's rows drained raw");
+    assert_eq!(
+        d.positions,
+        vec![(position_key(&a, 3).to_vec(), Some(bytes(&pa))), (position_key(&a, 4).to_vec(), Some(odd_a))]
+    );
+    assert!(d.balances.is_empty());
+
+    // b's irregular row deleted: b is regular again, drained from its record.
+    users.mutate().put_row(POSITIONS, &position_key(&b, 7), None);
+    assert!(users.get(&b).is_some(), "b regular again");
+    users.mutate().set_balance(&b, balance(14));
+    let before = Users::drain_sources();
+    let d = users.drain_dirty();
+    let after = Users::drain_sources();
+    assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0), "b's balance drained from its record");
+    assert_eq!(d.positions, vec![(position_key(&b, 7).to_vec(), None)]);
+    assert_eq!(d.balances, vec![(b.to_vec(), Some(bal_bytes(&balance(14))))]);
+
+    // A 17-byte `cvlm` row: the add is refused, nothing changes.
+    let rows_before = users.encode_rows(CF_NATIVE_BALANCES);
+    assert!(users.mutate().add_cum_volume(&c, FixedPoint::from_raw(1)).is_err());
+    assert_eq!(users.dirty_keys(), 0, "a refused add marks nothing");
+    assert_eq!(users.encode_rows(CF_NATIVE_BALANCES), rows_before);
+    assert!(users.self_consistent());
+}
+
+/// Plan section 3 "Order" (step 1 measures): a block's dirty keys in a
+/// `BTreeSet` vs a hash set sorted at the drain. ~120k position keys over
+/// 60k distinct `(trader, market)` and 40k balance keys over 20k traders
+/// (about a 300-market native block at ~49k fills), inserted in fill order,
+/// then emitted sorted. Ignored: a timing, not a check.
+#[test]
+#[ignore = "ubench: run with --ignored --nocapture"]
+fn ubench_dirty_set_btree_vs_hash_sort() {
+    let mut rng = Lcg(7);
+    let traders: Vec<Address> = (0..20_000u64).map(|i| {
+        let mut b = [0u8; 20];
+        b[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+        Address::new(b)
+    }).collect();
+    let pos: Vec<(Address, MarketId)> =
+        (0..120_000).map(|_| (traders[rng.below(20_000) as usize], rng.below(300))).collect();
+    let bal: Vec<Address> = (0..40_000).map(|_| traders[rng.below(20_000) as usize]).collect();
+    let best = |f: &dyn Fn() -> usize| (0..7).map(|_| {
+        let t = std::time::Instant::now();
+        std::hint::black_box(f());
+        t.elapsed()
+    }).min().unwrap();
+    let btree = best(&|| {
+        let mut p = BTreeSet::new();
+        let mut b = BTreeSet::new();
+        pos.iter().for_each(|k| { p.insert(*k); });
+        bal.iter().for_each(|k| { b.insert(*k); });
+        p.iter().count() + b.iter().count()
+    });
+    let hash = best(&|| {
+        let mut p: HashSet<(Address, MarketId)> = HashSet::default();
+        let mut b: HashSet<Address> = HashSet::default();
+        pos.iter().for_each(|k| { p.insert(*k); });
+        bal.iter().for_each(|k| { b.insert(*k); });
+        let mut p: Vec<_> = p.into_iter().collect();
+        let mut b: Vec<_> = b.into_iter().collect();
+        p.sort_unstable();
+        b.sort_unstable();
+        p.len() + b.len()
+    });
+    println!("DIRTY SET ubench: {} position + {} balance inserts: BTreeSet {:?}, hash set + sort {:?}", pos.len(), bal.len(), btree, hash);
 }
