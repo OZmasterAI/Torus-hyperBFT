@@ -12235,6 +12235,123 @@ fills 2.84 vs 3.05). Net -12.4% matched/s at 10 EVM tx/s.
   (`q5c-spec.json`, `ozarchy-q5c-campaign.sh`, `q5c-checks.sh`), analysis `ozarchy-q5c-run/analysis/`
   (`q5-analysis.txt`, `q5-cells.{txt,json}`, `q5-minutes.txt`, `q5-gaps.txt`; scripts `ozarchy-q5c-tools/analyst/`).
 
+## 81. Q8: item 6 Phase 5 step 0 profile, oracle on vs off, on-CPU + off-CPU stacks, 300 markets, 120 s cells, n = 2 (campaign ozarchy-q8p2, main `e3d11cb9`, archy, 2026-10-17)
+
+**Exec on-CPU is ~131 ms per native block with the oracle on and ~149 ms off (busy 75-80%). The Step 0 items, as
+inclusive shares of the exec thread (ON / OFF): cache `flush_all` 11% (14-17 ms), hashing (Keccak) 10-11%, malloc/free
+6%, `save_order_books` 6-7% (8-10 ms), `put_cf_raw*` 5.4% (7-8 ms), borsh 5%, `merge_disjoint` 4% (5-6 ms), `BTreeMap`
+insert 3.5-4%, `open_order_counts` 1.1%; `BlockSums` and `diff_stop_rows` ~0. Off-CPU (first measurement): the exec
+thread is off 20-26% of wall, mostly waiting on its own worker pool (match setup ~1 s and `run_jobs` ~0.6 s per 15 s),
+plus one ~1 s `pipeline_barrier` wait per 15 s window in 3 of 4 cells; hotstuff-algo is blocked on the full exec
+channel 9-35% of wall (exec backpressure). Oracle off: +4.0% matched/s (all 8 cells). Profile only, n = 2 per arm, one host; ms
+from 499 Hz samples are estimates.**
+
+Question (bench queue Q8 = `docs/plans/item6-phase5-impl.md` "Step 0"): the exec-thread share and ms per native block
+of the Phase 5 targets, oracle on and off, to size Phase 5 against its stop rule.
+
+### 81.1 Setup
+
+Binary M = main `e3d11cb9` (node md5 `bf720f9f`, staged `ozarchy-s64-stage/m-run`, = staged on all 3 nodes). Tools
+frozen from main `262470e8` (harness fixes `7aceb57e` in; no newer binary needed). Shape hsdb-300m as Q5 (Classic, 15 s
+checkpoints, 300 markets, BLOCK_CAP 400, MAX_IN_FLIGHT 4, commit tail), genesis N = 11 (`01168566`), D/M/T on, resend
+250. Arms: ON / OFF = oracle feed on / off; P = the same plus the perf sidecar on val1. Order r1 ONP, ON, OFFP, OFF;
+r2 OFF, OFFP, ON, ONP; warm-up w1 ON 120 s; 120 s cells. `perf_event_paranoid=1` for this campaign only (owner +
+18c s66), checked by the driver at the start and end of every cell.
+
+Perf windows on val1 (`perf-sidecar.sh`): W1 35-80 s `cycles:u` whole process (section 64 / p4s0 windows, comparable),
+W2 82-102 s exec thread 5 events, and new **W3 12-27 s off-CPU**: `perf record -e cycles/freq=499/ -e
+context-switches/period=1/ -g --call-graph fp --switch-events` (kernel + user stacks at every switch, 0 lost samples,
+~140 MB per cell, ~32k switches/s). Without root, `sched:sched_switch` (tracefs is 700 root) and `--off-cpu` (BPF)
+fail; `context-switches` records 0 samples at paranoid 2. Smoke 1 failed its perf check (W3 overran W1 by 6 s);
+W3 was moved to 12 s and smoke 2 passed.
+
+Validity: 9 / 9 cells + smoke rc 0, ACCEPT AGREE, md5 `bf720f9f` on 3 nodes, 0 CHECK FAIL, 0 CELL-FLAG, 0 HARD FINDING.
+Perf overhead within +-1% between paired P and non-P arms.
+
+### 81.2 Cells (`cells.txt`)
+
+| cell | matched/s | blk/s | native blk/s | fills / native blk | chain ms | CPU-s / 1M | timeouts |
+|---|---|---|---|---|---|---|---|
+| r1-ONP | 241,204 | 5.9 | 5.85 | 35,811 | 144.2 | 23.06 | 0 |
+| r1-ON | 241,075 | 5.8 | 5.81 | 37,325 | 150.2 | 22.79 | 0 |
+| r1-OFFP | 250,487 | 6.2 | 4.84 | 50,508 | 195.8 | 22.58 | 0 |
+| r1-OFF | 253,787 | 6.3 | 4.94 | 49,135 | 191.6 | 22.49 | 0 |
+| r2-OFF | 248,808 | 6.4 | 4.72 | 51,301 | 201.5 | 22.60 | 0 |
+| r2-OFFP | 248,700 | 6.3 | 4.74 | 52,214 | 205.3 | 22.87 | 0 |
+| r2-ON | 238,221 | 5.7 | 5.65 | 38,247 | 154.8 | 22.83 | 1 |
+| r2-ONP | 242,385 | 5.5 | 5.55 | 40,852 | 162.4 | 22.82 | 0 |
+
+w1 (ON) 239,845. no_proposal 0 in every cell. Means: ON 240.7k, OFF 250.4k matched/s, OFF +4.0% over all 8 cells (+4.9% in the
+non-perf cells, 251.3k vs 239.6k; +3.2% in the perf cells, 249.6k vs 241.8k). Block rate is indicative only (120 s cells). OFF runs fewer, bigger
+native blocks (~4.8 / s at ~50k fills vs ~5.7 / s at ~37k) and has empty blocks (1.4-1.7 / s; ON 0).
+
+### 81.3 Step 0 items, exec thread (W1, inclusive share / ms per native block; `profile-summary.txt`)
+
+| item | r1-ONP | r2-ONP | r1-OFFP | r2-OFFP |
+|---|---|---|---|---|
+| exec on-CPU ms / native block (busy) | 132.9 (80%) | 130.5 (78%) | 148.2 (76%) | 149.3 (75%) |
+| cache `flush_all` | 11.0% / 14.6 | 10.8% / 14.1 | 11.6% / 17.2 | 11.6% / 17.3 |
+| hash (Keccak; callers lost, asm without frame pointers) | 10.7% / 14.2 | 10.3% / 13.4 | 11.3% / 16.8 | 11.2% / 16.7 |
+| malloc / free | 5.9% / 7.9 | 6.3% / 8.3 | 6.3% / 9.4 | 6.2% / 9.2 |
+| `save_books` / `save_order_books` | 6.0% / 8.0 | 5.9% / 7.7 | 6.7% / 9.9 | 6.6% / 9.9 |
+| liquidation | 5.6% / 7.5 | 6.1% / 7.9 | 1.8% / 2.6 | 1.7% / 2.5 |
+| `put_cf_raw*` / `delete_cf_raw` | 5.4% / 7.2 | 5.3% / 6.9 | 5.6% / 8.4 | 5.4% / 8.0 |
+| borsh encode / serialize | 5.1% / 6.8 | 4.9% / 6.4 | 5.5% / 8.1 | 5.4% / 8.0 |
+| `merge_disjoint` | 3.8% / 5.1 | 4.0% / 5.2 | 4.3% / 6.3 | 4.0% / 5.9 |
+| `BTreeMap` insert | 3.4% / 4.5 | 3.7% / 4.8 | 3.5% / 5.2 | 4.0% / 5.9 |
+| `open_order_counts` | 1.1% / 1.5 | 1.2% / 1.5 | 1.2% / 1.7 | 1.1% / 1.6 |
+| rocksdb / checkpoint / oracle | 0.9 / 0.7 / 0.6% | 0.6 / 0.5 / 0.5% | 0.5 / 0.4 / 0.2% | 0.6 / 0.8 / 0.1% |
+| `BlockSums::base` / `sums_with_changes`, `diff_stop_rows` | ~0 | 0.1% / 0.1 | ~0 | ~0 |
+
+Shares are inclusive and overlap (borsh and `BTreeMap` run inside `put_cf_raw*` callers; malloc inside all), so they do
+not add up. Phase table (val0, `phase-val0.txt`, ON / OFF): engine 109-122 / 140-150 ms per block (settle cache_flush
+13.9-15.7 / 19.1-20.4), save_books 7.9-8.7 / 10.7-11.3, `end_resident` 12.2-13.5 / 16.2-17.2 ms off-chain with exec
+wait 0.5-0.7 / 0.7-1.1, checkpoint settle wait 2.9-3.3 / 3.9-4.2, upkeep 0.4-0.7 / 0.6-0.8, **residual untimed 12.9-15.9
+(9-10%) / 21.2-24.3 (11-12%)**. Not covered here: 10-market cells (engine ms per 1k fills; not in the Q8 spec), sessions
+reads, and the commit-interval p99 decomposition (section 9).
+
+### 81.4 Off-CPU (W3, 15 s, val1)
+
+| | r1-ONP | r2-ONP | r1-OFFP | r2-OFFP |
+|---|---|---|---|---|
+| **exec** off-CPU | 3.08 s (20%) | 3.38 s (22%) | 3.88 s (26%) | 3.68 s (24%) |
+| pool wait: match_parallel_setup | 1.00 s | 0.95 s | 1.01 s | 0.91 s |
+| pool wait: run_jobs (batch phases) | 0.60 s | 0.57 s | 0.62 s | 0.64 s |
+| pool wait: rayon join / bridge | 0.29 s | 0.21 s | 0.28 s | 0.25 s |
+| `pipeline_barrier` / flush `wait_idle` (n = 1) | 0.09 s | 0.75 s | 1.15 s | 0.98 s |
+| checkpoint layer recv (settle wait) | 0.36 s | 0.30 s | 0.31 s | 0.28 s |
+| preempt / irq | 0.45 s | 0.43 s | 0.30 s | 0.40 s |
+| **hotstuff-algo** off-CPU | 11.00 s (72%) | 11.49 s (76%) | 11.19 s (74%) | 11.36 s (75%) |
+| idle: hotstuff event recv | 5.31 s (35%) | 5.33 s (35%) | 8.89 s (59%) | 4.84 s (32%) |
+| exec channel full: send `CommittedBlockMsg` | 4.50 s (30%) | 5.00 s (33%) | 1.37 s (9%) | 5.35 s (35%) |
+| mempool lock: `remove_committed_native` | 0.62 s | 0.30 s | 0.47 s | 0.35 s |
+| rocksdb write / WAL | 0.15 s | 0.55 s | 0.13 s | 0.53 s |
+
+hotstuff-algo on-CPU is 36-44 ms per native block (busy 22%), 41% of it in Keccak. The single `pipeline_barrier` wait
+per window is INFERRED to be the epoch boundary (every 100 heights; `TORUS_EPOCH_FAST_PATH` off on M); ~1 s per 15 s is
+~10-14 ms per native block, the size of most of the residual untimed above (not checked per height).
+
+### 81.5 Reading for Phase 5
+
+* The overlay-write items Phase 5 targets (`put_cf_raw*`, borsh, `BTreeMap`, `flush_all`, `merge_disjoint`,
+  `save_order_books`) are 5-11% each; their ms per native block overlap, so the removable total is below their sum
+  (~46 ms ON / ~55 ms OFF as an upper bound). The stop rule's gate ms is still TBD (Gate 3); owner applies it.
+* Two items outside the plan list are as big: hashing 10-11% (callers unknown) and malloc 6%.
+* The exec thread is not only CPU-bound: ~2 s per 15 s goes to waiting on its worker pool, and consensus stalls on the
+  full exec channel for up to a third of wall. Campaign A's F arm (epoch fast path) tests the `pipeline_barrier` lead.
+
+### 81.6 Next
+
+* Owner: Phase 5 scope against the stop rule (decision 9).
+* If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default after campaign A, re-check the checkpoint and save-books rows here
+  (short re-run, bench queue).
+* Data: `~/bench-results-matched/ozarchy-q8p2-300m-{w1,r1-ONP,r1-ON,r1-OFFP,r1-OFF,r2-OFF,r2-OFFP,r2-ON,r2-ONP,
+  smoke-s0,smoke-s0-try1}`, campaign files `ozarchy-q8p2-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`,
+  `smoke-try1/`), tools `ozarchy-q8p2-tools/` (`q8p-spec.json`, `ozarchy-q8p2-campaign.sh`, `perf-sidecar.sh`,
+  `q8p-checks.sh`, `FROZEN.txt`), analysis `ozarchy-q8p2-run/analysis/` (`profile-summary.txt`, `cells.txt`,
+  `phase-val0.txt`, per-window `*-w{1,2,3}.{txt,json}`), scripts `ozarchy-q8p2-analyst/`. The stopped s64 attempt
+  (`ozarchy-q8p-*`) is kept; its smoke passed (236.2k matched/s).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

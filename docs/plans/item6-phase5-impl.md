@@ -181,7 +181,8 @@ Add the **commit-interval p99 decomposition** (section 9), queued for archy afte
 **Stop rule:** step 0's removable ms per native block x 0.4% must reach the ms the phase gate needs (**TBD (Gate 3)**,
 section 1 table). If it does not, the owner re-scopes (decision 9) before any code.
 
-**Measured:** TBD (step 0, after Phase 4 step 6 and Gate 3).
+**Measured:** archy s66, campaign ozarchy-q8p2 on main `e3d11cb9`: `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md`
+section 81 (oracle on / off, on-CPU + off-CPU; 10-market cells and the commit-interval p99 decomposition not run).
 
 ### Step 1: typed writes and rows at freeze, shadow only
 
