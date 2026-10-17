@@ -1122,10 +1122,6 @@ impl EthApiServer for RpcState {
         } else {
             BlockEnvCfg::default()
         };
-        // Binary search invariant: `lo` fails, `hi` succeeds. Below the 21000
-        // intrinsic gas every tx fails, so 20999 is the failing bound and
-        // 21000 itself is tried (a plain transfer estimates exactly 21000).
-        let mut lo: u64 = 21_000 - 1;
         let mut hi: u64 = block_env.gas_limit;
         let mut tx_env = build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
         // FIX 13 (EVM-PF-18): Default nonce to account's current nonce.
@@ -1143,7 +1139,7 @@ impl EthApiServer for RpcState {
         // D2 (S392): call-simulation mode — see `call` above.
         let (result, _) = self
             .executor
-            .execute_call(&self.state, &block_env, tx_env)
+            .execute_call(&self.state, &block_env, tx_env.clone())
             .map_err(|e| err(RpcError::Evm(e.to_string())))?;
         // FIX 8 (EVM-FIND-10): Return error on revert instead of gas used.
         // FIX 15: Include revert reason in error data.
@@ -1156,14 +1152,29 @@ impl EthApiServer for RpcState {
                 },
             }));
         }
+        // Binary search, as geth's `eth/gasestimator` `Estimate`. Invariant:
+        // `lo` fails, `hi` succeeds. The gas the run at the cap used
+        // lower-bounds the limit (geth `lo = result.UsedGas - 1`; it covers
+        // the intrinsic gas, so no tried limit fails pre-execution): a plain
+        // transfer estimates exactly 21000. A run that FAILS at a tried limit
+        // (out of gas, or a revert that only happens with less gas, e.g. an
+        // inner call starved by the 63/64 rule) raises `lo`; an ERROR (a DB
+        // read error, an internal error: not about gas) returns at once,
+        // never a gas value. Every try is the cap's tx with only the limit
+        // changed (same defaulted nonce).
+        let mut lo: u64 = result.gas_used.saturating_sub(1).max(21_000 - 1);
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            let mut tx_env =
-                build_call_tx_env(&tx, self.chain_id, block_env.gas_limit).map_err(err)?;
-            tx_env.gas_limit = mid;
-            match self.executor.execute_call(&self.state, &block_env, tx_env) {
-                Ok((r, _)) if r.success => hi = mid,
-                _ => lo = mid,
+            let mut try_env = tx_env.clone();
+            try_env.gas_limit = mid;
+            let (r, _) = self
+                .executor
+                .execute_call(&self.state, &block_env, try_env)
+                .map_err(|e| err(RpcError::Evm(e.to_string())))?;
+            if r.success {
+                hi = mid;
+            } else {
+                lo = mid;
             }
         }
         Ok(hex_u64(hi))
