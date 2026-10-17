@@ -10,8 +10,9 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from health import (COMMITTED, MEMPOOL, EXEC_QUEUE, FLUSH, FLOW, NODES, TRADE_WRITER,
-                    CHAIN_SUM, CHAIN_COUNT, DrainTracker, acceptance, assess_liveness,
-                    feed_live_rows, feed_live_summary, parse_metrics)
+                    CHAIN_SUM, CHAIN_COUNT, EXEC_HEIGHT, DrainTracker, acceptance,
+                    assess_liveness, committed_height, feed_live_rows, feed_live_summary,
+                    height_target, parse_metrics)
 from test_harness import BENCH_START, run_summarize, write_agreement, write_cell
 from collect_logs import collect
 
@@ -376,6 +377,143 @@ class FeedLiveHttpTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+
+def hsample(height, queue=1, commits=None, flow=1000):
+    """sample() plus the executed height (torus_block_height, set by the exec
+    thread after each block); commits default to the height."""
+    s = sample(height if commits is None else commits, exec_queue=queue, flow=flow)
+    s[EXEC_HEIGHT] = height
+    return s
+
+
+class SettleToHeightTest(unittest.TestCase):
+    """s64: the paused-feed settle (run-cell feed-stop-settle/) waits for a
+    height, not a fixed 60 s: target = the highest committed height across the
+    nodes at feed stop (executed + exec queue); done once every node has
+    executed it and the chain is quiet; rc != 0 if not within the max."""
+
+    def test_target_is_the_highest_committed_height_across_nodes(self):
+        nodes = [hsample(500, queue=60), hsample(530, queue=2), hsample(520, queue=0)]
+        self.assertEqual(height_target(nodes), 560)
+        self.assertEqual(committed_height(nodes[1]), 532)
+
+    def test_target_needs_a_complete_trio(self):
+        nodes = [hsample(500), hsample(510), hsample(505)]
+        del nodes[1][EXEC_HEIGHT]
+        self.assertIsNone(height_target(nodes))
+        self.assertIsNone(height_target(nodes[:2]))
+        nodes = [hsample(500), hsample(510), dict(hsample(505), scrape_valid=0)]
+        self.assertIsNone(height_target(nodes))
+
+    def test_keeps_waiting_while_any_node_is_behind_the_target(self):
+        tracker = DrainTracker(10, min_height=300)
+        # quiet and advancing for far longer than the quiet window, but val1
+        # executes 1 block/s from 200: below the target until t=100
+        for t in range(100):
+            nodes = [hsample(300 + t), hsample(200 + t), hsample(300 + t)]
+            r = tracker.observe(t, nodes)
+            self.assertFalse(r['drained'], t)
+        self.assertIn('height 300', r['reason'])
+        self.assertIn('val1', r['reason'])
+
+    def test_drains_once_every_node_reached_the_target_and_is_quiet(self):
+        tracker = DrainTracker(10, min_height=300)
+        results = [tracker.observe(t, [hsample(290 + t) for _ in NODES]) for t in range(30)]
+        drained = [t for t, r in enumerate(results) if r['drained']]
+        # heights reach 300 at t=10; quiet since t=0, so done right then
+        self.assertEqual(drained[0], 10)
+
+    def test_reaching_the_target_alone_is_not_enough(self):
+        tracker = DrainTracker(10, min_height=100)
+        for t in range(30):
+            # past the target but the exec queue is still deep: not quiet
+            self.assertFalse(tracker.observe(t, [hsample(200 + t, queue=40) for _ in NODES])['drained'])
+
+    def test_missing_height_metric_never_counts_as_reached(self):
+        tracker = DrainTracker(10, min_height=100)
+        for t in range(30):
+            nodes = [hsample(200 + t) for _ in NODES]
+            del nodes[2][EXEC_HEIGHT]
+            self.assertFalse(tracker.observe(t, nodes)['drained'])
+
+    def test_without_a_target_the_drain_is_unchanged(self):
+        tracker = DrainTracker(10)
+        results = [tracker.observe(t, [sample(100 + t) for _ in NODES]) for t in range(12)]
+        self.assertTrue(results[10]['drained'])
+
+    def test_parse_metrics_keeps_the_exec_height_only_when_asked(self):
+        text = f'{EXEC_HEIGHT} 42\n'
+        self.assertNotIn(EXEC_HEIGHT, parse_metrics(text))
+        self.assertEqual(parse_metrics(text, (EXEC_HEIGHT,))[EXEC_HEIGHT], 42.0)
+
+
+class SettleToHeightHttpTest(unittest.TestCase):
+    """The CLI end to end: `drain --to-height auto` records the target at the
+    first complete scrape and drains (rc 0) once it is executed; a target the
+    chain cannot reach within --timeout fails with rc 3 and says so."""
+
+    def serve(self):
+        class Metrics(BaseHTTPRequestHandler):
+            counts = {}
+            def log_message(self, *_args):
+                pass
+            def do_GET(self):
+                # executed height +1 per scrape from 100 (val1 from 90), queue 2
+                h = self.counts[self.path] = self.counts.get(
+                    self.path, 90 if self.path.endswith('val1') else 100) + 1
+                body = ''.join(f'{k} {v}\n' for k, v in hsample(h, queue=2).items()).encode()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Metrics)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        def stop():
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.addCleanup(stop)
+        return [f'http://127.0.0.1:{server.server_port}/{n}' for n in NODES]
+
+    def run_drain(self, directory, urls, to_height, timeout):
+        command = ['python3', str(Path(__file__).with_name('health.py')), 'drain',
+                   '--out', directory, '--timeout', str(timeout), '--quiet', '0.5',
+                   '--to-height', to_height, '--urls', *urls]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        return result, json.loads((Path(directory)/'drain.json').read_text())
+
+    def test_auto_target_is_reached_and_recorded(self):
+        urls = self.serve()
+        with tempfile.TemporaryDirectory() as directory:
+            result, drain = self.run_drain(directory, urls, 'auto', 30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(drain['drained'])
+            # first scrape: val0/val2 executed 101 + queue 2 -> committed 103
+            self.assertEqual(drain['target_height'], 103)
+            self.assertTrue(drain['target_reached'])
+            self.assertEqual(sorted(drain['target_committed_by_node']), list(NODES))
+            # val1 started 10 behind: it had to execute up to 103 first
+            self.assertGreaterEqual(min(drain['exec_heights'].values()), 103)
+
+    def test_unreachable_target_fails_with_rc_3_after_the_max(self):
+        urls = self.serve()
+        with tempfile.TemporaryDirectory() as directory:
+            result, drain = self.run_drain(directory, urls, '100000', 2)
+            self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+            self.assertFalse(drain['drained'])
+            self.assertFalse(drain['target_reached'])
+            self.assertEqual(drain['target_height'], 100000)
+            self.assertIn('height target 100000 not reached', drain['reason'])
+            self.assertGreaterEqual(drain['elapsed_s'], 2)
+
+    def test_bad_to_height_is_a_usage_error(self):
+        for bad in ('x', '-1', '0'):
+            r = subprocess.run(['python3', str(Path(__file__).with_name('health.py')), 'drain',
+                                '--out', '/nonexistent', '--timeout', '1', '--to-height', bad,
+                                '--urls', 'a', 'b', 'c'], capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 2, bad)
+            self.assertIn('--to-height', r.stderr)
 
 
 class CollectionTest(unittest.TestCase):

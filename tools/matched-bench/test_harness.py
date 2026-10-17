@@ -27,6 +27,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -356,6 +357,23 @@ class SummarizeTest(unittest.TestCase):
         self.assertAlmostEqual(
             s["funnel_by_node"]["val1"]["matched_s_first120"], 50_000, delta=500
         )
+
+    def test_nan_column_keeps_the_row(self):
+        """s64 (memory e20da0cb): an arm without the consensus DB gauges writes
+        'nan' in those sampler.csv columns. The loader must keep the row: an
+        empty value raised ValueError there and dropped every sample."""
+        write_cell(self.d, 50_000, 10_000, dur=300)
+        write_agreement(self.d, ["same"] * 3)
+        path = os.path.join(self.d, "sampler.csv")
+        with open(path) as f:
+            lines = f.read().splitlines()
+        cols = ",torus_rocksdb_consensus_write_other,torus_rocksdb_l0_files__cf_native_shards__consensus"
+        with open(path, "w") as f:
+            f.write(lines[0] + cols + "\n")
+            f.writelines(l + ",nan,nan\n" for l in lines[1:])
+        s, _ = run_summarize(self.d)
+        self.assertAlmostEqual(s["headline"]["matched_s_avg"], 26_000, delta=500)
+        self.assertAlmostEqual(s["headline"]["matched_s_first120"], 50_000, delta=500)
 
     def test_open_limit_rejects_are_in_the_node_funnel(self):
         write_cell(self.d, 50_000, 10_000, dur=300)
@@ -2383,10 +2401,11 @@ class OracleFeedHarnessTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp)
 
-    def _run_drain_flow(self, mode, max_lag="2"):
+    def _run_drain_flow(self, mode, max_lag="2", settle_max="600", settle_rc=0, settle=None):
         """Run run-cell.sh's real bench-end pause block and drain block with
         python3 stubbed: each health.py call prints the feed's process state
-        (T = SIGSTOPped) and its argv."""
+        (T = SIGSTOPped) and its argv; the feed-stop-settle call returns
+        settle_rc and leaves `settle` as its drain.json."""
         pause = self.fn(
             'ORACLE_ALIVE_END=""\n',
             "\n# ------------------------------------------------"
@@ -2415,18 +2434,28 @@ class OracleFeedHarnessTest(unittest.TestCase):
                 f,
             )
         with open(os.path.join(tmp, "feed-stop-settle", "drain.json"), "w") as f:
-            json.dump({"drained": True, "elapsed_s": 12.7}, f)
+            json.dump(
+                settle
+                or {
+                    "drained": True,
+                    "elapsed_s": 12.7,
+                    "target_height": 4321,
+                    "target_reached": True,
+                    "exec_heights": {"val0": 4330, "val1": 4329, "val2": 4330},
+                },
+                f,
+            )
         script = (
             self.fn("alive() {", "\nstop_sampler() {")
             + '\nlog() { echo "LOG $*"; }\n'
             + 'oracle_marks() { echo \'{"markets":300,"usable":300}\'; }\n'
-            + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; }\n'
-            % tmp
+            + 'python3() { echo "PY $(ps -o stat= -p "$FEED" | cut -c1) $*" >> "%s/py.log"; '
+            'case "$*" in *feed-stop-settle*) return %d;; esac; }\n' % (tmp, settle_rc)
             + "sleep 300 & ORACLE_PID=$!; FEED=$ORACLE_PID\n"
             + "trap 'kill -KILL $FEED 2>/dev/null' EXIT\n"
             + "OUT=%s TOOLS_DIR=/tools DRAIN_TIMEOUT=780 MARKETS=300 ORACLE_H0=7 "
-            "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s ORACLE_FEED_DRAIN_MAX_LAG=%s T_BENCH1=$(date +%%s)\n"
-            % (tmp, mode, max_lag)
+            "ORACLE_FEED=1 ORACLE_FEED_DRAIN=%s ORACLE_FEED_DRAIN_MAX_LAG=%s "
+            "FEED_STOP_SETTLE_MAX_S=%s T_BENCH1=$(date +%%s)\n" % (tmp, mode, max_lag, settle_max)
             + "METS=(9161 9162 9163)\n"
             + pause
             + "\n"
@@ -2483,10 +2512,12 @@ class OracleFeedHarnessTest(unittest.TestCase):
             py[0].endswith(" --feed-live --feed-mempool-max 12 --max-lag 2"), py[0]
         )
         # paused right after it, then a legacy quiet settle before the digest
+        # that also waits until every node executed the highest committed
+        # height at the pause (s64: was a fixed 60 s)
         self.assertTrue(
             py[1].startswith(
-                "PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 60 "
-                "--quiet 10 --urls " % out_dir
+                "PY T /tools/health.py drain --out %s/feed-stop-settle --timeout 600 "
+                "--quiet 10 --to-height auto --urls " % out_dir
             ),
             py[1],
         )
@@ -2500,7 +2531,9 @@ class OracleFeedHarnessTest(unittest.TestCase):
             if "feed-stop-settle" in l and l.startswith("LOG ")
         ]
         self.assertEqual(len(settle), 1, out)
-        self.assertRegex(settle[0], r"settle drained=1 after 12s")
+        self.assertRegex(
+            settle[0], r"settle drained=1 rc=0 after 12s: every node executed target height 4321"
+        )
         self.assertIn(
             "quiet_window_native_block_exec_ms (oracle-only proxy) p50=50.0 p95=200.0 "
             "max=200.0 native_blocks=5 single_block_intervals=3/4",
@@ -2513,6 +2546,78 @@ class OracleFeedHarnessTest(unittest.TestCase):
         self.assertIn(
             'kill -TERM "$pid" 2>/dev/null; kill -CONT "$pid" 2>/dev/null', self.src
         )
+
+    def test_feed_stop_settle_max_reaches_the_settle_and_a_miss_is_logged(self):
+        """FEED_STOP_SETTLE_MAX_S bounds the paused settle; a settle that does
+        not reach its height target (health.py rc 3) is logged as such and the
+        cell carries on (the digest quiescence check decides, as before)."""
+        out_dir, out = self._run_drain_flow(
+            "1",
+            settle_max="1500",
+            settle_rc=3,
+            settle={
+                "drained": False,
+                "elapsed_s": 1500.2,
+                "reason": "height target 9000 not reached (val1 at 8800)",
+                "target_height": 9000,
+                "target_reached": False,
+                "exec_heights": {"val0": 9001, "val1": 8800, "val2": 9001},
+            },
+        )
+        py = [l for l in out.splitlines() if l.startswith("PY ")]
+        self.assertIn(" --timeout 1500 --quiet 10 --to-height auto ", py[1])
+        settle = [l for l in out.splitlines() if "feed-stop-settle" in l and l.startswith("LOG ")]
+        self.assertEqual(len(settle), 1, out)
+        self.assertIn("settle drained=0 rc=3 after 1500s", settle[0])
+        self.assertIn(
+            "WARNING: target height 9000 NOT reached within FEED_STOP_SETTLE_MAX_S=1500 s "
+            "(exec heights val0=9001 val1=8800 val2=9001)",
+            settle[0],
+        )
+        self.assertIn("the digest quiescence check decides", settle[0])
+        self.assertIn("END T", out)
+
+    def test_feed_stop_settle_max_env(self):
+        self.assertIn("FEED_STOP_SETTLE_MAX_S=${FEED_STOP_SETTLE_MAX_S:-600}", self.src)
+        doc = self.src.index("#   FEED_STOP_SETTLE_MAX_S=N")
+        self.assertLess(self.src.index("#   ORACLE_FEED_DRAIN=1"), doc)
+        self.assertLess(doc, self.src.index("set -uo pipefail"))
+        self.assertNotIn("--timeout 60 ", self.src)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            self.assertIn('"FEED_STOP_SETTLE_MAX_S",', f.read())
+        tmp = tempfile.mkdtemp(prefix="settle-max-pre-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        tgt = os.path.join(tmp, "release")
+        os.makedirs(tgt)
+        for b in ("torus-node", "bench-throughput"):
+            p = os.path.join(tgt, b)
+            with open(p, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(p, 0o755)
+        script, wt = sandbox_repo(tmp)
+        drain_on = dict(ORACLE_FEED="1", ORACLE_FEED_DRAIN="1")
+        for env, msg in (
+            (dict(drain_on, FEED_STOP_SETTLE_MAX_S="x"), "FEED_STOP_SETTLE_MAX_S must be a positive integer"),
+            (dict(drain_on, FEED_STOP_SETTLE_MAX_S="0"), "FEED_STOP_SETTLE_MAX_S must be a positive integer"),
+            (dict(ORACLE_FEED="1", FEED_STOP_SETTLE_MAX_S="900"), "FEED_STOP_SETTLE_MAX_S=900 needs ORACLE_FEED_DRAIN=1"),
+        ):
+            r = subprocess.run(
+                [script, wt, "settle-max-pre-x"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=dict(
+                    os.environ,
+                    TARGET_DIR=tmp,
+                    RESULTS_ROOT=tmp,
+                    DATA_ROOT=tmp,
+                    BENCH_ALLOW_UNDETACHED="1",
+                    **env,
+                ),
+            )
+            self.assertEqual(r.returncode, 2, (env, r.stderr))
+            self.assertIn(msg, r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "settle-max-pre-x")))
 
     def test_bad_walk_env_fails_preflight(self):
         tmp = tempfile.mkdtemp(prefix="oracle-walk-pre-")
@@ -2806,6 +2911,75 @@ class StaleArtifactGuardTest(unittest.TestCase):
             allow = f.read()
         for k in ("EXPECT_NODE_MD5", "EXPECT_BENCH_MD5"):
             self.assertIn('"%s",' % k, allow)
+
+
+class ConsensusWideColsTest(unittest.TestCase):
+    """Section 71.8 option A (frozen ozarchy-hsdb copy, upstreamed s64): every
+    cell samples the consensus DB's 29 DB-wide gauges
+    (torus_rocksdb_consensus_*, the Rust RocksdbStatMetrics::NAMES with the
+    consensus prefix) and its 3 per-CF families x 3 CFs as CSV-safe
+    <family>__<cf>__consensus alias columns (sample_metrics.py)."""
+
+    TELEMETRY = os.path.join(REPO, "crates", "torus-telemetry", "src", "lib.rs")
+    CFS = ("cf_consensus_meta", "cf_native_pending", "cf_native_shards")
+    FAMILIES = (
+        "torus_rocksdb_l0_files",
+        "torus_rocksdb_memtable_bytes",
+        "torus_rocksdb_pending_compaction_bytes",
+    )
+
+    def wide_cols(self, liq=False):
+        """The effective WIDE_COLS of a cell (run-cell.sh's real block in bash)."""
+        with open(RUN_CELL_SH) as f:
+            src = f.read()
+        i = src.index('WIDE_COLS="torus_blocks_committed_total')
+        end = 'WIDE_COLS="$WIDE_COLS scrape_valid"\n'
+        block = src[i : src.index(end, i) + len(end)]
+        script = (
+            "liq_stress_on() { %s; }\n" % ("true" if liq else "false")
+            + block
+            + 'echo "$WIDE_COLS"\n'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.split()
+
+    def rust_names(self):
+        with open(self.TELEMETRY) as f:
+            src = f.read()
+        i = src.index("pub const NAMES: [&'static str; 29] = [")
+        names = re.findall(r'"(torus_rocksdb_[a-z0-9_]+)"', src[i : src.index("];", i)])
+        self.assertEqual(len(names), 29)
+        return ["torus_rocksdb_consensus_" + n[len("torus_rocksdb_") :] for n in names]
+
+    def test_wide_cols_carry_the_consensus_db_series(self):
+        cols = self.wide_cols()
+        aliases = [
+            "%s__%s__consensus" % (f, c) for f in self.FAMILIES for c in self.CFS
+        ]
+        for name in self.rust_names() + aliases:
+            self.assertIn(name, cols)
+        consensus = [c for c in cols if "consensus" in c]
+        # 29 + 9 new, plus the two consensus-thread series main already had
+        self.assertEqual(len(consensus), 40, consensus)
+        self.assertEqual(len(cols), len(set(cols)), "duplicate WIDE_COLS")
+        self.assertEqual(cols[-1], "scrape_valid")
+        # liq cells keep them too, and every column stays CSV-safe
+        self.assertTrue(set(consensus) <= set(self.wide_cols(liq=True)))
+        for c in cols:
+            self.assertRegex(c, r"^[A-Za-z0-9_]+$")
+
+    def test_absent_consensus_columns_are_nan_in_the_sampler(self):
+        sys.path.insert(0, HERE)
+        import sample_metrics
+
+        for name in self.wide_cols():
+            want = (
+                "nan"
+                if "rocksdb_consensus_" in name or name.endswith("__consensus")
+                else "0"
+            )
+            self.assertEqual(sample_metrics.absent_value(name), want, name)
 
 
 class LiqStressHarnessTest(unittest.TestCase):

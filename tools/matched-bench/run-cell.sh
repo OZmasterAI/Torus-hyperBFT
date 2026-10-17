@@ -204,8 +204,9 @@
 #                exec lag and mean exec ms per native block
 #                (torus_exec_chain_seconds) -> drain-feed-live.tsv; summary in
 #                drain.json .feed_live and run.log. Then the feed is SIGSTOPped
-#                and the default quiet drain re-run (feed-stop-settle/, 60 s)
-#                before the after-snapshots and the state digest.
+#                and the default quiet drain re-run (feed-stop-settle/) before
+#                the after-snapshots and the state digest; that settle also
+#                waits for a height (FEED_STOP_SETTLE_MAX_S below).
 #   ORACLE_FEED_DRAIN_MAX_LAG=N  with ORACLE_FEED_DRAIN=1 (else FATAL unless 2):
 #                the feed-live drain's exec-lag bound (health.py --max-lag),
 #                default 2. Only for cells whose timings are not read: a
@@ -213,6 +214,20 @@
 #                each native block (~0.34 s at 300 markets), so the lag stays
 #                ~60 while the feed runs and the default bound never holds.
 #                The paused settle (feed-stop-settle/) keeps the idle bound.
+#   FEED_STOP_SETTLE_MAX_S=N  with ORACLE_FEED_DRAIN=1 (else FATAL unless 600):
+#                the max seconds of the paused-feed settle, default 600 (s64; a
+#                fixed 60 s before). At the pause `health.py drain --to-height
+#                auto` records the target = the highest committed height across
+#                the nodes (torus_block_height + torus_exec_queue_depth) and
+#                waits until every node has executed it (torus_block_height >=
+#                target) AND the default quiet criterion holds. On a slow chain
+#                (value-sum cells: 0.82 blocks/s, exec ~60 blocks behind at the
+#                pause) 60 s ended mid catch-up and the digest read the nodes at
+#                different executed heights (perf doc section 72.4: a false
+#                REJECT on 5 mark fields). Target not reached within N s: rc 3,
+#                a WARNING in run.log naming the target and each node's executed
+#                height (feed-stop-settle/drain.json), and the digest
+#                quiescence check decides, as before.
 #   LIQ_THIN=N   liquidation stress (row 76): after the genesis is generated, set
 #                native `available` = LIQ_THIN_AVAIL (default 1000000.0 TRS, the
 #                genesis' decimal-string units; at most 8 decimals) on the
@@ -356,6 +371,7 @@ ORACLE_INTERVAL_MS=${ORACLE_INTERVAL_MS:-2000}
 ORACLE_WALK_BP=${ORACLE_WALK_BP:-0}
 ORACLE_FEED_DRAIN=${ORACLE_FEED_DRAIN:-0}
 ORACLE_FEED_DRAIN_MAX_LAG=${ORACLE_FEED_DRAIN_MAX_LAG:-2}
+FEED_STOP_SETTLE_MAX_S=${FEED_STOP_SETTLE_MAX_S:-600}
 LIQ_THIN=${LIQ_THIN:-0}
 LIQ_THIN_AVAIL=${LIQ_THIN_AVAIL:-1000000.0}
 ORACLE_SHOCK_BP=${ORACLE_SHOCK_BP:-0}
@@ -588,6 +604,11 @@ esac
 ORACLE_FEED_DRAIN_MAX_LAG=$((10#$ORACLE_FEED_DRAIN_MAX_LAG))
 [ "$ORACLE_FEED_DRAIN_MAX_LAG" = 2 ] || [ "$ORACLE_FEED_DRAIN" = 1 ] \
     || { echo "FATAL: ORACLE_FEED_DRAIN_MAX_LAG=$ORACLE_FEED_DRAIN_MAX_LAG needs ORACLE_FEED_DRAIN=1" >&2; exit 2; }
+[[ "$FEED_STOP_SETTLE_MAX_S" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$FEED_STOP_SETTLE_MAX_S))" -gt 0 ] \
+    || { echo "FATAL: FEED_STOP_SETTLE_MAX_S must be a positive integer number of seconds (got '$FEED_STOP_SETTLE_MAX_S')" >&2; exit 2; }
+FEED_STOP_SETTLE_MAX_S=$((10#$FEED_STOP_SETTLE_MAX_S))
+[ "$FEED_STOP_SETTLE_MAX_S" = 600 ] || [ "$ORACLE_FEED_DRAIN" = 1 ] \
+    || { echo "FATAL: FEED_STOP_SETTLE_MAX_S=$FEED_STOP_SETTLE_MAX_S needs ORACLE_FEED_DRAIN=1" >&2; exit 2; }
 case "$ORACLE_FEED" in
     0) [ "$ORACLE_WALK_BP" = 0 ] || { echo "FATAL: ORACLE_WALK_BP=$ORACLE_WALK_BP needs ORACLE_FEED=1" >&2; exit 2; }
        [ "$ORACLE_SHOCK_BP" = 0 ] || { echo "FATAL: ORACLE_SHOCK_BP=$ORACLE_SHOCK_BP needs ORACLE_FEED=1" >&2; exit 2; } ;;
@@ -1085,6 +1106,10 @@ FUNNEL_COLS="torus_native_actions_processed_total torus_orders_placed_accepted_t
 # Keep the positional phase60.awk layout; detailed write metrics belong in WIDE_COLS.
 PHASE_COLS="torus_blocks_committed_total torus_block_height torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_exec_resting_orders torus_exec_load_books_seconds_sum torus_exec_load_books_seconds_count torus_exec_root_seconds_sum torus_exec_root_seconds_count torus_exec_state_write_seconds_sum torus_exec_state_write_seconds_count torus_exec_evm_resync_seconds_sum torus_exec_evm_resync_seconds_count torus_exec_flush_seconds_sum torus_exec_flush_seconds_count torus_exec_root_dirty_buckets_sum torus_exec_root_dirty_buckets_count torus_exec_queue_depth torus_exec_root_bucket_scans_total torus_member_cache_hits_total torus_member_cache_misses_total torus_member_cache_evictions_total torus_member_cache_resident_buckets"
 WIDE_COLS="torus_blocks_committed_total torus_block_height torus_native_actions_processed_total torus_orders_placed_accepted_total torus_orders_matched_total torus_orders_resting_total torus_exec_resting_orders torus_orders_rejected_margin_total torus_orders_rejected_open_limit_total torus_orders_rejected_book_total torus_orders_rejected_cancelled_total torus_orders_rejected_other_total torus_exec_queue_depth torus_mempool_native_size torus_exec_block_seconds_sum torus_exec_block_seconds_count torus_exec_engine_seconds_count torus_exec_verify_seconds_count torus_exec_flush_seconds_count torus_exec_evm_seconds_sum torus_exec_verify_seconds_sum torus_exec_replay_guard_seconds_sum torus_exec_load_books_seconds_sum torus_exec_engine_seconds_sum torus_exec_phase_margin_seconds_sum torus_exec_phase_match_seconds_sum torus_exec_phase_settle_seconds_sum torus_exec_phase1_actions_seconds_sum torus_exec_phase1_actions_seconds_count torus_exec_settle_pass_a_seconds_sum torus_exec_settle_pass_b_seconds_sum torus_exec_cache_flush_seconds_sum torus_exec_post_engine_tail_seconds_sum torus_exec_engine_untimed_seconds_sum torus_exec_engine_untimed_seconds_count torus_exec_save_books_seconds_sum torus_exec_flush_seconds_sum torus_exec_root_seconds_sum torus_exec_state_write_seconds_sum torus_exec_state_write_build_seconds_sum torus_exec_state_write_build_seconds_count torus_exec_state_write_db_seconds_sum torus_exec_state_write_db_seconds_count torus_exec_state_write_batch_bytes_sum torus_exec_state_write_batch_bytes_count torus_exec_evm_resync_seconds_sum torus_exec_body_persist_seconds_sum torus_exec_root_dirty_buckets_sum torus_exec_root_dirty_buckets_count torus_exec_root_bucket_scans_total torus_member_cache_evictions_total torus_commit_interval_seconds_sum torus_commit_interval_seconds_count torus_exec_chain_seconds_sum torus_exec_chain_seconds_count torus_exec_handoff_wait_seconds_sum torus_exec_handoff_wait_seconds_count torus_flush_worker_seconds_sum torus_flush_worker_seconds_count torus_flush_worker_depth torus_exec_save_books_seconds_count torus_exec_save_books_drain_seconds_sum torus_exec_save_books_drain_seconds_count torus_exec_save_books_write_seconds_sum torus_exec_save_books_write_seconds_count torus_exec_native_blocks_total torus_consensus_timeout_total_total torus_consensus_view torus_block_transactions_count_sum torus_block_transactions_count_count torus_native_gossip_published_actions_total torus_native_gossip_dropped_full_total torus_rocksdb_memtable_bytes torus_rocksdb_l0_files torus_rocksdb_pending_compaction_bytes torus_db_size_bytes torus_exec_body_persist_write_seconds_sum torus_exec_body_persist_write_seconds_count torus_commit_persist_seconds_sum torus_commit_persist_seconds_count torus_commit_body_encode_seconds_sum torus_commit_persist_write_seconds_sum torus_trade_writer_queued_batches torus_rocksdb_memtable_bytes_all torus_rocksdb_immutable_memtables_all torus_rocksdb_l0_files_max torus_rocksdb_pending_compaction_bytes_all torus_rocksdb_delayed_write_rate torus_rocksdb_write_stopped torus_rocksdb_running_compactions torus_rocksdb_running_flushes torus_rocksdb_stall_micros torus_rocksdb_write_self torus_rocksdb_write_other torus_rocksdb_bytes_written torus_rocksdb_wal_bytes torus_rocksdb_flush_write_bytes torus_rocksdb_compact_read_bytes torus_rocksdb_compact_write_bytes torus_rocksdb_compaction_cpu_micros torus_rocksdb_db_write_count torus_rocksdb_db_write_sum_micros torus_rocksdb_db_write_p99_micros torus_rocksdb_db_write_max_micros torus_rocksdb_write_stall_count torus_rocksdb_write_stall_sum_micros torus_rocksdb_write_stall_p99_micros torus_rocksdb_write_stall_max_micros torus_rocksdb_flush_count torus_rocksdb_flush_sum_micros torus_rocksdb_compaction_count torus_rocksdb_compaction_sum_micros torus_view_duration_seconds_sum torus_view_duration_seconds_count torus_view_propose_delay_seconds_sum torus_view_propose_delay_seconds_count torus_view_propose_build_seconds_sum torus_view_propose_build_seconds_count torus_view_propose_finalize_seconds_sum torus_view_propose_finalize_seconds_count torus_view_qc_collect_seconds_sum torus_view_qc_collect_seconds_count torus_view_proposal_arrival_seconds_sum torus_view_proposal_arrival_seconds_count torus_view_insert_persist_seconds_sum torus_view_insert_persist_seconds_count torus_view_vote_delay_seconds_sum torus_view_vote_delay_seconds_count torus_block_build_seconds_sum torus_block_build_seconds_count torus_validate_block_seconds_sum torus_validate_block_seconds_count torus_validate_block_decode_seconds_sum torus_validate_block_decode_seconds_count torus_validate_block_da_reconstruct_seconds_sum torus_validate_block_da_reconstruct_seconds_count torus_validate_block_attest_seconds_sum torus_validate_block_attest_seconds_count torus_validate_block_custody_seconds_sum torus_validate_block_custody_seconds_count torus_on_committed_block_seconds_sum torus_on_committed_block_seconds_count torus_mempool_remove_committed_seconds_sum torus_mempool_remove_committed_seconds_count torus_block_build_parent_seconds_sum torus_block_build_parent_seconds_count torus_block_build_select_seconds_sum torus_block_build_select_seconds_count torus_block_build_mirror_seconds_sum torus_block_build_mirror_seconds_count torus_block_build_attest_seconds_sum torus_block_build_attest_seconds_count torus_block_build_encode_seconds_sum torus_block_build_encode_seconds_count torus_view_entry_slack_seconds_sum torus_view_entry_slack_seconds_count torus_view_timeout_after_seconds_sum torus_view_timeout_after_seconds_count torus_view_vote_gather_seconds_sum torus_view_vote_gather_seconds_count torus_view_qc_to_advance_seconds_sum torus_view_qc_to_advance_seconds_count torus_view_entered_past_deadline_total torus_view_timeout_no_proposal_total torus_view_timeout_no_vote_total torus_view_timeout_after_vote_total torus_view_timeout_leader_total torus_view_proposals_uncertified_total torus_exec_end_resident_seconds_sum torus_exec_end_resident_seconds_count torus_exec_end_resident_rows_seconds_sum torus_exec_end_resident_positions_seconds_sum torus_exec_end_resident_users_seconds_sum torus_exec_end_resident_wait_seconds_sum torus_exec_end_resident_wait_seconds_count torus_exec_margin_configs_seconds_sum torus_exec_margin_configs_seconds_count torus_exec_action_status_seconds_sum torus_exec_action_status_seconds_count torus_sell_cuts_pool_zero_t0_total torus_sell_cuts_pool_zero_t1_2_total torus_sell_cuts_pool_zero_t3_5_total torus_sell_cuts_pool_zero_t6_10_total torus_sell_cuts_pool_zero_t11_30_total torus_sell_cuts_pool_zero_t31p_total torus_sell_cuts_pool_partial_t0_total torus_sell_cuts_pool_partial_t1_2_total torus_sell_cuts_pool_partial_t3_5_total torus_sell_cuts_pool_partial_t6_10_total torus_sell_cuts_pool_partial_t11_30_total torus_sell_cuts_pool_partial_t31p_total torus_sell_cuts_nonpool_zero_t0_total torus_sell_cuts_nonpool_zero_t1_2_total torus_sell_cuts_nonpool_zero_t3_5_total torus_sell_cuts_nonpool_zero_t6_10_total torus_sell_cuts_nonpool_zero_t11_30_total torus_sell_cuts_nonpool_zero_t31p_total torus_sell_cuts_nonpool_partial_t0_total torus_sell_cuts_nonpool_partial_t1_2_total torus_sell_cuts_nonpool_partial_t3_5_total torus_sell_cuts_nonpool_partial_t6_10_total torus_sell_cuts_nonpool_partial_t11_30_total torus_sell_cuts_nonpool_partial_t31p_total torus_maker_margin_cancels_total torus_reduce_only_cuts_total torus_sell_top_ups_full_total torus_sell_top_ups_partial_total torus_sell_top_ups_none_total torus_exec_cancel_all_total torus_exec_cancel_all_books_visited_total torus_exec_cancel_all_books_hit_total torus_exec_by_id_actions_total torus_exec_by_id_books_probed_total torus_exec_thread_spawns_match torus_exec_thread_spawns_settle torus_exec_thread_spawns_save_books torus_exec_thread_spawns_margin_prepare torus_exec_thread_spawns_open_orders torus_exec_thread_spawns_end_resident torus_exec_thread_spawns_flush_digest torus_exec_thread_spawns_root_buckets torus_exec_thread_spawns_load_books torus_exec_oracle_only_block_seconds_sum torus_exec_oracle_only_block_seconds_count torus_exec_cancel_all_index_entries torus_exec_cancel_all_index_traders torus_exec_checkpoint_settle_wait_seconds_sum torus_exec_checkpoint_settle_wait_seconds_count torus_exec_checkpoint_upkeep_seconds_sum torus_exec_checkpoint_upkeep_seconds_count torus_exec_checkpoint_wait_seconds_sum torus_exec_checkpoint_wait_seconds_count torus_exec_checkpoint_deferred_join_seconds_sum torus_exec_checkpoint_deferred_join_seconds_count"
+# section 71.8 option A (ozarchy-hsdb, upstreamed s64): the consensus DB gauges (torus_rocksdb_consensus_*, the 29
+# RocksdbStatMetrics::NAMES) and its per-CF families (db="consensus", 60 s cadence) as CSV-safe
+# <family>__<cf>__consensus alias columns (sample_metrics.py); a build without the consensus DB writes nan in them.
+WIDE_COLS="$WIDE_COLS torus_rocksdb_consensus_memtable_bytes_all torus_rocksdb_consensus_immutable_memtables_all torus_rocksdb_consensus_l0_files_max torus_rocksdb_consensus_pending_compaction_bytes_all torus_rocksdb_consensus_delayed_write_rate torus_rocksdb_consensus_write_stopped torus_rocksdb_consensus_running_compactions torus_rocksdb_consensus_running_flushes torus_rocksdb_consensus_stall_micros torus_rocksdb_consensus_write_self torus_rocksdb_consensus_write_other torus_rocksdb_consensus_bytes_written torus_rocksdb_consensus_wal_bytes torus_rocksdb_consensus_flush_write_bytes torus_rocksdb_consensus_compact_read_bytes torus_rocksdb_consensus_compact_write_bytes torus_rocksdb_consensus_compaction_cpu_micros torus_rocksdb_consensus_db_write_count torus_rocksdb_consensus_db_write_sum_micros torus_rocksdb_consensus_db_write_p99_micros torus_rocksdb_consensus_db_write_max_micros torus_rocksdb_consensus_write_stall_count torus_rocksdb_consensus_write_stall_sum_micros torus_rocksdb_consensus_write_stall_p99_micros torus_rocksdb_consensus_write_stall_max_micros torus_rocksdb_consensus_flush_count torus_rocksdb_consensus_flush_sum_micros torus_rocksdb_consensus_compaction_count torus_rocksdb_consensus_compaction_sum_micros torus_rocksdb_l0_files__cf_consensus_meta__consensus torus_rocksdb_l0_files__cf_native_pending__consensus torus_rocksdb_l0_files__cf_native_shards__consensus torus_rocksdb_memtable_bytes__cf_consensus_meta__consensus torus_rocksdb_memtable_bytes__cf_native_pending__consensus torus_rocksdb_memtable_bytes__cf_native_shards__consensus torus_rocksdb_pending_compaction_bytes__cf_consensus_meta__consensus torus_rocksdb_pending_compaction_bytes__cf_native_pending__consensus torus_rocksdb_pending_compaction_bytes__cf_native_shards__consensus"
 
 # bl1 exec-chain-sub-100-attribution: histogram BUCKET series in LONG format
 # (ts,node,metric,le,count), read out of the SAME scrape as the wide row above
@@ -1265,13 +1290,26 @@ log "drained=$DRAINED after $((T_DRAIN - T_BENCH1))s (evidence: drain.json and d
 if [ "$ORACLE_FEED_DRAIN" = 1 ]; then
     log "feed-live drain: $(jq -r '.feed_live | "max_exec_lag=\(.max_exec_lag) quiet_window_native_block_exec_ms (oracle-only proxy) p50=\(.chain_ms.p50) p95=\(.chain_ms.p95) max=\(.chain_ms.max) native_blocks=\(.native_blocks) single_block_intervals=\(.single_block_intervals)/\(.native_intervals)"' "$OUT/drain.json" 2>/dev/null || echo MISSING) (drain-feed-live.tsv)"
     # The digest and the after-snapshots need quiet counters: pause the feed
-    # now and prove quiescence with the default criterion before them.
+    # now and prove quiescence with the default criterion before them. s64:
+    # and wait until every node has executed the highest committed height at
+    # the pause (--to-height auto), up to FEED_STOP_SETTLE_MAX_S: a slow chain
+    # is still catching up long after a fixed 60 s (perf doc section 72.4).
     kill -STOP "$ORACLE_PID" 2>/dev/null
     mkdir -p "$OUT/feed-stop-settle"
     SETTLED=0
-    python3 "$TOOLS_DIR/health.py" drain --out "$OUT/feed-stop-settle" --timeout 60 --quiet "$QUIET_S" \
-        --urls "${DRAIN_URLS[@]}" >>"$OUT/run.log" 2>&1 && SETTLED=1
-    log "oracle feed paused (SIGSTOP) for the digest; settle drained=$SETTLED after $(jq -r '.elapsed_s // "?" | if type == "number" then floor else . end' "$OUT/feed-stop-settle/drain.json" 2>/dev/null || echo '?')s (feed-stop-settle/drain.json$([ "$SETTLED" = 1 ] || echo '; NOT quiet within 60 s: the digest quiescence check decides'))"
+    python3 "$TOOLS_DIR/health.py" drain --out "$OUT/feed-stop-settle" --timeout "$FEED_STOP_SETTLE_MAX_S" --quiet "$QUIET_S" \
+        --to-height auto --urls "${DRAIN_URLS[@]}" >>"$OUT/run.log" 2>&1
+    SETTLE_RC=$?
+    [ "$SETTLE_RC" = 0 ] && SETTLED=1
+    SETTLE_JSON="$OUT/feed-stop-settle/drain.json"
+    SETTLE_S=$(jq -r '.elapsed_s // "?" | if type == "number" then floor else . end' "$SETTLE_JSON" 2>/dev/null || echo '?')
+    SETTLE_TARGET=$(jq -r '.target_height // "?"' "$SETTLE_JSON" 2>/dev/null || echo '?')
+    case "$SETTLE_RC" in
+        0) SETTLE_WHAT="every node executed target height $SETTLE_TARGET" ;;
+        3) SETTLE_WHAT="WARNING: target height $SETTLE_TARGET NOT reached within FEED_STOP_SETTLE_MAX_S=$FEED_STOP_SETTLE_MAX_S s (exec heights $(jq -r '(.exec_heights // {}) | to_entries | map("\(.key)=\(.value // "?")") | join(" ")' "$SETTLE_JSON" 2>/dev/null || echo '?')); the digest quiescence check decides" ;;
+        *) SETTLE_WHAT="WARNING: NOT quiet within FEED_STOP_SETTLE_MAX_S=$FEED_STOP_SETTLE_MAX_S s ($(jq -r '.reason // "?"' "$SETTLE_JSON" 2>/dev/null || echo '?')); the digest quiescence check decides" ;;
+    esac
+    log "oracle feed paused (SIGSTOP) for the digest; settle drained=$SETTLED rc=$SETTLE_RC after ${SETTLE_S}s: $SETTLE_WHAT (feed-stop-settle/drain.json)"
 fi
 sleep 2
 stop_sampler || die "metrics sampler failed (see sampler.log)"

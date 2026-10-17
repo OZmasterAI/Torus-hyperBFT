@@ -24,6 +24,17 @@ REQUIRED = (
 )
 NUMBER = re.compile(r"^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$")
 LE = re.compile(r'le="([^"]*)"')
+# section 71.8 option A (ozarchy-hsdb): the consensus DB's labelled per-CF series become CSV-safe alias columns
+# (<family>__<cf>__consensus); the label-free consensus gauges are torus_rocksdb_consensus_* as exported.
+CF_LABEL = re.compile(r'cf="([^"]*)"')
+
+
+def absent_value(name):
+    """Section 71.8 option A: 'nan' for the consensus DB columns on a build without that DB (arm A). Not '' (summarize.py
+    loads every column with float() and drops a whole row on ValueError, so arm A would have no samples) and not 0 (a
+    zero-write DB). float('nan') parses everywhere and reads as no measurement. Every other absent column stays 0
+    (the legacy awk extractor's default)."""
+    return "nan" if name.startswith("torus_rocksdb_consensus_") or name.endswith("__consensus") else "0"
 
 
 def parse_metrics(text, bucket_names):
@@ -38,6 +49,10 @@ def parse_metrics(text, bucket_names):
         name, value = fields[0], fields[1] if len(fields) > 1 else ""
         values[name] = value
         base, brace, _ = name.partition("{")
+        if brace and 'db="consensus"' in name:
+            cf = CF_LABEL.search(name)
+            if cf:
+                values[f"{base}__{cf.group(1)}__consensus"] = value
         bound = LE.search(name) if brace and base in bucket_names else None
         if bound:
             buckets.append((base, bound.group(1), value))
@@ -144,7 +159,7 @@ class CsvSink:
         values, buckets = parse_metrics(response.text if response.success else "", self.bucket_names)
         ts = int(response.completed_wall)
         def row(columns):
-            return ",".join(values.get(name, "0") for name in columns)
+            return ",".join(values.get(name, absent_value(name)) for name in columns)
         self.wide.write(f"{ts},{node},{row(self.columns[0])}\n")
         self.funnels[node].write(f"{ts},{row(self.columns[1])}\n")
         self.phases[node].write(f"{ts},{row(self.columns[2])}\n")

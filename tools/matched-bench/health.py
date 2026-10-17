@@ -36,6 +36,26 @@ DEFAULT_MAX_LAG = 2
 DEFAULT_FEED_MEMPOOL_MAX = 6  # 2 rounds x 3 validators x 1 chunk (<= 256 markets)
 FEED_LIVE_COLUMNS = ('elapsed_s', 'node', 'committed', 'exec_lag', 'mempool',
                      'chain_blocks', 'chain_ms', 'quiet_elapsed_s')
+# --to-height (s64, run-cell's paused-feed settle): the executed height. The exec
+# thread sets torus_block_height after each block it executes (app.rs
+# execute_committed_block_with), and torus_exec_queue_depth counts the committed
+# blocks dispatched to it but not yet executed, so executed + queue is the
+# node's committed height.
+EXEC_HEIGHT = 'torus_block_height'
+TARGET_MISSED_RC = 3
+
+
+def committed_height(sample):
+    """A node's committed height: executed height + blocks queued for execution."""
+    return sample[EXEC_HEIGHT] + sample[EXEC_QUEUE]
+
+
+def height_target(samples):
+    """The highest committed height across the 3 nodes, or None unless every
+    scrape is complete (a target from a partial trio could sit too low)."""
+    if len(samples) != 3 or not all(complete(s, REQUIRED + (EXEC_HEIGHT,)) for s in samples):
+        return None
+    return int(max(committed_height(s) for s in samples))
 
 
 def complete(sample, keys):
@@ -123,10 +143,14 @@ class DrainTracker:
 
     feed_live: only the order counters must be quiet; the native mempool may
     hold up to feed_mempool_max entries and the exec lag (torus_exec_queue_depth:
-    committed blocks not yet executed) must stay <= max_lag on every sample."""
+    committed blocks not yet executed) must stay <= max_lag on every sample.
+
+    min_height: also every node's executed height (EXEC_HEIGHT) >= min_height;
+    a node without the gauge never counts as there."""
     def __init__(self, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
-                 feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX):
+                 feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, min_height=None):
         self.quiet_s = quiet_s
+        self.min_height = min_height
         self.quiet_keys = ORDER_FLOW if feed_live else FLOW
         self.limits = (feed_mempool_max, max_lag) if feed_live else (0, IDLE_EXEC_QUEUE_MAX)
         self.base = None
@@ -157,10 +181,25 @@ class DrainTracker:
                      all(s[COMMITTED] > b[COMMITTED] for s, b in zip(samples, self.base)))
         if same and not ready:
             reason = 'waiting for quiet interval and commit progress on every node'
+        behind = self.behind(samples) if good else []
+        if behind:
+            ready = False
+            reason = 'waiting for every node to execute height %d (%s)' % (self.min_height, behind_text(behind))
         self.previous = [dict(s) for s in samples] if good else None
         self.last_time = now
         return {'drained': ready, 'reason': 'quiet and advancing' if ready else reason,
                 'quiet_elapsed_s': now-self.since if self.since is not None else 0}
+
+    def behind(self, samples):
+        """[(node, executed height or None)] below min_height; [] without one."""
+        if self.min_height is None:
+            return []
+        return [(node, s.get(EXEC_HEIGHT)) for node, s in zip(NODES, samples)
+                if not (complete(s, (EXEC_HEIGHT,)) and s[EXEC_HEIGHT] >= self.min_height)]
+
+
+def behind_text(behind):
+    return ', '.join('%s at %s' % (n, 'no height' if h is None else int(h)) for n, h in behind)
 
 
 def percentile(values, p):
@@ -228,9 +267,15 @@ def fetch(url, extra=()):
 
 
 def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAULT_MAX_LAG,
-                   feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX):
-    tracker = DrainTracker(quiet_s, feed_live, max_lag, feed_mempool_max)
+                   feed_mempool_max=DEFAULT_FEED_MEMPOOL_MAX, to_height=None):
+    """to_height: None (no height condition), an int, or 'auto' = the
+    height_target() of the first complete scrape (the chain at the call)."""
+    tracker = DrainTracker(quiet_s, feed_live, max_lag, feed_mempool_max,
+                           to_height if isinstance(to_height, int) else None)
     extra = (CHAIN_SUM, CHAIN_COUNT) if feed_live else ()
+    if to_height is not None:
+        extra += (EXEC_HEIGHT,)
+    target_by_node, heights = None, {n: None for n in NODES}
     rows, previous = [], [{} for _ in urls]
     start = time.monotonic()
     result = {'drained': False, 'reason': 'timeout before a complete scrape'}
@@ -238,7 +283,17 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
         while time.monotonic()-start < timeout_s:
             samples = list(pool.map(lambda url: fetch(url, extra), urls))
             elapsed = time.monotonic()-start
+            if to_height == 'auto' and tracker.min_height is None:
+                tracker.min_height = height_target(samples)
+                if tracker.min_height is not None:
+                    target_by_node = {n: int(committed_height(s)) for n, s in zip(NODES, samples)}
+            for n, s in zip(NODES, samples):
+                if EXEC_HEIGHT in s:
+                    heights[n] = int(s[EXEC_HEIGHT])
             result = tracker.observe(elapsed, samples)
+            if to_height == 'auto' and tracker.min_height is None:
+                result = dict(result, drained=False,
+                              reason='height target not recorded yet: no complete scrape')
             if elapsed >= timeout_s:
                 result = dict(result, drained=False, reason='drain deadline exceeded')
             log.write(json.dumps({'ts': time.time(), 'elapsed_s': elapsed, 'samples': samples,
@@ -251,6 +306,16 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
                 break
             time.sleep(min(1, max(0, timeout_s-(time.monotonic()-start))))
     result.update(elapsed_s=time.monotonic()-start, quiet_s=quiet_s, timeout_s=timeout_s)
+    target_missed = False
+    if to_height is not None:
+        target = tracker.min_height
+        behind = [(n, h) for n, h in heights.items() if h is None or target is None or h < target]
+        target_missed = not result['drained'] and (target is None or bool(behind))
+        result.update(to_height=to_height, target_height=target, target_reached=not target_missed,
+                      target_committed_by_node=target_by_node, exec_heights=heights)
+        if target_missed:
+            result['reason'] = ('height target not recorded: no complete scrape' if target is None else
+                                'height target %d not reached (%s)' % (target, behind_text(behind)))
     if feed_live:
         with (out/'drain-feed-live.tsv').open('w') as tsv:
             tsv.write('\t'.join(FEED_LIVE_COLUMNS)+'\n')
@@ -261,7 +326,7 @@ def wait_for_drain(urls, out, timeout_s, quiet_s, feed_live=False, max_lag=DEFAU
                                    feed_mempool_max=feed_mempool_max)
     (out/'drain.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result))
-    return 0 if result['drained'] else 1
+    return 0 if result['drained'] else TARGET_MISSED_RC if target_missed else 1
 
 
 def acceptance(liveness, drained, bench_rc, agreement, dissemination_clean, crash=None):
@@ -303,6 +368,10 @@ def main():
                        help='--feed-live: max torus_exec_queue_depth on every sample')
     drain.add_argument('--feed-mempool-max', type=int, default=DEFAULT_FEED_MEMPOOL_MAX,
                        help="--feed-live: max native mempool size (the feed's own entries)")
+    drain.add_argument('--to-height', type=to_height_arg, default=None,
+                       help="also wait until every node executed this height ('auto': the highest "
+                            "committed height across the nodes at the first complete scrape); "
+                            "exit %d if it is not reached within --timeout" % TARGET_MISSED_RC)
     accept = sub.add_parser('accept')
     accept.add_argument('summary', type=Path)
     args = parser.parse_args()
@@ -314,7 +383,19 @@ def main():
     if min(args.max_lag, args.feed_mempool_max) < 0:
         parser.error('max-lag and feed-mempool-max must be >= 0')
     return wait_for_drain(args.urls, args.out, args.timeout, args.quiet, args.feed_live,
-                          args.max_lag, args.feed_mempool_max)
+                          args.max_lag, args.feed_mempool_max, args.to_height)
+
+
+def to_height_arg(value):
+    if value == 'auto':
+        return value
+    try:
+        height = int(value)
+    except ValueError:
+        height = 0
+    if height <= 0:
+        raise argparse.ArgumentTypeError("'auto' or a positive height (got %r)" % value)
+    return height
 
 
 if __name__ == '__main__':
