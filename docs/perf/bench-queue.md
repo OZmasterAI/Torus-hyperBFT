@@ -2,8 +2,8 @@
 
 Benches run on archy only. 18c keeps this list current; archy reads it on pull. IDs (Q1, Q2, ...) stay fixed when an
 item moves between sections.
-Last archy benches: `ozarchy-q5c` (Q5, section 80 of `ozarchy-antispam-item6-pf1-2026-10-04.md`), 2026-10-17;
-before it `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
+Last archy benches: `ozarchy-q8p2` (Q8, section 81) and `ozarchy-q5c` (Q5, section 80) of
+`ozarchy-antispam-item6-pf1-2026-10-04.md`, 2026-10-17; before them `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
 
 ## Order (owner s125, updated s127)
 
@@ -38,6 +38,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    its checks (Q5 below). Gates every later campaign. **Done s64 (setup PASS, M = e3d11cb9).**
 2. **Q8. Item 6 Phase 5 step 0 profile** (campaign P, profile only, no A/B, ~1.5 h, `perf_event_paranoid=1` for this
    run only). Sent to archy directly (s125); it decides whether and how much of Phase 5 gets built.
+   **Done s66 (ozarchy-q8p2, 9 / 9 valid; section 81): exec ~131 / ~149 ms per native block ON / OFF; flush_all 11%,
+   Keccak 10-11%, save_order_books 6-7%, put_cf_raw 5%, borsh 5%, merge_disjoint 4%; exec off-CPU 20-26% (pool waits,
+   one ~1 s pipeline_barrier per 15 s); hotstuff-algo blocked on the full exec channel 9-35%.**
 3. **Q7. Item 7 step 2: READY (s126), ~2.5 h.** Arm A = main at the merge base **db84a1ad**; arm B =
    `feat/item7-step2` head **c567b1b3** (origin). C1-C10 built and Codex-clean, 4-validator devnet check done, main
    with the s58 bundle merged in, EVM double-inclusion fix and its follow-ups Codex-clean; gates nextest --workspace
