@@ -28153,6 +28153,543 @@ mod crash_recovery_tests {
     }
 
     // ======================================================================
+    // Item 6 Phase 5 step 1 (`docs/plans/item6-phase5-impl.md` Task 1.2): the
+    // long differential harness, reused by every later step. Two nodes, each
+    // on its own DB, run the same random block stream in lockstep: one on the
+    // reference path (today's overlay writes, the Phase 4 path), one on the
+    // typed path. After every block: the consensus write set of every height
+    // hashed since the last block (`h_n`), the durable markers, the action
+    // status row of every height that became durable, and the full CF dump
+    // once `dump_every` more heights are durable; at the end the running hash
+    // and the final dump. Step 1 has no typed path yet: both nodes run the
+    // reference path, so the harness passes trivially and must catch a
+    // planted divergence (`harness_detects_one_flipped_row`).
+    // ======================================================================
+
+    /// Which path a node of the Phase 5 differential runs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum P5Path {
+        /// Today's overlay writes (the Phase 4 path).
+        Reference,
+        /// Phase 5's typed writes (from step 2 on).
+        Typed,
+    }
+
+    /// The node's switch for `path`. Step 1 has no typed path: both paths
+    /// run today's overlay writes (step 2 sets the typed path here).
+    fn p5_configure(ctx: &mut ExecutionContext, path: P5Path) {
+        let _ = (ctx, path);
+    }
+
+    /// The checkpoint interval of a pipelined node.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum P5Ckpt {
+        /// Interval 0: every block flushed.
+        PerBlock,
+        /// A checkpoint every 5 blocks (the 15 s-like cell).
+        Every5,
+        /// Never by time: attest heights, barriers and shutdown only.
+        Never,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct P5Config {
+        pipelined: bool,
+        mode: torus_bridge::native_executor::BookMode,
+        ckpt: P5Ckpt,
+    }
+
+    /// Every configuration: serial in every BookMode; pipelined per block in
+    /// every mode, and with a checkpoint every 5 blocks and never by time in
+    /// the non-deferred modes (Classic, OrderRows: modes 2/3 refuse an
+    /// interval, `check_checkpoint_book_mode`).
+    fn p5_configs() -> Vec<P5Config> {
+        use torus_bridge::native_executor::BookMode;
+        let modes = [BookMode::Classic, BookMode::OrderRows, BookMode::LevelAuthority, BookMode::LevelAuthorityChunked];
+        let mut out: Vec<P5Config> = modes.iter().map(|&mode| P5Config { pipelined: false, mode, ckpt: P5Ckpt::PerBlock }).collect();
+        for mode in modes {
+            out.push(P5Config { pipelined: true, mode, ckpt: P5Ckpt::PerBlock });
+            if matches!(mode, BookMode::Classic | BookMode::OrderRows) {
+                out.push(P5Config { pipelined: true, mode, ckpt: P5Ckpt::Every5 });
+                out.push(P5Config { pipelined: true, mode, ckpt: P5Ckpt::Never });
+            }
+        }
+        out
+    }
+
+    /// The validator the stream's buffered slashes hit.
+    fn p5_slashed() -> Address {
+        Address::repeat_byte(0x77)
+    }
+
+    /// `p2_fixture` (C5's markets, oracle validators, traders, makers and
+    /// the thin positions, V4), every trader and maker with a large EVM
+    /// balance (EVM -> perp refunds keep long streams trading; EVM lockbox
+    /// deposits), and a registered validator for the slashes; the EVM trie
+    /// built over them. Epoch length 50 (C5's).
+    fn p5_fixture() -> (ChainConfig, StateDb) {
+        let (config, db) = p2_fixture();
+        let evm = U256::from(1_000_000_000u128 * FixedPoint::ONE.raw() as u128);
+        for seed in C5_TRADERS.into_iter().chain(C5_MAKERS) {
+            fund_evm_balance(&db, oracle_addr(seed), evm);
+        }
+        register_proposer(&db, p5_slashed());
+        // The EVM trie over the accounts written above, as the node builds it
+        // at boot (otherwise the first EVM bundle starts a partial trie and
+        // the next EVM block's incremental root fails its full-scan check).
+        torus_state::incremental::ensure_trie_built(&db).unwrap();
+        (config, db)
+    }
+
+    /// One block of the stream, with what the consensus side hands execution.
+    struct P5Block {
+        block: TorusBlock,
+        slashes: Vec<PendingSlash>,
+        /// The block fails with a local fault (a nonce write): fail-stop,
+        /// then a restart replays the committed blocks above the marker.
+        fatal: bool,
+    }
+
+    /// What the stream holds (non-vacuity of the input side).
+    #[derive(Debug, Default)]
+    struct P5Fed {
+        native: u64,
+        empty: u64,
+        evm_blocks: u64,
+        evm_deposits: u64,
+        evm_creates: u64,
+        slashes: u64,
+        epoch_boundaries: u64,
+        shocks: u64,
+        refunds: u64,
+        stops: u64,
+        reduce_only: u64,
+        fatal: u64,
+    }
+
+    /// The Phase 5 stream: heights 1..=n (ts 1000 + h), linked. C5 / P2's
+    /// mark walk (oracle rounds every 5th block plus at random), pulled back
+    /// towards 100 and shocked every 150 blocks (-15% / +18%, one market in
+    /// turn): liquidations and ADL. Each non-empty block: a maker requotes
+    /// every market (its cancel-all every 4th block), V4 rests early, 2-5
+    /// trader actions from P2's mix (resting / crossing limits, stop-limits,
+    /// stop-markets, cancel-alls, two-market batches; a third of the places
+    /// reduce-only), now and then an EVM -> perp refund or a perp -> EVM
+    /// transfer. EVM blocks at about one EVM height in four (h % 5 == 0):
+    /// lockbox deposits (credited by the next block's CoreWriter drain) and
+    /// contract creations, with the EVM nonces tracked. A buffered slash every
+    /// 97 blocks; epoch boundaries every 50 (the fixture's epoch length); one
+    /// fatal block at 2/5 of the stream; ~1/7 of the other blocks empty.
+    fn p5_blocks(n: u64, seed: u64) -> (Vec<P5Block>, P5Fed) {
+        let mut rng = C5Rng(seed);
+        let mut fed = P5Fed::default();
+        let mut mark = [100i64; 3];
+        let mut evm_nonce: std::collections::HashMap<u8, u64> = Default::default();
+        let lockbox = torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
+        let fatal_at = (n * 2 / 5).max(3);
+        let units = |v: u128| U256::from(v * FixedPoint::ONE.raw() as u128);
+        let order = |m: u64, is_buy: bool, price: i64, qty: i64, order_type: torus_types::OrderType| torus_types::PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: px(price),
+            quantity: px(qty),
+            order_type,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let limit = |m: u64, is_buy: bool, price: i64, qty: i64| order(m, is_buy, price, qty, torus_types::OrderType::Limit);
+        let mut blocks = Vec::new();
+        let mut extra: Vec<(Vec<PendingSlash>, bool)> = Vec::new();
+        for h in 1..=n {
+            // Per-sender nonces in this height's window (D12).
+            let mut per_sender: std::collections::HashMap<u8, u64> = Default::default();
+            let mut sign = |seed: u8, action: NativeAction| {
+                let k = per_sender.entry(seed).or_insert(0);
+                *k += 1;
+                torus_types::eip712::sign_native_action(action, NONCE_BASE + h * 1_000 + 100 + *k, &oracle_key(seed))
+            };
+            let mut actions = Vec::new();
+            let shock = h % 150 == 60;
+            let mark_round = h == 1 || h % 5 == 1 || shock || rng.below(4) == 0;
+            if mark_round {
+                if shock {
+                    fed.shocks += 1;
+                    let i = (h / 150 % 3) as usize;
+                    mark[i] = if (h / 150) % 2 == 0 { mark[i] * 85 / 100 } else { mark[i] * 118 / 100 };
+                } else if h > 1 {
+                    for p in &mut mark {
+                        *p = (*p + rng.below(5) as i64 - 2 + (100 - *p).signum()).clamp(50, 200);
+                    }
+                }
+                for (seed, _) in ORACLE_VALIDATORS {
+                    let prices = C5_MARKETS.iter().zip(mark).map(|(m, p)| (*m, px(p))).collect();
+                    actions.push(torus_types::eip712::sign_native_action(
+                        NativeAction::SubmitOraclePrices(torus_types::OracleSubmission { prices, timestamp: (1_000 + h) * 1_000 }),
+                        NONCE_BASE + h * 1_000 + seed as u64,
+                        &oracle_key(seed),
+                    ));
+                }
+            }
+            let evm = h % TEST_EVM_BLOCK_INTERVAL == 0 && rng.below(4) == 0;
+            let slashes = if h % 97 == 0 {
+                fed.slashes += 1;
+                vec![PendingSlash { validator: p5_slashed(), fraction_bps: 10, reason: SlashReason::DoubleSign, tombstone: false }]
+            } else {
+                vec![]
+            };
+            fed.epoch_boundaries += u64::from(h % C5_EPOCH == 0);
+            let fatal = h == fatal_at;
+            let mut evm_txs = Vec::new();
+            if evm {
+                fed.evm_blocks += 1;
+                for _ in 0..1 + rng.below(2) {
+                    let seed = C5_TRADERS[rng.below(C5_TRADERS.len() as u64) as usize];
+                    let nonce = evm_nonce.entry(seed).or_insert(0);
+                    let key = oracle_key(seed);
+                    if rng.below(3) == 0 {
+                        fed.evm_creates += 1;
+                        evm_txs.push(signed_sstore_create(&key, *nonce));
+                    } else {
+                        fed.evm_deposits += 1;
+                        let wei: u128 = 300 * 10u128.pow(18);
+                        let mut calldata = alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4].to_vec();
+                        calldata.extend_from_slice(&U256::from(wei).to_be_bytes::<32>());
+                        evm_txs.push(signed_eip1559_with_value(&key, *nonce, alloy_primitives::TxKind::Call(lockbox), calldata, U256::from(wei)));
+                    }
+                    *nonce += 1;
+                }
+            }
+            let empty = !mark_round && !evm && slashes.is_empty() && !fatal && rng.below(7) == 0;
+            if empty {
+                fed.empty += 1;
+            } else {
+                fed.native += 1;
+                let maker = C5_MAKERS[(h % 2) as usize];
+                if h % 4 == 0 {
+                    actions.push(sign(maker, NativeAction::CancelAllOrders { market_id: None }));
+                }
+                let quotes = C5_MARKETS
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(i, m)| {
+                        let q = 2 + (h as i64 + i as i64) % 4;
+                        [limit(m, true, mark[i] - 1 - (h % 2) as i64, q), limit(m, false, mark[i] + 1 + (h % 2) as i64, q)]
+                    })
+                    .collect();
+                actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
+                if (2..=40).contains(&h) && h % 4 == 3 {
+                    actions.push(sign(P2_V4, NativeAction::PlaceOrder(limit(2, true, mark[1] - 30, 1))));
+                }
+                for _ in 0..2 + rng.below(4) {
+                    let t = C5_TRADERS[rng.below(C5_TRADERS.len() as u64) as usize];
+                    let mi = rng.below(3) as usize;
+                    let (m, p) = (C5_MARKETS[mi], mark[mi]);
+                    let qty = 1 + rng.below(4) as i64;
+                    let is_buy = rng.below(2) == 0;
+                    let mut action = match rng.below(14) {
+                        0..=2 => {
+                            let off = 1 + rng.below(3) as i64;
+                            NativeAction::PlaceOrder(limit(m, is_buy, if is_buy { p - off } else { p + off }, qty))
+                        }
+                        3..=5 => NativeAction::PlaceOrder(limit(m, is_buy, if is_buy { p + 2 } else { p - 2 }, qty + 4)),
+                        6 => {
+                            fed.stops += 1;
+                            let (trigger, lim) = if is_buy { (p + 2, p + 1) } else { (p - 2, p - 1) };
+                            NativeAction::PlaceOrder(order(
+                                m,
+                                is_buy,
+                                lim,
+                                qty,
+                                torus_types::OrderType::StopLimit { trigger: px(trigger), limit: px(lim) },
+                            ))
+                        }
+                        7 => {
+                            fed.stops += 1;
+                            let trigger = if is_buy { p + 3 } else { p - 3 };
+                            let cap = if is_buy { trigger + 10 } else { trigger - 10 };
+                            NativeAction::PlaceOrder(order(m, is_buy, cap, qty, torus_types::OrderType::StopMarket { trigger: px(trigger) }))
+                        }
+                        8 | 9 => NativeAction::CancelAllOrders { market_id: (rng.below(2) == 0).then_some(m) },
+                        10 => {
+                            fed.refunds += 1;
+                            NativeAction::TransferToPerp { amount: units(2_000) }
+                        }
+                        11 if rng.below(3) == 0 => NativeAction::TransferToSpot { amount: units(50) },
+                        _ => {
+                            let mj = (mi + 1) % 3;
+                            NativeAction::PlaceOrderBatch(vec![
+                                limit(m, true, p - 1 - rng.below(3) as i64, qty),
+                                limit(C5_MARKETS[mj], false, mark[mj] + 1 + rng.below(3) as i64, qty),
+                            ])
+                        }
+                    };
+                    let legs = match &mut action {
+                        NativeAction::PlaceOrder(p) => std::slice::from_mut(p),
+                        NativeAction::PlaceOrderBatch(ps) => ps.as_mut_slice(),
+                        _ => &mut [],
+                    };
+                    for p in legs {
+                        if rng.below(3) == 0 {
+                            p.reduce_only = true;
+                            fed.reduce_only += 1;
+                        }
+                    }
+                    actions.push(sign(t, action));
+                }
+            }
+            fed.fatal += u64::from(fatal);
+            let mut b = make_block(h, actions);
+            b.header.evm_tx_count = evm_txs.len() as u32;
+            b.evm_transactions = evm_txs;
+            blocks.push(b);
+            extra.push((slashes, fatal));
+        }
+        link_blocks(&mut blocks);
+        let out = blocks.into_iter().zip(extra).map(|(block, (slashes, fatal))| P5Block { block, slashes, fatal }).collect();
+        (out, fed)
+    }
+
+    /// One node of the differential: its DB, its context (recreated after
+    /// the fatal block) and what it saw.
+    struct P5Node {
+        cfg: P5Config,
+        path: P5Path,
+        config: ChainConfig,
+        db: StateDb,
+        ctx: Option<ExecutionContext>,
+        metrics: Arc<torus_telemetry::Metrics>,
+        probe: Option<BlockProbe>,
+        /// Restarts after a fatal block; the most heights executed above the
+        /// durable marker after any block.
+        restarts: u64,
+        max_lag: u64,
+    }
+
+    impl P5Node {
+        fn new(cfg: P5Config, path: P5Path, probe: Option<BlockProbe>) -> Self {
+            let (config, db) = p5_fixture();
+            torus_state::running_hash::capture_begin(&db);
+            let metrics = Arc::new(torus_telemetry::Metrics::new());
+            let mut node = Self { cfg, path, config, db, ctx: None, metrics, probe, restarts: 0, max_lag: 0 };
+            node.ctx = Some(node.new_ctx(true));
+            node
+        }
+
+        fn new_ctx(&self, attach: bool) -> ExecutionContext {
+            let mut ctx = make_exec_ctx(&self.config, &self.db);
+            ctx.test_book_mode = Some(self.cfg.mode);
+            ctx.metrics = Some(self.metrics.clone());
+            ctx.checkpoint = match self.cfg.ckpt {
+                P5Ckpt::PerBlock => None,
+                P5Ckpt::Every5 => Some(ckpt_every(5)),
+                P5Ckpt::Never => Some(ckpt_never()),
+            };
+            ctx.test_block_probe = self.probe.clone();
+            p5_configure(&mut ctx, self.path);
+            if self.cfg.pipelined && attach {
+                ctx.attach_flush_worker(None);
+            }
+            ctx
+        }
+
+        /// Execute `b`; W drained after it. A fatal block fail-stops, nothing
+        /// of it is durable, and a new context replays the committed blocks
+        /// above the durable marker (the fatal one without its fault).
+        fn execute(&mut self, b: &P5Block) {
+            let h = b.block.header.height;
+            let what = format!("{:?} {:?}", self.path, self.cfg);
+            let durable = persist_committed_block_durably(&self.db, &b.block);
+            let ctx = self.ctx.as_mut().expect("a context");
+            if b.fatal {
+                ctx.test_replay_fault = Some(ReplayFault::NoncePut);
+            }
+            ctx.execute_committed_block_with(&b.block, b.slashes.clone(), durable);
+            if b.fatal {
+                let failed = self.ctx.take().expect("a context");
+                failed.pipeline_barrier();
+                assert!(failed.exec_failed.load(Ordering::SeqCst), "{what}: the fatal block {h} fail-stops");
+                drop(failed);
+                assert!(read_native_applied_height(&self.db).unwrap_or(0) < h, "{what}: nothing of {h} durable");
+                let mut replay = self.new_ctx(false);
+                let (_last, parked) = TorusApp::replay_committed(&self.db, &replay);
+                assert_eq!(parked, None, "{what}");
+                assert!(!replay.exec_failed.load(Ordering::SeqCst), "{what}: replay after {h}");
+                assert_eq!(read_native_applied_height(&self.db), Some(h), "{what}: replayed through {h}");
+                if self.cfg.pipelined {
+                    replay.attach_flush_worker(None);
+                }
+                self.ctx = Some(replay);
+                self.restarts += 1;
+                return;
+            }
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: fail-stop at {h}");
+            if let Some(w) = ctx.flush_worker.as_ref() {
+                assert!(w.wait_idle(), "{what}: W failed at {h}");
+            }
+            self.max_lag = self.max_lag.max(h - read_native_applied_height(&self.db).unwrap_or(0));
+        }
+    }
+
+    /// The first difference the harness found: at which block, and what.
+    #[derive(Debug)]
+    struct P5Divergence {
+        height: u64,
+        what: String,
+    }
+
+    /// What the harness compared (non-vacuity of the check side).
+    #[derive(Debug, Default)]
+    struct P5Compared {
+        heights_hashed: u64,
+        status_rows: u64,
+        dumps: u64,
+        durable_seen: u64,
+        dumped_at: u64,
+    }
+
+    /// One run's outcome: what was compared and what the stream did.
+    #[derive(Debug)]
+    struct P5Summary {
+        compared: P5Compared,
+        restarts: u64,
+        max_lag: u64,
+        fills: usize,
+        liquidations: u64,
+        bbo_rows: usize,
+    }
+
+    /// After block `h` on both nodes (both idle): see the section comment.
+    fn p5_compare(a: &P5Node, b: &P5Node, h: u64, dump_every: u64, c: &mut P5Compared) -> Result<(), P5Divergence> {
+        let _ = (a, b, h, dump_every, c);
+        Ok(())
+    }
+
+    /// The differential: `blocks` through a reference node and a typed node
+    /// (`probe` on the typed node's contexts, the planted divergence) in
+    /// lockstep, compared after every block and at the end; the first
+    /// difference is returned.
+    fn p5_differential(
+        blocks: &[P5Block],
+        cfg: P5Config,
+        probe: Option<BlockProbe>,
+        dump_every: u64,
+    ) -> Result<P5Summary, P5Divergence> {
+        let mut a = P5Node::new(cfg, P5Path::Reference, None);
+        let mut b = P5Node::new(cfg, P5Path::Typed, probe);
+        let mut compared = P5Compared::default();
+        for blk in blocks {
+            a.execute(blk);
+            b.execute(blk);
+            p5_compare(&a, &b, blk.block.header.height, dump_every, &mut compared)?;
+        }
+        let last = blocks.last().map_or(0, |b| b.block.header.height);
+        drop(a.ctx.take());
+        drop(b.ctx.take());
+        p5_compare(&a, &b, last, 1, &mut compared)?;
+        let (ha, hb) = (torus_state::running_hash::read_running_hash(&a.db), torus_state::running_hash::read_running_hash(&b.db));
+        if ha != hb {
+            return Err(P5Divergence { height: last, what: format!("running hash {ha:?} vs {hb:?}") });
+        }
+        let rows = |cf| StateBackend::iterate_cf(&a.db, cf, None).unwrap().len();
+        Ok(P5Summary {
+            compared,
+            restarts: a.restarts,
+            max_lag: a.max_lag,
+            fills: rows(torus_state::cf::CF_NATIVE_TRADES),
+            liquidations: a.metrics.liquidations_triggered.get(),
+            bbo_rows: rows(torus_state::cf::CF_NATIVE_BBO),
+        })
+    }
+
+    /// The matrix: the `n`-block stream through every configuration; no
+    /// divergence, and both sides non-vacuous.
+    fn p5_differential_matrix(n: u64, dump_every: u64) {
+        let started = std::time::Instant::now();
+        let (blocks, fed) = p5_blocks(n, 0x5005_0001);
+        assert_eq!(blocks.len() as u64, n);
+        println!("P5 differential: {n} blocks, fed {fed:?}");
+        assert!(fed.evm_blocks >= 3 && fed.evm_deposits >= 2 && fed.evm_creates >= 1, "{fed:?}");
+        assert!(fed.slashes >= 3 && fed.epoch_boundaries >= 5 && fed.shocks >= 2 && fed.fatal == 1, "{fed:?}");
+        assert!(fed.empty >= 10 && fed.refunds >= 10 && fed.stops >= 20 && fed.reduce_only >= 50, "{fed:?}");
+        for cfg in p5_configs() {
+            let t = std::time::Instant::now();
+            let s = p5_differential(&blocks, cfg, None, dump_every)
+                .unwrap_or_else(|d| panic!("{cfg:?}: diverged at {}: {}", d.height, d.what));
+            println!("P5 differential {cfg:?}: {s:?}; {:.1} s", t.elapsed().as_secs_f64());
+            assert!(s.compared.heights_hashed >= n, "{cfg:?}: every height hashed: {s:?}");
+            assert_eq!(s.compared.durable_seen, n, "{cfg:?}: every height durable at the end");
+            assert!(s.compared.status_rows >= fed.native, "{cfg:?}: action status rows {s:?}");
+            assert!(s.compared.dumps >= (n / dump_every / 4).max(2), "{cfg:?}: dumps {s:?}");
+            assert_eq!(s.restarts, 1, "{cfg:?}: one fatal block");
+            assert!(s.fills >= n as usize && s.liquidations >= 3 && s.bbo_rows >= 1, "{cfg:?}: {s:?}");
+            if cfg.ckpt != P5Ckpt::PerBlock {
+                assert!(s.max_lag >= 4, "{cfg:?}: blocks above the durable marker: {s:?}");
+            }
+        }
+        println!("P5 differential: {n} blocks x {} configurations in {:.1} s", p5_configs().len(), started.elapsed().as_secs_f64());
+    }
+
+    /// Plan Task 1.2: `phase5_differential_long_random`, ~300 blocks through
+    /// every configuration (serial / pipelined, interval 0 / every 5 blocks /
+    /// never, all BookModes; EVM, slash, epoch and a fatal block).
+    #[test]
+    fn phase5_differential_long_random() {
+        p5_differential_matrix(300, 1);
+    }
+
+    /// The long variant: 10,000 blocks through every configuration, a CF
+    /// dump every 50 durable heights.
+    #[test]
+    #[ignore = "long: 10k blocks x every configuration; run with --ignored"]
+    fn phase5_differential_long_random_10k() {
+        p5_differential_matrix(10_000, 50);
+    }
+
+    /// Plan Task 1.2: `harness_detects_one_flipped_row`. A probe on the
+    /// typed node rewrites one positions row with one byte flipped in block
+    /// k: the harness reports a divergence at exactly k, naming the positions
+    /// CF; the same stream without the probe has none.
+    #[test]
+    fn harness_detects_one_flipped_row() {
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::cf::CF_NATIVE_POSITIONS;
+        let (blocks, _fed) = p5_blocks(40, 0x5005_0001);
+        let k = blocks
+            .iter()
+            .map(|b| &b.block)
+            .find(|b| b.header.height >= 8 && !b.native_actions.is_empty() && b.evm_transactions.is_empty())
+            .expect("a native block")
+            .header
+            .height;
+        let flipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = flipped.clone();
+        let probe: BlockProbe = Arc::new(move |ctx: &NativeExecContext<NativeStateOverlay>| {
+            if ctx.block_height != k || seen.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let rows = StateBackend::iterate_cf(&ctx.state, CF_NATIVE_POSITIONS, None).unwrap();
+            let (key, mut row) = rows.into_iter().find(|(key, _)| key.len() == 28).expect("a position row");
+            // The last byte of `isolated_margin`: the row still decodes.
+            let at = row.len() - 2;
+            row[at] ^= 1;
+            StateBackend::put_cf_raw(&ctx.state, CF_NATIVE_POSITIONS, &key, &row).unwrap();
+        });
+        for cfg in [
+            P5Config { pipelined: false, mode: BookMode::Classic, ckpt: P5Ckpt::PerBlock },
+            P5Config { pipelined: true, mode: BookMode::Classic, ckpt: P5Ckpt::Every5 },
+        ] {
+            flipped.store(false, Ordering::SeqCst);
+            let err = p5_differential(&blocks, cfg, Some(probe.clone()), 1).expect_err("the flipped row is caught");
+            assert!(flipped.load(Ordering::SeqCst), "{cfg:?}: the probe ran");
+            assert_eq!(err.height, k, "{cfg:?}: caught at the flipped block: {err:?}");
+            assert!(err.what.contains(CF_NATIVE_POSITIONS), "{cfg:?}: names the positions CF: {err:?}");
+            p5_differential(&blocks, cfg, None, 1)
+                .unwrap_or_else(|d| panic!("{cfg:?}: diverged without the flip at {}: {}", d.height, d.what));
+        }
+    }
+
+    // ======================================================================
     // Item 6 Phase 2 (plan 9.8): app-level differential of torus-bridge's
     // reference paths (full-scan cancel-all, per-row position flush) against
     // the production paths, through the test-only `test-reference-paths`
