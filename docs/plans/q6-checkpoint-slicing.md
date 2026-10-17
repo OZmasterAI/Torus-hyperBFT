@@ -521,23 +521,23 @@ the mechanism under a pick, the note says how.
 9. **C1 `unordered_write` as an extra arm?** (a) no; (b) build the flag and smoke it only if step 0 shows the
    insert stage dominates with no switch wait. **Pick: (a). Accepted.**
 
-New in revision 2 (open):
+New in revision 2: **decided (owner s127): all five picks accepted (10 b, 11 a, 12 a, 13 a, 14 a).**
 10. **Slice pacing:** (a) no gap; (b) build `TORUS_CKPT_SLICE_GAP_US` (default 0, ~15 lines) and run one follow-up
     cell pair with a gap only if the A/B leaves `on_committed_block` in - out > ~5 ms; (c) a gap arm in the A/B
-    itself. **Pick: (b)** (the estimate says the criterion is likely missed without it, but a gap costs barrier
+    itself. **Pick: (b). Accepted.** (the estimate says the criterion is likely missed without it, but a gap costs barrier
     latency; measure first).
 11. **Sliced write fails after >= 1 slice landed:** (a) fail-stop and exit the process, restart applies the redo;
     (b) stay up fail-stopped and make DB-direct RPC refuse (~40 call sites); (c) as today (stay up, serve the mixed
-    DB indefinitely). **Pick: (a)** (one line in the W error path, the redo makes the restart exact).
+    DB indefinitely). **Pick: (a). Accepted.** (one line in the W error path, the redo makes the restart exact).
 12. **EVM-resync gap outside sliced checkpoints** (per-block flushes and unsliced checkpoints, issue d48eb561,
     pre-existing): (a) out of Q6 scope, its own issue; (b) write a small resync-intent file for every flush with EVM
-    addresses. **Pick: (a).**
+    addresses. **Pick: (a). Accepted.**
 13. **Barrier-triggered checkpoints:** (a) slice them like any other (one code path; +0.2-0.5 s per barrier block,
     reported by the A/B); (b) write them as one batch (barrier latency as today, but the consensus thread waits for
-    the full batch again at each barrier). **Pick: (a)**, switch to (b) only if barrier block exec p99 rises
+    the full batch again at each barrier). **Pick: (a). Accepted**, switch to (b) only if barrier block exec p99 rises
     measurably in the A/B.
 14. **Step Z rule and size:** (a) n = 2 per arm screen with the GO / NO-GO / SHIP-Z rule of section 5; (b) n = 4
-    per arm up front. **Pick: (a)**, extended to n = 4 only if ambiguous.
+    per arm up front. **Pick: (a). Accepted**, extended to n = 4 only if ambiguous.
 
 ## 7. Review findings and how the design handles them
 Reviews of revision 1: Codex `reviews/codex-q6-design-adv.md` (C1-C4), Claude `reviews/q6-claude-review.md` (R1-R7 +
