@@ -60,6 +60,8 @@ Phase gate: +0-10% matched/s; RSS per user within section 4's estimate.
 
 ## Phase 5: full in-memory execution (size L)
 
+**Full plan: `item6-phase5-impl.md`** (it replaces the table below: hot state typed only, no RPC adapter, Gate 3 met by section 65; scope owner s127: steps 1, 2, 3 and 7).
+
 | item | gate |
 |---|---|
 | all native state typed in memory; overlay off the hot path; change set from typed dirty sets | full differential vs Phase 4 on long randomized sequences |
