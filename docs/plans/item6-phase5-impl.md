@@ -7,9 +7,11 @@ Parent design: `market-scaling-in-memory-design.md` Phase 5, section 4 (memory b
 
 **Base: Phase 4, built first as Phase 5's base (owner s119, not folded in).** Phase 4 steps 1-4 go ahead; step 5 (the
 open-order counter) runs last and stays only on its own net A/B, otherwise it is dropped or moved here (optional step 4
-below). **Phase 4 is not built yet:** its step 1 has RED tests only (`feat/item6-phase4-step1` `da59b395`). Wherever
-this plan names `Users`, `UserState`, `ResidentSource` or typed loads, it means the shape in `item6-phase4-impl.md`
-section 3 and steps 1-4, not code. Those anchors are re-checked when Phase 4 merges.
+below). **Phase 4 is on main (s127 note):** steps 1-4 and 6 merged in s121 (`fd82758f` and earlier, D12 after it).
+Step 5 failed its own A/B (section 68: net exec ~0, matched/s -1.10% [-3.49, +1.30]) and stays on
+`feat/item6-phase4-step5` `6288ebe8`, unmerged: it is optional step 4 here. Wherever this plan names `Users`,
+`UserState`, `ResidentSource` or typed loads, it was written against the shape in `item6-phase4-impl.md` section 3
+and steps 1-4 before the merge; those anchors are re-checked against main before step 1.
 
 **Code references are `file:line` on main `21d238e0`** (= origin/main). Crate paths are under `crates/`.
 

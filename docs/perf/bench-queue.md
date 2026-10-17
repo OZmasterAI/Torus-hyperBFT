@@ -43,7 +43,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    with the s58 bundle merged in, EVM double-inclusion fix and its follow-ups Codex-clean; gates nextest --workspace
    4021/4021, full cargo test 4022. Spec under Items, Q7. (Main after db84a1ad adds only docs, harness fixes and the
    behaviour-neutral exec-failed latch order fix, so arm A stays db84a1ad.) Both arms are fixed SHAs: campaign A
-   does not move it. Moved ahead of campaign A (s127): Q7 gates the step 2 merge and item 7 step 3.
+   does not move it. Moved ahead of campaign A (s127): Q7 gates the step 2 merge, the last item before the item 6
+   Phase 5 build (roadmap order s121; item 7 step 3 comes after Phase 5, `item7-evm-lanes.md`).
 4. **Campaign A** (~4 h 40): 7 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
    **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
    `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
@@ -60,9 +61,10 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
 
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10).
-7. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9). Moved
-   here in s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls
-   (prune by default, validator retention N) and the RH4 merge wait on it. Any long idle slot (overnight) also works.
+7. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
+   **NOT READY: waits on Q10 and the owner's custody decision** (Items, Q9, "Arm b depends on Q10"). Moved here in
+   s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls (prune by
+   default, validator retention N) and the RH4 merge wait on it.
 8. **Q6. 71.8 checkpoint slicing** vs M, when 18c delivers the code (not built yet; 18c adds the
    `persist_commit_manifest` timer first). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
@@ -135,6 +137,11 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   was not idle. Open files follow the SST count (`max_open_files` unset). 18c ports the RH4 DA body GC to
   `perf/rh4-da-body-gc` (GC only on pruning nodes; window `max(N, 1000) + 128` blocks) with the harness env var
   `TORUS_RETENTION_BLOCKS`; 18c says when the branch is ready (SHA then).
+  - Arm b depends on Q10 (s127). The branch is pushed as `origin/perf/rh4-da-body-gc` 4514573f, a backup, NOT the
+    Q9 SHA. Custody OFF by default after Q10: arm (b) = that head with `main` merged in, custody off as specified.
+    Custody stays ON: 18c first builds the RH4 shard-count fix (option d; today a validator-set shrink leaves
+    n_old - n_new shards per body of the ~3 boundary blocks), and arm (b) also runs `TORUS_SHARD_CUSTODY=1` so the
+    shard GC is measured too. Either way 18c merges `main` into the branch once, runs the gates and gives the SHA.
   - Arms (owner s126, two binaries): (a) main; (b) main + RH4 with `TORUS_RETENTION_BLOCKS=1000` (adds
     `--retention-blocks=1000`). RH4's GC is OFF on archive nodes (a short window would strand a node that was down,
     without state sync), so (b) needs the retention to do anything; 1000 is a test value (the GC starts within
@@ -168,7 +175,8 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   - Decision it feeds (owner): a real cost -> ship custody OFF by default until the validator set is large (roadmap
     T3.1), and the RH4 shard-count fix waits for T3.1 (likely lazy serve-time shards: nothing stored, nothing to GC).
     Within noise at 300 and 10 -> keep it on, 18c builds the RH4 shard-count fix (option d: max of the old and new
-    set's n for 64 blocks after a set change, kept in the GC's own batch), and benches switch to custody on.
+    set's n for 64 blocks after a set change, kept in the GC's own batch), benches switch to custody on, and Q9's
+    arm (b) runs custody on (Items, Q9).
 
 ## Later
 
