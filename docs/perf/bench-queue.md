@@ -2,7 +2,8 @@
 
 Benches run on archy only. 18c keeps this list current; archy reads it on pull. IDs (Q1, Q2, ...) stay fixed when an
 item moves between sections.
-Last archy benches: `ozarchy-q7m3` + `ozarchy-q7cl` (Q7, `item7-step2-native-ab.md`), `ozarchy-q8p2` (Q8, section 81)
+Last archy benches: `ozarchy-q7m3s` + `ozarchy-q7cls` (Q7 run 2; run 1 `ozarchy-q7m3` + `ozarchy-q7cl`;
+`item7-step2-native-ab.md`), `ozarchy-q8p2` (Q8, section 81)
 and `ozarchy-q5c` (Q5, section 80) of `ozarchy-antispam-item6-pf1-2026-10-04.md`, 2026-10-17; before them `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
 
 ## Order (owner s125, updated s127)
@@ -64,6 +65,11 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    unresolved). It ran `run-cell.sh`'s bare load defaults, not the standard load (see above), so it does not decide the
    merge. **RERUN (owner s127): both shapes at the standard load, same binaries (A db84a1ad, B c567b1b3), same
    rounds, before campaign A (~2 h). The rerun decides the merge.**
+   **Run 2 done s66 (ozarchy-q7m3s + ozarchy-q7cls, standard load, load check passed on every cell;
+   `item7-step2-native-ab.md` Run 2): matched/s B/A mode 3 1.0264 [0.9497, 1.1093], Classic 1.0115 [0.9942, 1.0290],
+   both pass; save_books per native block mode 3 +0.54 ms [-0.60, +1.69], Classic +0.62 ms [-0.34, +1.58], over the
+   0.3 ms bound by point estimate (CI unresolved); B's blocks are ~7.7% bigger and per 1k fills B - A is ~0 (+0.0033 /
+   +0.0003 ms). Owner / 18c decide the merge.**
 4. **Campaign A** (~4 h 40): 7 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
    **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
    `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
