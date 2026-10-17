@@ -5,7 +5,7 @@ item moves between sections.
 Last archy benches: `ozarchy-q5c` (Q5, section 80 of `ozarchy-antispam-item6-pf1-2026-10-04.md`), 2026-10-17;
 before it `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
 
-## Order (owner s125, updated s126)
+## Order (owner s125, updated s127)
 
 Every campaign uses the N = 11 bench genesis (rebuilt once with `FORCE=1` in setup). Arms that compare against main
 share one binary and one all-off baseline inside a campaign.
@@ -41,7 +41,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    whether and how much of Phase 5 gets built.
 3. **Q5. Native vs native + EVM transfers** (campaign C): 2 arms on M. **Done s64 (setup PASS, M = e3d11cb9):
    E/N 0.876, -12.4% matched/s; EVM heights never pipelined, ~0.5 s exec idle before each (section 80).**
-4. **Campaign A:** 6 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
+4. **Campaign A:** 7 arms on M, 300 markets, 600 s, 3 replicates, rotating order, native load only.
    **Shape: the `hsdb-300m` shape** (Classic, 15 s checkpoints, oracle on), NOT the harness default
    `TORUS_BOOK_ROWS=3`: mode 3 turns checkpoints off, and then Q1 and DB do nothing.
 
@@ -53,6 +53,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    | PC (Q4) | `TORUS_PARALLEL_CANCEL_ALL=8` (unset, 0, 1 or garbage = the serial loop) |
    | KP (Q4) | `TORUS_EXEC_PARALLEL_KEYS=1` (only "1" turns it on) |
    | DB (Q4) | `TORUS_CKPT_DEFER_BOOKS=1`; check its `defer_books=true` info line in each node's log (it logs `false` if gated off) |
+   | C (Q10) | `TORUS_SHARD_CUSTODY=1` (overrides `env.sh`'s pinned 0); fresh data dirs per cell and a free-disk check first (Items, Q10) |
 
 5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
 6. **Campaign B (propose-defer): dropped** (owner s126; branch parked). Revisit rule and the arms if revived:
@@ -67,6 +68,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    in, EVM double-inclusion fix and its follow-ups Codex-clean; gates nextest --workspace 4021/4021, full cargo test
    4022. Spec under Items, Q7. (Main after db84a1ad adds only docs and the behaviour-neutral exec-failed latch order
    fix, so arm A stays db84a1ad.)
+8b. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10).
 
 If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and save-books rows of the Q8 profile
 (a short re-run, not a full profile).
@@ -148,8 +150,34 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
     matched/s and block rate within noise of (a). Then validators prune by default (owner s126: only if Q9 proves it);
     production retention N is decided after Q9.
 
+- **Q10. Shard custody on vs off** (s127, setting only, no code). `TORUS_SHARD_CUSTODY=0` is pinned in
+  `devnet/wsl/env.sh` since perf A1 (8fa6ccdb, Jul 16), so every bench so far ran custody off; the node binary
+  ships it ON (only "0" disables) and custody-on was never measured. Custody runs synchronously on hotstuff-algo
+  twice per view (leader `block_build_mirror`, every follower's `validate_block` decode, before the vote). s124's
+  model (n = 3, not measured): ~95-145 ms per block per node, 0 to -25% matched/s at 300 markets, worse at 10. At
+  N = 11 (k = 4) the per-shard proof work grows about n^2/k, so expect more.
+  - 300 markets: arm C of campaign A (same binary, genesis and base arm). 10 markets: one ABBA pair base vs C
+    (n = 3, 600 s) after Q7, only if arm C is within noise at 300.
+  - DISK: main never deletes shards (`cf_native_shards` in `<data_dir>/consensus-db`). Each body writes n shards of
+    ~body/k plus proofs, about 2.75x the body bytes at N = 11: rough estimate 20+ GB per node per 600 s cell (x 11 if
+    all nodes share a host). Fresh data dirs per cell, delete them after, check free disk before each C cell.
+  - Report per arm: matched/s (primary), native blocks/s, block time p50/p99, `torus_validate_block_custody_seconds`
+    (expect ~0 on base), `torus_block_build_mirror_seconds` (leader), hotstuff-algo CPU, CPU-s/1M, consensus-DB write
+    bytes and `cf_native_shards` size, `torus_native_da_shard_recovered`.
+  - Decision it feeds (owner): a real cost -> ship custody OFF by default until the validator set is large (roadmap
+    T3.1), and the RH4 shard-count fix waits for T3.1 (likely lazy serve-time shards: nothing stored, nothing to GC).
+    Within noise at 300 and 10 -> keep it on, 18c builds the RH4 shard-count fix (option d: max of the old and new
+    set's n for 64 blocks after a set change, kept in the GC's own batch), and benches switch to custody on.
+
 ## Later
 
+- HL-style storage for write-once, delete-by-age data (s127 design item, not built): HL keeps one file per height
+  and prunes by deleting files older than 48 h (cron, `hyperliquid-dex/node` `pruner/`), so nothing is compacted and
+  nothing counts what a file holds. Ours: full block bodies (`cf_block_bodies`, per height already: segment files,
+  prune by unlink; first stop storing bodies twice, the s124 compact body record) and DA bodies (`cf_native_pending`,
+  keyed by hash before a height exists: an append-only log plus a hash index, or RocksDB blob files as a
+  config-only try). Gain is CPU and disk (s124: bodies ~15 s and DA ~113 s compaction CPU per 600 s cell), not
+  matched/s.
 - Big-block sizing with mixed load (native + swaps), only when big blocks are switched on (item 7 step 2 decision 1).
 - Q5 rerun on the item 7 step 2 build (native vs native + EVM load): step 2 adds a lane-row read per EVM tx and the
   per-epoch fee rows. Only if Q7 shows a cost.
