@@ -150,17 +150,21 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
   was not idle. Open files follow the SST count (`max_open_files` unset). 18c ports the old RH4 DA body GC
   (`perf/rh4-da-body-gc`, `TORUS_DA_BODY_RETENTION`, default 128) and wires an optional block retention env var into
   `devnet/wsl/start-node.sh`; 18c says when the branch is ready (names and SHA then).
-  - Arms (two binaries, plus one env cell): (a) main; (b) main + RH4; (c) main + RH4 with the block retention env
-    var set (`--retention-blocks`, e.g. 1000). 60 min each, 300 markets, hsdb-300m shape (Classic, 15 s
-    checkpoints), margin top-ups or a lower load; then a TRULY idle phase of at least 10 min (load generator stopped).
+  - Arms (owner s126, two binaries): (a) main; (b) main + RH4 with `TORUS_RETENTION_BLOCKS=1000` (adds
+    `--retention-blocks=1000`). RH4's GC is OFF on archive nodes (no retention; a short window would strand a node
+    that was down without state sync), so (b) needs the retention to do anything; 1000 is a test value (the GC
+    starts within minutes; the devnet's 100,000 is about 5-9 h and would delete nothing in 60 min). FRESH data dirs
+    for every cell (bodies written before the RH4 binary are never GC'd). 60 min each, 300 markets, hsdb-300m shape
+    (Classic, 15 s checkpoints), margin top-ups or a lower load; then a TRULY idle phase of at least 10 min (load
+    generator stopped). Production retention N is decided after Q9 (owner s126).
   - Sample per node every 60 s: `du -sb` of `<data_dir>/consensus-db` and of the state DB separately (the split's
     `find -maxdepth 1` misses `consensus-db`), SST count per DB, per-CF sizes from each RocksDB `LOG`'s Compaction
     Stats (`cf_native_pending`, block bodies), `torus_rocksdb_pending_compaction_bytes`, L0 file counts, open fds
     (`ls /proc/PID/fd | wc -l`) and deleted-but-open fds (`ls -l /proc/PID/fd | grep -c deleted`, expect 0),
-    `torus_da_bodies_gc_deleted` (b, c).
+    `torus_da_bodies_gc_deleted` and `torus_da_gc_seconds` (b).
   - Also report per arm: matched/s, block rate, commit latency p50/p99 (the GC runs on the commit path).
-  - Pass: (b) holds `consensus-db` flat after the window and (c) also the state DB, with matched/s and block rate
-    within noise of (a). Then validators prune by default (owner s126: only if Q9 proves it).
+  - Pass: (b) holds both `consensus-db` and the state DB flat once past the window (about 1,128 blocks), with
+    matched/s and block rate within noise of (a). Then validators prune by default (owner s126: only if Q9 proves it).
 - **Q8. Item 6 Phase 5 step 0 profile:** see the message sent to archy (s125) and
   `docs/plans/item6-phase5-impl.md` "Step 0" on `origin/docs/item6-phase5-plan`.
 
