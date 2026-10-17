@@ -4487,6 +4487,73 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// eth_call / eth_estimateGas whose revm read fails on this node (a DB
+    /// without CF_STORAGE: the contract's SLOAD fails): the request returns
+    /// the local storage fault as an error, and nothing is latched: RPC has
+    /// no fail-stop (only block execution does), so the server keeps serving
+    /// and a following call that reads no storage succeeds. RED before: the
+    /// error named an internal EVM error, not the local fault.
+    #[tokio::test]
+    async fn eth_call_db_read_fault_returns_error_and_keeps_serving() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .copied()
+            .filter(|cf| *cf != torus_state::cf::CF_STORAGE);
+        let state = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let sender = Address::from([0x11; 20]);
+        let funded = AccountInfo {
+            balance: U256::from(10u64.pow(18)),
+            nonce: 0,
+            code_hash: B256::ZERO,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&sender, &funded).unwrap();
+        // `PUSH1 0 SLOAD STOP`.
+        let reader = Address::from([0xC0; 20]);
+        let code = [0x60, 0x00, 0x54, 0x00];
+        let code_hash = alloy_primitives::keccak256(code);
+        state.put_code(&code_hash, &code).unwrap();
+        let contract = AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&reader, &contract).unwrap();
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let faulting = serde_json::json!({ "from": hex_address(sender), "to": hex_address(reader) });
+        for method in ["eth_call", "eth_estimateGas"] {
+            let e = client
+                .request::<String, _>(method, jsonrpsee::rpc_params![faulting.clone(), "latest"])
+                .await
+                .unwrap_err();
+            assert!(e.to_string().contains("local storage fault"), "{method}: {e}");
+        }
+        let plain = serde_json::json!({ "from": hex_address(sender), "to": hex_address(Address::from([0x22; 20])), "value": "0x0" });
+        assert_eq!(
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![plain, "latest"])
+                .await
+                .unwrap(),
+            "0x",
+            "the server keeps serving"
+        );
+        handle.stop().unwrap();
+    }
+
     #[tokio::test]
     async fn eth_get_logs_with_filter() {
         let (_dir, state, mempool, executor) = setup();

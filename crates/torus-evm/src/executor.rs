@@ -718,4 +718,51 @@ mod tests {
         assert_eq!(calc_effective_gas_price(0, 100, Some(50)), 50);
         assert_eq!(calc_effective_gas_price(0, 0, Some(0)), 0);
     }
+
+    type RevmErr = EVMError<torus_state::StateError, revm::context::result::InvalidTransaction>;
+
+    /// A revm `EVMError::Database` is a read of THIS node's DB that failed
+    /// (`DatabaseRef for StateDb` / `StateOverlay` only err on a RocksDB or
+    /// decode error of a local row; a missing block hash reads as zero): a
+    /// local fault, so the consensus app fail-stops. RED before: it mapped to
+    /// `EvmError::Internal`, which the app logs and skips the EVM section.
+    #[test]
+    fn revm_database_error_is_a_local_fault() {
+        let err: RevmErr = EVMError::Database(torus_state::StateError::MissingColumnFamily(
+            "cf_storage".into(),
+        ));
+        match map_evm_err(err) {
+            EvmError::LocalFault(msg) => {
+                assert!(msg.contains("cf_storage"), "{msg}");
+                assert!(msg.contains("evm database read"), "{msg}");
+            }
+            other => panic!("expected EvmError::LocalFault, got {other:?}"),
+        }
+        // No precompile fault recorded: the same through `local_fault_or`.
+        let cell = std::sync::OnceLock::new();
+        let err: RevmErr =
+            EVMError::Database(torus_state::StateError::InvalidData("account data len 3 != 72".into()));
+        assert!(matches!(local_fault_or(&cell, err), EvmError::LocalFault(_)));
+    }
+
+    /// Deterministic revm errors keep their mapping exactly (every validator
+    /// gets the same one for the same block): a tx error stays
+    /// `InvalidTransaction`, header and custom errors stay `Internal`.
+    #[test]
+    fn deterministic_revm_errors_keep_their_mapping() {
+        let tx: RevmErr = EVMError::Transaction(revm::context::result::InvalidTransaction::NonceTooHigh {
+            tx: 5,
+            state: 0,
+        });
+        assert!(matches!(map_evm_err(tx), EvmError::InvalidTransaction(m) if m.contains("NonceTooHigh")));
+        let header: RevmErr = EVMError::Header(revm::context::result::InvalidHeader::PrevrandaoNotSet);
+        assert!(matches!(map_evm_err(header), EvmError::Internal(m) if m.starts_with("header: ")));
+        let custom: RevmErr = EVMError::Custom("precompile failed".into());
+        assert!(matches!(map_evm_err(custom), EvmError::Internal(m) if m == "precompile failed"));
+        // A recorded precompile fault still wins over the revm error.
+        let cell = std::sync::OnceLock::new();
+        cell.set("getPosition oracle read: x".to_string()).unwrap();
+        let custom: RevmErr = EVMError::Custom("precompile failed".into());
+        assert!(matches!(local_fault_or(&cell, custom), EvmError::LocalFault(m) if m.starts_with("getPosition")));
+    }
 }
