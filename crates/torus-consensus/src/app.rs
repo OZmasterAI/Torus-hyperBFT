@@ -3359,6 +3359,22 @@ impl ExecutionContext {
                     self.exec_failed.store(true, Ordering::SeqCst);
                     return;
                 }
+                // The same local fault after a successful EVM execution: on
+                // this path `BridgeError::State` comes only from the
+                // post-bundle state-root compute of
+                // `validate_block_for_catchup` (validator.rs), a read of THIS
+                // node's DB (RocksDB / missing CF / undecodable local row /
+                // the incremental-vs-full-scan oracle). Never a block outcome:
+                // fail-stop exactly as the arm above.
+                Err(torus_bridge::BridgeError::State(e)) => {
+                    tracing::error!(
+                        height,
+                        %e,
+                        "FATAL: local state fault computing the EVM post-bundle state root — halting execution pipeline (fail-stop)"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
+                }
                 Err(e) => {
                     tracing::error!(%e, height, "EVM execution failed for committed block");
                 }
@@ -20768,6 +20784,11 @@ mod crash_recovery_tests {
                 db.put_account(addr, &account(code_hash, U256::ZERO))
                     .unwrap();
             }
+            // The boot-time trie build over the seeded state (as
+            // `TorusApp::new`): without it block 1's commit leaves a partial
+            // EVM trie (the untouched contracts missing), the debug oracle
+            // fails block 2's root compute and the block fail-stops.
+            torus_state::incremental::ensure_trie_built(&db).unwrap();
             let mut ctx = pipeline_ctx(&db, on, None);
             ctx.checkpoint = ckpt;
             dispatch_and_execute(&ctx, &db, &blocks[0]);
@@ -20801,6 +20822,13 @@ mod crash_recovery_tests {
                 StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
                 want,
                 "on={on} ckpt={ckpt:?}: block 2 queued nothing, linked nothing"
+            );
+            assert_eq!(
+                db.get_account(&k256_address(&key))
+                    .unwrap()
+                    .map(|a| a.nonce),
+                Some(4),
+                "on={on} ckpt={ckpt:?}: block 2's EVM transfer ran"
             );
             let status = action_status(&db, 2).expect("block 2 drained rows: a record");
             let seqs: Vec<u64> = status.core_writer.iter().map(|r| r.seq).collect();
