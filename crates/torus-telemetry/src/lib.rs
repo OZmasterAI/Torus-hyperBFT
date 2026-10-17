@@ -496,6 +496,8 @@ pub struct Metrics {
     /// Consensus thread: whole `on_committed_block` hook (manifest persist,
     /// durable block persist, mempool prune, exec dispatch).
     pub on_committed_block_seconds: Histogram,
+    /// Consensus thread: the commit-manifest state-DB put inside `on_committed_block`.
+    pub commit_manifest_seconds: Histogram,
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
@@ -2176,6 +2178,12 @@ impl Metrics {
             "Consensus thread: whole on_committed_block hook (persist + prune + dispatch)",
             on_committed_block_seconds.clone(),
         );
+        let commit_manifest_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_commit_manifest_seconds",
+            "Consensus thread: commit-manifest state-DB put inside on_committed_block (section 74: queues behind the checkpoint batch)",
+            commit_manifest_seconds.clone(),
+        );
         let mempool_remove_committed_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_mempool_remove_committed_seconds",
@@ -2993,6 +3001,7 @@ impl Metrics {
             validate_block_da_wait_seconds,
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
+            commit_manifest_seconds,
             mempool_remove_committed_seconds,
             exec_resting_orders,
             exec_resident_rebuilds,
@@ -3664,6 +3673,7 @@ mod tests {
             "torus_validate_block_da_wait_seconds",
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
+            "torus_commit_manifest_seconds",
             "torus_mempool_remove_committed_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");

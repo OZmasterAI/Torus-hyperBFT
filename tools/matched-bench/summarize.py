@@ -602,6 +602,7 @@ def node_phase(node, rs, hi, buckets, window):
         return round((m(b, k + "_seconds_sum") - m(a, k + "_seconds_sum")) / c * 1000, 2) if c else None
     p["exec_body_persist_put_ms_per_call"] = per_call("exec_body_persist_write")
     p["commit_persist_ms_per_call"] = per_call("commit_persist")
+    p["commit_manifest_ms_per_call"] = per_call("commit_manifest")
     def rk(k):
         return (m(b, "rocksdb_" + k) - m(a, "rocksdb_" + k)) / span if span else 0.0
     def gstat(k, scale=1.0):
@@ -695,6 +696,7 @@ VIEW_HISTS = ["torus_view_duration_seconds", "torus_view_propose_delay_seconds",
               "torus_validate_block_seconds", "torus_validate_block_decode_seconds",
               "torus_validate_block_da_reconstruct_seconds", "torus_validate_block_attest_seconds",
               "torus_validate_block_custody_seconds", "torus_on_committed_block_seconds",
+              "torus_commit_manifest_seconds",
               "torus_mempool_remove_committed_seconds",
               # s68: leader produce_block phases (block_build splits into these)
               "torus_block_build_parent_seconds", "torus_block_build_select_seconds",
