@@ -409,6 +409,9 @@ fn run(seed: u64, l1: bool, stats: &mut Stats) -> Vec<BlockOut> {
     if l1 {
         assert_eq!(holder.rows_builds(), 1, "R built once");
         assert_eq!(holder.rows_shared_fallbacks(), 0);
+        // Phase 5 step 2 (plan Task 2.1, P3 on the in-place record).
+        assert_eq!(holder.users_in_place(), Some(true), "the node path is in place");
+        assert!(holder.in_place_rows() > 0, "the in-place drains emitted rows");
     }
     out
 }
@@ -678,6 +681,12 @@ fn adl_run_with(shape: AdlShape, r: Rm, caches: bool, c2: bool) -> Vec<AdlBlock>
             }
             ADL_CACHES_OFF.with(|c| c.set(false));
             ADL_C2_OFF.with(|c| c.set(false));
+            if resident {
+                // Phase 5 step 2 (plan Task 2.1, the ADL walk on the
+                // in-place record).
+                assert_eq!(holder.users_in_place(), Some(true), "the node path is in place");
+                assert!(holder.in_place_rows() > 0, "the in-place drains emitted rows");
+            }
             return out;
         }
     }

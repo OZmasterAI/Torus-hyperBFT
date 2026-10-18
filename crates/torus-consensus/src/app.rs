@@ -28279,10 +28279,14 @@ mod crash_recovery_tests {
         Typed,
     }
 
-    /// The node's switch for `path`. Step 1 has no typed path: both paths
-    /// run today's overlay writes (step 2 sets the typed path here).
+    /// The node's switch for `path`. Step 2: the typed path is the node's
+    /// own (the record set takes the block's writes in place); the reference
+    /// node's holder builds its record sets on the Phase 4 path.
     fn p5_configure(ctx: &mut ExecutionContext, path: P5Path) {
-        let _ = (ctx, path);
+        ctx.resident_books
+            .get_mut()
+            .unwrap()
+            .set_reference_writes(path == P5Path::Reference);
     }
 
     /// The checkpoint interval of a pipelined node.
@@ -28805,6 +28809,8 @@ mod crash_recovery_tests {
         fills: usize,
         liquidations: u64,
         bbo_rows: usize,
+        /// Step 2: rows drained in place by the reference / typed node.
+        drained: (u64, u64),
     }
 
     /// After block `h` on both nodes (both idle): the write sets of the
@@ -28952,6 +28958,10 @@ mod crash_recovery_tests {
             fills: rows(torus_state::cf::CF_NATIVE_TRADES),
             liquidations: a.metrics.liquidations_triggered.get(),
             bbo_rows: rows(torus_state::cf::CF_NATIVE_BBO),
+            drained: (
+                a.metrics.exec_users_drained_rows.get(),
+                b.metrics.exec_users_drained_rows.get(),
+            ),
         })
     }
 
@@ -29002,6 +29012,10 @@ mod crash_recovery_tests {
             };
             assert!(s.compared.dumps >= dumps, "{cfg:?}: dumps {s:?}");
             assert_eq!(s.restarts, 1, "{cfg:?}: one fatal block");
+            // Step 2: the typed node took the writes in place, the
+            // reference node never did.
+            assert_eq!(s.drained.0, 0, "{cfg:?}: the reference node drained rows: {s:?}");
+            assert!(s.drained.1 >= n, "{cfg:?}: the typed node drained in place: {s:?}");
             assert!(
                 s.fills >= n as usize && s.liquidations >= 3 && s.bbo_rows >= 1,
                 "{cfg:?}: {s:?}"
