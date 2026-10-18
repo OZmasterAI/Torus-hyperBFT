@@ -164,6 +164,24 @@ pub fn keep_from_for_tree_frontier(frontier: Option<u64>) -> u64 {
         .map_or(0, |f| f.saturating_add(1))
 }
 
+/// The Torus header height of the block the hotstuff tree holds at
+/// `hotstuff` height. RED stub: the identity every site uses today.
+pub fn torus_height_of(hotstuff: u64) -> Option<u64> {
+    Some(hotstuff)
+}
+
+/// The hotstuff height of the block carrying Torus header height `torus`.
+/// RED stub: the identity every site uses today.
+pub fn hotstuff_height_of(torus: u64) -> Option<u64> {
+    Some(torus)
+}
+
+/// The lowest Torus height the tree still serves, for its prune pointer.
+/// RED stub: the identity every site uses today.
+pub fn tree_served_from(pointer: Option<u64>) -> Option<u64> {
+    pointer
+}
+
 /// RH4 DA body GC settings of a node ([`crate::app::TorusApp::set_da_body_gc`]).
 #[derive(Clone)]
 pub struct DaBodyGc {
@@ -264,6 +282,11 @@ impl DaGcHistory for BlockTreeHistory<'_> {
         (self.restore)(height, &hashes, actions.as_deref());
         Ok(Some(hashes))
     }
+
+    fn committed_through(&self) -> Result<Option<u64>, StateError> {
+        // RED stub: the committed tip is not consulted yet.
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -342,16 +365,19 @@ mod tests {
         }
     }
 
-    /// hotstuff `prune_old_committed_blocks_with` keeps heights
+    /// hotstuff `prune_old_committed_blocks_with` keeps hotstuff heights
     /// `highest - retention ..= highest` (block_tree/accessors/internal.rs).
-    fn tree_serves(height: u64, highest: u64, retention: u64) -> bool {
-        highest <= retention || height >= highest - retention
+    /// Heights here are Torus heights: the tree holds Torus height `h` at
+    /// hotstuff height `h - 1` (written out, not via the code under test).
+    fn tree_serves(height: u64, tip: u64, retention: u64) -> bool {
+        let (hs, highest) = (height - 1, tip - 1);
+        highest <= retention || hs >= highest - retention
     }
 
-    /// The pruner's pointer once it kept up: `highest - retention`, `None`
-    /// while the chain is inside the window.
-    fn tree_frontier(highest: u64, retention: u64) -> Option<u64> {
-        highest.checked_sub(retention).filter(|&f| f > 0)
+    /// The pruner's pointer (a hotstuff height) once it kept up with Torus
+    /// tip `tip`: `highest - retention`, `None` while inside the window.
+    fn tree_frontier(tip: u64, retention: u64) -> Option<u64> {
+        (tip - 1).checked_sub(retention).filter(|&f| f > 0)
     }
 
     /// A lagging peer can always finish what block sync hands it: at every
@@ -367,8 +393,9 @@ mod tests {
         let store = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
         let actions: Vec<_> = (0..400).map(action).collect();
         store.put_batch(&actions).unwrap();
+        // Torus heights 1..=400 (height 0 is the genesis header).
         for (tip, a) in actions.iter().enumerate() {
-            let tip = tip as u64;
+            let tip = tip as u64 + 1;
             store
                 .gc_committed(
                     tip,
@@ -379,8 +406,8 @@ mod tests {
                     DA_GC_LIMITS,
                 )
                 .unwrap();
-            for (h, b) in actions[..=tip as usize].iter().enumerate() {
-                let h = h as u64;
+            for (h, b) in actions[..tip as usize].iter().enumerate() {
+                let h = h as u64 + 1;
                 let present = store.contains(&compute_action_hash(b).0).unwrap();
                 if tree_serves(h, tip, tree) {
                     assert!(
@@ -450,6 +477,9 @@ mod tests {
     /// sparse rows (empty blocks record none) a window derived from the NEW
     /// retention would delete their bodies at once. Every block the tree still
     /// holds must keep its body, and the bodies go once the tree pruned them.
+    ///
+    /// Heights are Torus heights; the tree holds Torus height `h` at hotstuff
+    /// height `h - 1` (spelled out here, not via the code under test).
     #[test]
     fn a_retention_drop_never_deletes_a_body_the_tree_still_serves() {
         const TIP: u64 = 600;
@@ -457,7 +487,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = StateDb::open(dir.path()).unwrap();
         let store = NativeDaStore::new(db.clone());
-        let (mut bt, mut tip_hash) = committed_tree(&db, TIP + 1);
+        // Torus 1..=TIP at hotstuff 0..TIP.
+        let (mut bt, mut tip_hash) = committed_tree(&db, TIP);
         let at = [300u64, 301, 450, 590];
         let actions: Vec<_> = at.iter().map(|&h| action(h)).collect();
         store.put_batch(&actions).unwrap();
@@ -482,14 +513,17 @@ mod tests {
         // After the drop: one commit + one prune pass + one DA pass per height.
         let window = resolve_da_body_retention(None, Some(NEW_TREE)).unwrap();
         for tip in TIP + 1..=TIP + 40 {
-            tip_hash = insert_child(&mut bt, tip, Some(tip_hash));
+            tip_hash = insert_child(&mut bt, tip - 1, Some(tip_hash));
             let mut wb = BlockTreeWriteBatch::new_unsafe();
             bt.commit(&mut wb, &tip_hash).unwrap();
             bt.write(wb);
             bt.prune_old_committed_blocks_with(NEW_TREE).unwrap();
             gc(tip, &[], window);
             for (i, &h) in at.iter().enumerate() {
-                let served = bt.block_at_height(BlockHeight::new(h)).unwrap().is_some();
+                let served = bt
+                    .block_at_height(BlockHeight::new(h - 1))
+                    .unwrap()
+                    .is_some();
                 let body = store.contains(&compute_action_hash(&actions[i]).0).unwrap();
                 assert!(
                     body || !served,
@@ -497,14 +531,41 @@ mod tests {
                 );
             }
         }
-        // The tree caught up (pointer 632 = tip - 8): 300, 301 and 450 went;
-        // 590 is pruned too but inside the margin (590 + 128 > 632).
-        assert_eq!(read_block_tree_frontier(&db).unwrap(), Some(632));
-        assert!(bt.block_at_height(BlockHeight::new(590)).unwrap().is_none());
+        // The tree caught up (pointer 631 = hotstuff tip 639 - 8, so it
+        // serves Torus 632 on): 300, 301 and 450 went; 590 is pruned too but
+        // inside the margin (590 + 128 > 632).
+        assert_eq!(read_block_tree_frontier(&db).unwrap(), Some(631));
+        assert!(bt.block_at_height(BlockHeight::new(589)).unwrap().is_none());
         for a in &actions[..3] {
             assert!(!store.contains(&compute_action_hash(a).0).unwrap());
         }
         assert!(store.contains(&compute_action_hash(&actions[3]).0).unwrap());
+    }
+
+    /// Codex P1 (round 2): the one conversion between the two height
+    /// systems, at both edges. Hotstuff numbers blocks from 0, the Torus
+    /// header from 1 (hotstuff block 0 extends the genesis header, Torus 0):
+    /// Torus `h` is hotstuff `h - 1`. Torus 0 has no tree block; hotstuff
+    /// `u64::MAX` has no Torus height. The prune pointer (a hotstuff height)
+    /// says the tree serves Torus heights from `pointer + 1` (saturating: an
+    /// overflow only keeps more).
+    #[test]
+    fn torus_and_hotstuff_heights_convert_at_both_edges() {
+        assert_eq!(hotstuff_height_of(0), None, "genesis header: no tree block");
+        assert_eq!(hotstuff_height_of(1), Some(0));
+        assert_eq!(hotstuff_height_of(1228), Some(1227));
+        assert_eq!(hotstuff_height_of(u64::MAX), Some(u64::MAX - 1));
+        assert_eq!(torus_height_of(0), Some(1));
+        assert_eq!(torus_height_of(1227), Some(1228));
+        assert_eq!(torus_height_of(u64::MAX - 1), Some(u64::MAX));
+        assert_eq!(torus_height_of(u64::MAX), None);
+        for h in [1, 2, 1228, u64::MAX] {
+            assert_eq!(hotstuff_height_of(h).and_then(torus_height_of), Some(h));
+        }
+        assert_eq!(tree_served_from(None), None, "never pruned");
+        assert_eq!(tree_served_from(Some(0)), Some(1));
+        assert_eq!(tree_served_from(Some(227)), Some(228));
+        assert_eq!(tree_served_from(Some(u64::MAX)), Some(u64::MAX));
     }
 
     /// The pointer the GC reads is the one hotstuff's pruner persists (key and
@@ -530,10 +591,17 @@ mod tests {
             read_block_tree_frontier(&db).unwrap(),
             Some(0x0102_0304_0506_0708)
         );
-        // h may go once h + 128 <= pointer.
-        assert_eq!(keep_from_for_tree_frontier(Some(127)), 0);
-        assert_eq!(keep_from_for_tree_frontier(Some(128)), 1);
-        assert_eq!(keep_from_for_tree_frontier(Some(1000)), 873);
+        // Torus height h may go once h + 128 <= the first Torus height the
+        // tree serves (pointer + 1).
+        assert_eq!(keep_from_for_tree_frontier(Some(126)), 0);
+        assert_eq!(keep_from_for_tree_frontier(Some(127)), 1);
+        assert_eq!(keep_from_for_tree_frontier(Some(128)), 2);
+        assert_eq!(keep_from_for_tree_frontier(Some(1000)), 874);
+        assert_eq!(
+            keep_from_for_tree_frontier(Some(u64::MAX)),
+            u64::MAX - 127,
+            "saturates: the top height stays"
+        );
         db.put_cf_raw(CF_CONSENSUS_META, &BLOCK_TREE_PRUNED_HEIGHT, &[1, 2, 3])
             .unwrap();
         assert!(read_block_tree_frontier(&db).is_err());

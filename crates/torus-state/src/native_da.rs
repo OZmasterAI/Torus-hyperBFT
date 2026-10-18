@@ -298,6 +298,11 @@ pub struct DaGcOutcome {
     /// read error): the pass deleted nothing (`deletion_held`) and the next
     /// one retries.
     pub backfill_stalled: bool,
+    /// The history holds committed heights above `height` (dispatch is
+    /// behind the committed tip: boot reconciliation, a multi-block commit):
+    /// the pass deleted nothing (`deletion_held`), since one of them may
+    /// re-include a due row's body before its own pass records the pin.
+    pub undispatched_commits: bool,
 }
 
 /// Where the GC re-reads committed heights it has no record for
@@ -311,6 +316,11 @@ pub trait DaGcHistory {
     /// [`pruned_below`](Self::pruned_below)). `Ok(None)` = not available (a
     /// missing block): the GC then deletes nothing until it is.
     fn committed_hashes(&self, height: u64) -> Result<Option<Vec<B256>>, StateError>;
+    /// The highest committed height the history holds (`Ok(None)` = none),
+    /// in the same height system as the GC's. A committed height above the
+    /// dispatched one is not recorded yet and may re-include a due row's
+    /// body, so nothing is deleted until dispatch catches up with it.
+    fn committed_through(&self) -> Result<Option<u64>, StateError>;
 }
 
 /// A history that knows no height: a gap in the GC bookkeeping holds every
@@ -324,6 +334,10 @@ impl DaGcHistory for NoDaGcHistory {
     }
 
     fn committed_hashes(&self, _height: u64) -> Result<Option<Vec<B256>>, StateError> {
+        Ok(None)
+    }
+
+    fn committed_through(&self) -> Result<Option<u64>, StateError> {
         Ok(None)
     }
 }
@@ -587,7 +601,7 @@ impl NativeDaStore {
     ) -> Result<DaGcOutcome, StateError> {
         self.gc_committed_with_history(
             height,
-            hashes,
+            Some(hashes),
             shard_count,
             retention,
             keep_from,
@@ -622,7 +636,7 @@ impl NativeDaStore {
     pub fn gc_committed_with_history(
         &self,
         height: u64,
-        hashes: &[B256],
+        hashes: Option<&[B256]>,
         shard_count: u16,
         retention: u64,
         keep_from: u64,
@@ -643,6 +657,8 @@ impl NativeDaStore {
         // membership tests below run once per listed hash (Codex P2).
         let mut moved: HashSet<[u8; 32]> = HashSet::new();
         let mut backfilled = false;
+        // RED stub: an unknown record still reads as "no actions".
+        let hashes = hashes.unwrap_or(&[]);
         // The cursor this pass starts from. Not established yet:
         // - a fresh store (no GC state, so no row an unrecorded pin could
         //   matter for) starts it at this height;
@@ -2026,13 +2042,16 @@ mod tests {
 
     /// A test [`DaGcHistory`]: `known` heights, every height below `pruned`
     /// pruned, every other height `empty` (known, no actions) or unknown;
-    /// `fail` = every read errors.
+    /// `fail` = every read errors. `tip`: its committed tip (`None` = none
+    /// known), `tip_fail` = reading the tip errors.
     #[derive(Default)]
     struct TestHistory {
         pruned: u64,
         known: std::collections::BTreeMap<u64, Vec<B256>>,
         empty: bool,
         fail: bool,
+        tip: Option<u64>,
+        tip_fail: bool,
     }
 
     impl DaGcHistory for TestHistory {
@@ -2054,6 +2073,13 @@ mod tests {
                 None => None,
             })
         }
+
+        fn committed_through(&self) -> Result<Option<u64>, StateError> {
+            if self.fail || self.tip_fail {
+                return Err(StateError::InvalidData("test history tip read".into()));
+            }
+            Ok(self.tip)
+        }
     }
 
     fn history(rows: &[(u64, Vec<B256>)]) -> TestHistory {
@@ -2072,7 +2098,7 @@ mod tests {
         history: &TestHistory,
     ) -> DaGcOutcome {
         store
-            .gc_committed_with_history(height, hashes, 0, retention, UNCAPPED, LIMITS, history)
+            .gc_committed_with_history(height, Some(hashes), 0, retention, UNCAPPED, LIMITS, history)
             .unwrap()
     }
 
@@ -2104,7 +2130,7 @@ mod tests {
         {
             let ro = NativeDaStore::new(StateDb::open_read_only(dir.path()).unwrap());
             assert!(ro
-                .gc_committed_with_history(13, &[hx], 0, W, UNCAPPED, LIMITS, &hist)
+                .gc_committed_with_history(13, Some(&[hx]), 0, W, UNCAPPED, LIMITS, &hist)
                 .is_err());
         }
         let store = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
@@ -2166,6 +2192,75 @@ mod tests {
         assert_eq!((out.heights_backfilled, out.deletion_held), (9, false));
         assert_eq!(out.rows_deleted, 1);
         assert!(!present(&store, &x));
+    }
+
+    /// Codex P1 (round 2, app.rs state-body write): a height whose record
+    /// is unknown (dispatch could not make its body durable) is never
+    /// recorded as "no actions". The pass leaves the cursor AT it and deletes
+    /// nothing, although row 10 is due; the next pass back-fills it from the
+    /// history, re-inclusion pin included, so x outlives row 10 until the
+    /// re-including height's window ends.
+    #[test]
+    fn gc_unknown_record_leaves_the_cursor_behind_and_holds_deletion() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let x = dummy_action(1);
+        let hx = compute_action_hash(&x);
+        store.put(&x).unwrap();
+        let hist = history(&[(10, vec![hx]), (14, vec![hx])]);
+        for h in 10..=13 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        let out = store
+            .gc_committed_with_history(14, None, 0, W, UNCAPPED, LIMITS, &hist)
+            .unwrap();
+        assert!(out.deletion_held, "row 10 is due at 14, but 14 is unknown");
+        assert_eq!(out.bodies_deleted, 0);
+        assert!(present(&store, &x));
+        let out = gc_h(&store, 15, &[], W, &hist);
+        assert_eq!(out.heights_backfilled, 1, "14 back-filled from the history");
+        for tip in 16..=14 + W {
+            gc_h(&store, tip, &[], W, &hist);
+            assert_eq!(present(&store, &x), tip < 14 + W, "x (pinned by 14) at {tip}");
+        }
+    }
+
+    /// Codex P1 (round 2, native_da.rs completeness): the history holds a
+    /// committed height above the dispatched one (boot reconciliation, a
+    /// multi-block commit) that re-includes a due row's body. Nothing goes
+    /// until dispatch caught up with the committed tip; an unreadable tip
+    /// holds too. Then the re-including height's pin keeps the body for its
+    /// own window.
+    #[test]
+    fn gc_holds_deletion_while_committed_heights_are_undispatched() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let x = dummy_action(1);
+        let hx = compute_action_hash(&x);
+        store.put(&x).unwrap();
+        let mut hist = history(&[(10, vec![hx]), (15, vec![hx])]);
+        for h in 10..=13 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        // 14 and 15 are committed together; row 10 is due at 14.
+        hist.tip = Some(15);
+        let out = gc_h(&store, 14, &[], W, &hist);
+        assert!(out.undispatched_commits && out.deletion_held);
+        assert_eq!(out.bodies_deleted, 0);
+        assert!(present(&store, &x), "committed 15 still needs x");
+        hist.tip_fail = true;
+        let out = gc_h(&store, 15, &[hx], W, &hist);
+        assert!(out.deletion_held, "an unreadable tip holds");
+        assert!(present(&store, &x));
+        hist.tip_fail = false;
+        for tip in 16..=15 + W {
+            hist.tip = Some(tip);
+            let out = gc_h(&store, tip, &[], W, &hist);
+            assert!(!out.undispatched_commits, "caught up at {tip}");
+            assert_eq!(present(&store, &x), tip < 15 + W, "x (pinned by 15) at {tip}");
+        }
     }
 
     /// A gap below the history's pruned height is skipped (those blocks are
@@ -2344,7 +2439,7 @@ mod tests {
         // What the old binary wrote: rows 10 and 11 (nothing due yet).
         for (h, hashes) in [(10, vec![hx]), (11, vec![hy])] {
             store
-                .gc_committed_with_history(h, &hashes, 0, W, 0, LIMITS, &history(&[]))
+                .gc_committed_with_history(h, Some(&hashes), 0, W, 0, LIMITS, &history(&[]))
                 .unwrap();
         }
         make_pre_cursor(&store, 12);
@@ -2354,7 +2449,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             empty: true,
-            fail: false,
+            ..TestHistory::default()
         };
         let out = gc_h(&store, 600, &[], W, &tree);
         assert_eq!((out.heights_backfilled, out.deletion_held), (B, true));

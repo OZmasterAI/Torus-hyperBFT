@@ -1754,7 +1754,7 @@ impl Mempool {
     pub fn gc_committed_native_da(
         &self,
         height: u64,
-        hashes: &[B256],
+        hashes: Option<&[B256]>,
         shard_count: u16,
         retention: u64,
         keep_from: u64,
