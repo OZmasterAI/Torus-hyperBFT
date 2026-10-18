@@ -584,22 +584,59 @@ fn exec_hole_failstop_budget() -> std::time::Duration {
 }
 
 /// Runtime toggle (perf A1): erasure-shard custody of native bodies
-/// (`custody_native_shards_best_effort`). Default ON — unset/`"1"`/anything
-/// but `"0"` keeps current behavior. `TORUS_SHARD_CUSTODY=0` skips custody:
-/// safe because the whole-body DA mirror stays the durability guarantee and
-/// peers fall back to whole-body pull (never wedge). Read once per process.
+/// (`custody_native_shards_best_effort`). Default OFF until T3.1 (owner
+/// decision s128, bench section 82: custody cost -21.6% matched/s, ~140 ms per
+/// follower validate). Only `TORUS_SHARD_CUSTODY=1` enables custody; unset or
+/// any other value skips it. Skipping is safe because the whole-body DA mirror
+/// stays the durability guarantee and peers fall back to whole-body pull
+/// (never wedge). Read once per process.
 fn shard_custody_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = shard_custody_test_override::get() {
+        return forced;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| parse_shard_custody_toggle(std::env::var("TORUS_SHARD_CUSTODY").ok()))
 }
 
-/// Pure parse of the `TORUS_SHARD_CUSTODY` value (default ON; only `"0"`
-/// disables). Split from the `OnceLock` reader so it is unit-testable without
-/// touching process-global state (same idiom as `parse_sync_wal_toggle`).
+/// Pure parse of the `TORUS_SHARD_CUSTODY` value (default OFF; only `"1"`,
+/// after trim, enables). Split from the `OnceLock` reader so it is unit-testable
+/// without touching process-global state (same idiom as
+/// `parse_async_validate_toggle`).
 fn parse_shard_custody_toggle(raw: Option<String>) -> bool {
-    match raw {
-        Some(v) => v.trim() != "0",
-        None => true,
+    matches!(raw.as_deref().map(str::trim), Some("1"))
+}
+
+/// Test-only, per-thread override of [`shard_custody_enabled`], so unit tests
+/// can exercise the custody-ON path without setting the process env var (tests
+/// share one process and the real toggle is a process-global `OnceLock`).
+/// Thread-local, so it only reaches custody calls made on the test's own thread
+/// (the synchronous `decode_proposal_and_ensure_durable` path), never the
+/// `torus-async-validate` worker or other tests running in parallel.
+#[cfg(test)]
+mod shard_custody_test_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<bool> {
+        FORCED.with(Cell::get)
+    }
+
+    /// Forces custody to `enabled` on this thread until the guard drops (the
+    /// previous value is restored).
+    pub(super) struct Guard(Option<bool>);
+
+    pub(super) fn force(enabled: bool) -> Guard {
+        Guard(FORCED.with(|c| c.replace(Some(enabled))))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCED.with(|c| c.set(self.0));
+        }
     }
 }
 
@@ -635,14 +672,19 @@ fn log_async_validate_resolution(enabled: bool) {
 mod shard_custody_toggle_tests {
     use super::parse_shard_custody_toggle;
 
+    /// Owner decision s128 (bench section 82: custody costs -21.6% matched/s,
+    /// ~140 ms per follower validate): custody is OFF by default until T3.1.
+    /// Only `"1"` (after trim) enables it; unset or anything else disables.
     #[test]
-    fn default_is_on_and_only_zero_disables() {
-        assert!(parse_shard_custody_toggle(None));
+    fn default_is_off_and_only_one_enables() {
+        assert!(!parse_shard_custody_toggle(None));
         assert!(parse_shard_custody_toggle(Some("1".into())));
-        assert!(parse_shard_custody_toggle(Some("true".into())));
-        assert!(parse_shard_custody_toggle(Some("".into())));
+        assert!(parse_shard_custody_toggle(Some(" 1 ".into())));
         assert!(!parse_shard_custody_toggle(Some("0".into())));
         assert!(!parse_shard_custody_toggle(Some(" 0 ".into())));
+        assert!(!parse_shard_custody_toggle(Some("".into())));
+        assert!(!parse_shard_custody_toggle(Some("true".into())));
+        assert!(!parse_shard_custody_toggle(Some("yes".into())));
     }
 }
 
@@ -7214,13 +7256,13 @@ impl TorusApp {
     /// wedge), so it is logged — NOT fail-closed like the body mirror. `height` is
     /// included in the warn log for correlation. Empty input is a no-op.
     ///
-    /// Runtime toggle (perf A1): `TORUS_SHARD_CUSTODY=0` skips shard custody at
-    /// ALL THREE call sites (proposer `produce_block`, validator full-block and
-    /// compact-block decode paths). Default `"1"` = custody on, byte-identical
-    /// to prior behavior. Skipping is safe because the whole-body mirror above
-    /// remains the durability guarantee — peers fall back to whole-body pull
-    /// and never wedge. Read once per process (OnceLock, same idiom as
-    /// `sync_wal_on_commit_enabled`).
+    /// Runtime toggle (perf A1): shard custody runs at ALL THREE call sites
+    /// (proposer `produce_block`, validator full-block and compact-block decode
+    /// paths) only when `TORUS_SHARD_CUSTODY=1`. Default OFF until T3.1 (owner
+    /// decision s128): unset or any other value skips custody. Skipping is safe
+    /// because the whole-body mirror above remains the durability guarantee —
+    /// peers fall back to whole-body pull and never wedge. Read once per process
+    /// (OnceLock, same idiom as `sync_wal_on_commit_enabled`).
     fn custody_native_shards_best_effort(
         &self,
         mempool: &torus_mempool::Mempool,
@@ -14049,6 +14091,8 @@ mod crash_recovery_tests {
     /// shards ⇒ `get_shard` returned `None`.
     #[test]
     fn validate_block_custodies_shards_torusblock() {
+        // Custody is OFF by default (s128); this test covers the custody-ON path.
+        let _custody = super::shard_custody_test_override::force(true);
         let (config, state_db) = make_test_config_and_db();
         let mempool = Arc::new(Mempool::new(
             state_db.clone(),
@@ -14098,6 +14142,8 @@ mod crash_recovery_tests {
     /// shards ⇒ `get_shard` returned `None`.
     #[test]
     fn validate_block_custodies_shards_compactblock() {
+        // Custody is OFF by default (s128); this test covers the custody-ON path.
+        let _custody = super::shard_custody_test_override::force(true);
         let (config, state_db) = make_test_config_and_db();
         let mempool = Arc::new(Mempool::new(
             state_db.clone(),
@@ -14141,6 +14187,64 @@ mod crash_recovery_tests {
                 mempool.get_shard(&hash, i).is_some(),
                 "validator (compact path) must custody shard {i} after validate"
             );
+        }
+    }
+
+    /// s128 owner decision: shard custody is OFF by default until T3.1. With no
+    /// override and `TORUS_SHARD_CUSTODY` unset, a validating peer mirrors the
+    /// whole body (durability) but custodies NO shards, on both the full
+    /// `TorusBlock` and the `CompactBlock` decode paths.
+    #[test]
+    fn validate_block_custodies_no_shards_by_default() {
+        assert!(
+            !matches!(
+                std::env::var("TORUS_SHARD_CUSTODY").ok().as_deref().map(str::trim),
+                Some("1")
+            ),
+            "run this test without TORUS_SHARD_CUSTODY=1 in the environment"
+        );
+        assert!(
+            super::shard_custody_test_override::get().is_none(),
+            "no override on this thread"
+        );
+        let (config, state_db) = make_test_config_and_db();
+        let mempool = Arc::new(Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let full = sign_claim_rewards(1);
+        let compact = sign_claim_rewards(2);
+        let full_hash = torus_types::compute_action_hash(&full);
+        let compact_hash = torus_types::compute_action_hash(&compact);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&compact))
+            .expect("mirror compact body into DA store");
+
+        let mut app =
+            TorusApp::new(state_db.clone(), &config, None, Some(mempool.clone()), None);
+        app.last_validator_set = make_validator_set(4);
+
+        let full_datum = encode_proposal_datum(&make_block(1, vec![full.clone()]), false);
+        match app.decode_proposal_and_ensure_durable(&full_datum) {
+            Ok(b) => assert_eq!(b.native_actions.len(), 1),
+            Err(_) => panic!("full TorusBlock must decode as Valid"),
+        }
+        let compact_datum = encode_proposal_datum(&make_block(2, vec![compact.clone()]), true);
+        match app.decode_proposal_and_ensure_durable(&compact_datum) {
+            Ok(b) => assert_eq!(b.native_actions.len(), 1),
+            Err(_) => panic!("compact block with a pre-loaded body must decode as Valid"),
+        }
+
+        // Durability is unchanged: the full-block body was mirrored.
+        assert!(mempool.get_native_da(&full_hash).is_some(), "full body durable");
+        let params = torus_state::ErasureParams::for_validator_set(4);
+        for hash in [&full_hash, &compact_hash] {
+            for i in 0..params.n as u16 {
+                assert!(
+                    mempool.get_shard(hash, i).is_none(),
+                    "default (custody off): validator must custody no shard {i}"
+                );
+            }
         }
     }
 
