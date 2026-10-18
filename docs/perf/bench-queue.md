@@ -210,6 +210,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    RH4); set PC + F by env on both arms (the coming defaults). Moved here in
    s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls (prune by
    default, validator retention N) and the RH4 merge wait on it.
+   **Done s68 (ozarchy-q9, A = main `e1be6c15` node md5 `5ab8040e`, B = `b2dd21a4` node md5 `d44f8b3b` +
+   `TORUS_RETENTION_BLOCKS=1000`, both PC + F + push threshold 524288 + custody 0, n = 1 per arm, 2 / 2 valid, section
+   88): pass. Load = the standard shape paced to 250 actions/s (49.7k matched/s, 0 margin rejects over the hour; the
+   unpaced load is in-flight-cap bound at ~251k matched/s and runs out of margin at ~minute 21). Over load minutes
+   5-60, SST growth per node: A consensus-db 0.0222 + state 0.0203 GB/min (14 MB per 1M fills, the s58safe rate);
+   B 0.0001 + 0.0007 GB/min. At 60 min: A SST 1.30 + 1.33 GB, B 0.03 + 0.25 GB; after shutdown A 3.7-4.1 GB per data
+   dir, B 0.30-0.36 GB. GC deleted all 915,892 bodies per node, 0.18 ms per block (p99 1.35 ms) on the consensus
+   thread. Idle (21-24 min, load stopped): SST flat in both arms; du grows ~0.004 GB/min per DB from WAL alone (the
+   s58safe "idle" growth came from a reject-only load). matched/s 49,751 vs 49,733 (paced, equal by construction),
+   native blk/s 26.50 vs 26.55, block p50 / p99 8.4 / 479 vs 8.6 / 479 ms, order-to-commit p50 / p99 159 / 582 vs
+   157 / 580 ms, CPU-s per 1M 44.1 vs 43.9, 0 timeouts. fds max 234-240 vs 183-189, 0 deleted-open. One cell per
+   arm, at a paced load below capacity: no CI, and it cannot show a GC throughput cost at saturation.**
 10. **Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

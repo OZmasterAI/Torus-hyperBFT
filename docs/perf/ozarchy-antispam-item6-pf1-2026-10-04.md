@@ -13131,6 +13131,174 @@ unchanged. matched/s and CPU per fill hold. Block p50 rises 15% (the CI clears 1
 | r2 | Z5 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,186.5 | 13.347 | 17,756 | 69.3 | 13 / 794 | 24.06 | 2 | 2 | 154.0 | 84.3 | 308 / 3,833 | 440 (1,003 / 562) | 94:0/94:0/94:0 | 8,035 |
 | r2 | Z15 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 250,320.4 | 17.633 | 13,749 | 53.5 | 11 / 516 | 23.92 | 0 | 0 | 105.0 | 103.9 | 390 / 1,205 | 464 (896 / 431) | 120:0/120:0/120:0 | 10,615 |
 
+## 88. Step 9, Q9: data-dir growth, main vs main + RH4 (DA body GC, retention 1,000), PC + F + 512 KB push threshold on both arms, standard load shape paced to 250 actions/s, 300 markets, 60 min load + idle, n = 1 per arm (campaign ozarchy-q9, binaries A `e1be6c15` / B `b2dd21a4`, archy, 2026-10-18)
+
+**Pass. With `--retention-blocks=1000`, RH4 holds both DBs flat past the window, and the comparison shows no cost.
+Over load minutes 5-60, arm A (main, archive) grows its SST files by 0.0222 GB/min in `consensus-db` and 0.0203
+GB/min in the state DB per node. That is 14 MB per 1M fills, the rate behind s58safe's ~0.2 GB/min at 240k matched/s
+(79.3c). Arm B grows them by 0.0001 and 0.0007 GB/min. At minute 60: A has 1.30 + 1.33 GB of SST per node, B has
+0.03 + 0.25 GB. After shutdown the data dirs are 3.7-4.1 GB (A) vs 0.30-0.36 GB (B). The GC deleted every committed
+body (915,892 per node, = native actions processed) at 0.18 ms per dispatched block (p99 1.35 ms) on the consensus
+thread. With the load stopped (21-24 min of empty blocks), SST size is flat in both arms. `du` still rises ~0.004
+GB/min per DB, but that is WAL only, which a memtable flush or shutdown removes. So 79.3c's "idle" growth came from
+the reject-only load, not from time. matched/s, native blocks/s, block p50 / p99, order-to-commit latency, CPU per
+fill and timeouts are equal within one cell's resolution. Limits: n = 1 per arm, and the load is paced below
+capacity, so matched/s is equal by construction. This cell cannot show a throughput cost of the GC at saturation.**
+
+Question (bench queue step 9, Items Q9): s58safe's 60 min soak grew each data dir by ~0.2 GB/min. 18c's code read
+says committed action bodies are kept twice and never deleted: DA bodies in `consensus-db` (`cf_native_pending`) and
+block bodies in the state DB (`cf_block_bodies`, pruned only with `--retention-blocks`). Does main + RH4 with
+retention 1,000 hold both DBs flat once past the GC window (`max(N, 1000) + 128` = 1,128 dispatched blocks), with
+matched/s and block rate within noise of main?
+
+### 88.1 Setup
+
+| arm | binary | node md5 | bench md5 | node env (both: `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1 TORUS_HASH_ONLY_PUSH_THRESHOLD=524288 TORUS_SHARD_CUSTODY=0`) |
+|---|---|---|---|---|
+| A | main `e1be6c15` | `5ab8040e4e368e7a05f189677e4783f6` | `02f6b373` | (archive: no `--retention-blocks`) |
+| B | `perf/rh4-da-body-gc` `b2dd21a4` (main `e1be6c15` merged into 4514573f) | `d44f8b3b4c796204e01fd347a35a61b9` | `474b48d2` | `TORUS_RETENTION_BLOCKS=1000` (EXTRA_ENV) -> `start-node.sh` passes `--retention-blocks=1000` |
+
+* Builds: each in a new detached worktree (`wt/q9-a-e1be6c15`, `wt/q9-b-b2dd21a4`) with its own target dir
+  (`~/.cargo-target-q9-{a-e1be6c15,b-b2dd21a4}`), the s64 recipe (release `--locked`, mold + frame pointers, line
+  tables, each package alone). tx-flood `8923ecb2` / `083005ff` (unused). Staged in `ozarchy-q9-stage/{a,b}-run`. The
+  exe md5 of all 3 nodes was re-checked in every cell.
+* Tools frozen from `b2dd21a4` (`ozarchy-q9-tools/`, `FROZEN.txt`): e1be6c15's harness, including
+  `fix/harness-upstream-s64` (the consensus-DB `sampler.csv` columns), plus RH4's `TORUS_RETENTION_BLOCKS` knob in
+  `devnet/wsl/{env.sh,start-node.sh}`. Unset, it is the archive launch every earlier cell ran. Harness worktree for
+  both arms: `wt/q9-b-b2dd21a4`. Cell genesis md5 `d694b81b` (as in 84-87), N = 11 genesis from campaign A.
+* **Push threshold:** `TORUS_HASH_ONLY_PUSH_THRESHOLD=524288` is set on both arms. That is the code default, which
+  section 86 moves `env.sh` to. 18c has not changed `env.sh` yet, and run-cell.sh scrubs `TORUS_*`. With it, DA
+  bodies over 512 KB reach followers as hash-only manifests plus a pre-warm pull, not as a full-body push. At this
+  load, about 11% of pushes per node were manifests (3,148-3,345 manifests vs 24,804-26,167 full-body pushes per
+  node, both arms).
+  Bodies still land in `cf_native_pending` either way.
+* D, M, T unset (on); PE, KP, DB absent; custody 0 (so `cf_native_shards` stays empty); 15 s checkpoints (Classic);
+  oracle on (30000, 2,000 ms, walk 0); 300 markets; `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900
+  IN_FLIGHT_TAIL=commit CLOID_SHARE=0`; native only.
+* **Load: the standard shape paced to `--rate-total 250` actions/s, not 76,000.** At 76,000, or at 15,000 (smoke B:
+  251k matched/s, ~1,300 actions/s), the bench is bound by the in-flight cap, not the rate. s58safe ran out of
+  account margin at minute 21: positions only grow, because each (sender, market) pair trades one side. The bench
+  has no top-up, so the rate was lowered for both arms. Smoke A at 280 actions/s gave 58.7k matched/s. 250 puts the
+  hour's fills at ~180M per node, about 62% of the ~290M after which s58safe's senders ran out. Result: 0 margin
+  rejects in either cell.
+* **Idle phase:** run-cell.sh's drain with `QUIET_S=660` and `DRAIN_TIMEOUT=2400`. The bench has exited, the oracle
+  feed is SIGSTOPped, and the nodes keep running and committing empty blocks (~26 blk/s) until counters have been
+  quiet for 660 s. The quiet window restarts on short `torus_flush_worker_depth` / exec-queue blips, so the phase
+  lasted 1,252 s (A) and 1,442 s (B). It ends with the usual digest and agreement.
+* **Q9 sampler** (`ozarchy-q9-tools/q9-sampler.py`, its own systemd unit beside the campaign, 60 s, per node; rows in
+  `ozarchy-q9-run/q9-samples/<label>.tsv`): `du -sb` of `<data_dir>/consensus-db` and of the state DB (= data dir
+  minus `consensus-db`); SST count, SST bytes and WAL (`*.log`) bytes per DB; open fds and deleted-but-open fds
+  (`/proc/PID/fd`); `torus_rocksdb_pending_compaction_bytes` (sum over CFs per DB and the `_all` gauges); L0 files (max
+  per DB, `cf_native_pending`, `cf_block_bodies`); `torus_da_bodies_gc_deleted_total`, `torus_da_gc_seconds`; block
+  height, margin rejects. It also records per-CF sizes from the latest Compaction Stats dump in each RocksDB `LOG`
+  (`cf_native_pending`, `cf_native_shards`, `cf_block_bodies`, `cf_block_headers`; RocksDB dumps every 600 s, so a
+  new value arrives every 10 min) and every node's command line.
+* Order: smoke B (180 s + idle) and smoke A (180 s + idle; rate calibration), then r1-A 12:18-13:41 and r1-B
+  13:44-15:11. Fresh data dirs every cell (`CLEAN=1`). Free disk 89-96 GB after each cell.
+* Checks (`q9-checks.sh`, stepz's adapted): `q9retchk` covers B's node cmdline `--retention-blocks=1000`, `DA body GC
+  on ... window=1128` on every node and the env on 3 environs; A has none. `q9gcchk`: B's GC counter > 0 on every
+  node, absent on A. `q9idlechk`: drained with >= 600 s quiet after the bench exited and the oracle was paused.
+  `q9sampchk`: sampler coverage. `q9rejchk`: margin rejects. Also load shape, Classic, F took effect (1,351 / 1,351
+  boundary blocks pipelined), push threshold, custody off, fresh launch.
+
+Validity: 2 / 2 cells rc 0, ACCEPT AGREE PASS, exe md5 as staged on 3 nodes, 0 panic / fail-stop lines, 0 margin
+rejects (all re-checked from the raw files). 48 CHECK OK, 0 CHECK FAIL / WARN / CELL-FLAG, no reruns. Smoke B's
+first `q9sampchk` failed on a check bug: the sampler's first row comes at process start, before the DBs exist, so it
+is NA. The check now exempts that row and was re-run OK on the same cell
+(`ozarchy-q9-run/smoke-b/smoke/recheck-q9sampchk.txt`). Smoke B also showed the GC moving: 241,088 bodies deleted
+per node, all of the smoke's.
+
+### 88.2 Growth per arm (GB = 10^9 bytes; mean of 3 nodes, [min, max] where the nodes differ; `q9.txt`)
+
+`du` includes the live WAL. In the state DB it swings between 0.4 and 2.2 GB as memtables flush (val0 series in
+`q9.txt`), so the SST columns are the growth measure. The fits are least squares per node.
+
+| quantity | A consensus-db | A state DB | B consensus-db | B state DB |
+|---|---|---|---|---|
+| **SST growth, load min 5-60, GB/min** | **0.0222** [0.0221, 0.0224] | **0.0203** | **0.0001** [-0.0000, 0.0003] | **0.0007** |
+| du growth, load min 5-60, GB/min | 0.0220 | 0.0182 [0.0171, 0.0204] | 0.0002 [-0.0000, 0.0004] | 0.0011 [0.0009, 0.0012] |
+| SST growth, idle (bench end + 2 min to drain end), GB/min | 0.0008 | 0.0000 | 0.0000 | 0.0000 |
+| du growth, idle, GB/min (all WAL) | 0.0045 | 0.0037 | 0.0043 | 0.0037 |
+| SST GB at 10 / 30 / 60 min / end of idle | 0.21 / 0.69 / 1.30 / 1.32 | 0.32 / 0.78 / 1.33 / 1.33 | 0.019 / 0.016 / 0.030 / 0.027 | 0.21 / 0.19 / 0.25 / 0.25 |
+| du GB at 10 / 30 / 60 min / end of idle | 0.59 / 0.98 / 1.60 / 1.47 | 2.45 / 1.71 / 2.55 / 2.63 | 0.38 / 0.05 / 0.12 / 0.21 | 1.52 / 1.42 / 2.18 / 2.27 |
+| WAL GB at 60 min / end of idle | 0.30 / 0.15 | 1.21 / 1.29 | 0.08 / 0.19 | 1.93 / 2.02 |
+| per-CF size from LOG Compaction Stats, last dump in the load (13:19 / 14:45) and the idle | `cf_native_pending` 1.18-1.21 / 1.21-1.22 | `cf_block_bodies` 1.17 / 1.16; `cf_block_headers` 0.024 | `cf_native_pending` 0.014-0.066 / 0.014-0.031 | `cf_block_bodies` 0.053 / 0.072; `cf_block_headers` 0.024 |
+| SST files at 60 min / end of idle (max) | 27-28 / 26-27 (29) | 120-122 / 115-118 (122) | 4-9 / 3-4 (9) | 83-85 / 80-82 (92) |
+| `torus_rocksdb_pending_compaction_bytes` max | 0.30-0.49 GB | 0 | 0-0.07 GB | 0 |
+| L0 files max (per DB) | 3-4 | 4 | 4 | 4 |
+| data dir after shutdown (`q9-disk.txt`, both DBs) | 3.71 / 4.09 / 4.06 GB | | 0.36 / 0.36 / 0.30 GB | |
+
+| per node | A | B |
+|---|---|---|
+| open fds start / 60 min / end of idle (max) | 73 / 234-240 / 224-226 (240) | 73 / 175-181 / 165-169 (189) |
+| deleted-but-open fds, max over the cell | 0 | 0 |
+| `torus_da_bodies_gc_deleted` at the end | absent | 915,892 on every node (= `torus_native_actions_processed_total`) |
+| `torus_da_gc_seconds` sum / calls / mean / p99 | absent | 24.0-24.2 s / 134,285 / 0.18 ms / 1.35 ms |
+| block height at bench end / end of idle | 95,580 / 128,544 | 95,768 / 133,430 |
+
+* **A, under load:** both DBs grow linearly (val0 SST: 0.37 GB at minute 5, 1.01 GB at 20, 2.60 GB at 60, summed over
+  both DBs). `cf_native_pending` (1.2 GB) and `cf_block_bodies` (1.17 GB) are almost all of it: the bodies are kept
+  twice, as 18c read. 0.0425 GB/min of SST at 2.98M fills per node per minute is 14.2 MB per 1M fills. s58safe's
+  0.194 GB/min at 240,385 matched/s is 13.5 MB per 1M fills (du, inferred match). At the unpaced standard load that
+  is ~0.2 GB/min, ~12 GB per node per hour.
+* **B, under load:** `consensus-db` SST stays at 0.015-0.055 GB and `cf_native_pending` at 0.014-0.066 GB. The
+  state DB's SST moves between 0.13 and 0.29 GB with compactions (fit +0.0007 GB/min, ~0.04 GB per hour: state rows,
+  not bodies). `cf_block_bodies` stays 0.05-0.07 GB. The GC counter rises from minute ~1 (window 1,128 blocks = ~43 s
+  at 26 blk/s; 59,769 deleted by minute 4.7 on val0) and tracks the load: 912,345 at minute 60.8, 915,892 once the
+  last window has passed.
+* **Idle, both arms:** no SST growth (A `consensus-db` +0.0008 GB/min, a small compaction residual). The only growth is
+  WAL, ~0.004 GB/min per DB from empty blocks into memtables that are not full, and it goes at flush or shutdown. So
+  79.3c's "0.2 GB/min with or without load" was a 37 min reject-only load (~17 blk/s of blocks full of rejected
+  orders whose bodies are kept), not idle time.
+* fds follow the SST count (`max_open_files` unset): A +161-167 over the hour (s58safe +316, at 4.8x the fill rate), B
+  +102-108, almost all state-DB SSTs. None held deleted files.
+
+### 88.3 Standard table (load window; mean of 3 nodes where per node; `q9.txt`)
+
+| arm | matched/s | placed/s | native blk/s | fills / native blk | block p50 / p99 ms | order-to-commit p50 / p99 ms | CPU-s / 1M | consensus-thread ms / blk (est) | timeouts / no_proposal | margin rejects |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | 49,750.5 | 65,095.4 | 26.496 | 1,853 | 8.37 / 479.4 | 159.1 / 582.1 | 44.12 | 2.88 | 0 / 0 | 0 |
+| B | 49,733.2 | 65,077.6 | 26.545 | 1,847 | 8.62 / 478.7 | 156.8 / 580.3 | 43.91 | 2.87 | 0 / 0 | 0 |
+| B / A | 0.9997 | 0.9997 | 1.0018 | 0.9965 | 1.031 / 0.998 | 0.986 / 0.997 | 0.995 | 0.997 | | |
+
+Block p50 / p99 come from the commit-interval histogram over the load window (86.2's method). Order-to-commit is the
+`torus_order_age_commit_seconds` histogram, same window. Run order A then B, one cell each, no warm-up cell (the two
+smokes ran just before). CPU-s per 1M is ~1.8x the unpaced cells' (23-25): at this load the fixed per-block cost is
+spread over ~1,850 fills per block instead of ~14,000.
+
+### 88.4 Rule and call
+
+| rule (Items Q9) | measured | met? |
+|---|---|---|
+| B holds `consensus-db` flat past the window | SST +0.0001 GB/min, 0.03 GB at 60 min (A +0.0222, 1.30 GB) | yes |
+| B holds the state DB flat past the window | SST +0.0007 GB/min (state rows), 0.25 GB at 60 min (A +0.0203, 1.33 GB); `cf_block_bodies` 0.05-0.07 GB | yes |
+| matched/s within noise of A | 0.9997 (paced load: equal by construction) | yes, uninformative |
+| block rate within noise of A | native blk/s 1.0018; block p50 +3%, p99 -0.2%; order-to-commit within 1.5% | yes (n = 1) |
+
+**What one cell per arm can show:** the growth result. It is a 30x difference in a slope measured on 3 nodes x 55
+points per arm, with all nodes within a few percent of each other, so noise cannot explain it. It also shows the
+GC's own cost per block from its histogram, 0.18 ms mean on the consensus thread, and that nothing broke: agreement,
+no timeouts, no deleted-open files. **What it cannot show:** a confidence interval on block rate or latency (n = 1;
+the 3% p50 difference is within the run-to-run spread seen in 84-87). It also cannot show a throughput cost at
+saturation: the load was paced below capacity to keep margin for an hour, so matched/s follows the offered rate. A
+paired n >= 3 at the unpaced load (600 s cells, where margin lasts) would answer that. Nor does it cover custody on:
+`cf_native_shards` stayed empty, so the shard GC path was not measured, as decided in Q10.
+
+### 88.5 Next
+
+* Owner / 18c: Q9 passes, so "validators prune by default" (owner s126) can go ahead, and production retention N can
+  be decided. At the unpaced standard load (~14 MB per 1M fills, ~0.2 GB/min), N = 100,000 blocks keeps roughly
+  N x the per-block body bytes. At ~17 blk/s that is ~1.6 h of history, ~20 GB per node; at 26 blk/s and this load,
+  ~1 h. These are estimates scaled from this cell, not measured.
+* Optional: a paired PC + F 600 s A/B at the unpaced standard load, if the GC's consensus-thread cost at saturation
+  (0.18 ms per block, more at ~14k fills per block) needs a CI before the RH4 merge.
+* Data: `~/bench-results-matched/ozarchy-q9-300m-r1-{A,B}`, `ozarchy-q9sa-300m-smoke-s0`, `ozarchy-q9sb-300m-smoke-s0`.
+  Campaign files are in `ozarchy-q9-run/campaign/` (`campaign.log`, `cells.tsv`) and `ozarchy-q9-run/smoke-{a,b}/`.
+  The sampler is in `ozarchy-q9-run/q9-samples/` (`<label>.tsv`, `<label>.cmdline`). Tools: `ozarchy-q9-tools/`
+  (`q9-spec.json`, `q9s{a,b}-spec.json`, the generated drivers, `q9-checks.sh`, `q9-sampler.py`, `FROZEN.txt`). Stage:
+  `ozarchy-q9-stage/` (`build/build.sh`, `md5s.txt`). Analysis: `ozarchy-q9-run/analyst/q9-analyse.py` -> `q9.txt`,
+  `q9-analyse.json`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
