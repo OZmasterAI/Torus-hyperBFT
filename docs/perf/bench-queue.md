@@ -291,6 +291,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per native block, and the slowest job's share of each wait (straggler vs too little parallel work). Report whether
    each top item has an obvious fix (cache, batch, skip, parallelize) and its upper-bound gain. Owner / 18c decide
    what enters a plan.
+   **Done s68 (ozarchy-q8re analysis, section 92, no new cells; W1 Keccak by neighbour sample + code order, since
+   99-99.9% of Keccak samples have no caller in the fp stacks; W3-W5 switch records for the pool waits).** Exec
+   Keccak 8.75 / 9.53 / 10.39 ms per native block (11.6-12.5%). It is two hashes over the same ~10.8 KB per action:
+   the trust-cache key pre-pass (`verified_cache_key_with_scratch`) 4.25 / 4.55 / 4.63 ms and the anti-MEV sort key
+   (`sort_native_actions_indexed` -> `action_sort_key`) 3.98 / 4.18 / 5.11 ms; 0.5-0.8 ms unsplit. Roots, running
+   hash, row / level hashing, EVM and ecrecover: 0 exec samples. Pool waits 16.9-18.9 ms per native block (18-19% of
+   wall): match setup 7.3-8.1, settle plan 4.1-4.6, cancel-all 3.6-4.4 (~5 jobs, too little work), and `par_recover`
+   1.9-2.2 (all trust-cache hits, 0 ecrecover samples: pure overhead). No book-save or flush jobs. Not stragglers:
+   the slowest job is on CPU for 45-58% of the wait, the last finisher is preempted 15-38% (shared host), and the
+   median worker starts 13-19% in. Upper bounds, ms per native block: skip the key pre-pass ~5.3, move the sort key
+   upstream ~5.1-6.3, one absorb for both ~4.1-4.9, skip an empty `par_recover` 1.9-2.2, match / settle / cancel-all
+   waits down to the slowest job 4.0-4.3 / 2.1-2.3 / 1.5-2.1. Owner / 18c: plan entry.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

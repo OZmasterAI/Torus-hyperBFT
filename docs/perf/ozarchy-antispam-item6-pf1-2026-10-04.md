@@ -13830,6 +13830,178 @@ Call:
 | r3 | A | 0/0 | ACCEPT/AGREE/PASS | True | ok | 260,402.4 | 10.542 | 23,485 | 89.7 | 19 / 879 | 23.38 | 2.0 | 0 | 9.36 [0.399] | 5.06 | 7.00 | n/a | 2.837 | 4,084 / 5,035 | 76:0/76:0/76:0 | 6,346 |
 | r3 | B | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,504.0 | 4.280 | 59,097 | 227.5 | 147 / 1,231 | 23.23 | 4.0 | 1.0 | 33.97 [0.575] | 15.04 | 16.03 | 7.668 | 2.999 | 5,228 / 6,912 | 40:0/40:0/40:0 | 2,581 |
 
+## 92. Step 8e: Keccak and exec pool-wait attribution from 8c's profiles (analysis only, campaign ozarchy-q8re, main `fbe36391`, archy, 2026-10-18)
+
+**Exec-thread Keccak is two per-action hashes over the same ~10.8 KB of canonical bytes, run one after the other at
+block start. The trust-cache key pre-pass (`verified_cache_key_with_scratch`, in `batch_verify_native_actions_cached`)
+costs 4.25 / 4.55 / 4.63 ms per native block (5.6-5.7% of exec on-CPU). The anti-MEV sort key (`action_sort_key` in
+`sort_native_actions_indexed`) costs 3.98 / 4.18 / 5.11 ms (5.2-6.2%). 0.5-0.8 ms sits between the two and was not
+assigned. State / trie roots, the running hash (SHA-256 anyway), CF row / level hashing, EVM and signature recovery
+show 0 exec samples. The EIP-712 domain separator is 0.03-0.22 ms. The exec thread's pool waits are 16.9-18.9 ms per
+native block (18-19% of wall), in four kinds: match setup 7.3-8.1 ms, settle plan 4.1-4.6, cancel-all 3.6-4.4, and a
+rayon `par_recover` over every action 1.9-2.2 ms. That last wait recovers nothing: 0 ecrecover samples on its workers
+in r1-r3, all trust-cache hits. No book-save or flush jobs run on the pool. No `run_jobs` wait is one long straggler job:
+the slowest worker is on CPU for 45-58% of the wait. The last worker to finish is preempted for 15-38% of the wait (3
+validators and the load generator share one 32-thread host). The median worker starts 13-19% into the wait. Cancel-all
+also has too little parallel work (~5 jobs, 3.2-3.6 workers busy on average). Upper bounds are in 92.4. Owner / 18c
+decide what enters a plan.**
+
+Question (bench queue step 8e, owner s128): section 90.5 left two large rows outside the Phase 5 plan. Keccak is ~12%
+of exec, callers unknown. The exec thread waits on its own pool 16-18% of wall. From the existing
+`ozarchy-q8re-300m-r{1,2,3}-ONP` profiles: (a) Keccak by caller, as % of exec and ms per native block, with the top 3
+call paths; (b) which job kinds the exec thread waits on, per 15 s and per native block, and the slowest job's share
+of each wait. For each top item: is there an obvious fix, and what is its upper-bound gain?
+
+### 92.1 Method
+
+No new cells. The inputs are section 90's raw profiles of val1 (node md5 `cb8d8ad8`, 4 / 4 cells valid there),
+re-read with `perf script --no-inline`. Source names come from the `wt/q8re-fbe36391` worktree. Scratch is in
+`ozarchy-q8re-run/analysis-8e/` (scripts in `scripts/`); no raw cell file was touched.
+
+* **(a) Keccak, W1** (45 s, `cycles:u` 499 Hz, fp call graphs, exec tid from `exec-tid.txt`). 99.0-99.9% of exec
+  Keccak samples are bare: the leaf is `__KeccakF1600` / `KECCAK_ASM_SHA3_absorb` with no caller. The asm does not keep the
+  frame pointer, which is the trap 18c's p3cloidprof analysis hit too. The exec thread is serial, so each run of
+  consecutive Keccak samples (470-537 runs, mean 3.7-4.0 samples) takes the phase of its neighbour samples (the
+  child of `execute_committed_block_with`). Rules: both neighbours in the same Keccak-calling phase: 11-14% of
+  samples. One neighbour Keccak-calling: 55-59%. Code order in `app.rs` (verify at 3830, then the replay-guard loop
+  with its nonce reads and action clones, then the sort at 4031): a run that ends in the replay loop is verify, one
+  that starts there is the sort; 22%. Two different Keccak phases, split in half: 1-3%. Unassigned: 6-8%. The 2-20
+  intact wrapper chains per cell name the callers. Poisson error on a ~800-sample row is about +-3.5% (1 sd).
+  Cost-model check: W1 averages 165-182 actions per native block at 239 orders per action (accepted orders / actions
+  processed). That is ~10.8 KB of canonical bytes per action at 45 B per order (limit order, no cloid). Both keys hash
+  those bytes; the verify key adds 73 B. So the two keys should cost about the same. Measured verify : sort is
+  1.07 / 1.09 / 0.91.
+* **(b) Pool waits, W3 / W4 / W5** (3 x 15 s per cell: kernel+user cycles 499 Hz, `context-switches` period 1 with
+  stacks, `PERF_RECORD_SWITCH` for every val1 thread). An exec wait runs from its switch-out sample to its next
+  switch-in, and the switch-out stack gives the kind. Each worker's job time inside the wait comes from its own switch
+  in / out records. A worker interval counts as a job if it holds a job sample (a rayon job frame plus a torus or k256
+  frame) or ends with a job stack. 6-9% of worker on-CPU time cannot be classified (W3 r1: 2.2 of 26.4 s), and short
+  jobs (< 2 ms, no sample, ending idle) are missed, so "workers active" is a lower bound. Pools: `torus-exec-pool`
+  (32 threads, `exec_pool::run_jobs`) and the rayon global pool (32 threads, comm `torus-execution`). Per wait the
+  script records: workers active, mean concurrency (job time / wait), the slowest worker's job time / wait (`run_jobs`
+  gives one chunk per worker), and the times with 1 and with 0 workers busy. It also records lead (wait start to the
+  median worker's first job slice) and tail (median worker done to last worker done). For the last finisher it splits
+  the wait into on-CPU, preempted (switch-out `preempt`) and asleep / lock time. Section 90's totals (`run_jobs` +
+  match setup, checkpoint recv) are reproduced to within ~0.04 s per window.
+
+### 92.2 Keccak on the exec thread by caller (W1; ms per native block = samples / 499 Hz / W1 native blocks)
+
+| caller (phase) | r1 | r2 | r3 |
+|---|---|---|---|
+| exec on-CPU (all samples) | 15,081 = 75.2 ms (402 blk) | 16,686 = 80.0 ms (418 blk) | 15,781 = 83.0 ms (381 blk) |
+| **Keccak total** | **1,755 = 11.6% / 8.75 ms** | **1,988 = 11.9% / 9.53 ms** | **1,976 = 12.5% / 10.39 ms** |
+| action hashing, trust-cache key pre-pass (`verified_cache_key_with_scratch`) | 5.44% / 4.09 | 4.70% / 3.76 | 5.41% / 4.49 |
+| same phase, rest of `batch_verify` (EIP-712 domain / struct hash, `par_recover` set-up, other) | 0.21% / 0.16 | 1.00% / 0.79 | 0.17% / 0.14 |
+| action hashing, anti-MEV sort key (`action_sort_key`) | 5.29% / 3.98 | 5.22% / 4.18 | 6.16% / 5.11 |
+| between verify and sort, not split (run spans both) | 0.68% / 0.51 | 1.00% / 0.80 | 0.79% / 0.65 |
+| state / trie roots (`native_trie`, `state_root`, `exec_root` timer 0.00 ms) | 0 | 0 | 0 |
+| running hash (`torus_state::running_hash`, SHA-256, not Keccak) | 0 (no `sha2` sample on exec) | 0 | 0 |
+| signature recovery (secp256k1 ecrecover) | 0 (no `k256` / `ecdsa` sample on exec) | 0 | 0 |
+| CF row / level hashing (`level_row_data`; Classic books, level-hash cache 0 hits) | 0 | 0 | 0 |
+| EVM (`revm`, `torus_evm`; native load only) | 0 | 0 | 0 |
+| block header hash (`header_record_bytes`, 1 hash per block) | 0 | 0 | 0 |
+| non-Keccak cost of the same phases: key pre-pass encoding; sort encoding; replay-loop `NativeAction::clone` | 0.63; 0.91; 0.78 ms | 0.82; 0.90; 0.90 ms | 0.66; 1.18; 0.84 ms |
+
+The Keccak total matches section 90.4's hash row (11.7 / 12.0 / 12.5%, 8.8 / 9.6 / 10.4 ms). Outside the exec thread,
+for scale only: hotstuff-algo spends 11.2 / 11.6 / 12.5 ms of Keccak per native block (44-46% of its own on-CPU,
+`compute_action_hash` at dispatch over the same bytes). The gossip and ingress verify threads hash much more again.
+
+Top 3 call paths (exec thread, `crates/...` in the q8re worktree):
+
+1. `torus-consensus/src/app.rs:ExecutionContext::execute_committed_block_with` (line 4031) ->
+   `torus-bridge/src/native_executor.rs:sort_native_actions_indexed` -> `action_sort_key` ->
+   `alloy_primitives::keccak256(NativeAction::canonical_bytes())` (`torus-types/src/lib.rs:canonical_bytes` /
+   `append_canonical_bytes` / `encode_place_order_params`). 3.98-5.11 ms per native block.
+2. `app.rs:execute_committed_block_with` (line 3830) -> `torus-types/src/eip712.rs:batch_verify_native_actions_cached`
+   -> `batch_verify_impl` (sequential pre-pass; `TORUS_EXEC_PARALLEL_KEYS` unset) ->
+   `torus-types/src/lib.rs:verified_cache_key_with_scratch` -> `keccak256(canonical ‖ nonce ‖ v ‖ r ‖ s)`.
+   3.76-4.49 ms (4.25-4.63 with the rest of the verify phase).
+3. `eip712.rs:batch_verify_impl` phase 2 -> `eip712_domain_separator` -> `eip712_domain_separator_for_chain`. It is
+   recomputed on every call (5 Keccaks per block) and has intact chains in W1. 0.03-0.22 ms, small.
+
+### 92.3 Exec-thread pool waits by job kind (W3 / W4 / W5; ms per native block = wait s / native blocks in the 3 windows: 446 / 455 / 520)
+
+| wait kind (exec switch-out stack) | cell | s per 15 s (W3 / W4 / W5) | waits / 15 s | ms / native blk | mean ms | workers active | mean busy | slowest job on-CPU, % of wait | max / median job | lead / tail | 0 / 1 worker busy | last finisher: on CPU / preempted / asleep or lock |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| match setup (`match_parallel_setup_with` -> `run_jobs`, exec pool) | r1 | 1.18 / 1.15 / 1.25 | 83 | 8.10 | 14.6 | 21.4 | 10.0 | 49% | 1.9 | 16% / 33% | 11% / 9% | 35% / 34% / 9% |
+| | r2 | 1.26 / 1.19 / 1.19 | 86 | 8.05 | 14.1 | 20.1 | 9.5 | 47% | 2.1 | 15% / 35% | 10% / 9% | 34% / 37% / 9% |
+| | r3 | 1.32 / 1.17 / 1.29 | 89 | 7.32 | 14.1 | 20.0 | 9.0 | 45% | 2.3 | 14% / 37% | 12% / 10% | 33% / 38% / 10% |
+| settle plan (`execute_batch_phases` -> `compute_market_settle_plan` jobs) | r1 | 0.64 / 0.67 / 0.74 | 84 | 4.63 | 8.2 | 18.9 | 8.5 | 50% | 2.0 | 19% / 33% | 16% / 10% | 32% / 31% / 7% |
+| | r2 | 0.68 / 0.64 / 0.62 | 75 | 4.28 | 8.6 | 20.2 | 8.6 | 51% | 1.9 | 18% / 34% | 13% / 11% | 34% / 33% / 9% |
+| | r3 | 0.71 / 0.68 / 0.75 | 82 | 4.14 | 8.7 | 19.3 | 8.0 | 47% | 2.0 | 18% / 33% | 14% / 11% | 30% / 32% / 11% |
+| cancel-all (`exec_cancel_all_run` -> `run_jobs`, PC cap 8) | r1 | 0.64 / 0.58 / 0.55 | 91 | 3.99 | 6.6 | 5.4 | 3.4 | 56% | 1.3 | 14% / 21% | 18% / 15% | 52% / 21% / 8% |
+| | r2 | 0.64 / 0.68 / 0.66 | 94 | 4.36 | 7.0 | 5.0 | 3.2 | 52% | 1.3 | 15% / 21% | 17% / 19% | 48% / 24% / 6% |
+| | r3 | 0.57 / 0.57 / 0.69 | 90 | 3.55 | 6.8 | 5.4 | 3.6 | 58% | 1.4 | 13% / 20% | 16% / 16% | 55% / 15% / 11% |
+| signature recovery `par_recover` (rayon global pool; all trust-cache hits) | r1 | 0.27 / 0.27 / 0.37 | 101 | 2.03 | 3.0 | 8.3 | 0.5 | 13% | 4.7 | 32% / 30% | 70% / 19% | 10% / 43% / 23% |
+| | r2 | 0.31 / 0.34 / 0.36 | 109 | 2.22 | 3.1 | 7.5 | 0.5 | 12% | 4.1 | 32% / 29% | 72% / 18% | 10% / 44% / 20% |
+| | r3 | 0.30 / 0.36 / 0.33 | 110 | 1.93 | 3.0 | 7.6 | 0.5 | 13% | 4.8 | 34% / 30% | 71% / 18% | 10% / 41% / 20% |
+| **all pool waits** | r1 / r2 / r3 | | | **18.7 / 18.9 / 16.9** | | | | | | | | |
+
+Other exec off-CPU rows, not pool jobs (ms per native block, r1 / r2 / r3): checkpoint settle / layer resolve
+(channel recv) 2.38 / 2.49 / 2.00; resident `settle_rows` 0.70 / 0.59 / 0.65; preemption / IRQ (runnable, not
+waiting) 4.30 / 4.20 / 3.73. Book save (`save_order_books`) and cache `flush_all` run inline on the exec thread (on-CPU
+in 90.4) and never appear as pool waits. Only a handful of `flush` frames show on workers during waits (1-4 samples
+per window). The global pool's samples during `par_recover` waits are rayon wake / scheduler frames (802 / 883 /
+1,040 of 890 / 938 / 1,140 samples in W3). None are `k256` / `ecdsa`: `recover_senders_phase1` sends every action
+through `par_iter().zip()`, even when every action hits the trust cache.
+
+Reading:
+
+* Match setup and settle plan look alike: ~20 chunks, ~9-10 workers busy on average, the slowest worker on CPU for
+  only about half the wait, max / median job time ~2. The rest of the wait is wall without work. The median worker
+  starts 14-19% into the wait (rayon's wake chain), and the last finisher spends a third of the wait preempted and
+  ~10% asleep in rayon `Sleep` (it ran more than one slice). So the waits are mostly scheduling and CPU contention,
+  with a moderate imbalance. One long job does not dominate, and the pool is not short of work (20 jobs for 32
+  threads).
+* Cancel-all is short of parallel work: ~5 jobs (cap 8, `DEFAULT_PARALLEL_CANCEL_ALL_MIN_VISITS` 64), 3.2-3.6 busy on
+  average, and 1 worker or none busy for 32-36% of the wait. Its jobs are balanced (max / median 1.3).
+* `par_recover` is pure overhead here: 3.0-3.1 ms per wait (mean) of waking 7-8 global-pool threads to copy cache
+  hits.
+* Wake-up of the exec thread after the last worker finishes: 0.34-0.53 ms per wait.
+
+### 92.4 Candidate fixes and upper bounds (present, not decide)
+
+Upper bound = the whole row, or (for the waits) what would be left if the wait shrank to the slowest job's on-CPU
+time. Exec on-CPU % uses W1 (75.2 / 80.0 / 83.0 ms per native block). Wall % uses the 15 s off-CPU windows.
+
+| item | obvious fix | upper bound, ms per native block (r1 / r2 / r3) | share | notes |
+|---|---|---|---|---|
+| K1 trust-cache key pre-pass (Keccak + encoding) | skip: key the trust cache by the `compute_action_hash` hotstuff-algo already computes (`native_action_hashes`), gated on `ActionSignature::Eip712`, and pass the hashes in with the block. Or parallelise (`TORUS_EXEC_PARALLEL_KEYS=1` exists) | 4.9 / 5.4 / 5.3 | 6.5 / 6.7 / 6.4% of exec on-CPU | Skip = a cache-key change on a fork-sensitive path: the mempool comment says "DO NOT unify the two keys", because session actions must not be cached. Needs a safety review. KP (parallel keys) in campaign A: +1.03% matched/s [0.9970, 1.0238], CPU per fill +2.1% (section 82). It adds a pool round trip (the `par_recover` round trip is ~3 ms here) |
+| K2 anti-MEV sort key (Keccak + encoding) | move it off the exec thread: compute it upstream (hotstuff-algo already absorbs the same bytes; it is off-CPU 69-75%), or `par_iter` on the pool (pure, deterministic) | 4.9 / 5.1 / 6.3 | 6.5 / 6.4 / 7.6% | The key value is consensus-visible (ordering), so it cannot be skipped without a consensus change. Moving it upstream keeps the value. A pool `par_iter` pays a round trip like K1 |
+| K3 one absorb for both keys | absorb the canonical bytes once, fork the sponge for the sort key and the verify key | ~4.1-4.9 (half of K1 + K2 Keccak) | ~5.5-5.9% | No consensus change. Needs a streaming Keccak (the `sha3` crate); its speed against the asm one-shot is not measured here |
+| K4 EIP-712 domain separator | `OnceLock` per chain id | 0.03-0.22 | <= 0.3% | small |
+| P1 `par_recover` with all hits | skip the `par_iter` when no action misses the trust cache (or run serially below N misses) | 2.03 / 2.22 / 1.93 | 2.0-2.2% of wall | 0 ecrecover samples on its workers; the whole wait is overhead |
+| P2 match setup wait | fewer, larger chunks or a lower `TORUS_MATCH_WORKERS` (less oversubscription, shorter wake chain), or the exec thread runs one chunk itself | 4.1 / 4.3 / 4.0 (wait - slowest job) | ~4% of wall | Preempted time is partly a testbed artefact (3 validators + load generator on one host; load average 26 at r1's W3 start). Needs an A/B. P2-3 (section 44) already moved spawns to the pool |
+| P3 settle plan wait | same as P2 (`TORUS_SETTLE_WORKERS`) | 2.3 / 2.1 / 2.2 | 2.1-2.5% of wall | same caveat |
+| P4 cancel-all wait | too little work: fold it into another pool round trip, or raise the work gate | 1.8 / 2.1 / 1.5 | 1.7-2.1% of wall | lead + wake ~15% of each wait is the per-trip cost |
+
+These do not add up to a throughput gain. The K rows are exec CPU; the P rows are exec wall. Hotstuff-algo was blocked
+on the full exec channel in 6 of 9 windows in section 90, so both feed the exec critical path while the node is
+saturated. Each would need an A/B, as section 91 showed for step 2 (block-size feedback).
+
+### 92.5 Limits
+
+* Keccak callers come from neighbour samples and code order, not from call chains. 6-8% stays unassigned between
+  verify and sort; the verify / sort split inside one run is +-1 sample (1-3% split by half). Verify vs sort agrees
+  with the 1 : 1 cost model within ~10% per cell. W1 is 45 s per cell, and W2 was not re-read.
+* Pool waits: wall times are exact (switch records). Job time per worker depends on the job / idle classification (6-9%
+  of worker on-CPU time unclassified). Worker counts are lower bounds. The off-CPU windows record every context switch,
+  and perf's own sched-in work (`perf_iterate_ctx`) shows in the scheduler paths, which can lengthen wake chains
+  somewhat. Which market sits in the slowest chunk is not visible.
+* "Preempted" means runnable but not running: the host runs 3 validators plus the load generator. On a dedicated host
+  that share would likely be smaller, and the P2 / P3 bounds with it.
+* `torus_verified_sender_cache_{hits,misses}` count gossip-ingest lookups too (22k misses per 15 s in W3 r1), so they
+  cannot give the exec miss rate. The 0 ecrecover samples are the evidence for "all hits" in this load.
+
+### 92.6 Next
+
+* Owner / 18c: whether K1-K3 and P1-P4 enter a plan. The cheapest and safest are P1 (skip an empty `par_recover`)
+  and K4. K1 needs a fork-safety review, K2 / K3 an A/B, and P2-P4 an A/B on worker caps or round-trip merging.
+* Data: scripts, per-window outputs and per-cell JSON in `~/bench-results-matched/ozarchy-q8re-run/analysis-8e/`.
+  Files: `keccak.txt`, `keccak-r{1,2,3}.json`, `pool-r{1,2,3}-w{3,4,5}.{txt,json}`, `pool-agg.{txt,json}`, and
+  `scripts/{parse,keccak,poolwait,agg}.py`. The gzipped `perf script --no-inline` dumps `r{1,2,3}-w{1,3,4,5}.txt.gz`
+  (~1 GB) can be deleted.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
