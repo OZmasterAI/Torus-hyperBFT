@@ -108,13 +108,28 @@ fn state_has_chain(db: &StateDb) -> Result<bool, String> {
     Ok(false)
 }
 
-/// Genesis has already been applied to this data dir.
+/// Genesis has already been applied to this data dir. One point read and one
+/// bounded seek, never a scan (bench queue 8f: the old
+/// `all_accounts().is_empty()` loaded every account on every boot).
+///
+/// * HotStuff state in the consensus DB: `Replica::initialize`, the LAST
+///   genesis step, writes `COMMITTED_VALIDATOR_SET` in one batch, so it is
+///   present once genesis completed, also for a genesis without EVM accounts
+///   (which the old check re-seeded on every boot, resetting the HotStuff
+///   locks and view).
+/// * Any row in `CF_ACCOUNTS`: the old check, kept so every data dir it
+///   called initialized still is.
+///
+/// A crash inside genesis: after the first account or validator row, the
+/// restart rule in [`open_node_dbs`] refuses the dir (chain without HotStuff
+/// state) before this runs; before it, nothing marks the dir and genesis runs
+/// again (its writes are idempotent puts). Both as before.
 pub fn genesis_applied(dbs: &NodeDbs) -> Result<bool, String> {
-    let accounts = dbs
-        .state
-        .all_accounts()
-        .map_err(|e| format!("probe genesis: {e}"))?;
-    Ok(!accounts.is_empty())
+    if has_hotstuff_state(&dbs.consensus)? {
+        return Ok(true);
+    }
+    StateBackend::prefix_exists(&dbs.state, CF_ACCOUNTS, &[])
+        .map_err(|e| format!("probe {CF_ACCOUNTS}: {e}"))
 }
 
 /// Boot step 4: seed `genesis` (state, then the HotStuff replica) unless
@@ -412,8 +427,10 @@ mod tests {
         torus_genesis::Genesis::from_json(&g.to_string()).unwrap()
     }
 
+    type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
     /// Every row genesis writes that a restart must leave alone.
-    fn chain_rows(dbs: &NodeDbs) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+    fn chain_rows(dbs: &NodeDbs) -> Vec<(&'static str, Rows)> {
         let mut rows: Vec<_> = [CF_ACCOUNTS, CF_VALIDATORS, CF_FEE_CONFIG]
             .into_iter()
             .map(|cf| (cf, StateBackend::iterate_cf(&dbs.state, cf, None).unwrap()))
