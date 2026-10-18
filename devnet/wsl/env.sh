@@ -42,7 +42,10 @@ PEER_TO_V1=/ip4/127.0.0.1/udp/$P2P1/quic-v1/p2p/$PID1
 # threshold is set AT the floor: every pre-proposal body set the codec can
 # carry (cap 200 ~5.6 MB, cap 300 ~7-8 MB at bs400) is pushed directly; only
 # larger sets fall back to the HASH manifest + chunked pull.
-export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-8000000}"
+# s128 (section 86, bench queue 7b): moved to the 512 KB code default
+# (HASH_ONLY_PUSH_THRESHOLD, torus-network bridge.rs): +4.3% matched/s, -5.9% CPU
+# per fill vs the 8 MB pin on one host; the WAN threshold is still open.
+export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-524288}"
 # r4: the compiled default IS the r3 cap-200 bundle (NATIVE_TOTAL_BLOCK_CAP 200,
 # ORDERS_PER_BLOCK 100k, BLOCK_BYTES 12 MB, trust-cache 32k) — leave the cap
 # UNSET here so the node runs its compiled default; export

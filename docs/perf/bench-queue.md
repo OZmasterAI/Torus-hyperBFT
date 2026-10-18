@@ -181,6 +181,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    +10%; matched/s 0.991 [0.905, 1.085], CPU per fill flat. Not extended to n = 4 (more rounds of the same arms cannot
    reach -40%). Next, decided with 18c: a stronger zero-code arm (`TORUS_CHECKPOINT_MAX_BYTES` ~40-50 MB or 2,000 ms),
    or build A1 on this evidence.**
+8b. **Step Z2: checkpoint size cap** (owner s128; ~45 min plus setup; zero code). Same binary as step Z (`9d770519`,
+   md5 `0d234898`), same shape, flags and push threshold (PC + F by env, 512 KB), ABBA n = 2: Z15 (as step Z) vs ZC =
+   Z15 + `TORUS_CHECKPOINT_MAX_BYTES=50000000` (step Z batches: mean 108 MB, max 208 MB, so ZC more than halves
+   them). Same metrics and the same GO / NO-GO / SHIP-ZC rule as step Z (W_db must fall >= 40%; then GO needs X and G
+   to fall >= half as much in relative terms, i.e. G 497 -> <= ~400 ms). Report also checkpoints per 100 blocks, the
+   share triggered by the cap, native blocks/s, block p50 / p99, state-DB writes and Dirty / Writeback. A GO means 18c
+   builds A1; a NO-GO drops A1 (the p99 windows are then not from the batch size).
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
    **READY (s128): arm (b) binary = `perf/rh4-da-body-gc` `b2dd21a4`** (main e1be6c15 merged into 4514573f, no
    conflicts; workspace 4069 passed / 0 failed, clippy no new warnings). Owner s128: custody OFF by default until T3.1,
