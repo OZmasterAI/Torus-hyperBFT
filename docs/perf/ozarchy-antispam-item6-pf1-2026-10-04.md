@@ -12474,6 +12474,101 @@ the validator set is large (roadmap T3.1), and the RH4 shard-count fix waits for
 | r3 | base | 0/0 | ACCEPT/AGREE/PASS | True | ok | 242,926.8 | 3.683 | 262.9 | 197 / 1,282 | 23.92 | 5.0 | 0 | 57.4 | 0.00 | 14.46 | 17.0 | 0.00 | 6.5 |
 | r3 | F | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,092.5 | 3.940 | 246.3 | 161 / 1,274 | 24.05 | 3.0 | 0 | 54.2 | 0.00 | 13.72 | 17.1 | 0.00 | 6.4 |
 
+## 83. Step 5, Q4 winners together: PC+F vs PC+F+PE, standard load, 300 markets, 600 s cells, n = 3 (campaign ozarchy-q4w, main `e3d11cb9`, archy, 2026-10-18)
+
+**PE does not stack on PC+F for matched/s: -1.38% [0.9768, 0.9957], a loss by section 82's rule (CI below 1).
+Its block-speed gain does stack and is larger than alone: native blocks/s +15.7% [1.0832, 1.2360] (alone +9.2%),
+exec block_ms -16.8% [0.7884, 0.8784] (alone -8.1%), block p99 -7.0% [0.9094, 0.9509] (alone within noise); block p50
+-6.7% within noise. CPU per fill +2.4% [1.0201, 1.0285] (alone +2.0%). Most of the exec gain per block is smaller
+blocks (fills per native block -14.1% [0.7971, 0.9252]); exec ms per 1k fills is only -3.1% [0.9503, 0.9884].
+no_proposal 0 in all 6 cells; timeouts 3 (PCF) / 0 (PCFPE). n = 3, one host, alternating order AB BA AB. PE's
+default is the owner's call: faster, smaller blocks and a lower p99 for -1.4% matched/s and +2.4% CPU per fill.**
+
+Question (bench queue step 5, owner s128): PC and F won in section 82 and go on by default. Does PE still pay for its
++2% CPU per fill with PC+F on? No all-off base and no PC-only arm (owner s128).
+
+### 83.1 Setup
+
+Binary M = main `e3d11cb9` as in section 82 (node md5 `bf720f9f`, staged `ozarchy-s64-stage/m-run`, not rebuilt;
+md5 re-checked on the 3 nodes of every cell). Tools: campaign A's frozen copy unchanged (`ozarchy-campA-tools`, main
+`5c6c82f8`; `tools/matched-bench` is unchanged up to main `e1be6c15`), harness worktree `wt/s64-main-e3d11cb9`; spec,
+checks and the generated driver in `ozarchy-q4w-tools/` (`q4w-spec.json`, `q4w-checks.sh`, `FROZEN.txt`). Same
+standard load as 82.1 (Classic, 15 s checkpoints, oracle on, 300 markets, rate 76,000, `BLOCK_CAP=400 RETRY_BUSY=1
+MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, native only, resend 250).
+D, M, T unset (on); KP, DB and custody off (KP / DB in `absent_env`, `TORUS_SHARD_CUSTODY=0` pinned in node env).
+
+| arm | env |
+|---|---|
+| PCF (reference) | `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1` |
+| PCFPE | PCF + `TORUS_PARALLEL_ENGINE=4` |
+
+Smoke (PCFPE, 60 s) and warm-up w1 (PCF, 300 s), then r1 PCF, PCFPE; r2 PCFPE, PCF; r3 PCF, PCFPE; 600 s cells;
+02:43-04:15. Fresh data dirs every cell (`CLEAN=1`), free disk 118-124 GB.
+
+Validity: smoke + 7 / 7 cells rc 0, ACCEPT AGREE PASS, md5 `bf720f9f` on 3 nodes, 0 panic / fail-stop lines (re-checked
+from raw files); the standard-load `cell=` check passed on every cell; 120 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, 0 HARD
+FINDING, no reruns. Took effect on every node of every cell: each arm's env on all 3 node environs; F = `epoch fast path
+ON` once per node and every boundary block (height a multiple of 100) pipelined (82-85 per node per PCF cell, 94-96
+per PCFPE cell, 0 not pipelined; the count follows the block rate: campaign A's F arm had 38); PE =
+`torus_exec_thread_spawns_margin_prepare` 11,939-12,428 per node in PCFPE cells, 0 in PCF cells (campaign A: ~7.8k in
+PE cells, 0 in every other arm; M logs no PE or PC line, PC is checked by env only, as in 82); no
+`TORUS_CKPT_DEFER_BOOKS` line; custody seconds < 0.004 s per node.
+
+### 83.2 Arm means (n = 3 each; `q4w.txt`)
+
+| arm | matched/s (diff, %) | native blk/s | fills / native blk | block p50 / p99 ms | CPU-s / 1M | exec block_ms | hotstuff-algo ms / blk | timeouts / no_proposal (sum of 3) |
+|---|---|---|---|---|---|---|---|---|
+| PCF | 248,329 | 11.806 | 20,191 | 15 / 883 | 24.87 | 80.0 | 20.8 | 3 / 0 |
+| PCFPE | 244,900 (-3,429, -1.38%) | 13.655 | 17,330 | 14 / 821 | 25.48 | 66.5 | 18.5 | 0 / 0 |
+
+Replicate CV of matched/s: PCF 0.58% (r1 249,914 first after the warm-up, r2 247,133, r3 247,940), PCFPE 0.27%.
+
+### 83.3 Paired PCFPE / PCF (geomean of per-round ratios, 95% CI, 2 df), with section 82's PE alone
+
+| metric | r1 / r2 / r3 | PCFPE / PCF | PE / base (82.3) |
+|---|---|---|---|
+| matched/s | 0.9819 / 0.9879 / 0.9888 | 0.9862 [0.9768, 0.9957] | 1.0103 [1.0025, 1.0182] |
+| native blk/s | 1.1877 / 1.1263 / 1.1580 | 1.1571 [1.0832, 1.2360] | 1.0917 [1.0506, 1.1343] |
+| exec block_ms | 0.8155 / 0.8515 / 0.8299 | 0.8322 [0.7884, 0.8784] | 0.9191 [0.8817, 0.9581] |
+| block p50 | 0.8875 / 0.9389 / 0.9755 | 0.9332 [0.8293, 1.0502] | (163 vs 192 ms, mean) |
+| block p99 | 0.9349 / 0.9346 / 0.9203 | 0.9299 [0.9094, 0.9509] | 1.0048 [0.8643, 1.1682] |
+| CPU-s / 1M fills | 1.0262 / 1.0235 / 1.0230 | 1.0243 [1.0201, 1.0285] | 1.0198 [1.0176, 1.0220] |
+| fills / native blk | 0.8341 / 0.8856 / 0.8574 | 0.8588 [0.7971, 0.9252] | |
+| exec ms per 1k fills | 0.9773 / 0.9621 / 0.9682 | 0.9692 [0.9503, 0.9884] | |
+| hotstuff-algo ms / blk | 0.8643 / 0.9105 / 0.8947 | 0.8896 [0.8330, 0.9501] | |
+
+Call: matched/s loss (CI below 1; the -1.38% is about 2.4x the larger arm replicate CV). The block-speed side stacks:
+PE's blocks/s and exec block_ms gains are larger on PC+F than alone, and the p99 gain is new. PC+F blocks are already
+small (20k fills, 80 ms exec, p50 15 ms vs base's 192 ms in 82); PE makes them smaller still (17k fills), so the exec
+gain per block is mostly block size: per 1k fills PE saves 3%, about what it costs in CPU per fill (+2.4%).
+
+Caveat (cross-campaign, not paired): PCF's 248,329 matched/s is below section 82's PC alone (253,980, -2.2%) and close
+to F alone (246,672), while its native blocks/s (11.8) is far above PC alone (6.5) or F alone (4.0). PC and F interact
+(super-additive on block rate, not on matched/s). Different runs (a day apart, same binary, tools and host), and no
+PC-only arm here (owner s128), so this campaign cannot say whether F on top of PC costs matched/s; a paired PC vs PC+F
+pair (n = 3, ~45 min) would.
+
+### 83.4 Next
+
+* PE default: owner's call (block speed and p99 vs -1.4% matched/s and +2.4% CPU per fill). By the matched/s rule it
+  stays off.
+* Optional: PC vs PC+F paired (83.3 caveat) before F goes on by default.
+* Data: `~/bench-results-matched/ozarchy-q4w-300m-{smoke-s0,w1,r1-*,r2-*,r3-*}` (each with `q4w-disk.txt`), campaign
+  files `ozarchy-q4w-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`), tools `ozarchy-q4w-tools/` (spec, checks,
+  driver, `FROZEN.txt`), analysis `ozarchy-q4w-run/analyst/` (`q4w.txt`, `q4w-analyse.py`, copied from campaign A's).
+
+### 83.5 Cells (`q4w.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | flag | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | no_proposal | hotstuff-algo ms/blk | custody ms/obs | PE spawns/node | panic lines | fail lines |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 251,364.6 | 11.805 | 19,343 | 75.0 | 15 / 859 | 24.18 | 1.0 | 0 | 20.7 | 0.000 | 0 | 0 | 0 |
+| r1 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 249,913.9 | 11.315 | 21,162 | 83.3 | 16 / 893 | 24.85 | 1.0 | 0 | 21.7 | 0.001 | 0 | 0 | 0 |
+| r1 | PCFPE | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,378.5 | 13.439 | 17,650 | 67.9 | 14 / 835 | 25.50 | 0.0 | 0 | 18.8 | 0.001 | 11,983 | 0 | 0 |
+| r2 | PCFPE | 0/0 | ACCEPT/AGREE/PASS | True | ok | 244,152.2 | 13.686 | 17,238 | 66.2 | 14 / 819 | 25.48 | 0.0 | 0 | 18.3 | 0.000 | 11,939 | 0 | 0 |
+| r2 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 247,132.9 | 12.151 | 19,465 | 77.7 | 15 / 877 | 24.90 | 0.0 | 0 | 20.1 | 0.000 | 0 | 0 | 0 |
+| r3 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 247,940.3 | 11.952 | 19,947 | 78.9 | 14 / 879 | 24.87 | 2.0 | 0 | 20.5 | 0.000 | 0 | 0 | 0 |
+| r3 | PCFPE | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,169.7 | 13.841 | 17,103 | 65.5 | 14 / 809 | 25.45 | 0.0 | 0 | 18.3 | 0.000 | 12,428 | 0 | 0 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

@@ -105,6 +105,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per 1M. matched/s keeps the win rule; PE's default is the owner's call on block speed vs CPU, so its secondary
    metrics matter as much as matched/s. KP and DB do not run (section 82: no gain on any metric; DB is parked for the
    book-depth scaling check).
+   **Done s68 (ozarchy-q4w, 7 / 7 valid, section 83): PE does not stack on matched/s: PCFPE / PCF 0.9862 [0.9768,
+   0.9957], a loss. Its block-speed gain stacks and grows: native blocks/s +15.7% [1.08, 1.24] (alone +9.2%), exec
+   block_ms -16.8% [0.79, 0.88] (alone -8.1%), block p99 -7.0% [0.91, 0.95]; p50 -6.7% within noise; CPU per fill
+   +2.4% [1.020, 1.029]. Blocks are 14% smaller (exec per 1k fills only -3.1%). no_proposal 0 in every cell. PE default:
+   owner's call (off by the matched/s rule). Caveat: PC+F's 248k matched/s is below 82's PC alone (254k, cross-campaign)
+   at 11.8 vs 6.5 native blocks/s; a paired PC vs PC+F pair would show whether F costs matched/s on top of PC.**
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10). **Not triggered (section 82: C -21.6%); skip.**
 7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
    on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
