@@ -4888,11 +4888,18 @@ const MAX_PARALLEL_CANCEL_ALL_WORKERS: usize = 64;
 /// tens of µs; a small run is not worth it). Byte-identical either way.
 const DEFAULT_PARALLEL_CANCEL_ALL_MIN_VISITS: usize = 64;
 
-/// `TORUS_PARALLEL_CANCEL_ALL=N` (default OFF): a batched cancel-all run's
-/// per-market book work (stops, `cancel_all_many`, the cancelled orders'
-/// margin) runs as up to `N` jobs on the exec pool, one job group per
-/// market. Unset / `0` / `1` / garbage → 1, the serial loop exactly as
-/// before; N>=2 → N (capped at [`MAX_PARALLEL_CANCEL_ALL_WORKERS`]).
+/// Default job cap of the parallel cancel-all book pass when
+/// `TORUS_PARALLEL_CANCEL_ALL` is unset (owner s128; the benched value,
+/// sections 82-84). Tune per validator core count.
+const DEFAULT_PARALLEL_CANCEL_ALL_WORKERS: usize = 8;
+
+/// `TORUS_PARALLEL_CANCEL_ALL=N` (default ON, 8 workers since s128): a
+/// batched cancel-all run's per-market book work (stops, `cancel_all_many`,
+/// the cancelled orders' margin) runs as up to `N` jobs on the exec pool,
+/// one job group per market. Unset / empty / whitespace →
+/// [`DEFAULT_PARALLEL_CANCEL_ALL_WORKERS`]; `0` / `1` → 1, the serial loop
+/// (the way to turn it off); garbage → 1 as well, so a typo never turns the
+/// pool on; N>=2 → N (capped at [`MAX_PARALLEL_CANCEL_ALL_WORKERS`]).
 /// Node-local: results, state and roots are byte-identical for any value.
 /// Read once per process; tests override the ctx field
 /// (`cancel_all_workers`) directly.
@@ -4905,12 +4912,12 @@ fn parallel_cancel_all_workers_env() -> usize {
 
 /// Pure parse for [`parallel_cancel_all_workers_env`].
 fn parse_parallel_cancel_all_workers(v: Option<String>) -> usize {
-    match v
-        .as_deref()
-        .map(str::trim)
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(n) if n >= 2 => n.min(MAX_PARALLEL_CANCEL_ALL_WORKERS),
+    let raw = match v.as_deref().map(str::trim) {
+        None | Some("") => return DEFAULT_PARALLEL_CANCEL_ALL_WORKERS,
+        Some(raw) => raw,
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if n >= 2 => n.min(MAX_PARALLEL_CANCEL_ALL_WORKERS),
         _ => 1,
     }
 }
@@ -4941,14 +4948,30 @@ fn parse_parallel_cancel_all_min_visits(v: Option<String>) -> usize {
 mod parallel_cancel_all_toggle_tests {
     use super::{
         parse_parallel_cancel_all_min_visits, parse_parallel_cancel_all_workers,
-        DEFAULT_PARALLEL_CANCEL_ALL_MIN_VISITS, MAX_PARALLEL_CANCEL_ALL_WORKERS,
+        DEFAULT_PARALLEL_CANCEL_ALL_MIN_VISITS, DEFAULT_PARALLEL_CANCEL_ALL_WORKERS,
+        MAX_PARALLEL_CANCEL_ALL_WORKERS,
     };
 
-    /// Default OFF: unset, 0, 1 and garbage all give the serial loop.
+    /// Default ON (owner s128, bench sections 82-84): unset, empty or
+    /// whitespace-only give the default 8 workers.
     #[test]
-    fn default_and_low_values_are_serial() {
-        assert_eq!(parse_parallel_cancel_all_workers(None), 1);
-        for v in ["0", "1", " 1 ", "", "on", "true", "-3", "2.5", "eight"] {
+    fn unset_or_empty_is_the_default_eight_workers() {
+        assert_eq!(DEFAULT_PARALLEL_CANCEL_ALL_WORKERS, 8);
+        assert_eq!(parse_parallel_cancel_all_workers(None), 8);
+        for v in ["", " ", "\t"] {
+            assert_eq!(
+                parse_parallel_cancel_all_workers(Some(v.to_string())),
+                8,
+                "{v:?}"
+            );
+        }
+    }
+
+    /// Explicit `0` / `1` keep the serial loop; garbage is serial too (the
+    /// safe reading: a typo never turns on the pool).
+    #[test]
+    fn explicit_low_values_and_garbage_are_serial() {
+        for v in ["0", " 0 ", "1", " 1 ", "on", "true", "-3", "2.5", "eight"] {
             assert_eq!(
                 parse_parallel_cancel_all_workers(Some(v.to_string())),
                 1,

@@ -55,7 +55,7 @@ pub fn parse_exec_pipeline_toggle(v: Option<String>) -> bool {
 }
 
 /// s124 epoch-boundary fast path (`TORUS_EPOCH_FAST_PATH`, node-local, default
-/// off, read once at startup by `TorusApp::try_new`): an
+/// ON since s128, read once at startup by `TorusApp::try_new`): an
 /// epoch-boundary block with no EVM tx and no buffered slash takes the
 /// pipelined path instead of the barrier (forced checkpoint drain + W drain)
 /// and the serial flush; with a checkpoint interval it checkpoints at its own
@@ -65,15 +65,17 @@ pub fn epoch_fast_path_enabled() -> bool {
     parse_epoch_fast_path(std::env::var("TORUS_EPOCH_FAST_PATH").ok())
 }
 
-/// Pure parse of `TORUS_EPOCH_FAST_PATH`: `1` or `true` = on; unset, empty,
-/// `0` or `false` = off; anything else = off with a warning.
+/// Pure parse of `TORUS_EPOCH_FAST_PATH` (default on since s128, bench
+/// section 84): unset, empty, `1` or `true` = on; `0` or `false` = off;
+/// anything else = OFF with a warning, so a typo in an explicit value never
+/// silently enables a consensus-timing change.
 pub fn parse_epoch_fast_path(raw: Option<String>) -> bool {
     let Some(raw) = raw else {
-        return false;
+        return true;
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "false" => false,
-        "1" | "true" => true,
+        "" | "1" | "true" => true,
+        "0" | "false" => false,
         other => {
             tracing::warn!(
                 value = other,
@@ -82,6 +84,13 @@ pub fn parse_epoch_fast_path(raw: Option<String>) -> bool {
             false
         }
     }
+}
+
+/// Whether `TORUS_EPOCH_FAST_PATH` is set at all (for the startup log: the
+/// default-on fast path without the exec pipeline is an info line, an
+/// explicit request a warning).
+pub fn epoch_fast_path_explicit() -> bool {
+    std::env::var_os("TORUS_EPOCH_FAST_PATH").is_some()
 }
 
 /// Item 6 Phase 3 step 6: the compiled default interval on validators (owner
@@ -1120,19 +1129,22 @@ mod tests {
         assert!(!parse_exec_pipeline_toggle(Some(" 0 ".to_string())));
     }
 
-    /// s124: `TORUS_EPOCH_FAST_PATH` is opt-in. `1` / `true` (any case,
-    /// trimmed) turn it on; unset, empty, `0`, `false` and anything else
-    /// (warned) leave it off.
+    /// s128: `TORUS_EPOCH_FAST_PATH` is on by default (owner s128, bench
+    /// section 84). Unset, empty, `1` / `true` (any case, trimmed) = on;
+    /// `0` / `false` = off; anything else = off with a warning, so a typo
+    /// never silently enables a consensus-timing change.
     #[test]
-    fn epoch_fast_path_parse_default_off() {
-        assert!(!parse_epoch_fast_path(None));
-        for v in [
-            "", " ", "0", " 0 ", "false", "FALSE", "off", "on", "yes", "2",
-        ] {
+    fn epoch_fast_path_parse_default_on() {
+        assert!(parse_epoch_fast_path(None));
+        for v in ["", " ", "1", " 1 ", "true", "TRUE", "True"] {
+            assert!(parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
+        }
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
         }
-        for v in ["1", " 1 ", "true", "TRUE", "True"] {
-            assert!(parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
+        // Garbage: off (warned), never on.
+        for v in ["off", "on", "yes", "2", "ture", "-1"] {
+            assert!(!parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
         }
     }
 

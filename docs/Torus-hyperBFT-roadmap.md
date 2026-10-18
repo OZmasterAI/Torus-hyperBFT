@@ -352,6 +352,32 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   re-sends per node per 300 s). Options: (a) code default 250 ms (one constant + test; 18c recommendation), (b) set
   250 ms in the testnet/validator configs only, (c) keep 3 s and rely on the rate-limiter fix (per-validator header
   budget, archy's follow-up), which makes the re-send a backup. Owner s126: decide pre-testnet.
+  **Decided s128: (a), code default 250 ms**, shipped in one defaults change with PC and F on after the PC vs PC+F run
+  (bench queue step 5b). **Done on branch `feat/defaults-pc-f-resend`** (s128): code default 250 ms
+  (`parse_header_resend_ms`), `=0` still off, any other number still overrides; the same branch makes PC
+  (`TORUS_PARALLEL_CANCEL_ALL`, 8 workers) and F (`TORUS_EPOCH_FAST_PATH`) default on.
+- **Shard custody default.** **Decided s128: OFF by default until T3.1** (section 82: custody on costs 21.6%
+  matched/s, 140 ms per follower validate on hotstuff-algo); the RH4 shard-count fix waits for T3.1. Code default
+  flipped on main `d6c4d0d2` (only `TORUS_SHARD_CUSTODY=1` enables).
+- **PE (`TORUS_PARALLEL_ENGINE`), testnet activation candidate.** Off by default (owner s128, section 83: on top of
+  PC+F it costs 1.4% matched/s and 2.4% CPU per fill, for +15.7% native blocks/s, -16.8% exec ms per block and -7%
+  block p99). Node-local and byte-identical, so it can be switched on per validator with a restart. Before switching
+  it on in a live network: a WAN A/B (round trips cap the block rate, so the one-host gain may shrink) and a
+  mixed-flag agree check (2 nodes on, 1 off); size the worker count to the validator's cores (bench: 4 workers).
+- **Push-manifest threshold on WAN.** Benches pin 8 MB (`devnet/wsl/env.sh`), devnet compose 6 MB, code default 512 KB.
+  Bench queue step 7b measures the CPU side on one host; the WAN threshold needs a WAN measurement.
+- **Parallel-settle merge drops a position update for "aliased" opaque rows (s128, found while fixing Phase 5 step
+  2's Codex finding).** An opaque position row whose payload market differs from its storage key (e.g. key (T, 1)
+  holding a market-2 position; `users.rs` keeps such rows opaque on purpose) can appear in two markets' position
+  caches. On the parallel settle (blocks above 1,024 fills) the reference merge lets a later plan's untouched loaded
+  row overwrite an earlier plan's changed row, so the update is lost and a stale row is rewritten every block; the
+  serial settle keeps the update. Every node takes the same path (it depends only on the fill count), so nodes agree;
+  the result is wrong for that trader and depends on block size. Benches never create such rows (no normal writer
+  does). Phase 5 step 2 copies today's behaviour byte for byte on purpose.
+  **Before fixing it, answer one question: can these odd rows exist at all?** (genesis import, migrations, older
+  code, any writer). If nothing can create them, reject or normalize them on load so the case cannot happen;
+  otherwise fix the merge so the parallel settle equals the serial one. Either way it changes consensus results for
+  such rows, so it lands **after Phase 5 step 2 merges** (same code) and **before the testnet genesis**.
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.

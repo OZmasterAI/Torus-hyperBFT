@@ -474,7 +474,8 @@ pub struct Metrics {
     /// `batch_verify_native_actions` path) inside `validate_block`.
     pub validate_block_attest_seconds: Histogram,
     /// Consensus thread: `custody_native_shards_best_effort` inside
-    /// `validate_block` (~0 when `TORUS_SHARD_CUSTODY=0`).
+    /// `validate_block` (~0 unless `TORUS_SHARD_CUSTODY=1`; custody is off by
+    /// default until T3.1).
     pub validate_block_custody_seconds: Histogram,
     /// s76 item 6: split of `validate_block_da_reconstruct_seconds` on the
     /// compact path. Ingress DA-mirror flush (`put_batch` of buffered bodies),

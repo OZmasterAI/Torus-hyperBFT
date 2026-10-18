@@ -55,13 +55,14 @@ use std::ops::Bound;
 
 use alloy_primitives::Address;
 use borsh::{BorshDeserialize, BorshSerialize};
+use torus_core::error::CoreError;
 use torus_core::position::{cum_volume_key, position_key, NativeBalance, Position, TypedRows, POSITION_V2_LEN};
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::error::StateError;
 use torus_state::resident_rows::{ResidentRow, ResidentRowIter, ResidentSource};
 #[cfg(test)]
 use torus_state::ResidentRows;
-use torus_state::{ResidentDelta, StateBackend};
+use torus_state::{FrozenPending, ResidentDelta, StateBackend};
 use torus_types::{FixedPoint, MarketId};
 
 use super::SumsResult;
@@ -186,6 +187,9 @@ pub(crate) struct Users {
     /// (position, balance, volume), and declined (an opaque trader).
     #[cfg(test)]
     typed: ([std::sync::atomic::AtomicUsize; 3], std::sync::atomic::AtomicUsize),
+    /// Phase 5 step 1: the keys [`UsersMut`] changed since the last drain.
+    #[cfg_attr(not(test), allow(dead_code))]
+    dirty: Dirty,
 }
 
 type Holders = HashMap<MarketId, HashSet<Address>>;
@@ -820,6 +824,332 @@ impl Users {
         let rows = |cf| self.encode_rows(cf);
         let cold = Self::build_maps(&rows(CF_NATIVE_POSITIONS), &rows(CF_NATIVE_BALANCES));
         self.same_as(&cold) && (self.rows, self.bytes) == self.recount() && (cold.rows, cold.bytes) == (self.rows, self.bytes)
+    }
+}
+
+/// Item 6 Phase 5 step 1 (`docs/plans/item6-phase5-impl.md` Task 1.1): the
+/// keys of both CFs changed since the last drain, by key shape. A key is in
+/// at most one set (the shapes are disjoint); its row is read from the
+/// record set at the drain, so a key written many times is emitted once.
+#[derive(Debug, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct Dirty {
+    /// 28-byte positions keys `t ‖ m`.
+    positions: HashSet<(Address, MarketId)>,
+    /// 20-byte balance keys.
+    balances: HashSet<Address>,
+    /// 24-byte `cvlm ‖ t` keys.
+    volumes: HashSet<Address>,
+    /// Every other key, per slot ([`POSITIONS`], [`BALANCES`]).
+    raw: [BTreeSet<Vec<u8>>; 2],
+}
+
+// Phase 5 step 1 (tests): rows the drains serialized from a record / as raw
+// bytes (an opaque trader's, a row under no trader).
+#[cfg(test)]
+thread_local! {
+    static DRAIN_SOURCES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Dirty {
+    /// Mark `key` of `slot`.
+    fn mark(&mut self, slot: usize, key: &[u8]) {
+        if slot == POSITIONS {
+            if key.len() == KEY {
+                self.positions
+                    .insert((Address::from_slice(&key[..TRADER]), market_of(key)));
+            } else {
+                self.raw[POSITIONS].insert(key.to_vec());
+            }
+            return;
+        }
+        match balance_owner(key) {
+            Some((t, BalanceRow::Balance)) => {
+                self.balances.insert(t);
+            }
+            Some((t, BalanceRow::Volume)) => {
+                self.volumes.insert(t);
+            }
+            None => {
+                self.raw[BALANCES].insert(key.to_vec());
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.positions.len()
+            + self.balances.len()
+            + self.volumes.len()
+            + self.raw.iter().map(BTreeSet::len).sum::<usize>()
+    }
+}
+
+/// One drained row: a write (`Some`) or a tombstone (`None`).
+pub(crate) type DirtyRow = (Vec<u8>, Option<Vec<u8>>);
+
+/// Phase 5 step 1: a drain's rows per CF, each CF key-sorted, each key once.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DirtyRows {
+    pub(crate) positions: Vec<DirtyRow>,
+    pub(crate) balances: Vec<DirtyRow>,
+}
+
+/// Phase 5 step 1: the typed write API of the record set. Every call
+/// changes the rows in place (records, or the raw rows of an opaque trader)
+/// and marks the key dirty; [`Users::drain_dirty_into`] serializes each
+/// dirty key's row once at freeze. Shadow only in step 1 (tests are its only
+/// callers; step 2 moves the hot writers onto it).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct UsersMut<'a> {
+    users: &'a mut Users,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Users {
+    /// Phase 5 step 1: the typed write handle.
+    pub(crate) fn mutate(&mut self) -> UsersMut<'_> {
+        UsersMut { users: self }
+    }
+
+    /// Phase 5 step 1: keys marked dirty since the last drain.
+    pub(crate) fn dirty_keys(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// Phase 5 step 1: every dirty key's row as the record set holds it now
+    /// (a regular trader's encoded from its record, an opaque trader's and a
+    /// row under no trader as bytes; absent: a tombstone), per CF in key
+    /// order; the dirty sets are left empty.
+    pub(crate) fn drain_dirty(&mut self) -> DirtyRows {
+        let Dirty {
+            positions,
+            balances,
+            volumes,
+            raw: [raw_positions, raw_balances],
+        } = std::mem::take(&mut self.dirty);
+        // Hash sets sorted here (plan section 3 "Order": step 1 measured
+        // them against `BTreeSet`s, `ubench_dirty_set_btree_vs_hash_sort`).
+        // The shapes are disjoint, so every key is distinct.
+        let mut pos: Vec<Vec<u8>> = positions
+            .into_iter()
+            .map(|(t, m)| position_key(&t, m).to_vec())
+            .chain(raw_positions)
+            .collect();
+        pos.sort_unstable();
+        let mut bal: Vec<Vec<u8>> = balances
+            .into_iter()
+            .map(|t| t.to_vec())
+            .chain(volumes.into_iter().map(|t| cum_volume_key(&t).to_vec()))
+            .chain(raw_balances)
+            .collect();
+        bal.sort_unstable();
+        DirtyRows {
+            positions: self.rows_at(POSITIONS, pos),
+            balances: self.rows_at(BALANCES, bal),
+        }
+    }
+
+    /// The rows of `keys` in `slot` as held now (absent: a tombstone).
+    fn rows_at(&self, slot: usize, keys: Vec<Vec<u8>>) -> Vec<DirtyRow> {
+        keys.into_iter()
+            .map(|k| {
+                let v = self.row(slot, &k).map(|r| {
+                    #[cfg(test)]
+                    DRAIN_SOURCES.with(|c| {
+                        let (rec, raw) = c.get();
+                        c.set(if matches!(r, Row::Raw(_)) {
+                            (rec, raw + 1)
+                        } else {
+                            (rec + 1, raw)
+                        });
+                    });
+                    r.value().into_owned()
+                });
+                (k, v)
+            })
+            .collect()
+    }
+
+    /// Phase 5 step 1 (tests): rows this thread's drains serialized from a
+    /// record and as raw bytes, so far.
+    #[cfg(test)]
+    pub(crate) fn drain_sources() -> (usize, usize) {
+        DRAIN_SOURCES.with(std::cell::Cell::get)
+    }
+
+    /// Phase 5 step 1: [`Self::drain_dirty`] into `out` (the block's frozen
+    /// set: its rows of the two CFs replaced key by key).
+    pub(crate) fn drain_dirty_into(&mut self, out: &mut FrozenPending) {
+        let rows = self.drain_dirty();
+        out.put_rows(CF_NATIVE_POSITIONS, rows.positions);
+        out.put_rows(CF_NATIVE_BALANCES, rows.balances);
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl UsersMut<'_> {
+    /// `p`'s row (key `p.trader ‖ p.market_id`) = `p`.
+    pub(crate) fn set_position(&mut self, p: Position) {
+        let (t, m) = (p.trader, p.market_id);
+        let users = &mut *self.users;
+        users.dirty.positions.insert((t, m));
+        if users.opaque_of(&t).is_some() {
+            let v = encode(&p, POSITION_V2_LEN);
+            users.reload(
+                t,
+                &[(&position_key(&t, m), Some(&v))],
+                BalanceDelta::default(),
+            );
+            return;
+        }
+        let old = users.map.get(&t).map_or((0, 0), UserState::footprint);
+        let u = users.map.entry(t).or_default();
+        match u.positions.binary_search_by_key(&m, |q| q.market_id) {
+            Ok(i) => u.positions[i] = p,
+            Err(i) => {
+                u.positions.insert(i, p);
+                Users::set_holder(&mut users.holders, t, m, true);
+                users.traders.insert(t);
+            }
+        }
+        let new = u.footprint();
+        users.track(old, new);
+    }
+
+    /// No row at `t ‖ m` (a tombstone even if there was none).
+    pub(crate) fn remove_position(&mut self, t: &Address, m: MarketId) {
+        let users = &mut *self.users;
+        users.dirty.positions.insert((*t, m));
+        if users.opaque_of(t).is_some() {
+            users.reload(*t, &[(&position_key(t, m), None)], BalanceDelta::default());
+            return;
+        }
+        let Some(u) = users.map.get_mut(t) else {
+            return;
+        };
+        let Ok(i) = u.positions.binary_search_by_key(&m, |q| q.market_id) else {
+            return;
+        };
+        let old = u.footprint();
+        u.positions.remove(i);
+        Users::set_holder(&mut users.holders, *t, m, false);
+        if u.positions.is_empty() {
+            users.traders.remove(t);
+        }
+        let new = u.footprint();
+        if u.is_empty() {
+            users.map.remove(t);
+        }
+        users.track(old, new);
+    }
+
+    /// `t`'s balance row = `b`.
+    pub(crate) fn set_balance(&mut self, t: &Address, b: NativeBalance) {
+        let users = &mut *self.users;
+        users.dirty.balances.insert(*t);
+        if users.opaque_of(t).is_some() {
+            let v = encode(&b, BALANCE_LEN);
+            users.reload(
+                *t,
+                &[],
+                BalanceDelta {
+                    balance: Some(Some(&v)),
+                    volume: None,
+                },
+            );
+            return;
+        }
+        let old = users.map.get(t).map_or((0, 0), UserState::footprint);
+        let u = users.map.entry(*t).or_default();
+        u.balance = Some(b);
+        let new = u.footprint();
+        users.track(old, new);
+    }
+
+    /// `t`'s `cvlm` row = its volume (zero without a row) + `amount`, as
+    /// `add_cum_volume` reads and writes it (`Err`: an opaque trader's `cvlm`
+    /// row is not 16 bytes, the read's error; nothing changes).
+    pub(crate) fn add_cum_volume(
+        &mut self,
+        t: &Address,
+        amount: FixedPoint,
+    ) -> Result<(), CoreError> {
+        let users = &mut *self.users;
+        if let Some(raw) = users.opaque_of(t) {
+            let cur = match raw.balances.get(cum_volume_key(t).as_slice()) {
+                None => FixedPoint::ZERO,
+                Some(v) => decode_volume(v).ok_or_else(|| {
+                    CoreError::Borsh(format!("cum_volume row has {} bytes, expected 16", v.len()))
+                })?,
+            };
+            let v = (cur + amount).raw().to_be_bytes();
+            users.dirty.volumes.insert(*t);
+            users.reload(
+                *t,
+                &[],
+                BalanceDelta {
+                    balance: None,
+                    volume: Some(Some(&v)),
+                },
+            );
+            return Ok(());
+        }
+        users.dirty.volumes.insert(*t);
+        let old = users.map.get(t).map_or((0, 0), UserState::footprint);
+        let u = users.map.entry(*t).or_default();
+        u.cum_volume = Some(u.cum_volume.unwrap_or(FixedPoint::ZERO) + amount);
+        let new = u.footprint();
+        users.track(old, new);
+        Ok(())
+    }
+
+    /// Decision 3's write-through: any raw write (`Some`) or tombstone
+    /// (`None`) of `key` in `slot` ([`POSITIONS`] / [`BALANCES`]), exactly
+    /// as `apply` follows it from a delta (a regular row of a regular trader
+    /// in place, any other change re-decodes the trader).
+    pub(crate) fn put_row(&mut self, slot: usize, key: &[u8], value: Option<&[u8]>) {
+        debug_assert!(slot == POSITIONS || slot == BALANCES, "source slot {slot}");
+        let users = &mut *self.users;
+        users.dirty.mark(slot, key);
+        let (t, group, b) = if slot == POSITIONS {
+            if key.len() < TRADER {
+                users.put_other(true, key, value);
+                return;
+            }
+            (
+                Address::from_slice(&key[..TRADER]),
+                Some((key, value)),
+                BalanceDelta::default(),
+            )
+        } else {
+            match balance_owner(key) {
+                None => {
+                    users.put_other(false, key, value);
+                    return;
+                }
+                Some((t, BalanceRow::Balance)) => (
+                    t,
+                    None,
+                    BalanceDelta {
+                        balance: Some(value),
+                        volume: None,
+                    },
+                ),
+                Some((t, BalanceRow::Volume)) => (
+                    t,
+                    None,
+                    BalanceDelta {
+                        balance: None,
+                        volume: Some(value),
+                    },
+                ),
+            }
+        };
+        let group = group.as_slice();
+        if !users.follow(t, group, b, &mut Vec::new(), &mut Vec::new(), None) {
+            users.reload(t, group, b);
+        }
     }
 }
 

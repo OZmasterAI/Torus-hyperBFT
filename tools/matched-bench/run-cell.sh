@@ -464,11 +464,11 @@ RECORD_ENV=(
 #   TORUS_NATIVE_BLOCK_BYTES_CAP       6 MB default; N*BATCH*~70 B touches it at
 #       N=200 => max(6 MB, N*BATCH*150 B) CAPPED at 12 MB — MAX_BLOCK_DATA_MSG_SIZE
 #       (block-data sync codec) is 16 MB, a body above it could never be synced.
-# NOT touched: TORUS_HASH_ONLY_PUSH_THRESHOLD — r4 raised the direct-push body
-# floor 4 MB -> 8 MB (TORUS_DIRECT_PUSH_BODY_BYTES) and env.sh sets the
-# threshold AT it (8000000), so cap-200/300 body sets (~5.6-8 MB at bs400) stay
-# on the direct push path; only larger sets go out as a HASH manifest and are
-# PULLED (the S387-hardened path). The dissemination counters below (manifest
+# NOT touched: TORUS_HASH_ONLY_PUSH_THRESHOLD — env.sh sets it to the 512 KB
+# code default since s128 (section 86: +4.3% matched/s, -5.9% CPU per fill vs
+# the old 8 MB pin at the direct-push floor), so most pre-proposal body sets go
+# out as a HASH manifest and are PULLED (the S387-hardened path); sets up to
+# 512 KB are still pushed whole. The dissemination counters below (manifest
 # pushes / body-fetch exhaustion / sync fallbacks) record which path a cell took;
 # EXTRA_ENV='TORUS_DIRECT_PUSH_BODY_BYTES=4194304' reproduces the pre-r4 clamp.
 block_cap_bundle() { # $1=N -> prints K=V lines

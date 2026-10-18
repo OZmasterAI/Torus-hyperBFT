@@ -42,7 +42,10 @@ PEER_TO_V1=/ip4/127.0.0.1/udp/$P2P1/quic-v1/p2p/$PID1
 # threshold is set AT the floor: every pre-proposal body set the codec can
 # carry (cap 200 ~5.6 MB, cap 300 ~7-8 MB at bs400) is pushed directly; only
 # larger sets fall back to the HASH manifest + chunked pull.
-export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-8000000}"
+# s128 (section 86, bench queue 7b): moved to the 512 KB code default
+# (HASH_ONLY_PUSH_THRESHOLD, torus-network bridge.rs): +4.3% matched/s, -5.9% CPU
+# per fill vs the 8 MB pin on one host; the WAN threshold is still open.
+export TORUS_HASH_ONLY_PUSH_THRESHOLD="${TORUS_HASH_ONLY_PUSH_THRESHOLD:-524288}"
 # r4: the compiled default IS the r3 cap-200 bundle (NATIVE_TOTAL_BLOCK_CAP 200,
 # ORDERS_PER_BLOCK 100k, BLOCK_BYTES 12 MB, trust-cache 32k) — leave the cap
 # UNSET here so the node runs its compiled default; export
@@ -69,12 +72,13 @@ export TORUS_ADDR_RATE_LIMIT="${TORUS_ADDR_RATE_LIMIT:-0}"
 export TORUS_RPC_IP_WEIGHT_PER_MIN="${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}"
 # s58 (exp/archy-s58-bundle-dmt): the stuck-leader header re-send (s75 fix D,
 # TORUS_HEADER_RESEND_MS) at 250 ms on the devnet and every matched-bench cell;
-# the node's compiled default stays 3000 ms (hotstuff implementation.rs) and
-# the testnet configs do not set it. A caller or a bench arm overrides it
-# (EXTRA_ENV / arm env 'TORUS_HEADER_RESEND_MS=3000'; '=0' = off). To run the
-# node default with the name ABSENT (an arm listing it in absent_env), set the
-# harness knob HEADER_RESEND_UNSET=1 (campaign harness_env, or the caller's
-# env): nothing is exported then.
+# since s128 the node's compiled default is 250 ms too (hotstuff
+# implementation.rs, was 3000), so this export only pins it. A caller or a
+# bench arm overrides it (EXTRA_ENV / arm env 'TORUS_HEADER_RESEND_MS=3000'
+# for the old 3 s; '=0' = off). To run with the name ABSENT (an arm listing it
+# in absent_env), set the harness knob HEADER_RESEND_UNSET=1 (campaign
+# harness_env, or the caller's env): nothing is exported then, and the node
+# uses its compiled default (250 ms, no longer 3 s).
 if [ "${HEADER_RESEND_UNSET:-0}" = 1 ]; then
     unset TORUS_HEADER_RESEND_MS
 else

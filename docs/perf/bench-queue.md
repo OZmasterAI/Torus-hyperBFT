@@ -31,6 +31,14 @@ main at or after 50d2316c.
 - `TORUS_HEADER_RESEND_MS=${...:-250}` in `devnet/wsl/env.sh` and `devnet/docker-compose.yml` gives every cell 250 ms
   (code default 3 s; revisited pre-testnet, roadmap). Comparisons inside a campaign stay valid; comparisons with
   results from before the resend change do not (fewer lost-proposal timeouts move block rate and matched/s).
+- **Defaults change (on main since `3429855d`, s128; binaries built from it or later):** an arm that leaves PC and
+  F unset gets PC (`TORUS_PARALLEL_CANCEL_ALL`, 8 workers) and F (`TORUS_EPOCH_FAST_PATH`) ON. A baseline arm
+  without them must set `TORUS_PARALLEL_CANCEL_ALL=0 TORUS_EPOCH_FAST_PATH=0` (an `absent_env` entry for either name
+  now means ON, not off). Header re-send is 250 ms both from the code default and from `env.sh` /
+  `docker-compose.yml`, so `HEADER_RESEND_UNSET=1` no longer gives 3 s: an arm that wants 3 s sets
+  `TORUS_HEADER_RESEND_MS=3000` (`=0` = off). Compare against results from before the merge only with the
+  pre-merge arms' env spelled out. Binaries built before it (M `e3d11cb9`, Q9's `e1be6c15` / `b2dd21a4`, step Z's
+  `9d770519`) keep the old defaults: their arms set PC + F by env, as in sections 83-87.
 - Block rate from cells shorter than about 5 min is indicative only: under sustained load it falls to exec pace
   (5.9 -> 3.0 blocks/s by minute 5) while matched/s stays flat (section 79). matched/s stays the primary metric.
 - Watch `no_proposal` in every replicate (1 in the s58dmt check cell, 1 in the s58safe soak).
@@ -105,17 +113,115 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per 1M. matched/s keeps the win rule; PE's default is the owner's call on block speed vs CPU, so its secondary
    metrics matter as much as matched/s. KP and DB do not run (section 82: no gain on any metric; DB is parked for the
    book-depth scaling check).
+   **Done s68 (ozarchy-q4w, 7 / 7 valid, section 83): PE does not stack on matched/s: PCFPE / PCF 0.9862 [0.9768,
+   0.9957], a loss. Its block-speed gain stacks and grows: native blocks/s +15.7% [1.08, 1.24] (alone +9.2%), exec
+   block_ms -16.8% [0.79, 0.88] (alone -8.1%), block p99 -7.0% [0.91, 0.95]; p50 -6.7% within noise; CPU per fill
+   +2.4% [1.020, 1.029]. Blocks are 14% smaller (exec per 1k fills only -3.1%). no_proposal 0 in every cell. PE default:
+   owner's call (off by the matched/s rule). Caveat: PC+F's 248k matched/s is below 82's PC alone (254k, cross-campaign)
+   at 11.8 vs 6.5 native blocks/s; a paired PC vs PC+F pair would show whether F costs matched/s on top of PC.**
+   **Owner s128: PE off by default.** It stays a node-local opt-in (`TORUS_PARALLEL_ENGINE=N`, read at startup,
+   byte-identical outputs) and is a candidate for activation on the live testnet, after a WAN A/B (one host has no
+   round trips to cap the block rate) and a mixed-flag agree check (2 nodes on, 1 off). Roadmap, "Pre-testnet decisions".
+5b. **PC vs PC+F, paired** (~1 h 10; owner s128; done s68, before step 7): does F cost matched/s on top of PC (section 83
+   caveat: PC+F 248k at 11.8 native blocks/s vs 82's PC alone 254k at 6.5, cross-campaign)? 2 arms on binary M
+   (`e3d11cb9`, md5 `bf720f9f`), standard load, 300 markets, **600 s cells** (shorter cells overstate blocks/s, section
+   79), warm-up w1 then 3 pairs in A B B A A B order; custody 0; PE, KP, DB off.
+
+   | arm | env |
+   |---|---|
+   | PC (reference) | `TORUS_PARALLEL_CANCEL_ALL=8` |
+   | PC+F | PC + `TORUS_EPOCH_FAST_PATH=1` |
+
+   Report paired ratios (as in 83.3) on matched/s, native blocks/s, fills per native block, exec block_ms, block p50 /
+   p99, CPU-s per 1M, timeouts and `no_proposal` (per 1,000 blocks too). F ships on regardless of a small matched/s
+   cost if its latency gain holds (owner's call on the numbers); this run sizes that trade.
+   **Done s68 (ozarchy-q5b, 7 / 7 valid, section 84): F on top of PC: matched/s PCF / PC 0.9872 [0.9702, 1.0046],
+   -1.3% within noise (all 3 rounds below 1, so ~1% is likely). The latency gain holds and is large: native blocks/s
+   +88.6% [1.71, 2.08] (6.38 -> 12.04), block p50 -73.6% [0.25, 0.28] (57 -> 15 ms), p99 -14.7% [0.78, 0.93]
+   (1,025 -> 874 ms), exec block_ms -46.6% [0.46, 0.61] (147 -> 79 ms); blocks half the size (fills per block -46.5%),
+   exec per 1k fills unchanged (0.998). CPU per fill +2.2% [1.020, 1.025]. Timeouts 8 vs 3 (0.69 vs 0.14 per 1,000
+   native blocks), no_proposal 2 vs 0 (0.17 vs 0). Both arms reproduce 82 (PC 254k at 6.5) and 83 (PC+F 248k at 11.8)
+   within 1%. F's ship-on rule (latency gain holds) is met; owner's call.**
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10). **Not triggered (section 82: C -21.6%); skip.**
-7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
+7. **[SUPERSEDED s128 by Q11, owner: no r2/r3, N stays 11] Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
    on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
+   **Owner s128: every arm sets PC + F by env** (`TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1`, the coming
+   defaults; Q12's own N11 arm is the reference, so section 80's baseline is not needed) **and the EVM arms are
+   E11 / E33 / E66** instead of E11 / E22 / E33: at PC+F's ~11.8 native blocks/s an EVM block every 11 heights comes
+   ~3x as often in wall time as in Q5, so the barrier costs more and the useful N is higher. At 10 tx/s an N = 66
+   block carries ~56 txs (66 / 11.8 s x 10), under the 142-tx cap; if the block rate is lower, check the cap rule.
+   **Stopped s68 after r1 (ozarchy-q12, binary M `e3d11cb9`, section 85; n = 1 screen, no verdict): E66 could not
+   take the load: the EVM mempool rejected 41% (`mempool full`), landed 3,115 < accepted 3,547 (check failed, campaign
+   stopped), one block at the 142-tx cap; E33 lost 13% of its load the same way. Under EVM load native blocks/s fall
+   12.99 (N11) -> 3.33 / 4.37 / 5.68 (E11 / E33 / E66), so N = 66 blocks average ~117 txs nominal. r1 matched/s
+   N11 246,458, E11 225,060 (0.913), E33 242,841 (0.985, at 87% load), E66 247,708 (1.005, at 52% landed, invalid).
+   Point estimate reads S-INTERIM (L(33) 1.5%), unconfirmed. Next: owner / 18c choose how E33 / E66 get the full
+   load (more senders, lower rate, or fix the pool fill), then r2 (+ r3).**
+7b. **Push-manifest threshold: the bench pin vs the code default** (~1 h 20; archy's s124 candidate, owner s128 agreed
+   to the baseline shift). The node's default is 512 KB (`HASH_ONLY_PUSH_THRESHOLD`, `torus-network/src/bridge.rs`);
+   `devnet/wsl/env.sh` pins 8 MB, so every bench so far pushed full bodies before the proposal and never used the
+   hash-manifest + pull path that production defaults to. 2 arms on binary M, setting only: A =
+   `TORUS_HASH_ONLY_PUSH_THRESHOLD=8000000` (env.sh as today) vs B = `524288`; both arms with the flags step 5 picks
+   set by env (PC + F, plus PE if the owner turns it on). Standard load, 300 markets, 600 s, n = 3, alternating order.
+   Report CPU-s per 1M (expected -3.8 to -4.9%), matched/s, native blocks/s, block p50 / p99, timeouts and
+   `no_proposal`, and the push / pull counts (manifest vs body pushes, bodies pulled, pull fallbacks). If B holds
+   matched/s and timeouts within noise, `env.sh` moves to the code default and later benches run it. One host has no
+   WAN latency or bandwidth, so this says nothing about the WAN threshold (pre-testnet, measured on WAN).
+   **Done s68 (ozarchy-q7b, binary M `e3d11cb9`, both arms PC + F, 7 / 7 valid, section 86): B (P512K) / A (P8M)
+   CPU-s per 1M fills 0.9412 [0.9341, 0.9484] (-5.9%, 24.92 -> 23.46) and matched/s 1.0434 [1.0400, 1.0467] (+4.3%,
+   246,971 -> 257,680; all 3 rounds 1.042-1.045); native blocks/s, block p50 / p99, exec block_ms within noise (12.50
+   -> 12.19, 15 -> 15 ms, 856 -> 830 ms); node RSS -10% (CI spans 1). Timeouts 2 vs 5 (0.09 vs 0.23 per 1,000 native
+   blocks), no_proposal 0 vs 0: within noise. B pushes 69% of pre-proposal sets as manifests (full-body volume 10.1 GB
+   -> 0.12 GB per cell), receivers pre-warm ~83k bodies per cell, 0 pull failures / fallback pulls / recovery
+   timeouts. Rule met: `env.sh` moves to the code default (18c); one host, says nothing about the WAN threshold.**
 8. **Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15000 vs 5000 ms** (n = 2 per arm ABBA, ~45 min plus
-   setup; step 0 binary from `perf/q6-ckpt-slicing`, SHA given by 18c after review; Items, Q6). Decides GO / NO-GO /
-   SHIP-Z for building checkpoint slicing (A1).
+   setup; step 0 binary from `perf/q6-ckpt-slicing` **`9d770519`** (s128: Codex torus re-review of step 0 had one P2,
+   a failed scrape corrupting `commit_db_split`, fixed in 84ea54cf + 9d770519, Codex quick review clean; Items, Q6).
+   Decides GO / NO-GO / SHIP-Z for building checkpoint slicing (A1).
+   **Done s68 (ozarchy-stepz, binary Z `9d770519` node md5 `0d234898`, both arms PC + F + push threshold 524288,
+   n = 2 ABBA, 5 / 5 valid, section 87): no GO / NO-GO; the rule's "anything else" branch. W_db fell only 26.5% (407
+   -> 299 ms per checkpoint, rounds 0.685 / 0.789; batch 108 -> 85 MB), short of the 40% bar, because attest heights
+   (h % 100) already checkpoint Z15 every ~100 blocks (~5.8 s at ~17 blocks/s; the 15 s interval never fires). Within
+   that step, G fell in proportion (497 -> 375 ms, -25%) and the in-window manifest wall fell 22% (7.56 -> 5.88 ms per
+   call); X at 1 Hz (in - out) fell 11%. The step 0 split: the manifest put waits in the write queue behind the batch
+   (pre/post + residual; mutex and cond-wait 0), i.e. "A1 aimed right". Not SHIP-Z: G ~375 ms, and Z5 costs native
+   blocks/s 0.777 [0.555, 1.089] (16.97 -> 13.18), block p50 +15% [1.080, 1.236], p99 556 -> 780 ms, state-DB writes
+   +10%; matched/s 0.991 [0.905, 1.085], CPU per fill flat. Not extended to n = 4 (more rounds of the same arms cannot
+   reach -40%). Next, decided with 18c: a stronger zero-code arm (`TORUS_CHECKPOINT_MAX_BYTES` ~40-50 MB or 2,000 ms),
+   or build A1 on this evidence.**
+   **Q12 r1 (section 85) ran binary M, before item 7 step 2's EVM routing fixes (16f201c4 committed txs leave every
+   pool, 0edfb154 routing per lane with re-send, 2cdc3ac7 drains skip parent-block txs): at N = 33 / 66 one validator
+   proposed every EVM block (multiples of 3 with 3 validators), txs reached it by a single forward, and gapped nonces
+   were drained and dropped, so the pool filled. Q11 (option 0's A/B on current main) measures today's EVM cost.
+   Item 7 to check before genesis: with N = 11 and 11 validators, one validator may propose every EVM block.**
+8b. **Step Z2: checkpoint size cap** (owner s128; ~45 min plus setup; zero code). Same binary as step Z (`9d770519`,
+   md5 `0d234898`), same shape, flags and push threshold (PC + F by env, 512 KB), ABBA n = 2: Z15 (as step Z) vs ZC =
+   Z15 + `TORUS_CHECKPOINT_MAX_BYTES=50000000` (step Z batches: mean 108 MB, max 208 MB, so ZC more than halves
+   them). Same metrics and the same GO / NO-GO / SHIP-ZC rule as step Z (W_db must fall >= 40%; then GO needs X and G
+   to fall >= half as much in relative terms, i.e. G 497 -> <= ~400 ms). Report also checkpoints per 100 blocks, the
+   share triggered by the cap, native blocks/s, block p50 / p99, state-DB writes and Dirty / Writeback. A GO means 18c
+   builds A1; a NO-GO drops A1 (the p99 windows are then not from the batch size).
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
-   **NOT READY: waits on 18c's Q9 SHA.** Owner s128: custody OFF by default until T3.1, so arm (b) = the RH4 head
-   with `main` merged in, custody off (Items, Q9, "Arm b depends on Q10"). Moved here in
+   **READY (s128): arm (b) binary = `perf/rh4-da-body-gc` `b2dd21a4`** (main e1be6c15 merged into 4514573f, no
+   conflicts; workspace 4069 passed / 0 failed, clippy no new warnings). Owner s128: custody OFF by default until T3.1,
+   so arm (b) runs custody off (Items, Q9, "Arm b depends on Q10"). `run-cell.sh` clears every `TORUS_*` variable
+   before starting the nodes, so `TORUS_RETENTION_BLOCKS=1000` must go in the arm's `EXTRA_ENV` (`--extra-env`); a
+   plain environment variable does nothing. Arm (a) = main `e1be6c15` (the merged main, so the arms differ only by
+   RH4); set PC + F by env on both arms (the coming defaults). Moved here in
    s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls (prune by
    default, validator retention N) and the RH4 merge wait on it.
+   **Done s68 (ozarchy-q9, A = main `e1be6c15` node md5 `5ab8040e`, B = `b2dd21a4` node md5 `d44f8b3b` +
+   `TORUS_RETENTION_BLOCKS=1000`, both PC + F + push threshold 524288 + custody 0, n = 1 per arm, 2 / 2 valid, section
+   88): pass. Load = the standard shape paced to 250 actions/s (49.7k matched/s, 0 margin rejects over the hour; the
+   unpaced load is in-flight-cap bound at ~251k matched/s and runs out of margin at ~minute 21). Over load minutes
+   5-60, SST growth per node: A consensus-db 0.0222 + state 0.0203 GB/min (14 MB per 1M fills, the s58safe rate);
+   B 0.0001 + 0.0007 GB/min. At 60 min: A SST 1.30 + 1.33 GB, B 0.03 + 0.25 GB; after shutdown A 3.7-4.1 GB per data
+   dir, B 0.30-0.36 GB. GC deleted all 915,892 bodies per node, 0.18 ms per block (p99 1.35 ms) on the consensus
+   thread. Idle (21-24 min, load stopped): SST flat in both arms; du grows ~0.004 GB/min per DB from WAL alone (the
+   s58safe "idle" growth came from a reject-only load). matched/s 49,751 vs 49,733 (paced, equal by construction),
+   native blk/s 26.50 vs 26.55, block p50 / p99 8.4 / 479 vs 8.6 / 479 ms, order-to-commit p50 / p99 159 / 582 vs
+   157 / 580 ms, CPU-s per 1M 44.1 vs 43.9, 0 timeouts. fds max 234-240 vs 183-189, 0 deleted-open. One cell per
+   arm, at a paced load below capacity: no CI, and it cannot show a GC throughput cost at saturation.**
 10. **Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
@@ -163,7 +269,9 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
     `cond_wait`), start / end gauges `torus_exec_checkpoint_db_write_{start,end}_ms` and a `checkpoint db write` log
     line, the 1 Hz / 10 Hz Dirty-Writeback sampler (`SOAK_DIRTY_HZ=10`), and `torus_commit_manifest_seconds`.
   - Step Z (queue step 8): one step 0 binary, arms `"env": {"TORUS_CHECKPOINT_INTERVAL_MS": "15000"}` vs `"5000"`, ABBA,
-    n = 2 (extend to 4 if ambiguous), hsdb-300m shape, other flags at the campaign A / Q4 defaults. Cut windows from the
+    n = 2 (extend to 4 if ambiguous), hsdb-300m shape. Both arms set the new defaults by env (s128: PC
+    `TORUS_PARALLEL_CANCEL_ALL=8` + F `TORUS_EPOCH_FAST_PATH=1`, plus PE if step 5 adopts it; custody 0) and the push
+    threshold `env.sh` has after step 7b. Cut windows from the
     start / end gauges (DB-write span), not the scrape-widened windows. Report per arm: checkpoint batch bytes and
     DB-write s (W_db), manifest put and persist-wait p99 / max and > 250 ms counts in vs out (X), in-vs-out block p99
     gap (G), overall block p99, matched/s, state-DB bytes/s, Dirty / Writeback max in windows, the stage split.
@@ -243,7 +351,7 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
     set's n for 64 blocks after a set change, kept in the GC's own batch), benches switch to custody on, and Q9's
     arm (b) runs custody on (Items, Q9).
   - **Decided (owner s128, on section 82: C -21.6% matched/s, 140 ms per validate):** custody OFF by default until
-    T3.1; the RH4 shard-count fix waits for T3.1. 18c flips the node's code default (today only `"0"` disables).
+    T3.1; the RH4 shard-count fix waits for T3.1. Code default flipped on main `d6c4d0d2` (s128): only `TORUS_SHARD_CUSTODY=1` enables.
 
 - **Q12. Option S: does a larger EVM cadence N recover Q5's loss?** (item 7 step 3, `docs/plans/item7-step3-design.md`
   sections 3 S and 6.2; no node code). Q5 (section 80): -12.4% matched/s at N = 11, from the barrier before every EVM
