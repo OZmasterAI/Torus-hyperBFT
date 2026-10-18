@@ -438,6 +438,12 @@ graph TD
 ```
 
 **Critical path to the two headline numbers:**
+  **RH4 review history (s128):** three review rounds found 1 + 3 P1s and a P2 (uncommitted tail re-inclusion); all
+  fixed with targeted changes to the cursor + record bookkeeping. **Redesign NOT chosen (owner s128), kept for later:**
+  derive "may this body go?" directly from the block tree at deletion time (scan every block the tree still serves,
+  incl. the uncommitted tail, for the hash) instead of separate records. Revisit if another bookkeeping / tree
+  divergence is found. Bodies committed before an upgrade from a pre-RH4 node are never cleaned (testnet starts from
+  a fresh genesis, so documented only).
 - **~70–100ms blocks:** T0.1 + T0.2 (hardware/RTT) → T1.1 (no load stalls) → T4.1/T4.2 (root cost off the hot path at scale). *Most of this is Tier 0.*
 - **200k orders/s:** T0.1 (CPU) → T2.1 (ingress) → T3.2 + T3.1 (dissemination bytes) → T2.5 (raise cap) → T4.3/T4.4 (execution). *Gated end-to-end on T1 staying live.*
 
