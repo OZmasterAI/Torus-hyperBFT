@@ -2841,13 +2841,25 @@ impl P5Node2 {
     /// later), `f` on its context. After `end_resident`, the slot's records
     /// must equal a cold read of the block's post-state.
     fn run_block<R>(&mut self, h: u64, f: impl FnOnce(&mut NativeExecContext<NativeStateOverlay>) -> R) -> P5Run<R> {
+        self.run_block_with(h, |o, _| o, f)
+    }
+
+    /// [`Self::run_block`] with the context's backend `wrap`ped around the
+    /// block's overlay (R attached).
+    fn run_block_with<S: StateBackend, R>(
+        &mut self,
+        h: u64,
+        wrap: impl FnOnce(NativeStateOverlay, &super::super::ResidentBlock) -> S,
+        f: impl FnOnce(&mut NativeExecContext<S>) -> R,
+    ) -> P5Run<R> {
         let tag = format!("block {h}");
         let mut overlay = NativeStateOverlay::with_parent(self.db.clone(), self.parent.clone());
         let mut rb = begin_resident(Some(&mut self.holder), &mut overlay, h, None);
         assert!(rb.attached(), "{tag}: R attached");
         let start = rb.test_users().expect("R attached");
+        let state = wrap(overlay.clone(), &rb);
         let mut ctx = NativeExecContext::new(
-            overlay.clone(),
+            state,
             h,
             10_000 + 7 * h,
             0,
@@ -2860,7 +2872,7 @@ impl P5Node2 {
         ctx.order_books = std::mem::take(&mut self.books);
         ctx.next_global_order_id = self.next_id;
         ctx.attach_resident_block(&mut rb);
-        let read = |ctx: &NativeExecContext<NativeStateOverlay>| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+        let read = |ctx: &NativeExecContext<S>| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
             [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
                 .iter()
                 .map(|cf| StateBackend::iterate_cf(&ctx.state, cf, None).unwrap())
@@ -2900,7 +2912,18 @@ impl P5Node2 {
     /// Returns the frozen set, the results and whether the record set
     /// changed in place before the freeze (rows or dirty keys).
     fn block(&mut self, h: u64, rng: &mut Lcg, ws: &mut WriterStats) -> (Arc<FrozenPending>, String, bool) {
-        let run = self.run_block(h, |ctx| {
+        self.block_with(h, rng, ws, |o, _| o)
+    }
+
+    /// [`Self::block`] on a `wrap`ped backend.
+    fn block_with<S: StateBackend>(
+        &mut self,
+        h: u64,
+        rng: &mut Lcg,
+        ws: &mut WriterStats,
+        wrap: impl FnOnce(NativeStateOverlay, &super::super::ResidentBlock) -> S,
+    ) -> (Arc<FrozenPending>, String, bool) {
+        let run = self.run_block_with(h, wrap, |ctx| {
             let mut results = Vec::new();
             for call in 0..P5_CALLS {
                 p5_direct_writes(ctx, rng, h, call, ws);
@@ -3298,4 +3321,215 @@ fn ubench_drain_per_block() {
     for (name, v) in ["apply in place", "drain", "put into frozen set", "sums report"].iter().zip(&times) {
         println!("DRAIN ubench {name}: best {:.2} ms, median {:.2} ms ({rows} rows)", best(v), median(v));
     }
+}
+
+// ======================================================================
+// Item 6 Phase 5 step 2 (`docs/plans/item6-phase5-impl.md` Task 2.2):
+// decision 3's write-through. A raw write of positions / balances from a
+// writer outside the settle's flush goes straight into the in-place record
+// set (decoded, applied, marked dirty), never into the overlay's pending
+// map; the next typed read sees it and the freeze emits it once.
+// ======================================================================
+
+/// What [`ColdProbe`] checked.
+#[derive(Debug, Default, Clone, Copy)]
+struct ColdStats {
+    puts: usize,
+    deletes: usize,
+    atomic: usize,
+}
+
+/// The block's overlay, checking after every write of the two CFs that the
+/// in-place record set took it at once: the overlay holds no pending row of
+/// the key, the record set's row of the key is the written one (a
+/// tombstone: none), the key is dirty, and a typed read of a regular row
+/// returns it.
+#[derive(Clone)]
+struct ColdProbe {
+    inner: NativeStateOverlay,
+    users: Arc<SharedUsers>,
+    stats: Arc<Mutex<ColdStats>>,
+}
+
+impl ColdProbe {
+    fn check(&self, cf: &str, key: &[u8], value: Option<&[u8]>) {
+        let slot = match cf {
+            CF_NATIVE_POSITIONS => POSITIONS,
+            CF_NATIVE_BALANCES => BALANCES,
+            _ => return,
+        };
+        assert!(
+            matches!(self.inner.own_pending_row(cf, key), OwnPendingRow::Resident),
+            "{cf} key {key:02x?}: the write stayed pending on the overlay"
+        );
+        assert_eq!(
+            <SharedUsers as ResidentSource>::get(&self.users, slot, key).as_deref(),
+            value,
+            "{cf} key {key:02x?}: the record set's row is not the written one"
+        );
+        assert!(
+            self.users.read().dirty_key_list(slot).iter().any(|k| k == key),
+            "{cf} key {key:02x?}: not dirty"
+        );
+        if slot == POSITIONS && key.len() == KEY {
+            let (t, m) = (Address::from_slice(&key[..TRADER]), market_of(key));
+            if let Some(p) = TypedRows::position(&*self.users, &t, m) {
+                assert_eq!(p.map(|p| encode(&p, POSITION_V2_LEN)).as_deref(), value, "typed read of {key:02x?}");
+            }
+        }
+        let mut s = self.stats.lock().unwrap();
+        if value.is_some() {
+            s.puts += 1;
+        } else {
+            s.deletes += 1;
+        }
+    }
+}
+
+impl StateBackend for ColdProbe {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        self.inner.put_cf_raw(cf, key, value)?;
+        self.check(cf, key, Some(value));
+        Ok(())
+    }
+    fn put_cf_raw_owned(&self, cf: &str, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
+        let v = value.clone();
+        self.inner.put_cf_raw_owned(cf, key, value)?;
+        self.check(cf, key, Some(&v));
+        Ok(())
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.inner.delete_cf_raw(cf, key)?;
+        self.check(cf, key, None);
+        Ok(())
+    }
+    fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf(cf, prefix)
+    }
+    fn iterate_cf_from(&self, cf: &str, start: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf_from(cf, start, limit)
+    }
+    fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        self.inner.get_cf_len(cf, key)
+    }
+    fn iterate_cf_prefix_from(
+        &self,
+        cf: &str,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        self.inner.iterate_cf_prefix_from(cf, prefix, start, limit)
+    }
+    fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        self.inner.prefix_exists(cf, prefix)
+    }
+    fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
+        self.inner.layer_touches(cf, prefix)
+    }
+    fn resident_changes(&self, cf: &str, prefix: &[u8]) -> Option<Vec<ResidentChange>> {
+        self.inner.resident_changes(cf, prefix)
+    }
+    fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
+        self.inner.layer_keys(cf)
+    }
+    fn fold_in_place(&self) {
+        self.inner.fold_in_place()
+    }
+    fn own_pending_row(&self, cf: &str, key: &[u8]) -> OwnPendingRow {
+        self.inner.own_pending_row(cf, key)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        self.inner.atomic_write(ops)?;
+        // The last op of each key holds.
+        let mut seen: BTreeSet<(String, Vec<u8>)> = BTreeSet::new();
+        for op in ops.iter().rev() {
+            let (cf, key, value) = match op {
+                AtomicWriteOp::Put { cf, key, value } => (*cf, *key, Some(*value)),
+                AtomicWriteOp::Delete { cf, key } => (*cf, *key, None),
+            };
+            if seen.insert((cf.to_string(), key.to_vec())) {
+                if cf == CF_NATIVE_POSITIONS || cf == CF_NATIVE_BALANCES {
+                    self.stats.lock().unwrap().atomic += 1;
+                }
+                self.check(cf, key, value);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Plan Task 2.2: `cold_raw_write_reaches_users_and_change_set`. Two nodes
+/// on the same seeded blocks (reference path, in place). On the in-place
+/// node every cold writer runs on a [`ColdProbe`]: lockbox `credit_native`
+/// and its two `atomic_write`s (deposit, withdrawal), the liquidation legs
+/// (transfer, collateral move, backstop, ADL to the escrow and its closes,
+/// the escrows' cross close), `apply_fill`, the single path's fills and
+/// order-margin writes (place, modify, cancel), EVM <-> perp transfers, raw
+/// puts / deletes and irregular rows. Each write is in the record set and
+/// its dirty set at once, nothing stays pending on the overlay, and after
+/// every block the two frozen sets are equal in every CF.
+#[test]
+fn cold_raw_write_reaches_users_and_change_set() {
+    let stats = Arc::new(Mutex::new(ColdStats::default()));
+    let mut ws = WriterStats::default();
+    for seed in 1..=2u64 {
+        let mut reference = P5Node2::new(seed, true);
+        let mut in_place = P5Node2::new(seed, false);
+        let mut rng = Lcg(seed * 7);
+        for h in 1..=25u64 {
+            let tag = format!("seed {seed} block {h}");
+            let (mut ra, mut rb) = (Lcg(rng.0), Lcg(rng.0));
+            let (fa, res_a, _) = reference.block(h, &mut ra, &mut WriterStats::default());
+            let probe_stats = stats.clone();
+            let (fb, res_b, _) = in_place.block_with(h, &mut rb, &mut ws, move |o, block| ColdProbe {
+                inner: o,
+                users: block.test_shared_users().expect("R attached"),
+                stats: probe_stats,
+            });
+            assert_eq!(ra.0, rb.0, "{tag}: the same draws");
+            rng = ra;
+            assert_eq!(res_a, res_b, "{tag}: results");
+            for cf in ALL_CF_NAMES {
+                assert!(fa.rows(cf) == fb.rows(cf), "{tag}: {cf}: change sets differ");
+            }
+        }
+    }
+    let s = *stats.lock().unwrap();
+    println!("P5 T2.2 cold writes checked: {s:?}; writers {ws:?}");
+    assert!(s.puts > 500 && s.deletes > 50 && s.atomic > 20, "{s:?}");
+    assert!(
+        ws.credit > 5 && ws.deposit > 5 && ws.withdraw > 5 && ws.transfer > 5 && ws.move_collateral > 2,
+        "{ws:?}"
+    );
+    assert!(ws.adl_closes > 2 && ws.apply_fill > 20 && ws.single_ok > 20 && ws.raw_blocks > 5, "{ws:?}");
+}
+
+/// Plan section 8 risk 2 (Task 2.2's guard): a row of the two CFs that
+/// reaches the overlay's pending map outside a tx scope bypassed the
+/// write-through (here: a clone of the block's overlay made before R was
+/// attached). Debug builds and tests fail on it at the fold; a release
+/// build still folds it into the record set and emits it at the freeze.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "bypassed the write-through"))]
+fn pending_typed_write_outside_a_tx_scope_is_caught() {
+    let mut node = P5Node2::new(1, false);
+    let t = p5_trader(0);
+    let bal = NativeBalance { available: p5_fp(4_242), order_margin: FixedPoint::ZERO };
+    let mut overlay = NativeStateOverlay::new(node.db.clone());
+    // A clone made before R is attached: its writes go to the shared
+    // pending map, past the write-through.
+    let early = overlay.clone();
+    let rb = begin_resident(Some(&mut node.holder), &mut overlay, 1, None);
+    assert!(rb.in_place(), "the node path");
+    PositionManager::new(early).put_native_balance(&t, &bal).unwrap();
+    let frozen = overlay.freeze(1);
+    // Release: folded into the record set and emitted once.
+    let row: Vec<_> = frozen.rows(CF_NATIVE_BALANCES).into_iter().filter(|(k, _)| k.as_slice() == t.as_slice()).collect();
+    assert_eq!(row, vec![(t.to_vec(), Some(bal_bytes(&bal)))]);
+    let users = rb.test_users().expect("R attached");
+    assert_eq!(users.balances.get(t.as_slice()), Some(&bal_bytes(&bal)));
 }
