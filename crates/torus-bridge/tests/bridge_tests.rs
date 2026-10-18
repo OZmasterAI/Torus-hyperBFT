@@ -478,6 +478,97 @@ fn gas_mismatch_detected() {
     assert!(result.is_err(), "tampered gas should be detected");
 }
 
+/// A funded alice and a proposed one-transfer block (alice -> bob) on `h`.
+fn transfer_block(h: &TestHarness) -> ProposedBlock {
+    let sk = test_signing_key(1);
+    let alice = signing_key_address(&sk);
+    let bob = Address::new([0xBB; 20]);
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+    h.db.put_account(&alice, &test_account(ten_eth)).unwrap();
+    let base_fee = h.parent_header.base_fee_per_gas as u128;
+    let rlp = build_signed_transfer(&sk, bob, U256::from(1_000u64), 0, base_fee);
+    h.propose(vec![rlp], Address::ZERO)
+}
+
+// 8b. Deterministic header mismatches stay `InvalidBlock` (every validator
+// computes the same outcome): receipts_root and logs_bloom.
+#[test]
+fn receipts_root_and_logs_bloom_mismatch_are_invalid_block() {
+    let h = TestHarness::new();
+    let proposed = transfer_block(&h);
+    let mut bad_receipts = proposed.block.clone();
+    bad_receipts.header.receipts_root = B256::repeat_byte(0x11);
+    let mut bad_bloom = proposed.block.clone();
+    bad_bloom.header.logs_bloom = alloy_primitives::Bloom::repeat_byte(0x22);
+    for (what, block) in [("receipts_root", bad_receipts), ("logs_bloom", bad_bloom)] {
+        match h.validator.validate_block(&block, &h.db, &h.executor) {
+            Err(torus_bridge::BridgeError::InvalidBlock(m)) => {
+                assert!(m.starts_with(&format!("{what} mismatch")), "{what}: {m}")
+            }
+            other => panic!("{what}: expected InvalidBlock, got {other:?}"),
+        }
+    }
+}
+
+// 8c. A state error while computing the post-bundle state root is a read of
+// THIS node's DB (here: a DB opened without CF_STORAGE; the transfer itself
+// never reads storage, so execution succeeds and the root's full scan is the
+// first read of the missing CF). It surfaces as `BridgeError::State`, never
+// as an invalid-block outcome, on the catch-up (committed) path and on the
+// strict path alike. The consensus app fail-stops on it
+// (`evm_state_root_compute_fault_fail_stops_block`).
+#[test]
+fn state_root_compute_read_fault_is_a_state_error() {
+    let h = TestHarness::new();
+    let proposed = transfer_block(&h);
+    let sk = test_signing_key(1);
+    let ten_eth = U256::from(10_000_000_000_000_000_000u128);
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    opts.create_missing_column_families(true);
+    let cfs = torus_state::cf::ALL_CF_NAMES
+        .iter()
+        .copied()
+        .filter(|cf| *cf != torus_state::cf::CF_STORAGE);
+    let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+    db.put_account(&signing_key_address(&sk), &test_account(ten_eth))
+        .unwrap();
+
+    let catchup = h
+        .validator
+        .validate_block_for_catchup(&proposed.block, &db, &h.executor);
+    assert!(
+        matches!(
+            catchup,
+            Err(torus_bridge::BridgeError::State(
+                torus_state::StateError::MissingColumnFamily(_)
+            ))
+        ),
+        "catch-up: {catchup:?}"
+    );
+    let strict = h
+        .validator
+        .validate_block(&proposed.block, &db, &h.executor);
+    assert!(
+        matches!(
+            strict,
+            Err(torus_bridge::BridgeError::State(
+                torus_state::StateError::MissingColumnFamily(_)
+            ))
+        ),
+        "strict: {strict:?}"
+    );
+    // Control: the same block on the healthy DB validates on both paths.
+    h.validator
+        .validate_block_for_catchup(&proposed.block, &h.db, &h.executor)
+        .expect("healthy catch-up");
+    h.validator
+        .validate_block(&proposed.block, &h.db, &h.executor)
+        .expect("healthy strict");
+}
+
 // ============================================================================
 // FIX 3 TEST: Block hash uses canonical encoding, not serde_json
 // ============================================================================
@@ -499,9 +590,12 @@ fn block_hash_uses_canonical_encoding() {
         evm_fee_revenue: 0,
         evm_gas_limit: 30_000_000,
         evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+        evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+        evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
         native_action_count: 5,
         evm_tx_count: 3,
         base_fee_per_gas: 1_000_000_000,
+        big_base_fee_per_gas: 1_000_000_000,
         epoch: 7,
         validator_set_hash: B256::new([3u8; 32]),
         sig_attestation: [0u8; 64],

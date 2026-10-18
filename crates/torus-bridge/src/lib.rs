@@ -21,6 +21,8 @@ pub use native_executor::{
     sort_native_actions, sort_native_actions_indexed, ActionCategory, NativeActionResult, NativeBatchResult, NativeExecContext,
     NativeExecutor,
 };
-pub use proposer::{genesis_parent_header, BlockProposer, ProposedBlock};
+pub use proposer::{
+    genesis_parent_header, genesis_parent_header_for, BlockProposer, ProposedBlock,
+};
 pub use revm::database::BundleState;
 pub use validator::{merge_bundle_into, BlockValidator, ValidatedBlock};

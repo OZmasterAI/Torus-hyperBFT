@@ -1,6 +1,6 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use crate::error::MempoolError;
 
@@ -121,6 +121,114 @@ fn compute_shuffle_key(parent_hash: &B256, sender: &Address, nonce: u64) -> u64 
     u64::from_be_bytes(hash.as_slice()[..8].try_into().unwrap())
 }
 
+/// Item 7 step 2: the EVM lane of a pooled tx.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EvmLane {
+    Small,
+    Big,
+}
+
+impl EvmLane {
+    /// The lane a sender may not also hold txs in (one lane per sender).
+    pub fn other(self) -> Self {
+        match self {
+            EvmLane::Small => EvmLane::Big,
+            EvmLane::Big => EvmLane::Small,
+        }
+    }
+}
+
+/// Item 7 step 2: both EVM pools and the in-flight filter (B13) under one lock.
+pub(crate) struct EvmLanes {
+    pub small: EvmPool,
+    pub big: EvmPool,
+    /// Decision 7: EVM txs a committed block carried, with that height; admission refuses them
+    /// (`DuplicateTx`) for `EVM_INFLIGHT_KEEP_BLOCKS`.
+    pub committed: HashMap<B256, u64>,
+    /// Decision 7: per sender, the nonce after its highest pooled or drained tx a committed
+    /// block carried, with that height: admission refuses lower nonces and `pending_nonce`
+    /// starts there, until the state nonce reaches it, its height executes, or it expires.
+    pub committed_next: HashMap<Address, (u64, u64)>,
+    /// Decision 7: this node's drained txs (its own proposals), hash -> (sender, nonce), until
+    /// a committed block carries them or they are reinserted. No reservation at drain: a lost
+    /// proposal's txs would be refused `NonceTooLow` by `reinsert_evm`.
+    pub drained: HashMap<B256, (Address, u64)>,
+}
+
+impl EvmLanes {
+    pub fn new(base_fee: u64) -> Self {
+        Self {
+            small: EvmPool::new(base_fee),
+            big: EvmPool::new(base_fee),
+            committed: HashMap::new(),
+            committed_next: HashMap::new(),
+            drained: HashMap::new(),
+        }
+    }
+
+    /// Decision 7: remove a pooled tx from whichever pool holds it.
+    pub fn remove_by_hash(&mut self, hash: &B256) -> Option<EvmPoolEntry> {
+        self.small
+            .remove_by_hash(hash)
+            .or_else(|| self.big.remove_by_hash(hash))
+    }
+
+    pub fn pool(&self, lane: EvmLane) -> &EvmPool {
+        match lane {
+            EvmLane::Small => &self.small,
+            EvmLane::Big => &self.big,
+        }
+    }
+
+    pub fn lane_of(&self, hash: &B256) -> Option<EvmLane> {
+        if self.small.contains(hash) {
+            Some(EvmLane::Small)
+        } else {
+            self.big.contains(hash).then_some(EvmLane::Big)
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.small.size() + self.big.size()
+    }
+
+    /// Insert a validated tx into `lane`'s pool ([`EvmPool::insert_sharing`], or with
+    /// `reinsert` [`EvmPool::reinsert_sharing`]). `max_pool_size` caps BOTH pools together
+    /// (`MempoolConfig::max_pool_size` is the total): at the cap the new tx must outbid the
+    /// lowest effective tip of either lane, which it evicts, as in one pool.
+    pub fn insert(
+        &mut self,
+        lane: EvmLane,
+        entry: EvmPoolEntry,
+        reinsert: bool,
+        max_pool_size: usize,
+        max_per_sender: usize,
+        replacement_bump_pct: u64,
+    ) -> Result<(Option<B256>, usize), MempoolError> {
+        let (pool, other) = match lane {
+            EvmLane::Small => (&mut self.small, &mut self.big),
+            EvmLane::Big => (&mut self.big, &mut self.small),
+        };
+        if reinsert {
+            pool.reinsert_sharing(
+                entry,
+                Some(other),
+                max_pool_size,
+                max_per_sender,
+                replacement_bump_pct,
+            )
+        } else {
+            pool.insert_sharing(
+                entry,
+                Some(other),
+                max_pool_size,
+                max_per_sender,
+                replacement_bump_pct,
+            )
+        }
+    }
+}
+
 /// Inner EVM transaction pool (not thread-safe — wrapped by Mempool).
 pub(crate) struct EvmPool {
     /// Per-sender nonce-ordered transaction queues.
@@ -176,16 +284,65 @@ impl EvmPool {
         self.by_hash.contains_key(hash)
     }
 
+    /// Item 7 step 2 (decision 7): a pooled tx's raw bytes (a re-send).
+    pub fn raw_of(&self, hash: &B256) -> Option<Vec<u8>> {
+        let (sender, nonce) = self.by_hash.get(hash)?;
+        self.by_sender
+            .get(sender)?
+            .get(nonce)
+            .map(|e| e.raw_rlp.clone())
+    }
+
     pub fn all_senders(&self) -> Vec<Address> {
         self.by_sender.keys().cloned().collect()
+    }
+
+    /// Item 7 step 2: the sender has a pooled tx here (one lane per sender).
+    pub fn has_sender(&self, sender: &Address) -> bool {
+        self.by_sender.contains_key(sender)
+    }
+
+    /// Item 7 step 2: remove and return every pooled raw tx (each sender's in nonce order),
+    /// leaving every index empty.
+    pub fn take_all(&mut self) -> Vec<Vec<u8>> {
+        self.by_hash.clear();
+        self.by_price.clear();
+        self.size = 0;
+        std::mem::take(&mut self.by_sender)
+            .into_values()
+            .flat_map(|txs| txs.into_values().map(|e| e.raw_rlp))
+            .collect()
+    }
+
+    /// [`Self::insert_sharing`] with this pool alone under `max_pool_size`.
+    #[cfg(test)]
+    pub fn insert(
+        &mut self,
+        entry: EvmPoolEntry,
+        max_pool_size: usize,
+        max_per_sender: usize,
+        replacement_bump_pct: u64,
+    ) -> Result<(Option<B256>, usize), MempoolError> {
+        self.insert_sharing(
+            entry,
+            None,
+            max_pool_size,
+            max_per_sender,
+            replacement_bump_pct,
+        )
     }
 
     /// Insert a validated transaction.
     /// Returns (replaced_hash, freed_bytes) — freed_bytes is the total raw RLP size
     /// of any evicted or replaced transactions (FIX EVM-FIND-02).
-    pub fn insert(
+    ///
+    /// Item 7 step 2: `max_pool_size` caps this pool and `other` (the other lane's pool)
+    /// together. At the cap the eviction candidate is the lowest effective tip of both pools,
+    /// each ranked at its own base fee (what the proposer earns per gas in that lane).
+    pub fn insert_sharing(
         &mut self,
         entry: EvmPoolEntry,
+        other: Option<&mut EvmPool>,
         max_pool_size: usize,
         max_per_sender: usize,
         replacement_bump_pct: u64,
@@ -241,17 +398,27 @@ impl EvmPool {
 
         // Pool-wide size limit: evict the lowest effective tip at the
         // current base fee (what the proposer would earn least from).
+        // Item 7 step 2: of both lanes' pools (the greatest in `TxPriority` order).
         let key = TxPriority::new(&entry, self.base_fee);
-        if replaced.is_none() && self.size >= max_pool_size {
-            if let Some(lowest) = self.by_price.iter().next_back().cloned() {
-                if key.tip <= lowest.tip {
-                    return Err(MempoolError::PoolFull);
-                }
-                if let Some(evicted) = self.remove_by_hash(&lowest.hash) {
-                    freed_bytes += evicted.raw_rlp.len();
-                }
-            } else {
+        let others = other.as_ref().map_or(0, |o| o.size);
+        if replaced.is_none() && self.size + others >= max_pool_size {
+            let own = self.by_price.last().cloned();
+            let theirs = other.as_ref().and_then(|o| o.by_price.last().cloned());
+            let (lowest, in_other) = match (own, theirs) {
+                (Some(own), Some(theirs)) if theirs > own => (theirs, true),
+                (Some(own), _) => (own, false),
+                (None, Some(theirs)) => (theirs, true),
+                (None, None) => return Err(MempoolError::PoolFull),
+            };
+            if key.tip <= lowest.tip {
                 return Err(MempoolError::PoolFull);
+            }
+            let evicted = match other {
+                Some(other) if in_other => other.remove_by_hash(&lowest.hash),
+                _ => self.remove_by_hash(&lowest.hash),
+            };
+            if let Some(evicted) = evicted {
+                freed_bytes += evicted.raw_rlp.len();
             }
         }
 
@@ -276,6 +443,7 @@ impl EvmPool {
     /// sender's highest pooled nonce above this one makes room; then `insert`
     /// cannot fail. Otherwise (a duplicate, a taken nonce, no higher nonce)
     /// the `insert` rules apply unchanged.
+    #[cfg(test)]
     pub fn reinsert(
         &mut self,
         entry: EvmPoolEntry,
@@ -283,8 +451,28 @@ impl EvmPool {
         max_per_sender: usize,
         replacement_bump_pct: u64,
     ) -> Result<(Option<B256>, usize), MempoolError> {
+        self.reinsert_sharing(
+            entry,
+            None,
+            max_pool_size,
+            max_per_sender,
+            replacement_bump_pct,
+        )
+    }
+
+    /// [`Self::reinsert`] under one `max_pool_size` for this pool and `other` (item 7 step 2:
+    /// the other lane's pool, see [`Self::insert_sharing`]): the pool is full when both
+    /// together are.
+    pub fn reinsert_sharing(
+        &mut self,
+        entry: EvmPoolEntry,
+        other: Option<&mut EvmPool>,
+        max_pool_size: usize,
+        max_per_sender: usize,
+        replacement_bump_pct: u64,
+    ) -> Result<(Option<B256>, usize), MempoolError> {
         let duplicate = self.by_hash.contains_key(&entry.hash);
-        let pool_full = self.size >= max_pool_size;
+        let pool_full = self.size + other.as_ref().map_or(0, |o| o.size) >= max_pool_size;
         let highest = self
             .by_sender
             .get(&entry.sender)
@@ -308,8 +496,13 @@ impl EvmPool {
                 freed_bytes = evicted.raw_rlp.len();
             }
         }
-        let (replaced, freed) =
-            self.insert(entry, max_pool_size, max_per_sender, replacement_bump_pct)?;
+        let (replaced, freed) = self.insert_sharing(
+            entry,
+            other,
+            max_pool_size,
+            max_per_sender,
+            replacement_bump_pct,
+        )?;
         Ok((replaced, freed_bytes + freed))
     }
 
@@ -398,6 +591,14 @@ impl EvmPool {
     /// pooled, and so do its sender's later nonces.
     /// Task 3.1.5: `parent_hash` seeds deterministic same-tip shuffling (anti-MEV).
     /// D4 (S392): `min_base_fee` re-checks the fee floor at selection time.
+    /// Item 7 step 2 (decision 7): each selected tx goes into `drained` (hash -> sender,
+    /// nonce), so the in-flight filter finds our own proposal's txs at commit.
+    /// Item 7 step 2 (owner s126, decision 9): a tx whose hash is in `in_flight` (carried by an
+    /// uncommitted block this proposal extends, so it executes first) is not selected, spends
+    /// no budget and stays pooled (the commit removes it); its sender's next nonce is still a
+    /// candidate. It never enters the heap, so it cannot stop the drain at the fee floor (its
+    /// fee may be below a base fee that rose since its block, Codex review s126).
+    #[allow(clippy::too_many_arguments)]
     pub fn drain(
         &mut self,
         gas_budget: u64,
@@ -405,11 +606,23 @@ impl EvmPool {
         sender_gas_cap: Option<u64>,
         parent_hash: &B256,
         min_base_fee: u128,
+        drained: &mut HashMap<B256, (Address, u64)>,
+        in_flight: &HashSet<B256>,
     ) -> Vec<Vec<u8>> {
+        // Decision 9: a sender's candidate from `nonce` on, past its in-flight txs (they
+        // execute before this block, in the blocks it extends).
+        let candidate = |txs: &BTreeMap<u64, EvmPoolEntry>, mut nonce: u64| {
+            let mut entry = txs.get(&nonce)?;
+            while in_flight.contains(&entry.hash) {
+                nonce += 1;
+                entry = txs.get(&nonce)?;
+            }
+            Some(DrainEntry::new(entry, min_base_fee, parent_hash))
+        };
         let mut heap = BinaryHeap::new();
         for txs in self.by_sender.values() {
-            if let Some(entry) = txs.values().next() {
-                heap.push(DrainEntry::new(entry, min_base_fee, parent_hash));
+            if let Some(entry) = txs.values().next().and_then(|e| candidate(txs, e.nonce)) {
+                heap.push(entry);
             }
         }
 
@@ -460,24 +673,24 @@ impl EvmPool {
 
             gas_used += top.gas_limit;
             bytes_used += raw.len();
-            to_remove.push(
-                self.by_sender
-                    .get(&top.sender)
-                    .and_then(|m| m.get(&top.nonce))
-                    .map(|e| e.hash)
-                    .unwrap(),
-            );
+            let hash = self
+                .by_sender
+                .get(&top.sender)
+                .and_then(|m| m.get(&top.nonce))
+                .map(|e| e.hash)
+                .unwrap();
+            to_remove.push(hash);
+            drained.insert(hash, (top.sender, top.nonce));
             result.push(raw);
             *sender_gas.entry(top.sender).or_insert(0) += top.gas_limit;
 
-            // Advance: push next nonce for this sender.
-            let next_nonce = top.nonce + 1;
+            // Advance: push next nonce for this sender (past its in-flight txs, decision 9).
             if let Some(next) = self
                 .by_sender
                 .get(&top.sender)
-                .and_then(|m| m.get(&next_nonce))
+                .and_then(|m| candidate(m, top.nonce + 1))
             {
-                heap.push(DrainEntry::new(next, min_base_fee, parent_hash));
+                heap.push(next);
             }
         }
 
@@ -516,8 +729,90 @@ mod tests {
         pool
     }
 
+    /// [`EvmPool::drain`] at base fee 10 with no share cap (the drained record is dropped).
+    fn drain_at(pool: &mut EvmPool, gas: u64, bytes: usize, parent: &B256) -> Vec<Vec<u8>> {
+        pool.drain(
+            gas,
+            bytes,
+            None,
+            parent,
+            10,
+            &mut HashMap::new(),
+            &HashSet::new(),
+        )
+    }
+
     fn senders_of(drained: &[Vec<u8>]) -> Vec<u8> {
         drained.iter().map(|raw| raw[0]).collect()
+    }
+
+    /// Item 7 step 2 (decision 9, Codex review s126): the base fee rose to 50 after A's nonce 0
+    /// (max fee 20) went into a pending block; A's nonce 1 (max fee 100) pays it. The
+    /// in-flight tx must not stop the drain at the fee floor, alone or behind B's below-floor
+    /// nonce 0 (max fee 45: it ranks above A's nonce 0 and is not in flight): A's nonce 1
+    /// drains, nothing below the floor does, both stay pooled.
+    #[test]
+    fn in_flight_tx_below_a_raised_fee_does_not_hold_its_next_nonce_back() {
+        let (a0, a1, b0) = (
+            entry(0xA, 0, 20, 2),
+            entry(0xA, 1, 100, 5),
+            entry(0xB, 0, 45, 2),
+        );
+        for with_b in [false, true] {
+            let mut entries = vec![a0.clone(), a1.clone()];
+            if with_b {
+                entries.push(b0.clone());
+            }
+            let mut pool = pool_with(10, &entries, 100);
+            let in_flight: HashSet<B256> = [a0.hash].into_iter().collect();
+            let mut drained = HashMap::new();
+            let got = pool.drain(
+                u64::MAX,
+                usize::MAX,
+                None,
+                &B256::ZERO,
+                50,
+                &mut drained,
+                &in_flight,
+            );
+            assert_eq!(got, vec![a1.raw_rlp.clone()], "with_b={with_b}");
+            assert_eq!(
+                pool.size(),
+                entries.len() - 1,
+                "with_b={with_b}: the below-floor txs stay pooled"
+            );
+        }
+    }
+
+    /// Item 7 step 2 (decision 9): an in-flight tx (A's nonce 0) is not selected, spends none
+    /// of the budget (two txs' gas buys A's nonce 1 and B's nonce 0), is not recorded as
+    /// drained and stays pooled; once not in flight it drains.
+    #[test]
+    fn drain_skips_in_flight_txs_and_advances_their_sender() {
+        let (a0, a1, b0) = (
+            entry(0xA, 0, 100, 5),
+            entry(0xA, 1, 100, 5),
+            entry(0xB, 0, 100, 1),
+        );
+        let mut pool = pool_with(10, &[a0.clone(), a1.clone(), b0.clone()], 100);
+        let in_flight: HashSet<B256> = [a0.hash].into_iter().collect();
+        let mut drained = HashMap::new();
+        let got = pool.drain(
+            42_000,
+            usize::MAX,
+            None,
+            &B256::ZERO,
+            10,
+            &mut drained,
+            &in_flight,
+        );
+        assert_eq!(got, vec![a1.raw_rlp.clone(), b0.raw_rlp.clone()]);
+        assert!(!drained.contains_key(&a0.hash), "not drained by us");
+        assert_eq!(pool.size(), 1, "the in-flight tx stays pooled");
+        assert_eq!(
+            drain_at(&mut pool, u64::MAX, usize::MAX, &B256::ZERO),
+            vec![a0.raw_rlp]
+        );
     }
 
     /// Fix (a): at base fee 10, A (max 100, tip 1) pays the proposer 1 and
@@ -525,9 +820,9 @@ mod tests {
     #[test]
     fn drain_orders_by_effective_tip_not_max_fee() {
         let mut pool = pool_with(10, &[entry(0xA, 0, 100, 1), entry(0xB, 0, 20, 9)], 100);
-        let first = pool.drain(21_000, usize::MAX, None, &B256::ZERO, 10);
+        let first = drain_at(&mut pool, 21_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&first), vec![0xB]);
-        let rest = pool.drain(21_000, usize::MAX, None, &B256::ZERO, 10);
+        let rest = drain_at(&mut pool, 21_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&rest), vec![0xA]);
     }
 
@@ -537,7 +832,7 @@ mod tests {
         // A: legacy-style (gas price 15, tip 15) -> effective 5 at base 10.
         // B: tip 6 under max 50 -> effective 6.
         let mut pool = pool_with(10, &[entry(0xA, 0, 15, 15), entry(0xB, 0, 50, 6)], 100);
-        let drained = pool.drain(42_000, usize::MAX, None, &B256::ZERO, 10);
+        let drained = drain_at(&mut pool, 42_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&drained), vec![0xB, 0xA]);
     }
 
@@ -560,7 +855,7 @@ mod tests {
             };
             let mut pool = pool_with(10, &[a.clone(), b.clone()], 100);
             assert_eq!(
-                senders_of(&pool.drain(42_000, usize::MAX, None, &parent, 10)),
+                senders_of(&drain_at(&mut pool, 42_000, usize::MAX, &parent)),
                 want
             );
             seen_a_first |= ka > kb;
@@ -577,7 +872,7 @@ mod tests {
     #[test]
     fn below_floor_tx_not_drained_and_stays_pooled() {
         let mut pool = pool_with(5, &[entry(0xA, 0, 9, 9), entry(0xB, 0, 11, 1)], 100);
-        let drained = pool.drain(1_000_000, usize::MAX, None, &B256::ZERO, 10);
+        let drained = drain_at(&mut pool, 1_000_000, usize::MAX, &B256::ZERO);
         assert_eq!(senders_of(&drained), vec![0xB]);
         assert_eq!(pool.size(), 1);
         assert!(pool.contains(&entry(0xA, 0, 9, 9).hash));
@@ -601,10 +896,10 @@ mod tests {
             entry(0xC, 0, 100, 1),
         ];
         let mut pool = pool_with(10, &entries, 100);
-        let first = pool.drain(3_000_000, 262_144, None, &B256::ZERO, 10);
+        let first = drain_at(&mut pool, 3_000_000, 262_144, &B256::ZERO);
         assert_eq!(senders_of(&first), vec![0xA, 0xC]);
         assert_eq!(pool.size(), 2);
-        let second = pool.drain(3_000_000, 262_144, None, &B256::ZERO, 10);
+        let second = drain_at(&mut pool, 3_000_000, 262_144, &B256::ZERO);
         assert_eq!(senders_of(&second), vec![0xB, 0xB]);
         assert_eq!(pool.size(), 0);
     }
@@ -664,6 +959,32 @@ mod tests {
         assert!(!pool.contains(&heavy.hash));
         assert_eq!(pool.size(), 1);
         assert_eq!(pool.evict_gas_above(1_000_000), (0, 0));
+    }
+
+    /// Item 7 step 2: `take_all` empties every index and returns each sender's txs in nonce
+    /// order; `has_sender` follows.
+    #[test]
+    fn take_all_empties_the_pool_in_nonce_order() {
+        let entries = [
+            entry(0xA, 1, 100, 5),
+            entry(0xA, 0, 100, 5),
+            entry(0xB, 0, 100, 5),
+        ];
+        let mut pool = pool_with(10, &entries, 100);
+        assert!(pool.has_sender(&Address::repeat_byte(0xA)));
+        let mut taken = pool.take_all();
+        assert_eq!(pool.size(), 0);
+        assert!(pool.by_hash.is_empty() && pool.by_price.is_empty());
+        assert!(!pool.has_sender(&Address::repeat_byte(0xA)));
+        let a: Vec<_> = taken.iter().filter(|raw| raw[0] == 0xA).cloned().collect();
+        assert_eq!(
+            a,
+            vec![entries[1].raw_rlp.clone(), entries[0].raw_rlp.clone()]
+        );
+        taken.sort();
+        let mut want: Vec<_> = entries.iter().map(|e| e.raw_rlp.clone()).collect();
+        want.sort();
+        assert_eq!(taken, want);
     }
 
     /// Fix (a) replacement: geth rule, both the max fee and the tip must rise
@@ -792,9 +1113,47 @@ mod tests {
             (1, entries[0].raw_rlp.len())
         );
         pool.set_base_fee(10);
-        pool.drain(1_000_000, usize::MAX, None, &B256::ZERO, 10);
+        drain_at(&mut pool, 1_000_000, usize::MAX, &B256::ZERO);
         assert_eq!(pool.size(), 0);
         assert!(pool.by_price.is_empty(), "no stale keys left in by_price");
         assert!(pool.by_hash.is_empty());
+    }
+
+    /// Item 7 step 2 (Codex C5 P3): one size cap for both lanes, and each lane ranks its txs at
+    /// its own base fee. Small base fee 10, big 50: A (small, max 100, tip 30) earns 30, B (big,
+    /// max 70, tip 30) earns 20. At the cap of 2 a small-lane C earning 25 evicts B from the
+    /// big pool; D earning 20 outbids neither. A replacement needs no room. RED before: no
+    /// shared cap (compile error).
+    #[test]
+    fn lanes_share_one_size_cap_ranked_at_each_lanes_base_fee() {
+        let mut lanes = EvmLanes::new(10);
+        lanes.big.set_base_fee(50);
+        let (a, b) = (entry(0xA, 0, 100, 30), entry(0xB, 0, 70, 30));
+        lanes
+            .insert(EvmLane::Small, a.clone(), false, 2, 16, BUMP)
+            .unwrap();
+        lanes
+            .insert(EvmLane::Big, b.clone(), false, 2, 16, BUMP)
+            .unwrap();
+
+        let c = entry(0xC, 0, 100, 25);
+        let (_, freed) = lanes
+            .insert(EvmLane::Small, c.clone(), false, 2, 16, BUMP)
+            .unwrap();
+        assert_eq!(freed, b.raw_rlp.len(), "B (20 at the big fee) evicted");
+        assert_eq!(lanes.lane_of(&b.hash), None);
+        assert_eq!(lanes.lane_of(&c.hash), Some(EvmLane::Small));
+        assert_eq!(lanes.size(), 2);
+        assert!(matches!(
+            lanes.insert(EvmLane::Big, entry(0xD, 0, 100, 20), false, 2, 16, BUMP),
+            Err(MempoolError::PoolFull)
+        ));
+
+        let a2 = entry(0xA, 0, 110, 33);
+        let (replaced, _) = lanes
+            .insert(EvmLane::Small, a2, false, 2, 16, BUMP)
+            .unwrap();
+        assert_eq!(replaced, Some(a.hash));
+        assert_eq!(lanes.size(), 2);
     }
 }

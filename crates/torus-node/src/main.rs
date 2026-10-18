@@ -25,7 +25,7 @@ use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
 use torus_rpc::{find_latest_height, BlockNotifier, RpcServer};
-use torus_state::cf::CF_BLOCK_HEADERS;
+use torus_state::cf::{CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
 use torus_state::{PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
@@ -387,6 +387,8 @@ fn default_chain_config() -> ChainConfig {
         chain_name: "torus".to_string(),
         evm_gas_limit: torus_types::DEFAULT_EVM_GAS_LIMIT,
         evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+        evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+        evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
         base_fee_per_gas: 1_000_000_000,
         epoch_length: 100_000,
         max_validators: 21,
@@ -1044,6 +1046,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // fills), not read back from the DB at commit; fills are recorded only
     // while a stream subscriber exists. Set before the replica starts.
     app.set_fill_sink(Arc::new(notifier.clone()));
+    // EVM forward channel (RPC -> network unicast), made before the replica consumes `app`:
+    // item 7 step 2 (decision 7) commit-path re-sends ride it too.
+    let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let evm_fwd_for_app = evm_fwd_tx.clone();
+    let own_vk_for_app = verifying_key.to_bytes();
+    app.set_evm_forward(Arc::new(move |vk: [u8; 32], raw: Vec<u8>| {
+        if vk != own_vk_for_app {
+            let _ = evm_fwd_for_app.send((vk, raw));
+        }
+    }));
     if let Some(path) = &cli.state_hash_attest_key {
         let addr = app.set_state_hash_attest_key(load_state_hash_attest_key(path)?);
         info!(%addr, "running state hash: automatic AttestStateHash enabled");
@@ -1146,7 +1158,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if height == 0 {
                 return;
             }
-            mempool_for_handler.prune_committed_txs();
+            // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read before
+            // the state nonces the prune reads from the same DB. Not `height`: the header row
+            // is written at commit, before execution.
+            let executed = state_db_for_handler
+                .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                .ok()
+                .flatten()
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map_or(0, u64::from_be_bytes);
+            mempool_for_handler.prune_committed_txs(executed);
             latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
             match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
                 Ok(Some(data)) if data.len() > 32 => {
@@ -1248,7 +1269,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // drop on the RPC side (`rpc_forward_dropped_full`), never unbounded
     // memory behind a stalled forwarder.
     let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(torus_rpc::FORWARD_CHANNEL_CAP);
-    let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
     // Full-body native forwards only in the no-gossip fallback: with pre-spread on,
     // gossip already delivers every body to the leader (Sprint 3.5). EVM forwarding has no
     // gossip path, so it is unconditional — wired via its own channel.
@@ -1260,11 +1280,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         !cli.native_gossip,
     );
     // Item 7 step 1: EVM txs go to the leader of the next EVM height.
+    // Item 7 step 2 (decision 7): the leaders of the next EVM height(s) of the tx's lane.
     let leader_state_for_evm = leader_state.clone();
-    rpc_server.set_evm_leader_fn(Arc::new(move || {
-        leader_state_for_evm
-            .next_evm_leader()
-            .map(|vk| vk.to_bytes())
+    rpc_server.set_evm_targets_fn(Arc::new(move |lane| {
+        let (target, vks) = leader_state_for_evm.next_evm_targets(lane);
+        (target, vks.iter().map(|vk| vk.to_bytes()).collect())
     }));
 
     // Extract shared handles before start() consumes the server

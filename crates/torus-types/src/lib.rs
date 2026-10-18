@@ -6,6 +6,7 @@ pub use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 
 use serde::{Deserialize, Serialize};
 
+pub mod eip1559;
 pub mod eip712;
 
 // ============================================================================
@@ -570,12 +571,19 @@ pub struct TorusBlockHeader {
     /// Item 7 step 1: N. EVM txs only in blocks with `height % N == 0`. Equals the parent's,
     /// except at an epoch boundary, where the epoch plan may change it.
     pub evm_block_interval: u64,
+    /// Item 7 step 2: M. A block with M > 0 and `height % M == 0` is a big EVM block; 0 = off.
+    /// Equals the parent's, except at an epoch boundary (the epoch plan).
+    pub evm_big_block_interval: u64,
+    /// Item 7 step 2: the big lane's gas limit, added to `evm_gas_limit` at a big height.
+    pub evm_big_gas_limit: u64,
     /// Native action count.
     pub native_action_count: u32,
     /// EVM transaction count.
     pub evm_tx_count: u32,
     /// Base fee per gas (EIP-1559).
     pub base_fee_per_gas: u64,
+    /// Item 7 step 2 (F3): the big lane's base fee. Changes only at an epoch boundary.
+    pub big_base_fee_per_gas: u64,
     /// Epoch number (validator set epoch).
     pub epoch: u64,
     /// Validator set hash for this epoch.
@@ -608,12 +616,73 @@ impl TorusBlockHeader {
         buf.extend_from_slice(&self.evm_fee_revenue.to_be_bytes());
         buf.extend_from_slice(&self.evm_gas_limit.to_be_bytes());
         buf.extend_from_slice(&self.evm_block_interval.to_be_bytes());
+        buf.extend_from_slice(&self.evm_big_block_interval.to_be_bytes());
+        buf.extend_from_slice(&self.evm_big_gas_limit.to_be_bytes());
         buf.extend_from_slice(&self.native_action_count.to_be_bytes());
         buf.extend_from_slice(&self.evm_tx_count.to_be_bytes());
         buf.extend_from_slice(&self.base_fee_per_gas.to_be_bytes());
+        buf.extend_from_slice(&self.big_base_fee_per_gas.to_be_bytes());
         buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.extend_from_slice(self.validator_set_hash.as_slice());
         buf
+    }
+
+    /// Item 7 step 2: this block is a big EVM block.
+    pub fn is_big_evm_height(&self) -> bool {
+        is_big_evm_height(self.height, self.evm_big_block_interval)
+    }
+
+    /// Item 7 step 2: EVM txs may ride this block (small cadence or a big height).
+    pub fn is_evm_height(&self) -> bool {
+        is_evm_height(
+            self.height,
+            self.evm_block_interval,
+            self.evm_big_block_interval,
+        )
+    }
+
+    /// Item 7 step 2: the EVM gas this block may declare and execute: the small limit, plus the
+    /// big limit at a big height.
+    pub fn evm_block_gas_cap(&self) -> u64 {
+        if self.is_big_evm_height() {
+            self.evm_gas_limit.saturating_add(self.evm_big_gas_limit)
+        } else {
+            self.evm_gas_limit
+        }
+    }
+
+    /// Item 7 step 2: most raw EVM tx bytes this block may carry (vote rule).
+    pub fn evm_block_byte_cap(&self) -> usize {
+        if self.is_big_evm_height() {
+            MAX_EVM_BIG_BLOCK_TX_BYTES
+        } else {
+            MAX_EVM_BLOCK_TX_BYTES
+        }
+    }
+}
+
+/// Item 7 step 2: the six EVM header values the boundary rule pins: the parent's, at an epoch
+/// boundary the plan's (`torus_economics::PlanEvm::resolve`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EvmHeaderValues {
+    pub gas_limit: u64,
+    pub block_interval: u64,
+    pub big_block_interval: u64,
+    pub big_gas_limit: u64,
+    pub base_fee: u64,
+    pub big_base_fee: u64,
+}
+
+impl EvmHeaderValues {
+    pub fn of(h: &TorusBlockHeader) -> Self {
+        Self {
+            gas_limit: h.evm_gas_limit,
+            block_interval: h.evm_block_interval,
+            big_block_interval: h.evm_big_block_interval,
+            big_gas_limit: h.evm_big_gas_limit,
+            base_fee: h.base_fee_per_gas,
+            big_base_fee: h.big_base_fee_per_gas,
+        }
     }
 }
 
@@ -695,6 +764,21 @@ pub const DEFAULT_EVM_BLOCK_INTERVAL: u64 = 11;
 pub const MAX_EVM_BLOCK_TX_BYTES: usize = 256 * 1024;
 /// Cheapest tx's intrinsic gas: `evm_gas_limit / EVM_MIN_TX_GAS` caps a block's EVM tx count.
 pub const EVM_MIN_TX_GAS: u64 = 21_000;
+/// Item 7 step 2 (owner decision 8): most raw EVM tx bytes at a big EVM height (vote rule), so also
+/// per big-lane tx (admission). Fits the 1 MiB consensus message (`o5_feed_gates.rs`).
+pub const MAX_EVM_BIG_BLOCK_TX_BYTES: usize = 768 * 1024;
+/// Item 7 step 2 (owner decision 1): genesis default M; 0 = big blocks off.
+pub const DEFAULT_EVM_BIG_BLOCK_INTERVAL: u64 = 0;
+/// Item 7 step 2 (owner decision 2): genesis default big-lane gas limit (10-15M at switch-on).
+pub const DEFAULT_EVM_BIG_GAS_LIMIT: u64 = 10_000_000;
+/// Item 7 step 2 (F3): neither lane's base fee drops below this (today's fixed 1 gwei).
+pub const EVM_MIN_BASE_FEE: u64 = 1_000_000_000;
+/// Item 7 step 2 (owner decision 4): CoreWriter order actions wait this many blocks when the
+/// governance key is absent or invalid; every other kind waits one.
+pub const DEFAULT_CORE_WRITER_ORDER_DELAY: u64 = 10;
+/// Item 7 step 2 (owner decision 4): most CoreWriter rows one block drains; a row whose target is
+/// full queues for the next block with room (`CoreWriterQueue::enqueue`).
+pub const CORE_WRITER_DRAIN_CAP: u64 = 200;
 
 /// s94 option 2 (HL "Order price too far from oracle"): the governance key
 /// (`CF_FEE_CONFIG`, a decimal string, `ParameterChange`) of the chain-wide
@@ -725,6 +809,33 @@ pub const EVM_BLOCK_GAS_LIMIT_PARAM: &str = "evm_block_gas_limit";
 pub const EVM_BLOCK_GAS_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 1_000_000..=10_000_000;
 pub const EVM_BLOCK_INTERVAL_PARAM: &str = "evm_block_interval";
 pub const EVM_BLOCK_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 2..=100;
+
+/// Item 7 step 2: governance keys of the big lane (copied into the epoch plan like the two above)
+/// and of the CoreWriter order delay (read when a row is queued).
+pub const EVM_BIG_BLOCK_INTERVAL_PARAM: &str = "evm_big_block_interval";
+/// A non-zero M must lie here; 0 switches big blocks off ([`evm_big_block_interval_ok`]).
+pub const EVM_BIG_BLOCK_INTERVAL_RANGE: std::ops::RangeInclusive<u64> = 30..=10_000;
+pub const EVM_BIG_BLOCK_GAS_LIMIT_PARAM: &str = "evm_big_block_gas_limit";
+/// Owner decision 2: up to HL's 30M; growing there takes a vote, not a release.
+pub const EVM_BIG_BLOCK_GAS_LIMIT_RANGE: std::ops::RangeInclusive<u64> = 1_000_000..=30_000_000;
+pub const CORE_WRITER_ORDER_DELAY_PARAM: &str = "core_writer_order_delay";
+pub const CORE_WRITER_ORDER_DELAY_RANGE: std::ops::RangeInclusive<u64> = 1..=100;
+
+/// Item 7 step 2: a valid M is 0 (off) or inside [`EVM_BIG_BLOCK_INTERVAL_RANGE`].
+pub fn evm_big_block_interval_ok(m: u64) -> bool {
+    m == 0 || EVM_BIG_BLOCK_INTERVAL_RANGE.contains(&m)
+}
+
+/// Item 7 step 2: a big EVM height: M > 0 and `height % M == 0`.
+pub fn is_big_evm_height(height: u64, big_interval: u64) -> bool {
+    big_interval > 0 && height.is_multiple_of(big_interval)
+}
+
+/// Item 7 step 2: EVM txs may ride `height`: the small cadence (`height % N == 0`) or a big
+/// height. N = 0 (never a valid header) carries none.
+pub fn is_evm_height(height: u64, interval: u64, big_interval: u64) -> bool {
+    height.checked_rem(interval) == Some(0) || is_big_evm_height(height, big_interval)
+}
 
 /// A stored governance value: the decimal when it is in `range`, else `None`.
 pub fn gov_u64_in(stored: Option<&[u8]>, range: &std::ops::RangeInclusive<u64>) -> Option<u64> {
@@ -873,6 +984,14 @@ pub enum NativeAction {
         market_id: MarketId,
         #[serde(with = "cloid_serde")]
         cloid: Cloid,
+    },
+
+    // === EVM (appended: item 7 step 2) ===
+    /// HL `evmUserModify`: the sender's EVM lane. `true` = big blocks: while they are on (header
+    /// M > 0) its EVM txs go to the big pool and pay the big base fee. EIP-712 only (not a trading
+    /// action, so no session key). Lanes are proposer routing and fees, never a vote rule.
+    EvmUserModify {
+        using_big_blocks: bool,
     },
 }
 
@@ -1180,6 +1299,10 @@ impl NativeAction {
                     }
                 }
             }
+            NativeAction::EvmUserModify { using_big_blocks } => {
+                buf.push(30);
+                buf.push(u8::from(*using_big_blocks));
+            }
         }
     }
 }
@@ -1469,6 +1592,12 @@ pub struct ChainConfig {
     /// ([`DEFAULT_EVM_BLOCK_INTERVAL`]).
     #[serde(default = "default_evm_block_interval")]
     pub evm_block_interval: u64,
+    /// Item 7 step 2: genesis M (`evm.big_block_interval`); absent = 0.
+    #[serde(default)]
+    pub evm_big_block_interval: u64,
+    /// Item 7 step 2: genesis big-lane gas limit (`evm.big_gas_limit`); absent = 10M.
+    #[serde(default = "default_evm_big_gas_limit")]
+    pub evm_big_gas_limit: u64,
     pub base_fee_per_gas: u64,
     pub epoch_length: u64,
     pub max_validators: u32,
@@ -1538,6 +1667,10 @@ fn default_timeout_base_ms() -> u64 {
 
 fn default_evm_block_interval() -> u64 {
     DEFAULT_EVM_BLOCK_INTERVAL
+}
+
+fn default_evm_big_gas_limit() -> u64 {
+    DEFAULT_EVM_BIG_GAS_LIMIT
 }
 
 fn default_backoff_factor() -> u32 {
@@ -1620,6 +1753,41 @@ pub struct ValidatorSet {
 mod tests {
     use super::*;
 
+    /// Item 7 step 2: EVM txs ride the small cadence (`h % N == 0`) or a big height
+    /// (M > 0, `h % M == 0`); M = 0 switches big heights off.
+    #[test]
+    fn evm_height_rules_cover_the_small_and_big_cadence() {
+        assert!(
+            is_evm_height(10, 5, 0) && !is_big_evm_height(10, 0),
+            "M = 0: off"
+        );
+        assert!(!is_evm_height(11, 5, 0));
+        assert!(
+            is_evm_height(7, 5, 7) && is_big_evm_height(7, 7),
+            "a big height off the small cadence"
+        );
+        assert!(is_evm_height(35, 5, 7) && is_big_evm_height(35, 7));
+        assert!(!is_evm_height(8, 5, 7));
+        assert!(!is_evm_height(10, 0, 0), "N = 0 carries nothing, no panic");
+    }
+
+    /// Item 7 step 2: a valid M is 0 (off) or 30..=10,000; the big-height byte cap is 768 KiB.
+    #[test]
+    fn big_block_interval_is_zero_or_in_range() {
+        for (m, ok) in [
+            (0, true),
+            (1, false),
+            (29, false),
+            (30, true),
+            (190, true),
+            (10_000, true),
+            (10_001, false),
+        ] {
+            assert_eq!(evm_big_block_interval_ok(m), ok, "{m}");
+        }
+        assert_eq!(MAX_EVM_BIG_BLOCK_TX_BYTES, 786_432);
+    }
+
     /// s517 oracle feeder S1: `SetOracleSigner` is canonical tag 28 (27 is
     /// ClaimUnbonded after the s87 rebase; 26 is main's AttestStateHash) + the
     /// 20-byte signer, and survives a serde JSON round trip.
@@ -1648,6 +1816,38 @@ mod tests {
         assert_eq!(b[30], 27);
         let back: NativeAction = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back.canonical_bytes(), b);
+    }
+
+    /// Item 7 step 2: `EvmUserModify` is canonical tag 30 + the flag byte, bincode variant 30
+    /// (appended last), EIP-712 only (no session scope allows it) and survives serde JSON.
+    #[test]
+    fn evm_user_modify_is_canonical_tag_30_and_eip712_only() {
+        let on = NativeAction::EvmUserModify {
+            using_big_blocks: true,
+        };
+        let off = NativeAction::EvmUserModify {
+            using_big_blocks: false,
+        };
+        assert_eq!(on.canonical_bytes(), vec![30, 1]);
+        assert_eq!(off.canonical_bytes(), vec![30, 0]);
+        for a in [&on, &off] {
+            assert!(!a.is_trading());
+            assert!(crate::eip712::requires_eip712(a));
+            for scope in [
+                SessionScope::Trading,
+                SessionScope::TransfersOnly,
+                SessionScope::Full,
+            ] {
+                assert!(!scope.allows(a), "{scope:?} must not allow EvmUserModify");
+            }
+            let bytes = bincode::serialize(a).unwrap();
+            assert_eq!(&bytes[..4], &30u32.to_le_bytes());
+            let back: NativeAction = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back.canonical_bytes(), a.canonical_bytes());
+            let json = serde_json::to_string(a).unwrap();
+            let back: NativeAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.canonical_bytes(), a.canonical_bytes());
+        }
     }
 
     /// S470 knob default: a ChainConfig serialized before the field existed
@@ -1716,6 +1916,11 @@ mod tests {
         }"#;
         let config: ChainConfig = serde_json::from_str(json).expect("legacy config must parse");
         assert_eq!(config.evm_block_interval, 11);
+        // Item 7 step 2: big blocks off, a 10M big lane.
+        assert_eq!(
+            (config.evm_big_block_interval, config.evm_big_gas_limit),
+            (0, 10_000_000)
+        );
         assert_eq!(DEFAULT_EVM_BLOCK_INTERVAL, 11);
         assert_eq!(DEFAULT_EVM_GAS_LIMIT, 3_000_000);
     }
@@ -2021,9 +2226,12 @@ mod tests {
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
             evm_block_interval: DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+            evm_big_gas_limit: DEFAULT_EVM_BIG_GAS_LIMIT,
             native_action_count: 0,
             evm_tx_count: 0,
             base_fee_per_gas: 1_000_000_000,
+            big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
             sig_attestation: [0u8; 64],
@@ -2036,7 +2244,7 @@ mod tests {
 
     #[test]
     fn header_without_attestation_defaults_to_zero() {
-        let json = br#"{"height":1,"timestamp":1000,"proposer":"0x0000000000000000000000000000000000000000","state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","receipts_root":"0x0000000000000000000000000000000000000000000000000000000000000000","logs_bloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","evm_gas_used":0,"evm_fee_revenue":0,"evm_gas_limit":30000000,"evm_block_interval":5,"native_action_count":0,"evm_tx_count":0,"base_fee_per_gas":1000000000,"epoch":0,"validator_set_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let json = br#"{"height":1,"timestamp":1000,"proposer":"0x0000000000000000000000000000000000000000","state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","receipts_root":"0x0000000000000000000000000000000000000000000000000000000000000000","logs_bloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","evm_gas_used":0,"evm_fee_revenue":0,"evm_gas_limit":30000000,"evm_block_interval":5,"evm_big_block_interval":0,"evm_big_gas_limit":10000000,"native_action_count":0,"evm_tx_count":0,"base_fee_per_gas":1000000000,"big_base_fee_per_gas":1000000000,"epoch":0,"validator_set_hash":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
         let decoded: TorusBlockHeader = serde_json::from_slice(json).unwrap();
         assert_eq!(decoded.sig_attestation, [0u8; 64]);
     }
@@ -2054,9 +2262,12 @@ mod tests {
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
             evm_block_interval: DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+            evm_big_gas_limit: DEFAULT_EVM_BIG_GAS_LIMIT,
             native_action_count: 0,
             evm_tx_count: 0,
             base_fee_per_gas: 1_000_000_000,
+            big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
             sig_attestation: [0u8; 64],
@@ -2319,9 +2530,12 @@ mod tests {
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
             evm_block_interval: DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+            evm_big_gas_limit: DEFAULT_EVM_BIG_GAS_LIMIT,
             native_action_count: 0,
             evm_tx_count: 0,
             base_fee_per_gas: 1_000_000_000,
+            big_base_fee_per_gas: 1_000_000_000,
             epoch: 0,
             validator_set_hash: B256::ZERO,
             sig_attestation: [0u8; 64],
@@ -2369,9 +2583,60 @@ mod tests {
     fn header_bincode_round_trip_keeps_evm_block_interval() {
         let mut header = test_header();
         header.evm_block_interval = 7;
+        // Item 7 step 2: and the big lane's three values.
+        header.evm_big_block_interval = 190;
+        header.evm_big_gas_limit = 15_000_000;
+        header.big_base_fee_per_gas = 2_000_000_000;
         let bytes = bincode::serialize(&header).unwrap();
         let back: TorusBlockHeader = bincode::deserialize(&bytes).unwrap();
         assert_eq!(back.evm_block_interval, 7);
+        assert_eq!(
+            (
+                back.evm_big_block_interval,
+                back.evm_big_gas_limit,
+                back.big_base_fee_per_gas
+            ),
+            (190, 15_000_000, 2_000_000_000)
+        );
+    }
+
+    /// Item 7 step 2: M, the big gas limit and the big base fee are block identity.
+    #[test]
+    fn big_lane_fields_in_canonical_bytes() {
+        let a = test_header();
+        type Change = fn(&mut TorusBlockHeader);
+        let changes: [Change; 3] = [
+            |h| h.evm_big_block_interval += 1,
+            |h| h.evm_big_gas_limit += 1,
+            |h| h.big_base_fee_per_gas += 1,
+        ];
+        for change in changes {
+            let mut b = a.clone();
+            change(&mut b);
+            assert_ne!(a.canonical_header_bytes(), b.canonical_header_bytes());
+        }
+    }
+
+    /// Item 7 step 2: a big height adds the big limit to the gas cap and lifts the byte cap
+    /// to 768 KiB; off a big height (or with M = 0) the caps are step 1's.
+    #[test]
+    fn header_caps_add_the_big_lane_at_big_heights() {
+        let mut h = test_header();
+        h.evm_gas_limit = 3_000_000;
+        h.evm_block_interval = 5;
+        h.evm_big_block_interval = 50;
+        h.evm_big_gas_limit = 10_000_000;
+        h.height = 100;
+        assert!(h.is_big_evm_height() && h.is_evm_height());
+        assert_eq!(h.evm_block_gas_cap(), 13_000_000);
+        assert_eq!(h.evm_block_byte_cap(), MAX_EVM_BIG_BLOCK_TX_BYTES);
+        h.height = 105;
+        assert!(!h.is_big_evm_height() && h.is_evm_height());
+        assert_eq!(h.evm_block_gas_cap(), 3_000_000);
+        assert_eq!(h.evm_block_byte_cap(), MAX_EVM_BLOCK_TX_BYTES);
+        h.evm_big_block_interval = 0;
+        h.height = 100;
+        assert_eq!(h.evm_block_gas_cap(), 3_000_000, "M = 0: big blocks off");
     }
 
     /// Genesis zero-parent case: `genesis_parent_header`-style header (height 0)

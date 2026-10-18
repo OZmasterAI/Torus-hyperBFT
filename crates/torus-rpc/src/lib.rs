@@ -242,6 +242,10 @@ pub type ForwardedAction = ([u8; 32], torus_types::Address, torus_types::SignedN
 /// latency (healed by the re-forward sweep), never the action.
 pub const FORWARD_CHANNEL_CAP: usize = 65_536;
 
+/// Item 7 step 2 (decision 7): for an EVM tx's lane, `(last target height, the verifying key
+/// bytes of each target's leader)` ([`RpcServer::set_evm_targets_fn`]).
+pub type EvmTargetsFn = Arc<dyn Fn(torus_mempool::EvmLane) -> (u64, Vec<[u8; 32]>) + Send + Sync>;
+
 /// Shared state for all RPC handlers.
 #[derive(Clone)]
 pub struct RpcState {
@@ -271,9 +275,9 @@ pub struct RpcState {
     pub(crate) own_vk: Option<[u8; 32]>,
     /// Returns the current leader's verifying key bytes.
     pub(crate) leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
-    /// Item 7 step 1: returns the verifying key bytes of the next EVM height's
-    /// leader; EVM forwards fall back to `leader_vk_fn` when unset.
-    pub(crate) evm_leader_vk_fn: Option<Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>>,
+    /// Item 7 steps 1-2: the next EVM height(s) of a tx's lane and their leaders' verifying
+    /// key bytes; EVM forwards fall back to `leader_vk_fn` (no re-send tracking) when unset.
+    pub(crate) evm_targets_fn: Option<EvmTargetsFn>,
     /// Channel to forward native actions to the leader (B1): structured
     /// (leader vk hint, verified sender, parsed action) tuples — no JSON
     /// re-encode — BOUNDED ([`FORWARD_CHANNEL_CAP`]); overflow drops the
@@ -367,7 +371,7 @@ impl RpcServer {
                 metrics: None,
                 own_vk: None,
                 leader_vk_fn: None,
-                evm_leader_vk_fn: None,
+                evm_targets_fn: None,
                 forward_action_tx: None,
                 forward_evm_tx: None,
                 forward_bodies: false,
@@ -425,11 +429,13 @@ impl RpcServer {
         self.state.forward_bodies = forward_bodies;
     }
 
-    /// Item 7 step 1: EVM txs land only in blocks with `height % N == 0`, so
-    /// EVM forwards go to the leader of the next EVM height returned by `f`
-    /// (instead of the current leader from [`Self::set_leader_forwarding`]).
-    pub fn set_evm_leader_fn(&mut self, f: Arc<dyn Fn() -> Option<[u8; 32]> + Send + Sync>) {
-        self.state.evm_leader_vk_fn = Some(f);
+    /// Item 7 steps 1-2: EVM txs land only at EVM heights (`height % N == 0`, or a big height
+    /// for the big lane), so an EVM forward goes to the leaders of the next EVM height(s) of
+    /// the tx's lane returned by `f` (instead of the current leader from
+    /// [`Self::set_leader_forwarding`]), and the mempool tracks the last target for a re-send
+    /// (decision 7).
+    pub fn set_evm_targets_fn(&mut self, f: EvmTargetsFn) {
+        self.state.evm_targets_fn = Some(f);
     }
 
     /// Use an externally-created height counter (shared with the commit handler).
@@ -1031,9 +1037,12 @@ mod tests {
             evm_fee_revenue: 0,
             evm_gas_limit: 30_000_000,
             evm_block_interval: torus_types::DEFAULT_EVM_BLOCK_INTERVAL,
+            evm_big_block_interval: torus_types::DEFAULT_EVM_BIG_BLOCK_INTERVAL,
+            evm_big_gas_limit: torus_types::DEFAULT_EVM_BIG_GAS_LIMIT,
             native_action_count: 0,
             evm_tx_count: 0,
             base_fee_per_gas: base_fee,
+            big_base_fee_per_gas: base_fee,
             epoch: 0,
             validator_set_hash: B256::ZERO,
             sig_attestation: [0u8; 64],
@@ -3482,7 +3491,8 @@ mod tests {
 
     /// Item 7 step 1 (E12): EVM txs land only at `height % N == 0`, so with an
     /// EVM leader hook wired the tx goes to the leader of the next EVM height,
-    /// not to the current-view leader (which stays the fallback).
+    /// not to the current-view leader (which stays the fallback). Item 7 step 2:
+    /// the hook is lane-aware (`set_evm_targets_fn`); a small-lane tx here.
     #[tokio::test]
     async fn evm_tx_forwarded_to_the_next_evm_height_leader() {
         use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
@@ -3557,7 +3567,10 @@ mod tests {
             evm_fwd_tx,
             false,
         );
-        server.set_evm_leader_fn(Arc::new(move || Some(evm_leader)));
+        server.set_evm_targets_fn(Arc::new(move |lane| {
+            assert_eq!(lane, torus_mempool::EvmLane::Small);
+            (10, vec![evm_leader])
+        }));
         let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let client = jsonrpsee::http_client::HttpClientBuilder::default()
             .build(format!("http://{addr}"))
@@ -3573,6 +3586,246 @@ mod tests {
         assert_eq!(vk, evm_leader, "forwarded to the next EVM height's leader");
         assert_eq!(payload, raw);
         assert!(evm_fwd_rx.try_recv().is_err(), "forwarded once");
+        handle.stop().unwrap();
+    }
+
+    /// Item 7 step 2 (owner s126): `eth_sendRawTransaction` refuses a tx with bytes after it,
+    /// in alloy's network form (an RLP string header before the EIP-2718 bytes) and in the
+    /// bare EIP-2718 bytes, before it reaches the pool or a leader; the same txs without them
+    /// are accepted and forwarded. RED before: decoding ignored trailing bytes, so the padded
+    /// txs were pooled and forwarded.
+    #[tokio::test]
+    async fn send_raw_transaction_refuses_trailing_bytes() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_primitives::{Bytes, Signature as AlloySig, TxKind};
+        use jsonrpsee::core::client::ClientT;
+
+        fn evm_addr(key: &k256::ecdsa::SigningKey) -> Address {
+            let pt = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pt.as_bytes()[1..]).as_slice()[12..])
+        }
+        fn signed_eip1559(key: &k256::ecdsa::SigningKey, nonce: u64) -> TxEnvelope {
+            let tx = TxEip1559 {
+                chain_id: TORUS_CHAIN_ID,
+                nonce,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+                access_list: Default::default(),
+            };
+            let sig_hash = tx.signature_hash();
+            let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+            let r = U256::from_be_slice(sig.r().to_bytes().as_slice());
+            let s = U256::from_be_slice(sig.s().to_bytes().as_slice());
+            TxEnvelope::Eip1559(tx.into_signed(AlloySig::new(r, s, recid.is_y_odd())))
+        }
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let (_dir, state, mempool, executor) = setup();
+        state
+            .put_account(
+                &evm_addr(&key),
+                &AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    nonce: 0,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        let network = alloy_rlp::encode(signed_eip1559(&key, 0));
+        let eip2718 = signed_eip1559(&key, 1).encoded_2718();
+        assert!(
+            network[0] > 0x80 && eip2718[0] == 0x02,
+            "the two byte forms"
+        );
+
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
+        let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(
+            [1u8; 32],
+            Arc::new(move || Some([2u8; 32])),
+            fwd_tx,
+            evm_fwd_tx,
+            false,
+        );
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let send = |raw: Vec<u8>| {
+            let client = &client;
+            async move {
+                client
+                    .request::<String, _>(
+                        "eth_sendRawTransaction",
+                        jsonrpsee::rpc_params![format!("0x{}", hex::encode(raw))],
+                    )
+                    .await
+            }
+        };
+
+        for (form, raw) in [("network form", &network), ("EIP-2718", &eip2718)] {
+            let err = send([raw.clone(), vec![0]].concat()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("trailing bytes"),
+                "{form}: refused for its trailing byte, got: {err}"
+            );
+            assert_eq!(mempool.evm_pool_size(), 0, "{form}: not pooled");
+            assert!(evm_fwd_rx.try_recv().is_err(), "{form}: not forwarded");
+        }
+        for (form, raw) in [("network form", &network), ("EIP-2718", &eip2718)] {
+            send(raw.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{form} without trailing bytes: {e}"));
+            let (_, payload) = evm_fwd_rx.try_recv().expect("forwarded");
+            assert_eq!(&payload, raw, "{form}: forwarded as submitted");
+        }
+        assert_eq!(mempool.evm_pool_size(), 2);
+        handle.stop().unwrap();
+    }
+
+    /// Item 7 step 2 (decision 7): with the lane-aware hook wired, a big-lane tx goes to the
+    /// leaders of its lane's targets (the next two big heights), never to this node's own
+    /// key, and the mempool tracks it at the last target (25) for a re-send. RED before: one
+    /// leader for every tx, no tracking (compile error).
+    #[tokio::test]
+    async fn evm_tx_forwarded_to_the_leaders_of_its_lane_and_tracked() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_primitives::{Bytes, Signature as AlloySig, TxKind};
+        use alloy_rlp::Encodable;
+        use jsonrpsee::core::client::ClientT;
+        use torus_mempool::EvmLane;
+
+        fn evm_addr(key: &k256::ecdsa::SigningKey) -> Address {
+            let pt = key.verifying_key().to_encoded_point(false);
+            Address::from_slice(&alloy_primitives::keccak256(&pt.as_bytes()[1..]).as_slice()[12..])
+        }
+        fn signed_eip1559(key: &k256::ecdsa::SigningKey, nonce: u64) -> Vec<u8> {
+            let tx = TxEip1559 {
+                chain_id: TORUS_CHAIN_ID,
+                nonce,
+                max_fee_per_gas: 1_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+                gas_limit: 21_000,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+                access_list: Default::default(),
+            };
+            let sig_hash = tx.signature_hash();
+            let (sig, recid) = key.sign_prehash_recoverable(sig_hash.as_slice()).unwrap();
+            let r = U256::from_be_slice(sig.r().to_bytes().as_slice());
+            let s = U256::from_be_slice(sig.s().to_bytes().as_slice());
+            let signature = AlloySig::new(r, s, recid.is_y_odd());
+            let mut buf = Vec::new();
+            TxEnvelope::Eip1559(tx.into_signed(signature)).encode(&mut buf);
+            buf
+        }
+
+        let key = k256::ecdsa::SigningKey::from_slice(
+            &hex::decode("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+                .unwrap(),
+        )
+        .unwrap();
+        let sender = evm_addr(&key);
+        let (own, a, b) = ([1u8; 32], [4u8; 32], [5u8; 32]);
+
+        let (_dir, state, mempool, executor) = setup();
+        state
+            .put_account(
+                &sender,
+                &AccountInfo {
+                    balance: U256::from(10u128.pow(18)),
+                    nonce: 0,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        // The sender's `EvmUserModify` row, with big blocks on: the big lane.
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::evm_lane_key(&sender),
+                &[1],
+            )
+            .unwrap();
+        mempool.set_big_lane(50, 10_000_000, 1_000_000_000);
+        let raw = signed_eip1559(&key, 0);
+        let mut server = RpcServer::new(
+            state,
+            mempool.clone(),
+            executor,
+            TORUS_CHAIN_ID,
+            100,
+            BlockNotifier::new(),
+        );
+        let (fwd_tx, _fwd_rx) = tokio::sync::mpsc::channel(FORWARD_CHANNEL_CAP);
+        let (evm_fwd_tx, mut evm_fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_leader_forwarding(
+            own,
+            Arc::new(move || Some([2u8; 32])),
+            fwd_tx,
+            evm_fwd_tx,
+            false,
+        );
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = asked.clone();
+        server.set_evm_targets_fn(Arc::new(move |lane| {
+            record.lock().unwrap().push(lane);
+            match lane {
+                EvmLane::Big => (25, vec![a, own, b]),
+                EvmLane::Small => (5, vec![[6u8; 32]]),
+            }
+        }));
+        let (handle, addr) = server.start("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let _: String = client
+            .request(
+                "eth_sendRawTransaction",
+                jsonrpsee::rpc_params![format!("0x{}", hex::encode(&raw))],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*asked.lock().unwrap(), vec![EvmLane::Big]);
+        let sent: Vec<([u8; 32], Vec<u8>)> =
+            std::iter::from_fn(|| evm_fwd_rx.try_recv().ok()).collect();
+        assert_eq!(
+            sent,
+            vec![(a, raw.clone()), (b, raw.clone())],
+            "both big-height leaders, not this node"
+        );
+        assert!(mempool.evm_due_resends(24).is_empty());
+        let due = mempool.evm_due_resends(25);
+        assert_eq!(
+            due.iter()
+                .map(|r| (r.raw.clone(), r.lane, r.sends))
+                .collect::<Vec<_>>(),
+            vec![(raw, EvmLane::Big, 0)],
+            "tracked at the last target"
+        );
         handle.stop().unwrap();
     }
 
@@ -4483,6 +4736,325 @@ mod tests {
                 .await
                 .unwrap(),
             "0x"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// eth_call / eth_estimateGas whose revm read fails on this node (a DB
+    /// without CF_STORAGE: the contract's SLOAD fails): the request returns
+    /// the local storage fault as an error, and nothing is latched: RPC has
+    /// no fail-stop (only block execution does), so the server keeps serving
+    /// and a following call that reads no storage succeeds. RED before: the
+    /// error named an internal EVM error, not the local fault.
+    #[tokio::test]
+    async fn eth_call_db_read_fault_returns_error_and_keeps_serving() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .copied()
+            .filter(|cf| *cf != torus_state::cf::CF_STORAGE);
+        let state =
+            StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let sender = Address::from([0x11; 20]);
+        let funded = AccountInfo {
+            balance: U256::from(10u64.pow(18)),
+            nonce: 0,
+            code_hash: B256::ZERO,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&sender, &funded).unwrap();
+        // `PUSH1 0 SLOAD STOP`.
+        let reader = Address::from([0xC0; 20]);
+        let code = [0x60, 0x00, 0x54, 0x00];
+        let code_hash = alloy_primitives::keccak256(code);
+        state.put_code(&code_hash, &code).unwrap();
+        let contract = AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&reader, &contract).unwrap();
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let faulting =
+            serde_json::json!({ "from": hex_address(sender), "to": hex_address(reader) });
+        for method in ["eth_call", "eth_estimateGas"] {
+            let e = client
+                .request::<String, _>(method, jsonrpsee::rpc_params![faulting.clone(), "latest"])
+                .await
+                .unwrap_err();
+            assert!(
+                e.to_string().contains("local storage fault"),
+                "{method}: {e}"
+            );
+        }
+        let plain = serde_json::json!({ "from": hex_address(sender), "to": hex_address(Address::from([0x22; 20])), "value": "0x0" });
+        assert_eq!(
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![plain, "latest"])
+                .await
+                .unwrap(),
+            "0x",
+            "the server keeps serving"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// Deploy `code` at `at` (nonce 1, no balance, no storage rows).
+    fn estgas_deploy(state: &StateDb, at: Address, code: &[u8]) {
+        let code_hash = alloy_primitives::keccak256(code);
+        state.put_code(&code_hash, code).unwrap();
+        let contract = AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        state.put_account(&at, &contract).unwrap();
+    }
+
+    /// `gasleft() < 100_000` at entry jumps to `low` (bytes 10..), else STOP:
+    /// `GAS PUSH3 100000 GT PUSH1 10 JUMPI STOP JUMPDEST <low>`.
+    fn estgas_gas_branch(low: &[u8]) -> Vec<u8> {
+        let mut code = vec![
+            0x5a, 0x62, 0x01, 0x86, 0xa0, 0x11, 0x60, 0x0a, 0x57, 0x00, 0x5b,
+        ];
+        code.extend_from_slice(low);
+        code
+    }
+
+    fn estgas_u64(s: &str) -> u64 {
+        u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
+    }
+
+    /// eth_estimateGas whose run at the cap succeeds but whose run at a
+    /// lower tried gas hits a read error of this node's DB (the contract
+    /// SLOADs only when `gasleft() < 100_000`; the DB has no CF_STORAGE):
+    /// the estimate returns that error at once, as geth's binary search
+    /// does for any non-gas error (`gasestimator.Estimate`: `if err != nil
+    /// { return 0, nil, err }`), never a gas value. RPC has no fail-stop:
+    /// the server keeps serving. RED before: every error at a tried gas
+    /// was taken as "gas too low", and the search returned a gas value.
+    #[tokio::test]
+    async fn estimate_gas_db_read_fault_below_cap_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .copied()
+            .filter(|cf| *cf != torus_state::cf::CF_STORAGE);
+        let state =
+            StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+        let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+        let contract = Address::from([0xC2; 20]);
+        // low: PUSH1 0 SLOAD STOP.
+        estgas_deploy(
+            &state,
+            contract,
+            &estgas_gas_branch(&[0x60, 0x00, 0x54, 0x00]),
+        );
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let from = hex_address(Address::from([0x11; 20]));
+        let call = serde_json::json!({ "from": from, "to": hex_address(contract) });
+        let at_cap: String = client
+            .request("eth_call", jsonrpsee::rpc_params![call.clone(), "latest"])
+            .await
+            .unwrap();
+        assert_eq!(at_cap, "0x", "the run at the cap reads no storage");
+        let e = client
+            .request::<String, _>("eth_estimateGas", jsonrpsee::rpc_params![call, "latest"])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("local storage fault"), "{e}");
+        let plain =
+            serde_json::json!({ "from": from, "to": hex_address(Address::from([0x22; 20])) });
+        assert_eq!(
+            client
+                .request::<String, _>("eth_estimateGas", jsonrpsee::rpc_params![plain, "latest"])
+                .await
+                .unwrap(),
+            "0x5208",
+            "the server keeps serving"
+        );
+        handle.stop().unwrap();
+    }
+
+    /// geth parity of the search (`gasestimator.Estimate`): a run that
+    /// FAILS at a tried gas below the cap — out of gas, or a revert that
+    /// only happens with less gas (the 63/64 rule makes that common) —
+    /// raises the lower bound; the estimate is the least gas at which the
+    /// tx succeeds (it succeeds there, one less fails). A tx that reverts
+    /// at the cap returns the revert (code 3 + revert data) at once.
+    #[tokio::test]
+    async fn estimate_gas_search_raises_on_failure_and_returns_revert_at_cap() {
+        let (_dir, state, mempool, executor) = setup();
+        // low: REVERT(0, 0).
+        let reverts_low = Address::from([0xC3; 20]);
+        estgas_deploy(
+            &state,
+            reverts_low,
+            &estgas_gas_branch(&[0x60, 0x00, 0x60, 0x00, 0xfd]),
+        );
+        // KECCAK256 over 64 KiB of memory (~26.5k gas), then STOP: runs
+        // out of gas below its cost.
+        let burns = Address::from([0xC4; 20]);
+        estgas_deploy(
+            &state,
+            burns,
+            &[0x62, 0x01, 0x00, 0x00, 0x60, 0x00, 0x20, 0x00],
+        );
+        // MSTORE(0, 0x2a) REVERT(0, 32): reverts with data at any gas.
+        let always_reverts = Address::from([0xC5; 20]);
+        estgas_deploy(
+            &state,
+            always_reverts,
+            &[0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xfd],
+        );
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let from = hex_address(Address::from([0x11; 20]));
+        for (what, to, floor) in [
+            ("reverts below 100k gasleft", reverts_low, 121_000),
+            ("out of gas", burns, 21_000 + 26_000),
+        ] {
+            let call = serde_json::json!({ "from": from, "to": hex_address(to) });
+            let est = estgas_u64(
+                &client
+                    .request::<String, _>(
+                        "eth_estimateGas",
+                        jsonrpsee::rpc_params![call.clone(), "latest"],
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert!(est > floor, "{what}: {est}");
+            let at = |gas: u64| {
+                let mut c = call.clone();
+                c["gas"] = serde_json::json!(format!("0x{gas:x}"));
+                c
+            };
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est), "latest"])
+                .await
+                .unwrap_or_else(|e| panic!("{what}: fails at the estimate {est}: {e}"));
+            assert!(
+                client
+                    .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est - 1), "latest"])
+                    .await
+                    .is_err(),
+                "{what}: {est} is not the least gas"
+            );
+        }
+        let call = serde_json::json!({ "from": from, "to": hex_address(always_reverts) });
+        match client
+            .request::<String, _>("eth_estimateGas", jsonrpsee::rpc_params![call, "latest"])
+            .await
+            .unwrap_err()
+        {
+            jsonrpsee::core::client::Error::Call(obj) => {
+                assert_eq!(obj.code(), 3, "{obj:?}");
+                assert!(obj.message().contains("execution reverted"), "{obj:?}");
+                assert_eq!(
+                    obj.data().map(|d| d.get()),
+                    Some(format!("\"0x{:064x}\"", 0x2a).as_str()),
+                    "revert data"
+                );
+            }
+            other => panic!("not a call error: {other}"),
+        }
+        handle.stop().unwrap();
+    }
+
+    /// A refund can bring the gas the run at the cap used BELOW the
+    /// intrinsic gas: 40 warm access-list keys (intrinsic 21000 + 2400 +
+    /// 40 * 1900 = 99400) and, only when `gasleft() > 50000`, an SSTORE
+    /// that clears a set slot (4800 refunded). The cap run's gas used is
+    /// ~97.5k, so the search tries limits below 99400, which revm rejects
+    /// before execution (`CallGasCostMoreThanGasLimit`). geth takes that
+    /// (`core.ErrIntrinsicGas`, `gasestimator.execute`: "Special case,
+    /// raise gas limit") as a FAILED try that raises the lower bound, and
+    /// never starts the search below the intrinsic gas. The estimate is the
+    /// least succeeding gas (the STOP path, ~99421). RED before: the
+    /// estimate returned the invalid-transaction error.
+    #[tokio::test]
+    async fn estimate_gas_refund_below_intrinsic_raises_lower_bound() {
+        let (_dir, state, mempool, executor) = setup();
+        let contract = Address::from([0xC6; 20]);
+        // GAS PUSH3 50000 LT PUSH1 10 JUMPI STOP
+        // JUMPDEST PUSH1 0 PUSH1 0 SSTORE STOP
+        estgas_deploy(
+            &state,
+            contract,
+            &[
+                0x5a, 0x62, 0x00, 0xc3, 0x50, 0x10, 0x60, 0x0a, 0x57, 0x00, 0x5b, 0x60, 0x00, 0x60,
+                0x00, 0x55, 0x00,
+            ],
+        );
+        state
+            .put_storage(&contract, &U256::ZERO, &U256::from(1u64))
+            .unwrap();
+        store_header(&state, &test_header(0, 0, 0));
+        let (handle, addr) = start_server(state, mempool, executor).await;
+        use jsonrpsee::core::client::ClientT;
+        let client = jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let keys: Vec<String> = (0u64..40).map(|k| format!("0x{k:064x}")).collect();
+        let call = serde_json::json!({
+            "from": hex_address(Address::from([0x11; 20])),
+            "to": hex_address(contract),
+            "accessList": [{ "address": hex_address(contract), "storageKeys": keys }],
+        });
+        let est = estgas_u64(
+            &client
+                .request::<String, _>(
+                    "eth_estimateGas",
+                    jsonrpsee::rpc_params![call.clone(), "latest"],
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(est >= 99_400, "below the intrinsic gas: {est}");
+        let at = |gas: u64| {
+            let mut c = call.clone();
+            c["gas"] = serde_json::json!(format!("0x{gas:x}"));
+            c
+        };
+        client
+            .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est), "latest"])
+            .await
+            .unwrap_or_else(|e| panic!("fails at the estimate {est}: {e}"));
+        assert!(
+            client
+                .request::<String, _>("eth_call", jsonrpsee::rpc_params![at(est - 1), "latest"])
+                .await
+                .is_err(),
+            "{est} is not the least gas"
         );
         handle.stop().unwrap();
     }

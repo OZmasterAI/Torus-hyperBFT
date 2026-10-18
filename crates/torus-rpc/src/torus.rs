@@ -253,6 +253,17 @@ pub trait TorusApi {
         limit: Option<u32>,
     ) -> RpcResult<Vec<RpcUserTrade>>;
 
+    // --- Item 7 step 2: EVM lanes ---
+    /// The big lane's base fee in the last committed header (HL `bigBlockGasPrice`);
+    /// `eth_gasPrice` is the small lane's.
+    #[method(name = "bigBlockGasPrice")]
+    async fn big_block_gas_price(&self) -> RpcResult<String>;
+
+    /// `address`'s stored lane choice (`EvmUserModify`): true = big blocks. Its txs use the big
+    /// lane only while big blocks are on (header `evm_big_block_interval` > 0).
+    #[method(name = "usingBigBlocks")]
+    async fn using_big_blocks(&self, address: String) -> RpcResult<bool>;
+
     // --- Phase 7B: Trade streaming subscription ---
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = serde_json::Value)]
     async fn subscribe(
@@ -288,7 +299,7 @@ type PeekFn = fn(&str) -> Option<u32>;
 
 /// `NativeAction` variant count: bincode tags are `0..NATIVE_ACTION_TAGS`
 /// (declaration order; variants are only ever appended).
-const NATIVE_ACTION_TAGS: u32 = 30;
+const NATIVE_ACTION_TAGS: u32 = 31;
 /// bincode tags of the actions that pass the pre-verify shed
 /// (`torus_mempool::is_cancel` / `is_oracle_submission`).
 const TAG_CANCEL_ORDER: u32 = 2;
@@ -943,19 +954,34 @@ impl RpcState {
     /// Takes the RLP by value (the caller already owns a clone, since `add_evm_tx` consumes the
     /// original): moving it into the channel avoids a second copy of the body on the hot path.
     ///
-    /// Item 7 step 1: the target is the leader of the next EVM height (`evm_leader_vk_fn`), since
-    /// EVM txs land only at `height % N == 0`; the current leader when that hook is unset.
-    pub(crate) fn forward_evm_to_leader(&self, raw_rlp: Vec<u8>) {
-        if let (Some(leader_fn), Some(own_vk), Some(fwd_tx)) = (
-            self.evm_leader_vk_fn
-                .as_ref()
-                .or(self.leader_vk_fn.as_ref()),
-            self.own_vk.as_ref(),
-            self.forward_evm_tx.as_ref(),
-        ) {
-            if let Some(leader_vk) = leader_fn() {
-                if leader_vk != *own_vk {
-                    let _ = fwd_tx.send((leader_vk, raw_rlp));
+    /// Item 7 steps 1-2: the targets are the leaders of the next EVM height(s) of the tx's lane
+    /// (`evm_targets_fn`: the next EVM height for the small lane, the next two big heights for
+    /// the big lane), since EVM txs land only at EVM heights, and the mempool tracks the last
+    /// target so the commit path re-sends the tx if that height commits without it (decision
+    /// 7). The current leader, untracked, when that hook is unset.
+    pub(crate) fn forward_evm_to_leader(&self, raw_rlp: Vec<u8>, hash: alloy_primitives::B256) {
+        let (Some(own_vk), Some(fwd_tx)) = (self.own_vk.as_ref(), self.forward_evm_tx.as_ref())
+        else {
+            return;
+        };
+        match self.evm_targets_fn.as_ref() {
+            Some(targets) => {
+                let lane = self
+                    .mempool
+                    .evm_lane_of(&hash)
+                    .unwrap_or(torus_mempool::EvmLane::Small);
+                let (target, leaders) = targets(lane);
+                for vk in leaders.into_iter().filter(|vk| vk != own_vk) {
+                    let _ = fwd_tx.send((vk, raw_rlp.clone()));
+                }
+                self.mempool.track_evm_forward(hash, target, 0);
+            }
+            // No consensus attached: the current leader, as before item 7.
+            None => {
+                if let Some(vk) = self.leader_vk_fn.as_ref().and_then(|f| f()) {
+                    if vk != *own_vk {
+                        let _ = fwd_tx.send((vk, raw_rlp));
+                    }
                 }
             }
         }
@@ -2216,6 +2242,39 @@ impl TorusApiServer for RpcState {
         })
     }
 
+    // === Item 7 step 2: EVM lanes ===
+
+    /// Mirrors `eth_gasPrice` with the big lane's base fee.
+    async fn big_block_gas_price(&self) -> RpcResult<String> {
+        let latest = self.latest_height.load(Relaxed);
+        if latest > 0 {
+            if let Some((header, _, _)) =
+                crate::eth::get_header_with_hash(self, latest).map_err(ErrorObjectOwned::from)?
+            {
+                if header.big_base_fee_per_gas > 0 {
+                    return Ok(hex_u64(header.big_base_fee_per_gas));
+                }
+            }
+        }
+        Ok(hex_u64(torus_types::EVM_MIN_BASE_FEE))
+    }
+
+    /// Reads the lane row through the ingress view (the state admission reads lanes from): a
+    /// choice executed in a block not yet checkpointed is already reported.
+    async fn using_big_blocks(&self, address: String) -> RpcResult<bool> {
+        let addr = parse_address(&address).map_err(ErrorObjectOwned::from)?;
+        let row = self
+            .mempool
+            .ingress_state()
+            .get_cf_raw(
+                torus_state::cf::CF_NATIVE_ORACLE,
+                &torus_state::cf::evm_lane_key(&addr),
+            )
+            .map_err(RpcError::from)
+            .map_err(ErrorObjectOwned::from)?;
+        Ok(row.is_some())
+    }
+
     // === Phase 7B: Trade streaming subscription ===
 
     async fn subscribe(
@@ -3305,6 +3364,7 @@ mod shed_peek_tests {
             NativeAction::ClaimUnbonded => 27,
             NativeAction::SetOracleSigner { .. } => 28,
             NativeAction::CancelByCloid { .. } => 29,
+            NativeAction::EvmUserModify { .. } => 30,
         }
     }
 
@@ -3349,6 +3409,9 @@ mod shed_peek_tests {
             NativeAction::CancelByCloid {
                 market_id: 3,
                 cloid: u128::MAX,
+            },
+            NativeAction::EvmUserModify {
+                using_big_blocks: true,
             },
             NativeAction::ModifyOrder {
                 order_id: 7,

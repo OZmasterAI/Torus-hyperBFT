@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rocksdb::perf::{set_perf_stats, PerfContext, PerfMetric, PerfStatsLevel};
-use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS};
+use torus_state::cf::{
+    CF_NATIVE_BALANCES, CF_NATIVE_BBO, CF_NATIVE_LIQUIDATION, CF_NATIVE_ORACLE, CF_NATIVE_POSITIONS,
+};
 use torus_state::error::StateError;
 use torus_state::{AtomicWriteOp, StateBackend};
 
@@ -52,6 +54,8 @@ pub struct Counts {
     /// obligation rows (prefix `0x07`) — the queue gauge's re-counts (the
     /// drain reads one row at a time).
     pub queue_page_scans: AtomicUsize,
+    /// Always on: puts and deletes of `CF_NATIVE_BBO` rows (item 7 step 2).
+    pub bbo_writes: AtomicUsize,
     /// Calls of the wrapped backend for the two probed CFs, `(cf, op)` ->
     /// count, answered by a layer or not.
     layer_calls: Mutex<HashMap<(&'static str, &'static str), usize>>,
@@ -133,13 +137,27 @@ impl<T: StateBackend> CountingBackend<T> {
         self.counts.queue_page_scans.load(Ordering::SeqCst)
     }
 
+    /// `CF_NATIVE_BBO` puts + deletes so far (never reset).
+    pub fn bbo_writes(&self) -> usize {
+        self.counts.bbo_writes.load(Ordering::SeqCst)
+    }
+
+    fn count_bbo_write(&self, cf: &str) {
+        if cf == CF_NATIVE_BBO {
+            self.counts.bbo_writes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// Scans of the pending rows so far (never reset).
     pub fn pending_scans(&self) -> usize {
         self.counts.pending_scans.load(Ordering::SeqCst)
     }
 
     pub fn new(inner: T) -> Self {
-        Self { inner, counts: Arc::new(Counts::default()) }
+        Self {
+            inner,
+            counts: Arc::new(Counts::default()),
+        }
     }
 
     /// The same counters over another backend (e.g. the next block's overlay).
@@ -247,14 +265,17 @@ impl<T: StateBackend> StateBackend for CountingBackend<T> {
         if cf == CF_NATIVE_LIQUIDATION && key.first() == Some(&0x02) && self.armed() {
             self.counts.cooldown_puts.fetch_add(1, Ordering::SeqCst);
         }
+        self.count_bbo_write(cf);
         self.inner.put_cf_raw(cf, key, value)
     }
 
     fn put_cf_raw_owned(&self, cf: &str, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
+        self.count_bbo_write(cf);
         self.inner.put_cf_raw_owned(cf, key, value)
     }
 
     fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.count_bbo_write(cf);
         self.inner.delete_cf_raw(cf, key)
     }
 

@@ -3,8 +3,19 @@
 A contract (or EOA) that calls a CoreWriter precompile (0x0810 orders, 0x0811
 staking) or the lockbox (0x0820) only queues an action. The call returns
 "queued", not "executed". The queue for block `N` runs (drains) at the end
-of block `N`'s native phase. An action queued by block `N - 1`'s EVM runs in
-block `N`.
+of block `N`'s native phase.
+
+Which block an action targets (item 7 step 2, owner decision 4): an order
+action (`place_order`, `cancel_order`, `cancel_all`, `cancel_by_cloid`)
+queued by block `B`'s EVM targets block `B + K`, where K is the governance
+key `core_writer_order_delay` (1..=100, default 10), and never a block
+before the previous order action's target (so lowering K cannot let a
+cancel overtake an earlier order). Every other kind (staking, lockbox)
+targets `B + 1`, as before step 2. A target block holds at most 200 rows
+(`CORE_WRITER_DRAIN_CAP`): a row whose target is full goes on to the next
+block with room, in queue order. So block `N`'s queue holds rows queued by
+block `N - 1` (any kind), by block `N - K` (order kinds), and rows that an
+earlier full target sent on.
 
 Every drained queue row has a result in block `N`'s action status record
 (`cf_block_action_status`, record v5; v4 before s114). `torus_getBlockBody(N)` returns these
@@ -43,10 +54,10 @@ have no native action and no EVM tx.
 
 | Field | Meaning |
 |---|---|
-| `seq` | The row's position in block `N`'s queue. The row key is `N ‖ seq`, so `(N, seq)` identifies one queued action. Within one block, seqs follow the order of the successful precompile calls in block `N - 1` (tx order, then call order). |
+| `seq` | The row's position in block `N`'s queue. The row key is `N ‖ seq`, so `(N, seq)` identifies one queued action (at most 200 per block). Seqs follow queue order: rows are appended to their target block's queue as the queuing blocks execute, and within one queuing block in the order of its successful precompile calls (tx order, then call order). The rows of block `N` come from `N - 1` (any kind), `N - K` (order kinds) and earlier blocks whose target was full. |
 | `kind` | `place_order`, `cancel_order`, `cancel_by_cloid`, `cancel_all`, `delegate`, `undelegate`, `claim_rewards`, `lock_permanent`, `claim_unbonded`, `lockbox_deposit`, `lockbox_withdraw`; `undecodable` for a row that did not decode; `unknown` for a code this node does not know. |
 | `trader` | The precompile caller (`msg.sender`, so a contract's address when a contract called it). `null` for `undecodable`. |
-| `queuedBlock` | The block whose EVM queued it (hex), normally `N - 1`. `null` for `undecodable`. |
+| `queuedBlock` | The block whose EVM queued it (hex): `N - 1` for staking and lockbox rows, `N - K` for order rows (K = `core_writer_order_delay`, default 10), earlier when a full block or an earlier order's target pushed the row on. `null` for `undecodable`. |
 | `status` | `executed`, `failed` or `rejected`. `rejected` is a CoreWriter order refused with a Hyperliquid `*Rejected` status (see `rejectStatus`), as for a native placement. |
 | `reason` | Stable lowercase reason (`margin`, `tick`, `ioc_cancel`, `other`, ...), as in `nativeActionFailures`. Absent for `executed`. |
 | `rejectStatus` | The HL `*Rejected` name. Present only for `rejected`. |
@@ -55,8 +66,9 @@ have no native action and no EVM tx.
 | `cloid` | The client order id the row carried: a `place_order` queued with one (the 7-argument `placeOrder`), or a `cancel_by_cloid`. `0x` + 32 hex digits, whatever the row's status (a placement refused as a duplicate shows the cloid it tried). Absent otherwise. |
 | `txHash`, `callIndex` | The EVM tx that queued the row, see below. |
 
-Failed rows include: the one-block delay guard (`action queued in block X
-cannot execute in block N`), an order type the queue cannot run (stop
+Failed rows include: the delay guard (`action queued in block X
+cannot execute in block N`, a row from the current or a later block; never
+expected), an order type the queue cannot run (stop
 types), a lockbox withdraw without enough native balance, a cancel of an
 order that does not exist (`cancel_order`, `cancel_by_cloid`), a placement
 whose cloid one of the caller's open orders already uses (reason
@@ -84,8 +96,8 @@ Each entry also carries the EVM tx whose precompile call queued the row:
 
 The link is not in the queue row (that is consensus state and stays
 unchanged). Execution writes it to a node-local index, `cf_core_writer_tx`,
-keyed like the queue row (`N ‖ seq`), in the same atomic batch as block
-`N - 1`'s EVM state and queue rows. It is written only for rows a successful
+keyed like the queue row (`N ‖ seq`), in the same atomic batch as the
+queuing block's EVM state and queue rows. It is written only for rows a successful
 tx queued, so a block that queues nothing writes nothing there. It is not in
 the state hash, and it is pruned with block `N`'s body.
 

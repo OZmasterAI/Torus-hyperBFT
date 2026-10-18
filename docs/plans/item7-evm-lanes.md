@@ -1,6 +1,6 @@
 # Item 7: EVM lanes (design, s99)
 
-Status: step 1 built (s123, see below); the rest is design. Owner decision s99: item 7 is its own
+Status: step 1 merged (853fed28, s123); step 2 built (s126, see below), not merged yet; step 3 is design. Owner decision s99: item 7 is its own
 item; design now, build after item 6 Phase 2 (before Phase 3 and before testnet; a block-format
 change needs a fresh genesis, which is free before testnet). Context: `item6-phase1-impl.md` 9.16.
 
@@ -16,7 +16,19 @@ the per-block EVM gas budget) go to the owner before building.
 `evm_block_interval`, genesis 3M / N = 5, governance keys `evm_block_gas_limit` (1M..=10M) and
 `evm_block_interval` (2..=100) switching at epoch boundaries, pre-vote cadence / count / 256 KiB caps,
 admission caps, lost-proposal reinsert, routing to the next EVM height's leader, RPC gas at the header
-limit, `getOrderBook` removed. Next: step 2.
+limit, `getOrderBook` removed. Next: step 2. Merged to main 853fed28 (s123).
+
+**Status s126: step 2 built** on `feat/item7-step2` (commit groups C1-C10), not merged yet (the merge waits for the
+4-validator devnet check and archy's native-only A/B, bench queue Q7). Design `item7-step2-design.md` (option A, owner
+decisions s123), plan `item7-step2-impl.md` (with the owner's build decisions s126). Big EVM heights at
+`height % M == 0` (header fields M, big gas limit, big base fee; genesis M = 0, big blocks off), per-height vote caps
+(small + big gas, 768 KiB at a big height), governance keys `evm_big_block_interval` (0 or 30..=10,000),
+`evm_big_block_gas_limit` (1M..=30M) and `core_writer_order_delay` (1..=100, default 10), `EvmUserModify` lanes with
+two EVM pools, fees per lane from each epoch's executed gas (F3, floor 1 gwei), `TORUS_EVM_BLOCK_GAS_BUDGET` without a
+default (small lane only), routing with upcoming N/M, an in-flight filter and up to 8 re-sends, CoreWriter order
+delay K and a 200-row drain cap, the bbo reader at 0x080e (16,440 gas), RPC per lane (`torus_bigBlockGasPrice`,
+`torus_usingBigBlocks`, `eth_feeHistory` `blockType`). Operator view: `docs/configuration-reference.md`, "EVM blocks
+(item 7 step 2)". Next: step 3 (EVM isolation, after D1).
 
 **Owner decisions (s99):** the target is **option C** (HL-style small and big EVM blocks), built in
 two steps: step 1 = A + B (consensus EVM budget per block, EVM only every Nth block), then step 2 =
@@ -61,6 +73,11 @@ overlay / state layers first, both after item 6 Phase 5, which shares the EVM wr
   behaviour would change twice).
 - Also for step 2: HL delays CoreWriter order actions a few seconds so contracts cannot bypass the L1 mempool; ours
   wait one block (~0.3 s).
+- **Design s127: `item7-step3-design.md`**, revision 2 after two adversarial reviews (after Q5, section 80: -12.4%
+  matched/s from the barrier). The overlay step alone ("option 0") removes the barrier, changes nothing EVM-visible
+  (no genesis) and forces no extra checkpoint: EVM RPC follows the regular checkpoint. Same-block EVM -> native timing
+  (T, genesis-bound) comes after 0, with its own per-target slot range. HL order is a parity-only choice; C can be
+  semantics-neutral (C0, parked). Option S (raise N) is measured by bench Q12 first. Owner questions in its section 7.
 
 ## 1. Problem
 

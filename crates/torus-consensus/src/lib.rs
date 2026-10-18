@@ -18,7 +18,7 @@ pub mod shard_recovery;
 pub mod slashing;
 pub mod state_hash;
 
-pub use app::{LeaderState, NativeDaFetcher, PreProposalBundle, TorusApp};
+pub use app::{EvmForward, LeaderState, NativeDaFetcher, PreProposalBundle, TorusApp};
 pub use genesis::GenesisConfig;
 pub use kv_store::RocksKVStore;
 pub use network::ChannelNetwork;

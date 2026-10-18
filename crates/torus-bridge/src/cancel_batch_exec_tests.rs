@@ -7,8 +7,8 @@ use crate::state_root::compute_native_state_root;
 use alloy_primitives::U256;
 use torus_core::position::NativeBalance;
 use torus_state::cf::{
-    CF_BOOK_ORDER_ROWS, CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS,
-    CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
+    CF_BOOK_ORDER_ROWS, CF_NATIVE_BALANCES, CF_NATIVE_BBO, CF_NATIVE_MARKETS,
+    CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS, CF_NATIVE_TRADES, CF_NATIVE_USER_TRADES,
 };
 use torus_types::{OrderType, PlaceOrderParams, TimeInForce};
 
@@ -315,6 +315,8 @@ fn run_observed_par(
         CF_NATIVE_TRADES,
         CF_NATIVE_USER_TRADES,
         CF_BOOK_ORDER_ROWS,
+        // Item 7 step 2 B16: the bbo row of every dirty market.
+        CF_NATIVE_BBO,
     ] {
         for (k, v) in ctx.state.iterate_cf(cf, None).expect("iterate cf") {
             cf_dump.push((cf.to_string(), k, v));
@@ -1679,6 +1681,70 @@ fn parallel_cancel_all_counts_visited_and_hit_books() {
         assert_eq!(ctx.order_books[&2].open_order_count(&addr(1)), 0, "{what}");
         assert_eq!(ctx.order_books[&3].pending_stop_count(), 0, "{what}");
         assert!(assert_index_covers_books(&ctx, &what));
+    }
+}
+
+/// Merge of main (parallel cancel-all) into item 7 step 2 (B16): the books a parallel
+/// cancel-all run empties get their bbo rows deleted at the save, the books it leaves
+/// non-empty carry their new top of book, exactly as the dirty marks of the serial pass
+/// (the differential tests above also compare `CF_NATIVE_BBO`, serial vs parallel).
+#[test]
+fn parallel_cancel_all_writes_the_bbo_rows_of_its_books() {
+    let bbo_rows = |ctx: &NativeExecContext| -> Vec<(Vec<u8>, Vec<u8>)> {
+        ctx.state
+            .iterate_cf(CF_NATIVE_BBO, None)
+            .expect("iterate bbo")
+    };
+    let blocks = long_emptying_run_blocks();
+    assert_eq!(blocks.len(), 2, "setup + one emptying run");
+    for mode in [
+        BookMode::Classic,
+        BookMode::OrderRows,
+        BookMode::LevelAuthority,
+        BookMode::LevelAuthorityChunked,
+    ] {
+        let what = format!("{mode:?}");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut ctx = new_ctx(&dir, mode);
+        ctx.cancel_all_workers = 4;
+        ctx.cancel_all_min_visits = 0;
+
+        NativeExecutor::execute_batch_cancel_mode(&mut ctx, &blocks[0], true);
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        ctx.save_order_books();
+        ctx.dirty_books.clear();
+        let keys: Vec<Vec<u8>> = bbo_rows(&ctx).into_iter().map(|(k, _)| k).collect();
+        let want: Vec<Vec<u8>> = MARKETS.iter().map(|m| m.to_be_bytes().to_vec()).collect();
+        assert_eq!(keys, want, "{what}: every setup book has a bbo row");
+
+        NativeExecutor::execute_batch_cancel_mode(&mut ctx, &blocks[1], true);
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        assert_eq!(
+            ctx.test_cancel_all_parallel_runs, 1,
+            "{what}: the run used the pool"
+        );
+        let mut dirty: Vec<_> = ctx.dirty_books.iter().copied().collect();
+        dirty.sort_unstable();
+        assert_eq!(dirty, MARKETS.to_vec(), "{what}: every book was hit");
+        ctx.save_order_books();
+        assert!(ctx.fatal_error.is_none(), "{what}: {:?}", ctx.fatal_error);
+        // The row of each book as its top now stands; an empty book has none.
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = ctx
+            .order_books
+            .iter()
+            .map(|(m, b)| (*m, b.bbo_row()))
+            .filter(|(_, r)| *r != [0u8; 32])
+            .map(|(m, r)| (m.to_be_bytes().to_vec(), r.to_vec()))
+            .collect();
+        want.sort_unstable();
+        let got = bbo_rows(&ctx);
+        assert_eq!(got, want, "{what}: bbo rows follow the books");
+        for m in [1u64, 3, 4] {
+            assert!(
+                !got.iter().any(|(k, _)| *k == m.to_be_bytes()),
+                "{what}: emptied book {m} keeps no bbo row"
+            );
+        }
     }
 }
 

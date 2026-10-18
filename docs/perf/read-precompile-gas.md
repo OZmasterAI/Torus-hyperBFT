@@ -5,7 +5,10 @@
 >
 > Item 7 step 1 (owner s122, built s123) removed `getOrderBook` from 0x0800: its selector reverts
 > for the base gas, like `getOpenOrders`. The getOrderBook measurements below are history. See
-> the last section, "Item 7 step 1: getOrderBook removed".
+> the section "Item 7 step 1: getOrderBook removed".
+>
+> Item 7 step 2 (owner s125, built s126) adds the best bid / ask reader `bbo(bytes32)` at 0x080e
+> for 16,440 gas; see the last section, "Item 7 step 2: bbo at 0x080e".
 
 ozarchy, 2026-10-07. Bench `crates/torus-bridge/tests/ubench_read_precompile_gas.rs`
 (branch `bench/read-precompile-gas`, base `98f035ee`). Release, `-C force-frame-pointers=yes`,
@@ -550,3 +553,32 @@ s99 removal of getOpenOrders).
 * The s100 decision "before mainnet: getOrderBook answers from the in-memory book" no longer
   concerns the precompile. Step 2 adds an HL-style best bid / ask read instead
   (`docs/plans/item7-evm-lanes.md`, owner decisions s122).
+
+## Item 7 step 2: bbo at 0x080e (owner s125, built s126)
+
+Branch `feat/item7-step2`, plan `docs/plans/item7-step2-impl.md` tasks B16-B17 (owner decision
+3: HL's bbo address with our metering; open question 1 answered 16,440).
+
+* **0x080e `bbo(bytes32 marketId) -> (uint128 bid, uint128 ask)`**: the market's best bid and
+  ask, FixedPoint raw, 0 for an empty side or an unknown market. A reader like 0x0800-0x0803
+  (`is_reader_precompile`, `ALL_PRECOMPILE_ADDRESSES`, `precompile_gas` = the base), also in
+  `eth_call`.
+* **Gas: 16,440** = base 16,400 (its one point read included, like `getPrice` and
+  `getPosition`) + 2 returned words x 20. No row charge: the plan's 16,940 (the row charged
+  like a scanned row) was dropped by the owner (s125). Pinned by
+  `crates/torus-evm/tests/evm_tests.rs` `bbo_call_costs_exactly_16440_gas` (intrinsic + 16,440
+  through the EVM) and `crates/torus-core/tests/precompile_tests.rs`
+  `bbo_reads_the_rows_bid_and_ask`, `bbo_is_a_reader_at_0x080e`.
+* **Source:** one point read of `cf_native_bbo` (key market id, 8 BE; value best bid raw ‖ best
+  ask raw, i128 BE each). The executor writes it at block end for every market whose book
+  changed, in every book mode and both save paths (`save_order_books`,
+  `save_order_books_deferred`); an emptied book deletes its row, and a node-local
+  `OrderBook::saved_bbo` skips the put when the top of the book did not move. The column family
+  is node-written and not hashed, so a failed read or a row that is not 32 bytes is a
+  `PrecompileLocalFault` (the node fail-stops), never zeros and never a revert.
+* **Cost not measured yet:** the bbo read is one point read, priced like the other point readers
+  measured above; the bbo writes are on the native save path, and archy's native-only A/B
+  measures them before the merge (`docs/perf/item7-step2-native-ab.md`, bench queue Q7).
+* The call shape is ours, not HL's (HL's 0x080e takes `abi.encode(uint64 asset)` with no selector
+  and returns `(uint64 bid, uint64 ask)`), so HL contracts need porting (market ids and price
+  units differ anyway).

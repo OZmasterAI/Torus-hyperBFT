@@ -361,6 +361,13 @@ pub struct WorkerGate {
     fail_next: AtomicBool,
     /// Heights W has received (passed the gate) — observability for tests.
     received: Mutex<Vec<u64>>,
+    /// s64 seam: park W inside its failure latch, between the two stores
+    /// (see [`latch_failstop`]), until `release`.
+    #[cfg(test)]
+    hold_latch: AtomicBool,
+    /// W is parked at the latch seam.
+    #[cfg(test)]
+    latch_parked: AtomicBool,
 }
 
 impl WorkerGate {
@@ -376,6 +383,8 @@ impl WorkerGate {
         let mut held = self.held.lock().unwrap();
         *held = false;
         self.hold_ckpt.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        self.hold_latch.store(false, Ordering::SeqCst);
         drop(held);
         self.cv.notify_all();
     }
@@ -395,6 +404,29 @@ impl WorkerGate {
 
     pub fn fail_next(&self) {
         self.fail_next.store(true, Ordering::SeqCst);
+    }
+
+    /// s64 seam: park W between the two stores of its failure latch until
+    /// `release`.
+    #[cfg(test)]
+    pub fn hold_latch(&self) {
+        let _held = self.held.lock().unwrap();
+        self.hold_latch.store(true, Ordering::SeqCst);
+    }
+
+    /// W is parked at the latch seam (`hold_latch`).
+    #[cfg(test)]
+    pub fn latch_parked(&self) -> bool {
+        self.latch_parked.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn latch_seam(&self) {
+        let mut held = self.held.lock().unwrap();
+        while self.hold_latch.load(Ordering::SeqCst) {
+            self.latch_parked.store(true, Ordering::SeqCst);
+            held = self.cv.wait(held).unwrap();
+        }
     }
 
     pub fn received(&self) -> Vec<u64> {
@@ -751,16 +783,14 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
                      already have executed its successor on top of it; latching fail-stop (restart \
                      replays from the durable marker)"
                 );
-                shared.failed.store(true, Ordering::SeqCst);
-                env.exec_failed.store(true, Ordering::SeqCst);
+                latch_failstop(&env, &shared);
                 release_checkpoint(&shared);
                 finish_job(&shared, &env.metrics);
                 return;
             }
             Err(_) => {
                 tracing::error!(height, "FATAL: flush worker PANICKED — latching fail-stop");
-                shared.failed.store(true, Ordering::SeqCst);
-                env.exec_failed.store(true, Ordering::SeqCst);
+                latch_failstop(&env, &shared);
                 release_checkpoint(&shared);
                 finish_job(&shared, &env.metrics);
                 return;
@@ -768,6 +798,21 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         }
     }
     tracing::info!("flush worker thread shutting down");
+}
+
+/// W's failure latch (write error or panic). Order matters: the shared
+/// `exec_failed` fail-stop FIRST, then W's own latch, so anyone who sees
+/// `failed()` (`wait_idle`, `submit`) also sees `exec_failed` (s64: the
+/// reverse order let `wait_idle` return with `exec_failed` still false when
+/// W was preempted between the stores). The flags stay separate: E's paths
+/// latch `exec_failed` themselves; `failed` is W's own state.
+fn latch_failstop(env: &WorkerEnv, shared: &Shared) {
+    env.exec_failed.store(true, Ordering::SeqCst);
+    #[cfg(test)]
+    if let Some(g) = &env.gate {
+        g.latch_seam();
+    }
+    shared.failed.store(true, Ordering::SeqCst);
 }
 
 enum JobError {
@@ -1315,6 +1360,56 @@ mod tests {
                 .is_err(),
             "no job may be accepted after the latch"
         );
+    }
+
+    /// s64: whoever sees W's latch (`failed()`, hence `wait_idle`/`submit`)
+    /// must already see the shared `exec_failed` fail-stop. W used to store
+    /// its own latch first, so a caller could return from `wait_idle` and read
+    /// `exec_failed == false` (the "crash at N latched" flake under load).
+    /// The seam parks W between its two stores, which makes the window
+    /// deterministic.
+    #[test]
+    fn failed_latch_implies_exec_failed_visible() {
+        let gate = WorkerGate::new();
+        let (env, _dir) = temp_env(Some(gate.clone()));
+        let exec_failed = env.exec_failed.clone();
+        let worker = Arc::new(FlushWorker::spawn(env, 0));
+        gate.hold_latch();
+        gate.fail_next();
+        worker
+            .submit(Job::Marker {
+                height: 1,
+                pending: Arc::new(FrozenPending::marker_only(1)),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !gate.latch_parked() {
+            assert!(std::time::Instant::now() < deadline, "W never reached the latch seam");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // W is between its two stores.
+        assert!(
+            !worker.failed() || exec_failed.load(Ordering::SeqCst),
+            "failed() visible before the shared exec_failed fail-stop"
+        );
+        // The flake's shape: `wait_idle` must not report the failure before
+        // `exec_failed` is set. Give it a bounded chance to return early.
+        let w2 = worker.clone();
+        let ef = exec_failed.clone();
+        let waiter = std::thread::spawn(move || {
+            let healthy = w2.wait_idle();
+            (healthy, ef.load(Ordering::SeqCst))
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while !waiter.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        gate.release();
+        let (healthy, latched) = waiter.join().unwrap();
+        assert!(!healthy, "wait_idle must report the failure");
+        assert!(latched, "wait_idle returned before exec_failed was latched");
+        assert!(worker.failed());
+        assert!(exec_failed.load(Ordering::SeqCst));
     }
 
     /// R01b follow-up: once the shared fail-stop is set from outside W (e.g.

@@ -763,12 +763,21 @@ impl<T: StateBackend> GovernanceManager<T> {
                     });
                 }
             }
-            // Item 7 step 1: copied into the next epoch plan (torus_economics::epoch_plan).
-            torus_types::EVM_BLOCK_GAS_LIMIT_PARAM | torus_types::EVM_BLOCK_INTERVAL_PARAM => {
-                let range = if key == torus_types::EVM_BLOCK_GAS_LIMIT_PARAM {
-                    torus_types::EVM_BLOCK_GAS_LIMIT_RANGE
-                } else {
-                    torus_types::EVM_BLOCK_INTERVAL_RANGE
+            // Item 7 steps 1-2: copied into the next epoch plan (torus_economics::epoch_plan),
+            // or read when a CoreWriter row is queued (the order delay).
+            torus_types::EVM_BLOCK_GAS_LIMIT_PARAM
+            | torus_types::EVM_BLOCK_INTERVAL_PARAM
+            | torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM
+            | torus_types::CORE_WRITER_ORDER_DELAY_PARAM => {
+                let range = match key {
+                    torus_types::EVM_BLOCK_GAS_LIMIT_PARAM => {
+                        torus_types::EVM_BLOCK_GAS_LIMIT_RANGE
+                    }
+                    torus_types::EVM_BLOCK_INTERVAL_PARAM => torus_types::EVM_BLOCK_INTERVAL_RANGE,
+                    torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM => {
+                        torus_types::EVM_BIG_BLOCK_GAS_LIMIT_RANGE
+                    }
+                    _ => torus_types::CORE_WRITER_ORDER_DELAY_RANGE,
                 };
                 let v: u64 = value
                     .parse()
@@ -780,6 +789,25 @@ impl<T: StateBackend> GovernanceManager<T> {
                     return Err(EconomicsError::InvalidParameterValue {
                         key: key.to_string(),
                         reason: format!("must be between {} and {}", range.start(), range.end()),
+                    });
+                }
+            }
+            torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM => {
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: "must be a valid u64".to_string(),
+                    })?;
+                if !torus_types::evm_big_block_interval_ok(v) {
+                    let r = torus_types::EVM_BIG_BLOCK_INTERVAL_RANGE;
+                    return Err(EconomicsError::InvalidParameterValue {
+                        key: key.to_string(),
+                        reason: format!(
+                            "must be 0 (big blocks off) or between {} and {}",
+                            r.start(),
+                            r.end()
+                        ),
                     });
                 }
             }

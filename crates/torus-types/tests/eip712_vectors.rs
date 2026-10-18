@@ -324,6 +324,18 @@ fn all_vectors() -> Vec<Vector> {
             },
         ),
         build_vector("DelistMarket", NativeAction::DelistMarket { market_id: 99 }),
+        build_vector(
+            "EvmUserModify_Big",
+            NativeAction::EvmUserModify {
+                using_big_blocks: true,
+            },
+        ),
+        build_vector(
+            "EvmUserModify_Small",
+            NativeAction::EvmUserModify {
+                using_big_blocks: false,
+            },
+        ),
         // Nested-struct variants: Phase B consumers need these too. TS MVP
         // can skip verifying these hashes until the parallel TS dispatcher
         // lands, but the fixture captures them so drift is caught.

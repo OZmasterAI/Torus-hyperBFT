@@ -142,8 +142,14 @@ python3 tools/matched-bench/test_harness.py
    kind, so "bench pool empty" is that proxy. `drain-feed-live.tsv` holds the
    per-sample exec lag and mean ms per native block (`torus_exec_chain_seconds`);
    `drain.json .feed_live` its summary over the final quiet window. The feed
-   is then paused and the default drain re-run (`feed-stop-settle/`, up to
-   60 s), so this step can take `DRAIN_TIMEOUT` + ~60 s.
+   is then paused and the default drain re-run (`feed-stop-settle/`) with
+   `--to-height auto`: it also waits until every node has executed the highest
+   committed height across the nodes at the pause, up to
+   `FEED_STOP_SETTLE_MAX_S` (default 600 s; a fixed 60 s before s64, which
+   ended mid catch-up on a 0.8 blocks/s chain). Missing the target exits 3 and
+   logs a WARNING with each node's executed height; the digest quiescence
+   check then decides. This step can take `DRAIN_TIMEOUT` +
+   `FEED_STOP_SETTLE_MAX_S`.
    **Liquidation stress** (all off by default; default cells unchanged):
    `LIQ_THIN=N` sets `available` to `LIQ_THIN_AVAIL` (default 1,000,000 TRS)
    for genesis notes `bulk-test 60` .. `bulk-test 60+N-1` before the genesis

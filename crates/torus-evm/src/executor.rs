@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, Bloom, B256, U256};
-use revm::context::result::{EVMError, ExecutionResult, HaltReason, Output};
+use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction, Output};
 use revm::context::{BlockEnv as RevmBlockEnv, TxEnv};
 use revm::database::states::bundle_state::BundleRetention;
 use revm::database::{BundleState, State};
@@ -70,6 +70,25 @@ impl<CTX> Inspector<CTX> for NativeJournalInspector {
     }
 }
 
+/// The EVM spec every execution here runs at (blocks, eth_call,
+/// eth_estimateGas).
+const EVM_SPEC: SpecId = SpecId::CANCUN;
+
+/// Least gas limit revm accepts for `tx` before execution, at the spec the
+/// executor runs: the intrinsic gas (21000 / 53000 base, calldata, access
+/// list, authorizations) and, from Prague, the EIP-7623 calldata floor.
+/// The same computation as revm's `validate_initial_tx_gas`, so a limit
+/// below it fails with `EvmError::IntrinsicGasTooLow` and one at or above
+/// it never does.
+pub fn intrinsic_gas(tx: &TxEnv) -> u64 {
+    let gas = revm::interpreter::instructions::calculate_initial_tx_gas_for_tx(tx, EVM_SPEC);
+    if EVM_SPEC.is_enabled_in(SpecId::PRAGUE) {
+        gas.initial_gas.max(gas.floor_gas)
+    } else {
+        gas.initial_gas
+    }
+}
+
 /// Default block gas limit (30M).
 pub const DEFAULT_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
@@ -93,6 +112,14 @@ impl Default for BlockEnvCfg {
             base_fee: 0,
         }
     }
+}
+
+/// Item 7 step 2: a block's big lane: its base fee and the senders that pay it (their
+/// `EvmUserModify` rows, read by the caller while big blocks are on). Default = one lane.
+#[derive(Clone, Debug, Default)]
+pub struct BigLane {
+    pub base_fee: u64,
+    pub senders: std::collections::HashSet<Address>,
 }
 
 /// Result of executing a single EVM transaction.
@@ -119,6 +146,11 @@ pub struct BlockExecResult {
     pub bundle: BundleState,
     /// Total gas consumed by all transactions in the block.
     pub gas_used: u64,
+    /// Item 7 step 2: gas used by big-lane txs (the rest is the small lane's).
+    pub big_gas_used: u64,
+    /// Item 7 step 2: the base-fee part of the fees, each tx at its lane's base fee:
+    /// `sum(gas_used * min(effective_gas_price, lane base fee))`.
+    pub fee_revenue: u128,
     /// Aggregate logs bloom for the block.
     pub logs_bloom: Bloom,
     /// Indices of input txs that were included (only differs from 0..N when
@@ -141,7 +173,8 @@ pub struct BlockExecResult {
 /// s114: the tx that queued one CoreWriter / lockbox queue row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoreWriterOrigin {
-    /// The row's target (drain) block: this block + 1.
+    /// The row's target (drain) block, the key's high 8 bytes. Item 7 step 2: K blocks
+    /// after this one for an order kind, one for any other, later if a block was full.
     pub target_block: u64,
     /// The row's sequence in the target block's queue.
     pub seq: u64,
@@ -209,7 +242,7 @@ impl EvmExecutor {
         let chain_id = self.chain_id;
         let ctx = Context::mainnet()
             .modify_cfg_chained(|cfg| {
-                cfg.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
+                cfg.set_spec_and_mainnet_gas_params(EVM_SPEC);
                 cfg.chain_id = chain_id;
                 if call_mode {
                     cfg.disable_base_fee = true;
@@ -228,7 +261,7 @@ impl EvmExecutor {
         // succeeds, so an EVM revert also reverts native side effects.
         let journal = NativeStateOverlay::new(state_db.clone());
         let precompiles = TorusPrecompiles::with_mode(
-            SpecId::CANCUN,
+            EVM_SPEC,
             journal.clone(),
             block_cfg.number,
             block_cfg.timestamp,
@@ -279,6 +312,25 @@ impl EvmExecutor {
         transactions: Vec<TxEnv>,
         skip_invalid: bool,
     ) -> Result<BlockExecResult, EvmError> {
+        self.execute_block_lanes(
+            state_db,
+            block_cfg,
+            transactions,
+            skip_invalid,
+            &BigLane::default(),
+        )
+    }
+
+    /// [`Self::execute_block`] with a big lane (item 7 step 2): a tx from `big.senders` runs at
+    /// `big.base_fee`, every other tx at `block_cfg.base_fee`.
+    pub fn execute_block_lanes(
+        &self,
+        state_db: &StateDb,
+        block_cfg: &BlockEnvCfg,
+        transactions: Vec<TxEnv>,
+        skip_invalid: bool,
+        big: &BigLane,
+    ) -> Result<BlockExecResult, EvmError> {
         let state = State::builder()
             .with_database_ref(state_db)
             .with_bundle_update()
@@ -287,7 +339,7 @@ impl EvmExecutor {
         let chain_id = self.chain_id;
         let ctx = Context::mainnet()
             .modify_cfg_chained(|cfg| {
-                cfg.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
+                cfg.set_spec_and_mainnet_gas_params(EVM_SPEC);
                 cfg.chain_id = chain_id;
             })
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
@@ -302,7 +354,7 @@ impl EvmExecutor {
         // commit) leaves no queued action behind.
         let journal = NativeStateOverlay::new(state_db.clone());
         let precompiles =
-            TorusPrecompiles::new(SpecId::CANCUN, journal.clone(), block_cfg.number, block_cfg.timestamp);
+            TorusPrecompiles::new(EVM_SPEC, journal.clone(), block_cfg.number, block_cfg.timestamp);
         // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
         let local_fault = precompiles.local_fault();
         let mut evm = ctx
@@ -317,10 +369,22 @@ impl EvmExecutor {
         let mut included_indices = Vec::with_capacity(transactions.len());
         let mut receipt_idx: usize = 0;
         let mut core_writer_origins = Vec::new();
+        let mut big_gas_used: u64 = 0;
+        let mut fee_revenue: u128 = 0;
 
         for (idx, tx) in transactions.into_iter().enumerate() {
             let max_fee = tx.gas_price;
             let priority_fee = tx.gas_priority_fee;
+            // Item 7 step 2: the tx runs at its lane's base fee (revm's per-tx block env).
+            let in_big_lane = big.senders.contains(&tx.caller);
+            let lane_base_fee = if in_big_lane {
+                big.base_fee
+            } else {
+                block_cfg.base_fee
+            };
+            if !big.senders.is_empty() {
+                evm.ctx.modify_block(|b| b.basefee = lane_base_fee);
+            }
 
             // T4.4: inspector path so writer-precompile side effects are checkpointed
             // per call frame (caught inner-frame reverts roll back their native writes).
@@ -336,6 +400,9 @@ impl EvmExecutor {
             };
             included_indices.push(idx);
             let gas_used = result.gas().used();
+            if in_big_lane {
+                big_gas_used += gas_used;
+            }
 
             cumulative_gas =
                 cumulative_gas
@@ -384,7 +451,9 @@ impl EvmExecutor {
             };
 
             let effective_gas_price =
-                calc_effective_gas_price(block_cfg.base_fee, max_fee, priority_fee);
+                calc_effective_gas_price(lane_base_fee, max_fee, priority_fee);
+            fee_revenue +=
+                u128::from(gas_used) * u128::from(effective_gas_price.min(lane_base_fee));
 
             receipts.push(Receipt {
                 tx_hash: B256::ZERO,
@@ -413,6 +482,8 @@ impl EvmExecutor {
             receipts,
             bundle,
             gas_used: cumulative_gas,
+            big_gas_used,
+            fee_revenue,
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,
@@ -438,7 +509,7 @@ impl EvmExecutor {
         let chain_id = self.chain_id;
         let ctx = Context::mainnet()
             .modify_cfg_chained(|cfg| {
-                cfg.set_spec_and_mainnet_gas_params(SpecId::CANCUN);
+                cfg.set_spec_and_mainnet_gas_params(EVM_SPEC);
                 cfg.chain_id = chain_id;
             })
             .modify_block_chained(|b| apply_block_env(b, block_cfg))
@@ -449,7 +520,7 @@ impl EvmExecutor {
         // F1 (s515): block-scoped, returned in `native_writes` (see `execute_block`).
         let journal = NativeStateOverlay::new(overlay.base().clone());
         let precompiles =
-            TorusPrecompiles::new(SpecId::CANCUN, journal.clone(), block_cfg.number, block_cfg.timestamp);
+            TorusPrecompiles::new(EVM_SPEC, journal.clone(), block_cfg.number, block_cfg.timestamp);
         // R02 branch 5: the provider's local-fault cell (see `local_fault_or`).
         let local_fault = precompiles.local_fault();
         let mut evm = ctx
@@ -464,6 +535,7 @@ impl EvmExecutor {
         let mut included_indices = Vec::with_capacity(transactions.len());
         let mut receipt_idx: usize = 0;
         let mut core_writer_origins = Vec::new();
+        let mut fee_revenue: u128 = 0;
 
         for (idx, tx) in transactions.into_iter().enumerate() {
             let max_fee = tx.gas_price;
@@ -531,6 +603,8 @@ impl EvmExecutor {
 
             let effective_gas_price =
                 calc_effective_gas_price(block_cfg.base_fee, max_fee, priority_fee);
+            fee_revenue +=
+                u128::from(gas_used) * u128::from(effective_gas_price.min(block_cfg.base_fee));
 
             receipts.push(Receipt {
                 tx_hash: B256::ZERO,
@@ -558,6 +632,8 @@ impl EvmExecutor {
             receipts,
             bundle,
             gas_used: cumulative_gas,
+            big_gas_used: 0,
+            fee_revenue,
             logs_bloom: block_bloom,
             included_indices,
             native_writes: journal,
@@ -659,9 +735,9 @@ fn calc_effective_gas_price(base_fee: u64, max_fee: u128, priority_fee: Option<u
 /// execution with a fatal error for exactly that reason), else the usual
 /// mapping ([`map_evm_err`]). The consensus app fail-stops on `LocalFault`
 /// only.
-fn local_fault_or<DB: core::fmt::Debug, TX: core::fmt::Debug>(
+fn local_fault_or<DB: core::fmt::Debug>(
     cell: &std::sync::OnceLock<String>,
-    err: EVMError<DB, TX>,
+    err: EVMError<DB, InvalidTransaction>,
 ) -> EvmError {
     match cell.get() {
         Some(msg) => EvmError::LocalFault(msg.clone()),
@@ -670,10 +746,26 @@ fn local_fault_or<DB: core::fmt::Debug, TX: core::fmt::Debug>(
 }
 
 /// Map a revm [`EVMError`] into our [`EvmError`].
-fn map_evm_err<DB: core::fmt::Debug, TX: core::fmt::Debug>(err: EVMError<DB, TX>) -> EvmError {
+///
+/// `EVMError::Database` is a read of THIS node's DB that failed inside revm:
+/// `DatabaseRef for StateDb` / `StateOverlay` only err on a RocksDB error or
+/// an undecodable local row (a missing block hash reads as zero). That is a
+/// local fault, never an outcome of the block: `EvmError::LocalFault`, so the
+/// consensus app fail-stops instead of running the block without its EVM
+/// writes on this node only. Every other revm error is deterministic and
+/// keeps its mapping. A gas limit below the intrinsic gas or the EIP-7623
+/// floor is `EvmError::IntrinsicGasTooLow` (same message as
+/// `InvalidTransaction`; eth_estimateGas raises the limit on it).
+fn map_evm_err<DB: core::fmt::Debug>(err: EVMError<DB, InvalidTransaction>) -> EvmError {
     match err {
+        EVMError::Transaction(
+            tx_err @ (InvalidTransaction::CallGasCostMoreThanGasLimit { .. }
+            | InvalidTransaction::GasFloorMoreThanGasLimit { .. }),
+        ) => EvmError::IntrinsicGasTooLow(format!("{tx_err:?}")),
         EVMError::Transaction(tx_err) => EvmError::InvalidTransaction(format!("{tx_err:?}")),
-        EVMError::Database(db_err) => EvmError::Internal(format!("database: {db_err:?}")),
+        EVMError::Database(db_err) => {
+            EvmError::LocalFault(format!("evm database read: {db_err:?}"))
+        }
         EVMError::Header(h_err) => EvmError::Internal(format!("header: {h_err:?}")),
         EVMError::Custom(msg) => EvmError::Internal(msg),
     }
@@ -717,5 +809,80 @@ mod tests {
         // Zero base fee: effective price equals min(priority_fee, max_fee).
         assert_eq!(calc_effective_gas_price(0, 100, Some(50)), 50);
         assert_eq!(calc_effective_gas_price(0, 0, Some(0)), 0);
+    }
+
+    type RevmErr = EVMError<torus_state::StateError, revm::context::result::InvalidTransaction>;
+
+    /// A revm `EVMError::Database` is a read of THIS node's DB that failed
+    /// (`DatabaseRef for StateDb` / `StateOverlay` only err on a RocksDB or
+    /// decode error of a local row; a missing block hash reads as zero): a
+    /// local fault, so the consensus app fail-stops. RED before: it mapped to
+    /// `EvmError::Internal`, which the app logs and skips the EVM section.
+    #[test]
+    fn revm_database_error_is_a_local_fault() {
+        let err: RevmErr = EVMError::Database(torus_state::StateError::MissingColumnFamily(
+            "cf_storage".into(),
+        ));
+        match map_evm_err(err) {
+            EvmError::LocalFault(msg) => {
+                assert!(msg.contains("cf_storage"), "{msg}");
+                assert!(msg.contains("evm database read"), "{msg}");
+            }
+            other => panic!("expected EvmError::LocalFault, got {other:?}"),
+        }
+        // No precompile fault recorded: the same through `local_fault_or`.
+        let cell = std::sync::OnceLock::new();
+        let err: RevmErr = EVMError::Database(torus_state::StateError::InvalidData(
+            "account data len 3 != 72".into(),
+        ));
+        assert!(matches!(
+            local_fault_or(&cell, err),
+            EvmError::LocalFault(_)
+        ));
+    }
+
+    /// Deterministic revm errors keep their mapping exactly (every validator
+    /// gets the same one for the same block): a tx error stays
+    /// `InvalidTransaction`, header and custom errors stay `Internal`.
+    #[test]
+    fn deterministic_revm_errors_keep_their_mapping() {
+        let tx: RevmErr =
+            EVMError::Transaction(revm::context::result::InvalidTransaction::NonceTooHigh {
+                tx: 5,
+                state: 0,
+            });
+        assert!(
+            matches!(map_evm_err(tx), EvmError::InvalidTransaction(m) if m.contains("NonceTooHigh"))
+        );
+        let header: RevmErr =
+            EVMError::Header(revm::context::result::InvalidHeader::PrevrandaoNotSet);
+        assert!(matches!(map_evm_err(header), EvmError::Internal(m) if m.starts_with("header: ")));
+        let custom: RevmErr = EVMError::Custom("precompile failed".into());
+        assert!(matches!(map_evm_err(custom), EvmError::Internal(m) if m == "precompile failed"));
+        // A gas limit below the intrinsic gas / the EIP-7623 floor is its
+        // own variant (eth_estimateGas raises the limit on it), with the
+        // same message.
+        for e in [
+            InvalidTransaction::CallGasCostMoreThanGasLimit {
+                initial_gas: 99_400,
+                gas_limit: 99_351,
+            },
+            InvalidTransaction::GasFloorMoreThanGasLimit {
+                gas_floor: 30_000,
+                gas_limit: 29_999,
+            },
+        ] {
+            let want = format!("invalid transaction: {e:?}");
+            let got = map_evm_err(RevmErr::Transaction(e));
+            assert!(matches!(got, EvmError::IntrinsicGasTooLow(_)), "{got:?}");
+            assert_eq!(got.to_string(), want);
+        }
+        // A recorded precompile fault still wins over the revm error.
+        let cell = std::sync::OnceLock::new();
+        cell.set("getPosition oracle read: x".to_string()).unwrap();
+        let custom: RevmErr = EVMError::Custom("precompile failed".into());
+        assert!(
+            matches!(local_fault_or(&cell, custom), EvmError::LocalFault(m) if m.starts_with("getPosition"))
+        );
     }
 }

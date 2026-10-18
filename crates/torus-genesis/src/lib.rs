@@ -149,10 +149,20 @@ pub struct EvmConfig {
     /// (`DEFAULT_EVM_BLOCK_INTERVAL`); 0 is refused.
     #[serde(default = "default_evm_block_interval")]
     pub block_interval: u64,
+    /// Item 7 step 2: M, big EVM blocks at `height % M == 0`; absent = 0 (off).
+    #[serde(default)]
+    pub big_block_interval: u64,
+    /// Item 7 step 2: the big lane's gas limit; absent = 10M.
+    #[serde(default = "default_evm_big_gas_limit")]
+    pub big_gas_limit: u64,
 }
 
 fn default_evm_block_interval() -> u64 {
     torus_types::DEFAULT_EVM_BLOCK_INTERVAL
+}
+
+fn default_evm_big_gas_limit() -> u64 {
+    torus_types::DEFAULT_EVM_BIG_GAS_LIMIT
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -699,6 +709,8 @@ impl Genesis {
             chain_name: self.chain_name.clone(),
             evm_gas_limit: self.evm.gas_limit,
             evm_block_interval: self.evm.block_interval,
+            evm_big_block_interval: self.evm.big_block_interval,
+            evm_big_gas_limit: self.evm.big_gas_limit,
             base_fee_per_gas: self.evm.base_fee_initial,
             epoch_length: self.consensus.epoch_length,
             max_validators: self.economics.validator.max_validators,
@@ -954,6 +966,32 @@ mod tests {
         assert!(matches!(err, GenesisError::InvalidEvm(_)), "{err}");
     }
 
+    /// Item 7 step 2: `evm.big_block_interval` (M) defaults to 0 (off) and
+    /// `evm.big_gas_limit` to 10M; both feed `ChainConfig`.
+    #[test]
+    fn big_block_values_default_off_and_feed_chain_config() {
+        let genesis = Genesis::from_json(&sample_genesis_json()).unwrap();
+        assert_eq!(
+            (genesis.evm.big_block_interval, genesis.evm.big_gas_limit),
+            (0, 10_000_000)
+        );
+        let config = genesis.chain_config();
+        assert_eq!(
+            (config.evm_big_block_interval, config.evm_big_gas_limit),
+            (0, 10_000_000)
+        );
+        let mut json: serde_json::Value = serde_json::from_str(&sample_genesis_json()).unwrap();
+        json["evm"]["big_block_interval"] = 190.into();
+        json["evm"]["big_gas_limit"] = 15_000_000u64.into();
+        let config = Genesis::from_json(&json.to_string())
+            .unwrap()
+            .chain_config();
+        assert_eq!(
+            (config.evm_big_block_interval, config.evm_big_gas_limit),
+            (190, 15_000_000)
+        );
+    }
+
     /// Item 7 step 1: every tracked genesis file ships the 3M EVM budget and
     /// N = 11 (s123 owner, was 5), spelled out in the file (not left to the
     /// serde default).
@@ -990,6 +1028,21 @@ mod tests {
             assert_eq!(
                 raw["evm"]["block_interval"], 11,
                 "{name}: field spelled out"
+            );
+            // Item 7 step 2: big blocks off (M = 0) and a 10M big lane, spelled out too.
+            assert_eq!(
+                raw["evm"]["big_block_interval"], 0,
+                "{name}: field spelled out"
+            );
+            assert_eq!(
+                raw["evm"]["big_gas_limit"], 10_000_000,
+                "{name}: field spelled out"
+            );
+            let config = genesis.chain_config();
+            assert_eq!(
+                (config.evm_big_block_interval, config.evm_big_gas_limit),
+                (0, 10_000_000),
+                "{name}"
             );
         }
     }

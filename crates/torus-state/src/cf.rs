@@ -160,6 +160,17 @@ pub fn oracle_signer_key(signer: &alloy_primitives::Address) -> [u8; 23] {
     key
 }
 
+/// Item 7 step 2: the EVM lane row in [`CF_NATIVE_ORACLE`]: `"lan" ‖ address(20)` -> `[1]` while
+/// the address uses big blocks (`EvmUserModify`); no row = the small lane. In this CF (like the
+/// `"sgn"` index) because the ingress view answers it (`read_view::INGRESS_CFS`): admission reads the
+/// lane without waiting for a checkpoint. Read by execution (fees), admission, routing and RPC.
+pub fn evm_lane_key(address: &alloy_primitives::Address) -> [u8; 23] {
+    let mut key = [0u8; 23];
+    key[..3].copy_from_slice(b"lan");
+    key[3..].copy_from_slice(address.as_slice());
+    key
+}
+
 // Native-action data-availability (DA) body store (Phase C: native-action DA)
 /// Durable native-action bodies keyed by 32-byte action-hash. Value: bincode(SignedNativeAction).
 ///
@@ -279,6 +290,13 @@ pub const CF_NATIVE_HASHED: &str = "cf_native_hashed";
 ///   the step due, review M2)
 pub const CF_NATIVE_LIQUIDATION: &str = "cf_native_liquidation";
 
+/// Item 7 step 2 (owner decision 3): the best bid / ask per market the 0x080e precompile reads.
+/// Key: market id (8 BE). Value: best bid raw (i128 BE) ‖ best ask raw (i128 BE), 0 for an empty
+/// side; no row while the book is empty. Written at block end for every market whose book changed.
+/// Derived from the book rows: neither hashed nor in the native root (an EVM read of a wrong row
+/// would change the hashed EVM state, so a divergence is still caught).
+pub const CF_NATIVE_BBO: &str = "cf_native_bbo";
+
 /// All column family names. RocksDB requires these at open time.
 pub const ALL_CF_NAMES: &[&str] = &[
     CF_ACCOUNTS,
@@ -329,6 +347,8 @@ pub const ALL_CF_NAMES: &[&str] = &[
     CF_BLOCK_ACTION_STATUS,
     CF_NATIVE_LIQUIDATION,
     CF_CORE_WRITER_TX,
+    // Append only: `intern_cf` ids are positional.
+    CF_NATIVE_BBO,
 ];
 
 #[cfg(test)]
@@ -346,5 +366,25 @@ mod oracle_signer_key_tests {
         assert_eq!(&k[3..], a.as_slice());
         assert_ne!(&k[..3], b"sub");
         assert_ne!(&k[..3], b"agg");
+    }
+}
+
+#[cfg(test)]
+mod evm_lane_key_tests {
+    use super::*;
+
+    /// Item 7 step 2: the EVM lane row key is `"lan" ‖ address`, 23 bytes, and shares no prefix
+    /// (not even the first byte) with the other `CF_NATIVE_ORACLE` rows `"sgn"`, `"sub"`, `"agg"`.
+    #[test]
+    fn evm_lane_key_layout() {
+        let a = alloy_primitives::Address::repeat_byte(0x5a);
+        let k = evm_lane_key(&a);
+        assert_eq!(k.len(), 23);
+        assert_eq!(&k[..3], b"lan");
+        assert_eq!(&k[3..], a.as_slice());
+        for other in [&b"sgn"[..], ORACLE_SUBMISSION_PREFIX, b"agg"] {
+            assert_ne!(k[0], other[0], "{other:?}");
+        }
+        assert_ne!(k, oracle_signer_key(&a));
     }
 }

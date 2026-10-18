@@ -31,6 +31,68 @@ pub const EPOCH_VSET_PREFIX: &[u8] = b"epoch_vset:";
 const PLAN_PREFIX: &[u8] = b"epoch_vset:plan:";
 const CURRENT_KEY: &[u8] = b"epoch_vset:current";
 
+/// Item 7 step 2 (F3): `CF_CONSENSUS_META` row of the gas the EVM blocks since the last boundary
+/// used: small lane ‖ big lane (u64 BE each). Hashed (`running_hash::META_CONSENSUS_PREFIXES`).
+pub const EVM_EPOCH_GAS_KEY: &[u8] = b"evm_epoch_gas";
+
+/// Item 7 step 2 (F3): the epoch's EVM gas so far, `(small, big)`; no row = `(0, 0)`.
+pub fn epoch_evm_gas<T: StateBackend>(state: &T) -> Result<(u64, u64)> {
+    let row = state.get_cf_raw(CF_CONSENSUS_META, EVM_EPOCH_GAS_KEY)?;
+    Ok(match row {
+        Some(v) if v.len() == 16 => (
+            u64::from_be_bytes(v[..8].try_into().expect("8 bytes")),
+            u64::from_be_bytes(v[8..].try_into().expect("8 bytes")),
+        ),
+        _ => (0, 0),
+    })
+}
+
+/// Item 7 step 2 (F3): add one block's EVM gas to the epoch row.
+pub fn add_epoch_evm_gas<T: StateBackend>(state: &T, gas: u64, big_gas: u64) -> Result<()> {
+    let (small, big) = epoch_evm_gas(state)?;
+    let mut v = [0u8; 16];
+    v[..8].copy_from_slice(&small.saturating_add(gas).to_be_bytes());
+    v[8..].copy_from_slice(&big.saturating_add(big_gas).to_be_bytes());
+    state.put_cf_raw(CF_CONSENSUS_META, EVM_EPOCH_GAS_KEY, &v)?;
+    Ok(())
+}
+
+/// Item 7 step 2 (F3): the base fees after the epoch `[from, to)` ran with `window` (its header
+/// values) and used `(gas, big_gas)`: EIP-1559 with the epoch as one block. A lane's gas limit is
+/// its limit times its EVM heights in the window (small lane: every EVM height, big ones included;
+/// big lane: big heights), so the target is half of it; at most +/-12.5% per epoch, never below
+/// `EVM_MIN_BASE_FEE`.
+pub fn next_base_fees(
+    window: &torus_types::EvmHeaderValues,
+    from: u64,
+    to: u64,
+    gas: u64,
+    big_gas: u64,
+) -> (u64, u64) {
+    let (mut evm_heights, mut big_heights) = (0u64, 0u64);
+    for h in from.max(1)..to {
+        if torus_types::is_evm_height(h, window.block_interval, window.big_block_interval) {
+            evm_heights += 1;
+        }
+        if torus_types::is_big_evm_height(h, window.big_block_interval) {
+            big_heights += 1;
+        }
+    }
+    let next = |used: u64, heights: u64, limit: u64, fee: u64| {
+        torus_types::eip1559::calc_next_block_base_fee(used, heights.saturating_mul(limit), fee)
+            .max(torus_types::EVM_MIN_BASE_FEE)
+    };
+    (
+        next(gas, evm_heights, window.gas_limit, window.base_fee),
+        next(
+            big_gas,
+            big_heights,
+            window.big_gas_limit,
+            window.big_base_fee,
+        ),
+    )
+}
+
 /// One validator of a planned set, exactly as installed in hotstuff.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PlanMember {
@@ -40,11 +102,33 @@ pub struct PlanMember {
     pub commission_bps: u16,
 }
 
-/// Item 7 step 1: EVM header values from `boundary` on (`None` = keep the parent's).
+/// Item 7 steps 1-2: EVM header values from `boundary` on (`None` = keep the parent's).
 #[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlanEvm {
     pub gas_limit: Option<u64>,
     pub block_interval: Option<u64>,
+    /// Item 7 step 2: M and the big lane's gas limit (governance), and both base fees (F3,
+    /// set by the previous boundary's execution, B9).
+    pub big_block_interval: Option<u64>,
+    pub big_gas_limit: Option<u64>,
+    pub base_fee: Option<u64>,
+    pub big_base_fee: Option<u64>,
+}
+
+impl PlanEvm {
+    /// The header values from this boundary on: each set value, else the parent's.
+    pub fn resolve(&self, parent: &torus_types::TorusBlockHeader) -> torus_types::EvmHeaderValues {
+        torus_types::EvmHeaderValues {
+            gas_limit: self.gas_limit.unwrap_or(parent.evm_gas_limit),
+            block_interval: self.block_interval.unwrap_or(parent.evm_block_interval),
+            big_block_interval: self
+                .big_block_interval
+                .unwrap_or(parent.evm_big_block_interval),
+            big_gas_limit: self.big_gas_limit.unwrap_or(parent.evm_big_gas_limit),
+            base_fee: self.base_fee.unwrap_or(parent.base_fee_per_gas),
+            big_base_fee: self.big_base_fee.unwrap_or(parent.big_base_fee_per_gas),
+        }
+    }
 }
 
 /// The validator set that takes effect at `boundary`, computed by the
@@ -277,12 +361,16 @@ impl EpochManager {
     /// The plan of the PREVIOUS boundary is pruned here, not the one just
     /// applied: consensus may still re-read `plan(height)` (re-validation of
     /// that boundary) until the next boundary executes.
+    /// Item 7 step 2 (F3): with `fee_window` (the closing epoch's EVM header values, i.e. the
+    /// boundary's parent header) the epoch's EVM gas row sets plan(`height + epoch_length`)'s
+    /// two base fees; the row is deleted either way.
     /// Returns the set installed at `height` (`None` = unchanged).
     pub fn execute_planned_rotation<T: StateBackend>(
         staking: &StakingManager<T>,
         max_validators: u32,
         height: u64,
         epoch_length: u64,
+        fee_window: Option<torus_types::EvmHeaderValues>,
     ) -> Result<Option<ValidatorSet>> {
         let mut installed = None;
         let previous = plan_key(height.saturating_sub(epoch_length));
@@ -320,7 +408,35 @@ impl EpochManager {
                 torus_types::EVM_BLOCK_INTERVAL_PARAM,
                 &torus_types::EVM_BLOCK_INTERVAL_RANGE,
             )?,
+            // Item 7 step 2: M is 0 (off) or in its range, so the range check is a predicate.
+            big_block_interval: gov(torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM, &(0..=u64::MAX))?
+                .filter(|&m| torus_types::evm_big_block_interval_ok(m)),
+            big_gas_limit: gov(
+                torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM,
+                &torus_types::EVM_BIG_BLOCK_GAS_LIMIT_RANGE,
+            )?,
+            base_fee: None,
+            big_base_fee: None,
         };
+        // Item 7 step 2 (F3): the epoch [height - L, height) sets plan(height + L)'s fees; its row
+        // starts over (this block's own EVM gas is added after, into the next epoch).
+        let (gas, big_gas) = epoch_evm_gas(staking.state())?;
+        if let Some(window) = fee_window {
+            let (fee, big_fee) = next_base_fees(
+                &window,
+                height.saturating_sub(epoch_length),
+                height,
+                gas,
+                big_gas,
+            );
+            next.evm.base_fee = Some(fee);
+            next.evm.big_base_fee = Some(big_fee);
+        }
+        if (gas, big_gas) != (0, 0) {
+            staking
+                .state()
+                .delete_cf_raw(CF_CONSENSUS_META, EVM_EPOCH_GAS_KEY)?;
+        }
         staking.put_epoch_rotation_plan(&next)?;
         Ok(installed)
     }
@@ -417,13 +533,13 @@ mod tests {
         for n in 1..=4 {
             put(&mgr, n, 100, ValidatorStatus::Active);
         }
-        let first = EpochManager::execute_planned_rotation(&mgr, 4, 4, 4).unwrap();
+        let first = EpochManager::execute_planned_rotation(&mgr, 4, 4, 4, None).unwrap();
         assert!(first.is_none(), "no plan for the first planned boundary");
         let plan8 = mgr
             .epoch_rotation_plan(8)
             .unwrap()
             .expect("plan for 8 stored");
-        let installed = EpochManager::execute_planned_rotation(&mgr, 4, 8, 4).unwrap();
+        let installed = EpochManager::execute_planned_rotation(&mgr, 4, 8, 4, None).unwrap();
         assert!(installed.is_some(), "bootstrap plan installs");
         assert_eq!(
             mgr.current_epoch_set().unwrap(),
@@ -443,7 +559,7 @@ mod tests {
             Some(plan8),
             "kept until 12 executes"
         );
-        EpochManager::execute_planned_rotation(&mgr, 4, 12, 4).unwrap();
+        EpochManager::execute_planned_rotation(&mgr, 4, 12, 4, None).unwrap();
         assert_eq!(
             mgr.epoch_rotation_plan(8).unwrap(),
             None,
@@ -482,7 +598,7 @@ mod tests {
         let genesis = EpochManager::compute_new_validator_set(&mgr, u32::MAX, 0).unwrap();
         mgr.record_genesis_epoch_set(&genesis).unwrap();
         put_evm_params(&mgr, b"5000000", b"10");
-        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4).unwrap();
+        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4, None).unwrap();
         let plan8 = mgr
             .epoch_rotation_plan(8)
             .unwrap()
@@ -492,9 +608,140 @@ mod tests {
             PlanEvm {
                 gas_limit: Some(5_000_000),
                 block_interval: Some(10),
+                ..PlanEvm::default()
             }
         );
         assert!(!plan8.changed, "EVM values leave the validator set alone");
+    }
+
+    /// Item 7 step 2 (F3): the epoch counts as one EIP-1559 block per lane: target = half the
+    /// lane's gas over its EVM heights in the window, +/-12.5% at most, never below 1 gwei.
+    #[test]
+    fn next_base_fees_follow_the_epochs_gas_per_lane() {
+        use torus_types::EVM_MIN_BASE_FEE;
+        let w = torus_types::EvmHeaderValues {
+            gas_limit: 3_000_000,
+            block_interval: 5,
+            big_block_interval: 50,
+            big_gas_limit: 10_000_000,
+            base_fee: 2_000_000_000,
+            big_base_fee: 2_000_000_000,
+        };
+        // [100, 200): 20 small-cadence heights (100 and 150 are big too), 2 big heights.
+        // Targets: 20 x 3M / 2 = 30M (small), 2 x 10M / 2 = 10M (big).
+        assert_eq!(
+            next_base_fees(&w, 100, 200, 30_000_000, 10_000_000),
+            (2_000_000_000, 2_000_000_000)
+        );
+        assert_eq!(
+            next_base_fees(&w, 100, 200, 60_000_000, 20_000_000),
+            (2_250_000_000, 2_250_000_000)
+        );
+        assert_eq!(
+            next_base_fees(&w, 100, 200, 0, 0),
+            (1_750_000_000, 1_750_000_000)
+        );
+        let low = torus_types::EvmHeaderValues {
+            base_fee: 1_000_000_000,
+            big_base_fee: 1_000_000_000,
+            ..w
+        };
+        assert_eq!(
+            next_base_fees(&low, 100, 200, 0, 0),
+            (EVM_MIN_BASE_FEE, EVM_MIN_BASE_FEE),
+            "floor"
+        );
+        let off = torus_types::EvmHeaderValues {
+            big_block_interval: 0,
+            ..w
+        };
+        assert_eq!(
+            next_base_fees(&off, 100, 200, 30_000_000, 5).1,
+            2_000_000_000,
+            "no big height: unchanged"
+        );
+        // M = 7, N = 5 over [1, 15): EVM heights 5, 7, 10, 14 (4), big 7, 14 (2).
+        let mixed = torus_types::EvmHeaderValues {
+            big_block_interval: 7,
+            ..w
+        };
+        assert_eq!(
+            next_base_fees(&mixed, 1, 15, 6_000_000, 10_000_000),
+            (2_000_000_000, 2_000_000_000)
+        );
+        // Gas over a lane's window limit (60M small, 20M big) counts as the limit: exactly +12.5%
+        // (unclamped: 2,500,000,000 and 2,375,000,000).
+        assert_eq!(
+            next_base_fees(&w, 100, 200, 90_000_000, 25_000_000),
+            (2_250_000_000, 2_250_000_000)
+        );
+        assert_eq!(
+            next_base_fees(&w, 100, 200, u64::MAX, u64::MAX),
+            (2_250_000_000, 2_250_000_000)
+        );
+        let top = torus_types::EvmHeaderValues {
+            base_fee: u64::MAX - 1,
+            big_base_fee: u64::MAX - 1,
+            ..w
+        };
+        assert_eq!(
+            next_base_fees(&top, 100, 200, 60_000_000, 20_000_000),
+            (u64::MAX, u64::MAX),
+            "saturates"
+        );
+    }
+
+    /// Item 7 step 2 (F3): execution of boundary H turns the epoch's EVM gas row into
+    /// plan(H + L)'s two base fees (with the closing epoch's header values) and deletes the row;
+    /// without a window the fees stay `None` and the row is still reset. The row is hashed
+    /// consensus state.
+    #[test]
+    fn boundary_turns_the_epoch_gas_into_plan_fees_and_resets_the_row() {
+        use torus_state::running_hash::{hashed_cf_id, key_is_hashed};
+        let meta = hashed_cf_id(CF_CONSENSUS_META).unwrap();
+        assert!(key_is_hashed(meta, EVM_EPOCH_GAS_KEY));
+        let window = torus_types::EvmHeaderValues {
+            gas_limit: 3_000_000,
+            block_interval: 1,
+            big_block_interval: 0,
+            big_gas_limit: 10_000_000,
+            base_fee: 2_000_000_000,
+            big_base_fee: 2_000_000_000,
+        };
+        for fee_window in [Some(window), None] {
+            let (_d, mgr) = setup();
+            for n in 1..=4 {
+                put(&mgr, n, 100, ValidatorStatus::Active);
+            }
+            let genesis = EpochManager::compute_new_validator_set(&mgr, u32::MAX, 0).unwrap();
+            mgr.record_genesis_epoch_set(&genesis).unwrap();
+            add_epoch_evm_gas(mgr.state(), 9_000_000, 0).unwrap();
+            assert_eq!(epoch_evm_gas(mgr.state()).unwrap(), (9_000_000, 0));
+            EpochManager::execute_planned_rotation(&mgr, 4, 4, 4, fee_window).unwrap();
+            let plan8 = mgr
+                .epoch_rotation_plan(8)
+                .unwrap()
+                .expect("plan for 8 stored");
+            if fee_window.is_some() {
+                // [0, 4) at N = 1: 3 EVM heights, target 4.5M, used 2x: +12.5%. M = 0: unchanged.
+                assert_eq!(plan8.evm.base_fee, Some(2_250_000_000));
+                assert_eq!(plan8.evm.big_base_fee, Some(2_000_000_000));
+            } else {
+                assert_eq!((plan8.evm.base_fee, plan8.evm.big_base_fee), (None, None));
+            }
+            assert_eq!(
+                epoch_evm_gas(mgr.state()).unwrap(),
+                (0, 0),
+                "{fee_window:?}"
+            );
+            assert_eq!(
+                mgr.state()
+                    .get_cf_raw(CF_CONSENSUS_META, EVM_EPOCH_GAS_KEY)
+                    .unwrap(),
+                None,
+                "row deleted"
+            );
+        }
     }
 
     /// No row, or a row outside its governance range (1M..=10M, 2..=100) or
@@ -517,13 +764,158 @@ mod tests {
             if let Some(v) = stored {
                 put_evm_params(&mgr, v.as_bytes(), v.as_bytes());
             }
-            EpochManager::execute_planned_rotation(&mgr, 4, 4, 4).unwrap();
+            EpochManager::execute_planned_rotation(&mgr, 4, 4, 4, None).unwrap();
             let plan8 = mgr
                 .epoch_rotation_plan(8)
                 .unwrap()
                 .expect("plan for 8 stored");
             assert_eq!(plan8.evm, PlanEvm::default(), "{stored:?}");
         }
+    }
+
+    /// Write the two big-lane governance rows (`CF_FEE_CONFIG`, decimal).
+    fn put_big_params(mgr: &StakingManager, big_block_interval: &[u8], big_gas_limit: &[u8]) {
+        let state = mgr.state();
+        state
+            .put_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::EVM_BIG_BLOCK_INTERVAL_PARAM.as_bytes(),
+                big_block_interval,
+            )
+            .unwrap();
+        state
+            .put_cf_raw(
+                CF_FEE_CONFIG,
+                torus_types::EVM_BIG_BLOCK_GAS_LIMIT_PARAM.as_bytes(),
+                big_gas_limit,
+            )
+            .unwrap();
+    }
+
+    /// Execute boundary 4 with both big-lane rows set (any may be unparsable)
+    /// and return plan(8)'s EVM values.
+    fn plan8_evm_with_big_params(big_block_interval: &str, big_gas_limit: &str) -> PlanEvm {
+        let (_d, mgr) = setup();
+        for n in 1..=4 {
+            put(&mgr, n, 100, ValidatorStatus::Active);
+        }
+        put_big_params(
+            &mgr,
+            big_block_interval.as_bytes(),
+            big_gas_limit.as_bytes(),
+        );
+        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4, None).unwrap();
+        mgr.epoch_rotation_plan(8)
+            .unwrap()
+            .expect("plan for 8 stored")
+            .evm
+    }
+
+    /// Item 7 step 2: execution of boundary H copies the governance big-lane
+    /// rows (M, big gas limit) into plan(H + L). RED before: the plan had no
+    /// big-lane values.
+    #[test]
+    fn plan_carries_governance_big_lane_params() {
+        let (_d, mgr) = setup();
+        for n in 1..=4 {
+            put(&mgr, n, 100, ValidatorStatus::Active);
+        }
+        let genesis = EpochManager::compute_new_validator_set(&mgr, u32::MAX, 0).unwrap();
+        mgr.record_genesis_epoch_set(&genesis).unwrap();
+        put_big_params(&mgr, b"190", b"15000000");
+        EpochManager::execute_planned_rotation(&mgr, 4, 4, 4, None).unwrap();
+        let plan8 = mgr
+            .epoch_rotation_plan(8)
+            .unwrap()
+            .expect("plan for 8 stored");
+        assert_eq!(plan8.evm.big_block_interval, Some(190));
+        assert_eq!(plan8.evm.big_gas_limit, Some(15_000_000));
+        assert_eq!(plan8.evm.gas_limit, None);
+        assert_eq!(plan8.evm.block_interval, None);
+        assert_eq!(plan8.evm.base_fee, None, "F3 (B9) sets the fees");
+        assert_eq!(plan8.evm.big_base_fee, None, "F3 (B9) sets the fees");
+        assert!(!plan8.changed, "EVM values leave the validator set alone");
+    }
+
+    /// M: 0 switches big blocks off (a value); 1..=29, above 10,000 or not a
+    /// number keep the chain's M. Big limit: outside 1M..=30M or not a number
+    /// keeps the chain's limit.
+    #[test]
+    fn plan_big_lane_values_outside_their_range_keep_the_chain_values() {
+        let m_cases = [
+            ("0", Some(0)),
+            ("30", Some(30)),
+            ("10000", Some(10_000)),
+            ("1", None),
+            ("29", None),
+            ("10001", None),
+            ("x", None),
+        ];
+        for (stored, want) in m_cases {
+            let evm = plan8_evm_with_big_params(stored, "x");
+            assert_eq!(evm.big_block_interval, want, "M {stored:?}");
+            assert_eq!(evm.big_gas_limit, None, "M {stored:?}");
+        }
+        let limit_cases = [
+            ("999999", None),
+            ("30000001", None),
+            ("x", None),
+            ("1000000", Some(1_000_000)),
+            ("30000000", Some(30_000_000)),
+        ];
+        for (stored, want) in limit_cases {
+            let evm = plan8_evm_with_big_params("x", stored);
+            assert_eq!(evm.big_gas_limit, want, "big limit {stored:?}");
+            assert_eq!(evm.big_block_interval, None, "big limit {stored:?}");
+        }
+    }
+
+    /// `PlanEvm::resolve` takes each set value, else the parent's.
+    #[test]
+    fn plan_resolve_takes_set_values_else_the_parents() {
+        let parent = torus_types::TorusBlockHeader {
+            height: 7,
+            parent_hash: alloy_primitives::B256::ZERO,
+            timestamp: 0,
+            proposer: Address::ZERO,
+            state_root: alloy_primitives::B256::ZERO,
+            receipts_root: alloy_primitives::B256::ZERO,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            evm_gas_used: 0,
+            evm_fee_revenue: 0,
+            evm_gas_limit: 3_000_000,
+            evm_block_interval: 11,
+            evm_big_block_interval: 50,
+            evm_big_gas_limit: 10_000_000,
+            native_action_count: 0,
+            evm_tx_count: 0,
+            base_fee_per_gas: 1_000_000_000,
+            big_base_fee_per_gas: 1_500_000_000,
+            epoch: 0,
+            validator_set_hash: alloy_primitives::B256::ZERO,
+            sig_attestation: [0u8; 64],
+        };
+        let plan = PlanEvm {
+            big_block_interval: Some(190),
+            base_fee: Some(2_000_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan.resolve(&parent),
+            torus_types::EvmHeaderValues {
+                gas_limit: 3_000_000,
+                block_interval: 11,
+                big_block_interval: 190,
+                big_gas_limit: 10_000_000,
+                base_fee: 2_000_000_000,
+                big_base_fee: 1_500_000_000,
+            }
+        );
+        assert_eq!(
+            PlanEvm::default().resolve(&parent),
+            torus_types::EvmHeaderValues::of(&parent),
+            "an empty plan keeps every parent value"
+        );
     }
 
     #[test]

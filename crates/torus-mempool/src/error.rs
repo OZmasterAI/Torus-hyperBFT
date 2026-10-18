@@ -72,6 +72,9 @@ pub enum MempoolError {
     /// Item 7 step 1: raw tx above the per-block EVM byte cap (256 KiB), so
     /// it could never be selected into a block.
     TxTooLarge { size: usize, max: usize },
+    /// Item 7 step 2: one lane per sender. The sender still has pooled EVM txs in its other
+    /// lane (its `EvmUserModify` row changed, or big blocks switched on, since they entered).
+    EvmLaneSwitchPending { sender: Address },
 }
 
 impl fmt::Display for MempoolError {
@@ -159,6 +162,11 @@ impl fmt::Display for MempoolError {
             Self::TxTooLarge { size, max } => {
                 write!(f, "oversized data: tx size {size}, limit {max}")
             }
+            Self::EvmLaneSwitchPending { sender } => write!(
+                f,
+                "sender {sender} still has pooled EVM txs in its other lane; \
+                 resend after they are included"
+            ),
         }
     }
 }

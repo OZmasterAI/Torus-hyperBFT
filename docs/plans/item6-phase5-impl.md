@@ -1,21 +1,29 @@
 # Implementation Plan: item 6 Phase 5 (full in-memory execution)
 
-Status: DRAFT, numbers pending Gate 3 (2026-10-14, s119). Nothing built. Section 7 decided (owner s122: 1 a, 2 a, 3 a, 4 a, 5 b, 6 a, 7 a, 8 a, 9 build for the gain).
+Status: PLAN, nothing built. Gate 3 met (section 65, s119); step 0 measured (section 81, s66); scope decided (owner
+s127): **build steps 1, 2, 3 and 7**; step 4 deferred, steps 5 and 6 decided later (section 1 "Scope (owner s127)").
+Section 7 decided (owner s122: 1 a, 2 a, 3 a, 4 a, 5 b, 6 a, 7 a, 8 a, 9 build for the gain).
 Parent design: `market-scaling-in-memory-design.md` Phase 5, section 4 (memory budget), section 5 rules 1, 2, 4, 5, 6,
 8, 9, D7 c, D10, D11 a, D12 b, D16. Short form: `item6-phases-2-5-plans.md` Phase 5. Format and base:
 `item6-phase4-impl.md` (and `item6-phase3-impl.md`).
 
 **Base: Phase 4, built first as Phase 5's base (owner s119, not folded in).** Phase 4 steps 1-4 go ahead; step 5 (the
 open-order counter) runs last and stays only on its own net A/B, otherwise it is dropped or moved here (optional step 4
-below). **Phase 4 is not built yet:** its step 1 has RED tests only (`feat/item6-phase4-step1` `da59b395`). Wherever
-this plan names `Users`, `UserState`, `ResidentSource` or typed loads, it means the shape in `item6-phase4-impl.md`
-section 3 and steps 1-4, not code. Those anchors are re-checked when Phase 4 merges.
+below). **Phase 4 is on main (s127 note):** steps 1-4 and 6 merged in s121 (`fd82758f` and earlier, D12 after it).
+Step 5 failed its own A/B (section 68: net exec ~0, matched/s -1.10% [-3.49, +1.30]) and stays on
+`feat/item6-phase4-step5` `6288ebe8`, unmerged: it is optional step 4 here. Wherever this plan names `Users`,
+`UserState`, `ResidentSource` or typed loads, it was written against the shape in `item6-phase4-impl.md` section 3
+and steps 1-4 before the merge; those anchors are re-checked against main before step 1.
+
+**Timing (s127, roadmap order s121):** the Phase 5 build starts after Q7 passes and item 7 step 2
+(`feat/item7-step2` `c567b1b3`) merges to main. This plan's `file:line` anchors are re-checked against main after that
+merge, before step 1 (not before: the merge moves them).
 
 **Code references are `file:line` on main `21d238e0`** (= origin/main). Crate paths are under `crates/`.
 
 Every number below is from the results doc (`docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md`, "section N"), from
-the code or from the Phase 4 plan, unless marked **(estimate)**. Placeholders that wait for Gate 3 are marked
-**TBD (Gate 3)**.
+the code or from the Phase 4 plan, unless marked **(estimate)**. The former **TBD (Gate 3)** placeholders are filled
+from Gate 3 (section 65).
 
 ## Design decision
 
@@ -54,19 +62,22 @@ the Phase 1 / 2 plans is also named Gate 3 (`item6-phase1-impl.md:349`, `item6-p
 | gate | target | measured by |
 |---|---|---|
 | final Gate 3 (1.4x) | matched/s >= 1.4x main `199bdc97` at 300 markets, oracle off primary, as shipped (oracle on) secondary, the Gate 3 recipe (ozarchy-g3s0) | step 7 |
-| phase gate vs Phase 4 | matched/s >= **TBD (Gate 3)** vs the Phase 4 head, derived as `1.4 / (r x (1 + p4)) - 1`. `r` = `d3cba5e2` / `199bdc97` from Gate 3; `p4` = the Phase 4 head vs `d3cba5e2` from Phase 4 step 6. Lower bound of the paired CI; native blocks/s no regression; no 10-market regression (same campaign, D15) | step 7 |
-| mechanism | exec `block_ms` down by >= **TBD (Gate 3)** ms per native block (the ms the phase gate needs, at +0.4-0.55% matched/s per ms, `item6-phase2-impl.md:55`); `torus_exec_cache_flush_seconds` and `torus_exec_save_books_seconds` ~0 for typed state; `end_resident` rows ms down | step 7 |
+| phase gate vs Phase 4 | **met by Gate 3 (section 65); Phase 5 is built for the gain (owner s122 decision 9).** Needed gain `g = 1.4 / (r x (1 + p4)) - 1`, `r` = `d3cba5e2` / `199bdc97` from Gate 3, `p4` = the Phase 4 head vs `d3cba5e2` from Phase 4 step 6. `r` = 1.931 [1.877, 1.985] oracle off (1.835 as shipped) >= 1.36, so `g` ~0 (below 0 for any `p4` >= 0). Step 7 reports the gain vs the Phase 4 head (lower bound of the paired CI); native blocks/s no regression; no 10-market regression (same campaign, D15) | step 7 |
+| mechanism | exec `block_ms` down per native block: the phase gate needs ~0 ms (met by Gate 3, section 65; ms = `g` / (+0.4-0.55% matched/s per ms), `item6-phase2-impl.md:55`). Phase 5 is built for the gain: the s127 scope targets at most ~46 ms oracle on / ~55 ms off (section 81, overlapping shares, upper bound **(estimate)**); `torus_exec_cache_flush_seconds` and `torus_exec_save_books_seconds` ~0 for typed state; `end_resident` rows ms down | step 7 |
 | CPU | node CPU-s/1M no regression beyond noise | step 7 |
-| crab overhead | engine ms per 1k fills oracle on <= +15% vs oracle off, same binary and campaign (decision 6; the base ratio on main is **TBD (Gate 3)**, from its two arms) | step 7 |
+| crab overhead | engine ms per 1k fills oracle on <= +15% vs oracle off, same binary and campaign (decision 6; base on main `d3cba5e2` from Gate 3's two M arms: 3.48 vs 3.33 ms per 1k fills, +4.5%, arm means without a CI, section 65.2) | step 7 |
 | correctness | full differential vs the Phase 4 path on long randomized sequences: identical rows, CF dumps, every `h_n` and every action result; serial and pipelined; interval 0 / 15 s / never; all BookModes; EVM blocks; goldens A and B unchanged; P1, P3, P5 (warm == cold), P7 green; `torus_exec_checkpoint_deferred_read_waits` stays 0; SIGKILL multi-crash replay identical | tests, steps 1-6; step 7 crash cells |
 | RAM per user | within section 4 (light ~2.4 KB, active ~21 KB incl. orders); Phase 4's record sizes unchanged or smaller | step 7 ubench |
 | genesis cell | 1M accounts / 1M resting orders: RSS per node **TBD** (section 4: ~8 GB of state for 1M mixed users **(estimate)**; the 1M-order cell has no number yet), restart -> ready <= 60 s | step 7 |
 | block time p99 | no regression vs the Phase 4 head beyond noise. Target and cause wait on the commit-interval p99 decomposition (section 9) | step 7 |
 | EVM / RPC | EVM, precompile and RPC suites green, unchanged | tests |
 
-**Why a TBD gate.** Gate 3 (campaign ozarchy-g3s0: `199bdc97` vs `d3cba5e2`, oracle off primary, as shipped
-secondary, an LD_PRELOAD-jemalloc arm) is running. It sets how far today's main is from 1.4x, and that distance sets
-how much Phase 5 must deliver.
+**Why the phase gate is met (was "Why a TBD gate").** Gate 3 (section 65, s119; campaign ozarchy-g3: `199bdc97`
+vs `d3cba5e2`, oracle off primary, as shipped secondary, an LD_PRELOAD-jemalloc arm) put main `d3cba5e2` at 1.931x
+[1.877, 1.985] of pre-item-6 `199bdc97` at 300 markets with the oracle off on both arms, and 1.835x [1.774, 1.898] as
+shipped (M oracle on vs G off). Confound (section 65): the bench binaries and the action mix differ (place share 0.28
+on G off vs 0.61 on M off; the mix is partly an outcome of node speed). So `r` >= 1.36 and the needed Phase 5 gain `g`
+~0: the 1.4x target is already met. Phase 5 is built for the gain (owner s122 decision 9), sized by step 0.
 
 **How much Phase 5 can remove (estimates from older builds; step 0 re-measures).** Exec wall is 244.4 ms per native
 block at ~49k fills on main `d3cba5e2` (section 64.2), ~217k matched/s, ~4.2 native blocks/s (section 64.1). Phase 4
@@ -86,6 +97,9 @@ Sum of plausibly removable items: ~25-45 ms per native block **(estimate)**, i.e
 thumb **(estimate)**. **Caveat (section 54):** exec time saved showed up as +11.3% native blocks/s with matched/s a
 tie in the closed-loop bench. The matched/s gate can lag the mechanism.
 
+The table above is from older builds. Step 0 (section 81, main `e3d11cb9`) replaces it: see step 0's "Measured" and
+"Scope (owner s127)" below.
+
 ### Scope by the Gate 3 gap (decision 9)
 
 Needed Phase 5 gain `g = 1.4 / (r x (1 + p4)) - 1`; ms per native block = `g / (0.4-0.55%)`. With `p4` = +3%
@@ -98,7 +112,20 @@ Needed Phase 5 gain `g = 1.4 / (r x (1 + p4)) - 1`; ms per native block = `g / (
 | ~1.15 | ~+18% | ~33-46 | medium: steps 1-6, all of them |
 | <= ~1.05 | >= ~+29% | >= ~54-74 | large: above what Phase 5 removes **(estimate)**. Owner picks: add exec-thread work outside item 6 (signature verify 11.5 ms per native block, section 59.3, off the exec thread; per-fill margin / settle cost), restate the target, or judge on blocks/s too |
 
-The `r` rows are examples, not predictions. The real row is chosen when Gate 3 reports.
+The `r` rows were examples, not predictions. **Gate 3 reported `r` = 1.931 (section 65): the >= 1.36 row applies**,
+`g` ~0. The owner did not stop: Phase 5 is built for the gain (decision 9), with the scope below.
+
+### Scope (owner s127, from step 0)
+
+**Build steps 1, 2, 3 and 7.** Step 4 is deferred, steps 5 and 6 are decided later (their step sections).
+- Steps 1-2 target cache `flush_all` (11%, 14-17 ms per native block), the overlay writes (`put_cf_raw*` 5.4%,
+  `merge_disjoint` 4%, `BTreeMap` insert 3.5-4%) and part of borsh (5%); step 3 targets `save_order_books` (6-7%).
+  Shares of exec on-CPU time, section 81.3; they overlap.
+- Gain, upper bound by the rule of thumb (+0.4-0.55% matched/s per ms): ~+18-25% at ~46 ms **(estimate)** (section 81's
+  upper bound with the oracle on; ~55 ms off). Realistically lower: the shares overlap, and saved exec time partly
+  shows as native blocks/s instead of matched/s (section 54 caveat).
+- Not in the plan and as big (section 81.5): Keccak 10-11% of exec (callers lost, asm without frame pointers) and
+  malloc / free 6%.
 
 ## 2. What changes vs the design doc (code check on main `21d238e0`)
 
@@ -146,16 +173,16 @@ Each task: test first (fails before), then code, then verify with
 `F="--cargo-quiet --status-level fail --final-status-level fail --hide-progress-bar"`.
 Before every commit: `cargo nextest run --workspace $F` and the doc-test command from `TESTING.md`.
 
-| step | what | size | who |
-|---|---|---|---|
-| 0 | re-profile the Phase 4 head; stop rule against the Gate 3 gap | S | archy |
-| 1 | typed write API + dirty sets + rows at freeze, shadow only; long differential harness | M | builder |
-| 2 | hot writers mutate `Users` in place; caches and their flush deleted; write-through; EVM fold | L | builder, then Codex torus-adversarial |
-| 3 | book rows from a dirty set (Classic) | M | builder, then Codex torus-adversarial |
-| 4 | (optional) open-order count in `UserState` from the book dirty sites | M | builder |
-| 5 | crab: summary updated inline per fill; summary slimmed for light users (owner s121) | M | builder |
-| 6 | (conditional) remaining hot overlay reads (oracle, markets) to typed tables | S | builder |
-| 7 | RAM ubench, 1M genesis cell, gate campaign incl. final Gate 3 (1.4x) | M | builder (ubench), archy (campaigns) |
+| step | what | size | who | status (owner s127) |
+|---|---|---|---|---|
+| 0 | re-profile the Phase 4 head; stop rule against the Gate 3 gap | S | archy | done (section 81); stop rule met |
+| 1 | typed write API + dirty sets + rows at freeze, shadow only; long differential harness | M | builder | build |
+| 2 | hot writers mutate `Users` in place; caches and their flush deleted; write-through; EVM fold | L | builder, then Codex torus-adversarial | build |
+| 3 | book rows from a dirty set (Classic) | M | builder, then Codex torus-adversarial | build |
+| 4 | (optional) open-order count: stored counter (option a) or a probe via `TraderMarkets` (option b, s127) | M | builder | deferred: decided after step 3 |
+| 5 | crab: summary updated inline per fill; summary slimmed for light users (owner s121) | M | builder | decided later (at or before step 7's campaign) |
+| 6 | (conditional) remaining hot overlay reads (oracle, markets) to typed tables | S | builder | decided later (needs a measurement) |
+| 7 | RAM ubench, 1M genesis cell, gate campaign incl. final Gate 3 (1.4x) | M | builder (ubench), archy (campaigns) | build |
 
 ### Step 0: re-profile (archy, measurement only, no code)
 
@@ -174,12 +201,32 @@ the exec-thread share and ms per native block of:
 - `open_order_counts` if Phase 4 step 5 was dropped (optional step 4);
 - 10-market cells for engine ms per 1k fills.
 
-Add the **commit-interval p99 decomposition** (section 9), queued for archy after Gate 3.
+Add the **commit-interval p99 decomposition** (section 9), queued for archy after Gate 3. Not run in Q8; it rides
+the step 7 gate campaign (owner s127).
 
-**Stop rule:** step 0's removable ms per native block x 0.4% must reach the ms the phase gate needs (**TBD (Gate 3)**,
-section 1 table). If it does not, the owner re-scopes (decision 9) before any code.
+**Stop rule:** step 0's removable ms per native block x 0.4% must reach the ms the phase gate needs (section 1
+table). If it does not, the owner re-scopes (decision 9) before any code. **Met:** the gate needs ~0 ms (Gate 3,
+section 65); step 0 measures up to ~46 ms (on) / ~55 ms (off) removable (below). The owner set the scope for the gain
+(s127, section 1 "Scope (owner s127)").
 
-**Measured:** TBD (step 0, after Phase 4 step 6 and Gate 3).
+**Measured (section 81):** archy s66, campaign ozarchy-q8p2, binary main `e3d11cb9`, hsdb-300m shape (Classic, 15 s
+checkpoints, 300 markets), oracle on vs off, 120 s cells, n = 2 per arm; profiled and unprofiled cells within noise
+(perf overhead within +-1%, 81.1). One host; ms from 499 Hz samples are estimates (section 81).
+- Exec thread on-CPU ~131 ms per native block oracle on / ~149 ms off, busy 75-80%.
+- Step 0 items as inclusive shares of exec on-CPU time (81.3): cache `flush_all` 11% (14-17 ms), `save_order_books`
+  6-7%, `put_cf_raw*` / `delete_cf_raw` 5.4%, borsh 5%, `merge_disjoint` 4%, `BTreeMap` insert 3.5-4%,
+  `open_order_counts` 1.1%, `BlockSums` / `sums_with_changes` and `diff_stop_rows` ~0. The shares overlap (borsh and
+  `BTreeMap` run inside the `put_cf_raw*` callers), so the removable total is below their sum of ~46 ms (on) /
+  ~55 ms (off) per native block (the upper bound).
+- Outside the plan's list: Keccak 10-11% (callers lost), malloc / free 6%. Liquidation 5.6-6.1% of exec on vs 1.7-1.8%
+  off. Residual untimed 13-16 ms (on) / 21-24 ms (off) per native block.
+- Off-CPU (81.4): exec is off-CPU 20-26% of wall, mostly waiting on its own worker pool (match setup ~1 s and
+  `run_jobs` ~0.6 s per 15 s), plus a ~1 s `pipeline_barrier` wait per 15 s window in 3 of 4 cells (archy's inference:
+  the epoch boundary with `TORUS_EPOCH_FAST_PATH` off; campaign A's F arm tests it). hotstuff-algo is blocked 9-35% of
+  wall sending into the full exec channel: the node is exec-bound.
+- Oracle off: +4.0% matched/s over all 8 cells (81.2).
+- Not covered: 10-market cells (engine ms per 1k fills), session reads / cold R-slot reads, the commit-interval p99
+  decomposition. They ride the step 7 gate campaign (owner s127, not run now).
 
 ### Step 1: typed writes and rows at freeze, shadow only
 
@@ -242,6 +289,10 @@ Consensus-adjacent write path. Codex torus-adversarial review before step 3.
   - `evm_then_native_same_key`: an EVM tx credits a balance and a native action in the same block trades on it. Rows
     and `h_n` equal the reference path.
   - EVM suites (`torus-evm`, precompile reader tests) green.
+- **Pending owner (note, not a decision; s127):** the item 7 step 3 design (branch `docs/item7-step3-design`
+  `3b79a617`, not on main) found that this task's premise, EVM txs writing native balances, does not hold: the writer
+  precompiles only queue CoreWriter rows, and the lockbox credit runs in the next block. It proposes shrinking Task
+  2.3. The owner has not decided; the task below is unchanged until then.
 - Code: while an EVM tx scope is open, typed-CF writes stay raw in the journalled pending map. They are folded into
   `Users` (apply + dirty, then removed from pending) after the block's EVM part, before the native batch, and at freeze.
 - Verify: `cargo nextest run -p torus-evm $F`, `cargo nextest run -E 'rdeps(torus-state)' $F`.
@@ -265,18 +316,38 @@ Codex torus-adversarial review before step 4.
   reference path and for modes 2/3.
 - Verify: `cargo nextest run -p torus-core $F`, `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
 
-### Step 4 (optional): open-order count in `UserState`
+### Step 4 (optional): open-order count
+
+**Deferred (owner s127):** decided after step 3, kept only on its own net A/B (the existing rule). Step 0 measured
+`open_order_counts` at 1.1% of exec (1.5-1.7 ms per native block, section 81.3).
 
 Only if Phase 4 step 5 was dropped or moved (owner s119) and step 0 still shows `open_order_counts` at a size worth it.
 Same keep rule as s119: kept only on its own net A/B (counter upkeep netted). Decision 5.
 **Moved here (owner s120):** Phase 4 step 5 (`6288ebe8`) had no net gain (section 68: walk saved -2.76 ms per 1k fills,
 counter read ~3.7 ms per native block); revisit after step 0, needs a cheaper counter read; drop if still no net gain.
 
+Why it matters: today's `open_order_counts` (`torus-core/src/order_book.rs:54`, called from `native_executor.rs`
+~10133) walks every book for the batch's senders, so its cost grows with markets x senders (1.1% at 300 markets,
+section 81).
+
+**Option a: stored counter in `UserState`** (Phase 4 step 5, `6288ebe8`; section 68: no net gain).
 - Test first: `open_order_count_in_user_equals_book_scan` (Phase 4 step 5's test), serial and with match workers.
 - Code: count deltas from the book dirty sites of step 3 (shared upkeep); `open_at_start` (:7019, :9762) reads the
   record; a cold rebuild recounts from the books.
 
+**Option b (s127): no stored counter; count via `TraderMarkets`.** The existing trader -> markets index
+(`native_executor.rs` ~3945) is carried with the resident books for cancel-all, never hashed or persisted, and a
+superset by contract (an extra entry costs one probe; a missing one is a bug). Each sender probes only the books it
+has orders in: O(senders x markets per sender) instead of the walk of every book. No new state, no upkeep beyond
+cancel-all's. Open checks before building it:
+- the index is built lazily at the first cancel-all after a load, so counting would have to build it first;
+- whether it covers pending stops, which the count includes.
+
 ### Step 5: crab summary updated inline per fill
+
+**Decided later (owner s127):** at the step 7 gate campaign or a short cell before it, by the crab-overhead check
+(engine ms per 1k fills oracle on <= +15% vs off, decision 6) and by whether the RAM slimming of the margin summary
+(moved here from Phase 4, owner s121) is wanted. `BlockSums` is ~0 of exec (section 81.3).
 
 - Test first: `inline_sums_equal_account_view_every_fill`. After every fill, at the block's mark version, the
   trader's summary equals `AccountView::build` (`torus-core/src/margin.rs:283`), bit-exact incl. `Err` (rule 8, owner
@@ -294,6 +365,9 @@ counter read ~3.7 ms per native block); revisit after step 0, needs a cheaper co
 
 ### Step 6 (conditional): typed oracle and market tables
 
+**Decided later (owner s127):** when a session-read / cold-R-slot measurement exists (Q8 did not cover it, section
+81.3). Archy runs it in the Phase 5 gate campaign (step 7) or a short cell before.
+
 Only if step 0 shows the cold R slots' reads at >= ~1% of exec wall **(estimate)**. Marks and market parameters as typed
 tables following their rows (rows stay raw writes; the table follows like Phase 4's `Users`).
 - Test first: `typed_marks_equal_oracle_rows_every_block`; P1 with moving marks.
@@ -308,6 +382,8 @@ tables following their rows (rows stay raw writes; the table follows like Phase 
   (as shipped).
 - Final Gate 3 (1.4x): Phase 5 head vs `199bdc97`, the ozarchy-g3s0 recipe (oracle off primary, as shipped secondary,
   LD_PRELOAD-jemalloc arm for `199bdc97`).
+- Riding this campaign (owner s127; not run in step 0, section 81.3): the 10-market cells (engine ms per 1k fills),
+  session reads (step 6's trigger) and the commit-interval p99 decomposition (section 9).
 - Report: matched/s, native blocks/s, `block_ms`, exec busy, engine ms per 1k fills and its phases, cache flush and
   save_books ms, `end_resident` ms, RSS mean / peak / slope and jemalloc allocated, CPU-s/1M, block time p50 / p99.
 
@@ -340,8 +416,12 @@ Not built by Phase 5. Decide each one once Phase 5's state model and first bench
    which Phase 5 makes cheap. Size it with an archy bench.
 3. **Propose-defer** (`exp/s123-propose-defer-on-exec-queue`, parked): read `torus_exec_queue_depth` and exec lag in
    Phase 5's first bench (hsdb-300m shape). Queue well under 64 with a lag of a few seconds: delete the branch. Queue
-   still about 64 with a lag over about 5 s: revive it (fix the two P2s, third Codex review, campaign B). Rule
-   also in `docs/perf/bench-queue.md` step 6.
+   still about 64 with a lag over about 5 s: revive it (fix the two P2s, third Codex review, campaign B). Campaign B
+   if revived (archy): its own campaign at the hsdb-300m shape on top of Phase 5, 3 arms: (a) base
+   (`TORUS_EXEC_QUEUE_DEPTH` and `TORUS_PROPOSE_EXEC_WATERMARK` absent); (b) control `TORUS_EXEC_QUEUE_DEPTH=16` (the
+   same short exec queue, still a blocking send); (c) `TORUS_PROPOSE_EXEC_WATERMARK=16`. Without (b), a gain cannot be
+   split between the deferral and the shorter queue. Metrics: `torus_exec_queue_depth` mean and max, view timeouts,
+   exec lag, matched/s (branch notes `/home/18c/projects/wt/exp-s123/propose-defer-on-exec-queue.md`).
 
 ## 6. Rollback
 
@@ -385,7 +465,8 @@ roll back one at a time; no data migration.
    (b) Optional step 4, sharing step 3's dirty sites, kept only on its own net A/B.
    Recommendation: b if Phase 4 step 5 failed only on upkeep cost (step 3 removes part of it); a if step 0 shows
    `open_order_counts` well under 1.45%.
-   **Decided: b** (owner s122).
+   **Decided: b** (owner s122). **s127:** step 0 shows 1.1% (section 81); step 4 is deferred until after step 3, with
+   two ways to build it (step 4: option a stored counter, option b probe via `TraderMarkets`).
 6. **Crab overhead gate ("<= +15% per fill vs the same phase without crab").**
    (a) Proxy: engine ms per 1k fills oracle on vs oracle off, same binary and campaign (Gate 3 already runs both).
    (b) Build a crab-free binary of the Phase 5 head (no longer a clean cut: crab is merged into main).
@@ -409,6 +490,8 @@ roll back one at a time; no data migration.
    **Decided (owner s119): build Phase 5 for the gain, not the gate** (~+10-25% matched/s **(estimate)**, the typed
    base for option D). Step 0 sizes what is built: only the items it measures as worth it. Block-time p99 (section
    66) is worked on in parallel by archy and is not a Phase 5 gate beyond "no regression".
+   **Scope from step 0 (owner s127, section 81): build steps 1, 2, 3 and 7**; step 4 deferred until after step 3;
+   steps 5 and 6 decided later (section 1 "Scope (owner s127)").
 
 ## 8. Risks
 
