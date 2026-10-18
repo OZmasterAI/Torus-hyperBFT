@@ -242,6 +242,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    wait per 15 s window, which section 81 put at ~1 s in 3 of 4 cells), `save_order_books`, `flush_all`, exec
    off-CPU share and hotstuff-algo blocked on the exec channel; plus exec ms per native block and per 1k fills. Say
    whether Phase 5's remaining scope (steps 3 and 7) still targets the biggest rows.
+8d. **Phase 5 step 2 A/B: main vs step 2** (owner s128; right after 8c; ~1 h 10). Does step 2 (`Users` mutated in
+   place, write-through, dirty-set drain) speed up execution in a real run? The builder's release microbench showed
+   the exec thread only level with Phase 4 (~160 ms per write set) and ~75 ms saved on the flush worker. Two binaries:
+   A = main `d3cab057` (step 2's base), B = `feat/item6-phase5-step2` `1e51c8b9` (Codex torus-adversarial round 2
+   approve; 10k differential 12 configurations no divergence). Both predate the new code defaults, so both arms set
+   `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1` and `TORUS_HASH_ONLY_PUSH_THRESHOLD=524288` by env; custody 0.
+   Standard load, 300 markets, Classic, 15 s checkpoints, oracle on, 600 s cells, warm-up then A B B A A B (n = 3).
+   Report paired ratios (as in 83.3) on matched/s, exec block_ms, exec ms per 1k fills, CPU-s per 1M, native
+   blocks/s, block p50 / p99, the flush-worker time per block, `flush_all` / `merge_disjoint` / `save_order_books`
+   ms per block if the timers exist, node RSS mean / max, and `torus_exec_evm_scope_typed_writes_total` (expect 0).
+   Rule: exec ms per 1k fills and CPU per fill must not regress (CI not above 1) for the merge; a gain decides
+   whether the drain encoding moves to the flush worker next.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
