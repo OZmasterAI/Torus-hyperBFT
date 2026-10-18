@@ -340,7 +340,18 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    on-CPU ms per 1k fills must fall (CI below 1), and native blocks/s, block p50 / p99 and timeouts per 1,000 blocks
    must not get worse; also report matched/s, CPU-s per 1M, fills per native block and the verify / sort / recovery
    phase timers if present.
-8h. **Deep-book follow-up to 8f** (owner s131; after 8g; ~1 h 30-2 h, estimate; a pre-testnet check). Section 93's
+8h. **RH4 GC cost at full load** (owner s131; right after 8g; ~1 h 15). Q9 (section 88) ran paced below capacity, so
+   it could not show a GC cost at saturation. RH4 is merged: main `687eac9e` (retention off by default; the GC runs
+   only with `--retention-blocks`). One binary built from `687eac9e` (code defaults, nothing set; 512 KB from `env.sh`;
+   custody 0). Arms: A = no retention; B = `TORUS_RETENTION_BLOCKS=1000` in the arm's `EXTRA_ENV` (`--extra-env`;
+   run-cell clears plain `TORUS_*` env). Standard unpaced load, 300 markets, 15 min cells (margin lasts ~21 min), warm-up
+   then A B B A (n = 2). The GC starts after `max(N, 1000) + 128` blocks (~1.5 min at ~13 blocks/s), so report the
+   window after the first GC pass. Judge by the exec-path merge rule above: native blocks/s, block p50 / p99 and
+   timeouts per 1,000 blocks must not get worse in B; also matched/s, CPU-s per 1M, `torus_da_gc_seconds` (mean, p99,
+   per block), `torus_da_gc_held_passes` by reason (expect ~0 outside start-up), bodies deleted, SST / data-dir
+   growth per arm. Not covered: the GC's tail decode with EVM txs (each pass decodes the 2-3 uncommitted tail blocks;
+   the standard load is native only).
+8i. **Deep-book follow-up to 8f** (owner s131; after 8h; ~1 h 30-2 h, estimate; a pre-testnet check). Section 93's
    M cell changed two things at once (1M accounts and 1M resting orders), and restarts ran only after the load. Same
    node binary as 8f (main `76204a69`, md5 `7f91438d`) so the cells line up with section 93; tools `c2336e70` or
    main if it has the pre-load by then; section 93's hand-written driver (`ozarchy-8f-b/campaign.sh`, per-cell genesis,
