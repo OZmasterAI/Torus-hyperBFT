@@ -303,6 +303,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    median worker starts 13-19% in. Upper bounds, ms per native block: skip the key pre-pass ~5.3, move the sort key
    upstream ~5.1-6.3, one absorb for both ~4.1-4.9, skip an empty `par_recover` 1.9-2.2, match / settle / cancel-all
    waits down to the slowest job 4.0-4.3 / 2.1-2.3 / 1.5-2.1. Owner / 18c: plan entry.
+8f. **1M-account RAM check** (owner s128; next while the queue is otherwise empty; item 6 Phase 5's revisit trigger 3
+   and a pre-testnet check; the genesis cell of Phase 5 step 7, run on main without Phase 5 steps 2-3). Binary built
+   from main `477ba3e5` or later (code defaults: PC 8, F on, re-send 250 ms; 512 KB from `env.sh`; custody off).
+   Genesis: 1M accounts with ~1M resting orders spread over the 300 markets (Phase 5 plan section 1 "genesis cell";
+   section 4 estimates ~8 GB of state for 1M mixed users; no number yet for 1M orders). If the genesis tooling cannot
+   produce this yet, report what is missing (generator, `FORCE=1` path, account keys, margin) before building
+   anything; 18c decides. Measure per node: RSS and jemalloc allocated at ready (after boot / load of genesis), during
+   10 min of the standard load, and after it; data dir size; boot -> ready time; restart -> ready after SIGTERM and
+   after SIGKILL (gate: <= 60 s) and replay correctness (AGREE, one digest); block p50 / p99 and matched/s during the
+   load window vs a 300-market standard cell on the same binary. One cell per kind is enough (n = 1): this is a
+   capacity check, not an A/B.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

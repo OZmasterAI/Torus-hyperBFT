@@ -393,6 +393,12 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   code, any writer). If nothing can create them, reject or normalize them on load so the case cannot happen;
   otherwise fix the merge so the parallel settle equals the serial one. Either way it changes consensus results for
   such rows, so it lands **after Phase 5 step 2 merges** (same code) and **before the testnet genesis**.
+- **EVM block proposer concentration (s128; item 7 option 0 plan, section 85 Q12 r1).** Leaders rotate by view; with
+  equal stake, an EVM interval N that is a multiple of the validator count (N = 11 with 11 validators, the default N
+  with an 11-validator testnet; N = 33 / 66 with 3) gives ONE validator every EVM block until a timeout shifts the
+  rotation. Not a throughput issue, but all EVM ordering (and its MEV) sits with one validator. Option 0 does not
+  change it. Decide before the testnet genesis: pick N coprime to the validator count, or rotate the EVM proposer by
+  EVM height instead of view (consensus change, genesis-bound).
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.
