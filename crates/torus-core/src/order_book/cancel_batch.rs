@@ -164,7 +164,7 @@ impl OrderBook {
     /// At most 32 index reads and one level lookup; no queue-position probes.
     /// A shallow first target intentionally leaves even a deep tail on the
     /// original path, rather than searching the whole trader list to qualify.
-    fn cancel_batch_has_concentrated_prefix(&self, order_ids: &[OrderId]) -> bool {
+    pub(super) fn cancel_batch_has_concentrated_prefix(&self, order_ids: &[OrderId]) -> bool {
         let Some(first) = order_ids.first().and_then(|id| self.order_index.get(id)) else {
             return false;
         };

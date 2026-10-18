@@ -25,9 +25,11 @@ use torus_state::action_status::FailureReason;
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
+mod classic_rows;
 mod cloid_key;
 mod trader_orders;
 
+pub use classic_rows::ClassicRowStats;
 pub use cloid_key::CloidKey;
 
 use trader_orders::TraderOrders;
@@ -40,6 +42,9 @@ mod account_margins_p1_tests;
 mod mark_charge_tests;
 #[cfg(test)]
 mod cloid_tests;
+// Item 6 Phase 5 step 3: Classic rows from the level dirty set.
+#[cfg(test)]
+mod classic_rows_tests;
 
 // perf/cloid-engine-cost fix 4.
 #[cfg(test)]
@@ -1306,6 +1311,13 @@ pub struct OrderBook {
     /// serialized; `None` after a load (the next save writes the row again;
     /// the CF is unhashed, so a repeated put changes nothing).
     saved_bbo: Option<[u8; 32]>,
+
+    // ---- Item 6 Phase 5 step 3: Classic rows (in-RAM only) ----
+    /// The kept encoding of every price level for [`Self::classic_row`]
+    /// (`order_book/classic_rows.rs`); `None` = not built (a new or loaded
+    /// book, or dropped by a level-journal drain other than
+    /// `classic_row`'s). Never serialized, hashed or read by matching.
+    classic_rows: Option<Box<classic_rows::ClassicRowCache>>,
 }
 
 /// s120 (Codex r2): [`OrderBook::log_mark`]: which in-memory book, and how
@@ -1411,6 +1423,7 @@ impl OrderBook {
             instance: BookInstance::fresh(),
             log_drains: 0,
             saved_bbo: None,
+            classic_rows: None,
         }
     }
 
@@ -4703,6 +4716,7 @@ impl BorshDeserialize for OrderBook {
             instance: BookInstance::fresh(),
             log_drains: 0,
             saved_bbo: None,
+            classic_rows: None,
         };
 
         for _ in 0..order_count {
