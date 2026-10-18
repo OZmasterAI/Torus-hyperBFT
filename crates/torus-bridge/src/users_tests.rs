@@ -3259,37 +3259,53 @@ fn ubench_drain_per_block() {
         bal.insert(t.to_vec(), bal_bytes(&balance(1_000_000 + i as u64)));
         bal.insert(cum_volume_key(t).to_vec(), volume_bytes(5_000 + i as u64));
     }
-    // The block: 50k distinct position keys, 20k balances, 20k volumes.
-    let mut keys: BTreeSet<(Address, MarketId)> = BTreeSet::new();
+    // The block: 50k distinct position keys (60% updates of held positions,
+    // 10% closes of held ones, 30% opens), 20k balances, 20k volumes.
+    let held: Vec<(Address, MarketId)> = pos.keys().map(|k| (Address::from_slice(&k[..TRADER]), market_of(k))).collect();
+    let mut keys: BTreeSet<(Address, MarketId, bool)> = BTreeSet::new();
+    let mut seen: BTreeSet<(Address, MarketId)> = BTreeSet::new();
     while keys.len() < 50_000 {
-        keys.insert((traders[rng.below(N_TRADERS) as usize], 1 + rng.below(N_MARKETS)));
+        let r = rng.below(10);
+        let (t, m) = if r < 7 {
+            held[rng.below(held.len() as u64) as usize]
+        } else {
+            (traders[rng.below(N_TRADERS) as usize], 1 + rng.below(N_MARKETS))
+        };
+        if seen.insert((t, m)) {
+            keys.insert((t, m, r == 6));
+        }
     }
-    let mut keys: Vec<(Address, MarketId)> = keys.into_iter().collect();
+    let mut writes: Vec<(Address, MarketId, bool)> = keys.into_iter().collect();
     // Fill order, not key order.
-    for i in (1..keys.len()).rev() {
-        keys.swap(i, rng.below(i as u64 + 1) as usize);
+    for i in (1..writes.len()).rev() {
+        writes.swap(i, rng.below(i as u64 + 1) as usize);
     }
-    let writes: Vec<(Address, MarketId, bool)> = keys.into_iter().map(|(t, m)| (t, m, rng.below(10) == 0)).collect();
     let mut times: [Vec<f64>; 4] = Default::default();
+    let mut pos_apply: Vec<f64> = Vec::new();
     let mut rows = 0;
     for _ in 0..7 {
         let mut users = Users::build_maps(&pos, &bal);
+        let new_pos: Vec<Position> =
+            writes.iter().enumerate().map(|(i, (t, m, _))| position(*t, *m, 7 + i as u64, i % 3 == 0)).collect();
         let t0 = std::time::Instant::now();
+        let tp;
         {
             let mut w = users.mutate();
-            for (i, (t, m, close)) in writes.iter().enumerate() {
+            for ((t, m, close), p) in writes.iter().zip(new_pos) {
                 if *close {
                     w.remove_position(t, *m);
                 } else {
-                    w.set_position(position(*t, *m, 7 + i as u64, i % 3 == 0));
+                    w.set_position(p);
                 }
             }
+            tp = t0.elapsed().as_secs_f64() * 1e3;
             for (i, t) in traders.iter().enumerate() {
                 w.set_balance(t, balance(2_000_000 + i as u64));
                 w.add_cum_volume(t, p5_fp(1 + (i % 50) as i64)).unwrap();
             }
         }
         let t1 = std::time::Instant::now();
+        pos_apply.push(tp);
         let drained = users.drain_dirty();
         let t2 = std::time::Instant::now();
         rows = drained.positions.len() + drained.balances.len();
@@ -3306,12 +3322,81 @@ fn ubench_drain_per_block() {
             v.push(d.as_secs_f64() * 1e3);
         }
     }
+    // Phase 4 (the reference path) on the same writes and host: each row
+    // encoded and put on the block's overlay (R reads the record set), the
+    // freeze, then `Users::apply` of the block's delta (`end_resident`, on
+    // its worker).
+    let mut p4: [Vec<f64>; 3] = Default::default();
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        let shared = Arc::new(SharedUsers::new(Users::build_maps(&pos, &bal), false));
+        let mut overlay = NativeStateOverlay::new(db.clone());
+        let r = ResidentRows::build_with_source(&overlay, shared.clone()).unwrap();
+        overlay.attach_resident(Arc::new(r));
+        let pm = PositionManager::new(overlay.clone());
+        let typed: &dyn TypedRows = &*shared;
+        let new_pos: Vec<Position> =
+            writes.iter().enumerate().map(|(i, (t, m, _))| position(*t, *m, 7 + i as u64, i % 3 == 0)).collect();
+        let t0 = std::time::Instant::now();
+        for ((t, m, close), p) in writes.iter().zip(&new_pos) {
+            if *close {
+                pm.delete_position(t, *m).unwrap();
+            } else {
+                pm.put_position(p).unwrap();
+            }
+        }
+        for (i, t) in traders.iter().enumerate() {
+            pm.put_native_balance(t, &balance(2_000_000 + i as u64)).unwrap();
+            let v = pm.get_cum_volume_typed(Some(typed), t).unwrap();
+            pm.put_cum_volume(t, v + p5_fp(1 + (i % 50) as i64)).unwrap();
+        }
+        let t1 = std::time::Instant::now();
+        let frozen = overlay.freeze(1);
+        let delta = frozen.resident_delta();
+        let t2 = std::time::Instant::now();
+        drop(pm);
+        drop(overlay);
+        let mut shared = Arc::try_unwrap(shared).expect("unshared");
+        let mut n = 0usize;
+        shared.get_mut().apply(&delta, Some(&mut |_, r| n += usize::from(r.is_some())));
+        let t3 = std::time::Instant::now();
+        assert!(n > 10_000);
+        for (v, d) in p4.iter_mut().zip([t1 - t0, t2 - t1, t3 - t2]) {
+            v.push(d.as_secs_f64() * 1e3);
+        }
+    }
+    let low = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    println!(
+        "DRAIN ubench Phase 4 path: overlay writes best {:.2} ms, freeze + delta best {:.2} ms, Users::apply (worker) best {:.2} ms",
+        low(&p4[0]),
+        low(&p4[1]),
+        low(&p4[2])
+    );
+    // Host calibration: the same counts of plain map work.
+    let calib = {
+        let t = std::time::Instant::now();
+        let mut h: HashSet<(Address, MarketId)> = HashSet::default();
+        for (tr, m, _) in &writes {
+            h.insert((*tr, *m));
+        }
+        let mut b: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut ks: Vec<(Address, MarketId)> = h.into_iter().collect();
+        ks.sort_unstable();
+        for (tr, m) in ks {
+            b.insert(position_key(&tr, m).to_vec(), vec![0u8; POSITION_V2_LEN]);
+        }
+        std::hint::black_box(&b);
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    println!("DRAIN ubench calibration: 50k hash inserts + sort + 50k sorted BTreeMap<Vec> inserts: {calib:.2} ms");
     let best = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
     let median = |v: &[f64]| {
         let mut v = v.to_vec();
         v.sort_by(f64::total_cmp);
         v[v.len() / 2]
     };
+    println!("DRAIN ubench apply in place, positions part: best {:.2} ms", best(&pos_apply));
     for (name, v) in ["apply in place", "drain", "put into frozen set", "sums report"].iter().zip(&times) {
         println!("DRAIN ubench {name}: best {:.2} ms, median {:.2} ms ({rows} rows)", best(v), median(v));
     }
@@ -3527,3 +3612,5 @@ fn pending_typed_write_outside_a_tx_scope_is_caught() {
     let users = rb.test_users().expect("R attached");
     assert_eq!(users.balances.get(t.as_slice()), Some(&bal_bytes(&bal)));
 }
+
+
