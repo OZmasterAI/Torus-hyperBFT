@@ -5533,9 +5533,8 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// instrumentation: never read by execution, never part of the state root.
     pub save_split: SaveSplitAccum,
     /// Item 6 Phase 5 step 3: Classic saves write each dirty book's row from
-    /// its level dirty set ([`OrderBook::classic_row`]). On for a context
-    /// with a resident holder (off: books reloaded every block, and the
-    /// holder's test-only reference path).
+    /// its level dirty set ([`OrderBook::classic_row`]). Always on but for a
+    /// holder on the test-only reference path (`borsh::to_vec` of the book).
     book_rows_cached: bool,
     /// Item 6 Phase 5 step 3: this context's cached Classic saves.
     book_rows: BookRowsAccum,
@@ -5906,6 +5905,12 @@ impl<T: StateBackend> NativeExecContext<T> {
         // guard failure the memory state is dropped and the DB (authoritative)
         // is re-read, so a stale holder can never leak into execution.
         let resident_mode = resident.is_some();
+        // Item 6 Phase 5 step 3: Classic rows from the level dirty set, on
+        // every node (no runtime switch, D16; books reloaded every block,
+        // `TORUS_RESIDENT_BOOKS=0`, build their kept levels at each save).
+        // Only a holder on the test-only reference path keeps the reference
+        // encoding.
+        let book_rows_cached = resident.as_deref().is_none_or(|h| h.in_place_mode());
         let mut reused_inner: Option<ResidentInner> = None;
         // R02 branch 7: a failed applied-marker read is a local fault: the
         // block fail-stops (`fatal_error`, kept first), the holder is
@@ -6118,7 +6123,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             load_timings,
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
-            book_rows_cached: false,
+            book_rows_cached,
             book_rows: BookRowsAccum::default(),
             #[cfg(any(test, feature = "test-reference-paths"))]
             test_book_rows_check: true,
@@ -7170,7 +7175,20 @@ impl<T: StateBackend> NativeExecContext<T> {
             match self.book_mode {
                 BookMode::Classic => {
                     let key = market_id.to_be_bytes();
-                    match borsh::to_vec(&*book) {
+                    // Item 6 Phase 5 step 3: the row from the book's level
+                    // dirty set (same bytes); the reference encoding without
+                    // resident books and on the test-only reference path.
+                    let encoded = if self.book_rows_cached {
+                        Self::classic_row_cached(
+                            book,
+                            &mut self.book_rows,
+                            #[cfg(any(test, feature = "test-reference-paths"))]
+                            self.test_book_rows_check,
+                        )
+                    } else {
+                        borsh::to_vec(&*book)
+                    };
+                    match encoded {
                         Ok(data) => {
                             if let Err(e) =
                                 self.state.put_cf_raw_owned(CF_NATIVE_ORDER_BOOKS, &key, data)
@@ -7273,6 +7291,36 @@ impl<T: StateBackend> NativeExecContext<T> {
         let _ = acc;
 
         written
+    }
+
+    /// Item 6 Phase 5 step 3: `book`'s Classic row from its level dirty set
+    /// ([`OrderBook::classic_row`]), counted into `acc`. Tests (`check`)
+    /// also encode it the reference way and panic on any difference.
+    fn classic_row_cached(
+        book: &mut OrderBook,
+        acc: &mut BookRowsAccum,
+        #[cfg(any(test, feature = "test-reference-paths"))] check: bool,
+    ) -> std::io::Result<Vec<u8>> {
+        let (row, s) = book.classic_row()?;
+        acc.saves += 1;
+        acc.full_builds += u64::from(s.full_build);
+        acc.levels_reused += s.levels_reused;
+        acc.levels_encoded += s.levels_encoded;
+        acc.levels_removed += s.levels_removed;
+        acc.bytes += s.bytes;
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        if check {
+            let reference = borsh::to_vec(&*book)?;
+            assert!(
+                row == reference,
+                "Phase 5 step 3: market {}'s Classic row from the level dirty set != the reference encoding ({} vs {} bytes)",
+                book.market_id,
+                row.len(),
+                reference.len()
+            );
+            acc.checked += 1;
+        }
+        Ok(row)
     }
 
     /// Item 7 step 2 (owner decision 3): the bbo row of every dirty market

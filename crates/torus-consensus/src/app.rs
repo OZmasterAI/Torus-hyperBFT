@@ -4577,6 +4577,13 @@ impl ExecutionContext {
                 // two-pass save.
                 let split = ctx.save_split;
                 m.exec_save_books_drain_seconds.observe(secs(split.drain_ns));
+                // Item 6 Phase 5 step 3: the Classic rows from the level
+                // dirty set (all zero on the reference encoding).
+                let rows = ctx.book_rows_stats();
+                m.exec_book_rows_cached.inc_by(rows.saves);
+                m.exec_book_rows_full_builds.inc_by(rows.full_builds);
+                m.exec_book_rows_levels_reused.inc_by(rows.levels_reused);
+                m.exec_book_rows_levels_encoded.inc_by(rows.levels_encoded);
                 // Deferred blocks: the write half runs on W, which observes
                 // `exec_save_books_write_seconds` when it applies the sidecar —
                 // still ONE observation per native block.

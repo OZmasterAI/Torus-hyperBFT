@@ -333,9 +333,11 @@ fn book_rows_modes_1_to_3_unchanged() {
 }
 
 /// Without resident books (`TORUS_RESIDENT_BOOKS=0`, every block reloads
-/// its books) the Classic save stays the reference encoding.
+/// its books) the Classic save also writes the row from the level dirty set,
+/// a full build each block (the loaded books keep no levels); a holder on
+/// the test-only reference path keeps the reference encoding.
 #[test]
-fn classic_rows_need_resident_books() {
+fn classic_rows_without_resident_books_build_each_block() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = StateDb::open(dir.path()).expect("open db");
     PositionManager::new(db.clone())
@@ -358,14 +360,15 @@ fn classic_rows_need_resident_books() {
         let r = NativeExecutor::execute(&mut ctx, &addr(1), &NativeAction::PlaceOrder(order(1, true, 90 + h as i64, 1)));
         assert!(r.success, "{r:?}");
         ctx.save_order_books();
-        assert_eq!(ctx.book_rows_stats(), BookRowsAccum::default(), "block {h}");
+        let s = ctx.book_rows_stats();
+        assert!(s.saves == 1 && s.full_builds == 1 && s.checked == 1, "block {h}: {s:?}");
     }
     let mut holder = ResidentBooks::default();
+    holder.set_reference_writes(true);
     let mut ctx = NativeExecContext::new_with_mode(
         db.clone(), 4, 1_004, 0, 100, 10, addr(99), addr(100), addr(101), BookMode::Classic, Some(&mut holder),
     );
     NativeExecutor::execute(&mut ctx, &addr(1), &NativeAction::PlaceOrder(order(1, true, 80, 1)));
     ctx.save_order_books();
-    let s = ctx.book_rows_stats();
-    assert!(s.saves == 1 && s.full_builds == 1, "a resident node takes it: {s:?}");
+    assert_eq!(ctx.book_rows_stats(), BookRowsAccum::default(), "the reference holder keeps borsh::to_vec");
 }
