@@ -31,6 +31,12 @@ reed-solomon-erasure = { workspace = true }
 # from torus-bridge's `test-reference-paths` and its dev-dependencies only).
 # Changes no behaviour by itself; no node build reaches it.
 test-reference-paths = []
+# Item 7 option 0 step 0 (task 0.3): TEST-ONLY. The overlay read probes
+# (`probes`: per layer x CF x reader counters, in-flight counters, planted
+# layer skips) and the running-hash `capture_drain` hook. Enabled from
+# torus-consensus's dev-dependency only; without an installed probe nothing
+# changes, and no node build reaches it.
+test-probes = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

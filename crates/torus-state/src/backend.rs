@@ -1369,6 +1369,10 @@ pub struct NativeStateOverlay {
     /// Item 6 Phase 3: the checkpoint in flight C (handed to the flush worker,
     /// not durable yet), read after L and before the DB.
     inflight: Option<Arc<crate::checkpoint_layer::CheckpointLayer>>,
+    /// Item 7 option 0 step 0 (test-only `test-probes`): the layers a planted
+    /// fault makes this overlay's reads skip (none without a probe).
+    #[cfg(feature = "test-probes")]
+    skip: crate::probes::Skip,
 }
 
 impl std::fmt::Debug for NativeStateOverlay {
@@ -1434,6 +1438,8 @@ impl NativeStateOverlay {
             layer,
             deferred,
             inflight,
+            #[cfg(feature = "test-probes")]
+            skip: crate::probes::skip(),
         }
     }
 
@@ -1458,10 +1464,31 @@ impl NativeStateOverlay {
     #[inline]
     fn lower(&self, id: CfId) -> Result<[Option<&PendingState>; 3], StateError> {
         Ok([
-            self.parent.as_deref().map(|p| &p.state),
+            self.parent_for_reads().map(|p| &p.state),
             self.layer_for(id)?,
-            self.inflight.as_deref().map(|c| c.pending_state()),
+            self.inflight_for_reads().map(|c| c.pending_state()),
         ])
+    }
+
+    /// The parent layer as reads see it (a `test-probes` planted fault can
+    /// hide it; the field itself is untouched).
+    #[inline]
+    fn parent_for_reads(&self) -> Option<&FrozenPending> {
+        #[cfg(feature = "test-probes")]
+        if self.skip.parent {
+            return None;
+        }
+        self.parent.as_deref()
+    }
+
+    /// C as reads see it (see [`Self::parent_for_reads`]).
+    #[inline]
+    fn inflight_for_reads(&self) -> Option<&crate::checkpoint_layer::CheckpointLayer> {
+        #[cfg(feature = "test-probes")]
+        if self.skip.checkpoint {
+            return None;
+        }
+        self.inflight.as_deref()
     }
 
     /// L as CF `id` sees it: for a deferred CF (with L split) the deferred
@@ -1469,6 +1496,13 @@ impl NativeStateOverlay {
     #[inline]
     fn layer_for(&self, id: CfId) -> Result<Option<&PendingState>, StateError> {
         match &self.deferred {
+            #[cfg(feature = "test-probes")]
+            Some(_)
+                if self.skip.deferred
+                    && crate::checkpoint_layer::is_deferred_slot(id.0 as usize) =>
+            {
+                Ok(None)
+            }
             Some(d) if crate::checkpoint_layer::is_deferred_slot(id.0 as usize) => {
                 d.read().map(|l| Some(l.pending_state())).ok_or_else(|| {
                     StateError::Io(std::io::Error::other(
@@ -1486,14 +1520,96 @@ impl NativeStateOverlay {
     /// deferred part still being merged (Codex P3, p3 merge wait r1).
     #[inline]
     fn lookup_lower(&self, id: CfId, key: &[u8]) -> Result<Option<Option<&[u8]>>, StateError> {
-        if let Some(hit) = self.parent.as_deref().and_then(|p| p.state.lookup(id, key)) {
+        if let Some(hit) = self
+            .parent_for_reads()
+            .and_then(|p| p.state.lookup(id, key))
+        {
+            #[cfg(feature = "test-probes")]
+            self.probe_point(id, key, crate::probes::Layer::Parent, hit);
             return Ok(Some(hit));
         }
-        let rest = [
-            self.layer_for(id)?,
-            self.inflight.as_deref().map(|c| c.pending_state()),
+        if let Some(hit) = self.layer_for(id)?.and_then(|l| l.lookup(id, key)) {
+            #[cfg(feature = "test-probes")]
+            self.probe_point(id, key, self.l_tag(id), hit);
+            return Ok(Some(hit));
+        }
+        let hit = self
+            .inflight_for_reads()
+            .and_then(|c| c.pending_state().lookup(id, key));
+        #[cfg(feature = "test-probes")]
+        if let Some(hit) = hit {
+            self.probe_point(id, key, crate::probes::Layer::Checkpoint, hit);
+        }
+        Ok(hit)
+    }
+
+    /// `test-probes`: L's tag for CF `id` (main, or the deferred part).
+    #[cfg(feature = "test-probes")]
+    fn l_tag(&self, id: CfId) -> crate::probes::Layer {
+        if self.deferred.is_some() && crate::checkpoint_layer::is_deferred_slot(id.0 as usize) {
+            crate::probes::Layer::LDeferred
+        } else {
+            crate::probes::Layer::LMain
+        }
+    }
+
+    /// `test-probes`: count a point read `layer` answered with `hit`
+    /// (`None`: a tombstone); in flight iff the DB answers otherwise now.
+    #[cfg(feature = "test-probes")]
+    fn probe_point(&self, id: CfId, key: &[u8], layer: crate::probes::Layer, hit: Option<&[u8]>) {
+        crate::probes::record(id.name(), layer, || {
+            self.db.get_cf_raw(id.name(), key).ok().flatten().as_deref() != hit
+        });
+    }
+
+    /// `test-probes`: count a range read (iterators, `prefix_exists`) over
+    /// the frozen layers `lower` (parent, L, C) restricted to keys
+    /// `in_range` from `start`: each layer holding such a key is a hit, in
+    /// flight iff one of its keys (the first 256) answers otherwise in the
+    /// DB now; the DB iterator is one DB hit.
+    #[cfg(feature = "test-probes")]
+    fn probe_iter(
+        &self,
+        id: CfId,
+        lower: &[Option<&PendingState>; 3],
+        start: &[u8],
+        in_range: impl Fn(&[u8]) -> bool,
+    ) {
+        if !crate::probes::active() {
+            return;
+        }
+        let tags = [
+            crate::probes::Layer::Parent,
+            self.l_tag(id),
+            crate::probes::Layer::Checkpoint,
         ];
-        Ok(rest.into_iter().flatten().find_map(|l| l.lookup(id, key)))
+        for (layer, tag) in lower.iter().zip(tags) {
+            let Some(layer) = layer else { continue };
+            let cfp = layer.cf(id);
+            let from = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
+            let writes = cfp
+                .writes
+                .range::<[u8], _>(from)
+                .map(|(k, v)| (k.as_slice(), Some(v.as_slice())));
+            let deletes = cfp
+                .deletes
+                .range::<[u8], _>(from)
+                .map(|k| (k.as_slice(), None));
+            let keys: Vec<(&[u8], Option<&[u8]>)> = writes
+                .take_while(|(k, _)| in_range(k))
+                .chain(deletes.take_while(|(k, _)| in_range(k)))
+                .take(512)
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            crate::probes::record(id.name(), tag, || {
+                keys.iter()
+                    .take(256)
+                    .any(|(k, v)| self.db.get_cf_raw(id.name(), k).ok().flatten().as_deref() != *v)
+            });
+        }
+        crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
     }
 
     /// Item 6 Phase 3: the layered parent (the previous block's frozen set).
@@ -2482,12 +2598,16 @@ impl StateBackend for NativeStateOverlay {
             {
                 let state = self.pending.read().unwrap();
                 if let Some(hit) = state.lookup(id, key) {
+                    #[cfg(feature = "test-probes")]
+                    crate::probes::record(id.name(), crate::probes::Layer::Own, || false);
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
             }
             // Item 6 Phase 1: R replaces the DB for its CFs; C6a (B0):
             // and the parent layer, which R already holds.
             if let Some(rows) = self.resident(id) {
+                #[cfg(feature = "test-probes")]
+                crate::probes::record(id.name(), crate::probes::Layer::Resident, || false);
                 return Ok(rows.get(key));
             }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes);
@@ -2495,6 +2615,8 @@ impl StateBackend for NativeStateOverlay {
             if let Some(hit) = self.lookup_lower(id, key)? {
                 return Ok(hit.map(<[u8]>::to_vec));
             }
+            #[cfg(feature = "test-probes")]
+            crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
         }
         self.db.get_cf_raw(cf, key)
     }
@@ -2570,6 +2692,8 @@ impl StateBackend for NativeStateOverlay {
         // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
         let lower = self.lower(id)?;
+        #[cfg(feature = "test-probes")]
+        self.probe_iter(id, &lower, p, |k: &[u8]| k.starts_with(p));
         let state = self.pending.read().unwrap();
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
         // as they are (already sorted and unique under the bytewise comparator).
@@ -2612,6 +2736,8 @@ impl StateBackend for NativeStateOverlay {
             return merge_from(&pending, &[], id, start, limit, base);
         }
         let lower = self.lower(id)?;
+        #[cfg(feature = "test-probes")]
+        self.probe_iter(id, &lower, start, |_: &[u8]| true);
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2631,15 +2757,21 @@ impl StateBackend for NativeStateOverlay {
             {
                 let state = self.pending.read().unwrap();
                 if let Some(hit) = state.lookup(id, key) {
+                    #[cfg(feature = "test-probes")]
+                    crate::probes::record(id.name(), crate::probes::Layer::Own, || false);
                     return Ok(hit.map(<[u8]>::len));
                 }
             }
             if let Some(rows) = self.resident(id) {
+                #[cfg(feature = "test-probes")]
+                crate::probes::record(id.name(), crate::probes::Layer::Resident, || false);
                 return Ok(rows.get_len(key));
             }
             if let Some(hit) = self.lookup_lower(id, key)? {
                 return Ok(hit.map(<[u8]>::len));
             }
+            #[cfg(feature = "test-probes")]
+            crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
         }
         StateBackend::get_cf_len(&self.db, cf, key)
     }
@@ -2668,6 +2800,8 @@ impl StateBackend for NativeStateOverlay {
             return merge_from(&pending, &[], id, start, limit, base).map(cut);
         }
         let lower = self.lower(id)?;
+        #[cfg(feature = "test-probes")]
+        self.probe_iter(id, &lower, start, |k: &[u8]| k.starts_with(prefix));
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2708,6 +2842,10 @@ impl StateBackend for NativeStateOverlay {
                 None => true,
             }
         };
+        #[cfg(feature = "test-probes")]
+        if rows.is_none() {
+            self.probe_iter(id, &lower, prefix, |k: &[u8]| k.starts_with(prefix));
+        }
         if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
             return Ok(true);
         }

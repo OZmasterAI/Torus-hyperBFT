@@ -284,6 +284,29 @@ pub fn check_checkpoint_book_mode(
     }
 }
 
+/// Item 7 option 0 step 0 (task 0.4, R5 / F11): where a height became
+/// complete (its state, marker AND EVM mirror resync written). Test-only.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CompleteSite {
+    /// W: a `Job::Flush` (interval 0).
+    WFlush,
+    /// W: a `Job::Marker` (interval 0).
+    WMarker,
+    /// W: a `Job::Checkpoint` (the window up to its height).
+    WCheckpoint,
+    /// E: the serial flush, after its EVM mirror resync.
+    ESerialFlush,
+    /// E: a successful marker-only flush (no native phase).
+    EMarkerOnly,
+}
+
+/// Test-only completion hook: `(site, completed height, the DB)`, called
+/// where the height is known complete (after the EVM mirror resync, before
+/// W moves its durable height or receives its next job).
+#[cfg(test)]
+pub type CompleteHook = std::sync::Arc<dyn Fn(CompleteSite, u64, &StateDb) + Send + Sync>;
+
 /// One unit of work for W, in commit order.
 pub enum Job {
     /// A native block: flush its frozen pending set (state + trie + marker in one
@@ -377,6 +400,17 @@ pub struct WorkerGate {
     /// W is parked at the latch seam.
     #[cfg(test)]
     latch_parked: AtomicBool,
+    /// Item 7 option 0 step 0 (F11): park W between a job's batch and its
+    /// EVM mirror resync, until `release`.
+    #[cfg(test)]
+    hold_resync: AtomicBool,
+    /// W is parked at the resync seam.
+    #[cfg(test)]
+    resync_parked: AtomicBool,
+    /// Item 7 option 0 step 0 (G mode): park W at the gate of this height's
+    /// job and every later one, until `release`.
+    #[cfg(test)]
+    hold_from: Mutex<Option<u64>>,
 }
 
 impl WorkerGate {
@@ -394,6 +428,12 @@ impl WorkerGate {
         self.hold_ckpt.store(false, Ordering::SeqCst);
         #[cfg(test)]
         self.hold_latch.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        self.hold_resync.store(false, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            *self.hold_from.lock().unwrap() = None;
+        }
         drop(held);
         self.cv.notify_all();
     }
@@ -429,6 +469,41 @@ impl WorkerGate {
         self.latch_parked.load(Ordering::SeqCst)
     }
 
+    /// Item 7 option 0 step 0 (G mode): park W at the gate of job `height`
+    /// (and every later job) until `release`. Unlike [`Self::hold`] it
+    /// cannot catch the job before `height` whatever W's timing: the G-mode
+    /// controller holds the job E is about to hand off.
+    #[cfg(test)]
+    pub fn hold_from(&self, height: u64) {
+        let _held = self.held.lock().unwrap();
+        *self.hold_from.lock().unwrap() = Some(height);
+    }
+
+    /// Item 7 option 0 step 0 (F11): park W after the next batch it writes
+    /// and before that job's EVM mirror resync, until `release`.
+    #[cfg(test)]
+    pub fn hold_before_resync(&self) {
+        let _held = self.held.lock().unwrap();
+        self.resync_parked.store(false, Ordering::SeqCst);
+        self.hold_resync.store(true, Ordering::SeqCst);
+    }
+
+    /// W is parked at the resync seam (`hold_before_resync`).
+    #[cfg(test)]
+    pub fn resync_parked(&self) -> bool {
+        self.resync_parked.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn resync_seam(&self) {
+        let mut held = self.held.lock().unwrap();
+        while self.hold_resync.load(Ordering::SeqCst) {
+            self.resync_parked.store(true, Ordering::SeqCst);
+            held = self.cv.wait(held).unwrap();
+        }
+        self.resync_parked.store(false, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     fn latch_seam(&self) {
         let mut held = self.held.lock().unwrap();
@@ -461,7 +536,11 @@ impl WorkerGate {
         let mut held = self.held.lock().unwrap();
         loop {
             let ckpt_held = checkpoint && self.hold_ckpt.load(Ordering::SeqCst);
-            if !*held && !ckpt_held {
+            #[cfg(test)]
+            let from_held = self.hold_from.lock().unwrap().is_some_and(|f| height >= f);
+            #[cfg(not(test))]
+            let from_held = false;
+            if !*held && !ckpt_held && !from_held {
                 break;
             }
             if ckpt_held {
@@ -542,6 +621,9 @@ pub struct WorkerEnv {
     /// The node-wide fail-stop latch (T1.5), shared with E and consensus.
     pub exec_failed: Arc<AtomicBool>,
     pub gate: Option<Arc<WorkerGate>>,
+    /// Item 7 option 0 step 0: the completion hook (test-only).
+    #[cfg(test)]
+    pub test_on_complete: Option<CompleteHook>,
 }
 
 impl FlushWorker {
@@ -761,6 +843,21 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             (&result, &env.metrics, &job)
         {
             m.observe_order_ages(torus_telemetry::OrderStage::Durable, order_nonces.iter().copied());
+        }
+        // Item 7 option 0 step 0 (F11): the height is complete (batch AND
+        // EVM mirror resync written); before W publishes it or receives its
+        // next job. Never for a digest or a failed job.
+        #[cfg(test)]
+        if let (Ok(Ok(()) | Err(JobError::TrieStale(_))), false, Some(hook)) =
+            (&result, digest, &env.test_on_complete)
+        {
+            let site = match &job {
+                Job::Flush { .. } => CompleteSite::WFlush,
+                Job::Marker { .. } => CompleteSite::WMarker,
+                Job::Checkpoint { .. } => CompleteSite::WCheckpoint,
+                Job::Digest { .. } => unreachable!("digests are filtered above"),
+            };
+            hook(site, height, &env.state_db);
         }
         match result {
             Ok(Ok(())) => {
@@ -1076,6 +1173,10 @@ fn marker_is(env: &WorkerEnv, height: u64) -> bool {
 /// CF_ACCOUNTS; resync the incremental mirror AFTER the batch is durable
 /// (DB->DB, sequenced here — design F2). Best-effort, as today.
 fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
+    #[cfg(test)]
+    if let Some(g) = &env.gate {
+        g.resync_seam();
+    }
     let resync_timer = std::time::Instant::now();
     if !evm_addrs.is_empty() {
         if let Err(e) = torus_state::incremental::resync_evm_accounts(&env.state_db, &evm_addrs) {
@@ -1273,6 +1374,7 @@ mod tests {
                 metrics: None,
                 exec_failed: Arc::new(AtomicBool::new(false)),
                 gate,
+                test_on_complete: None,
             },
             dir,
         )

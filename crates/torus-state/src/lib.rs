@@ -16,6 +16,9 @@ pub mod native_trie;
 pub mod nonce_window;
 pub mod overlay;
 pub mod pruner;
+/// Item 7 option 0 step 0: test-only overlay read probes (`test-probes`).
+#[cfg(feature = "test-probes")]
+pub mod probes;
 pub mod read_view;
 pub mod resident_rows;
 pub mod retention;
