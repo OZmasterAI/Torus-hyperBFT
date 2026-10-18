@@ -353,7 +353,9 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   250 ms in the testnet/validator configs only, (c) keep 3 s and rely on the rate-limiter fix (per-validator header
   budget, archy's follow-up), which makes the re-send a backup. Owner s126: decide pre-testnet.
   **Decided s128: (a), code default 250 ms**, shipped in one defaults change with PC and F on after the PC vs PC+F run
-  (bench queue step 5b).
+  (bench queue step 5b). **Done on branch `feat/defaults-pc-f-resend`** (s128): code default 250 ms
+  (`parse_header_resend_ms`), `=0` still off, any other number still overrides; the same branch makes PC
+  (`TORUS_PARALLEL_CANCEL_ALL`, 8 workers) and F (`TORUS_EPOCH_FAST_PATH`) default on.
 - **Shard custody default.** **Decided s128: OFF by default until T3.1** (section 82: custody on costs 21.6%
   matched/s, 140 ms per follower validate on hotstuff-algo); the RH4 shard-count fix waits for T3.1. Code default
   flipped on main `d6c4d0d2` (only `TORUS_SHARD_CUSTODY=1` enables).
