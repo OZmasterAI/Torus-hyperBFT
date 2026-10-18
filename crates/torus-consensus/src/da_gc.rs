@@ -75,9 +75,16 @@
 //!   Such a gap means the GC was off or failing for longer than the tree
 //!   window; the first-inclusion bodies of the skipped heights stay for good.
 //!
-//! A store without a cursor (fresh, or written by a pre-cursor binary)
-//! establishes it at the first recorded height. With the GC off (archive
-//! node, `TORUS_DA_BODY_RETENTION=0`) no pass runs and nothing is written.
+//! A fresh store (no GC state, so no row a lost pin could matter for)
+//! establishes the cursor at its first recorded height. A store a pre-cursor
+//! binary wrote (owner, s128) may already have lost a pin that way: its
+//! cursor starts where the tree's retained range starts (the prune pointer,
+//! never below the GC frontier), so the normal back-fill re-reads every
+//! height the tree still serves (256 per pass, deletion held until it caught
+//! up; heights the tree already pruned held as above). Its replays still
+//! record nothing, and no pass deletes before the cursor exists. With the GC
+//! off (archive node, `TORUS_DA_BODY_RETENTION=0`) no pass runs and nothing
+//! is written.
 
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
 use hotstuff_rs::block_tree::variables::BLOCK_TREE_PRUNED_HEIGHT;

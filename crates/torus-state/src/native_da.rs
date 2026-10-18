@@ -156,6 +156,9 @@ struct DaGcState {
     /// pruned it (`0` = none). Its re-inclusions are unknown, so nothing is
     /// deleted until it is itself due (window and tree bound).
     hold: u64,
+    /// Decoded from a pre-cursor (16-byte) state: rows exist that no cursor
+    /// vouches for. Not encoded.
+    pre_cursor: bool,
 }
 
 impl DaGcState {
@@ -170,12 +173,14 @@ impl DaGcState {
                 legacy_next_record: 0,
                 cursor: Some(word(b, 1)),
                 hold: word(b, 2),
+                pre_cursor: false,
             },
             Some(b) if b.len() == 16 => Self {
                 frontier: word(b, 0),
                 legacy_next_record: word(b, 1),
                 cursor: None,
                 hold: 0,
+                pre_cursor: true,
             },
             _ => Self::default(),
         }
@@ -638,25 +643,43 @@ impl NativeDaStore {
         // membership tests below run once per listed hash (Codex P2).
         let mut moved: HashSet<[u8; 32]> = HashSet::new();
         let mut backfilled = false;
-        match state.cursor {
-            // Not established: a pre-cursor store, or a fresh one. Nothing
-            // before this pass was recorded under the cursor: start it here.
-            None => {
-                if height >= state.legacy_next_record.max(state.frontier) {
-                    if !hashes.is_empty() {
-                        self.record_row(
-                            &mut batch,
-                            height,
-                            hashes,
-                            shard_count,
-                            state.frontier,
-                            &mut moved,
-                            None,
-                        )?;
+        // The cursor this pass starts from. Not established yet:
+        // - a fresh store (no GC state, so no row an unrecorded pin could
+        //   matter for) starts it at this height;
+        // - a pre-cursor store (owner, s128) holds rows no cursor vouches
+        //   for, and its binary may have missed a re-inclusion's record (the
+        //   P1 crash): start it where the block tree's retained range starts
+        //   (its prune pointer; never below the frontier, whose rows are
+        //   gone), so the back-fill re-reads every height the tree still
+        //   serves before anything is deleted. Heights the tree already
+        //   pruned are held like a back-fill skip.
+        // A replay (below the pre-cursor replay floor) records nothing.
+        let floor = state.legacy_next_record.max(state.frontier);
+        let start = match state.cursor {
+            Some(cursor) => Some(cursor),
+            None if height < floor => None,
+            None if !state.pre_cursor => Some(height),
+            None => match history.pruned_below() {
+                Ok(pruned) => {
+                    let start = state.frontier.max(pruned.min(height));
+                    if start > state.frontier {
+                        next.hold = next.hold.max(start);
                     }
-                    next.cursor = Some(height.saturating_add(1));
+                    Some(start)
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(
+                        height,
+                        "DA body GC: upgrading a pre-cursor store, the block tree's prune \
+                         pointer is unreadable, deleting nothing this pass: {e}"
+                    );
+                    out.backfill_stalled = true;
+                    None
+                }
+            },
+        };
+        match start {
+            None => {}
             // A replay: already recorded (or already GC'd).
             Some(cursor) if height < cursor => {}
             Some(cursor) => {
@@ -694,8 +717,11 @@ impl NativeDaStore {
             }
         }
         out.references_moved = moved.len() as u64;
-        // Still behind (stalled, or the back-fill bound): delete nothing.
-        let behind = next.cursor.is_some_and(|c| c <= height);
+        // Still behind (stalled, or the back-fill bound), or a pre-cursor
+        // store not yet vouched for: delete nothing.
+        let behind = out.backfill_stalled
+            || next.cursor.is_some_and(|c| c <= height)
+            || (next.cursor.is_none() && state.pre_cursor);
         // Rows at or below `last_due` are due: `h + retention <= height` and
         // `h < keep_from`.
         let last_due = height
@@ -2277,6 +2303,7 @@ mod tests {
                 legacy_next_record: next_record,
                 cursor: None,
                 hold: 0,
+                pre_cursor: true,
             },
         );
         assert_eq!(gc_state(store).encode().len(), 16);
@@ -2334,7 +2361,10 @@ mod tests {
         assert_eq!(out.bodies_deleted, 0);
         let out = gc_h(&store, 601, &[], W, &tree);
         assert_eq!((out.heights_backfilled, out.deletion_held), (B, true));
-        assert!(present(&store, &x) && present(&store, &y), "rows 10, 11 due, held");
+        assert!(
+            present(&store, &x) && present(&store, &y),
+            "rows 10, 11 due, held"
+        );
         // 517..=601 closes the gap; 602 records; rows 10 and 11 go.
         let out = gc_h(&store, 602, &[], W, &tree);
         assert_eq!(
