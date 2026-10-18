@@ -1744,9 +1744,11 @@ impl Mempool {
     }
 
     /// RH4: one durable DA body GC pass for a dispatched committed height,
-    /// see [`NativeDaStore::gc_committed_with_history`] (`keep_from`: no row
-    /// at or above it is deleted; `history` back-fills heights the GC has no
-    /// record for). Best effort: a store error is logged and reads as nothing
+    /// see [`NativeDaStore::gc_committed_with_history`] (`hashes`: `None` =
+    /// the height's record is unknown, left for the next pass; `keep_from`:
+    /// no row at or above it is deleted; `history` back-fills heights the GC
+    /// has no record for and says whether dispatch is behind its committed
+    /// tip). Best effort: a store error is logged and reads as nothing
     /// done. The pass's batch did not land, so the GC cursor stays behind and
     /// the next pass back-fills this height from `history` before deleting
     /// anything (a failed record is retried, never dropped).

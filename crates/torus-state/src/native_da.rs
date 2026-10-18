@@ -310,7 +310,8 @@ pub struct DaGcOutcome {
 /// tree.
 pub trait DaGcHistory {
     /// Heights below this are pruned: never served again, so not needed.
-    /// `0` = nothing pruned.
+    /// `0` = nothing pruned. All heights here are the GC's (the caller
+    /// converts its history's own numbering).
     fn pruned_below(&self) -> Result<u64, StateError>;
     /// The native-action hashes committed at `height` (at or above
     /// [`pruned_below`](Self::pruned_below)). `Ok(None)` = not available (a
@@ -556,7 +557,8 @@ impl NativeDaStore {
     /// them) are never touched.
     ///
     /// `keep_from` is the caller's bound from what the node can still serve:
-    /// the consensus app passes the block tree's durable prune pointer minus a
+    /// the consensus app passes the first height the block tree still serves
+    /// (its durable prune pointer, converted to this height system) minus a
     /// margin (Codex P1: a window derived from the configured block-tree
     /// retention runs ahead of the pruner, which removes at most 64 heights
     /// per commit). `u64::MAX` = no bound, `0` = delete nothing.
@@ -613,6 +615,17 @@ impl NativeDaStore {
     /// [`gc_committed`](Self::gc_committed) with a [`DaGcHistory`] to
     /// back-fill missed heights from (the consensus app's block tree).
     ///
+    /// `hashes`: `height`'s record, `None` = unknown (dispatch could not
+    /// make the block durable). An unknown record is never written as "no
+    /// actions" (that would drop its re-inclusion pins): the cursor stays at
+    /// `height`, the pass deletes nothing, and the next pass back-fills it
+    /// from `history`.
+    ///
+    /// Nothing is deleted either while `history` holds committed heights
+    /// above `height` ([`DaGcHistory::committed_through`], read only when a
+    /// row is due; an error holds too, [`DaGcOutcome::undispatched_commits`]):
+    /// they are not recorded yet and one may re-include a due row's body.
+    ///
     /// Before any deletion, every height from the cursor up to `height` gets
     /// its record: the missing ones from `history` (at most
     /// [`DA_GC_MAX_BACKFILL_HEIGHTS`] per pass; their bodies and shards then
@@ -657,8 +670,6 @@ impl NativeDaStore {
         // membership tests below run once per listed hash (Codex P2).
         let mut moved: HashSet<[u8; 32]> = HashSet::new();
         let mut backfilled = false;
-        // RED stub: an unknown record still reads as "no actions".
-        let hashes = hashes.unwrap_or(&[]);
         // The cursor this pass starts from. Not established yet:
         // - a fresh store (no GC state, so no row an unrecorded pin could
         //   matter for) starts it at this height;
@@ -715,7 +726,10 @@ impl NativeDaStore {
                         &mut out,
                     )?;
                 }
-                if recorded_to == height {
+                // An unknown record (`None`) is never written as "no
+                // actions": the cursor stays at `height`, so this pass
+                // deletes nothing and the next one back-fills it.
+                if let Some(hashes) = hashes.filter(|_| recorded_to == height) {
                     if !hashes.is_empty() {
                         self.record_row(
                             &mut batch,
@@ -755,9 +769,30 @@ impl NativeDaStore {
             written = next;
             moved.clear();
         }
-        if behind || held {
+        // Something is due: committed heights above `height` are not
+        // recorded yet (dispatch is behind the committed tip) and may
+        // re-include a due row's body, so nothing goes until dispatch caught
+        // up. Read only when a deletion is otherwise allowed.
+        let due = last_due.filter(|&due| next.frontier <= due);
+        let undispatched = !(behind || held) && due.is_some() && {
+            match history.committed_through() {
+                Ok(tip) => {
+                    out.undispatched_commits = tip.is_some_and(|tip| tip > height);
+                    out.undispatched_commits
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        height,
+                        "DA body GC: the history's committed tip is unreadable, deleting \
+                         nothing this pass: {e}"
+                    );
+                    true
+                }
+            }
+        };
+        if behind || held || undispatched {
             out.deletion_held = true;
-        } else if let Some(last_due) = last_due.filter(|&due| next.frontier <= due) {
+        } else if let Some(last_due) = due {
             if let Some(frontier) = self.gc_due_rows(
                 &mut batch,
                 next.frontier,
@@ -2098,7 +2133,15 @@ mod tests {
         history: &TestHistory,
     ) -> DaGcOutcome {
         store
-            .gc_committed_with_history(height, Some(hashes), 0, retention, UNCAPPED, LIMITS, history)
+            .gc_committed_with_history(
+                height,
+                Some(hashes),
+                0,
+                retention,
+                UNCAPPED,
+                LIMITS,
+                history,
+            )
             .unwrap()
     }
 
@@ -2222,7 +2265,11 @@ mod tests {
         assert_eq!(out.heights_backfilled, 1, "14 back-filled from the history");
         for tip in 16..=14 + W {
             gc_h(&store, tip, &[], W, &hist);
-            assert_eq!(present(&store, &x), tip < 14 + W, "x (pinned by 14) at {tip}");
+            assert_eq!(
+                present(&store, &x),
+                tip < 14 + W,
+                "x (pinned by 14) at {tip}"
+            );
         }
     }
 
@@ -2259,7 +2306,11 @@ mod tests {
             hist.tip = Some(tip);
             let out = gc_h(&store, tip, &[], W, &hist);
             assert!(!out.undispatched_commits, "caught up at {tip}");
-            assert_eq!(present(&store, &x), tip < 15 + W, "x (pinned by 15) at {tip}");
+            assert_eq!(
+                present(&store, &x),
+                tip < 15 + W,
+                "x (pinned by 15) at {tip}"
+            );
         }
     }
 

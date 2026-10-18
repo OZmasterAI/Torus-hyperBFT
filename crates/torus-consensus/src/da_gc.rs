@@ -25,8 +25,9 @@
 //!   [`DA_GC_MARGIN_BLOCKS`]; `TORUS_DA_BODY_RETENTION=N` overrides it
 //!   (`0` = off, floor [`MIN_DA_BODY_RETENTION`]),
 //! - the block tree itself (Codex P1): the body of height `h` goes only once
-//!   the tree's durable prune pointer (the lowest height it still holds) is
-//!   at least `h + DA_GC_MARGIN_BLOCKS` ([`keep_from_for_tree_frontier`]).
+//!   the lowest height the tree still serves (its durable prune pointer,
+//!   converted, see below) is at least `h + DA_GC_MARGIN_BLOCKS`
+//!   ([`keep_from_for_tree_frontier`]).
 //!   The window alone runs ahead of the tree: the pruner removes at most 64
 //!   heights per commit, so after `--retention-blocks` drops (restart with a
 //!   smaller window) the tree serves old blocks for many commits, and rows
@@ -36,6 +37,21 @@
 //! ([`resolve_da_body_retention`] = `None`, even with the env set) and stays
 //! a full sync source. A window below the block-tree window no longer
 //! shortens anything: the tree bound keeps the bodies.
+//!
+//! # Two height systems
+//!
+//! The GC counts Torus heights (the committed header's `height`, the key of
+//! `CF_BLOCK_BODIES` and of every GC row). The block tree counts hotstuff
+//! heights: hotstuff numbers blocks from 0, the Torus header from 1 (hotstuff
+//! block 0 extends the genesis header, Torus 0, and `check_parent_link`
+//! makes every header its parent's plus one), so Torus `h` sits at hotstuff
+//! `h - 1`. Every tree read and every comparison with a tree height goes
+//! through one conversion ([`hotstuff_height_of`], [`torus_height_of`],
+//! [`tree_served_from`]; Codex P1, round 2: the back-fill read hotstuff `h`
+//! for Torus `h`, the NEXT block, and missed the re-inclusion pin): the
+//! back-fill's block reads, the prune pointer (the tree serves Torus
+//! `pointer + 1` on: the tree bound and the back-fill's pruned heights), and
+//! the committed tip. Overflows saturate toward keeping more.
 //!
 //! The pointer is read from the consensus DB, the DB the DA store writes to:
 //! one WAL, recovered as a prefix after a crash, so a GC batch that deleted a
@@ -69,7 +85,25 @@
 //!   back-fill: the pass deletes NOTHING, logs, counts
 //!   `torus_da_gc_held_passes`, and the next pass retries. A failed record is
 //!   therefore never dropped: the cursor stays behind until it lands.
-//! - Heights below the tree's prune pointer are skipped (no longer served),
+//! - A height dispatch could not make durable (its `CF_BLOCK_BODIES` write
+//!   failed) is not recorded at all, never as "no actions" (Codex P1, round
+//!   2: that dropped its pins and moved the cursor past it): the cursor stays
+//!   at it, the pass deletes nothing (counted in `torus_da_gc_held_passes`)
+//!   and the next pass back-fills it from the tree. Its bodies then follow
+//!   the normal window (crash replay re-executes from the DA store only above
+//!   the applied height, and execution rewrites a failed body row); before
+//!   round 2 they were kept for good, at the cost of the pins.
+//! - Nothing is deleted while the tree holds committed heights above the
+//!   dispatched one (Codex P1, round 2): a multi-block commit or boot
+//!   reconciliation commits them all before their callbacks run, and one of
+//!   them may re-include a due row's body; deleting it before its own pass
+//!   pins it leaves its compact block unreconstructable. The tip is read only
+//!   when something is due; an unreadable tip holds too. Holding (not
+//!   pinning the undispatched blocks' hashes) is the simpler rule: no datum
+//!   decode on the consensus thread, and in blocking dispatch (the default)
+//!   dispatch reaches the tip at the last block of every commit, where the
+//!   held rows go (up to [`DA_GC_LIMITS`] rows per pass).
+//! - Heights below the first one the tree serves are skipped (pruned),
 //!   but deletion waits until the last skipped height is itself due (window
 //!   and tree bound): one of them may have re-included an older row's body.
 //!   Such a gap means the GC was off or failing for longer than the tree
@@ -78,8 +112,8 @@
 //! A fresh store (no GC state, so no row a lost pin could matter for)
 //! establishes the cursor at its first recorded height. A store a pre-cursor
 //! binary wrote (owner, s128) may already have lost a pin that way: its
-//! cursor starts where the tree's retained range starts (the prune pointer,
-//! never below the GC frontier), so the normal back-fill re-reads every
+//! cursor starts where the tree's retained range starts (the first Torus
+//! height the tree serves, never below the GC frontier), so the normal back-fill re-reads every
 //! height the tree still serves (256 per pass, deletion held until it caught
 //! up; heights the tree already pruned held as above). Its replays still
 //! record nothing, and no pass deletes before the cursor exists. With the GC
@@ -97,7 +131,7 @@ use crate::kv_store::RocksKVStore;
 
 /// Blocks a body outlives its block in the block tree by: the window derived
 /// from `--retention-blocks` is the block-tree retention plus this, and a body
-/// goes only once the tree's prune pointer is this far past its height. It
+/// goes only once the first height the tree serves is this far past it. It
 /// covers block-sync responses in flight when the tree prunes (in steady state
 /// the pointer moves one height per commit; while the pruner drains a backlog,
 /// up to 64).
@@ -136,8 +170,9 @@ pub fn resolve_da_body_retention(
     }
 }
 
-/// The block tree's durable prune pointer in `db` (the lowest committed height
-/// the tree still holds; `None` = never pruned), as hotstuff's pruner persists
+/// The block tree's durable prune pointer in `db` (the lowest committed
+/// HOTSTUFF height the tree still holds; `None` = never pruned; in Torus
+/// heights: [`tree_served_from`]), as hotstuff's pruner persists
 /// it (`BLOCK_TREE_PRUNED_HEIGHT` in `cf_consensus_meta`, a borsh `BlockHeight`:
 /// 8 bytes little-endian).
 pub fn read_block_tree_frontier(db: &StateDb) -> Result<Option<u64>, StateError> {
@@ -154,32 +189,60 @@ pub fn read_block_tree_frontier(db: &StateDb) -> Result<Option<u64>, StateError>
 }
 
 /// The `keep_from` bound of a GC pass ([`torus_state::NativeDaStore::gc_committed`])
-/// for the tree's prune pointer `frontier`: the body of height `h` may go
-/// once `h + DA_GC_MARGIN_BLOCKS <= frontier`. `None` (never pruned) = `0`,
-/// nothing goes. With the derived window this matches it exactly in steady
-/// state (pointer = tip - tree retention), so it only bites while the tree lags.
+/// for the tree's prune pointer `frontier` (a hotstuff height, as
+/// [`read_block_tree_frontier`] returns it): the body of Torus height `h` may
+/// go once `h + DA_GC_MARGIN_BLOCKS <= served`, `served` = the lowest Torus
+/// height the tree still serves ([`tree_served_from`]). `None` (never
+/// pruned) = `0`, nothing goes. With the derived window this matches it
+/// exactly in steady state (`served` = tip - tree retention), so it only
+/// bites while the tree lags.
 pub fn keep_from_for_tree_frontier(frontier: Option<u64>) -> u64 {
-    frontier
+    tree_served_from(frontier)
         .and_then(|f| f.checked_sub(DA_GC_MARGIN_BLOCKS))
         .map_or(0, |f| f.saturating_add(1))
 }
 
 /// The Torus header height of the block the hotstuff tree holds at
-/// `hotstuff` height. RED stub: the identity every site uses today.
+/// `hotstuff` height: `hotstuff + 1` (`None` past `u64::MAX`). Hotstuff
+/// numbers its blocks from 0, the Torus header from 1: hotstuff block 0
+/// extends the genesis header (Torus 0), and every block's header is its
+/// parent's plus one (`check_parent_link`). One of the two conversions every
+/// block-tree read and prune comparison of the GC goes through (Codex P1,
+/// round 2: the back-fill read hotstuff `H` for Torus `H`, the next block).
 pub fn torus_height_of(hotstuff: u64) -> Option<u64> {
-    Some(hotstuff)
+    hotstuff.checked_add(1)
 }
 
-/// The hotstuff height of the block carrying Torus header height `torus`.
-/// RED stub: the identity every site uses today.
+/// The hotstuff height of the block carrying Torus header height `torus`:
+/// `torus - 1`. `None` for the genesis header (Torus 0), which no tree block
+/// carries. See [`torus_height_of`].
 pub fn hotstuff_height_of(torus: u64) -> Option<u64> {
-    Some(torus)
+    torus.checked_sub(1)
 }
 
-/// The lowest Torus height the tree still serves, for its prune pointer.
-/// RED stub: the identity every site uses today.
+/// The lowest Torus height the block tree still serves, for its prune
+/// pointer (the lowest hotstuff height it holds; `None` = never pruned):
+/// `pointer + 1`, saturating (an overflow only keeps more).
 pub fn tree_served_from(pointer: Option<u64>) -> Option<u64> {
-    pointer
+    pointer.map(|p| torus_height_of(p).unwrap_or(u64::MAX))
+}
+
+/// The Torus height of the highest committed block in the block tree in
+/// `db` (`None` = nothing committed). An unreadable tip is an error, never
+/// "nothing committed".
+pub fn read_tree_committed_tip(db: &StateDb) -> Result<Option<u64>, StateError> {
+    let tree_err = |e| StateError::InvalidData(format!("block tree committed tip: {e:?}"));
+    let camera = BlockTreeCamera::new(RocksKVStore::new(db.db_arc()));
+    let snapshot = camera.snapshot();
+    let Some(hash) = snapshot.highest_committed_block().map_err(tree_err)? else {
+        return Ok(None);
+    };
+    let Some(height) = snapshot.block_height(&hash).map_err(tree_err)? else {
+        return Err(StateError::InvalidData(
+            "block tree: the highest committed block has no height".into(),
+        ));
+    };
+    Ok(Some(torus_height_of(height.int()).unwrap_or(u64::MAX)))
 }
 
 /// RH4 DA body GC settings of a node ([`crate::app::TorusApp::set_da_body_gc`]).
@@ -201,21 +264,30 @@ impl DaBodyGc {
 }
 
 /// The native actions the hotstuff block tree in `db` holds for committed
-/// `height`, decoded like `TorusApp::on_committed_block` decodes the datum:
-/// `(hashes, Some(actions))` for a full datum, `(hashes, None)` for a compact
-/// one. A block without a datum or with an undecodable one carries none (the
-/// commit path executes nothing from it). `None` = the tree has no committed
+/// Torus `height` (its block sits at hotstuff height `height - 1`,
+/// [`hotstuff_height_of`]), decoded like `TorusApp::on_committed_block`
+/// decodes the datum: `(hashes, Some(actions))` for a full datum,
+/// `(hashes, None)` for a compact one. A block without a datum or with an
+/// undecodable one carries none (the commit path executes nothing from it),
+/// nor does the genesis header (Torus 0). `None` = the tree has no committed
 /// block at `height`.
 #[allow(clippy::type_complexity)]
 pub fn committed_native_actions_in_tree(
     db: &StateDb,
     height: u64,
 ) -> Result<Option<(Vec<B256>, Option<Vec<SignedNativeAction>>)>, StateError> {
-    let tree_err = |e| StateError::InvalidData(format!("block tree read at {height}: {e:?}"));
+    let Some(hotstuff) = hotstuff_height_of(height) else {
+        return Ok(Some((Vec::new(), None)));
+    };
+    let tree_err = |e| {
+        StateError::InvalidData(format!(
+            "block tree read at Torus {height} (hotstuff {hotstuff}): {e:?}"
+        ))
+    };
     let camera = BlockTreeCamera::new(RocksKVStore::new(db.db_arc()));
     let snapshot = camera.snapshot();
     let Some(block) = snapshot
-        .block_at_height(BlockHeight::new(height))
+        .block_at_height(BlockHeight::new(hotstuff))
         .map_err(tree_err)?
     else {
         return Ok(None);
@@ -271,8 +343,9 @@ impl<'a> BlockTreeHistory<'a> {
 }
 
 impl DaGcHistory for BlockTreeHistory<'_> {
+    /// In Torus heights: the tree serves Torus `pointer + 1` on.
     fn pruned_below(&self) -> Result<u64, StateError> {
-        Ok(read_block_tree_frontier(self.db)?.unwrap_or(0))
+        Ok(tree_served_from(read_block_tree_frontier(self.db)?).unwrap_or(0))
     }
 
     fn committed_hashes(&self, height: u64) -> Result<Option<Vec<B256>>, StateError> {
@@ -284,8 +357,7 @@ impl DaGcHistory for BlockTreeHistory<'_> {
     }
 
     fn committed_through(&self) -> Result<Option<u64>, StateError> {
-        // RED stub: the committed tip is not consulted yet.
-        Ok(None)
+        read_tree_committed_tip(self.db)
     }
 }
 

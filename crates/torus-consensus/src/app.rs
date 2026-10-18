@@ -6554,10 +6554,14 @@ impl TorusApp {
     /// shards) of the heights that aged out AND whose blocks the block tree
     /// pruned at least [`crate::da_gc::DA_GC_MARGIN_BLOCKS`] heights ago
     /// (its durable prune pointer, read each pass; unreadable = delete
-    /// nothing). A height is recorded only when its
-    /// body row landed in `CF_BLOCK_BODIES` (`body_durable`): otherwise crash
-    /// replay could still need the DA copy, so its bodies stay for good (the
-    /// pass still runs for older heights).
+    /// nothing). A block whose body row did not land in `CF_BLOCK_BODIES`
+    /// (`!body_durable`) and that has native actions is not recorded at all,
+    /// never as "no actions" (Codex P1, round 2): the GC cursor stays at it,
+    /// the pass deletes nothing (counted in `torus_da_gc_held_passes`) and
+    /// the next pass back-fills it, pins included, from the block tree.
+    /// Nothing is deleted either while the tree holds committed heights
+    /// above `height` (a multi-block commit, boot reconciliation): one may
+    /// re-include a due body before its own pass pins it.
     ///
     /// A hash this block re-includes moves to this height
     /// ([`torus_state::NativeDaStore::gc_committed`]), so its body goes when
@@ -6599,17 +6603,21 @@ impl TorusApp {
         let (Some(gc), Some(mempool)) = (self.da_body_gc.as_ref(), self.mempool.as_ref()) else {
             return;
         };
-        let record: &[torus_types::B256] = if body_durable {
-            hashes
+        // A height whose body row did not land is not recorded at all (never
+        // as "no actions": that would drop its re-inclusion pins, Codex P1
+        // round 2): the GC cursor stays at it, this pass deletes nothing, and
+        // the next pass back-fills it from the block tree. A native-empty
+        // block has nothing to pin: its empty record is the truth.
+        let record: Option<&[torus_types::B256]> = if body_durable || hashes.is_empty() {
+            Some(hashes)
         } else {
-            if !hashes.is_empty() {
-                tracing::warn!(
-                    height,
-                    bodies = hashes.len(),
-                    "DA body GC: body row not durable at dispatch, keeping this height's DA bodies"
-                );
-            }
-            &[]
+            tracing::warn!(
+                height,
+                bodies = hashes.len(),
+                "DA body GC: body row not durable at dispatch, not recording this height \
+                 (deleting nothing; the next pass back-fills it from the block tree)"
+            );
+            None
         };
         // The shards custodied per body (`custody_native_shards_core`): none with
         // custody off, else `n` of the current set's erasure params.
@@ -6626,8 +6634,8 @@ impl TorusApp {
             0
         };
         let started = std::time::Instant::now();
-        if !record.is_empty() {
-            match mempool.mirror_missing_native_to_da(actions, record) {
+        if !hashes.is_empty() {
+            match mempool.mirror_missing_native_to_da(actions, hashes) {
                 Ok(0) => {}
                 Ok(restored) => tracing::info!(
                     height,
@@ -6700,7 +6708,7 @@ impl TorusApp {
         let history = crate::da_gc::BlockTreeHistory::new(&gc.block_tree_db, &restore);
         let out = mempool.gc_committed_native_da(
             height,
-            Some(record),
+            record,
             shard_count,
             gc.retention,
             keep_from,
@@ -6710,7 +6718,7 @@ impl TorusApp {
         if let Some(ref m) = self.metrics {
             m.da_gc_seconds.observe(started.elapsed().as_secs_f64());
             m.da_bodies_gc_deleted.inc_by(out.bodies_deleted);
-            if out.backfill_stalled {
+            if out.backfill_stalled || record.is_none() {
                 m.da_gc_held_passes.inc();
             }
         }
@@ -34114,7 +34122,9 @@ mod crash_recovery_tests {
         let limits = crate::da_gc::DA_GC_LIMITS;
         for h in row..=recorded_through {
             let hashes = if h == row { vec![hx] } else { vec![] };
-            store.gc_committed(h, &hashes, 0, window, 0, limits).unwrap();
+            store
+                .gc_committed(h, &hashes, 0, window, 0, limits)
+                .unwrap();
         }
         (consensus, store, mempool)
     }
@@ -34149,13 +34159,20 @@ mod crash_recovery_tests {
         let (hashes, actions) = crate::da_gc::committed_native_actions_in_tree(&db, 0)
             .unwrap()
             .expect("the genesis header is committed");
-        assert!(hashes.is_empty() && actions.is_none(), "genesis: no actions");
+        assert!(
+            hashes.is_empty() && actions.is_none(),
+            "genesis: no actions"
+        );
         assert!(crate::da_gc::committed_native_actions_in_tree(&db, 4)
             .unwrap()
             .is_none());
         let noop = |_: u64, _: &[torus_types::B256], _: Option<&[SignedNativeAction]>| {};
         let history = crate::da_gc::BlockTreeHistory::new(&db, &noop);
-        assert_eq!(history.committed_through().unwrap(), Some(3), "tip: Torus 3");
+        assert_eq!(
+            history.committed_through().unwrap(),
+            Some(3),
+            "tip: Torus 3"
+        );
         assert_eq!(history.pruned_below().unwrap(), 0, "never pruned");
         set_tree_frontier(&db, 227);
         assert_eq!(history.pruned_below().unwrap(), 228, "serves Torus 228 on");
@@ -34199,7 +34216,11 @@ mod crash_recovery_tests {
             Some(mempool.clone()),
             None,
         );
-        assert_eq!(read_native_applied_height(&state_db), Some(1227), "boot replay");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1227),
+            "boot replay"
+        );
         app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
             retention: W,
             block_tree_db: consensus.clone(),
@@ -34338,7 +34359,11 @@ mod crash_recovery_tests {
             store.contains(&hx.0).unwrap(),
             "1228's record is unknown (its body write failed): nothing goes"
         );
-        assert_eq!(metrics.da_gc_held_passes.get(), 1, "the held pass is counted");
+        assert_eq!(
+            metrics.da_gc_held_passes.get(),
+            1,
+            "the held pass is counted"
+        );
         // The next pass back-fills 1228 from the tree: x moves to row 1228.
         app.gc_da_bodies_after_dispatch(1229, &[], &[], true);
         assert!(store.contains(&hx.0).unwrap(), "pinned by 1228");
