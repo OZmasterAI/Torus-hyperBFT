@@ -12569,6 +12569,113 @@ pair (n = 3, ~45 min) would.
 | r3 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 247,940.3 | 11.952 | 19,947 | 78.9 | 14 / 879 | 24.87 | 2.0 | 0 | 20.5 | 0.000 | 0 | 0 | 0 |
 | r3 | PCFPE | 0/0 | ACCEPT/AGREE/PASS | True | ok | 245,169.7 | 13.841 | 17,103 | 65.5 | 14 / 809 | 25.45 | 0.0 | 0 | 18.3 | 0.000 | 12,428 | 0 | 0 |
 
+## 84. Step 5b, PC vs PC+F paired, standard load, 300 markets, 600 s cells, n = 3 (campaign ozarchy-q5b, main `e3d11cb9`, archy, 2026-10-18)
+
+**F on top of PC costs at most a little matched/s and roughly halves block latency. matched/s PCF / PC 0.9872
+[0.9702, 1.0046]: -1.3%, within noise by section 82's rule (CI spans 1), though all 3 rounds are below 1 (0.979-0.992).
+The latency side holds and is large: native blocks/s +88.6% [1.7070, 2.0833] (6.38 -> 12.04), block p50 -73.6%
+[0.2470, 0.2822] (57 -> 15 ms), block p99 -14.7% [0.7806, 0.9328] (1,025 -> 874 ms), exec block_ms -46.6% [0.4643,
+0.6137] (147 -> 79 ms). Blocks are half the size (fills per native block -46.5% [0.4689, 0.6096]); exec per 1k fills
+is unchanged (0.9984 [0.9819, 1.0152]), so the exec gain is all block size. CPU per fill +2.2% [1.0195, 1.0251] (twice
+the blocks: per-block overhead). Timeouts 8 (PC) vs 3 (PCF) over the 3 cells = 0.69 vs 0.14 per 1,000 native blocks;
+no_proposal 2 (PC, r3) vs 0 = 0.17 vs 0 per 1,000. n = 3, one host, A B B A A B. The section 83 caveat is answered:
+F's matched/s cost on top of PC is about -1.3% (point estimate), not resolved from 0 at n = 3.**
+
+Question (bench queue step 5b, owner s128): does F cost matched/s on top of PC? Section 83's caveat: PC+F 248,329
+matched/s at 11.8 native blocks/s vs section 82's PC alone 253,980 at 6.5 (cross-campaign). F ships on regardless of
+a small matched/s cost if its latency gain holds (owner's call on the numbers); this run sizes that trade.
+
+### 84.1 Setup
+
+Binary M = main `e3d11cb9` as in sections 82 and 83 (node md5 `bf720f9f`, staged `ozarchy-s64-stage/m-run`, not
+rebuilt; md5 re-checked on the 3 nodes of every cell). Tools: campaign A's frozen copy unchanged (`ozarchy-campA-tools`,
+main `5c6c82f8`; `tools/matched-bench` is unchanged up to main `d22f4e69`), harness worktree `wt/s64-main-e3d11cb9`;
+spec, checks and the generated driver in `ozarchy-q5b-tools/` (`q5b-spec.json`, `q5b-checks.sh`, `FROZEN.txt`; copies
+of step 5's with arms PC / PCF). Same standard load as 82.1 and 83.1 (Classic, 15 s checkpoints, oracle on, 300
+markets, rate 76,000, `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1
+IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, native only, resend 250). D, M, T unset (on); PE, KP, DB off (in `absent_env`),
+custody off (`TORUS_SHARD_CUSTODY=0` pinned in node env).
+
+| arm | env |
+|---|---|
+| PC (reference) | `TORUS_PARALLEL_CANCEL_ALL=8` |
+| PCF | PC + `TORUS_EPOCH_FAST_PATH=1` |
+
+Smoke (PC, 60 s, 257,158 matched/s) and warm-up w1 (PC, 300 s), then r1 PC, PCF; r2 PCF, PC; r3 PC, PCF; 600 s cells;
+05:11-06:45. Fresh data dirs every cell (`CLEAN=1`), free disk 118-121 GB after each cell.
+
+Validity: smoke + 7 / 7 cells rc 0, ACCEPT AGREE PASS, md5 `bf720f9f` on 3 nodes, 0 panic / fail-stop lines (re-checked
+from raw files); the standard-load `cell=` check passed on every cell; 120 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, 0 HARD
+FINDING, no reruns. Took effect on every node of every cell: each arm's env on all 3 node environs (PC cells:
+`TORUS_EPOCH_FAST_PATH` absent); F = `epoch fast path ON` once per node and every boundary block (height a multiple of
+100) pipelined in PCF cells (82-92 per node, 0 not pipelined), no `epoch fast path ON` line and every boundary block
+not pipelined in PC cells (51-54 per node per 600 s cell, 33 in w1, 0 pipelined); PE off =
+`torus_exec_thread_spawns_margin_prepare` 0 on every node of every cell (section 83's PE cells: ~12k); no
+`TORUS_CKPT_DEFER_BOOKS` line; custody seconds <= 0.0021 s per node. The new F-off check was run before the launch on
+section 82's r1-PC cell (OK, 0 / 53 pipelined) and against wrong-arm cells (q4w PCF as PC, campA PC as PCF, q4w PCFPE
+and campA PE for PE off: all FAIL as they should).
+
+### 84.2 Arm means (n = 3 each; `q5b.txt`)
+
+| arm | matched/s (diff, %) | native blk/s | fills / native blk | block p50 / p99 ms | CPU-s / 1M | exec block_ms | exec ms / 1k fills | hotstuff-algo ms / blk | timeouts / no_proposal (sum of 3) | per 1,000 native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|
+| PC | 251,859 | 6.378 | 37,211 | 57 / 1,025 | 24.35 | 147.0 | 3.951 | 36.0 | 8 / 2 (11,531 blocks) | 0.694 / 0.173 |
+| PCF | 248,638 (-3,220, -1.28%) | 12.043 | 19,917 | 15 / 874 | 24.89 | 78.6 | 3.945 | 20.5 | 3 / 0 (21,774 blocks) | 0.138 / 0 |
+
+Replicate CV of matched/s: PC 0.45% (r1 251,494, r2 253,140, r3 250,942), PCF 0.27% (249,172, 247,892, 248,850). No
+drift in run order (w1 250,795, then 251,494, 249,172, 247,892, 253,140, 250,942, 248,850). Timeouts per cell: PC 2 /
+1 / 5, PCF 2 / 1 / 0; PC r3's 2 no_proposal are on val0 and val1 (1 each). hotstuff-algo on-CPU per second (ms / blk x
+blk/s, from the means): PC 230, PCF 247 ms/s (+7%): less per block, more per second.
+
+Cross-campaign context only (not paired; same binary, tools and host, a day apart): PC here 251,859 matched/s at 6.38
+native blocks/s vs section 82's PC alone 253,980 at 6.51 (-0.8%); PCF here 248,638 at 12.04 vs section 83's PC+F
+248,329 at 11.81 (+0.1%). Both arms reproduce their earlier campaigns; the -2.2% gap in section 83's caveat was about
+-1.3% F and the rest run-to-run spread.
+
+### 84.3 Paired PCF / PC (geomean of per-round ratios, 95% CI, 2 df)
+
+| metric | r1 / r2 / r3 | PCF / PC |
+|---|---|---|
+| matched/s | 0.9908 / 0.9793 / 0.9917 | 0.9872 [0.9702, 1.0046] |
+| native blk/s | 1.8388 / 1.9750 / 1.8466 | 1.8858 [1.7070, 2.0833] |
+| fills / native blk | 0.5612 / 0.5053 / 0.5389 | 0.5346 [0.4689, 0.6096] |
+| exec block_ms | 0.5595 / 0.5016 / 0.5420 | 0.5338 [0.4643, 0.6137] |
+| exec ms per 1k fills | 0.9970 / 0.9926 / 1.0058 | 0.9984 [0.9819, 1.0152] |
+| block p50 | 0.2718 / 0.2624 / 0.2579 | 0.2640 [0.2470, 0.2822] |
+| block p99 | 0.8278 / 0.8454 / 0.8877 | 0.8533 [0.7806, 0.9328] |
+| CPU-s / 1M fills | 1.0228 / 1.0231 / 1.0210 | 1.0223 [1.0195, 1.0251] |
+| hotstuff-algo ms / blk | 0.5850 / 0.5453 / 0.5786 | 0.5693 [0.5183, 0.6254] |
+
+Timeouts and no_proposal are too few for a paired ratio (0-5 per cell); see the per-1,000-block rates in 84.2.
+
+Call: matched/s within noise (CI spans 1; the -1.28% point estimate is about 2.8x the larger arm replicate CV, and all
+3 rounds are below 1, so a real cost of ~1% is likely but not resolved at n = 3). Latency: a clear, large win on every
+latency metric: blocks/s nearly doubles, p50 falls to a quarter, p99 by 15%, exec block_ms halves. F does not make
+execution cheaper per fill (exec per 1k fills unchanged); it cuts the boundary-block stall, so blocks commit twice as
+often and carry half the fills. The cost is per-block overhead: +2.2% CPU per fill and +7% hotstuff-algo CPU per
+second. Timeouts and no_proposal do not rise with twice the blocks (per 1,000 blocks they fall, from small counts).
+
+### 84.4 Next
+
+* F default: the owner's rule (F ships on if its latency gain holds) is met: latency gain confirmed paired, matched/s
+  cost at most ~3% (CI low end) and likely ~1%.
+* Data: `~/bench-results-matched/ozarchy-q5b-300m-{smoke-s0,w1,r1-*,r2-*,r3-*}` (each with `q5b-disk.txt`), campaign
+  files `ozarchy-q5b-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`), tools `ozarchy-q5b-tools/` (spec, checks,
+  driver, `FROZEN.txt`), analysis `ozarchy-q5b-run/analyst/` (`q5b.txt`, `q5b-analyse.py`, copied from step 5's, plus
+  exec per 1k fills, boundary-block counts from the node logs and per-1,000-block timeout rates).
+
+### 84.5 Cells (`q5b.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | flag | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | no_proposal | hotstuff-algo ms/blk | custody ms/obs | PE spawns/node | panic lines | fail lines | boundary pipelined true:false per node | native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 250,795.3 | 6.591 | 35,438 | 139.1 | 54 / 991 | 24.21 | 2.0 | 0 | 35.2 | 0.000 | 0 | 0 | 0 | 0:33/0:33/0:33 | 1,997 |
+| r1 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 251,494.4 | 6.407 | 36,288 | 144.1 | 57 / 1,067 | 24.39 | 2.0 | 0 | 35.7 | 0.001 | 0 | 0 | 0 | 0:52/0:52/0:52 | 3,857 |
+| r1 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 249,172.1 | 11.781 | 20,363 | 80.6 | 15 / 883 | 24.94 | 2.0 | 0 | 20.9 | 0.000 | 0 | 0 | 0 | 84:0/84:0/84:0 | 7,092 |
+| r2 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 247,892.5 | 13.045 | 18,280 | 71.4 | 14 / 844 | 24.73 | 1.0 | 0 | 19.0 | 0.000 | 0 | 0 | 0 | 92:0/92:0/92:0 | 7,866 |
+| r2 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 253,139.6 | 6.605 | 36,175 | 142.3 | 54 / 998 | 24.17 | 1.0 | 0 | 34.8 | 0.001 | 0 | 0 | 0 | 0:54/0:54/0:54 | 3,983 |
+| r3 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 250,941.9 | 6.121 | 39,169 | 154.7 | 60 / 1,009 | 24.49 | 5.0 | 2.0 | 37.5 | 0.001 | 0 | 0 | 0 | 0:51/0:51/0:51 | 3,691 |
+| r3 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 248,850.2 | 11.303 | 21,108 | 83.8 | 16 / 896 | 25.00 | 0.0 | 0 | 21.7 | 0.000 | 0 | 0 | 0 | 82:0/82:0/82:0 | 6,816 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

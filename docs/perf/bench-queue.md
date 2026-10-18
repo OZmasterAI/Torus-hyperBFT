@@ -114,7 +114,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    **Owner s128: PE off by default.** It stays a node-local opt-in (`TORUS_PARALLEL_ENGINE=N`, read at startup,
    byte-identical outputs) and is a candidate for activation on the live testnet, after a WAN A/B (one host has no
    round trips to cap the block rate) and a mixed-flag agree check (2 nodes on, 1 off). Roadmap, "Pre-testnet decisions".
-5b. **PC vs PC+F, paired** (~1 h 10; owner s128; NEXT, before step 7): does F cost matched/s on top of PC (section 83
+5b. **PC vs PC+F, paired** (~1 h 10; owner s128; done s68, before step 7): does F cost matched/s on top of PC (section 83
    caveat: PC+F 248k at 11.8 native blocks/s vs 82's PC alone 254k at 6.5, cross-campaign)? 2 arms on binary M
    (`e3d11cb9`, md5 `bf720f9f`), standard load, 300 markets, **600 s cells** (shorter cells overstate blocks/s, section
    79), warm-up w1 then 3 pairs in A B B A A B order; custody 0; PE, KP, DB off.
@@ -127,6 +127,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    Report paired ratios (as in 83.3) on matched/s, native blocks/s, fills per native block, exec block_ms, block p50 /
    p99, CPU-s per 1M, timeouts and `no_proposal` (per 1,000 blocks too). F ships on regardless of a small matched/s
    cost if its latency gain holds (owner's call on the numbers); this run sizes that trade.
+   **Done s68 (ozarchy-q5b, 7 / 7 valid, section 84): F on top of PC: matched/s PCF / PC 0.9872 [0.9702, 1.0046],
+   -1.3% within noise (all 3 rounds below 1, so ~1% is likely). The latency gain holds and is large: native blocks/s
+   +88.6% [1.71, 2.08] (6.38 -> 12.04), block p50 -73.6% [0.25, 0.28] (57 -> 15 ms), p99 -14.7% [0.78, 0.93]
+   (1,025 -> 874 ms), exec block_ms -46.6% [0.46, 0.61] (147 -> 79 ms); blocks half the size (fills per block -46.5%),
+   exec per 1k fills unchanged (0.998). CPU per fill +2.2% [1.020, 1.025]. Timeouts 8 vs 3 (0.69 vs 0.14 per 1,000
+   native blocks), no_proposal 2 vs 0 (0.17 vs 0). Both arms reproduce 82 (PC 254k at 6.5) and 83 (PC+F 248k at 11.8)
+   within 1%. F's ship-on rule (latency gain holds) is met; owner's call.**
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10). **Not triggered (section 82: C -21.6%); skip.**
 7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
    on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
