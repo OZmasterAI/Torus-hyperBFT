@@ -322,6 +322,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    node stays under ~15 GB, run the 3-node cell; watch free memory and swap, and stop if it swaps (swapped restart
    times are meaningless). (3) If it does not fit: stop and report; 18c and the owner pick 500k on archy's host or a
    capacity-only 3-node cell (RSS, restart, replay; no throughput) on 18c's 94 GB host.
+   **Done s68 (ozarchy-8f, main `76204a69` node `7f91438d`, tools `c2336e70`; perf doc section 93).** Stage a, one
+   node, 1M accounts: ready 34.2 s (before fix 34.3 s), RSS 893 MB, jemalloc 350 MB. 1M orders pre-loaded in 25 s:
+   peak RSS 2.6 GB; restart with the books 2.0 s (SIGTERM) / 11.4 s (SIGKILL, a ~10 s view timeout): gate passed.
+   Stage b, 3 nodes, 1M accounts + 1M orders, standard load 600 s: RSS 6.6-7.8 GB mean, 8.1-9.2 GB max per node
+   (standard cell 4.8-5.9 GB), host >= 26.6 GB free, no swap. After the load: restart 3.0 s (SIGTERM) / 3.5 s
+   (SIGKILL); AGREE; digest 6.6 s per node. FINDING: matched/s -14.3% (256k -> 219k), blocks/s 13.3 -> 3.0, p50 15 ->
+   240 ms, p99 774 -> 1,416 ms; `save_books` x19 per block at 1M resting orders. Stage c not needed for capacity;
+   owner / 18c: the deep-book throughput cost (section 93.7).
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
