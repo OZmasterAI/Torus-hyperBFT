@@ -27486,6 +27486,8 @@ mod crash_recovery_tests {
         assert_storage_cf_fault_fail_stops_then_replays(
             0x57,
             alloy_primitives::TxKind::Call(EVM_DB_FAULT_READER),
+            vec![],
+            torus_state::cf::CF_STORAGE,
             "a revm DB read fault",
         );
     }
@@ -27505,21 +27507,76 @@ mod crash_recovery_tests {
         assert_storage_cf_fault_fail_stops_then_replays(
             0x58,
             alloy_primitives::TxKind::Call(alloy_primitives::Address::new([0xD0; 20])),
+            vec![],
+            torus_state::cf::CF_STORAGE,
             "a state-root compute read fault",
         );
     }
 
+    /// F1 (s128): a read of this node's DB that fails INSIDE a Torus
+    /// precompile (here: 0x0801 getBalances on a DB opened without
+    /// CF_NATIVE_BALANCES, so the balance point read returns
+    /// `CoreError::State(MissingColumnFamily)`; no test seam) is a local
+    /// fault: the provider records it and aborts the execution, the executor
+    /// returns `EvmError::LocalFault` (torus-evm `r02_precompile_fault_tests`
+    /// `f1_*`), and the block fail-stops exactly as for a revm DB read fault
+    /// (marker and every CF unchanged; the restart replay equals a run
+    /// without the fault). Serial and pipelined. RED before: the read error
+    /// was a precompile revert, so block 2 applied with a reverted receipt on
+    /// this node only (a divergence).
+    #[test]
+    fn precompile_read_fault_fail_stops_block() {
+        use torus_core::precompiles::{precompile_address, ADDR_BALANCE_READER};
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x59; 32]).unwrap();
+        let mut input = alloy_primitives::keccak256(b"getBalances(address)")[..4].to_vec();
+        input.extend_from_slice(&[0u8; 12]);
+        input.extend_from_slice(k256_address(&key).as_slice());
+        assert_storage_cf_fault_fail_stops_then_replays(
+            0x59,
+            alloy_primitives::TxKind::Call(precompile_address(ADDR_BALANCE_READER)),
+            input,
+            torus_state::cf::CF_NATIVE_BALANCES,
+            "a precompile read fault",
+        );
+    }
+
+    /// F1 Codex review P1: a precompile SCAN of a CF this node lacks (0x0803
+    /// getStakingInfo's delegation scan on a DB opened without
+    /// CF_STAKING_DELEGATIONS) fail-stops the block like a point read. RED
+    /// before: `scan_prefix_metered` read the missing CF as empty, so block 2
+    /// applied with a SUCCESS receipt and a gas charge only this node
+    /// computes. (CF_STAKING_DELEGATIONS, not getMarkets' CF_NATIVE_MARKETS:
+    /// block 1 already reads the markets CF outside the EVM.)
+    #[test]
+    fn precompile_scan_fault_fail_stops_block() {
+        use torus_core::precompiles::{precompile_address, ADDR_STAKING_READER};
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x5A; 32]).unwrap();
+        let mut input = alloy_primitives::keccak256(b"getStakingInfo(address)")[..4].to_vec();
+        input.extend_from_slice(&[0u8; 12]);
+        input.extend_from_slice(k256_address(&key).as_slice());
+        assert_storage_cf_fault_fail_stops_then_replays(
+            0x5A,
+            alloy_primitives::TxKind::Call(precompile_address(ADDR_STAKING_READER)),
+            input,
+            torus_state::cf::CF_STAKING_DELEGATIONS,
+            "a precompile scan fault",
+        );
+    }
+
     /// Body of [`evm_db_read_fault_fail_stops_block`] /
-    /// [`evm_state_root_compute_fault_fail_stops_block`]: block 2's one EVM
-    /// tx (key `seed`, to `to`) runs on a DB opened without CF_STORAGE.
+    /// [`evm_state_root_compute_fault_fail_stops_block`] /
+    /// [`precompile_read_fault_fail_stops_block`]: block 2's one EVM tx (key
+    /// `seed`, to `to`, calldata `input`) runs on a DB opened without the
+    /// column family `missing` (CF_STORAGE for the first two).
     fn assert_storage_cf_fault_fail_stops_then_replays(
         seed: u8,
         to: alloy_primitives::TxKind,
+        input: Vec<u8>,
+        missing: &'static str,
         what: &str,
     ) {
-        use torus_state::cf::CF_STORAGE;
         let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
-        let (blocks, b) = r02_evm_blocks(&key, to, vec![]);
+        let (blocks, b) = r02_evm_blocks(&key, to, input);
         let (last, prefix) = blocks.split_last().unwrap();
         for on in [false, true] {
             // Control: a healthy DB.
@@ -27537,7 +27594,7 @@ mod crash_recovery_tests {
             assert_eq!(r02_evm_nonce(&db_ref, &key), 1, "on={on}: the EVM tx ran");
             assert_eq!(r02_receipt_status(&db_ref, 2), Some(true), "on={on}");
 
-            // Fault: this node's DB has no CF_STORAGE.
+            // Fault: this node's DB has no `missing` CF.
             torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
             let dir = scratch_db_dir("torus-evm-db-fault");
             let mut opts = rocksdb::Options::default();
@@ -27546,7 +27603,7 @@ mod crash_recovery_tests {
             let cfs = torus_state::cf::ALL_CF_NAMES
                 .iter()
                 .copied()
-                .filter(|cf| *cf != CF_STORAGE);
+                .filter(|cf| *cf != missing);
             let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, &dir, cfs).unwrap());
             torus_state::running_hash::configure_activation(&db, Some(1))
                 .expect("configure running hash activation");
@@ -27561,7 +27618,7 @@ mod crash_recovery_tests {
                 "on={on}: prefix never reads storage"
             );
             let durable = persist_committed_block_durably(&db, last);
-            let before = dump_cfs_except(&db, CF_STORAGE);
+            let before = dump_cfs_except(&db, missing);
             ctx.execute_committed_block_with(last, vec![], durable);
             ctx.pipeline_barrier();
             assert!(
@@ -27580,7 +27637,7 @@ mod crash_recovery_tests {
             );
             assert_dumps_equal(
                 &before,
-                &dump_cfs_except(&db, CF_STORAGE),
+                &dump_cfs_except(&db, missing),
                 "nothing of the block flushed",
             );
 
