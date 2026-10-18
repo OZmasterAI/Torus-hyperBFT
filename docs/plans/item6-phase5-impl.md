@@ -355,6 +355,16 @@ The overlay still takes every write. The new path runs next to it in tests and i
 
 Consensus-adjacent write path. Codex torus-adversarial review before step 3.
 
+**Anchor re-check on `d3cab057` (s128, before step 2).** Step 1 changed only `users.rs`, `backend.rs` (+`put_rows` /
+`rows`), `app.rs` and telemetry, so every `native_executor.rs`, `lockbox.rs`, `position.rs`, `liquidation*.rs`,
+`torus-evm` and golden anchor below still holds (`execute_batch` :7772, `EndResidentJob::run` :4787, the order-margin
+writes :11143 / :11425 / :12669, the `credit_native` drain :13743, `lockbox.rs` :91 / :113 / :181, goldens
+`crates/torus-bridge/tests/perf_equivalence_golden.rs:846-889`, `execute_block_lanes` :326, `execute_block_with_overlay`
+:497). Drift: the overlay tx-scope API moved to `backend.rs` `begin_tx` :1624, `revert_tx` :1664,
+`revert_to_checkpoint` :1715 (was :1585-1690); in `app.rs` the C5 `warm_equals_cold_every_block_*` tests are at
+:28240-28257 (was :28136-28153), the R == DB dump test at :25422 (was :25318) and the `!has_evm` barrier at
+:3436-3439 (was :3391-3397).
+
 **Task 2.1: settle, balances and volume on `UsersMut`**
 - Test first:
   - `rejected_action_leaves_users_untouched`: every rejection path of `execute_batch` (`native_executor.rs:7772`;
@@ -379,18 +389,20 @@ Consensus-adjacent write path. Codex torus-adversarial review before step 3.
 - Verify: `cargo nextest run -p torus-state $F`, `cargo nextest run -E 'rdeps(torus-state)' $F`.
 
 **Task 2.3: EVM blocks (decision 4)**
+- **Owner decision s128: option (a), SHRINK** (`item7-step3-design.md` section 4.3 "Finding for the Phase 5 plan" and
+  question 7). The premise of the task as first written (EVM txs write native balances) does not hold: the writer
+  precompiles only enqueue CoreWriter rows into the EVM journal, and `credit_native` runs in the next block's native
+  drain, a cold writer covered by Task 2.2's write-through. No EVM fold into `Users` is built. The two tests the
+  first draft named (`evm_revert_drops_typed_writes`, `evm_then_native_same_key`) are replaced by the two below.
 - Test first:
-  - `evm_revert_drops_typed_writes`: a lockbox credit inside a reverted frame or tx (`revert_to_checkpoint`,
-    `revert_tx`) never reaches `Users`.
-  - `evm_then_native_same_key`: an EVM tx credits a balance and a native action in the same block trades on it. Rows
-    and `h_n` equal the reference path.
+  - Guard: no typed-CF (positions / balances) write happens inside an EVM tx scope. The test fails if a future change
+    adds one (a test seam plants such a write and the guard must catch it).
+  - Next-block lockbox drain: an EVM tx queues a lockbox credit in block h; the native drain's `credit_native` in
+    block h + 1 lands in `Users` and its dirty set through Task 2.2's write-through; rows and `h_n` equal the
+    reference path.
   - EVM suites (`torus-evm`, precompile reader tests) green.
-- **Pending owner (note, not a decision; s127):** the item 7 step 3 design (branch `docs/item7-step3-design`
-  `3b79a617`, not on main) found that this task's premise, EVM txs writing native balances, does not hold: the writer
-  precompiles only queue CoreWriter rows, and the lockbox credit runs in the next block. It proposes shrinking Task
-  2.3. The owner has not decided; the task below is unchanged until then.
-- Code: while an EVM tx scope is open, typed-CF writes stay raw in the journalled pending map. They are folded into
-  `Users` (apply + dirty, then removed from pending) after the block's EVM part, before the native batch, and at freeze.
+- Code: the guard only. Honours item 7 step 3's "Phase 5 must not foreclose" list: typed rows are still serialized
+  into `FrozenPending` at freeze; nothing is tied to "before the native batch"; no new raw-DB read on the EVM path.
 - Verify: `cargo nextest run -p torus-evm $F`, `cargo nextest run -E 'rdeps(torus-state)' $F`.
 
 **Task 2.4: guards and warm == cold**
@@ -554,7 +566,8 @@ roll back one at a time; no data migration.
    (b) Write-through during EVM txs with a typed undo log mirroring revm frame checkpoints.
    Recommendation: a. EVM blocks are serial and rare (EVM 0.0 ms in the s84 cells); the overlay journal already
    handles reverts.
-   **Decided: a** (owner s122).
+   **Decided: a** (owner s122). **Superseded s128:** no EVM tx scope writes a typed CF (item 7 step 3 design,
+   section 4.3), so no fold is built; Task 2.3 shrinks to a guard test and the next-block drain test.
 5. **Open-order counter (if Phase 4 step 5 is not kept).**
    (a) Drop it; keep counting from the books.
    (b) Optional step 4, sharing step 3's dirty sites, kept only on its own net A/B.
