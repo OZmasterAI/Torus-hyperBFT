@@ -882,6 +882,19 @@ fn scenario_b_liquidation_digests_equal_c93c579() {
     }
 }
 
+/// Item 6 Phase 5 step 2 (plan Task 2.1): scenario B with the engine forced
+/// (4 threads: sharded Phase 2, parallel settle) gives the same digests.
+#[test]
+fn scenario_b_engine_digests_equal_c93c579() {
+    for r in R_MODES {
+        let (_d, db) = listed_db(&[1, 2, 3]);
+        let blocks = scenario_b(&db);
+        let (digests, pre_row50, _) = run(&db, &blocks, Some(4), r);
+        check("GOLDEN_B", &digests, &GOLDEN_B);
+        check("GOLDEN_B", &pre_row50, &GOLDEN_B);
+    }
+}
+
 /// 18c review (adl-budget A3 nit c; A5/A6): the GOLDEN_A / GOLDEN_B re-pins
 /// change only rule H's `0x03` rows and P2's rows. The reduced digests
 /// ([`reduced_digest`] + the block's outputs) were pinned on 56318a9 (D10, no
