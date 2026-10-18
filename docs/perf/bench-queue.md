@@ -2,7 +2,7 @@
 
 Benches run on archy only. 18c keeps this list current; archy reads it on pull. IDs (Q1, Q2, ...) stay fixed when an
 item moves between sections.
-Last archy benches: `ozarchy-campA` (campaign A + Q10 arm C, section 82), 2026-10-18; `ozarchy-q7m3s` + `ozarchy-q7cls` (Q7 run 2; run 1 `ozarchy-q7m3` + `ozarchy-q7cl`;
+Last archy benches: `ozarchy-p5s2` (step 8d, section 91), 2026-10-18; `ozarchy-campA` (campaign A + Q10 arm C, section 82), 2026-10-18; `ozarchy-q7m3s` + `ozarchy-q7cls` (Q7 run 2; run 1 `ozarchy-q7m3` + `ozarchy-q7cl`;
 `item7-step2-native-ab.md`), `ozarchy-q8p2` (Q8, section 81)
 and `ozarchy-q5c` (Q5, section 80) of `ozarchy-antispam-item6-pf1-2026-10-04.md`, 2026-10-17; before them `ozarchy-s58b600`, `ozarchy-s58dmt`, `ozarchy-s58safe` (sections 78-79), 2026-10-16.
 
@@ -264,6 +264,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    ms per block if the timers exist, node RSS mean / max, and `torus_exec_evm_scope_typed_writes_total` (expect 0).
    Rule: exec ms per 1k fills and CPU per fill must not regress (CI not above 1) for the merge; a gain decides
    whether the drain encoding moves to the flush worker next.
+   **Done s68 (ozarchy-p5s2, A `d3cab057` node `0bc9880e`, B `1e51c8b9` node `83052e22`, PC + F + 524288 by env,
+   600 s, n = 3, 7 / 7 cells valid, section 91).** Rule, read literally: met. Exec ms per 1k fills 1.0064 [0.9959,
+   1.0171], CPU-s per 1M 0.9950 [0.9800, 1.0102]. No speed-up: exec thread on-CPU per 1k fills +5.0% [1.0327,
+   1.0681]; cache-flush (`flush_all` / in-place apply) per 1k fills +44% [1.41, 1.47]; B's drain 6.4 ms per native
+   block (0.130 ms per 1k fills); flush worker per 1k fills only -9% [0.86, 0.96]. B flips to big blocks from minute 1
+   (3 / 3): native blk/s 10.80 -> 5.17 (0.48 [0.32, 0.70]), fills / blk x2.1, block p50 18 -> 92 ms, p99 872 -> 1,192
+   ms (+37% [1.25, 1.49]), timeouts 0.36 -> 1.39 per 1,000 blocks, RSS +19% mean / +23% max (CI spans 1). matched/s
+   258.8k -> 256.8k (-0.7%, CI spans 1). `evm_scope_typed_writes` 0. `merge_disjoint` has no timer. No gain, so the
+   drain trigger is not met; moving the drain to the worker would take back most of the exec-thread +5%. Owner / 18c:
+   merge call (latency regression).
 8e. **Keccak and exec pool-wait attribution from 8c's profiles** (owner s128; after 8d; analysis only, no new cells;
    ~30-60 min). Section 90.5: Keccak hashing is ~12% of exec (outside the Phase 5 plan, callers unknown) and the exec
    thread waits on its own worker pool 16-18% of wall (`run_jobs` + match setup 2.4-2.8 s per 15 s, up from ~1.5 s).

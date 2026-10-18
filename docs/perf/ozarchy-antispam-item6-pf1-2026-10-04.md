@@ -13656,6 +13656,180 @@ Shares are inclusive and overlap, as in 81.3.
   per-window `*-w{1,2,3,4,5}.{txt,json}`). Scripts in `ozarchy-q8re-analyst/` (81's `fold.py` / `agg.py` /
   `cells.py` / `run-fold.sh` for W4/W5, plus `q8re-ctx.py`).
 
+## 91. Step 8d, Phase 5 step 2 A/B: main `d3cab057` vs step 2 `1e51c8b9`, both PC + F + 512 KB push threshold by env, standard load, 300 markets, 600 s cells, n = 3 (campaign ozarchy-p5s2, archy, 2026-10-18)
+
+**Step 2 does not speed up execution in a real run. It moves work onto the exec thread, and the latency cost is
+large. Merge rule, read literally: met. Exec ms per 1k fills B / A 1.0064 [0.9959, 1.0171] and CPU-s per 1M fills
+0.9950 [0.9800, 1.0102]: neither CI is above 1. But the exec thread's own on-CPU time per 1k fills is +5.0% [1.0327,
+1.0681] (2.851 -> 2.994 ms), resolved in all 3 rounds. The cache-flush timer (`flush_all` in A, the in-place apply in
+B) is +44% per 1k fills [1.4114, 1.4686], and B adds the `Users` drain on the exec thread (0.130 ms per 1k fills,
+6.4 ms per native block). The flush worker saves only -9% per 1k fills [0.8578, 0.9633] (0.332 -> 0.302 ms): about
+0.03 ms per 1k fills, against ~0.3 ms added on the exec thread. Near exec saturation (A busy 0.945 of wall) this
+extra exec-thread work flips B into a big-block regime from minute 1 of every B cell (3 / 3). Native blocks/s -52%
+(10.80 -> 5.17, 0.4755 [0.3230, 0.6999]), fills per native block x2.1, block p50 x4.7 (18 -> 92 ms), block p99 +37%
+[1.2504, 1.4910] (872 -> 1,192 ms), timeouts 0.36 -> 1.39 per 1,000 native blocks. matched/s -0.7% (0.9926 [0.9782,
+1.0072], within noise). Node RSS +19% mean / +23% max (CIs span 1). `torus_exec_evm_scope_typed_writes_total` is 0
+on every node of every B cell. No gain, so the trigger for moving the drain encoding to the flush worker is not met.
+Moving the drain is still the obvious next step: it is about the size of the exec-thread regression (0.130 of
++0.143 ms per 1k fills). Owner / 18c: do not merge on the literal rule alone. The latency regression is what this
+run measured.**
+
+Question (bench queue step 8d, owner s128): does step 2 speed up execution in a real run? Step 2 mutates `Users` in
+place, writes cold writers through, and drains the dirty sets into the block's change set. The builder's release
+microbench had the exec thread only level with Phase 4 (~160 ms per write set) and ~75 ms saved on the flush worker.
+Rule: exec ms per 1k fills and CPU per fill must not regress (CI not above 1) for the merge. A gain decides whether
+the drain encoding moves to the flush worker next.
+
+### 91.1 Setup
+
+The two binaries were built with the q7 two-arm recipe (`ozarchy-p5s2-stage/build/build.sh`): release `--locked`,
+mold + frame pointers, line tables, each package built alone. Each arm had its own target dir
+(`~/.cargo-target-p5s2a` / `-p5s2b`, reflink-seeded from `~/.cargo-target-q8re`) and a detached worktree
+(`wt/p5s2-a-d3cab057`, `wt/p5s2-b-1e51c8b9`). The node md5 of each cell's arm was re-checked on all 3 nodes, by the
+driver and again from the raw `node-environ-trie.txt`.
+
+| arm | commit | node md5 | bench md5 | tx-flood md5 |
+|---|---|---|---|---|
+| A (reference) | main `d3cab057` (step 1 merged, step 2's base) | `0bc9880e` | `051df468` | `a56598eb` |
+| B | `feat/item6-phase5-step2` `1e51c8b9` (Codex torus-adversarial round 2 approve) | `83052e22` | `c293d8eb` | `96b5f8c3` |
+
+Both binaries predate the s128 code defaults (`3429855d` is in neither). Both arms therefore set
+`TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1 TORUS_HASH_ONLY_PUSH_THRESHOLD=524288` by env, with custody 0
+(`TORUS_SHARD_CUSTODY=0`), D, M, T unset (on), PE, KP, DB absent, and header re-send 250 ms from `env.sh`. Standard
+load (s127): Classic, 15 s checkpoints, oracle on, 300 markets, rate 76,000, `BLOCK_CAP=400 RETRY_BUSY=1
+MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, native only, N = 11
+genesis.
+
+The tools were frozen from `d3cab057` with `git archive` (`ozarchy-p5s2-tools/`, `FROZEN.txt`). B's tree has no diff
+in `tools/`, `devnet/` or `testnet/` against A, so one harness runs both arms. Against section 90's `fbe36391` copy,
+only comments and `env.sh`'s threshold default differ. The spec is `p5s2-spec.json` (generator, two binaries as in
+Q7's `q7cls`). The checks are in `p5s2-checks.sh`: q7b's checks renamed, with F on and threshold 524288 for both
+arms, plus `p5evmchk` (B: `torus_exec_evm_scope_typed_writes_total` present, > 0 printed as CHECK FLAG,
+`torus_exec_users_drain_seconds_count` > 0; A: neither metric present). The generator takes only one smoke arm, so
+A's per-binary smoke came from a twin spec (`p5s2-smokeA-spec.json`, smoke arm A only).
+
+Smoke B (60 s, 253,374 matched/s) and smoke A (60 s, 259,896) came first, then warm-up w1 (A, 300 s), then r1 A, B;
+r2 B, A; r3 A, B. Cells were 600 s, 18:31-20:02. Data dirs were fresh every cell (`CLEAN=1`), with 77-81 GB free
+after each cell. `kernel.perf_event_paranoid` was 2 at the start and end of every cell.
+
+Validity: 2 smokes + 7 / 7 cells rc 0, ACCEPT AGREE PASS, md5 per arm on 3 nodes, 0 panic / fail-stop lines (re-checked
+from raw files), standard-load `cell=` check on every cell, 141 CHECK OK, 0 CHECK FAIL, 0 CHECK FLAG, 0 CELL-FLAG, 0
+HARD FINDING, no reruns. Took effect on every node of every cell:
+* Each arm's env was on all 3 node environs.
+* F: `epoch fast path ON` once, and every boundary block pipelined (A 76-82, B 40-47 per node per 600 s cell; 0 not
+  pipelined).
+* PE spawns 0, no `TORUS_CKPT_DEFER_BOOKS` line, custody <= 0.001 ms per observation.
+* Threshold 524288: >= 20 manifest pushes per node, every full-body push <= 524,288 B, pre-warm pulls present, no
+  clamp warning.
+* B's step 2 drain ran on every native block (`torus_exec_users_drain_seconds_count` = engine count; 2,973-3,987 per
+  node). A has neither step 2 metric.
+
+Before the launch, the new checks were run on scratch copies of q7b cells in `/tmp/p5s2-checktest`: r1-P512K was OK
+as A, and `p5evmchk` failed as B; r1-P8M failed `p5pushchk` on env and, with the env edited, on 1 manifest.
+
+### 91.2 Arm means (n = 3 each; `p5s2.txt`)
+
+Timers: node `/metrics` after - before the bench, mean of 3 nodes. "Per native block" = histogram sum / the
+`torus_exec_engine_seconds` count (one per native block executed). Exec thread on-CPU = `sched_by_node`
+`torus-execution` over the load window.
+
+| arm | matched/s (diff, %) | native blk/s | fills / native blk | block p50 / p99 ms | CPU-s / 1M | exec block_ms | exec ms / 1k fills | exec thread on-CPU ms / 1k fills | timeouts / no_proposal (sum of 3) | per 1,000 native blocks | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | 258,760 | 10.799 | 22,878 | 18 / 872 | 23.41 | 87.7 | 3.834 | 2.851 | 7 / 0 (19,514 blocks) | 0.359 / 0 | 4,324 / 5,552 |
+| B | 256,841 (-1,919, -0.74%) | 5.172 | 49,135 | 92 / 1,192 | 23.30 | 189.6 | 3.859 | 2.994 | 13 / 1 (9,345 blocks) | 1.391 / 0.107 | 5,159 / 6,812 |
+
+| arm | flush_all ms / native blk (per 1k fills) | merge_disjoint | save_order_books ms / blk (per 1k fills) | flush worker ms / blk (per 1k fills) | flush worker ms / job | Users drain ms / blk (per 1k fills) | drained rows / blk | exec engine ms / blk (per 1k fills) | exec busy (block_ms x blk/s) | evm_scope_typed_writes_total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | 9.11 (0.398) | no timer | 4.90 (0.214) | 7.58 (0.332) | 7.44 | n/a (no metric) | n/a | 65.2 (2.851) | 0.945 | n/a (no metric) |
+| B | 28.19 (0.574) | no timer | 11.50 (0.232) | 14.68 (0.302) | 13.15 | 6.38 (0.130) | 29,421 | 132.5 (2.701) | 0.963 | 0 (every node, every cell) |
+
+What each timer covers:
+* `flush_all` = `torus_exec_cache_flush_seconds`. In A it times the position + balance `flush_all` walks. In B the
+  same timer wraps the in-place apply / write-through that replaces them.
+* `merge_disjoint` has no timer in either binary (section 90 read it from perf only).
+* `save_order_books` = `torus_exec_save_books_seconds`. Its drain / write pass timers and `torus_exec_flush_seconds`
+  read 0 in both binaries (not observed on this path).
+
+Replicate CV of matched/s: A 0.59% (257,381, 258,497, 260,402), B 0.74% (254,698, 258,320, 257,504). CPU-s / 1M: A
+0.22%, B 0.81%. matched/s in run order: w1-A 257,580, r1-A 257,381, r1-B 254,698, r2-B 258,320, r2-A 258,497, r3-A
+260,402, r3-B 257,504 (no drift). Timeouts per cell: A 1 / 4 / 2, B 4 / 5 / 4. B's no_proposal is in r3; the warm-up w1 (A) had 1 more, not counted.
+
+Within a cell (val1, per minute of load; `metrics-1hz`), the two arms behave differently:
+* B starts at A's block rate. In minute 0 B ran 643-652 native blocks at 22.5k matched per block, against A's
+  776-868 at ~18k.
+* From minute 1, B's blocks double (43-45k matched per block, 347-385 blocks per minute) and keep growing to the end:
+  r1-B 253 blocks per minute and 60k per block in minute 9; r3-B ~187 and ~82k.
+* r1-A stays at 18-29k per block. r3-A's block rate sags only in its last 2 minutes (492 and 425 blocks per minute).
+* B's cache-flush timer is 0.59-0.68 ms per 1k matched in every minute, against A's ~0.40. Its drain is ~0.13-0.14.
+  The extra cost per fill is there from the start and does not grow with time. Block size grows because the exec
+  thread is saturated, not because the per-fill cost rises.
+
+### 91.3 Paired B / A (geomean of per-round ratios, 95% CI, 2 df)
+
+| metric | r1 / r2 / r3 | B / A |
+|---|---|---|
+| matched/s | 0.9896 / 0.9993 / 0.9889 | 0.9926 [0.9782, 1.0072] |
+| CPU-s / 1M fills | 1.0016 / 0.9897 / 0.9936 | 0.9950 [0.9800, 1.0102] |
+| exec ms per 1k fills (block_ms / fills) | 1.0096 / 1.0016 / 1.0081 | 1.0064 [0.9959, 1.0171] |
+| exec thread on-CPU ms per 1k fills | 1.0510 / 1.0428 / 1.0570 | 1.0502 [1.0327, 1.0681] |
+| exec engine ms per 1k fills | 0.9584 / 0.9517 / 0.9329 | 0.9476 [0.9152, 0.9811] |
+| native blk/s | 0.4778 / 0.5542 / 0.4060 | 0.4755 [0.3230, 0.6999] |
+| fills / native blk | 2.1391 / 1.7908 / 2.5164 | 2.1282 [1.3947, 3.2476] |
+| exec block_ms | 2.1595 / 1.7937 / 2.5368 | 2.1419 [1.3920, 3.2958] |
+| block p50 | 4.1127 / 3.2173 / 7.6707 | 4.6647 [1.5331, 14.1933] |
+| block p99 | 1.3113 / 1.3860 / 1.4007 | 1.3654 [1.2504, 1.4910] |
+| flush_all ms / native blk | 3.1021 / 2.5563 / 3.6276 | 3.0640 [1.9821, 4.7366] |
+| flush_all ms per 1k fills | 1.4502 / 1.4274 / 1.4416 | 1.4397 [1.4114, 1.4686] |
+| save_order_books ms / native blk | 2.2635 / 1.8084 / 2.9738 | 2.3004 [1.2389, 4.2714] |
+| save_order_books ms per 1k fills | 1.0582 / 1.0098 / 1.1818 | 1.0809 [0.8844, 1.3211] |
+| flush worker ms / native blk | 1.8984 / 1.6652 / 2.2907 | 1.9347 [1.2991, 2.8811] |
+| flush worker ms per 1k fills | 0.8875 / 0.9298 / 0.9103 | 0.9091 [0.8578, 0.9633] |
+| node RSS mean | 1.2338 / 1.0754 / 1.2802 | 1.1931 [0.9497, 1.4990] |
+| node RSS max | 1.2222 / 1.1076 / 1.3728 | 1.2295 [0.9414, 1.6057] |
+| hotstuff-algo ms / blk | 1.8969 / 1.6584 / 2.2016 | 1.9061 [1.3404, 2.7106] |
+
+The B-only rows (Users drain 6.38 ms per native block, 0.130 ms per 1k fills; `evm_scope_typed_writes` 0) and
+merge_disjoint (no timer) have no ratio. Timeouts and no_proposal are too few for a paired ratio (0-5 per cell); see
+the per-1,000-block rates in 91.2.
+
+Call:
+* Merge rule, read literally: met. Neither exec ms per 1k fills nor CPU per fill has a CI above 1.
+* What the run shows: step 2 does not make execution cheaper. The exec engine is -5% per 1k fills [0.9152, 0.9811],
+  but that is the bigger blocks amortizing per-block work (as in section 84, where block size alone moved exec per
+  block). It is offset elsewhere on the exec thread, whose on-CPU time per fill is +5% [1.0327, 1.0681].
+* The cache-flush timer costs +44% per fill [1.4114, 1.4686], and the drain adds 0.130 ms per 1k fills. The flush
+  worker gains only 9% per fill (about 0.03 ms per 1k fills, ~1.5 ms per B-size block), not the microbench's ~75 ms.
+* Near saturation, the extra exec-thread time pushes B into a big-block regime: blocks/s halve, p50 x4.7, p99 +37%,
+  and timeouts per 1,000 blocks x3.9.
+* matched/s and CPU per fill are unchanged within noise.
+
+### 91.4 Next
+
+* Owner / 18c: merge call. The literal rule passes; latency regresses by a large, resolved margin (p99 CI [1.25,
+  1.49]). This run argues against merging step 2 alone.
+* Drain encoding to the flush worker (the plan's next move): the "gain" trigger is not met. Moving the drain is still
+  the obvious way to take back most of the exec-thread regression (drain 0.130 of +0.143 ms per 1k fills on-CPU). The
+  in-place apply (+0.175 ms per 1k fills on the cache-flush timer) would stay on the exec thread. A re-bench of step 2
+  + drain on the worker against this A would show whether the block rate returns.
+* Data: `~/bench-results-matched/ozarchy-p5s2-300m-{smoke-s0,w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}` and
+  `ozarchy-p5s2sa-300m-smoke-s0` (per cell `p5s2-push.txt`, `p5s2-evm.txt`, `p5s2-disk.txt`). Campaign files in
+  `ozarchy-p5s2-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`) and `ozarchy-p5s2-run/smokeA/smoke/`. Tools in
+  `ozarchy-p5s2-tools/` (`p5s2-spec.json`, `p5s2-smokeA-spec.json`, `p5s2-checks.sh`, the two generated drivers,
+  `FROZEN.txt`). Binaries in `ozarchy-p5s2-stage/` (`build/build.sh`, `md5s.txt`, build logs). Analysis in
+  `ozarchy-p5s2-run/analyst/` (`p5s2-analyse.py`, from q7b's, and `p5s2.txt`).
+
+### 91.5 Cells (`p5s2.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | flag | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | no_proposal | flush_all ms/blk [per 1k fills] | save_order_books ms/blk | flush worker ms/blk | Users drain ms/blk | exec on-CPU ms/1k fills | RSS mean/max MB | boundary pipelined true:false per node | native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,579.6 | 12.878 | 18,426 | 70.4 | 15 / 806 | 23.09 | 1.0 | 1.0 | 7.17 [0.389] | 3.95 | 6.95 | n/a | 2.843 | 3,834 / 4,830 | 53:0/53:0/53:0 | 3,902 |
+| r1 | A | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,380.7 | 11.473 | 21,408 | 82.4 | 16 / 855 | 23.47 | 1.0 | 0 | 8.54 [0.399] | 4.43 | 7.68 | n/a | 2.865 | 4,354 / 5,676 | 82:0/82:0/82:0 | 6,907 |
+| r1 | B | 0/0 | ACCEPT/AGREE/PASS | True | ok | 254,698.1 | 5.482 | 45,794 | 177.9 | 67 / 1,121 | 23.51 | 4.0 | 0 | 26.49 [0.579] | 10.04 | 14.57 | 5.937 | 3.011 | 5,372 / 6,937 | 47:0/47:0/47:0 | 3,300 |
+| r2 | B | 0/0 | ACCEPT/AGREE/PASS | True | ok | 258,320.5 | 5.754 | 42,514 | 163.3 | 61 / 1,223 | 23.15 | 5.0 | 0 | 24.12 [0.567] | 9.42 | 13.44 | 5.535 | 2.972 | 4,876 / 6,587 | 47:0/47:0/47:0 | 3,464 |
+| r2 | A | 0/0 | ACCEPT/AGREE/PASS | True | ok | 258,497.1 | 10.383 | 23,740 | 91.1 | 19 / 882 | 23.39 | 4.0 | 0 | 9.44 [0.397] | 5.21 | 8.07 | n/a | 2.850 | 4,534 / 5,947 | 76:0/76:0/76:0 | 6,261 |
+| r3 | A | 0/0 | ACCEPT/AGREE/PASS | True | ok | 260,402.4 | 10.542 | 23,485 | 89.7 | 19 / 879 | 23.38 | 2.0 | 0 | 9.36 [0.399] | 5.06 | 7.00 | n/a | 2.837 | 4,084 / 5,035 | 76:0/76:0/76:0 | 6,346 |
+| r3 | B | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,504.0 | 4.280 | 59,097 | 227.5 | 147 / 1,231 | 23.23 | 4.0 | 1.0 | 33.97 [0.575] | 15.04 | 16.03 | 7.668 | 2.999 | 5,228 / 6,912 | 40:0/40:0/40:0 | 2,581 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
