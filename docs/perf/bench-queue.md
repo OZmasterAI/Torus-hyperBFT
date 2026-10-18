@@ -150,8 +150,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    a failed scrape corrupting `commit_db_split`, fixed in 84ea54cf + 9d770519, Codex quick review clean; Items, Q6).
    Decides GO / NO-GO / SHIP-Z for building checkpoint slicing (A1).
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
-   **NOT READY: waits on 18c's Q9 SHA.** Owner s128: custody OFF by default until T3.1, so arm (b) = the RH4 head
-   with `main` merged in, custody off (Items, Q9, "Arm b depends on Q10"). Moved here in
+   **READY (s128): arm (b) binary = `perf/rh4-da-body-gc` `b2dd21a4`** (main e1be6c15 merged into 4514573f, no
+   conflicts; workspace 4069 passed / 0 failed, clippy no new warnings). Owner s128: custody OFF by default until T3.1,
+   so arm (b) runs custody off (Items, Q9, "Arm b depends on Q10"). `run-cell.sh` clears every `TORUS_*` variable
+   before starting the nodes, so `TORUS_RETENTION_BLOCKS=1000` must go in the arm's `EXTRA_ENV` (`--extra-env`); a
+   plain environment variable does nothing. Arm (a) = main `e1be6c15` (the merged main, so the arms differ only by
+   RH4); set PC + F by env on both arms (the coming defaults). Moved here in
    s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls (prune by
    default, validator retention N) and the RH4 merge wait on it.
 10. **Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
