@@ -322,6 +322,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    node stays under ~15 GB, run the 3-node cell; watch free memory and swap, and stop if it swaps (swapped restart
    times are meaningless). (3) If it does not fit: stop and report; 18c and the owner pick 500k on archy's host or a
    capacity-only 3-node cell (RSS, restart, replay; no throughput) on 18c's 94 GB host.
+   **Done s68 (ozarchy-8f, main `76204a69` node `7f91438d`, tools `c2336e70`; perf doc section 93).** Stage a, one
+   node, 1M accounts: ready 34.2 s (before fix 34.3 s), RSS 893 MB, jemalloc 350 MB. 1M orders pre-loaded in 25 s:
+   peak RSS 2.6 GB; restart with the books 2.0 s (SIGTERM) / 11.4 s (SIGKILL, a ~10 s view timeout): gate passed.
+   Stage b, 3 nodes, 1M accounts + 1M orders, standard load 600 s: RSS 6.6-7.8 GB mean, 8.1-9.2 GB max per node
+   (standard cell 4.8-5.9 GB), host >= 26.6 GB free, no swap. After the load: restart 3.0 s (SIGTERM) / 3.5 s
+   (SIGKILL); AGREE; digest 6.6 s per node. FINDING: matched/s -14.3% (256k -> 219k), blocks/s 13.3 -> 3.0, p50 15 ->
+   240 ms, p99 774 -> 1,416 ms; `save_books` x19 per block at 1M resting orders. Stage c not needed for capacity;
+   owner / 18c: the deep-book throughput cost (section 93.7).
 8g. **Exec hashing quick wins A/B** (owner s128; right after 8f; ~1 h 10). Section 92's fix on `perf/exec-hash-once`
    `70993fa9` (from main `25c5939f`; Codex torus-adversarial approve: 16,160 differential hash cases, keys byte-identical):
    the sort key and the trust-cache key come from one encoding of each action, signature recovery is skipped when

@@ -14002,6 +14002,177 @@ saturated. Each would need an A/B, as section 91 showed for step 2 (block-size f
   `scripts/{parse,keccak,poolwait,agg}.py`. The gzipped `perf script --no-inline` dumps `r{1,2,3}-w{1,3,4,5}.txt.gz`
   (~1 GB) can be deleted.
 
+## 93. Step 8f: 1M-account RAM check, stages a and b (campaign ozarchy-8f, main `76204a69`, archy, 2026-10-18)
+
+**One node with 1M accounts and 1M resting orders peaks at 2.6 GB RSS (HWM). A restart with the books in state is
+ready in 2.0 s after SIGTERM and 11.4 s after SIGKILL (gate 60 s), so the stage b gate passed. Stage b (3 nodes, 1M
+accounts, 1M pre-loaded orders, 600 s of the standard load) peaks at 8.1-9.2 GB RSS per node (HWM 8.3-9.3 GB), with
+6.6-7.8 GB mean during the load. That is ~1.7x the standard cell (100k accounts, no pre-load: 4.8-5.9 GB max). The
+host kept >= 26.6 GB available and swap did not grow. Restarts after the load: SIGTERM 3.0 s, SIGKILL 3.5 s (val1),
+cold restart of all 3 nodes 7.5-8.7 s, books visible after 3.1 / 3.6 / 11.0 s. The cell AGREEs; the end-of-cell
+digest takes 6.6 s per node (5.9 s at 100k), so no finding there. FINDING: throughput. Matched/s drops 14.3% (256,224
+-> 219,484), native blocks/s 13.3 -> 3.0, block p50 15 -> 240 ms, p99 774 -> 1,416 ms, with 4 consensus timeouts (0 in
+the standard cell). Exec block time goes 71 -> 322 ms. `save_books` goes 4.0 -> 76.7 ms per block (x19; per 1k fills
+0.22 -> 1.07 ms) and checkpoint settle wait 1.5 -> 24.7 ms (val0). The resting depth (1.0M -> ~1.74M during the load)
+puts the chain into the big-block regime of section 91. n = 1 per cell (a capacity check, not an A/B).**
+
+Question (bench queue step 8f, owner s128; 18c's staged plan): (a) one node on a 1M-account genesis: RSS / jemalloc /
+boot at ready, then ~1M resting orders and restarts with the books in state; gate to (b): peak RSS < ~15 GB and
+restarts <= 60 s. (b) the 3-node cell at 1M accounts + 1M resting orders under the standard load: per-node memory at
+ready / after the pre-load / during / after the load, data dir, boot -> ready, pre-load time, restart -> ready after
+SIGTERM and SIGKILL, AGREE / one digest, matched/s and block p50 / p99 against a standard 300-market cell on the same
+binary.
+
+### 93.1 Setup
+
+* Node: main `76204a69` (boot-probe fix `1d2bcfbb`), worktree `wt/8f-76204a69`, plain release `--locked` (repo
+  `.cargo/config`: clang + mold), the same recipe as the before binary. md5 `7f91438d144508bfa18a0d048e572322`,
+  checked on every node of every run (stage a: each launch; stage b: run-cell's staged / dst md5 plus
+  `/proc/<pid>/exe` of all 3 nodes per cell and of each restart). Code defaults (PC 8, F on), re-send 250 ms and the
+  512 KB push threshold from `env.sh`, custody 0. None of them was set by env.
+* Tools: `feat/bench-1m-preload` `c2336e70` (BULK_COUNT, `bench-throughput preload`, run-cell `PRELOAD=`), frozen
+  as `ozarchy-8f-tools/` (`FROZEN.txt`). bench-throughput `0a030a0c` is built from `c2336e70`, because main's bench
+  (`24939967`) has no `preload`. torus-tx-flood `dd59d50d` (`76204a69`). Against main, c2336e70 differs in tools/ devnet/
+  testnet/ only by the branch's own 8f commits.
+* Stage a (`ozarchy-8f-a/stage-a.sh`) is the before probe's method. The genesis is the before run's 1M genesis
+  (1,000,052 accounts, 300 markets, BULK_COUNT 1M, 295 MB), trimmed to 1 validator with jq and reused (md5
+  `15b50eef`). The node env is `env.sh` only. Ready = metrics up + RPC up + 5 commits. Pre-load: `bench-throughput
+  preload` with run-cell's defaults (1,000,000 orders, 300 markets, 900 per owner, owners 5060..6172, distance 1,000,
+  100 levels, 50 actions/s), without an oracle feed: the smoke showed it is not needed on one node. Memory watcher
+  every 5 s.
+* Stage b (`ozarchy-8f-b/campaign.sh`, hand-written: the driver generator has no per-cell genesis rebuild, no
+  post-cell restart probe and no swap stop rule). Cells: S = standard load (hsdb-300m: 300 markets, rate 76,000,
+  SENDERS 5,000, BLOCK_CAP 400, RETRY_BUSY, MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900, oracle on, IN_FLIGHT_TAIL commit,
+  CLOID_SHARE 0, Classic, 15 s checkpoints, node_env as campaign p5s2), 100k genesis (N = 11, md5 `01168566`),
+  600 s. M = the same with `FORCE=1 BULK_COUNT=1000000 PRELOAD=1000000`; the rebuilt weighted-full genesis is
+  byte-identical to the before run's (md5 `a644d0a7`), the cell genesis md5 `4c8b8af8`. After M,
+  `post-restart.sh` restarts on M's data dirs with M's exact node env: a cold restart of all 3 nodes, SIGTERM val1,
+  then SIGKILL val1, followed by block-hash agreement at one height and one state digest per node. `memwatch.sh`
+  samples the whole campaign at 1 Hz (VmRSS / VmHWM / VmSwap per node; jemalloc every 5 s). Stop rule: swap > +512 MB
+  over the baseline, MemAvailable < 10 GB, or node VmSwap > 64 MB. It never fired.
+* Host: archy, 62 GB RAM, 32 CPUs, swap 62.7 GB zram + 62.7 GB file (~1.5 GB zram in use at baseline). Quiet: no
+  cargo / rustc / indexer.
+
+### 93.2 Stage a: one node, before vs after
+
+| | before: main `e083f6e1` (node `d9c5d63e`) | after: main `76204a69` (node `7f91438d`) |
+|---|---|---|
+| genesis | 1,000,052 accounts, 300 markets, 295 MB (built in 135 s) | the same file (reused) |
+| first boot -> ready | 34.3 s | 34.2 s |
+| RSS at ready (HWM) | 832 MB (1,076) | 893 MB (1,207) |
+| jemalloc allocated at ready | 350 MB | 350 MB |
+| data dir at ready | 299 MB | 299 MB |
+| pre-load 1M orders | - | 25.2 s wall (submit 22.2 s), 1,112 actions, 0 resends / failures, resting 1,000,000 |
+| after the pre-load (+60 s settle) | - | RSS 1,846 MB, jemalloc 1,224 MB allocated / 1,330 MB resident, data dir 1,014 MB |
+| restart -> ready, SIGTERM | 1.6 s (no orders) | 2.0 s with 1M orders (exit 0.4 s); books visible +2.1 s |
+| RSS at ready after SIGTERM | 1,167 MB | 1,505 MB |
+| restart -> ready, SIGKILL | 1.6 s (no orders; 78-block replay) | 11.4 s with 1M orders (15-block replay in 0.4 s); books visible +12.6 s |
+| RSS at ready after SIGKILL | 1,038 MB | 477 MB at ready, 1,412 MB once the books show (+1.2 s) |
+| peak RSS (5 s samples / HWM) | 1,286 MB / 1,327 MB | 2,349 MB / 2,574 MB (just after the pre-load) |
+| min MemAvailable / swap | 54.9 GB / no growth | 53.5 GB / no growth |
+
+* The probe fix changes nothing measurable at 1M accounts (the before run found the old `all_accounts()` check costs
+  ~0.6 s); first boot -> ready is the same within 0.1 s.
+* The SIGKILL restart's extra ~10 s is consensus, not the books. The exec replay finished at +0.4 s and "consensus
+  replica started" was logged at +0.4 s. Then nothing was logged until the first `produce_block` at +10.7 s, a view
+  timeout after the crash (lone validator; it depends on where in the view the kill hits). Stage b's SIGKILL restart
+  was 3.5 s.
+* `torus_exec_resting_orders` reads 0 at ready after SIGKILL until the first executed block, then 1,000,000: the books
+  survive both restarts. jemalloc readings within ~5 s of a (re)start lag (e.g. 28 MB allocated at 1.5 GB RSS).
+* Artifact (as before): a lone validator commits ~1,000 empty blocks/s, so the data dir grows ~4 MB/s while it runs
+  (755 MB right after the pre-load -> 1,014 MB 60 s later). A clean close shrinks it to 184 MB. The tooling has no
+  block-time or empty-block knob (no `TORUS_*` pacing env, nothing in the genesis scripts), so stage a ran without one.
+* Gate to stage b: peak RSS 2.6 GB < ~15 GB, restarts 2.0 / 11.4 s <= 60 s: **passed**.
+
+### 93.3 Stage b: per-node memory (MB; memwatch 1 Hz RSS, jemalloc allocated every 5 s)
+
+| cell / node | RSS at ready | jemalloc at ready | RSS after pre-load | jemalloc after pre-load | RSS load mean / max | jemalloc load mean / max | RSS after load | jemalloc after load | HWM |
+|---|---|---|---|---|---|---|---|---|---|
+| M val0 | 778 | 647 | 2,346 | 1,544 | 6,562 / 8,212 | 4,358 / 6,064 | 3,977 | 2,060 | 8,312 |
+| M val1 | 728 | 648 | 2,369 | 1,655 | 6,813 / 8,121 | 4,348 / 5,756 | 4,081 | 1,855 | 8,542 |
+| M val2 | 841 | 647 | 2,391 | 1,600 | 7,754 / 9,215 | 4,387 / 6,103 | 3,880 | 1,856 | 9,328 |
+| S val0 | 415 | 56 | - | - | 3,465 / 4,981 | 1,800 / 2,368 | 2,639 | 1,046 | 5,261 |
+| S val1 | 418 | 56 | - | - | 3,543 / 4,838 | 1,788 / 2,300 | 2,408 | 968 | 4,847 |
+| S val2 | 413 | 57 | - | - | 4,393 / 5,861 | 1,901 / 2,570 | 1,814 | 946 | 6,070 |
+
+* Host during M: MemAvailable >= 26.6 GB (S: >= 36.5 GB). Swap stayed at the baseline (1,542-1,543 MB) for the
+  whole campaign, and no node swapped.
+* Data dir: `torus_db_size_bytes` at the end of the cell is M 5.41 / 5.38 / 5.06 GB vs S 5.28 / 5.26 / 5.26 GB. `du`
+  of M's data dirs after the cell: 2,097 / 4,022 / 3,713 MB, and ~2.0-2.1 GB once the nodes had reopened them.
+* Timings (M): boot -> ready 38 s (S: 7 s), the 1M genesis seed. Genesis build in the cell (FORCE=1): ~2 min 20 s.
+  Oracle marks fresh 6 s after the feed started. Pre-load 23 s wall (submit 22.2 s), 1,112 actions, 0 resends /
+  failures, resting 1,000,000 on all 3 nodes (counter and gauge). Drain 31 s. Resting orders during the load:
+  1.00M -> ~1.72-1.74M -> 1.00M after the drain (S: 0 -> ~190k -> 94k).
+
+### 93.4 Stage b: throughput vs the standard cell (same binary, n = 1 each)
+
+| metric | S (100k accounts, no pre-load) | M (1M accounts + 1M pre-load) | M / S |
+|---|---|---|---|
+| validity / agreement / liveness | ACCEPT / AGREE / PASS | ACCEPT / AGREE / PASS | |
+| matched/s | 256,224 | 219,484 | 0.857 |
+| native blocks/s | 13.33 | 2.98 | 0.223 |
+| fills per native block | 18,519 | 71,613 | 3.87 |
+| exec block_ms (mean of 3) | 70.9 | 322.1 | 4.55 |
+| save_books ms / block (mean of 3) | 4.04 | 76.72 | 19.0 |
+| checkpoint settle wait ms / block (val0) | 1.45 | 24.67 | 17.0 |
+| engine ms per 1k fills (val0) | 2.89 | 2.56 | 0.89 |
+| block p50 / p99 ms (commit interval, mean of 3) | 14.6 / 774 | 240.2 / 1,416 | 16.4 / 1.83 |
+| CPU-s per 1M fills | 23.56 | 24.54 | 1.04 |
+| consensus timeouts / no_proposal | 0 / 0 | 4 / 0 | |
+| state digest per node | 5.9 / 5.9 / 5.8 s | 6.6 / 6.5 / 6.6 s | |
+
+S agrees with the standard cells on earlier mains (section 91 arm A: 257-260k matched/s, 10.4-12.9 blocks/s). The
+1M state slows `save_books` per block ~19x (Classic book rows: cost grows with resting depth in the touched books). The
+exec thread then runs longer per block, blocks grow ~3.9x, and the chain settles in the big-block regime (as in
+section 91's B arm, p50 x16 here). Engine work per fill stays the same or drops (2.56 vs 2.89 ms per 1k fills).
+
+### 93.5 Stage b: restarts after the load (M's data dirs, M's node env; `post-M/post.log`)
+
+| restart | exit | metrics / RPC up | ready (+5 commits) | books visible (= other nodes' `torus_exec_resting_orders`, 1,000,000) | RSS at ready / with books |
+|---|---|---|---|---|---|
+| cold, all 3 (val0 / val1 / val2) | - | 1.2 / 7.5 / 8.2 s | 7.5 / 8.1 / 8.7 s | 10.9 / 10.9 / 11.0 s | 472 / 1,797 / 1,803 MB; 1,819 / 1,799 / 1,803 MB |
+| SIGTERM val1 | 0.4 s | 0.9 s | 3.0 s | 3.1 s | 1,929 MB |
+| SIGKILL val1 (replay gap 67 blocks, done at +2.8 s) | 0.2 s | 2.9 s | 3.5 s | 3.6 s | 1,820 MB |
+
+* Cold restart: the probe polls the nodes one after another (val1 only once val0 is ready), so val1 / val2 times are
+  upper bounds.
+* Agreement after the restarts: block hash equal on all 3 nodes at height 6,898 (POST AGREE). One state digest per
+  node, all 3 equal (`70ff9380`, 7.0 s). Against the cell's end digest (`1d256e51`), all 600 market lines (book + open
+  interest) are identical. The 50 account lines differ in mark-dependent fields only (account value, margin), because
+  the oracle feed is stopped after the cell and the marks go stale. The restarted node's books equal the cell's.
+* Nodes at idle with the books after the restarts: RSS 1.6-1.7 GB, jemalloc ~1.27 GB allocated.
+* Not measured: a restart during the load. The cell had no `CRASH_KILL_AT_S`, to keep its matched/s comparable with
+  S, so restarts ran on the idle chain after the load. A crash-kill cell at 1M would add that number.
+
+### 93.6 Limits
+
+* n = 1 per cell, one host. The memory numbers are absolute and repeatable within a few hundred MB (stage a vs the
+  before run, val0-val2 spread). The S vs M throughput rows have no CI.
+* M and S differ in two things at once (1M accounts and 1M resting orders). The `save_books` / block-size effect fits
+  resting depth (stage a and the post-restart idle chain show the 1M accounts alone cost < 1 GB). This cell does not
+  split the two.
+* Stage a's SIGKILL time (11.4 s) is one sample dominated by a consensus view timeout. With 3 nodes after the load
+  it was 3.5 s.
+* jemalloc gauges lag after a (re)start (stale for a few seconds), so "jemalloc at ready" just after a restart reads
+  low. The stage b ready values come 5 s apart from the RSS samples.
+
+### 93.7 Next
+
+* Owner / 18c: 1M accounts + 1M orders fit easily on archy (3 nodes <= 9.3 GB each, >= 26 GB free), so stage c (500k
+  / 94 GB host) is not needed for capacity. The open item is the throughput cost of a deep book: `save_books` x19 and
+  blocks/s x0.22 at 1M resting orders. Candidates for a plan entry: a resting-depth sweep (e.g. 0 / 250k / 500k / 1M
+  pre-load on the 1M-account genesis, to split the accounts and depth effects); a perf profile of `save_books` at 1M
+  resting; whether Phase 5 (users / book rows) changes this; a crash-kill restart during the load at 1M.
+* Data: stage a `~/bench-results-matched/ozarchy-8f-a/` (`stage-a.sh`, `stage-a.log`, `run/` incl. `mem.tsv`,
+  `preload.json`; smoke `smoke/`). Stage b cells `~/bench-results-matched/ozarchy-8f-300m-{S,M}` (+ `.campaign.log`,
+  `.cell.rc`). Driver, memwatch, restart probe and logs: `~/bench-results-matched/ozarchy-8f-b/` (`campaign.sh`,
+  `memwatch.sh`, `post-restart.sh`, `campaign.log`, `mem-1hz-full.tsv`, `post-M/`, smoke `post-smoke/`,
+  `mem-1hz-smoke.tsv`), analysis `ozarchy-8f-b/analyst/{8f-analyse.py,8f.txt}`. Smoke cell
+  `ozarchy-8f-300m-smoke` (60 s, PRELOAD 20,000: ACCEPT / AGREE). Binaries: `ozarchy-8f-stage/` (`build/build.sh`,
+  `build/md5s.txt`). Attempt logs `ozarchy-8f-b/campaign-attempt{1,2}.log` and `ozarchy-8f-300m-S-attempt2.*` are
+  driver preflight failures (indexer check matched the launching shell; a leftover empty pids file from the smoke's
+  restart probe). No cell ran in either.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
