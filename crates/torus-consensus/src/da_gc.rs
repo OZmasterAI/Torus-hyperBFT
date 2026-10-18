@@ -2,8 +2,8 @@
 //! how much one GC pass may do.
 //!
 //! Committed native-action bodies live in the consensus DB's
-//! `cf_native_pending`, and with shard custody on (the production default)
-//! as erasure shards in `cf_native_shards`. Before RH4 nothing deleted them.
+//! `cf_native_pending`, and with shard custody on (`TORUS_SHARD_CUSTODY=1`,
+//! off by default since s128) as erasure shards in `cf_native_shards`. Before RH4 nothing deleted them.
 //! The GC itself is [`torus_state::NativeDaStore::gc_committed`], run once per
 //! dispatched committed height from `TorusApp::dispatch_to_exec`.
 //!

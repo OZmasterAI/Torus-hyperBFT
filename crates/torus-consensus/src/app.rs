@@ -33671,10 +33671,19 @@ mod crash_recovery_tests {
         }
     }
 
-    /// With shard custody on (the production default) a GC'd body's shards
-    /// go with it.
+    /// With shard custody on (`TORUS_SHARD_CUSTODY=1`; off by default since
+    /// s128) a GC'd body's shards go with it. With custody off the pass
+    /// deletes no shard rows (none are written), so shards already present
+    /// stay.
     #[test]
     fn da_gc_deletes_custodied_shards_with_the_body() {
+        for custody in [true, false] {
+            da_gc_shards_follow_custody(custody);
+        }
+    }
+
+    fn da_gc_shards_follow_custody(custody: bool) {
+        let _custody = super::shard_custody_test_override::force(custody);
         let (config, state_db) = make_test_config_and_db();
         let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(1));
         // One validator cannot encode shards (k = n = 1): use a 4-validator set.
@@ -33694,8 +33703,8 @@ mod crash_recovery_tests {
         for i in 0..params.n as u16 {
             assert_eq!(
                 mempool.get_shard(&hash, i).is_none(),
-                shard_custody_enabled(),
-                "shard {i} (custody on: deleted with the body)"
+                custody,
+                "shard {i}, custody {custody}: deleted with the body only with custody on"
             );
         }
     }
