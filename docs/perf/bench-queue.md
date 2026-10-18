@@ -135,7 +135,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    native blocks), no_proposal 2 vs 0 (0.17 vs 0). Both arms reproduce 82 (PC 254k at 6.5) and 83 (PC+F 248k at 11.8)
    within 1%. F's ship-on rule (latency gain holds) is met; owner's call.**
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10). **Not triggered (section 82: C -21.6%); skip.**
-7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
+7. **[SUPERSEDED s128 by Q11, owner: no r2/r3, N stays 11] Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
    on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
    **Owner s128: every arm sets PC + F by env** (`TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1`, the coming
    defaults; Q12's own N11 arm is the reference, so section 80's baseline is not needed) **and the EVM arms are
@@ -181,6 +181,11 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    +10%; matched/s 0.991 [0.905, 1.085], CPU per fill flat. Not extended to n = 4 (more rounds of the same arms cannot
    reach -40%). Next, decided with 18c: a stronger zero-code arm (`TORUS_CHECKPOINT_MAX_BYTES` ~40-50 MB or 2,000 ms),
    or build A1 on this evidence.**
+   **Q12 r1 (section 85) ran binary M, before item 7 step 2's EVM routing fixes (16f201c4 committed txs leave every
+   pool, 0edfb154 routing per lane with re-send, 2cdc3ac7 drains skip parent-block txs): at N = 33 / 66 one validator
+   proposed every EVM block (multiples of 3 with 3 validators), txs reached it by a single forward, and gapped nonces
+   were drained and dropped, so the pool filled. Q11 (option 0's A/B on current main) measures today's EVM cost.
+   Item 7 to check before genesis: with N = 11 and 11 validators, one validator may propose every EVM block.**
 8b. **Step Z2: checkpoint size cap** (owner s128; ~45 min plus setup; zero code). Same binary as step Z (`9d770519`,
    md5 `0d234898`), same shape, flags and push threshold (PC + F by env, 512 KB), ABBA n = 2: Z15 (as step Z) vs ZC =
    Z15 + `TORUS_CHECKPOINT_MAX_BYTES=50000000` (step Z batches: mean 108 MB, max 208 MB, so ZC more than halves
