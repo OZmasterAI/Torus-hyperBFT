@@ -189,3 +189,187 @@ fn r02_ordinary_precompile_revert_is_not_a_local_fault() {
         assert_eq!((b.receipts.len(), b.receipts[0].status), (1, false), "{what}");
     }
 }
+
+// ============================================================================
+// F1 (s128, item 7 option 0 plan 2.2): every LOCAL storage fault a precompile
+// hits is a fail-stop, not only `CoreError::PrecompileLocalFault`. A reader's
+// point read or a writer's enqueue read that fails with `?` returns
+// `CoreError::State` (a `CoreError::is_local_fault` class). Before the fix
+// that was a revert on this node only (receipt false, gas spent, journal rows
+// dropped): a divergence. Deterministic precompile errors (bad calldata, an
+// unknown selector, value to a non-payable precompile, out of gas, "not
+// found", a writer in eth_call) stay reverts, even on a faulty DB.
+// ============================================================================
+
+mod f1 {
+    use super::*;
+    use torus_core::precompiles::{
+        precompile_address, ADDR_BALANCE_READER, ADDR_CORE_WRITER, ADDR_CORE_WRITER_STAKING,
+        ADDR_LOCKBOX, ADDR_ORACLE_READER, ADDR_ORDER_BOOK_READER, ADDR_STAKING_READER,
+    };
+    use torus_state::cf::{
+        CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG, CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS,
+        CF_STAKING_PERMANENT,
+    };
+
+    /// A DB without the column family `missing` (every read of it fails on
+    /// this node with `StateError::MissingColumnFamily`); ALICE funded.
+    fn db_without(missing: &str) -> (tempfile::TempDir, StateDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = ALL_CF_NAMES.iter().copied().filter(|cf| *cf != missing);
+        let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        let funded = AccountInfo {
+            balance: U256::from(10u128.pow(19)),
+            nonce: 0,
+            code_hash: KECCAK_EMPTY,
+            code: None,
+            account_id: None,
+        };
+        db.put_account(&ALICE, &funded).unwrap();
+        (dir, db)
+    }
+
+    fn call(sig: &str, words: &[[u8; 32]]) -> Vec<u8> {
+        let mut data = alloy_primitives::keccak256(sig.as_bytes())[..4].to_vec();
+        for w in words {
+            data.extend_from_slice(w);
+        }
+        data
+    }
+
+    fn addr_word(a: Address) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[12..].copy_from_slice(a.as_slice());
+        w
+    }
+
+    fn u_word(v: u128) -> [u8; 32] {
+        U256::from(v).to_be_bytes::<32>()
+    }
+
+    fn tx_to(id: u16, data: Vec<u8>, value: U256, gas_limit: u64) -> TxEnv {
+        TxEnv {
+            caller: ALICE,
+            gas_limit,
+            gas_price: block_cfg().base_fee as u128,
+            kind: TxKind::Call(precompile_address(id)),
+            data: Bytes::from(data),
+            value,
+            nonce: 0,
+            chain_id: Some(TORUS_CHAIN_ID),
+            ..Default::default()
+        }
+    }
+
+    fn expect_local_fault<T: std::fmt::Debug>(r: Result<T, EvmError>, cf: &str, what: &str) {
+        match r {
+            Err(EvmError::LocalFault(msg)) => {
+                assert!(msg.contains(cf), "{what}: fault message names {cf}: {msg}")
+            }
+            other => panic!("{what}: expected EvmError::LocalFault, got {other:?}"),
+        }
+    }
+
+    /// (case, the missing CF, precompile, calldata): each call's first read
+    /// of `cf` is a `?` on a point read / scan that the CF's absence fails.
+    fn fault_cases() -> Vec<(&'static str, &'static str, u16, Vec<u8>)> {
+        let alice = addr_word(ALICE);
+        let market = u_word(MARKET as u128);
+        vec![
+            ("0x0800 getPosition position read", CF_NATIVE_POSITIONS, ADDR_ORDER_BOOK_READER, call("getPosition(address,bytes32)", &[alice, market])),
+            ("0x0801 getBalances balance read", CF_NATIVE_BALANCES, ADDR_BALANCE_READER, call("getBalances(address)", &[alice])),
+            ("0x0802 getPrice aggregate read", CF_NATIVE_ORACLE, ADDR_ORACLE_READER, call("getPrice(bytes32)", &[market])),
+            ("0x0803 getStakingInfo permanent read", CF_STAKING_PERMANENT, ADDR_STAKING_READER, call("getStakingInfo(address)", &[alice])),
+            ("0x0810 placeOrder delay read", CF_FEE_CONFIG, ADDR_CORE_WRITER, call("placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)", &[market, u_word(0), u_word(0), u_word(1), u_word(1), u_word(0)])),
+            ("0x0810 cancelOrder queue read", CF_CORE_WRITER_QUEUE, ADDR_CORE_WRITER, call("cancelOrder(bytes32)", &[u_word(1)])),
+            ("0x0811 claimRewards queue read", CF_CORE_WRITER_QUEUE, ADDR_CORE_WRITER_STAKING, call("claimRewards()", &[])),
+            ("0x0820 withdrawFromNative queue read", CF_CORE_WRITER_QUEUE, ADDR_LOCKBOX, call("withdrawFromNative(uint128)", &[u_word(10u128.pow(10))])),
+        ]
+    }
+
+    /// A precompile read that fails on this node aborts the block's EVM
+    /// execution with `EvmError::LocalFault` on every consensus path (block,
+    /// overlay, single tx): no receipt, no bundle. RED before F1: a revert
+    /// receipt (status false) on this node only.
+    #[test]
+    fn f1_precompile_read_fault_is_a_local_fault() {
+        for (what, cf, id, data) in fault_cases() {
+            let (_d, db) = db_without(cf);
+            let ex = EvmExecutor::new(TORUS_CHAIN_ID);
+            let tx = || tx_to(id, data.clone(), U256::ZERO, 200_000);
+            expect_local_fault(ex.execute_block(&db, &block_cfg(), vec![tx()], true), cf, &format!("{what} (block)"));
+            let overlay = torus_state::StateOverlay::new(db.clone());
+            expect_local_fault(
+                ex.execute_block_with_overlay(&overlay, &block_cfg(), vec![tx()], true),
+                cf,
+                &format!("{what} (overlay)"),
+            );
+            expect_local_fault(ex.execute_tx(&db, &block_cfg(), tx()).map(|(r, _)| r), cf, &format!("{what} (tx)"));
+        }
+    }
+
+    /// eth_call (read-only provider): a reader's read fault is an error, not
+    /// a revert answer (RPC has no fail-stop; it returns the error).
+    #[test]
+    fn f1_reader_read_fault_in_eth_call_is_an_error() {
+        for (what, cf, id, data) in fault_cases().into_iter().filter(|c| c.2 < ADDR_CORE_WRITER) {
+            let (_d, db) = db_without(cf);
+            let r = EvmExecutor::new(TORUS_CHAIN_ID).execute_call(&db, &block_cfg(), tx_to(id, data, U256::ZERO, 200_000));
+            expect_local_fault(r.map(|(r, _)| r), cf, &format!("{what} (eth_call)"));
+        }
+    }
+
+    /// The same faulty DBs, calls that fail deterministically BEFORE any
+    /// read of the missing CF (or that find nothing on a healthy DB): each
+    /// stays a revert receipt / failed result, never a local fault.
+    #[test]
+    fn f1_deterministic_precompile_errors_stay_reverts() {
+        let alice = addr_word(ALICE);
+        let market = u_word(MARKET as u128);
+        let place = |side: u128| call("placeOrder(bytes32,uint8,uint8,uint128,uint128,uint8)", &[market, u_word(side), u_word(0), u_word(1), u_word(1), u_word(0)]);
+        let cases: Vec<(&str, Option<&str>, TxEnv)> = vec![
+            ("short calldata", Some(CF_NATIVE_BALANCES), tx_to(ADDR_BALANCE_READER, vec![0xDE, 0xAD], U256::ZERO, 200_000)),
+            ("unknown selector", Some(CF_NATIVE_BALANCES), tx_to(ADDR_BALANCE_READER, vec![0xDE, 0xAD, 0xBE, 0xEF], U256::ZERO, 200_000)),
+            ("missing word", Some(CF_NATIVE_BALANCES), tx_to(ADDR_BALANCE_READER, call("getBalances(address)", &[]), U256::ZERO, 200_000)),
+            ("value to a non-payable reader", Some(CF_NATIVE_BALANCES), tx_to(ADDR_BALANCE_READER, call("getBalances(address)", &[alice]), U256::from(1), 200_000)),
+            ("out of gas before the read", Some(CF_NATIVE_BALANCES), tx_to(ADDR_BALANCE_READER, call("getBalances(address)", &[alice]), U256::ZERO, 25_000)),
+            ("invalid side before the enqueue", Some(CF_FEE_CONFIG), tx_to(ADDR_CORE_WRITER, place(2), U256::ZERO, 200_000)),
+            ("no oracle price (not found)", None, tx_to(ADDR_ORACLE_READER, call("getPrice(bytes32)", &[market]), U256::ZERO, 200_000)),
+        ];
+        for (what, missing, tx) in cases {
+            let (_d, db) = match missing {
+                Some(cf) => db_without(cf),
+                None => db_without("no-such-cf"),
+            };
+            let b = EvmExecutor::new(TORUS_CHAIN_ID)
+                .execute_block(&db, &block_cfg(), vec![tx], true)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, false), "{what}");
+        }
+        // A writer in eth_call is denied before it reads: a failed result.
+        let (_d, db) = db_without(CF_CORE_WRITER_QUEUE);
+        let (r, _) = EvmExecutor::new(TORUS_CHAIN_ID)
+            .execute_call(&db, &block_cfg(), tx_to(ADDR_CORE_WRITER, call("cancelOrder(bytes32)", &[u_word(1)]), U256::ZERO, 200_000))
+            .expect("writer in eth_call: a revert, not an error");
+        assert!(!r.success, "writer in eth_call reverts");
+    }
+
+    /// Healthy control: the fault cases succeed on a DB with every CF (so
+    /// the fault, not the call, is what fails above).
+    #[test]
+    fn f1_fault_cases_succeed_on_a_healthy_db() {
+        for (what, _cf, id, data) in fault_cases() {
+            if id == ADDR_ORACLE_READER {
+                continue; // no aggregate row: a deterministic NoOraclePrice revert
+            }
+            let (_d, db) = db_without("no-such-cf");
+            let b = EvmExecutor::new(TORUS_CHAIN_ID)
+                .execute_block(&db, &block_cfg(), vec![tx_to(id, data, U256::ZERO, 200_000)], true)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true), "{what}");
+        }
+    }
+}
