@@ -2265,42 +2265,89 @@ mod tests {
         assert_eq!(dump(&rewound), dump(&control));
     }
 
+    /// Turn `store` into what a pre-cursor binary left: its rows and
+    /// references, a 16-byte state (no cursor) whose replay floor is
+    /// `next_record`.
+    fn make_pre_cursor(store: &NativeDaStore, next_record: u64) {
+        let state = gc_state(store);
+        put_gc_state(
+            store,
+            DaGcState {
+                frontier: state.frontier,
+                legacy_next_record: next_record,
+                cursor: None,
+                hold: 0,
+            },
+        );
+        assert_eq!(gc_state(store).encode().len(), 16);
+    }
+
     /// A store a pre-cursor binary wrote (16-byte state): a replay below its
-    /// last recorded height still records nothing, the first later pass
-    /// establishes the cursor at its own height (nothing to back-fill, no
-    /// hold), and the GC goes on as before.
+    /// last recorded height still records nothing and establishes nothing.
     #[test]
-    fn gc_establishes_the_cursor_on_a_pre_cursor_store() {
+    fn gc_replay_on_a_pre_cursor_store_records_nothing() {
         const W: u64 = 4;
         let (_dir, store) = temp_store();
         let (x, y) = (dummy_action(1), dummy_action(2));
         store.put_batch(&[x.clone(), y.clone()]).unwrap();
         gc_h(&store, 20, &[compute_action_hash(&x)], W, &history(&[]));
-        put_gc_state(
-            &store,
-            DaGcState {
-                frontier: 0,
-                legacy_next_record: 21,
-                cursor: None,
-                hold: 0,
-            },
-        );
-        assert_eq!(gc_state(&store).encode().len(), 16);
-        let none = TestHistory::default();
-        gc_h(&store, 19, &[compute_action_hash(&y)], W, &none);
+        make_pre_cursor(&store, 21);
+        let before = dump(&store);
+        gc_h(&store, 19, &[compute_action_hash(&y)], W, &history(&[]));
+        assert_eq!(dump(&store), before, "a replay changes nothing");
+        assert_eq!(gc_state(&store).cursor, None);
+    }
+
+    /// Upgrade from a pre-cursor store (owner, s128): the old binary recorded
+    /// rows 10 [x] and 11 [y], then crashed before recording 598, which
+    /// re-included x, and never recorded it. On the first pass of the new
+    /// code (600) the cursor starts where the block tree's retained range
+    /// starts (its prune pointer, 5), not at 600: the back-fill walks
+    /// 5..=601 at 256 heights per pass, deleting nothing until it caught up
+    /// (602), and it re-finds 598's pin, so x outlives row 10 until 598's
+    /// window ends while y goes as soon as deletion resumes.
+    #[test]
+    fn gc_upgrade_from_a_pre_cursor_store_backfills_the_retained_tree_range() {
+        const W: u64 = 8;
+        const B: u64 = DA_GC_MAX_BACKFILL_HEIGHTS;
+        let (_dir, store) = temp_store();
+        let (x, y) = (dummy_action(1), dummy_action(2));
+        let (hx, hy) = (compute_action_hash(&x), compute_action_hash(&y));
+        store.put_batch(&[x.clone(), y.clone()]).unwrap();
+        // What the old binary wrote: rows 10 and 11 (nothing due yet).
+        for (h, hashes) in [(10, vec![hx]), (11, vec![hy])] {
+            store
+                .gc_committed_with_history(h, &hashes, 0, W, 0, LIMITS, &history(&[]))
+                .unwrap();
+        }
+        make_pre_cursor(&store, 12);
+        let tree = TestHistory {
+            pruned: 5,
+            known: [(10, vec![hx]), (11, vec![hy]), (598, vec![hx])]
+                .into_iter()
+                .collect(),
+            empty: true,
+            fail: false,
+        };
+        let out = gc_h(&store, 600, &[], W, &tree);
+        assert_eq!((out.heights_backfilled, out.deletion_held), (B, true));
+        assert_eq!(out.bodies_deleted, 0);
+        let out = gc_h(&store, 601, &[], W, &tree);
+        assert_eq!((out.heights_backfilled, out.deletion_held), (B, true));
+        assert!(present(&store, &x) && present(&store, &y), "rows 10, 11 due, held");
+        // 517..=601 closes the gap; 602 records; rows 10 and 11 go.
+        let out = gc_h(&store, 602, &[], W, &tree);
         assert_eq!(
-            gc_state(&store).cursor,
-            None,
-            "a replay establishes nothing"
+            (out.heights_backfilled, out.deletion_held),
+            (601 - 517 + 1, false)
         );
-        let out = gc_h(&store, 23, &[], W, &none);
-        assert_eq!((out.heights_backfilled, out.deletion_held), (0, false));
-        assert_eq!(gc_state(&store).cursor, Some(24));
-        assert!(present(&store, &x));
-        let out = gc_h(&store, 24, &[], W, &none);
-        assert_eq!(out.bodies_deleted, 1, "row 20 due at 24");
-        assert!(!present(&store, &x));
-        assert!(present(&store, &y), "the replay recorded nothing for y");
+        assert!(!present(&store, &y), "deletion resumed once caught up");
+        for tip in 603..=598 + W {
+            assert!(present(&store, &x), "tip {tip}: 598 still pins x");
+            gc_h(&store, tip, &[], W, &tree);
+        }
+        assert!(!present(&store, &x), "598's window ended");
+        assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
     }
 
     /// A long gap is back-filled at most `DA_GC_MAX_BACKFILL_HEIGHTS` heights
