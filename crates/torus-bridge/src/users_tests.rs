@@ -3614,3 +3614,243 @@ fn pending_typed_write_outside_a_tx_scope_is_caught() {
 }
 
 
+
+// ======================================================================
+// Codex torus-adversarial review of step 2 (s128, memory 9a856dad9952e103):
+// the parallel settle's per-market position caches can share a key when a
+// stored row is opaque because its Position names another (trader, market)
+// than its key: `PositionCache::update_in_place` loads `t ‖ m` and files
+// the fill's result under the row's own fields. The reference path merges
+// the caches in market order (`PositionCache::merge_disjoint`: a LATER
+// cache's entry, clean ones included, replaces an earlier one's, the dirty
+// marks are unioned) and flushes the dirty keys in key order; the in-place
+// path must emit exactly the same rows.
+// ======================================================================
+
+/// A position of `t` in `m` at entry 100 (`size` units, long or short).
+fn alias_pos(t: Address, m: MarketId, long: bool, size: i64, entry: i64) -> Position {
+    Position {
+        trader: t,
+        market_id: m,
+        is_long: long,
+        size: p5_fp(size),
+        entry_price: p5_fp(entry),
+        cost_basis: p5_fp(entry * size),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    }
+}
+
+/// `p` stored raw under `t ‖ m` (an opaque row when `p` names another key).
+fn alias_put(db: &StateDb, t: Address, m: MarketId, p: &Position) {
+    db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&t, m), &borsh::to_vec(p).unwrap()).unwrap();
+}
+
+/// A taker's order: a buy at 100 (the makers' ask), a sell at 99 (their bid).
+fn alias_place(m: MarketId, is_buy: bool, qty: i64) -> NativeAction {
+    NativeAction::PlaceOrder(rj_gtc(m, is_buy, if is_buy { 100 } else { 99 }, qty))
+}
+
+const ALIAS_MARKETS: MarketId = 3;
+
+fn alias_trader() -> Address {
+    Address::repeat_byte(0x31)
+}
+
+fn alias_other() -> Address {
+    Address::repeat_byte(0x32)
+}
+
+fn alias_maker(m: MarketId, sells: bool) -> Address {
+    Address::repeat_byte(0x40 + m as u8 * 2 + u8::from(sells))
+}
+
+/// One aliased-rows scenario: its irregular rows and the block's actions
+/// (one batch, then single actions).
+struct AliasCase {
+    name: &'static str,
+    seed: fn(&StateDb),
+    batch: Vec<(Address, NativeAction)>,
+    single: Vec<(Address, NativeAction)>,
+}
+
+/// What one run of an [`AliasCase`] produced.
+#[derive(Debug, PartialEq)]
+struct AliasOut {
+    rows: Vec<(&'static str, Vec<(Vec<u8>, Option<Vec<u8>>)>)>,
+    results: Vec<(bool, Option<String>)>,
+    running_hash: Option<(u64, [u8; 32])>,
+    native_root: String,
+}
+
+fn alias_cases() -> Vec<AliasCase> {
+    let (t, u) = (alias_trader(), alias_other());
+    vec![
+        // Codex's repro: key(T,1) holds T's market-2 position, key(T,2) T's
+        // market-3 one. Market 1's plan writes (T,2) dirty; market 2's plan
+        // loads (T,2) clean (opaque) and writes (T,3). The reference merge
+        // lets the later clean (T,2) replace the earlier dirty one.
+        AliasCase {
+            name: "later clean entry over an earlier dirty one",
+            seed: |db| {
+                let t = alias_trader();
+                alias_put(db, t, 1, &alias_pos(t, 2, true, 2, 100));
+                alias_put(db, t, 2, &alias_pos(t, 3, true, 4, 100));
+                alias_put(db, t, 3, &alias_pos(t, 3, true, 4, 100));
+            },
+            batch: vec![(t, alias_place(1, true, 1)), (t, alias_place(2, true, 1))],
+            single: vec![],
+        },
+        // The same through another trader: key(T,1) holds U's market-2
+        // position, key(U,2) U's market-3 one; U trades market 2.
+        AliasCase {
+            name: "another trader's payload",
+            seed: |db| {
+                let (t, u) = (alias_trader(), alias_other());
+                alias_put(db, t, 1, &alias_pos(u, 2, true, 2, 100));
+                alias_put(db, u, 2, &alias_pos(u, 3, true, 1, 100));
+            },
+            batch: vec![(t, alias_place(1, true, 1)), (u, alias_place(2, true, 1))],
+            single: vec![(u, alias_place(2, true, 1))],
+        },
+        // Two dirty entries for one key: market 2's plan files (T,1) under
+        // the market-1 payload of key(T,2) after market 1's plan opened
+        // (T,1); then a single action on the aliased rows.
+        AliasCase {
+            name: "two dirty entries for one key",
+            seed: |db| {
+                let t = alias_trader();
+                alias_put(db, t, 2, &alias_pos(t, 1, true, 2, 100));
+            },
+            batch: vec![(t, alias_place(1, true, 1)), (t, alias_place(2, true, 1))],
+            single: vec![(t, alias_place(1, true, 1))],
+        },
+        // Closes with realized PnL on aliased short rows (balance credits
+        // and a `cvlm` row of the opaque trader), one close to a tombstone
+        // of a key whose payload names another market.
+        AliasCase {
+            name: "closes with PnL, balance and cvlm of an opaque trader",
+            seed: |db| {
+                let t = alias_trader();
+                alias_put(db, t, 1, &alias_pos(t, 2, false, 2, 110));
+                alias_put(db, t, 2, &alias_pos(t, 3, false, 1, 110));
+                alias_put(db, t, 3, &alias_pos(t, 3, false, 1, 110));
+                PositionManager::new(db.clone()).put_cum_volume(&t, p5_fp(7)).unwrap();
+            },
+            batch: vec![
+                (t, alias_place(1, true, 1)),
+                (t, alias_place(2, true, 1)),
+                (t, alias_place(3, true, 1)),
+            ],
+            single: vec![(t, alias_place(3, false, 1))],
+        },
+    ]
+}
+
+/// `case` on a fresh DB: markets 1..=3, makers resting an ask at 100 and a
+/// bid at 99 in every market, then the batch (`parallel`: the parallel settle forced,
+/// else the sequential loop) and the single actions in block 1, on the
+/// reference path or in place; the frozen set flushed with the running
+/// hash on.
+fn alias_run(case: &AliasCase, reference: bool, parallel: bool) -> AliasOut {
+    use torus_state::cf::CF_NATIVE_MARKETS;
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(dir.path()).unwrap();
+    torus_state::running_hash::configure_activation(&db, Some(1)).unwrap();
+    let pm = PositionManager::new(db.clone());
+    let funded = (1..=ALIAS_MARKETS)
+        .flat_map(|m| [alias_maker(m, true), alias_maker(m, false)])
+        .chain([alias_trader(), alias_other()]);
+    for a in funded {
+        pm.put_native_balance(&a, &NativeBalance { available: p5_fp(1_000_000), order_margin: FixedPoint::ZERO })
+            .unwrap();
+    }
+    for m in 1..=ALIAS_MARKETS {
+        let row = borsh::to_vec(&("BTC".to_string(), "USDC".to_string(), p5_fp(1).raw(), p5_fp(1).raw(), p5_fp(5).raw()))
+            .unwrap();
+        db.put_cf_raw(CF_NATIVE_MARKETS, &m.to_be_bytes(), &row).unwrap();
+    }
+    (case.seed)(&db);
+    let mut holder = ResidentBooks::default();
+    holder.set_reference_writes(reference);
+    let mut ov = NativeStateOverlay::new(db.clone());
+    let mut rb = begin_resident(Some(&mut holder), &mut ov, 1, None);
+    assert!(rb.attached(), "R attached");
+    assert_eq!(rb.in_place(), !reference, "the path");
+    let mut ctx = NativeExecContext::new_with_mode(
+        ov.clone(),
+        1,
+        1_000,
+        0,
+        1_000,
+        100,
+        Address::ZERO,
+        Address::ZERO,
+        Address::ZERO,
+        super::super::BookMode::Classic,
+        None,
+    );
+    ctx.attach_resident_block(&mut rb);
+    let mut results: Vec<(bool, Option<String>)> = Vec::new();
+    for m in 1..=ALIAS_MARKETS {
+        for sells in [true, false] {
+            let quote = NativeAction::PlaceOrder(rj_gtc(m, !sells, if sells { 100 } else { 99 }, 5));
+            let r = NativeExecutor::execute(&mut ctx, &alias_maker(m, sells), &quote);
+            assert!(r.success, "{}: maker: {r:?}", case.name);
+        }
+    }
+    let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &case.batch, parallel);
+    results.extend(r.results.iter().map(|x| (x.success, x.error.as_deref().map(str::to_string))));
+    for (s, a) in &case.single {
+        let r = NativeExecutor::execute(&mut ctx, s, a);
+        results.push((r.success, r.error.as_deref().map(str::to_string)));
+    }
+    assert!(ctx.fatal_error.is_none(), "{}: {:?}", case.name, ctx.fatal_error);
+    assert!(results.iter().all(|r| r.0), "{}: every action fills: {results:?}", case.name);
+    ctx.detach_resident_block(&mut rb);
+    drop(ctx);
+    let frozen = ov.freeze(1);
+    // Non-vacuous: the takers' fills changed their (aliased) rows.
+    let taker_rows = frozen
+        .rows(CF_NATIVE_POSITIONS)
+        .iter()
+        .filter(|(k, _)| k.starts_with(alias_trader().as_slice()) || k.starts_with(alias_other().as_slice()))
+        .count();
+    assert!(taker_rows >= 1, "{}: the takers filled ({taker_rows} position rows)", case.name);
+    frozen.flush_with_native_trie_stats(&db, Some(1), None, None).unwrap();
+    AliasOut {
+        rows: torus_state::cf::ALL_CF_NAMES.iter().map(|cf| (*cf, frozen.rows(cf))).collect(),
+        results,
+        running_hash: torus_state::running_hash::read_running_hash(&db),
+        native_root: format!("{:?}", crate::state_root::flagged_native_root(&db).unwrap()),
+    }
+}
+
+/// The finding's regression test: every aliased-rows case, parallel and
+/// sequential settle, in place == reference (every CF's rows, the results,
+/// the running hash, the native root).
+#[test]
+fn parallel_settle_aliased_opaque_rows_equal_reference() {
+    let (mut runs, mut diverged) = (0, Vec::new());
+    for case in alias_cases() {
+        for parallel in [true, false] {
+            let tag = format!("{} (parallel settle {parallel})", case.name);
+            let want = alias_run(&case, true, parallel);
+            let got = alias_run(&case, false, parallel);
+            assert!(want.running_hash.is_some(), "{tag}: the running hash is on");
+            let cfs: Vec<_> = want.rows.iter().zip(&got.rows).filter(|(a, b)| a != b).map(|(a, _)| a.0).collect();
+            if want != got {
+                diverged.push(format!(
+                    "{tag}: rows of {cfs:?}, results {}, running hash {}, native root {}",
+                    want.results == got.results,
+                    want.running_hash == got.running_hash,
+                    want.native_root == got.native_root
+                ));
+            }
+            runs += 1;
+        }
+    }
+    assert!(diverged.is_empty(), "in place != reference:\n{}", diverged.join("\n"));
+    assert_eq!(runs, 8);
+}

@@ -5543,6 +5543,13 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// overlay writes are compared against. Default off.
     #[cfg(any(test, feature = "test-reference-paths"))]
     pub test_flush_per_row: bool,
+    /// Item 6 Phase 5 step 2 (Codex review, aliased plan caches): test-only
+    /// stand-in for the settle's work gate (`SettleMode::Auto`): `Some(p)`
+    /// runs every `execute_batch` as `SettleMode::Force { parallel: p }`, so
+    /// a test stream of a few fills per block reaches the parallel settle.
+    /// Default `None` (the production gate).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_parallel_settle: Option<bool>,
     /// Test-only fault injection: the parallel cancel-all book pass's job
     /// panics (contained) when it reaches this market's book, before
     /// touching it. Exercises the fail-stop exit. Default `None`.
@@ -6062,6 +6069,8 @@ impl<T: StateBackend> NativeExecContext<T> {
             test_cancel_all_full_scan: false,
             #[cfg(any(test, feature = "test-reference-paths"))]
             test_flush_per_row: false,
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            test_parallel_settle: None,
             #[cfg(test)]
             test_cancel_all_panic_market: None,
             #[cfg(test)]
@@ -8708,6 +8717,14 @@ impl NativeExecutor {
         // >=2 markets with work (always) and, in Auto mode, enough fills to
         // amortize the overhead. The sequential loop remains the canonical
         // semantics that the parallel path must reproduce byte-for-byte.
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        let settle_mode = match (settle_mode, ctx.test_parallel_settle) {
+            (SettleMode::Auto, Some(parallel)) => SettleMode::Force {
+                parallel,
+                workers: None,
+            },
+            (mode, _) => mode,
+        };
         let use_parallel = market_results.len() >= 2
             && match settle_mode {
                 SettleMode::Force { parallel, .. } => parallel,

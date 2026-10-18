@@ -1282,6 +1282,13 @@ struct ExecutionContext {
     /// test-only `test-reference-paths` feature (this crate's dev-dependency).
     #[cfg(test)]
     test_reference_paths: bool,
+    /// Item 6 Phase 5 step 2 (Codex review, aliased plan caches): test-only
+    /// stand-in for the parallel settle's work gate: `true` forces the
+    /// parallel settle on odd heights and the sequential loop on even ones
+    /// (torus-bridge's `test_parallel_settle`), so a test stream of a few
+    /// fills per block runs both. Default off (the production gate).
+    #[cfg(test)]
+    test_parallel_settle_odd_heights: bool,
     /// Test-only crash injection (consensus bug (c)): return right after the
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
@@ -4228,6 +4235,9 @@ impl ExecutionContext {
             {
                 ctx.test_cancel_all_full_scan = self.test_reference_paths;
                 ctx.test_flush_per_row = self.test_reference_paths;
+                ctx.test_parallel_settle = self
+                    .test_parallel_settle_odd_heights
+                    .then_some(torus_block.header.height % 2 == 1);
             }
             // Item 6 C2: the slot's previous mark table / configs decide the
             // version of this block's table (filled by begin_block_oracle).
@@ -6208,6 +6218,8 @@ impl TorusApp {
             test_no_resident_rows: false,
             #[cfg(test)]
             test_reference_paths: false,
+            #[cfg(test)]
+            test_parallel_settle_odd_heights: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -14821,6 +14833,8 @@ mod crash_recovery_tests {
             test_no_resident_rows: false,
             #[cfg(test)]
             test_reference_paths: false,
+            #[cfg(test)]
+            test_parallel_settle_odd_heights: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -28494,11 +28508,46 @@ mod crash_recovery_tests {
             fund_evm_balance(&db, oracle_addr(seed), evm);
         }
         register_proposer(&db, p5_slashed());
+        p5_seed_aliased(&db);
         // The EVM trie over the accounts written above, as the node builds it
         // at boot (otherwise the first EVM bundle starts a partial trie and
         // the next EVM block's incremental root fails its full-scan check).
         torus_state::incremental::ensure_trie_built(&db).unwrap();
         (config, db)
+    }
+
+    /// The aliased trader (Codex review of step 2): its rows `t ‖ 1` and
+    /// `t ‖ 2` hold its market-2 and market-3 positions (opaque: the payload
+    /// names another market), `t ‖ 3` its market-3 one. It buys (IOC) in
+    /// markets 1 and 2 on odd heights only (the parallel settle, forced
+    /// there by `test_parallel_settle_odd_heights`): market 1's plan writes
+    /// `t ‖ 2`, market 2's plan loads it clean, so the plan caches share a
+    /// key in every such block (a fill in market 1 alone, or in the
+    /// sequential loop, would rewrite `t ‖ 2` regular and end the pattern).
+    const P5_ALIAS: u8 = 101;
+    /// Its seeded positions' counterparty (open interest symmetric); rests
+    /// the asks it buys.
+    const P5_ALIAS_CP: u8 = 102;
+
+    /// [`P5_ALIAS`]'s rows, written through `apply_fill`, then copied raw
+    /// one key down: `t ‖ 1` = its market-2 row, `t ‖ 2` = its market-3 row.
+    fn p5_seed_aliased(db: &StateDb) {
+        use torus_core::position::{position_key, MarginType, NativeBalance, PositionManager};
+        use torus_state::cf::CF_NATIVE_POSITIONS;
+        let pm = PositionManager::new(db.clone());
+        let (a, cp) = (oracle_addr(P5_ALIAS), oracle_addr(P5_ALIAS_CP));
+        for t in [a, cp] {
+            pm.put_native_balance(&t, &NativeBalance { available: px(1_000_000_000), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        for (m, size) in [(2, 2), (3, 4)] {
+            pm.apply_fill(&a, m, true, px(size), px(100), MarginType::Cross).unwrap();
+            pm.apply_fill(&cp, m, false, px(size), px(100), MarginType::Cross).unwrap();
+        }
+        for m in [1u64, 2] {
+            let row = db.get_cf_raw(CF_NATIVE_POSITIONS, &position_key(&a, m + 1)).unwrap().expect("seeded row");
+            db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&a, m), &row).unwrap();
+        }
     }
 
     /// One block of the stream, with what the consensus side hands execution.
@@ -28527,6 +28576,8 @@ mod crash_recovery_tests {
         stops: u64,
         reduce_only: u64,
         fatal: u64,
+        /// [`P5_ALIAS`]'s two-market buys (odd heights).
+        aliased: u64,
     }
 
     /// The Phase 5 stream: heights 1..=n (ts 1000 + h), linked. C5 / P2's
@@ -28681,6 +28732,29 @@ mod crash_recovery_tests {
                     })
                     .collect();
                 actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
+                // The aliased trader: IOC buys in markets 1 and 2 on odd
+                // heights (the parallel settle), never resting, so it fills
+                // in no other block; its counterparty rests an ask in both
+                // on even heights so both buys find liquidity.
+                if h % 2 == 0 {
+                    actions.push(sign(
+                        P5_ALIAS_CP,
+                        NativeAction::PlaceOrderBatch(vec![
+                            limit(1, false, mark[0] + 3, 1),
+                            limit(2, false, mark[1] + 3, 1),
+                        ]),
+                    ));
+                } else if h > 1 {
+                    fed.aliased += 1;
+                    let ioc = |m: u64, price: i64| torus_types::PlaceOrderParams {
+                        time_in_force: torus_types::TimeInForce::IOC,
+                        ..limit(m, true, price, 1)
+                    };
+                    actions.push(sign(
+                        P5_ALIAS,
+                        NativeAction::PlaceOrderBatch(vec![ioc(1, mark[0] + 3), ioc(2, mark[1] + 3)]),
+                    ));
+                }
                 if (2..=40).contains(&h) && h % 4 == 3 {
                     actions.push(sign(
                         P2_V4,
@@ -28851,6 +28925,7 @@ mod crash_recovery_tests {
                 P5Ckpt::Never => Some(ckpt_never()),
             };
             ctx.test_block_probe = self.probe.clone();
+            ctx.test_parallel_settle_odd_heights = true;
             p5_configure(&mut ctx, self.path);
             if self.cfg.pipelined && attach {
                 ctx.attach_flush_worker(None);
@@ -28942,6 +29017,9 @@ mod crash_recovery_tests {
         bbo_rows: usize,
         /// Step 2: rows drained in place by the reference / typed node.
         drained: (u64, u64),
+        /// [`P5_ALIAS`]'s positions changed and its row `t ‖ 2` still holds
+        /// a market-3 position at the end (the plans kept sharing a key).
+        aliased_alive: bool,
     }
 
     /// After block `h` on both nodes (both idle): the write sets of the
@@ -29082,6 +29160,14 @@ mod crash_recovery_tests {
             });
         }
         let rows = |cf| StateBackend::iterate_cf(&a.db, cf, None).unwrap().len();
+        let aliased_alive = {
+            let t = oracle_addr(P5_ALIAS);
+            let pm = torus_core::position::PositionManager::new(a.db.clone());
+            // `get_position(t, 2)` decodes the row stored at `t ‖ 2`.
+            let held = pm.get_position(&t, 2).unwrap();
+            let m3 = pm.get_position(&t, 3).unwrap();
+            held.is_some_and(|p| p.market_id == 3) && m3.is_some_and(|p| p.size > px(4))
+        };
         Ok(P5Summary {
             compared,
             restarts: a.restarts,
@@ -29093,6 +29179,7 @@ mod crash_recovery_tests {
                 a.metrics.exec_users_drained_rows.get(),
                 b.metrics.exec_users_drained_rows.get(),
             ),
+            aliased_alive,
         })
     }
 
@@ -29116,6 +29203,7 @@ mod crash_recovery_tests {
             fed.empty >= 10 && fed.refunds >= 10 && fed.stops >= 20 && fed.reduce_only >= 50,
             "{fed:?}"
         );
+        assert!(fed.aliased >= n / 3, "{fed:?}");
         let run = |cfg: P5Config| {
             let t = std::time::Instant::now();
             let s = p5_differential(&blocks, cfg, None, dump_every)
@@ -29147,6 +29235,7 @@ mod crash_recovery_tests {
             // reference node never did.
             assert_eq!(s.drained.0, 0, "{cfg:?}: the reference node drained rows: {s:?}");
             assert!(s.drained.1 >= n, "{cfg:?}: the typed node drained in place: {s:?}");
+            assert!(s.aliased_alive, "{cfg:?}: the aliased trader's rows: {s:?}");
             assert!(
                 s.fills >= n as usize && s.liquidations >= 3 && s.bbo_rows >= 1,
                 "{cfg:?}: {s:?}"
