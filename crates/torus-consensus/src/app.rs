@@ -5467,7 +5467,9 @@ impl ExecutionContext {
                     // pending set below, past the write-through (the freeze
                     // folds such a row into the record set, and its fold
                     // `debug_assert`s on it). Tests and debug builds fail on
-                    // it, a release build logs it.
+                    // it, a release build logs and counts it
+                    // (`torus_exec_evm_scope_typed_writes`) and does not
+                    // fail-stop (owner s128).
                     let typed = validated.native_writes.pending_rows(torus_state::cf::CF_NATIVE_POSITIONS)
                         + validated.native_writes.pending_rows(torus_state::cf::CF_NATIVE_BALANCES);
                     #[cfg(test)]
@@ -5479,6 +5481,9 @@ impl ExecutionContext {
                         self.test_evm_guard.2.fetch_add(typed as u64, Ordering::SeqCst);
                     }
                     if typed != 0 {
+                        if let Some(ref m) = self.metrics {
+                            m.exec_evm_scope_typed_writes.inc_by(typed as u64);
+                        }
                         tracing::error!(
                             height,
                             typed,
@@ -37218,6 +37223,40 @@ mod crash_recovery_tests {
         }
         let typed = node.ctx.as_ref().expect("a context").test_evm_guard.2.load(Ordering::SeqCst);
         assert!(typed > 0, "the planted row was caught");
+    }
+
+    /// Plan Task 2.3 (owner s128): the guard does not fail-stop a release
+    /// node; it logs and counts the rows in
+    /// `torus_exec_evm_scope_typed_writes`. The planted row of
+    /// `evm_typed_write_is_caught`: the counter is 0 before the first EVM
+    /// block and holds the caught rows after it. A debug build still fails
+    /// on it (after counting); a release build runs the block to the end,
+    /// not failed.
+    #[test]
+    fn evm_typed_write_counts_in_the_metric() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p5_blocks(300, 0x5005_0001);
+        let cfg = P5Config { pipelined: false, mode: BookMode::Classic, ckpt: P5Ckpt::PerBlock };
+        let mut node = P5Node::new(cfg, P5Path::Typed, None);
+        let metrics = node.metrics.clone();
+        node.ctx.as_mut().expect("a context").test_evm_typed_write = Some(oracle_addr(C5_TRADERS[0]));
+        let first_evm = blocks.iter().position(|b| !b.block.evm_transactions.is_empty()).expect("an EVM block");
+        for b in &blocks[..first_evm] {
+            node.execute(b);
+        }
+        assert_eq!(metrics.exec_evm_scope_typed_writes.get(), 0, "nothing caught before the first EVM block");
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.execute(&blocks[first_evm])));
+        let counted = metrics.exec_evm_scope_typed_writes.get();
+        assert_eq!(out.is_err(), cfg!(debug_assertions), "debug builds fail on it, release builds run on");
+        if out.is_err() {
+            // The context unwound mid-block: never dropped (no use after).
+            std::mem::forget(node);
+        } else {
+            let ctx = node.ctx.as_ref().expect("a context");
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst), "no fail-stop");
+            assert_eq!(ctx.test_evm_guard.2.load(Ordering::SeqCst), counted, "the guard's rows");
+        }
+        assert!(counted > 0, "the planted row was counted");
     }
 
     /// Plan Task 2.3: the next-block lockbox drain. An EVM tx queues a lockbox
