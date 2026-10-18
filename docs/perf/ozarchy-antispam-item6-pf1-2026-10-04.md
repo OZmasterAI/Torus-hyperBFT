@@ -12940,6 +12940,197 @@ default was set for (view-timeout wedge on big-body dissemination) nor the WAN t
 | r3 | P8M | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,921.6 | 12.120 | 19,530 | 77.5 | 15 / 868 | 24.88 | 0 | 0 | 20.2 | 4,230 / 5,321 | 85:0/85:0/85:0 | 7,296 |
 | r3 | P512K | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,635.3 | 12.146 | 20,330 | 77.3 | 15 / 814 | 23.45 | 0 | 0 | 20.5 | 4,075 / 5,137 | 86:0/86:0/86:0 | 7,312 |
 
+## 87. Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15,000 vs 5,000 ms on the step 0 binary, PC + F + 512 KB push threshold on both arms, standard load, 300 markets, 600 s cells, n = 2 (campaign ozarchy-stepz, binary Z `9d770519`, archy, 2026-10-18)
+
+**No GO / NO-GO from this screen: W_db fell only 26.5% (407 -> 299 ms per checkpoint; rounds -31.5% and -21.1%), short
+of the rule's 40% bar, so the "anything else" branch applies (extend or try `TORUS_CHECKPOINT_MAX_BYTES`, then decide
+with 18c). Why the bar was missed: at ~17 native blocks/s the attest heights (h % 100) already checkpoint every ~5.8 s,
+so the 15 s interval never fires (0.997 checkpoints per 100 blocks on every Z15 node). Z5 adds the 5 s trigger between
+attest heights (1.87-1.91 per 100 blocks), so batches fall only 22% (108 -> 85 MB), not to ~1/3. Within that smaller
+step, the in-vs-out block p99 gap G fell about in proportion (497 -> 375 ms, -25%; rounds -41% and -5%). The
+manifest put's in-window wall fell 22% (7.56 -> 5.88 ms per call). X measured at 1 Hz (in - out) fell 11%. SHIP-Z is
+out: G stays ~375 ms (criterion ~100 ms), and the manifest put is ~9 ms per call in windows vs ~0.08 ms out. Z5 also
+costs native blocks/s 0.777 [0.555, 1.089] (16.97 -> 13.18), block p50 1.155 [1.080, 1.236] (12 -> 14 ms) and
+overall block p99 556 -> 780 ms. State-DB bytes written rise 10% (35.1 -> 38.7 MB/s). matched/s 0.991 [0.905, 1.085]
+and CPU-s per 1M fills are flat. The step 0 split says what the in-window manifest put waits on: the write queue
+behind the checkpoint batch (pre/post 2.0 + residual 5.5 of 7.6 ms; its own WAL / memtable < 0.1 ms; mutex and
+cond-wait 0, so no memtable-switch signal). This is the case where "A1 is aimed right".**
+
+Question (bench queue step 8, Items Q6 "Step Z"; design `docs/plans/q6-checkpoint-slicing.md` on
+`perf/q6-ckpt-slicing`, section 5): on the step 0 binary (checkpoint DB-write stage timers, start / end gauges and the
+`checkpoint db write` log line, consensus-thread write split, 10 Hz Dirty / Writeback sampler), does a shorter
+checkpoint interval (a smaller single batch) shrink the consensus-thread waits and the in-window block-p99 excess in
+proportion to the DB write? GO / NO-GO / SHIP-Z for building checkpoint slicing (A1).
+
+### 87.1 Setup
+
+Binary Z = `perf/q6-ckpt-slicing` `9d770519` (step 0 + the Codex P2 fix 84ea54cf / 9d770519; contains main
+`e3d11cb9`, 26 commits on top). Built in a new detached worktree `wt/stepz-9d770519` with its own target dir
+`~/.cargo-target-stepz-9d770519`, the s64 recipe (release `--locked`, mold + frame pointers, line tables, each package
+alone): node md5 `0d2348988679a80d2bff2630f6cc6bd5`, bench `70e96f48`, tx-flood `fcbecded` (staged
+`ozarchy-stepz-stage/z-run`, md5 re-checked on the 3 nodes of every cell). Tools frozen from `9d770519`
+(`ozarchy-stepz-tools/`, `FROZEN.txt`; they carry the step 0 harness: `SOAK_DIRTY_HZ=10` -> `host-dirty-10hz.tsv`,
+`summarize.py` `checkpoint_db_<stage>_ms_per_call` and `commit_db_split`). The N = 11 genesis is campaign A's
+(`genesis-weighted-full.json` md5 `01168566`, cell genesis md5 `d694b81b` as in 84-86). Spec, checks and the
+generated driver are in the same dir (`stepz-spec.json` = q7b's with arms Z15 / Z5, `stepz-checks.sh`). Standard load
+as 86.1 (Classic, oracle on, 300 markets, rate 76,000, `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4
+OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, native only). D, M, T unset (on); PE, KP, DB
+absent; custody 0; `TORUS_CHECKPOINT_MAX_BYTES` absent; `SOAK_DIRTY_HZ=10` exported at launch.
+
+| arm | env |
+|---|---|
+| Z15 (reference) | `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1 TORUS_HASH_ONLY_PUSH_THRESHOLD=524288 TORUS_CHECKPOINT_INTERVAL_MS=15000` |
+| Z5 | `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1 TORUS_HASH_ONLY_PUSH_THRESHOLD=524288 TORUS_CHECKPOINT_INTERVAL_MS=5000` |
+
+The push threshold is set to the code default in both arms (section 86: env.sh moves to it; 18c has not changed env.sh
+yet, and run-cell.sh scrubs `TORUS_*`). Smoke (Z5, 60 s) and warm-up w1 (Z15, 300 s), then r1 Z15, Z5; r2 Z5, Z15;
+600 s cells; 10:07-11:10. Fresh data dirs every cell (`CLEAN=1`); free disk 104-107 GB after each cell.
+
+Validity: 5 / 5 cells rc 0, ACCEPT AGREE PASS, md5 `0d234898` on 3 nodes, 0 panic / fail-stop lines (re-checked from
+raw files); 101 CHECK OK, 0 CHECK FAIL, 0 CELL-FLAG, no reruns. The new `zckptchk` checks that the interval took
+effect: the arm's env on 3 nodes; `coalesced state checkpoints ON policy=CheckpointPolicy { interval: Some(15s|5s) }`
+on every node; `checkpoint db write` lines up to the metrics-after scrape equal the
+`torus_exec_checkpoint_db_write_seconds` count; both gauges present. Z15 cells show 0.992-0.997 checkpoints per 100
+blocks, Z5 cells 1.867-1.914, median start gap 5.4-5.5 s vs 4.5-4.7 s. `zdirtychk`: 6,526-6,574 10 Hz rows per 600 s
+cell. The smoke's first run flagged `zckptchk`. That was a driver bug: it counted log lines past the metrics-after
+scrape, 29 vs 26. It was fixed and re-run OK on the same cell. The Z15 branch was shown to FAIL on a scratch copy of
+the Z5 smoke (1.609 > 1.3).
+
+**Caveat for the design:** the screen assumed 15 s vs 5 s batches (~1/3). But `checkpoint_upkeep_with` (app.rs) also
+fires on every attest height (h % 100) and, with F, on epoch boundaries. At this block rate the attest trigger comes
+first: Z15 = one checkpoint per 100 blocks (5.6-5.9 s median gap). Section 86's q7b r1-P512K had the same: 82
+checkpoints / 8,269 blocks, at ~12 blocks/s.
+
+### 87.2 Step Z metrics per arm (mean of the 2 cells; load window [t_bench0 + 20 s, t_bench1]; `stepz-ckpt.txt`)
+
+Windows are the DB-write spans themselves, `[start_ms, end_ms]` from every node's `checkpoint db write` line (no scrape
+widening). G uses the union of the 3 nodes' spans (any). X uses the node's own spans on 1 Hz scrape intervals. Block
+intervals come from `on_commit_block fired` (per node, consecutive heights). One interval is in-window if it overlaps
+a span.
+
+| metric | Z15 | Z5 | Z5 / Z15 |
+|---|---|---|---|
+| checkpoints per node per cell (window) | 100.5 | 153.7 | 1.53 |
+| checkpoint batch MB mean / max | 107.9 / 208.2 | 84.6 / 168.3 | 0.784 / 0.808 |
+| batch MB per min per node | 1,116 | 1,340 | 1.20 |
+| **W_db: DB-write ms per checkpoint, mean** (p50; max) | **407** (369; 1,142) | **299** (301; 2,293) | **0.735** (rounds 0.685, 0.789) |
+| DB-write s per min per node | 4.21 | 4.74 | 1.13 |
+| W stage split, ms per checkpoint: WAL / memtable / delay / pre-post / residual / mutex / cond-wait | 165.1 / 233.5 / 0 / 0.1 / 8.8 / 0 / 0 | 133.0 / 158.4 / 0 / 0.3 / 7.6 / 0 / 0 | WAL 0.81, memtable 0.68 |
+| share of load time inside any node's span | 11.9% | 15.9% | 1.33 |
+| block (commit-interval) p99 ms, all / in / out (mean of 3 nodes) | 531 / 952 / 455 | 631 / 929 / 553 | 1.19 / 0.98 / 1.22 |
+| **G = p99 in - out ms** | **497** (r1 530, r2 464) | **375** (r1 310, r2 440) | **0.754** (rounds 0.585, 0.948) |
+| commit intervals > 1 s, in / out (3 nodes) | 10 / 5 | 10.5 / 6.5 | |
+| manifest put wall ms per call, in / out (summary `commit_db_split.own`, 1 s intervals touching a span) | 7.56 / 0.55 | 5.88 / 1.20 | 0.78 / 2.17 |
+| manifest put stages in-window, ms per call: WAL / memtable / pre-post / residual / mutex / cond-wait | 0.060 / 0.009 / 1.98 / 5.52 / 0 / 0 | 0.056 / 0.007 / 1.62 / 4.19 / 0 / 0 | |
+| **X: manifest put ms per call in / out (1 Hz, own exact spans)** | **10.37 / 0.07** | **9.27 / 0.08** | in - out **0.892** (10.30 -> 9.19) |
+| manifest put: max 1 s sum in / out ms; 1 s sums > 250 ms in / out | 1,067 / 80; 106 / 0 | 1,124 / 70; 115 / 0 | |
+| manifest put per call (cell histogram): p99 ms; calls > 256 ms (3 nodes); max bucket | 2.8; 104; 2.048 s | 90.1; 112; 1.536 s | per node-checkpoint 0.345 -> 0.243 |
+| persist wait (`torus_commit_persist_seconds`) ms per call in / out (1 Hz, own) | 2.67 / 3.24 | 3.84 / 4.42 | in - out -0.57 vs -0.58 |
+| persist wait: max 1 s sum in / out ms; 1 s sums > 250 ms in / out | 570 / 322; 3 / 2 | 485 / 274; 6 / 0 | |
+| persist wait per call (cell histogram): p99 ms; calls > 256 ms; max bucket | 31.1; 4; 0.768 s | 37.2; 5; 0.512 s | |
+| commit-persist write wall ms per call in / out (`commit_db_split.own`; WAL is most of it both sides) | 1.71 / 1.59 | 1.80 / 2.34 | |
+| Dirty max MB in spans / out (10 Hz) | 137 / 85 | 170 / 84 | |
+| Writeback max MB in spans / out | 21 / 16 | 116 / 53 | r2-Z5 alone 224 / 91 |
+| state-DB bytes written MB/s (= WAL) / flush / compaction write | 35.05 / 6.90 / 1.81 | 38.69 / 7.41 / 2.05 | 1.104 / 1.07 / 1.13 |
+
+Per-call p99 / max in vs out cannot be measured for X on this binary. The puts keep no per-call record, and the 1 Hz
+scrape keeps only the >= 0.128 s buckets of the latency families, which do not include these two. So X in / out is
+the per-call mean, the largest 1 s sum (an upper bound of the slowest call) and the count of 1 s sums over 250 ms. The
+whole-cell histogram gives p99 and calls > 256 ms. The in-window >250 ms sums (100-118 per cell) and the > 256 ms
+calls (98-116) match: about one slow manifest put per node every 3 checkpoints on Z15, and one every 4 on Z5. None
+occur out of windows. Both 1 Hz and per-call manifest walls are 0.07-0.08 ms out of windows. The summary's split
+reads 0.55 / 1.20 ms "out" because its 1 s intervals touching a span leave partial window time in "out".
+
+r2-Z5 anomaly: val2's checkpoint at height 7176 took 3,833 ms (WAL 3,659 ms, 143 MB; the one before it 1,216 ms).
+Host Writeback reached 224 MB in that window. Every load-window consensus-timeout increment on any node (5 node
+increments, the headline's 2 timeouts and 2 no_proposal) fell in the same ~4 s (epoch 1792313566.8-570.6). That one IO stall drives Z5's W_db max, Writeback max and timeouts. It
+does not change W_db's mean (r2-Z5 307.5 vs r1-Z5 291.0).
+
+### 87.3 Rule (design section 5) and call
+
+| rule | needs | measured | met? |
+|---|---|---|---|
+| GO | W_db -40% or more, and X and G each at least half that | W_db -26.5% | no (W_db short) |
+| NO-GO | W_db -40% or more, and X and G < 10% or in the noise | W_db -26.5% | no (W_db short) |
+| SHIP-Z | G <= ~100 ms and manifest in = out, matched/s in the noise | G 375 ms; manifest 9.3 vs 0.08 ms; blocks/s -22%, p99 +40% | no |
+| anything else | extend to n = 4, or try `TORUS_CHECKPOINT_MAX_BYTES`, then decide with 18c | | **this branch** |
+
+Not extended to n = 4. The branch is not noise: both rounds miss the bar (W_db 0.685 and 0.789), and the cause is
+structural (attest checkpoints cap Z15's batch at ~100 blocks), so more rounds of the same arms cannot reach -40%.
+The ratios inside the smaller step lean GO:
+* G fell 25% for a 26.5% W_db cut (0.95 of it; r1 1.3x, r2 0.25x, noisy).
+* The in-window manifest wall fell 22% (0.83 of it). X at 1 Hz fell 11% (0.41 of it).
+* In-window slow manifest calls per checkpoint fell 30%.
+
+The stage split points the same way: the manifest put waits in the write queue behind the checkpoint batch
+(pre/post holds the WAL-stage queue wait, residual the memtable-leader wait), not on a memtable switch (mutex and
+cond-wait 0 on every call), and its own WAL and memtable work is < 0.1 ms. The persist write is not window-bound
+(in = out). This matches the step 0 case "WAL + insert dominate (the batch in flight): slicing is aimed right".
+
+### 87.4 Standard table, arm means (n = 2 each; `stepz.txt`)
+
+| arm | matched/s (diff, %) | CPU-s / 1M | native blk/s | fills / native blk | block p50 / p99 ms | exec block_ms | exec ms / 1k fills | hotstuff-algo ms / blk | node RSS mean / max MB | timeouts / no_proposal (sum of 3) | per 1,000 native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Z15 | 250,599 | 23.91 | 16.972 | 14,294 | 12 / 556 | 55.5 | 3.885 | 15.3 | 3,476 / 4,653 | 1 / 0 (20,434 blocks) | 0.049 / 0 |
+| Z5 | 248,236 (-2,362, -0.94%) | 23.98 | 13.183 | 18,110 | 14 / 780 | 70.5 | 3.894 | 19.1 | 3,577 / 4,393 | 2 / 2 (15,873 blocks) | 0.126 / 0.126 |
+
+Replicate CV of matched/s: Z15 0.16% (r1 250,878, r2 250,320), Z5 1.17% (250,287, 246,187). In run order: w1
+254,237 (300 s), 250,878, 250,287, 246,187, 250,320. No drift, and r2-Z5 is the IO-stall cell. Block p50 / p99 come
+from the commit-interval histogram over the load window, mean of 3 nodes (86.2's method). The log-based p99 in 87.2
+(531 / 631) is the same intervals minus the first 20 s.
+
+Cross-campaign context only (not paired): Z15 has 86's P512K env plus an explicit 15 s interval, but runs on the step
+0 binary: 250,599 vs 257,680 matched/s, 16.97 vs 12.19 native blocks/s, CPU-s / 1M 23.91 vs 23.46. The branch
+differs from M by 26 commits (step 0 timers and Q6 step 1's manifest timer among them).
+
+### 87.5 Paired Z5 / Z15 (geomean of per-round ratios, 95% CI, 1 df: t = 12.71, so the CIs are wide)
+
+| metric | r1 / r2 | Z5 / Z15 |
+|---|---|---|
+| matched/s | 0.9976 / 0.9835 | 0.9905 [0.9046, 1.0847] |
+| CPU-s / 1M fills | 1.0006 / 1.0056 | 1.0031 [0.9718, 1.0354] |
+| native blk/s | 0.7982 / 0.7569 | 0.7773 [0.5546, 1.0894] |
+| fills / native blk | 1.2443 / 1.2915 | 1.2677 [1.0010, 1.6054] |
+| exec block_ms | 1.2485 / 1.2936 | 1.2708 [1.0143, 1.5922] |
+| exec ms per 1k fills | 1.0033 / 1.0016 | 1.0025 [0.9918, 1.0133] |
+| block p50 | 1.1490 / 1.1613 | 1.1551 [1.0800, 1.2355] |
+| block p99 | 1.2852 / 1.5382 | 1.4060 [0.4489, 4.4036] |
+| hotstuff-algo ms / blk | 1.2175 / 1.2717 | 1.2443 [0.9438, 1.6404] |
+| node RSS mean | 1.0107 / 1.0488 | 1.0296 [0.8140, 1.3023] |
+| node RSS max | 0.9221 / 0.9685 | 0.9450 [0.6918, 1.2908] |
+| W_db (87.2) | 0.685 / 0.789 | mean 0.737 |
+| G (87.2) | 0.585 / 0.948 | mean 0.766 |
+
+Timeouts and no_proposal are too few for a paired ratio. Z5's 2 + 2 are all in r2-Z5's IO-stall window (87.2).
+
+Reading: Z5 makes fewer, larger blocks. Native blocks/s fall 22% while fills per block rise 27%, so exec per fill is
+unchanged. matched/s and CPU per fill hold. Block p50 rises 15% (the CI clears 1), and the out-of-window p99 rises
+22%. So the extra checkpoints slow the block cadence outside the DB-write spans too, not only inside them.
+
+### 87.6 Next
+
+* Decide with 18c: (a) a stronger zero-code arm that clears the 40% bar, e.g. `TORUS_CHECKPOINT_MAX_BYTES` near 40-50
+  MB (counted from above, so batches end at or below it) or a 2,000 ms interval; same Z15 control, n = 2 ABBA; or
+  (b) take the proportional G / manifest-wall drop and the queue-wait split as enough to build A1. A shorter interval
+  is not a ship candidate: it costs block cadence and +10% state-DB writes, and G stays far above 100 ms.
+* Any later Q6 run on this host should expect attest-driven checkpoints (one per 100 blocks), not 15 s ones.
+* Data: `~/bench-results-matched/ozarchy-stepz-300m-{smoke-s0,w1,r1-Z15,r1-Z5,r2-Z5,r2-Z15}` (each with
+  `stepz-ckpt.txt`, `stepz-push.txt`, `stepz-disk.txt`, `host-dirty-10hz.tsv`). Campaign files are in
+  `ozarchy-stepz-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`). Tools and binaries:
+  `ozarchy-stepz-tools/` (spec, checks, driver, `FROZEN.txt`) and `ozarchy-stepz-stage/` (`build/build.sh`,
+  `md5s.txt`). Analysis is in `ozarchy-stepz-run/analyst/`: `stepz.txt` / `stepz-analyse.py` (q7b's script, arms
+  Z15 / Z5) and `stepz-ckpt.txt` / `stepz-ckpt.py` / `stepz-ckpt.json` (the Step Z list).
+
+### 87.7 Cells (`stepz.txt`, `stepz-ckpt.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | flag | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | no_proposal | checkpoints / node | batch MB mean | W_db ms mean / max | G ms (in / out p99) | boundary pipelined true:false per node | native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | Z15 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 254,236.9 | 14.399 | 16,390 | 61.9 | 13 / 748 | 23.16 | 0 | 0 | 41.3 | 122.5 | 470 / 1,120 | 520 (1,071 / 551) | 59:0/59:0/59:0 | 4,363 |
+| r1 | Z15 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 250,877.6 | 16.311 | 14,839 | 57.5 | 13 / 596 | 23.89 | 1 | 0 | 96.0 | 111.9 | 425 / 1,078 | 530 (1,009 / 479) | 112:0/112:0/112:0 | 9,819 |
+| r1 | Z5 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 250,286.5 | 13.020 | 18,465 | 71.8 | 14 / 765 | 23.91 | 0 | 0 | 153.3 | 84.9 | 291 / 754 | 310 (854 / 544) | 91:0/91:0/91:0 | 7,838 |
+| r2 | Z5 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,186.5 | 13.347 | 17,756 | 69.3 | 13 / 794 | 24.06 | 2 | 2 | 154.0 | 84.3 | 308 / 3,833 | 440 (1,003 / 562) | 94:0/94:0/94:0 | 8,035 |
+| r2 | Z15 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 250,320.4 | 17.633 | 13,749 | 53.5 | 11 / 516 | 23.92 | 0 | 0 | 105.0 | 103.9 | 390 / 1,205 | 464 (896 / 431) | 120:0/120:0/120:0 | 10,615 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

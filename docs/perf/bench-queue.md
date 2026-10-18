@@ -170,6 +170,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    setup; step 0 binary from `perf/q6-ckpt-slicing` **`9d770519`** (s128: Codex torus re-review of step 0 had one P2,
    a failed scrape corrupting `commit_db_split`, fixed in 84ea54cf + 9d770519, Codex quick review clean; Items, Q6).
    Decides GO / NO-GO / SHIP-Z for building checkpoint slicing (A1).
+   **Done s68 (ozarchy-stepz, binary Z `9d770519` node md5 `0d234898`, both arms PC + F + push threshold 524288,
+   n = 2 ABBA, 5 / 5 valid, section 87): no GO / NO-GO; the rule's "anything else" branch. W_db fell only 26.5% (407
+   -> 299 ms per checkpoint, rounds 0.685 / 0.789; batch 108 -> 85 MB), short of the 40% bar, because attest heights
+   (h % 100) already checkpoint Z15 every ~100 blocks (~5.8 s at ~17 blocks/s; the 15 s interval never fires). Within
+   that step, G fell in proportion (497 -> 375 ms, -25%) and the in-window manifest wall fell 22% (7.56 -> 5.88 ms per
+   call); X at 1 Hz (in - out) fell 11%. The step 0 split: the manifest put waits in the write queue behind the batch
+   (pre/post + residual; mutex and cond-wait 0), i.e. "A1 aimed right". Not SHIP-Z: G ~375 ms, and Z5 costs native
+   blocks/s 0.777 [0.555, 1.089] (16.97 -> 13.18), block p50 +15% [1.080, 1.236], p99 556 -> 780 ms, state-DB writes
+   +10%; matched/s 0.991 [0.905, 1.085], CPU per fill flat. Not extended to n = 4 (more rounds of the same arms cannot
+   reach -40%). Next, decided with 18c: a stronger zero-code arm (`TORUS_CHECKPOINT_MAX_BYTES` ~40-50 MB or 2,000 ms),
+   or build A1 on this evidence.**
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
    **READY (s128): arm (b) binary = `perf/rh4-da-body-gc` `b2dd21a4`** (main e1be6c15 merged into 4514573f, no
    conflicts; workspace 4069 passed / 0 failed, clippy no new warnings). Owner s128: custody OFF by default until T3.1,
