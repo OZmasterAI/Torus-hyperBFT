@@ -13489,6 +13489,173 @@ not a fixed reference: rules on G need a same-campaign control, as used here.
 | r2 | ZC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 239,300.0 | 5.635 | 42,319 | 173.5 | 69 / 1,178 | 24.84 | 0 | 0 | 27.48 | 0.963 | 46.1 | 124 / 375 | 553 (1,016 / 462) | 48:0/48:0/48:0 | 3,398 |
 | r2 | Z15 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 251,607.9 | 15.154 | 16,043 | 61.9 | 13 / 709 | 23.77 | 1 | 2 | 1.03 | 0 | 120.5 | 476 / 1,229 | 666 (1,162 / 495) | 104:0/104:0/104:0 | 9,138 |
 
+## 90. Step 8c, Q8 short re-check: checkpoint and save-books rows with F on by default, oracle on + perf sidecar, 300 markets, 600 s cells, n = 3 (campaign ozarchy-q8re, main `fbe36391`, archy, 2026-10-18)
+
+**The `pipeline_barrier` wait is gone: 0.00 s in all 9 off-CPU windows (section 81: 0.09-1.15 s per 15 s window, ~1 s
+in 3 of 4 cells). The node logs agree: 0 blocks ran `pipelined=false` (5,976-7,349 blocks per node per cell, 59-73
+epoch boundaries, all pipelined). The checkpoint rows left on the exec thread are small: upkeep 0.86-1.02 ms per
+native block (81: 0.60-0.73) and settle wait 2.0-2.6 ms per block on val0 (81: 2.9-3.3). The flush worker's
+checkpoint write grew to 804-935 ms per checkpoint (81: 670-788), but it runs on W, off the exec thread. Exec on-CPU
+fell to 75-83 ms per native block (81: 131-133). That is mostly smaller blocks: 7.7-9.9 native blocks/s at 25-32k
+fills, vs 5.6-5.9 at 36-41k. Per 1k fills the fall is smaller: 2.46-2.67 vs 2.99 ms (W1). `save_order_books` is
+5.6-5.9 ms per native block (81: 7.7-8.0) and the same per fill (0.22-0.23 vs 0.24-0.27 ms per 1k fills). Cache
+`flush_all` is 10.4-10.9 ms (81: 14.1-14.6), 13-14% of exec, still the largest item. The exec thread is off-CPU 25-29%
+of wall (81: 20-22%), now all pool waits. Hotstuff-algo is blocked on the full exec channel 19-26% of wall in 6 of 9
+windows and ~0 in the other 3 (81: 30-33%). Phase 5: step 3 still targets a real row, but not the biggest (90.5).
+Profile only, one arm, no A/B.**
+
+Question (bench queue step 8c, owner s128; the rule under section 81.6): F (`TORUS_EPOCH_FAST_PATH`) has been on by
+default since main `3429855d`. Re-check the section 81 rows that F and the new defaults can move: checkpoint upkeep, the
+`pipeline_barrier` wait, `save_order_books`, `flush_all`, exec off-CPU and hotstuff-algo blocked on the exec channel;
+plus exec ms per native block and per 1k fills. Does Phase 5's remaining scope (steps 3 and 7) still target the
+biggest rows?
+
+### 90.1 Setup
+
+Binary P = main `fbe36391` (>= `b4cdbfc1`: code defaults PC 8, F on, header re-send 250 ms). Built with the Q8 recipe
+of M (section 81: release `--locked`, mold + frame pointers, line tables, each package alone) in a detached worktree
+`wt/q8re-fbe36391` with its own target dir. Node md5 `cb8d8ad890f900a5dfa5a9427c09a6af` (bench `6c9b195e`, tx-flood
+`9110bdcf`), staged `ozarchy-q8re-stage/p-run`, the same on all 3 nodes in every cell. Tools frozen from `fbe36391`
+(`ozarchy-q8re-tools/`, `FROZEN.txt`) plus section 81's perf sidecar. Standard load (hsdb-300m: Classic, 15 s
+checkpoints, 300 markets, BLOCK_CAP 400, MAX_IN_FLIGHT 4, commit tail, rate 76,000, oracle on), genesis N = 11.
+
+Nothing set. `TORUS_PARALLEL_CANCEL_ALL`, `_MIN_VISITS`, `TORUS_EPOCH_FAST_PATH`, `TORUS_HEADER_RESEND_MS`,
+`TORUS_PARALLEL_ENGINE`, `TORUS_EXEC_PARALLEL_KEYS` and `TORUS_CKPT_DEFER_BOOKS` are absent from every node environ
+(driver `absent_env` + `q8defchk`); `HEADER_RESEND_UNSET=1` keeps `env.sh` from pinning the re-send. The 512 KB push
+threshold and custody 0 come from the frozen `env.sh` and reached all 3 nodes (`q8pushchk`: 688-823 manifest pushes
+per node per cell, every full-body push <= 524,288 bytes, pre-warm pulls on every node; `q8custchk`). The defaults
+took effect: F logged `epoch fast path ON (TORUS_EPOCH_FAST_PATH unset or 1)` once per node, and every boundary block
+ran pipelined (`q8flagchk`). The binary logs no PC line, so PC is shown by the profile: `exec_cancel_all_run_parallel`
+/ `cancel_all_groups_parallel` frames on the exec pool in W1 (smoke). The engine's `phase1_actions` also fell from
+20-23 to 4.4-5.8 ms per block (val0).
+
+One arm ONP (oracle on + perf sidecar on val1). Warm-up w1 is the same arm for 120 s without perf, then r1, r2 and r3
+at 600 s each, 17:11-17:56. Smoke ONP 240 s. `perf_event_paranoid=1` was set by the owner for this run only (host
+check at every cell start and end). Sidecar windows after the bench line: W3 12-27 s off-CPU, W1 35-80 s `cycles:u`
+and W2 82-102 s exec thread, all as section 81. New: two more off-CPU windows, W4 200-215 s and W5 400-415 s (W3's
+events), so there are 3 off-CPU windows per cell. Folded with section 81's scripts (`ozarchy-q8re-analyst/`, copies)
+and `perf script --no-inline`: without it, this binary's stacks resolve to inlined short names, and 81's patterns
+(e.g. `borsh::ser`, `Channel<...CommittedBlockMsg>>::send`) match nothing.
+
+Validity: 4 / 4 cells + smoke rc 0, ACCEPT AGREE PASS, 0 panic / fail-stop lines (re-checked from the raw
+`summary.json`), md5 `cb8d8ad8` on 3 nodes; 89 CHECK OK in the campaign (+ 23 in the smoke), 0 CHECK FAIL, 0
+CELL-FLAG, 0 HARD FINDING; host quiet (no build, no analysis during the cells). Smoke try 1 failed one check, an
+expect regex in the spec (`gen-3val-genesis.sh` prints `evm_block_interval = 11`, the full genesis carries it). The
+regex was fixed and smoke 2 passed (254.2k matched/s). Before launch, the checks were run on a scratch copy of the
+try-1 cell and failed as they should: an F env set, the threshold 8 MB, custody 1, a wrong exe md5, no F line, perf
+output in w1. No non-perf control here: section 81 measured the sidecar's cost at +-1%.
+
+### 90.2 Cells (`cells.txt`, `ctx.txt`)
+
+| cell | matched/s | native blk/s | fills / native blk | chain ms (val0) | block p50 / p99 ms | CPU-s / 1M | timeouts | no_proposal |
+|---|---|---|---|---|---|---|---|---|
+| 81 r1-ONP (120 s) | 241,204 | 5.85 | 35,811 | 144.2 | 60 / 1,048 | 23.06 | 0 | 0 |
+| 81 r2-ONP (120 s) | 242,385 | 5.55 | 40,852 | 162.4 | 71 / 1,170 | 22.82 | 0 | 0 |
+| w1 (120 s, no perf) | 266,019 | 10.81 | 20,013 | 74.3 | | 22.37 | 1 | 0 |
+| r1-ONP | 259,223 | 9.89 | 24,998 | 95.5 | 21 / 892 | 23.46 | 3 | 0 |
+| r2-ONP | 265,301 | 7.72 | 32,204 | 120.4 | 39 / 938 | 23.02 | 1 | 2 |
+| r3-ONP | 259,589 | 9.24 | 26,338 | 99.9 | 23 / 912 | 23.38 | 5 | 0 |
+
+Block p50 / p99 = `torus_commit_interval_seconds` over [t_bench0, t_bench1], mean of 3 nodes (section 89's method,
+applied to the 81 cells too). CPU-s / 1M = whole run, as section 81.2. Not an A/B: PC, F, re-send 250 and the 512 KB
+threshold all changed together since M, and section 81's cells were 120 s (block rate indicative only). Section 89's
+Z15 (another binary, PC + F + 512 KB by env, no perf) ran 15.9 native blocks/s at 250k matched/s; the gap to
+7.7-9.9 here was not looked into.
+
+### 90.3 The step 8c rows, section 81 vs now (absolute)
+
+Metric rows: mean of the 3 nodes over [t_bench0 + 20 s, t_bench1] (1 Hz scrapes; 81's cells re-read the same way, ~103 s
+windows, vs ~583 s now). Profile rows: val1, W1 (on-CPU) or W3/W4/W5 (off-CPU, 15 s each). 81 = its two ONP cells
+(r1 / r2); now = r1 / r2 / r3.
+
+| row | 81 (ONP r1 / r2) | now (r1 / r2 / r3) |
+|---|---|---|
+| `exec_checkpoint_upkeep_seconds`, ms per native block | 0.73 / 0.60 | 0.92 / 1.02 / 0.86 |
+| same, s per minute (exec thread) | 0.25 / 0.19 | 0.55 / 0.47 / 0.48 |
+| upkeep in the val0 phase table, ms per block | 0.56 / 0.51 | 0.84 / 0.87 / 0.75 |
+| `flush_worker_checkpoint_seconds`, ms per checkpoint (W, off the exec thread) | 670 / 788 | 804 / 935 / 846 |
+| same: checkpoints per min; s per min | 5.6 / 4.7; 3.78 / 3.67 | 6.0 / 4.6 / 5.6; 4.81 / 4.29 / 4.70 |
+| checkpoint layer MB per checkpoint | 155 / 166 | 160 / 198 / 174 |
+| checkpoint settle wait, ms per native block (metric) | 3.66 / 3.54 | 2.10 / 2.81 / 2.34 |
+| **`pipeline_barrier` / flush `wait_idle` per 15 s window (exec, off-CPU)** | **0.09 / 0.75 s** (n = 1 each; OFFP 1.15 / 0.98 s) | **0.00 s, n = 0, in 9 / 9 windows** |
+| blocks run `pipelined=false` (node logs, whole cell, per node) | (not counted; F off: every boundary) | 0 of 7,349 / 5,976 / 6,951 |
+| **`save_order_books`**: W1 share / ms per native block | 6.0% / 8.0; 5.9% / 7.7 | 7.4% / 5.6; 7.0% / 5.6; 7.1% / 5.9 |
+| same, metric `exec_save_books_seconds`: ms per native block; per 1k fills | 9.81 / 9.84; 0.274 / 0.241 | 5.56 / 7.42 / 6.11; 0.222 / 0.230 / 0.232 |
+| **cache `flush_all`**: W1 share / ms per native block | 11.0% / 14.6; 10.8% / 14.1 | 13.9% / 10.4; 13.1% / 10.5; 13.1% / 10.9 |
+| same, metric `exec_cache_flush_seconds`: ms per native block; per 1k fills | 17.16 / 18.28; 0.479 / 0.448 | 10.57 / 13.75 / 11.35; 0.423 / 0.427 / 0.431 |
+| **exec off-CPU** (s of ~15.1 s, share) | 3.08 s (20%) / 3.38 s (22%) | W3 / W4 / W5: r1 3.92 / 3.78 / 4.22 (25-28%); r2 3.95 / 4.07 / 4.05 (26-27%); r3 3.96 / 3.98 / 4.34 (26-29%) |
+| of it: pool wait `run_jobs`; `match_parallel_setup` | 0.60 / 0.57 s; 1.00 / 0.95 s | 1.26-1.45 s; 1.15-1.32 s |
+| of it: checkpoint layer recv (settle wait); rayon join | 0.36 / 0.30 s; 0.29 / 0.21 s | 0.32-0.43 s; 0.26-0.37 s |
+| **hotstuff-algo blocked on the exec channel** (`send CommittedBlockMsg`), s per window (share) | 4.50 s (30%) / 5.00 s (33%) | r1 0.00 / 3.59 (24%) / 0.00; r2 2.89 (19%) / 3.89 (26%) / 3.97 (26%); r3 0.13 (1%) / 3.38 (22%) / 0.00 |
+| hotstuff-algo off-CPU, total | 72% / 76% | 69-75% |
+| **exec on-CPU ms per native block** (W1, busy) | 132.9 (80%) / 130.5 (78%) | 75.2 (67%) / 80.0 (74%) / 83.0 (70%) |
+| **exec ms per 1k fills** (W1 on-CPU / matched orders in W1) | 2.99 / 2.99 | 2.46 / 2.67 / 2.51 |
+| same, val0 phase `block_ms` / cell fills per native block | 4.03 / 3.98 | 3.82 / 3.74 / 3.79 |
+| residual untimed (val0 phase table), ms per block (share) | 12.9 (8.9%) / 15.8 (9.7%) | 6.0 (6.3%) / 7.7 (6.4%) / 6.3 (6.3%) |
+
+Reading:
+
+* F removed the barrier: no block took the serial path in any cell. Section 81 put the barrier at ~10-14 ms per native
+  block and inferred it was most of the residual untimed. That residual halved (12.9-15.8 -> 6.0-7.7 ms) and fell per
+  fill too (0.36-0.39 -> 0.24 ms per 1k fills).
+* Upkeep on E rose ~0.3 ms per block (0.60-0.73 -> 0.86-1.02). It is still ~1% of the block. Epoch boundaries now take
+  their own checkpoint in upkeep (the F design) instead of draining in the barrier. Per minute it doubled (0.19-0.25 ->
+  0.47-0.55 s), mostly from the higher block rate.
+* The flush worker writes larger, slower checkpoints (layer 160-198 MB, 804-935 ms each; 81: 155-166 MB, 670-788 ms),
+  4.3-4.8 s per minute on W. That is section 87/89's W_db territory, not the exec thread. The settle wait it costs E
+  fell (3.5-3.7 -> 2.1-2.8 ms per block).
+* `save_order_books` and `flush_all` cost the same per fill as before (within ~10%). Their per-block fall comes from
+  the smaller blocks. They are now a larger share of a smaller exec block (7% and 13-14%).
+* Exec off-CPU went up (20-22% -> 25-29%). It is now all pool waits: `run_jobs` doubled (0.6 -> 1.3-1.45 s per 15 s;
+  PC's cancel-all jobs run there) and match setup rose to 1.2-1.3 s. Hotstuff still stalls on the full exec channel,
+  in bursts: 3 of 9 windows ~0, 6 of 9 at 19-26% of wall (81: 30-33% in both ONP cells).
+
+### 90.4 Exec on-CPU items now (W1, inclusive share / ms per native block; `profile-summary.txt`)
+
+| item | r1 | r2 | r3 | 81 ONP (r1 / r2) |
+|---|---|---|---|---|
+| cache `flush_all` | 13.9% / 10.4 | 13.1% / 10.5 | 13.1% / 10.9 | 11.0% / 14.6; 10.8% / 14.1 |
+| hash (Keccak) | 11.7% / 8.8 | 12.0% / 9.6 | 12.5% / 10.4 | 10.7% / 14.2; 10.3% / 13.4 |
+| liquidation | 7.8% / 5.9 | 7.0% / 5.6 | 6.9% / 5.8 | 5.6% / 7.5; 6.1% / 7.9 |
+| `save_books` / `save_order_books` | 7.4% / 5.6 | 7.0% / 5.6 | 7.1% / 5.9 | 6.0% / 8.0; 5.9% / 7.7 |
+| `put_cf_raw*` / `delete_cf_raw` | 6.7% / 5.0 | 6.2% / 4.9 | 6.1% / 5.1 | 5.4% / 7.2; 5.3% / 6.9 |
+| malloc / free | 6.3% / 4.7 | 6.6% / 5.2 | 5.6% / 4.6 | 5.9% / 7.9; 6.3% / 8.3 |
+| borsh encode / serialize | 6.3% / 4.7 | 5.6% / 4.5 | 6.0% / 5.0 | 5.1% / 6.8; 4.9% / 6.4 |
+| `merge_disjoint` | 4.6% / 3.5 | 4.9% / 3.9 | 4.9% / 4.1 | 3.8% / 5.1; 4.0% / 5.2 |
+| `BTreeMap` insert | 4.1% / 3.1 | 3.0% / 2.4 | 2.9% / 2.4 | 3.4% / 4.5; 3.7% / 4.8 |
+| `open_order_counts` | 1.4% / 1.0 | 1.5% / 1.2 | 1.4% / 1.2 | 1.1% / 1.5; 1.2% / 1.5 |
+| checkpoint / rocksdb / oracle | 1.2 / 0.5 / 0.8% | 0.8 / 0.7 / 1.0% | 0.1 / 0.5 / 0.9% | 0.7 / 0.9 / 0.6%; 0.5 / 0.6 / 0.5% |
+
+Shares are inclusive and overlap, as in 81.3.
+
+### 90.5 Reading for Phase 5 (steps 3 and 7)
+
+* No checkpoint row needs a Phase 5 step any more. With F on there is no barrier, upkeep is ~1 ms per block, and the
+  checkpoint write runs on W. The ~1 s per 15 s that section 81 listed beside the overlay items is gone.
+* Step 3 (book rows from a dirty set) targets `save_order_books`: 7.0-7.4% of exec, 5.6-5.9 ms per native block,
+  0.22-0.23 ms per 1k fills. It is unchanged per fill and still one of the top five named items, level with
+  liquidation. It is not the biggest. Larger rows: cache `flush_all` 13-14% (step 2's target, built, A/B next in
+  bench queue 8d; this binary is main without step 2), Keccak hashing 12% (outside the plan, callers unknown), and on
+  the wall-clock side the exec pool waits (`run_jobs` + match setup 2.4-2.8 s per 15 s, 16-18% of wall, up from
+  ~1.5-1.6 s).
+* So steps 3 and 7 do not reach the biggest rows left after step 2. Step 3 is a real but mid-size item (~6 ms per
+  native block at this block size, upper bound). Step 7 measures and removes nothing; its report list (cache flush and
+  save_books ms, `end_resident` ms) still covers the planned rows. Adding Keccak and the exec pool-wait rows would show
+  the two biggest rows outside the plan. Owner / 18c decide.
+
+### 90.6 Next
+
+* Owner: restore `kernel.perf_event_paranoid=2` (set to 1 for this run only).
+* Owner / 18c: Phase 5 scope against 90.5 (step 3 mid-size; `flush_all`, Keccak and pool waits are the larger rows).
+* Data: `~/bench-results-matched/ozarchy-q8re-300m-{smoke-s0-try1,smoke-s0,w1,r1-ONP,r2-ONP,r3-ONP}` (per cell
+  `q8re-barrier.txt`, `q8re-push.txt`, `q8re-disk.txt`, `perf.data`, `perf-w{2,3,4,5}.data`, `prof-*`). Campaign files
+  in `ozarchy-q8re-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`, `smoke-try1/`). Tools in
+  `ozarchy-q8re-tools/` (`q8re-spec.json`, `q8re-checks.sh`, `ozarchy-q8re-campaign.sh`, `perf-sidecar.sh`,
+  `FROZEN.txt`). Binary in `ozarchy-q8re-stage/` (`build/build.sh`, `md5s.txt`). Analysis in
+  `ozarchy-q8re-run/analysis/` (`cells.txt`, `ctx.txt` / `ctx.json`, `phase-val0.txt`, `profile-summary.txt`,
+  per-window `*-w{1,2,3,4,5}.{txt,json}`). Scripts in `ozarchy-q8re-analyst/` (81's `fold.py` / `agg.py` /
+  `cells.py` / `run-fold.sh` for W4/W5, plus `q8re-ctx.py`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
