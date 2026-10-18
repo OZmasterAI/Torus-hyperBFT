@@ -475,6 +475,11 @@ Task 2.3 RED `18d93dfc`, code `781bbeba`; Task 2.4 test and this note in the las
   - What is left is record cache misses (50k cold record lookups alone take 17-23 ms here) and `FrozenPending`'s
     per-row key / value allocations. That is still more than "a few ms": the next lever is encoding the drain on the
     flush worker over the drained keys (risk 3's fallback), not built (owner review).
+- Runs: `phase5_differential_long_random_10k` with the typed path on (10,000 blocks: 9,247 native, 489 EVM blocks,
+  510 lockbox deposits, 103 slashes, 200 epoch boundaries, one fatal block) passed all 12 configurations with no
+  divergence, in 4,414 s (debug). The typed node drained 95,435 rows in place per configuration and the reference
+  node none. Goldens A and B are unchanged, serial and engine-forced (`scenario_b_engine_digests_equal_c93c579`
+  added). Last workspace run: 4055/4055, doc 1/0.
 
 ### Step 3: book rows from a dirty set (Classic)
 
