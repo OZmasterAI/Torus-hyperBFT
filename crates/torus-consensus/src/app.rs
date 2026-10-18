@@ -5458,6 +5458,37 @@ impl ExecutionContext {
                             .put_cf_raw(torus_state::cf::CF_NATIVE_BALANCES, t.as_slice(), &[0u8; 33])
                             .expect("journal write");
                     }
+                    // Item 6 Phase 5 step 2 (plan Task 2.3, owner s128): no
+                    // EVM tx scope writes positions or balances. The writer
+                    // precompiles only enqueue CoreWriter rows; a lockbox
+                    // credit runs in the next block's native drain, through
+                    // the in-place record set's write-through. Item 7 option
+                    // 0: this journal is absorbed into the block overlay's
+                    // pending set below, past the write-through (the freeze
+                    // folds such a row into the record set, and its fold
+                    // `debug_assert`s on it). Tests and debug builds fail on
+                    // it, a release build logs it.
+                    let typed = validated.native_writes.pending_rows(torus_state::cf::CF_NATIVE_POSITIONS)
+                        + validated.native_writes.pending_rows(torus_state::cf::CF_NATIVE_BALANCES);
+                    #[cfg(test)]
+                    {
+                        self.test_evm_guard.0.fetch_add(1, Ordering::SeqCst);
+                        self.test_evm_guard
+                            .1
+                            .fetch_add(validated.native_writes.pending_write_count() as u64, Ordering::SeqCst);
+                        self.test_evm_guard.2.fetch_add(typed as u64, Ordering::SeqCst);
+                    }
+                    if typed != 0 {
+                        tracing::error!(
+                            height,
+                            typed,
+                            "item 6 Phase 5: a typed-CF write inside an EVM tx scope (positions / balances in the EVM journal)"
+                        );
+                    }
+                    debug_assert_eq!(
+                        typed, 0,
+                        "item 6 Phase 5: typed-CF write inside an EVM tx scope ({typed} rows at height {height})"
+                    );
                     let absorbed = overlay.absorb_evm(&validated.bundle, validated.native_writes);
                     #[cfg(test)]
                     let absorbed = if self.test_replay_fault == Some(ReplayFault::AbsorbPut) {
