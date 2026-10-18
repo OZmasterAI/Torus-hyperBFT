@@ -405,6 +405,9 @@ PRELOAD_DISTANCE=${PRELOAD_DISTANCE:-1000}
 PRELOAD_LEVELS=${PRELOAD_LEVELS:-100}
 PRELOAD_RATE=${PRELOAD_RATE:-50}
 PRELOAD_TIMEOUT=${PRELOAD_TIMEOUT:-900}
+# The harness kills a pre-load still running PRELOAD_KILL_GRACE s past its own
+# --timeout-s (a hang, never a slow but bounded run): rc 124, the cell fails.
+PRELOAD_KILL_GRACE=60
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -1260,7 +1263,7 @@ PRELOAD_S=""; PRELOAD_RC=""
 if preload_on; then
     log "pre-load: PRELOAD=$PRELOAD resting orders over $MARKETS markets, owners (count first end) $PRELOAD_OWNERS: ${PRELOAD_CMD[*]}"
     T_PRELOAD0=$(date +%s)
-    "${PRELOAD_CMD[@]}" > "$OUT/preload.log" 2>&1; PRELOAD_RC=$?
+    timeout --kill-after=10 "$((PRELOAD_TIMEOUT + PRELOAD_KILL_GRACE))" "${PRELOAD_CMD[@]}" > "$OUT/preload.log" 2>&1; PRELOAD_RC=$?
     PRELOAD_S=$(( $(date +%s) - T_PRELOAD0 ))
     for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null || die "node pid $p died during the pre-load"; done
     if PRELOAD_V=$(preload_record "$PRELOAD_RC" "$PRELOAD_S"); then

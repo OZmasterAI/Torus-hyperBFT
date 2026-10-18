@@ -1101,7 +1101,9 @@ genesis-funded (<= 60 + BULK_COUNT) and below the funded spam keys. Buys at
 default 1000 ticks, `PRELOAD_LEVELS` default 100), one max-size `PlaceOrderBatch` per owner
 (min(1024, per-owner) orders), `PRELOAD_RATE` actions/s (default 50); a busy or transport
 refusal resends the same signed action. Then it waits until every node's
-`torus_orders_resting_total` rose by N (`PRELOAD_TIMEOUT`, default 900 s): the per-trader RPCs
+`torus_orders_resting_total` rose by N (`PRELOAD_TIMEOUT`, default 900 s, one deadline for the whole
+run: key derivation, sends, resends, scrapes and waits; the harness also kills it 60 s past that,
+rc 124): the per-trader RPCs
 (`torus_getUserLimits`, `torus_getOpenOrders`) scan every book under the 250k-row RPC budget and
 fail at 1M orders. Plan only: `bench-throughput preload --dry-run --target 1000000 --markets 300
 --funded-bulk-end 1000060`.

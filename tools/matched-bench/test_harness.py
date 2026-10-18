@@ -5116,6 +5116,7 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
                 os.chmod(stub, 0o755)
                 script = (
                     'OUT="%s"; SELF_DIR="%s"; PRELOAD=20000; MARKETS=10; PIDS=(); T_LAUNCH=100; T_HEALTHY=130\n'
+                    'PRELOAD_TIMEOUT=900; PRELOAD_KILL_GRACE=60\n'
                     'PRELOAD_OWNERS="23 5060 5083"\n'
                     'log() { echo "LOG $*"; }; die() { echo "DIE $*"; exit 1; }\n'
                     'preload_on() { true; }\n'
@@ -5139,6 +5140,39 @@ class BulkCountAndPreloadHarnessTest(unittest.TestCase):
                     self.assertNotIn("CONTINUED", r.stdout)
                     self.assertEqual(s["validity"]["verdict"], "REJECT")
                     self.assertFalse(p["ok"])
+
+    def test_a_hung_preload_is_killed_past_its_timeout(self):
+        """Belt and braces over the bench's own --timeout-s: the harness runs
+        it under `timeout` (PRELOAD_TIMEOUT + PRELOAD_KILL_GRACE), so a hung
+        pre-load fails the cell (rc 124) instead of blocking it."""
+        self.assertIn("PRELOAD_KILL_GRACE=60", self.src)
+        i = self.src.index("# ---------------------------------------------------------------- 4c. pre-load")
+        block = self.src[i : self.src.index("# ---------------------------------------------------------------- 5. samplers")]
+        i = self.src.index("preload_record() {")
+        rec = self.src[i : self.src.index("\n}\n", i) + 3]
+        out = os.path.join(self.tmp, "hung")
+        os.makedirs(out)
+        stub = os.path.join(self.tmp, "stub-hung")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\nsleep 30\n")
+        os.chmod(stub, 0o755)
+        script = (
+            'OUT="%s"; SELF_DIR="%s"; PRELOAD=20000; MARKETS=10; PIDS=(); T_LAUNCH=100; T_HEALTHY=130\n'
+            'PRELOAD_TIMEOUT=1; PRELOAD_KILL_GRACE=1; PRELOAD_OWNERS="23 5060 5083"\n'
+            'log() { echo "LOG $*"; }; die() { echo "DIE $*"; exit 1; }\n'
+            'preload_on() { true; }\n'
+            'PRELOAD_CMD=("%s")\n' % (out, HERE, stub)
+            + rec + block + 'echo "CONTINUED"\n'
+        )
+        t0 = time.monotonic()
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("rc=124", r.stdout)
+        with open(os.path.join(out, "summary.json")) as f:
+            s = json.load(f)
+        self.assertIn("preload rc=124", s["preload"]["problems"])
+        self.assertEqual(s["validity"]["verdict"], "REJECT")
 
     def test_preload_is_re_recorded_after_summarize(self):
         summ = self.src.index('python3 "$TOOLS_DIR/summarize.py"')

@@ -60,6 +60,9 @@ pub const FUNDED_BULK_START: usize = 60;
 /// inside the node's 60 s nonce window.
 const RESEND_MAX_AGE: Duration = Duration::from_secs(30);
 const RESEND_BACKOFF: Duration = Duration::from_millis(100);
+/// How long past the --timeout-s deadline the run waits for its send tasks
+/// (each already ends at the deadline) before aborting them.
+const JOIN_GRACE: Duration = Duration::from_millis(250);
 
 pub const M_RESTING: &str = "torus_orders_resting_total";
 pub const M_PLACED: &str = "torus_orders_placed_accepted_total";
@@ -388,6 +391,13 @@ fn is_ambiguous(err: &str) -> bool {
     err.starts_with("http:") || err.starts_with("parse:")
 }
 
+/// Owner `o`'s (0-based in the owner range) signing key: the `gen-accounts`
+/// derivation of index `owner_offset + o`, derived when its first action is
+/// sent (deriving every owner's key up front bypassed the deadline).
+fn owner_key(plan: &PreloadPlan, o: u64) -> SigningKey {
+    super::load_sender_keys(1, plan.owner_offset + o as usize).remove(0).signing_key
+}
+
 pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     let t0 = Instant::now();
     let urls = split_urls(a.rpc_urls);
@@ -413,12 +423,6 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     // and the resting wait. Nothing is sent once it has passed.
     let deadline = t0 + a.timeout;
     let base = scrape_all(&client, &murls, deadline).await;
-    let keys: Arc<Vec<SigningKey>> = Arc::new(
-        super::load_sender_keys(plan.owners as usize, plan.owner_offset)
-            .into_iter()
-            .map(|k| k.signing_key)
-            .collect(),
-    );
     let placed = Arc::new(AtomicU64::new(0));
     let admitted = Arc::new(AtomicU64::new(0));
     let accepted = Arc::new(AtomicU64::new(0));
@@ -434,6 +438,13 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     let mut action_no = 0u64;
     let mut sent = 0u64;
     'owners: for o in 0..plan.owners {
+        // Nothing past the deadline: not even an owner's (sync) key
+        // derivation and batch build (also skips everything when the
+        // baseline scrape used it up).
+        if Instant::now() >= deadline {
+            break 'owners;
+        }
+        let key = owner_key(&plan, o);
         let batches = plan.owner_batches(o);
         let mut last_nonce = 0u64;
         for orders in batches {
@@ -452,7 +463,7 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
             let n = orders.len() as u64;
             let nonce = now_ms().max(last_nonce + 1);
             last_nonce = nonce;
-            let signed = sign_native_action(NativeAction::PlaceOrderBatch(orders), nonce, &keys[o as usize]);
+            let signed = sign_native_action(NativeAction::PlaceOrderBatch(orders), nonce, &key);
             let payload = format!("0x{}", hex::encode(bincode::serialize(&signed).expect("bincode")));
             let url = urls[o as usize % urls.len()].clone();
             let (client, placed, admitted, accepted, failed, dup_after, resends, failures) = (
@@ -520,10 +531,17 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
         }
     }
     for t in tasks {
-        // Every task ends by the deadline; the margin covers scheduling only.
+        // Every task ends by the deadline (requests and resend sleeps are
+        // bounded by it); JOIN_GRACE covers scheduling only. A task still
+        // running then is aborted and counted as failed.
         let abort = t.abort_handle();
-        if tokio::time::timeout_at((deadline + Duration::from_secs(1)).into(), t).await.is_err() {
+        if tokio::time::timeout_at((deadline + JOIN_GRACE).into(), t).await.is_err() {
             abort.abort();
+            failed.fetch_add(1, Ordering::Relaxed);
+            let mut f = failures.lock().unwrap();
+            if f.len() < 10 {
+                f.push("a send still running at the deadline was aborted".into());
+            }
         }
     }
     rep.submit_seconds = t0.elapsed().as_secs_f64();
@@ -985,7 +1003,49 @@ mod tests {
         assert!(took < Duration::from_millis(1_800), "run took {took:?}");
         assert!(!rep.reached);
         assert_eq!(rep.resting, None, "no scrape answered by the deadline");
+        // The baseline scrape used up the deadline: nothing is initialised or sent.
+        assert_eq!(stub.rpc_calls.load(Ordering::SeqCst), 0);
+        assert_eq!((rep.actions_unsent, rep.orders_placed), (8, 0), "{rep:?}");
         assert!(rep.resting_gauge_by_node.iter().all(Option::is_none), "{rep:?}");
+    }
+
+    /// Codex P2 (third pass): owner keys are derived lazily, so a plan with
+    /// 20,000 owners and a 1 s timeout ends near 1 s (it took 17.7 s when all
+    /// keys were derived up front, before the first send).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_owners_do_not_overrun_the_timeout() {
+        let stub = Arc::new(Stub {
+            rpc: Box::new(|_| (Duration::ZERO, Some(OK.to_string()))),
+            metrics: Box::new(|_| (0, 0, 0)),
+            rpc_calls: Default::default(),
+            bodies: Default::default(),
+            scrapes: Default::default(),
+            metrics_delay: Duration::ZERO,
+        });
+        let url = serve(stub.clone()).await;
+        let m = format!("{url}/metrics");
+        let plan = small_plan(20_000);
+        assert_eq!(plan.owners, 20_000);
+        let t0 = Instant::now();
+        let rep = run(&plan, args(&url, &m, Duration::from_secs(1))).await;
+        let took = t0.elapsed();
+        assert!(took < Duration::from_millis(1_800), "run took {took:?}");
+        assert!(!rep.reached);
+        assert!(rep.actions_unsent > 0 && rep.actions_unsent < plan.actions, "{rep:?}");
+        let sent = plan.actions - rep.actions_unsent;
+        assert_eq!(rep.actions_admitted + rep.actions_failed, sent, "every sent action has an outcome: {rep:?}");
+        // A send cut at the deadline may never reach the node: <=, not ==.
+        assert!(stub.rpc_calls.load(Ordering::SeqCst) as u64 <= sent);
+    }
+
+    #[test]
+    fn a_lazily_derived_owner_key_is_the_gen_accounts_key() {
+        let p = small_plan(3);
+        for o in 0..3u64 {
+            let lazy = owner_key(&p, o);
+            let eager = super::super::load_sender_keys(3, p.owner_offset).remove(o as usize).signing_key;
+            assert_eq!(lazy.to_bytes(), eager.to_bytes());
+        }
     }
 
     #[test]
