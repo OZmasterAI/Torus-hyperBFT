@@ -3675,10 +3675,13 @@ struct AliasCase {
     single: Vec<(Address, NativeAction)>,
 }
 
+/// A frozen set's rows of one CF (`None`: a tombstone).
+type AliasRows = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 /// What one run of an [`AliasCase`] produced.
 #[derive(Debug, PartialEq)]
 struct AliasOut {
-    rows: Vec<(&'static str, Vec<(Vec<u8>, Option<Vec<u8>>)>)>,
+    rows: Vec<(&'static str, AliasRows)>,
     results: Vec<(bool, Option<String>)>,
     running_hash: Option<(u64, [u8; 32])>,
     native_root: String,
@@ -3748,12 +3751,23 @@ fn alias_cases() -> Vec<AliasCase> {
     ]
 }
 
+/// How [`alias_run`] runs the batch.
+#[derive(Clone, Copy, Debug)]
+enum AliasSettle {
+    /// `execute_batch_settle_mode(.., true)`: the parallel settle.
+    Parallel,
+    /// `execute_batch_settle_mode(.., false)`: the sequential loop.
+    Sequential,
+    /// `execute_batch_engine_mode(.., 4)`: Phase 2's sharded workers (their
+    /// balance caches merged, `BalanceCache::merge_disjoint`), auto settle.
+    Engine,
+}
+
 /// `case` on a fresh DB: markets 1..=3, makers resting an ask at 100 and a
-/// bid at 99 in every market, then the batch (`parallel`: the parallel settle forced,
-/// else the sequential loop) and the single actions in block 1, on the
-/// reference path or in place; the frozen set flushed with the running
-/// hash on.
-fn alias_run(case: &AliasCase, reference: bool, parallel: bool) -> AliasOut {
+/// bid at 99 in every market, then the batch (`settle`) and the single
+/// actions in block 1, on the reference path or in place; the frozen set
+/// flushed with the running hash on.
+fn alias_run(case: &AliasCase, reference: bool, settle: AliasSettle) -> AliasOut {
     use torus_state::cf::CF_NATIVE_MARKETS;
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
@@ -3800,7 +3814,11 @@ fn alias_run(case: &AliasCase, reference: bool, parallel: bool) -> AliasOut {
             assert!(r.success, "{}: maker: {r:?}", case.name);
         }
     }
-    let r = NativeExecutor::execute_batch_settle_mode(&mut ctx, &case.batch, parallel);
+    let r = match settle {
+        AliasSettle::Parallel => NativeExecutor::execute_batch_settle_mode(&mut ctx, &case.batch, true),
+        AliasSettle::Sequential => NativeExecutor::execute_batch_settle_mode(&mut ctx, &case.batch, false),
+        AliasSettle::Engine => NativeExecutor::execute_batch_engine_mode(&mut ctx, &case.batch, 4),
+    };
     results.extend(r.results.iter().map(|x| (x.success, x.error.as_deref().map(str::to_string))));
     for (s, a) in &case.single {
         let r = NativeExecutor::execute(&mut ctx, s, a);
@@ -3827,17 +3845,21 @@ fn alias_run(case: &AliasCase, reference: bool, parallel: bool) -> AliasOut {
     }
 }
 
-/// The finding's regression test: every aliased-rows case, parallel and
-/// sequential settle, in place == reference (every CF's rows, the results,
-/// the running hash, the native root).
+/// The finding's regression test: every aliased-rows case, with the
+/// parallel settle, the sequential loop and Phase 2's sharded workers, in
+/// place == reference (every CF's rows, the results, the running hash, the
+/// native root). The other caches step 2 moved off the overlay flush (the
+/// batch position cache, the balance cache, the volumes, the single path's
+/// `cvlm` adds) each take values from one merged map, so the cases' opaque
+/// trader's balance credits and `cvlm` row cover them too.
 #[test]
 fn parallel_settle_aliased_opaque_rows_equal_reference() {
     let (mut runs, mut diverged) = (0, Vec::new());
     for case in alias_cases() {
-        for parallel in [true, false] {
-            let tag = format!("{} (parallel settle {parallel})", case.name);
-            let want = alias_run(&case, true, parallel);
-            let got = alias_run(&case, false, parallel);
+        for settle in [AliasSettle::Parallel, AliasSettle::Sequential, AliasSettle::Engine] {
+            let tag = format!("{} ({settle:?})", case.name);
+            let want = alias_run(&case, true, settle);
+            let got = alias_run(&case, false, settle);
             assert!(want.running_hash.is_some(), "{tag}: the running hash is on");
             let cfs: Vec<_> = want.rows.iter().zip(&got.rows).filter(|(a, b)| a != b).map(|(a, _)| a.0).collect();
             if want != got {
@@ -3852,5 +3874,5 @@ fn parallel_settle_aliased_opaque_rows_equal_reference() {
         }
     }
     assert!(diverged.is_empty(), "in place != reference:\n{}", diverged.join("\n"));
-    assert_eq!(runs, 8);
+    assert_eq!(runs, 12);
 }

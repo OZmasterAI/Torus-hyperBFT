@@ -28516,38 +28516,62 @@ mod crash_recovery_tests {
         (config, db)
     }
 
-    /// The aliased trader (Codex review of step 2): its rows `t ‖ 1` and
-    /// `t ‖ 2` hold its market-2 and market-3 positions (opaque: the payload
-    /// names another market), `t ‖ 3` its market-3 one. It buys (IOC) in
-    /// markets 1 and 2 on odd heights only (the parallel settle, forced
-    /// there by `test_parallel_settle_odd_heights`): market 1's plan writes
-    /// `t ‖ 2`, market 2's plan loads it clean, so the plan caches share a
-    /// key in every such block (a fill in market 1 alone, or in the
-    /// sequential loop, would rewrite `t ‖ 2` regular and end the pattern).
-    const P5_ALIAS: u8 = 101;
-    /// Its seeded positions' counterparty (open interest symmetric); rests
-    /// the asks it buys.
+    /// The aliased traders (Codex review of step 2). Each one's rows `t ‖ 1`
+    /// and `t ‖ 2` hold its market-2 and market-3 positions (opaque: the
+    /// payload names another market), `t ‖ 3` its market-3 one. The trader
+    /// of a height's window ([`p5_alias_of`]) buys (IOC) in markets 1 and 2
+    /// on odd heights only (the parallel settle, forced there by
+    /// `test_parallel_settle_odd_heights`): market 1's plan writes `t ‖ 2`,
+    /// market 2's plan loads it clean, so the plan caches share a key in
+    /// every such block. A fill in market 1 alone (no ask in market 2, e.g.
+    /// after a shock's liquidations took them) rewrites `t ‖ 2` regular and
+    /// ends that trader's aliasing; the next window starts a fresh trader.
+    const P5_ALIAS_FIRST: u8 = 110;
+    const P5_ALIAS_TRADERS: u64 = 16;
+    const P5_ALIAS_WINDOW: u64 = 625;
+    /// The aliased traders' seeded positions' counterparty (open interest
+    /// symmetric); rests the asks they buy.
     const P5_ALIAS_CP: u8 = 102;
 
-    /// [`P5_ALIAS`]'s rows, written through `apply_fill`, then copied raw
-    /// one key down: `t ‖ 1` = its market-2 row, `t ‖ 2` = its market-3 row.
+    /// The aliased trader active at height `h`.
+    fn p5_alias_of(h: u64) -> u8 {
+        P5_ALIAS_FIRST + (h / P5_ALIAS_WINDOW % P5_ALIAS_TRADERS) as u8
+    }
+
+    /// The aliased traders' rows, written through `apply_fill`, then copied
+    /// raw one key down: `t ‖ 1` = its market-2 row, `t ‖ 2` = its market-3
+    /// row.
     fn p5_seed_aliased(db: &StateDb) {
         use torus_core::position::{position_key, MarginType, NativeBalance, PositionManager};
         use torus_state::cf::CF_NATIVE_POSITIONS;
         let pm = PositionManager::new(db.clone());
-        let (a, cp) = (oracle_addr(P5_ALIAS), oracle_addr(P5_ALIAS_CP));
-        for t in [a, cp] {
-            pm.put_native_balance(&t, &NativeBalance { available: px(1_000_000_000), order_margin: FixedPoint::ZERO })
-                .unwrap();
+        let cp = oracle_addr(P5_ALIAS_CP);
+        let funded = NativeBalance { available: px(1_000_000_000), order_margin: FixedPoint::ZERO };
+        pm.put_native_balance(&cp, &funded).unwrap();
+        for k in 0..P5_ALIAS_TRADERS as u8 {
+            let a = oracle_addr(P5_ALIAS_FIRST + k);
+            pm.put_native_balance(&a, &funded).unwrap();
+            for (m, size) in [(2, 2), (3, 4)] {
+                pm.apply_fill(&a, m, true, px(size), px(100), MarginType::Cross).unwrap();
+                pm.apply_fill(&cp, m, false, px(size), px(100), MarginType::Cross).unwrap();
+            }
+            for m in [1u64, 2] {
+                let row = db.get_cf_raw(CF_NATIVE_POSITIONS, &position_key(&a, m + 1)).unwrap().expect("seeded row");
+                db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&a, m), &row).unwrap();
+            }
         }
-        for (m, size) in [(2, 2), (3, 4)] {
-            pm.apply_fill(&a, m, true, px(size), px(100), MarginType::Cross).unwrap();
-            pm.apply_fill(&cp, m, false, px(size), px(100), MarginType::Cross).unwrap();
-        }
-        for m in [1u64, 2] {
-            let row = db.get_cf_raw(CF_NATIVE_POSITIONS, &position_key(&a, m + 1)).unwrap().expect("seeded row");
-            db.put_cf_raw(CF_NATIVE_POSITIONS, &position_key(&a, m), &row).unwrap();
-        }
+    }
+
+    /// Height `h`'s aliased trader's durable rows still aliased (`t ‖ 2`
+    /// holds a market-3 position) and moved by its fills (`t ‖ 3` above the
+    /// seeded 4).
+    fn p5_aliased_live(db: &StateDb, h: u64) -> bool {
+        let t = oracle_addr(p5_alias_of(h));
+        let pm = torus_core::position::PositionManager::new(db.clone());
+        // `get_position(t, m)` decodes the row stored at `t ‖ m`.
+        let held = pm.get_position(&t, 2).unwrap();
+        let m3 = pm.get_position(&t, 3).unwrap();
+        held.is_some_and(|p| p.market_id == 3) && m3.is_some_and(|p| p.size > px(4))
     }
 
     /// One block of the stream, with what the consensus side hands execution.
@@ -28576,7 +28600,7 @@ mod crash_recovery_tests {
         stops: u64,
         reduce_only: u64,
         fatal: u64,
-        /// [`P5_ALIAS`]'s two-market buys (odd heights).
+        /// The aliased traders' two-market buys (odd heights).
         aliased: u64,
     }
 
@@ -28734,14 +28758,16 @@ mod crash_recovery_tests {
                 actions.push(sign(maker, NativeAction::PlaceOrderBatch(quotes)));
                 // The aliased trader: IOC buys in markets 1 and 2 on odd
                 // heights (the parallel settle), never resting, so it fills
-                // in no other block; its counterparty rests an ask in both
-                // on even heights so both buys find liquidity.
+                // in no other block; its counterparty rests asks in both on
+                // even heights, and the market-2 buy reaches 10 above the
+                // mark, so a market-1 fill alone (which ends the aliasing)
+                // is rare.
                 if h % 2 == 0 {
                     actions.push(sign(
                         P5_ALIAS_CP,
                         NativeAction::PlaceOrderBatch(vec![
                             limit(1, false, mark[0] + 3, 1),
-                            limit(2, false, mark[1] + 3, 1),
+                            limit(2, false, mark[1] + 3, 2),
                         ]),
                     ));
                 } else if h > 1 {
@@ -28751,8 +28777,8 @@ mod crash_recovery_tests {
                         ..limit(m, true, price, 1)
                     };
                     actions.push(sign(
-                        P5_ALIAS,
-                        NativeAction::PlaceOrderBatch(vec![ioc(1, mark[0] + 3), ioc(2, mark[1] + 3)]),
+                        p5_alias_of(h),
+                        NativeAction::PlaceOrderBatch(vec![ioc(1, mark[0] + 3), ioc(2, mark[1] + 10)]),
                     ));
                 }
                 if (2..=40).contains(&h) && h % 4 == 3 {
@@ -29017,9 +29043,10 @@ mod crash_recovery_tests {
         bbo_rows: usize,
         /// Step 2: rows drained in place by the reference / typed node.
         drained: (u64, u64),
-        /// [`P5_ALIAS`]'s positions changed and its row `t ‖ 2` still holds
-        /// a market-3 position at the end (the plans kept sharing a key).
-        aliased_alive: bool,
+        /// Blocks after which the durable height's aliased trader's rows
+        /// were still aliased and had moved ([`p5_aliased_live`]), and the
+        /// last such durable height.
+        aliased_live: (u64, u64),
     }
 
     /// After block `h` on both nodes (both idle): the write sets of the
@@ -29140,10 +29167,15 @@ mod crash_recovery_tests {
         let mut a = P5Node::new(cfg, P5Path::Reference, None);
         let mut b = P5Node::new(cfg, P5Path::Typed, probe);
         let mut compared = P5Compared::default();
+        let mut aliased_live = (0, 0);
         for blk in blocks {
             a.execute(blk);
             b.execute(blk);
             p5_compare(&a, &b, blk.block.header.height, dump_every, &mut compared)?;
+            let durable = read_native_applied_height(&a.db).unwrap_or(0);
+            if durable > 0 && p5_aliased_live(&a.db, durable) {
+                aliased_live = (aliased_live.0 + 1, durable);
+            }
         }
         let last = blocks.last().map_or(0, |b| b.block.header.height);
         drop(a.ctx.take());
@@ -29160,14 +29192,6 @@ mod crash_recovery_tests {
             });
         }
         let rows = |cf| StateBackend::iterate_cf(&a.db, cf, None).unwrap().len();
-        let aliased_alive = {
-            let t = oracle_addr(P5_ALIAS);
-            let pm = torus_core::position::PositionManager::new(a.db.clone());
-            // `get_position(t, 2)` decodes the row stored at `t ‖ 2`.
-            let held = pm.get_position(&t, 2).unwrap();
-            let m3 = pm.get_position(&t, 3).unwrap();
-            held.is_some_and(|p| p.market_id == 3) && m3.is_some_and(|p| p.size > px(4))
-        };
         Ok(P5Summary {
             compared,
             restarts: a.restarts,
@@ -29179,7 +29203,7 @@ mod crash_recovery_tests {
                 a.metrics.exec_users_drained_rows.get(),
                 b.metrics.exec_users_drained_rows.get(),
             ),
-            aliased_alive,
+            aliased_live,
         })
     }
 
@@ -29235,7 +29259,7 @@ mod crash_recovery_tests {
             // reference node never did.
             assert_eq!(s.drained.0, 0, "{cfg:?}: the reference node drained rows: {s:?}");
             assert!(s.drained.1 >= n, "{cfg:?}: the typed node drained in place: {s:?}");
-            assert!(s.aliased_alive, "{cfg:?}: the aliased trader's rows: {s:?}");
+            assert!(s.aliased_live.0 >= n / 4, "{cfg:?}: the aliased trader's rows: {s:?}");
             assert!(
                 s.fills >= n as usize && s.liquidations >= 3 && s.bbo_rows >= 1,
                 "{cfg:?}: {s:?}"

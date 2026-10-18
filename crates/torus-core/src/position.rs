@@ -857,6 +857,15 @@ impl PositionCache {
         self.dirty.extend(other.dirty);
     }
 
+    /// Item 6 Phase 5 step 2 (Codex review, aliased plan caches): every
+    /// entry (clean or dirty) is keyed in market `m`. Per-market caches of
+    /// different markets that all hold this are disjoint; a cache that
+    /// loaded an opaque row whose payload names another market (filed under
+    /// the payload's key by [`Self::update_in_place`]) does not.
+    pub fn keys_in_market(&self, m: MarketId) -> bool {
+        self.map.keys().all(|k| k.1 == m)
+    }
+
     /// Number of cached entries (live rows, misses and tombstones).
     pub fn len(&self) -> usize {
         self.map.len()

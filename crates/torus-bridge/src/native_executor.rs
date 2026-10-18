@@ -8312,9 +8312,11 @@ impl NativeExecutor {
         let mut pos_cache = PositionCache::new();
         let mut vol_cache = VolumeCache::default();
         // Item 6 Phase 5 step 2: with an in-place record set, the parallel
-        // settle's per-market position caches are kept here (disjoint keys)
-        // and go straight into it at the flush, without a merge.
-        let mut pos_plans: Vec<PositionCache> = Vec::new();
+        // settle's per-market position caches are kept here with their
+        // market, in market order, and go straight into it at the flush,
+        // without a merge, when their keys are disjoint (else the
+        // reference merge; see the flush).
+        let mut pos_plans: Vec<(MarketId, PositionCache)> = Vec::new();
         let in_place = ctx.in_place_users().is_some();
 
         // L3-ENG: resolve the engine worker count (0 = serial prepare).
@@ -8791,15 +8793,40 @@ impl NativeExecutor {
             // straight into the in-place record set under one lock: no row
             // encode, no overlay write per row; the block's change set is
             // serialized once at its freeze. Same rows: each key's final
-            // value (one per key in the caches; the plans' keys are disjoint
-            // per market; the overlay's own pending rows of the two CFs, if
-            // any, are folded in first, as the flush overwrote them before).
-            // Order-free: every key is applied on its own and the drain
-            // sorts.
+            // value (one per key in the caches; the overlay's own pending
+            // rows of the two CFs, if any, are folded in first, as the flush
+            // overwrote them before). Order-free: every key is applied on
+            // its own and the drain sorts.
             ctx.state.fold_in_place();
+            // Codex review of step 2 (aliased plan caches): that holds when
+            // the caches' keys are disjoint, which every plan keyed in its
+            // own market (distinct markets) and an empty batch cache prove;
+            // then each dirty entry's row is its own key's (`set` files a row
+            // under its fields). An opaque row whose payload names another
+            // market breaks it: its fill is filed under the payload's key,
+            // which a later plan may hold too (dirty, or loaded clean). The
+            // reference merges the plans in market order (a later entry,
+            // clean ones included, replaces an earlier one; the dirty marks
+            // are unioned) and writes each dirty key's merged entry under
+            // the entry's own fields in key order, so a row can land under
+            // another key. Those blocks take exactly that path: the same
+            // merge, the same `flush_all`, through the overlay's
+            // write-through into the record set (no users lock held).
+            let disjoint = pos_plans.is_empty()
+                || (pos_cache.is_empty()
+                    && pos_plans.windows(2).all(|w| w[0].0 < w[1].0)
+                    && pos_plans.iter().all(|(m, c)| c.keys_in_market(*m)));
+            if !disjoint {
+                for (_, plan) in pos_plans.drain(..) {
+                    pos_cache.merge_disjoint(plan);
+                }
+                if let Err(e) = pos_cache.flush_all(&ctx.positions) {
+                    ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
+                }
+            }
             let mut u = users.write();
             let mut w = u.mutate();
-            for cache in pos_plans.iter_mut().chain(std::iter::once(&mut pos_cache)) {
+            for cache in pos_plans.iter_mut().map(|(_, c)| c).chain(std::iter::once(&mut pos_cache)) {
                 for ((t, m), row) in cache.take_dirty() {
                     match row {
                         Some(p) => w.set_position(p),
@@ -9560,7 +9587,7 @@ impl NativeExecutor {
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
         vol_cache: &mut VolumeCache,
-        mut pos_plans: Option<&mut Vec<PositionCache>>,
+        mut pos_plans: Option<&mut Vec<(MarketId, PositionCache)>>,
         max_workers: usize,
     ) {
         // ---- Pass A: pure per-market plans on CAPPED chunk workers ----
@@ -9766,7 +9793,7 @@ impl NativeExecutor {
             // (disjoint keys across markets; single sorted flush at call end).
             // Phase 5 step 2: kept apart for the in-place record set.
             match pos_plans.as_deref_mut() {
-                Some(plans) => plans.push(plan.pos_cache),
+                Some(plans) => plans.push((market_id, plan.pos_cache)),
                 None => pos_cache.merge_disjoint(plan.pos_cache),
             }
 
