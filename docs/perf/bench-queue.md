@@ -31,13 +31,14 @@ main at or after 50d2316c.
 - `TORUS_HEADER_RESEND_MS=${...:-250}` in `devnet/wsl/env.sh` and `devnet/docker-compose.yml` gives every cell 250 ms
   (code default 3 s; revisited pre-testnet, roadmap). Comparisons inside a campaign stay valid; comparisons with
   results from before the resend change do not (fewer lost-proposal timeouts move block rate and matched/s).
-- **Defaults change (branch `feat/defaults-pc-f-resend`, s128; applies once it is on main):** an arm that leaves PC and
+- **Defaults change (on main since `3429855d`, s128; binaries built from it or later):** an arm that leaves PC and
   F unset gets PC (`TORUS_PARALLEL_CANCEL_ALL`, 8 workers) and F (`TORUS_EPOCH_FAST_PATH`) ON. A baseline arm
   without them must set `TORUS_PARALLEL_CANCEL_ALL=0 TORUS_EPOCH_FAST_PATH=0` (an `absent_env` entry for either name
   now means ON, not off). Header re-send is 250 ms both from the code default and from `env.sh` /
   `docker-compose.yml`, so `HEADER_RESEND_UNSET=1` no longer gives 3 s: an arm that wants 3 s sets
   `TORUS_HEADER_RESEND_MS=3000` (`=0` = off). Compare against results from before the merge only with the
-  pre-merge arms' env spelled out.
+  pre-merge arms' env spelled out. Binaries built before it (M `e3d11cb9`, Q9's `e1be6c15` / `b2dd21a4`, step Z's
+  `9d770519`) keep the old defaults: their arms set PC + F by env, as in sections 83-87.
 - Block rate from cells shorter than about 5 min is indicative only: under sustained load it falls to exec pace
   (5.9 -> 3.0 blocks/s by minute 5) while matched/s stays flat (section 79). matched/s stays the primary metric.
 - Watch `no_proposal` in every replicate (1 in the s58dmt check cell, 1 in the s58safe soak).
