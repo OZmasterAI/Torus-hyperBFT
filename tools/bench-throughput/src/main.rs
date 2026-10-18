@@ -19,6 +19,7 @@ mod by_id;
 mod cloid;
 mod in_flight;
 mod oracle_feed;
+mod preload;
 
 const HARDHAT_KEYS: [&str; 20] = [
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
@@ -266,6 +267,11 @@ enum Command {
         /// index range, never a load sender) instead of fresh unfunded keys.
         #[arg(long, default_value_t = false)]
         spam_cancel_funded: bool,
+        /// Exclusive end of the genesis-funded bulk sender range: 60 +
+        /// BULK_COUNT of testnet/gen-weighted-genesis.sh (default 100_060 =
+        /// the 100k genesis). --spam-cancel-funded takes the top of it.
+        #[arg(long, default_value_t = DEFAULT_FUNDED_BULK_END)]
+        funded_bulk_end: usize,
         /// Percent (0..=100) of placed orders that carry a client order id
         /// (cloid; s114). Picked per order by a hash of a fixed per-sender
         /// seed and the sender's order index (repeatable, never draws from
@@ -319,6 +325,83 @@ enum Command {
         /// These are deterministic bench keys — NEVER use on a real network.
         #[arg(long, default_value_t = false)]
         secret_keys: bool,
+    },
+    /// Bench queue 8f: place ~--target non-crossing resting orders, spread
+    /// over markets 1..=--markets, from genesis-funded owners in their own
+    /// index range (never a load sender), well outside the load's price band;
+    /// then wait until every node's torus_orders_resting_total rose by the
+    /// target (--metrics-urls) and print one JSON summary. --dry-run prints
+    /// the plan only. Exit 0 = target reached, 1 = not, 2 = bad flags. See
+    /// preload.rs.
+    Preload {
+        /// Comma-separated node RPC urls; owner i sends to url i % n.
+        #[arg(long, default_value = "http://127.0.0.1:8645,http://127.0.0.1:8646,http://127.0.0.1:8647")]
+        rpc_urls: String,
+        /// Comma-separated node /metrics urls: the resting count is read
+        /// there, on every node. Empty = submit only, never "reached".
+        #[arg(long, default_value = "")]
+        metrics_urls: String,
+        /// Resting orders to place in total.
+        #[arg(long, default_value_t = 1_000_000)]
+        target: u64,
+        /// Spread over markets 1..=N.
+        #[arg(long, default_value_t = 300)]
+        markets: u64,
+        /// Max orders per owner (<= the chain's 1000 per-user limit).
+        #[arg(long, default_value_t = preload::DEFAULT_PER_OWNER)]
+        per_owner: u64,
+        /// First owner index. Default: --sender-offset + --senders (just
+        /// past the load's senders).
+        #[arg(long)]
+        owner_offset: Option<usize>,
+        /// The load's first sender index (`consensus --sender-offset`).
+        #[arg(long, default_value_t = 60)]
+        sender_offset: usize,
+        /// The load's sender count (`consensus --senders`).
+        #[arg(long, default_value_t = 5_000)]
+        senders: usize,
+        /// Exclusive end of the genesis-funded bulk range (60 + BULK_COUNT).
+        #[arg(long, default_value_t = DEFAULT_FUNDED_BULK_END)]
+        funded_bulk_end: usize,
+        /// The load's econ shape: mid = --econ-mid, else 20 x --target-margin.
+        #[arg(long, default_value_t = 1500)]
+        target_margin: u64,
+        #[arg(long, default_value_t = 0)]
+        econ_mid: u64,
+        /// The load's half-band in ticks; --distance must exceed it.
+        #[arg(long, default_value_t = 5)]
+        band: u64,
+        /// Ticks from mid to the nearest pre-load price (buys below, sells above).
+        #[arg(long, default_value_t = 1_000)]
+        distance: u64,
+        /// Price levels per side, one tick apart, from --distance outward.
+        #[arg(long, default_value_t = 100)]
+        levels: u64,
+        /// Orders per PlaceOrderBatch (<= 1024); 0 = min(1024, --per-owner).
+        #[arg(long, default_value_t = 0)]
+        batch: usize,
+        /// Lots per order.
+        #[arg(long, default_value_t = 1)]
+        qty: u64,
+        /// Submission pace, actions/s in aggregate.
+        #[arg(long, default_value_t = 50.0)]
+        rate: f64,
+        /// Max submissions in flight.
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+        /// Give up waiting for the resting count after this many seconds
+        /// (from the first submission).
+        #[arg(long, default_value_t = 900)]
+        timeout_s: u64,
+        /// ... or once it has not grown for this many seconds.
+        #[arg(long, default_value_t = 120)]
+        stall_s: u64,
+        /// Print the plan (owners, actions, per-market spread, prices) and exit.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Also write the JSON summary here.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
     /// Keep oracle MARK prices fresh on the bench devnet: every --interval-ms
     /// each validator signs --price (or its --walk-bp walk) for markets 1..=--markets (ceil(N/256)
@@ -2305,8 +2388,10 @@ mod max_in_flight_tests {
 /// Bulk-funded genesis sender indices: testnet/gen-weighted-genesis.sh funds
 /// `BULK_OFFSET` (60) .. 60 + `BULK_COUNT` (100_000) with the `gen-accounts`
 /// derivation (the 3-validator devnet genesis inherits them).
+/// The range end is `--funded-bulk-end` (default: the 100k genesis), so a
+/// larger genesis (BULK_COUNT=1M, bench queue 8f) moves it.
 const FUNDED_BULK_START: usize = 60;
-const FUNDED_BULK_END: usize = 100_060;
+const DEFAULT_FUNDED_BULK_END: usize = 100_060;
 
 /// Where `--spam-cancel-*` keys come from.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2334,6 +2419,7 @@ fn spam_cancel_plan(
     funded: bool,
     senders: usize,
     sender_offset: usize,
+    funded_end: usize,
 ) -> Result<Option<SpamCancel>, String> {
     if keys == 0 {
         return Ok(None);
@@ -2344,19 +2430,19 @@ fn spam_cancel_plan(
         ));
     }
     let source = if funded {
-        let Some(first) = FUNDED_BULK_END
+        let Some(first) = funded_end
             .checked_sub(keys)
             .filter(|f| *f >= FUNDED_BULK_START)
         else {
             return Err(format!(
                 "--spam-cancel-funded: {keys} keys exceed the {} funded genesis accounts",
-                FUNDED_BULK_END - FUNDED_BULK_START
+                funded_end.saturating_sub(FUNDED_BULK_START)
             ));
         };
         let load_end = sender_offset.saturating_add(senders);
-        if sender_offset < FUNDED_BULK_END && load_end > first {
+        if sender_offset < funded_end && load_end > first {
             return Err(format!(
-                "--spam-cancel-funded: spam indices {first}..{FUNDED_BULK_END} overlap the \
+                "--spam-cancel-funded: spam indices {first}..{funded_end} overlap the \
                  load senders {sender_offset}..{load_end}; lower --senders or --spam-cancel-keys"
             ));
         }
@@ -2568,22 +2654,22 @@ mod spam_cancel_tests {
             ]),
             (8, 250.5, true)
         );
-        assert_eq!(spam_cancel_plan(0, 0.0, false, 5000, 60), Ok(None));
-        assert_eq!(spam_cancel_plan(0, 99.0, true, 5000, 60), Ok(None));
+        assert_eq!(spam_cancel_plan(0, 0.0, false, 5000, 60, DEFAULT_FUNDED_BULK_END), Ok(None));
+        assert_eq!(spam_cancel_plan(0, 99.0, true, 5000, 60, DEFAULT_FUNDED_BULK_END), Ok(None));
     }
 
     #[test]
     fn spam_cancel_needs_a_positive_rate() {
-        assert!(spam_cancel_plan(4, 0.0, false, 5000, 60).is_err());
-        assert!(spam_cancel_plan(4, -1.0, false, 5000, 60).is_err());
-        assert!(spam_cancel_plan(4, f64::NAN, false, 5000, 60).is_err());
+        assert!(spam_cancel_plan(4, 0.0, false, 5000, 60, DEFAULT_FUNDED_BULK_END).is_err());
+        assert!(spam_cancel_plan(4, -1.0, false, 5000, 60, DEFAULT_FUNDED_BULK_END).is_err());
+        assert!(spam_cancel_plan(4, f64::NAN, false, 5000, 60, DEFAULT_FUNDED_BULK_END).is_err());
     }
 
     #[test]
     fn funded_spam_keys_are_the_top_of_the_funded_range_and_not_load_senders() {
         // gen-weighted-genesis.sh funds indices 60..100_060; the load senders
         // use --sender-offset 60 --senders N, so the spammers take the top K.
-        let plan = spam_cancel_plan(3, 30.0, true, 5000, 60).unwrap().unwrap();
+        let plan = spam_cancel_plan(3, 30.0, true, 5000, 60, DEFAULT_FUNDED_BULK_END).unwrap().unwrap();
         assert_eq!(plan.keys, 3);
         assert_eq!(plan.source, SpamKeys::Funded { first: 100_057 });
         let want: Vec<Address> = load_sender_keys(3, 100_057)
@@ -2593,17 +2679,52 @@ mod spam_cancel_tests {
         let got: Vec<Address> = plan.signing_keys().iter().map(addr).collect();
         assert_eq!(got, want, "same derivation as gen-accounts (funded)");
         // Load senders 60..60+N must not reach the spam range.
-        assert!(spam_cancel_plan(10, 1.0, true, 99_990, 60).is_ok());
-        assert!(spam_cancel_plan(10, 1.0, true, 99_991, 60).is_err());
+        assert!(spam_cancel_plan(10, 1.0, true, 99_990, 60, DEFAULT_FUNDED_BULK_END).is_ok());
+        assert!(spam_cancel_plan(10, 1.0, true, 99_991, 60, DEFAULT_FUNDED_BULK_END).is_err());
         // Senders above the funded range do not collide either.
-        assert!(spam_cancel_plan(10, 1.0, true, 100, 100_060).is_ok());
+        assert!(spam_cancel_plan(10, 1.0, true, 100, 100_060, DEFAULT_FUNDED_BULK_END).is_ok());
         // More keys than funded accounts.
-        assert!(spam_cancel_plan(100_001, 1.0, true, 0, 0).is_err());
+        assert!(spam_cancel_plan(100_001, 1.0, true, 0, 0, DEFAULT_FUNDED_BULK_END).is_err());
+    }
+
+    #[test]
+    fn funded_bulk_end_defaults_to_the_100k_genesis_and_moves_with_a_larger_one() {
+        let end = |extra: &[&str]| {
+            let cli = Cli::try_parse_from(["bench-throughput", "consensus"].iter().chain(extra).copied())
+                .expect("parses");
+            let Command::Consensus { funded_bulk_end, .. } = cli.command else { panic!("consensus") };
+            funded_bulk_end
+        };
+        assert_eq!(end(&[]), 100_060);
+        assert_eq!(end(&["--funded-bulk-end", "1000060"]), 1_000_060);
+        // BULK_COUNT=1M: the spammers take the top of the 1M range ...
+        let plan = spam_cancel_plan(3, 30.0, true, 5000, 60, 1_000_060).unwrap().unwrap();
+        assert_eq!(plan.source, SpamKeys::Funded { first: 1_000_057 });
+        // ... and more of them fit than in the 100k genesis.
+        assert!(spam_cancel_plan(200_000, 1.0, true, 5000, 60, 1_000_060).is_ok());
+        assert!(spam_cancel_plan(200_000, 1.0, true, 5000, 60, DEFAULT_FUNDED_BULK_END).is_err());
+        // An end below the bulk start funds nobody.
+        assert!(spam_cancel_plan(1, 1.0, true, 0, 0, 30).is_err());
+    }
+
+    #[test]
+    fn preload_flags_default_to_1m_orders_over_300_markets() {
+        let cli = Cli::try_parse_from(["bench-throughput", "preload", "--dry-run"]).expect("parses");
+        let Command::Preload {
+            target, markets, per_owner, owner_offset, sender_offset, senders, funded_bulk_end,
+            band, distance, levels, batch, qty, dry_run, ..
+        } = cli.command
+        else {
+            panic!("preload")
+        };
+        assert_eq!((target, markets, per_owner, owner_offset), (1_000_000, 300, 900, None));
+        assert_eq!((sender_offset, senders, funded_bulk_end), (60, 5_000, 100_060));
+        assert_eq!((band, distance, levels, batch, qty, dry_run), (5, 1_000, 100, 0, 1, true));
     }
 
     #[test]
     fn unfunded_spam_keys_are_fresh_deterministic_and_distinct() {
-        let plan = spam_cancel_plan(16, 30.0, false, 5000, 60)
+        let plan = spam_cancel_plan(16, 30.0, false, 5000, 60, DEFAULT_FUNDED_BULK_END)
             .unwrap()
             .unwrap();
         assert_eq!(plan.source, SpamKeys::Unfunded);
@@ -2622,7 +2743,7 @@ mod spam_cancel_tests {
 
     #[test]
     fn spam_report_is_one_line_apart_from_the_load() {
-        let plan = spam_cancel_plan(2, 10.0, false, 5000, 60).unwrap().unwrap();
+        let plan = spam_cancel_plan(2, 10.0, false, 5000, 60, DEFAULT_FUNDED_BULK_END).unwrap().unwrap();
         let stats = SpamStats::default();
         stats.sent.store(7, Ordering::Relaxed);
         stats.accepted.store(3, Ordering::Relaxed);
@@ -4506,6 +4627,7 @@ async fn main() {
             spam_cancel_keys,
             spam_cancel_rate,
             spam_cancel_funded,
+            funded_bulk_end,
             cloid_share,
         } => {
             let bin = match format.as_str() {
@@ -4530,6 +4652,7 @@ async fn main() {
                 spam_cancel_funded,
                 senders.max(1),
                 sender_offset,
+                funded_bulk_end,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -4588,6 +4711,84 @@ async fn main() {
             count,
             secret_keys,
         } => run_gen_accounts(offset, count, secret_keys),
+        Command::Preload {
+            rpc_urls,
+            metrics_urls,
+            target,
+            markets,
+            per_owner,
+            owner_offset,
+            sender_offset,
+            senders,
+            funded_bulk_end,
+            target_margin,
+            econ_mid,
+            band,
+            distance,
+            levels,
+            batch,
+            qty,
+            rate,
+            concurrency,
+            timeout_s,
+            stall_s,
+            dry_run,
+            out,
+        } => {
+            let shape = EconShape::new(target_margin, econ_mid, band, 0.0, 0.0);
+            let spec = preload::PreloadSpec {
+                target,
+                markets,
+                per_owner,
+                owner_offset,
+                load_offset: sender_offset,
+                load_senders: senders,
+                funded_end: funded_bulk_end,
+                mid: shape.mid,
+                load_band: band,
+                distance,
+                levels,
+                batch,
+                qty,
+            };
+            let plan = match preload::PreloadPlan::new(&spec) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("preload: {e}");
+                    std::process::exit(2);
+                }
+            };
+            if dry_run {
+                println!("{}", serde_json::to_string_pretty(&plan).expect("plan json"));
+                return;
+            }
+            if !(rate.is_finite() && rate > 0.0) {
+                eprintln!("preload: --rate must be > 0 (got {rate})");
+                std::process::exit(2);
+            }
+            let report = preload::run(
+                &plan,
+                preload::RunArgs {
+                    rpc_urls: &rpc_urls,
+                    metrics_urls: &metrics_urls,
+                    rate,
+                    concurrency,
+                    timeout: Duration::from_secs(timeout_s),
+                    stall: Duration::from_secs(stall_s),
+                },
+            )
+            .await;
+            let json = serde_json::to_string(&report).expect("report json");
+            if let Some(p) = out {
+                if let Err(e) = std::fs::write(&p, format!("{json}\n")) {
+                    eprintln!("preload: cannot write {}: {e}", p.display());
+                }
+            }
+            println!("{json}");
+            if !report.reached {
+                std::process::exit(1);
+            }
+        }
         Command::OracleFeed {
             rpc_urls,
             validator_keys,

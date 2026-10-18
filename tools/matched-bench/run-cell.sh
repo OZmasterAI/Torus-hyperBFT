@@ -292,6 +292,36 @@
 #                EVM load's cadence check and records it as
 #                summary.json .genesis.evm_block_interval. An ambient
 #                EVM_BLOCK_INTERVAL is ignored: only EXTRA_ENV sets it.
+#   BULK_COUNT=N  genesis-funded bulk senders "bulk-test 60".."bulk-test
+#                60+N-1" (testnet/gen-weighted-genesis.sh; default 100000 =
+#                every cell before bench queue 8f). Handed to
+#                gen-3val-genesis.sh, which refuses to reuse a weighted-full
+#                genesis built with another N (rebuild with FORCE=1; 1M accounts
+#                take minutes and ~290 MB, each jq pass ~3-7 s). SENDERS <= N.
+#                Off the default the bench gets --funded-bulk-end 60+N (the
+#                funded spam keys sit at the top of that range). Logged in the
+#                cell= line; summary.json .genesis.bulk_count.
+#   PRELOAD=N    bench queue 8f: after node ready (and fresh oracle marks)
+#                and BEFORE the metrics-before snapshot, the samplers and the
+#                load, `bench-throughput preload` places N non-crossing resting
+#                orders over markets 1..MARKETS from funded owners in their own
+#                index range (never a load sender, so the load's cancel-alls
+#                never touch them), PRELOAD_DISTANCE ticks or more outside the
+#                load's mid, at most PRELOAD_PER_OWNER per owner, then waits
+#                until every node's torus_orders_resting_total rose by N.
+#                Artifacts: preload.log, preload.json (the bench report),
+#                preload-cell.json; summary.json .preload (seconds, counts,
+#                resting, owners; boot_to_ready_s apart from the pre-load's
+#                own seconds). Target missed (or rc != 0): .preload.ok=false,
+#                validity REJECT, and the cell FAILS before the load. 0 / unset
+#                (default) = off: no step, file or flag changes.
+#   PRELOAD_PER_OWNER=P (default 900, <= 1000 = the per-user open-order limit)
+#   PRELOAD_OWNER_OFFSET=I  first owner index (default 60 + SENDERS, just past
+#                the load); owners I..I+ceil(N/P) must be genesis-funded (<= 60
+#                + BULK_COUNT) and below the funded spam keys.
+#   PRELOAD_DISTANCE=D (default 1000 ticks; > BAND)  PRELOAD_LEVELS=L (default
+#                100 price levels per side)  PRELOAD_RATE=R (default 50
+#                actions/s)  PRELOAD_TIMEOUT=S (default 900 s to reach N).
 #   TOOLS_FROM_WORKTREE  1 (default) scores the cell with <worktree>/tools/
 #                matched-bench/summarize.py, i.e. the CANDIDATE's own summarizer,
 #                whichever copy of run-cell.sh was invoked. 0 keeps the old
@@ -367,6 +397,17 @@ SPAM_CANCEL_FUNDED=${SPAM_CANCEL_FUNDED:-}
 CANCEL_BY_ID_FRACTION=${CANCEL_BY_ID_FRACTION:-}
 MODIFY_FRACTION=${MODIFY_FRACTION:-}
 CLOID_SHARE=${CLOID_SHARE:-}
+BULK_COUNT=${BULK_COUNT:-100000}
+PRELOAD=${PRELOAD:-0}
+PRELOAD_PER_OWNER=${PRELOAD_PER_OWNER:-900}
+PRELOAD_OWNER_OFFSET=${PRELOAD_OWNER_OFFSET:-}
+PRELOAD_DISTANCE=${PRELOAD_DISTANCE:-1000}
+PRELOAD_LEVELS=${PRELOAD_LEVELS:-100}
+PRELOAD_RATE=${PRELOAD_RATE:-50}
+PRELOAD_TIMEOUT=${PRELOAD_TIMEOUT:-900}
+# The harness kills a pre-load still running PRELOAD_KILL_GRACE s past its own
+# --timeout-s (a hang, never a slow but bounded run): rc 124, the cell fails.
+PRELOAD_KILL_GRACE=60
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-240}
 # Drain scales with the market count: the mempool backlog at 300 markets needs
 # far longer than 180 s to execute, and a cell that stops draining early is
@@ -593,6 +634,10 @@ for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
+# BULK_COUNT: the genesis' funded bulk senders; the load's must be among them.
+[[ "$BULK_COUNT" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "FATAL: BULK_COUNT must be a positive integer (got '$BULK_COUNT')" >&2; exit 2; }
+{ [[ "$SENDERS" =~ ^[0-9]+$ ]] && [ "$SENDERS" -le "$BULK_COUNT" ]; } \
+    || { echo "FATAL: SENDERS=$SENDERS exceeds BULK_COUNT=$BULK_COUNT (the load senders 60..60+SENDERS must be genesis-funded)" >&2; exit 2; }
 # EVM_BLOCK_INTERVAL (genesis EVM cadence N) comes from EXTRA_ENV only; checked
 # here so a bad N fails before anything is staged. Same range as
 # gen-3val-genesis.sh (torus_types::EVM_BLOCK_INTERVAL_RANGE = 2..=100).
@@ -670,6 +715,46 @@ if evm_load_on; then
     [ -f "$SELF_DIR/evm_load.py" ] || { echo "FATAL: $SELF_DIR/evm_load.py missing" >&2; exit 1; }
 elif [ -n "$EVM_LOAD_SENDERS" ]; then
     echo "FATAL: EVM_LOAD_SENDERS=$EVM_LOAD_SENDERS needs EVM_LOAD_RATE > 0" >&2; exit 2
+fi
+
+# ---- pre-load (PRELOAD > 0, bench queue 8f) pre-flight. Every pre-load step
+# below sits in an `if preload_on` block: off (the default), the cell runs
+# exactly as before.
+[[ "$PRELOAD" =~ ^[0-9]{1,9}$ ]] || { echo "FATAL: PRELOAD must be a non-negative integer number of orders (got '$PRELOAD')" >&2; exit 2; }
+PRELOAD=$((10#$PRELOAD))
+preload_on() { [ "$PRELOAD" -gt 0 ]; }
+# preload_cmd: PRELOAD_CMD = the bench pre-load for this cell (same econ mid,
+# --target-margin 1500, and band as the load; owners past the load's senders).
+preload_cmd() {
+    PRELOAD_CMD=("$BENCH" preload --rpc-urls "$(IFS=,; printf '%s' "${RPCS[*]}")" \
+        --metrics-urls "http://127.0.0.1:${METS[0]}/metrics,http://127.0.0.1:${METS[1]}/metrics,http://127.0.0.1:${METS[2]}/metrics" \
+        --target "$PRELOAD" --markets "$MARKETS" --per-owner "$PRELOAD_PER_OWNER" --owner-offset "$PRELOAD_OWNER_OFFSET" \
+        --sender-offset 60 --senders "$SENDERS" --funded-bulk-end "$((60 + BULK_COUNT))" \
+        --target-margin 1500 --band "$BAND" --distance "$PRELOAD_DISTANCE" --levels "$PRELOAD_LEVELS" \
+        --rate "$PRELOAD_RATE" --timeout-s "$PRELOAD_TIMEOUT" --out "$OUT/preload.json")
+}
+PRELOAD_OWNERS=""
+if preload_on; then
+    [[ "$PRELOAD_PER_OWNER" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$PRELOAD_PER_OWNER" -le 1000 ] \
+        || { echo "FATAL: PRELOAD_PER_OWNER must be an integer in 1..1000 (the per-user open-order limit) (got '$PRELOAD_PER_OWNER')" >&2; exit 2; }
+    for v in PRELOAD_DISTANCE PRELOAD_LEVELS PRELOAD_TIMEOUT; do
+        [[ "${!v}" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "FATAL: $v must be a positive integer (got '${!v}')" >&2; exit 2; }
+    done
+    PRELOAD_OWNER_OFFSET=${PRELOAD_OWNER_OFFSET:-$((60 + SENDERS))}
+    [[ "$PRELOAD_OWNER_OFFSET" =~ ^[0-9]{1,9}$ ]] || { echo "FATAL: PRELOAD_OWNER_OFFSET must be a non-negative integer (got '$PRELOAD_OWNER_OFFSET')" >&2; exit 2; }
+    { [[ "$PRELOAD_RATE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v r="$PRELOAD_RATE" 'BEGIN{exit !(r>0)}'; } \
+        || { echo "FATAL: PRELOAD_RATE must be a positive number of actions/s (got '$PRELOAD_RATE')" >&2; exit 2; }
+    [ -f "$SELF_DIR/preload.py" ] || { echo "FATAL: PRELOAD=$PRELOAD needs $SELF_DIR/preload.py" >&2; exit 1; }
+    "$BENCH" preload --help 2>/dev/null | grep -q -- --per-owner \
+        || { echo "FATAL: PRELOAD=$PRELOAD but $BENCH has no preload subcommand (rebuild bench-throughput)" >&2; exit 1; }
+    PRELOAD_SPAM=0; [ "$SPAM_CANCEL_FUNDED" = 1 ] && PRELOAD_SPAM=${SPAM_CANCEL_KEYS:-0}
+    PRELOAD_OWNERS=$(python3 "$SELF_DIR/preload.py" owners --target "$PRELOAD" --per-owner "$PRELOAD_PER_OWNER" \
+        --owner-offset "$PRELOAD_OWNER_OFFSET" --bulk-count "$BULK_COUNT" --spam-funded-keys "$PRELOAD_SPAM" 2>&1) \
+        || { echo "FATAL: PRELOAD=$PRELOAD: $PRELOAD_OWNERS" >&2; exit 2; }
+    preload_cmd
+    # The bench validates the whole plan (funded range, load overlap, band, batch caps).
+    PRELOAD_DRY=$("${PRELOAD_CMD[@]}" --dry-run 2>&1 >/dev/null) \
+        || { echo "FATAL: PRELOAD=$PRELOAD: bench preload --dry-run refused the plan: $PRELOAD_DRY" >&2; exit 2; }
 fi
 
 # ---- crash gate (bl3) pre-flight: validated HERE, before anything is launched,
@@ -775,6 +860,28 @@ record_genesis_evm_n() {
         rm -f -- "${tmp:?}"
         return 1
     fi
+}
+
+# record_genesis_bulk_count <summary.json> <n>: .genesis.bulk_count = n (the
+# BULK_COUNT this cell's genesis was built with). rc 1, file untouched, on failure.
+record_genesis_bulk_count() {
+    local p=$1 n=$2 tmp
+    tmp="$p.bulk-count.tmp"
+    if ! jq --argjson n "$n" '.genesis.bulk_count = $n' "$p" > "$tmp" || ! mv -f "$tmp" "$p"; then
+        rm -f -- "${tmp:?}"
+        return 1
+    fi
+}
+
+# preload_record <rc> <seconds>: preload-cell.json (what run-cell.sh knows of
+# the pre-load) + preload.py summary -> summary.json .preload (REJECT folded in
+# when the target was missed). Prints preload.py's one-line verdict; rc 0 iff ok.
+preload_record() {
+    jq -n --argjson target "$PRELOAD" --argjson seconds "$2" --argjson rc "$1" \
+        --argjson boot "$((T_HEALTHY - T_LAUNCH))" --argjson markets "$MARKETS" --arg cmd "${PRELOAD_CMD[*]}" \
+        '{target: $target, seconds: $seconds, rc: $rc, boot_to_ready_s: $boot, markets: $markets, cmd: $cmd}' \
+        > "$OUT/preload-cell.json" || return 1
+    python3 "$SELF_DIR/preload.py" summary --dir "$OUT" | jq -e -c '., if .ok then empty else error("not ok") end' 2>/dev/null
 }
 
 # weighted_full_check <file> <senders>: gen-3val-genesis.sh REUSES an existing
@@ -903,7 +1010,7 @@ if [ "$ORACLE_FEED" = 1 ]; then trap 'stop_oracle_feed' EXIT; fi
 # ... nor a tx-flood (stop_oracle_feed is a no-op without a feed).
 if evm_load_on; then trap 'stop_oracle_feed; evm_load_stop' EXIT; fi
 
-log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' cloid_share='${CLOID_SHARE:-unset}' extra_env='$EXTRA_ENV'"
+log "cell=$LABEL worktree=$WT markets=$MARKETS dur=${DUR}s rate=$RATE senders=$SENDERS block_cap='${BLOCK_CAP:-unset}' mps='${MPS:-unset}' band=$BAND cross=$CROSS_FRACTION cancel=$CANCEL_FRACTION open_order_budget='${OPEN_ORDER_BUDGET:-unset}' retry_busy='${RETRY_BUSY:-unset}' max_in_flight='${MAX_IN_FLIGHT:-unset}' in_flight_tail='${IN_FLIGHT_TAIL:-unset}' antispam='${ANTISPAM:-unset}' spam_cancel_keys='${SPAM_CANCEL_KEYS:-unset}' spam_cancel_rate='${SPAM_CANCEL_RATE:-unset}' spam_cancel_funded='${SPAM_CANCEL_FUNDED:-unset}' cancel_by_id='${CANCEL_BY_ID_FRACTION:-unset}' modify='${MODIFY_FRACTION:-unset}' cloid_share='${CLOID_SHARE:-unset}' bulk_count=$BULK_COUNT preload='$(preload_on && echo "$PRELOAD" || echo off)' extra_env='$EXTRA_ENV'"
 log "drain_timeout=${DRAIN_TIMEOUT}s digest_par=$DIGEST_PAR rpc_timeout=${RPC_TIMEOUT}s"
 [ -n "$BLOCK_CAP" ] && log "block-cap bundle (BLOCK_CAP=$BLOCK_CAP, BATCH=$BATCH): ${BLOCK_CAP_ENV[*]}"
 if liq_stress_on; then
@@ -946,7 +1053,7 @@ for kv in $EXTRA_ENV; do case $kv in TIMEOUT_BASE_MS=*) GEN_TIMEOUT_BASE_MS=${kv
 if [ "${FORCE:-0}" != 1 ]; then
     WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
 fi
-TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL MARKETS=$MARKETS OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
+TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
     || die "genesis generation failed (see run.log)"
 log "genesis timeout_base_ms=$(jq '.consensus.timeout_base_ms' "$GENESIS")"
 # The genesis EVM cadence N must be the cell's: EVM_BLOCK_INTERVAL, else the
@@ -965,11 +1072,13 @@ if [ "$LIQ_THIN" -gt 0 ]; then
         || die "LIQ_THIN=$LIQ_THIN genesis patch failed (see run.log)"
     log "LIQ_THIN=$LIQ_THIN: native available=$LIQ_THIN_AVAIL on $LIQ_THIN_ROWS genesis rows 'bulk-test 60'..'bulk-test $((60 + LIQ_THIN - 1))' (load senders 0..$((LIQ_THIN - 1)); under a shock the EVEN ones lose on every position)"
 fi
-GEN_MARKETS=$(jq '.markets|length' "$GENESIS")
-GEN_ACCTS=$(jq '.native_balances|length' "$GENESIS")
+# One jq pass (each parses the whole genesis: ~3 s at BULK_COUNT=1M).
+read -r GEN_MARKETS GEN_ACCTS GEN_BULK < <(jq -r '[(.markets|length), (.native_balances|length),
+    ([.native_balances[] | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length)] | @tsv' "$GENESIS")
 GEN_MD5=$(md5sum "$GENESIS" | cut -d' ' -f1)
 [ "$GEN_MARKETS" = "$MARKETS" ] || die "genesis has $GEN_MARKETS markets, wanted $MARKETS"
-log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS md5=$GEN_MD5"
+[ "$GEN_BULK" = "$BULK_COUNT" ] || die "genesis has $GEN_BULK bulk-test senders, wanted BULK_COUNT=$BULK_COUNT"
+log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS bulk_count=$GEN_BULK md5=$GEN_MD5"
 if evm_load_on; then
     # Sender keys (deterministic bench keys) live beside the devnet's pids and
     # logs, never in the results dir; evm_load_stop deletes them.
@@ -1145,6 +1254,25 @@ if [ "$ORACLE_FEED" = 1 ]; then
     log "oracle marks fresh on all $MARKETS markets after ${ORACLE_FRESH_S}s: $ORACLE_M"
 fi
 
+# ---------------------------------------------------------------- 4c. pre-load (PRELOAD > 0)
+# After ready (and fresh marks: the placement band is around the mark), BEFORE
+# the metrics-before snapshot, the samplers and the load: nothing below counts
+# the pre-load's blocks as load. Its seconds are reported apart from boot ->
+# ready (.preload.seconds vs .preload.boot_to_ready_s).
+PRELOAD_S=""; PRELOAD_RC=""
+if preload_on; then
+    log "pre-load: PRELOAD=$PRELOAD resting orders over $MARKETS markets, owners (count first end) $PRELOAD_OWNERS: ${PRELOAD_CMD[*]}"
+    T_PRELOAD0=$(date +%s)
+    timeout --kill-after=10 "$((PRELOAD_TIMEOUT + PRELOAD_KILL_GRACE))" "${PRELOAD_CMD[@]}" > "$OUT/preload.log" 2>&1; PRELOAD_RC=$?
+    PRELOAD_S=$(( $(date +%s) - T_PRELOAD0 ))
+    for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null || die "node pid $p died during the pre-load"; done
+    if PRELOAD_V=$(preload_record "$PRELOAD_RC" "$PRELOAD_S"); then
+        log "pre-load done rc=$PRELOAD_RC in ${PRELOAD_S}s (boot -> ready $((T_HEALTHY - T_LAUNCH))s, apart): $PRELOAD_V"
+    else
+        die "pre-load missed PRELOAD=$PRELOAD (rc=$PRELOAD_RC after ${PRELOAD_S}s): $(jq -c '.preload | {resting, reached, problems}' "$OUT/summary.json" 2>/dev/null || echo 'no record') (preload.log, preload.json; summary.json validity REJECT)"
+    fi
+fi
+
 # ---------------------------------------------------------------- 5. samplers
 # Wide CSV: independent per-node 1 Hz attempts (bounded requests, no catch-up),
 # timestamped at response completion; per-node CSVs retain the exact
@@ -1223,6 +1351,7 @@ BENCH_CMD=("$BENCH" consensus --rpc-urls "$BENCH_RPC_URLS" --econ --senders "$SE
 [ -n "$CANCEL_BY_ID_FRACTION" ] && BENCH_CMD+=(--cancel-by-id-fraction "$CANCEL_BY_ID_FRACTION")
 [ -n "$MODIFY_FRACTION" ] && BENCH_CMD+=(--modify-fraction "$MODIFY_FRACTION")
 [ -n "$CLOID_SHARE" ] && BENCH_CMD+=(--cloid-share "$CLOID_SHARE")
+[ "$BULK_COUNT" = 100000 ] || BENCH_CMD+=(--funded-bulk-end "$((60 + BULK_COUNT))")
 log "bench: ${BENCH_CMD[*]}"
 T_BENCH0=$(date +%s)
 "${BENCH_CMD[@]}" > "$OUT/bench.log" 2>&1 & BENCH_PID=$!
@@ -1620,6 +1749,11 @@ python3 "$TOOLS_DIR/summarize.py" \
 rc=${PIPESTATUS[0]}
 if [ "$rc" = 0 ]; then
     record_genesis_evm_n "$OUT/summary.json" "$GEN_EVM_N" || log "WARNING: summary.json .genesis.evm_block_interval not written"
+    record_genesis_bulk_count "$OUT/summary.json" "$BULK_COUNT" || log "WARNING: summary.json .genesis.bulk_count not written"
+fi
+# summarize.py rewrote summary.json: put the pre-load record (and its verdict) back.
+if preload_on && [ "$rc" = 0 ]; then
+    python3 "$SELF_DIR/preload.py" summary --dir "$OUT" >/dev/null || log "WARNING: summary.json .preload not written"
 fi
 # summary.json .oracle_feed: feed stats + the marks the load ended with
 # (stale_marks_at_bench_end = markets whose mark was NOT usable at bench end).

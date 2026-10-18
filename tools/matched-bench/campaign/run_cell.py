@@ -43,6 +43,14 @@ RUNNER_ENV_KEYS = {
     "EVM_LOAD_SENDERS",
     "EXPECT_NODE_MD5",
     "EXPECT_BENCH_MD5",
+    "BULK_COUNT",
+    "PRELOAD",
+    "PRELOAD_PER_OWNER",
+    "PRELOAD_OWNER_OFFSET",
+    "PRELOAD_DISTANCE",
+    "PRELOAD_LEVELS",
+    "PRELOAD_RATE",
+    "PRELOAD_TIMEOUT",
 }
 p = argparse.ArgumentParser(
     description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter

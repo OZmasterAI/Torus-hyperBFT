@@ -9,6 +9,8 @@ j() { jq -r "$@" "$D/summary.json"; }
 EVM_LOAD=$(jq -c '.evm_load // empty' "$D/summary.json")
 # ... nor .genesis.evm_block_interval (run-cell.sh records it after summarize.py).
 EVM_N=$(jq -r '.genesis.evm_block_interval // empty' "$D/summary.json")
+# ... nor .genesis.bulk_count (BULK_COUNT, bench queue 8f; run-cell.sh records it after summarize.py).
+BULK_N=$(jq -r '.genesis.bulk_count // empty' "$D/summary.json")
 python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .worktree)" --commit "$(j .commit)" \
   --dirty "$(j .dirty_files)" --markets "$(j .cell.markets)" --dur "$(j .cell.duration_s)" --rate "$(j .cell.rate_total)" \
   --senders "$(j .cell.senders)" --t-bench0 "$(j .timing.t_bench0)" --t-bench1 "$(j .timing.t_bench1)" \
@@ -34,6 +36,14 @@ python3 "$T/summarize.py" --out "$D" --label "$(j .label)" --worktree "$(j .work
 if [ -n "$EVM_N" ]; then
     tmp="$D/summary.json.evm-n.tmp"
     jq --argjson n "$EVM_N" '.genesis.evm_block_interval = $n' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
+fi
+if [ -n "$BULK_N" ]; then
+    tmp="$D/summary.json.bulk-count.tmp"
+    jq --argjson n "$BULK_N" '.genesis.bulk_count = $n' "$D/summary.json" > "$tmp" && mv -f "$tmp" "$D/summary.json"
+fi
+# PRELOAD cells: .preload (and its REJECT fold) is re-derived from preload-cell.json + preload.json.
+if [ -f "$D/preload-cell.json" ]; then
+    python3 "$T/preload.py" summary --dir "$D" >/dev/null
 fi
 if [ -n "$EVM_LOAD" ]; then
     python3 "$T/evm_load.py" summary --dir "$D" --rate "$(jq -r '.rate // ""' <<<"$EVM_LOAD")" \

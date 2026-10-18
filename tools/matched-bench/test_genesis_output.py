@@ -44,13 +44,14 @@ class GenesisOutputTests(unittest.TestCase):
         self.output = self.root / 'custom final.json'
         self.calls = self.root / 'child-outputs.txt'
         self.binary = self.root / 'mock-bench'
+        # gen-accounts --offset O --count N: N rows "idx 0x<idx as 40 hex>".
         self.binary.write_text('''#!/usr/bin/env bash
 set -eu
 [ "$1" = gen-accounts ]
 [ "$2" = --offset ] && [ "$3" = 60 ]
-[ "$4" = --count ] && [ "$5" = 2 ]
-printf '%s\\n' "$OUT" >> "$CALL_LOG"
-printf '60 0x0000000000000000000000000000000000000060\\n61 0x0000000000000000000000000000000000000061\\n'
+[ "$4" = --count ]
+printf '%s %s\\n' "$OUT" "$5" >> "$CALL_LOG"
+for i in $(seq "$3" $(( $3 + $5 - 1 ))); do printf '%s 0x%040x\\n' "$i" "$i"; done
 ''')
         self.binary.chmod(0o755)
 
@@ -88,7 +89,7 @@ printf '60 0x0000000000000000000000000000000000000060\\n61 0x0000000000000000000
         full, final = self.generate()
         self.assert_artifacts(full, final)
         self.assertEqual(len(full['native_balances']), 3)
-        self.assertEqual(self.calls.read_text().splitlines(), [str(self.full)])
+        self.assertEqual(self.calls.read_text().splitlines(), [str(self.full) + ' 2'])
 
     def test_force_regenerates_weighted_base_separately_from_custom_output(self):
         self.full.write_text(json.dumps({**self.base, 'stale': True}))
@@ -97,14 +98,108 @@ printf '60 0x0000000000000000000000000000000000000060\\n61 0x0000000000000000000
         self.assert_artifacts(full, final)
         self.assertNotIn('stale', full)
         self.assertEqual(len(full['accounts']), 3)
-        self.assertEqual(self.calls.read_text().splitlines(), [str(self.full)])
+        self.assertEqual(self.calls.read_text().splitlines(), [str(self.full) + ' 2'])
+
+    def bulk_rows(self, n):
+        return [{'address': '0x%040x' % i, 'available': '1.0', 'note': 'bulk-test %d' % i}
+                for i in range(60, 60 + n)]
+
+    def write_legacy_full(self, bulk, **extra):
+        """A weighted-full genesis built before the params sidecar: only its
+        rows say which BULK_COUNT built it."""
+        self.full.write_text(json.dumps({**self.base, **extra,
+                                         'native_balances': self.base['native_balances'] + self.bulk_rows(bulk)}))
 
     def test_existing_weighted_base_is_reused_without_invoking_child(self):
-        self.full.write_text(json.dumps({**self.base, 'reused': True}))
+        self.write_legacy_full(2, reused=True)
         full, final = self.generate()
         self.assert_artifacts(full, final)
         self.assertTrue(final['reused'])
         self.assertFalse(self.calls.exists())
+
+    # ---- BULK_COUNT (bench queue 8f): the funded bulk-sender count of the
+    # weighted-full genesis. Default 100000; a reused genesis built with a
+    # different count is refused, never silently reused.
+
+    def params(self):
+        return json.loads(self.full.with_name('genesis-weighted-full.params.json').read_text())
+
+    def test_bulk_count_reaches_the_weighted_generator_and_is_recorded(self):
+        full, final = self.generate(force=True, BULK_COUNT='5')
+        self.assertEqual(self.calls.read_text().splitlines(), [str(self.full) + ' 5'])
+        notes = [b.get('note') for b in final['native_balances']]
+        self.assertEqual(notes[1:], ['bulk-test %d' % i for i in range(60, 65)])
+        self.assertEqual(len(final['accounts']), 6)
+        p = self.params()
+        self.assertEqual((p['bulk_offset'], p['bulk_count']), (60, 5))
+        self.assertEqual(p['bytes'], self.full.stat().st_size)
+
+    def test_summary_names_the_bulk_count(self):
+        result = self.run_script(force=True, BULK_COUNT='3')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('building weighted-full genesis (BULK_COUNT=3 bulk senders)', result.stdout)
+        self.assertRegex(result.stdout, r'bulk_count = 3\b')
+        self.assertNotIn('100k', result.stdout)
+
+    def test_reuse_with_the_same_bulk_count_does_not_rebuild(self):
+        self.generate(force=True, BULK_COUNT='3')
+        self.calls.unlink()
+        self.generate(BULK_COUNT='3')
+        self.assertFalse(self.calls.exists())
+
+    def test_reuse_with_a_different_bulk_count_is_refused(self):
+        self.generate(force=True, BULK_COUNT='3')
+        self.calls.unlink()
+        self.output.unlink()
+        result = self.run_script(BULK_COUNT='4')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('BULK_COUNT=3', result.stderr)
+        self.assertIn('BULK_COUNT=4', result.stderr)
+        self.assertIn('FORCE=1', result.stderr)
+        self.assertFalse(self.output.exists(), 'refused before the 3-val genesis is written')
+        self.assertFalse(self.calls.exists(), 'never rebuilt implicitly')
+
+    def test_force_rebuilds_at_the_new_bulk_count(self):
+        self.generate(force=True, BULK_COUNT='3')
+        full, _ = self.generate(force=True, BULK_COUNT='4')
+        self.assertEqual(len(full['native_balances']), 5)
+        self.assertEqual(self.params()['bulk_count'], 4)
+
+    def test_legacy_full_without_params_is_checked_by_its_rows(self):
+        self.write_legacy_full(2)
+        self.generate(BULK_COUNT='2')
+        self.output.unlink()
+        result = self.run_script(BULK_COUNT='7')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('BULK_COUNT=2', result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_default_bulk_count_is_100000(self):
+        # Unset: the generator's old default; a 2-row legacy genesis is refused against it.
+        self.write_legacy_full(2)
+        result = self.run_script(BULK_COUNT=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('BULK_COUNT=100000', result.stderr)
+        weighted = (self.root / 'testnet/gen-weighted-genesis.sh').read_text()
+        self.assertIn('BULK_COUNT="${BULK_COUNT:-100000}"', weighted)
+
+    def test_params_whose_size_does_not_match_fall_back_to_the_rows(self):
+        self.generate(force=True, BULK_COUNT='3')
+        # Replace the genesis behind the sidecar's back (size changes).
+        self.write_legacy_full(2)
+        self.output.unlink()
+        result = self.run_script(BULK_COUNT='3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('BULK_COUNT=2', result.stderr)
+
+    def test_bad_bulk_count_is_refused_before_anything_is_written(self):
+        for value in ('0', 'abc', '-1', '1e6', '10 '):
+            with self.subTest(value=value):
+                result = self.run_script(force=True, BULK_COUNT=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('BULK_COUNT must be a positive integer', result.stderr)
+                self.assertFalse(self.output.exists())
+                self.assertFalse(self.calls.exists())
 
     def test_key_file_holds_three_distinct_test_keys_in_validator_order(self):
         keys = json.loads(self.keys_file.read_text())

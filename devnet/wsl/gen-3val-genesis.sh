@@ -2,8 +2,8 @@
 # gen-3val-genesis.sh — build a bare-metal 3-validator devnet genesis for the
 # WSL local devnet (perf/funnel-truth). NO docker.
 #
-# The genesis = the WEIGHTED 100k-account testnet genesis (bench-reproducible
-# funded senders, pre-seeded markets, hardhat governance stakers) but with the
+# The genesis = the WEIGHTED testnet genesis with BULK_COUNT (default 100k)
+# bench-reproducible funded senders (plus pre-seeded markets, hardhat governance stakers) but with the
 # consensus validator set REPLACED by the 3 deterministic devnet validator keys
 # (0x01.. / 0x02.. / 0x03..) whose private keys we actually hold, each under a
 # test-only EVM address from devnet/wsl/bench-validator-keys.json. permanent_stakes
@@ -21,8 +21,19 @@
 #               market rows verbatim (ids 1..N, the bench spreads orders over
 #               ids 1..=--markets). N > base: append synthetic S<k>-USD perps
 #               following the existing row schema (lot/tick 1.0, im 5.0).
-#               The 100k funded accounts are untouched either way.
+#               The BULK_COUNT funded accounts are untouched either way.
 #   OUT=/path   where to write the 3-val genesis.
+#   BULK_COUNT=N  funded bulk senders "bulk-test 60".."bulk-test 60+N-1" in the
+#               weighted-full genesis (testnet/gen-weighted-genesis.sh; default
+#               100000, unchanged). An EXISTING weighted-full genesis is reused
+#               only if it was built with the same N (its params sidecar
+#               genesis-weighted-full.params.json, else a count of its
+#               "bulk-test N" rows); a different N is FATAL: rebuild with
+#               FORCE=1. Never rebuilt implicitly (1M accounts take minutes and
+#               ~290 MB). Cost at N = 1M: each jq pass over the genesis parses
+#               ~240-290 MB (~3 s, a rewrite ~7 s and ~1.4 GB RSS with jq 1.8);
+#               this script does one rewrite (step 3, more with the optional
+#               steps 4-5) and one summary pass.
 #   EVM_BLOCK_INTERVAL=N  genesis EVM cadence N (.evm.block_interval: EVM txs
 #               only at heights with height % N == 0; bench Q12). Integer in
 #               2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE, what governance
@@ -48,13 +59,37 @@ if [ -n "${EVM_BLOCK_INTERVAL:-}" ]; then
         || { echo "FATAL: EVM_BLOCK_INTERVAL must be an integer in 2..=100 (torus_types::EVM_BLOCK_INTERVAL_RANGE) (got '$EVM_BLOCK_INTERVAL')" >&2; exit 1; }
 fi
 
-# 1. Materialise the weighted 100k-account genesis (adds ~100k bulk senders).
+BULK_COUNT="${BULK_COUNT:-100000}"
+[[ "$BULK_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "FATAL: BULK_COUNT must be a positive integer (got '$BULK_COUNT')" >&2; exit 1; }
+FULL_PARAMS="${FULL%.json}.params.json"
+
+# full_bulk_count: the BULK_COUNT that built $FULL. The params sidecar
+# gen-weighted-genesis.sh writes, when its recorded size is FULL's (else it
+# describes another file); otherwise (a genesis built before the sidecar) the
+# number of "bulk-test N" native rows, one jq pass.
+full_bulk_count() {
+    local n bytes
+    if [ -f "$FULL_PARAMS" ]; then
+        bytes=$(wc -c < "$FULL")
+        n=$(jq -r --argjson b "$bytes" 'select(.bytes == $b) | .bulk_count' "$FULL_PARAMS" 2>/dev/null) || n=""
+        [[ "$n" =~ ^[0-9]+$ ]] && { echo "$n"; return 0; }
+    fi
+    jq '[.native_balances[]? | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length' "$FULL"
+}
+
+# 1. Materialise the weighted-full genesis (adds BULK_COUNT bulk senders).
 if [ "${FORCE:-0}" = 1 ] || [ ! -f "$FULL" ]; then
-    echo "building weighted-full genesis (100k bulk senders)..."
+    echo "building weighted-full genesis (BULK_COUNT=$BULK_COUNT bulk senders)..."
     # Parent OUT names the final 3-validator genesis, not this child artifact.
-    OUT="$FULL" BIN="$BIN" "$REPO/testnet/gen-weighted-genesis.sh"
+    OUT="$FULL" BIN="$BIN" BULK_COUNT="$BULK_COUNT" "$REPO/testnet/gen-weighted-genesis.sh"
 else
-    echo "reusing existing $FULL"
+    HAVE_BULK=$(full_bulk_count) || { echo "FATAL: cannot read $FULL to check its BULK_COUNT; rebuild with FORCE=1" >&2; exit 1; }
+    [ "$HAVE_BULK" = "$BULK_COUNT" ] || {
+        echo "FATAL: $FULL was built with BULK_COUNT=$HAVE_BULK, this run wants BULK_COUNT=$BULK_COUNT;" \
+            "rebuild it with FORCE=1 (never reused silently)" >&2
+        exit 1
+    }
+    echo "reusing existing $FULL (BULK_COUNT=$HAVE_BULK)"
 fi
 
 # 2. The 3 devnet validators (pubkeys == ed25519 pubkeys of keys 01/02/03),
@@ -124,12 +159,15 @@ if [ -n "${STATE_HASH_ACTIVATION:-}" ]; then
 fi
 
 echo "wrote $OUT"
-echo "  timeout_ms = $(jq '.consensus.timeout_base_ms' "$OUT")"
-echo "  evm_block_interval = $(jq '.evm.block_interval // "absent (node default 11)"' "$OUT")"
-echo "  state_hash_activation = $(jq '.consensus.state_hash_activation_height // "off"' "$OUT")"
-echo "  chain_id   = $(jq '.chain_id' "$OUT")"
-echo "  validators = $(jq '.validators|length' "$OUT")  ($(jq -r '.validators[].address' "$OUT" | tr '\n' ' '))"
-echo "  native_bal = $(jq '.native_balances|length' "$OUT")"
-echo "  accounts   = $(jq '.accounts|length' "$OUT")"
-echo "  markets    = $(jq '.markets|length' "$OUT")"
-echo "  perm_stakes= $(jq '.permanent_stakes|length' "$OUT")"
+# One jq pass for the whole summary (each pass parses the full genesis, ~3 s at 1M accounts).
+jq -r '
+    "  timeout_ms = \(.consensus.timeout_base_ms)",
+    "  evm_block_interval = \(.evm.block_interval // "absent (node default 11)")",
+    "  state_hash_activation = \(.consensus.state_hash_activation_height // "off")",
+    "  chain_id   = \(.chain_id)",
+    "  validators = \(.validators|length)  (\([.validators[].address] | join(" ")) )",
+    "  native_bal = \(.native_balances|length)",
+    "  bulk_count = \([.native_balances[]? | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length)",
+    "  accounts   = \(.accounts|length)",
+    "  markets    = \(.markets|length)",
+    "  perm_stakes= \(.permanent_stakes|length)"' "$OUT"
