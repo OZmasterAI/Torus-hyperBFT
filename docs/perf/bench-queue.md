@@ -22,6 +22,13 @@ Why: Q7 run 1 (s66) ran the bare defaults (MAX_IN_FLIGHT, IN_FLIGHT_TAIL, OPEN_O
 unset): ~140-156k matched/s instead of ~240-250k, deeper books, ~76k fills per block vs ~50k, ~4.9 vs ~2.9 ms exec per
 1k fills. The A/B stayed fair but not at the load every other bench uses.
 
+**Exec-path A/B merge rule (owner s128, after section 91):** any A/B that decides a merge of an exec-path change
+judges, besides matched/s, exec ms per 1k fills and CPU-s per 1M fills: **exec-thread on-CPU ms per 1k fills**, native
+blocks/s, block p50 / p99 and timeouts per 1,000 blocks. A change that adds exec-thread CPU per fill (CI above 1) or
+worsens blocks/s or p50 / p99 (CI on the wrong side of 1) does not merge, even if the other rows pass: the exec thread
+runs ~95% busy, so a few % more work there doubles block size and halves the block rate (section 91: +5% exec-thread
+CPU per fill -> blocks/s 10.8 -> 5.2, p50 18 -> 92 ms).
+
 **Main as benched (s126):** main carries the three merged s123 experiments (KP, DB, PC; flags off) and archy's s58
 bundle (merge 4156a83b: D `TORUS_SETTLE_DEFER_RESULTS`, M `TORUS_PARALLEL_MATCH_SETUP`, T `TORUS_FAST_SELL_TOP_UPS`,
 all ON by default; 18c Codex torus review no findings, torus-adversarial approve; main gate 3923/3923). Build M from

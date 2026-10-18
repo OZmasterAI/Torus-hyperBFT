@@ -1,6 +1,15 @@
 # Implementation Plan: item 6 Phase 5 (full in-memory execution)
 
-Status: PLAN, nothing built. Gate 3 met (section 65, s119); step 0 measured (section 81, s66); scope decided (owner
+**Status s128: PARKED after step 1** (owner s128). Step 1 is on main (`d3cab057`). Step 2 (`feat/item6-phase5-step2`
+`1e51c8b9`, Codex torus-adversarial round 2 approve) failed its A/B (bench section 91): +5% exec-thread CPU per fill
+halves blocks/s and raises block p50 18 -> 92 ms, p99 +37%, RSS +19%; not merged. Step 3 is parked on
+`feat/item6-phase5-step3` (built on step 2, no 10k run). Revisit when (1) bench 8e (Keccak / pool-wait attribution)
+shows a fix that needs in-memory state, (2) the profile after item 7 option 0 and the 8e fixes shows `flush_all` /
+`save_order_books` among the top exec costs again, or (3) the 1M-account RAM check before testnet forces it. A revisit
+starts with the bounded rework: the drain encoding moves to the flush worker (0.130 of the +0.143 ms per 1k fills),
+then step 2 is re-A/B'd under the queue's exec-path merge rule (exec-thread CPU per fill, blocks/s, p50 / p99).
+
+Status (before s128): PLAN, nothing built. Gate 3 met (section 65, s119); step 0 measured (section 81, s66); scope decided (owner
 s127): **build steps 1, 2, 3 and 7**; step 4 deferred, steps 5 and 6 decided later (section 1 "Scope (owner s127)").
 Section 7 decided (owner s122: 1 a, 2 a, 3 a, 4 a, 5 b, 6 a, 7 a, 8 a, 9 build for the gain).
 Parent design: `market-scaling-in-memory-design.md` Phase 5, section 4 (memory budget), section 5 rules 1, 2, 4, 5, 6,
