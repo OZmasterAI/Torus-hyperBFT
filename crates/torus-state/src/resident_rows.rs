@@ -61,6 +61,10 @@ pub const SOURCE_SLOTS: usize = 2;
 /// holds the bytes, owned when it builds them (a record encoded per read).
 pub type ResidentRow<'a> = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 
+/// Item 6 Phase 5 step 2: one slot's drained rows (a write, or `None`: a
+/// tombstone), key-sorted ([`ResidentSource::drain`]).
+pub type SourceRows = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 /// An ordered run of [`ResidentRow`]s.
 pub type ResidentRowIter<'a> = Box<dyn Iterator<Item = ResidentRow<'a>> + 'a>;
 
@@ -83,6 +87,52 @@ pub trait ResidentSource: Send + Sync {
     /// including) the first whose key does not start with `prefix` (a sorted
     /// map's `range(start..).take_while(|k| k.starts_with(prefix))`).
     fn range<'a>(&'a self, slot: usize, start: &[u8], prefix: &[u8]) -> ResidentRowIter<'a>;
+
+    /// Item 6 Phase 5 step 2 (`docs/plans/item6-phase5-impl.md` Task 2.1):
+    /// the source takes the block's writes of its CFs in place (the node's
+    /// record set). Then the overlay keeps none of them pending outside an
+    /// open tx scope ([`Self::put_row`]), answers the block's own-change
+    /// questions of the two CFs from the source's dirty sets
+    /// ([`Self::dirty_keys`], [`Self::touches`], [`Self::changes`]) merged
+    /// with its own pending set, and fills its change set from
+    /// [`Self::drain`] at the freeze / the flush. `false` (default): a
+    /// read-only source (the Phase 4 path): every write stays pending.
+    fn in_place(&self) -> bool {
+        false
+    }
+
+    /// An in-place source's write (`Some`) / tombstone (`None`) of `key` in
+    /// `slot`, applied at once and marked dirty (the first write of a key in
+    /// a block keeps its row before the block). Never called on a source
+    /// that is not [`Self::in_place`].
+    fn put_row(&self, slot: usize, key: &[u8], value: Option<&[u8]>) {
+        let _ = (slot, key, value);
+        unreachable!("put_row on a read-only resident source");
+    }
+
+    /// The keys of `slot` the block changed in place so far, sorted.
+    fn dirty_keys(&self, _slot: usize) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+
+    /// Whether the block changed a key of `slot` under `prefix` in place.
+    fn touches(&self, _slot: usize, _prefix: &[u8]) -> bool {
+        false
+    }
+
+    /// The keys of `slot` under `prefix` the block changed in place, each
+    /// with its row at the block start (`resident`) and now (`current`),
+    /// in key order; `None`: not answered for `slot` (the caller falls back).
+    fn changes(&self, _slot: usize, _prefix: &[u8]) -> Option<Vec<ResidentChange>> {
+        Some(Vec::new())
+    }
+
+    /// The block's changed rows of every slot, each key once in key order
+    /// and serialized once (a write, or `None`: a tombstone); the dirty sets
+    /// are emptied. Called once per block, at its freeze or flush.
+    fn drain(&self) -> [SourceRows; SOURCE_SLOTS] {
+        Default::default()
+    }
 }
 
 /// Who answers R's first two CFs.
@@ -189,6 +239,15 @@ impl ResidentDelta {
 
     pub fn is_empty(&self) -> bool {
         self.cfs.iter().all(Vec::is_empty)
+    }
+
+    /// Item 6 Phase 5 step 2: this delta without the source slots
+    /// (positions, balances): R's raw CFs only.
+    pub fn raw_only(mut self) -> Self {
+        for slot in &mut self.cfs[..SOURCE_SLOTS] {
+            slot.clear();
+        }
+        self
     }
 
     /// Keys of `cf` the block wrote or deleted, sorted (none for a CF outside
@@ -314,6 +373,16 @@ impl ResidentRows {
     /// Whether positions and balances come from a source.
     pub fn has_source(&self) -> bool {
         matches!(self.users, SourceSlots::Source(_))
+    }
+
+    /// Item 6 Phase 5 step 2: the source of positions and balances if it
+    /// takes the block's writes in place ([`ResidentSource::in_place`]).
+    #[inline]
+    pub(crate) fn in_place_source(&self) -> Option<&dyn ResidentSource> {
+        match &self.users {
+            SourceSlots::Source(s) if s.in_place() => Some(&**s),
+            _ => None,
+        }
     }
 
     /// How R answers CF `slot` of [`RESIDENT_CFS`] (`None`: it does not hold

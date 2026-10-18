@@ -1795,6 +1795,9 @@ impl StateBackend for Shadow {
     fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
         self.inner.layer_keys(cf)
     }
+    fn fold_in_place(&self) {
+        self.inner.fold_in_place()
+    }
     fn own_pending_row(&self, cf: &str, key: &[u8]) -> OwnPendingRow {
         self.inner.own_pending_row(cf, key)
     }
@@ -2152,7 +2155,11 @@ fn dirty_rows_equal_overlay_rows_every_block() {
             rng: Lcg(seed),
             stats: MutStats::default(),
         }));
+        // Step 2: the reference path (every write of the two CFs on the
+        // overlay, so the shadow sees them all); the node's in-place path is
+        // checked against it by `in_place_blocks_equal_reference_every_block`.
         let mut holder = ResidentBooks::default();
+        holder.set_reference_writes(true);
         let mut parent: Option<Arc<FrozenPending>> = None;
         let mut books = Default::default();
         let mut next_id: u128 = 1;
@@ -2223,10 +2230,12 @@ fn dirty_rows_equal_overlay_rows_every_block() {
             let dirty = s.users.dirty_keys();
             s.users.drain_dirty_into(&mut typed);
             for cf in ALL_CF_NAMES {
-                assert_eq!(
-                    typed.rows(cf),
-                    frozen.rows(cf),
-                    "{tag}: {cf}: dirty rows != the overlay's pending rows"
+                let (a, b) = (typed.rows(cf), frozen.rows(cf));
+                assert!(
+                    a == b,
+                    "{tag}: {cf}: dirty rows != the overlay's pending rows ({} vs {} rows)",
+                    a.len(),
+                    b.len()
                 );
             }
             let pending =
@@ -2822,7 +2831,7 @@ impl P5Node2 {
                 let o = NativeStateOverlay::new(db.clone());
                 random_block(&o, &mut rng);
                 random_balance_block(&o, &mut rng);
-                o.flush(&db).unwrap();
+                o.flush(db).unwrap();
             }
         })
     }
@@ -3196,4 +3205,97 @@ fn rejected_action_leaves_users_untouched() {
     }
     println!("P5 T2.1 rejects: {cases_run} cases; no-op rewrites of the in-place record set (row 11 audit): {audit:?}");
     assert!(cases_run >= 4 * 21, "{cases_run}");
+}
+
+/// Phase 5 step 2 (plan risk 3, owner s128): the per-block drain on the
+/// typed path, at a standard-load-sized native block: ~20k fills, i.e.
+/// ~50k position rows touched (distinct `(trader, market)` keys, 1 in 10 a
+/// close), ~20k balance rows and ~20k `cvlm` rows, over 20k traders holding
+/// ~60k positions in 300 markets. Per repetition: the block's writes applied
+/// in place (`UsersMut`, what the settle's flush does), the drain (dirty
+/// keys sorted, each row encoded once: on the execution thread at the
+/// freeze), its rows put into the frozen set (the freeze), and the sums
+/// carry's report (`end_resident`, on its worker). Best of 7, release:
+///   cargo test --release -p torus-bridge --lib ubench_drain_per_block -- --ignored --nocapture
+#[test]
+#[ignore = "ubench: run with --release --ignored --nocapture"]
+fn ubench_drain_per_block() {
+    const N_TRADERS: u64 = 20_000;
+    const N_MARKETS: u64 = 300;
+    let mut rng = Lcg(0xD8A1_2026);
+    let traders: Vec<Address> = (0..N_TRADERS)
+        .map(|i| {
+            let mut b = [0u8; 20];
+            b[..8].copy_from_slice(&i.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+            b[8..16].copy_from_slice(&(i + 7).to_be_bytes());
+            Address::new(b)
+        })
+        .collect();
+    let pos_row = |t: Address, m: MarketId, raw: u64| bytes(&position(t, m, raw, raw.is_multiple_of(2)));
+    let mut pos: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut bal: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for (i, t) in traders.iter().enumerate() {
+        for _ in 0..3 {
+            let m = 1 + rng.below(N_MARKETS);
+            pos.insert(position_key(t, m).to_vec(), pos_row(*t, m, 100 + i as u64));
+        }
+        bal.insert(t.to_vec(), bal_bytes(&balance(1_000_000 + i as u64)));
+        bal.insert(cum_volume_key(t).to_vec(), volume_bytes(5_000 + i as u64));
+    }
+    // The block: 50k distinct position keys, 20k balances, 20k volumes.
+    let mut keys: BTreeSet<(Address, MarketId)> = BTreeSet::new();
+    while keys.len() < 50_000 {
+        keys.insert((traders[rng.below(N_TRADERS) as usize], 1 + rng.below(N_MARKETS)));
+    }
+    let mut keys: Vec<(Address, MarketId)> = keys.into_iter().collect();
+    // Fill order, not key order.
+    for i in (1..keys.len()).rev() {
+        keys.swap(i, rng.below(i as u64 + 1) as usize);
+    }
+    let writes: Vec<(Address, MarketId, bool)> = keys.into_iter().map(|(t, m)| (t, m, rng.below(10) == 0)).collect();
+    let mut times: [Vec<f64>; 4] = Default::default();
+    let mut rows = 0;
+    for _ in 0..7 {
+        let mut users = Users::build_maps(&pos, &bal);
+        let t0 = std::time::Instant::now();
+        {
+            let mut w = users.mutate();
+            for (i, (t, m, close)) in writes.iter().enumerate() {
+                if *close {
+                    w.remove_position(t, *m);
+                } else {
+                    w.set_position(position(*t, *m, 7 + i as u64, i % 3 == 0));
+                }
+            }
+            for (i, t) in traders.iter().enumerate() {
+                w.set_balance(t, balance(2_000_000 + i as u64));
+                w.add_cum_volume(t, p5_fp(1 + (i % 50) as i64)).unwrap();
+            }
+        }
+        let t1 = std::time::Instant::now();
+        let drained = users.drain_dirty();
+        let t2 = std::time::Instant::now();
+        rows = drained.positions.len() + drained.balances.len();
+        let mut frozen = FrozenPending::marker_only(1);
+        frozen.put_rows(CF_NATIVE_POSITIONS, drained.positions);
+        frozen.put_rows(CF_NATIVE_BALANCES, drained.balances);
+        let t3 = std::time::Instant::now();
+        let mut reported = 0usize;
+        users.report_in_place(&mut |_, r| reported += usize::from(r.is_some()));
+        let t4 = std::time::Instant::now();
+        assert!(reported > 10_000);
+        std::hint::black_box(&frozen);
+        for (v, d) in times.iter_mut().zip([t1 - t0, t2 - t1, t3 - t2, t4 - t3]) {
+            v.push(d.as_secs_f64() * 1e3);
+        }
+    }
+    let best = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+    let median = |v: &[f64]| {
+        let mut v = v.to_vec();
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    for (name, v) in ["apply in place", "drain", "put into frozen set", "sums report"].iter().zip(&times) {
+        println!("DRAIN ubench {name}: best {:.2} ms, median {:.2} ms ({rows} rows)", best(v), median(v));
+    }
 }

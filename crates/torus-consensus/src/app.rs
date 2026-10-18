@@ -6710,12 +6710,23 @@ impl ExecutionContext {
                 drop(ctx);
                 let frozen = overlay.freeze(height);
                 if resident_rows.attached() {
+                    // Item 6 Phase 5 step 2: in place, the freeze adds the
+                    // record set's drained rows of positions and balances;
+                    // R's raw CFs are the delta before the freeze.
                     #[cfg(test)]
-                    assert_eq!(
-                        Some(frozen.resident_delta()),
-                        test_delta_before_freeze,
-                        "cut 5: the frozen set's delta is the one before freeze"
-                    );
+                    if resident_rows.in_place() {
+                        assert_eq!(
+                            Some(frozen.resident_delta_raw()),
+                            test_delta_before_freeze.clone().map(torus_state::ResidentDelta::raw_only),
+                            "cut 5: the frozen set's raw delta is the one before freeze"
+                        );
+                    } else {
+                        assert_eq!(
+                            Some(frozen.resident_delta()),
+                            test_delta_before_freeze,
+                            "cut 5: the frozen set's delta is the one before freeze"
+                        );
+                    }
                     resident_delta =
                         torus_bridge::native_executor::BlockDelta::Frozen(frozen.clone());
                 }

@@ -1324,6 +1324,21 @@ impl PositionCache {
         Ok(RunsFlush::Unmerged)
     }
 
+    /// Item 6 Phase 5 step 2: take every dirty row out of the cache (`Some`:
+    /// the row, `None`: a tombstone) for a typed sink that applies each key
+    /// on its own (the in-place record set; its change set is key-sorted at
+    /// its drain, so the order here does not matter). Clean entries stay;
+    /// the dirty set is emptied.
+    pub fn take_dirty(&mut self) -> Vec<((Address, MarketId), Option<Position>)> {
+        let mut out = Vec::with_capacity(self.dirty.len());
+        for key in self.dirty.drain() {
+            if let Some(entry) = self.map.remove(&key) {
+                out.push((key, entry));
+            }
+        }
+        out
+    }
+
     /// Item 6 Phase 2 step 0.4: the per-row flush, frozen as the reference
     /// for P2-2's batch overlay writes: one `put_position` /
     /// `delete_position` per dirty key in key order (`flush_all` as of
