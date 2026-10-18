@@ -412,6 +412,70 @@ writes :11143 / :11425 / :12669, the `credit_native` drain :13743, `lockbox.rs` 
 - Code: fatal block invalidates `Users`; a rebuild is cold from DB + layers.
 - Verify: `cargo nextest run --workspace $F`.
 
+**Built (s128, branch `feat/item6-phase5-step2` off `d3cab057`; not merged).** Commits: anchors / Task 2.3 decision
+`2dff76c1`; Task 2.1 RED `ea7cd6dd`, code `690d78fd`; Task 2.2 RED `b8413c06`, code `db05d89a`; drain cut `983a720d`;
+Task 2.3 RED `18d93dfc`, code `781bbeba`; Task 2.4 test and this note in the last commits.
+- Shape (`torus-bridge/src/users.rs`, `torus-state/src/backend.rs`):
+  - `SharedUsers { RwLock<Users>, in_place }` is R's `ResidentSource`, the typed loads' `TypedRows` and the sums
+    cache's records, shared by R, the block's sums and the executor. The writes (settle flush, `cvlm`, the overlay's
+    write hook) run on the execution thread and never overlap a parallel phase's reads. Lock order: the overlay's
+    pending lock, then the users lock; no users guard is held across an overlay call (ranges are copied out in
+    chunks, `traders_after` copies its candidates first, the memo build copies the positions).
+  - `ResidentSource` gained `in_place`, `put_row`, `dirty_keys`, `touches`, `changes`, `drain`. With an in-place
+    source the overlay answers `layer_touches` / `layer_keys` / `resident_changes` as its own pending set UNION the
+    source's dirty set. The sums machinery (C6b partial re-value, C6c batch dirty set, ADL / E2 dirty merges) depends
+    on "R = block start, pending = the block's changes", so the dirty set keeps each positions key's row at its
+    first change (= block start). `own_pending_row` and the reads are unchanged.
+  - The freeze drains the source into the `FrozenPending` (each changed key once, key order). The serial flush passes
+    the drained rows as the batch's sidecar (`flush_pending_after_batch`), so the batch, `h_n` and the native-root
+    dirty set are the same. `FrozenPending::resident_delta_raw` lets `end_resident` copy only R's raw CFs.
+  - `end_resident` in place does not apply the two CFs. The sums carry runs from the drain's before-images
+    (`Users::report_in_place`): a trader regular at every first change and now gets `(changes, now, sums)`; any other
+    gets `None` and its sums entry is dropped. A record set with a key changed after its drain drops the slot.
+  - Hot writers (Task 2.1): the settle's caches go into `UsersMut` under one lock at the flush point. Those are the
+    sequential cache and the parallel pass B's per-market plan caches, applied per market without
+    `PositionCache::merge_disjoint`; the batch volumes and the single path's `cvlm` adds go the same way.
+  - Write-through (Task 2.2): with no tx scope open, `put_cf_raw` / `put_cf_raw_owned` / `delete_cf_raw` /
+    `atomic_write` of the two CFs go to `put_row`. Decode, apply, mark dirty; irregular rows stay raw. A tx
+    scope's writes stay journalled and are folded in at the next fold point or the freeze. Risk 2's guard: rows
+    of the two CFs pending outside a scope make the fold `debug_assert` (a writer bypassed the hook); release folds
+    them.
+  - Task 2.3 guard (`app.rs` EVM section): the EVM journal's kept writes must hold no row of the two CFs.
+    `debug_assert` plus an error log; release does not fail-stop.
+  - No runtime switch: the Phase 4 path stays as the test-only reference (`ResidentBooks::set_reference_writes`,
+    `cfg(test)` / `test-reference-paths`); `p5_configure` puts the differential's reference node on it.
+- Deviations:
+  - Decision 3's hook ordering. Task 2.1 kept the cold writes on the overlay and folded them into `Users` at the hot
+    writers' fold points (`StateBackend::fold_in_place`) and at the freeze; the in-place model has no correct state
+    without that, because a hot write next to a stale pending row reads wrong. Task 2.2 then made it the immediate
+    write-through.
+  - The caches stay as the batch's write-back buffers: Phase 2's per-worker caches and C6c's frozen-backend rule
+    need them. Only their flush target changed. `BalanceCache::merge_disjoint` (Phase 2 workers) stays;
+    `PositionCache::merge_disjoint` left the in-place path.
+  - Tests that pinned Phase 4's pending rows now run on the reference holder: step 1's shadow test, and
+    `typed_loads_equal_overlay_reads`, which also gained an in-place run asserting that no key is ever pending.
+  - Task 2.4 needed no code. The slot is taken at `begin_resident` and only `end_resident(ok)` returns it, so a
+    fatal block's in-place writes drop with it; `fatal_block_after_in_place_writes_rebuilds_users_cold` pins it.
+  - Task 2.1's `rejected_action_leaves_users_untouched` (row 11's audit): a rejected action never changes a row
+    value, but rejections after Phase 2's reservation (IOC / ALO / market / reduce-only / FOK / trigger / band /
+    cloid) rewrite the sender's balance row unchanged (reserve, then release). The reference path writes it too, so
+    the dirty set holds those keys and the change sets match. "Dirty set equal to before" does not hold for them.
+- Drain cost (`ubench_drain_per_block`, release; a standard-load-sized native block: 50k position keys, 60% updates
+  / 30% opens / 10% closes, plus 20k balance and 20k `cvlm` rows over 20k traders holding 60k positions in 300
+  markets; busy shared host, calibration 36-44 ms for 50k hash inserts + sort + 50k sorted `BTreeMap<Vec>` inserts;
+  `perf` is not allowed on this host):
+  - First design (Task 2.1 code): apply in place 185 ms, drain 105-110 ms, frozen-set inserts 57-68 ms, carry report
+    62 ms. The Phase 4 path on the same writes: overlay writes 110-153 ms, its `end_resident` apply 59-65 ms
+    (worker). So the first design was a regression on the execution thread.
+  - Cut (`983a720d`): dirty keys kept per trader (one lookup marks a key and keeps its block-start row); one record
+    lookup per typed write; the drain walks the dirty traders in address order, reading each record once; the
+    frozen set's two maps are bulk-built from the sorted rows.
+  - After: apply 96-99 ms, drain 37-41 ms, frozen-set build 22-26 ms, carry report 25-29 ms (worker). Execution
+    thread about level with Phase 4 on this ubench (about 160 vs 110-153 ms); worker -75 ms.
+  - What is left is record cache misses (50k cold record lookups alone take 17-23 ms here) and `FrozenPending`'s
+    per-row key / value allocations. That is still more than "a few ms": the next lever is encoding the drain on the
+    flush worker over the drained keys (risk 3's fallback), not built (owner review).
+
 ### Step 3: book rows from a dirty set (Classic)
 
 Codex torus-adversarial review before step 4.

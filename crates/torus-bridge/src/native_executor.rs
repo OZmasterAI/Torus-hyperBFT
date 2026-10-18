@@ -6095,6 +6095,13 @@ impl<T: StateBackend> NativeExecContext<T> {
         Some(self.in_place_users()?.read().dirty_key_list(slot).iter().any(|k| k.as_slice() == key))
     }
 
+    /// Item 6 Phase 5 step 2 (tests): keys the in-place record set changed
+    /// since the block start (`None`: no in-place record set).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn test_in_place_dirty_keys(&self) -> Option<usize> {
+        Some(self.in_place_users()?.read().dirty_keys())
+    }
+
     /// Item 6 Phase 5 step 2: the block's record set, if it takes the
     /// block's writes in place.
     fn in_place_users(&self) -> Option<&Arc<SharedUsers>> {

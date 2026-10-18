@@ -25747,6 +25747,68 @@ mod crash_recovery_tests {
         assert_dumps_equal(&dump_ref, &dump_all_cfs(&db), "guard sequence with R vs without R");
     }
 
+    /// Item 6 Phase 5 step 2 (plan Task 2.4): a fatal block that already
+    /// changed the record set in place (block 3's fill, then a nonce-put
+    /// fault at the block's end, just before its freeze: fail-stop) leaves
+    /// no trace. R and its record set were taken by the block and drop with
+    /// it; the re-executed block rebuilds them cold from the DB, they equal
+    /// the DB after every later block, and the final state equals a run
+    /// without R.
+    #[test]
+    fn fatal_block_after_in_place_writes_rebuilds_users_cold() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use torus_bridge::native_executor::BookMode;
+        let blocks = book_fixture_blocks();
+        let first5 = &blocks[..5];
+        let (_c0, db_ref) = make_test_config_and_db();
+        fund_book_fixture(&db_ref);
+        let mut ctx_ref = book_pipeline_ctx(&db_ref, false, None, BookMode::Classic);
+        ctx_ref.test_no_resident_rows = true;
+        for b in first5 {
+            dispatch_and_execute(&ctx_ref, &db_ref, b);
+        }
+        drop(ctx_ref);
+        let dump_ref = dump_all_cfs(&db_ref);
+
+        let (_c1, db) = make_test_config_and_db();
+        fund_book_fixture(&db);
+        let mut ctx = book_pipeline_ctx(&db, false, None, BookMode::Classic);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        ctx.test_block_probe = Some(Arc::new(move |c: &NativeExecContext<NativeStateOverlay>| {
+            s.lock().unwrap().push((c.block_height, c.test_in_place_dirty_keys()));
+        }));
+        let builds = |ctx: &ExecutionContext| ctx.resident_books.lock().unwrap().rows_builds();
+        dispatch_and_execute(&ctx, &db, &first5[0]);
+        dispatch_and_execute(&ctx, &db, &first5[1]);
+        assert_resident_rows_track_db(&ctx, &db, 2, "after 2");
+        assert_eq!(builds(&ctx), 1);
+
+        ctx.test_replay_fault = Some(ReplayFault::NoncePut);
+        dispatch_and_execute(&ctx, &db, &first5[2]);
+        assert!(ctx.exec_failed.load(SeqCst), "the nonce put fault fail-stops");
+        let at3: Vec<Option<usize>> = seen.lock().unwrap().iter().filter(|(h, _)| *h == 3).map(|(_, d)| *d).collect();
+        assert!(
+            matches!(at3.as_slice(), [Some(n)] if *n > 0),
+            "block 3 changed the record set in place before the fault: {at3:?}"
+        );
+        assert_eq!(read_native_applied_height(&db), Some(2), "nothing of 3 durable");
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_height(), None, "R taken by the fatal block");
+
+        ctx.test_replay_fault = None;
+        ctx.exec_failed.store(false, SeqCst);
+        for (i, b) in first5[2..].iter().enumerate() {
+            dispatch_and_execute(&ctx, &db, b);
+            assert!(!ctx.exec_failed.load(SeqCst));
+            assert_resident_rows_track_db(&ctx, &db, 3 + i as u64, "after the fatal block");
+        }
+        assert_eq!(builds(&ctx), 2, "the re-executed block rebuilt R and its record set");
+        assert_eq!(ctx.resident_books.lock().unwrap().users_in_place(), Some(true));
+        assert_eq!(ctx.resident_books.lock().unwrap().rows_shared_fallbacks(), 0);
+        drop(ctx);
+        assert_dumps_equal(&dump_ref, &dump_all_cfs(&db), "fatal block with R vs without R");
+    }
+
     /// Item 6 C1: an EVM lockbox deposit (0x0820) in block 1 is credited by
     /// block 2's CoreWriter drain (a write of `CF_NATIVE_BALANCES` through the
     /// block overlay, so R takes it); orders in 2 (placed before the drain)
