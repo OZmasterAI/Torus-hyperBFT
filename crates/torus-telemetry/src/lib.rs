@@ -560,6 +560,11 @@ pub struct Metrics {
     /// Item 6 Phase 5 step 2: rows of positions and balances the drains
     /// serialized from the in-place `Users` (writes and tombstones).
     pub exec_users_drained_rows: Counter,
+    /// Item 6 Phase 5 step 2 (Task 2.3 guard, owner s128): rows of positions
+    /// or balances found in an EVM block's journal (an EVM tx scope wrote a
+    /// typed CF the in-place `Users` never sees). Should stay 0; the guard
+    /// logs and counts, it does not fail-stop a release node.
+    pub exec_evm_scope_typed_writes: Counter,
     /// Item 6 step 2: time the exec thread waited for the `end_resident`
     /// worker at the join (next block's `begin_resident`, or an untouched
     /// block's advance), once per worker joined: the part of
@@ -2272,6 +2277,12 @@ impl Metrics {
             "Item 6 Phase 5: position / balance rows serialized from the in-place Users (writes and tombstones)",
             exec_users_drained_rows.clone(),
         );
+        let exec_evm_scope_typed_writes = Counter::default();
+        registry.register(
+            "torus_exec_evm_scope_typed_writes",
+            "Item 6 Phase 5: positions / balances rows written inside an EVM tx scope (the in-place Users does not see them; should stay 0)",
+            exec_evm_scope_typed_writes.clone(),
+        );
         let exec_end_resident_wait_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
         registry.register(
             "torus_exec_end_resident_wait_seconds",
@@ -3027,6 +3038,7 @@ impl Metrics {
             exec_end_resident_users_seconds,
             exec_users_drain_seconds,
             exec_users_drained_rows,
+            exec_evm_scope_typed_writes,
             exec_end_resident_wait_seconds,
             exec_cancel_all,
             exec_cancel_all_books_visited,
@@ -3656,6 +3668,7 @@ mod tests {
             "torus_exec_end_resident_users_seconds",
             "torus_exec_users_drain_seconds",
             "torus_exec_users_drained_rows",
+            "torus_exec_evm_scope_typed_writes",
             "torus_exec_end_resident_wait_seconds",
             "torus_exec_queue_depth",
             "torus_exec_throttle_tier",
