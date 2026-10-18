@@ -118,7 +118,7 @@ pub(crate) struct HotStuff<N: Network> {
     /// s75 fix D: this leader's last proposed header and when to re-send it
     /// directly (see [`tick_header_resend_at`](Self::tick_header_resend_at)).
     header_resend: Option<(ProposalHeader, Instant)>,
-    /// `TORUS_HEADER_RESEND_MS` (default 3 s; `None` = off).
+    /// `TORUS_HEADER_RESEND_MS` (default 250 ms; `None` = off).
     header_resend_interval: Option<Duration>,
     /// Hybrid pipelining: full blocks stored locally by the proposer after broadcasting header.
     pending_bodies: PendingBodies,
@@ -3638,13 +3638,18 @@ pub(crate) fn parse_round_skip(raw: Option<String>) -> bool {
     !matches!(raw.as_deref().map(str::trim), Some("0"))
 }
 
+/// Default stuck-leader header re-send interval (owner s128, bench section
+/// 77: 33-47 lost-proposal timeouts per 300 s cell at 3 s vs 3 at 250 ms).
+pub(crate) const DEFAULT_HEADER_RESEND_MS: u64 = 250;
+
 /// `TORUS_HEADER_RESEND_MS` (s75 fix D): the stuck-leader header re-send
-/// interval; default 3000, `0` turns it off, unparsable keeps the default.
+/// interval; default [`DEFAULT_HEADER_RESEND_MS`] (250 ms since s128, was
+/// 3000), `0` turns it off, unparsable keeps the default.
 pub(crate) fn parse_header_resend_ms(raw: Option<String>) -> Option<Duration> {
     match raw.as_deref().map(str::trim).map(str::parse::<u64>) {
         Some(Ok(0)) => None,
         Some(Ok(ms)) => Some(Duration::from_millis(ms)),
-        _ => Some(Duration::from_millis(3000)),
+        _ => Some(Duration::from_millis(DEFAULT_HEADER_RESEND_MS)),
     }
 }
 

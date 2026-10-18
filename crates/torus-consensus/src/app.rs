@@ -1331,8 +1331,8 @@ struct ExecutionContext {
     /// metrics attached the liquidation step logs the value sum over all
     /// accounts. Never changes what a block writes.
     liq_value_sum: bool,
-    /// s124 epoch-boundary fast path (`TORUS_EPOCH_FAST_PATH=1`, node-local,
-    /// default off, read once at construction): an epoch-boundary block with
+    /// s124 epoch-boundary fast path (`TORUS_EPOCH_FAST_PATH`, node-local,
+    /// default on since s128, `=0` off, read once at construction): an epoch-boundary block with
     /// no EVM tx and no buffered slash takes the pipelined path instead of
     /// [`Self::pipeline_barrier`] and the serial flush, and with a checkpoint
     /// interval it checkpoints at its own height ([`Self::checkpoint_upkeep`])
@@ -6267,13 +6267,18 @@ impl TorusApp {
             if exec_ctx.flush_worker.is_some() {
                 tracing::info!(
                     epoch_length = config.epoch_length,
-                    "epoch fast path ON (TORUS_EPOCH_FAST_PATH=1): epoch-boundary blocks without \
+                    "epoch fast path ON (TORUS_EPOCH_FAST_PATH unset or 1): epoch-boundary blocks without \
                      EVM txs or slashes run pipelined, no barrier"
                 );
-            } else {
+            } else if crate::exec_pipeline::epoch_fast_path_explicit() {
                 tracing::warn!(
                     "TORUS_EPOCH_FAST_PATH is set but the exec pipeline is off: no effect, every \
                      epoch-boundary block runs serially"
+                );
+            } else {
+                tracing::info!(
+                    "epoch fast path on by default but the exec pipeline is off \
+                     (TORUS_EXEC_PIPELINE=0): no effect, every epoch-boundary block runs serially"
                 );
             }
         }
@@ -30745,7 +30750,7 @@ mod crash_recovery_tests {
     /// (`TORUS_PARALLEL_MATCH_SETUP`) and T (`TORUS_FAST_SELL_TOP_UPS`) are
     /// on by default: the on run pins each per thread to its parse of the
     /// unset env, the off run to its parse of `0` (the executor reads them on
-    /// the calling thread, E here). E (`TORUS_EPOCH_FAST_PATH`, default off)
+    /// the calling thread, E here). E (`TORUS_EPOCH_FAST_PATH`, default on)
     /// is the context field. Over the 130 P2 blocks (boundaries 50 / 100),
     /// pipelined with a checkpoint every 5 blocks: D+M+T and D+M+T+E each
     /// equal the all-off run per block (write sets), in the running hash,
