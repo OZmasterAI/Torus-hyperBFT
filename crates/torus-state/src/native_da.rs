@@ -195,6 +195,14 @@ impl DaGcState {
     }
 }
 
+/// What [`NativeDaStore::gc_due_rows`] did.
+enum DueRows {
+    /// The deletes are in the batch; `Some` = the new frontier (a row went).
+    Deleted(Option<u64>),
+    /// The uncommitted tail is unreadable: nothing added, the pass holds.
+    TailUnreadable,
+}
+
 /// Most heights one pass back-fills from the [`DaGcHistory`] (heights the
 /// history pruned are skipped in O(1) and do not count). A longer gap takes
 /// several passes, deleting nothing until it is closed.
@@ -690,6 +698,10 @@ impl NativeDaStore {
     /// above `height` ([`DaGcHistory::committed_through`], read only when a
     /// row is due; an error holds too, [`DaGcOutcome::undispatched_commits`]):
     /// they are not recorded yet and one may re-include a due row's body.
+    /// And a due body a block ABOVE the committed tip references
+    /// ([`DaGcHistory::uncommitted_hashes`], read at the first due row) stays
+    /// while its row goes ([`DaGcOutcome::tail_pinned`]); an unreadable tail
+    /// holds the pass. A held pass names why ([`DaGcOutcome::hold_reason`]).
     ///
     /// Before any deletion, every height from the cursor up to `height` gets
     /// its record: the missing ones from `history` (at most
@@ -834,16 +846,37 @@ impl NativeDaStore {
             written = next;
             moved.clear();
         }
+        // Why nothing may go, the first rule that holds (P3: every held
+        // pass is counted by its reason).
+        let mut hold = if out.backfill_stalled {
+            Some(DaGcHoldReason::Gap)
+        } else if let Some(cursor) = next.cursor.filter(|&c| c <= height) {
+            // Short of `height`: the back-fill bound; AT it: `height`'s own
+            // record is unknown (`hashes` = `None`).
+            Some(if cursor < height {
+                DaGcHoldReason::Backfilling
+            } else {
+                DaGcHoldReason::Unrecorded
+            })
+        } else if behind {
+            Some(DaGcHoldReason::PreCursor)
+        } else if held {
+            Some(DaGcHoldReason::PrunedGap)
+        } else {
+            None
+        };
         // Something is due: committed heights above `height` are not
         // recorded yet (dispatch is behind the committed tip) and may
         // re-include a due row's body, so nothing goes until dispatch caught
         // up. Read only when a deletion is otherwise allowed.
         let due = last_due.filter(|&due| next.frontier <= due);
-        let undispatched = !(behind || held) && due.is_some() && {
+        if hold.is_none() && due.is_some() {
             match history.committed_through() {
                 Ok(tip) => {
                     out.undispatched_commits = tip.is_some_and(|tip| tip > height);
-                    out.undispatched_commits
+                    if out.undispatched_commits {
+                        hold = Some(DaGcHoldReason::DispatchBehind);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -851,23 +884,30 @@ impl NativeDaStore {
                         "DA body GC: the history's committed tip is unreadable, deleting \
                          nothing this pass: {e}"
                     );
-                    true
+                    hold = Some(DaGcHoldReason::TipUnreadable);
                 }
             }
-        };
-        if behind || held || undispatched {
-            out.deletion_held = true;
-        } else if let Some(last_due) = due {
-            if let Some(frontier) = self.gc_due_rows(
-                &mut batch,
-                next.frontier,
-                last_due,
-                limits,
-                &moved,
-                &mut out,
-            )? {
-                next.frontier = frontier;
+        }
+        if hold.is_none() {
+            if let Some(last_due) = due {
+                match self.gc_due_rows(
+                    &mut batch,
+                    next.frontier,
+                    last_due,
+                    limits,
+                    &moved,
+                    history,
+                    &mut out,
+                )? {
+                    DueRows::Deleted(Some(frontier)) => next.frontier = frontier,
+                    DueRows::Deleted(None) => {}
+                    DueRows::TailUnreadable => hold = Some(DaGcHoldReason::TailUnreadable),
+                }
             }
+        }
+        if let Some(reason) = hold {
+            out.deletion_held = true;
+            out.hold_reason = Some(reason);
         }
         if next != written {
             batch.put_cf(cf, DA_GC_STATE_KEY, next.encode());
@@ -1036,8 +1076,16 @@ impl NativeDaStore {
 
     /// Add the deletes of the rows in `[frontier, last_due]` to `batch`, within
     /// `limits`: each listed body, its reference and its shards (bar the
-    /// hashes in `moved` and those the row's markers name), the row and its
-    /// markers. Returns the new frontier when any row went.
+    /// hashes in `moved`, those the row's markers name and those the
+    /// history's uncommitted tail references), the row and its markers.
+    /// Returns the new frontier when any row went.
+    ///
+    /// The tail ([`DaGcHistory::uncommitted_hashes`]) is read once, at the
+    /// first due row (a pass with no due row reads nothing): a body a block
+    /// above the committed tip references stays, its row goes (claude-review
+    /// r4 / Codex r3 P2). An unreadable tail adds nothing to `batch` and
+    /// returns [`DueRows::TailUnreadable`]: the pass holds.
+    #[allow(clippy::too_many_arguments)]
     fn gc_due_rows(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -1045,8 +1093,9 @@ impl NativeDaStore {
         last_due: u64,
         limits: DaGcLimits,
         moved: &HashSet<[u8; 32]>,
+        history: &dyn DaGcHistory,
         out: &mut DaGcOutcome,
-    ) -> Result<Option<u64>, StateError> {
+    ) -> Result<DueRows, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let mut shards_cf = None;
         let start = da_gc_row_key(frontier);
@@ -1064,6 +1113,7 @@ impl NativeDaStore {
         let mut markers = self.db.inner().raw_iterator_cf_opt(cf, opts);
         markers.seek(markers_start);
         let mut marked: HashSet<[u8; 32]> = HashSet::new();
+        let mut tail: Option<HashSet<[u8; 32]>> = None;
         let mut next_frontier = last_due + 1;
         let mut deletes = 0usize;
         while let (Some(key), Some(value)) = (it.key(), it.value()) {
@@ -1078,6 +1128,21 @@ impl NativeDaStore {
                 tracing::warn!(height = h, len = value.len(), "malformed DA GC row dropped");
                 (0, &[][..])
             });
+            let pins = match &mut tail {
+                Some(pins) => &*pins,
+                // The first due row: nothing is in `batch` from this walk yet.
+                None => match history.uncommitted_hashes() {
+                    Ok(hashes) => &*tail.insert(hashes.iter().map(|h| h.0).collect()),
+                    Err(e) => {
+                        tracing::warn!(
+                            due_from = h,
+                            "DA body GC: a block above the committed tip is unreadable, \
+                             deleting nothing this pass: {e}"
+                        );
+                        return Ok(DueRows::TailUnreadable);
+                    }
+                },
+            };
             let bodies = row_hashes.len() / 32;
             let row_deletes = bodies * (1 + usize::from(row_shards));
             if out.rows_deleted as usize >= limits.max_rows.max(1)
@@ -1102,6 +1167,15 @@ impl NativeDaStore {
                 if marked.contains(hash) {
                     continue;
                 }
+                // Referenced by a block above the committed tip: it may still
+                // commit (and is block-synced meanwhile). The body, its
+                // reference and shards stay; if that block commits, its
+                // record owns them; if it never does, they stay for good
+                // (a faulty leader's re-inclusion only).
+                if pins.contains(hash) {
+                    out.tail_pinned += 1;
+                    continue;
+                }
                 batch.delete_cf(cf, hash);
                 batch.delete_cf(cf, da_gc_ref_key(hash));
                 if let Some(shards) = shards_cf {
@@ -1123,7 +1197,7 @@ impl NativeDaStore {
             // Every row up to `last_due` went: a marker left there has no row.
             take_da_gc_markers(&mut markers, batch, cf, last_due, &mut marked)?;
         }
-        Ok((out.rows_deleted > 0).then_some(next_frontier))
+        Ok(DueRows::Deleted((out.rows_deleted > 0).then_some(next_frontier)))
     }
 
     /// Erasure-encode each body under `params` and persist all `n` shards into

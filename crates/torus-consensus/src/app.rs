@@ -6557,11 +6557,14 @@ impl TorusApp {
     /// nothing). A block whose body row did not land in `CF_BLOCK_BODIES`
     /// (`!body_durable`) and that has native actions is not recorded at all,
     /// never as "no actions" (Codex P1, round 2): the GC cursor stays at it,
-    /// the pass deletes nothing (counted in `torus_da_gc_held_passes`) and
-    /// the next pass back-fills it, pins included, from the block tree.
+    /// the pass deletes nothing (`torus_da_gc_held_passes{reason="unrecorded"}`)
+    /// and the next pass back-fills it, pins included, from the block tree.
     /// Nothing is deleted either while the tree holds committed heights
     /// above `height` (a multi-block commit, boot reconciliation): one may
-    /// re-include a due body before its own pass pins it.
+    /// re-include a due body before its own pass pins it. A due body a block
+    /// above the committed tip references (the tree's uncommitted tail) stays
+    /// while its row goes; an unreadable tail holds the pass. Every held
+    /// pass counts `torus_da_gc_held_passes{reason}`.
     ///
     /// A hash this block re-includes moves to this height
     /// ([`torus_state::NativeDaStore::gc_committed`]), so its body goes when
@@ -6573,8 +6576,10 @@ impl TorusApp {
     /// shards: a shard miss falls back to the whole-body pull.
     ///
     /// Runs on the consensus thread, bounded: two point reads (the tree's
-    /// prune pointer, the GC state), two `MultiGet`s over this block's hashes
-    /// (body presence, latest references), one iterator over at most
+    /// prune pointer, the GC state; plus, when a row is due, the tree's
+    /// committed tip and its uncommitted tail: normally 2-3 datum decodes,
+    /// at most [`crate::da_gc::MAX_TAIL_BLOCKS`]), two `MultiGet`s over this
+    /// block's hashes (body presence, latest references), one iterator over at most
     /// [`crate::da_gc::DA_GC_LIMITS`] aged rows (and one over their
     /// re-inclusion markers, normally none) and one `WriteBatch` to the
     /// consensus DB (plus a body write on a restore), all linear in this
@@ -6586,7 +6591,7 @@ impl TorusApp {
     /// record write) is back-filled from the block tree on the next pass,
     /// with its re-inclusion pins and body restores, before anything is
     /// deleted. A height the tree cannot supply holds every deletion (logged,
-    /// `torus_da_gc_held_passes`) until a later pass fills it. Back-filled
+    /// `torus_da_gc_held_passes{reason="gap"}`) until a later pass fills it. Back-filled
     /// heights are recorded whatever their body row's durability (their
     /// dispatch is past).
     ///
@@ -6718,11 +6723,19 @@ impl TorusApp {
         if let Some(ref m) = self.metrics {
             m.da_gc_seconds.observe(started.elapsed().as_secs_f64());
             m.da_bodies_gc_deleted.inc_by(out.bodies_deleted);
-            if out.backfill_stalled || record.is_none() {
+            // P3 (claude-review r4): every held pass, by its reason.
+            if let Some(reason) = out.hold_reason {
                 m.da_gc_held_passes
-                    .get_or_create(&vec![("reason".into(), "gap".into())])
+                    .get_or_create(&vec![("reason".into(), reason.as_str().into())])
                     .inc();
             }
+        }
+        if out.tail_pinned > 0 {
+            tracing::warn!(
+                height,
+                kept = out.tail_pinned,
+                "DA body GC: kept due bodies a block above the committed tip re-includes"
+            );
         }
         if out.heights_backfilled > 0 {
             tracing::info!(

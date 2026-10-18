@@ -83,13 +83,13 @@
 //!   deleted. Records are idempotent, so a re-write is harmless.
 //! - A height the tree cannot supply (missing block, read error) stops the
 //!   back-fill: the pass deletes NOTHING, logs, counts
-//!   `torus_da_gc_held_passes`, and the next pass retries. A failed record is
+//!   `torus_da_gc_held_passes{reason="gap"}`, and the next pass retries. A failed record is
 //!   therefore never dropped: the cursor stays behind until it lands.
 //! - A height dispatch could not make durable (its `CF_BLOCK_BODIES` write
 //!   failed) is not recorded at all, never as "no actions" (Codex P1, round
 //!   2: that dropped its pins and moved the cursor past it): the cursor stays
-//!   at it, the pass deletes nothing (counted in `torus_da_gc_held_passes`)
-//!   and the next pass back-fills it from the tree. Its bodies then follow
+//!   at it, the pass deletes nothing (`reason="unrecorded"`) and the next
+//!   pass back-fills it from the tree. Its bodies then follow
 //!   the normal window (crash replay re-executes from the DA store only above
 //!   the applied height, and execution rewrites a failed body row); before
 //!   round 2 they were kept for good, at the cost of the pins.
@@ -99,15 +99,36 @@
 //!   them may re-include a due row's body; deleting it before its own pass
 //!   pins it leaves its compact block unreconstructable. The tip is read only
 //!   when something is due; an unreadable tip holds too. Holding (not
-//!   pinning the undispatched blocks' hashes) is the simpler rule: no datum
-//!   decode on the consensus thread, and in blocking dispatch (the default)
-//!   dispatch reaches the tip at the last block of every commit, where the
-//!   held rows go (up to [`DA_GC_LIMITS`] rows per pass).
+//!   pinning the undispatched blocks' hashes) is the simpler rule: in
+//!   blocking dispatch (the default) dispatch reaches the tip at the last
+//!   block of every commit, where the held rows go (up to [`DA_GC_LIMITS`]
+//!   rows per pass). In the opt-in non-blocking dispatch, steady
+//!   backpressure can hold it for long: visible as `reason="dispatch_behind"`.
+//! - A due body a block ABOVE the committed tip references stays (claude
+//!   review r4 / Codex r3 P2, torus issue 282de5bb): the tree holds and
+//!   block-syncs its uncommitted tail, and a tail block may commit on a node
+//!   without its cached proposal (after a restart, or a same-height
+//!   re-proposal overwrote the cache entry), which rebuilds the compact block
+//!   from the DA store; dispatch's restore runs only after that rebuild. At
+//!   the first due row the pass reads the tail ([`BlockTreeHistory`]:
+//!   [`uncommitted_native_hashes_in_tree`], every branch, normally 2-3
+//!   blocks) and skips the hashes it references: the row goes, the body, its
+//!   reference and shards stay. If the tail block commits, its record owns
+//!   the body; if it never does, the body stays for good (it takes a faulty
+//!   leader re-including a ~window-old action as its row expires). A tail
+//!   block that cannot be read or decoded (or a tail over
+//!   [`MAX_TAIL_BLOCKS`]) holds the whole pass (`reason="tail_unreadable"`).
 //! - Heights below the first one the tree serves are skipped (pruned),
 //!   but deletion waits until the last skipped height is itself due (window
 //!   and tree bound): one of them may have re-included an older row's body.
 //!   Such a gap means the GC was off or failing for longer than the tree
 //!   window; the first-inclusion bodies of the skipped heights stay for good.
+//!
+//! Every pass that deletes nothing counts `torus_da_gc_held_passes` once,
+//! labelled with the first rule that held it
+//! ([`torus_state::DaGcHoldReason`]: `gap`, `backfilling`, `unrecorded`,
+//! `pre_cursor`, `pruned_gap`, `dispatch_behind`, `tip_unreadable`,
+//! `tail_unreadable`, `store_error`; P3, claude-review r4).
 //!
 //! A fresh store (no GC state, so no row a lost pin could matter for)
 //! establishes the cursor at its first recorded height. A store a pre-cursor
@@ -119,9 +140,27 @@
 //! record nothing, and no pass deletes before the cursor exists. With the GC
 //! off (archive node, `TORUS_DA_BODY_RETENTION=0`) no pass runs and nothing
 //! is written.
+//!
+//! Not cleaned (owner, s128): bodies a node stored before its first GC pass
+//! (a store upgraded from a binary without RH4: no GC state, so it starts as
+//! a fresh store at its first dispatched height) have no row and stay for
+//! good. Testnet starts from a fresh genesis, so none exist there.
+//!
+//! # Design alternative not chosen (s128)
+//!
+//! After three review rounds (each finding a way the cursor + record
+//! bookkeeping could diverge from what the block tree still serves) the
+//! owner chose targeted fixes over a redesign that would derive "may this
+//! body go?" directly from the block tree at deletion time: scan every block
+//! the tree still serves, the uncommitted tail included, for the hash,
+//! instead of keeping rows, references, markers and a cursor. Revisit it if
+//! another bookkeeping/tree divergence is found.
 
+use hotstuff_rs::block_tree::accessors::internal::BlockTreeError;
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
+use hotstuff_rs::block_tree::pluggables::{KVGetError, Key};
 use hotstuff_rs::block_tree::variables::BLOCK_TREE_PRUNED_HEIGHT;
+use hotstuff_rs::hotstuff::types::PhaseCertificate;
 use hotstuff_rs::types::data_types::BlockHeight;
 use torus_state::cf::CF_CONSENSUS_META;
 use torus_state::{DaGcHistory, DaGcLimits, StateDb, StateError};
@@ -298,29 +337,94 @@ pub fn committed_native_actions_in_tree(
     let Some(datum) = data.vec().first() else {
         return Ok(Some((Vec::new(), None)));
     };
-    let bytes = datum.bytes();
+    match decode_native_datum(datum.bytes()) {
+        Some(decoded) => Ok(Some(decoded)),
+        None => {
+            tracing::warn!(
+                height,
+                "DA body GC back-fill: undecodable committed datum, no actions"
+            );
+            Ok(Some((Vec::new(), None)))
+        }
+    }
+}
+
+/// A block datum's native actions, decoded like `TorusApp::on_committed_block`
+/// decodes it: `(hashes, Some(actions))` for a full datum, `(hashes, None)`
+/// for a compact one, `None` when it is neither.
+#[allow(clippy::type_complexity)]
+fn decode_native_datum(bytes: &[u8]) -> Option<(Vec<B256>, Option<Vec<SignedNativeAction>>)> {
     if let Ok(full) = bincode::deserialize::<TorusBlock>(bytes) {
         let hashes = full
             .native_actions
             .iter()
             .map(compute_action_hash)
             .collect();
-        return Ok(Some((hashes, Some(full.native_actions))));
+        return Some((hashes, Some(full.native_actions)));
     }
-    if let Ok(compact) = bincode::deserialize::<CompactBlock>(bytes) {
-        return Ok(Some((compact.native_action_hashes, None)));
-    }
-    tracing::warn!(
-        height,
-        "DA body GC back-fill: undecodable committed datum, no actions"
-    );
-    Ok(Some((Vec::new(), None)))
+    bincode::deserialize::<CompactBlock>(bytes)
+        .ok()
+        .map(|compact| (compact.native_action_hashes, None))
 }
 
+/// Most blocks [`uncommitted_native_hashes_in_tree`] reads above the
+/// committed tip (normally 2-3); a larger tail is an error, so the pass holds.
+pub const MAX_TAIL_BLOCKS: usize = 256;
+
 /// The native-action hashes the blocks of the tree in `db` ABOVE its
-/// highest committed block reference (the uncommitted tail, every branch).
-pub fn uncommitted_native_hashes_in_tree(_db: &StateDb) -> Result<Vec<B256>, StateError> {
-    Ok(Vec::new())
+/// highest committed block reference (the uncommitted tail: every
+/// descendant of that block, on every branch; with nothing committed, every
+/// block). Such a block may still commit and is block-synced meanwhile, so
+/// the GC keeps the due bodies it references (claude-review r4 / Codex r3
+/// P2). A tail block without data, with an undecodable datum, or more than
+/// [`MAX_TAIL_BLOCKS`] of them is an error, never "no actions": the pass
+/// then holds. Normally 2-3 blocks, read only when a row is due.
+pub fn uncommitted_native_hashes_in_tree(db: &StateDb) -> Result<Vec<B256>, StateError> {
+    let tree_err = |e| StateError::InvalidData(format!("block tree tail read: {e:?}"));
+    let camera = BlockTreeCamera::new(RocksKVStore::new(db.db_arc()));
+    let snapshot = camera.snapshot();
+    let root = snapshot
+        .highest_committed_block()
+        .map_err(tree_err)?
+        .unwrap_or(PhaseCertificate::genesis_pc().block);
+    let mut stack = vec![root];
+    let mut hashes = Vec::new();
+    let mut read = 0usize;
+    while let Some(block) = stack.pop() {
+        let children = match snapshot.children(&block) {
+            Ok(children) => children,
+            // No children list: a leaf (hotstuff writes the list of a block
+            // when its first child is inserted; a read error panics in
+            // `RocksKVStore`, never reads as absent).
+            Err(BlockTreeError::KVGetError(KVGetError::ValueExpectedButNotFound {
+                key: Key::BlockChildren { .. },
+            })) => continue,
+            Err(e) => return Err(tree_err(e)),
+        };
+        for child in children.iter() {
+            read += 1;
+            if read > MAX_TAIL_BLOCKS {
+                return Err(StateError::InvalidData(format!(
+                    "block tree tail: more than {MAX_TAIL_BLOCKS} blocks above the committed tip"
+                )));
+            }
+            let Some(data) = snapshot.block_data(child).map_err(tree_err)? else {
+                return Err(StateError::InvalidData(format!(
+                    "block tree tail: block {child:?} has no data"
+                )));
+            };
+            if let Some(datum) = data.vec().first() {
+                let Some((block_hashes, _)) = decode_native_datum(datum.bytes()) else {
+                    return Err(StateError::InvalidData(format!(
+                        "block tree tail: block {child:?} has an undecodable datum"
+                    )));
+                };
+                hashes.extend(block_hashes);
+            }
+            stack.push(*child);
+        }
+    }
+    Ok(hashes)
 }
 
 /// [`BlockTreeHistory`]'s restore hook: `(height, hashes, full datum's
