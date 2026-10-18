@@ -2023,7 +2023,7 @@ fn serial_run_overhead_allocs(mode: BookMode, books: u64) -> u64 {
     run_allocs - book_allocs
 }
 
-/// Codex s123 review P2 (flag OFF, `TORUS_PARALLEL_CANCEL_ALL` unset): the
+/// Codex s123 review P2 (flag OFF, `TORUS_PARALLEL_CANCEL_ALL=1`): the
 /// serial cancel-all run allocates exactly as main — its two scratch
 /// buffers once per run, groups walked in place — so its own allocations
 /// do not grow with the markets it visits (the flag-off branch allocated

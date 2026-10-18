@@ -72,12 +72,13 @@ export TORUS_ADDR_RATE_LIMIT="${TORUS_ADDR_RATE_LIMIT:-0}"
 export TORUS_RPC_IP_WEIGHT_PER_MIN="${TORUS_RPC_IP_WEIGHT_PER_MIN:-0}"
 # s58 (exp/archy-s58-bundle-dmt): the stuck-leader header re-send (s75 fix D,
 # TORUS_HEADER_RESEND_MS) at 250 ms on the devnet and every matched-bench cell;
-# the node's compiled default stays 3000 ms (hotstuff implementation.rs) and
-# the testnet configs do not set it. A caller or a bench arm overrides it
-# (EXTRA_ENV / arm env 'TORUS_HEADER_RESEND_MS=3000'; '=0' = off). To run the
-# node default with the name ABSENT (an arm listing it in absent_env), set the
-# harness knob HEADER_RESEND_UNSET=1 (campaign harness_env, or the caller's
-# env): nothing is exported then.
+# since s128 the node's compiled default is 250 ms too (hotstuff
+# implementation.rs, was 3000), so this export only pins it. A caller or a
+# bench arm overrides it (EXTRA_ENV / arm env 'TORUS_HEADER_RESEND_MS=3000'
+# for the old 3 s; '=0' = off). To run with the name ABSENT (an arm listing it
+# in absent_env), set the harness knob HEADER_RESEND_UNSET=1 (campaign
+# harness_env, or the caller's env): nothing is exported then, and the node
+# uses its compiled default (250 ms, no longer 3 s).
 if [ "${HEADER_RESEND_UNSET:-0}" = 1 ]; then
     unset TORUS_HEADER_RESEND_MS
 else
