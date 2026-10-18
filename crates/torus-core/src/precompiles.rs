@@ -151,8 +151,13 @@ impl ReadMeter {
 /// therefore reads at most `min(rows paid + 1, max_rows)` rows, plus the
 /// node-local rows it skips, plus the RocksDB deletion markers inside the
 /// prefix that the iterator steps over uncharged (node-local). Unlimited and
-/// uncapped: one `iterate_cf` (the pre-existing read). A missing CF reads as
-/// empty.
+/// uncapped: one `iterate_cf` (the pre-existing read).
+///
+/// F1 (Codex review P1): every storage error, a missing CF included, is
+/// `CoreError::State` — a local fault the EVM provider fail-stops on. A
+/// missing CF is never an empty answer: that would be a success receipt
+/// with a gas charge only this node computes. An existing but empty CF is
+/// the empty result.
 fn scan_prefix_metered(
     state: &impl StateBackend,
     cf: &'static str,
@@ -161,10 +166,6 @@ fn scan_prefix_metered(
     meter: &mut ReadMeter,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoreError> {
     const PAGE: u64 = 64;
-    let missing_is_empty = |e: torus_state::StateError| match e {
-        torus_state::StateError::MissingColumnFamily(_) => Ok(Vec::new()),
-        e => Err(CoreError::State(e)),
-    };
     let Some(hashed_id) = torus_state::running_hash::hashed_cf_id(cf) else {
         return Err(CoreError::InvalidPrecompileInput(format!(
             "reader scan of {cf}: not a hashed consensus CF (its charge would be node-dependent)"
@@ -173,7 +174,7 @@ fn scan_prefix_metered(
     let consensus = |k: &[u8]| torus_state::running_hash::key_is_hashed(hashed_id, k);
     if meter.is_unlimited() && max_rows.is_none() {
         let p = (!prefix.is_empty()).then_some(prefix);
-        let mut rows = state.iterate_cf(cf, p).or_else(missing_is_empty)?;
+        let mut rows = state.iterate_cf(cf, p)?;
         rows.retain(|(k, _)| consensus(k));
         meter.charge_rows(rows.len() as u64)?;
         return Ok(rows);
@@ -189,9 +190,7 @@ fn scan_prefix_metered(
             .saturating_sub(out.len() as u64)
             .saturating_add(1);
         let page = left.min(PAGE).min(max_rows - out.len() as u64) as usize;
-        let rows = state
-            .iterate_cf_prefix_from(cf, prefix, &start, page)
-            .or_else(missing_is_empty)?;
+        let rows = state.iterate_cf_prefix_from(cf, prefix, &start, page)?;
         let ended = rows.len() < page;
         let last = rows.last().map(|(k, _)| k.clone());
         out.extend(rows.into_iter().filter(|(k, _)| consensus(k)));
@@ -2205,7 +2204,10 @@ mod scan_prefix_metered_tests {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        let cfs = torus_state::cf::ALL_CF_NAMES.iter().copied().filter(|cf| *cf != missing);
+        let cfs = torus_state::cf::ALL_CF_NAMES
+            .iter()
+            .copied()
+            .filter(|cf| *cf != missing);
         let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
         (dir, db)
     }
@@ -2236,9 +2238,15 @@ mod scan_prefix_metered_tests {
         fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
             self.0.delete_cf_raw(cf, key)
         }
-        fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        fn iterate_cf(
+            &self,
+            cf: &str,
+            prefix: Option<&[u8]>,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
             if cf == self.1 {
-                return Err(StateError::Io(std::io::Error::other("injected iterator failure")));
+                return Err(StateError::Io(std::io::Error::other(
+                    "injected iterator failure",
+                )));
             }
             self.0.iterate_cf(cf, prefix)
         }
@@ -2276,15 +2284,50 @@ mod scan_prefix_metered_tests {
         let sel = |sig: &str| selector_for(sig).to_be_bytes().to_vec();
         let staker = [sel("getStakingInfo(address)"), vec![0u8; 12], vec![7u8; 20]].concat();
         vec![
-            ("getMarkets", CF_NATIVE_MARKETS, ADDR_BALANCE_READER, sel("getMarkets()")),
-            ("getAllPrices", CF_NATIVE_ORACLE, ADDR_ORACLE_READER, sel("getAllPrices()")),
-            ("getStakingInfo", CF_STAKING_DELEGATIONS, ADDR_STAKING_READER, staker),
-            ("getValidators", CF_STAKING_VALIDATORS, ADDR_STAKING_READER, sel("getValidators()")),
+            (
+                "getMarkets",
+                CF_NATIVE_MARKETS,
+                ADDR_BALANCE_READER,
+                sel("getMarkets()"),
+            ),
+            (
+                "getAllPrices",
+                CF_NATIVE_ORACLE,
+                ADDR_ORACLE_READER,
+                sel("getAllPrices()"),
+            ),
+            (
+                "getStakingInfo",
+                CF_STAKING_DELEGATIONS,
+                ADDR_STAKING_READER,
+                staker,
+            ),
+            (
+                "getValidators",
+                CF_STAKING_VALIDATORS,
+                ADDR_STAKING_READER,
+                sel("getValidators()"),
+            ),
         ]
     }
 
-    fn run_reader(state: &impl StateBackend, id: u16, data: &[u8], meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
-        execute_precompile_metered(&precompile_address(id), data, &Address::ZERO, U256::ZERO, state, 1, 1_000, false, meter)
+    fn run_reader(
+        state: &impl StateBackend,
+        id: u16,
+        data: &[u8],
+        meter: &mut ReadMeter,
+    ) -> Result<Vec<u8>, CoreError> {
+        execute_precompile_metered(
+            &precompile_address(id),
+            data,
+            &Address::ZERO,
+            U256::ZERO,
+            state,
+            1,
+            1_000,
+            false,
+            meter,
+        )
     }
 
     /// Through each scan reader (metered as in the EVM, and unlimited): a

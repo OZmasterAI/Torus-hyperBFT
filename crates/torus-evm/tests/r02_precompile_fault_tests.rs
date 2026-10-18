@@ -383,16 +383,42 @@ mod f1 {
     // point read; an existing but empty CF is still the normal empty answer.
     // ------------------------------------------------------------------------
 
-    /// (case, the scanned CF, precompile, calldata, the empty-CF answer):
-    /// every reader that scans (`scan_prefix_metered`).
-    fn scan_cases() -> Vec<(&'static str, &'static str, u16, Vec<u8>, Vec<u8>)> {
+    /// (case, the scanned CF, precompile, calldata, the empty-CF answer).
+    type ScanCase = (&'static str, &'static str, u16, Vec<u8>, Vec<u8>);
+
+    /// Every reader that scans (`scan_prefix_metered`).
+    fn scan_cases() -> Vec<ScanCase> {
         use torus_core::precompiles::abi::encode_arrays_response;
         use torus_state::cf::{CF_NATIVE_MARKETS, CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS};
         vec![
-            ("0x0801 getMarkets scan", CF_NATIVE_MARKETS, ADDR_BALANCE_READER, call("getMarkets()", &[]), encode_arrays_response(&[&[], &[]])),
-            ("0x0802 getAllPrices scan", CF_NATIVE_ORACLE, ADDR_ORACLE_READER, call("getAllPrices()", &[]), encode_arrays_response(&[&[], &[], &[]])),
-            ("0x0803 getStakingInfo delegation scan", CF_STAKING_DELEGATIONS, ADDR_STAKING_READER, call("getStakingInfo(address)", &[addr_word(ALICE)]), vec![0u8; 128]),
-            ("0x0803 getValidators scan", CF_STAKING_VALIDATORS, ADDR_STAKING_READER, call("getValidators()", &[]), encode_arrays_response(&[&[], &[], &[]])),
+            (
+                "0x0801 getMarkets scan",
+                CF_NATIVE_MARKETS,
+                ADDR_BALANCE_READER,
+                call("getMarkets()", &[]),
+                encode_arrays_response(&[&[], &[]]),
+            ),
+            (
+                "0x0802 getAllPrices scan",
+                CF_NATIVE_ORACLE,
+                ADDR_ORACLE_READER,
+                call("getAllPrices()", &[]),
+                encode_arrays_response(&[&[], &[], &[]]),
+            ),
+            (
+                "0x0803 getStakingInfo delegation scan",
+                CF_STAKING_DELEGATIONS,
+                ADDR_STAKING_READER,
+                call("getStakingInfo(address)", &[addr_word(ALICE)]),
+                vec![0u8; 128],
+            ),
+            (
+                "0x0803 getValidators scan",
+                CF_STAKING_VALIDATORS,
+                ADDR_STAKING_READER,
+                call("getValidators()", &[]),
+                encode_arrays_response(&[&[], &[], &[]]),
+            ),
         ]
     }
 
@@ -406,15 +432,27 @@ mod f1 {
             let (_d, db) = db_without(cf);
             let ex = EvmExecutor::new(TORUS_CHAIN_ID);
             let tx = || tx_to(id, data.clone(), U256::ZERO, 200_000);
-            expect_local_fault(ex.execute_block(&db, &block_cfg(), vec![tx()], true), cf, &format!("{what} (block)"));
+            expect_local_fault(
+                ex.execute_block(&db, &block_cfg(), vec![tx()], true),
+                cf,
+                &format!("{what} (block)"),
+            );
             let overlay = torus_state::StateOverlay::new(db.clone());
             expect_local_fault(
                 ex.execute_block_with_overlay(&overlay, &block_cfg(), vec![tx()], true),
                 cf,
                 &format!("{what} (overlay)"),
             );
-            expect_local_fault(ex.execute_tx(&db, &block_cfg(), tx()).map(|(r, _)| r), cf, &format!("{what} (tx)"));
-            expect_local_fault(ex.execute_call(&db, &block_cfg(), tx()).map(|(r, _)| r), cf, &format!("{what} (eth_call)"));
+            expect_local_fault(
+                ex.execute_tx(&db, &block_cfg(), tx()).map(|(r, _)| r),
+                cf,
+                &format!("{what} (tx)"),
+            );
+            expect_local_fault(
+                ex.execute_call(&db, &block_cfg(), tx()).map(|(r, _)| r),
+                cf,
+                &format!("{what} (eth_call)"),
+            );
         }
     }
 
@@ -428,9 +466,18 @@ mod f1 {
             let (_d, db) = db_without("no-such-cf");
             let ex = EvmExecutor::new(TORUS_CHAIN_ID);
             let b = ex
-                .execute_block(&db, &block_cfg(), vec![tx_to(id, data.clone(), U256::ZERO, 200_000)], true)
+                .execute_block(
+                    &db,
+                    &block_cfg(),
+                    vec![tx_to(id, data.clone(), U256::ZERO, 200_000)],
+                    true,
+                )
                 .unwrap_or_else(|e| panic!("{what}: {e:?}"));
-            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true), "{what}");
+            assert_eq!(
+                (b.receipts.len(), b.receipts[0].status),
+                (1, true),
+                "{what}"
+            );
             let (r, _) = ex
                 .execute_call(&db, &block_cfg(), tx_to(id, data, U256::ZERO, 200_000))
                 .unwrap_or_else(|e| panic!("{what} (eth_call): {e:?}"));
@@ -446,9 +493,18 @@ mod f1 {
         for (what, cf, id, data, _) in scan_cases() {
             let (_d, db) = db_without(cf);
             let b = EvmExecutor::new(TORUS_CHAIN_ID)
-                .execute_block(&db, &block_cfg(), vec![tx_to(id, data, U256::ZERO, 25_000)], true)
+                .execute_block(
+                    &db,
+                    &block_cfg(),
+                    vec![tx_to(id, data, U256::ZERO, 25_000)],
+                    true,
+                )
                 .unwrap_or_else(|e| panic!("{what}: {e:?}"));
-            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, false), "{what}");
+            assert_eq!(
+                (b.receipts.len(), b.receipts[0].status),
+                (1, false),
+                "{what}"
+            );
         }
     }
 }
