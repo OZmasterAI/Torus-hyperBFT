@@ -201,6 +201,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    to fall >= half as much in relative terms, i.e. G 497 -> <= ~400 ms). Report also checkpoints per 100 blocks, the
    share triggered by the cap, native blocks/s, block p50 / p99, state-DB writes and Dirty / Writeback. A GO means 18c
    builds A1; a NO-GO drops A1 (the p99 windows are then not from the batch size).
+   **Done s68 (ozarchy-z2, binary Z `9d770519` node md5 `0d234898`, both arms 15 s + PC + F + push threshold 524288,
+   n = 2 ABBA, 5 / 5 valid, section 89): no GO / NO-GO; the "else" branch, decide with 18c. W_db fell 72.7% (455 ->
+   124 ms per checkpoint; batch 115 -> 45 MB mean, 207 -> 68 MB max) and X (manifest in - out) fell 47.6% (12.07 ->
+   6.32 ms per call), but G did not move (637 -> 649 ms, rounds 1.225 / 0.830; in-window p99 ~1.1 s on both arms).
+   ZC is confounded: the cap (counted from above) fires every ~3.7 blocks (26.8 vs 1.04 checkpoints per 100 blocks,
+   96% cap-triggered), upkeep on E 0.8 -> 14 ms per block, state-DB writes 2.46x, and the node drops to native
+   blocks/s 0.364 [0.278, 0.477] (15.91 -> 5.79) with block p50 13 -> 64 ms, p99 630 -> 1,152 ms; matched/s 0.955
+   [0.911, 1.001], CPU-s per 1M +3.7%. Not SHIP-ZC. Z15 reproduces step Z's throughput (250,402 vs 250,599) but G
+   637 vs 497 ms: use a same-campaign control. Options for 18c (89.7): drop A1 on G, a cadence-preserving cap
+   (~80-100 MB), or build A1 on the manifest evidence.**
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
    **READY (s128): arm (b) binary = `perf/rh4-da-body-gc` `b2dd21a4`** (main e1be6c15 merged into 4514573f, no
    conflicts; workspace 4069 passed / 0 failed, clippy no new warnings). Owner s128: custody OFF by default until T3.1,
