@@ -666,6 +666,17 @@ impl PendingState {
         self.cfs.iter().all(CfPending::is_empty)
     }
 
+    /// Item 6 Phase 5 step 2: drop this set's row of `key` in CF `id` (a
+    /// newer write of it went to the in-place source).
+    #[inline]
+    fn forget(&mut self, id: CfId, key: &[u8]) {
+        let cfp = self.cf_mut(id);
+        if !cfp.is_empty() {
+            cfp.writes.remove(key);
+            cfp.deletes.remove(key);
+        }
+    }
+
     /// Put `rows` of CF `id` into this set, each a write (`Some`) or a
     /// tombstone (`None`) replacing whatever the set held for its key
     /// ([`FrozenPending::put_rows`]).
@@ -2022,6 +2033,19 @@ impl NativeStateOverlay {
         Some((self.resident.as_ref()?.in_place_source()?, slot))
     }
 
+    /// Item 6 Phase 5 step 2 (plan Task 2.2, decision 3's write-through):
+    /// where a write of CF `id` goes instead of the pending map: R's
+    /// in-place source and the CF's slot, when no tx scope is open (a
+    /// scope's writes stay journalled on the pending map, folded in once it
+    /// is kept: at the next fold point or the freeze).
+    #[inline]
+    fn write_through(&self, id: CfId, state: &PendingState) -> Option<(&dyn ResidentSource, usize)> {
+        if !state.checkpoints.is_empty() {
+            return None;
+        }
+        self.in_place(id)
+    }
+
     /// Item 6 Phase 5 step 2: the in-place source, if R has one.
     #[inline]
     fn in_place_source(&self) -> Option<&dyn ResidentSource> {
@@ -2037,7 +2061,8 @@ impl NativeStateOverlay {
         let Some(source) = self.in_place_source() else {
             return 0;
         };
-        if !closing && !state.checkpoints.is_empty() {
+        let in_scope = !state.checkpoints.is_empty();
+        if !closing && in_scope {
             return 0;
         }
         let mut moved = 0;
@@ -2049,6 +2074,15 @@ impl NativeStateOverlay {
                 moved += 1;
             }
         }
+        // Plan section 8 risk 2 (Task 2.2): with the write-through, such a
+        // row reaches the pending map only inside a tx scope; outside one a
+        // writer bypassed it (e.g. an overlay clone made before R was
+        // attached). Tests and debug builds fail here; a release build has
+        // just folded it (the record set and the change set stay right).
+        debug_assert!(
+            moved == 0 || in_scope,
+            "item 6 Phase 5: {moved} rows of positions / balances pending outside a tx scope: a writer bypassed the write-through"
+        );
         moved
     }
 
@@ -3229,6 +3263,11 @@ impl StateBackend for NativeStateOverlay {
         if state.frozen {
             return Err(PendingState::frozen_err());
         }
+        if let Some((source, slot)) = self.write_through(id, &state) {
+            state.forget(id, key);
+            source.put_row(slot, key, Some(value));
+            return Ok(());
+        }
         state.record(id, key);
         let cfp = state.cf_mut(id);
         cfp.deletes.remove(key);
@@ -3242,6 +3281,11 @@ impl StateBackend for NativeStateOverlay {
         if state.frozen {
             return Err(PendingState::frozen_err());
         }
+        if let Some((source, slot)) = self.write_through(id, &state) {
+            state.forget(id, key);
+            source.put_row(slot, key, Some(&value));
+            return Ok(());
+        }
         state.record(id, key);
         let cfp = state.cf_mut(id);
         cfp.deletes.remove(key);
@@ -3254,6 +3298,11 @@ impl StateBackend for NativeStateOverlay {
         let mut state = self.pending.write().unwrap();
         if state.frozen {
             return Err(PendingState::frozen_err());
+        }
+        if let Some((source, slot)) = self.write_through(id, &state) {
+            state.forget(id, key);
+            source.put_row(slot, key, None);
+            return Ok(());
         }
         state.record(id, key);
         let cfp = state.cf_mut(id);
@@ -3682,6 +3731,17 @@ impl StateBackend for NativeStateOverlay {
             return Err(PendingState::frozen_err());
         }
         for (op, &id) in ops.iter().zip(ids.iter()) {
+            // Phase 5 step 2 (Task 2.2): the in-place CFs' ops go into the
+            // source (it cannot fail: the set stays all-or-nothing).
+            if let Some((source, slot)) = self.write_through(id, &state) {
+                let (key, value) = match op {
+                    AtomicWriteOp::Put { key, value, .. } => (*key, Some(*value)),
+                    AtomicWriteOp::Delete { key, .. } => (*key, None),
+                };
+                state.forget(id, key);
+                source.put_row(slot, key, value);
+                continue;
+            }
             match op {
                 AtomicWriteOp::Put { key, value, .. } => {
                     state.record(id, key);

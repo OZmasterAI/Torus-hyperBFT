@@ -215,7 +215,9 @@ fn block_actions(rng: &mut Lcg) -> Vec<(Address, NativeAction)> {
 
 /// One seeded run (`cached`: R, slot and typed loads; else no R). Returns
 /// each call's results and the rows of both CFs after it.
-fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<String> {
+/// Phase 5 step 2: `reference`, the holder on the Phase 4 reference path
+/// (writes of the two CFs pending on the overlay); else in place.
+fn run(seed: u64, cached: bool, reference: bool, stats: &mut Stats) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(dir.path()).unwrap();
     // Owner s138: a fixture from before the never-marked rule (test-only seam).
@@ -232,6 +234,7 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<String> {
     }
     let mut rng = Lcg(seed);
     let mut holder = ResidentBooks::default();
+    holder.set_reference_writes(reference);
     let mut parent: Option<Arc<FrozenPending>> = None;
     let mut books = HashMap::default();
     let mut next_id: u128 = 1;
@@ -297,18 +300,27 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<String> {
 /// Plan step 4: `typed_loads_equal_overlay_reads` — 4 seeds x 24 blocks x 3
 /// calls; every typed load == the overlay read, the record read exactly for
 /// clean keys of regular traders, the calls take the typed path, and the
-/// run equals the run without R call by call.
+/// run equals the run without R call by call. Phase 5 step 2: on the
+/// reference holder (Phase 4's pending rows) and in place (none pending).
 #[test]
 fn typed_loads_equal_overlay_reads() {
     let mut stats = Stats::default();
+    let mut in_place_stats = Stats::default();
     for seed in 1..=4u64 {
-        let typed = run(seed * 0x5851_F42D, true, &mut stats);
-        let reference = run(seed * 0x5851_F42D, false, &mut Stats::default());
+        let typed = run(seed * 0x5851_F42D, true, true, &mut stats);
+        let in_place = run(seed * 0x5851_F42D, true, false, &mut in_place_stats);
+        let reference = run(seed * 0x5851_F42D, false, true, &mut Stats::default());
         assert_eq!(typed.len(), reference.len());
-        for (a, b) in typed.iter().zip(&reference) {
+        for ((a, b), c) in typed.iter().zip(&reference).zip(&in_place) {
             assert_eq!(a, b, "seed {seed}: typed run != run without R");
+            assert_eq!(c, b, "seed {seed}: in-place run != run without R");
         }
     }
+    // Phase 5 step 2: in place, no key of the two CFs is ever pending on
+    // the overlay (the write-through), so every typed load of a regular
+    // trader reads its record.
+    assert_eq!((in_place_stats.dirty, in_place_stats.tombstones), (0, 0), "in place: {in_place_stats:?}");
+    assert!(in_place_stats.clean > stats.clean && in_place_stats.opaque > 20, "in place: {in_place_stats:?}");
     assert!(stats.clean > 1_000, "clean keys read from the record: {stats:?}");
     assert!(stats.dirty > 100, "keys with an own pending row: {stats:?}");
     assert!(stats.tombstones > 20, "own pending tombstones: {stats:?}");
