@@ -169,6 +169,25 @@ class PreloadRecordTest(unittest.TestCase):
         self.run_cli("summary", "--dir", self.d)
         self.assertFalse(self.summary()["preload"]["ok"])
 
+    def test_duplicate_after_a_lost_reply_is_not_a_failure(self):
+        # Codex P2: a resend refused as a duplicate after a lost reply was admitted.
+        self.accepted_summary()
+        self.cell()
+        self.write(preload.REPORT_FILE, report(duplicate_after_resend=1, actions_failed=0))
+        self.run_cli("summary", "--dir", self.d)
+        p = self.summary()["preload"]
+        self.assertTrue(p["ok"], p["problems"])
+        self.assertEqual(p["duplicate_after_resend"], 1)
+
+    def test_unsent_actions_are_a_problem(self):
+        self.accepted_summary()
+        self.cell(rc=1)
+        self.write(preload.REPORT_FILE, report(actions_unsent=3, reached=False, resting=19000))
+        self.run_cli("summary", "--dir", self.d)
+        p = self.summary()["preload"]
+        self.assertIn("3 actions unsent (deadline)", p["problems"])
+        self.assertEqual(p["actions_unsent"], 3)
+
     def test_ok_predicate(self):
         self.assertEqual(
             preload.problems_of({"rc": 0, "target": 5, "report": report(resting=5)}), []

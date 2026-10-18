@@ -279,6 +279,12 @@ pub struct PreloadReport {
     /// Orders in admitted actions (the RPC took them; execution decides).
     pub orders_accepted: u64,
     pub actions_failed: u64,
+    /// A resend after an ambiguous send (reply lost: transport / parse error)
+    /// refused by the pool as a duplicate: the first send was admitted.
+    /// Counted in `actions_admitted`, not in `actions_failed`.
+    pub duplicate_after_resend: u64,
+    /// Actions never sent because the --timeout-s deadline passed first.
+    pub actions_unsent: u64,
     pub resends: u64,
     /// min over nodes of the `torus_orders_resting_total` delta.
     pub resting: Option<u64>,
@@ -352,6 +358,19 @@ pub fn resendable(err: &str) -> bool {
     super::is_busy_reject(err) || err.starts_with("http:") || err.starts_with("parse:")
 }
 
+/// The node pool's refusal of an action it already holds (torus-mempool
+/// `MempoolError::DuplicateNativeAction`, "duplicate native action", wrapped by
+/// the RPC as "mempool: ...").
+pub fn is_duplicate_reject(err: &str) -> bool {
+    err.contains("mempool: duplicate native action")
+}
+
+/// A failed send whose outcome is unknown: the request may have been admitted
+/// and only its reply lost (transport error, unparsable reply, client deadline).
+fn is_ambiguous(err: &str) -> bool {
+    err.starts_with("http:") || err.starts_with("parse:")
+}
+
 pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     let t0 = Instant::now();
     let urls = split_urls(a.rpc_urls);
@@ -373,6 +392,9 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
         actions: plan.actions,
         ..Default::default()
     };
+    // ONE deadline for everything: pacing, permits, requests, resends, joins
+    // and the resting wait. Nothing is sent once it has passed.
+    let deadline = t0 + a.timeout;
     let base = scrape_all(&client, &murls).await;
     let keys: Arc<Vec<SigningKey>> = Arc::new(
         super::load_sender_keys(plan.owners as usize, plan.owner_offset)
@@ -384,6 +406,7 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     let admitted = Arc::new(AtomicU64::new(0));
     let accepted = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
+    let dup_after = Arc::new(AtomicU64::new(0));
     let resends = Arc::new(AtomicU64::new(0));
     let failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sem = Arc::new(tokio::sync::Semaphore::new(a.concurrency.max(1)));
@@ -392,25 +415,36 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     let mut tasks = Vec::new();
     let plan = Arc::new(plan.clone());
     let mut action_no = 0u64;
-    for o in 0..plan.owners {
+    let mut sent = 0u64;
+    'owners: for o in 0..plan.owners {
         let batches = plan.owner_batches(o);
         let mut last_nonce = 0u64;
         for orders in batches {
-            tokio::time::sleep_until(next.into()).await;
+            if tokio::time::timeout_at(deadline.into(), tokio::time::sleep_until(next.into())).await.is_err() {
+                break 'owners;
+            }
             next += gap;
-            let permit = sem.clone().acquire_owned().await.expect("semaphore");
+            let Ok(permit) = tokio::time::timeout_at(deadline.into(), sem.clone().acquire_owned()).await else {
+                break 'owners;
+            };
+            let permit = permit.expect("semaphore");
+            if Instant::now() >= deadline {
+                break 'owners;
+            }
+            sent += 1;
             let n = orders.len() as u64;
             let nonce = now_ms().max(last_nonce + 1);
             last_nonce = nonce;
             let signed = sign_native_action(NativeAction::PlaceOrderBatch(orders), nonce, &keys[o as usize]);
             let payload = format!("0x{}", hex::encode(bincode::serialize(&signed).expect("bincode")));
             let url = urls[o as usize % urls.len()].clone();
-            let (client, placed, admitted, accepted, failed, resends, failures) = (
+            let (client, placed, admitted, accepted, failed, dup_after, resends, failures) = (
                 client.clone(),
                 placed.clone(),
                 admitted.clone(),
                 accepted.clone(),
                 failed.clone(),
+                dup_after.clone(),
                 resends.clone(),
                 failures.clone(),
             );
@@ -421,8 +455,22 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
                 let _permit = permit;
                 placed.fetch_add(n, Ordering::Relaxed);
                 let first = Instant::now();
+                // An earlier send of this payload may have been admitted with
+                // its reply lost.
+                let mut ambiguous = false;
+                let fail = |err: String| {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    let mut f = failures.lock().unwrap();
+                    if f.len() < 10 {
+                        f.push(format!("action {id} owner {owner_idx}: {err}"));
+                    }
+                };
                 loop {
-                    let r = super::submit_items(&client, &url, std::slice::from_ref(&payload), id, true).await;
+                    let send = super::submit_items(&client, &url, std::slice::from_ref(&payload), id, true);
+                    let r = match tokio::time::timeout_at(deadline.into(), send).await {
+                        Ok(r) => r,
+                        Err(_) => return fail("deadline (--timeout-s) passed during the request".into()),
+                    };
                     let err = match r {
                         Ok(items) if items.first().is_some_and(|e| e.is_none()) => {
                             admitted.fetch_add(1, Ordering::Relaxed);
@@ -432,39 +480,52 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
                         Ok(items) => items.into_iter().flatten().next().unwrap_or_else(|| "empty reply".into()),
                         Err(e) => e,
                     };
-                    if resendable(&err) && first.elapsed() + RESEND_BACKOFF < RESEND_MAX_AGE {
+                    if ambiguous && is_duplicate_reject(&err) {
+                        // The lost send was admitted: the pool already holds this
+                        // exact action. The resting count stays the real check.
+                        dup_after.fetch_add(1, Ordering::Relaxed);
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                        accepted.fetch_add(n, Ordering::Relaxed);
+                        return;
+                    }
+                    ambiguous |= is_ambiguous(&err);
+                    let now = Instant::now();
+                    if resendable(&err) && now.duration_since(first) + RESEND_BACKOFF < RESEND_MAX_AGE
+                        && now + RESEND_BACKOFF < deadline
+                    {
                         resends.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(RESEND_BACKOFF).await;
                         continue;
                     }
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    let mut f = failures.lock().unwrap();
-                    if f.len() < 10 {
-                        f.push(format!("action {id} owner {owner_idx}: {err}"));
-                    }
-                    return;
+                    return fail(err);
                 }
             }));
         }
     }
     for t in tasks {
-        let _ = t.await;
+        // Every task ends by the deadline; the margin covers scheduling only.
+        let abort = t.abort_handle();
+        if tokio::time::timeout_at((deadline + Duration::from_secs(1)).into(), t).await.is_err() {
+            abort.abort();
+        }
     }
     rep.submit_seconds = t0.elapsed().as_secs_f64();
+    rep.actions_unsent = plan.actions - sent;
     rep.orders_placed = placed.load(Ordering::Relaxed);
     rep.actions_admitted = admitted.load(Ordering::Relaxed);
     rep.orders_accepted = accepted.load(Ordering::Relaxed);
     rep.actions_failed = failed.load(Ordering::Relaxed);
+    rep.duplicate_after_resend = dup_after.load(Ordering::Relaxed);
     rep.resends = resends.load(Ordering::Relaxed);
     rep.failures = failures.lock().unwrap().clone();
     eprintln!(
-        "[preload] submitted {} actions ({} orders) in {:.1}s: admitted {} ({} orders), failed {}, resends {}",
-        plan.actions, rep.orders_placed, rep.submit_seconds, rep.actions_admitted, rep.orders_accepted,
-        rep.actions_failed, rep.resends
+        "[preload] submitted {} of {} actions ({} orders) in {:.1}s: admitted {} ({} orders; {} as a duplicate after a lost reply), \
+         failed {}, unsent {}, resends {}",
+        sent, plan.actions, rep.orders_placed, rep.submit_seconds, rep.actions_admitted, rep.orders_accepted,
+        rep.duplicate_after_resend, rep.actions_failed, rep.actions_unsent, rep.resends
     );
 
-    // Wait until every node shows the target resting (or timeout / stall).
-    let deadline = t0 + a.timeout;
+    // Wait until every node shows the target resting, by the deadline (or a stall).
     let mut best = 0u64;
     let mut last_progress = Instant::now();
     let mut now = base.clone();
@@ -477,7 +538,8 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
                     last_progress = Instant::now();
                 }
                 if r >= plan.target {
-                    rep.reached = true;
+                    // Only a target seen by the deadline counts.
+                    rep.reached = Instant::now() <= deadline;
                     break;
                 }
             }
@@ -498,8 +560,9 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
         .zip(&now)
         .map(|(b, n)| Some(n.as_ref()?.1.saturating_sub(b.as_ref()?.1)))
         .collect();
-    // The gauge is set at the start of the NEXT native block: give it a few s.
-    let gauge_deadline = Instant::now() + Duration::from_secs(10);
+    // The gauge is set at the start of the NEXT native block: give it a few s
+    // (reporting only; `reached` is already decided).
+    let gauge_deadline = Instant::now() + Duration::from_secs(if rep.reached { 10 } else { 0 });
     loop {
         let g: Vec<Option<u64>> = scrape_all(&client, &murls).await.iter().map(|c| c.map(|c| c.2)).collect();
         let done = g.iter().all(|v| v.is_some_and(|v| v >= plan.target));
@@ -724,4 +787,165 @@ mod tests {
         assert_eq!(NATIVE_ORDERS_PER_BATCH_CAP, 1_024);
         assert_eq!(OWNER_LIMIT, 1_000);
     }
+
+    // ---- runtime against stub nodes (one HTTP server for RPC and /metrics)
+
+    /// What the stub answers: per RPC call index, (delay, Some(body) or None =
+    /// drop the connection without a reply); /metrics: (resting, placed,
+    /// gauge) per scrape index.
+    struct Stub {
+        rpc: Box<dyn Fn(usize) -> (Duration, Option<String>) + Send + Sync>,
+        metrics: Box<dyn Fn(usize) -> (u64, u64, u64) + Send + Sync>,
+        rpc_calls: std::sync::atomic::AtomicUsize,
+        bodies: Mutex<Vec<String>>,
+        scrapes: std::sync::atomic::AtomicUsize,
+    }
+
+    async fn serve(stub: Arc<Stub>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = l.accept().await else { return };
+                let stub = stub.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    let (head_end, len) = loop {
+                        let Ok(n) = sock.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                                .unwrap_or(0usize);
+                            break (p + 4, len);
+                        }
+                    };
+                    while buf.len() < head_end + len {
+                        let Ok(n) = sock.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let first = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let (delay, body) = if first.starts_with("GET /metrics") {
+                        let k = stub.scrapes.fetch_add(1, Ordering::SeqCst);
+                        let (r, p, g) = (stub.metrics)(k);
+                        (Duration::ZERO, Some(format!("{M_RESTING} {r}\n{M_PLACED} {p}\n{M_GAUGE} {g}\n")))
+                    } else {
+                        stub.bodies.lock().unwrap().push(String::from_utf8_lossy(&buf[head_end..]).to_string());
+                        let k = stub.rpc_calls.fetch_add(1, Ordering::SeqCst);
+                        (stub.rpc)(k)
+                    };
+                    tokio::time::sleep(delay).await;
+                    if let Some(b) = body {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{b}",
+                            b.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    }
+                    // None: drop the socket unanswered (a lost admission reply).
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn small_plan(target: u64) -> PreloadPlan {
+        PreloadPlan::new(&PreloadSpec { target, markets: 2, per_owner: 1, batch: 1, ..spec() }).unwrap()
+    }
+
+    fn args<'a>(rpc: &'a str, metrics: &'a str, timeout: Duration) -> RunArgs<'a> {
+        RunArgs { rpc_urls: rpc, metrics_urls: metrics, rate: 1_000.0, concurrency: 4, timeout, stall: Duration::from_secs(60) }
+    }
+
+    const OK: &str = r#"{"jsonrpc":"2.0","id":0,"result":[{"hash":"0x01"}]}"#;
+
+    /// Codex P2 #1: the deadline bounds the submission too. Every request
+    /// hangs 4 s; with a 1 s timeout the run ends near 1 s, never claims the
+    /// target (even though the counters later show it) and stops submitting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_timeout_bounds_submission_and_a_late_target_is_not_reached() {
+        let stub = Arc::new(Stub {
+            rpc: Box::new(|_| (Duration::from_secs(4), Some(OK.to_string()))),
+            metrics: Box::new(|k| if k == 0 { (0, 0, 0) } else { (8, 8, 8) }),
+            rpc_calls: Default::default(),
+            bodies: Default::default(),
+            scrapes: Default::default(),
+        });
+        let url = serve(stub.clone()).await;
+        let m = format!("{url}/metrics");
+        let plan = small_plan(8);
+        let t0 = Instant::now();
+        let rep = run(&plan, args(&url, &m, Duration::from_secs(1))).await;
+        let took = t0.elapsed();
+        assert!(took < Duration::from_millis(2_500), "run took {took:?}");
+        assert!(rep.submit_seconds < 1.6, "submit_seconds {}", rep.submit_seconds);
+        assert!(!rep.reached, "a target seen only after the deadline is not reached");
+        assert_eq!(rep.actions_admitted, 0);
+        assert_eq!(rep.actions_failed + rep.actions_unsent, plan.actions, "{rep:?}");
+        assert!(stub.rpc_calls.load(Ordering::SeqCst) <= 4, "concurrency 4, no new request past the deadline");
+    }
+
+    /// Codex P2 #2: the first send's reply is lost (connection dropped), the
+    /// resend of the SAME signed action gets the pool's duplicate refusal: a
+    /// prior admission, not a failure. The resting count stays the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_duplicate_after_a_lost_reply_counts_as_admitted_not_failed() {
+        const DUP: &str =
+            r#"{"jsonrpc":"2.0","id":0,"result":[{"error":"mempool: duplicate native action"}]}"#;
+        let stub = Arc::new(Stub {
+            rpc: Box::new(|k| (Duration::ZERO, if k == 0 { None } else { Some(DUP.to_string()) })),
+            metrics: Box::new(|k| if k == 0 { (0, 0, 0) } else { (1, 1, 1) }),
+            rpc_calls: Default::default(),
+            bodies: Default::default(),
+            scrapes: Default::default(),
+        });
+        let url = serve(stub.clone()).await;
+        let m = format!("{url}/metrics");
+        let rep = run(&small_plan(1), args(&url, &m, Duration::from_secs(20))).await;
+        let bodies = stub.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        let payload = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap()["params"].clone();
+        assert_eq!(payload(&bodies[0]), payload(&bodies[1]), "the identical signed action is resent");
+        assert_eq!((rep.actions_failed, rep.duplicate_after_resend, rep.actions_admitted), (0, 1, 1), "{rep:?}");
+        assert_eq!(rep.orders_accepted, 1);
+        assert!(rep.reached);
+        assert!(rep.failures.is_empty());
+    }
+
+    /// A duplicate refusal with no earlier ambiguous send is still a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_duplicate_on_the_first_send_is_a_failure() {
+        const DUP: &str =
+            r#"{"jsonrpc":"2.0","id":0,"result":[{"error":"mempool: duplicate native action"}]}"#;
+        let stub = Arc::new(Stub {
+            rpc: Box::new(|_| (Duration::ZERO, Some(DUP.to_string()))),
+            metrics: Box::new(|_| (0, 0, 0)),
+            rpc_calls: Default::default(),
+            bodies: Default::default(),
+            scrapes: Default::default(),
+        });
+        let url = serve(stub.clone()).await;
+        let m = format!("{url}/metrics");
+        let rep = run(&small_plan(1), RunArgs { stall: Duration::from_secs(1), ..args(&url, &m, Duration::from_secs(5)) }).await;
+        assert_eq!((rep.actions_failed, rep.duplicate_after_resend), (1, 0), "{rep:?}");
+        assert!(!rep.reached);
+    }
+
+    #[test]
+    fn the_duplicate_refusal_text_is_the_pools() {
+        assert!(is_duplicate_reject("\"mempool: duplicate native action\""));
+        assert!(!is_duplicate_reject("\"mempool: duplicate tx: 0xab\""));
+        assert!(!is_duplicate_reject("http: connection closed"));
+    }
+
 }

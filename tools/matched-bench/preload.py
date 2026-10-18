@@ -48,6 +48,8 @@ REPORT_KEYS = (
     "actions_admitted",
     "orders_accepted",
     "actions_failed",
+    "duplicate_after_resend",
+    "actions_unsent",
     "resends",
     "resting",
     "resting_by_node",
@@ -83,6 +85,10 @@ def problems_of(p):
         out.append("bench reports the target not reached")
     if rep.get("actions_failed"):
         out.append("%s actions failed" % rep["actions_failed"])
+    # duplicate_after_resend is NOT a failure: a resend after a lost reply that
+    # the pool refused as a duplicate (the first send was admitted).
+    if rep.get("actions_unsent"):
+        out.append("%s actions unsent (deadline)" % rep["actions_unsent"])
     return out
 
 
