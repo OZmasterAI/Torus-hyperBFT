@@ -260,9 +260,21 @@ and changed meaning.
   the batch with the marker at `app.rs:4674`, the resync at `4743-4753`. A marker-keyed snapshot can therefore see
   height h's native state next to h-1's EVM mirror (Codex probe: `same_marker=true same_hashed_account=false`). A
   RocksDB snapshot does not help: the interval lies between two separate writes. A height is complete only after
-  `run_job` returns `Ok` or `TrieStale` (`worker_loop` `766-786`, before `durable_height.store` and
+  `run_job` returns `Ok`, or `TrieStale` for a Checkpoint (a TrieStale Flush skips the resync, F4b)
+  (`worker_loop` `766-786`, before `durable_height.store` and
   `finish_job`), or on E after the resync (`app.rs:4759`) or the marker-only flush (`4970`). W runs its jobs in
   order on one thread, so no later job writes before that point.
+- **F4b (Codex P2 on `543980f0`, step 0). A TrieStale Flush on W skips the EVM mirror resync, for good.** When a
+  Flush's batch lands but its native trie maintenance fails (only with `TORUS_NATIVE_TRIE_MAINTENANCE=1`; off by
+  default), `run_job`'s Flush arm returns `TrieStale` before `resync_evm`, and nothing makes it up: the block's
+  native-credited EVM accounts keep a pre-resync CF_HASHED_* / CF_TRIE_* mirror until a later block resyncs them, so
+  the incremental EVM root drifts from the full scan (the F4 failure mode, from the native side). The three sites
+  disagree today: a Checkpoint resyncs even on `TrieStale`, W's Flush skips it and goes on, and E's serial flush
+  fail-stops on the same error (its flush `Err` arm). Step 0 changes no production code: the completion hook does not
+  fire for a TrieStale Flush (its height is not complete), the next completed height records it, and
+  `o0_trie_stale_flush_is_not_a_completion` pins the gap (a manual `resync_evm_accounts` fixes the row). Task 2.3
+  closes it: resync on `TrieStale` as the Checkpoint does, or set F4's stale marker so the root routes to the full
+  scan and boot rebuilds.
 
 ## 3. Shape of the fast-path EVM section
 
@@ -392,7 +404,8 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     known complete: a `#[cfg(test)] test_on_complete: Option<Arc<dyn Fn(u64, &StateDb) + Send + Sync>>` on the
     worker env and on `ExecutionContext`, called with the completed height:
     - on W in `worker_loop` (`exec_pipeline.rs:766-786`), for a Flush, Marker or Checkpoint whose `run_job` returned
-      `Ok` or `TrieStale`. That is after `resync_evm` (`957`, `1054`) and before `durable_height.store` /
+      `Ok`, or `TrieStale` for a Checkpoint (a TrieStale Flush returns before its resync and is not complete, F4b;
+      the next completed height covers it). That is after `resync_evm` (`957`, `1054`) and before `durable_height.store` /
       `finish_job`, and so before W can `recv` the next job. Never for a Digest (nothing durable) or a failed job;
     - on E after the serial flush's resync (`app.rs:4743-4753`, at the end of the serial-flush block `4759`) and after
       a successful `flush_marker_only` (`4970`). S takes all its heights here; a pipelined node takes its barrier
@@ -615,6 +628,8 @@ branch). Golden green after every task.
 - Code: a node-local key outside `META_CONSENSUS_PREFIXES` (not hashed) set in the same batch when the step fails (the
   checkpoint lands without the EVM ops). `evm_root_routed` (`state_root.rs:37`) uses the full scan while it is set.
   `ensure_trie_built` (`incremental.rs:131`) wipes and rebuilds when it is set, then clears it.
+- F4b: a TrieStale Flush returns before `resync_evm`. Make it resync (as the Checkpoint) or set the stale marker;
+  then flip `o0_trie_stale_flush_is_not_a_completion`'s pinned pre-resync row and let the hook fire for it.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
 
 **Task 2.4: job plumbing**

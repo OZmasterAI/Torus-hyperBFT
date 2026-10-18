@@ -1562,52 +1562,164 @@ impl NativeStateOverlay {
         });
     }
 
-    /// `test-probes`: count a range read (iterators, `prefix_exists`) over
-    /// the frozen layers `lower` (parent, L, C) restricted to keys
-    /// `in_range` from `start`: each layer holding such a key is a hit, in
-    /// flight iff one of its keys (the first 256) answers otherwise in the
-    /// DB now; the DB iterator is one DB hit.
+    /// `test-probes`: the probe tags of `lower`'s slots (parent, L, C).
     #[cfg(feature = "test-probes")]
-    fn probe_iter(
-        &self,
-        id: CfId,
-        lower: &[Option<&PendingState>; 3],
-        start: &[u8],
-        in_range: impl Fn(&[u8]) -> bool,
-    ) {
-        if !crate::probes::active() {
-            return;
-        }
-        let tags = [
+    fn lower_tags(&self, id: CfId) -> [crate::probes::Layer; 3] {
+        [
             crate::probes::Layer::Parent,
             self.l_tag(id),
             crate::probes::Layer::Checkpoint,
-        ];
-        for (layer, tag) in lower.iter().zip(tags) {
-            let Some(layer) = layer else { continue };
+        ]
+    }
+
+    /// `test-probes`: the DB answers `key` otherwise than `v` now.
+    #[cfg(feature = "test-probes")]
+    fn db_differs(&self, id: CfId, key: &[u8], v: Option<&[u8]>) -> bool {
+        self.db.get_cf_raw(id.name(), key).ok().flatten().as_deref() != v
+    }
+
+    /// `test-probes`: the effective rows of each frozen layer of `lower`
+    /// (parent, L, C, newest first) under the overlay's own set `own`: its
+    /// writes and tombstones from `start` while `within` holds, minus the
+    /// keys a newer layer (own, or an earlier slot) also holds.
+    #[cfg(feature = "test-probes")]
+    fn effective_rows<'a>(
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&'a PendingState>; 3],
+        start: &[u8],
+        within: impl Fn(&[u8]) -> bool,
+    ) -> [Vec<(&'a [u8], Option<&'a [u8]>)>; 3] {
+        std::array::from_fn(|i| {
+            let Some(layer) = lower[i] else {
+                return Vec::new();
+            };
+            let shadowed = |k: &[u8]| {
+                own.lookup(id, k).is_some()
+                    || lower[..i].iter().flatten().any(|s| s.lookup(id, k).is_some())
+            };
             let cfp = layer.cf(id);
             let from = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
             let writes = cfp
                 .writes
                 .range::<[u8], _>(from)
-                .map(|(k, v)| (k.as_slice(), Some(v.as_slice())));
+                .map(|(k, v)| (k.as_slice(), Some(v.as_slice())))
+                .take_while(|(k, _)| within(k));
             let deletes = cfp
                 .deletes
                 .range::<[u8], _>(from)
-                .map(|k| (k.as_slice(), None));
-            let keys: Vec<(&[u8], Option<&[u8]>)> = writes
-                .take_while(|(k, _)| in_range(k))
-                .chain(deletes.take_while(|(k, _)| in_range(k)))
-                .take(512)
-                .collect();
-            if keys.is_empty() {
-                continue;
+                .map(|k| (k.as_slice(), None))
+                .take_while(|(k, _)| within(k));
+            writes.chain(deletes).filter(|(k, _)| !shadowed(k)).collect()
+        })
+    }
+
+    /// `test-probes`: count a range read (the iterators) over the frozen
+    /// layers `lower` by the rows that determined its answer (Codex P2 on
+    /// 543980f0): a layer's row counts iff no newer layer holds its key
+    /// (precedence) and the key lies in the window the read resolved: keys
+    /// `in_range` from `start` and, when the limit cut the read, at most
+    /// `upto` (the last returned key). There a write is a returned item and
+    /// a tombstone a hidden one. A layer with such a row is one hit, in
+    /// flight iff one of them answers otherwise in the DB now (with only
+    /// the DB below: iff skipping the layer changes the answer). The DB
+    /// iterator is one DB hit.
+    #[cfg(feature = "test-probes")]
+    fn probe_range(
+        &self,
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&PendingState>; 3],
+        start: &[u8],
+        in_range: impl Fn(&[u8]) -> bool,
+        upto: Option<&[u8]>,
+    ) {
+        if !crate::probes::active() {
+            return;
+        }
+        let within = |k: &[u8]| in_range(k) && upto.is_none_or(|u| k <= u);
+        let rows = Self::effective_rows(id, own, lower, start, within);
+        for (rows, tag) in rows.iter().zip(self.lower_tags(id)) {
+            if !rows.is_empty() {
+                crate::probes::record(id.name(), tag, || {
+                    rows.iter().any(|(k, v)| self.db_differs(id, k, *v))
+                });
             }
-            crate::probes::record(id.name(), tag, || {
-                keys.iter()
-                    .take(256)
-                    .any(|(k, v)| self.db.get_cf_raw(id.name(), k).ok().flatten().as_deref() != *v)
+        }
+        crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
+    }
+
+    /// `test-probes`: count a `prefix_exists` read that answered `exists`
+    /// by the rows that determined it. `true`: the layer of the first live
+    /// key under `prefix` (key order, precedence resolved) is one hit, in
+    /// flight iff the answer turns `false` with that layer's effective rows
+    /// read from the DB instead. `false`: each layer with an effective
+    /// tombstone under `prefix` is one hit, in flight iff the DB holds one
+    /// of those keys. The DB walk is one DB hit.
+    #[cfg(feature = "test-probes")]
+    fn probe_exists(
+        &self,
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&PendingState>; 3],
+        prefix: &[u8],
+        exists: bool,
+    ) {
+        if !crate::probes::active() {
+            return;
+        }
+        let rows = Self::effective_rows(id, own, lower, prefix, |k: &[u8]| k.starts_with(prefix));
+        let tags = self.lower_tags(id);
+        let in_db = |k: &[u8]| self.db.get_cf_raw(id.name(), k).ok().flatten().is_some();
+        if exists {
+            // The first live key and the layer it came from (None: own or DB).
+            let own_first = writes_under(&own.cf(id).writes, prefix).next();
+            let first_write = |i: usize| {
+                rows[i]
+                    .iter()
+                    .filter(|(_, v)| v.is_some())
+                    .map(|(k, _)| *k)
+                    .min()
+            };
+            // The DB's first key no layer holds (a held key resolves above).
+            let held = |k: &[u8]| {
+                own.lookup(id, k).is_some()
+                    || lower.iter().flatten().any(|s| s.lookup(id, k).is_some())
+            };
+            let db_first = self.db.inner().cf_handle(id.name()).and_then(|h| {
+                crate::db::prefix_iter(self.db.inner(), &h, prefix)
+                    .map_while(|item| item.ok())
+                    .map(|(k, _)| k)
+                    .take_while(|k| k.starts_with(prefix))
+                    .find(|k| !held(k))
             });
+            let mut first: Option<(&[u8], Option<usize>)> = own_first.map(|k| (k.as_slice(), None));
+            for i in 0..3 {
+                if let Some(k) = first_write(i) {
+                    if first.is_none_or(|(f, _)| k < f) {
+                        first = Some((k, Some(i)));
+                    }
+                }
+            }
+            if let Some(k) = db_first.as_deref() {
+                if first.is_none_or(|(f, _)| k < f) {
+                    first = None;
+                }
+            }
+            if let Some((_, Some(i))) = first {
+                crate::probes::record(id.name(), tags[i], || {
+                    let other_live = own_first.is_some()
+                        || db_first.is_some()
+                        || (0..3).any(|j| j != i && first_write(j).is_some());
+                    !other_live && !rows[i].iter().any(|(k, _)| in_db(k))
+                });
+            }
+        } else {
+            for (rows, tag) in rows.iter().zip(tags) {
+                if !rows.is_empty() {
+                    crate::probes::record(id.name(), tag, || rows.iter().any(|(k, _)| in_db(k)));
+                }
+            }
         }
         crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
     }
@@ -2464,6 +2576,15 @@ pub struct NativeFlushStats {
     pub state_hash_entries: usize,
 }
 
+/// `test-probes`: the last returned key when `limit` cut the read (`out`
+/// holds `limit` rows), else `None` (the whole range was resolved).
+#[cfg(feature = "test-probes")]
+fn limit_cut(out: &[(Vec<u8>, Vec<u8>)], limit: usize) -> Option<&[u8]> {
+    out.last()
+        .filter(|_| out.len() >= limit)
+        .map(|(k, _)| k.as_slice())
+}
+
 /// A layer's pending-write keys starting with `prefix`, in key order.
 pub(crate) fn writes_under<'a>(
     writes: &'a BTreeMap<Vec<u8>, Vec<u8>>,
@@ -2692,9 +2813,9 @@ impl StateBackend for NativeStateOverlay {
         // writes override what sits below.
         let db_entries = StateBackend::iterate_cf(&self.db, cf, prefix)?;
         let lower = self.lower(id)?;
-        #[cfg(feature = "test-probes")]
-        self.probe_iter(id, &lower, p, |k: &[u8]| k.starts_with(p));
         let state = self.pending.read().unwrap();
+        #[cfg(feature = "test-probes")]
+        self.probe_range(id, &state, &lower, p, |k: &[u8]| k.starts_with(p), None);
         // Fix 3 (s87): no layer holds a key under the prefix -> the DB rows
         // as they are (already sorted and unique under the bytewise comparator).
         if !state.touches(id, p) && !lower.iter().flatten().any(|s| s.touches(id, p)) {
@@ -2736,8 +2857,6 @@ impl StateBackend for NativeStateOverlay {
             return merge_from(&pending, &[], id, start, limit, base);
         }
         let lower = self.lower(id)?;
-        #[cfg(feature = "test-probes")]
-        self.probe_iter(id, &lower, start, |_: &[u8]| true);
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2748,7 +2867,10 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, &lower, id, start, limit, dbi)
+        let out = merge_from(&pending, &lower, id, start, limit, dbi)?;
+        #[cfg(feature = "test-probes")]
+        self.probe_range(id, &pending, &lower, start, |_: &[u8]| true, limit_cut(&out, limit));
+        Ok(out)
     }
 
     /// The layered point-read rule (pending, R, parent, DB) on lengths only.
@@ -2800,8 +2922,6 @@ impl StateBackend for NativeStateOverlay {
             return merge_from(&pending, &[], id, start, limit, base).map(cut);
         }
         let lower = self.lower(id)?;
-        #[cfg(feature = "test-probes")]
-        self.probe_iter(id, &lower, start, |k: &[u8]| k.starts_with(prefix));
         let db = self.db.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2813,7 +2933,20 @@ impl StateBackend for NativeStateOverlay {
                 rocksdb::IteratorMode::From(start, rocksdb::Direction::Forward),
             )
             .map(|item| item.map_err(StateError::from));
-        merge_from(&pending, &lower, id, start, limit, dbi).map(cut)
+        let out: Vec<(Vec<u8>, Vec<u8>)> =
+            cut(merge_from(&pending, &lower, id, start, limit, dbi)?);
+        // A cut row past the prefix leaves fewer than `limit`: the whole
+        // prefix range from `start` was resolved.
+        #[cfg(feature = "test-probes")]
+        self.probe_range(
+            id,
+            &pending,
+            &lower,
+            start,
+            |k: &[u8]| k.starts_with(prefix),
+            limit_cut(&out, limit),
+        );
+        Ok(out)
     }
 
     /// Same answer as the merged `iterate_cf`, without materialising it: a key
@@ -2842,36 +2975,40 @@ impl StateBackend for NativeStateOverlay {
                 None => true,
             }
         };
+        let exists = 'exists: {
+            if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
+                break 'exists true;
+            }
+            for layer in lower.iter().flatten() {
+                if writes_under(&layer.cf(id).writes, prefix).any(|k| live(k)) {
+                    break 'exists true;
+                }
+            }
+            // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
+            if let Some(rows) = rows {
+                break 'exists rows.range(prefix, prefix).any(|(k, _)| live(&k));
+            }
+            let db = self.db.inner();
+            let cf_handle = db
+                .cf_handle(cf)
+                .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
+            for item in crate::db::prefix_iter(db, &cf_handle, prefix) {
+                let (key, _) = item?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if live(&key) {
+                    break 'exists true;
+                }
+            }
+            false
+        };
         #[cfg(feature = "test-probes")]
         if rows.is_none() {
-            self.probe_iter(id, &lower, prefix, |k: &[u8]| k.starts_with(prefix));
+            let own = self.pending.read().unwrap();
+            self.probe_exists(id, &own, &lower, prefix, exists);
         }
-        if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
-            return Ok(true);
-        }
-        for layer in lower.iter().flatten() {
-            if writes_under(&layer.cf(id).writes, prefix).any(|k| live(k)) {
-                return Ok(true);
-            }
-        }
-        // Item 6 Phase 1: R's keys under the prefix stand in for the DB walk.
-        if let Some(rows) = rows {
-            return Ok(rows.range(prefix, prefix).any(|(k, _)| live(&k)));
-        }
-        let db = self.db.inner();
-        let cf_handle = db
-            .cf_handle(cf)
-            .ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()))?;
-        for item in crate::db::prefix_iter(db, &cf_handle, prefix) {
-            let (key, _) = item?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            if live(&key) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(exists)
     }
 
     /// With R attached and `cf` one of its CFs: this overlay's own pending set
@@ -3020,6 +3157,169 @@ mod tests {
         }
         assert!(yes > 0 && no > 0, "non-vacuous: {yes} / {no}");
         assert!(!overlay.prefix_exists(cf, b"q").unwrap(), "no key under the prefix");
+    }
+
+    /// Item 7 option 0 step 0 (task 0.3, Codex P2 on 543980f0): a range
+    /// read (`iterate_cf`, `iterate_cf_from`, `iterate_cf_prefix_from`,
+    /// `prefix_exists`) counts the parent layer only where the parent's row
+    /// determined the answer: never a row the overlay's own set shadows,
+    /// never a row past the range limit. Over every layering of three keys
+    /// (DB: absent / row; parent: none / write / tombstone / write equal to
+    /// the DB row; own: none / write / tombstone), many starts and limits:
+    /// the parent is in flight iff the same read with the parent skipped
+    /// (`Plant::SkipParent`, below it only the DB) answers otherwise, and a
+    /// parent hit is at most one per read. Plus the two Codex cases by name.
+    #[cfg(feature = "test-probes")]
+    #[test]
+    fn o0_probe_range_counts_effective_parent_rows_only() {
+        use crate::probes::{self, Layer, Plant, Probe};
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        // per key: (in DB, parent op 0..4, own op 0..3)
+        let states: Vec<(bool, u8, u8)> = (0..24u8)
+            .map(|i| (i % 2 == 1, (i / 2) % 4, i / 8))
+            .collect();
+        let combos: Vec<[(bool, u8, u8); 3]> = (0..states.len() * states.len() * 2)
+            .map(|i| {
+                let a = states[i % states.len()];
+                let b = states[(i / states.len()) % states.len()];
+                // The third key: absent everywhere, or a plain DB row.
+                [a, b, (i / (states.len() * states.len()) == 1, 0, 0)]
+            })
+            .collect();
+        let prefix = |c: usize| [b'p', (c >> 8) as u8, c as u8].to_vec();
+        let key = |c: usize, k: u8| [prefix(c), vec![k * 2 + 1]].concat();
+        for (c, keys) in combos.iter().enumerate() {
+            for (k, &(in_db, _, _)) in keys.iter().enumerate() {
+                if in_db {
+                    db.put_cf_raw(cf, &key(c, k as u8), b"db").unwrap();
+                }
+            }
+        }
+        let apply = |ov: &NativeStateOverlay, layer: usize| {
+            for (c, keys) in combos.iter().enumerate() {
+                for (k, st) in keys.iter().enumerate() {
+                    let kk = key(c, k as u8);
+                    match if layer == 0 { st.1 } else { st.2 } {
+                        1 => ov.put_cf_raw(cf, &kk, b"w").unwrap(),
+                        2 => ov.delete_cf_raw(cf, &kk).unwrap(),
+                        3 => ov.put_cf_raw(cf, &kk, b"db").unwrap(),
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        apply(&parent_ov, 0);
+        let parent = parent_ov.freeze(1);
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+        apply(&overlay, 1);
+        let skipped = {
+            let plant = Probe::new();
+            plant.plant(Plant::SkipParent);
+            let _i = probes::install(plant);
+            let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+            apply(&ov, 1);
+            ov
+        };
+        let p = Probe::new();
+        let _i = probes::install(p.clone());
+        // One read: the parent's count, and whether skipping it changes the answer.
+        let read = |f: &dyn Fn(&NativeStateOverlay) -> String| {
+            p.reset();
+            let got = f(&overlay);
+            let c = p.total(|_, l, _| l == Layer::Parent);
+            (c, got != f(&skipped))
+        };
+        let (mut inflight, mut quiet, mut hidden) = (0, 0, 0);
+        let mut check = |what: String, f: &dyn Fn(&NativeStateOverlay) -> String| {
+            let (c, differs) = read(f);
+            assert!(c.hits <= 1, "{what}: {c:?}");
+            assert_eq!(
+                c.inflight > 0,
+                differs,
+                "{what}: {c:?}, answer differs without the parent: {differs}"
+            );
+            match (c.hits, differs) {
+                (_, true) => inflight += 1,
+                (1, false) => quiet += 1,
+                _ => hidden += 1,
+            }
+        };
+        for (c, combo) in combos.iter().enumerate() {
+            let pre = prefix(c);
+            check(format!("iterate_cf {c} {combo:?}"), &|ov| {
+                format!("{:?}", ov.iterate_cf(cf, Some(&pre)).unwrap())
+            });
+            check(format!("prefix_exists {c} {combo:?}"), &|ov| {
+                format!("{:?}", ov.prefix_exists(cf, &pre).unwrap())
+            });
+            for s in [vec![], vec![2], vec![3], vec![4], vec![6]] {
+                let start = [pre.clone(), s].concat();
+                for limit in 1..=4 {
+                    check(format!("iterate_cf_from {c} {combo:?} {start:?} {limit}"), &|ov| {
+                        format!("{:?}", ov.iterate_cf_from(cf, &start, limit).unwrap())
+                    });
+                    check(
+                        format!("iterate_cf_prefix_from {c} {combo:?} {start:?} {limit}"),
+                        &|ov| {
+                            format!(
+                                "{:?}",
+                                ov.iterate_cf_prefix_from(cf, &pre, &start, limit).unwrap()
+                            )
+                        },
+                    );
+                }
+            }
+        }
+        assert!(
+            inflight > 0 && quiet > 0 && hidden > 0,
+            "non-vacuous: {inflight} / {quiet} / {hidden}"
+        );
+
+        // The Codex cases by name. Shadowed: the parent's row sits under
+        // the overlay's own write of the same key: no parent hit at all.
+        let q = |k: u8| vec![b'q', k];
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        parent_ov.put_cf_raw(cf, &q(1), b"parent").unwrap();
+        parent_ov.put_cf_raw(cf, &q(5), b"parent").unwrap();
+        let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent_ov.freeze(2)));
+        ov.put_cf_raw(cf, &q(1), b"own").unwrap();
+        db.put_cf_raw(cf, &q(3), b"db").unwrap();
+        let parent_hits = |f: &dyn Fn()| {
+            p.reset();
+            f();
+            p.total(|_, l, _| l == Layer::Parent)
+        };
+        let none = probes::Count::default();
+        assert_eq!(
+            parent_hits(&|| {
+                ov.iterate_cf_prefix_from(cf, b"q", &q(0), 2).unwrap();
+            }),
+            none,
+            "q1 shadowed by own, q5 past the limit (q1, q3 returned)"
+        );
+        assert_eq!(
+            parent_hits(&|| {
+                ov.iterate_cf_from(cf, &q(0), 2).unwrap();
+            }),
+            none,
+            "the same without the prefix bound"
+        );
+        assert_eq!(
+            parent_hits(&|| {
+                ov.prefix_exists(cf, b"q").unwrap();
+            }),
+            none,
+            "the first live key is own's q1"
+        );
+        assert_eq!(
+            parent_hits(&|| {
+                ov.iterate_cf_from(cf, &q(0), 3).unwrap();
+            }),
+            probes::Count { hits: 1, inflight: 1 },
+            "q5 returned: the parent determined it, the DB lacks it"
+        );
     }
 
     /// Review H3 (s517): `iterate_cf_from(start, limit)` == the first `limit`

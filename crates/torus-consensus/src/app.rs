@@ -32102,6 +32102,92 @@ mod crash_recovery_tests {
         assert!(node.ledger().calls.is_empty());
     }
 
+    /// Plan task 0.4 (F11; Codex P2 on 543980f0, finding F4b): a Flush
+    /// whose native trie maintenance fails after its batch landed
+    /// (`TrieStale`) returns before `resync_evm`, so its height is NOT
+    /// complete: the hook must not fire for it. The next completed height
+    /// covers it (the ledger records every height of the range), so the
+    /// ledger stays complete. The production gap is pinned: the skipped
+    /// resync is never made up (the trader's CF_HASHED_ACCOUNTS row stays
+    /// pre-resync until a manual resync), see the plan's F4b.
+    #[test]
+    fn o0_trie_stale_flush_is_not_a_completion() {
+        use crate::exec_pipeline::CompleteSite::*;
+        let blocks = o0_hand_blocks(&[O0Hand::Spot, O0Hand::Empty]);
+        let trader = oracle_addr(C5_TRADERS[1]);
+        let mut s = O0Node::new(O0Cfg::serial());
+        s.run(&blocks[..1]);
+        let want = o0_hashed_account(&s.db, trader);
+        assert!(want.is_some());
+        // Native trie maintenance on (the module forces it) over a built
+        // trie whose mirror rows are all corrupt (not 32 B): block 1's
+        // dirty buckets fail to load, after the batch is written.
+        let (config, db) = o0_fixture();
+        assert!(torus_state::native_trie::native_trie_maintenance_enabled());
+        torus_state::native_trie::build_native_trie_to_cf(&db).unwrap();
+        let mirror =
+            StateBackend::iterate_cf(&db, torus_state::cf::CF_NATIVE_HASHED, None).unwrap();
+        assert!(!mirror.is_empty());
+        for (k, _) in &mirror {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_HASHED, k, &[0]).unwrap();
+        }
+        let mirror_rows = |db: &StateDb| {
+            StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_HASHED, None).unwrap()
+        };
+        let before = mirror_rows(&db);
+        let mut b = O0Node::with_fixture(O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D), (config, db));
+        let pre = o0_hashed_account(&b.db, trader);
+        b.run(&blocks[..1]);
+        assert_eq!(mirror_rows(&b.db), before, "trie maintenance failed: no mirror row rewritten");
+        let w = b.ctx.as_ref().unwrap().flush_worker.as_ref().unwrap();
+        assert_eq!(w.durable_height(), 1, "TrieStale: the batch landed, W goes on");
+        assert_eq!(read_native_applied_height(&b.db), Some(1));
+        assert_eq!(
+            o0_hashed_account(&b.db, trader),
+            pre,
+            "TrieStale skipped block 1's EVM mirror resync"
+        );
+        assert_ne!(pre, want);
+        assert!(
+            b.ledger().calls.is_empty(),
+            "a TrieStale Flush is no completion: its mirror is pre-resync"
+        );
+        // Block 2 (a Marker, no trie work) completes 1..=2.
+        b.run(&blocks[1..]);
+        b.finish();
+        let l = b.ledger();
+        assert_eq!(l.calls, vec![(WMarker, 2)]);
+        l.assert_complete(2, "TrieStale at 1");
+        drop(l);
+        // The pinned production gap: nothing resyncs block 1's account.
+        assert_eq!(o0_hashed_account(&b.db, trader), pre);
+        torus_state::incremental::resync_evm_accounts(&b.db, &[trader]).unwrap();
+        assert_eq!(o0_hashed_account(&b.db, trader), want, "a manual resync fixes it");
+
+        // A TrieStale Checkpoint resyncs its window, so it IS a completion.
+        use O0Hand::{Native, Spot};
+        let blocks = o0_hand_blocks(&[Native, Native, Spot, Native, Native]);
+        let mut s = O0Node::new(O0Cfg::serial());
+        s.run(&blocks);
+        let want = o0_hashed_account(&s.db, trader);
+        let (config, db) = o0_fixture();
+        torus_state::native_trie::build_native_trie_to_cf(&db).unwrap();
+        for (k, _) in mirror_rows(&db) {
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_HASHED, &k, &[0]).unwrap();
+        }
+        let before = mirror_rows(&db);
+        let mut b = O0Node::with_fixture(O0Cfg::piped(P5Ckpt::Every5, O0Run::D), (config, db));
+        b.run(&blocks);
+        assert_eq!(mirror_rows(&b.db), before, "trie maintenance failed: no mirror row rewritten");
+        let w = b.ctx.as_ref().unwrap().flush_worker.as_ref().unwrap();
+        assert_eq!(w.durable_height(), 5, "TrieStale: the window landed, W goes on");
+        let l = b.ledger();
+        assert_eq!(l.calls, vec![(WCheckpoint, 5)]);
+        l.assert_complete(5, "TrieStale checkpoint at 5");
+        drop(l);
+        assert_eq!(o0_hashed_account(&b.db, trader), want, "the checkpoint resynced");
+    }
+
     /// Plan task 0.4: the hook snapshot drops the dispatcher's header and
     /// body rows above the completed height and the trade rows of blocks at
     /// or above it (E's other off-batch write, see `o0_dispatch_row_above`),

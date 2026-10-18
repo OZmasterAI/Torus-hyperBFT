@@ -846,11 +846,18 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         }
         // Item 7 option 0 step 0 (F11): the height is complete (batch AND
         // EVM mirror resync written); before W publishes it or receives its
-        // next job. Never for a digest or a failed job.
+        // next job. Never for a digest or a failed job, and not for a
+        // TrieStale Flush: its arm returns before `resync_evm` (plan F4b),
+        // so the next completed height covers it. A TrieStale Checkpoint
+        // has resynced.
         #[cfg(test)]
-        if let (Ok(Ok(()) | Err(JobError::TrieStale(_))), false, Some(hook)) =
-            (&result, digest, &env.test_on_complete)
-        {
+        let complete = match &result {
+            Ok(Ok(())) => true,
+            Ok(Err(JobError::TrieStale(_))) => ckpt,
+            _ => false,
+        };
+        #[cfg(test)]
+        if let (true, false, Some(hook)) = (complete, digest, &env.test_on_complete) {
             let site = match &job {
                 Job::Flush { .. } => CompleteSite::WFlush,
                 Job::Marker { .. } => CompleteSite::WMarker,
