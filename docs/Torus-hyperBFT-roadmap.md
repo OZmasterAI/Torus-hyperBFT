@@ -366,6 +366,18 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   mixed-flag agree check (2 nodes on, 1 off); size the worker count to the validator's cores (bench: 4 workers).
 - **Push-manifest threshold on WAN.** Benches pin 8 MB (`devnet/wsl/env.sh`), devnet compose 6 MB, code default 512 KB.
   Bench queue step 7b measures the CPU side on one host; the WAN threshold needs a WAN measurement.
+- **Parallel-settle merge drops a position update for "aliased" opaque rows (s128, found while fixing Phase 5 step
+  2's Codex finding).** An opaque position row whose payload market differs from its storage key (e.g. key (T, 1)
+  holding a market-2 position; `users.rs` keeps such rows opaque on purpose) can appear in two markets' position
+  caches. On the parallel settle (blocks above 1,024 fills) the reference merge lets a later plan's untouched loaded
+  row overwrite an earlier plan's changed row, so the update is lost and a stale row is rewritten every block; the
+  serial settle keeps the update. Every node takes the same path (it depends only on the fill count), so nodes agree;
+  the result is wrong for that trader and depends on block size. Benches never create such rows (no normal writer
+  does). Phase 5 step 2 copies today's behaviour byte for byte on purpose.
+  **Before fixing it, answer one question: can these odd rows exist at all?** (genesis import, migrations, older
+  code, any writer). If nothing can create them, reject or normalize them on load so the case cannot happen;
+  otherwise fix the merge so the parallel settle equals the serial one. Either way it changes consensus results for
+  such rows, so it lands **after Phase 5 step 2 merges** (same code) and **before the testnet genesis**.
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.
