@@ -14123,17 +14123,56 @@ pub type IndexedActions = (Vec<(Address, NativeAction)>, Vec<u32>);
 pub fn sort_native_actions_indexed(
     actions: Vec<(Address, NativeAction)>,
 ) -> (IndexedActions, IndexedActions) {
+    sort_keyed(actions.into_iter().enumerate().map(|(i, (sender, action))| {
+        (action_sort_key(&sender, &action), i as u32, (sender, action))
+    }))
+}
+
+/// Split keyed entries (in input order) into the pre-EVM and post-EVM lists
+/// and sort each one deterministically.
+fn sort_keyed(entries: impl Iterator<Item = KeyedAction>) -> (IndexedActions, IndexedActions) {
     let mut pre_evm = Vec::new();
     let mut post_evm = Vec::new();
-    for (i, (sender, action)) in actions.into_iter().enumerate() {
-        let key = action_sort_key(&sender, &action);
-        let entry = (key, i as u32, (sender, action));
-        match key.0 {
+    for entry in entries {
+        match entry.0 .0 {
             ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(entry),
             _ => post_evm.push(entry),
         }
     }
     (sort_deterministic(pre_evm), sort_deterministic(post_evm))
+}
+
+/// [`sort_native_actions_indexed`] with each action's content hash
+/// (`keccak256(canonical_bytes)`) supplied by the caller: `sort_hashes[i]`
+/// belongs to `actions[i]`. The exec path takes them from the verify pass
+/// (`batch_verify_native_actions_cached_with_sort_hashes`), which absorbs the
+/// canonical bytes once for both the trust-cache key and this hash (section
+/// 92 step 8e). Same keys, same stable sort, so the same lists and positions
+/// as [`sort_native_actions_indexed`]. Debug builds recompute every hash and
+/// assert it. Panics if the lengths differ.
+pub fn sort_native_actions_indexed_with_sort_hashes(
+    actions: Vec<(Address, NativeAction)>,
+    sort_hashes: Vec<B256>,
+) -> (IndexedActions, IndexedActions) {
+    assert_eq!(
+        actions.len(),
+        sort_hashes.len(),
+        "one sort hash per action (caller bug: the hashes would shift)"
+    );
+    sort_keyed(
+        actions
+            .into_iter()
+            .zip(sort_hashes)
+            .enumerate()
+            .map(|(i, ((sender, action), hash))| {
+                debug_assert_eq!(
+                    hash,
+                    alloy_primitives::keccak256(action.canonical_bytes()),
+                    "sort hash of action {i} is not keccak(canonical_bytes)"
+                );
+                ((classify_action(&action), sender, hash), i as u32, (sender, action))
+            }),
+    )
 }
 
 /// Deterministic sort key for a native action.

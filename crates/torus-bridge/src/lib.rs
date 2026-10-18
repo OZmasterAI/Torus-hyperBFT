@@ -18,7 +18,8 @@ pub use committer::BlockCommitter;
 pub use decode::{declared_gas_limit, decode_all_txs, decode_rlp_tx, decode_txs_lossy, DecodedTx};
 pub use error::BridgeError;
 pub use native_executor::{
-    sort_native_actions, sort_native_actions_indexed, ActionCategory, NativeActionResult, NativeBatchResult, NativeExecContext,
+    sort_native_actions, sort_native_actions_indexed, sort_native_actions_indexed_with_sort_hashes,
+    ActionCategory, NativeActionResult, NativeBatchResult, NativeExecContext,
     NativeExecutor,
 };
 pub use proposer::{
