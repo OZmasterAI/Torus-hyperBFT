@@ -14136,6 +14136,22 @@ pub fn sort_native_actions_indexed(
     (sort_deterministic(pre_evm), sort_deterministic(post_evm))
 }
 
+/// [`sort_native_actions_indexed`] with each action's content hash
+/// (`keccak256(canonical_bytes)`) supplied by the caller: `sort_hashes[i]`
+/// belongs to `actions[i]`. The exec path takes them from the verify pass
+/// (`batch_verify_native_actions_cached_with_sort_hashes`), which absorbs the
+/// canonical bytes once for both the trust-cache key and this hash (section
+/// 92 step 8e). Same keys, same stable sort, so the same lists and positions
+/// as [`sort_native_actions_indexed`]. Debug builds recompute every hash and
+/// assert it. Panics if the lengths differ.
+pub fn sort_native_actions_indexed_with_sort_hashes(
+    actions: Vec<(Address, NativeAction)>,
+    sort_hashes: Vec<B256>,
+) -> (IndexedActions, IndexedActions) {
+    let _ = (actions, sort_hashes);
+    todo!("RED")
+}
+
 /// Deterministic sort key for a native action.
 ///
 /// Uses `NativeAction::canonical_bytes()` instead of `Debug` formatting to ensure

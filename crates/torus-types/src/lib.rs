@@ -1413,6 +1413,29 @@ pub fn verified_cache_key_with_scratch(
     Some(alloy_primitives::keccak256(&*data))
 }
 
+/// Both per-action exec keys from ONE absorb of the action's canonical bytes
+/// `C` (section 92 step 8e: each was a separate full keccak of `C`).
+///
+/// Returns `(sort_hash, cache_key)`:
+/// - `sort_hash = keccak256(C)`: the content hash of the anti-MEV sort key
+///   (`torus_bridge::native_executor::sort_native_actions_indexed`);
+/// - `cache_key = keccak256(C || nonce || v || r || s)`, exactly
+///   [`verified_cache_key`] (`None` for a session action).
+///
+/// Keccak-256 absorbs its input sequentially, so the sponge state after `C` is
+/// the common prefix of both preimages: one copy of it is finalized for the
+/// sort hash, the other absorbs the signature tail for the cache key. Both
+/// values are byte-identical to hashing each preimage separately (pinned by
+/// the frozen-encoder tests). `data` is a scratch buffer; it holds `C`
+/// afterwards.
+pub fn sort_hash_and_verified_cache_key_with_scratch(
+    action: &SignedNativeAction,
+    data: &mut Vec<u8>,
+) -> (B256, Option<B256>) {
+    let _ = (action, data);
+    todo!("RED: absorb canonical bytes once for both keys")
+}
+
 // ============================================================================
 // Order Types
 // ============================================================================

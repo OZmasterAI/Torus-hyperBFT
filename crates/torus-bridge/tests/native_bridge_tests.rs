@@ -788,6 +788,207 @@ fn indexed_sort_matches_the_pre_cut_sort_and_maps_back() {
     }
 }
 
+/// Section 92 step 8e: random blocks (every category, repeated identical
+/// actions, empty) sorted with caller-supplied hashes equal to
+/// keccak(canonical_bytes) give exactly the lists and positions of
+/// `sort_native_actions_indexed`.
+#[test]
+fn sort_with_sort_hashes_matches_indexed_sort_randomized() {
+    use torus_bridge::native_executor::{
+        sort_native_actions_indexed, sort_native_actions_indexed_with_sort_hashes,
+    };
+    let mut seed = 0x51_7cc1_b727_220au64;
+    let mut next = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let bytes = |l: &[(Address, NativeAction)]| -> Vec<(Address, Vec<u8>)> {
+        l.iter().map(|(s, a)| (*s, a.canonical_bytes())).collect()
+    };
+    let order = |market: u64, buy: bool, p: i64, tif| PlaceOrderParams {
+        market_id: 1 + market,
+        is_buy: buy,
+        price: fp(p),
+        quantity: fp(1),
+        order_type: OrderType::Limit,
+        time_in_force: tif,
+        reduce_only: false,
+        client_order_id: None,
+    };
+    let mut categories = std::collections::BTreeSet::new();
+    for round in 0..400 {
+        let len = if round == 0 { 0 } else { next(60) as usize };
+        let mut actions: Vec<(Address, NativeAction)> = Vec::with_capacity(len);
+        for _ in 0..len {
+            let sender = addr(1 + next(3) as u8);
+            let (m, b, p) = (next(2), next(2) == 0, 100 + next(2) as i64);
+            let action = match next(12) {
+                0 => NativeAction::CancelOrder {
+                    order_id: next(3) as u128,
+                },
+                1 => NativeAction::PlaceOrder(order(m, b, p, TimeInForce::IOC)),
+                2 => NativeAction::PlaceOrder(order(m, b, p, TimeInForce::GTC)),
+                3 => NativeAction::PlaceOrderBatch(
+                    (0..next(4))
+                        .map(|_| order(m, b, 100, TimeInForce::GTC))
+                        .collect(),
+                ),
+                4 => NativeAction::TransferToPerp {
+                    amount: U256::from(next(2)),
+                },
+                5 => NativeAction::CancelAllOrders {
+                    market_id: (next(2) == 0).then_some(m),
+                },
+                6 => NativeAction::ModifyOrder {
+                    order_id: next(3) as u128,
+                    new_price: Some(fp(p)),
+                    new_qty: None,
+                },
+                7 => NativeAction::Withdraw {
+                    amount: U256::from(next(3)),
+                    to: addr(9),
+                },
+                8 => NativeAction::Delegate {
+                    validator: addr(7),
+                    amount: U256::from(next(2)),
+                },
+                9 => NativeAction::Vote {
+                    proposal_id: next(2),
+                    option: torus_types::VoteOption::Yes,
+                },
+                10 => NativeAction::CancelByCloid {
+                    market_id: m,
+                    cloid: next(3) as u128,
+                },
+                _ => NativeAction::ClaimRewards,
+            };
+            categories.insert(format!("{:?}", classify_action(&action)));
+            actions.push((sender, action));
+        }
+        let hashes: Vec<B256> = actions
+            .iter()
+            .map(|(_, a)| alloy_primitives::keccak256(a.canonical_bytes()))
+            .collect();
+        let ((pre, pre_idx), (post, post_idx)) = sort_native_actions_indexed(actions.clone());
+        let ((hpre, hpre_idx), (hpost, hpost_idx)) =
+            sort_native_actions_indexed_with_sort_hashes(actions.clone(), hashes);
+        assert_eq!(bytes(&hpre), bytes(&pre), "round {round}: pre-EVM list");
+        assert_eq!(bytes(&hpost), bytes(&post), "round {round}: post-EVM list");
+        assert_eq!(hpre_idx, pre_idx, "round {round}: pre-EVM positions");
+        assert_eq!(hpost_idx, post_idx, "round {round}: post-EVM positions");
+    }
+    assert!(categories.len() >= 7, "categories covered: {categories:?}");
+}
+
+/// Mismatched hash and action counts are a caller bug: panic, never sort
+/// with a shifted key.
+#[test]
+#[should_panic(expected = "sort hash per action")]
+fn sort_with_sort_hashes_rejects_a_length_mismatch() {
+    let actions = vec![(addr(1), NativeAction::ClaimRewards)];
+    let _ = torus_bridge::native_executor::sort_native_actions_indexed_with_sort_hashes(
+        actions,
+        vec![],
+    );
+}
+
+/// The exec pipeline end to end: hashes from the verify pass, carried through
+/// a replay-guard style filter (drops by body position), sort the surviving
+/// actions exactly as `sort_native_actions_indexed` does.
+#[test]
+fn verify_pass_sort_hashes_through_filter_give_the_same_sorted_block() {
+    use torus_bridge::native_executor::{
+        sort_native_actions_indexed, sort_native_actions_indexed_with_sort_hashes,
+    };
+    use torus_types::eip712::{
+        batch_verify_native_actions_cached_with_sort_hashes, sign_native_action,
+    };
+    let keys: Vec<k256::ecdsa::SigningKey> = (1u8..=3)
+        .map(|b| {
+            let mut bytes = [0u8; 32];
+            bytes[31] = b;
+            k256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+        })
+        .collect();
+    let now = 1_700_000_000_000u64;
+    let mut body = Vec::new();
+    for i in 0..90u64 {
+        let action = match i % 5 {
+            0 => NativeAction::CancelOrder { order_id: u128::from(i % 4) },
+            1 => NativeAction::PlaceOrder(PlaceOrderParams {
+                market_id: 1 + i % 2,
+                is_buy: i % 2 == 0,
+                price: fp(100),
+                quantity: fp(1),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::IOC,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            2 => NativeAction::PlaceOrderBatch(
+                (0..(i % 7))
+                    .map(|j| PlaceOrderParams {
+                        market_id: 1,
+                        is_buy: j % 2 == 0,
+                        price: fp(100 + j as i64),
+                        quantity: fp(1),
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GTC,
+                        reduce_only: false,
+                        client_order_id: None,
+                    })
+                    .collect(),
+            ),
+            3 => NativeAction::TransferToPerp { amount: U256::from(i % 3) },
+            _ => NativeAction::ClaimRewards,
+        };
+        let mut signed = sign_native_action(action, now + i, &keys[(i % 3) as usize]);
+        if i % 17 == 0 {
+            // Unrecoverable: dropped like an invalid signature at exec.
+            if let torus_types::ActionSignature::Eip712(ref mut sig) = signed.signature {
+                sig.r = [0; 32];
+            }
+        }
+        body.push(signed);
+    }
+    // Half the block is warm in the trust-cache.
+    let cache: std::collections::HashMap<B256, Address> = body
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 0 && i % 17 != 0)
+        .map(|(_, a)| (torus_types::verified_cache_key(a).unwrap(), a.recover_sender().unwrap()))
+        .collect();
+    let (senders, hashes) = batch_verify_native_actions_cached_with_sort_hashes(
+        &body,
+        now,
+        |_| None,
+        |k| cache.get(k).copied(),
+    );
+    assert_eq!(hashes.len(), body.len());
+    let mut sender_actions = Vec::new();
+    let mut sort_hashes = Vec::new();
+    for (i, signed) in body.iter().enumerate() {
+        let Some(sender) = senders[i] else { continue };
+        if i % 11 == 0 {
+            continue; // replay-guard style skip
+        }
+        sender_actions.push((sender, signed.action.clone()));
+        sort_hashes.push(hashes[i]);
+    }
+    assert!(sender_actions.len() > 60);
+    let bytes = |l: &[(Address, NativeAction)]| -> Vec<(Address, Vec<u8>)> {
+        l.iter().map(|(s, a)| (*s, a.canonical_bytes())).collect()
+    };
+    let ((pre, pre_idx), (post, post_idx)) = sort_native_actions_indexed(sender_actions.clone());
+    let ((hpre, hpre_idx), (hpost, hpost_idx)) =
+        sort_native_actions_indexed_with_sort_hashes(sender_actions, sort_hashes);
+    assert_eq!(bytes(&hpre), bytes(&pre));
+    assert_eq!(bytes(&hpost), bytes(&post));
+    assert_eq!((hpre_idx, hpost_idx), (pre_idx, post_idx));
+}
+
 /// R02 branch 8 (B): `core_writer_due` reports the queue for exactly its
 /// height as `Ok` (a read error is `Err`; the caller fail-stops — driven in
 /// torus-consensus `r02_core_writer_due_read_fault_fail_stops_block`).

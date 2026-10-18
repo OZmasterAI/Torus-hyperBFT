@@ -199,6 +199,15 @@ pub fn eip712_domain_separator() -> B256 {
     eip712_domain_separator_for_chain(network_chain_id())
 }
 
+/// The domain separator of `chain_id`, from `cache` when it holds that chain
+/// (filled on first use), else computed. The network chain id is set once per
+/// process, so the live cache is filled once; a different `chain_id` is never
+/// served the cached value.
+fn domain_separator_cached(cache: &std::sync::OnceLock<(u64, B256)>, chain_id: u64) -> B256 {
+    let _ = (cache, chain_id);
+    todo!("RED")
+}
+
 /// Compute the EIP-712 domain separator for Torus on `chain_id`.
 ///
 /// ```text
@@ -1337,6 +1346,61 @@ pub fn batch_verify_native_actions_cached_with_mode(
             false,
         ),
     }
+}
+
+/// [`batch_verify_native_actions_cached`] that also returns, for every action,
+/// the content hash of its anti-MEV sort key (`keccak256(canonical_bytes)`),
+/// computed in the same pass as the trust-cache key from one absorb of the
+/// canonical bytes ([`crate::sort_hash_and_verified_cache_key_with_scratch`]).
+/// The senders, the `verified_lookup` key sequence and the session lookups are
+/// exactly those of [`batch_verify_native_actions_cached`]; the second vector
+/// is parallel to `actions` (one hash per action, also for an action whose
+/// sender does not resolve). The exec path hands these hashes to
+/// `sort_native_actions_indexed_with_sort_hashes`, so the canonical bytes are
+/// absorbed once per action per block instead of twice.
+pub fn batch_verify_native_actions_cached_with_sort_hashes(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
+) -> (Vec<Option<Address>>, Vec<B256>) {
+    let _ = (actions, timestamp, session_lookup, verified_lookup);
+    todo!("RED")
+}
+
+/// [`batch_verify_impl`] that can also return each action's sort hash
+/// (`want_sort_hashes`; an empty vector otherwise).
+#[allow(clippy::too_many_arguments)]
+fn batch_verify_impl_keyed(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
+    mode: VerifyMode,
+    dedicated: Option<&rayon::ThreadPool>,
+    parallel_keys: bool,
+    want_sort_hashes: bool,
+) -> (Vec<Option<Address>>, Vec<B256>) {
+    let _ = (
+        actions,
+        timestamp,
+        session_lookup,
+        verified_lookup,
+        mode,
+        dedicated,
+        parallel_keys,
+        want_sort_hashes,
+    );
+    todo!("RED")
+}
+
+/// Whether phase 1 has any secp256k1 recovery to do: an EIP-712 action that
+/// missed the trust-cache. When none does, phase 1's output is `cache_hits`
+/// itself (a hit is reused verbatim, a session action is `None` until phase 2),
+/// so the pool dispatch is skipped.
+fn phase1_has_miss(actions: &[SignedNativeAction], cache_hits: &[Option<Address>]) -> bool {
+    let _ = (actions, cache_hits);
+    todo!("RED")
 }
 
 /// Shared body for the env-driven and mode-pinned entrypoints.
@@ -3326,6 +3390,228 @@ mod tests {
             assert_eq!(got.0, serial, "{mode:?}: senders diverged");
             assert_eq!(got.1, serial_keys, "{mode:?}: lookup sequence diverged");
         }
+    }
+
+    // ---- section 92 step 8e: sort hashes in the verify pass, phase-1 skip,
+    // ---- cached domain separator
+
+    /// `batch_verify_impl_keyed` with a recording `verified_lookup`.
+    #[allow(clippy::type_complexity)]
+    fn verify_keyed_recording(
+        actions: &[SignedNativeAction],
+        sessions: &std::collections::HashMap<[u8; 32], SessionData>,
+        cache: &std::collections::HashMap<B256, Address>,
+        mode: VerifyMode,
+        pool: Option<&rayon::ThreadPool>,
+        parallel_keys: bool,
+        want_sort_hashes: bool,
+    ) -> (Vec<Option<Address>>, Vec<B256>, Vec<B256>) {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let (senders, hashes) = super::batch_verify_impl_keyed(
+            actions,
+            TEST_NONCE,
+            |pk: &[u8; 32]| sessions.get(pk).cloned(),
+            |k: &B256| {
+                seen.borrow_mut().push(*k);
+                cache.get(k).copied()
+            },
+            mode,
+            pool,
+            parallel_keys,
+            want_sort_hashes,
+        );
+        (senders, hashes, seen.into_inner())
+    }
+
+    /// The sort hashes from the verify pass equal keccak(canonical_bytes) of
+    /// every action (valid, tampered, session, duplicate), and asking for them
+    /// changes neither the senders nor the trust-cache lookup sequence, in
+    /// every mode, with and without parallel keys.
+    #[test]
+    fn verify_pass_sort_hashes_equal_separate_keccak_and_keep_senders_and_lookups() {
+        let KeysFixture {
+            actions,
+            expected,
+            sessions,
+            cache,
+        } = parallel_keys_fixture();
+        let want_hashes: Vec<B256> = actions
+            .iter()
+            .map(|a| keccak256(a.action.canonical_bytes()))
+            .collect();
+        let (serial, serial_keys) =
+            verify_recording_keys(&actions, &sessions, &cache, VerifyMode::Serial, None, false);
+        assert_eq!(serial, expected);
+        let p2 = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let cases: [(VerifyMode, Option<&rayon::ThreadPool>); 4] = [
+            (VerifyMode::Serial, None),
+            (VerifyMode::Default, None),
+            (VerifyMode::Pool(2), Some(&p2)),
+            (VerifyMode::Pool(3), None),
+        ];
+        for (mode, pool) in cases {
+            for parallel_keys in [false, true] {
+                let (got, hashes, keys) = verify_keyed_recording(
+                    &actions,
+                    &sessions,
+                    &cache,
+                    mode,
+                    pool,
+                    parallel_keys,
+                    true,
+                );
+                assert_eq!(got, serial, "{mode:?} pk={parallel_keys}: senders");
+                assert_eq!(hashes, want_hashes, "{mode:?} pk={parallel_keys}: sort hashes");
+                assert_eq!(keys, serial_keys, "{mode:?} pk={parallel_keys}: lookups");
+                let (got, hashes, keys) = verify_keyed_recording(
+                    &actions,
+                    &sessions,
+                    &cache,
+                    mode,
+                    pool,
+                    parallel_keys,
+                    false,
+                );
+                assert_eq!(got, serial, "{mode:?} pk={parallel_keys}: senders (no hashes)");
+                assert!(hashes.is_empty(), "no sort hashes unless asked");
+                assert_eq!(keys, serial_keys, "{mode:?} pk={parallel_keys}: lookups (no hashes)");
+            }
+        }
+    }
+
+    /// The public entrypoint: same senders as `batch_verify_native_actions_cached`,
+    /// one sort hash per action; an empty block gives two empty vectors.
+    #[test]
+    fn with_sort_hashes_entrypoint_matches_cached_and_handles_empty() {
+        let KeysFixture {
+            actions,
+            sessions,
+            cache,
+            ..
+        } = parallel_keys_fixture();
+        let lookup = |pk: &[u8; 32]| sessions.get(pk).cloned();
+        let hit = |k: &B256| cache.get(k).copied();
+        let plain = batch_verify_native_actions_cached(&actions, TEST_NONCE, lookup, hit);
+        let (senders, hashes) =
+            batch_verify_native_actions_cached_with_sort_hashes(&actions, TEST_NONCE, lookup, hit);
+        assert_eq!(senders, plain);
+        assert_eq!(hashes.len(), actions.len());
+        for (a, h) in actions.iter().zip(&hashes) {
+            assert_eq!(*h, keccak256(a.action.canonical_bytes()));
+        }
+        let (s, h) =
+            batch_verify_native_actions_cached_with_sort_hashes(&[], TEST_NONCE, lookup, hit);
+        assert!(s.is_empty() && h.is_empty());
+    }
+
+    #[test]
+    fn phase1_has_miss_only_for_an_uncached_eip712_action() {
+        use super::phase1_has_miss;
+        let key = test_key();
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let e1 = sign_native_action(NativeAction::ClaimRewards, TEST_NONCE, &key);
+        let e2 = sign_native_action(NativeAction::ClaimUnbonded, TEST_NONCE + 1, &key);
+        let s1 = sign_action_with_session(NativeAction::CancelOrder { order_id: 1 }, TEST_NONCE, &ed);
+        let hit = Some(Address::from([0xAB; 20]));
+        assert!(!phase1_has_miss(&[], &[]), "empty block");
+        assert!(!phase1_has_miss(&[e1.clone(), e2.clone()], &[hit, hit]), "all hit");
+        assert!(!phase1_has_miss(std::slice::from_ref(&s1), &[None]), "session only");
+        assert!(
+            !phase1_has_miss(&[e1.clone(), s1.clone(), e2.clone()], &[hit, None, hit]),
+            "hits and sessions"
+        );
+        assert!(phase1_has_miss(&[e1.clone(), e2.clone()], &[hit, None]), "one EIP-712 miss");
+        assert!(phase1_has_miss(&[s1, e1], &[None, None]), "session plus a miss");
+    }
+
+    /// All EIP-712 actions hit the cache: phase 1 does no recovery (its
+    /// output is the cache hits verbatim; sessions still resolve in phase 2).
+    /// One cold action with a broken signature: recovery runs for it and the
+    /// signature is caught (`None`), while the warm ones keep their hits.
+    #[test]
+    fn all_hit_block_skips_recovery_and_a_miss_still_catches_a_bad_signature() {
+        let key = test_key();
+        let owner = Address::from([0x11; 20]);
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(ed.verifying_key().to_bytes(), make_session(owner));
+        let warm: Vec<SignedNativeAction> = (0..20u64)
+            .map(|i| sign_native_action(keys_order_batch(1 + i % 3, i % 2 == 0, i), TEST_NONCE + i, &key))
+            .collect();
+        let mut cache = std::collections::HashMap::new();
+        let mut want = Vec::new();
+        for (i, a) in warm.iter().enumerate() {
+            let sentinel = Address::from([0xC0 + i as u8; 20]);
+            cache.insert(crate::verified_cache_key(a).unwrap(), sentinel);
+            want.push(Some(sentinel));
+        }
+        let mut block = warm.clone();
+        block.push(sign_action_with_session(
+            NativeAction::CancelOrder { order_id: 9 },
+            TEST_NONCE,
+            &ed,
+        ));
+        want.push(Some(owner));
+        let hits: Vec<Option<Address>> = block
+            .iter()
+            .map(|a| crate::verified_cache_key(a).and_then(|k| cache.get(&k).copied()))
+            .collect();
+        assert!(!super::phase1_has_miss(&block, &hits), "every EIP-712 action is warm");
+        for mode in [VerifyMode::Serial, VerifyMode::Default, VerifyMode::Pool(2)] {
+            let got = batch_verify_native_actions_cached_with_mode(
+                &block,
+                TEST_NONCE,
+                |pk| sessions.get(pk).cloned(),
+                |k| cache.get(k).copied(),
+                mode,
+            );
+            assert_eq!(got, want, "{mode:?}: all-hit block");
+        }
+
+        // One cold action with an unrecoverable signature among warm ones.
+        let mut bad = sign_native_action(NativeAction::ClaimRewards, TEST_NONCE + 99, &key);
+        if let ActionSignature::Eip712(ref mut sig) = bad.signature {
+            sig.r = [0; 32];
+            sig.s = [0; 32];
+        }
+        assert!(bad.recover_sender().is_err(), "zero r/s never recovers");
+        let mut block = warm;
+        block.insert(7, bad);
+        let mut want_miss: Vec<Option<Address>> = want[..20].to_vec();
+        want_miss.insert(7, None);
+        for mode in [VerifyMode::Serial, VerifyMode::Default, VerifyMode::Pool(2)] {
+            let got = batch_verify_native_actions_cached_with_mode(
+                &block,
+                TEST_NONCE,
+                |_| None,
+                |k| cache.get(k).copied(),
+                mode,
+            );
+            assert_eq!(got, want_miss, "{mode:?}: the miss is recovered and caught");
+        }
+    }
+
+    /// The cached domain separator equals a fresh computation, and a cache
+    /// filled for one chain never answers for another.
+    #[test]
+    fn domain_separator_cache_serves_only_its_chain() {
+        let cache = std::sync::OnceLock::new();
+        let d7778 = eip712_domain_separator_for_chain(7778);
+        let d7779 = eip712_domain_separator_for_chain(7779);
+        assert_ne!(d7778, d7779);
+        assert_eq!(super::domain_separator_cached(&cache, 7778), d7778);
+        assert_eq!(super::domain_separator_cached(&cache, 7779), d7779, "other chain");
+        assert_eq!(super::domain_separator_cached(&cache, 7778), d7778, "still cached");
+        assert_eq!(cache.get(), Some(&(7778, d7778)));
+        // The process-wide accessor equals the per-chain computation.
+        assert_eq!(
+            eip712_domain_separator(),
+            eip712_domain_separator_for_chain(network_chain_id())
+        );
+        assert_eq!(eip712_domain_separator(), eip712_domain_separator());
     }
 
     /// L3 acceptance (e): in-proc µbench — N=400 and N=25k mixed ed25519+eip712
