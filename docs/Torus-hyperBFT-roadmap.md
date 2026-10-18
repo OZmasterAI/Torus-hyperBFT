@@ -352,6 +352,18 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   re-sends per node per 300 s). Options: (a) code default 250 ms (one constant + test; 18c recommendation), (b) set
   250 ms in the testnet/validator configs only, (c) keep 3 s and rely on the rate-limiter fix (per-validator header
   budget, archy's follow-up), which makes the re-send a backup. Owner s126: decide pre-testnet.
+  **Decided s128: (a), code default 250 ms**, shipped in one defaults change with PC and F on after the PC vs PC+F run
+  (bench queue step 5b).
+- **Shard custody default.** **Decided s128: OFF by default until T3.1** (section 82: custody on costs 21.6%
+  matched/s, 140 ms per follower validate on hotstuff-algo); the RH4 shard-count fix waits for T3.1. Code flip on
+  `fix/shard-custody-default-off`.
+- **PE (`TORUS_PARALLEL_ENGINE`), testnet activation candidate.** Off by default (owner s128, section 83: on top of
+  PC+F it costs 1.4% matched/s and 2.4% CPU per fill, for +15.7% native blocks/s, -16.8% exec ms per block and -7%
+  block p99). Node-local and byte-identical, so it can be switched on per validator with a restart. Before switching
+  it on in a live network: a WAN A/B (round trips cap the block rate, so the one-host gain may shrink) and a
+  mixed-flag agree check (2 nodes on, 1 off); size the worker count to the validator's cores (bench: 4 workers).
+- **Push-manifest threshold on WAN.** Benches pin 8 MB (`devnet/wsl/env.sh`), devnet compose 6 MB, code default 512 KB.
+  Bench queue step 7b measures the CPU side on one host; the WAN threshold needs a WAN measurement.
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.

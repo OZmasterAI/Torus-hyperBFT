@@ -111,9 +111,30 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    +2.4% [1.020, 1.029]. Blocks are 14% smaller (exec per 1k fills only -3.1%). no_proposal 0 in every cell. PE default:
    owner's call (off by the matched/s rule). Caveat: PC+F's 248k matched/s is below 82's PC alone (254k, cross-campaign)
    at 11.8 vs 6.5 native blocks/s; a paired PC vs PC+F pair would show whether F costs matched/s on top of PC.**
+   **Owner s128: PE off by default.** It stays a node-local opt-in (`TORUS_PARALLEL_ENGINE=N`, read at startup,
+   byte-identical outputs) and is a candidate for activation on the live testnet, after a WAN A/B (one host has no
+   round trips to cap the block rate) and a mixed-flag agree check (2 nodes on, 1 off). Roadmap, "Pre-testnet decisions".
+5b. **PC vs PC+F, paired** (~1 h 10; owner s128; NEXT, before step 7): does F cost matched/s on top of PC (section 83
+   caveat: PC+F 248k at 11.8 native blocks/s vs 82's PC alone 254k at 6.5, cross-campaign)? 2 arms on binary M
+   (`e3d11cb9`, md5 `bf720f9f`), standard load, 300 markets, **600 s cells** (shorter cells overstate blocks/s, section
+   79), warm-up w1 then 3 pairs in A B B A A B order; custody 0; PE, KP, DB off.
+
+   | arm | env |
+   |---|---|
+   | PC (reference) | `TORUS_PARALLEL_CANCEL_ALL=8` |
+   | PC+F | PC + `TORUS_EPOCH_FAST_PATH=1` |
+
+   Report paired ratios (as in 83.3) on matched/s, native blocks/s, fills per native block, exec block_ms, block p50 /
+   p99, CPU-s per 1M, timeouts and `no_proposal` (per 1,000 blocks too). F ships on regardless of a small matched/s
+   cost if its latency gain holds (owner's call on the numbers); this run sizes that trade.
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10). **Not triggered (section 82: C -21.6%); skip.**
 7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
    on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
+   **Owner s128: every arm sets PC + F by env** (`TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1`, the coming
+   defaults; Q12's own N11 arm is the reference, so section 80's baseline is not needed) **and the EVM arms are
+   E11 / E33 / E66** instead of E11 / E22 / E33: at PC+F's ~11.8 native blocks/s an EVM block every 11 heights comes
+   ~3x as often in wall time as in Q5, so the barrier costs more and the useful N is higher. At 10 tx/s an N = 66
+   block carries ~56 txs (66 / 11.8 s x 10), under the 142-tx cap; if the block rate is lower, check the cap rule.
 7b. **Push-manifest threshold: the bench pin vs the code default** (~1 h 20; archy's s124 candidate, owner s128 agreed
    to the baseline shift). The node's default is 512 KB (`HASH_ONLY_PUSH_THRESHOLD`, `torus-network/src/bridge.rs`);
    `devnet/wsl/env.sh` pins 8 MB, so every bench so far pushed full bodies before the proposal and never used the
@@ -125,8 +146,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    matched/s and timeouts within noise, `env.sh` moves to the code default and later benches run it. One host has no
    WAN latency or bandwidth, so this says nothing about the WAN threshold (pre-testnet, measured on WAN).
 8. **Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15000 vs 5000 ms** (n = 2 per arm ABBA, ~45 min plus
-   setup; step 0 binary from `perf/q6-ckpt-slicing`, SHA given by 18c after review; Items, Q6). Decides GO / NO-GO /
-   SHIP-Z for building checkpoint slicing (A1).
+   setup; step 0 binary from `perf/q6-ckpt-slicing` **`9d770519`** (s128: Codex torus re-review of step 0 had one P2,
+   a failed scrape corrupting `commit_db_split`, fixed in 84ea54cf + 9d770519, Codex quick review clean; Items, Q6).
+   Decides GO / NO-GO / SHIP-Z for building checkpoint slicing (A1).
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
    **NOT READY: waits on 18c's Q9 SHA.** Owner s128: custody OFF by default until T3.1, so arm (b) = the RH4 head
    with `main` merged in, custody off (Items, Q9, "Arm b depends on Q10"). Moved here in
@@ -179,7 +201,9 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
     `cond_wait`), start / end gauges `torus_exec_checkpoint_db_write_{start,end}_ms` and a `checkpoint db write` log
     line, the 1 Hz / 10 Hz Dirty-Writeback sampler (`SOAK_DIRTY_HZ=10`), and `torus_commit_manifest_seconds`.
   - Step Z (queue step 8): one step 0 binary, arms `"env": {"TORUS_CHECKPOINT_INTERVAL_MS": "15000"}` vs `"5000"`, ABBA,
-    n = 2 (extend to 4 if ambiguous), hsdb-300m shape, other flags at the campaign A / Q4 defaults. Cut windows from the
+    n = 2 (extend to 4 if ambiguous), hsdb-300m shape. Both arms set the new defaults by env (s128: PC
+    `TORUS_PARALLEL_CANCEL_ALL=8` + F `TORUS_EPOCH_FAST_PATH=1`, plus PE if step 5 adopts it; custody 0) and the push
+    threshold `env.sh` has after step 7b. Cut windows from the
     start / end gauges (DB-write span), not the scrape-widened windows. Report per arm: checkpoint batch bytes and
     DB-write s (W_db), manifest put and persist-wait p99 / max and > 250 ms counts in vs out (X), in-vs-out block p99
     gap (G), overall block p99, matched/s, state-DB bytes/s, Dirty / Writeback max in windows, the stage split.
