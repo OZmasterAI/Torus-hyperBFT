@@ -108,6 +108,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
 6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10). **Not triggered (section 82: C -21.6%); skip.**
 7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
    on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
+7b. **Push-manifest threshold: the bench pin vs the code default** (~1 h 20; archy's s124 candidate, owner s128 agreed
+   to the baseline shift). The node's default is 512 KB (`HASH_ONLY_PUSH_THRESHOLD`, `torus-network/src/bridge.rs`);
+   `devnet/wsl/env.sh` pins 8 MB, so every bench so far pushed full bodies before the proposal and never used the
+   hash-manifest + pull path that production defaults to. 2 arms on binary M, setting only: A =
+   `TORUS_HASH_ONLY_PUSH_THRESHOLD=8000000` (env.sh as today) vs B = `524288`; both arms with the flags step 5 picks
+   set by env (PC + F, plus PE if the owner turns it on). Standard load, 300 markets, 600 s, n = 3, alternating order.
+   Report CPU-s per 1M (expected -3.8 to -4.9%), matched/s, native blocks/s, block p50 / p99, timeouts and
+   `no_proposal`, and the push / pull counts (manifest vs body pushes, bodies pulled, pull fallbacks). If B holds
+   matched/s and timeouts within noise, `env.sh` moves to the code default and later benches run it. One host has no
+   WAN latency or bandwidth, so this says nothing about the WAN threshold (pre-testnet, measured on WAN).
 8. **Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15000 vs 5000 ms** (n = 2 per arm ABBA, ~45 min plus
    setup; step 0 binary from `perf/q6-ckpt-slicing`, SHA given by 18c after review; Items, Q6). Decides GO / NO-GO /
    SHIP-Z for building checkpoint slicing (A1).
