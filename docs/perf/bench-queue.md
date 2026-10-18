@@ -340,6 +340,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    on-CPU ms per 1k fills must fall (CI below 1), and native blocks/s, block p50 / p99 and timeouts per 1,000 blocks
    must not get worse; also report matched/s, CPU-s per 1M, fills per native block and the verify / sort / recovery
    phase timers if present.
+8h. **Deep-book follow-up to 8f** (owner s131; after 8g; ~1 h 30-2 h, estimate; a pre-testnet check). Section 93's
+   M cell changed two things at once (1M accounts and 1M resting orders), and restarts ran only after the load. Same
+   node binary as 8f (main `76204a69`, md5 `7f91438d`) so the cells line up with section 93; tools `c2336e70` or
+   main if it has the pre-load by then; section 93's hand-written driver (`ozarchy-8f-b/campaign.sh`, per-cell genesis,
+   swap stop rule). Standard load, 300 markets, 600 s, n = 1 per cell. (1) **Depth sweep:** the 1M-account genesis
+   with `PRELOAD=` 0 / 250k / 500k / 1M: matched/s, native blocks/s, block p50 / p99, timeouts, exec ms per block,
+   `save_books` ms per block and per 1k fills, fills per native block, resting depth during the load, RSS. Question:
+   does the 8f slowdown follow the resting depth (orders) or is it there at 0 pre-load (accounts)? (2) **Profile:**
+   during the 1M cell, a `perf` profile of the exec thread as section 92 did, split `save_books` into its parts (book
+   row encode, level hashing, DB writes, other). (3) **Crash-kill at 1M:** one more 1M cell with `CRASH_KILL_AT_S`
+   (SIGKILL val1 mid-load, restart): kill -> first commit, replayed blocks, catch-up time, AGREE and one digest, and
+   matched/s around the kill. If the depth curve is unclear at n = 1 (e.g. 0 and 1M within the S-cell spread), report
+   it and 18c decides on replicates.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
