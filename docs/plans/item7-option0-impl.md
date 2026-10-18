@@ -415,9 +415,11 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     status and side rows, and at a dump point the per-CF dump hashes. It asserts the marker in the snapshot equals h
     (a check on the hook site). Hashing may run on a ledger thread after the snapshot is handed over (the snapshot
     pins the bytes). Neither E nor the gate waits on the hook: W pauses only for the snapshot call, and E is never
-    drained between blocks. Header and body rows above h are filtered out (the dispatcher writes them ahead,
-    `persist_committed_block_durably`, the only other writer in the harness while W is in the hook); the filter
-    covers that one CF pair and nothing else (`o0_snapshot_filter_is_dispatch_rows_only`).
+    drained between blocks. Two writers besides W can run while W is in the hook, and their rows are filtered out: the
+    dispatcher's header and body rows above h (it writes them ahead, `persist_committed_block_durably`), and E's
+    trade-history rows (`CF_NATIVE_TRADES`, `CF_NATIVE_USER_TRADES`) of blocks at or above h, written outside the
+    block batch (found in step 0, s131; the plan first named the dispatcher only). The filter covers those rows and
+    nothing else (`o0_snapshot_filter_is_dispatch_rows_only`).
   - `o0_compare(a: &O0Ledger, b: &O0Ledger)`: compares each key present in both (height for `hn`, status and side
     rows; completed height for dumps) as soon as both have it, and never compares markers. A divergence names the
     height and the CF. At the end both nodes drain once, and completeness is asserted: every height in `hn` and
@@ -449,7 +451,8 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     in-flight parent and C hits at interval 0 (the masking, pinned).
   - `o0_planted_skip_parent_caught_only_in_g`: a `test-probes` switch makes the overlay skip the parent layer
     (`with_split_layers`). D mode at interval 0 does not see it (asserted, the reason G exists); G mode reports a
-    divergence. Same for `o0_planted_skip_inflight_checkpoint` (skip C) with an interval.
+    divergence. Same for `o0_planted_skip_inflight_checkpoint` (skip C) with an interval; on today's native-only
+    stream it is caught only with the resident rows R off: with R the native phase reads too little through C (s131).
   - `o0_golden_today_g`: today's code in G mode reproduces the golden (determinism under timing).
   - `o0_marker_keyed_snapshot_sees_pre_resync_mirror` (guard, pins F11): a pipelined interval-0 block that credits an
     EVM account (a fee to an EVM address, so `evm_addrs` is non-empty), with W parked between its batch and
@@ -880,7 +883,8 @@ Planted faults that only an in-flight read exposes (R2). They read through the o
 but skip one layer, so their answer differs only while that layer is not yet durable:
 - `o0_planted_skip_parent_layer` (the EVM section's overlay and journal built without the parent): caught in G mode at
   interval 0; in D mode at interval 0 it passes (asserted: the drain hides it, the reason G exists);
-- `o0_planted_skip_inflight_checkpoint` (without C): caught only in G mode with a held checkpoint;
+- `o0_planted_skip_inflight_checkpoint` (without C): caught only in G mode with a held checkpoint (on the native
+  phase only with R off, task 0.4; the EVM section reads no R, so step 3 must show it caught with R on);
 - `o0_planted_skip_deferred_part` (without L's deferred part): caught with a held merge.
 Task 0.4 proves the same switches on today's native phase before any option 0 code exists.
 
