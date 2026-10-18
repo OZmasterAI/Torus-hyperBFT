@@ -287,7 +287,7 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
     set's n for 64 blocks after a set change, kept in the GC's own batch), benches switch to custody on, and Q9's
     arm (b) runs custody on (Items, Q9).
   - **Decided (owner s128, on section 82: C -21.6% matched/s, 140 ms per validate):** custody OFF by default until
-    T3.1; the RH4 shard-count fix waits for T3.1. 18c flips the node's code default (today only `"0"` disables).
+    T3.1; the RH4 shard-count fix waits for T3.1. Code default flipped on main `d6c4d0d2` (s128): only `TORUS_SHARD_CUSTODY=1` enables.
 
 - **Q12. Option S: does a larger EVM cadence N recover Q5's loss?** (item 7 step 3, `docs/plans/item7-step3-design.md`
   sections 3 S and 6.2; no node code). Q5 (section 80): -12.4% matched/s at N = 11, from the barrier before every EVM

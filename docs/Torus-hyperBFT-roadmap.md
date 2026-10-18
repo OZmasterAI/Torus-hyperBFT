@@ -355,8 +355,8 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   **Decided s128: (a), code default 250 ms**, shipped in one defaults change with PC and F on after the PC vs PC+F run
   (bench queue step 5b).
 - **Shard custody default.** **Decided s128: OFF by default until T3.1** (section 82: custody on costs 21.6%
-  matched/s, 140 ms per follower validate on hotstuff-algo); the RH4 shard-count fix waits for T3.1. Code flip on
-  `fix/shard-custody-default-off`.
+  matched/s, 140 ms per follower validate on hotstuff-algo); the RH4 shard-count fix waits for T3.1. Code default
+  flipped on main `d6c4d0d2` (only `TORUS_SHARD_CUSTODY=1` enables).
 - **PE (`TORUS_PARALLEL_ENGINE`), testnet activation candidate.** Off by default (owner s128, section 83: on top of
   PC+F it costs 1.4% matched/s and 2.4% CPU per fill, for +15.7% native blocks/s, -16.8% exec ms per block and -7%
   block p99). Node-local and byte-identical, so it can be switched on per validator with a restart. Before switching
