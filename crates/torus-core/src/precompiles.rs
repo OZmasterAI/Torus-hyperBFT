@@ -2178,4 +2178,133 @@ mod scan_prefix_metered_tests {
         let mut meter = ReadMeter::with_max(1_000);
         assert!(scan_prefix_metered(&db, CF_NATIVE_MARKETS, b"", None, &mut meter).is_ok());
     }
+
+    // F1 Codex review P1: a scan's storage fault is a LOCAL fault (the EVM
+    // provider fail-stops on `CoreError::is_local_fault`), never an empty
+    // answer. A missing CF used to read as empty: a success with a gas charge
+    // only this node computes.
+
+    use torus_state::{AtomicWriteOp, StateError};
+
+    /// Every (metered, unlimited) x (prefix, no prefix) x max_rows mode.
+    fn modes() -> Vec<(ReadMeter, &'static [u8], Option<u64>)> {
+        let mut out = Vec::new();
+        for prefix in [b"" as &[u8], b"agg"] {
+            for max_rows in [None, Some(3)] {
+                out.push((ReadMeter::with_max(100_000), prefix, max_rows));
+                out.push((ReadMeter::with_max(0), prefix, max_rows));
+                out.push((ReadMeter::unlimited(), prefix, max_rows));
+            }
+        }
+        out
+    }
+
+    /// A DB opened without `missing` (every read of it fails here only).
+    fn db_without(missing: &str) -> (tempfile::TempDir, StateDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cfs = torus_state::cf::ALL_CF_NAMES.iter().copied().filter(|cf| *cf != missing);
+        let db = StateDb::from_existing_db(rocksdb::DB::open_cf(&opts, dir.path(), cfs).unwrap());
+        (dir, db)
+    }
+
+    #[test]
+    fn scan_of_a_missing_cf_is_a_local_fault() {
+        let (_d, db) = db_without(CF_NATIVE_ORACLE);
+        for (mut meter, prefix, max_rows) in modes() {
+            let e = scan_prefix_metered(&db, CF_NATIVE_ORACLE, prefix, max_rows, &mut meter)
+                .expect_err("missing CF scanned as empty");
+            assert!(e.is_local_fault(), "{e}");
+            assert!(e.to_string().contains(CF_NATIVE_ORACLE), "{e}");
+        }
+    }
+
+    /// `StateDb` with the iterator of one CF failing (an I/O error, e.g. a
+    /// corrupt SST block); point reads and other CFs work.
+    #[derive(Clone)]
+    struct FailingScan(StateDb, &'static str);
+
+    impl StateBackend for FailingScan {
+        fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+            self.0.get_cf_raw(cf, key)
+        }
+        fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+            self.0.put_cf_raw(cf, key, value)
+        }
+        fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+            self.0.delete_cf_raw(cf, key)
+        }
+        fn iterate_cf(&self, cf: &str, prefix: Option<&[u8]>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+            if cf == self.1 {
+                return Err(StateError::Io(std::io::Error::other("injected iterator failure")));
+            }
+            self.0.iterate_cf(cf, prefix)
+        }
+        fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+            self.0.atomic_write(ops)
+        }
+    }
+
+    #[test]
+    fn scan_iterator_error_is_a_local_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = FailingScan(StateDb::open(dir.path()).unwrap(), CF_NATIVE_ORACLE);
+        for (mut meter, prefix, max_rows) in modes() {
+            let e = scan_prefix_metered(&db, CF_NATIVE_ORACLE, prefix, max_rows, &mut meter)
+                .expect_err("iterator failure scanned as a result");
+            assert!(e.is_local_fault(), "{e}");
+        }
+    }
+
+    /// An existing but empty CF is the normal empty result, nothing charged.
+    #[test]
+    fn scan_of_an_empty_cf_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        for (mut meter, prefix, max_rows) in modes() {
+            let rows = scan_prefix_metered(&db, CF_NATIVE_ORACLE, prefix, max_rows, &mut meter)
+                .expect("empty CF");
+            assert!(rows.is_empty());
+            assert_eq!(meter.used(), 0);
+        }
+    }
+
+    /// (case, scanned CF, precompile, calldata): every reader that scans.
+    fn scan_readers() -> Vec<(&'static str, &'static str, u16, Vec<u8>)> {
+        let sel = |sig: &str| selector_for(sig).to_be_bytes().to_vec();
+        let staker = [sel("getStakingInfo(address)"), vec![0u8; 12], vec![7u8; 20]].concat();
+        vec![
+            ("getMarkets", CF_NATIVE_MARKETS, ADDR_BALANCE_READER, sel("getMarkets()")),
+            ("getAllPrices", CF_NATIVE_ORACLE, ADDR_ORACLE_READER, sel("getAllPrices()")),
+            ("getStakingInfo", CF_STAKING_DELEGATIONS, ADDR_STAKING_READER, staker),
+            ("getValidators", CF_STAKING_VALIDATORS, ADDR_STAKING_READER, sel("getValidators()")),
+        ]
+    }
+
+    fn run_reader(state: &impl StateBackend, id: u16, data: &[u8], meter: &mut ReadMeter) -> Result<Vec<u8>, CoreError> {
+        execute_precompile_metered(&precompile_address(id), data, &Address::ZERO, U256::ZERO, state, 1, 1_000, false, meter)
+    }
+
+    /// Through each scan reader (metered as in the EVM, and unlimited): a
+    /// missing CF and an iterator error are local faults; an empty CF
+    /// answers.
+    #[test]
+    fn scan_readers_storage_faults_are_local_faults() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy = StateDb::open(dir.path()).unwrap();
+        for (what, cf, id, data) in scan_readers() {
+            for meter in [ReadMeter::with_max(100_000), ReadMeter::unlimited()] {
+                let (_d, db) = db_without(cf);
+                let e = run_reader(&db, id, &data, &mut { meter }).expect_err(what);
+                assert!(e.is_local_fault(), "{what} missing CF: {e}");
+                let failing = FailingScan(healthy.clone(), cf);
+                let e = run_reader(&failing, id, &data, &mut { meter }).expect_err(what);
+                assert!(e.is_local_fault(), "{what} iterator error: {e}");
+                run_reader(&healthy, id, &data, &mut { meter })
+                    .unwrap_or_else(|e| panic!("{what} empty CF: {e}"));
+            }
+        }
+    }
 }

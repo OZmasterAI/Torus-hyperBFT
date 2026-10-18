@@ -372,4 +372,83 @@ mod f1 {
             assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true), "{what}");
         }
     }
+
+    // ------------------------------------------------------------------------
+    // F1 Codex review P1: the SCAN readers. `scan_prefix_metered` read a
+    // missing CF as empty, so getMarkets / getAllPrices / getStakingInfo /
+    // getValidators answered "nothing" with a SUCCESS receipt and a gas
+    // charge only this node computes (Codex repro: getMarkets healthy
+    // status=true gas=38084; missing cf_native_markets status=true
+    // gas=37544). A scan of a CF this node lacks is a local fault like a
+    // point read; an existing but empty CF is still the normal empty answer.
+    // ------------------------------------------------------------------------
+
+    /// (case, the scanned CF, precompile, calldata, the empty-CF answer):
+    /// every reader that scans (`scan_prefix_metered`).
+    fn scan_cases() -> Vec<(&'static str, &'static str, u16, Vec<u8>, Vec<u8>)> {
+        use torus_core::precompiles::abi::encode_arrays_response;
+        use torus_state::cf::{CF_NATIVE_MARKETS, CF_STAKING_DELEGATIONS, CF_STAKING_VALIDATORS};
+        vec![
+            ("0x0801 getMarkets scan", CF_NATIVE_MARKETS, ADDR_BALANCE_READER, call("getMarkets()", &[]), encode_arrays_response(&[&[], &[]])),
+            ("0x0802 getAllPrices scan", CF_NATIVE_ORACLE, ADDR_ORACLE_READER, call("getAllPrices()", &[]), encode_arrays_response(&[&[], &[], &[]])),
+            ("0x0803 getStakingInfo delegation scan", CF_STAKING_DELEGATIONS, ADDR_STAKING_READER, call("getStakingInfo(address)", &[addr_word(ALICE)]), vec![0u8; 128]),
+            ("0x0803 getValidators scan", CF_STAKING_VALIDATORS, ADDR_STAKING_READER, call("getValidators()", &[]), encode_arrays_response(&[&[], &[], &[]])),
+        ]
+    }
+
+    /// A scan of a CF this node's DB lacks aborts the execution with
+    /// `EvmError::LocalFault` on every consensus path (block, overlay, tx)
+    /// and in eth_call: no receipt, never an "empty" success. RED before the
+    /// fix: a success receipt with node-dependent gas.
+    #[test]
+    fn f1_precompile_scan_fault_is_a_local_fault() {
+        for (what, cf, id, data, _) in scan_cases() {
+            let (_d, db) = db_without(cf);
+            let ex = EvmExecutor::new(TORUS_CHAIN_ID);
+            let tx = || tx_to(id, data.clone(), U256::ZERO, 200_000);
+            expect_local_fault(ex.execute_block(&db, &block_cfg(), vec![tx()], true), cf, &format!("{what} (block)"));
+            let overlay = torus_state::StateOverlay::new(db.clone());
+            expect_local_fault(
+                ex.execute_block_with_overlay(&overlay, &block_cfg(), vec![tx()], true),
+                cf,
+                &format!("{what} (overlay)"),
+            );
+            expect_local_fault(ex.execute_tx(&db, &block_cfg(), tx()).map(|(r, _)| r), cf, &format!("{what} (tx)"));
+            expect_local_fault(ex.execute_call(&db, &block_cfg(), tx()).map(|(r, _)| r), cf, &format!("{what} (eth_call)"));
+        }
+    }
+
+    /// Control: on a DB where the scanned CF exists but is empty, each scan
+    /// reader still succeeds with the normal empty answer (block receipt
+    /// true; eth_call output byte-identical to the empty encoding), the same
+    /// gas on the block and eth_call paths.
+    #[test]
+    fn f1_scan_of_an_empty_cf_is_the_empty_answer() {
+        for (what, _cf, id, data, empty) in scan_cases() {
+            let (_d, db) = db_without("no-such-cf");
+            let ex = EvmExecutor::new(TORUS_CHAIN_ID);
+            let b = ex
+                .execute_block(&db, &block_cfg(), vec![tx_to(id, data.clone(), U256::ZERO, 200_000)], true)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true), "{what}");
+            let (r, _) = ex
+                .execute_call(&db, &block_cfg(), tx_to(id, data, U256::ZERO, 200_000))
+                .unwrap_or_else(|e| panic!("{what} (eth_call): {e:?}"));
+            assert!(r.success, "{what} (eth_call)");
+            assert_eq!(r.output, empty, "{what}: the empty answer");
+        }
+    }
+
+    /// Out of gas before the scan stays a revert, even on a DB without the
+    /// scanned CF (the meter refuses before any read).
+    #[test]
+    fn f1_scan_out_of_gas_before_the_read_stays_a_revert() {
+        for (what, cf, id, data, _) in scan_cases() {
+            let (_d, db) = db_without(cf);
+            let b = EvmExecutor::new(TORUS_CHAIN_ID)
+                .execute_block(&db, &block_cfg(), vec![tx_to(id, data, U256::ZERO, 25_000)], true)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, false), "{what}");
+        }
+    }
 }

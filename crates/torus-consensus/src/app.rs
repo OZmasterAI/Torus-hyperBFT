@@ -27540,6 +27540,29 @@ mod crash_recovery_tests {
         );
     }
 
+    /// F1 Codex review P1: a precompile SCAN of a CF this node lacks (0x0803
+    /// getStakingInfo's delegation scan on a DB opened without
+    /// CF_STAKING_DELEGATIONS) fail-stops the block like a point read. RED
+    /// before: `scan_prefix_metered` read the missing CF as empty, so block 2
+    /// applied with a SUCCESS receipt and a gas charge only this node
+    /// computes. (CF_STAKING_DELEGATIONS, not getMarkets' CF_NATIVE_MARKETS:
+    /// block 1 already reads the markets CF outside the EVM.)
+    #[test]
+    fn precompile_scan_fault_fail_stops_block() {
+        use torus_core::precompiles::{precompile_address, ADDR_STAKING_READER};
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x5A; 32]).unwrap();
+        let mut input = alloy_primitives::keccak256(b"getStakingInfo(address)")[..4].to_vec();
+        input.extend_from_slice(&[0u8; 12]);
+        input.extend_from_slice(k256_address(&key).as_slice());
+        assert_storage_cf_fault_fail_stops_then_replays(
+            0x5A,
+            alloy_primitives::TxKind::Call(precompile_address(ADDR_STAKING_READER)),
+            input,
+            torus_state::cf::CF_STAKING_DELEGATIONS,
+            "a precompile scan fault",
+        );
+    }
+
     /// Body of [`evm_db_read_fault_fail_stops_block`] /
     /// [`evm_state_root_compute_fault_fail_stops_block`] /
     /// [`precompile_read_fault_fail_stops_block`]: block 2's one EVM tx (key
