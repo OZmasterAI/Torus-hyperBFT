@@ -142,6 +142,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    E11 / E33 / E66** instead of E11 / E22 / E33: at PC+F's ~11.8 native blocks/s an EVM block every 11 heights comes
    ~3x as often in wall time as in Q5, so the barrier costs more and the useful N is higher. At 10 tx/s an N = 66
    block carries ~56 txs (66 / 11.8 s x 10), under the 142-tx cap; if the block rate is lower, check the cap rule.
+   **Stopped s68 after r1 (ozarchy-q12, binary M `e3d11cb9`, section 85; n = 1 screen, no verdict): E66 could not
+   take the load: the EVM mempool rejected 41% (`mempool full`), landed 3,115 < accepted 3,547 (check failed, campaign
+   stopped), one block at the 142-tx cap; E33 lost 13% of its load the same way. Under EVM load native blocks/s fall
+   12.99 (N11) -> 3.33 / 4.37 / 5.68 (E11 / E33 / E66), so N = 66 blocks average ~117 txs nominal. r1 matched/s
+   N11 246,458, E11 225,060 (0.913), E33 242,841 (0.985, at 87% load), E66 247,708 (1.005, at 52% landed, invalid).
+   Point estimate reads S-INTERIM (L(33) 1.5%), unconfirmed. Next: owner / 18c choose how E33 / E66 get the full
+   load (more senders, lower rate, or fix the pool fill), then r2 (+ r3).**
 7b. **Push-manifest threshold: the bench pin vs the code default** (~1 h 20; archy's s124 candidate, owner s128 agreed
    to the baseline shift). The node's default is 512 KB (`HASH_ONLY_PUSH_THRESHOLD`, `torus-network/src/bridge.rs`);
    `devnet/wsl/env.sh` pins 8 MB, so every bench so far pushed full bodies before the proposal and never used the

@@ -12676,6 +12676,127 @@ second. Timeouts and no_proposal do not rise with twice the blocks (per 1,000 bl
 | r3 | PC | 0/0 | ACCEPT/AGREE/PASS | True | ok | 250,941.9 | 6.121 | 39,169 | 154.7 | 60 / 1,009 | 24.49 | 5.0 | 2.0 | 37.5 | 0.001 | 0 | 0 | 0 | 0:51/0:51/0:51 | 3,691 |
 | r3 | PCF | 0/0 | ACCEPT/AGREE/PASS | True | ok | 248,850.2 | 11.303 | 21,108 | 83.8 | 16 / 896 | 25.00 | 0.0 | 0 | 21.7 | 0.000 | 0 | 0 | 0 | 82:0/82:0/82:0 | 6,816 |
 
+## 85. Step 7, Q12 option S: larger EVM cadence N, PC + F on every arm, standard load + EVM 10 tx/s, 300 markets, 600 s cells, STOPPED after r1 (n = 1 screen; campaign ozarchy-q12, binary M `e3d11cb9`, archy, 2026-10-18)
+
+**Stopped after round 1: E66 could not take the EVM load. At N = 66 the EVM mempool rejected 41% of the load
+(`mempool full`, 2,453 of 6,000 sends, from ~200 s on), 432 accepted txs never landed (landed 3,115 < accepted 3,547:
+the Q5 check landed >= 98% of accepted failed, so the campaign stopped), and one EVM block hit the 142-tx cap (height
+3,696). E33 lost 13% of its load the same way (794 rejected, accepted 8.68 tx/s, landed 5,189). So the E arms did not
+run at the same EVM load, and the larger N, the less EVM traffic they carried. The n = 1 screen: E11 / N11 matched/s 0.913
+(L11 = 8.7%), E33 0.985 (L(33) = 1.5%, at 87% of the load), E66 1.005 (at 52% landed: not a 10 tx/s result). By
+point estimate the rule reads S-INTERIM (L(33) <= 3%, margin -1.5 pt), but nothing here confirms it: n = 1, no CI,
+E33 load-short, E66 invalid. Under EVM load, F's block rate does not survive: native blocks/s 12.99 (N11) -> 3.33
+(E11), block p50 14 -> 208 ms, p99 857 -> 1,751 ms; larger N recovers part of it (E66 5.68 blk/s, p50 72 ms).**
+
+Question (bench queue step 7, Items Q12, owner s128): does a larger EVM cadence N recover Q5's loss (section 80: E/N
+0.876 at N = 11, without PC + F)? Owner s128: every arm PC + F by env; EVM arms E11 / E33 / E66 instead of E11 / E22 /
+E33. Rules (Items, with the owner's arms: Items' 22 / 33 read as 33 / 66): S-INTERIM if L(33) <= 0.03 or L(66) <=
+0.03; STOPGAP if L(66) <= L11 / 2 and above 0.03; REJECT if L(66) > L11 / 2.
+
+### 85.1 Setup
+
+Binary M = main `e3d11cb9` as in sections 82-84 (node md5 `bf720f9f`, staged `ozarchy-s64-stage/m-run`, not rebuilt;
+md5 re-checked on the 3 nodes of every cell). Tools: campaign A's frozen copy does NOT carry the `EVM_BLOCK_INTERVAL`
+knob in its `devnet/wsl/gen-3val-genesis.sh` (82.1 put back `e3d11cb9`'s, to equal `wt/s64-main-e3d11cb9`). New copy
+`ozarchy-q12-tools` = git archive of main `5c6c82f8` (campaign A's freeze commit; `tools/matched-bench` unchanged up
+to main `7b9ebf7a`) with its own `gen-3val-genesis.sh` (knob) + the N = 11 weighted-full genesis (md5 `01168566`);
+new harness worktree `wt/q12-h-5c6c82f8` (detached `5c6c82f8`, `devnet/wsl` equal to the copy as the driver preflight
+requires; vs `wt/s64-main-e3d11cb9` only the knob differs). Knob checked before the launch: unset -> genesis md5
+`d694b81b` (= every earlier cell), 33 -> `c1940314`, 66 -> `56d5d217`, nothing but `.evm.block_interval` differs.
+Spec, checks and the generated driver in `ozarchy-q12-tools/` (`q12-spec.json`, `q12-checks.sh`, `FROZEN.txt`).
+Standard load as 84.1 (Classic, 15 s checkpoints, oracle on, 300 markets, rate 76,000, `BLOCK_CAP=400 RETRY_BUSY=1
+MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, resend 250); D, M, T unset (on); PE, KP,
+DB off (`absent_env`), custody off (`TORUS_SHARD_CUSTODY=0`).
+
+| arm | node env (all arms: `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1`) | harness | genesis N |
+|---|---|---|---|
+| N11 (reference) | - | native only | 11 (absent = node default) |
+| E11 | - | + `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40` | 11 (absent) |
+| E33 | `EVM_BLOCK_INTERVAL=33` (run-cell.sh lifts it into the genesis) | + EVM load | 33 |
+| E66 | `EVM_BLOCK_INTERVAL=66` | + EVM load | 66 |
+
+Plan: smoke (E66, 60 s), warm-up w1 (N11, 300 s), r1 N11, E11, E33, E66, r2 E66, E33, E11, N11; 600 s cells. Ran:
+smoke, w1, r1 (07:02-08:05); the campaign stopped on r1-E66's check (r2 not run; rerun queued, not run).
+
+Validity: smoke + w1 + 4 r1 cells rc 0, ACCEPT AGREE PASS, md5 `bf720f9f` on 3 nodes, 0 panic / fail-stop lines (re-checked
+from raw files); 94 CHECK OK, 2 CHECK FAIL (both r1-E66's EVM check), 0 HARD FINDING. Took effect on every node of
+every cell: `epoch fast path ON` once per node, every boundary block without EVM txs pipelined (33-91 per node), the 1-2
+boundary heights per E cell that carry EVM txs ran serial (the barrier), PE spawns 0, no `TORUS_CKPT_DEFER_BOOKS`
+line, custody seconds <= 0.0018 s per node; `genesis evm.block_interval=N` logged with the arm's N and
+`.evm_load.interval` = N in every E cell; EVM heights `% N` = `[0]`, off-cadence blocks 0; N11 cells no EVM load.
+r1-N11 246,458 matched/s at 12.99 native blocks/s matches section 84's PCF (248,638 at 12.04; -0.9%, cross-campaign).
+
+### 85.2 Arm values (r1, n = 1 each; `q12.txt`)
+
+| metric | N11 | E11 | E33 | E66 (invalid: load short) |
+|---|---|---|---|---|
+| matched/s | 246,458 | 225,060 | 242,841 | 247,708 |
+| native blocks/s | 12.990 | 3.334 | 4.372 | 5.679 |
+| fills per native block | 18,275 | 66,161 | 54,683 | 41,687 |
+| exec block_ms | 71.8 | 289.8 | 223.0 | 167.0 |
+| block p50 / p99 ms | 14 / 857 | 208 / 1,751 | 128 / 1,391 | 72 / 1,135 |
+| CPU-s / 1M fills | 24.85 | 25.49 | 24.94 | 24.71 |
+| EVM sent / accepted / landed | - | 6,000 / 6,000 / 6,000 | 6,000 / 5,206 / 5,189 | 6,000 / 3,547 / 3,115 |
+| EVM blocks / s (scan) | - | 0.310 | 0.140 | 0.090 |
+| txs per EVM block mean / max (scan) | - | 32.3 / 56 | 61.8 / 124 | 57.7 / 142 (cap) |
+| EVM height interval p50 / p99 s (val1) | - | 3.89 / 8.16 | 8.17 / 23.25 | 11.70 / 27.00 |
+| exec idle before an EVM height mean / p50 ms (val1) | - | 412 / 491 | 612 / 568 | 743 / 796 |
+| exec idle before EVM heights, % of window | - | 12.5 | 8.1 | 6.4 |
+| exec ms at EVM heights / other heights (val1) | - / 74 | 412 / 242 | 322 / 206 | 249 / 163 |
+| commit -> exec lag p50 s (val1) | 1.7 | 18.6 | 12.4 | 9.3 |
+| EVM exec ms per EVM block (`torus_exec_evm_seconds`) | - | 32.7 | 34.4 | 34.0 |
+| checkpoints / min, mean layer MB | 7.7, 126 | 19.7, 86 | 10.6, 110 | 8.6, 114 |
+| timeouts / no_proposal (native blocks) | 1 / 0 (7,833) | 7 / 2 (2,007) | 8 / 3 (2,632) | 10 / 2 (3,419) |
+| per 1,000 native blocks | 0.13 / 0 | 3.49 / 1.00 | 3.04 / 1.14 | 2.92 / 0.58 |
+
+E / N11 (r1 only, no CI): matched/s 0.9132 / 0.9853 / 1.0051 (E11 / E33 / E66); native blocks/s 0.257 / 0.337 / 0.437;
+fills per native block 3.62 / 2.99 / 2.28; exec block_ms 4.03 / 3.10 / 2.32; block p50 14.9x / 9.2x / 5.1x; p99
+2.04 / 1.62 / 1.32; CPU-s / 1M 1.026 / 1.004 / 0.994. L(N) = 1 - E/N11: L11 0.087, L(33) 0.015, L(66) -0.005.
+
+142-tx cap (owner s128): E66's native rate (5.68 blocks/s) is above the ~4.65 the owner's estimate needs, but EVM heights
+came every 11.7 s (p50; all heights 6.9 / s incl. empty), so 10 tx/s would put ~117 txs in an average N = 66 block. In
+the first ~200 s the blocks carried 76-137 txs; then the mempool began to reject (`mempool full`; the EVM pool's
+per-sender limit is 16, `crates/torus-mempool/src/lib.rs:119`, 40 senders), rejects concentrated on 2 of the 3 RPCs
+(78 / 1,307 / 1,068), and blocks fell to 20-55 txs; one block (height 3,696) held 142 = the cap. **Flag: E66 is
+mempool- and cap-bound (landed < accepted), not a 10 tx/s cell.** E33: max 124 (under the cap) but 794 sends rejected.
+E11: no rejects. Cause of the rejects at N = 33 / 66 not established here (pending txs per sender at 10 tx/s / 40
+senders should stay well under 16 at these intervals; EVM heights were proposed unevenly: E66 val0 32, val1 15, val2 7
+of 54; E33 16 / 45 / 23 of 84; E11 63 / 61 / 62).
+
+Reading (n = 1): the barrier cost per EVM block rises with N (idle before an EVM height 412 -> 612 -> 743 ms mean,
+extra exec ms at EVM heights +170 / +116 / +86 ms over other heights) while EVM blocks per second fall 3.4x, so the
+total idle share falls (12.5 -> 8.1 -> 6.4%): S scales a little worse than 1 / N, consistent with the forced checkpoint
+growing with the window (86 -> 110 -> 114 MB per layer). E11's checkpoints / min (19.7) are 2.5x N11's (7.7): every
+EVM height forces one. EVM latency: inclusion ~ interval / 2 + lag = ~20.6 / ~16.5 / ~15.1 s (E11 / E33 / E66): the
+exec backlog (lag 18.6 s at E11) dominates, and a larger N shortens it. Cross-campaign (section 80, no PC + F, same
+binary): N 241,611 at 4.4-5.1 native blocks/s, E 211,649 at 2.9 (0.876); here N11 246,458 at 12.99, E11 225,060 at
+3.33 (0.913): PC + F narrows the matched/s loss at N = 11 (12.4% -> 8.7%) but not the block-rate collapse under EVM
+load.
+
+### 85.3 Next
+
+* Owner / 18c: decide how to run E33 / E66 at the same EVM load before any Q12 verdict. Options: more EVM senders
+  (e.g. `EVM_LOAD_SENDERS=160`: 4x fewer pending txs per sender), a lower EVM rate on every E arm, or find why the pool
+  fills at N = 33 / 66 (per-sender 16, the uneven proposers, txs not gossiped). Then r2 (and r3 if a rule sits within
+  1.5 points) with the same spec; the check `landed >= 98% accepted` stays hard, and `accepted == sent` should become
+  one (E33 passed with 13% rejected).
+* The n = 1 screen points to S-INTERIM via L(33) (1.5%), but at 87% of the load; not a verdict.
+* Data: `~/bench-results-matched/ozarchy-q12-300m-{smoke-s0,w1,r1-N11,r1-E11,r1-E33,r1-E66}` (each with `q12-disk.txt`),
+  campaign files `ozarchy-q12-run/campaign/` (`campaign.log`, `cells.tsv`, `rerun-queue.tsv`, `smoke/`), tools
+  `ozarchy-q12-tools/` (spec, checks, driver, `FROZEN.txt`), analysis `ozarchy-q12-run/analyst/` (`q12.txt`,
+  `q12-analyse.py`: q5b's script + q5c's EVM-height views from the val1 log, checkpoints from `ckpt-samples.txt`).
+
+### 85.4 Cells (`q12.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | flag | genesis N | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | no_proposal | EVM accepted / landed / blocks / mean / max txs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| smoke | E66 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 66 | 242,441.7 | 6.667 | 25,511 | 98.8 | 50 / 1,002 | 24.79 | 0 | 0 | 600 / 600 / 8 / 75.0 / 125 (60 s) |
+| w1 | N11 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 11 | 251,741.0 | 12.450 | 18,643 | 72.6 | 15 / 845 | 24.51 | 1 | 0 | - |
+| r1 | N11 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 11 | 246,457.8 | 12.990 | 18,275 | 71.8 | 14 / 857 | 24.85 | 1 | 0 | - |
+| r1 | E11 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 11 | 225,059.9 | 3.334 | 66,161 | 289.8 | 208 / 1,751 | 25.49 | 7 | 2 | 6,000 / 6,000 / 186 / 32.3 / 56 |
+| r1 | E33 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 33 | 242,841.1 | 4.372 | 54,683 | 223.0 | 128 / 1,391 | 24.94 | 8 | 3 | 5,206 / 5,189 / 84 / 61.8 / 124 |
+| r1 | E66 | 0/0 | ACCEPT/AGREE/PASS | True | bad:check | 66 | 247,708.3 | 5.679 | 41,687 | 167.0 | 72 / 1,135 | 24.71 | 10 | 2 | 3,547 / 3,115 / 54 / 57.7 / 142 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
