@@ -242,6 +242,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    wait per 15 s window, which section 81 put at ~1 s in 3 of 4 cells), `save_order_books`, `flush_all`, exec
    off-CPU share and hotstuff-algo blocked on the exec channel; plus exec ms per native block and per 1k fills. Say
    whether Phase 5's remaining scope (steps 3 and 7) still targets the biggest rows.
+   **Done s68 (ozarchy-q8re, main `fbe36391` node `cb8d8ad8`, nothing set, ONP, 600 s, n = 3, 4 / 4 cells valid,
+   section 90).** `pipeline_barrier` 0.00 s in 9 / 9 off-CPU windows (81: 0.09-1.15 s per 15 s), 0 blocks
+   `pipelined=false`; residual untimed 12.9-15.8 -> 6.0-7.7 ms per block. Upkeep 0.60-0.73 -> 0.86-1.02 ms per
+   native block; flush-worker checkpoint 670-788 -> 804-935 ms each (on W). Exec on-CPU 131-133 -> 75-83 ms per
+   native block, mostly smaller blocks (native blk/s 5.6-5.9 -> 7.7-9.9, fills/blk 36-41k -> 25-32k); per 1k fills
+   2.99 -> 2.46-2.67 ms. `save_order_books` 7.7-8.0 -> 5.6-5.9 ms per native block, 0.24-0.27 -> 0.22-0.23 ms per 1k
+   fills; `flush_all` 14.1-14.6 -> 10.4-10.9 ms (13-14% of exec, still the largest). Exec off-CPU 20-22% -> 25-29%
+   (pool waits); hotstuff blocked on the exec channel 30-33% -> 0-26% per window (6 of 9 windows 19-26%). matched/s
+   259.2k / 265.3k / 259.6k, block p50 / p99 21-39 / 892-938 ms, CPU-s per 1M 23.0-23.5. Phase 5: step 3 targets
+   a mid-size row (save_books 7%); the larger ones are `flush_all` (step 2, 8d), Keccak 12% and the pool waits.
 8d. **Phase 5 step 2 A/B: main vs step 2** (owner s128; right after 8c; ~1 h 10). Does step 2 (`Users` mutated in
    place, write-through, dirty-set drain) speed up execution in a real run? The builder's release microbench showed
    the exec thread only level with Phase 4 (~160 ms per write set) and ~75 ms saved on the flush worker. Two binaries:
