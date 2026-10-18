@@ -142,6 +142,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    E11 / E33 / E66** instead of E11 / E22 / E33: at PC+F's ~11.8 native blocks/s an EVM block every 11 heights comes
    ~3x as often in wall time as in Q5, so the barrier costs more and the useful N is higher. At 10 tx/s an N = 66
    block carries ~56 txs (66 / 11.8 s x 10), under the 142-tx cap; if the block rate is lower, check the cap rule.
+   **Stopped s68 after r1 (ozarchy-q12, binary M `e3d11cb9`, section 85; n = 1 screen, no verdict): E66 could not
+   take the load: the EVM mempool rejected 41% (`mempool full`), landed 3,115 < accepted 3,547 (check failed, campaign
+   stopped), one block at the 142-tx cap; E33 lost 13% of its load the same way. Under EVM load native blocks/s fall
+   12.99 (N11) -> 3.33 / 4.37 / 5.68 (E11 / E33 / E66), so N = 66 blocks average ~117 txs nominal. r1 matched/s
+   N11 246,458, E11 225,060 (0.913), E33 242,841 (0.985, at 87% load), E66 247,708 (1.005, at 52% landed, invalid).
+   Point estimate reads S-INTERIM (L(33) 1.5%), unconfirmed. Next: owner / 18c choose how E33 / E66 get the full
+   load (more senders, lower rate, or fix the pool fill), then r2 (+ r3).**
 7b. **Push-manifest threshold: the bench pin vs the code default** (~1 h 20; archy's s124 candidate, owner s128 agreed
    to the baseline shift). The node's default is 512 KB (`HASH_ONLY_PUSH_THRESHOLD`, `torus-network/src/bridge.rs`);
    `devnet/wsl/env.sh` pins 8 MB, so every bench so far pushed full bodies before the proposal and never used the
@@ -152,10 +159,28 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `no_proposal`, and the push / pull counts (manifest vs body pushes, bodies pulled, pull fallbacks). If B holds
    matched/s and timeouts within noise, `env.sh` moves to the code default and later benches run it. One host has no
    WAN latency or bandwidth, so this says nothing about the WAN threshold (pre-testnet, measured on WAN).
+   **Done s68 (ozarchy-q7b, binary M `e3d11cb9`, both arms PC + F, 7 / 7 valid, section 86): B (P512K) / A (P8M)
+   CPU-s per 1M fills 0.9412 [0.9341, 0.9484] (-5.9%, 24.92 -> 23.46) and matched/s 1.0434 [1.0400, 1.0467] (+4.3%,
+   246,971 -> 257,680; all 3 rounds 1.042-1.045); native blocks/s, block p50 / p99, exec block_ms within noise (12.50
+   -> 12.19, 15 -> 15 ms, 856 -> 830 ms); node RSS -10% (CI spans 1). Timeouts 2 vs 5 (0.09 vs 0.23 per 1,000 native
+   blocks), no_proposal 0 vs 0: within noise. B pushes 69% of pre-proposal sets as manifests (full-body volume 10.1 GB
+   -> 0.12 GB per cell), receivers pre-warm ~83k bodies per cell, 0 pull failures / fallback pulls / recovery
+   timeouts. Rule met: `env.sh` moves to the code default (18c); one host, says nothing about the WAN threshold.**
 8. **Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15000 vs 5000 ms** (n = 2 per arm ABBA, ~45 min plus
    setup; step 0 binary from `perf/q6-ckpt-slicing` **`9d770519`** (s128: Codex torus re-review of step 0 had one P2,
    a failed scrape corrupting `commit_db_split`, fixed in 84ea54cf + 9d770519, Codex quick review clean; Items, Q6).
    Decides GO / NO-GO / SHIP-Z for building checkpoint slicing (A1).
+   **Done s68 (ozarchy-stepz, binary Z `9d770519` node md5 `0d234898`, both arms PC + F + push threshold 524288,
+   n = 2 ABBA, 5 / 5 valid, section 87): no GO / NO-GO; the rule's "anything else" branch. W_db fell only 26.5% (407
+   -> 299 ms per checkpoint, rounds 0.685 / 0.789; batch 108 -> 85 MB), short of the 40% bar, because attest heights
+   (h % 100) already checkpoint Z15 every ~100 blocks (~5.8 s at ~17 blocks/s; the 15 s interval never fires). Within
+   that step, G fell in proportion (497 -> 375 ms, -25%) and the in-window manifest wall fell 22% (7.56 -> 5.88 ms per
+   call); X at 1 Hz (in - out) fell 11%. The step 0 split: the manifest put waits in the write queue behind the batch
+   (pre/post + residual; mutex and cond-wait 0), i.e. "A1 aimed right". Not SHIP-Z: G ~375 ms, and Z5 costs native
+   blocks/s 0.777 [0.555, 1.089] (16.97 -> 13.18), block p50 +15% [1.080, 1.236], p99 556 -> 780 ms, state-DB writes
+   +10%; matched/s 0.991 [0.905, 1.085], CPU per fill flat. Not extended to n = 4 (more rounds of the same arms cannot
+   reach -40%). Next, decided with 18c: a stronger zero-code arm (`TORUS_CHECKPOINT_MAX_BYTES` ~40-50 MB or 2,000 ms),
+   or build A1 on this evidence.**
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
    **READY (s128): arm (b) binary = `perf/rh4-da-body-gc` `b2dd21a4`** (main e1be6c15 merged into 4514573f, no
    conflicts; workspace 4069 passed / 0 failed, clippy no new warnings). Owner s128: custody OFF by default until T3.1,
