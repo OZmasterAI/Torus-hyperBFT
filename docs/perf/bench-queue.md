@@ -159,6 +159,13 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `no_proposal`, and the push / pull counts (manifest vs body pushes, bodies pulled, pull fallbacks). If B holds
    matched/s and timeouts within noise, `env.sh` moves to the code default and later benches run it. One host has no
    WAN latency or bandwidth, so this says nothing about the WAN threshold (pre-testnet, measured on WAN).
+   **Done s68 (ozarchy-q7b, binary M `e3d11cb9`, both arms PC + F, 7 / 7 valid, section 86): B (P512K) / A (P8M)
+   CPU-s per 1M fills 0.9412 [0.9341, 0.9484] (-5.9%, 24.92 -> 23.46) and matched/s 1.0434 [1.0400, 1.0467] (+4.3%,
+   246,971 -> 257,680; all 3 rounds 1.042-1.045); native blocks/s, block p50 / p99, exec block_ms within noise (12.50
+   -> 12.19, 15 -> 15 ms, 856 -> 830 ms); node RSS -10% (CI spans 1). Timeouts 2 vs 5 (0.09 vs 0.23 per 1,000 native
+   blocks), no_proposal 0 vs 0: within noise. B pushes 69% of pre-proposal sets as manifests (full-body volume 10.1 GB
+   -> 0.12 GB per cell), receivers pre-warm ~83k bodies per cell, 0 pull failures / fallback pulls / recovery
+   timeouts. Rule met: `env.sh` moves to the code default (18c); one host, says nothing about the WAN threshold.**
 8. **Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15000 vs 5000 ms** (n = 2 per arm ABBA, ~45 min plus
    setup; step 0 binary from `perf/q6-ckpt-slicing` **`9d770519`** (s128: Codex torus re-review of step 0 had one P2,
    a failed scrape corrupting `commit_db_split`, fixed in 84ea54cf + 9d770519, Codex quick review clean; Items, Q6).

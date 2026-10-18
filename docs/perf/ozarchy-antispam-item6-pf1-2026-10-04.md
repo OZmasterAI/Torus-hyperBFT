@@ -12797,6 +12797,149 @@ load.
 | r1 | E33 | 0/0 | ACCEPT/AGREE/PASS | True | ok | 33 | 242,841.1 | 4.372 | 54,683 | 223.0 | 128 / 1,391 | 24.94 | 8 | 3 | 5,206 / 5,189 / 84 / 61.8 / 124 |
 | r1 | E66 | 0/0 | ACCEPT/AGREE/PASS | True | bad:check | 66 | 247,708.3 | 5.679 | 41,687 | 167.0 | 72 / 1,135 | 24.71 | 10 | 2 | 3,547 / 3,115 / 54 / 57.7 / 142 |
 
+## 86. Step 7b, push-manifest threshold: the bench pin (8 MB) vs the code default (512 KB), PC + F on both arms, standard load, 300 markets, 600 s cells, n = 3 (campaign ozarchy-q7b, binary M `e3d11cb9`, archy, 2026-10-18)
+
+**The code default is cheaper and faster on one host: P512K / P8M matched/s 1.0434 [1.0400, 1.0467] (+4.3%, 246,971
+-> 257,680; all 3 rounds 1.042-1.045) and CPU-s per 1M fills 0.9412 [0.9341, 0.9484] (-5.9%, 24.92 -> 23.46; a bit
+more than the -3.8 to -4.9% expected). Latency unchanged within noise: native blocks/s 0.976 [0.893, 1.066] (12.50 ->
+12.19), block p50 15 -> 15 ms, p99 856 -> 830 ms (0.970 [0.879, 1.070]); exec per 1k fills -3.6% [0.9527, 0.9743].
+Node RSS -10% (4,542 -> 4,065 MB mean; CI spans 1). Timeouts 2 vs 5 over ~22k native blocks each (0.09 vs 0.23 per
+1,000), no_proposal 0 vs 0: within noise (5 of 7 in one arm, one-sided binomial p = 0.23). With 512 KB, 69% of
+pre-proposal pushes go out as hash manifests and full-body push volume falls from ~10.1 GB to ~0.12 GB per cell (3
+nodes); the receivers pre-warm ~83k bodies per cell by pull; 0 pull failures, 0 fallback pulls, 0 recovery timeouts on
+both arms. The queue's rule (P512K holds matched/s and timeouts within noise) is met: env.sh can move to the code
+default (18c). One host, no WAN latency or bandwidth: this says nothing about the WAN threshold.**
+
+Question (bench queue step 7b, archy s124 candidate, owner s128): `devnet/wsl/env.sh` pins
+`TORUS_HASH_ONLY_PUSH_THRESHOLD=8000000`, so every bench so far pushed full bodies before the proposal and never used
+the hash-manifest + pull path that production defaults to (`HASH_ONLY_PUSH_THRESHOLD` = 512 KB,
+`crates/torus-network/src/bridge.rs:97`). What does the bench baseline cost or gain at the code default?
+
+### 86.1 Setup
+
+Binary M = main `e3d11cb9` as in sections 82-85 (node md5 `bf720f9f`, staged `ozarchy-s64-stage/m-run`, not rebuilt;
+md5 re-checked on the 3 nodes of every cell). Tools: campaign A's frozen copy unchanged (`ozarchy-campA-tools`, main
+`5c6c82f8`), harness worktree `wt/s64-main-e3d11cb9`; spec, checks and the generated driver in `ozarchy-q7b-tools/`
+(`q7b-spec.json`, `q7b-checks.sh`, `FROZEN.txt`; copies of step 5b's with arms P8M / P512K). Same standard load as 84.1
+(Classic, 15 s checkpoints, oracle on, 300 markets, rate 76,000, `BLOCK_CAP=400 RETRY_BUSY=1 MAX_IN_FLIGHT=4
+OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, native only, resend 250). Both arms PC + F
+by env; D, M, T unset (on); PE, KP, DB off; custody off (`TORUS_SHARD_CUSTODY=0`); `TORUS_DIRECT_PUSH_BODY_BYTES`
+absent (the direct-push floor stays at its 8,000,000 default).
+
+| arm | env |
+|---|---|
+| P8M (reference, env.sh as today) | `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1 TORUS_HASH_ONLY_PUSH_THRESHOLD=8000000` |
+| P512K (code default) | `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1 TORUS_HASH_ONLY_PUSH_THRESHOLD=524288` |
+
+The threshold is set explicitly in each arm's env (run-cell.sh scrubs `TORUS_*`; env.sh:45 uses the default-if-unset
+form, so the arm value wins). The node reads it once and clamps it to the direct-push floor
+(`hash_only_push_threshold()`, `bridge.rs:118`: `min(requested, caps::direct_push_body_bytes())`, with a WARN `above
+fleet direct-msg floor -- clamped` if it clamps); 8,000,000 = the floor, so neither arm clamps. A body set larger than
+the threshold goes out as a hash manifest (`pre-proposal HASH-ONLY manifest push`, swarm.rs), and the receivers pull
+the bodies they miss from the proposer (`pre-proposal HASH manifest -> pre-warm pull of MISSING bodies`, count =
+hashes requested); smaller sets go out as `pre-proposal FULL-BODY push` (bytes logged).
+
+Smoke (P512K, 60 s, 269,424 matched/s) and warm-up w1 (P8M, 300 s), then r1 P8M, P512K; r2 P512K, P8M; r3 P8M,
+P512K; 600 s cells; 08:19-09:50. Fresh data dirs every cell (`CLEAN=1`), free disk 111-117 GB after each cell.
+
+Validity: smoke + 7 / 7 cells rc 0, ACCEPT AGREE PASS, md5 `bf720f9f` on 3 nodes, 0 panic / fail-stop lines (re-checked
+from raw files); 127 CHECK OK (19 in the smoke), 0 CHECK FAIL, 0 CELL-FLAG, 0 HARD FINDING, no reruns. Took effect on
+every node of every cell (`q7pushchk`): the arm's threshold on all 3 node environs, no clamp warning; P512K cells
+774-910 manifests per node, every full-body push <= 522,943 B (<= 524,288), 599-698 pre-warm pull lines per node; P8M
+cells 0-1 manifests per node (<= 0.1% of pushes), largest full-body push 7.74-7.98 MB per node. F on (as 84.1: `epoch
+fast path ON` once per node, every boundary block pipelined, 85-93 per node per cell), PE spawns 0, no DB line, custody
+seconds ~0. The new push check was run before the launch on section 84's r1-PCF cell as P8M (OK: 0 manifests, max 7.9
+MB) and on a scratch copy with the env edited to 524288 (FAIL on 0 manifests, then on the 7.9 MB body, then on 0
+pre-warm lines, as it should).
+
+### 86.2 Arm means (n = 3 each; `q7b.txt`)
+
+| arm | matched/s (diff, %) | CPU-s / 1M | native blk/s | fills / native blk | block p50 / p99 ms | exec block_ms | exec ms / 1k fills | hotstuff-algo ms / blk | node RSS mean / max MB | timeouts / no_proposal (sum of 3) | per 1,000 native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| P8M | 246,971 | 24.92 | 12.495 | 18,994 | 15 / 856 | 75.3 | 3.962 | 19.8 | 4,542 / 5,730 | 2 / 0 (22,566 blocks) | 0.089 / 0 |
+| P512K | 257,680 (+10,709, +4.34%) | 23.46 | 12.188 | 20,279 | 15 / 830 | 77.4 | 3.817 | 20.4 | 4,065 / 5,203 | 5 / 0 (22,035 blocks) | 0.227 / 0 |
+
+Replicate CV of matched/s: P8M 0.17% (r1 247,424, r2 246,566, r3 246,922), P512K 0.05% (257,814, 257,590, 257,635);
+CPU-s / 1M: P8M 24.94 / 24.94 / 24.88, P512K 23.53 / 23.39 / 23.45. The arms separate in every round, no drift in run
+order (w1 254,427 at 300 s, then 247,424, 257,814, 257,590, 246,566, 246,922, 257,635). Timeouts per cell: P8M 0 / 2 /
+0, P512K 1 / 4 / 0. RSS is the 1 Hz VmRSS (`host-1hz.tsv`) over the load window, mean of the 3 nodes.
+
+Cross-campaign context only (not paired): P8M here = section 84's PCF arm (same env; env.sh pinned 8 MB there too):
+246,971 matched/s at 12.50 native blocks/s vs 248,638 at 12.04 (-0.7%), CPU-s / 1M 24.92 vs 24.89.
+
+### 86.3 Paired P512K / P8M (geomean of per-round ratios, 95% CI, 2 df)
+
+| metric | r1 / r2 / r3 | P512K / P8M |
+|---|---|---|
+| CPU-s / 1M fills | 0.9434 / 0.9380 / 0.9423 | 0.9412 [0.9341, 0.9484] |
+| matched/s | 1.0420 / 1.0447 / 1.0434 | 1.0434 [1.0400, 1.0467] |
+| native blk/s | 0.9897 / 0.9372 / 1.0021 | 0.9760 [0.8933, 1.0662] |
+| fills / native blk | 1.0562 / 1.1087 / 1.0409 | 1.0682 [0.9841, 1.1595] |
+| exec block_ms | 1.0209 / 1.0702 / 0.9977 | 1.0292 [0.9417, 1.1247] |
+| exec ms per 1k fills | 0.9666 / 0.9653 / 0.9585 | 0.9635 [0.9527, 0.9743] |
+| block p50 | 0.9979 / 1.0041 / 1.0324 | 1.0114 [0.9668, 1.0580] |
+| block p99 | 0.9590 / 1.0131 / 0.9380 | 0.9695 [0.8786, 1.0699] |
+| hotstuff-algo ms / blk | 1.0238 / 1.0650 / 1.0132 | 1.0338 [0.9683, 1.1036] |
+| node RSS mean | 0.8160 / 0.9134 / 0.9635 | 0.8955 [0.7254, 1.1054] |
+| node RSS max | 0.8730 / 0.8915 / 0.9653 | 0.9091 [0.7969, 1.0370] |
+
+Timeouts and no_proposal are too few for a paired ratio (0-4 per cell); see the per-1,000-block rates in 86.2.
+
+### 86.4 Push / pull counts (sum of the 3 nodes per cell; per node in `q7b.txt`)
+
+Manifest / full-body pushes: the node logs' push lines (summary `.dissemination`); full-body MB = sum of the logged
+bytes; pre-warm = receiver pull lines / bodies requested; served = native-DA requests served; the rest are node metrics
+(after - before the cell). Failure keys = body fetch exhausted, sync fallback, native-DA / block-data outbound
+failure, header-first body starvation, exec-backlog pacing lines.
+
+| cell | arm | manifest pushes | full-body pushes | full-body MB | pre-warm lines / bodies | DA served / serve dropped | fallback pulls / recovered / pull failures | recovery handoffs / timeouts | missing-action rejections | proposer body mirror written | failure keys |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | P8M | 0 | 1,793 | 5,220 | 0 / 0 | 0 / 0 | 0 / 0 / 0 | 14 / 0 | 14 | 5,630 | 0 |
+| r1 | P8M | 1 | 3,651 | 10,126 | 1 / 16 | 1 / 17 | 0 / 0 / 0 | 29 / 0 | 29 | 11,461 | 0 |
+| r1 | P512K | 2,500 | 1,099 | 122 | 1,934 / 84,442 | 6,307 / 28 | 0 / 0 / 0 | 15 / 0 | 15 | 10,598 | 0 |
+| r2 | P512K | 2,475 | 1,147 | 129 | 1,842 / 82,696 | 6,110 / 51 | 0 / 0 / 0 | 21 / 0 | 21 | 9,081 | 0 |
+| r2 | P8M | 2 | 3,815 | 10,095 | 4 / 106 | 9 / 19 | 0 / 0 / 0 | 44 / 0 | 44 | 13,265 | 0 |
+| r3 | P8M | 2 | 3,529 | 10,094 | 0 / 0 | 0 / 15 | 0 / 0 / 0 | 39 / 0 | 39 | 12,570 | 0 |
+| r3 | P512K | 2,487 | 1,099 | 119 | 1,878 / 83,594 | 6,160 / 47 | 0 / 0 / 0 | 18 / 0 | 18 | 11,436 | 0 |
+
+P512K: 69.0% of pushes are manifests (774-910 per node per cell); the receivers log 1,842-1,934 pre-warm pulls per
+cell against 2,475-2,500 manifests sent (the rest find every body already local), ~44 bodies per pull. Full-body
+volume falls ~99% (10.1 GB -> 0.12 GB per cell). P8M's 1-2 manifests per cell are body sets above 8,000,000 B.
+Recovery hand-offs (each = one validate that missed a body and failed fast with MissingData; equal to the
+missing-action rejections on every node) are fewer with P512K (54 vs 112 over the 3 cells), and none timed out.
+Serve-pool drops (empty answers at capacity) 28-51 per cell with P512K vs 15-19 with P8M, none followed by a pull
+failure.
+
+Call: P512K holds matched/s (it gains 4.3%, CI clear of 1) and its timeouts are within noise (5 vs 2 from ~22k blocks
+per arm; no no_proposal), so the queue's rule is met. The gain is CPU: -5.9% per fill, and exec itself -3.6% per 1k
+fills, consistent with no longer serializing, copying and absorbing ~10 GB of full bodies per cell on one host's 3
+nodes (less CPU and memory pressure next to execution). Block rate and latency are unchanged within noise. Scope: one
+host over loopback, where a pull costs no RTT and bandwidth is free; this does not test the WAN case the 512 KB
+default was set for (view-timeout wedge on big-body dissemination) nor the WAN threshold.
+
+### 86.5 Next
+
+* env.sh moves to the code default (drop the 8 MB pin or set 524288): 18c's change; later benches then run the
+  manifest + pull path that production defaults to. Cross-campaign comparisons against earlier P8M baselines (every
+  bench before this one) should account for the ~4% matched/s and ~6% CPU per fill shift.
+* WAN: the threshold itself is a pre-testnet WAN measurement (latency and bandwidth), not a one-host one.
+* Data: `~/bench-results-matched/ozarchy-q7b-300m-{smoke-s0,w1,r1-*,r2-*,r3-*}` (each with `q7b-disk.txt`,
+  `q7b-push.txt`), campaign files `ozarchy-q7b-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`), tools
+  `ozarchy-q7b-tools/` (spec, checks, driver, `FROZEN.txt`), analysis `ozarchy-q7b-run/analyst/` (`q7b.txt`,
+  `q7b-analyse.py`: q5b's script + RSS, push / pull counts per node and native-DA metric deltas).
+
+### 86.6 Cells (`q7b.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | flag | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | no_proposal | hotstuff-algo ms/blk | RSS mean/max MB | boundary pipelined true:false per node | native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | P8M | 0/0 | ACCEPT/AGREE/PASS | True | ok | 254,427.0 | 11.874 | 19,854 | 77.2 | 15 / 883 | 24.26 | 0 | 0 | 20.8 | 4,155 / 5,113 | 47:0/47:0/47:0 | 3,586 |
+| r1 | P8M | 0/0 | ACCEPT/AGREE/PASS | True | ok | 247,424.3 | 12.269 | 19,312 | 76.6 | 15 / 870 | 24.94 | 0 | 0 | 20.1 | 4,769 / 5,825 | 87:0/87:0/87:0 | 7,386 |
+| r1 | P512K | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,813.6 | 12.143 | 20,396 | 78.2 | 15 / 835 | 23.53 | 1 | 0 | 20.6 | 3,892 / 5,085 | 86:0/86:0/86:0 | 7,322 |
+| r2 | P512K | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,589.6 | 12.274 | 20,110 | 76.7 | 15 / 841 | 23.39 | 4 | 0 | 20.2 | 4,228 / 5,389 | 86:0/86:0/86:0 | 7,401 |
+| r2 | P8M | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,566.3 | 13.096 | 18,139 | 71.7 | 15 / 830 | 24.94 | 2 | 0 | 19.0 | 4,629 / 6,044 | 93:0/93:0/93:0 | 7,884 |
+| r3 | P8M | 0/0 | ACCEPT/AGREE/PASS | True | ok | 246,921.6 | 12.120 | 19,530 | 77.5 | 15 / 868 | 24.88 | 0 | 0 | 20.2 | 4,230 / 5,321 | 85:0/85:0/85:0 | 7,296 |
+| r3 | P512K | 0/0 | ACCEPT/AGREE/PASS | True | ok | 257,635.3 | 12.146 | 20,330 | 77.3 | 15 / 814 | 23.45 | 0 | 0 | 20.5 | 4,075 / 5,137 | 86:0/86:0/86:0 | 7,312 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
