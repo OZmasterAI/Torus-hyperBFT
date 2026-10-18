@@ -4486,9 +4486,15 @@ impl ResidentBlock {
         self.users.as_ref().is_some_and(|u| u.in_place())
     }
 
-    /// Item 6 Phase 5 step 2 (tests): the record set's rows of positions and
-    /// balances as it holds them now, and its dirty keys (`None`: R not
-    /// attached).
+    /// Item 6 Phase 5 step 2 (tests): the block's record set (`None`: R
+    /// not attached). Drop the clone before `end_resident`.
+    #[cfg(test)]
+    pub(crate) fn test_shared_users(&self) -> Option<Arc<SharedUsers>> {
+        self.users.clone()
+    }
+
+    /// Item 6 Phase 5 step 2 (tests): the record set as it holds the two
+    /// CFs now and what its drain would emit now.
     #[cfg(test)]
     pub(crate) fn test_users(&self) -> Option<TestUsers> {
         let u = self.users.as_deref()?.read();
