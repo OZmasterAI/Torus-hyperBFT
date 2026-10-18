@@ -63,6 +63,16 @@ fn save(book: &mut OrderBook, what: &str, totals: &mut ClassicRowStats, saves: &
     assert_eq!((stats.full_build, stats.levels_encoded, stats.levels_removed), (false, 0, 0), "{what}");
 }
 
+/// A resting order of `book`, at random.
+fn pick_live(book: &OrderBook, rng: &mut Rng) -> Option<OrderId> {
+    let live: Vec<OrderId> = book
+        .bid_queues()
+        .chain(book.ask_queues())
+        .flat_map(|(_, q)| q.iter().map(|o| o.id))
+        .collect();
+    (!live.is_empty()).then(|| live[rng.below(live.len() as u64) as usize])
+}
+
 /// What the random driver did that changed the book (non-vacuity).
 #[derive(Debug, Default)]
 struct Did {
@@ -164,14 +174,14 @@ fn random_run(seed: u64, blocks: u64) -> Did {
                     did.stops_stored += u64::from(r.status == OrderStatus::PendingTrigger);
                 }
                 8 => {
-                    if !ids.is_empty() {
-                        let id = ids[rng.below(ids.len() as u64) as usize];
+                    if let Some(id) = pick_live(&book, &mut rng).or(ids.last().copied()) {
                         did.cancels += u64::from(book.cancel_order(id).is_ok());
                     }
                 }
                 9 => {
-                    if !ids.is_empty() {
-                        let id = ids[rng.below(ids.len() as u64) as usize];
+                    let stops: Vec<OrderId> = book.pending_stops().iter().map(|s| s.id).collect();
+                    if !stops.is_empty() {
+                        let id = stops[rng.below(stops.len() as u64) as usize];
                         did.stops_cancelled += u64::from(book.cancel_stop(id).is_some());
                     }
                 }
@@ -188,8 +198,7 @@ fn random_run(seed: u64, blocks: u64) -> Did {
                     did.stops_taken += book.take_pending_stops(&t).len() as u64;
                 }
                 13 => {
-                    if !ids.is_empty() {
-                        let id = ids[rng.below(ids.len() as u64) as usize];
+                    if let Some(id) = pick_live(&book, &mut rng) {
                         if let Some(o) = book.get_order(id).cloned() {
                             let (price, qty) = match rng.below(3) {
                                 0 => (None, Some(fp(1).max(o.remaining_qty - fp(1)))),
@@ -405,7 +414,8 @@ fn classic_row_rebuilds_after_other_drains_and_loaded_orders() {
                 id: 9_999,
                 trader: addr(9),
                 side: Side::Buy,
-                price: fp(96),
+                // A level the journal does not hold.
+                price: fp(80),
                 remaining_qty: fp(3),
                 original_qty: fp(3),
                 order_type: OrderType::Limit,
@@ -415,8 +425,8 @@ fn classic_row_rebuilds_after_other_drains_and_loaded_orders() {
                 client_order_id: None,
             };
             let seq = b.next_seq();
-            b.insert_loaded_order(o, seq);
             b.set_next_seq(seq + 1);
+            b.insert_loaded_order(o, seq);
         }),
     ];
     for (name, drain) in drains {
@@ -442,10 +452,20 @@ fn classic_row_rebuilds_after_other_drains_and_loaded_orders() {
 #[test]
 fn classic_row_after_batched_cancel_all() {
     let mut book = OrderBook::new(1, fp(1), fp(1));
-    for i in 0..1_100u64 {
+    // One deep bid level (the batch needs the first target's level >= 1,024
+    // deep), a few shallow ones, and asks.
+    for i in 0..1_600u64 {
         let trader = if i % 3 == 0 { addr(1) } else { addr(2 + (i % 5) as u8) };
-        let price = if i % 2 == 0 { 90 + (i % 4) as i64 } else { 110 + (i % 4) as i64 };
-        book.place_order(params(i % 2 == 0, price, 1), trader, 0);
+        let (is_buy, price) = match i % 7 {
+            0..=4 => (true, 95),
+            5 => (true, 90 + (i % 4) as i64),
+            _ => (false, 110 + (i % 4) as i64),
+        };
+        book.place_order(params(is_buy, price, 1), trader, 0);
+    }
+    // Levels no cancel below touches (kept bytes copied).
+    for p in 120..125 {
+        book.place_order(params(false, p, 1), addr(9), 0);
     }
     let mut totals = ClassicRowStats::default();
     let mut saves = 0;

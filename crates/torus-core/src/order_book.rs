@@ -3590,6 +3590,8 @@ impl OrderBook {
     /// as persisted. Callers must insert in canonical order (bids ascending
     /// (price, seq), then asks) — the loader owns that ordering.
     pub fn insert_loaded_order(&mut self, order: Order, seq: u64) {
+        // Phase 5 step 3: a level changes without a journal entry.
+        self.forget_classic_rows();
         let side = order.side;
         let price = order.price;
         let id = order.id;
@@ -3733,6 +3735,11 @@ impl OrderBook {
     pub fn take_level_ops(
         &mut self,
     ) -> Vec<((u8, i128), Option<crate::book_rows::LevelRowData>)> {
+        // Phase 5 step 3: the journal leaves for good; the Classic row's
+        // kept levels cannot follow it.
+        if !self.level_journal.is_empty() {
+            self.forget_classic_rows();
+        }
         if self.level_hash_chunked {
             return self.take_level_ops_chunked();
         }
@@ -3988,6 +3995,11 @@ impl OrderBook {
     /// Modes 0/1 never persist level rows: drop the journaled level keys
     /// without computing any aggregates (no keccak spent).
     pub fn discard_level_ops(&mut self) {
+        // Phase 5 step 3: entries dropped unseen by `classic_row` (the
+        // Classic save calls it first, which empties the journal).
+        if !self.level_journal.is_empty() {
+            self.forget_classic_rows();
+        }
         self.level_journal.clear();
         // Mode 3 bookkeeping is meaningless without level rows; keep it from
         // leaking if a chunked book is ever drained this way.
@@ -4005,6 +4017,9 @@ impl OrderBook {
     /// offline rebuild). Resets the level journal and marks all level rows
     /// persisted. Deterministic: bids then asks, price ascending.
     pub fn full_level_ops(&mut self) -> Vec<((u8, i128), crate::book_rows::LevelRowData)> {
+        if !self.level_journal.is_empty() {
+            self.forget_classic_rows();
+        }
         self.level_journal.clear();
         self.level_exists.clear();
         // L3: full writes (genesis / offline rebuild) use the plain path;
