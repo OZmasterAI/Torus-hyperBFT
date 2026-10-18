@@ -264,6 +264,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    ms per block if the timers exist, node RSS mean / max, and `torus_exec_evm_scope_typed_writes_total` (expect 0).
    Rule: exec ms per 1k fills and CPU per fill must not regress (CI not above 1) for the merge; a gain decides
    whether the drain encoding moves to the flush worker next.
+8e. **Keccak and exec pool-wait attribution from 8c's profiles** (owner s128; after 8d; analysis only, no new cells;
+   ~30-60 min). Section 90.5: Keccak hashing is ~12% of exec (outside the Phase 5 plan, callers unknown) and the exec
+   thread waits on its own worker pool 16-18% of wall (`run_jobs` + match setup 2.4-2.8 s per 15 s, up from ~1.5 s).
+   From the existing `ozarchy-q8re-300m-r{1,2,3}-ONP` `perf.data` (call graphs; `perf script --no-inline` as in 90):
+   (a) Keccak by caller, as % of exec and ms per native block: state / trie roots, the running hash, action and order
+   hashing, signature recovery, CF row hashing, EVM; name the top 3 call paths with file:function; (b) the pool waits:
+   which job kinds the exec thread waits on (match setup, settle passes, cancel-all, book save, flush), per 15 s and
+   per native block, and the slowest job's share of each wait (straggler vs too little parallel work). Report whether
+   each top item has an obvious fix (cache, batch, skip, parallelize) and its upper-bound gain. Owner / 18c decide
+   what enters a plan.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
