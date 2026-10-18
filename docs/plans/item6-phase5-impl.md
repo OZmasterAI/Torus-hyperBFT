@@ -530,6 +530,90 @@ Codex torus-adversarial review before step 4.
   reference path and for modes 2/3.
 - Verify: `cargo nextest run -p torus-core $F`, `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
 
+**Anchor re-check on `1e51c8b9` (s128, before step 3).** Section 2 row 7 drifted: `ResidentInner.books`
+`native_executor.rs:3766` (was :3738), `save_order_books` :7058 (Classic arm :7105-7130; was :6884),
+`save_order_books_deferred` :7376 (was :7202), `write_bbo_rows` calls :7174 / :7413 and fn :7225 (were :7000 / :7239 /
+:7051), `diff_stop_rows` :7542 (was :7368). Step 4: the `open_order_counts` wrapper :10439 (was :10186), `open_at_start`
+:8297 / :11444 (were :8123 / :11174). Changed meaning: Classic has no diff. Its row is one whole-book Borsh blob per
+dirty market (`borsh::to_vec(book)`), and `diff_stop_rows` is on the OrderRows path only (modes 2/3 diff stops in
+`write_drained_book`). The market-level dirty set already exists (`dirty_books`). So "rows from the dirty set equal
+`save_order_books` + `diff_stop_rows`" reads, for Classic: the blob from a finer dirty set equals `borsh::to_vec`.
+
+**PARKED s128 (Phase 5 paused after step 1; rebase onto a reworked step 2 if Phase 5 resumes).**
+
+**Built (s128, branch `feat/item6-phase5-step3` off `1e51c8b9`, step 2 not merged; not merged).** Commits: Task 3.1
+RED `63720f9b`, code `11e0b135`; Tasks 3.2-3.3 RED `ac828900`; Task 3.1 one-pass revision `ae59277c`; Tasks 3.2-3.3
+code `0df509dd`; clippy `80b42d1e`; this note last.
+- Shape (`torus-core/src/order_book/classic_rows.rs`): `OrderBook::classic_row()` returns `borsh::to_vec(book)`
+  byte for byte. Each book keeps every price level's encoded orders (in RAM, never serialized or hashed). The dirty
+  set is the book's existing 3c level journal: every queue primitive writes it (insert, cancel, cancel-all and the
+  batched `try_cancel_all_batch` / `cancel_all_many`, modify, the match loop's fills and self-trade / reduce-only /
+  margin cuts), and it is complete because mode 2's consensus level rows are written from it. One pass in row order:
+  a journaled level is encoded straight into the row, then its kept bytes are replaced from there (a copy of bytes
+  just written); any other level is copied from its kept bytes. The header and the stops are encoded every time
+  (as the reference). Any other drain of the level journal (`take_level_ops`, `full_level_ops`, a bare
+  `discard_level_ops`) and `insert_loaded_order` (no journal entry) drop the kept levels, so the next row is a full
+  build.
+- Executor (`save_order_books`, Classic arm): every node writes the row from `classic_row` (no runtime switch, D16;
+  non-resident nodes, `TORUS_RESIDENT_BOOKS=0`, build the kept levels at each save). A `ResidentBooks` holder on the
+  test-only reference path (`set_reference_writes`, `p5_configure`'s reference node) keeps `borsh::to_vec`, which is
+  unchanged. Test builds (`cfg(test)` / `test-reference-paths`) also encode each cached row the reference way and
+  panic on a difference (`test_book_rows_check`, default on). Metrics: `torus_exec_book_rows_{cached, full_builds,
+  levels_reused, levels_encoded}`.
+- Deviations from the step text:
+  - No new mark sites and nothing for E to merge: the level journal lives in each book, so the per-market workers
+    (match, settle, the parallel cancel-all pass) carry it with the book.
+  - The row is made at the book save point (end of the native part), not inside `freeze`. It still reaches
+    `FrozenPending` through the overlay unchanged: the overlay put is under 1% of `save_books` (s124), and books
+    reloaded per block read the row through the overlay.
+  - Level, not order, granularity. A per-order rebuild of a dirty level (orders outside the row journal copied by
+    id) was built and dropped: it reads every order of the level anyway, so it cost as much as encoding (memory
+    bound), up to 1.6x the reference with random cancels. The first version (encode the dirty levels into the cache,
+    then copy every level) lost too when most bytes sat in dirty levels (up to +17%); the one-pass revision fixed it.
+- Path coverage (lesson from step 2). Paths of the book-row writer and where each is exercised:
+  - Classic cached vs reference, modes 1-3 untouched: the P5 harness asserts per configuration that the typed node
+    wrote cached rows (844-871 per 300 blocks, 6 full builds, levels reused 8,469 / encoded 2,796), the reference
+    node and every mode-1/2/3 configuration none.
+  - Serial and pipelined, checkpoint per block / every 5 / never: the 6 Classic configurations (Classic never defers
+    its save; `save_order_books_deferred` returns `None`, so deferred books are modes 2/3 only, unchanged).
+  - Block kinds, counted from the typed node's metric per block: cached rows in 3 epoch-boundary, 17 EVM, 3 slash and
+    33-34 liquidation blocks of 300, and the replay after the fatal block is a full build (books reloaded).
+  - Cancel-all: the sequential `cancel_all`, the batched run, and the parallel book pass. The latter is
+    `TORUS_PARALLEL_CANCEL_ALL` (default 1 on this base, 8 on main since `3429855d`); a new seam
+    (`test_parallel_cancel_all_even_heights`: 4 jobs, no work gate, even heights) forces it, 33 runs per node in 300
+    blocks; the bridge differential 406. `try_cancel_all_batch` needs a 1,024-deep level, which the streams never
+    build; the core test `classic_row_after_batched_cancel_all` covers it.
+  - Single-action vs batched (market workers): the bridge differential `book_dirty_rows_equal_save_order_books`
+    alternates single, batched and batched with the parallel cancel-all pass; restarts every 50 blocks.
+  - Book primitives: `classic_row_equals_borsh_every_save_random` (6 seeds x 400 blocks) reaches every primitive at
+    least 7 times (rested 8.4k, fills 6.7k, self-trade 563, reduce-only cuts 97, stops stored / fired / cancelled /
+    taken, cancels 2.1k, cancel-all, `cancel_all_many`, modifies in place 515 and re-inserted 1.5k, sweeps, other
+    drains, reloads, skipped saves, full builds). Not reached by any stream: margin cancels at match time (same
+    level-journal guard at the top of `match_at_level` as fills).
+  - Mutants caught: drain hooks removed, the loaded-order hook removed, journaled levels not re-encoded.
+- Cost (`crates/torus-core/tests/classic_row_ubench.rs`, release, jemalloc as the node, 300 books, 0.76-1.06M
+  resting orders, 53-82 MB of rows per block, 390 operations per book per block, medians of 12 blocks; busy shared
+  host). Reference (`borsh::to_vec`, today's arm) vs `classic_row`:
+
+  | ops | levels a side | reference ms | classic_row ms | change | all levels clean (floor) ms |
+  |---|---|---|---|---|---|
+  | top (fills + places near the mid) | 50 | 35.3 | 32.8 | -7% | 12.1 |
+  | top | 100 | 58.6 | 39.8 | -32% | 16.7 |
+  | random (+ cancels / modifies anywhere) | 50 | 50.4 | 49.5 | -2% | 16.4 |
+  | random | 100 | 56.6 | 54.4 | -4% | 19.8 |
+
+  The gain is the share of a book's bytes in clean levels; the floor (copy every level) is ~30% of the reference.
+  The bench's share is not known: archy's A/B decides (`torus_exec_save_books_seconds`, the new
+  `torus_exec_book_rows_levels_{reused,encoded}`). RAM: the kept levels hold about one more copy of the serialized
+  books (~97 B per resting order; ~70-80 MB per node at 0.7-0.8M resting orders).
+- Runs: workspace 4064/4064, doc tests 1/0; goldens A and B unchanged, serial and engine-forced (their contexts have
+  no resident holder, so they now run the cached path); the three default differentials pass all 12 configurations.
+  `phase5_differential_long_random_10k`: not run to the end (owner s128: skipped, Phase 5 parked); the first 4 of 12
+  configurations (serial, all four BookModes) had passed when it was stopped.
+- Reference quirk (not changed): on a Borsh error the Classic arm logs and skips the put without a fail-stop, so the
+  DB would keep the old row while the book moved on. Encoding into a `Vec` cannot fail today; the cached path keeps
+  the same behaviour and drops its kept levels.
+
 ### Step 4 (optional): open-order count
 
 **Deferred (owner s127):** decided after step 3, kept only on its own net A/B (the existing rule). Step 0 measured
