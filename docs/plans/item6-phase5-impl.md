@@ -489,6 +489,43 @@ Task 2.3 RED `18d93dfc`, code `781bbeba`; Task 2.4 test and this note in the las
   divergence, in 4,414 s (debug). The typed node drained 95,435 rows in place per configuration and the reference
   node none. Goldens A and B are unchanged, serial and engine-forced (`scenario_b_engine_digests_equal_c93c579`
   added). Last workspace run: 4055/4055, doc 1/0.
+- Codex torus-adversarial review (s128, `reviews/codex-p5-step2-adversarial.md`, memory 9a856dad9952e103):
+  consensus divergence, reproduced. A stored position row whose payload names another market (opaque, kept raw)
+  makes the parallel settle's per-market caches share a key: `PositionCache::update_in_place` loads `t ‖ m` and
+  files the fill under the payload's key. The reference merges the plans in market order (`merge_disjoint`: a
+  later entry, clean ones included, replaces an earlier one; dirty marks unioned) and writes each dirty key's merged
+  entry under its own fields in key order; the in-place flush took each plan's dirty rows apart and emitted an
+  extra row (rows, `h_n`, running hash and native root differed).
+  - Fix: the in-place flush takes the plans apart only when their keys are provably disjoint (every key of each
+    plan in its own market, `PositionCache::keys_in_market`; markets strictly ascending; the batch cache empty).
+    Otherwise it runs the reference itself: the same merge in market order and the same `flush_all`, through the
+    overlay's write-through into `Users` (no users lock held). The reference path is unchanged.
+  - Audit of the other caches step 2 moved off the overlay flush: the batch position cache, the balance cache
+    (incl. Phase 2's `BalanceCache::merge_disjoint`), the batch volumes and the single path's `cvlm` adds each
+    take their values from one merged map, the same on both paths: no other overlap. Tx-scope journal rows vs the
+    dirty set: the native overlay opens no tx scope in production (Task 2.3's guard covers the EVM journal).
+  - Tests: `parallel_settle_aliased_opaque_rows_equal_reference` (torus-bridge `users_tests.rs`): four
+    aliased-rows cases (Codex's repro, another trader's payload, two dirty entries for one key, closes with PnL,
+    balance and `cvlm` of an opaque trader) with the parallel settle, the sequential loop and Phase 2's sharded
+    workers; every CF's rows, results, running hash and native root equal the reference. The long differential
+    now forces the parallel settle on odd heights (test seams `NativeExecContext::test_parallel_settle`,
+    `ExecutionContext::test_parallel_settle_odd_heights`: the stream's few fills never reach the Auto gate of 1024)
+    and seeds 16 aliased traders (one per 625-block window) buying IOC in markets 1 and 2 on odd heights; a fill
+    in market 1 alone (no ask left in market 2, e.g. after a shock's liquidations) ends a trader's aliasing, so a
+    fresh one takes the next window. The summary asserts the aliasing was live after at least n / 4 blocks (300:
+    ~298; 10k: 6,330 of 10,000 on the serial reference node). RED `091f0d3e`: all 7 default configurations
+    diverged at height 3.
+  - Finding on the reference merge itself (not fixed; today's consensus): with such rows it drops a write (a later
+    plan's clean loaded entry replaces an earlier plan's dirty one, and the stale payload is rewritten every block),
+    so the reference parallel settle and the reference sequential loop give different rows for them. Ordinary
+    writers are not shown to create such rows.
+- EVM guard (owner s128): no fail-stop in release (as built); the guard also counts the rows in
+  `torus_exec_evm_scope_typed_writes` (`_total`); `evm_typed_write_counts_in_the_metric` (0 before the first EVM
+  block, the planted rows after it; a debug build still fails on it after counting).
+- Runs after the fix (s128): workspace 4057/4057, doc tests 1/0, `rdeps(torus-bridge)` 2093/2093 incl. goldens A and B
+  serial and engine-forced. `phase5_differential_long_random_10k` (parallel settle forced on odd heights, 16 aliased
+  traders): all 12 configurations, no divergence, 3,530 s (debug; rerun by 18c after a VPS reboot cut the first run).
+  The finding on the reference merge goes to the roadmap's pre-testnet list (first: can such rows exist at all?).
 
 ### Step 3: book rows from a dirty set (Classic)
 
