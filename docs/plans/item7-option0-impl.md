@@ -1,6 +1,6 @@
 # Implementation Plan: item 7 step 3 option 0, the EVM fast path
 
-Status (s128): PLAN revision 1, nothing built. Design: `docs/plans/item7-step3-design.md` revision 2 (on main;
+Status (s128): PLAN revision 2, nothing built. Design: `docs/plans/item7-step3-design.md` revision 2 (on main;
 section 7 picks 1-11 accepted by the owner s127). This plan covers option 0 only: design phases P1 and P2 (section 4.1). T (P3) gets
 its own plan after P2 merges; C0 stays parked (design question 6). Format: `item7-step2-impl.md`,
 `item6-phase5-impl.md`.
@@ -14,6 +14,15 @@ its own plan after P2 merges; C0 stays parked (design question 6). Format: `item
   W-gated asynchronous runs); section 5 and tasks 0.2, 0.3, 3.5, 3.6, 3.8 rebuilt on it (decision 12).
 - R3, F1: confirmed on main and fixed on its own branch `fix/precompile-read-error-fail-stop`. Gate D1 (section 4):
   no flag-on execution before that fix is in the branch's base. Task 1.1 keeps the classification audit.
+
+**Revision 2 (s128), after the Codex round 2 review of `a719620a` (needs-attention, two harness gaps):**
+- R4, crashes: dropping a gated context is not a crash. It releases the gate, W drains every held job, and a healthy
+  context writes a final checkpoint (F10). Tasks 3.4, 3.5 and C19 now crash through a latched fail-stop (the
+  `ckpt_crash_replay_with` mechanism) and assert that the marker stays behind, the side rows stay absent and the lost
+  heights replay. A guard test pins the drain (decision 13).
+- R5, snapshots: a snapshot keyed by the DB marker can show a height whose EVM mirror resync has not run yet (F11).
+  Task 0.4 now takes its snapshots in a completion hook after the resync, tagged with the completed height; tasks
+  0.2, 3.4, 3.5 and section 5.1 compare by completed height.
 
 **Base: main `47c5f6fb`.** Every `file:line` below is on that commit (crate paths under `crates/`), unless marked
 "design" (the design's anchors, written on `dcee5cac` / `c567b1b3`). Section 2 re-checks every design anchor.
@@ -68,11 +77,11 @@ Two rules from s128 shape the plan:
 | gate | target | measured by |
 |---|---|---|
 | flag off = today | every height's `h_n` write set, every CF dump (consensus, receipts, tx index, hash -> number, CoreWriter tx links, action status, CF_HASHED_*, CF_TRIE_*), the running hash and the RPC answers equal the step 0 golden of main `47c5f6fb` | tests 0.2, 1.x, 3.6 |
-| flag on = today | the same golden, in every checkpoint policy, with EVM heights pipelined, in drained (D) and W-gated asynchronous (G) runs, compared by height and by durable height (task 0.4) | test 3.6 |
+| flag on = today | the same golden, in every checkpoint policy, with EVM heights pipelined, in drained (D) and W-gated asynchronous (G) runs, compared by height and by completed height (task 0.4's hook snapshots, never a marker-keyed read) | test 3.6 |
 | coverage | every path in section 5's table counted >= 1 in every (configuration, run mode) that can reach it, layer rows counted only for reads served by IN-FLIGHT layers; each planted bypass and each in-flight-only planted fault (section 5.4) makes the harness fail | test 0.4, 3.6, 3.7 |
 | F1 first | the F1 fix (`fix/precompile-read-error-fail-stop`) is in the base before any flag-on run | gate D1 |
 | no raw read | the tripwire (task 1.6) gets 0 hits over the whole stream with the flag on | test 3.6 |
-| local faults | every new read path's error fail-stops (never a revert, never a skipped EVM part); restart replays to the uncrashed state | tests 1.1, 3.4 |
+| local faults | every new read path's error fail-stops (never a revert, never a skipped EVM part); the held jobs are refused, not written (marker stays at the pre-fault height, no side row above it); restart replays exactly the lost heights to the uncrashed state | tests 1.1, 3.4, 3.5 |
 | R and L unshared | `rows_shared_fallbacks` 0, `torus_exec_checkpoint_layer_shared` 0 over the stream with the flag on | test 3.6 |
 | Q11 | the exec-path merge rule (bench-queue.md) on E-on / E-off, plus section 6's passes | Q11 |
 | mixed flags | three replicas (off; on 15 s; on interval 0) and a 3-node devnet cell agree on every `h_n` and attestation | test 3.8, Q11 extra cell |
@@ -233,6 +242,27 @@ and changed meaning.
 - **F9. `validate_block_with_overlay` / `execute_block_with_overlay`** (`validator.rs:285`, `executor.rs:497`) are an
   older deferred-commit path with no production caller. Their precompiles read the raw DB (the very bug), so they are
   not a template. They stay as they are.
+- **F10 (R4). Dropping a context with W gated lands its held jobs.** `Drop for FlushWorker`
+  (`exec_pipeline.rs:677-687`) closes the channel, releases the gate and joins W, and `worker_loop`
+  (`723-810`) still receives and writes every job already sent. Before that, `Drop for ExecutionContext`
+  (`app.rs:2595-2603`) runs `pipeline_barrier`, a final checkpoint, whenever `exec_failed` is not latched. A bare drop
+  is a clean shutdown, not a crash (Codex probe: `held_before_drop: marker=0`, `after_drop: marker=1`). W refuses to
+  write only once `exec_failed` is latched (`exec_pipeline.rs:742-744`) or after an injected write failure
+  (`gate.fail_next()`, `wait_open` `459-473`; the latch `787-798`, `latch_failstop` `818-825`). The Phase 3 crash
+  template does exactly that before its drop: `fail_next`, `release`, then asserts `!wait_idle()` and
+  `exec_failed` (`app.rs:29887-29897`), and only then drops and checks `durable < last` (`29899-29904`). The E-side
+  seam `test_crash_after_evm_section` (`app.rs:3688-3690`) only returns. It latches nothing, so with W held a drop
+  after it lands the parent's jobs too.
+- **F11 (R5). The durable marker lands before the EVM mirror is resynced.** On W a Flush writes native state and the
+  marker in one batch (`flush_on_worker`, `exec_pipeline.rs:1032-1039`; the result `1041-1052`), then
+  `resync_evm` (`1054`, fn `1078-1089`) rewrites CF_HASHED_* / CF_TRIE_* for the native-credited EVM accounts in a
+  separate write. A checkpoint does the same (`flush_checkpoint` `932`, `resync_evm` `957`). E's serial flush too:
+  the batch with the marker at `app.rs:4674`, the resync at `4743-4753`. A marker-keyed snapshot can therefore see
+  height h's native state next to h-1's EVM mirror (Codex probe: `same_marker=true same_hashed_account=false`). A
+  RocksDB snapshot does not help: the interval lies between two separate writes. A height is complete only after
+  `run_job` returns `Ok` or `TrieStale` (`worker_loop` `766-786`, before `durable_height.store` and
+  `finish_job`), or on E after the resync (`app.rs:4759`) or the marker-only flush (`4970`). W runs its jobs in
+  order on one thread, so no later job writes before that point.
 
 ## 3. Shape of the fast-path EVM section
 
@@ -315,9 +345,10 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
   interval 0; pipelined Every5 (EVM heights barrier today). Each run fills a task 0.4 ledger, keyed by height, never
   by "after block h": the `h_n` write set hash of every height (`capture_take` returns `(height, entries)`,
   `running_hash.rs:623`), the action-status row, the receipts / tx-location / hash -> number / CoreWriter-link rows of
-  that height, and per-CF dump hashes at each durable height the run reaches (every height for serial; the checkpoint
-  heights for Every5). The golden stores the per-height entries once (the three runs must agree) and the dump hashes
-  at the durable heights all three runs share (multiples of 5 and the last height). At the end: a hash per CF of the
+  that height, and per-CF dump hashes at each completed height the run reaches (every height for serial; the
+  checkpoint heights for Every5), taken by task 0.4's completion hook, never by reading the marker (F11). The golden
+  stores the per-height entries once (the three runs must agree) and the dump hashes at the completed heights all
+  three runs share (multiples of 5 and the last height). At the end: a hash per CF of the
   full dump (all `ALL_CF_NAMES`, CF_HASHED_* and CF_TRIE_* included), the running hash, the EVM root (incremental ==
   full scan) and the RPC answers of 3.6's list.
   `TORUS_O0_GOLDEN_WRITE=1` writes the file; it is written once, on the step 0 commit, whose parent is `47c5f6fb`.
@@ -353,21 +384,33 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
 **Task 0.4: the ledger comparator and the W-gated asynchronous runner (R2; replaces `p5_compare` for option 0)**
 - Code (`app.rs` test module, next to `p5_compare` `28820`, which stays for Phase 5's own tests):
   - `O0Ledger` per node: `hn: BTreeMap<height, hash>`; `status: BTreeMap<height, Option<hash>>` and the per-height
-    side rows of task 0.2, filled when that height becomes durable; `dumps: BTreeMap<durable height, Vec<(cf,
-    hash)>>`. A node appends to it after each of its blocks without waiting for W: it drains `capture_take` into
-    `hn` by height, reads its durable marker, and for every newly durable height reads the status and side rows and,
-    at a dump point, dumps.
-  - Snapshot-consistent dumps: with W running, a dump must not straddle a checkpoint write. The dump and the marker
-    are read from one `rocksdb::Snapshot` (a test helper `dump_all_cfs_at`; `StateDb` has no snapshot API on
-    `47c5f6fb`, `dump_all_cfs` is `app.rs:18156`), and keyed by that marker. Header and body rows above the marker are
-    filtered out (the dispatcher writes them ahead, `persist_committed_block_durably`); the filter is that one CF pair
-    and nothing else (`o0_snapshot_filter_is_dispatch_rows_only`).
+    side rows of task 0.2, filled when that height completes; `dumps: BTreeMap<completed height, Vec<(cf, hash)>>`.
+    E appends to `hn` after each of its blocks without waiting for W (it drains `capture_take` by height). Status,
+    side rows and dumps come only from the completion hook below, never from a read of the marker.
+  - **Completion hook (R5, F11).** A marker-keyed snapshot can sit between a batch and its EVM mirror resync, and a
+    RocksDB snapshot cannot close that gap (two separate writes). The ledger therefore snapshots where a height is
+    known complete: a `#[cfg(test)] test_on_complete: Option<Arc<dyn Fn(u64, &StateDb) + Send + Sync>>` on the
+    worker env and on `ExecutionContext`, called with the completed height:
+    - on W in `worker_loop` (`exec_pipeline.rs:766-786`), for a Flush, Marker or Checkpoint whose `run_job` returned
+      `Ok` or `TrieStale`. That is after `resync_evm` (`957`, `1054`) and before `durable_height.store` /
+      `finish_job`, and so before W can `recv` the next job. Never for a Digest (nothing durable) or a failed job;
+    - on E after the serial flush's resync (`app.rs:4743-4753`, at the end of the serial-flush block `4759`) and after
+      a successful `flush_marker_only` (`4970`). S takes all its heights here; a pipelined node takes its barrier
+      heights here, written by E after `wait_idle`, so W is idle.
+    The hook takes a `rocksdb::Snapshot` (a test helper `dump_all_cfs_at`; `StateDb` has no snapshot API on
+    `47c5f6fb`, `dump_all_cfs` is `app.rs:18156`). It records, for every height in (previous completed, h], the
+    status and side rows, and at a dump point the per-CF dump hashes. It asserts the marker in the snapshot equals h
+    (a check on the hook site). Hashing may run on a ledger thread after the snapshot is handed over (the snapshot
+    pins the bytes). Neither E nor the gate waits on the hook: W pauses only for the snapshot call, and E is never
+    drained between blocks. Header and body rows above h are filtered out (the dispatcher writes them ahead,
+    `persist_committed_block_durably`, the only other writer in the harness while W is in the hook); the filter
+    covers that one CF pair and nothing else (`o0_snapshot_filter_is_dispatch_rows_only`).
   - `o0_compare(a: &O0Ledger, b: &O0Ledger)`: compares each key present in both (height for `hn`, status and side
-    rows; durable height for dumps) as soon as both have it, and never compares markers. A divergence names the height
-    and the CF. At the end both nodes drain once, and completeness is asserted: every height in `hn` and `status` on
-    both, and every dump key of the coarser node present in the finer one (S dumps at every height, so S's ledger
-    holds the reference snapshot for any durable height a pipelined node reports). On a dump mismatch the harness
-    re-runs S to that height and prints the first differing row (S is deterministic), so S keeps hashes only.
+    rows; completed height for dumps) as soon as both have it, and never compares markers. A divergence names the
+    height and the CF. At the end both nodes drain once, and completeness is asserted: every height in `hn` and
+    `status` on both, and every dump key of the coarser node present in the finer one (S dumps at every height, so S's
+    ledger holds the reference snapshot for any completed height a pipelined node reports). On a dump mismatch the
+    harness re-runs S to that height and prints the first differing row (S is deterministic), so S keeps hashes only.
   - Two run modes per pipelined node:
     - **D (drained lockstep):** today's `P5Node::execute` (W drained after each block). Deterministic markers; it is
       the mode the golden is recorded in.
@@ -395,10 +438,20 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     (`with_split_layers`). D mode at interval 0 does not see it (asserted, the reason G exists); G mode reports a
     divergence. Same for `o0_planted_skip_inflight_checkpoint` (skip C) with an interval.
   - `o0_golden_today_g`: today's code in G mode reproduces the golden (determinism under timing).
+  - `o0_marker_keyed_snapshot_sees_pre_resync_mirror` (guard, pins F11): a pipelined interval-0 block that credits an
+    EVM account (a fee to an EVM address, so `evm_addrs` is non-empty), with W parked between its batch and
+    `resync_evm` by a new `#[cfg(test)]` `WorkerGate::hold_before_resync` seam (as `hold_latch`, `exec_pipeline.rs:
+    374-379`). A marker-keyed snapshot taken there has S's marker and a different CF_HASHED_ACCOUNTS row (the Codex
+    probe). The hook snapshot of the same height equals S's (`o0_completion_snapshot_equals_serial`).
+  - `o0_completion_hook_fires_after_resync_only`: per job kind (Flush, Marker, Checkpoint, a barrier's E flush), one
+    hook call per completed height range. None for a Digest or a failed job. The marker in each snapshot equals its
+    tag.
 - Verify: `cargo nextest run -p torus-consensus $F -E 'test(o0_ledger) | test(o0_gated) | test(o0_planted_skip) |
-  test(o0_golden_today)'`, twice (G mode is timing-driven; the gate makes its coverage deterministic).
+  test(o0_golden_today) | test(o0_marker_keyed) | test(o0_completion)'`, twice (G mode is timing-driven; the gate
+  makes its coverage deterministic).
 
-Size: ~1,050-1,350 lines, almost all tests (estimate; task 0.4 adds ~350-450).
+Size: ~1,120-1,450 lines, almost all tests (estimate; task 0.4 adds ~420-550, of which ~70-100 for the completion
+hook, the resync seam and their guards, R5).
 
 ### Step 1 (design P1): behaviour-neutral preparation, no flag
 
@@ -621,21 +674,50 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
 
 **Task 3.4: local faults on the fast path**
 - Test first: `fast_path_adapter_read_fault_fail_stops`, `fast_path_deferred_merge_failure_under_journal_fail_stops`
-  (the merge thread's failure seam), `fast_path_absorb_put_fault_fail_stops`. Each: nothing is handed off, the marker
-  stays below h, and the restart replays to the uncrashed dump. The faults are injected in G mode with the parent's
-  job (interval 0) or the checkpoint (interval) still held, and checked against S's ledger snapshot at the restarted
-  node's durable height (R2).
+  (the merge thread's failure seam), `fast_path_absorb_put_fault_fail_stops`. The faults are injected in G mode with
+  the parent's job (interval 0) or the checkpoint (interval) still held (R2). Each is a fail-stop on E, which latches
+  `exec_failed`, so W must refuse the held jobs (`exec_pipeline.rs:742-744`) and not land them. The checks follow
+  task 3.5's crash protocol (R4): d = the marker before the fault; before the drop, `exec_failed` is set and
+  `wait_idle()` returns false; after it, the marker is still d (not just below h); no status or side row exists for
+  any height in (d, h]; the restart replays exactly d+1..=h. The result equals S's hook snapshot at h, by completed
+  height (R5).
 
 **Task 3.5: W crash and replay**
-- Test first: SIGKILL-style crashes (drop the context with W gated, the `WorkerGate` seams): after the EVM part
-  before the absorb (`test_crash_after_evm_section`, `app.rs:3688`); after the absorb before the hand-off; after the
-  hand-off before the checkpoint; during W's EVM trie step (inject); during the replay of an EVM block. The restart
-  replays serially, and the dump (EVM trie included) and `h_n` equal the uncrashed serial run. Single and repeated
-  crashes. Template: `epoch_fast_path_checkpoint_crash_replay_matches_uncrashed` (`app.rs:30727`).
+- Test first: crashes at these points: after the EVM part before the absorb (`test_crash_after_evm_section`,
+  `app.rs:3688`); after the absorb before the hand-off; after the hand-off before the checkpoint; during W's EVM trie
+  step (inject); during the replay of an EVM block. The restart replays serially, and the dump (EVM trie included)
+  and `h_n` equal the uncrashed serial run. Single and repeated crashes. Template:
+  `epoch_fast_path_checkpoint_crash_replay_matches_uncrashed` (`app.rs:30727`) through `ckpt_crash_replay_with`
+  (`31191`) and its `CkptCrash` arm (`29843-29922`).
 - R2: every crash point is taken in task 0.4's G mode, with the jobs before it still held at the gate (never after a
-  `wait_idle`), so the crash drops in-flight EVM jobs, side rows included; the comparison is the ledger one (crashed
-  node vs uncrashed S, by height and durable height), not `p5_compare`. One case crashes with an all-skipped block's
-  Marker held (its hash -> number row must come back from the replay).
+  `wait_idle`); the comparison is the ledger one (crashed node vs uncrashed S, by height and completed height), not
+  `p5_compare`. One case crashes with an all-skipped block's Marker held (its hash -> number row must come back from
+  the replay).
+- **R4, the crash protocol (`o0_crash`, one helper for every point; never a bare drop).** A drop releases the gate,
+  W writes every held job, and a healthy context also writes a final checkpoint (F10). A crash by drop alone would
+  land the "lost" jobs and the comparison would pass without any replay. So, as the template does:
+  1. Record d = the durable marker and the last handed-off height `last` while W is held.
+  2. Latch before releasing. E-side points (after the EVM part, after the absorb): the seam latches `exec_failed`,
+     then returns. `test_crash_after_evm_section` gains the latch, since today it only returns (`3688-3690`); the
+     new after-absorb seam is built the same way. W-side points (after the hand-off, the EVM trie step):
+     `gate.fail_next()` before `gate.release()` fails the oldest held job, and W latches (`exec_pipeline.rs:787-798`)
+     and refuses the rest (`742-744`); the trie step's inject is a panic seam inside the step, before its batch
+     (caught at `800-806`). Replay-time crash: the same latch on the replay context.
+  3. Before the drop: `!wait_idle()` (or `exec_failed` for the E-side points with W idle) and `exec_failed` set.
+  4. After the drop: the marker is still d, below every handed-off height. For every height in (d, last], no
+     CF_BLOCK_ACTION_STATUS, CF_RECEIPTS, CF_BLOCK_HASH_TO_NUMBER, CF_TX_HASH_TO_LOCATION or CoreWriter-link row exists.
+     CF_HASHED_* / CF_TRIE_* equal the hook snapshot at d.
+  5. The restart: `replay_committed` reaches `last`; the replay's `capture_take` lists exactly d+1..=last (each
+     re-hashed, `dedup_captured` as in `ckpt_crash_replay_with`, `app.rs:31209-31214`), with >= 1 EVM height and,
+     where the point involves one, the all-skipped Marker height among them. Only then the ledger comparison with S.
+  - Guard `o0_bare_drop_lands_held_jobs` (pins F10, the Codex probe): interval 0, W held after a native block and
+    after a flag-on EVM block, a drop without the latch. The marker goes from d to `last` and the side rows of
+    (d, last] are present. This is why every crash uses `o0_crash`.
+  - Guard `o0_crash_protocol_rejects_unlatched_crash`: `o0_crash` with step 2 switched off fails at step 4 (the
+    harness catches a crash that is not one).
+  - A real process kill (the node as a child process, SIGKILL) is not used here. It needs a node binary harness and
+    adds no path the latch does not reach: W writes nothing after the latch, and the atomic batch makes a kill land
+    all of a job or none of it. Q11's SIGKILL cell (section 6) covers the process kill (decision 13).
 
 **Task 3.6: the equivalence harness with the flag** (section 5)
 - Test first: `o0_equivalence_*` (section 5.3's matrix, D and G modes) against the golden, plus
@@ -647,7 +729,10 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
 - `corewriter_evm_row_drains_in_empty_next_block` (+ `_with_interval`, `app.rs:25834`, `25923`),
   `core_writer_tx_links_each_queued_row_to_its_evm_tx` (`21585`) and
   `f3_epoch_gas_sets_plan_fees_serial_and_pipelined` (`21496`) gain a flag-on run. So does the R02 branch 5 fault
-  family (`evm_db_read_fault_fail_stops_block` `27485`, `ReplayFault::EvmLocalFault`).
+  family (`evm_db_read_fault_fail_stops_block` `27485`, `ReplayFault::EvmLocalFault`). That family already drains
+  before the faulty block and asserts the latch before its drop (`assert_storage_cf_fault_fail_stops_then_replays`,
+  `27515`). Its flag-on run keeps that and adds task 3.5's step 4: no side row of the faulted height, and the replay
+  re-hashes it. It must not be rewritten to drop with W held without the latch (F10).
 
 **Task 3.8: mixed replicas**
 - Test first: `o0_mixed_replicas_agree`: three nodes on one stream (flag off; flag on with Every5; flag on with
@@ -655,8 +740,9 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
   so the comparison is task 0.4's ledger (by height), never `p5_compare` (it would fail on the marker lag). Run in D
   and in G mode (the two flag-on nodes gated on independent schedules).
 
-Step 3 size: ~700-1,000 lines, mostly tests (estimate; +100-150 for the all-skipped cases, the G-mode wiring of the
-matrix, the in-flight planted faults).
+Step 3 size: ~750-1,070 lines, mostly tests (estimate; +100-150 for the all-skipped cases, the G-mode wiring of the
+matrix, the in-flight planted faults; +50-70 in revision 2 for the `o0_crash` protocol, the seam latches and their
+two guards, R4).
 
 ### Step 4: node-local consumers, docs, review
 
@@ -701,10 +787,11 @@ together with the bench-queue defaults note ("an arm that leaves it unset gets i
   markers, `app.rs:28872-28874`, and fails S vs a checkpointing node on legitimate lag):
   - per height: `h_n` write-set hash, action-status row, side rows (receipts, tx index, hash -> number, CoreWriter
     links), compared as soon as both nodes have that height;
-  - per durable height: snapshot-consistent per-CF dump hashes (CF_HASHED_* and CF_TRIE_* included). A pipelined
-    node's dump at durable height d is compared with S's reference snapshot at d (S has one for every height), and the
-    incremental root against the full scan;
-  - O against B, O against S, B against S, and every height and shared durable height against the golden.
+  - per completed height: per-CF dump hashes (CF_HASHED_* and CF_TRIE_* included) from task 0.4's completion-hook
+    snapshot, taken after the EVM mirror resync (F11), never keyed by a marker read. A pipelined node's dump at
+    completed height d is compared with S's reference snapshot at d (S has one for every height), and the incremental
+    root against the full scan;
+  - O against B, O against S, B against S, and every height and shared completed height against the golden.
 - Run modes (task 0.4): D (drained lockstep, today's `P5Node`) and G (W-gated asynchronous: no drain, no forced
   checkpoint or barrier between blocks; the controller holds the parent's Flush, a checkpoint job or a deferred merge
   across EVM heights). D gives deterministic markers; only G reaches reads served by in-flight layers at interval 0
@@ -742,7 +829,7 @@ layer still answers, with bytes the DB already has).
 | C16 | revert dropping journal rows; caught inner frame; reader OOG | stream |
 | C17 | BLOCKHASH answered from the DB through the overlay | stream |
 | C18 | reader precompile deferred-read wait counted (<= 1 per EVM height) | held merge |
-| C19 | crash points of task 3.5, each with jobs held in flight | test switches, G mode |
+| C19 | crash points of task 3.5, each with jobs held in flight, crashed through the latch (`o0_crash`, never a bare drop: F10), the marker left at d and every height in (d, last] replayed | test switches, G mode |
 | C20 | an EVM height executed while its parent's Flush (interval 0) or a checkpoint job (interval) is held, with >= 1 in-flight read from that held layer | G mode |
 
 `o0_coverage_floor_per_config` asserts every row for every (configuration, run mode) where it is reachable. The
@@ -875,6 +962,12 @@ item 7 pre-genesis list, next to T.
    the in-flight counter and the skip-layer planted faults (5.4) close it. G mode is timing-driven; its coverage is
    forced by the gate, its results must be timing-free, and a watchdog turns a gate deadlock into a failure. Residual:
    a schedule the seeded gate never produces; the ignored 3,000-block variant runs more seeds.
+2c. **A harness that tests a crash that is not one, or compares half-written heights** (R4, R5): a bare drop lands
+   the held jobs (F10), and a marker-keyed snapshot can precede the EVM resync (F11). Closed by `o0_crash`'s latch and
+   its step-4 assertions with the guards `o0_bare_drop_lands_held_jobs` / `o0_crash_protocol_rejects_unlatched_crash`,
+   and by the completion hook with `o0_marker_keyed_snapshot_sees_pre_resync_mirror`. Residual: the hook sites are
+   test-only code on W and E. A new durable write after the hook (a later refactor) would reopen F11. The hook's
+   assert "marker in the snapshot == tag" catches a misplaced hook, but not a write added after it.
 3. **Window trie != per-block trie bytes** (CF_TRIE_* is node-local and unhashed, but the golden compares it).
    Decision 4 has the fallback.
 4. **The journal keeps L / C shared** -> deep copy at `take_layer`, or R rebuilt. Test 3.6 asserts 0; Q11 pass 4.
@@ -938,23 +1031,31 @@ item 7 pre-genesis list, next to T.
     in the ignored long variant. **Recommend a:** the in-flight floor and the skip-layer planted faults are only
     reachable in G; leaving them out of the per-commit gate repeats Phase 5 step 2's unreached-path lesson.
 
-Recommendations unchanged by revision 1: 1, 2, 4-10. Decision 1 (a) keeps the golden, now stored by height and by
-durable height (task 0.2). Decision 3 is no longer open.
+13. **(new, R4) How the crash tests crash.** (a) In process: latch the fail-stop (seam or `gate.fail_next()`), then
+    drop, as `ckpt_crash_replay_with` does; a bare drop is forbidden by the guard test. (b) The node as a child
+    process, SIGKILLed with W held. **Recommend a:** after the latch W writes nothing, and the atomic batch makes a
+    kill land all of a job or none of it, so (b) reaches no extra path at the cost of a process harness in a unit test.
+    The real kill stays in Q11's SIGKILL cell.
+
+Recommendations unchanged by revisions 1 and 2: 1, 2, 4-10, 12. Decision 1 (a) keeps the golden, now stored by height
+and by completed height (task 0.2). Decision 3 is no longer open.
 
 ## 11. Commit groups and size
 
 | group | tasks | content | size (lines, incl. tests; estimate) | builder hours (estimate) |
 |---|---|---|---|---|
-| G0 | 0.1-0.4 | stream, golden, probes, ledger comparator, G-mode runner | 1,050-1,350 | 13-17 |
+| G0 | 0.1-0.4 | stream, golden, probes, ledger comparator, completion hook, G-mode runner | 1,120-1,450 | 14-18 |
 | G1a | 1.1 | F1 dependency check + classification audit (the fix itself is on `fix/precompile-read-error-fail-stop`, not counted) | 50-150 | 1-2 |
 | G1b | 1.2-1.7 | absorb, overlay first, typed entry points, tripwire, docs | 450-650 | 9-12 |
 | G2 | 2.1-2.4 | W: side rows (Marker included), EVM trie step, stale marker, jobs | 580-800 | 11-15 |
-| G3 | 3.1-3.8 | flag, fast-path section, all-skipped cases, faults, crashes, harness matrix (D + G) | 700-1,000 | 13-18 |
+| G3 | 3.1-3.8 | flag, fast-path section, all-skipped cases, faults, latched crashes, harness matrix (D + G) | 750-1,070 | 14-19 |
 | G4 | 4.1-4.4 | mempool view prune, metrics, docs, review fixes | 150-300 | 4-6 + review |
-| | | **total** | **~3.0-4.3k** | **~51-70 h** |
+| | | **total** | **~3.1-4.5k** | **~53-72 h** |
 
 Revision 1 changes the total from ~2.6-3.7k / 45-62 h: +350-450 for task 0.4 (R2), +30-50 in G2 and +100-150 in G3
 for the all-skipped side rows and the G-mode matrix (R1, R2), -100 in G1a (the F1 fix moved to its own branch, R3).
+Revision 2 adds +70-100 in G0 (completion hook, resync seam, guards, R5) and +50-70 in G3 (crash protocol, R4):
+~3.0-4.3k / 51-70 h -> ~3.1-4.5k / 53-72 h.
 The design said ~1.5-2.2k. The difference is the reference and the coverage proof the s128 lessons ask for
 (G0, ~1.2k), the F1 audit, the stale-trie handling (F4) and the per-config coverage floor. G1a waits for the F1 fix
 (gate D1) and can go in parallel with G0; the rest is sequential, and G3 cannot start before D1 holds. Q11 is ~2 h 20 of bench time plus the extra cells (bench agent). Each group passes
