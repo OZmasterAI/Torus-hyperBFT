@@ -5470,11 +5470,14 @@ mod header_resend_tests {
     }
 
     #[test]
-    fn header_resend_flag_defaults_to_3s_and_zero_disables() {
-        assert_eq!(parse_header_resend_ms(None), Some(Duration::from_millis(3000)));
+    fn header_resend_flag_defaults_to_250ms_and_zero_disables() {
+        assert_eq!(parse_header_resend_ms(None), Some(Duration::from_millis(250)));
         assert_eq!(parse_header_resend_ms(Some("0".into())), None);
+        assert_eq!(parse_header_resend_ms(Some(" 0 ".into())), None);
         assert_eq!(parse_header_resend_ms(Some(" 1500 ".into())), Some(Duration::from_millis(1500)));
-        assert_eq!(parse_header_resend_ms(Some("junk".into())), Some(Duration::from_millis(3000)));
+        assert_eq!(parse_header_resend_ms(Some("3000".into())), Some(Duration::from_millis(3000)));
+        assert_eq!(parse_header_resend_ms(Some("junk".into())), Some(Duration::from_millis(250)));
+        assert_eq!(parse_header_resend_ms(Some("".into())), Some(Duration::from_millis(250)));
     }
 
     struct NoBodyApp;

@@ -4944,11 +4944,25 @@ mod parallel_cancel_all_toggle_tests {
         DEFAULT_PARALLEL_CANCEL_ALL_MIN_VISITS, MAX_PARALLEL_CANCEL_ALL_WORKERS,
     };
 
-    /// Default OFF: unset, 0, 1 and garbage all give the serial loop.
+    /// Default ON (owner s128, bench sections 82-84): unset, empty or
+    /// whitespace-only give the default 8 workers.
     #[test]
-    fn default_and_low_values_are_serial() {
-        assert_eq!(parse_parallel_cancel_all_workers(None), 1);
-        for v in ["0", "1", " 1 ", "", "on", "true", "-3", "2.5", "eight"] {
+    fn unset_or_empty_is_the_default_eight_workers() {
+        assert_eq!(parse_parallel_cancel_all_workers(None), 8);
+        for v in ["", " ", "\t"] {
+            assert_eq!(
+                parse_parallel_cancel_all_workers(Some(v.to_string())),
+                8,
+                "{v:?}"
+            );
+        }
+    }
+
+    /// Explicit `0` / `1` keep the serial loop; garbage is serial too (the
+    /// safe reading: a typo never turns on the pool).
+    #[test]
+    fn explicit_low_values_and_garbage_are_serial() {
+        for v in ["0", " 0 ", "1", " 1 ", "on", "true", "-3", "2.5", "eight"] {
             assert_eq!(
                 parse_parallel_cancel_all_workers(Some(v.to_string())),
                 1,

@@ -1120,19 +1120,22 @@ mod tests {
         assert!(!parse_exec_pipeline_toggle(Some(" 0 ".to_string())));
     }
 
-    /// s124: `TORUS_EPOCH_FAST_PATH` is opt-in. `1` / `true` (any case,
-    /// trimmed) turn it on; unset, empty, `0`, `false` and anything else
-    /// (warned) leave it off.
+    /// s128: `TORUS_EPOCH_FAST_PATH` is on by default (owner s128, bench
+    /// section 84). Unset, empty, `1` / `true` (any case, trimmed) = on;
+    /// `0` / `false` = off; anything else = off with a warning, so a typo
+    /// never silently enables a consensus-timing change.
     #[test]
-    fn epoch_fast_path_parse_default_off() {
-        assert!(!parse_epoch_fast_path(None));
-        for v in [
-            "", " ", "0", " 0 ", "false", "FALSE", "off", "on", "yes", "2",
-        ] {
+    fn epoch_fast_path_parse_default_on() {
+        assert!(parse_epoch_fast_path(None));
+        for v in ["", " ", "1", " 1 ", "true", "TRUE", "True"] {
+            assert!(parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
+        }
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
         }
-        for v in ["1", " 1 ", "true", "TRUE", "True"] {
-            assert!(parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
+        // Garbage: off (warned), never on.
+        for v in ["off", "on", "yes", "2", "ture", "-1"] {
+            assert!(!parse_epoch_fast_path(Some(v.to_string())), "{v:?}");
         }
     }
 
