@@ -108,6 +108,38 @@ fn state_has_chain(db: &StateDb) -> Result<bool, String> {
     Ok(false)
 }
 
+/// Genesis has already been applied to this data dir.
+pub fn genesis_applied(dbs: &NodeDbs) -> Result<bool, String> {
+    let accounts = dbs
+        .state
+        .all_accounts()
+        .map_err(|e| format!("probe genesis: {e}"))?;
+    Ok(!accounts.is_empty())
+}
+
+/// Boot step 4: seed `genesis` (state, then the HotStuff replica) unless
+/// [`genesis_applied`]. Returns whether it seeded.
+pub fn apply_genesis_if_fresh(
+    dbs: &NodeDbs,
+    genesis: &torus_genesis::Genesis,
+) -> Result<bool, String> {
+    if genesis_applied(dbs)? {
+        tracing::info!("database already initialized, skipping genesis");
+        return Ok(false);
+    }
+    tracing::info!("initializing from genesis");
+    let state_root = genesis
+        .initialize(&dbs.state)
+        .map_err(|e| format!("genesis initialize: {e}"))?;
+    tracing::info!(%state_root, "genesis state seeded");
+    let (app_state, vs_state) = genesis
+        .to_hotstuff_genesis()
+        .map_err(|e| format!("genesis hotstuff state: {e}"))?;
+    hotstuff_rs::replica::Replica::initialize(dbs.kv_store(), app_state, vs_state);
+    tracing::info!("consensus replica initialized with genesis validator set");
+    Ok(true)
+}
+
 /// Open the state DB and the consensus DB under `data_dir`, apply the
 /// restart rule, and attach the consensus DB's WAL to the state DB's
 /// `sync_wal`.
@@ -366,6 +398,162 @@ mod tests {
         let err = open_node_dbs(dir.path()).err().expect("must refuse");
         assert!(err.contains("state DB"), "{err}");
         assert!(err.contains("is empty"), "{err}");
+    }
+
+    // ---- Boot step 4: genesis applied once, cheap probe (bench queue 8f) ----
+
+    use torus_state::cf::{CF_FEE_CONFIG, CF_STAKING_VALIDATORS as CF_VALIDATORS};
+
+    fn genesis_without_accounts() -> torus_genesis::Genesis {
+        let mut g: serde_json::Value =
+            serde_json::from_str(include_str!("../../../devnet/genesis.json")).unwrap();
+        g["accounts"] = serde_json::json!([]);
+        g["evm_alloc"] = serde_json::json!({});
+        torus_genesis::Genesis::from_json(&g.to_string()).unwrap()
+    }
+
+    /// Every row genesis writes that a restart must leave alone.
+    fn chain_rows(dbs: &NodeDbs) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let mut rows: Vec<_> = [CF_ACCOUNTS, CF_VALIDATORS, CF_FEE_CONFIG]
+            .into_iter()
+            .map(|cf| (cf, StateBackend::iterate_cf(&dbs.state, cf, None).unwrap()))
+            .collect();
+        rows.push((
+            "consensus-db",
+            StateBackend::iterate_cf(&dbs.consensus, CF_CONSENSUS_META, None).unwrap(),
+        ));
+        rows
+    }
+
+    fn advance_hotstuff_view(dbs: &NodeDbs, view: u64) {
+        let mut kv = dbs.kv_store();
+        let mut wb = RocksWriteBatch::new();
+        wb.set(&HIGHEST_VIEW_ENTERED, &view.to_le_bytes());
+        kv.write(wb);
+    }
+
+    /// A fresh data dir is seeded once; a restart skips genesis and leaves
+    /// state and HotStuff state as they were.
+    #[test]
+    fn genesis_is_applied_once_and_a_restart_skips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = genesis();
+        let before = {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            assert!(!genesis_applied(&dbs).unwrap());
+            assert!(apply_genesis_if_fresh(&dbs, &g).unwrap(), "fresh dir seeded");
+            assert!(genesis_applied(&dbs).unwrap());
+            assert!(!StateBackend::iterate_cf(&dbs.state, CF_ACCOUNTS, None)
+                .unwrap()
+                .is_empty());
+            // A chain that moved on after genesis.
+            advance_hotstuff_view(&dbs, 42);
+            dbs.state
+                .put_cf_raw(CF_FEE_CONFIG, b"gov_params", b"changed by governance")
+                .unwrap();
+            chain_rows(&dbs)
+        };
+        let dbs = open_node_dbs(dir.path()).expect("restart");
+        assert!(!apply_genesis_if_fresh(&dbs, &g).unwrap(), "restart re-seeded genesis");
+        assert_eq!(chain_rows(&dbs), before, "restart changed state");
+    }
+
+    /// A chain whose genesis has no EVM accounts (validators only) is still
+    /// initialized: a restart must not re-seed it or reset the HotStuff
+    /// locks / view. Before: `all_accounts().is_empty()` re-ran genesis and
+    /// `Replica::initialize` on every boot.
+    #[test]
+    fn zero_account_chain_restart_skips_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = genesis_without_accounts();
+        let before = {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            assert!(apply_genesis_if_fresh(&dbs, &g).unwrap());
+            assert!(StateBackend::iterate_cf(&dbs.state, CF_ACCOUNTS, None)
+                .unwrap()
+                .is_empty());
+            advance_hotstuff_view(&dbs, 42);
+            chain_rows(&dbs)
+        };
+        let dbs = open_node_dbs(dir.path()).expect("restart");
+        assert!(genesis_applied(&dbs).unwrap(), "zero-account chain seen as fresh");
+        assert!(!apply_genesis_if_fresh(&dbs, &g).unwrap());
+        assert_eq!(chain_rows(&dbs), before, "restart reset state / HotStuff view");
+    }
+
+    /// Equivalence with the old check (`!all_accounts().is_empty()`) on every
+    /// case it distinguishes, across HotStuff state present / absent (the
+    /// probe is called with the DBs opened directly, so the restart rule does
+    /// not filter any combination out). The one new verdict: no accounts but
+    /// HotStuff initialized is "applied".
+    #[test]
+    fn probe_matches_the_old_all_accounts_check() {
+        for (accounts, hotstuff) in [(false, false), (true, false), (false, true), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let dbs = NodeDbs {
+                state: StateDb::open(dir.path()).unwrap(),
+                consensus: StateDb::open_consensus(&consensus_db_path(dir.path())).unwrap(),
+            };
+            if accounts {
+                dbs.state
+                    .put_cf_raw(CF_ACCOUNTS, &[7u8; 20], &[0u8; 72])
+                    .unwrap();
+            }
+            if hotstuff {
+                let (app_state, vs_state) = genesis().to_hotstuff_genesis().unwrap();
+                Replica::initialize(dbs.kv_store(), app_state, vs_state);
+            }
+            let old = !dbs.state.all_accounts().unwrap().is_empty();
+            let new = genesis_applied(&dbs).unwrap();
+            if accounts {
+                assert_eq!(new, old, "accounts={accounts} hotstuff={hotstuff}");
+            } else {
+                assert!(!old);
+                assert_eq!(new, hotstuff, "accounts=false hotstuff={hotstuff}");
+            }
+        }
+    }
+
+    /// Crash inside genesis init before any account / validator row (only
+    /// contract code written): the restart rule lets it through and genesis
+    /// runs again, as before. A crash after the first account or validator
+    /// row is refused at open (`chain_without_hotstuff_state_is_refused`).
+    #[test]
+    fn crash_before_the_first_genesis_row_reseeds() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let dbs = open_node_dbs(dir.path()).unwrap();
+            dbs.state
+                .put_code(&alloy_primitives::B256::repeat_byte(1), b"\x60\x00")
+                .unwrap();
+        }
+        let dbs = open_node_dbs(dir.path()).expect("no chain rows yet");
+        assert!(!genesis_applied(&dbs).unwrap());
+        assert!(apply_genesis_if_fresh(&dbs, &genesis()).unwrap());
+        drop(dbs);
+        let dbs = open_node_dbs(dir.path()).expect("restart after the reseed");
+        assert!(genesis_applied(&dbs).unwrap());
+    }
+
+    /// The probe reads at most one account row. Many accounts are seeded
+    /// plus a malformed row sorting last: a scan (the old `all_accounts`)
+    /// reaches it and errors; the probe never does.
+    #[test]
+    fn probe_does_not_scan_the_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let dbs = open_node_dbs(dir.path()).unwrap();
+        init_chain(&dbs);
+        for i in 0u32..20_000 {
+            let mut a = [0u8; 20];
+            a[..4].copy_from_slice(&i.to_be_bytes());
+            // An encoded account row (72 bytes: balance, nonce, code hash).
+            dbs.state.put_cf_raw(CF_ACCOUNTS, &a, &[0u8; 72]).unwrap();
+        }
+        dbs.state
+            .put_cf_raw(CF_ACCOUNTS, &[0xff; 21], b"not an account")
+            .unwrap();
+        assert!(dbs.state.all_accounts().is_err(), "a scan reaches the bad row");
+        assert!(genesis_applied(&dbs).expect("probe read past the first row"));
     }
 
     #[test]
