@@ -325,12 +325,29 @@ async fn scrape(client: &reqwest::Client, url: &str) -> Counters {
     ))
 }
 
-async fn scrape_all(client: &reqwest::Client, urls: &[String]) -> Vec<Counters> {
+/// Longest a single /metrics scrape may take (the client's request timeout).
+const SCRAPE_MAX: Duration = Duration::from_secs(30);
+
+/// Every node's counters, each scrape bounded by min(SCRAPE_MAX, the time left
+/// to `deadline`); once the deadline has passed no request is made (`None`).
+async fn scrape_all(client: &reqwest::Client, urls: &[String], deadline: Instant) -> Vec<Counters> {
     let mut out = Vec::with_capacity(urls.len());
     for u in urls {
-        out.push(scrape(client, u).await);
+        let now = Instant::now();
+        let c = if now >= deadline {
+            None
+        } else {
+            let until = deadline.min(now + SCRAPE_MAX);
+            tokio::time::timeout_at(until.into(), scrape(client, u)).await.ok().flatten()
+        };
+        out.push(c);
     }
     out
+}
+
+/// Sleep `d`, but never past `deadline`.
+async fn sleep_by(d: Duration, deadline: Instant) {
+    tokio::time::sleep_until(deadline.min(Instant::now() + d).into()).await;
 }
 
 /// min over nodes of `now - base` (resting), `None` if any node is unreadable.
@@ -395,7 +412,7 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     // ONE deadline for everything: pacing, permits, requests, resends, joins
     // and the resting wait. Nothing is sent once it has passed.
     let deadline = t0 + a.timeout;
-    let base = scrape_all(&client, &murls).await;
+    let base = scrape_all(&client, &murls, deadline).await;
     let keys: Arc<Vec<SigningKey>> = Arc::new(
         super::load_sender_keys(plan.owners as usize, plan.owner_offset)
             .into_iter()
@@ -531,7 +548,7 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
     let mut now = base.clone();
     loop {
         if !murls.is_empty() {
-            now = scrape_all(&client, &murls).await;
+            now = scrape_all(&client, &murls, deadline).await;
             if let Some(r) = min_delta(&base, &now, |c| c.0) {
                 if r > best {
                     best = r;
@@ -547,7 +564,7 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
         if murls.is_empty() || Instant::now() >= deadline || last_progress.elapsed() >= a.stall {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        sleep_by(Duration::from_secs(1), deadline).await;
     }
     rep.resting = if murls.is_empty() { None } else { min_delta(&base, &now, |c| c.0) };
     rep.resting_by_node = base
@@ -562,15 +579,16 @@ pub async fn run(plan: &PreloadPlan, a: RunArgs<'_>) -> PreloadReport {
         .collect();
     // The gauge is set at the start of the NEXT native block: give it a few s
     // (reporting only; `reached` is already decided).
-    let gauge_deadline = Instant::now() + Duration::from_secs(if rep.reached { 10 } else { 0 });
+    let gauge_deadline = deadline.min(Instant::now() + Duration::from_secs(if rep.reached { 10 } else { 0 }));
     loop {
-        let g: Vec<Option<u64>> = scrape_all(&client, &murls).await.iter().map(|c| c.map(|c| c.2)).collect();
+        let g: Vec<Option<u64>> =
+            scrape_all(&client, &murls, deadline).await.iter().map(|c| c.map(|c| c.2)).collect();
         let done = g.iter().all(|v| v.is_some_and(|v| v >= plan.target));
         rep.resting_gauge_by_node = g;
         if done || Instant::now() >= gauge_deadline || murls.is_empty() {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        sleep_by(Duration::from_secs(1), gauge_deadline).await;
     }
     rep.seconds = t0.elapsed().as_secs_f64();
     rep
@@ -799,6 +817,8 @@ mod tests {
         rpc_calls: std::sync::atomic::AtomicUsize,
         bodies: Mutex<Vec<String>>,
         scrapes: std::sync::atomic::AtomicUsize,
+        /// Delay before every /metrics reply.
+        metrics_delay: Duration,
     }
 
     async fn serve(stub: Arc<Stub>) -> String {
@@ -838,7 +858,7 @@ mod tests {
                     let (delay, body) = if first.starts_with("GET /metrics") {
                         let k = stub.scrapes.fetch_add(1, Ordering::SeqCst);
                         let (r, p, g) = (stub.metrics)(k);
-                        (Duration::ZERO, Some(format!("{M_RESTING} {r}\n{M_PLACED} {p}\n{M_GAUGE} {g}\n")))
+                        (stub.metrics_delay, Some(format!("{M_RESTING} {r}\n{M_PLACED} {p}\n{M_GAUGE} {g}\n")))
                     } else {
                         stub.bodies.lock().unwrap().push(String::from_utf8_lossy(&buf[head_end..]).to_string());
                         let k = stub.rpc_calls.fetch_add(1, Ordering::SeqCst);
@@ -880,6 +900,7 @@ mod tests {
             rpc_calls: Default::default(),
             bodies: Default::default(),
             scrapes: Default::default(),
+            metrics_delay: Duration::ZERO,
         });
         let url = serve(stub.clone()).await;
         let m = format!("{url}/metrics");
@@ -908,6 +929,7 @@ mod tests {
             rpc_calls: Default::default(),
             bodies: Default::default(),
             scrapes: Default::default(),
+            metrics_delay: Duration::ZERO,
         });
         let url = serve(stub.clone()).await;
         let m = format!("{url}/metrics");
@@ -933,12 +955,37 @@ mod tests {
             rpc_calls: Default::default(),
             bodies: Default::default(),
             scrapes: Default::default(),
+            metrics_delay: Duration::ZERO,
         });
         let url = serve(stub.clone()).await;
         let m = format!("{url}/metrics");
         let rep = run(&small_plan(1), RunArgs { stall: Duration::from_secs(1), ..args(&url, &m, Duration::from_secs(5)) }).await;
         assert_eq!((rep.actions_failed, rep.duplicate_after_resend), (1, 0), "{rep:?}");
         assert!(!rep.reached);
+    }
+
+    /// Codex P2 (rest of the timeout fix): slow /metrics (4 s per scrape, 3
+    /// nodes) must not stretch a 1 s run: the baseline, resting and gauge
+    /// scrapes and the polling sleeps all end at the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_metrics_do_not_overrun_the_timeout() {
+        let stub = Arc::new(Stub {
+            rpc: Box::new(|_| (Duration::ZERO, Some(OK.to_string()))),
+            metrics: Box::new(|_| (8, 8, 8)),
+            rpc_calls: Default::default(),
+            bodies: Default::default(),
+            scrapes: Default::default(),
+            metrics_delay: Duration::from_secs(4),
+        });
+        let url = serve(stub.clone()).await;
+        let m = format!("{url}/metrics,{url}/metrics,{url}/metrics");
+        let t0 = Instant::now();
+        let rep = run(&small_plan(8), args(&url, &m, Duration::from_secs(1))).await;
+        let took = t0.elapsed();
+        assert!(took < Duration::from_millis(1_800), "run took {took:?}");
+        assert!(!rep.reached);
+        assert_eq!(rep.resting, None, "no scrape answered by the deadline");
+        assert!(rep.resting_gauge_by_node.iter().all(Option::is_none), "{rep:?}");
     }
 
     #[test]
