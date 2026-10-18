@@ -507,6 +507,11 @@ pub struct Metrics {
     /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
     /// (record the height's row, delete aged bodies and shards: one batch).
     pub da_gc_seconds: Histogram,
+    /// RH4: DA body GC passes that deleted nothing because the GC bookkeeping
+    /// was behind the dispatched height and could not be back-filled from the
+    /// block tree (a block missing or unreadable). The bodies stay; the next
+    /// pass retries.
+    pub da_gc_held_passes: Counter,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -2202,6 +2207,12 @@ impl Metrics {
             "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
             da_gc_seconds.clone(),
         );
+        let da_gc_held_passes = Counter::default();
+        registry.register(
+            "torus_da_gc_held_passes",
+            "DA body GC passes that deleted nothing: GC records behind and not back-fillable from the block tree (RH4)",
+            da_gc_held_passes.clone(),
+        );
 
         let exec_resting_orders = Gauge::default();
         registry.register(
@@ -3016,6 +3027,7 @@ impl Metrics {
             mempool_remove_committed_seconds,
             da_bodies_gc_deleted,
             da_gc_seconds,
+            da_gc_held_passes,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_resident_rows,

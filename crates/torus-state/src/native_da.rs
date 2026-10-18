@@ -244,6 +244,43 @@ pub struct DaGcOutcome {
     /// Hashes the recorded block re-includes that an earlier, still pending
     /// row listed: moved to this height, their bodies now go with it.
     pub references_moved: u64,
+    /// Heights below `height` whose records this pass wrote from the
+    /// [`DaGcHistory`] (the GC bookkeeping was behind: a crash between the
+    /// body write and the GC record, or a failed record write).
+    pub heights_backfilled: u64,
+    /// The pass deleted nothing because the bookkeeping is still behind (a
+    /// height the history could not supply) or a skipped height is still
+    /// inside the window or the tree margin. The bodies stay; the next pass
+    /// retries.
+    pub deletion_held: bool,
+}
+
+/// Where the GC re-reads committed heights it has no record for
+/// ([`NativeDaStore::gc_committed_with_history`]): the consensus app's block
+/// tree.
+pub trait DaGcHistory {
+    /// Heights below this are pruned: never served again, so not needed.
+    /// `0` = nothing pruned.
+    fn pruned_below(&self) -> Result<u64, StateError>;
+    /// The native-action hashes committed at `height` (at or above
+    /// [`pruned_below`](Self::pruned_below)). `Ok(None)` = not available (a
+    /// missing block): the GC then deletes nothing until it is.
+    fn committed_hashes(&self, height: u64) -> Result<Option<Vec<B256>>, StateError>;
+}
+
+/// A history that knows no height: a gap in the GC bookkeeping holds every
+/// deletion (the safe default of [`NativeDaStore::gc_committed`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoDaGcHistory;
+
+impl DaGcHistory for NoDaGcHistory {
+    fn pruned_below(&self) -> Result<u64, StateError> {
+        Ok(0)
+    }
+
+    fn committed_hashes(&self, _height: u64) -> Result<Option<Vec<B256>>, StateError> {
+        Ok(None)
+    }
 }
 
 impl NativeDaStore {
@@ -493,6 +530,30 @@ impl NativeDaStore {
         retention: u64,
         keep_from: u64,
         limits: DaGcLimits,
+    ) -> Result<DaGcOutcome, StateError> {
+        self.gc_committed_with_history(
+            height,
+            hashes,
+            shard_count,
+            retention,
+            keep_from,
+            limits,
+            &NoDaGcHistory,
+        )
+    }
+
+    /// [`gc_committed`](Self::gc_committed) with a [`DaGcHistory`] to
+    /// back-fill missed heights from.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gc_committed_with_history(
+        &self,
+        height: u64,
+        hashes: &[B256],
+        shard_count: u16,
+        retention: u64,
+        keep_from: u64,
+        limits: DaGcLimits,
+        _history: &dyn DaGcHistory,
     ) -> Result<DaGcOutcome, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let state = DaGcState::decode(
@@ -1339,6 +1400,12 @@ mod tests {
         reopened
             .gc_committed(20, &[ha], 0, 8, UNCAPPED, LIMITS)
             .unwrap();
+        // Every height dispatches (a skipped one is a gap in the bookkeeping).
+        for height in 21..28 {
+            reopened
+                .gc_committed(height, &[], 0, 8, UNCAPPED, LIMITS)
+                .unwrap();
+        }
         assert_eq!(
             reopened
                 .gc_committed(28, &[], 0, 8, UNCAPPED, LIMITS)
@@ -1394,6 +1461,9 @@ mod tests {
                 .unwrap();
         }
         assert!(actions.iter().all(|a| present(&store, a)), "keep_from 0");
+        for h in 13..100 {
+            store.gc_committed(h, &[], 0, 1, 0, LIMITS).unwrap();
+        }
         // Every row aged out of window 1 by 100; keep_from 11 frees height 10.
         let out = store.gc_committed(100, &[], 0, 1, 11, LIMITS).unwrap();
         assert_eq!((out.rows_deleted, out.backlog), (1, false));
@@ -1546,6 +1616,9 @@ mod tests {
                 .gc_committed(10, &hashes, 0, W, UNCAPPED, LIMITS)
                 .unwrap();
             let fresh = started.elapsed();
+            for h in 11..10 + W {
+                store.gc_committed(h, &[], 0, W, UNCAPPED, LIMITS).unwrap();
+            }
             // 10 + W: this pass re-includes every hash of row 10 AND ages it out.
             let started = std::time::Instant::now();
             let out = store
@@ -1693,6 +1766,212 @@ mod tests {
         panic!("re-including {ROWS} hashes from {ROWS} rows cost {ratios:.1?} x recording them");
     }
 
+    /// A test [`DaGcHistory`]: `known` heights, every height below `pruned`
+    /// pruned, every other height `empty` (known, no actions) or unknown;
+    /// `fail` = every read errors.
+    #[derive(Default)]
+    struct TestHistory {
+        pruned: u64,
+        known: std::collections::BTreeMap<u64, Vec<B256>>,
+        empty: bool,
+        fail: bool,
+    }
+
+    impl DaGcHistory for TestHistory {
+        fn pruned_below(&self) -> Result<u64, StateError> {
+            if self.fail {
+                return Err(StateError::InvalidData("test history read".into()));
+            }
+            Ok(self.pruned)
+        }
+
+        fn committed_hashes(&self, height: u64) -> Result<Option<Vec<B256>>, StateError> {
+            if self.fail {
+                return Err(StateError::InvalidData("test history read".into()));
+            }
+            assert!(height >= self.pruned, "pruned height {height} read");
+            Ok(match self.known.get(&height) {
+                Some(hashes) => Some(hashes.clone()),
+                None if self.empty => Some(vec![]),
+                None => None,
+            })
+        }
+    }
+
+    fn history(rows: &[(u64, Vec<B256>)]) -> TestHistory {
+        TestHistory {
+            known: rows.iter().cloned().collect(),
+            empty: true,
+            ..TestHistory::default()
+        }
+    }
+
+    fn gc_h(
+        store: &NativeDaStore,
+        height: u64,
+        hashes: &[B256],
+        retention: u64,
+        history: &TestHistory,
+    ) -> DaGcOutcome {
+        store
+            .gc_committed_with_history(height, hashes, 0, retention, UNCAPPED, LIMITS, history)
+            .unwrap()
+    }
+
+    /// Every key and value of `CF_NATIVE_PENDING` (bodies and bookkeeping).
+    fn dump(store: &NativeDaStore) -> Vec<(Vec<u8>, Vec<u8>)> {
+        use crate::StateBackend;
+        store.db.iterate_cf(CF_NATIVE_PENDING, None).unwrap()
+    }
+
+    /// Codex P1 (pre-merge review, failed record): the write that records a
+    /// re-inclusion fails. It is not dropped: the next pass back-fills it
+    /// from the history before deleting anything, so the body stays until
+    /// the re-including height's window ends while the earlier row's other
+    /// body still goes on time.
+    #[test]
+    fn gc_failed_record_write_is_backfilled_before_any_deletion() {
+        const W: u64 = 8;
+        let (dir, store) = temp_store();
+        let (x, y) = (dummy_action(1), dummy_action(2));
+        let (hx, hy) = (compute_action_hash(&x), compute_action_hash(&y));
+        store.put_batch(&[x.clone(), y.clone()]).unwrap();
+        let hist = history(&[(10, vec![hx, hy]), (13, vec![hx])]);
+        for h in 10..=12 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        drop(store);
+        // The record of height 13 fails: the DB rejects the write.
+        {
+            let ro = NativeDaStore::new(StateDb::open_read_only(dir.path()).unwrap());
+            assert!(ro
+                .gc_committed_with_history(13, &[hx], 0, W, UNCAPPED, LIMITS, &hist)
+                .is_err());
+        }
+        let store = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+        for tip in 14..=13 + W {
+            let out = gc_h(&store, tip, &[], W, &hist);
+            if tip == 14 {
+                assert_eq!(out.heights_backfilled, 1, "height 13's record lands on retry");
+            }
+            assert_eq!(present(&store, &y), tip < 10 + W, "y (row 10) at tip {tip}");
+            assert_eq!(present(&store, &x), tip < 13 + W, "x (re-included at 13) at tip {tip}");
+        }
+        assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
+    }
+
+    /// A gap the history cannot fill (a missing block, a read error): the
+    /// pass deletes nothing, however due the rows are, and says so; once the
+    /// history supplies the heights the deletions resume.
+    #[test]
+    fn gc_unfillable_gap_holds_every_deletion_until_filled() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let x = dummy_action(1);
+        let hx = compute_action_hash(&x);
+        store.put(&x).unwrap();
+        let full = history(&[(10, vec![hx])]);
+        for h in 10..=12 {
+            let hashes = full.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &full);
+        }
+        // 13..=19 never recorded; the history does not have them.
+        let missing = TestHistory {
+            known: full.known.clone(),
+            ..TestHistory::default()
+        };
+        let out = gc_h(&store, 20, &[], W, &missing);
+        assert!(out.deletion_held, "row 10 is due at 20 but 13..=19 are unknown");
+        assert_eq!(out.rows_deleted, 0);
+        assert!(present(&store, &x));
+        let broken = TestHistory {
+            fail: true,
+            ..TestHistory::default()
+        };
+        let out = gc_h(&store, 21, &[], W, &broken);
+        assert!(out.deletion_held, "a history read error holds too");
+        assert!(present(&store, &x));
+        // Filled: 13..=21 back-filled (20 and 21 included: their own passes
+        // recorded nothing), then row 10 goes.
+        let out = gc_h(&store, 22, &[], W, &full);
+        assert_eq!((out.heights_backfilled, out.deletion_held), (9, false));
+        assert_eq!(out.rows_deleted, 1);
+        assert!(!present(&store, &x));
+    }
+
+    /// A gap below the history's pruned height is skipped (those blocks are
+    /// never served again), but nothing goes until every skipped height is
+    /// itself due: one of them may have re-included a body an older row
+    /// lists.
+    #[test]
+    fn gc_pruned_gap_holds_deletion_until_the_skipped_heights_are_due() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let x = dummy_action(1);
+        let hx = compute_action_hash(&x);
+        store.put(&x).unwrap();
+        let hist = TestHistory {
+            pruned: 30,
+            empty: true,
+            ..TestHistory::default()
+        };
+        gc_h(&store, 10, &[hx], W, &hist);
+        // 11..=29 pruned (skipped), 30 and 31 back-filled; skipped 29 is due
+        // only at 33.
+        let out = gc_h(&store, 32, &[], W, &hist);
+        assert_eq!(out.heights_backfilled, 2);
+        assert!(out.deletion_held);
+        assert!(present(&store, &x), "row 10 waits for skipped 29 to be due");
+        let out = gc_h(&store, 33, &[], W, &hist);
+        assert_eq!((out.rows_deleted, out.deletion_held), (1, false));
+        assert!(!present(&store, &x));
+    }
+
+    /// Idempotence: back-filling heights writes exactly what recording them
+    /// live wrote (re-inclusions across the back-filled heights included),
+    /// and replaying already recorded heights, live or after a back-fill,
+    /// changes nothing. Both stores then GC identically.
+    #[test]
+    fn gc_backfill_matches_live_recording_and_replays_change_nothing() {
+        const W: u64 = 6;
+        let actions: Vec<_> = (1..=4).map(dummy_action).collect();
+        let h: Vec<B256> = actions.iter().map(compute_action_hash).collect();
+        let sched = history(&[
+            (10, vec![h[0], h[1]]),
+            (12, vec![h[0]]),
+            (13, vec![h[2], h[0], h[0]]),
+            (15, vec![h[3], h[2]]),
+        ]);
+        let at = |height: u64| sched.known.get(&height).cloned().unwrap_or_default();
+        let (_d1, live) = temp_store();
+        let (_d2, filled) = temp_store();
+        for store in [&live, &filled] {
+            store.put_batch(&actions).unwrap();
+        }
+        for tip in 10..=16 {
+            gc_h(&live, tip, &at(tip), W, &sched);
+        }
+        gc_h(&filled, 10, &at(10), W, &sched);
+        let out = gc_h(&filled, 16, &at(16), W, &sched);
+        assert_eq!(out.heights_backfilled, 5, "11..=15");
+        assert_eq!(dump(&filled), dump(&live), "back-fill = live recording");
+        let before = dump(&live);
+        for tip in [10, 13, 15, 16] {
+            gc_h(&live, tip, &at(tip), W, &sched);
+            gc_h(&filled, tip, &at(tip), W, &sched);
+        }
+        assert_eq!(dump(&live), before, "a replay changes nothing");
+        assert_eq!(dump(&filled), before);
+        for tip in 17..=15 + W {
+            gc_h(&live, tip, &[], W, &sched);
+            gc_h(&filled, tip, &[], W, &sched);
+            assert_eq!(dump(&filled), dump(&live), "tip {tip}");
+            assert_eq!(present(&live, &actions[0]), tip < 13 + W, "x at tip {tip}");
+        }
+        assert_eq!(bookkeeping_keys(&live), 1, "only the GC state key remains");
+    }
+
     /// Markers across a bounded pass: a pass stopped by its row limit leaves
     /// the next row's markers for the next pass (its moved hash stays), and a
     /// marker without a row (none in a consistent store) goes once the GC
@@ -1729,6 +2008,9 @@ mod tests {
                     &[],
                 )
                 .unwrap();
+        }
+        for height in 13..15 {
+            store.gc_committed(height, &[], 0, W, 0, LIMITS).unwrap();
         }
         let live = |store: &NativeDaStore| -> Vec<bool> {
             actions.iter().map(|a| present(store, a)).collect()

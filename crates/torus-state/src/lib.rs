@@ -38,7 +38,9 @@ pub use db::{
     RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,
 };
 pub use error::StateError;
-pub use native_da::{DaGcLimits, DaGcOutcome, DaReadTiming, NativeDaStore};
+pub use native_da::{
+    DaGcHistory, DaGcLimits, DaGcOutcome, DaReadTiming, NativeDaStore, NoDaGcHistory,
+};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
 pub use read_view::ReadView;
