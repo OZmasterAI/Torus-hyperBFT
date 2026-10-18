@@ -8,7 +8,9 @@ use rocksdb::WriteBatch;
 use crate::cf::{CF_ACCOUNTS, CF_SESSIONS};
 use crate::db::{decode_account_info, encode_account_info, StateDb};
 use crate::error::StateError;
-use crate::resident_rows::{Resident, ResidentChange, ResidentDelta, ResidentRows, RESIDENT_CFS};
+use crate::resident_rows::{
+    Resident, ResidentChange, ResidentDelta, ResidentRows, ResidentSource, RESIDENT_CFS, SOURCE_SLOTS,
+};
 
 pub enum AtomicWriteOp<'a> {
     Put {
@@ -145,6 +147,14 @@ pub trait StateBackend: Clone + Send + Sync {
     fn own_pending_row(&self, _cf: &str, _key: &[u8]) -> OwnPendingRow {
         OwnPendingRow::Unknown
     }
+
+    /// Item 6 Phase 5 step 2: with an in-place resident source attached
+    /// ([`crate::ResidentSource::in_place`]), move this block's own pending
+    /// rows of the source's CFs into it (applied and marked dirty), so the
+    /// source holds every write of them before a writer changes it directly.
+    /// A no-op otherwise (default), and inside an open tx scope. A wrapper
+    /// around an overlay must forward it.
+    fn fold_in_place(&self) {}
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError>;
 
@@ -615,6 +625,25 @@ impl PendingState {
         self.cfs.iter().all(CfPending::is_empty)
     }
 
+    /// Put `rows` of CF `id` into this set, each a write (`Some`) or a
+    /// tombstone (`None`) replacing whatever the set held for its key
+    /// ([`FrozenPending::put_rows`]).
+    fn put_rows(&mut self, id: CfId, rows: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>) {
+        let cfp = self.cf_mut(id);
+        for (key, value) in rows {
+            match value {
+                Some(value) => {
+                    cfp.deletes.remove(key.as_slice());
+                    cfp.writes.insert(key, value);
+                }
+                None => {
+                    cfp.writes.remove(key.as_slice());
+                    cfp.deletes.insert(key);
+                }
+            }
+        }
+    }
+
     fn clear(&mut self) {
         for cfp in &mut self.cfs {
             cfp.writes.clear();
@@ -982,8 +1011,14 @@ pub struct FrozenPending {
 
 /// R's CFs' writes and tombstones in `state`, key-sorted ([`ResidentDelta`]).
 fn resident_delta_of(state: &PendingState) -> ResidentDelta {
+    resident_delta_from(state, 0)
+}
+
+/// [`resident_delta_of`] for R's slots from `first` on (the slots below are
+/// left empty).
+fn resident_delta_from(state: &PendingState, first: usize) -> ResidentDelta {
     let mut delta = ResidentDelta::default();
-    for (slot, cf) in RESIDENT_CFS.iter().enumerate() {
+    for (slot, cf) in RESIDENT_CFS.iter().enumerate().skip(first) {
         let id = intern_cf(cf).expect("resident CF is registered");
         delta.cfs[slot] = cf_stream(state.cf(id))
             .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
@@ -1090,6 +1125,13 @@ impl FrozenPending {
         resident_delta_of(&self.state)
     }
 
+    /// Item 6 Phase 5 step 2: [`Self::resident_delta`] of R's raw CFs only
+    /// (liquidation, oracle, markets): an in-place source already holds the
+    /// block's positions and balances, so `end_resident` copies none of them.
+    pub fn resident_delta_raw(&self) -> ResidentDelta {
+        resident_delta_from(&self.state, SOURCE_SLOTS)
+    }
+
     /// A 1-key frozen set holding only the native applied-height marker
     /// (`CF_CONSENSUS_META` / `META_NATIVE_APPLIED_HEIGHT` = `height`, big-endian —
     /// byte-identical to the standalone marker write). Used for empty / non-native
@@ -1145,19 +1187,7 @@ impl FrozenPending {
         rows: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
     ) {
         let id = intern_cf(cf).expect("put_rows: CF is registered");
-        let cfp = self.state.cf_mut(id);
-        for (key, value) in rows {
-            match value {
-                Some(value) => {
-                    cfp.deletes.remove(key.as_slice());
-                    cfp.writes.insert(key, value);
-                }
-                None => {
-                    cfp.writes.remove(key.as_slice());
-                    cfp.deletes.insert(key);
-                }
-            }
-        }
+        self.state.put_rows(id, rows);
     }
 
     /// Item 6 Phase 5 (tests): the set's writes (`Some`) and tombstones
@@ -1545,8 +1575,72 @@ impl NativeStateOverlay {
     /// Item 6 Phase 1: this overlay's OWN pending writes and tombstones of R's
     /// CFs (the parent layer is already in R), key-sorted. Take it before
     /// [`Self::freeze`] (which moves the pending set out) or the flush.
+    /// Phase 5 step 2: with an in-place source, positions and balances live
+    /// in the source until the freeze / flush drains them, so this delta
+    /// holds none of them (`end_resident` does not need them then).
     pub fn own_pending_delta(&self) -> ResidentDelta {
         resident_delta_of(&self.pending.read().unwrap())
+    }
+
+    /// Item 6 Phase 5 step 2: R's in-place source and CF `id`'s slot in it
+    /// (`None`: R not attached, its source is read-only, or `id` is not
+    /// one of the source's CFs).
+    #[inline]
+    fn in_place(&self, id: CfId) -> Option<(&dyn ResidentSource, usize)> {
+        let slot = resident_slot_of(id).filter(|s| *s < SOURCE_SLOTS)?;
+        Some((self.resident.as_ref()?.in_place_source()?, slot))
+    }
+
+    /// Item 6 Phase 5 step 2: the in-place source, if R has one.
+    #[inline]
+    fn in_place_source(&self) -> Option<&dyn ResidentSource> {
+        self.resident.as_ref()?.in_place_source()
+    }
+
+    /// Item 6 Phase 5 step 2: move `state`'s rows of the in-place source's
+    /// CFs into the source, in key order per CF (each applied and marked
+    /// dirty; [`ResidentSource::put_row`]). Mid-block (`closing` false) it
+    /// is skipped inside an open tx scope (its writes stay journalled); the
+    /// block's freeze / flush folds whatever is left. Returns the rows moved.
+    fn fold_in_place_locked(&self, state: &mut PendingState, closing: bool) -> usize {
+        let Some(source) = self.in_place_source() else {
+            return 0;
+        };
+        if !closing && !state.checkpoints.is_empty() {
+            return 0;
+        }
+        let mut moved = 0;
+        for (slot, cf) in RESIDENT_CFS.iter().enumerate().take(SOURCE_SLOTS) {
+            let id = intern_cf(cf).expect("resident CF is registered");
+            let taken = std::mem::take(state.cf_mut(id));
+            for (key, value) in cf_stream(&taken) {
+                source.put_row(slot, key, value);
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// Item 6 Phase 5 step 2: the in-place source's rows of the block (its
+    /// pending rows of the two CFs folded in first), drained once, as a set
+    /// of their own; `None` without an in-place source.
+    fn drain_in_place_locked(&self, state: &mut PendingState) -> Option<PendingState> {
+        self.in_place_source()?;
+        self.fold_in_place_locked(state, true);
+        let mut out = PendingState::new();
+        self.drain_in_place_into(&mut out);
+        Some(out)
+    }
+
+    /// Item 6 Phase 5 step 2: the in-place source's drained rows put into
+    /// `state` (no-op without an in-place source).
+    fn drain_in_place_into(&self, state: &mut PendingState) {
+        let Some(source) = self.in_place_source() else {
+            return;
+        };
+        for (cf, rows) in RESIDENT_CFS.iter().zip(source.drain()) {
+            state.put_rows(intern_cf(cf).expect("resident CF is registered"), rows);
+        }
     }
 
     /// Close this block: MOVE the pending set out into a [`FrozenPending`] tagged
@@ -1555,13 +1649,20 @@ impl NativeStateOverlay {
     /// set: by the pipeline's rendezvous invariant everything below the parent is
     /// durable when the next block starts, and the parent itself is what the
     /// frozen set will be layered over next.
+    ///
+    /// Item 6 Phase 5 step 2: with an in-place source, the block's rows of
+    /// positions and balances are drained from it into the frozen set here
+    /// (each changed key once, serialized once), after its pending rows of
+    /// those CFs (if any) were folded into it.
     pub fn freeze(&self, height: u64) -> Arc<FrozenPending> {
         let mut guard = self.pending.write().unwrap();
+        self.fold_in_place_locked(&mut guard, true);
         let mut state = std::mem::replace(&mut *guard, PendingState::new());
         guard.frozen = true;
         state.journal_log.clear();
         state.checkpoints.clear();
         state.frozen = false;
+        self.drain_in_place_into(&mut state);
         Arc::new(FrozenPending {
             height,
             state,
@@ -1578,9 +1679,13 @@ impl NativeStateOverlay {
     }
 
     pub fn flush(&self, target: &StateDb) -> Result<(), StateError> {
+        let drained = self.drain_in_place_locked(&mut self.pending.write().unwrap());
         let state = self.pending.read().unwrap();
         let mut batch = WriteBatch::default();
         state.append_to_batch(target.inner(), &mut batch)?;
+        if let Some(d) = &drained {
+            d.append_to_batch(target.inner(), &mut batch)?;
+        }
         target.write(batch)
     }
 
@@ -1877,11 +1982,15 @@ impl NativeStateOverlay {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<NativeFlushStats, StateError> {
+        // Item 6 Phase 5 step 2: the in-place source's rows of the block
+        // join the same batch, hash and native-root dirty set as a sidecar
+        // (the overlay holds none of their keys after the fold).
+        let drained = self.drain_in_place_locked(&mut self.pending.write().unwrap());
         let state = self.pending.read().unwrap();
         flush_pending_after_batch(
             prefix,
             &state,
-            None,
+            drained.as_ref(),
             target,
             applied_height,
             trie_cache,
@@ -2738,21 +2847,32 @@ impl StateBackend for NativeStateOverlay {
 
     /// With R attached and `cf` one of its CFs: this overlay's own pending set
     /// holds a write or tombstone under `prefix`. Otherwise "assume dirty".
+    /// Phase 5 step 2: with an in-place source, also the keys the source
+    /// took this block ([`ResidentSource::touches`]).
     fn layer_touches(&self, cf: &str, prefix: &[u8]) -> bool {
         match intern_cf(cf) {
             Some(id) if self.resident(id).is_some() => {
                 self.pending.read().unwrap().touches(id, prefix)
+                    || self.in_place(id).is_some_and(|(s, slot)| s.touches(slot, prefix))
             }
             _ => true,
         }
     }
 
+    /// Phase 5 step 2: with an in-place source, merged with the keys the
+    /// source took this block ([`ResidentSource::dirty_keys`]).
     fn layer_keys(&self, cf: &str) -> Option<Vec<Vec<u8>>> {
         let id = intern_cf(cf)?;
         self.resident(id)?;
         let state = self.pending.read().unwrap();
         let cfp = state.cf(id);
         let mut keys: Vec<Vec<u8>> = cfp.writes.keys().chain(cfp.deletes.iter()).cloned().collect();
+        if let Some((s, slot)) = self.in_place(id) {
+            keys.extend(s.dirty_keys(slot));
+            keys.sort_unstable();
+            keys.dedup();
+            return Some(keys);
+        }
         keys.sort_unstable();
         Some(keys)
     }
@@ -2773,6 +2893,31 @@ impl StateBackend for NativeStateOverlay {
         let id = intern_cf(cf)?;
         let rows = self.resident(id)?;
         let state = self.pending.read().unwrap();
+        // Phase 5 step 2: an in-place source holds the block's changes of its
+        // CFs (each with its row at the block start); a key still pending here
+        // (a tx scope's write, not folded yet) is newer, so its `current` wins
+        // and its block-start row is the source's (its first change's, else
+        // the row it holds: the key is untouched in place).
+        if let Some((s, slot)) = self.in_place(id) {
+            let mut out: BTreeMap<Vec<u8>, ResidentChange> =
+                s.changes(slot, prefix)?.into_iter().map(|c| (c.key.clone(), c)).collect();
+            let cfp = state.cf(id);
+            let range = (std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded);
+            let pending = cfp
+                .writes
+                .range::<[u8], _>(range)
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| (k, Some(v)))
+                .chain(state.deletes_under(id, prefix).map(|k| (k, None)));
+            for (key, current) in pending {
+                let resident = match out.get(key) {
+                    Some(c) => c.resident.clone(),
+                    None => rows.get(key),
+                };
+                out.insert(key.clone(), ResidentChange { key: key.clone(), resident, current: current.cloned() });
+            }
+            return Some(out.into_values().collect());
+        }
         let change = |key: &Vec<u8>, current: Option<&Vec<u8>>| ResidentChange {
             key: key.clone(),
             resident: rows.get(key),
@@ -2788,6 +2933,24 @@ impl StateBackend for NativeStateOverlay {
             .collect();
         out.extend(state.deletes_under(id, prefix).map(|k| change(k, None)));
         Some(out)
+    }
+
+    fn fold_in_place(&self) {
+        if self.in_place_source().is_none() {
+            return;
+        }
+        let pending = |st: &PendingState| {
+            RESIDENT_CFS[..SOURCE_SLOTS]
+                .iter()
+                .any(|cf| !st.cf(intern_cf(cf).expect("resident CF is registered")).is_empty())
+        };
+        if !pending(&self.pending.read().unwrap()) {
+            return;
+        }
+        let mut state = self.pending.write().unwrap();
+        if !state.frozen {
+            self.fold_in_place_locked(&mut state, false);
+        }
     }
 
     fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {

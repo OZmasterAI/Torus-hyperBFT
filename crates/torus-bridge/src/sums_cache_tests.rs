@@ -118,7 +118,7 @@ fn check_slot_sums(holder: &ResidentBooks, tag: &str) -> usize {
     let Some(t) = slot.marks.as_ref() else { return 0 };
     let rows: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = slot.rows.dump(CF_NATIVE_POSITIONS).unwrap().into_iter().collect();
     let entries: Vec<(Address, SumsResult)> =
-        slot.users.sums_entries().filter(|(_, v, _)| *v == t.marks.version).map(|(a, _, r)| (a, r)).collect();
+        slot.users.read().sums_entries().filter(|(_, v, _)| *v == t.marks.version).map(|(a, _, r)| (a, r)).collect();
     for (trader, cached) in &entries {
         let ps: Vec<Position> = rows
             .range(trader.to_vec()..)
@@ -575,7 +575,7 @@ fn end_resident_carries_dirtied_traders_and_rebuild_starts_empty() {
         let delta = overlay.own_pending_delta();
         overlay.flush_with_native_trie_and_marker(&db, h).unwrap();
         end_resident(holder, rb, &mut overlay, delta, true, None);
-        let mut kept: Vec<Address> = holder.rows.as_ref().unwrap().users.sums_entries().map(|(t, _, _)| t).collect();
+        let mut kept: Vec<Address> = holder.rows.as_ref().unwrap().users.read().sums_entries().map(|(t, _, _)| t).collect();
         kept.sort();
         (kept, hits)
     };
@@ -663,7 +663,7 @@ fn stale_version_entry_never_read() {
         (version, hits)
     };
     let tag = |holder: &ResidentBooks, t: Address| -> Option<u64> {
-        holder.rows.as_ref().unwrap().users.sums_entries().find(|(x, _, _)| *x == t).map(|(_, v, _)| v)
+        holder.rows.as_ref().unwrap().users.read().sums_entries().find(|(x, _, _)| *x == t).map(|(_, v, _)| v)
     };
     let (v1, hits) = block(&mut holder, 1, None, &[a, b, c], None);
     assert_eq!(hits, 0, "R built: no entries yet");
@@ -1040,7 +1040,7 @@ fn dirty_trader_reads_pending_rows_not_its_record() {
     ctx.positions.put_position(&pos(a, 1, 9)).unwrap();
     ctx.positions.delete_position(&a, 2).unwrap();
     ctx.positions.put_position(&pos(a, 3, 5)).unwrap();
-    let stale = ctx.sums.as_ref().unwrap().records.as_ref().unwrap().get(&a).unwrap();
+    let stale = ctx.sums.as_ref().unwrap().records.as_ref().unwrap().positions_of(&a).unwrap();
     assert_eq!(stale.len(), 2, "a's record still holds R (the test is not vacuous)");
     let batch = BatchSums::new(&ctx.positions);
     for (tag, reader) in [

@@ -78,7 +78,7 @@ fn check_typed<T: StateBackend>(ctx: &NativeExecContext<T>, stats: &mut Stats, t
     let state = ctx.positions.state();
     let pm = &ctx.positions;
     let expect = |cf: &str, key: &[u8], opaque: bool, kind: usize, n: usize, before: ([usize; 3], usize), stats: &mut Stats| {
-        let (hits, declined) = users.typed_counts();
+        let (hits, declined) = users.read().typed_counts();
         let own = state.own_pending_row(cf, key);
         match own {
             OwnPendingRow::Pending(row) => {
@@ -103,9 +103,9 @@ fn check_typed<T: StateBackend>(ctx: &NativeExecContext<T>, stats: &mut Stats, t
     };
     for i in 0..=TRADERS {
         let t = trader(i);
-        let opaque = users.get(&t).is_none();
+        let opaque = users.read().get(&t).is_none();
         for m in (0..=MARKETS + 1).chain([ODD_MARKET]) {
-            let before = users.typed_counts();
+            let before = users.read().typed_counts();
             let want = format!("{:?}", pm.get_position(&t, m));
             assert_eq!(format!("{:?}", pm.get_position_typed(Some(typed), &t, m)), want, "{tag}: position {i} {m}");
             let mut cache = PositionCache::new();
@@ -113,12 +113,12 @@ fn check_typed<T: StateBackend>(ctx: &NativeExecContext<T>, stats: &mut Stats, t
             assert_eq!(format!("{:?}", cache.load_typed(pm, Some(typed), &t, m)), want, "{tag}: cache hit {i} {m}");
             expect(CF_NATIVE_POSITIONS, &position_key(&t, m), opaque, 0, 2, before, stats);
         }
-        let before = users.typed_counts();
+        let before = users.read().typed_counts();
         let want = format!("{:?}", pm.get_native_balance(&t));
         assert_eq!(format!("{:?}", pm.get_native_balance_typed(Some(typed), &t)), want, "{tag}: balance {i}");
         assert_eq!(format!("{:?}", BalanceCache::new().load(pm, Some(typed), &t)), want, "{tag}: cached balance {i}");
         expect(CF_NATIVE_BALANCES, t.as_slice(), opaque, 1, 2, before, stats);
-        let before = users.typed_counts();
+        let before = users.read().typed_counts();
         let want = format!("{:?}", pm.get_cum_volume(&t));
         assert_eq!(format!("{:?}", pm.get_cum_volume_typed(Some(typed), &t)), want, "{tag}: cum_volume {i}");
         expect(CF_NATIVE_BALANCES, &cum_volume_key(&t), opaque, 2, 1, before, stats);
@@ -246,7 +246,7 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<String> {
             if cached {
                 check_typed(&ctx, stats, &format!("seed {seed} block {h} call {call} before"));
             }
-            let before = ctx.sums.as_ref().and_then(|s| s.records.as_deref()).map(|u| u.typed_counts().0);
+            let before = ctx.sums.as_ref().and_then(|s| s.records.as_deref()).map(|u| u.read().typed_counts().0);
             let actions = block_actions(&mut rng);
             let r = match (h + call) % 3 {
                 0 => NativeExecutor::execute_batch_engine_mode(&mut ctx, &actions, 4),
@@ -255,7 +255,7 @@ fn run(seed: u64, cached: bool, stats: &mut Stats) -> Vec<String> {
             };
             assert!(ctx.fatal_error.is_none(), "seed {seed} block {h} call {call}: {:?}", ctx.fatal_error);
             if let Some(before) = before {
-                let after = ctx.sums.as_ref().and_then(|s| s.records.as_deref()).unwrap().typed_counts().0;
+                let after = ctx.sums.as_ref().and_then(|s| s.records.as_deref()).unwrap().read().typed_counts().0;
                 for k in 0..3 {
                     stats.batch_hits[k] += after[k] - before[k];
                 }

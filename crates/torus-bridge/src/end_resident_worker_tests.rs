@@ -513,6 +513,6 @@ fn slot_reads_positions_and_balances_from_users() {
         assert_eq!(metrics.exec_resident_users.get(), user_rows, "{mode:?}");
         assert_eq!(metrics.exec_resident_users_bytes.get(), user_bytes, "{mode:?}");
         let slot = holder.rows.as_ref().unwrap();
-        assert_eq!((slot.users.row_count() as i64, slot.users.row_bytes() as i64), (user_rows, user_bytes));
+        assert_eq!((slot.users.read().row_count() as i64, slot.users.read().row_bytes() as i64), (user_rows, user_bytes));
     }
 }

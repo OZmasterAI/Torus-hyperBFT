@@ -401,6 +401,20 @@ impl BalanceCache {
         self.dirty.extend(other.dirty);
     }
 
+    /// Item 6 Phase 5 step 2: every dirty balance, for the in-place record
+    /// set (each key on its own: its change set is key-sorted at its drain);
+    /// the entries stay cached and clean.
+    fn take_dirty(&mut self) -> Vec<(Address, NativeBalance)> {
+        let mut out = Vec::with_capacity(self.dirty.len());
+        for addr in self.dirty.drain(..) {
+            if let Some(entry) = self.map.get_mut(&addr) {
+                entry.dirty = false;
+                out.push((addr, entry.balance.clone()));
+            }
+        }
+        out
+    }
+
     /// Flush every pending dirty balance to the overlay (end of the `execute_batch` call).
     /// Keys are distinct per sender, so final overlay state is independent of flush order;
     /// sorted anyway to keep the write sequence deterministic.
@@ -433,7 +447,7 @@ mod liquidation_step;
 
 #[path = "users.rs"]
 mod users;
-use users::Users;
+use users::{SharedUsers, Users};
 /// Phase 4 step 6: the users RSS ubench seam (`users::bench`; not an API).
 #[doc(hidden)]
 pub use users::bench as users_bench;
@@ -1696,7 +1710,7 @@ pub(crate) struct BlockSums {
     /// record set R reads those CFs from (shared; dropped before
     /// `end_resident` takes it back). Phase 4 step 3: also the persistent
     /// sums (each user's entry).
-    records: Option<Arc<Users>>,
+    records: Option<Arc<SharedUsers>>,
     /// P1 (tests): every cached answer is also computed by the reference
     /// path; differences are recorded (a panic in a worker would be caught).
     #[cfg(test)]
@@ -2284,16 +2298,20 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         }
     }
 
-    /// Item 6 C7: `trader`'s positions decoded from R's slot — what the
-    /// overlay reads for a trader with nothing pending. `None` (read the
-    /// overlay): no records, the trader is dirty, or it holds an irregular
-    /// row.
-    fn resident_positions(&self, trader: &Address) -> Option<&'a [torus_core::position::Position]> {
+    /// Item 6 C7: `trader`'s position in `market_id` decoded from R's slot
+    /// — what the overlay reads for a trader with nothing pending. `None`
+    /// (read the overlay): no records, the trader is dirty, or it holds an
+    /// irregular row.
+    fn resident_position(
+        &self,
+        trader: &Address,
+        market_id: MarketId,
+    ) -> Option<Option<torus_core::position::Position>> {
         let records = self.sums?.records.as_deref()?;
         if self.dirty(trader) {
             return None;
         }
-        records.get(trader)
+        records.position_of(trader, market_id)
     }
 
     /// `trader`'s position in `market_id`: C7's record when clean, else the
@@ -2303,10 +2321,9 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
         trader: &Address,
         market_id: MarketId,
     ) -> Result<Option<torus_core::position::Position>, CoreError> {
-        let Some(ps) = self.resident_positions(trader) else {
+        let Some(p) = self.resident_position(trader, market_id) else {
             return self.positions.get_position(trader, market_id);
         };
-        let p = users::find(ps, market_id).cloned();
         #[cfg(test)]
         if let Some(s) = self.sums {
             bump(&s.counters.records);
@@ -2409,11 +2426,11 @@ impl<'a, T: StateBackend> AccountReader<'a, T> {
             }
             // C7: the caller found the trader clean, so its record (if
             // any) is exactly the overlay's rows.
-            let (r, in_table) = match s.records.as_deref().and_then(|rec| rec.get(trader)) {
+            let (r, in_table) = match s.records.as_deref().and_then(|rec| rec.positions_of(trader)) {
                 Some(ps) => {
                     #[cfg(test)]
                     bump(&s.counters.records);
-                    self.sums_of(ps)
+                    self.sums_of(&ps)
                 }
                 None => self.sums_of(&self.positions.positions_for_trader(trader).ok()?),
             };
@@ -3739,8 +3756,9 @@ struct RowsSlot {
     /// C7 / Phase 4 step 1: `rows`' positions and balances decoded per
     /// trader. Built with R, updated by each block's delta, dropped with it.
     /// Phase 4 step 2: also `rows`' source for those two CFs (the same
-    /// `Arc`; R holds no raw map of them).
-    users: Arc<Users>,
+    /// `Arc`; R holds no raw map of them). Phase 5 step 2: shared through
+    /// one lock, written in place during a block.
+    users: Arc<SharedUsers>,
     height: u64,
 }
 
@@ -4191,7 +4209,17 @@ impl ResidentBooks {
     /// `end_resident` worker.
     pub fn users_in_place(&mut self) -> Option<bool> {
         self.settle_rows();
-        self.rows.as_ref().map(|_| false)
+        self.rows.as_ref().map(|s| s.users.in_place())
+    }
+
+    /// Item 6 Phase 5 step 2: whether the record sets this holder builds
+    /// take the blocks' writes in place (always, but on the test-only
+    /// reference path).
+    fn in_place_mode(&self) -> bool {
+        #[cfg(any(test, feature = "test-reference-paths"))]
+        return !self.reference_writes;
+        #[cfg(not(any(test, feature = "test-reference-paths")))]
+        true
     }
 
     /// Item 6 Phase 5 step 2 (tests): build every later record set on the
@@ -4215,7 +4243,7 @@ impl ResidentBooks {
     /// [`torus_state::ResidentRows::dump`]).
     pub fn trader_positions_match_rows(&mut self) -> Option<bool> {
         self.settle_rows();
-        self.rows.as_ref().map(|s| s.rows.has_source() && s.users.self_consistent())
+        self.rows.as_ref().map(|s| s.rows.has_source() && s.users.read().self_consistent())
     }
 
     /// Item 6 C5 (tests): empty the slot's sums cache (R, its decoded
@@ -4235,7 +4263,7 @@ impl ResidentBooks {
         let slot = self.rows.as_mut()?;
         let r = Arc::get_mut(&mut slot.rows)?;
         let had = r.take_source().is_some();
-        let out = Arc::get_mut(&mut slot.users).map(f);
+        let out = Arc::get_mut(&mut slot.users).map(|u| f(u.get_mut()));
         if had {
             r.set_source(slot.users.clone());
         }
@@ -4398,8 +4426,9 @@ pub struct ResidentBlock {
     /// Phase 4 step 2: the record set R reads positions and balances from
     /// (`None`: R not attached). `end_resident` takes it back unshared
     /// (else the slot is dropped, like a live clone of R) and applies the
-    /// block's delta to it.
-    users: Option<Arc<Users>>,
+    /// block's delta to it (Phase 5 step 2, in place: carries the sums of
+    /// the traders it changed).
+    users: Option<Arc<SharedUsers>>,
     /// Item 6 cut 5: [`Self::drop_later`].
     retired: Retired,
     /// R02: the applied-marker read of the slot's staleness guard failed
@@ -4454,7 +4483,7 @@ impl ResidentBlock {
     /// Item 6 Phase 5 step 2: the block's record set takes its writes in
     /// place (false: R not attached, or the reference path).
     pub fn in_place(&self) -> bool {
-        false
+        self.users.as_ref().is_some_and(|u| u.in_place())
     }
 
     /// Item 6 Phase 5 step 2 (tests): the record set's rows of positions and
@@ -4462,7 +4491,7 @@ impl ResidentBlock {
     /// attached).
     #[cfg(test)]
     pub(crate) fn test_users(&self) -> Option<TestUsers> {
-        let u = self.users.as_deref()?;
+        let u = self.users.as_deref()?.read();
         Some(TestUsers {
             positions: u.encode_rows(torus_state::cf::CF_NATIVE_POSITIONS),
             balances: u.encode_rows(torus_state::cf::CF_NATIVE_BALANCES),
@@ -4566,7 +4595,7 @@ pub fn begin_resident(
         Some(rows) => rows,
         None => {
             let timer = std::time::Instant::now();
-            match build_resident(&*overlay) {
+            match build_resident(&*overlay, holder.in_place_mode()) {
                 Ok((rows, users)) => {
                     holder.rows_builds += 1;
                     block.rebuilt = true;
@@ -4597,7 +4626,7 @@ pub fn begin_resident(
         }
     };
     if let Some(m) = metrics {
-        set_resident_gauges(m, &rows, block.users.as_deref());
+        set_resident_gauges(m, &rows, block.users.as_deref().map(|u| u.read()).as_deref());
     }
     debug_assert!(rows.has_source(), "R reads positions and balances from its record set");
     overlay.attach_resident(rows);
@@ -4609,10 +4638,13 @@ pub fn begin_resident(
 /// WITHOUT R: DB + parent layer): the liquidation, oracle and market rows
 /// raw, positions and balances from the record set built from the same
 /// rows (returned too: the typed readers' records).
+/// Phase 5 step 2: `in_place`, the record set takes the blocks' writes (the
+/// node); else the Phase 4 reference path (tests).
 fn build_resident<B: StateBackend>(
     backend: &B,
-) -> Result<(torus_state::ResidentRows, Arc<Users>), torus_state::error::StateError> {
-    let users = Arc::new(Users::build_from(backend)?);
+    in_place: bool,
+) -> Result<(torus_state::ResidentRows, Arc<SharedUsers>), torus_state::error::StateError> {
+    let users = Arc::new(SharedUsers::new(Users::build_from(backend)?, in_place));
     let rows = torus_state::ResidentRows::build_with_source(backend, users.clone())?;
     Ok((rows, users))
 }
@@ -4620,7 +4652,7 @@ fn build_resident<B: StateBackend>(
 /// Item 6 Phase 4 step 2: R cold, as [`begin_resident`] builds it (bench
 /// harnesses: the build cost, and the carried R compared with it).
 pub fn resident_rows_cold<B: StateBackend>(backend: &B) -> Result<torus_state::ResidentRows, torus_state::error::StateError> {
-    build_resident(backend).map(|(rows, _)| rows)
+    build_resident(backend, true).map(|(rows, _)| rows)
 }
 
 /// The resident gauges: R's raw rows (liquidation, oracle, market) and,
@@ -4654,6 +4686,7 @@ pub fn end_resident(
 ) {
     let delta = delta.into();
     holder.settle_rows();
+    note_drain(holder, &block, metrics);
     let timer = std::time::Instant::now();
     if let Some(job) = end_resident_take(holder, block, overlay, delta, ok) {
         holder.rows = Some(job.run(metrics));
@@ -4687,6 +4720,7 @@ pub fn end_resident_on_worker(
 ) {
     let delta = delta.into();
     holder.settle_rows();
+    note_drain(holder, &block, metrics.as_deref());
     let timer = std::time::Instant::now();
     let Some(job) = end_resident_take(holder, block, overlay, delta, ok) else {
         if let Some(m) = metrics.as_deref() {
@@ -4747,6 +4781,20 @@ pub fn end_resident_on_worker(
     }
 }
 
+/// Item 6 Phase 5 step 2: the block's in-place drain (rows, time), taken
+/// from its record set: into the holder's count and the drain metrics.
+fn note_drain(holder: &mut ResidentBooks, block: &ResidentBlock, metrics: Option<&torus_telemetry::Metrics>) {
+    let Some(users) = block.users.as_deref().filter(|u| u.in_place()) else {
+        return;
+    };
+    let (rows, secs) = users.take_drain_stats();
+    holder.in_place_rows += rows;
+    if let Some(m) = metrics {
+        m.exec_users_drain_seconds.observe(secs);
+        m.exec_users_drained_rows.inc_by(rows);
+    }
+}
+
 /// Item 6 cut 5: the block's own writes and tombstones of R's CFs as
 /// `end_resident` gets them.
 pub enum BlockDelta {
@@ -4766,9 +4814,12 @@ impl From<torus_state::ResidentDelta> for BlockDelta {
 }
 
 impl BlockDelta {
-    fn into_delta(self) -> torus_state::ResidentDelta {
+    /// Phase 5 step 2: `raw_only`, R's raw CFs only (an in-place record set
+    /// already holds the block's positions and balances).
+    fn into_delta(self, raw_only: bool) -> torus_state::ResidentDelta {
         match self {
             Self::Taken(delta) => delta,
+            Self::Frozen(frozen) if raw_only => frozen.resident_delta_raw(),
             Self::Frozen(frozen) => frozen.resident_delta(),
         }
     }
@@ -4782,7 +4833,7 @@ struct EndResidentJob {
     rows: Arc<torus_state::ResidentRows>,
     /// Phase 4 step 2: the record set, with no other clone alive (checked
     /// by [`end_resident_take`]).
-    users: Arc<Users>,
+    users: Arc<SharedUsers>,
     height: u64,
     marks: Option<BlockMarksState>,
     sums: Option<BlockSums>,
@@ -4826,12 +4877,21 @@ fn end_resident_take(
         return None;
     };
     // A clone of the record set alive (a reader kept by mistake).
-    if Arc::get_mut(&mut users).is_none() {
+    let Some(shared) = Arc::get_mut(&mut users) else {
         holder.rows_shared_fallbacks += 1;
         tracing::warn!(
             height,
             "item 6: the record set (Users) still shared at end of block — dropping R (next block rebuilds)"
         );
+        return None;
+    };
+    // Phase 5 step 2: an in-place record set was drained at the block's
+    // freeze / flush; a key changed after it is in no change set, so the
+    // record set no longer equals the post-state: drop it (the next block
+    // rebuilds from the DB). Never in the normal sequence.
+    if shared.in_place() && shared.get_mut().dirty_keys() != 0 {
+        debug_assert!(false, "item 6 Phase 5: a write after the block's drain (height {height})");
+        tracing::error!(height, "item 6: the record set changed after the block's drain — dropping R (next block rebuilds)");
         return None;
     }
     Some(EndResidentJob {
@@ -4867,7 +4927,8 @@ impl EndResidentJob {
             (hook.0)();
         }
         let r = Arc::get_mut(&mut rows).expect("end_resident_take checked R is not shared");
-        let u = Arc::get_mut(&mut users).expect("end_resident_take checked the record set is not shared");
+        let in_place = users.in_place();
+        let u = Arc::get_mut(&mut users).expect("end_resident_take checked the record set is not shared").get_mut();
         // Item 6 M1: every trader whose positions the block wrote or deleted
         // has its sums moved on to its rows after the block, else loses them
         // (step 1: while its decoded positions follow the delta, below; Phase
@@ -4875,7 +4936,7 @@ impl EndResidentJob {
         // rows); then the block's memo joins the users' entries.
         let mut carry = sums.map_or_else(SumsCarry::none, |s| s.into_carry(marks.as_ref()));
         // Item 6 cut 5: from the frozen set (pipelined), here on the worker.
-        let delta = delta.into_delta();
+        let delta = delta.into_delta(in_place);
         // Phase 4 step 2: R's raw CFs (liquidation, oracle, markets) only.
         let timer = std::time::Instant::now();
         r.apply(&delta);
@@ -4883,9 +4944,16 @@ impl EndResidentJob {
             m.exec_end_resident_rows_seconds.observe(timer.elapsed().as_secs_f64());
         }
         // C7 / Phase 4 step 1: the record set follows the delta of positions
-        // and balances (step 2: R's only copy of them).
+        // and balances (step 2: R's only copy of them). Phase 5 step 2: in
+        // place, it already holds them; only the sums of the traders the
+        // block changed are carried (from the block-start rows its drain
+        // kept).
         let timer = std::time::Instant::now();
-        u.apply(&delta, Some(&mut |t: &Address, report| carry.trader(t, report)));
+        if in_place {
+            u.report_in_place(&mut |t: &Address, report| carry.trader(t, report));
+        } else {
+            u.apply(&delta, Some(&mut |t: &Address, report| carry.trader(t, report)));
+        }
         if let Some(m) = metrics {
             m.exec_end_resident_users_seconds.observe(timer.elapsed().as_secs_f64());
             set_resident_gauges(m, r, Some(u));
@@ -6006,6 +6074,12 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// read the overlay).
     fn typed_rows(&self) -> Option<&dyn TypedRows> {
         Some(self.sums.as_ref()?.records.as_deref()?)
+    }
+
+    /// Item 6 Phase 5 step 2: the block's record set, if it takes the
+    /// block's writes in place.
+    fn in_place_users(&self) -> Option<&Arc<SharedUsers>> {
+        self.sums.as_ref()?.records.as_ref().filter(|u| u.in_place())
     }
 
     pub fn attach_resident_block(&mut self, block: &mut ResidentBlock) {
@@ -8202,6 +8276,11 @@ impl NativeExecutor {
         // (sorted keys) at the end of the call.
         let mut pos_cache = PositionCache::new();
         let mut vol_cache = VolumeCache::default();
+        // Item 6 Phase 5 step 2: with an in-place record set, the parallel
+        // settle's per-market position caches are kept here (disjoint keys)
+        // and go straight into it at the flush, without a merge.
+        let mut pos_plans: Vec<PositionCache> = Vec::new();
+        let in_place = ctx.in_place_users().is_some();
 
         // L3-ENG: resolve the engine worker count (0 = serial prepare).
         let engine_threads = match engine_mode {
@@ -8637,6 +8716,7 @@ impl NativeExecutor {
                 &mut bal_cache,
                 &mut pos_cache,
                 &mut vol_cache,
+                in_place.then_some(&mut pos_plans),
                 settle_workers,
             );
         } else {
@@ -8661,26 +8741,57 @@ impl NativeExecutor {
         // r6: the two sorted flush_all walks are the tail of Phase 4 and were
         // only ever visible lumped into `exec_phase_settle_seconds`.
         let cache_flush_timer = std::time::Instant::now();
-        // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
-        #[cfg(any(test, feature = "test-reference-paths"))]
-        let pos_flushed = if ctx.test_flush_per_row {
-            pos_cache.flush_all_per_row(&ctx.positions)
-        } else {
-            pos_cache.flush_all(&ctx.positions)
-        };
-        #[cfg(not(any(test, feature = "test-reference-paths")))]
-        let pos_flushed = pos_cache.flush_all(&ctx.positions);
-        if let Err(e) = pos_flushed {
-            ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
-        }
-        if let Err(e) = bal_cache.flush_all(&ctx.positions) {
-            ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
-        }
         let mut volumes: Vec<_> = vol_cache.into_iter().collect();
         volumes.sort_unstable_by_key(|(trader, _)| *trader);
-        for (trader, add) in volumes {
-            if let Err(e) = Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &trader, add) {
-                ctx.fatal_error = Some(format!("cum_volume flush failed: {e}"));
+        if let Some(users) = ctx.in_place_users().cloned() {
+            // Item 6 Phase 5 step 2 (plan Task 2.1): the call's caches go
+            // straight into the in-place record set under one lock: no row
+            // encode, no overlay write per row; the block's change set is
+            // serialized once at its freeze. Same rows: each key's final
+            // value (one per key in the caches; the plans' keys are disjoint
+            // per market; the overlay's own pending rows of the two CFs, if
+            // any, are folded in first, as the flush overwrote them before).
+            // Order-free: every key is applied on its own and the drain
+            // sorts.
+            ctx.state.fold_in_place();
+            let mut u = users.write();
+            let mut w = u.mutate();
+            for cache in pos_plans.iter_mut().chain(std::iter::once(&mut pos_cache)) {
+                for ((t, m), row) in cache.take_dirty() {
+                    match row {
+                        Some(p) => w.set_position(p),
+                        None => w.remove_position(&t, m),
+                    }
+                }
+            }
+            for (t, b) in bal_cache.take_dirty() {
+                w.set_balance(&t, b);
+            }
+            for (trader, add) in volumes {
+                if let Err(e) = w.add_cum_volume(&trader, add) {
+                    ctx.fatal_error = Some(format!("cum_volume flush failed: {e}"));
+                }
+            }
+        } else {
+            // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            let pos_flushed = if ctx.test_flush_per_row {
+                pos_cache.flush_all_per_row(&ctx.positions)
+            } else {
+                pos_cache.flush_all(&ctx.positions)
+            };
+            #[cfg(not(any(test, feature = "test-reference-paths")))]
+            let pos_flushed = pos_cache.flush_all(&ctx.positions);
+            if let Err(e) = pos_flushed {
+                ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
+            }
+            if let Err(e) = bal_cache.flush_all(&ctx.positions) {
+                ctx.fatal_error = Some(format!("balance cache flush failed: {e}"));
+            }
+            for (trader, add) in volumes {
+                if let Err(e) = Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &trader, add) {
+                    ctx.fatal_error = Some(format!("cum_volume flush failed: {e}"));
+                }
             }
         }
         ctx.phase_accum.cache_flush_ns += cache_flush_timer.elapsed().as_nanos();
@@ -9406,6 +9517,7 @@ impl NativeExecutor {
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
         vol_cache: &mut VolumeCache,
+        mut pos_plans: Option<&mut Vec<PositionCache>>,
         max_workers: usize,
     ) {
         // ---- Pass A: pure per-market plans on CAPPED chunk workers ----
@@ -9582,7 +9694,9 @@ impl NativeExecutor {
         // One allocation for every market's position entries: merging 300
         // caches into an unreserved map rehashes it at each doubling
         // (capacity only; ubench_position_cache: ~1.2 -> ~0.7 us/entry).
-        pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum());
+        if pos_plans.is_none() {
+            pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum());
+        }
         // s58 (`TORUS_SETTLE_DEFER_RESULTS=1`): each placed order's book
         // reject, by flat index (`Some` = placed here, written after the
         // market loop). 1 byte per action (`FailureReason` is a Copy u8
@@ -9607,7 +9721,11 @@ impl NativeExecutor {
 
             // This market's position mutations become part of the batch cache
             // (disjoint keys across markets; single sorted flush at call end).
-            pos_cache.merge_disjoint(plan.pos_cache);
+            // Phase 5 step 2: kept apart for the in-place record set.
+            match pos_plans.as_deref_mut() {
+                Some(plans) => plans.push(plan.pos_cache),
+                None => pos_cache.merge_disjoint(plan.pos_cache),
+            }
 
             let prepared = match market_batches.get(&market_id) {
                 Some(p) => p,
@@ -10267,6 +10385,23 @@ impl NativeExecutor {
         idx.into_iter()
             .map(|(sender, i)| (sender, u32::try_from(counts[i]).unwrap_or(u32::MAX)))
             .collect()
+    }
+
+    /// Item 6 Phase 5 step 2: [`Self::add_cum_volume`] on the block's
+    /// context: one typed add on the in-place record set (no row read,
+    /// encode or overlay write), else through the overlay.
+    fn add_cum_volume_ctx<T: StateBackend>(
+        ctx: &NativeExecContext<T>,
+        trader: &Address,
+        amount: FixedPoint,
+    ) -> Result<(), CoreError> {
+        match ctx.in_place_users() {
+            Some(users) => {
+                ctx.state.fold_in_place();
+                users.write().mutate().add_cum_volume(trader, amount)
+            }
+            None => Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), trader, amount),
+        }
     }
 
     /// Add `amount` to `trader`'s stored lifetime volume (`cum_volume`).
@@ -11635,7 +11770,7 @@ impl NativeExecutor {
                     MarginType::Cross,
                 )
                 .and_then(|effect| {
-                    Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.taker, notional)?;
+                    Self::add_cum_volume_ctx(ctx, &fill.taker, notional)?;
                     Ok(effect)
                 }) {
                 Ok(effect) => effect,
@@ -11665,7 +11800,7 @@ impl NativeExecutor {
                     MarginType::Cross,
                 )
                 .and_then(|effect| {
-                    Self::add_cum_volume(&ctx.positions, ctx.typed_rows(), &fill.maker, notional)?;
+                    Self::add_cum_volume_ctx(ctx, &fill.maker, notional)?;
                     Ok(effect)
                 }) {
                 Ok(effect) => effect,
@@ -14698,7 +14833,7 @@ mod maker_accounts_tests {
             assert!(computed <= traders.len(), "round {round}: each trader built once ({computed})");
             assert!(memo_sums.shadow_mismatches.lock().unwrap().is_empty(), "round {round}: shadow");
             memo_sums.into_carry(None).finish(&mut users);
-            let mut next = BlockSums { shadow: true, records: Some(Arc::new(std::mem::take(&mut users))), ..BlockSums::default() };
+            let mut next = BlockSums { shadow: true, records: Some(Arc::new(SharedUsers::new(std::mem::take(&mut users), false))), ..BlockSums::default() };
             next.start(Some(7));
             let carried = AccountReader { marks: Some(&table), sums: Some(&next), ..AccountReader::of(&rctx) };
             for &(t, m) in &pairs {
