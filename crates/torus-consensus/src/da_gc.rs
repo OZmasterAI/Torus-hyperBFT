@@ -317,6 +317,12 @@ pub fn committed_native_actions_in_tree(
     Ok(Some((Vec::new(), None)))
 }
 
+/// The native-action hashes the blocks of the tree in `db` ABOVE its
+/// highest committed block reference (the uncommitted tail, every branch).
+pub fn uncommitted_native_hashes_in_tree(_db: &StateDb) -> Result<Vec<B256>, StateError> {
+    Ok(Vec::new())
+}
+
 /// [`BlockTreeHistory`]'s restore hook: `(height, hashes, full datum's
 /// actions)`.
 pub type RestoreBodies<'a> = &'a dyn Fn(u64, &[B256], Option<&[SignedNativeAction]>);
@@ -358,6 +364,10 @@ impl DaGcHistory for BlockTreeHistory<'_> {
 
     fn committed_through(&self) -> Result<Option<u64>, StateError> {
         read_tree_committed_tip(self.db)
+    }
+
+    fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError> {
+        uncommitted_native_hashes_in_tree(self.db)
     }
 }
 

@@ -507,11 +507,17 @@ pub struct Metrics {
     /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
     /// (record the height's row, delete aged bodies and shards: one batch).
     pub da_gc_seconds: Histogram,
-    /// RH4: DA body GC passes that deleted nothing because the GC bookkeeping
-    /// was behind the dispatched height and could not be back-filled from the
-    /// block tree (a block missing or unreadable). The bodies stay; the next
-    /// pass retries.
-    pub da_gc_held_passes: Counter,
+    /// RH4: DA body GC passes that deleted nothing, by `reason`
+    /// (`torus_state::DaGcHoldReason::as_str`): `gap` (bookkeeping behind,
+    /// not back-fillable from the block tree), `backfilling` (behind by more
+    /// than one pass back-fills), `unrecorded` (the height's body row did not
+    /// land), `pre_cursor` (a pre-cursor store's replay), `pruned_gap` (a
+    /// skipped pruned height not due yet), `dispatch_behind` (dispatch is
+    /// behind the committed tip, e.g. backpressure in non-blocking dispatch),
+    /// `tip_unreadable`, `tail_unreadable` (a block above the committed tip
+    /// cannot be read or decoded), `store_error` (the pass failed). The
+    /// bodies stay; the next pass retries.
+    pub da_gc_held_passes: Family<Vec<(String, String)>, Counter>,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -2207,10 +2213,11 @@ impl Metrics {
             "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
             da_gc_seconds.clone(),
         );
-        let da_gc_held_passes = Counter::default();
+        let da_gc_held_passes = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
             "torus_da_gc_held_passes",
-            "DA body GC passes that deleted nothing: GC records behind and not back-fillable from the block tree (RH4)",
+            "DA body GC passes that deleted nothing, by reason (gap / backfilling / unrecorded / \
+             pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error) (RH4)",
             da_gc_held_passes.clone(),
         );
 

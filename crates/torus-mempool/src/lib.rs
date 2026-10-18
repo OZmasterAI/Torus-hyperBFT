@@ -3037,6 +3037,36 @@ mod tests {
         );
     }
 
+    /// RH4 P3 (claude-review r4): a GC pass the store rejects deleted
+    /// nothing and says so (`store_error`, counted in
+    /// `torus_da_gc_held_passes`), never "nothing to do".
+    #[test]
+    fn gc_committed_native_da_store_error_is_a_held_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(StateDb::open(dir.path()).unwrap());
+        let ro = StateDb::open_read_only(dir.path()).unwrap();
+        let pool = Mempool::with_da_store(
+            ro.clone(),
+            NativeDaStore::new(ro),
+            MempoolConfig::default(),
+        );
+        let limits = DaGcLimits {
+            max_rows: 8,
+            max_deletes: 1024,
+        };
+        let out = pool.gc_committed_native_da(
+            5,
+            Some(&[B256::repeat_byte(7)]),
+            0,
+            4,
+            u64::MAX,
+            limits,
+            &torus_state::NoDaGcHistory,
+        );
+        assert!(out.deletion_held);
+        assert_eq!(out.hold_reason, Some(torus_state::DaGcHoldReason::StoreError));
+    }
+
     /// R01b (review): a read-only pool with the fail-stop latch installed, and
     /// one signed action.
     fn r01b_failing_pool() -> (

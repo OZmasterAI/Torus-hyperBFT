@@ -303,6 +303,61 @@ pub struct DaGcOutcome {
     /// the pass deleted nothing (`deletion_held`), since one of them may
     /// re-include a due row's body before its own pass records the pin.
     pub undispatched_commits: bool,
+    /// Why the pass deleted nothing (`deletion_held`), `None` when it did
+    /// not hold. One reason per held pass, the first rule that held it.
+    pub hold_reason: Option<DaGcHoldReason>,
+    /// Bodies of due rows kept because a block above the history's
+    /// committed tip (the uncommitted tail) references them: the row went,
+    /// the body (its reference and shards) stayed.
+    pub tail_pinned: u64,
+}
+
+/// Why a GC pass deleted nothing ([`DaGcOutcome::hold_reason`]); its
+/// [`as_str`](Self::as_str) is the `reason` label of
+/// `torus_da_gc_held_passes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DaGcHoldReason {
+    /// The bookkeeping is behind and the history cannot supply a missing
+    /// height (a missing block, a read error), or a pre-cursor store's
+    /// prune pointer is unreadable.
+    Gap,
+    /// The bookkeeping is behind by more than one pass back-fills
+    /// ([`DA_GC_MAX_BACKFILL_HEIGHTS`]); the next passes continue.
+    Backfilling,
+    /// This height's record is unknown (dispatch could not make its body
+    /// durable): the cursor stays at it.
+    Unrecorded,
+    /// A pre-cursor store whose cursor is not established yet (a replay
+    /// below its replay floor).
+    PreCursor,
+    /// A height a back-fill skipped (the history pruned it) is not due yet.
+    PrunedGap,
+    /// The history holds committed heights above the dispatched one.
+    DispatchBehind,
+    /// The history's committed tip is unreadable.
+    TipUnreadable,
+    /// A block above the history's committed tip cannot be read or decoded.
+    TailUnreadable,
+    /// The pass failed (a store read or write error; set by the caller that
+    /// absorbs the error): its batch did not land.
+    StoreError,
+}
+
+impl DaGcHoldReason {
+    /// The metric label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gap => "gap",
+            Self::Backfilling => "backfilling",
+            Self::Unrecorded => "unrecorded",
+            Self::PreCursor => "pre_cursor",
+            Self::PrunedGap => "pruned_gap",
+            Self::DispatchBehind => "dispatch_behind",
+            Self::TipUnreadable => "tip_unreadable",
+            Self::TailUnreadable => "tail_unreadable",
+            Self::StoreError => "store_error",
+        }
+    }
 }
 
 /// Where the GC re-reads committed heights it has no record for
@@ -322,6 +377,12 @@ pub trait DaGcHistory {
     /// dispatched one is not recorded yet and may re-include a due row's
     /// body, so nothing is deleted until dispatch catches up with it.
     fn committed_through(&self) -> Result<Option<u64>, StateError>;
+    /// The native-action hashes the history's blocks ABOVE its committed tip
+    /// reference (the uncommitted tail, every branch; normally 2-3 blocks).
+    /// Such a block may still commit, and peers block-sync it meanwhile, so
+    /// a due row's body it references stays. An error (a tail block that
+    /// cannot be read or decoded) holds the whole pass.
+    fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError>;
 }
 
 /// A history that knows no height: a gap in the GC bookkeeping holds every
@@ -340,6 +401,10 @@ impl DaGcHistory for NoDaGcHistory {
 
     fn committed_through(&self) -> Result<Option<u64>, StateError> {
         Ok(None)
+    }
+
+    fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError> {
+        Ok(Vec::new())
     }
 }
 
@@ -2078,7 +2143,8 @@ mod tests {
     /// A test [`DaGcHistory`]: `known` heights, every height below `pruned`
     /// pruned, every other height `empty` (known, no actions) or unknown;
     /// `fail` = every read errors. `tip`: its committed tip (`None` = none
-    /// known), `tip_fail` = reading the tip errors.
+    /// known), `tip_fail` = reading the tip errors. `tail`: the hashes its
+    /// uncommitted blocks reference, `tail_fail` = reading them errors.
     #[derive(Default)]
     struct TestHistory {
         pruned: u64,
@@ -2087,6 +2153,8 @@ mod tests {
         fail: bool,
         tip: Option<u64>,
         tip_fail: bool,
+        tail: Vec<B256>,
+        tail_fail: bool,
     }
 
     impl DaGcHistory for TestHistory {
@@ -2114,6 +2182,13 @@ mod tests {
                 return Err(StateError::InvalidData("test history tip read".into()));
             }
             Ok(self.tip)
+        }
+
+        fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError> {
+            if self.fail || self.tail_fail {
+                return Err(StateError::InvalidData("test history tail read".into()));
+            }
+            Ok(self.tail.clone())
         }
     }
 
@@ -2340,6 +2415,172 @@ mod tests {
         let out = gc_h(&store, 33, &[], W, &hist);
         assert_eq!((out.rows_deleted, out.deletion_held), (1, false));
         assert!(!present(&store, &x));
+    }
+
+    /// Codex r3 / claude-review r4 P2 (torus issue 282de5bb): the history
+    /// holds an UNCOMMITTED block above its committed tip (the tail) that
+    /// re-includes x as x's row comes due. Peers block-sync that block and
+    /// it may still commit, possibly on a node with no cached proposal,
+    /// which then rebuilds it from the DA store. So the row goes but x
+    /// (body and reference) stays; y, which the tail does not reference,
+    /// goes on time. Once the tail commits, its record pins x for its own
+    /// window.
+    #[test]
+    fn gc_keeps_the_bodies_the_uncommitted_tail_references() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let (x, y) = (dummy_action(1), dummy_action(2));
+        let (hx, hy) = (compute_action_hash(&x), compute_action_hash(&y));
+        store.put_batch(&[x.clone(), y.clone()]).unwrap();
+        let mut hist = history(&[(10, vec![hx, hy])]);
+        for h in 10..=13 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        // Row 10 is due at 14; the uncommitted 15 re-includes x.
+        hist.tip = Some(14);
+        hist.tail = vec![hx];
+        let out = gc_h(&store, 14, &[], W, &hist);
+        assert_eq!((out.rows_deleted, out.deletion_held), (1, false));
+        assert_eq!(out.hold_reason, None);
+        assert_eq!((out.bodies_deleted, out.tail_pinned), (1, 1));
+        assert!(present(&store, &x), "the uncommitted tail still needs x");
+        assert!(!present(&store, &y), "y is not in the tail: it goes");
+        // 15 commits and dispatches: its record pins x for its own window.
+        hist.tail.clear();
+        for tip in 15..=15 + W {
+            hist.tip = Some(tip);
+            let hashes = if tip == 15 { vec![hx] } else { vec![] };
+            gc_h(&store, tip, &hashes, W, &hist);
+            assert_eq!(present(&store, &x), tip < 15 + W, "x (pinned by 15) at {tip}");
+        }
+        assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
+    }
+
+    /// A tail block that cannot be read or decoded holds the whole pass
+    /// (the safe direction): nothing goes until the tail reads again.
+    #[test]
+    fn gc_unreadable_tail_holds_the_pass() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let x = dummy_action(1);
+        let hx = compute_action_hash(&x);
+        store.put(&x).unwrap();
+        let mut hist = history(&[(10, vec![hx])]);
+        for h in 10..=13 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        hist.tip = Some(14);
+        hist.tail_fail = true;
+        let out = gc_h(&store, 14, &[], W, &hist);
+        assert!(out.deletion_held);
+        assert_eq!(out.hold_reason, Some(DaGcHoldReason::TailUnreadable));
+        assert_eq!(out.rows_deleted, 0);
+        assert!(present(&store, &x));
+        hist.tail_fail = false;
+        hist.tip = Some(15);
+        let out = gc_h(&store, 15, &[], W, &hist);
+        assert_eq!((out.rows_deleted, out.hold_reason), (1, None));
+        assert!(!present(&store, &x));
+    }
+
+    /// P3 (claude-review r4): every pass that deletes nothing names why
+    /// (the `reason` label of `torus_da_gc_held_passes`), each rule its own
+    /// reason; a pass that is not held names none.
+    #[test]
+    fn gc_every_held_pass_names_its_reason() {
+        use DaGcHoldReason as R;
+        const W: u64 = 4;
+        // A store with x recorded at 10 and every height through 13.
+        let fresh = || {
+            let (dir, store) = temp_store();
+            let x = dummy_action(1);
+            store.put(&x).unwrap();
+            let hx = compute_action_hash(&x);
+            for h in 10..=13 {
+                let hashes = if h == 10 { vec![hx] } else { vec![] };
+                gc_h(&store, h, &hashes, W, &history(&[]));
+            }
+            (dir, store)
+        };
+        let reason = |store: &NativeDaStore, height: u64, record: Option<&[B256]>, hist: &TestHistory| {
+            let out = store
+                .gc_committed_with_history(height, record, 0, W, UNCAPPED, LIMITS, hist)
+                .unwrap();
+            assert_eq!(out.deletion_held, out.hold_reason.is_some(), "{out:?}");
+            out.hold_reason
+        };
+        let (_d, store) = fresh();
+        assert_eq!(reason(&store, 14, Some(&[]), &history(&[])), None, "not held");
+        let (_d, store) = fresh();
+        let missing = TestHistory::default();
+        assert_eq!(reason(&store, 20, Some(&[]), &missing), Some(R::Gap));
+        let (_d, store) = fresh();
+        let broken = TestHistory {
+            fail: true,
+            ..TestHistory::default()
+        };
+        assert_eq!(reason(&store, 20, Some(&[]), &broken), Some(R::Gap));
+        let (_d, store) = fresh();
+        let far = 14 + DA_GC_MAX_BACKFILL_HEIGHTS + 1;
+        assert_eq!(reason(&store, far, Some(&[]), &history(&[])), Some(R::Backfilling));
+        let (_d, store) = fresh();
+        assert_eq!(reason(&store, 14, None, &history(&[])), Some(R::Unrecorded));
+        let (_d, store) = fresh();
+        let pruned = TestHistory {
+            pruned: 30,
+            empty: true,
+            ..TestHistory::default()
+        };
+        assert_eq!(reason(&store, 32, Some(&[]), &pruned), Some(R::PrunedGap));
+        let (_d, store) = fresh();
+        let ahead = TestHistory {
+            empty: true,
+            tip: Some(15),
+            ..TestHistory::default()
+        };
+        assert_eq!(reason(&store, 14, Some(&[]), &ahead), Some(R::DispatchBehind));
+        let (_d, store) = fresh();
+        let tip_broken = TestHistory {
+            empty: true,
+            tip_fail: true,
+            ..TestHistory::default()
+        };
+        assert_eq!(reason(&store, 14, Some(&[]), &tip_broken), Some(R::TipUnreadable));
+        let (_d, store) = fresh();
+        let tail_broken = TestHistory {
+            empty: true,
+            tail_fail: true,
+            ..TestHistory::default()
+        };
+        assert_eq!(reason(&store, 14, Some(&[]), &tail_broken), Some(R::TailUnreadable));
+        // A pre-cursor store (16-byte state) replaying below its floor.
+        let (_d, store) = temp_store();
+        store
+            .db
+            .put_cf_raw(
+                CF_NATIVE_PENDING,
+                DA_GC_STATE_KEY,
+                &[0u64.to_be_bytes(), 50u64.to_be_bytes()].concat(),
+            )
+            .unwrap();
+        assert_eq!(reason(&store, 20, Some(&[]), &history(&[])), Some(R::PreCursor));
+        let labels: std::collections::HashSet<_> = [
+            R::Gap,
+            R::Backfilling,
+            R::Unrecorded,
+            R::PreCursor,
+            R::PrunedGap,
+            R::DispatchBehind,
+            R::TipUnreadable,
+            R::TailUnreadable,
+            R::StoreError,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        assert_eq!(labels.len(), 9, "one label per reason");
     }
 
     /// Idempotence: back-filling heights writes exactly what recording them
