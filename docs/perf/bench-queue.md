@@ -89,15 +89,31 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    within noise; C (custody) -21.61% [0.7794, 0.7884] loss (140 ms per validate, shards ~1.7 GB per node per cell, not
    20 GB). Step 5 candidates PC + F (PE owner's call); step 6 not triggered.**
 
-5. **Q4 winners together:** baseline vs the flags that won in step 4, combined.
-6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10).
+5. **Q4 winners together: does PE stack on PC+F?** (~1 h 20; owner s128): 2 arms, 300 markets, 600 s, 3
+   replicates, alternating order (AB BA AB), native load only, the same shape and checks as campaign A. Binary: campaign
+   A's M (`e3d11cb9`, node md5 `bf720f9f`, already staged); custody pinned 0 on both arms.
+
+   | arm | env |
+   |---|---|
+   | PC+F (reference) | `TORUS_PARALLEL_CANCEL_ALL=8 TORUS_EPOCH_FAST_PATH=1` |
+   | PC+F+PE | PC+F + `TORUS_PARALLEL_ENGINE=4` |
+
+   PC and F both won in section 82 and go on by default; no all-off base and no PC-only arm (owner s128). Question:
+   does PE still pay for its +2% CPU per fill with PC+F on? In section 82, PE alone gave native blocks/s +9.2%
+   [1.05, 1.13] and exec block_ms -8.1% [0.88, 0.96], but PC already cuts exec block_ms by 45%, so PE's gain may not
+   stack. Report paired ratios (as in 82.3) on matched/s, native blocks/s, exec block_ms, block p50 / p99 and CPU-s
+   per 1M. matched/s keeps the win rule; PE's default is the owner's call on block speed vs CPU, so its secondary
+   metrics matter as much as matched/s. KP and DB do not run (section 82: no gain on any metric; DB is parked for the
+   book-depth scaling check).
+6. **Q10 10-market cell** (conditional): only if campaign A's arm C shows no cost at 300 markets (Items, Q10). **Not triggered (section 82: C -21.6%); skip.**
 7. **Q12. Option S: larger EVM cadence N** (~1 h 45, n = 2; no node code, binary M; harness knob `EVM_BLOCK_INTERVAL`
    on main since 64c41f13; Items, Q12). Item 7 step 3: decides whether raising N is a usable stopgap before option 0.
 8. **Step Z (Q6 step 0 + zero-code screen): checkpoint interval 15000 vs 5000 ms** (n = 2 per arm ABBA, ~45 min plus
    setup; step 0 binary from `perf/q6-ckpt-slicing`, SHA given by 18c after review; Items, Q6). Decides GO / NO-GO /
    SHIP-Z for building checkpoint slicing (A1).
 9. **Q9. Data-dir growth: main vs main + RH4** (60 min soak per arm plus the idle phase, ~2.5-3 h; Items, Q9).
-   **NOT READY: waits on Q10 and the owner's custody decision** (Items, Q9, "Arm b depends on Q10"). Moved here in
+   **NOT READY: waits on 18c's Q9 SHA.** Owner s128: custody OFF by default until T3.1, so arm (b) = the RH4 head
+   with `main` merged in, custody off (Items, Q9, "Arm b depends on Q10"). Moved here in
    s127: nothing in steps 2-6 needs RH4 (its GC only runs with `--retention-blocks`); only pre-testnet calls (prune by
    default, validator retention N) and the RH4 merge wait on it.
 10. **Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
@@ -226,6 +242,8 @@ If Q1 or `TORUS_CKPT_DEFER_BOOKS` becomes a default, re-check the checkpoint and
     Within noise at 300 and 10 -> keep it on, 18c builds the RH4 shard-count fix (option d: max of the old and new
     set's n for 64 blocks after a set change, kept in the GC's own batch), benches switch to custody on, and Q9's
     arm (b) runs custody on (Items, Q9).
+  - **Decided (owner s128, on section 82: C -21.6% matched/s, 140 ms per validate):** custody OFF by default until
+    T3.1; the RH4 shard-count fix waits for T3.1. 18c flips the node's code default (today only `"0"` disables).
 
 - **Q12. Option S: does a larger EVM cadence N recover Q5's loss?** (item 7 step 3, `docs/plans/item7-step3-design.md`
   sections 3 S and 6.2; no node code). Q5 (section 80): -12.4% matched/s at N = 11, from the barrier before every EVM
