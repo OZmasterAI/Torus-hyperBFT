@@ -190,11 +190,20 @@ COMMIT_DB_STAGES = [
 ]
 
 
+def scrape_ok(r):
+    """False for a failed scrape (sample_metrics.py writes every counter as 0 and scrape_valid=0); a CSV without the
+    column (older sampler) counts as valid."""
+    return r.get("scrape_valid", 1.0) == 1.0
+
+
 def checkpoint_spans(rs):
     """Every checkpoint DB-write span (s, unix) a node's rows show: the start / end gauges hold the LAST write, and
-    at 1 Hz sampling each write (one per 5-15 s) is seen. Unique (start, end) pairs, sorted."""
+    at 1 Hz sampling each write (one per 5-15 s) is seen. Unique (start, end) pairs, sorted. Failed scrapes are
+    skipped (their gauges are not data)."""
     out = set()
     for r in rs:
+        if not scrape_ok(r):
+            continue
         s, e = (
             m(r, "exec_checkpoint_db_write_start_ms"),
             m(r, "exec_checkpoint_db_write_end_ms"),
@@ -233,7 +242,9 @@ def commit_db_split(sel, spans):
     """The consensus-thread commit writes over the rows `sel`, split by sample interval: a 1 s interval (ts_prev,
     ts] is `in` if it touches a checkpoint DB-write span (s <= ts and e > ts_prev; 1 s resolution: ts is the
     scrape's completion second), else `out`. Per side and write: calls, wall and stage ms per call (None without
-    calls). checkpoint_db_writes counts the spans touching the window."""
+    calls). checkpoint_db_writes counts the spans touching the window. An interval with a failed scrape at either end
+    contributes nothing (calls, timings, exposure): a zeroed row would otherwise turn the next interval's delta into
+    the whole accumulated history."""
     acc = {
         w: {side: {"calls": 0.0, "write": 0.0, **{k: 0.0 for k in COMMIT_DB_STAGES}} for side in ("in", "out")}
         for w in COMMIT_DB_WRITES
@@ -241,7 +252,7 @@ def commit_db_split(sel, spans):
     secs = {"in": 0, "out": 0}
     for r0, r1 in zip(sel, sel[1:], strict=False):
         lo, hi = r0["ts"], r1["ts"]
-        if hi <= lo:
+        if hi <= lo or not (scrape_ok(r0) and scrape_ok(r1)):
             continue
         side = "in" if any(s <= hi and e > lo for s, e in spans) else "out"
         secs[side] += hi - lo
