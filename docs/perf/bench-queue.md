@@ -340,6 +340,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    on-CPU ms per 1k fills must fall (CI below 1), and native blocks/s, block p50 / p99 and timeouts per 1,000 blocks
    must not get worse; also report matched/s, CPU-s per 1M, fills per native block and the verify / sort / recovery
    phase timers if present.
+   **Done s68 (ozarchy-p8g, A `25c5939f` node `d9c5d63e`, B `70993fa9` node `af40fa06`, both arms on A's bench
+   `24939967`; perf doc section 94).** Merge rule met on every row. Exec-thread on-CPU ms per 1k fills 2.823 -> 2.695
+   (0.9546 [0.9358, 0.9738]); native blocks/s 11.03 -> 15.34 (1.3931 [1.1215, 1.7305]); block p50 17 -> 14 ms
+   (0.8292 [0.5409, 1.2712]), p99 861 -> 653 ms (0.7514 [0.5043, 1.1196]); timeouts per 1,000 native blocks 0.351 ->
+   0.072. matched/s +1.5% and CPU-s per 1M +0.4% (both CIs span 1); exec ms per 1k fills -2.7% [0.9621, 0.9850];
+   fills per native block 22,759 -> 16,799. Timers: verify (`torus_exec_verify_seconds`, includes recovery) 5.95 ->
+   3.68 ms per native block; the sort has no timer and sits in the untimed residual, 5.40 -> 0.42 ms. Verify + sort per
+   1k orders placed -51% (0.4864 [0.4816, 0.4913]); ~9.1 -> ~4.4 ms at 100 x 239 orders vs the microbench's 13.1 ->
+   ~5.2. Owner / 18c: merge.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

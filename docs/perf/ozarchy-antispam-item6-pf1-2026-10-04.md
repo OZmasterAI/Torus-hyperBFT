@@ -14173,6 +14173,175 @@ section 91's B arm, p50 x16 here). Engine work per fill stays the same or drops 
   driver preflight failures (indexer check matched the launching shell; a leftover empty pids file from the smoke's
   restart probe). No cell ran in either.
 
+## 94. Step 8g, exec hashing quick wins A/B: main `25c5939f` vs `perf/exec-hash-once` `70993fa9`, both code defaults (nothing set), standard load, 300 markets, 600 s cells, n = 3 (campaign ozarchy-p8g, archy, 2026-10-18/19)
+
+**B passes the exec-path merge rule on every row. Exec-thread on-CPU time per 1k fills falls 4.5% (2.823 -> 2.695
+ms, B / A 0.9546 [0.9358, 0.9738]), resolved in all 3 rounds. Native blocks/s rise 39% (11.03 -> 15.34, 1.3931
+[1.1215, 1.7305]). Block p50 falls 17 -> 14 ms (0.8292 [0.5409, 1.2712]) and p99 861 -> 653 ms (0.7514 [0.5043,
+1.1196]): both CIs span 1, so neither is worse. Timeouts per 1,000 native blocks fall 0.351 -> 0.072 (7 -> 2).
+matched/s +1.5% (0.9879-1.0429) and CPU-s per 1M fills +0.4% (0.9831-1.0257) are unchanged within noise. Exec ms per
+1k fills is -2.7% [0.9621, 0.9850]. The fix removes almost all of the action sort's cost (the untimed residual on the
+exec thread, which holds the sort, falls 5.40 -> 0.42 ms per native block, 0.0776 [0.0598, 0.1007]) and 38% of
+verify (5.95 -> 3.68 ms per block; per 1k fills 0.8381 [0.8222, 0.8543]). Verify + sort per 1k orders placed falls
+51% (0.382 -> 0.186 ms, 0.4864 [0.4816, 0.4913]). At the microbench's 100 actions x 239 orders that is ~9.1 -> ~4.4
+ms, against the microbench's 13.1 -> ~5.2 ms (live -51%, microbench -60%). This is section 91's mechanism in
+reverse: less exec-thread work per fill near saturation (busy 0.945 / 0.948) gives smaller, more frequent blocks
+(fills per native block 22,759 -> 16,799). Owner / 18c: merge.**
+
+Question (bench queue step 8g, owner s128): does section 92's fix (one encoding of each action for the sort key and
+the trust-cache key, signature recovery skipped when every action hits the cache, the EIP-712 domain separator
+cached; Codex torus-adversarial approve, 16,160 differential hash cases, keys byte-identical) pay on the exec thread
+in a real run? Judge by the exec-path merge rule: exec-thread on-CPU ms per 1k fills must fall (CI below 1), and
+native blocks/s, block p50 / p99 and timeouts per 1,000 blocks must not get worse. Release microbench, verify + sort
+per block: 13.1 -> ~5.2 ms (100 actions x 239 orders).
+
+### 94.1 Setup
+
+The binaries were built with the 8f recipe (`ozarchy-p8g-stage/build/build.sh`): plain release `--locked` (repo
+`.cargo/config`: clang + mold), each package built alone, inside a detach.sh unit. Each arm had its own target dir
+(`~/.cargo-target-p8g-a` / `-p8g-b`, reflink-seeded from `~/.cargo-target-8f`) and a detached worktree
+(`wt/p8g-a-25c5939f`, `wt/p8g-b-70993fa9`, clean after the build). The node md5 of each cell's arm was checked on
+all 3 nodes, by the driver and again from the raw `node-environ-trie.txt`.
+
+| arm | commit | node md5 | bench md5 | tx-flood md5 |
+|---|---|---|---|---|
+| A (reference) | main `25c5939f` | `d9c5d63e` | `24939967` | `dd59d50d` |
+| B | `perf/exec-hash-once` `70993fa9` (on `25c5939f`) | `af40fa06` | `24939967` (A's; B's own `e3786756` not used) | `dd59d50d` |
+
+Both arms ran A's `bench-throughput`, so only the node differs. B changes `torus-types` `eip712.rs`, which the load
+generator links; the keys are byte-identical, but one generator removes the question. Both binaries carry the s128
+code defaults, and no arm sets any env: PC 8, F on, trust cache on (`--exec-trust-cache` default true), re-send
+250 ms. `env.sh` gives `TORUS_HASH_ONLY_PUSH_THRESHOLD=524288` (main `54cad185`, an ancestor of `25c5939f`),
+`TORUS_HEADER_RESEND_MS=250` (= the code default) and `TORUS_SHARD_CUSTODY=0`. D, M, T unset (on); PE, KP, DB absent;
+`TORUS_EPOCH_FAST_PATH` and `TORUS_PARALLEL_CANCEL_ALL` checked absent on every node environ. Standard load (s127):
+Classic, 15 s checkpoints, oracle on, 300 markets, rate 76,000, SENDERS 5,000, `BLOCK_CAP=400 RETRY_BUSY=1
+MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, native only, default
+genesis (300 markets, 100,060 native balances, md5 `d694b81b`).
+
+The tools were frozen from `25c5939f` with `git archive` (`ozarchy-p8g-tools/`, `FROZEN.txt`). B has no diff in
+`tools/`, `devnet/`, `testnet/` or `scripts/` against A: one harness for both arms. Against section 91's `d3cab057`
+copy, only comments and `env.sh`'s threshold default (now 524288) differ. The spec is `p8g-spec.json` (generator,
+p5s2's with no arm env), with a twin `p8g-smokeA-spec.json` for A's per-binary smoke. The checks are in
+`p8g-checks.sh`: p5s2's renamed, `p5evmchk` dropped, and `p8flagchk` also requires `exec trust-cache ENABLED` once per
+node (B's all-hit skip needs the cache) and `TORUS_HEADER_RESEND_MS=250` on all 3 environs. Before the launch the
+checks ran on a scratch copy of `ozarchy-p5s2-300m-r1-A` in `/tmp/p8g-checktest`: all OK; with the trust-cache line
+removed from one node log, and then one environ's re-send changed, `p8flagchk` failed on each.
+
+Smoke B (60 s, 279,763 matched/s) and smoke A (60 s, 268,929) came first, then warm-up w1 (A, 300 s), then r1 A, B;
+r2 B, A; r3 A, B. Cells were 600 s, 23:48-01:19. Data dirs were fresh every cell (`CLEAN=1`), with 81-82 GB free
+after each cell. No build or indexer ran (driver host lines: builds none). Swap held a static 1.5 GB from before the
+campaign; it did not grow (1,576,496 -> 1,566,832 kB at the cell starts).
+
+Validity: 2 smokes + 7 / 7 cells rc 0, ACCEPT AGREE PASS, md5 per arm on 3 nodes, 0 panic / fail-stop lines (re-checked
+from raw files), standard-load `cell=` check on every cell, 134 + 2 x 20 CHECK OK, 0 CHECK FAIL, 0 CHECK FLAG, 0
+CELL-FLAG, 0 HARD FINDING, no reruns. Took effect on every node of every cell:
+* F (code default): `epoch fast path ON` once, and every boundary block pipelined (A 72-84, B 99-114 per node per
+  600 s cell; 0 not pipelined).
+* Trust cache ENABLED once per node; hit share (cache hits / lookups, node counters) 0.618 A / 0.616 B.
+* PE spawns 0, no `TORUS_CKPT_DEFER_BOOKS` line, custody <= 0.001 ms per observation.
+* Threshold 524288: >= 20 manifest pushes per node, every full-body push <= 524,288 B, pre-warm pulls present, no
+  clamp warning.
+
+### 94.2 Arm means (n = 3 each; `p8g.txt`)
+
+Timers: node `/metrics` after - before the bench, mean of 3 nodes; "per native block" = histogram sum / the
+`torus_exec_engine_seconds` count. Exec thread on-CPU = `sched_by_node` `torus-execution` over the load window.
+Timeouts per 1,000 native blocks are pooled over the 3 cells of an arm.
+
+| arm | matched/s (%) | native blk/s | fills / native blk | block p50 / p99 ms | CPU-s / 1M | exec block_ms | exec ms / 1k fills | exec thread on-CPU ms / 1k fills | timeouts (native blocks) | per 1,000 native blocks | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | 261,216 | 11.028 | 22,759 | 17 / 861 | 23.27 | 86.3 | 3.794 | 2.823 | 7 (19,929) | 0.351 | 4,324 / 5,656 |
+| B | 265,140 (+1.50%) | 15.340 | 16,799 | 14 / 653 | 23.36 | 62.0 | 3.694 | 2.695 | 2 (27,735) | 0.072 | 3,730 / 4,779 |
+
+Phase timers (ms per native block; per 1k fills in brackets):
+
+| arm | verify | sort (residual untimed) | verify + sort | per 1k orders placed | actions / orders placed per blk | replay guard | match phase | exec engine | save_order_books | flush_all | flush worker | exec busy |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | 5.95 [0.262] | 5.40 | 11.44 | 0.382 | 121.7 / 29,988 | 1.05 | 7.36 | 64.1 [2.819] | 4.88 [0.215] | 9.23 [0.406] | 6.90 [0.305] | 0.945 |
+| B | 3.68 [0.219] | 0.42 | 4.15 | 0.186 | 90.2 / 22,330 | 0.79 | 5.78 | 49.2 [2.929] | 3.59 [0.214] | 6.80 [0.405] | 5.59 [0.333] | 0.948 |
+
+Which phase timers exist:
+* verify = `torus_exec_verify_seconds`: the batch signature pass (trust-cache key, cache lookups, ecrecover of the
+  misses; in B also the sort hash, absorbed with the key). There is no separate recovery timer.
+* The sort of the native actions has no timer. It runs between the replay-guard and load-books timers, so it lands in
+  `summary.json`'s `residual_untimed` (block_ms minus the exec-thread phases). That residual is the sort row above;
+  anything else in it is in both arms.
+* replay guard = `torus_exec_replay_guard_seconds`, match phase = `torus_exec_phase_match_seconds`.
+
+Replicate CV of matched/s: A 0.60% (259,937, 262,976, 260,734), B 0.50% (266,526, 263,861, 265,035). CPU-s / 1M: A
+0.72%, B 0.30%. matched/s in run order: w1-A 265,690, r1-A 259,937, r1-B 266,526, r2-B 263,861, r2-A 262,976, r3-A
+260,734, r3-B 265,035 (no drift). Timeouts per cell: A 0 / 1 / 6, B 1 / 1 / 0; no_proposal 0 in every cell. A's r2
+ran the biggest blocks of the campaign (25,642 fills, 9.71 blk/s), B's r3 the smallest (15,339, 16.77 blk/s).
+
+### 94.3 Paired B / A (geomean of per-round ratios, 95% CI, 2 df)
+
+| metric | r1 / r2 / r3 | B / A |
+|---|---|---|
+| exec thread on-CPU ms per 1k fills | 0.9462 / 0.9609 / 0.9569 | 0.9546 [0.9358, 0.9738] |
+| native blk/s | 1.2603 / 1.4785 / 1.4510 | 1.3931 [1.1215, 1.7305] |
+| block p50 | 0.9841 / 0.6977 / 0.8304 | 0.8292 [0.5409, 1.2712] |
+| block p99 | 0.7980 / 0.8487 / 0.6264 | 0.7514 [0.5043, 1.1196] |
+| matched/s | 1.0253 / 1.0034 / 1.0165 | 1.0150 [0.9879, 1.0429] |
+| CPU-s / 1M fills | 0.9949 / 1.0117 / 1.0061 | 1.0042 [0.9831, 1.0257] |
+| fills / native blk | 0.8194 / 0.6928 / 0.7124 | 0.7395 [0.5915, 0.9246] |
+| exec block_ms | 0.7937 / 0.6749 / 0.6966 | 0.7199 [0.5815, 0.8913] |
+| exec ms per 1k fills (block_ms / fills) | 0.9686 / 0.9741 / 0.9778 | 0.9735 [0.9621, 0.9850] |
+| verify ms / native blk | 0.6831 / 0.5858 / 0.5949 | 0.6198 [0.5023, 0.7648] |
+| verify ms per 1k fills | 0.8337 / 0.8456 / 0.8351 | 0.8381 [0.8222, 0.8543] |
+| sort (residual untimed) ms / blk | 0.0838 / 0.0688 / 0.0809 | 0.0776 [0.0598, 0.1007] |
+| verify + sort ms per 1k orders placed | 0.4843 / 0.4882 / 0.4868 | 0.4864 [0.4816, 0.4913] |
+| exec engine ms per 1k fills | 1.0347 / 1.0367 / 1.0453 | 1.0389 [1.0249, 1.0530] |
+| exec thread runqueue wait ms per 1k fills | 0.9591 / 0.9427 / 0.9689 | 0.9568 [0.9245, 0.9904] |
+| flush worker ms per 1k fills | 1.0428 / 1.1921 / 1.0526 | 1.0938 [0.9085, 1.3169] |
+| hotstuff-algo ms / blk | 0.8521 / 0.7342 / 0.7494 | 0.7769 [0.6356, 0.9495] |
+| node RSS mean / max | 0.8802 / 0.8312 / 0.8790; 0.8487 / 0.8268 / 0.8601 | 0.8632 [0.7958, 0.9362]; 0.8451 [0.8039, 0.8884] |
+| trust-cache hit share | 0.9960 / 0.9980 / 0.9942 | 0.9961 [0.9913, 1.0008] |
+
+Timeouts have no paired ratio (r1-A had 0); pooled rates are in 94.2.
+
+Call (exec-path merge rule):
+* Exec-thread on-CPU ms per 1k fills: falls, CI below 1 [0.9358, 0.9738]. Met.
+* Native blocks/s: +39%, CI above 1. Not worse.
+* Block p50 / p99: -17% / -25%, CIs span 1 ([0.54, 1.27] / [0.50, 1.12]). Not on the wrong side: not worse.
+* Timeouts per 1,000 native blocks: 0.351 -> 0.072. Not worse.
+* matched/s, exec ms per 1k fills and CPU-s per 1M: no regression (matched/s and CPU within noise, exec per fill
+  -2.7% resolved).
+* Verdict: B passes every row; merge.
+* The exec engine per 1k fills is +3.9% [1.0249, 1.0530]. That is the smaller blocks amortizing per-block engine work
+  over fewer fills (section 91 saw -5% the other way with bigger blocks). The exec thread as a whole is cheaper per
+  fill.
+* Microbench vs live. Live A spends 11.4 ms on verify + sort at ~122 actions x ~246 orders. Per 1k orders that is
+  0.382 ms, or ~9.1 ms at the microbench's 100 x 239, below the microbench's 13.1 ms. B: ~4.4 ms vs ~5.2. The live
+  cut is 51% of verify + sort per order, against the microbench's 60%. Most of it is the sort (-92%); verify is -16%
+  per fill. A ~62% node-wide trust-cache hit share leaves few blocks where every action hits, so the all-hit
+  recovery skip can contribute only a small part here.
+
+### 94.4 Next
+
+* Owner / 18c: merge `perf/exec-hash-once` `70993fa9`. The rule passes on every row, and latency improves (point
+  estimates p50 -17%, p99 -25%; blocks/s +39% resolved).
+* The sort has no timer of its own; it shows only as the residual. A `torus_exec_sort_seconds` histogram would make
+  the next exec-path A/B read it directly.
+* Data: `~/bench-results-matched/ozarchy-p8g-300m-{smoke-s0,w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}` and
+  `ozarchy-p8gsa-300m-smoke-s0` (per cell `p8g-push.txt`, `p8g-disk.txt`). Campaign files in
+  `ozarchy-p8g-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`) and `ozarchy-p8g-run/smokeA/smoke/`. Tools in
+  `ozarchy-p8g-tools/` (`p8g-spec.json`, `p8g-smokeA-spec.json`, `p8g-checks.sh`, the two generated drivers,
+  `FROZEN.txt`). Binaries in `ozarchy-p8g-stage/` (`build/build.sh`, `build/md5s.txt`, `build/md5s-driver.txt`,
+  `build/build.log`; B's unused bench in `b/unused/`). Analysis in `ozarchy-p8g-run/analyst/` (`p8g-analyse.py`,
+  from p5s2's, and `p8g.txt`).
+
+### 94.5 Cells (`p8g.txt`)
+
+| cell | arm | rc | valid/agree/live | md5 raw | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts | verify ms/blk [per 1k fills] | sort (residual) ms/blk | exec engine ms/blk | exec on-CPU ms/1k fills | exec busy | RSS mean/max MB | boundary pipelined true:false per node | native blocks |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 0/0 | ACCEPT/AGREE/PASS | True | 265,689.6 | 9.715 | 24,249 | 90.6 | 23 / 877 | 22.70 | 0 | 6.12 [0.252] | 5.68 | 66.4 | 2.794 | 0.881 | 3,932 / 5,024 | 43:0/43:0/43:0 | 2,934 |
+| r1 | A | 0/0 | ACCEPT/AGREE/PASS | True | 259,936.8 | 11.819 | 21,105 | 80.3 | 15 / 857 | 23.42 | 0 | 5.56 [0.263] | 5.05 | 59.6 | 2.836 | 0.949 | 4,290 / 5,553 | 84:0/84:0/84:0 | 7,115 |
+| r1 | B | 0/0 | ACCEPT/AGREE/PASS | True | 266,525.7 | 14.895 | 17,293 | 63.7 | 15 / 684 | 23.30 | 1 | 3.80 [0.220] | 0.42 | 50.5 | 2.683 | 0.949 | 3,776 / 4,712 | 103:0/103:0/103:0 | 8,967 |
+| r2 | B | 0/0 | ACCEPT/AGREE/PASS | True | 263,860.8 | 14.355 | 17,766 | 65.4 | 14 / 745 | 23.36 | 1 | 3.88 [0.218] | 0.42 | 51.7 | 2.700 | 0.939 | 3,802 / 4,774 | 99:0/99:0/99:0 | 8,656 |
+| r2 | A | 0/0 | ACCEPT/AGREE/PASS | True | 262,976.2 | 9.709 | 25,642 | 96.9 | 21 / 878 | 23.09 | 1 | 6.62 [0.258] | 6.05 | 72.0 | 2.810 | 0.941 | 4,575 / 5,775 | 72:0/72:0/72:0 | 5,845 |
+| r3 | A | 0/0 | ACCEPT/AGREE/PASS | True | 260,734.2 | 11.557 | 21,531 | 81.8 | 16 / 848 | 23.30 | 6 | 5.66 [0.263] | 5.11 | 60.9 | 2.823 | 0.945 | 4,107 / 5,639 | 83:0/83:0/83:0 | 6,969 |
+| r3 | B | 0/0 | ACCEPT/AGREE/PASS | True | 265,034.9 | 16.769 | 15,339 | 57.0 | 13 / 531 | 23.44 | 0 | 3.37 [0.220] | 0.41 | 45.3 | 2.701 | 0.956 | 3,610 / 4,851 | 114:0/114:0/114:0 | 10,112 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
