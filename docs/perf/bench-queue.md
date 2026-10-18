@@ -322,6 +322,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    node stays under ~15 GB, run the 3-node cell; watch free memory and swap, and stop if it swaps (swapped restart
    times are meaningless). (3) If it does not fit: stop and report; 18c and the owner pick 500k on archy's host or a
    capacity-only 3-node cell (RSS, restart, replay; no throughput) on 18c's 94 GB host.
+8g. **Exec hashing quick wins A/B** (owner s128; right after 8f; ~1 h 10). Section 92's fix on `perf/exec-hash-once`
+   `70993fa9` (from main `25c5939f`; Codex torus-adversarial approve: 16,160 differential hash cases, keys byte-identical):
+   the sort key and the trust-cache key come from one encoding of each action, signature recovery is skipped when
+   every action hits the cache, the EIP-712 domain separator is cached. Release microbench, verify + sort per block:
+   13.1 -> ~5.2 ms (100 actions x 239 orders); 61.6 -> 50-54 ms (24k one-order actions). Two binaries, both with the
+   new code defaults (nothing set; 512 KB from `env.sh`; custody 0): A = main `25c5939f`, B = `70993fa9`. Standard load,
+   300 markets, 600 s cells, warm-up then A B B A A B (n = 3). Judge by the exec-path merge rule above: exec-thread
+   on-CPU ms per 1k fills must fall (CI below 1), and native blocks/s, block p50 / p99 and timeouts per 1,000 blocks
+   must not get worse; also report matched/s, CPU-s per 1M, fills per native block and the verify / sort / recovery
+   phase timers if present.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
