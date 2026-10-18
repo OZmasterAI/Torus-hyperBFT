@@ -1289,6 +1289,15 @@ struct ExecutionContext {
     /// fills per block runs both. Default off (the production gate).
     #[cfg(test)]
     test_parallel_settle_odd_heights: bool,
+    /// Item 6 Phase 5 step 3: test-only, forces the parallel cancel-all book
+    /// pass (`TORUS_PARALLEL_CANCEL_ALL`: 4 jobs, no work gate) on even
+    /// heights, so a test stream's few cancel-all runs take it; odd heights
+    /// keep the env default (the serial pass). Counts the runs that took it
+    /// in `test_cancel_all_parallel_runs`. Default off.
+    #[cfg(test)]
+    test_parallel_cancel_all_even_heights: bool,
+    #[cfg(test)]
+    test_cancel_all_parallel_runs: std::sync::atomic::AtomicU64,
     /// Test-only crash injection (consensus bug (c)): return right after the
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
@@ -4243,6 +4252,10 @@ impl ExecutionContext {
                 ctx.test_parallel_settle = self
                     .test_parallel_settle_odd_heights
                     .then_some(torus_block.header.height % 2 == 1);
+                if self.test_parallel_cancel_all_even_heights && torus_block.header.height % 2 == 0 {
+                    ctx.cancel_all_workers = 4;
+                    ctx.cancel_all_min_visits = 0;
+                }
             }
             // Item 6 C2: the slot's previous mark table / configs decide the
             // version of this block's table (filled by begin_block_oracle).
@@ -4368,6 +4381,9 @@ impl ExecutionContext {
             if let Some(probe) = self.test_block_probe.as_ref() {
                 probe(&ctx);
             }
+            #[cfg(test)]
+            self.test_cancel_all_parallel_runs
+                .fetch_add(ctx.test_cancel_all_parallel_runs, Ordering::SeqCst);
             // F11: a storage fault in the step (or, R02, in the CoreWriter
             // drain above) fail-stops exactly like the batches' check above.
             if let Some(reason) = ctx.take_fatal_error() {
@@ -6225,6 +6241,10 @@ impl TorusApp {
             test_reference_paths: false,
             #[cfg(test)]
             test_parallel_settle_odd_heights: false,
+            #[cfg(test)]
+            test_parallel_cancel_all_even_heights: false,
+            #[cfg(test)]
+            test_cancel_all_parallel_runs: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -14840,6 +14860,10 @@ mod crash_recovery_tests {
             test_reference_paths: false,
             #[cfg(test)]
             test_parallel_settle_odd_heights: false,
+            #[cfg(test)]
+            test_parallel_cancel_all_even_heights: false,
+            #[cfg(test)]
+            test_cancel_all_parallel_runs: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_crash_after_evm_section: false,
             #[cfg(test)]
@@ -28924,6 +28948,9 @@ mod crash_recovery_tests {
         /// durable marker after any block.
         restarts: u64,
         max_lag: u64,
+        /// Step 3: cancel-all runs that took the parallel book pass, summed
+        /// over this node's contexts.
+        parallel_cancel_all: u64,
     }
 
     impl P5Node {
@@ -28941,6 +28968,7 @@ mod crash_recovery_tests {
                 probe,
                 restarts: 0,
                 max_lag: 0,
+                parallel_cancel_all: 0,
             };
             node.ctx = Some(node.new_ctx(true));
             node
@@ -28957,6 +28985,7 @@ mod crash_recovery_tests {
             };
             ctx.test_block_probe = self.probe.clone();
             ctx.test_parallel_settle_odd_heights = true;
+            ctx.test_parallel_cancel_all_even_heights = true;
             p5_configure(&mut ctx, self.path);
             if self.cfg.pipelined && attach {
                 ctx.attach_flush_worker(None);
@@ -28979,6 +29008,7 @@ mod crash_recovery_tests {
             if b.fatal {
                 let failed = self.ctx.take().expect("a context");
                 failed.pipeline_barrier();
+                self.parallel_cancel_all += failed.test_cancel_all_parallel_runs.load(Ordering::SeqCst);
                 assert!(
                     failed.exec_failed.load(Ordering::SeqCst),
                     "{what}: the fatal block {h} fail-stops"
@@ -29018,6 +29048,29 @@ mod crash_recovery_tests {
                 .max_lag
                 .max(h - read_native_applied_height(&self.db).unwrap_or(0));
         }
+
+        /// Drop the context (W drained), keeping its counters.
+        fn finish(&mut self) {
+            if let Some(ctx) = self.ctx.take() {
+                self.parallel_cancel_all += ctx.test_cancel_all_parallel_runs.load(Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Step 3: the blocks in which the typed node wrote Classic book rows
+    /// from the level dirty set, by kind (path coverage of the book-row
+    /// writer).
+    #[derive(Debug, Default)]
+    struct P5BookBlocks {
+        any: u64,
+        epoch: u64,
+        evm: u64,
+        slash: u64,
+        liquidation: u64,
+        /// The block replayed after the fatal one, or the next block that
+        /// wrote rows: a full build (the books were loaded).
+        full_after_restart: u64,
+        empty_skipped: u64,
     }
 
     /// The first difference the harness found: at which block, and what.
@@ -29052,6 +29105,17 @@ mod crash_recovery_tests {
         /// were still aliased and had moved ([`p5_aliased_live`]), and the
         /// last such durable height.
         aliased_live: (u64, u64),
+        /// Step 3: Classic book rows written from the level dirty set by the
+        /// reference / typed node; the typed node's full builds, levels
+        /// reused and levels encoded.
+        book_rows: (u64, u64),
+        book_full_builds: u64,
+        book_levels: (u64, u64),
+        /// Step 3: the typed node's blocks with cached book rows, by kind.
+        book_blocks: P5BookBlocks,
+        /// Step 3: cancel-all runs on the parallel book pass (reference,
+        /// typed).
+        parallel_cancel_all: (u64, u64),
     }
 
     /// After block `h` on both nodes (both idle): the write sets of the
@@ -29173,18 +29237,41 @@ mod crash_recovery_tests {
         let mut b = P5Node::new(cfg, P5Path::Typed, probe);
         let mut compared = P5Compared::default();
         let mut aliased_live = (0, 0);
+        let mut book_blocks = P5BookBlocks::default();
+        let mut after_restart = false;
         for blk in blocks {
             a.execute(blk);
+            let m = b.metrics.clone();
+            let before = (m.exec_book_rows_cached.get(), m.exec_book_rows_full_builds.get(), m.liquidations_triggered.get());
+            let restarts = b.restarts;
             b.execute(blk);
-            p5_compare(&a, &b, blk.block.header.height, dump_every, &mut compared)?;
+            let h = blk.block.header.height;
+            let rows = m.exec_book_rows_cached.get() - before.0;
+            if b.restarts > restarts {
+                after_restart = true;
+            }
+            if rows > 0 {
+                book_blocks.any += 1;
+                book_blocks.epoch += u64::from(h % C5_EPOCH == 0);
+                book_blocks.evm += u64::from(!blk.block.evm_transactions.is_empty());
+                book_blocks.slash += u64::from(!blk.slashes.is_empty());
+                book_blocks.liquidation += u64::from(m.liquidations_triggered.get() > before.2);
+                if after_restart {
+                    after_restart = false;
+                    book_blocks.full_after_restart += u64::from(m.exec_book_rows_full_builds.get() > before.1);
+                }
+            } else if blk.block.native_actions.is_empty() && blk.block.evm_transactions.is_empty() {
+                book_blocks.empty_skipped += 1;
+            }
+            p5_compare(&a, &b, h, dump_every, &mut compared)?;
             let durable = read_native_applied_height(&a.db).unwrap_or(0);
             if durable > 0 && p5_aliased_live(&a.db, durable) {
                 aliased_live = (aliased_live.0 + 1, durable);
             }
         }
         let last = blocks.last().map_or(0, |b| b.block.header.height);
-        drop(a.ctx.take());
-        drop(b.ctx.take());
+        a.finish();
+        b.finish();
         p5_compare(&a, &b, last, 1, &mut compared)?;
         let (ha, hb) = (
             torus_state::running_hash::read_running_hash(&a.db),
@@ -29209,6 +29296,17 @@ mod crash_recovery_tests {
                 b.metrics.exec_users_drained_rows.get(),
             ),
             aliased_live,
+            book_rows: (
+                a.metrics.exec_book_rows_cached.get(),
+                b.metrics.exec_book_rows_cached.get(),
+            ),
+            book_full_builds: b.metrics.exec_book_rows_full_builds.get(),
+            book_levels: (
+                b.metrics.exec_book_rows_levels_reused.get(),
+                b.metrics.exec_book_rows_levels_encoded.get(),
+            ),
+            book_blocks,
+            parallel_cancel_all: (a.parallel_cancel_all, b.parallel_cancel_all),
         })
     }
 
@@ -29265,6 +29363,26 @@ mod crash_recovery_tests {
             assert_eq!(s.drained.0, 0, "{cfg:?}: the reference node drained rows: {s:?}");
             assert!(s.drained.1 >= n, "{cfg:?}: the typed node drained in place: {s:?}");
             assert!(s.aliased_live.0 >= n / 4, "{cfg:?}: the aliased trader's rows: {s:?}");
+            // Step 3: the typed node wrote Classic rows from the level dirty
+            // set in blocks of every kind (epoch boundary, EVM, slash,
+            // liquidation, the replay after the fatal block: a full build),
+            // the reference node never; modes 1-3 never. Both nodes took the
+            // parallel cancel-all book pass (even heights) and the serial
+            // one.
+            let b = &s.book_blocks;
+            if cfg.mode == torus_bridge::native_executor::BookMode::Classic {
+                assert_eq!(s.book_rows.0, 0, "{cfg:?}: the reference node took the cached path: {s:?}");
+                assert!(s.book_rows.1 >= fed.native / 2, "{cfg:?}: cached book rows: {s:?}");
+                assert!(s.book_full_builds >= 6, "{cfg:?}: full builds at the start and after the restart: {s:?}");
+                assert!(s.book_levels.0 > s.book_rows.1 && s.book_levels.1 > 0, "{cfg:?}: levels reused / encoded: {s:?}");
+                assert!(
+                    b.epoch >= 1 && b.evm >= 1 && b.slash >= 1 && b.liquidation >= 1 && b.full_after_restart == 1,
+                    "{cfg:?}: block kinds with cached book rows: {s:?}"
+                );
+            } else {
+                assert_eq!(s.book_rows, (0, 0), "{cfg:?}: modes 1-3 keep their save: {s:?}");
+            }
+            assert!(s.parallel_cancel_all.0 > 0 && s.parallel_cancel_all.1 > 0, "{cfg:?}: parallel cancel-all runs: {s:?}");
             assert!(
                 s.fills >= n as usize && s.liquidations >= 3 && s.bbo_rows >= 1,
                 "{cfg:?}: {s:?}"

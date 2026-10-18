@@ -5152,6 +5152,11 @@ mod cloid_equiv_tests;
 #[path = "book_index_tests.rs"]
 mod book_index_tests;
 
+// Item 6 Phase 5 step 3: Classic rows from the level dirty set.
+#[cfg(test)]
+#[path = "book_rows_tests.rs"]
+mod book_rows_tests;
+
 #[cfg(test)]
 #[path = "margin_label_tests.rs"]
 mod margin_label_tests;
@@ -5527,6 +5532,18 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     /// thread needs the PRODUCTION share, not a µbench's. Node-local
     /// instrumentation: never read by execution, never part of the state root.
     pub save_split: SaveSplitAccum,
+    /// Item 6 Phase 5 step 3: Classic saves write each dirty book's row from
+    /// its level dirty set ([`OrderBook::classic_row`]). On for a context
+    /// with a resident holder (off: books reloaded every block, and the
+    /// holder's test-only reference path).
+    book_rows_cached: bool,
+    /// Item 6 Phase 5 step 3: this context's cached Classic saves.
+    book_rows: BookRowsAccum,
+    /// Item 6 Phase 5 step 3 (tests): every cached Classic row is also
+    /// encoded the reference way and must be equal (panics otherwise).
+    /// Default on in test builds.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub test_book_rows_check: bool,
 
     /// Item 6 Phase 2 step 0.4: test-only reference switch (no runtime flag,
     /// D16). `true` runs every cancel-all (user runs and single actions, the
@@ -5556,8 +5573,9 @@ pub struct NativeExecContext<T: StateBackend = StateDb> {
     #[cfg(test)]
     pub test_cancel_all_panic_market: Option<MarketId>,
     /// Test-only: cancel-all runs that took the parallel book pass (the
-    /// differential tests prove the pool was used, not just the serial loop).
-    #[cfg(test)]
+    /// differential tests prove the pool was used, not just the serial loop;
+    /// item 6 Phase 5 step 3: the app-level differential too).
+    #[cfg(any(test, feature = "test-reference-paths"))]
     pub test_cancel_all_parallel_runs: u64,
     /// Test-only: `order_books` entries the parallel cancel-all book pass
     /// examined to lend the run's books (Codex s123 P2: must scale with the
@@ -5582,6 +5600,41 @@ pub struct SaveSplitAccum {
     /// Pass 2: the serial market-ascending overlay writes (order rows, level
     /// rows, stop diff, meta).
     pub write_ns: u128,
+}
+
+/// Item 6 Phase 5 step 3: what the Classic saves of one context did on the
+/// cached path ([`OrderBook::classic_row`], the level dirty set). All zero
+/// on the reference encoding (modes 1-3, books without a resident holder,
+/// the test-only reference path).
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BookRowsAccum {
+    /// Book rows written from the cached path.
+    pub saves: u64,
+    /// Of those, rows whose level cache was built from every level.
+    pub full_builds: u64,
+    /// Levels copied from the cache.
+    pub levels_reused: u64,
+    /// Levels encoded again (all of a full build's).
+    pub levels_encoded: u64,
+    /// Journaled levels gone from the book.
+    pub levels_removed: u64,
+    /// Bytes of the rows.
+    pub bytes: u64,
+    /// Rows checked against the reference encoding (test-only check).
+    pub checked: u64,
+}
+
+impl BookRowsAccum {
+    /// Field-wise sum.
+    pub fn add(&mut self, o: &Self) {
+        self.saves += o.saves;
+        self.full_builds += o.full_builds;
+        self.levels_reused += o.levels_reused;
+        self.levels_encoded += o.levels_encoded;
+        self.levels_removed += o.levels_removed;
+        self.bytes += o.bytes;
+        self.checked += o.checked;
+    }
 }
 
 /// r6 engine-untimed-attribution: per-block nanosecond accumulators for the
@@ -6065,6 +6118,10 @@ impl<T: StateBackend> NativeExecContext<T> {
             load_timings,
             phase_accum: ExecPhaseAccum::default(),
             save_split: SaveSplitAccum::default(),
+            book_rows_cached: false,
+            book_rows: BookRowsAccum::default(),
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            test_book_rows_check: true,
             #[cfg(any(test, feature = "test-reference-paths"))]
             test_cancel_all_full_scan: false,
             #[cfg(any(test, feature = "test-reference-paths"))]
@@ -6073,7 +6130,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             test_parallel_settle: None,
             #[cfg(test)]
             test_cancel_all_panic_market: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-reference-paths"))]
             test_cancel_all_parallel_runs: 0,
             #[cfg(test)]
             test_cancel_all_parallel_books_examined: 0,
@@ -6153,6 +6210,11 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// rebuilding from persisted). Test/ops introspection.
     pub fn resident_reused(&self) -> bool {
         self.resident_reused
+    }
+
+    /// Item 6 Phase 5 step 3: this context's cached Classic saves so far.
+    pub fn book_rows_stats(&self) -> BookRowsAccum {
+        self.book_rows
     }
 
     /// rank8: whether this context runs in resident-book mode at all (was
@@ -12368,7 +12430,7 @@ impl NativeExecutor {
         run: &[(usize, Address, Option<MarketId>)],
         visits: &[(MarketId, usize)],
     ) -> Result<Vec<NativeActionResult>, Vec<NativeActionResult>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-reference-paths"))]
         {
             ctx.test_cancel_all_parallel_runs += 1;
         }

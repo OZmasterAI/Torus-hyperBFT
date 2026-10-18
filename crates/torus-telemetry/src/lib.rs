@@ -560,6 +560,15 @@ pub struct Metrics {
     /// Item 6 Phase 5 step 2: rows of positions and balances the drains
     /// serialized from the in-place `Users` (writes and tombstones).
     pub exec_users_drained_rows: Counter,
+    /// Item 6 Phase 5 step 3: Classic book rows written from the level dirty
+    /// set (`OrderBook::classic_row`), and of those, rows whose level cache
+    /// was built from every level (first save after a load or restart).
+    pub exec_book_rows_cached: Counter,
+    pub exec_book_rows_full_builds: Counter,
+    /// Item 6 Phase 5 step 3: levels the cached Classic rows copied from the
+    /// cache, and levels they encoded again (the dirty set).
+    pub exec_book_rows_levels_reused: Counter,
+    pub exec_book_rows_levels_encoded: Counter,
     /// Item 6 Phase 5 step 2 (Task 2.3 guard, owner s128): rows of positions
     /// or balances found in an EVM block's journal (an EVM tx scope wrote a
     /// typed CF the in-place `Users` never sees). Should stay 0; the guard
@@ -2277,6 +2286,32 @@ impl Metrics {
             "Item 6 Phase 5: position / balance rows serialized from the in-place Users (writes and tombstones)",
             exec_users_drained_rows.clone(),
         );
+        let [exec_book_rows_cached, exec_book_rows_full_builds, exec_book_rows_levels_reused, exec_book_rows_levels_encoded]: [Counter; 4] =
+            Default::default();
+        for (name, help, c) in [
+            (
+                "torus_exec_book_rows_cached",
+                "Item 6 Phase 5: Classic book rows written from the level dirty set",
+                &exec_book_rows_cached,
+            ),
+            (
+                "torus_exec_book_rows_full_builds",
+                "Item 6 Phase 5: cached Classic book rows whose level cache was built from every level",
+                &exec_book_rows_full_builds,
+            ),
+            (
+                "torus_exec_book_rows_levels_reused",
+                "Item 6 Phase 5: price levels the cached Classic book rows copied unchanged",
+                &exec_book_rows_levels_reused,
+            ),
+            (
+                "torus_exec_book_rows_levels_encoded",
+                "Item 6 Phase 5: price levels the cached Classic book rows encoded again (the dirty set)",
+                &exec_book_rows_levels_encoded,
+            ),
+        ] {
+            registry.register(name, help, c.clone());
+        }
         let exec_evm_scope_typed_writes = Counter::default();
         registry.register(
             "torus_exec_evm_scope_typed_writes",
@@ -3038,6 +3073,10 @@ impl Metrics {
             exec_end_resident_users_seconds,
             exec_users_drain_seconds,
             exec_users_drained_rows,
+            exec_book_rows_cached,
+            exec_book_rows_full_builds,
+            exec_book_rows_levels_reused,
+            exec_book_rows_levels_encoded,
             exec_evm_scope_typed_writes,
             exec_end_resident_wait_seconds,
             exec_cancel_all,
@@ -3668,6 +3707,10 @@ mod tests {
             "torus_exec_end_resident_users_seconds",
             "torus_exec_users_drain_seconds",
             "torus_exec_users_drained_rows",
+            "torus_exec_book_rows_cached",
+            "torus_exec_book_rows_full_builds",
+            "torus_exec_book_rows_levels_reused",
+            "torus_exec_book_rows_levels_encoded",
             "torus_exec_evm_scope_typed_writes",
             "torus_exec_end_resident_wait_seconds",
             "torus_exec_queue_depth",
