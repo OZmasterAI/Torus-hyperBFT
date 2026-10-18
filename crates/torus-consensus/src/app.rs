@@ -28542,7 +28542,12 @@ mod crash_recovery_tests {
                 }
             }
             fed.fatal += u64::from(fatal);
-            let mut b = make_block(h, actions);
+            // `make_block(h)` links to `make_block(h - 1)` recursively (depth
+            // h, quadratic over the stream): height 1's block re-stamped to h,
+            // its parent hash set by `link_blocks` below.
+            let mut b = make_block(1, actions);
+            b.header.height = h;
+            b.header.timestamp = 1000 + h;
             b.header.evm_tx_count = evm_txs.len() as u32;
             b.evm_transactions = evm_txs;
             blocks.push(b);
@@ -28953,9 +28958,11 @@ mod crash_recovery_tests {
     }
 
     /// The long variant: 10,000 blocks through every configuration (4 at a
-    /// time), a CF dump every 50 durable heights.
+    /// time), a CF dump every 50 durable heights. Over nextest's 10 min cap:
+    /// `cargo test -p torus-consensus --lib phase5_differential_long_random_10k
+    /// -- --ignored`.
     #[test]
-    #[ignore = "long: 10k blocks x every configuration; run with --run-ignored"]
+    #[ignore = "long: 10k blocks x every configuration; run with cargo test -- --ignored"]
     fn phase5_differential_long_random_10k() {
         p5_differential_matrix(10_000, 50, &p5_configs(), 4);
     }

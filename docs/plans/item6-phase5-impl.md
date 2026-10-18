@@ -307,6 +307,50 @@ The overlay still takes every write. The new path runs next to it in tests and i
   planted divergence: `harness_detects_one_flipped_row`).
 - Verify: `cargo nextest run -p torus-consensus $F`.
 
+**Built (s128, branch `feat/item6-phase5-step1` off `cfa35ed1`; shadow only, no production caller).**
+- Task 1.1 (`torus-bridge/src/users.rs`):
+  - The dirty sets sit in `Users`, one per key shape: hash sets of `(trader, market)` keys, of balance traders and
+    of `cvlm` traders, plus a raw `BTreeSet` per CF for every other key. `drain_dirty` sorts at the drain and reads
+    each row as held then (absent: a tombstone).
+  - Hash sets plus sort, not `BTreeSet`s: `ubench_dirty_set_btree_vs_hash_sort` (release; 120k position and 40k
+    balance inserts over 60k and 20k keys) took 51-52 ms vs 65-76 ms. The absolute cost is high for one native
+    block (busy shared host). Step 2 measures the real drain, and should sort fixed-size keys instead of `Vec<u8>`
+    or move the drain to a worker (risk 3).
+  - `UsersMut` has `set_position`, `remove_position`, `set_balance` and `add_cum_volume`. On an opaque trader's
+    bad `cvlm` row, `add_cum_volume` returns the same read error that today's `add_cum_volume` read gives, and marks
+    nothing. `put_row` is decision 3's write-through: one row, followed exactly as `Users::apply` follows a delta.
+  - `torus-state` gains `FrozenPending::put_rows`, plus `rows(cf)` for tests.
+  - Deviation: an opaque trader's typed write goes into its raw rows inside `Users`. The trader is re-decoded, so it
+    may turn regular. Its keys are in the dirty set, and the drain emits their bytes, never from a record. Section 3
+    had them stay on the overlay's pending path; keeping them in `Users` avoids two owners of one key in one block (a
+    typed write followed by an irregular write of the same key).
+  - The tests' `Shadow` is a `StateBackend` around the block overlay. It mirrors every write of the two CFs onto a
+    `Users`, by a typed call or by `put_row` (seeded). It runs every production writer in "Anchor re-check" plus
+    raw and irregular rows.
+- Task 1.2 (`torus-consensus/src/app.rs`, after the C5 tests):
+  - Pieces: `p5_blocks`, `P5Node`, `p5_compare`, `p5_differential`. `p5_configure` is the typed-path switch (empty
+    in step 1).
+  - Per block, the harness compares: the write set (`h_n`) of every height hashed since the last block, the
+    durable markers, and the action status row of every height that became durable ("action results"). It
+    compares the full CF dump every block in the default run and every 50 durable heights in the 10k run. At the
+    end it compares the running hash and the final dump.
+  - Configurations: 12. Serial in all four BookModes. Pipelined per block in all four. Every 5 blocks and never in
+    Classic and OrderRows only (modes 2/3 refuse an interval).
+  - Fault: the stream's fatal block is a nonce-put fault. It fail-stops, then a new context replays from the
+    durable marker.
+  - Test split: the default 300 blocks run as three tests, because of nextest's 10 min cap:
+    `phase5_differential_long_random` (serial), `..._pipelined` and `..._pipelined_level_authority`.
+    `phase5_differential_long_random_10k` is ignored; run it with `cargo test ... -- --ignored`.
+  - Fixture: it builds the EVM trie as the node does at boot. Without that, the first EVM bundle starts a partial
+    trie, and the next EVM block's incremental root fails its full-scan check (a test artifact).
+- Runs: `phase5_differential_long_random_10k` (10,000 blocks: 9,247 native, 489 EVM blocks, 103 slashes, 200 epoch
+  boundaries, one fatal block; 12,042 fills) passed all 12 configurations, no divergence, in 5,022 s (4 at a time,
+  1,123-1,764 s each, debug build).
+- For step 2:
+  - The sums carry (section 2, anchor re-check).
+  - The drain cost (above).
+  - The `Shadow` mirror can cross-check step 2's write-through hook.
+
 ### Step 2: hot writers mutate `Users` in place
 
 Consensus-adjacent write path. Codex torus-adversarial review before step 3.
