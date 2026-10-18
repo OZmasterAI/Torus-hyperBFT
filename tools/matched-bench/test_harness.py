@@ -4026,28 +4026,39 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
             _stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched"
         )
 
-    def write_generator(self, stale_n):
+    def write_generator(self, stale_n, bulk="$BULK_COUNT"):
         """A generator that records the EVM_BLOCK_INTERVAL it was given and
         writes a MARKETS-market genesis with that N (or with `stale_n`, the
-        hand-patched weighted base case, when the knob is unset)."""
+        hand-patched weighted base case, when the knob is unset), funding
+        `bulk` "bulk-test N" senders (default: the BULK_COUNT it was handed,
+        which run-cell.sh checks after the genesis step)."""
         with open(self.gen, "w") as f:
             f.write(
                 "#!/usr/bin/env bash\n"
                 "printf '%%s\\n' \"${EVM_BLOCK_INTERVAL-<unset>}\" >> '%s'\n"
                 "n=${EVM_BLOCK_INTERVAL:-%s}\n"
-                "jq -n --argjson m \"$MARKETS\" --arg n \"$n\" '{markets: [range($m)], native_balances: [],"
+                "jq -n --argjson m \"$MARKETS\" --arg n \"$n\" --argjson b \"%s\" '{markets: [range($m)],"
+                " native_balances: [range($b) | {note: \"bulk-test \\(. + 60)\"}],"
                 " consensus: {timeout_base_ms: 500}, evm: ({chain_id: 7778}"
                 " + (if $n == \"\" then {} else {block_interval: ($n|tonumber)} end))}' > \"$OUT\"\n"
-                % (self.seen, stale_n)
+                % (self.seen, stale_n, bulk)
             )
         os.chmod(self.gen, 0o755)
+
+    def test_a_genesis_without_bulk_count_senders_stops_the_cell(self):
+        # e.g. an older gen-3val-genesis.sh that ignores BULK_COUNT and reuses a 100k genesis
+        self.write_generator("", bulk="7")
+        r, log = self.run_cell(BULK_COUNT="8")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("genesis has 7 bulk-test senders, wanted BULK_COUNT=8", log)
+        self.assertNotIn("launch-3val.sh failed", log)
 
     def run_cell(self, extra_env="", **env):
         e = {
             k: v
             for k, v in os.environ.items()
             if not k.startswith(("LIQ_", "ORACLE_", "EXPECT_", "EVM_"))
-            and k not in ("FORCE", "SENDERS")
+            and k not in ("FORCE", "SENDERS", "BULK_COUNT")
         }
         e.update(
             PATH=self.bin + os.pathsep + os.environ["PATH"],
@@ -4056,9 +4067,10 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
             DATA_ROOT=os.path.join(self.tmp, "data"),
             BENCH_ALLOW_UNDETACHED="1",
             SENDERS="5",
+            BULK_COUNT="5",
             OVERWRITE="1",
-            **env,
         )
+        e.update(env)
         r = subprocess.run(
             [self.script, self.wt, "knob-x", "4", "60", "1000", extra_env],
             capture_output=True,
@@ -4866,6 +4878,272 @@ class EvmLoadScanTest(unittest.TestCase):
                 e = json.load(f)["evm_load"]
             self.assertEqual(e["problems"], want, rc)
             self.assertIs(e["ok"], False)
+
+
+
+# ------------------------- run-cell.sh: BULK_COUNT and PRELOAD (bench queue 8f)
+class BulkCountAndPreloadHarnessTest(unittest.TestCase):
+    """BULK_COUNT (the funded bulk-sender count of the genesis, default
+    100000) reaches gen-3val-genesis.sh, the cell= line and summary.json, and
+    moves the bench's --funded-bulk-end. PRELOAD=N (default 0 = off) runs
+    `bench-throughput preload` between node ready and the load start, before
+    the metrics-before snapshot and the samplers, so pre-load blocks never
+    count as load; its record lands in summary.json .preload and a missed
+    target REJECTs the cell. Runs a sandbox copy (see sandbox_repo)."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(RUN_CELL_SH) as f:
+            cls.src = f.read()
+
+    def setUp(self):
+        self.real_full = _stat(WEIGHTED_FULL)
+        self.tmp = tempfile.mkdtemp(prefix="bulk-preload-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        fake_target(self.tmp, "Usage: oracle-feed --price <PRICE> --walk-bp <N>; preload --per-owner <P>")
+        self.script, self.wt = sandbox_repo(self.tmp)
+        shutil.copy2(os.path.join(HERE, "preload.py"), os.path.dirname(self.script))
+        self.called = os.path.join(self.tmp, "generator-called")
+        gen = os.path.join(self.wt, "devnet", "wsl", "gen-3val-genesis.sh")
+        with open(gen, "w") as f:
+            f.write("#!/bin/sh\necho \"BULK_COUNT=${BULK_COUNT-unset}\" > '%s'\n" % self.called)
+        os.chmod(gen, 0o755)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "pgrep"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(self.bin, "pgrep"), 0o755)
+
+    def tearDown(self):
+        self.assertEqual(_stat(WEIGHTED_FULL), self.real_full, "the real worktree was touched")
+
+    def run_cell(self, **env):
+        e = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("LIQ_", "ORACLE_", "EXPECT_", "PRELOAD", "SPAM_"))
+            and k not in ("FORCE", "SENDERS", "BULK_COUNT")
+        }
+        e.update(
+            PATH=self.bin + os.pathsep + os.environ["PATH"],
+            TARGET_DIR=self.tmp,
+            RESULTS_ROOT=os.path.join(self.tmp, "results"),
+            DATA_ROOT=os.path.join(self.tmp, "data"),
+            BENCH_ALLOW_UNDETACHED="1",
+            SENDERS="5",
+            FORCE="1",
+            OVERWRITE="1",
+            **env,
+        )
+        r = subprocess.run([self.script, self.wt, "bulk-x"], capture_output=True, text=True,
+                           timeout=60, env=e)
+        try:
+            with open(os.path.join(self.tmp, "results", "bulk-x", "run.log")) as f:
+                log = f.read()
+        except OSError:
+            log = ""
+        return r, log
+
+    def generator_saw(self):
+        with open(self.called) as f:
+            return f.read().strip()
+
+    # ---- BULK_COUNT
+    def test_bulk_count_reaches_the_generator_default_unchanged(self):
+        r, log = self.run_cell()
+        self.assertEqual(self.generator_saw(), "BULK_COUNT=100000", r.stderr + log)
+        self.assertIn("bulk_count=100000", log)
+        os.remove(self.called)
+        r, log = self.run_cell(BULK_COUNT="1000000")
+        self.assertEqual(self.generator_saw(), "BULK_COUNT=1000000", r.stderr + log)
+        self.assertIn("bulk_count=1000000", log)
+
+    def test_bad_bulk_count_or_too_many_senders_fails_preflight(self):
+        for env, msg in (
+            ({"BULK_COUNT": "abc"}, "BULK_COUNT must be a positive integer"),
+            ({"BULK_COUNT": "0"}, "BULK_COUNT must be a positive integer"),
+            ({"BULK_COUNT": "4"}, "SENDERS=5 exceeds BULK_COUNT=4"),
+        ):
+            with self.subTest(env=env):
+                r, _ = self.run_cell(**env)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(os.path.exists(self.called))
+
+    def test_funded_bulk_end_reaches_the_bench_only_off_the_default(self):
+        lines = [l for l in self.src.splitlines() if "--funded-bulk-end" in l and "BENCH_CMD+=" in l]
+        self.assertEqual(len(lines), 1, lines)
+        snippet = "BENCH_CMD=()\n" + lines[0] + '\necho "${BENCH_CMD[*]}"'
+        for bulk, want in (("100000", ""), ("1000000", "--funded-bulk-end 1000060"), ("2000", "--funded-bulk-end 2060")):
+            r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True,
+                               env=dict(os.environ, BULK_COUNT=bulk))
+            self.assertEqual(r.stdout.strip(), want, r.stderr)
+
+    def test_bulk_count_is_recorded_in_the_summary_and_kept_by_resummarize(self):
+        i = self.src.index("record_genesis_bulk_count() {")
+        fn = self.src[i : self.src.index("\n}\n", i) + 3]
+        p = os.path.join(self.tmp, "summary.json")
+        with open(p, "w") as f:
+            json.dump({"genesis": {"md5": "x"}}, f)
+        r = subprocess.run(["bash", "-c", fn + 'record_genesis_bulk_count "%s" 1000000' % p],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(p) as f:
+            self.assertEqual(json.load(f)["genesis"], {"md5": "x", "bulk_count": 1000000})
+        self.assertIn('record_genesis_bulk_count "$OUT/summary.json" "$BULK_COUNT"', self.src)
+        with open(os.path.join(HERE, "resummarize.sh")) as f:
+            resum = f.read()
+        self.assertIn(".genesis.bulk_count", resum)
+        self.assertIn("preload.py", resum)
+
+    def test_knobs_are_documented_and_allowlisted(self):
+        head = self.src[: self.src.index("set -uo pipefail")]
+        for k in ("BULK_COUNT", "PRELOAD=N", "PRELOAD_PER_OWNER", "PRELOAD_OWNER_OFFSET",
+                  "PRELOAD_DISTANCE", "PRELOAD_LEVELS", "PRELOAD_RATE", "PRELOAD_TIMEOUT"):
+            self.assertIn(k, head)
+        with open(os.path.join(HERE, "campaign", "run_cell.py")) as f:
+            allow = f.read()
+        for k in ("BULK_COUNT", "PRELOAD", "PRELOAD_PER_OWNER", "PRELOAD_OWNER_OFFSET",
+                  "PRELOAD_DISTANCE", "PRELOAD_LEVELS", "PRELOAD_RATE", "PRELOAD_TIMEOUT"):
+            self.assertIn('"%s",' % k, allow)
+
+    # ---- PRELOAD
+    def test_preload_defaults_off_and_every_step_is_gated(self):
+        self.assertIn("PRELOAD=${PRELOAD:-0}", self.src)
+        for marker in ('"${PRELOAD_CMD[@]}" >', '$(preload_record "', 'preload.py" summary --dir "$OUT" >/dev/null'):
+            i = self.src.index(marker)
+            gate = self.src.rindex("if preload_on", 0, i)
+            self.assertNotIn("\nfi\n", self.src[gate:i], marker)
+        r, log = self.run_cell()
+        self.assertNotIn("pre-load", log)
+        self.assertIn("preload='off'", log)
+
+    def test_preload_runs_after_ready_and_before_the_load_window(self):
+        run = self.src.index('"${PRELOAD_CMD[@]}" >')
+        self.assertGreater(run, self.src.index('log "healthy after'))
+        self.assertGreater(run, self.src.index('log "idle blk/s'))
+        # after the oracle marks are fresh (orders are banded around the mark) ...
+        self.assertGreater(run, self.src.index('log "oracle marks fresh on all'))
+        # ... and before anything that measures the load.
+        for later in ('scrape_one "${METS[$i]}" > "$OUT/metrics-before-val$i.txt"',
+                      'python3 "$SELF_DIR/sample_metrics.py"', 'T_BENCH0=$(date +%s)',
+                      '"${BENCH_CMD[@]}" >'):
+            self.assertLess(run, self.src.index(later), later)
+
+    def test_preload_cmd_carries_the_cell_shape(self):
+        i = self.src.index("preload_cmd() {")
+        fn = self.src[i : self.src.index("\n}\n", i) + 3]
+        script = (
+            'BENCH=/b; OUT=/o; MARKETS=300; SENDERS=5000; BULK_COUNT=1000000; BAND=5\n'
+            'RPCS=(http://r0 http://r1 http://r2); METS=(1 2 3)\n'
+            'PRELOAD=1000000; PRELOAD_PER_OWNER=900; PRELOAD_OWNER_OFFSET=5060; PRELOAD_DISTANCE=1000\n'
+            'PRELOAD_LEVELS=100; PRELOAD_RATE=50; PRELOAD_TIMEOUT=900\n'
+            + fn + 'preload_cmd; printf "%s\\n" "${PRELOAD_CMD[@]}"'
+        )
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = r.stdout.split("\n")
+        self.assertEqual(args[:2], ["/b", "preload"])
+        pairs = dict(zip(args[2::2], args[3::2]))
+        self.assertEqual(pairs["--rpc-urls"], "http://r0,http://r1,http://r2")
+        self.assertEqual(pairs["--metrics-urls"],
+                         "http://127.0.0.1:1/metrics,http://127.0.0.1:2/metrics,http://127.0.0.1:3/metrics")
+        want = {"--target": "1000000", "--markets": "300", "--per-owner": "900", "--owner-offset": "5060",
+                "--sender-offset": "60", "--senders": "5000", "--funded-bulk-end": "1000060",
+                "--target-margin": "1500", "--band": "5", "--distance": "1000", "--levels": "100",
+                "--rate": "50", "--timeout-s": "900", "--out": "/o/preload.json"}
+        for k, v in want.items():
+            self.assertEqual(pairs.get(k), v, k)
+        # The load uses the same econ mid (--target-margin 1500) and band.
+        bench = self.src[self.src.index("BENCH_CMD=(") :]
+        bench = bench[: bench.index(")\n")]
+        self.assertIn("--target-margin 1500", bench)
+        self.assertIn("--sender-offset 60", bench)
+
+    def test_bad_preload_env_fails_preflight(self):
+        for env, msg in (
+            ({"PRELOAD": "lots"}, "PRELOAD must be"),
+            ({"PRELOAD": "20000", "PRELOAD_PER_OWNER": "0"}, "PRELOAD_PER_OWNER must be"),
+            ({"PRELOAD": "20000", "PRELOAD_PER_OWNER": "1001"}, "PRELOAD_PER_OWNER must be"),
+            ({"PRELOAD": "20000", "PRELOAD_RATE": "fast"}, "PRELOAD_RATE must be"),
+            ({"PRELOAD": "20000", "PRELOAD_DISTANCE": "x"}, "PRELOAD_DISTANCE must be"),
+            # 1M / 900 = 1112 owners from 65: past a 1000-account genesis.
+            ({"PRELOAD": "1000000", "BULK_COUNT": "1000"}, "not all genesis-funded"),
+            # the top 50 funded indices are the spam keys
+            ({"PRELOAD": "900", "BULK_COUNT": "60", "PRELOAD_OWNER_OFFSET": "100",
+              "SPAM_CANCEL_KEYS": "30", "SPAM_CANCEL_RATE": "1", "SPAM_CANCEL_FUNDED": "1"}, "spam keys"),
+        ):
+            with self.subTest(env=env):
+                r, _ = self.run_cell(**env)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(msg, r.stderr)
+                self.assertFalse(os.path.exists(self.called), "refused before the genesis")
+
+    def test_bench_without_preload_fails_preflight(self):
+        for name in ("torus-node", "bench-throughput"):
+            with open(os.path.join(self.tmp, "release", name), "w") as f:
+                f.write("#!/bin/sh\necho 'Usage: oracle-feed --price <PRICE>'\n")
+        r, _ = self.run_cell(PRELOAD="20000")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no preload subcommand", r.stderr)
+
+    def test_bench_dry_run_refusal_fails_preflight(self):
+        with open(os.path.join(self.tmp, "release", "bench-throughput"), "w") as f:
+            f.write("#!/bin/sh\ncase \"$*\" in *--dry-run*) echo 'preload: --distance 4 must exceed' >&2; exit 2;; esac\n"
+                    "echo 'preload --per-owner'\n")
+        r, _ = self.run_cell(PRELOAD="20000")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("--distance 4 must exceed", r.stderr)
+
+    def test_preload_phase_records_and_fails_the_cell_on_a_miss(self):
+        """Run the real 4c block with a stub bench: a miss writes .preload with
+        a REJECT and dies; a hit records and continues."""
+        i = self.src.index("# ---------------------------------------------------------------- 4c. pre-load")
+        block = self.src[i : self.src.index("# ---------------------------------------------------------------- 5. samplers")]
+        i = self.src.index("preload_record() {")
+        rec = self.src[i : self.src.index("\n}\n", i) + 3]
+        out = os.path.join(self.tmp, "cell")
+        os.makedirs(out)
+        for reached, rc in ((False, 1), (True, 0)):
+            with self.subTest(reached=reached):
+                for f in os.listdir(out):
+                    os.remove(os.path.join(out, f))
+                rep = {"resting": 20000 if reached else 10, "reached": reached, "actions_failed": 0,
+                       "owners": 23, "orders_placed": 20000}
+                stub = os.path.join(self.tmp, "stub-preload")
+                with open(stub, "w") as f:
+                    f.write("#!/bin/sh\necho '%s' > '%s/preload.json'; exit %d\n" % (json.dumps(rep), out, rc))
+                os.chmod(stub, 0o755)
+                script = (
+                    'OUT="%s"; SELF_DIR="%s"; PRELOAD=20000; MARKETS=10; PIDS=(); T_LAUNCH=100; T_HEALTHY=130\n'
+                    'PRELOAD_OWNERS="23 5060 5083"\n'
+                    'log() { echo "LOG $*"; }; die() { echo "DIE $*"; exit 1; }\n'
+                    'preload_on() { true; }\n'
+                    'PRELOAD_CMD=("%s")\n' % (out, HERE, stub)
+                    + rec + block + 'echo "CONTINUED"\n'
+                )
+                r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+                with open(os.path.join(out, "summary.json")) as f:
+                    s = json.load(f)
+                p = s["preload"]
+                self.assertEqual(p["target"], 20000)
+                self.assertEqual(p["boot_to_ready_s"], 30)
+                self.assertIsInstance(p["seconds"], int)
+                if reached:
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertIn("CONTINUED", r.stdout)
+                    self.assertTrue(p["ok"])
+                else:
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    self.assertIn("DIE", r.stdout)
+                    self.assertNotIn("CONTINUED", r.stdout)
+                    self.assertEqual(s["validity"]["verdict"], "REJECT")
+                    self.assertFalse(p["ok"])
+
+    def test_preload_is_re_recorded_after_summarize(self):
+        summ = self.src.index('python3 "$TOOLS_DIR/summarize.py"')
+        again = self.src.index('python3 "$SELF_DIR/preload.py" summary --dir "$OUT"', summ)
+        self.assertLess(again, self.src.index('python3 "$TOOLS_DIR/health.py" accept'))
 
 
 if __name__ == "__main__":

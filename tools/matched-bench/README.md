@@ -1074,3 +1074,47 @@ jq .evm_load ~/bench-results-matched/evm-smoke/summary.json
 
 Self-tests: `test_harness.py` (`EvmLoadHarnessTest`, `EvmLoadScanTest`) and the tx-flood crate
 (`cargo nextest run -p torus-tx-flood`: rate, pinning, re-send with the same nonce, key file).
+
+## Large genesis and a pre-loaded book (`BULK_COUNT`, `PRELOAD`; bench queue 8f)
+
+`BULK_COUNT=N` (default 100000, every cell before 8f) sets how many bulk senders
+`testnet/gen-weighted-genesis.sh` funds ("bulk-test 60" .. "bulk-test 60+N-1", deterministic
+`gen-accounts` keys). run-cell.sh hands it to `gen-3val-genesis.sh`, logs it in the `cell=` line,
+checks the generated genesis carries exactly N bulk rows and records `.genesis.bulk_count`. The
+generator writes `testnet/genesis-weighted-full.params.json` (`bulk_count`, `bulk_offset`,
+`bytes`) beside the weighted-full genesis; `gen-3val-genesis.sh` reuses that genesis only if it
+was built with the same N (the sidecar when its `bytes` match, else a count of the rows) and
+otherwise stops: rebuild with `FORCE=1`. Off the default the load gets `--funded-bulk-end 60+N`
+(the funded spam keys take the top of that range). Cost at N = 1M (archy): `gen-accounts` ~80 s
+(~8 s per 100k keys), the genesis ~240-290 MB, each jq pass over it ~3 s parse / ~7 s rewrite and
+~1.4 GB RSS (jq 1.8); `gen-3val-genesis.sh` does one rewrite plus one summary pass, run-cell.sh
+two more parses.
+
+`PRELOAD=N` (default 0 = off) runs `bench-throughput preload` after ready and the fresh oracle
+marks, before the metrics-before snapshot, the samplers and the load, so no pre-load block counts
+as load. It places N non-crossing GTC limit orders (1 lot) over markets 1..MARKETS: order k sits
+in market `k % MARKETS + 1` and belongs to owner `k / PRELOAD_PER_OWNER` (default 900, the chain's
+per-user limit is 1000) in the owner range `PRELOAD_OWNER_OFFSET` (default `60 + SENDERS`, just
+past the load: the load's cancel-alls never touch them) .. + ceil(N / per-owner), which must be
+genesis-funded (<= 60 + BULK_COUNT) and below the funded spam keys. Buys at
+`mid - PRELOAD_DISTANCE - level`, sells at `mid + PRELOAD_DISTANCE + level` (mid 30000, distance
+default 1000 ticks, `PRELOAD_LEVELS` default 100), one max-size `PlaceOrderBatch` per owner
+(min(1024, per-owner) orders), `PRELOAD_RATE` actions/s (default 50); a busy or transport
+refusal resends the same signed action. Then it waits until every node's
+`torus_orders_resting_total` rose by N (`PRELOAD_TIMEOUT`, default 900 s): the per-trader RPCs
+(`torus_getUserLimits`, `torus_getOpenOrders`) scan every book under the 250k-row RPC budget and
+fail at 1M orders. Plan only: `bench-throughput preload --dry-run --target 1000000 --markets 300
+--funded-bulk-end 1000060`.
+
+| file | content |
+|---|---|
+| `preload.log` | the bench's stderr (submit line) and JSON report |
+| `preload.json` | the report: owners, actions, `orders_placed`, `orders_accepted`, `actions_failed`, `resends`, `resting` (min over nodes), `resting_by_node`, `resting_gauge_by_node` (`torus_exec_resting_orders`), `reached`, `submit_seconds`, `failures` |
+| `preload-cell.json` | run-cell.sh's side: target, wall `seconds`, `rc`, `boot_to_ready_s`, the command |
+| `summary.json` `.preload` | both, plus `ok` / `problems` |
+
+A missed target (rc != 0, `resting` < N, a failed action) is folded into `.validity` (REJECT,
+reason `pre-load failed: ...`), `.status` (INVALID) and `.headline.benchmark_accepted`, and the
+cell stops before the load. `resummarize.sh` re-derives `.preload` and `.genesis.bulk_count`.
+Self-tests: `test_preload.py`, `test_harness.py` (`BulkCountAndPreloadHarnessTest`),
+`test_genesis_output.py` (BULK_COUNT), `cargo nextest run -p bench-throughput` (`preload::tests`).
