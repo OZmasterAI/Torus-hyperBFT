@@ -242,7 +242,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    wait per 15 s window, which section 81 put at ~1 s in 3 of 4 cells), `save_order_books`, `flush_all`, exec
    off-CPU share and hotstuff-algo blocked on the exec channel; plus exec ms per native block and per 1k fills. Say
    whether Phase 5's remaining scope (steps 3 and 7) still targets the biggest rows.
-10. **Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
+10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
 Done / dropped: **Q5** native vs native + EVM (campaign C, done s64: E/N 0.876, -12.4% matched/s; EVM heights never

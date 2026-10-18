@@ -223,6 +223,21 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 - **Acceptance:** the slow views explained by cause, then an A/B of the fix (block-time p99 outside windows down, no regression elsewhere).
 - **Effort:** attribution small to medium; fix unknown.
 
+### T5.3 — The block-time p99 jump inside checkpoint windows *(added s128; Q6 / A1 parked here)*
+- **Problem:** during a checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (G; sections
+  87, 89: 497 and 637 ms for the same arm in two campaigns, so G drifts between runs). Q6's A1 (checkpoint slicing)
+  targets the consensus thread's manifest put waiting behind the checkpoint batch (X), but X is only ~6-12 ms per put:
+  Z2 halved X and cut the write 73% (50 MB cap) while G stayed flat (the cap also tripled the checkpoint rate and cut
+  blocks/s to a third, so that run is confounded). A1 can recover a few percent of G at most, so it is parked
+  (owner s128; design `docs/plans/q6-checkpoint-slicing.md` on `perf/q6-ckpt-slicing`, step 0 timers built there).
+- **Plan:** (1) Attribution, no code: per view inside vs outside checkpoint windows, a phase breakdown of the
+  consensus thread (proposal wait, validate, vote, commit, manifest put) and the exec thread (checkpoint upkeep,
+  freeze, flush handoff), with the window and its control from the same campaign (G drifts between runs).
+  (2) Fix the dominant phase. Revisit after item 6 Phase 5 (it changes what a checkpoint writes) and with T5.2.
+- **Acceptance:** the in-window gap explained by phase, then an A/B of the fix (G down, measured against a
+  same-campaign control).
+- **Effort:** attribution small to medium (Q6 step 0's stage timers help); fix unknown.
+
 ---
 
 ## Product-parity track — P0 to P5 *(runs alongside Tiers 1–4)*
