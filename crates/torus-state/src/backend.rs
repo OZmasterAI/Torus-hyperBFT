@@ -682,6 +682,22 @@ impl PendingState {
     /// ([`FrozenPending::put_rows`]).
     fn put_rows(&mut self, id: CfId, rows: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>)>) {
         let cfp = self.cf_mut(id);
+        let rows: Vec<(Vec<u8>, Option<Vec<u8>>)> = rows.into_iter().collect();
+        // Item 6 Phase 5 step 2: into an empty CF, rows with strictly
+        // increasing keys (the freeze's drain of an in-place source) build
+        // the maps in bulk instead of row by row: the same contents.
+        if cfp.is_empty() && rows.windows(2).all(|w| w[0].0 < w[1].0) {
+            let (mut writes, mut deletes) = (Vec::new(), Vec::new());
+            for (key, value) in rows {
+                match value {
+                    Some(value) => writes.push((key, value)),
+                    None => deletes.push(key),
+                }
+            }
+            cfp.writes = writes.into_iter().collect();
+            cfp.deletes = deletes.into_iter().collect();
+            return;
+        }
         for (key, value) in rows {
             match value {
                 Some(value) => {

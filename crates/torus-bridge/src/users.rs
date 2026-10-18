@@ -815,28 +815,40 @@ impl Users {
 }
 
 /// Item 6 Phase 5 step 1 (`docs/plans/item6-phase5-impl.md` Task 1.1): the
-/// keys of both CFs changed since the last drain, by key shape. A key is in
-/// at most one set (the shapes are disjoint); its row is read from the
-/// record set at the drain, so a key written many times is emitted once.
-/// Step 2 (Task 2.1): each positions key keeps its row at its first change
-/// in the block (= at the block start): the overlay's own-change answers
+/// keys of both CFs changed since the last drain. A key is marked once; its
+/// row is read from the record set at the drain, so a key written many
+/// times is emitted once. Step 2 (Task 2.1): kept per trader (one lookup
+/// marks a key), each positions key with its row at its first change in
+/// the block (= at the block start): the overlay's own-change answers
 /// (`resident_changes`: the sums' partial re-value) and the sums carry at
 /// `end_resident` need the block-start rows the in-place record no longer
 /// holds.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Dirty {
-    /// 28-byte positions keys `t ‖ m`, each with its row at the block start.
-    positions: HashMap<(Address, MarketId), Before>,
-    /// Per trader: its markets in `positions`, in first-change order (a
-    /// trader's own changes without a scan).
-    by_trader: HashMap<Address, Vec<MarketId>>,
-    /// 20-byte balance keys.
-    balances: HashSet<Address>,
-    /// 24-byte `cvlm ‖ t` keys.
-    volumes: HashSet<Address>,
+    /// Per trader: its changed `t ‖ m`, balance and `cvlm` keys.
+    traders: HashMap<Address, TraderDirty>,
     /// Every other key, per slot ([`POSITIONS`], [`BALANCES`]), with (a
     /// positions key) its raw row at the block start; `None` for balances.
     raw: [BTreeMap<Vec<u8>, Option<Vec<u8>>>; 2],
+    /// Keys marked in `traders`.
+    keys: usize,
+}
+
+/// Phase 5 step 2: one trader's changed keys since the last drain.
+#[derive(Debug, Default, Clone)]
+struct TraderDirty {
+    /// Its 28-byte positions keys' markets, each with the row at the block
+    /// start, in first-change order (sorted at the drain).
+    positions: Vec<(MarketId, Before)>,
+    balance: bool,
+    volume: bool,
+}
+
+impl TraderDirty {
+    #[inline]
+    fn has(&self, m: MarketId) -> bool {
+        self.positions.iter().any(|(x, _)| *x == m)
+    }
 }
 
 /// Phase 5 step 2: a dirty positions key's row at the block start.
@@ -860,13 +872,12 @@ impl Before {
 }
 
 /// Phase 5 step 2: what the drains of a block leave for its sums carry
-/// ([`Users::report_in_place`]): its changed positions keys with their rows
-/// at the block start, and the traders of its other positions keys (their
-/// records were re-decoded: no carry).
+/// ([`Users::report_in_place`]): per trader (address order) its changed
+/// positions keys with their rows at the block start, and the traders of
+/// its other positions keys (their records were re-decoded: no carry).
 #[derive(Debug, Default)]
 struct Carry {
-    positions: HashMap<(Address, MarketId), Before>,
-    by_trader: HashMap<Address, Vec<MarketId>>,
+    traders: Vec<(Address, Vec<(MarketId, Before)>)>,
     raw_traders: HashSet<Address>,
 }
 
@@ -877,60 +888,99 @@ thread_local! {
     static DRAIN_SOURCES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+#[cfg(test)]
+fn count_drained(raw: bool) {
+    DRAIN_SOURCES.with(|c| {
+        let (rec, r) = c.get();
+        c.set(if raw { (rec, r + 1) } else { (rec + 1, r) });
+    });
+}
+
 impl Dirty {
     fn len(&self) -> usize {
-        self.positions.len()
-            + self.balances.len()
-            + self.volumes.len()
-            + self.raw.iter().map(BTreeMap::len).sum::<usize>()
+        self.keys + self.raw.iter().map(BTreeMap::len).sum::<usize>()
     }
 
-    /// The dirty keys of `slot`, key-sorted (fixed-size keys sorted typed,
-    /// then merged with the raw keys by bytes).
-    fn sorted_keys(&self, slot: usize) -> Vec<Vec<u8>> {
-        if slot == POSITIONS {
-            let mut typed: Vec<(Address, MarketId)> = self.positions.keys().copied().collect();
-            typed.sort_unstable();
-            return merge_sorted(
-                vec![
-                    typed.iter().map(|(t, m)| position_key(t, *m).to_vec()).collect(),
-                    self.raw[POSITIONS].keys().cloned().collect(),
-                ],
-            );
+    /// Mark `t ‖ m` of a regular trader, `before` its row now (asked only
+    /// at the key's first change).
+    #[inline]
+    fn mark_typed(&mut self, t: Address, m: MarketId, before: impl FnOnce() -> Option<Position>) {
+        let d = self.traders.entry(t).or_default();
+        if !d.has(m) {
+            d.positions.push((m, Before::Typed(before())));
+            self.keys += 1;
         }
-        let mut bal: Vec<Address> = self.balances.iter().copied().collect();
-        bal.sort_unstable();
-        let mut vol: Vec<Address> = self.volumes.iter().copied().collect();
-        vol.sort_unstable();
-        merge_sorted(vec![
-            bal.iter().map(|t| t.to_vec()).collect(),
-            vol.iter().map(|t| cum_volume_key(t).to_vec()).collect(),
-            self.raw[BALANCES].keys().cloned().collect(),
-        ])
+    }
+
+    #[inline]
+    fn mark_balance(&mut self, t: Address) {
+        let d = self.traders.entry(t).or_default();
+        if !d.balance {
+            d.balance = true;
+            self.keys += 1;
+        }
+    }
+
+    #[inline]
+    fn mark_volume(&mut self, t: Address) {
+        let d = self.traders.entry(t).or_default();
+        if !d.volume {
+            d.volume = true;
+            self.keys += 1;
+        }
+    }
+
+    /// The dirty keys of `slot`, key-sorted (traders sorted as fixed-size
+    /// addresses, each one's markets in order, merged with the raw keys).
+    fn sorted_keys(&self, slot: usize) -> Vec<Vec<u8>> {
+        let mut ts: Vec<(&Address, &TraderDirty)> = self.traders.iter().collect();
+        ts.sort_unstable_by_key(|(t, _)| **t);
+        let raw: Vec<Vec<u8>> = self.raw[slot].keys().cloned().collect();
+        if slot == POSITIONS {
+            let mut keys = Vec::with_capacity(self.keys);
+            let mut ms: Vec<MarketId> = Vec::new();
+            for (t, d) in ts {
+                ms.clear();
+                ms.extend(d.positions.iter().map(|(m, _)| *m));
+                ms.sort_unstable();
+                keys.extend(ms.iter().map(|m| position_key(t, *m).to_vec()));
+            }
+            return merge_sorted(vec![keys, raw]);
+        }
+        let bal = ts.iter().filter(|(_, d)| d.balance).map(|(t, _)| t.to_vec()).collect();
+        let vol = ts.iter().filter(|(_, d)| d.volume).map(|(t, _)| cum_volume_key(t).to_vec()).collect();
+        merge_sorted(vec![bal, vol, raw])
     }
 }
 
-/// Key-sorted runs of distinct keys merged into one key-sorted list (one
+/// Key-sorted runs of distinct items merged into one key-sorted list (one
 /// run, the usual case, is returned as it is).
-fn merge_sorted(runs: Vec<Vec<Vec<u8>>>) -> Vec<Vec<u8>> {
-    let mut runs: Vec<Vec<Vec<u8>>> = runs.into_iter().filter(|r| !r.is_empty()).collect();
+fn merge_runs<T>(runs: Vec<Vec<T>>, key: impl Fn(&T) -> &[u8]) -> Vec<T> {
+    let mut runs: Vec<Vec<T>> = runs.into_iter().filter(|r| !r.is_empty()).collect();
     if runs.len() <= 1 {
         return runs.pop().unwrap_or_default();
     }
-    let mut at = vec![0usize; runs.len()];
     let mut out = Vec::with_capacity(runs.iter().map(Vec::len).sum());
+    let mut iters: Vec<std::vec::IntoIter<T>> = runs.into_iter().map(Vec::into_iter).collect();
+    let mut heads: Vec<Option<T>> = iters.iter_mut().map(Iterator::next).collect();
     loop {
         let mut best: Option<usize> = None;
-        for i in 0..runs.len() {
-            if at[i] < runs[i].len() && best.is_none_or(|b| runs[i][at[i]] < runs[b][at[b]]) {
+        for i in 0..heads.len() {
+            let Some(h) = heads[i].as_ref() else { continue };
+            if best.is_none_or(|b| heads[b].as_ref().is_none_or(|x| key(h) < key(x))) {
                 best = Some(i);
             }
         }
         let Some(i) = best else { break };
-        out.push(std::mem::take(&mut runs[i][at[i]]));
-        at[i] += 1;
+        let next = iters[i].next();
+        out.push(std::mem::replace(&mut heads[i], next).expect("a head"));
     }
     out
+}
+
+/// [`merge_runs`] of plain keys.
+fn merge_sorted(runs: Vec<Vec<Vec<u8>>>) -> Vec<Vec<u8>> {
+    merge_runs(runs, |k| k.as_slice())
 }
 
 /// One drained row: a write (`Some`) or a tombstone (`None`).
@@ -967,56 +1017,124 @@ impl Users {
     /// without draining.
     #[cfg(test)]
     pub(crate) fn dirty_preview(&self) -> DirtyRows {
-        DirtyRows {
-            positions: self.rows_at(POSITIONS, self.dirty.sorted_keys(POSITIONS)),
-            balances: self.rows_at(BALANCES, self.dirty.sorted_keys(BALANCES)),
-        }
+        let mut d = self.dirty.clone();
+        let mut ts: Vec<(Address, TraderDirty)> = std::mem::take(&mut d.traders).into_iter().collect();
+        self.drained_rows(&mut ts, &d.raw)
     }
 
     /// Phase 5 step 1: every dirty key's row as the record set holds it now
     /// (a regular trader's encoded from its record, an opaque trader's and a
     /// row under no trader as bytes; absent: a tombstone), per CF in key
-    /// order; the dirty sets are left empty. Step 2: the positions keys'
-    /// rows at the block start move to the sums carry (`end_resident`).
+    /// order; the dirty sets are left empty. Step 2: walks the dirty traders
+    /// in address order, each record read once; the positions keys' rows at
+    /// the block start move to the sums carry (`end_resident`).
     pub(crate) fn drain_dirty(&mut self) -> DirtyRows {
-        let pos = self.dirty.sorted_keys(POSITIONS);
-        let bal = self.dirty.sorted_keys(BALANCES);
-        let Dirty { positions, by_trader, raw: [raw_positions, _], .. } = std::mem::take(&mut self.dirty);
+        let Dirty { traders, raw, .. } = std::mem::take(&mut self.dirty);
+        let mut ts: Vec<(Address, TraderDirty)> = traders.into_iter().collect();
+        let rows = self.drained_rows(&mut ts, &raw);
+        let raw_traders = raw[POSITIONS].keys().filter(|k| k.len() >= TRADER).map(|k| Address::from_slice(&k[..TRADER]));
         let carry = &mut self.carry;
-        // Normally empty here (`end_resident` takes it every block); a
-        // second drain before it keeps each key's first row.
-        for (k, b) in positions {
-            carry.positions.entry(k).or_insert(b);
-        }
-        for (t, ms) in by_trader {
-            let have = carry.by_trader.entry(t).or_default();
-            for m in ms {
-                if !have.contains(&m) {
-                    have.push(m);
+        carry.raw_traders.extend(raw_traders);
+        let typed = ts.into_iter().filter(|(_, d)| !d.positions.is_empty()).map(|(t, d)| (t, d.positions));
+        if carry.traders.is_empty() {
+            carry.traders = typed.collect();
+        } else {
+            // A second drain before `end_resident` took the carry (never in
+            // the node's sequence): each key keeps its first row.
+            let mut all: BTreeMap<Address, Vec<(MarketId, Before)>> = std::mem::take(&mut carry.traders).into_iter().collect();
+            for (t, ps) in typed {
+                let have = all.entry(t).or_default();
+                for (m, b) in ps {
+                    if !have.iter().any(|(x, _)| *x == m) {
+                        have.push((m, b));
+                    }
                 }
             }
+            carry.traders = all.into_iter().collect();
         }
-        carry
-            .raw_traders
-            .extend(raw_positions.keys().filter(|k| k.len() >= TRADER).map(|k| Address::from_slice(&k[..TRADER])));
+        rows
+    }
+
+    /// The rows of the dirty traders `ts` (sorted here, and each one's
+    /// markets) and of the raw keys `raw`, per CF in key order.
+    fn drained_rows(&self, ts: &mut [(Address, TraderDirty)], raw: &[BTreeMap<Vec<u8>, Option<Vec<u8>>>; 2]) -> DirtyRows {
+        ts.sort_unstable_by_key(|(t, _)| *t);
+        let mut pos: Vec<DirtyRow> = Vec::with_capacity(ts.iter().map(|(_, d)| d.positions.len()).sum());
+        let mut bal: Vec<DirtyRow> = Vec::new();
+        let mut vol: Vec<DirtyRow> = Vec::new();
+        for (t, d) in ts.iter_mut() {
+            let opaque = self.opaque_of(t);
+            let rec = if opaque.is_some() { None } else { self.map.get(t) };
+            if !d.positions.is_empty() {
+                d.positions.sort_unstable_by_key(|(m, _)| *m);
+                for (m, _) in &d.positions {
+                    let key = position_key(t, *m);
+                    let value = match opaque {
+                        Some(r) => r.positions.get(key.as_slice()).cloned(),
+                        None => rec.and_then(|u| find(&u.positions, *m)).map(|p| encode(p, POSITION_V2_LEN)),
+                    };
+                    #[cfg(test)]
+                    if value.is_some() {
+                        count_drained(opaque.is_some());
+                    }
+                    pos.push((key.to_vec(), value));
+                }
+            }
+            if d.balance {
+                let value = match opaque {
+                    Some(r) => r.balances.get(t.as_slice()).cloned(),
+                    None => rec.and_then(|u| u.balance.as_ref()).map(|b| encode(b, BALANCE_LEN)),
+                };
+                #[cfg(test)]
+                if value.is_some() {
+                    count_drained(opaque.is_some());
+                }
+                bal.push((t.to_vec(), value));
+            }
+            if d.volume {
+                let key = cum_volume_key(t);
+                let value = match opaque {
+                    Some(r) => r.balances.get(key.as_slice()).cloned(),
+                    None => rec.and_then(|u| u.cum_volume).map(|v| v.raw().to_be_bytes().to_vec()),
+                };
+                #[cfg(test)]
+                if value.is_some() {
+                    count_drained(opaque.is_some());
+                }
+                vol.push((key.to_vec(), value));
+            }
+        }
+        let raw_rows = |slot: usize| -> Vec<DirtyRow> {
+            raw[slot]
+                .keys()
+                .map(|k| {
+                    let v = self.row(slot, k).map(|r| {
+                        #[cfg(test)]
+                        count_drained(matches!(r, Row::Raw(_)));
+                        r.value().into_owned()
+                    });
+                    (k.clone(), v)
+                })
+                .collect()
+        };
         DirtyRows {
-            positions: self.rows_at(POSITIONS, pos),
-            balances: self.rows_at(BALANCES, bal),
+            positions: merge_runs(vec![pos, raw_rows(POSITIONS)], |(k, _)| k.as_slice()),
+            balances: merge_runs(vec![bal, vol, raw_rows(BALANCES)], |(k, _)| k.as_slice()),
         }
     }
 
     /// Phase 5 step 2: mark `t ‖ m` dirty, keeping its row as held now if
     /// this is its first change since the last drain. Call before the change.
     fn mark_position(&mut self, t: Address, m: MarketId) {
-        if self.dirty.positions.contains_key(&(t, m)) {
+        if self.dirty.traders.get(&t).is_some_and(|d| d.has(m)) {
             return;
         }
         let before = match self.opaque_of(&t) {
             Some(raw) => Before::Raw(raw.positions.get(position_key(&t, m).as_slice()).cloned()),
             None => Before::Typed(self.map.get(&t).and_then(|u| find(&u.positions, m).cloned())),
         };
-        self.dirty.positions.insert((t, m), before);
-        self.dirty.by_trader.entry(t).or_default().push(m);
+        self.dirty.traders.entry(t).or_default().positions.push((m, before));
+        self.dirty.keys += 1;
     }
 
     /// Phase 5 step 2: mark `key` of `slot` dirty (any key shape), keeping a
@@ -1033,12 +1151,8 @@ impl Users {
             return;
         }
         match balance_owner(key) {
-            Some((t, BalanceRow::Balance)) => {
-                self.dirty.balances.insert(t);
-            }
-            Some((t, BalanceRow::Volume)) => {
-                self.dirty.volumes.insert(t);
-            }
+            Some((t, BalanceRow::Balance)) => self.dirty.mark_balance(t),
+            Some((t, BalanceRow::Volume)) => self.dirty.mark_volume(t),
             None => {
                 self.dirty.raw[BALANCES].entry(key.to_vec()).or_insert(None);
             }
@@ -1063,17 +1177,16 @@ impl Users {
             return true;
         }
         if slot == POSITIONS {
+            let under = |t: &Address, td: &TraderDirty| td.positions.iter().any(|(m, _)| position_key(t, *m).starts_with(prefix));
             if prefix.len() >= TRADER {
                 let t = Address::from_slice(&prefix[..TRADER]);
-                return d
-                    .by_trader
-                    .get(&t)
-                    .is_some_and(|ms| ms.iter().any(|m| position_key(&t, *m).starts_with(prefix)));
+                return d.traders.get(&t).is_some_and(|td| under(&t, td));
             }
-            return d.positions.keys().any(|(t, m)| position_key(t, *m).starts_with(prefix));
+            return d.traders.iter().any(|(t, td)| under(t, td));
         }
-        d.balances.iter().any(|t| t.as_slice().starts_with(prefix))
-            || d.volumes.iter().any(|t| cum_volume_key(t).starts_with(prefix))
+        d.traders.iter().any(|(t, td)| {
+            (td.balance && t.as_slice().starts_with(prefix)) || (td.volume && cum_volume_key(t).starts_with(prefix))
+        })
     }
 
     /// Phase 5 step 2: the positions keys under `prefix` changed since the
@@ -1087,21 +1200,22 @@ impl Users {
         let d = &self.dirty;
         let now = |key: &[u8]| self.position_row(key).map(|r| r.value().into_owned());
         let mut out: Vec<ResidentChange> = Vec::new();
-        if prefix.len() >= TRADER {
-            let t = Address::from_slice(&prefix[..TRADER]);
-            for m in d.by_trader.get(&t).into_iter().flatten() {
-                let key = position_key(&t, *m);
-                if key.starts_with(prefix) {
-                    let resident = d.positions[&(t, *m)].bytes();
-                    out.push(ResidentChange { key: key.to_vec(), resident, current: now(&key) });
-                }
-            }
-        } else {
-            for ((t, m), b) in &d.positions {
+        let mut of = |t: &Address, td: &TraderDirty| {
+            for (m, b) in &td.positions {
                 let key = position_key(t, *m);
                 if key.starts_with(prefix) {
                     out.push(ResidentChange { key: key.to_vec(), resident: b.bytes(), current: now(&key) });
                 }
+            }
+        };
+        if prefix.len() >= TRADER {
+            let t = Address::from_slice(&prefix[..TRADER]);
+            if let Some(td) = d.traders.get(&t) {
+                of(&t, td);
+            }
+        } else {
+            for (t, td) in &d.traders {
+                of(t, td);
             }
         }
         for (k, b) in d.raw[POSITIONS]
@@ -1123,22 +1237,30 @@ impl Users {
     /// has a record, is dropped: the record was re-decoded or has rows the
     /// carry cannot value).
     pub(crate) fn report_in_place(&mut self, seen: &mut Seen<'_>) {
-        let Carry { mut positions, by_trader, raw_traders } = std::mem::take(&mut self.carry);
-        let mut traders: Vec<Address> = by_trader.keys().chain(raw_traders.iter()).copied().collect();
-        traders.sort_unstable();
-        traders.dedup();
+        let Carry { traders, raw_traders } = std::mem::take(&mut self.carry);
+        let mut raw_only: Vec<Address> =
+            raw_traders.iter().filter(|t| traders.binary_search_by_key(*t, |(x, _)| *x).is_err()).copied().collect();
+        raw_only.sort_unstable();
+        for t in &raw_only {
+            if let Some(u) = self.map.get_mut(t) {
+                u.sums = None;
+            }
+        }
         let mut changes: Vec<Change> = Vec::new();
-        for t in traders {
-            let ms = by_trader.get(&t).map_or(&[][..], Vec::as_slice);
+        let mut raw_only = raw_only.into_iter().peekable();
+        for (t, ps) in traders {
+            while let Some(r) = raw_only.next_if(|r| *r < t) {
+                seen(&r, None);
+            }
             let typed = !raw_traders.contains(&t)
                 && self.opaque_of(&t).is_none()
-                && ms.iter().all(|m| matches!(positions.get(&(t, *m)), Some(Before::Typed(_))));
+                && ps.iter().all(|(_, b)| matches!(b, Before::Typed(_)));
             match self.map.get_mut(&t) {
                 Some(u) if typed => {
                     changes.clear();
-                    for m in ms {
-                        if let Some(Before::Typed(b)) = positions.remove(&(t, *m)) {
-                            changes.push((b, find(&u.positions, *m).cloned()));
+                    for (m, b) in ps {
+                        if let Before::Typed(b) = b {
+                            changes.push((b, find(&u.positions, m).cloned()));
                         }
                     }
                     seen(&t, Some((changes.as_slice(), u.positions.as_slice(), &mut u.sums)));
@@ -1150,27 +1272,9 @@ impl Users {
                 None => seen(&t, None),
             }
         }
-    }
-
-    /// The rows of `keys` in `slot` as held now (absent: a tombstone).
-    fn rows_at(&self, slot: usize, keys: Vec<Vec<u8>>) -> Vec<DirtyRow> {
-        keys.into_iter()
-            .map(|k| {
-                let v = self.row(slot, &k).map(|r| {
-                    #[cfg(test)]
-                    DRAIN_SOURCES.with(|c| {
-                        let (rec, raw) = c.get();
-                        c.set(if matches!(r, Row::Raw(_)) {
-                            (rec, raw + 1)
-                        } else {
-                            (rec + 1, raw)
-                        });
-                    });
-                    r.value().into_owned()
-                });
-                (k, v)
-            })
-            .collect()
+        for r in raw_only {
+            seen(&r, None);
+        }
     }
 
     /// Phase 5 step 1 (tests): rows this thread's drains serialized from a
@@ -1192,28 +1296,31 @@ impl Users {
 }
 
 impl UsersMut<'_> {
-    /// `p`'s row (key `p.trader ‖ p.market_id`) = `p`.
+    /// `p`'s row (key `p.trader ‖ p.market_id`) = `p`. Phase 5 step 2: one
+    /// record lookup, one dirty-set lookup.
     pub(crate) fn set_position(&mut self, p: Position) {
         let (t, m) = (p.trader, p.market_id);
         let users = &mut *self.users;
-        users.mark_position(t, m);
         if users.opaque_of(&t).is_some() {
+            users.mark_position(t, m);
             let v = encode(&p, p.encoded_len());
-            users.reload(
-                t,
-                &[(&position_key(&t, m), Some(&v))],
-                BalanceDelta::default(),
-            );
+            users.reload(t, &[(&position_key(&t, m), Some(&v))], BalanceDelta::default());
             return;
         }
-        let old = users.map.get(&t).map_or((0, 0), UserState::footprint);
         let u = users.map.entry(t).or_default();
-        match u.positions.binary_search_by_key(&m, |q| q.market_id) {
+        let old = u.footprint();
+        let at = u.positions.binary_search_by_key(&m, |q| q.market_id);
+        users.dirty.mark_typed(t, m, || at.ok().map(|i| u.positions[i].clone()));
+        match at {
             Ok(i) => u.positions[i] = p,
             Err(i) => {
+                let first = u.positions.is_empty();
                 u.positions.insert(i, p);
                 Users::set_holder(&mut users.holders, t, m, true);
-                users.traders.insert(t);
+                // E2: a regular trader with a position is in the set.
+                if first {
+                    users.traders.insert(t);
+                }
             }
         }
         let new = u.footprint();
@@ -1223,15 +1330,18 @@ impl UsersMut<'_> {
     /// No row at `t ‖ m` (a tombstone even if there was none).
     pub(crate) fn remove_position(&mut self, t: &Address, m: MarketId) {
         let users = &mut *self.users;
-        users.mark_position(*t, m);
         if users.opaque_of(t).is_some() {
+            users.mark_position(*t, m);
             users.reload(*t, &[(&position_key(t, m), None)], BalanceDelta::default());
             return;
         }
         let Some(u) = users.map.get_mut(t) else {
+            users.dirty.mark_typed(*t, m, || None);
             return;
         };
-        let Ok(i) = u.positions.binary_search_by_key(&m, |q| q.market_id) else {
+        let at = u.positions.binary_search_by_key(&m, |q| q.market_id);
+        users.dirty.mark_typed(*t, m, || at.ok().map(|i| u.positions[i].clone()));
+        let Ok(i) = at else {
             return;
         };
         let old = u.footprint();
@@ -1250,21 +1360,14 @@ impl UsersMut<'_> {
     /// `t`'s balance row = `b`.
     pub(crate) fn set_balance(&mut self, t: &Address, b: NativeBalance) {
         let users = &mut *self.users;
-        users.dirty.balances.insert(*t);
+        users.dirty.mark_balance(*t);
         if users.opaque_of(t).is_some() {
             let v = encode(&b, BALANCE_LEN);
-            users.reload(
-                *t,
-                &[],
-                BalanceDelta {
-                    balance: Some(Some(&v)),
-                    volume: None,
-                },
-            );
+            users.reload(*t, &[], BalanceDelta { balance: Some(Some(&v)), volume: None });
             return;
         }
-        let old = users.map.get(t).map_or((0, 0), UserState::footprint);
         let u = users.map.entry(*t).or_default();
+        let old = u.footprint();
         u.balance = Some(b);
         let new = u.footprint();
         users.track(old, new);
@@ -1273,34 +1376,22 @@ impl UsersMut<'_> {
     /// `t`'s `cvlm` row = its volume (zero without a row) + `amount`, as
     /// `add_cum_volume` reads and writes it (`Err`: an opaque trader's `cvlm`
     /// row is not 16 bytes, the read's error; nothing changes).
-    pub(crate) fn add_cum_volume(
-        &mut self,
-        t: &Address,
-        amount: FixedPoint,
-    ) -> Result<(), CoreError> {
+    pub(crate) fn add_cum_volume(&mut self, t: &Address, amount: FixedPoint) -> Result<(), CoreError> {
         let users = &mut *self.users;
         if let Some(raw) = users.opaque_of(t) {
             let cur = match raw.balances.get(cum_volume_key(t).as_slice()) {
                 None => FixedPoint::ZERO,
-                Some(v) => decode_volume(v).ok_or_else(|| {
-                    CoreError::Borsh(format!("cum_volume row has {} bytes, expected 16", v.len()))
-                })?,
+                Some(v) => decode_volume(v)
+                    .ok_or_else(|| CoreError::Borsh(format!("cum_volume row has {} bytes, expected 16", v.len())))?,
             };
             let v = (cur + amount).raw().to_be_bytes();
-            users.dirty.volumes.insert(*t);
-            users.reload(
-                *t,
-                &[],
-                BalanceDelta {
-                    balance: None,
-                    volume: Some(Some(&v)),
-                },
-            );
+            users.dirty.mark_volume(*t);
+            users.reload(*t, &[], BalanceDelta { balance: None, volume: Some(Some(&v)) });
             return Ok(());
         }
-        users.dirty.volumes.insert(*t);
-        let old = users.map.get(t).map_or((0, 0), UserState::footprint);
+        users.dirty.mark_volume(*t);
         let u = users.map.entry(*t).or_default();
+        let old = u.footprint();
         u.cum_volume = Some(u.cum_volume.unwrap_or(FixedPoint::ZERO) + amount);
         let new = u.footprint();
         users.track(old, new);
