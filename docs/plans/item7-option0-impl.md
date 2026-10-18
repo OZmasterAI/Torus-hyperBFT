@@ -996,6 +996,13 @@ item 7 pre-genesis list, next to T.
 
 ## 10. Decisions for the owner
 
+**Decided (owner s128): every recommendation accepted** (1a, 2a, 4a, 5a, 6a, 7a, 8a, 9a, 10a, 11a, 12a, 13a; 3 settled
+earlier). The options NOT chosen stay listed below with their trade-offs, for a later revisit: 1b / 1c, 2b, 4b, 5b,
+6b, 7b, 8b, 9b / 9c, 10b, 11b, 12b, 13b. Revisit triggers worth noting: 6b if a release-only raw read is ever
+suspected; 7b if Q11 shows N matters with the fast path on; 10b if Q11 passes but T changes the EVM path; 13b if a
+crash bug shows up that the in-process latch cannot reach.
+
+
 1. **Reference for "byte-identical to today".** (a) A golden record written once on `47c5f6fb` (task 0.2) plus the
    live S / B / O differential; (b) keep today's EVM batch path as a `cfg(test)` reference path (Phase 5 style);
    (c) live differential only. **Recommend a:** b keeps two serial paths alive in the code, and c compares the new
