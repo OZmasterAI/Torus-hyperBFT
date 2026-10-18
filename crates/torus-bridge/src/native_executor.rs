@@ -7387,6 +7387,19 @@ impl<T: StateBackend> NativeExecContext<T> {
         typed_rows_of(&self.sums)
     }
 
+    /// Item 6 Phase 5 step 2 (tests): whether `key` of `cf` (positions or
+    /// balances) is in the in-place record set's dirty set now (`None`: no
+    /// in-place record set, or another CF).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn test_in_place_dirty(&self, cf: &str, key: &[u8]) -> Option<bool> {
+        let slot = match cf {
+            torus_state::cf::CF_NATIVE_POSITIONS => users::POSITIONS,
+            torus_state::cf::CF_NATIVE_BALANCES => users::BALANCES,
+            _ => return None,
+        };
+        Some(self.in_place_users()?.read().dirty_key_list(slot).iter().any(|k| k.as_slice() == key))
+    }
+
     /// Item 6 Phase 5 step 2: the block's record set, if it takes the
     /// block's writes in place.
     fn in_place_users(&self) -> Option<&Arc<SharedUsers>> {

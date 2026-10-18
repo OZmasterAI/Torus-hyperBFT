@@ -1902,6 +1902,16 @@ struct ExecutionContext {
     /// attached, the previous layer merge's deferred part possibly held).
     #[cfg(test)]
     test_block_probe: Option<BlockProbe>,
+    /// Item 6 Phase 5 step 2 (plan Task 2.3) test seam: plant a balance row
+    /// of this trader in the EVM journal's kept writes (what a precompile
+    /// writing a typed CF inside an EVM tx scope would leave).
+    #[cfg(test)]
+    test_evm_typed_write: Option<Address>,
+    /// Item 6 Phase 5 step 2 (plan Task 2.3, tests): EVM sections the typed-CF
+    /// guard checked, the journal rows it saw, and the typed-CF rows among
+    /// them.
+    #[cfg(test)]
+    test_evm_guard: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64),
     /// D12 test log: `(height, rows scanned, rows deleted)` of every block's
     /// nonce-window prune.
     #[cfg(test)]
@@ -5441,6 +5451,13 @@ impl ExecutionContext {
                         self.exec_failed.store(true, Ordering::SeqCst);
                         return;
                     }
+                    #[cfg(test)]
+                    if let Some(t) = self.test_evm_typed_write {
+                        validated
+                            .native_writes
+                            .put_cf_raw(torus_state::cf::CF_NATIVE_BALANCES, t.as_slice(), &[0u8; 33])
+                            .expect("journal write");
+                    }
                     let absorbed = overlay.absorb_evm(&validated.bundle, validated.native_writes);
                     #[cfg(test)]
                     let absorbed = if self.test_replay_fault == Some(ReplayFault::AbsorbPut) {
@@ -8694,6 +8711,10 @@ impl TorusApp {
             test_replay_fault: None,
             #[cfg(test)]
             test_block_probe: None,
+            #[cfg(test)]
+            test_evm_typed_write: None,
+            #[cfg(test)]
+            test_evm_guard: Default::default(),
             #[cfg(test)]
             test_nonce_prune: Default::default(),
             #[cfg(test)]
@@ -19073,6 +19094,10 @@ mod crash_recovery_tests {
             test_replay_fault: None,
             #[cfg(test)]
             test_block_probe: None,
+            #[cfg(test)]
+            test_evm_typed_write: None,
+            #[cfg(test)]
+            test_evm_guard: Default::default(),
             #[cfg(test)]
             test_nonce_prune: Default::default(),
             #[cfg(test)]
@@ -36354,6 +36379,8 @@ mod crash_recovery_tests {
         evm_blocks: u64,
         evm_deposits: u64,
         evm_creates: u64,
+        /// Step 2 (Task 2.3): each lockbox deposit's EVM height and sender.
+        deposits: Vec<(u64, Address)>,
         slashes: u64,
         epoch_boundaries: u64,
         shocks: u64,
@@ -36474,6 +36501,7 @@ mod crash_recovery_tests {
                         evm_txs.push(signed_sstore_create(&key, *nonce));
                     } else {
                         fed.evm_deposits += 1;
+                        fed.deposits.push((h, oracle_addr(seed)));
                         let wei: u128 = 300 * 10u128.pow(18);
                         let mut calldata =
                             alloy_primitives::keccak256("depositToNative(uint128)".as_bytes())[..4]
@@ -37047,6 +37075,105 @@ mod crash_recovery_tests {
     #[ignore = "long: 10k blocks x every configuration; run with cargo test -- --ignored"]
     fn phase5_differential_long_random_10k() {
         p5_differential_matrix(10_000, 50, &p5_configs(), 4);
+    }
+
+    /// Plan Task 2.3 (owner s128, option a): no typed-CF (positions /
+    /// balances) write happens inside an EVM tx scope. Every EVM block of the
+    /// Phase 5 stream up to its fatal block (lockbox deposits, contract
+    /// creations) runs through the EVM section's guard: the journal's kept
+    /// writes (the CoreWriter rows the writer precompiles enqueue) hold no
+    /// row of the two CFs. The in-place record set never sees that journal
+    /// (it reaches the DB as the block batch's prefix), so such a row would
+    /// leave it stale; `evm_typed_write_is_caught` plants one.
+    #[test]
+    fn evm_tx_scopes_write_no_typed_cf() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p5_blocks(300, 0x5005_0001);
+        let fatal = blocks.iter().find(|b| b.fatal).expect("a fatal block").block.header.height;
+        let cfg = P5Config { pipelined: false, mode: BookMode::Classic, ckpt: P5Ckpt::PerBlock };
+        let mut node = P5Node::new(cfg, P5Path::Typed, None);
+        let mut evm_blocks = 0u64;
+        for b in blocks.iter().filter(|b| b.block.header.height < fatal) {
+            evm_blocks += u64::from(!b.block.evm_transactions.is_empty());
+            node.execute(b);
+        }
+        let guard = &node.ctx.as_ref().expect("a context").test_evm_guard;
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::SeqCst);
+        let (checked, rows, typed) = (load(&guard.0), load(&guard.1), load(&guard.2));
+        println!("P5 T2.3 EVM guard: {evm_blocks} EVM blocks, {checked} checked, {rows} journal rows, {typed} typed");
+        assert!(evm_blocks >= 3, "EVM blocks before the fatal one: {evm_blocks}");
+        assert_eq!(checked, evm_blocks, "every EVM section checked");
+        assert!(rows > 0, "the journals held rows (the deposits' queue rows)");
+        assert_eq!(typed, 0, "no typed-CF row in an EVM tx scope");
+    }
+
+    /// Plan Task 2.3: the guard catches a typed-CF row in the EVM journal (a
+    /// test seam plants a balance row there, as a precompile writing it in
+    /// an EVM tx scope would leave). Tests and debug builds fail on it; a
+    /// release build logs it and counts it.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "typed-CF write inside an EVM tx scope"))]
+    fn evm_typed_write_is_caught() {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, _fed) = p5_blocks(300, 0x5005_0001);
+        let cfg = P5Config { pipelined: false, mode: BookMode::Classic, ckpt: P5Ckpt::PerBlock };
+        let mut node = P5Node::new(cfg, P5Path::Typed, None);
+        node.ctx.as_mut().expect("a context").test_evm_typed_write = Some(oracle_addr(C5_TRADERS[0]));
+        let first_evm = blocks.iter().position(|b| !b.block.evm_transactions.is_empty()).expect("an EVM block");
+        for b in &blocks[..=first_evm] {
+            node.execute(b);
+        }
+        let typed = node.ctx.as_ref().expect("a context").test_evm_guard.2.load(Ordering::SeqCst);
+        assert!(typed > 0, "the planted row was caught");
+    }
+
+    /// Plan Task 2.3: the next-block lockbox drain. An EVM tx queues a lockbox
+    /// credit in block h; the native drain's `credit_native` in block h + 1
+    /// lands in the in-place record set and its dirty set through the
+    /// write-through (never pending on the overlay), checked mid-block
+    /// (after the drain) for every deposit of the stream; rows, every `h_n`
+    /// and the action results equal the reference path, serial and
+    /// pipelined.
+    #[test]
+    fn evm_lockbox_credit_lands_in_users_next_block() {
+        use torus_bridge::native_executor::BookMode;
+        use torus_state::cf::CF_NATIVE_BALANCES;
+        let (blocks, fed) = p5_blocks(120, 0x5005_0001);
+        let mut drains: std::collections::HashMap<u64, Vec<Address>> = Default::default();
+        for (h, t) in &fed.deposits {
+            drains.entry(h + 1).or_default().push(*t);
+        }
+        let drains = Arc::new(drains);
+        let checks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (d, c) = (drains.clone(), checks.clone());
+        let probe: BlockProbe = Arc::new(move |ctx: &NativeExecContext<NativeStateOverlay>| {
+            for t in d.get(&ctx.block_height).into_iter().flatten() {
+                let h = ctx.block_height;
+                assert!(
+                    matches!(
+                        StateBackend::own_pending_row(&ctx.state, CF_NATIVE_BALANCES, t.as_slice()),
+                        torus_state::OwnPendingRow::Resident
+                    ),
+                    "block {h}: {t}'s credited balance is pending on the overlay"
+                );
+                assert_eq!(
+                    ctx.test_in_place_dirty(CF_NATIVE_BALANCES, t.as_slice()),
+                    Some(true),
+                    "block {h}: {t}'s credited balance is not in the record set's dirty set"
+                );
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        for cfg in [
+            P5Config { pipelined: false, mode: BookMode::Classic, ckpt: P5Ckpt::PerBlock },
+            P5Config { pipelined: true, mode: BookMode::Classic, ckpt: P5Ckpt::Every5 },
+        ] {
+            p5_differential(&blocks, cfg, Some(probe.clone()), 1)
+                .unwrap_or_else(|d| panic!("{cfg:?}: diverged at {}: {}", d.height, d.what));
+        }
+        let n = checks.load(Ordering::SeqCst);
+        println!("P5 T2.3 lockbox drains checked: {n} ({} deposits)", fed.deposits.len());
+        assert!(n >= 4, "drained credits checked: {n}");
     }
 
     /// Plan Task 1.2: `harness_detects_one_flipped_row`. A probe on the

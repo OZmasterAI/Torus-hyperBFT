@@ -2457,6 +2457,16 @@ impl NativeStateOverlay {
         &self.db
     }
 
+    /// Item 6 Phase 5 step 2 (plan Task 2.3): this overlay's pending writes
+    /// and tombstones of `cf` (0 for an unregistered CF).
+    pub fn pending_rows(&self, cf: &str) -> usize {
+        intern_cf(cf).map_or(0, |id| {
+            let state = self.pending.read().unwrap();
+            let c = state.cf(id);
+            c.writes.len() + c.deletes.len()
+        })
+    }
+
     pub fn pending_write_count(&self) -> usize {
         let state = self.pending.read().unwrap();
         state
