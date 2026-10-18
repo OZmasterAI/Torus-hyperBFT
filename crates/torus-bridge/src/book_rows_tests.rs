@@ -254,7 +254,10 @@ fn actions(rng: &mut Lcg, resting: &[(Address, u128, Option<u128>)], cloid: &mut
     out
 }
 
-fn dump(db: &StateDb) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+/// Every CF's rows, by CF name.
+type Dump = Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)>;
+
+fn dump(db: &StateDb) -> Dump {
     torus_state::cf::ALL_CF_NAMES
         .iter()
         .map(|cf| (*cf, db.iterate_cf(cf, None).expect("iterate")))

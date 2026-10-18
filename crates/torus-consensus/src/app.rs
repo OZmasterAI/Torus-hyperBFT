@@ -4252,7 +4252,7 @@ impl ExecutionContext {
                 ctx.test_parallel_settle = self
                     .test_parallel_settle_odd_heights
                     .then_some(torus_block.header.height % 2 == 1);
-                if self.test_parallel_cancel_all_even_heights && torus_block.header.height % 2 == 0 {
+                if self.test_parallel_cancel_all_even_heights && torus_block.header.height.is_multiple_of(2) {
                     ctx.cancel_all_workers = 4;
                     ctx.cancel_all_min_visits = 0;
                 }
