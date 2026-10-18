@@ -314,6 +314,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    after SIGKILL (gate: <= 60 s) and replay correctness (AGREE, one digest); block p50 / p99 and matched/s during the
    load window vs a 300-market standard cell on the same binary. One cell per kind is enough (n = 1): this is a
    capacity check, not an A/B.
+   **Update s128:** tooling (BULK_COUNT pass-through + FUNDED_BULK_END, a bench-throughput pre-load command, a
+   PRELOAD= phase) is built by archy on a branch for 18c's review. Node fix first: the boot-time `all_accounts()`
+   emptiness check becomes a single-key probe (`fix/boot-empty-db-probe`, 18c gives the SHA); run 8f on a binary
+   with it (optional: one restart on the current main binary for the before number). Staged: (1) boot ONE node on
+   the 1M genesis, no load: RSS and jemalloc allocated at ready, boot time; confirm the host's RAM. (2) Only if one
+   node stays under ~15 GB, run the 3-node cell; watch free memory and swap, and stop if it swaps (swapped restart
+   times are meaningless). (3) If it does not fit: stop and report; 18c and the owner pick 500k on archy's host or a
+   capacity-only 3-node cell (RSS, restart, replay; no throughput) on 18c's 94 GB host.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
