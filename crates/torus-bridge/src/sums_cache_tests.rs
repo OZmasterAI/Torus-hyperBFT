@@ -1040,8 +1040,11 @@ fn dirty_trader_reads_pending_rows_not_its_record() {
     ctx.positions.put_position(&pos(a, 1, 9)).unwrap();
     ctx.positions.delete_position(&a, 2).unwrap();
     ctx.positions.put_position(&pos(a, 3, 5)).unwrap();
-    let stale = ctx.sums.as_ref().unwrap().records.as_ref().unwrap().positions_of(&a).unwrap();
-    assert_eq!(stale.len(), 2, "a's record still holds R (the test is not vacuous)");
+    // Phase 5 step 2: the record took the writes in place (it held R's rows
+    // until then); a dirty trader still reads through the overlay, whose
+    // answer the record now equals.
+    let now: Vec<(MarketId, FixedPoint)> = ctx.sums.as_ref().unwrap().records.as_ref().unwrap().positions_of(&a).unwrap().iter().map(|p| (p.market_id, p.size)).collect();
+    assert_eq!(now, vec![(1, fp(9)), (3, fp(5))], "a's record holds the block's writes (the test is not vacuous)");
     let batch = BatchSums::new(&ctx.positions);
     for (tag, reader) in [
         ("single", AccountReader::of(&ctx)),
