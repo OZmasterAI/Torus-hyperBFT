@@ -26,6 +26,8 @@ test-reference-paths = []
 criterion = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# Item 6 Phase 5 step 3: the Classic row µbench runs on the node's allocator.
+tikv-jemallocator = "0.7"
 
 [[bench]]
 name = "order_book"

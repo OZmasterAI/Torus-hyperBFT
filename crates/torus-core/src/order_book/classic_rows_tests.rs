@@ -401,7 +401,7 @@ fn classic_row_encodes_only_journaled_levels() {
 #[test]
 fn classic_row_rebuilds_after_other_drains_and_loaded_orders() {
     type Drain = fn(&mut OrderBook);
-    let drains: [(&str, Drain); 4] = [
+    let drains: [(&str, Drain); 7] = [
         ("take_level_ops", |b| {
             b.take_level_ops();
         }),
@@ -409,6 +409,15 @@ fn classic_row_rebuilds_after_other_drains_and_loaded_orders() {
             b.full_level_ops();
         }),
         ("discard_level_ops", |b| b.discard_level_ops()),
+        // The row journal alone (the level journal stays and still names
+        // the changed level): no rebuild needed, the row stays exact.
+        ("take_row_ops", |b| {
+            b.take_row_ops();
+        }),
+        ("full_row_ops", |b| {
+            b.full_row_ops();
+        }),
+        ("discard_row_ops", |b| b.discard_row_ops()),
         ("insert_loaded_order", |b| {
             let o = Order {
                 id: 9_999,
@@ -436,13 +445,16 @@ fn classic_row_rebuilds_after_other_drains_and_loaded_orders() {
         }
         book.classic_row().unwrap();
         book.discard_level_ops();
-        // A change, then the other drain takes its journal entry.
+        // Changes (an order at 96 modified in place, one added there), then
+        // the other drain takes their journal entries.
+        let id = book.bid_queues().find(|(p, _)| **p == fp(96)).unwrap().1[0].id;
+        book.modify_order(id, None, Some(fp(1))).unwrap();
         book.place_order(params(true, 96, 1), addr(2), 1);
         drain(&mut book);
         let reference = borsh::to_vec(&book).unwrap();
         let (row, stats) = book.classic_row().unwrap();
         assert!(row == reference, "{name}: stale level bytes");
-        assert!(stats.full_build, "{name}: {stats:?}");
+        assert!(stats.full_build || name.ends_with("_row_ops"), "{name}: {stats:?}");
     }
 }
 
