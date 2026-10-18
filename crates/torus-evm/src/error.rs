@@ -22,8 +22,9 @@ pub enum EvmError {
     /// Internal EVM error.
     Internal(String),
     /// R02 branch 5 (owner option A): a precompile hit a LOCAL storage fault
-    /// it must not answer around (`CoreError::PrecompileLocalFault`: the read
-    /// failed on this node), or a read of this node's DB failed inside revm
+    /// it must not answer around (any `CoreError::is_local_fault` error, F1:
+    /// `PrecompileLocalFault`, or a reader's / an enqueue's read of this
+    /// node's DB that failed), or a read of this node's DB failed inside revm
     /// (`EVMError::Database`). The execution was aborted (no result); the
     /// consensus app fail-stops the node on it. Never a revert, never
     /// produced by a deterministic error.

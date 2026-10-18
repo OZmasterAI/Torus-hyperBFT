@@ -40,7 +40,7 @@ pub struct TorusPrecompiles {
     /// a simulation can't durably mutate the shared `StateDb` outside consensus.
     read_only: bool,
     /// R02 branch 5 (owner option A): the first LOCAL storage fault a precompile
-    /// hit (`CoreError::PrecompileLocalFault`). Set before [`Self::run`] aborts
+    /// hit (any `CoreError::is_local_fault` error, F1). Set before [`Self::run`] aborts
     /// the execution with a fatal error; the executor reads it
     /// ([`Self::local_fault`]) to return `EvmError::LocalFault`. Per provider,
     /// i.e. per executed block / tx.
@@ -189,31 +189,48 @@ impl<CTX: ContextTr> PrecompileProvider<CTX> for TorusPrecompiles {
         // enclosing revert restores it (the queued credit is dropped with that frame).
         let result = match result {
             Ok(output) if id == ADDR_LOCKBOX && !call_value.is_zero() => {
-                let burned = context
+                // F1 (s128): a failed account load is a read of this node's
+                // DB, a local fault (below), never a revert. (The value
+                // transfer already loaded 0x0820 into the journal, so this is
+                // a cache hit in practice.)
+                match context
                     .journal_mut()
                     .load_account_mut(address)
                     .map(|mut acct| acct.data.decr_balance(call_value))
-                    .unwrap_or(false);
-                if burned {
-                    Ok(output)
-                } else {
-                    Err(CoreError::InvalidPrecompileInput(
+                {
+                    Ok(true) => Ok(output),
+                    Ok(false) => Err(CoreError::InvalidPrecompileInput(
                         "lockbox: failed to burn deposit value".into(),
-                    ))
+                    )),
+                    Err(e) => Err(CoreError::PrecompileLocalFault(format!(
+                        "lockbox burn: account load: {e}"
+                    ))),
                 }
             }
             other => other,
         };
 
-        // R02 branch 5 (owner option A): a LOCAL storage fault is never a
-        // revert (its bytes and gas would be an answer only this node gives):
-        // record it and abort the execution with a fatal error (revm maps it
-        // to `EVMError::Custom`, no receipt); the executor returns
-        // `EvmError::LocalFault` and the node fail-stops. Only this variant:
-        // every other precompile error stays a revert, exactly as before.
-        if let Err(CoreError::PrecompileLocalFault(msg)) = &result {
-            let _ = self.local_fault.set(msg.clone());
-            return Err(format!("precompile local fault: {msg}"));
+        // R02 branch 5 (owner option A) + F1 (s128): a LOCAL storage fault is
+        // never a revert (its bytes and gas would be an answer only this node
+        // gives): record it and abort the execution with a fatal error (revm
+        // maps it to `EVMError::Custom`, no receipt); the executor returns
+        // `EvmError::LocalFault` and the node fail-stops. Local = any
+        // `CoreError::is_local_fault` error: `PrecompileLocalFault`, and a
+        // reader's or an enqueue's failed read of this node's DB (`State`),
+        // an undecodable stored row (`Borsh`), a missing CF, a corrupt book
+        // row. None of these is a function of the calldata: every CF a
+        // precompile reads is a constant and every `Borsh` source decodes a
+        // stored row (or encodes into a `Vec`). Every other precompile error
+        // is deterministic and stays a revert, exactly as before.
+        if let Err(e) = &result {
+            if e.is_local_fault() {
+                let msg = match e {
+                    CoreError::PrecompileLocalFault(msg) => msg.clone(),
+                    e => format!("precompile 0x{id:04x}: {e}"),
+                };
+                let _ = self.local_fault.set(msg.clone());
+                return Err(format!("precompile local fault: {msg}"));
+            }
         }
 
         // A reader over its budget runs out of gas (its stipend is spent).
