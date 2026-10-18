@@ -22,8 +22,8 @@ use std::sync::RwLock;
 use alloy_primitives::{Address, B256};
 use torus_state::backend::StateBackend as _;
 use torus_state::{
-    DaGcLimits, DaGcOutcome, DaReadTiming, ErasureParams, NativeDaStore, StateDb, StateError,
-    StoredShard,
+    DaGcHistory, DaGcLimits, DaGcOutcome, DaReadTiming, ErasureParams, NativeDaStore, StateDb,
+    StateError, StoredShard,
 };
 use torus_types::SignedNativeAction;
 
@@ -1744,10 +1744,13 @@ impl Mempool {
     }
 
     /// RH4: one durable DA body GC pass for a dispatched committed height,
-    /// see [`NativeDaStore::gc_committed`] (`keep_from`: no row at or above
-    /// it is deleted). Best effort: a store error is logged and reads as
-    /// nothing done. The aged rows stay and the next pass retries them; a
-    /// `height` whose row was not written keeps its bodies.
+    /// see [`NativeDaStore::gc_committed_with_history`] (`keep_from`: no row
+    /// at or above it is deleted; `history` back-fills heights the GC has no
+    /// record for). Best effort: a store error is logged and reads as nothing
+    /// done. The pass's batch did not land, so the GC cursor stays behind and
+    /// the next pass back-fills this height from `history` before deleting
+    /// anything (a failed record is retried, never dropped).
+    #[allow(clippy::too_many_arguments)]
     pub fn gc_committed_native_da(
         &self,
         height: u64,
@@ -1756,11 +1759,17 @@ impl Mempool {
         retention: u64,
         keep_from: u64,
         limits: DaGcLimits,
+        history: &dyn DaGcHistory,
     ) -> DaGcOutcome {
-        match self
-            .da_store
-            .gc_committed(height, hashes, shard_count, retention, keep_from, limits)
-        {
+        match self.da_store.gc_committed_with_history(
+            height,
+            hashes,
+            shard_count,
+            retention,
+            keep_from,
+            limits,
+            history,
+        ) {
             Ok(out) => out,
             Err(e) => {
                 tracing::warn!(height, "native DA body GC pass failed: {e}");

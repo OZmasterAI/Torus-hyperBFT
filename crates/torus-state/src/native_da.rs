@@ -75,7 +75,7 @@ pub struct NativeDaStore {
 /// are 15 bytes, so they can never be read or served as a body.
 const DA_GC_ROW_PREFIX: &[u8; 7] = b"\xffda-gc/";
 const DA_GC_ROW_KEY_LEN: usize = DA_GC_ROW_PREFIX.len() + 8;
-/// GC state, `frontier (8 BE) ++ next_record (8 BE)` ([`DaGcState`]).
+/// GC state, `frontier ++ cursor ++ hold` (8 BE each; [`DaGcState`]).
 /// Outside the row prefix (`-` sorts before `/`), so no row scan meets it.
 const DA_GC_STATE_KEY: &[u8] = b"\xffda-gc-state";
 /// Latest reference of a committed hash: `DA_GC_REF_PREFIX ++ hash` ->
@@ -130,38 +130,74 @@ fn da_gc_moved_key(height: u64, hash: &[u8]) -> Vec<u8> {
 }
 
 /// The durable GC state ([`DA_GC_STATE_KEY`]), written in the batch of the
-/// pass that changes it.
+/// pass that changes it: `frontier ++ cursor ++ hold` (24 bytes, 8 BE each),
+/// or the pre-cursor `frontier ++ next_record` (16 bytes, no cursor yet).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DaGcState {
     /// Lowest height whose row may still exist (rows below it were deleted).
     /// Only a seek start: it keeps each pass from walking old row tombstones.
     frontier: u64,
-    /// One past the highest recorded height. A dispatch below it is a replay
-    /// (committed blocks are final: its row is already written, or already
-    /// GC'd) and records nothing, so a replay never re-attaches a hash to an
-    /// earlier row than its latest reference.
-    next_record: u64,
+    /// Pre-cursor state only (16-byte encoding): one past the highest height
+    /// that recorded a row. A dispatch below it is a replay.
+    legacy_next_record: u64,
+    /// "Recorded through": one past the highest height whose record (a row,
+    /// or nothing for a native-empty height) is durable; every height from
+    /// the first recorded one up to it is recorded. Written in the batch of
+    /// the records it covers. A dispatch below it is a replay (committed
+    /// blocks are final) and records nothing, so a replay never re-attaches a
+    /// hash to an earlier row than its latest reference. A dispatch above it
+    /// finds the bookkeeping behind (a crash between the body write and the
+    /// record, a failed record write): the missing heights are back-filled
+    /// from the [`DaGcHistory`] before anything is deleted. `None` = not
+    /// established (a fresh store, or a pre-cursor one): the first recording
+    /// pass establishes it at its own height.
+    cursor: Option<u64>,
+    /// One past the highest height a back-fill skipped because the history
+    /// pruned it (`0` = none). Its re-inclusions are unknown, so nothing is
+    /// deleted until it is itself due (window and tree bound).
+    hold: u64,
 }
 
 impl DaGcState {
     /// Absent or malformed = the initial state.
     fn decode(bytes: Option<&[u8]>) -> Self {
+        let word = |b: &[u8], i: usize| {
+            u64::from_be_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes"))
+        };
         match bytes {
+            Some(b) if b.len() == 24 => Self {
+                frontier: word(b, 0),
+                legacy_next_record: 0,
+                cursor: Some(word(b, 1)),
+                hold: word(b, 2),
+            },
             Some(b) if b.len() == 16 => Self {
-                frontier: u64::from_be_bytes(b[..8].try_into().expect("8 bytes")),
-                next_record: u64::from_be_bytes(b[8..].try_into().expect("8 bytes")),
+                frontier: word(b, 0),
+                legacy_next_record: word(b, 1),
+                cursor: None,
+                hold: 0,
             },
             _ => Self::default(),
         }
     }
 
-    fn encode(self) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&self.frontier.to_be_bytes());
-        out[8..].copy_from_slice(&self.next_record.to_be_bytes());
-        out
+    fn encode(self) -> Vec<u8> {
+        let words = match self.cursor {
+            Some(cursor) => vec![self.frontier, cursor, self.hold],
+            None => vec![self.frontier, self.legacy_next_record],
+        };
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
     }
 }
+
+/// Most heights one pass back-fills from the [`DaGcHistory`] (heights the
+/// history pruned are skipped in O(1) and do not count). A longer gap takes
+/// several passes, deleting nothing until it is closed.
+pub const DA_GC_MAX_BACKFILL_HEIGHTS: u64 = 256;
+
+/// Latest references recorded earlier in the same batch (a back-fill writes
+/// several heights in one batch, and a `MultiGet` does not see the batch).
+type PendingRefs = std::collections::HashMap<[u8; 32], (u64, u16)>;
 
 fn da_gc_row_key(height: u64) -> [u8; DA_GC_ROW_KEY_LEN] {
     let mut key = [0u8; DA_GC_ROW_KEY_LEN];
@@ -253,6 +289,10 @@ pub struct DaGcOutcome {
     /// inside the window or the tree margin. The bodies stay; the next pass
     /// retries.
     pub deletion_held: bool,
+    /// The history could not supply a missing height (a missing block or a
+    /// read error): the pass deleted nothing (`deletion_held`) and the next
+    /// one retries.
+    pub backfill_stalled: bool,
 }
 
 /// Where the GC re-reads committed heights it has no record for
@@ -510,6 +550,15 @@ impl NativeDaStore {
     /// expires (Codex P1, P2). A `height` below one already recorded is a
     /// replay and records nothing.
     ///
+    /// Never delete while the bookkeeping is behind (Codex P1, pre-merge
+    /// review): the GC state's cursor says which heights are recorded. A
+    /// `height` above it means a dispatched height has no record (a crash
+    /// between the body write and this pass, a failed record write), so a
+    /// re-inclusion's pin may be missing. This variant has no history to fill
+    /// such a gap: the pass records and deletes nothing, ever, until a pass
+    /// with a history ([`gc_committed_with_history`](Self::gc_committed_with_history))
+    /// fills it.
+    ///
     /// One atomic `WriteBatch` per pass (the row, the references, the markers
     /// of a re-inclusion, the deletes and the GC state), bounded by `limits`;
     /// the first due row is always taken whole, so the GC always progresses.
@@ -543,7 +592,27 @@ impl NativeDaStore {
     }
 
     /// [`gc_committed`](Self::gc_committed) with a [`DaGcHistory`] to
-    /// back-fill missed heights from.
+    /// back-fill missed heights from (the consensus app's block tree).
+    ///
+    /// Before any deletion, every height from the cursor up to `height` gets
+    /// its record: the missing ones from `history` (at most
+    /// [`DA_GC_MAX_BACKFILL_HEIGHTS`] per pass; their bodies and shards then
+    /// follow the same rules, re-inclusion pins included), then `height`'s own
+    /// from `hashes`. Records are idempotent and the cursor lands in the
+    /// batch of the records it covers, so a crash or a failed write only
+    /// leaves the cursor behind, and the next pass re-does exactly the
+    /// missing heights. A height the history cannot supply (`Ok(None)` or an
+    /// error) stops the back-fill: the pass writes the heights before it,
+    /// deletes nothing ([`DaGcOutcome::backfill_stalled`]) and the next pass
+    /// retries. Heights below the history's pruned height are skipped (their
+    /// blocks are never served again), but nothing is deleted until the last
+    /// of them is itself due (window and `keep_from`): one of them may have
+    /// re-included a body an older row lists.
+    ///
+    /// A back-filling pass writes its records in one batch, then deletes in a
+    /// second (the deletion pass reads the rows from the DB, so it must see
+    /// the back-filled ones); a crash between the two only defers the
+    /// deletion. A pass without a gap is one batch, as before.
     #[allow(clippy::too_many_arguments)]
     pub fn gc_committed_with_history(
         &self,
@@ -553,7 +622,7 @@ impl NativeDaStore {
         retention: u64,
         keep_from: u64,
         limits: DaGcLimits,
-        _history: &dyn DaGcHistory,
+        history: &dyn DaGcHistory,
     ) -> Result<DaGcOutcome, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let state = DaGcState::decode(
@@ -568,28 +637,88 @@ impl NativeDaStore {
         // in this same pass, its read-back copy still lists them. A set: the
         // membership tests below run once per listed hash (Codex P2).
         let mut moved: HashSet<[u8; 32]> = HashSet::new();
-        if !hashes.is_empty() && height >= state.next_record.max(state.frontier) {
-            self.record_row(
-                &mut batch,
-                height,
-                hashes,
-                shard_count,
-                state.frontier,
-                &mut moved,
-            )?;
-            out.references_moved = moved.len() as u64;
-            next.next_record = height.saturating_add(1);
+        let mut backfilled = false;
+        match state.cursor {
+            // Not established: a pre-cursor store, or a fresh one. Nothing
+            // before this pass was recorded under the cursor: start it here.
+            None => {
+                if height >= state.legacy_next_record.max(state.frontier) {
+                    if !hashes.is_empty() {
+                        self.record_row(
+                            &mut batch,
+                            height,
+                            hashes,
+                            shard_count,
+                            state.frontier,
+                            &mut moved,
+                            None,
+                        )?;
+                    }
+                    next.cursor = Some(height.saturating_add(1));
+                }
+            }
+            // A replay: already recorded (or already GC'd).
+            Some(cursor) if height < cursor => {}
+            Some(cursor) => {
+                let mut recorded_to = cursor;
+                let mut refs = PendingRefs::new();
+                if cursor < height {
+                    backfilled = true;
+                    recorded_to = self.backfill_rows(
+                        &mut batch,
+                        cursor,
+                        height,
+                        shard_count,
+                        state.frontier,
+                        history,
+                        &mut next.hold,
+                        &mut refs,
+                        &mut out,
+                    )?;
+                }
+                if recorded_to == height {
+                    if !hashes.is_empty() {
+                        self.record_row(
+                            &mut batch,
+                            height,
+                            hashes,
+                            shard_count,
+                            state.frontier,
+                            &mut moved,
+                            backfilled.then_some(&mut refs),
+                        )?;
+                    }
+                    recorded_to = height.saturating_add(1);
+                }
+                next.cursor = Some(recorded_to);
+            }
         }
+        out.references_moved = moved.len() as u64;
+        // Still behind (stalled, or the back-fill bound): delete nothing.
+        let behind = next.cursor.is_some_and(|c| c <= height);
         // Rows at or below `last_due` are due: `h + retention <= height` and
         // `h < keep_from`.
         let last_due = height
             .checked_sub(retention.max(1))
             .zip(keep_from.checked_sub(1))
             .map(|(window, served)| window.min(served));
-        if let Some(last_due) = last_due.filter(|&due| state.frontier <= due) {
+        // Every height a back-fill skipped must be due itself.
+        let held = next.hold > 0 && last_due.is_none_or(|due| due < next.hold - 1);
+        let mut written = state;
+        if backfilled && next != state {
+            // The deletion pass reads rows from the DB: land the back-filled
+            // ones (and the cursor covering them) first.
+            batch.put_cf(cf, DA_GC_STATE_KEY, next.encode());
+            self.db.write(std::mem::take(&mut batch))?;
+            written = next;
+            moved.clear();
+        }
+        if behind || held {
+            out.deletion_held = true;
+        } else if let Some(last_due) = last_due.filter(|&due| next.frontier <= due) {
             if let Some(frontier) = self.gc_due_rows(
                 &mut batch,
-                state.frontier,
+                next.frontier,
                 last_due,
                 limits,
                 &moved,
@@ -598,13 +727,102 @@ impl NativeDaStore {
                 next.frontier = frontier;
             }
         }
-        if next != state {
+        if next != written {
             batch.put_cf(cf, DA_GC_STATE_KEY, next.encode());
         }
         if !batch.is_empty() {
             self.db.write(batch)?;
         }
         Ok(out)
+    }
+
+    /// Add the records of the heights `[cursor, height)` to `batch` from
+    /// `history`: skip those below its pruned height (raising `hold` past
+    /// them), then record up to [`DA_GC_MAX_BACKFILL_HEIGHTS`] in order.
+    /// Returns the first height not recorded (`height` when the gap is
+    /// closed). A height the history cannot supply stops it there
+    /// (`out.backfill_stalled`, logged).
+    #[allow(clippy::too_many_arguments)]
+    fn backfill_rows(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        cursor: u64,
+        height: u64,
+        shard_count: u16,
+        frontier: u64,
+        history: &dyn DaGcHistory,
+        hold: &mut u64,
+        refs: &mut PendingRefs,
+        out: &mut DaGcOutcome,
+    ) -> Result<u64, StateError> {
+        let mut at = cursor;
+        let pruned = match history.pruned_below() {
+            Ok(pruned) => pruned,
+            Err(e) => {
+                tracing::warn!(
+                    height,
+                    behind_from = cursor,
+                    "DA body GC: bookkeeping behind and the history's pruned height is \
+                     unreadable, deleting nothing this pass: {e}"
+                );
+                out.backfill_stalled = true;
+                return Ok(at);
+            }
+        };
+        if pruned > at {
+            // Never served again: skip, but hold deletion until they are due.
+            at = pruned.min(height);
+            *hold = (*hold).max(at);
+            tracing::info!(
+                skipped_from = cursor,
+                skipped_to = at,
+                "DA body GC: skipped heights the block tree already pruned; deletion waits \
+                 until they are due"
+            );
+        }
+        let end = height.min(at.saturating_add(DA_GC_MAX_BACKFILL_HEIGHTS));
+        while at < end {
+            match history.committed_hashes(at) {
+                Ok(Some(hashes)) => {
+                    if !hashes.is_empty() {
+                        // Per height: a marker per (earlier row, hash).
+                        let mut moved = HashSet::new();
+                        self.record_row(
+                            batch,
+                            at,
+                            &hashes,
+                            shard_count,
+                            frontier,
+                            &mut moved,
+                            Some(&mut *refs),
+                        )?;
+                    }
+                    out.heights_backfilled += 1;
+                    at += 1;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        height,
+                        missing = at,
+                        "DA body GC: bookkeeping behind and the block tree lacks a height to \
+                         back-fill, deleting nothing this pass"
+                    );
+                    out.backfill_stalled = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        height,
+                        missing = at,
+                        "DA body GC: bookkeeping behind and back-filling a height failed, \
+                         deleting nothing this pass: {e}"
+                    );
+                    out.backfill_stalled = true;
+                    break;
+                }
+            }
+        }
+        Ok(at)
     }
 
     /// Add the row of `height` and the latest-reference keys of `hashes` to
@@ -619,6 +837,11 @@ impl NativeDaStore {
     /// and its latest expiry must delete every index written. The new row's
     /// other hashes then also get deletes for indices they never had:
     /// tombstones, only on a re-inclusion after a set shrink.
+    ///
+    /// `pending`: the references recorded earlier in the same batch (a
+    /// back-fill records several heights in one), which win over the DB's;
+    /// this row's references are added to it.
+    #[allow(clippy::too_many_arguments)]
     fn record_row(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -627,6 +850,7 @@ impl NativeDaStore {
         shard_count: u16,
         frontier: u64,
         moved: &mut HashSet<[u8; 32]>,
+        pending: Option<&mut PendingRefs>,
     ) -> Result<(), StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let ref_keys: Vec<[u8; DA_GC_REF_KEY_LEN]> =
@@ -637,8 +861,11 @@ impl NativeDaStore {
                 .inner()
                 .batched_multi_get_cf(cf, ref_keys.iter().map(|k| k.as_slice()), false);
         for (hash, slot) in hashes.iter().zip(refs) {
-            let Some(value) = slot? else { continue };
-            let Some((prev, prev_shards)) = decode_da_gc_ref(&value) else {
+            let slot = slot?;
+            let earlier = pending.as_deref().and_then(|p| p.get(&hash.0).copied());
+            let Some((prev, prev_shards)) =
+                earlier.or_else(|| slot.as_deref().and_then(decode_da_gc_ref))
+            else {
                 continue;
             };
             if (frontier..height).contains(&prev) {
@@ -656,6 +883,11 @@ impl NativeDaStore {
         let reference = encode_da_gc_ref(height, row_shard_count);
         for key in &ref_keys {
             batch.put_cf(cf, key, reference);
+        }
+        if let Some(pending) = pending {
+            for hash in hashes {
+                pending.insert(hash.0, (height, row_shard_count));
+            }
         }
         Ok(())
     }
@@ -1853,10 +2085,17 @@ mod tests {
         for tip in 14..=13 + W {
             let out = gc_h(&store, tip, &[], W, &hist);
             if tip == 14 {
-                assert_eq!(out.heights_backfilled, 1, "height 13's record lands on retry");
+                assert_eq!(
+                    out.heights_backfilled, 1,
+                    "height 13's record lands on retry"
+                );
             }
             assert_eq!(present(&store, &y), tip < 10 + W, "y (row 10) at tip {tip}");
-            assert_eq!(present(&store, &x), tip < 13 + W, "x (re-included at 13) at tip {tip}");
+            assert_eq!(
+                present(&store, &x),
+                tip < 13 + W,
+                "x (re-included at 13) at tip {tip}"
+            );
         }
         assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
     }
@@ -1882,7 +2121,10 @@ mod tests {
             ..TestHistory::default()
         };
         let out = gc_h(&store, 20, &[], W, &missing);
-        assert!(out.deletion_held, "row 10 is due at 20 but 13..=19 are unknown");
+        assert!(
+            out.deletion_held,
+            "row 10 is due at 20 but 13..=19 are unknown"
+        );
         assert_eq!(out.rows_deleted, 0);
         assert!(present(&store, &x));
         let broken = TestHistory {
@@ -1970,6 +2212,119 @@ mod tests {
             assert_eq!(present(&live, &actions[0]), tip < 13 + W, "x at tip {tip}");
         }
         assert_eq!(bookkeeping_keys(&live), 1, "only the GC state key remains");
+    }
+
+    fn gc_state(store: &NativeDaStore) -> DaGcState {
+        DaGcState::decode(
+            store
+                .db
+                .get_cf_raw(CF_NATIVE_PENDING, DA_GC_STATE_KEY)
+                .unwrap()
+                .as_deref(),
+        )
+    }
+
+    fn put_gc_state(store: &NativeDaStore, state: DaGcState) {
+        store
+            .db
+            .put_cf_raw(CF_NATIVE_PENDING, DA_GC_STATE_KEY, &state.encode())
+            .unwrap();
+    }
+
+    /// Records are idempotent: with the cursor rewound over heights whose
+    /// records already landed (rows, references, re-inclusion markers), the
+    /// back-fill re-writes them and the store ends exactly as without the
+    /// rewind.
+    #[test]
+    fn gc_rewriting_landed_records_changes_nothing() {
+        const W: u64 = 6;
+        let actions: Vec<_> = (1..=4).map(dummy_action).collect();
+        let h: Vec<B256> = actions.iter().map(compute_action_hash).collect();
+        let sched = history(&[
+            (10, vec![h[0], h[1]]),
+            (12, vec![h[0]]),
+            (13, vec![h[2], h[0], h[0]]),
+            (15, vec![h[3], h[2]]),
+        ]);
+        let at = |height: u64| sched.known.get(&height).cloned().unwrap_or_default();
+        let (_d1, control) = temp_store();
+        let (_d2, rewound) = temp_store();
+        for store in [&control, &rewound] {
+            store.put_batch(&actions).unwrap();
+            for tip in 10..=15 {
+                gc_h(store, tip, &at(tip), W, &sched);
+            }
+        }
+        let mut state = gc_state(&rewound);
+        assert_eq!(state.cursor, Some(16));
+        state.cursor = Some(11);
+        put_gc_state(&rewound, state);
+        gc_h(&control, 16, &[], W, &sched);
+        let out = gc_h(&rewound, 16, &[], W, &sched);
+        assert_eq!(out.heights_backfilled, 5, "11..=15 re-written");
+        assert_eq!(dump(&rewound), dump(&control));
+    }
+
+    /// A store a pre-cursor binary wrote (16-byte state): a replay below its
+    /// last recorded height still records nothing, the first later pass
+    /// establishes the cursor at its own height (nothing to back-fill, no
+    /// hold), and the GC goes on as before.
+    #[test]
+    fn gc_establishes_the_cursor_on_a_pre_cursor_store() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let (x, y) = (dummy_action(1), dummy_action(2));
+        store.put_batch(&[x.clone(), y.clone()]).unwrap();
+        gc_h(&store, 20, &[compute_action_hash(&x)], W, &history(&[]));
+        put_gc_state(
+            &store,
+            DaGcState {
+                frontier: 0,
+                legacy_next_record: 21,
+                cursor: None,
+                hold: 0,
+            },
+        );
+        assert_eq!(gc_state(&store).encode().len(), 16);
+        let none = TestHistory::default();
+        gc_h(&store, 19, &[compute_action_hash(&y)], W, &none);
+        assert_eq!(
+            gc_state(&store).cursor,
+            None,
+            "a replay establishes nothing"
+        );
+        let out = gc_h(&store, 23, &[], W, &none);
+        assert_eq!((out.heights_backfilled, out.deletion_held), (0, false));
+        assert_eq!(gc_state(&store).cursor, Some(24));
+        assert!(present(&store, &x));
+        let out = gc_h(&store, 24, &[], W, &none);
+        assert_eq!(out.bodies_deleted, 1, "row 20 due at 24");
+        assert!(!present(&store, &x));
+        assert!(present(&store, &y), "the replay recorded nothing for y");
+    }
+
+    /// A long gap is back-filled at most `DA_GC_MAX_BACKFILL_HEIGHTS` heights
+    /// per pass, deleting nothing until it is closed.
+    #[test]
+    fn gc_backfill_is_bounded_per_pass() {
+        const W: u64 = 4;
+        const B: u64 = DA_GC_MAX_BACKFILL_HEIGHTS;
+        let (_dir, store) = temp_store();
+        let x = dummy_action(1);
+        store.put(&x).unwrap();
+        let hist = history(&[]);
+        gc_h(&store, 10, &[compute_action_hash(&x)], W, &hist);
+        let gap_end = 11 + 2 * B + 50;
+        let out = gc_h(&store, gap_end, &[], W, &hist);
+        assert_eq!((out.heights_backfilled, out.deletion_held), (B, true));
+        assert!(!out.backfill_stalled, "bounded, not stalled");
+        let out = gc_h(&store, gap_end + 1, &[], W, &hist);
+        assert_eq!((out.heights_backfilled, out.deletion_held), (B, true));
+        assert!(present(&store, &x));
+        let out = gc_h(&store, gap_end + 2, &[], W, &hist);
+        assert_eq!((out.heights_backfilled, out.deletion_held), (52, false));
+        assert_eq!(out.bodies_deleted, 1);
+        assert_eq!(gc_state(&store).cursor, Some(gap_end + 3));
     }
 
     /// Markers across a bounded pass: a pass stopped by its row limit leaves

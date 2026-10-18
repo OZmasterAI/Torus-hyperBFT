@@ -6575,10 +6575,20 @@ impl TorusApp {
     /// re-inclusion markers, normally none) and one `WriteBatch` to the
     /// consensus DB (plus a body write on a restore), all linear in this
     /// block's hashes and the aged rows. Timed by `torus_da_gc_seconds`.
+    ///
+    /// Never deletes while the bookkeeping is behind (Codex P1, pre-merge
+    /// review; [`crate::da_gc`] module docs): a height dispatched without its
+    /// GC record (a crash after the body write, before this pass; a failed
+    /// record write) is back-filled from the block tree on the next pass,
+    /// with its re-inclusion pins and body restores, before anything is
+    /// deleted. A height the tree cannot supply holds every deletion (logged,
+    /// `torus_da_gc_held_passes`) until a later pass fills it. Back-filled
+    /// heights are recorded whatever their body row's durability (their
+    /// dispatch is past).
+    ///
     /// To move it off this thread, send `(height, hashes, shard_count)` over a
     /// channel to one dedicated thread that runs the same pass, in order:
-    /// a late pass only lengthens the window; a lost one leaves that height's
-    /// bodies behind, never deletes early.
+    /// a late pass only lengthens the window; a lost one is back-filled.
     fn gc_da_bodies_after_dispatch(
         &self,
         height: u64,
@@ -6638,6 +6648,56 @@ impl TorusApp {
             );
             0
         });
+        // Heights this pass finds unrecorded (a crash after an earlier
+        // dispatch's body write, or a failed record) are re-read from the
+        // block tree; their missing bodies are restored like this height's.
+        let state_db = &self.state_db;
+        let restore = |at: u64,
+                       hashes: &[torus_types::B256],
+                       actions: Option<&[torus_types::SignedNativeAction]>| {
+            if hashes.is_empty() || mempool.has_all_native_da(hashes) {
+                return;
+            }
+            let loaded;
+            let actions = match actions {
+                Some(actions) => actions,
+                None => match load_replay_body(state_db, at) {
+                    Some(body) => {
+                        loaded = body.native_actions;
+                        &loaded[..]
+                    }
+                    None => {
+                        tracing::warn!(
+                            height = at,
+                            "DA body GC back-fill: a referenced body is missing and the \
+                             durable block body is unavailable to restore it"
+                        );
+                        return;
+                    }
+                },
+            };
+            if actions.len() != hashes.len() {
+                tracing::warn!(
+                    height = at,
+                    "DA body GC back-fill: block body does not match the tree's hashes, \
+                     not restoring"
+                );
+                return;
+            }
+            match mempool.mirror_missing_native_to_da(actions, hashes) {
+                Ok(0) => {}
+                Ok(restored) => tracing::info!(
+                    height = at,
+                    restored,
+                    "DA body GC back-fill: restored bodies a committed block references"
+                ),
+                Err(e) => tracing::warn!(
+                    height = at,
+                    "DA body GC back-fill: restoring missing bodies failed: {e}"
+                ),
+            }
+        };
+        let history = crate::da_gc::BlockTreeHistory::new(&gc.block_tree_db, &restore);
         let out = mempool.gc_committed_native_da(
             height,
             record,
@@ -6645,10 +6705,21 @@ impl TorusApp {
             gc.retention,
             keep_from,
             crate::da_gc::DA_GC_LIMITS,
+            &history,
         );
         if let Some(ref m) = self.metrics {
             m.da_gc_seconds.observe(started.elapsed().as_secs_f64());
             m.da_bodies_gc_deleted.inc_by(out.bodies_deleted);
+            if out.backfill_stalled {
+                m.da_gc_held_passes.inc();
+            }
+        }
+        if out.heights_backfilled > 0 {
+            tracing::info!(
+                height,
+                backfilled = out.heights_backfilled,
+                "DA body GC: back-filled unrecorded heights from the block tree"
+            );
         }
         if out.backlog {
             tracing::debug!(
@@ -33859,7 +33930,8 @@ mod crash_recovery_tests {
             parent = Some(committed.hash);
         }
         let mut wb = BlockTreeWriteBatch::new_unsafe();
-        bt.commit(&mut wb, &parent.expect("at least one block")).unwrap();
+        bt.commit(&mut wb, &parent.expect("at least one block"))
+            .unwrap();
         bt.write(wb);
     }
 
@@ -33937,7 +34009,11 @@ mod crash_recovery_tests {
             Some(mempool.clone()),
             None,
         );
-        assert_eq!(read_native_applied_height(&state_db), Some(1227), "{what}: boot replay");
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1227),
+            "{what}: boot replay"
+        );
         assert!(!app.is_exec_failed(), "{what}");
         app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
             retention: W,
@@ -33992,7 +34068,10 @@ mod crash_recovery_tests {
         assert!(da_has(&mempool, &x), "inside the window at 250");
         // 251..=260: dispatched before a crash, never recorded, not in the tree.
         app.gc_da_bodies_after_dispatch(261, &[], &[], true);
-        assert!(da_has(&mempool, &x), "row 100 is due, but the bookkeeping is behind");
+        assert!(
+            da_has(&mempool, &x),
+            "row 100 is due, but the bookkeeping is behind"
+        );
         assert_eq!(metrics.da_gc_held_passes.get(), 1);
         assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
         let mut gap: Vec<TorusBlock> = (251..=261).map(|h| high_block(h, vec![])).collect();

@@ -45,10 +45,48 @@
 //! the state DB's `CF_BLOCK_BODIES`), not consensus commits: a committed block
 //! still parked behind an execution hole is re-read from the DA store, so its
 //! bodies are not even recorded for GC until it is dispatched.
+//!
+//! # Never delete while the bookkeeping is behind
+//!
+//! A body re-included by a later block is pinned by that block's GC record
+//! (the record moves the hash out of the earlier row). Dispatch persists the
+//! block body in the state DB, then runs the GC pass in the consensus DB: a
+//! crash in between, or a failed GC write, leaves a dispatched height without
+//! its record. Boot replay then applies the block and skips its re-delivery,
+//! so no pass records it live, and the earlier row would delete the body
+//! while the tree still serves the re-including block (Codex P1, pre-merge
+//! review). Hence the cursor rule:
+//!
+//! - The GC state holds a "recorded through" cursor, written in the same
+//!   batch as the records it covers: a crash or a failed write only leaves it
+//!   behind.
+//! - Every pass (boot or steady state) first checks it. Behind the dispatched
+//!   height, the missing heights are back-filled from the block tree
+//!   ([`BlockTreeHistory`]: the committed blocks it still holds, at least the
+//!   window while unpruned), re-inclusion pins included, before anything is
+//!   deleted. Records are idempotent, so a re-write is harmless.
+//! - A height the tree cannot supply (missing block, read error) stops the
+//!   back-fill: the pass deletes NOTHING, logs, counts
+//!   `torus_da_gc_held_passes`, and the next pass retries. A failed record is
+//!   therefore never dropped: the cursor stays behind until it lands.
+//! - Heights below the tree's prune pointer are skipped (no longer served),
+//!   but deletion waits until the last skipped height is itself due (window
+//!   and tree bound): one of them may have re-included an older row's body.
+//!   Such a gap means the GC was off or failing for longer than the tree
+//!   window; the first-inclusion bodies of the skipped heights stay for good.
+//!
+//! A store without a cursor (fresh, or written by a pre-cursor binary)
+//! establishes it at the first recorded height. With the GC off (archive
+//! node, `TORUS_DA_BODY_RETENTION=0`) no pass runs and nothing is written.
 
+use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
 use hotstuff_rs::block_tree::variables::BLOCK_TREE_PRUNED_HEIGHT;
+use hotstuff_rs::types::data_types::BlockHeight;
 use torus_state::cf::CF_CONSENSUS_META;
-use torus_state::{DaGcLimits, StateDb, StateError};
+use torus_state::{DaGcHistory, DaGcLimits, StateDb, StateError};
+use torus_types::{compute_action_hash, CompactBlock, SignedNativeAction, TorusBlock, B256};
+
+use crate::kv_store::RocksKVStore;
 
 /// Blocks a body outlives its block in the block tree by: the window derived
 /// from `--retention-blocks` is the block-tree retention plus this, and a body
@@ -134,6 +172,90 @@ impl DaBodyGc {
     /// This pass's `keep_from`, from the tree's durable prune pointer.
     pub fn keep_from(&self) -> Result<u64, StateError> {
         read_block_tree_frontier(&self.block_tree_db).map(keep_from_for_tree_frontier)
+    }
+}
+
+/// The native actions the hotstuff block tree in `db` holds for committed
+/// `height`, decoded like `TorusApp::on_committed_block` decodes the datum:
+/// `(hashes, Some(actions))` for a full datum, `(hashes, None)` for a compact
+/// one. A block without a datum or with an undecodable one carries none (the
+/// commit path executes nothing from it). `None` = the tree has no committed
+/// block at `height`.
+#[allow(clippy::type_complexity)]
+pub fn committed_native_actions_in_tree(
+    db: &StateDb,
+    height: u64,
+) -> Result<Option<(Vec<B256>, Option<Vec<SignedNativeAction>>)>, StateError> {
+    let tree_err = |e| StateError::InvalidData(format!("block tree read at {height}: {e:?}"));
+    let camera = BlockTreeCamera::new(RocksKVStore::new(db.db_arc()));
+    let snapshot = camera.snapshot();
+    let Some(block) = snapshot
+        .block_at_height(BlockHeight::new(height))
+        .map_err(tree_err)?
+    else {
+        return Ok(None);
+    };
+    let Some(data) = snapshot.block_data(&block).map_err(tree_err)? else {
+        return Ok(None);
+    };
+    let Some(datum) = data.vec().first() else {
+        return Ok(Some((Vec::new(), None)));
+    };
+    let bytes = datum.bytes();
+    if let Ok(full) = bincode::deserialize::<TorusBlock>(bytes) {
+        let hashes = full
+            .native_actions
+            .iter()
+            .map(compute_action_hash)
+            .collect();
+        return Ok(Some((hashes, Some(full.native_actions))));
+    }
+    if let Ok(compact) = bincode::deserialize::<CompactBlock>(bytes) {
+        return Ok(Some((compact.native_action_hashes, None)));
+    }
+    tracing::warn!(
+        height,
+        "DA body GC back-fill: undecodable committed datum, no actions"
+    );
+    Ok(Some((Vec::new(), None)))
+}
+
+/// [`BlockTreeHistory`]'s restore hook: `(height, hashes, full datum's
+/// actions)`.
+pub type RestoreBodies<'a> = &'a dyn Fn(u64, &[B256], Option<&[SignedNativeAction]>);
+
+/// The block tree as the GC's [`DaGcHistory`] (Codex P1, pre-merge review):
+/// heights the GC has no record for (a crash between dispatch's body write
+/// and its GC pass, a failed record write) are re-read from the committed
+/// blocks the tree still holds. The tree keeps at least the GC window's
+/// heights while it is not pruned past them, and its prune pointer says which
+/// heights it no longer serves.
+pub struct BlockTreeHistory<'a> {
+    db: &'a StateDb,
+    restore: RestoreBodies<'a>,
+}
+
+impl<'a> BlockTreeHistory<'a> {
+    /// `db` holds the block tree. `restore(height, hashes, actions)` runs for
+    /// each back-filled height before its record (`actions`: the full
+    /// datum's, if it is one), so a body the block references but the DA
+    /// store lost is put back, as dispatch does.
+    pub fn new(db: &'a StateDb, restore: RestoreBodies<'a>) -> Self {
+        Self { db, restore }
+    }
+}
+
+impl DaGcHistory for BlockTreeHistory<'_> {
+    fn pruned_below(&self) -> Result<u64, StateError> {
+        Ok(read_block_tree_frontier(self.db)?.unwrap_or(0))
+    }
+
+    fn committed_hashes(&self, height: u64) -> Result<Option<Vec<B256>>, StateError> {
+        let Some((hashes, actions)) = committed_native_actions_in_tree(self.db, height)? else {
+            return Ok(None);
+        };
+        (self.restore)(height, &hashes, actions.as_deref());
+        Ok(Some(hashes))
     }
 }
 
