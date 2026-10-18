@@ -500,6 +500,24 @@ pub struct Metrics {
     /// Consensus thread: `remove_committed_native` (mempool write-lock + prune)
     /// inside the commit dispatch.
     pub mempool_remove_committed_seconds: Histogram,
+    /// RH4: committed native-action bodies deleted from the DA store
+    /// (`cf_native_pending`) after leaving the retention window. Without the
+    /// GC the store only grew.
+    pub da_bodies_gc_deleted: Counter,
+    /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
+    /// (record the height's row, delete aged bodies and shards: one batch).
+    pub da_gc_seconds: Histogram,
+    /// RH4: DA body GC passes that deleted nothing, by `reason`
+    /// (`torus_state::DaGcHoldReason::as_str`): `gap` (bookkeeping behind,
+    /// not back-fillable from the block tree), `backfilling` (behind by more
+    /// than one pass back-fills), `unrecorded` (the height's body row did not
+    /// land), `pre_cursor` (a pre-cursor store's replay), `pruned_gap` (a
+    /// skipped pruned height not due yet), `dispatch_behind` (dispatch is
+    /// behind the committed tip, e.g. backpressure in non-blocking dispatch),
+    /// `tip_unreadable`, `tail_unreadable` (a block above the committed tip
+    /// cannot be read or decoded), `store_error` (the pass failed). The
+    /// bodies stay; the next pass retries.
+    pub da_gc_held_passes: Family<Vec<(String, String)>, Counter>,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -2183,6 +2201,25 @@ impl Metrics {
             "Consensus thread: remove_committed_native inside the commit dispatch",
             mempool_remove_committed_seconds.clone(),
         );
+        let da_bodies_gc_deleted = Counter::default();
+        registry.register(
+            "torus_da_bodies_gc_deleted",
+            "Committed native-action bodies deleted from the DA store after the retention window (RH4)",
+            da_bodies_gc_deleted.clone(),
+        );
+        let da_gc_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 14));
+        registry.register(
+            "torus_da_gc_seconds",
+            "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
+            da_gc_seconds.clone(),
+        );
+        let da_gc_held_passes = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register(
+            "torus_da_gc_held_passes",
+            "DA body GC passes that deleted nothing, by reason (gap / backfilling / unrecorded / \
+             pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error) (RH4)",
+            da_gc_held_passes.clone(),
+        );
 
         let exec_resting_orders = Gauge::default();
         registry.register(
@@ -2995,6 +3032,9 @@ impl Metrics {
             validate_block_attest_lookup_seconds,
             on_committed_block_seconds,
             mempool_remove_committed_seconds,
+            da_bodies_gc_deleted,
+            da_gc_seconds,
+            da_gc_held_passes,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_resident_rows,
@@ -3666,6 +3706,8 @@ mod tests {
             "torus_validate_block_attest_lookup_seconds",
             "torus_on_committed_block_seconds",
             "torus_mempool_remove_committed_seconds",
+            "torus_da_bodies_gc_deleted_total",
+            "torus_da_gc_seconds",
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }

@@ -5284,6 +5284,12 @@ pub struct TorusApp {
     /// when the mempool or fetcher is absent (consensus-only tests) — a miss
     /// then fails the view without a handoff, same as before BS-4a.
     da_recovery: Option<DaRecoveryWorker>,
+    /// RH4 durable DA body GC: the window in dispatched heights and the
+    /// block tree whose prune pointer bounds it. `None` = off, the default:
+    /// every committed body stays (an archive node, or a test). The node sets
+    /// it from `TORUS_DA_BODY_RETENTION` / the block-tree retention
+    /// ([`crate::da_gc::resolve_da_body_retention`]).
+    da_body_gc: Option<crate::da_gc::DaBodyGc>,
     /// Item 3 (`TORUS_ASYNC_VALIDATE=1`): speculative body validation off the
     /// hotstuff-algo thread. `None` with the flag off (the default) — the
     /// validate path then runs synchronously; cost parity still needs measurement.
@@ -6350,6 +6356,7 @@ impl TorusApp {
             da_fetcher: None,
             shard_fetcher: None,
             da_recovery: None,
+            da_body_gc: None,
             async_validate: None,
             exec_next_height: None,
             deferred_exec: std::collections::BTreeMap::new(),
@@ -6532,6 +6539,218 @@ impl TorusApp {
 
     pub fn set_pre_proposal_tx(&mut self, tx: std::sync::mpsc::SyncSender<PreProposalBundle>) {
         self.pre_proposal_tx = Some(tx);
+    }
+
+    /// RH4: durable DA body GC settings, `None` = off. Call before the
+    /// replica starts; see [`crate::da_gc`] for the policy
+    /// ([`crate::da_gc::resolve_da_body_retention`]).
+    pub fn set_da_body_gc(&mut self, gc: Option<crate::da_gc::DaBodyGc>) {
+        self.da_body_gc = gc;
+    }
+
+    /// RH4: one durable DA body GC pass for the committed `height` that
+    /// dispatch just made durable. Records `hashes` for deletion
+    /// `retention` dispatched heights later and deletes the bodies (and
+    /// shards) of the heights that aged out AND whose blocks the block tree
+    /// pruned at least [`crate::da_gc::DA_GC_MARGIN_BLOCKS`] heights ago
+    /// (its durable prune pointer, read each pass; unreadable = delete
+    /// nothing). A block whose body row did not land in `CF_BLOCK_BODIES`
+    /// (`!body_durable`) and that has native actions is not recorded at all,
+    /// never as "no actions" (Codex P1, round 2): the GC cursor stays at it,
+    /// the pass deletes nothing (`torus_da_gc_held_passes{reason="unrecorded"}`)
+    /// and the next pass back-fills it, pins included, from the block tree.
+    /// Nothing is deleted either while the tree holds committed heights
+    /// above `height` (a multi-block commit, boot reconciliation): one may
+    /// re-include a due body before its own pass pins it. A due body a block
+    /// above the committed tip references (the tree's uncommitted tail) stays
+    /// while its row goes; an unreadable tail holds the pass. Every held
+    /// pass counts `torus_da_gc_held_passes{reason}`.
+    ///
+    /// A hash this block re-includes moves to this height
+    /// ([`torus_state::NativeDaStore::gc_committed`]), so its body goes when
+    /// this block's window ends, not the earlier one's. And a body the block
+    /// references that is already gone (a re-inclusion validated while the
+    /// action's earlier row was pending, that row aging out before this
+    /// dispatch) is restored from `actions` first, so the block stays
+    /// servable for its own window (Codex P1 sibling). The body only, not its
+    /// shards: a shard miss falls back to the whole-body pull.
+    ///
+    /// Runs on the consensus thread, bounded: two point reads (the tree's
+    /// prune pointer, the GC state; plus, when a row is due, the tree's
+    /// committed tip and its uncommitted tail: normally 2-3 datum decodes,
+    /// at most [`crate::da_gc::MAX_TAIL_BLOCKS`]), two `MultiGet`s over this
+    /// block's hashes (body presence, latest references), one iterator over at most
+    /// [`crate::da_gc::DA_GC_LIMITS`] aged rows (and one over their
+    /// re-inclusion markers, normally none) and one `WriteBatch` to the
+    /// consensus DB (plus a body write on a restore), all linear in this
+    /// block's hashes and the aged rows. Timed by `torus_da_gc_seconds`.
+    ///
+    /// Never deletes while the bookkeeping is behind (Codex P1, pre-merge
+    /// review; [`crate::da_gc`] module docs): a height dispatched without its
+    /// GC record (a crash after the body write, before this pass; a failed
+    /// record write) is back-filled from the block tree on the next pass,
+    /// with its re-inclusion pins and body restores, before anything is
+    /// deleted. A height the tree cannot supply holds every deletion (logged,
+    /// `torus_da_gc_held_passes{reason="gap"}`) until a later pass fills it. Back-filled
+    /// heights are recorded whatever their body row's durability (their
+    /// dispatch is past).
+    ///
+    /// To move it off this thread, send `(height, hashes, shard_count)` over a
+    /// channel to one dedicated thread that runs the same pass, in order:
+    /// a late pass only lengthens the window; a lost one is back-filled.
+    fn gc_da_bodies_after_dispatch(
+        &self,
+        height: u64,
+        actions: &[torus_types::SignedNativeAction],
+        hashes: &[torus_types::B256],
+        body_durable: bool,
+    ) {
+        let (Some(gc), Some(mempool)) = (self.da_body_gc.as_ref(), self.mempool.as_ref()) else {
+            return;
+        };
+        // A height whose body row did not land is not recorded at all (never
+        // as "no actions": that would drop its re-inclusion pins, Codex P1
+        // round 2): the GC cursor stays at it, this pass deletes nothing, and
+        // the next pass back-fills it from the block tree. A native-empty
+        // block has nothing to pin: its empty record is the truth.
+        let record: Option<&[torus_types::B256]> = if body_durable || hashes.is_empty() {
+            Some(hashes)
+        } else {
+            tracing::warn!(
+                height,
+                bodies = hashes.len(),
+                "DA body GC: body row not durable at dispatch, not recording this height \
+                 (deleting nothing; the next pass back-fills it from the block tree)"
+            );
+            None
+        };
+        // The shards custodied per body (`custody_native_shards_core`): none with
+        // custody off, else `n` of the current set's erasure params.
+        let shard_count = if shard_custody_enabled() {
+            let params = torus_state::ErasureParams::for_validator_set(
+                self.last_validator_set.validators.len(),
+            );
+            if params.validate().is_ok() {
+                params.n as u16
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let started = std::time::Instant::now();
+        if !hashes.is_empty() {
+            match mempool.mirror_missing_native_to_da(actions, hashes) {
+                Ok(0) => {}
+                Ok(restored) => tracing::info!(
+                    height,
+                    restored,
+                    "DA body GC: restored bodies a dispatched block references (re-included after \
+                     an earlier row aged out)"
+                ),
+                Err(e) => tracing::warn!(
+                    height,
+                    "DA body GC: restoring a dispatched block's missing bodies failed: {e}"
+                ),
+            }
+        }
+        let keep_from = gc.keep_from().unwrap_or_else(|e| {
+            tracing::warn!(
+                height,
+                "DA body GC: block-tree prune pointer unreadable, deleting nothing this pass: {e}"
+            );
+            0
+        });
+        // Heights this pass finds unrecorded (a crash after an earlier
+        // dispatch's body write, or a failed record) are re-read from the
+        // block tree; their missing bodies are restored like this height's.
+        let state_db = &self.state_db;
+        let restore = |at: u64,
+                       hashes: &[torus_types::B256],
+                       actions: Option<&[torus_types::SignedNativeAction]>| {
+            if hashes.is_empty() || mempool.has_all_native_da(hashes) {
+                return;
+            }
+            let loaded;
+            let actions = match actions {
+                Some(actions) => actions,
+                None => match load_replay_body(state_db, at) {
+                    Some(body) => {
+                        loaded = body.native_actions;
+                        &loaded[..]
+                    }
+                    None => {
+                        tracing::warn!(
+                            height = at,
+                            "DA body GC back-fill: a referenced body is missing and the \
+                             durable block body is unavailable to restore it"
+                        );
+                        return;
+                    }
+                },
+            };
+            if actions.len() != hashes.len() {
+                tracing::warn!(
+                    height = at,
+                    "DA body GC back-fill: block body does not match the tree's hashes, \
+                     not restoring"
+                );
+                return;
+            }
+            match mempool.mirror_missing_native_to_da(actions, hashes) {
+                Ok(0) => {}
+                Ok(restored) => tracing::info!(
+                    height = at,
+                    restored,
+                    "DA body GC back-fill: restored bodies a committed block references"
+                ),
+                Err(e) => tracing::warn!(
+                    height = at,
+                    "DA body GC back-fill: restoring missing bodies failed: {e}"
+                ),
+            }
+        };
+        let history = crate::da_gc::BlockTreeHistory::new(&gc.block_tree_db, &restore);
+        let out = mempool.gc_committed_native_da(
+            height,
+            record,
+            shard_count,
+            gc.retention,
+            keep_from,
+            crate::da_gc::DA_GC_LIMITS,
+            &history,
+        );
+        if let Some(ref m) = self.metrics {
+            m.da_gc_seconds.observe(started.elapsed().as_secs_f64());
+            m.da_bodies_gc_deleted.inc_by(out.bodies_deleted);
+            // P3 (claude-review r4): every held pass, by its reason.
+            if let Some(reason) = out.hold_reason {
+                m.da_gc_held_passes
+                    .get_or_create(&vec![("reason".into(), reason.as_str().into())])
+                    .inc();
+            }
+        }
+        if out.tail_pinned > 0 {
+            tracing::warn!(
+                height,
+                kept = out.tail_pinned,
+                "DA body GC: kept due bodies a block above the committed tip re-includes"
+            );
+        }
+        if out.heights_backfilled > 0 {
+            tracing::info!(
+                height,
+                backfilled = out.heights_backfilled,
+                "DA body GC: back-filled unrecorded heights from the block tree"
+            );
+        }
+        if out.backlog {
+            tracing::debug!(
+                height,
+                rows = out.rows_deleted,
+                "DA body GC: backlog left for the next pass"
+            );
+        }
     }
 
     /// s80: install the stream sink for executed blocks' fills. The execution
@@ -8861,13 +9080,16 @@ impl TorusApp {
                 );
             }
 
+            let mut hashes: Vec<torus_types::B256> = Vec::new();
             if !torus_block.native_actions.is_empty() {
                 if let Some(ref mempool) = self.mempool {
                     let mut scratch = Vec::new();
-                    let hashes: Vec<torus_types::B256> = torus_block
+                    hashes = torus_block
                         .native_actions
                         .iter()
-                        .map(|action| torus_types::compute_action_hash_with_scratch(action, &mut scratch))
+                        .map(|action| {
+                            torus_types::compute_action_hash_with_scratch(action, &mut scratch)
+                        })
                         .collect();
                     let prune_timer = std::time::Instant::now();
                     mempool.remove_committed_native(&hashes);
@@ -8877,6 +9099,14 @@ impl TorusApp {
                     }
                 }
             }
+            // RH4: record this height's bodies for the DA body GC and delete
+            // the bodies that aged out (one bounded batch, see `da_gc`).
+            self.gc_da_bodies_after_dispatch(
+                height,
+                &torus_block.native_actions,
+                &hashes,
+                durable.body,
+            );
 
             // D4 (S392): pin the mempool's admission fee floor to the base fee
             // committed blocks actually charge. Item 7 step 1: the admission gas
@@ -33380,5 +33610,1110 @@ mod crash_recovery_tests {
                 assert_eq!(read_native_applied_height(&db), Some(3), "{what}");
             }
         }
+    }
+
+    // ---- RH4 durable DA body GC on the commit dispatch ----
+
+    type DaGcFixture = (
+        TorusApp,
+        Arc<torus_mempool::Mempool>,
+        Arc<torus_telemetry::Metrics>,
+        std::sync::mpsc::Receiver<CommittedBlockMsg>,
+    );
+
+    /// Persist the hotstuff block tree's prune pointer in `db` the way the
+    /// pruner does.
+    fn set_tree_frontier(db: &StateDb, frontier: u64) {
+        use hotstuff_rs::block_tree::accessors::internal::{
+            BlockTreeSingleton, BlockTreeWriteBatch,
+        };
+        // SAFETY: test-only direct tree access, no replica runs on this store.
+        let mut bt = unsafe { BlockTreeSingleton::new_unsafe(RocksKVStore::new(db.db_arc())) };
+        let mut wb = BlockTreeWriteBatch::new_unsafe();
+        wb.set_block_tree_pruned_height(hotstuff_rs::types::data_types::BlockHeight::new(frontier))
+            .unwrap();
+        bt.write(wb);
+    }
+
+    /// An app over a mempool (whose DA store is the test DB) with a capture
+    /// channel standing in for the execution thread. With a window, the test
+    /// DB doubles as the block tree's DB, its pointer far ahead (the window
+    /// alone decides) unless the test moves it.
+    fn da_gc_app(state_db: &StateDb, config: &ChainConfig, retention: Option<u64>) -> DaGcFixture {
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            state_db.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1024);
+        app.replace_exec_tx(tx);
+        if retention.is_some() {
+            set_tree_frontier(state_db, u64::MAX);
+        }
+        app.set_da_body_gc(retention.map(|retention| crate::da_gc::DaBodyGc {
+            retention,
+            block_tree_db: state_db.clone(),
+        }));
+        (app, mempool, metrics, rx)
+    }
+
+    fn da_gc_commit(app: &mut TorusApp, height: u64, actions: Vec<SignedNativeAction>) {
+        let committed = committed_compact_block(&make_block(height, actions));
+        app.on_committed_block(&committed, committed.hash);
+    }
+
+    fn da_has(mempool: &torus_mempool::Mempool, action: &SignedNativeAction) -> bool {
+        mempool
+            .get_native_da(&torus_types::compute_action_hash(action))
+            .is_some()
+    }
+
+    /// The bodies of a dispatched committed height go once `window` more
+    /// heights have dispatched, not before; a body no committed block lists
+    /// stays; the counter counts every deleted body.
+    #[test]
+    fn da_gc_deletes_dispatched_bodies_after_the_window() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let committed: Vec<_> = (1..=8u64).map(sign_claim_rewards).collect();
+        let stray = sign_claim_rewards(99);
+        mempool.mirror_native_to_da(&committed).unwrap();
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&stray))
+            .unwrap();
+        for tip in 1..=8u64 {
+            da_gc_commit(&mut app, tip, vec![committed[tip as usize - 1].clone()]);
+            for (i, action) in committed[..tip as usize].iter().enumerate() {
+                let at = i as u64 + 1;
+                assert_eq!(
+                    da_has(&mempool, action),
+                    at + 4 > tip,
+                    "tip {tip}: body committed at {at}"
+                );
+            }
+        }
+        assert!(
+            da_has(&mempool, &stray),
+            "a body no committed block lists is never GC'd"
+        );
+        assert_eq!(
+            metrics.da_bodies_gc_deleted.get(),
+            4,
+            "heights 1..=4 GC'd by tip 8"
+        );
+    }
+
+    /// The window counts DISPATCHED heights, not commits: a committed block
+    /// parked behind an execution hole is re-read from the DA store when the
+    /// hole heals, so nothing may go while dispatch is stalled.
+    #[test]
+    fn da_gc_counts_dispatched_heights_not_commits() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(2));
+        let actions: Vec<_> = (1..=10u64).map(sign_claim_rewards).collect();
+        // Every body but height 3's: height 3 becomes a hole.
+        for (i, action) in actions.iter().enumerate() {
+            if i != 2 {
+                mempool
+                    .mirror_native_to_da(std::slice::from_ref(action))
+                    .unwrap();
+            }
+        }
+        for tip in 1..=10u64 {
+            da_gc_commit(&mut app, tip, vec![actions[tip as usize - 1].clone()]);
+        }
+        assert_eq!(
+            app.exec_next_height,
+            Some(3),
+            "heights 4..=10 parked behind the hole"
+        );
+        for (i, action) in actions.iter().enumerate() {
+            if i != 2 {
+                assert!(
+                    da_has(&mempool, action),
+                    "height {} kept while dispatch is stalled",
+                    i + 1
+                );
+            }
+        }
+        // The hole heals: 3..=10 dispatch, and the window slides to tip 10.
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&actions[2]))
+            .unwrap();
+        app.drain_exec_queue();
+        assert_eq!(app.exec_next_height, Some(11));
+        for (i, action) in actions.iter().enumerate() {
+            let at = i as u64 + 1;
+            assert_eq!(
+                da_has(&mempool, action),
+                at + 2 > 10,
+                "body committed at {at}"
+            );
+        }
+    }
+
+    /// Off unless enabled: the default app deletes nothing.
+    #[test]
+    fn da_gc_is_off_unless_enabled() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, None);
+        let actions: Vec<_> = (1..=20u64).map(sign_claim_rewards).collect();
+        mempool.mirror_native_to_da(&actions).unwrap();
+        for tip in 1..=20u64 {
+            da_gc_commit(&mut app, tip, vec![actions[tip as usize - 1].clone()]);
+        }
+        assert!(actions.iter().all(|a| da_has(&mempool, a)));
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
+        assert_eq!(
+            state_db
+                .get_cf_raw(torus_state::cf::CF_NATIVE_PENDING, b"\xffda-gc-state")
+                .unwrap(),
+            None,
+            "GC off writes no GC bookkeeping"
+        );
+    }
+
+    /// The GC rows are durable: bodies recorded before a restart still go on
+    /// schedule after it (no residue per restart).
+    #[test]
+    fn da_gc_rows_survive_an_app_restart() {
+        let (config, state_db) = make_test_config_and_db();
+        let actions: Vec<_> = (1..=8u64).map(sign_claim_rewards).collect();
+        // A genuinely linked chain: the restart's boot replay checks ancestry.
+        let mut blocks: Vec<TorusBlock> = actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| make_block(i as u64 + 1, vec![a.clone()]))
+            .collect();
+        link_blocks(&mut blocks);
+        let commit = |app: &mut TorusApp, block: &TorusBlock| {
+            let committed = committed_compact_block(block);
+            app.on_committed_block(&committed, committed.hash);
+        };
+        {
+            let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+            mempool.mirror_native_to_da(&actions).unwrap();
+            for block in &blocks[..4] {
+                commit(&mut app, block);
+            }
+            assert_eq!(app.exec_next_height, Some(5));
+            assert!(
+                actions.iter().all(|a| da_has(&mempool, a)),
+                "nothing aged by tip 4"
+            );
+        }
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        assert!(!app.is_exec_failed(), "restarted app fail-stopped at boot");
+        for block in &blocks[4..] {
+            commit(&mut app, block);
+        }
+        assert_eq!(
+            app.exec_next_height,
+            Some(9),
+            "5..=8 dispatched after the restart"
+        );
+        for (i, action) in actions.iter().enumerate() {
+            assert_eq!(
+                da_has(&mempool, action),
+                i >= 4,
+                "body committed at {}",
+                i + 1
+            );
+        }
+    }
+
+    /// With shard custody on (`TORUS_SHARD_CUSTODY=1`; off by default since
+    /// s128) a GC'd body's shards go with it. With custody off the pass
+    /// deletes no shard rows (none are written), so shards already present
+    /// stay.
+    #[test]
+    fn da_gc_deletes_custodied_shards_with_the_body() {
+        for custody in [true, false] {
+            da_gc_shards_follow_custody(custody);
+        }
+    }
+
+    fn da_gc_shards_follow_custody(custody: bool) {
+        let _custody = super::shard_custody_test_override::force(custody);
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(1));
+        // One validator cannot encode shards (k = n = 1): use a 4-validator set.
+        app.last_validator_set = make_validator_set(4);
+        let params = torus_state::ErasureParams::for_validator_set(4);
+        let action = sign_claim_rewards(1);
+        let hash = torus_types::compute_action_hash(&action);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&action))
+            .unwrap();
+        mempool
+            .mirror_native_shards(std::slice::from_ref(&action), params)
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![action.clone()]);
+        da_gc_commit(&mut app, 2, vec![]);
+        assert!(!da_has(&mempool, &action));
+        for i in 0..params.n as u16 {
+            assert_eq!(
+                mempool.get_shard(&hash, i).is_none(),
+                custody,
+                "shard {i}, custody {custody}: deleted with the body only with custody on"
+            );
+        }
+    }
+
+    /// Codex P1 (finding 1) through the dispatch path: a body goes only once
+    /// the block tree's durable prune pointer is DA_GC_MARGIN_BLOCKS past its
+    /// height, however far the window says; an unreadable pointer deletes
+    /// nothing.
+    #[test]
+    fn da_gc_waits_for_the_block_tree_to_prune() {
+        use crate::da_gc::DA_GC_MARGIN_BLOCKS as M;
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let actions: Vec<_> = (1..=16u64).map(sign_claim_rewards).collect();
+        mempool.mirror_native_to_da(&actions).unwrap();
+        // Committed heights (1..=tip) whose body is still in the DA store.
+        let kept = |mempool: &torus_mempool::Mempool, tip: u64| -> Vec<u64> {
+            (1..=tip)
+                .filter(|&h| da_has(mempool, &actions[h as usize - 1]))
+                .collect()
+        };
+        // The tree pruned nothing yet: the window ages 1..=8 out by tip 12,
+        // nothing goes.
+        set_tree_frontier(&state_db, 0);
+        for tip in 1..=12u64 {
+            da_gc_commit(&mut app, tip, vec![actions[tip as usize - 1].clone()]);
+        }
+        assert_eq!(kept(&mempool, 12), (1..=12).collect::<Vec<_>>());
+        // The tree pruned below hotstuff M + 3, so it serves Torus M + 4 on:
+        // heights 1..=4 may go (h + M <= M + 4).
+        set_tree_frontier(&state_db, M + 3);
+        da_gc_commit(&mut app, 13, vec![actions[12].clone()]);
+        assert_eq!(kept(&mempool, 13), (5..=13).collect::<Vec<_>>());
+        // An unreadable pointer is never read as "pruned".
+        state_db
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                &hotstuff_rs::block_tree::variables::BLOCK_TREE_PRUNED_HEIGHT,
+                b"bad",
+            )
+            .unwrap();
+        da_gc_commit(&mut app, 14, vec![actions[13].clone()]);
+        assert_eq!(kept(&mempool, 14), (5..=14).collect::<Vec<_>>());
+        // The tree caught up: the window decides again (h + 4 <= 15).
+        set_tree_frontier(&state_db, u64::MAX);
+        da_gc_commit(&mut app, 15, vec![actions[14].clone()]);
+        assert_eq!(kept(&mempool, 15), (12..=15).collect::<Vec<_>>());
+    }
+
+    /// Codex P1 (finding 2) through the dispatch path: an action committed at
+    /// height 2 and re-included at height 6 keeps its body until height 6's
+    /// window ends. At tip 6 row 2 ages out in the same pass that records
+    /// height 6, so the later reference must win inside one batch too.
+    #[test]
+    fn da_gc_keeps_a_reincluded_body_until_its_later_block_expires() {
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let x = sign_claim_rewards(1);
+        let fillers: Vec<_> = (2..=13u64).map(sign_claim_rewards).collect();
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        mempool.mirror_native_to_da(&fillers).unwrap();
+        for tip in 1..=12u64 {
+            let mut actions = vec![fillers[tip as usize - 1].clone()];
+            if tip == 2 || tip == 6 {
+                actions.push(x.clone());
+            }
+            da_gc_commit(&mut app, tip, actions);
+            assert_eq!(da_has(&mempool, &x), tip < 6 + 4, "tip {tip}");
+        }
+    }
+
+    /// Sibling of finding 2: a block re-includes an action AFTER the action's
+    /// earlier row aged out (validated while the body was still there,
+    /// dispatched after the GC took it). Dispatch restores the body from the
+    /// block, so the new block stays servable for its own window.
+    #[test]
+    fn da_gc_dispatch_restores_a_body_its_block_still_needs() {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, _metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![x.clone()]);
+        for tip in 2..=5u64 {
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "row 1 aged out at tip 5");
+        // Height 6 re-includes x and carries the body (a full datum here, as
+        // a proposal this node validated and cached).
+        let datum = encode_proposal_datum(&make_block(6, vec![x.clone()]), false);
+        let committed = hotstuff_rs::types::block::Block::new(
+            BlockHeight::new(6),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new(TorusApp::hash_datum(&datum)),
+            Data::new(vec![Datum::new(datum)]),
+        );
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(7), "height 6 dispatched");
+        for tip in 7..=10u64 {
+            assert!(
+                da_has(&mempool, &x),
+                "tip {}: block 6 still needs it",
+                tip - 1
+            );
+            da_gc_commit(&mut app, tip, vec![]);
+        }
+        assert!(!da_has(&mempool, &x), "block 6's window ended at tip 10");
+    }
+
+    /// Commit `blocks` (ascending, consecutive heights) as one chain into the
+    /// hotstuff block tree in `db`, each carrying its compact datum, in the
+    /// production mapping: Torus height `h` at hotstuff height `h - 1`
+    /// (spelled out here, not via the code under test).
+    fn tree_commit_chain(db: &StateDb, blocks: &[TorusBlock]) {
+        use hotstuff_rs::block_tree::accessors::internal::{
+            BlockTreeSingleton, BlockTreeWriteBatch,
+        };
+        use hotstuff_rs::hotstuff::types::{Phase, PhaseCertificate};
+        use hotstuff_rs::types::data_types::{BlockHeight, ChainID, SignatureSet, ViewNumber};
+        // SAFETY: test-only direct tree access, no replica runs on this store.
+        let mut bt = unsafe { BlockTreeSingleton::new_unsafe(RocksKVStore::new(db.db_arc())) };
+        let mut parent: Option<CryptoHash> = None;
+        for block in blocks {
+            let height = block.header.height;
+            let justify = match parent {
+                None => PhaseCertificate::genesis_pc(),
+                Some(parent) => PhaseCertificate {
+                    chain_id: ChainID::new(0),
+                    view: ViewNumber::new(height),
+                    block: parent,
+                    phase: Phase::Generic,
+                    signatures: SignatureSet::new(0),
+                },
+            };
+            let datum = encode_proposal_datum(block, true);
+            let committed = hotstuff_rs::types::block::Block::new(
+                BlockHeight::new(height - 1),
+                justify,
+                CryptoHash::new(TorusApp::hash_datum(&datum)),
+                Data::new(vec![Datum::new(datum)]),
+            );
+            bt.insert(&committed, None, None).unwrap();
+            parent = Some(committed.hash);
+        }
+        let mut wb = BlockTreeWriteBatch::new_unsafe();
+        bt.commit(&mut wb, &parent.expect("at least one block"))
+            .unwrap();
+        bt.write(wb);
+    }
+
+    /// Insert one block into the hotstuff tree in `db` at hotstuff height
+    /// `hotstuff`, extending `parent` (`None` = genesis), carrying `data`.
+    fn tree_insert(
+        db: &StateDb,
+        hotstuff: u64,
+        parent: Option<CryptoHash>,
+        data: Data,
+    ) -> CryptoHash {
+        use hotstuff_rs::block_tree::accessors::internal::BlockTreeSingleton;
+        use hotstuff_rs::hotstuff::types::{Phase, PhaseCertificate};
+        use hotstuff_rs::types::data_types::{BlockHeight, ChainID, SignatureSet, ViewNumber};
+        // SAFETY: test-only direct tree access, no replica runs on this store.
+        let mut bt = unsafe { BlockTreeSingleton::new_unsafe(RocksKVStore::new(db.db_arc())) };
+        let justify = match parent {
+            None => PhaseCertificate::genesis_pc(),
+            Some(parent) => PhaseCertificate {
+                chain_id: ChainID::new(0),
+                view: ViewNumber::new(hotstuff + 1),
+                block: parent,
+                phase: Phase::Generic,
+                signatures: SignatureSet::new(0),
+            },
+        };
+        let mut data_hash = [0u8; 32];
+        data_hash[..8].copy_from_slice(&hotstuff.to_be_bytes());
+        data_hash[8..16].copy_from_slice(&(data.vec().len() as u64).to_be_bytes());
+        if let Some(d) = data.vec().first() {
+            data_hash[16..].copy_from_slice(&TorusApp::hash_datum(d.bytes())[..16]);
+        }
+        if let Some(p) = parent {
+            data_hash[24..].copy_from_slice(&p.bytes()[..8]);
+        }
+        let block = hotstuff_rs::types::block::Block::new(
+            BlockHeight::new(hotstuff),
+            justify,
+            CryptoHash::new(data_hash),
+            data,
+        );
+        bt.insert(&block, None, None).unwrap();
+        block.hash
+    }
+
+    /// Commit `block` (and its uncommitted ancestors) in the tree in `db`.
+    fn tree_commit(db: &StateDb, block: &CryptoHash) {
+        use hotstuff_rs::block_tree::accessors::internal::{
+            BlockTreeSingleton, BlockTreeWriteBatch,
+        };
+        // SAFETY: test-only direct tree access, no replica runs on this store.
+        let mut bt = unsafe { BlockTreeSingleton::new_unsafe(RocksKVStore::new(db.db_arc())) };
+        let mut wb = BlockTreeWriteBatch::new_unsafe();
+        bt.commit(&mut wb, block).unwrap();
+        bt.write(wb);
+    }
+
+    /// The compact (`compact`) or full datum of `block` as tree block data.
+    fn tree_data(block: &TorusBlock, compact: bool) -> Data {
+        Data::new(vec![Datum::new(encode_proposal_datum(block, compact))])
+    }
+
+    /// Every `reason` label of `torus_da_gc_held_passes`.
+    const DA_GC_HOLD_LABELS: [&str; 9] = [
+        "gap",
+        "backfilling",
+        "unrecorded",
+        "pre_cursor",
+        "pruned_gap",
+        "dispatch_behind",
+        "tip_unreadable",
+        "tail_unreadable",
+        "store_error",
+    ];
+
+    /// `torus_da_gc_held_passes{reason}`.
+    fn held_passes(metrics: &torus_telemetry::Metrics, reason: &str) -> u64 {
+        metrics
+            .da_gc_held_passes
+            .get_or_create(&vec![("reason".into(), reason.into())])
+            .get()
+    }
+
+    /// `torus_da_gc_held_passes` summed over every reason.
+    fn held_total(metrics: &torus_telemetry::Metrics) -> u64 {
+        DA_GC_HOLD_LABELS
+            .iter()
+            .map(|r| held_passes(metrics, r))
+            .sum()
+    }
+
+    /// `make_block` at a high `height` without its recursion (its parent
+    /// link is not load-bearing here: `link_blocks` sets the ones that are).
+    fn high_block(height: u64, actions: Vec<SignedNativeAction>) -> TorusBlock {
+        let mut block = make_block(1, actions);
+        block.header.height = height;
+        block.header.timestamp = 1000 + height;
+        block
+    }
+
+    /// The tree in `db` serves Torus `height` (hotstuff `height - 1`).
+    fn tree_serves(db: &StateDb, height: u64) -> bool {
+        use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
+        BlockTreeCamera::new(RocksKVStore::new(db.db_arc()))
+            .snapshot()
+            .block_at_height(hotstuff_rs::types::data_types::BlockHeight::new(height - 1))
+            .unwrap()
+            .is_some()
+    }
+
+    /// The tree in `db` still holds the block `hash` (committed or not).
+    fn tree_serves_block(db: &StateDb, hash: &CryptoHash) -> bool {
+        use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
+        BlockTreeCamera::new(RocksKVStore::new(db.db_arc()))
+            .snapshot()
+            .block(hash)
+            .unwrap()
+            .is_some()
+    }
+
+    /// Codex P1 (pre-merge review, app.rs dispatch GC; port of its repro
+    /// `/tmp/rh4-review-1068`): a crash after dispatch made height 1227's
+    /// header and body durable but before its GC record. 1227 re-includes x,
+    /// first committed (and recorded) at 100. Boot replay applies 1227 and its
+    /// re-delivery is skipped, so no pass ever records it live; the next pass
+    /// (1228, window 1128, tree pruned below 228) ages row 100 out while the
+    /// tree still serves 1227: x must stay.
+    ///
+    /// `recorded_through` is the GC bookkeeping at the crash: every height
+    /// through 1226 (the real case: 1227 is back-filled from the tree), or
+    /// only 100 (Codex's repro: the tree lacks 228..=1226, the gap cannot be
+    /// filled, the pass deletes nothing and counts a held pass).
+    #[test]
+    fn da_gc_crash_before_the_gc_record_keeps_a_reincluded_body() {
+        for recorded_through in [1226u64, 100] {
+            da_gc_crash_before_the_gc_record(recorded_through);
+        }
+    }
+
+    fn da_gc_crash_before_the_gc_record(recorded_through: u64) {
+        const W: u64 = 1128;
+        let what = format!("recorded through {recorded_through}");
+        let (config, state_db) = make_test_config_and_db();
+        let consensus = StateDb::open_consensus(&scratch_db_dir("torus-da-gc-crash")).unwrap();
+        let store = torus_state::NativeDaStore::new(consensus.clone());
+        let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
+            state_db.clone(),
+            store.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        store.put(&x).unwrap();
+        let limits = crate::da_gc::DA_GC_LIMITS;
+        store.gc_committed(100, &[hx], 0, W, 0, limits).unwrap();
+        for h in 101..=recorded_through {
+            store.gc_committed(h, &[], 0, W, 0, limits).unwrap();
+        }
+        // The tree (window 1000) pruned below 228 and holds 1227.
+        set_tree_frontier(&consensus, 228);
+        let mut blocks = vec![high_block(1226, vec![]), high_block(1227, vec![x.clone()])];
+        link_blocks(&mut blocks);
+        tree_commit_chain(&consensus, &blocks[1..]);
+        // 1226 applied; dispatch of 1227 made its rows durable, then the crash.
+        persist_committed_block_durably(&state_db, &blocks[0]);
+        write_native_applied_height(&state_db, 1226);
+        let durable = persist_committed_block_durably(&state_db, &blocks[1]);
+        assert!(durable.body, "{what}");
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1227),
+            "{what}: boot replay"
+        );
+        assert!(!app.is_exec_failed(), "{what}");
+        app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+            retention: W,
+            block_tree_db: consensus.clone(),
+        }));
+        // The at-least-once feed re-delivers 1227 (skipped), then 1228 commits.
+        let next = {
+            let mut next = high_block(1228, vec![]);
+            next.header.parent_hash =
+                alloy_primitives::keccak256(blocks[1].header.canonical_header_bytes());
+            next
+        };
+        for block in [&blocks[1], &next] {
+            let committed = committed_compact_block(block);
+            app.on_committed_block(&committed, committed.hash);
+        }
+        assert!(!app.is_exec_failed(), "{what}");
+        assert_eq!(app.exec_next_height, Some(1229), "{what}: 1228 dispatched");
+        assert!(tree_serves(&consensus, 1227), "{what}");
+        assert!(
+            store.contains(&hx.0).unwrap(),
+            "{what}: the tree serves 1227, its re-included body must stay"
+        );
+        if recorded_through == 100 {
+            assert_eq!(
+                (held_passes(&metrics, "gap"), held_total(&metrics)),
+                (1, 1),
+                "{what}: the unfillable gap is counted"
+            );
+        } else {
+            assert_eq!(held_total(&metrics), 0, "{what}: 1227 back-filled from the tree");
+        }
+    }
+
+    /// The dispatch GC finds its bookkeeping behind (heights 251..=260 never
+    /// recorded) and the block tree missing those heights: the pass deletes
+    /// nothing, although row 100 is due, and counts a held pass. Once the
+    /// tree holds them the next pass back-fills and the deletion resumes.
+    #[test]
+    fn da_gc_unfillable_gap_holds_deletion_and_resumes_once_filled() {
+        const W: u64 = 155;
+        let (config, state_db) = make_test_config_and_db();
+        let (app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, Some(W));
+        // keep_from 113: row 100 may go once its window ends (100 + 155 = 255).
+        set_tree_frontier(&state_db, 240);
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        app.gc_da_bodies_after_dispatch(100, std::slice::from_ref(&x), &[hx], true);
+        for h in 101..=250 {
+            app.gc_da_bodies_after_dispatch(h, &[], &[], true);
+        }
+        assert!(da_has(&mempool, &x), "inside the window at 250");
+        // 251..=260: dispatched before a crash, never recorded, not in the tree.
+        app.gc_da_bodies_after_dispatch(261, &[], &[], true);
+        assert!(
+            da_has(&mempool, &x),
+            "row 100 is due, but the bookkeeping is behind"
+        );
+        assert_eq!((held_passes(&metrics, "gap"), held_total(&metrics)), (1, 1));
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
+        let mut gap: Vec<TorusBlock> = (251..=261).map(|h| high_block(h, vec![])).collect();
+        link_blocks(&mut gap);
+        tree_commit_chain(&state_db, &gap);
+        app.gc_da_bodies_after_dispatch(262, &[], &[], true);
+        assert!(!da_has(&mempool, &x), "back-filled 251..=261, row 100 went");
+        assert_eq!(held_total(&metrics), 1);
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 1);
+    }
+
+    /// The DA store over a fresh consensus DB plus a mempool on it, with
+    /// `x`'s body stored and recorded at `row`, then every height through
+    /// `recorded_through` recorded empty (window `W`, no tree bound).
+    fn da_gc_store_with_row(
+        state_db: &StateDb,
+        prefix: &str,
+        x: &SignedNativeAction,
+        row: u64,
+        recorded_through: u64,
+        window: u64,
+    ) -> (
+        StateDb,
+        torus_state::NativeDaStore,
+        Arc<torus_mempool::Mempool>,
+    ) {
+        let consensus = StateDb::open_consensus(&scratch_db_dir(prefix)).unwrap();
+        let store = torus_state::NativeDaStore::new(consensus.clone());
+        let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
+            state_db.clone(),
+            store.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let hx = torus_types::compute_action_hash(x);
+        store.put(x).unwrap();
+        let limits = crate::da_gc::DA_GC_LIMITS;
+        for h in row..=recorded_through {
+            let hashes = if h == row { vec![hx] } else { vec![] };
+            store
+                .gc_committed(h, &hashes, 0, window, 0, limits)
+                .unwrap();
+        }
+        (consensus, store, mempool)
+    }
+
+    /// Codex P1 (round 2, da_gc.rs:200): every block-tree read converts the
+    /// Torus height to the tree's hotstuff height (Torus h = hotstuff h - 1),
+    /// at both edges: Torus 1 is hotstuff 0, Torus 0 (the genesis header)
+    /// has no block and no actions, one past the tip has no block. The prune
+    /// pointer, the `keep_from` bound and the committed tip convert the same
+    /// way.
+    #[test]
+    fn da_gc_tree_reads_convert_torus_heights_to_hotstuff_heights() {
+        use torus_state::DaGcHistory;
+        let (_config, db) = make_test_config_and_db();
+        let mut blocks: Vec<TorusBlock> = (1..=3u64)
+            .map(|h| high_block(h, vec![sign_claim_rewards(h)]))
+            .collect();
+        link_blocks(&mut blocks);
+        tree_commit_chain(&db, &blocks);
+        for (i, block) in blocks.iter().enumerate() {
+            let h = i as u64 + 1;
+            let (hashes, actions) = crate::da_gc::committed_native_actions_in_tree(&db, h)
+                .unwrap()
+                .expect("committed");
+            assert_eq!(
+                hashes,
+                vec![torus_types::compute_action_hash(&block.native_actions[0])],
+                "Torus {h}"
+            );
+            assert!(actions.is_none(), "Torus {h}: compact datum");
+        }
+        let (hashes, actions) = crate::da_gc::committed_native_actions_in_tree(&db, 0)
+            .unwrap()
+            .expect("the genesis header is committed");
+        assert!(
+            hashes.is_empty() && actions.is_none(),
+            "genesis: no actions"
+        );
+        assert!(crate::da_gc::committed_native_actions_in_tree(&db, 4)
+            .unwrap()
+            .is_none());
+        let noop = |_: u64, _: &[torus_types::B256], _: Option<&[SignedNativeAction]>| {};
+        let history = crate::da_gc::BlockTreeHistory::new(&db, &noop);
+        assert_eq!(
+            history.committed_through().unwrap(),
+            Some(3),
+            "tip: Torus 3"
+        );
+        assert_eq!(history.pruned_below().unwrap(), 0, "never pruned");
+        set_tree_frontier(&db, 227);
+        assert_eq!(history.pruned_below().unwrap(), 228, "serves Torus 228 on");
+        let gc = crate::da_gc::DaBodyGc {
+            retention: 1128,
+            block_tree_db: db.clone(),
+        };
+        assert_eq!(gc.keep_from().unwrap(), 101, "h goes once h + 128 <= 228");
+    }
+
+    /// Codex P1 (round 2, da_gc.rs:200; port of `/tmp/rh4-height-proof`):
+    /// round 1's crash (1227's rows durable, its GC record lost) in the
+    /// production mapping: the tree holds Torus 1227 (re-includes x, first
+    /// recorded at 99) at hotstuff 1226 and the next block 1228 at 1227. The
+    /// back-fill of 1227 must read hotstuff 1226, not 1227 (the empty 1228):
+    /// row 99 is due at 1228 while the tree still serves 1227.
+    #[test]
+    fn da_gc_backfill_reads_the_tree_block_of_the_torus_height() {
+        const W: u64 = 1128;
+        let (config, state_db) = make_test_config_and_db();
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        let (consensus, store, mempool) =
+            da_gc_store_with_row(&state_db, "torus-da-gc-height", &x, 99, 1226, W);
+        set_tree_frontier(&consensus, 227);
+        let mut blocks = vec![
+            high_block(1226, vec![]),
+            high_block(1227, vec![x.clone()]),
+            high_block(1228, vec![]),
+        ];
+        link_blocks(&mut blocks);
+        tree_commit_chain(&consensus, &blocks[1..]);
+        persist_committed_block_durably(&state_db, &blocks[0]);
+        write_native_applied_height(&state_db, 1226);
+        assert!(persist_committed_block_durably(&state_db, &blocks[1]).body);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        assert_eq!(
+            read_native_applied_height(&state_db),
+            Some(1227),
+            "boot replay"
+        );
+        app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+            retention: W,
+            block_tree_db: consensus.clone(),
+        }));
+        // The feed re-delivers 1227 (skipped), then 1228.
+        for block in &blocks[1..] {
+            let committed = committed_compact_block(block);
+            app.on_committed_block(&committed, committed.hash);
+        }
+        assert!(!app.is_exec_failed());
+        assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
+        assert!(tree_serves(&consensus, 1227));
+        assert!(
+            store.contains(&hx.0).unwrap(),
+            "the tree serves 1227, its re-included body must stay"
+        );
+        assert_eq!(held_total(&metrics), 0, "1227 back-filled");
+    }
+
+    /// Codex P1 (round 2, native_da.rs:723; port of `committed_ahead` in
+    /// `/tmp/rh4-production-proof`): 1228 and 1229 are committed together
+    /// (a multi-block commit, boot reconciliation), 1229 re-includes x
+    /// (row 100, due at 1228). The pass of 1228 runs before 1229's callback,
+    /// so nothing may go while dispatch is behind the committed tip: 1229
+    /// then reconstructs from the DA store and pins x itself.
+    #[test]
+    fn da_gc_holds_deletion_until_dispatch_reaches_the_committed_tip() {
+        const W: u64 = 1128;
+        let (config, state_db) = make_test_config_and_db();
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        let (consensus, store, mempool) =
+            da_gc_store_with_row(&state_db, "torus-da-gc-ahead", &x, 100, 1227, W);
+        let mut blocks = vec![
+            high_block(1227, vec![]),
+            high_block(1228, vec![]),
+            high_block(1229, vec![x.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        persist_committed_block_durably(&state_db, &blocks[0]);
+        write_native_applied_height(&state_db, 1227);
+        tree_commit_chain(&consensus, &blocks[1..]);
+        set_tree_frontier(&consensus, 228);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+            retention: W,
+            block_tree_db: consensus.clone(),
+        }));
+        let committed = committed_compact_block(&blocks[1]);
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
+        assert!(
+            store.contains(&hx.0).unwrap(),
+            "committed 1229 is not dispatched yet and needs x"
+        );
+        let committed = committed_compact_block(&blocks[2]);
+        app.on_committed_block(&committed, committed.hash);
+        assert!(!app.is_exec_failed());
+        assert_eq!(
+            app.exec_next_height,
+            Some(1230),
+            "1229 reconstructed from the DA store"
+        );
+        assert!(store.contains(&hx.0).unwrap(), "pinned by 1229");
+        // P3 (claude-review r4): the hold is counted, by its reason.
+        assert_eq!(
+            (held_passes(&metrics, "dispatch_behind"), held_total(&metrics)),
+            (1, 1),
+            "dispatch behind the committed tip is a counted hold"
+        );
+    }
+
+    /// Codex P1 (round 2, app.rs state-body write; port of
+    /// `failed_state_body_write` in `/tmp/rh4-production-proof`): dispatch
+    /// cannot make 1228's body durable (the state DB rejects writes; the
+    /// consensus DB stays writable). 1228 re-includes x (row 99, due at 1228).
+    /// Its record must not be "no actions": the cursor stays at 1228 and
+    /// nothing goes; the next pass back-fills 1228 from the tree, pin
+    /// included.
+    #[test]
+    fn da_gc_failed_body_write_leaves_the_cursor_behind() {
+        use hotstuff_rs::hotstuff::types::PhaseCertificate;
+        use hotstuff_rs::types::data_types::BlockHeight;
+        const W: u64 = 1128;
+        let (config, scratch) = make_test_config_and_db();
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        let (consensus, store, _) =
+            da_gc_store_with_row(&scratch, "torus-da-gc-ro", &x, 99, 1227, W);
+        let mut blocks = vec![high_block(1227, vec![]), high_block(1228, vec![x.clone()])];
+        link_blocks(&mut blocks);
+        let state_dir = scratch_db_dir("torus-da-gc-ro-state");
+        {
+            let state = StateDb::open(&state_dir).unwrap();
+            persist_committed_block_durably(&state, &blocks[0]);
+            write_native_applied_height(&state, 1227);
+        }
+        tree_commit_chain(&consensus, &blocks[1..]);
+        set_tree_frontier(&consensus, 227);
+        let state_db = StateDb::open_read_only(&state_dir).unwrap();
+        assert!(
+            !persist_committed_block_durably(&state_db, &blocks[1]).body,
+            "the state DB rejects the body write"
+        );
+        let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
+            state_db.clone(),
+            store.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+            retention: W,
+            block_tree_db: consensus.clone(),
+        }));
+        // A full datum (a proposal this node validated): the body is in hand.
+        let datum = encode_proposal_datum(&blocks[1], false);
+        let committed = hotstuff_rs::types::block::Block::new(
+            BlockHeight::new(1227),
+            PhaseCertificate::genesis_pc(),
+            CryptoHash::new(TorusApp::hash_datum(&datum)),
+            Data::new(vec![Datum::new(datum)]),
+        );
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
+        assert!(tree_serves(&consensus, 1228));
+        assert!(
+            store.contains(&hx.0).unwrap(),
+            "1228's record is unknown (its body write failed): nothing goes"
+        );
+        assert_eq!(
+            (held_passes(&metrics, "unrecorded"), held_total(&metrics)),
+            (1, 1),
+            "the held pass is counted, by its reason"
+        );
+        // The next pass back-fills 1228 from the tree: x moves to row 1228.
+        app.gc_da_bodies_after_dispatch(1229, &[], &[], true);
+        assert!(store.contains(&hx.0).unwrap(), "pinned by 1228");
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
+        assert_eq!(held_total(&metrics), 1);
+    }
+
+    /// The tree's uncommitted tail, as the GC reads it: every block above
+    /// the highest committed one, on every branch, full or compact datum;
+    /// committed blocks are not in it. A tail block whose datum does not
+    /// decode is an error (the pass then holds). With nothing committed the
+    /// tail starts at genesis.
+    #[test]
+    fn da_gc_tree_tail_reads_every_branch_above_the_committed_tip() {
+        use std::collections::HashSet;
+        use torus_state::DaGcHistory;
+        let (_config, db) = make_test_config_and_db();
+        let noop = |_: u64, _: &[torus_types::B256], _: Option<&[SignedNativeAction]>| {};
+        let history = crate::da_gc::BlockTreeHistory::new(&db, &noop);
+        assert!(history.uncommitted_hashes().unwrap().is_empty(), "empty tree");
+        let [a, b, c, d, e] = [1u64, 2, 3, 4, 5].map(sign_claim_rewards);
+        let hash = torus_types::compute_action_hash;
+        let mut chain = vec![
+            high_block(1, vec![a.clone()]),
+            high_block(2, vec![b.clone()]),
+            high_block(3, vec![c.clone()]),
+            high_block(4, vec![d.clone()]),
+        ];
+        link_blocks(&mut chain);
+        // Nothing committed: the tail starts at genesis.
+        let h1 = tree_insert(&db, 0, None, tree_data(&chain[0], true));
+        let set = |v: Vec<torus_types::B256>| v.into_iter().collect::<HashSet<_>>();
+        assert_eq!(set(history.uncommitted_hashes().unwrap()), set(vec![hash(&a)]));
+        let h2 = tree_insert(&db, 1, Some(h1), tree_data(&chain[1], true));
+        tree_commit(&db, &h2);
+        assert!(history.uncommitted_hashes().unwrap().is_empty(), "1, 2 committed");
+        // Branch one: 3 (compact) <- 4 (full); branch two: 3' (empty data).
+        let h3 = tree_insert(&db, 2, Some(h2), tree_data(&chain[2], true));
+        tree_insert(&db, 3, Some(h3), tree_data(&chain[3], false));
+        let mut fork = high_block(3, vec![e.clone()]);
+        fork.header.timestamp += 1;
+        tree_insert(&db, 2, Some(h2), Data::new(vec![]));
+        let h3b = tree_insert(&db, 2, Some(h2), tree_data(&fork, true));
+        assert_eq!(
+            set(history.uncommitted_hashes().unwrap()),
+            set(vec![hash(&c), hash(&d), hash(&e)])
+        );
+        assert_eq!(history.committed_through().unwrap(), Some(2), "tip unchanged");
+        // An undecodable tail datum: unreadable, never "no actions".
+        tree_insert(&db, 3, Some(h3b), Data::new(vec![Datum::new(vec![0xff; 7])]));
+        assert!(history.uncommitted_hashes().is_err());
+    }
+
+    /// Codex r3 / claude-review r4 P2 (torus issue 282de5bb; port of
+    /// `/tmp/rh4-claude-r4`): the tree holds UNCOMMITTED Torus 1229 (compact)
+    /// above committed 1228; 1229 re-includes x, whose row (100) is due at
+    /// 1228. The 1228 pass must keep x: the tree sync-serves 1229 and it may
+    /// commit on a node with no cached proposal (after a restart, or a
+    /// same-height re-proposal overwrote the entry), which rebuilds it from
+    /// the DA store. The restart below is that node: 1229 must dispatch.
+    #[test]
+    fn da_gc_keeps_a_body_the_uncommitted_tail_reincludes() {
+        const W: u64 = 1128;
+        let (config, state_db) = make_test_config_and_db();
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        let (consensus, store, mempool) =
+            da_gc_store_with_row(&state_db, "torus-da-gc-tail", &x, 100, 1227, W);
+        let mut blocks = vec![
+            high_block(1227, vec![]),
+            high_block(1228, vec![]),
+            high_block(1229, vec![x.clone()]),
+        ];
+        link_blocks(&mut blocks);
+        persist_committed_block_durably(&state_db, &blocks[0]);
+        write_native_applied_height(&state_db, 1227);
+        let h1228 = tree_insert(&consensus, 1227, None, tree_data(&blocks[1], true));
+        tree_commit(&consensus, &h1228);
+        let h1229 = tree_insert(&consensus, 1228, Some(h1228), tree_data(&blocks[2], true));
+        set_tree_frontier(&consensus, 228);
+        let gc = || crate::da_gc::DaBodyGc {
+            retention: W,
+            block_tree_db: consensus.clone(),
+        };
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        app.set_da_body_gc(Some(gc()));
+        let committed = committed_compact_block(&blocks[1]);
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
+        assert!(tree_serves_block(&consensus, &h1229), "the tree still holds 1229");
+        assert!(
+            store.contains(&hx.0).unwrap(),
+            "uncommitted 1229 (served by block sync, may commit) needs x"
+        );
+        assert_eq!(held_total(&metrics), 0, "row 100 went, x is skipped, not held");
+        // Restart: no cached proposal. 1229 commits and must rebuild from
+        // the DA store.
+        drop(app);
+        let mempool = Arc::new(torus_mempool::Mempool::with_da_store(
+            state_db.clone(),
+            store.clone(),
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool),
+            None,
+        );
+        app.set_da_body_gc(Some(gc()));
+        tree_commit(&consensus, &h1229);
+        let committed = committed_compact_block(&blocks[2]);
+        app.on_committed_block(&committed, committed.hash);
+        assert!(!app.is_exec_failed());
+        assert!(
+            load_replay_body(&state_db, 1229).is_some(),
+            "1229 dispatched (reconstructed from the DA store)"
+        );
+        assert!(store.contains(&hx.0).unwrap(), "pinned by 1229");
+    }
+
+    /// A tail block the GC cannot decode holds the whole pass (the safe
+    /// direction), counted as `tail_unreadable`.
+    #[test]
+    fn da_gc_unreadable_tail_block_holds_the_pass() {
+        const W: u64 = 1128;
+        let (config, state_db) = make_test_config_and_db();
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        let (consensus, store, mempool) =
+            da_gc_store_with_row(&state_db, "torus-da-gc-tail-bad", &x, 100, 1227, W);
+        let mut blocks = vec![high_block(1227, vec![]), high_block(1228, vec![])];
+        link_blocks(&mut blocks);
+        persist_committed_block_durably(&state_db, &blocks[0]);
+        write_native_applied_height(&state_db, 1227);
+        let h1228 = tree_insert(&consensus, 1227, None, tree_data(&blocks[1], true));
+        tree_commit(&consensus, &h1228);
+        tree_insert(
+            &consensus,
+            1228,
+            Some(h1228),
+            Data::new(vec![Datum::new(vec![0xff; 7])]),
+        );
+        set_tree_frontier(&consensus, 228);
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool),
+            None,
+        );
+        app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+            retention: W,
+            block_tree_db: consensus.clone(),
+        }));
+        let committed = committed_compact_block(&blocks[1]);
+        app.on_committed_block(&committed, committed.hash);
+        assert_eq!(app.exec_next_height, Some(1229), "1228 dispatched");
+        assert!(store.contains(&hx.0).unwrap(), "an unreadable tail holds");
+        assert_eq!(
+            (held_passes(&metrics, "tail_unreadable"), held_total(&metrics)),
+            (1, 1)
+        );
+        assert_eq!(metrics.da_bodies_gc_deleted.get(), 0);
     }
 }

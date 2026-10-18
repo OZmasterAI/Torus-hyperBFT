@@ -349,6 +349,30 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    3.68 ms per native block; the sort has no timer and sits in the untimed residual, 5.40 -> 0.42 ms. Verify + sort per
    1k orders placed -51% (0.4864 [0.4816, 0.4913]); ~9.1 -> ~4.4 ms at 100 x 239 orders vs the microbench's 13.1 ->
    ~5.2. Owner / 18c: merge.
+8h. **RH4 GC cost at full load** (owner s131; right after 8g; ~1 h 15). Q9 (section 88) ran paced below capacity, so
+   it could not show a GC cost at saturation. RH4 is merged: main `687eac9e` (retention off by default; the GC runs
+   only with `--retention-blocks`). One binary built from `687eac9e` (code defaults, nothing set; 512 KB from `env.sh`;
+   custody 0). Arms: A = no retention; B = `TORUS_RETENTION_BLOCKS=1000` in the arm's `EXTRA_ENV` (`--extra-env`;
+   run-cell clears plain `TORUS_*` env). Standard unpaced load, 300 markets, 15 min cells (margin lasts ~21 min), warm-up
+   then A B B A (n = 2). The GC starts after `max(N, 1000) + 128` blocks (~1.5 min at ~13 blocks/s), so report the
+   window after the first GC pass. Judge by the exec-path merge rule above: native blocks/s, block p50 / p99 and
+   timeouts per 1,000 blocks must not get worse in B; also matched/s, CPU-s per 1M, `torus_da_gc_seconds` (mean, p99,
+   per block), `torus_da_gc_held_passes` by reason (expect ~0 outside start-up), bodies deleted, SST / data-dir
+   growth per arm. Not covered: the GC's tail decode with EVM txs (each pass decodes the 2-3 uncommitted tail blocks;
+   the standard load is native only).
+8i. **Deep-book follow-up to 8f** (owner s131; after 8h; ~1 h 30-2 h, estimate; a pre-testnet check). Section 93's
+   M cell changed two things at once (1M accounts and 1M resting orders), and restarts ran only after the load. Same
+   node binary as 8f (main `76204a69`, md5 `7f91438d`) so the cells line up with section 93; tools `c2336e70` or
+   main if it has the pre-load by then; section 93's hand-written driver (`ozarchy-8f-b/campaign.sh`, per-cell genesis,
+   swap stop rule). Standard load, 300 markets, 600 s, n = 1 per cell. (1) **Depth sweep:** the 1M-account genesis
+   with `PRELOAD=` 0 / 250k / 500k / 1M: matched/s, native blocks/s, block p50 / p99, timeouts, exec ms per block,
+   `save_books` ms per block and per 1k fills, fills per native block, resting depth during the load, RSS. Question:
+   does the 8f slowdown follow the resting depth (orders) or is it there at 0 pre-load (accounts)? (2) **Profile:**
+   during the 1M cell, a `perf` profile of the exec thread as section 92 did, split `save_books` into its parts (book
+   row encode, level hashing, DB writes, other). (3) **Crash-kill at 1M:** one more 1M cell with `CRASH_KILL_AT_S`
+   (SIGKILL val1 mid-load, restart): kill -> first commit, replayed blocks, catch-up time, AGREE and one digest, and
+   matched/s around the kill. If the depth curve is unclear at n = 1 (e.g. 0 and 1M within the S-cell spread), report
+   it and 18c decides on replicates.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
