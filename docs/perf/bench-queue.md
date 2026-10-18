@@ -222,6 +222,16 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    native blk/s 26.50 vs 26.55, block p50 / p99 8.4 / 479 vs 8.6 / 479 ms, order-to-commit p50 / p99 159 / 582 vs
    157 / 580 ms, CPU-s per 1M 44.1 vs 43.9, 0 timeouts. fds max 234-240 vs 183-189, 0 deleted-open. One cell per
    arm, at a paced load below capacity: no CI, and it cannot show a GC throughput cost at saturation.**
+8c. **Q8 short re-check: checkpoint and save-books rows with F on** (owner s128; after 8b; ~45 min plus setup;
+   profile only, no A/B). Triggered by the rule below the queue ("If Q1 ... becomes a default"): F
+   (`TORUS_EPOCH_FAST_PATH`) is on by default since main `3429855d`. Binary built from main `b4cdbfc1` or later (the
+   new defaults: PC 8, F on, re-send 250 ms, all unset; 512 KB push threshold from `env.sh`; custody 0). Standard
+   load, 300 markets, Classic, 15 s checkpoints, oracle on; the Q8 recipe (`perf_event_paranoid=1` for this run
+   only), 2-3 cells of 600 s. Report against section 81 only the rows that F and the new defaults can move:
+   checkpoint upkeep (`exec_checkpoint_upkeep_seconds`, `flush_worker_checkpoint_seconds`, the `pipeline_barrier`
+   wait per 15 s window, which section 81 put at ~1 s in 3 of 4 cells), `save_order_books`, `flush_all`, exec
+   off-CPU share and hotstuff-algo blocked on the exec channel; plus exec ms per native block and per 1k fills. Say
+   whether Phase 5's remaining scope (steps 3 and 7) still targets the biggest rows.
 10. **Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
