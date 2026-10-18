@@ -14,7 +14,7 @@ use hotstuff_rs::events::{
     ReceivePhaseVoteEvent, ReceiveProposalEvent, ReceiveProposalHeaderEvent, StartViewEvent,
     UpdateHighestPCEvent, ViewTimeoutEvent,
 };
-use hotstuff_rs::replica::{Configuration, Replica, ReplicaSpec};
+use hotstuff_rs::replica::{Configuration, ReplicaSpec};
 use hotstuff_rs::types::data_types::{BufferSize, ChainID, EpochLength};
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -639,20 +639,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let genesis = load_genesis(genesis_path)?;
         let config = genesis.chain_config();
 
-        // Only initialize if DB is empty (first run)
-        let existing_accounts = state_db.all_accounts()?;
-        if existing_accounts.is_empty() {
-            info!(genesis = %genesis_path.display(), "initializing from genesis");
-            let state_root = genesis.initialize(&state_db)?;
-            info!(%state_root, "genesis state seeded");
-
-            // Initialize hotstuff_rs replica
-            let (app_state, vs_state) = genesis.to_hotstuff_genesis()?;
-            Replica::initialize(dbs.kv_store(), app_state, vs_state);
-            info!("consensus replica initialized with genesis validator set");
-        } else {
-            info!("database already initialized, skipping genesis");
-        }
+        // Only initialize on first run (see `node_dbs::genesis_applied`).
+        info!(genesis = %genesis_path.display(), "genesis file");
+        node_dbs::apply_genesis_if_fresh(&dbs, &genesis)?;
 
         config
     } else {
