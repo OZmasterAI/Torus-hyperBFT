@@ -921,6 +921,32 @@ impl Users {
         self.dirty.len()
     }
 
+    /// Phase 5 step 2 (tests): what [`Self::drain_dirty`] would emit now,
+    /// without draining.
+    #[cfg(test)]
+    pub(crate) fn dirty_preview(&self) -> DirtyRows {
+        let d = &self.dirty;
+        let mut pos: Vec<Vec<u8>> = d
+            .positions
+            .iter()
+            .map(|(t, m)| position_key(t, *m).to_vec())
+            .chain(d.raw[POSITIONS].iter().cloned())
+            .collect();
+        pos.sort_unstable();
+        let mut bal: Vec<Vec<u8>> = d
+            .balances
+            .iter()
+            .map(|t| t.to_vec())
+            .chain(d.volumes.iter().map(|t| cum_volume_key(t).to_vec()))
+            .chain(d.raw[BALANCES].iter().cloned())
+            .collect();
+        bal.sort_unstable();
+        DirtyRows {
+            positions: self.rows_at(POSITIONS, pos),
+            balances: self.rows_at(BALANCES, bal),
+        }
+    }
+
     /// Phase 5 step 1: every dirty key's row as the record set holds it now
     /// (a regular trader's encoded from its record, an opaque trader's and a
     /// row under no trader as bytes; absent: a tombstone), per CF in key

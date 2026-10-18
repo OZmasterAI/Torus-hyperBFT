@@ -4441,6 +4441,16 @@ pub struct ResidentBooks {
     /// ops introspection).
     rows_builds: u64,
     rows_shared_fallbacks: u64,
+    /// Item 6 Phase 5 step 2: rows the in-place record set's drains
+    /// serialized into the blocks' change sets, summed over the blocks this
+    /// holder ended (test / ops introspection).
+    in_place_rows: u64,
+    /// Item 6 Phase 5 step 2 (tests): the record sets this holder builds
+    /// take no writes in place; the Phase 4 path (every write of the two CFs
+    /// on the overlay, `Users::apply` at `end_resident`) is the reference of
+    /// the differential. Never set on the node path (no runtime switch, D16).
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    reference_writes: bool,
 }
 
 /// Item 6 step 2: one block's `end_resident` running on a worker thread.
@@ -4935,6 +4945,32 @@ impl ResidentBooks {
         self.rows_shared_fallbacks
     }
 
+    /// Item 6 Phase 5 step 2: rows the in-place drains serialized so far
+    /// (0 on the reference path).
+    pub fn in_place_rows(&self) -> u64 {
+        self.in_place_rows
+    }
+
+    /// Item 6 Phase 5 step 2: whether the slot's record set takes the
+    /// block's writes in place (`None`: no slot). Waits for an
+    /// `end_resident` worker.
+    pub fn users_in_place(&mut self) -> Option<bool> {
+        self.settle_rows();
+        self.rows.as_ref().map(|_| false)
+    }
+
+    /// Item 6 Phase 5 step 2 (tests): build every later record set on the
+    /// Phase 4 reference path (`true`) or in place (`false`, the node).
+    /// Drops the slot so the next block builds one in the new mode.
+    #[cfg(any(test, feature = "test-reference-paths"))]
+    pub fn set_reference_writes(&mut self, on: bool) {
+        self.settle_rows();
+        if self.reference_writes != on {
+            self.rows = None;
+        }
+        self.reference_writes = on;
+    }
+
     /// Item 6 C7 / Phase 4 step 1: whether the slot's record set equals a
     /// cold decode of its R and re-encodes to exactly R's positions and
     /// balances rows (`None`: no slot). Test / ops introspection. Phase 4
@@ -5170,6 +5206,16 @@ pub struct ResidentBlock {
     worker_hook: Option<WorkerHook>,
 }
 
+/// Item 6 Phase 5 step 2 (tests): a block's record set as it holds the two
+/// CFs now, and what its drain would emit now ([`ResidentBlock::test_users`]).
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestUsers {
+    pub(crate) positions: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) balances: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    pub(crate) dirty: users::DirtyRows,
+}
+
 /// Item 6 cut 5: values a block no longer needs, never read again, dropped
 /// with its `end_resident` work ([`ResidentBlock::drop_later`]).
 #[derive(Default)]
@@ -5197,6 +5243,25 @@ impl ResidentBlock {
     /// failed — reads go to the DB, today's path).
     pub fn attached(&self) -> bool {
         self.attached
+    }
+
+    /// Item 6 Phase 5 step 2: the block's record set takes its writes in
+    /// place (false: R not attached, or the reference path).
+    pub fn in_place(&self) -> bool {
+        false
+    }
+
+    /// Item 6 Phase 5 step 2 (tests): the record set's rows of positions and
+    /// balances as it holds them now, and its dirty keys (`None`: R not
+    /// attached).
+    #[cfg(test)]
+    pub(crate) fn test_users(&self) -> Option<TestUsers> {
+        let u = self.users.as_deref()?;
+        Some(TestUsers {
+            positions: u.encode_rows(torus_state::cf::CF_NATIVE_POSITIONS),
+            balances: u.encode_rows(torus_state::cf::CF_NATIVE_BALANCES),
+            dirty: u.dirty_preview(),
+        })
     }
 
     /// R was built for this block (cold start or staleness guard trip).

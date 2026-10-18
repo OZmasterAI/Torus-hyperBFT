@@ -1855,8 +1855,8 @@ struct WriterStats {
 /// close), `apply_fill` (opens, closes, flips), position / balance / `cvlm`
 /// puts and position deletes; now and then a raw block of irregular rows
 /// over the P1 traders (who never trade), and the odd trader's lenient row.
-fn p5_direct_writes(
-    ctx: &NativeExecContext<Shadow>,
+fn p5_direct_writes<T: StateBackend>(
+    ctx: &NativeExecContext<T>,
     rng: &mut Lcg,
     h: u64,
     call: u64,
@@ -2045,7 +2045,7 @@ fn p5_direct_writes(
 
 /// One call's actions: crossing and resting limits around the mid, cancel-
 /// alls, a modify of a resting order, transfers EVM <-> perp.
-fn p5_actions(ctx: &NativeExecContext<Shadow>, rng: &mut Lcg) -> Vec<(Address, NativeAction)> {
+fn p5_actions<T: StateBackend>(ctx: &NativeExecContext<T>, rng: &mut Lcg) -> Vec<(Address, NativeAction)> {
     (0..6 + rng.below(10))
         .map(|_| {
             let t = p5_trader(rng.below(P5_TRADERS));
@@ -2731,4 +2731,469 @@ fn ubench_dirty_set_btree_vs_hash_sort() {
         btree,
         hash
     );
+}
+
+// ======================================================================
+// Item 6 Phase 5 step 2 (`docs/plans/item6-phase5-impl.md` Task 2.1): the
+// hot writers mutate `Users` in place, and the block's rows of the two CFs
+// come from its dirty sets. The reference is the Phase 4 path on the same
+// input: a holder with `set_reference_writes(true)` (every write of the two
+// CFs on the overlay, `Users::apply` at `end_resident`).
+// ======================================================================
+
+/// One node of the bridge-level in-place differential: its DB, holder and
+/// what one block hands the next.
+struct P5Node2 {
+    _dir: tempfile::TempDir,
+    db: StateDb,
+    holder: ResidentBooks,
+    parent: Option<Arc<FrozenPending>>,
+    books: HashMap<MarketId, torus_core::order_book::OrderBook>,
+    next_id: u128,
+}
+
+/// One block of a [`P5Node2`]: `f`'s output, the frozen set, the record set
+/// at the block start and before the freeze ([`ResidentBlock::test_users`]),
+/// and the rows of both CFs read through the block's overlay before and
+/// after `f`.
+struct P5Run<R> {
+    out: R,
+    frozen: Arc<FrozenPending>,
+    start: super::super::TestUsers,
+    end: super::super::TestUsers,
+    before: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+    after: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+impl P5Node2 {
+    /// An empty DB set up by `fixture`, the holder on the reference path or
+    /// in place.
+    fn with(reference: bool, fixture: impl FnOnce(&StateDb)) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        fixture(&db);
+        let mut holder = ResidentBooks::default();
+        holder.set_reference_writes(reference);
+        Self {
+            _dir: dir,
+            db,
+            holder,
+            parent: None,
+            books: HashMap::default(),
+            next_id: 1,
+        }
+    }
+
+    /// `dirty_rows_equal_overlay_rows_every_block`'s fixture (seeded by
+    /// `seed`).
+    fn new(seed: u64, reference: bool) -> Self {
+        Self::with(reference, |db| {
+            let mut rng = Lcg(seed * 0x2545_F491);
+            for m in 1..=P5_MARKETS {
+                let row = borsh::to_vec(&(
+                    "BTC".to_string(),
+                    "USDC".to_string(),
+                    p5_fp(1).raw(),
+                    p5_fp(1).raw(),
+                    p5_fp(5).raw(),
+                ))
+                .unwrap();
+                db.put_cf_raw(torus_state::cf::CF_NATIVE_MARKETS, &m.to_be_bytes(), &row)
+                    .unwrap();
+            }
+            let pm = PositionManager::new(db.clone());
+            for i in 0..P5_TRADERS {
+                let t = p5_trader(i);
+                pm.put_native_balance(
+                    &t,
+                    &NativeBalance {
+                        available: p5_fp(500_000),
+                        order_margin: FixedPoint::ZERO,
+                    },
+                )
+                .unwrap();
+                let evm = revm::state::AccountInfo {
+                    balance: U256::from(10u128.pow(36)),
+                    ..Default::default()
+                };
+                db.put_account(&t, &evm).unwrap();
+            }
+            for _ in 0..4 {
+                let o = NativeStateOverlay::new(db.clone());
+                random_block(&o, &mut rng);
+                random_balance_block(&o, &mut rng);
+                o.flush(&db).unwrap();
+            }
+        })
+    }
+
+    /// Block `h` through the node's lifecycle (R attached, the block's
+    /// overlay over the previous block's frozen set, flushed one block
+    /// later), `f` on its context. After `end_resident`, the slot's records
+    /// must equal a cold read of the block's post-state.
+    fn run_block<R>(&mut self, h: u64, f: impl FnOnce(&mut NativeExecContext<NativeStateOverlay>) -> R) -> P5Run<R> {
+        let tag = format!("block {h}");
+        let mut overlay = NativeStateOverlay::with_parent(self.db.clone(), self.parent.clone());
+        let mut rb = begin_resident(Some(&mut self.holder), &mut overlay, h, None);
+        assert!(rb.attached(), "{tag}: R attached");
+        let start = rb.test_users().expect("R attached");
+        let mut ctx = NativeExecContext::new(
+            overlay.clone(),
+            h,
+            10_000 + 7 * h,
+            0,
+            1_000,
+            10,
+            Address::ZERO,
+            Address::ZERO,
+            Address::ZERO,
+        );
+        ctx.order_books = std::mem::take(&mut self.books);
+        ctx.next_global_order_id = self.next_id;
+        ctx.attach_resident_block(&mut rb);
+        let read = |ctx: &NativeExecContext<NativeStateOverlay>| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+            [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES]
+                .iter()
+                .map(|cf| StateBackend::iterate_cf(&ctx.state, cf, None).unwrap())
+                .collect()
+        };
+        let before = read(&ctx);
+        let out = f(&mut ctx);
+        let after = read(&ctx);
+        assert!(ctx.fatal_error.is_none(), "{tag}: {:?}", ctx.fatal_error);
+        self.books = std::mem::take(&mut ctx.order_books);
+        self.next_id = ctx.next_global_order_id;
+        ctx.detach_resident_block(&mut rb);
+        drop(ctx);
+        let end = rb.test_users().expect("R attached");
+        overlay
+            .put_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT, &h.to_be_bytes())
+            .unwrap();
+        let delta = overlay.own_pending_delta();
+        let frozen = overlay.freeze(h);
+        end_resident(&mut self.holder, rb, &mut overlay, delta, true, None);
+        if let Some(p) = self.parent.take() {
+            p.flush_with_native_trie_stats(&self.db, None, None, None).expect("flush");
+        }
+        self.parent = Some(frozen.clone());
+        let cold = NativeStateOverlay::with_parent(self.db.clone(), self.parent.clone());
+        for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+            let want = StateBackend::iterate_cf(&cold, cf, None).unwrap();
+            let got = self.holder.rows().expect("slot").dump(cf).expect("source attached");
+            assert!(got == want, "{tag}: {cf}: the slot's rows != a cold read of the post-state");
+        }
+        assert_eq!(self.holder.trader_positions_match_rows(), Some(true), "{tag}: records self-consistent");
+        P5Run { out, frozen, start, end, before, after }
+    }
+
+    /// Block `h` with every writer of the two CFs on its context (the
+    /// writers and actions of `dirty_rows_equal_overlay_rows_every_block`).
+    /// Returns the frozen set, the results and whether the record set
+    /// changed in place before the freeze (rows or dirty keys).
+    fn block(&mut self, h: u64, rng: &mut Lcg, ws: &mut WriterStats) -> (Arc<FrozenPending>, String, bool) {
+        let run = self.run_block(h, |ctx| {
+            let mut results = Vec::new();
+            for call in 0..P5_CALLS {
+                p5_direct_writes(ctx, rng, h, call, ws);
+                let actions = p5_actions(ctx, rng);
+                let r = match (h + call) % 3 {
+                    0 => NativeExecutor::execute_batch_engine_mode(ctx, &actions, 4),
+                    1 => NativeExecutor::execute_batch_settle_mode(ctx, &actions, false),
+                    _ => NativeExecutor::execute_batch_settle_mode(ctx, &actions, true),
+                };
+                ws.batch_ok += r.results.iter().filter(|x| x.success).count();
+                results.extend(r.results.iter().map(|x| (x.success, x.error.clone())));
+                for (t, a) in p5_actions(ctx, rng).into_iter().take(2) {
+                    let r = NativeExecutor::execute(ctx, &t, &a);
+                    ws.single_ok += usize::from(r.success);
+                    results.push((r.success, r.error.clone()));
+                }
+                assert!(ctx.fatal_error.is_none(), "block {h} call {call}: {:?}", ctx.fatal_error);
+            }
+            format!("{results:?}")
+        });
+        let changed = run.end != run.start;
+        (run.frozen, run.out, changed)
+    }
+}
+
+/// Plan Task 2.1: two nodes, each on its own DB, run the same seeded blocks
+/// (`dirty_rows_equal_overlay_rows_every_block`'s writers: the batch's cache
+/// flushes, order-margin writes, `cvlm`, single actions, cancel-alls,
+/// modifies, EVM <-> perp transfers, lockbox, liquidation, ADL, `apply_fill`,
+/// raw puts / deletes, irregular rows), one on the Phase 4 reference path
+/// and one in place. After every block the two frozen sets are equal in
+/// every CF (byte for byte, tombstones included) and so are the results;
+/// each slot's records equal a cold read of the post-state. The in-place
+/// record set changed during every block (it takes the writes) and its
+/// drains emitted rows; the reference record set never changed inside a
+/// block and drained nothing.
+#[test]
+fn in_place_blocks_equal_reference_every_block() {
+    let mut ws = WriterStats::default();
+    let (mut rows, mut changed_blocks) = (0usize, 0u64);
+    for seed in 1..=3u64 {
+        let mut reference = P5Node2::new(seed, true);
+        let mut in_place = P5Node2::new(seed, false);
+        let mut rng = Lcg(seed);
+        for h in 1..=P5_BLOCKS {
+            let tag = format!("seed {seed} block {h}");
+            let (mut ra, mut rb) = (Lcg(rng.0), Lcg(rng.0));
+            let (fa, res_a, changed_a) = reference.block(h, &mut ra, &mut WriterStats::default());
+            let (fb, res_b, changed_b) = in_place.block(h, &mut rb, &mut ws);
+            assert_eq!(ra.0, rb.0, "{tag}: the same draws (same state seen)");
+            rng = ra;
+            assert_eq!(res_a, res_b, "{tag}: results");
+            for cf in ALL_CF_NAMES {
+                assert!(fa.rows(cf) == fb.rows(cf), "{tag}: {cf}: in-place change set != reference");
+            }
+            assert!(!changed_a, "{tag}: the reference record set changed inside the block");
+            changed_blocks += u64::from(changed_b);
+            rows += fb.rows(CF_NATIVE_POSITIONS).len() + fb.rows(CF_NATIVE_BALANCES).len();
+        }
+        assert_eq!(reference.holder.users_in_place(), Some(false), "seed {seed}: reference path");
+        assert_eq!(in_place.holder.users_in_place(), Some(true), "seed {seed}: in place");
+        assert_eq!(reference.holder.in_place_rows(), 0, "seed {seed}: the reference drains nothing");
+        assert!(in_place.holder.in_place_rows() > 1_000, "seed {seed}: drained {}", in_place.holder.in_place_rows());
+        assert_eq!(in_place.holder.rows_builds(), 1, "seed {seed}: R built once");
+    }
+    println!("P5 T2.1 in place: writers {ws:?}; rows {rows}; blocks changed in place {changed_blocks}");
+    assert_eq!(changed_blocks, 3 * P5_BLOCKS, "every block changed the record set in place");
+    assert!(rows > 4_000, "non-vacuous: {rows}");
+    assert!(ws.batch_ok > 500 && ws.single_ok > 50 && ws.credit > 10 && ws.adl_closes > 5, "{ws:?}");
+}
+
+/// `rejected_action_leaves_users_untouched`'s markets: market 1 tick / lot
+/// 2 (from its row), markets 3 and 4 without a row (tick / lot 1).
+fn rj_market_row(tick: i128, lot: i128) -> Vec<u8> {
+    borsh::to_vec(&("BTC".to_string(), "USD".to_string(), lot, tick, 5 * FixedPoint::SCALE)).unwrap()
+}
+
+fn rj_addr(n: u8) -> Address {
+    Address::new([n; 20])
+}
+
+fn rj_limit(m: MarketId, is_buy: bool, price: FixedPoint, qty: i64, tif: TimeInForce) -> PlaceOrderParams {
+    PlaceOrderParams {
+        market_id: m,
+        is_buy,
+        price,
+        quantity: p5_fp(qty),
+        order_type: OrderType::Limit,
+        time_in_force: tif,
+        reduce_only: false,
+        client_order_id: None,
+    }
+}
+
+fn rj_gtc(m: MarketId, is_buy: bool, price: i64, qty: i64) -> PlaceOrderParams {
+    rj_limit(m, is_buy, p5_fp(price), qty, TimeInForce::GTC)
+}
+
+/// `None` = the single-action path, `Some(t)` = `execute_batch_engine_mode`
+/// with `t` threads (0: serial Phase 2 and sequential settle).
+type RjMode = Option<usize>;
+
+fn rj_exec(
+    ctx: &mut NativeExecContext<NativeStateOverlay>,
+    mode: RjMode,
+    actions: &[(Address, NativeAction)],
+) -> Vec<super::super::NativeActionResult> {
+    match mode {
+        None => actions.iter().map(|(s, a)| NativeExecutor::execute(ctx, s, a)).collect(),
+        Some(t) => NativeExecutor::execute_batch_engine_mode(ctx, actions, t).results,
+    }
+}
+
+/// Plan Task 2.1 (and section 2 row 11's audit):
+/// `rejected_action_leaves_users_untouched`. Every rejection reason an
+/// action can get without a local fault (`Fill` needs one: a fail-stop),
+/// on the single-action path and the batch engine (serial and sharded
+/// Phase 2, sequential and parallel settle): tick, lot, price (limit,
+/// overflow), margin, other (unknown cancel / modify), IOC / ALO / market /
+/// reduce-only / FOK / trigger book rejects, the price band, a duplicate
+/// cloid, the open-order limit, modify rejects, refused transfers, and the
+/// single path's empty batch. Each runs alone in its own block on two
+/// nodes (reference path, in place) after a setup block: the rows of both
+/// CFs read through the block's overlay are unchanged, the in-place record
+/// set holds the same rows as at the block start, any key it marked dirty
+/// keeps its row (a no-op rewrite, e.g. a reservation released by the
+/// settle), and the two nodes' frozen sets are equal in every CF. A last
+/// block with a filling order (the control) changes the in-place record
+/// set inside the block.
+#[test]
+fn rejected_action_leaves_users_untouched() {
+    use torus_state::action_status::FailureReason as R;
+    let (a, poor, mm, t4, t5, many) = (rj_addr(1), rj_addr(2), rj_addr(3), rj_addr(4), rj_addr(5), rj_addr(6));
+    let fixture = |db: &StateDb| {
+        db.put_cf_raw(
+            torus_state::cf::CF_NATIVE_MARKETS,
+            &1u64.to_be_bytes(),
+            &rj_market_row(2 * FixedPoint::SCALE, 2 * FixedPoint::SCALE),
+        )
+        .unwrap();
+        // Market 3's last aggregated price: its band (default +-50%).
+        let agg = [
+            p5_fp(105).raw().to_be_bytes().as_slice(),
+            &7u64.to_be_bytes(),
+            &3u32.to_be_bytes(),
+            &10_000u64.to_be_bytes(),
+        ]
+        .concat();
+        db.put_cf_raw(torus_state::cf::CF_NATIVE_ORACLE, &[b"agg".as_slice(), &3u64.to_be_bytes()].concat(), &agg)
+            .unwrap();
+        let pm = PositionManager::new(db.clone());
+        for (t, v) in [(a, 1_000_000), (poor, 1), (mm, 1_000_000), (t4, 1_000_000), (t5, 1_000_000), (many, 1_000_000)] {
+            pm.put_native_balance(&t, &NativeBalance { available: p5_fp(v), order_margin: FixedPoint::ZERO })
+                .unwrap();
+        }
+        db.put_account(&a, &revm::state::AccountInfo { balance: U256::from(10u128.pow(30)), ..Default::default() })
+            .unwrap();
+    };
+    let cloid = |c: u128, p: PlaceOrderParams| PlaceOrderParams { client_order_id: Some(c), ..p };
+    let place = |s: Address, p: PlaceOrderParams| (s, NativeAction::PlaceOrder(p));
+    let huge = FixedPoint::from_raw((i128::MAX / (2 * FixedPoint::SCALE)) * (2 * FixedPoint::SCALE));
+    let mut audit: BTreeMap<String, usize> = BTreeMap::new();
+    let mut cases_run = 0usize;
+    for mode in [None, Some(0), Some(2), Some(4)] {
+        let mut nodes = [P5Node2::with(true, fixture), P5Node2::with(false, fixture)];
+        // Setup (single path): a trade at 105 in market 3, its book bid 100
+        // x 2 / ask 110 x 2, a's resting order in market 1 (id_rest) and its
+        // cloid-7 order in market 3, poor's order in market 1 that uses its
+        // whole balance (id_poor), and `many` at the open-order limit.
+        let mut ids = (0u128, 0u128);
+        for node in nodes.iter_mut() {
+            let run = node.run_block(1, |ctx| {
+                let mut ok = Vec::new();
+                for action in [
+                    place(t4, rj_gtc(3, false, 105, 1)),
+                    place(t5, rj_gtc(3, true, 105, 1)),
+                    place(mm, rj_gtc(3, true, 100, 2)),
+                    place(mm, rj_gtc(3, false, 110, 2)),
+                ] {
+                    ok.push(rj_exec(ctx, None, &[action])[0].success);
+                }
+                let id_rest = ctx.next_global_order_id;
+                ok.push(rj_exec(ctx, None, &[place(a, rj_gtc(1, true, 50, 2))])[0].success);
+                ok.push(rj_exec(ctx, None, &[place(a, cloid(7, rj_gtc(3, true, 60, 1)))])[0].success);
+                let id_poor = ctx.next_global_order_id;
+                ok.push(rj_exec(ctx, None, &[place(poor, rj_gtc(1, true, 10, 2))])[0].success);
+                let fill: Vec<_> = (0..torus_core::position::OPEN_ORDER_BASE_LIMIT as i64)
+                    .map(|k| place(many, rj_gtc(4, true, 1 + k, 1)))
+                    .collect();
+                for chunk in fill.chunks(250) {
+                    ok.extend(rj_exec(ctx, Some(0), chunk).iter().map(|r| r.success));
+                }
+                (ok, (id_rest, id_poor))
+            });
+            assert!(run.out.0.iter().all(|x| *x), "{mode:?}: setup");
+            ids = run.out.1;
+        }
+        let (id_rest, id_poor) = ids;
+        let modify = |s: Address, order_id: u128, price: Option<i64>, qty: Option<i64>| {
+            (s, NativeAction::ModifyOrder { order_id, new_price: price.map(p5_fp), new_qty: qty.map(p5_fp) })
+        };
+        let mut cases: Vec<(&str, (Address, NativeAction), Option<R>)> = vec![
+            ("tick", place(a, rj_gtc(1, true, 61, 2)), Some(R::Tick)),
+            ("lot", place(a, rj_gtc(1, true, 60, 1)), Some(R::Lot)),
+            ("price", place(a, rj_gtc(1, true, 0, 2)), Some(R::Price)),
+            ("price_overflow", place(a, rj_limit(1, true, huge, 2, TimeInForce::GTC)), Some(R::Price)),
+            ("margin", place(poor, rj_gtc(1, true, 100, 1000)), Some(R::Margin)),
+            ("cancel_unknown", (a, NativeAction::CancelOrder { order_id: 999_999 }), Some(R::Other)),
+            ("ioc", place(a, rj_limit(3, true, p5_fp(105), 1, TimeInForce::IOC)), Some(R::IocCancel)),
+            ("alo", place(a, rj_limit(3, true, p5_fp(110), 1, TimeInForce::PostOnly)), Some(R::BadAloPx)),
+            (
+                "market_no_liquidity",
+                place(
+                    a,
+                    PlaceOrderParams {
+                        order_type: OrderType::Market,
+                        ..rj_limit(3, true, p5_fp(106), 1, TimeInForce::IOC)
+                    },
+                ),
+                Some(R::MarketNoLiquidity),
+            ),
+            ("reduce_only", place(a, PlaceOrderParams { reduce_only: true, ..rj_gtc(3, false, 100, 1) }), Some(R::ReduceOnly)),
+            ("fok", place(a, rj_limit(3, true, p5_fp(110), 5, TimeInForce::FOK)), Some(R::FokCancel)),
+            (
+                "trigger",
+                place(
+                    a,
+                    PlaceOrderParams { order_type: OrderType::StopMarket { trigger: p5_fp(104) }, ..rj_gtc(3, true, 200, 1) },
+                ),
+                Some(R::BadTriggerPx),
+            ),
+            ("price_band", place(a, rj_gtc(3, true, 200, 1)), Some(R::PriceBand)),
+            ("duplicate_cloid", place(a, cloid(7, rj_gtc(3, true, 61, 1))), Some(R::DuplicateCloid)),
+            ("open_limit", place(many, rj_gtc(4, true, 1, 1)), Some(R::OpenLimit)),
+            ("modify_tick", modify(a, id_rest, Some(51), None), Some(R::Tick)),
+            ("modify_lot", modify(a, id_rest, None, Some(1)), Some(R::Lot)),
+            ("modify_unknown", modify(a, 999_999, Some(52), None), Some(R::Other)),
+            ("modify_margin", modify(poor, id_poor, None, Some(2000)), Some(R::Margin)),
+            (
+                "transfer_to_spot",
+                (poor, NativeAction::TransferToSpot { amount: U256::from(10u128.pow(30)) }),
+                None,
+            ),
+            (
+                "transfer_to_perp",
+                (poor, NativeAction::TransferToPerp { amount: U256::from(10u128.pow(30)) }),
+                None,
+            ),
+        ];
+        if mode.is_none() {
+            cases.push(("empty_batch", (a, NativeAction::PlaceOrderBatch(vec![])), Some(R::BatchCap)));
+        }
+        let mut h = 2;
+        for (name, action, reason) in cases {
+            let tag = format!("{mode:?} {name}");
+            let [r0, r1] = nodes.each_mut().map(|node| node.run_block(h, |ctx| rj_exec(ctx, mode, std::slice::from_ref(&action))));
+            assert_eq!(format!("{:?}", r0.out), format!("{:?}", r1.out), "{tag}: results");
+            let res = &r1.out[0];
+            assert!(!res.success, "{tag}: must be rejected: {res:?}");
+            if let Some(reason) = reason {
+                assert_eq!(res.reason, reason, "{tag}: {res:?}");
+            }
+            for (i, run) in [&r0, &r1].into_iter().enumerate() {
+                assert!(run.before == run.after, "{tag} node {i}: the rows read through the overlay changed");
+                assert_eq!(
+                    (&run.end.positions, &run.end.balances),
+                    (&run.start.positions, &run.start.balances),
+                    "{tag} node {i}: the record set's rows changed"
+                );
+                for (cf, rows, held) in [
+                    ("positions", &run.end.dirty.positions, &run.start.positions),
+                    ("balances", &run.end.dirty.balances, &run.start.balances),
+                ] {
+                    for (k, v) in rows {
+                        assert_eq!(v.as_ref(), held.get(k), "{tag} node {i}: dirty {cf} key changed its row");
+                    }
+                }
+            }
+            assert!(r0.end.dirty.positions.is_empty() && r0.end.dirty.balances.is_empty(), "{tag}: reference dirty");
+            let rewrites = r1.end.dirty.positions.len() + r1.end.dirty.balances.len();
+            if rewrites > 0 {
+                *audit.entry(format!("{name} {mode:?}")).or_default() += rewrites;
+            }
+            for cf in ALL_CF_NAMES {
+                assert!(r0.frozen.rows(cf) == r1.frozen.rows(cf), "{tag}: {cf}: change sets differ");
+            }
+            cases_run += 1;
+            h += 1;
+        }
+        // The control: a filling IOC changes the in-place record set inside
+        // the block (and nothing in the reference's).
+        let [r0, r1] = nodes.each_mut().map(|node| {
+            node.run_block(h, |ctx| rj_exec(ctx, mode, &[place(a, rj_limit(3, true, p5_fp(110), 1, TimeInForce::IOC))]))
+        });
+        assert!(r1.out[0].success && r0.out[0].success, "{mode:?}: control fills");
+        assert!(r0.end == r0.start, "{mode:?}: the reference record set changed inside the block");
+        assert!(r1.end.balances != r1.start.balances, "{mode:?}: the in-place record set took the fill");
+        assert!(!r1.end.dirty.balances.is_empty(), "{mode:?}: the fill's rows are dirty");
+        for cf in ALL_CF_NAMES {
+            assert!(r0.frozen.rows(cf) == r1.frozen.rows(cf), "{mode:?} control: {cf}: change sets differ");
+        }
+    }
+    println!("P5 T2.1 rejects: {cases_run} cases; no-op rewrites of the in-place record set (row 11 audit): {audit:?}");
+    assert!(cases_run >= 4 * 21, "{cases_run}");
 }

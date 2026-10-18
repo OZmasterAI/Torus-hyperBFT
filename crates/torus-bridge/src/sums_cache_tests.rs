@@ -434,6 +434,10 @@ fn run_mode(seed: u64, cached: bool, calm: bool, worker: bool, stats: &mut Stats
     if cached {
         assert_eq!(holder.rows_builds(), 1, "R built once");
         assert_eq!(holder.rows_shared_fallbacks(), 0);
+        // Phase 5 step 2 (plan Task 2.1, P1 on the in-place record): the
+        // slot's record set took the blocks' writes in place.
+        assert_eq!(holder.users_in_place(), Some(true), "the node path is in place");
+        assert!(holder.in_place_rows() > 0, "the in-place drains emitted rows");
     }
     out
 }
