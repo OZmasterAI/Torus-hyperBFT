@@ -4337,6 +4337,66 @@ mod tests {
         assert!(store.get_raw_batch(&[]).unwrap().is_empty());
     }
 
+    /// RH4: what a lagging peer's `/torus/native-da/1.0` pull (and shard pull)
+    /// gets from a node running the DA body GC: every committed body still
+    /// inside the window is served, whole and as shards; a body past it is
+    /// not, and the GC's own rows are never served as a body.
+    #[test]
+    fn serve_native_da_within_the_gc_window() {
+        use torus_state::db::StateDb;
+        use torus_state::erasure::ErasureParams;
+        use torus_state::{DaGcLimits, NativeDaStore};
+        use torus_types::{
+            compute_action_hash, ActionSignature, NativeAction, Signature, SignedNativeAction,
+        };
+        let limits = DaGcLimits {
+            max_rows: 8,
+            max_deletes: 1 << 16,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = NativeDaStore::new(StateDb::open(dir.path()).expect("open db"));
+        let params = ErasureParams::new(2, 3);
+        let actions: Vec<SignedNativeAction> = (1..=6)
+            .map(|nonce| SignedNativeAction {
+                action: NativeAction::ClaimRewards,
+                nonce,
+                signature: ActionSignature::Eip712(Signature {
+                    v: 27,
+                    r: [0u8; 32],
+                    s: [0u8; 32],
+                }),
+            })
+            .collect();
+        store.put_batch(&actions).unwrap();
+        store.put_shards_batch(&actions, params).unwrap();
+        let hashes: Vec<[u8; 32]> = actions.iter().map(|a| compute_action_hash(a).0).collect();
+        // Heights 1..=6, one action each, window 3: at tip 6 heights 1..=3 aged out.
+        for (i, hash) in hashes.iter().enumerate() {
+            store
+                .gc_committed(
+                    i as u64 + 1,
+                    &[(*hash).into()],
+                    params.n as u16,
+                    3,
+                    u64::MAX,
+                    limits,
+                )
+                .unwrap();
+        }
+        let served = serve_native_da_bodies(Some(&store), &hashes);
+        for (i, body) in served.iter().enumerate() {
+            let height = i + 1;
+            assert_eq!(body.is_empty(), height <= 3, "body committed at {height}");
+            let shard = serve_native_da_shard(Some(&store), &hashes[i], 0);
+            assert_eq!(shard.present, height > 3, "shard 0 committed at {height}");
+        }
+        // The GC row keys (15/16 bytes) can never be requested as 32-byte hashes,
+        // so every served slot decodes as a body.
+        for body in served.iter().filter(|b| !b.is_empty()) {
+            assert!(bincode::deserialize::<SignedNativeAction>(body).is_ok());
+        }
+    }
+
     /// T7: a custodied shard is served `present=true` and the shipped
     /// bytes+proof+root verify standalone (verify-then-reconstruct at the fetcher).
     #[test]

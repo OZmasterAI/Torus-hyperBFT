@@ -1307,6 +1307,113 @@ class CrashKillGuardTest(unittest.TestCase):
         self.assertIn("start-node.sh", crash, "crash-kill.sh must use it")
 
 
+# ------------------------------- start-node.sh: optional history retention (Q9)
+class StartNodeRetentionTest(unittest.TestCase):
+    """devnet/wsl/start-node.sh passes `--retention-blocks=N` only when
+    TORUS_RETENTION_BLOCKS is set. Unset or empty = archive, the argv of every
+    earlier cell, byte for byte. The flag goes last, so crash-kill.sh's
+    `--data-dir=` match (and with it the restart) still accepts the node."""
+
+    START_NODE_SH = os.path.join(
+        os.path.dirname(os.path.dirname(HERE)), "devnet", "wsl", "start-node.sh"
+    )
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="start-node-test-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        self.argv_file = os.path.join(self.d, "argv")
+        self.bin = os.path.join(self.d, "torus-node")
+        with open(self.bin, "w") as f:
+            f.write('#!/bin/bash\nprintf "%s\\0" "$@" > "$FAKE_ARGV"\n')
+        os.chmod(self.bin, 0o755)
+
+    def start(self, retention=None):
+        """Run `start_node 1` under `set -u` with a fake binary; return
+        (completed process, argv the binary got or None)."""
+        if os.path.exists(self.argv_file):
+            os.remove(self.argv_file)
+        env = dict(
+            os.environ,
+            FAKE_ARGV=self.argv_file,
+            BIN=self.bin,
+            GENESIS=os.path.join(self.d, "genesis.json"),
+            DATA_ROOT=self.d,
+            RUN_DIR=os.path.join(self.d, "run"),
+            KEY1="02" + "00" * 31,
+            P2P1="30402",
+            RPC1="8646",
+            MET1="9162",
+            PEER_TO_V0="/ip4/127.0.0.1/udp/30401/quic-v1/p2p/PID0",
+            PEER_TO_V1="/ip4/127.0.0.1/udp/30402/quic-v1/p2p/PID1",
+        )
+        env.pop("TORUS_RETENTION_BLOCKS", None)
+        if retention is not None:
+            env["TORUS_RETENTION_BLOCKS"] = retention
+        r = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'set -u; source "$1"; start_node 1 || exit 7; wait "$STARTED_PID"',
+                "_",
+                self.START_NODE_SH,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        argv = None
+        if os.path.exists(self.argv_file):
+            with open(self.argv_file) as f:
+                argv = f.read().split("\0")[:-1]
+        return r, argv
+
+    def test_unset_or_empty_is_archive(self):
+        r, argv = self.start()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--data-dir=%s/data/val1" % self.d, argv)
+        self.assertFalse([a for a in argv if a.startswith("--retention-blocks")], argv)
+        r, empty = self.start("")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(empty, argv)
+
+    def test_set_appends_the_flag_last(self):
+        _, archive = self.start()
+        r, argv = self.start("5000")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(argv, archive + ["--retention-blocks=5000"])
+        # crash-kill.sh still accepts the node for the restart.
+        pids = os.path.join(self.d, "pids")
+        with open(pids, "w") as f:
+            f.write("1001\n")
+        cmdline = " ".join([self.bin] + argv)
+        g = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; shift; crash_target_ok "$@"',
+                "_",
+                CRASH_KILL_SH,
+                "1",
+                "1001",
+                cmdline,
+                self.d,
+                pids,
+            ],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, CRASH_KILL_LIB="1"),
+            timeout=30,
+        )
+        self.assertEqual(g.returncode, 0, g.stderr)
+
+    def test_non_numeric_refuses_to_start(self):
+        r, argv = self.start("12k")
+        self.assertEqual(r.returncode, 7)
+        self.assertIn("not a block count", r.stderr)
+        self.assertIsNone(argv, "the node must not start")
+
+
 # --------------------------------------------- run-cell.sh: which tools score
 class ToolsDirResolutionTest(unittest.TestCase):
     """A candidate is scored by ITS OWN summarize.py. run-cell.sh lives in the

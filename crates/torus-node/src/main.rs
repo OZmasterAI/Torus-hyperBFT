@@ -953,6 +953,46 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "block-tree pruner enabled (cf_consensus_meta)"
         );
     }
+    // RH4 durable DA body GC: committed bodies (and their shards) stay as long
+    // as block sync can still hand their block to a lagging peer: a body goes
+    // once its window (block-tree window + 128, or TORUS_DA_BODY_RETENTION;
+    // 0 = off) has passed AND the block tree's durable prune pointer is 128
+    // past it. Archive (no --retention-blocks): no GC. The pointer is read
+    // from the consensus DB, where the DA store writes too (one WAL). See
+    // torus_consensus::da_gc.
+    let tree_retention = hotstuff_rs::block_tree::block_tree_retention();
+    let da_retention_env = std::env::var("TORUS_DA_BODY_RETENTION").ok();
+    let da_retention = torus_consensus::da_gc::resolve_da_body_retention(
+        da_retention_env.as_deref(),
+        tree_retention,
+    );
+    app.set_da_body_gc(
+        da_retention.map(|retention| torus_consensus::da_gc::DaBodyGc {
+            retention,
+            block_tree_db: dbs.consensus.clone(),
+        }),
+    );
+    match (da_retention, tree_retention) {
+        (None, None) => info!(
+            env = ?da_retention_env,
+            "DA body GC off: archive node (no --retention-blocks), every committed body is kept"
+        ),
+        (None, Some(_)) => {
+            info!("DA body GC off (TORUS_DA_BODY_RETENTION=0): every committed body is kept")
+        }
+        (Some(window), Some(tree)) if window <= tree => info!(
+            window,
+            block_tree_retention = tree,
+            "DA body GC on: TORUS_DA_BODY_RETENTION is below the block-tree window, so bodies \
+             still stay until the block tree has pruned their block (+128)"
+        ),
+        (Some(window), tree) => info!(
+            window,
+            block_tree_retention = ?tree,
+            "DA body GC on: committed bodies deleted {window} dispatched blocks after commit, \
+             once the block tree pruned their block (+128)"
+        ),
+    }
 
     // S470: commit-lag backoff cap — genesis-sourced, env-overridable for
     // devnets (TORUS_COMMIT_LAG_BACKOFF_CAP). Fleet-uniform: see
