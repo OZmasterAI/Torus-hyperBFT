@@ -635,14 +635,19 @@ fn log_async_validate_resolution(enabled: bool) {
 mod shard_custody_toggle_tests {
     use super::parse_shard_custody_toggle;
 
+    /// Owner decision s128 (bench section 82: custody costs -21.6% matched/s,
+    /// ~140 ms per follower validate): custody is OFF by default until T3.1.
+    /// Only `"1"` (after trim) enables it; unset or anything else disables.
     #[test]
-    fn default_is_on_and_only_zero_disables() {
-        assert!(parse_shard_custody_toggle(None));
+    fn default_is_off_and_only_one_enables() {
+        assert!(!parse_shard_custody_toggle(None));
         assert!(parse_shard_custody_toggle(Some("1".into())));
-        assert!(parse_shard_custody_toggle(Some("true".into())));
-        assert!(parse_shard_custody_toggle(Some("".into())));
+        assert!(parse_shard_custody_toggle(Some(" 1 ".into())));
         assert!(!parse_shard_custody_toggle(Some("0".into())));
         assert!(!parse_shard_custody_toggle(Some(" 0 ".into())));
+        assert!(!parse_shard_custody_toggle(Some("".into())));
+        assert!(!parse_shard_custody_toggle(Some("true".into())));
+        assert!(!parse_shard_custody_toggle(Some("yes".into())));
     }
 }
 
