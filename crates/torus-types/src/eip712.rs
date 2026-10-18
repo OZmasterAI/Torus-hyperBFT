@@ -196,7 +196,7 @@ fn encode_string(s: &str) -> [u8; 32] {
 /// The EIP-712 domain separator of this process's network
 /// ([`network_chain_id`]; devnet 7778 unless set).
 pub fn eip712_domain_separator() -> B256 {
-    eip712_domain_separator_for_chain(network_chain_id())
+    domain_separator_cached(&NETWORK_DOMAIN_SEPARATOR, network_chain_id())
 }
 
 /// The domain separator of `chain_id`, from `cache` when it holds that chain
@@ -204,9 +204,18 @@ pub fn eip712_domain_separator() -> B256 {
 /// process, so the live cache is filled once; a different `chain_id` is never
 /// served the cached value.
 fn domain_separator_cached(cache: &std::sync::OnceLock<(u64, B256)>, chain_id: u64) -> B256 {
-    let _ = (cache, chain_id);
-    todo!("RED")
+    let &(cached_chain, separator) =
+        cache.get_or_init(|| (chain_id, eip712_domain_separator_for_chain(chain_id)));
+    if cached_chain == chain_id {
+        separator
+    } else {
+        eip712_domain_separator_for_chain(chain_id)
+    }
 }
+
+/// The process-wide cache of [`eip712_domain_separator`] (section 92 step 8e:
+/// it was recomputed on every verify pass, 0.03-0.22 ms per block).
+static NETWORK_DOMAIN_SEPARATOR: std::sync::OnceLock<(u64, B256)> = std::sync::OnceLock::new();
 
 /// Compute the EIP-712 domain separator for Torus on `chain_id`.
 ///
@@ -1016,7 +1025,13 @@ impl SignedNativeAction {
     where
         F: FnOnce(&[u8; 32]) -> Option<crate::SessionData>,
     {
-        let domain = eip712_domain_separator_for_chain(chain_id);
+        // The cached separator only for the network chain once it is set
+        // (`get` has no init side effect); any other chain is computed.
+        let domain = if NETWORK_CHAIN_ID.get() == Some(&chain_id) {
+            eip712_domain_separator()
+        } else {
+            eip712_domain_separator_for_chain(chain_id)
+        };
         match &self.signature {
             ActionSignature::Eip712(sig) => {
                 let struct_hash = eip712_struct_hash(&self.action, self.nonce);
@@ -1194,6 +1209,12 @@ fn recover_senders_phase1(
     mode: VerifyMode,
     dedicated: Option<&rayon::ThreadPool>,
 ) -> Vec<Option<Address>> {
+    // No EIP-712 miss: every entry would be its hit (or `None` for a session
+    // action), so skip the pool dispatch (section 92 step 8e: 1.9-2.2 ms of
+    // pool wait per all-hit block).
+    if !phase1_has_miss(actions, cache_hits) {
+        return cache_hits.to_vec();
+    }
     // Per-action recovery: a trust-cache HIT is reused verbatim (skips the
     // secp256k1 recover); an EIP-712 miss recovers; a session action is left
     // `None` here and resolved in the sequential Phase 2. Captures nothing, so
@@ -1364,8 +1385,37 @@ pub fn batch_verify_native_actions_cached_with_sort_hashes(
     session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
     verified_lookup: impl Fn(&alloy_primitives::B256) -> Option<Address>,
 ) -> (Vec<Option<Address>>, Vec<B256>) {
-    let _ = (actions, timestamp, session_lookup, verified_lookup);
-    todo!("RED")
+    let mode = verify_mode();
+    let pool = if matches!(mode, VerifyMode::Pool(_)) {
+        live_verify_pool()
+    } else {
+        None
+    };
+    batch_verify_impl_keyed(
+        actions,
+        timestamp,
+        session_lookup,
+        verified_lookup,
+        mode,
+        pool,
+        exec_parallel_keys(),
+        true,
+    )
+}
+
+/// One action's `(sort hash if wanted, trust-cache key)`. Without
+/// `want_sort_hash` this is exactly today's `verified_cache_key_with_scratch`.
+fn action_keys(
+    action: &SignedNativeAction,
+    scratch: &mut Vec<u8>,
+    want_sort_hash: bool,
+) -> (Option<B256>, Option<B256>) {
+    if want_sort_hash {
+        let (sort, key) = crate::sort_hash_and_verified_cache_key_with_scratch(action, scratch);
+        (Some(sort), key)
+    } else {
+        (None, crate::verified_cache_key_with_scratch(action, scratch))
+    }
 }
 
 /// [`batch_verify_impl`] that can also return each action's sort hash
@@ -1381,17 +1431,53 @@ fn batch_verify_impl_keyed(
     parallel_keys: bool,
     want_sort_hashes: bool,
 ) -> (Vec<Option<Address>>, Vec<B256>) {
-    let _ = (
-        actions,
-        timestamp,
-        session_lookup,
-        verified_lookup,
-        mode,
-        dedicated,
-        parallel_keys,
-        want_sort_hashes,
-    );
-    todo!("RED")
+    // Pre-pass (mode-independent result): consult the trust-cache. For a
+    // locally-verified EIP-712 action a HIT yields the sender a fresh recover
+    // would produce, so the dominant ecrecover below is skipped.
+    // `verified_cache_key` returns None for session / non-EIP-712 actions, which
+    // are never short-circuited. With `want_sort_hashes` the same pass also
+    // yields each action's sort hash from the one absorb of its canonical bytes.
+    let parallel = use_parallel_keys(parallel_keys, mode, actions.len());
+    let mut sort_hashes = Vec::with_capacity(if want_sort_hashes { actions.len() } else { 0 });
+    let cache_hits: Vec<Option<Address>> = if parallel {
+        // Hash the keys order-preserving on the same pool phase 1 uses (the
+        // dedicated pool for `Pool(_)`, else the global one); one scratch buffer
+        // per rayon split. Each key is a pure function of its action, so `keys`
+        // equals what the sequential loop below computes.
+        let hash_keys = || -> Vec<(Option<B256>, Option<B256>)> {
+            use rayon::prelude::*;
+            actions
+                .par_iter()
+                .map_init(Vec::<u8>::new, |buf, action| {
+                    action_keys(action, buf, want_sort_hashes)
+                })
+                .collect()
+        };
+        let keys = match (mode, dedicated) {
+            (VerifyMode::Pool(_), Some(pool)) => pool.install(hash_keys),
+            _ => hash_keys(),
+        };
+        // Lookups stay on this thread, in input order: `verified_lookup` sees the
+        // identical key sequence (no call for a session action's `None`).
+        keys.into_iter()
+            .map(|(sort, key)| {
+                sort_hashes.extend(sort);
+                key.and_then(|k| verified_lookup(&k))
+            })
+            .collect()
+    } else {
+        let mut cache_key_scratch = Vec::new();
+        actions
+            .iter()
+            .map(|action| {
+                let (sort, key) = action_keys(action, &mut cache_key_scratch, want_sort_hashes);
+                sort_hashes.extend(sort);
+                key.and_then(|k| verified_lookup(&k))
+            })
+            .collect()
+    };
+    let senders = verify_phases(actions, timestamp, session_lookup, &cache_hits, mode, dedicated);
+    (senders, sort_hashes)
 }
 
 /// Whether phase 1 has any secp256k1 recovery to do: an EIP-712 action that
@@ -1399,8 +1485,10 @@ fn batch_verify_impl_keyed(
 /// itself (a hit is reused verbatim, a session action is `None` until phase 2),
 /// so the pool dispatch is skipped.
 fn phase1_has_miss(actions: &[SignedNativeAction], cache_hits: &[Option<Address>]) -> bool {
-    let _ = (actions, cache_hits);
-    todo!("RED")
+    actions
+        .iter()
+        .zip(cache_hits)
+        .any(|(action, hit)| hit.is_none() && matches!(action.signature, ActionSignature::Eip712(_)))
 }
 
 /// Shared body for the env-driven and mode-pinned entrypoints.
@@ -1417,52 +1505,34 @@ fn batch_verify_impl(
     dedicated: Option<&rayon::ThreadPool>,
     parallel_keys: bool,
 ) -> Vec<Option<Address>> {
-    // Pre-pass (mode-independent result): consult the trust-cache. For a
-    // locally-verified EIP-712 action a HIT yields the sender a fresh recover
-    // would produce, so the dominant ecrecover below is skipped.
-    // `verified_cache_key` returns None for session / non-EIP-712 actions, which
-    // are never short-circuited.
-    let parallel = use_parallel_keys(parallel_keys, mode, actions.len());
-    let cache_hits: Vec<Option<Address>> = if parallel {
-        // Hash the keys order-preserving on the same pool phase 1 uses (the
-        // dedicated pool for `Pool(_)`, else the global one); one scratch buffer
-        // per rayon split. Each key is a pure function of its action, so `keys`
-        // equals what the sequential loop below computes.
-        let hash_keys = || -> Vec<Option<B256>> {
-            use rayon::prelude::*;
-            actions
-                .par_iter()
-                .map_init(Vec::<u8>::new, |buf, action| {
-                    crate::verified_cache_key_with_scratch(action, buf)
-                })
-                .collect()
-        };
-        let keys = match (mode, dedicated) {
-            (VerifyMode::Pool(_), Some(pool)) => pool.install(hash_keys),
-            _ => hash_keys(),
-        };
-        // Lookups stay on this thread, in input order: `verified_lookup` sees the
-        // identical key sequence (no call for a session action's `None`).
-        keys.into_iter()
-            .map(|key| key.and_then(|k| verified_lookup(&k)))
-            .collect()
-    } else {
-        let mut cache_key_scratch = Vec::new();
-        actions
-            .iter()
-            .map(|action| {
-                crate::verified_cache_key_with_scratch(action, &mut cache_key_scratch)
-                    .and_then(|k| verified_lookup(&k))
-            })
-            .collect()
-    };
+    batch_verify_impl_keyed(
+        actions,
+        timestamp,
+        session_lookup,
+        verified_lookup,
+        mode,
+        dedicated,
+        parallel_keys,
+        false,
+    )
+    .0
+}
 
+/// Phases 1 and 2 of the verify pass, after the trust-cache pre-pass.
+fn verify_phases(
+    actions: &[SignedNativeAction],
+    timestamp: u64,
+    session_lookup: impl Fn(&[u8; 32]) -> Option<crate::SessionData>,
+    cache_hits: &[Option<Address>],
+    mode: VerifyMode,
+    dedicated: Option<&rayon::ThreadPool>,
+) -> Vec<Option<Address>> {
     // Phase 1: recover EIP-712 senders for cache MISSES only, under the chosen
     // mode. Each ecrecover is pure, independent crypto; the collect is
     // order-preserving, so the output is deterministic and identical across
     // serial / global / dedicated-pool at any thread count.
     let mut senders: Vec<Option<Address>> =
-        recover_senders_phase1(actions, &cache_hits, mode, dedicated);
+        recover_senders_phase1(actions, cache_hits, mode, dedicated);
 
     // Phase 2 (sequential): resolve session actions (needs `session_lookup`) and
     // assemble the ed25519 batch.

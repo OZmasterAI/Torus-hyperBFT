@@ -14123,12 +14123,18 @@ pub type IndexedActions = (Vec<(Address, NativeAction)>, Vec<u32>);
 pub fn sort_native_actions_indexed(
     actions: Vec<(Address, NativeAction)>,
 ) -> (IndexedActions, IndexedActions) {
+    sort_keyed(actions.into_iter().enumerate().map(|(i, (sender, action))| {
+        (action_sort_key(&sender, &action), i as u32, (sender, action))
+    }))
+}
+
+/// Split keyed entries (in input order) into the pre-EVM and post-EVM lists
+/// and sort each one deterministically.
+fn sort_keyed(entries: impl Iterator<Item = KeyedAction>) -> (IndexedActions, IndexedActions) {
     let mut pre_evm = Vec::new();
     let mut post_evm = Vec::new();
-    for (i, (sender, action)) in actions.into_iter().enumerate() {
-        let key = action_sort_key(&sender, &action);
-        let entry = (key, i as u32, (sender, action));
-        match key.0 {
+    for entry in entries {
+        match entry.0 .0 {
             ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(entry),
             _ => post_evm.push(entry),
         }
@@ -14148,8 +14154,25 @@ pub fn sort_native_actions_indexed_with_sort_hashes(
     actions: Vec<(Address, NativeAction)>,
     sort_hashes: Vec<B256>,
 ) -> (IndexedActions, IndexedActions) {
-    let _ = (actions, sort_hashes);
-    todo!("RED")
+    assert_eq!(
+        actions.len(),
+        sort_hashes.len(),
+        "one sort hash per action (caller bug: the hashes would shift)"
+    );
+    sort_keyed(
+        actions
+            .into_iter()
+            .zip(sort_hashes)
+            .enumerate()
+            .map(|(i, ((sender, action), hash))| {
+                debug_assert_eq!(
+                    hash,
+                    alloy_primitives::keccak256(action.canonical_bytes()),
+                    "sort hash of action {i} is not keccak(canonical_bytes)"
+                );
+                ((classify_action(&action), sender, hash), i as u32, (sender, action))
+            }),
+    )
 }
 
 /// Deterministic sort key for a native action.

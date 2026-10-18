@@ -1413,8 +1413,16 @@ pub fn verified_cache_key_with_scratch(
     Some(alloy_primitives::keccak256(&*data))
 }
 
-/// Both per-action exec keys from ONE absorb of the action's canonical bytes
-/// `C` (section 92 step 8e: each was a separate full keccak of `C`).
+/// Canonical length from which [`sort_hash_and_verified_cache_key_with_scratch`]
+/// shares one absorb between both keys: one Keccak-256 rate block. Below it
+/// both preimages need the same permutations either way, so two one-shot
+/// hashes are cheaper than forking a streaming hasher
+/// (`shared_absorb_crossover_ubench`).
+pub const SHARED_ABSORB_MIN_BYTES: usize = 136;
+
+/// Both per-action exec keys with the action's canonical bytes `C` encoded
+/// once and, from [`SHARED_ABSORB_MIN_BYTES`] on, absorbed once (section 92
+/// step 8e: each key was a separate encode + full keccak of `C`).
 ///
 /// Returns `(sort_hash, cache_key)`:
 /// - `sort_hash = keccak256(C)`: the content hash of the anti-MEV sort key
@@ -1426,14 +1434,34 @@ pub fn verified_cache_key_with_scratch(
 /// the common prefix of both preimages: one copy of it is finalized for the
 /// sort hash, the other absorbs the signature tail for the cache key. Both
 /// values are byte-identical to hashing each preimage separately (pinned by
-/// the frozen-encoder tests). `data` is a scratch buffer; it holds `C`
-/// afterwards.
+/// the frozen-encoder tests on both sides of the threshold). `data` is a
+/// scratch buffer; its contents afterwards are unspecified.
 pub fn sort_hash_and_verified_cache_key_with_scratch(
     action: &SignedNativeAction,
     data: &mut Vec<u8>,
 ) -> (B256, Option<B256>) {
-    let _ = (action, data);
-    todo!("RED: absorb canonical bytes once for both keys")
+    data.clear();
+    action.action.append_canonical_bytes(data);
+    let ActionSignature::Eip712(sig) = &action.signature else {
+        return (alloy_primitives::keccak256(&*data), None);
+    };
+    let mut tail = [0u8; 8 + 1 + 32 + 32];
+    tail[..8].copy_from_slice(&action.nonce.to_be_bytes());
+    tail[8] = sig.v;
+    tail[9..41].copy_from_slice(&sig.r);
+    tail[41..].copy_from_slice(&sig.s);
+    if data.len() < SHARED_ABSORB_MIN_BYTES {
+        let sort_hash = alloy_primitives::keccak256(&*data);
+        data.extend_from_slice(&tail);
+        return (sort_hash, Some(alloy_primitives::keccak256(&*data)));
+    }
+    // Fork the sponge after `C`: one copy finalizes keccak256(C), the other
+    // absorbs the tail of `verified_cache_key_with_scratch`'s preimage.
+    let mut hasher = alloy_primitives::Keccak256::new();
+    hasher.update(&*data);
+    let sort_hash = hasher.clone().finalize();
+    hasher.update(tail);
+    (sort_hash, Some(hasher.finalize()))
 }
 
 // ============================================================================

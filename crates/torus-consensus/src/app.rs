@@ -33,7 +33,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use torus_bridge::{
-    sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator, BundleState,
+    sort_native_actions_indexed_with_sort_hashes, BlockCommitter, BlockProposer, BlockValidator, BundleState,
     NativeExecContext, NativeExecutor,
 };
 use torus_economics::{EpochManager, EpochRotationPlan, PlanEvm, SlashReason, StakingManager};
@@ -3826,8 +3826,11 @@ impl ExecutionContext {
             // (which drops the action). The callback keeps the first one; the
             // block fail-stops right after the verification pass.
             let session_fault = std::cell::OnceCell::new();
-            let resolved_senders = if has_native {
-                torus_types::eip712::batch_verify_native_actions_cached(
+            // Section 92 step 8e: the same pass returns each action's anti-MEV
+            // sort hash (keccak of its canonical bytes), absorbed once with the
+            // trust-cache key; the sort below takes it instead of re-hashing.
+            let (resolved_senders, verify_sort_hashes) = if has_native {
+                torus_types::eip712::batch_verify_native_actions_cached_with_sort_hashes(
                     &torus_block.native_actions,
                     block_ms,
                     |pubkey| {
@@ -3857,7 +3860,7 @@ impl ExecutionContext {
                     },
                 )
             } else {
-                vec![]
+                (vec![], vec![])
             };
             if let Some(e) = session_fault.into_inner() {
                 self.fail_stop_on_fault(torus_block, fold_header, "session read", &e);
@@ -3908,6 +3911,9 @@ impl ExecutionContext {
             let mut sender_actions = Vec::with_capacity(torus_block.native_actions.len());
             // v2 action status: body position of each `sender_actions` entry.
             let mut sender_body_index: Vec<u32> =
+                Vec::with_capacity(torus_block.native_actions.len());
+            // The sort hash of each `sender_actions` entry, by body position.
+            let mut sender_sort_hashes: Vec<torus_types::B256> =
                 Vec::with_capacity(torus_block.native_actions.len());
             let mut consumed_nonces = Vec::new();
             let mut dropped_invalid: u64 = 0;
@@ -3991,6 +3997,7 @@ impl ExecutionContext {
                 consumed_nonces.push((sender, signed.nonce));
                 sender_actions.push((sender, signed.action.clone()));
                 sender_body_index.push(i as u32);
+                sender_sort_hashes.push(verify_sort_hashes[i]);
             }
             if dropped_invalid > 0 {
                 // FIX 2: surface the count of dropped-at-exec actions (state-dependent
@@ -4028,7 +4035,7 @@ impl ExecutionContext {
             #[cfg(test)]
             let oracle_executed = sender_actions.clone();
             let ((pre_evm, pre_index), (post_evm, post_index)) =
-                sort_native_actions_indexed(sender_actions);
+                sort_native_actions_indexed_with_sort_hashes(sender_actions, sender_sort_hashes);
             // rank8: books come from the resident holder when
             // TORUS_RESIDENT_BOOKS=1 (and its staleness guard passes);
             // otherwise this is exactly the classic per-block reload.

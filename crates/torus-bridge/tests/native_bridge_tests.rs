@@ -824,7 +824,7 @@ fn sort_with_sort_hashes_matches_indexed_sort_randomized() {
         for _ in 0..len {
             let sender = addr(1 + next(3) as u8);
             let (m, b, p) = (next(2), next(2) == 0, 100 + next(2) as i64);
-            let action = match next(12) {
+            let action = match next(14) {
                 0 => NativeAction::CancelOrder {
                     order_id: next(3) as u128,
                 },
@@ -862,6 +862,13 @@ fn sort_with_sort_hashes_matches_indexed_sort_randomized() {
                     market_id: m,
                     cloid: next(3) as u128,
                 },
+                11 => NativeAction::SubmitOraclePrices(torus_types::OracleSubmission {
+                    prices: vec![(m, fp(p))],
+                    timestamp: next(2),
+                }),
+                12 => NativeAction::EvmUserModify {
+                    using_big_blocks: next(2) == 0,
+                },
                 _ => NativeAction::ClaimRewards,
             };
             categories.insert(format!("{:?}", classify_action(&action)));
@@ -879,7 +886,7 @@ fn sort_with_sort_hashes_matches_indexed_sort_randomized() {
         assert_eq!(hpre_idx, pre_idx, "round {round}: pre-EVM positions");
         assert_eq!(hpost_idx, post_idx, "round {round}: post-EVM positions");
     }
-    assert!(categories.len() >= 7, "categories covered: {categories:?}");
+    assert_eq!(categories.len(), 8, "every category covered: {categories:?}");
 }
 
 /// Mismatched hash and action counts are a caller bug: panic, never sort

@@ -125,6 +125,19 @@ fn report(new: bool) {
     }
 }
 
+/// Both arms on the same blocks, alternating order over 3 rounds (the host
+/// is shared, so one-shot runs are noisy).
+#[test]
+#[ignore]
+fn exec_hash_once_ubench_ab() {
+    for round in 0..3 {
+        let order = if round % 2 == 0 { [false, true] } else { [true, false] };
+        for new in order {
+            report(new);
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn exec_hash_once_ubench_old_path() {
