@@ -31850,6 +31850,9 @@ mod crash_recovery_tests {
         mode: torus_bridge::native_executor::BookMode,
         /// `TORUS_EPOCH_FAST_PATH` (on: the production default).
         epoch_fast: bool,
+        /// Mixed into the G-mode controller's seed (task 3.8: replicas
+        /// gated on independent schedules).
+        ctl_seed: u64,
     }
 
     impl O0Cfg {
@@ -31862,6 +31865,7 @@ mod crash_recovery_tests {
                 evm_fast: false,
                 mode: torus_bridge::native_executor::BookMode::Classic,
                 epoch_fast: true,
+                ctl_seed: 0,
             }
         }
 
@@ -31874,6 +31878,7 @@ mod crash_recovery_tests {
                 evm_fast: false,
                 mode: torus_bridge::native_executor::BookMode::Classic,
                 epoch_fast: true,
+                ctl_seed: 0,
             }
         }
 
@@ -32029,7 +32034,7 @@ mod crash_recovery_tests {
         fn with_fixture(cfg: O0Cfg, (config, db): (ChainConfig, StateDb)) -> Self {
             torus_state::running_hash::capture_begin(&db);
             let ctl = (cfg.pipelined && cfg.run == O0Run::G)
-                .then(|| O0Ctl::new(cfg.interval(), O0_SEED ^ 0x6a7e));
+                .then(|| O0Ctl::new(cfg.interval(), O0_SEED ^ 0x6a7e ^ cfg.ctl_seed));
             let gate = match (&ctl, cfg.pipelined) {
                 (Some(c), _) => Some(c.gate.clone()),
                 (None, true) => Some(crate::exec_pipeline::WorkerGate::new()),
@@ -34940,6 +34945,61 @@ mod crash_recovery_tests {
             "TORUS_CKPT_DEFER_BOOKS=1: the book CF in L's deferred part"
         );
         o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Every5], o0_same);
+    }
+
+    // ---- Item 7 option 0 task 3.8: mixed replicas ----
+
+    /// Plan task 3.8: three replicas of one stream, one per flag setting:
+    /// flag off (Every5, the validators' checkpointing), flag on with Every5,
+    /// flag on at interval 0 (`run` mode; in G mode the two flag-on nodes are
+    /// gated on independent schedules). They agree on every height's `h_n`,
+    /// status and side rows and every state-hash attestation row (the
+    /// running-hash checkpoints at h % 100), by height (their checkpoint
+    /// policies differ, so never by marker), and all equal the golden.
+    fn o0_mixed_replicas(run: O0Run) {
+        let (blocks, _) = o0_blocks(300, O0_SEED);
+        let cfgs = [
+            O0Cfg::piped(P5Ckpt::Every5, run),
+            O0Cfg {
+                ctl_seed: 1,
+                ..O0Cfg::piped(P5Ckpt::Every5, run).fast()
+            },
+            O0Cfg {
+                ctl_seed: 2,
+                ..O0Cfg::piped(P5Ckpt::PerBlock, run).fast()
+            },
+        ];
+        let (nodes, finals) = o0_run_agreeing(&blocks, &cfgs);
+        for h in [100u64, 200, 300] {
+            let cps: Vec<Option<[u8; 32]>> = nodes
+                .iter()
+                .map(|n| torus_state::running_hash::read_checkpoint(&n.db, h))
+                .collect();
+            assert!(cps[0].is_some(), "{run:?}: a state-hash checkpoint at {h}");
+            assert!(cps.iter().all(|c| *c == cps[0]), "{run:?}: attestation rows at {h}: {cps:?}");
+        }
+        for (i, a) in nodes.iter().enumerate() {
+            for b in &nodes[i + 1..] {
+                let c = o0_compare(&a.ledger(), &b.ledger()).unwrap_or_else(|d| {
+                    panic!("{:?} vs {:?} diverged at {}: {}", a.cfg, b.cfg, d.height, d.what)
+                });
+                assert!(c.hn >= 300 && c.status >= 300 && c.side >= 300, "{c:?}");
+            }
+        }
+        o0_assert_golden(&nodes, &finals);
+    }
+
+    /// Plan task 3.8, D mode.
+    #[test]
+    fn o0_mixed_replicas_agree() {
+        o0_mixed_replicas(O0Run::D);
+    }
+
+    /// Plan task 3.8, G mode (the two flag-on nodes on independent gate
+    /// schedules).
+    #[test]
+    fn o0_mixed_replicas_agree_g() {
+        o0_mixed_replicas(O0Run::G);
     }
 
     // ---- Item 7 option 0 task 3.6: poison tests (plan 5.4, design 3b / 3c) ----
