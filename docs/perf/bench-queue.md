@@ -609,6 +609,11 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      lower), p50 +7.3% (4 / 4 higher), CPU per fill +1.5%. Inline passes up to 299 ms ran on the consensus thread.
    * Next: find the ~5% blocks/s cost left in both retention arms (pruners vs GC write, `perf` A vs B), and drop the
      `dispatch_behind` re-passes. Prune-by-default should not go in on this evidence alone.
+   * 8r-attr: **Done s68 (8r-attr, analysis only, section 103.6): the cost common to B and C is state DB compaction of
+     `cf_block_bodies` from the state pruner's `delete_range_cf` tombstones (compaction CPU 0.077 -> 0.151 / 0.154 s/s
+     per node, x 2.0, 4 / 4), not the DA GC; with the GC it accounts for CPU per fill; exec us / fill +14-16% in
+     state-compaction seconds (23% vs 13% of seconds); blocks/s link medium-low (bigger blocks, saturated exec); no
+     RocksDB stalls. Next: retention-on arm with block-body pruning off.**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

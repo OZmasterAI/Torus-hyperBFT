@@ -16029,6 +16029,160 @@ B / A whole is 0.95 / 1.06 / 0.95. Every cell stayed in one regime: 19-22k fills
   `ozarchy-8r-run/analyst/`: `r8-analyse.py` (8o's helpers, three arms, B / A, C / A and C / B, plus the worker
   metrics), with `r8.txt` and `r8-analyse.json`.
 
+### 103.6 8r attribution (bench queue 8r-attr; analysis only, no new cells; archy s68)
+
+What does retention slow, if not the GC pass? Same 12 cells and windows as 103.3 (post = the later first deleting pass
++ 5 s .. load end, 208-215 s). Sources per cell: `sampler.csv` (1 Hz, per node: the `torus_rocksdb_*` state DB and
+`torus_rocksdb_consensus_*` consensus DB gauges, phase timers), `metrics-1hz.txt.gz` (per-CF L0, pruner, GC),
+`host-1hz.tsv` (process CPU ticks), `vmstat-1hz.txt`, `summary.json` schedstat (load window), `rocksdb-LOG-val*.txt`
+(state DB only: flush / compaction events per CF; it holds one stats dump, at open), `val*.log.gz` (pruner, slow
+pass). Node mean per cell; ratios as 103.3 (geomean of 4 pair ratios, 95% t CI, 3 df).
+
+**Per cell, post window (run order)**
+
+| cell | native blk/s | state compaction CPU s/s | state compact write MB/s | state compaction running (mean) | `cf_block_bodies` L0 (mean) | cons compaction CPU s/s | cons compact write MB/s | process CPU cores | exec us / fill | exec us / fill, no-compaction s | exec us / fill, state-compaction s | state-compaction share of s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| r1-A | 14.85 | 0.072 | 1.48 | 0.083 | 1.21 | 0.177 | 9.65 | 6.14 | 3.63 | 3.589 | 3.971 | 87 / 624 |
+| r1-B | 13.25 | 0.158 | 3.72 | 0.170 | 3.35 | 0.201 | 6.09 | 6.28 | 3.74 | 3.645 | 4.258 | 148 / 624 |
+| r1-C | 13.41 | 0.157 | 3.69 | 0.176 | 3.35 | 0.195 | 5.79 | 6.27 | 3.71 | 3.645 | 4.116 | 151 / 624 |
+| r2-C | 13.72 | 0.151 | 3.62 | 0.159 | 3.38 | 0.195 | 5.80 | 6.26 | 3.71 | 3.580 | 4.164 | 139 / 624 |
+| r2-B | 13.05 | 0.148 | 3.54 | 0.158 | 3.29 | 0.181 | 5.30 | 6.21 | 3.71 | 3.508 | 4.237 | 137 / 618 |
+| r2-A | 14.50 | 0.082 | 1.54 | 0.088 | 1.21 | 0.177 | 9.48 | 6.14 | 3.67 | 3.659 | 3.922 | 85 / 624 |
+| r3-A | 14.27 | 0.077 | 1.49 | 0.085 | 1.17 | 0.154 | 7.95 | 6.09 | 3.67 | 3.637 | 3.818 | 85 / 645 |
+| r3-B | 14.49 | 0.150 | 3.47 | 0.160 | 3.24 | 0.173 | 5.33 | 6.18 | 3.69 | 3.607 | 4.100 | 149 / 645 |
+| r3-C | 13.31 | 0.153 | 3.58 | 0.160 | 3.24 | 0.191 | 5.87 | 6.22 | 3.65 | 3.623 | 4.016 | 145 / 639 |
+| r4-C | 13.79 | 0.153 | 3.66 | 0.156 | 3.33 | 0.203 | 6.01 | 6.23 | 3.67 | 3.518 | 4.138 | 146 / 627 |
+| r4-B | 13.75 | 0.150 | 3.64 | 0.162 | 3.31 | 0.187 | 5.64 | 6.22 | 3.70 | 3.633 | 4.120 | 141 / 621 |
+| r4-A | 14.34 | 0.076 | 1.55 | 0.080 | 1.21 | 0.177 | 9.69 | 6.16 | 3.71 | 3.636 | 4.166 | 81 / 621 |
+
+Exec us / fill = `torus_exec_block_seconds_sum` / fills. The last three columns split the node-seconds by whether a
+state DB compaction ran in that second (`torus_rocksdb_running_compactions` > 0 at either end, or compaction CPU grew),
+fill-weighted.
+
+**RocksDB, state DB vs consensus DB (post window; arm mean (sd); B / A and C / A with 95% CI, k / 4 = pairs higher
+than A)**
+
+| metric | A | B | C | B / A | C / A |
+|---|---|---|---|---|---|
+| state compaction CPU s/s | 0.077 (0.004) | 0.151 (0.005) | 0.154 (0.003) | 1.971 [1.737, 2.238] 4/4 | 2.002 [1.800, 2.227] 4/4 |
+| state compactions / min | 5.93 | 7.86 | 7.86 | 1.327 [1.153, 1.528] 4/4 | 1.327 [1.153, 1.528] 4/4 |
+| state compact read / write MB/s | 6.33 / 1.51 | 10.20 / 3.59 | 10.28 / 3.64 | 1.614 / 2.371 4/4 | 1.627 / 2.401 4/4 |
+| state flushes / min, flush write MB/s | 27.30, 7.03 | 27.19, 6.74 | 27.29, 6.79 | 0.998, 0.959 | 1.002, 0.965 |
+| state WAL MB/s | 36.54 | 35.77 | 35.87 | 0.979 [0.961, 0.997] | 0.982 [0.960, 1.005] |
+| state pending compaction MB (max) | 238.2 | 290.5 | 275.6 | 1.215 [1.036, 1.424] 4/4 | 1.152 [0.970, 1.368] 4/4 |
+| state L0 files max (any CF) | 4.00 | 4.00 | 4.08 | 1.000 | 1.020 |
+| state DB write mean us (~0.14 / s, the checkpoint batch) | 4,461 | 4,661 | 4,715 | 1.045 [0.929, 1.176] | 1.058 [0.943, 1.187] |
+| state DB write p99 us / max ms (cumulative) | 152 / 970 | 134 / 1,004 | 141 / 962 | 0.878 / 1.029 | 0.924 / 0.988 |
+| cons compaction CPU s/s | 0.172 (0.011) | 0.186 (0.012) | 0.196 (0.005) | 1.083 [1.003, 1.169] 4/4 | 1.144 [1.047, 1.251] 4/4 |
+| cons compactions / min | 2.67 | 2.14 | 2.29 | 0.806 [0.638, 1.017] 0/4 | 0.860 [0.732, 1.011] 0/4 |
+| cons compact read / write MB/s | 9.66 / 9.19 | 8.32 / 5.59 | 8.67 / 5.87 | 0.864 / 0.609 0/4 | 0.901 / 0.640 0/4 |
+| cons flushes / min, flush write MB/s | 9.36, 2.94 | 9.48, 3.16 | 9.36, 3.12 | 1.013, 1.076 4/4 | 1.000, 1.061 4/4 |
+| cons WAL MB/s | 19.42 | 19.40 | 19.54 | 0.999 | 1.006 |
+| cons pending compaction MB (max) | 409.9 | 102.9 | 105.5 | 0.250 [0.223, 0.281] 0/4 | 0.257 [0.254, 0.261] 0/4 |
+| cons L0 files max (any CF) | 5.00 | 4.83 | 5.00 | 0.965 | 1.000 |
+| cons DB writes / s, write mean us | 174.6, 314.0 | 194.2, 348.3 | 192.9, 318.6 | 1.112 4/4, 1.105 [0.921, 1.325] | 1.105 4/4, 1.013 |
+| cons DB write p99 us / max ms (cumulative) | 4,689 / 142.5 | 4,734 / 173.6 | 4,471 / 216.2 | 1.009 / 1.279 | 0.954 / 1.602 |
+| cons write-group followers / s | 0.024 | 0.088 | 0.026 | 3.98 [1.84, 8.61] 4/4 | 1.16 [0.50, 2.70] |
+| write stalls, stall micros, write-stopped, delayed write rate (both DBs) | 0 | 0 | 0 | - | - |
+
+**State DB per CF, from the LOG (whole window, per node, mean of 4 cells x 3 nodes)**
+
+| CF | A jobs / CPU s / in MB / out MB / records in -> out | B | C |
+|---|---|---|---|
+| `cf_block_bodies` | 6 / 7.30 / 454 / 260 / 2,240 -> 2,240 | 12 / 22.86 / 1,261 / 696 / 9,122 -> 6,386 | 12 / 23.03 / 1,273 / 705 / 9,065 -> 6,376 |
+| `cf_native_positions` | 5 / 13.28 / 1,257 / 168 | 5 / 13.38 / 1,265 / 168 | 5 / 13.48 / 1,267 / 168 |
+| all other CFs | < 0.6 s CPU together, same in every arm | same | same |
+
+**CPU by thread and phase timers**
+
+| metric | A | B | C | B / A | C / A |
+|---|---|---|---|---|---|
+| process CPU cores (post, `host-1hz`) | 6.13 | 6.22 | 6.24 | 1.014 [1.006, 1.023] 4/4 | 1.018 [1.010, 1.026] 4/4 |
+| DA GC s/s (any thread, post) | 0 | 0.027 | 0.022 | +0.027 | +0.022 |
+| exec on-CPU s (load, schedstat) | 218.3 | 219.3 | 218.6 | 1.005 [0.991, 1.018] | 1.001 [0.985, 1.019] |
+| exec runqueue wait s (load) | 10.80 | 11.04 | 11.15 | 1.022 [0.956, 1.092] | 1.033 [0.999, 1.067] 4/4 |
+| hotstuff-algo on-CPU s (load) | 79.44 | 79.47 | 84.34 | 1.000 [0.974, 1.027] | 1.062 [1.041, 1.083] 4/4 |
+| all other threads CPU s (load: process - exec - hotstuff) | 1,547 | 1,566 | 1,568 | 1.012 [1.004, 1.020] 4/4 | 1.013 [1.008, 1.019] 4/4 |
+| host idle % / runqueue r (vmstat, post) | 33.24 / 39.4 | 32.78 / 41.0 | 32.80 / 42.3 | 0.986 / 1.040 | 0.987 / 1.072 |
+| exec block ms | 67.68 | 71.91 | 72.58 | 1.062 [0.962, 1.172] | 1.072 [1.012, 1.137] 4/4 |
+| exec us / fill | 3.67 | 3.71 | 3.69 | 1.011 [0.990, 1.033] | 1.004 [0.982, 1.028] |
+| exec block busy s/s | 0.981 | 0.979 | 0.984 | 0.998 | 1.003 |
+| exec queue depth (blocks, mean) | 28.85 | 29.14 | 28.44 | 1.010 | 0.986 |
+| exec handoff wait ms / blk | 0.015 | 0.016 | 0.019 | 1.10 [0.64, 1.89] | 1.29 [0.79, 2.10] |
+| exec body persist ms / blk | 0.0003 | 0.0003 | 0.0005 | 0.955 | 1.30 [0.70, 2.44] |
+| exec state write db ms / write | 463.9 | 489.5 | 485.6 | 1.055 [1.000, 1.113] 4/4 | 1.047 [1.009, 1.085] 4/4 |
+| flush worker ms / pass | 6.03 | 6.42 | 6.32 | 1.065 [0.993, 1.142] | 1.047 [0.991, 1.107] |
+| view duration ms | 69.09 | 72.88 | 73.26 | 1.055 [0.951, 1.169] | 1.061 [1.017, 1.107] 4/4 |
+| view insert persist ms | 10.37 | 10.31 | 10.70 | 0.994 | 1.032 |
+| commit persist ms (write part) | 3.71 (2.07) | 4.05 (2.21) | 3.91 (2.17) | 1.091 [0.933, 1.276] | 1.054 [0.967, 1.150] |
+| on_committed_block ms | 18.12 | 19.41 | 20.44 | 1.071 [0.925, 1.239] | 1.128 [1.043, 1.221] 4/4 |
+| vote state write ms | 0.059 | 0.066 | 0.057 | 1.10 | 0.95 |
+
+The GC worker, flush worker and RocksDB background threads have no schedstat sampler (`torus-flush-worker` is `null`
+in `schedstat.json`); "all other threads" is the remainder.
+
+**1 Hz, all 12 cells pooled per arm (post)**: exec us / fill in seconds with no compaction in either DB is A 3.630,
+B 3.598, C 3.591; with a state DB compaction running it is A 3.969 (+9.3%), B 4.179 (+16.1%), C 4.108 (+14.4%); the
+compaction penalty is larger than A's in 3 / 4 B pairs and 4 / 4 C pairs. Those seconds are 13.4% of node-seconds in
+A, 22.9% in B, 23.1% in C. Seconds with only a consensus DB compaction show no exec penalty (A 3.626, B 3.582,
+C 3.537). Weighting gives about A 3.68, B 3.73, C 3.71 us / fill, close to the measured 3.67 / 3.71 / 3.69.
+
+* **Dominant difference: state DB compaction of `cf_block_bodies`, the same in B and C.** State compaction CPU goes
+  from 0.077 to 0.151 / 0.154 s/s per node (x 1.97 / x 2.00, 4 / 4, tight CIs), +15.4 s per node per 208 s post window,
+  ~7% of a core per node and ~0.22 cores across the 3 nodes. Compaction writes are x 2.4 and a compaction is running
+  16% of the time instead of 8%. The LOG puts all of it in `cf_block_bodies`: 12 jobs instead of 6 per cell, 22.9 s
+  CPU instead of 7.3 s, 1.26 GB read instead of 0.45 GB, 2,736 records dropped per node (A: none dropped; r1 val0 has
+  9 trivial moves in A vs 4 in B). Its L0 count averages 3.3 instead of 1.2. Every other CF is the same in all arms.
+* **Source: the state pruner that `--retention-blocks` turns on, not the DA GC.** It runs every 90 s (3 passes per
+  cell, 236 / 1,042 / 1,243 heights, < 1 ms each in `val*.log`) and deletes `cf_block_bodies` with
+  `delete_range_cf` (`torus-state/src/pruner.rs`). Without retention the bodies are append-only and L0 files move to
+  the bottom level for free; with the range tombstones each compaction rewrites the overlapping bottom-level files.
+  That is why B and C pay the same, wherever the GC runs. The DA GC deletes are in the consensus DB, where compaction
+  gets cheaper per byte (writes -39% / -36%, pending max 410 -> 103 MB) and costs only +0.014 / +0.024 s/s CPU.
+* **CPU per fill (+1.5-2% in 103.3) is accounted for.** Process CPU +0.09 / +0.11 cores (+1.4% / +1.8%) = state
+  compaction +0.074 / +0.077 + DA GC 0.027 / 0.022 + consensus compaction +0.014 / +0.024 (sum 0.115 / 0.123, inside the
+  tick noise). The state DB compaction is ~65-70% of it. C's extra hotstuff CPU (+4.9 s, +6.2%) is the inline pass
+  (6.0 s, 103.4); B's hotstuff CPU is unchanged.
+* **Exec per fill: the compaction seconds explain it.** With no compaction running, B and C exec costs per fill
+  are at or below A's (3.598 / 3.591 vs 3.630). The whole difference comes from the extra seconds with a
+  state compaction running, which also cost more per second in B and C (+16% / +14% vs A's +9%). Nothing stalls:
+  zero write stalls, stall micros, write stops and delayed writes in both DBs in every cell, and state DB write
+  latency moves 3-6% inside its noise. The penalty fits CPU / cache competition on a host that is 33% idle on
+  average but has a runqueue of 39-42 on 32 CPUs in the parallel bursts. The data cannot tell CPU, memory
+  bandwidth or LLC apart.
+* **Blocks/s: bigger blocks, not slower exec per fill.** All 12 cells fall on one line of exec ms per block against
+  fills per block (exec ms = -6.5 + 4.03 per 1k fills; mean residuals A -0.1, B +0.4, C -0.3 ms). Exec is saturated
+  in every arm (busy 0.98 s/s, backlog ~28 blocks). The consensus view tracks the exec block (view - exec 0.7-1.4
+  ms). So the 5-6% lower blocks/s is 5-6% bigger blocks at the same matched/s (C 0.999). In this state the block size
+  floats, and a sub-1% shift in exec cost per fill can move it by several percent. A 1 Hz split of the blocks/s
+  gap (B -0.85, C -0.97 blk/s) puts -0.56 / -0.57 of it in the state-compaction seconds and the rest in the other
+  seconds. Per pair this holds in only 2 / 4, so the blocks/s link is a reading, not a resolved result.
+* **Ruled out or minor:** write stalls / delays / stops (0 everywhere); WAL (state -2%, cons 0%); flush counts (same);
+  consensus DB compaction (+8-14% CPU, smaller than the state DB change, and no exec penalty in its seconds); the
+  pruner pass itself (< 1 ms, 3 per cell); slow-pass WARN seconds (exec us / fill +-2 s around them 3.40-4.14, n 3-13
+  per cell, no consistent rise); exec handoff wait (0.015-0.019 ms); body persist (< 0.001 ms / blk).
+  B-only: consensus DB write-group followers x 4 (0.088 / s: the worker's batch joins the consensus thread's write
+  group) and consensus DB write mean +10% (CI spans 1). These are small and may be part of B's matched/s -1%.
+* **`dispatch_behind` (B only, 884-936 per cell over 3 nodes):** a steady ~25 per minute per node, from the first
+  deleting minute to load end (per minute 186-241 summed over 3 nodes), with no bursts and no queue or lag. They do
+  not line up with anything. Bodies deleted match C.
+* **Confidence:** high that retention's main extra work is `cf_block_bodies` compaction from the state pruner's range
+  tombstones, and that it plus the GC accounts for the CPU per fill. Medium that it drives exec cost per fill: the
+  1 Hz conditioning is consistent, but compaction timing follows flush cadence, which also follows load, so a little
+  reverse causation cannot be excluded. Low-medium for blocks/s (the block-size equilibrium is noisy, n = 4).
+* **Next (to resolve):** a retention-on arm with the state pruner's block-body deletes off (or retention on with
+  `cf_block_bodies` pruning moved to a compaction filter / periodic `CompactRange` on that CF), A vs that vs B,
+  300 s, A B C C B A x 2 (~1 h 50 as 8r). If blocks/s and CPU per fill return to A with the GC still on, the cost is
+  the pruner. The cheap mitigations to try are: a compaction filter instead of `delete_range_cf`, a larger
+  `prune_interval`, or `cf_block_bodies` with blob files so compaction does not rewrite the body values.
+* **Method limits:** the state DB LOG is the only per-CF compaction source (the consensus DB LOG is not copied by
+  `savelog`); no per-thread CPU for RocksDB background / GC / flush-worker threads; cumulative histogram p99 / max
+  cover the whole run; 1 Hz counter steps for block-level timers are coarse (14 blocks per second); `exec us / fill`
+  in a second uses exec-side counters only.
+* **Files:** scripts and outputs in `~/bench-results-matched/ozarchy-8r-tools/analyst/attr/` (gate 27 blocks writes
+  in the run dir): `attr-collect.py` -> `attr.json`, `attr-screen.py` -> `screen-post.txt`, `attr-report.py` ->
+  `report-post.txt` / `report-whole.txt`, `attr-1hz.py` -> `onehz-post.txt`, `attr-decomp.py` -> `decomp-post.txt`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
