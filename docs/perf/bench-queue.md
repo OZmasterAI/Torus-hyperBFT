@@ -594,6 +594,21 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    coalesced heights, fence pins / refused / held `fence_full`). Verdicts: B vs A (does the worker remove 8o's
    regression: p50, blocks/s, CPU per fill within noise?) and C vs A (does 8o's regression reproduce on this
    binary?). Prune-by-default waits for this.
+   **Done s68 (ozarchy-8r, one binary `perf/rh4-gc-worker` `a0181b8b` node `94053e26`, tools main `d1efbfa6`, smokes
+   B and C 180 s, w1 A 300 s, then A B C C B A x 2, 300 s, n = 4 per arm; perf doc section 103).**
+   * Validity: all 15 cells ACCEPT / AGREE / PASS, md5 45 / 45, 326 CHECK OK + smokes 26 + 26, 0 CHECK FAIL / WARN, no
+     swap growth. Every node ran its arm's GC mode (B worker, C inline, A none). The reused-genesis cells pass 8o's
+     plain `state_hash_activation` expectation (3aaaa046). Gaps were 67-70 s.
+   * B vs A: **the worker fixes p50 but not blocks/s.** p50 14.9 -> 14.7 ms (0.989 [0.882, 1.110]; C / B 1.084 [1.008,
+     1.167]). Native blocks/s 13.420 -> 12.738 whole (0.949 [0.820, 1.099], 3 / 4 lower) and 14.493 -> 13.635 post
+     (0.940 [0.854, 1.035]). CPU-s per 1M fills +2.0% (1.020 [1.008, 1.033], 4 / 4). matched/s -1.0% (0.990 [0.979,
+     0.9997], 4 / 4; not in C). The consensus-thread GC handoff costs 22 us per height (C: 1.6 ms per native block).
+     There was no queue backlog, no coalescing, no refused pin and no `fence_full`, but ~300 `dispatch_behind` held
+     passes per node per cell.
+   * C vs A: **8o's regression reproduces.** blocks/s 0.947 [0.886, 1.012] whole and 0.935 [0.896, 0.976] post (4 / 4
+     lower), p50 +7.3% (4 / 4 higher), CPU per fill +1.5%. Inline passes up to 299 ms ran on the consensus thread.
+   * Next: find the ~5% blocks/s cost left in both retention arms (pruners vs GC write, `perf` A vs B), and drop the
+     `dispatch_behind` re-passes. Prune-by-default should not go in on this evidence alone.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
