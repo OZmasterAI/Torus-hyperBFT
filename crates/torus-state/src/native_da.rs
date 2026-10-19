@@ -2481,6 +2481,77 @@ mod tests {
         assert!(!present(&store, &x) && !present(&store, &y));
     }
 
+    /// A history whose body checks go through a real [`DaGcFence`].
+    struct FenceHistory<'a>(&'a crate::DaGcFence);
+
+    impl DaGcHistory for FenceHistory<'_> {
+        fn pruned_below(&self) -> Result<u64, StateError> {
+            Ok(0)
+        }
+        fn committed_hashes(&self, _: u64) -> Result<Option<Vec<B256>>, StateError> {
+            Ok(Some(vec![]))
+        }
+        fn committed_through(&self) -> Result<Option<u64>, StateError> {
+            Ok(None)
+        }
+        fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError> {
+            Ok(vec![])
+        }
+        fn begin_delete(&self, bodies: &mut Vec<([u8; 32], u16)>) -> u64 {
+            self.0.begin_delete(bodies)
+        }
+        fn end_delete(&self) {
+            self.0.end_delete()
+        }
+        fn fence_full(&self) -> bool {
+            self.0.is_full()
+        }
+    }
+
+    /// Codex adversarial round 2 (s132, `/tmp/rh4-round2-store-proof`, real
+    /// GC and RocksDB): once the fence saturated, honest pipelined checks at
+    /// H+1 kept every pass held ("pins=0 full=true held_passes=1000
+    /// body_present=true"). The fence resumes tracking pins as soon as it
+    /// has room, so the hold ends once the worker passed the refused height
+    /// and x (due at 14, never pinned) goes. Cap 2: this schedule needs two
+    /// pins at a time (the block at H until pass H, the proposal at H+1).
+    #[test]
+    fn gc_resumes_after_the_fence_saturated_under_honest_pipelining() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let x = dummy_action(1);
+        let hx = compute_action_hash(&x);
+        store.put(&x).unwrap();
+        let fence = crate::DaGcFence::with_max_pins(2);
+        fence.set_enabled(true);
+        fence.note_committed(13);
+        let hist = FenceHistory(&fence);
+        let gc = |height: u64, hashes: &[B256]| {
+            store
+                .gc_committed_with_history(height, Some(hashes), 0, W, UNCAPPED, LIMITS, &hist)
+                .unwrap()
+        };
+        gc(10, &[hx]);
+        for h in 11..=13 {
+            gc(h, &[]);
+        }
+        let n = |i: u64| B256::from(alloy_primitives::U256::from(i));
+        assert!(fence.pin(15, &[n(1), n(2), n(3)]).is_empty());
+        let mut held = Vec::new();
+        for h in 14..=1013u64 {
+            fence.note_committed(h);
+            assert!(fence.pin(h + 1, &[n(h + 10)]).is_empty());
+            let out = gc(h, &[]);
+            if out.hold_reason == Some(DaGcHoldReason::FenceFull) {
+                held.push(h);
+            }
+            assert_eq!(store.contains(&hx.0).unwrap(), h < 17, "x at {h}");
+            fence.release_through(h);
+        }
+        assert_eq!(held, vec![14, 15, 16], "held through refusals only");
+        assert_eq!((fence.pinned(), fence.is_full()), (1, false));
+    }
+
     /// RH4 GC worker: right before its write a pass hands its due bodies to
     /// the history's fence, which drops the ones a concurrent check pinned:
     /// the row goes, those bodies (and their references) stay, counted as

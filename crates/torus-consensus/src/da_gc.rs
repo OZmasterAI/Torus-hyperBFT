@@ -184,8 +184,10 @@
 //!   body as missing. The fence lock is held for set operations only, never
 //!   across DB I/O. Pins go once the worker passed their height. The fence
 //!   is bounded: one height entry per pinned hash, at most
-//!   `DA_GC_FENCE_MAX_PINS` hashes (over it every pass holds,
-//!   `reason="fence_full"`, until the worker passed the heights asked for),
+//!   `DA_GC_FENCE_MAX_PINS` hashes (a hash refused at the cap makes every
+//!   pass hold, `reason="fence_full"`, until the worker passed its height;
+//!   new hashes are pinned again as soon as there is room), released in
+//!   bounded chunks so no fence lock hold grows with the pins,
 //!   and no pin above the committed tip plus `DA_GC_FENCE_HEIGHT_WINDOW` (a
 //!   speculative far-future datum): such a check reads its bodies as missing
 //!   (`torus_da_gc_fence_refused_pins`).
