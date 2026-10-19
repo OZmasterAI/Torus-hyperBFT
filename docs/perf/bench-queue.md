@@ -394,12 +394,10 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    300 markets, 600 s, warm-up then A B B A A B (n = 3). Judge by the exec-path merge rule above (exec-thread on-CPU
    ms per 1k fills, native blocks/s, block p50 / p99, timeouts per 1,000 blocks); also exec ms at EVM heights vs
    other heights (the q5-gaps view), `torus_exec_evm_seconds` per EVM block, matched/s, CPU-s per 1M. If the SHAs line is
-   not here when 8i ends, start 8k in full and pull main every 30 min; when the SHAs appear, pause 8k at the next
-   safe point and run 8j first.
+   not here when 8i ends, start 8k; 8j then runs after 8k is done (8k is never paused for it).
    **SHAs:** not yet (G1b in progress).
-8k. **Explore workflow: new high-gain ideas, build and bench the best** (owner s131; starts right after 8i in full if
-   8j's SHAs are not posted by then; when they appear, 8k pauses at the next safe point (after the current bench cell
-   or build), 8j runs, then 8k resumes; ~a day, bench time <= ~4 h). Run the prompt in `docs/perf/8k-explore-workflow.md` as one
+8k. **Explore workflow: new high-gain ideas, build and bench the best** (owner s131; starts right after 8i if 8j's
+   SHAs are not posted by then, and once started it runs to the end without pausing; 8j then runs after 8k; ~a day, bench time <= ~4 h). Run the prompt in `docs/perf/8k-explore-workflow.md` as one
    multi-agent workflow (owner opt-in given): survey what is already explored, fan-out ideation (consensus, execution,
    storage, network / DA, crypto, wildcard incl. theoretical), adversarial review and ranking, build the top 1-2 on
    `exp/8k-<name>` behind a flag (tests first, microbench gate), A/B n = 3 under the exec-path merge rule, write-up.
