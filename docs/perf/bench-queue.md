@@ -468,16 +468,20 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (digests agree, replay length); one mixed-flag cell (val0 on, val1 off, val2 on with
    `TORUS_CHECKPOINT_INTERVAL_MS=0`): attestations agree for the whole cell. The default flip is the owner's call
    after this.
-8m. **Book storage mode at depth, + L3.1's zero-build flag** (owner s131; NEXT, 8l is paused; ~2 h 30: 10 cells,
-   deep cells ~15 min incl. genesis / boot / pre-load / post checks, ~1 min between cells). 8i: at 1M resting orders
+8m. **Book storage mode at depth, + L3.1's zero-build flag** (owner s131; NEXT, 8l is paused; ~1 h 15: 7 cells of
+   300 s, ~10 min each incl. genesis / boot / pre-load / post checks, ~1 min between cells). 8i: at 1M resting orders
    Classic's `save_books` is 73% whole-book encode, linear in depth. The other modes save only what changed but were
-   only benched at normal load (Classic vs mode 3, Q7). Main (current), one binary. Arms, one cell each (a screen; the
-   expected effect is large): Classic (`TORUS_BOOK_ROWS=0`), Classic + `TORUS_CKPT_DEFER_BOOKS=1` (L3.1's zero-build
-   version), mode 1 OrderRows, mode 2 LevelAuthority, mode 3 LevelAuthorityChunked; each at P0 and P1M (the 8i
-   shapes, 1M-account genesis, standard load, 600 s). The mode changes the state-root format: fresh genesis per mode,
-   every node the same mode (check `/proc/<pid>/environ` and the boot line). Report per cell: matched/s, native
-   blocks/s, p50 / p99, save_books ms per block and per 1k fills, exec-thread on-CPU per 1k fills, RSS, data-dir
-   size, boot time on the 1M genesis. Question: which mode should the testnet genesis use?
+   only benched at normal load (Classic vs mode 3, Q7: about a tie). Main (current), one binary. One cell each (a
+   screen; the expected effect at depth is large), 300 s load (owner s131: enough blocks for the per-block timers).
+   **P1M** (8i shape: 1M-account genesis, `PRELOAD=1000000`, standard load): Classic (`TORUS_BOOK_ROWS=0`), Classic +
+   `TORUS_CKPT_DEFER_BOOKS=1` (L3.1's zero-build version), mode 1 OrderRows, mode 2 LevelAuthority, mode 3
+   LevelAuthorityChunked. **P0** (same genesis, no pre-load): Classic and mode 1 only (does row storage cost anything
+   on a shallow book; mode 3 and defer-books were already compared at normal load, mode 2 is superseded by mode 3).
+   The mode changes the state-root format: fresh genesis per mode, every node the same mode (check
+   `/proc/<pid>/environ` and the boot line). Judge mainly by `save_books` ms per block and per 1k fills and
+   exec-thread on-CPU per 1k fills; also report matched/s, native blocks/s, p50 / p99, RSS, data-dir size, boot time
+   on the 1M genesis. Question: which mode should the testnet genesis use? A winner gets a longer A/B before any
+   default or genesis change.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
