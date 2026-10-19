@@ -750,11 +750,13 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   (`analysis-words`, run_analysis's own split and fill) split `analysis.cmd` and fill its
   placeholders (`{run}` `{prefix}` `{cell}` `{label}` `{tag}` `{arm}` `{out}`) for every cell
   it can run (each planned cell and its `-rerun`; smoke: the smoke cell under `$RUN/smoke`),
-  then checks that each `*.py` / `*.sh` word exists (`PREFLIGHT FAIL: analysis script
-  <filled path> missing`; a quoted path is a path; a command that does not split fails
-  preflight too). An older frozen `cell_step.py` without `analysis-words`: the command is only
-  split, and a script word holding a placeholder is not checked (`PREFLIGHT NOTE: analysis
-  script ... not checked`).
+  then notes each `*.py` / `*.sh` word that is no file (`PREFLIGHT NOTE: analysis script
+  <filled path> not found (not checked further)`; a quoted path is a path). Advisory only: the
+  check never fails preflight (a command that does not split is a NOTE too), so every spec the
+  pre-0f2ca85b driver accepted still passes. A `-c` command string (`bash -c '...'`, `bash -lc`,
+  `python3 -c`) is skipped entirely; the operands after it are still noted. An older frozen
+  `cell_step.py` without `analysis-words`: the command is only split, and a script word holding
+  a placeholder is not checked (`PREFLIGHT NOTE: analysis script ... not checked`).
 - **Genesis reuse**: every cell runs with `GENESIS_CACHE_DIR=$RUN/genesis-cache`. run-cell.sh
   keys every genesis input (`genesis_cache.py`: the generator scripts and their data incl.
   the weighted-full base genesis and its params sidecar, run-cell.sh, `MARKETS`,

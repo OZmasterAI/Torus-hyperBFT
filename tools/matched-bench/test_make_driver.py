@@ -79,6 +79,9 @@ EXAMPLE = os.path.join(HERE, "campaign", "driver-spec.example.json")
 FIX = os.path.join(HERE, "testdata", "make-driver")
 CELLFIX = os.path.join(HERE, "testdata", "cell-step")
 NODE_MD5_H = "03a2b75727727f972cf5e80865646f0d"
+# preflight's analysis script check is advisory (s131): these NOTEs, never a PREFLIGHT FAIL
+NOTE_MISSING = "PREFLIGHT NOTE: analysis script %s not found (not checked further)"
+NOTE_NOSPLIT = "PREFLIGHT NOTE: analysis.cmd does not split as cell_step splits it (shlex.split; not checked further)"
 
 
 def load_gen():
@@ -3374,15 +3377,17 @@ class DeferredReadersTest(Base):
                     minimal_spec(self.tmp, analysis={"cmd": cmd}), "analysis.cmd"
                 )
 
-    def test_quoted_analysis_script_is_checked_like_cell_step(self):
-        """preflight's missing-script check splits analysis.cmd as cell_step runs it (shlex.split): a quoted
-        path is a path"""
+    def test_quoted_analysis_script_is_noted_like_cell_step(self):
+        """preflight's advisory script note splits analysis.cmd as cell_step runs it (shlex.split): a quoted
+        path is a path. Advisory only (s131): a missing script or a command that does not split is a
+        PREFLIGHT NOTE, never a FAIL"""
         a = os.path.join(self.tmp, "with space", "a.py")
         for cmd in ('python3 -I "%s" {out}' % a, "python3 -I '%s' {out}" % a):
             with self.subTest(cmd=cmd):
                 rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": cmd}))
-                self.assertEqual(rc, 1, out)
-                self.assertIn("PREFLIGHT FAIL: analysis script %s missing" % a, out)
+                self.assertEqual(rc, 0, out)
+                self.assertIn(NOTE_MISSING % a, out)
+                self.assertNotIn("PREFLIGHT FAIL", out)
         os.makedirs(os.path.dirname(a))
         with open(a, "w") as fh:
             fh.write("import sys\n")
@@ -3390,13 +3395,12 @@ class DeferredReadersTest(Base):
             minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s" {out}' % a})
         )
         self.assertEqual(rc, 0, out)
+        self.assertNotIn("PREFLIGHT NOTE: analysis", out)
         rc, out = self.dry(
             minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s {out}' % a})
         )
-        self.assertEqual(rc, 1, out)
-        self.assertIn(
-            "PREFLIGHT FAIL: analysis.cmd cannot be split as cell_step runs it", out
-        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn(NOTE_NOSPLIT, out)
 
     def test_quoted_analysis_probe_reads_filled_counts(self):
         """the bcc95fab review's analysis probe end to end: a quoted script path keeps the scans in-line, so the
@@ -3445,8 +3449,9 @@ class AnalysisPlaceholderPreflightTest(Base):
     "{run}/analysis.py" failed preflight although the script existed after expansion). The frozen tools copy's
     cell_step.py fills the words (analysis-words: run_analysis's own placeholders and fill) for every cell the
     campaign can run (each planned cell and its -rerun; dry smoke: the smoke cell), and a */*.py or */*.sh word
-    that is no file is a PREFLIGHT FAIL naming the filled path. An older cell_step.py without analysis-words: a
-    word with a placeholder is not checked (one PREFLIGHT NOTE names it), the other words still are."""
+    that is no file is a PREFLIGHT NOTE naming the filled path (advisory, s131: preflight never fails on it). An
+    older cell_step.py without analysis-words: a word with a placeholder is not checked (one PREFLIGHT NOTE names
+    it), the other words still are."""
 
     SCRIPTS = {  # each placeholder cell_step fills -> a script path built from it
         "run": "{run}/an.py",
@@ -3513,10 +3518,11 @@ class AnalysisPlaceholderPreflightTest(Base):
                 os.remove(f)
 
     def assertMissing(self, out, paths):
-        self.assertNotIn("PREFLIGHT FAIL: analysis script {", out)
+        self.assertNotIn("PREFLIGHT NOTE: analysis script {", out)
+        self.assertNotIn("PREFLIGHT FAIL", out)
         self.assertTrue(
-            any("PREFLIGHT FAIL: analysis script %s missing" % f in out for f in paths),
-            "no PREFLIGHT FAIL names one of %s:\n%s" % (paths, out),
+            any(NOTE_MISSING % f in out for f in paths),
+            "no PREFLIGHT NOTE names one of %s:\n%s" % (paths, out),
         )
 
     def test_every_placeholder_is_filled_before_the_check(self):
@@ -3528,20 +3534,20 @@ class AnalysisPlaceholderPreflightTest(Base):
                 with self.subTest(placeholder=ph, cmd=cmd):
                     self.assertTrue(paths and all("{" not in f for f in paths), paths)
                     rc, out = self.dry(spec)
-                    self.assertEqual(rc, 1, out)
+                    self.assertEqual(rc, 0, out)
                     self.assertMissing(out, paths)
                     if len(paths) > 1:  # per cell: only the last cell's rerun lacks it
                         self.touch(paths[:-1])
                         rc, out = self.dry(spec)
-                        self.assertEqual(rc, 1, out)
-                        self.assertIn(
-                            "PREFLIGHT FAIL: analysis script %s missing" % paths[-1],
-                            out,
-                        )
+                        self.assertEqual(rc, 0, out)
+                        self.assertIn(NOTE_MISSING % paths[-1], out)
+                        for f in paths[:-1]:
+                            self.assertNotIn(NOTE_MISSING % f, out)
                     self.touch(paths)
                     rc, out = self.dry(spec)
                     self.assertEqual(rc, 0, out)
                     self.assertIn("PREFLIGHT OK (dry", out)
+                    self.assertNotIn("PREFLIGHT NOTE: analysis", out)
                     self.unlink(paths)
 
     def test_smoke_fills_the_smoke_run(self):
@@ -3556,13 +3562,12 @@ class AnalysisPlaceholderPreflightTest(Base):
                 self.assertNotIn(smoke[0], full)
                 self.touch(full)
                 rc, out = self.dry(spec, smoke=True)
-                self.assertEqual(rc, 1, out)
-                self.assertIn(
-                    "PREFLIGHT FAIL: analysis script %s missing" % smoke[0], out
-                )
+                self.assertEqual(rc, 0, out)
+                self.assertIn(NOTE_MISSING % smoke[0], out)
                 self.touch(smoke)
                 rc, out = self.dry(spec, smoke=True)
                 self.assertEqual(rc, 0, out)
+                self.assertNotIn("PREFLIGHT NOTE: analysis", out)
                 self.unlink(full + smoke)
 
     def test_review_probe_shape(self):
@@ -3600,8 +3605,8 @@ class AnalysisPlaceholderPreflightTest(Base):
 
     def test_archived_command_shapes(self):
         """the archived shapes (python3 -I $ANALYST/a-cells.py {out} {prefix} {tag}:{arm}, the example spec's
-        absolute path) pass with the script and fail without it, as before 9f30ce12 (bash word split, which
-        checked their unquoted absolute script word the same way)"""
+        absolute path) pass with the script, and pass with a NOTE naming it without it (advisory, s131; before,
+        a FAIL: the pre-9f30ce12 bash word split checked their unquoted absolute script word the same way)"""
         cmds = self.archived_cmds()
         self.assertGreaterEqual(len(cmds), 5, cmds)
         analyst = os.path.join(self.tmp, "analyst")
@@ -3621,13 +3626,12 @@ class AnalysisPlaceholderPreflightTest(Base):
             spec = minimal_spec(self.tmp, analysis={"cmd": cmd})
             with self.subTest(source=f, cmd=raw):
                 rc, out = self.dry(spec)
-                self.assertEqual(rc, 1, out)
-                self.assertIn(
-                    "PREFLIGHT FAIL: analysis script %s missing" % scripts[0], out
-                )
+                self.assertEqual(rc, 0, out)
+                self.assertIn(NOTE_MISSING % scripts[0], out)
                 self.touch(scripts)
                 rc, out = self.dry(spec)
                 self.assertEqual(rc, 0, out)
+                self.assertNotIn("PREFLIGHT NOTE: analysis", out)
                 self.unlink(scripts)
 
     def test_words_are_cell_steps_argv(self):
@@ -3704,7 +3708,7 @@ class AnalysisPlaceholderPreflightTest(Base):
 
     def test_older_cell_step_skips_placeholder_words(self):
         """a frozen cell_step.py without analysis-words: a word with a placeholder is not checked (PREFLIGHT
-        NOTE), a plain missing script still fails"""
+        NOTE), a plain missing script is still noted, a command that does not split too (never a FAIL)"""
         spec = minimal_spec(self.tmp)
         with open(os.path.join(spec["tools_dir"], "cell_step.py"), "w") as fh:
             fh.write("# an older cell_step.py: record and pending-reruns only\n")
@@ -3718,15 +3722,110 @@ class AnalysisPlaceholderPreflightTest(Base):
         rc, out = self.dry(
             minimal_spec(self.tmp, analysis={"cmd": "python3 -I %s {out}" % a})
         )
-        self.assertEqual(rc, 1, out)
-        self.assertIn("PREFLIGHT FAIL: analysis script %s missing" % a, out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(NOTE_MISSING % a, out)
         rc, out = self.dry(
             minimal_spec(self.tmp, analysis={"cmd": "python3 -I '%s {out}" % a})
         )
-        self.assertEqual(rc, 1, out)
-        self.assertIn(
-            "PREFLIGHT FAIL: analysis.cmd cannot be split as cell_step runs it", out
+        self.assertEqual(rc, 0, out)
+        self.assertIn(NOTE_NOSPLIT, out)
+
+
+class AnalysisShellStringPreflightTest(Base):
+    """Codex P2 on c2b72397: preflight took a `bash -c` command string ending in .py/.sh for a script path and
+    failed a valid spec. Owner decision s131: the script check is advisory (a NOTE, never a FAIL), preflight
+    accepts every spec the pre-0f2ca85b driver accepted, and a -c command string (bash -c, bash -lc, python3
+    -c) is skipped entirely (no NOTE); the operands after it are still noted"""
+
+    def dry(self, spec):
+        drv = self.generate(self.write_spec(spec))
+        r = subprocess.run([drv, "dry"], capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+    def script(self):
+        p = os.path.join(self.tmp, "analysis.py")
+        with open(p, "w") as fh:
+            fh.write(
+                "import json, os\n"
+                'json.dump({os.environ["REPORT_TAG"]: {"metric": 1}}, open(os.environ["REPORT_JSON"], "w"))\n'
+            )
+        return p
+
+    def test_review_probe(self):
+        """the c2b72397 review probe: bash -c '...; exec python3 -I /path/analysis.py' passes preflight_static
+        (rc 0, no NOTE, as the pre-0f2ca85b driver) and cell_step runs the analysis (status ok)"""
+        sys.path.insert(0, HERE)
+        import cell_step
+
+        spec = minimal_spec(self.tmp, samplers=False)
+        run = spec["run_dir"]
+        os.makedirs(run)
+        script = self.script()
+        cmd = (
+            "bash -c 'export REPORT_JSON={out} REPORT_TAG={tag}; exec python3 -I %s'"
+            % script
         )
+        spec["analysis"] = {"cmd": cmd, "metric": "metric"}
+        drv = self.generate(self.write_spec(spec))
+        r = self.lib(drv, "preflight_static")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("PREFLIGHT NOTE: analysis", r.stdout)
+        old = subprocess.run(
+            ["git", "-C", HERE, "show",
+             "0f2ca85b^:tools/matched-bench/campaign/driver-body.sh"],
+            capture_output=True, text=True,
+        )
+        if old.returncode == 0:  # parity with the pre-0f2ca85b driver (skipped outside a full clone)
+            text = open(drv).read()
+            olddrv = os.path.join(self.tmp, "old-driver.sh")
+            with open(olddrv, "w") as fh:
+                fh.write(text[: text.index("# ---- driver body (")] + old.stdout)
+            r = self.lib(olddrv, "preflight_static")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cell = os.path.join(self.tmp, "cell-0")
+        os.makedirs(cell)
+        step = os.path.join(run, "cell-step")
+        os.makedirs(step)
+        a = types.SimpleNamespace(
+            label="cell-0", tag="0", arm="A", run_dir=run, analysis_cmd=cmd,
+            analysis_timeout=30, analysis_key="{tag}", analysis_metric="metric",
+        )
+        status, _row, evidence = cell_step.run_analysis(a, cell, step)
+        self.assertEqual(status, "ok", evidence)
+
+    def test_command_strings_are_skipped(self):
+        """a -c command string is no script path, whatever it ends with and whether its script exists"""
+        missing = os.path.join(self.tmp, "nope", "a.py")
+        for cmd in (
+            "bash -c 'exec python3 -I %s {out}'" % missing,
+            "bash -lc 'exec python3 -I %s {out}'" % missing,
+            "sh -ec 'cd {run} && ./%s'" % "x/run.sh",
+            "python3 -I -c 'import runpy; runpy.run_path(\"%s\")' {out}" % missing,
+        ):
+            with self.subTest(cmd=cmd):
+                rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": cmd}))
+                self.assertEqual(rc, 0, out)
+                self.assertNotIn("PREFLIGHT NOTE: analysis", out)
+                self.assertNotIn("PREFLIGHT FAIL", out)
+
+    def test_operands_after_a_command_string_are_noted(self):
+        """bash -c 'python3 -I "$0" "$@"' /path/a.py {out}: the operand is a script path, noted when missing"""
+        missing = os.path.join(self.tmp, "nope", "a.py")
+        cmd = "bash -c 'exec python3 -I \"$0\" \"$@\"' %s {out}" % missing
+        rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": cmd}))
+        self.assertEqual(rc, 0, out)
+        self.assertIn(NOTE_MISSING % missing, out)
+        self.assertNotIn("PREFLIGHT FAIL", out)
+        self.assertEqual(out.count("PREFLIGHT NOTE: analysis"), 1, out)
+
+    def test_missing_script_is_a_note(self):
+        missing = os.path.join(self.tmp, "nope", "a.py")
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": "python3 -I %s {out}" % missing})
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn(NOTE_MISSING % missing, out)
+        self.assertIn("PREFLIGHT OK (dry", out)
 
 
 class EndPassRunTest(FakeHostBase):
