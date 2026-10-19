@@ -820,17 +820,40 @@ preflight_genesis() { # the genesis inputs under run-cell.sh's repo root GENESIS
     return 0
 }
 
-deferred_readers() { # why the report scans must stay in-line: an expectation or the checks file reads one of their
-    # outputs (val<i>.log.excerpt, run.log's ingest line, summary.json .ingest evictions); empty = none does
-    local i
+deferred_readers() { # why the report scans must stay in-line: an in-line reader reads one of their outputs before
+    # the end pass fills it; empty = none does. The deferred outputs (log-scans.sh REPORT_SCANS) and what an in-line
+    # reader would see instead: summary.json .ingest.mempool_nonce_expired_evictions_per_node ([]), run.log's ingest
+    # line (the "ingest scan deferred" line), val<i>.log.excerpt (absent). The in-line readers of cell files:
+    #   expectations (spec-wide and per arm; expectchk counts grep -E lines): any on summary.json (a line count can
+    #     match the field's key, its [] or its value lines, so no regex is safe), any on an excerpt, a run.log one
+    #     that matches either form of the ingest line or names it (DEFER_WORDS)
+    #   the checks file (campaignchecks) and the analysis script(s) (cell_step: the cells.tsv metric, the analysis
+    #     json): one that names a deferred output (DEFER_WORDS)
+    # Checked, reads none: marketchk (summary.json cell.markets), warmgatechk and cell_step.py (validity, agreement,
+    # liveness, headline, crash, binaries), md5chk / envchk / sysctlchk / fdsum / savelog (their own files).
+    local i e f s DEFER_WORDS='excerpt|evict|ingest|nonce'
+    s=$( . "$TOOLS/log-scans.sh" && ingest_line 1234567 "0 0 0 " && ingest_line 1234567 "20812 1 300 " \
+        && ingest_line "" "0 0 0 ")
+    s=$(sed 's/^/[12:00:00] /' <<< "$s
+ingest scan deferred to the campaign end pass (DEFER_REPORT_SCANS=1; node log bytes 123 4567 89012; bench submitted=1234567 actions)
+ingest scan deferred to the campaign end pass (DEFER_REPORT_SCANS=1; node log bytes 0 0 0; bench submitted=? actions)")
     for i in "${!EXP_FILE[@]}"; do
+        e="expectation '${EXP_RE[$i]}' (arm ${EXP_ARM[$i]}) reads ${EXP_FILE[$i]}"
         case ${EXP_FILE[$i]} in
-            *.log.excerpt) echo "expectation '${EXP_RE[$i]}' reads ${EXP_FILE[$i]};" ;;
-            run.log) grep -qiE 'ingest|evict' <<< "${EXP_RE[$i]}" && echo "expectation '${EXP_RE[$i]}' reads run.log's ingest line;" ;;
+            *.log.excerpt) echo "$e (log-excerpts);" ;;
+            summary.json|*/summary.json) echo "$e (ingest-evictions: .ingest.mempool_nonce_expired_evictions_per_node is [] until the end pass);" ;;
+            run.log|*/run.log)
+                # grep rc 1 = no sample line matches; 2 (a bad regex: expectchk fails it anyway) counts as a reader
+                grep -qE -- "${EXP_RE[$i]}" <<< "$s"; [ $? = 1 ] && ! grep -qiE "$DEFER_WORDS" <<< "${EXP_RE[$i]}" \
+                    || echo "$e's ingest line (ingest-evictions);" ;;
         esac
     done
-    [ -z "$CHECKS_SOURCE" ] || ! grep -qiE 'excerpt|evict|ingest' "$CHECKS_SOURCE" \
-        || echo "$CHECKS_SOURCE mentions excerpt / evict / ingest;"
+    [ -z "$CHECKS_SOURCE" ] || ! grep -qiE "$DEFER_WORDS" "$CHECKS_SOURCE" \
+        || echo "$CHECKS_SOURCE mentions excerpt / evict / ingest / nonce;"
+    for f in $ANALYSIS_CMD; do
+        case $f in */*.py|*/*.sh) ! grep -qiE "$DEFER_WORDS" "$f" 2>/dev/null \
+            || echo "analysis script $f mentions excerpt / evict / ingest / nonce;" ;; esac
+    done
     return 0
 }
 
@@ -844,7 +867,8 @@ preflight_post() { # what run-cell.sh in TOOLS supports: the end pass (DEFER_REP
         done
         why=$(deferred_readers)
         if [ -n "$why" ]; then
-            echo "PREFLIGHT NOTE: report-only scans stay in-line (no end pass): $why"
+            echo "PREFLIGHT NOTE: report-only scans stay in-line ($(sed -n 's/^REPORT_SCANS="\(.*\)"$/\1/p' \
+                "$TOOLS/log-scans.sh"); no end pass for them, run-cell.sh defers them together): $why"
         else
             DEFER_SCANS=1
         fi

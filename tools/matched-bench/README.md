@@ -729,10 +729,17 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   `END PASS OK <label>` per cell, the `HARD FINDING` / `CHECK SOAK` lines and `END PASS done`
   before `CAMPAIGN END`. A cell left with `deferred-scans.json` (a killed campaign, an `END
   PASS FAIL` line) is finished by hand: `tools/matched-bench/cell-endpass.sh <results>/<label>`.
-  Preflight keeps the scans in-line (`PREFLIGHT NOTE`, `end_pass=0`) when an `expect` reads
-  `val<i>.log.excerpt` or run.log's ingest line, or the checks file mentions excerpt / evict /
-  ingest; opt out by hand with `harness_env` `"DEFER_REPORT_SCANS": "0"` (also needed when an
-  `analysis.cmd` reads the excerpts or the eviction counts: preflight cannot see into it).
+  Preflight keeps the scans in-line (`PREFLIGHT NOTE` naming the scans and each reader,
+  `end_pass=0`) when an in-line reader would see a deferred output before the end pass fills
+  it (`summary.json` `.ingest.mempool_nonce_expired_evictions_per_node` is `[]`, run.log has
+  the "ingest scan deferred" line instead of the ingest line, no excerpts): an `expect`
+  (spec-wide or per arm) on `summary.json` (any regex: a line count can hit the field's lines)
+  or on `val<i>.log.excerpt`, a run.log `expect` that matches either form of the ingest line
+  or names excerpt / evict / ingest / nonce, or a checks file or `analysis.cmd` script
+  (`*.py` / `*.sh` in the command) that names one of those. The other in-line steps read none
+  (marketchk: `cell.markets`; warm-up gate and cell_step: validity, agreement, liveness,
+  headline, crash, binaries). Opt out by hand with `harness_env` `"DEFER_REPORT_SCANS": "0"`
+  (e.g. an analysis script that imports a helper which reads them).
 - **Genesis reuse**: every cell runs with `GENESIS_CACHE_DIR=$RUN/genesis-cache`. run-cell.sh
   keys every genesis input (`genesis_cache.py`: the generator scripts and their data incl.
   the weighted-full base genesis and its params sidecar, run-cell.sh, `MARKETS`,

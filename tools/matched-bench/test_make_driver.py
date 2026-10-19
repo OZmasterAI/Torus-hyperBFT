@@ -48,8 +48,8 @@ fake /proc (DRIVER_PROC). Pinned:
    POST_ENDPASS ones (cell-endpass.sh, hardscan, soakchk) only in end_pass, which run_campaign calls once after
    the last cell (also on a CAMPAIGN STOP) and before the EXIT trap's campaign.done; each cell gets
    DEFER_REPORT_SCANS=1 and GENESIS_CACHE_DIR=$RUN/genesis-cache when run-cell.sh supports them (preflight_post;
-   an expectation or checks file that reads a deferred output keeps the scans in-line), an arm's harness_env
-   opts out.
+   an expectation, checks file or analysis script that reads a deferred output keeps the scans in-line:
+   DeferredReadersTest), an arm's harness_env opts out.
 """
 
 import glob
@@ -3153,6 +3153,157 @@ class PreflightPostTest(Base):
             )
         )
         self.assertIn("end_pass=1", out)
+
+
+class DeferredReadersTest(Base):
+    """deferred_readers (Codex P2 on 0f2ca85b): every in-line reader of a deferred output keeps the report scans
+    in-line. The deferred outputs: summary.json .ingest.mempool_nonce_expired_evictions_per_node ([] until the end
+    pass), run.log's ingest line (a "deferred" line until then), val<i>.log.excerpt (absent until then). The in-line
+    readers: the expectations (spec-wide and per arm; expectchk greps the cell file), the checks file
+    (campaignchecks) and the analysis script (cell_step, cells.tsv metric). The rest of the in-line work reads none
+    of them (marketchk: summary.json cell.markets; warmgatechk / cell_step: validity, agreement, liveness, headline,
+    crash, binaries)."""
+
+    PLACEHOLDER = {
+        "file": "summary.json",
+        "regex": '"mempool_nonce_expired_evictions_per_node": \\[\\]',
+        "min": 0,
+        "max": 0,
+    }
+
+    def dry(self, spec):
+        drv = self.generate(self.write_spec(spec))
+        r = subprocess.run([drv, "dry"], capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+    def assertInline(self, spec, why):
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=0", out)
+        self.assertIn(
+            "PREFLIGHT NOTE: report-only scans stay in-line (ingest-evictions log-excerpts;",
+            out,
+        )
+        self.assertIn(why, out)
+        return out
+
+    def assertDeferred(self, spec):
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=1", out)
+        self.assertNotIn("stay in-line", out)
+
+    def test_summary_json_expectation_keeps_them_in_line(self):
+        self.assertInline(
+            minimal_spec(self.tmp, expect=[self.PLACEHOLDER]), "reads summary.json"
+        )
+
+    def test_per_arm_summary_json_expectation_keeps_them_in_line(self):
+        s = minimal_spec(self.tmp)
+        s["arms"][1]["expect"] = [
+            {"file": "summary.json", "regex": '"benchmark_accepted": true', "min": 1}
+        ]
+        self.assertInline(s, "arm M1")
+
+    def test_run_log_ingest_line_by_any_part_keeps_them_in_line(self):
+        # no 'ingest' / 'evict' in the regex: the old keyword test missed these
+        for rx in (
+            "bench submitted=[0-9]+ actions",
+            "nonce-expired",
+            "per node: [0-9]",
+        ):
+            with self.subTest(rx=rx):
+                self.assertInline(
+                    minimal_spec(self.tmp, expect=[{"file": "run.log", "regex": rx}]),
+                    "reads run.log's ingest line",
+                )
+
+    def test_run_log_samples_follow_run_cell(self):
+        # deferred_readers' sample of run-cell.sh's deferral line (the ingest line itself comes from log-scans.sh)
+        head = "ingest scan deferred to the campaign end pass (DEFER_REPORT_SCANS=1; node log bytes "
+        tail = "; bench submitted="
+        rc_text = open(os.path.join(HERE, "run-cell.sh")).read()
+        self.assertIn(
+            head + "$INGEST_LOG_BYTES" + tail + "${BENCH_SUBMITTED:-?} actions)",
+            rc_text,
+        )
+        body = func_text(
+            open(os.path.join(HERE, "campaign", "driver-body.sh")).read(),
+            "deferred_readers",
+        )
+        self.assertIn(head + "123 4567 89012" + tail + "1234567 actions)", body)
+
+    def test_unrelated_run_log_expectation_defers(self):
+        self.assertDeferred(
+            minimal_spec(
+                self.tmp,
+                expect=[
+                    {"file": "run.log", "regex": "oracle feed pid [0-9]+;", "min": 0}
+                ],
+            )
+        )
+
+    def test_checks_file_mentioning_nonce_keeps_them_in_line(self):
+        f = os.path.join(self.tmp, "checks.sh")
+        with open(f, "w") as fh:
+            fh.write(
+                "okchk() { jq -e '.x.mempool_nonce_expired' \"$R/$1/summary.json\" > /dev/null; }\n"
+            )
+        self.assertInline(
+            minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]}),
+            "checks.sh mentions",
+        )
+
+    def test_analysis_script_reading_ingest_keeps_them_in_line(self):
+        a = os.path.join(self.tmp, "a-cells.py")
+        with open(a, "w") as fh:
+            fh.write(
+                'import json, sys\ns = json.load(open(sys.argv[1]))\ning = s["ingest"]\n'
+            )
+        self.assertInline(
+            minimal_spec(
+                self.tmp,
+                analysis={"cmd": "python3 -I %s {out} {prefix} {tag}:{arm}" % a},
+            ),
+            "a-cells.py mentions",
+        )
+        with open(a, "w") as fh:
+            fh.write(
+                'import json, sys\ns = json.load(open(sys.argv[1]))\nh = s["headline"]\n'
+            )
+        self.assertDeferred(
+            minimal_spec(
+                self.tmp,
+                analysis={"cmd": "python3 -I %s {out} {prefix} {tag}:{arm}" % a},
+            )
+        )
+
+    def test_placeholder_expectation_does_not_stop_the_campaign(self):
+        """the review's probe: an expectation that the eviction counts are filled in (not the [] placeholder) passes
+        on the cell the campaign runs, and the campaign goes on"""
+        sys.path.insert(0, HERE)
+        from test_cell_endpass import EquivalenceTest
+
+        drv = self.generate(
+            self.write_spec(minimal_spec(self.tmp, expect=[self.PLACEHOLDER]))
+        )
+        e = EquivalenceTest()
+        e.setUp()
+        self.addCleanup(e.doCleanups)
+        r = self.lib(drv, "preflight_static > /dev/null; echo DEFER_SCANS=$DEFER_SCANS")
+        self.assertIn("DEFER_SCANS=0", r.stdout, r.stdout + r.stderr)
+        cell, _ = e.run_cell_blocks(
+            0
+        )  # DEFER_SCANS=0: run-cell.sh runs the scans in-line
+        r = self.lib(
+            drv,
+            'preflight_static > /dev/null; cell() { STARTED_LABEL=$P-$1; expectchk "$CELL" "$2" || '
+            '{ CELL_FAIL=check; return 1; }; }; cell_step() { :; }; CELLS=("w1:A:120:none:"); '
+            "run_cells; echo CAMPAIGN_RC=$?",
+            {"CELL": cell},
+        )
+        self.assertIn("CAMPAIGN_RC=0", r.stdout, r.stdout + r.stderr)
+        self.assertNotIn("CHECK FAIL", r.stdout)
 
 
 class EndPassRunTest(FakeHostBase):
