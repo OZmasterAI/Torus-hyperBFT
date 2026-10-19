@@ -149,7 +149,7 @@ set, then DB" per Flush and "L, then DB" at a checkpoint; `item7-option0-impl.md
 `__book_mode__` marker cannot catch a mixed fleet on a fresh DB (`item6-phase2-impl.md:792-803`). Add the s450
 mode-2 test gaps vs mode 3: resident re-verify, match-workers determinism, multi-market chunking. Estimate 1-2 days for
 the genesis field and 2-3 days for the gaps. b0 / b1 themselves are node-local: same bytes as the serial mode-3 save,
-with the hash on or off. Mode 3's per-block hashed book bytes are small: ~1,387 level entries per block (99.3), vs
+with the hash on or off. Mode 3's per-block hashed book bytes are small: ~1,387 dirty book-CF entries per block (99.3; levels plus stop / meta writes and deletes), vs
 ~155 MB of blobs in Classic.
 
 **Crash / replay / boot verify.** Level rows (root CF) and order rows (`cf_book_order_rows`) both sit in L (b0) or
