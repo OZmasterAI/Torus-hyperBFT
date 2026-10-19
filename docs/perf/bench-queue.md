@@ -384,6 +384,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (SIGKILL val1 mid-load, restart): kill -> first commit, replayed blocks, catch-up time, AGREE and one digest, and
    matched/s around the kill. If the depth curve is unclear at n = 1 (e.g. 0 and 1M within the S-cell spread), report
    it and 18c decides on replicates.
+   **Done s68 (ozarchy-8i, main `76204a69` node `7f91438d`, bench `0a030a0c`, tools `c2336e70`, 1M-account genesis
+   reused (`a644d0a7`), code defaults, 600 s, n = 1; perf doc section 96).** Depth, not accounts. P0 (1M accounts,
+   no pre-load) = the standard cell: 263,708 matched/s (S 256,224), save_books 0.217 ms per 1k fills (S 0.218),
+   CPU-s per 1M 23.16 (S 23.56), 10.5 blocks/s (standard spread 9.3-16.4). PRELOAD 250k / 500k / 1M: matched/s
+   251,920 / 244,017 / 221,362 (0.955 / 0.925 / 0.839 of P0), blocks/s 3.83 / 3.42 / 2.91 (big-block regime from
+   250k), p50 177 / 223 / 243 ms, save_books 37.1 / 49.9 / 78.9 ms per block = 0.576 / 0.719 / 1.070 ms per 1k fills,
+   linear in mean resting depth (0.21 / 0.75 / 1.04 / 1.61M; +0.61 ms per 1k fills per 1M). P1M repeats 8f's M within
+   0.9%. 0 vs 1M is clear at n = 1; the middle points are one cell each (18c: replicates only if needed). Profile
+   (user space, paranoid 2 kept; no frame pointers, so leaf + neighbour rule): save_books 83 ms per block at 1M =
+   borsh encode of the whole book 73% + output-Vec memmove 15% + jemalloc 3% + journal drop 2% + overlay put 0.1-0.2%
+   + hashing 0 (Classic) + not sampled 6-7%. Crash-kill at bench+300 s: chain halts (3 validators), val1 replays 76
+   blocks (applied marker 2,144 vs committed 2,220) in 41.4 s, first commit 48.4 s after the kill, at par at ~50 s;
+   ~28 s of zero fills, matched/s 226k before, 193k in the first minute after. AGREE, one digest `a99ad5c1`; REJECT
+   on liveness (30 s stall) and the crash gate (marker 12 blocks beyond the exec queue, gate allows 2; plus a
+   false-positive panic count on an INFO line in `crash-kill.sh`). No swap growth, host >= 22.1 GB free, highest
+   node RSS 9.9 GB (P1M) / 10.3 GB (CK).
 8j. **Item 7 option 0 G1b: flag-off cost under EVM load** (owner s131; after 8i, when 18c posts the two SHAs;
    ~1 h 20, estimate; NOT blocking: the G2-G4 builds go on meanwhile). G1b (`docs/plans/item7-option0-impl.md`
    tasks 1.2-1.7) changes today's EVM path with no flag: the block overlay is built before the EVM part and the EVM
