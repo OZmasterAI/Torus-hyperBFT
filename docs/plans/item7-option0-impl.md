@@ -336,6 +336,22 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
     targets), staking writer calls; lockbox deposits; BLOCKHASH of h-1 and h-256; reader precompile calls
     (`getPosition`, balances, oracle, staking, bbo).
   - An account destroyed or EIP-161-emptied, then re-created with new storage inside one checkpoint window.
+    - Destroy is same-block only: the EVM spec is CANCUN (`torus-evm/src/executor.rs:75`), so SELFDESTRUCT
+      (EIP-6780) deletes only an account created in the same tx; a pre-existing account's storage can never be wiped.
+      The stream's `destroy_recreate` (create + destroy in one tx, re-create by the next tx of the same block) reads
+      no lower layer.
+    - The cross-block deletion is EIP-161, and it is reachable (s131, `o0_eip161_native_drained_account_is_deleted_by_touch`):
+      `Withdraw { to: Z }` writes Z's CF_ACCOUNTS row (nonce 0, KECCAK_EMPTY: `torus-core/src/lockbox.rs:146-194`,
+      new row `236-247`); Z's `TransferToPerp` of its whole EVM balance rewrites the row with balance 0 and keeps it
+      (`lockbox.rs:62-103`, `build_evm_balance_update` preserves nonce and code hash and never deletes); a zero-value
+      EVM call to Z in a later block then deletes the row (revm state clear; `apply_bundle_plain` deletes
+      CF_ACCOUNTS, `torus-state/src/incremental.rs:291-294`). Z's `TransferToSpot` re-creates it, and Z sends again
+      from nonce 0. The stream runs this cycle for 3 addresses (`O0_EMPTIED`): fund at e-3, drain at e-2, touch at
+      the EVM height e (`e % 5 == 0`, so drain and touch share one Every5 window), re-fund at e+1, Z's create (new
+      storage) at the next EVM height (seed `O0_SEED`: touches at 20, 30, 60; reuse at 25, 40, 65). Fed counter
+      `eip161_cross_block` (floor 3); `o0_stream_eip161_cycles_delete_and_recreate` checks each row on the serial
+      run (written, empty, gone, re-created at nonce 0, nonce 1). The golden was re-written with the cycles (serial,
+      interval 0 and Every5 agree).
   - `TransferToSpot` in a native block, spent by the next EVM height; `TransferToPerp` in the same block as EVM txs.
   - Native credits (fees, rewards) to EVM accounts the window's EVM bundles also touch.
   - Big lane: the fixture header carries `evm_big_block_interval` M = 10 (big heights `h % 10 == 0`, with

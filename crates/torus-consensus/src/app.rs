@@ -29347,6 +29347,10 @@ mod crash_recovery_tests {
     const O0_BIG: u64 = 10;
     /// The stream's EVM-only senders (EVM balance, no native account).
     const O0_USERS: [u8; 4] = [0x31, 0x32, 0x33, 0x34];
+    /// Addresses that only ever get native credits (`Withdraw { to }`),
+    /// drained to an empty EVM account natively, then deleted by an EVM
+    /// touch (EIP-161) and re-funded (`O0Fed::eip161_cross_block`).
+    const O0_EMPTIED: [u8; 3] = [0x41, 0x42, 0x43];
     /// The trader that turns big (`EvmUserModify`) at height 8.
     const O0_BIG_TRADER: u8 = C5_TRADERS[0];
 
@@ -29581,6 +29585,26 @@ mod crash_recovery_tests {
         evm_all_skipped_undecodable_marker: u64,
         evm_all_skipped_undecodable_native: u64,
         evm_all_skipped_undecodable_ckpt: u64,
+        /// EIP-161 cycles (`O0_EMPTIED`), one per address.
+        eip161_cross_block: u64,
+        eip161: Vec<O0Eip161>,
+    }
+
+    /// One EIP-161 cycle of the stream (plan task 0.1): Z (`seed`) gets a
+    /// `Withdraw { to: Z }` at `fund` (its CF_ACCOUNTS row: nonce 0, no
+    /// code), drains it to an empty account by its own `TransferToPerp` at
+    /// `drain`, a zero-value EVM call to Z at `touch` (1-4 heights later,
+    /// the same Every5 window) deletes the row, Z's `TransferToSpot` at
+    /// `refund` re-creates it, and Z deploys a storage-writing contract
+    /// from nonce 0 at the EVM height `reuse`.
+    #[derive(Clone, Copy, Debug)]
+    struct O0Eip161 {
+        seed: u8,
+        fund: u64,
+        drain: u64,
+        touch: u64,
+        refund: u64,
+        reuse: u64,
     }
 
     impl O0Fed {
@@ -29619,6 +29643,7 @@ mod crash_recovery_tests {
                 ("evm_slash", self.evm_slash, 2),
                 ("evm_after_fatal", self.evm_after_fatal, 1),
                 ("evm_section_error", self.evm_section_error, 1),
+                ("eip161_cross_block", self.eip161_cross_block, 3),
                 (
                     "all_skipped_nonce_marker",
                     self.evm_all_skipped_nonce_marker,
@@ -29716,7 +29741,10 @@ mod crash_recovery_tests {
     /// one target; a `TransferToSpot` spent by the next EVM height and a
     /// `TransferToPerp` in an EVM block (native credits to EVM accounts the
     /// window's bundles touch); the big lane (an `EvmUserModify` at 8, big
-    /// heights carrying both lanes). Forced EVM heights at epoch boundaries,
+    /// heights carrying both lanes); EIP-161 cycles (`O0Eip161`: an address
+    /// with only native credits drained natively to an empty account,
+    /// deleted by an EVM touch in the same Every5 window, re-funded and
+    /// re-used). Forced EVM heights at epoch boundaries,
     /// attest heights, a slash height, the fatal block's successor, a failed
     /// section, and the all-skipped blocks (`O0_ALL_SKIPPED`).
     fn o0_blocks(n: u64, seed: u64) -> (Vec<O0Block>, O0Fed) {
@@ -29806,6 +29834,61 @@ mod crash_recovery_tests {
             .collect();
         evm_heights.retain(|h| !quiet.contains(&(h + 1)));
         let no_orders = |h: u64| quiet.contains(&(h + 10));
+        // The EIP-161 cycles, one after the other from height 20: the touch
+        // at an EVM height e on the Every5 grid, so the drain (e - 2) and
+        // the touch share one checkpoint window; no forced special block
+        // (all-skipped, fatal and its successor, the failed section) from
+        // e - 3 to e + 1 nor at the reuse height.
+        let special = |x: u64| {
+            skipped_at(x).is_some()
+                || Some(x) == fatal_at
+                || Some(x) == fatal_at.map(|f| f + 1)
+                || x == O0_SECTION_ERROR
+        };
+        let mut from = 20;
+        for seed in O0_EMPTIED {
+            let cycle = evm_heights.iter().copied().find_map(|e| {
+                if e < from || e % 5 != 0 || (e - 3..=e + 1).any(special) {
+                    return None;
+                }
+                let reuse = evm_heights.iter().copied().find(|&r| r > e + 1 && !special(r))?;
+                Some(O0Eip161 {
+                    seed,
+                    fund: e - 3,
+                    drain: e - 2,
+                    touch: e,
+                    refund: e + 1,
+                    reuse,
+                })
+            });
+            let Some(c) = cycle else { break };
+            from = c.reuse + 1;
+            fed.eip161_cross_block += 1;
+            fed.eip161.push(c);
+            let z = oracle_addr(seed);
+            let unit = |n: u128| U256::from(n * FixedPoint::ONE.raw() as u128);
+            push_native(
+                &mut blocks,
+                c.fund,
+                C5_TRADERS[1],
+                NativeAction::Withdraw {
+                    amount: unit(5),
+                    to: z,
+                },
+            );
+            push_native(
+                &mut blocks,
+                c.drain,
+                seed,
+                NativeAction::TransferToPerp { amount: unit(5) },
+            );
+            push_native(
+                &mut blocks,
+                c.refund,
+                seed,
+                NativeAction::TransferToSpot { amount: unit(2) },
+            );
+        }
         let lockbox =
             torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
         let reader =
@@ -29834,6 +29917,25 @@ mod crash_recovery_tests {
             }
             let users: Vec<u8> = C5_TRADERS.iter().chain(&O0_USERS).copied().collect();
             let pick = |rng: &mut C5Rng| users[rng.below(users.len() as u64) as usize];
+            for c in fed.eip161.clone() {
+                if h == c.touch {
+                    // EIP-161: a zero-value call touches the empty Z.
+                    txs.push(o0_tx(
+                        &mut evm_nonce,
+                        O0_USERS[(c.seed % 4) as usize],
+                        alloy_primitives::TxKind::Call(oracle_addr(c.seed)),
+                        vec![],
+                        U256::ZERO,
+                        300_000,
+                    ));
+                }
+                if h == c.reuse {
+                    // The re-created Z sends from nonce 0: a contract with storage.
+                    let nonce = evm_nonce.entry(c.seed).or_insert(0);
+                    txs.push(signed_sstore_create(&oracle_key(c.seed), *nonce));
+                    *nonce += 1;
+                }
+            }
             if h == O0_CAP_SPILL {
                 // More than the drain cap to one target (cancels target h + 1).
                 fed.cap_spill_rows += 210;
@@ -30261,6 +30363,129 @@ mod crash_recovery_tests {
             assert_eq!(b.native_actions.is_empty(), place != O0Place::Native, "{h}");
         }
         assert!(blocks[(O0_SECTION_ERROR - 1) as usize].section_error);
+    }
+
+    /// Plan task 0.1 (guard, reachability of the cross-block account
+    /// deletion): the EVM spec is CANCUN, so SELFDESTRUCT (EIP-6780) wipes
+    /// only an account created in the same tx; the one deletion of an
+    /// account that already exists in state is EIP-161's touch of an empty
+    /// account. A native route makes one: `Withdraw { to: Z }` writes Z's
+    /// CF_ACCOUNTS row (nonce 0, no code), Z's `TransferToPerp` of the whole
+    /// balance rewrites it with balance 0 and keeps the row
+    /// (`Lockbox::deposit_to_native`, `build_evm_balance_update`), and a
+    /// zero-value EVM call to Z in a later block deletes the row; Z's
+    /// `TransferToSpot` re-creates it and Z can send again from nonce 0.
+    #[test]
+    fn o0_eip161_native_drained_account_is_deleted_by_touch() {
+        let z = oracle_addr(O0_EMPTIED[0]);
+        let unit = |n: u128| U256::from(n * FixedPoint::ONE.raw() as u128);
+        let wei = |n: u128| U256::from(n * 10u128.pow(18));
+        let sign = |seed: u8, h: u64, action| {
+            torus_types::eip712::sign_native_action(
+                action,
+                NONCE_BASE + h * 1_000 + 501,
+                &oracle_key(seed),
+            )
+        };
+        let actions = [
+            vec![sign(
+                C5_TRADERS[1],
+                1,
+                NativeAction::Withdraw {
+                    amount: unit(5),
+                    to: z,
+                },
+            )],
+            vec![sign(O0_EMPTIED[0], 2, NativeAction::TransferToPerp { amount: unit(5) })],
+            vec![],
+            vec![sign(O0_EMPTIED[0], 4, NativeAction::TransferToSpot { amount: unit(2) })],
+            vec![],
+        ];
+        let mut chain = Vec::new();
+        for (i, a) in actions.into_iter().enumerate() {
+            let h = i as u64 + 1;
+            let mut b = make_block(1, a);
+            b.header.height = h;
+            b.header.timestamp = 1000 + h;
+            b.evm_transactions = match h {
+                3 => vec![signed_eip1559_with_value(
+                    &oracle_key(O0_USERS[0]),
+                    0,
+                    alloy_primitives::TxKind::Call(z),
+                    vec![],
+                    U256::ZERO,
+                )],
+                5 => vec![signed_sstore_create(&oracle_key(O0_EMPTIED[0]), 0)],
+                _ => vec![],
+            };
+            b.header.evm_tx_count = b.evm_transactions.len() as u32;
+            chain.push(b);
+        }
+        link_blocks(&mut chain);
+        let mut node = O0Node::new(O0Cfg::serial());
+        let mut rows = Vec::new();
+        for block in chain {
+            node.execute(&O0Block {
+                block,
+                slashes: vec![],
+                fatal: false,
+                section_error: false,
+            });
+            rows.push(node.db.get_account(&z).unwrap());
+        }
+        let row = |h: usize| rows[h - 1].clone();
+        let funded = row(1).expect("Withdraw { to } writes Z's row");
+        assert_eq!((funded.balance, funded.nonce), (wei(5), 0));
+        let emptied = row(2).expect("the native drain keeps Z's row");
+        assert!(
+            emptied.is_empty(),
+            "Z after its TransferToPerp: an empty account row {emptied:?}"
+        );
+        assert_eq!(row(3), None, "EIP-161: the zero-value call deletes Z");
+        let refunded = row(4).expect("TransferToSpot re-creates Z");
+        assert_eq!((refunded.balance, refunded.nonce), (wei(2), 0));
+        let reused = row(5).expect("Z sends from nonce 0");
+        assert_eq!(reused.nonce, 1, "Z's create executed");
+    }
+
+    /// Plan task 0.1 (guard on the stream's EIP-161 cycles, so the fed
+    /// counter is not vacuous): the option 0 stream run serially to the
+    /// last cycle's reuse height leaves each Z with a row after its fund,
+    /// an empty row after its drain, no row after the touch, a row of 2
+    /// units at nonce 0 after the re-fund, and nonce 1 after the reuse.
+    #[test]
+    fn o0_stream_eip161_cycles_delete_and_recreate() {
+        let (blocks, fed) = o0_blocks(300, O0_SEED);
+        assert_eq!(fed.eip161.len(), O0_EMPTIED.len(), "{:?}", fed.eip161);
+        let last = fed.eip161.iter().map(|c| c.reuse).max().unwrap();
+        let mut node = O0Node::new(O0Cfg::serial());
+        let mut seen = 0;
+        for b in &blocks[..last as usize] {
+            node.execute(b);
+            let h = b.block.header.height;
+            for c in &fed.eip161 {
+                let row = node.db.get_account(&oracle_addr(c.seed)).unwrap();
+                let what = format!("{c:?} at {h}: {row:?}");
+                if h == c.fund {
+                    let r = row.expect(&what);
+                    assert_eq!((r.balance, r.nonce), (U256::from(5u128 * 10u128.pow(18)), 0), "{what}");
+                } else if h == c.drain {
+                    assert!(row.expect(&what).is_empty(), "{what}");
+                } else if h == c.touch {
+                    assert_eq!(row, None, "{what}");
+                } else if h == c.refund {
+                    let r = row.expect(&what);
+                    assert_eq!((r.balance, r.nonce), (U256::from(2u128 * 10u128.pow(18)), 0), "{what}");
+                } else if h == c.reuse {
+                    assert_eq!(row.expect(&what).nonce, 1, "{what}");
+                } else {
+                    continue;
+                }
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 5 * O0_EMPTIED.len());
+        println!("o0 eip161 cycles: {:?}", fed.eip161);
     }
 
     /// The seed of the option 0 stream (golden and every option 0 run).
