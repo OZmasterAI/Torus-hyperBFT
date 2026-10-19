@@ -439,8 +439,9 @@ def analysis_argv(cmd, run_dir, cell, label, tag, arm, out):
 def analysis_words(a):
     """analysis-words: the words of --analysis-cmd as run_analysis runs it for each --cell (CELL_DIR LABEL TAG
     ARM), each distinct word once in first-seen order, NUL-terminated on stdout. Exit 1 (reason on stderr,
-    nothing on stdout) when it cannot run for one of them. The campaign preflight checks the script paths in
-    them before the first cell (a script path built from a placeholder is checked as each cell fills it)."""
+    nothing on stdout) when it cannot run for one of them. The campaign preflight notes the script paths in
+    them that are no file before the first cell, advisory only (a script path built from a placeholder is noted
+    as each cell fills it)."""
     words, seen = [], set()
     for cell, label, tag, arm in a.cell or []:
         out = analysis_out(step_dir_of(a.run_dir), label)

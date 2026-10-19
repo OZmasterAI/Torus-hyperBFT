@@ -841,6 +841,20 @@ cmd_words() { # cmd_words CMD: CMD split as cell_step.py runs it (shlex.split), 
 sys.stdout.write("".join(w + "\0" for w in shlex.split(sys.argv[1])))' "$1" 2>/dev/null
 }
 
+script_cmd() { # script_cmd CMD: CMD split as cell_step.py runs it (shlex.split) minus each -c command string (the
+    # word after -c or a cluster ending in c: bash -c '...', bash -lc, sh -ec, python3 -c; a string of shell or python
+    # code, no script path), re-joined (shlex.join) for analysis-words / cmd_words; rc 1 = CMD does not split
+    python3 -I -c 'import re, shlex, sys
+out, skip = [], False
+for w in shlex.split(sys.argv[1]):
+    if skip:
+        skip = False
+        continue
+    skip = re.fullmatch("-[A-Za-z]*c", w) is not None
+    out.append(w)
+sys.stdout.write(shlex.join(out))' "$1" 2>/dev/null
+}
+
 deferred_readers() { # the in-line readers that keep the report scans in-line, one "<reader>;" line each; empty =
     # none, the scans defer. The deferred outputs (log-scans.sh REPORT_SCANS, cell-endpass.sh): summary.json
     # .ingest.mempool_nonce_expired_evictions_per_node ([] until the end pass), run.log's ingest line (the "ingest
@@ -899,7 +913,7 @@ preflight_static() { # preflight_paths, then the spec checks (load_checks), from
 }
 
 preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
-    local f b node m tgt words cells filled
+    local f b node m tgt
     for f in "$HARNESS" "$DETACH" "$TOOLS/cell-step.sh" "$TOOLS/cell_step.py"; do [ -f "$f" ] || PF "$f missing"; done
     for f in pgrep zcat timeout; do command -v "$f" > /dev/null || PF "$f missing (the watchers use it)"; done
     if [ "$SAMPLERS" = 1 ]; then
@@ -927,30 +941,45 @@ preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5
             [ "$m" = "${BBMD5[$b]}" ] || PF "binary $b: bench-throughput md5 ${m:-missing} != staged ${BBMD5[$b]}"
         fi
     done
-    if [ -n "$ANALYSIS_CMD" ]; then  # its words as cell_step runs them (shlex.split: a quoted path is a path)
-        if grep -q 'analysis-words' "$TOOLS/cell_step.py"; then
-            # filled by cell_step itself for every cell it can run (Codex P2 on 9f30ce12: "{run}/analysis.py")
-            filled=1
-            mapfile -d '' -t cells < <(analysis_cells)
-            mapfile -d '' -t words < <(python3 -I "$TOOLS/cell_step.py" analysis-words --run-dir "$RUN" \
-                --analysis-cmd="$ANALYSIS_CMD" "${cells[@]}" < /dev/null; echo -n "rc=$?")
-        else  # an older frozen cell_step.py: split only, a word with a placeholder is not checked (NOTE below)
-            filled=0
-            mapfile -d '' -t words < <(cmd_words "$ANALYSIS_CMD"; echo -n "rc=$?")
-        fi
-        [ "${words[-1]:-}" = rc=0 ] || PF "analysis.cmd cannot be split as cell_step runs it (shlex.split)" \
-            "or filled for each cell (its placeholders): $ANALYSIS_CMD"
-        for f in "${words[@]:0:${#words[@]}-1}"; do
-            case $f in */*.py|*/*.sh)
-                if [ "$filled" = 0 ] && [[ $f =~ \{(out|prefix|tag|arm|label|cell|run)\} ]]; then
-                    echo "PREFLIGHT NOTE: analysis script $f not checked: $TOOLS/cell_step.py has no analysis-words" \
-                        "(an older copy), so preflight cannot fill its placeholders as each cell's cell_step does"
-                else
-                    [ -f "$f" ] || PF "analysis script $f missing"
-                fi ;;
-            esac
-        done
+    [ -z "$ANALYSIS_CMD" ] || preflight_analysis_notes
+    return 0
+}
+
+preflight_analysis_notes() { # advisory only (owner s131, after Codex P2s on 9f30ce12/c2b72397): a PREFLIGHT NOTE per
+    # analysis.cmd script word that is no file, never a FAIL, so preflight accepts every spec the pre-0f2ca85b
+    # driver accepted. The words as cell_step runs them (shlex.split: a quoted path is a path), minus each -c command
+    # string (script_cmd: bash -c '...', bash -lc, python3 -c), filled for every cell it can run by the frozen
+    # cell_step.py (analysis-words); an older one without it: split only, a word with a placeholder is not checked
+    local f cmd filled words cells
+    if ! cmd=$(script_cmd "$ANALYSIS_CMD"); then
+        echo "PREFLIGHT NOTE: analysis.cmd does not split as cell_step splits it (shlex.split; not checked further):" \
+            "$ANALYSIS_CMD"
+        return 0
     fi
+    if grep -q 'analysis-words' "$TOOLS/cell_step.py" 2>/dev/null; then
+        filled=1
+        mapfile -d '' -t cells < <(analysis_cells)
+        mapfile -d '' -t words < <(python3 -I "$TOOLS/cell_step.py" analysis-words --run-dir "$RUN" \
+            --analysis-cmd="$cmd" "${cells[@]}" < /dev/null; echo -n "rc=$?")
+    else
+        filled=0
+        mapfile -d '' -t words < <(cmd_words "$cmd"; echo -n "rc=$?")
+    fi
+    if [ "${words[-1]:-}" != rc=0 ]; then
+        echo "PREFLIGHT NOTE: analysis.cmd cannot be filled for each cell as cell_step fills it (not checked further):" \
+            "$ANALYSIS_CMD"
+        return 0
+    fi
+    for f in "${words[@]:0:${#words[@]}-1}"; do
+        case $f in */*.py|*/*.sh)
+            if [ "$filled" = 0 ] && [[ $f =~ \{(out|prefix|tag|arm|label|cell|run)\} ]]; then
+                echo "PREFLIGHT NOTE: analysis script $f not checked: $TOOLS/cell_step.py has no analysis-words" \
+                    "(an older copy), so preflight cannot fill its placeholders as each cell's cell_step does"
+            elif [ ! -f "$f" ]; then
+                echo "PREFLIGHT NOTE: analysis script $f not found (not checked further)"
+            fi ;;
+        esac
+    done
     return 0
 }
 
