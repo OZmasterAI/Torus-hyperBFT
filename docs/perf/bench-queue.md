@@ -538,6 +538,20 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per block (8n: -9.8 ms settle), `torus_exec_settle_no_merge_fallbacks_total` (must stay 0), matched/s, CPU-s per
    1M, RSS (8n: +256 MB, watch). Tools: freeze from a main that has the fix for the deferred-scan placeholder bug
    (after 0f2ca85b); if that fix isn't on main yet, freeze from `32648b44`.
+   **Done s68 (ozarchy-8q, A node `0d24371e` / B node `0d6fc0a2`, tools frozen from `32648b44` (18c: the deferred-scan
+   change has open review findings), deep P1M, smoke B 60 s, w1 A 300 s, then A B B A A B, 300 s, n = 3; perf doc
+   section 101).**
+   * Validity: all 8 cells ACCEPT / AGREE / PASS, md5 21 / 21 (+ smoke 3 / 3), 169 CHECK OK + smoke 25, 0 CHECK FAIL.
+     Flag on=true once per B node, absent in A. `torus_exec_settle_no_merge_fallbacks_total` 0 on every B node.
+     Swap +129 MB, min MemAvailable 22.4 GB.
+   * Verdict: **merge candidate** (exec-path rule met). Exec-thread on-CPU per 1k fills 3.401 -> 3.306 (0.972 [0.963,
+     0.982], 3 / 3). Native blocks/s 3.326 -> 3.327 (1.000 [0.967, 1.035]), p50 198 -> 201 ms (1.016 [0.929, 1.112]),
+     p99 1,440 -> 1,467 ms (1.020 [0.810, 1.284]): all span 1. Timeouts 2.31 -> 4.65 per 1,000 blocks (7 -> 14, not
+     resolved, p ~0.19; 8n 12 -> 6): watch.
+   * Settle 63.03 -> 56.14 ms per block (-6.89, 0.891 [0.854, 0.929]): pass B 29.79 -> 17.25, cache flush 22.92 ->
+     28.22, pass A flat. matched/s 223,639 -> 228,485 (+2.2%, 1.022 [1.010, 1.033]), CPU-s per 1M flat, fills per
+     block +1.7%. RSS mean +245 MB (+3.7%, CI spans 1; 8n +256 MB).
+   * Inter-cell gaps 66-67 s (post-cell step 61-62 s, rest 5-6 s).
 8p. **Classic vs mode 3 A/B, deep and shallow** (owner s131; after 8q; ~2 h). 8m (section 99): at 1M resting orders
    mode 3 beats Classic (save_books 65.7 -> 4.9 ms per block, blocks/s 3.2 -> 10.1, p99 1,563 -> 836 ms, RSS -2.6 GB),
    but modes 2 / 3 can't use checkpoints today (`check_checkpoint_book_mode`, owner s109: W's deferred book save assumes

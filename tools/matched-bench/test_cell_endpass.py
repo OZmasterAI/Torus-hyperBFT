@@ -85,6 +85,7 @@ class ClassificationTest(unittest.TestCase):
             [
                 "DEFER_REPORT_SCANS=${DEFER_REPORT_SCANS:-0}"[:40],
                 'case "$DEFER_REPORT_SCANS" in 0|1) ;; *)',
+                "for kv in $EXTRA_ENV; do case $kv in DEFER_REPORT_SCANS=*|GENESIS_CACHE_DIR=*)"[:40],
             ],
             uses,
         )

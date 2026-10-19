@@ -49,7 +49,9 @@ fake /proc (DRIVER_PROC). Pinned:
    which run_campaign calls once after the last cell (also on a CAMPAIGN STOP) and before the EXIT trap's
    campaign.done; each cell gets DEFER_REPORT_SCANS=1 and GENESIS_CACHE_DIR=$RUN/genesis-cache when run-cell.sh
    supports them (preflight_post; an expectation, checks file or analysis script that reads a deferred output
-   keeps the scans in-line: DeferredReadersTest), an arm's harness_env opts out.
+   keeps the scans in-line: DeferredReadersTest).
+   The driver owns both (Codex round 6): set after the arm's harness env, both ways, never from a spec or the
+   inherited env; make-driver.py refuses them in every env object (DriverOwnedHarnessVarsTest).
 16. in-line (DEFER_SCANS=0; owner rule after Codex round 4 on d6647299): each cell runs exactly the pre-end-pass
    driver's (0f2ca85b^) steps, in its order, with the same inputs, and the end pass does nothing
    (InlineSequenceTest: both bodies from one spec, run against tracing fakes, the traces compared).
@@ -3771,11 +3773,19 @@ class AnalysisShellStringPreflightTest(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("PREFLIGHT NOTE: analysis", r.stdout)
         old = subprocess.run(
-            ["git", "-C", HERE, "show",
-             "0f2ca85b^:tools/matched-bench/campaign/driver-body.sh"],
-            capture_output=True, text=True,
+            [
+                "git",
+                "-C",
+                HERE,
+                "show",
+                "0f2ca85b^:tools/matched-bench/campaign/driver-body.sh",
+            ],
+            capture_output=True,
+            text=True,
         )
-        if old.returncode == 0:  # parity with the pre-0f2ca85b driver (skipped outside a full clone)
+        if (
+            old.returncode == 0
+        ):  # parity with the pre-0f2ca85b driver (skipped outside a full clone)
             text = open(drv).read()
             olddrv = os.path.join(self.tmp, "old-driver.sh")
             with open(olddrv, "w") as fh:
@@ -3787,8 +3797,14 @@ class AnalysisShellStringPreflightTest(Base):
         step = os.path.join(run, "cell-step")
         os.makedirs(step)
         a = types.SimpleNamespace(
-            label="cell-0", tag="0", arm="A", run_dir=run, analysis_cmd=cmd,
-            analysis_timeout=30, analysis_key="{tag}", analysis_metric="metric",
+            label="cell-0",
+            tag="0",
+            arm="A",
+            run_dir=run,
+            analysis_cmd=cmd,
+            analysis_timeout=30,
+            analysis_key="{tag}",
+            analysis_metric="metric",
         )
         status, _row, evidence = cell_step.run_analysis(a, cell, step)
         self.assertEqual(status, "ok", evidence)
@@ -3811,7 +3827,7 @@ class AnalysisShellStringPreflightTest(Base):
     def test_operands_after_a_command_string_are_noted(self):
         """bash -c 'python3 -I "$0" "$@"' /path/a.py {out}: the operand is a script path, noted when missing"""
         missing = os.path.join(self.tmp, "nope", "a.py")
-        cmd = "bash -c 'exec python3 -I \"$0\" \"$@\"' %s {out}" % missing
+        cmd = 'bash -c \'exec python3 -I "$0" "$@"\' %s {out}' % missing
         rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": cmd}))
         self.assertEqual(rc, 0, out)
         self.assertIn(NOTE_MISSING % missing, out)
@@ -3922,16 +3938,170 @@ class EndPassRunTest(FakeHostBase):
         self.assertNotIn("CAMPAIGN END", out)
         self.assertLess(out.index("END PASS done"), out.index("DONE-MARKER exit=1"))
 
-    def test_arm_harness_env_opts_out(self):
-        spec = minimal_spec(
-            self.tmp, harness_env={"DEFER_REPORT_SCANS": "0", "GENESIS_CACHE_DIR": ""}
+
+class DriverOwnedHarnessVarsTest(FakeHostBase):
+    """Codex round 6 (P2 on bb2a727f): an arm's harness env DEFER_REPORT_SCANS=1 came after the driver's own on
+    run-cell.sh's env line, so a campaign whose preflight chose in-line scans (a run.log expectation) ran its cells
+    deferred and the expectation stopped the campaign. Rule: the driver's preflight decision is the only source of
+    run-cell.sh's DEFER_REPORT_SCANS (and GENESIS_REUSE of its GENESIS_CACHE_DIR): make-driver.py refuses both in
+    every env object of the spec, and the driver sets both after every override (a hand-edited AHENV, an inherited
+    environment), in both directions"""
+
+    INGEST_RE = "ingest: bench submitted=5 actions; mempool nonce-expired evictions per node: 0 0 0"
+
+    def campaign(self, spec, ahenv, **env):
+        """Codex's probe: the generated driver with AHENV[A] edited to AHENV (what an older generator or a hand
+        edit leaves), run-cell.sh = the fake harness with run-cell.sh's real report-scan blocks; preflight_static,
+        then run_campaign of one smoke cell r1-A"""
+        from test_cell_endpass import block
+
+        body = FAKE_HARNESS.replace("@GUARD@", run_cell_guard())
+        i = body.index('for i in 0 1 2; do echo "2026-10-15')
+        j = body.index("stopall\nexit", i)
+        body = (
+            body[:i]
+            + 'RUN_DIR=$DATA_ROOT/run\n. "$TOOLS_DIR/log-scans.sh"\n'
+            + "echo 'Submitted (load-gen accepted): 5' > \"$OUT/bench.log\"\n"
+            + 'echo "harness env DEFER_REPORT_SCANS=${DEFER_REPORT_SCANS:-unset}'
+            + ' GENESIS_CACHE_DIR=${GENESIS_CACHE_DIR-unset}" >> "$OUT/run.log"\n'
+            + block("ingest")
+            + "\n"
+            + block("save")
+            + "\n"
+            + body[j:]
         )
-        rc, out = self.campaign(spec, ["r1-A:A:120:none:"])
+        self.write_fake("scan-run-cell.sh", body)
+        drv = self.generate(self.write_spec(spec, "own.json"), "own.sh")
+        text = open(drv).read()
+        text, n = re.subn(
+            r"^AHENV\[A\]=.*$", "AHENV[A]=%s" % shlex.quote(ahenv), text, flags=re.M
+        )
+        self.assertEqual(n, 1, "the generated driver has no AHENV[A] line")
+        with open(drv, "w") as f:
+            f.write(text)
+        os.makedirs(spec["run_dir"])
+        script = "\n".join(
+            [
+                "DRIVER_LIB_ONLY=1; . %s || exit 99" % shlex.quote(drv),
+                "preflight_static || exit 90",
+                "echo PREFLIGHT_DEFER_SCANS=$DEFER_SCANS GENESIS_REUSE=$GENESIS_REUSE",
+                "HARNESS=%s" % shlex.quote(os.path.join(self.bin, "scan-run-cell.sh")),
+                "quiet() { return 0; }",
+                '. "$TOOLS/cell-step.sh" || exit 98',
+                "export CELL_STEP_LOG=$RUN/campaign.log",
+                "sysctl_pin",
+                'CELLS=("r1-A:A:120:none:"); SMOKE=1',
+                "run_campaign",
+            ]
+        )
+        e = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("DEFER_REPORT_SCANS", "GENESIS_CACHE_DIR")
+        }
+        e.update(
+            self.env(
+                DRIVER_DETACH=os.path.join(self.bin, "detach.sh"),
+                FAKE_PROC=self.proc,
+                FAKE_RUN_S="4",
+            )
+        )
+        e.update(env)
+        log = os.path.join(spec["run_dir"], "campaign.log")
+        with open(log, "w") as fo:
+            r = subprocess.run(
+                ["bash", "-c", script],
+                stdout=fo,
+                stderr=subprocess.STDOUT,
+                env=e,
+                timeout=600,
+            )
+        out = open(log).read()
+        runlog = open(
+            os.path.join(spec["results_root"], "test-camp-10m-r1-A", "run.log")
+        ).read()
+        return r.returncode, out, runlog
+
+    def test_codex_probe_inline_preflight_wins_over_arm_and_inherited_env(self):
+        """the round 6 probe (/tmp/review-bb2a-arm-override.py, NEW): preflight in-line (a run.log expectation),
+        the arm's harness env and the launching environment both say DEFER_REPORT_SCANS=1 and GENESIS_CACHE_DIR=
+        empty: the cell runs with DEFER_REPORT_SCANS=0 and the driver's cache dir, the expectation holds, no end
+        pass"""
+        spec = minimal_spec(
+            self.tmp,
+            samplers=False,
+            expect=[{"file": "run.log", "regex": self.INGEST_RE, "min": 1}],
+        )
+        rc, out, runlog = self.campaign(
+            spec,
+            "DEFER_REPORT_SCANS=1 GENESIS_CACHE_DIR=",
+            DEFER_REPORT_SCANS="1",
+            GENESIS_CACHE_DIR="/tmp/elsewhere",
+        )
+        self.assertIn("PREFLIGHT_DEFER_SCANS=0 GENESIS_REUSE=1", out)
         self.assertEqual(rc, 0, out)
-        runlog = open(os.path.join(spec["results_root"], LB, "run.log")).read()
-        self.assertIn("harness env DEFER_REPORT_SCANS=0 GENESIS_CACHE_DIR=\n", runlog)
-        self.assertNotIn("END PASS OK", out)
-        self.assertIn("CHECK OK %s hardscan done" % LB, out)
+        self.assertNotIn("CHECK FAIL", out)
+        self.assertNotIn("CAMPAIGN STOP", out)
+        self.assertNotIn("END PASS", out)
+        self.assertIn(
+            "harness env DEFER_REPORT_SCANS=0 GENESIS_CACHE_DIR=%s/genesis-cache\n"
+            % spec["run_dir"],
+            runlog,
+        )
+        self.assertIn(self.INGEST_RE, runlog)
+
+    def test_deferred_preflight_wins_over_arm_env(self):
+        """the other direction: preflight deferred (no reader), the arm's harness env says DEFER_REPORT_SCANS=0:
+        the cell runs deferred and the end pass completes it"""
+        spec = minimal_spec(self.tmp, samplers=False)
+        rc, out, runlog = self.campaign(spec, "DEFER_REPORT_SCANS=0")
+        self.assertIn("PREFLIGHT_DEFER_SCANS=1 GENESIS_REUSE=1", out)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("harness env DEFER_REPORT_SCANS=1 GENESIS_CACHE_DIR=", runlog)
+        self.assertIn("ingest scan deferred to the campaign end pass", runlog)
+        self.assertIn("END PASS OK test-camp-10m-r1-A:", out)
+
+    def test_spec_may_not_set_driver_owned_vars(self):
+        """make-driver.py refuses DEFER_REPORT_SCANS and GENESIS_CACHE_DIR in harness_env (spec-wide, per arm) and
+        in node_env / an arm's env (run-cell.sh's EXTRA_ENV, exported mid-run: it would overwrite run-cell.sh's
+        DEFER_REPORT_SCANS before the scans read it)"""
+        for name, val in (
+            ("DEFER_REPORT_SCANS", "0"),
+            ("DEFER_REPORT_SCANS", "1"),
+            ("GENESIS_CACHE_DIR", ""),
+            ("GENESIS_CACHE_DIR", "/x"),
+        ):
+            with self.subTest(name=name, val=val):
+                specs = {
+                    "harness_env": minimal_spec(self.tmp, harness_env={name: val}),
+                    "node_env": minimal_spec(self.tmp, node_env={name: val}),
+                }
+                s = minimal_spec(self.tmp)
+                s["arms"][1]["harness_env"] = {name: val}
+                specs["arm M1.harness_env"] = s
+                s = minimal_spec(self.tmp)
+                s["arms"][1]["env"][name] = val
+                specs["arm M1.env"] = s
+                for where, spec in specs.items():
+                    with self.assertRaises(self.gen.SpecError) as cm:
+                        self.gen.validate(spec)
+                    msg = str(cm.exception)
+                    self.assertIn(
+                        "%s: %s is set by the driver from its preflight"
+                        % (where, name),
+                        msg,
+                    )
+                # and the generator CLI refuses it (no driver written)
+                p = self.write_spec(specs["harness_env"], "bad.json")
+                out = os.path.join(self.tmp, "bad.sh")
+                r = subprocess.run(
+                    [sys.executable, "-I", GEN, p, "-o", out],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("SPEC ERROR", r.stderr)
+                self.assertFalse(os.path.exists(out))
 
 
 # ---------------------------------------------------------------- in-line = the pre-end-pass driver (owner rule)
@@ -4183,6 +4353,19 @@ class InlineSequenceTest(FakeHostBase):
         self.assertEqual(trace[enter[0] + 1], "< end_pass rc=0", trace[enter[0] :])
         return [ln for ln in trace if ln.split()[1] not in ("run_campaign", "end_pass")]
 
+    def inline_inputs(self, trace):
+        """the new trace with run-cell.sh's DEFER_REPORT_SCANS=0 taken off each detach line (Codex round 6: the
+        driver sets it after the arm's harness env, from its preflight, so neither an arm nor the launching
+        environment can defer an in-line cell's scans; run-cell.sh reads unset as 0, so the input is the old one)"""
+        res = []
+        for ln in trace:
+            if ln.startswith("detach "):
+                self.assertEqual(ln.count(" DEFER_REPORT_SCANS="), 1, ln)
+                self.assertIn(" DEFER_REPORT_SCANS=0 ", ln)
+                ln = ln.replace(" DEFER_REPORT_SCANS=0 ", " ", 1)
+            res.append(ln)
+        return res
+
     def assertSameInline(self, old, new, why):
         self.assertEqual(old["defer"], "DEFER_SCANS=none")
         self.assertEqual(new["defer"], "DEFER_SCANS=0", new["out"])
@@ -4190,7 +4373,9 @@ class InlineSequenceTest(FakeHostBase):
             "PREFLIGHT NOTE: report scans: in-line because %s" % why, new["out"]
         )
         self.assertEqual(new["rc"], old["rc"], new["out"])
-        self.assertEqual(self.without_end_pass(new["trace"]), old["trace"])
+        self.assertEqual(
+            self.inline_inputs(self.without_end_pass(new["trace"])), old["trace"]
+        )
         self.assertNotIn("cell-endpass", "\n".join(new["trace"]))
         self.assertNotIn("END PASS", new["out"])
         self.assertEqual(self.report_lines(new["out"]), self.report_lines(old["out"]))
@@ -4258,6 +4443,10 @@ class InlineSequenceTest(FakeHostBase):
             ["w1:A:120:none:", "r1-M1:M1:120:none:"],
         )
         self.assertSameInline(old, new, "expectation")
+        # the driver's DEFER_REPORT_SCANS comes after the arm's harness env on run-cell.sh's env line
+        for ln in new["trace"]:
+            if ln.startswith("detach "):
+                self.assertIn(" BULK_COUNT=100000 DEFER_REPORT_SCANS=0 ", ln)
         self.assertEqual(new["rc"], 0, new["out"])
         self.assertEqual([f for _, f in new["rows"]], ["ok", "ok"], new["out"])
         steps = self.steps(new["trace"], "test-camp-10m-w1")
