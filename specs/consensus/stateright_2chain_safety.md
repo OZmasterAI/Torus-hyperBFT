@@ -243,11 +243,10 @@ protocol at QC granularity (state, action, property fully defined):
   * `parent_lock_upholds_agreement` — BFS finds **no** violation (validates the
     fix).
   * `agreement_under_production_rule` — the **RED-first** test: it configures the
-    model with `LockRule::PRODUCTION` (currently `Grandparent`) and asserts
-    `agreement` holds. It **fails on the current rule (RED)** and **passes once
-    `PRODUCTION` is set to `Parent`** — i.e. once the `pc_to_lock` fix in §0 is
-    applied and `LockRule::PRODUCTION` is repointed. This is the red→green
-    witness for the fix.
+    model with `LockRule::PRODUCTION` and asserts `agreement` holds. It failed
+    while the rule was `Grandparent` (RED) and passes since `PRODUCTION` was set
+    to `Parent` with the `pc_to_lock` fix in §0 (`4a94e8bc`, `f6fac872`). This is
+    the red→green witness for the fix. (Status s131: `PRODUCTION = Parent`.)
 
 ---
 
