@@ -582,6 +582,12 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   - The plain fallback on an incremental error (`3580-3587`) becomes "trie ops dropped + stale marker" (task 2.3);
     until step 2 it keeps the plain rows in the overlay and logs as today.
 - Verify: `cargo nextest run -E 'rdeps(torus-state)' $F` (big core change); golden green.
+- **Done (s131, G1b, `619d1f83`, after 1.3).** As planned; `absorb_evm` moves a journal CF the overlay has not
+  touched without a copy. Deviations: `absorb_keeps_h_n_and_flush_bytes` is a torus-state test (today's path rebuilt
+  in-test from its parts: prefix batch, `HashExtras`, the seeded CF_ACCOUNTS rows; 40 random blocks with native
+  writes overlapping the EVM rows), not torus-consensus; the golden is the end-to-end check. F8's test uses the
+  probe's key watch, extended to scans (`Probe::watch_scans`), instead of a counting backend (the native phase
+  runs on the concrete overlay). New path flag `evm.absorb` (the coverage test's exact map gained it).
 
 **Task 1.3: the overlay before the EVM part; due-check through it after the absorb (R5)**
 - Test first:
@@ -599,6 +605,8 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
     the EVM part; for native blocks that only moves time.
   - The `ExecutionContext::core_writer_due` test seam (`2623`) keeps its `ReplayFault::CoreWriterDueRead` switch.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`; golden green.
+- **Done (s131, G1b, `cf6b9b2b`, first G1b commit).** As planned; the due-check runs under the `DueCheck` probe
+  scope. `pending_count` stays (test callers), over any backend.
 
 **Task 1.4: the lane read and the enqueue reads go through a backend (R7, R8)**
 - Test first: `lane_row_in_parent_layer_sets_big_fee` (`torus-bridge`): `validate_block_inner` over a layered backend
@@ -609,6 +617,9 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   (`154-178`; the comment "runs after a barrier" goes). Enqueue already takes `&impl StateBackend`: fix the doc
   (`precompiles.rs:1407`).
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`; golden green.
+- **Done (s131, G1b, `10eabfad`, after 1.5: the lane read uses 1.5's `EvmReads`).** `EvmReads::get_cf_raw` (Db:
+  the DB; Layered: `EvmBlockState::lane_read`, probe scope `Lane`). `enqueue_reads_cursor_rows_from_layers` is a
+  guard (enqueue already read through its backend): rows only in the parent, L or C give the same seqs and rows.
 
 **Task 1.5: EVM entry points take `EvmReads`, not `&StateDb`**
 - Test first: `execute_block_lanes_over_layers_equals_db` (`torus-evm`): the same block over the DB and over an
@@ -627,6 +638,14 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
     reads) or `Db`. Both are covered by the golden.
   - `append_links(&StateDb)` stays on the serial path; the fast path drops it (task 2.2).
 - Verify: `cargo nextest run -E 'rdeps(torus-evm)' $F`; golden green.
+- **Done (s131, G1b, `1ee11778`).** Deviations: `EvmReads::Layered` holds the `EvmBlockState` by value (not
+  `&EvmBlockState`): the journal moves into the executor and comes back as `native_writes`, which the absorb consumes,
+  so no layer handle outlives the EVM part (3.2's "journal dropped before native"). `RootMode { OnE, Skip }` is in
+  (Skip: zero root, no `TrieUpdates`, no oracle; unused until 3.2). The serial path passes `EvmReads::Db`: the same
+  reads and journal as before, without the overlay's per-read lookups (perf: the flag-off path is unchanged).
+  The shared decoders live in `db.rs` (`decode_code`, `decode_storage_value`, `decode_block_hash`).
+  Open for step 3: the journal's precompile reads carry no `Journal` probe scope yet (torus-evm has no
+  `test-probes` feature); the revm adapter's reads carry `Revm`.
 
 **Task 1.6: the raw-DB tripwire**
 - Test first: `tripwire_fires_on_raw_read_in_armed_scope` and `tripwire_allows_overlay_bottom_reads` (`torus-state`).
@@ -636,9 +655,17 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   `2671`, `2690`, `2723`) hold an exemption token around the call. Release builds compile it out. Step 3 arms it for
   the fast-path EVM section.
 - Verify: `cargo nextest run -p torus-state $F` + `cargo check --workspace --tests -q`.
+- **Done (s131, G1b, `4a7665a7`).** Also trips `multi_get_cf_raw`, `exists_cf_raw`, `get_storage`, `get_code`,
+  `all_accounts`, `account_storage`, `get_session`, `count_sessions_for_owner`. The overlay exempts each read method
+  for its whole call (its DB fall-through and the probes' re-reads run inside). `cargo check` ran on the plan's -p
+  set, not `--workspace` (feature re-unification); the rest of the workspace ran its nextest after 1.7.
 
 **Task 1.7: docs of the barrier assumptions** (`native_executor.rs:13619-13628`, `precompiles.rs:1407`,
 `validator.rs:154-157`, `app.rs:3418-3426`): they now say "read through the block overlay".
+- **Done (s131, G1b).** `native_executor.rs` (`core_writer_due`) in 1.3, `precompiles.rs` (`enqueue`) and
+  `validator.rs` (lane read) in 1.4; this task: the pipelined-predicate comment in `app.rs` (the EVM part's reads go
+  through the block overlay; an EVM block still barriers for its writes until step 3). "EVM blocks are never
+  pipelined" (the hand-off assert, the no-native comment) stays true until 3.2.
 
 Step 1 size: ~500-800 lines, about half tests (estimate; task 1.1 is now ~50-150, the fix's own lines are on its
 branch). Golden green after every task.

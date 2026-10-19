@@ -3485,6 +3485,14 @@ impl ExecutionContext {
         // a BARRIER: wait for W to drain, then today's serial path verbatim.
         // Replay (`DurableRows::default()`) is therefore always serial, and W
         // does not even exist at replay time (F4).
+        // Item 7 option 0 step 1: the EVM part's READS no longer need the
+        // barrier: the revm adapter and the writer-precompile journal
+        // (`EvmReads`, `EvmBlockState`), the lane read and the CoreWriter
+        // due-check all read through the block overlay (own pending -> parent
+        // -> L -> C -> DB), and the block's EVM rows are absorbed into it. An
+        // EVM block still barriers until step 3's flag, for its WRITES: the
+        // EVM root on E over the DB, the hashed mirror / trie batch, and the
+        // receipts / indices / CoreWriter links written on E.
         // s124 epoch fast path (`TORUS_EPOCH_FAST_PATH=1`): an epoch boundary
         // is pipelined too. F2: W resyncs the EVM accounts the boundary
         // credited after its write / checkpoint, as for any block. F8 is gone
