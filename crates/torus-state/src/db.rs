@@ -969,6 +969,7 @@ impl StateDb {
 
     /// Get a reference to the underlying RocksDB instance.
     pub fn inner(&self) -> &DB {
+        crate::tripwire::check("inner");
         &self.db
     }
 
@@ -1153,6 +1154,7 @@ impl StateDb {
 
     /// Get a column family handle by name (public, for WriteBatch usage).
     pub fn cf_handle(&self, name: &str) -> Result<&ColumnFamily, StateError> {
+        crate::tripwire::check("cf_handle");
         self.cf(name)
     }
 
@@ -1217,6 +1219,7 @@ impl StateDb {
 
     /// Get account info by address. Returns `None` for non-existent accounts.
     pub fn get_account(&self, address: &Address) -> Result<Option<AccountInfo>, StateError> {
+        crate::tripwire::check("get_account");
         let cf = self.cf(CF_ACCOUNTS)?;
         match self.db.get_cf(cf, address.as_slice())? {
             Some(data) => Ok(Some(decode_account_info(&data)?)),
@@ -1243,6 +1246,7 @@ impl StateDb {
 
     /// Get a storage slot value. Returns `U256::ZERO` for unset slots.
     pub fn get_storage(&self, address: &Address, index: &U256) -> Result<U256, StateError> {
+        crate::tripwire::check("get_storage");
         let cf = self.cf(CF_STORAGE)?;
         let key = storage_key(address, index);
         decode_storage_value(self.db.get_cf(cf, key)?.as_deref())
@@ -1269,6 +1273,7 @@ impl StateDb {
 
     /// Get contract bytecode by its keccak256 hash.
     pub fn get_code(&self, code_hash: &B256) -> Result<Option<Vec<u8>>, StateError> {
+        crate::tripwire::check("get_code");
         let cf = self.cf(CF_CODE)?;
         Ok(self.db.get_cf(cf, code_hash.as_slice())?)
     }
@@ -1284,6 +1289,7 @@ impl StateDb {
 
     /// Get block hash by block number.
     pub fn get_block_hash(&self, number: u64) -> Result<Option<B256>, StateError> {
+        crate::tripwire::check("get_block_hash");
         let cf = self.cf(CF_BLOCK_HEADERS)?;
         let key = number.to_be_bytes();
         Ok(decode_block_hash(self.db.get_cf(cf, key)?.as_deref()))
@@ -1304,6 +1310,7 @@ impl StateDb {
 
     /// Get a raw value from any column family.
     pub fn get_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        crate::tripwire::check("get_cf_raw");
         let cf = self.cf(cf_name)?;
         Ok(self.db.get_cf(cf, key)?)
     }
@@ -1318,6 +1325,7 @@ impl StateDb {
         cf_name: &str,
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Vec<u8>>>, StateError> {
+        crate::tripwire::check("multi_get_cf_raw");
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -1333,6 +1341,7 @@ impl StateDb {
     /// (pinned read). For hot paths that only need to know a (multi-KB) value is
     /// already local — e.g. the native-DA pre-warm filter.
     pub fn exists_cf_raw(&self, cf_name: &str, key: &[u8]) -> Result<bool, StateError> {
+        crate::tripwire::check("exists_cf_raw");
         let cf = self.cf(cf_name)?;
         Ok(self.db.get_pinned_cf(cf, key)?.is_some())
     }
@@ -1358,6 +1367,7 @@ impl StateDb {
         &self,
         pubkey: &[u8; 32],
     ) -> Result<Option<torus_types::SessionData>, StateError> {
+        crate::tripwire::check("get_session");
         match self.get_cf_raw(crate::cf::CF_SESSIONS, pubkey)? {
             Some(bytes) => {
                 let data: torus_types::SessionData = serde_json::from_slice(&bytes)
@@ -1389,6 +1399,7 @@ impl StateDb {
         &self,
         owner: &alloy_primitives::Address,
     ) -> Result<usize, StateError> {
+        crate::tripwire::check("count_sessions_for_owner");
         let cf = self.cf(crate::cf::CF_SESSIONS)?;
         count_owner_sessions(self.db.iterator_cf(cf, rocksdb::IteratorMode::Start), owner)
     }
@@ -1402,6 +1413,7 @@ impl StateDb {
 
     /// Collect all accounts from the database.
     pub fn all_accounts(&self) -> Result<Vec<(Address, AccountInfo)>, StateError> {
+        crate::tripwire::check("all_accounts");
         let cf = self.cf(CF_ACCOUNTS)?;
         let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
         let mut accounts = Vec::new();
@@ -1422,6 +1434,7 @@ impl StateDb {
 
     /// Collect all storage slots for a given address.
     pub fn account_storage(&self, address: &Address) -> Result<Vec<(U256, U256)>, StateError> {
+        crate::tripwire::check("account_storage");
         let cf = self.cf(CF_STORAGE)?;
         let prefix = address.as_slice();
         let iter = prefix_iter(&self.db, &cf, prefix);

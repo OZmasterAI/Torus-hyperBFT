@@ -226,6 +226,7 @@ impl StateBackend for StateDb {
 
     /// Pinned get: the value stays in RocksDB's block, only its length is read.
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        crate::tripwire::check("get_cf_len");
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -240,6 +241,7 @@ impl StateBackend for StateDb {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        crate::tripwire::check("iterate_cf_prefix_from");
         let mut out = Vec::new();
         if limit == 0 {
             return Ok(out);
@@ -275,6 +277,7 @@ impl StateBackend for StateDb {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        crate::tripwire::check("iterate_cf");
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -309,6 +312,7 @@ impl StateBackend for StateDb {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        crate::tripwire::check("iterate_cf_from");
         let mut out = Vec::new();
         if limit == 0 {
             return Ok(out);
@@ -331,6 +335,7 @@ impl StateBackend for StateDb {
     /// First key at/after `prefix` only (keys are sorted: if it does not
     /// start with `prefix`, none does).
     fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        crate::tripwire::check("prefix_exists");
         let db = self.inner();
         let cf_handle = db
             .cf_handle(cf)
@@ -2848,6 +2853,9 @@ fn overlay_sorted<'a>(
 
 impl StateBackend for NativeStateOverlay {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         // C2: interned CF + borrowed key lookup — ZERO allocations on this path
         // (was one String + one Vec<u8> per get). An unregistered CF name can
         // never hold overlay entries (put/delete reject it), so it falls through
@@ -2944,6 +2952,9 @@ impl StateBackend for NativeStateOverlay {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             // Unregistered CF: the overlay cannot hold entries for it; delegate
             // (the DB reports MissingColumnFamily, same as pre-C2).
@@ -2998,6 +3009,9 @@ impl StateBackend for NativeStateOverlay {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             return StateBackend::iterate_cf_from(&self.db, cf, start, limit);
         };
@@ -3030,6 +3044,9 @@ impl StateBackend for NativeStateOverlay {
 
     /// The layered point-read rule (pending, R, parent, DB) on lengths only.
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         if let Some(id) = intern_cf(cf) {
             {
                 let state = self.pending.read().unwrap();
@@ -3080,6 +3097,9 @@ impl StateBackend for NativeStateOverlay {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             return StateBackend::iterate_cf_prefix_from(&self.db, cf, prefix, start, limit);
         };
@@ -3128,6 +3148,9 @@ impl StateBackend for NativeStateOverlay {
     /// stops at the first one no layer tombstones — it skips at most the
     /// tombstones under `prefix`.
     fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
+        // bottom of its layered read, never a raw-DB bypass.
+        let _exempt = crate::tripwire::exempt();
         let Some(id) = intern_cf(cf) else {
             return StateBackend::prefix_exists(&self.db, cf, prefix);
         };

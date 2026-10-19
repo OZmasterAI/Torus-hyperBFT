@@ -29,6 +29,8 @@ pub mod snapshot;
 pub mod spawn_count;
 pub mod trade_rows;
 pub mod trie;
+/// Item 7 option 0 (task 1.6): the raw-DB tripwire (debug / test-probes builds).
+pub mod tripwire;
 pub mod trie_cursor;
 
 pub use backend::{
