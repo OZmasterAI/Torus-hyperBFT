@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use torus_core::position::{
-    position_key, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
+    position_key, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager, RunsFlush,
 };
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::{AtomicWriteOp, StateBackend, StateDb, StateError};
@@ -614,4 +614,436 @@ fn row_with_mismatched_fields_matches_the_classic_path() {
         "K untouched, K' written"
     );
     assert_state_identical(&cached, &reference);
+}
+
+// ============================================================================
+// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`): flush_with_runs == merge + flush_all
+// ============================================================================
+
+/// One backend write, in issue order: (cf, key, `Some(value)` or a delete).
+type Write = (String, Vec<u8>, Option<Vec<u8>>);
+
+/// StateBackend wrapper that records every write in order and fails the
+/// write of `fail_key` (any CF) once it is set.
+#[derive(Clone)]
+struct Recorder {
+    inner: StateDb,
+    log: Arc<Mutex<Vec<Write>>>,
+    fail_key: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl Recorder {
+    fn new() -> (tempfile::TempDir, PositionManager<Recorder>) {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recorder {
+            inner: StateDb::open(dir.path()).unwrap(),
+            log: Arc::default(),
+            fail_key: Arc::default(),
+        };
+        (dir, PositionManager::new(rec))
+    }
+
+    fn check(&self, key: &[u8]) -> Result<(), StateError> {
+        if self.fail_key.lock().unwrap().as_deref() == Some(key) {
+            return Err(StateError::InvalidData("injected write failure".into()));
+        }
+        Ok(())
+    }
+}
+
+impl StateBackend for Recorder {
+    fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        self.inner.get_cf_raw(cf, key)
+    }
+    fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        self.check(key)?;
+        self.log
+            .lock()
+            .unwrap()
+            .push((cf.to_string(), key.to_vec(), Some(value.to_vec())));
+        self.inner.put_cf_raw(cf, key, value)
+    }
+    fn delete_cf_raw(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
+        self.check(key)?;
+        self.log
+            .lock()
+            .unwrap()
+            .push((cf.to_string(), key.to_vec(), None));
+        self.inner.delete_cf_raw(cf, key)
+    }
+    fn iterate_cf(
+        &self,
+        cf: &str,
+        prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        StateBackend::iterate_cf(&self.inner, cf, prefix)
+    }
+    fn atomic_write(&self, ops: &[AtomicWriteOp<'_>]) -> Result<(), StateError> {
+        self.inner.atomic_write(ops)
+    }
+}
+
+/// Tiny deterministic LCG (no deps).
+struct Lcg(u64);
+impl Lcg {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 11) % n
+    }
+}
+
+/// Seeds `pm` with backend rows, then builds pass B's inputs: one batch
+/// cache holding market `markets + 1`'s keys (what the sequential path would
+/// leave; empty when `batch_keys` is false) and one cache per market 1..=
+/// `markets`. The fills open, extend, reduce, flip and fully close
+/// (tombstones) positions; every cache also memoizes clean reads (backend
+/// hits and misses) that must not be written.
+fn runs_scenario(
+    pm: &PositionManager<Recorder>,
+    seed: u64,
+    markets: u64,
+    batch_keys: bool,
+) -> (PositionCache, Vec<PositionCache>) {
+    let mut rng = Lcg(seed);
+    let trader = |t: u64| {
+        let mut a = [0u8; 20];
+        a[0] = (t * 37 % 251) as u8; // traders interleave across markets
+        a[19] = t as u8;
+        Address::new(a)
+    };
+    // Backend rows the fills reduce, flip or close.
+    for m in 1..=markets + 1 {
+        for t in 0..6 {
+            if rng.below(2) == 0 {
+                pm.apply_fill(&trader(t), m, t % 2 == 0, fp(2), fp(100), MarginType::Cross)
+                    .unwrap();
+            }
+        }
+    }
+    pm.state().log.lock().unwrap().clear();
+    let fill = |pm: &PositionManager<Recorder>, c: &mut PositionCache, m: u64, rng: &mut Lcg| {
+        for _ in 0..12 {
+            let t = rng.below(9);
+            let qty = 1 + rng.below(3) as i64;
+            pm.apply_fill_cached(
+                c,
+                &trader(t),
+                m,
+                rng.below(2) == 0,
+                fp(qty),
+                fp(95 + rng.below(10) as i64),
+                MarginType::Cross,
+            )
+            .unwrap();
+        }
+        // Clean reads: hits on backend rows and memoized misses.
+        for t in 9..12 {
+            c.load(pm, &trader(t), m).unwrap();
+        }
+        c.load(pm, &trader(0), m).unwrap();
+    };
+    let mut batch = PositionCache::new();
+    if batch_keys {
+        fill(pm, &mut batch, markets + 1, &mut rng);
+    }
+    let runs = (1..=markets)
+        .map(|m| {
+            let mut c = PositionCache::new();
+            fill(pm, &mut c, m, &mut rng);
+            c
+        })
+        .collect();
+    (batch, runs)
+}
+
+/// The writes and DB contents of `merge_disjoint` (reserved first, as pass
+/// B does) + `flush_all` vs `flush_with_runs`, for one scenario.
+fn flush_both_ways(seed: u64, markets: u64, batch_keys: bool) -> (Vec<Write>, Vec<Write>) {
+    let (_d1, merged_pm) = Recorder::new();
+    let (_d2, runs_pm) = Recorder::new();
+
+    let (mut merged, runs) = runs_scenario(&merged_pm, seed, markets, batch_keys);
+    merged.reserve(runs.iter().map(PositionCache::len).sum());
+    for c in runs {
+        merged.merge_disjoint(c);
+    }
+    merged.flush_all(&merged_pm).unwrap();
+
+    let (mut batch, mut runs) = runs_scenario(&runs_pm, seed, markets, batch_keys);
+    batch.flush_with_runs(&mut runs, &runs_pm).unwrap();
+
+    for cf in [CF_NATIVE_POSITIONS, CF_NATIVE_BALANCES] {
+        assert_eq!(
+            merged_pm.state().inner.iterate_cf(cf, None).unwrap(),
+            runs_pm.state().inner.iterate_cf(cf, None).unwrap(),
+            "{cf} diverged"
+        );
+    }
+    let a = std::mem::take(&mut *merged_pm.state().log.lock().unwrap());
+    let b = std::mem::take(&mut *runs_pm.state().log.lock().unwrap());
+
+    // The dirty sets are cleared: a second flush writes nothing.
+    merged.flush_all(&merged_pm).unwrap();
+    batch.flush_with_runs(&mut runs, &runs_pm).unwrap();
+    assert!(merged_pm.state().log.lock().unwrap().is_empty());
+    assert!(
+        runs_pm.state().log.lock().unwrap().is_empty(),
+        "flush_with_runs left a dirty mark"
+    );
+    (a, b)
+}
+
+/// THE contract: the same writes (CF, key, bytes, put or delete) in the same
+/// order, over many seeded scenarios with puts, deletes and clean entries,
+/// with and without keys already in the batch cache.
+#[test]
+fn flush_with_runs_writes_exactly_like_merge_then_flush_all() {
+    let (mut puts, mut deletes) = (0, 0);
+    for seed in 0..40u64 {
+        for (markets, batch_keys) in [(1, false), (5, false), (5, true), (24, true)] {
+            let (merged, runs) = flush_both_ways(seed, markets, batch_keys);
+            assert!(!merged.is_empty(), "seed {seed}: nothing written");
+            assert_eq!(
+                merged, runs,
+                "write sequence diverged (seed {seed}, {markets} markets, batch keys {batch_keys})"
+            );
+            assert!(
+                runs.windows(2).all(|w| w[0].1 < w[1].1),
+                "writes in ascending key order"
+            );
+            puts += runs.iter().filter(|w| w.2.is_some()).count();
+            deletes += runs.iter().filter(|w| w.2.is_none()).count();
+        }
+    }
+    // Not vacuous: rows written AND fully closed positions deleted.
+    assert!(puts > 1_000 && deletes > 100, "puts {puts}, deletes {deletes}");
+}
+
+/// No runs: `flush_with_runs` is `flush_all` (the sequential path and the
+/// plan-failure fallback leave everything in the batch cache).
+#[test]
+fn flush_with_no_runs_is_flush_all() {
+    for seed in 0..10u64 {
+        let (_d1, a_pm) = Recorder::new();
+        let (_d2, b_pm) = Recorder::new();
+        let (mut a, _) = runs_scenario(&a_pm, seed, 0, true);
+        let (mut b, _) = runs_scenario(&b_pm, seed, 0, true);
+        a.flush_all(&a_pm).unwrap();
+        b.flush_with_runs(&mut [], &b_pm).unwrap();
+        let (a, b) = (a_pm.state().log.lock().unwrap(), b_pm.state().log.lock().unwrap());
+        assert!(!a.is_empty());
+        assert_eq!(*a, *b, "seed {seed}");
+    }
+}
+
+/// A failing write stops both flushes at the same row with the same error:
+/// the writes before it are identical, nothing after it is written.
+#[test]
+fn flush_with_runs_fails_at_the_same_write() {
+    for seed in 0..10u64 {
+        let (full, _) = flush_both_ways(seed, 6, true);
+        let stop = full.len() / 2;
+        let fail_key = full[stop].1.clone();
+        let run = |with_runs: bool| {
+            let (_d, pm) = Recorder::new();
+            let (mut batch, mut runs) = runs_scenario(&pm, seed, 6, true);
+            *pm.state().fail_key.lock().unwrap() = Some(fail_key.clone());
+            let err = if with_runs {
+                batch.flush_with_runs(&mut runs, &pm).map(|_| ())
+            } else {
+                batch.reserve(runs.iter().map(PositionCache::len).sum());
+                for c in runs {
+                    batch.merge_disjoint(c);
+                }
+                batch.flush_all(&pm)
+            }
+            .expect_err("the write of fail_key fails")
+            .to_string();
+            let log = std::mem::take(&mut *pm.state().log.lock().unwrap());
+            (err, log)
+        };
+        let (merged_err, merged_log) = run(false);
+        let (runs_err, runs_log) = run(true);
+        assert_eq!(merged_log.len(), stop, "seed {seed}: stops at the failing row");
+        assert_eq!(merged_log, runs_log, "seed {seed}");
+        assert_eq!(merged_err, runs_err, "seed {seed}");
+    }
+}
+
+// ============================================================================
+// 8k L2.2 Codex P1: aliased opaque rows make the per-market caches overlap
+// ============================================================================
+
+/// Codex's probe (review of dbe14b21): stored rows whose fields name another
+/// market (an "opaque" row; `put_position` never writes one) make two
+/// per-market caches hold the same key. Trader 1's row under key (1, 1) says
+/// market 2, so market 1's cache loads (1, 1) and files the fill under
+/// (1, 2); market 2's cache loads (1, 2) too. Without `collision` the row
+/// under (1, 2) names market 3 (market 2's cache dirties (1, 3) and keeps
+/// (1, 2) clean: the merge's later clean row wins); with it, the row is a
+/// plain market-2 row and both caches dirty (1, 2). `extra` plain traders
+/// per market make the sort non-trivial.
+fn aliased_runs(pm: &PositionManager<Recorder>, collision: bool, extra: u8) -> Vec<PositionCache> {
+    use torus_core::position::Position;
+    let alias = addr(1);
+    let row = |market_id: MarketId, size: i64| Position {
+        trader: alias,
+        market_id,
+        is_long: true,
+        size: fp(size),
+        entry_price: fp(100),
+        cost_basis: fp(100 * size),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    for (key_market, payload_market, size) in [(1, 2, 2), (2, if collision { 2 } else { 3 }, 4)] {
+        pm.state()
+            .put_cf_raw(
+                CF_NATIVE_POSITIONS,
+                &position_key(&alias, key_market),
+                &borsh::to_vec(&row(payload_market, size)).unwrap(),
+            )
+            .unwrap();
+    }
+    pm.state().log.lock().unwrap().clear();
+    [1u64, 2]
+        .into_iter()
+        .map(|m| {
+            let mut c = PositionCache::new();
+            pm.apply_fill_cached(&mut c, &alias, m, true, fp(1), fp(100), MarginType::Cross)
+                .unwrap();
+            for i in 2..2 + extra {
+                pm.apply_fill_cached(&mut c, &addr(i), m, true, fp(1), fp(100), MarginType::Cross)
+                    .unwrap();
+            }
+            c
+        })
+        .collect()
+}
+
+/// (writes in issue order, CF_NATIVE_POSITIONS at the end, the path taken).
+type AliasOut = (Vec<Write>, Vec<(Vec<u8>, Vec<u8>)>, Option<RunsFlush>);
+
+/// Flag off (merge in market order + flush_all) or on (flush_with_runs).
+fn flush_aliased(on: bool, collision: bool, extra: u8) -> AliasOut {
+    let (_d, pm) = Recorder::new();
+    let mut runs = aliased_runs(&pm, collision, extra);
+    let mut batch = PositionCache::new();
+    let path = if on {
+        Some(batch.flush_with_runs(&mut runs, &pm).unwrap())
+    } else {
+        for c in runs {
+            batch.merge_disjoint(c);
+        }
+        batch.flush_all(&pm).unwrap();
+        None
+    };
+    let writes = std::mem::take(&mut *pm.state().log.lock().unwrap());
+    let rows = pm.state().inner.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap();
+    (writes, rows, path)
+}
+
+/// RED for Codex P1 (non-collision probe: "flag_off writes [(3, 4), (3, 5)];
+/// flag_on writes [(2, 3), (3, 5)]; final state equal: false"): with
+/// overlapping caches the flag-on flush must write exactly what merge +
+/// flush_all writes (whatever that reference does), and say it merged.
+#[test]
+fn aliased_rows_across_runs_flush_like_merge_then_flush_all() {
+    for collision in [false, true] {
+        for extra in [0u8, 50] {
+            let label = format!("collision {collision}, extra {extra}");
+            let (off_writes, off_rows, _) = flush_aliased(false, collision, extra);
+            let (on_writes, on_rows, path) = flush_aliased(true, collision, extra);
+            assert!(!off_writes.is_empty(), "{label}");
+            assert_eq!(off_writes, on_writes, "{label}: write sequence");
+            assert_eq!(off_rows, on_rows, "{label}: final positions");
+            assert_eq!(path, Some(RunsFlush::Merged), "{label}: overlapping caches fall back");
+        }
+    }
+}
+
+/// RED for Codex P1 (release probe: "flag_on market2 final sizes over 200
+/// identical inputs: {3, 5}"): the same overlapping input gives one result
+/// every time (no unstable sort over a duplicated key), equal to flag off.
+#[test]
+fn overlapping_runs_flush_one_result_every_time() {
+    let reference = flush_aliased(false, true, 50);
+    for i in 0..200 {
+        let (writes, rows, _) = flush_aliased(true, true, 50);
+        assert_eq!((&writes, &rows), (&reference.0, &reference.1), "iteration {i}");
+    }
+}
+
+/// The normal case keeps the fast path: per-market caches (clean reads,
+/// misses, tombstones; with and without batch keys of a further market; an
+/// empty run among them) flush unmerged, and still exactly like merge +
+/// flush_all.
+#[test]
+fn disjoint_runs_take_the_unmerged_path() {
+    for seed in 0..10u64 {
+        for (markets, batch_keys) in [(1, false), (5, true), (24, true)] {
+            let (_d, pm) = Recorder::new();
+            let (mut batch, mut runs) = runs_scenario(&pm, seed, markets, batch_keys);
+            runs.insert(runs.len() / 2, PositionCache::new());
+            assert_eq!(
+                batch.flush_with_runs(&mut runs, &pm).unwrap(),
+                RunsFlush::Unmerged,
+                "seed {seed}, {markets} markets"
+            );
+        }
+    }
+}
+
+/// Conservative edges: a run holding a key of another run's market (no
+/// alias needed: a plain `set` of a foreign-market row), or a batch cache
+/// whose market sits inside the runs' range, falls back; the writes still
+/// equal merge + flush_all.
+#[test]
+fn foreign_market_keys_fall_back_and_match() {
+    use torus_core::position::Position;
+    let foreign = |m: MarketId| Position {
+        trader: addr(200),
+        market_id: m,
+        is_long: false,
+        size: fp(3),
+        entry_price: fp(100),
+        cost_basis: fp(300),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    // (into run 0 a key of market 3 | into the batch cache a key of market 2)
+    for into_batch in [false, true] {
+        let build = |pm: &PositionManager<Recorder>| {
+            let (mut batch, mut runs) = runs_scenario(pm, 7, 5, false);
+            if into_batch {
+                batch.set(foreign(2));
+            } else {
+                runs[0].set(foreign(3));
+            }
+            (batch, runs)
+        };
+        let (_d1, a_pm) = Recorder::new();
+        let (mut a, runs) = build(&a_pm);
+        for c in runs {
+            a.merge_disjoint(c);
+        }
+        a.flush_all(&a_pm).unwrap();
+        let (_d2, b_pm) = Recorder::new();
+        let (mut b, mut runs) = build(&b_pm);
+        assert_eq!(
+            b.flush_with_runs(&mut runs, &b_pm).unwrap(),
+            RunsFlush::Merged,
+            "into_batch {into_batch}"
+        );
+        assert_eq!(*a_pm.state().log.lock().unwrap(), *b_pm.state().log.lock().unwrap());
+        // The fallback leaves nothing dirty behind either.
+        b_pm.state().log.lock().unwrap().clear();
+        b.flush_with_runs(&mut runs, &b_pm).unwrap();
+        assert!(b_pm.state().log.lock().unwrap().is_empty());
+    }
 }

@@ -30221,6 +30221,9 @@ mod crash_recovery_tests {
             ctx.test_no_resident = mode.is_none();
             ctx.test_reference_paths = reference;
             ctx.test_no_resident_rows = no_r;
+            // 8k L2.2: the engine pin of `with_p2_engine_threads` (`None`:
+            // production `execute_batch`, as before).
+            ctx.test_engine_threads = P2_ENGINE_THREADS.with(std::cell::Cell::get);
             if let Some(p) = probe {
                 ctx.test_block_probe = Some(p.clone());
                 ctx.liq_value_sum = true;
@@ -31290,6 +31293,85 @@ mod crash_recovery_tests {
         // Not vacuous: the books carried resting orders and stops.
         assert!(on.v4_max > 0, "V4 rested orders / stops");
         assert!(on.ro_resting_max > 0, "reduce-only orders rested");
+    }
+
+    thread_local! {
+        /// 8k L2.2: engine threads pinned on every `p2_run_full` context
+        /// made on this thread (`None` = production `execute_batch`).
+        static P2_ENGINE_THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// 8k L2.2: runs `f` with every `p2_run_full` context on this thread
+    /// pinned to the engine with `threads` workers (parallel Phase 2 and the
+    /// forced parallel settle whenever two markets have work).
+    fn with_p2_engine_threads<R>(threads: usize, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                P2_ENGINE_THREADS.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(P2_ENGINE_THREADS.with(|c| c.replace(Some(threads))));
+        f()
+    }
+
+    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, off by default): pass B
+    /// keeps each market's position cache unmerged and the end-of-call flush
+    /// writes them with the batch cache in the same key order. Over the 130
+    /// P2 blocks with reduce-only places and cloids (fills, closes and flips
+    /// in three markets, cancels, liquidations, epoch boundaries 50 / 100),
+    /// on the engine with 4 workers (so every call with two markets at work
+    /// runs the parallel settle), pipelined with a checkpoint every 5 blocks,
+    /// flag on equals flag off per block (write sets, receipts included), in
+    /// the running hash h_n, every CF and the persisted native root. The flag
+    /// is pinned on this thread (E, where pass B and the flush run); the on
+    /// run must have taken the unmerged flush, the off run never.
+    #[test]
+    fn settle_no_merge_state_equals_flag_off() {
+        use torus_bridge::native_executor::{
+            parse_settle_no_merge, settle_no_merge_fallbacks_on_this_thread,
+            settle_no_merge_flushes_on_this_thread, with_settle_no_merge, BookMode,
+        };
+        assert!(!parse_settle_no_merge(None), "off by default");
+        assert!(parse_settle_no_merge(Some("1")));
+        let (blocks, _, cloid_places) = p2_blocks_with(true, true);
+        assert!(!cloid_places.is_empty(), "the stream places cloids");
+        let run = |on: bool| {
+            let before = settle_no_merge_flushes_on_this_thread();
+            let fallbacks_before = settle_no_merge_fallbacks_on_this_thread();
+            let r = with_p2_engine_threads(4, || {
+                with_settle_no_merge(on, || {
+                    p2_run_with(
+                        &blocks,
+                        true,
+                        Some(BookMode::Classic),
+                        false,
+                        &P2Fault::None,
+                        Some(ckpt_every(5)),
+                    )
+                })
+            });
+            // Codex P1 fix: plain rows keep the per-market caches provably
+            // disjoint, so no flush falls back to merge + flush_all.
+            assert_eq!(
+                settle_no_merge_fallbacks_on_this_thread() - fallbacks_before,
+                0,
+                "no-merge fallbacks (on {on})"
+            );
+            (r, settle_no_merge_flushes_on_this_thread() - before)
+        };
+        let (off, off_runs) = run(false);
+        let (on, on_runs) = run(true);
+        assert_eq!(off_runs, 0, "flag off: no unmerged flush");
+        assert!(on_runs > 20, "flag on: the parallel settle flushed unmerged ({on_runs})");
+        assert_write_sets_equal(&off.captured, &on.captured, "settle no merge");
+        assert!(on.hash.is_some(), "running hash active");
+        assert_eq!(off.hash, on.hash, "running hash h_n");
+        assert_dumps_equal(&off.dump, &on.dump, "settle no merge");
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        assert_eq!(persisted(&off.db), persisted(&on.db), "native root");
+        assert!(on.ro_resting_max > 0, "reduce-only orders rested");
+        assert!(on.ro_moved > 0, "positions under reduce-only orders moved");
     }
 
     /// The resident staleness guards read the applied marker through the
