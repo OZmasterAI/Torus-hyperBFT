@@ -2875,44 +2875,24 @@ impl ExecutionContext {
         // written now: W digests it and keeps its side rows for the next
         // checkpoint. Deferred book saves never reach here (task 1.2 refuses
         // modes 2/3 with an interval); one would be a code bug: fail-stop.
-        let job = match (self.checkpoint.is_some(), job) {
-            (
-                true,
-                crate::exec_pipeline::Job::Flush {
+        // Item 7 option 0 (task 2.4): a Marker becomes a Digest carrying its
+        // action status and EVM side rows (`Job::into_digest`); before, its
+        // Digest had `action_status: None` and no EVM part.
+        let job = if self.checkpoint.is_some() {
+            if matches!(
+                &job,
+                crate::exec_pipeline::Job::Flush { books: Some(_), .. }
+            ) {
+                tracing::error!(
                     height,
-                    pending,
-                    evm_addrs,
-                    books,
-                    order_nonces,
-                    action_status,
-                },
-            ) => {
-                if books.is_some() {
-                    tracing::error!(
-                        height,
-                        "FATAL: deferred book save with a checkpoint interval — fail-stop"
-                    );
-                    self.exec_failed.store(true, Ordering::SeqCst);
-                    return false;
-                }
-                crate::exec_pipeline::Job::Digest {
-                    height,
-                    pending,
-                    evm_addrs,
-                    order_nonces,
-                    action_status,
-                }
+                    "FATAL: deferred book save with a checkpoint interval — fail-stop"
+                );
+                self.exec_failed.store(true, Ordering::SeqCst);
+                return false;
             }
-            (true, crate::exec_pipeline::Job::Marker { height, pending }) => {
-                crate::exec_pipeline::Job::Digest {
-                    height,
-                    pending,
-                    evm_addrs: Vec::new(),
-                    order_nonces: Vec::new(),
-                    action_status: None,
-                }
-            }
-            (_, job) => job,
+            job.into_digest()
+        } else {
+            job
         };
         let pending = match &job {
             crate::exec_pipeline::Job::Flush { pending, .. }
@@ -4776,6 +4756,10 @@ impl ExecutionContext {
                     books: deferred_books,
                     order_nonces: order_nonces.clone(),
                     action_status,
+                    // Item 7 option 0 (task 2.4): an EVM block's EVM part
+                    // rides the job only on the fast path (step 3); EVM
+                    // blocks barrier until then.
+                    evm: None,
                 }) {
                     return;
                 }
@@ -5117,7 +5101,14 @@ impl ExecutionContext {
                         .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
-                if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker { height, pending }) {
+                if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker {
+                    height,
+                    pending,
+                    // Item 7 option 0 (task 2.4): only a fast-path EVM block
+                    // without a native phase sets these (step 3, plan F2).
+                    action_status: None,
+                    evm: None,
+                }) {
                     return;
                 }
                 if !self.checkpoint_upkeep(&mut overlay, height) {
@@ -19916,6 +19907,7 @@ mod crash_recovery_tests {
                     books: Some(save),
                     order_nonces: vec![],
                     action_status: None,
+                    evm: None,
                 })
                 .unwrap();
             assert!(worker.wait_idle());
@@ -19934,6 +19926,7 @@ mod crash_recovery_tests {
                 books: Some(save3.unwrap()),
                 order_nonces: vec![],
                 action_status: None,
+                evm: None,
             })
             .unwrap();
         assert!(gate.wait_received(3), "W must have taken job 3");
@@ -19973,6 +19966,7 @@ mod crash_recovery_tests {
                 books: save,
                 order_nonces: vec![],
                 action_status: None,
+                evm: None,
             })
             .unwrap();
         assert!(!worker_c.wait_idle(), "wait_idle must report the failure");
