@@ -22045,7 +22045,7 @@ mod crash_recovery_tests {
             link_blocks(&mut blocks);
             blocks
         };
-        let run = |on: bool, fast: bool, evm_at_4: bool| {
+        let run_evm = |on: bool, fast: bool, evm_fast: bool, evm_at_4: bool| {
             let (_cfg, db) = make_test_config_and_db();
             db.put_account(
                 &k256_address(&key),
@@ -22061,6 +22061,7 @@ mod crash_recovery_tests {
             torus_economics::add_epoch_evm_gas(&db, 9_000_000, 0).unwrap();
             let mut ctx = pipeline_ctx(&db, on, None);
             ctx.epoch_fast_path = fast;
+            ctx.evm_fast_path = evm_fast;
             for b in &blocks(evm_at_4) {
                 dispatch_and_execute(&ctx, &db, b);
                 assert!(
@@ -22084,6 +22085,7 @@ mod crash_recovery_tests {
             let fees = (plan8.evm.base_fee, plan8.evm.big_base_fee);
             (fees, epoch_evm_gas(&db).unwrap(), dump_all_cfs(&db))
         };
+        let run = |on: bool, fast: bool, evm_at_4: bool| run_evm(on, fast, false, evm_at_4);
         let want = (Some(1_125_000_000), Some(1_000_000_000));
         let (fees, row, serial) = run(false, false, true);
         assert_eq!(fees, want);
@@ -22097,6 +22099,13 @@ mod crash_recovery_tests {
         let (fees, row, fast) = run(true, true, false);
         assert_eq!((fees, row), (want, (0, 0)));
         assert_dumps_equal(&serial, &fast, "F3 serial vs epoch fast path");
+        // Item 7 option 0 (task 3.7): the EVM fast path on too: block 2's EVM
+        // block and the EVM boundary 4 are pipelined; same fees, same state.
+        let (fees, row, serial) = run(false, false, true);
+        let (fees_on, row_on, evm_fast) = run_evm(true, true, true, true);
+        assert_eq!((fees_on, row_on), (fees, row));
+        assert_eq!((fees_on, row_on), (want, (21_000, 0)));
+        assert_dumps_equal(&serial, &evm_fast, "F3 serial vs EVM fast path");
     }
 
     /// Item 7 option 0 task 1.2 (F8): the absorb makes block h's own
@@ -22270,11 +22279,17 @@ mod crash_recovery_tests {
             ..Default::default()
         };
         let mut dumps = Vec::new();
-        for (on, ckpt) in [
-            (false, None),
-            (true, None),
-            (true, Some(ckpt_15000)),
-            (true, Some(ckpt_never())),
+        // Item 7 option 0 (task 3.7): each W configuration also with the EVM
+        // fast path on: the links are side rows of the block's W job (written
+        // with its Flush, or by the window's checkpoint).
+        for (on, ckpt, fast) in [
+            (false, None, false),
+            (true, None, false),
+            (true, Some(ckpt_15000), false),
+            (true, Some(ckpt_never()), false),
+            (true, None, true),
+            (true, Some(ckpt_15000), true),
+            (true, Some(ckpt_never()), true),
         ] {
             let (_cfg, db) = make_test_config_and_db();
             // Item 7 step 2: CoreWriter order delay K = 1 (rows drain at the next block).
@@ -22302,6 +22317,7 @@ mod crash_recovery_tests {
             torus_state::incremental::ensure_trie_built(&db).unwrap();
             let mut ctx = pipeline_ctx(&db, on, None);
             ctx.checkpoint = ckpt;
+            ctx.evm_fast_path = fast;
             dispatch_and_execute(&ctx, &db, &blocks[0]);
             assert!(
                 !ctx.exec_failed.load(Ordering::SeqCst),
@@ -22310,11 +22326,20 @@ mod crash_recovery_tests {
             if let Some(w) = ctx.flush_worker.as_ref() {
                 assert!(w.wait_idle());
             }
-            assert_eq!(
-                StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
-                want,
-                "on={on} ckpt={ckpt:?}: one link per queued row, after block 1"
-            );
+            // Fast path with an interval: block 1's links wait for the
+            // window's checkpoint (asserted after the shutdown below).
+            if !(fast && ckpt.is_some()) {
+                assert_eq!(
+                    StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap(),
+                    want,
+                    "on={on} ckpt={ckpt:?} fast={fast}: one link per queued row, after block 1"
+                );
+            } else {
+                assert!(
+                    StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap().is_empty(),
+                    "ckpt={ckpt:?} fast: the links ride the window"
+                );
+            }
             dispatch_and_execute(&ctx, &db, &blocks[1]);
             assert!(
                 !ctx.exec_failed.load(Ordering::SeqCst),
@@ -26460,7 +26485,11 @@ mod crash_recovery_tests {
         use torus_state::cf::CF_CORE_WRITER_QUEUE;
         let (_key, trader, blocks) = cw_due_blocks();
         let mut dumps = Vec::new();
-        for on in [false, true] {
+        // Item 7 option 0 (task 3.7): a third run with the EVM fast path on:
+        // block 2 is pipelined, its queue row rides its frozen set (the
+        // parent layer of block 3), and block 3's due-check sees it through
+        // the block overlay; same final state.
+        for (on, fast) in [(false, false), (true, false), (true, true)] {
             let (_cfg, db) = make_test_config_and_db();
             db.put_account(
                 &trader,
@@ -26473,7 +26502,8 @@ mod crash_recovery_tests {
                 },
             )
             .unwrap();
-            let ctx = pipeline_ctx(&db, on, None);
+            let mut ctx = pipeline_ctx(&db, on, None);
+            ctx.evm_fast_path = fast;
             let last_job =
                 |ctx: &ExecutionContext| ctx.last_job.lock().unwrap().as_ref().map(|p| p.height());
 
@@ -26487,19 +26517,32 @@ mod crash_recovery_tests {
 
             dispatch_and_execute(&ctx, &db, &blocks[1]);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: block 2");
-            assert_eq!(
-                last_job(&ctx),
-                None,
-                "on={on}: the EVM block is a barrier (serial)"
-            );
-            // The invariant the raw-DB due-check relies on: the EVM block's
-            // queue row is durable in the DB before block 3 runs.
-            assert_eq!(
-                CoreWriterQueue::pending_count(&db, 3).unwrap(),
-                1,
-                "on={on}: block 2's queue row (target 3) is in the raw DB"
-            );
-            assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            if fast {
+                // The EVM fast path: block 2 is pipelined and its queue row
+                // rides its frozen set, block 3's parent layer.
+                assert_eq!(last_job(&ctx), Some(2), "fast: the EVM block is pipelined");
+                let mut q3 = 3u64.to_be_bytes().to_vec();
+                q3.extend_from_slice(&0u64.to_be_bytes());
+                let parent = ctx.last_job.lock().unwrap().clone().unwrap();
+                assert!(
+                    parent.lookup_row(CF_CORE_WRITER_QUEUE, &q3).is_some_and(|r| r.is_some()),
+                    "fast: block 2's queue row (target 3) is in block 3's parent layer"
+                );
+            } else {
+                assert_eq!(
+                    last_job(&ctx),
+                    None,
+                    "on={on}: the EVM block is a barrier (serial)"
+                );
+                // The invariant the raw-DB due-check relied on: the EVM block's
+                // queue row is durable in the DB before block 3 runs.
+                assert_eq!(
+                    CoreWriterQueue::pending_count(&db, 3).unwrap(),
+                    1,
+                    "on={on}: block 2's queue row (target 3) is in the raw DB"
+                );
+                assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
+            }
 
             dispatch_and_execute(&ctx, &db, &blocks[2]);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: block 3");
@@ -26529,6 +26572,7 @@ mod crash_recovery_tests {
             dumps.push(dump_all_cfs(&db));
         }
         assert_dumps_equal(&dumps[0], &dumps[1], "CoreWriter due: pipeline off vs on");
+        assert_dumps_equal(&dumps[0], &dumps[2], "CoreWriter due: pipeline off vs EVM fast path");
     }
 
     /// Phase 3 step 2 variant of the main-branch test: a real EVM tx queues
@@ -26552,14 +26596,19 @@ mod crash_recovery_tests {
             interval: Some(std::time::Duration::from_millis(15_000)),
             ..Default::default()
         };
-        let configs: [(&str, bool, Option<crate::exec_pipeline::CheckpointPolicy>); 4] = [
-            ("pipeline off", false, None),
-            ("interval 0", true, None),
-            ("interval 15000", true, Some(ckpt_15000)),
-            ("interval never", true, Some(ckpt_never())),
+        // Item 7 option 0 (task 3.7): each W configuration also with the EVM
+        // fast path on (block 2 pipelined; its row in the parent / L).
+        let configs: [(&str, bool, Option<crate::exec_pipeline::CheckpointPolicy>, bool); 7] = [
+            ("pipeline off", false, None, false),
+            ("interval 0", true, None, false),
+            ("interval 15000", true, Some(ckpt_15000), false),
+            ("interval never", true, Some(ckpt_never()), false),
+            ("interval 0, EVM fast path", true, None, true),
+            ("interval 15000, EVM fast path", true, Some(ckpt_15000), true),
+            ("interval never, EVM fast path", true, Some(ckpt_never()), true),
         ];
         let mut dumps = Vec::new();
-        for (what, on, ckpt) in configs {
+        for (what, on, ckpt, fast) in configs {
             let (_cfg, db) = make_test_config_and_db();
             db.put_account(
                 &trader,
@@ -26576,6 +26625,7 @@ mod crash_recovery_tests {
             config.epoch_length = 4;
             let mut ctx = make_exec_ctx(&config, &db);
             ctx.checkpoint = ckpt;
+            ctx.evm_fast_path = fast;
             if on {
                 ctx.attach_flush_worker(None);
             }
@@ -26599,22 +26649,34 @@ mod crash_recovery_tests {
 
             dispatch_and_execute(&ctx, &db, &blocks[1]);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 2");
-            assert_eq!(
-                last_job(&ctx),
-                None,
-                "{what}: the EVM block is a barrier (serial)"
-            );
-            // The invariant the raw-DB due-check relies on.
-            assert_eq!(
-                CoreWriterQueue::pending_count(&db, 3).unwrap(),
-                1,
-                "{what}: block 2's queue row (target 3) is in the raw DB"
-            );
-            assert_eq!(
-                read_native_applied_height(&db),
-                Some(2),
-                "{what}: barrier made 1-2 durable"
-            );
+            if fast {
+                assert_eq!(last_job(&ctx), Some(2), "{what}: the EVM block is pipelined");
+                if ckpt.is_some() {
+                    assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+                    assert_eq!(
+                        CoreWriterQueue::pending_count(&db, 3).unwrap(),
+                        0,
+                        "{what}: block 2's queue row is in L / the parent, not the DB"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    last_job(&ctx),
+                    None,
+                    "{what}: the EVM block is a barrier (serial)"
+                );
+                // The invariant the raw-DB due-check relied on.
+                assert_eq!(
+                    CoreWriterQueue::pending_count(&db, 3).unwrap(),
+                    1,
+                    "{what}: block 2's queue row (target 3) is in the raw DB"
+                );
+                assert_eq!(
+                    read_native_applied_height(&db),
+                    Some(2),
+                    "{what}: barrier made 1-2 durable"
+                );
+            }
 
             dispatch_and_execute(&ctx, &db, &blocks[2]);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 3");
@@ -26629,7 +26691,7 @@ mod crash_recovery_tests {
             if ckpt.is_some() {
                 assert_eq!(
                     read_native_applied_height(&db),
-                    Some(2),
+                    if fast { None } else { Some(2) },
                     "{what}: block 3 still above the durable marker (in L)"
                 );
             }
@@ -27523,6 +27585,86 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Item 7 option 0 (task 3.5 step 4, for task 3.7's flag-on runs): no
+    /// status, receipt or hash -> number row of height `h` exists.
+    fn r02_assert_no_side_rows(db: &StateDb, h: u64, what: &str) {
+        assert!(
+            db.get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &h.to_be_bytes())
+                .unwrap()
+                .is_none(),
+            "{what}: no status row of {h}"
+        );
+        assert_eq!(o0_rows_at(db, torus_state::cf::CF_RECEIPTS, h), 0, "{what}: no receipt of {h}");
+        assert_eq!(o0_hash_index_at(db, h), 0, "{what}: no hash -> number row of {h}");
+    }
+
+    /// Item 7 option 0 (task 3.7): [`r02_assert_fault_fail_stops_then_replays`]
+    /// on the EVM fast path (W attached, the faulted EVM block pipelined).
+    /// As the other runs, W is drained before the faulty block and the
+    /// latch is asserted before the drop (never a drop with W held without
+    /// it, F10); plus task 3.5's step 4: no status / side row of the faulted
+    /// height, and the restart's replay re-hashes exactly that height.
+    fn r02_assert_fault_fail_stops_then_replays_fast(
+        blocks: &[TorusBlock],
+        setup: &dyn Fn(&StateDb),
+        fault: ReplayFault,
+        check: &dyn Fn(&StateDb),
+    ) {
+        let (last, prefix) = blocks.split_last().expect("at least one block");
+        let top = last.header.height;
+        let (_c, db_ref) = make_test_config_and_db();
+        setup(&db_ref);
+        let mut ctx = pipeline_ctx(&db_ref, true, None);
+        ctx.evm_fast_path = true;
+        for b in blocks {
+            dispatch_and_execute(&ctx, &db_ref, b);
+        }
+        assert!(ctx.pipeline_barrier());
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fast: control");
+        assert_eq!(ctx.test_paths.lock().unwrap().get("block.pipelined.evm"), Some(&1));
+        drop(ctx);
+        check(&db_ref);
+
+        let (dir, db) = r02_reopenable_db();
+        setup(&db);
+        let mut ctx = pipeline_ctx(&db, true, None);
+        ctx.evm_fast_path = true;
+        for b in prefix {
+            dispatch_and_execute(&ctx, &db, b);
+        }
+        assert!(ctx.pipeline_barrier());
+        let durable = persist_committed_block_durably(&db, last);
+        let before = dump_all_cfs(&db);
+        ctx.test_replay_fault = Some(fault);
+        ctx.execute_committed_block_with(last, vec![], durable);
+        assert_eq!(
+            ctx.test_paths.lock().unwrap().get("block.pipelined.evm"),
+            Some(&1),
+            "fast {fault:?}: the faulted EVM block took the fast path"
+        );
+        ctx.pipeline_barrier();
+        assert!(ctx.exec_failed.load(Ordering::SeqCst), "fast {fault:?}: must fail-stop");
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), prefix.last().map(|b| b.header.height));
+        r02_assert_no_side_rows(&db, top, &format!("fast {fault:?}"));
+        assert_dumps_equal(&before, &dump_all_cfs(&db), "R02 fast: nothing of the block flushed");
+        drop(db);
+        let db = StateDb::open(&dir).expect("reopen");
+        torus_state::running_hash::capture_begin(&db);
+        let ctx = pipeline_ctx(&db, false, None);
+        let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
+        assert_eq!(parked, None);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fast: replay");
+        drop(ctx);
+        let rehashed: Vec<u64> = torus_state::running_hash::capture_take(&db)
+            .iter()
+            .map(|(h, _)| *h)
+            .collect();
+        assert_eq!(rehashed, vec![top], "fast {fault:?}: the replay re-hashes the faulted height");
+        assert_eq!(read_native_applied_height(&db), Some(top));
+        assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "R02 fast: replay vs no fault");
+    }
+
     /// The `ClaimRewards` action R02 branch 2 replays: `nonce` is in the
     /// window of every `make_block` height used here.
     fn r02_claim(nonce: u64) -> SignedNativeAction {
@@ -28030,6 +28172,12 @@ mod crash_recovery_tests {
             assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
             assert_eq!(r02_receipt_status(db, 2), Some(true));
         });
+        // Item 7 option 0 (task 3.7): the same on the EVM fast path.
+        r02_assert_fault_fail_stops_then_replays_fast(&blocks, &|db| r02_fund(db, &key), ReplayFault::EvmLocalFault, &|db| {
+            assert!(r02_nonce_consumed(db, &b));
+            assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
+            assert_eq!(r02_receipt_status(db, 2), Some(true));
+        });
     }
 
     /// Item 7 option 0 (task 2.3): the serial EVM section's read of the EVM
@@ -28131,12 +28279,14 @@ mod crash_recovery_tests {
     /// the EVM nonce not consumed): a divergence.
     #[test]
     fn evm_db_read_fault_fail_stops_block() {
-        assert_storage_cf_fault_fail_stops_then_replays(
+        assert_storage_cf_fault_fail_stops_then_replays_runs(
             0x57,
             alloy_primitives::TxKind::Call(EVM_DB_FAULT_READER),
             vec![],
             torus_state::cf::CF_STORAGE,
             "a revm DB read fault",
+            // Item 7 option 0 (task 3.7): and on the EVM fast path.
+            &[(false, false), (true, false), (true, true)],
         );
     }
 
@@ -28150,6 +28300,10 @@ mod crash_recovery_tests {
     /// Serial and pipelined. RED before: `BridgeError::State` took the app's
     /// generic EVM arm (logged), so the block ran without its EVM writes on
     /// this node only (native part applied, EVM nonce not consumed).
+    /// Item 7 option 0 (task 3.7): no EVM-fast-path run: on the fast path E
+    /// computes no EVM root (`RootMode::Skip`), so this read does not exist;
+    /// W's EVM trie step reads the hashed mirror and trie CFs, and its own
+    /// failure marks the trie stale (task 2.3, F4).
     #[test]
     fn evm_state_root_compute_fault_fail_stops_block() {
         assert_storage_cf_fault_fail_stops_then_replays(
@@ -28179,12 +28333,14 @@ mod crash_recovery_tests {
         let mut input = alloy_primitives::keccak256(b"getBalances(address)")[..4].to_vec();
         input.extend_from_slice(&[0u8; 12]);
         input.extend_from_slice(k256_address(&key).as_slice());
-        assert_storage_cf_fault_fail_stops_then_replays(
+        assert_storage_cf_fault_fail_stops_then_replays_runs(
             0x59,
             alloy_primitives::TxKind::Call(precompile_address(ADDR_BALANCE_READER)),
             input,
             torus_state::cf::CF_NATIVE_BALANCES,
             "a precompile read fault",
+            // Item 7 option 0 (task 3.7): and on the EVM fast path.
+            &[(false, false), (true, false), (true, true)],
         );
     }
 
@@ -28202,12 +28358,14 @@ mod crash_recovery_tests {
         let mut input = alloy_primitives::keccak256(b"getStakingInfo(address)")[..4].to_vec();
         input.extend_from_slice(&[0u8; 12]);
         input.extend_from_slice(k256_address(&key).as_slice());
-        assert_storage_cf_fault_fail_stops_then_replays(
+        assert_storage_cf_fault_fail_stops_then_replays_runs(
             0x5A,
             alloy_primitives::TxKind::Call(precompile_address(ADDR_STAKING_READER)),
             input,
             torus_state::cf::CF_STAKING_DELEGATIONS,
             "a precompile scan fault",
+            // Item 7 option 0 (task 3.7): and on the EVM fast path.
+            &[(false, false), (true, false), (true, true)],
         );
     }
 
@@ -28223,14 +28381,37 @@ mod crash_recovery_tests {
         missing: &'static str,
         what: &str,
     ) {
+        assert_storage_cf_fault_fail_stops_then_replays_runs(
+            seed,
+            to,
+            input,
+            missing,
+            what,
+            &[(false, false), (true, false)],
+        );
+    }
+
+    /// [`assert_storage_cf_fault_fail_stops_then_replays`] for the runs
+    /// `(exec pipeline on, EVM fast path on)`. Item 7 option 0 (task 3.7):
+    /// a fast-path run adds task 3.5's step 4 (no status / side row of the
+    /// faulted height) and the replay re-hashing exactly it.
+    fn assert_storage_cf_fault_fail_stops_then_replays_runs(
+        seed: u8,
+        to: alloy_primitives::TxKind,
+        input: Vec<u8>,
+        missing: &'static str,
+        what: &str,
+        runs: &[(bool, bool)],
+    ) {
         let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
         let (blocks, b) = r02_evm_blocks(&key, to, input);
         let (last, prefix) = blocks.split_last().unwrap();
-        for on in [false, true] {
+        for &(on, fast) in runs {
             // Control: a healthy DB.
             let (_c, db_ref) = make_test_config_and_db();
             evm_db_fault_setup(&db_ref, &key);
-            let ctx = pipeline_ctx(&db_ref, on, None);
+            let mut ctx = pipeline_ctx(&db_ref, on, None);
+            ctx.evm_fast_path = fast;
             for blk in &blocks {
                 dispatch_and_execute(&ctx, &db_ref, blk);
             }
@@ -28256,7 +28437,8 @@ mod crash_recovery_tests {
             torus_state::running_hash::configure_activation(&db, Some(1))
                 .expect("configure running hash activation");
             evm_db_fault_setup(&db, &key);
-            let ctx = pipeline_ctx(&db, on, None);
+            let mut ctx = pipeline_ctx(&db, on, None);
+            ctx.evm_fast_path = fast;
             for blk in prefix {
                 dispatch_and_execute(&ctx, &db, blk);
             }
@@ -28268,12 +28450,22 @@ mod crash_recovery_tests {
             let durable = persist_committed_block_durably(&db, last);
             let before = dump_cfs_except(&db, missing);
             ctx.execute_committed_block_with(last, vec![], durable);
+            if fast {
+                assert_eq!(
+                    ctx.test_paths.lock().unwrap().get("block.pipelined.evm"),
+                    Some(&1),
+                    "fast: {what}: the faulted EVM block took the fast path"
+                );
+            }
             ctx.pipeline_barrier();
             assert!(
                 ctx.exec_failed.load(Ordering::SeqCst),
-                "on={on}: {what} must fail-stop"
+                "on={on} fast={fast}: {what} must fail-stop"
             );
             drop(ctx);
+            if fast {
+                r02_assert_no_side_rows(&db, 2, &format!("fast: {what}"));
+            }
             assert_eq!(
                 read_native_applied_height(&db),
                 Some(1),
@@ -28292,11 +28484,17 @@ mod crash_recovery_tests {
             // Restart: reopen with every CF, replay the faulted height.
             drop(db);
             let db = StateDb::open(&dir).expect("reopen");
+            torus_state::running_hash::capture_begin(&db);
             let ctx = pipeline_ctx(&db, false, None);
             let (_last, parked) = TorusApp::replay_committed(&db, &ctx);
             assert_eq!(parked, None);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "on={on}: replay");
             drop(ctx);
+            let rehashed: Vec<u64> = torus_state::running_hash::capture_take(&db)
+                .iter()
+                .map(|(h, _)| *h)
+                .collect();
+            assert_eq!(rehashed, vec![2], "on={on} fast={fast}: the replay re-hashes the faulted height");
             assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
             assert_dumps_equal(
                 &dump_all_cfs(&db_ref),
