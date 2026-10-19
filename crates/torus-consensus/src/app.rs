@@ -38497,6 +38497,55 @@ mod crash_recovery_tests {
         }
     }
 
+    /// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, off by default): the
+    /// Classic save's exact-size encoder writes the same book blobs as
+    /// `borsh::to_vec`. Over the 130 P2 blocks with reduce-only places and
+    /// cloids (resting orders with and without a cloid, pending stops,
+    /// cancels, liquidations, epoch boundaries 50 / 100), pipelined with a
+    /// checkpoint every 5 blocks, flag on equals flag off per block (write
+    /// sets, receipts included), in the running hash, every CF and the
+    /// persisted native root. The flag is pinned on this thread (E, where
+    /// the save runs); the on run must have taken the fast path, the off run
+    /// never.
+    #[test]
+    fn book_fast_encode_state_equals_flag_off() {
+        use torus_bridge::native_executor::{
+            book_fast_encodes_on_this_thread, parse_book_fast_encode, with_book_fast_encode,
+            BookMode,
+        };
+        assert!(!parse_book_fast_encode(None), "off by default");
+        assert!(parse_book_fast_encode(Some("1")));
+        let (blocks, _, cloid_places) = p2_blocks_with(true, true);
+        assert!(!cloid_places.is_empty(), "the stream places cloids");
+        let run = |on: bool| {
+            let before = book_fast_encodes_on_this_thread();
+            let r = with_book_fast_encode(on, || {
+                p2_run_with(
+                    &blocks,
+                    true,
+                    Some(BookMode::Classic),
+                    false,
+                    &P2Fault::None,
+                    Some(ckpt_every(5)),
+                )
+            });
+            (r, book_fast_encodes_on_this_thread() - before)
+        };
+        let (off, off_fast) = run(false);
+        let (on, on_fast) = run(true);
+        assert_eq!(off_fast, 0, "flag off: no fast encode");
+        assert!(on_fast > 0, "flag on: the Classic save took the fast path");
+        assert_write_sets_equal(&off.captured, &on.captured, "book fast encode");
+        assert!(on.hash.is_some(), "running hash active");
+        assert_eq!(off.hash, on.hash, "running hash");
+        assert_dumps_equal(&off.dump, &on.dump, "book fast encode");
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        assert_eq!(persisted(&off.db), persisted(&on.db), "native root");
+        // Not vacuous: the books carried resting orders and stops.
+        assert!(on.v4_max > 0, "V4 rested orders / stops");
+        assert!(on.ro_resting_max > 0, "reduce-only orders rested");
+    }
+
     /// The resident staleness guards read the applied marker through the
     /// overlay (parent layer first), never the DB: over the 130 P2 blocks
     /// with checkpoints never by time, R and the books are built once, as

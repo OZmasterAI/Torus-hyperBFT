@@ -25,6 +25,10 @@ use torus_state::action_status::FailureReason;
 use crate::position::{borsh_read_address, borsh_read_fp, borsh_write_address, borsh_write_fp};
 
 mod cancel_batch;
+// 8k L3.3: exact-size Classic encoder (`OrderBook::encode_classic`).
+mod classic_encode;
+#[cfg(test)]
+mod classic_encode_tests;
 mod cloid_key;
 mod trader_orders;
 
