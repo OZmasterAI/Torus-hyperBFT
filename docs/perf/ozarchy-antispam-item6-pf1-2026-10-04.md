@@ -15508,6 +15508,131 @@ error=none`, `tail_ms` <= 0.12, `delete_scan_ms` <= 0.25, `record_ms` <= 1.9):
   stage is in `ozarchy-8o-stage/` (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis is in
   `ozarchy-8o-run/analyst/` (`o8-analyse.py`, adapted from `p8h-analyse.py`, with `o8.txt` and `o8-analyse.json`).
 
+## 101. Step 8q, L2.2 full A/B (fixed): main `0f5bef38` vs `exp/8k-settle-no-merge-fix` `ddf41758` with `TORUS_SETTLE_NO_MERGE=1`, 1M-resting deep book (8i P1M), standard load, 300 markets, 300 s cells, A B B A A B, n = 3 (campaign ozarchy-8q, archy, 2026-10-19)
+
+**B passes the exec-path merge rule. Exec-thread on-CPU per 1k fills falls 2.8% (3.401 -> 3.306 ms, B / A 0.972
+[0.963, 0.982], lower in 3 / 3 pairs). Native blocks/s is unchanged (3.326 -> 3.327, 1.000 [0.967, 1.035]), and so are
+block p50 (198 -> 201 ms, 1.016 [0.929, 1.112]) and p99 (1,440 -> 1,467 ms, 1.020 [0.810, 1.284]): every CI spans 1.
+Timeouts per 1,000 native blocks are 2.31 -> 4.65 (7 -> 14 over ~3,020 blocks per arm; per pair 2 / 5, 1 / 5, 4 / 4).
+That is not resolved (exact two-sided binomial p ~0.19, paired CI [0.32, 16.7]), and 8n went the other way (12 -> 6),
+but it is the row to watch. The settle timer drops 63.03 -> 56.14 ms per native block (-6.89 ms, 0.891 [0.854,
+0.929]). Pass B falls 29.79 -> 17.25 ms (0.579 [0.546, 0.614]), the cache flush rises 22.92 -> 28.22 ms (+5.30, 1.231
+[1.200, 1.263]), and pass A does not move (8.97 -> 9.29, CI spans 1). The fixed branch never took its fallback:
+`torus_exec_settle_no_merge_fallbacks_total` was 0 on all 3 nodes of every B cell. matched/s rises 223,639 ->
+228,485 (+2.2%, 1.022 [1.010, 1.033], 3 / 3), CPU-s per 1M fills is unchanged (24.66 -> 24.57, 0.996 [0.989,
+1.004]), and fills per block are +1.7% (CI spans 1). RSS mean 6,690 -> 6,935 MB (+245 MB, 1.037 [0.987, 1.089]),
+the same +250 MB as 8n, not resolved. Plain verdict: merge candidate.**
+
+Question (bench queue step 8q, owner s131): section 98 (8n, n = 1) found the settle timer 9.8 ms per block lower with
+L2.2. Codex's P1 (aliased position rows) was then fixed on `exp/8k-settle-no-merge-fix` `ddf41758`: per-cache
+market-id ranges, and an exact flag-off fallback (merge + `flush_all`) when ranges overlap. Does the fixed branch pass
+the exec-path merge rule at n = 3 on the same deep shape, and does the fallback stay at 0?
+
+### 101.1 Setup
+
+* A: origin/main `0f5bef38`, node md5 `0d24371e849027211a69b3cf5c2c41a4`, the 8k stage reused
+  (`ozarchy-8k-stage/a`, not rebuilt), nothing set in the arm env.
+* B: `exp/8k-settle-no-merge-fix` `ddf41758` (archy's `dbe14b21` + the P1 fix), node md5
+  `0d6fc0a249aa731d9e1872f5bcd112f3`, built `cargo build --release --locked -p torus-node` in the detached worktree
+  `wt/8q-b-ddf41758` (HEAD checked by the build script) with its own `CARGO_TARGET_DIR` `~/.cargo-target-8q-b`
+  (27.8 s). Staged in `ozarchy-8q-stage/b`. `TORUS_SETTLE_NO_MERGE=1` set in B's arm env only.
+* Both arms ran A's bench-throughput `708eb332` and torus-tx-flood `dd59d50d`, so only the node differs. The
+  running exe md5 (`/proc/<pid>/exe`) matched its arm on all 3 nodes of every cell: 21 / 21, plus 3 / 3 in the smoke.
+  Code defaults otherwise (Classic books, PC 8, F on, trust cache on), re-send 250 ms and the 512 KB push threshold
+  from `env.sh`, custody 0.
+* Took effect, B only (`k8nmchk`): every B node logged `TORUS_SETTLE_NO_MERGE: settle pass B writes per-market
+  position caches unmerged` once with `on=true`. No A node logged `TORUS_SETTLE_NO_MERGE`, and the variable was
+  absent from every A node's environ.
+* Fallback (`k8fbchk`, new): the counter is registered as `torus_exec_settle_no_merge_fallbacks` in `ddf41758`'s
+  `torus-telemetry` (`lib.rs`) and exported as `torus_exec_settle_no_merge_fallbacks_total`. The check fails a B cell
+  (and so stops the campaign) if any node's end-of-cell scrape lacks it or shows > 0, and fails an A cell if the
+  metric is there. Tested both ways before launch: the smoke (B) fails as A, an 8n A cell fails as B, and a scrape
+  with value 2 fails as B. Result: 0 / 0 / 0 in each of r1-B, r2-B, r3-B and the smoke; absent in every A cell.
+* Shape: the 8i / 8n P1M deep book. 1M-account genesis (`BULK_COUNT=1000000`, input md5 `a644d0a7` copied from
+  `ozarchy-8k-tools-deep`, cell genesis md5 `4c8b8af8` in every cell) plus `PRELOAD=1000000` resting orders before
+  the load (pre-load ok, 1,000,000 resting, 23-24 s in every cell). Standard load as 8n (300 markets, rate 76,000,
+  5,000 senders, BLOCK_CAP 400, RETRY_BUSY, MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900, oracle on, IN_FLIGHT_TAIL commit,
+  CLOID_SHARE 0). 300 s cells (8n: 600 s).
+* Tools: frozen fresh from main `32648b44` by `git archive` into `ozarchy-8q-tools` (18c: the deferred-scan /
+  genesis-reuse change `0f2ca85b` .. `d6647299` has open review findings, so this overrides the queue's "freeze after
+  `0f2ca85b`" line). `diff -r` against `ozarchy-8o-tools` (a verified `32648b44` freeze): identical. An earlier
+  partial re-freeze was moved aside unused (`ozarchy-8q-tools-partial-unused`). Harness worktree `wt/8q-h-32648b44`.
+  Spec `8q-spec.json` = 8n's with the arms, labels, 300 s, the A B B A A B order, no `max_load`, and
+  `TORUS_LEVEL_HASH_CACHE` / `TORUS_DA_GC_SLOW_MS` added to `absent_env`. Checks `8q-checks.sh` = `8n-checks.sh` +
+  `k8fbchk` + `k8memchk` (min MemAvailable over the cell >= 10 GiB). Driver generated by `32648b44`'s
+  `make-driver.py`. Notes in `FROZEN.txt`.
+* Cells (one detached driver, back to back): smoke B 60 s (separate `launch smoke`), then w1 A 300 s (gated), r1-A,
+  r1-B, r2-B, r2-A, r3-A, r3-B. Pair k = rk-A / rk-B.
+* Pacing: `32648b44`'s `quiet()` gates on a 5 s CPU busy sample below 10% (the 1-min load gate that cost 8k 142-152 s
+  is gone), so no `max_load`. Gaps END -> next START: 66-67 s for all six (post-cell step 61-62 s, rest 5-6 s = the
+  busy sample). The post-cell step (checks, filtering the deep logs, records) sets the floor, as in 8n (62 s).
+* Host: archy, 62 GB, 32 CPUs. Swap used 2,269,052 kB at preflight, at most 2,398,072 kB after a cell (+129 MB;
+  stop rule +512 MB). The smoke alone grew zram swap by 515,588 kB from 1,753,468 kB, just under the limit, and swap
+  then stayed flat. Min MemAvailable during a cell 22.4 GB (stop rule 10 GB). `kernel.perf_event_paranoid` 2 at
+  every cell start and end. No cargo / rustc / indexer during the cells, and no analysis until `campaign.done`.
+
+### 101.2 Validity
+
+All 8 cells (smoke, w1, 3 x A, 3 x B) rc 0, ACCEPT / AGREE / PASS, 0 panic or fail-stop lines. 169 CHECK OK in the
+campaign plus 25 in the smoke, 0 CHECK FAIL, no CELL-FLAG, rerun pass empty. Boundary blocks pipelined 37-39 : 0 on
+every node. PE spawns 0. Warm-up gate: w1 223,669 matched/s, 3 timeouts. No drift by run order: A 224,578 / 223,485
+/ 222,853, B 229,099 / 227,518 / 228,839 matched/s (CV 0.39% / 0.37%). Every B cell is above every A cell.
+
+### 101.3 A vs B (`ozarchy-8q-run/analyst/8q.txt`; load window, node mean; per native block = per `torus_exec_engine_seconds` observation; arm means of 3 cells, paired B / A geomean with 95% t CI, 2 df)
+
+| metric | A (main) | B (no-merge, fixed) | B - A | B / A [95% CI] |
+|---|---|---|---|---|
+| exec-thread on-CPU ms per 1k fills | 3.401 | 3.306 | -0.094 | 0.972 [0.963, 0.982] |
+| native blocks/s | 3.326 | 3.327 | +0.001 | 1.000 [0.967, 1.035] |
+| block p50 ms | 198 | 201 | +3 | 1.016 [0.929, 1.112] |
+| block p99 ms | 1,440 | 1,467 | +26 | 1.020 [0.810, 1.284] |
+| timeouts per 1,000 native blocks (count) | 2.31 (7) | 4.65 (14) | +2.34 | 2.33 [0.32, 16.7] |
+| settle phase ms per native block | 63.03 | 56.14 | -6.89 | 0.891 [0.854, 0.929] |
+| settle pass A ms per block | 8.97 | 9.29 | +0.32 | 1.036 [0.969, 1.107] |
+| settle pass B ms per block | 29.79 | 17.25 | -12.54 | 0.579 [0.546, 0.614] |
+| cache flush (`torus_exec_cache_flush_seconds`) ms per block | 22.92 | 28.22 | +5.30 | 1.231 [1.200, 1.263] |
+| settle phase ms per 1k fills | 0.980 | 0.859 | -0.122 | 0.876 [0.807, 0.950] |
+| no-merge fallbacks (per node, every B cell) | absent | 0 | | |
+| fills per native block | 64,304 | 65,387 | +1,083 | 1.017 [0.978, 1.058] |
+| matched/s | 223,639 | 228,485 | +4,847 | 1.022 [1.010, 1.033] |
+| CPU-s per 1M fills | 24.66 | 24.57 | -0.09 | 0.996 [0.989, 1.004] |
+| exec ms per 1k fills | 4.366 | 4.300 | -0.066 | 0.985 [0.975, 0.995] |
+| exec engine ms per block | 154.7 | 149.8 | -4.9 | 0.968 [0.957, 0.980] |
+| save_books ms per block / per 1k fills | 64.47 / 1.003 | 66.37 / 1.015 | +1.90 / +0.012 | 1.030 [1.003, 1.057] / 1.012 [0.955, 1.074] |
+| match phase ms per block | 16.25 | 16.80 | +0.55 | 1.034 [0.998, 1.070] |
+| verify ms per block / per 1k fills | 12.22 / 0.190 | 12.51 / 0.191 | +0.29 / +0.001 | 1.024 [1.001, 1.047] / 1.007 [0.978, 1.037] |
+| exec busy share | 0.934 | 0.935 | +0.002 | 1.002 [0.998, 1.007] |
+| hotstuff-algo on-CPU ms per block | 60.7 | 61.3 | +0.6 | 1.010 [0.984, 1.038] |
+| RSS mean / max MB (3 nodes) | 6,690 / 8,229 | 6,935 / 8,424 | +245 / +195 | 1.037 [0.987, 1.089] / 1.024 [0.949, 1.104] |
+
+* Settle: pass B -12.54 ms + flush +5.30 ms + pass A +0.32 ms = -6.92 ms, which matches the -6.89 ms settle drop. As
+  in 8n, the merge goes away and the sorted walk over the runs gives ~42% of it back in the flush (8n: ~37%). The fix's
+  overlap test does not show up as a cost: pass A is within noise, and the fallback never fired.
+* Against 8n: settle -6.89 ms per block at 64k fills (8n -9.79 at 71k), per 1k fills -0.122 vs -0.134. Exec-thread
+  on-CPU per 1k fills -0.094 vs -0.134, now resolved (3 / 3 pairs, CI below 1). The deep blocks here are smaller
+  (64k vs 71k fills) because the cells are 300 s, not 600 s.
+* Per block, save_books, match and verify rise 2-3%, in step with the +1.7% fills per block; per 1k fills they are
+  flat (CIs span 1). Exec busy stays at 0.934-0.935. With less exec-thread work per fill and the same block rate, B
+  packs ~1.7% more fills into each block, so matched/s is +2.2% (resolved, 3 / 3). CPU-s per 1M fills does not change.
+* Timeouts: 7 vs 14 is the one row in B's disfavour. Pooled with 8n (A 12, B 6 over ~1,850 blocks each), the two
+  campaigns give A 19, B 20. Not a signal at this count, but the rule lists timeouts, so a longer or standard-shape
+  run should report it again.
+* RSS +245 MB mean (+3.7%) repeats 8n's +256 MB; the CI spans 1 and the per-cell range overlaps (A 6,523-6,822, B
+  6,813-7,162 MB). Plausible cause: the per-market runs are held until the flush instead of being moved into one map.
+
+### 101.4 Limits and next
+
+* n = 3 pairs of 300 s cells on the deep shape only. The standard (100k, no pre-load) shape, where blocks are ~15-28k
+  fills and the microbench's 5-7 ms applies directly, was not run (section 98 asked for it).
+* Timeouts and p99 are too few / too wide to rank (p99 CI 0.81-1.28).
+* Verdict for the owner / 18c: merge candidate under the exec-path rule (exec-thread CPU per fill CI below 1;
+  blocks/s, p50, p99 CIs span 1; fallback 0). Watch timeouts and RSS in the first standard-shape run after merge.
+* Data: `~/bench-results-matched/ozarchy-8q-300m-{smoke-s0,w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}`. Campaign files are in
+  `ozarchy-8q-run/campaign/` (`campaign.log`, `cells.tsv`, `cell-step/`, `smoke/`). Tools are in `ozarchy-8q-tools/`
+  (`8q-spec.json`, `8q-checks.sh`, `ozarchy-8q-campaign.sh`, `FROZEN.txt`), the B stage in `ozarchy-8q-stage/`
+  (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis is in `ozarchy-8q-run/analyst/` (`8q-analyse.py`
+  = 8n's with B's md5 and a per-cell fallback column; `8q.txt`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
