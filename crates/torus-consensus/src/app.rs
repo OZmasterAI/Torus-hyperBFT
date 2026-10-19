@@ -1362,6 +1362,14 @@ struct ExecutionContext {
     /// State, roots and the running hash are identical; only timing changes.
     /// No effect without W.
     epoch_fast_path: bool,
+    /// Item 7 option 0 (task 3.1): the EVM fast path
+    /// (`TORUS_EVM_FAST_PATH`, node-local, default off until Q11, read once
+    /// at construction; see `exec_pipeline::evm_fast_path_enabled`). With it
+    /// a block with EVM txs is not a barrier: it takes the pipelined path
+    /// (its other barrier reasons still hold: a buffered slash, a header or
+    /// body not dispatch-durable, an epoch boundary without the epoch fast
+    /// path, replay). No effect without W.
+    evm_fast_path: bool,
 }
 
 /// See [`ExecutionContext::test_block_probe`].
@@ -6351,6 +6359,7 @@ impl TorusApp {
             test_paths: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
             epoch_fast_path: crate::exec_pipeline::epoch_fast_path_enabled(),
+            evm_fast_path: crate::exec_pipeline::evm_fast_path_enabled(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -6462,6 +6471,24 @@ impl TorusApp {
                      (TORUS_EXEC_PIPELINE=0): no effect, every epoch-boundary block runs serially"
                 );
             }
+        }
+        // Item 7 option 0 (task 3.1): the EVM fast path only changes which
+        // blocks take the pipelined path, so it needs W too.
+        if exec_ctx.evm_fast_path {
+            if exec_ctx.flush_worker.is_some() {
+                tracing::info!(
+                    "EVM fast path ON (TORUS_EVM_FAST_PATH=1): blocks with EVM txs run pipelined \
+                     (reads through the block overlay, EVM trie and receipts on the flush worker); \
+                     EVM state and receipts become durable with the block's checkpoint"
+                );
+            } else {
+                tracing::warn!(
+                    "TORUS_EVM_FAST_PATH is set but the exec pipeline is off: no effect, every \
+                     block with EVM txs runs serially"
+                );
+            }
+        } else if crate::exec_pipeline::evm_fast_path_explicit() {
+            tracing::info!("EVM fast path OFF (TORUS_EVM_FAST_PATH): blocks with EVM txs barrier");
         }
 
         // Spawn execution pipeline: bounded channel (64 blocks) for backpressure.
@@ -14974,6 +15001,8 @@ mod crash_recovery_tests {
             liq_value_sum: liq_value_sum_enabled(),
             // s124: the epoch fast path is off unless a test sets it.
             epoch_fast_path: false,
+            // Item 7 option 0: off unless a test sets it.
+            evm_fast_path: false,
         }
     }
 
@@ -34184,6 +34213,19 @@ mod crash_recovery_tests {
         evm_at: Option<u64>,
         slash_at: Option<u64>,
     ) -> FastPathRun {
+        fast_path_run_evm(on, fast, false, policy, evm_at, slash_at)
+    }
+
+    /// [`fast_path_run`] with the item 7 option 0 EVM fast path flag
+    /// (`TORUS_EVM_FAST_PATH`) = `evm_fast`.
+    fn fast_path_run_evm(
+        on: bool,
+        fast: bool,
+        evm_fast: bool,
+        policy: Option<crate::exec_pipeline::CheckpointPolicy>,
+        evm_at: Option<u64>,
+        slash_at: Option<u64>,
+    ) -> FastPathRun {
         torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
         let key = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
         let validator = Address::repeat_byte(0x77);
@@ -34223,6 +34265,7 @@ mod crash_recovery_tests {
         let mut ctx = make_exec_ctx(&config, &db);
         ctx.checkpoint = policy;
         ctx.epoch_fast_path = fast;
+        ctx.evm_fast_path = evm_fast;
         if on {
             ctx.attach_flush_worker(None);
         }
@@ -34404,6 +34447,30 @@ mod crash_recovery_tests {
             slashed.self_stake < torus_economics::MIN_SELF_DELEGATION,
             "the slash landed"
         );
+    }
+
+    /// Item 7 option 0 (task 3.1): without `TORUS_EVM_FAST_PATH` (the
+    /// default: unset, and a test context) every block with EVM txs still
+    /// barriers and runs serially, with the epoch fast path on and W
+    /// attached: only the EVM boundary 8 (and the slash boundary 12) leave
+    /// the pipelined path, as before the flag existed, and the state equals
+    /// the serial run.
+    #[test]
+    fn evm_fast_path_flag_absent_evm_heights_stay_serial() {
+        assert!(!crate::exec_pipeline::parse_evm_fast_path(None), "unset: off");
+        let (config, db) = make_test_config_and_db();
+        assert!(!make_exec_ctx(&config, &db).evm_fast_path, "a test context: off");
+        let serial = fast_path_run(false, false, None, Some(8), Some(12));
+        let expected: Vec<u64> = (1..=13).filter(|h| *h != 8 && *h != 12).collect();
+        for (what, policy) in [
+            ("per-block", None),
+            ("never", Some(ckpt_never())),
+            ("every 5", Some(ckpt_every(5))),
+        ] {
+            let off = fast_path_run_evm(true, true, false, policy, Some(8), Some(12));
+            assert_eq!(off.pipelined, expected, "{what}: EVM height 8 serial without the flag");
+            assert_fast_path_runs_equal(&serial, &off, &format!("{what}: flag absent vs serial"));
+        }
     }
 
     /// s124 epoch fast path (e), ported from s58 bb62bab1: item 6 Phase 3
