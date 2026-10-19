@@ -630,6 +630,11 @@ pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
 /// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, OFF by default): pure
 /// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
 /// `false` = off; anything else is warned and off.
+///
+/// Classic book mode only (`TORUS_BOOK_ROWS` unset or `0`): modes 1, 2 and 3
+/// never call the Classic encoder, so the flag does nothing there. If the
+/// testnet genesis picks mode 3 (pending bench 8p and the owner's book-mode
+/// decision), remove this flag and `encode_classic` in a cleanup.
 #[doc(hidden)]
 pub fn parse_book_fast_encode(v: Option<&str>) -> bool {
     let Some(v) = v else {

@@ -14,6 +14,13 @@
 //!
 //! The layout is the Classic blob's and must never diverge from it: the
 //! `classic_encode_tests` proptest pins the two byte for byte.
+//!
+//! Scope (s131): only the Classic book mode (`TORUS_BOOK_ROWS` unset or `0`)
+//! calls this. Modes 1, 2 and 3 never do. If the testnet genesis picks mode 3
+//! (pending bench 8p and the owner's book-mode decision), this encoder and its
+//! flag are dead code: remove them in a cleanup. Before any default-on,
+//! profile the unexplained +2.8% exec-engine timer on the deep book (perf doc
+//! section 97.8).
 
 use super::*;
 

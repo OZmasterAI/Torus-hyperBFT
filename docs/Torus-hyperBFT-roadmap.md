@@ -421,6 +421,14 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
   tolerate no node down (sleep, reboot or an internet drop halts the chain until it is back; a 4th node would allow
   one); archy cannot bench while it validates (CPU and disk contention, and it skews the bench), so the bench queue
   pauses or moves to cachy.
+- **Book storage mode for the testnet genesis (s131).** 8m (perf doc section 99, n = 1): at 1M resting orders mode 3
+  (`TORUS_BOOK_ROWS=3`) cuts the exec-thread book save from 65.70 to 4.93 ms per block and blocks/s 3.24 -> 10.14, but
+  costs the flush worker (per-block flush, +18% whole-process CPU-s per 1M fills); mode 3 is the candidate. Pending:
+  bench 8p (longer Classic vs mode 3 A/B, deep and standard shape) and the owner's decision; design note
+  `docs/plans/deep-book-save-options.md` on branch `docs/deep-book-save-options`. **L3.3 (`TORUS_BOOK_FAST_ENCODE`,
+  merged off by default s131) only affects Classic:** if the genesis picks mode 3 it is dead code and should be
+  removed in a cleanup; before any default-on, profile the unexplained +2.8% exec-engine timer on the deep book
+  (section 97.8).
 
 ---
 
