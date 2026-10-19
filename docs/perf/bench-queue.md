@@ -619,6 +619,11 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (view durations, commit persist, body persist, handoff waits), blocks/s per minute aligned to the first deleting
    pass, the slow-pass WARN lines, and the worker's ~300 'dispatch_behind' holds per cell. Name the dominant
    difference with numbers. Also push the raw per-cell metric data (text only, no node DBs) to `data/ozarchy-8r`.
+   **Done s68 (8r-attr, analysis only, section 103.6): the cost common to B and C is state DB compaction of
+   `cf_block_bodies` from the state pruner's `delete_range_cf` tombstones (compaction CPU 0.077 -> 0.151 / 0.154 s/s
+   per node, x 2.0, 4 / 4), not the DA GC; with the GC it accounts for CPU per fill; exec us / fill +14-16% in
+   state-compaction seconds (23% vs 13% of seconds); blocks/s link medium-low (bigger blocks, saturated exec); no
+   RocksDB stalls. Next: retention-on arm with block-body pruning off. Raw 8r data: branch `data/ozarchy-8r` 7c8323ac.**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
