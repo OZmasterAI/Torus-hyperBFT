@@ -404,6 +404,25 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    storage, network / DA, crypto, wildcard incl. theoretical), adversarial review and ranking, build the top 1-2 on
    `exp/8k-<name>` behind a flag (tests first, microbench gate), A/B n = 3 under the exec-path merge rule, write-up.
    Never merges to main; keeps off item 7 option 0's and RH4's code.
+8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; after 8k; ~2 h 20 + extra cells,
+   estimate). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
+   `origin/feat/item7-option0` at `f8a45a2d` (G0-G4 done; G3 and the whole branch Codex torus-adversarial reviewed;
+   not merged: the owner decides the merge), code defaults, 512 KB from `env.sh`, custody 0. The off and on arms run
+   the SAME binary. **Arms (2 x 2):** N-off, E-off, N-on, E-on; every arm sets `TORUS_EVM_FAST_PATH=0` or `=1`
+   explicitly via `EXTRA_ENV` (never absent). E arms: `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`. Standard load
+   (hsdb-300m), N = 11 bench genesis, 300 markets, 600 s, 3 validators. **Order:** smoke per arm (60 s), warm-up E-on
+   300 s, r1 N-off E-off E-on N-on, r2 N-on E-on E-off N-off, r3 as r1 (n = 3; n = 4 if a merge-rule CI straddles 1
+   by under 1 point). **Judge** E-on / E-off by the exec-path merge rule above; N-on / N-off within noise (the flag
+   is inert without EVM); plus section 6's six option 0 passes (E-on / N-on >= 0.97 matched/s; E-off / N-off near
+   section 85's 0.913; pipelined share at EVM heights >= 99% from `torus_exec_evm_fast_path_blocks` /
+   `torus_exec_evm_blocks`; exec idle before an EVM block from `torus_exec_evm_idle_before_seconds` (the 4 / 8 ms
+   bucket edges can't resolve 5 ms: use the logs); 0 deferred-read waits, 0 resident-row rebuilds, 0 shared layers;
+   EVM landed = accepted, eth head within one interval, attestations agree). Also report
+   `torus_flush_worker_evm_trie_seconds` and W busy (the EVM trie step moved to W). **Extra cells** (n = 1 each,
+   after the matrix): E-heavy `EVM_LOAD_RATE=40` off and on; one SIGKILL crash cell under EVM load with the flag on
+   (digests agree, replay length); one mixed-flag cell (val0 on, val1 off, val2 on with
+   `TORUS_CHECKPOINT_INTERVAL_MS=0`): attestations agree for the whole cell. The default flip is the owner's call
+   after this.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
