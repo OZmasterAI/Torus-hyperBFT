@@ -709,7 +709,9 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   death: ... -> continuing`: no checks run, cell_step flags its row `death` and queues a
   rerun, and the campaign goes on. `memguard` stops the cell unit when MemAvailable < 6 GB.
   `hardscan` prints `HARD FINDING` lines for panic, fail-stop and state hash mismatch lines
-  logged at WARN or ERROR (it never fails a cell); it runs in the end pass (next bullet).
+  logged at WARN or ERROR (it never fails a cell); in-line it runs right after the cell's
+  checks, before its cells.tsv row (an `analysis.cmd` may read its lines), deferred in the end
+  pass (next bullet).
 - **Post-cell work: in-line vs end pass** (bench queue pacing rule, s131). Right after a cell
   only what decides the next cell runs (`DRIVER show`: `POSTCELL inline ...`): run-cell.sh's
   rc, validity / agreement / liveness (summary.json, incl. the panic / fail-stop and ERROR
@@ -737,17 +739,24 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   excerpt or `deferred-scans.json`, any checks file and any `analysis.cmd` keep them in-line
   (`end_pass=0`). One `PREFLIGHT NOTE: report scans: deferred to the campaign end pass ...`
   or `PREFLIGHT NOTE: report scans: in-line because <readers> ...` line records the decision.
+  In-line, every cell runs exactly the pre-end-pass driver's steps (0f2ca85b^), in its order,
+  with the same inputs (`hardscan`, `soakchk` in `cell()` before the cell's row; run-cell.sh
+  scans in-line) and the end pass does nothing, not even a line (owner rule s131;
+  `InlineSequenceTest` runs both bodies from one spec against tracing fakes and compares the
+  step traces). Genesis reuse is the one in-line difference: `GENESIS_CACHE_DIR`.
   The other in-line steps read none (marketchk: `cell.markets`; warm-up gate and cell_step:
   validity, agreement, liveness, headline, crash, binaries). Opt out by hand with
   `harness_env` `"DEFER_REPORT_SCANS": "0"`. Preflight has the frozen `cell_step.py`
   (`analysis-words`, run_analysis's own split and fill) split `analysis.cmd` and fill its
   placeholders (`{run}` `{prefix}` `{cell}` `{label}` `{tag}` `{arm}` `{out}`) for every cell
   it can run (each planned cell and its `-rerun`; smoke: the smoke cell under `$RUN/smoke`),
-  then checks that each `*.py` / `*.sh` word exists (`PREFLIGHT FAIL: analysis script
-  <filled path> missing`; a quoted path is a path; a command that does not split fails
-  preflight too). An older frozen `cell_step.py` without `analysis-words`: the command is only
-  split, and a script word holding a placeholder is not checked (`PREFLIGHT NOTE: analysis
-  script ... not checked`).
+  then notes each `*.py` / `*.sh` word that is no file (`PREFLIGHT NOTE: analysis script
+  <filled path> not found (not checked further)`; a quoted path is a path). Advisory only: the
+  check never fails preflight (a command that does not split is a NOTE too), so every spec the
+  pre-0f2ca85b driver accepted still passes. A `-c` command string (`bash -c '...'`, `bash -lc`,
+  `python3 -c`) is skipped entirely; the operands after it are still noted. An older frozen
+  `cell_step.py` without `analysis-words`: the command is only split, and a script word holding
+  a placeholder is not checked (`PREFLIGHT NOTE: analysis script ... not checked`).
 - **Genesis reuse**: every cell runs with `GENESIS_CACHE_DIR=$RUN/genesis-cache`. run-cell.sh
   keys every genesis input (`genesis_cache.py`: the generator scripts and their data incl.
   the weighted-full base genesis and its params sidecar, run-cell.sh, `MARKETS`,
