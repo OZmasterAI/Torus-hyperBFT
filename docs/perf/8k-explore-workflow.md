@@ -112,7 +112,8 @@ One short report to 18c / the owner: the ideas (top 5 with scores), what was bui
   in the bench queue. `perf_event_paranoid` stays as it is unless the owner says otherwise.
 - Budget: Phases 1-3 at most ~12 agents in total; at most 2 builds; bench time at most ~4 h. If the top pick dies at
   the microbench, the second pick gets the budget.
-- Phases 1-3 use no bench time and may run while 8j waits for its SHAs; pause any build or bench of 8k while 8j runs.
+- If 8j's SHAs are not posted when 8i ends, run 8k in full (all phases). When they appear, pause 8k at the next safe
+  point (after the current bench cell or build), run 8j, then resume 8k. Never build or bench 8k while 8j runs.
 - Never edit results. A failed idea is a result: write it up as carefully as a win.
 
 ---- PROMPT END ----
