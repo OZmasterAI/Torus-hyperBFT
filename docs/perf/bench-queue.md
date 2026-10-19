@@ -408,6 +408,24 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    storage, network / DA, crypto, wildcard incl. theoretical), adversarial review and ranking, build the top 1-2 on
    `exp/8k-<name>` behind a flag (tests first, microbench gate), A/B n = 3 under the exec-path merge rule, write-up.
    Never merges to main; keeps off item 7 option 0's and RH4's code.
+   **Done s68 (8k, phases 1-5 run, verdict pending; perf doc section 97). 21 ideas (4 dead, 15 backlog, 2 picked;
+   top 5: L3.3 1.60, L2.2 0.84, L3.1 0.54, L5.1 0.47, L2.1 0.37; `docs/perf/8k-explore-ideas.md`). L3.3 exact-size
+   Classic book encoder built on `exp/8k-book-fast-encode` `4b916ecf` (`TORUS_BOOK_FAST_ENCODE=1`, default off;
+   nextest 4161 / 0 failed; flag on == off on a 130-block app stream; microbench P1M encode -30 to -36% with
+   spread book sizes, -5.5 to -18.7% with equal sizes; the ranker's size-pass design -9 to -16%, dead). A/B, A = main
+   `0f5bef38` node `0d24371e`, B = `4b916ecf` node `b0a4c2f1`, 600 s, A B B A A B: ozarchy-8k standard 7 / 7 cells
+   valid by driver (raw matched/s A 259,917, B 261,123); ozarchy-8kd deep book (PRELOAD=1000000) 7 / 7 valid by
+   driver (raw A 224,195, B 227,344, +1.4%). Analysis not run, so no verdict yet: run
+   `ozarchy-8k-run/analyst/8k-analyse.py` on both run dirs, then judge by the exec-path merge rule. L2.2 no-merge position flush written but
+   not compiled (worktree `wt/8k-settle-no-merge`, uncommitted). Next best idea: L3.1.**
+   **Final (s131, section 97.8, archy's 8k report; the Done line above was written mid-run):** L3.3 A/B, both shapes
+   n = 3: save_books per 1k fills 0.845 [0.762, 0.938] standard, 0.853 [0.836, 0.872] deep; exec-thread on-CPU per 1k
+   fills 0.990 (spans 1) standard, 0.968 [0.962, 0.973] deep; matched/s, blocks/s, p99 span 1. Codex torus review of
+   `4b916ecf`: no findings. L2.2 committed and pushed (`exp/8k-settle-no-merge` `dbe14b21`, workspace 4163 / 4163;
+   microbench -5.3 / -7.0 ms per block at 16.8k / 22.8k fills); Codex torus review P1: aliased opaque position rows
+   make the market caches overlap, so flag on != off and the release state is nondeterministic (unstable sort); fix
+   before any merge (prove disjointness incl. clean entries, else fall back to merge_disjoint). The 8n screen stays
+   valid (benches create no aliased rows).
    **Pacing rule (owner s131, every step from here on):** run all cells of a step from ONE detached driver, back to
    back, with at most ~60 s idle between the end of one cell and the start of the next (teardown, the quiet check and
    the next genesis included where possible). Don't wait for an agent wake-up between cells; the driver chains them.
