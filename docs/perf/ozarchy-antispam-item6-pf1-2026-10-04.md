@@ -15156,6 +15156,161 @@ campaign plus the smoke's, 0 CHECK FAIL, no CELL-FLAG. Every node had boundary b
   (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis is in `ozarchy-8n-run/analyst/`
   (`8n-analyse.py` = 8k's with settle pass A / B rows, a B/A column and n = 1 handling; `8n.txt`).
 
+## 99. Step 8m, book storage mode at depth + `TORUS_CKPT_DEFER_BOOKS` (L3.1 zero-build) screen: one binary main `898213e5`, Classic / Classic + defer-books / modes 1, 2, 3 on the 1M-resting deep book, Classic and mode 1 without pre-load, standard load, 300 markets, 300 s cells, n = 1 (campaign ozarchy-8m, archy, 2026-10-19)
+
+**At 1M resting orders mode 3 (LevelAuthorityChunked) cuts the exec-thread book save from 65.70 to 4.93 ms per native
+block (0.996 -> 0.228 ms per 1k fills) and exec-thread on-CPU from 3.419 to 2.551 ms per 1k fills (-25%). matched/s
+223,857 -> 238,445, blocks/s 3.24 -> 10.14, p50 / p99 202 / 1,563 -> 34 / 836 ms, RSS mean 6,944 -> 4,360 MB. It pays
+on the flush worker: modes 2 / 3 turn the 15 s checkpoints off (per-block flush), and W's time per 1k fills rises from
+0.378 to 1.994 ms (5.3x). Whole-process CPU-s per 1M fills is 24.85 -> 29.33 (+18%). Mode 2 is close to mode 3 and a
+little worse everywhere. Mode 1 (OrderRows) is in between at depth (save_books 0.709 ms per 1k fills, on-CPU 2.962) but
+worse than Classic on a shallow book: P0 save_books 0.212 -> 0.676 ms per 1k fills, on-CPU 2.652 -> 2.926, matched/s
+265,863 -> 232,960. `TORUS_CKPT_DEFER_BOOKS=1` changes nothing that this screen can see: save_books 65.70 -> 66.73 ms
+per block, on-CPU 3.419 -> 3.727 per 1k fills, matched/s 218,372. Screen answer (n = 1): mode 3 is the candidate for
+the testnet genesis. Mode 1 and defer-books drop out, and mode 2 is superseded by mode 3. Before any genesis change,
+the longer A/B is Classic vs mode 3 (deep and standard shape), judged also on CPU per fill and W headroom.**
+
+Question (bench queue step 8m, owner s131): 8i (section 96) found that at 1M resting orders Classic's `save_books` is
+73% whole-book encode, linear in depth. The row and level modes save only what changed, but they were benched only at
+normal load: Classic vs mode 3 was about a tie there (section 36 / Q7, `docs/perf/item7-step2-native-ab.md`). The
+owner's s107 decision kept Classic on testnet and said to revisit mode 3 with a deep-book shape. Which mode should the
+testnet genesis use?
+
+### 99.1 Setup
+
+* One binary: origin/main `898213e5`, built `cargo build --release --locked -p torus-node / bench-throughput /
+  torus-tx-flood` in a new detached worktree `wt/8m-898213e5`. Its `CARGO_TARGET_DIR` `~/.cargo-target-8m` was a
+  reflink copy of `~/.cargo-target-8l-m` (node 28 s). Node md5 `0d24371e849027211a69b3cf5c2c41a4`, bench `708eb332`,
+  flood `dd59d50d`. This is byte-identical to the `0f5bef38` node of 8k / 8n: there is no crate or `Cargo.lock` change
+  between the two commits (docs and tools only). Staged in `ozarchy-8m-stage/m`. Code defaults (F on, PC 8, trust
+  cache on). Re-send 250 ms and the 512 KB push threshold come from `env.sh`, custody 0. The running exe md5 was
+  checked on all 3 nodes of every cell: 27 / 27 (smoke, w1 and 7 cells).
+* Arms. Every arm sets `TORUS_BOOK_ROWS` explicitly, because run-cell.sh's `RECORD_ENV` exports `=3` and the arm's
+  `EXTRA_ENV` overrides it. Env names were checked in the code: `parse_book_rows_mode` maps `1` / `2` / `3` to
+  OrderRows / LevelAuthority / LevelAuthorityChunked and anything else to Classic. `parse_defer_books` is on only for
+  `1` with Classic books and resident books.
+  * P1M (`PRELOAD=1000000`): C (`=0`), CD (`=0` + `TORUS_CKPT_DEFER_BOOKS=1`), M1 (`=1`), M2 (`=2`), M3 (`=3`).
+  * P0 (no pre-load, arm harness env `PRELOAD=0`): C_P0 (`=0`), M1_P0 (`=1`).
+  * The other names stay absent on every node, including `TORUS_CHECKPOINT_INTERVAL_MS` and
+    `TORUS_LEVEL_HASH_CACHE`.
+* Checkpoints. `resolve_checkpoint_interval` turns the default 15 s checkpoints off for both deferred modes, 2 and 3
+  (the bench queue names only mode 3), and runs a per-block flush instead (an explicit interval would refuse to start).
+  C, CD, M1, C_P0 and M1_P0 run 15 s checkpoints. So M2 / M3 vs C changes two things at once: the book layout and the
+  checkpoint regime.
+  * In Classic, `save_books` (exec thread) encodes the whole changed books into the overlay, and the checkpoint writes
+    only the last version every 15 s (~7 book entries per native block).
+  * In modes 2 / 3, `save_books` on the exec thread is the journal drain plus point writes. The level / row writes go
+    to W every block (`torus_exec_save_books_write_seconds`, 12.5-17.0 ms per block) with no coalescing (~1,400-1,600
+    entries per block).
+  * The `save_books` timer alone therefore flatters 2 / 3. The fair comparisons are exec-thread on-CPU per 1k fills,
+    W per 1k fills and whole-process CPU per fill.
+* Shape: the 8i / 8n deep book. 1M-account genesis (`BULK_COUNT=1000000`; the 8k-tools-deep `genesis-weighted-full.json`
+  `a644d0a7` reused without FORCE; cell genesis md5 `4c8b8af8` in every cell). CLEAN=1 wipes the data dirs, so every
+  cell, and every mode, starts from a fresh genesis and a fresh data dir. Standard load as 8n (300 markets, rate 76,000,
+  5,000 senders, BLOCK_CAP 400, RETRY_BUSY, MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900, oracle on, IN_FLIGHT_TAIL commit,
+  CLOID_SHARE 0). Cells run 300 s (owner s131).
+* Took-effect check `k8bmchk` (`ozarchy-8m-tools/8m-checks.sh`), per node:
+  * `TORUS_BOOK_ROWS=<mode>` in the environ.
+  * Classic and mode 1: `coalesced state checkpoints ON` and no `deferred book save` warning. Modes 2 / 3: the warning
+    once and no checkpoints.
+  * Load-window deltas of `torus_exec_dirty_entries_order_books_total` per native block (Classic < 50, row modes > 500),
+    `torus_exec_book_{rows,levels}_written_total` and `save_books_drain_seconds` (> 0 only in modes 2 / 3), and the
+    level-hash cache gauges (> 0 only in mode 2: mode 3 disables the cache).
+  * CD: one `TORUS_CKPT_DEFER_BOOKS` line with `defer_books=true`. Every other arm: none.
+  * Results: Classic cells 2.8-6.9 dirty book entries per block, M1 28,641, M1_P0 27,304, M2 1,621 (cache sum
+    4,183,406), M3 1,387 (cache 0). CD's line was `defer_books=true` on 3 / 3.
+  * The `__book_mode__` marker byte scan of the data dir (WAL + SST) found nothing in any cell: LZ4 / Zstd blocks hide
+    it. It was info only.
+  * Self-tested before the launch: an 8n Classic cell passes as C / CD / C_P0 and fails as M1 / M2 / M3.
+* Tools: `ozarchy-8m-tools`, frozen from `898213e5` (run-cell.sh as 8k-tools-deep; the driver carries the s131 quiet
+  gate, a 5 s CPU-busy sample below `max_busy_pct` 10). Spec `8m-spec.json`, driver by `make-driver.py`, `FROZEN.txt`.
+  Harness worktree `wt/8m-898213e5`.
+* Cells (one detached driver, back to back): smoke M3 60 s (separate `launch smoke`), then w1 C 120 s (gated), then r1
+  C, M3, M1, CD, M2, C_P0, M1_P0. The run took 85 min, 14:52-16:18.
+* Pacing: gaps END -> next START were 70 / 69 / 68 / 68 / 69 / 68 / 70 s, and smoke -> w1 was 76 s (two launches). That
+  is ~8 s above 8n's 62 s. The quiet gate never held a start. The marker scan takes < 1 s per node (timed afterwards),
+  so the extra seconds are the per-cell checks and records.
+* Host: archy, 62 GB, 32 CPUs. MemAvailable >= 56.4 GB at every start. Swap used was 1,793,948 kB at preflight and
+  1,763,748 kB after the last cell (no growth). `kernel.perf_event_paranoid` was 2 at every cell start and end (no
+  profiling in 8m). No cargo / rustc / indexer ran during the cells.
+
+### 99.2 Validity
+
+All 9 cells (smoke, w1, 7 measured) ended rc 0, ACCEPT / AGREE / PASS, with 0 panic or fail-stop lines and 0 FATAL
+lines in run.log. The campaign logged 169 CHECK OK plus the smoke's, 0 CHECK FAIL, 0 HARD FINDING and no CELL-FLAG.
+Boundary blocks were pipelined on every node (32-64 true, 0 false). Pre-load was ok with 1,000,000 resting in 23-24 s in
+every P1M cell, and absent in both P0 cells. The warm-up gate passed: w1 219,429 matched/s, 0 timeouts.
+
+### 99.3 One row per cell (`ozarchy-8m-run/analyst/8m.txt`; load window, node mean; per native block = per `torus_exec_engine_seconds` observation)
+
+| metric | C (P1M) | CD (P1M) | M1 (P1M) | M2 (P1M) | M3 (P1M) | C_P0 | M1_P0 |
+|---|---|---|---|---|---|---|---|
+| checkpoints | 15 s | 15 s | 15 s | off | off | 15 s | 15 s |
+| save_books ms per native block | 65.70 | 66.73 | 44.23 | 9.36 | 4.93 | 3.63 | 40.30 |
+| save_books ms per 1k fills | 0.996 | 1.082 | 0.709 | 0.313 | 0.228 | 0.212 | 0.676 |
+| book write half on W ms per block | (in save_books) | (in save_books) | (in save_books) | 16.99 | 12.51 | (in save_books) | (in save_books) |
+| exec-thread on-CPU ms per 1k fills | 3.419 | 3.727 | 2.962 | 2.581 | 2.551 | 2.652 | 2.926 |
+| flush worker ms per block / per 1k fills | 24.91 / 0.378 | 26.01 / 0.422 | 29.08 / 0.466 | 58.89 / 1.971 | 43.14 / 1.994 | 5.69 / 0.332 | 28.06 / 0.471 |
+| exec block ms / engine ms per block | 289.4 / 156.9 | 276.2 / 162.3 | 262.9 / 147.5 | 124.9 / 92.5 | 88.1 / 66.1 | 61.5 / 48.1 | 248.9 / 140.5 |
+| matched/s | 223,857 | 218,372 | 232,126 | 232,522 | 238,445 | 265,863 | 232,960 |
+| native blocks/s | 3.235 | 3.389 | 3.596 | 7.033 | 10.142 | 14.298 | 3.809 |
+| fills per native block | 65,977 | 61,695 | 62,391 | 29,874 | 21,635 | 17,145 | 59,617 |
+| block p50 / p99 ms | 202 / 1,563 | 191 / 1,601 | 184 / 1,583 | 55 / 940 | 34 / 836 | 13 / 738 | 156 / 1,668 |
+| consensus timeouts (per 1k native blocks) | 1 (1.02) | 4 (3.90) | 1 (0.92) | 0 (0) | 0 (0) | 2 (0.46) | 11 (9.53) |
+| CPU-s per 1M fills (whole process) | 24.85 | 25.71 | 27.13 | 30.64 | 29.33 | 22.74 | 26.85 |
+| RSS mean / max MB (3 nodes) | 6,944 / 8,586 | 6,726 / 8,458 | 6,367 / 7,900 | 4,294 / 4,834 | 4,360 / 4,906 | 4,076 / 5,252 | 5,426 / 7,008 |
+| data dir at cell end GB, total (SST) | 2.72 (0.82) | 2.19 (0.92) | 1.80 (0.64) | 1.37 (0.75) | 2.02 (0.71) | 2.99 (0.88) | 2.69 (0.69) |
+| boot -> ready s (1M-account genesis) | 90 | 37 | 90 | 89 | 89 | 89 | 89 |
+| pre-load s | 23 | 23 | 24 | 23 | 23 | - | - |
+| dirty book entries per native block | 6.9 | 6.6 | 28,641 | 1,621 | 1,387 | 2.8 | 27,304 |
+
+Run order: w1-C, C, M3, M1, CD, M2, C_P0, M1_P0.
+
+* **Block size follows exec speed.** The load is unpaced, so a slower block lets more actions queue for the next one.
+  Fills per block range from 17k (C_P0) to 66k (C). Per-block timers therefore mix cost with block size. Read the
+  per-1k-fill rows. Even with 3x smaller blocks (more fixed cost per fill), M3 has the lowest exec-thread on-CPU per
+  fill.
+* **Where mode 3's gain comes from (INFERRED from the timers).**
+  * Add the W write half back in and the book work per 1k fills is M3 (4.93 + 12.51) / 21.6 = 0.806 ms and M2 0.882 ms,
+    vs Classic 0.996. So the total book work drops ~19%.
+  * Most of the exec-thread gain is the write moving to W, where it is pipelined, and the encode of whole books
+    disappearing from the exec thread.
+  * The per-block flush is the price: W per 1k fills is 5.3x Classic's, and whole-process CPU per fill is +18% (M2
+    +23%). W is busy 0.44 of the wall time (M3 43 ms per block x 10.1 blocks/s), Classic 0.08.
+  * RSS -37% is probably the checkpoint regime: without the 15 s since-checkpoint layer, no 15 s of whole-book blobs
+    sit in the overlay. This is not measured here (no jemalloc / smaps split in this analysis).
+* **Mode 1 vs Classic.** At depth, mode 1 is better than Classic (save_books -29% per fill, on-CPU -13%, matched/s
+  +3.7%). It writes ~28k order rows per block, though, and on the shallow book that costs more than Classic's small
+  blobs: save_books 3.2x per fill, on-CPU +10%, matched/s -12.4%, timeouts 11. Its blocks also grow to 60k fills at P0.
+  Mode 3 keeps order rows node-local (out of the root) and writes only level rows to the root CF.
+* **Defer-books (CD) vs C.** save_books +1.6% per block (+8.6% per fill), W per block +4%, on-CPU per 1k fills +9%,
+  matched/s -2.5%, timeouts 4 vs 1. CD ran 4th, C 2nd: n = 1, so none of this is resolved. Still, moving the book
+  CF into the deferred part of the checkpoint layer L (what the flag does, `checkpoint_layer.rs`) shows no gain in W
+  or on the exec thread at this shape.
+* **Data dir.** The cell-end total is dominated by WAL files, whose size depends on rotation timing (0.8-3.7 GB between
+  nodes of the same cell). SST bytes are 0.64-0.92 GB in every cell, with no mode difference this screen can resolve.
+* **Boot -> ready** is bimodal, 37 s or 89-90 s, and does not follow the mode (C 90 s, CD 37 s, both Classic). No
+  difference is resolvable. 8i measured ~87 s for health on the 1M genesis.
+
+### 99.4 Recommendation, limits and next
+
+* Screen recommendation for the testnet genesis: **mode 3**, to be confirmed by a longer A/B. Mode 1 is out (worse
+  than Classic on a shallow book). Defer-books is out (no gain, n = 1). Mode 2 is superseded by mode 3 (worse on drain,
+  W and CPU, as the queue expected).
+* What the A/B must settle: n >= 3, Classic vs mode 3, at P1M and on the standard 100k genesis without pre-load (Q7 at
+  normal load: about a tie, so mode 3's P0 cost is the open half). Judge it on exec-thread on-CPU and whole-process
+  CPU per fill and on W busy share. On a smaller testnet box, mode 3's +18% CPU per fill and 5x W per fill matter
+  more than on archy's 32 CPUs. Its gain here is partly the per-block flush regime (smaller blocks, lower latency, lower
+  RSS), which modes 2 / 3 force.
+* Before any genesis change: the s107 owner rule (book mode in genesis + the s450 test gaps vs mode 3).
+* Limits: n = 1 per cell, so matched/s, blocks/s, p99 and timeouts are not resolved. The timers are robust per block
+  (1,000-4,300 native blocks per cell). Drift by run order is unknown (w1-C 219k, C 224k); in 8n, later cells ran faster.
+* Data: `~/bench-results-matched/ozarchy-8m-300m-{smoke-s0,w1,r1-C,r1-M3,r1-M1,r1-CD,r1-M2,r1-C_P0,r1-M1_P0}` (per
+  cell `8m-bookmode.txt`). Campaign files are in `ozarchy-8m-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`).
+  Tools are in `ozarchy-8m-tools/` (`8m-spec.json`, `8m-checks.sh`, `8m-bookmarker.py`, `ozarchy-8m-campaign.sh`,
+  `FROZEN.txt`). The stage is in `ozarchy-8m-stage/` (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis
+  is in `ozarchy-8m-run/analyst/` (`8m-analyse.py` = 8n's `cell()` / `extra()` with a one-row-per-cell output; `8m.txt`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
