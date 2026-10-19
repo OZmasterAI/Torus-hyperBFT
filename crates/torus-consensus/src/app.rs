@@ -265,7 +265,8 @@ const TEST_EVM_BLOCK_INTERVAL: u64 = 5;
 /// until E reaches a point that may need it (the end-of-block upkeep, a
 /// drain) or a read blocks on it, all of which release it. A hold that
 /// times out means E waited for the deferred half where nothing should:
-/// it is counted and the gate opens for the rest of the run.
+/// it is counted and the gate opens for the rest of the run (or, with
+/// [`Self::rearming`], lets only that merge through).
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct DeferredGate {
@@ -275,6 +276,12 @@ struct DeferredGate {
     /// panics before its deferred half (the merge thread's failure seam:
     /// reads of L's deferred part then get `StateError::Io`).
     fail_next: AtomicBool,
+    /// Item 7 option 0 (G4, F15): a timed-out hold lets only its own merge
+    /// through; the next one is held again. The option 0 harness's G mode
+    /// uses it: there a timeout is only a block slower than the timeout
+    /// (heavy load), and opening the gate for the rest of the run would
+    /// drop every later forced deferred-read wait (coverage row C18).
+    rearm: bool,
 }
 
 #[cfg(test)]
@@ -295,6 +302,14 @@ struct DeferredGateState {
 impl DeferredGate {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+    /// A gate that re-arms after a timed-out hold (see `rearm`).
+    fn rearming() -> Self {
+        Self {
+            rearm: true,
+            ..Self::default()
+        }
+    }
+
     fn ticket(&self) -> u64 {
         let mut s = self.state.lock().unwrap();
         s.spawned += 1;
@@ -312,7 +327,11 @@ impl DeferredGate {
             s.held += 1;
         } else if !s.open {
             s.timeouts += 1;
-            s.open = true;
+            if self.rearm {
+                s.released = s.released.max(ticket);
+            } else {
+                s.open = true;
+            }
         }
         drop(s);
         if self.fail_next.swap(false, Ordering::SeqCst) {
@@ -32123,7 +32142,9 @@ mod crash_recovery_tests {
             }
             ctx.attach_flush_worker(self.gate.clone());
             if self.ctl.is_some() && self.cfg.interval() {
-                ctx.ckpt.lock().unwrap().test_gate = Some(Arc::new(DeferredGate::default()));
+                // F15: re-arming, so a slow block under load does not open
+                // the gate for the rest of the run.
+                ctx.ckpt.lock().unwrap().test_gate = Some(Arc::new(DeferredGate::rearming()));
             }
         }
 
@@ -33840,6 +33861,46 @@ mod crash_recovery_tests {
             .unwrap_or_else(|d| panic!("diverged at {}: {}", d.height, d.what));
         assert_eq!((c.hn, c.status, c.side, c.dumps), (3, 3, 3, 3));
         assert_eq!(o0_final(&s, &blocks), o0_final(&node, &blocks));
+    }
+
+    /// G4 finding F15 (RED before: no `DeferredGate::rearming`): the option 0
+    /// harness's deferred gate re-arms after a timed-out hold. The default
+    /// gate (item 6 p3 tests: a timeout is a failure they count) opens for
+    /// the rest of the run; under heavy load (load average 260 on 18 cores)
+    /// one block slower than the timeout then removed every later forced
+    /// deferred-read wait of a G-mode run, and `o0_coverage_floor_per_config`
+    /// lost its C18 row. A re-arming gate lets only the timed-out merge
+    /// through and holds the next one again.
+    #[test]
+    fn deferred_gate_rearm_holds_after_a_timeout() {
+        for rearm in [false, true] {
+            let gate = if rearm {
+                DeferredGate::rearming()
+            } else {
+                DeferredGate::default()
+            };
+            let t1 = gate.ticket();
+            gate.hold(t1);
+            assert_eq!(gate.stats().timeouts, 1, "rearm {rearm}: no release, timed out");
+            let t2 = gate.ticket();
+            let start = std::time::Instant::now();
+            gate.hold(t2);
+            let s = gate.stats();
+            if rearm {
+                assert!(start.elapsed() >= DeferredGate::TIMEOUT, "held again: {s:?}");
+                assert_eq!((s.timeouts, s.held, s.open), (2, 0, false), "{s:?}");
+                let t3 = gate.ticket();
+                gate.release();
+                gate.hold(t3);
+                assert_eq!(gate.stats().held, 1, "a release still ends a hold");
+            } else {
+                assert_eq!(
+                    (s.timeouts, s.held, s.open),
+                    (1, 0, true),
+                    "open for the rest: {s:?}"
+                );
+            }
+        }
     }
 
     /// An option 0 node whose context (and its W) report to a fresh
