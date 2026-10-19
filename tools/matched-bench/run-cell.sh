@@ -314,6 +314,10 @@
 #                the generator, weighted_full_check and the jq checks (their
 #                values come from the entry): "genesis reused (key K, md5 M)";
 #                else "genesis built (key K, md5 M)" and the entry is stored.
+#                run.log has the build's genesis lines either way, in their form
+#                (the "generating" line, the generator's output: its summary
+#                kept in the entry, "reusing existing ..." / "wrote G" for this
+#                cell; genesis_cache.py replay).
 #                A cached md5 mismatch rebuilds. FORCE=1: only an entry a
 #                FORCE=1 cell built is reused, so the first FORCE=1 cell of a
 #                campaign rebuilds as before and later ones reuse its result.
@@ -1096,13 +1100,15 @@ genesis_key_store() {
     genesis_key store --dir "$GENESIS_CACHE_DIR" --genesis "$GENESIS" --md5 "$GEN_MD5" $GEN_FORCED \
         --meta label="$LABEL" --meta markets="$GEN_MARKETS" --meta native_balances="$GEN_ACCTS" --meta bulk_count="$GEN_BULK" \
         --meta timeout_base_ms="$GEN_TBMS" --meta evm_block_interval="$GEN_EVM_N" --meta liq_thin_rows="${LIQ_THIN_ROWS:-}" \
+        --gen-out <(tail -c +$((GEN_LOG_FROM + 1)) "$OUT/run.log" | head -c $((GEN_LOG_TO - GEN_LOG_FROM))) \
         2>>"$OUT/run.log"
 }
 GEN_REUSED=0; GEN_KEY=""; GEN_FORCED=""
 [ "${FORCE:-0}" = 1 ] && GEN_FORCED=--forced
 if [ -n "$GENESIS_CACHE_DIR" ]; then
     GEN_KEY=$(genesis_key key 2>>"$OUT/run.log") || die "genesis key failed (genesis_cache.py, see run.log)"
-    GEN_META=$(python3 -I "$SELF_DIR/genesis_cache.py" fetch --dir "$GENESIS_CACHE_DIR" --key "$GEN_KEY" --dest "$GENESIS" $GEN_FORCED 2>"$OUT/genesis-cache.err")
+    GEN_META=$(python3 -I "$SELF_DIR/genesis_cache.py" fetch --dir "$GENESIS_CACHE_DIR" --key "$GEN_KEY" --dest "$GENESIS" \
+        --root "$MAINREPO" $GEN_FORCED 2>"$OUT/genesis-cache.err")
     case $? in
         0) GEN_REUSED=1 ;;
         1) log "genesis cache: $(cat "$OUT/genesis-cache.err") -> building" ;;
@@ -1115,15 +1121,23 @@ if [ "$GEN_REUSED" = 1 ]; then
     # (the one field that may be empty comes last: read collapses adjacent tabs)
     IFS=$'\t' read -r GEN_MD5 GEN_MARKETS GEN_ACCTS GEN_BULK GEN_TBMS GEN_EVM_N GEN_BUILT LIQ_THIN_ROWS < <(jq -r \
         '[.md5, .markets, .native_balances, .bulk_count, .timeout_base_ms, .evm_block_interval, .built_at, (.liq_thin_rows // "")] | @tsv' <<<"$GEN_META")
-    log "genesis reused (key $GEN_KEY, md5 $GEN_MD5) from $GENESIS_CACHE_DIR (built $GEN_BUILT${GEN_FORCED:+ under FORCE=1}): generator, weighted-full check and jq passes skipped -> $GENESIS"
+    # run.log gets the build path's lines in their form (checks and spec expectations read them, e.g. the
+    # generator's "  state_hash_activation = off"): this line, then the generator's output as it prints it for
+    # this cell (genesis_cache.py replay: its summary from the entry), then the reuse line (test_genesis_reuse_lines.py).
+    log "generating $MARKETS-market 3-val genesis -> $GENESIS"
+    jq -r '.replay[]' <<<"$GEN_META" >> "$OUT/run.log" || die "genesis cache entry $GEN_KEY: no generator lines to replay"
+    log "genesis reused (key $GEN_KEY, md5 $GEN_MD5) from $GENESIS_CACHE_DIR (built $GEN_BUILT${GEN_FORCED:+ under FORCE=1}): generator, weighted-full check and jq passes skipped, the generator lines above replayed from the entry -> $GENESIS"
     log "genesis timeout_base_ms=$GEN_TBMS"
 else
     log "generating $MARKETS-market 3-val genesis -> $GENESIS"
     if [ "${FORCE:-0}" != 1 ]; then
         WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
     fi
+    # The generator's run.log bytes (GEN_LOG_FROM..GEN_LOG_TO) go into the cache entry (genesis_key_store).
+    GEN_LOG_FROM=$(stat -c %s -- "$OUT/run.log")
     TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
         || die "genesis generation failed (see run.log)"
+    GEN_LOG_TO=$(stat -c %s -- "$OUT/run.log")
     GEN_TBMS=$(jq '.consensus.timeout_base_ms' "$GENESIS")
     log "genesis timeout_base_ms=$GEN_TBMS"
     # The genesis EVM cadence N must be the cell's: EVM_BLOCK_INTERVAL, else the

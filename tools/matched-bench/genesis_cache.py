@@ -7,15 +7,24 @@ run-cell.sh calls this when GENESIS_CACHE_DIR is set (the campaign driver sets i
         prints the genesis key: sha256 (first 20 hex) over every genesis input (KEY_FILES under MAINREPO, the
         run-cell.sh that post-processes the genesis, PARAMS, AMBIENT_ENV, jq's version). --explain prints the
         inputs as JSON instead.
-    genesis_cache.py fetch --dir D --key K --dest GENESIS [--forced]
+    genesis_cache.py fetch --dir D --key K --dest GENESIS [--forced] [--root MAINREPO]
         a hit (D/K.genesis + D/K.meta.json, whose md5 the copy re-hashes): GENESIS = the cached file, prints the
-        meta (one JSON line), rc 0. rc 1 = miss (no entry, or --forced and the entry was not built under
-        FORCE=1), rc 2 = the cached file's md5 is not its meta's (corrupt: rebuild, the store overwrites it).
-        The reason goes to stderr. GENESIS is replaced atomically, only on a hit.
-    genesis_cache.py store --dir D --genesis GENESIS --md5 MD5 [--forced] [--meta NAME=VALUE ...] + key's args
+        meta (one JSON line), rc 0; with --root the meta's "replay" holds the generator's run.log lines for this
+        cell (replay()). rc 1 = miss (no entry, or --forced and the entry was not built under FORCE=1), rc 2 = the
+        cached file's md5 is not its meta's, or the meta has no generator output (corrupt or an older entry:
+        rebuild, the store overwrites it). The reason goes to stderr. GENESIS is replaced atomically, only on a hit.
+    genesis_cache.py store --dir D --genesis GENESIS --md5 MD5 --gen-out FILE [--forced] [--meta NAME=VALUE ...]
+                           + key's args
         keys the inputs as they are now (after a build, which may have written the weighted-full genesis), copies
-        GENESIS to D/K.genesis (its md5 must be MD5), writes D/K.meta.json (md5, forced, the --meta values, the key
-        inputs) last, so an entry without one is never a hit, and prints K.
+        GENESIS to D/K.genesis (its md5 must be MD5), writes D/K.meta.json (md5, forced, the --meta values, the
+        generator's output FILE as generator_output(), the key inputs) last, so an entry without one is never a
+        hit, and prints K.
+
+Generator output: before reuse (0f2ca85b) every cell's run.log held devnet/wsl/gen-3val-genesis.sh's output, and
+campaign checks and spec expectations read it ("  state_hash_activation = off", "wrote G", ...). A reused cell
+prints the same lines (test_genesis_reuse_lines.py): the generator's summary after its "wrote GENESIS" line is a
+function of the genesis bytes and the generator script, both key inputs, so the entry keeps it verbatim; the lines
+before it name paths and depend on FORCE (replay()).
 
 The inputs (test_genesis_cache.py checks that every env name the generator scripts read is a key input or
 EXEMPT_ENV): the generator scripts and their data (KEY_FILES, incl. the weighted-full base genesis and its params
@@ -33,7 +42,7 @@ import subprocess
 import sys
 import time
 
-KEY_VERSION = 1
+KEY_VERSION = 2  # 2: an entry holds the generator output (generator_output)
 KEY_LEN = 20
 # genesis inputs under run-cell.sh's MAINREPO (absent = "absent"; the weighted-full genesis and its sidecar may
 # not exist before the first build, which then creates them: the store key is computed after the build)
@@ -73,6 +82,7 @@ EXEMPT_ENV = {
     "CARGO_TARGET_DIR": "as BENCH_BIN (cargo-bin.sh)",
 }
 DEFAULT_BASE = "testnet/genesis-weighted-base.json"
+WEIGHTED_FULL = "testnet/genesis-weighted-full.json"
 CHUNK = 1 << 20
 
 
@@ -149,6 +159,42 @@ def copy_hashed(src, dst):
     return h.hexdigest()
 
 
+def generator_output(lines, genesis, root):
+    """the generator's run.log lines of a build, split at its last "wrote GENESIS" line: head (the weighted-full
+    genesis step: "reusing existing FULL (BULK_COUNT=N)", or under FORCE=1 its rebuild's lines), summary (after
+    it: the genesis' own fields, no paths). root: the build's MAINREPO (the generator's REPO)"""
+    wrote = "wrote " + genesis
+    at = [i for i, line in enumerate(lines) if line == wrote]
+    if not at:
+        raise ValueError("generator output has no %r line" % wrote)
+    return {"root": root, "head": lines[: at[-1]], "summary": lines[at[-1] + 1 :]}
+
+
+def generator_output_ok(go):
+    return (
+        isinstance(go, dict)
+        and isinstance(go.get("root"), str)
+        and all(isinstance(go.get(k), list) and all(isinstance(x, str) for x in go[k]) for k in ("head", "summary"))
+    )
+
+
+def replay(meta, dest, root, forced):
+    """the lines gen-3val-genesis.sh prints when run now for this cell (OUT=dest, REPO=root) over the entry's inputs:
+    the weighted-full genesis (a key input) is on disk, so without FORCE=1 it prints its "reusing existing" line
+    (its BULK_COUNT = the entry's bulk_count, else it fails); under FORCE=1 it rebuilds that genesis from the same
+    inputs: the entry's head (a FORCE=1 entry's, the only kind a FORCE=1 cell reuses) with its MAINREPO this one's.
+    Then "wrote dest" and the entry's summary."""
+    go = meta["generator_output"]
+    if forced:
+        old = go["root"].rstrip("/") + "/"
+        head = [line.replace(old, root.rstrip("/") + "/") for line in go["head"]]
+    else:
+        head = [
+            "reusing existing %s/%s (BULK_COUNT=%s)" % (root.rstrip("/"), WEIGHTED_FULL, meta["bulk_count"])
+        ]
+    return head + ["wrote " + dest] + go["summary"]
+
+
 def fetch(d, key, dest, forced):
     """(rc, meta or reason): 0 hit (dest replaced), 1 miss, 2 md5 mismatch"""
     gen, meta_p = entry(d, key)
@@ -164,6 +210,11 @@ def fetch(d, key, dest, forced):
             meta_p,
             meta.get("key"),
             meta.get("md5"),
+        )
+    if not generator_output_ok(meta.get("generator_output")) or "bulk_count" not in meta:
+        return 2, "cache entry %s: meta %s has no generator output or bulk_count (an older genesis_cache.py's?)" % (
+            key,
+            meta_p,
         )
     if forced and meta.get("forced") is not True:
         return (
@@ -188,7 +239,9 @@ def fetch(d, key, dest, forced):
     return 0, meta
 
 
-def store(d, key, genesis, md5, forced, extra, inputs):
+def store(d, key, genesis, md5, forced, extra, inputs, gen_out):
+    if not generator_output_ok(gen_out):
+        raise ValueError("store: no generator output (generator_output())")
     os.makedirs(d, exist_ok=True)
     gen, meta_p = entry(d, key)
     tmp = gen + ".tmp.%d" % os.getpid()
@@ -210,6 +263,7 @@ def store(d, key, genesis, md5, forced, extra, inputs):
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     meta.update(extra)
+    meta["generator_output"] = gen_out
     meta["inputs"] = inputs
     mtmp = meta_p + ".tmp.%d" % os.getpid()
     with open(mtmp, "w") as f:
@@ -244,6 +298,7 @@ def main(argv=None):
     f.add_argument("--key", required=True)
     f.add_argument("--dest", required=True)
     f.add_argument("--forced", action="store_true")
+    f.add_argument("--root", help="MAINREPO: print the generator lines for this cell as the meta's replay")
     s = sub.add_parser("store")
     s.add_argument("--dir", required=True)
     s.add_argument("--key", help="if given, must be the key of the inputs now")
@@ -251,6 +306,7 @@ def main(argv=None):
     s.add_argument("--md5", required=True)
     s.add_argument("--forced", action="store_true")
     s.add_argument("--meta", action="append")
+    s.add_argument("--gen-out", required=True, help="the generator's run.log output of the build")
     s.add_argument("--root", required=True)
     s.add_argument("--run-cell", required=True)
     s.add_argument("--param", action="append")
@@ -265,11 +321,10 @@ def main(argv=None):
         if a.cmd == "fetch":
             rc, res = fetch(a.dir, a.key, a.dest, a.forced)
             if rc == 0:
-                print(
-                    json.dumps(
-                        {x: y for x, y in res.items() if x != "inputs"}, sort_keys=True
-                    )
-                )
+                out = {x: y for x, y in res.items() if x not in ("inputs", "generator_output")}
+                if a.root:
+                    out["replay"] = replay(res, a.dest, a.root, a.forced)
+                print(json.dumps(out, sort_keys=True))
             else:
                 print(res, file=sys.stderr)
             return rc
@@ -277,7 +332,9 @@ def main(argv=None):
         key = key_of(inp)
         if a.key and a.key != key:
             raise ValueError("store: --key %s is not the key of the inputs now (%s)" % (a.key, key))
-        store(a.dir, key, a.genesis, a.md5, a.forced, kv_list(a.meta, "--meta"), inp)
+        with open(a.gen_out, errors="replace") as f:
+            gen_out = generator_output(f.read().splitlines(), a.genesis, a.root)
+        store(a.dir, key, a.genesis, a.md5, a.forced, kv_list(a.meta, "--meta"), inp, gen_out)
         print(key)
         return 0
     except (OSError, ValueError) as ex:

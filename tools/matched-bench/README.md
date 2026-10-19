@@ -770,7 +770,18 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   `NATIVE_AVAIL`, `EVM_WEI`, jq's version); an entry for the key (`<key>.genesis`, md5
   re-checked on the copy) replaces the generator and its jq passes (~50-60 s per 1M-account
   cell): run.log `genesis reused (key K, md5 M)`, else `genesis built (key K, md5 M); cached
-  in ...`. A corrupt entry (md5 mismatch) is rebuilt. `FORCE=1` in `harness_env`: only an
+  in ...`. A reused cell's run.log still has every genesis line a built cell's has, in the
+  same form, so checks and spec expectations written for the build path pass unchanged
+  (ozarchy 8p's `^  state_hash_activation = "?off"?$`): the `generating N-market 3-val
+  genesis -> G` line, then the generator's output as it prints it for this cell
+  (`reusing existing <MAINREPO>/testnet/genesis-weighted-full.json (BULK_COUNT=N)`, or under
+  `FORCE=1` the entry's weighted-full rebuild lines; `wrote G`; its summary block
+  `  timeout_ms = ...` .. `  perm_stakes= ...`, kept verbatim in the entry), then the reuse
+  line. `test_genesis_reuse_lines.py` runs the real generator, the pre-reuse run-cell.sh
+  (0f2ca85b^) and a built and a reused cell per genesis configuration and compares the
+  genesis section, the run.log expectations of the archived and testdata specs and the
+  archived campaign scripts' genesis checks. A corrupt entry (md5 mismatch) or one without
+  the generator output (older tools) is rebuilt. `FORCE=1` in `harness_env`: only an
   entry a `FORCE=1` cell built is reused, so the campaign's first cell rebuilds the
   weighted-full genesis as before and later cells reuse that build. Data dirs stay fresh per
   cell. The cache keeps one ~290 MB file per distinct key at 1M accounts (delete

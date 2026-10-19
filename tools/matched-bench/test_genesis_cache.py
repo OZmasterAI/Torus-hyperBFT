@@ -171,9 +171,23 @@ class CacheTest(unittest.TestCase):
         with open(self.gen, "w") as f:
             f.write('{"markets": [1, 2, 3]}\n')
 
-    def store(self, key="k1", forced=False):
+    def gen_out(self, root="/old/repo", head=None):
+        """the generator's run.log output for self.gen, as genesis_cache.generator_output keeps it"""
+        if head is None:
+            head = ["reusing existing %s/testnet/genesis-weighted-full.json (BULK_COUNT=3)" % root]
+        lines = head + ["wrote " + self.gen, "  timeout_ms = 500", "  state_hash_activation = off"]
+        return self.gc.generator_output(lines, self.gen, root)
+
+    def store(self, key="k1", forced=False, gen_out=None):
         return self.gc.store(
-            self.dir, key, self.gen, md5(self.gen), forced, {"markets": "3"}, {"x": 1}
+            self.dir,
+            key,
+            self.gen,
+            md5(self.gen),
+            forced,
+            {"markets": "3", "bulk_count": "3"},
+            {"x": 1},
+            self.gen_out() if gen_out is None else gen_out,
         )
 
     def test_hit_copies_and_verifies(self):
@@ -228,8 +242,92 @@ class CacheTest(unittest.TestCase):
 
     def test_store_refuses_a_wrong_md5(self):
         with self.assertRaises(ValueError):
-            self.gc.store(self.dir, "k1", self.gen, "0" * 32, False, {}, {})
+            self.gc.store(self.dir, "k1", self.gen, "0" * 32, False, {}, {}, self.gen_out())
         self.assertFalse(os.path.exists(os.path.join(self.dir, "k1.meta.json")))
+
+    def test_generator_output_splits_at_the_wrote_line(self):
+        full = "/old/repo/testnet/genesis-weighted-full.json"
+        head = [
+            "building weighted-full genesis (BULK_COUNT=3 bulk senders)...",
+            "wrote %s (100 bytes, native=63 accts=50), bulk_offset=60 bulk_count=3) + x.params.json" % full,
+        ]
+        g = self.gen_out(head=head)
+        self.assertEqual(g["root"], "/old/repo")
+        self.assertEqual(g["head"], head, "the weighted-full build's own 'wrote' line is head, not the split")
+        self.assertEqual(g["summary"], ["  timeout_ms = 500", "  state_hash_activation = off"])
+        with self.assertRaises(ValueError):
+            self.gc.generator_output(["wrote /elsewhere.json", "  x = 1"], self.gen, "/old/repo")
+
+    def test_replay_is_what_the_generator_prints_on_this_cell(self):
+        built = self.gen_out(head=["building weighted-full genesis (BULK_COUNT=3 bulk senders)...", "noise"])
+        meta = self.store(gen_out=built)
+        dest = "/new/repo/devnet/wsl/genesis-3val.json"
+        # not FORCE=1: the generator would find the weighted-full genesis (a key input) and reuse it
+        self.assertEqual(
+            self.gc.replay(meta, dest, "/new/repo", False),
+            [
+                "reusing existing /new/repo/testnet/genesis-weighted-full.json (BULK_COUNT=3)",
+                "wrote " + dest,
+                "  timeout_ms = 500",
+                "  state_hash_activation = off",
+            ],
+        )
+        # FORCE=1: the generator rebuilds the weighted-full genesis, the same bytes as the build: its head again
+        forced = self.gen_out(
+            head=["building weighted-full genesis (BULK_COUNT=3 bulk senders)...", "wrote /old/repo/testnet/f.json + /old/repo/p"]
+        )
+        meta = self.store(forced=True, gen_out=forced)
+        self.assertEqual(
+            self.gc.replay(meta, dest, "/new/repo", True)[:3],
+            [
+                "building weighted-full genesis (BULK_COUNT=3 bulk senders)...",
+                "wrote /new/repo/testnet/f.json + /new/repo/p",
+                "wrote " + dest,
+            ],
+        )
+
+    def test_entry_without_generator_output_is_rebuilt(self):
+        self.store()
+        meta_p = os.path.join(self.dir, "k1.meta.json")
+        meta = json.load(open(meta_p))
+        del meta["generator_output"]
+        json.dump(meta, open(meta_p, "w"))
+        rc, why = self.gc.fetch(self.dir, "k1", self.gen + ".d", False)
+        self.assertEqual(rc, 2)
+        self.assertIn("generator output", why)
+
+    def test_cli_store_and_fetch_replay(self):
+        out = os.path.join(self.tmp, "gen.out")
+        with open(out, "w") as f:
+            f.write("reusing existing %s/testnet/genesis-weighted-full.json (BULK_COUNT=3)\n" % self.tmp)
+            f.write("wrote %s\n  state_hash_activation = off\n" % self.gen)
+        run_cell = os.path.join(self.tmp, "run-cell.sh")
+        open(run_cell, "w").close()
+        params = sum((["--param", "%s=%s" % kv] for kv in PARAMS.items()), [])
+        common = ["--root", self.tmp, "--run-cell", run_cell] + params
+        r = subprocess.run(
+            [sys.executable, "-I", GC, "store", "--dir", self.dir, "--genesis", self.gen, "--md5", md5(self.gen),
+             "--meta", "bulk_count=3", "--gen-out", out] + common,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        key = r.stdout.strip()
+        dest = os.path.join(self.tmp, "dest.json")
+        r = subprocess.run(
+            [sys.executable, "-I", GC, "fetch", "--dir", self.dir, "--key", key, "--dest", dest, "--root", self.tmp],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = json.loads(r.stdout)
+        self.assertEqual(
+            meta["replay"],
+            [
+                "reusing existing %s/testnet/genesis-weighted-full.json (BULK_COUNT=3)" % self.tmp,
+                "wrote " + dest,
+                "  state_hash_activation = off",
+            ],
+        )
+        self.assertNotIn("generator_output", meta)
 
     def test_cli_rc(self):
         r = subprocess.run(
