@@ -564,6 +564,23 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    the boot line). Judge by: matched/s, native blocks/s, p50 / p99, timeouts, exec-thread on-CPU per 1k fills,
    flush-worker ms per 1k fills and busy share, whole-process CPU-s per 1M fills, save_books, RSS, data-dir growth.
    Question: should the testnet genesis use mode 3, given its shallow-book cost?
+   **Done s68 (ozarchy-8p deep / ozarchy-8ps shallow, one binary main `bb2a727f` node `7585952e`, tools frozen from
+   `1489255f` (deferred scans + genesis reuse; scans in-line here), both shapes in one detached unit back to back: smoke
+   B 60 s, w1 A 300 s, then A B B A A B, 300 s, n = 3 per shape; perf doc section 102).**
+   * Validity: all 14 cells ACCEPT / AGREE / PASS, md5 42 / 42, 155 CHECK OK per shape (+ 23 per smoke), 0 CHECK FAIL.
+     Mode took effect on every node (environ + boot line: A checkpoints ON, B deferred book save). 1M resting in every
+     deep cell. Swap +195 MB, min MemAvailable 22.4 GB. Try 1 stopped at r1-A: a reused genesis has no generator
+     `state_hash_activation = off` line; the expectation now also accepts `genesis reused (..., md5 <genesis md5>)`.
+   * Answer: **testnet genesis stays Classic.** Shallow: mode 3 matched/s 268,533 -> 251,550 (0.937 [0.923, 0.951]),
+     native blocks/s 13.80 -> 8.62 (0.624), p50 14 -> 47 ms, p99 769 -> 878 ms (1.141 [1.039, 1.253]), CPU-s per 1M
+     fills 22.71 -> 26.64 (1.173 [1.163, 1.183]), flush worker per 1k fills 5.9x, busy 0.079 -> 0.421.
+   * Deep (1M resting): mode 3 wins: matched/s 223,488 -> 242,938 (1.087 [1.058, 1.116]), blocks/s 3.22 -> 6.96, p50
+     210 -> 61 ms, p99 1,500 -> 942 ms, timeouts 4.11 -> 0.16 per 1,000 blocks, save_books 65.05 -> 6.97 ms per block,
+     exec-thread on-CPU per 1k fills 3.395 -> 2.550 (0.751), RSS -2.2 GB; but CPU-s per 1M +18.5% (1.185 [1.164,
+     1.207]), flush worker per 1k fills 4.7x, busy 0.089 -> 0.411. The cost in both shapes is the forced per-block
+     flush; re-test mode 3 only once it can use checkpoints.
+   * Pacing: gaps deep 68-72 s (in-line post-cell step, 8q 66-67 s), shallow 14-16 s, deep -> shallow 69 s. Genesis
+     reuse cut deep non-load time per cell 302 -> 238 s (genesis 55 -> 1 s).
 8r. **8o rerun with the RH4 GC worker** (owner s131; after 8p; ~1 h 50). 8o (section 100): retention 1000 cost block
    p50 +8.1% (6/6 pairs), blocks/s ~-4%, CPU per fill +1.4%, from the GC running ~1.5 ms per block on the consensus
    thread. Fix: `perf/rh4-gc-worker` `a0181b8b` (pushed, not merged): consensus only hands the GC a job on a bounded

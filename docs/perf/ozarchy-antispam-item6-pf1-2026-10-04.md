@@ -15633,6 +15633,185 @@ every node. PE spawns 0. Warm-up gate: w1 223,669 matched/s, 3 timeouts. No drif
   (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis is in `ozarchy-8q-run/analyst/` (`8q-analyse.py`
   = 8n's with B's md5 and a per-cell fallback column; `8q.txt`).
 
+## 102. Step 8p, Classic vs mode 3 A/B, deep and shallow: one binary main `bb2a727f`, A = Classic (`TORUS_BOOK_ROWS=0`, 15 s checkpoints) vs B = mode 3 (`TORUS_BOOK_ROWS=3`, per-block flush), 1M-resting deep book (8i P1M) and standard shape (100k genesis, no pre-load), standard load, 300 markets, 300 s cells, A B B A A B, n = 3 per shape (campaigns ozarchy-8p / ozarchy-8ps, archy, 2026-10-19)
+
+**Mode 3 wins at depth and loses on the shallow book, and it costs ~17-19% more CPU per fill in both shapes. Deep
+(1M resting orders): matched/s 223,488 -> 242,938 (B / A 1.087 [1.058, 1.116]), native blocks/s 3.215 -> 6.958
+(2.160 [1.787, 2.610]), p50 210 -> 61 ms (0.290 [0.233, 0.360]), p99 1,500 -> 942 ms (0.630 [0.523, 0.757]), timeouts
+4.11 -> 0.16 per 1,000 native blocks (12 -> 1), save_books 65.05 -> 6.97 ms per block, RSS mean 6,654 -> 4,493 MB.
+Shallow (standard shape): matched/s 268,533 -> 251,550 (0.937 [0.923, 0.951]), native blocks/s 13.80 -> 8.62 (0.624
+[0.518, 0.751]), p50 14 -> 47 ms (3.27 [2.45, 4.38]), p99 769 -> 878 ms (1.141 [1.039, 1.253]), 0 timeouts in both
+arms. Both shapes: CPU-s per 1M fills +18.5% deep (24.68 -> 29.24, 1.185 [1.164, 1.207]) and +17.3% shallow (22.71 ->
+26.64, 1.173 [1.163, 1.183]); the flush worker does 4.7x (deep) and 5.9x (shallow) the work per fill and is busy 41-42%
+of the time instead of 8-9%. Exec-thread on-CPU per 1k fills is lower with mode 3 in both shapes (deep 3.395 -> 2.550,
+0.751 [0.721, 0.783]; shallow 2.664 -> 2.531, 0.950 [0.944, 0.956]). Plain answer: no, the testnet genesis should stay
+Classic. A testnet chain starts with shallow books, where mode 3 is 6% slower, has 3x the median block time and burns
+17% more CPU per fill. Its depth gain comes from not rewriting whole books. The cost is the forced per-block flush
+(modes 2 / 3 cannot use checkpoints, `check_checkpoint_book_mode`). Revisit mode 3 only once it can run with
+checkpoints, and re-run both shapes then.**
+
+Question (bench queue step 8p, owner s131): section 99 (8m, n = 1) found mode 3 far ahead of Classic at 1M resting
+orders, but mode 3 has to flush every block, so the flush worker does ~5x the work per fill. It was never run on a
+shallow book. Should the testnet genesis use mode 3, given its shallow-book cost? The mode changes the state-root
+format, so the choice is fixed at genesis.
+
+### 102.1 Setup
+
+* One binary for both arms and shapes: main `bb2a727f` (`wt/8p-bb2a727f`, `CARGO_TARGET_DIR ~/.cargo-target-8p`),
+  node md5 `7585952e706dbc6f1a425bc1f1e3a1ab` (= 8o's `32648b44` node: `32648b44..bb2a727f` changes no crate),
+  bench-throughput `35e25abd`, torus-tx-flood `dd59d50d`, staged in `ozarchy-8p-stage/m`. It was built for the stopped
+  first attempt and reused (md5s re-verified, `bb2a727f..1489255f` touches only `tools/matched-bench`).
+* A = `TORUS_BOOK_ROWS=0` (Classic whole-book blobs, 15 s coalesced checkpoints). B = `TORUS_BOOK_ROWS=3`
+  (LevelAuthorityChunked, deferred book save, checkpoints off = flush every block). Set explicitly in each arm's env.
+  Code defaults otherwise: PC 8, F on, trust cache on, re-send 250 ms and the 512 KB push threshold from `env.sh`,
+  custody 0. Fresh data dirs in every cell (`CLEAN=1`).
+* Deep = 8i P1M: 1M-account genesis (`BULK_COUNT=1000000`, input md5 `a644d0a7` from `ozarchy-8k-tools-deep`, cell
+  genesis md5 `4c8b8af8` in every cell) + `PRELOAD=1000000` resting orders before the load (ok, 1,000,000 resting,
+  23-24 s in every cell). Shallow = the standard shape: 100k genesis (input `01168566` from `ozarchy-8o-tools`, cell
+  md5 `d694b81b`), no pre-load, comparable with 8g / 8o (8o's A: 268,516 matched/s; here A 268,533). Standard load in
+  both: 300 markets, rate 76,000, 5,000 senders, BLOCK_CAP 400, RETRY_BUSY, MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900,
+  oracle on, IN_FLIGHT_TAIL commit, CLOID_SHARE 0.
+* Tools: frozen from main `1489255f` (18c: deferred report scans + genesis reuse, Codex-reviewed clean) by
+  `git archive` into `ozarchy-8p-tools` (deep) and `ozarchy-8ps-tools` (shallow). Two copies because the genesis input
+  sits at `tools_dir/../../testnet/`. Harness worktree `wt/8p-h-1489255f` (detached). Specs = the stopped attempt's
+  (8m / 8q env and expectations). Checks `8p-checks.sh` = 8m's checks adapted to arms A / B and the two shapes
+  (`k8bmchk` book mode took effect, `k8deepchk` deep / shallow, `k8loadchk`, `k8flagchk`, `k8pushchk`, `k8custchk`,
+  `k8diskchk`) + 8q's `k8memchk` + `k8swapchk` against one swap baseline for the whole campaign. With expectations and a
+  checks file the report scans stay in-line (`end_pass=0`); genesis reuse is on (`genesis_reuse=1`). Notes in
+  `FROZEN.txt`.
+* An earlier attempt on `32648b44` tools was stopped during its warm-up, before any measured cell. Its dirs are
+  `*-32648b44-unused`. Try 1 on `1489255f` stopped at r1-A on a spec expectation: `^  state_hash_activation = "?off"?$`
+  comes from the genesis generator's stdout, which a reused genesis skips. w1 built the genesis and passed, and r1-A
+  reused it and found 0 lines. A one-cell smoke cannot catch this. Try 2 also accepts run-cell's `genesis reused (key K,
+  md5 <shape's genesis md5>)` line: same md5, same bytes as the built cell that logged `off`. Self-tested on try 1's
+  run.logs (1 / 1; wrong md5: 0). Try 1 is kept as `ozarchy-8p-run/campaign-try1-statehash` and
+  `ozarchy-8p-300m-{w1,r1-A}-try1-unused`, not analysed.
+* Cells: smokes B 60 s per shape (`launch smoke`, 23 CHECK OK each; deep 243.3k, shallow 248.9k matched/s), then ONE
+  detached unit `bench-ozarchy-8p` (`ozarchy-8p-run/chain.sh`) ran the deep driver, then the shallow driver, back to
+  back: per shape w1 A 300 s (gated), r1-A, r1-B, r2-B, r2-A, r3-A, r3-B. 20:42:55 -> 22:39:27.
+* Host: archy, 62 GB. Swap used 2,385,404 kB at chain start, at most 2,584,820 kB after a cell (+195 MB; stop rule
+  +512 MB). Min MemAvailable during a cell 22.4 GB (stop rule 10 GB). `kernel.perf_event_paranoid` 2 at every cell
+  start and end. No cargo / rustc / indexer during the cells, no analysis until `chain.done`.
+
+### 102.2 Validity
+
+All 14 cells (2 x w1, 6 x A, 6 x B) rc 0, ACCEPT / AGREE / PASS, 0 panic or fail-stop lines; 155 CHECK OK per shape
+(+ 23 per smoke), 0 CHECK FAIL, no CELL-FLAG. Node exe md5 `7585952e` on 3 / 3 nodes of every cell (42 / 42). Book mode
+took effect on every node: environ `TORUS_BOOK_ROWS=0` (A) / `=3` (B) on 3 / 3 nodes per cell. Every A node logged
+`coalesced state checkpoints ON` once and no deferred-save warning. Every B node logged `TORUS_BOOK_ROWS selects a
+deferred book save ... mode=LevelAuthorityChunked` once and no checkpoint line. Book rows / levels written > 0 only in
+B. Deep check: `k8deepchk` 1,000,000 resting at bulk 1M in 7 / 7 deep cells, no pre-load at bulk 100k in 7 / 7
+shallow cells. Boundary blocks pipelined on every node, PE spawns 0. Warm-ups: deep 221,492, shallow 268,323
+matched/s. No drift by run order: deep A 222,058 / 225,512 / 222,896 (CV 0.81%), B 239,613 / 243,903 / 245,297
+(1.22%); shallow A 268,278 / 268,189 / 269,131 (0.19%), B 252,334 / 251,931 / 250,384 (0.41%). In each shape every B
+cell is on the same side of every A cell.
+
+### 102.3 Deep (1M resting orders; `ozarchy-8p-run/analyst/8p-analysis.md`; load window, node mean; per native block = per `torus_exec_engine_seconds` observation; arm means of 3 cells, paired B / A geomean with 95% t CI, 2 df)
+
+| metric | A (Classic) | B (mode 3) | B - A | B / A [95% CI] |
+|---|---|---|---|---|
+| matched/s | 223,488 | 242,938 | +19,449 | 1.087 [1.058, 1.116] |
+| native blocks/s | 3.215 | 6.958 | +3.743 | 2.160 [1.787, 2.610] |
+| fills per native block | 66,323 | 30,325 | -35,998 | 0.457 [0.400, 0.521] |
+| block p50 / p99 ms | 210 / 1,500 | 61 / 942 | -149 / -558 | 0.290 [0.233, 0.360] / 0.630 [0.523, 0.757] |
+| timeouts per 1,000 native blocks (count) | 4.11 (12) | 0.16 (1) | -3.95 | per pair 3 / 1, 4 / 0, 5 / 0 |
+| exec-thread on-CPU ms per 1k fills | 3.395 | 2.550 | -0.845 | 0.751 [0.721, 0.783] |
+| exec ms per 1k fills (block_ms) | 4.377 | 4.031 | -0.346 | 0.921 [0.896, 0.946] |
+| exec busy share | 0.933 | 0.848 | -0.085 | 0.909 [0.869, 0.950] |
+| exec-thread runqueue wait ms per 1k fills | 0.123 | 0.231 | +0.109 | 1.886 [1.872, 1.901] |
+| flush worker ms per 1k fills | 0.418 | 1.955 | +1.538 | 4.684 [4.375, 5.016] |
+| flush worker ms per native block | 27.70 | 59.32 | +31.62 | 2.140 [1.914, 2.392] |
+| flush worker busy share | 0.089 | 0.411 | +0.322 | 4.621 [4.226, 5.053] |
+| CPU-s per 1M fills (whole process) | 24.68 | 29.24 | +4.56 | 1.185 [1.164, 1.207] |
+| save_books ms per block / per 1k fills | 65.05 / 0.981 | 6.97 / 0.229 | -58.08 / -0.751 | 0.107 [0.084, 0.135] / 0.234 [0.211, 0.259] |
+| B's deferred save: drain / write ms per block | | 6.74 / 17.34 | | |
+| settle / cache flush ms per 1k fills | 0.967 / 0.344 | 1.171 / 0.408 | +0.204 / +0.064 | 1.211 [1.199, 1.223] / 1.186 [1.124, 1.251] |
+| exec engine ms per 1k fills | 2.383 | 3.052 | +0.670 | 1.281 [1.238, 1.325] |
+| RSS mean / max MB (3 nodes) | 6,654 / 8,117 | 4,493 / 4,994 | -2,161 / -3,123 | 0.676 [0.627, 0.728] / 0.616 [0.560, 0.677] |
+| data dir growth over the load, GB (MB per 1M fills) | 3.640 (53.8) | 2.479 (33.9) | -1.161 | 0.596 [0.133, 2.664] |
+| data dir at cell end GB | 2.395 | 1.908 | -0.487 | 0.777 [0.247, 2.448] |
+
+* This confirms 8m's screen at n = 3: save_books 65.05 -> 6.97 ms per block (8m 65.70 -> 4.93), matched/s +8.7%
+  (8m +6.5%), RSS -2.2 GB (8m -2.6 GB), flush worker per 1k fills 0.418 -> 1.955 (8m 0.378 -> 1.994), CPU-s per 1M
+  +18.5% (8m +18.0%). Blocks/s doubles (8m 3.2 -> 10.1) and p50 falls to 61 ms (8m 34 ms): smaller, faster blocks,
+  but not as small as the screen's single cell.
+* Classic's block is dominated by rewriting whole books (65 ms of 290 ms exec per block). Mode 3 moves the book write
+  off the exec thread: exec-thread on-CPU per fill -25%, and the exec thread gives up some time to the flush worker
+  (runqueue wait 1.9x). Per fill, settle, cache flush and engine cost more with mode 3 (+19-28%), because the blocks
+  are half the size and the per-block fixed costs are spread over fewer fills.
+* Timeouts 12 -> 1 over 2,919 / 6,332 native blocks (A 3 / 4 / 5 per cell, B 1 / 0 / 0): fewer in every pair.
+* Data dir rows are noisy (compaction timing; CIs 0.13-2.7) and only indicative: mode 3 is lower in r2 and r3 and
+  higher in r1, both for growth over the load and at cell end.
+
+### 102.4 Shallow (standard shape, 100k genesis, no pre-load; `ozarchy-8p-run/analyst/8ps-analysis.md`; same definitions)
+
+| metric | A (Classic) | B (mode 3) | B - A | B / A [95% CI] |
+|---|---|---|---|---|
+| matched/s | 268,533 | 251,550 | -16,983 | 0.937 [0.923, 0.951] |
+| native blocks/s | 13.802 | 8.617 | -5.184 | 0.624 [0.518, 0.751] |
+| fills per native block | 18,160 | 26,406 | +8,246 | 1.453 [1.237, 1.707] |
+| block p50 / p99 ms | 14 / 769 | 47 / 878 | +33 / +109 | 3.274 [2.446, 4.383] / 1.141 [1.039, 1.253] |
+| timeouts per 1,000 native blocks (count) | 0 (0 over 12,532) | 0 (0 over 7,824) | 0 | |
+| exec-thread on-CPU ms per 1k fills | 2.664 | 2.531 | -0.134 | 0.950 [0.944, 0.956] |
+| exec ms per 1k fills (block_ms) | 3.630 | 3.887 | +0.257 | 1.071 [1.058, 1.083] |
+| exec busy share | 0.910 | 0.883 | -0.027 | 0.970 [0.942, 1.000] |
+| exec-thread runqueue wait ms per 1k fills | 0.135 | 0.203 | +0.068 | 1.501 [1.331, 1.694] |
+| flush worker ms per 1k fills | 0.316 | 1.852 | +1.536 | 5.852 [5.569, 6.150] |
+| flush worker ms per native block | 5.75 | 48.91 | +43.16 | 8.502 [7.073, 10.221] |
+| flush worker busy share | 0.079 | 0.421 | +0.341 | 5.303 [5.089, 5.525] |
+| CPU-s per 1M fills (whole process) | 22.71 | 26.64 | +3.93 | 1.173 [1.163, 1.183] |
+| save_books ms per block / per 1k fills | 3.97 / 0.219 | 5.32 / 0.201 | +1.34 / -0.017 | 1.337 [1.150, 1.556] / 0.921 [0.863, 0.982] |
+| B's deferred save: drain / write ms per block | | 5.15 / 12.57 | | |
+| settle / cache flush ms per 1k fills | 1.128 / 0.400 | 1.165 / 0.405 | +0.037 / +0.005 | 1.033 [1.004, 1.064] / 1.013 [0.970, 1.058] |
+| exec engine ms per 1k fills | 2.839 | 2.978 | +0.140 | 1.049 [1.035, 1.063] |
+| RSS mean / max MB (3 nodes) | 3,736 / 4,644 | 3,061 / 3,528 | -674 / -1,116 | 0.820 [0.781, 0.860] / 0.760 [0.741, 0.779] |
+| data dir growth over the load, GB (MB per 1M fills) | 4.317 (53.1) | 3.243 (42.7) | -1.074 | 0.715 [0.282, 1.815] |
+| data dir at cell end GB | 2.656 | 1.546 | -1.110 | 0.619 [0.149, 2.567] |
+
+* On a shallow book Classic's save_books is already small (3.97 ms per block, 0.219 per 1k fills), so mode 3 has
+  little to save (-8% per fill). What it adds is the per-block flush: 5.75 -> 48.91 ms of flush-worker time per block
+  and busy share 0.079 -> 0.421. Blocks get longer (exec block_ms 65.9 -> 102.6) and carry 45% more fills. Native
+  blocks/s falls 38%, p50 goes 14 -> 47 ms and p99 +14%. The exec thread waits on the runqueue 1.5x as long per fill,
+  and exec ms per 1k fills is +7% even though its own on-CPU per fill is -5%.
+* matched/s -6.3% (3 / 3 pairs, CV < 0.5%), CPU-s per 1M fills +17.3%. RSS is lower (-674 MB mean): Classic keeps
+  whole-book blobs resident.
+
+### 102.5 Pacing and per-cell overhead (18c rule; `ozarchy-8p-run/analyst/overhead.md`, `8p-overhead.py`)
+
+| | deep 8p | deep 8q (`32648b44` tools) | shallow 8ps |
+|---|---|---|---|
+| gap END -> next START | 68-72 s (mean 69) | 66-67 s | 14-16 s (mean 15) |
+| genesis (measured cells) | 1-2 s (reused; w1 built it in 54 s) | 53-66 s (mean 55) | 0-1 s (w1 7 s) |
+| boot -> healthy | 38-92 s (mean 81; bimodal 38 / ~90) | 38-92 s (mean 81) | 6-7 s |
+| healthy -> bench start (idle probe, oracle marks, pre-load 23-24 s) | 40-44 s | 40-44 s | 17-21 s |
+| tail (bench exit -> done: drain, digest, in-line scans) | 104-123 s (mean 114) | 120-128 s (mean 123) | 29-37 s |
+| non-load per cell (cell wall - bench wall) | 238 s | 302 s | 59 s |
+
+* Genesis reuse cut deep non-load time by 64 s per cell (302 -> 238 s), almost all of it in genesis (55 -> 1 s). The
+  deep gaps (68-72 s) are still over the ~60 s target: they are the in-line post-cell step (checks, filtering the
+  deep logs, hard scans), as in 8q (66-67 s), and this campaign must keep them in-line. Deep -> shallow handover:
+  21:53:58 END r3-B -> 21:55:07 START shallow w1 (69 s, the same step plus the shallow preflight). Shallow gaps 14-16 s.
+* Boot -> healthy is bimodal (38 s or ~90 s) in both arms, as in 8m and 8q: not mode-related.
+
+### 102.6 Limits and next
+
+* n = 3 pairs of 300 s cells per shape, one host. The deep blocks/s and p50 ratios have wide CIs (blocks/s 1.79-2.61)
+  but every pair goes the same way. Data-dir rows are not resolved.
+* Only two depths: 1M resting orders and the standard shape's natural depth. The depth at which mode 3 starts to win
+  was not measured. 8i's resting-depth sweep (section 96) gives Classic's save_books per depth.
+* Mode 3 ran without checkpoints (per-block flush), as the code requires today. Its shallow loss and +17-19% CPU per
+  fill are mostly that flush (flush worker 4.7-5.9x per fill). A mode 3 that could use checkpoints is the variant
+  worth re-testing on both shapes.
+* Verdict for the owner / 18c: testnet genesis stays Classic, as decided in s107. Mode 3 is a deep-book option for
+  later, and needs checkpoint support before it is worth another A/B.
+* Data: `~/bench-results-matched/ozarchy-8p-300m-{w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}` and
+  `ozarchy-8ps-300m-{w1,r1-A,r1-B,r2-B,r2-A,r3-A,r3-B}`, smokes `ozarchy-8p{,s}-300m-smoke-s0` (the deep smoke's driver files are in `ozarchy-8p-run/campaign-try1-statehash/smoke`). Campaign files are in
+  `ozarchy-8p-run/` (`chain.sh`, `chain.log`, `chain.done`, `campaign/`) and `ozarchy-8ps-run/campaign/`. Tools are in
+  `ozarchy-8p-tools/` and `ozarchy-8ps-tools/` (specs, `8p-checks.sh`, `8p-bookmarker.py`, drivers, `FROZEN.txt`), the
+  stage in `ozarchy-8p-stage/`. Analysis is in `ozarchy-8p-run/analyst/`: `8p-analyse.py` (the stopped attempt's copy of
+  8q's, plus flush-worker busy share, data-dir growth and gaps; a paired ratio <= 0 is printed without a log CI),
+  `8p-analysis.md`, `8ps-analysis.md`, `8p-overhead.py`, `overhead.md`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
