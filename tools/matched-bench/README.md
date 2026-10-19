@@ -802,7 +802,9 @@ duration_s, gate}`, default baseline / `w1` / `duration_s` / `true`; `false` = n
 duration_s}`, default baseline / 60), `node_env` (node env for every arm), `harness_env`
 (run-cell.sh env for every cell, e.g. `BLOCK_CAP`, `MAX_IN_FLIGHT`, `ORACLE_FEED`),
 `absent_env` (names that must be unset unless an arm sets them), `expect` (every arm),
-`analysis` (`{cmd, metric}` = `CELL_STEP_ANALYSIS_CMD` / `_METRIC`), `max_load` (2),
+`analysis` (`{cmd, metric}` = `CELL_STEP_ANALYSIS_CMD` / `_METRIC`), `max_busy_pct` (10: before each
+cell `quiet()` waits for no build / node / bench process, then for a 5 s sample of `/proc/stat` below this
+CPU busy %; `max_load` is still accepted from older specs but ignored, the generator prints a NOTE),
 `checks` (`{source, per_cell}`, campaign checks, below), `samplers` (`true` default, or `false`), `host_checks` (`true` default, `false`, or
 `{min_mem_avail_gb: 40, sysctl: {"vm.dirty_bytes": "268435456", ...}}`; unknown keys are a
 SPEC ERROR too). The runtime watchers have no switch.

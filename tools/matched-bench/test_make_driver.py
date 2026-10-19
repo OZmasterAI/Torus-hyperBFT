@@ -1756,6 +1756,141 @@ class MemguardTest(FakeHostBase):
         self.assertEqual(unit.wait(timeout=10), 0)
 
 
+def cpu_line(user, system, idle, iowait, guest=0):
+    """an aggregate /proc/stat cpu line: user nice system idle iowait irq softirq steal guest guest_nice"""
+    return "cpu  %d 0 %d %d %d 0 0 0 %d 0\n" % (user, system, idle, iowait, guest)
+
+
+class QuietSpecTest(Base):
+    """spec max_busy_pct (s131, archy 8k: the 1-min load average fell below max_load 2 only ~2.4 min after an
+    idle-again host, the 142-152 s gap between cells): a number in (0, 100], default 10; max_load is still
+    accepted from older specs but no longer gates (the generator says so once)"""
+
+    def bad(self, spec, needle):
+        with self.assertRaises(self.gen.SpecError) as cm:
+            self.gen.validate(spec)
+        self.assertIn(needle, str(cm.exception))
+
+    def test_default_and_values(self):
+        self.assertEqual(self.gen.validate(minimal_spec(self.tmp))["max_busy_pct"], 10)
+        for v in (0.5, 25, 100):
+            p = self.gen.validate(minimal_spec(self.tmp, max_busy_pct=v))
+            self.assertEqual(p["max_busy_pct"], v)
+
+    def test_bad_values(self):
+        for v in (0, -1, 100.5, True, "10", None, [10]):
+            self.bad(minimal_spec(self.tmp, max_busy_pct=v), "max_busy_pct")
+
+    def test_max_load_still_accepted_and_ignored(self):
+        self.gen.validate(minimal_spec(self.tmp, max_load=2))
+        p = self.write_spec(minimal_spec(self.tmp, max_load=2))
+        out = os.path.join(self.tmp, "ml.sh")
+        r = subprocess.run(
+            [sys.executable, "-I", GEN, p, "-o", out], capture_output=True, text=True
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stderr.count("max_load"), 1, r.stderr)
+        self.assertIn("ignored", r.stderr)
+        self.assertIsNone(re.search(r"^MAX_LOAD=", open(out).read(), re.M))
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                GEN,
+                self.write_spec(minimal_spec(self.tmp), "n.json"),
+                "-o",
+                os.path.join(self.tmp, "n.sh"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("max_load", r.stderr)
+
+    def test_rendered_config(self):
+        drv = self.generate(self.write_spec(minimal_spec(self.tmp, max_busy_pct=25)))
+        r = self.lib(drv, 'echo "B=$MAX_BUSY_PCT S=$QUIET_SAMPLE_S"')
+        self.assertIn("B=25 S=5", r.stdout, r.stdout + r.stderr)
+        listed = self.lib(drv, 'echo "$DRIVER_VARS"').stdout.split()
+        self.assertIn("MAX_BUSY_PCT", listed)
+        self.assertIn("QUIET_SAMPLE_S", listed)
+
+
+class QuietTest(Base):
+    """quiet(): no build / node / bench / analysis process (stubbed here), then a QUIET_SAMPLE_S sample of the
+    aggregate cpu line of $PROC/stat (DRIVER_PROC) must be below MAX_BUSY_PCT busy, where busy % =
+    100 * (dtotal - didle - diowait) / dtotal. A stubbed sleep moves the fake /proc/stat to the next sample."""
+
+    BASE = (100000, 50000, 9000000, 4000, 777)  # user system idle iowait guest
+
+    def quiet(self, deltas, hits="", wait=3600, **spec):
+        """deltas: one (user, system, idle, iowait[, guest]) increment per sleep; returns (rc, sleeps, stdout)"""
+        drv = self.generate(self.write_spec(minimal_spec(self.tmp, **spec)))
+        proc, samp = os.path.join(self.tmp, "proc"), os.path.join(self.tmp, "samp")
+        os.makedirs(proc)
+        os.makedirs(samp)
+        cur = list(self.BASE)
+        for k in range(len(deltas) + 1):
+            if k:
+                d = list(deltas[k - 1]) + [0] * (5 - len(deltas[k - 1]))
+                cur = [a + b for a, b in zip(cur, d)]
+            with open(os.path.join(samp, "stat.%d" % k), "w") as f:
+                f.write(cpu_line(*cur) + "cpu0 1 2 3 4 5 6 7 8 9 10\nintr 12345\n")
+        shutil.copy(os.path.join(samp, "stat.0"), os.path.join(proc, "stat"))
+        script = r"""
+buildhits() { printf '%s' "$HITS"; }; benchhits() { :; }; anahits() { :; }
+sleep() { echo "$1" >> "$SAMP/sleeps"; local k; k=$(wc -l < "$SAMP/sleeps")
+          [ -f "$SAMP/stat.$k" ] && cp "$SAMP/stat.$k" "$PROC/stat"; return 0; }
+quiet; echo "QRC=$?"
+"""
+        r = self.lib(
+            drv,
+            script,
+            env={
+                "DRIVER_PROC": proc,
+                "SAMP": samp,
+                "HITS": hits,
+                "QUIET_WAIT_S": str(wait),
+            },
+        )
+        m = re.search(r"QRC=(\d+)", r.stdout)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        sl = os.path.join(samp, "sleeps")
+        sleeps = open(sl).read().split() if os.path.exists(sl) else []
+        return int(m.group(1)), sleeps, r.stdout
+
+    def test_idle_sample_returns_at_once(self):
+        # 5 % busy: iowait counts as idle (with iowait as busy it would be 10 %, not < 10)
+        rc, sleeps, out = self.quiet([(4, 1, 90, 5)])
+        self.assertEqual((rc, sleeps), (0, ["5"]), out)
+
+    def test_guest_time_is_not_counted_twice(self):
+        # guest is already inside user: 9 % busy (summed again it would be 9+40 / 140 = 35 %)
+        rc, sleeps, out = self.quiet([(49, 0, 500, 0, 40)], max_busy_pct=10)
+        self.assertEqual((rc, sleeps), (0, ["5"]), out)
+
+    def test_busy_sample_waits_then_idle_returns(self):
+        rc, sleeps, out = self.quiet(
+            [(40, 10, 50, 0), (100, 100, 800, 0), (2, 1, 97, 0)]
+        )
+        self.assertEqual((rc, sleeps), (0, ["5", "10", "5"]), out)
+
+    def test_busy_until_timeout(self):
+        rc, sleeps, out = self.quiet([(40, 10, 50, 0)] * 20, wait=40)
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"host not quiet after 40s \(cpu busy 50(\.0)?%")
+
+    def test_threshold_is_the_specs(self):
+        rc, sleeps, out = self.quiet([(40, 10, 50, 0)], max_busy_pct=60)
+        self.assertEqual((rc, sleeps), (0, ["5"]), out)
+
+    def test_process_hits_wait_without_sampling(self):
+        rc, sleeps, out = self.quiet([(1, 0, 99, 0)] * 10, hits="cargo:4242 ", wait=30)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(sleeps, ["10", "10"], out)
+        self.assertIn("cargo:4242", out)
+
+
 class CellRunTest(FakeHostBase):
     """the generated cell() for real (library mode, run_spec) against the fakes: detach.sh starts the cell command
     in its own session (the unit), systemctl --user answers for it, run-cell.sh runs 3 stub nodes. quiet() is

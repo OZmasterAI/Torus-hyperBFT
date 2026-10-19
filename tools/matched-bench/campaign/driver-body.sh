@@ -39,6 +39,7 @@ SOAKPY=$TOOLS/soak-sampler.py   # samplers: the hand drivers' 1 Hz sidecar (tool
 UNIT_NAME=$CAMPAIGN
 MIN_FREE_MB=${MIN_FREE_MB:-20000}
 QUIET_WAIT_S=${QUIET_WAIT_S:-3600}
+QUIET_SAMPLE_S=5        # quiet(): the CPU busy sample's length (MAX_BUSY_PCT)
 SMOKE=          # 1 = the smoke run (apply_smoke); the driver's own, never the caller's
 GENESIS_ROOT=   # run-cell.sh's MAINREPO = $TOOLS/../.. (preflight_genesis)
 DD=${DEVNET:-}          # the devnet data root (data/val<i>, run/pids, run/val<i>.log), the Job 4 helpers' name for it
@@ -53,10 +54,10 @@ SYSCTL_PIN="vm.dirty_bytes vm.dirty_background_bytes"
 # Every name the driver keeps state in (generated config + this body). scrub_env un-exports these and never
 # unsets them: a caller that exported RUN, ARMS, ... must not delete (or, exported, leak) driver config.
 # test_make_driver.py checks that each name the config or the body assigns at top level is listed.
-DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_LOAD NODES BASELINE BDIR BMD5 BBMD5 BWRAP
+DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_BUSY_PCT NODES BASELINE BDIR BMD5 BBMD5 BWRAP
  ABIN AENV AXE AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL
  ANALYSIS_CMD ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT SELF PROC HARNESS DETACH SOAKPY
- UNIT_NAME MIN_FREE_MB QUIET_WAIT_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
+ UNIT_NAME MIN_FREE_MB QUIET_WAIT_S QUIET_SAMPLE_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
  TAGS STARTED_LABEL CELL_FAIL GATE_TAGS CHECKS_SOURCE CHECK_FNS DRIVER_VARS"
 # run-cell.sh generates each cell's genesis from ITS OWN repo root ($TOOLS/../..), not from the harness worktree
 # it is handed (which only launches the nodes): a frozen tools copy must carry these, equal to the harness's
@@ -126,13 +127,28 @@ anahits() { # host checks: heavy analysis processes (perf record/report/script, 
     [ "$HOST_CHECKS" = 1 ] || return 0
     local p; for p in $(pgrep -f '^(\S*/)?(perf|inferno-\S+|flamegraph\S*|jeprof|addr2line|llvm-addr2line)( |$)|^perl \S*(stackcollapse|flamegraph)'); do printf '%s:%s ' "$(cat /proc/$p/comm 2>/dev/null)" "$p"; done
 }
-quiet() { # no build, no node or bench left over, no heavy analysis (host checks), 1-min load < MAX_LOAD; waits up to QUIET_WAIT_S
-    local t=0 l1
+cpustat() { # "total idle" jiffies of $PROC/stat's aggregate cpu line: total = user..steal (guest, guest_nice are
+    # already in user, nice), idle = idle + iowait
+    awk '$1 == "cpu" { print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit }' "$PROC/stat" 2>/dev/null
+}
+cpubusy() { # CPU busy % over a QUIET_SAMPLE_S sample: 100 * (dtotal - didle - diowait) / dtotal; empty = unreadable
+    local a b
+    a=$(cpustat); sleep "$QUIET_SAMPLE_S"; b=$(cpustat)
+    awk -v a="$a" -v b="$b" 'BEGIN { if (split(a, x, " ") != 2 || split(b, y, " ") != 2 || y[1] <= x[1]) exit
+        printf "%.1f\n", 100 * ((y[1] - x[1]) - (y[2] - x[2])) / (y[1] - x[1]) }'
+}
+quiet() { # no build, no node or bench left over, no heavy analysis (host checks), then CPU busy < MAX_BUSY_PCT over a
+    # QUIET_SAMPLE_S sample (cpubusy; s131: the 1-min load average this read before lagged ~2.4 min behind a host
+    # already idle after a cell); waits up to QUIET_WAIT_S
+    local t=0 nl=300 h b
     while :; do
-        read -r l1 _ < /proc/loadavg
-        if [ -z "$(buildhits)$(benchhits)$(anahits)" ] && awk -v l="$l1" -v m="$MAX_LOAD" 'BEGIN{exit !(l<m)}'; then return 0; fi
-        [ $((t % 300)) = 0 ] && [ $t -gt 0 ] && log "waiting for a quiet host ${t}s (load $l1; $(buildhits)$(benchhits)$(anahits))"
-        t=$((t+10)); [ $t -ge "$QUIET_WAIT_S" ] && { log "host not quiet after ${QUIET_WAIT_S}s (load $l1; $(buildhits)$(benchhits)$(anahits))"; return 1; }
+        h=$(buildhits)$(benchhits)$(anahits); b=
+        if [ -z "$h" ]; then
+            b=$(cpubusy); t=$((t + QUIET_SAMPLE_S))
+            awk -v b="$b" -v m="$MAX_BUSY_PCT" 'BEGIN{exit !(b != "" && b + 0 < m + 0)}' && return 0
+        fi
+        [ $t -ge $nl ] && { log "waiting for a quiet host ${t}s (cpu busy ${b:-?}%; load $(cut -d' ' -f1 /proc/loadavg); $h)"; nl=$((nl + 300)); }
+        t=$((t+10)); [ $t -ge "$QUIET_WAIT_S" ] && { log "host not quiet after ${QUIET_WAIT_S}s (cpu busy ${b:-?}%; load $(cut -d' ' -f1 /proc/loadavg); $h)"; return 1; }
         sleep 10
     done
 }

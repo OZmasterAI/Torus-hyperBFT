@@ -384,6 +384,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (SIGKILL val1 mid-load, restart): kill -> first commit, replayed blocks, catch-up time, AGREE and one digest, and
    matched/s around the kill. If the depth curve is unclear at n = 1 (e.g. 0 and 1M within the S-cell spread), report
    it and 18c decides on replicates.
+   **Done s68 (ozarchy-8i, main `76204a69` node `7f91438d`, bench `0a030a0c`, tools `c2336e70`, 1M-account genesis
+   reused (`a644d0a7`), code defaults, 600 s, n = 1; perf doc section 96).** Depth, not accounts. P0 (1M accounts,
+   no pre-load) = the standard cell: 263,708 matched/s (S 256,224), save_books 0.217 ms per 1k fills (S 0.218),
+   CPU-s per 1M 23.16 (S 23.56), 10.5 blocks/s (standard spread 9.3-16.4). PRELOAD 250k / 500k / 1M: matched/s
+   251,920 / 244,017 / 221,362 (0.955 / 0.925 / 0.839 of P0), blocks/s 3.83 / 3.42 / 2.91 (big-block regime from
+   250k), p50 177 / 223 / 243 ms, save_books 37.1 / 49.9 / 78.9 ms per block = 0.576 / 0.719 / 1.070 ms per 1k fills,
+   linear in mean resting depth (0.21 / 0.75 / 1.04 / 1.61M; +0.61 ms per 1k fills per 1M). P1M repeats 8f's M within
+   0.9%. 0 vs 1M is clear at n = 1; the middle points are one cell each (18c: replicates only if needed). Profile
+   (user space, paranoid 2 kept; no frame pointers, so leaf + neighbour rule): save_books 83 ms per block at 1M =
+   borsh encode of the whole book 73% + output-Vec memmove 15% + jemalloc 3% + journal drop 2% + overlay put 0.1-0.2%
+   + hashing 0 (Classic) + not sampled 6-7%. Crash-kill at bench+300 s: chain halts (3 validators), val1 replays 76
+   blocks (applied marker 2,144 vs committed 2,220) in 41.4 s, first commit 48.4 s after the kill, at par at ~50 s;
+   ~28 s of zero fills, matched/s 226k before, 193k in the first minute after. AGREE, one digest `a99ad5c1`; REJECT
+   on liveness (30 s stall) and the crash gate (marker 12 blocks beyond the exec queue, gate allows 2; plus a
+   false-positive panic count on an INFO line in `crash-kill.sh`). No swap growth, host >= 22.1 GB free, highest
+   node RSS 9.9 GB (P1M) / 10.3 GB (CK).
 8j. **[DROPPED s131, owner] Item 7 option 0 G1b flag-off cost.** Option 0 is fully built (G0-G4), so the early
    warning is moot; its question (flag-off cost vs main under EVM load) moved into 8l as arm M.
 8k. **Explore workflow: new high-gain ideas, build and bench the best** (owner s131; starts right after 8i if 8j's
@@ -392,9 +408,29 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    storage, network / DA, crypto, wildcard incl. theoretical), adversarial review and ranking, build the top 1-2 on
    `exp/8k-<name>` behind a flag (tests first, microbench gate), A/B n = 3 under the exec-path merge rule, write-up.
    Never merges to main; keeps off item 7 option 0's and RH4's code.
+   **Done s68 (8k, phases 1-5 run, verdict pending; perf doc section 97). 21 ideas (4 dead, 15 backlog, 2 picked;
+   top 5: L3.3 1.60, L2.2 0.84, L3.1 0.54, L5.1 0.47, L2.1 0.37; `docs/perf/8k-explore-ideas.md`). L3.3 exact-size
+   Classic book encoder built on `exp/8k-book-fast-encode` `4b916ecf` (`TORUS_BOOK_FAST_ENCODE=1`, default off;
+   nextest 4161 / 0 failed; flag on == off on a 130-block app stream; microbench P1M encode -30 to -36% with
+   spread book sizes, -5.5 to -18.7% with equal sizes; the ranker's size-pass design -9 to -16%, dead). A/B, A = main
+   `0f5bef38` node `0d24371e`, B = `4b916ecf` node `b0a4c2f1`, 600 s, A B B A A B: ozarchy-8k standard 7 / 7 cells
+   valid by driver (raw matched/s A 259,917, B 261,123); ozarchy-8kd deep book (PRELOAD=1000000) 7 / 7 valid by
+   driver (raw A 224,195, B 227,344, +1.4%). Analysis not run, so no verdict yet: run
+   `ozarchy-8k-run/analyst/8k-analyse.py` on both run dirs, then judge by the exec-path merge rule. L2.2 no-merge position flush written but
+   not compiled (worktree `wt/8k-settle-no-merge`, uncommitted). Next best idea: L3.1.**
+   **Final (s131, section 97.8, archy's 8k report; the Done line above was written mid-run):** L3.3 A/B, both shapes
+   n = 3: save_books per 1k fills 0.845 [0.762, 0.938] standard, 0.853 [0.836, 0.872] deep; exec-thread on-CPU per 1k
+   fills 0.990 (spans 1) standard, 0.968 [0.962, 0.973] deep; matched/s, blocks/s, p99 span 1. Codex torus review of
+   `4b916ecf`: no findings. L2.2 committed and pushed (`exp/8k-settle-no-merge` `dbe14b21`, workspace 4163 / 4163;
+   microbench -5.3 / -7.0 ms per block at 16.8k / 22.8k fills); Codex torus review P1: aliased opaque position rows
+   make the market caches overlap, so flag on != off and the release state is nondeterministic (unstable sort); fix
+   before any merge (prove disjointness incl. clean entries, else fall back to merge_disjoint). The 8n screen stays
+   valid (benches create no aliased rows).
    **Pacing rule (owner s131, every step from here on):** run all cells of a step from ONE detached driver, back to
    back, with at most ~60 s idle between the end of one cell and the start of the next (teardown, the quiet check and
    the next genesis included where possible). Don't wait for an agent wake-up between cells; the driver chains them.
+   quiet() now gates on a 5 s CPU busy sample (`max_busy_pct`, default 10) instead of the 1-min load average (commit
+   "matched-bench: quiet() gates on a 5 s CPU busy sample", the commit that adds this line).
 8n. **L2.2 screen (8k pick 2), NEXT** (owner s131; ~40 min). `exp/8k-settle-no-merge` `dbe14b21`
    (`TORUS_SETTLE_NO_MERGE=1`, byte-identical; microbench -5.3 to -7.0 ms per block) vs main `0f5bef38` (its base).
    One binary per arm, md5 checked. Shape: the 8i P1M deep book (1M-account genesis, `PRELOAD=1000000`), standard
