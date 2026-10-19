@@ -276,6 +276,27 @@ and changed meaning.
   closes it: resync on `TrieStale` as the Checkpoint does, or set F4's stale marker so the root routes to the full
   scan and boot rebuilds.
 
+- **F12 (s132, task 3.6). With Every5, the EIP-161 next-block re-fund is not an in-flight read.** Z's fund (e-3), drain
+  (e-2) and touch (e) share one Every5 window, so until that window lands the DB has no row of Z: at e+1 the deletion
+  in the parent / C answers "absent", which is what the DB answers too. By R2's definition (the DB answer differs) the
+  read is not in flight, and a raw-DB reader would read the same. The in-flight case exists at interval 0 (G mode, the
+  parent held: asserted). Task 3.6's flip asserts in flight at interval 0 and "answered by a frozen layer" with Every5.
+- **F13 (s132, task 3.6). The 300-block stream reaches C3-C6 only in part, and several bypasses only trip.** (a) Its
+  in-flight enqueue cursor reads never change a decision (the stale and the layer value pick the same target), so the
+  journal and enqueue bypasses diverge only on a hand stream (210 cancels spill into h+2, the next cancel's seq reads
+  the parent). (b) A reader precompile called from an EOA leaves no state: a skipped deferred part or a layer-less
+  journal changes only the answer, which no ledger sees; the planted test runs a recorder contract that stores
+  keccak(answer) (`o0_fixture_recorder`; the golden's fixture is untouched). (c) No in-flight queue row of the stream
+  targets an otherwise idle block, so the due-check bypass diverges only on a deposit-then-empty hand stream. (d) Revm
+  code / storage at the parent or C, journal markets / staking / queue rows in flight, the lane read at the parent and
+  the due-check over a tombstone are never reached: `o0_poison_readers_answer_from_every_layer` forces every reader x
+  CF x layer cell. Every bypass trips the armed tripwire except the layer-less journal (an overlay read by design).
+- **F14 (s132, task 3.7). No fast-path twin of `evm_state_root_compute_fault_fail_stops_block`.** On the fast path E
+  computes no EVM root (`RootMode::Skip`), so a node without CF_STORAGE fail-stops only where a read touches it (a revm
+  SLOAD: `evm_db_read_fault_fail_stops_block` has a flag-on run), not at a root compute; W's EVM trie step reads the
+  hashed mirror and trie CFs, and its own failure marks the trie stale (F4, task 2.3), it does not fail-stop. By design;
+  listed for the G4 review.
+
 ## 3. Shape of the fast-path EVM section
 
 ```
@@ -896,6 +917,50 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
   interval 0) agree on every `h_n` and every state-hash attestation row (`h % 100`). Their checkpoint policies differ,
   so the comparison is task 0.4's ledger (by height), never `p5_compare` (it would fail on the marker lag). Run in D
   and in G mode (the two flag-on nodes gated on independent schedules).
+
+**Done (s132, G3, on `41f6407f`; F1 fix `86cd520f` + `a361e764` in the base, gate D1).** Commits: 3.1 `4a3f7aad`,
+3.2 `b28fd4ff`, 3.3 `fbdfd079`, 3.4 `c14ac3bd`, 3.5 `d5997009`, 3.6 `ce8b413e` (counters, poison grid, planted
+bypasses) + `9437b9d9` (coverage floor, matrix, flips), 3.7 `5bbdcc07`, 3.8 `7123cc3d`.
+- **Flag-on golden: byte-equal** (`o0_golden_fast_path_d` / `_g`, the matrix, the mixed replicas): Classic at interval
+  0, Every5 and Never, D and G mode, epoch flag on and off, `TORUS_CKPT_DEFER_BOOKS=1`; every flag-off cell too.
+  OrderRows and modes 2 / 3 against S in their mode (the golden is Classic).
+- 3.1: as planned, except that the predicate term moved to 3.2, so no commit runs today's serial EVM section (DB
+  reads, root on E, receipts written on E) on a pipelined block.
+- 3.2: as planned. The tripwire is also armed around the pipelined due-check (debug / test-probes builds). Seams:
+  torus-evm `test-probes` (precompile reads labelled `Journal`), W path counters shared with E (C13, `w.*`), the
+  drain-checkpoint flag, the panic seam inside W's EVM trie step.
+- 3.3: the Marker carries `action_status` and the EVM part (all-skipped `Ok`) or `None` (failed section); E's debug
+  assert as planned. Flag-on golden reachable from here (`o0_golden_fast_path_d` / `_g`).
+- 3.4: the three planned tests, each at interval 0 (the parent's Flush held) and Every5 (the checkpoint held) where it
+  applies. The faults are taken with W held on a fixed schedule (`hold_from`, `hold_checkpoints`), not the seeded G
+  controller, so the held job is the one the fault needs; same semantics (no drain between the held blocks). The
+  crash protocol `o0_crash` (R4, steps 1-5) is built here, where it is first needed; step 4 compares the whole DB
+  with the hook snapshot at d. New seams: `Plant::FaultRevmRead`, `ReplayFault::AbsorbPut`,
+  `DeferredGate::fail_next`; `test_crash_after_evm_section` now latches.
+- 3.5: every planned crash point (before / after the absorb, after the hand-off, inside W's EVM trie step, during the
+  replay of an EVM block; repeated crashes; an all-skipped Marker held) at interval 0 and Every5, plus the two guards.
+- 3.6: section 5.2's table is `o0_coverage_floor_per_config` (47 rows x 7 configurations, the reachable pairs and the
+  reasons for the others next to it; asserted unreachable: no in-flight parent in D at interval 0, no C read in D, no
+  second deferred-read wait in a block, no shared L / C / R). C4 is read as "every CF has an in-flight layer hit and
+  every layer an in-flight hit" on the stream; the full reader x CF x layer grid, the stale answer of each planted
+  bypass and its tripwire are `o0_poison_readers_answer_from_every_layer` (F13). Planted bypasses (5.4): revm, lane,
+  due-check, enqueue, journal (`o0_planted_bypass_*`); in-flight-only skips limited to the EVM section (new plants
+  `SkipParentEvm`, `SkipCheckpointEvm`, `SkipDeferredEvm`): skip parent caught in G at interval 0 and not in D, skip C
+  caught with R on in G and not in D, skip deferred caught. The defer-books cell runs in a child process of the test
+  binary (the routing is read once per process). The EIP-161 flip holds at interval 0 (F12 for Every5). Added: the
+  C2 non-durable header case (`fast_path_evm_block_not_dispatch_durable_stays_serial`), the controller knob
+  `every_parent`.
+- 3.7: as planned; all R02 fault runs now also assert that the replay re-hashes exactly the faulted height (F14 for
+  the root-compute case).
+- 3.8: three replicas (off Every5; on Every5; on interval 0), D and G (independent schedules): equal ledgers, equal
+  attestation rows (checkpoints 100 / 200 / 300), all equal the golden.
+- Tripwire: 0 hits on every flag-on run (a hit panics); the planted bypasses show it live.
+- Gates on `7123cc3d`: plan -p set nextest 3703 passed / 0 failed (40 skipped); rest of the workspace (torus-network,
+  -telemetry, -explorer, -faucet, -price-feeder, -tx-flood, bench-throughput) 473 passed; doc tests rc=0 (1 passed);
+  `o0_*` 48 / 48 twice in a row; fast_path | journal_dropped | epoch_fast_path 38 / 38 once more; release
+  `cargo build -p torus-node` OK (tripwire and probes compiled out).
+- Open for G4: task 4.2's metrics (`torus_exec_evm_fast_path_blocks`, `torus_flush_worker_evm_trie_seconds`) and the
+  mempool prune on the view (4.1) are not built; F14's behaviour difference; Codex torus-adversarial review of G3.
 
 Step 3 size: ~750-1,070 lines, mostly tests (estimate; +100-150 for the all-skipped cases, the G-mode wiring of the
 matrix, the in-flight planted faults; +50-70 in revision 2 for the `o0_crash` protocol, the seam latches and their
