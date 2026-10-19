@@ -5155,8 +5155,12 @@ impl ExecutionContext {
         // EVM batch rides that marker write (bug (c)).
         // s84: an EVM block without a native phase: its executed/skipped
         // record rides the EVM marker flush below (an empty batch when the EVM
-        // section failed and executed nothing). EVM blocks are never pipelined
-        // without a native phase until task 3.3 (item 7 option 0).
+        // section failed and executed nothing), or its Marker job on the
+        // fast path (item 7 option 0, task 3.3).
+        // Item 7 option 0 (task 3.3, plan F2): on the fast path that record
+        // rides the block's Marker job instead (W writes it in the marker
+        // batch, or keeps it in the window with an interval).
+        let mut marker_status = None;
         if !run_native && has_evm {
             #[cfg(test)]
             self.test_path("marker.evm_status");
@@ -5166,17 +5170,21 @@ impl ExecutionContext {
                 native_skipped: vec![],
                 native_failed: vec![],
             };
-            match self
-                .state_db
-                .cf_handle(torus_state::cf::CF_BLOCK_ACTION_STATUS)
-            {
-                Ok(cf) => evm_batch.get_or_insert_with(Default::default).put_cf(
-                    cf,
-                    height.to_be_bytes(),
-                    crate::action_results::encode_status(&status, self.metrics.as_deref()),
-                ),
-                Err(e) => {
-                    tracing::error!(%e, height, "failed to stage the executed/skipped record")
+            if pipelined {
+                marker_status = Some(status);
+            } else {
+                match self
+                    .state_db
+                    .cf_handle(torus_state::cf::CF_BLOCK_ACTION_STATUS)
+                {
+                    Ok(cf) => evm_batch.get_or_insert_with(Default::default).put_cf(
+                        cf,
+                        height.to_be_bytes(),
+                        crate::action_results::encode_status(&status, self.metrics.as_deref()),
+                    ),
+                    Err(e) => {
+                        tracing::error!(%e, height, "failed to stage the executed/skipped record")
+                    }
                 }
             }
         }
@@ -5199,13 +5207,29 @@ impl ExecutionContext {
                         .with_deletes(torus_state::cf::CF_NATIVE_NONCES, &expired_nonces)
                         .with_hash_extras(hash_extras.take().unwrap_or_default()),
                 );
+                // Item 7 option 0 (task 3.3, plan F2, decision 11): a
+                // fast-path EVM block without a native phase executed no tx
+                // (its section failed, or every tx was skipped). Its Marker
+                // carries its status row and, when the section returned `Ok`,
+                // its EVM part: an empty bundle and the hash -> number side
+                // row (`commit_block_metadata` writes it on the serial path).
+                // A Marker never carries absorbed rows.
+                debug_assert!(
+                    evm_job.as_ref().is_none_or(|j| j.bundle.state.is_empty()
+                        && j.side.receipts.is_empty()
+                        && j.side.links.is_empty()),
+                    "a Marker never carries absorbed rows (plan F2)"
+                );
+                debug_assert_eq!(marker_status.is_some(), has_evm, "an EVM Marker has a status");
+                #[cfg(test)]
+                if evm_job.is_some() {
+                    self.test_path("marker.evm_side");
+                }
                 if !self.pipeline_handoff(crate::exec_pipeline::Job::Marker {
                     height,
                     pending,
-                    // Item 7 option 0 (task 2.4): only a fast-path EVM block
-                    // without a native phase sets these (task 3.3, plan F2).
-                    action_status: None,
-                    evm: None,
+                    action_status: marker_status.take(),
+                    evm: evm_job.take(),
                 }) {
                     return;
                 }
@@ -32229,6 +32253,62 @@ mod crash_recovery_tests {
         }
     }
 
+    /// Item 7 option 0 (task 3.3 onward): `nodes` against the golden of
+    /// today (`o0_golden_today`), every height, every shared dump height and
+    /// the final state.
+    fn o0_assert_golden(nodes: &[O0Node], finals: &[O0Final]) {
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(o0_golden_path()).unwrap()).unwrap();
+        assert_eq!(file["base"], O0_GOLDEN_BASE);
+        for (node, fin) in nodes.iter().zip(finals) {
+            let (diffs, dumps) = o0_golden_diff(&file, node, fin);
+            assert!(diffs.is_empty(), "{:?} vs the golden: {diffs:#?}", node.cfg);
+            assert!(dumps >= 2, "{:?}: golden dumps compared {dumps}", node.cfg);
+        }
+    }
+
+    /// Plan task 3.3 (flag-on golden, D mode): with `TORUS_EVM_FAST_PATH`
+    /// on, pipelined at interval 0 and Every5 (EVM heights pipelined), the
+    /// stream reproduces today's golden byte for byte: every height's `h_n`,
+    /// status and side rows, every shared dump, the final dump, running
+    /// hash, EVM root and RPC answers.
+    #[test]
+    fn o0_golden_fast_path_d() {
+        let (blocks, fed) = o0_blocks(300, O0_SEED);
+        let cfgs = [
+            O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast(),
+            O0Cfg::piped(P5Ckpt::Every5, O0Run::D).fast(),
+        ];
+        let (nodes, finals) = o0_run_agreeing(&blocks, &cfgs);
+        for node in &nodes {
+            let p = &node.paths;
+            assert!(
+                p.get("block.pipelined.evm").copied().unwrap_or(0) >= fed.evm_blocks - 10,
+                "{:?}: EVM heights pipelined {p:?} vs {fed:?}",
+                node.cfg
+            );
+            assert_eq!(p.get("block.serial.evm"), None, "{:?}: {p:?}", node.cfg);
+        }
+        o0_assert_golden(&nodes, &finals);
+    }
+
+    /// Plan task 3.3 (flag-on golden, G mode): the same in W-gated runs
+    /// (the controller parks W across blocks; reads with writes in flight).
+    #[test]
+    fn o0_golden_fast_path_g() {
+        let (blocks, _) = o0_blocks(300, O0_SEED);
+        let cfgs = [
+            O0Cfg::piped(P5Ckpt::PerBlock, O0Run::G).fast(),
+            O0Cfg::piped(P5Ckpt::Every5, O0Run::G).fast(),
+        ];
+        let (nodes, finals) = o0_run_agreeing(&blocks, &cfgs);
+        for node in &nodes {
+            let holds = node.ctl.as_ref().unwrap().st.lock().unwrap().holds;
+            assert!(holds >= 10, "{:?}: the controller parked W {holds} times", node.cfg);
+        }
+        o0_assert_golden(&nodes, &finals);
+    }
+
     // ---- Tasks 0.3 / 0.4: hand streams and the harness tests ----
 
     /// A hand block of the option 0 tests.
@@ -32248,6 +32328,16 @@ mod crash_recovery_tests {
         /// A trader's `TransferToSpot` (credits its EVM account: W resyncs
         /// the EVM mirror after the batch).
         Spot,
+        /// Item 7 option 0 (task 3.3): an EVM tx one nonce above its
+        /// sender's (skipped by `skip_invalid`), no native action: an
+        /// all-skipped section `Ok` without a native phase.
+        NonceSkipped,
+        /// An undecodable EVM tx with a native action (`TransferToPerp`):
+        /// an all-skipped section `Ok` with a native phase.
+        SkippedNative,
+        /// A plain EVM transfer whose section fails
+        /// (`ReplayFault::EvmSectionError`), no native action.
+        Failed,
     }
 
     fn o0_hand_blocks(kinds: &[O0Hand]) -> Vec<O0Block> {
@@ -32265,13 +32355,19 @@ mod crash_recovery_tests {
                 )
             };
             let actions = match kind {
-                O0Hand::Native | O0Hand::Slash => vec![sign(NativeAction::TransferToPerp {
-                    amount: U256::from(FixedPoint::ONE.raw() as u128),
-                })],
+                O0Hand::Native | O0Hand::Slash | O0Hand::SkippedNative => {
+                    vec![sign(NativeAction::TransferToPerp {
+                        amount: U256::from(FixedPoint::ONE.raw() as u128),
+                    })]
+                }
                 O0Hand::Spot => vec![sign(NativeAction::TransferToSpot {
                     amount: U256::from(50 * FixedPoint::ONE.raw() as u128),
                 })],
-                O0Hand::Empty | O0Hand::Evm | O0Hand::Skipped => vec![],
+                O0Hand::Empty
+                | O0Hand::Evm
+                | O0Hand::Skipped
+                | O0Hand::NonceSkipped
+                | O0Hand::Failed => vec![],
             };
             let mut b = make_block(1, actions);
             b.header.height = h;
@@ -32287,7 +32383,23 @@ mod crash_recovery_tests {
                         U256::from(10u128.pow(18)),
                     )]
                 }
-                O0Hand::Skipped => vec![vec![0xde, 0xad, 0xbe, 0xef]],
+                O0Hand::Skipped | O0Hand::SkippedNative => vec![vec![0xde, 0xad, 0xbe, 0xef]],
+                // One above the sender's nonce: revm refuses it, never runs.
+                O0Hand::NonceSkipped => vec![signed_eip1559_with_value(
+                    &oracle_key(O0_USERS[0]),
+                    evm_nonce + 1,
+                    alloy_primitives::TxKind::Call(o0_addr(0xB1)),
+                    vec![],
+                    U256::from(10u128.pow(18)),
+                )],
+                // The section fails: the tx never runs, its nonce stays.
+                O0Hand::Failed => vec![signed_eip1559_with_value(
+                    &oracle_key(O0_USERS[0]),
+                    evm_nonce,
+                    alloy_primitives::TxKind::Call(o0_addr(0xB1)),
+                    vec![],
+                    U256::from(10u128.pow(18)),
+                )],
                 _ => vec![],
             };
             b.header.evm_tx_count = b.evm_transactions.len() as u32;
@@ -32307,11 +32419,12 @@ mod crash_recovery_tests {
         chain
             .into_iter()
             .zip(slashes)
-            .map(|(block, slashes)| O0Block {
+            .zip(kinds)
+            .map(|((block, slashes), kind)| O0Block {
                 block,
                 slashes,
                 fatal: false,
-                section_error: false,
+                section_error: *kind == O0Hand::Failed,
             })
             .collect()
     }
@@ -33099,6 +33212,128 @@ mod crash_recovery_tests {
         assert!(p.get("evm.fast").copied().unwrap_or(0) >= 10, "{p:?}");
         let _ = Layer::Own;
         node.finish();
+    }
+
+    /// Plan task 3.3: block 3 of `[Native, Native, kind, Native, Native,
+    /// Native]` on the fast path (interval 0 and Every5, D and G) against
+    /// the serial run S of the same blocks (today's path): the ledgers
+    /// agree (per height `h_n`, status row, side rows; the dumps at every
+    /// completed height), and so do the final states. At height 3 S has a
+    /// status row, `hash_index` hash -> number rows and no receipt, and so
+    /// does every fast node's DB. Returns each fast node's path flags.
+    fn o0_fast_case(kind: O0Hand, hash_index: usize) -> Vec<(O0Cfg, BTreeMap<&'static str, u64>)> {
+        use O0Hand::Native;
+        let blocks = o0_hand_blocks(&[Native, Native, kind, Native, Native, Native]);
+        let cfgs = [
+            O0Cfg::serial(),
+            O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast(),
+            O0Cfg::piped(P5Ckpt::Every5, O0Run::D).fast(),
+            O0Cfg::piped(P5Ckpt::PerBlock, O0Run::G).fast(),
+            O0Cfg::piped(P5Ckpt::Every5, O0Run::G).fast(),
+        ];
+        let nodes = o0_run(&blocks, &cfgs, &[]);
+        let s = &nodes[0];
+        assert!(s.ledger().status[&3].is_some(), "{kind:?}: S has a status row at 3");
+        let fin = o0_final(s, &blocks);
+        for node in &nodes {
+            let what = format!("{kind:?} {:?}", node.cfg);
+            node.ledger().assert_complete(6, &what);
+            assert_eq!(o0_hash_index_at(&node.db, 3), hash_index, "{what}: hash -> number");
+            assert_eq!(o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 3), 0, "{what}: receipts");
+            assert!(
+                node.db
+                    .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &3u64.to_be_bytes())
+                    .unwrap()
+                    .is_some(),
+                "{what}: status row"
+            );
+            if node.cfg.pipelined {
+                let c = o0_compare(&s.ledger(), &node.ledger())
+                    .unwrap_or_else(|d| panic!("{what}: diverged at {}: {}", d.height, d.what));
+                assert_eq!((c.hn, c.status, c.side), (6, 6, 6), "{what}");
+                assert!(c.dumps >= 2, "{what}: {c:?}");
+                assert_eq!(o0_final(node, &blocks), fin, "{what}: final state");
+                assert!(
+                    node.paths.get("block.pipelined.evm").copied() == Some(1),
+                    "{what}: {:?}",
+                    node.paths
+                );
+            }
+        }
+        nodes
+            .into_iter()
+            .skip(1)
+            .map(|n| (n.cfg, n.paths))
+            .collect()
+    }
+
+    fn o0_has(p: &BTreeMap<&'static str, u64>, k: &str) -> bool {
+        p.get(k).copied().unwrap_or(0) > 0
+    }
+
+    /// Plan task 3.3 (C11a): a failed EVM section on the fast path, no
+    /// native phase: a Marker with the status row and no EVM part (no hash
+    /// -> number row, as today: `commit_block_metadata` never ran).
+    #[test]
+    fn fast_path_failed_evm_section_writes_status_with_marker() {
+        for (cfg, p) in o0_fast_case(O0Hand::Failed, 0) {
+            assert!(o0_has(&p, "evm.failed") && o0_has(&p, "marker.evm_status"), "{cfg:?}: {p:?}");
+            assert!(!o0_has(&p, "marker.evm_side"), "{cfg:?}: no EVM part: {p:?}");
+            if cfg.ckpt == P5Ckpt::PerBlock {
+                assert!(o0_has(&p, "w.status.marker"), "{cfg:?}: {p:?}");
+                assert!(!o0_has(&p, "w.evm_side.marker"), "{cfg:?}: {p:?}");
+            } else {
+                assert!(o0_has(&p, "handoff.digest"), "{cfg:?}: {p:?}");
+            }
+        }
+    }
+
+    /// The flags of an all-skipped section `Ok` without a native phase
+    /// (C11b; C11d with an interval: the Marker becomes a Digest).
+    fn o0_assert_all_skipped_marker(cfg: O0Cfg, p: &BTreeMap<&'static str, u64>) {
+        assert!(o0_has(p, "evm.ok.all_skipped") && o0_has(p, "marker.evm_side"), "{cfg:?}: {p:?}");
+        if cfg.ckpt == P5Ckpt::PerBlock {
+            assert!(o0_has(p, "w.evm_side.marker") && o0_has(p, "w.status.marker"), "{cfg:?}: {p:?}");
+        } else {
+            assert!(o0_has(p, "w.evm_side.digest"), "{cfg:?}: {p:?}");
+        }
+        assert!(!o0_has(p, "w.evm_step.flush") && !o0_has(p, "w.evm_fold.digest"), "{cfg:?}: no trie work: {p:?}");
+    }
+
+    /// Plan task 3.3 (C11b): every tx one nonce above its sender's
+    /// (`skip_invalid`), no native phase: the Marker carries the status row
+    /// and the hash -> number side row.
+    #[test]
+    fn fast_path_wrong_nonce_only_block_writes_hash_index_with_marker() {
+        for (cfg, p) in o0_fast_case(O0Hand::NonceSkipped, 1) {
+            o0_assert_all_skipped_marker(cfg, &p);
+        }
+    }
+
+    /// Plan task 3.3 (C11b): undecodable txs only (`decode_txs_lossy`), no
+    /// native phase: as the wrong-nonce block.
+    #[test]
+    fn fast_path_undecodable_only_block_writes_hash_index_with_marker() {
+        for (cfg, p) in o0_fast_case(O0Hand::Skipped, 1) {
+            o0_assert_all_skipped_marker(cfg, &p);
+        }
+    }
+
+    /// Plan task 3.3 (C11c): an all-skipped section with a native action in
+    /// the same block: the block's Flush / Digest carries the empty-bundle
+    /// EVM part (no trie step) and its hash -> number side row.
+    #[test]
+    fn fast_path_all_skipped_block_with_native_phase_writes_hash_index() {
+        for (cfg, p) in o0_fast_case(O0Hand::SkippedNative, 1) {
+            assert!(o0_has(&p, "evm.ok.all_skipped") && o0_has(&p, "evm.job"), "{cfg:?}: {p:?}");
+            assert!(!o0_has(&p, "marker.evm_status"), "{cfg:?}: a native phase: {p:?}");
+            if cfg.ckpt == P5Ckpt::PerBlock {
+                assert!(o0_has(&p, "w.evm_side.flush"), "{cfg:?}: {p:?}");
+            } else {
+                assert!(o0_has(&p, "w.evm_side.digest"), "{cfg:?}: {p:?}");
+            }
+            assert!(!o0_has(&p, "w.evm_step.flush") && !o0_has(&p, "w.evm_fold.digest"), "{cfg:?}: {p:?}");
+        }
     }
 
     // ======================================================================
