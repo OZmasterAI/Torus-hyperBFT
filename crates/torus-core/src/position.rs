@@ -897,6 +897,53 @@ impl PositionCache {
         Ok(())
     }
 
+    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`): [`flush_all`] of this cache with
+    /// `runs` (pass B's per-market caches) merged in, without merging them.
+    /// Gathers `(key, row)` for every dirty key of this cache and of each run,
+    /// sorts by `(trader, market_id)` and writes in that order, then clears
+    /// every dirty set. The caches must hold disjoint keys (per-market caches
+    /// do: the market is part of the key; debug-asserted), so the keys are
+    /// unique and the write sequence is exactly that of [`merge_disjoint`]
+    /// of every run followed by [`flush_all`]: the same rows, in the same
+    /// global key order (which keeps the overlay's sorted-map inserts at its
+    /// right edge). What it skips: moving every entry of every run (clean
+    /// read hits included) into one map, and the second lookup per dirty key.
+    ///
+    /// [`flush_all`]: Self::flush_all
+    /// [`merge_disjoint`]: Self::merge_disjoint
+    pub fn flush_with_runs<T: StateBackend>(
+        &mut self,
+        runs: &mut [PositionCache],
+        positions: &PositionManager<T>,
+    ) -> Result<(), CoreError> {
+        let total = self.dirty.len() + runs.iter().map(|r| r.dirty.len()).sum::<usize>();
+        let mut rows: Vec<((Address, MarketId), &Option<Position>)> = Vec::with_capacity(total);
+        for cache in std::iter::once(&*self).chain(runs.iter()) {
+            rows.extend(
+                cache
+                    .dirty
+                    .iter()
+                    .filter_map(|key| cache.map.get(key).map(|row| (*key, row))),
+            );
+        }
+        rows.sort_unstable_by_key(|row| row.0);
+        debug_assert!(
+            rows.windows(2).all(|w| w[0].0 < w[1].0),
+            "flush_with_runs: two caches hold the same key"
+        );
+        for (key, row) in rows {
+            match row {
+                Some(pos) => positions.put_position(pos)?,
+                None => positions.delete_position(&key.0, key.1)?,
+            }
+        }
+        self.dirty.clear();
+        for run in runs.iter_mut() {
+            run.dirty.clear();
+        }
+        Ok(())
+    }
+
     /// Item 6 Phase 2 step 0.4: the per-row flush, frozen as the reference
     /// for P2-2's batch overlay writes: one `put_position` /
     /// `delete_position` per dirty key in key order (`flush_all` as of
