@@ -6607,7 +6607,18 @@ impl TorusApp {
             if inline { "on the consensus thread" } else { "on the torus-da-gc worker" }
         );
         if !inline {
-            mempool.da_gc_fence().set_enabled(true);
+            // The fence's window starts at the committed tip this node knows
+            // (its last header, the block tree's); every commit moves it.
+            let fence = mempool.da_gc_fence();
+            fence.note_committed(self.last_header.height);
+            match crate::da_gc::read_tree_committed_tip(&gc.block_tree_db) {
+                Ok(tip) => fence.note_committed(tip.unwrap_or(0)),
+                Err(e) => tracing::warn!(
+                    "DA body GC: block tree committed tip unreadable at start, the fence \
+                     window starts at the last header: {e}"
+                ),
+            }
+            fence.set_enabled(true);
         }
         self.da_gc_runner = Some(Arc::new(crate::da_gc_worker::DaGcRunner {
             gc,
@@ -6662,8 +6673,8 @@ impl TorusApp {
     /// RH4: hand the committed `height` that dispatch just made durable to
     /// the DA body GC. The consensus thread builds the job (the `hashes`
     /// dispatch computed for the mempool prune, moved; the shard count) and
-    /// `try_send`s it to the GC worker ([`crate::da_gc_worker`]): no DB read
-    /// or write, no body lookup, no wait. A full queue keeps only the height
+    /// pushes it on the GC worker's queue ([`crate::da_gc_worker`]): no DB
+    /// read or write, no body lookup, no wait for a pass. A full queue keeps only the height
     /// (its record is back-filled from the block tree). With
     /// `TORUS_DA_GC_INLINE=1` the pass runs right here instead.
     ///
@@ -8507,6 +8518,11 @@ impl App<RocksKVStore> for TorusApp {
         // consensus voting/finalization runs ahead; execution lags and heals below.
         if height > self.last_header.height {
             self.last_header = header.clone();
+            // RH4 GC worker: the DA body GC fence takes pins up to a window
+            // above the committed tip (one atomic).
+            if let Some(ref mempool) = self.mempool {
+                mempool.da_gc_fence().note_committed(height);
+            }
             self.leader_state.set_view(height.saturating_add(1));
             self.leader_state
                 .set_evm_block_interval(header.evm_block_interval);
@@ -34592,7 +34608,7 @@ mod crash_recovery_tests {
     }
 
     /// Every `reason` label of `torus_da_gc_held_passes`.
-    const DA_GC_HOLD_LABELS: [&str; 9] = [
+    const DA_GC_HOLD_LABELS: [&str; 10] = [
         "gap",
         "backfilling",
         "unrecorded",
@@ -34602,6 +34618,7 @@ mod crash_recovery_tests {
         "tip_unreadable",
         "tail_unreadable",
         "store_error",
+        "fence_full",
     ];
 
     /// `torus_da_gc_held_passes{reason}`.
@@ -35800,5 +35817,168 @@ mod crash_recovery_tests {
         assert!(da_has(&mempool, &y), "pinned before its pass: kept");
         assert_eq!(metrics.da_gc_fence_kept.get(), 1, "y");
         assert_eq!(metrics.da_bodies_gc_deleted.get(), 1, "x only");
+    }
+
+    /// RH4 GC worker (Codex adversarial, s132): `TORUS_ASYNC_VALIDATE`'s
+    /// speculative decode pins a datum's bodies before any ancestry check, at
+    /// whatever height the datum claims. A height beyond the fence's window
+    /// above the committed tip is refused: the check reads its bodies as
+    /// missing (`MissingData`, nothing cached, the sync path decides), the
+    /// fence stores nothing (2000 rising far-future datums re-pinning one
+    /// hash leave it empty), and the refusals are exported. A datum in the
+    /// window pins and validates as before.
+    #[test]
+    fn da_gc_fence_refuses_speculative_far_future_pins() {
+        use torus_state::da_gc_fence::DA_GC_FENCE_HEIGHT_WINDOW as WINDOW;
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        da_gc_commit(&mut app, 1, vec![]);
+        let x = sign_claim_rewards(1);
+        let hx = torus_types::compute_action_hash(&x);
+        mempool.mirror_native_to_da(std::slice::from_ref(&x)).unwrap();
+        let fence = mempool.da_gc_fence().clone();
+        let speculate = |height: u64, compact: bool| {
+            let datum = encode_proposal_datum(&high_block(height, vec![x.clone()]), compact);
+            TorusApp::decode_proposal_and_ensure_durable_core(
+                Some(&mempool),
+                None,
+                None,
+                &Some(metrics.clone()),
+                4,
+                &datum,
+                |_, _| {},
+            )
+            .map(|_| ())
+            .map_err(|e| matches!(e, ValidateBlockResponse::MissingData))
+        };
+        for i in 0..2_000u64 {
+            let r = speculate(2 + WINDOW + i * 1_000, i % 2 == 0);
+            assert_eq!(r, Err(true), "datum {i}: refused pin reads as missing");
+        }
+        assert_eq!(fence.metadata_entries(), 0, "nothing stored");
+        assert!(!fence.is_full());
+        assert_eq!(fence.refused_pins(), 2_000);
+        assert!(da_has(&mempool, &x), "the body itself is untouched");
+        // In the window: pinned and valid.
+        assert!(speculate(1 + WINDOW, true).is_ok());
+        assert!(fence.is_pinned(&hx));
+        da_gc_commit(&mut app, 2, vec![]);
+        assert_eq!(metrics.da_gc_fence_refused_pins.get(), 2_000, "exported");
+    }
+
+    /// RH4 GC worker (Codex adversarial, s132): over its cap the fence cannot
+    /// say which bodies a check is about to read, so every pass HOLDS
+    /// (`held_passes{reason="fence_full"}`): x's row and body stay. Once the
+    /// worker passed the highest height pinned meanwhile (9), the next pass
+    /// deletes x.
+    #[test]
+    fn da_gc_full_fence_holds_the_pass() {
+        let (config, state_db) = make_test_config_and_db();
+        set_tree_frontier(&state_db, u64::MAX);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 4, false);
+        let x = sign_claim_rewards(1);
+        mempool
+            .mirror_native_to_da(std::slice::from_ref(&x))
+            .unwrap();
+        da_gc_commit(&mut app, 1, vec![x.clone()]);
+        for h in 2..=4 {
+            da_gc_commit(&mut app, h, vec![]);
+        }
+        let fence = mempool.da_gc_fence().clone();
+        fence.set_max_pins(1);
+        let (a, b) = (sign_claim_rewards(7), sign_claim_rewards(8));
+        let busy = fence.pin(
+            9,
+            &[
+                torus_types::compute_action_hash(&a),
+                torus_types::compute_action_hash(&b),
+            ],
+        );
+        assert!(busy.is_empty());
+        assert!(fence.is_full());
+        for h in 5..=9 {
+            da_gc_commit(&mut app, h, vec![]);
+            assert!(da_has(&mempool, &x), "x due at 5, held at {h}");
+        }
+        assert_eq!(held_passes(&metrics, "fence_full"), 5);
+        assert!(!fence.is_full(), "the worker passed 9");
+        da_gc_commit(&mut app, 10, vec![]);
+        assert!(!da_has(&mempool, &x), "deleted once the fence drained");
+        assert_eq!(held_passes(&metrics, "fence_full"), 5);
+    }
+
+    /// RH4 GC worker (Codex adversarial, s132; probe `/tmp/rh4-wakeup-proof`):
+    /// a height coalesced on a full queue is published after the full
+    /// `try_send`. Scheduled so the worker drains the queue, finds nothing
+    /// coalesced and goes to wait BEFORE that publication, the height must
+    /// still be passed without another dispatch (the old receive slept until
+    /// the next dispatch: `processed=2 pending=3`).
+    #[test]
+    fn da_gc_coalesced_height_wakes_a_waiting_worker() {
+        use std::sync::mpsc::channel;
+        use std::sync::Mutex;
+        let secs = std::time::Duration::from_secs;
+        let (config, state_db) = make_test_config_and_db();
+        let mut blocks: Vec<TorusBlock> = (1..=3u64)
+            .map(|h| high_block(h, vec![sign_claim_rewards(h)]))
+            .collect();
+        link_blocks(&mut blocks);
+        tree_commit_chain(&state_db, &blocks);
+        let (mut app, mempool, metrics, _rx) = da_gc_app_mode(&state_db, &config, 1128, false);
+        for block in &blocks {
+            mempool.mirror_native_to_da(&block.native_actions).unwrap();
+        }
+        let hooks = app.da_gc_hooks().clone();
+        hooks.queue_cap.store(1, Ordering::SeqCst);
+        let (wait_tx, wait_rx) = channel::<u64>();
+        let wait_tx = Mutex::new(wait_tx);
+        let weak = Arc::downgrade(&hooks);
+        *hooks.before_wait.lock().unwrap() = Some(Box::new(move || {
+            let passes = weak
+                .upgrade()
+                .map_or(0, |h| h.passes.load(Ordering::SeqCst));
+            let _ = wait_tx.lock().unwrap().send(passes);
+        }));
+        let (full_tx, full_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let (full_tx, go_rx) = (Mutex::new(full_tx), Mutex::new(go_rx));
+        *hooks.on_full.lock().unwrap() = Some(Box::new(move || {
+            full_tx.lock().unwrap().send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        }));
+        hooks.pause();
+        let commit = |app: &mut TorusApp, block: &TorusBlock| {
+            let committed = committed_compact_block(block);
+            app.on_committed_block(&committed, committed.hash);
+        };
+        commit(&mut app, &blocks[0]);
+        assert!(hooks.wait_gated(secs(60)), "the worker holds job 1");
+        commit(&mut app, &blocks[1]);
+        std::thread::scope(|s| {
+            let third = s.spawn(|| commit(&mut app, &blocks[2]));
+            full_rx
+                .recv_timeout(secs(60))
+                .expect("height 3 finds the queue full");
+            hooks.resume();
+            // The worker runs 1 and 2, then goes to wait for more.
+            while wait_rx.recv_timeout(secs(60)).expect("the worker waits") < 2 {}
+            go_tx.send(()).unwrap();
+            third.join().unwrap();
+        });
+        *hooks.on_full.lock().unwrap() = None;
+        *hooks.before_wait.lock().unwrap() = None;
+        assert_eq!(metrics.da_gc_coalesced_heights.get(), 1);
+        assert!(
+            app.da_gc_wait_idle(secs(10)),
+            "coalesced height 3 left pending: {} passes",
+            hooks.passes.load(Ordering::SeqCst)
+        );
+        assert_eq!(hooks.passes.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            da_gc_state(&state_db).map(|s| s.1),
+            Some(4),
+            "1..=3 recorded"
+        );
     }
 }

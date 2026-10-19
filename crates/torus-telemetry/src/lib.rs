@@ -568,8 +568,9 @@ pub struct Metrics {
     /// skipped pruned height not due yet), `dispatch_behind` (dispatch is
     /// behind the committed tip, e.g. backpressure in non-blocking dispatch),
     /// `tip_unreadable`, `tail_unreadable` (a block above the committed tip
-    /// cannot be read or decoded), `store_error` (the pass failed). The
-    /// bodies stay; the next pass retries.
+    /// cannot be read or decoded), `store_error` (the pass failed),
+    /// `fence_full` (the GC worker's fence is over its cap). The bodies
+    /// stay; the next pass retries.
     pub da_gc_held_passes: Family<Vec<(String, String)>, Counter>,
     /// RH4 GC worker, consensus thread: handing one dispatched height to the
     /// DA body GC (`torus_da_gc_handoff_seconds`): building its job and the
@@ -590,6 +591,11 @@ pub struct Metrics {
     /// RH4 GC worker: hashes pinned against it by proposal checks and
     /// validation (released once the worker passed their height).
     pub da_gc_fence_pins: Gauge,
+    /// RH4 GC worker: body checks whose pin the fence refused (a height more
+    /// than `torus_state::da_gc_fence::DA_GC_FENCE_HEIGHT_WINDOW` above the
+    /// committed tip, e.g. a speculative far-future datum): their bodies
+    /// were treated as missing.
+    pub da_gc_fence_refused_pins: Counter,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -2304,7 +2310,8 @@ impl Metrics {
         registry.register(
             "torus_da_gc_held_passes",
             "DA body GC passes that deleted nothing, by reason (gap / backfilling / unrecorded / \
-             pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error) (RH4)",
+             pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error / \
+             fence_full) (RH4)",
             da_gc_held_passes.clone(),
         );
         // 1 us .. 16 ms: a handoff is a job build and a try_send.
@@ -2346,6 +2353,13 @@ impl Metrics {
             "torus_da_gc_fence_pins",
             "Hashes pinned against the DA body GC worker by proposal checks and validation (RH4)",
             da_gc_fence_pins.clone(),
+        );
+        let da_gc_fence_refused_pins = Counter::default();
+        registry.register(
+            "torus_da_gc_fence_refused_pins",
+            "Body checks whose DA body GC fence pin was refused (height beyond the window above \
+             the committed tip): their bodies were treated as missing (RH4)",
+            da_gc_fence_refused_pins.clone(),
         );
 
         let exec_resting_orders = Gauge::default();
@@ -3170,6 +3184,7 @@ impl Metrics {
             da_gc_coalesced_heights,
             da_gc_fence_kept,
             da_gc_fence_pins,
+            da_gc_fence_refused_pins,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_resident_rows,
@@ -3865,6 +3880,7 @@ mod tests {
         m.da_gc_coalesced_heights.inc();
         m.da_gc_fence_kept.inc();
         m.da_gc_fence_pins.set(7);
+        m.da_gc_fence_refused_pins.inc();
         let text = m.encode();
         for line in [
             "torus_da_gc_handoff_seconds_count 1",
@@ -3873,6 +3889,7 @@ mod tests {
             "torus_da_gc_coalesced_heights_total 1",
             "torus_da_gc_fence_kept_total 1",
             "torus_da_gc_fence_pins 7",
+            "torus_da_gc_fence_refused_pins_total 1",
         ] {
             assert!(text.contains(line), "{line} missing:\n{text}");
         }

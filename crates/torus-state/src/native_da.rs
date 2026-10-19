@@ -400,6 +400,11 @@ pub enum DaGcHoldReason {
     /// The pass failed (a store read or write error; set by the caller that
     /// absorbs the error): its batch did not land.
     StoreError,
+    /// The history's fence against concurrent body checks is over its cap
+    /// ([`crate::DaGcFence`]): it cannot tell which bodies a check is about
+    /// to read, so nothing goes until the GC passed every height it was
+    /// asked to pin meanwhile.
+    FenceFull,
 }
 
 impl DaGcHoldReason {
@@ -415,6 +420,7 @@ impl DaGcHoldReason {
             Self::TipUnreadable => "tip_unreadable",
             Self::TailUnreadable => "tail_unreadable",
             Self::StoreError => "store_error",
+            Self::FenceFull => "fence_full",
         }
     }
 }
@@ -456,6 +462,11 @@ pub trait DaGcHistory {
     }
     /// The batch [`begin_delete`](Self::begin_delete) preceded returned.
     fn end_delete(&self) {}
+    /// Whether the history's fence is over its cap: the pass then deletes
+    /// nothing ([`DaGcHoldReason::FenceFull`]). Default: never.
+    fn fence_full(&self) -> bool {
+        false
+    }
 }
 
 /// A history that knows no height: a gap in the GC bookkeeping holds every
@@ -992,6 +1003,13 @@ impl NativeDaStore {
                     hold = Some(DaGcHoldReason::TipUnreadable);
                 }
             }
+        }
+        // A full fence (GC worker) cannot say which bodies a concurrent check
+        // is about to read: nothing goes, the rows stay for a later pass. (A
+        // fence that fills between here and `begin_delete` keeps every body
+        // there instead: those rows go, their bodies stay.)
+        if hold.is_none() && due.is_some() && history.fence_full() {
+            hold = Some(DaGcHoldReason::FenceFull);
         }
         // The due bodies to delete, `(hash, shard count)`: added to the batch
         // only after the history's fence saw them, right before the write.
@@ -2376,6 +2394,8 @@ mod tests {
         /// `begin_delete` / `end_delete` calls.
         begun: std::cell::Cell<u32>,
         ended: std::cell::Cell<u32>,
+        /// Its fence is over its cap.
+        full: bool,
     }
 
     impl DaGcHistory for TestHistory {
@@ -2425,6 +2445,40 @@ mod tests {
             self.ended.set(self.ended.get() + 1);
             assert_eq!(self.begun.get(), self.ended.get(), "end without begin");
         }
+
+        fn fence_full(&self) -> bool {
+            self.full
+        }
+    }
+
+    /// RH4 GC worker (Codex adversarial, s132): a full fence cannot say which
+    /// bodies a concurrent check is about to read, so the pass HOLDS
+    /// (`fence_full`): no row, no body goes, the frontier stays, the fence
+    /// is not even asked. The next pass after the fence drained deletes them.
+    #[test]
+    fn gc_holds_while_the_fence_is_full() {
+        const W: u64 = 4;
+        let (_dir, store) = temp_store();
+        let (x, y) = (dummy_action(1), dummy_action(2));
+        let (hx, hy) = (compute_action_hash(&x), compute_action_hash(&y));
+        store.put_batch(&[x.clone(), y.clone()]).unwrap();
+        let mut hist = history(&[(10, vec![hx, hy])]);
+        for h in 10..=13 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        hist.full = true;
+        let out = gc_h(&store, 14, &[], W, &hist);
+        assert_eq!(
+            (out.rows_deleted, out.bodies_deleted, out.hold_reason, out.deletion_held),
+            (0, 0, Some(DaGcHoldReason::FenceFull), true)
+        );
+        assert_eq!(hist.begun.get(), 0, "held before the fence");
+        assert!(present(&store, &x) && present(&store, &y));
+        hist.full = false;
+        let out = gc_h(&store, 15, &[], W, &hist);
+        assert_eq!((out.rows_deleted, out.bodies_deleted, out.hold_reason), (1, 2, None));
+        assert!(!present(&store, &x) && !present(&store, &y));
     }
 
     /// RH4 GC worker: right before its write a pass hands its due bodies to
@@ -2983,11 +3037,12 @@ mod tests {
             R::TipUnreadable,
             R::TailUnreadable,
             R::StoreError,
+            R::FenceFull,
         ]
         .iter()
         .map(|r| r.as_str())
         .collect();
-        assert_eq!(labels.len(), 9, "one label per reason");
+        assert_eq!(labels.len(), 10, "one label per reason");
     }
 
     /// Idempotence: back-filling heights writes exactly what recording them

@@ -4,18 +4,23 @@
 //!
 //! The consensus thread hands each dispatched height to one worker thread
 //! and returns: `DaGcWorker::submit` moves the block's action hashes (already
-//! computed for the mempool prune) into a `DaGcJob` and `try_send`s it on a
+//! computed for the mempool prune) into a `DaGcJob` and pushes it on a
 //! bounded queue ([`DA_GC_QUEUE_CAP`]). No DB read or write, no body lookup,
-//! no wait. The worker runs the passes (`DaGcRunner::run`), in height order:
-//! the body restore, the record, the delete scan and the batch write, with
-//! every rule of [`crate::da_gc`] unchanged. `TORUS_DA_GC_INLINE=1` runs the
-//! same pass on the consensus thread instead (the pre-worker behaviour, for
-//! bisects and A/B benches).
+//! no wait beyond the queue's mutex, which the worker only holds to take
+//! the queued jobs (never across a pass). The worker runs the passes
+//! (`DaGcRunner::run`), in height order: the body restore, the record, the
+//! delete scan and the batch write, with every rule of [`crate::da_gc`]
+//! unchanged. `TORUS_DA_GC_INLINE=1` runs the same pass on the consensus
+//! thread instead (the pre-worker behaviour, for bisects and A/B benches).
 //!
 //! # The handoff
 //!
 //! A full queue never blocks consensus: the job is dropped and only its
-//! height kept ("coalesced", `torus_da_gc_coalesced_heights`). Its record
+//! height kept ("coalesced", `torus_da_gc_coalesced_heights`). The height is
+//! published under the queue's mutex, and the worker checks for coalesced
+//! heights under the same mutex before it waits on the queue's condvar, so
+//! a coalesced height always wakes it (or is seen before it sleeps): no
+//! handoff is left pending until the next dispatch. Its record
 //! then comes from the block tree, by the cursor rule that already covers a
 //! crash between dispatch and the GC record: the next pass finds the cursor
 //! behind and back-fills the missing heights from the tree before it deletes
@@ -56,9 +61,9 @@
 //!   durable body row dispatch wrote (from the block's actions when that row
 //!   did not land: then the job carries them).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use torus_mempool::Mempool;
@@ -399,9 +404,23 @@ pub(crate) enum Handoff {
     Dead,
 }
 
-/// State shared by the consensus thread and the worker (all atomics).
+/// The handoff queue (under [`WorkerShared::queue`]).
+#[derive(Default)]
+struct Queue {
+    jobs: VecDeque<DaGcJob>,
+    /// The node is shutting down: no more jobs.
+    closed: bool,
+}
+
+/// State shared by the consensus thread and the worker.
 struct WorkerShared {
-    /// Jobs in the queue.
+    /// The handoff queue. `dropped_through` is raised under it too, and the
+    /// worker checks both under it before it waits on `wake`.
+    queue: Mutex<Queue>,
+    wake: Condvar,
+    /// Most jobs `queue` holds.
+    cap: usize,
+    /// Jobs in the queue (a mirror for the gauges and `is_idle`).
     queued: AtomicUsize,
     /// The worker is processing a batch.
     busy: AtomicBool,
@@ -428,6 +447,11 @@ impl WorkerShared {
         self.hooks.kill();
     }
 
+    fn lock_queue(&self) -> MutexGuard<'_, Queue> {
+        // Plain pushes and takes: a poisoned queue is still consistent.
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn update_gauges(&self) {
         if let Some(ref m) = self.metrics {
             m.da_gc_queue_depth
@@ -447,7 +471,6 @@ impl WorkerShared {
 /// the block tree after the restart), and the thread never outlives the
 /// stores it writes.
 pub(crate) struct DaGcWorker {
-    tx: Option<SyncSender<DaGcJob>>,
     shared: Arc<WorkerShared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -455,7 +478,8 @@ pub(crate) struct DaGcWorker {
 impl Drop for DaGcWorker {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        self.tx = None;
+        self.shared.lock_queue().closed = true;
+        self.shared.wake.notify_all();
         // A test-paused worker would wait at its gate for good.
         #[cfg(test)]
         self.shared.wake_gate();
@@ -471,8 +495,15 @@ impl DaGcWorker {
     /// Spawn the worker over `runner` with a queue of `cap` heights. The
     /// thread logs through the caller's tracing dispatcher.
     pub fn spawn(runner: Arc<DaGcRunner>, cap: usize) -> std::io::Result<Self> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(cap.max(1));
+        #[cfg(test)]
+        let cap = match runner.hooks.queue_cap.load(Ordering::SeqCst) {
+            0 => cap,
+            test_cap => test_cap,
+        };
         let shared = Arc::new(WorkerShared {
+            queue: Mutex::new(Queue::default()),
+            wake: Condvar::new(),
+            cap: cap.max(1),
             queued: AtomicUsize::new(0),
             busy: AtomicBool::new(false),
             dispatched: AtomicU64::new(0),
@@ -495,50 +526,51 @@ impl DaGcWorker {
                     shared: thread_shared.clone(),
                     runner: runner.clone(),
                 };
-                work(&rx, &runner, &thread_shared);
+                work(&runner, &thread_shared);
             })?;
         Ok(Self {
-            tx: Some(tx),
             shared,
             thread: Some(thread),
         })
     }
 
-    /// Hand `job` to the worker: never blocks, never touches the DB.
+    /// Hand `job` to the worker: never touches the DB, never waits for a
+    /// pass (the worker holds the queue's mutex only to take the jobs).
     pub fn submit(&self, job: DaGcJob) -> Handoff {
         let height = job.height;
         let shards = job.shard_count;
-        self.shared.dispatched.fetch_max(height, Ordering::SeqCst);
-        let Some(tx) = self.tx.as_ref() else {
-            return Handoff::Dead;
-        };
-        if self.shared.dead.load(Ordering::SeqCst) {
+        let shared = &*self.shared;
+        shared.dispatched.fetch_max(height, Ordering::SeqCst);
+        if shared.dead.load(Ordering::SeqCst) {
             return Handoff::Dead;
         }
-        // Counted before the send, so the worker's decrement never runs first.
-        self.shared.queued.fetch_add(1, Ordering::SeqCst);
-        let handoff = match tx.try_send(job) {
-            Ok(()) => Handoff::Queued,
-            Err(TrySendError::Full(_)) => {
-                self.shared.queued.fetch_sub(1, Ordering::SeqCst);
-                self.shared
-                    .dropped_shards
-                    .store(u64::from(shards), Ordering::SeqCst);
-                self.shared
-                    .dropped_through
-                    .fetch_max(height, Ordering::SeqCst);
-                if let Some(ref m) = self.shared.metrics {
-                    m.da_gc_coalesced_heights.inc();
-                }
-                Handoff::Coalesced
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.shared.queued.fetch_sub(1, Ordering::SeqCst);
-                self.shared.dead.store(true, Ordering::SeqCst);
-                Handoff::Dead
-            }
+        let mut queue = shared.lock_queue();
+        let (handoff, dropped) = if queue.closed {
+            (Handoff::Dead, Some(job))
+        } else if queue.jobs.len() < shared.cap {
+            queue.jobs.push_back(job);
+            shared.queued.store(queue.jobs.len(), Ordering::SeqCst);
+            (Handoff::Queued, None)
+        } else {
+            // Published under the queue's mutex: the worker sees it before
+            // it waits, or is woken below.
+            shared
+                .dropped_shards
+                .store(u64::from(shards), Ordering::SeqCst);
+            shared.dropped_through.fetch_max(height, Ordering::SeqCst);
+            (Handoff::Coalesced, Some(job))
         };
-        self.shared.update_gauges();
+        drop(queue);
+        drop(dropped);
+        if handoff == Handoff::Coalesced {
+            #[cfg(test)]
+            shared.hooks.on_full();
+            if let Some(ref m) = shared.metrics {
+                m.da_gc_coalesced_heights.inc();
+            }
+        }
+        shared.wake.notify_one();
+        shared.update_gauges();
         handoff
     }
 
@@ -595,9 +627,10 @@ impl Drop for ExitGuard {
     }
 }
 
-/// The worker loop: drain the queue in batches, record every job, run the
-/// full pass for the last of each batch, then the coalesced heights.
-fn work(rx: &Receiver<DaGcJob>, runner: &DaGcRunner, shared: &WorkerShared) {
+/// The worker loop: take every queued job, record each, run the full pass
+/// for the last one, then the coalesced heights; wait (under the queue's
+/// mutex, so no handoff is missed) when there is neither.
+fn work(runner: &DaGcRunner, shared: &WorkerShared) {
     let finish = |height: u64| {
         shared.processed.fetch_max(height, Ordering::SeqCst);
         if runner.fenced {
@@ -605,20 +638,40 @@ fn work(rx: &Receiver<DaGcJob>, runner: &DaGcRunner, shared: &WorkerShared) {
             fence.release_through(height);
             if let Some(ref m) = runner.metrics {
                 m.da_gc_fence_pins.set(fence.pinned() as i64);
+                // Only this thread exports the fence's refusal count.
+                let refused = fence.refused_pins();
+                let exported = m.da_gc_fence_refused_pins.get();
+                m.da_gc_fence_refused_pins
+                    .inc_by(refused.saturating_sub(exported));
             }
         }
         shared.update_gauges();
     };
-    while let Ok(first) = rx.recv() {
-        shared.busy.store(true, Ordering::SeqCst);
-        shared.queued.fetch_sub(1, Ordering::SeqCst);
-        let mut jobs = vec![first];
-        while let Ok(job) = rx.try_recv() {
-            shared.queued.fetch_sub(1, Ordering::SeqCst);
-            jobs.push(job);
-        }
+    loop {
+        let jobs = {
+            let mut queue = shared.lock_queue();
+            loop {
+                if queue.closed || shared.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !queue.jobs.is_empty()
+                    || shared.dropped_through.load(Ordering::SeqCst)
+                        > shared.processed.load(Ordering::SeqCst)
+                {
+                    break;
+                }
+                #[cfg(test)]
+                runner.hooks.before_wait();
+                queue = shared.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+            }
+            // Busy before the count drops (`is_idle` reads the count first).
+            shared.busy.store(true, Ordering::SeqCst);
+            let jobs = std::mem::take(&mut queue.jobs);
+            shared.queued.store(0, Ordering::SeqCst);
+            jobs
+        };
         shared.update_gauges();
-        let last = jobs.len() - 1;
+        let last = jobs.len().saturating_sub(1);
         for (i, job) in jobs.into_iter().enumerate() {
             #[cfg(test)]
             if !runner.hooks.wait_gate() {
@@ -681,6 +734,15 @@ pub(crate) struct DaGcTestHooks {
     /// Passes run, and the threads they ran on.
     pub passes: AtomicU64,
     pub pass_threads: std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+    /// The handoff queue's capacity (0 = [`DA_GC_QUEUE_CAP`]).
+    pub queue_cap: AtomicUsize,
+    /// Runs on the submitting thread once a height was coalesced (queue
+    /// full), before the worker is notified.
+    #[allow(clippy::type_complexity)]
+    pub on_full: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Runs on the worker right before it waits for more work.
+    #[allow(clippy::type_complexity)]
+    pub before_wait: std::sync::Mutex<Option<Box<dyn Fn() + Send>>>,
     gate: std::sync::Mutex<TestGate>,
     gate_cv: std::sync::Condvar,
 }
@@ -690,6 +752,8 @@ pub(crate) struct DaGcTestHooks {
 struct TestGate {
     paused: bool,
     killed: bool,
+    /// The worker is stopped at the gate.
+    waiting: bool,
     /// Jobs the worker still runs before it pauses itself.
     pause_after: Option<u64>,
 }
@@ -707,6 +771,32 @@ impl DaGcTestHooks {
         if let Some(f) = self.before_delete.lock().unwrap().as_ref() {
             f();
         }
+    }
+
+    fn on_full(&self) {
+        if let Some(f) = self.on_full.lock().unwrap().as_ref() {
+            f();
+        }
+    }
+
+    fn before_wait(&self) {
+        if let Some(f) = self.before_wait.lock().unwrap().as_ref() {
+            f();
+        }
+    }
+
+    /// Wait (at most `timeout`) until the worker is stopped at the gate.
+    pub fn wait_gated(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut gate = self.gate.lock().unwrap();
+        while !gate.waiting {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            gate = self.gate_cv.wait_timeout(gate, left).unwrap().0;
+        }
+        true
     }
 
     fn note_pass(&self) {
@@ -758,7 +848,12 @@ impl DaGcTestHooks {
                 if let Some(n) = gate.pause_after.as_mut() {
                     *n -= 1;
                 }
+                gate.waiting = false;
                 return true;
+            }
+            if !gate.waiting {
+                gate.waiting = true;
+                self.gate_cv.notify_all();
             }
             gate = self.gate_cv.wait(gate).unwrap();
         }

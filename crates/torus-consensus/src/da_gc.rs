@@ -135,7 +135,7 @@
 //! labelled with the first rule that held it
 //! ([`torus_state::DaGcHoldReason`]: `gap`, `backfilling`, `unrecorded`,
 //! `pre_cursor`, `pruned_gap`, `dispatch_behind`, `tip_unreadable`,
-//! `tail_unreadable`, `store_error`; P3, claude-review r4).
+//! `tail_unreadable`, `store_error`, `fence_full`; P3, claude-review r4).
 //!
 //! A fresh store (no GC state, so no row a lost pin could matter for)
 //! establishes the cursor at its first recorded height. A store a pre-cursor
@@ -160,9 +160,9 @@
 //! one worker thread ([`crate::da_gc_worker`]). The consensus thread only
 //! builds a job (the dispatched height, the action hashes dispatch already
 //! computed, moved; the shard count; the actions only if the body row did
-//! not land) and `try_send`s it on a bounded queue
+//! not land) and pushes it on a bounded queue
 //! ([`crate::da_gc_worker::DA_GC_QUEUE_CAP`]): no DB read or write, no body
-//! lookup, no wait (`torus_da_gc_handoff_seconds`). The worker restores,
+//! lookup, no wait for a pass (`torus_da_gc_handoff_seconds`). The worker restores,
 //! records, scans and writes, in height order, by the rules above.
 //!
 //! - Full queue: the height is kept, the job dropped (counted,
@@ -182,7 +182,13 @@
 //!   pinned bodies (row goes, body stays: `torus_da_gc_fence_kept`) and marks
 //!   the rest as being deleted, and a check that meets a mark treats the
 //!   body as missing. The fence lock is held for set operations only, never
-//!   across DB I/O. Pins go once the worker passed their height.
+//!   across DB I/O. Pins go once the worker passed their height. The fence
+//!   is bounded: one height entry per pinned hash, at most
+//!   `DA_GC_FENCE_MAX_PINS` hashes (over it every pass holds,
+//!   `reason="fence_full"`, until the worker passed the heights asked for),
+//!   and no pin above the committed tip plus `DA_GC_FENCE_HEIGHT_WINDOW` (a
+//!   speculative far-future datum): such a check reads its bodies as missing
+//!   (`torus_da_gc_fence_refused_pins`).
 //! - Queue depth, lag and fence size: `torus_da_gc_queue_depth`,
 //!   `torus_da_gc_lag_heights`, `torus_da_gc_fence_pins`. The slow-pass warn
 //!   line and the pass metrics are unchanged (they time the worker's pass).
@@ -615,6 +621,10 @@ impl DaGcHistory for BlockTreeHistory<'_> {
         if let Some(fence) = self.fence {
             fence.end_delete();
         }
+    }
+
+    fn fence_full(&self) -> bool {
+        self.fence.is_some_and(|fence| fence.is_full())
     }
 }
 
