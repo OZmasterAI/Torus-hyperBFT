@@ -384,34 +384,24 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (SIGKILL val1 mid-load, restart): kill -> first commit, replayed blocks, catch-up time, AGREE and one digest, and
    matched/s around the kill. If the depth curve is unclear at n = 1 (e.g. 0 and 1M within the S-cell spread), report
    it and 18c decides on replicates.
-8j. **Item 7 option 0 G1b: flag-off cost under EVM load** (owner s131; after 8i, when 18c posts the two SHAs;
-   ~1 h 20, estimate; NOT blocking: the G2-G4 builds go on meanwhile). G1b (`docs/plans/item7-option0-impl.md`
-   tasks 1.2-1.7) changes today's EVM path with no flag: the block overlay is built before the EVM part and the EVM
-   rows are absorbed into it on every EVM block. Q11 would only see its cost at the end (E-off vs section 85's 0.913).
-   One binary per arm, both from `feat/item7-option0`: A = the commit before G1b (behaviour = its main base), B = the
-   G1b commit; 18c writes both SHAs into this entry (a **SHAs:** line) and pushes main once G1b has passed review. Nothing set (no fast-path flag exists yet); 512 KB from
-   `env.sh`; custody 0. Standard load + EVM `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40` (Q5's load), N = 11 bench genesis,
-   300 markets, 600 s, warm-up then A B B A A B (n = 3). Judge by the exec-path merge rule above (exec-thread on-CPU
-   ms per 1k fills, native blocks/s, block p50 / p99, timeouts per 1,000 blocks); also exec ms at EVM heights vs
-   other heights (the q5-gaps view), `torus_exec_evm_seconds` per EVM block, matched/s, CPU-s per 1M. If the SHAs line is
-   not here when 8i ends, start 8k; 8j then runs after 8k is done (8k is never paused for it).
-   **SHAs (posted s131, both on `origin/feat/item7-option0`):** A = `a7c10b13` (G0 + G1a, test-only on top of main
-   `fd94818d`: behaviour = main), B = `45cbd9f3` (G1b, tasks 1.2-1.7; Codex torus review no findings; golden
-   byte-equal). Build both from that branch the same way; nothing set.
+8j. **[DROPPED s131, owner] Item 7 option 0 G1b flag-off cost.** Option 0 is fully built (G0-G4), so the early
+   warning is moot; its question (flag-off cost vs main under EVM load) moved into 8l as arm M.
 8k. **Explore workflow: new high-gain ideas, build and bench the best** (owner s131; starts right after 8i if 8j's
    SHAs are not posted by then, and once started it runs to the end without pausing; 8j then runs after 8k; ~a day, bench time <= ~4 h). Run the prompt in `docs/perf/8k-explore-workflow.md` as one
    multi-agent workflow (owner opt-in given): survey what is already explored, fan-out ideation (consensus, execution,
    storage, network / DA, crypto, wildcard incl. theoretical), adversarial review and ranking, build the top 1-2 on
    `exp/8k-<name>` behind a flag (tests first, microbench gate), A/B n = 3 under the exec-path merge rule, write-up.
    Never merges to main; keeps off item 7 option 0's and RH4's code.
-8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; after 8k; ~2 h 20 + extra cells,
-   estimate). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
+8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; NEXT, right after the disk is freed;
+   replaces 8j; ~2 h 50 + extra cells, estimate). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
    `origin/feat/item7-option0` at `f8a45a2d` (G0-G4 done; G3 and the whole branch Codex torus-adversarial reviewed;
    not merged: the owner decides the merge), code defaults, 512 KB from `env.sh`, custody 0. The off and on arms run
-   the SAME binary. **Arms (2 x 2):** N-off, E-off, N-on, E-on; every arm sets `TORUS_EVM_FAST_PATH=0` or `=1`
-   explicitly via `EXTRA_ENV` (never absent). E arms: `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`. Standard load
+   the SAME binary. **Arms (2 x 2 + M):** N-off, E-off, N-on, E-on; every arm sets `TORUS_EVM_FAST_PATH=0` or `=1`
+   explicitly via `EXTRA_ENV` (never absent). **Arm M (owner s131, from dropped 8j):** main `fd94818d` (the branch's
+   base; the second binary) under the same EVM load, flag unset (it doesn't exist there): E-off / M answers the
+   branch's flag-off cost, judged by the exec-path merge rule (must not be worse). E arms: `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`. Standard load
    (hsdb-300m), N = 11 bench genesis, 300 markets, 600 s, 3 validators. **Order:** smoke per arm (60 s), warm-up E-on
-   300 s, r1 N-off E-off E-on N-on, r2 N-on E-on E-off N-off, r3 as r1 (n = 3; n = 4 if a merge-rule CI straddles 1
+   300 s, r1 N-off E-off M E-on N-on, r2 N-on E-on M E-off N-off, r3 as r1 (n = 3; n = 4 if a merge-rule CI straddles 1
    by under 1 point). **Judge** E-on / E-off by the exec-path merge rule above; N-on / N-off within noise (the flag
    is inert without EVM); plus section 6's six option 0 passes (E-on / N-on >= 0.97 matched/s; E-off / N-off near
    section 85's 0.913; pipelined share at EVM heights >= 99% from `torus_exec_evm_fast_path_blocks` /
