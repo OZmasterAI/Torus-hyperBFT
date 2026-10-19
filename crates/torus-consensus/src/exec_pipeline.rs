@@ -345,6 +345,19 @@ pub enum CompleteSite {
 #[cfg(test)]
 pub type CompleteHook = std::sync::Arc<dyn Fn(CompleteSite, u64, &StateDb) + Send + Sync>;
 
+/// Item 7 option 0 (task 3.6, C13): test-only path flags, shared by E
+/// (`ExecutionContext::test_paths`) and W (`WorkerEnv::test_paths`).
+#[cfg(test)]
+pub type TestPaths = Arc<Mutex<std::collections::BTreeMap<&'static str, u64>>>;
+
+/// Count path `name` (W side; no-op without a shared map).
+#[cfg(test)]
+fn w_path(env: &WorkerEnv, name: &'static str) {
+    if let Some(p) = &env.test_paths {
+        *p.lock().unwrap().entry(name).or_default() += 1;
+    }
+}
+
 /// One unit of work for W, in commit order.
 pub enum Job {
     /// A native block: flush its frozen pending set (state + trie + marker in one
@@ -735,6 +748,18 @@ pub struct WorkerEnv {
     /// Item 7 option 0 step 0: the completion hook (test-only).
     #[cfg(test)]
     pub test_on_complete: Option<CompleteHook>,
+    /// Item 7 option 0 (task 3.6, C13): W's path flags (test-only).
+    #[cfg(test)]
+    pub test_paths: Option<TestPaths>,
+    /// Item 7 option 0 (task 3.6, C13): set by E right before it hands
+    /// over a barrier's drain checkpoint (`checkpoint_drain`); W takes it
+    /// in that checkpoint (test-only).
+    #[cfg(test)]
+    pub test_drain: Option<Arc<AtomicBool>>,
+    /// Item 7 option 0 (task 3.5): a panic inside W's next EVM trie step,
+    /// before its batch (the crash seam; test-only).
+    #[cfg(test)]
+    pub test_evm_step_panic: Option<Arc<AtomicBool>>,
 }
 
 impl FlushWorker {
@@ -1067,6 +1092,15 @@ fn run_job(
             );
             // Item 7 option 0 (task 2.4): its status and side rows (none
             // today) join the marker batch through the sidecar.
+            #[cfg(test)]
+            {
+                if action_status.is_some() {
+                    w_path(env, "w.status.marker");
+                }
+                if evm.is_some() {
+                    w_path(env, "w.evm_side.marker");
+                }
+            }
             let sidecar = side_rows_sidecar(
                 env,
                 *height,
@@ -1119,7 +1153,11 @@ fn run_job(
                 evm.as_ref().map(|j| j.side.clone()),
             )?;
             if let Some(j) = &evm {
+                #[cfg(test)]
+                w_path(env, "w.evm_side.digest");
                 if !j.bundle.state.is_empty() {
+                    #[cfg(test)]
+                    w_path(env, "w.evm_fold.digest");
                     window.evm.fold(&j.bundle);
                 }
             }
@@ -1153,9 +1191,23 @@ fn run_job(
             // mirror and trie nodes) leads the checkpoint's ONE batch; the
             // final CF_ACCOUNTS rows are L's (the DB below). No EVM bundle in
             // the window: no step (today's path).
+            #[cfg(test)]
+            let drain = env
+                .test_drain
+                .as_ref()
+                .is_some_and(|d| d.swap(false, Ordering::SeqCst));
             let prefix = if window.evm.is_empty() {
                 rocksdb::WriteBatch::default()
             } else {
+                #[cfg(test)]
+                w_path(
+                    env,
+                    if drain {
+                        "w.evm_step.drain"
+                    } else {
+                        "w.evm_step.checkpoint"
+                    },
+                );
                 let mut delta = std::mem::take(&mut window.evm);
                 delta.note_accounts(window.evm_addrs.iter().copied());
                 let side = &window.side;
@@ -1272,8 +1324,14 @@ fn run_job(
             // (a window of one) leads the batch; the final CF_ACCOUNTS rows
             // are the block's set (the DB below). An empty bundle (all txs
             // skipped) has no trie work: today's path.
+            #[cfg(test)]
+            if evm.is_some() {
+                w_path(env, "w.evm_side.flush");
+            }
             let prefix = match &evm {
                 Some(j) if !j.bundle.state.is_empty() => {
+                    #[cfg(test)]
+                    w_path(env, "w.evm_step.flush");
                     let mut delta = torus_state::incremental::EvmWindowDelta::default();
                     delta.fold(&j.bundle);
                     delta.note_accounts(evm_addrs.iter().copied());
@@ -1443,6 +1501,16 @@ fn evm_trie_prefix(
     delta: torus_state::incremental::EvmWindowDelta,
     rows: impl FnMut(&str, &[u8]) -> Option<Option<Vec<u8>>>,
 ) -> Result<rocksdb::WriteBatch, JobError> {
+    // Item 7 option 0 (task 3.5): the crash seam inside the EVM trie step,
+    // before its batch is built (caught by `worker_loop`: W latches).
+    #[cfg(test)]
+    if env
+        .test_evm_step_panic
+        .as_ref()
+        .is_some_and(|p| p.swap(false, Ordering::SeqCst))
+    {
+        panic!("injected panic inside W's EVM trie step at {height} (test)");
+    }
     match torus_state::incremental::evm_window_prefix(&env.state_db, delta, rows) {
         Ok((batch, None)) => Ok(batch),
         Ok((batch, Some(e))) => {
@@ -1661,6 +1729,9 @@ mod tests {
                 exec_failed: Arc::new(AtomicBool::new(false)),
                 gate,
                 test_on_complete: None,
+                test_paths: None,
+                test_drain: None,
+                test_evm_step_panic: None,
             },
             dir,
         )

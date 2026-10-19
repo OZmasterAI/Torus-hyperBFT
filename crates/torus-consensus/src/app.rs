@@ -1347,7 +1347,16 @@ struct ExecutionContext {
     /// Item 7 option 0 step 0 (task 0.3): path flags, counted per block (see
     /// `test_path`).
     #[cfg(test)]
-    test_paths: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    test_paths: crate::exec_pipeline::TestPaths,
+    /// Item 7 option 0 (task 3.6, C13): shared with W; set right before a
+    /// barrier's drain checkpoint is handed over, so W counts its EVM trie
+    /// step as the drain's.
+    #[cfg(test)]
+    test_drain: Arc<AtomicBool>,
+    /// Item 7 option 0 (task 3.5): shared with W; a panic inside W's next
+    /// EVM trie step (the crash seam).
+    #[cfg(test)]
+    test_evm_step_panic: Arc<AtomicBool>,
     /// adl-budget A7, node-local proof flag (`TORUS_LIQ_VALUE_SUM=1`, read
     /// once at construction): copied into every block's context; with
     /// metrics attached the liquidation step logs the value sum over all
@@ -2778,6 +2787,12 @@ impl ExecutionContext {
             gate,
             #[cfg(test)]
             test_on_complete: self.test_on_complete.clone(),
+            #[cfg(test)]
+            test_paths: Some(self.test_paths.clone()),
+            #[cfg(test)]
+            test_drain: Some(self.test_drain.clone()),
+            #[cfg(test)]
+            test_evm_step_panic: Some(self.test_evm_step_panic.clone()),
         };
         self.flush_worker = Some(match self.checkpoint {
             Some(policy) => {
@@ -3193,6 +3208,11 @@ impl ExecutionContext {
         };
         let mut layer = st.take_layer();
         layer.merge(&top);
+        #[cfg(test)]
+        {
+            self.test_path("checkpoint.drain");
+            self.test_drain.store(true, Ordering::SeqCst);
+        }
         self.checkpoint_submit(&mut st, top.height(), layer)
     }
 
@@ -3490,20 +3510,26 @@ impl ExecutionContext {
         // since bug (b): consensus reads the plan from the DB only, once the
         // durable marker reaches the previous boundary; the boundary's own
         // checkpoint (`checkpoint_upkeep`) makes it durable without later blocks.
+        // Item 7 option 0 (task 3.2): with `TORUS_EVM_FAST_PATH` an EVM
+        // block is no barrier by itself: its EVM part reads through the
+        // block overlay (`EvmBlockState`, tripwire armed), its rows are
+        // absorbed into the pending set, its EVM trie step and its side rows
+        // (receipts, hash -> number, tx index, CoreWriter links) ride its W
+        // job. Its other barrier reasons above still hold.
         let pipelined = self.flush_worker.is_some()
             && durable.header
             && durable.body
-            && !has_evm
+            && (!has_evm || self.evm_fast_path)
             && pending_slashes.is_empty()
             && (self.epoch_fast_path
                 || !EpochManager::is_epoch_boundary(height, self.epoch_length));
         #[cfg(test)]
         {
-            self.test_path(if pipelined {
+            let reason = if pipelined {
                 "block.pipelined"
             } else if self.flush_worker.is_none() {
                 "block.serial.no_worker"
-            } else if has_evm {
+            } else if has_evm && !self.evm_fast_path {
                 "block.serial.evm"
             } else if !pending_slashes.is_empty() {
                 "block.serial.slash"
@@ -3511,9 +3537,21 @@ impl ExecutionContext {
                 "block.serial.nondurable"
             } else {
                 "block.serial.epoch"
-            });
+            };
+            self.test_path(reason);
             if has_evm {
                 self.test_path("block.evm");
+                if pipelined {
+                    self.test_path("block.pipelined.evm");
+                } else if self.evm_fast_path {
+                    // C2: a flag-on EVM height still serial, by reason.
+                    self.test_path(match reason {
+                        "block.serial.no_worker" => "evm.serial_flag_on.no_worker",
+                        "block.serial.slash" => "evm.serial_flag_on.slash",
+                        "block.serial.nondurable" => "evm.serial_flag_on.nondurable",
+                        _ => "evm.serial_flag_on.epoch",
+                    });
+                }
             }
         }
         if !pipelined && !self.pipeline_barrier() {
@@ -3658,22 +3696,49 @@ impl ExecutionContext {
         // keeps only the EVM-derived rows: the hashed mirror, the incremental
         // trie nodes and the node-local CoreWriter tx links.
         let mut evm_batch: Option<rocksdb::WriteBatch> = None;
+        // Item 7 option 0 (task 3.2): a pipelined EVM block's EVM part for
+        // its W job (the bundle for W's EVM trie step, the side rows). `Some`
+        // on EVERY `Ok` of the section, an all-skipped one included (plan F2:
+        // its side rows are then the hash -> number row alone); `None` on the
+        // serial path and for a failed section.
+        let mut evm_job: Option<crate::exec_pipeline::EvmJobRows> = None;
         // s84 executed/skipped record: an EVM tx is executed iff it has a
         // receipt (an undecodable tx or one revm refuses gets none; a reverted
         // tx has one). A failed EVM section executes none of them.
         let mut evm_skipped = vec![true; torus_block.evm_transactions.len()];
         if has_evm {
-            // Item 7 option 0 (task 1.5): an EVM block runs serial (after a
-            // barrier), where the block overlay has no layers, so its EVM part
-            // reads the DB directly (`EvmReads::Db`: the same reads as
-            // `EvmReads::Layered` over the layer-less overlay, without the
-            // overlay's per-read lookups) and computes its root on E.
-            let validated = self.validator.validate_block_for_catchup(
-                torus_block,
-                torus_bridge::EvmReads::Db(&self.state_db),
-                &self.evm_executor,
-                torus_bridge::RootMode::OnE,
-            );
+            let validated = if pipelined {
+                // Item 7 option 0 (task 3.2): the fast path. revm and the
+                // writer-precompile journal read through the block overlay
+                // (own pending -> parent -> L -> C -> DB, no R), so with
+                // writes in flight they read what the barrier path reads from
+                // the DB. No EVM root on E (`RootMode::Skip`: no root, no
+                // full-scan oracle, F6): W runs the EVM trie step. The raw-DB
+                // tripwire is armed for the section (debug / test-probes
+                // builds; a read that bypasses the overlay panics).
+                #[cfg(test)]
+                self.test_path("evm.fast");
+                let reads = torus_bridge::EvmReads::Layered(torus_state::EvmBlockState::new(&overlay));
+                let _armed = torus_state::tripwire::arm();
+                self.validator.validate_block_for_catchup(
+                    torus_block,
+                    reads,
+                    &self.evm_executor,
+                    torus_bridge::RootMode::Skip,
+                )
+            } else {
+                // Item 7 option 0 (task 1.5): a serial EVM block (after a
+                // barrier, the block overlay has no layers) reads the DB
+                // directly (`EvmReads::Db`: the same reads as
+                // `EvmReads::Layered` over the layer-less overlay, without
+                // the overlay's per-read lookups) and computes its root on E.
+                self.validator.validate_block_for_catchup(
+                    torus_block,
+                    torus_bridge::EvmReads::Db(&self.state_db),
+                    &self.evm_executor,
+                    torus_bridge::RootMode::OnE,
+                )
+            };
             #[cfg(test)]
             let validated = match self.test_replay_fault {
                 Some(ReplayFault::EvmLocalFault) => Err(torus_bridge::BridgeError::Evm(
@@ -3711,6 +3776,9 @@ impl ExecutionContext {
                     // Item 7 option 0 (task 1.2): the plain rows and the journal rows go
                     // into the block overlay, in one pass; the journal is consumed. Only a
                     // code bug fails it (frozen overlay, unregistered CF): fail-stop.
+                    // Task 3.2: on the fast path the journal (an overlay over the block's
+                    // layers) is dropped here, so no handle on L, its deferred part or C
+                    // outlives the EVM part (else `take_layer` copies them).
                     if let Err(e) = overlay.absorb_evm(&validated.bundle, validated.native_writes) {
                         self.fail_stop_on_fault(
                             torus_block,
@@ -3722,6 +3790,25 @@ impl ExecutionContext {
                     }
                     #[cfg(test)]
                     self.test_path("evm.absorb");
+                    if pipelined {
+                        // Item 7 option 0 (task 3.2): no EVM batch on E, no
+                        // `commit_block_metadata`, no `append_links`. The
+                        // bundle goes to W's EVM trie step (hashed mirror +
+                        // trie nodes, in the block's batch or the
+                        // checkpoint's), the receipts / hash -> number / tx
+                        // index / CoreWriter links become the job's side rows
+                        // (header and body are dispatch-durable).
+                        #[cfg(test)]
+                        self.test_path("evm.job");
+                        evm_job = Some(crate::exec_pipeline::EvmJobRows {
+                            side: torus_bridge::EvmSideRows::of(
+                                torus_block,
+                                std::mem::take(&mut validated.receipts),
+                                std::mem::take(&mut validated.core_writer_links),
+                            ),
+                            bundle: validated.bundle,
+                        });
+                    } else {
                     // Phase A: the hashed mirror + the incremental trie nodes ride the block's
                     // flush batch as its prefix, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
                     // CF_ACCOUNTS (keeps the incremental root's base correct across
@@ -3807,6 +3894,7 @@ impl ExecutionContext {
                         }
                         Err(e) => tracing::error!(%e, height, "failed to commit block metadata"),
                     }
+                    } // end serial EVM batch / metadata
                 }
                 // R02 branch 5 (owner option A): a precompile hit a LOCAL
                 // storage fault (it aborted the execution instead of answering
@@ -4719,7 +4807,7 @@ impl ExecutionContext {
                 (pipelined && resident_rows.attached()).then(|| overlay.own_pending_delta());
             let resident_ok;
             if pipelined {
-                debug_assert!(evm_batch.is_none(), "bl2: EVM blocks are never pipelined");
+                debug_assert!(evm_batch.is_none(), "a pipelined block never built an evm_batch");
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
                 // the overlay too (CF_CONSENSUS_META is a non-root CF — root-
                 // neutral; the flush appends the same key/bytes again, so the
@@ -4764,10 +4852,11 @@ impl ExecutionContext {
                     books: deferred_books,
                     order_nonces: order_nonces.clone(),
                     action_status,
-                    // Item 7 option 0 (task 2.4): an EVM block's EVM part
-                    // rides the job only on the fast path (step 3); EVM
-                    // blocks barrier until then.
-                    evm: None,
+                    // Item 7 option 0 (task 3.2): a fast-path EVM block's EVM
+                    // part (W: the EVM trie step for a window of one, the side
+                    // rows in the sidecar; with an interval it rides the
+                    // Digest into the window). `None` for a native block.
+                    evm: evm_job.take(),
                 }) {
                     return;
                 }
@@ -5066,7 +5155,8 @@ impl ExecutionContext {
         // EVM batch rides that marker write (bug (c)).
         // s84: an EVM block without a native phase: its executed/skipped
         // record rides the EVM marker flush below (an empty batch when the EVM
-        // section failed and executed nothing). EVM blocks are never pipelined.
+        // section failed and executed nothing). EVM blocks are never pipelined
+        // without a native phase until task 3.3 (item 7 option 0).
         if !run_native && has_evm {
             #[cfg(test)]
             self.test_path("marker.evm_status");
@@ -5113,7 +5203,7 @@ impl ExecutionContext {
                     height,
                     pending,
                     // Item 7 option 0 (task 2.4): only a fast-path EVM block
-                    // without a native phase sets these (step 3, plan F2).
+                    // without a native phase sets these (task 3.3, plan F2).
                     action_status: None,
                     evm: None,
                 }) {
@@ -6357,6 +6447,10 @@ impl TorusApp {
             test_before_wait: None,
             #[cfg(test)]
             test_paths: Default::default(),
+            #[cfg(test)]
+            test_drain: Default::default(),
+            #[cfg(test)]
+            test_evm_step_panic: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
             epoch_fast_path: crate::exec_pipeline::epoch_fast_path_enabled(),
             evm_fast_path: crate::exec_pipeline::evm_fast_path_enabled(),
@@ -14998,6 +15092,10 @@ mod crash_recovery_tests {
             test_before_wait: None,
             #[cfg(test)]
             test_paths: Default::default(),
+            #[cfg(test)]
+            test_drain: Default::default(),
+            #[cfg(test)]
+            test_evm_step_panic: Default::default(),
             liq_value_sum: liq_value_sum_enabled(),
             // s124: the epoch fast path is off unless a test sets it.
             epoch_fast_path: false,
@@ -19891,6 +19989,9 @@ mod crash_recovery_tests {
                     exec_failed,
                     gate: Some(gate),
                     test_on_complete: None,
+                    test_paths: None,
+                    test_drain: None,
+                    test_evm_step_panic: None,
                 },
                 0,
             )
@@ -31232,6 +31333,9 @@ mod crash_recovery_tests {
         run: O0Run,
         /// No resident rows R (positions / balances read through L).
         no_resident_rows: bool,
+        /// Item 7 option 0 (step 3): `TORUS_EVM_FAST_PATH` on this node
+        /// (its replay contexts too: they have no W, so they run serial).
+        evm_fast: bool,
     }
 
     impl O0Cfg {
@@ -31241,6 +31345,7 @@ mod crash_recovery_tests {
                 ckpt: P5Ckpt::PerBlock,
                 run: O0Run::D,
                 no_resident_rows: false,
+                evm_fast: false,
             }
         }
 
@@ -31250,6 +31355,15 @@ mod crash_recovery_tests {
                 ckpt,
                 run,
                 no_resident_rows: false,
+                evm_fast: false,
+            }
+        }
+
+        /// This config with the EVM fast path on (step 3).
+        fn fast(self) -> Self {
+            Self {
+                evm_fast: true,
+                ..self
             }
         }
 
@@ -31417,6 +31531,7 @@ mod crash_recovery_tests {
             ctx.test_no_resident_rows = self.cfg.no_resident_rows;
             // Production default since s128.
             ctx.epoch_fast_path = true;
+            ctx.evm_fast_path = self.cfg.evm_fast;
             ctx.checkpoint = match self.cfg.ckpt {
                 P5Ckpt::PerBlock => None,
                 P5Ckpt::Every5 => Some(ckpt_every(5)),
@@ -31543,11 +31658,15 @@ mod crash_recovery_tests {
         }
 
         /// Shut down (W drained, the open window checkpointed): the ledger
-        /// is complete from here.
+        /// is complete from here. The path flags are taken after the drop,
+        /// so W's flags of the final drain count.
         fn finish(&mut self) {
             if let Some(ctx) = self.ctx.take() {
-                self.retire(&ctx);
+                let paths = ctx.test_paths.clone();
                 drop(ctx);
+                for (k, v) in std::mem::take(&mut *paths.lock().unwrap()) {
+                    *self.paths.entry(k).or_default() += v;
+                }
             }
             self.ledger.lock().unwrap().take_hn(&self.db);
         }
@@ -32864,6 +32983,122 @@ mod crash_recovery_tests {
                 .sum::<usize>(),
             full.iter().map(|(_, r)| r.len()).sum::<usize>()
         );
+    }
+
+    // ---- Item 7 option 0 step 3: the fast-path EVM section ----
+
+    /// Rows of `cf` whose key starts with height `h` (receipts: `h ‖ index`).
+    fn o0_rows_at(db: &StateDb, cf: &str, h: u64) -> usize {
+        StateBackend::iterate_cf(db, cf, Some(&h.to_be_bytes()))
+            .unwrap()
+            .len()
+    }
+
+    /// Rows of CF_BLOCK_HASH_TO_NUMBER pointing at height `h`.
+    fn o0_hash_index_at(db: &StateDb, h: u64) -> usize {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_BLOCK_HASH_TO_NUMBER, None)
+            .unwrap()
+            .iter()
+            .filter(|(_, v)| v.get(..8) == Some(&h.to_be_bytes()[..]))
+            .count()
+    }
+
+    /// The path flags of `node` so far (its live context and the retired).
+    fn o0_paths(node: &O0Node) -> BTreeMap<&'static str, u64> {
+        let mut out = node.paths.clone();
+        if let Some(ctx) = &node.ctx {
+            for (k, v) in ctx.test_paths.lock().unwrap().iter() {
+                *out.entry(k).or_default() += v;
+            }
+        }
+        out
+    }
+
+    /// Plan task 3.2: with the flag on, an EVM block with a native phase
+    /// (its fees) takes the pipelined path. E reads through the block
+    /// overlay, absorbs the EVM rows (the sender's account is in the frozen
+    /// set it hands off) and writes nothing of its own: with W held, the
+    /// block's receipts and hash -> number row are not in the DB, and its
+    /// Flush carries the EVM part. W then runs the EVM trie step and stages
+    /// the side rows in the block's batch; the ledger equals the serial run's.
+    #[test]
+    fn fast_path_evm_block_hands_off_evm_rows() {
+        use O0Hand::*;
+        let blocks = o0_hand_blocks(&[Native, Evm, Native]);
+        let mut s = O0Node::new(O0Cfg::serial());
+        s.run(&blocks);
+        s.finish();
+        let mut node = O0Node::new(O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast());
+        node.run(&blocks[..1]);
+        let gate = node.gate.clone().unwrap();
+        gate.hold();
+        o0_step(&node, &blocks[1]);
+        assert!(gate.wait_received(2), "W received the EVM block's job");
+        let ctx = node.ctx.as_ref().unwrap();
+        let sender = oracle_addr(O0_USERS[0]);
+        let parent = ctx.last_job.lock().unwrap().clone().expect("pipelined: a parent layer");
+        assert_eq!(parent.height(), 2);
+        let row = parent
+            .lookup_row(torus_state::cf::CF_ACCOUNTS, sender.as_slice())
+            .expect("the absorbed account row rides the frozen set")
+            .expect("a put");
+        assert_eq!(
+            torus_state::db::decode_account_info(&row).unwrap().nonce,
+            1,
+            "the EVM tx executed"
+        );
+        assert_eq!(read_native_applied_height(&node.db), Some(1), "W holds 2");
+        assert_eq!(o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 2), 0, "no receipt on E");
+        assert_eq!(o0_hash_index_at(&node.db, 2), 0, "no hash -> number row on E");
+        let p = o0_paths(&node);
+        for k in ["block.pipelined.evm", "evm.fast", "evm.absorb", "evm.job", "handoff.flush"] {
+            assert!(p.get(k).copied().unwrap_or(0) >= 1, "{k}: {p:?}");
+        }
+        assert_eq!(p.get("block.serial.evm"), None, "{p:?}");
+        gate.release();
+        assert!(node.ctx.as_ref().unwrap().flush_worker.as_ref().unwrap().wait_idle());
+        assert_eq!(o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 2), 1, "W wrote the receipt");
+        assert_eq!(o0_hash_index_at(&node.db, 2), 1, "W wrote the hash -> number row");
+        let p = o0_paths(&node);
+        assert_eq!(p.get("w.evm_side.flush"), Some(&1), "{p:?}");
+        assert_eq!(p.get("w.evm_step.flush"), Some(&1), "{p:?}");
+        node.run(&blocks[2..]);
+        node.finish();
+        node.ledger().assert_complete(3, "fast path");
+        let c = o0_compare(&s.ledger(), &node.ledger())
+            .unwrap_or_else(|d| panic!("diverged at {}: {}", d.height, d.what));
+        assert_eq!((c.hn, c.status, c.side, c.dumps), (3, 3, 3, 3));
+        assert_eq!(o0_final(&s, &blocks), o0_final(&node, &blocks));
+    }
+
+    /// Plan task 3.2 (R and L unshared, success criteria): the fast path's
+    /// journal (an overlay over the block's layers) is consumed by the
+    /// absorb, so no handle on L, its deferred part or C outlives the EVM
+    /// part: `take_layer` never copies a shared layer and R never falls back
+    /// to a copy, over the stream's first 120 blocks (reader and writer
+    /// precompile calls inside Every5 windows), G mode. Non-vacuous: the
+    /// journal's reads were served by the frozen layers.
+    #[test]
+    fn journal_dropped_before_native() {
+        use torus_state::probes::{Layer, Reader};
+        let (blocks, _) = o0_blocks(120, O0_SEED);
+        let mut node = O0Node::new(O0Cfg::piped(P5Ckpt::Every5, O0Run::G).fast());
+        node.run(&blocks);
+        let ctx = node.ctx.as_ref().expect("no fail-stop");
+        assert_eq!(ctx.ckpt.lock().unwrap().shared_fallbacks, 0, "L / C never shared");
+        assert_eq!(
+            ctx.resident_books.lock().unwrap().rows_shared_fallbacks(),
+            0,
+            "R never shared"
+        );
+        let journal = node
+            .probe
+            .total(|r, l, _| r == Reader::Journal && l.frozen());
+        assert!(journal.hits > 0, "journal reads through the layers:\n{}", node.probe.report());
+        let p = o0_paths(&node);
+        assert!(p.get("evm.fast").copied().unwrap_or(0) >= 10, "{p:?}");
+        let _ = Layer::Own;
+        node.finish();
     }
 
     // ======================================================================

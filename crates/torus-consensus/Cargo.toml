@@ -40,6 +40,9 @@ torus-bridge = { workspace = true, features = ["test-reference-paths"] }
 # Item 7 option 0 step 0 (task 0.3): the overlay read probes and the
 # running-hash `capture_drain` hook. Test builds only.
 torus-state = { workspace = true, features = ["test-probes"] }
+# Item 7 option 0 (task 3.6): precompile journal reads labelled for the
+# probes. Test builds only.
+torus-evm = { workspace = true, features = ["test-probes"] }
 # Item 7 option 0 step 0 (task 0.2): the golden's RPC answers come from the eth
 # handlers over the node's DB. Dev-only: torus-rpc does not depend on
 # torus-consensus, so this adds no cycle.
