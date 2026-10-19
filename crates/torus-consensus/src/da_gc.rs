@@ -190,6 +190,28 @@ pub const DA_GC_LIMITS: DaGcLimits = DaGcLimits {
     max_deletes: 16_384,
 };
 
+/// A GC pass that takes at least this long (ms) logs one warn line with its
+/// phases (`TorusApp::gc_da_bodies_after_dispatch`) and counts
+/// `torus_da_gc_slow_passes`; `TORUS_DA_GC_SLOW_MS` overrides it
+/// ([`resolve_da_gc_slow_ms`]). 8h saw rare 51-205 ms passes on the
+/// consensus thread with nothing recorded to explain them.
+pub const DA_GC_SLOW_PASS_MS: u64 = 50;
+
+/// The slow-pass log threshold in ms from `TORUS_DA_GC_SLOW_MS` (`env`):
+/// unset or unparsable = [`DA_GC_SLOW_PASS_MS`], `0` = log every pass.
+pub fn resolve_da_gc_slow_ms(env: Option<&str>) -> u64 {
+    env.and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(DA_GC_SLOW_PASS_MS)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: [`BlockTreeHistory`]'s tail read sleeps this long first,
+    /// so a test can make one GC phase slow.
+    pub(crate) static TEST_TAIL_DELAY: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
 /// The DA body GC window in blocks, `None` = GC off.
 ///
 /// `env` is `TORUS_DA_BODY_RETENTION`; `block_tree_retention` is the active
@@ -380,6 +402,11 @@ pub const MAX_TAIL_BLOCKS: usize = 256;
 /// [`MAX_TAIL_BLOCKS`] of them is an error, never "no actions": the pass
 /// then holds. Normally 2-3 blocks, read only when a row is due.
 pub fn uncommitted_native_hashes_in_tree(db: &StateDb) -> Result<Vec<B256>, StateError> {
+    uncommitted_native_tail_in_tree(db).map(|(hashes, _)| hashes)
+}
+
+/// [`uncommitted_native_hashes_in_tree`], and how many tail blocks it read.
+pub fn uncommitted_native_tail_in_tree(db: &StateDb) -> Result<(Vec<B256>, usize), StateError> {
     let tree_err = |e| StateError::InvalidData(format!("block tree tail read: {e:?}"));
     let camera = BlockTreeCamera::new(RocksKVStore::new(db.db_arc()));
     let snapshot = camera.snapshot();
@@ -424,7 +451,7 @@ pub fn uncommitted_native_hashes_in_tree(db: &StateDb) -> Result<Vec<B256>, Stat
             stack.push(*child);
         }
     }
-    Ok(hashes)
+    Ok((hashes, read))
 }
 
 /// [`BlockTreeHistory`]'s restore hook: `(height, hashes, full datum's
@@ -440,6 +467,9 @@ pub type RestoreBodies<'a> = &'a dyn Fn(u64, &[B256], Option<&[SignedNativeActio
 pub struct BlockTreeHistory<'a> {
     db: &'a StateDb,
     restore: RestoreBodies<'a>,
+    /// Tail blocks the last [`DaGcHistory::uncommitted_hashes`] read
+    /// (slow-pass log).
+    tail_blocks: std::cell::Cell<usize>,
 }
 
 impl<'a> BlockTreeHistory<'a> {
@@ -448,7 +478,16 @@ impl<'a> BlockTreeHistory<'a> {
     /// datum's, if it is one), so a body the block references but the DA
     /// store lost is put back, as dispatch does.
     pub fn new(db: &'a StateDb, restore: RestoreBodies<'a>) -> Self {
-        Self { db, restore }
+        Self {
+            db,
+            restore,
+            tail_blocks: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Blocks the last tail read walked (0 when none was read).
+    pub fn tail_blocks(&self) -> usize {
+        self.tail_blocks.get()
     }
 }
 
@@ -471,7 +510,11 @@ impl DaGcHistory for BlockTreeHistory<'_> {
     }
 
     fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError> {
-        uncommitted_native_hashes_in_tree(self.db)
+        #[cfg(test)]
+        std::thread::sleep(TEST_TAIL_DELAY.with(|d| d.get()));
+        let (hashes, blocks) = uncommitted_native_tail_in_tree(self.db)?;
+        self.tail_blocks.set(blocks);
+        Ok(hashes)
     }
 }
 
@@ -535,6 +578,19 @@ mod tests {
                 "{raw:?}"
             );
             assert_eq!(resolve_da_body_retention(Some(raw), None), None, "{raw:?}");
+        }
+    }
+
+    /// `TORUS_DA_GC_SLOW_MS`: a pass at or over it logs one warn line;
+    /// unset or unparsable = [`DA_GC_SLOW_PASS_MS`] (50), `0` = every pass.
+    #[test]
+    fn slow_pass_threshold_from_env() {
+        assert_eq!(DA_GC_SLOW_PASS_MS, 50);
+        assert_eq!(resolve_da_gc_slow_ms(None), 50);
+        assert_eq!(resolve_da_gc_slow_ms(Some(" 20 ")), 20);
+        assert_eq!(resolve_da_gc_slow_ms(Some("0")), 0);
+        for raw in ["", "off", "-1", "5ms"] {
+            assert_eq!(resolve_da_gc_slow_ms(Some(raw)), 50, "{raw:?}");
         }
     }
 
@@ -726,6 +782,78 @@ mod tests {
             assert!(!store.contains(&compute_action_hash(a).0).unwrap());
         }
         assert!(store.contains(&compute_action_hash(&actions[3]).0).unwrap());
+    }
+
+    /// RH4 part 2 (docs/plans/rh4-retention-early-cost.md): the block-tree
+    /// pruner `--retention-blocks` turns on runs after every commit on the
+    /// hotstuff thread. Its cost per commit while the tip is inside the
+    /// window (two point reads, nothing pruned) and once it prunes one block
+    /// per commit, on the real tree over RocksDB with compact-block-sized
+    /// data (`RH4_BENCH_HASHES` hashes, default 130). Release only:
+    /// `cargo test --release -p torus-consensus --lib rh4_early_cost --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "microbench, release: see the doc comment"]
+    fn rh4_early_cost_block_tree_pruner() {
+        use std::time::{Duration, Instant};
+        const TREE: u64 = 1000;
+        let hashes: usize = std::env::var("RH4_BENCH_HASHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(130);
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDb::open(dir.path()).unwrap();
+        // SAFETY: test-only direct tree access, no replica runs on this store.
+        let mut bt = unsafe { BlockTreeSingleton::new_unsafe(RocksKVStore::new(db.db_arc())) };
+        let mut parent = None;
+        let (mut inside, mut pruning) = (Vec::new(), Vec::new());
+        for h in 0..1500u64 {
+            let justify = match parent {
+                None => PhaseCertificate::genesis_pc(),
+                Some(block) => PhaseCertificate {
+                    chain_id: ChainID::new(0),
+                    view: ViewNumber::new(h),
+                    block,
+                    phase: Phase::Generic,
+                    signatures: SignatureSet::new(0),
+                },
+            };
+            let mut data_hash = [0u8; 32];
+            data_hash[..8].copy_from_slice(&h.to_be_bytes());
+            let datum = hotstuff_rs::types::data_types::Datum::new(vec![h as u8; 32 * hashes + 200]);
+            let block = Block::new(
+                BlockHeight::new(h),
+                justify,
+                CryptoHash::new(data_hash),
+                Data::new(vec![datum]),
+            );
+            bt.insert(&block, None, None).unwrap();
+            let mut wb = BlockTreeWriteBatch::new_unsafe();
+            bt.commit(&mut wb, &block.hash).unwrap();
+            bt.write(wb);
+            parent = Some(block.hash);
+            let t = Instant::now();
+            let pruned = bt.prune_old_committed_blocks_with(TREE).unwrap();
+            let took = t.elapsed();
+            if h <= TREE {
+                assert_eq!(pruned, 0);
+                inside.push(took);
+            } else {
+                pruning.push(took);
+            }
+        }
+        for (name, xs) in [("inside the window", &mut inside), ("pruning 1/commit", &mut pruning)] {
+            xs.sort();
+            let us = |d: Duration| d.as_secs_f64() * 1e6;
+            let mean = xs.iter().map(|d| us(*d)).sum::<f64>() / xs.len() as f64;
+            println!(
+                "block-tree pruner {name}: n={} mean={mean:.1}us p50={:.1}us p99={:.1}us max={:.1}us",
+                xs.len(),
+                us(xs[xs.len() / 2]),
+                us(xs[xs.len() * 99 / 100]),
+                us(xs[xs.len() - 1]),
+            );
+        }
     }
 
     /// Codex P1 (round 2): the one conversion between the two height
