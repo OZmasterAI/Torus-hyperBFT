@@ -1441,6 +1441,11 @@ fn resident_slot_of(id: CfId) -> Option<usize> {
         .position(|x| *x == id)
 }
 
+/// `test-probes`: one frozen layer's effective rows (key, value; `None` = a
+/// tombstone), see `NativeStateOverlay::effective_rows`.
+#[cfg(feature = "test-probes")]
+type LayerRows<'a> = Vec<(&'a [u8], Option<&'a [u8]>)>;
+
 impl NativeStateOverlay {
     pub fn new(db: StateDb) -> Self {
         Self::with_parent(db, None)
@@ -1709,7 +1714,7 @@ impl NativeStateOverlay {
         lower: &[Option<&'a PendingState>; 3],
         start: &[u8],
         within: impl Fn(&[u8]) -> bool,
-    ) -> [Vec<(&'a [u8], Option<&'a [u8]>)>; 3] {
+    ) -> [LayerRows<'a>; 3] {
         std::array::from_fn(|i| {
             let Some(layer) = lower[i] else {
                 return Vec::new();
@@ -3710,7 +3715,8 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for (c, combo) in combos.iter().enumerate() {
             let k = key(c);
-            let reads: [(&str, &dyn Fn(&NativeStateOverlay) -> String); 4] = [
+            type Read<'r> = &'r dyn Fn(&NativeStateOverlay) -> String;
+            let reads: [(&str, Read); 4] = [
                 ("get_cf_raw", &|ov| format!("{:?}", ov.get_cf_raw(cf, &k).unwrap())),
                 ("get_cf_len", &|ov| format!("{:?}", ov.get_cf_len(cf, &k).unwrap())),
                 ("iterate_cf", &|ov| format!("{:?}", ov.iterate_cf(cf, Some(&k)).unwrap())),
@@ -6009,7 +6015,8 @@ mod tests {
     fn absorb_keeps_h_n_and_flush_bytes() {
         use crate::cf::{CF_ACCOUNTS, CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
         use crate::running_hash::read_running_hash;
-        let dump = |db: &StateDb| -> Vec<(&str, Vec<(Vec<u8>, Vec<u8>)>)> {
+        type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+        let dump = |db: &StateDb| -> Vec<(&str, Rows)> {
             crate::cf::ALL_CF_NAMES
                 .iter()
                 .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))

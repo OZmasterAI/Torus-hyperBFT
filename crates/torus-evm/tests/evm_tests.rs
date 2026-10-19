@@ -2284,7 +2284,7 @@ fn execute_block_lanes_over_layers_equals_db() {
     );
     let EvmBlockState { db, journal } = EvmBlockState::new(&overlay);
     let b = exec
-        .execute_block_lanes(&db, journal, &cfg, txs(), false, &BigLane::default())
+        .execute_block_lanes(db, journal, &cfg, txs(), false, &BigLane::default())
         .unwrap();
 
     assert_eq!(format!("{:?}", a.receipts), format!("{:?}", b.receipts));

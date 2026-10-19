@@ -153,7 +153,8 @@ mod tests {
     fn tripwire_fires_on_raw_read_in_armed_scope() {
         let (db, _d) = db();
         let code = B256::repeat_byte(7);
-        let entries: Vec<(&str, Box<dyn Fn(&StateDb) + Sync>)> = vec![
+        type Read = Box<dyn Fn(&StateDb) + Sync>;
+        let entries: Vec<(&str, Read)> = vec![
             ("get_cf_raw", Box::new(|db| drop(db.get_cf_raw(CF_ACCOUNTS, b"k")))),
             ("StateBackend::get_cf_raw", Box::new(|db| drop(StateBackend::get_cf_raw(db, CF_ACCOUNTS, b"k")))),
             ("multi_get_cf_raw", Box::new(|db| drop(db.multi_get_cf_raw(CF_ACCOUNTS, &[b"k".as_slice()])))),

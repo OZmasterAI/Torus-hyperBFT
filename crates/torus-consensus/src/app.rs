@@ -30114,7 +30114,7 @@ mod crash_recovery_tests {
     /// The shape of the cycle of `O0_EMPTIED[i]`: alternating, next-block
     /// first (3 next-block cycles, 2 same-block ones).
     fn o0_recreate(i: usize) -> O0Recreate {
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             O0Recreate::NextBlock
         } else {
             O0Recreate::SameBlock
@@ -31587,7 +31587,10 @@ mod crash_recovery_tests {
     /// The side rows of each height in a snapshot: receipts (key height),
     /// tx locations (value height), hash -> number (value height) and
     /// CoreWriter tx links (the height of their tx's location).
-    fn o0_side_rows(snap: &[CfDump]) -> BTreeMap<u64, Vec<(&'static str, Vec<u8>, Vec<u8>)>> {
+    /// Side rows by height: (CF, key, value).
+    type O0SideRows = BTreeMap<u64, Vec<(&'static str, Vec<u8>, Vec<u8>)>>;
+
+    fn o0_side_rows(snap: &[CfDump]) -> O0SideRows {
         use torus_state::cf::{CF_CORE_WRITER_TX, CF_RECEIPTS, CF_TX_HASH_TO_LOCATION};
         let rows = |name: &str| {
             snap.iter()
@@ -31603,7 +31606,7 @@ mod crash_recovery_tests {
             .iter()
             .filter_map(|(k, v)| Some((k.as_slice(), head8(v)?)))
             .collect();
-        let mut out: BTreeMap<u64, Vec<(&'static str, Vec<u8>, Vec<u8>)>> = BTreeMap::new();
+        let mut out: O0SideRows = BTreeMap::new();
         let mut put = |h: Option<u64>, cf: &'static str, k: &[u8], v: &[u8]| {
             out.entry(h.unwrap_or(0))
                 .or_default()
@@ -31932,6 +31935,7 @@ mod crash_recovery_tests {
     /// - with an interval: at checkpoint h's hand-off it parks that
     ///   checkpoint (and the digests behind it) across 1-4 more hand-offs,
     ///   so the next blocks read through C in flight.
+    ///
     /// Before any wait of E on W (a barrier, a checkpoint hand-off) it
     /// releases first: E never waits on a parked W. A hold older than 30 s
     /// fires the watchdog: released, and the test fails instead of hanging.
@@ -32743,9 +32747,8 @@ mod crash_recovery_tests {
         assert!(get("evm.ok") >= fed.evm_blocks - 2, "{s:?} vs {fed:?}");
         for node in &nodes[1..] {
             let p = &node.paths;
-            assert_eq!(
+            assert!(
                 p.get("block.pipelined").copied().unwrap_or(0) > 100,
-                true,
                 "{:?}: {p:?}",
                 node.cfg
             );
@@ -33882,9 +33885,24 @@ mod crash_recovery_tests {
         // `metric_value` panics with the whole exposition if a series is absent.
         let v = |text: &str, name: &str| metric_value(text, name) as u64;
         let cells = [
-            ("flag off, interval 0", O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D), 0, 0),
-            ("flag on, interval 0", O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast(), 3, 2),
-            ("flag on, Every5", O0Cfg::piped(P5Ckpt::Every5, O0Run::D).fast(), 3, 1),
+            (
+                "flag off, interval 0",
+                O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D),
+                0,
+                0,
+            ),
+            (
+                "flag on, interval 0",
+                O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast(),
+                3,
+                2,
+            ),
+            (
+                "flag on, Every5",
+                O0Cfg::piped(P5Ckpt::Every5, O0Run::D).fast(),
+                3,
+                1,
+            ),
             ("flag on, no W", O0Cfg::serial().fast(), 0, 0),
         ];
         let mut evm_seconds = Vec::new();

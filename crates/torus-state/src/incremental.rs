@@ -1360,8 +1360,11 @@ mod tests {
 
     // ---- Item 7 option 0 task 2.2: the EVM trie step on the flush worker ----
 
+    /// A CF's (key, value) rows.
+    type CfRows = Vec<(Vec<u8>, Vec<u8>)>;
+
     /// The four EVM trie / mirror CFs, dumped (key, value) per CF.
-    fn trie_cf_dump(db: &StateDb) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+    fn trie_cf_dump(db: &StateDb) -> Vec<(&'static str, CfRows)> {
         use crate::cf::{CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_TRIE_STORAGE};
         [
             CF_HASHED_ACCOUNTS,
@@ -1442,7 +1445,7 @@ mod tests {
             let ops = (xorshift(rng) % 6) + 1;
             for _ in 0..ops {
                 let kind = xorshift(rng) % 6;
-                let a = if kind == 0 && xorshift(rng) % 2 == 0 {
+                let a = if kind == 0 && xorshift(rng).is_multiple_of(2) {
                     addr_of(pool_a(xorshift(rng)))
                 } else if kind <= 2 {
                     addr_of(pool_b(xorshift(rng)))
@@ -1464,7 +1467,7 @@ mod tests {
                         if !st.is_empty() {
                             builder = builder.state_storage(a, st);
                         }
-                        if xorshift(rng) % 2 == 0 {
+                        if xorshift(rng).is_multiple_of(2) {
                             destroyed.push(a);
                         }
                     }
@@ -1477,12 +1480,12 @@ mod tests {
                         let bal = xorshift(rng) % 1_000_000 + 1;
                         let nonce = xorshift(rng) % 50 + 1;
                         builder = builder.state_present_account_info(a, eoa(bal, nonce));
-                        if kind >= 3 && xorshift(rng) % 3 != 0 {
+                        if kind >= 3 && !xorshift(rng).is_multiple_of(3) {
                             let mut st = StorageKeyMap::default();
                             let mut slots = slots_of(a, model);
                             for _ in 0..(xorshift(rng) % 4) + 1 {
                                 let slot = U256::from(xorshift(rng) % 24);
-                                let zero = xorshift(rng) % 3 == 0;
+                                let zero = xorshift(rng).is_multiple_of(3);
                                 let v = if zero {
                                     U256::ZERO
                                 } else {
@@ -1511,7 +1514,7 @@ mod tests {
             // account this block's bundle also touched (plan C9).
             let mut credits = Vec::new();
             for _ in 0..xorshift(rng) % 3 {
-                let a = if xorshift(rng) % 2 == 0 {
+                let a = if xorshift(rng).is_multiple_of(2) {
                     addr_of(pool_a(xorshift(rng)))
                 } else {
                     addr_of(pool_b(xorshift(rng)))
@@ -1519,7 +1522,7 @@ mod tests {
                 credits.push((a, eoa(xorshift(rng) % 90_000 + 1, xorshift(rng) % 9)));
             }
             if let Some((a, _)) = bundle.state.iter().next() {
-                if xorshift(rng) % 2 == 0 {
+                if xorshift(rng).is_multiple_of(2) {
                     credits.push((*a, eoa(4_242, 3)));
                 }
             }
@@ -1635,7 +1638,7 @@ mod tests {
     #[test]
     fn window_trie_step_equals_per_block_apply() {
         o0_window_vs_per_block(0x51ce_0be5_7a7e_d00d, 40, 8);
-        o0_window_vs_per_block(0x0dd5_eed5_0f_c0ffee, 40, 8);
+        o0_window_vs_per_block(0x0dd5_eed5_0fc0_ffee, 40, 8);
     }
 
     /// Task 2.2, interval 0: a window of one block (a `Job::Flush` with
