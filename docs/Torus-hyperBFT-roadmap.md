@@ -402,6 +402,13 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.
+  **s131, 8h (perf doc section 95):** retention 1000 vs off at full load: no cost per fill or per CPU-s, SST growth
+  0.200 -> ~0 GB/min; blocks/s and p50 / p99 open (per pair r1 A 12.6 / B 13.1, r2 A 16.4 / B 9.3 blk/s; the owner
+  reads r2-B as a possible regression); rare GC passes of 51-205 ms on the consensus thread. **Before deciding
+  prune-by-default (pre-testnet):** (1) log every GC pass over 50 ms and add a per-pass max gauge; (2) check what
+  `--retention-blocks` does from block 1, before the first deleting pass; (3) then rerun 8h with two more A B B A
+  rounds (n = 6 pooled), blocks/s per minute from minute 1 with the first deleting pass marked. Retention stays off by
+  default until then (node-local `--retention-blocks`, restart to change).
 - **Trial testnet before the real testnet (owner s131; after the current work).** Three validators: archy and cachy
   (the owner's home PCs, same house, wired, 1 Gbit internet) and the 18c server. No router setup: archy and cachy
   peer over the LAN with explicit `--p2p-peers` LAN addresses, and both dial out to 18c (public), so every pair is

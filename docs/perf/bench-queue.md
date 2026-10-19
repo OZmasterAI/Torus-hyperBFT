@@ -384,16 +384,6 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (SIGKILL val1 mid-load, restart): kill -> first commit, replayed blocks, catch-up time, AGREE and one digest, and
    matched/s around the kill. If the depth curve is unclear at n = 1 (e.g. 0 and 1M within the S-cell spread), report
    it and 18c decides on replicates.
-8h2. **8h rerun: does retention cost native blocks/s?** (owner s131; right after 8i, BEFORE 8j; ~2 h 30, estimate).
-   Section 95 left blocks/s and p50 / p99 open: per pair r1 A 12.6 / B 13.1, r2 A 16.4 / B 9.3 blk/s. The owner reads
-   r2-B as a possible regression (9.3 is well below both A cells of the same campaign), so it is treated as one until
-   more pairs show otherwise. Same binary and shape as 8h (main `687eac9e` node md5 `f38d132e`, code defaults, B =
-   `TORUS_RETENTION_BLOCKS=1000` via `EXTRA_ENV`, standard unpaced load, 300 markets, 900 s), two more rounds A B B A
-   A B B A (n = 4 new; also report pooled with 8h, n = 6). Report per cell and per pair: native blocks/s, fills per
-   block, p50 / p99, timeouts, and **blocks/s per minute from minute 1** for every cell, marking the first deleting GC
-   pass, so a B cell that slows before any deletion is visible. Also per B cell: `torus_da_gc_seconds` count / sum /
-   max bucket, held passes by reason, and every pass over 50 ms with its time (the 51-205 ms passes of section 95).
-   Verdict: if B is lower than its paired A in most pairs, say so plainly; prune-by-default waits for this.
 8j. **Item 7 option 0 G1b: flag-off cost under EVM load** (owner s131; after 8i, when 18c posts the two SHAs;
    ~1 h 20, estimate; NOT blocking: the G2-G4 builds go on meanwhile). G1b (`docs/plans/item7-option0-impl.md`
    tasks 1.2-1.7) changes today's EVM path with no flag: the block overlay is built before the EVM part and the EVM
