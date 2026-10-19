@@ -1778,7 +1778,8 @@ impl Mempool {
 
     /// [`gc_committed_native_da`](Self::gc_committed_native_da), and where
     /// the pass spent its time ([`DaGcPassStats`], added to `stats`; RH4
-    /// slow-pass observability). The same decisions and writes.
+    /// slow-pass observability; a failed pass also sets `stats.error`). The
+    /// same decisions and writes.
     #[allow(clippy::too_many_arguments)]
     pub fn gc_committed_native_da_timed(
         &self,
@@ -1804,6 +1805,7 @@ impl Mempool {
             Ok(out) => out,
             Err(e) => {
                 tracing::warn!(height, "native DA body GC pass failed: {e}");
+                stats.error = Some(e.to_string());
                 DaGcOutcome {
                     deletion_held: true,
                     hold_reason: Some(torus_state::DaGcHoldReason::StoreError),

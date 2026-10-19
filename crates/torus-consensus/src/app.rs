@@ -6817,7 +6817,9 @@ impl TorusApp {
     /// `delete_scan_ms` the due-row walk (tail excluded) and `write_ms` the
     /// batch write (record, deletes and GC state together). `dispatch_lag` is
     /// the tree's committed tip minus this height (the tip read again here
-    /// when the pass did not). Off the hot path: only slow passes get here.
+    /// when the pass did not). A failed pass logs too (`held=store_error`,
+    /// `error` its message, the failed phase's time included; `none` when
+    /// it did not fail). Off the hot path: only slow passes get here.
     #[allow(clippy::too_many_arguments)]
     fn log_slow_da_gc_pass(
         &self,
@@ -6863,6 +6865,7 @@ impl TorusApp {
             committed_tip = %opt(tip),
             dispatch_lag = %opt(tip.map(|tip| tip.saturating_sub(height))),
             held = %out.hold_reason.map_or("none", |r| r.as_str()),
+            error = %stats.error.as_deref().unwrap_or("none"),
             "DA body GC: slow pass"
         );
     }
@@ -33895,6 +33898,7 @@ mod crash_recovery_tests {
             "committed_tip=none",
             "dispatch_lag=none",
             "held=none",
+            "error=none",
         ] {
             assert!(line.contains(field), "{field} missing: {line}");
         }
@@ -33914,6 +33918,59 @@ mod crash_recovery_tests {
             1,
             "the pass still deleted"
         );
+    }
+
+    /// Codex P2 (8h review): a FAILED pass over the threshold still logs
+    /// the slow-pass line, with its error, `held=store_error` and the failed
+    /// write's phase. The DA store here is read-only, so the pass's batch
+    /// write fails; the threshold is zero, so every pass is slow.
+    #[test]
+    fn da_gc_failed_slow_pass_logs_its_error() {
+        use std::time::Duration;
+        let (config, state_db) = make_test_config_and_db();
+        let da_dir = scratch_db_dir("torus-da-gc-ro");
+        drop(StateDb::open(&da_dir).expect("create the DA db"));
+        let da_db = StateDb::open_read_only(&da_dir).expect("open the DA db read-only");
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            da_db,
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1024);
+        app.replace_exec_tx(tx);
+        set_tree_frontier(&state_db, u64::MAX);
+        app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+            retention: 4,
+            block_tree_db: state_db.clone(),
+        }));
+        app.set_da_gc_slow_pass(Duration::ZERO);
+        // No body to wait for (the store can hold none); the pass still
+        // writes the new GC state, and that write fails.
+        let out = capture_logs(|| da_gc_commit(&mut app, 1, vec![]));
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("DA body GC: slow pass"))
+            .collect();
+        assert_eq!(lines.len(), 1, "the failed pass is logged:\n{out}");
+        let line = lines[0];
+        for field in [
+            "WARN",
+            "height=1",
+            "held=store_error",
+            "write_ms=",
+            "error=",
+            "read only",
+        ] {
+            assert!(line.contains(field), "{field} missing: {line}");
+        }
+        assert_eq!(metrics.da_gc_slow_passes.get(), 1);
     }
 
     /// RH4 part 2 (docs/plans/rh4-retention-early-cost.md): what
