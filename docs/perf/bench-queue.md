@@ -439,6 +439,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per block (`torus_exec_phase_settle_seconds`, pass A / pass B, `torus_exec_cache_flush_seconds`), fills per block;
    report matched/s, blocks/s, p50 / p99 too. If the settle timer drops by roughly the microbench's 5-7 ms per block
    and nothing else gets worse, the full A B B A A B comes later, before any merge.
+   **Done s68 (ozarchy-8n, A main `0f5bef38` node `0d24371e` (8k stage reused), B `dbe14b21` node `4cecf409` +
+   `TORUS_SETTLE_NO_MERGE=1`, both A's bench `708eb332`, P1M deep book, smoke B then w1 A, r1-A, r1-B, 600 s; perf
+   doc section 98).** All 4 cells ACCEPT / AGREE / PASS, md5 12 / 12, flag on=true once per B node and absent in A,
+   0 CHECK FAIL, no swap growth. Settle phase 72.20 -> 62.41 ms per native block (-9.79, 0.864; pass B 34.40 ->
+   18.94, cache flush 25.69 -> 31.38, pass A flat), exec-thread on-CPU 3.362 -> 3.228 ms per 1k fills (0.960), fills
+   per block 71,388 -> 71,152, save_books 73.20 -> 73.77 ms per block. matched/s 226,021 -> 235,116, blocks/s 3.076 ->
+   3.206, p50 / p99 228 / 1,485 -> 225 / 1,434 ms, timeouts 12 -> 6, RSS mean 6,792 -> 7,048 MB (in 8kd's spread);
+   n = 1, not resolved. Verdict: full A B B A A B later. Inter-cell gaps 62 / 62 / 62 s (`max_load` 10).
 8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; after 8n (the disk must be freed
    first); replaces 8j; ~4-5 h incl. the extra cells, estimate). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
    `origin/feat/item7-option0` at `f8a45a2d` (G0-G4 done; G3 and the whole branch Codex torus-adversarial reviewed;
