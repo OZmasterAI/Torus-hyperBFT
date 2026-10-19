@@ -373,6 +373,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (SIGKILL val1 mid-load, restart): kill -> first commit, replayed blocks, catch-up time, AGREE and one digest, and
    matched/s around the kill. If the depth curve is unclear at n = 1 (e.g. 0 and 1M within the S-cell spread), report
    it and 18c decides on replicates.
+8j. **Item 7 option 0 G1b: flag-off cost under EVM load** (owner s131; after 8i, when 18c posts the two SHAs;
+   ~1 h 20, estimate; NOT blocking: the G2-G4 builds go on meanwhile). G1b (`docs/plans/item7-option0-impl.md`
+   tasks 1.2-1.7) changes today's EVM path with no flag: the block overlay is built before the EVM part and the EVM
+   rows are absorbed into it on every EVM block. Q11 would only see its cost at the end (E-off vs section 85's 0.913).
+   One binary per arm, both from `feat/item7-option0`: A = the commit before G1b (behaviour = its main base), B = the
+   G1b commit; 18c gives both SHAs once G1b has passed review. Nothing set (no fast-path flag exists yet); 512 KB from
+   `env.sh`; custody 0. Standard load + EVM `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40` (Q5's load), N = 11 bench genesis,
+   300 markets, 600 s, warm-up then A B B A A B (n = 3). Judge by the exec-path merge rule above (exec-thread on-CPU
+   ms per 1k fills, native blocks/s, block p50 / p99, timeouts per 1,000 blocks); also exec ms at EVM heights vs
+   other heights (the q5-gaps view), `torus_exec_evm_seconds` per EVM block, matched/s, CPU-s per 1M. If the SHAs are
+   not posted when 8i ends, skip it and report; it runs whenever they arrive.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
