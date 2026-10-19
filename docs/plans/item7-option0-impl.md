@@ -684,6 +684,12 @@ branch). Golden green after every task.
   a second writer would break Q6 A1's key disjointness (design point 7). A shared encoder in `torus-bridge` serves
   both `commit_block_metadata` and W.
 - Verify: `cargo nextest run -E 'rdeps(torus-consensus)' $F`.
+- **Done (s131, G2, `c2162f7f`).** As planned. `EvmSideRows { height, block_hash, receipts, links }` and the shared
+  encoder `metadata_side_rows` are in `torus-bridge/src/committer.rs`; `commit_block_metadata` now writes its
+  receipts / hash -> number / tx-index rows through it (same rows, same order; header and body stay there). W stages
+  them with `stage_evm_side_rows` (`exec_pipeline.rs`): a receipt that does not serialize is logged and nothing is
+  staged (the serial path writes none either); a put error fails the job (fail-stop). Verify widened to
+  `rdeps(torus-bridge)` (the bridge changed): 1940 passed.
 
 **Task 2.2: the EVM trie step on W**
 - Test first (`torus-state`, `incremental.rs` tests):
@@ -709,6 +715,19 @@ branch). Golden green after every task.
 - Decision 4: if the window step cannot match per-block CF_TRIE_* bytes (reth's update sets differ by batching) while
   the roots and the mirror agree, fall back to per-block steps on W in height order over reth's in-memory
   trie / hashed cursor overlays.
+- **Done (s131, G2, `601e5f93`).** Decision 4 holds without the fallback: one step over a window gives CF_HASHED_*
+  and CF_TRIE_* byte-equal to the per-block path (80 random windows of 1-8 blocks, 60 windows of one, a
+  delete-with-storage / re-create case; a mutation dropping the forced storage-trie delete is caught). Shape, refined
+  from the plan: the ACCOUNT side is the window's final CF_ACCOUNTS row for every account the window wrote (each bundle
+  account and each noted native credit: every CF_ACCOUNTS write is in E's `dirty_evm_accounts`, so per block the
+  mirror ends at that row), not a per-account keep flag; the STORAGE side folds `apply_bundle_hashed` (mirror: kept
+  accounts' slots last-value-wins, a not-kept account wipes) and reth's `HashedPostState::extend` of each block's
+  `from_bundle_state` with the EIP-161 override (trie), plus a storage wipe for each account a block leaves out of the
+  trie; that account's storage trie is deleted (`is_deleted`) before its new nodes are written. The W wiring (the
+  prefix on Flush / Checkpoint) needs the job fields, so it landed in 2.4; this task added the torus-state plumbing
+  (`EvmWindowDelta`, `FrozenPending::flush_on_worker_after_batch`, `CheckpointLayer::flush_checkpoint_after_batch`,
+  `lookup_row` on both). Assumption (in the doc comment): an account holds no storage while EIP-161 empty or after a
+  native resync to absent (true for EOAs; a contract is never empty). Verify: `rdeps(torus-state)`, 3229 passed.
 
 **Task 2.3: stale trie: marker, full-scan fallback, boot rebuild (F4)**
 - Test first: `evm_trie_step_failure_marks_stale_and_boot_rebuilds` and `stale_trie_routes_root_to_full_scan`.
@@ -718,6 +737,24 @@ branch). Golden green after every task.
 - F4b: a TrieStale Flush returns before `resync_evm`. Make it resync (as the Checkpoint) or set the stale marker;
   then flip `o0_trie_stale_flush_is_not_a_completion`'s pinned pre-resync row and let the hook fire for it.
 - Verify: `cargo nextest run -E 'rdeps(torus-bridge)' $F`.
+- **Done (s131, G2, `751cd9bf`).** Marker `META_EVM_TRIE_STALE` (`b"evm_trie_stale"`, CF_CONSENSUS_META, outside
+  `META_CONSENSUS_PREFIXES`: never hashed). `incremental::evm_window_prefix` (W's prefix): the step's batch; nothing
+  when already stale (a stale trie is never extended); the marker alone when the step fails. `evm_root_routed`: full
+  scan while stale (no `TrieUpdates`, no oracle). `ensure_trie_built` (boot, before replay): a stale trie is wiped (the
+  four CFs) and rebuilt EIP-161 clean, the marker cleared in the trie nodes' batch (a crash before it rebuilds again).
+  Also, as task 1.2 deferred here, the serial EVM section: an incremental trie-batch error marks the trie stale in the
+  block's prefix (was: logged, the trie silently lagging), a stale trie gets no trie batch, and the marker read
+  fail-stops (`ReplayFault::EvmTrieStaleRead`, test `o0_evm_trie_stale_marker_read_fault_fail_stops_block`). F4b:
+  "resync, as the Checkpoint" chosen. **Production behaviour change** (only with `TORUS_NATIVE_TRIE_MAINTENANCE=1`,
+  off by default): a TrieStale Flush on W now runs the EVM mirror resync and is a completion (hook fires). The pin test
+  is renamed `o0_trie_stale_flush_resyncs_and_is_a_completion`. E's serial flush keeps its fail-stop on that error.
+  Test placement: `evm_trie_step_failure_marks_stale_and_boot_rebuilds` in torus-state (on `evm_window_prefix` and
+  `ensure_trie_built`; the rebuilt mirror and trie are byte-equal to the maintained ones, with an EIP-161 empty row in
+  the plain state), `stale_trie_routes_root_to_full_scan` in torus-bridge (unmarked, the lagging trie trips the debug
+  oracle). Verify widened to `rdeps(torus-state)`: 3232 passed. Finding (unchanged code): `build_trie_to_cf`, the
+  first-boot build, mirrors EIP-161 empty accounts, which maintenance drops; harmless from a fresh genesis, but a first
+  build over a DB holding empty rows gives a trie whose root differs from the full-scan oracle
+  (`compute_post_bundle_evm_root` drops empties). The stale rebuild does not have this.
 
 **Task 2.4: job plumbing**
 - Code: `Job::Flush`, `Job::Digest` and `Job::Marker` gain `evm: Option<EvmJobRows { bundle, side }>`; `Job::Marker`
@@ -728,6 +765,19 @@ branch). Golden green after every task.
 - Test first: `marker_job_carries_action_status_to_checkpoint` and
   `marker_job_side_rows_land_at_interval_0_and_at_checkpoint` (an all-skipped block's hash -> number row is in the DB after its Marker at interval 0, and after the checkpoint
   with Every5, byte-equal to `commit_block_metadata`'s).
+- **Done (s131, G2, `7d01dce6`).** As planned, plus `EvmJobRows { bundle, side }` and `Job::into_digest` (the
+  Flush / Marker -> Digest conversion, now used by `pipeline_handoff`, which keeps the books fail-stop). W: a Flush
+  with `evm` runs the step for a window of one (final rows: sidecar, the frozen set, then the DB) into
+  `flush_on_worker_after_batch`, side rows into its sidecar; a Marker writes its status and side rows through a
+  sidecar of the marker batch (debug assert: no absorbed rows); a Digest stages them into `window.side` and folds a
+  non-empty bundle into `Window.evm`; a Checkpoint notes the window's `evm_addrs`, runs the window's step (final rows:
+  L, then the DB) into `flush_checkpoint_after_batch`. An empty bundle (all skipped) gets no trie step: today's
+  post-write resync covers its native credits. Both planned tests are W-level, through `Job::into_digest` (no E path
+  builds a Marker with status before step 3). Added `evm_jobs_flush_and_checkpoint_equal_serial`: 10 EVM blocks (one
+  all-skipped) as Flush jobs and as Digests closed by two Checkpoints equal today's serial pieces (trie-batch prefix +
+  links, `commit_block_metadata`, flush, resync) on every CF but header / body, root == full scan; a mutation emptying
+  W's prefix is caught. Open for step 3: W has no path counter (C13 needs one on the worker env); the EVM step's
+  panic seam for task 3.5 is not built; E's debug assert on the Marker (3.3) is not built (W has one).
 
 Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and its tests).
 
