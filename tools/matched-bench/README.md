@@ -745,8 +745,13 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   `InlineSequenceTest` runs both bodies from one spec against tracing fakes and compares the
   step traces). Genesis reuse is the one in-line difference: `GENESIS_CACHE_DIR`.
   The other in-line steps read none (marketchk: `cell.markets`; warm-up gate and cell_step:
-  validity, agreement, liveness, headline, crash, binaries). Opt out by hand with
-  `harness_env` `"DEFER_REPORT_SCANS": "0"`. Preflight has the frozen `cell_step.py`
+  validity, agreement, liveness, headline, crash, binaries). The preflight decision is
+  run-cell.sh's only `DEFER_REPORT_SCANS`: `cell()` puts `DEFER_REPORT_SCANS=0|1` after the
+  arm's harness env on run-cell.sh's env line, so no arm, spec or inherited value overrides it
+  (Codex round 6: an arm's `"DEFER_REPORT_SCANS": "1"` deferred the scans an in-line
+  campaign's expectation read), and make-driver.py refuses it (and `GENESIS_CACHE_DIR`) in
+  `harness_env`, `node_env` and every arm's `env` / `harness_env` (SPEC ERROR); run-cell.sh
+  refuses either in `EXTRA_ENV`. Preflight has the frozen `cell_step.py`
   (`analysis-words`, run_analysis's own split and fill) split `analysis.cmd` and fill its
   placeholders (`{run}` `{prefix}` `{cell}` `{label}` `{tag}` `{arm}` `{out}`) for every cell
   it can run (each planned cell and its `-rerun`; smoke: the smoke cell under `$RUN/smoke`),
@@ -765,12 +770,24 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   `NATIVE_AVAIL`, `EVM_WEI`, jq's version); an entry for the key (`<key>.genesis`, md5
   re-checked on the copy) replaces the generator and its jq passes (~50-60 s per 1M-account
   cell): run.log `genesis reused (key K, md5 M)`, else `genesis built (key K, md5 M); cached
-  in ...`. A corrupt entry (md5 mismatch) is rebuilt. `FORCE=1` in `harness_env`: only an
+  in ...`. A reused cell's run.log still has every genesis line a built cell's has, in the
+  same form, so checks and spec expectations written for the build path pass unchanged
+  (ozarchy 8p's `^  state_hash_activation = "?off"?$`): the `generating N-market 3-val
+  genesis -> G` line, then the generator's output as it prints it for this cell
+  (`reusing existing <MAINREPO>/testnet/genesis-weighted-full.json (BULK_COUNT=N)`, or under
+  `FORCE=1` the entry's weighted-full rebuild lines; `wrote G`; its summary block
+  `  timeout_ms = ...` .. `  perm_stakes= ...`, kept verbatim in the entry), then the reuse
+  line. `test_genesis_reuse_lines.py` runs the real generator, the pre-reuse run-cell.sh
+  (0f2ca85b^) and a built and a reused cell per genesis configuration and compares the
+  genesis section, the run.log expectations of the archived and testdata specs and the
+  archived campaign scripts' genesis checks. A corrupt entry (md5 mismatch) or one without
+  the generator output (older tools) is rebuilt. `FORCE=1` in `harness_env`: only an
   entry a `FORCE=1` cell built is reused, so the campaign's first cell rebuilds the
   weighted-full genesis as before and later cells reuse that build. Data dirs stay fresh per
   cell. The cache keeps one ~290 MB file per distinct key at 1M accounts (delete
-  `$RUN/genesis-cache/*.genesis` after the campaign if the space matters); opt out with
-  `harness_env` `"GENESIS_CACHE_DIR": ""`. `PREFLIGHT OK` shows `end_pass=1 genesis_reuse=1`;
+  `$RUN/genesis-cache/*.genesis` after the campaign if the space matters). The driver owns
+  `GENESIS_CACHE_DIR` (set after the arm's harness env; empty without genesis reuse): a spec
+  cannot set it. `PREFLIGHT OK` shows `end_pass=1 genesis_reuse=1`;
   an older frozen run-cell.sh without them runs as before (`=0`).
 - **Samplers** (spec `samplers`, default `true`): `data-du-samples.txt` (data dir sizes,
   MemAvailable, /dev/shm; 2 s), `ckpt-samples.txt` (each node's checkpoint and reject metrics;

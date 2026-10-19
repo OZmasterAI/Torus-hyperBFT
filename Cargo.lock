@@ -6998,6 +6998,7 @@ dependencies = [
  "sha3",
  "tempfile",
  "thiserror 2.0.18",
+ "tikv-jemallocator",
  "torus-economics",
  "torus-state",
  "torus-types",

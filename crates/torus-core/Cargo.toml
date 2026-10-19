@@ -27,6 +27,14 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# 8k L3.3 microbench (`benches/book_encode.rs`): the node's allocator.
+tikv-jemallocator = { version = "0.7" }
+
 [[bench]]
 name = "order_book"
+harness = false
+
+[[bench]]
+name = "book_encode"
 harness = false
