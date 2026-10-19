@@ -745,8 +745,13 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   `InlineSequenceTest` runs both bodies from one spec against tracing fakes and compares the
   step traces). Genesis reuse is the one in-line difference: `GENESIS_CACHE_DIR`.
   The other in-line steps read none (marketchk: `cell.markets`; warm-up gate and cell_step:
-  validity, agreement, liveness, headline, crash, binaries). Opt out by hand with
-  `harness_env` `"DEFER_REPORT_SCANS": "0"`. Preflight has the frozen `cell_step.py`
+  validity, agreement, liveness, headline, crash, binaries). The preflight decision is
+  run-cell.sh's only `DEFER_REPORT_SCANS`: `cell()` puts `DEFER_REPORT_SCANS=0|1` after the
+  arm's harness env on run-cell.sh's env line, so no arm, spec or inherited value overrides it
+  (Codex round 6: an arm's `"DEFER_REPORT_SCANS": "1"` deferred the scans an in-line
+  campaign's expectation read), and make-driver.py refuses it (and `GENESIS_CACHE_DIR`) in
+  `harness_env`, `node_env` and every arm's `env` / `harness_env` (SPEC ERROR); run-cell.sh
+  refuses either in `EXTRA_ENV`. Preflight has the frozen `cell_step.py`
   (`analysis-words`, run_analysis's own split and fill) split `analysis.cmd` and fill its
   placeholders (`{run}` `{prefix}` `{cell}` `{label}` `{tag}` `{arm}` `{out}`) for every cell
   it can run (each planned cell and its `-rerun`; smoke: the smoke cell under `$RUN/smoke`),
@@ -769,8 +774,9 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   entry a `FORCE=1` cell built is reused, so the campaign's first cell rebuilds the
   weighted-full genesis as before and later cells reuse that build. Data dirs stay fresh per
   cell. The cache keeps one ~290 MB file per distinct key at 1M accounts (delete
-  `$RUN/genesis-cache/*.genesis` after the campaign if the space matters); opt out with
-  `harness_env` `"GENESIS_CACHE_DIR": ""`. `PREFLIGHT OK` shows `end_pass=1 genesis_reuse=1`;
+  `$RUN/genesis-cache/*.genesis` after the campaign if the space matters). The driver owns
+  `GENESIS_CACHE_DIR` (set after the arm's harness env; empty without genesis reuse): a spec
+  cannot set it. `PREFLIGHT OK` shows `end_pass=1 genesis_reuse=1`;
   an older frozen run-cell.sh without them runs as before (`=0`).
 - **Samplers** (spec `samplers`, default `true`): `data-du-samples.txt` (data dir sizes,
   MemAvailable, /dev/shm; 2 s), `ckpt-samples.txt` (each node's checkpoint and reject metrics;

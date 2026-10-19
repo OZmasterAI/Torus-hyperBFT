@@ -88,6 +88,12 @@ RESERVED_HARNESS = {
     "EXPECT_BENCH_MD5",
     "BENCH_ALLOW_UNDETACHED",
 }
+# set by the driver from its preflight (preflight_post), after every spec / arm / harness env on run-cell.sh's env
+# line, in both directions: DEFER_REPORT_SCANS = DEFER_SCANS (in-line 0, deferred 1), GENESIS_CACHE_DIR = the run's
+# genesis cache or empty (Codex round 6 on bb2a727f: an arm's DEFER_REPORT_SCANS=1 deferred the scans an in-line
+# campaign's expectation read). Refused in every env object: harness env (the driver's value wins anyway) and node
+# env (run-cell.sh's EXTRA_ENV, exported mid-run, would overwrite run-cell.sh's own; run-cell.sh refuses it too)
+DRIVER_OWNED = {"DEFER_REPORT_SCANS", "GENESIS_CACHE_DIR"}
 # every name the generated config assigns (render() unsets them first; driver-body.sh DRIVER_VARS lists them)
 CONFIG_VARS = (
     "CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_BUSY_PCT NODES BASELINE BDIR BMD5 BBMD5 BWRAP ABIN AENV AXE"
@@ -166,6 +172,11 @@ def env_obj(d, where, harness=False):
             not BAD_VALUE_RE.search(v),
             "%s: %s=%r: no whitespace, quotes, backslash or $ in values"
             % (where, k, v),
+        )
+        need(
+            k not in DRIVER_OWNED,
+            "%s: %s is set by the driver from its preflight (report scans in-line or deferred, genesis reuse),"
+            " after every spec and arm env: drop the key" % (where, k),
         )
         if harness:
             need(

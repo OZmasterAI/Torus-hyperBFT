@@ -4234,6 +4234,22 @@ class EvmBlockIntervalKnobTest(unittest.TestCase):
                 self.assertEqual(self.generator_saw(), [])
                 self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
 
+    def test_harness_vars_in_extra_env_fail_preflight(self):
+        """Codex round 6: EXTRA_ENV is exported mid-run (after the RECORD_ENV), so a
+        DEFER_REPORT_SCANS in it overwrote the harness's own value before the report
+        scans read it; GENESIS_CACHE_DIR there is read by nothing but the nodes. Both
+        are harness variables (the campaign driver sets them from its preflight):
+        refused before anything runs"""
+        for kv in ("DEFER_REPORT_SCANS=1", "DEFER_REPORT_SCANS=0", "GENESIS_CACHE_DIR=/x"):
+            with self.subTest(kv=kv):
+                r, _ = self.run_cell("TORUS_X=1 " + kv)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn(
+                    "FATAL: %s in EXTRA_ENV (the node env)" % kv.split("=")[0], r.stderr
+                )
+                self.assertEqual(self.generator_saw(), [])
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "results")))
+
     def test_n_is_the_evm_loads_cadence_and_is_recorded_in_the_summary(self):
         with open(RUN_CELL_SH) as f:
             src = f.read()

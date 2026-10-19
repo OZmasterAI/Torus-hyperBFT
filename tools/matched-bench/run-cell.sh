@@ -662,6 +662,9 @@ done
 # The post-cell node-log scans (in-line, or report-only ones deferred to the campaign end pass) and the genesis
 # cache are this script's own helpers (SELF_DIR, like evm_load.py / preload.py), never a candidate's copy.
 case "$DEFER_REPORT_SCANS" in 0|1) ;; *) echo "FATAL: DEFER_REPORT_SCANS must be 0 or 1 (got '$DEFER_REPORT_SCANS')" >&2; exit 2 ;; esac
+# EXTRA_ENV is exported mid-run: there a harness variable would overwrite this script's own (DEFER_REPORT_SCANS
+# before the report scans read it; GENESIS_CACHE_DIR reaches only the nodes). Set them in run-cell.sh's env.
+for kv in $EXTRA_ENV; do case $kv in DEFER_REPORT_SCANS=*|GENESIS_CACHE_DIR=*) echo "FATAL: ${kv%%=*} in EXTRA_ENV (the node env): a run-cell.sh variable, set it in run-cell.sh's own env (the campaign driver sets it from its preflight)" >&2; exit 2 ;; esac; done
 # shellcheck source=log-scans.sh
 . "$SELF_DIR/log-scans.sh" 2>/dev/null || { echo "FATAL: $SELF_DIR/log-scans.sh missing (copy it beside run-cell.sh)" >&2; exit 1; }
 [ -z "$GENESIS_CACHE_DIR" ] || [ -f "$SELF_DIR/genesis_cache.py" ] \

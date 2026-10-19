@@ -38,8 +38,10 @@
 # soakchk in cell(), before run_spec's cell_step, whose analysis may read their lines) and end_pass does nothing.
 # Genesis reuse: each cell gets GENESIS_CACHE_DIR=$RUN/genesis-cache (run-cell.sh: an unchanged genesis key reuses
 # the cached genesis, "genesis reused (key ..., md5 ...)"). Both need a run-cell.sh that has them (preflight_post;
-# an older frozen copy runs as before). Opt out per arm or spec-wide with harness_env DEFER_REPORT_SCANS=0 /
-# GENESIS_CACHE_DIR="" (the arm's harness env comes after the driver's on run-cell.sh's env line).
+# an older frozen copy runs as before). The driver owns both variables (Codex round 6): cell() sets
+# DEFER_REPORT_SCANS=$DEFER_SCANS and GENESIS_CACHE_DIR (the cache or empty) after the arm's harness env on
+# run-cell.sh's env line, so no arm, spec or inherited value overrides the preflight; make-driver.py refuses them in
+# every spec env object (harness and node env).
 # Test-only overrides: DRIVER_PROC (a fake /proc: node exe/environ, meminfo), DRIVER_DETACH (a fake detach.sh).
 set -u
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -612,9 +614,11 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     # OVERWRITE=1 (as Job 4): sysctl.txt and the samplers' files are in the cell dir before run-cell.sh, which refuses
     # a non-empty dir without it; this function refused an existing cell dir above (the spec may only repeat it)
     E=(TARGET_DIR="${BDIR[$b]}" TOOLS_DIR="$TOOLS" DATA_ROOT="$DEVNET" RESULTS_ROOT="$R" OVERWRITE=1)
-    [ "$DEFER_SCANS" != 1 ] || E+=(DEFER_REPORT_SCANS=1)
-    [ "$GENESIS_REUSE" != 1 ] || E+=(GENESIS_CACHE_DIR="$RUN/genesis-cache")
-    for kv in ${AHENV[$arm]}; do E+=("$kv"); done   # after those two (an arm may opt out: DEFER_REPORT_SCANS=0 ...)
+    for kv in ${AHENV[$arm]}; do E+=("$kv"); done
+    # driver-owned, after the arm's harness env (env: the last one wins) and over any inherited value: the
+    # preflight decision is run-cell.sh's only source of these two, both ways (make-driver.py refuses them in a spec)
+    E+=(DEFER_REPORT_SCANS="$DEFER_SCANS")
+    if [ "$GENESIS_REUSE" = 1 ]; then E+=(GENESIS_CACHE_DIR="$RUN/genesis-cache"); else E+=(GENESIS_CACHE_DIR=); fi
     [ "${BWRAP[$b]}" = 1 ] || E+=(EXPECT_NODE_MD5="${BMD5[$b]}")
     [ -z "${BBMD5[$b]}" ] || E+=(EXPECT_BENCH_MD5="${BBMD5[$b]}")
     "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
