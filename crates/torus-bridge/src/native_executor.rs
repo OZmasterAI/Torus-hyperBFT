@@ -3443,7 +3443,11 @@ impl DeferredBookSave {
 /// row bytes MOVE into the pending set). Returns the root-CF write count (same
 /// meaning as `save_order_books`'s return). `state`'s reads (stop-row diff,
 /// meta compare) must see the durable post-state of every height below this
-/// block — the flush worker's view, since it flushes strictly in order.
+/// block — the flush worker's view, since it flushes strictly in order. That
+/// holds only with the per-block flush: with a checkpoint interval the DB
+/// lags to the last checkpoint, so the exec pipeline then runs the whole
+/// `save_order_books` on the exec thread instead (b0,
+/// `docs/plans/deep-book-save-options.md` section 4).
 /// R02 branch 7: the first failed write (or stop-row scan) is the `Err`; the
 /// flush worker then fails the job (fail-stop: nothing of the block lands).
 pub fn apply_deferred_book_save<T: StateBackend>(
@@ -7343,7 +7347,9 @@ impl<T: StateBackend> NativeExecContext<T> {
     /// the meta bytes; they are captured HERE (block N's post-state) because by
     /// the time the flush worker runs, block N+1's engine is already mutating
     /// the books. The stop-row diff and the meta compare themselves move to the
-    /// worker, whose read view (heights < N durable) matches what this thread
+    /// worker, whose read view (heights < N durable: per-block flush only;
+    /// with checkpoints the caller runs `save_order_books` instead, b0)
+    /// matches what this thread
     /// would have read through the overlay (E writes no book-CF key before the
     /// save, so the overlay contributes nothing to those reads).
     pub fn save_order_books_deferred(&mut self) -> Option<DeferredBookSave> {
