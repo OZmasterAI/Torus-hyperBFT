@@ -3150,7 +3150,8 @@ class PreflightPostTest(Base):
                 self.assertIn("end_pass=0 genesis_reuse=1", out)
         rc, out = self.dry(
             minimal_spec(
-                self.tmp, expect=[{"file": "agreement.jsonl", "regex": "agree", "min": 0}]
+                self.tmp,
+                expect=[{"file": "agreement.jsonl", "regex": "agree", "min": 0}],
             )
         )
         self.assertIn("end_pass=1", out)
@@ -3262,7 +3263,9 @@ class DeferredReadersTest(Base):
         for f in ("val0.log.excerpt", "deferred-scans.json"):
             with self.subTest(f=f):
                 self.assertInline(
-                    minimal_spec(self.tmp, expect=[{"file": f, "regex": "x", "min": 0}]),
+                    minimal_spec(
+                        self.tmp, expect=[{"file": f, "regex": "x", "min": 0}]
+                    ),
                     "on %s" % f,
                 )
 
@@ -3328,10 +3331,13 @@ class DeferredReadersTest(Base):
     def test_any_analysis_cmd_keeps_them_in_line(self):
         a = os.path.join(self.tmp, "a-cells.py")
         with open(a, "w") as fh:
-            fh.write('import json, sys\ns = json.load(open(sys.argv[1]))\nh = s["headline"]\n')
+            fh.write(
+                'import json, sys\ns = json.load(open(sys.argv[1]))\nh = s["headline"]\n'
+            )
         for cmd in (
             "python3 -I %s {out} {prefix} {tag}:{arm}" % a,
-            'python3 -I "%s" {out} {cell} {tag}' % a,  # Codex P2 on bcc95fab: quotes hid the script
+            'python3 -I "%s" {out} {cell} {tag}'
+            % a,  # Codex P2 on bcc95fab: quotes hid the script
             "python3 -I -c 'import sys' {out}",  # no script file at all
         ):
             with self.subTest(cmd=cmd):
@@ -3351,11 +3357,17 @@ class DeferredReadersTest(Base):
         os.makedirs(os.path.dirname(a))
         with open(a, "w") as fh:
             fh.write("import sys\n")
-        rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s" {out}' % a}))
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s" {out}' % a})
+        )
         self.assertEqual(rc, 0, out)
-        rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s {out}' % a}))
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s {out}' % a})
+        )
         self.assertEqual(rc, 1, out)
-        self.assertIn("PREFLIGHT FAIL: analysis.cmd cannot be split as cell_step runs it", out)
+        self.assertIn(
+            "PREFLIGHT FAIL: analysis.cmd cannot be split as cell_step runs it", out
+        )
 
     def test_quoted_analysis_probe_reads_filled_counts(self):
         """the bcc95fab review's analysis probe end to end: a quoted script path keeps the scans in-line, so the
@@ -3397,6 +3409,295 @@ class DeferredReadersTest(Base):
         self.assertEqual(rc, 0, out)
         self.assertIn("end_pass=0 genesis_reuse=0", out)
         self.assertIn("PREFLIGHT NOTE: report scans: in-line because ", out)
+
+
+class AnalysisPlaceholderPreflightTest(Base):
+    """preflight's missing-script check sees analysis.cmd as cell_step runs it (Codex P2 on 9f30ce12: a quoted
+    "{run}/analysis.py" failed preflight although the script existed after expansion). The frozen tools copy's
+    cell_step.py fills the words (analysis-words: run_analysis's own placeholders and fill) for every cell the
+    campaign can run (each planned cell and its -rerun; dry smoke: the smoke cell), and a */*.py or */*.sh word
+    that is no file is a PREFLIGHT FAIL naming the filled path. An older cell_step.py without analysis-words: a
+    word with a placeholder is not checked (one PREFLIGHT NOTE names it), the other words still are."""
+
+    SCRIPTS = {  # each placeholder cell_step fills -> a script path built from it
+        "run": "{run}/an.py",
+        "prefix": "{prefix}an.py",
+        "cell": "{cell}.an.py",
+        "label": "{run}/an-{label}.py",
+        "tag": "{run}/an-{tag}.sh",
+        "arm": "{run}/an-{arm}.py",
+        "out": "{out}.py",
+    }
+
+    def dry(self, spec, smoke=False):
+        drv = self.generate(self.write_spec(spec))
+        r = subprocess.run(
+            [drv, "dry"] + (["smoke"] if smoke else []),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return r.returncode, r.stdout + r.stderr
+
+    def filled(self, spec, tpl, smoke=False):
+        """tpl filled for each cell cell_step can run, in order (the cells, then their reruns), computed here
+        from the plan and cell_step's documented placeholders, not by cell_step"""
+        drv = self.generate(self.write_spec(spec, "plan.json"), "plan.sh")
+        cells = [
+            tuple(l.split()[1:3])
+            for l in self.plan(drv, smoke)
+            if l.startswith("CELL ")
+        ]
+        if not smoke:
+            cells += [(t + "-rerun", a) for t, a in cells]
+        run = spec["run_dir"] + ("/smoke" if smoke else "")
+        p = spec["label_prefix"] + ("-smoke" if smoke else "")
+        out = []
+        for tag, arm in cells:
+            label = "%s-%s" % (p, tag)
+            cell = os.path.normpath(os.path.join(spec["results_root"], label))
+            ph = {
+                "out": os.path.join(run, "cell-step", label + ".analysis.json"),
+                "prefix": cell[: -len(tag)],
+                "tag": tag,
+                "arm": arm,
+                "label": label,
+                "cell": cell,
+                "run": os.path.normpath(run),
+            }
+            s = tpl
+            for k, v in ph.items():
+                s = s.replace("{%s}" % k, v)
+            if s not in out:
+                out.append(s)
+        return out
+
+    def touch(self, paths):
+        for f in paths:
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w") as fh:
+                fh.write("import sys\n")
+
+    def unlink(self, paths):
+        for f in paths:
+            if os.path.exists(f):
+                os.remove(f)
+
+    def assertMissing(self, out, paths):
+        self.assertNotIn("PREFLIGHT FAIL: analysis script {", out)
+        self.assertTrue(
+            any("PREFLIGHT FAIL: analysis script %s missing" % f in out for f in paths),
+            "no PREFLIGHT FAIL names one of %s:\n%s" % (paths, out),
+        )
+
+    def test_every_placeholder_is_filled_before_the_check(self):
+        for ph, tpl in self.SCRIPTS.items():
+            for word in ('"%s"' % tpl, tpl, "'%s'" % tpl):
+                cmd = "python3 -I %s {out} {prefix} {tag}:{arm}" % word
+                spec = minimal_spec(self.tmp, analysis={"cmd": cmd})
+                paths = self.filled(spec, tpl)
+                with self.subTest(placeholder=ph, cmd=cmd):
+                    self.assertTrue(paths and all("{" not in f for f in paths), paths)
+                    rc, out = self.dry(spec)
+                    self.assertEqual(rc, 1, out)
+                    self.assertMissing(out, paths)
+                    if len(paths) > 1:  # per cell: only the last cell's rerun lacks it
+                        self.touch(paths[:-1])
+                        rc, out = self.dry(spec)
+                        self.assertEqual(rc, 1, out)
+                        self.assertIn(
+                            "PREFLIGHT FAIL: analysis script %s missing" % paths[-1],
+                            out,
+                        )
+                    self.touch(paths)
+                    rc, out = self.dry(spec)
+                    self.assertEqual(rc, 0, out)
+                    self.assertIn("PREFLIGHT OK (dry", out)
+                    self.unlink(paths)
+
+    def test_smoke_fills_the_smoke_run(self):
+        """dry smoke: RUN/smoke, P-smoke, the smoke cell, no rerun (as the smoke run's cell_step sees them)"""
+        for tpl in (self.SCRIPTS["run"], self.SCRIPTS["label"], self.SCRIPTS["cell"]):
+            spec = minimal_spec(
+                self.tmp, analysis={"cmd": 'python3 -I "%s" {out}' % tpl}
+            )
+            full, smoke = self.filled(spec, tpl), self.filled(spec, tpl, smoke=True)
+            with self.subTest(tpl=tpl):
+                self.assertEqual(len(smoke), 1, smoke)
+                self.assertNotIn(smoke[0], full)
+                self.touch(full)
+                rc, out = self.dry(spec, smoke=True)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(
+                    "PREFLIGHT FAIL: analysis script %s missing" % smoke[0], out
+                )
+                self.touch(smoke)
+                rc, out = self.dry(spec, smoke=True)
+                self.assertEqual(rc, 0, out)
+                self.unlink(full + smoke)
+
+    def test_review_probe_shape(self):
+        """the 9f30ce12 review probe: python3 -I "{run}/analysis.py" ... with the script in the run dir"""
+        spec = minimal_spec(
+            self.tmp,
+            analysis={"cmd": 'python3 -I "{run}/analysis.py" {out} {cell} {tag}'},
+        )
+        self.touch([os.path.join(spec["run_dir"], "analysis.py")])
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+
+    def archived_cmds(self):
+        """every analysis command shape in the archived campaigns and specs: CELL_STEP_ANALYSIS_CMD="..." in the
+        hand-written drivers, analysis.cmd in the JSON specs"""
+        arch = os.path.join(
+            os.path.dirname(os.path.dirname(HERE)), "docs", "perf", "bench-archive"
+        )
+        cmds, files = [], []
+        for pat in ("*.sh", "*.py", "*.json"):
+            files += glob.glob(os.path.join(FIX, pat))
+            files += glob.glob(os.path.join(arch, "**", pat), recursive=True)
+        files.append(EXAMPLE)
+        for f in sorted(set(files)):
+            txt = open(f, errors="replace").read()
+            found = re.findall(r'CELL_STEP_ANALYSIS_CMD="([^"]*)"', txt)
+            if f.endswith(".json"):
+                try:
+                    an = json.loads(txt).get("analysis") or {}
+                except (ValueError, AttributeError):
+                    an = {}
+                found += [an["cmd"]] if an.get("cmd") else []
+            cmds += [(f, c) for c in found]
+        return cmds
+
+    def test_archived_command_shapes(self):
+        """the archived shapes (python3 -I $ANALYST/a-cells.py {out} {prefix} {tag}:{arm}, the example spec's
+        absolute path) pass with the script and fail without it, as before 9f30ce12 (bash word split, which
+        checked their unquoted absolute script word the same way)"""
+        cmds = self.archived_cmds()
+        self.assertGreaterEqual(len(cmds), 5, cmds)
+        analyst = os.path.join(self.tmp, "analyst")
+        seen = set()
+        for f, raw in cmds:
+            cmd = raw.replace("$ANALYST", analyst)
+            for w in shlex.split(cmd):
+                if re.match(r".*/.*\.(py|sh)$", w):
+                    cmd = cmd.replace(w, os.path.join(analyst, os.path.basename(w)))
+            if cmd in seen:
+                continue
+            seen.add(cmd)
+            scripts = [
+                w for w in cmd.split() if re.match(r".*/.*\.(py|sh)$", w)
+            ]  # the pre-9f30ce12 check: bash word split, */*.py|*/*.sh
+            self.assertTrue(scripts, (f, raw))
+            spec = minimal_spec(self.tmp, analysis={"cmd": cmd})
+            with self.subTest(source=f, cmd=raw):
+                rc, out = self.dry(spec)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(
+                    "PREFLIGHT FAIL: analysis script %s missing" % scripts[0], out
+                )
+                self.touch(scripts)
+                rc, out = self.dry(spec)
+                self.assertEqual(rc, 0, out)
+                self.unlink(scripts)
+
+    def test_words_are_cell_steps_argv(self):
+        """analysis-words prints the argv run_analysis runs (its own placeholders and fill): compared with the
+        command line run_analysis logs, every placeholder, a quoted word with a space"""
+        sys.path.insert(0, HERE)
+        import cell_step
+
+        run = os.path.join(self.tmp, "run") + "/"
+        cell = os.path.join(self.tmp, "res", "pfx-r1-A")
+        step = os.path.join(run, "cell-step")
+        os.makedirs(step)
+        cmd = (
+            "python3 -I -c 'import sys' {out} {prefix} {tag}:{arm} {label} {cell} {run} "
+            "'{run}/x y.py' plain"
+        )
+        a = types.SimpleNamespace(
+            label="pfx-r1-A",
+            tag="r1-A",
+            arm="A",
+            run_dir=run,
+            analysis_cmd=cmd,
+            analysis_timeout=30,
+            analysis_key="{tag}",
+            analysis_metric="",
+        )
+        cell_step.run_analysis(a, cell, step)
+        with open(os.path.join(step, "pfx-r1-A.analysis.log")) as fh:
+            logged = shlex.split(fh.readline()[2:])
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                os.path.join(HERE, "cell_step.py"),
+                "analysis-words",
+                "--run-dir",
+                run,
+                "--analysis-cmd",
+                cmd,
+                "--cell",
+                cell,
+                "pfx-r1-A",
+                "r1-A",
+                "A",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.split("\0")[:-1], logged)
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                os.path.join(HERE, "cell_step.py"),
+                "analysis-words",
+                "--run-dir",
+                run,
+                "--analysis-cmd",
+                "python3 'x",
+                "--cell",
+                cell,
+                "pfx-r1-A",
+                "r1-A",
+                "A",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual((r.returncode, r.stdout), (1, ""), r.stderr)
+        self.assertIn("cannot parse the analysis command", r.stderr)
+
+    def test_older_cell_step_skips_placeholder_words(self):
+        """a frozen cell_step.py without analysis-words: a word with a placeholder is not checked (PREFLIGHT
+        NOTE), a plain missing script still fails"""
+        spec = minimal_spec(self.tmp)
+        with open(os.path.join(spec["tools_dir"], "cell_step.py"), "w") as fh:
+            fh.write("# an older cell_step.py: record and pending-reruns only\n")
+        cmd = 'python3 -I "{run}/analysis.py" {out} {tag}'
+        rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": cmd}))
+        self.assertEqual(rc, 0, out)
+        self.assertIn(
+            "PREFLIGHT NOTE: analysis script {run}/analysis.py not checked", out
+        )
+        a = os.path.join(self.tmp, "nope", "a.py")
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": "python3 -I %s {out}" % a})
+        )
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PREFLIGHT FAIL: analysis script %s missing" % a, out)
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": "python3 -I '%s {out}" % a})
+        )
+        self.assertEqual(rc, 1, out)
+        self.assertIn(
+            "PREFLIGHT FAIL: analysis.cmd cannot be split as cell_step runs it", out
+        )
 
 
 class EndPassRunTest(FakeHostBase):

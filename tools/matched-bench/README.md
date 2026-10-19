@@ -739,10 +739,15 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   or `PREFLIGHT NOTE: report scans: in-line because <readers> ...` line records the decision.
   The other in-line steps read none (marketchk: `cell.markets`; warm-up gate and cell_step:
   validity, agreement, liveness, headline, crash, binaries). Opt out by hand with
-  `harness_env` `"DEFER_REPORT_SCANS": "0"`. Preflight splits `analysis.cmd` as cell_step
-  runs it (`shlex.split`; a quoted path is a path) to check that its `*.py` / `*.sh`
-  scripts exist (`PREFLIGHT FAIL: analysis script ... missing`; a command that does not
-  split fails preflight too).
+  `harness_env` `"DEFER_REPORT_SCANS": "0"`. Preflight has the frozen `cell_step.py`
+  (`analysis-words`, run_analysis's own split and fill) split `analysis.cmd` and fill its
+  placeholders (`{run}` `{prefix}` `{cell}` `{label}` `{tag}` `{arm}` `{out}`) for every cell
+  it can run (each planned cell and its `-rerun`; smoke: the smoke cell under `$RUN/smoke`),
+  then checks that each `*.py` / `*.sh` word exists (`PREFLIGHT FAIL: analysis script
+  <filled path> missing`; a quoted path is a path; a command that does not split fails
+  preflight too). An older frozen `cell_step.py` without `analysis-words`: the command is only
+  split, and a script word holding a placeholder is not checked (`PREFLIGHT NOTE: analysis
+  script ... not checked`).
 - **Genesis reuse**: every cell runs with `GENESIS_CACHE_DIR=$RUN/genesis-cache`. run-cell.sh
   keys every genesis input (`genesis_cache.py`: the generator scripts and their data incl.
   the weighted-full base genesis and its params sidecar, run-cell.sh, `MARKETS`,
