@@ -396,6 +396,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    other heights (the q5-gaps view), `torus_exec_evm_seconds` per EVM block, matched/s, CPU-s per 1M. If the SHAs line is
    not here when 8i ends, pull main every 30 min and start as soon as it appears.
    **SHAs:** not yet (G1b in progress).
+8k. **Explore workflow: new high-gain ideas, build and bench the best** (owner s131; after 8j; Phases 1-3 may run
+   while 8j waits for its SHAs; ~a day, bench time <= ~4 h). Run the prompt in `docs/perf/8k-explore-workflow.md` as one
+   multi-agent workflow (owner opt-in given): survey what is already explored, fan-out ideation (consensus, execution,
+   storage, network / DA, crypto, wildcard incl. theoretical), adversarial review and ranking, build the top 1-2 on
+   `exp/8k-<name>` behind a flag (tests first, microbench gate), A/B n = 3 under the exec-path merge rule, write-up.
+   Never merges to main; keeps off item 7 option 0's and RH4's code.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
