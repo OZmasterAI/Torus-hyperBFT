@@ -482,6 +482,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    exec-thread on-CPU per 1k fills; also report matched/s, native blocks/s, p50 / p99, RSS, data-dir size, boot time
    on the 1M genesis. Question: which mode should the testnet genesis use? A winner gets a longer A/B before any
    default or genesis change.
+   **Done s68 (ozarchy-8m, one binary main `898213e5`, node `0d24371e` (= the `0f5bef38` node: no crate change), smoke
+   M3 60 s, w1 C 120 s, then C M3 M1 CD M2 C_P0 M1_P0, 300 s, n = 1; perf doc section 99).**
+   * Validity: all 9 cells ACCEPT / AGREE / PASS, md5 27 / 27, 0 CHECK FAIL, no swap growth. Book mode took effect
+     in every cell (`k8bmchk`: environ, checkpoint vs deferred-save lines, dirty book entries per block, row / level
+     counters, level-cache gauges; CD `defer_books=true`). Modes 2 AND 3 both run without checkpoints (per-block
+     flush).
+   * P1M, C -> M3: save_books 65.70 -> 4.93 ms per block (0.996 -> 0.228 per 1k fills, + a 12.51 ms write half on
+     W), exec-thread on-CPU 3.419 -> 2.551 ms per 1k fills, matched/s 223,857 -> 238,445, p50 / p99 202 / 1,563 ->
+     34 / 836 ms, RSS mean 6,944 -> 4,360 MB. Costs: W per 1k fills 0.378 -> 1.994, CPU-s per 1M fills 24.85 ->
+     29.33.
+   * P1M, the other arms: M2 is close to M3, a little worse. M1 0.709 per 1k fills, on-CPU 2.962. CD no gain
+     (save_books 66.73, on-CPU 3.727, 218,372 matched/s).
+   * P0, C_P0 -> M1_P0: save_books 0.212 -> 0.676 per 1k fills, on-CPU 2.652 -> 2.926, matched/s 265,863 -> 232,960.
+   * Screen verdict: mode 3 is the candidate. Mode 1 and defer-books drop out, mode 2 is superseded. Next: Classic vs
+     mode 3 A/B, n >= 3, deep and standard shape, judged also on CPU per fill and W busy.
+   * Inter-cell gaps 68-70 s.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
