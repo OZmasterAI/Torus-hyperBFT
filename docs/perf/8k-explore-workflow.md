@@ -32,11 +32,11 @@ Read and list every idea already tried, built, rejected or parked, with its verd
   profiles in sections 81, 90, 92, 93);
 - every file name and status line in `docs/plans/` and `docs/perf/` (designs, experiments `exp-*`, verdicts);
 - memory: `search_knowledge` with project torus-hyperbft, if the toolshed is available.
-- explored on 18c whose code is NOT on origin (treat as explored; the docs on main describe them): propose-defer on
-  the exec queue (`exp/s123-propose-defer-on-exec-queue`, `TORUS_PROPOSE_EXEC_WATERMARK`, campaign B, dropped s126;
+- explored on 18c, code pushed s131 as reference only (treat as explored; the docs on main describe them): propose-defer on
+  the exec queue (`exp/s123-propose-defer-on-exec-queue-v2`, `TORUS_PROPOSE_EXEC_WATERMARK`, campaign B, dropped s126;
   bench-queue "Done / dropped"); exec-aware mempool admission (`perf/exec-aware-admission`, parked WIP, uncompiled,
   unbenched; results doc and `docs/configuration-reference.md`); the chunked level-hash / book-digest line
-  (`perf/book-digest-3c`, hard fork judged not justified; `docs/design-level-rows-authority.md`,
+  (`perf/book-digest-3c` + `wip/book-digest-3c-stash`, hard fork judged not justified; `docs/design-level-rows-authority.md`,
   `docs/mission-handoff-layer3.md`). The docs on main are the authority; memory, where available, is a hint.
 Also profile-ground the baseline: what are the top exec-thread, consensus-thread and network costs today (cite
 sections). The list is the "already explored" filter for Phase 2.
