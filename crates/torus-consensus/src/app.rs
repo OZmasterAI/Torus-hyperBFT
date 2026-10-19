@@ -4987,13 +4987,20 @@ impl ExecutionContext {
                     }) {
                         self.test_path("evm.native_credit_same_block");
                     }
+                    // With an interval only (at interval 0 a window is one block).
                     let mut window = self.test_window_evm.lock().unwrap();
                     if evm_addrs.iter().any(|a| {
                         window.contains(a) && !test_bundle_rows.iter().any(|(b, _)| b == a)
                     }) {
                         self.test_path("evm.native_credit_in_window");
                     }
-                    window.extend(test_bundle_rows.iter().map(|(a, _)| *a));
+                    if self.checkpoint.is_some() {
+                        window.extend(test_bundle_rows.iter().map(|(a, _)| *a));
+                    }
+                    if evm_job.as_ref().is_some_and(|j| j.bundle.state.is_empty() && j.side.receipts.is_empty()) {
+                        // C11c: an all-skipped section with a native phase.
+                        self.test_path("handoff.flush.all_skipped_evm");
+                    }
                 }
                 drop(ctx);
                 let frozen = overlay.freeze(height);
@@ -31134,6 +31141,12 @@ mod crash_recovery_tests {
     ///   e + 1 runs. No read of an EIP-161 deletion can be in flight on
     ///   today's code. With the option 0 flag on, the deletion sits in the
     ///   parent / L / C at e + 1: task 3.6 flips this half to "in flight".
+    ///
+    /// Task 3.6 flips the next-block half for the flag-on nodes (G interval
+    /// 0, G Every5): e is pipelined, so the re-fund at e + 1 reads Z's
+    /// deletion from a layer in flight (the parent at interval 0, C or L
+    /// with Every5) at least once per configuration; the same-block half
+    /// stays (the block's own pending layer).
     #[test]
     fn o0_eip161_recreation_reads_by_layer() {
         use torus_state::probes::{Layer, Reader};
@@ -31143,6 +31156,8 @@ mod crash_recovery_tests {
             O0Cfg::serial(),
             O0Cfg::piped(P5Ckpt::PerBlock, O0Run::G),
             O0Cfg::piped(P5Ckpt::Every5, O0Run::G),
+            O0Cfg::piped(P5Ckpt::PerBlock, O0Run::G).fast(),
+            O0Cfg::piped(P5Ckpt::Every5, O0Run::G).fast(),
         ];
         let (blocks, fed) = (&blocks[..last as usize], &fed);
         let runs: Vec<_> = std::thread::scope(|s| {
@@ -31151,6 +31166,11 @@ mod crash_recovery_tests {
                 .map(|cfg| {
                     s.spawn(move || {
                         let mut node = O0Node::new(*cfg);
+                        // Flag on: every parent (interval 0) or checkpoint
+                        // (Every5) held, so e's job is in flight at e + 1.
+                        if let (true, Some(ctl)) = (cfg.evm_fast, &node.ctl) {
+                            ctl.every_parent.store(true, Ordering::SeqCst);
+                        }
                         for c in &fed.eip161 {
                             node.probe
                                 .watch(torus_state::cf::CF_ACCOUNTS, oracle_addr(c.seed).to_vec());
@@ -31167,6 +31187,7 @@ mod crash_recovery_tests {
                 .collect()
         });
         for (cfg, reads) in &runs {
+            let (mut inflight_next_block, mut frozen_next_block) = (0, 0);
             for c in &fed.eip161 {
                 let key = oracle_addr(c.seed).to_vec();
                 let at: Vec<_> = reads
@@ -31184,15 +31205,43 @@ mod crash_recovery_tests {
                         );
                         assert!(at.iter().all(|r| r.layer == Layer::Own), "{what}");
                     }
+                    O0Recreate::NextBlock if cfg.evm_fast => {
+                        // Flag on: the deletion is not durable at e + 1 when
+                        // W holds it; the first read of Z finds it absent
+                        // either way (a tombstone in a layer, or the DB).
+                        assert!(!first.found, "Z deleted: {what}");
+                        if first.layer.frozen() {
+                            frozen_next_block += 1;
+                            if first.inflight {
+                                inflight_next_block += 1;
+                            }
+                        }
+                    }
                     O0Recreate::NextBlock => {
                         assert_eq!(
                             (first.layer, first.found, first.inflight),
                             (Layer::Db, false, false),
-                            "today: the deletion is durable at e + 1: {what}"
+                            "flag off: the deletion is durable at e + 1: {what}"
                         );
                         assert!(!at.iter().any(|r| r.layer.frozen()), "{what}");
                     }
                 }
+            }
+            if cfg.evm_fast && cfg.ckpt == P5Ckpt::PerBlock {
+                assert!(
+                    inflight_next_block >= 1,
+                    "{cfg:?}: the re-fund at e + 1 reads Z's deletion in flight at least once"
+                );
+            } else if cfg.evm_fast {
+                // Every5: Z's fund (e - 3), drain and touch share one window,
+                // so until it lands the DB has no row of Z: the deletion in
+                // the frozen layer answers what the DB answers (absent), not
+                // in flight by R2's definition (a raw-DB reader reads the
+                // same). It is still the frozen layer that answers.
+                assert!(
+                    frozen_next_block >= 1,
+                    "{cfg:?}: the re-fund at e + 1 reads Z's deletion from a frozen layer"
+                );
             }
         }
         for (cfg, reads) in &runs {
@@ -31661,6 +31710,10 @@ mod crash_recovery_tests {
         interval: bool,
         st: std::sync::Mutex<O0CtlState>,
         fired: AtomicBool,
+        /// Item 7 option 0 (task 3.6): hold at EVERY chance, not a seeded
+        /// 2 in 3: at interval 0 every block's job until the next hand-off
+        /// (every parent in flight), with an interval every checkpoint.
+        every_parent: AtomicBool,
     }
 
     struct O0CtlState {
@@ -31688,6 +31741,7 @@ mod crash_recovery_tests {
                     releases: 0,
                 }),
                 fired: AtomicBool::new(false),
+                every_parent: AtomicBool::new(false),
             })
         }
 
@@ -31707,15 +31761,18 @@ mod crash_recovery_tests {
 
         fn pre_handoff(&self, h: u64) {
             let mut st = self.st.lock().unwrap();
+            let every = self.every_parent.load(Ordering::SeqCst);
             if st.held.is_some() {
                 if st.left > 0 {
                     st.left -= 1;
                     return;
                 }
                 self.release(&mut st);
-                return;
+                if !every {
+                    return;
+                }
             }
-            if !self.interval && st.rng.below(3) != 0 {
+            if !self.interval && (every || st.rng.below(3) != 0) {
                 self.hold(&mut st, h, 0);
             }
         }
@@ -31724,7 +31781,7 @@ mod crash_recovery_tests {
             let mut st = self.st.lock().unwrap();
             self.release(&mut st);
             if let (true, Some(h)) = (self.interval, checkpoint) {
-                if st.rng.below(3) != 0 {
+                if self.every_parent.load(Ordering::SeqCst) || st.rng.below(3) != 0 {
                     let left = 1 + st.rng.below(4);
                     self.hold(&mut st, h, left);
                 }
@@ -34278,11 +34335,40 @@ mod crash_recovery_tests {
         out
     }
 
-    /// Exploration helper: print the coverage of the flag-on configs.
+    /// `probe.<reader>.<layer>.<cf>.<field>` of a coverage map, summed over
+    /// the CFs (`cf` = `None`) or one CF.
+    fn o0_pv(c: &BTreeMap<String, u64>, reader: &str, layer: &str, cf: Option<&str>, field: &str) -> u64 {
+        let head = format!("probe.{reader}.{layer}.");
+        let tail = format!(".{field}");
+        c.iter()
+            .filter(|(k, _)| {
+                k.starts_with(&head)
+                    && k.ends_with(&tail)
+                    && cf.is_none_or(|cf| k[head.len()..k.len() - tail.len()] == *cf)
+            })
+            .map(|(_, v)| *v)
+            .sum()
+    }
+
+    /// Plan 5.2: the coverage floor. The 300-block stream, flag on, Classic,
+    /// at interval 0, Every5 and Never in D and G mode, and Every5 G with the
+    /// epoch flag off. Every row of section 5.2 the stream can reach is
+    /// counted >= 1 in each (configuration, run mode) that can reach it; the
+    /// table below says which, and why the others cannot. Rows the stream
+    /// cannot reach at all are forced elsewhere (named per row). Asserted
+    /// unreachable (a stale table or a wrong counter fails): D mode at
+    /// interval 0 counts no in-flight parent or C hit, D mode never reads
+    /// C, no block waits twice on the deferred part (C18), and no context
+    /// shared L / C or R (success criteria "R and L unshared"). The raw-DB
+    /// tripwire is armed over every fast-path EVM section and due-check: a
+    /// hit panics, so a finished run had 0.
     #[test]
-    #[ignore]
-    fn o0_coverage_report_fast_path() {
+    fn o0_coverage_floor_per_config() {
         let (blocks, _) = o0_blocks(300, O0_SEED);
+        let epoch_off = O0Cfg {
+            epoch_fast: false,
+            ..O0Cfg::piped(P5Ckpt::Every5, O0Run::G).fast()
+        };
         let cfgs = [
             O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast(),
             O0Cfg::piped(P5Ckpt::PerBlock, O0Run::G).fast(),
@@ -34290,16 +34376,372 @@ mod crash_recovery_tests {
             O0Cfg::piped(P5Ckpt::Every5, O0Run::G).fast(),
             O0Cfg::piped(P5Ckpt::Never, O0Run::D).fast(),
             O0Cfg::piped(P5Ckpt::Never, O0Run::G).fast(),
+            epoch_off,
         ];
         let nodes = o0_run(&blocks, &cfgs, &[]);
-        for node in &nodes {
-            println!("==== {:?} (layer_shared {}, rows_shared {})", node.cfg, node.layer_shared, node.rows_shared);
-            for (k, v) in o0_coverage(node) {
-                if v > 0 && !k.starts_with("probe.Native") && !k.starts_with("probe.Other") && !k.starts_with("probe.Test") {
-                    println!("  {k} = {v}");
+        type Metric = fn(&BTreeMap<String, u64>) -> u64;
+        type Reach = fn(&O0Cfg) -> bool;
+        let all: Reach = |_| true;
+        let g0: Reach = |c| c.ckpt == P5Ckpt::PerBlock && c.run == O0Run::G;
+        // A parent in flight: held at interval 0 (G), or any digested block.
+        let parent: Reach = |c| c.ckpt != P5Ckpt::PerBlock || c.run == O0Run::G;
+        let interval: Reach = |c| c.ckpt != P5Ckpt::PerBlock;
+        let every5_g: Reach = |c| c.ckpt == P5Ckpt::Every5 && c.run == O0Run::G;
+        let never: Reach = |c| c.ckpt == P5Ckpt::Never;
+        let g_interval: Reach = |c| c.ckpt != P5Ckpt::PerBlock && c.run == O0Run::G;
+        let epoch_on: Reach = |c| c.epoch_fast;
+        let epoch_off_r: Reach = |c| !c.epoch_fast;
+        let perblock: Reach = |c| c.ckpt == P5Ckpt::PerBlock;
+        let interval_epoch_on: Reach = |c| c.ckpt != P5Ckpt::PerBlock && c.epoch_fast;
+        let g_or_never: Reach = |c| c.run == O0Run::G || c.ckpt == P5Ckpt::Never;
+        let never_or_epoch_off: Reach = |c| c.ckpt == P5Ckpt::Never || !c.epoch_fast;
+        macro_rules! flag {
+            ($key:literal) => {
+                (|c: &BTreeMap<String, u64>| c.get($key).copied().unwrap_or(0)) as Metric
+            };
+        }
+        macro_rules! pv {
+            ($r:literal, $l:literal, $cf:expr, $f:literal) => {
+                (|c: &BTreeMap<String, u64>| o0_pv(c, $r, $l, $cf, $f)) as Metric
+            };
+        }
+        // (row, what, metric, reachable in). Unreachable cells, and why:
+        // - interval 0 has no L / C / deferred part and no window (C9 in
+        //   window, C11d, C13 checkpoint / drain, C18);
+        // - D mode drains W after each block: at interval 0 the parent is
+        //   durable (no in-flight parent), a checkpoint is durable before the
+        //   next block (no C read at all);
+        // - C (held checkpoint) in flight for revm / journal: only Every5 G:
+        //   Never checkpoints at attest / epoch heights, whose next EVM
+        //   height comes 5 blocks later, after the controller's release;
+        // - the drain's EVM step (C13) and a native credit to an earlier EVM
+        //   bundle of the window (C9): Every5 closes the window at each EVM
+        //   height on its grid, so an EVM bundle is closed by a barrier, or
+        //   followed by a credit in its window, only in Never or when epoch
+        //   barriers shift the windows (epoch flag off);
+        // - D mode with an interval: a checkpoint is durable before the next
+        //   block, so the due-check's parent row at a checkpoint height is
+        //   not in flight (C6: G mode or Never);
+        // - the epoch flag off makes the epoch boundaries (attest heights
+        //   among them) serial EVM heights: no fast-path EVM height at an
+        //   attest height (C10), and the journal's L reads of accounts and
+        //   balances fall on serial heights;
+        // - revm storage / journal positions / bbo / fee config in L: Never
+        //   only (the next touch of a row lands in a later Every5 window);
+        // - the stream never reaches: revm code in flight and storage at the
+        //   parent or C, journal markets / staking / queue rows in flight, the
+        //   lane read at the parent, the due-check false over a tombstone:
+        //   `o0_poison_readers_answer_from_every_layer` forces each from each
+        //   layer; C2 non-durable header:
+        //   `fast_path_evm_block_not_dispatch_durable_stays_serial`; C12:
+        //   task 3.4's tests; C15 (K-delayed after a checkpoint, the cap
+        //   spill) and C16's caught frame are stream inputs (`O0Fed` floors)
+        //   checked by the golden; C19: task 3.5's tests.
+        let table: Vec<(&str, &str, Metric, Reach)> = vec![
+            ("C1", "EVM height pipelined", flag!("block.pipelined.evm"), all),
+            ("C2", "flag on, serial: slash", flag!("evm.serial_flag_on.slash"), all),
+            ("C2", "flag on, serial: replay after restart", flag!("evm.serial_flag_on.no_worker"), all),
+            ("C2", "flag on, serial: epoch flag off", flag!("evm.serial_flag_on.epoch"), epoch_off_r),
+            ("C3", "revm accounts, parent in flight", pv!("Revm", "Parent", Some("cf_accounts"), "inflight"), parent),
+            ("C3", "revm accounts, L main in flight", pv!("Revm", "LMain", Some("cf_accounts"), "inflight"), interval),
+            ("C3", "revm accounts, C in flight", pv!("Revm", "Checkpoint", Some("cf_accounts"), "inflight"), every5_g),
+            ("C3", "revm storage, L main in flight", pv!("Revm", "LMain", Some("cf_storage"), "inflight"), never),
+            ("C3", "revm accounts from the DB", pv!("Revm", "Db", Some("cf_accounts"), "hits"), all),
+            ("C3", "revm storage from the DB", pv!("Revm", "Db", Some("cf_storage"), "hits"), all),
+            ("C3", "revm code from the DB", pv!("Revm", "Db", Some("cf_code"), "hits"), all),
+            ("C4", "journal oracle, parent in flight", pv!("Journal", "Parent", Some("cf_native_oracle"), "inflight"), parent),
+            ("C4", "journal accounts, L main in flight", pv!("Journal", "LMain", Some("cf_accounts"), "inflight"), interval_epoch_on),
+            ("C4", "journal balances, L deferred in flight", pv!("Journal", "LDeferred", Some("cf_native_balances"), "inflight"), interval_epoch_on),
+            ("C4", "journal positions, L deferred in flight", pv!("Journal", "LDeferred", Some("cf_native_positions"), "inflight"), never),
+            ("C4", "journal fee-config cursor, L main in flight", pv!("Journal", "LMain", Some("cf_fee_config"), "inflight"), never),
+            ("C4", "journal bbo, L main in flight", pv!("Journal", "LMain", Some("cf_native_bbo"), "inflight"), never),
+            ("C4", "journal fee-config cursor, C in flight", pv!("Journal", "Checkpoint", Some("cf_fee_config"), "inflight"), every5_g),
+            ("C4", "journal from the DB", pv!("Journal", "Db", None, "hits"), all),
+            ("C4", "journal queue rows from the DB", pv!("Journal", "Db", Some("cf_core_writer_queue"), "hits"), all),
+            ("C4", "journal staking from the DB", pv!("Journal", "Db", Some("cf_staking_rewards"), "hits"), all),
+            ("C5", "lane read, L main in flight", pv!("Lane", "LMain", None, "inflight"), interval),
+            ("C6", "due-check true from an in-flight parent row", pv!("DueCheck", "Parent", Some("cf_core_writer_queue"), "inflight"), g_or_never),
+            ("C7", "absorb: account put", flag!("absorb.account_put"), all),
+            ("C7", "absorb: account delete", flag!("absorb.account_delete"), all),
+            ("C7", "absorb: slot put", flag!("absorb.slot_put"), all),
+            ("C7", "absorb: zero-slot delete", flag!("absorb.slot_delete"), all),
+            ("C7", "absorb: code put", flag!("absorb.code_put"), all),
+            ("C7", "absorb: queue row", flag!("absorb.queue_row"), all),
+            ("C7", "absorb: cursor row", flag!("absorb.cursor_row"), all),
+            ("C9", "native credit to this block's EVM account", flag!("evm.native_credit_same_block"), all),
+            ("C9", "native credit to a window's EVM account", flag!("evm.native_credit_in_window"), never_or_epoch_off),
+            ("C10", "EVM height at an attest height", flag!("evm.fast.attest"), epoch_on),
+            ("C10", "EVM epoch boundary pipelined", flag!("evm.fast.epoch"), epoch_on),
+            ("C11a", "failed section: Marker, status, no EVM part", flag!("evm.fast.failed"), all),
+            ("C11b", "all skipped, no native phase: Marker with side rows", flag!("marker.evm_side"), all),
+            ("C11c", "all skipped with a native phase", flag!("handoff.flush.all_skipped_evm"), all),
+            ("C11d", "Marker with side rows -> Digest", flag!("handoff.marker_to_digest.evm"), interval),
+            ("C13", "W EVM step in a Flush", flag!("w.evm_step.flush"), perblock),
+            ("C13", "W EVM step in a Digest -> Checkpoint", flag!("w.evm_step.checkpoint"), interval),
+            ("C13", "W EVM step in a barrier's drain", flag!("w.evm_step.drain"), never_or_epoch_off),
+            ("C14", "big and small lane at one height", flag!("evm.fast.both_lanes"), all),
+            ("C16", "revert on the fast path", flag!("evm.fast.revert"), all),
+            ("C17", "BLOCKHASH from the DB through the overlay", pv!("Revm", "Db", Some("cf_block_headers"), "hits"), all),
+            ("C18", "a deferred-read wait", flag!("deferred.read_wait"), g_interval),
+            ("C20", "EVM height on a held parent, an in-flight read of it", pv!("Revm", "Parent", None, "inflight"), g0),
+            ("C20", "EVM height on a held checkpoint, an in-flight read of it", pv!("Revm", "Checkpoint", None, "inflight"), every5_g),
+        ];
+        let covs: Vec<BTreeMap<String, u64>> = nodes.iter().map(o0_coverage).collect();
+        let mut low = Vec::new();
+        println!("o0 coverage floor (row | what | {}):", nodes.iter().map(|n| format!("{:?}/{:?}{}", n.cfg.ckpt, n.cfg.run, if n.cfg.epoch_fast { "" } else { "/epoch-off" })).collect::<Vec<_>>().join(" | "));
+        for (row, what, metric, reach) in &table {
+            let vals: Vec<String> = nodes
+                .iter()
+                .zip(&covs)
+                .map(|(n, c)| {
+                    let v = metric(c);
+                    if reach(&n.cfg) && v == 0 {
+                        low.push(format!("{row} {what}: {:?}", n.cfg));
+                    }
+                    if reach(&n.cfg) { v.to_string() } else { format!("({v})") }
+                })
+                .collect();
+            println!("  {row} | {what} | {}", vals.join(" | "));
+        }
+        assert!(low.is_empty(), "rows below their floor: {low:#?}");
+        for (n, c) in nodes.iter().zip(&covs) {
+            let what = format!("{:?}", n.cfg);
+            if n.cfg.ckpt == P5Ckpt::PerBlock && n.cfg.run == O0Run::D {
+                assert_eq!(o0_pv(c, "Revm", "Parent", None, "inflight") + o0_pv(c, "Journal", "Parent", None, "inflight") + o0_pv(c, "Lane", "Parent", None, "inflight") + o0_pv(c, "DueCheck", "Parent", None, "inflight") + o0_pv(c, "Native", "Parent", None, "inflight"), 0, "{what}: D at interval 0 has no in-flight parent");
+            }
+            if n.cfg.run == O0Run::D {
+                let reads_c: u64 = ["Revm", "Journal", "Lane", "DueCheck", "Native"].iter().map(|r| o0_pv(c, r, "Checkpoint", None, "hits")).sum();
+                assert_eq!(reads_c, 0, "{what}: D mode never reads C");
+            }
+            assert_eq!(c.get("deferred.read_waits_over_1").copied().unwrap_or(0), 0, "{what}: <= 1 deferred-read wait per block");
+            assert_eq!((n.layer_shared, n.rows_shared), (0, 0), "{what}: L / C and R never shared");
+            assert_eq!(n.failed_at, None, "{what}");
+        }
+    }
+
+    /// Plan 5.2 C2 (forced: the stream's blocks are always dispatch-durable,
+    /// and a replay context has no W): with the flag on and W attached, an
+    /// EVM block whose header / body the dispatcher did not land (boot
+    /// crash-replay, a failed dispatch batch) still barriers and runs the
+    /// serial EVM section; the run equals S.
+    #[test]
+    fn fast_path_evm_block_not_dispatch_durable_stays_serial() {
+        use O0Hand::*;
+        let blocks = o0_hand_blocks(&[Native, Native, Evm, Native, Evm, Native]);
+        let mut s = O0Node::new(O0Cfg::serial());
+        s.run(&blocks);
+        s.finish();
+        let mut node = O0Node::new(O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast());
+        node.run(&blocks[..2]);
+        {
+            let _probe = torus_state::probes::install(node.probe.clone());
+            let ctx = node.ctx.as_ref().unwrap();
+            ctx.execute_committed_block_with(&blocks[2].block, vec![], DurableRows::default());
+            assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+            assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
+            node.ledger().take_hn(&node.db);
+        }
+        node.run(&blocks[3..]);
+        let p = o0_paths(&node);
+        assert_eq!(p.get("evm.serial_flag_on.nondurable"), Some(&1), "{p:?}");
+        assert_eq!(p.get("block.pipelined.evm"), Some(&1), "the durable EVM block 5: {p:?}");
+        node.finish();
+        node.ledger().assert_complete(6, "non-durable EVM block");
+        o0_compare(&s.ledger(), &node.ledger()).unwrap_or_else(|d| panic!("diverged at {}: {}", d.height, d.what));
+        assert_eq!(o0_final(&s, &blocks), o0_final(&node, &blocks));
+    }
+
+    // ---- Item 7 option 0 task 3.6: the equivalence matrix (plan 5.3) ----
+
+    /// Plan 5.3 (R1): the forced cases of the stream asserted by name in a
+    /// finished node's DB: each all-skipped EVM block (wrong nonce /
+    /// undecodable; without a native phase, with one, at a checkpoint
+    /// height) has its status row, its hash -> number row and no receipt;
+    /// the failed section has its status row and neither.
+    fn o0_assert_forced_cases(node: &O0Node) {
+        use torus_state::cf::{CF_BLOCK_ACTION_STATUS, CF_RECEIPTS};
+        let what = format!("{:?}", node.cfg);
+        let forced = O0_ALL_SKIPPED
+            .iter()
+            .map(|(h, k, p)| (*h, 1, format!("{k:?} {p:?}")))
+            .chain(std::iter::once((O0_SECTION_ERROR, 0, "failed section".to_string())));
+        for (h, hash_rows, name) in forced {
+            assert!(
+                node.db.get_cf_raw(CF_BLOCK_ACTION_STATUS, &h.to_be_bytes()).unwrap().is_some(),
+                "{what}: {name} at {h}: status row"
+            );
+            assert_eq!(o0_hash_index_at(&node.db, h), hash_rows, "{what}: {name} at {h}: hash -> number");
+            assert_eq!(o0_rows_at(&node.db, CF_RECEIPTS, h), 0, "{what}: {name} at {h}: no receipt");
+        }
+    }
+
+    /// Plan 5.3: the 300-block stream on S (serial, `mode`) and on the
+    /// pipelined configs `ckpts` x {flag off, on} x {D, G} of `mode` (with
+    /// `tweak` applied): every node agrees with S by ledger (per height
+    /// `h_n`, status, side rows; per completed height the dumps) and in the
+    /// final state (dump, running hash, EVM root incremental == full scan,
+    /// RPC answers); Classic: every node equals the golden too. The forced
+    /// cases by name; flag off: every EVM height barriers; flag on: EVM
+    /// heights pipelined and no context shared L / C or R.
+    fn o0_matrix(
+        mode: torus_bridge::native_executor::BookMode,
+        ckpts: &[P5Ckpt],
+        tweak: fn(O0Cfg) -> O0Cfg,
+    ) {
+        use torus_bridge::native_executor::BookMode;
+        let (blocks, fed) = o0_blocks(300, O0_SEED);
+        let mut cfgs = vec![O0Cfg { mode, ..O0Cfg::serial() }];
+        for &ckpt in ckpts {
+            for run in [O0Run::D, O0Run::G] {
+                for fast in [false, true] {
+                    let c = O0Cfg { mode, ..O0Cfg::piped(ckpt, run) };
+                    cfgs.push(tweak(if fast { c.fast() } else { c }));
                 }
             }
         }
+        let (nodes, finals) = o0_run_agreeing(&blocks, &cfgs);
+        for node in &nodes {
+            o0_assert_forced_cases(node);
+            let p = &node.paths;
+            let get = |k: &str| p.get(k).copied().unwrap_or(0);
+            let what = format!("{:?}", node.cfg);
+            if !node.cfg.pipelined {
+                continue;
+            }
+            if node.cfg.evm_fast {
+                assert!(get("block.pipelined.evm") >= fed.evm_blocks - 12, "{what}: {p:?}");
+                assert_eq!(get("block.serial.evm"), 0, "{what}: {p:?}");
+                assert_eq!((node.layer_shared, node.rows_shared), (0, 0), "{what}: shared");
+            } else {
+                assert_eq!(get("block.pipelined.evm"), 0, "{what}: {p:?}");
+                assert!(get("block.serial.evm") >= fed.evm_blocks - 2, "{what}: {p:?}");
+            }
+            if node.cfg.run == O0Run::G {
+                // With Never the controller parks only triggered checkpoints
+                // (attest / epoch heights). Flag off, every one of them is an
+                // EVM height of this stream, which barriers: no trigger, no
+                // hold (W still runs unwaited between blocks).
+                let holds = node.ctl.as_ref().unwrap().st.lock().unwrap().holds;
+                let floor = match (node.cfg.ckpt, node.cfg.evm_fast) {
+                    (P5Ckpt::Never, false) => 0,
+                    (P5Ckpt::Never, true) => 1,
+                    _ => 10,
+                };
+                assert!(holds >= floor, "{what}: the controller parked W {holds} times");
+            }
+        }
+        if mode == BookMode::Classic {
+            o0_assert_golden(&nodes, &finals);
+        }
+        println!(
+            "o0 matrix {mode:?} {ckpts:?}: {} nodes agree with S{}",
+            nodes.len(),
+            if mode == BookMode::Classic { " and the golden" } else { "" }
+        );
+    }
+
+    fn o0_same(c: O0Cfg) -> O0Cfg {
+        c
+    }
+
+    /// Plan 5.3: Classic, interval 0, flag off / on, D / G.
+    #[test]
+    fn o0_equivalence_classic_interval0() {
+        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::PerBlock], o0_same);
+    }
+
+    /// Plan 5.3: Classic, Every5.
+    #[test]
+    fn o0_equivalence_classic_every5() {
+        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Every5], o0_same);
+    }
+
+    /// Plan 5.3: Classic, Never (checkpoints at attest / epoch heights,
+    /// barriers and shutdown only).
+    #[test]
+    fn o0_equivalence_classic_never() {
+        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Never], o0_same);
+    }
+
+    /// Plan 5.3: OrderRows, interval 0 (against S in OrderRows).
+    #[test]
+    fn o0_equivalence_orderrows_interval0() {
+        o0_matrix(torus_bridge::native_executor::BookMode::OrderRows, &[P5Ckpt::PerBlock], o0_same);
+    }
+
+    /// Plan 5.3: OrderRows, Every5.
+    #[test]
+    fn o0_equivalence_orderrows_every5() {
+        o0_matrix(torus_bridge::native_executor::BookMode::OrderRows, &[P5Ckpt::Every5], o0_same);
+    }
+
+    /// Plan 5.3: OrderRows, Never.
+    #[test]
+    fn o0_equivalence_orderrows_never() {
+        o0_matrix(torus_bridge::native_executor::BookMode::OrderRows, &[P5Ckpt::Never], o0_same);
+    }
+
+    /// Plan 5.3: Classic Every5 with the epoch flag off (epoch boundaries
+    /// barrier, so do the EVM heights on them: C2).
+    #[test]
+    fn o0_equivalence_classic_every5_epoch_off() {
+        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Every5], |c| O0Cfg {
+            epoch_fast: false,
+            ..c
+        });
+    }
+
+    /// Plan 5.3: the deferred book modes 2 / 3 (they refuse an interval):
+    /// per block only, against S in the same mode.
+    #[test]
+    fn o0_equivalence_level_authority_modes_interval0() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            o0_matrix(mode, &[P5Ckpt::PerBlock], o0_same);
+        }
+    }
+
+    /// Plan 5.3: `TORUS_CKPT_DEFER_BOOKS=1` on Classic Every5. The routing
+    /// is read once per process, so the cell runs in a child process of this
+    /// test binary with the variable set (`o0_equivalence_defer_books_inner`),
+    /// whatever runner (nextest or one `cargo test` process) runs this one.
+    #[test]
+    fn o0_equivalence_classic_every5_defer_books() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "app::crash_recovery_tests::o0_equivalence_defer_books_inner",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("TORUS_CKPT_DEFER_BOOKS", "1")
+            .env_remove("TORUS_BOOK_ROWS")
+            .env_remove("TORUS_RESIDENT_BOOKS")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the defer-books cell failed:\n{}\n{}",
+            stdout.lines().rev().take(30).collect::<Vec<_>>().join("\n"),
+            stderr.lines().rev().take(30).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    /// The defer-books cell (run by `o0_equivalence_classic_every5_defer_books`
+    /// in its own process).
+    #[test]
+    #[ignore]
+    fn o0_equivalence_defer_books_inner() {
+        assert!(
+            torus_state::checkpoint_layer::books_deferred(),
+            "TORUS_CKPT_DEFER_BOOKS=1: the book CF in L's deferred part"
+        );
+        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Every5], o0_same);
     }
 
     // ---- Item 7 option 0 task 3.6: poison tests (plan 5.4, design 3b / 3c) ----
@@ -36432,6 +36874,11 @@ mod crash_recovery_tests {
     /// serial path; only the plain boundary 4 is pipelined. The state equals
     /// the serial run per block and in every CF, and the EVM tx and the
     /// slash really landed.
+    ///
+    /// Item 7 option 0 (task 3.6): with the EVM fast path on too, the EVM
+    /// boundary 8 is pipelined; the slash boundary 12 still barriers (a
+    /// non-durable header does as well:
+    /// `fast_path_evm_block_not_dispatch_durable_stays_serial`).
     #[test]
     fn epoch_fast_path_evm_or_slash_boundary_stays_serial() {
         let serial = fast_path_run(false, false, None, Some(8), Some(12));
@@ -36443,6 +36890,13 @@ mod crash_recovery_tests {
                 "{what}: EVM boundary 8 and slash boundary 12 serial"
             );
             assert_fast_path_runs_equal(&serial, &on, &format!("{what}: flag on vs serial"));
+            let evm_on = fast_path_run_evm(true, true, true, policy, Some(8), Some(12));
+            let expected_evm_on: Vec<u64> = (1..=13).filter(|h| *h != 12).collect();
+            assert_eq!(
+                evm_on.pipelined, expected_evm_on,
+                "{what}, EVM fast path on: EVM boundary 8 pipelined, slash boundary 12 serial"
+            );
+            assert_fast_path_runs_equal(&serial, &evm_on, &format!("{what}: EVM fast path on vs serial"));
         }
         let evm_sender = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
         assert_eq!(

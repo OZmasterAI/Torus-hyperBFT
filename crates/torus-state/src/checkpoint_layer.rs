@@ -102,6 +102,16 @@ pub(crate) fn is_deferred_slot(i: usize) -> bool {
     })[i]
 }
 
+/// Whether this process routes the book CF into L's deferred part
+/// (`TORUS_CKPT_DEFER_BOOKS=1`, read once per process; tests check the
+/// route they run under).
+pub fn books_deferred() -> bool {
+    crate::cf::ALL_CF_NAMES
+        .iter()
+        .position(|n| *n == crate::cf::CF_NATIVE_ORDER_BOOKS)
+        .is_some_and(is_deferred_slot)
+}
+
 /// Which CFs of a layer an operation covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerPart {
