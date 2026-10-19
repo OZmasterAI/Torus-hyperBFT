@@ -1443,6 +1443,9 @@ enum ReplayFault {
     /// empty blocks). A header that rides the flush batch with the applied
     /// marker is not affected.
     StandaloneHeaderWrite,
+    /// Item 7 option 0 (task 2.3): the serial EVM section's read of the EVM
+    /// trie stale marker (`incremental::is_evm_trie_stale`) failed.
+    EvmTrieStaleRead,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -3737,16 +3740,47 @@ impl ExecutionContext {
                     // restarts/replay). On an incremental error only the trie work is dropped
                     // (the plain rows are already in the overlay, as the old plain fallback
                     // wrote them), so a trie bug can never halt the chain (the full-scan root
-                    // stays primary unless the flag is on).
-                    let mut batch = match torus_state::incremental::evm_block_trie_batch(
-                        &self.state_db,
-                        &validated.bundle,
-                        precomputed_root,
-                    ) {
-                        Ok((_root, batch)) => batch,
+                    // stays primary unless the flag is on). Item 7 option 0 (task 2.3, F4):
+                    // the dropped trie work marks the trie stale in the same batch (the root
+                    // then routes to the full scan, boot rebuilds), and a stale trie is never
+                    // extended. Reading or putting the marker fails only on a local fault.
+                    let stale = torus_state::incremental::is_evm_trie_stale(&self.state_db);
+                    #[cfg(test)]
+                    let stale = if self.test_replay_fault == Some(ReplayFault::EvmTrieStaleRead) {
+                        Err(injected_fault("EVM trie stale marker read"))
+                    } else {
+                        stale
+                    };
+                    let batch = match stale {
+                        Ok(true) => Ok(rocksdb::WriteBatch::default()),
+                        Ok(false) => match torus_state::incremental::evm_block_trie_batch(
+                            &self.state_db,
+                            &validated.bundle,
+                            precomputed_root,
+                        ) {
+                            Ok((_root, batch)) => Ok(batch),
+                            Err(e) => {
+                                tracing::error!(%e, height, "incremental EVM batch failed; the plain EVM rows land without a hashed mirror / trie update; EVM trie marked stale (full-scan root until the boot rebuild)");
+                                let mut batch = rocksdb::WriteBatch::default();
+                                torus_state::incremental::mark_evm_trie_stale(
+                                    &self.state_db,
+                                    &mut batch,
+                                )
+                                .map(|()| batch)
+                            }
+                        },
+                        Err(e) => Err(e),
+                    };
+                    let mut batch = match batch {
+                        Ok(batch) => batch,
                         Err(e) => {
-                            tracing::error!(%e, height, "incremental EVM batch failed; falling back to the plain EVM rows (no hashed mirror / trie update for this block)");
-                            rocksdb::WriteBatch::default()
+                            self.fail_stop_on_fault(
+                                torus_block,
+                                fold_header,
+                                "EVM trie stale marker",
+                                &e,
+                            );
+                            return;
                         }
                     };
                     // s114 (CoreWriter follow-up 1): the node-local link of
@@ -27673,6 +27707,30 @@ mod crash_recovery_tests {
         });
     }
 
+    /// Item 7 option 0 (task 2.3): the serial EVM section's read of the EVM
+    /// trie stale marker failing is a local fault: the block fail-stops
+    /// (exec_failed, marker unchanged, nothing flushed) and the restart's
+    /// replay matches the no-fault run, serial and pipelined.
+    #[test]
+    fn o0_evm_trie_stale_marker_read_fault_fail_stops_block() {
+        let key = k256::ecdsa::SigningKey::from_slice(&[0x57; 32]).unwrap();
+        let (blocks, b) = r02_evm_blocks(
+            &key,
+            alloy_primitives::TxKind::Create,
+            vec![0x60, 0x01, 0x60, 0x00, 0x55],
+        );
+        r02_assert_fault_fail_stops_then_replays(
+            &blocks,
+            &|db| r02_fund(db, &key),
+            ReplayFault::EvmTrieStaleRead,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &b));
+                assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
+                assert!(!torus_state::incremental::is_evm_trie_stale(db).unwrap());
+            },
+        );
+    }
+
     /// R02 branch 5: every other EVM outcome keeps today's handling, no
     /// fail-stop. (a) An ordinary EVM execution error (`EvmError::Internal`):
     /// logged, the EVM section skipped, the native part applied. (b) A real
@@ -32628,16 +32686,16 @@ mod crash_recovery_tests {
         assert!(node.ledger().calls.is_empty());
     }
 
-    /// Plan task 0.4 (F11; Codex P2 on 543980f0, finding F4b): a Flush
-    /// whose native trie maintenance fails after its batch landed
-    /// (`TrieStale`) returns before `resync_evm`, so its height is NOT
-    /// complete: the hook must not fire for it. The next completed height
-    /// covers it (the ledger records every height of the range), so the
-    /// ledger stays complete. The production gap is pinned: the skipped
-    /// resync is never made up (the trader's CF_HASHED_ACCOUNTS row stays
-    /// pre-resync until a manual resync), see the plan's F4b.
+    /// Plan task 0.4 (F11; Codex P2 on 543980f0, finding F4b), flipped by
+    /// task 2.3: a Flush whose native trie maintenance fails after its batch
+    /// landed (`TrieStale`, only with `TORUS_NATIVE_TRIE_MAINTENANCE=1`)
+    /// now runs the EVM mirror resync, as a TrieStale Checkpoint does, so
+    /// its height IS complete and the hook fires for it. Before the fix the
+    /// Flush arm returned before `resync_evm` and nothing made it up: the
+    /// trader's CF_HASHED_ACCOUNTS row stayed pre-resync (the F4 failure mode
+    /// from the native side).
     #[test]
-    fn o0_trie_stale_flush_is_not_a_completion() {
+    fn o0_trie_stale_flush_resyncs_and_is_a_completion() {
         use crate::exec_pipeline::CompleteSite::*;
         let blocks = o0_hand_blocks(&[O0Hand::Spot, O0Hand::Empty]);
         let trader = oracle_addr(C5_TRADERS[1]);
@@ -32663,6 +32721,7 @@ mod crash_recovery_tests {
         let before = mirror_rows(&db);
         let mut b = O0Node::with_fixture(O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D), (config, db));
         let pre = o0_hashed_account(&b.db, trader);
+        assert_ne!(pre, want);
         b.run(&blocks[..1]);
         assert_eq!(mirror_rows(&b.db), before, "trie maintenance failed: no mirror row rewritten");
         let w = b.ctx.as_ref().unwrap().flush_worker.as_ref().unwrap();
@@ -32670,25 +32729,21 @@ mod crash_recovery_tests {
         assert_eq!(read_native_applied_height(&b.db), Some(1));
         assert_eq!(
             o0_hashed_account(&b.db, trader),
-            pre,
-            "TrieStale skipped block 1's EVM mirror resync"
+            want,
+            "a TrieStale Flush resyncs block 1's EVM mirror (F4b)"
         );
-        assert_ne!(pre, want);
-        assert!(
-            b.ledger().calls.is_empty(),
-            "a TrieStale Flush is no completion: its mirror is pre-resync"
+        assert_eq!(
+            b.ledger().calls,
+            vec![(WFlush, 1)],
+            "a TrieStale Flush is a completion: its mirror is resynced"
         );
-        // Block 2 (a Marker, no trie work) completes 1..=2.
+        // Block 2 (a Marker, no trie work) completes 2.
         b.run(&blocks[1..]);
         b.finish();
         let l = b.ledger();
-        assert_eq!(l.calls, vec![(WMarker, 2)]);
+        assert_eq!(l.calls, vec![(WFlush, 1), (WMarker, 2)]);
         l.assert_complete(2, "TrieStale at 1");
         drop(l);
-        // The pinned production gap: nothing resyncs block 1's account.
-        assert_eq!(o0_hashed_account(&b.db, trader), pre);
-        torus_state::incremental::resync_evm_accounts(&b.db, &[trader]).unwrap();
-        assert_eq!(o0_hashed_account(&b.db, trader), want, "a manual resync fixes it");
 
         // A TrieStale Checkpoint resyncs its window, so it IS a completion.
         use O0Hand::{Native, Spot};

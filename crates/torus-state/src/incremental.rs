@@ -19,7 +19,10 @@ use revm::database::BundleState;
 use revm::state::AccountInfo;
 use rocksdb::WriteBatch;
 
-use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_STORAGE};
+use crate::cf::{
+    CF_ACCOUNTS, CF_CODE, CF_CONSENSUS_META, CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_STORAGE,
+    META_EVM_TRIE_STALE,
+};
 use crate::db::{decode_account_info, encode_account_info, storage_key, StateDb, KECCAK_EMPTY};
 use crate::error::StateError;
 use crate::trie::{compute_state_root, compute_storage_root, TrieAccount, EMPTY_ROOT_HASH};
@@ -58,15 +61,45 @@ fn hashed_storage_key(hashed_address: &B256, hashed_slot: &B256) -> [u8; 64] {
 /// `StateRoot` and `state_root_unhashed` drive the same `HashBuilder`. Idempotent: re-running
 /// reproduces the same root and node set.
 pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
+    build_trie_inner(db, false)
+}
+
+/// [`build_trie_to_cf`], or with `stale_rebuild` the boot rebuild of a trie marked stale
+/// ([`META_EVM_TRIE_STALE`], item 7 option 0 task 2.3): the four CFs are wiped first (in the
+/// mirror's batch: every old row goes), EIP-161 empty accounts are left out of the mirror and
+/// the trie (as per-block maintenance leaves them, `apply_bundle_hashed` /
+/// [`resync_evm_accounts`]), and the marker is cleared in the trie nodes' batch, so a crash
+/// before it leaves the marker set and the next boot rebuilds again.
+fn build_trie_inner(db: &StateDb, stale_rebuild: bool) -> Result<B256, StateError> {
     // 1. Mirror plain state into the keccak-ordered hashed-state CFs, recording which accounts
     //    have storage (so their storage tries are marked dirty for the from-scratch rebuild).
     let mut batch = WriteBatch::default();
     let hashed_acc_cf = db.cf_handle(CF_HASHED_ACCOUNTS)?;
     let hashed_stor_cf = db.cf_handle(CF_HASHED_STORAGE)?;
+    if stale_rebuild {
+        for cf in [
+            CF_HASHED_ACCOUNTS,
+            CF_HASHED_STORAGE,
+            crate::cf::CF_TRIE_ACCOUNTS,
+            crate::cf::CF_TRIE_STORAGE,
+        ] {
+            let handle = db.cf_handle(cf)?;
+            let mut iter = db.inner().raw_iterator_cf(handle);
+            iter.seek_to_first();
+            while let Some(k) = iter.key() {
+                batch.delete_cf(handle, k);
+                iter.next();
+            }
+            iter.status()?;
+        }
+    }
 
     let accounts = db.all_accounts()?;
     let mut storage_addrs: Vec<B256> = Vec::new();
     for (address, info) in &accounts {
+        if stale_rebuild && is_empty_account(info) {
+            continue;
+        }
         let hashed_address = keccak256(address.as_slice());
         batch.put_cf(
             hashed_acc_cf,
@@ -117,6 +150,9 @@ pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
     // 3. Persist the trie nodes.
     let mut batch = WriteBatch::default();
     write_trie_updates(db, &mut batch, &updates)?;
+    if stale_rebuild {
+        batch.delete_cf(db.cf_handle(CF_CONSENSUS_META)?, META_EVM_TRIE_STALE);
+    }
     db.write(batch)?;
 
     Ok(root)
@@ -128,12 +164,63 @@ pub fn build_trie_to_cf(db: &StateDb) -> Result<B256, StateError> {
 /// [`commit_evm_bundle_incremental`] persists plain state, the hashed mirror, and the trie nodes
 /// in one atomic batch, so `CF_HASHED_*`/`CF_TRIE_*` advance in lockstep with `CF_ACCOUNTS`; this
 /// therefore only does work on the first boot after Phase A is enabled (or after a fresh genesis).
+///
+/// Item 7 option 0 (task 2.3, F4): a trie marked stale ([`is_evm_trie_stale`]) is wiped and
+/// rebuilt (EIP-161 clean), then the marker is cleared.
 pub fn ensure_trie_built(db: &StateDb) -> Result<bool, StateError> {
+    if is_evm_trie_stale(db)? {
+        tracing::warn!(
+            "EVM trie marked stale (a trie step failed): rebuilding the trie and the hashed mirror"
+        );
+        build_trie_inner(db, true)?;
+        return Ok(true);
+    }
     if is_trie_built(db)? {
         return Ok(false);
     }
     build_trie_to_cf(db)?;
     Ok(true)
+}
+
+/// Item 7 option 0 (task 2.3, F4): `true` iff the EVM trie and hashed mirror lag the plain
+/// state ([`META_EVM_TRIE_STALE`] present): an EVM trie step failed and its window landed
+/// without its EVM ops. Then the EVM root routes to the full scan, no step extends the trie, and
+/// boot rebuilds it ([`ensure_trie_built`]).
+pub fn is_evm_trie_stale(db: &StateDb) -> Result<bool, StateError> {
+    Ok(db
+        .get_cf_raw(CF_CONSENSUS_META, META_EVM_TRIE_STALE)?
+        .is_some())
+}
+
+/// Item 7 option 0 (task 2.3): put the stale marker ([`META_EVM_TRIE_STALE`]) into `batch`, the
+/// batch the failed step's window lands in (state, marker and sentinel commit together).
+pub fn mark_evm_trie_stale(db: &StateDb, batch: &mut WriteBatch) -> Result<(), StateError> {
+    batch.put_cf(db.cf_handle(CF_CONSENSUS_META)?, META_EVM_TRIE_STALE, [1u8]);
+    Ok(())
+}
+
+/// Item 7 option 0 (task 2.3): the flush worker's EVM prefix batch for a window: the
+/// [`EvmWindowDelta::step`] batch; nothing if the trie is already stale (it is never extended);
+/// or, when the step fails, the stale marker alone, so the window lands without its EVM ops and
+/// the trie is marked (F4: the root then routes to the full scan, boot rebuilds). Returns the
+/// step's error for the caller to log. `Err` only if the marker itself cannot be read or put (a
+/// local fault: the caller fails the job).
+pub fn evm_window_prefix(
+    db: &StateDb,
+    delta: EvmWindowDelta,
+    rows: impl FnMut(&str, &[u8]) -> Option<Option<Vec<u8>>>,
+) -> Result<(WriteBatch, Option<StateError>), StateError> {
+    if is_evm_trie_stale(db)? {
+        return Ok((WriteBatch::default(), None));
+    }
+    match delta.step(db, rows) {
+        Ok((_root, batch)) => Ok((batch, None)),
+        Err(e) => {
+            let mut batch = WriteBatch::default();
+            mark_evm_trie_stale(db, &mut batch)?;
+            Ok((batch, Some(e)))
+        }
+    }
 }
 
 /// `true` if the persistent EVM trie + hashed mirror exist (cheap probe: `CF_HASHED_ACCOUNTS` is
@@ -1614,6 +1701,114 @@ mod tests {
         let empty = BundleState::builder(0..=0).build();
         assert_eq!(root, full_post_bundle_evm_root(&db_b, &empty).unwrap());
         assert_eq!(trie_cf_dump(&db_b), trie_cf_dump(&db_a));
+    }
+
+    /// Task 2.3 (F4): a failed EVM trie step lands the window WITHOUT its
+    /// EVM ops and with the stale marker (node-local, never hashed); while
+    /// it is set no later step extends the lagging trie; boot wipes and
+    /// rebuilds the mirror and the trie (EIP-161 clean, as the maintained
+    /// ones), byte-equal to today's per-block result, and clears it.
+    #[test]
+    fn evm_trie_step_failure_marks_stale_and_boot_rebuilds() {
+        use super::{ensure_trie_built, evm_window_prefix, is_evm_trie_stale, EvmWindowDelta};
+        use crate::cf::{CF_CONSENSUS_META, META_EVM_TRIE_STALE};
+        let id = crate::running_hash::hashed_cf_id(CF_CONSENSUS_META).unwrap();
+        assert!(
+            !crate::running_hash::key_is_hashed(id, META_EVM_TRIE_STALE),
+            "the stale marker is node-local"
+        );
+        let (db_a, _da) = temp_db();
+        let (db_b, _dbb) = temp_db();
+        for db in [&db_a, &db_b] {
+            seed(db);
+            build_trie_to_cf(db).expect("migration");
+        }
+        let mut rng = 0xfa11_57a1_e5ee_d001u64;
+        let mut model = Default::default();
+        let mut window = o0_random_window(&mut rng, 6, &db_a, &mut model);
+        // An EIP-161 empty account in the plain state (the rebuild must
+        // leave it out of the mirror and the trie, as maintenance does).
+        let mut b = [0u8; 20];
+        b[0..4].copy_from_slice(&11u32.to_be_bytes());
+        b[19] = 0x5a;
+        let emptied = Address::from(b);
+        window.push((
+            BundleState::builder(0..=0)
+                .state_present_account_info(emptied, eoa(0, 0))
+                .build(),
+            Vec::new(),
+        ));
+        for (bundle, credits) in &window {
+            o0_serial_block(&db_a, bundle, credits);
+        }
+        let mut delta = EvmWindowDelta::default();
+        let mut plain = rocksdb::WriteBatch::default();
+        for (bundle, credits) in &window {
+            delta.fold(bundle);
+            delta.note_accounts(credits.iter().map(|(a, _)| *a));
+            super::apply_bundle_plain(&db_b, &mut plain, bundle).unwrap();
+            let cf = db_b.cf_handle(crate::cf::CF_ACCOUNTS).unwrap();
+            for (a, info) in credits {
+                plain.put_cf(cf, a.as_slice(), crate::db::encode_account_info(info));
+            }
+        }
+        // The step fails: one final account row does not decode.
+        let corrupt = emptied;
+        let rows = |cf: &str, key: &[u8]| {
+            if key == corrupt.as_slice() {
+                Some(Some(vec![0xde, 0xad]))
+            } else {
+                Some(db_a.get_cf_raw(cf, key).unwrap())
+            }
+        };
+        let before = trie_cf_dump(&db_b);
+        let (batch, err) = evm_window_prefix(&db_b, delta, rows).unwrap();
+        assert!(err.is_some(), "the step failed");
+        db_b.write(batch).unwrap();
+        db_b.write(plain).unwrap();
+        assert!(
+            is_evm_trie_stale(&db_b).unwrap(),
+            "the marker landed with the window"
+        );
+        assert_eq!(
+            trie_cf_dump(&db_b),
+            before,
+            "no EVM op of the window landed"
+        );
+        assert_ne!(trie_cf_dump(&db_b), trie_cf_dump(&db_a));
+
+        // Stale: the next window's step is skipped (nothing written).
+        let mut next = EvmWindowDelta::default();
+        next.fold(
+            &BundleState::builder(0..=0)
+                .state_present_account_info(emptied, eoa(5, 5))
+                .build(),
+        );
+        let ok_rows = |cf: &str, key: &[u8]| Some(db_a.get_cf_raw(cf, key).unwrap());
+        let (batch, err) = evm_window_prefix(&db_b, next, ok_rows).unwrap();
+        assert!(err.is_none());
+        assert_eq!(batch.len(), 0, "a stale trie is never extended");
+
+        // Boot.
+        assert!(
+            ensure_trie_built(&db_b).unwrap(),
+            "the stale trie is rebuilt"
+        );
+        assert!(!is_evm_trie_stale(&db_b).unwrap(), "and the marker cleared");
+        assert_eq!(
+            trie_cf_dump(&db_b),
+            trie_cf_dump(&db_a),
+            "the rebuilt mirror and trie equal the maintained ones"
+        );
+        let empty = BundleState::builder(0..=0).build();
+        assert_eq!(
+            incremental_evm_root(&db_b, &empty).unwrap().0,
+            full_post_bundle_evm_root(&db_b, &empty).unwrap()
+        );
+        assert!(
+            !ensure_trie_built(&db_b).unwrap(),
+            "the next boot has nothing to do"
+        );
     }
 
     /// A1.6 scaling proof: the incremental EVM root is O(changed) — its per-block compute time is

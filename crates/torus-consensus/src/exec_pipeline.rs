@@ -846,16 +846,10 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
         }
         // Item 7 option 0 step 0 (F11): the height is complete (batch AND
         // EVM mirror resync written); before W publishes it or receives its
-        // next job. Never for a digest or a failed job, and not for a
-        // TrieStale Flush: its arm returns before `resync_evm` (plan F4b),
-        // so the next completed height covers it. A TrieStale Checkpoint
-        // has resynced.
+        // next job. Never for a digest or a failed job. A TrieStale Flush or
+        // Checkpoint has landed and resynced (task 2.3, F4b), so it is.
         #[cfg(test)]
-        let complete = match &result {
-            Ok(Ok(())) => true,
-            Ok(Err(JobError::TrieStale(_))) => ckpt,
-            _ => false,
-        };
+        let complete = matches!(&result, Ok(Ok(()) | Err(JobError::TrieStale(_))));
         #[cfg(test)]
         if let (true, false, Some(hook)) = (complete, digest, &env.test_on_complete) {
             let site = match &job {
@@ -880,7 +874,8 @@ fn worker_loop(rx: Receiver<Job>, env: WorkerEnv, shared: Arc<Shared>) {
             Ok(Err(JobError::TrieStale(e))) => {
                 // Today's semantics: the batch (state + marker) is durable, only
                 // the off-by-default incremental native root is stale for this
-                // block; caches were invalidated inside the flush. Keep going.
+                // block; caches were invalidated inside the flush; the EVM
+                // mirror was resynced (task 2.3, F4b). Keep going.
                 tracing::error!(%e, height, "flush worker: native trie maintenance failed (state + marker durable, root stale)");
                 shared.durable_height.store(height, Ordering::SeqCst);
                 if ckpt {
@@ -1143,21 +1138,24 @@ fn run_job(
                     Some(&mut chain),
                 )
             };
-            match flush_result {
-                Ok(stats) => observe_flush_stats(env, &stats),
-                Err(e) => {
-                    // `flush_with_native_trie_stats` returns Err both when the
-                    // write failed (nothing landed) and when the write landed but
-                    // trie maintenance failed. The durable marker tells them apart.
-                    return Err(if marker_is(env, *height) {
-                        JobError::TrieStale(e.to_string())
-                    } else {
-                        JobError::Write(e.to_string())
-                    });
+            let landed = match flush_result {
+                Ok(stats) => {
+                    observe_flush_stats(env, &stats);
+                    Ok(())
                 }
-            }
+                // `flush_with_native_trie_stats` returns Err both when the
+                // write failed (nothing landed) and when the write landed but
+                // trie maintenance failed. The durable marker tells them apart.
+                Err(e) if marker_is(env, *height) => Err(JobError::TrieStale(e.to_string())),
+                Err(e) => return Err(JobError::Write(e.to_string())),
+            };
+            // Item 7 option 0 task 2.3 (plan F4b): the batch is durable, so
+            // the EVM mirror is resynced even when the native trie
+            // maintenance failed (`TrieStale`), as a Checkpoint does. Before,
+            // a TrieStale Flush returned here and its native-credited EVM
+            // accounts kept a pre-resync mirror for good.
             resync_evm(env, *height, std::mem::take(evm_addrs));
-            Ok(())
+            landed
         }
     }
 }
