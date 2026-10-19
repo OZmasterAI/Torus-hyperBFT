@@ -33,7 +33,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use torus_bridge::{
-    sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator, BundleState,
+    sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator,
     NativeExecContext, NativeExecutor,
 };
 use torus_economics::{EpochManager, EpochRotationPlan, PlanEvm, SlashReason, StakingManager};
@@ -3331,15 +3331,6 @@ impl ExecutionContext {
         }
     }
 
-    fn running_hash_extras(
-        out_of_batch: torus_state::OutOfBatchRecorder,
-        bundle_extras: torus_state::HashExtras,
-    ) -> torus_state::HashExtras {
-        let mut extras = out_of_batch.finish();
-        extras.extend(bundle_extras);
-        extras
-    }
-
     fn execute_committed_block_with(
         &self,
         torus_block: &TorusBlock,
@@ -3654,18 +3645,19 @@ impl ExecutionContext {
         // block metadata) so it is attributed rather than sitting in the block
         // residual.
         let evm_timer = std::time::Instant::now();
-        let mut bundle = BundleState::default();
-        let mut bundle_extras = torus_state::HashExtras::new();
         let mut computed_fee_revenue: u128 = 0;
         // Item 7 step 2 (F3): this block's EVM gas `(small lane, big lane)`, added to the epoch row.
         let mut evm_gas = (0u64, 0u64);
         // Consensus bug (c), docs/plans/consensus-bug-c-evm-commit-atomicity.md:
-        // the EVM block's consensus writes (bundle, hashed mirror, incremental
-        // trie nodes, writer-precompile queue rows) are BUILT here and written
-        // as the PREFIX of this block's one flush batch below (with the native
-        // state and the applied-height marker): a crash before that write leaves
-        // nothing of the block durable, so the replay re-executes it from the
-        // same base.
+        // the EVM block's consensus writes land in this block's ONE flush batch
+        // (with the native state and the applied-height marker): a crash before
+        // that write leaves nothing of the block durable, so the replay
+        // re-executes it from the same base. Item 7 option 0 (task 1.2): the
+        // plain rows (bundle) and the writer-precompile journal rows are
+        // absorbed into the block overlay (`absorb_evm`), so they are flushed
+        // and digested with its pending set; `evm_batch` (the batch's PREFIX)
+        // keeps only the EVM-derived rows: the hashed mirror, the incremental
+        // trie nodes and the node-local CoreWriter tx links.
         let mut evm_batch: Option<rocksdb::WriteBatch> = None;
         // s84 executed/skipped record: an EVM tx is executed iff it has a
         // receipt (an undecodable tx or one revm refuses gets none; a reverted
@@ -3688,7 +3680,7 @@ impl ExecutionContext {
                 _ => validated,
             };
             match validated {
-                Ok(validated) => {
+                Ok(mut validated) => {
                     #[cfg(test)]
                     {
                         self.test_path("evm.ok");
@@ -3710,50 +3702,52 @@ impl ExecutionContext {
                     // T4.1: reuse the validation-time (root, TrieUpdates) pair — computed by the
                     // ONE StateRoot run inside validate_block_for_catchup over this same committed
                     // base — so the commit never recomputes the EVM root for this block.
-                    let precomputed_root = validated.evm_root_updates;
-                    // Phase A: EVM plain state + the hashed mirror + the incremental trie nodes
-                    // in ONE batch, so CF_HASHED_*/CF_TRIE_* stay in lockstep with CF_ACCOUNTS
-                    // (keeps the incremental root's base correct across restarts/replay).
-                    // Falls back to the plain batch if the incremental path errors, so a trie bug
-                    // can never halt the chain (the full-scan root stays primary unless the flag is on).
-                    let built = match torus_state::incremental::evm_block_batch_incremental(
+                    let precomputed_root = validated.evm_root_updates.take();
+                    // Item 7 option 0 (task 1.2): the plain rows and the journal rows go
+                    // into the block overlay, in one pass; the journal is consumed. Only a
+                    // code bug fails it (frozen overlay, unregistered CF): fail-stop.
+                    if let Err(e) = overlay.absorb_evm(&validated.bundle, validated.native_writes) {
+                        self.fail_stop_on_fault(
+                            torus_block,
+                            fold_header,
+                            "EVM rows absorb into the block overlay",
+                            &e,
+                        );
+                        return;
+                    }
+                    #[cfg(test)]
+                    self.test_path("evm.absorb");
+                    // Phase A: the hashed mirror + the incremental trie nodes ride the block's
+                    // flush batch as its prefix, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
+                    // CF_ACCOUNTS (keeps the incremental root's base correct across
+                    // restarts/replay). On an incremental error only the trie work is dropped
+                    // (the plain rows are already in the overlay, as the old plain fallback
+                    // wrote them), so a trie bug can never halt the chain (the full-scan root
+                    // stays primary unless the flag is on).
+                    let mut batch = match torus_state::incremental::evm_block_trie_batch(
                         &self.state_db,
                         &validated.bundle,
                         precomputed_root,
-                        Some(&validated.native_writes),
                     ) {
-                        Ok((_root, batch)) => Ok(batch),
+                        Ok((_root, batch)) => batch,
                         Err(e) => {
-                            tracing::error!(%e, height, "incremental EVM batch failed; falling back to the plain EVM batch");
-                            BlockCommitter::pending_bundle_batch(
-                                &self.state_db,
-                                &validated.bundle,
-                                Some(&validated.native_writes),
-                            )
+                            tracing::error!(%e, height, "incremental EVM batch failed; falling back to the plain EVM rows (no hashed mirror / trie update for this block)");
+                            rocksdb::WriteBatch::default()
                         }
                     };
                     // s114 (CoreWriter follow-up 1): the node-local link of
                     // each queued row to its EVM tx rides the same batch as
                     // the row itself (nothing when the block queued nothing).
-                    let built = built.and_then(|mut batch| {
-                        torus_state::corewriter_tx::append_links(
-                            &self.state_db,
-                            &mut batch,
-                            &validated.core_writer_links,
-                        )
-                        .map_err(torus_bridge::BridgeError::from)?;
-                        Ok(batch)
-                    });
-                    match built {
-                        Ok(batch) => {
-                            bundle_extras.add_evm_bundle(&validated.bundle);
-                            bundle_extras.add_overlay_pending(&validated.native_writes);
-                            evm_batch = Some(batch);
-                        }
+                    match torus_state::corewriter_tx::append_links(
+                        &self.state_db,
+                        &mut batch,
+                        &validated.core_writer_links,
+                    ) {
+                        Ok(()) => evm_batch = Some(batch),
                         Err(e2) => {
                             // Executing the native phase without the block's EVM
                             // writes would make a partial block durable.
-                            tracing::error!(%e2, height, "FATAL: could not build the EVM batch (fallback) — fail-stop");
+                            tracing::error!(%e2, height, "FATAL: could not build the EVM batch (links) — fail-stop");
                             self.exec_failed.store(true, Ordering::SeqCst);
                             return;
                         }
@@ -3777,7 +3771,6 @@ impl ExecutionContext {
                         }
                         Err(e) => tracing::error!(%e, height, "failed to commit block metadata"),
                     }
-                    bundle = validated.bundle;
                 }
                 // R02 branch 5 (owner option A): a precompile hit a LOCAL
                 // storage fault (it aborted the execution instead of answering
@@ -3837,7 +3830,9 @@ impl ExecutionContext {
             return;
         }
 
-        let mut hash_extras = Some(Self::running_hash_extras(out_of_batch, bundle_extras));
+        // Out-of-batch consensus writes (the buffered slashes); the block's EVM
+        // rows are in the overlay's pending set (task 1.2), digested with it.
+        let mut hash_extras = Some(out_of_batch.finish());
 
         // Bug (b): every boundary block runs the native phase (even when empty)
         // — it applies / computes the validator-set plans (`process_epoch_boundary`).
@@ -4129,7 +4124,6 @@ impl ExecutionContext {
                     .inc_by(sender_actions.len() as u64);
             }
 
-            overlay.seed_from_bundle(&bundle);
             // r3 / Codex D12 r2: the header record rides the flush batch (see
             // `header_record`). The overlay put fails only on a code bug
             // (unregistered CF, frozen overlay); it fail-stops rather than let
@@ -5057,6 +5051,14 @@ impl ExecutionContext {
             }
         }
         if !run_native {
+            // Item 7 option 0 (F2): a block without a native phase executed no
+            // EVM tx (an executed tx uses gas, and gas runs the native phase),
+            // so it absorbed no EVM rows: nothing of the overlay is dropped.
+            debug_assert_eq!(
+                overlay.pending_write_count(),
+                0,
+                "a block without a native phase absorbed no EVM rows"
+            );
             if pipelined {
                 // bl2: the marker must advance IN ORDER behind the previous block's
                 // batch on W (a direct put here would land before batch(N−1) and be
@@ -21724,6 +21726,106 @@ mod crash_recovery_tests {
         assert_dumps_equal(&serial, &fast, "F3 serial vs epoch fast path");
     }
 
+    /// Item 7 option 0 task 1.2 (F8): the absorb makes block h's own
+    /// writer-precompile journal rows (queue rows for targets > h, the
+    /// CF_FEE_CONFIG cursor rows) visible to h's native phase. That equals
+    /// today only if no native reader observes them in block h. Block 1's EVM
+    /// txs queue order rows (target 1 + K = 11) and write the last-order
+    /// cursor; the block runs its native phase (gas). With a probe watching
+    /// every queue key of targets 2..=12 and the three cursor keys, scans
+    /// included, no read by the native phase or the due-checks covers any of
+    /// them; the EVM part's own reads are logged (the watch works) and the
+    /// rows are durable after the block.
+    #[test]
+    fn native_phase_never_reads_this_blocks_journal_rows() {
+        use torus_core::precompiles::{
+            CORE_WRITER_FIRST_OPEN_TARGET_KEY, CORE_WRITER_FULL_ORDER_RUN_KEY,
+            CORE_WRITER_LAST_ORDER_TARGET_KEY,
+        };
+        use torus_state::cf::{CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
+        use torus_state::probes::{self, Probe, Reader};
+        let key = k256::ecdsa::SigningKey::from_slice(&[83u8; 32]).unwrap();
+        let account = |code_hash: B256, balance: U256| revm::state::AccountInfo {
+            balance,
+            nonce: 0,
+            code_hash,
+            code: None,
+            account_id: None,
+        };
+        // Forward calldata to CoreWriter (0x0810), twice.
+        #[rustfmt::skip]
+        let call = [
+            0x36, 0x5f, 0x5f, 0x37,
+            0x5f, 0x5f, 0x36, 0x5f, 0x5f,
+            0x61, 0x08, 0x10, 0x5a, 0xf1, 0x50,
+        ];
+        let twice = [&call[..], &call[..], &[0x00]].concat();
+        let contract = Address::repeat_byte(0xC5);
+        let mut calldata =
+            alloy_primitives::keccak256("cancelOrder(bytes32)".as_bytes())[..4].to_vec();
+        calldata.extend_from_slice(&[0u8; 31]);
+        calldata.push(42);
+        let to = alloy_primitives::TxKind::Call(contract);
+        let mut blocks = vec![make_block(1, vec![])];
+        blocks[0].evm_transactions = vec![
+            signed_eip1559(&key, 0, to, calldata.clone()),
+            signed_eip1559(&key, 1, to, calldata.clone()),
+        ];
+        blocks[0].header.evm_tx_count = 2;
+        link_blocks(&mut blocks);
+
+        let (_cfg, db) = make_test_config_and_db();
+        db.put_account(&k256_address(&key), &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))))
+            .unwrap();
+        let code_hash = alloy_primitives::keccak256(&twice);
+        db.put_code(&code_hash, &twice).unwrap();
+        db.put_account(&contract, &account(code_hash, U256::ZERO)).unwrap();
+        torus_state::incremental::ensure_trie_built(&db).unwrap();
+
+        let probe = Probe::new();
+        let _installed = probes::install(probe.clone());
+        probe.watch_scans();
+        let qkey = |t: u64, s: u64| [t.to_be_bytes(), s.to_be_bytes()].concat();
+        for t in 2..=12u64 {
+            for s in 0..4u64 {
+                probe.watch(CF_CORE_WRITER_QUEUE, qkey(t, s));
+            }
+        }
+        for k in [
+            CORE_WRITER_LAST_ORDER_TARGET_KEY,
+            CORE_WRITER_FIRST_OPEN_TARGET_KEY,
+            CORE_WRITER_FULL_ORDER_RUN_KEY,
+        ] {
+            probe.watch(CF_FEE_CONFIG, k.to_vec());
+        }
+        probe.set_height(1);
+        let ctx = pipeline_ctx(&db, false, None);
+        dispatch_and_execute(&ctx, &db, &blocks[0]);
+        assert!(!ctx.exec_failed.load(Ordering::SeqCst));
+        drop(ctx);
+        assert_eq!(read_native_applied_height(&db), Some(1));
+        assert!(
+            probe.total(|r, _, _| r == Reader::Native).hits > 0,
+            "block 1 ran its native phase"
+        );
+
+        let watched = probe.watched();
+        let native: Vec<_> = watched
+            .iter()
+            .filter(|r| matches!(r.reader, Reader::Native | Reader::DueCheck))
+            .collect();
+        assert!(native.is_empty(), "native-phase reads of block 1's journal rows: {native:?}");
+        assert!(
+            watched.iter().any(|r| r.cf == CF_FEE_CONFIG),
+            "the EVM part reads the cursor (the watch works): {watched:?}"
+        );
+        // The rows are durable: four order rows at 1 + K, the cursor at 11.
+        for s in 0..4u64 {
+            assert!(db.get_cf_raw(CF_CORE_WRITER_QUEUE, &qkey(11, s)).unwrap().is_some(), "seq {s}");
+        }
+        assert!(db.get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_LAST_ORDER_TARGET_KEY).unwrap().is_some());
+    }
+
     /// s114 (CoreWriter follow-up 1): block 1's EVM txs queue CoreWriter rows
     /// for block 2 (one call, a reverted call, two calls in one tx); the
     /// committed-block path writes one `CF_CORE_WRITER_TX` row per queued
@@ -30592,7 +30694,7 @@ mod crash_recovery_tests {
     /// interval 0 and G Every5 (checkpoints parked by the controller):
     /// - same-block: every native-phase read of Z in the touch block is
     ///   answered by the block's own pending layer, the first with the
-    ///   tombstone the EVM bundle's deletion seeded (`seed_from_bundle`);
+    ///   tombstone the EVM bundle's deletion absorbed (`absorb_evm`, formerly `seed_from_bundle`);
     /// - next-block: TODAY the re-fund's first read of Z is answered by the
     ///   DB (absent) and no read of Z there is served by a frozen layer:
     ///   the touch height is an EVM height, so a barrier (checkpoint
@@ -31418,7 +31520,7 @@ mod crash_recovery_tests {
         let (rh_height, rh) =
             torus_state::running_hash::read_running_hash(db).expect("a running hash");
         let (incremental, _) =
-            torus_state::incremental::incremental_evm_root(db, &BundleState::default()).unwrap();
+            torus_state::incremental::incremental_evm_root(db, &revm::database::BundleState::default()).unwrap();
         let full = torus_state::trie::compute_state_root_from_db(db).unwrap();
         assert_eq!(
             incremental, full,
@@ -32085,6 +32187,8 @@ mod crash_recovery_tests {
             ("block.pipelined", 10),
             ("block.serial.evm", 1),
             ("block.serial.slash", 1),
+            // Task 1.2: the EVM block's rows absorbed into its overlay.
+            ("evm.absorb", 1),
             ("evm.ok", 1),
             ("handoff.flush", 8),
             ("handoff.marker", 2),

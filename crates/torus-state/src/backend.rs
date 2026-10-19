@@ -1663,6 +1663,7 @@ impl NativeStateOverlay {
             return;
         }
         let within = |k: &[u8]| in_range(k) && upto.is_none_or(|u| k <= u);
+        self.probe_scan_watch(id, own, lower, |k: &[u8]| k >= start && within(k));
         let rows = Self::effective_rows(id, own, lower, start, within);
         for (rows, tag) in rows.iter().zip(self.lower_tags(id)) {
             if !rows.is_empty() {
@@ -1672,6 +1673,32 @@ impl NativeStateOverlay {
             }
         }
         crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
+    }
+
+    /// `test-probes` (item 7 option 0 task 1.2, F8): log a range read that
+    /// covers watched keys ([`crate::probes::Probe::watch_scans`]), each at
+    /// the layer holding its effective row.
+    #[cfg(feature = "test-probes")]
+    fn probe_scan_watch(
+        &self,
+        id: CfId,
+        own: &PendingState,
+        lower: &[Option<&PendingState>; 3],
+        covers: impl Fn(&[u8]) -> bool,
+    ) {
+        let tags = self.lower_tags(id);
+        crate::probes::record_scan(id.name(), covers, |key| {
+            if let Some(hit) = own.lookup(id, key) {
+                return (crate::probes::Layer::Own, hit.is_some());
+            }
+            for (layer, tag) in lower.iter().zip(tags) {
+                if let Some(hit) = layer.and_then(|l| l.lookup(id, key)) {
+                    return (tag, hit.is_some());
+                }
+            }
+            let found = self.db.get_cf_raw(id.name(), key).ok().flatten().is_some();
+            (crate::probes::Layer::Db, found)
+        });
     }
 
     /// `test-probes`: count a `prefix_exists` read that answered `exists`
@@ -1693,6 +1720,7 @@ impl NativeStateOverlay {
         if !crate::probes::active() {
             return;
         }
+        self.probe_scan_watch(id, own, lower, |k: &[u8]| k.starts_with(prefix));
         let rows = Self::effective_rows(id, own, lower, prefix, |k: &[u8]| k.starts_with(prefix));
         let tags = self.lower_tags(id);
         let in_db = |k: &[u8]| self.db.get_cf_raw(id.name(), k).ok().flatten().is_some();
@@ -1989,28 +2017,93 @@ impl NativeStateOverlay {
         }
     }
 
-    /// Pre-populate CF_ACCOUNTS from an EVM BundleState so that native execution
-    /// (specifically Lockbox) can read EVM account changes from this block.
-    pub fn seed_from_bundle(&self, bundle: &revm::database::BundleState) {
-        use crate::cf::CF_ACCOUNTS;
-        use crate::db::encode_account_info;
-        for (address, bundle_acct) in &bundle.state {
-            match &bundle_acct.info {
+    /// Item 7 option 0 (task 1.2): absorb a block's EVM rows into this block
+    /// overlay, in ONE pass under one write lock, so they ride the block's
+    /// pending set (its flush, its running-hash digest, and on the fast path
+    /// the frozen set, L and the checkpoint) instead of a separate batch:
+    /// - the bundle's plain change set, exactly as
+    ///   [`crate::incremental::apply_bundle_plain`] writes it (CF_ACCOUNTS put /
+    ///   delete, CF_STORAGE put / delete per slot, a zero slot deleted, CF_CODE
+    ///   put of the original bytes);
+    /// - then the writer-precompile journal's own pending puts and deletes
+    ///   (CoreWriter queue rows, the CF_FEE_CONFIG cursor rows), moved out of
+    ///   `journal` (consumed: its layers, if any, are released with it).
+    ///
+    /// The native phase then reads the bundle's CF_ACCOUNTS rows (lockbox) as
+    /// it read the rows the old `seed_from_bundle` put there, and
+    /// [`Self::dirty_evm_accounts`] still lists every bundle account. Errors
+    /// only on a closed (frozen) overlay or an unregistered CF (a code bug).
+    pub fn absorb_evm(
+        &self,
+        bundle: &revm::database::BundleState,
+        journal: NativeStateOverlay,
+    ) -> Result<(), StateError> {
+        use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_STORAGE};
+        use crate::db::{encode_account_info, storage_key};
+        let id = |cf: &str| intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()));
+        let (accounts, storage, code) = (id(CF_ACCOUNTS)?, id(CF_STORAGE)?, id(CF_CODE)?);
+        // Move the journal's rows out (its pending set is left empty) and
+        // release the journal before taking this overlay's lock.
+        let rows = std::mem::replace(&mut *journal.pending.write().unwrap(), PendingState::new());
+        drop(journal);
+        let mut state = self.pending.write().unwrap();
+        if state.frozen {
+            return Err(PendingState::frozen_err());
+        }
+        fn put(cfp: &mut CfPending, key: Vec<u8>, value: Vec<u8>) {
+            cfp.deletes.remove(&key);
+            cfp.writes.insert(key, value);
+        }
+        fn delete(cfp: &mut CfPending, key: Vec<u8>) {
+            cfp.writes.remove(&key);
+            cfp.deletes.insert(key);
+        }
+        for (address, acct) in &bundle.state {
+            match &acct.info {
                 Some(info) => {
-                    let _ = StateBackend::put_cf_raw(
-                        self,
-                        CF_ACCOUNTS,
-                        address.as_slice(),
-                        &encode_account_info(info),
-                    );
+                    put(state.cf_mut(accounts), address.to_vec(), encode_account_info(info).to_vec());
+                    let cfp = state.cf_mut(storage);
+                    for (slot, sv) in &acct.storage {
+                        let key = storage_key(address, slot).to_vec();
+                        if sv.present_value.is_zero() {
+                            delete(cfp, key);
+                        } else {
+                            put(cfp, key, sv.present_value.to_be_bytes::<32>().to_vec());
+                        }
+                    }
                 }
                 None => {
-                    if bundle_acct.original_info.is_some() {
-                        let _ = StateBackend::delete_cf_raw(self, CF_ACCOUNTS, address.as_slice());
+                    if acct.original_info.is_some() {
+                        delete(state.cf_mut(accounts), address.to_vec());
+                    }
+                    let cfp = state.cf_mut(storage);
+                    for slot in acct.storage.keys() {
+                        delete(cfp, storage_key(address, slot).to_vec());
                     }
                 }
             }
         }
+        let cfp = state.cf_mut(code);
+        for (code_hash, bytecode) in &bundle.contracts {
+            put(cfp, code_hash.to_vec(), bytecode.original_byte_slice().to_vec());
+        }
+        // The journal's pending set: puts and deletes are disjoint per key.
+        for (dst, src) in state.cfs.iter_mut().zip(rows.cfs) {
+            if src.is_empty() {
+                continue;
+            }
+            if dst.is_empty() {
+                *dst = src;
+                continue;
+            }
+            for key in src.deletes {
+                delete(dst, key);
+            }
+            for (key, value) in src.writes {
+                put(dst, key, value);
+            }
+        }
+        Ok(())
     }
 
     pub fn db(&self) -> &StateDb {
@@ -5569,6 +5662,253 @@ mod tests {
                 .as_deref(),
             Some(&[0x60u8, 0x00][..])
         );
+    }
+
+    /// Item 7 option 0 (task 1.2): a seeded random EVM block: a bundle
+    /// (accounts put with storage puts and zeroed slots, destroyed accounts
+    /// with slots, a slot-only `None` account, new code) and a journal's
+    /// pending set (queue rows and cursor rows, puts and deletes). Built
+    /// twice from one seed (`absorb_evm` consumes the journal).
+    fn o0_random_evm_block(
+        db: &StateDb,
+        seed: u64,
+    ) -> (revm::database::BundleState, NativeStateOverlay) {
+        use crate::cf::{CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
+        use alloy_primitives::{Bytes, U256};
+        use revm::database::states::{StorageSlot, StorageWithOriginalValues};
+        use revm::database::{AccountStatus, BundleAccount, BundleState};
+        use revm::state::{AccountInfo, Bytecode};
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut bundle = BundleState::default();
+        for a in 0..(1 + next(6)) {
+            let address = Address::repeat_byte((a as u8) * 16 + next(16) as u8);
+            let mut storage = StorageWithOriginalValues::default();
+            for _ in 0..next(5) {
+                let present = if next(3) == 0 { U256::ZERO } else { U256::from(1 + next(1000)) };
+                storage.insert(U256::from(next(8)), StorageSlot::new_changed(U256::from(next(9)), present));
+            }
+            let acct = match next(4) {
+                0 => BundleAccount::new(
+                    Some(AccountInfo::default()),
+                    None,
+                    storage,
+                    AccountStatus::Destroyed,
+                ),
+                1 => BundleAccount::new(None, None, storage, AccountStatus::Destroyed),
+                _ => {
+                    let code = (next(2) == 0).then(|| {
+                        Bytecode::new_raw(Bytes::from(vec![0x60, next(255) as u8, 0x00]))
+                    });
+                    let info = AccountInfo {
+                        balance: U256::from(next(1_000_000)),
+                        nonce: next(9),
+                        code_hash: code.as_ref().map_or(revm::primitives::KECCAK_EMPTY, |c| c.hash_slow()),
+                        code: code.clone(),
+                        account_id: None,
+                    };
+                    if let Some(c) = code {
+                        bundle.contracts.insert(c.hash_slow(), c);
+                    }
+                    BundleAccount::new(None, Some(info), storage, AccountStatus::Changed)
+                }
+            };
+            bundle.state.insert(address, acct);
+        }
+        let journal = NativeStateOverlay::new(db.clone());
+        for _ in 0..next(6) {
+            let mut key = (100 + next(4)).to_be_bytes().to_vec();
+            key.extend_from_slice(&next(5).to_be_bytes());
+            if next(4) == 0 {
+                journal.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key).unwrap();
+            } else {
+                journal.put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &[next(255) as u8; 9]).unwrap();
+            }
+        }
+        for cursor in [&b"core_writer_last_order_target"[..], b"core_writer_full_order_run"] {
+            if next(2) == 0 {
+                journal.put_cf_raw(CF_FEE_CONFIG, cursor, &next(500).to_be_bytes()).unwrap();
+            }
+        }
+        (bundle, journal)
+    }
+
+    /// The rows a `WriteBatch` holds, decoded back per CF name (later wins:
+    /// RocksDB's batch semantics). CF ids are learnt from a probe batch.
+    fn o0_decode_batch(
+        db: &StateDb,
+        batch: &WriteBatch,
+    ) -> BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>> {
+        struct Names<'a>(&'a mut BTreeMap<u32, &'static str>, &'static str);
+        impl rocksdb::WriteBatchIteratorCf for Names<'_> {
+            fn put_cf(&mut self, id: u32, _: &[u8], _: &[u8]) {
+                self.0.insert(id, self.1);
+            }
+            fn delete_cf(&mut self, _: u32, _: &[u8]) {}
+            fn merge_cf(&mut self, _: u32, _: &[u8], _: &[u8]) {}
+        }
+        let mut names = BTreeMap::new();
+        for cf in crate::cf::ALL_CF_NAMES {
+            let mut probe = WriteBatch::default();
+            probe.put_cf(db.cf_handle(cf).unwrap(), b"k", b"v");
+            probe.iterate_cf(&mut Names(&mut names, cf));
+        }
+        struct Rows<'a>(
+            &'a BTreeMap<u32, &'static str>,
+            BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>>,
+        );
+        impl rocksdb::WriteBatchIteratorCf for Rows<'_> {
+            fn put_cf(&mut self, id: u32, k: &[u8], v: &[u8]) {
+                self.1.insert((self.0[&id], k.to_vec()), Some(v.to_vec()));
+            }
+            fn delete_cf(&mut self, id: u32, k: &[u8]) {
+                self.1.insert((self.0[&id], k.to_vec()), None);
+            }
+            fn merge_cf(&mut self, _: u32, _: &[u8], _: &[u8]) {
+                panic!("no merge in an EVM batch");
+            }
+        }
+        let mut rows = Rows(&names, BTreeMap::new());
+        batch.iterate_cf(&mut rows);
+        rows.1
+    }
+
+    /// The overlay's own pending rows per CF name (`None` = tombstone).
+    fn o0_pending_rows(ov: &NativeStateOverlay) -> BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>> {
+        let state = ov.pending.read().unwrap();
+        let mut out = BTreeMap::new();
+        for (i, cfp) in state.cfs.iter().enumerate() {
+            let name = CfId(i as u8).name();
+            for (k, v) in &cfp.writes {
+                out.insert((name, k.clone()), Some(v.clone()));
+            }
+            for k in &cfp.deletes {
+                out.insert((name, k.clone()), None);
+            }
+        }
+        out
+    }
+
+    /// Item 7 option 0 (task 1.2, RED before `absorb_evm`): for random
+    /// bundles and journal pending sets, the block overlay's rows after
+    /// `absorb_evm` equal, key and value (tombstones included), what
+    /// `apply_bundle_plain` + `append_pending_to_batch` put in a `WriteBatch`
+    /// (today's EVM prefix minus the hashed mirror and trie), decoded back. The
+    /// journal is consumed (its pending set is left empty), and a closed
+    /// (frozen) overlay refuses the absorb.
+    #[test]
+    fn absorb_evm_writes_exactly_the_plain_batch_rows() {
+        let (db, _d) = temp_db();
+        let mut nonempty = 0;
+        for seed in 0..200u64 {
+            let (bundle, journal) = o0_random_evm_block(&db, seed);
+            let mut batch = WriteBatch::default();
+            crate::incremental::apply_bundle_plain(&db, &mut batch, &bundle).unwrap();
+            journal.append_pending_to_batch(&db, &mut batch).unwrap();
+            let want = o0_decode_batch(&db, &batch);
+            let ov = NativeStateOverlay::new(db.clone());
+            let shared = journal.clone();
+            ov.absorb_evm(&bundle, journal).unwrap();
+            assert_eq!(o0_pending_rows(&ov), want, "seed {seed}");
+            assert_eq!(shared.pending_write_count(), 0, "the journal is consumed");
+            nonempty += usize::from(!want.is_empty());
+        }
+        assert!(nonempty > 150, "the generator yields rows ({nonempty})");
+
+        // A frozen overlay refuses it (the block is closed).
+        let (bundle, journal) = o0_random_evm_block(&db, 7);
+        let ov = NativeStateOverlay::new(db.clone());
+        let _ = ov.freeze(1);
+        assert!(ov.absorb_evm(&bundle, journal).is_err());
+    }
+
+    /// Item 7 option 0 (task 1.2): one EVM block flushed today's way (plain
+    /// rows + journal rows as the batch PREFIX, the same rows as hash extras,
+    /// the bundle's CF_ACCOUNTS rows seeded into the overlay, then the native
+    /// writes) and the absorb way (rows absorbed into the overlay, then the
+    /// same native writes) gives the same `h_n` and the same bytes in every
+    /// CF. The native writes overlap the EVM rows on purpose: a credit to a
+    /// bundle account, a delete of an EVM-deleted account, a queue row drained
+    /// and a cursor rewritten.
+    #[test]
+    fn absorb_keeps_h_n_and_flush_bytes() {
+        use crate::cf::{CF_ACCOUNTS, CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
+        use crate::running_hash::read_running_hash;
+        let dump = |db: &StateDb| -> Vec<(&str, Vec<(Vec<u8>, Vec<u8>)>)> {
+            crate::cf::ALL_CF_NAMES
+                .iter()
+                .map(|cf| (*cf, StateBackend::iterate_cf(db, cf, None).unwrap()))
+                .collect()
+        };
+        for seed in 0..40u64 {
+            let mut out = Vec::new();
+            for absorb in [false, true] {
+                let (db, _d) = rsh_db();
+                // Pre-state, so deletions are observable.
+                for a in 0..16u8 {
+                    db.put_cf_raw(CF_ACCOUNTS, &[a * 16 + 3; 20], b"pre").unwrap();
+                }
+                let (bundle, journal) = o0_random_evm_block(&db, seed);
+                let native = |ov: &NativeStateOverlay| {
+                    let first = bundle.state.keys().next().copied().unwrap();
+                    ov.put_cf_raw(CF_ACCOUNTS, first.as_slice(), b"credited").unwrap();
+                    ov.delete_cf_raw(CF_ACCOUNTS, &[0x33; 20]).unwrap();
+                    let mut q = 101u64.to_be_bytes().to_vec();
+                    q.extend_from_slice(&0u64.to_be_bytes());
+                    ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &q).unwrap();
+                    ov.put_cf_raw(CF_FEE_CONFIG, b"core_writer_full_order_run", b"native").unwrap();
+                    ov.put_cf_raw(crate::cf::CF_NATIVE_BALANCES, &[seed as u8], b"bal").unwrap();
+                };
+                let ov = NativeStateOverlay::new(db.clone());
+                let prefix = if absorb {
+                    ov.absorb_evm(&bundle, journal).unwrap();
+                    native(&ov);
+                    WriteBatch::default()
+                } else {
+                    let mut batch = WriteBatch::default();
+                    crate::incremental::apply_bundle_plain(&db, &mut batch, &bundle).unwrap();
+                    journal.append_pending_to_batch(&db, &mut batch).unwrap();
+                    let mut extras = HashExtras::new();
+                    extras.add_evm_bundle(&bundle);
+                    extras.add_overlay_pending(&journal);
+                    // Today's `seed_from_bundle`: the bundle's CF_ACCOUNTS rows.
+                    for (address, acct) in &bundle.state {
+                        match &acct.info {
+                            Some(info) => ov
+                                .put_cf_raw(
+                                    CF_ACCOUNTS,
+                                    address.as_slice(),
+                                    &crate::db::encode_account_info(info),
+                                )
+                                .unwrap(),
+                            None if acct.original_info.is_some() => {
+                                ov.delete_cf_raw(CF_ACCOUNTS, address.as_slice()).unwrap()
+                            }
+                            None => {}
+                        }
+                    }
+                    native(&ov);
+                    ov.set_hash_extras(extras);
+                    batch
+                };
+                ov.flush_after_batch_with_native_trie_stats(prefix, &db, Some(1), None, None)
+                    .unwrap();
+                out.push((read_running_hash(&db), dump(&db), ov.dirty_evm_accounts()));
+            }
+            assert_eq!(out[0].0, out[1].0, "seed {seed}: h_n");
+            assert!(out[0].0.is_some());
+            assert_eq!(out[0].1, out[1].1, "seed {seed}: CF bytes");
+            let mut a = out[0].2.clone();
+            let mut b = out[1].2.clone();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "seed {seed}: dirty EVM accounts (the resync set)");
+        }
     }
 
     fn flush_block(db: &StateDb, h: u64) {

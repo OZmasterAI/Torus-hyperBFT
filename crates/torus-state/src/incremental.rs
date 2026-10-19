@@ -413,6 +413,28 @@ pub fn evm_block_batch_incremental(
     Ok((root, batch))
 }
 
+/// Item 7 option 0 (task 1.2): the EVM-derived part of
+/// [`evm_block_batch_incremental`] only: the hashed mirror (`CF_HASHED_*`,
+/// [`apply_bundle_hashed`]) and the trie nodes (`CF_TRIE_*`). The block's plain
+/// rows and its writer-precompile journal rows are absorbed into the block
+/// overlay instead ([`crate::NativeStateOverlay::absorb_evm`]); the caller
+/// makes this batch the prefix of the block's flush batch (consensus bug (c)),
+/// so all three land in ONE atomic write.
+pub fn evm_block_trie_batch(
+    db: &StateDb,
+    bundle: &BundleState,
+    precomputed: Option<(B256, TrieUpdates)>,
+) -> Result<(B256, WriteBatch), StateError> {
+    let (root, trie_updates) = match precomputed {
+        Some(pair) => pair,
+        None => incremental_evm_root(db, bundle)?,
+    };
+    let mut batch = WriteBatch::default();
+    apply_bundle_hashed(db, &mut batch, bundle)?;
+    write_trie_updates(db, &mut batch, &trie_updates)?;
+    Ok((root, batch))
+}
+
 /// Re-sync the incremental EVM trie (`CF_HASHED_ACCOUNTS` + `CF_TRIE_*`) for accounts whose
 /// `CF_ACCOUNTS` entry changed OUTSIDE the EVM-bundle commit — i.e. native post-commit (fee
 /// distribution to treasury/dev_pool, validator rewards) crediting EVM account balances.
@@ -423,8 +445,8 @@ pub fn evm_block_batch_incremental(
 /// each address. Without this, `CF_HASHED_*`/`CF_TRIE_*` drift from `CF_ACCOUNTS` after every
 /// fee-bearing block and the incremental root diverges from the full scan (devnet-smoke finding).
 ///
-/// T4.1: the dirty list is conservative — `seed_from_bundle` marks every EVM-bundle account dirty
-/// in the overlay, so most entries were already synced by [`commit_evm_bundle_incremental`].
+/// T4.1: the dirty list is conservative — the block overlay's EVM absorb (`absorb_evm`, formerly
+/// `seed_from_bundle`) marks every EVM-bundle account dirty in the overlay, so most entries were already synced by [`commit_evm_bundle_incremental`].
 /// Accounts whose `CF_HASHED_ACCOUNTS` mirror already byte-equals their final plain value are
 /// skipped (mirror and trie advance in one atomic batch, so mirror-equal implies trie-equal); when
 /// nothing genuinely drifted there is NO third `StateRoot` engine run at all.

@@ -148,6 +148,8 @@ pub struct Probe {
     watch: Mutex<Vec<(&'static str, Vec<u8>)>>,
     watched: Mutex<Vec<WatchedRead>>,
     height: AtomicU64,
+    /// Item 7 option 0 (task 1.2, F8): log scans too ([`Self::watch_scans`]).
+    scans: AtomicBool,
     skip_parent: AtomicBool,
     skip_checkpoint: AtomicBool,
     skip_deferred: AtomicBool,
@@ -195,6 +197,15 @@ impl Probe {
     /// Log every point read of `key` in `cf` from now on ([`Self::watched`]).
     pub fn watch(&self, cf: &'static str, key: Vec<u8>) {
         self.watch.lock().unwrap().push((cf, key));
+    }
+
+    /// Item 7 option 0 (task 1.2, F8): from now on a range read (iterate,
+    /// prefix walk, `prefix_exists`) whose range covers a watched key is
+    /// logged as a read of that key too, whether or not a row is there (the
+    /// scan could have observed it). The layer is the one holding the key's
+    /// effective row (`Db` when no layer holds it).
+    pub fn watch_scans(&self) {
+        self.scans.store(true, Ordering::SeqCst);
     }
 
     /// The height the next watched reads are logged at (the test sets it
@@ -297,6 +308,44 @@ pub(crate) fn record(cf: &'static str, layer: Layer, inflight: impl FnOnce() -> 
         let reader = READER.with(|r| r.get());
         let inflight = layer.frozen() && inflight();
         p.add(reader, layer, cf, inflight);
+    }
+}
+
+/// A range read of `cf`: with [`Probe::watch_scans`], every watched key of
+/// `cf` that `covers` selects is logged, at the layer `resolve` names (with
+/// whether a row is there). Counts nothing (the range's layer hits are
+/// [`record`]ed by the caller).
+pub(crate) fn record_scan(
+    cf: &'static str,
+    covers: impl Fn(&[u8]) -> bool,
+    resolve: impl Fn(&[u8]) -> (Layer, bool),
+) {
+    let probe = ACTIVE.with(|a| a.borrow().clone());
+    let Some(p) = probe else { return };
+    if !p.scans.load(Ordering::SeqCst) {
+        return;
+    }
+    let keys: Vec<Vec<u8>> = p
+        .watch
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(c, k)| *c == cf && covers(k))
+        .map(|(_, k)| k.clone())
+        .collect();
+    let reader = READER.with(|r| r.get());
+    for key in keys {
+        let (layer, found) = resolve(&key);
+        let read = WatchedRead {
+            cf,
+            key,
+            height: p.height.load(Ordering::SeqCst),
+            reader,
+            layer,
+            inflight: false,
+            found,
+        };
+        p.watched.lock().unwrap().push(read);
     }
 }
 
