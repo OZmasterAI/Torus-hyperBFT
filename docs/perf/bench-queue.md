@@ -660,6 +660,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    body persist) and the exec thread's (checkpoint upkeep, freeze, flush handoff, settle wait), plus RocksDB write /
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
+   **Order (owner s131):** 8u and 8v run **before** the RH4 3-arm rerun, which still waits on 18c's compaction-filter
+   build and its review. Queue after 8s: 8l, 8t, 8u, 8v, then the RH4 rerun.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
