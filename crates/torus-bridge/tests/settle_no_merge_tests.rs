@@ -31,11 +31,12 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{
-    parse_settle_no_merge, settle_no_merge_flushes_on_this_thread, with_settle_no_merge,
+    parse_settle_no_merge, settle_no_merge_fallbacks_on_this_thread,
+    settle_no_merge_flushes_on_this_thread, with_settle_no_merge,
     NativeActionResult, NativeExecContext, NativeExecutor,
 };
 use torus_bridge::state_root::compute_native_state_root;
-use torus_core::position::NativeBalance;
+use torus_core::position::{position_key, MarginType, NativeBalance, Position};
 use torus_state::action_status::FailureReason;
 use torus_state::cf::{
     CF_NATIVE_BALANCES, CF_NATIVE_MARKETS, CF_NATIVE_ORDER_BOOKS, CF_NATIVE_POSITIONS,
@@ -326,6 +327,9 @@ struct RunStats {
     parallel_calls: u64,
     /// Unmerged flushes (`settle_no_merge_flushes_on_this_thread` delta).
     no_merge_flushes: u64,
+    /// Flushes with runs that fell back to merge + flush_all
+    /// (`settle_no_merge_fallbacks_on_this_thread` delta).
+    no_merge_fallbacks: u64,
     /// Position deletes (fully closed positions) written.
     position_deletes: usize,
     position_puts: usize,
@@ -359,11 +363,52 @@ fn db_dump(db: &StateDb) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     out
 }
 
+/// Codex P1 (review of dbe14b21): stored "opaque" position rows whose
+/// fields name another market than their key, so two markets' pass-A caches
+/// hold the same key. Trader 5: key (5, 1) says market 2, key (5, 2) says
+/// market 3 (market 2's cache keeps (5, 2) CLEAN while market 1's dirties
+/// it). Trader 6: key (6, 1) says market 2 and (6, 2) is a plain market-2
+/// row (both caches dirty (6, 2)). (trader, key market, row market, size).
+const ALIASES: [(u8, MarketId, MarketId, i64); 4] = [(5, 1, 2, 2), (5, 2, 3, 4), (6, 1, 2, 2), (6, 2, 2, 4)];
+
+fn seed_aliases(db: &StateDb) {
+    for (t, key_market, market_id, size) in ALIASES {
+        let row = Position {
+            trader: addr(t),
+            market_id,
+            is_long: true,
+            size: fp(size),
+            entry_price: fp(100),
+            cost_basis: fp(100 * size),
+            realized_pnl: FixedPoint::ZERO,
+            isolated_margin: FixedPoint::ZERO,
+            margin_type: MarginType::Cross,
+        };
+        db.put_cf_raw(
+            CF_NATIVE_POSITIONS,
+            &position_key(&addr(t), key_market),
+            &borsh::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 /// Feeds `blocks` through one context per block over a fresh overlay on
 /// one DB (flushed after each block, as the committer does), on the forced
 /// parallel settle with the pass-A cap pinned. A block that goes fatal is
 /// never flushed and ends the run.
 fn run(blocks: &[Block], cap: usize, record_fills: bool, fault: &LastBlockFault) -> (RunOut, RunStats) {
+    run_seeded(blocks, cap, record_fills, fault, false)
+}
+
+/// [`run`], with the [`ALIASES`] rows stored first when `aliases`.
+fn run_seeded(
+    blocks: &[Block],
+    cap: usize,
+    record_fills: bool,
+    fault: &LastBlockFault,
+    aliases: bool,
+) -> (RunOut, RunStats) {
     let dir = tempfile::tempdir().expect("temp dir");
     let db = StateDb::open(dir.path()).expect("open db");
     for n in 1..=TRADERS as u8 {
@@ -375,9 +420,13 @@ fn run(blocks: &[Block], cap: usize, record_fills: bool, fault: &LastBlockFault)
             .put_native_balance(&addr(n), &bal)
             .unwrap();
     }
+    if aliases {
+        seed_aliases(&db);
+    }
     let mut stats = RunStats::default();
     let mut out = Vec::new();
     let flushes_before = settle_no_merge_flushes_on_this_thread();
+    let fallbacks_before = settle_no_merge_fallbacks_on_this_thread();
     for (h, block) in blocks.iter().enumerate() {
         let last = h + 1 == blocks.len();
         let rec = Recorder {
@@ -464,6 +513,7 @@ fn run(blocks: &[Block], cap: usize, record_fills: bool, fault: &LastBlockFault)
         rec.inner.flush(&db).expect("flush block overlay");
     }
     stats.no_merge_flushes = settle_no_merge_flushes_on_this_thread() - flushes_before;
+    stats.no_merge_fallbacks = settle_no_merge_fallbacks_on_this_thread() - fallbacks_before;
     let out = RunOut {
         blocks: out,
         db_dump: db_dump(&db),
@@ -474,26 +524,46 @@ fn run(blocks: &[Block], cap: usize, record_fills: bool, fault: &LastBlockFault)
 
 /// Flag off vs on (and the unpinned env run, which must equal flag off
 /// unless the env turns it on) over `blocks`, at caps 1, 2 and 8, with and
-/// without a fill subscriber. Returns the flag-off runs' stats.
+/// without a fill subscriber. Returns the flag-off and flag-on runs' stats.
 fn assert_no_merge_equivalent(
     blocks: &[Block],
     fault: &dyn Fn(&RunOut) -> LastBlockFault,
     what: &str,
 ) -> Vec<RunStats> {
+    assert_no_merge_equivalent_seeded(blocks, fault, what, false)
+        .into_iter()
+        .map(|(off, on)| {
+            assert_eq!(on.no_merge_fallbacks, 0, "{what}: per-market caches are disjoint ({on:?})");
+            off
+        })
+        .collect()
+}
+
+/// [`assert_no_merge_equivalent`] over [`run_seeded`].
+fn assert_no_merge_equivalent_seeded(
+    blocks: &[Block],
+    fault: &dyn Fn(&RunOut) -> LastBlockFault,
+    what: &str,
+    aliases: bool,
+) -> Vec<(RunStats, RunStats)> {
     let mut all = Vec::new();
     for record_fills in [true, false] {
         for cap in [1usize, 2, 8] {
             let label = format!("{what}, cap {cap}, record_fills {record_fills}");
             // The fault is chosen from a fault-free flag-off run.
             let (clean, _) = with_settle_no_merge(false, || {
-                run(blocks, cap, record_fills, &LastBlockFault::None)
+                run_seeded(blocks, cap, record_fills, &LastBlockFault::None, aliases)
             });
             let fault = fault(&clean);
             let (off, off_stats) =
-                with_settle_no_merge(false, || run(blocks, cap, record_fills, &fault));
+                with_settle_no_merge(false, || run_seeded(blocks, cap, record_fills, &fault, aliases));
             let (on, on_stats) =
-                with_settle_no_merge(true, || run(blocks, cap, record_fills, &fault));
-            assert_eq!(off_stats.no_merge_flushes, 0, "{label}: flag off never skips the merge");
+                with_settle_no_merge(true, || run_seeded(blocks, cap, record_fills, &fault, aliases));
+            assert_eq!(
+                (off_stats.no_merge_flushes, off_stats.no_merge_fallbacks),
+                (0, 0),
+                "{label}: flag off never skips the merge"
+            );
             assert!(
                 on_stats.no_merge_flushes > 0,
                 "{label}: flag on never took the unmerged flush ({on_stats:?})"
@@ -503,11 +573,12 @@ fn assert_no_merge_equivalent(
                 (on_stats.fallbacks, on_stats.parallel_calls, on_stats.hits),
                 "{label}: same settle paths and faults"
             );
-            // Every parallel call without a fallback flushed unmerged.
+            // Every parallel call without a plan fallback flushed with runs:
+            // unmerged, or merged when the runs were not provably disjoint.
             assert_eq!(
-                on_stats.no_merge_flushes,
+                on_stats.no_merge_flushes + on_stats.no_merge_fallbacks,
                 on_stats.parallel_calls - on_stats.fallbacks,
-                "{label}: unmerged flushes"
+                "{label}: flushes with runs"
             );
             assert_eq!(off.blocks.len(), on.blocks.len(), "{label}: blocks run");
             for (h, (a, b)) in off.blocks.iter().zip(&on.blocks).enumerate() {
@@ -524,13 +595,13 @@ fn assert_no_merge_equivalent(
             }
             assert_eq!(off, on, "{label}: run diverged");
             let env_on = parse_settle_no_merge(std::env::var("TORUS_SETTLE_NO_MERGE").ok().as_deref());
-            let (plain, _) = run(blocks, cap, record_fills, &fault);
+            let (plain, _) = run_seeded(blocks, cap, record_fills, &fault, aliases);
             assert_eq!(
                 if env_on { &on } else { &off },
                 &plain,
                 "{label}: unpinned (env) run diverged"
             );
-            all.push(off_stats);
+            all.push((off_stats, on_stats));
         }
     }
     all
@@ -617,4 +688,20 @@ fn settle_no_merge_identical_with_fatal_flush_failure() {
             .is_some_and(|f| f.starts_with("position cache flush failed")),
         "{fatal:?}"
     );
+}
+
+/// Codex P1 (review of dbe14b21): aliased opaque rows put the same key in
+/// two markets' pass-A caches (clean in one, dirty in the other; or dirty in
+/// both). The flag-on flush must detect the overlap and fall back to merge +
+/// flush_all, so every write, result and the state root equal flag off
+/// (whatever the reference merge does with the alias: not fixed here), and
+/// the fallback is counted.
+#[test]
+fn settle_no_merge_identical_with_aliased_opaque_rows() {
+    let blocks = stream(0x0A11_A5ED_8C22, 6, 6, 400);
+    let stats = assert_no_merge_equivalent_seeded(&blocks, &|_| LastBlockFault::None, "aliases", true);
+    for (off, on) in stats {
+        assert_eq!(off.fallbacks, 0, "{off:?}");
+        assert!(on.no_merge_fallbacks > 0, "the overlap was detected: {on:?}");
+    }
 }

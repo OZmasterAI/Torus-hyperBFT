@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use torus_core::position::{
-    position_key, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager,
+    position_key, FillEffect, MarginType, NativeBalance, PositionCache, PositionManager, RunsFlush,
 };
 use torus_state::cf::{CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS};
 use torus_state::{AtomicWriteOp, StateBackend, StateDb, StateError};
@@ -852,7 +852,7 @@ fn flush_with_runs_fails_at_the_same_write() {
             let (mut batch, mut runs) = runs_scenario(&pm, seed, 6, true);
             *pm.state().fail_key.lock().unwrap() = Some(fail_key.clone());
             let err = if with_runs {
-                batch.flush_with_runs(&mut runs, &pm)
+                batch.flush_with_runs(&mut runs, &pm).map(|_| ())
             } else {
                 batch.reserve(runs.iter().map(PositionCache::len).sum());
                 for c in runs {
@@ -870,5 +870,180 @@ fn flush_with_runs_fails_at_the_same_write() {
         assert_eq!(merged_log.len(), stop, "seed {seed}: stops at the failing row");
         assert_eq!(merged_log, runs_log, "seed {seed}");
         assert_eq!(merged_err, runs_err, "seed {seed}");
+    }
+}
+
+// ============================================================================
+// 8k L2.2 Codex P1: aliased opaque rows make the per-market caches overlap
+// ============================================================================
+
+/// Codex's probe (review of dbe14b21): stored rows whose fields name another
+/// market (an "opaque" row; `put_position` never writes one) make two
+/// per-market caches hold the same key. Trader 1's row under key (1, 1) says
+/// market 2, so market 1's cache loads (1, 1) and files the fill under
+/// (1, 2); market 2's cache loads (1, 2) too. Without `collision` the row
+/// under (1, 2) names market 3 (market 2's cache dirties (1, 3) and keeps
+/// (1, 2) clean: the merge's later clean row wins); with it, the row is a
+/// plain market-2 row and both caches dirty (1, 2). `extra` plain traders
+/// per market make the sort non-trivial.
+fn aliased_runs(pm: &PositionManager<Recorder>, collision: bool, extra: u8) -> Vec<PositionCache> {
+    use torus_core::position::Position;
+    let alias = addr(1);
+    let row = |market_id: MarketId, size: i64| Position {
+        trader: alias,
+        market_id,
+        is_long: true,
+        size: fp(size),
+        entry_price: fp(100),
+        cost_basis: fp(100 * size),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    for (key_market, payload_market, size) in [(1, 2, 2), (2, if collision { 2 } else { 3 }, 4)] {
+        pm.state()
+            .put_cf_raw(
+                CF_NATIVE_POSITIONS,
+                &position_key(&alias, key_market),
+                &borsh::to_vec(&row(payload_market, size)).unwrap(),
+            )
+            .unwrap();
+    }
+    pm.state().log.lock().unwrap().clear();
+    [1u64, 2]
+        .into_iter()
+        .map(|m| {
+            let mut c = PositionCache::new();
+            pm.apply_fill_cached(&mut c, &alias, m, true, fp(1), fp(100), MarginType::Cross)
+                .unwrap();
+            for i in 2..2 + extra {
+                pm.apply_fill_cached(&mut c, &addr(i), m, true, fp(1), fp(100), MarginType::Cross)
+                    .unwrap();
+            }
+            c
+        })
+        .collect()
+}
+
+/// (writes in issue order, CF_NATIVE_POSITIONS at the end, the path taken).
+type AliasOut = (Vec<Write>, Vec<(Vec<u8>, Vec<u8>)>, Option<RunsFlush>);
+
+/// Flag off (merge in market order + flush_all) or on (flush_with_runs).
+fn flush_aliased(on: bool, collision: bool, extra: u8) -> AliasOut {
+    let (_d, pm) = Recorder::new();
+    let mut runs = aliased_runs(&pm, collision, extra);
+    let mut batch = PositionCache::new();
+    let path = if on {
+        Some(batch.flush_with_runs(&mut runs, &pm).unwrap())
+    } else {
+        for c in runs {
+            batch.merge_disjoint(c);
+        }
+        batch.flush_all(&pm).unwrap();
+        None
+    };
+    let writes = std::mem::take(&mut *pm.state().log.lock().unwrap());
+    let rows = pm.state().inner.iterate_cf(CF_NATIVE_POSITIONS, None).unwrap();
+    (writes, rows, path)
+}
+
+/// RED for Codex P1 (non-collision probe: "flag_off writes [(3, 4), (3, 5)];
+/// flag_on writes [(2, 3), (3, 5)]; final state equal: false"): with
+/// overlapping caches the flag-on flush must write exactly what merge +
+/// flush_all writes (whatever that reference does), and say it merged.
+#[test]
+fn aliased_rows_across_runs_flush_like_merge_then_flush_all() {
+    for collision in [false, true] {
+        for extra in [0u8, 50] {
+            let label = format!("collision {collision}, extra {extra}");
+            let (off_writes, off_rows, _) = flush_aliased(false, collision, extra);
+            let (on_writes, on_rows, path) = flush_aliased(true, collision, extra);
+            assert!(!off_writes.is_empty(), "{label}");
+            assert_eq!(off_writes, on_writes, "{label}: write sequence");
+            assert_eq!(off_rows, on_rows, "{label}: final positions");
+            assert_eq!(path, Some(RunsFlush::Merged), "{label}: overlapping caches fall back");
+        }
+    }
+}
+
+/// RED for Codex P1 (release probe: "flag_on market2 final sizes over 200
+/// identical inputs: {3, 5}"): the same overlapping input gives one result
+/// every time (no unstable sort over a duplicated key), equal to flag off.
+#[test]
+fn overlapping_runs_flush_one_result_every_time() {
+    let reference = flush_aliased(false, true, 50);
+    for i in 0..200 {
+        let (writes, rows, _) = flush_aliased(true, true, 50);
+        assert_eq!((&writes, &rows), (&reference.0, &reference.1), "iteration {i}");
+    }
+}
+
+/// The normal case keeps the fast path: per-market caches (clean reads,
+/// misses, tombstones; with and without batch keys of a further market; an
+/// empty run among them) flush unmerged, and still exactly like merge +
+/// flush_all.
+#[test]
+fn disjoint_runs_take_the_unmerged_path() {
+    for seed in 0..10u64 {
+        for (markets, batch_keys) in [(1, false), (5, true), (24, true)] {
+            let (_d, pm) = Recorder::new();
+            let (mut batch, mut runs) = runs_scenario(&pm, seed, markets, batch_keys);
+            runs.insert(runs.len() / 2, PositionCache::new());
+            assert_eq!(
+                batch.flush_with_runs(&mut runs, &pm).unwrap(),
+                RunsFlush::Unmerged,
+                "seed {seed}, {markets} markets"
+            );
+        }
+    }
+}
+
+/// Conservative edges: a run holding a key of another run's market (no
+/// alias needed: a plain `set` of a foreign-market row), or a batch cache
+/// whose market sits inside the runs' range, falls back; the writes still
+/// equal merge + flush_all.
+#[test]
+fn foreign_market_keys_fall_back_and_match() {
+    use torus_core::position::Position;
+    let foreign = |m: MarketId| Position {
+        trader: addr(200),
+        market_id: m,
+        is_long: false,
+        size: fp(3),
+        entry_price: fp(100),
+        cost_basis: fp(300),
+        realized_pnl: FixedPoint::ZERO,
+        isolated_margin: FixedPoint::ZERO,
+        margin_type: MarginType::Cross,
+    };
+    // (into run 0 a key of market 3 | into the batch cache a key of market 2)
+    for into_batch in [false, true] {
+        let build = |pm: &PositionManager<Recorder>| {
+            let (mut batch, mut runs) = runs_scenario(pm, 7, 5, false);
+            if into_batch {
+                batch.set(foreign(2));
+            } else {
+                runs[0].set(foreign(3));
+            }
+            (batch, runs)
+        };
+        let (_d1, a_pm) = Recorder::new();
+        let (mut a, runs) = build(&a_pm);
+        for c in runs {
+            a.merge_disjoint(c);
+        }
+        a.flush_all(&a_pm).unwrap();
+        let (_d2, b_pm) = Recorder::new();
+        let (mut b, mut runs) = build(&b_pm);
+        assert_eq!(
+            b.flush_with_runs(&mut runs, &b_pm).unwrap(),
+            RunsFlush::Merged,
+            "into_batch {into_batch}"
+        );
+        assert_eq!(*a_pm.state().log.lock().unwrap(), *b_pm.state().log.lock().unwrap());
+        // The fallback leaves nothing dirty behind either.
+        b_pm.state().log.lock().unwrap().clear();
+        b.flush_with_runs(&mut runs, &b_pm).unwrap();
+        assert!(b_pm.state().log.lock().unwrap().is_empty());
     }
 }

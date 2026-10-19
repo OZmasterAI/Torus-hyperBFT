@@ -655,6 +655,10 @@ thread_local! {
     /// per-market caches unmerged (tests: proves the flag-on arm took the
     /// no-merge path).
     static SETTLE_NO_MERGE_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 8k L2.2: end-of-call flushes on this thread whose runs were not
+    /// provably disjoint, so they were merged in order and `flush_all`-ed
+    /// (the flag-off sequence; also `torus_exec_settle_no_merge_fallbacks`).
+    static SETTLE_NO_MERGE_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// 8k L2.2: runs `f` with `TORUS_SETTLE_NO_MERGE` pinned to `on` on this
@@ -678,6 +682,13 @@ pub fn with_settle_no_merge<R>(on: bool, f: impl FnOnce() -> R) -> R {
 #[doc(hidden)]
 pub fn settle_no_merge_flushes_on_this_thread() -> u64 {
     SETTLE_NO_MERGE_FLUSHES.with(std::cell::Cell::get)
+}
+
+/// 8k L2.2: end-of-call flushes with runs this thread ran so far that fell
+/// back to merge + `flush_all` (runs not provably disjoint).
+#[doc(hidden)]
+pub fn settle_no_merge_fallbacks_on_this_thread() -> u64 {
+    SETTLE_NO_MERGE_FALLBACKS.with(std::cell::Cell::get)
 }
 
 /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`, node-local, off by default): the
@@ -8755,9 +8766,21 @@ impl NativeExecutor {
         }
         // 8k L2.2: pass B's unmerged runs and `pos_cache` in one sorted
         // flush: the writes and their order are those of merge + flush_all.
+        // Runs not provably disjoint (an opaque row put one market's key in
+        // another market's cache) ARE merged + flush_all-ed, counted here
+        // (decided before any write, so a failing flush is counted too).
         let pos_flushed = if !pos_runs.is_empty() {
-            SETTLE_NO_MERGE_FLUSHES.with(|c| c.set(c.get() + 1));
-            pos_cache.flush_with_runs(&mut pos_runs, &ctx.positions)
+            if pos_cache.runs_disjoint(&pos_runs) {
+                SETTLE_NO_MERGE_FLUSHES.with(|c| c.set(c.get() + 1));
+            } else {
+                SETTLE_NO_MERGE_FALLBACKS.with(|c| c.set(c.get() + 1));
+                if let Some(ref m) = ctx.metrics {
+                    m.exec_settle_no_merge_fallbacks.inc();
+                }
+            }
+            pos_cache
+                .flush_with_runs(&mut pos_runs, &ctx.positions)
+                .map(|_| ())
         } else {
             // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
             #[cfg(any(test, feature = "test-reference-paths"))]

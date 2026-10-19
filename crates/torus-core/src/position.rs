@@ -712,6 +712,17 @@ fn pro_rata(basis: FixedPoint, q: FixedPoint, size: FixedPoint) -> FixedPoint {
     FixedPoint::from_raw(if negative { -m } else { m })
 }
 
+/// How [`PositionCache::flush_with_runs`] wrote its caches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunsFlush {
+    /// The caches' key sets were provably disjoint: one sorted pass over
+    /// every cache's dirty rows, nothing merged.
+    Unmerged,
+    /// Not provably disjoint: the runs were `merge_disjoint`-ed into the
+    /// batch cache in order and `flush_all` ran (the flag-off sequence).
+    Merged,
+}
+
 /// C1: per-batch write-back cache for `Position` rows, mirroring the
 /// executor's BalanceCache pattern.
 ///
@@ -745,6 +756,21 @@ fn pro_rata(basis: FixedPoint, q: FixedPoint, size: FixedPoint) -> FixedPoint {
 pub struct PositionCache {
     map: HashMap<(Address, MarketId), Option<Position>>,
     dirty: HashSet<(Address, MarketId)>,
+    /// 8k L2.2: lowest and highest market id of any key ever put in `map`
+    /// (clean reads, misses, tombstones and dirty rows alike); `None` while
+    /// `map` is empty. `map` never drops a key, so this always covers its
+    /// key set: two caches whose ranges do not intersect hold disjoint keys
+    /// ([`Self::runs_disjoint`]). Two compares per new key.
+    markets: Option<(MarketId, MarketId)>,
+}
+
+/// Widen `markets` (a [`PositionCache`]'s key-market range) to cover `m`.
+#[inline]
+fn cover_market(markets: &mut Option<(MarketId, MarketId)>, m: MarketId) {
+    *markets = Some(match *markets {
+        Some((lo, hi)) => (lo.min(m), hi.max(m)),
+        None => (m, m),
+    });
 }
 
 impl PositionCache {
@@ -778,6 +804,7 @@ impl PositionCache {
         }
         let pos = positions.get_position_typed(typed, trader, market_id)?;
         self.map.insert(key, pos.clone());
+        cover_market(&mut self.markets, market_id);
         Ok(pos)
     }
 
@@ -804,7 +831,11 @@ impl PositionCache {
         let key = (*trader, market_id);
         let slot = match self.map.entry(key) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(positions.get_position_typed(typed, trader, market_id)?),
+            Entry::Vacant(e) => {
+                let row = positions.get_position_typed(typed, trader, market_id)?;
+                cover_market(&mut self.markets, market_id);
+                e.insert(row)
+            }
         };
         if slot
             .as_ref()
@@ -834,6 +865,7 @@ impl PositionCache {
     /// Store an updated position and mark it dirty (no backend write yet).
     pub fn set(&mut self, pos: Position) {
         let key = (pos.trader, pos.market_id);
+        cover_market(&mut self.markets, key.1);
         self.map.insert(key, Some(pos));
         self.dirty.insert(key);
     }
@@ -841,6 +873,7 @@ impl PositionCache {
     /// Tombstone a fully-closed position (flushes as a delete).
     pub fn remove(&mut self, trader: &Address, market_id: MarketId) {
         let key = (*trader, market_id);
+        cover_market(&mut self.markets, market_id);
         self.map.insert(key, None);
         self.dirty.insert(key);
     }
@@ -852,9 +885,43 @@ impl PositionCache {
     /// have provably disjoint key sets and the merged map is identical to
     /// what one shared cache would hold after sequential settlement — in any
     /// merge order. Callers merge in sorted market order anyway.
+    ///
+    /// Not always disjoint: a stored row whose fields name another market
+    /// (an opaque row, see `update_in_place`) files a fill under that
+    /// market's key, so two market caches can share a key; `extend` then
+    /// keeps the later cache's entry (roadmap pre-testnet note "Parallel-
+    /// settle merge drops a position update for aliased opaque rows").
     pub fn merge_disjoint(&mut self, other: PositionCache) {
         self.map.extend(other.map);
         self.dirty.extend(other.dirty);
+        if let Some((lo, hi)) = other.markets {
+            cover_market(&mut self.markets, lo);
+            cover_market(&mut self.markets, hi);
+        }
+    }
+
+    /// 8k L2.2: proof that this cache and every run hold pairwise disjoint
+    /// key sets, from the key-market ranges alone (O(runs), no key walk):
+    /// the non-empty runs' ranges are strictly ascending (each run's lowest
+    /// market above the previous run's highest) and this cache's range
+    /// meets none of them. Pass B's per-market caches satisfy it unless an
+    /// opaque row put a foreign market's key in one. `false` = not proven
+    /// (conservative: disjoint caches can fail it, overlapping ones never
+    /// pass).
+    pub fn runs_disjoint(&self, runs: &[PositionCache]) -> bool {
+        let mut prev_hi: Option<MarketId> = None;
+        for (lo, hi) in runs.iter().filter_map(|r| r.markets) {
+            if prev_hi.is_some_and(|p| lo <= p) {
+                return false;
+            }
+            if let Some((blo, bhi)) = self.markets {
+                if blo <= hi && lo <= bhi {
+                    return false;
+                }
+            }
+            prev_hi = Some(hi);
+        }
+        true
     }
 
     /// Number of cached entries (live rows, misses and tombstones).
@@ -898,24 +965,41 @@ impl PositionCache {
     }
 
     /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`): [`flush_all`] of this cache with
-    /// `runs` (pass B's per-market caches) merged in, without merging them.
-    /// Gathers `(key, row)` for every dirty key of this cache and of each run,
-    /// sorts by `(trader, market_id)` and writes in that order, then clears
-    /// every dirty set. The caches must hold disjoint keys (per-market caches
-    /// do: the market is part of the key; debug-asserted), so the keys are
-    /// unique and the write sequence is exactly that of [`merge_disjoint`]
-    /// of every run followed by [`flush_all`]: the same rows, in the same
-    /// global key order (which keeps the overlay's sorted-map inserts at its
-    /// right edge). What it skips: moving every entry of every run (clean
-    /// read hits included) into one map, and the second lookup per dirty key.
+    /// `runs` (pass B's per-market caches) merged in, in order, without
+    /// merging them when that is provably the same.
+    ///
+    /// Fast path ([`RunsFlush::Unmerged`]), when [`runs_disjoint`] proves
+    /// every cache's key set (clean entries included) disjoint from the
+    /// others': gathers `(key, row)` for every dirty key of this cache and
+    /// of each run, sorts by `(trader, market_id)` (the keys are unique, so
+    /// the order is total and the sort deterministic) and writes in that
+    /// order, then clears every dirty set. That is exactly the write sequence
+    /// of [`merge_disjoint`] of every run followed by [`flush_all`]: the same
+    /// rows, in the same global key order. What it skips: moving every entry
+    /// of every run (clean read hits included) into one map, and the second
+    /// lookup per dirty key.
+    ///
+    /// Otherwise ([`RunsFlush::Merged`]; an opaque row put one market's key
+    /// in another market's cache): it IS merge + flush_all, run by run in
+    /// slice order (`std::mem::take` leaves each run empty), so a clean
+    /// entry of a later run replaces an earlier run's dirty row exactly as
+    /// the flag-off path does.
     ///
     /// [`flush_all`]: Self::flush_all
     /// [`merge_disjoint`]: Self::merge_disjoint
+    /// [`runs_disjoint`]: Self::runs_disjoint
     pub fn flush_with_runs<T: StateBackend>(
         &mut self,
         runs: &mut [PositionCache],
         positions: &PositionManager<T>,
-    ) -> Result<(), CoreError> {
+    ) -> Result<RunsFlush, CoreError> {
+        if !self.runs_disjoint(runs) {
+            for run in runs.iter_mut() {
+                self.merge_disjoint(std::mem::take(run));
+            }
+            self.flush_all(positions)?;
+            return Ok(RunsFlush::Merged);
+        }
         let total = self.dirty.len() + runs.iter().map(|r| r.dirty.len()).sum::<usize>();
         let mut rows: Vec<((Address, MarketId), &Option<Position>)> = Vec::with_capacity(total);
         for cache in std::iter::once(&*self).chain(runs.iter()) {
@@ -929,7 +1013,7 @@ impl PositionCache {
         rows.sort_unstable_by_key(|row| row.0);
         debug_assert!(
             rows.windows(2).all(|w| w[0].0 < w[1].0),
-            "flush_with_runs: two caches hold the same key"
+            "flush_with_runs: runs_disjoint passed but two caches hold the same key"
         );
         for (key, row) in rows {
             match row {
@@ -941,7 +1025,7 @@ impl PositionCache {
         for run in runs.iter_mut() {
             run.dirty.clear();
         }
-        Ok(())
+        Ok(RunsFlush::Unmerged)
     }
 
     /// Item 6 Phase 2 step 0.4: the per-row flush, frozen as the reference

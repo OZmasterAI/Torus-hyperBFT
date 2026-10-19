@@ -291,3 +291,50 @@ fn ubench_position_cache_flush_runs() {
         );
     }
 }
+
+// ============================================================================
+// 8k L2.2 Codex P1 fix: the cost of the disjointness proof
+// ============================================================================
+
+/// `PositionCache::runs_disjoint`, the proof `flush_with_runs` runs before
+/// its unmerged fast path, on pass B's 300 per-market caches at ~16.8k and
+/// ~26k cache entries per block (the 8n deep-book sizes). It compares the
+/// caches' key-market ranges (kept on insert, two compares per new key), so
+/// it walks the 300 runs, never the keys: the cost must not grow with the
+/// entry count.
+///
+///   cargo test -p torus-core --release --test ubench_position_cache ubench_position_cache_runs_disjoint -- --ignored --nocapture
+#[test]
+#[ignore]
+fn ubench_position_cache_runs_disjoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let pm = PositionManager::new(StateDb::open(dir.path()).unwrap());
+    for target in [16_800usize, 26_000] {
+        // The fewest fills per market whose caches reach `target` entries.
+        let mut fills_per_market = 20;
+        let (runs, entries) = loop {
+            let (runs, _) = block_runs(&pm, fills_per_market, 0x0D15_7017);
+            let n: usize = runs.iter().map(PositionCache::len).sum();
+            if n >= target {
+                break (runs, n);
+            }
+            fills_per_market += 1;
+        };
+        let batch = PositionCache::new();
+        assert!(batch.runs_disjoint(&runs), "per-market caches are disjoint");
+        let iters = 20_000;
+        let mut ns = Vec::new();
+        for _ in 0..ROUNDS * 2 {
+            let t = Instant::now();
+            for _ in 0..iters {
+                black_box(black_box(&batch).runs_disjoint(black_box(&runs)));
+            }
+            ns.push(t.elapsed().as_nanos() as f64 / iters as f64);
+        }
+        println!(
+            "UBENCH runs_disjoint {entries} cache entries ({fills_per_market} fills/market x {MARKETS} runs): median {:.1} ns/block, min {:.1}",
+            median(ns.clone()),
+            ns.iter().cloned().fold(f64::MAX, f64::min)
+        );
+    }
+}

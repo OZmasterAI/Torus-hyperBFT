@@ -31151,8 +31151,8 @@ mod crash_recovery_tests {
     #[test]
     fn settle_no_merge_state_equals_flag_off() {
         use torus_bridge::native_executor::{
-            parse_settle_no_merge, settle_no_merge_flushes_on_this_thread, with_settle_no_merge,
-            BookMode,
+            parse_settle_no_merge, settle_no_merge_fallbacks_on_this_thread,
+            settle_no_merge_flushes_on_this_thread, with_settle_no_merge, BookMode,
         };
         assert!(!parse_settle_no_merge(None), "off by default");
         assert!(parse_settle_no_merge(Some("1")));
@@ -31160,6 +31160,7 @@ mod crash_recovery_tests {
         assert!(!cloid_places.is_empty(), "the stream places cloids");
         let run = |on: bool| {
             let before = settle_no_merge_flushes_on_this_thread();
+            let fallbacks_before = settle_no_merge_fallbacks_on_this_thread();
             let r = with_p2_engine_threads(4, || {
                 with_settle_no_merge(on, || {
                     p2_run_with(
@@ -31172,6 +31173,13 @@ mod crash_recovery_tests {
                     )
                 })
             });
+            // Codex P1 fix: plain rows keep the per-market caches provably
+            // disjoint, so no flush falls back to merge + flush_all.
+            assert_eq!(
+                settle_no_merge_fallbacks_on_this_thread() - fallbacks_before,
+                0,
+                "no-merge fallbacks (on {on})"
+            );
             (r, settle_no_merge_flushes_on_this_thread() - before)
         };
         let (off, off_runs) = run(false);
