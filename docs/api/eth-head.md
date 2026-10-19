@@ -19,10 +19,15 @@ So:
 
 - **The eth head, the receipts and the EVM state move together, at the checkpoint.** A receipt is
   never visible before the state it produced, and no state change shows before its block does.
-- **They lag execution by up to one checkpoint interval** (up to ~15 s at the default). Native state
-  read through `torus_*` methods has lagged the same way since item 6 Phase 3. A client polling
-  `eth_getTransactionReceipt` gets `null` until the checkpoint that holds the tx lands. Then the
-  receipt, the block and the new balances appear together.
+- **They lag execution by about one checkpoint interval while blocks keep executing** (~15 s at the
+  default), plus the time the flush worker takes to write the checkpoint. There is no wall-clock
+  maximum: the checkpoint triggers (the interval, every 100th block, the byte cap, a barrier,
+  shutdown) are checked only when a block executes, and there is no idle checkpoint timer. If
+  execution pauses after a block with EVM txs, its receipt stays invisible until the next trigger
+  fires. Native state read through `torus_*` methods has lagged the same way since item 6 Phase 3.
+  A client polling `eth_getTransactionReceipt` gets `null` until the checkpoint that holds the tx
+  lands; then the receipt, the block and the new balances appear together. Choose receipt timeouts
+  with this in mind, not a fixed 15 s.
 - `eth_getTransactionCount(address, "pending")` reads the mempool's ingress view: the executed
   state, not the disk, plus the sender's pooled and committed-but-not-executed txs. A sender can
   sign its next tx at once. `"latest"` returns the nonce at the eth head and lags with it.

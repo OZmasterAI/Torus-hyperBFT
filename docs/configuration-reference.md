@@ -338,8 +338,11 @@ byte cap, a barrier, shutdown), in the same atomic batch as the applied-height m
 
 * the eth head, the receipts and the EVM state move together, at the checkpoint; a receipt is never
   visible before its state, and a state change never before its block;
-* they lag execution by up to one checkpoint interval, as native state has since item 6 Phase 3.
-  A wallet polling `eth_getTransactionReceipt` sees `null` for up to ~15 s after its tx executes;
+* they lag execution by about one checkpoint interval while blocks keep executing, plus the flush
+  worker's write time, as native state has since item 6 Phase 3. There is no wall-clock maximum: the
+  triggers are checked only when a block executes (no idle checkpoint timer), so if execution pauses
+  a receipt can stay `null` until the next trigger. A wallet polling `eth_getTransactionReceipt`
+  typically sees `null` for ~15 s after its tx executes;
 * `eth_getTransactionCount(address, "pending")` and mempool admission read the ingress view (the
   executed state), so senders get fresh nonces; `"latest"` follows the eth head.
 
