@@ -499,7 +499,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    * Screen verdict: mode 3 is the candidate. Mode 1 and defer-books drop out, mode 2 is superseded. Next: Classic vs
      mode 3 A/B, n >= 3, deep and standard shape, judged also on CPU per fill and W busy.
    * Inter-cell gaps 68-70 s.
-8o. **8h rerun: does retention cost native blocks/s?** (owner s131; after 8m; ~1 h 30). Section 95 left blocks/s and
+8q. **L2.2 full A/B (fixed), NEXT** (owner s131: before 8o; ~1 h). Stop 8o (it restarts from scratch after 8q).
+   A = main `0f5bef38` (L2.2's base), B = `exp/8k-settle-no-merge-fix` `ddf41758` with `TORUS_SETTLE_NO_MERGE=1` (archy's
+   `dbe14b21` + the fix for Codex's P1 on aliased position rows: per-cache market-id ranges, exact flag-off fallback on
+   overlap; Codex torus review no findings). One binary per arm, md5 checked. Shape: the 8i P1M deep book (1M-account
+   genesis, `PRELOAD=1000000`), standard load, 300 s, warm-up then A B B A A B (n = 3). Judge by the exec-path merge
+   rule (exec-thread on-CPU ms per 1k fills, native blocks/s, block p50 / p99, timeouts per 1,000 blocks); also settle
+   phase / pass B / cache flush ms per block (8n: -9.8 ms settle), `torus_exec_settle_no_merge_fallbacks_total` (must
+   stay 0), matched/s, CPU-s per 1M, RSS (8n: +256 MB, watch). Tools: freeze from a main that has the fix for the
+   deferred-scan placeholder bug (after 0f2ca85b); if that fix isn't on main yet, freeze from `32648b44`.
+8o. **8h rerun: does retention cost native blocks/s?** (owner s131; after 8q: the run started after 8m is stopped and
+   restarts from scratch; ~1 h 30). Section 95 left blocks/s and
    p50 / p99 open (per pair r1 A 12.6 / B 13.1, r2 A 16.4 / B 9.3 blk/s; the owner reads r2-B as a possible
    regression). Since then: RH4 slow-pass logging is merged (main `32648b44`: a WARN line per GC pass over 50 ms with
    phase timings, `torus_da_gc_last_pass_max_seconds`, `torus_da_gc_slow_passes_total`), and
@@ -512,6 +522,27 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    this campaign's 6 pairs alone (8h ran on an older main without exec-hash; report its 2 pairs next to it, not
    pooled). Verdict in plain words: if B is lower than its paired A in most pairs, say so; prune-by-default waits for
    this.
+8q. **L2.2 full A/B (fixed)** (owner s131; after 8o; ~1 h). A = main `0f5bef38` (L2.2's base), B =
+   `exp/8k-settle-no-merge-fix` `ddf41758` with `TORUS_SETTLE_NO_MERGE=1` (archy's `dbe14b21` + the fix for Codex's P1
+   on aliased position rows: per-cache market-id ranges, exact flag-off fallback on overlap; Codex torus review no
+   findings). One binary per arm, md5 checked. Shape: the 8i P1M deep book (1M-account genesis, `PRELOAD=1000000`),
+   standard load, 300 s, warm-up then A B B A A B (n = 3). Judge by the exec-path merge rule (exec-thread on-CPU ms per
+   1k fills, native blocks/s, block p50 / p99, timeouts per 1,000 blocks); also settle phase / pass B / cache flush ms
+   per block (8n: -9.8 ms settle), `torus_exec_settle_no_merge_fallbacks_total` (must stay 0), matched/s, CPU-s per
+   1M, RSS (8n: +256 MB, watch). Tools: freeze from a main that has the fix for the deferred-scan placeholder bug
+   (after 0f2ca85b); if that fix isn't on main yet, freeze from `32648b44`.
+8p. **Classic vs mode 3 A/B, deep and shallow** (owner s131; after 8q; ~2 h). 8m (section 99): at 1M resting orders
+   mode 3 beats Classic (save_books 65.7 -> 4.9 ms per block, blocks/s 3.2 -> 10.1, p99 1,563 -> 836 ms, RSS -2.6 GB),
+   but modes 2 / 3 can't use checkpoints today (`check_checkpoint_book_mode`, owner s109: W's deferred book save assumes
+   every height < N is durable), so they flush every block: flush worker 5.3x per fill, whole-process CPU per fill +18%.
+   Mode 3 on a shallow book was not run. One main binary (current, with the deferred-scan fix); A = Classic
+   (`TORUS_BOOK_ROWS=0`, 15 s checkpoints), B = mode 3 (`TORUS_BOOK_ROWS=3`, per-block flush as today). Two shapes,
+   warm-up then A B B A A B (n = 3) each, 300 s cells: **deep** = the 8i P1M shape (1M-account genesis,
+   `PRELOAD=1000000`); **shallow** = the standard shape (100k genesis, no pre-load; comparable with 8g / 8o). The mode
+   changes the state-root format: fresh data dirs per cell, every node the same mode (check `/proc/<pid>/environ` and
+   the boot line). Judge by: matched/s, native blocks/s, p50 / p99, timeouts, exec-thread on-CPU per 1k fills,
+   flush-worker ms per 1k fills and busy share, whole-process CPU-s per 1M fills, save_books, RSS, data-dir growth.
+   Question: should the testnet genesis use mode 3, given its shallow-book cost?
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
