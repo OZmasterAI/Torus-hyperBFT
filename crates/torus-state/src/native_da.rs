@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
 use torus_types::{compute_action_hash, compute_action_hash_with_scratch, SignedNativeAction};
@@ -237,6 +238,14 @@ fn decode_da_gc_row(row: &[u8]) -> Option<(u16, &[u8])> {
     Some((u16::from_be_bytes([row[0], row[1]]), &row[2..]))
 }
 
+/// Run `f`, adding its wall time to `total`.
+fn timed<T>(total: &mut Duration, f: impl FnOnce() -> T) -> T {
+    let t = Instant::now();
+    let r = f();
+    *total += t.elapsed();
+    r
+}
+
 /// Walk `markers` (ascending, bounded to the marker keys) through the
 /// markers at or below `through`, deleting each in `batch`; `marked` ends up
 /// holding the hashes of those AT `through`. One below it has no row left
@@ -318,6 +327,43 @@ pub struct DaGcOutcome {
     /// committed tip (the uncommitted tail) references them: the row went,
     /// the body (its reference and shards) stayed.
     pub tail_pinned: u64,
+}
+
+/// Where one GC pass spent its time and what it walked
+/// ([`NativeDaStore::gc_committed_with_history_timed`]; RH4 slow-pass
+/// observability, 8h). Plain `Instant`s around each phase and two counters,
+/// nothing else: the pass decides and writes exactly what the untimed pass
+/// does. Kept out of [`DaGcOutcome`], whose equality the tests rely on.
+/// A failed phase still adds its time before the error propagates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DaGcPassStats {
+    /// Reading the GC state (one point read).
+    pub state_read: Duration,
+    /// Back-filling unrecorded heights from the history (its block reads,
+    /// body restores and the records), normally zero.
+    pub backfill: Duration,
+    /// Recording this height: the latest-reference `MultiGet` over its
+    /// hashes and the row, reference and marker puts into the batch.
+    pub record: Duration,
+    /// Reading the history's committed tip (only when a row is due).
+    pub tip_read: Duration,
+    /// Reading the history's uncommitted tail (once, at the first due row).
+    pub tail_read: Duration,
+    /// Walking the due rows and their markers and adding the deletes to the
+    /// batch, the tail read excluded.
+    pub delete_scan: Duration,
+    /// The batch write (records, deletes, GC state; a back-filling pass
+    /// writes two batches, both counted).
+    pub write: Duration,
+    /// Bodies the deleted rows list (deleted, moved, marked or tail-pinned).
+    pub bodies_scanned: u64,
+    /// Hashes the uncommitted tail references (when it was read).
+    pub tail_hashes: u64,
+    /// The history's committed tip, when this pass read it.
+    pub committed_tip: Option<u64>,
+    /// The error of a failed pass, set by the caller that absorbs it (as
+    /// [`DaGcHoldReason::StoreError`]) so its slow-pass line can name it.
+    pub error: Option<String>,
 }
 
 /// Why a GC pass deleted nothing ([`DaGcOutcome::hold_reason`]); its
@@ -733,12 +779,42 @@ impl NativeDaStore {
         limits: DaGcLimits,
         history: &dyn DaGcHistory,
     ) -> Result<DaGcOutcome, StateError> {
+        self.gc_committed_with_history_timed(
+            height,
+            hashes,
+            shard_count,
+            retention,
+            keep_from,
+            limits,
+            history,
+            &mut DaGcPassStats::default(),
+        )
+    }
+
+    /// [`gc_committed_with_history`](Self::gc_committed_with_history), and
+    /// where the pass spent its time ([`DaGcPassStats`], added to `stats`):
+    /// the same decisions and the same writes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gc_committed_with_history_timed(
+        &self,
+        height: u64,
+        hashes: Option<&[B256]>,
+        shard_count: u16,
+        retention: u64,
+        keep_from: u64,
+        limits: DaGcLimits,
+        history: &dyn DaGcHistory,
+        stats: &mut DaGcPassStats,
+    ) -> Result<DaGcOutcome, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
-        let state = DaGcState::decode(
+        // Every fallible phase is timed with its `Result` and only then
+        // propagated: a failed (and maybe slow) phase still reports its time
+        // (Codex P2, 8h review).
+        let state = timed(&mut stats.state_read, || {
             self.db
-                .get_cf_raw(CF_NATIVE_PENDING, DA_GC_STATE_KEY)?
-                .as_deref(),
-        );
+                .get_cf_raw(CF_NATIVE_PENDING, DA_GC_STATE_KEY)
+                .map(|raw| DaGcState::decode(raw.as_deref()))
+        })?;
         let mut next = state;
         let mut batch = rocksdb::WriteBatch::default();
         let mut out = DaGcOutcome::default();
@@ -791,32 +867,36 @@ impl NativeDaStore {
                 let mut refs = PendingRefs::new();
                 if cursor < height {
                     backfilled = true;
-                    recorded_to = self.backfill_rows(
-                        &mut batch,
-                        cursor,
-                        height,
-                        shard_count,
-                        state.frontier,
-                        history,
-                        &mut next.hold,
-                        &mut refs,
-                        &mut out,
-                    )?;
+                    recorded_to = timed(&mut stats.backfill, || {
+                        self.backfill_rows(
+                            &mut batch,
+                            cursor,
+                            height,
+                            shard_count,
+                            state.frontier,
+                            history,
+                            &mut next.hold,
+                            &mut refs,
+                            &mut out,
+                        )
+                    })?;
                 }
                 // An unknown record (`None`) is never written as "no
                 // actions": the cursor stays at `height`, so this pass
                 // deletes nothing and the next one back-fills it.
                 if let Some(hashes) = hashes.filter(|_| recorded_to == height) {
                     if !hashes.is_empty() {
-                        self.record_row(
-                            &mut batch,
-                            height,
-                            hashes,
-                            shard_count,
-                            state.frontier,
-                            &mut moved,
-                            backfilled.then_some(&mut refs),
-                        )?;
+                        timed(&mut stats.record, || {
+                            self.record_row(
+                                &mut batch,
+                                height,
+                                hashes,
+                                shard_count,
+                                state.frontier,
+                                &mut moved,
+                                backfilled.then_some(&mut refs),
+                            )
+                        })?;
                     }
                     recorded_to = height.saturating_add(1);
                 }
@@ -842,7 +922,9 @@ impl NativeDaStore {
             // The deletion pass reads rows from the DB: land the back-filled
             // ones (and the cursor covering them) first.
             batch.put_cf(cf, DA_GC_STATE_KEY, next.encode());
-            self.db.write(std::mem::take(&mut batch))?;
+            timed(&mut stats.write, || {
+                self.db.write(std::mem::take(&mut batch))
+            })?;
             written = next;
             moved.clear();
         }
@@ -871,8 +953,12 @@ impl NativeDaStore {
         // up. Read only when a deletion is otherwise allowed.
         let due = last_due.filter(|&due| next.frontier <= due);
         if hold.is_none() && due.is_some() {
-            match history.committed_through() {
+            let t = Instant::now();
+            let tip = history.committed_through();
+            stats.tip_read += t.elapsed();
+            match tip {
                 Ok(tip) => {
+                    stats.committed_tip = tip;
                     out.undispatched_commits = tip.is_some_and(|tip| tip > height);
                     if out.undispatched_commits {
                         hold = Some(DaGcHoldReason::DispatchBehind);
@@ -890,7 +976,9 @@ impl NativeDaStore {
         }
         if hold.is_none() {
             if let Some(last_due) = due {
-                match self.gc_due_rows(
+                let t = Instant::now();
+                let tail_before = stats.tail_read;
+                let rows = self.gc_due_rows(
                     &mut batch,
                     next.frontier,
                     last_due,
@@ -898,7 +986,11 @@ impl NativeDaStore {
                     &moved,
                     history,
                     &mut out,
-                )? {
+                    stats,
+                );
+                // `stats` goes into the walk (its tail read), so not `timed`.
+                stats.delete_scan += t.elapsed().saturating_sub(stats.tail_read - tail_before);
+                match rows? {
                     DueRows::Deleted(Some(frontier)) => next.frontier = frontier,
                     DueRows::Deleted(None) => {}
                     DueRows::TailUnreadable => hold = Some(DaGcHoldReason::TailUnreadable),
@@ -913,7 +1005,7 @@ impl NativeDaStore {
             batch.put_cf(cf, DA_GC_STATE_KEY, next.encode());
         }
         if !batch.is_empty() {
-            self.db.write(batch)?;
+            timed(&mut stats.write, || self.db.write(batch))?;
         }
         Ok(out)
     }
@@ -1095,6 +1187,7 @@ impl NativeDaStore {
         moved: &HashSet<[u8; 32]>,
         history: &dyn DaGcHistory,
         out: &mut DaGcOutcome,
+        stats: &mut DaGcPassStats,
     ) -> Result<DueRows, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
         let mut shards_cf = None;
@@ -1131,8 +1224,11 @@ impl NativeDaStore {
             let pins = match &mut tail {
                 Some(pins) => &*pins,
                 // The first due row: nothing is in `batch` from this walk yet.
-                None => match history.uncommitted_hashes() {
-                    Ok(hashes) => &*tail.insert(hashes.iter().map(|h| h.0).collect()),
+                None => match timed(&mut stats.tail_read, || history.uncommitted_hashes()) {
+                    Ok(hashes) => {
+                        stats.tail_hashes = hashes.len() as u64;
+                        &*tail.insert(hashes.iter().map(|h| h.0).collect())
+                    }
                     Err(e) => {
                         tracing::warn!(
                             due_from = h,
@@ -1152,6 +1248,7 @@ impl NativeDaStore {
                 out.backlog = true;
                 break;
             }
+            stats.bodies_scanned += bodies as u64;
             if row_shards > 0 && shards_cf.is_none() {
                 shards_cf = Some(self.db.cf_handle(CF_NATIVE_SHARDS)?);
             }
@@ -2229,6 +2326,8 @@ mod tests {
         tip_fail: bool,
         tail: Vec<B256>,
         tail_fail: bool,
+        /// How long reading the tail takes (slow-pass timing tests).
+        tail_delay: std::time::Duration,
     }
 
     impl DaGcHistory for TestHistory {
@@ -2259,6 +2358,7 @@ mod tests {
         }
 
         fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError> {
+            std::thread::sleep(self.tail_delay);
             if self.fail || self.tail_fail {
                 return Err(StateError::InvalidData("test history tail read".into()));
             }
@@ -2557,6 +2657,130 @@ mod tests {
         let out = gc_h(&store, 15, &[], W, &hist);
         assert_eq!((out.rows_deleted, out.hold_reason), (1, None));
         assert!(!present(&store, &x));
+    }
+
+    /// Slow-pass observability (8h): the timed pass reports its phases (the
+    /// tail read, here made slow by the history; the due-row scan, which
+    /// excludes it; the GC state read; the batch write), the bodies the
+    /// due rows list, the tail's hashes and the committed tip it read. And it
+    /// changes nothing: the same passes untimed give the same outcomes and
+    /// byte-identical stores.
+    #[test]
+    fn gc_timed_pass_reports_its_phases_and_changes_nothing() {
+        use std::time::Duration;
+        const W: u64 = 4;
+        let (_d1, timed) = temp_store();
+        let (_d2, plain) = temp_store();
+        let (x, y, z) = (dummy_action(1), dummy_action(2), dummy_action(3));
+        let (hx, hy, hz) = (
+            compute_action_hash(&x),
+            compute_action_hash(&y),
+            compute_action_hash(&z),
+        );
+        for store in [&timed, &plain] {
+            store.put_batch(&[x.clone(), y.clone(), z.clone()]).unwrap();
+        }
+        let mut hist = history(&[(10, vec![hx, hy]), (11, vec![hz])]);
+        let mut last = DaGcPassStats::default();
+        for h in 10..=14 {
+            if h == 14 {
+                // Row 10 is due; the uncommitted tail re-includes x.
+                hist.tip = Some(14);
+                hist.tail = vec![hx];
+                hist.tail_delay = Duration::from_millis(30);
+            }
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            let mut stats = DaGcPassStats::default();
+            let a = timed
+                .gc_committed_with_history_timed(
+                    h,
+                    Some(&hashes),
+                    0,
+                    W,
+                    UNCAPPED,
+                    LIMITS,
+                    &hist,
+                    &mut stats,
+                )
+                .unwrap();
+            let b = gc_h(&plain, h, &hashes, W, &hist);
+            assert_eq!(a, b, "height {h}: the same outcome");
+            assert_eq!(dump(&timed), dump(&plain), "height {h}: the same store");
+            assert!(stats.state_read > Duration::ZERO, "height {h}: {stats:?}");
+            if h < 14 {
+                assert_eq!(stats.bodies_scanned, 0, "height {h}: no row due");
+                assert_eq!(stats.tail_read, Duration::ZERO, "height {h}");
+            }
+            last = stats;
+        }
+        assert_eq!(last.bodies_scanned, 2, "row 10 lists x and y");
+        assert_eq!(last.tail_hashes, 1);
+        assert_eq!(last.committed_tip, Some(14));
+        assert!(last.tail_read >= Duration::from_millis(30), "{last:?}");
+        assert!(
+            last.delete_scan < Duration::from_millis(30),
+            "the scan excludes the tail read: {last:?}"
+        );
+        assert!(last.write > Duration::ZERO, "{last:?}");
+    }
+
+    /// Codex P2 (8h review): a pass whose phase fails still reports that
+    /// phase's elapsed time (a slow failing write must not read
+    /// `write_ms=0`) and still returns the error. Both write sites: the
+    /// single batch of a pass without a gap, and the first batch of a
+    /// back-filling pass (whose back-fill is timed too).
+    #[test]
+    fn gc_failed_write_reports_its_elapsed_and_still_errs() {
+        use std::time::Duration;
+        const W: u64 = 8;
+        let (dir, store) = temp_store();
+        let (x, y) = (dummy_action(1), dummy_action(2));
+        let (hx, hy) = (compute_action_hash(&x), compute_action_hash(&y));
+        store.put_batch(&[x.clone(), y.clone()]).unwrap();
+        let hist = history(&[(10, vec![hx, hy]), (13, vec![hx])]);
+        for h in 10..=12 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        drop(store);
+        let ro = NativeDaStore::new(StateDb::open_read_only(dir.path()).unwrap());
+        // No gap: record height 13, one batch, the write fails.
+        let mut stats = DaGcPassStats::default();
+        let err = ro.gc_committed_with_history_timed(
+            13,
+            Some(&[hx]),
+            0,
+            W,
+            UNCAPPED,
+            LIMITS,
+            &hist,
+            &mut stats,
+        );
+        assert!(err.is_err(), "the failed write is still an error");
+        assert!(stats.state_read > Duration::ZERO, "{stats:?}");
+        assert!(stats.record > Duration::ZERO, "{stats:?}");
+        assert!(
+            stats.write > Duration::ZERO,
+            "the failed write's time: {stats:?}"
+        );
+        // A gap (13 and 14 unrecorded): the back-fill batch write fails.
+        let mut stats = DaGcPassStats::default();
+        let err = ro.gc_committed_with_history_timed(
+            15,
+            Some(&[hy]),
+            0,
+            W,
+            UNCAPPED,
+            LIMITS,
+            &hist,
+            &mut stats,
+        );
+        assert!(err.is_err(), "the failed back-fill write is still an error");
+        assert!(stats.backfill > Duration::ZERO, "{stats:?}");
+        assert!(
+            stats.write > Duration::ZERO,
+            "the failed write's time: {stats:?}"
+        );
     }
 
     /// P3 (claude-review r4): every pass that deletes nothing names why

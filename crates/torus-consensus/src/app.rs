@@ -5297,6 +5297,11 @@ pub struct TorusApp {
     /// it from `TORUS_DA_BODY_RETENTION` / the block-tree retention
     /// ([`crate::da_gc::resolve_da_body_retention`]).
     da_body_gc: Option<crate::da_gc::DaBodyGc>,
+    /// A DA body GC pass at least this long logs one warn line with its
+    /// phases and counts `torus_da_gc_slow_passes` (`TORUS_DA_GC_SLOW_MS`,
+    /// default [`crate::da_gc::DA_GC_SLOW_PASS_MS`]; read in
+    /// [`Self::set_da_body_gc`]).
+    da_gc_slow_pass: std::time::Duration,
     /// Item 3 (`TORUS_ASYNC_VALIDATE=1`): speculative body validation off the
     /// hotstuff-algo thread. `None` with the flag off (the default) — the
     /// validate path then runs synchronously; cost parity still needs measurement.
@@ -6364,6 +6369,7 @@ impl TorusApp {
             shard_fetcher: None,
             da_recovery: None,
             da_body_gc: None,
+            da_gc_slow_pass: std::time::Duration::from_millis(crate::da_gc::DA_GC_SLOW_PASS_MS),
             async_validate: None,
             exec_next_height: None,
             deferred_exec: std::collections::BTreeMap::new(),
@@ -6552,7 +6558,23 @@ impl TorusApp {
     /// replica starts; see [`crate::da_gc`] for the policy
     /// ([`crate::da_gc::resolve_da_body_retention`]).
     pub fn set_da_body_gc(&mut self, gc: Option<crate::da_gc::DaBodyGc>) {
+        if gc.is_some() {
+            let env = std::env::var("TORUS_DA_GC_SLOW_MS").ok();
+            let ms = crate::da_gc::resolve_da_gc_slow_ms(env.as_deref());
+            self.da_gc_slow_pass = std::time::Duration::from_millis(ms);
+            tracing::info!(
+                slow_ms = ms,
+                env = ?env,
+                "DA body GC: a pass at or over slow_ms logs one warn line (TORUS_DA_GC_SLOW_MS)"
+            );
+        }
         self.da_body_gc = gc;
+    }
+
+    /// The slow-pass log threshold (tests; the node takes
+    /// `TORUS_DA_GC_SLOW_MS` in [`Self::set_da_body_gc`]).
+    pub fn set_da_gc_slow_pass(&mut self, threshold: std::time::Duration) {
+        self.da_gc_slow_pass = threshold;
     }
 
     /// RH4: one durable DA body GC pass for the committed `height` that
@@ -6661,6 +6683,8 @@ impl TorusApp {
                 ),
             }
         }
+        // Slow-pass observability: plain `Instant`s between the phases.
+        let restored_at = std::time::Instant::now();
         let keep_from = gc.keep_from().unwrap_or_else(|e| {
             tracing::warn!(
                 height,
@@ -6668,6 +6692,7 @@ impl TorusApp {
             );
             0
         });
+        let pointer_read = restored_at.elapsed();
         // Heights this pass finds unrecorded (a crash after an earlier
         // dispatch's body write, or a failed record) are re-read from the
         // block tree; their missing bodies are restored like this height's.
@@ -6718,7 +6743,8 @@ impl TorusApp {
             }
         };
         let history = crate::da_gc::BlockTreeHistory::new(&gc.block_tree_db, &restore);
-        let out = mempool.gc_committed_native_da(
+        let mut stats = torus_state::DaGcPassStats::default();
+        let out = mempool.gc_committed_native_da_timed(
             height,
             record,
             shard_count,
@@ -6726,9 +6752,29 @@ impl TorusApp {
             keep_from,
             crate::da_gc::DA_GC_LIMITS,
             &history,
+            &mut stats,
         );
+        let elapsed = started.elapsed();
+        let slow = elapsed >= self.da_gc_slow_pass;
+        if slow {
+            self.log_slow_da_gc_pass(
+                gc,
+                height,
+                hashes.len(),
+                elapsed,
+                restored_at.duration_since(started),
+                pointer_read,
+                &stats,
+                &out,
+                history.tail_blocks(),
+            );
+        }
         if let Some(ref m) = self.metrics {
-            m.da_gc_seconds.observe(started.elapsed().as_secs_f64());
+            m.da_gc_seconds.observe(elapsed.as_secs_f64());
+            m.da_gc_last_pass_max.observe(elapsed.as_secs_f64());
+            if slow {
+                m.da_gc_slow_passes.inc();
+            }
             m.da_bodies_gc_deleted.inc_by(out.bodies_deleted);
             // P3 (claude-review r4): every held pass, by its reason.
             if let Some(reason) = out.hold_reason {
@@ -6758,6 +6804,70 @@ impl TorusApp {
                 "DA body GC: backlog left for the next pass"
             );
         }
+    }
+
+    /// The one warn line of a DA body GC pass at or over the slow-pass
+    /// threshold (8h: rare 51-205 ms passes, nothing recorded to explain
+    /// them). Times in ms (3 decimals): `restore_ms` the body presence
+    /// `MultiGet` (and any restore write), `bookkeeping_read_ms` the tree's
+    /// prune pointer plus the GC state, `record_ms` the latest-reference
+    /// `MultiGet` and the record's puts, `backfill_ms` back-filling from the
+    /// tree, `tip_ms` / `tail_ms` the tree's committed tip and uncommitted
+    /// tail (`tail_blocks` blocks decoded, `tail_hashes` hashes),
+    /// `delete_scan_ms` the due-row walk (tail excluded) and `write_ms` the
+    /// batch write (record, deletes and GC state together). `dispatch_lag` is
+    /// the tree's committed tip minus this height (the tip read again here
+    /// when the pass did not). A failed pass logs too (`held=store_error`,
+    /// `error` its message, the failed phase's time included; `none` when
+    /// it did not fail). Off the hot path: only slow passes get here.
+    #[allow(clippy::too_many_arguments)]
+    fn log_slow_da_gc_pass(
+        &self,
+        gc: &crate::da_gc::DaBodyGc,
+        height: u64,
+        recorded: usize,
+        total: std::time::Duration,
+        restore: std::time::Duration,
+        pointer_read: std::time::Duration,
+        stats: &torus_state::DaGcPassStats,
+        out: &torus_state::DaGcOutcome,
+        tail_blocks: usize,
+    ) {
+        let ms = |d: std::time::Duration| (d.as_secs_f64() * 1e6).round() / 1e3;
+        let tip = stats.committed_tip.or_else(|| {
+            crate::da_gc::read_tree_committed_tip(&gc.block_tree_db)
+                .ok()
+                .flatten()
+        });
+        let opt = |v: Option<u64>| v.map_or_else(|| "none".to_string(), |v| v.to_string());
+        tracing::warn!(
+            height,
+            total_ms = ms(total),
+            threshold_ms = self.da_gc_slow_pass.as_millis() as u64,
+            bodies_recorded = recorded,
+            rows_deleted = out.rows_deleted,
+            bodies_scanned = stats.bodies_scanned,
+            bodies_deleted = out.bodies_deleted,
+            shard_keys_deleted = out.shard_keys_deleted,
+            tail_pinned = out.tail_pinned,
+            backlog = out.backlog,
+            restore_ms = ms(restore),
+            bookkeeping_read_ms = ms(pointer_read + stats.state_read),
+            record_ms = ms(stats.record),
+            backfill_ms = ms(stats.backfill),
+            heights_backfilled = out.heights_backfilled,
+            tip_ms = ms(stats.tip_read),
+            tail_ms = ms(stats.tail_read),
+            tail_blocks,
+            tail_hashes = stats.tail_hashes,
+            delete_scan_ms = ms(stats.delete_scan),
+            write_ms = ms(stats.write),
+            committed_tip = %opt(tip),
+            dispatch_lag = %opt(tip.map(|tip| tip.saturating_sub(height))),
+            held = %out.hold_reason.map_or("none", |r| r.as_str()),
+            error = %stats.error.as_deref().unwrap_or("none"),
+            "DA body GC: slow pass"
+        );
     }
 
     /// s80: install the stream sink for executed blocks' fills. The execution
@@ -14120,6 +14230,33 @@ mod crash_recovery_tests {
     fn async_validate_resolution_is_logged_at_startup() {
         // TORUS_MATCH_WORKERS lesson: an unlogged knob makes bench results
         // un-analyzable. The resolution line must fire in BOTH states.
+        let out = capture_logs(|| {
+            // The callsite's first hit is on another thread (as TorusApp::new
+            // in a parallel test would): the capture must still see ours.
+            std::thread::spawn(|| log_async_validate_resolution(true))
+                .join()
+                .unwrap();
+            log_async_validate_resolution(true);
+            log_async_validate_resolution(false);
+        });
+        assert!(
+            out.contains("TORUS_ASYNC_VALIDATE"),
+            "startup log missing:\n{out}"
+        );
+        assert!(
+            out.contains("enabled=true"),
+            "enabled state not logged:\n{out}"
+        );
+        assert!(
+            out.contains("enabled=false"),
+            "disabled state not logged:\n{out}"
+        );
+    }
+
+    /// Run `f` with this thread's tracing events captured (fmt, no ANSI) and
+    /// return the text. One process-wide default subscriber backs every
+    /// capture, so tests sharing a process (`cargo test`) can all use it.
+    fn capture_logs(f: impl FnOnce()) -> String {
         use std::io::Write;
         #[derive(Clone, Default)]
         struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -14168,17 +14305,9 @@ mod crash_recovery_tests {
             .with_writer(buf.clone())
             .with_ansi(false)
             .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            // The callsite's first hit is on another thread (as TorusApp::new
-            // in a parallel test would): the capture must still see ours.
-            std::thread::spawn(|| log_async_validate_resolution(true)).join().unwrap();
-            log_async_validate_resolution(true);
-            log_async_validate_resolution(false);
-        });
+        tracing::subscriber::with_default(subscriber, f);
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("TORUS_ASYNC_VALIDATE"), "startup log missing:\n{out}");
-        assert!(out.contains("enabled=true"), "enabled state not logged:\n{out}");
-        assert!(out.contains("enabled=false"), "disabled state not logged:\n{out}");
+        out
     }
 
     fn signed_order_batch_action(nonce: u64, n_orders: usize) -> SignedNativeAction {
@@ -33715,6 +33844,335 @@ mod crash_recovery_tests {
             4,
             "heights 1..=4 GC'd by tip 8"
         );
+    }
+
+    /// Slow-pass observability (8h: rare 51-205 ms passes on the consensus
+    /// thread, nothing recorded to explain them): a pass at or over the
+    /// threshold logs ONE warn line with its phases, counts, the dispatch lag
+    /// and the hold reason, counts `torus_da_gc_slow_passes` and shows in the
+    /// per-scrape max gauge. Here a test hook makes the tail read slow; the
+    /// passes before it stay under the threshold and log nothing.
+    #[test]
+    fn da_gc_slow_pass_logs_one_line_with_every_field() {
+        use std::time::Duration;
+        let (config, state_db) = make_test_config_and_db();
+        let (mut app, mempool, metrics, _rx) = da_gc_app(&state_db, &config, Some(4));
+        app.set_da_gc_slow_pass(Duration::from_millis(50));
+        let committed: Vec<_> = (1..=5u64).map(sign_claim_rewards).collect();
+        mempool.mirror_native_to_da(&committed).unwrap();
+        let out = capture_logs(|| {
+            for tip in 1..=4u64 {
+                da_gc_commit(&mut app, tip, vec![committed[tip as usize - 1].clone()]);
+            }
+            // Tip 5: row 1 is due, so the pass reads the tail: make it slow.
+            crate::da_gc::TEST_TAIL_DELAY.with(|d| d.set(Duration::from_millis(80)));
+            da_gc_commit(&mut app, 5, vec![committed[4].clone()]);
+            crate::da_gc::TEST_TAIL_DELAY.with(|d| d.set(Duration::ZERO));
+        });
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("DA body GC: slow pass"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one line, for the slow pass only:\n{out}");
+        let line = lines[0];
+        assert!(line.contains("WARN"), "{line}");
+        for field in [
+            "height=5",
+            "total_ms=",
+            "threshold_ms=50",
+            "bodies_recorded=1",
+            "rows_deleted=1",
+            "bodies_scanned=1",
+            "bodies_deleted=1",
+            "tail_ms=",
+            "tail_blocks=0",
+            "tail_hashes=0",
+            "delete_scan_ms=",
+            "write_ms=",
+            "bookkeeping_read_ms=",
+            "record_ms=",
+            "restore_ms=",
+            "backfill_ms=",
+            "heights_backfilled=0",
+            "tip_ms=",
+            "committed_tip=none",
+            "dispatch_lag=none",
+            "held=none",
+            "error=none",
+        ] {
+            assert!(line.contains(field), "{field} missing: {line}");
+        }
+        let ms = |name: &str| -> f64 {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{name} missing: {line}"))
+                .parse()
+                .unwrap()
+        };
+        assert!(ms("tail_ms") >= 80.0, "{line}");
+        assert!(ms("total_ms") >= ms("tail_ms"), "{line}");
+        assert_eq!(metrics.da_gc_slow_passes.get(), 1);
+        assert!(metrics.da_gc_last_pass_max.peek() >= 0.08);
+        assert_eq!(
+            metrics.da_bodies_gc_deleted.get(),
+            1,
+            "the pass still deleted"
+        );
+    }
+
+    /// Codex P2 (8h review): a FAILED pass over the threshold still logs
+    /// the slow-pass line, with its error, `held=store_error` and the failed
+    /// write's phase. The DA store here is read-only, so the pass's batch
+    /// write fails; the threshold is zero, so every pass is slow.
+    #[test]
+    fn da_gc_failed_slow_pass_logs_its_error() {
+        use std::time::Duration;
+        let (config, state_db) = make_test_config_and_db();
+        let da_dir = scratch_db_dir("torus-da-gc-ro");
+        drop(StateDb::open(&da_dir).expect("create the DA db"));
+        let da_db = StateDb::open_read_only(&da_dir).expect("open the DA db read-only");
+        let mempool = Arc::new(torus_mempool::Mempool::new(
+            da_db,
+            torus_mempool::MempoolConfig::default(),
+        ));
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut app = TorusApp::new(
+            state_db.clone(),
+            &config,
+            Some(metrics.clone()),
+            Some(mempool.clone()),
+            None,
+        );
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1024);
+        app.replace_exec_tx(tx);
+        set_tree_frontier(&state_db, u64::MAX);
+        app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+            retention: 4,
+            block_tree_db: state_db.clone(),
+        }));
+        app.set_da_gc_slow_pass(Duration::ZERO);
+        // No body to wait for (the store can hold none); the pass still
+        // writes the new GC state, and that write fails.
+        let out = capture_logs(|| da_gc_commit(&mut app, 1, vec![]));
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("DA body GC: slow pass"))
+            .collect();
+        assert_eq!(lines.len(), 1, "the failed pass is logged:\n{out}");
+        let line = lines[0];
+        for field in [
+            "WARN",
+            "height=1",
+            "held=store_error",
+            "write_ms=",
+            "error=",
+            "read only",
+        ] {
+            assert!(line.contains(field), "{field} missing: {line}");
+        }
+        assert_eq!(metrics.da_gc_slow_passes.get(), 1);
+    }
+
+    /// RH4 part 2 (docs/plans/rh4-retention-early-cost.md): what
+    /// `--retention-blocks 1000` adds per dispatched block, before and after
+    /// the first deleting pass, on the commit dispatch (consensus thread).
+    /// Two measurements over the same block stream (`RH4_BENCH_BLOCKS`
+    /// blocks of `RH4_BENCH_ACTIONS` order batches of `RH4_BENCH_ORDERS`
+    /// orders, bodies put into the DA store first as ingress does):
+    ///  1. `on_committed_block` with the GC off vs on (window 1128, the tree
+    ///     prune pointer moved as hotstuff's pruner moves it), interleaved,
+    ///     separate DBs laid out as the node's: the app's state DB, the DA
+    ///     store and the block tree in a consensus DB;
+    ///  2. the GC pass's own steps on a bare store: the body presence
+    ///     `MultiGet`, the prune-pointer read, and the pass (GC state read,
+    ///     record, write; tip / tail / delete scan once rows are due).
+    /// Release only: `cargo test --release -p torus-consensus --lib
+    /// rh4_early_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "microbench, release: see the doc comment"]
+    fn rh4_early_cost_per_block() {
+        use std::time::{Duration, Instant};
+        let knob = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let blocks = knob("RH4_BENCH_BLOCKS", 1500);
+        let per_block = knob("RH4_BENCH_ACTIONS", 130);
+        let orders = knob("RH4_BENCH_ORDERS", 8) as usize;
+        const TREE: u64 = 1000;
+        let window = crate::da_gc::resolve_da_body_retention(None, Some(TREE)).unwrap();
+        // The pointer hotstuff's pruner leaves once the hotstuff tip (Torus
+        // h - 1) passed the tree window: `tip - TREE`, one height per commit.
+        let pointer_at = |h: u64| (h - 1).checked_sub(TREE).filter(|&p| p > 0);
+        let set_pointer = |db: &StateDb, h: u64| {
+            if let Some(p) = pointer_at(h) {
+                set_tree_frontier(db, p);
+            }
+        };
+        let actions_at = |h: u64| -> Vec<SignedNativeAction> {
+            (0..per_block)
+                .map(|i| big_order_batch_action(h * 10_000 + i, orders))
+                .collect()
+        };
+        // Segments: record only before the tree prunes; record + pointer
+        // until the window; then deleting passes.
+        let segment = |h: u64| -> usize {
+            if h <= TREE + 1 {
+                0
+            } else if h <= window {
+                1
+            } else {
+                2
+            }
+        };
+        let names = ["1..=1001 (record only)", "1002..=1128 (tree prunes)", "1129.. (deleting)"];
+        fn summary(xs: &mut [Duration]) -> String {
+            if xs.is_empty() {
+                return "n=0".into();
+            }
+            xs.sort();
+            let us = |d: Duration| d.as_secs_f64() * 1e6;
+            let mean = xs.iter().map(|d| us(*d)).sum::<f64>() / xs.len() as f64;
+            format!(
+                "n={} mean={:.1}us p50={:.1}us p99={:.1}us max={:.1}us",
+                xs.len(),
+                mean,
+                us(xs[xs.len() / 2]),
+                us(xs[(xs.len() * 99 / 100).min(xs.len() - 1)]),
+                us(xs[xs.len() - 1]),
+            )
+        }
+
+        // 1. The commit dispatch, GC off vs on.
+        let consensus_db = || StateDb::open_consensus(&scratch_db_dir("rh4-bench")).unwrap();
+        let (config, state_off) = make_test_config_and_db();
+        let (_, state_on) = make_test_config_and_db();
+        let (db_off, db_on) = (consensus_db(), consensus_db());
+        let app_for = |state: &StateDb, db: &StateDb, gc: bool| {
+            let mempool = Arc::new(torus_mempool::Mempool::new(
+                db.clone(),
+                torus_mempool::MempoolConfig::default(),
+            ));
+            let mut app = TorusApp::new(
+                state.clone(),
+                &config,
+                Some(Arc::new(torus_telemetry::Metrics::new())),
+                Some(mempool.clone()),
+                None,
+            );
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommittedBlockMsg>(1024);
+            app.replace_exec_tx(tx);
+            std::thread::spawn(move || for _ in rx {});
+            if gc {
+                app.set_da_body_gc(Some(crate::da_gc::DaBodyGc {
+                    retention: window,
+                    block_tree_db: db.clone(),
+                }));
+            }
+            (app, mempool)
+        };
+        let (mut off, mp_off) = app_for(&state_off, &db_off, false);
+        let (mut on, mp_on) = app_for(&state_on, &db_on, true);
+        let mut t_off: [Vec<Duration>; 3] = Default::default();
+        let mut t_on: [Vec<Duration>; 3] = Default::default();
+        for h in 1..=blocks {
+            let actions = actions_at(h);
+            mp_off.mirror_native_to_da(&actions).unwrap();
+            mp_on.mirror_native_to_da(&actions).unwrap();
+            set_pointer(&db_on, h);
+            let committed = committed_compact_block(&make_block(h, actions));
+            let run = |app: &mut TorusApp| {
+                let t = Instant::now();
+                app.on_committed_block(&committed, committed.hash);
+                t.elapsed()
+            };
+            // Alternate the order so neither arm always runs second.
+            let (a, b) = if h % 2 == 0 {
+                let a = run(&mut off);
+                (a, run(&mut on))
+            } else {
+                let b = run(&mut on);
+                (run(&mut off), b)
+            };
+            t_off[segment(h)].push(a);
+            t_on[segment(h)].push(b);
+        }
+        println!(
+            "RH4 early cost: {blocks} blocks x {per_block} actions x {orders} orders, \
+             window {window}"
+        );
+        for i in 0..3 {
+            println!("on_committed_block {}: off {}", names[i], summary(&mut t_off[i]));
+            println!("on_committed_block {}: on  {}", names[i], summary(&mut t_on[i]));
+        }
+
+        // 2. The pass's own steps on a bare store in a consensus DB (the DA
+        // store and the block tree's pointer).
+        let db = consensus_db();
+        let store = torus_state::NativeDaStore::new(db.clone());
+        let noop = |_: u64, _: &[torus_types::B256], _: Option<&[SignedNativeAction]>| {};
+        let mut steps: [Vec<[Duration; 9]>; 3] = Default::default();
+        for h in 1..=blocks {
+            let actions = actions_at(h);
+            store.put_batch(&actions).unwrap();
+            set_pointer(&db, h);
+            let hashes: Vec<_> = actions.iter().map(torus_types::compute_action_hash).collect();
+            let t = Instant::now();
+            let missing = store.missing(&hashes).unwrap();
+            let presence = t.elapsed();
+            assert!(missing.is_empty());
+            let t = Instant::now();
+            let keep_from = crate::da_gc::keep_from_for_tree_frontier(
+                crate::da_gc::read_block_tree_frontier(&db).unwrap(),
+            );
+            let pointer = t.elapsed();
+            let history = crate::da_gc::BlockTreeHistory::new(&db, &noop);
+            let mut st = torus_state::DaGcPassStats::default();
+            let t = Instant::now();
+            store
+                .gc_committed_with_history_timed(
+                    h,
+                    Some(&hashes),
+                    0,
+                    window,
+                    keep_from,
+                    crate::da_gc::DA_GC_LIMITS,
+                    &history,
+                    &mut st,
+                )
+                .unwrap();
+            let pass = t.elapsed();
+            steps[segment(h)].push([
+                presence + pointer + pass,
+                presence,
+                pointer,
+                st.state_read,
+                st.record,
+                st.write,
+                st.tip_read,
+                st.tail_read,
+                st.delete_scan,
+            ]);
+        }
+        let step_names = [
+            "whole pass",
+            "presence MultiGet",
+            "prune-pointer read",
+            "GC state read",
+            "record (ref MultiGet + puts)",
+            "batch write",
+            "tip read",
+            "tail read",
+            "delete scan",
+        ];
+        for (i, rows) in steps.iter().enumerate() {
+            for (j, name) in step_names.iter().enumerate() {
+                let mut xs: Vec<Duration> = rows.iter().map(|r| r[j]).collect();
+                println!("GC step {}: {name}: {}", names[i], summary(&mut xs));
+            }
+        }
     }
 
     /// The window counts DISPATCHED heights, not commits: a committed block

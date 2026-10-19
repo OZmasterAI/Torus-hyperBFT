@@ -22,8 +22,8 @@ use std::sync::RwLock;
 use alloy_primitives::{Address, B256};
 use torus_state::backend::StateBackend as _;
 use torus_state::{
-    DaGcHistory, DaGcLimits, DaGcOutcome, DaReadTiming, ErasureParams, NativeDaStore, StateDb,
-    StateError, StoredShard,
+    DaGcHistory, DaGcLimits, DaGcOutcome, DaGcPassStats, DaReadTiming, ErasureParams,
+    NativeDaStore, StateDb, StateError, StoredShard,
 };
 use torus_types::SignedNativeAction;
 
@@ -1764,7 +1764,7 @@ impl Mempool {
         limits: DaGcLimits,
         history: &dyn DaGcHistory,
     ) -> DaGcOutcome {
-        match self.da_store.gc_committed_with_history(
+        self.gc_committed_native_da_timed(
             height,
             hashes,
             shard_count,
@@ -1772,10 +1772,40 @@ impl Mempool {
             keep_from,
             limits,
             history,
+            &mut DaGcPassStats::default(),
+        )
+    }
+
+    /// [`gc_committed_native_da`](Self::gc_committed_native_da), and where
+    /// the pass spent its time ([`DaGcPassStats`], added to `stats`; RH4
+    /// slow-pass observability; a failed pass also sets `stats.error`). The
+    /// same decisions and writes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gc_committed_native_da_timed(
+        &self,
+        height: u64,
+        hashes: Option<&[B256]>,
+        shard_count: u16,
+        retention: u64,
+        keep_from: u64,
+        limits: DaGcLimits,
+        history: &dyn DaGcHistory,
+        stats: &mut DaGcPassStats,
+    ) -> DaGcOutcome {
+        match self.da_store.gc_committed_with_history_timed(
+            height,
+            hashes,
+            shard_count,
+            retention,
+            keep_from,
+            limits,
+            history,
+            stats,
         ) {
             Ok(out) => out,
             Err(e) => {
                 tracing::warn!(height, "native DA body GC pass failed: {e}");
+                stats.error = Some(e.to_string());
                 DaGcOutcome {
                     deletion_held: true,
                     hold_reason: Some(torus_state::DaGcHoldReason::StoreError),
