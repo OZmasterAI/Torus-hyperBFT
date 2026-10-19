@@ -448,7 +448,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per block 71,388 -> 71,152, save_books 73.20 -> 73.77 ms per block. matched/s 226,021 -> 235,116, blocks/s 3.076 ->
    3.206, p50 / p99 228 / 1,485 -> 225 / 1,434 ms, timeouts 12 -> 6, RSS mean 6,792 -> 7,048 MB (in 8kd's spread);
    n = 1, not resolved. Verdict: full A B B A A B later. Inter-cell gaps 62 / 62 / 62 s (`max_load` 10).
-8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; UNPAUSED s131: right after 8r;
+8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; UNPAUSED s131; briefly paused again
+   for the 8r attribution (8r-attr below), then restarts from scratch;
    replaces 8j; ~4-5 h incl. the extra cells, estimate; tools from main `3aaaa046` or later). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
    `origin/feat/item7-option0` at `f8a45a2d` (G0-G4 done; G3 and the whole branch Codex torus-adversarial reviewed;
    not merged: the owner decides the merge), code defaults, 512 KB from `env.sh`, custody 0. The off and on arms run
@@ -609,6 +610,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
      lower), p50 +7.3% (4 / 4 higher), CPU per fill +1.5%. Inline passes up to 299 ms ran on the consensus thread.
    * Next: find the ~5% blocks/s cost left in both retention arms (pruners vs GC write, `perf` A vs B), and drop the
      `dispatch_behind` re-passes. Prune-by-default should not go in on this evidence alone.
+8r-attr. **8r attribution, analysis only, NOW (8l paused for it)** (owner s131; ~30-60 min, no new cells). 8r (section
+   103): worker GC fixed p50 but blocks/s stays ~5% lower in BOTH retention arms (B worker 0.949, C inline 0.947) and
+   CPU per fill +1.5-2%, so the cost is not where the GC runs. Question: what does retention slow? Per cell, A vs B
+   vs C: RocksDB compaction CPU / bytes, write-stall count and micros, flush count, L0 files, pending compaction bytes,
+   delayed write rate, WAL bytes, DB write p99 / max (state DB and consensus DB separately), per-thread CPU
+   (exec, hotstuff-algo, flush worker, GC worker, rocksdb bg threads) if sampled, exec / consensus phase timers
+   (view durations, commit persist, body persist, handoff waits), blocks/s per minute aligned to the first deleting
+   pass, the slow-pass WARN lines, and the worker's ~300 'dispatch_behind' holds per cell. Name the dominant
+   difference with numbers. Also push the raw per-cell metric data (text only, no node DBs) to `data/ozarchy-8r`.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
