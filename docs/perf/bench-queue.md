@@ -392,8 +392,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    storage, network / DA, crypto, wildcard incl. theoretical), adversarial review and ranking, build the top 1-2 on
    `exp/8k-<name>` behind a flag (tests first, microbench gate), A/B n = 3 under the exec-path merge rule, write-up.
    Never merges to main; keeps off item 7 option 0's and RH4's code.
-8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; NEXT, right after the disk is freed;
-   replaces 8j; ~2 h 50 + extra cells, estimate). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
+   **Pacing rule (owner s131, every step from here on):** run all cells of a step from ONE detached driver, back to
+   back, with at most ~60 s idle between the end of one cell and the start of the next (teardown, the quiet check and
+   the next genesis included where possible). Don't wait for an agent wake-up between cells; the driver chains them.
+8n. **L2.2 screen (8k pick 2), NEXT** (owner s131; ~40 min). `exp/8k-settle-no-merge` `dbe14b21`
+   (`TORUS_SETTLE_NO_MERGE=1`, byte-identical; microbench -5.3 to -7.0 ms per block) vs main `0f5bef38` (its base).
+   One binary per arm, md5 checked. Shape: the 8i P1M deep book (1M-account genesis, `PRELOAD=1000000`), standard
+   load, 600 s. Warm-up (300 s, either arm), then A and B one cell each (n = 1, a screen). Judge by the per-fill and
+   per-block timers, not matched/s (one pair can't resolve ~2%): exec-thread on-CPU ms per 1k fills, settle phase ms
+   per block (`torus_exec_phase_settle_seconds`, pass A / pass B, `torus_exec_cache_flush_seconds`), fills per block;
+   report matched/s, blocks/s, p50 / p99 too. If the settle timer drops by roughly the microbench's 5-7 ms per block
+   and nothing else gets worse, the full A B B A A B comes later, before any merge.
+8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; after 8n (the disk must be freed
+   first); replaces 8j; ~4-5 h incl. the extra cells, estimate). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
    `origin/feat/item7-option0` at `f8a45a2d` (G0-G4 done; G3 and the whole branch Codex torus-adversarial reviewed;
    not merged: the owner decides the merge), code defaults, 512 KB from `env.sh`, custody 0. The off and on arms run
    the SAME binary. **Arms (2 x 2 + M):** N-off, E-off, N-on, E-on; every arm sets `TORUS_EVM_FAST_PATH=0` or `=1`
@@ -413,6 +424,15 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (digests agree, replay length); one mixed-flag cell (val0 on, val1 off, val2 on with
    `TORUS_CHECKPOINT_INTERVAL_MS=0`): attestations agree for the whole cell. The default flip is the owner's call
    after this.
+8m. **Book storage mode at depth, + L3.1's zero-build flag** (owner s131; after 8l; ~2 h 30). 8i: at 1M resting orders
+   Classic's `save_books` is 73% whole-book encode, linear in depth. The other modes save only what changed but were
+   only benched at normal load (Classic vs mode 3, Q7). Main (current), one binary. Arms, one cell each (a screen; the
+   expected effect is large): Classic (`TORUS_BOOK_ROWS=0`), Classic + `TORUS_CKPT_DEFER_BOOKS=1` (L3.1's zero-build
+   version), mode 1 OrderRows, mode 2 LevelAuthority, mode 3 LevelAuthorityChunked; each at P0 and P1M (the 8i
+   shapes, 1M-account genesis, standard load, 600 s). The mode changes the state-root format: fresh genesis per mode,
+   every node the same mode (check `/proc/<pid>/environ` and the boot line). Report per cell: matched/s, native
+   blocks/s, p50 / p99, save_books ms per block and per 1k fills, exec-thread on-CPU per 1k fills, RSS, data-dir
+   size, boot time on the 1M genesis. Question: which mode should the testnet genesis use?
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
