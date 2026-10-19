@@ -395,6 +395,11 @@ pub struct Metrics {
     /// End-of-`execute_batch` position + balance cache `flush_all` into the
     /// overlay (nested inside `exec_phase_settle_seconds`).
     pub exec_cache_flush_seconds: Histogram,
+    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`): end-of-call position flushes
+    /// whose per-market caches were not provably disjoint (an opaque row put
+    /// one market's key in another's cache), so they were merged in order
+    /// and `flush_all`-ed like the flag-off path. Expected 0.
+    pub exec_settle_no_merge_fallbacks: Counter,
     /// Post-engine tail on the exec thread: core-writer drain, governance,
     /// fee distribution and the epoch boundary.
     pub exec_post_engine_tail_seconds: Histogram,
@@ -1907,6 +1912,12 @@ impl Metrics {
             "Exec sub-phase: position + balance cache flush_all into the overlay (inside settle)",
             exec_cache_flush_seconds.clone(),
         );
+        let exec_settle_no_merge_fallbacks = Counter::default();
+        registry.register(
+            "torus_exec_settle_no_merge_fallbacks",
+            "TORUS_SETTLE_NO_MERGE=1 position flushes whose per-market caches were not provably disjoint, so merged + flush_all-ed (expected 0)",
+            exec_settle_no_merge_fallbacks.clone(),
+        );
 
         let exec_post_engine_tail_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
@@ -3047,6 +3058,7 @@ impl Metrics {
             exec_settle_pass_a_seconds,
             exec_settle_pass_b_seconds,
             exec_cache_flush_seconds,
+            exec_settle_no_merge_fallbacks,
             exec_post_engine_tail_seconds,
             exec_engine_untimed_seconds,
             exec_save_books_seconds,
@@ -3911,6 +3923,13 @@ mod tests {
         ] {
             assert!(text.contains(name), "{name} not registered:\n{text}");
         }
+        // 8k L2.2: the no-merge fallback counter (a `_total` series).
+        m.exec_settle_no_merge_fallbacks.inc();
+        let text = m.encode();
+        assert!(
+            text.contains("torus_exec_settle_no_merge_fallbacks_total 1\n"),
+            "{text}"
+        );
     }
 
     /// L3 level-hash sponge cache stats (perf/l3-cache-stats): the aggregated
