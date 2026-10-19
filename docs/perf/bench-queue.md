@@ -395,7 +395,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    ms per 1k fills, native blocks/s, block p50 / p99, timeouts per 1,000 blocks); also exec ms at EVM heights vs
    other heights (the q5-gaps view), `torus_exec_evm_seconds` per EVM block, matched/s, CPU-s per 1M. If the SHAs line is
    not here when 8i ends, start 8k; 8j then runs after 8k is done (8k is never paused for it).
-   **SHAs:** not yet (G1b in progress).
+   **SHAs (posted s131, both on `origin/feat/item7-option0`):** A = `a7c10b13` (G0 + G1a, test-only on top of main
+   `fd94818d`: behaviour = main), B = `45cbd9f3` (G1b, tasks 1.2-1.7; Codex torus review no findings; golden
+   byte-equal). Build both from that branch the same way; nothing set.
 8k. **Explore workflow: new high-gain ideas, build and bench the best** (owner s131; starts right after 8i if 8j's
    SHAs are not posted by then, and once started it runs to the end without pausing; 8j then runs after 8k; ~a day, bench time <= ~4 h). Run the prompt in `docs/perf/8k-explore-workflow.md` as one
    multi-agent workflow (owner opt-in given): survey what is already explored, fan-out ideation (consensus, execution,
