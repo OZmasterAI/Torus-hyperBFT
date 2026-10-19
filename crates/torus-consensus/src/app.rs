@@ -1395,6 +1395,9 @@ struct ExecutionContext {
     /// body not dispatch-durable, an epoch boundary without the epoch fast
     /// path, replay). No effect without W.
     evm_fast_path: bool,
+    /// Item 7 option 0 (task 4.2): when the previous block's execution ended
+    /// (`None` before the first), for `torus_exec_evm_idle_before_seconds`.
+    last_block_end: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// See [`ExecutionContext::test_block_probe`].
@@ -3670,6 +3673,20 @@ impl ExecutionContext {
             native_count = torus_block.native_actions.len(),
             "execution pipeline: executing finalized block"
         );
+        // Item 7 option 0 (task 4.2): bench Q11's pipelined share at EVM
+        // heights and exec idle before an EVM block (the barrier included).
+        if has_evm {
+            if let Some(ref m) = self.metrics {
+                m.exec_evm_blocks.inc();
+                if pipelined {
+                    m.exec_evm_fast_path_blocks.inc();
+                }
+                if let Some(end) = *self.last_block_end.lock().unwrap() {
+                    m.exec_evm_idle_before_seconds
+                        .observe(end.elapsed().as_secs_f64());
+                }
+            }
+        }
 
         // Item 7 option 0 (task 1.3): the block overlay is built BEFORE the EVM
         // section, so the block's EVM rows can be absorbed into it (task 1.2) and
@@ -5546,6 +5563,7 @@ impl ExecutionContext {
             &self.exec_failed,
         );
 
+        *self.last_block_end.lock().unwrap() = Some(std::time::Instant::now());
         tracing::info!(height, "execution pipeline: block done");
     }
 }
@@ -6651,6 +6669,7 @@ impl TorusApp {
             liq_value_sum: liq_value_sum_enabled(),
             epoch_fast_path: crate::exec_pipeline::epoch_fast_path_enabled(),
             evm_fast_path: crate::exec_pipeline::evm_fast_path_enabled(),
+            last_block_end: Default::default(),
         };
 
         // Phase A: ensure the persistent incremental trie exists before any commit (including
@@ -6770,7 +6789,10 @@ impl TorusApp {
                 tracing::info!(
                     "EVM fast path ON (TORUS_EVM_FAST_PATH=1): blocks with EVM txs run pipelined \
                      (reads through the block overlay, EVM trie and receipts on the flush worker); \
-                     EVM state and receipts become durable with the block's checkpoint"
+                     EVM state and receipts become durable with the block's checkpoint (eth head, \
+                     receipts and EVM state move together); the mempool commit prune reads the \
+                     ingress view; metrics torus_exec_evm_fast_path_blocks, \
+                     torus_flush_worker_evm_trie_seconds"
                 );
             } else {
                 tracing::warn!(
@@ -15302,6 +15324,7 @@ mod crash_recovery_tests {
             epoch_fast_path: false,
             // Item 7 option 0: off unless a test sets it.
             evm_fast_path: false,
+            last_block_end: Default::default(),
         }
     }
 
@@ -33810,6 +33833,80 @@ mod crash_recovery_tests {
             .unwrap_or_else(|d| panic!("diverged at {}: {}", d.height, d.what));
         assert_eq!((c.hn, c.status, c.side, c.dumps), (3, 3, 3, 3));
         assert_eq!(o0_final(&s, &blocks), o0_final(&node, &blocks));
+    }
+
+    /// An option 0 node whose context (and its W) report to a fresh
+    /// `Metrics` (the replay contexts do not).
+    fn o0_node_with_metrics(cfg: O0Cfg) -> (O0Node, Arc<torus_telemetry::Metrics>) {
+        let mut node = O0Node::new(cfg);
+        drop(node.ctx.take());
+        let metrics = Arc::new(torus_telemetry::Metrics::new());
+        let mut ctx = node.new_ctx();
+        ctx.metrics = Some(metrics.clone());
+        node.attach(&mut ctx);
+        node.ctx = Some(ctx);
+        (node, metrics)
+    }
+
+    /// Plan task 4.2 (RED before: the series do not exist): the EVM fast
+    /// path's metrics, the ones bench Q11 reads (plan section 6).
+    /// - `torus_exec_evm_blocks` counts every executed block with EVM txs,
+    ///   `torus_exec_evm_fast_path_blocks` those that ran pipelined: their
+    ///   ratio is Q11's "pipelined share at EVM heights". An all-skipped
+    ///   EVM block (a Marker on the fast path) counts in both.
+    /// - `torus_exec_evm_idle_before_seconds` is observed once per EVM
+    ///   block after the first block (Q11's "exec idle before an EVM
+    ///   block").
+    /// - `torus_flush_worker_evm_trie_seconds` is W's EVM trie step: one per
+    ///   fast-path EVM block with a non-empty bundle at interval 0, one per
+    ///   checkpoint whose window holds one with an interval, never on the
+    ///   serial path (the root is computed on E there).
+    /// - `torus_exec_evm_seconds` keeps its meaning: its count is the same
+    ///   with the flag off and on.
+    #[test]
+    fn evm_fast_path_metrics_count_evm_blocks_and_w_trie_step() {
+        use O0Hand::*;
+        let blocks = o0_hand_blocks(&[Native, Evm, Native, Evm, NonceSkipped, Empty]);
+        let run = |cfg: O0Cfg| {
+            let (mut node, m) = o0_node_with_metrics(cfg);
+            node.run(&blocks);
+            node.finish();
+            node.ledger().assert_complete(6, &format!("{cfg:?}"));
+            m.encode()
+        };
+        // `metric_value` panics with the whole exposition if a series is absent.
+        let v = |text: &str, name: &str| metric_value(text, name) as u64;
+        let cells = [
+            ("flag off, interval 0", O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D), 0, 0),
+            ("flag on, interval 0", O0Cfg::piped(P5Ckpt::PerBlock, O0Run::D).fast(), 3, 2),
+            ("flag on, Every5", O0Cfg::piped(P5Ckpt::Every5, O0Run::D).fast(), 3, 1),
+            ("flag on, no W", O0Cfg::serial().fast(), 0, 0),
+        ];
+        let mut evm_seconds = Vec::new();
+        for (what, cfg, fast, trie) in cells {
+            let text = run(cfg);
+            assert_eq!(v(&text, "torus_exec_evm_blocks_total"), 3, "{what}");
+            assert_eq!(
+                v(&text, "torus_exec_evm_fast_path_blocks_total"),
+                fast,
+                "{what}"
+            );
+            assert_eq!(
+                v(&text, "torus_exec_evm_idle_before_seconds_count"),
+                3,
+                "{what}"
+            );
+            assert_eq!(
+                v(&text, "torus_flush_worker_evm_trie_seconds_count"),
+                trie,
+                "{what}"
+            );
+            evm_seconds.push(v(&text, "torus_exec_evm_seconds_count"));
+        }
+        assert!(
+            evm_seconds.windows(2).all(|w| w[0] == w[1]),
+            "torus_exec_evm_seconds counts the same blocks on every path: {evm_seconds:?}"
+        );
     }
 
     /// Plan task 3.2 (R and L unshared, success criteria): the fast path's

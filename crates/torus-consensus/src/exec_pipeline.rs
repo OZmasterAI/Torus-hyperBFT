@@ -1511,7 +1511,14 @@ fn evm_trie_prefix(
     {
         panic!("injected panic inside W's EVM trie step at {height} (test)");
     }
-    match torus_state::incremental::evm_window_prefix(&env.state_db, delta, rows) {
+    let timer = std::time::Instant::now();
+    let prefix = torus_state::incremental::evm_window_prefix(&env.state_db, delta, rows);
+    // Item 7 option 0 (task 4.2): W's EVM trie step (bench Q11 report).
+    if let Some(m) = &env.metrics {
+        m.flush_worker_evm_trie_seconds
+            .observe(timer.elapsed().as_secs_f64());
+    }
+    match prefix {
         Ok((batch, None)) => Ok(batch),
         Ok((batch, Some(e))) => {
             tracing::error!(
