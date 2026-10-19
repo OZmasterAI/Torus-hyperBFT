@@ -32,6 +32,12 @@ Read and list every idea already tried, built, rejected or parked, with its verd
   profiles in sections 81, 90, 92, 93);
 - every file name and status line in `docs/plans/` and `docs/perf/` (designs, experiments `exp-*`, verdicts);
 - memory: `search_knowledge` with project torus-hyperbft, if the toolshed is available.
+- explored on 18c whose code is NOT on origin (treat as explored; the docs on main describe them): propose-defer on
+  the exec queue (`exp/s123-propose-defer-on-exec-queue`, `TORUS_PROPOSE_EXEC_WATERMARK`, campaign B, dropped s126;
+  bench-queue "Done / dropped"); exec-aware mempool admission (`perf/exec-aware-admission`, parked WIP, uncompiled,
+  unbenched; results doc and `docs/configuration-reference.md`); the chunked level-hash / book-digest line
+  (`perf/book-digest-3c`, hard fork judged not justified; `docs/design-level-rows-authority.md`,
+  `docs/mission-handoff-layer3.md`). The docs on main are the authority; memory, where available, is a hint.
 Also profile-ground the baseline: what are the top exec-thread, consensus-thread and network costs today (cite
 sections). The list is the "already explored" filter for Phase 2.
 
@@ -58,8 +64,17 @@ refutes it? Verdict: survives / weakened (new estimate) / dead (why).
 Ranker: score survivors by expected gain x confidence / cost; prefer node-local, byte-identical changes (they can ship
 behind a flag and validators can mix). Pick the top 1 (at most 2) to build. A consensus-changing idea may be picked
 only if its gain is clearly larger; then the prototype is research-only and the report says so.
-Write the idea report (all ideas, verdicts, scores, the pick and why) BEFORE building:
-`docs/perf/8k-explore-ideas.md` on the docs branch below.
+Write the idea report BEFORE building: `docs/perf/8k-explore-ideas.md`, one table with a row per idea (every idea
+from Phase 2, dead ones included): id, idea, lens, mechanism (one line), attacked cost (profile row, its size, section
+cited), expected gain range (with the arithmetic in a footnote), confidence (low / medium / high), cost (lines, days),
+node-local or consensus-changing, critic verdict, score, status (picked / backlog / dead). Below the table: the pick
+and why, and the falsifying experiment for each backlog idea. Unbuilt survivors stay in it as the idea backlog.
+Keep the table's status column current through Phases 4-6.
+
+From Phase 1 onward, keep an APPEND-ONLY progress log `docs/perf/8k-explore-log.md`: one dated entry per event
+(phase started / done; idea picked, dropped or demoted and why; microbench result; build or test result; bench cell
+valid / void; verdict), each naming the commit or file it refers to. Never edit or delete an earlier entry; a
+correction is a new entry that names the one it corrects. Commit the log with each phase.
 
 ## Phase 4: build (one builder per pick, sequential)
 
@@ -82,7 +97,9 @@ book with `PRELOAD=1000000`, or EVM load). Every cell valid (ACCEPT / AGREE / PA
 ## Phase 6: write-up
 
 Results-doc section (next number) in `docs/perf/ozarchy-antispam-item6-pf1-2026-10-04.md` + a Done line under 8k in
-`bench-queue.md`, on a `docs/perf-section-<n>-8k` branch with origin/main merged in, plus `docs/perf/8k-explore-ideas.md`.
+`bench-queue.md`, on a `docs/perf-section-<n>-8k` branch with origin/main merged in, plus `docs/perf/8k-explore-ideas.md` (final
+statuses) and `docs/perf/8k-explore-log.md`. Push the docs branch after each phase, not only at the end, so 18c can
+follow.
 One short report to 18c / the owner: the ideas (top 5 with scores), what was built, the verdict, the recommendation
 (merge candidate / more work / drop), and the next best idea.
 
