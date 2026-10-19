@@ -53,6 +53,7 @@
 | `TORUS_CHECKPOINT_INTERVAL_MS` | Item 6 Phase 3 coalesced state checkpoints: execution time (milliseconds) between checkpoints; executed state reaches disk once per interval and at every 100th block, barrier and shutdown, not every block. Unset or empty: the role default, 15000 (15 s) on validators, 0 on `--rpc-only` nodes (step 6). `0`: per-block flush. Not a whole number: a warning and the per-block flush. With a deferred book mode (`TORUS_BOOK_ROWS=2` or `3`) an explicit value above 0 refuses to start, and the unset default is off (per-block flush, a warning). Needs the exec pipeline (`TORUS_EXEC_PIPELINE` not `0`). Node-local. Validator RPC reads other than the submit checks lag by up to one interval (`docs/validator-home-network.md`). Read once at startup. |
 | `TORUS_CHECKPOINT_MAX_BYTES` | Item 6 Phase 3: also checkpoint when the since-checkpoint layer reaches this many bytes. Unset, `0` or not a number (warned): no byte cap. Only with checkpoints on. |
 | `TORUS_EPOCH_FAST_PATH` | s124 epoch-boundary fast path, **on by default since s128** (bench section 84: block p50 57 -> 15 ms, matched/s within noise). With it off, every epoch-boundary block (height a multiple of the epoch length) first drains the exec pipeline (a forced checkpoint of everything not yet on disk, then a wait for the flush worker) and then runs and writes its state on the execution thread. With it on, a boundary block with no EVM tx and no buffered slash skips that drain and takes the pipelined path like any other block. With checkpoints on (`TORUS_CHECKPOINT_INTERVAL_MS`) such a boundary is also checkpointed at its own height, so the next epoch's validator-set plan it computes reaches disk without waiting for later blocks (consensus reads that plan only from disk). A boundary with an EVM tx or a slash still drains first. State, roots and the running state hash are identical either way; only timing changes. Unset, empty, `1` or `true`: on. `0` or `false`: off (turn it off this way). Any other value: off, with a warning (a typo never silently enables a consensus-timing change). Needs the exec pipeline (`TORUS_EXEC_PIPELINE` not `0`); without it the setting has no effect (logged at startup; a warning when the variable is set explicitly). Node-local. Read once at startup; when on, the node logs `epoch fast path ON` at startup and boundary blocks log `pipelined=true` in `executing finalized block`. |
+| `TORUS_EVM_FAST_PATH` | Item 7 option 0, the EVM fast path, **off by default** until bench Q11 passes (`docs/plans/item7-option0-impl.md` section 6). With it off, every block with EVM txs first drains the exec pipeline (a forced checkpoint of everything not yet on disk, then a wait for the flush worker) and then runs on the execution thread, which writes its EVM state, receipts and indices itself (Q5: about 0.5 s of exec idle per EVM block). With it on, such a block takes the pipelined path like a native block: its EVM part reads through the block's layered state, its EVM rows ride the block's pending set, and the flush worker does its EVM trie step and writes its receipts, tx index, block hash index and CoreWriter links in the block's batch (interval 0) or the checkpoint's. A buffered slash, a header or body not yet on disk, or an epoch boundary with `TORUS_EPOCH_FAST_PATH=0` still drain first. State, roots, receipts and the running state hash are identical either way; only timing changes, so validators may run mixed settings. With checkpoints on, EVM state and receipts reach the RPC with the block's checkpoint (see [EVM fast path](#evm-fast-path-item-7-option-0) for the RPC freshness rule). The mempool's commit prune then reads the published ingress view instead of the disk. `1` or `true`: on. Unset, empty, `0` or `false`: off. Any other value: off, with a warning. Needs the exec pipeline (`TORUS_EXEC_PIPELINE` not `0`); without it the setting has no effect (a warning at startup). Node-local; turning it off needs no data change. Read once at startup; when on, the node logs `EVM fast path ON` at startup and EVM blocks log `pipelined=true` in `executing finalized block`. |
 | `TORUS_PARALLEL_CANCEL_ALL` | s123 parallel cancel-all book pass, **on by default since s128 (8 workers)**. A batched cancel-all run's per-market book work (stops, `cancel_all_many`, the cancelled orders' margin) runs as up to N jobs on the exec pool, one job group per market, once the run has at least `TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS` (default 64) (market, action) visits. Unset, empty or whitespace: 8 workers. `N` >= 2: N workers (capped at 64). `0` or `1`: the serial loop (turn it off this way). Any other value (not a whole number): the serial loop, so a typo never turns the pool on. 8 is the benched value (sections 82-84, 300 markets); tune it per validator core count. Node-local: results, state and roots are byte-identical for any value. Read once at startup. |
 | `TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS` | Work gate of `TORUS_PARALLEL_CANCEL_ALL`: a cancel-all run with fewer (market, action) visits keeps the serial loop. Default 64; unset or not a number: 64; `0`: parallel whenever the run touches 2 or more markets. Node-local, byte-identical either way. Read once at startup. |
 | `TORUS_HEADER_RESEND_MS` | s75 fix D, stuck-leader header re-send: a leader still in its own view one interval after proposing re-sends its proposal header directly to every other validator, then every interval. Default **250 ms since s128** (was 3000 ms; bench section 77: 33-47 lost-proposal timeouts per 300 s cell at 3 s vs 3 at 250 ms). `0`: off (turn it off this way). Any other whole number: that many milliseconds. Unset, empty or not a number: the default. `devnet/wsl/env.sh` and `devnet/docker-compose.yml` also export 250. Read once at startup. |
@@ -320,6 +321,42 @@ Constants: `MAX_EVM_BIG_BLOCK_TX_BYTES`, `DEFAULT_EVM_BIG_BLOCK_INTERVAL`,
 `DEFAULT_EVM_BIG_GAS_LIMIT`, `EVM_MIN_BASE_FEE`, `DEFAULT_CORE_WRITER_ORDER_DELAY`,
 `CORE_WRITER_DRAIN_CAP` and the three key names and ranges in `crates/torus-types/src/lib.rs`;
 `EVM_INFLIGHT_KEEP_BLOCKS` and `EVM_RESEND_MAX` in `crates/torus-mempool/src/lib.rs`.
+
+## EVM fast path (item 7 option 0)
+
+`TORUS_EVM_FAST_PATH` (environment table above; design `docs/plans/item7-step3-design.md`, plan
+`docs/plans/item7-option0-impl.md`). Default off until bench Q11 passes; then the default flips to on in
+one commit and `TORUS_EVM_FAST_PATH=0` turns it off per node.
+
+### RPC freshness (design question 4 a)
+
+No checkpoint is forced at an EVM height. With the flag on and checkpoints on
+(`TORUS_CHECKPOINT_INTERVAL_MS`, 15 s on validators), a block's EVM state, receipts, tx index and
+block hash index reach the disk in the next regular checkpoint (the interval, every 100th block, the
+byte cap, a barrier, shutdown), in the same atomic batch as the applied-height marker. The eth head
+(`eth_blockNumber`, the `latest` tag) is that marker, so:
+
+* the eth head, the receipts and the EVM state move together, at the checkpoint; a receipt is never
+  visible before its state, and a state change never before its block;
+* they lag execution by up to one checkpoint interval, as native state has since item 6 Phase 3.
+  A wallet polling `eth_getTransactionReceipt` sees `null` for up to ~15 s after its tx executes;
+* `eth_getTransactionCount(address, "pending")` and mempool admission read the ingress view (the
+  executed state), so senders get fresh nonces; `"latest"` follows the eth head.
+
+With the flag off, every EVM height drains to disk before it runs, so the eth head reaches each EVM
+block right after it executes (the native blocks between them still lag by up to one interval).
+`--rpc-only` nodes (interval 0) write every block. Fresher reads through the view are design question
+4 b, not built. Details: `docs/api/eth-head.md`.
+
+### Metrics
+
+`torus_exec_evm_blocks_total` (every executed block with EVM txs) and
+`torus_exec_evm_fast_path_blocks_total` (those that ran pipelined): their ratio is the pipelined share at
+EVM heights. `torus_exec_evm_idle_before_seconds` (per EVM block, the exec thread's time from the
+previous block's end to this block's start, its drain included), `torus_exec_evm_block_seconds` (the
+block wall of EVM blocks), `torus_exec_evm_seconds` (the EVM section on the exec thread, every block,
+unchanged), `torus_flush_worker_evm_trie_seconds` (the flush worker's EVM trie step; never observed with
+the flag off). See `docs/monitoring-setup.md`.
 
 ## Economic Constants
 
