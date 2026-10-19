@@ -448,8 +448,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per block 71,388 -> 71,152, save_books 73.20 -> 73.77 ms per block. matched/s 226,021 -> 235,116, blocks/s 3.076 ->
    3.206, p50 / p99 228 / 1,485 -> 225 / 1,434 ms, timeouts 12 -> 6, RSS mean 6,792 -> 7,048 MB (in 8kd's spread);
    n = 1, not resolved. Verdict: full A B B A A B later. Inter-cell gaps 62 / 62 / 62 s (`max_load` 10).
-8l. **[PAUSED s131, owner: stopped for now; runs when the owner says] Q11: item 7 option 0 (EVM fast path) A/B**
-   (owner s128 decisions 7a / 8a; replaces 8j; ~4-5 h incl. the extra cells, estimate). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
+8l. **Q11: item 7 option 0 (EVM fast path) A/B** (owner s128 decisions 7a / 8a; UNPAUSED s131: right after 8r;
+   replaces 8j; ~4-5 h incl. the extra cells, estimate; tools from main `3aaaa046` or later). Full spec: `docs/plans/item7-option0-impl.md` section 6 on the branch. **Binary:** one build of
    `origin/feat/item7-option0` at `f8a45a2d` (G0-G4 done; G3 and the whole branch Codex torus-adversarial reviewed;
    not merged: the owner decides the merge), code defaults, 512 KB from `env.sh`, custody 0. The off and on arms run
    the SAME binary. **Arms (2 x 2 + M):** N-off, E-off, N-on, E-on; every arm sets `TORUS_EVM_FAST_PATH=0` or `=1`
