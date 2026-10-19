@@ -15812,6 +15812,223 @@ cell is on the same side of every A cell.
   8q's, plus flush-worker busy share, data-dir growth and gaps; a paired ratio <= 0 is printed without a log CI),
   `8p-analysis.md`, `8ps-analysis.md`, `8p-overhead.py`, `overhead.md`.
 
+## 103. Step 8r, 8o rerun with the RH4 GC worker: one binary `perf/rh4-gc-worker` `a0181b8b`, A = no retention vs B = `TORUS_RETENTION_BLOCKS=1000` (GC on the worker) vs C = the same + `TORUS_DA_GC_INLINE=1` (the old inline GC), standard unpaced load, 300 markets, 300 s cells, A B C C B A x 2, n = 4 (campaign ozarchy-8r, archy, 2026-10-19/20)
+
+**The worker removes 8o's block p50 cost, but not the blocks/s cost, and it adds a small cost of its own. B's block
+p50 is at A's level: 14.9 -> 14.7 ms whole (B / A 0.989 [0.882, 1.110]), and it is below C's in 4 / 4 replicates
+(C / B 1.084 [1.008, 1.167] whole, 1.074 [1.034, 1.116] post). Native blocks/s is still lower: whole 13.420 ->
+12.738 (0.949 [0.820, 1.099], 3 / 4 lower), after the first deleting pass 14.493 -> 13.635 (0.940 [0.854, 1.035],
+3 / 4). That is the same as C (C / B 0.998 whole). CPU-s per 1M fills is +2.0% in B (22.59 -> 23.05, 1.020 [1.008,
+1.033], 4 / 4), so CPU per fill is not within noise. matched/s is -1.0% in B (269,543 -> 266,712, 0.990 [0.979,
+0.9997], 4 / 4), and C does not show this drop (C / B 1.010 [1.003, 1.017], 4 / 4). Exec-thread on-CPU per 1k fills is
++1.5% in B (CI touches 1) and 1.2% above C in 4 / 4 (C / B 0.988 [0.986, 0.991]). On the consensus thread the GC costs
+B 22 us per height (0.022 ms per native block), against C's 1.6 ms per native block (the whole pass). C reproduces 8o's
+regression on this binary: blocks/s 0.947 [0.886, 1.012] whole and 0.935 [0.896, 0.976] post (4 / 4 lower, the post CI
+excludes 1); p50 +7.3% (1.073 [0.969, 1.188], higher in 4 / 4; 8o: +8.1%); CPU-s per 1M fills +1.5% [0.7, 2.3]
+(8o: +1.4%); matched/s unchanged (0.999). Plain verdicts: B vs A, the worker fixes p50, but blocks/s stays ~5% lower
+and CPU per fill is +2%, so 8o's regression is only partly removed. C vs A, yes, 8o's regression reproduces.**
+
+Question (bench queue step 8r, owner s131): 8o (section 100) found that retention 1000 costs block p50 +8.1% (6 / 6
+pairs), blocks/s ~-4% and CPU per fill +1.4%, from the GC pass running ~1.5 ms per block on the consensus thread.
+`perf/rh4-gc-worker` `a0181b8b` (pushed, not merged) has consensus hand the GC a job on a bounded queue. A worker thread
+then records, deletes and writes, and a pin fence protects bodies under check. Does the worker remove 8o's regression
+(B vs A), and does 8o's regression reproduce on this binary with the old inline path (C vs A)? Prune-by-default waits
+for this.
+
+### 103.1 Setup
+
+* One binary: `perf/rh4-gc-worker` `a0181b8b`, built `cargo build --release --locked -p torus-node / bench-throughput
+  / torus-tx-flood` in a new detached worktree `wt/8r-a0181b8b`, `CARGO_TARGET_DIR` `~/.cargo-target-8r` (reflink
+  copy of `~/.cargo-target-8o`). Node md5 `94053e26bad87a43845cddb509800d62`, bench `7dac5c5c`, flood `dd59d50d`.
+  Staged in `ozarchy-8r-stage/a`. Code defaults otherwise, as 8o: Classic books (`TORUS_BOOK_ROWS` empty), 15 s
+  checkpoints, 512 KB push threshold and re-send 250 ms from `env.sh`, custody 0, `TORUS_DA_GC_SLOW_MS` absent (50 ms).
+* Arms, all through the arm's `EXTRA_ENV`: A = no retention. B = `TORUS_RETENTION_BLOCKS=1000` (window 1128; the GC
+  pass runs on the `torus-da-gc` worker, the branch default). C = `TORUS_RETENTION_BLOCKS=1000` +
+  `TORUS_DA_GC_INLINE=1` (the pass runs on the consensus thread inside the commit dispatch, as 8o's B).
+* Took-effect checks (`ozarchy-8r-tools/8r-checks.sh` = 8o's renamed `r8*`; `retchk` / `gcchk` / `slowchk` take B and
+  C as 8o's B), plus `r8modechk` (new). B: every node logged the GC config line with `passes run on the torus-da-gc
+  worker` and `inline=false`, with `TORUS_DA_GC_INLINE` on no environ. C: every node logged `passes run on the
+  consensus thread` and `inline=true`, with `TORUS_DA_GC_INLINE=1` on 3 environs. A: neither line. B and C also need
+  `torus_da_gc_handoff_seconds_count` > 0 per node, and the worker metrics go to `<cell>/r8-worker.txt`. Self-tested:
+  the B smoke fails `r8modechk` as A and as C, and fails `retchk` / `slowchk` / `gcchk` as A. The C smoke fails
+  `r8modechk` as B and as A. Both pass as their own arm.
+* Shape: as 8o. Standard unpaced load (hsdb-300m): 300 markets, rate 76,000, 5,000 senders, BLOCK_CAP 400, RETRY_BUSY,
+  MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900, oracle on, IN_FLIGHT_TAIL commit, CLOID_SHARE 0, native only, default 100k
+  genesis (cell genesis md5 `d694b81b`), CLEAN=1. Cells run 300 s.
+* Tools: `ozarchy-8r-tools`, a `git archive` of main `d1efbfa6`, which contains `3aaaa046` (a reused-genesis cell
+  prints the build path's genesis lines) and `1489255f`. So 8o's plain `state_hash_activation = off` expectation is
+  back. It held on the reused path: the C smoke reused the B smoke's cached genesis (reflink copy into its own smoke
+  cache), and its run.log has `genesis reused (key 75c43338..., md5 d694b81b...)` followed by `state_hash_activation =
+  off`. It also held on all 12 measured cells, which reuse w1's genesis. Report scans in-line, genesis reuse on.
+  Sidecar `o8-sampler.py` (8o's, unchanged) runs in its own unit `r8sampler-main`, 60 s per node.
+* Cells, one detached driver (`ozarchy-8r-campaign.sh`, unit `bench-ozarchy-8r`, quiet gate 5 s CPU-busy < 10%):
+  smoke B 180 s (`launch smoke`). Then a smoke C 180 s from a sibling driver (`ozarchy-8rc-smoke.sh`, spec
+  `8rc-spec.json`, label `ozarchy-8rc-300m-smoke-s0`) to check `r8modechk` C and the reused-genesis line. Then w1 A
+  300 s (gated), then r1-A r1-B r1-C r2-C r2-B r2-A r3-A r3-B r3-C r4-C r4-B r4-A. Replicate k = rk-A / rk-B / rk-C:
+  three adjacent cells of one A B C or C B A half-block.
+* Windows per replicate: whole = load +0 s to the shortest load end of the three cells (+302 s). Post = the later of
+  B's and C's first deleting pass (first 1 Hz scrape with `torus_da_bodies_gc_deleted_total` > 0 on every node) + 5 s,
+  to the same end. Pre = +0 to the post start. The same windows apply to A, B and C.
+* Run: 23:02:32-00:37:07 (94.6 min). Pacing: END -> next START was 67-70 s for all 12 gaps. Of that, 62-64 s is the
+  post-cell step (checks and records) and 5-6 s is the rest. So the cells ran back to back from one driver, with ~8 s
+  more idle than the ~60 s target (8o: 53-54 s; the new `r8modechk` reads the three node logs once more). The quiet gate
+  never held a start. Smoke B 22:49:47-22:55:06, smoke C 22:55:35-23:00:47 (separate launches), w1 started 23:02:32.
+* Host: archy, 62 GB, 32 CPUs. MemAvailable >= 56.04 GB at every start. Swap used was 2,583,488 kB at preflight and
+  2,574,696 kB after the last cell (no growth; the 512 MB stop never fired). `kernel.perf_event_paranoid` was 2 at
+  every start and end. No cargo, rustc or indexer ran during the cells.
+
+### 103.2 Validity
+
+All 15 cells (two smokes, w1, 12 measured) ended rc 0, ACCEPT / AGREE / PASS, with 0 panic or fail-stop lines. The
+running node exe md5 was `94053e26` on 3 / 3 nodes in every cell (45 / 45). The campaign logged 326 CHECK OK plus
+26 + 26 on the smokes, with 0 CHECK FAIL, 0 CHECK WARN, 0 HARD FINDING, no CELL-FLAG and no rerun. Margin rejects were
+0% in every cell. The arms took effect as specified on every node: B ran the worker, C ran inline, and A had no
+retention and no GC line. The warm-up gate passed (w1 268,254 matched/s).
+
+### 103.3 Arm means and paired ratios (`ozarchy-8r-run/analyst/r8.txt`; node mean; n = 4 per arm; ratios = geomean of the 4 per-replicate ratios, 95% t CI, 3 df, t = 3.182; timeouts as the mean difference)
+
+First deleting pass: B at +88 / +88 / +76 / +81 s, C at +79 / +88 / +81 / +87 s. So post = +87 to +94 s through +302 s
+(208-215 s).
+
+| metric | window | A | B | C | B / A [95% CI] | B < A | C / A [95% CI] | C < A | C / B [95% CI] |
+|---|---|---|---|---|---|---|---|---|---|
+| native blocks/s | whole | 13.420 | 12.738 | 12.700 | 0.9490 [0.8199, 1.0985] | 3 / 4 | 0.9469 [0.8860, 1.0121] | 4 / 4 | 0.9978 [0.9001, 1.1061] |
+| native blocks/s | post | 14.493 | 13.635 | 13.557 | 0.9401 [0.8540, 1.0350] | 3 / 4 | 0.9354 [0.8963, 0.9763] | 4 / 4 | 0.9950 [0.9088, 1.0893] |
+| native blocks/s | pre | 10.947 | 10.688 | 10.736 | 0.9813 [0.6793, 1.4176] | 2 / 4 | 0.9868 [0.7987, 1.2193] | 2 / 4 | 1.0057 [0.8215, 1.2311] |
+| block p50 ms | whole | 14.9 | 14.7 | 16.0 | 0.9894 [0.8820, 1.1097] | 3 / 4 | 1.0729 [0.9689, 1.1880] | 0 / 4 | 1.0844 [1.0079, 1.1668] |
+| block p50 ms | post | 14.4 | 14.2 | 15.3 | 0.9885 [0.9039, 1.0810] | 2 / 4 | 1.0618 [0.9698, 1.1625] | 1 / 4 | 1.0742 [1.0338, 1.1161] |
+| block p50 ms | pre | 19.3 | 17.6 | 21.5 | 0.9223 [0.5825, 1.4603] | 3 / 4 | 1.1076 [0.7041, 1.7422] | 1 / 4 | 1.2008 [0.8094, 1.7815] |
+| block p99 ms | whole | 784 | 809 | 811 | 1.0313 [0.9514, 1.1180] | 1 / 4 | 1.0344 [0.9693, 1.1039] | 1 / 4 | 1.0030 [0.9448, 1.0648] |
+| block p99 ms | post | 745 | 776 | 782 | 1.0421 [0.9671, 1.1230] | 1 / 4 | 1.0502 [0.9799, 1.1255] | 0 / 4 | 1.0077 [0.9548, 1.0636] |
+| timeouts per cell (node mean) | whole | 0.6 | 0.6 | 0.3 | +0.00 [-0.61, +0.61] | 2 / 4 | -0.25 [-1.05, +0.55] | 2 / 4 | -0.25 [-0.52, +0.02] |
+| fills per native block | whole | 20,115 | 20,974 | 21,208 | 1.0426 [0.9072, 1.1982] | 1 / 4 | 1.0549 [0.9857, 1.1290] | 0 / 4 | 1.0118 [0.9188, 1.1142] |
+| fills per native block | post | 18,442 | 19,377 | 19,692 | 1.0501 [0.9659, 1.1416] | 1 / 4 | 1.0678 [1.0237, 1.1137] | 0 / 4 | 1.0168 [0.9333, 1.1078] |
+| matched/s | whole | 269,543 | 266,712 | 269,267 | 0.9895 [0.9794, 0.9997] | 4 / 4 | 0.9990 [0.9939, 1.0041] | 2 / 4 | 1.0096 [1.0026, 1.0166] |
+| matched/s | post | 267,220 | 263,808 | 266,899 | 0.9872 [0.9739, 1.0008] | 4 / 4 | 0.9988 [0.9885, 1.0092] | 2 / 4 | 1.0117 [1.0055, 1.0180] |
+| CPU-s per 1M fills | whole | 22.59 | 23.05 | 22.93 | 1.0203 [1.0082, 1.0326] | 0 / 4 | 1.0150 [1.0071, 1.0230] | 0 / 4 | 0.9948 [0.9854, 1.0043] |
+| CPU-s per 1M fills | post | 22.95 | 23.58 | 23.40 | 1.0275 [1.0118, 1.0435] | 0 / 4 | 1.0194 [1.0047, 1.0344] | 0 / 4 | 0.9921 [0.9812, 1.0032] |
+| CPU-s per 1M fills | pre | 21.80 | 21.90 | 21.91 | 1.0042 [0.9892, 1.0194] | 1 / 4 | 1.0049 [0.9954, 1.0145] | 1 / 4 | 1.0007 [0.9880, 1.0135] |
+| exec-thread on-CPU ms per 1k fills | whole load | 2.678 | 2.716 | 2.685 | 1.0145 [0.9999, 1.0294] | 0 / 4 | 1.0027 [0.9878, 1.0178] | 1 / 4 | 0.9884 [0.9862, 0.9905] |
+| exec block_ms | whole | 73.2 | 77.1 | 77.5 | 1.0526 [0.9033, 1.2266] | 1 / 4 | 1.0590 [0.9815, 1.1426] | 0 / 4 | 1.0061 [0.9131, 1.1085] |
+| exec block_ms | post | 67.7 | 71.9 | 72.6 | 1.0619 [0.9617, 1.1725] | 1 / 4 | 1.0724 [1.0119, 1.1366] | 0 / 4 | 1.0100 [0.9329, 1.0933] |
+
+Per cell (run order; node mean):
+
+| cell | blk/s whole | blk/s post | p50 / p99 ms whole | p50 / p99 ms post | timeouts whole | matched/s whole | CPU-s / 1M fills whole |
+|---|---|---|---|---|---|---|---|
+| r1-A | 14.285 | 14.854 | 13.8 / 758 | 13.7 / 734 | 0.0 | 270,167 | 22.56 |
+| r1-B | 12.077 | 13.252 | 15.2 / 827 | 14.5 / 784 | 0.3 | 266,284 | 23.25 |
+| r1-C | 12.792 | 13.410 | 16.2 / 802 | 15.6 / 785 | 0.3 | 269,603 | 22.96 |
+| r2-C | 12.961 | 13.716 | 15.4 / 792 | 15.3 / 764 | 0.3 | 269,068 | 22.98 |
+| r2-B | 12.535 | 13.048 | 14.8 / 815 | 14.4 / 792 | 0.7 | 265,822 | 23.03 |
+| r2-A | 13.147 | 14.505 | 15.0 / 795 | 14.3 / 755 | 1.0 | 270,384 | 22.55 |
+| r3-A | 12.848 | 14.273 | 15.2 / 818 | 14.5 / 777 | 0.0 | 268,874 | 22.57 |
+| r3-B | 13.603 | 14.485 | 14.2 / 790 | 13.7 / 756 | 0.3 | 268,111 | 22.90 |
+| r3-C | 12.433 | 13.309 | 16.5 / 820 | 15.2 / 788 | 0.0 | 268,960 | 22.92 |
+| r4-C | 12.613 | 13.793 | 15.8 / 829 | 15.0 / 793 | 0.7 | 269,437 | 22.88 |
+| r4-B | 12.737 | 13.754 | 14.7 / 802 | 14.3 / 773 | 1.0 | 266,631 | 23.04 |
+| r4-A | 13.402 | 14.340 | 15.5 / 766 | 15.1 / 716 | 1.3 | 268,748 | 22.70 |
+
+Native blocks/s per minute from minute 1 (node mean; * = the cell's first deleting pass, minute 2 in every B and C
+cell):
+
+| cell | m1 | m2 | m3 | m4 | m5 |
+|---|---|---|---|---|---|
+| r1-A | 11.08 | 15.17 | 14.97 | 14.63 | 14.57 |
+| r1-B | 8.52 | 11.12* | 14.47 | 12.83 | 13.70 |
+| r1-C | 9.96 | 12.55* | 14.47 | 14.01 | 13.21 |
+| r2-C | 9.93 | 12.70* | 14.47 | 13.69 | 13.46 |
+| r2-B | 9.71 | 13.24* | 14.78 | 12.78 | 12.46 |
+| r2-A | 8.49 | 12.99 | 14.42 | 13.98 | 16.16 |
+| r3-A | 9.21 | 11.87 | 12.90 | 14.17 | 15.08 |
+| r3-B | 10.14 | 14.51* | 14.49 | 13.59 | 13.47 |
+| r3-C | 9.86 | 12.37* | 14.18 | 12.67 | 13.36 |
+| r4-C | 9.33 | 11.63* | 13.34 | 13.33 | 13.82 |
+| r4-B | 9.66 | 12.27* | 15.86 | 13.21 | 12.97 |
+| r4-A | 9.94 | 13.83 | 15.68 | 14.21 | 12.47 |
+
+Per-minute B / A (geomean of 4): m1 0.985, m2 0.948, m3 1.030, m4 0.920 [0.867, 0.976] (4 / 4 lower), m5 0.906.
+C / A: m1 1.014, m2 0.917, m3 0.976, m4 0.942 [0.886, 1.002] (4 / 4), m5 0.928. Minute 1 shows no difference in
+either arm. The gap opens from minute 2 (the first deleting pass) and is clearest in minute 4. Run order shows no
+drift: A ran 14.29 / 13.15 / 12.85 / 13.40 blk/s (whole), B 12.08 / 12.54 / 13.60 / 12.74, C 12.79 / 12.96 / 12.43 /
+12.61. r1 carries the largest B / A gap (0.846), from a high r1-A and a slow r1-B pre window (9.48 blk/s). Without r1,
+B / A whole is 0.95 / 1.06 / 0.95. Every cell stayed in one regime: 19-22k fills per block, 266-271k matched/s.
+
+### 103.4 GC and worker (B and C cells; `r8-worker.txt`, metrics-after and 1 Hz; node mean unless a sum)
+
+| cell | GC passes | GC ms / pass post | GC ms / native blk post | GC p50 / p99 ms per pass | consensus-thread handoff us / height post | handoff ms / native blk post | handoff p50 / p99 ms | bodies deleted | queue depth max | lag max (heights) | coalesced | fence pins max / refused / kept | held passes (sum 3 nodes) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| r1-B | 4,682 | 2.063 | 2.073 | 0.439 / 12.99 | 22.1 | 0.022 | 0.0037 / 0.237 | 356,510 | 0 | 1 | 0 | 800 / 0 / 0 | dispatch_behind 884 |
+| r2-B | 4,730 | 2.083 | 2.144 | 0.380 / 12.96 | 24.0 | 0.025 | 0.0040 / 0.434 | 352,571 | 0 | 1 | 0 | 800 / 0 / 0 | dispatch_behind 889 |
+| r3-B | 5,052 | 1.817 | 1.775 | 0.374 / 12.11 | 22.0 | 0.022 | 0.0038 / 0.279 | 358,361 | 0 | 1 | 0 | 800 / 0 / 0 | dispatch_behind 936 |
+| r4-B | 4,869 | 1.873 | 1.879 | 0.377 / 11.99 | 22.3 | 0.022 | 0.0037 / 0.188 | 357,477 | 0 | 1 | 0 | 800 / 0 / 0 | dispatch_behind 939 |
+| r1-C | 4,894 | 1.650 | 1.677 | 0.319 / 10.48 | 1,651.7 | 1.678 | 0.317 / 8.14 | 359,935 | 0 | 0 | 0 | 0 / 0 / 0 | none |
+| r2-C | 4,820 | 1.551 | 1.560 | 0.312 / 10.34 | 1,552.2 | 1.562 | 0.309 / 8.84 | 357,529 | 0 | 0 | 0 | 0 / 0 / 0 | none |
+| r3-C | 4,789 | 1.573 | 1.596 | 0.284 / 10.84 | 1,574.6 | 1.598 | 0.278 / 9.25 | 361,121 | 0 | 0 | 0 | 0 / 0 / 0 | none |
+| r4-C | 4,761 | 1.587 | 1.566 | 0.325 / 10.77 | 1,588.4 | 1.567 | 0.334 / 9.41 | 359,974 | 0 | 0 | 0 | 0 / 0 / 0 | none |
+
+* The worker does what it should for the consensus thread. The handoff (job build + `try_send`) is 22-24 us per
+  height (p99 0.19-0.43 ms), about 70x less than C's inline pass at 1.55-1.68 ms per native block (8o B: 1.43-1.65).
+  The queue never held a height at a 1 Hz scrape (depth max 0, end 0). The lag was at most 1 height. No height was
+  coalesced, no fence pin was refused, no due body was kept by the fence, and no pass was held `fence_full`. Fence pins
+  peaked at 800 (two blocks of 400 bodies).
+* The pass itself is ~15-35% slower on the worker than inline: 1.82-2.08 vs 1.55-1.65 ms per pass, p99 12.0-13.0 vs
+  10.3-10.8 ms. It now runs beside consensus, exec and the flush worker instead of in the consensus thread's own time.
+* Every B node logs ~300 held passes `dispatch_behind` per cell (884-939 summed over 3 nodes; C 0, 8o's B 0). On the
+  worker a pass often sees the committed tip a height ahead of the height it was handed. It holds, and the next pass
+  catches up (bodies deleted per cell are the same as C: 352-358k vs 358-361k). This is benign for the GC. It is,
+  though, wasted pass work that C does not do.
+* Slow-pass WARN lines (`<cell>/r8-slowpass.txt`; all `fence_pinned=0`, all `held=none error=none` except one
+  `dispatch_behind`):
+  * B: 19 lines in 4 cells, 50.1-275.6 ms (median 57.0); `write_ms` is 92.6% of their time. 11 deleted nothing, 5 came
+    before +80 s, and 6 in +120-135 s. The two longest are r3-B val0 / val1 at +64 s (275.6 / 268.1 ms, both
+    `write_ms`; val0's also held `dispatch_behind`). They ran on the worker, so they did not stall the commit path.
+  * C: 10 lines, 57.9-298.5 ms (median 81.1); `write_ms` is 96.3%. r1-C val1 / val2 at +126 s took 296.7 / 298.5 ms
+    *on the consensus thread*, the longest single GC stalls seen so far (8o max 189 ms).
+  * As in 8o, the slow part is the one RocksDB batch write, not the scans. The +120-135 s cluster returns in both arms
+    (8o: the 2 GiB `max_total_wal_size` flush).
+
+### 103.5 Verdict, limits and next
+
+* **B vs A (does the worker remove 8o's regression?): only in part.** Block p50 is fixed: B 14.7 vs A 14.9 ms (0.989,
+  3 / 4 lower), and B is below C in 4 / 4 (C / B +8.4%, CI excludes 1). Native blocks/s is not fixed: -5.1% whole and
+  -6.0% post (3 / 4 lower; CIs 0.82-1.10 and 0.85-1.04 span 1 at n = 4), the same as C. CPU per fill is not within
+  noise: +2.0% whole and +2.7% post (4 / 4, CI excludes 1), a little more than C's +1.5%. B also has a small cost C
+  does not have: matched/s -1.0% (4 / 4, CI just excludes 1), and exec-thread on-CPU per 1k fills +1.2% over C (4 / 4,
+  tight CI). Block p99 is +3% (1 / 4 lower, CI spans 1), as in C and 8o.
+* **C vs A (does 8o's regression reproduce on this binary?): yes.** Blocks/s -5.3% whole and -6.5% post (4 / 4; the
+  post CI 0.896-0.976 excludes 1). p50 +7.3% (higher in 4 / 4; 8o +8.1%; the CI 0.97-1.19 spans 1 at n = 4).
+  CPU-s per 1M fills +1.5% (CI excludes 1; 8o +1.4%), and matched/s unchanged (0.999; 8o 0.997).
+* Reading: the consensus-thread pass (C) explains the p50 cost, and the worker removes it. It does not explain the
+  blocks/s cost. Both retention arms lose ~5-6% blocks/s with 4-7% bigger blocks, whichever thread runs the pass. So
+  the blocks/s cost comes from something retention does besides the pass's commit-path time. Candidates, all
+  unproven: the pass's RocksDB batch writes competing with the state DB's own writes and flushes (the slow-pass lines
+  are `write_ms`), the state / block-tree pruners that `--retention-blocks` also turns on, or CPU taken from the other
+  threads. B's own extra cost (matched/s -1%, exec-thread CPU +1.2% vs C) fits the worker running at the same time as
+  exec. The ~300 `dispatch_behind` re-passes per node and the fence pin / unpin on every body check are candidates
+  too (a perf profile of B vs C would separate them).
+* Under the exec-path merge rule (native blocks/s, block p50 / p99 and timeouts must not get worse), B passes p50 and
+  timeouts but probably fails blocks/s (3 / 4 lower, -5%) and CPU per fill. So prune-by-default should not go in on
+  this evidence alone. The worker is a clear win over inline for block p50 and for the long commit-path stalls (C had
+  a 299 ms pass on the consensus thread). It is worth merging as the GC path if retention ships at all.
+* Next, for the owner / 18c: (1) find the blocks/s cost that remains in both arms. Options are a retention-on,
+  GC-off arm (pruners only), if the code can split them, and a `perf` profile of A vs B at the same load. (2) Make the
+  worker skip a pass whose height is already behind the committed tip, instead of holding it as `dispatch_behind`.
+  (3) A longer run (900 s, n >= 6) would tighten the blocks/s CI, which still spans 1 for B at n = 4.
+* Limits: n = 4 per arm (3 df, t = 3.182), so the blocks/s CIs for B are wide (r1 alone gives 0.846). 300 s cells give
+  a 208-215 s post window. The load is native only. No restart or crash-kill with the worker on, custody 0 only. The
+  pairs are three adjacent cells, so C / A spans one cell more than B / A in the first half of each block and one
+  cell less in the second. The gaps were 67-70 s, ~8 s more idle than the ~60 s target, the same in every gap.
+* Data: `~/bench-results-matched/ozarchy-8r-300m-{smoke-s0,w1,r1-A,r1-B,r1-C,r2-C,r2-B,r2-A,r3-A,r3-B,r3-C,r4-C,r4-B,r4-A}`
+  and `ozarchy-8rc-300m-smoke-s0` (per cell `r8-worker.txt`, `r8-slowpass.txt`, `r8-push.txt`, `r8-disk.txt`,
+  `r8-swap.txt`). Campaign files are in `ozarchy-8r-run/campaign/` (`campaign.log`, `cells.tsv`, `cell-step/`,
+  `smoke/`) and `ozarchy-8r-run/smokeC/smoke/`, and the 60 s sampler rows in `ozarchy-8r-run/r8-samples/`. The check
+  self-test script is `ozarchy-8r-run/selftest/selftest.sh`. Tools are in `ozarchy-8r-tools/` (`8r-spec.json`,
+  `8rc-spec.json`, `8r-checks.sh`, `o8-sampler.py`, `ozarchy-8r-campaign.sh`, `ozarchy-8rc-smoke.sh`, `FROZEN.txt`).
+  The stage is in `ozarchy-8r-stage/` (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis is in
+  `ozarchy-8r-run/analyst/`: `r8-analyse.py` (8o's helpers, three arms, B / A, C / A and C / B, plus the worker
+  metrics), with `r8.txt` and `r8-analyse.json`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
