@@ -402,6 +402,18 @@ This is a single-file roadmap **plus** the detailed work packages ("PRPs" — Pr
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.
+- **Trial testnet before the real testnet (owner s131; after the current work).** Three validators: archy and cachy
+  (the owner's home PCs, same house, wired, 1 Gbit internet) and the 18c server. No router setup: archy and cachy
+  peer over the LAN with explicit `--p2p-peers` LAN addresses, and both dial out to 18c (public), so every pair is
+  connected without port forwarding and CGNAT does not matter (`docs/validator-home-network.md`, option B, which
+  allows only one NAT'd validator per site because two different sites cannot reach each other; one LAN avoids
+  that). A home leader sends the block to the other home node over the LAN, so only one copy per block crosses the
+  home uplink. It doubles as the pending WAN measurements: PE on WAN, the push-manifest threshold, header re-send.
+  Expect block p50 well above the one-host benches (every consensus round crosses the home <-> 18c link).
+  Before: ping 18c from home (RTT decides the block-time cost) and confirm the upload speed. Limits: 3 validators
+  tolerate no node down (sleep, reboot or an internet drop halts the chain until it is back; a 4th node would allow
+  one); archy cannot bench while it validates (CPU and disk contention, and it skews the bench), so the bench queue
+  pauses or moves to cachy.
 
 ---
 
