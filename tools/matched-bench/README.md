@@ -709,7 +709,9 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   death: ... -> continuing`: no checks run, cell_step flags its row `death` and queues a
   rerun, and the campaign goes on. `memguard` stops the cell unit when MemAvailable < 6 GB.
   `hardscan` prints `HARD FINDING` lines for panic, fail-stop and state hash mismatch lines
-  logged at WARN or ERROR (it never fails a cell); it runs in the end pass (next bullet).
+  logged at WARN or ERROR (it never fails a cell); in-line it runs right after the cell's
+  checks, before its cells.tsv row (an `analysis.cmd` may read its lines), deferred in the end
+  pass (next bullet).
 - **Post-cell work: in-line vs end pass** (bench queue pacing rule, s131). Right after a cell
   only what decides the next cell runs (`DRIVER show`: `POSTCELL inline ...`): run-cell.sh's
   rc, validity / agreement / liveness (summary.json, incl. the panic / fail-stop and ERROR
@@ -737,6 +739,11 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   excerpt or `deferred-scans.json`, any checks file and any `analysis.cmd` keep them in-line
   (`end_pass=0`). One `PREFLIGHT NOTE: report scans: deferred to the campaign end pass ...`
   or `PREFLIGHT NOTE: report scans: in-line because <readers> ...` line records the decision.
+  In-line, every cell runs exactly the pre-end-pass driver's steps (0f2ca85b^), in its order,
+  with the same inputs (`hardscan`, `soakchk` in `cell()` before the cell's row; run-cell.sh
+  scans in-line) and the end pass does nothing, not even a line (owner rule s131;
+  `InlineSequenceTest` runs both bodies from one spec against tracing fakes and compares the
+  step traces). Genesis reuse is the one in-line difference: `GENESIS_CACHE_DIR`.
   The other in-line steps read none (marketchk: `cell.markets`; warm-up gate and cell_step:
   validity, agreement, liveness, headline, crash, binaries). Opt out by hand with
   `harness_env` `"DEFER_REPORT_SCANS": "0"`. Preflight has the frozen `cell_step.py`

@@ -30,9 +30,12 @@
 # which unsets every other visible name and re-declares the file's. The prefix _DRV_ is the driver's (preflight
 # refuses a checks file that uses it). Limits: load_checks' header.
 # Post-cell work (bench queue pacing rule, s131): what decides the next cell runs right after each cell (POST_INLINE);
-# the report-only scans (POST_ENDPASS) run once, in end_pass, after the campaign's last cell (main cells, reruns, or
-# a CAMPAIGN STOP) and before campaign.done, from each cell's preserved logs: run-cell.sh DEFER_REPORT_SCANS=1 leaves
-# the ingest eviction counts and val<i>.log.excerpt to $TOOLS/cell-endpass.sh, and hardscan / soakchk move here too.
+# with the report scans deferred (DEFER_SCANS=1, preflight_post) the report-only scans (POST_ENDPASS) run once, in
+# end_pass, after the campaign's last cell (main cells, reruns, or a CAMPAIGN STOP) and before campaign.done, from
+# each cell's preserved logs: run-cell.sh DEFER_REPORT_SCANS=1 leaves the ingest eviction counts and
+# val<i>.log.excerpt to $TOOLS/cell-endpass.sh, and hardscan / soakchk move there too. In-line (DEFER_SCANS=0; owner
+# rule s131): every cell runs exactly the pre-end-pass driver's steps in its order with the same inputs (hardscan and
+# soakchk in cell(), before run_spec's cell_step, whose analysis may read their lines) and end_pass does nothing.
 # Genesis reuse: each cell gets GENESIS_CACHE_DIR=$RUN/genesis-cache (run-cell.sh: an unchanged genesis key reuses
 # the cached genesis, "genesis reused (key ..., md5 ...)"). Both need a run-cell.sh that has them (preflight_post;
 # an older frozen copy runs as before). Opt out per arm or spec-wide with harness_env DEFER_REPORT_SCANS=0 /
@@ -48,7 +51,7 @@ ENDPASS=$TOOLS/cell-endpass.sh  # end_pass: a cell's deferred report-only node-l
 DEFER_SCANS=0           # 1 = cells run with DEFER_REPORT_SCANS=1 (preflight_post: run-cell.sh has it, nothing in-line reads them)
 GENESIS_REUSE=0         # 1 = cells run with GENESIS_CACHE_DIR=$RUN/genesis-cache (preflight_post: run-cell.sh has it)
 ENDPASS_LABELS=()       # every started cell, in order: end_pass runs cell-endpass.sh on those with deferred-scans.json
-END_SCANS=()            # label:dur of each cell that reached its report scans (hardscan, soakchk): end_pass runs them
+END_SCANS=()            # DEFER_SCANS=1: label:dur of each cell that reached its report scans (hardscan, soakchk): end_pass runs them
 # post-cell work, classified (show_plan POSTCELL; test_make_driver.py checks cell() and end_pass against these lists).
 # In-line: validity and stop decisions, records of state the next cell overwrites, the cells.tsv row / rerun queue
 POST_INLINE="node-death md5chk envchk marketchk expectchk campaignchecks sysctlchk warmgatechk fdsum savelog cell_step"
@@ -609,11 +612,11 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     # OVERWRITE=1 (as Job 4): sysctl.txt and the samplers' files are in the cell dir before run-cell.sh, which refuses
     # a non-empty dir without it; this function refused an existing cell dir above (the spec may only repeat it)
     E=(TARGET_DIR="${BDIR[$b]}" TOOLS_DIR="$TOOLS" DATA_ROOT="$DEVNET" RESULTS_ROOT="$R" OVERWRITE=1)
-    [ "${BWRAP[$b]}" = 1 ] || E+=(EXPECT_NODE_MD5="${BMD5[$b]}")
-    [ -z "${BBMD5[$b]}" ] || E+=(EXPECT_BENCH_MD5="${BBMD5[$b]}")
     [ "$DEFER_SCANS" != 1 ] || E+=(DEFER_REPORT_SCANS=1)
     [ "$GENESIS_REUSE" != 1 ] || E+=(GENESIS_CACHE_DIR="$RUN/genesis-cache")
-    for kv in ${AHENV[$arm]}; do E+=("$kv"); done   # after the driver's: an arm may opt out (DEFER_REPORT_SCANS=0 ...)
+    for kv in ${AHENV[$arm]}; do E+=("$kv"); done   # after those two (an arm may opt out: DEFER_REPORT_SCANS=0 ...)
+    [ "${BWRAP[$b]}" = 1 ] || E+=(EXPECT_NODE_MD5="${BMD5[$b]}")
+    [ -z "${BBMD5[$b]}" ] || E+=(EXPECT_BENCH_MD5="${BBMD5[$b]}")
     "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
         "${E[@]}" "$HARNESS" "$WT_H" "$label" "$MARKETS" "$dur" "$RATE" "${AXE[$arm]}" \
         || { stopbg "$EP" "$DP" "$KP" "$MP" "$FP" "$SKP" "$VMP"; CELL_FAIL=abort-detach; return 1; }
@@ -667,7 +670,14 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
         warmgatechk "$label" "$rc" || crc=1
     fi
     [ "$crc" = 0 ] || { CELL_FAIL=check; return 1; }
-    END_SCANS+=("$label:$dur")   # hardscan, soakchk: report-only, end_pass runs them after the campaign's last cell
+    if [ "$DEFER_SCANS" = 1 ]; then
+        END_SCANS+=("$label:$dur")   # hardscan, soakchk: report-only, end_pass runs them after the campaign's last cell
+    else   # in-line: where the pre-end-pass driver ran them (an analysis.cmd or check may read their lines)
+        hardscan "$label"
+        if [ "$SAMPLERS" = 1 ]; then
+            soakchk "$label" "$dur"
+        fi
+    fi
     [ "$rc" = 0 ] || log "CELL FAIL $label: run-cell rc=$rc -> recorded (cells.tsv row + rerun), continuing"
     if [ "$fdok" = 1 ]; then log "STOP: a node held > $FD_STOP open fds in $label"; CELL_FAIL=stop-fd; return 1; fi
     return 0
@@ -701,9 +711,14 @@ run_cells() { # the campaign: each of CELLS through run_spec in order; 1 = stopp
 end_pass() { # once, after the campaign's last cell (no cell runs any more), before campaign.done: each started cell's
     # deferred report-only node-log scans (cell-endpass.sh, on the cells with deferred-scans.json), then hardscan and
     # soakchk of the cells that reached them (END_SCANS), cell by cell. Never fails the campaign: a failed cell scan
-    # is an END PASS FAIL line and keeps its marker (rerun by hand: cell-endpass.sh <cell dir>)
+    # is an END PASS FAIL line and keeps its marker (rerun by hand: cell-endpass.sh <cell dir>). Nothing deferred
+    # (DEFER_SCANS=0: the scans ran in-line, no cell has a marker) = nothing at all, not even a line
     local label c dur t0 n=0 bad=0 r
-    [ ${#ENDPASS_LABELS[@]} -gt 0 ] || return 0
+    [ ${#END_SCANS[@]} -gt 0 ] || for label in "${ENDPASS_LABELS[@]}"; do
+        [ ! -e "$R/$label/deferred-scans.json" ] || { n=1; break; }
+    done
+    [ ${#END_SCANS[@]} -gt 0 ] || [ "$n" = 1 ] || return 0
+    n=0
     t0=$(date +%s)
     log "END PASS start: ${#ENDPASS_LABELS[@]} cells (report-only scans: $POST_ENDPASS)"
     for label in "${ENDPASS_LABELS[@]}"; do

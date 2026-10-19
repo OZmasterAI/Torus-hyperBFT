@@ -44,12 +44,15 @@ fake /proc (DRIVER_PROC). Pinned:
 12. campaign checks (spec checks {source, per_cell}): the source file is sourced at preflight (each function must
    be defined, no driver function or name redefined), each function runs after every cell as `fn <label> <arm>`
    with the driver's R / AENV / ...; non-zero = CHECK FAIL, the cell's row bad:check, the campaign stops.
-15. post-cell work (bench queue pacing rule, s131): the POST_INLINE steps run in cell() / run_spec, the
-   POST_ENDPASS ones (cell-endpass.sh, hardscan, soakchk) only in end_pass, which run_campaign calls once after
-   the last cell (also on a CAMPAIGN STOP) and before the EXIT trap's campaign.done; each cell gets
-   DEFER_REPORT_SCANS=1 and GENESIS_CACHE_DIR=$RUN/genesis-cache when run-cell.sh supports them (preflight_post;
-   an expectation, checks file or analysis script that reads a deferred output keeps the scans in-line:
-   DeferredReadersTest), an arm's harness_env opts out.
+15. post-cell work (bench queue pacing rule, s131): the POST_INLINE steps run in cell() / run_spec; with the
+   scans deferred (DEFER_SCANS=1) the POST_ENDPASS ones (cell-endpass.sh, hardscan, soakchk) run only in end_pass,
+   which run_campaign calls once after the last cell (also on a CAMPAIGN STOP) and before the EXIT trap's
+   campaign.done; each cell gets DEFER_REPORT_SCANS=1 and GENESIS_CACHE_DIR=$RUN/genesis-cache when run-cell.sh
+   supports them (preflight_post; an expectation, checks file or analysis script that reads a deferred output
+   keeps the scans in-line: DeferredReadersTest), an arm's harness_env opts out.
+16. in-line (DEFER_SCANS=0; owner rule after Codex round 4 on d6647299): each cell runs exactly the pre-end-pass
+   driver's (0f2ca85b^) steps, in its order, with the same inputs, and the end pass does nothing
+   (InlineSequenceTest: both bodies from one spec, run against tracing fakes, the traces compared).
 """
 
 import glob
@@ -387,8 +390,9 @@ CELL_WIRING = [
     'if [ -e "$R/$label/node-death.txt" ]; then',
     'hardscan "$label"',
 ]
-# the Job 4 cell() wiring that a generated driver runs in end_pass instead (report-only, bench queue pacing rule s131:
-# once after the campaign's last cell): checked there, and absent from the generated cell()
+# the Job 4 cell() wiring that a generated driver runs in end_pass instead when the report scans are deferred
+# (DEFER_SCANS=1; bench queue pacing rule s131: once after the campaign's last cell): checked there too; in-line
+# (DEFER_SCANS=0) the generated cell() runs it where Job 4 did (InlineSequenceTest)
 CELL_WIRING_ENDPASS = ['hardscan "$label"']
 # cell(): the Job 4 drivers' failure handling around them (substrings)
 CELL_HANDLING = [
@@ -435,12 +439,8 @@ class GoldenTest(Base):
             lines = [ln.strip() for ln in body.splitlines()]
             wiring = CELL_WIRING
             if who == "generated":
-                wiring = [m for m in CELL_WIRING if m not in CELL_WIRING_ENDPASS]
                 ep = [ln.strip() for ln in func_text(txt, "end_pass").splitlines()]
                 for m in CELL_WIRING_ENDPASS:
-                    self.assertNotIn(
-                        m, lines, "generated cell() still runs %s in-line" % m
-                    )
                     self.assertIn(m, ep, "generated end_pass lacks %s" % m)
             self.assertEqual(
                 [m for m in wiring if m not in lines], [], "%s cell()" % who
@@ -2003,11 +2003,13 @@ class CellRunTest(FakeHostBase):
             "[%s] fds max/end" % LB,
         ):
             self.assertIn(s, out)
-        # report-only: hardscan and soakchk run in end_pass, after the cell (run_spec) returned
+        # in-line (DEFER_SCANS=0 here: no preflight_post): hardscan and soakchk run in cell(), as the pre-end-pass
+        # driver did, before run_spec's step; the end pass does nothing (EndPassRunTest: the deferred case)
         rc_at = out.index("RUN_SPEC_RC=0")
-        self.assertGreater(out.index("CHECK OK %s hardscan done" % LB), rc_at)
-        self.assertGreater(out.index("CHECK SOAK %s" % LB), rc_at)
+        self.assertLess(out.index("CHECK OK %s hardscan done" % LB), rc_at)
+        self.assertLess(out.index("CHECK SOAK %s" % LB), rc_at)
         self.assertLess(out.index("[%s] fds max/end" % LB), rc_at)
+        self.assertNotIn("END PASS", out)
         self.assertEqual(self.row(spec)[7], "ok", out)
         self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
 
@@ -3040,8 +3042,12 @@ class WarmGateRunTest(FakeHostBase):
 
 
 class PostCellClassificationTest(Base):
-    """the driver's POST_INLINE / POST_ENDPASS lists against the code: every end-pass step runs only in end_pass
-    (never in cell(), i.e. never while a later cell could run), every in-line step runs in cell() / run_spec"""
+    """the driver's POST_INLINE / POST_ENDPASS lists against the code: every in-line step runs in cell() / run_spec;
+    deferred (DEFER_SCANS=1) every end-pass step runs only in end_pass (never while a later cell could run). In-line
+    (DEFER_SCANS=0) cell() runs hardscan / soakchk where the pre-end-pass driver did (InlineSequenceTest), in the
+    DEFER_SCANS branch's else, and nothing else of them"""
+
+    DEFER_IF = '    if [ "$DEFER_SCANS" = 1 ]; then\n'
 
     # how each listed step shows in the driver text
     INLINE_CALLS = {
@@ -3087,11 +3093,34 @@ class PostCellClassificationTest(Base):
         for k in ("md5chk", "envchk", "marketchk", "expectchk"):
             self.assertIn(k + ' "$1"', cc)
         self.assertIn("cell_step ", spec)
+        # cell()'s report-scan branch: deferred = END_SCANS only; else (in-line) = hardscan, soakchk
+        self.assertEqual(cell.count(self.DEFER_IF), 1, cell)
+        i = cell.index(self.DEFER_IF)
+        j = cell.index("\n    fi\n", i) + len("\n    fi\n")
+        branch, rest = cell[i:j], cell[:i] + cell[j:]
+        deferred, inline_ = branch.split("\n    else", 1)
+        self.assertIn('END_SCANS+=("$label:$dur")', deferred)
+        self.assertNotIn("END_SCANS", rest + inline_)
         for k, call in self.ENDPASS_CALLS.items():
             self.assertIn(call, ep, "end pass %s" % k)
-            self.assertNotIn(call, cell, "end pass %s in cell()" % k)
+            self.assertNotIn(
+                call, rest, "end pass %s in cell() outside its in-line branch" % k
+            )
+            self.assertNotIn(
+                call, deferred, "end pass %s in cell()'s deferred branch" % k
+            )
+            self.assertEqual(
+                call in inline_, k != "cell-endpass", "in-line branch: %s" % k
+            )
             self.assertNotIn(call, spec, "end pass %s in run_spec" % k)
             self.assertNotIn(call, func_text(self.text, "run_cells"))
+        # in-line, where the pre-end-pass driver had them: after the checks' stop, before the rc / fd-stop lines
+        self.assertLess(
+            cell.index('[ "$crc" = 0 ] || { CELL_FAIL=check; return 1; }'), i
+        )
+        self.assertLess(
+            j, cell.index('[ "$rc" = 0 ] || log "CELL FAIL $label: run-cell rc=$rc')
+        )
 
     def test_show_lists_them(self):
         plan = self.plan(self.drv)
@@ -3804,6 +3833,372 @@ class EndPassRunTest(FakeHostBase):
         self.assertIn("harness env DEFER_REPORT_SCANS=0 GENESIS_CACHE_DIR=\n", runlog)
         self.assertNotIn("END PASS OK", out)
         self.assertIn("CHECK OK %s hardscan done" % LB, out)
+
+
+# ---------------------------------------------------------------- in-line = the pre-end-pass driver (owner rule)
+
+# the driver body before the end pass (0f2ca85b: matched-bench end pass + genesis reuse). Owner rule (s131, after
+# Codex round 4 on d6647299: an in-line campaign ran hardscan after cell_step, so an analysis that rejects a cell's
+# HARD FINDING lines recorded ok): with the report scans in-line (DEFER_SCANS=0) every cell runs EXACTLY this
+# body's steps, in its order, with the same inputs, and the end pass does nothing; only DEFER_SCANS=1 may differ
+OLD_BODY_REV = "0f2ca85b^"
+BODY_MARKER = "# ---- driver body ("
+# the foreground steps of a cell and its write-up (each traced "> fn" / "< fn rc=N" in call order). The background
+# ones (envrec, the samplers, watch_nodes, memguard) run concurrently by design: no order to pin
+TRACED = (
+    "run_campaign run_cells run_spec cell end_pass sysctlchk savelog fdsum cellchecks md5chk envchk marketchk"
+    " expectchk campaignchecks gated warmgatechk hardscan soakchk step_summary_md5 cell_step cell_step_has_row"
+    " cell_step_fallback cell_step_rerun_pass"
+)
+TRACE_WRAP = r"""
+_trace_wrap() { # each named function -> a wrapper that traces its entry and exit (with its rc) to $TRACE
+    local f src
+    for f in "$@"; do
+        declare -F "$f" > /dev/null || continue
+        src=$(declare -f "$f")
+        eval "_traced_$src"
+        eval "$f() { echo \"> $f\" >> \"\$TRACE\"; _traced_$f \"\$@\"; set -- \$?; echo \"< $f rc=\$1\" >> \"\$TRACE\"; return \$1; }"
+    done
+}
+"""
+# the cell's run-cell.sh (FAKE_HARNESS) also traces itself: its label, and the report scans it runs in-line
+TRACE_HARNESS = FAKE_HARNESS.replace(
+    'stopall\nexit "${FAKE_RC:-0}"',
+    'echo "run-cell $label" >> "$TRACE"\n'
+    '[ "${DEFER_REPORT_SCANS:-0}" = 1 ] || echo "run-cell $label report scans in-line (ingest, excerpts)" >> "$TRACE"\n'
+    'stopall\nexit "${FAKE_RC:-0}"',
+)
+assert TRACE_HARNESS != FAKE_HARNESS
+# Codex's round 4 probe harness: each node log has a STATE HASH MISMATCH WARN line (hardscan: a HARD FINDING)
+HARD_LINE = (
+    "INFO torus_node: fake val$i",
+    "WARN torus_node: STATE HASH MISMATCH fake val$i",
+)
+# fake detach.sh that traces the cell command it starts: its argv (minus GENESIS_CACHE_DIR: genesis reuse stays)
+TRACE_DETACH = FAKE_DETACH.replace(
+    "mkdir -p",
+    'a=(); for x in "$@"; do case $x in GENESIS_CACHE_DIR=*) ;; *) a+=("$x") ;; esac; done\n'
+    'echo "detach $name $log ${a[*]}" >> "$TRACE"\nmkdir -p',
+    1,
+)
+assert TRACE_DETACH != FAKE_DETACH
+# an analysis that rejects its cell's HARD FINDING lines in {run}/campaign.log (Codex round 4)
+HARD_ANALYSIS = (
+    "import json, sys\n"
+    'text = open(sys.argv[2] + "/campaign.log").read()\n'
+    'assert "HARD FINDING " + sys.argv[3] + ":" not in text, "correctness finding"\n'
+    'json.dump({sys.argv[4]: {"metric": 1}}, open(sys.argv[1], "w"))\n'
+)
+
+
+def body_at(rev):
+    """driver-body.sh at git rev REV; None outside a git checkout that has it"""
+    r = subprocess.run(
+        [
+            "git",
+            "-C",
+            HERE,
+            "show",
+            "%s:tools/matched-bench/campaign/driver-body.sh" % rev,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return r.stdout if r.returncode == 0 else None
+
+
+def main_tail(body):
+    """what a body's main runs after its PREFLIGHT OK line (the cells, the rerun pass, the end pass, the totals)"""
+    i = body.index('\nlog "PREFLIGHT OK ')
+    return body[body.index("\n", i + 1) + 1 :]
+
+
+class InlineSequenceTest(FakeHostBase):
+    """the owner rule: report scans in-line (DEFER_SCANS=0) = the pre-end-pass driver's per-cell sequence (same
+    steps, same order, same inputs) and a no-op end pass; DEFER_SCANS=1 moves only the report-only scans (hardscan,
+    soakchk, run-cell.sh's ingest scan and excerpts) into the end pass. Old and new: one driver generated from the
+    same spec (old = OLD_BODY_REV's body under the same config), each run through its own main tail against the
+    traced fakes"""
+
+    def setUp(self):
+        super().setUp()
+        self.old = body_at(OLD_BODY_REV)
+        if self.old is None:
+            self.skipTest("no git history with %s (a frozen tools copy)" % OLD_BODY_REV)
+        self.write_fake(
+            "trace-run-cell.sh", TRACE_HARNESS.replace("@GUARD@", run_cell_guard())
+        )
+        self.write_fake("trace-detach.sh", TRACE_DETACH)
+        self.write_fake(
+            "trace-endpass.sh",
+            '#!/bin/bash\necho "cell-endpass ${1##*/}" >> "$TRACE"\nexec "$REAL_ENDPASS" "$@"\n',
+        )
+
+    def tearDown(self):
+        for f in glob.glob(os.path.join(self.units, "*", "*.pid")):
+            try:
+                os.killpg(int(open(f).read()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        super().tearDown()
+
+    def start(self, version, spec_over, cells, smoke=False, hard=False):
+        """generate the driver for VERSION ('old': OLD_BODY_REV's body; 'new') under tmp/VERSION and start its
+        campaign: preflight_static, then the body's main tail, stdout to {run}/campaign.log as its unit has it"""
+        root = os.path.join(self.tmp, version)
+        os.makedirs(root)
+        spec_over = dict(spec_over)
+        if spec_over.pop("analysis", False):
+            script = os.path.join(root, "analysis.py")
+            with open(script, "w") as f:
+                f.write(HARD_ANALYSIS)
+            spec_over["analysis"] = {
+                "cmd": "python3 -I %s {out} {run} {label} {tag}" % shlex.quote(script),
+                "metric": "metric",
+            }
+        if spec_over.pop("checks", False):
+            src = os.path.join(root, "checks.sh")
+            with open(src, "w") as f:
+                f.write(CHECKS_SH)
+            spec_over["checks"] = {"source": src, "per_cell": ["okchk", "alsochk"]}
+        spec = minimal_spec(root, **spec_over)
+        drv = self.generate(
+            self.write_spec(spec, "%s.json" % version), "%s.sh" % version
+        )
+        text = open(drv).read()
+        if version == "old":
+            text = text[: text.index(BODY_MARKER)] + self.old
+            with open(drv, "w") as f:
+                f.write(text)
+        harness = os.path.join(self.bin, "trace-run-cell.sh")
+        if hard:
+            harness = os.path.join(self.bin, "hard-run-cell.sh")
+            self.write_fake(
+                "hard-run-cell.sh",
+                TRACE_HARNESS.replace("@GUARD@", run_cell_guard()).replace(*HARD_LINE),
+            )
+        run = spec["run_dir"]
+        os.makedirs(run)
+        trace = os.path.join(root, "trace.txt")
+        open(trace, "w").close()
+        script = "\n".join(
+            [
+                "DRIVER_LIB_ONLY=1; . %s || exit 99" % shlex.quote(drv),
+                "CELLS=(%s)" % " ".join(shlex.quote(c) for c in cells),
+                "SMOKE=1" if smoke else "",
+                "preflight_static || exit 90",
+                'echo "DEFER_SCANS=${DEFER_SCANS-none}" > %s'
+                % shlex.quote(os.path.join(root, "defer")),
+                "HARNESS=%s" % shlex.quote(harness),
+                "REAL_ENDPASS=${ENDPASS:-}; export REAL_ENDPASS",
+                "ENDPASS=%s" % shlex.quote(os.path.join(self.bin, "trace-endpass.sh")),
+                "quiet() { return 0; }",
+                # the main's run mode up to its PREFLIGHT OK line
+                "export CELL_STEP_LOG=$RUN/campaign.log",
+                '[ -z "$ANALYSIS_CMD" ] || export CELL_STEP_ANALYSIS_CMD=$ANALYSIS_CMD',
+                '[ -z "$ANALYSIS_METRIC" ] || export CELL_STEP_ANALYSIS_METRIC=$ANALYSIS_METRIC',
+                '. "$TOOLS/cell-step.sh" || exit 98',
+                "sysctl_pin",
+                TRACE_WRAP,
+                "_trace_wrap %s" % TRACED,
+                main_tail(text),
+            ]
+        )
+        units = os.path.join(self.units, version)
+        os.makedirs(units)
+        e = dict(os.environ)
+        e.update(
+            self.env(
+                DRIVER_DETACH=os.path.join(self.bin, "trace-detach.sh"),
+                FAKE_PROC=self.proc,
+                FAKE_UNITS=units,
+                FAKE_RUN_S="4",
+                TRACE=trace,
+            )
+        )
+        log = os.path.join(run, "campaign.log")
+        fo = open(log, "w")
+        self.addCleanup(fo.close)
+        p = subprocess.Popen(
+            ["bash", "-c", script],
+            stdout=fo,
+            stderr=subprocess.STDOUT,
+            env=e,
+            start_new_session=True,
+        )
+        self.procs.append(p)
+        return p, spec, root
+
+    def finish(self, started):
+        p, spec, root = started
+        p.wait(timeout=900)
+        run = spec["run_dir"]
+        tsv = os.path.join(run, "cells.tsv")
+        rows = (
+            [ln.split("\t") for ln in open(tsv).read().splitlines()[1:]]
+            if os.path.exists(tsv)
+            else []
+        )
+        return {
+            "rc": p.returncode,
+            "defer": open(os.path.join(root, "defer")).read().strip(),
+            "out": open(os.path.join(run, "campaign.log")).read(),
+            "trace": open(os.path.join(root, "trace.txt"))
+            .read()
+            .replace(root, "<ROOT>")
+            .splitlines(),
+            "rows": [(r[0], r[7]) for r in rows],
+            "spec": spec,
+        }
+
+    def both(self, spec_over, cells, **kw):
+        """old and new from the same spec, concurrently (own dirs and fake units)"""
+        a = self.start("old", spec_over, cells, **kw)
+        b = self.start("new", spec_over, cells, **kw)
+        return self.finish(a), self.finish(b)
+
+    @staticmethod
+    def report_lines(out):
+        """the campaign.log lines that record a step's outcome, without times (digits -> N: sample counts)"""
+        keep = (
+            "HARD FINDING",
+            "CHECK ",
+            "CELL-FLAG",
+            "CELL FAIL",
+            "MAIN CELLS END",
+            "CAMPAIGN",
+            "END PASS",
+            "cells.tsv:",
+        )
+        res = []
+        for ln in out.splitlines():
+            ln = re.sub(r"^\[[0-9:]+\] ", "", ln)
+            if ln.startswith(keep):
+                res.append(re.sub(r"\d+", "N", ln))
+        return res
+
+    def without_end_pass(self, trace):
+        """the new trace minus run_campaign's and end_pass's own lines; end_pass ran once and traced nothing"""
+        enter = [i for i, ln in enumerate(trace) if ln == "> end_pass"]
+        self.assertEqual(len(enter), 1, trace)
+        self.assertEqual(trace[enter[0] + 1], "< end_pass rc=0", trace[enter[0] :])
+        return [ln for ln in trace if ln.split()[1] not in ("run_campaign", "end_pass")]
+
+    def assertSameInline(self, old, new, why):
+        self.assertEqual(old["defer"], "DEFER_SCANS=none")
+        self.assertEqual(new["defer"], "DEFER_SCANS=0", new["out"])
+        self.assertIn(
+            "PREFLIGHT NOTE: report scans: in-line because %s" % why, new["out"]
+        )
+        self.assertEqual(new["rc"], old["rc"], new["out"])
+        self.assertEqual(self.without_end_pass(new["trace"]), old["trace"])
+        self.assertNotIn("cell-endpass", "\n".join(new["trace"]))
+        self.assertNotIn("END PASS", new["out"])
+        self.assertEqual(self.report_lines(new["out"]), self.report_lines(old["out"]))
+        self.assertEqual(new["rows"], old["rows"])
+
+    @staticmethod
+    def steps(trace, label):
+        """one cell's traced steps, from its detach to the end of its run_spec ("> fn" -> fn)"""
+        i = next(k for k, ln in enumerate(trace) if ln.startswith("detach %s " % label))
+        j = trace.index("< run_spec rc=0", i)
+        return [ln[2:] if ln.startswith("> ") else ln for ln in trace[i : j + 1]]
+
+    # ---- Codex round 4 (P2 on d6647299): an in-line analysis that rejects the cell's HARD FINDING lines
+    def test_analysis_sees_the_cells_hard_findings(self):
+        """the review probe: one smoke cell whose node logs have STATE HASH MISMATCH WARN lines, an analysis.cmd
+        that rejects the cell's HARD FINDING lines in {run}/campaign.log: hardscan runs before cell_step (as in the
+        pre-end-pass driver), so the row is bad:analysis and a rerun is queued"""
+        r = self.finish(
+            self.start(
+                "new", {"analysis": True}, ["r1-A:A:120:none:"], smoke=True, hard=True
+            )
+        )
+        self.assertEqual(r["defer"], "DEFER_SCANS=0", r["out"])
+        self.assertEqual(r["out"].count("HARD FINDING"), 3, r["out"])
+        self.assertEqual(r["rows"], [(LB, "bad:analysis")], r["out"])
+        ev = json.load(
+            open(os.path.join(r["spec"]["run_dir"], "cell-step", LB + ".json"))
+        )
+        self.assertEqual(ev["analysis"]["status"], "fail", ev)
+        self.assertTrue(ev.get("rerun_queued"), ev)
+        self.assertLess(r["trace"].index("> hardscan"), r["trace"].index("> cell_step"))
+
+    # ---- the structural pin: in-line = the old sequence
+    def test_inline_analysis_campaign_is_the_old_sequence(self):
+        """analysis.cmd (in-line), hard findings, so the analysis rejects the cell and its rerun"""
+        old, new = self.both({"analysis": True}, ["r1-A:A:120:none:"], hard=True)
+        self.assertSameInline(old, new, "analysis.cmd")
+        self.assertEqual(
+            new["rows"],
+            [(LB, "bad:analysis"), (LB + "-rerun", "bad:analysis")],
+            new["out"],
+        )
+        steps = self.steps(new["trace"], LB)
+        self.assertIn("run-cell %s report scans in-line (ingest, excerpts)" % LB, steps)
+        order = [
+            "savelog",
+            "cellchecks",
+            "hardscan",
+            "soakchk",
+            "< cell rc=0",
+            "step_summary_md5",
+            "cell_step",
+        ]
+        self.assertEqual([s for s in steps if s in order], order, steps)
+
+    def test_inline_checks_and_expect_campaign_is_the_old_sequence(self):
+        """a checks file and a run.log expectation (in-line); a warm-up gate cell, then a measured cell (other arm);
+        a harness_env (its place on run-cell.sh's env line, in detach's traced argv, is pinned too)"""
+        old, new = self.both(
+            {
+                "checks": True,
+                "expect": [{"file": "run.log", "regex": "bench exited rc=0", "min": 1}],
+                "harness_env": {"BULK_COUNT": "100000"},
+            },
+            ["w1:A:120:none:", "r1-M1:M1:120:none:"],
+        )
+        self.assertSameInline(old, new, "expectation")
+        self.assertEqual(new["rc"], 0, new["out"])
+        self.assertEqual([f for _, f in new["rows"]], ["ok", "ok"], new["out"])
+        steps = self.steps(new["trace"], "test-camp-10m-w1")
+        order = ["campaignchecks", "warmgatechk", "hardscan", "soakchk", "cell_step"]
+        self.assertEqual([s for s in steps if s in order], order, steps)
+
+    def test_deferred_moves_only_the_report_scans(self):
+        """DEFER_SCANS=1 (no reader): the old sequence minus hardscan / soakchk and run-cell.sh's in-line report
+        scans; the end pass, after the last cell, runs cell-endpass.sh, hardscan and soakchk on the cell"""
+        old, new = self.both({}, ["r1-A:A:120:none:"])
+        self.assertEqual(new["defer"], "DEFER_SCANS=1", new["out"])
+        self.assertEqual(new["rc"], 0, new["out"])
+        t = new["trace"]
+        i, j = t.index("> end_pass"), t.index("< end_pass rc=0")
+        self.assertEqual(
+            [
+                ln
+                for ln in t[i + 1 : j]
+                if ln.startswith(("cell-endpass", "> hardscan", "> soakchk"))
+            ],
+            ["cell-endpass %s" % LB, "> hardscan", "> soakchk"],
+        )
+        moved = ("hardscan", "soakchk")
+        expect = [
+            ln
+            for ln in old["trace"]
+            if ln.split()[1] not in moved
+            and not ln.endswith("report scans in-line (ingest, excerpts)")
+        ]
+        # the one input that differs: run-cell.sh's env line gets DEFER_REPORT_SCANS=1
+        self.assertEqual(
+            [
+                ln.replace(" DEFER_REPORT_SCANS=1 ", " ", 1)
+                for ln in t[:i] + t[j + 1 :]
+                if ln.split()[1] != "run_campaign"
+            ],
+            expect,
+        )
+        self.assertIn(" OVERWRITE=1 DEFER_REPORT_SCANS=1 ", t[t.index("> cell") + 3])
+        self.assertEqual(new["rows"], old["rows"])
 
 
 if __name__ == "__main__":
