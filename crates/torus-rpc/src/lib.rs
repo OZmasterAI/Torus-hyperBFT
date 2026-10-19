@@ -4504,7 +4504,7 @@ mod tests {
         let b1 = block(1, vec![t_ok, t_skip.clone(), t_rev]);
         let validated =
             torus_bridge::BlockValidator::new(TORUS_CHAIN_ID, 100, 4, Address::ZERO, Address::ZERO)
-                .validate_block_for_catchup(&b1, &state, &executor)
+                .validate_block_for_catchup(&b1, torus_bridge::EvmReads::Db(&state), &executor, torus_bridge::RootMode::OnE)
                 .unwrap();
         assert_eq!(validated.receipts.len(), 2, "the unfunded tx is skipped");
         assert!(!validated.receipts[1].status, "the create reverted");

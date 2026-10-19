@@ -1245,18 +1245,7 @@ impl StateDb {
     pub fn get_storage(&self, address: &Address, index: &U256) -> Result<U256, StateError> {
         let cf = self.cf(CF_STORAGE)?;
         let key = storage_key(address, index);
-        match self.db.get_cf(cf, key)? {
-            Some(data) => {
-                if data.len() != 32 {
-                    return Err(StateError::InvalidData(format!(
-                        "storage value len {} != 32",
-                        data.len()
-                    )));
-                }
-                Ok(U256::from_be_slice(&data))
-            }
-            None => Ok(U256::ZERO),
-        }
+        decode_storage_value(self.db.get_cf(cf, key)?.as_deref())
     }
 
     /// Set a storage slot. Zero values are deleted to save space.
@@ -1297,10 +1286,7 @@ impl StateDb {
     pub fn get_block_hash(&self, number: u64) -> Result<Option<B256>, StateError> {
         let cf = self.cf(CF_BLOCK_HEADERS)?;
         let key = number.to_be_bytes();
-        match self.db.get_cf(cf, key)? {
-            Some(data) if data.len() >= 32 => Ok(Some(B256::from_slice(&data[..32]))),
-            _ => Ok(None),
-        }
+        Ok(decode_block_hash(self.db.get_cf(cf, key)?.as_deref()))
     }
 
     /// Store a block hash mapping (number -> hash and hash -> number).
@@ -1479,13 +1465,10 @@ impl revm::DatabaseRef for StateDb {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
+        if code_hash_is_empty(&code_hash) {
             return Ok(Bytecode::default());
         }
-        match self.get_code(&code_hash)? {
-            Some(bytes) => Ok(Bytecode::new_raw(Bytes::from(bytes))),
-            None => Ok(Bytecode::default()),
-        }
+        Ok(decode_code(self.get_code(&code_hash)?))
     }
 
     fn storage_ref(
@@ -1502,6 +1485,49 @@ impl revm::DatabaseRef for StateDb {
 }
 
 // ---- Encoding helpers ----
+
+// Item 7 option 0 (task 1.5): the decoders `DatabaseRef for StateDb` and the
+// overlay adapter (`crate::evm_block_state::LayeredEvmDb`) share, so both
+// answer every row with the same value.
+
+/// A code hash revm reads no code for (empty account, or none).
+pub(crate) fn code_hash_is_empty(code_hash: &B256) -> bool {
+    *code_hash == KECCAK_EMPTY || *code_hash == B256::ZERO
+}
+
+/// A CF_CODE row as revm bytecode (absent = empty code).
+pub(crate) fn decode_code(row: Option<Vec<u8>>) -> Bytecode {
+    match row {
+        Some(bytes) => Bytecode::new_raw(Bytes::from(bytes)),
+        None => Bytecode::default(),
+    }
+}
+
+/// A CF_STORAGE row as a slot value (absent = zero; any length but 32 is a
+/// local row fault).
+pub(crate) fn decode_storage_value(row: Option<&[u8]>) -> Result<U256, StateError> {
+    match row {
+        Some(data) => {
+            if data.len() != 32 {
+                return Err(StateError::InvalidData(format!(
+                    "storage value len {} != 32",
+                    data.len()
+                )));
+            }
+            Ok(U256::from_be_slice(data))
+        }
+        None => Ok(U256::ZERO),
+    }
+}
+
+/// A CF_BLOCK_HEADERS row's block hash (its first 32 bytes; a shorter or
+/// absent row has none).
+pub(crate) fn decode_block_hash(row: Option<&[u8]>) -> Option<B256> {
+    match row {
+        Some(data) if data.len() >= 32 => Some(B256::from_slice(&data[..32])),
+        _ => None,
+    }
+}
 
 /// Encode AccountInfo as 72 bytes: balance(32 BE) + nonce(8 BE) + code_hash(32).
 pub fn encode_account_info(info: &AccountInfo) -> [u8; 72] {

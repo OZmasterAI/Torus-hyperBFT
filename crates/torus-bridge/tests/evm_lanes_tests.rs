@@ -129,7 +129,7 @@ fn catchup_validation_charges_each_sender_its_lane_while_big_blocks_are_on() {
             signed_transfer(&kb, 0, 21_000),
         ];
         let v = validator()
-            .validate_block_for_catchup(&block(100, m, txs), &db, &EvmExecutor::new(TORUS_CHAIN_ID))
+            .validate_block_for_catchup(&block(100, m, txs), torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
             .unwrap();
         assert_eq!(v.receipts.len(), 2);
         (
@@ -156,11 +156,7 @@ fn a_tx_above_the_small_limit_runs_only_at_a_big_height() {
         let (_dir, db) = open_test_db();
         fund(&db, &sender);
         let v = validator()
-            .validate_block_for_catchup(
-                &block(height, 50, vec![signed_transfer(&k, 0, 5_000_000)]),
-                &db,
-                &EvmExecutor::new(TORUS_CHAIN_ID),
-            )
+            .validate_block_for_catchup(&block(height, 50, vec![signed_transfer(&k, 0, 5_000_000)]), torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
             .unwrap();
         v.receipts.len()
     };
@@ -168,4 +164,57 @@ fn a_tx_above_the_small_limit_runs_only_at_a_big_height() {
     assert_eq!(run(100), 1);
     // Height 105 (small cadence only): cap 3M, revm refuses it (above the block gas limit).
     assert_eq!(run(105), 0);
+}
+
+/// Item 7 option 0 (task 1.5): the catch-up validation over `EvmReads::Layered` on a
+/// layer-less block overlay (the serial path's reads) equals `EvmReads::Db`: receipts,
+/// bundle, fees, root and trie updates. `RootMode::Skip` gives the same execution with no
+/// root (zero) and no trie updates.
+#[test]
+fn catchup_validation_reads_layered_equals_db_and_skip_computes_no_root() {
+    use torus_bridge::{EvmReads, RootMode};
+    use torus_state::{EvmBlockState, NativeStateOverlay};
+    let (ka, kb) = (key(0x44), key(0x55));
+    let (a, b) = (address_from_key(&ka), address_from_key(&kb));
+    let (_dir, db) = open_test_db();
+    fund(&db, &a);
+    fund(&db, &b);
+    db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&b), &[1]).unwrap();
+    let blk = block(100, 50, vec![signed_transfer(&ka, 0, 21_000), signed_transfer(&kb, 0, 21_000)]);
+    let exec = EvmExecutor::new(TORUS_CHAIN_ID);
+    let summary = |v: &torus_bridge::ValidatedBlock| {
+        (
+            format!("{:?}", v.receipts),
+            v.bundle.clone(),
+            v.fee_revenue,
+            v.gas_used,
+            v.big_gas_used,
+        )
+    };
+    let on_db = validator()
+        .validate_block_for_catchup(&blk, EvmReads::Db(&db), &exec, RootMode::OnE)
+        .unwrap();
+    let overlay = NativeStateOverlay::new(db.clone());
+    let layered = validator()
+        .validate_block_for_catchup(
+            &blk,
+            EvmReads::Layered(EvmBlockState::new(&overlay)),
+            &exec,
+            RootMode::OnE,
+        )
+        .unwrap();
+    assert_eq!(summary(&on_db), summary(&layered));
+    assert_eq!(on_db.state_root, layered.state_root);
+    assert_ne!(on_db.state_root, B256::ZERO);
+    assert_eq!(
+        on_db.evm_root_updates.as_ref().map(|(r, _)| *r),
+        layered.evm_root_updates.as_ref().map(|(r, _)| *r)
+    );
+    assert_eq!(overlay.pending_write_count(), 0, "the block overlay is only read");
+    let skip = validator()
+        .validate_block_for_catchup(&blk, EvmReads::Db(&db), &exec, RootMode::Skip)
+        .unwrap();
+    assert_eq!(summary(&on_db), summary(&skip));
+    assert_eq!(skip.state_root, B256::ZERO);
+    assert!(skip.evm_root_updates.is_none());
 }

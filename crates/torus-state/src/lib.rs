@@ -10,6 +10,7 @@ pub mod corewriter_tx;
 pub mod db;
 pub mod erasure;
 pub mod error;
+pub mod evm_block_state;
 pub mod incremental;
 pub mod native_da;
 pub mod native_trie;
@@ -41,6 +42,7 @@ pub use db::{
     RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,
 };
 pub use error::StateError;
+pub use evm_block_state::{EvmBlockState, LayeredEvmDb};
 pub use native_da::{DaReadTiming, NativeDaStore};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};

@@ -1443,6 +1443,25 @@ impl NativeStateOverlay {
         }
     }
 
+    /// Item 7 option 0 (task 1.5): a fresh overlay over this one's DB and
+    /// frozen layers (parent, L in its two parts, C), with an empty pending
+    /// set of its own and WITHOUT the resident rows R: the block's
+    /// writer-precompile journal ([`crate::EvmBlockState`]). Clones the layer
+    /// handles (no rows are copied).
+    pub fn journal_over_layers(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            pending: Arc::new(RwLock::new(PendingState::new())),
+            parent: self.parent.clone(),
+            resident: None,
+            layer: self.layer.clone(),
+            deferred: self.deferred.clone(),
+            inflight: self.inflight.clone(),
+            #[cfg(feature = "test-probes")]
+            skip: self.skip,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn layer_for_tests(&self) -> Option<Arc<crate::checkpoint_layer::CheckpointLayer>> {
         self.layer.clone()

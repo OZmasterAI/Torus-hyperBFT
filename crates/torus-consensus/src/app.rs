@@ -3664,10 +3664,16 @@ impl ExecutionContext {
         // tx has one). A failed EVM section executes none of them.
         let mut evm_skipped = vec![true; torus_block.evm_transactions.len()];
         if has_evm {
+            // Item 7 option 0 (task 1.5): an EVM block runs serial (after a
+            // barrier), where the block overlay has no layers, so its EVM part
+            // reads the DB directly (`EvmReads::Db`: the same reads as
+            // `EvmReads::Layered` over the layer-less overlay, without the
+            // overlay's per-read lookups) and computes its root on E.
             let validated = self.validator.validate_block_for_catchup(
                 torus_block,
-                &self.state_db,
+                torus_bridge::EvmReads::Db(&self.state_db),
                 &self.evm_executor,
+                torus_bridge::RootMode::OnE,
             );
             #[cfg(test)]
             let validated = match self.test_replay_fault {

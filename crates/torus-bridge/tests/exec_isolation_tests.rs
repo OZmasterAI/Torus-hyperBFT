@@ -126,7 +126,7 @@ fn undecodable_tx_skips_only_itself_on_catchup() {
 
     let block = block_with_txs(vec![t1, junk, t2]);
     let validated = validator()
-        .validate_block_for_catchup(&block, &db, &EvmExecutor::new(TORUS_CHAIN_ID))
+        .validate_block_for_catchup(&block, torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
         .expect("one bad tx must not poison the whole block's EVM execution");
 
     assert_eq!(
@@ -158,7 +158,7 @@ fn exec_skipped_tx_leaves_aligned_receipts() {
 
     let block = block_with_txs(vec![t1, t2, t3]);
     let validated = validator()
-        .validate_block_for_catchup(&block, &db, &EvmExecutor::new(TORUS_CHAIN_ID))
+        .validate_block_for_catchup(&block, torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
         .expect("catchup execution must succeed with one exec-skipped tx");
 
     assert_eq!(validated.receipts.len(), 2, "skipped tx gets NO receipt");
@@ -229,7 +229,7 @@ fn tx_location_index_follows_receipts_under_skips() {
 
     let block = block_with_txs(vec![t1, t2, t3]);
     let validated = validator()
-        .validate_block_for_catchup(&block, &db, &EvmExecutor::new(TORUS_CHAIN_ID))
+        .validate_block_for_catchup(&block, torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
         .unwrap();
     BlockCommitter::commit_block_metadata(&db, &block, &validated.receipts).unwrap();
 

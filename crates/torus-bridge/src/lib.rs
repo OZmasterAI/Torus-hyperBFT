@@ -25,4 +25,4 @@ pub use proposer::{
     genesis_parent_header, genesis_parent_header_for, BlockProposer, ProposedBlock,
 };
 pub use revm::database::BundleState;
-pub use validator::{merge_bundle_into, BlockValidator, ValidatedBlock};
+pub use validator::{merge_bundle_into, BlockValidator, EvmReads, RootMode, ValidatedBlock};
