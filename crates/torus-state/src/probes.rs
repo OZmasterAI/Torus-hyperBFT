@@ -154,6 +154,14 @@ pub enum Plant {
     /// `tripwire::arm` does not arm on this thread (a planted bypass then
     /// shows its divergence instead of tripping).
     NoTripwire,
+    /// Item 7 option 0 (plan 5.4, in-flight-only faults): the fast-path EVM
+    /// section's reads (revm adapter, journal, lane) skip the parent layer;
+    /// the block overlay of the native phase keeps it (torus-consensus).
+    SkipParentEvm,
+    /// The same without the checkpoint in flight C.
+    SkipCheckpointEvm,
+    /// The same without L's deferred part.
+    SkipDeferredEvm,
 }
 
 /// The layers an overlay skips (all `false` without a probe).
@@ -179,6 +187,9 @@ pub struct Probe {
     skip_deferred: AtomicBool,
     /// Item 7 option 0 (step 3): every plant (the skips too).
     plants: Mutex<std::collections::BTreeSet<Plant>>,
+    /// Item 7 option 0 (task 3.6): named path counters of torus-state
+    /// (the absorb's rows by kind, plan C7).
+    named: Mutex<BTreeMap<&'static str, u64>>,
 }
 
 impl Probe {
@@ -217,6 +228,11 @@ impl Probe {
     /// Whether `p` is planted.
     pub fn has(&self, p: Plant) -> bool {
         self.plants.lock().unwrap().contains(&p)
+    }
+
+    /// The named path counters ([`bump`]).
+    pub fn named(&self) -> BTreeMap<&'static str, u64> {
+        self.named.lock().unwrap().clone()
     }
 
     fn skip(&self) -> Skip {
@@ -342,6 +358,16 @@ pub fn scope(reader: Reader) -> Scoped {
 /// Whether a probe is installed on this thread.
 pub fn active() -> bool {
     ACTIVE.with(|a| a.borrow().is_some())
+}
+
+/// Count the named path `name` on this thread's probe (no-op without one).
+pub(crate) fn bump(name: &'static str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    if let Some(p) = ACTIVE.with(|a| a.borrow().clone()) {
+        *p.named.lock().unwrap().entry(name).or_default() += n;
+    }
 }
 
 /// Whether plant `p` is set on this thread's probe (`false` without one).

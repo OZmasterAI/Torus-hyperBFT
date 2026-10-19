@@ -2182,6 +2182,37 @@ impl NativeStateOverlay {
         for (code_hash, bytecode) in &bundle.contracts {
             put(cfp, code_hash.to_vec(), bytecode.original_byte_slice().to_vec());
         }
+        // Item 7 option 0 (task 3.6, plan C7): the absorbed rows by kind.
+        #[cfg(feature = "test-probes")]
+        {
+            use crate::probes::bump;
+            let mut c = [0u64; 5];
+            for acct in bundle.state.values() {
+                match &acct.info {
+                    Some(_) => {
+                        c[0] += 1;
+                        for sv in acct.storage.values() {
+                            c[if sv.present_value.is_zero() { 3 } else { 2 }] += 1;
+                        }
+                    }
+                    None => {
+                        c[1] += u64::from(acct.original_info.is_some());
+                        c[3] += acct.storage.len() as u64;
+                    }
+                }
+            }
+            c[4] = bundle.contracts.len() as u64;
+            bump("absorb.account_put", c[0]);
+            bump("absorb.account_delete", c[1]);
+            bump("absorb.slot_put", c[2]);
+            bump("absorb.slot_delete", c[3]);
+            bump("absorb.code_put", c[4]);
+            let journal_rows = |cf: &str| {
+                intern_cf(cf).map_or(0, |id| rows.cf(id).writes.len() as u64)
+            };
+            bump("absorb.queue_row", journal_rows(crate::cf::CF_CORE_WRITER_QUEUE));
+            bump("absorb.cursor_row", journal_rows(crate::cf::CF_FEE_CONFIG));
+        }
         // The journal's pending set: puts and deletes are disjoint per key.
         for (dst, src) in state.cfs.iter_mut().zip(rows.cfs) {
             if src.is_empty() {
