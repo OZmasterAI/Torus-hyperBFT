@@ -624,6 +624,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per node, x 2.0, 4 / 4), not the DA GC; with the GC it accounts for CPU per fill; exec us / fill +14-16% in
    state-compaction seconds (23% vs 13% of seconds); blocks/s link medium-low (bigger blocks, saturated exec); no
    RocksDB stalls. Next: retention-on arm with block-body pruning off. Raw 8r data: branch `data/ozarchy-8r` 7c8323ac.**
+8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; right after 8l; ~40 min). 8p
+   (section 102): mode 3 wins deep (blocks/s 2.16x) but loses shallow (blocks/s 0.62x, p50 3.3x, CPU per fill +17%)
+   because modes 2/3 flushed every block. b0 (`perf/mode3-checkpoints-b0` `c2fbfbc0`, Codex torus-adversarial approve,
+   137 targeted tests): with a checkpoint interval set, modes 2/3 use checkpoints; the write half of the book save runs
+   on the exec thread instead of the flush worker. **One binary** from `c2fbfbc0`, code defaults (15 s checkpoints now
+   apply to mode 3). A = Classic (`TORUS_BOOK_ROWS=0`), B = mode 3 (`TORUS_BOOK_ROWS=3`). Per shape: one 120 s warm-up
+   cell, then A and B one 300 s cell each (n = 1, a screen: the expected effect is large). Shapes: **shallow** = the
+   standard shape (100k genesis, no pre-load); **deep** = the 8i P1M shape (1M-account genesis, `PRELOAD=1000000`). Fresh
+   data dirs per cell; every node the same mode (check environ + boot line); confirm mode 3 cells run checkpoints (the
+   checkpoint metrics move, no per-block flush). Report per cell: matched/s, native blocks/s, p50 / p99, exec-thread
+   on-CPU per 1k fills, `save_books` ms per block and per 1k fills, flush-worker ms per 1k fills and busy share,
+   CPU-s per 1M fills, RSS; and compare with 8p's mode 3 (per-block flush) cells. Question: does b0 close mode 3's
+   shallow gap while keeping most of its deep win? It decides whether b1 gets built. Tools: main `3aaaa046` or later.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
