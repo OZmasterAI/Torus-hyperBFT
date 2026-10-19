@@ -14,6 +14,49 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+/// A gauge holding the largest value observed since the previous scrape:
+/// encoding it reads the value and resets it to 0, so a 1 Hz scraper sees
+/// each second's maximum (a spike between scrapes is never overwritten by a
+/// later, smaller value). Non-negative values only (the bits of a
+/// non-negative `f64` order like the value). Meant for one scraper: with
+/// two, each scrape resets what the other has not read yet.
+#[derive(Clone, Debug, Default)]
+pub struct MaxSinceScrape(Arc<std::sync::atomic::AtomicU64>);
+
+impl MaxSinceScrape {
+    /// Raise the value to `v` if it is larger (NaN and negatives ignored).
+    pub fn observe(&self, v: f64) {
+        if v > 0.0 {
+            self.0
+                .fetch_max(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The current value, without resetting it.
+    pub fn peek(&self) -> f64 {
+        f64::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl prometheus_client::metrics::TypedMetric for MaxSinceScrape {
+    const TYPE: prometheus_client::metrics::MetricType =
+        prometheus_client::metrics::MetricType::Gauge;
+}
+
+impl prometheus_client::encoding::EncodeMetric for MaxSinceScrape {
+    fn encode(
+        &self,
+        mut encoder: prometheus_client::encoding::MetricEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        let bits = self.0.swap(0, std::sync::atomic::Ordering::Relaxed);
+        encoder.encode_gauge(&f64::from_bits(bits))
+    }
+
+    fn metric_type(&self) -> prometheus_client::metrics::MetricType {
+        prometheus_client::metrics::MetricType::Gauge
+    }
+}
+
 /// Global metrics for the Torus node.
 ///
 /// Metric handles are `Clone + Send + Sync` (internally Arc-based).
@@ -507,6 +550,15 @@ pub struct Metrics {
     /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
     /// (record the height's row, delete aged bodies and shards: one batch).
     pub da_gc_seconds: Histogram,
+    /// RH4, `torus_da_gc_last_pass_max_seconds`: the longest DA body GC pass
+    /// since the previous scrape (each scrape reads and resets it to 0). The
+    /// 1 Hz bench sampler sees every slow pass in the second it ran; a
+    /// second scraper would split the passes between the two.
+    pub da_gc_last_pass_max: MaxSinceScrape,
+    /// RH4: DA body GC passes at or over the slow-pass threshold
+    /// (`TORUS_DA_GC_SLOW_MS`, default 50 ms); each also logs one warn line
+    /// with its phases.
+    pub da_gc_slow_passes: Counter,
     /// RH4: DA body GC passes that deleted nothing, by `reason`
     /// (`torus_state::DaGcHoldReason::as_str`): `gap` (bookkeeping behind,
     /// not back-fillable from the block tree), `backfilling` (behind by more
@@ -2207,11 +2259,25 @@ impl Metrics {
             "Committed native-action bodies deleted from the DA store after the retention window (RH4)",
             da_bodies_gc_deleted.clone(),
         );
-        let da_gc_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 14));
+        // 0.1 ms .. 1.64 s: 8h saw passes up to the old top bucket (0.82 s).
+        let da_gc_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 15));
         registry.register(
             "torus_da_gc_seconds",
             "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
             da_gc_seconds.clone(),
+        );
+        let da_gc_last_pass_max = MaxSinceScrape::default();
+        registry.register(
+            "torus_da_gc_last_pass_max_seconds",
+            "Longest DA body GC pass since the previous scrape; a scrape resets it (RH4)",
+            da_gc_last_pass_max.clone(),
+        );
+        let da_gc_slow_passes = Counter::default();
+        registry.register(
+            "torus_da_gc_slow_passes",
+            "DA body GC passes at or over TORUS_DA_GC_SLOW_MS (default 50 ms); each logs one \
+             warn line (RH4)",
+            da_gc_slow_passes.clone(),
         );
         let da_gc_held_passes = Family::<Vec<(String, String)>, Counter>::default();
         registry.register(
@@ -3034,6 +3100,8 @@ impl Metrics {
             mempool_remove_committed_seconds,
             da_bodies_gc_deleted,
             da_gc_seconds,
+            da_gc_last_pass_max,
+            da_gc_slow_passes,
             da_gc_held_passes,
             exec_resting_orders,
             exec_resident_rebuilds,
@@ -3713,6 +3781,52 @@ mod tests {
         }
         assert!(text.contains("torus_validate_block_seconds_count 1"), "{text}");
         assert!(text.contains("torus_mempool_native_size 3"), "{text}");
+    }
+
+    /// RH4 slow-pass observability (8h: rare 51-205 ms GC passes, the old
+    /// buckets topped out at 0.82 s and nothing showed which pass): the
+    /// pass histogram reaches past 1 s, the longest pass since the previous
+    /// scrape is a gauge that the scrape resets, and slow passes are counted.
+    #[test]
+    fn da_gc_slow_pass_metrics_register() {
+        let m = Metrics::new();
+        let text = m.encode();
+        for name in [
+            "torus_da_gc_last_pass_max_seconds",
+            "torus_da_gc_slow_passes_total",
+            "torus_da_gc_seconds",
+        ] {
+            assert!(text.contains(name), "{name} not registered:\n{text}");
+        }
+        let top_bucket = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("torus_da_gc_seconds_bucket{le=\""))
+            .filter_map(|l| l.split('"').next())
+            .filter_map(|le| le.parse::<f64>().ok())
+            .filter(|le| le.is_finite())
+            .fold(0.0f64, f64::max);
+        assert!(
+            top_bucket >= 1.0,
+            "top finite bucket {top_bucket} s:\n{text}"
+        );
+
+        let gauge = |text: &str| -> f64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix("torus_da_gc_last_pass_max_seconds "))
+                .expect("gauge line")
+                .parse()
+                .unwrap()
+        };
+        m.da_gc_last_pass_max.observe(0.002);
+        m.da_gc_last_pass_max.observe(0.15);
+        m.da_gc_last_pass_max.observe(0.01);
+        m.da_gc_slow_passes.inc();
+        let text = m.encode();
+        assert_eq!(gauge(&text), 0.15, "the longest pass since the last scrape");
+        assert!(text.contains("torus_da_gc_slow_passes_total 1"), "{text}");
+        assert_eq!(gauge(&m.encode()), 0.0, "a scrape resets it");
+        m.da_gc_last_pass_max.observe(0.004);
+        assert_eq!(gauge(&m.encode()), 0.004);
     }
 
     /// s68: the leader's `produce_block` phases, so the ~180 ms loaded
