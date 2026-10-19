@@ -435,6 +435,187 @@ pub fn evm_block_trie_batch(
     Ok((root, batch))
 }
 
+/// Item 7 option 0 (task 2.2): the EVM trie work of a flush window (one
+/// `Job::Flush` at interval 0, or the blocks a `Job::Checkpoint` closes),
+/// folded on the flush worker in height order and applied in ONE step from
+/// the DB at the window's start S. Its batch (the hashed mirror `CF_HASHED_*`
+/// and the trie nodes `CF_TRIE_*`) becomes the prefix of the window's flush
+/// batch, so the EVM mirror lands atomically with the state and the marker.
+///
+/// The result equals today's per-block path (each block's
+/// [`evm_block_batch_incremental`] over the DB the block before left, then
+/// [`resync_evm_accounts`] for the accounts the block wrote), byte for byte
+/// (decision 4, `window_trie_step_equals_per_block_apply`), because:
+/// - the mirror's account rows are a function of the final `CF_ACCOUNTS`
+///   rows: every account the window wrote (each bundle account, each native
+///   credit: E's `dirty_evm_accounts`) is resynced to its row after its
+///   block, so its last mirror row is its final row (EIP-161 empty ->
+///   absent). The step reads those final rows through the window's layers;
+/// - the mirror's storage follows [`apply_bundle_hashed`]: slots of a kept
+///   account, last value wins; an account a block leaves out of the trie
+///   (`None` or EIP-161 empty) wipes its slots (the DB at S is scanned, the
+///   window's earlier slots dropped);
+/// - the trie's post-state is each block's
+///   `HashedPostState::from_bundle_state` with [`incremental_evm_root`]'s
+///   EIP-161 override, folded with `HashedPostState::extend` (last account
+///   wins, a wiped storage drops earlier slots), plus the wipe above (a
+///   per-block `None` deletes the storage trie through reth's destroyed
+///   accounts; a later re-creation must not see the old slots or nodes),
+///   with the final account rows on top. The persisted nodes are canonical
+///   for a hashed state, so one `StateRoot` run gives the nodes the
+///   per-block runs leave; a wiped account's storage trie is deleted before
+///   its new nodes are written.
+#[derive(Default)]
+pub struct EvmWindowDelta {
+    /// The trie's folded post-state (accounts are replaced by the final
+    /// rows at the step).
+    trie: HashedPostState,
+    /// The hashed mirror's storage per hashed address.
+    mirror: BTreeMap<B256, MirrorStorage>,
+    /// Every account whose `CF_ACCOUNTS` row the window wrote.
+    accounts: std::collections::BTreeSet<Address>,
+    /// Bundles folded.
+    blocks: usize,
+}
+
+/// One account's hashed-mirror storage in an [`EvmWindowDelta`].
+#[derive(Default)]
+struct MirrorStorage {
+    /// The window wiped the account's slots (scan the DB at S).
+    wiped: bool,
+    /// Last value per hashed slot (zero = delete).
+    slots: BTreeMap<B256, U256>,
+}
+
+impl EvmWindowDelta {
+    /// No bundle folded.
+    pub fn is_empty(&self) -> bool {
+        self.blocks == 0
+    }
+
+    /// Bundles folded.
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Fold the next block's EVM bundle (height order).
+    pub fn fold(&mut self, bundle: &BundleState) {
+        self.blocks += 1;
+        let mut post = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state.iter());
+        for (address, bundle_acct) in &bundle.state {
+            let hashed_address = keccak256(address.as_slice());
+            self.accounts.insert(*address);
+            let mirror = self.mirror.entry(hashed_address).or_default();
+            match &bundle_acct.info {
+                Some(info) if !is_empty_account(info) => {
+                    for (slot, slot_val) in &bundle_acct.storage {
+                        mirror
+                            .slots
+                            .insert(keccak256(slot.to_be_bytes::<32>()), slot_val.present_value);
+                    }
+                }
+                _ => {
+                    // Out of the trie: the EIP-161 override, and the wipe.
+                    mirror.wiped = true;
+                    mirror.slots.clear();
+                    post.accounts.insert(hashed_address, None);
+                    post.storages
+                        .insert(hashed_address, reth_trie_common::HashedStorage::new(true));
+                }
+            }
+        }
+        self.trie.extend(post);
+    }
+
+    /// Accounts the window's native phase credited (`evm_addrs`): their
+    /// mirror rows follow their final `CF_ACCOUNTS` rows, account only.
+    pub fn note_accounts(&mut self, addresses: impl IntoIterator<Item = Address>) {
+        self.accounts.extend(addresses);
+    }
+
+    /// The step, from `db` at the window's start: `(root, batch)`, the batch
+    /// holding the mirror ops then the trie nodes. `rows(cf, key)` reads the
+    /// window's final rows: `Some(Some(v))` a write, `Some(None)` a
+    /// tombstone, `None` untouched (the DB answers).
+    pub fn step(
+        self,
+        db: &StateDb,
+        mut rows: impl FnMut(&str, &[u8]) -> Option<Option<Vec<u8>>>,
+    ) -> Result<(B256, WriteBatch), StateError> {
+        let mut post = self.trie;
+        let mut batch = WriteBatch::default();
+        let cf_acc = db.cf_handle(CF_HASHED_ACCOUNTS)?;
+        let cf_stor = db.cf_handle(CF_HASHED_STORAGE)?;
+        for address in &self.accounts {
+            let info = match rows(CF_ACCOUNTS, address.as_slice()) {
+                Some(Some(bytes)) => Some(decode_account_info(&bytes)?),
+                Some(None) => None,
+                None => db.get_account(address)?,
+            };
+            let live = info.filter(|info| !is_empty_account(info));
+            let hashed_address = keccak256(address.as_slice());
+            match &live {
+                Some(info) => {
+                    batch.put_cf(cf_acc, hashed_address.as_slice(), encode_account_info(info))
+                }
+                None => batch.delete_cf(cf_acc, hashed_address.as_slice()),
+            }
+            post.accounts
+                .insert(hashed_address, live.as_ref().map(Account::from));
+        }
+        for (hashed_address, mirror) in &self.mirror {
+            if mirror.wiped {
+                let mut iter = db.inner().raw_iterator_cf_opt(
+                    cf_stor,
+                    crate::db::prefix_read_opts(hashed_address.as_slice()),
+                );
+                iter.seek(hashed_address.as_slice());
+                while iter.valid() {
+                    let k = match iter.key() {
+                        Some(k) if k.starts_with(hashed_address.as_slice()) => k.to_vec(),
+                        _ => break,
+                    };
+                    batch.delete_cf(cf_stor, &k);
+                    iter.next();
+                }
+                iter.status()?;
+            }
+            for (hashed_slot, value) in &mirror.slots {
+                let key = hashed_storage_key(hashed_address, hashed_slot);
+                if value.is_zero() {
+                    batch.delete_cf(cf_stor, key);
+                } else {
+                    batch.put_cf(cf_stor, key, value.to_be_bytes::<32>());
+                }
+            }
+        }
+
+        let prefix_sets = post.construct_prefix_sets().freeze();
+        let sorted = post.into_sorted();
+        note_engine_run();
+        let (root, mut updates) = StateRoot::new(
+            RocksTrieCursorFactory::new(db),
+            HashedPostStateCursorFactory::new(RocksHashedCursorFactory::new(db), &sorted),
+        )
+        .with_prefix_sets(prefix_sets)
+        .root_with_updates()
+        .map_err(|e| StateError::InvalidData(format!("evm window trie step: {e}")))?;
+        // A wiped account's old storage nodes go before its new ones are
+        // written (the per-block path deleted them at the wiping block).
+        for (hashed_address, mirror) in &self.mirror {
+            if mirror.wiped {
+                updates
+                    .storage_tries
+                    .entry(*hashed_address)
+                    .or_default()
+                    .set_deleted(true);
+            }
+        }
+        write_trie_updates(db, &mut batch, &updates)?;
+        Ok((root, batch))
+    }
+}
+
 /// Re-sync the incremental EVM trie (`CF_HASHED_ACCOUNTS` + `CF_TRIE_*`) for accounts whose
 /// `CF_ACCOUNTS` entry changed OUTSIDE the EVM-bundle commit — i.e. native post-commit (fee
 /// distribution to treasury/dev_pool, validator rewards) crediting EVM account balances.
@@ -1088,6 +1269,351 @@ mod tests {
             full_post_bundle_evm_root(&db, &empty()).unwrap(),
             "after filtered resync: incremental must equal full scan"
         );
+    }
+
+    // ---- Item 7 option 0 task 2.2: the EVM trie step on the flush worker ----
+
+    /// The four EVM trie / mirror CFs, dumped (key, value) per CF.
+    fn trie_cf_dump(db: &StateDb) -> Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> {
+        use crate::cf::{CF_HASHED_ACCOUNTS, CF_HASHED_STORAGE, CF_TRIE_STORAGE};
+        [
+            CF_HASHED_ACCOUNTS,
+            CF_HASHED_STORAGE,
+            CF_TRIE_ACCOUNTS,
+            CF_TRIE_STORAGE,
+        ]
+        .into_iter()
+        .map(|cf| (cf, crate::StateBackend::iterate_cf(db, cf, None).unwrap()))
+        .collect()
+    }
+
+    /// One random window of `blocks` EVM bundles plus native credits, over
+    /// the plain state `model` (address -> its nonzero plain slots), which
+    /// it keeps current. Pool A (seeded storage accounts, and the fresh
+    /// 300..310) gets storage churn; pool B (storage-less) gets EIP-161
+    /// empties and deletes; both get changes, re-creates (a B account
+    /// deleted, then changed later in the window) and native credits.
+    /// Deletes zero every plain slot the account holds (as revm lists the
+    /// slots it touched), with status `Destroyed` half the time.
+    #[allow(clippy::type_complexity)]
+    fn o0_random_window(
+        rng: &mut u64,
+        blocks: usize,
+        db: &StateDb,
+        model: &mut std::collections::BTreeMap<Address, std::collections::BTreeSet<U256>>,
+    ) -> Vec<(BundleState, Vec<(Address, AccountInfo)>)> {
+        fn xorshift(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let addr_of = |i: u32| -> Address {
+            let mut b = [0u8; 20];
+            b[0..4].copy_from_slice(&i.to_be_bytes());
+            b[19] = 0x5a;
+            Address::from(b)
+        };
+        let pool_a = |r: u64| -> u32 {
+            let i = (r % 40) as u32;
+            if i < 30 {
+                i * 10
+            } else {
+                300 + (i - 30)
+            }
+        };
+        let pool_b = |r: u64| -> u32 {
+            let i = (r % 60) as u32;
+            if i < 30 {
+                i * 10 + 1 + (i % 9)
+            } else {
+                310 + (i - 30)
+            }
+        };
+        let mut out = Vec::new();
+        for _ in 0..blocks {
+            let slots_of = |a: Address,
+                            model: &mut std::collections::BTreeMap<
+                Address,
+                std::collections::BTreeSet<U256>,
+            >| {
+                model
+                    .entry(a)
+                    .or_insert_with(|| {
+                        db.account_storage(&a)
+                            .unwrap()
+                            .into_iter()
+                            .filter(|(_, v)| !v.is_zero())
+                            .map(|(k, _)| k)
+                            .collect()
+                    })
+                    .clone()
+            };
+            let mut builder = BundleState::builder(0..=0);
+            let mut destroyed = Vec::new();
+            let mut touched = std::collections::BTreeSet::new();
+            let ops = (xorshift(rng) % 6) + 1;
+            for _ in 0..ops {
+                let kind = xorshift(rng) % 6;
+                let a = if kind == 0 && xorshift(rng) % 2 == 0 {
+                    addr_of(pool_a(xorshift(rng)))
+                } else if kind <= 2 {
+                    addr_of(pool_b(xorshift(rng)))
+                } else {
+                    addr_of(pool_a(xorshift(rng)))
+                };
+                if !touched.insert(a) {
+                    continue;
+                }
+                match kind {
+                    0 => {
+                        // Delete (info None), zeroing every plain slot.
+                        let mut st = StorageKeyMap::default();
+                        for slot in slots_of(a, model) {
+                            st.insert(slot, (U256::from(1u64), U256::ZERO));
+                        }
+                        model.insert(a, Default::default());
+                        builder = builder.state_original_account_info(a, eoa(1, 1));
+                        if !st.is_empty() {
+                            builder = builder.state_storage(a, st);
+                        }
+                        if xorshift(rng) % 2 == 0 {
+                            destroyed.push(a);
+                        }
+                    }
+                    1 => {
+                        // EIP-161 empty (pool B: no storage).
+                        builder = builder.state_present_account_info(a, eoa(0, 0));
+                    }
+                    _ => {
+                        // Change / new / re-create, pool A with storage churn.
+                        let bal = xorshift(rng) % 1_000_000 + 1;
+                        let nonce = xorshift(rng) % 50 + 1;
+                        builder = builder.state_present_account_info(a, eoa(bal, nonce));
+                        if kind >= 3 && xorshift(rng) % 3 != 0 {
+                            let mut st = StorageKeyMap::default();
+                            let mut slots = slots_of(a, model);
+                            for _ in 0..(xorshift(rng) % 4) + 1 {
+                                let slot = U256::from(xorshift(rng) % 24);
+                                let zero = xorshift(rng) % 3 == 0;
+                                let v = if zero {
+                                    U256::ZERO
+                                } else {
+                                    U256::from(xorshift(rng) % 10_000 + 1)
+                                };
+                                if zero {
+                                    slots.remove(&slot);
+                                } else {
+                                    slots.insert(slot);
+                                }
+                                st.insert(slot, (U256::ZERO, v));
+                            }
+                            model.insert(a, slots);
+                            builder = builder.state_storage(a, st);
+                        }
+                    }
+                }
+            }
+            let mut bundle = builder.build();
+            for a in destroyed {
+                if let Some(acct) = bundle.state.get_mut(&a) {
+                    acct.status = revm::database::AccountStatus::Destroyed;
+                }
+            }
+            // Native credits after the EVM part (account-only), some to an
+            // account this block's bundle also touched (plan C9).
+            let mut credits = Vec::new();
+            for _ in 0..xorshift(rng) % 3 {
+                let a = if xorshift(rng) % 2 == 0 {
+                    addr_of(pool_a(xorshift(rng)))
+                } else {
+                    addr_of(pool_b(xorshift(rng)))
+                };
+                credits.push((a, eoa(xorshift(rng) % 90_000 + 1, xorshift(rng) % 9)));
+            }
+            if let Some((a, _)) = bundle.state.iter().next() {
+                if xorshift(rng) % 2 == 0 {
+                    credits.push((*a, eoa(4_242, 3)));
+                }
+            }
+            out.push((bundle, credits));
+        }
+        out
+    }
+
+    /// Today's serial path for one block: the block's batch from
+    /// `evm_block_batch_incremental` (plain + hashed + trie), then the native
+    /// credits written to CF_ACCOUNTS and `resync_evm_accounts` over every
+    /// account the block wrote (E's `dirty_evm_accounts`).
+    fn o0_serial_block(db: &StateDb, bundle: &BundleState, credits: &[(Address, AccountInfo)]) {
+        let (_root, batch) = super::evm_block_batch_incremental(db, bundle, None, None).unwrap();
+        db.write(batch).unwrap();
+        for (a, info) in credits {
+            db.put_account(a, info).unwrap();
+        }
+        let dirty: Vec<Address> = bundle
+            .state
+            .keys()
+            .copied()
+            .chain(credits.iter().map(|(a, _)| *a))
+            .collect();
+        super::resync_evm_accounts(db, &dirty).unwrap();
+    }
+
+    /// Runs `windows` windows of `1..=max_blocks` blocks each through the
+    /// serial per-block path (db A) and through ONE W step per window (db
+    /// B: [`super::EvmWindowDelta`] folded in height order, its batch
+    /// written with the window's plain rows). After every window the EVM
+    /// trie / mirror CFs are byte-equal, both roots equal the full scan, and
+    /// the post-write resync safety net finds nothing to repair.
+    fn o0_window_vs_per_block(seed_rng: u64, windows: usize, max_blocks: u64) {
+        use super::{evm_root_engine_runs, resync_evm_accounts, EvmWindowDelta};
+        let (db_a, _da) = temp_db();
+        let (db_b, _dbb) = temp_db();
+        for db in [&db_a, &db_b] {
+            seed(db);
+            build_trie_to_cf(db).expect("migration");
+        }
+        let empty = || BundleState::builder(0..=0).build();
+        let mut rng = seed_rng;
+        let mut model = Default::default();
+        for w in 0..windows {
+            let blocks = ((rng >> 7) % max_blocks + 1) as usize;
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let window = o0_random_window(&mut rng, blocks, &db_a, &mut model);
+
+            // A: today, block by block.
+            for (bundle, credits) in &window {
+                o0_serial_block(&db_a, bundle, credits);
+            }
+
+            // B: the window's plain rows (as the checkpoint layer holds
+            // them) and ONE step from the DB at the window's start.
+            let mut delta = EvmWindowDelta::default();
+            let mut plain = rocksdb::WriteBatch::default();
+            for (bundle, credits) in &window {
+                delta.fold(bundle);
+                delta.note_accounts(credits.iter().map(|(a, _)| *a));
+                super::apply_bundle_plain(&db_b, &mut plain, bundle).unwrap();
+                let cf = db_b.cf_handle(crate::cf::CF_ACCOUNTS).unwrap();
+                for (a, info) in credits {
+                    plain.put_cf(cf, a.as_slice(), crate::db::encode_account_info(info));
+                }
+            }
+            assert!(!delta.is_empty(), "window {w}: {blocks} blocks folded");
+            // The window's final CF_ACCOUNTS rows (A has the same plain state).
+            let rows = |cf: &str, key: &[u8]| Some(db_a.get_cf_raw(cf, key).unwrap());
+            let (root, batch) = delta.step(&db_b, rows).expect("W step");
+            db_b.write(batch).unwrap();
+            db_b.write(plain).unwrap();
+
+            let full = full_post_bundle_evm_root(&db_b, &empty()).unwrap();
+            assert_eq!(
+                root, full,
+                "window {w} ({blocks} blocks): step root != full scan"
+            );
+            assert_eq!(
+                incremental_evm_root(&db_a, &empty()).unwrap().0,
+                full_post_bundle_evm_root(&db_a, &empty()).unwrap(),
+                "window {w}: the per-block reference drifted"
+            );
+            assert_eq!(
+                trie_cf_dump(&db_b),
+                trie_cf_dump(&db_a),
+                "window {w} ({blocks} blocks): CF_HASHED_* / CF_TRIE_* differ from per-block"
+            );
+            // The post-checkpoint resync stays a safety net: nothing to do.
+            let all: Vec<Address> = window
+                .iter()
+                .flat_map(|(b, c)| b.state.keys().copied().chain(c.iter().map(|(a, _)| *a)))
+                .collect();
+            let before = evm_root_engine_runs();
+            resync_evm_accounts(&db_b, &all).unwrap();
+            assert_eq!(
+                evm_root_engine_runs() - before,
+                0,
+                "window {w}: resync found drift"
+            );
+        }
+    }
+
+    /// Task 2.2: random windows of 1-8 EVM bundles (deletes and `Destroyed`
+    /// wipes, EIP-161 empties, re-creates, storage churn) plus native
+    /// credits: one W step from the DB at the window's start gives
+    /// CF_HASHED_* and CF_TRIE_* byte-equal to today's per-block
+    /// `evm_block_batch_incremental` + `resync_evm_accounts`, and its root
+    /// equals the full scan (decision 4: the hard gate).
+    #[test]
+    fn window_trie_step_equals_per_block_apply() {
+        o0_window_vs_per_block(0x51ce_0be5_7a7e_d00d, 40, 8);
+        o0_window_vs_per_block(0x0dd5_eed5_0f_c0ffee, 40, 8);
+    }
+
+    /// Task 2.2, interval 0: a window of one block (a `Job::Flush` with
+    /// its EVM part) equals today's serial block.
+    #[test]
+    fn per_block_flush_trie_step_equals_serial() {
+        o0_window_vs_per_block(0x1234_5678_9abc_def1, 60, 1);
+    }
+
+    /// Task 2.2: a window that deletes an account with storage (`Destroyed`)
+    /// and re-creates it with new storage two blocks later wipes the old
+    /// slots and trie nodes exactly as the per-block path does.
+    #[test]
+    fn window_trie_step_wipe_then_recreate() {
+        use super::EvmWindowDelta;
+        let (db_a, _da) = temp_db();
+        let (db_b, _dbb) = temp_db();
+        for db in [&db_a, &db_b] {
+            seed(db);
+            build_trie_to_cf(db).expect("migration");
+        }
+        // Bulk account 20 has slots 20 and 27 (seed).
+        let mut b = [0u8; 20];
+        b[0..4].copy_from_slice(&20u32.to_be_bytes());
+        b[19] = 0x5a;
+        let z = Address::from(b);
+        let mut zero = StorageKeyMap::default();
+        zero.insert(U256::from(20u64), (U256::from(21u64), U256::ZERO));
+        zero.insert(U256::from(27u64), (U256::from(22u64), U256::ZERO));
+        let mut del = BundleState::builder(0..=0)
+            .state_original_account_info(z, eoa(1_020, 20))
+            .state_storage(z, zero)
+            .build();
+        del.state.get_mut(&z).unwrap().status = revm::database::AccountStatus::Destroyed;
+        let other = BundleState::builder(0..=0)
+            .state_present_account_info(
+                address!("0000000000000000000000000000000000000001"),
+                eoa(5, 5),
+            )
+            .build();
+        let mut fresh = StorageKeyMap::default();
+        for s in [3u64, 4, 400] {
+            fresh.insert(U256::from(s), (U256::ZERO, U256::from(s * 11)));
+        }
+        let recreate = BundleState::builder(0..=0)
+            .state_present_account_info(z, eoa(9, 1))
+            .state_storage(z, fresh)
+            .build();
+        let window = [del, other, recreate];
+        for bundle in &window {
+            o0_serial_block(&db_a, bundle, &[]);
+        }
+        let mut delta = EvmWindowDelta::default();
+        let mut plain = rocksdb::WriteBatch::default();
+        for bundle in &window {
+            delta.fold(bundle);
+            super::apply_bundle_plain(&db_b, &mut plain, bundle).unwrap();
+        }
+        let rows = |cf: &str, key: &[u8]| Some(db_a.get_cf_raw(cf, key).unwrap());
+        let (root, batch) = delta.step(&db_b, rows).unwrap();
+        db_b.write(batch).unwrap();
+        db_b.write(plain).unwrap();
+        let empty = BundleState::builder(0..=0).build();
+        assert_eq!(root, full_post_bundle_evm_root(&db_b, &empty).unwrap());
+        assert_eq!(trie_cf_dump(&db_b), trie_cf_dump(&db_a));
     }
 
     /// A1.6 scaling proof: the incremental EVM root is O(changed) — its per-block compute time is

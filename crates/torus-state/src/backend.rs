@@ -1177,6 +1177,14 @@ impl FrozenPending {
         })
     }
 
+    /// Item 7 option 0 (task 2.2): this set's row for `(cf, key)`:
+    /// `Some(Some(v))` a write, `Some(None)` a tombstone, `None` untouched
+    /// (or an unregistered CF). Hash extras excluded.
+    pub fn lookup_row(&self, cf: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let id = intern_cf(cf)?;
+        self.state.lookup(id, key).map(|v| v.map(<[u8]>::to_vec))
+    }
+
     /// Number of pending writes + tombstones in this set.
     pub fn entry_count(&self) -> usize {
         self.state
@@ -1272,8 +1280,36 @@ impl FrozenPending {
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
         memo: Option<&mut crate::running_hash::ChainMemo>,
     ) -> Result<NativeFlushStats, StateError> {
-        flush_pending_after_batch(
+        self.flush_on_worker_after_batch(
             WriteBatch::default(),
+            sidecar,
+            target,
+            applied_height,
+            trie_cache,
+            member_cache,
+            memo,
+        )
+    }
+
+    /// Item 7 option 0 (task 2.2): [`Self::flush_on_worker`] whose batch
+    /// starts with `prefix` (the flush worker's EVM trie step: the hashed
+    /// mirror and the trie nodes, `crate::incremental::EvmWindowDelta`).
+    /// `CF_HASHED_*` / `CF_TRIE_*` are never in a pending set, so the order
+    /// is free; the prefix is neither digested nor a native-root input. An
+    /// empty prefix is exactly [`Self::flush_on_worker`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn flush_on_worker_after_batch(
+        &self,
+        prefix: WriteBatch,
+        sidecar: Option<&FrozenPending>,
+        target: &StateDb,
+        applied_height: Option<u64>,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+        memo: Option<&mut crate::running_hash::ChainMemo>,
+    ) -> Result<NativeFlushStats, StateError> {
+        flush_pending_after_batch(
+            prefix,
             &self.state,
             sidecar.map(|s| &s.state),
             target,
@@ -2350,7 +2386,9 @@ fn flush_pending_with_native_trie_stats(
 
 /// Item 6 Phase 3: the checkpoint batch (see
 /// [`crate::CheckpointLayer::flush_checkpoint`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_checkpoint_batch(
+    prefix: WriteBatch,
     state: &PendingState,
     side: Option<&PendingState>,
     rows: &crate::running_hash::ChainRows,
@@ -2360,7 +2398,7 @@ pub(crate) fn flush_checkpoint_batch(
     member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
 ) -> Result<NativeFlushStats, StateError> {
     flush_pending_after_batch(
-        WriteBatch::default(),
+        prefix,
         state,
         side,
         target,

@@ -325,6 +325,14 @@ impl CheckpointLayer {
         &self.state
     }
 
+    /// Item 7 option 0 (task 2.2): the layer's row for `(cf, key)`:
+    /// `Some(Some(v))` a write, `Some(None)` a tombstone, `None` untouched
+    /// (or an unregistered CF).
+    pub fn lookup_row(&self, cf: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let id = crate::backend::intern_cf(cf)?;
+        self.state.lookup(id, key).map(|v| v.map(<[u8]>::to_vec))
+    }
+
     /// Append every write and tombstone to `batch` (CF order, key order).
     pub fn append_to_batch(&self, db: &StateDb, batch: &mut WriteBatch) -> Result<(), StateError> {
         self.state.append_to_batch(db.inner(), batch)
@@ -346,7 +354,35 @@ impl CheckpointLayer {
         trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
         member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
     ) -> Result<crate::NativeFlushStats, StateError> {
+        self.flush_checkpoint_after_batch(
+            WriteBatch::default(),
+            side,
+            rows,
+            target,
+            height,
+            trie_cache,
+            member_cache,
+        )
+    }
+
+    /// Item 7 option 0 (task 2.2): [`Self::flush_checkpoint`] whose batch
+    /// starts with `prefix` (the flush worker's EVM trie step over the
+    /// window, `crate::incremental::EvmWindowDelta`), so the window's EVM
+    /// mirror and trie nodes land in the checkpoint's ONE batch, before the
+    /// marker. An empty prefix is exactly [`Self::flush_checkpoint`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn flush_checkpoint_after_batch(
+        &self,
+        prefix: WriteBatch,
+        side: Option<&CheckpointLayer>,
+        rows: &crate::running_hash::ChainRows,
+        target: &StateDb,
+        height: u64,
+        trie_cache: Option<&mut crate::native_trie::NativeTrieCache>,
+        member_cache: Option<&mut crate::native_trie::NativeMemberCache>,
+    ) -> Result<crate::NativeFlushStats, StateError> {
         crate::backend::flush_checkpoint_batch(
+            prefix,
             &self.state,
             side.map(|s| &s.state),
             rows,
