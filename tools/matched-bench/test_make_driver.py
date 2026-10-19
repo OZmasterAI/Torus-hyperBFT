@@ -44,6 +44,12 @@ fake /proc (DRIVER_PROC). Pinned:
 12. campaign checks (spec checks {source, per_cell}): the source file is sourced at preflight (each function must
    be defined, no driver function or name redefined), each function runs after every cell as `fn <label> <arm>`
    with the driver's R / AENV / ...; non-zero = CHECK FAIL, the cell's row bad:check, the campaign stops.
+15. post-cell work (bench queue pacing rule, s131): the POST_INLINE steps run in cell() / run_spec, the
+   POST_ENDPASS ones (cell-endpass.sh, hardscan, soakchk) only in end_pass, which run_campaign calls once after
+   the last cell (also on a CAMPAIGN STOP) and before the EXIT trap's campaign.done; each cell gets
+   DEFER_REPORT_SCANS=1 and GENESIS_CACHE_DIR=$RUN/genesis-cache when run-cell.sh supports them (preflight_post;
+   an expectation, checks file or analysis script that reads a deferred output keeps the scans in-line:
+   DeferredReadersTest), an arm's harness_env opts out.
 """
 
 import glob
@@ -61,6 +67,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +106,9 @@ TOOL_FILES = [
     "cell_step.py",
     "campaign/detach.sh",
     "soak-sampler.py",
+    "log-scans.sh",
+    "cell-endpass.sh",
+    "genesis_cache.py",
 ]
 
 
@@ -377,6 +387,9 @@ CELL_WIRING = [
     'if [ -e "$R/$label/node-death.txt" ]; then',
     'hardscan "$label"',
 ]
+# the Job 4 cell() wiring that a generated driver runs in end_pass instead (report-only, bench queue pacing rule s131:
+# once after the campaign's last cell): checked there, and absent from the generated cell()
+CELL_WIRING_ENDPASS = ['hardscan "$label"']
 # cell(): the Job 4 drivers' failure handling around them (substrings)
 CELL_HANDLING = [
     'sysctlchk "$label" start || { CELL_FAIL=abort-sysctl; return 1; }',
@@ -420,10 +433,19 @@ class GoldenTest(Base):
         for who, txt in (("Job 4 " + kind, hand), ("generated", gen)):
             body = func_text(txt, "cell")
             lines = [ln.strip() for ln in body.splitlines()]
+            wiring = CELL_WIRING
+            if who == "generated":
+                wiring = [m for m in CELL_WIRING if m not in CELL_WIRING_ENDPASS]
+                ep = [ln.strip() for ln in func_text(txt, "end_pass").splitlines()]
+                for m in CELL_WIRING_ENDPASS:
+                    self.assertNotIn(
+                        m, lines, "generated cell() still runs %s in-line" % m
+                    )
+                    self.assertIn(m, ep, "generated end_pass lacks %s" % m)
             self.assertEqual(
-                [m for m in CELL_WIRING if m not in lines], [], "%s cell()" % who
+                [m for m in wiring if m not in lines], [], "%s cell()" % who
             )
-            idx = [lines.index(m) for m in CELL_WIRING]
+            idx = [lines.index(m) for m in wiring]
             self.assertEqual(idx, sorted(idx), "%s cell(): wiring order" % who)
             for s in CELL_HANDLING:
                 self.assertIn(s, body, "%s cell()" % who)
@@ -909,6 +931,10 @@ run_spec "r1-M1:M1:120:none:"; echo "m=$?"
     def test_body_wiring(self):
         t = open(self.drv).read()
         self.assertIn("cell_step_rerun_pass", t)
+        self.assertIn("\nrun_campaign || exit 1\nexit 0\n", t)
+        rc = func_text(t, "run_campaign")
+        self.assertLess(rc.index("cell_step_rerun_pass"), rc.index("end_pass"))
+        self.assertLess(rc.index("end_pass"), rc.index('log "CAMPAIGN END"'))
         self.assertNotRegex(t, r"cell_step [^\n]*&\s*$")
         self.assertIn("campaign.done", t)
         self.assertIn('"$DETACH" "$label"', t)  # every cell in its own bench unit
@@ -1473,6 +1499,8 @@ for k, v in json.loads(os.environ.get("FAKE_SUMMARY") or "{}").items():
     s.setdefault(k, {}).update(v)
 json.dump(s, open(sys.argv[1], "w"))' "$OUT/summary.json" "$markets"
 for i in 0 1 2; do echo "2026-10-15T00:00:00.000Z  INFO torus_node: fake val$i" | gzip > "$OUT/val$i.log.gz"; done
+echo "harness env DEFER_REPORT_SCANS=${DEFER_REPORT_SCANS:-unset} GENESIS_CACHE_DIR=${GENESIS_CACHE_DIR-unset}" >> "$OUT/run.log"
+[ "${DEFER_REPORT_SCANS:-0}" != 1 ] || echo '{"version": 1, "scans": "x", "bench_submitted": "5", "ingest_log_bytes": [9, 9, 9]}' > "$OUT/deferred-scans.json"
 stopall
 exit "${FAKE_RC:-0}"
 """
@@ -1908,6 +1936,7 @@ class CellRunTest(FakeHostBase):
                 "export CELL_STEP_LOG=$RUN/campaign.log",
                 pre,
                 'run_spec "r1-A:A:120:none:"; echo "RUN_SPEC_RC=$?"',
+                "end_pass",
             ]
         )
         e = dict(os.environ)
@@ -1974,6 +2003,11 @@ class CellRunTest(FakeHostBase):
             "[%s] fds max/end" % LB,
         ):
             self.assertIn(s, out)
+        # report-only: hardscan and soakchk run in end_pass, after the cell (run_spec) returned
+        rc_at = out.index("RUN_SPEC_RC=0")
+        self.assertGreater(out.index("CHECK OK %s hardscan done" % LB), rc_at)
+        self.assertGreater(out.index("CHECK SOAK %s" % LB), rc_at)
+        self.assertLess(out.index("[%s] fds max/end" % LB), rc_at)
         self.assertEqual(self.row(spec)[7], "ok", out)
         self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
 
@@ -3000,6 +3034,776 @@ class WarmGateRunTest(FakeHostBase):
             ],
         )
         self.assertEqual([r[7] for r in self.rows(spec)], ["ok"])
+
+
+# ---------------------------------------------------------------- post-cell work: in-line vs the end pass (s131)
+
+
+class PostCellClassificationTest(Base):
+    """the driver's POST_INLINE / POST_ENDPASS lists against the code: every end-pass step runs only in end_pass
+    (never in cell(), i.e. never while a later cell could run), every in-line step runs in cell() / run_spec"""
+
+    # how each listed step shows in the driver text
+    INLINE_CALLS = {
+        "node-death": 'if [ -e "$R/$label/node-death.txt" ]; then',
+        "md5chk": "cellchecks",
+        "envchk": "cellchecks",
+        "marketchk": "cellchecks",
+        "expectchk": "cellchecks",
+        "campaignchecks": 'campaignchecks "$label" "$arm"',
+        "sysctlchk": 'sysctlchk "$label" end',
+        "warmgatechk": 'warmgatechk "$label" "$rc"',
+        "fdsum": 'fdsum "$label"',
+        "savelog": 'savelog "$label"',
+    }
+    ENDPASS_CALLS = {
+        "cell-endpass": '"$ENDPASS" "$R/$label"',
+        "hardscan": 'hardscan "$label"',
+        "soakchk": 'soakchk "$label" "$dur"',
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        self.text = open(self.drv).read()
+
+    def lists(self):
+        r = self.lib(self.drv, 'echo "$POST_INLINE"; echo "$POST_ENDPASS"')
+        a, b = r.stdout.splitlines()
+        return a.split(), b.split()
+
+    def test_lists_cover_the_code(self):
+        inline, endpass = self.lists()
+        self.assertEqual(sorted(set(inline) - {"cell_step"}), sorted(self.INLINE_CALLS))
+        self.assertEqual(sorted(endpass), sorted(self.ENDPASS_CALLS))
+        self.assertEqual(set(inline) & set(endpass), set())
+        cell = func_text(self.text, "cell")
+        spec = func_text(self.text, "run_spec")
+        ep = func_text(self.text, "end_pass")
+        for k, call in self.INLINE_CALLS.items():
+            self.assertIn(call, cell, "in-line %s" % k)
+            self.assertNotIn(call, ep, "in-line %s in the end pass" % k)
+        cc = func_text(self.text, "cellchecks")
+        for k in ("md5chk", "envchk", "marketchk", "expectchk"):
+            self.assertIn(k + ' "$1"', cc)
+        self.assertIn("cell_step ", spec)
+        for k, call in self.ENDPASS_CALLS.items():
+            self.assertIn(call, ep, "end pass %s" % k)
+            self.assertNotIn(call, cell, "end pass %s in cell()" % k)
+            self.assertNotIn(call, spec, "end pass %s in run_spec" % k)
+            self.assertNotIn(call, func_text(self.text, "run_cells"))
+
+    def test_show_lists_them(self):
+        plan = self.plan(self.drv)
+        inline, endpass = self.lists()
+        self.assertIn("POSTCELL inline %s" % " ".join(inline), plan)
+        self.assertIn(
+            "POSTCELL endpass %s (once, after the last cell, before campaign.done)"
+            % " ".join(endpass),
+            plan,
+        )
+
+
+class PreflightPostTest(Base):
+    """preflight_post: the end pass and genesis reuse follow what run-cell.sh in tools_dir supports"""
+
+    def dry(self, spec):
+        drv = self.generate(self.write_spec(spec))
+        r = subprocess.run([drv, "dry"], capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_current_tools_turn_both_on(self):
+        rc, out = self.dry(minimal_spec(self.tmp))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=1 genesis_reuse=1", out)
+
+    def test_old_run_cell_runs_as_before(self):
+        spec = minimal_spec(self.tmp)
+        with open(os.path.join(spec["tools_dir"], "run-cell.sh"), "w") as f:
+            f.write("#!/bin/bash\n# an older run-cell.sh without the knobs\n")
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=0 genesis_reuse=0", out)
+
+    def test_missing_helpers_fail_preflight(self):
+        for f in ("log-scans.sh", "cell-endpass.sh", "genesis_cache.py"):
+            with self.subTest(f=f):
+                spec = minimal_spec(self.tmp)
+                p = os.path.join(spec["tools_dir"], f)
+                os.rename(p, p + ".away")
+                try:
+                    rc, out = self.dry(spec)
+                finally:
+                    os.rename(p + ".away", p)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("PREFLIGHT FAIL: %s missing" % p, out)
+
+    def test_a_reader_of_a_deferred_output_keeps_them_in_line(self):
+        for exp in (
+            {"file": "val0.log.excerpt", "regex": "book mode"},
+            {"file": "run.log", "regex": "ingest: bench submitted"},
+        ):
+            with self.subTest(exp=exp):
+                rc, out = self.dry(minimal_spec(self.tmp, expect=[exp]))
+                self.assertEqual(rc, 0, out)
+                self.assertIn("PREFLIGHT NOTE: report scans: in-line because ", out)
+                self.assertIn("end_pass=0 genesis_reuse=1", out)
+        rc, out = self.dry(
+            minimal_spec(
+                self.tmp,
+                expect=[{"file": "agreement.jsonl", "regex": "agree", "min": 0}],
+            )
+        )
+        self.assertIn("end_pass=1", out)
+
+
+class DeferredReadersTest(Base):
+    """deferred_readers (Codex P2s on 0f2ca85b and bcc95fab): the report scans defer only when no in-line step
+    reads anything a deferred scan writes or could write. The deferred outputs: summary.json
+    .ingest.mempool_nonce_expired_evictions_per_node ([] until the end pass), run.log's ingest line (a "deferred"
+    line until then), val<i>.log.excerpt (absent until then), deferred-scans.json (until then). No guessing which
+    regex or script reads which field (a sample line or a keyword test missed valid readers): any expectation on
+    one of those files, any checks file and any analysis.cmd keep the scans in-line. The rest of the in-line work
+    reads none of them (marketchk: summary.json cell.markets; warmgatechk / cell_step: validity, agreement,
+    liveness, headline, crash, binaries)."""
+
+    PLACEHOLDER = {
+        "file": "summary.json",
+        "regex": '"mempool_nonce_expired_evictions_per_node": \\[\\]',
+        "min": 0,
+        "max": 0,
+    }
+    ANALYSIS = (
+        "import json, sys\n"
+        's = json.load(open(sys.argv[2] + "/summary.json"))\n'
+        'v = s["ingest"]["mempool_nonce_expired_evictions_per_node"]\n'
+        'assert v, "deferred evictions"\n'
+        'json.dump({sys.argv[3]: {"evictions": sum(v)}}, open(sys.argv[1], "w"))\n'
+    )
+
+    def dry(self, spec):
+        drv = self.generate(self.write_spec(spec))
+        r = subprocess.run([drv, "dry"], capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+    def assertInline(self, spec, why):
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=0 genesis_reuse=1", out)
+        self.assertEqual(out.count("PREFLIGHT NOTE: report scans: "), 1, out)
+        self.assertIn("PREFLIGHT NOTE: report scans: in-line because ", out)
+        self.assertIn(why, out)
+        return out
+
+    def assertDeferred(self, spec):
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=1 genesis_reuse=1", out)
+        self.assertEqual(out.count("PREFLIGHT NOTE: report scans: "), 1, out)
+        self.assertIn(
+            "PREFLIGHT NOTE: report scans: deferred to the campaign end pass (ingest-evictions log-excerpts;",
+            out,
+        )
+        self.assertNotIn("in-line because", out)
+
+    def defer_scans(self, drv):
+        r = self.lib(drv, "preflight_static > /dev/null; echo DEFER_SCANS=$DEFER_SCANS")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return int(r.stdout.rsplit("DEFER_SCANS=", 1)[1].split()[0])
+
+    def probe_cell(self, drv):
+        """the review probes' cell: run-cell.sh's ingest and save blocks with the DEFER_SCANS preflight chose"""
+        sys.path.insert(0, HERE)
+        from test_cell_endpass import EquivalenceTest
+
+        defer = self.defer_scans(drv)
+        e = EquivalenceTest()
+        e.setUp()
+        self.addCleanup(e.doCleanups)
+        cell, _ = e.run_cell_blocks(defer)
+        return defer, cell
+
+    def campaign_rc(self, drv, cell):
+        r = self.lib(
+            drv,
+            'preflight_static > /dev/null; cell() { STARTED_LABEL=$P-$1; expectchk "$CELL" "$2" || '
+            '{ CELL_FAIL=check; return 1; }; }; cell_step() { :; }; CELLS=("w1:A:120:none:"); '
+            "run_cells; echo CAMPAIGN_RC=$?",
+            {"CELL": cell},
+        )
+        self.assertNotIn("CHECK FAIL", r.stdout, r.stdout + r.stderr)
+        return r
+
+    # ---- no reader: the scans defer
+    def test_no_reader_defers(self):
+        self.assertDeferred(minimal_spec(self.tmp))
+
+    def test_expectation_on_another_file_defers(self):
+        self.assertDeferred(
+            minimal_spec(
+                self.tmp,
+                expect=[{"file": "agreement.jsonl", "regex": "agree", "min": 0}],
+            )
+        )
+
+    # ---- expectations
+    def test_summary_json_expectation_keeps_them_in_line(self):
+        self.assertInline(
+            minimal_spec(self.tmp, expect=[self.PLACEHOLDER]), "on summary.json"
+        )
+
+    def test_per_arm_summary_json_expectation_keeps_them_in_line(self):
+        s = minimal_spec(self.tmp)
+        s["arms"][1]["expect"] = [
+            {"file": "summary.json", "regex": '"benchmark_accepted": true', "min": 1}
+        ]
+        self.assertInline(s, "arm M1")
+
+    def test_excerpt_and_marker_expectations_keep_them_in_line(self):
+        for f in ("val0.log.excerpt", "deferred-scans.json"):
+            with self.subTest(f=f):
+                self.assertInline(
+                    minimal_spec(
+                        self.tmp, expect=[{"file": f, "regex": "x", "min": 0}]
+                    ),
+                    "on %s" % f,
+                )
+
+    def test_any_run_log_expectation_keeps_them_in_line(self):
+        # Codex P2 on bcc95fab: 'per node: 435 ' matched no sample ingest line, so the scans deferred and the
+        # cell failed before the end pass wrote the matching line. Any run.log regex may read the ingest line
+        for rx in (
+            "per node: 435 ",
+            "bench submitted=[0-9]+ actions",
+            "oracle feed pid [0-9]+;",
+            "genesis built",
+        ):
+            with self.subTest(rx=rx):
+                self.assertInline(
+                    minimal_spec(self.tmp, expect=[{"file": "run.log", "regex": rx}]),
+                    "on run.log",
+                )
+
+    def test_run_log_probe_does_not_stop_the_campaign(self):
+        """the bcc95fab review's runlog probe end to end: in-line scans, the cell's run.log has the expected
+        ingest line when expectchk reads it, the campaign goes on"""
+        drv = self.generate(
+            self.write_spec(
+                minimal_spec(
+                    self.tmp,
+                    expect=[{"file": "run.log", "regex": "per node: 435 ", "min": 1}],
+                )
+            )
+        )
+        defer, cell = self.probe_cell(drv)
+        self.assertEqual(defer, 0)
+        r = self.campaign_rc(drv, cell)
+        self.assertIn("CAMPAIGN_RC=0", r.stdout, r.stdout + r.stderr)
+
+    def test_placeholder_expectation_does_not_stop_the_campaign(self):
+        """the 0f2ca85b review's probe: an expectation that the eviction counts are filled in (not the []
+        placeholder) passes on the cell the campaign runs, and the campaign goes on"""
+        drv = self.generate(
+            self.write_spec(minimal_spec(self.tmp, expect=[self.PLACEHOLDER]))
+        )
+        defer, cell = self.probe_cell(drv)
+        self.assertEqual(defer, 0)
+        r = self.campaign_rc(drv, cell)
+        self.assertIn("CAMPAIGN_RC=0", r.stdout, r.stdout + r.stderr)
+
+    # ---- checks file
+    def test_any_checks_file_keeps_them_in_line(self):
+        f = os.path.join(self.tmp, "checks.sh")
+        for body in (
+            "okchk() { jq -e '.x.mempool_nonce_expired' \"$R/$1/summary.json\" > /dev/null; }\n",
+            "okchk() { f=summary; jq -e '.ingest' \"$R/$1/$f.json\" > /dev/null; }\n",
+            "okchk() { return 0; }\n",
+        ):
+            with self.subTest(body=body):
+                with open(f, "w") as fh:
+                    fh.write(body)
+                self.assertInline(
+                    minimal_spec(self.tmp, checks={"source": f, "per_cell": ["okchk"]}),
+                    "checks file %s" % f,
+                )
+
+    # ---- analysis.cmd
+    def test_any_analysis_cmd_keeps_them_in_line(self):
+        a = os.path.join(self.tmp, "a-cells.py")
+        with open(a, "w") as fh:
+            fh.write(
+                'import json, sys\ns = json.load(open(sys.argv[1]))\nh = s["headline"]\n'
+            )
+        for cmd in (
+            "python3 -I %s {out} {prefix} {tag}:{arm}" % a,
+            'python3 -I "%s" {out} {cell} {tag}'
+            % a,  # Codex P2 on bcc95fab: quotes hid the script
+            "python3 -I -c 'import sys' {out}",  # no script file at all
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertInline(
+                    minimal_spec(self.tmp, analysis={"cmd": cmd}), "analysis.cmd"
+                )
+
+    def test_quoted_analysis_script_is_checked_like_cell_step(self):
+        """preflight's missing-script check splits analysis.cmd as cell_step runs it (shlex.split): a quoted
+        path is a path"""
+        a = os.path.join(self.tmp, "with space", "a.py")
+        for cmd in ('python3 -I "%s" {out}' % a, "python3 -I '%s' {out}" % a):
+            with self.subTest(cmd=cmd):
+                rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": cmd}))
+                self.assertEqual(rc, 1, out)
+                self.assertIn("PREFLIGHT FAIL: analysis script %s missing" % a, out)
+        os.makedirs(os.path.dirname(a))
+        with open(a, "w") as fh:
+            fh.write("import sys\n")
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s" {out}' % a})
+        )
+        self.assertEqual(rc, 0, out)
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": 'python3 -I "%s {out}' % a})
+        )
+        self.assertEqual(rc, 1, out)
+        self.assertIn(
+            "PREFLIGHT FAIL: analysis.cmd cannot be split as cell_step runs it", out
+        )
+
+    def test_quoted_analysis_probe_reads_filled_counts(self):
+        """the bcc95fab review's analysis probe end to end: a quoted script path keeps the scans in-line, so the
+        analysis cell_step runs right after the cell reads filled eviction counts (status ok)"""
+        sys.path.insert(0, HERE)
+        import cell_step
+
+        script = os.path.join(self.tmp, "analysis.py")
+        with open(script, "w") as fh:
+            fh.write(self.ANALYSIS)
+        cmd = 'python3 -I "%s" {out} {cell} {tag}' % script
+        drv = self.generate(
+            self.write_spec(
+                minimal_spec(self.tmp, analysis={"cmd": cmd, "metric": "evictions"})
+            )
+        )
+        defer, cell = self.probe_cell(drv)
+        self.assertEqual(defer, 0)
+        step = os.path.join(self.tmp, "step")
+        os.makedirs(step, exist_ok=True)
+        a = types.SimpleNamespace(
+            label=os.path.basename(cell),  # cell_step: the cell dir ends with the tag
+            tag=os.path.basename(cell).rsplit("-", 1)[1],
+            arm="A",
+            run_dir=self.tmp,
+            analysis_cmd=cmd,
+            analysis_timeout=30,
+            analysis_key="{tag}",
+            analysis_metric="evictions",
+        )
+        status, _row, evidence = cell_step.run_analysis(a, cell, step)
+        self.assertEqual(status, "ok", evidence)
+
+    def test_old_run_cell_logs_the_decision(self):
+        spec = minimal_spec(self.tmp)
+        with open(os.path.join(spec["tools_dir"], "run-cell.sh"), "w") as f:
+            f.write("#!/bin/bash\n# an older run-cell.sh without the knobs\n")
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=0 genesis_reuse=0", out)
+        self.assertIn("PREFLIGHT NOTE: report scans: in-line because ", out)
+
+
+class AnalysisPlaceholderPreflightTest(Base):
+    """preflight's missing-script check sees analysis.cmd as cell_step runs it (Codex P2 on 9f30ce12: a quoted
+    "{run}/analysis.py" failed preflight although the script existed after expansion). The frozen tools copy's
+    cell_step.py fills the words (analysis-words: run_analysis's own placeholders and fill) for every cell the
+    campaign can run (each planned cell and its -rerun; dry smoke: the smoke cell), and a */*.py or */*.sh word
+    that is no file is a PREFLIGHT FAIL naming the filled path. An older cell_step.py without analysis-words: a
+    word with a placeholder is not checked (one PREFLIGHT NOTE names it), the other words still are."""
+
+    SCRIPTS = {  # each placeholder cell_step fills -> a script path built from it
+        "run": "{run}/an.py",
+        "prefix": "{prefix}an.py",
+        "cell": "{cell}.an.py",
+        "label": "{run}/an-{label}.py",
+        "tag": "{run}/an-{tag}.sh",
+        "arm": "{run}/an-{arm}.py",
+        "out": "{out}.py",
+    }
+
+    def dry(self, spec, smoke=False):
+        drv = self.generate(self.write_spec(spec))
+        r = subprocess.run(
+            [drv, "dry"] + (["smoke"] if smoke else []),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return r.returncode, r.stdout + r.stderr
+
+    def filled(self, spec, tpl, smoke=False):
+        """tpl filled for each cell cell_step can run, in order (the cells, then their reruns), computed here
+        from the plan and cell_step's documented placeholders, not by cell_step"""
+        drv = self.generate(self.write_spec(spec, "plan.json"), "plan.sh")
+        cells = [
+            tuple(l.split()[1:3])
+            for l in self.plan(drv, smoke)
+            if l.startswith("CELL ")
+        ]
+        if not smoke:
+            cells += [(t + "-rerun", a) for t, a in cells]
+        run = spec["run_dir"] + ("/smoke" if smoke else "")
+        p = spec["label_prefix"] + ("-smoke" if smoke else "")
+        out = []
+        for tag, arm in cells:
+            label = "%s-%s" % (p, tag)
+            cell = os.path.normpath(os.path.join(spec["results_root"], label))
+            ph = {
+                "out": os.path.join(run, "cell-step", label + ".analysis.json"),
+                "prefix": cell[: -len(tag)],
+                "tag": tag,
+                "arm": arm,
+                "label": label,
+                "cell": cell,
+                "run": os.path.normpath(run),
+            }
+            s = tpl
+            for k, v in ph.items():
+                s = s.replace("{%s}" % k, v)
+            if s not in out:
+                out.append(s)
+        return out
+
+    def touch(self, paths):
+        for f in paths:
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            with open(f, "w") as fh:
+                fh.write("import sys\n")
+
+    def unlink(self, paths):
+        for f in paths:
+            if os.path.exists(f):
+                os.remove(f)
+
+    def assertMissing(self, out, paths):
+        self.assertNotIn("PREFLIGHT FAIL: analysis script {", out)
+        self.assertTrue(
+            any("PREFLIGHT FAIL: analysis script %s missing" % f in out for f in paths),
+            "no PREFLIGHT FAIL names one of %s:\n%s" % (paths, out),
+        )
+
+    def test_every_placeholder_is_filled_before_the_check(self):
+        for ph, tpl in self.SCRIPTS.items():
+            for word in ('"%s"' % tpl, tpl, "'%s'" % tpl):
+                cmd = "python3 -I %s {out} {prefix} {tag}:{arm}" % word
+                spec = minimal_spec(self.tmp, analysis={"cmd": cmd})
+                paths = self.filled(spec, tpl)
+                with self.subTest(placeholder=ph, cmd=cmd):
+                    self.assertTrue(paths and all("{" not in f for f in paths), paths)
+                    rc, out = self.dry(spec)
+                    self.assertEqual(rc, 1, out)
+                    self.assertMissing(out, paths)
+                    if len(paths) > 1:  # per cell: only the last cell's rerun lacks it
+                        self.touch(paths[:-1])
+                        rc, out = self.dry(spec)
+                        self.assertEqual(rc, 1, out)
+                        self.assertIn(
+                            "PREFLIGHT FAIL: analysis script %s missing" % paths[-1],
+                            out,
+                        )
+                    self.touch(paths)
+                    rc, out = self.dry(spec)
+                    self.assertEqual(rc, 0, out)
+                    self.assertIn("PREFLIGHT OK (dry", out)
+                    self.unlink(paths)
+
+    def test_smoke_fills_the_smoke_run(self):
+        """dry smoke: RUN/smoke, P-smoke, the smoke cell, no rerun (as the smoke run's cell_step sees them)"""
+        for tpl in (self.SCRIPTS["run"], self.SCRIPTS["label"], self.SCRIPTS["cell"]):
+            spec = minimal_spec(
+                self.tmp, analysis={"cmd": 'python3 -I "%s" {out}' % tpl}
+            )
+            full, smoke = self.filled(spec, tpl), self.filled(spec, tpl, smoke=True)
+            with self.subTest(tpl=tpl):
+                self.assertEqual(len(smoke), 1, smoke)
+                self.assertNotIn(smoke[0], full)
+                self.touch(full)
+                rc, out = self.dry(spec, smoke=True)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(
+                    "PREFLIGHT FAIL: analysis script %s missing" % smoke[0], out
+                )
+                self.touch(smoke)
+                rc, out = self.dry(spec, smoke=True)
+                self.assertEqual(rc, 0, out)
+                self.unlink(full + smoke)
+
+    def test_review_probe_shape(self):
+        """the 9f30ce12 review probe: python3 -I "{run}/analysis.py" ... with the script in the run dir"""
+        spec = minimal_spec(
+            self.tmp,
+            analysis={"cmd": 'python3 -I "{run}/analysis.py" {out} {cell} {tag}'},
+        )
+        self.touch([os.path.join(spec["run_dir"], "analysis.py")])
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+
+    def archived_cmds(self):
+        """every analysis command shape in the archived campaigns and specs: CELL_STEP_ANALYSIS_CMD="..." in the
+        hand-written drivers, analysis.cmd in the JSON specs"""
+        arch = os.path.join(
+            os.path.dirname(os.path.dirname(HERE)), "docs", "perf", "bench-archive"
+        )
+        cmds, files = [], []
+        for pat in ("*.sh", "*.py", "*.json"):
+            files += glob.glob(os.path.join(FIX, pat))
+            files += glob.glob(os.path.join(arch, "**", pat), recursive=True)
+        files.append(EXAMPLE)
+        for f in sorted(set(files)):
+            txt = open(f, errors="replace").read()
+            found = re.findall(r'CELL_STEP_ANALYSIS_CMD="([^"]*)"', txt)
+            if f.endswith(".json"):
+                try:
+                    an = json.loads(txt).get("analysis") or {}
+                except (ValueError, AttributeError):
+                    an = {}
+                found += [an["cmd"]] if an.get("cmd") else []
+            cmds += [(f, c) for c in found]
+        return cmds
+
+    def test_archived_command_shapes(self):
+        """the archived shapes (python3 -I $ANALYST/a-cells.py {out} {prefix} {tag}:{arm}, the example spec's
+        absolute path) pass with the script and fail without it, as before 9f30ce12 (bash word split, which
+        checked their unquoted absolute script word the same way)"""
+        cmds = self.archived_cmds()
+        self.assertGreaterEqual(len(cmds), 5, cmds)
+        analyst = os.path.join(self.tmp, "analyst")
+        seen = set()
+        for f, raw in cmds:
+            cmd = raw.replace("$ANALYST", analyst)
+            for w in shlex.split(cmd):
+                if re.match(r".*/.*\.(py|sh)$", w):
+                    cmd = cmd.replace(w, os.path.join(analyst, os.path.basename(w)))
+            if cmd in seen:
+                continue
+            seen.add(cmd)
+            scripts = [
+                w for w in cmd.split() if re.match(r".*/.*\.(py|sh)$", w)
+            ]  # the pre-9f30ce12 check: bash word split, */*.py|*/*.sh
+            self.assertTrue(scripts, (f, raw))
+            spec = minimal_spec(self.tmp, analysis={"cmd": cmd})
+            with self.subTest(source=f, cmd=raw):
+                rc, out = self.dry(spec)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(
+                    "PREFLIGHT FAIL: analysis script %s missing" % scripts[0], out
+                )
+                self.touch(scripts)
+                rc, out = self.dry(spec)
+                self.assertEqual(rc, 0, out)
+                self.unlink(scripts)
+
+    def test_words_are_cell_steps_argv(self):
+        """analysis-words prints the argv run_analysis runs (its own placeholders and fill): compared with the
+        command line run_analysis logs, every placeholder, a quoted word with a space"""
+        sys.path.insert(0, HERE)
+        import cell_step
+
+        run = os.path.join(self.tmp, "run") + "/"
+        cell = os.path.join(self.tmp, "res", "pfx-r1-A")
+        step = os.path.join(run, "cell-step")
+        os.makedirs(step)
+        cmd = (
+            "python3 -I -c 'import sys' {out} {prefix} {tag}:{arm} {label} {cell} {run} "
+            "'{run}/x y.py' plain"
+        )
+        a = types.SimpleNamespace(
+            label="pfx-r1-A",
+            tag="r1-A",
+            arm="A",
+            run_dir=run,
+            analysis_cmd=cmd,
+            analysis_timeout=30,
+            analysis_key="{tag}",
+            analysis_metric="",
+        )
+        cell_step.run_analysis(a, cell, step)
+        with open(os.path.join(step, "pfx-r1-A.analysis.log")) as fh:
+            logged = shlex.split(fh.readline()[2:])
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                os.path.join(HERE, "cell_step.py"),
+                "analysis-words",
+                "--run-dir",
+                run,
+                "--analysis-cmd",
+                cmd,
+                "--cell",
+                cell,
+                "pfx-r1-A",
+                "r1-A",
+                "A",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.split("\0")[:-1], logged)
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                os.path.join(HERE, "cell_step.py"),
+                "analysis-words",
+                "--run-dir",
+                run,
+                "--analysis-cmd",
+                "python3 'x",
+                "--cell",
+                cell,
+                "pfx-r1-A",
+                "r1-A",
+                "A",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual((r.returncode, r.stdout), (1, ""), r.stderr)
+        self.assertIn("cannot parse the analysis command", r.stderr)
+
+    def test_older_cell_step_skips_placeholder_words(self):
+        """a frozen cell_step.py without analysis-words: a word with a placeholder is not checked (PREFLIGHT
+        NOTE), a plain missing script still fails"""
+        spec = minimal_spec(self.tmp)
+        with open(os.path.join(spec["tools_dir"], "cell_step.py"), "w") as fh:
+            fh.write("# an older cell_step.py: record and pending-reruns only\n")
+        cmd = 'python3 -I "{run}/analysis.py" {out} {tag}'
+        rc, out = self.dry(minimal_spec(self.tmp, analysis={"cmd": cmd}))
+        self.assertEqual(rc, 0, out)
+        self.assertIn(
+            "PREFLIGHT NOTE: analysis script {run}/analysis.py not checked", out
+        )
+        a = os.path.join(self.tmp, "nope", "a.py")
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": "python3 -I %s {out}" % a})
+        )
+        self.assertEqual(rc, 1, out)
+        self.assertIn("PREFLIGHT FAIL: analysis script %s missing" % a, out)
+        rc, out = self.dry(
+            minimal_spec(self.tmp, analysis={"cmd": "python3 -I '%s {out}" % a})
+        )
+        self.assertEqual(rc, 1, out)
+        self.assertIn(
+            "PREFLIGHT FAIL: analysis.cmd cannot be split as cell_step runs it", out
+        )
+
+
+class EndPassRunTest(FakeHostBase):
+    """run_campaign for real against the fakes (as CellRunTest; cell-endpass.sh is the real one in the frozen
+    tools copy): the end pass runs once, after the last cell and before campaign.done, also when the campaign
+    stops"""
+
+    def campaign(self, spec, cells, **env):
+        drv = self.generate(self.write_spec(spec, "ep.json"), "ep.sh")
+        os.makedirs(spec["run_dir"], exist_ok=True)
+        script = "\n".join(
+            [
+                "DRIVER_LIB_ONLY=1; . %s || exit 99" % shlex.quote(drv),
+                "HARNESS=%s" % shlex.quote(os.path.join(self.bin, "run-cell.sh")),
+                "quiet() { return 0; }",
+                "CELLS=(%s)" % " ".join(shlex.quote(c) for c in cells),
+                '. "$TOOLS/cell-step.sh" || exit 98',
+                "export CELL_STEP_LOG=$RUN/campaign.log",
+                "sysctl_pin",
+                "DEFER_SCANS=1; GENESIS_REUSE=1",
+                # main's trap: campaign.done when the driver exits
+                """trap 'rc=$?; echo "DONE-MARKER exit=$rc"; echo "exit=$rc" > "$RUN/campaign.done"' EXIT""",
+                "run_campaign",
+            ]
+        )
+        e = dict(os.environ)
+        e.update(
+            self.env(
+                DRIVER_DETACH=os.path.join(self.bin, "detach.sh"),
+                FAKE_PROC=self.proc,
+                FAKE_RUN_S="4",
+            )
+        )
+        e.update(env)
+        out = os.path.join(self.tmp, "ep.out")
+        with open(out, "w") as fo:
+            r = subprocess.run(
+                ["bash", "-c", script],
+                stdout=fo,
+                stderr=subprocess.STDOUT,
+                env=e,
+                timeout=600,
+            )
+        return r.returncode, open(out).read()
+
+    def test_end_pass_once_after_the_last_cell_before_done(self):
+        spec = minimal_spec(self.tmp)
+        cells = ["r1-A:A:120:none:", "r1-M1:M1:120:none:", "r2-A:A:120:none:"]
+        rc, out = self.campaign(spec, cells)
+        self.assertEqual(rc, 0, out)
+        labels = ["test-camp-10m-" + c.split(":")[0] for c in cells]
+        last_end = max(out.index("] END %s rc=0" % lb) for lb in labels)
+        self.assertEqual(out.count("END PASS start: 3 cells"), 1, out)
+        start = out.index("END PASS start")
+        self.assertGreater(
+            start, last_end, "the end pass ran while cells were still running"
+        )
+        for lb in labels:
+            self.assertEqual(out.count("END PASS OK %s:" % lb), 1, out)
+            self.assertGreater(out.index("END PASS OK %s:" % lb), last_end)
+            self.assertGreater(out.index("CHECK OK %s hardscan done" % lb), last_end)
+            cell = os.path.join(spec["results_root"], lb)
+            self.assertFalse(os.path.exists(os.path.join(cell, "deferred-scans.json")))
+            self.assertTrue(os.path.exists(os.path.join(cell, "val0.log.excerpt")))
+            runlog = open(os.path.join(cell, "run.log")).read()
+            self.assertIn(
+                "harness env DEFER_REPORT_SCANS=1 GENESIS_CACHE_DIR=%s/genesis-cache"
+                % spec["run_dir"],
+                runlog,
+            )
+            self.assertIn(
+                "ingest: bench submitted=5 actions; mempool nonce-expired evictions per node: 0 0 0 ",
+                runlog,
+            )
+        self.assertLess(out.index("END PASS done"), out.index("CAMPAIGN END"))
+        self.assertLess(out.index("CAMPAIGN END"), out.index("DONE-MARKER exit=0"))
+        self.assertEqual(
+            open(os.path.join(spec["run_dir"], "campaign.done")).read(), "exit=0\n"
+        )
+
+    def test_end_pass_runs_on_a_campaign_stop(self):
+        """a failed warm-up gate stops the campaign: the end pass still completes the started cell, before
+        campaign.done; no hardscan for it (as before: a cell that fails its checks never reached it)"""
+        spec = minimal_spec(self.tmp)
+        rc, out = self.campaign(
+            spec,
+            ["w1:A:120:none:", "r1-A:A:120:none:"],
+            FAKE_SUMMARY='{"validity": {"verdict": "REJECT"}}',
+        )
+        self.assertEqual(rc, 1, out)
+        self.assertIn("CAMPAIGN STOP at w1", out)
+        self.assertIn("END PASS OK test-camp-10m-w1:", out)
+        self.assertNotIn("hardscan done", out)
+        self.assertNotIn("CAMPAIGN END", out)
+        self.assertLess(out.index("END PASS done"), out.index("DONE-MARKER exit=1"))
+
+    def test_arm_harness_env_opts_out(self):
+        spec = minimal_spec(
+            self.tmp, harness_env={"DEFER_REPORT_SCANS": "0", "GENESIS_CACHE_DIR": ""}
+        )
+        rc, out = self.campaign(spec, ["r1-A:A:120:none:"])
+        self.assertEqual(rc, 0, out)
+        runlog = open(os.path.join(spec["results_root"], LB, "run.log")).read()
+        self.assertIn("harness env DEFER_REPORT_SCANS=0 GENESIS_CACHE_DIR=\n", runlog)
+        self.assertNotIn("END PASS OK", out)
+        self.assertIn("CHECK OK %s hardscan done" % LB, out)
 
 
 if __name__ == "__main__":

@@ -241,7 +241,11 @@ python3 tools/matched-bench/test_harness.py
    survivors, `counters_equal_all_nodes` / `counters_excluded_node` /
    `counters_compared_nodes` record exactly what was compared. The killed
    node's *state* is not excused — see the crash gate.
-10. `stop-3val.sh`; node logs gzipped into the result dir + an excerpt.
+10. `stop-3val.sh`; node logs gzipped into the result dir + an excerpt. With
+   `DEFER_REPORT_SCANS=1` (the campaign driver sets it) the report-only scans (the
+   ingest eviction counts of step 8's `ingest:` line and the excerpt; `log-scans.sh`)
+   are left to `cell-endpass.sh`, which the driver runs after the campaign's last cell
+   (below, "Post-cell work").
 11. `summarize.py` -> `summary.json` (+ `analysis-valN.txt` from the awk scripts).
 
 ## Result dir `/home/18c/bench-results-matched/<label>/`
@@ -704,8 +708,61 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
   TERMs the harness (its trap stops the rest). Such a cell is a `CELL FAIL <label> rc=<rc>
   death: ... -> continuing`: no checks run, cell_step flags its row `death` and queues a
   rerun, and the campaign goes on. `memguard` stops the cell unit when MemAvailable < 6 GB.
-  After the checks, `hardscan` prints `HARD FINDING` lines for panic, fail-stop and state hash
-  mismatch lines logged at WARN or ERROR (it never fails a cell).
+  `hardscan` prints `HARD FINDING` lines for panic, fail-stop and state hash mismatch lines
+  logged at WARN or ERROR (it never fails a cell); it runs in the end pass (next bullet).
+- **Post-cell work: in-line vs end pass** (bench queue pacing rule, s131). Right after a cell
+  only what decides the next cell runs (`DRIVER show`: `POSTCELL inline ...`): run-cell.sh's
+  rc, validity / agreement / liveness (summary.json, incl. the panic / fail-stop and ERROR
+  line counts and the dissemination counts of `collect_logs.py`, which feed the validity
+  verdict and health.py's rc), the node logs copied as `val<i>.log.gz` (the next cell's launch
+  overwrites the raw ones), the md5 / env / markets / expect / campaign checks, the sysctl
+  end check, the warm-up gate, the fd stop, node death, memguard, the RocksDB LOG and
+  data-dir records (the next cell wipes the data dirs), and the cells.tsv row / rerun queue.
+  The report-only work (`POSTCELL endpass cell-endpass hardscan soakchk`) runs once, in
+  `end_pass`, after the campaign's last cell (main cells and reruns, or a `CAMPAIGN STOP`)
+  and before `campaign.done`, never while a cell runs: for each cell `cell-endpass.sh` writes
+  `val<i>.log.excerpt`, appends run.log's `ingest: ...` line (the eviction scan reads each
+  log only up to the length it had when run-cell.sh would have scanned it) and fills
+  summary.json `.ingest.mempool_nonce_expired_evictions_per_node` (empty until then), then
+  removes the cell's `deferred-scans.json`; then `hardscan` and `soakchk` of the cells that
+  passed their checks. Same files and names as before; campaign.log gets `END PASS start`,
+  `END PASS OK <label>` per cell, the `HARD FINDING` / `CHECK SOAK` lines and `END PASS done`
+  before `CAMPAIGN END`. A cell left with `deferred-scans.json` (a killed campaign, an `END
+  PASS FAIL` line) is finished by hand: `tools/matched-bench/cell-endpass.sh <results>/<label>`.
+  Preflight defers the scans only when no in-line step reads anything they write or could
+  write (summary.json `.ingest.mempool_nonce_expired_evictions_per_node` is `[]` until the
+  end pass, run.log has the "ingest scan deferred" line instead of the ingest line, no
+  excerpts, `deferred-scans.json` exists). It does not guess which regex, check or script
+  reads which field: any `expect` (spec-wide or per arm) on `run.log`, `summary.json`, an
+  excerpt or `deferred-scans.json`, any checks file and any `analysis.cmd` keep them in-line
+  (`end_pass=0`). One `PREFLIGHT NOTE: report scans: deferred to the campaign end pass ...`
+  or `PREFLIGHT NOTE: report scans: in-line because <readers> ...` line records the decision.
+  The other in-line steps read none (marketchk: `cell.markets`; warm-up gate and cell_step:
+  validity, agreement, liveness, headline, crash, binaries). Opt out by hand with
+  `harness_env` `"DEFER_REPORT_SCANS": "0"`. Preflight has the frozen `cell_step.py`
+  (`analysis-words`, run_analysis's own split and fill) split `analysis.cmd` and fill its
+  placeholders (`{run}` `{prefix}` `{cell}` `{label}` `{tag}` `{arm}` `{out}`) for every cell
+  it can run (each planned cell and its `-rerun`; smoke: the smoke cell under `$RUN/smoke`),
+  then checks that each `*.py` / `*.sh` word exists (`PREFLIGHT FAIL: analysis script
+  <filled path> missing`; a quoted path is a path; a command that does not split fails
+  preflight too). An older frozen `cell_step.py` without `analysis-words`: the command is only
+  split, and a script word holding a placeholder is not checked (`PREFLIGHT NOTE: analysis
+  script ... not checked`).
+- **Genesis reuse**: every cell runs with `GENESIS_CACHE_DIR=$RUN/genesis-cache`. run-cell.sh
+  keys every genesis input (`genesis_cache.py`: the generator scripts and their data incl.
+  the weighted-full base genesis and its params sidecar, run-cell.sh, `MARKETS`,
+  `BULK_COUNT`, `TIMEOUT_BASE_MS` / `EVM_BLOCK_INTERVAL` from `EXTRA_ENV`, `LIQ_THIN`,
+  `LIQ_THIN_AVAIL`, the ambient `STATE_HASH_ACTIVATION`, `BASE`, `BULK_OFFSET`,
+  `NATIVE_AVAIL`, `EVM_WEI`, jq's version); an entry for the key (`<key>.genesis`, md5
+  re-checked on the copy) replaces the generator and its jq passes (~50-60 s per 1M-account
+  cell): run.log `genesis reused (key K, md5 M)`, else `genesis built (key K, md5 M); cached
+  in ...`. A corrupt entry (md5 mismatch) is rebuilt. `FORCE=1` in `harness_env`: only an
+  entry a `FORCE=1` cell built is reused, so the campaign's first cell rebuilds the
+  weighted-full genesis as before and later cells reuse that build. Data dirs stay fresh per
+  cell. The cache keeps one ~290 MB file per distinct key at 1M accounts (delete
+  `$RUN/genesis-cache/*.genesis` after the campaign if the space matters); opt out with
+  `harness_env` `"GENESIS_CACHE_DIR": ""`. `PREFLIGHT OK` shows `end_pass=1 genesis_reuse=1`;
+  an older frozen run-cell.sh without them runs as before (`=0`).
 - **Samplers** (spec `samplers`, default `true`): `data-du-samples.txt` (data dir sizes,
   MemAvailable, /dev/shm; 2 s), `ckpt-samples.txt` (each node's checkpoint and reject metrics;
   2 s), `mem-samples.txt` + `smaps/` (smaps_rollup, status and memory gauges every 5 s; val0's
@@ -792,7 +849,8 @@ and regenerate (the spec is embedded in the driver header). Standard parts:
 not an arm, an env value with whitespace/quotes/`$`, or a harness key the driver sets
 itself is a `SPEC ERROR`, exit 2, nothing written). Required: `campaign` (unit name),
 `run_dir`, `label_prefix`, `harness_worktree` (run-cell.sh's `<worktree>`), `tools_dir` (the
-frozen tools copy: run-cell.sh, cell-step.sh, cell_step.py, campaign/detach.sh; its root
+frozen tools copy: run-cell.sh with log-scans.sh, cell-endpass.sh and genesis_cache.py, cell-step.sh,
+cell_step.py, campaign/detach.sh; its root
 `tools_dir/../..` must carry the genesis inputs, see below),
 `binaries`, `arms`, `baseline`, `duration_s`, `markets`, and `replicates` unless `order` is a
 list. Optional: `comment`, `results_root` (`~/bench-results-matched`), `devnet_dir`
