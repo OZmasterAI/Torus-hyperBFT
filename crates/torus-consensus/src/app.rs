@@ -2945,8 +2945,9 @@ impl ExecutionContext {
         }
         // Item 6 Phase 3: with a checkpoint interval a block's rows are not
         // written now: W digests it and keeps its side rows for the next
-        // checkpoint. Deferred book saves never reach here (task 1.2 refuses
-        // modes 2/3 with an interval); one would be a code bug: fail-stop.
+        // checkpoint. Deferred book saves never reach here (b0: with an
+        // interval modes 2/3 save their books on E); one would be a code
+        // bug: fail-stop.
         // Item 7 option 0 (task 2.4): a Marker becomes a Digest carrying its
         // action status and EVM side rows (`Job::into_digest`); before, its
         // Digest had `action_status: None` and no EVM part.
@@ -4879,7 +4880,13 @@ impl ExecutionContext {
             // which must then already hold the book bytes — those nodes keep the
             // on-thread pass 2. `save_order_books_deferred` returns None (no side
             // effects) for Classic / OrderRows.
-            let deferred_books = if pipelined && ctx.resident_mode() {
+            // b0 (docs/plans/deep-book-save-options.md section 4): with a
+            // checkpoint interval the save runs HERE in full (the serial save:
+            // reads through own -> R -> parent -> L -> C -> DB, writes into
+            // this overlay, then L and the checkpoint). W's deferred pass 2
+            // reads the DB as "every height < N durable", which a
+            // since-checkpoint layer breaks. Same bytes either way.
+            let deferred_books = if pipelined && ctx.resident_mode() && self.checkpoint.is_none() {
                 ctx.save_order_books_deferred()
             } else {
                 None
@@ -6787,13 +6794,12 @@ impl TorusApp {
         // (serial) boot replay — so the durable marker equals the replayed top
         // height before `exec_next_height` / manifest parking read it (design
         // §2.1 W.6, F4). Default ON; `TORUS_EXEC_PIPELINE=0` ⇒ None ⇒ serial chain.
-        // Item 6 Phase 3 (task 1.2): a checkpoint interval needs a
-        // non-deferred book mode; refuse to start otherwise (owner s109).
-        // Step 6: the role default (15 s on validators) yields to a deferred
-        // book mode instead (per-block flush, warned).
+        // Item 6 Phase 3: the interval (step 6 role default: 15 s on
+        // validators) for every book mode; b0: with an interval, book modes
+        // 2/3 save their books on E instead of deferring to W.
         let checkpoint_interval = crate::exec_pipeline::effective_checkpoint_interval(
             torus_bridge::native_executor::configured_book_mode(),
-        )?;
+        );
         if crate::exec_pipeline::exec_pipeline_enabled() {
             exec_ctx.checkpoint =
                 crate::exec_pipeline::CheckpointPolicy::for_interval(checkpoint_interval);
@@ -20564,6 +20570,62 @@ mod crash_recovery_tests {
             let books = dump_book_cfs(&db_on);
             assert!(!books[0].1.is_empty() && !books[1].1.is_empty(), "{mode:?}: book rows persisted");
             assert_eq!(dump_book_cfs(&db_off), books);
+        }
+    }
+
+    /// b0: with a checkpoint interval, modes 2 AND 3 do NOT defer the book
+    /// save: every pipelined native block that dirtied a book hands W a
+    /// frozen set that already holds its book bytes (the save ran on E), W
+    /// only digests (no `Flush`, so no sidecar), nothing fail-stops, and the
+    /// final state equals the serial run in every CF, with the same native
+    /// root.
+    #[test]
+    fn exec_pipeline_books_saved_on_exec_thread_with_checkpoints() {
+        use torus_bridge::native_executor::BookMode;
+        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
+            let (_db_off, off, root_off, _) = run_book_fixture(false, mode);
+            torus_state::native_trie::force_native_trie_maintenance_on_for_tests();
+            let (_cfg, state_db) = make_test_config_and_db();
+            fund_book_fixture(&state_db);
+            let mut ctx = book_pipeline_ctx(&state_db, false, None, mode);
+            ctx.checkpoint = Some(ckpt_every(5));
+            ctx.attach_flush_worker(None);
+            let mut with_books = 0;
+            for b in &book_fixture_blocks() {
+                dispatch_and_execute(&ctx, &state_db, b);
+                assert!(
+                    !ctx.exec_failed.load(Ordering::SeqCst),
+                    "{mode:?}: fail-stop at {}",
+                    b.header.height
+                );
+                let h = b.header.height;
+                if h > 1 && !b.native_actions.is_empty() && !EpochManager::is_epoch_boundary(h, 4) {
+                    let last = ctx.last_job.lock().unwrap().clone().expect("fast path");
+                    assert_eq!(last.height(), h);
+                    // Blocks whose actions dirtied a book carry its bytes
+                    // (a cancel-all of a sender without orders dirties none).
+                    if frozen_book_rows(&last) > 0 {
+                        with_books += 1;
+                    }
+                    assert!(
+                        !ctx.last_job_books_deferred.load(Ordering::SeqCst),
+                        "{mode:?} h{h}"
+                    );
+                }
+            }
+            assert!(with_books >= 6, "{mode:?}: {with_books}");
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&state_db), Some(13));
+            assert_dumps_equal(
+                &off,
+                &dump_all_cfs(&state_db),
+                &format!("{mode:?}: b0 vs serial"),
+            );
+            assert_eq!(
+                root_off,
+                torus_state::native_trie::persisted_native_root(&state_db).unwrap(),
+                "{mode:?}: native root"
+            );
         }
     }
 
@@ -36861,6 +36923,18 @@ mod crash_recovery_tests {
     /// placed again. The extra draws happen only with `cloid`. Returns the
     /// single places with a cloid.
     fn p2_blocks_with(ro: bool, cloid: bool) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
+        p2_blocks_full(ro, cloid, false)
+    }
+
+    /// [`p2_blocks_with`], and with `deep` (b0): the deep-level traffic of
+    /// [`p2_deep_actions`] in front of each block's other actions (no extra
+    /// draws: the rest of the sequence is the original one). Needs
+    /// [`p2_deep_seed`] on the fixture.
+    fn p2_blocks_full(
+        ro: bool,
+        cloid: bool,
+        deep: bool,
+    ) -> (Vec<TorusBlock>, P2Fed, Vec<P2CloidPlace>) {
         let mut rng = C5Rng(0x9e21_0008);
         let mut fed = P2Fed::default();
         let mut cloid_places: Vec<P2CloidPlace> = Vec::new();
@@ -36920,6 +36994,11 @@ mod crash_recovery_tests {
                         NONCE_BASE + h * 1_000 + seed as u64,
                         &oracle_key(seed),
                     ));
+                }
+            }
+            if deep {
+                for (seed, action) in p2_deep_actions(h) {
+                    actions.push(sign(seed, action));
                 }
             }
             if !mark_round && rng.below(6) == 0 {
@@ -37173,6 +37252,14 @@ mod crash_recovery_tests {
         /// (the DB at the block) and the holder's R (positions and balances
         /// read through `Users`) was checked equal to the DB scan of its CFs.
         r_db_checked: u64,
+        /// b0: `(S, full CF dump)` each time the durable marker moved (as
+        /// `roots`), recorded only while [`P2_DUMP_DURABLE`] is set.
+        dumps: Vec<(u64, Vec<CfDump>)>,
+    }
+
+    thread_local! {
+        /// b0: record a full CF dump in `P2Run::dumps` at every durable height.
+        static P2_DUMP_DURABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// P2-1 review (GPT-6.1-sol, gap 1): what `p2_run` does to the node
@@ -37434,6 +37521,7 @@ mod crash_recovery_tests {
         let mut crash_windows: Vec<(u64, u64)> = Vec::new();
         let mut cloid_checked = 0;
         let mut r_db_checked = 0;
+        let mut dumps: Vec<(u64, Vec<CfDump>)> = Vec::new();
         let mut ctx = new_ctx(true);
         let (mut v4_max, mut v4_last, mut index_checked, mut restarts, mut faults) =
             (0, 0, 0, 0, 0);
@@ -37607,6 +37695,9 @@ mod crash_recovery_tests {
                         durable,
                         torus_state::native_trie::persisted_native_root(&db).unwrap(),
                     ));
+                    if P2_DUMP_DURABLE.get() {
+                        dumps.push((durable, dump_all_cfs(&db)));
+                    }
                 }
             }
             let h = h.max(skip_to);
@@ -37680,6 +37771,7 @@ mod crash_recovery_tests {
             crash_windows,
             cloid_checked,
             r_db_checked,
+            dumps,
         }
     }
 
@@ -38872,16 +38964,38 @@ mod crash_recovery_tests {
         crashes: &[(u64, bool)],
         fast: Option<bool>,
     ) -> (P2Run, P2Run) {
-        let reference = p2_run_fast(
-            blocks,
-            true,
-            Some(mode),
-            &P2Fault::None,
-            None,
-            fast.map(|_| false),
-        );
+        ckpt_crash_replay_seeded(mode, blocks, what, crashes, fast, &|_| {})
+    }
+
+    /// [`ckpt_crash_replay_with`] on a `p2_fixture` DB that `seed` wrote to
+    /// first (both runs).
+    fn ckpt_crash_replay_seeded(
+        mode: torus_bridge::native_executor::BookMode,
+        blocks: &[TorusBlock],
+        what: &str,
+        crashes: &[(u64, bool)],
+        fast: Option<bool>,
+        seed: &dyn Fn(&StateDb),
+    ) -> (P2Run, P2Run) {
+        let run_one = |fault: &P2Fault,
+                       ckpt: Option<crate::exec_pipeline::CheckpointPolicy>,
+                       fast: Option<bool>| {
+            p2_run_full(
+                blocks,
+                true,
+                Some(mode),
+                false,
+                fault,
+                ckpt,
+                seed,
+                false,
+                None,
+                fast,
+            )
+        };
+        let reference = run_one(&P2Fault::None, None, fast.map(|_| false));
         let fault = P2Fault::CkptCrash(crashes.to_vec());
-        let run = p2_run_fast(blocks, true, Some(mode), &fault, Some(ckpt_every(5)), fast);
+        let run = run_one(&fault, Some(ckpt_every(5)), fast);
         assert_eq!(run.faults, crashes.len() as u64, "{what}");
         let captured = dedup_captured(&run.captured, what);
         assert_eq!(
@@ -39043,6 +39157,403 @@ mod crash_recovery_tests {
     #[test]
     fn checkpoint_crash_replay_matches_uncrashed_order_rows() {
         ckpt_crash_replay(torus_bridge::native_executor::BookMode::OrderRows);
+    }
+
+    // ---- b0 (docs/plans/deep-book-save-options.md section 4): book modes
+    // 2 / 3 with checkpoints. With a checkpoint interval the book save runs
+    // on E (the serial save, into the block overlay and then L), not on W;
+    // without one the deferred save on W is unchanged. ----
+
+    /// b0 deep-level traffic: a maker resting many orders on single price
+    /// levels (150 bids at 80 per market: 3 chunks of `LEVEL_CHUNK_SEQS` =
+    /// 64; asks at 125, more bids at 79), a stop far from the mark, takers
+    /// sweeping across chunk boundaries, and cancel-alls deleting whole deep
+    /// levels (market 2 at 96, re-placed after) and a stop (market 3 at 104).
+    const P2_DEEP_MAKER: u8 = 96;
+    const P2_DEEP_TAKER: u8 = 97;
+
+    fn p2_deep_seed(db: &StateDb) {
+        use torus_core::position::{NativeBalance, PositionManager};
+        let pm = PositionManager::new(db.clone());
+        for seed in [P2_DEEP_MAKER, P2_DEEP_TAKER] {
+            pm.put_native_balance(
+                &oracle_addr(seed),
+                &NativeBalance {
+                    available: px(10_000_000),
+                    order_margin: FixedPoint::ZERO,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// The deep actions of height `h` (`(signer seed, action)`), a pure
+    /// function of `h`.
+    fn p2_deep_actions(h: u64) -> Vec<(u8, NativeAction)> {
+        let limit = |m: u64, is_buy: bool, price: i64, qty: i64| torus_types::PlaceOrderParams {
+            market_id: m,
+            is_buy,
+            price: px(price),
+            quantity: px(qty),
+            order_type: torus_types::OrderType::Limit,
+            time_in_force: torus_types::TimeInForce::GTC,
+            reduce_only: false,
+            client_order_id: None,
+        };
+        let m = C5_MARKETS[(h % 3) as usize];
+        let mut out = Vec::new();
+        let mut maker = Vec::new();
+        if (2..=19).contains(&h) {
+            maker.extend((0..25).map(|_| limit(m, true, 80, 1)));
+            maker.extend((0..10).map(|_| limit(m, false, 125, 1)));
+            if h % 5 == 4 {
+                maker.extend((0..20).map(|_| limit(m, true, 79, 1)));
+            }
+        }
+        if h == 99 || h == 101 {
+            maker.extend((0..25).map(|_| limit(2, true, 80, 1)));
+        }
+        if !maker.is_empty() {
+            out.push((P2_DEEP_MAKER, NativeAction::PlaceOrderBatch(maker)));
+        }
+        match h {
+            20 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                    order_type: torus_types::OrderType::StopMarket { trigger: px(30) },
+                    ..limit(3, false, 20, 1)
+                }),
+            )),
+            60 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::PlaceOrder(torus_types::PlaceOrderParams {
+                    order_type: torus_types::OrderType::StopLimit {
+                        trigger: px(300),
+                        limit: px(301),
+                    },
+                    ..limit(1, true, 301, 1)
+                }),
+            )),
+            96 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::CancelAllOrders { market_id: Some(2) },
+            )),
+            104 => out.push((
+                P2_DEEP_MAKER,
+                NativeAction::CancelAllOrders { market_id: Some(3) },
+            )),
+            25 | 41 | 66 | 88 | 111 => out.push((
+                P2_DEEP_TAKER,
+                NativeAction::PlaceOrder(limit(m, false, 79, 70)),
+            )),
+            33 | 77 => out.push((
+                P2_DEEP_TAKER,
+                NativeAction::PlaceOrder(limit(m, true, 125, 15)),
+            )),
+            _ => {}
+        }
+        out
+    }
+
+    fn p2_deep_blocks() -> Vec<TorusBlock> {
+        p2_blocks_full(false, false, true).0
+    }
+
+    /// Order rows in the node-local `CF_BOOK_ORDER_ROWS` (non-vacuity).
+    fn book_order_rows(db: &StateDb) -> usize {
+        StateBackend::iterate_cf(db, torus_state::cf::CF_BOOK_ORDER_ROWS, None)
+            .unwrap()
+            .len()
+    }
+
+    /// Boot verify on `db` as it is: a fresh context with an empty resident
+    /// holder loads every book from the node-local order rows and
+    /// byte-verifies the root-committed meta, stop and level rows. Returns
+    /// the resting orders loaded.
+    fn b0_boot_verify(
+        db: &StateDb,
+        mode: torus_bridge::native_executor::BookMode,
+        what: &str,
+    ) -> usize {
+        let mut empty = torus_bridge::native_executor::ResidentBooks::default();
+        let h = read_native_applied_height(db).unwrap_or(0) + 1;
+        let mut ctx = NativeExecContext::new_with_mode(
+            db.clone(),
+            h,
+            1_000 + h,
+            0,
+            100,
+            10,
+            Address::ZERO,
+            Address::ZERO,
+            Address::ZERO,
+            mode,
+            Some(&mut empty),
+        );
+        assert_eq!(ctx.take_fatal_error(), None, "{what}: boot verify");
+        ctx.resting_order_count()
+    }
+
+    /// b0 equivalence in `mode` on the deep P2 stream: serial, pipelined per
+    /// block (interval 0: the deferred save on W) and pipelined with
+    /// checkpoints (every 5 blocks, every 7, never by time, a 1 ms
+    /// interval; the save on E) give the same per-block consensus write set
+    /// at every height (every `h_n`), running hash and final dump of every CF
+    /// (incl. the node-local `CF_BOOK_ORDER_ROWS`); at every height a run
+    /// made durable, its full CF dump and persisted native root equal the
+    /// per-block run's at that height. The final DB passes boot verify.
+    fn b0_equivalence(mode: torus_bridge::native_executor::BookMode) {
+        let blocks = p2_deep_blocks();
+        let what = format!("b0 {mode:?}");
+        P2_DUMP_DURABLE.set(true);
+        let run = |pipelined: bool, ckpt: Option<crate::exec_pipeline::CheckpointPolicy>| {
+            p2_run_seeded(
+                &blocks,
+                pipelined,
+                Some(mode),
+                false,
+                &P2Fault::None,
+                ckpt,
+                &p2_deep_seed,
+                false,
+                None,
+            )
+        };
+        let serial = run(false, None);
+        let per_block = run(true, None);
+        assert_eq!(per_block.max_lag, 0, "{what}: per-block flush");
+        assert_eq!(
+            per_block.dumps.len() as u64,
+            P2_BLOCKS,
+            "{what}: a dump per height"
+        );
+        assert_eq!(
+            serial.dumps.len() as u64,
+            P2_BLOCKS,
+            "{what}: a dump per height"
+        );
+        for ((h, a), (_, b)) in serial.dumps.iter().zip(&per_block.dumps) {
+            assert_dumps_equal(a, b, &format!("{what}: per-block vs serial at {h}"));
+        }
+        assert_write_sets_equal(
+            &serial.captured,
+            &per_block.captured,
+            &format!("{what}: per-block vs serial"),
+        );
+        // Non-vacuous: deep levels rested, filled and were cancelled.
+        let fills = serial.metrics.orders_matched.get();
+        let max_rows = serial
+            .dumps
+            .iter()
+            .map(|(_, d)| {
+                d.iter()
+                    .find(|(cf, _)| *cf == torus_state::cf::CF_BOOK_ORDER_ROWS)
+                    .map_or(0, |(_, rows)| rows.len())
+            })
+            .max()
+            .unwrap_or(0);
+        println!(
+            "{what}: fills {fills}, most order rows {max_rows}, final {}",
+            book_order_rows(&serial.db)
+        );
+        assert!(fills >= 300, "{what}: fills {fills}");
+        assert!(max_rows >= 600, "{what}: order rows {max_rows}");
+        let interval = crate::exec_pipeline::CheckpointPolicy {
+            interval: Some(std::time::Duration::from_millis(1)),
+            ..Default::default()
+        };
+        for (name, policy, min_lag) in [
+            ("every 5", ckpt_every(5), 4),
+            ("every 7", ckpt_every(7), 6),
+            ("never", ckpt_never(), 40),
+            ("interval 1 ms", interval, 0),
+        ] {
+            let ck = run(true, Some(policy));
+            let w = format!("{what} {name}");
+            assert!(
+                ck.max_lag >= min_lag,
+                "{w}: max lag {} < {min_lag}",
+                ck.max_lag
+            );
+            assert_eq!(
+                ck.captured.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+                (1..=P2_BLOCKS).collect::<Vec<_>>(),
+                "{w}: every height hashed once"
+            );
+            for (base_name, base) in [("serial", &serial), ("per-block", &per_block)] {
+                assert_write_sets_equal(
+                    &base.captured,
+                    &ck.captured,
+                    &format!("{w} vs {base_name}"),
+                );
+                assert_eq!(base.hash, ck.hash, "{w} vs {base_name}: running hash");
+                assert_dumps_equal(&base.dump, &ck.dump, &format!("{w} vs {base_name}"));
+            }
+            assert!(!ck.dumps.is_empty(), "{w}: checkpoints");
+            for (s, dump) in &ck.dumps {
+                let (_, want) = per_block
+                    .dumps
+                    .iter()
+                    .find(|(h, _)| h == s)
+                    .expect("per-block dump at every height");
+                assert_dumps_equal(want, dump, &format!("{w}: CF dump at checkpoint {s}"));
+            }
+            for (s, root) in &ck.roots {
+                let want = per_block
+                    .roots
+                    .iter()
+                    .find(|(h, _)| h == s)
+                    .map(|(_, r)| *r);
+                assert_eq!(Some(*root), want, "{w}: native root at checkpoint {s}");
+            }
+            assert!(
+                b0_boot_verify(&ck.db, mode, &w) > 0,
+                "{w}: resting orders loaded"
+            );
+        }
+        P2_DUMP_DURABLE.set(false);
+    }
+
+    #[test]
+    fn checkpoint_b0_matches_per_block_level_authority() {
+        b0_equivalence(torus_bridge::native_executor::BookMode::LevelAuthority);
+    }
+
+    #[test]
+    fn checkpoint_b0_matches_per_block_level_authority_chunked() {
+        b0_equivalence(torus_bridge::native_executor::BookMode::LevelAuthorityChunked);
+    }
+
+    /// b0 crash / restart: the deep P2 stream with a checkpoint every 5
+    /// blocks and 6 crashes at non-checkpoint heights (3 with a checkpoint
+    /// batch in flight): every lost window replays from the durable marker
+    /// (the guard rebuilds the books from the DB: boot verify of the
+    /// node-local order rows each time), and the run equals the uncrashed
+    /// per-block run (deferred save on W): every `h_n`, running hash, full CF
+    /// dump, the native root at every checkpoint and at the end. A cold load
+    /// of the final DB passes boot verify, and a planted stale order row
+    /// fails it.
+    fn b0_crash_replay(mode: torus_bridge::native_executor::BookMode) {
+        let blocks = p2_deep_blocks();
+        let what = format!("b0 {mode:?} checkpoint crashes");
+        let (reference, run) =
+            ckpt_crash_replay_seeded(mode, &blocks, &what, &CKPT_CRASHES, None, &p2_deep_seed);
+        assert_eq!(run.crash_windows.len(), CKPT_CRASHES.len(), "{what}");
+        for (durable, last) in &run.crash_windows {
+            assert!(durable < last, "{what}: crash window ({durable}, {last}]");
+        }
+        assert!(
+            run.roots.len() >= 10,
+            "{what}: checkpoints {}",
+            run.roots.len()
+        );
+        for (s, root) in &run.roots {
+            let want = reference
+                .roots
+                .iter()
+                .find(|(h, _)| h == s)
+                .map(|(_, r)| *r);
+            assert_eq!(Some(*root), want, "{what}: native root at checkpoint {s}");
+        }
+        let persisted = |db: &StateDb| torus_state::native_trie::persisted_native_root(db).unwrap();
+        assert_eq!(
+            persisted(&run.db),
+            persisted(&reference.db),
+            "{what}: final root"
+        );
+        let rows = book_order_rows(&run.db);
+        assert!(rows >= 150, "{what}: order rows {rows}");
+        assert_eq!(
+            b0_boot_verify(&run.db, mode, &what),
+            rows,
+            "{what}: every order row loaded"
+        );
+        // Mutation: boot verify must catch a stale node-local order row.
+        let (key, value) =
+            StateBackend::iterate_cf(&run.db, torus_state::cf::CF_BOOK_ORDER_ROWS, None)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+        let mut stale = value.clone();
+        let last = stale.len() - 1;
+        stale[last] ^= 0x01;
+        run.db
+            .put_cf_raw(torus_state::cf::CF_BOOK_ORDER_ROWS, &key, &stale)
+            .unwrap();
+        let mut empty = torus_bridge::native_executor::ResidentBooks::default();
+        let mut ctx = NativeExecContext::new_with_mode(
+            run.db.clone(),
+            P2_BLOCKS + 1,
+            0,
+            0,
+            100,
+            10,
+            Address::ZERO,
+            Address::ZERO,
+            Address::ZERO,
+            mode,
+            Some(&mut empty),
+        );
+        assert!(
+            ctx.take_fatal_error().is_some(),
+            "{what}: a stale order row passed boot verify"
+        );
+    }
+
+    #[test]
+    fn checkpoint_b0_crash_replay_matches_uncrashed_level_authority() {
+        b0_crash_replay(torus_bridge::native_executor::BookMode::LevelAuthority);
+    }
+
+    #[test]
+    fn checkpoint_b0_crash_replay_matches_uncrashed_level_authority_chunked() {
+        b0_crash_replay(torus_bridge::native_executor::BookMode::LevelAuthorityChunked);
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_with_cloids_matches_uncrashed_level_authority() {
+        ckpt_crash_replay_cloids(torus_bridge::native_executor::BookMode::LevelAuthority);
+    }
+
+    #[test]
+    fn checkpoint_crash_replay_with_cloids_matches_uncrashed_level_authority_chunked() {
+        ckpt_crash_replay_cloids(torus_bridge::native_executor::BookMode::LevelAuthorityChunked);
+    }
+
+    /// b0: a stale resident holder mid-window (checkpoint every 5 blocks)
+    /// rebuilds its books from the DB plus L (order rows and level rows of
+    /// the open window) and lands the per-block run's state.
+    #[test]
+    fn checkpoint_b0_stale_holder_rebuild_mid_window_level_authority_chunked() {
+        let mode = torus_bridge::native_executor::BookMode::LevelAuthorityChunked;
+        let blocks = p2_deep_blocks();
+        let run = |fault: &P2Fault, ckpt| {
+            p2_run_seeded(
+                &blocks,
+                true,
+                Some(mode),
+                false,
+                fault,
+                ckpt,
+                &p2_deep_seed,
+                false,
+                None,
+            )
+        };
+        let reference = run(&P2Fault::None, None);
+        // Windows ending off the checkpoint grid (every 5).
+        let stale = P2Fault::StaleHolder(vec![(21, 27), (72, 78), (103, 109)]);
+        let ck = run(&stale, Some(ckpt_every(5)));
+        assert_eq!(ck.faults, 3);
+        assert_eq!(
+            ck.metrics.exec_resident_rebuilds.get(),
+            1 + 2 * 3,
+            "one guard rebuild per fault"
+        );
+        assert_write_sets_equal(&reference.captured, &ck.captured, "b0 stale holder");
+        assert_eq!(reference.hash, ck.hash, "b0 stale holder: running hash");
+        assert_dumps_equal(&reference.dump, &ck.dump, "b0 stale holder");
     }
 
     /// Three replicas of the reduce-only P2 sequence (OrderRows) with

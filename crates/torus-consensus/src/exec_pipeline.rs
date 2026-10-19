@@ -178,40 +178,41 @@ fn checkpoint_interval_env_set(v: Option<&str>) -> bool {
     v.is_some_and(|s| !s.trim().is_empty())
 }
 
-/// The interval the node runs, from the env value, the role default and the
-/// book mode. An explicit interval > 0 with a deferred book mode (2/3) refuses
-/// to start ([`check_checkpoint_book_mode`], task 1.2). The role default
-/// yields to a deferred book mode instead (per-block flush, `Ok(None)`): the
-/// operator chose the book mode, not the interval (e.g. the bench
-/// `RECORD_ENV`'s `TORUS_BOOK_ROWS=3`).
+/// The interval the node runs, from the env value and the role default, for
+/// every book mode. b0 (`docs/plans/deep-book-save-options.md` section 4):
+/// with an interval, book modes 2 / 3 run their book save on E (the serial
+/// save, into the block overlay and then L) instead of deferring its write
+/// half to W, so they take the same interval as Classic / OrderRows (before
+/// b0 an explicit interval refused to start and the role default yielded to
+/// them, owner s109). Without an interval (per-block flush) they keep the
+/// deferred save on W.
 pub fn resolve_checkpoint_interval(
     raw: Option<String>,
     default: Option<std::time::Duration>,
     mode: torus_bridge::native_executor::BookMode,
-) -> Result<Option<std::time::Duration>, String> {
-    let explicit = checkpoint_interval_env_set(raw.as_deref());
+) -> Option<std::time::Duration> {
+    use torus_bridge::native_executor::BookMode;
     let interval = parse_checkpoint_interval(raw, default);
-    if explicit {
-        check_checkpoint_book_mode(interval, mode)?;
-        return Ok(interval);
+    if interval.is_some()
+        && matches!(
+            mode,
+            BookMode::LevelAuthority | BookMode::LevelAuthorityChunked
+        )
+    {
+        tracing::info!(
+            ?mode,
+            ?interval,
+            "checkpoints with a level-authority book mode: the book save runs on the exec \
+             thread (b0), not on the flush worker"
+        );
     }
-    match check_checkpoint_book_mode(interval, mode) {
-        Ok(()) => Ok(interval),
-        Err(_) => {
-            tracing::warn!(
-                ?mode,
-                "TORUS_BOOK_ROWS selects a deferred book save: the compiled default checkpoint \
-                 interval is off (per-block flush); set TORUS_BOOK_ROWS unset/0/1 for checkpoints"
-            );
-            Ok(None)
-        }
-    }
+    interval
 }
 
 /// [`resolve_checkpoint_interval`] from the environment and the role default.
 pub fn effective_checkpoint_interval(
     mode: torus_bridge::native_executor::BookMode,
-) -> Result<Option<std::time::Duration>, String> {
+) -> Option<std::time::Duration> {
     resolve_checkpoint_interval(
         std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok(),
         checkpoint_interval_default(),
@@ -301,27 +302,6 @@ impl CheckpointPolicy {
     }
 }
 
-/// Interval > 0 requires a non-deferred book mode (owner s109, plan 6.1): in
-/// modes 2/3 W applies the deferred book save reading the DB as "every height
-/// < N durable", which is false with a since-checkpoint layer. The node
-/// refuses to start; the error names both settings.
-pub fn check_checkpoint_book_mode(
-    interval: Option<std::time::Duration>,
-    mode: torus_bridge::native_executor::BookMode,
-) -> Result<(), String> {
-    use torus_bridge::native_executor::BookMode;
-    match (interval, mode) {
-        (Some(iv), BookMode::LevelAuthority | BookMode::LevelAuthorityChunked) => Err(format!(
-            "TORUS_CHECKPOINT_INTERVAL_MS={} needs a non-deferred book mode, but \
-             TORUS_BOOK_ROWS selects {:?} (deferred book save); unset \
-             TORUS_CHECKPOINT_INTERVAL_MS or use TORUS_BOOK_ROWS unset/0 (Classic) or 1 (OrderRows)",
-            iv.as_millis(),
-            mode
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// Item 7 option 0 step 0 (task 0.4, R5 / F11): where a height became
 /// complete (its state, marker AND EVM mirror resync written). Test-only.
 #[cfg(test)]
@@ -367,7 +347,9 @@ pub enum Job {
     /// into a sidecar pending set whose entries join the SAME atomic batch and
     /// the SAME native-root inputs as `pending` — byte-identical durable state
     /// to the serial on-E save, with the write half of save_books off E's
-    /// critical path. `None` = exactly the pre-port job.
+    /// critical path. `None` = exactly the pre-port job. Only on the per-block
+    /// flush: with a checkpoint interval E runs the whole save (b0), since W's
+    /// pass 2 reads the DB as "every height < N durable".
     Flush {
         height: u64,
         pending: Arc<FrozenPending>,
@@ -1661,66 +1643,54 @@ mod tests {
         }
     }
 
-    /// Step 6: the role default yields to a deferred book mode (per-block
-    /// flush) instead of refusing to start; an explicit interval still
-    /// refuses (task 1.2); Classic / OrderRows run the default.
+    /// b0 (deep-book-save-options.md section 4): the interval applies to
+    /// every book mode. Modes 2 / 3 then save their books on E (the serial
+    /// save) instead of deferring pass 2 to W, so the role default (15 s on
+    /// validators) no longer yields to them and an explicit interval starts;
+    /// `0` and no role default stay the per-block flush.
     #[test]
-    fn checkpoint_interval_role_default_yields_to_deferred_book_modes() {
+    fn checkpoint_interval_applies_to_every_book_mode() {
         use std::time::Duration;
         use torus_bridge::native_executor::BookMode;
         let d = role_checkpoint_interval(false);
-        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
-            assert_eq!(resolve_checkpoint_interval(None, d, mode), Ok(None), "{mode:?}");
-            assert_eq!(
-                resolve_checkpoint_interval(Some("".into()), d, mode),
-                Ok(None),
-                "{mode:?}"
-            );
-            let err = resolve_checkpoint_interval(Some("15000".into()), d, mode)
-                .expect_err("an explicit interval with a deferred book mode refuses to start");
-            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
-            assert_eq!(
-                resolve_checkpoint_interval(Some("0".into()), d, mode),
-                Ok(None),
-                "{mode:?}"
-            );
-        }
-        for mode in [BookMode::Classic, BookMode::OrderRows] {
-            assert_eq!(
-                resolve_checkpoint_interval(None, d, mode),
-                Ok(Some(Duration::from_secs(15))),
-                "{mode:?}"
-            );
-            assert_eq!(resolve_checkpoint_interval(None, None, mode), Ok(None), "{mode:?}");
-            assert_eq!(
-                resolve_checkpoint_interval(Some("0".into()), d, mode),
-                Ok(None),
-                "{mode:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn checkpoint_interval_refuses_deferred_book_modes() {
-        use std::time::Duration;
-        use torus_bridge::native_executor::BookMode;
         let on = Some(Duration::from_secs(15));
-        for mode in [BookMode::LevelAuthority, BookMode::LevelAuthorityChunked] {
-            let err = check_checkpoint_book_mode(on, mode)
-                .expect_err("interval > 0 with a deferred book mode must refuse to start");
-            assert!(err.contains("TORUS_CHECKPOINT_INTERVAL_MS"), "{err}");
-            assert!(err.contains("TORUS_BOOK_ROWS"), "{err}");
-        }
-        for mode in [BookMode::Classic, BookMode::OrderRows] {
-            assert_eq!(check_checkpoint_book_mode(on, mode), Ok(()), "{mode:?}");
-        }
         for mode in [
             BookMode::Classic,
             BookMode::OrderRows,
             BookMode::LevelAuthority,
             BookMode::LevelAuthorityChunked,
         ] {
-            assert_eq!(check_checkpoint_book_mode(None, mode), Ok(()), "{mode:?}");
+            assert_eq!(resolve_checkpoint_interval(None, d, mode), on, "{mode:?}");
+            assert_eq!(
+                resolve_checkpoint_interval(Some("".into()), d, mode),
+                on,
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_checkpoint_interval(Some("15000".into()), d, mode),
+                on,
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_checkpoint_interval(Some("15000".into()), None, mode),
+                on,
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_checkpoint_interval(Some("0".into()), d, mode),
+                None,
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_checkpoint_interval(None, None, mode),
+                None,
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_checkpoint_interval(None, role_checkpoint_interval(true), mode),
+                None,
+                "{mode:?}: --rpc-only"
+            );
         }
     }
 
