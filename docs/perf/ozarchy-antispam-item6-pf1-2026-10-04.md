@@ -14519,6 +14519,197 @@ than 15 min (the SST count stays flat over 13.5 min of window, not proven for ho
 | r2 | B | 0 | ACCEPT/AGREE/PASS | True | 261,301 | 9.321 | 28,034 | 106.6 | 25.5 / 912 | 23.81 | 0.133 | 2.821 | 261,589 / 9.295 |
 | r2 | A | 0 | ACCEPT/AGREE/PASS | True | 255,589 | 16.424 | 15,562 | 60.2 | 13.1 / 600 | 23.92 | 0.025 | 2.830 | 256,922 / 15.962 |
 
+## 96. Step 8i: deep-book follow-up to 8f: resting-depth sweep on the 1M-account genesis, save_books profile, crash-kill at 1M (campaign ozarchy-8i, main `76204a69`, archy, 2026-10-19)
+
+**The 8f slowdown comes from resting depth (orders), not from accounts. With 1M accounts and no pre-load (P0),
+the standard cell runs as on the 100k genesis: 263,708 matched/s (S 256,224), save_books 0.217 ms per 1k fills (S
+0.218), engine 2.83 ms per 1k fills (S 2.89), CPU-s per 1M 23.16 (S 23.56). Its 10.5 blocks/s is inside the
+standard cells' block-rate spread (9.3-16.4 in sections 94 / 95). With 250k / 500k / 1M pre-loaded orders, matched/s falls to
+251,920 / 244,017 / 221,362 (0.955 / 0.925 / 0.839 of P0). The chain is in the big-block regime already at 250k
+(3.83 blocks/s, p50 177 ms) and stays there (3.42 / 2.91 blocks/s, p50 223 / 243 ms). save_books per 1k fills
+grows in line with the mean resting depth during the load (0.21M / 0.75M / 1.04M / 1.61M orders -> 0.217 / 0.576 /
+0.719 / 1.070 ms, ~0.61 ms per 1k fills per 1M resting orders). P1M repeats 8f's M within 1% on matched/s (221,362
+vs 219,484). Profile of save_books at 1M (Classic book mode, the code default): 83 ms per native block, of which
+~73% is borsh encoding of the whole book (`Order` / `OrderBook` serialize), ~15% is libc memmove growing the output
+Vec, ~3% jemalloc, ~2% dropping the journals, 0.1-0.2% the pending-overlay put (the DB write), no hashing at all, and
+6-7% not sampled (kernel time). Crash-kill at 1M (SIGKILL val1 at bench+300 s): the chain halts at once (3
+validators), val1 replays 76 blocks and commits again 48.4 s after the kill. The cell AGREEs with one digest, but it
+is REJECT (liveness: a 30 s stall on the survivors; crash gate, see 96.4). n = 1 per cell.**
+
+Question (bench queue step 8i, owner s131): section 93's M cell changed two things at once (1M accounts and 1M
+resting orders). (1) Does the slowdown follow the resting depth, or is it there at 0 pre-load? (2) Where does
+`save_books` spend its time at 1M (book row encode, level hashing, DB writes, other)? (3) A SIGKILL restart during
+the load at 1M: kill -> first commit, replayed blocks, catch-up, AGREE, matched/s around the kill.
+
+### 96.1 Setup
+
+* Node: the 8f binary, main `76204a69`, md5 `7f91438d144508bfa18a0d048e572322` (staged in `ozarchy-8f-stage/`, not
+  rebuilt), worktree `wt/8f-76204a69` (clean). bench-throughput `0a030a0c` (`c2336e70`, has `preload`). The md5 was
+  checked on every node of every cell and on the restarted val1: run-cell's staged / dst md5 plus `/proc/<pid>/exe`
+  for 16 / 16 processes (memwatch), 0 mismatches. Code defaults (Classic books, PC 8, F on), re-send 250 ms and the
+  512 KB push threshold from `env.sh`, custody 0. Nothing set by env; node env digest `89d6a583` in every cell.
+* Tools: `ozarchy-8i-tools/` = a copy of `ozarchy-8f-tools/` (`c2336e70`, `FROZEN.txt` appended). The 8f M cell had
+  rebuilt its weighted-full genesis as the 1M one (md5 `a644d0a7`, `bulk_count` 1,000,000). Every 8i cell reuses it
+  (`BULK_COUNT=1000000`, no `FORCE`; run-cell logs "reusing existing"). Cell genesis md5 `4c8b8af8` in all cells, the
+  same as 8f's M.
+* Driver: `ozarchy-8i-b/campaign.sh`, a copy of 8f's hand-written driver (the generator has no per-cell
+  PRELOAD / BULK_COUNT genesis, no swap stop rule, no perf sidecar in a single cell and no crash cell next to plain
+  ones). Standard load as section 93 (hsdb-300m: 300 markets, rate 76,000, SENDERS 5,000, BLOCK_CAP 400,
+  RETRY_BUSY, MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900, oracle on, IN_FLIGHT_TAIL commit, CLOID_SHARE 0, 15 s
+  checkpoints, node_env as 8f), 600 s, n = 1. Cells in run order: P0, P250k, P500k, P1M (`PRELOAD=` 0 / 250,000 /
+  500,000 / 1,000,000; run-cell's pre-load defaults: 900 per owner, distance 1,000, 100 levels, 50 actions/s), then
+  CK (`PRELOAD=1000000 CRASH_KILL_AT_S=300`). 30 s between cells. `memwatch.sh` (8f's, 1 Hz) for the whole campaign
+  with 8f's stop rule (swap > +512 MB over the baseline, MemAvailable < 10 GB, node VmSwap > 64 MB); free disk >= 25 GB
+  checked before each cell. Neither fired.
+* Profile (P1M only, `ozarchy-8i-b/perf-sidecar.sh`): `kernel.perf_event_paranoid` was 2 at every cell start and end,
+  and was not changed (owner asleep). User space only: W1 = `perf record -e cycles:u -F 499 -g --call-graph fp -p
+  <val1>` at bench+240 s for 25 s (whole process); W2 = `perf record -e cycles:u -F 499 --call-graph dwarf,65528
+  --no-inherit -t <exec tid>` at bench+280 s for 30 s (exec thread only). Read with `perf script --no-inline -G`.
+  Exec tid = the `torus-execution` task with the most CPU. Off-CPU and kernel stacks need paranoid <= 1 and were
+  skipped.
+* Smoke (`ozarchy-8i-300m-smoke`, `-smoke2`; 120 s, PRELOAD 20,000, kill at bench+75 s, short perf windows): both
+  AGREE, pre-load ok, md5 ok, perf rc 0. Both REJECT on the crash gate only, for the reasons in 96.4. Smoke 1 used
+  `dwarf,32768`; smoke 2 raised it to the maximum 65,528, which did not help (96.3).
+* Host: archy, 62 GB, 32 CPUs, swap 62.7 GB zram + 62.7 GB file (~1.5 GB zram used at baseline). Quiet: no cargo /
+  rustc / indexer; no analysis ran during the cells.
+
+### 96.2 Depth sweep (`ozarchy-8i-b/analyst/8i.txt`; 8f's S and M for reference; phase rows mean of 3 nodes)
+
+| metric | S (8f: 100k accts, no pre-load) | M (8f: 1M + 1M) | P0 | P250k | P500k | P1M (perf) | CK (1M, kill) |
+|---|---|---|---|---|---|---|---|
+| validity / agreement / liveness | ACCEPT / AGREE / PASS | ACCEPT / AGREE / PASS | ACCEPT / AGREE / PASS | ACCEPT / AGREE / PASS | ACCEPT / AGREE / PASS | ACCEPT / AGREE / PASS | REJECT / AGREE / FAIL |
+| pre-load (orders, s) | - | 1,000,000, 23 s | - | 250,000, 6 s | 500,000, 12 s | 1,000,000, 23 s | 1,000,000, 23 s |
+| resting orders, load mean / max | 0.19M / 0.50M | 1.59M / 1.77M | 0.21M / 0.53M | 0.75M / 1.00M | 1.04M / 1.25M | 1.61M / 1.77M | 1.51M / 1.76M |
+| matched/s | 256,224 | 219,484 | 263,708 | 251,920 | 244,017 | 221,362 | 209,697 |
+| native blocks/s | 13.33 | 2.98 | 10.48 | 3.83 | 3.42 | 2.91 | 3.11 |
+| fills per native block | 18,519 | 71,613 | 24,121 | 64,338 | 69,310 | 73,786 | 65,683 |
+| exec block ms | 70.9 | 322.1 | 90.6 | 252.0 | 281.5 | 329.9 | 293.5 |
+| save_books ms per block | 4.04 | 76.72 | 5.23 | 37.09 | 49.85 | 78.92 | 69.40 |
+| save_books ms per 1k fills | 0.218 | 1.071 | 0.217 | 0.576 | 0.719 | 1.070 | 1.057 |
+| engine ms per block / per 1k fills | 53.5 / 2.89 | 182.7 / 2.55 | 68.3 / 2.83 | 167.8 / 2.61 | 178.3 / 2.57 | 186.7 / 2.53 | 167.6 / 2.55 |
+| checkpoint settle wait ms per block | 1.47 | 23.61 | 1.96 | 10.75 | 15.10 | 23.71 | 20.39 |
+| block p50 / p99 ms (commit interval) | 14.6 / 774 | 240.2 / 1,416 | 18.5 / 886 | 177.4 / 1,141 | 222.9 / 1,265 | 242.5 / 1,575 | 168.8 / 1,586 |
+| consensus timeouts (per 1k native blocks) | 0 (0.00) | 4 (2.23) | 5 (0.79) | 1 (0.43) | 1 (0.49) | 7 (3.99) | 24 (12.81) |
+| CPU-s per 1M fills | 23.56 | 24.54 | 23.16 | 23.43 | 23.66 | 24.42 | 24.88 |
+| RSS during the load, mean / max MB (3 nodes) | 3,800 / 5,861 | 7,043 / 9,215 | 4,566 / 6,275 | 6,890 / 9,059 | 6,684 / 9,439 | 7,414 / 9,915 | 7,323 / 10,256 |
+| host min MemAvailable / max swap MB | 36,477 / 1,543 | 26,613 / 1,542 | 33,758 / 1,526 | 25,259 / 1,526 | 25,430 / 1,501 | 22,613 / 1,501 | 22,105 / 1,482 |
+
+* Resting depth is `torus_exec_resting_orders` (a gauge) on val0 over the load window. `torus_orders_resting_total`
+  is a cumulative counter (orders that ever rested: 0 -> 128.6M in P0), so it cannot show depth.
+* Accounts: P0 vs S changes only the genesis (1M vs 100k accounts). Every per-fill row is equal (save_books 0.217 vs
+  0.218 ms per 1k fills, engine 2.83 vs 2.89, CPU-s per 1M 23.16 vs 23.56), and matched/s is 2.9% higher. Blocks/s
+  (10.48 vs 13.33) and p50 (18.5 vs 14.6 ms) differ by the known block-regime spread of the standard cell (9.3-16.4
+  blocks/s in sections 94 / 95). The 1M accounts cost ~0.8 GB RSS per node (mean 4.6 vs 3.8 GB), as in section 93.
+* Depth: save_books per 1k fills rises with the mean resting depth, close to a straight line: +0.61 ms per 1k fills
+  per 1M resting orders (P0 -> P1M). That line predicts 0.55 at P250k (measured 0.576) and 0.72 at P500k (0.719).
+  Classic writes each touched book as a whole borsh blob, so the cost per touched book grows with that book's
+  depth. Blocks then grow ~3x (24k -> 64-74k fills per block), and the chain goes to the big-block regime at 250k
+  already. Engine work per fill stays the same or drops (2.83 -> 2.53 ms per 1k fills). The checkpoint settle
+  wait rises with depth as well (1.96 -> 23.71 ms per block), since the same blobs pass through the checkpoint
+  merge (96.3).
+* The depth curve is clear at n = 1 for 0 vs 1M. P0 -> P1M is -16.1% on matched/s, and P1M repeats 8f's M within
+  0.9% (221,362 vs 219,484; blocks/s 2.91 vs 2.98, save_books 78.9 vs 76.7 ms). Standard cells spread ~1-2% on
+  matched/s (section 95's four cells: 255.6-261.3k). P250k (-4.5%) and P500k (-7.5%) are monotone and outside that
+  spread, but each is one cell. 18c decides whether the middle points need replicates.
+* The P1M cell carried the perf windows (55 s of 600 s). Its matched/s is 0.9% above M's (no perf), so no visible cost.
+* Timeouts are small counts (1-7 per cell in the sweep) and do not order with depth at n = 1.
+
+### 96.3 save_books split at 1M (P1M, val1; `prof-ozarchy-8i-300m-P1M/`, `analyst/8i-prof-K3.txt`)
+
+The binary has no frame pointers (plain release; `.eh_frame` only), so the fp chains are garbage past the leaf.
+Dwarf unwinding (`dwarf,65528`, the maximum copy) gave no chain at all for 85% of the exec-thread samples (9,811 of
+11,500) and only the leaf for the rest: the exec thread's stack frames are larger than the copied stack. So the split uses leaf symbols and
+section 92's neighbour rule on the serial exec thread. In Classic (the default), `save_order_books` is one loop per
+native block: for each dirty market, `borsh::to_vec(book)`, `put_cf_raw_owned` into the pending overlay, then the
+journals are dropped (`discard_row_ops` / `discard_level_ops`). Its unique leaves are `<Order as BorshSerialize>::serialize`
+and `<OrderBook as BorshSerialize>::serialize`. A save span is a cluster of such samples with at most 3 other samples
+between two of them. Every sample from the first to the last of a cluster counts as save_books and is split by its
+leaf. The method finds one span per native block (75 spans / 74 blocks in W1, 89 / 90 in W2). The spans' samples
+add up to 94% / 93% of the `torus_exec_save_books_seconds` delta in the same window. The rest (kernel time, which
+`cycles:u` does not sample, and span edges) is shown as "not sampled". With 6 samples allowed between, every share
+moves by < 1 point. With 1, the spans break at memmove runs (189 / 199 spans) and lose 36-42% of the memmove samples,
+so 3 is used. The libc samples have no symbols (stripped local symbols). Their hot addresses (e.g.
+`0x1765a0-0x1765ca`, `0x17640d`) disassemble to the AVX2 4 x 32 B `vmovdqu` / `vmovdqa` copy loop of memmove.
+
+| part (leaf) | W1 (25 s, 74 blocks) ms per block | % | W2 (30 s, exec thread only, 90 blocks) ms per block | % |
+|---|---|---|---|---|
+| book row encode: `Order` / `OrderBook` borsh serialize | 60.5 | 73.1 | 60.7 | 73.0 |
+| encode, output Vec growth: libc memmove | 12.2 | 14.7 | 12.1 | 14.6 |
+| alloc / free (jemalloc, `rallocx`, `sdallocx`) | 2.4 | 2.9 | 2.1 | 2.5 |
+| drop the journals (`BTreeSet<u128>` / `<(u8, i128)>` `dying_next`) | 1.7 | 2.1 | 1.3 | 1.6 |
+| DB writes: pending-overlay put (`BTreeMap<Vec<u8>, Vec<u8>>::insert`) | 0.1 | 0.1 | 0.1 | 0.2 |
+| level hashing (Keccak) | 0.0 | 0.0 | 0.0 | 0.0 |
+| other (incl. kernel-ip skid samples) | 1.1 | 1.4 | 1.1 | 1.3 |
+| not sampled (kernel time, span edges) | 4.7 | 5.7 | 5.8 | 6.9 |
+| **total = `torus_exec_save_books_seconds` delta per native block** | **82.7** | 100 | **83.2** | 100 |
+
+* Encode is ~88% of save_books (serialize 73% + Vec growth 15%). The DB write is cheap because it only moves the
+  blob into the in-memory overlay. Classic has no level rows, so there is no level hashing in save_books (0 Keccak
+  samples in 164 spans). Keccak is 9.7-9.8% of all exec-thread samples, outside the spans (verify and the sort, as
+  in section 92).
+* The same blobs cost more off the exec thread (W1 leaves, not split further): the checkpoint-merge thread
+  (`merge_cf`, overlay `BTreeMap` insert / clone and unsymbolised libc, 1,761 samples ≈ 14% of a core) and the flush
+  worker (RocksDB `crc32c` 436 of 1,444 samples, memtable insert). On the exec thread this shows up as the
+  checkpoint settle wait (23.7 ms per block at P1M, 2.0 at P0).
+
+### 96.4 Crash-kill at 1M (CK: PRELOAD 1M, SIGKILL val1 at bench+300 s; `ozarchy-8i-300m-CK/`)
+
+| event (val1 log / sampler, UTC) | time after the kill |
+|---|---|
+| SIGKILL val1 (02:30:17.18; pre-kill counters: height 2,154, exec queue 64) | 0 |
+| restarted process up (crash-kill.sh) / "starting torus-node" | 1.0 s |
+| "crash recovery: execution gap detected": committed 2,220, applied marker 2,144, gap 76 | 6.6 s (open + books load) |
+| replay done, flush worker attached at applied 2,220 (76 blocks in 41.4 s, ~545 ms per block) | 48.0 s |
+| first commit on val1 (height 2,220, then 2,222) | 48.4 s |
+| val1 height = val0's (2,226 vs 2,225), exec queue back to 62 | ~50 s |
+
+* With 3 validators, the chain cannot commit without val1. Commits stop at 2,220, the committed height at the kill.
+  The survivors run their exec queue (~64 blocks) down to 2,220 by +20 s, then sit idle until val1 votes again at
+  +48 s. Catch-up after the first commit is therefore immediate: there is nothing to catch up, the chain waited.
+* matched/s on val0: -120..-60 s 228,094; -60..0 s 226,357; 0..+20 s 238,997 (queue drain); +20..+48 s 0;
+  0..+60 s 112,716; +48..+108 s 193,293; +60..+120 s 209,379; +120..+180 s 215,405; +180..+240 s 219,602;
+  +240..+283 s 226,359. Whole load 209,697 (P1M 221,362), i.e. ~28 s of zero fills and ~2 min of slower recovery.
+* Agreement: block hash equal on all 3 nodes at 3,593, one state digest on all 3 nodes (`a99ad5c1344d`, 4.7 / 5.0 /
+  4.7 s), 0 panic / fail-stop lines in the 3-node agreement scan. The restarted val1's md5 was `7f91438d` (memwatch).
+* Validity REJECT for three reasons. None of them is a fork. (1) Liveness FAIL: val0 / val2 had a 31 / 30 s commit
+  stall (the halt above; stall threshold 30 s), and "drain not established" follows from that FAIL in
+  `summarize.py`. (2) Crash gate FAIL, "rewind 12 blocks beyond the exec queue (max 2)": the gate was written for
+  the `TORUS_EXEC_PIPELINE` flip and allows the exec queue + 2. Here the applied marker (2,144) was 76 blocks behind
+  the committed height and 12 blocks behind the queue read just before the kill (smoke 2: marker 1,000, gap 130,
+  queue 65). (3) Crash gate "panic/fail-stop after the restart": a false positive. `crash-kill.sh`'s tail scan
+  counts the INFO config echo "running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false". run-cell's own
+  scan drops INFO lines (s83), and crash-kill.sh lacks that filter. The tools were not changed.
+* Against 8f's restarts after the load (SIGKILL 3.5 s to ready, section 93.5), a kill during the load at 1M costs
+  48 s: 6.6 s of boot and books load, then a 76-block replay of big blocks (~65k fills each).
+
+### 96.5 Limits
+
+* n = 1 per cell, one host, one run order (P0 -> P1M -> CK). Only P1M has a repeat (8f's M, within 1%).
+* The save_books split is a leaf + neighbour attribution, not a call graph. It covers user CPU only (6-7% of the
+  metric is not sampled). "Book row encode" here means Classic's whole-book borsh blob. Level-row modes (2 / 3)
+  were not measured.
+* The crash cell has one kill at one offset. The replay time depends on the exec backlog at the kill (64 blocks
+  here) and on the block size.
+
+### 96.6 Next
+
+* Owner / 18c: the deep-book cost is Classic's whole-book re-encode per touched book. It is ~73% borsh serialize
+  + ~15% Vec growth, grows linearly with resting depth, and is 83 ms per block at 1.6M resting. The DB write and
+  hashing are negligible inside save_books. Candidates: a level-row mode (`TORUS_BOOK_ROWS=3`, chunked digest,
+  O(touched chunks)) once the book mode is in genesis (plan 9.13), or, short of that, presizing the output Vec
+  (most likely the memmove 15%: `borsh::to_vec` grows the Vec by reallocation, and jemalloc copies large blocks). A 0 / 1M A/B on mode 3 would size the gain.
+* 18c: replicates of P250k / P500k only if the middle of the curve matters. 0 vs 1M is settled.
+* Tools (18c): `crash-kill.sh`'s tail scan needs run-cell's INFO filter. The crash gate's "exec queue + 2" rewind
+  bound fails on the code-default node (F on) at 1M (marker 12-65 blocks behind the queue read). Decide whether that
+  bound still applies, or whether the applied marker should keep closer.
+* Data: cells `~/bench-results-matched/ozarchy-8i-300m-{P0,P250k,P500k,P1M,CK}` (+ `.campaign.log`, `.cell.rc`),
+  smokes `ozarchy-8i-300m-smoke{,2}`. Driver, memwatch, perf sidecar and logs: `~/bench-results-matched/ozarchy-8i-b/`
+  (`campaign.sh`, `memwatch.sh`, `perf-sidecar.sh`, `campaign.log`, `mem-1hz-full.tsv`, `smoke.log`,
+  `smoke-try1.log`), profiles `ozarchy-8i-b/prof-ozarchy-8i-300m-P1M/` (`perf-w1.data`, `perf-w2.data`,
+  `perf-sidecar.log`, `prof-*` snapshots, `8i-prof-K{1,3,6}.json`), analysis `ozarchy-8i-b/analyst/`
+  (`8i-analyse.py`, `8i.txt`, `8i-cells.json`, `8i-prof.py`, `8i-prof-K{1,3,6}.txt`). Tools `ozarchy-8i-tools/`,
+  binaries `ozarchy-8f-stage/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
