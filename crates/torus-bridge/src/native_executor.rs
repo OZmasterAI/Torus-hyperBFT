@@ -627,6 +627,125 @@ pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
     on_by_default_flag("TORUS_SETTLE_DEFER_RESULTS", v)
 }
 
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, OFF by default): pure
+/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
+/// `false` = off; anything else is warned and off.
+#[doc(hidden)]
+pub fn parse_book_fast_encode(v: Option<&str>) -> bool {
+    let Some(v) = v else {
+        return false;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => true,
+        "" | "0" | "false" => false,
+        _ => {
+            tracing::warn!(
+                value = v,
+                "TORUS_BOOK_FAST_ENCODE: not empty, 1, true, 0 or false (any case); using the default (off)"
+            );
+            false
+        }
+    }
+}
+
+thread_local! {
+    /// 8k L3.3: [`with_book_fast_encode`]'s per-thread pin; `None` = the env.
+    static BOOK_FAST_ENCODE_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// 8k L3.3: Classic books encoded by `OrderBook::encode_classic` on this
+    /// thread (tests: proves the flag-on arm took the fast path).
+    static BOOK_FAST_ENCODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 8k L3.3: runs `f` with `TORUS_BOOK_FAST_ENCODE` pinned to `on` on this
+/// thread (tests and differential runs). The previous pin comes back when `f`
+/// returns or unwinds.
+#[doc(hidden)]
+pub fn with_book_fast_encode<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOOK_FAST_ENCODE_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(BOOK_FAST_ENCODE_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// 8k L3.3: Classic books this thread encoded with the fast encoder so far.
+#[doc(hidden)]
+pub fn book_fast_encodes_on_this_thread() -> u64 {
+    BOOK_FAST_ENCODES.with(std::cell::Cell::get)
+}
+
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE=1`, node-local, off by default): the
+/// Classic save encodes each dirty book with `OrderBook::encode_classic`
+/// (one allocation sized from the book's counts, one copy per resting order)
+/// instead of `borsh::to_vec` (1 KiB start, doubling: the blob is copied on
+/// every growth). Same bytes (proptest `classic_encode_tests`). The thread's
+/// pin if set, else the env read once per process.
+fn book_fast_encode_enabled() -> bool {
+    if let Some(on) = BOOK_FAST_ENCODE_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_book_fast_encode(std::env::var("TORUS_BOOK_FAST_ENCODE").ok().as_deref());
+        tracing::info!(on, "TORUS_BOOK_FAST_ENCODE: Classic book save exact-size encoder");
+        on
+    })
+}
+
+/// The Classic whole-book blob: `encode_classic` with the flag on, else
+/// today's `borsh::to_vec` (byte-identical).
+fn encode_classic_book(book: &OrderBook) -> std::io::Result<Vec<u8>> {
+    if book_fast_encode_enabled() {
+        BOOK_FAST_ENCODES.with(|c| c.set(c.get() + 1));
+        Ok(book.encode_classic())
+    } else {
+        borsh::to_vec(book)
+    }
+}
+
+#[cfg(test)]
+mod book_fast_encode_flag_tests {
+    use super::{
+        book_fast_encode_enabled, parse_book_fast_encode, with_book_fast_encode,
+        BOOK_FAST_ENCODE_PIN,
+    };
+
+    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    #[test]
+    fn parse_off_by_default() {
+        assert!(!parse_book_fast_encode(None));
+        for v in ["1", " 1", "1\n", "true", "TRUE", " True "] {
+            assert!(parse_book_fast_encode(Some(v)), "{v:?}");
+        }
+        for v in ["", " ", "0", "false", "FALSE", "2", "on", "yes", "01"] {
+            assert!(!parse_book_fast_encode(Some(v)), "{v:?}");
+        }
+    }
+
+    /// The pin wins over the env, nests, restores and stays on its thread.
+    #[test]
+    fn pin_overrides_nests_and_restores() {
+        let pin = || BOOK_FAST_ENCODE_PIN.with(|c| c.get());
+        assert_eq!(pin(), None);
+        assert_eq!(
+            book_fast_encode_enabled(),
+            parse_book_fast_encode(std::env::var("TORUS_BOOK_FAST_ENCODE").ok().as_deref())
+        );
+        with_book_fast_encode(true, || {
+            assert!(book_fast_encode_enabled());
+            with_book_fast_encode(false, || assert!(!book_fast_encode_enabled()));
+            assert_eq!(pin(), Some(true));
+            std::thread::spawn(move || assert_eq!(BOOK_FAST_ENCODE_PIN.with(|c| c.get()), None))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(pin(), None);
+    }
+}
+
 thread_local! {
     /// s58: [`with_settle_defer_results`]'s per-thread pin; `None` = the env.
     static SETTLE_DEFER_RESULTS_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
@@ -6957,7 +7076,7 @@ impl<T: StateBackend> NativeExecContext<T> {
             match self.book_mode {
                 BookMode::Classic => {
                     let key = market_id.to_be_bytes();
-                    match borsh::to_vec(&*book) {
+                    match encode_classic_book(book) {
                         Ok(data) => {
                             if let Err(e) =
                                 self.state.put_cf_raw_owned(CF_NATIVE_ORDER_BOOKS, &key, data)
@@ -7469,7 +7588,7 @@ impl<T: StateBackend> NativeExecContext<T> {
 
         if mode == BookMode::Classic {
             let key = market_id.to_be_bytes();
-            if let Ok(data) = borsh::to_vec(&*book) {
+            if let Ok(data) = encode_classic_book(book) {
                 if state.put_cf_raw(CF_NATIVE_ORDER_BOOKS, &key, &data).is_ok() {
                     written += 1;
                 }
