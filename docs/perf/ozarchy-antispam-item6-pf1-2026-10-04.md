@@ -14342,6 +14342,183 @@ Call (exec-path merge rule):
 | r3 | A | 0/0 | ACCEPT/AGREE/PASS | True | 260,734.2 | 11.557 | 21,531 | 81.8 | 16 / 848 | 23.30 | 6 | 5.66 [0.263] | 5.11 | 60.9 | 2.823 | 0.945 | 4,107 / 5,639 | 83:0/83:0/83:0 | 6,969 |
 | r3 | B | 0/0 | ACCEPT/AGREE/PASS | True | 265,034.9 | 16.769 | 15,339 | 57.0 | 13 / 531 | 23.44 | 0 | 3.37 [0.220] | 0.41 | 45.3 | 2.701 | 0.956 | 3,610 / 4,851 | 114:0/114:0/114:0 | 10,112 |
 
+## 95. Step 8h, RH4 GC cost at full load: main `687eac9e`, no retention vs `TORUS_RETENTION_BLOCKS=1000`, code defaults otherwise, standard unpaced load, 300 markets, 900 s cells, n = 2 (campaign ozarchy-p8h, archy, 2026-10-19)
+
+**At saturation the GC costs nothing per fill, but n = 2 cannot settle the block-rate and latency rows. Exec-thread
+on-CPU ms per 1k fills 2.829 -> 2.837 (B / A 1.0026 [0.9283, 1.0828]), CPU-s per 1M fills 23.83 -> 23.81 (0.9992
+[0.9484, 1.0526]), matched/s 257,139 -> 259,772 (1.0102 [0.8684, 1.1753]) and exec ms per 1k fills (0.9923) are
+unchanged. The GC pass itself takes 1.51 / 2.09 ms (r1 / r2) per native block on the consensus thread (~1 pass per
+block, 107 / 147 bodies per pass), ~19.5 ms per second of load, p99 ~11 ms. Hotstuff-algo busy goes 0.252 -> 0.269 in
+r1. The block rows split by pair. In r1 both cells ran the same block regime and B is not worse: native blocks/s
+12.61 -> 13.12 (1.0401), p50 15.0 -> 15.3 ms, p99 830 -> 793 ms, timeouts per 1,000 native blocks 0.325 -> 0.219. In
+r2, B ran the big-block regime for the whole load (9.32 blk/s, 28,034 fills per block) and A the small one (16.42,
+15,562). r2-B was already the slowest cell in minute 1 (8.5 blk/s against 9.5-10.9), before its first deleting pass
+(+90 s). Per-fill exec work is equal, so this is not section 91's mechanism. Arm means: blocks/s 14.52 -> 11.22, p50
+14.1 -> 20.4 ms, p99 715 -> 853 ms, timeouts per 1k 0.175 -> 0.176. Every paired CI spans 1 (blocks/s [0.016,
+36]), so no row is on the wrong side and the rule is formally met. But a 2-pair CI that wide shows nothing:
+the r2 split is the known regime spread (A alone ran 12.6-16.4 blk/s here and 9.7-11.8 in 8g). Disk: SST growth
+stops in B (cdb + state SST 0.200 -> ~0.000 GB/min per node; du 0.229 -> 0.058 GB/min, the rest is WAL). GC holds 3
+passes (`dispatch_behind`, r2-B, 1 per node), otherwise 0. Owner / 18c: one more A B B A (n = 4) settles the blocks/s
+and latency rows. The per-fill and CPU rows already show no cost.**
+
+Question (bench queue step 8h, owner s131): Q9 (section 88) ran paced at ~50k matched/s, below capacity, so it could
+not show the RH4 DA body GC's cost at saturation. RH4 is merged (main `687eac9e`; retention off by default, the GC runs
+only with `--retention-blocks`). Does `--retention-blocks=1000` (DA body GC window 1128, plus the state and block-tree
+pruners it turns on) cost anything on the standard unpaced load? Judge by the exec-path merge rule: native blocks/s,
+block p50 / p99 and timeouts per 1,000 blocks must not get worse in B.
+
+### 95.1 Setup
+
+One binary for both arms, built with the 8f / 8g recipe (`ozarchy-p8h-stage/build/build.sh`: plain release `--locked`,
+repo `.cargo/config` clang + mold, each package alone, inside a detach.sh unit) from a detached worktree
+(`wt/p8h-687eac9e`, clean after the build) with its own target dir (`~/.cargo-target-p8h`, reflink-seeded from
+`~/.cargo-target-p8g-b`). The node md5 was checked on all 3 nodes of every cell by the driver and again from the raw
+`node-environ-trie.txt`.
+
+| commit | node md5 | bench md5 | tx-flood md5 |
+|---|---|---|---|
+| main `687eac9e` | `f38d132e` | `c1210126` | `dd59d50d` |
+
+`687eac9e` contains main `25c5939f` (8g's A) but not `perf/exec-hash-once` (8g's B, not merged yet), so its exec
+thread is 8g's A.
+
+Arms: A = nothing set (archive, as every earlier cell). B = `TORUS_RETENTION_BLOCKS=1000` in the arm's env (run-cell
+`EXTRA_ENV`; `start-node.sh` passes `--retention-blocks=1000`). Both run the code defaults (PC 8, F on, trust cache on,
+re-send 250 ms). `env.sh` gives `TORUS_HASH_ONLY_PUSH_THRESHOLD=524288`, `TORUS_HEADER_RESEND_MS=250` and
+`TORUS_SHARD_CUSTODY=0`. D, M, T are unset (on); PE, KP, DB and `TORUS_DA_BODY_RETENTION` are absent, and
+`TORUS_RETENTION_BLOCKS` is absent on A, as the driver checked on every environ. Standard load (s127), unpaced:
+Classic, 15 s checkpoints, oracle on, 300 markets, rate 76,000, SENDERS 5,000, `BLOCK_CAP=400 RETRY_BUSY=1
+MAX_IN_FLIGHT=4 OPEN_ORDER_BUDGET=900 ORACLE_FEED=1 IN_FLIGHT_TAIL=commit CLOID_SHARE=0`, native only, default genesis
+(300 markets, 100,060 native balances, md5 `d694b81b`). 900 s cells: the senders' margin lasts ~21 min, and margin
+rejects were 0 in every cell.
+
+The tools were frozen from `687eac9e` (`ozarchy-p8h-tools/`, `FROZEN.txt`). Against 8g's copy, the harness adds the
+1M-account tooling (unused here) and RH4's `TORUS_RETENTION_BLOCKS` knob. The spec is `p8h-spec.json` (generator,
+8g's with one binary and B's env). The checks in `p8h-checks.sh` are 8g's renamed, plus three adapted from Q9:
+* `p8hretchk`: B has `--retention-blocks=1000` on every node cmdline and one `DA body GC on ... window=1128` log line
+  per node; A has neither.
+* `p8hgcchk`: B deleted bodies on every node; A deleted 0.
+* `p8hrejchk`: margin rejects (WARN above 2%, FAIL above 20%).
+
+Before the launch, `p8hretchk` and `p8hgcchk` failed on the B smoke read as arm A and on `ozarchy-q9-300m-r1-A` read
+as arm B, and passed on that Q9 cell as arm A. A sidecar ran Q9's 60 s per-node data-dir sampler (`p8h-sampler.py`,
+unit `p8hsampler-main`), writing to `ozarchy-p8h-run/p8h-samples/`.
+
+The smoke came first: B, 180 s so that it reaches the first GC pass, 264,858 matched/s, 174.6k bodies deleted per
+node. All checks were OK except two `expect` regexes: `687eac9e`'s harness prints the genesis line with
+`bulk_count=100000` (same md5) and `state_hash_activation` unquoted. The spec was fixed and both regexes were checked
+on the smoke's `run.log`. Then came warm-up w1 (A, 300 s, gated) and r1 A, B; r2 B, A, from 01:34 to 02:57. Data
+dirs were fresh every cell (`CLEAN=1`), with 79-85 GB free after each cell. No build or indexer ran (driver host
+lines: builds none). Swap held a static 1.57 GB from before the campaign; it did not grow.
+
+Validity: 5 / 5 cells rc 0, ACCEPT AGREE PASS, md5 `f38d132e` on 3 nodes, 0 panic / fail-stop lines (re-checked from
+raw files). The campaign logged 111 CHECK OK, 0 CHECK FAIL, 0 WARN, 0 CELL-FLAG and no reruns. Retention took effect
+on every B node (`TORUS_RETENTION_BLOCKS=1000` on 3 environs, 1 GC-on line per node) and on no A node.
+
+Window: the GC deletes nothing until `max(N, 1000) + 128` dispatched blocks. (Passes before that are timed too, all
+<= 0.1 ms, and delete nothing.) The B cell's first deleting pass is the first 1 Hz scrape with
+`torus_da_bodies_gc_deleted_total > 0` on all 3 nodes: load +82 s (r1) and +90 s (r2). Every row below is over load
++88..+902 s (r1) and +96..+902 s (r2), with the same offsets for both cells of a pair. Sources: 1 Hz `sampler.csv`
+(counters), `buckets.csv` (commit interval), `host-1hz.tsv` (process CPU ticks) and `metrics-1hz.txt.gz` (GC
+counters). Two rows are exceptions. Exec-thread on-CPU ms per 1k fills uses the whole load window, because schedstat
+is read only before and after the load. GC p99 uses the whole cell, because the `torus_da_gc_seconds` buckets are only
+in `metrics-after`.
+
+### 95.2 Arm means (n = 2 each, window after the first GC pass; `p8h.txt`)
+
+| arm | matched/s | native blk/s | fills / native blk | block p50 / p99 ms | timeouts per 1,000 native blocks | exec thread on-CPU ms / 1k fills | CPU-s / 1M | exec block_ms | exec ms / 1k fills | hotstuff-algo busy, whole load (r1 / r2) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | 257,139 | 14.517 | 18,038 | 14.1 / 715 | 0.175 | 2.829 | 23.83 | 69.4 | 3.851 | 0.252 / 0.257 |
+| B | 259,772 (+1.0%) | 11.219 | 23,861 | 20.4 / 853 | 0.176 | 2.837 | 23.81 | 91.1 | 3.821 | 0.269 / 0.259 |
+
+GC, B cells (node means; per pass = `torus_da_gc_seconds` sum / count):
+
+| cell | passes in window (per native blk) | ms per pass = per native blk | GC ms per s of load | p99 per pass (whole cell; max node) | slowest passes (bucket) | bodies deleted window / cell | per pass | held passes (3 nodes) |
+|---|---|---|---|---|---|---|---|---|
+| r1-B | 10,629 (0.996) | 1.506 / 1.499 | 19.7 | 10.9 ms (11.1) | val1: 1 pass in 102-205 ms; 2 in 25.6-51 ms | 1,132,269 / 1,229,015 | 107 | 0 |
+| r2-B | 7,494 (0.998) | 2.092 / 2.086 | 19.4 | 11.8 ms (11.8) | val1: 2 passes in 51-102 ms | 1,105,147 / 1,235,942 | 147 | 3 `dispatch_behind` (1 per node) |
+
+The cost per pass follows the bodies per block (bigger blocks in r2), so the GC costs about the same per second at
+either block rate: ~0.02 of the consensus thread. That fits hotstuff-algo busy +0.017 in r1 (+0.002 in r2, where
+bigger blocks cut the per-block consensus work). Q9 measured 0.18 ms per block paced at ~50k matched/s.
+
+Data-dir growth (p8h sampler, least squares over the window rows, GB/min per node, mean of 3 nodes and 2 cells; live
+du includes the WAL):
+
+| arm | consensus-db du | consensus-db SST | state DB du | state DB SST | WAL (cdb / state) | SST files at load end (cdb / state) | GB at load end (cdb / state) |
+|---|---|---|---|---|---|---|---|
+| A | 0.1196 | 0.1114 | 0.1096 | 0.0891 | 0.0082 / 0.0203 | 32-34 / 90-98 | 2.69-3.03 / 2.71-3.67 |
+| B | -0.0007 | -0.0002 | 0.0591 | 0.0007 | -0.0006 / 0.0582 | 8 / 56-76 | 1.22-1.34 / 2.03-2.30 |
+
+A's SST growth, 0.200 GB/min at ~15.4M fills per minute, is 13 MB per 1M fills (Q9: 14). B's SSTs are flat at full
+load, as they were in Q9 at 50k matched/s; B's remaining du growth is the state WAL, which goes away at shutdown
+(section 88).
+
+### 95.3 Paired B / A (geomean of per-pair ratios, 95% CI, 1 df: t = 12.7, so the CIs are wide)
+
+| metric | r1 / r2 | B / A |
+|---|---|---|
+| matched/s | 0.9983 / 1.0223 | 1.0102 [0.8684, 1.1753] |
+| native blk/s | 1.0401 / 0.5675 | 0.7683 [0.0164, 36.07] |
+| block p50 | 1.0171 / 1.9418 | 1.4053 [0.0231, 85.5] |
+| block p99 | 0.9553 / 1.5201 | 1.2051 [0.0630, 23.0] |
+| timeouts per 1,000 native blocks | 0.6730 / 5.2863 | 1.8862 [~0, ~9e5] |
+| exec thread on-CPU ms per 1k fills (whole load) | 1.0087 / 0.9965 | 1.0026 [0.9283, 1.0828] |
+| CPU-s / 1M fills | 1.0033 / 0.9951 | 0.9992 [0.9484, 1.0526] |
+| fills / native blk | 0.9598 / 1.8015 | 1.3149 [0.0241, 71.8] |
+| exec block_ms | 0.9612 / 1.7711 | 1.3047 [0.0269, 63.4] |
+| exec ms per 1k fills | 1.0015 / 0.9832 | 0.9923 [0.8825, 1.1157] |
+
+Timeouts: r1-A 3.3, r1-B 2.3, r2-B 1.0, r2-A 0.3 per node in the window (whole load 9 / 4 / 2 / 2). r2's ratio is 1.0
+against 0.3, a count too small to rank.
+
+Native blocks/s per minute (val0; GC starts in minute 2):
+* r1-A: 9.5 10.8 13.2 14.6 12.3 12.3 13.7 12.9 13.5 13.9 13.1 13.8 11.0 10.5 10.7
+* r1-B: 9.8 10.1 12.7 12.2 14.3 13.1 13.7 14.2 13.6 13.2 13.2 11.4 12.8 12.6 14.1
+* r2-B: 8.5 10.0 9.4 7.4 9.4 9.4 7.5 8.5 9.3 8.9 9.1 11.1 11.1 11.1 8.9
+* r2-A: 10.9 13.7 14.8 14.1 14.4 14.5 16.2 17.1 17.9 17.3 17.4 17.4 18.0 16.8 17.8
+
+w1 (A, 300 s) ran 10.3-13.4. matched/s held at 248-272k per minute in every cell. Run order shows no drift (w1 13,
+r1-A ~12.5, r1-B ~13, r2-B ~9.5, r2-A ~16 blk/s).
+
+Call (exec-path merge rule):
+* Exec-thread on-CPU per 1k fills, CPU-s per 1M fills, exec ms per 1k fills, matched/s: no cost (point estimates
+  within +/-1%, CIs span 1). The GC runs on the consensus thread, not the exec thread.
+* Native blocks/s, block p50 / p99: every CI spans 1, so formally not worse. Pair r1 (same regime) shows no cost
+  (+4.0% blk/s, p50 +1.7%, p99 -4.5%). Pair r2's gap is the block regime: B was in the big-block regime from minute
+  1, before its first deleting pass. n = 2 cannot separate a GC effect from the regime spread.
+* Timeouts per 1,000 native blocks: 0.175 A vs 0.176 B. Not worse.
+* Verdict: no measured cost per fill or per CPU, and the rule is met formally. For the block-rate and latency rows,
+  the evidence is r1 alone. One more A B B A would let the CIs say something.
+
+Not covered: the GC's tail decode with EVM txs (each pass decodes the 2-3 uncommitted tail blocks; this load is
+native only). Restarts and crash-kill with retention on are not covered either, nor custody on, nor a soak longer
+than 15 min (the SST count stays flat over 13.5 min of window, not proven for hours at full load).
+
+### 95.4 Next
+
+* Owner / 18c: retention 1000 shows no exec or CPU cost at saturation, and it removes SST growth. If the owner wants
+  the block-rate and latency rows resolved before turning retention on by default, run one more A B B A on the same
+  binary and tools (`ozarchy-p8h-tools`, regenerate with new labels).
+* The rare slow passes (one 102-205 ms on r1-B val1, two 51-102 ms on r2-B val1) are worth a look. They run inside
+  the commit dispatch on the consensus thread. A per-pass max gauge, or the GC's own log line above some threshold,
+  would show whether they line up with RocksDB stalls.
+* Data: `~/bench-results-matched/ozarchy-p8h-300m-{smoke-s0,w1,r1-A,r1-B,r2-B,r2-A}` (per cell `p8h-push.txt`,
+  `p8h-disk.txt`). Campaign files are in `ozarchy-p8h-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`), sampler
+  rows in `ozarchy-p8h-run/p8h-samples/`. Tools are in `ozarchy-p8h-tools/` (`p8h-spec.json`, `p8h-checks.sh`,
+  `p8h-sampler.py`, the generated driver, `FROZEN.txt`), binaries in `ozarchy-p8h-stage/` (`build/build.sh`,
+  `build/md5s.txt`, `build/md5s-driver.txt`, `build/build.log`). Analysis is in `ozarchy-p8h-run/analyst/`
+  (`p8h-analyse.py`, `p8h.txt`, `p8h-analyse.json`).
+
+### 95.5 Cells (`p8h.txt`; window after the first GC pass)
+
+| cell | arm | rc | valid/agree/live | md5 raw | matched/s | native blk/s | fills/blk | exec block_ms | block p50/p99 ms | CPU-s/1M | timeouts per 1k blk | exec on-CPU ms/1k fills (whole load) | whole-load matched/s / blk/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| r1 | A | 0 | ACCEPT/AGREE/PASS | True | 258,688 | 12.610 | 20,514 | 78.6 | 15.0 / 830 | 23.74 | 0.325 | 2.828 | 259,155 / 12.363 |
+| r1 | B | 0 | ACCEPT/AGREE/PASS | True | 258,243 | 13.116 | 19,689 | 75.6 | 15.3 / 793 | 23.81 | 0.219 | 2.853 | 258,835 / 12.831 |
+| r2 | B | 0 | ACCEPT/AGREE/PASS | True | 261,301 | 9.321 | 28,034 | 106.6 | 25.5 / 912 | 23.81 | 0.133 | 2.821 | 261,589 / 9.295 |
+| r2 | A | 0 | ACCEPT/AGREE/PASS | True | 255,589 | 16.424 | 15,562 | 60.2 | 13.1 / 600 | 23.92 | 0.025 | 2.830 | 256,922 / 15.962 |
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

@@ -360,6 +360,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per block), `torus_da_gc_held_passes` by reason (expect ~0 outside start-up), bodies deleted, SST / data-dir
    growth per arm. Not covered: the GC's tail decode with EVM txs (each pass decodes the 2-3 uncommitted tail blocks;
    the standard load is native only).
+   **Done s68 (ozarchy-p8h, main `687eac9e` node `f38d132e`, bench `c1210126`, A no retention vs B
+   `TORUS_RETENTION_BLOCKS=1000`, w1 then A B B A, 900 s; perf doc section 95).** All 5 cells AGREE, 111 CHECK OK, 0
+   FAIL; retention on in every B node only. Window after the first deleting pass (+82 / +90 s). No cost per fill:
+   exec-thread on-CPU ms per 1k fills 2.829 -> 2.837 (1.0026 [0.9283, 1.0828]), CPU-s per 1M 23.83 -> 23.81, matched/s
+   257,139 -> 259,772 (+1.0%, CI spans 1). GC 1.51 / 2.09 ms per native block (~1 pass per block, 107 / 147 bodies),
+   ~19.5 ms per s on the consensus thread, p99 ~11 ms, a few passes 51-205 ms; held passes 3 (`dispatch_behind`, r2-B)
+   else 0; SST growth A 0.200 -> B ~0 GB/min per node (du 0.229 -> 0.058, WAL). Block rows split by pair: r1 same
+   regime, B not worse (blk/s 12.61 -> 13.12, p50 15.0 -> 15.3, p99 830 -> 793 ms, timeouts per 1k 0.325 -> 0.219); r2-B
+   ran the big-block regime from minute 1, before its first deleting pass (9.32 vs 16.42 blk/s). Arm means blk/s 14.52
+   -> 11.22, p50 14.1 -> 20.4, p99 715 -> 853 ms, timeouts per 1k 0.175 -> 0.176; every CI spans 1 (formally met, but
+   n = 2 cannot separate GC from the regime spread). Owner / 18c: one more A B B A to settle the blocks/s and latency rows.
 8i. **Deep-book follow-up to 8f** (owner s131; after 8h; ~1 h 30-2 h, estimate; a pre-testnet check). Section 93's
    M cell changed two things at once (1M accounts and 1M resting orders), and restarts ran only after the load. Same
    node binary as 8f (main `76204a69`, md5 `7f91438d`) so the cells line up with section 93; tools `c2336e70` or
