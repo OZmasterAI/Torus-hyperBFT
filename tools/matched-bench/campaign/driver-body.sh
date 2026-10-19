@@ -820,58 +820,54 @@ preflight_genesis() { # the genesis inputs under run-cell.sh's repo root GENESIS
     return 0
 }
 
-deferred_readers() { # why the report scans must stay in-line: an in-line reader reads one of their outputs before
-    # the end pass fills it; empty = none does. The deferred outputs (log-scans.sh REPORT_SCANS) and what an in-line
-    # reader would see instead: summary.json .ingest.mempool_nonce_expired_evictions_per_node ([]), run.log's ingest
-    # line (the "ingest scan deferred" line), val<i>.log.excerpt (absent). The in-line readers of cell files:
-    #   expectations (spec-wide and per arm; expectchk counts grep -E lines): any on summary.json (a line count can
-    #     match the field's key, its [] or its value lines, so no regex is safe), any on an excerpt, a run.log one
-    #     that matches either form of the ingest line or names it (DEFER_WORDS)
-    #   the checks file (campaignchecks) and the analysis script(s) (cell_step: the cells.tsv metric, the analysis
-    #     json): one that names a deferred output (DEFER_WORDS)
-    # Checked, reads none: marketchk (summary.json cell.markets), warmgatechk and cell_step.py (validity, agreement,
-    # liveness, headline, crash, binaries), md5chk / envchk / sysctlchk / fdsum / savelog (their own files).
-    local i e f s DEFER_WORDS='excerpt|evict|ingest|nonce'
-    s=$( . "$TOOLS/log-scans.sh" && ingest_line 1234567 "0 0 0 " && ingest_line 1234567 "20812 1 300 " \
-        && ingest_line "" "0 0 0 ")
-    s=$(sed 's/^/[12:00:00] /' <<< "$s
-ingest scan deferred to the campaign end pass (DEFER_REPORT_SCANS=1; node log bytes 123 4567 89012; bench submitted=1234567 actions)
-ingest scan deferred to the campaign end pass (DEFER_REPORT_SCANS=1; node log bytes 0 0 0; bench submitted=? actions)")
+cmd_words() { # cmd_words CMD: CMD split as cell_step.py runs it (shlex.split), NUL-terminated words; rc 1 = it
+    # does not split (e.g. an unclosed quote)
+    python3 -I -c 'import shlex, sys
+sys.stdout.write("".join(w + "\0" for w in shlex.split(sys.argv[1])))' "$1" 2>/dev/null
+}
+
+deferred_readers() { # the in-line readers that keep the report scans in-line, one "<reader>;" line each; empty =
+    # none, the scans defer. The deferred outputs (log-scans.sh REPORT_SCANS, cell-endpass.sh): summary.json
+    # .ingest.mempool_nonce_expired_evictions_per_node ([] until the end pass), run.log's ingest line (the "ingest
+    # scan deferred" line until then), val<i>.log.excerpt (absent until then), deferred-scans.json (until then).
+    # No guessing which regex, check or script reads which of them (Codex P2s on 0f2ca85b and bcc95fab: sample
+    # lines and keyword tests missed valid readers, a quoted script path hid the script). A reader is:
+    #   any expectation (spec-wide or per arm) on one of those files, any checks file (campaignchecks), any
+    #   analysis.cmd (cell_step runs it in-line)
+    # Checked, reads none: marketchk (summary.json cell.markets), warmgatechk and cell_step.py (validity,
+    # agreement, liveness, headline, crash, binaries), md5chk / envchk / sysctlchk / fdsum / savelog (their own files).
+    local i
     for i in "${!EXP_FILE[@]}"; do
-        e="expectation '${EXP_RE[$i]}' (arm ${EXP_ARM[$i]}) reads ${EXP_FILE[$i]}"
-        case ${EXP_FILE[$i]} in
-            *.log.excerpt) echo "$e (log-excerpts);" ;;
-            summary.json|*/summary.json) echo "$e (ingest-evictions: .ingest.mempool_nonce_expired_evictions_per_node is [] until the end pass);" ;;
-            run.log|*/run.log)
-                # grep rc 1 = no sample line matches; 2 (a bad regex: expectchk fails it anyway) counts as a reader
-                grep -qE -- "${EXP_RE[$i]}" <<< "$s"; [ $? = 1 ] && ! grep -qiE "$DEFER_WORDS" <<< "${EXP_RE[$i]}" \
-                    || echo "$e's ingest line (ingest-evictions);" ;;
+        case ${EXP_FILE[$i]##*/} in
+            run.log|summary.json|*excerpt*|deferred-scans.json)
+                echo "expectation '${EXP_RE[$i]}' (arm ${EXP_ARM[$i]}) on ${EXP_FILE[$i]};" ;;
         esac
     done
-    [ -z "$CHECKS_SOURCE" ] || ! grep -qiE "$DEFER_WORDS" "$CHECKS_SOURCE" \
-        || echo "$CHECKS_SOURCE mentions excerpt / evict / ingest / nonce;"
-    for f in $ANALYSIS_CMD; do
-        case $f in */*.py|*/*.sh) ! grep -qiE "$DEFER_WORDS" "$f" 2>/dev/null \
-            || echo "analysis script $f mentions excerpt / evict / ingest / nonce;" ;; esac
-    done
+    [ -z "$CHECKS_SOURCE" ] || echo "checks file $CHECKS_SOURCE;"
+    [ -z "$ANALYSIS_CMD" ] || echo "analysis.cmd '$ANALYSIS_CMD';"
     return 0
 }
 
 preflight_post() { # what run-cell.sh in TOOLS supports: the end pass (DEFER_REPORT_SCANS) and genesis reuse
-    # (GENESIS_CACHE_DIR). An older frozen run-cell.sh has neither: the cells run as before
-    local f why
+    # (GENESIS_CACHE_DIR). An older frozen run-cell.sh has neither: the cells run as before. One PREFLIGHT NOTE
+    # names where the report scans run and why
+    local f why scans
     DEFER_SCANS=0; GENESIS_REUSE=0
     if grep -q 'DEFER_REPORT_SCANS' "$HARNESS" 2>/dev/null; then
         for f in "$TOOLS/log-scans.sh" "$ENDPASS"; do
             [ -f "$f" ] || PF "$f missing: $HARNESS needs it (copy it from tools/matched-bench into tools_dir)"
         done
-        why=$(deferred_readers)
+        scans=$(sed -n 's/^REPORT_SCANS="\(.*\)"$/\1/p' "$TOOLS/log-scans.sh")
+        why=$(deferred_readers | paste -sd' ')
         if [ -n "$why" ]; then
-            echo "PREFLIGHT NOTE: report-only scans stay in-line ($(sed -n 's/^REPORT_SCANS="\(.*\)"$/\1/p' \
-                "$TOOLS/log-scans.sh"); no end pass for them, run-cell.sh defers them together): $why"
+            echo "PREFLIGHT NOTE: report scans: in-line because ${why%;} ($scans; run-cell.sh defers them together)"
         else
             DEFER_SCANS=1
+            echo "PREFLIGHT NOTE: report scans: deferred to the campaign end pass ($scans; no expectation on run.log," \
+                "summary.json, an excerpt or deferred-scans.json, no checks file, no analysis.cmd)"
         fi
+    else
+        echo "PREFLIGHT NOTE: report scans: in-line because $HARNESS has no DEFER_REPORT_SCANS (an older run-cell.sh)"
     fi
     if grep -q 'GENESIS_CACHE_DIR' "$HARNESS" 2>/dev/null; then
         [ -f "$TOOLS/genesis_cache.py" ] || PF "$TOOLS/genesis_cache.py missing: $HARNESS needs it (copy it from tools/matched-bench into tools_dir)"
@@ -888,7 +884,7 @@ preflight_static() { # preflight_paths, then the spec checks (load_checks), from
 }
 
 preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
-    local f b node m tgt
+    local f b node m tgt words
     for f in "$HARNESS" "$DETACH" "$TOOLS/cell-step.sh" "$TOOLS/cell_step.py"; do [ -f "$f" ] || PF "$f missing"; done
     for f in pgrep zcat timeout; do command -v "$f" > /dev/null || PF "$f missing (the watchers use it)"; done
     if [ "$SAMPLERS" = 1 ]; then
@@ -916,7 +912,13 @@ preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5
             [ "$m" = "${BBMD5[$b]}" ] || PF "binary $b: bench-throughput md5 ${m:-missing} != staged ${BBMD5[$b]}"
         fi
     done
-    for f in $ANALYSIS_CMD; do case $f in */*.py|*/*.sh) [ -f "$f" ] || PF "analysis script $f missing";; esac; done
+    if [ -n "$ANALYSIS_CMD" ]; then  # its words as cell_step runs them (shlex.split: a quoted path is a path)
+        mapfile -d '' -t words < <(cmd_words "$ANALYSIS_CMD"; echo -n "rc=$?")
+        [ "${words[-1]:-}" = rc=0 ] || PF "analysis.cmd cannot be split as cell_step runs it (shlex.split): $ANALYSIS_CMD"
+        for f in "${words[@]:0:${#words[@]}-1}"; do
+            case $f in */*.py|*/*.sh) [ -f "$f" ] || PF "analysis script $f missing";; esac
+        done
+    fi
     return 0
 }
 
