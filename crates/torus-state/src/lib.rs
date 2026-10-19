@@ -7,6 +7,7 @@ pub mod block_body;
 pub mod cf;
 pub mod checkpoint_layer;
 pub mod corewriter_tx;
+pub mod da_gc_fence;
 pub mod db;
 pub mod erasure;
 pub mod error;
@@ -37,6 +38,7 @@ pub use db::{
     consensus_db_path, DbTuning, RocksdbHist, RocksdbHistograms, RocksdbRuntimeStats,
     RocksdbTickers, StateDb, CONSENSUS_DB_CFS, CONSENSUS_DB_DIR,
 };
+pub use da_gc_fence::DaGcFence;
 pub use error::StateError;
 pub use native_da::{
     DaGcHistory, DaGcHoldReason, DaGcLimits, DaGcOutcome, DaGcPassStats, DaReadTiming,

@@ -547,8 +547,9 @@ pub struct Metrics {
     /// (`cf_native_pending`) after leaving the retention window. Without the
     /// GC the store only grew.
     pub da_bodies_gc_deleted: Counter,
-    /// RH4, consensus thread: one DA body GC pass inside the commit dispatch
-    /// (record the height's row, delete aged bodies and shards: one batch).
+    /// RH4: one DA body GC pass (restore, record the height's row, delete
+    /// aged bodies and shards: one batch), on the GC worker thread (inside
+    /// the commit dispatch with `TORUS_DA_GC_INLINE=1`).
     pub da_gc_seconds: Histogram,
     /// RH4, `torus_da_gc_last_pass_max_seconds`: the longest DA body GC pass
     /// since the previous scrape (each scrape reads and resets it to 0). The
@@ -570,6 +571,25 @@ pub struct Metrics {
     /// cannot be read or decoded), `store_error` (the pass failed). The
     /// bodies stay; the next pass retries.
     pub da_gc_held_passes: Family<Vec<(String, String)>, Counter>,
+    /// RH4 GC worker, consensus thread: handing one dispatched height to the
+    /// DA body GC (`torus_da_gc_handoff_seconds`): building its job and the
+    /// non-blocking enqueue; with `TORUS_DA_GC_INLINE=1`, the whole pass.
+    pub da_gc_handoff_seconds: Histogram,
+    /// RH4 GC worker: dispatched heights waiting in its handoff queue.
+    pub da_gc_queue_depth: Gauge,
+    /// RH4 GC worker: the highest dispatched height minus the highest height
+    /// the worker finished (0 = caught up).
+    pub da_gc_lag_heights: Gauge,
+    /// RH4 GC worker: heights handed off while its queue was full (the
+    /// consensus thread never waits): their records are back-filled from the
+    /// block tree.
+    pub da_gc_coalesced_heights: Counter,
+    /// RH4 GC worker: due bodies a pass kept because a concurrent proposal
+    /// check or validation pinned them (`torus_state::DaGcFence`).
+    pub da_gc_fence_kept: Counter,
+    /// RH4 GC worker: hashes pinned against it by proposal checks and
+    /// validation (released once the worker passed their height).
+    pub da_gc_fence_pins: Gauge,
     /// PROFILER (s470): total resting orders across all books, sampled once per
     /// block right after the load/rebuild. Book-depth axis for the
     /// depth-vs-cost correlation (the funnel `orders_resting` counter is a
@@ -2263,7 +2283,8 @@ impl Metrics {
         let da_gc_seconds = Histogram::new(exponential_buckets(0.0001, 2.0, 15));
         registry.register(
             "torus_da_gc_seconds",
-            "Consensus thread: one DA body GC pass inside the commit dispatch (RH4)",
+            "One DA body GC pass (on its worker thread; inside the commit dispatch with \
+             TORUS_DA_GC_INLINE=1) (RH4)",
             da_gc_seconds.clone(),
         );
         let da_gc_last_pass_max = MaxSinceScrape::default();
@@ -2285,6 +2306,46 @@ impl Metrics {
             "DA body GC passes that deleted nothing, by reason (gap / backfilling / unrecorded / \
              pre_cursor / pruned_gap / dispatch_behind / tip_unreadable / tail_unreadable / store_error) (RH4)",
             da_gc_held_passes.clone(),
+        );
+        // 1 us .. 16 ms: a handoff is a job build and a try_send.
+        let da_gc_handoff_seconds = Histogram::new(exponential_buckets(0.000001, 2.0, 15));
+        registry.register(
+            "torus_da_gc_handoff_seconds",
+            "Consensus thread: handing one dispatched height to the DA body GC worker \
+             (the whole pass with TORUS_DA_GC_INLINE=1) (RH4)",
+            da_gc_handoff_seconds.clone(),
+        );
+        let da_gc_queue_depth = Gauge::default();
+        registry.register(
+            "torus_da_gc_queue_depth",
+            "Dispatched heights waiting in the DA body GC worker's queue (RH4)",
+            da_gc_queue_depth.clone(),
+        );
+        let da_gc_lag_heights = Gauge::default();
+        registry.register(
+            "torus_da_gc_lag_heights",
+            "Highest dispatched height minus the highest height the DA body GC worker finished (RH4)",
+            da_gc_lag_heights.clone(),
+        );
+        let da_gc_coalesced_heights = Counter::default();
+        registry.register(
+            "torus_da_gc_coalesced_heights",
+            "Heights handed to the DA body GC worker while its queue was full; back-filled from \
+             the block tree (RH4)",
+            da_gc_coalesced_heights.clone(),
+        );
+        let da_gc_fence_kept = Counter::default();
+        registry.register(
+            "torus_da_gc_fence_kept",
+            "Due DA bodies the GC worker kept because a concurrent proposal check or validation \
+             pinned them (RH4)",
+            da_gc_fence_kept.clone(),
+        );
+        let da_gc_fence_pins = Gauge::default();
+        registry.register(
+            "torus_da_gc_fence_pins",
+            "Hashes pinned against the DA body GC worker by proposal checks and validation (RH4)",
+            da_gc_fence_pins.clone(),
         );
 
         let exec_resting_orders = Gauge::default();
@@ -3103,6 +3164,12 @@ impl Metrics {
             da_gc_last_pass_max,
             da_gc_slow_passes,
             da_gc_held_passes,
+            da_gc_handoff_seconds,
+            da_gc_queue_depth,
+            da_gc_lag_heights,
+            da_gc_coalesced_heights,
+            da_gc_fence_kept,
+            da_gc_fence_pins,
             exec_resting_orders,
             exec_resident_rebuilds,
             exec_resident_rows,
@@ -3787,6 +3854,30 @@ mod tests {
     /// buckets topped out at 0.82 s and nothing showed which pass): the
     /// pass histogram reaches past 1 s, the longest pass since the previous
     /// scrape is a gauge that the scrape resets, and slow passes are counted.
+    /// RH4 GC worker: the consensus-side handoff cost, the queue depth and
+    /// lag, coalesced heights and the fence are exported.
+    #[test]
+    fn da_gc_worker_metrics_register() {
+        let m = Metrics::new();
+        m.da_gc_handoff_seconds.observe(0.000_02);
+        m.da_gc_queue_depth.set(3);
+        m.da_gc_lag_heights.set(5);
+        m.da_gc_coalesced_heights.inc();
+        m.da_gc_fence_kept.inc();
+        m.da_gc_fence_pins.set(7);
+        let text = m.encode();
+        for line in [
+            "torus_da_gc_handoff_seconds_count 1",
+            "torus_da_gc_queue_depth 3",
+            "torus_da_gc_lag_heights 5",
+            "torus_da_gc_coalesced_heights_total 1",
+            "torus_da_gc_fence_kept_total 1",
+            "torus_da_gc_fence_pins 7",
+        ] {
+            assert!(text.contains(line), "{line} missing:\n{text}");
+        }
+    }
+
     #[test]
     fn da_gc_slow_pass_metrics_register() {
         let m = Metrics::new();

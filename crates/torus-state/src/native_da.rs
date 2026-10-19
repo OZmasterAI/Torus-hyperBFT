@@ -327,6 +327,11 @@ pub struct DaGcOutcome {
     /// committed tip (the uncommitted tail) references them: the row went,
     /// the body (its reference and shards) stayed.
     pub tail_pinned: u64,
+    /// Bodies of due rows kept because the history's fence dropped them
+    /// right before the write ([`DaGcHistory::begin_delete`]: a concurrent
+    /// check pinned them for a block it is validating). The row went, the
+    /// body (its reference and shards) stayed, as for [`tail_pinned`](Self::tail_pinned).
+    pub fence_pinned: u64,
 }
 
 /// Where one GC pass spent its time and what it walked
@@ -437,6 +442,20 @@ pub trait DaGcHistory {
     /// a due row's body it references stays. An error (a tail block that
     /// cannot be read or decoded) holds the whole pass.
     fn uncommitted_hashes(&self) -> Result<Vec<B256>, StateError>;
+    /// Right before the pass writes its batch: `bodies` (`(hash, shard
+    /// count)`) are the due bodies it is about to delete. Drop the ones that
+    /// must stay after all and return how many were dropped
+    /// ([`DaGcOutcome::fence_pinned`]: the row goes, the body, its reference
+    /// and shards stay). Runs only when the pass deletes a body, and is then
+    /// followed by exactly one [`end_delete`](Self::end_delete) once the write
+    /// returned (landed or failed). A pass off the consensus thread fences
+    /// its deletes against concurrent body checks here
+    /// ([`crate::DaGcFence`]). Default: keep none.
+    fn begin_delete(&self, _bodies: &mut Vec<([u8; 32], u16)>) -> u64 {
+        0
+    }
+    /// The batch [`begin_delete`](Self::begin_delete) preceded returned.
+    fn end_delete(&self) {}
 }
 
 /// A history that knows no height: a gap in the GC bookkeeping holds every
@@ -974,6 +993,9 @@ impl NativeDaStore {
                 }
             }
         }
+        // The due bodies to delete, `(hash, shard count)`: added to the batch
+        // only after the history's fence saw them, right before the write.
+        let mut bodies: Vec<([u8; 32], u16)> = Vec::new();
         if hold.is_none() {
             if let Some(last_due) = due {
                 let t = Instant::now();
@@ -987,13 +1009,17 @@ impl NativeDaStore {
                     history,
                     &mut out,
                     stats,
+                    &mut bodies,
                 );
                 // `stats` goes into the walk (its tail read), so not `timed`.
                 stats.delete_scan += t.elapsed().saturating_sub(stats.tail_read - tail_before);
                 match rows? {
                     DueRows::Deleted(Some(frontier)) => next.frontier = frontier,
                     DueRows::Deleted(None) => {}
-                    DueRows::TailUnreadable => hold = Some(DaGcHoldReason::TailUnreadable),
+                    DueRows::TailUnreadable => {
+                        bodies.clear();
+                        hold = Some(DaGcHoldReason::TailUnreadable);
+                    }
                 }
             }
         }
@@ -1004,9 +1030,36 @@ impl NativeDaStore {
         if next != written {
             batch.put_cf(cf, DA_GC_STATE_KEY, next.encode());
         }
-        if !batch.is_empty() {
-            timed(&mut stats.write, || self.db.write(batch))?;
+        // Nothing fallible between the fence's begin and end but the write.
+        let shards_cf = if bodies.iter().any(|&(_, shards)| shards > 0) {
+            Some(self.db.cf_handle(CF_NATIVE_SHARDS)?)
+        } else {
+            None
+        };
+        let fenced = !bodies.is_empty();
+        if fenced {
+            out.fence_pinned = history.begin_delete(&mut bodies);
+            for (hash, shards) in &bodies {
+                batch.delete_cf(cf, hash);
+                batch.delete_cf(cf, da_gc_ref_key(hash));
+                if let Some(shards_cf) = shards_cf {
+                    for i in 0..*shards {
+                        batch.delete_cf(shards_cf, shard_key(hash, i));
+                    }
+                }
+                out.bodies_deleted += 1;
+                out.shard_keys_deleted += u64::from(*shards);
+            }
         }
+        let wrote = if batch.is_empty() {
+            Ok(())
+        } else {
+            timed(&mut stats.write, || self.db.write(batch))
+        };
+        if fenced {
+            history.end_delete();
+        }
+        wrote?;
         Ok(out)
     }
 
@@ -1167,10 +1220,12 @@ impl NativeDaStore {
     }
 
     /// Add the deletes of the rows in `[frontier, last_due]` to `batch`, within
-    /// `limits`: each listed body, its reference and its shards (bar the
-    /// hashes in `moved`, those the row's markers name and those the
-    /// history's uncommitted tail references), the row and its markers.
-    /// Returns the new frontier when any row went.
+    /// `limits`: the row and its markers; each listed body (bar the hashes in
+    /// `moved`, those the row's markers name and those the history's
+    /// uncommitted tail references) goes to `bodies` with the row's shard
+    /// count, its body, reference and shard deletes added by the caller once
+    /// the history's fence saw them. Returns the new frontier when any row
+    /// went.
     ///
     /// The tail ([`DaGcHistory::uncommitted_hashes`]) is read once, at the
     /// first due row (a pass with no due row reads nothing): a body a block
@@ -1188,9 +1243,9 @@ impl NativeDaStore {
         history: &dyn DaGcHistory,
         out: &mut DaGcOutcome,
         stats: &mut DaGcPassStats,
+        bodies: &mut Vec<([u8; 32], u16)>,
     ) -> Result<DueRows, StateError> {
         let cf = self.db.cf_handle(CF_NATIVE_PENDING)?;
-        let mut shards_cf = None;
         let start = da_gc_row_key(frontier);
         let mut opts = rocksdb::ReadOptions::default();
         opts.set_iterate_lower_bound(start.to_vec());
@@ -1239,8 +1294,8 @@ impl NativeDaStore {
                     }
                 },
             };
-            let bodies = row_hashes.len() / 32;
-            let row_deletes = bodies * (1 + usize::from(row_shards));
+            let listed = row_hashes.len() / 32;
+            let row_deletes = listed * (1 + usize::from(row_shards));
             if out.rows_deleted as usize >= limits.max_rows.max(1)
                 || (out.rows_deleted > 0 && deletes + row_deletes > limits.max_deletes)
             {
@@ -1248,10 +1303,7 @@ impl NativeDaStore {
                 out.backlog = true;
                 break;
             }
-            stats.bodies_scanned += bodies as u64;
-            if row_shards > 0 && shards_cf.is_none() {
-                shards_cf = Some(self.db.cf_handle(CF_NATIVE_SHARDS)?);
-            }
+            stats.bodies_scanned += listed as u64;
             take_da_gc_markers(&mut markers, batch, cf, h, &mut marked)?;
             for hash in row_hashes.chunks_exact(32) {
                 // Re-included at this pass's height: the new row owns it (and
@@ -1273,16 +1325,7 @@ impl NativeDaStore {
                     out.tail_pinned += 1;
                     continue;
                 }
-                batch.delete_cf(cf, hash);
-                batch.delete_cf(cf, da_gc_ref_key(hash));
-                if let Some(shards) = shards_cf {
-                    let hash: &[u8; 32] = hash.try_into().expect("32-byte chunk");
-                    for i in 0..row_shards {
-                        batch.delete_cf(shards, shard_key(hash, i));
-                    }
-                }
-                out.bodies_deleted += 1;
-                out.shard_keys_deleted += u64::from(row_shards);
+                bodies.push((hash.try_into().expect("32-byte chunk"), row_shards));
             }
             batch.delete_cf(cf, key);
             deletes += row_deletes;
@@ -2328,6 +2371,11 @@ mod tests {
         tail_fail: bool,
         /// How long reading the tail takes (slow-pass timing tests).
         tail_delay: std::time::Duration,
+        /// Bodies its fence drops from a pass's deletes.
+        fenced: Vec<B256>,
+        /// `begin_delete` / `end_delete` calls.
+        begun: std::cell::Cell<u32>,
+        ended: std::cell::Cell<u32>,
     }
 
     impl DaGcHistory for TestHistory {
@@ -2364,6 +2412,67 @@ mod tests {
             }
             Ok(self.tail.clone())
         }
+
+        fn begin_delete(&self, bodies: &mut Vec<([u8; 32], u16)>) -> u64 {
+            assert_eq!(self.begun.get(), self.ended.get(), "begin without end");
+            self.begun.set(self.begun.get() + 1);
+            let before = bodies.len();
+            bodies.retain(|(h, _)| !self.fenced.iter().any(|f| f.0 == *h));
+            (before - bodies.len()) as u64
+        }
+
+        fn end_delete(&self) {
+            self.ended.set(self.ended.get() + 1);
+            assert_eq!(self.begun.get(), self.ended.get(), "end without begin");
+        }
+    }
+
+    /// RH4 GC worker: right before its write a pass hands its due bodies to
+    /// the history's fence, which drops the ones a concurrent check pinned:
+    /// the row goes, those bodies (and their references) stay, counted as
+    /// `fence_pinned`; the others go. `end_delete` follows once the write
+    /// returned, also when it failed; a pass that deletes no body calls
+    /// neither. A kept body follows its later re-inclusion's window.
+    #[test]
+    fn gc_keeps_the_bodies_the_fence_drops() {
+        const W: u64 = 4;
+        let (dir, store) = temp_store();
+        let (x, y) = (dummy_action(1), dummy_action(2));
+        let (hx, hy) = (compute_action_hash(&x), compute_action_hash(&y));
+        store.put_batch(&[x.clone(), y.clone()]).unwrap();
+        let mut hist = history(&[(10, vec![hx, hy])]);
+        for h in 10..=13 {
+            let hashes = hist.known.get(&h).cloned().unwrap_or_default();
+            gc_h(&store, h, &hashes, W, &hist);
+        }
+        assert_eq!(hist.begun.get(), 0, "nothing due, no fence call");
+        // The failed write of the due pass still ends the fence.
+        drop(store);
+        {
+            let ro = NativeDaStore::new(StateDb::open_read_only(dir.path()).unwrap());
+            assert!(ro
+                .gc_committed_with_history(14, Some(&[]), 0, W, UNCAPPED, LIMITS, &hist)
+                .is_err());
+            assert_eq!((hist.begun.get(), hist.ended.get()), (1, 1));
+        }
+        let store = NativeDaStore::new(StateDb::open(dir.path()).unwrap());
+        hist.fenced = vec![hx];
+        let out = gc_h(&store, 14, &[], W, &hist);
+        assert_eq!(
+            (out.rows_deleted, out.bodies_deleted, out.fence_pinned, out.hold_reason),
+            (1, 1, 1, None)
+        );
+        assert_eq!((hist.begun.get(), hist.ended.get()), (2, 2));
+        assert!(present(&store, &x), "fenced: stays");
+        assert!(!present(&store, &y), "not fenced: goes");
+        // The pinning block (16) commits: its record owns x for its window.
+        hist.fenced.clear();
+        for tip in 15..=16 + W {
+            let hashes = if tip == 16 { vec![hx] } else { vec![] };
+            gc_h(&store, tip, &hashes, W, &hist);
+            assert_eq!(present(&store, &x), tip < 16 + W, "x (pinned by 16) at {tip}");
+        }
+        assert_eq!(bookkeeping_keys(&store), 1, "only the GC state key remains");
     }
 
     fn history(rows: &[(u64, Vec<B256>)]) -> TestHistory {
