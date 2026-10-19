@@ -1,0 +1,4 @@
+val0 data_bytes=612314945
+val1 data_bytes=614342484
+val2 data_bytes=612498950
+free_gb_after=105

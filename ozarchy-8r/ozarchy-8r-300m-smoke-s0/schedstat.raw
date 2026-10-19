@@ -1,0 +1,36 @@
+before val0 main 798496 3781654129 3279413 2901
+before val0 hotstuff-algo 799054 904301464 9015194 2784
+before val0 torus-execution 799012 256819122 5198094 629
+before val0 torus-flush-worker -
+before val1 main 798539 3273349307 1546720 2898
+before val1 hotstuff-algo 798988 928717739 11834956 2881
+before val1 torus-execution 798962 262355420 6611333 703
+before val1 torus-flush-worker -
+before val2 main 798582 3374358536 2656013 2701
+before val2 hotstuff-algo 799046 942195848 9552205 2882
+before val2 torus-execution 798997 267323779 1970281 702
+before val2 torus-flush-worker -
+bench_end val0 main 798496 3781654129 3279413 2901
+bench_end val0 hotstuff-algo 799054 47950952992 6022920565 38931
+bench_end val0 torus-execution 799012 132767038166 6829508350 40557
+bench_end val0 torus-flush-worker -
+bench_end val1 main 798539 3273349307 1546720 2898
+bench_end val1 hotstuff-algo 798988 48435936335 5983216547 38959
+bench_end val1 torus-execution 798962 133115665937 6665543883 39496
+bench_end val1 torus-flush-worker -
+bench_end val2 main 798582 3374358536 2656013 2701
+bench_end val2 hotstuff-algo 799046 48775681049 6457993400 39099
+bench_end val2 torus-execution 798997 134878224802 7097629272 40515
+bench_end val2 torus-flush-worker -
+after val0 main 798496 3781654129 3279413 2901
+after val0 hotstuff-algo 799054 48715719413 6035754269 41484
+after val0 torus-execution 799012 133843073400 6841984788 41392
+after val0 torus-flush-worker -
+after val1 main 798539 3273349307 1546720 2898
+after val1 hotstuff-algo 798988 49205747562 5993458263 41419
+after val1 torus-execution 798962 133822630797 6670921946 40459
+after val1 torus-flush-worker -
+after val2 main 798582 3374358536 2656013 2701
+after val2 hotstuff-algo 799046 49539291129 6471991359 41758
+after val2 torus-execution 798997 135480427124 7102547473 41285
+after val2 torus-flush-worker -

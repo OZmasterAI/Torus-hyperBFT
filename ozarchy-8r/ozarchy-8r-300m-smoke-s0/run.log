@@ -1,0 +1,89 @@
+[22:49:52] cell=ozarchy-8r-300m-smoke-s0 worktree=/home/oz/projects/wt/8r-a0181b8b markets=300 dur=180s rate=76000 senders=5000 block_cap='400' mps='unset' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' antispam='unset' spam_cancel_keys='unset' spam_cancel_rate='unset' spam_cancel_funded='unset' cancel_by_id='unset' modify='unset' cloid_share='0' bulk_count=100000 preload='off' extra_env='TORUS_ROCKSDB_PIPELINED_WRITE= TORUS_RESIDENT_BOOKS= TORUS_NATIVE_ROOT_CACHE= TORUS_PARALLEL_SETTLE= TORUS_PARALLEL_BUCKET_HASH= TORUS_BUCKET_MEMBER_CACHE_MB= TORUS_BOOK_ROWS= TORUS_ROCKSDB_STATS=2 TORUS_ROCKSDB_STATS_INTERVAL_SECS=1 TORUS_SHARD_CUSTODY=0 TORUS_RETENTION_BLOCKS=1000'
+[22:49:52] drain_timeout=780s digest_par=8 rpc_timeout=60s
+[22:49:52] block-cap bundle (BLOCK_CAP=400, BATCH=400): TORUS_NATIVE_TOTAL_BLOCK_CAP=400 TORUS_NATIVE_ORDERS_PER_BLOCK_CAP=200000 TORUS_VERIFIED_SENDER_CACHE_CAP=64000 TORUS_NATIVE_BLOCK_BYTES_CAP=12000000
+[22:49:52] oracle feed ON: price=30000 walk_bp=0 shock_bp=0 shock_round=0 interval=2000ms markets=300 keys=/home/oz/bench-results-matched/ozarchy-8r-tools/devnet/wsl/bench-validator-keys.json fresh_timeout=90s
+[22:49:52] worktree commit=a0181b8bf90c6f4b55d5936d146d51e559e36103 dirty_files=0
+[22:49:53] torus-node md5 src=94053e26bad87a43845cddb509800d62 (/home/oz/bench-results-matched/ozarchy-8r-stage/a/release/torus-node, mtime 2026-10-19T22:48:07) expected 94053e26bad87a43845cddb509800d62
+[22:49:53] torus-node md5 dst=94053e26bad87a43845cddb509800d62 (/home/oz/projects/wt/8r-a0181b8b/target/release/torus-node)
+[22:49:53] bench-throughput md5=7dac5c5c75e757d6a68fe9fb6ba07e16 (/home/oz/bench-results-matched/ozarchy-8r-stage/a/release/bench-throughput, mtime 2026-10-19T22:48:25) expected 7dac5c5c75e757d6a68fe9fb6ba07e16
+[22:49:53] genesis cache: no cache entry for key 75c433385a2e3139966a in /home/oz/bench-results-matched/ozarchy-8r-run/campaign/smoke/genesis-cache -> building
+[22:49:53] generating 300-market 3-val genesis -> /home/oz/projects/wt/8r-a0181b8b/devnet/wsl/genesis-3val.json
+reusing existing /home/oz/bench-results-matched/ozarchy-8r-tools/testnet/genesis-weighted-full.json (BULK_COUNT=100000)
+wrote /home/oz/projects/wt/8r-a0181b8b/devnet/wsl/genesis-3val.json
+  timeout_ms = 1200
+  evm_block_interval = 11
+  state_hash_activation = off
+  chain_id   = 7778
+  validators = 3  (0x8c3229ec621644789d7f61faa82c6d0e5f97d43d 0x9586a4833970847aef259ad5bfb7aa8901ddf746 0x0e9971c0005d91336c1441b8f03c1c4fe5fb4584 )
+  native_bal = 100060
+  bulk_count = 100000
+  accounts   = 100052
+  markets    = 300
+  perm_stakes= 10
+[22:49:58] genesis timeout_base_ms=1200
+[22:49:58] genesis evm.block_interval=11 (absent: node default)
+[22:49:59] genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830
+[22:49:59] genesis built (key 75c433385a2e3139966a, md5 d694b81b3dd75b3dc24aaa9a730b9830); cached in /home/oz/bench-results-matched/ozarchy-8r-run/campaign/smoke/genesis-cache
+[22:49:59] MAX_IN_FLIGHT=4: TORUS_RPC_MAX_RESPONSE_MB=64 on the nodes (loaded torus_getBlockBody replies pass the 10 MiB default)
+[22:49:59] node env: {"TORUS_BOOK_ROWS": "", "TORUS_BUCKET_MEMBER_CACHE_MB": "", "TORUS_COMMIT_LAG_BACKOFF_CAP": "8", "TORUS_NATIVE_BLOCK_BYTES_CAP": "12000000", "TORUS_NATIVE_ORDERS_PER_BLOCK_CAP": "200000", "TORUS_NATIVE_ROOT_CACHE": "", "TORUS_NATIVE_TOTAL_BLOCK_CAP": "400", "TORUS_PARALLEL_BUCKET_HASH": "", "TORUS_PARALLEL_SETTLE": "", "TORUS_RESIDENT_BOOKS": "", "TORUS_RETENTION_BLOCKS": "1000", "TORUS_ROCKSDB_PIPELINED_WRITE": "", "TORUS_ROCKSDB_STATS": "2", "TORUS_ROCKSDB_STATS_INTERVAL_SECS": "1", "TORUS_RPC_MAX_RESPONSE_MB": "64", "TORUS_SHARD_CUSTODY": "0", "TORUS_VERIFIED_SENDER_CACHE_CAP": "64000"}
+CLEAN=1 — wiping data dirs for fresh genesis init
+starting val0  rpc=8645 p2p=30401 metrics=9161 (log: truncate)
+starting val1  rpc=8646 p2p=30402 metrics=9162 (log: truncate)
+starting val2  rpc=8647 p2p=30403 metrics=9163 (log: truncate)
+
+launched pids: 798496 798539 798582 
+logs:          /home/oz/torus-wsl-devnet/run/val{0,1,2}.log
+rpc:           http://localhost:8645 http://localhost:8646 http://localhost:8647
+metrics:       9161 9162 9163
+run health-3val.sh in ~40s to confirm idle block production.
+[22:50:01] node pids: 798496 798539 798582
+[22:50:01] per-node TORUS_* env digest(s): 1c812ba2  (must be a single value)
+[22:50:01] waiting for health (all 3 committing, peers>=2, timeout 240s)
+[22:50:06] healthy after 7s
+[22:50:16] idle blk/s (val0, 10s, probe 1) = 26.20
+[22:50:16] oracle marks before the feed: usable=0/300 head=300
+[22:50:16] oracle feed: /home/oz/bench-results-matched/ozarchy-8r-stage/a/release/bench-throughput oracle-feed --rpc-urls http://127.0.0.1:8645,http://127.0.0.1:8646,http://127.0.0.1:8647 --validator-keys /home/oz/bench-results-matched/ozarchy-8r-tools/devnet/wsl/bench-validator-keys.json --markets 300 --price 30000 --interval-ms 2000 --stats-file /home/oz/bench-results-matched/ozarchy-8r-300m-smoke-s0/oracle-feed-stats.json
+[22:50:16] oracle feed pid 800566; waiting for fresh marks on all 300 markets (aggregate block > 300, timeout 90s)
+[22:50:22] oracle marks fresh on all 300 markets after 6s: {"since_height": 300, "markets": 300, "checked": 300, "usable": 300, "fresh": 300, "errors": 0, "head": 400, "oldest_usable_agg_block": 400, "max_agg_age_blocks": 0, "not_fresh_ids": []}
+[22:50:26] bench: /home/oz/bench-results-matched/ozarchy-8r-stage/a/release/bench-throughput consensus --rpc-urls http://127.0.0.1:8645,http://127.0.0.1:8646,http://127.0.0.1:8647 --econ --senders 5000 --sender-offset 60 --markets 300 --batch-size 400 --submit-batch 1 --format bin --concurrency 256 --duration 180 --target-margin 1500 --cross-fraction 0.5 --cancel-fraction 0.05 --band 5 --rate-total 76000 --open-order-budget 900 --retry-busy --max-in-flight 4 --in-flight-watch-rpc http://127.0.0.1:8647 --in-flight-tail commit --cloid-share 0
+[22:53:31] bench exited rc=0 after 183s
+[22:53:31] oracle marks at bench end: {"since_height": 300, "markets": 300, "checked": 300, "usable": 300, "fresh": 300, "errors": 0, "head": 2600, "oldest_usable_agg_block": 2600, "max_agg_age_blocks": 0, "not_fresh_ids": []}
+[22:53:31] oracle feed paused (SIGSTOP) for drain + digest
+[22:53:31] draining (quiet counters, no pending work, per-node commit progress for 10s; timeout 780s)
+{"drained": true, "reason": "quiet and advancing", "quiet_elapsed_s": 10.053336273995228, "elapsed_s": 10.068484491028357, "quiet_s": 10.0, "timeout_s": 780.0}
+[22:53:41] drained=1 after 12s (evidence: drain.json and drain-samples.jsonl)
+[22:53:45] heights after drain: 2948 2947 2948 (spread 1); comparing block 2942 on all nodes
+[22:53:45] state digest: 300 markets + 50 accounts + 0 position accounts, 3 nodes CONCURRENTLY (par=8/node, rpc timeout 60s), heights 2978 2977 2978
+[22:53:54] state digest done in 9s wall (per node: 9.1 9.3 8.7 s), quiescent=1
+[22:53:54] oracle feed pid 800566 stopped rc=0
+[22:53:54] oracle feed: oracle_feed=1 {"sent":588,"accepted":588,"rejected":0,"last_error":""} stale_marks_at_bench_end=0 fresh_after_s=6
+{"node":"val0","height":2948,"cmp_height":2942,"block_hash":"0xa1125ecb7cea1df538739370f1d9b8fb489324c11767aea31a44ce7a73ede9c4","header_state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","state_digest":"4970aef187850dcca0bc2496f0be2aae3c303314f9f7b14a4088abcb7a3ab056","digest_height":2978,"digest_seconds":9.1,"matched":49888479,"placed":65753494,"resting":40065741,"actions":264084,"resident_rebuilds":1,"panic_or_failstop_lines":0,"error_lines":0}
+{"node":"val1","height":2947,"cmp_height":2942,"block_hash":"0xa1125ecb7cea1df538739370f1d9b8fb489324c11767aea31a44ce7a73ede9c4","header_state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","state_digest":"4970aef187850dcca0bc2496f0be2aae3c303314f9f7b14a4088abcb7a3ab056","digest_height":2977,"digest_seconds":9.3,"matched":49888479,"placed":65753494,"resting":40065741,"actions":264084,"resident_rebuilds":1,"panic_or_failstop_lines":0,"error_lines":0}
+{"node":"val2","height":2948,"cmp_height":2942,"block_hash":"0xa1125ecb7cea1df538739370f1d9b8fb489324c11767aea31a44ce7a73ede9c4","header_state_root":"0x0000000000000000000000000000000000000000000000000000000000000000","state_digest":"4970aef187850dcca0bc2496f0be2aae3c303314f9f7b14a4088abcb7a3ab056","digest_height":2978,"digest_seconds":8.7,"matched":49888479,"placed":65753494,"resting":40065741,"actions":264084,"resident_rebuilds":1,"panic_or_failstop_lines":0,"error_lines":0}
+[22:53:58] ingest: bench submitted=263496 actions; mempool nonce-expired evictions per node: 0 0 0 
+stopping pid 798496
+stopping pid 798539
+stopping pid 798582
+stopped.
+[22:54:03] dissemination/pacing log counts: val0:manifest=231,body_push=92,body_push_max_bytes=521073,exhausted=0,sync_fallback=0,da_outbound_fail=0,starvation=0,pacing=0 val1:manifest=239,body_push=133,body_push_max_bytes=492962,exhausted=0,sync_fallback=0,da_outbound_fail=0,starvation=0,pacing=0 val2:manifest=261,body_push=101,body_push_max_bytes=513593,exhausted=0,sync_fallback=0,da_outbound_fail=0,starvation=0,pacing=0
+SUMMARY ozarchy-8r-300m-smoke-s0: matched/s avg=270760.9 first120=271349.1 best60=284078.9 placed/s=356904.3 blk/s=10.7 txs/blk=113.9 timeouts=1.0 dissem_clean=True agree=AGREE (True) resident_rebuilds=[1, 1, 1] digest_s=[9.1, 9.3, 8.7] drained=True bench_rc=0
+VALIDITY ozarchy-8r-300m-smoke-s0: ACCEPT liveness=PASS reasons=[]
+PHASE val0: block_ms=79.13 wall/committed(load)=93.3 (incl_drain=84.1) evm=0.0(0.0%) verify=4.77(6.0%) replay_guard=1.05(1.3%) load_books=0.14(0.2%) engine=63.43(80.2%) action_status=0.13(0.2%) save_books=4.69(5.9%) flush=0.0(off-chain) body_persist=0.0(0.0%) end_resident=7.95(off-chain) end_resident_wait=1.69(2.1%) checkpoint_settle_wait=1.81(2.3%) checkpoint_upkeep=0.93(1.2%) residual_untimed=0.48(0.6%)
+ORDER_AGE val0 (ms p50/p90/p99): admit=185.3/1154.9/2298.1 commit=1586.1/4601.1/9139.5 exec=4306.0/8895.9/10224.8 durable=9929.0/18318.6/20263.9 fills_visible=-
+ORDER_AGE val1 (ms p50/p90/p99): admit=205.1/1191.8/2337.5 commit=1583.2/4592.2/9122.4 exec=4268.2/8892.6/10227.1 durable=9792.4/18257.3/20257.7 fills_visible=-
+ORDER_AGE val2 (ms p50/p90/p99): admit=277.1/1178.5/2333.2 commit=1580.6/4592.4/9129.0 exec=4822.4/9259.9/14949.2 durable=11235.2/18631.0/20295.1 fills_visible=-
+CHAIN val0: chain_ms=79.1 (p50=7.5 p95=407.6) gap_to_100ms=-20.9 pipelined_ms=6.56 handoff_wait_ms=0.02 worker=True empty_block_ms=0.03 | fills/blk=21709.5 engine_ms/1k_fills=2.92 | LOAD native_blk/s=10.716 empty_blk/s=0.0 commit_ms avg/p50/p95=91.4/15.3/506.8 | save_books=4.69(drain=0.0 write=0.0) | identity covers_e=True le_block=True chain-e_phases=3.2
+ENGINE val0: total=63.43 = phase1_actions=3.85 margin=17.91 match=7.19 settle=25.74(passA=4.23 passB=11.97 cache_flush=9.03) tail=5.06 untimed=3.68
+CONSENSUS val0 (whole run): view_ms=81.4 views=2473.0 views/committed=1.0 | propose delay=16.16 build=15.87 finalize=0.29 qc_collect=75.15 | arrival=38.38 insert_persist=9.11 vote_delay=7.82 | commit_persist=4.09 block_build=15.7 validate=3.02(decode=0.01 da=6.68 attest=None custody=0.0) on_committed=14.93 mempool_rm=4.7 | thread_est/view=11.46 /committed=11.46 | sched hotstuff-algo on_cpu/blk=23.991 rq_wait/blk=3.067
+CONSENSUS val0 (LOAD window): view_ms=91.4 views=2006.0 views/committed=1.023 | arrival=39.6 propose delay=19.9 build=19.55 qc_collect=83.12 insert_persist=10.86
+VIEW_TIMEOUTS val0 (LOAD window): views=2006.0 entered_past_deadline=0.0 slack_ms=1753.81 timeout_after_ms=1228.0 n=1.0 | no_proposal=0.0 no_vote=0.0 after_vote=1.0 leader=0.0 uncertified=0.0
+BLOCK_BUILD val0 (LOAD window): total=19.36 (parent=0.01 select=9.91 mirror=7.64 attest=1.71 encode=0.1) n=669.0
+CONSENSUS val1 (whole run): view_ms=81.4 views=2473.0 views/committed=1.0 | propose delay=16.75 build=16.66 finalize=0.09 qc_collect=48.0 | arrival=36.52 insert_persist=10.15 vote_delay=9.72 | commit_persist=4.17 block_build=16.5 validate=3.0(decode=0.01 da=7.11 attest=None custody=0.0) on_committed=16.36 mempool_rm=4.99 | thread_est/view=12.35 /committed=12.35 | sched hotstuff-algo on_cpu/blk=24.251 rq_wait/blk=3.048
+CONSENSUS val1 (LOAD window): view_ms=91.4 views=2006.0 views/committed=1.024 | arrival=37.49 propose delay=20.61 build=20.5 qc_collect=49.98 insert_persist=12.13
+VIEW_TIMEOUTS val1 (LOAD window): views=2006.0 entered_past_deadline=0.0 slack_ms=1753.97 timeout_after_ms=1220.78 n=1.0 | no_proposal=0.0 no_vote=0.0 after_vote=1.0 leader=0.0 uncertified=0.0
+BLOCK_BUILD val1 (LOAD window): total=20.33 (parent=0.01 select=10.45 mirror=7.96 attest=1.83 encode=0.09) n=669.0
+CONSENSUS val2 (whole run): view_ms=81.4 views=2473.0 views/committed=1.0 | propose delay=17.87 build=17.72 finalize=0.15 qc_collect=48.11 | arrival=28.23 insert_persist=10.29 vote_delay=10.31 | commit_persist=4.35 block_build=17.52 validate=3.03(decode=0.0 da=7.07 attest=None custody=0.0) on_committed=29.87 mempool_rm=3.82 | thread_est/view=12.82 /committed=12.81 | sched hotstuff-algo on_cpu/blk=24.417 rq_wait/blk=3.292
+CONSENSUS val2 (LOAD window): view_ms=91.4 views=2006.0 views/committed=1.024 | arrival=26.82 propose delay=22.01 build=21.83 qc_collect=51.25 insert_persist=12.32
+VIEW_TIMEOUTS val2 (LOAD window): views=2006.0 entered_past_deadline=0.0 slack_ms=1753.65 timeout_after_ms=None n=0.0 | no_proposal=0.0 no_vote=0.0 after_vote=0.0 leader=0.0 uncertified=0.0
+BLOCK_BUILD val2 (LOAD window): total=21.61 (parent=0.02 select=9.7 mirror=9.54 attest=2.28 encode=0.08) n=668.0
+[22:54:05] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-smoke-s0/summary.json

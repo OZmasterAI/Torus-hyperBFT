@@ -1,0 +1,8 @@
+{
+  "drained": true,
+  "reason": "quiet and advancing",
+  "quiet_elapsed_s": 10.050397565006278,
+  "elapsed_s": 10.065573883999605,
+  "quiet_s": 10.0,
+  "timeout_s": 780.0
+}

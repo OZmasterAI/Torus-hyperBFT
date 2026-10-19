@@ -1,0 +1,3 @@
+val0 total_bytes 4420779200 sst_bytes 787377903 sst_files 59 wal_bytes 2113821662
+val1 total_bytes 4407224728 sst_bytes 789056064 sst_files 59 wal_bytes 2113887715
+val2 total_bytes 1562914995 sst_bytes 823699258 sst_files 70 wal_bytes 0

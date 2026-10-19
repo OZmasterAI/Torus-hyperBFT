@@ -1,0 +1,7 @@
+00:22:41 watching node pids: 1398508 1398551 1398594
+00:22:55.975 watching oracle feed pid 1400615
+00:23:06.082 watching load generator pid 1402989 (bench-throughpu)
+2026-10-20 00:28:08.303 load generator pid 1402989 gone; harness: [00:28:09] bench exited rc=0 after 303s
+2026-10-20 00:28:34.430 oracle feed pid 1400615 gone; harness: [00:28:34] oracle feed pid 1400615 stopped rc=0
+2026-10-20 00:28:38.452 all 3 node pids alive at every 0.5 s check until the harness stop began (stopping pid seen; previous check <= ~0.6 s earlier)
+stop-3val window (contains its TERM + kill -9 of the node pids 1398508 1398551 1398594): from <= 2026-10-20 00:28:38.452 to 2026-10-20 00:28:39.061 (local, CEST)

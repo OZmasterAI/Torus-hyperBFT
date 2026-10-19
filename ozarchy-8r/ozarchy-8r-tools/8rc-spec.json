@@ -1,0 +1,180 @@
+{
+ "campaign": "ozarchy-8rc",
+ "comment": "ozarchy-8r smoke of arm C only (the inline GC mode check + the reused-genesis path): = 8r-spec.json with campaign ozarchy-8rc, run_dir ozarchy-8r-run/smokeC (its smoke genesis-cache seeded by reflink copy of 8r smoke B cache), label prefix ozarchy-8rc-300m, smoke arm C 180 s. Only \"launch smoke\" is used.",
+ "run_dir": "/home/oz/bench-results-matched/ozarchy-8r-run/smokeC",
+ "label_prefix": "ozarchy-8rc-300m",
+ "harness_worktree": "/home/oz/projects/wt/8r-a0181b8b",
+ "tools_dir": "/home/oz/bench-results-matched/ozarchy-8r-tools/tools/matched-bench",
+ "binaries": {
+  "a": {
+   "stage_dir": "/home/oz/bench-results-matched/ozarchy-8r-stage/a",
+   "md5_file": "/home/oz/bench-results-matched/ozarchy-8r-stage/build/md5s.txt",
+   "node_row": "NA a0181b8b",
+   "bench_row": "bench-A a0181b8b"
+  }
+ },
+ "markets": 300,
+ "duration_s": 300,
+ "order": [
+  "r1:A",
+  "r1:B",
+  "r1:C",
+  "r2:C",
+  "r2:B",
+  "r2:A",
+  "r3:A",
+  "r3:B",
+  "r3:C",
+  "r4:C",
+  "r4:B",
+  "r4:A"
+ ],
+ "baseline": "A",
+ "warmup": {
+  "arm": "A",
+  "tag": "w1",
+  "duration_s": 300,
+  "gate": true
+ },
+ "smoke": {
+  "arm": "C",
+  "duration_s": 180
+ },
+ "harness_env": {
+  "BLOCK_CAP": "400",
+  "RETRY_BUSY": "1",
+  "MAX_IN_FLIGHT": "4",
+  "OPEN_ORDER_BUDGET": "900",
+  "ORACLE_FEED": "1",
+  "ORACLE_PRICE": "30000",
+  "ORACLE_INTERVAL_MS": "2000",
+  "ORACLE_WALK_BP": "0",
+  "IN_FLIGHT_TAIL": "commit",
+  "CLOID_SHARE": "0"
+ },
+ "node_env": {
+  "TORUS_ROCKSDB_PIPELINED_WRITE": "",
+  "TORUS_RESIDENT_BOOKS": "",
+  "TORUS_NATIVE_ROOT_CACHE": "",
+  "TORUS_PARALLEL_SETTLE": "",
+  "TORUS_PARALLEL_BUCKET_HASH": "",
+  "TORUS_BUCKET_MEMBER_CACHE_MB": "",
+  "TORUS_BOOK_ROWS": "",
+  "TORUS_ROCKSDB_STATS": "2",
+  "TORUS_ROCKSDB_STATS_INTERVAL_SECS": "1",
+  "TORUS_SHARD_CUSTODY": "0"
+ },
+ "absent_env": [
+  "TORUS_SETTLE_DEFER_RESULTS",
+  "TORUS_PARALLEL_MATCH_SETUP",
+  "TORUS_FAST_SELL_TOP_UPS",
+  "TORUS_EPOCH_FAST_PATH",
+  "TORUS_EXEC_POOL_GRAIN",
+  "TORUS_PARALLEL_BOOK_SAVE",
+  "TORUS_PARALLEL_ENGINE",
+  "TORUS_PARALLEL_CANCEL_ALL",
+  "TORUS_EXEC_PARALLEL_KEYS",
+  "TORUS_CKPT_DEFER_BOOKS",
+  "TORUS_CONSENSUS_DIRECT_FAN",
+  "TORUS_CONSENSUS_GOSSIP_MIRROR",
+  "TORUS_CHECKPOINT_INTERVAL_MS",
+  "TORUS_SHUTDOWN_TIMEOUT_SECS",
+  "MALLOC_CONF",
+  "LD_PRELOAD",
+  "TORUS_DIRECT_PUSH_BODY_BYTES",
+  "TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS",
+  "TORUS_CHECKPOINT_MAX_BYTES",
+  "TORUS_DA_BODY_RETENTION",
+  "TORUS_RETENTION_BLOCKS",
+  "TORUS_EXEC_PIPELINE",
+  "TORUS_SAVE_BOOKS_WORKERS",
+  "TORUS_BOOK_FAST_ENCODE",
+  "TORUS_SETTLE_NO_MERGE",
+  "TORUS_LEVEL_HASH_CACHE",
+  "TORUS_DA_GC_SLOW_MS",
+  "TORUS_DA_GC_INLINE"
+ ],
+ "arms": [
+  {
+   "label": "A",
+   "binary": "a",
+   "note": "perf/rh4-gc-worker a0181b8b, no retention (archive); code defaults; custody 0"
+  },
+  {
+   "label": "B",
+   "binary": "a",
+   "note": "a0181b8b + TORUS_RETENTION_BLOCKS=1000 (window 1128), DA body GC on the torus-da-gc worker (branch default); custody 0",
+   "env": {
+    "TORUS_RETENTION_BLOCKS": "1000"
+   }
+  },
+  {
+   "label": "C",
+   "binary": "a",
+   "note": "a0181b8b + TORUS_RETENTION_BLOCKS=1000 + TORUS_DA_GC_INLINE=1 (inline GC on the consensus thread, as 8o B); custody 0",
+   "env": {
+    "TORUS_RETENTION_BLOCKS": "1000",
+    "TORUS_DA_GC_INLINE": "1"
+   }
+  }
+ ],
+ "expect": [
+  {
+   "file": "run.log",
+   "regex": "in_flight_tail='commit'"
+  },
+  {
+   "file": "run.log",
+   "regex": "--in-flight-tail commit"
+  },
+  {
+   "file": "bench.log",
+   "regex": "^In-flight cap 4 action"
+  },
+  {
+   "file": "run.log",
+   "regex": "genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830"
+  },
+  {
+   "file": "run.log",
+   "regex": "oracle feed pid [0-9]+;"
+  },
+  {
+   "file": "run.log",
+   "regex": "^  state_hash_activation = \"?off\"?$",
+   "min": 1,
+   "max": 1
+  },
+  {
+   "file": "run.log",
+   "regex": "^\\[[0-9:]+\\] genesis evm\\.block_interval=11 ",
+   "min": 1,
+   "max": 1
+  }
+ ],
+ "checks": {
+  "source": "/home/oz/bench-results-matched/ozarchy-8r-tools/8r-checks.sh",
+  "per_cell": [
+   "r8loadchk",
+   "r8clchk",
+   "r8flagchk",
+   "r8pushchk",
+   "r8custchk",
+   "r8retchk",
+   "r8gcchk",
+   "r8slowchk",
+   "r8rejchk",
+   "r8swapchk",
+   "r8diskchk",
+   "r8modechk"
+  ]
+ },
+ "host_checks": {
+  "min_mem_avail_gb": 40,
+  "sysctl": {
+   "vm.dirty_bytes": "268435456",
+   "vm.dirty_background_bytes": "67108864",
+   "kernel.perf_event_paranoid": "2"
+  }
+ }
+}

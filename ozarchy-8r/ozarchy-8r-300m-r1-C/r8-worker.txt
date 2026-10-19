@@ -1,0 +1,3 @@
+val0 mode_worker_lines=0 mode_inline_lines=1 handoff_count=4894 handoff_sum_s=6.120334034000016 queue_depth=0 lag_heights=0 coalesced=0 fence_kept=0 fence_pins=0 fence_refused=0 held_fence_full=NA
+val1 mode_worker_lines=0 mode_inline_lines=1 handoff_count=4894 handoff_sum_s=6.252427076000011 queue_depth=0 lag_heights=0 coalesced=0 fence_kept=0 fence_pins=0 fence_refused=0 held_fence_full=NA
+val2 mode_worker_lines=0 mode_inline_lines=1 handoff_count=4893 handoff_sum_s=6.312413530000014 queue_depth=0 lag_heights=0 coalesced=0 fence_kept=0 fence_pins=0 fence_refused=0 held_fence_full=NA

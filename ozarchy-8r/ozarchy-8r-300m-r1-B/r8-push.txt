@@ -1,0 +1,3 @@
+val0 manifest=447 body_push=178 body_push_max_bytes=521623 clamp_warn=0 prewarm_lines=340 prewarm_bodies=15266
+val1 manifest=419 body_push=186 body_push_max_bytes=515903 clamp_warn=0 prewarm_lines=350 prewarm_bodies=15474
+val2 manifest=454 body_push=179 body_push_max_bytes=498136 clamp_warn=0 prewarm_lines=318 prewarm_bodies=14182

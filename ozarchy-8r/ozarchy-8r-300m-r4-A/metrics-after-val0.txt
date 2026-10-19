@@ -1,0 +1,2957 @@
+# HELP torus_blocks_committed Total number of committed blocks.
+# TYPE torus_blocks_committed counter
+torus_blocks_committed_total 5047
+# HELP torus_block_height Current block height.
+# TYPE torus_block_height gauge
+torus_block_height 5047
+# HELP torus_block_build_seconds Time to build a block.
+# TYPE torus_block_build_seconds histogram
+torus_block_build_seconds_sum 21.730235875999975
+torus_block_build_seconds_count 1684
+torus_block_build_seconds_bucket{le="0.001"} 1030
+torus_block_build_seconds_bucket{le="0.002"} 1069
+torus_block_build_seconds_bucket{le="0.004"} 1139
+torus_block_build_seconds_bucket{le="0.008"} 1228
+torus_block_build_seconds_bucket{le="0.016"} 1336
+torus_block_build_seconds_bucket{le="0.032"} 1439
+torus_block_build_seconds_bucket{le="0.064"} 1553
+torus_block_build_seconds_bucket{le="0.128"} 1675
+torus_block_build_seconds_bucket{le="0.256"} 1684
+torus_block_build_seconds_bucket{le="0.512"} 1684
+torus_block_build_seconds_bucket{le="1.024"} 1684
+torus_block_build_seconds_bucket{le="2.048"} 1684
+torus_block_build_seconds_bucket{le="4.096"} 1684
+torus_block_build_seconds_bucket{le="8.192"} 1684
+torus_block_build_seconds_bucket{le="16.384"} 1684
+torus_block_build_seconds_bucket{le="+Inf"} 1684
+# HELP torus_block_build_parent_seconds Consensus thread: parent block read + datum decode, before the whole-build timer in produce_block.
+# TYPE torus_block_build_parent_seconds histogram
+torus_block_build_parent_seconds_sum 0.016761803999999986
+torus_block_build_parent_seconds_count 1684
+torus_block_build_parent_seconds_bucket{le="0.0005"} 1684
+torus_block_build_parent_seconds_bucket{le="0.001"} 1684
+torus_block_build_parent_seconds_bucket{le="0.002"} 1684
+torus_block_build_parent_seconds_bucket{le="0.004"} 1684
+torus_block_build_parent_seconds_bucket{le="0.008"} 1684
+torus_block_build_parent_seconds_bucket{le="0.016"} 1684
+torus_block_build_parent_seconds_bucket{le="0.032"} 1684
+torus_block_build_parent_seconds_bucket{le="0.064"} 1684
+torus_block_build_parent_seconds_bucket{le="0.128"} 1684
+torus_block_build_parent_seconds_bucket{le="0.256"} 1684
+torus_block_build_parent_seconds_bucket{le="0.512"} 1684
+torus_block_build_parent_seconds_bucket{le="1.024"} 1684
+torus_block_build_parent_seconds_bucket{le="2.048"} 1684
+torus_block_build_parent_seconds_bucket{le="4.096"} 1684
+torus_block_build_parent_seconds_bucket{le="+Inf"} 1684
+# HELP torus_block_build_select_seconds Consensus thread: select_block_payload (in-flight set, mempool select, EVM drain) in produce_block.
+# TYPE torus_block_build_select_seconds histogram
+torus_block_build_select_seconds_sum 10.806142070999984
+torus_block_build_select_seconds_count 1684
+torus_block_build_select_seconds_bucket{le="0.0005"} 1008
+torus_block_build_select_seconds_bucket{le="0.001"} 1060
+torus_block_build_select_seconds_bucket{le="0.002"} 1118
+torus_block_build_select_seconds_bucket{le="0.004"} 1210
+torus_block_build_select_seconds_bucket{le="0.008"} 1325
+torus_block_build_select_seconds_bucket{le="0.016"} 1443
+torus_block_build_select_seconds_bucket{le="0.032"} 1584
+torus_block_build_select_seconds_bucket{le="0.064"} 1669
+torus_block_build_select_seconds_bucket{le="0.128"} 1681
+torus_block_build_select_seconds_bucket{le="0.256"} 1684
+torus_block_build_select_seconds_bucket{le="0.512"} 1684
+torus_block_build_select_seconds_bucket{le="1.024"} 1684
+torus_block_build_select_seconds_bucket{le="2.048"} 1684
+torus_block_build_select_seconds_bucket{le="4.096"} 1684
+torus_block_build_select_seconds_bucket{le="+Inf"} 1684
+# HELP torus_block_build_mirror_seconds Consensus thread: proposer DA body mirror + shard custody in produce_block.
+# TYPE torus_block_build_mirror_seconds histogram
+torus_block_build_mirror_seconds_sum 8.791544173999942
+torus_block_build_mirror_seconds_count 1684
+torus_block_build_mirror_seconds_bucket{le="0.0005"} 1156
+torus_block_build_mirror_seconds_bucket{le="0.001"} 1198
+torus_block_build_mirror_seconds_bucket{le="0.002"} 1242
+torus_block_build_mirror_seconds_bucket{le="0.004"} 1286
+torus_block_build_mirror_seconds_bucket{le="0.008"} 1377
+torus_block_build_mirror_seconds_bucket{le="0.016"} 1454
+torus_block_build_mirror_seconds_bucket{le="0.032"} 1601
+torus_block_build_mirror_seconds_bucket{le="0.064"} 1683
+torus_block_build_mirror_seconds_bucket{le="0.128"} 1684
+torus_block_build_mirror_seconds_bucket{le="0.256"} 1684
+torus_block_build_mirror_seconds_bucket{le="0.512"} 1684
+torus_block_build_mirror_seconds_bucket{le="1.024"} 1684
+torus_block_build_mirror_seconds_bucket{le="2.048"} 1684
+torus_block_build_mirror_seconds_bucket{le="4.096"} 1684
+torus_block_build_mirror_seconds_bucket{le="+Inf"} 1684
+# HELP torus_block_build_attest_seconds Consensus thread: proposer sig attestation over all native bodies in produce_block.
+# TYPE torus_block_build_attest_seconds histogram
+torus_block_build_attest_seconds_sum 2.0532609040000087
+torus_block_build_attest_seconds_count 1684
+torus_block_build_attest_seconds_bucket{le="0.0005"} 1234
+torus_block_build_attest_seconds_bucket{le="0.001"} 1276
+torus_block_build_attest_seconds_bucket{le="0.002"} 1372
+torus_block_build_attest_seconds_bucket{le="0.004"} 1442
+torus_block_build_attest_seconds_bucket{le="0.008"} 1660
+torus_block_build_attest_seconds_bucket{le="0.016"} 1682
+torus_block_build_attest_seconds_bucket{le="0.032"} 1684
+torus_block_build_attest_seconds_bucket{le="0.064"} 1684
+torus_block_build_attest_seconds_bucket{le="0.128"} 1684
+torus_block_build_attest_seconds_bucket{le="0.256"} 1684
+torus_block_build_attest_seconds_bucket{le="0.512"} 1684
+torus_block_build_attest_seconds_bucket{le="1.024"} 1684
+torus_block_build_attest_seconds_bucket{le="2.048"} 1684
+torus_block_build_attest_seconds_bucket{le="4.096"} 1684
+torus_block_build_attest_seconds_bucket{le="+Inf"} 1684
+# HELP torus_block_build_encode_seconds Consensus thread: block construction, pre-proposal push, proposal encode + datum hash in produce_block.
+# TYPE torus_block_build_encode_seconds histogram
+torus_block_build_encode_seconds_sum 0.07659826399999999
+torus_block_build_encode_seconds_count 1684
+torus_block_build_encode_seconds_bucket{le="0.0005"} 1675
+torus_block_build_encode_seconds_bucket{le="0.001"} 1678
+torus_block_build_encode_seconds_bucket{le="0.002"} 1680
+torus_block_build_encode_seconds_bucket{le="0.004"} 1683
+torus_block_build_encode_seconds_bucket{le="0.008"} 1684
+torus_block_build_encode_seconds_bucket{le="0.016"} 1684
+torus_block_build_encode_seconds_bucket{le="0.032"} 1684
+torus_block_build_encode_seconds_bucket{le="0.064"} 1684
+torus_block_build_encode_seconds_bucket{le="0.128"} 1684
+torus_block_build_encode_seconds_bucket{le="0.256"} 1684
+torus_block_build_encode_seconds_bucket{le="0.512"} 1684
+torus_block_build_encode_seconds_bucket{le="1.024"} 1684
+torus_block_build_encode_seconds_bucket{le="2.048"} 1684
+torus_block_build_encode_seconds_bucket{le="4.096"} 1684
+torus_block_build_encode_seconds_bucket{le="+Inf"} 1684
+# HELP torus_evm_txs_processed Total EVM transactions processed.
+# TYPE torus_evm_txs_processed counter
+torus_evm_txs_processed_total 0
+# HELP torus_native_actions_processed Total native actions processed.
+# TYPE torus_native_actions_processed counter
+torus_native_actions_processed_total 434541
+# HELP torus_exec_action_failures Native actions recorded as failed at execution (action status record).
+# TYPE torus_exec_action_failures counter
+torus_exec_action_failures_total 0
+# HELP torus_exec_action_rejections Native actions recorded as rejected at execution (action status record).
+# TYPE torus_exec_action_rejections counter
+torus_exec_action_rejections_total 139
+# HELP torus_exec_action_status_bytes Bytes written to cf_block_action_status.
+# TYPE torus_exec_action_status_bytes counter
+torus_exec_action_status_bytes_total 76503
+# HELP torus_consensus_rounds Total consensus rounds.
+# TYPE torus_consensus_rounds counter
+torus_consensus_rounds_total 0
+# HELP torus_consensus_view Current consensus view number.
+# TYPE torus_consensus_view gauge
+torus_consensus_view 5050
+# HELP torus_state_root_compute_seconds Time to compute state root.
+# TYPE torus_state_root_compute_seconds histogram
+torus_state_root_compute_seconds_sum 0.0
+torus_state_root_compute_seconds_count 0
+torus_state_root_compute_seconds_bucket{le="0.0001"} 0
+torus_state_root_compute_seconds_bucket{le="0.0002"} 0
+torus_state_root_compute_seconds_bucket{le="0.0004"} 0
+torus_state_root_compute_seconds_bucket{le="0.0008"} 0
+torus_state_root_compute_seconds_bucket{le="0.0016"} 0
+torus_state_root_compute_seconds_bucket{le="0.0032"} 0
+torus_state_root_compute_seconds_bucket{le="0.0064"} 0
+torus_state_root_compute_seconds_bucket{le="0.0128"} 0
+torus_state_root_compute_seconds_bucket{le="0.0256"} 0
+torus_state_root_compute_seconds_bucket{le="0.0512"} 0
+torus_state_root_compute_seconds_bucket{le="0.1024"} 0
+torus_state_root_compute_seconds_bucket{le="0.2048"} 0
+torus_state_root_compute_seconds_bucket{le="0.4096"} 0
+torus_state_root_compute_seconds_bucket{le="0.8192"} 0
+torus_state_root_compute_seconds_bucket{le="1.6384"} 0
+torus_state_root_compute_seconds_bucket{le="+Inf"} 0
+# HELP torus_mempool_evm_size Number of pending EVM transactions.
+# TYPE torus_mempool_evm_size gauge
+torus_mempool_evm_size 0
+# HELP torus_mempool_native_size Number of pending native actions.
+# TYPE torus_mempool_native_size gauge
+torus_mempool_native_size 0
+# HELP torus_mempool_native_committed_unexecuted Normal native actions committed and dispatched to execution but not yet executed (exec-aware admission; 0 unless TORUS_ADMISSION_EXEC_AWARE is on).
+# TYPE torus_mempool_native_committed_unexecuted gauge
+torus_mempool_native_committed_unexecuted 0
+# HELP torus_peers_connected Number of connected peers.
+# TYPE torus_peers_connected gauge
+torus_peers_connected 2
+# HELP torus_db_size_bytes Total RocksDB data directory size in bytes.
+# TYPE torus_db_size_bytes gauge
+torus_db_size_bytes 3292592764
+# HELP torus_epoch_number Current epoch number.
+# TYPE torus_epoch_number gauge
+torus_epoch_number 50
+# HELP torus_validator_set_size Number of validators in the active set.
+# TYPE torus_validator_set_size gauge
+torus_validator_set_size 0
+# HELP torus_orders_matched Total number of order fills.
+# TYPE torus_orders_matched counter
+torus_orders_matched_total 81230765
+# HELP torus_liquidations_triggered Total liquidations triggered.
+# TYPE torus_liquidations_triggered counter
+torus_liquidations_triggered_total 0
+# HELP torus_liquidator_vault_deficit Liquidator vault deficit (negative cash, tokens) after the last liquidation step.
+# TYPE torus_liquidator_vault_deficit gauge
+torus_liquidator_vault_deficit 0.0
+# HELP torus_liquidation_step_seconds Liquidation step wall time per native block (run_liquidations).
+# TYPE torus_liquidation_step_seconds histogram
+torus_liquidation_step_seconds_sum 20.121958440999998
+torus_liquidation_step_seconds_count 4681
+torus_liquidation_step_seconds_bucket{le="0.0001"} 4
+torus_liquidation_step_seconds_bucket{le="0.0002"} 265
+torus_liquidation_step_seconds_bucket{le="0.0004"} 275
+torus_liquidation_step_seconds_bucket{le="0.0008"} 813
+torus_liquidation_step_seconds_bucket{le="0.0016"} 2216
+torus_liquidation_step_seconds_bucket{le="0.0032"} 3253
+torus_liquidation_step_seconds_bucket{le="0.0064"} 3783
+torus_liquidation_step_seconds_bucket{le="0.0128"} 4271
+torus_liquidation_step_seconds_bucket{le="0.0256"} 4588
+torus_liquidation_step_seconds_bucket{le="0.0512"} 4672
+torus_liquidation_step_seconds_bucket{le="0.1024"} 4681
+torus_liquidation_step_seconds_bucket{le="0.2048"} 4681
+torus_liquidation_step_seconds_bucket{le="0.4096"} 4681
+torus_liquidation_step_seconds_bucket{le="0.8192"} 4681
+torus_liquidation_step_seconds_bucket{le="1.6384"} 4681
+torus_liquidation_step_seconds_bucket{le="3.2768"} 4681
+torus_liquidation_step_seconds_bucket{le="+Inf"} 4681
+# HELP torus_liquidations_stage1 Accounts liquidated by stage 1 (reduce-only IOC orders into the book).
+# TYPE torus_liquidations_stage1 counter
+torus_liquidations_stage1_total 0
+# HELP torus_liquidations_backstop Accounts backstopped (positions and collateral moved to the liquidator vault).
+# TYPE torus_liquidations_backstop counter
+torus_liquidations_backstop_total 0
+# HELP torus_liquidations_adl Accounts auto-deleveraged (ADL), the liquidator vault's own ADL included.
+# TYPE torus_liquidations_adl counter
+torus_liquidations_adl_total 0
+# HELP torus_liquidation_scanned Accounts classified by the liquidation step (vault excluded).
+# TYPE torus_liquidation_scanned counter
+torus_liquidation_scanned_total 7334274
+# HELP torus_liquidation_acted Accounts acted on by the liquidation step within the per-block act budget (vault excluded).
+# TYPE torus_liquidation_acted counter
+torus_liquidation_acted_total 0
+# HELP torus_liquidation_pending After the liquidation step: accounts left under maintenance (pending rows) plus scan-window candidates the act budget left unclassified (upper bound).
+# TYPE torus_liquidation_pending gauge
+torus_liquidation_pending 0
+# HELP torus_liquidation_deferred After the liquidation step: scan-window candidates left unclassified because the act budget ran out.
+# TYPE torus_liquidation_deferred gauge
+torus_liquidation_deferred 0
+# HELP torus_liquidation_adl_queue After the liquidation step: ADL obligation rows queued for the escrows (rows, not accounts).
+# TYPE torus_liquidation_adl_queue gauge
+torus_liquidation_adl_queue 0
+# HELP torus_liquidation_adl_queue_deficit After the liquidation step: sum over both ADL escrows of available + UPnL at the step's marks (signed tokens).
+# TYPE torus_liquidation_adl_queue_deficit gauge
+torus_liquidation_adl_queue_deficit 0.0
+# HELP torus_liquidation_adl_work ADL drain work units (rows visited + traders ranked + candidates read + edge rows).
+# TYPE torus_liquidation_adl_work counter
+torus_liquidation_adl_work_total 0
+# HELP torus_liquidation_adl_escrow_notional After the liquidation step: notional of both ADL escrows' positions at the step's marks (tokens).
+# TYPE torus_liquidation_adl_escrow_notional gauge
+torus_liquidation_adl_escrow_notional 0.0
+# HELP torus_liquidation_adl_dust Cumulative ADL escrow dust swept to the liquidator vault (signed tokens, since start).
+# TYPE torus_liquidation_adl_dust gauge
+torus_liquidation_adl_dust 0.0
+# HELP torus_liquidation_adl_pairing Cumulative liquidator vault amounts of ADL escrow-vs-escrow pairings (signed tokens, since start).
+# TYPE torus_liquidation_adl_pairing gauge
+torus_liquidation_adl_pairing 0.0
+# HELP torus_liquidation_value_sum Proof-only (TORUS_LIQ_VALUE_SUM=1): sum over all accounts of available + order margin + UPnL at one common price per market (0; equal to the marks' while OI is symmetric) (tokens).
+# TYPE torus_liquidation_value_sum gauge
+torus_liquidation_value_sum 0.0
+# HELP torus_orders_placed_accepted Orders accepted onto a book (status Filled|PartiallyFilled|Resting).
+# TYPE torus_orders_placed_accepted counter
+torus_orders_placed_accepted_total 107511776
+# HELP torus_orders_resting Orders that left liquidity on the book (status Resting|PartiallyFilled).
+# TYPE torus_orders_resting counter
+torus_orders_resting_total 65665234
+# HELP torus_orders_rejected_margin Orders rejected pre-book: available balance below the required margin reserve.
+# TYPE torus_orders_rejected_margin counter
+torus_orders_rejected_margin_total 0
+# HELP torus_orders_rejected_open_limit Orders rejected pre-book: the sender is at its open-order limit (all markets).
+# TYPE torus_orders_rejected_open_limit counter
+torus_orders_rejected_open_limit_total 0
+# HELP torus_orders_rejected_book Orders the matching engine rejected (dust, off-tick, PostOnly cross, FOK unfillable, market into empty book, bad stop trigger).
+# TYPE torus_orders_rejected_book counter
+torus_orders_rejected_book_total 0
+# HELP torus_orders_rejected_cancelled IOC/FOK/Market orders cancelled on arrival with zero fills.
+# TYPE torus_orders_rejected_cancelled counter
+torus_orders_rejected_cancelled_total 9824
+# HELP torus_sell_cuts_pool_zero_t0 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_zero_t0 counter
+torus_sell_cuts_pool_zero_t0_total 0
+# HELP torus_sell_cuts_pool_zero_t1_2 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_zero_t1_2 counter
+torus_sell_cuts_pool_zero_t1_2_total 0
+# HELP torus_sell_cuts_pool_zero_t3_5 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_zero_t3_5 counter
+torus_sell_cuts_pool_zero_t3_5_total 0
+# HELP torus_sell_cuts_pool_zero_t6_10 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_zero_t6_10 counter
+torus_sell_cuts_pool_zero_t6_10_total 0
+# HELP torus_sell_cuts_pool_zero_t11_30 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_zero_t11_30 counter
+torus_sell_cuts_pool_zero_t11_30_total 0
+# HELP torus_sell_cuts_pool_zero_t31p Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_zero_t31p counter
+torus_sell_cuts_pool_zero_t31p_total 0
+# HELP torus_sell_cuts_pool_partial_t0 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_partial_t0 counter
+torus_sell_cuts_pool_partial_t0_total 0
+# HELP torus_sell_cuts_pool_partial_t1_2 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_partial_t1_2 counter
+torus_sell_cuts_pool_partial_t1_2_total 0
+# HELP torus_sell_cuts_pool_partial_t3_5 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_partial_t3_5 counter
+torus_sell_cuts_pool_partial_t3_5_total 0
+# HELP torus_sell_cuts_pool_partial_t6_10 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_partial_t6_10 counter
+torus_sell_cuts_pool_partial_t6_10_total 0
+# HELP torus_sell_cuts_pool_partial_t11_30 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_partial_t11_30 counter
+torus_sell_cuts_pool_partial_t11_30_total 0
+# HELP torus_sell_cuts_pool_partial_t31p Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_pool_partial_t31p counter
+torus_sell_cuts_pool_partial_t31p_total 0
+# HELP torus_sell_cuts_nonpool_zero_t0 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_zero_t0 counter
+torus_sell_cuts_nonpool_zero_t0_total 0
+# HELP torus_sell_cuts_nonpool_zero_t1_2 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_zero_t1_2 counter
+torus_sell_cuts_nonpool_zero_t1_2_total 2914
+# HELP torus_sell_cuts_nonpool_zero_t3_5 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_zero_t3_5 counter
+torus_sell_cuts_nonpool_zero_t3_5_total 4099
+# HELP torus_sell_cuts_nonpool_zero_t6_10 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_zero_t6_10 counter
+torus_sell_cuts_nonpool_zero_t6_10_total 2811
+# HELP torus_sell_cuts_nonpool_zero_t11_30 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_zero_t11_30 counter
+torus_sell_cuts_nonpool_zero_t11_30_total 0
+# HELP torus_sell_cuts_nonpool_zero_t31p Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_zero_t31p counter
+torus_sell_cuts_nonpool_zero_t31p_total 0
+# HELP torus_sell_cuts_nonpool_partial_t0 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_partial_t0 counter
+torus_sell_cuts_nonpool_partial_t0_total 0
+# HELP torus_sell_cuts_nonpool_partial_t1_2 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_partial_t1_2 counter
+torus_sell_cuts_nonpool_partial_t1_2_total 0
+# HELP torus_sell_cuts_nonpool_partial_t3_5 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_partial_t3_5 counter
+torus_sell_cuts_nonpool_partial_t3_5_total 0
+# HELP torus_sell_cuts_nonpool_partial_t6_10 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_partial_t6_10 counter
+torus_sell_cuts_nonpool_partial_t6_10_total 0
+# HELP torus_sell_cuts_nonpool_partial_t11_30 Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_partial_t11_30 counter
+torus_sell_cuts_nonpool_partial_t11_30_total 0
+# HELP torus_sell_cuts_nonpool_partial_t31p Sell takers cut by match-time margin, by budget (pool / non-pool), fills before the cut (zero / partial) and hit minus reservation price in ticks (s92).
+# TYPE torus_sell_cuts_nonpool_partial_t31p counter
+torus_sell_cuts_nonpool_partial_t31p_total 0
+# HELP torus_maker_margin_cancels Resting makers cancelled whole at match time for margin (HL marginCanceled).
+# TYPE torus_maker_margin_cancels counter
+torus_maker_margin_cancels_total 0
+# HELP torus_maker_offmark_charged_fills Maker fills charged their loss against the mark; upper bound on cross-market maker over-commit in one batch (plan 9.11).
+# TYPE torus_maker_offmark_charged_fills counter
+torus_maker_offmark_charged_fills_total 0
+# HELP torus_reduce_only_cuts Reduce-only order cuts at match time or by the post-fill sweep.
+# TYPE torus_reduce_only_cuts counter
+torus_reduce_only_cuts_total 0
+# HELP torus_sell_top_ups_full B-blind non-pool sell top-ups to reserve(B0 x (1 + 10 bps)): granted in full / partly / not at all (s92).
+# TYPE torus_sell_top_ups_full counter
+torus_sell_top_ups_full_total 53167236
+# HELP torus_sell_top_ups_partial B-blind non-pool sell top-ups to reserve(B0 x (1 + 10 bps)): granted in full / partly / not at all (s92).
+# TYPE torus_sell_top_ups_partial counter
+torus_sell_top_ups_partial_total 0
+# HELP torus_sell_top_ups_none B-blind non-pool sell top-ups to reserve(B0 x (1 + 10 bps)): granted in full / partly / not at all (s92).
+# TYPE torus_sell_top_ups_none counter
+torus_sell_top_ups_none_total 0
+# HELP torus_orders_cancelled_partial_fill IOC/Market remainders cancelled after partial fills (filled part traded).
+# TYPE torus_orders_cancelled_partial_fill counter
+torus_orders_cancelled_partial_fill_total 0
+# HELP torus_orders_self_trade_cancels Resting maker orders auto-cancelled by self-trade prevention.
+# TYPE torus_orders_self_trade_cancels counter
+torus_orders_self_trade_cancels_total 0
+# HELP torus_orders_rejected_other Orders that died on other error paths (balance read/write or fill application failures).
+# TYPE torus_orders_rejected_other counter
+torus_orders_rejected_other_total 0
+# HELP torus_orders_rejected_reason Rejected PlaceOrders by reason: pre-book account margin split into position (fails even with the sender's reservations released) vs reservation (passes with them released), match-time margin, open-order limit, tick, lot, price, price band, reduce-only, the book's HL rejects, fill application, other (s114).
+# TYPE torus_orders_rejected_reason counter
+torus_orders_rejected_reason_total{reason="lot"} 0
+torus_orders_rejected_reason_total{reason="margin_match"} 9824
+torus_orders_rejected_reason_total{reason="other"} 0
+torus_orders_rejected_reason_total{reason="reduce_only"} 0
+torus_orders_rejected_reason_total{reason="margin_reservation"} 0
+torus_orders_rejected_reason_total{reason="margin_position"} 0
+torus_orders_rejected_reason_total{reason="price"} 0
+torus_orders_rejected_reason_total{reason="open_limit"} 0
+torus_orders_rejected_reason_total{reason="price_band"} 0
+torus_orders_rejected_reason_total{reason="fok_cancel"} 0
+torus_orders_rejected_reason_total{reason="market_no_liquidity"} 0
+torus_orders_rejected_reason_total{reason="tick"} 0
+torus_orders_rejected_reason_total{reason="bad_alo_px"} 0
+torus_orders_rejected_reason_total{reason="duplicate_cloid"} 0
+torus_orders_rejected_reason_total{reason="ioc_cancel"} 0
+torus_orders_rejected_reason_total{reason="bad_trigger_px"} 0
+torus_orders_rejected_reason_total{reason="fill"} 0
+# HELP torus_pruner_blocks_removed Total blocks removed by pruner.
+# TYPE torus_pruner_blocks_removed counter
+torus_pruner_blocks_removed_total 0
+# HELP torus_rpc_requests_total Total RPC requests by method and status.
+# TYPE torus_rpc_requests_total counter
+torus_rpc_requests_total_total{method="torus_submitNativeActionsBin",status="ok"} 144879
+torus_rpc_requests_total_total{method="eth_blockNumber",status="ok"} 595
+torus_rpc_requests_total_total{method="torus_getMarkPrice",status="ok"} 1228
+torus_rpc_requests_total_total{method="torus_submitNativeAction",status="ok"} 316
+torus_rpc_requests_total_total{method="torus_getMarkets",status="ok"} 1
+torus_rpc_requests_total_total{method="torus_submitNativeActionsBin",status="error"} 44
+# HELP torus_rpc_request_duration_seconds RPC request duration in seconds.
+# TYPE torus_rpc_request_duration_seconds histogram
+torus_rpc_request_duration_seconds_sum 3236.4066318809534
+torus_rpc_request_duration_seconds_count 147063
+torus_rpc_request_duration_seconds_bucket{le="0.0001"} 1620
+torus_rpc_request_duration_seconds_bucket{le="0.0002"} 1928
+torus_rpc_request_duration_seconds_bucket{le="0.0004"} 2745
+torus_rpc_request_duration_seconds_bucket{le="0.0008"} 8732
+torus_rpc_request_duration_seconds_bucket{le="0.0016"} 14206
+torus_rpc_request_duration_seconds_bucket{le="0.0032"} 24047
+torus_rpc_request_duration_seconds_bucket{le="0.0064"} 47385
+torus_rpc_request_duration_seconds_bucket{le="0.0128"} 79881
+torus_rpc_request_duration_seconds_bucket{le="0.0256"} 110408
+torus_rpc_request_duration_seconds_bucket{le="0.0512"} 130847
+torus_rpc_request_duration_seconds_bucket{le="0.1024"} 142890
+torus_rpc_request_duration_seconds_bucket{le="0.2048"} 146449
+torus_rpc_request_duration_seconds_bucket{le="0.4096"} 147013
+torus_rpc_request_duration_seconds_bucket{le="0.8192"} 147063
+torus_rpc_request_duration_seconds_bucket{le="1.6384"} 147063
+torus_rpc_request_duration_seconds_bucket{le="+Inf"} 147063
+# HELP torus_gossip_messages_received Total gossip messages received.
+# TYPE torus_gossip_messages_received counter
+torus_gossip_messages_received_total 53895
+# HELP torus_gossip_messages_sent Total gossip messages sent.
+# TYPE torus_gossip_messages_sent counter
+torus_gossip_messages_sent_total 46601
+# HELP torus_native_gossip_published_actions Native actions published to gossipsub (summed per batch).
+# TYPE torus_native_gossip_published_actions counter
+torus_native_gossip_published_actions_total 144350
+# HELP torus_native_gossip_received_actions Native actions received from gossipsub and forwarded to ingest.
+# TYPE torus_native_gossip_received_actions counter
+torus_native_gossip_received_actions_total 290191
+# HELP torus_native_gossip_dropped_full Outbound native actions dropped on full gossip channel.
+# TYPE torus_native_gossip_dropped_full counter
+torus_native_gossip_dropped_full_total 0
+# HELP torus_native_gossip_dropped_oversized Outbound native actions dropped from pre-spread for exceeding the gossip message cap.
+# TYPE torus_native_gossip_dropped_oversized counter
+torus_native_gossip_dropped_oversized_total 0
+# HELP torus_verified_sender_cache_hits Exec trust-cache hits (locally-verified sender reused, secp256k1 recover skipped).
+# TYPE torus_verified_sender_cache_hits counter
+torus_verified_sender_cache_hits_total 471401
+# HELP torus_verified_sender_cache_misses Exec trust-cache misses (fell through to full recover + slash).
+# TYPE torus_verified_sender_cache_misses counter
+torus_verified_sender_cache_misses_total 290305
+# HELP torus_verified_sender_cache_evictions Exec trust-cache FIFO evictions.
+# TYPE torus_verified_sender_cache_evictions counter
+torus_verified_sender_cache_evictions_total 370541
+# HELP torus_rpc_submit_permit_wait_seconds Time a batch submit waited for a verify permit.
+# TYPE torus_rpc_submit_permit_wait_seconds histogram
+torus_rpc_submit_permit_wait_seconds_sum 1072.3253338789899
+torus_rpc_submit_permit_wait_seconds_count 144879
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.001"} 109068
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.002"} 110346
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.004"} 113309
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.008"} 117925
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.016"} 124472
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.032"} 133208
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.064"} 141282
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.128"} 143991
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.256"} 144733
+torus_rpc_submit_permit_wait_seconds_bucket{le="0.512"} 144879
+torus_rpc_submit_permit_wait_seconds_bucket{le="1.024"} 144879
+torus_rpc_submit_permit_wait_seconds_bucket{le="2.048"} 144879
+torus_rpc_submit_permit_wait_seconds_bucket{le="4.096"} 144879
+torus_rpc_submit_permit_wait_seconds_bucket{le="8.192"} 144879
+torus_rpc_submit_permit_wait_seconds_bucket{le="+Inf"} 144879
+# HELP torus_rpc_submit_verify_seconds Time a batch submit spent in blocking-pool verification.
+# TYPE torus_rpc_submit_verify_seconds histogram
+torus_rpc_submit_verify_seconds_sum 1905.0230911230133
+torus_rpc_submit_verify_seconds_count 144879
+torus_rpc_submit_verify_seconds_bucket{le="0.001"} 10469
+torus_rpc_submit_verify_seconds_bucket{le="0.002"} 17428
+torus_rpc_submit_verify_seconds_bucket{le="0.004"} 36769
+torus_rpc_submit_verify_seconds_bucket{le="0.008"} 70175
+torus_rpc_submit_verify_seconds_bucket{le="0.016"} 111207
+torus_rpc_submit_verify_seconds_bucket{le="0.032"} 135218
+torus_rpc_submit_verify_seconds_bucket{le="0.064"} 141624
+torus_rpc_submit_verify_seconds_bucket{le="0.128"} 144074
+torus_rpc_submit_verify_seconds_bucket{le="0.256"} 144781
+torus_rpc_submit_verify_seconds_bucket{le="0.512"} 144879
+torus_rpc_submit_verify_seconds_bucket{le="1.024"} 144879
+torus_rpc_submit_verify_seconds_bucket{le="2.048"} 144879
+torus_rpc_submit_verify_seconds_bucket{le="4.096"} 144879
+torus_rpc_submit_verify_seconds_bucket{le="8.192"} 144879
+torus_rpc_submit_verify_seconds_bucket{le="+Inf"} 144879
+# HELP torus_rpc_submit_verify_cpu_seconds In-closure span of batch verify (parallel wall since Option A; verify_seconds minus this = pool queue).
+# TYPE torus_rpc_submit_verify_cpu_seconds histogram
+torus_rpc_submit_verify_cpu_seconds_sum 978.1570675129992
+torus_rpc_submit_verify_cpu_seconds_count 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.001"} 16641
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.002"} 25641
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.004"} 54430
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.008"} 96212
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.016"} 136098
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.032"} 144635
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.064"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.128"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.256"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="0.512"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="1.024"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="2.048"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="4.096"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="8.192"} 144879
+torus_rpc_submit_verify_cpu_seconds_bucket{le="+Inf"} 144879
+# HELP torus_rpc_submit_admit_seconds Time a batch submit spent admitting verified actions to the pool.
+# TYPE torus_rpc_submit_admit_seconds histogram
+torus_rpc_submit_admit_seconds_sum 142.21273060600283
+torus_rpc_submit_admit_seconds_count 144879
+torus_rpc_submit_admit_seconds_bucket{le="0.001"} 116195
+torus_rpc_submit_admit_seconds_bucket{le="0.002"} 127924
+torus_rpc_submit_admit_seconds_bucket{le="0.004"} 136788
+torus_rpc_submit_admit_seconds_bucket{le="0.008"} 141568
+torus_rpc_submit_admit_seconds_bucket{le="0.016"} 143982
+torus_rpc_submit_admit_seconds_bucket{le="0.032"} 144812
+torus_rpc_submit_admit_seconds_bucket{le="0.064"} 144877
+torus_rpc_submit_admit_seconds_bucket{le="0.128"} 144879
+torus_rpc_submit_admit_seconds_bucket{le="0.256"} 144879
+torus_rpc_submit_admit_seconds_bucket{le="0.512"} 144879
+torus_rpc_submit_admit_seconds_bucket{le="1.024"} 144879
+torus_rpc_submit_admit_seconds_bucket{le="2.048"} 144879
+torus_rpc_submit_admit_seconds_bucket{le="4.096"} 144879
+torus_rpc_submit_admit_seconds_bucket{le="8.192"} 144879
+torus_rpc_submit_admit_seconds_bucket{le="+Inf"} 144879
+# HELP torus_rpc_submit_admit_insert_seconds Cumulative mempool-insert time within one batch admit.
+# TYPE torus_rpc_submit_admit_insert_seconds histogram
+torus_rpc_submit_admit_insert_seconds_sum 141.41164243999919
+torus_rpc_submit_admit_insert_seconds_count 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.001"} 116376
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.002"} 128023
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.004"} 136825
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.008"} 141574
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.016"} 143984
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.032"} 144812
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.064"} 144877
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.128"} 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.256"} 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="0.512"} 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="1.024"} 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="2.048"} 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="4.096"} 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="8.192"} 144879
+torus_rpc_submit_admit_insert_seconds_bucket{le="+Inf"} 144879
+# HELP torus_rpc_submit_admit_forward_seconds Cumulative leader-forward time within one batch admit.
+# TYPE torus_rpc_submit_admit_forward_seconds histogram
+torus_rpc_submit_admit_forward_seconds_sum 0.00934358199997894
+torus_rpc_submit_admit_forward_seconds_count 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.001"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.002"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.004"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.008"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.016"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.032"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.064"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.128"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.256"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="0.512"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="1.024"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="2.048"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="4.096"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="8.192"} 144879
+torus_rpc_submit_admit_forward_seconds_bucket{le="+Inf"} 144879
+# HELP torus_rpc_submit_admit_rejects Batch-submit items rejected at admission, by reason.
+# TYPE torus_rpc_submit_admit_rejects counter
+torus_rpc_submit_admit_rejects_total{reason="backlog_preverify"} 845
+# HELP torus_native_da_pull_failures Native-DA pull requests that failed (timeout or substream exhaustion).
+# TYPE torus_native_da_pull_failures counter
+torus_native_da_pull_failures_total 0
+# HELP torus_direct_send_failures_untracked Untracked direct sends (native push / leader-forward) that failed.
+# TYPE torus_direct_send_failures_untracked counter
+torus_direct_send_failures_untracked_total 0
+# HELP torus_block_transactions_count Number of transactions per committed block.
+# TYPE torus_block_transactions_count histogram
+torus_block_transactions_count_sum 434893.0
+torus_block_transactions_count_count 5047
+torus_block_transactions_count_bucket{le="1.0"} 3070
+torus_block_transactions_count_bucket{le="2.0"} 3145
+torus_block_transactions_count_bucket{le="4.0"} 3207
+torus_block_transactions_count_bucket{le="8.0"} 3307
+torus_block_transactions_count_bucket{le="16.0"} 3360
+torus_block_transactions_count_bucket{le="32.0"} 3424
+torus_block_transactions_count_bucket{le="64.0"} 3581
+torus_block_transactions_count_bucket{le="128.0"} 3913
+torus_block_transactions_count_bucket{le="256.0"} 4147
+torus_block_transactions_count_bucket{le="512.0"} 5047
+torus_block_transactions_count_bucket{le="1024.0"} 5047
+torus_block_transactions_count_bucket{le="2048.0"} 5047
+torus_block_transactions_count_bucket{le="+Inf"} 5047
+# HELP torus_consensus_timeout_total Total consensus timeouts.
+# TYPE torus_consensus_timeout_total counter
+torus_consensus_timeout_total_total 2
+# HELP torus_pending_sends_enqueued Consensus unicast messages buffered because the target was unreachable.
+# TYPE torus_pending_sends_enqueued counter
+torus_pending_sends_enqueued_total 0
+# HELP torus_pending_sends_flushed Buffered consensus unicast messages flushed on (re)connect.
+# TYPE torus_pending_sends_flushed counter
+torus_pending_sends_flushed_total 0
+# HELP torus_native_bundle_repushed Recent native-action bundles re-pushed to a (re)connecting validator.
+# TYPE torus_native_bundle_repushed counter
+torus_native_bundle_repushed_total 0
+# HELP torus_missing_action_rejections CompactBlock validations rejected after retry due to missing native actions.
+# TYPE torus_missing_action_rejections counter
+torus_missing_action_rejections_total 0
+# HELP torus_proposer_body_mirror_failures produce_block proposals that dropped native actions on a durable DA mirror failure (S459).
+# TYPE torus_proposer_body_mirror_failures counter
+torus_proposer_body_mirror_failures_total 0
+# HELP torus_proposer_body_mirror_written Selected native bodies produce_block wrote because the DA store lacked them (s68).
+# TYPE torus_proposer_body_mirror_written counter
+torus_proposer_body_mirror_written_total 2248
+# HELP torus_native_da_pull_requests Native-DA pull-fallback fetches issued on a reconstruction miss (should stay LOW).
+# TYPE torus_native_da_pull_requests counter
+torus_native_da_pull_requests_total 0
+# HELP torus_native_da_pull_recovered Native-DA pull-fallbacks that recovered all missing bodies in-call.
+# TYPE torus_native_da_pull_recovered counter
+torus_native_da_pull_recovered_total 0
+# HELP torus_native_da_shard_recovered Native-DA bodies recovered by the erasure-shard pre-step before whole-body pull.
+# TYPE torus_native_da_shard_recovered counter
+torus_native_da_shard_recovered_total 0
+# HELP torus_native_da_shard_unsupported_peer Shard fetch requests that hit a peer not speaking /torus/native-da-shards (mixed-version fleet); the body falls back to whole-body pull.
+# TYPE torus_native_da_shard_unsupported_peer counter
+torus_native_da_shard_unsupported_peer_total 0
+# HELP torus_native_da_served Native-DA pull requests this node served (off-loop serve pool).
+# TYPE torus_native_da_served counter
+torus_native_da_served_total 1321
+# HELP torus_native_da_serve_dropped Native-DA serves answered all-empty because the serve pool was at capacity.
+# TYPE torus_native_da_serve_dropped counter
+torus_native_da_serve_dropped_total 8
+# HELP torus_native_da_recovery_handoffs Hot-path native-DA misses handed off to the recovery worker (BS-4a: each = one view failed fast with MissingData).
+# TYPE torus_native_da_recovery_handoffs counter
+torus_native_da_recovery_handoffs_total 0
+# HELP torus_native_da_recovery_timeouts Recovery-worker batches whose pull budget expired without recovering every body.
+# TYPE torus_native_da_recovery_timeouts counter
+torus_native_da_recovery_timeouts_total 0
+# HELP torus_exec_verify_seconds Exec phase: batch signature verification of native actions.
+# TYPE torus_exec_verify_seconds histogram
+torus_exec_verify_seconds_sum 17.948544702999955
+torus_exec_verify_seconds_count 4681
+torus_exec_verify_seconds_bucket{le="0.001"} 3217
+torus_exec_verify_seconds_bucket{le="0.002"} 3347
+torus_exec_verify_seconds_bucket{le="0.004"} 3544
+torus_exec_verify_seconds_bucket{le="0.008"} 3820
+torus_exec_verify_seconds_bucket{le="0.016"} 4185
+torus_exec_verify_seconds_bucket{le="0.032"} 4659
+torus_exec_verify_seconds_bucket{le="0.064"} 4681
+torus_exec_verify_seconds_bucket{le="0.128"} 4681
+torus_exec_verify_seconds_bucket{le="0.256"} 4681
+torus_exec_verify_seconds_bucket{le="0.512"} 4681
+torus_exec_verify_seconds_bucket{le="1.024"} 4681
+torus_exec_verify_seconds_bucket{le="2.048"} 4681
+torus_exec_verify_seconds_bucket{le="4.096"} 4681
+torus_exec_verify_seconds_bucket{le="8.192"} 4681
+torus_exec_verify_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_replay_guard_seconds Exec phase: per-action (sender, nonce) replay-guard point reads.
+# TYPE torus_exec_replay_guard_seconds histogram
+torus_exec_replay_guard_seconds_sum 3.9706369529999909
+torus_exec_replay_guard_seconds_count 4681
+torus_exec_replay_guard_seconds_bucket{le="0.001"} 3590
+torus_exec_replay_guard_seconds_bucket{le="0.002"} 3869
+torus_exec_replay_guard_seconds_bucket{le="0.004"} 4328
+torus_exec_replay_guard_seconds_bucket{le="0.008"} 4666
+torus_exec_replay_guard_seconds_bucket{le="0.016"} 4681
+torus_exec_replay_guard_seconds_bucket{le="0.032"} 4681
+torus_exec_replay_guard_seconds_bucket{le="0.064"} 4681
+torus_exec_replay_guard_seconds_bucket{le="0.128"} 4681
+torus_exec_replay_guard_seconds_bucket{le="0.256"} 4681
+torus_exec_replay_guard_seconds_bucket{le="0.512"} 4681
+torus_exec_replay_guard_seconds_bucket{le="1.024"} 4681
+torus_exec_replay_guard_seconds_bucket{le="2.048"} 4681
+torus_exec_replay_guard_seconds_bucket{le="4.096"} 4681
+torus_exec_replay_guard_seconds_bucket{le="8.192"} 4681
+torus_exec_replay_guard_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_engine_seconds Exec phase: native engine batches, governance, fees and epoch boundary.
+# TYPE torus_exec_engine_seconds histogram
+torus_exec_engine_seconds_sum 239.5812232090001
+torus_exec_engine_seconds_count 4681
+torus_exec_engine_seconds_bucket{le="0.001"} 273
+torus_exec_engine_seconds_bucket{le="0.002"} 1647
+torus_exec_engine_seconds_bucket{le="0.004"} 2679
+torus_exec_engine_seconds_bucket{le="0.008"} 2846
+torus_exec_engine_seconds_bucket{le="0.016"} 3016
+torus_exec_engine_seconds_bucket{le="0.032"} 3235
+torus_exec_engine_seconds_bucket{le="0.064"} 3547
+torus_exec_engine_seconds_bucket{le="0.128"} 3888
+torus_exec_engine_seconds_bucket{le="0.256"} 4465
+torus_exec_engine_seconds_bucket{le="0.512"} 4681
+torus_exec_engine_seconds_bucket{le="1.024"} 4681
+torus_exec_engine_seconds_bucket{le="2.048"} 4681
+torus_exec_engine_seconds_bucket{le="4.096"} 4681
+torus_exec_engine_seconds_bucket{le="8.192"} 4681
+torus_exec_engine_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_phase_margin_seconds Exec sub-phase: per-order margin reservation + market partition (execute_batch Phase 2).
+# TYPE torus_exec_phase_margin_seconds histogram
+torus_exec_phase_margin_seconds_sum 67.63170047100003
+torus_exec_phase_margin_seconds_count 1830
+torus_exec_phase_margin_seconds_bucket{le="0.001"} 108
+torus_exec_phase_margin_seconds_bucket{le="0.002"} 232
+torus_exec_phase_margin_seconds_bucket{le="0.004"} 361
+torus_exec_phase_margin_seconds_bucket{le="0.008"} 481
+torus_exec_phase_margin_seconds_bucket{le="0.016"} 681
+torus_exec_phase_margin_seconds_bucket{le="0.032"} 996
+torus_exec_phase_margin_seconds_bucket{le="0.064"} 1414
+torus_exec_phase_margin_seconds_bucket{le="0.128"} 1823
+torus_exec_phase_margin_seconds_bucket{le="0.256"} 1830
+torus_exec_phase_margin_seconds_bucket{le="0.512"} 1830
+torus_exec_phase_margin_seconds_bucket{le="1.024"} 1830
+torus_exec_phase_margin_seconds_bucket{le="2.048"} 1830
+torus_exec_phase_margin_seconds_bucket{le="4.096"} 1830
+torus_exec_phase_margin_seconds_bucket{le="8.192"} 1830
+torus_exec_phase_margin_seconds_bucket{le="+Inf"} 1830
+# HELP torus_exec_phase_match_seconds Exec sub-phase: per-market parallel order matching (execute_batch Phase 3).
+# TYPE torus_exec_phase_match_seconds histogram
+torus_exec_phase_match_seconds_sum 27.331506695999928
+torus_exec_phase_match_seconds_count 1830
+torus_exec_phase_match_seconds_bucket{le="0.001"} 53
+torus_exec_phase_match_seconds_bucket{le="0.002"} 212
+torus_exec_phase_match_seconds_bucket{le="0.004"} 383
+torus_exec_phase_match_seconds_bucket{le="0.008"} 730
+torus_exec_phase_match_seconds_bucket{le="0.016"} 1168
+torus_exec_phase_match_seconds_bucket{le="0.032"} 1635
+torus_exec_phase_match_seconds_bucket{le="0.064"} 1812
+torus_exec_phase_match_seconds_bucket{le="0.128"} 1830
+torus_exec_phase_match_seconds_bucket{le="0.256"} 1830
+torus_exec_phase_match_seconds_bucket{le="0.512"} 1830
+torus_exec_phase_match_seconds_bucket{le="1.024"} 1830
+torus_exec_phase_match_seconds_bucket{le="2.048"} 1830
+torus_exec_phase_match_seconds_bucket{le="4.096"} 1830
+torus_exec_phase_match_seconds_bucket{le="8.192"} 1830
+torus_exec_phase_match_seconds_bucket{le="+Inf"} 1830
+# HELP torus_exec_phase_settle_seconds Exec sub-phase: settlement - margin release, fills, trade persist (execute_batch Phase 4).
+# TYPE torus_exec_phase_settle_seconds histogram
+torus_exec_phase_settle_seconds_sum 94.63080179400012
+torus_exec_phase_settle_seconds_count 1830
+torus_exec_phase_settle_seconds_bucket{le="0.001"} 47
+torus_exec_phase_settle_seconds_bucket{le="0.002"} 123
+torus_exec_phase_settle_seconds_bucket{le="0.004"} 240
+torus_exec_phase_settle_seconds_bucket{le="0.008"} 363
+torus_exec_phase_settle_seconds_bucket{le="0.016"} 523
+torus_exec_phase_settle_seconds_bucket{le="0.032"} 825
+torus_exec_phase_settle_seconds_bucket{le="0.064"} 1110
+torus_exec_phase_settle_seconds_bucket{le="0.128"} 1719
+torus_exec_phase_settle_seconds_bucket{le="0.256"} 1830
+torus_exec_phase_settle_seconds_bucket{le="0.512"} 1830
+torus_exec_phase_settle_seconds_bucket{le="1.024"} 1830
+torus_exec_phase_settle_seconds_bucket{le="2.048"} 1830
+torus_exec_phase_settle_seconds_bucket{le="4.096"} 1830
+torus_exec_phase_settle_seconds_bucket{le="8.192"} 1830
+torus_exec_phase_settle_seconds_bucket{le="+Inf"} 1830
+# HELP torus_exec_phase1_actions_seconds Exec sub-phase: Phase-1 non-PlaceOrder action loop (cancels, modifies, transfers).
+# TYPE torus_exec_phase1_actions_seconds histogram
+torus_exec_phase1_actions_seconds_sum 15.219596133999758
+torus_exec_phase1_actions_seconds_count 4681
+torus_exec_phase1_actions_seconds_bucket{le="0.001"} 3051
+torus_exec_phase1_actions_seconds_bucket{le="0.002"} 3182
+torus_exec_phase1_actions_seconds_bucket{le="0.004"} 3393
+torus_exec_phase1_actions_seconds_bucket{le="0.008"} 3965
+torus_exec_phase1_actions_seconds_bucket{le="0.016"} 4443
+torus_exec_phase1_actions_seconds_bucket{le="0.032"} 4662
+torus_exec_phase1_actions_seconds_bucket{le="0.064"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="0.128"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="0.256"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="0.512"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="1.024"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="2.048"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="4.096"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="8.192"} 4681
+torus_exec_phase1_actions_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_settle_pass_a_seconds Exec sub-phase: parallel settle pass A (per-market plan compute on scoped threads).
+# TYPE torus_exec_settle_pass_a_seconds histogram
+torus_exec_settle_pass_a_seconds_sum 15.977714972000017
+torus_exec_settle_pass_a_seconds_count 4681
+torus_exec_settle_pass_a_seconds_bucket{le="0.001"} 3119
+torus_exec_settle_pass_a_seconds_bucket{le="0.002"} 3263
+torus_exec_settle_pass_a_seconds_bucket{le="0.004"} 3530
+torus_exec_settle_pass_a_seconds_bucket{le="0.008"} 3885
+torus_exec_settle_pass_a_seconds_bucket{le="0.016"} 4375
+torus_exec_settle_pass_a_seconds_bucket{le="0.032"} 4646
+torus_exec_settle_pass_a_seconds_bucket{le="0.064"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="0.128"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="0.256"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="0.512"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="1.024"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="2.048"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="4.096"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="8.192"} 4681
+torus_exec_settle_pass_a_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_settle_pass_b_seconds Exec sub-phase: settle pass B (single-threaded deterministic apply; = whole sequential loop).
+# TYPE torus_exec_settle_pass_b_seconds histogram
+torus_exec_settle_pass_b_seconds_sum 43.765142987
+torus_exec_settle_pass_b_seconds_count 4681
+torus_exec_settle_pass_b_seconds_bucket{le="0.001"} 2929
+torus_exec_settle_pass_b_seconds_bucket{le="0.002"} 3103
+torus_exec_settle_pass_b_seconds_bucket{le="0.004"} 3255
+torus_exec_settle_pass_b_seconds_bucket{le="0.008"} 3412
+torus_exec_settle_pass_b_seconds_bucket{le="0.016"} 3738
+torus_exec_settle_pass_b_seconds_bucket{le="0.032"} 4021
+torus_exec_settle_pass_b_seconds_bucket{le="0.064"} 4608
+torus_exec_settle_pass_b_seconds_bucket{le="0.128"} 4681
+torus_exec_settle_pass_b_seconds_bucket{le="0.256"} 4681
+torus_exec_settle_pass_b_seconds_bucket{le="0.512"} 4681
+torus_exec_settle_pass_b_seconds_bucket{le="1.024"} 4681
+torus_exec_settle_pass_b_seconds_bucket{le="2.048"} 4681
+torus_exec_settle_pass_b_seconds_bucket{le="4.096"} 4681
+torus_exec_settle_pass_b_seconds_bucket{le="8.192"} 4681
+torus_exec_settle_pass_b_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_cache_flush_seconds Exec sub-phase: position + balance cache flush_all into the overlay (inside settle).
+# TYPE torus_exec_cache_flush_seconds histogram
+torus_exec_cache_flush_seconds_sum 32.87839245299999
+torus_exec_cache_flush_seconds_count 4681
+torus_exec_cache_flush_seconds_bucket{le="0.001"} 3109
+torus_exec_cache_flush_seconds_bucket{le="0.002"} 3218
+torus_exec_cache_flush_seconds_bucket{le="0.004"} 3339
+torus_exec_cache_flush_seconds_bucket{le="0.008"} 3528
+torus_exec_cache_flush_seconds_bucket{le="0.016"} 3867
+torus_exec_cache_flush_seconds_bucket{le="0.032"} 4293
+torus_exec_cache_flush_seconds_bucket{le="0.064"} 4665
+torus_exec_cache_flush_seconds_bucket{le="0.128"} 4681
+torus_exec_cache_flush_seconds_bucket{le="0.256"} 4681
+torus_exec_cache_flush_seconds_bucket{le="0.512"} 4681
+torus_exec_cache_flush_seconds_bucket{le="1.024"} 4681
+torus_exec_cache_flush_seconds_bucket{le="2.048"} 4681
+torus_exec_cache_flush_seconds_bucket{le="4.096"} 4681
+torus_exec_cache_flush_seconds_bucket{le="8.192"} 4681
+torus_exec_cache_flush_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_post_engine_tail_seconds Exec sub-phase: core-writer drain + governance + fee distribution + epoch boundary.
+# TYPE torus_exec_post_engine_tail_seconds histogram
+torus_exec_post_engine_tail_seconds_sum 20.27271141199999
+torus_exec_post_engine_tail_seconds_count 4681
+torus_exec_post_engine_tail_seconds_bucket{le="0.001"} 1053
+torus_exec_post_engine_tail_seconds_bucket{le="0.002"} 2714
+torus_exec_post_engine_tail_seconds_bucket{le="0.004"} 3419
+torus_exec_post_engine_tail_seconds_bucket{le="0.008"} 3944
+torus_exec_post_engine_tail_seconds_bucket{le="0.016"} 4393
+torus_exec_post_engine_tail_seconds_bucket{le="0.032"} 4634
+torus_exec_post_engine_tail_seconds_bucket{le="0.064"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="0.128"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="0.256"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="0.512"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="1.024"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="2.048"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="4.096"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="8.192"} 4681
+torus_exec_post_engine_tail_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_engine_untimed_seconds Exec sub-phase residual: engine total minus phase1/margin/match/settle/tail.
+# TYPE torus_exec_engine_untimed_seconds histogram
+torus_exec_engine_untimed_seconds_sum 14.494906702000021
+torus_exec_engine_untimed_seconds_count 4681
+torus_exec_engine_untimed_seconds_bucket{le="0.001"} 2736
+torus_exec_engine_untimed_seconds_bucket{le="0.002"} 3258
+torus_exec_engine_untimed_seconds_bucket{le="0.004"} 3660
+torus_exec_engine_untimed_seconds_bucket{le="0.008"} 3979
+torus_exec_engine_untimed_seconds_bucket{le="0.016"} 4562
+torus_exec_engine_untimed_seconds_bucket{le="0.032"} 4679
+torus_exec_engine_untimed_seconds_bucket{le="0.064"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="0.128"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="0.256"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="0.512"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="1.024"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="2.048"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="4.096"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="8.192"} 4681
+torus_exec_engine_untimed_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_save_books_seconds Exec phase: serializing dirty order books into the overlay.
+# TYPE torus_exec_save_books_seconds histogram
+torus_exec_save_books_seconds_sum 17.667897749000006
+torus_exec_save_books_seconds_count 4681
+torus_exec_save_books_seconds_bucket{le="0.001"} 2670
+torus_exec_save_books_seconds_bucket{le="0.002"} 2687
+torus_exec_save_books_seconds_bucket{le="0.004"} 2980
+torus_exec_save_books_seconds_bucket{le="0.008"} 3795
+torus_exec_save_books_seconds_bucket{le="0.016"} 4453
+torus_exec_save_books_seconds_bucket{le="0.032"} 4681
+torus_exec_save_books_seconds_bucket{le="0.064"} 4681
+torus_exec_save_books_seconds_bucket{le="0.128"} 4681
+torus_exec_save_books_seconds_bucket{le="0.256"} 4681
+torus_exec_save_books_seconds_bucket{le="0.512"} 4681
+torus_exec_save_books_seconds_bucket{le="1.024"} 4681
+torus_exec_save_books_seconds_bucket{le="2.048"} 4681
+torus_exec_save_books_seconds_bucket{le="4.096"} 4681
+torus_exec_save_books_seconds_bucket{le="8.192"} 4681
+torus_exec_save_books_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_flush_seconds Exec phase: nonce writes, atomic overlay flush and incremental tries.
+# TYPE torus_exec_flush_seconds histogram
+torus_exec_flush_seconds_sum 0.0
+torus_exec_flush_seconds_count 0
+torus_exec_flush_seconds_bucket{le="0.001"} 0
+torus_exec_flush_seconds_bucket{le="0.002"} 0
+torus_exec_flush_seconds_bucket{le="0.004"} 0
+torus_exec_flush_seconds_bucket{le="0.008"} 0
+torus_exec_flush_seconds_bucket{le="0.016"} 0
+torus_exec_flush_seconds_bucket{le="0.032"} 0
+torus_exec_flush_seconds_bucket{le="0.064"} 0
+torus_exec_flush_seconds_bucket{le="0.128"} 0
+torus_exec_flush_seconds_bucket{le="0.256"} 0
+torus_exec_flush_seconds_bucket{le="0.512"} 0
+torus_exec_flush_seconds_bucket{le="1.024"} 0
+torus_exec_flush_seconds_bucket{le="2.048"} 0
+torus_exec_flush_seconds_bucket{le="4.096"} 0
+torus_exec_flush_seconds_bucket{le="8.192"} 0
+torus_exec_flush_seconds_bucket{le="+Inf"} 0
+# HELP torus_exec_root_seconds Flush breakdown: incremental native-trie maintenance (bucket rehash + path).
+# TYPE torus_exec_root_seconds histogram
+torus_exec_root_seconds_sum 0.00016494000000000008
+torus_exec_root_seconds_count 50
+torus_exec_root_seconds_bucket{le="0.001"} 50
+torus_exec_root_seconds_bucket{le="0.002"} 50
+torus_exec_root_seconds_bucket{le="0.004"} 50
+torus_exec_root_seconds_bucket{le="0.008"} 50
+torus_exec_root_seconds_bucket{le="0.016"} 50
+torus_exec_root_seconds_bucket{le="0.032"} 50
+torus_exec_root_seconds_bucket{le="0.064"} 50
+torus_exec_root_seconds_bucket{le="0.128"} 50
+torus_exec_root_seconds_bucket{le="0.256"} 50
+torus_exec_root_seconds_bucket{le="0.512"} 50
+torus_exec_root_seconds_bucket{le="1.024"} 50
+torus_exec_root_seconds_bucket{le="2.048"} 50
+torus_exec_root_seconds_bucket{le="4.096"} 50
+torus_exec_root_seconds_bucket{le="8.192"} 50
+torus_exec_root_seconds_bucket{le="+Inf"} 50
+# HELP torus_state_hash_seconds Running state hash: digest of the block's consensus writes + chain step.
+# TYPE torus_state_hash_seconds histogram
+torus_state_hash_seconds_sum 0.0
+torus_state_hash_seconds_count 5097
+torus_state_hash_seconds_bucket{le="0.0001"} 5097
+torus_state_hash_seconds_bucket{le="0.0002"} 5097
+torus_state_hash_seconds_bucket{le="0.0004"} 5097
+torus_state_hash_seconds_bucket{le="0.0008"} 5097
+torus_state_hash_seconds_bucket{le="0.0016"} 5097
+torus_state_hash_seconds_bucket{le="0.0032"} 5097
+torus_state_hash_seconds_bucket{le="0.0064"} 5097
+torus_state_hash_seconds_bucket{le="0.0128"} 5097
+torus_state_hash_seconds_bucket{le="0.0256"} 5097
+torus_state_hash_seconds_bucket{le="0.0512"} 5097
+torus_state_hash_seconds_bucket{le="0.1024"} 5097
+torus_state_hash_seconds_bucket{le="0.2048"} 5097
+torus_state_hash_seconds_bucket{le="0.4096"} 5097
+torus_state_hash_seconds_bucket{le="0.8192"} 5097
+torus_state_hash_seconds_bucket{le="1.6384"} 5097
+torus_state_hash_seconds_bucket{le="3.2768"} 5097
+torus_state_hash_seconds_bucket{le="+Inf"} 5097
+# HELP torus_state_hash_entries Running state hash: consensus write-set entries hashed.
+# TYPE torus_state_hash_entries counter
+torus_state_hash_entries_total 0
+# HELP torus_state_hash_no_quorum Running state hash: checkpoints with every vote in and no quorum hash.
+# TYPE torus_state_hash_no_quorum counter
+torus_state_hash_no_quorum_total 0
+# HELP torus_state_hash_attestations_submitted Running state hash: AttestStateHash actions submitted by this node.
+# TYPE torus_state_hash_attestations_submitted counter
+torus_state_hash_attestations_submitted_total 0
+# HELP torus_state_hash_height Running state hash: last hashed (applied) height.
+# TYPE torus_state_hash_height gauge
+torus_state_hash_height 0
+# HELP torus_state_hash_unverified Running state hash: 1 while this node has no valid local hash chain (no attesting, no fail-stop).
+# TYPE torus_state_hash_unverified gauge
+torus_state_hash_unverified 0
+# HELP torus_exec_state_write_seconds Flush breakdown: WriteBatch build + atomic RocksDB write.
+# TYPE torus_exec_state_write_seconds histogram
+torus_exec_state_write_seconds_sum 26.490225174999997
+torus_exec_state_write_seconds_count 50
+torus_exec_state_write_seconds_bucket{le="0.001"} 3
+torus_exec_state_write_seconds_bucket{le="0.002"} 6
+torus_exec_state_write_seconds_bucket{le="0.004"} 8
+torus_exec_state_write_seconds_bucket{le="0.008"} 8
+torus_exec_state_write_seconds_bucket{le="0.016"} 8
+torus_exec_state_write_seconds_bucket{le="0.032"} 8
+torus_exec_state_write_seconds_bucket{le="0.064"} 9
+torus_exec_state_write_seconds_bucket{le="0.128"} 9
+torus_exec_state_write_seconds_bucket{le="0.256"} 19
+torus_exec_state_write_seconds_bucket{le="0.512"} 26
+torus_exec_state_write_seconds_bucket{le="1.024"} 44
+torus_exec_state_write_seconds_bucket{le="2.048"} 50
+torus_exec_state_write_seconds_bucket{le="4.096"} 50
+torus_exec_state_write_seconds_bucket{le="8.192"} 50
+torus_exec_state_write_seconds_bucket{le="+Inf"} 50
+# HELP torus_exec_state_write_build_seconds state_write split: serializing the pending overlay maps into the WriteBatch.
+# TYPE torus_exec_state_write_build_seconds histogram
+torus_exec_state_write_build_seconds_sum 6.264752932
+torus_exec_state_write_build_seconds_count 50
+torus_exec_state_write_build_seconds_bucket{le="0.001"} 8
+torus_exec_state_write_build_seconds_bucket{le="0.002"} 8
+torus_exec_state_write_build_seconds_bucket{le="0.004"} 8
+torus_exec_state_write_build_seconds_bucket{le="0.008"} 8
+torus_exec_state_write_build_seconds_bucket{le="0.016"} 9
+torus_exec_state_write_build_seconds_bucket{le="0.032"} 9
+torus_exec_state_write_build_seconds_bucket{le="0.064"} 18
+torus_exec_state_write_build_seconds_bucket{le="0.128"} 27
+torus_exec_state_write_build_seconds_bucket{le="0.256"} 47
+torus_exec_state_write_build_seconds_bucket{le="0.512"} 50
+torus_exec_state_write_build_seconds_bucket{le="1.024"} 50
+torus_exec_state_write_build_seconds_bucket{le="2.048"} 50
+torus_exec_state_write_build_seconds_bucket{le="4.096"} 50
+torus_exec_state_write_build_seconds_bucket{le="8.192"} 50
+torus_exec_state_write_build_seconds_bucket{le="+Inf"} 50
+# HELP torus_exec_state_write_db_seconds state_write split: the atomic rocksdb write(batch) alone (WAL + memtable).
+# TYPE torus_exec_state_write_db_seconds histogram
+torus_exec_state_write_db_seconds_sum 20.225472243
+torus_exec_state_write_db_seconds_count 50
+torus_exec_state_write_db_seconds_bucket{le="0.001"} 4
+torus_exec_state_write_db_seconds_bucket{le="0.002"} 7
+torus_exec_state_write_db_seconds_bucket{le="0.004"} 8
+torus_exec_state_write_db_seconds_bucket{le="0.008"} 8
+torus_exec_state_write_db_seconds_bucket{le="0.016"} 8
+torus_exec_state_write_db_seconds_bucket{le="0.032"} 8
+torus_exec_state_write_db_seconds_bucket{le="0.064"} 9
+torus_exec_state_write_db_seconds_bucket{le="0.128"} 11
+torus_exec_state_write_db_seconds_bucket{le="0.256"} 23
+torus_exec_state_write_db_seconds_bucket{le="0.512"} 27
+torus_exec_state_write_db_seconds_bucket{le="1.024"} 50
+torus_exec_state_write_db_seconds_bucket{le="2.048"} 50
+torus_exec_state_write_db_seconds_bucket{le="4.096"} 50
+torus_exec_state_write_db_seconds_bucket{le="8.192"} 50
+torus_exec_state_write_db_seconds_bucket{le="+Inf"} 50
+# HELP torus_exec_state_write_batch_bytes Bytes in the WriteBatch handed to RocksDB per native block.
+# TYPE torus_exec_state_write_batch_bytes histogram
+torus_exec_state_write_batch_bytes_sum 5557258897.0
+torus_exec_state_write_batch_bytes_count 50
+torus_exec_state_write_batch_bytes_bucket{le="4096.0"} 3
+torus_exec_state_write_batch_bytes_bucket{le="8192.0"} 3
+torus_exec_state_write_batch_bytes_bucket{le="16384.0"} 3
+torus_exec_state_write_batch_bytes_bucket{le="32768.0"} 3
+torus_exec_state_write_batch_bytes_bucket{le="65536.0"} 3
+torus_exec_state_write_batch_bytes_bucket{le="131072.0"} 5
+torus_exec_state_write_batch_bytes_bucket{le="262144.0"} 7
+torus_exec_state_write_batch_bytes_bucket{le="524288.0"} 8
+torus_exec_state_write_batch_bytes_bucket{le="1048576.0"} 8
+torus_exec_state_write_batch_bytes_bucket{le="2097152.0"} 8
+torus_exec_state_write_batch_bytes_bucket{le="4194304.0"} 8
+torus_exec_state_write_batch_bytes_bucket{le="8388608.0"} 8
+torus_exec_state_write_batch_bytes_bucket{le="16777216.0"} 8
+torus_exec_state_write_batch_bytes_bucket{le="33554432.0"} 9
+torus_exec_state_write_batch_bytes_bucket{le="67108864.0"} 22
+torus_exec_state_write_batch_bytes_bucket{le="134217728.0"} 28
+torus_exec_state_write_batch_bytes_bucket{le="268435456.0"} 50
+torus_exec_state_write_batch_bytes_bucket{le="536870912.0"} 50
+torus_exec_state_write_batch_bytes_bucket{le="1073741824.0"} 50
+torus_exec_state_write_batch_bytes_bucket{le="2147483648.0"} 50
+torus_exec_state_write_batch_bytes_bucket{le="+Inf"} 50
+# HELP torus_exec_evm_resync_seconds Flush breakdown: post-flush incremental-trie EVM account resync.
+# TYPE torus_exec_evm_resync_seconds histogram
+torus_exec_evm_resync_seconds_sum 0.10646222199999994
+torus_exec_evm_resync_seconds_count 50
+torus_exec_evm_resync_seconds_bucket{le="0.001"} 5
+torus_exec_evm_resync_seconds_bucket{le="0.002"} 38
+torus_exec_evm_resync_seconds_bucket{le="0.004"} 46
+torus_exec_evm_resync_seconds_bucket{le="0.008"} 49
+torus_exec_evm_resync_seconds_bucket{le="0.016"} 49
+torus_exec_evm_resync_seconds_bucket{le="0.032"} 50
+torus_exec_evm_resync_seconds_bucket{le="0.064"} 50
+torus_exec_evm_resync_seconds_bucket{le="0.128"} 50
+torus_exec_evm_resync_seconds_bucket{le="0.256"} 50
+torus_exec_evm_resync_seconds_bucket{le="0.512"} 50
+torus_exec_evm_resync_seconds_bucket{le="1.024"} 50
+torus_exec_evm_resync_seconds_bucket{le="2.048"} 50
+torus_exec_evm_resync_seconds_bucket{le="4.096"} 50
+torus_exec_evm_resync_seconds_bucket{le="8.192"} 50
+torus_exec_evm_resync_seconds_bucket{le="+Inf"} 50
+# HELP torus_exec_root_dirty_buckets Buckets rehashed per block by native-trie maintenance (O(dirty) witness).
+# TYPE torus_exec_root_dirty_buckets histogram
+torus_exec_root_dirty_buckets_sum 0.0
+torus_exec_root_dirty_buckets_count 50
+torus_exec_root_dirty_buckets_bucket{le="1.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="2.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="4.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="8.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="16.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="32.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="64.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="128.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="256.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="512.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="1024.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="2048.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="4096.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="8192.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="16384.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="32768.0"} 50
+torus_exec_root_dirty_buckets_bucket{le="+Inf"} 50
+# HELP torus_exec_root_bucket_scans CF_NATIVE_HASHED prefix-scans by native-trie maintenance (drops with member-cache hits).
+# TYPE torus_exec_root_bucket_scans counter
+torus_exec_root_bucket_scans_total 0
+# HELP torus_member_cache_hits Bucket-member cache hits (scan elided).
+# TYPE torus_member_cache_hits counter
+torus_member_cache_hits_total 0
+# HELP torus_member_cache_misses Bucket-member cache misses (mirror re-scanned).
+# TYPE torus_member_cache_misses counter
+torus_member_cache_misses_total 0
+# HELP torus_member_cache_evictions Bucket-member cache LRU evictions (memory-budget pressure).
+# TYPE torus_member_cache_evictions counter
+torus_member_cache_evictions_total 0
+# HELP torus_member_cache_resident_buckets Bucket-member cache resident bucket count after the last flush (eviction-pressure witness).
+# TYPE torus_member_cache_resident_buckets gauge
+torus_member_cache_resident_buckets 0
+# HELP torus_exec_dirty_entries_balances Native-root dirty entries per flush for this cf_tag (3c funnel attribution).
+# TYPE torus_exec_dirty_entries_balances counter
+torus_exec_dirty_entries_balances_total 310349
+# HELP torus_exec_dirty_entries_order_books Native-root dirty entries per flush for this cf_tag (3c funnel attribution).
+# TYPE torus_exec_dirty_entries_order_books counter
+torus_exec_dirty_entries_order_books_total 12600
+# HELP torus_exec_dirty_entries_positions Native-root dirty entries per flush for this cf_tag (3c funnel attribution).
+# TYPE torus_exec_dirty_entries_positions counter
+torus_exec_dirty_entries_positions_total 35183665
+# HELP torus_exec_dirty_entries_oracle Native-root dirty entries per flush for this cf_tag (3c funnel attribution).
+# TYPE torus_exec_dirty_entries_oracle counter
+torus_exec_dirty_entries_oracle_total 55500
+# HELP torus_exec_dirty_entries_staking_delegations Native-root dirty entries per flush for this cf_tag (3c funnel attribution).
+# TYPE torus_exec_dirty_entries_staking_delegations counter
+torus_exec_dirty_entries_staking_delegations_total 0
+# HELP torus_exec_dirty_entries_staking_validators Native-root dirty entries per flush for this cf_tag (3c funnel attribution).
+# TYPE torus_exec_dirty_entries_staking_validators counter
+torus_exec_dirty_entries_staking_validators_total 0
+# HELP torus_exec_dirty_entries_liquidation Native-root dirty entries per flush for this cf_tag (3c funnel attribution).
+# TYPE torus_exec_dirty_entries_liquidation counter
+torus_exec_dirty_entries_liquidation_total 344
+# HELP torus_exec_book_rows_written Node-local order-row store upserts (3c mode 2).
+# TYPE torus_exec_book_rows_written counter
+torus_exec_book_rows_written_total 0
+# HELP torus_exec_book_rows_deleted Node-local order-row store deletes (3c mode 2).
+# TYPE torus_exec_book_rows_deleted counter
+torus_exec_book_rows_deleted_total 0
+# HELP torus_exec_book_levels_written Root-CF level-row upserts (3c mode 2).
+# TYPE torus_exec_book_levels_written counter
+torus_exec_book_levels_written_total 0
+# HELP torus_exec_book_levels_deleted Root-CF level-row deletes (3c mode 2).
+# TYPE torus_exec_book_levels_deleted counter
+torus_exec_book_levels_deleted_total 0
+# HELP torus_exec_block_seconds Total time to execute a committed block on the execution thread.
+# TYPE torus_exec_block_seconds histogram
+torus_exec_block_seconds_sum 297.97932660600068
+torus_exec_block_seconds_count 5047
+torus_exec_block_seconds_bucket{le="0.001"} 496
+torus_exec_block_seconds_bucket{le="0.002"} 1337
+torus_exec_block_seconds_bucket{le="0.004"} 2449
+torus_exec_block_seconds_bucket{le="0.008"} 2781
+torus_exec_block_seconds_bucket{le="0.016"} 3101
+torus_exec_block_seconds_bucket{le="0.032"} 3416
+torus_exec_block_seconds_bucket{le="0.064"} 3775
+torus_exec_block_seconds_bucket{le="0.128"} 4169
+torus_exec_block_seconds_bucket{le="0.256"} 4657
+torus_exec_block_seconds_bucket{le="0.512"} 5044
+torus_exec_block_seconds_bucket{le="1.024"} 5047
+torus_exec_block_seconds_bucket{le="2.048"} 5047
+torus_exec_block_seconds_bucket{le="4.096"} 5047
+torus_exec_block_seconds_bucket{le="8.192"} 5047
+torus_exec_block_seconds_bucket{le="+Inf"} 5047
+# HELP torus_exec_evm_seconds Exec phase: EVM validate + commit bundle + block metadata (native-only cells ~0).
+# TYPE torus_exec_evm_seconds histogram
+torus_exec_evm_seconds_sum 0.003905417999999969
+torus_exec_evm_seconds_count 5047
+torus_exec_evm_seconds_bucket{le="0.001"} 5047
+torus_exec_evm_seconds_bucket{le="0.002"} 5047
+torus_exec_evm_seconds_bucket{le="0.004"} 5047
+torus_exec_evm_seconds_bucket{le="0.008"} 5047
+torus_exec_evm_seconds_bucket{le="0.016"} 5047
+torus_exec_evm_seconds_bucket{le="0.032"} 5047
+torus_exec_evm_seconds_bucket{le="0.064"} 5047
+torus_exec_evm_seconds_bucket{le="0.128"} 5047
+torus_exec_evm_seconds_bucket{le="0.256"} 5047
+torus_exec_evm_seconds_bucket{le="0.512"} 5047
+torus_exec_evm_seconds_bucket{le="1.024"} 5047
+torus_exec_evm_seconds_bucket{le="2.048"} 5047
+torus_exec_evm_seconds_bucket{le="4.096"} 5047
+torus_exec_evm_seconds_bucket{le="8.192"} 5047
+torus_exec_evm_seconds_bucket{le="+Inf"} 5047
+# HELP torus_exec_load_books_seconds Exec phase: per-block order-book load + rebuild from cf_native_order_books (O(total resting depth); classic blob or C4 rows depending on TORUS_BOOK_ROWS).
+# TYPE torus_exec_load_books_seconds histogram
+torus_exec_load_books_seconds_sum 0.6024525989999984
+torus_exec_load_books_seconds_count 4681
+torus_exec_load_books_seconds_bucket{le="0.001"} 4639
+torus_exec_load_books_seconds_bucket{le="0.002"} 4671
+torus_exec_load_books_seconds_bucket{le="0.004"} 4681
+torus_exec_load_books_seconds_bucket{le="0.008"} 4681
+torus_exec_load_books_seconds_bucket{le="0.016"} 4681
+torus_exec_load_books_seconds_bucket{le="0.032"} 4681
+torus_exec_load_books_seconds_bucket{le="0.064"} 4681
+torus_exec_load_books_seconds_bucket{le="0.128"} 4681
+torus_exec_load_books_seconds_bucket{le="0.256"} 4681
+torus_exec_load_books_seconds_bucket{le="0.512"} 4681
+torus_exec_load_books_seconds_bucket{le="1.024"} 4681
+torus_exec_load_books_seconds_bucket{le="2.048"} 4681
+torus_exec_load_books_seconds_bucket{le="4.096"} 4681
+torus_exec_load_books_seconds_bucket{le="8.192"} 4681
+torus_exec_load_books_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_margin_configs_seconds Item 6 E4: the context's margin-config load (market rows scan + decode), part of load_books.
+# TYPE torus_exec_margin_configs_seconds histogram
+torus_exec_margin_configs_seconds_sum 0.5203521009999994
+torus_exec_margin_configs_seconds_count 4681
+torus_exec_margin_configs_seconds_bucket{le="0.0001"} 2933
+torus_exec_margin_configs_seconds_bucket{le="0.0002"} 4450
+torus_exec_margin_configs_seconds_bucket{le="0.0004"} 4595
+torus_exec_margin_configs_seconds_bucket{le="0.0008"} 4653
+torus_exec_margin_configs_seconds_bucket{le="0.0016"} 4673
+torus_exec_margin_configs_seconds_bucket{le="0.0032"} 4680
+torus_exec_margin_configs_seconds_bucket{le="0.0064"} 4681
+torus_exec_margin_configs_seconds_bucket{le="0.0128"} 4681
+torus_exec_margin_configs_seconds_bucket{le="0.0256"} 4681
+torus_exec_margin_configs_seconds_bucket{le="0.0512"} 4681
+torus_exec_margin_configs_seconds_bucket{le="0.1024"} 4681
+torus_exec_margin_configs_seconds_bucket{le="0.2048"} 4681
+torus_exec_margin_configs_seconds_bucket{le="0.4096"} 4681
+torus_exec_margin_configs_seconds_bucket{le="0.8192"} 4681
+torus_exec_margin_configs_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_action_status_seconds Item 6 cut 1: the v2 action status (native failures mapped to body positions), exec thread.
+# TYPE torus_exec_action_status_seconds histogram
+torus_exec_action_status_seconds_sum 0.4731451470000006
+torus_exec_action_status_seconds_count 4681
+torus_exec_action_status_seconds_bucket{le="0.0001"} 3538
+torus_exec_action_status_seconds_bucket{le="0.0002"} 3809
+torus_exec_action_status_seconds_bucket{le="0.0004"} 4291
+torus_exec_action_status_seconds_bucket{le="0.0008"} 4623
+torus_exec_action_status_seconds_bucket{le="0.0016"} 4675
+torus_exec_action_status_seconds_bucket{le="0.0032"} 4677
+torus_exec_action_status_seconds_bucket{le="0.0064"} 4680
+torus_exec_action_status_seconds_bucket{le="0.0128"} 4681
+torus_exec_action_status_seconds_bucket{le="0.0256"} 4681
+torus_exec_action_status_seconds_bucket{le="0.0512"} 4681
+torus_exec_action_status_seconds_bucket{le="0.1024"} 4681
+torus_exec_action_status_seconds_bucket{le="0.2048"} 4681
+torus_exec_action_status_seconds_bucket{le="0.4096"} 4681
+torus_exec_action_status_seconds_bucket{le="0.8192"} 4681
+torus_exec_action_status_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_body_persist_seconds Exec phase: commit-callback block-body persist to CF_BLOCK_BODIES (+ marker).
+# TYPE torus_exec_body_persist_seconds histogram
+torus_exec_body_persist_seconds_sum 0.01945484900000015
+torus_exec_body_persist_seconds_count 5047
+torus_exec_body_persist_seconds_bucket{le="0.001"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.002"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.004"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.008"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.016"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.032"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.064"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.128"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.256"} 5047
+torus_exec_body_persist_seconds_bucket{le="0.512"} 5047
+torus_exec_body_persist_seconds_bucket{le="1.024"} 5047
+torus_exec_body_persist_seconds_bucket{le="2.048"} 5047
+torus_exec_body_persist_seconds_bucket{le="4.096"} 5047
+torus_exec_body_persist_seconds_bucket{le="8.192"} 5047
+torus_exec_body_persist_seconds_bucket{le="+Inf"} 5047
+# HELP torus_commit_persist_seconds Consensus thread: commit-time durable header+body+manifest persist (one WriteBatch, FIX 1a).
+# TYPE torus_commit_persist_seconds histogram
+torus_commit_persist_seconds_sum 15.910968035000013
+torus_commit_persist_seconds_count 5047
+torus_commit_persist_seconds_bucket{le="0.001"} 3637
+torus_commit_persist_seconds_bucket{le="0.002"} 3782
+torus_commit_persist_seconds_bucket{le="0.004"} 4066
+torus_commit_persist_seconds_bucket{le="0.008"} 4278
+torus_commit_persist_seconds_bucket{le="0.016"} 4653
+torus_commit_persist_seconds_bucket{le="0.032"} 5024
+torus_commit_persist_seconds_bucket{le="0.064"} 5044
+torus_commit_persist_seconds_bucket{le="0.128"} 5047
+torus_commit_persist_seconds_bucket{le="0.256"} 5047
+torus_commit_persist_seconds_bucket{le="0.512"} 5047
+torus_commit_persist_seconds_bucket{le="1.024"} 5047
+torus_commit_persist_seconds_bucket{le="2.048"} 5047
+torus_commit_persist_seconds_bucket{le="4.096"} 5047
+torus_commit_persist_seconds_bucket{le="8.192"} 5047
+torus_commit_persist_seconds_bucket{le="+Inf"} 5047
+# HELP torus_vote_state_write_seconds Consensus thread: vote-state write, done before the vote is sent (s65).
+# TYPE torus_vote_state_write_seconds histogram
+torus_vote_state_write_seconds_sum 0.2917406430000003
+torus_vote_state_write_seconds_count 5050
+torus_vote_state_write_seconds_bucket{le="0.00001"} 90
+torus_vote_state_write_seconds_bucket{le="0.00002"} 2398
+torus_vote_state_write_seconds_bucket{le="0.00004"} 4347
+torus_vote_state_write_seconds_bucket{le="0.00008"} 4929
+torus_vote_state_write_seconds_bucket{le="0.00016"} 4990
+torus_vote_state_write_seconds_bucket{le="0.00032"} 4997
+torus_vote_state_write_seconds_bucket{le="0.00064"} 5008
+torus_vote_state_write_seconds_bucket{le="0.00128"} 5017
+torus_vote_state_write_seconds_bucket{le="0.00256"} 5030
+torus_vote_state_write_seconds_bucket{le="0.00512"} 5037
+torus_vote_state_write_seconds_bucket{le="0.01024"} 5049
+torus_vote_state_write_seconds_bucket{le="0.02048"} 5050
+torus_vote_state_write_seconds_bucket{le="0.04096"} 5050
+torus_vote_state_write_seconds_bucket{le="0.08192"} 5050
+torus_vote_state_write_seconds_bucket{le="0.16384"} 5050
+torus_vote_state_write_seconds_bucket{le="+Inf"} 5050
+# HELP torus_commit_body_encode_seconds Consensus thread: body-record encode alone inside the commit-time persist.
+# TYPE torus_commit_body_encode_seconds histogram
+torus_commit_body_encode_seconds_sum 4.359074703999994
+torus_commit_body_encode_seconds_count 5047
+torus_commit_body_encode_seconds_bucket{le="0.0005"} 3768
+torus_commit_body_encode_seconds_bucket{le="0.001"} 4023
+torus_commit_body_encode_seconds_bucket{le="0.002"} 4257
+torus_commit_body_encode_seconds_bucket{le="0.004"} 4581
+torus_commit_body_encode_seconds_bucket{le="0.008"} 5001
+torus_commit_body_encode_seconds_bucket{le="0.016"} 5043
+torus_commit_body_encode_seconds_bucket{le="0.032"} 5047
+torus_commit_body_encode_seconds_bucket{le="0.064"} 5047
+torus_commit_body_encode_seconds_bucket{le="0.128"} 5047
+torus_commit_body_encode_seconds_bucket{le="0.256"} 5047
+torus_commit_body_encode_seconds_bucket{le="0.512"} 5047
+torus_commit_body_encode_seconds_bucket{le="1.024"} 5047
+torus_commit_body_encode_seconds_bucket{le="2.048"} 5047
+torus_commit_body_encode_seconds_bucket{le="4.096"} 5047
+torus_commit_body_encode_seconds_bucket{le="+Inf"} 5047
+# HELP torus_commit_persist_write_seconds Consensus thread: RocksDB WriteBatch write alone inside the commit-time persist.
+# TYPE torus_commit_persist_write_seconds histogram
+torus_commit_persist_write_seconds_sum 8.753461969999997
+torus_commit_persist_write_seconds_count 5047
+torus_commit_persist_write_seconds_bucket{le="0.0005"} 3611
+torus_commit_persist_write_seconds_bucket{le="0.001"} 3736
+torus_commit_persist_write_seconds_bucket{le="0.002"} 3977
+torus_commit_persist_write_seconds_bucket{le="0.004"} 4248
+torus_commit_persist_write_seconds_bucket{le="0.008"} 4581
+torus_commit_persist_write_seconds_bucket{le="0.016"} 5009
+torus_commit_persist_write_seconds_bucket{le="0.032"} 5041
+torus_commit_persist_write_seconds_bucket{le="0.064"} 5044
+torus_commit_persist_write_seconds_bucket{le="0.128"} 5047
+torus_commit_persist_write_seconds_bucket{le="0.256"} 5047
+torus_commit_persist_write_seconds_bucket{le="0.512"} 5047
+torus_commit_persist_write_seconds_bucket{le="1.024"} 5047
+torus_commit_persist_write_seconds_bucket{le="2.048"} 5047
+torus_commit_persist_write_seconds_bucket{le="4.096"} 5047
+torus_commit_persist_write_seconds_bucket{le="+Inf"} 5047
+# HELP torus_validate_block_seconds Consensus thread: whole validate_block (every exit path).
+# TYPE torus_validate_block_seconds histogram
+torus_validate_block_seconds_sum 8.256146234000007
+torus_validate_block_seconds_count 3366
+torus_validate_block_seconds_bucket{le="0.001"} 2415
+torus_validate_block_seconds_bucket{le="0.002"} 2543
+torus_validate_block_seconds_bucket{le="0.004"} 2713
+torus_validate_block_seconds_bucket{le="0.008"} 2945
+torus_validate_block_seconds_bucket{le="0.016"} 3265
+torus_validate_block_seconds_bucket{le="0.032"} 3349
+torus_validate_block_seconds_bucket{le="0.064"} 3366
+torus_validate_block_seconds_bucket{le="0.128"} 3366
+torus_validate_block_seconds_bucket{le="0.256"} 3366
+torus_validate_block_seconds_bucket{le="0.512"} 3366
+torus_validate_block_seconds_bucket{le="1.024"} 3366
+torus_validate_block_seconds_bucket{le="2.048"} 3366
+torus_validate_block_seconds_bucket{le="4.096"} 3366
+torus_validate_block_seconds_bucket{le="8.192"} 3366
+torus_validate_block_seconds_bucket{le="+Inf"} 3366
+# HELP torus_validate_block_decode_seconds Consensus thread: proposal datum decode inside validate_block.
+# TYPE torus_validate_block_decode_seconds histogram
+torus_validate_block_decode_seconds_sum 0.014198104000000088
+torus_validate_block_decode_seconds_count 3366
+torus_validate_block_decode_seconds_bucket{le="0.0005"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.001"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.002"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.004"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.008"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.016"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.032"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.064"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.128"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.256"} 3366
+torus_validate_block_decode_seconds_bucket{le="0.512"} 3366
+torus_validate_block_decode_seconds_bucket{le="1.024"} 3366
+torus_validate_block_decode_seconds_bucket{le="2.048"} 3366
+torus_validate_block_decode_seconds_bucket{le="4.096"} 3366
+torus_validate_block_decode_seconds_bucket{le="+Inf"} 3366
+# HELP torus_validate_block_da_reconstruct_seconds Consensus thread: native-body DA reconstruct/mirror inside validate_block (incl. any wait).
+# TYPE torus_validate_block_da_reconstruct_seconds histogram
+torus_validate_block_da_reconstruct_seconds_sum 8.022751307999995
+torus_validate_block_da_reconstruct_seconds_count 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.0005"} 368
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.001"} 486
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.002"} 615
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.004"} 780
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.008"} 1015
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.016"} 1328
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.032"} 1411
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.064"} 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.128"} 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.256"} 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="0.512"} 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="1.024"} 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="2.048"} 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="4.096"} 1426
+torus_validate_block_da_reconstruct_seconds_bucket{le="+Inf"} 1426
+# HELP torus_validate_block_attest_seconds Consensus thread: sig attestation / batch signature verify inside validate_block.
+# TYPE torus_validate_block_attest_seconds histogram
+torus_validate_block_attest_seconds_sum 0.0
+torus_validate_block_attest_seconds_count 0
+torus_validate_block_attest_seconds_bucket{le="0.0005"} 0
+torus_validate_block_attest_seconds_bucket{le="0.001"} 0
+torus_validate_block_attest_seconds_bucket{le="0.002"} 0
+torus_validate_block_attest_seconds_bucket{le="0.004"} 0
+torus_validate_block_attest_seconds_bucket{le="0.008"} 0
+torus_validate_block_attest_seconds_bucket{le="0.016"} 0
+torus_validate_block_attest_seconds_bucket{le="0.032"} 0
+torus_validate_block_attest_seconds_bucket{le="0.064"} 0
+torus_validate_block_attest_seconds_bucket{le="0.128"} 0
+torus_validate_block_attest_seconds_bucket{le="0.256"} 0
+torus_validate_block_attest_seconds_bucket{le="0.512"} 0
+torus_validate_block_attest_seconds_bucket{le="1.024"} 0
+torus_validate_block_attest_seconds_bucket{le="2.048"} 0
+torus_validate_block_attest_seconds_bucket{le="4.096"} 0
+torus_validate_block_attest_seconds_bucket{le="+Inf"} 0
+# HELP torus_validate_block_custody_seconds Consensus thread: shard custody encode inside validate_block.
+# TYPE torus_validate_block_custody_seconds histogram
+torus_validate_block_custody_seconds_sum 0.0008308300000000022
+torus_validate_block_custody_seconds_count 2096
+torus_validate_block_custody_seconds_bucket{le="0.0005"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.001"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.002"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.004"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.008"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.016"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.032"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.064"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.128"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.256"} 2096
+torus_validate_block_custody_seconds_bucket{le="0.512"} 2096
+torus_validate_block_custody_seconds_bucket{le="1.024"} 2096
+torus_validate_block_custody_seconds_bucket{le="2.048"} 2096
+torus_validate_block_custody_seconds_bucket{le="4.096"} 2096
+torus_validate_block_custody_seconds_bucket{le="+Inf"} 2096
+# HELP torus_validate_block_da_flush_seconds Consensus thread: ingress DA-mirror flush before the compact reconstruct read.
+# TYPE torus_validate_block_da_flush_seconds histogram
+torus_validate_block_da_flush_seconds_sum 0.214559884
+torus_validate_block_da_flush_seconds_count 130
+torus_validate_block_da_flush_seconds_bucket{le="0.0001"} 59
+torus_validate_block_da_flush_seconds_bucket{le="0.0002"} 63
+torus_validate_block_da_flush_seconds_bucket{le="0.0004"} 70
+torus_validate_block_da_flush_seconds_bucket{le="0.0008"} 87
+torus_validate_block_da_flush_seconds_bucket{le="0.0016"} 99
+torus_validate_block_da_flush_seconds_bucket{le="0.0032"} 109
+torus_validate_block_da_flush_seconds_bucket{le="0.0064"} 119
+torus_validate_block_da_flush_seconds_bucket{le="0.0128"} 128
+torus_validate_block_da_flush_seconds_bucket{le="0.0256"} 130
+torus_validate_block_da_flush_seconds_bucket{le="0.0512"} 130
+torus_validate_block_da_flush_seconds_bucket{le="0.1024"} 130
+torus_validate_block_da_flush_seconds_bucket{le="0.2048"} 130
+torus_validate_block_da_flush_seconds_bucket{le="0.4096"} 130
+torus_validate_block_da_flush_seconds_bucket{le="0.8192"} 130
+torus_validate_block_da_flush_seconds_bucket{le="1.6384"} 130
+torus_validate_block_da_flush_seconds_bucket{le="3.2768"} 130
+torus_validate_block_da_flush_seconds_bucket{le="+Inf"} 130
+# HELP torus_validate_block_da_flush_bodies Bodies written by the ingress DA-mirror flush inside validate_block.
+# TYPE torus_validate_block_da_flush_bodies counter
+torus_validate_block_da_flush_bodies_total 2082
+# HELP torus_validate_block_da_multiget_seconds Consensus thread: RocksDB MultiGet of the compact reconstruct's first read.
+# TYPE torus_validate_block_da_multiget_seconds histogram
+torus_validate_block_da_multiget_seconds_sum 1.471682417
+torus_validate_block_da_multiget_seconds_count 1426
+torus_validate_block_da_multiget_seconds_bucket{le="0.0001"} 364
+torus_validate_block_da_multiget_seconds_bucket{le="0.0002"} 483
+torus_validate_block_da_multiget_seconds_bucket{le="0.0004"} 638
+torus_validate_block_da_multiget_seconds_bucket{le="0.0008"} 804
+torus_validate_block_da_multiget_seconds_bucket{le="0.0016"} 1047
+torus_validate_block_da_multiget_seconds_bucket{le="0.0032"} 1363
+torus_validate_block_da_multiget_seconds_bucket{le="0.0064"} 1413
+torus_validate_block_da_multiget_seconds_bucket{le="0.0128"} 1424
+torus_validate_block_da_multiget_seconds_bucket{le="0.0256"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="0.0512"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="0.1024"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="0.2048"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="0.4096"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="0.8192"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="1.6384"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="3.2768"} 1426
+torus_validate_block_da_multiget_seconds_bucket{le="+Inf"} 1426
+# HELP torus_validate_block_da_decode_seconds Consensus thread: body decode of the compact reconstruct's first read.
+# TYPE torus_validate_block_da_decode_seconds histogram
+torus_validate_block_da_decode_seconds_sum 4.887545967000002
+torus_validate_block_da_decode_seconds_count 1426
+torus_validate_block_da_decode_seconds_bucket{le="0.0001"} 261
+torus_validate_block_da_decode_seconds_bucket{le="0.0002"} 338
+torus_validate_block_da_decode_seconds_bucket{le="0.0004"} 442
+torus_validate_block_da_decode_seconds_bucket{le="0.0008"} 536
+torus_validate_block_da_decode_seconds_bucket{le="0.0016"} 675
+torus_validate_block_da_decode_seconds_bucket{le="0.0032"} 862
+torus_validate_block_da_decode_seconds_bucket{le="0.0064"} 1089
+torus_validate_block_da_decode_seconds_bucket{le="0.0128"} 1393
+torus_validate_block_da_decode_seconds_bucket{le="0.0256"} 1425
+torus_validate_block_da_decode_seconds_bucket{le="0.0512"} 1426
+torus_validate_block_da_decode_seconds_bucket{le="0.1024"} 1426
+torus_validate_block_da_decode_seconds_bucket{le="0.2048"} 1426
+torus_validate_block_da_decode_seconds_bucket{le="0.4096"} 1426
+torus_validate_block_da_decode_seconds_bucket{le="0.8192"} 1426
+torus_validate_block_da_decode_seconds_bucket{le="1.6384"} 1426
+torus_validate_block_da_decode_seconds_bucket{le="3.2768"} 1426
+torus_validate_block_da_decode_seconds_bucket{le="+Inf"} 1426
+# HELP torus_validate_block_da_wait_seconds Consensus thread: local wait for bodies missing on the first read.
+# TYPE torus_validate_block_da_wait_seconds histogram
+torus_validate_block_da_wait_seconds_sum 1.4324469210000004
+torus_validate_block_da_wait_seconds_count 78
+torus_validate_block_da_wait_seconds_bucket{le="0.0001"} 0
+torus_validate_block_da_wait_seconds_bucket{le="0.0002"} 0
+torus_validate_block_da_wait_seconds_bucket{le="0.0004"} 1
+torus_validate_block_da_wait_seconds_bucket{le="0.0008"} 1
+torus_validate_block_da_wait_seconds_bucket{le="0.0016"} 2
+torus_validate_block_da_wait_seconds_bucket{le="0.0032"} 5
+torus_validate_block_da_wait_seconds_bucket{le="0.0064"} 16
+torus_validate_block_da_wait_seconds_bucket{le="0.0128"} 22
+torus_validate_block_da_wait_seconds_bucket{le="0.0256"} 60
+torus_validate_block_da_wait_seconds_bucket{le="0.0512"} 78
+torus_validate_block_da_wait_seconds_bucket{le="0.1024"} 78
+torus_validate_block_da_wait_seconds_bucket{le="0.2048"} 78
+torus_validate_block_da_wait_seconds_bucket{le="0.4096"} 78
+torus_validate_block_da_wait_seconds_bucket{le="0.8192"} 78
+torus_validate_block_da_wait_seconds_bucket{le="1.6384"} 78
+torus_validate_block_da_wait_seconds_bucket{le="3.2768"} 78
+torus_validate_block_da_wait_seconds_bucket{le="+Inf"} 78
+# HELP torus_validate_block_attest_lookup_seconds Consensus thread: proposer validator lookup inside the attestation check.
+# TYPE torus_validate_block_attest_lookup_seconds histogram
+torus_validate_block_attest_lookup_seconds_sum 0.0
+torus_validate_block_attest_lookup_seconds_count 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0001"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0002"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0004"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0008"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0016"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0032"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0064"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0128"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0256"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.0512"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.1024"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.2048"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.4096"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="0.8192"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="1.6384"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="3.2768"} 0
+torus_validate_block_attest_lookup_seconds_bucket{le="+Inf"} 0
+# HELP torus_on_committed_block_seconds Consensus thread: whole on_committed_block hook (persist + prune + dispatch).
+# TYPE torus_on_committed_block_seconds histogram
+torus_on_committed_block_seconds_sum 73.51826027999994
+torus_on_committed_block_seconds_count 5047
+torus_on_committed_block_seconds_bucket{le="0.001"} 3291
+torus_on_committed_block_seconds_bucket{le="0.002"} 3444
+torus_on_committed_block_seconds_bucket{le="0.004"} 3591
+torus_on_committed_block_seconds_bucket{le="0.008"} 3803
+torus_on_committed_block_seconds_bucket{le="0.016"} 4065
+torus_on_committed_block_seconds_bucket{le="0.032"} 4292
+torus_on_committed_block_seconds_bucket{le="0.064"} 4788
+torus_on_committed_block_seconds_bucket{le="0.128"} 4940
+torus_on_committed_block_seconds_bucket{le="0.256"} 5023
+torus_on_committed_block_seconds_bucket{le="0.512"} 5036
+torus_on_committed_block_seconds_bucket{le="1.024"} 5047
+torus_on_committed_block_seconds_bucket{le="2.048"} 5047
+torus_on_committed_block_seconds_bucket{le="4.096"} 5047
+torus_on_committed_block_seconds_bucket{le="8.192"} 5047
+torus_on_committed_block_seconds_bucket{le="+Inf"} 5047
+# HELP torus_mempool_remove_committed_seconds Consensus thread: remove_committed_native inside the commit dispatch.
+# TYPE torus_mempool_remove_committed_seconds histogram
+torus_mempool_remove_committed_seconds_sum 6.434378447999989
+torus_mempool_remove_committed_seconds_count 2095
+torus_mempool_remove_committed_seconds_bucket{le="0.0005"} 1009
+torus_mempool_remove_committed_seconds_bucket{le="0.001"} 1313
+torus_mempool_remove_committed_seconds_bucket{le="0.002"} 1779
+torus_mempool_remove_committed_seconds_bucket{le="0.004"} 1907
+torus_mempool_remove_committed_seconds_bucket{le="0.008"} 1967
+torus_mempool_remove_committed_seconds_bucket{le="0.016"} 2015
+torus_mempool_remove_committed_seconds_bucket{le="0.032"} 2055
+torus_mempool_remove_committed_seconds_bucket{le="0.064"} 2075
+torus_mempool_remove_committed_seconds_bucket{le="0.128"} 2089
+torus_mempool_remove_committed_seconds_bucket{le="0.256"} 2095
+torus_mempool_remove_committed_seconds_bucket{le="0.512"} 2095
+torus_mempool_remove_committed_seconds_bucket{le="1.024"} 2095
+torus_mempool_remove_committed_seconds_bucket{le="2.048"} 2095
+torus_mempool_remove_committed_seconds_bucket{le="4.096"} 2095
+torus_mempool_remove_committed_seconds_bucket{le="+Inf"} 2095
+# HELP torus_da_bodies_gc_deleted Committed native-action bodies deleted from the DA store after the retention window (RH4).
+# TYPE torus_da_bodies_gc_deleted counter
+torus_da_bodies_gc_deleted_total 0
+# HELP torus_da_gc_seconds One DA body GC pass (on its worker thread; inside the commit dispatch with TORUS_DA_GC_INLINE=1) (RH4).
+# TYPE torus_da_gc_seconds histogram
+torus_da_gc_seconds_sum 0.0
+torus_da_gc_seconds_count 0
+torus_da_gc_seconds_bucket{le="0.0001"} 0
+torus_da_gc_seconds_bucket{le="0.0002"} 0
+torus_da_gc_seconds_bucket{le="0.0004"} 0
+torus_da_gc_seconds_bucket{le="0.0008"} 0
+torus_da_gc_seconds_bucket{le="0.0016"} 0
+torus_da_gc_seconds_bucket{le="0.0032"} 0
+torus_da_gc_seconds_bucket{le="0.0064"} 0
+torus_da_gc_seconds_bucket{le="0.0128"} 0
+torus_da_gc_seconds_bucket{le="0.0256"} 0
+torus_da_gc_seconds_bucket{le="0.0512"} 0
+torus_da_gc_seconds_bucket{le="0.1024"} 0
+torus_da_gc_seconds_bucket{le="0.2048"} 0
+torus_da_gc_seconds_bucket{le="0.4096"} 0
+torus_da_gc_seconds_bucket{le="0.8192"} 0
+torus_da_gc_seconds_bucket{le="1.6384"} 0
+torus_da_gc_seconds_bucket{le="+Inf"} 0
+# HELP torus_da_gc_last_pass_max_seconds Longest DA body GC pass since the previous scrape; a scrape resets it (RH4).
+# TYPE torus_da_gc_last_pass_max_seconds gauge
+torus_da_gc_last_pass_max_seconds 0.0
+# HELP torus_da_gc_slow_passes DA body GC passes at or over TORUS_DA_GC_SLOW_MS (default 50 ms); each logs one warn line (RH4).
+# TYPE torus_da_gc_slow_passes counter
+torus_da_gc_slow_passes_total 0
+# HELP torus_da_gc_handoff_seconds Consensus thread: handing one dispatched height to the DA body GC worker (the whole pass with TORUS_DA_GC_INLINE=1) (RH4).
+# TYPE torus_da_gc_handoff_seconds histogram
+torus_da_gc_handoff_seconds_sum 0.0
+torus_da_gc_handoff_seconds_count 0
+torus_da_gc_handoff_seconds_bucket{le="0.000001"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000002"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000004"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000008"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000016"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000032"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000064"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000128"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000256"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.000512"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.001024"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.002048"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.004096"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.008192"} 0
+torus_da_gc_handoff_seconds_bucket{le="0.016384"} 0
+torus_da_gc_handoff_seconds_bucket{le="+Inf"} 0
+# HELP torus_da_gc_queue_depth Dispatched heights waiting in the DA body GC worker's queue (RH4).
+# TYPE torus_da_gc_queue_depth gauge
+torus_da_gc_queue_depth 0
+# HELP torus_da_gc_lag_heights Highest dispatched height minus the highest height the DA body GC worker finished (RH4).
+# TYPE torus_da_gc_lag_heights gauge
+torus_da_gc_lag_heights 0
+# HELP torus_da_gc_coalesced_heights Heights handed to the DA body GC worker while its queue was full; back-filled from the block tree (RH4).
+# TYPE torus_da_gc_coalesced_heights counter
+torus_da_gc_coalesced_heights_total 0
+# HELP torus_da_gc_fence_kept Due DA bodies the GC worker kept because a concurrent proposal check or validation pinned them (RH4).
+# TYPE torus_da_gc_fence_kept counter
+torus_da_gc_fence_kept_total 0
+# HELP torus_da_gc_fence_pins Hashes pinned against the DA body GC worker by proposal checks and validation (RH4).
+# TYPE torus_da_gc_fence_pins gauge
+torus_da_gc_fence_pins 0
+# HELP torus_da_gc_fence_refused_pins Body checks whose DA body GC fence pin was refused (height beyond the window above the committed tip): their bodies were treated as missing (RH4).
+# TYPE torus_da_gc_fence_refused_pins counter
+torus_da_gc_fence_refused_pins_total 0
+# HELP torus_exec_resting_orders Total resting orders across all books, sampled per block after load/rebuild.
+# TYPE torus_exec_resting_orders gauge
+torus_exec_resting_orders 92664
+# HELP torus_exec_resident_rebuilds rank8 resident-mode blocks that rebuilt the order books from persisted state (holder empty/drained or staleness guard tripped) — full reload on the exec thread.
+# TYPE torus_exec_resident_rebuilds counter
+torus_exec_resident_rebuilds_total 1
+# HELP torus_exec_resident_rows Item 6: raw rows resident in memory (R; Phase 4: liquidation, oracle, market rows; positions and balances: torus_exec_resident_users).
+# TYPE torus_exec_resident_rows gauge
+torus_exec_resident_rows 902
+# HELP torus_exec_resident_rows_bytes Item 6: key + value bytes of the resident rows R's raw rows (Phase 4: without positions and balances).
+# TYPE torus_exec_resident_rows_bytes gauge
+torus_exec_resident_rows_bytes 42859
+# HELP torus_exec_resident_users Item 6 Phase 4: rows of cf_native_positions + cf_native_balances held by the Users record set (R's source for them).
+# TYPE torus_exec_resident_users gauge
+torus_exec_resident_users 1605060
+# HELP torus_exec_resident_users_bytes Item 6 Phase 4: key + value bytes of the rows the Users record set holds.
+# TYPE torus_exec_resident_users_bytes gauge
+torus_exec_resident_users_bytes 214003180
+# HELP torus_exec_resident_rows_rebuilds Item 6: native blocks that rebuilt the resident rows R from the DB + parent layer.
+# TYPE torus_exec_resident_rows_rebuilds counter
+torus_exec_resident_rows_rebuilds_total 1
+# HELP torus_exec_resident_rows_build_seconds Item 6: time to build the resident rows R (full scan of both CFs).
+# TYPE torus_exec_resident_rows_build_seconds histogram
+torus_exec_resident_rows_build_seconds_sum 0.047254181
+torus_exec_resident_rows_build_seconds_count 1
+torus_exec_resident_rows_build_seconds_bucket{le="0.001"} 0
+torus_exec_resident_rows_build_seconds_bucket{le="0.002"} 0
+torus_exec_resident_rows_build_seconds_bucket{le="0.004"} 0
+torus_exec_resident_rows_build_seconds_bucket{le="0.008"} 0
+torus_exec_resident_rows_build_seconds_bucket{le="0.016"} 0
+torus_exec_resident_rows_build_seconds_bucket{le="0.032"} 0
+torus_exec_resident_rows_build_seconds_bucket{le="0.064"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="0.128"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="0.256"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="0.512"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="1.024"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="2.048"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="4.096"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="8.192"} 1
+torus_exec_resident_rows_build_seconds_bucket{le="+Inf"} 1
+# HELP torus_exec_end_resident_seconds Item 6: end_resident (resident rows R end-of-block upkeep on the exec thread).
+# TYPE torus_exec_end_resident_seconds histogram
+torus_exec_end_resident_seconds_sum 28.597499002999986
+torus_exec_end_resident_seconds_count 4681
+torus_exec_end_resident_seconds_bucket{le="0.001"} 2869
+torus_exec_end_resident_seconds_bucket{le="0.002"} 3081
+torus_exec_end_resident_seconds_bucket{le="0.004"} 3274
+torus_exec_end_resident_seconds_bucket{le="0.008"} 3565
+torus_exec_end_resident_seconds_bucket{le="0.016"} 3943
+torus_exec_end_resident_seconds_bucket{le="0.032"} 4470
+torus_exec_end_resident_seconds_bucket{le="0.064"} 4679
+torus_exec_end_resident_seconds_bucket{le="0.128"} 4681
+torus_exec_end_resident_seconds_bucket{le="0.256"} 4681
+torus_exec_end_resident_seconds_bucket{le="0.512"} 4681
+torus_exec_end_resident_seconds_bucket{le="1.024"} 4681
+torus_exec_end_resident_seconds_bucket{le="2.048"} 4681
+torus_exec_end_resident_seconds_bucket{le="4.096"} 4681
+torus_exec_end_resident_seconds_bucket{le="8.192"} 4681
+torus_exec_end_resident_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_end_resident_rows_seconds Item 6: end_resident, R applying the block's delta (ResidentRows::apply).
+# TYPE torus_exec_end_resident_rows_seconds histogram
+torus_exec_end_resident_rows_seconds_sum 0.30966220700000038
+torus_exec_end_resident_rows_seconds_count 4681
+torus_exec_end_resident_rows_seconds_bucket{le="0.001"} 4670
+torus_exec_end_resident_rows_seconds_bucket{le="0.002"} 4679
+torus_exec_end_resident_rows_seconds_bucket{le="0.004"} 4679
+torus_exec_end_resident_rows_seconds_bucket{le="0.008"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="0.016"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="0.032"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="0.064"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="0.128"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="0.256"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="0.512"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="1.024"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="2.048"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="4.096"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="8.192"} 4681
+torus_exec_end_resident_rows_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_end_resident_users_seconds Item 6 Phase 4: end_resident, the Users record set (positions, balances, cvlm rows) following the delta plus the sums carry.
+# TYPE torus_exec_end_resident_users_seconds histogram
+torus_exec_end_resident_users_seconds_sum 18.499509480000066
+torus_exec_end_resident_users_seconds_count 4681
+torus_exec_end_resident_users_seconds_bucket{le="0.001"} 3024
+torus_exec_end_resident_users_seconds_bucket{le="0.002"} 3198
+torus_exec_end_resident_users_seconds_bucket{le="0.004"} 3399
+torus_exec_end_resident_users_seconds_bucket{le="0.008"} 3810
+torus_exec_end_resident_users_seconds_bucket{le="0.016"} 4239
+torus_exec_end_resident_users_seconds_bucket{le="0.032"} 4640
+torus_exec_end_resident_users_seconds_bucket{le="0.064"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="0.128"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="0.256"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="0.512"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="1.024"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="2.048"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="4.096"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="8.192"} 4681
+torus_exec_end_resident_users_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_end_resident_wait_seconds Item 6: exec thread waiting for the end_resident worker at the join (exposed end_resident).
+# TYPE torus_exec_end_resident_wait_seconds histogram
+torus_exec_end_resident_wait_seconds_sum 5.453833933000024
+torus_exec_end_resident_wait_seconds_count 4681
+torus_exec_end_resident_wait_seconds_bucket{le="0.0005"} 3749
+torus_exec_end_resident_wait_seconds_bucket{le="0.001"} 3842
+torus_exec_end_resident_wait_seconds_bucket{le="0.002"} 3981
+torus_exec_end_resident_wait_seconds_bucket{le="0.004"} 4191
+torus_exec_end_resident_wait_seconds_bucket{le="0.008"} 4445
+torus_exec_end_resident_wait_seconds_bucket{le="0.016"} 4636
+torus_exec_end_resident_wait_seconds_bucket{le="0.032"} 4679
+torus_exec_end_resident_wait_seconds_bucket{le="0.064"} 4681
+torus_exec_end_resident_wait_seconds_bucket{le="0.128"} 4681
+torus_exec_end_resident_wait_seconds_bucket{le="0.256"} 4681
+torus_exec_end_resident_wait_seconds_bucket{le="0.512"} 4681
+torus_exec_end_resident_wait_seconds_bucket{le="1.024"} 4681
+torus_exec_end_resident_wait_seconds_bucket{le="2.048"} 4681
+torus_exec_end_resident_wait_seconds_bucket{le="4.096"} 4681
+torus_exec_end_resident_wait_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_cancel_all Item 6 P2-1: cancel-alls executed (user and liquidation step).
+# TYPE torus_exec_cancel_all counter
+torus_exec_cancel_all_total 164789
+# HELP torus_exec_cancel_all_books_visited Item 6 P2-1: books the cancel-alls visited.
+# TYPE torus_exec_cancel_all_books_visited counter
+torus_exec_cancel_all_books_visited_total 32426955
+# HELP torus_exec_cancel_all_books_hit Item 6 P2-1: books where the cancel-all sender had orders or stops.
+# TYPE torus_exec_cancel_all_books_hit counter
+torus_exec_cancel_all_books_hit_total 15759266
+# HELP torus_exec_by_id_actions Item 6 P2-1b: CancelOrder / ModifyOrder executed.
+# TYPE torus_exec_by_id_actions counter
+torus_exec_by_id_actions_total 0
+# HELP torus_exec_by_id_books_probed Item 6 P2-1b: books CancelOrder / ModifyOrder probed to find the order.
+# TYPE torus_exec_by_id_books_probed counter
+torus_exec_by_id_books_probed_total 0
+# HELP torus_exec_cancel_all_index_entries Item 6 P2-1: (trader, market) entries in the cancel-all index after the last native block.
+# TYPE torus_exec_cancel_all_index_entries gauge
+torus_exec_cancel_all_index_entries 161415
+# HELP torus_exec_cancel_all_index_traders Item 6 P2-1: traders in the cancel-all index after the last native block.
+# TYPE torus_exec_cancel_all_index_traders gauge
+torus_exec_cancel_all_index_traders 759
+# HELP torus_exec_thread_spawns_match Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_match gauge
+torus_exec_thread_spawns_match 0
+# HELP torus_exec_thread_spawns_settle Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_settle gauge
+torus_exec_thread_spawns_settle 0
+# HELP torus_exec_thread_spawns_save_books Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_save_books gauge
+torus_exec_thread_spawns_save_books 0
+# HELP torus_exec_thread_spawns_margin_prepare Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_margin_prepare gauge
+torus_exec_thread_spawns_margin_prepare 0
+# HELP torus_exec_thread_spawns_open_orders Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_open_orders gauge
+torus_exec_thread_spawns_open_orders 0
+# HELP torus_exec_thread_spawns_end_resident Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_end_resident gauge
+torus_exec_thread_spawns_end_resident 1
+# HELP torus_exec_thread_spawns_flush_digest Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_flush_digest gauge
+torus_exec_thread_spawns_flush_digest 0
+# HELP torus_exec_thread_spawns_root_buckets Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_root_buckets gauge
+torus_exec_thread_spawns_root_buckets 0
+# HELP torus_exec_thread_spawns_load_books Item 6 P2-3: threads spawned at this execution-path site since process start.
+# TYPE torus_exec_thread_spawns_load_books gauge
+torus_exec_thread_spawns_load_books 0
+# HELP torus_exec_oracle_only_block_seconds Item 6: exec wall per oracle-only block (only SubmitOraclePrices, no EVM tx).
+# TYPE torus_exec_oracle_only_block_seconds histogram
+torus_exec_oracle_only_block_seconds_sum 0.379754441
+torus_exec_oracle_only_block_seconds_count 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.001"} 0
+torus_exec_oracle_only_block_seconds_bucket{le="0.0015"} 3
+torus_exec_oracle_only_block_seconds_bucket{le="0.0022500000000000004"} 16
+torus_exec_oracle_only_block_seconds_bucket{le="0.003375"} 28
+torus_exec_oracle_only_block_seconds_bucket{le="0.0050625"} 33
+torus_exec_oracle_only_block_seconds_bucket{le="0.00759375"} 33
+torus_exec_oracle_only_block_seconds_bucket{le="0.011390625"} 35
+torus_exec_oracle_only_block_seconds_bucket{le="0.0170859375"} 43
+torus_exec_oracle_only_block_seconds_bucket{le="0.02562890625"} 50
+torus_exec_oracle_only_block_seconds_bucket{le="0.038443359375"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.0576650390625"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.08649755859375"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.129746337890625"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.1946195068359375"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.29192926025390628"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.4378938903808594"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.656840835571289"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="0.9852612533569336"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="1.4778918800354005"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="2.2168378200531007"} 51
+torus_exec_oracle_only_block_seconds_bucket{le="+Inf"} 51
+# HELP torus_exec_queue_depth Committed blocks sent to the execution channel but not yet executed.
+# TYPE torus_exec_queue_depth gauge
+torus_exec_queue_depth 0
+# HELP torus_exec_throttle_tier Exec-backlog pacing tier applied to the proposer's latest native selection (0 full, 1 half, 2 quarter, 3 cancels-only).
+# TYPE torus_exec_throttle_tier gauge
+torus_exec_throttle_tier 0
+# HELP torus_exec_dispatch_deferred Committed blocks parked (deferred) because the exec channel was full (non-blocking dispatch).
+# TYPE torus_exec_dispatch_deferred counter
+torus_exec_dispatch_deferred_total 0
+# HELP torus_trade_writer_queued_batches Trade-history KV batches queued to the background CF writer but not yet written.
+# TYPE torus_trade_writer_queued_batches gauge
+torus_trade_writer_queued_batches 0
+# HELP torus_post_flush_writer_queued_batches Block-body KV batches queued to the post-flush background writer but not yet written.
+# TYPE torus_post_flush_writer_queued_batches gauge
+torus_post_flush_writer_queued_batches 0
+# HELP torus_exec_body_persist_write_seconds Exec phase: the RocksDB put inside the body persist only (excludes the body JSON encode).
+# TYPE torus_exec_body_persist_write_seconds histogram
+torus_exec_body_persist_write_seconds_sum 0.0
+torus_exec_body_persist_write_seconds_count 0
+torus_exec_body_persist_write_seconds_bucket{le="0.001"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.002"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.004"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.008"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.016"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.032"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.064"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.128"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.256"} 0
+torus_exec_body_persist_write_seconds_bucket{le="0.512"} 0
+torus_exec_body_persist_write_seconds_bucket{le="1.024"} 0
+torus_exec_body_persist_write_seconds_bucket{le="2.048"} 0
+torus_exec_body_persist_write_seconds_bucket{le="4.096"} 0
+torus_exec_body_persist_write_seconds_bucket{le="8.192"} 0
+torus_exec_body_persist_write_seconds_bucket{le="+Inf"} 0
+# HELP torus_exec_chain_seconds Exec CRITICAL CHAIN: serial wall time on the exec thread per NATIVE block (the ms this campaign drives to 100).
+# TYPE torus_exec_chain_seconds histogram
+torus_exec_chain_seconds_sum 297.94065075800065
+torus_exec_chain_seconds_count 4681
+torus_exec_chain_seconds_bucket{le="0.001"} 130
+torus_exec_chain_seconds_bucket{le="0.002"} 971
+torus_exec_chain_seconds_bucket{le="0.004"} 2083
+torus_exec_chain_seconds_bucket{le="0.008"} 2415
+torus_exec_chain_seconds_bucket{le="0.016"} 2735
+torus_exec_chain_seconds_bucket{le="0.032"} 3050
+torus_exec_chain_seconds_bucket{le="0.064"} 3409
+torus_exec_chain_seconds_bucket{le="0.128"} 3803
+torus_exec_chain_seconds_bucket{le="0.256"} 4291
+torus_exec_chain_seconds_bucket{le="0.512"} 4678
+torus_exec_chain_seconds_bucket{le="1.024"} 4681
+torus_exec_chain_seconds_bucket{le="2.048"} 4681
+torus_exec_chain_seconds_bucket{le="4.096"} 4681
+torus_exec_chain_seconds_bucket{le="8.192"} 4681
+torus_exec_chain_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_handoff_wait_seconds Exec chain: time the exec thread blocked handing a flush job to the worker (0 on a serial binary).
+# TYPE torus_exec_handoff_wait_seconds histogram
+torus_exec_handoff_wait_seconds_sum 0.07479877300000003
+torus_exec_handoff_wait_seconds_count 5047
+torus_exec_handoff_wait_seconds_bucket{le="0.0005"} 5025
+torus_exec_handoff_wait_seconds_bucket{le="0.001"} 5034
+torus_exec_handoff_wait_seconds_bucket{le="0.002"} 5040
+torus_exec_handoff_wait_seconds_bucket{le="0.004"} 5045
+torus_exec_handoff_wait_seconds_bucket{le="0.008"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="0.016"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="0.032"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="0.064"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="0.128"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="0.256"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="0.512"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="1.024"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="2.048"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="4.096"} 5047
+torus_exec_handoff_wait_seconds_bucket{le="+Inf"} 5047
+# HELP torus_flush_worker_seconds Flush worker: wall time per block job off the exec chain (never observed on a serial binary).
+# TYPE torus_flush_worker_seconds histogram
+torus_flush_worker_seconds_sum 26.849774256000019
+torus_flush_worker_seconds_count 5097
+torus_flush_worker_seconds_bucket{le="0.001"} 4989
+torus_flush_worker_seconds_bucket{le="0.002"} 5027
+torus_flush_worker_seconds_bucket{le="0.004"} 5047
+torus_flush_worker_seconds_bucket{le="0.008"} 5053
+torus_flush_worker_seconds_bucket{le="0.016"} 5055
+torus_flush_worker_seconds_bucket{le="0.032"} 5055
+torus_flush_worker_seconds_bucket{le="0.064"} 5056
+torus_flush_worker_seconds_bucket{le="0.128"} 5056
+torus_flush_worker_seconds_bucket{le="0.256"} 5066
+torus_flush_worker_seconds_bucket{le="0.512"} 5073
+torus_flush_worker_seconds_bucket{le="1.024"} 5091
+torus_flush_worker_seconds_bucket{le="2.048"} 5097
+torus_flush_worker_seconds_bucket{le="4.096"} 5097
+torus_flush_worker_seconds_bucket{le="8.192"} 5097
+torus_flush_worker_seconds_bucket{le="+Inf"} 5097
+# HELP torus_flush_worker_depth Flush jobs handed to the worker and not yet durable (0 on a serial binary; the harness drains on it).
+# TYPE torus_flush_worker_depth gauge
+torus_flush_worker_depth 0
+# HELP torus_exec_checkpoints Item 6 Phase 3: state checkpoints handed to the flush worker (0 without a checkpoint interval).
+# TYPE torus_exec_checkpoints counter
+torus_exec_checkpoints_total 50
+# HELP torus_exec_checkpoint_wait_seconds Item 6 Phase 3: exec thread blocked handing off a checkpoint (previous one still in flight).
+# TYPE torus_exec_checkpoint_wait_seconds histogram
+torus_exec_checkpoint_wait_seconds_sum 0.003525852999999999
+torus_exec_checkpoint_wait_seconds_count 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.0005"} 48
+torus_exec_checkpoint_wait_seconds_bucket{le="0.001"} 48
+torus_exec_checkpoint_wait_seconds_bucket{le="0.002"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.004"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.008"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.016"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.032"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.064"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.128"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.256"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="0.512"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="1.024"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="2.048"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="4.096"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="8.192"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="16.384"} 50
+torus_exec_checkpoint_wait_seconds_bucket{le="+Inf"} 50
+# HELP torus_exec_checkpoint_layer_bytes Item 6 Phase 3: since-checkpoint layer bytes per checkpoint.
+# TYPE torus_exec_checkpoint_layer_bytes histogram
+torus_exec_checkpoint_layer_bytes_sum 5411972388.0
+torus_exec_checkpoint_layer_bytes_count 50
+torus_exec_checkpoint_layer_bytes_bucket{le="65536.0"} 3
+torus_exec_checkpoint_layer_bytes_bucket{le="131072.0"} 5
+torus_exec_checkpoint_layer_bytes_bucket{le="262144.0"} 7
+torus_exec_checkpoint_layer_bytes_bucket{le="524288.0"} 8
+torus_exec_checkpoint_layer_bytes_bucket{le="1048576.0"} 8
+torus_exec_checkpoint_layer_bytes_bucket{le="2097152.0"} 8
+torus_exec_checkpoint_layer_bytes_bucket{le="4194304.0"} 8
+torus_exec_checkpoint_layer_bytes_bucket{le="8388608.0"} 8
+torus_exec_checkpoint_layer_bytes_bucket{le="16777216.0"} 8
+torus_exec_checkpoint_layer_bytes_bucket{le="33554432.0"} 10
+torus_exec_checkpoint_layer_bytes_bucket{le="67108864.0"} 23
+torus_exec_checkpoint_layer_bytes_bucket{le="134217728.0"} 28
+torus_exec_checkpoint_layer_bytes_bucket{le="268435456.0"} 50
+torus_exec_checkpoint_layer_bytes_bucket{le="536870912.0"} 50
+torus_exec_checkpoint_layer_bytes_bucket{le="1073741824.0"} 50
+torus_exec_checkpoint_layer_bytes_bucket{le="2147483648.0"} 50
+torus_exec_checkpoint_layer_bytes_bucket{le="+Inf"} 50
+# HELP torus_exec_checkpoint_layer_shared Item 6 Phase 3: layer still shared at the end of a block (deep copy; expected 0).
+# TYPE torus_exec_checkpoint_layer_shared counter
+torus_exec_checkpoint_layer_shared_total 0
+# HELP torus_exec_checkpoint_settle_wait_seconds Item 6 Phase 3: exec thread blocked joining the previous block's since-checkpoint layer merge (once per pipelined block).
+# TYPE torus_exec_checkpoint_settle_wait_seconds histogram
+torus_exec_checkpoint_settle_wait_seconds_sum 7.0617287519999929
+torus_exec_checkpoint_settle_wait_seconds_count 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.00005"} 2019
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0001"} 2751
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0002"} 2976
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0004"} 3053
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0008"} 3169
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0016"} 3686
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0032"} 4296
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0064"} 4743
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0128"} 5020
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0256"} 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.0512"} 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.1024"} 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.2048"} 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.4096"} 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="0.8192"} 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="1.6384"} 5047
+torus_exec_checkpoint_settle_wait_seconds_bucket{le="+Inf"} 5047
+# HELP torus_exec_checkpoint_deferred_join_seconds Item 6 Phase 3: exec thread blocked at the end of a pipelined block joining the deferred (positions, balances) part of the layer merge (inside upkeep; once per pipelined block).
+# TYPE torus_exec_checkpoint_deferred_join_seconds histogram
+torus_exec_checkpoint_deferred_join_seconds_sum 1.4294333809999956
+torus_exec_checkpoint_deferred_join_seconds_count 5047
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.00005"} 4810
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.0001"} 4816
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.00025"} 4821
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.0005"} 4827
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.001"} 4840
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.0015"} 4862
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.002"} 4868
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.003"} 4890
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.004"} 4925
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.005"} 4944
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.006"} 4965
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.008"} 4987
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.01"} 5002
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.012"} 5017
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.015"} 5030
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.02"} 5042
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.025"} 5045
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.03"} 5046
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.04"} 5046
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.05"} 5046
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.075"} 5047
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.1"} 5047
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.25"} 5047
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="0.5"} 5047
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="1.0"} 5047
+torus_exec_checkpoint_deferred_join_seconds_bucket{le="+Inf"} 5047
+# HELP torus_exec_checkpoint_deferred_read_waits Item 6 Phase 3: reads that blocked on the deferred part of the since-checkpoint layer while it was being merged.
+# TYPE torus_exec_checkpoint_deferred_read_waits counter
+torus_exec_checkpoint_deferred_read_waits_total 0
+# HELP torus_exec_checkpoint_upkeep_seconds Item 6 Phase 3: exec thread time in the end-of-block checkpoint upkeep (once per pipelined block).
+# TYPE torus_exec_checkpoint_upkeep_seconds histogram
+torus_exec_checkpoint_upkeep_seconds_sum 3.268826462999991
+torus_exec_checkpoint_upkeep_seconds_count 5047
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.00005"} 1761
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0001"} 3892
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0002"} 4625
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0004"} 4710
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0008"} 4752
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0016"} 4790
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0032"} 4837
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0064"} 4908
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0128"} 4985
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0256"} 5033
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.0512"} 5039
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.1024"} 5046
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.2048"} 5047
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.4096"} 5047
+torus_exec_checkpoint_upkeep_seconds_bucket{le="0.8192"} 5047
+torus_exec_checkpoint_upkeep_seconds_bucket{le="1.6384"} 5047
+torus_exec_checkpoint_upkeep_seconds_bucket{le="+Inf"} 5047
+# HELP torus_exec_checkpoint_drop_inline Item 6 Phase 3: released layers / sets / views freed on the exec thread (background free queue full).
+# TYPE torus_exec_checkpoint_drop_inline counter
+torus_exec_checkpoint_drop_inline_total 4776
+# HELP torus_exec_checkpoint_live_layers Item 6 Phase 3: live frozen sets / ingress slices / layers (L, C) the checkpoint path retains, wherever held.
+# TYPE torus_exec_checkpoint_live_layers gauge
+torus_exec_checkpoint_live_layers 48
+# HELP torus_exec_checkpoint_live_bytes Item 6 Phase 3: bytes of those live objects (layer_bytes measure; a frozen set counts once merged into L).
+# TYPE torus_exec_checkpoint_live_bytes gauge
+torus_exec_checkpoint_live_bytes 22318
+# HELP torus_exec_checkpoint_read_views_live Item 6 Phase 3: live handles on published ingress read views (exec thread, mempool, per-request clones).
+# TYPE torus_exec_checkpoint_read_views_live gauge
+torus_exec_checkpoint_read_views_live 2
+# HELP torus_exec_checkpoint_oldest_live_age_blocks Item 6 Phase 3: executed height minus the oldest live frozen set / slice height (0 with none).
+# TYPE torus_exec_checkpoint_oldest_live_age_blocks gauge
+torus_exec_checkpoint_oldest_live_age_blocks 46
+# HELP torus_flush_worker_checkpoint_seconds Item 6 Phase 3: flush worker wall time per checkpoint job.
+# TYPE torus_flush_worker_checkpoint_seconds histogram
+torus_flush_worker_checkpoint_seconds_sum 26.605977343
+torus_flush_worker_checkpoint_seconds_count 50
+torus_flush_worker_checkpoint_seconds_bucket{le="0.001"} 1
+torus_flush_worker_checkpoint_seconds_bucket{le="0.002"} 3
+torus_flush_worker_checkpoint_seconds_bucket{le="0.004"} 8
+torus_flush_worker_checkpoint_seconds_bucket{le="0.008"} 8
+torus_flush_worker_checkpoint_seconds_bucket{le="0.016"} 8
+torus_flush_worker_checkpoint_seconds_bucket{le="0.032"} 8
+torus_flush_worker_checkpoint_seconds_bucket{le="0.064"} 9
+torus_flush_worker_checkpoint_seconds_bucket{le="0.128"} 9
+torus_flush_worker_checkpoint_seconds_bucket{le="0.256"} 19
+torus_flush_worker_checkpoint_seconds_bucket{le="0.512"} 26
+torus_flush_worker_checkpoint_seconds_bucket{le="1.024"} 44
+torus_flush_worker_checkpoint_seconds_bucket{le="2.048"} 50
+torus_flush_worker_checkpoint_seconds_bucket{le="4.096"} 50
+torus_flush_worker_checkpoint_seconds_bucket{le="8.192"} 50
+torus_flush_worker_checkpoint_seconds_bucket{le="16.384"} 50
+torus_flush_worker_checkpoint_seconds_bucket{le="32.768"} 50
+torus_flush_worker_checkpoint_seconds_bucket{le="+Inf"} 50
+# HELP torus_order_age_admit_seconds Order age (now - nonce) when the RPC node admits a native action.
+# TYPE torus_order_age_admit_seconds histogram
+torus_order_age_admit_seconds_sum 43279.148999995145
+torus_order_age_admit_seconds_count 144350
+torus_order_age_admit_seconds_bucket{le="0.005"} 17362
+torus_order_age_admit_seconds_bucket{le="0.01"} 33418
+torus_order_age_admit_seconds_bucket{le="0.02"} 56393
+torus_order_age_admit_seconds_bucket{le="0.04"} 73553
+torus_order_age_admit_seconds_bucket{le="0.08"} 78725
+torus_order_age_admit_seconds_bucket{le="0.16"} 83833
+torus_order_age_admit_seconds_bucket{le="0.32"} 94234
+torus_order_age_admit_seconds_bucket{le="0.64"} 115618
+torus_order_age_admit_seconds_bucket{le="1.28"} 140444
+torus_order_age_admit_seconds_bucket{le="2.56"} 144228
+torus_order_age_admit_seconds_bucket{le="5.12"} 144350
+torus_order_age_admit_seconds_bucket{le="10.24"} 144350
+torus_order_age_admit_seconds_bucket{le="20.48"} 144350
+torus_order_age_admit_seconds_bucket{le="40.96"} 144350
+torus_order_age_admit_seconds_bucket{le="81.92"} 144350
+torus_order_age_admit_seconds_bucket{le="163.84"} 144350
+torus_order_age_admit_seconds_bucket{le="327.68"} 144350
+torus_order_age_admit_seconds_bucket{le="655.36"} 144350
+torus_order_age_admit_seconds_bucket{le="+Inf"} 144350
+# HELP torus_order_age_commit_seconds Order age (now - nonce) when its committed block is handed to execution.
+# TYPE torus_order_age_commit_seconds histogram
+torus_order_age_commit_seconds_sum 691137.1660000298
+torus_order_age_commit_seconds_count 434893
+torus_order_age_commit_seconds_bucket{le="0.005"} 0
+torus_order_age_commit_seconds_bucket{le="0.01"} 2
+torus_order_age_commit_seconds_bucket{le="0.02"} 49
+torus_order_age_commit_seconds_bucket{le="0.04"} 373
+torus_order_age_commit_seconds_bucket{le="0.08"} 3020
+torus_order_age_commit_seconds_bucket{le="0.16"} 26099
+torus_order_age_commit_seconds_bucket{le="0.32"} 74784
+torus_order_age_commit_seconds_bucket{le="0.64"} 157360
+torus_order_age_commit_seconds_bucket{le="1.28"} 233374
+torus_order_age_commit_seconds_bucket{le="2.56"} 332284
+torus_order_age_commit_seconds_bucket{le="5.12"} 422519
+torus_order_age_commit_seconds_bucket{le="10.24"} 434893
+torus_order_age_commit_seconds_bucket{le="20.48"} 434893
+torus_order_age_commit_seconds_bucket{le="40.96"} 434893
+torus_order_age_commit_seconds_bucket{le="81.92"} 434893
+torus_order_age_commit_seconds_bucket{le="163.84"} 434893
+torus_order_age_commit_seconds_bucket{le="327.68"} 434893
+torus_order_age_commit_seconds_bucket{le="655.36"} 434893
+torus_order_age_commit_seconds_bucket{le="+Inf"} 434893
+# HELP torus_order_age_exec_seconds Order age (now - nonce) when its block has executed.
+# TYPE torus_order_age_exec_seconds histogram
+torus_order_age_exec_seconds_sum 1715225.648999865
+torus_order_age_exec_seconds_count 434893
+torus_order_age_exec_seconds_bucket{le="0.005"} 0
+torus_order_age_exec_seconds_bucket{le="0.01"} 0
+torus_order_age_exec_seconds_bucket{le="0.02"} 0
+torus_order_age_exec_seconds_bucket{le="0.04"} 0
+torus_order_age_exec_seconds_bucket{le="0.08"} 0
+torus_order_age_exec_seconds_bucket{le="0.16"} 12
+torus_order_age_exec_seconds_bucket{le="0.32"} 81
+torus_order_age_exec_seconds_bucket{le="0.64"} 4498
+torus_order_age_exec_seconds_bucket{le="1.28"} 30624
+torus_order_age_exec_seconds_bucket{le="2.56"} 122847
+torus_order_age_exec_seconds_bucket{le="5.12"} 318349
+torus_order_age_exec_seconds_bucket{le="10.24"} 433193
+torus_order_age_exec_seconds_bucket{le="20.48"} 434893
+torus_order_age_exec_seconds_bucket{le="40.96"} 434893
+torus_order_age_exec_seconds_bucket{le="81.92"} 434893
+torus_order_age_exec_seconds_bucket{le="163.84"} 434893
+torus_order_age_exec_seconds_bucket{le="327.68"} 434893
+torus_order_age_exec_seconds_bucket{le="655.36"} 434893
+torus_order_age_exec_seconds_bucket{le="+Inf"} 434893
+# HELP torus_order_age_durable_seconds Order age (now - nonce) when its block's state is durable (readable over RPC).
+# TYPE torus_order_age_durable_seconds histogram
+torus_order_age_durable_seconds_sum 3737632.8940000135
+torus_order_age_durable_seconds_count 434893
+torus_order_age_durable_seconds_bucket{le="0.005"} 0
+torus_order_age_durable_seconds_bucket{le="0.01"} 0
+torus_order_age_durable_seconds_bucket{le="0.02"} 0
+torus_order_age_durable_seconds_bucket{le="0.04"} 0
+torus_order_age_durable_seconds_bucket{le="0.08"} 0
+torus_order_age_durable_seconds_bucket{le="0.16"} 0
+torus_order_age_durable_seconds_bucket{le="0.32"} 0
+torus_order_age_durable_seconds_bucket{le="0.64"} 0
+torus_order_age_durable_seconds_bucket{le="1.28"} 1116
+torus_order_age_durable_seconds_bucket{le="2.56"} 16036
+torus_order_age_durable_seconds_bucket{le="5.12"} 67430
+torus_order_age_durable_seconds_bucket{le="10.24"} 289346
+torus_order_age_durable_seconds_bucket{le="20.48"} 434893
+torus_order_age_durable_seconds_bucket{le="40.96"} 434893
+torus_order_age_durable_seconds_bucket{le="81.92"} 434893
+torus_order_age_durable_seconds_bucket{le="163.84"} 434893
+torus_order_age_durable_seconds_bucket{le="327.68"} 434893
+torus_order_age_durable_seconds_bucket{le="655.36"} 434893
+torus_order_age_durable_seconds_bucket{le="+Inf"} 434893
+# HELP torus_order_age_fills_visible_seconds Order age (now - nonce) when its block's trade rows are written (fills readable over RPC).
+# TYPE torus_order_age_fills_visible_seconds histogram
+torus_order_age_fills_visible_seconds_sum 0.0
+torus_order_age_fills_visible_seconds_count 0
+torus_order_age_fills_visible_seconds_bucket{le="0.005"} 0
+torus_order_age_fills_visible_seconds_bucket{le="0.01"} 0
+torus_order_age_fills_visible_seconds_bucket{le="0.02"} 0
+torus_order_age_fills_visible_seconds_bucket{le="0.04"} 0
+torus_order_age_fills_visible_seconds_bucket{le="0.08"} 0
+torus_order_age_fills_visible_seconds_bucket{le="0.16"} 0
+torus_order_age_fills_visible_seconds_bucket{le="0.32"} 0
+torus_order_age_fills_visible_seconds_bucket{le="0.64"} 0
+torus_order_age_fills_visible_seconds_bucket{le="1.28"} 0
+torus_order_age_fills_visible_seconds_bucket{le="2.56"} 0
+torus_order_age_fills_visible_seconds_bucket{le="5.12"} 0
+torus_order_age_fills_visible_seconds_bucket{le="10.24"} 0
+torus_order_age_fills_visible_seconds_bucket{le="20.48"} 0
+torus_order_age_fills_visible_seconds_bucket{le="40.96"} 0
+torus_order_age_fills_visible_seconds_bucket{le="81.92"} 0
+torus_order_age_fills_visible_seconds_bucket{le="163.84"} 0
+torus_order_age_fills_visible_seconds_bucket{le="327.68"} 0
+torus_order_age_fills_visible_seconds_bucket{le="655.36"} 0
+torus_order_age_fills_visible_seconds_bucket{le="+Inf"} 0
+# HELP torus_order_age_future_nonce Native actions whose nonce was ahead of this node's clock (observed as age 0).
+# TYPE torus_order_age_future_nonce counter
+torus_order_age_future_nonce_total 0
+# HELP torus_exec_save_books_drain_seconds save_books pass 1: journal drain + level digests (reads live book levels — cannot leave the exec thread).
+# TYPE torus_exec_save_books_drain_seconds histogram
+torus_exec_save_books_drain_seconds_sum 0.0
+torus_exec_save_books_drain_seconds_count 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.001"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.002"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.004"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.008"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.016"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.032"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.064"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.128"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.256"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="0.512"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="1.024"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="2.048"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="4.096"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="8.192"} 4681
+torus_exec_save_books_drain_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_save_books_write_seconds save_books pass 2: overlay writes (rows, levels, stop diff, meta) — the half a flush worker could take.
+# TYPE torus_exec_save_books_write_seconds histogram
+torus_exec_save_books_write_seconds_sum 0.0
+torus_exec_save_books_write_seconds_count 4681
+torus_exec_save_books_write_seconds_bucket{le="0.001"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.002"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.004"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.008"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.016"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.032"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.064"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.128"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.256"} 4681
+torus_exec_save_books_write_seconds_bucket{le="0.512"} 4681
+torus_exec_save_books_write_seconds_bucket{le="1.024"} 4681
+torus_exec_save_books_write_seconds_bucket{le="2.048"} 4681
+torus_exec_save_books_write_seconds_bucket{le="4.096"} 4681
+torus_exec_save_books_write_seconds_bucket{le="8.192"} 4681
+torus_exec_save_books_write_seconds_bucket{le="+Inf"} 4681
+# HELP torus_exec_native_blocks Native (loaded) blocks executed; exec_block_seconds_count minus this = empty blocks.
+# TYPE torus_exec_native_blocks counter
+torus_exec_native_blocks_total 4681
+# HELP torus_rocksdb_memtable_bytes_all RocksDB memtable bytes summed over all CFs.
+# TYPE torus_rocksdb_memtable_bytes_all gauge
+torus_rocksdb_memtable_bytes_all 104461288
+# HELP torus_rocksdb_immutable_memtables_all RocksDB immutable (unflushed) memtables summed over all CFs.
+# TYPE torus_rocksdb_immutable_memtables_all gauge
+torus_rocksdb_immutable_memtables_all 0
+# HELP torus_rocksdb_l0_files_max RocksDB max L0 file count over all CFs (per-CF slowdown trigger).
+# TYPE torus_rocksdb_l0_files_max gauge
+torus_rocksdb_l0_files_max 3
+# HELP torus_rocksdb_pending_compaction_bytes_all RocksDB estimated pending compaction bytes summed over all CFs.
+# TYPE torus_rocksdb_pending_compaction_bytes_all gauge
+torus_rocksdb_pending_compaction_bytes_all 0
+# HELP torus_rocksdb_delayed_write_rate RocksDB actual delayed write rate (bytes/s; 0 = no delay in force).
+# TYPE torus_rocksdb_delayed_write_rate gauge
+torus_rocksdb_delayed_write_rate 0
+# HELP torus_rocksdb_write_stopped RocksDB is-write-stopped (1 while writes are stopped).
+# TYPE torus_rocksdb_write_stopped gauge
+torus_rocksdb_write_stopped 0
+# HELP torus_rocksdb_running_compactions RocksDB running compactions.
+# TYPE torus_rocksdb_running_compactions gauge
+torus_rocksdb_running_compactions 0
+# HELP torus_rocksdb_running_flushes RocksDB running flushes.
+# TYPE torus_rocksdb_running_flushes gauge
+torus_rocksdb_running_flushes 0
+# HELP torus_rocksdb_stall_micros RocksDB rocksdb.stall.micros (cumulative writer stall time).
+# TYPE torus_rocksdb_stall_micros gauge
+torus_rocksdb_stall_micros 0
+# HELP torus_rocksdb_write_self RocksDB rocksdb.write.self (write-group leaders, cumulative).
+# TYPE torus_rocksdb_write_self gauge
+torus_rocksdb_write_self 210607
+# HELP torus_rocksdb_write_other RocksDB rocksdb.write.other (write-group followers, cumulative).
+# TYPE torus_rocksdb_write_other gauge
+torus_rocksdb_write_other 0
+# HELP torus_rocksdb_bytes_written RocksDB rocksdb.bytes.written (cumulative).
+# TYPE torus_rocksdb_bytes_written gauge
+torus_rocksdb_bytes_written 11142717068
+# HELP torus_rocksdb_wal_bytes RocksDB rocksdb.wal.bytes (cumulative).
+# TYPE torus_rocksdb_wal_bytes gauge
+torus_rocksdb_wal_bytes 11142717068
+# HELP torus_rocksdb_flush_write_bytes RocksDB rocksdb.flush.write.bytes (cumulative).
+# TYPE torus_rocksdb_flush_write_bytes gauge
+torus_rocksdb_flush_write_bytes 2116286684
+# HELP torus_rocksdb_compact_read_bytes RocksDB rocksdb.compact.read.bytes (cumulative).
+# TYPE torus_rocksdb_compact_read_bytes gauge
+torus_rocksdb_compact_read_bytes 1719985524
+# HELP torus_rocksdb_compact_write_bytes RocksDB rocksdb.compact.write.bytes (cumulative).
+# TYPE torus_rocksdb_compact_write_bytes gauge
+torus_rocksdb_compact_write_bytes 443960500
+# HELP torus_rocksdb_compaction_cpu_micros RocksDB compaction CPU micros (cumulative).
+# TYPE torus_rocksdb_compaction_cpu_micros gauge
+torus_rocksdb_compaction_cpu_micros 20652850
+# HELP torus_rocksdb_db_write_count RocksDB db.write.micros histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_db_write_count gauge
+torus_rocksdb_db_write_count 210607
+# HELP torus_rocksdb_db_write_sum_micros RocksDB db.write.micros histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_db_write_sum_micros gauge
+torus_rocksdb_db_write_sum_micros 41234689
+# HELP torus_rocksdb_db_write_p99_micros RocksDB db.write.micros p99 (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_db_write_p99_micros gauge
+torus_rocksdb_db_write_p99_micros 158
+# HELP torus_rocksdb_db_write_max_micros RocksDB db.write.micros max (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_db_write_max_micros gauge
+torus_rocksdb_db_write_max_micros 898129
+# HELP torus_rocksdb_write_stall_count RocksDB db.write.stall histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_write_stall_count gauge
+torus_rocksdb_write_stall_count 0
+# HELP torus_rocksdb_write_stall_sum_micros RocksDB db.write.stall histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_write_stall_sum_micros gauge
+torus_rocksdb_write_stall_sum_micros 0
+# HELP torus_rocksdb_write_stall_p99_micros RocksDB db.write.stall p99 (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_write_stall_p99_micros gauge
+torus_rocksdb_write_stall_p99_micros 0
+# HELP torus_rocksdb_write_stall_max_micros RocksDB db.write.stall max (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_write_stall_max_micros gauge
+torus_rocksdb_write_stall_max_micros 0
+# HELP torus_rocksdb_flush_count RocksDB db.flush.micros histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_flush_count gauge
+torus_rocksdb_flush_count 147
+# HELP torus_rocksdb_flush_sum_micros RocksDB db.flush.micros histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_flush_sum_micros gauge
+torus_rocksdb_flush_sum_micros 21292443
+# HELP torus_rocksdb_compaction_count RocksDB compaction.times.micros histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_compaction_count gauge
+torus_rocksdb_compaction_count 27
+# HELP torus_rocksdb_compaction_sum_micros RocksDB compaction.times.micros histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_compaction_sum_micros gauge
+torus_rocksdb_compaction_sum_micros 22236316
+# HELP torus_rocksdb_consensus_memtable_bytes_all Consensus DB (HotStuff + DA store): RocksDB memtable bytes summed over all CFs.
+# TYPE torus_rocksdb_consensus_memtable_bytes_all gauge
+torus_rocksdb_consensus_memtable_bytes_all 57677824
+# HELP torus_rocksdb_consensus_immutable_memtables_all Consensus DB (HotStuff + DA store): RocksDB immutable (unflushed) memtables summed over all CFs.
+# TYPE torus_rocksdb_consensus_immutable_memtables_all gauge
+torus_rocksdb_consensus_immutable_memtables_all 0
+# HELP torus_rocksdb_consensus_l0_files_max Consensus DB (HotStuff + DA store): RocksDB max L0 file count over all CFs (per-CF slowdown trigger).
+# TYPE torus_rocksdb_consensus_l0_files_max gauge
+torus_rocksdb_consensus_l0_files_max 3
+# HELP torus_rocksdb_consensus_pending_compaction_bytes_all Consensus DB (HotStuff + DA store): RocksDB estimated pending compaction bytes summed over all CFs.
+# TYPE torus_rocksdb_consensus_pending_compaction_bytes_all gauge
+torus_rocksdb_consensus_pending_compaction_bytes_all 0
+# HELP torus_rocksdb_consensus_delayed_write_rate Consensus DB (HotStuff + DA store): RocksDB actual delayed write rate (bytes/s; 0 = no delay in force).
+# TYPE torus_rocksdb_consensus_delayed_write_rate gauge
+torus_rocksdb_consensus_delayed_write_rate 0
+# HELP torus_rocksdb_consensus_write_stopped Consensus DB (HotStuff + DA store): RocksDB is-write-stopped (1 while writes are stopped).
+# TYPE torus_rocksdb_consensus_write_stopped gauge
+torus_rocksdb_consensus_write_stopped 0
+# HELP torus_rocksdb_consensus_running_compactions Consensus DB (HotStuff + DA store): RocksDB running compactions.
+# TYPE torus_rocksdb_consensus_running_compactions gauge
+torus_rocksdb_consensus_running_compactions 0
+# HELP torus_rocksdb_consensus_running_flushes Consensus DB (HotStuff + DA store): RocksDB running flushes.
+# TYPE torus_rocksdb_consensus_running_flushes gauge
+torus_rocksdb_consensus_running_flushes 0
+# HELP torus_rocksdb_consensus_stall_micros Consensus DB (HotStuff + DA store): RocksDB rocksdb.stall.micros (cumulative writer stall time).
+# TYPE torus_rocksdb_consensus_stall_micros gauge
+torus_rocksdb_consensus_stall_micros 0
+# HELP torus_rocksdb_consensus_write_self Consensus DB (HotStuff + DA store): RocksDB rocksdb.write.self (write-group leaders, cumulative).
+# TYPE torus_rocksdb_consensus_write_self gauge
+torus_rocksdb_consensus_write_self 59896
+# HELP torus_rocksdb_consensus_write_other Consensus DB (HotStuff + DA store): RocksDB rocksdb.write.other (write-group followers, cumulative).
+# TYPE torus_rocksdb_consensus_write_other gauge
+torus_rocksdb_consensus_write_other 3
+# HELP torus_rocksdb_consensus_bytes_written Consensus DB (HotStuff + DA store): RocksDB rocksdb.bytes.written (cumulative).
+# TYPE torus_rocksdb_consensus_bytes_written gauge
+torus_rocksdb_consensus_bytes_written 5932490772
+# HELP torus_rocksdb_consensus_wal_bytes Consensus DB (HotStuff + DA store): RocksDB rocksdb.wal.bytes (cumulative).
+# TYPE torus_rocksdb_consensus_wal_bytes gauge
+torus_rocksdb_consensus_wal_bytes 5932490772
+# HELP torus_rocksdb_consensus_flush_write_bytes Consensus DB (HotStuff + DA store): RocksDB rocksdb.flush.write.bytes (cumulative).
+# TYPE torus_rocksdb_consensus_flush_write_bytes gauge
+torus_rocksdb_consensus_flush_write_bytes 886853134
+# HELP torus_rocksdb_consensus_compact_read_bytes Consensus DB (HotStuff + DA store): RocksDB rocksdb.compact.read.bytes (cumulative).
+# TYPE torus_rocksdb_consensus_compact_read_bytes gauge
+torus_rocksdb_consensus_compact_read_bytes 2508777928
+# HELP torus_rocksdb_consensus_compact_write_bytes Consensus DB (HotStuff + DA store): RocksDB rocksdb.compact.write.bytes (cumulative).
+# TYPE torus_rocksdb_consensus_compact_write_bytes gauge
+torus_rocksdb_consensus_compact_write_bytes 2325150555
+# HELP torus_rocksdb_consensus_compaction_cpu_micros Consensus DB (HotStuff + DA store): RocksDB compaction CPU micros (cumulative).
+# TYPE torus_rocksdb_consensus_compaction_cpu_micros gauge
+torus_rocksdb_consensus_compaction_cpu_micros 46871272
+# HELP torus_rocksdb_consensus_db_write_count Consensus DB (HotStuff + DA store): RocksDB db.write.micros histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_db_write_count gauge
+torus_rocksdb_consensus_db_write_count 59899
+# HELP torus_rocksdb_consensus_db_write_sum_micros Consensus DB (HotStuff + DA store): RocksDB db.write.micros histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_db_write_sum_micros gauge
+torus_rocksdb_consensus_db_write_sum_micros 16878565
+# HELP torus_rocksdb_consensus_db_write_p99_micros Consensus DB (HotStuff + DA store): RocksDB db.write.micros p99 (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_db_write_p99_micros gauge
+torus_rocksdb_consensus_db_write_p99_micros 4378
+# HELP torus_rocksdb_consensus_db_write_max_micros Consensus DB (HotStuff + DA store): RocksDB db.write.micros max (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_db_write_max_micros gauge
+torus_rocksdb_consensus_db_write_max_micros 89957
+# HELP torus_rocksdb_consensus_write_stall_count Consensus DB (HotStuff + DA store): RocksDB db.write.stall histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_write_stall_count gauge
+torus_rocksdb_consensus_write_stall_count 0
+# HELP torus_rocksdb_consensus_write_stall_sum_micros Consensus DB (HotStuff + DA store): RocksDB db.write.stall histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_write_stall_sum_micros gauge
+torus_rocksdb_consensus_write_stall_sum_micros 0
+# HELP torus_rocksdb_consensus_write_stall_p99_micros Consensus DB (HotStuff + DA store): RocksDB db.write.stall p99 (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_write_stall_p99_micros gauge
+torus_rocksdb_consensus_write_stall_p99_micros 0
+# HELP torus_rocksdb_consensus_write_stall_max_micros Consensus DB (HotStuff + DA store): RocksDB db.write.stall max (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_write_stall_max_micros gauge
+torus_rocksdb_consensus_write_stall_max_micros 0
+# HELP torus_rocksdb_consensus_flush_count Consensus DB (HotStuff + DA store): RocksDB db.flush.micros histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_flush_count gauge
+torus_rocksdb_consensus_flush_count 47
+# HELP torus_rocksdb_consensus_flush_sum_micros Consensus DB (HotStuff + DA store): RocksDB db.flush.micros histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_flush_sum_micros gauge
+torus_rocksdb_consensus_flush_sum_micros 6583025
+# HELP torus_rocksdb_consensus_compaction_count Consensus DB (HotStuff + DA store): RocksDB compaction.times.micros histogram count (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_compaction_count gauge
+torus_rocksdb_consensus_compaction_count 15
+# HELP torus_rocksdb_consensus_compaction_sum_micros Consensus DB (HotStuff + DA store): RocksDB compaction.times.micros histogram sum (TORUS_ROCKSDB_STATS>=2).
+# TYPE torus_rocksdb_consensus_compaction_sum_micros gauge
+torus_rocksdb_consensus_compaction_sum_micros 50710225
+# HELP torus_jemalloc_allocated_bytes jemalloc stats.allocated: bytes in live allocations.
+# TYPE torus_jemalloc_allocated_bytes gauge
+torus_jemalloc_allocated_bytes 1029850032
+# HELP torus_jemalloc_active_bytes jemalloc stats.active: bytes in active pages.
+# TYPE torus_jemalloc_active_bytes gauge
+torus_jemalloc_active_bytes 1130094592
+# HELP torus_jemalloc_resident_bytes jemalloc stats.resident: bytes in physically resident pages.
+# TYPE torus_jemalloc_resident_bytes gauge
+torus_jemalloc_resident_bytes 1602867200
+# HELP torus_jemalloc_retained_bytes jemalloc stats.retained: bytes retained (virtual, not returned to the OS).
+# TYPE torus_jemalloc_retained_bytes gauge
+torus_jemalloc_retained_bytes 10048102400
+# HELP torus_jemalloc_mapped_bytes jemalloc stats.mapped: bytes in active extents mapped by the allocator.
+# TYPE torus_jemalloc_mapped_bytes gauge
+torus_jemalloc_mapped_bytes 1876828160
+# HELP torus_exec_level_hash_cache_hits L3 level-hash sponge cache O(tail) extensions, summed across books (cumulative sum-as-gauge).
+# TYPE torus_exec_level_hash_cache_hits gauge
+torus_exec_level_hash_cache_hits 0
+# HELP torus_exec_level_hash_cache_misses L3 level-hash cache plain one-shot fallbacks, summed across books (cumulative sum-as-gauge).
+# TYPE torus_exec_level_hash_cache_misses gauge
+torus_exec_level_hash_cache_misses 0
+# HELP torus_exec_level_hash_cache_seeds L3 level-hash cache probe→sponge promotions, summed across books (cumulative sum-as-gauge).
+# TYPE torus_exec_level_hash_cache_seeds gauge
+torus_exec_level_hash_cache_seeds 0
+# HELP torus_exec_level_hash_cache_entries L3 level-hash cache live seeded-sponge entries resident across books at last save (instantaneous).
+# TYPE torus_exec_level_hash_cache_entries gauge
+torus_exec_level_hash_cache_entries 0
+# HELP torus_view_duration_seconds Full view duration: StartView to the next StartView.
+# TYPE torus_view_duration_seconds histogram
+torus_view_duration_seconds_sum 337.88777157699959
+torus_view_duration_seconds_count 5049
+torus_view_duration_seconds_bucket{le="0.001"} 0
+torus_view_duration_seconds_bucket{le="0.002"} 0
+torus_view_duration_seconds_bucket{le="0.004"} 391
+torus_view_duration_seconds_bucket{le="0.008"} 2266
+torus_view_duration_seconds_bucket{le="0.016"} 2763
+torus_view_duration_seconds_bucket{le="0.032"} 3153
+torus_view_duration_seconds_bucket{le="0.064"} 3636
+torus_view_duration_seconds_bucket{le="0.128"} 4034
+torus_view_duration_seconds_bucket{le="0.256"} 4726
+torus_view_duration_seconds_bucket{le="0.512"} 5017
+torus_view_duration_seconds_bucket{le="1.024"} 5047
+torus_view_duration_seconds_bucket{le="2.048"} 5049
+torus_view_duration_seconds_bucket{le="4.096"} 5049
+torus_view_duration_seconds_bucket{le="8.192"} 5049
+torus_view_duration_seconds_bucket{le="16.384"} 5049
+torus_view_duration_seconds_bucket{le="+Inf"} 5049
+# HELP torus_view_propose_delay_seconds Leader: StartView to Propose broadcast (block build + readiness).
+# TYPE torus_view_propose_delay_seconds histogram
+torus_view_propose_delay_seconds_sum 22.143648292999985
+torus_view_propose_delay_seconds_count 1684
+torus_view_propose_delay_seconds_bucket{le="0.001"} 1022
+torus_view_propose_delay_seconds_bucket{le="0.002"} 1061
+torus_view_propose_delay_seconds_bucket{le="0.004"} 1135
+torus_view_propose_delay_seconds_bucket{le="0.008"} 1227
+torus_view_propose_delay_seconds_bucket{le="0.016"} 1330
+torus_view_propose_delay_seconds_bucket{le="0.032"} 1434
+torus_view_propose_delay_seconds_bucket{le="0.064"} 1551
+torus_view_propose_delay_seconds_bucket{le="0.128"} 1675
+torus_view_propose_delay_seconds_bucket{le="0.256"} 1684
+torus_view_propose_delay_seconds_bucket{le="0.512"} 1684
+torus_view_propose_delay_seconds_bucket{le="1.024"} 1684
+torus_view_propose_delay_seconds_bucket{le="2.048"} 1684
+torus_view_propose_delay_seconds_bucket{le="4.096"} 1684
+torus_view_propose_delay_seconds_bucket{le="8.192"} 1684
+torus_view_propose_delay_seconds_bucket{le="16.384"} 1684
+torus_view_propose_delay_seconds_bucket{le="+Inf"} 1684
+# HELP torus_view_propose_build_seconds Leader: StartView to own-block insert (produce_block + block-tree write).
+# TYPE torus_view_propose_build_seconds histogram
+torus_view_propose_build_seconds_sum 22.00104940199997
+torus_view_propose_build_seconds_count 1684
+torus_view_propose_build_seconds_bucket{le="0.001"} 1025
+torus_view_propose_build_seconds_bucket{le="0.002"} 1061
+torus_view_propose_build_seconds_bucket{le="0.004"} 1136
+torus_view_propose_build_seconds_bucket{le="0.008"} 1227
+torus_view_propose_build_seconds_bucket{le="0.016"} 1333
+torus_view_propose_build_seconds_bucket{le="0.032"} 1438
+torus_view_propose_build_seconds_bucket{le="0.064"} 1551
+torus_view_propose_build_seconds_bucket{le="0.128"} 1675
+torus_view_propose_build_seconds_bucket{le="0.256"} 1684
+torus_view_propose_build_seconds_bucket{le="0.512"} 1684
+torus_view_propose_build_seconds_bucket{le="1.024"} 1684
+torus_view_propose_build_seconds_bucket{le="2.048"} 1684
+torus_view_propose_build_seconds_bucket{le="4.096"} 1684
+torus_view_propose_build_seconds_bucket{le="8.192"} 1684
+torus_view_propose_build_seconds_bucket{le="16.384"} 1684
+torus_view_propose_build_seconds_bucket{le="+Inf"} 1684
+# HELP torus_view_propose_finalize_seconds Leader: own-block insert to Propose broadcast (update/commit + broadcast handoff).
+# TYPE torus_view_propose_finalize_seconds histogram
+torus_view_propose_finalize_seconds_sum 0.1425988909999996
+torus_view_propose_finalize_seconds_count 1684
+torus_view_propose_finalize_seconds_bucket{le="0.001"} 1660
+torus_view_propose_finalize_seconds_bucket{le="0.002"} 1670
+torus_view_propose_finalize_seconds_bucket{le="0.004"} 1683
+torus_view_propose_finalize_seconds_bucket{le="0.008"} 1684
+torus_view_propose_finalize_seconds_bucket{le="0.016"} 1684
+torus_view_propose_finalize_seconds_bucket{le="0.032"} 1684
+torus_view_propose_finalize_seconds_bucket{le="0.064"} 1684
+torus_view_propose_finalize_seconds_bucket{le="0.128"} 1684
+torus_view_propose_finalize_seconds_bucket{le="0.256"} 1684
+torus_view_propose_finalize_seconds_bucket{le="0.512"} 1684
+torus_view_propose_finalize_seconds_bucket{le="1.024"} 1684
+torus_view_propose_finalize_seconds_bucket{le="2.048"} 1684
+torus_view_propose_finalize_seconds_bucket{le="4.096"} 1684
+torus_view_propose_finalize_seconds_bucket{le="8.192"} 1684
+torus_view_propose_finalize_seconds_bucket{le="16.384"} 1684
+torus_view_propose_finalize_seconds_bucket{le="+Inf"} 1684
+# HELP torus_view_qc_collect_seconds Leader: Propose broadcast to our block certified locally (PC observed via a later justify; full vote round-trip).
+# TYPE torus_view_qc_collect_seconds histogram
+torus_view_qc_collect_seconds_sum 86.59639069300015
+torus_view_qc_collect_seconds_count 1682
+torus_view_qc_collect_seconds_bucket{le="0.001"} 0
+torus_view_qc_collect_seconds_bucket{le="0.002"} 0
+torus_view_qc_collect_seconds_bucket{le="0.004"} 180
+torus_view_qc_collect_seconds_bucket{le="0.008"} 763
+torus_view_qc_collect_seconds_bucket{le="0.016"} 961
+torus_view_qc_collect_seconds_bucket{le="0.032"} 1129
+torus_view_qc_collect_seconds_bucket{le="0.064"} 1286
+torus_view_qc_collect_seconds_bucket{le="0.128"} 1467
+torus_view_qc_collect_seconds_bucket{le="0.256"} 1617
+torus_view_qc_collect_seconds_bucket{le="0.512"} 1679
+torus_view_qc_collect_seconds_bucket{le="1.024"} 1682
+torus_view_qc_collect_seconds_bucket{le="2.048"} 1682
+torus_view_qc_collect_seconds_bucket{le="4.096"} 1682
+torus_view_qc_collect_seconds_bucket{le="8.192"} 1682
+torus_view_qc_collect_seconds_bucket{le="16.384"} 1682
+torus_view_qc_collect_seconds_bucket{le="+Inf"} 1682
+# HELP torus_view_proposal_arrival_seconds Follower: StartView to the leader's proposal arriving.
+# TYPE torus_view_proposal_arrival_seconds histogram
+torus_view_proposal_arrival_seconds_sum 104.4237135549998
+torus_view_proposal_arrival_seconds_count 3374
+torus_view_proposal_arrival_seconds_bucket{le="0.001"} 1636
+torus_view_proposal_arrival_seconds_bucket{le="0.002"} 1878
+torus_view_proposal_arrival_seconds_bucket{le="0.004"} 2036
+torus_view_proposal_arrival_seconds_bucket{le="0.008"} 2182
+torus_view_proposal_arrival_seconds_bucket{le="0.016"} 2429
+torus_view_proposal_arrival_seconds_bucket{le="0.032"} 2649
+torus_view_proposal_arrival_seconds_bucket{le="0.064"} 2890
+torus_view_proposal_arrival_seconds_bucket{le="0.128"} 3112
+torus_view_proposal_arrival_seconds_bucket{le="0.256"} 3337
+torus_view_proposal_arrival_seconds_bucket{le="0.512"} 3371
+torus_view_proposal_arrival_seconds_bucket{le="1.024"} 3373
+torus_view_proposal_arrival_seconds_bucket{le="2.048"} 3374
+torus_view_proposal_arrival_seconds_bucket{le="4.096"} 3374
+torus_view_proposal_arrival_seconds_bucket{le="8.192"} 3374
+torus_view_proposal_arrival_seconds_bucket{le="16.384"} 3374
+torus_view_proposal_arrival_seconds_bucket{le="+Inf"} 3374
+# HELP torus_view_insert_persist_seconds Follower: proposal arrival to block persisted (validate + block-tree write).
+# TYPE torus_view_insert_persist_seconds histogram
+torus_view_insert_persist_seconds_sum 30.66638052699992
+torus_view_insert_persist_seconds_count 3366
+torus_view_insert_persist_seconds_bucket{le="0.001"} 0
+torus_view_insert_persist_seconds_bucket{le="0.002"} 901
+torus_view_insert_persist_seconds_bucket{le="0.004"} 1965
+torus_view_insert_persist_seconds_bucket{le="0.008"} 2315
+torus_view_insert_persist_seconds_bucket{le="0.016"} 2749
+torus_view_insert_persist_seconds_bucket{le="0.032"} 3180
+torus_view_insert_persist_seconds_bucket{le="0.064"} 3336
+torus_view_insert_persist_seconds_bucket{le="0.128"} 3361
+torus_view_insert_persist_seconds_bucket{le="0.256"} 3366
+torus_view_insert_persist_seconds_bucket{le="0.512"} 3366
+torus_view_insert_persist_seconds_bucket{le="1.024"} 3366
+torus_view_insert_persist_seconds_bucket{le="2.048"} 3366
+torus_view_insert_persist_seconds_bucket{le="4.096"} 3366
+torus_view_insert_persist_seconds_bucket{le="8.192"} 3366
+torus_view_insert_persist_seconds_bucket{le="16.384"} 3366
+torus_view_insert_persist_seconds_bucket{le="+Inf"} 3366
+# HELP torus_view_vote_delay_seconds Follower: proposal arrival to phase vote sent.
+# TYPE torus_view_vote_delay_seconds histogram
+torus_view_vote_delay_seconds_sum 27.502705318999973
+torus_view_vote_delay_seconds_count 3367
+torus_view_vote_delay_seconds_bucket{le="0.001"} 0
+torus_view_vote_delay_seconds_bucket{le="0.002"} 1229
+torus_view_vote_delay_seconds_bucket{le="0.004"} 2032
+torus_view_vote_delay_seconds_bucket{le="0.008"} 2538
+torus_view_vote_delay_seconds_bucket{le="0.016"} 2941
+torus_view_vote_delay_seconds_bucket{le="0.032"} 3181
+torus_view_vote_delay_seconds_bucket{le="0.064"} 3332
+torus_view_vote_delay_seconds_bucket{le="0.128"} 3360
+torus_view_vote_delay_seconds_bucket{le="0.256"} 3366
+torus_view_vote_delay_seconds_bucket{le="0.512"} 3366
+torus_view_vote_delay_seconds_bucket{le="1.024"} 3367
+torus_view_vote_delay_seconds_bucket{le="2.048"} 3367
+torus_view_vote_delay_seconds_bucket{le="4.096"} 3367
+torus_view_vote_delay_seconds_bucket{le="8.192"} 3367
+torus_view_vote_delay_seconds_bucket{le="16.384"} 3367
+torus_view_vote_delay_seconds_bucket{le="+Inf"} 3367
+# HELP torus_view_vote_gather_seconds Collector: first phase vote received for a view to its PC collected (s70).
+# TYPE torus_view_vote_gather_seconds histogram
+torus_view_vote_gather_seconds_sum 96.20060831099991
+torus_view_vote_gather_seconds_count 3325
+torus_view_vote_gather_seconds_bucket{le="0.001"} 33
+torus_view_vote_gather_seconds_bucket{le="0.002"} 1181
+torus_view_vote_gather_seconds_bucket{le="0.004"} 1704
+torus_view_vote_gather_seconds_bucket{le="0.008"} 1967
+torus_view_vote_gather_seconds_bucket{le="0.016"} 2363
+torus_view_vote_gather_seconds_bucket{le="0.032"} 2694
+torus_view_vote_gather_seconds_bucket{le="0.064"} 2995
+torus_view_vote_gather_seconds_bucket{le="0.128"} 3117
+torus_view_vote_gather_seconds_bucket{le="0.256"} 3285
+torus_view_vote_gather_seconds_bucket{le="0.512"} 3313
+torus_view_vote_gather_seconds_bucket{le="1.024"} 3325
+torus_view_vote_gather_seconds_bucket{le="2.048"} 3325
+torus_view_vote_gather_seconds_bucket{le="4.096"} 3325
+torus_view_vote_gather_seconds_bucket{le="8.192"} 3325
+torus_view_vote_gather_seconds_bucket{le="16.384"} 3325
+torus_view_vote_gather_seconds_bucket{le="+Inf"} 3325
+# HELP torus_view_qc_to_advance_seconds Collector: PC collected to our next StartView (update/commit feed + AdvanceView) (s70).
+# TYPE torus_view_qc_to_advance_seconds histogram
+torus_view_qc_to_advance_seconds_sum 56.39928348500011
+torus_view_qc_to_advance_seconds_count 3325
+torus_view_qc_to_advance_seconds_bucket{le="0.001"} 282
+torus_view_qc_to_advance_seconds_bucket{le="0.002"} 2008
+torus_view_qc_to_advance_seconds_bucket{le="0.004"} 2263
+torus_view_qc_to_advance_seconds_bucket{le="0.008"} 2415
+torus_view_qc_to_advance_seconds_bucket{le="0.016"} 2607
+torus_view_qc_to_advance_seconds_bucket{le="0.032"} 2770
+torus_view_qc_to_advance_seconds_bucket{le="0.064"} 3102
+torus_view_qc_to_advance_seconds_bucket{le="0.128"} 3240
+torus_view_qc_to_advance_seconds_bucket{le="0.256"} 3311
+torus_view_qc_to_advance_seconds_bucket{le="0.512"} 3323
+torus_view_qc_to_advance_seconds_bucket{le="1.024"} 3325
+torus_view_qc_to_advance_seconds_bucket{le="2.048"} 3325
+torus_view_qc_to_advance_seconds_bucket{le="4.096"} 3325
+torus_view_qc_to_advance_seconds_bucket{le="8.192"} 3325
+torus_view_qc_to_advance_seconds_bucket{le="16.384"} 3325
+torus_view_qc_to_advance_seconds_bucket{le="+Inf"} 3325
+# HELP torus_view_entry_slack_seconds Pacemaker: deadline minus now at view entry, positive slack only (s68).
+# TYPE torus_view_entry_slack_seconds histogram
+torus_view_entry_slack_seconds_sum 8922.259075208016
+torus_view_entry_slack_seconds_count 5050
+torus_view_entry_slack_seconds_bucket{le="0.001"} 0
+torus_view_entry_slack_seconds_bucket{le="0.002"} 0
+torus_view_entry_slack_seconds_bucket{le="0.004"} 0
+torus_view_entry_slack_seconds_bucket{le="0.008"} 0
+torus_view_entry_slack_seconds_bucket{le="0.016"} 0
+torus_view_entry_slack_seconds_bucket{le="0.032"} 0
+torus_view_entry_slack_seconds_bucket{le="0.064"} 0
+torus_view_entry_slack_seconds_bucket{le="0.128"} 0
+torus_view_entry_slack_seconds_bucket{le="0.256"} 0
+torus_view_entry_slack_seconds_bucket{le="0.512"} 0
+torus_view_entry_slack_seconds_bucket{le="1.024"} 0
+torus_view_entry_slack_seconds_bucket{le="2.048"} 2584
+torus_view_entry_slack_seconds_bucket{le="4.096"} 5049
+torus_view_entry_slack_seconds_bucket{le="8.192"} 5050
+torus_view_entry_slack_seconds_bucket{le="16.384"} 5050
+torus_view_entry_slack_seconds_bucket{le="+Inf"} 5050
+# HELP torus_view_timeout_after_seconds View start to ViewTimeout; near zero = entered past its deadline (s68).
+# TYPE torus_view_timeout_after_seconds histogram
+torus_view_timeout_after_seconds_sum 1.2149704
+torus_view_timeout_after_seconds_count 1
+torus_view_timeout_after_seconds_bucket{le="0.001"} 0
+torus_view_timeout_after_seconds_bucket{le="0.002"} 0
+torus_view_timeout_after_seconds_bucket{le="0.004"} 0
+torus_view_timeout_after_seconds_bucket{le="0.008"} 0
+torus_view_timeout_after_seconds_bucket{le="0.016"} 0
+torus_view_timeout_after_seconds_bucket{le="0.032"} 0
+torus_view_timeout_after_seconds_bucket{le="0.064"} 0
+torus_view_timeout_after_seconds_bucket{le="0.128"} 0
+torus_view_timeout_after_seconds_bucket{le="0.256"} 0
+torus_view_timeout_after_seconds_bucket{le="0.512"} 0
+torus_view_timeout_after_seconds_bucket{le="1.024"} 0
+torus_view_timeout_after_seconds_bucket{le="2.048"} 1
+torus_view_timeout_after_seconds_bucket{le="4.096"} 1
+torus_view_timeout_after_seconds_bucket{le="8.192"} 1
+torus_view_timeout_after_seconds_bucket{le="16.384"} 1
+torus_view_timeout_after_seconds_bucket{le="+Inf"} 1
+# HELP torus_view_entered_past_deadline Views entered at or past their pacemaker deadline (s68).
+# TYPE torus_view_entered_past_deadline counter
+torus_view_entered_past_deadline_total 0
+# HELP torus_view_timeout_no_proposal Timed-out views where no proposal had arrived (s68).
+# TYPE torus_view_timeout_no_proposal counter
+torus_view_timeout_no_proposal_total 1
+# HELP torus_view_timeout_no_vote Timed-out views where a proposal arrived but no vote was sent (s68).
+# TYPE torus_view_timeout_no_vote counter
+torus_view_timeout_no_vote_total 0
+# HELP torus_view_timeout_after_vote Timed-out views where this node had already voted (s68).
+# TYPE torus_view_timeout_after_vote counter
+torus_view_timeout_after_vote_total 1
+# HELP torus_view_timeout_leader Timed-out views where this node was the proposer (s68).
+# TYPE torus_view_timeout_leader counter
+torus_view_timeout_leader_total 0
+# HELP torus_view_proposals_uncertified Own proposals replaced by the next before any PC certified them (s68).
+# TYPE torus_view_proposals_uncertified counter
+torus_view_proposals_uncertified_total 1
+# HELP torus_commit_interval_seconds Gap between consecutive local block commits (chain cadence per node).
+# TYPE torus_commit_interval_seconds histogram
+torus_commit_interval_seconds_sum 337.8802187659999
+torus_commit_interval_seconds_count 5046
+torus_commit_interval_seconds_bucket{le="0.001"} 796
+torus_commit_interval_seconds_bucket{le="0.002"} 977
+torus_commit_interval_seconds_bucket{le="0.004"} 1259
+torus_commit_interval_seconds_bucket{le="0.008"} 2211
+torus_commit_interval_seconds_bucket{le="0.016"} 2969
+torus_commit_interval_seconds_bucket{le="0.032"} 3364
+torus_commit_interval_seconds_bucket{le="0.064"} 3839
+torus_commit_interval_seconds_bucket{le="0.128"} 4245
+torus_commit_interval_seconds_bucket{le="0.256"} 4536
+torus_commit_interval_seconds_bucket{le="0.512"} 4942
+torus_commit_interval_seconds_bucket{le="1.024"} 5042
+torus_commit_interval_seconds_bucket{le="2.048"} 5046
+torus_commit_interval_seconds_bucket{le="4.096"} 5046
+torus_commit_interval_seconds_bucket{le="8.192"} 5046
+torus_commit_interval_seconds_bucket{le="16.384"} 5046
+torus_commit_interval_seconds_bucket{le="+Inf"} 5046
+# HELP torus_consensus_mesh_peers Gossipsub mesh size for the consensus topic.
+# TYPE torus_consensus_mesh_peers gauge
+torus_consensus_mesh_peers 2
+# HELP torus_consensus_subscribed_validators Connected validator peers subscribed to the consensus topic.
+# TYPE torus_consensus_subscribed_validators gauge
+torus_consensus_subscribed_validators 2
+# HELP torus_mesh_watchdog_disconnects Validators force-disconnected by the mesh watchdog (connected but unsubscribed past grace).
+# TYPE torus_mesh_watchdog_disconnects counter
+torus_mesh_watchdog_disconnects_total 0
+# HELP torus_mesh_stale_conn_disconnects Validators force-disconnected for redialing over a stale connection we still held (gossipsub skips resending subscriptions).
+# TYPE torus_mesh_stale_conn_disconnects counter
+torus_mesh_stale_conn_disconnects_total 0
+# HELP torus_consensus_subscribe_delay_seconds Time from a validator connecting to it being seen subscribed to the consensus topic (spans watchdog reconnects).
+# TYPE torus_consensus_subscribe_delay_seconds histogram
+torus_consensus_subscribe_delay_seconds_sum 0.002678641
+torus_consensus_subscribe_delay_seconds_count 2
+torus_consensus_subscribe_delay_seconds_bucket{le="0.05"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="0.1"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="0.2"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="0.4"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="0.8"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="1.6"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="3.2"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="6.4"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="12.8"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="25.6"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="51.2"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="102.4"} 2
+torus_consensus_subscribe_delay_seconds_bucket{le="+Inf"} 2
+# HELP torus_rocksdb_l0_files RocksDB files at level 0, per column family.
+# TYPE torus_rocksdb_l0_files gauge
+torus_rocksdb_l0_files{cf="cf_tx_hash_to_location"} 0
+torus_rocksdb_l0_files{cf="cf_book_order_rows"} 0
+torus_rocksdb_l0_files{cf="cf_block_action_status"} 3
+torus_rocksdb_l0_files{cf="cf_native_liquidation"} 0
+torus_rocksdb_l0_files{cf="cf_native_shards",db="consensus"} 0
+torus_rocksdb_l0_files{cf="cf_consensus_meta",db="consensus"} 3
+torus_rocksdb_l0_files{cf="cf_logs"} 0
+torus_rocksdb_l0_files{cf="cf_native_markets"} 0
+torus_rocksdb_l0_files{cf="cf_native_user_trades"} 1
+torus_rocksdb_l0_files{cf="cf_treasury"} 0
+torus_rocksdb_l0_files{cf="cf_slash_records"} 0
+torus_rocksdb_l0_files{cf="cf_core_writer_queue"} 0
+torus_rocksdb_l0_files{cf="cf_native_bbo"} 0
+torus_rocksdb_l0_files{cf="cf_native_pending",db="consensus"} 1
+torus_rocksdb_l0_files{cf="cf_state_hash_votes"} 0
+torus_rocksdb_l0_files{cf="cf_block_hash_to_number"} 0
+torus_rocksdb_l0_files{cf="cf_native_pending"} 0
+torus_rocksdb_l0_files{cf="cf_trie_accounts"} 0
+torus_rocksdb_l0_files{cf="cf_native_orders"} 0
+torus_rocksdb_l0_files{cf="cf_jail_votes"} 0
+torus_rocksdb_l0_files{cf="cf_commit_manifest"} 3
+torus_rocksdb_l0_files{cf="cf_staking_rewards"} 0
+torus_rocksdb_l0_files{cf="cf_native_oracle"} 0
+torus_rocksdb_l0_files{cf="cf_native_shards"} 0
+torus_rocksdb_l0_files{cf="cf_sessions"} 0
+torus_rocksdb_l0_files{cf="cf_trie_nodes"} 0
+torus_rocksdb_l0_files{cf="cf_hashed_accounts"} 0
+torus_rocksdb_l0_files{cf="cf_native_hashed"} 0
+torus_rocksdb_l0_files{cf="cf_staking_validators"} 1
+torus_rocksdb_l0_files{cf="cf_native_balances"} 0
+torus_rocksdb_l0_files{cf="cf_native_trades"} 1
+torus_rocksdb_l0_files{cf="cf_native_trie"} 0
+torus_rocksdb_l0_files{cf="cf_native_positions"} 1
+torus_rocksdb_l0_files{cf="cf_core_writer_tx"} 0
+torus_rocksdb_l0_files{cf="cf_storage"} 0
+torus_rocksdb_l0_files{cf="cf_logs_bloom"} 0
+torus_rocksdb_l0_files{cf="cf_staking_delegations"} 0
+torus_rocksdb_l0_files{cf="cf_accounts"} 0
+torus_rocksdb_l0_files{cf="cf_receipts"} 0
+torus_rocksdb_l0_files{cf="cf_staking_permanent"} 1
+torus_rocksdb_l0_files{cf="cf_native_order_books"} 0
+torus_rocksdb_l0_files{cf="cf_block_headers"} 3
+torus_rocksdb_l0_files{cf="cf_fee_config"} 1
+torus_rocksdb_l0_files{cf="cf_dev_pool"} 0
+torus_rocksdb_l0_files{cf="cf_hashed_storage"} 0
+torus_rocksdb_l0_files{cf="cf_governance_votes"} 0
+torus_rocksdb_l0_files{cf="cf_consensus_meta"} 0
+torus_rocksdb_l0_files{cf="cf_trie_storage"} 0
+torus_rocksdb_l0_files{cf="cf_native_nonces"} 0
+torus_rocksdb_l0_files{cf="cf_governance_proposals"} 0
+torus_rocksdb_l0_files{cf="cf_block_bodies"} 3
+torus_rocksdb_l0_files{cf="cf_code"} 0
+# HELP torus_rocksdb_memtable_bytes RocksDB cur-size-all-mem-tables, per column family.
+# TYPE torus_rocksdb_memtable_bytes gauge
+torus_rocksdb_memtable_bytes{cf="cf_native_shards",db="consensus"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_commit_manifest"} 3147776
+torus_rocksdb_memtable_bytes{cf="cf_native_balances"} 3147776
+torus_rocksdb_memtable_bytes{cf="cf_native_orders"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_logs_bloom"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_governance_proposals"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_fee_config"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_trie"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_liquidation"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_logs"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_storage"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_core_writer_tx"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_consensus_meta",db="consensus"} 3147776
+torus_rocksdb_memtable_bytes{cf="cf_block_bodies"} 36993968
+torus_rocksdb_memtable_bytes{cf="cf_native_markets"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_governance_votes"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_staking_validators"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_receipts"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_treasury"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_dev_pool"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_oracle"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_native_nonces"} 7342080
+torus_rocksdb_memtable_bytes{cf="cf_accounts"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_sessions"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_book_order_rows"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_trades"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_state_hash_votes"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_block_action_status"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_native_pending",db="consensus"} 29362176
+torus_rocksdb_memtable_bytes{cf="cf_staking_delegations"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_trie_accounts"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_code"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_jail_votes"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_pending"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_block_hash_to_number"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_block_headers"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_staking_rewards"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_slash_records"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_tx_hash_to_location"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_core_writer_queue"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_trie_nodes"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_shards"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_hashed"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_staking_permanent"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_order_books"} 72353792
+torus_rocksdb_memtable_bytes{cf="cf_trie_storage"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_hashed_accounts"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_native_positions"} 65013760
+torus_rocksdb_memtable_bytes{cf="cf_hashed_storage"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_native_bbo"} 1050624
+torus_rocksdb_memtable_bytes{cf="cf_native_user_trades"} 2048
+torus_rocksdb_memtable_bytes{cf="cf_consensus_meta"} 1050624
+# HELP torus_rocksdb_pending_compaction_bytes RocksDB estimate-pending-compaction-bytes, per column family.
+# TYPE torus_rocksdb_pending_compaction_bytes gauge
+torus_rocksdb_pending_compaction_bytes{cf="cf_core_writer_queue"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_markets"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_consensus_meta"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_commit_manifest"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_state_hash_votes"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_governance_votes"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_book_order_rows"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_block_action_status"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_logs"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_treasury"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_code"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_block_hash_to_number"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_oracle"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_hashed_accounts"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_receipts"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_consensus_meta",db="consensus"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_trie_nodes"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_storage"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_staking_delegations"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_trades"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_governance_proposals"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_logs_bloom"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_positions"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_slash_records"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_jail_votes"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_block_bodies"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_nonces"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_hashed_storage"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_balances"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_staking_permanent"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_orders"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_dev_pool"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_trie_storage"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_trie"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_liquidation"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_trie_accounts"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_fee_config"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_hashed"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_core_writer_tx"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_pending"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_accounts"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_shards"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_tx_hash_to_location"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_pending",db="consensus"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_user_trades"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_block_headers"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_staking_validators"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_staking_rewards"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_bbo"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_shards",db="consensus"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_native_order_books"} 0
+torus_rocksdb_pending_compaction_bytes{cf="cf_sessions"} 0
+# HELP torus_rocksdb_block_cache_bytes RocksDB shared block-cache usage.
+# TYPE torus_rocksdb_block_cache_bytes gauge
+torus_rocksdb_block_cache_bytes 87
+# HELP torus_wire_compression_bytes Cumulative bytes per /2.0 zstd wire path (labels: path, kind=pre|wire); ratio=pre/wire.
+# TYPE torus_wire_compression_bytes gauge
+torus_wire_compression_bytes{path="block-data",kind="pre"} 0
+torus_wire_compression_bytes{path="native-da",kind="pre"} 272169995
+torus_wire_compression_bytes{path="native-da",kind="wire"} 22081236
+torus_wire_compression_bytes{path="direct",kind="pre"} 63793979
+torus_wire_compression_bytes{path="block-data",kind="wire"} 0
+torus_wire_compression_bytes{path="gossip-native",kind="wire"} 0
+torus_wire_compression_bytes{path="direct",kind="wire"} 24983531
+torus_wire_compression_bytes{path="gossip-native",kind="pre"} 0
+# HELP torus_gossipsub_slow_peer_events Gossipsub SlowPeer events (heartbeats where a peer's send queue dropped/timed out messages).
+# TYPE torus_gossipsub_slow_peer_events counter
+torus_gossipsub_slow_peer_events_total 0
+# HELP torus_gossip_publish_all_queues_full Gossipsub publishes rejected with AllQueuesFull (every recipient send queue full).
+# TYPE torus_gossip_publish_all_queues_full counter
+torus_gossip_publish_all_queues_full_total 0
+# HELP torus_consensus_direct_fan_sent B2 consensus-isolation direct-fan sends fired on a live connection.
+# TYPE torus_consensus_direct_fan_sent counter
+torus_consensus_direct_fan_sent_total 0
+# HELP torus_consensus_direct_fan_buffered B2 direct-fan sends buffered for a disconnected validator (reconnect flush).
+# TYPE torus_consensus_direct_fan_buffered counter
+torus_consensus_direct_fan_buffered_total 0
+# HELP torus_consensus_dedup_dropped Inbound consensus messages dropped as dual-path duplicates (direct fan + gossip mirror).
+# TYPE torus_consensus_dedup_dropped counter
+torus_consensus_dedup_dropped_total 0
+# HELP torus_consensus_rate_limited_dropped Inbound consensus gossip dropped by the per-author consensus rate limiter.
+# TYPE torus_consensus_rate_limited_dropped counter
+torus_consensus_rate_limited_dropped_total 330
+# HELP torus_rpc_forward_dropped_full Leader forwards shed because the bounded RPC forward channel was full (B1).
+# TYPE torus_rpc_forward_dropped_full counter
+torus_rpc_forward_dropped_full_total 0
+# HELP torus_d2l_envelopes_sent Batched 0xFD direct-to-leader forward envelopes dispatched (B1).
+# TYPE torus_d2l_envelopes_sent counter
+torus_d2l_envelopes_sent_total 0
+# HELP torus_d2l_envelopes_retried Forward envelopes re-sent to the re-resolved leader after an outbound failure (B1).
+# TYPE torus_d2l_envelopes_retried counter
+torus_d2l_envelopes_retried_total 0
+# HELP torus_d2l_envelopes_dropped Forward envelopes dropped after exhausted retries / unmapped leader / queue overflow (B1).
+# TYPE torus_d2l_envelopes_dropped counter
+torus_d2l_envelopes_dropped_total 0
+# HELP torus_d2l_envelope_bytes Size in bytes of dispatched direct-to-leader forward envelopes (B1).
+# TYPE torus_d2l_envelope_bytes histogram
+torus_d2l_envelope_bytes_sum 0.0
+torus_d2l_envelope_bytes_count 0
+torus_d2l_envelope_bytes_bucket{le="1024.0"} 0
+torus_d2l_envelope_bytes_bucket{le="2048.0"} 0
+torus_d2l_envelope_bytes_bucket{le="4096.0"} 0
+torus_d2l_envelope_bytes_bucket{le="8192.0"} 0
+torus_d2l_envelope_bytes_bucket{le="16384.0"} 0
+torus_d2l_envelope_bytes_bucket{le="32768.0"} 0
+torus_d2l_envelope_bytes_bucket{le="65536.0"} 0
+torus_d2l_envelope_bytes_bucket{le="131072.0"} 0
+torus_d2l_envelope_bytes_bucket{le="262144.0"} 0
+torus_d2l_envelope_bytes_bucket{le="524288.0"} 0
+torus_d2l_envelope_bytes_bucket{le="1048576.0"} 0
+torus_d2l_envelope_bytes_bucket{le="2097152.0"} 0
+torus_d2l_envelope_bytes_bucket{le="4194304.0"} 0
+torus_d2l_envelope_bytes_bucket{le="+Inf"} 0
+# EOF

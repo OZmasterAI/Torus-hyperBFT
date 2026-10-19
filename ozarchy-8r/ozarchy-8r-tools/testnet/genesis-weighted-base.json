@@ -1,0 +1,1597 @@
+{
+  "chain_id": 7778,
+  "chain_name": "torus-testnet",
+  "timestamp": 1784678400,
+  "consensus": {
+    "protocol": "hotstuff",
+    "epoch_length": 100,
+    "timeout_base_ms": 1200,
+    "timeout_max_ms": 30000,
+    "reputation_leader_selection": false
+  },
+  "evm": {
+    "spec_id": "cancun",
+    "gas_limit": 3000000,
+    "block_interval": 11,
+    "big_block_interval": 0,
+    "big_gas_limit": 10000000,
+    "base_fee_initial": 1000000000,
+    "chain_id": 7778
+  },
+  "economics": {
+    "treasury_address": "0xf000000000000000000000000000000000000001",
+    "dev_pool_address": "0xf000000000000000000000000000000000000002",
+    "fee_split": {
+      "start": {
+        "burn": 1000,
+        "validator": 0,
+        "treasury": 4500,
+        "dev_pool": 4500
+      },
+      "end": {
+        "burn": 2500,
+        "validator": 2500,
+        "treasury": 2500,
+        "dev_pool": 2500
+      },
+      "transition_epochs": 1825
+    },
+    "permanent_staking": {
+      "annual_rate_bps": 500,
+      "governance_multiplier_bps": 15000
+    },
+    "validator": {
+      "min_self_delegation": "10000000000000000000000",
+      "max_validators": 21,
+      "unbonding_period_blocks": 604800,
+      "max_commission_bps": 5000,
+      "max_commission_change_bps": 100
+    }
+  },
+  "validators": [
+    {
+      "address": "0x1000000000000000000000000000000000000001",
+      "pubkey": "0xdc4ca7a6ab405ad1da72806658b4f87282b25e448eb438b09a3034c7328cecf5",
+      "stake": "4000000000000000000000000",
+      "commission_bps": 500
+    },
+    {
+      "address": "0x24ae5329d4d8039a72dec32cc9945b717f11d8d2",
+      "pubkey": "0x821781a42368b782826de07c351e99921ee8bee3773b617af0300ae124cc7eda",
+      "stake": "4000000000000000000000000",
+      "commission_bps": 500
+    },
+    {
+      "address": "0x0936adb653ffd8ef521029ffbf27bc1c815a7cbb",
+      "pubkey": "0x537f761858a3b44a23a0d63e16d9e642a86c44aac98a94d39501d2115528a63c",
+      "stake": "4000000000000000000000000",
+      "commission_bps": 500
+    },
+    {
+      "address": "0x7e7cfdb06a5c0e3cc85510ccaeed896f39c179f5",
+      "pubkey": "0x99f813745e8347609dda017afbbe4a963921ed32df40e1d215c56bb9ddb3a59f",
+      "stake": "2000000000000000000000000",
+      "commission_bps": 500
+    }
+  ],
+  "accounts": [
+    {
+      "address": "0xf000000000000000000000000000000000000001",
+      "balance": "1000000000000000000000000000",
+      "note": "treasury"
+    },
+    {
+      "address": "0xf000000000000000000000000000000000000002",
+      "balance": "500000000000000000000000000",
+      "note": "dev_pool"
+    },
+    {
+      "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-0 (hardhat #0)"
+    },
+    {
+      "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-1 (hardhat #1)"
+    },
+    {
+      "address": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-2 (hardhat #2)"
+    },
+    {
+      "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-3 (hardhat #3)"
+    },
+    {
+      "address": "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-4 (hardhat #4)"
+    },
+    {
+      "address": "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-5 (hardhat #5) — governance staker"
+    },
+    {
+      "address": "0x976ea74026e726554db657fa54763abd0c3a0aa9",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-6 (hardhat #6) — governance staker"
+    },
+    {
+      "address": "0x14dc79964da2c08b23698b3d3cc7ca32193d9955",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-7 (hardhat #7) — governance staker"
+    },
+    {
+      "address": "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-8 (hardhat #8) — governance staker"
+    },
+    {
+      "address": "0xa0ee7a142d267c1f36714e4a8f75612f20a79720",
+      "balance": "1000000000000000000000000",
+      "note": "test-account-9 (hardhat #9) — governance staker"
+    },
+    {
+      "address": "0xd5e87531b4d7dab180ca474efc23073ee1842652",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 20"
+    },
+    {
+      "address": "0x21e2791132f625878858ec56808742af418d1924",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 21"
+    },
+    {
+      "address": "0x4a44dff6effd1bb57363d623f6e764bcfecfe4e9",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 22"
+    },
+    {
+      "address": "0x7d1551b7c59ec854ef7cd4420217253fb18bb2cb",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 23"
+    },
+    {
+      "address": "0x0799c9eb0cbf7b3ecd13da96f7173e1916fac395",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 24"
+    },
+    {
+      "address": "0xaa68f6cfeb044a0dc6fa899111a83a6ea2dbd46d",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 25"
+    },
+    {
+      "address": "0xcff1825eb162c25711da4d3fdd9a229f750a7952",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 26"
+    },
+    {
+      "address": "0x18809ba729bab1a7643b0f9ba9541d5dc09303bb",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 27"
+    },
+    {
+      "address": "0xf8b33cdcfa4626719a41a3c53ffe7ef0de9fbf00",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 28"
+    },
+    {
+      "address": "0xd7c8a70c55f95e0f1f2a6428f51df9217db77708",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 29"
+    },
+    {
+      "address": "0x12d381db95d8ce6a8a9fb4959f9619d5d5c07fb3",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 30"
+    },
+    {
+      "address": "0x5f8b8ac1807f19ec89dc4fedcfdbf7d6346a50bc",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 31"
+    },
+    {
+      "address": "0x3f82580eacfd33b75665a585e1a78d3ac196c13f",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 32"
+    },
+    {
+      "address": "0xbbde82270f86bb46d61af50752d202a5d5ffc075",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 33"
+    },
+    {
+      "address": "0x4b4032e27aa63aedf081e356f14b16fa0434ec9b",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 34"
+    },
+    {
+      "address": "0xdcfda1f542f9d72ffa675e23ed91be2682688550",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 35"
+    },
+    {
+      "address": "0xadccd8598f0b38d4545adb15a12b8c033833315b",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 36"
+    },
+    {
+      "address": "0x8ea82ef3327aa76adb15fb1a8d9b1987db05d32f",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 37"
+    },
+    {
+      "address": "0x83e298ecd0973a3ccaac76325e258b000e354565",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 38"
+    },
+    {
+      "address": "0xa8d30d2c60f58cd564e7939eb6a92a6204a8f631",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 39"
+    },
+    {
+      "address": "0xaf8007a3ad9af2a95798093f6ac790b02389304f",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 40"
+    },
+    {
+      "address": "0x59cd47208ad092af802eaec4f180d1ea8bca742d",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 41"
+    },
+    {
+      "address": "0x994e0de0d214269e90ae4ea98d2e4aca950d06ae",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 42"
+    },
+    {
+      "address": "0x1d52cbdf949123cc4fb47dd51ea9d51004552c87",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 43"
+    },
+    {
+      "address": "0x7c7aa46d258077f2a6d82413cb35840b65d28152",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 44"
+    },
+    {
+      "address": "0x153e6b1f13956a1ffb65cfd93c692a1b21c100b8",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 45"
+    },
+    {
+      "address": "0xbaf35f6b57ea4cf6a7b7a5f26cb31a3153736b5a",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 46"
+    },
+    {
+      "address": "0x827af5dcd0c2306b9983fa2566173d31805b21f2",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 47"
+    },
+    {
+      "address": "0x8abd02480de3894bf8110d36a6b1aa381ef4ac28",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 48"
+    },
+    {
+      "address": "0x6300154e65f9a696ca91f0cef21798ed9f93df8c",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 49"
+    },
+    {
+      "address": "0xce615509f7453ff4a3a3bc79be968f89980e7ee1",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 50"
+    },
+    {
+      "address": "0xcfd267bd388da848b6e388f917df253df47dd35a",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 51"
+    },
+    {
+      "address": "0xed346f5885b1aa7fa2a3134b6e93472af7aa9252",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 52"
+    },
+    {
+      "address": "0x171466a2261ff1f772b5e15809133c0736ff80d8",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 53"
+    },
+    {
+      "address": "0x4fa132a8a05789e7996ff3453ded71aa03efb2d0",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 54"
+    },
+    {
+      "address": "0x03f4650a241ce5b4be35b01bd3acfdeee4214991",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 55"
+    },
+    {
+      "address": "0xb954f139f1458f5a9cada6bb3629762cfbba0363",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 56"
+    },
+    {
+      "address": "0x6f470e5b7efbe84894c4c9b5cc40f30f60667774",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 57"
+    },
+    {
+      "address": "0x5d70f3edcb2b3f052b7fd7218ee2ea0f613c3571",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 58"
+    },
+    {
+      "address": "0xb1fb382d1f4db6893e0b6c522fec9f6cf4110833",
+      "balance": "1000000000000000000000000",
+      "note": "bench sender 59"
+    }
+  ],
+  "evm_alloc": {},
+  "markets": [
+    {
+      "market_id": 1,
+      "base_asset": "BTC",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "BTC-USD perp. tick/lot cosmetic — runtime order book auto-creates tick=lot=1.0"
+    },
+    {
+      "market_id": 2,
+      "base_asset": "ETH",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "ETH-USD perp"
+    },
+    {
+      "market_id": 3,
+      "base_asset": "SOL",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "SOL-USD perp"
+    },
+    {
+      "market_id": 4,
+      "base_asset": "AVAX",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "AVAX-USD perp"
+    },
+    {
+      "market_id": 5,
+      "base_asset": "ARB",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "ARB-USD perp"
+    },
+    {
+      "market_id": 6,
+      "base_asset": "OP",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "OP-USD perp"
+    },
+    {
+      "market_id": 7,
+      "base_asset": "DOGE",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "DOGE-USD perp"
+    },
+    {
+      "market_id": 8,
+      "base_asset": "LINK",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "LINK-USD perp"
+    },
+    {
+      "market_id": 9,
+      "base_asset": "MATIC",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "MATIC-USD perp"
+    },
+    {
+      "market_id": 10,
+      "base_asset": "APT",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "APT-USD perp"
+    },
+    {
+      "market_id": 11,
+      "base_asset": "S11",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S11-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 12,
+      "base_asset": "S12",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S12-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 13,
+      "base_asset": "S13",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S13-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 14,
+      "base_asset": "S14",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S14-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 15,
+      "base_asset": "S15",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S15-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 16,
+      "base_asset": "S16",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S16-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 17,
+      "base_asset": "S17",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S17-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 18,
+      "base_asset": "S18",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S18-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 19,
+      "base_asset": "S19",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S19-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 20,
+      "base_asset": "S20",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S20-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 21,
+      "base_asset": "S21",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S21-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 22,
+      "base_asset": "S22",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S22-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 23,
+      "base_asset": "S23",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S23-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 24,
+      "base_asset": "S24",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S24-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 25,
+      "base_asset": "S25",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S25-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 26,
+      "base_asset": "S26",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S26-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 27,
+      "base_asset": "S27",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S27-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 28,
+      "base_asset": "S28",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S28-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 29,
+      "base_asset": "S29",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S29-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 30,
+      "base_asset": "S30",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S30-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 31,
+      "base_asset": "S31",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S31-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 32,
+      "base_asset": "S32",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S32-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 33,
+      "base_asset": "S33",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S33-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 34,
+      "base_asset": "S34",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S34-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 35,
+      "base_asset": "S35",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S35-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 36,
+      "base_asset": "S36",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S36-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 37,
+      "base_asset": "S37",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S37-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 38,
+      "base_asset": "S38",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S38-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 39,
+      "base_asset": "S39",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S39-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 40,
+      "base_asset": "S40",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S40-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 41,
+      "base_asset": "S41",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S41-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 42,
+      "base_asset": "S42",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S42-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 43,
+      "base_asset": "S43",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S43-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 44,
+      "base_asset": "S44",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S44-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 45,
+      "base_asset": "S45",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S45-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 46,
+      "base_asset": "S46",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S46-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 47,
+      "base_asset": "S47",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S47-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 48,
+      "base_asset": "S48",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S48-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 49,
+      "base_asset": "S49",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S49-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 50,
+      "base_asset": "S50",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S50-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 51,
+      "base_asset": "S51",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S51-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 52,
+      "base_asset": "S52",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S52-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 53,
+      "base_asset": "S53",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S53-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 54,
+      "base_asset": "S54",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S54-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 55,
+      "base_asset": "S55",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S55-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 56,
+      "base_asset": "S56",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S56-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 57,
+      "base_asset": "S57",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S57-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 58,
+      "base_asset": "S58",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S58-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 59,
+      "base_asset": "S59",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S59-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 60,
+      "base_asset": "S60",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S60-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 61,
+      "base_asset": "S61",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S61-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 62,
+      "base_asset": "S62",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S62-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 63,
+      "base_asset": "S63",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S63-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 64,
+      "base_asset": "S64",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S64-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 65,
+      "base_asset": "S65",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S65-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 66,
+      "base_asset": "S66",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S66-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 67,
+      "base_asset": "S67",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S67-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 68,
+      "base_asset": "S68",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S68-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 69,
+      "base_asset": "S69",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S69-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 70,
+      "base_asset": "S70",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S70-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 71,
+      "base_asset": "S71",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S71-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 72,
+      "base_asset": "S72",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S72-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 73,
+      "base_asset": "S73",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S73-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 74,
+      "base_asset": "S74",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S74-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 75,
+      "base_asset": "S75",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S75-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 76,
+      "base_asset": "S76",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S76-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 77,
+      "base_asset": "S77",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S77-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 78,
+      "base_asset": "S78",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S78-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 79,
+      "base_asset": "S79",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S79-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 80,
+      "base_asset": "S80",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S80-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 81,
+      "base_asset": "S81",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S81-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 82,
+      "base_asset": "S82",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S82-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 83,
+      "base_asset": "S83",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S83-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 84,
+      "base_asset": "S84",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S84-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 85,
+      "base_asset": "S85",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S85-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 86,
+      "base_asset": "S86",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S86-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 87,
+      "base_asset": "S87",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S87-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 88,
+      "base_asset": "S88",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S88-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 89,
+      "base_asset": "S89",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S89-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 90,
+      "base_asset": "S90",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S90-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 91,
+      "base_asset": "S91",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S91-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 92,
+      "base_asset": "S92",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S92-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 93,
+      "base_asset": "S93",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S93-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 94,
+      "base_asset": "S94",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S94-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 95,
+      "base_asset": "S95",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S95-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 96,
+      "base_asset": "S96",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S96-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 97,
+      "base_asset": "S97",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S97-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 98,
+      "base_asset": "S98",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S98-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 99,
+      "base_asset": "S99",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S99-USD (added for multi-market throughput sweeps)"
+    },
+    {
+      "market_id": 100,
+      "base_asset": "S100",
+      "quote_asset": "USD",
+      "lot_size": "1.0",
+      "tick_size": "1.0",
+      "initial_margin": "5.0",
+      "note": "synthetic bench market S100-USD (added for multi-market throughput sweeps)"
+    }
+  ],
+  "precompiles": {},
+  "permanent_stakes": [
+    {
+      "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #0 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #1 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #2 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #3 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #4 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #5 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x976ea74026e726554db657fa54763abd0c3a0aa9",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #6 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x14dc79964da2c08b23698b3d3cc7ca32193d9955",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #7 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #8 — 100k permanent stake (governance voter)"
+    },
+    {
+      "address": "0xa0ee7a142d267c1f36714e4a8f75612f20a79720",
+      "amount": "100000000000000000000000",
+      "note": "hardhat #9 — 100k permanent stake (governance voter)"
+    }
+  ],
+  "native_balances": [
+    {
+      "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "available": "1000000000000.0",
+      "note": "hardhat #0 (bench market-maker)"
+    },
+    {
+      "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+      "available": "1000000000000.0",
+      "note": "hardhat #1 (bench market-maker)"
+    },
+    {
+      "address": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+      "available": "1000000000000.0",
+      "note": "hardhat #2 (bench market-maker)"
+    },
+    {
+      "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+      "available": "1000000000000.0",
+      "note": "hardhat #3 (bench market-maker)"
+    },
+    {
+      "address": "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+      "available": "1000000000000.0",
+      "note": "hardhat #4 (bench market-maker)"
+    },
+    {
+      "address": "0x9965507d1a55bcc2695c58ba16fb37d819b0a4dc",
+      "available": "1000000000000.0",
+      "note": "hardhat #5 (bench market-maker)"
+    },
+    {
+      "address": "0x976ea74026e726554db657fa54763abd0c3a0aa9",
+      "available": "1000000000000.0",
+      "note": "hardhat #6 (bench market-maker)"
+    },
+    {
+      "address": "0x14dc79964da2c08b23698b3d3cc7ca32193d9955",
+      "available": "1000000000000.0",
+      "note": "hardhat #7 (bench market-maker)"
+    },
+    {
+      "address": "0x23618e81e3f5cdf7f54c3d65f7fbc0abf5b21e8f",
+      "available": "1000000000000.0",
+      "note": "hardhat #8 (bench market-maker)"
+    },
+    {
+      "address": "0xa0ee7a142d267c1f36714e4a8f75612f20a79720",
+      "available": "1000000000000.0",
+      "note": "hardhat #9 (bench market-maker)"
+    },
+    {
+      "address": "0xbcd4042de499d14e55001ccbb24a551f3b954096",
+      "available": "1000000000000.0",
+      "note": "hardhat #10 (bench market-maker)"
+    },
+    {
+      "address": "0x71be63f3384f5fb98995898a86b02fb2426c5788",
+      "available": "1000000000000.0",
+      "note": "hardhat #11 (bench market-maker)"
+    },
+    {
+      "address": "0xfabb0ac9d68b0b445fb7357272ff202c5651694a",
+      "available": "1000000000000.0",
+      "note": "hardhat #12 (bench market-maker)"
+    },
+    {
+      "address": "0x1cbd3b2770909d4e10f157cabc84c7264073c9ec",
+      "available": "1000000000000.0",
+      "note": "hardhat #13 (bench market-maker)"
+    },
+    {
+      "address": "0xdf3e18d64bc6a983f673ab319ccae4f1a57c7097",
+      "available": "1000000000000.0",
+      "note": "hardhat #14 (bench market-maker)"
+    },
+    {
+      "address": "0xcd3b766ccdd6ae721141f452c550ca635964ce71",
+      "available": "1000000000000.0",
+      "note": "hardhat #15 (bench market-maker)"
+    },
+    {
+      "address": "0x2546bcd3c84621e976d8185a91a922ae77ecec30",
+      "available": "1000000000000.0",
+      "note": "hardhat #16 (bench market-maker)"
+    },
+    {
+      "address": "0xbda5747bfd65f08deb54cb465eb87d40e51b197e",
+      "available": "1000000000000.0",
+      "note": "hardhat #17 (bench market-maker)"
+    },
+    {
+      "address": "0xdd2fd4581271e230360230f9337d5c0430bf44c0",
+      "available": "1000000000000.0",
+      "note": "hardhat #18 (bench market-maker)"
+    },
+    {
+      "address": "0x8626f6940e2eb28930efb4cef49b2d1f2c9c1199",
+      "available": "1000000000000.0",
+      "note": "hardhat #19 (bench market-maker)"
+    },
+    {
+      "address": "0xd5e87531b4d7dab180ca474efc23073ee1842652",
+      "available": "1000000000000.0",
+      "note": "bench sender 20"
+    },
+    {
+      "address": "0x21e2791132f625878858ec56808742af418d1924",
+      "available": "1000000000000.0",
+      "note": "bench sender 21"
+    },
+    {
+      "address": "0x4a44dff6effd1bb57363d623f6e764bcfecfe4e9",
+      "available": "1000000000000.0",
+      "note": "bench sender 22"
+    },
+    {
+      "address": "0x7d1551b7c59ec854ef7cd4420217253fb18bb2cb",
+      "available": "1000000000000.0",
+      "note": "bench sender 23"
+    },
+    {
+      "address": "0x0799c9eb0cbf7b3ecd13da96f7173e1916fac395",
+      "available": "1000000000000.0",
+      "note": "bench sender 24"
+    },
+    {
+      "address": "0xaa68f6cfeb044a0dc6fa899111a83a6ea2dbd46d",
+      "available": "1000000000000.0",
+      "note": "bench sender 25"
+    },
+    {
+      "address": "0xcff1825eb162c25711da4d3fdd9a229f750a7952",
+      "available": "1000000000000.0",
+      "note": "bench sender 26"
+    },
+    {
+      "address": "0x18809ba729bab1a7643b0f9ba9541d5dc09303bb",
+      "available": "1000000000000.0",
+      "note": "bench sender 27"
+    },
+    {
+      "address": "0xf8b33cdcfa4626719a41a3c53ffe7ef0de9fbf00",
+      "available": "1000000000000.0",
+      "note": "bench sender 28"
+    },
+    {
+      "address": "0xd7c8a70c55f95e0f1f2a6428f51df9217db77708",
+      "available": "1000000000000.0",
+      "note": "bench sender 29"
+    },
+    {
+      "address": "0x12d381db95d8ce6a8a9fb4959f9619d5d5c07fb3",
+      "available": "1000000000000.0",
+      "note": "bench sender 30"
+    },
+    {
+      "address": "0x5f8b8ac1807f19ec89dc4fedcfdbf7d6346a50bc",
+      "available": "1000000000000.0",
+      "note": "bench sender 31"
+    },
+    {
+      "address": "0x3f82580eacfd33b75665a585e1a78d3ac196c13f",
+      "available": "1000000000000.0",
+      "note": "bench sender 32"
+    },
+    {
+      "address": "0xbbde82270f86bb46d61af50752d202a5d5ffc075",
+      "available": "1000000000000.0",
+      "note": "bench sender 33"
+    },
+    {
+      "address": "0x4b4032e27aa63aedf081e356f14b16fa0434ec9b",
+      "available": "1000000000000.0",
+      "note": "bench sender 34"
+    },
+    {
+      "address": "0xdcfda1f542f9d72ffa675e23ed91be2682688550",
+      "available": "1000000000000.0",
+      "note": "bench sender 35"
+    },
+    {
+      "address": "0xadccd8598f0b38d4545adb15a12b8c033833315b",
+      "available": "1000000000000.0",
+      "note": "bench sender 36"
+    },
+    {
+      "address": "0x8ea82ef3327aa76adb15fb1a8d9b1987db05d32f",
+      "available": "1000000000000.0",
+      "note": "bench sender 37"
+    },
+    {
+      "address": "0x83e298ecd0973a3ccaac76325e258b000e354565",
+      "available": "1000000000000.0",
+      "note": "bench sender 38"
+    },
+    {
+      "address": "0xa8d30d2c60f58cd564e7939eb6a92a6204a8f631",
+      "available": "1000000000000.0",
+      "note": "bench sender 39"
+    },
+    {
+      "address": "0xaf8007a3ad9af2a95798093f6ac790b02389304f",
+      "available": "1000000000000.0",
+      "note": "bench sender 40"
+    },
+    {
+      "address": "0x59cd47208ad092af802eaec4f180d1ea8bca742d",
+      "available": "1000000000000.0",
+      "note": "bench sender 41"
+    },
+    {
+      "address": "0x994e0de0d214269e90ae4ea98d2e4aca950d06ae",
+      "available": "1000000000000.0",
+      "note": "bench sender 42"
+    },
+    {
+      "address": "0x1d52cbdf949123cc4fb47dd51ea9d51004552c87",
+      "available": "1000000000000.0",
+      "note": "bench sender 43"
+    },
+    {
+      "address": "0x7c7aa46d258077f2a6d82413cb35840b65d28152",
+      "available": "1000000000000.0",
+      "note": "bench sender 44"
+    },
+    {
+      "address": "0x153e6b1f13956a1ffb65cfd93c692a1b21c100b8",
+      "available": "1000000000000.0",
+      "note": "bench sender 45"
+    },
+    {
+      "address": "0xbaf35f6b57ea4cf6a7b7a5f26cb31a3153736b5a",
+      "available": "1000000000000.0",
+      "note": "bench sender 46"
+    },
+    {
+      "address": "0x827af5dcd0c2306b9983fa2566173d31805b21f2",
+      "available": "1000000000000.0",
+      "note": "bench sender 47"
+    },
+    {
+      "address": "0x8abd02480de3894bf8110d36a6b1aa381ef4ac28",
+      "available": "1000000000000.0",
+      "note": "bench sender 48"
+    },
+    {
+      "address": "0x6300154e65f9a696ca91f0cef21798ed9f93df8c",
+      "available": "1000000000000.0",
+      "note": "bench sender 49"
+    },
+    {
+      "address": "0xce615509f7453ff4a3a3bc79be968f89980e7ee1",
+      "available": "1000000000000.0",
+      "note": "bench sender 50"
+    },
+    {
+      "address": "0xcfd267bd388da848b6e388f917df253df47dd35a",
+      "available": "1000000000000.0",
+      "note": "bench sender 51"
+    },
+    {
+      "address": "0xed346f5885b1aa7fa2a3134b6e93472af7aa9252",
+      "available": "1000000000000.0",
+      "note": "bench sender 52"
+    },
+    {
+      "address": "0x171466a2261ff1f772b5e15809133c0736ff80d8",
+      "available": "1000000000000.0",
+      "note": "bench sender 53"
+    },
+    {
+      "address": "0x4fa132a8a05789e7996ff3453ded71aa03efb2d0",
+      "available": "1000000000000.0",
+      "note": "bench sender 54"
+    },
+    {
+      "address": "0x03f4650a241ce5b4be35b01bd3acfdeee4214991",
+      "available": "1000000000000.0",
+      "note": "bench sender 55"
+    },
+    {
+      "address": "0xb954f139f1458f5a9cada6bb3629762cfbba0363",
+      "available": "1000000000000.0",
+      "note": "bench sender 56"
+    },
+    {
+      "address": "0x6f470e5b7efbe84894c4c9b5cc40f30f60667774",
+      "available": "1000000000000.0",
+      "note": "bench sender 57"
+    },
+    {
+      "address": "0x5d70f3edcb2b3f052b7fd7218ee2ea0f613c3571",
+      "available": "1000000000000.0",
+      "note": "bench sender 58"
+    },
+    {
+      "address": "0xb1fb382d1f4db6893e0b6c522fec9f6cf4110833",
+      "available": "1000000000000.0",
+      "note": "bench sender 59"
+    }
+  ]
+}

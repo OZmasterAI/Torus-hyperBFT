@@ -1,0 +1,47 @@
+{
+  "val0": {
+    "counts": {
+      "manifest": 461,
+      "body_push": 172,
+      "body_push_max_bytes": 512933,
+      "exhausted": 0,
+      "sync_fallback": 0,
+      "da_outbound_fail": 0,
+      "starvation": 0,
+      "pacing": 0
+    },
+    "log_bytes": 57723491,
+    "send_queue_full_lines": 0,
+    "send_queue_full_bytes": 0
+  },
+  "val1": {
+    "counts": {
+      "manifest": 412,
+      "body_push": 247,
+      "body_push_max_bytes": 512933,
+      "exhausted": 0,
+      "sync_fallback": 0,
+      "da_outbound_fail": 0,
+      "starvation": 0,
+      "pacing": 0
+    },
+    "log_bytes": 57721821,
+    "send_queue_full_lines": 0,
+    "send_queue_full_bytes": 0
+  },
+  "val2": {
+    "counts": {
+      "manifest": 488,
+      "body_push": 194,
+      "body_push_max_bytes": 521293,
+      "exhausted": 0,
+      "sync_fallback": 0,
+      "da_outbound_fail": 0,
+      "starvation": 0,
+      "pacing": 0
+    },
+    "log_bytes": 57754999,
+    "send_queue_full_lines": 0,
+    "send_queue_full_bytes": 0
+  }
+}

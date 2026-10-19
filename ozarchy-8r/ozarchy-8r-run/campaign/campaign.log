@@ -1,0 +1,463 @@
+build lock: waiting
+PREFLIGHT NOTE: report scans: in-line because expectation 'in_flight_tail='commit'' (arm *) on run.log; expectation '--in-flight-tail commit' (arm *) on run.log; expectation 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm *) on run.log; expectation 'oracle feed pid [0-9]+;' (arm *) on run.log; expectation '^  state_hash_activation = "?off"?$' (arm *) on run.log; expectation '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm *) on run.log; checks file /home/oz/bench-results-matched/ozarchy-8r-tools/8r-checks.sh (ingest-evictions log-excerpts; run-cell.sh defers them together)
+[23:02:26] PREFLIGHT OK CAMPAIGN=ozarchy-8r driver=/home/oz/bench-results-matched/ozarchy-8r-tools/ozarchy-8r-campaign.sh RUN=/home/oz/bench-results-matched/ozarchy-8r-run/campaign P=ozarchy-8r-300m genesis_root=/home/oz/bench-results-matched/ozarchy-8r-tools arms=A B C baseline=A markets=300 rate=76000 warmgate=w1,s0 checks=r8loadchk,r8clchk,r8flagchk,r8pushchk,r8custchk,r8retchk,r8gcchk,r8slowchk,r8rejchk,r8swapchk,r8diskchk,r8modechk samplers=1 host_checks=1 end_pass=0 genesis_reuse=1 min_mem_avail_kb=40000000 kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 cells=13: w1 r1-A r1-B r1-C r2-C r2-B r2-A r3-A r3-B r3-C r4-C r4-B r4-A 
+[23:02:32] HOST before ozarchy-8r-300m-w1: builds none; analysis none; load 3.44 15.14 19.05
+[23:02:32] START ozarchy-8r-300m-w1 arm=A bin=a node_md5=94053e26 wrapper=0 env=none dur=300 markets=300 rate=76000 mem_avail_kb=56163312 swap_used_kb=2583488
+CHECK OK ozarchy-8r-300m-w1 sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-w1.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-w1.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-w1.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:02:32] ozarchy-8r-300m-w1 unit=bench-ozarchy-8r-300m-w1 main_pid=880461 harness_pid=880468 (bash)
+[23:08:49] saved RocksDB LOG for ozarchy-8r-300m-w1: 3 files
+[23:08:49] data sizes for ozarchy-8r-300m-w1: val0 total_bytes 1881103842 sst_bytes 822502232 sst_files 72 wal_bytes 298795446;val1 total_bytes 1438266954 sst_bytes 821453423 sst_files 72 wal_bytes 0;val2 total_bytes 1599052629 sst_bytes 822503020 sst_files 72 wal_bytes 0;
+[23:08:49] END ozarchy-8r-300m-w1 rc=0 [23:08:47] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-w1/summary.json
+[ozarchy-8r-300m-w1] fds max/end val0 424/150 val1 424/148 val2 424/150 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-w1 node exe md5 94053e26 on 3 nodes (arm A)
+CHECK OK ozarchy-8r-300m-w1 node env on 3 nodes (arm A: no arm env; unset: TORUS_RETENTION_BLOCKS TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-w1 markets=300
+CHECK OK ozarchy-8r-300m-w1 run.log: 1 lines matching 'in_flight_tail='commit'' (arm A)
+CHECK OK ozarchy-8r-300m-w1 run.log: 1 lines matching '--in-flight-tail commit' (arm A)
+CHECK OK ozarchy-8r-300m-w1 bench.log: 1 lines matching '^In-flight cap 4 action' (arm A)
+CHECK OK ozarchy-8r-300m-w1 run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm A)
+CHECK OK ozarchy-8r-300m-w1 run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm A)
+CHECK OK ozarchy-8r-300m-w1 run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm A)
+CHECK OK ozarchy-8r-300m-w1 run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm A)
+CHECK OK ozarchy-8r-300m-w1 r8loadchk: arm A standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-w1 r8clchk: arm A Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-w1 r8flagchk: arm A (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=55/55,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=55/55,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=55/55,pe_spawns=0
+CHECK OK ozarchy-8r-300m-w1 r8pushchk: arm A threshold 524288 on 3 nodes, no clamp; val0:manifest=454,body=211,max_bytes=512933,prewarm=367/16171 val1:manifest=456,body=237,max_bytes=518213,prewarm=370/17474 val2:manifest=464,body=216,max_bytes=513593,prewarm=370/17091
+CHECK OK ozarchy-8r-300m-w1 r8custchk: arm A TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008151400000000015s/count=2038 val1:custody_sum=0.0008415029999999999s/count=2038 val2:custody_sum=0.0009271820000000011s/count=2038
+CHECK OK ozarchy-8r-300m-w1 r8retchk: arm A retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 0); val0:retention_cmdline=0,gc_on=0,window1128=0 val1:retention_cmdline=0,gc_on=0,window1128=0 val2:retention_cmdline=0,gc_on=0,window1128=0
+CHECK OK ozarchy-8r-300m-w1 r8gcchk: arm A; val0:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val1:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val2:gc_deleted=0,gc_s_sum=0.0,gc_count=0
+CHECK OK ozarchy-8r-300m-w1 r8slowchk: arm A; val0:slow_lines=0,slow_counter=0 val1:slow_lines=0,slow_counter=0 val2:slow_lines=0,slow_counter=0
+CHECK OK ozarchy-8r-300m-w1 r8rejchk: arm A margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107065808,pct=0.000 val1:rej_margin=0,placed_accepted=107065808,pct=0.000 val2:rej_margin=0,placed_accepted=107065808,pct=0.000
+CHECK OK ozarchy-8r-300m-w1 r8swapchk: arm A swap used 2582712 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-w1 r8diskchk: arm A fresh launch (CLEAN=1); val0 data_bytes=1881103842;val1 data_bytes=1438266954;val2 data_bytes=1599052629;free_gb_after=103;
+CHECK OK ozarchy-8r-300m-w1 r8modechk: arm A GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-w1 sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-w1 warm-up gate: validity=ACCEPT agreement=AGREE liveness=PASS panic_or_failstop_lines=0 consensus_timeouts=1.0 matched/s=268253.8
+CHECK OK ozarchy-8r-300m-w1 hardscan done
+CHECK SOAK ozarchy-8r-300m-w1: vmstat rows 377 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 72, du rows 187, metrics ok scrapes 516, metrics-1hz ok scrapes 1071, host-1hz rows 359
+[cell-step] ozarchy-8r-300m-w1 rc=0 agree=yes md5_ok=yes metric=268253.8 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[23:09:57] HOST before ozarchy-8r-300m-r1-A: builds none; analysis none; load 8.07 25.05 23.93
+[23:09:57] START ozarchy-8r-300m-r1-A arm=A bin=a node_md5=94053e26 wrapper=0 env=none dur=300 markets=300 rate=76000 mem_avail_kb=56037292 swap_used_kb=2582712
+CHECK OK ozarchy-8r-300m-r1-A sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r1-A.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r1-A.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r1-A.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:09:58] ozarchy-8r-300m-r1-A unit=bench-ozarchy-8r-300m-r1-A main_pid=928745 harness_pid=928752 (bash)
+[23:16:00] saved RocksDB LOG for ozarchy-8r-300m-r1-A: 3 files
+[23:16:00] data sizes for ozarchy-8r-300m-r1-A: val0 total_bytes 1267034327 sst_bytes 644599888 sst_files 76 wal_bytes 0;val1 total_bytes 3812523396 sst_bytes 617813386 sst_files 59 wal_bytes 1449134541;val2 total_bytes 3819208847 sst_bytes 617815597 sst_files 59 wal_bytes 1446246635;
+[23:16:00] END ozarchy-8r-300m-r1-A rc=0 [23:15:58] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r1-A/summary.json
+[ozarchy-8r-300m-r1-A] fds max/end val0 423/156 val1 421/154 val2 422/155 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r1-A node exe md5 94053e26 on 3 nodes (arm A)
+CHECK OK ozarchy-8r-300m-r1-A node env on 3 nodes (arm A: no arm env; unset: TORUS_RETENTION_BLOCKS TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r1-A markets=300
+CHECK OK ozarchy-8r-300m-r1-A run.log: 1 lines matching 'in_flight_tail='commit'' (arm A)
+CHECK OK ozarchy-8r-300m-r1-A run.log: 1 lines matching '--in-flight-tail commit' (arm A)
+CHECK OK ozarchy-8r-300m-r1-A bench.log: 1 lines matching '^In-flight cap 4 action' (arm A)
+CHECK OK ozarchy-8r-300m-r1-A run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm A)
+CHECK OK ozarchy-8r-300m-r1-A run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm A)
+CHECK OK ozarchy-8r-300m-r1-A run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm A)
+CHECK OK ozarchy-8r-300m-r1-A run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm A)
+CHECK OK ozarchy-8r-300m-r1-A r8loadchk: arm A standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 947/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r1-A r8clchk: arm A Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r1-A r8flagchk: arm A (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=55/55,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=55/55,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=55/55,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r1-A r8pushchk: arm A threshold 524288 on 3 nodes, no clamp; val0:manifest=471,body=199,max_bytes=522393,prewarm=359/15515 val1:manifest=442,body=246,max_bytes=499126,prewarm=350/17348 val2:manifest=443,body=248,max_bytes=519973,prewarm=364/16587
+CHECK OK ozarchy-8r-300m-r1-A r8custchk: arm A TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0009083760000000024s/count=2049 val1:custody_sum=0.0008686830000000002s/count=2049 val2:custody_sum=0.0008067930000000018s/count=2049
+CHECK OK ozarchy-8r-300m-r1-A r8retchk: arm A retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 0); val0:retention_cmdline=0,gc_on=0,window1128=0 val1:retention_cmdline=0,gc_on=0,window1128=0 val2:retention_cmdline=0,gc_on=0,window1128=0
+CHECK OK ozarchy-8r-300m-r1-A r8gcchk: arm A; val0:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val1:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val2:gc_deleted=0,gc_s_sum=0.0,gc_count=0
+CHECK OK ozarchy-8r-300m-r1-A r8slowchk: arm A; val0:slow_lines=0,slow_counter=0 val1:slow_lines=0,slow_counter=0 val2:slow_lines=0,slow_counter=0
+CHECK OK ozarchy-8r-300m-r1-A r8rejchk: arm A margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107787458,pct=0.000 val1:rej_margin=0,placed_accepted=107787458,pct=0.000 val2:rej_margin=0,placed_accepted=107787458,pct=0.000
+CHECK OK ozarchy-8r-300m-r1-A r8swapchk: arm A swap used 2582704 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r1-A r8diskchk: arm A fresh launch (CLEAN=1); val0 data_bytes=1267034327;val1 data_bytes=3812523396;val2 data_bytes=3819208847;free_gb_after=103;
+CHECK OK ozarchy-8r-300m-r1-A r8modechk: arm A GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r1-A sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r1-A hardscan done
+CHECK SOAK ozarchy-8r-300m-r1-A: vmstat rows 363 (cell 300 s), mem samples 201, smaps snapshots 12, fd rows 70, du rows 180, metrics ok scrapes 504, metrics-1hz ok scrapes 1050, host-1hz rows 352
+[cell-step] ozarchy-8r-300m-r1-A rc=0 agree=yes md5_ok=yes metric=269275.4 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[23:17:10] HOST before ozarchy-8r-300m-r1-B: builds none; analysis none; load 7.41 22.42 24.06
+[23:17:10] START ozarchy-8r-300m-r1-B arm=B bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 dur=300 markets=300 rate=76000 mem_avail_kb=56119280 swap_used_kb=2582704
+CHECK OK ozarchy-8r-300m-r1-B sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r1-B.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r1-B.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r1-B.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:17:10] ozarchy-8r-300m-r1-B unit=bench-ozarchy-8r-300m-r1-B main_pid=975857 harness_pid=975864 (bash)
+[23:23:19] saved RocksDB LOG for ozarchy-8r-300m-r1-B: 3 files
+[23:23:19] data sizes for ozarchy-8r-300m-r1-B: val0 total_bytes 2791207216 sst_bytes 415787095 sst_files 41 wal_bytes 2146421190;val1 total_bytes 2789194483 sst_bytes 418633565 sst_files 43 wal_bytes 2146423353;val2 total_bytes 592795086 sst_bytes 430257160 sst_files 55 wal_bytes 0;
+[23:23:19] END ozarchy-8r-300m-r1-B rc=0 [23:23:18] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r1-B/summary.json
+[ozarchy-8r-300m-r1-B] fds max/end val0 416/126 val1 418/128 val2 419/126 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r1-B node exe md5 94053e26 on 3 nodes (arm B)
+CHECK OK ozarchy-8r-300m-r1-B node env on 3 nodes (arm B: TORUS_RETENTION_BLOCKS=1000; unset: TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r1-B markets=300
+CHECK OK ozarchy-8r-300m-r1-B run.log: 1 lines matching 'in_flight_tail='commit'' (arm B)
+CHECK OK ozarchy-8r-300m-r1-B run.log: 1 lines matching '--in-flight-tail commit' (arm B)
+CHECK OK ozarchy-8r-300m-r1-B bench.log: 1 lines matching '^In-flight cap 4 action' (arm B)
+CHECK OK ozarchy-8r-300m-r1-B run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm B)
+CHECK OK ozarchy-8r-300m-r1-B run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm B)
+CHECK OK ozarchy-8r-300m-r1-B run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm B)
+CHECK OK ozarchy-8r-300m-r1-B run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm B)
+CHECK OK ozarchy-8r-300m-r1-B r8loadchk: arm B standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r1-B r8clchk: arm B Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r1-B r8flagchk: arm B (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=50/50,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=50/50,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=50/50,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r1-B r8pushchk: arm B threshold 524288 on 3 nodes, no clamp; val0:manifest=447,body=178,max_bytes=521623,prewarm=340/15266 val1:manifest=419,body=186,max_bytes=515903,prewarm=350/15474 val2:manifest=454,body=179,max_bytes=498136,prewarm=318/14182
+CHECK OK ozarchy-8r-300m-r1-B r8custchk: arm B TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0006974820000000011s/count=1863 val1:custody_sum=0.0007682380000000007s/count=1864 val2:custody_sum=0.004584230999999998s/count=1863
+CHECK OK ozarchy-8r-300m-r1-B r8retchk: arm B retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=1,gc_on=1,window1128=1 val1:retention_cmdline=1,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r1-B r8gcchk: arm B; val0:gc_deleted=356530,gc_s_sum=7.841051085999994,gc_count=4682 val1:gc_deleted=356471,gc_s_sum=7.405992510999982,gc_count=4681 val2:gc_deleted=356530,gc_s_sum=7.558289635000007,gc_count=4682
+CHECK OK ozarchy-8r-300m-r1-B r8slowchk: arm B; val0:slow_lines=1,slow_counter=1 val1:slow_lines=0,slow_counter=0 val2:slow_lines=2,slow_counter=2
+CHECK OK ozarchy-8r-300m-r1-B r8rejchk: arm B margin rejects <= 0%; val0:rej_margin=0,placed_accepted=106902696,pct=0.000 val1:rej_margin=0,placed_accepted=106902696,pct=0.000 val2:rej_margin=0,placed_accepted=106902696,pct=0.000
+CHECK OK ozarchy-8r-300m-r1-B r8swapchk: arm B swap used 2582696 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r1-B r8diskchk: arm B fresh launch (CLEAN=1); val0 data_bytes=2791207216;val1 data_bytes=2789194483;val2 data_bytes=592795086;free_gb_after=105;
+CHECK OK ozarchy-8r-300m-r1-B r8modechk: arm B GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=1,inline=0,handoffs=4682,handoff_s=0.08625125700000011,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=1,inline=0,handoffs=4681,handoff_s=0.09415833800000027,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=1,inline=0,handoffs=4682,handoff_s=0.07827140700000034,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r1-B sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r1-B hardscan done
+CHECK SOAK ozarchy-8r-300m-r1-B: vmstat rows 369 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 72, du rows 183, metrics ok scrapes 516, metrics-1hz ok scrapes 1068, host-1hz rows 359
+[cell-step] ozarchy-8r-300m-r1-B rc=0 agree=yes md5_ok=yes metric=266148.4 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[23:24:27] HOST before ozarchy-8r-300m-r1-C: builds none; analysis none; load 9.31 26.81 27.06
+[23:24:27] START ozarchy-8r-300m-r1-C arm=C bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1 dur=300 markets=300 rate=76000 mem_avail_kb=56142760 swap_used_kb=2582688
+CHECK OK ozarchy-8r-300m-r1-C sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r1-C.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r1-C.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r1-C.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:24:27] ozarchy-8r-300m-r1-C unit=bench-ozarchy-8r-300m-r1-C main_pid=1021732 harness_pid=1021739 (bash)
+[23:30:34] saved RocksDB LOG for ozarchy-8r-300m-r1-C: 3 files
+[23:30:34] data sizes for ozarchy-8r-300m-r1-C: val0 total_bytes 545526113 sst_bytes 377858233 sst_files 67 wal_bytes 0;val1 total_bytes 548282729 sst_bytes 377856000 sst_files 67 wal_bytes 0;val2 total_bytes 547233031 sst_bytes 377858048 sst_files 67 wal_bytes 0;
+[23:30:34] END ozarchy-8r-300m-r1-C rc=0 [23:30:31] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r1-C/summary.json
+[ozarchy-8r-300m-r1-C] fds max/end val0 417/137 val1 417/137 val2 417/138 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r1-C node exe md5 94053e26 on 3 nodes (arm C)
+CHECK OK ozarchy-8r-300m-r1-C node env on 3 nodes (arm C: TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1; unset: TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r1-C markets=300
+CHECK OK ozarchy-8r-300m-r1-C run.log: 1 lines matching 'in_flight_tail='commit'' (arm C)
+CHECK OK ozarchy-8r-300m-r1-C run.log: 1 lines matching '--in-flight-tail commit' (arm C)
+CHECK OK ozarchy-8r-300m-r1-C bench.log: 1 lines matching '^In-flight cap 4 action' (arm C)
+CHECK OK ozarchy-8r-300m-r1-C run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm C)
+CHECK OK ozarchy-8r-300m-r1-C run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm C)
+CHECK OK ozarchy-8r-300m-r1-C run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm C)
+CHECK OK ozarchy-8r-300m-r1-C run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm C)
+CHECK OK ozarchy-8r-300m-r1-C r8loadchk: arm C standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r1-C r8clchk: arm C Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r1-C r8flagchk: arm C (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r1-C r8pushchk: arm C threshold 524288 on 3 nodes, no clamp; val0:manifest=454,body=184,max_bytes=518983,prewarm=360/15694 val1:manifest=461,body=217,max_bytes=492962,prewarm=372/17776 val2:manifest=437,body=232,max_bytes=513369,prewarm=367/17744
+CHECK OK ozarchy-8r-300m-r1-C r8custchk: arm C TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008588650000000017s/count=1985 val1:custody_sum=0.0007631339999999998s/count=1985 val2:custody_sum=0.0007072200000000005s/count=1986
+CHECK OK ozarchy-8r-300m-r1-C r8retchk: arm C retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=1,gc_on=1,window1128=1 val1:retention_cmdline=1,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r1-C r8gcchk: arm C; val0:gc_deleted=359935,gc_s_sum=6.114645946000014,gc_count=4894 val1:gc_deleted=359935,gc_s_sum=6.2470737060000049,gc_count=4894 val2:gc_deleted=359935,gc_s_sum=6.306955985000009,gc_count=4893
+CHECK OK ozarchy-8r-300m-r1-C r8slowchk: arm C; val0:slow_lines=1,slow_counter=1 val1:slow_lines=2,slow_counter=2 val2:slow_lines=1,slow_counter=1
+CHECK OK ozarchy-8r-300m-r1-C r8rejchk: arm C margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107694318,pct=0.000 val1:rej_margin=0,placed_accepted=107694318,pct=0.000 val2:rej_margin=0,placed_accepted=107694318,pct=0.000
+CHECK OK ozarchy-8r-300m-r1-C r8swapchk: arm C swap used 2582636 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r1-C r8diskchk: arm C fresh launch (CLEAN=1); val0 data_bytes=545526113;val1 data_bytes=548282729;val2 data_bytes=547233031;free_gb_after=105;
+CHECK OK ozarchy-8r-300m-r1-C r8modechk: arm C GC mode as specified (TORUS_DA_GC_INLINE environs 3); val0:worker=0,inline=1,handoffs=4894,handoff_s=6.120334034000016,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=1,handoffs=4894,handoff_s=6.252427076000011,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=1,handoffs=4893,handoff_s=6.312413530000014,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r1-C sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r1-C hardscan done
+CHECK SOAK ozarchy-8r-300m-r1-C: vmstat rows 367 (cell 300 s), mem samples 202, smaps snapshots 12, fd rows 71, du rows 182, metrics ok scrapes 510, metrics-1hz ok scrapes 1057, host-1hz rows 355
+[cell-step] ozarchy-8r-300m-r1-C rc=0 agree=yes md5_ok=yes metric=269550.4 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[23:31:42] HOST before ozarchy-8r-300m-r2-C: builds none; analysis none; load 8.76 26.08 27.75
+[23:31:42] START ozarchy-8r-300m-r2-C arm=C bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1 dur=300 markets=300 rate=76000 mem_avail_kb=56110056 swap_used_kb=2582636
+CHECK OK ozarchy-8r-300m-r2-C sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r2-C.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r2-C.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r2-C.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:31:43] ozarchy-8r-300m-r2-C unit=bench-ozarchy-8r-300m-r2-C main_pid=1068248 harness_pid=1068255 (bash)
+[23:37:49] saved RocksDB LOG for ozarchy-8r-300m-r2-C: 3 files
+[23:37:49] data sizes for ozarchy-8r-300m-r2-C: val0 total_bytes 617830245 sst_bytes 442622904 sst_files 58 wal_bytes 0;val1 total_bytes 609870655 sst_bytes 439867835 sst_files 58 wal_bytes 0;val2 total_bytes 610939463 sst_bytes 441201114 sst_files 58 wal_bytes 0;
+[23:37:49] END ozarchy-8r-300m-r2-C rc=0 [23:37:47] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r2-C/summary.json
+[ozarchy-8r-300m-r2-C] fds max/end val0 417/127 val1 415/128 val2 416/128 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r2-C node exe md5 94053e26 on 3 nodes (arm C)
+CHECK OK ozarchy-8r-300m-r2-C node env on 3 nodes (arm C: TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1; unset: TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r2-C markets=300
+CHECK OK ozarchy-8r-300m-r2-C run.log: 1 lines matching 'in_flight_tail='commit'' (arm C)
+CHECK OK ozarchy-8r-300m-r2-C run.log: 1 lines matching '--in-flight-tail commit' (arm C)
+CHECK OK ozarchy-8r-300m-r2-C bench.log: 1 lines matching '^In-flight cap 4 action' (arm C)
+CHECK OK ozarchy-8r-300m-r2-C run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm C)
+CHECK OK ozarchy-8r-300m-r2-C run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm C)
+CHECK OK ozarchy-8r-300m-r2-C run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm C)
+CHECK OK ozarchy-8r-300m-r2-C run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm C)
+CHECK OK ozarchy-8r-300m-r2-C r8loadchk: arm C standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 936/936; no EVM load)
+CHECK OK ozarchy-8r-300m-r2-C r8clchk: arm C Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r2-C r8flagchk: arm C (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r2-C r8pushchk: arm C threshold 524288 on 3 nodes, no clamp; val0:manifest=461,body=172,max_bytes=512933,prewarm=379/17087 val1:manifest=412,body=247,max_bytes=512933,prewarm=370/16838 val2:manifest=488,body=194,max_bytes=521293,prewarm=361/16390
+CHECK OK ozarchy-8r-300m-r2-C r8custchk: arm C TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008533280000000015s/count=1974 val1:custody_sum=0.0008507730000000016s/count=1975 val2:custody_sum=0.0020133759999999996s/count=1974
+CHECK OK ozarchy-8r-300m-r2-C r8retchk: arm C retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=1,gc_on=1,window1128=1 val1:retention_cmdline=1,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r2-C r8gcchk: arm C; val0:gc_deleted=357563,gc_s_sum=6.011632755999986,gc_count=4820 val1:gc_deleted=357462,gc_s_sum=5.963397526000022,gc_count=4819 val2:gc_deleted=357563,gc_s_sum=5.817668787999985,gc_count=4820
+CHECK OK ozarchy-8r-300m-r2-C r8slowchk: arm C; val0:slow_lines=2,slow_counter=2 val1:slow_lines=0,slow_counter=0 val2:slow_lines=0,slow_counter=0
+CHECK OK ozarchy-8r-300m-r2-C r8rejchk: arm C margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107493896,pct=0.000 val1:rej_margin=0,placed_accepted=107493896,pct=0.000 val2:rej_margin=0,placed_accepted=107493896,pct=0.000
+CHECK OK ozarchy-8r-300m-r2-C r8swapchk: arm C swap used 2582636 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r2-C r8diskchk: arm C fresh launch (CLEAN=1); val0 data_bytes=617830245;val1 data_bytes=609870655;val2 data_bytes=610939463;free_gb_after=105;
+CHECK OK ozarchy-8r-300m-r2-C r8modechk: arm C GC mode as specified (TORUS_DA_GC_INLINE environs 3); val0:worker=0,inline=1,handoffs=4820,handoff_s=6.0170556710000089,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=1,handoffs=4819,handoff_s=5.970979655000003,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=1,handoffs=4820,handoff_s=5.825081978000002,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r2-C sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r2-C hardscan done
+CHECK SOAK ozarchy-8r-300m-r2-C: vmstat rows 367 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 71, du rows 182, metrics ok scrapes 510, metrics-1hz ok scrapes 1060, host-1hz rows 357
+[cell-step] ozarchy-8r-300m-r2-C rc=0 agree=yes md5_ok=yes metric=269089.6 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[23:38:58] HOST before ozarchy-8r-300m-r2-B: builds none; analysis none; load 6.48 23.95 27.50
+[23:38:58] START ozarchy-8r-300m-r2-B arm=B bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 dur=300 markets=300 rate=76000 mem_avail_kb=56089388 swap_used_kb=2582636
+CHECK OK ozarchy-8r-300m-r2-B sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r2-B.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r2-B.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r2-B.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:38:58] ozarchy-8r-300m-r2-B unit=bench-ozarchy-8r-300m-r2-B main_pid=1114734 harness_pid=1114741 (bash)
+[23:45:05] saved RocksDB LOG for ozarchy-8r-300m-r2-B: 3 files
+[23:45:05] data sizes for ozarchy-8r-300m-r2-B: val0 total_bytes 2584132449 sst_bytes 414331182 sst_files 42 wal_bytes 2004499149;val1 total_bytes 2609205192 sst_bytes 414331494 sst_files 42 wal_bytes 2004496993;val2 total_bytes 582327352 sst_bytes 437161563 sst_files 58 wal_bytes 0;
+[23:45:05] END ozarchy-8r-300m-r2-B rc=0 [23:45:03] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r2-B/summary.json
+[ozarchy-8r-300m-r2-B] fds max/end val0 420/127 val1 418/127 val2 429/126 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r2-B node exe md5 94053e26 on 3 nodes (arm B)
+CHECK OK ozarchy-8r-300m-r2-B node env on 3 nodes (arm B: TORUS_RETENTION_BLOCKS=1000; unset: TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r2-B markets=300
+CHECK OK ozarchy-8r-300m-r2-B run.log: 1 lines matching 'in_flight_tail='commit'' (arm B)
+CHECK OK ozarchy-8r-300m-r2-B run.log: 1 lines matching '--in-flight-tail commit' (arm B)
+CHECK OK ozarchy-8r-300m-r2-B bench.log: 1 lines matching '^In-flight cap 4 action' (arm B)
+CHECK OK ozarchy-8r-300m-r2-B run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm B)
+CHECK OK ozarchy-8r-300m-r2-B run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm B)
+CHECK OK ozarchy-8r-300m-r2-B run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm B)
+CHECK OK ozarchy-8r-300m-r2-B run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm B)
+CHECK OK ozarchy-8r-300m-r2-B r8loadchk: arm B standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 936/936; no EVM load)
+CHECK OK ozarchy-8r-300m-r2-B r8clchk: arm B Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r2-B r8flagchk: arm B (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r2-B r8pushchk: arm B threshold 524288 on 3 nodes, no clamp; val0:manifest=444,body=188,max_bytes=493186,prewarm=315/13435 val1:manifest=413,body=236,max_bytes=518983,prewarm=319/14610 val2:manifest=429,body=210,max_bytes=518323,prewarm=275/11926
+CHECK OK ozarchy-8r-300m-r2-B r8custchk: arm B TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008175160000000001s/count=1920 val1:custody_sum=0.0008803270000000013s/count=1920 val2:custody_sum=0.000751428000000002s/count=1920
+CHECK OK ozarchy-8r-300m-r2-B r8retchk: arm B retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=2,gc_on=1,window1128=1 val1:retention_cmdline=2,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r2-B r8gcchk: arm B; val0:gc_deleted=352573,gc_s_sum=7.457651574000006,gc_count=4730 val1:gc_deleted=352568,gc_s_sum=7.6466461749999878,gc_count=4729 val2:gc_deleted=352573,gc_s_sum=7.852349987999978,gc_count=4730
+CHECK OK ozarchy-8r-300m-r2-B r8slowchk: arm B; val0:slow_lines=0,slow_counter=0 val1:slow_lines=2,slow_counter=2 val2:slow_lines=4,slow_counter=4
+CHECK OK ozarchy-8r-300m-r2-B r8rejchk: arm B margin rejects <= 0%; val0:rej_margin=0,placed_accepted=106768987,pct=0.000 val1:rej_margin=0,placed_accepted=106768987,pct=0.000 val2:rej_margin=0,placed_accepted=106768987,pct=0.000
+CHECK OK ozarchy-8r-300m-r2-B r8swapchk: arm B swap used 2575128 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r2-B r8diskchk: arm B fresh launch (CLEAN=1); val0 data_bytes=2584132449;val1 data_bytes=2609205192;val2 data_bytes=582327352;free_gb_after=105;
+CHECK OK ozarchy-8r-300m-r2-B r8modechk: arm B GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=1,inline=0,handoffs=4730,handoff_s=0.08995464299999985,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=1,inline=0,handoffs=4729,handoff_s=0.08579828600000006,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=1,inline=0,handoffs=4730,handoff_s=0.08814365000000003,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r2-B sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r2-B hardscan done
+CHECK SOAK ozarchy-8r-300m-r2-B: vmstat rows 367 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 71, du rows 182, metrics ok scrapes 510, metrics-1hz ok scrapes 1064, host-1hz rows 357
+[cell-step] ozarchy-8r-300m-r2-B rc=0 agree=yes md5_ok=yes metric=266175 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[23:46:13] HOST before ozarchy-8r-300m-r2-A: builds none; analysis none; load 9.17 25.65 28.30
+[23:46:13] START ozarchy-8r-300m-r2-A arm=A bin=a node_md5=94053e26 wrapper=0 env=none dur=300 markets=300 rate=76000 mem_avail_kb=56074716 swap_used_kb=2575128
+CHECK OK ozarchy-8r-300m-r2-A sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r2-A.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r2-A.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r2-A.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:46:13] ozarchy-8r-300m-r2-A unit=bench-ozarchy-8r-300m-r2-A main_pid=1164055 harness_pid=1164062 (bash)
+[23:52:22] saved RocksDB LOG for ozarchy-8r-300m-r2-A: 3 files
+[23:52:22] data sizes for ozarchy-8r-300m-r2-A: val0 total_bytes 4452881947 sst_bytes 776245198 sst_files 54 wal_bytes 2059014164;val1 total_bytes 4464772220 sst_bytes 776245079 sst_files 54 wal_bytes 2059016308;val2 total_bytes 1429409472 sst_bytes 802712789 sst_files 67 wal_bytes 0;
+[23:52:22] END ozarchy-8r-300m-r2-A rc=0 [23:52:20] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r2-A/summary.json
+[ozarchy-8r-300m-r2-A] fds max/end val0 425/150 val1 424/149 val2 424/149 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r2-A node exe md5 94053e26 on 3 nodes (arm A)
+CHECK OK ozarchy-8r-300m-r2-A node env on 3 nodes (arm A: no arm env; unset: TORUS_RETENTION_BLOCKS TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r2-A markets=300
+CHECK OK ozarchy-8r-300m-r2-A run.log: 1 lines matching 'in_flight_tail='commit'' (arm A)
+CHECK OK ozarchy-8r-300m-r2-A run.log: 1 lines matching '--in-flight-tail commit' (arm A)
+CHECK OK ozarchy-8r-300m-r2-A bench.log: 1 lines matching '^In-flight cap 4 action' (arm A)
+CHECK OK ozarchy-8r-300m-r2-A run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm A)
+CHECK OK ozarchy-8r-300m-r2-A run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm A)
+CHECK OK ozarchy-8r-300m-r2-A run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm A)
+CHECK OK ozarchy-8r-300m-r2-A run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm A)
+CHECK OK ozarchy-8r-300m-r2-A r8loadchk: arm A standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r2-A r8clchk: arm A Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r2-A r8flagchk: arm A (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=53/53,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=53/53,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=53/53,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r2-A r8pushchk: arm A threshold 524288 on 3 nodes, no clamp; val0:manifest=435,body=193,max_bytes=521403,prewarm=355/14730 val1:manifest=481,body=235,max_bytes=513923,prewarm=343/15607 val2:manifest=439,body=234,max_bytes=521733,prewarm=372/16061
+CHECK OK ozarchy-8r-300m-r2-A r8custchk: arm A TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0007701970000000011s/count=2017 val1:custody_sum=0.000862836000000001s/count=2018 val2:custody_sum=0.0008742010000000044s/count=2017
+CHECK OK ozarchy-8r-300m-r2-A r8retchk: arm A retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 0); val0:retention_cmdline=0,gc_on=0,window1128=0 val1:retention_cmdline=0,gc_on=0,window1128=0 val2:retention_cmdline=0,gc_on=0,window1128=0
+CHECK OK ozarchy-8r-300m-r2-A r8gcchk: arm A; val0:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val1:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val2:gc_deleted=0,gc_s_sum=0.0,gc_count=0
+CHECK OK ozarchy-8r-300m-r2-A r8slowchk: arm A; val0:slow_lines=0,slow_counter=0 val1:slow_lines=0,slow_counter=0 val2:slow_lines=0,slow_counter=0
+CHECK OK ozarchy-8r-300m-r2-A r8rejchk: arm A margin rejects <= 0%; val0:rej_margin=0,placed_accepted=108536333,pct=0.000 val1:rej_margin=0,placed_accepted=108536333,pct=0.000 val2:rej_margin=0,placed_accepted=108536333,pct=0.000
+CHECK OK ozarchy-8r-300m-r2-A r8swapchk: arm A swap used 2575124 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r2-A r8diskchk: arm A fresh launch (CLEAN=1); val0 data_bytes=4452881947;val1 data_bytes=4464772220;val2 data_bytes=1429409472;free_gb_after=102;
+CHECK OK ozarchy-8r-300m-r2-A r8modechk: arm A GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r2-A sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r2-A hardscan done
+CHECK SOAK ozarchy-8r-300m-r2-A: vmstat rows 369 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 71, du rows 183, metrics ok scrapes 513, metrics-1hz ok scrapes 1067, host-1hz rows 358
+[cell-step] ozarchy-8r-300m-r2-A rc=0 agree=yes md5_ok=yes metric=270834.5 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[23:53:31] HOST before ozarchy-8r-300m-r3-A: builds none; analysis none; load 7.84 25.23 28.49
+[23:53:31] START ozarchy-8r-300m-r3-A arm=A bin=a node_md5=94053e26 wrapper=0 env=none dur=300 markets=300 rate=76000 mem_avail_kb=56080708 swap_used_kb=2575124
+CHECK OK ozarchy-8r-300m-r3-A sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r3-A.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r3-A.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r3-A.service; no build lock: started inside a bench unit, whose launch holds it)
+[23:53:31] ozarchy-8r-300m-r3-A unit=bench-ozarchy-8r-300m-r3-A main_pid=1211410 harness_pid=1211417 (bash)
+[23:59:40] saved RocksDB LOG for ozarchy-8r-300m-r3-A: 3 files
+[23:59:40] data sizes for ozarchy-8r-300m-r3-A: val0 total_bytes 4420779200 sst_bytes 787377903 sst_files 59 wal_bytes 2113821662;val1 total_bytes 4407224728 sst_bytes 789056064 sst_files 59 wal_bytes 2113887715;val2 total_bytes 1562914995 sst_bytes 823699258 sst_files 70 wal_bytes 0;
+[23:59:40] END ozarchy-8r-300m-r3-A rc=0 [23:59:38] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r3-A/summary.json
+[ozarchy-8r-300m-r3-A] fds max/end val0 428/167 val1 428/164 val2 427/157 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r3-A node exe md5 94053e26 on 3 nodes (arm A)
+CHECK OK ozarchy-8r-300m-r3-A node env on 3 nodes (arm A: no arm env; unset: TORUS_RETENTION_BLOCKS TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r3-A markets=300
+CHECK OK ozarchy-8r-300m-r3-A run.log: 1 lines matching 'in_flight_tail='commit'' (arm A)
+CHECK OK ozarchy-8r-300m-r3-A run.log: 1 lines matching '--in-flight-tail commit' (arm A)
+CHECK OK ozarchy-8r-300m-r3-A bench.log: 1 lines matching '^In-flight cap 4 action' (arm A)
+CHECK OK ozarchy-8r-300m-r3-A run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm A)
+CHECK OK ozarchy-8r-300m-r3-A run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm A)
+CHECK OK ozarchy-8r-300m-r3-A run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm A)
+CHECK OK ozarchy-8r-300m-r3-A run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm A)
+CHECK OK ozarchy-8r-300m-r3-A r8loadchk: arm A standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r3-A r8clchk: arm A Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r3-A r8flagchk: arm A (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r3-A r8pushchk: arm A threshold 524288 on 3 nodes, no clamp; val0:manifest=423,body=208,max_bytes=517223,prewarm=303/12913 val1:manifest=439,body=246,max_bytes=513369,prewarm=334/15029 val2:manifest=458,body=205,max_bytes=513369,prewarm=313/12815
+CHECK OK ozarchy-8r-300m-r3-A r8custchk: arm A TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008553420000000021s/count=1979 val1:custody_sum=0.0008501800000000018s/count=1979 val2:custody_sum=0.0008063920000000008s/count=1979
+CHECK OK ozarchy-8r-300m-r3-A r8retchk: arm A retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 0); val0:retention_cmdline=0,gc_on=0,window1128=0 val1:retention_cmdline=0,gc_on=0,window1128=0 val2:retention_cmdline=0,gc_on=0,window1128=0
+CHECK OK ozarchy-8r-300m-r3-A r8gcchk: arm A; val0:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val1:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val2:gc_deleted=0,gc_s_sum=0.0,gc_count=0
+CHECK OK ozarchy-8r-300m-r3-A r8slowchk: arm A; val0:slow_lines=0,slow_counter=0 val1:slow_lines=0,slow_counter=0 val2:slow_lines=0,slow_counter=0
+CHECK OK ozarchy-8r-300m-r3-A r8rejchk: arm A margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107291237,pct=0.000 val1:rej_margin=0,placed_accepted=107291237,pct=0.000 val2:rej_margin=0,placed_accepted=107291237,pct=0.000
+CHECK OK ozarchy-8r-300m-r3-A r8swapchk: arm A swap used 2575084 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r3-A r8diskchk: arm A fresh launch (CLEAN=1); val0 data_bytes=4420779200;val1 data_bytes=4407224728;val2 data_bytes=1562914995;free_gb_after=102;
+CHECK OK ozarchy-8r-300m-r3-A r8modechk: arm A GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r3-A sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r3-A hardscan done
+CHECK SOAK ozarchy-8r-300m-r3-A: vmstat rows 369 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 71, du rows 183, metrics ok scrapes 516, metrics-1hz ok scrapes 1068, host-1hz rows 358
+[cell-step] ozarchy-8r-300m-r3-A rc=0 agree=yes md5_ok=yes metric=268873.5 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[00:00:48] HOST before ozarchy-8r-300m-r3-B: builds none; analysis none; load 8.25 26.16 29.05
+[00:00:48] START ozarchy-8r-300m-r3-B arm=B bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 dur=300 markets=300 rate=76000 mem_avail_kb=56047712 swap_used_kb=2575080
+CHECK OK ozarchy-8r-300m-r3-B sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r3-B.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r3-B.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r3-B.service; no build lock: started inside a bench unit, whose launch holds it)
+[00:00:48] ozarchy-8r-300m-r3-B unit=bench-ozarchy-8r-300m-r3-B main_pid=1258383 harness_pid=1258390 (bash)
+[00:06:55] saved RocksDB LOG for ozarchy-8r-300m-r3-B: 3 files
+[00:06:55] data sizes for ozarchy-8r-300m-r3-B: val0 total_bytes 2625205597 sst_bytes 356247895 sst_files 41 wal_bytes 2060168186;val1 total_bytes 545438659 sst_bytes 377221397 sst_files 56 wal_bytes 0;val2 total_bytes 2595178938 sst_bytes 356248853 sst_files 41 wal_bytes 2060168193;
+[00:06:55] END ozarchy-8r-300m-r3-B rc=0 [00:06:53] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r3-B/summary.json
+[ozarchy-8r-300m-r3-B] fds max/end val0 415/126 val1 417/126 val2 414/127 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r3-B node exe md5 94053e26 on 3 nodes (arm B)
+CHECK OK ozarchy-8r-300m-r3-B node env on 3 nodes (arm B: TORUS_RETENTION_BLOCKS=1000; unset: TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r3-B markets=300
+CHECK OK ozarchy-8r-300m-r3-B run.log: 1 lines matching 'in_flight_tail='commit'' (arm B)
+CHECK OK ozarchy-8r-300m-r3-B run.log: 1 lines matching '--in-flight-tail commit' (arm B)
+CHECK OK ozarchy-8r-300m-r3-B bench.log: 1 lines matching '^In-flight cap 4 action' (arm B)
+CHECK OK ozarchy-8r-300m-r3-B run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm B)
+CHECK OK ozarchy-8r-300m-r3-B run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm B)
+CHECK OK ozarchy-8r-300m-r3-B run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm B)
+CHECK OK ozarchy-8r-300m-r3-B run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm B)
+CHECK OK ozarchy-8r-300m-r3-B r8loadchk: arm B standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 947/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r3-B r8clchk: arm B Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r3-B r8flagchk: arm B (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=54/54,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=54/54,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=54/54,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r3-B r8pushchk: arm B threshold 524288 on 3 nodes, no clamp; val0:manifest=441,body=194,max_bytes=520083,prewarm=349/15641 val1:manifest=458,body=218,max_bytes=512933,prewarm=337/16772 val2:manifest=436,body=217,max_bytes=521153,prewarm=362/18682
+CHECK OK ozarchy-8r-300m-r3-B r8custchk: arm B TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008535360000000025s/count=1964 val1:custody_sum=0.0008568730000000004s/count=1964 val2:custody_sum=0.0008601680000000012s/count=1964
+CHECK OK ozarchy-8r-300m-r3-B r8retchk: arm B retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=1,gc_on=1,window1128=1 val1:retention_cmdline=1,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r3-B r8gcchk: arm B; val0:gc_deleted=357561,gc_s_sum=7.747401953000008,gc_count=5050 val1:gc_deleted=358361,gc_s_sum=7.80162783100001,gc_count=5052 val2:gc_deleted=359161,gc_s_sum=7.060865827999981,gc_count=5054
+CHECK OK ozarchy-8r-300m-r3-B r8slowchk: arm B; val0:slow_lines=5,slow_counter=5 val1:slow_lines=2,slow_counter=2 val2:slow_lines=0,slow_counter=0
+CHECK OK ozarchy-8r-300m-r3-B r8rejchk: arm B margin rejects <= 0%; val0:rej_margin=0,placed_accepted=106981610,pct=0.000 val1:rej_margin=0,placed_accepted=106981610,pct=0.000 val2:rej_margin=0,placed_accepted=106981610,pct=0.000
+CHECK OK ozarchy-8r-300m-r3-B r8swapchk: arm B swap used 2575056 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r3-B r8diskchk: arm B fresh launch (CLEAN=1); val0 data_bytes=2625205597;val1 data_bytes=545438659;val2 data_bytes=2595178938;free_gb_after=104;
+CHECK OK ozarchy-8r-300m-r3-B r8modechk: arm B GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=1,inline=0,handoffs=5051,handoff_s=0.09543797300000001,lag=1,coalesced=0,refused=0,fence_full=NA val1:worker=1,inline=0,handoffs=5052,handoff_s=0.08701795700000031,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=1,inline=0,handoffs=5054,handoff_s=0.08726046800000007,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r3-B sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r3-B hardscan done
+CHECK SOAK ozarchy-8r-300m-r3-B: vmstat rows 367 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 71, du rows 182, metrics ok scrapes 512, metrics-1hz ok scrapes 1062, host-1hz rows 356
+[cell-step] ozarchy-8r-300m-r3-B rc=0 agree=yes md5_ok=yes metric=267225.9 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[00:08:03] HOST before ozarchy-8r-300m-r3-C: builds none; analysis none; load 9.07 26.20 28.92
+[00:08:04] START ozarchy-8r-300m-r3-C arm=C bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1 dur=300 markets=300 rate=76000 mem_avail_kb=56267040 swap_used_kb=2575056
+CHECK OK ozarchy-8r-300m-r3-C sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r3-C.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r3-C.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r3-C.service; no build lock: started inside a bench unit, whose launch holds it)
+[00:08:04] ozarchy-8r-300m-r3-C unit=bench-ozarchy-8r-300m-r3-C main_pid=1305661 harness_pid=1305668 (bash)
+[00:14:13] saved RocksDB LOG for ozarchy-8r-300m-r3-C: 3 files
+[00:14:13] data sizes for ozarchy-8r-300m-r3-C: val0 total_bytes 612314945 sst_bytes 439027185 sst_files 56 wal_bytes 0;val1 total_bytes 614342484 sst_bytes 439050827 sst_files 56 wal_bytes 0;val2 total_bytes 612498950 sst_bytes 439050273 sst_files 56 wal_bytes 0;
+[00:14:13] END ozarchy-8r-300m-r3-C rc=0 [00:14:10] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r3-C/summary.json
+[ozarchy-8r-300m-r3-C] fds max/end val0 419/127 val1 418/128 val2 419/127 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r3-C node exe md5 94053e26 on 3 nodes (arm C)
+CHECK OK ozarchy-8r-300m-r3-C node env on 3 nodes (arm C: TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1; unset: TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r3-C markets=300
+CHECK OK ozarchy-8r-300m-r3-C run.log: 1 lines matching 'in_flight_tail='commit'' (arm C)
+CHECK OK ozarchy-8r-300m-r3-C run.log: 1 lines matching '--in-flight-tail commit' (arm C)
+CHECK OK ozarchy-8r-300m-r3-C bench.log: 1 lines matching '^In-flight cap 4 action' (arm C)
+CHECK OK ozarchy-8r-300m-r3-C run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm C)
+CHECK OK ozarchy-8r-300m-r3-C run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm C)
+CHECK OK ozarchy-8r-300m-r3-C run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm C)
+CHECK OK ozarchy-8r-300m-r3-C run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm C)
+CHECK OK ozarchy-8r-300m-r3-C r8loadchk: arm C standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r3-C r8clchk: arm C Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r3-C r8flagchk: arm C (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r3-C r8pushchk: arm C threshold 524288 on 3 nodes, no clamp; val0:manifest=448,body=169,max_bytes=514803,prewarm=341/14516 val1:manifest=452,body=218,max_bytes=515243,prewarm=348/15746 val2:manifest=435,body=204,max_bytes=519533,prewarm=367/15751
+CHECK OK ozarchy-8r-300m-r3-C r8custchk: arm C TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008278290000000001s/count=1926 val1:custody_sum=0.0008460080000000012s/count=1926 val2:custody_sum=0.0007441429999999996s/count=1926
+CHECK OK ozarchy-8r-300m-r3-C r8retchk: arm C retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=1,gc_on=1,window1128=1 val1:retention_cmdline=1,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r3-C r8gcchk: arm C; val0:gc_deleted=361121,gc_s_sum=5.928808674000015,gc_count=4789 val1:gc_deleted=361121,gc_s_sum=6.0817721379999949,gc_count=4789 val2:gc_deleted=361121,gc_s_sum=6.107090274000003,gc_count=4788
+CHECK OK ozarchy-8r-300m-r3-C r8slowchk: arm C; val0:slow_lines=0,slow_counter=0 val1:slow_lines=1,slow_counter=1 val2:slow_lines=1,slow_counter=1
+CHECK OK ozarchy-8r-300m-r3-C r8rejchk: arm C margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107879698,pct=0.000 val1:rej_margin=0,placed_accepted=107879698,pct=0.000 val2:rej_margin=0,placed_accepted=107879698,pct=0.000
+CHECK OK ozarchy-8r-300m-r3-C r8swapchk: arm C swap used 2575044 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r3-C r8diskchk: arm C fresh launch (CLEAN=1); val0 data_bytes=612314945;val1 data_bytes=614342484;val2 data_bytes=612498950;free_gb_after=105;
+CHECK OK ozarchy-8r-300m-r3-C r8modechk: arm C GC mode as specified (TORUS_DA_GC_INLINE environs 3); val0:worker=0,inline=1,handoffs=4789,handoff_s=5.9340813870000039,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=1,handoffs=4789,handoff_s=6.090232083999983,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=1,handoffs=4788,handoff_s=6.112848599999996,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r3-C sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r3-C hardscan done
+CHECK SOAK ozarchy-8r-300m-r3-C: vmstat rows 369 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 71, du rows 183, metrics ok scrapes 513, metrics-1hz ok scrapes 1065, host-1hz rows 357
+[cell-step] ozarchy-8r-300m-r3-C rc=0 agree=yes md5_ok=yes metric=269366.7 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[00:15:20] HOST before ozarchy-8r-300m-r4-C: builds none; analysis none; load 6.07 23.23 27.98
+[00:15:20] START ozarchy-8r-300m-r4-C arm=C bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1 dur=300 markets=300 rate=76000 mem_avail_kb=56091432 swap_used_kb=2575044
+CHECK OK ozarchy-8r-300m-r4-C sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r4-C.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r4-C.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r4-C.service; no build lock: started inside a bench unit, whose launch holds it)
+[00:15:21] ozarchy-8r-300m-r4-C unit=bench-ozarchy-8r-300m-r4-C main_pid=1352200 harness_pid=1352207 (bash)
+[00:21:29] saved RocksDB LOG for ozarchy-8r-300m-r4-C: 3 files
+[00:21:29] data sizes for ozarchy-8r-300m-r4-C: val0 total_bytes 2722171094 sst_bytes 416169020 sst_files 41 wal_bytes 2078650163;val1 total_bytes 2692625951 sst_bytes 416171059 sst_files 41 wal_bytes 2078652333;val2 total_bytes 618530486 sst_bytes 447422100 sst_files 57 wal_bytes 0;
+[00:21:29] END ozarchy-8r-300m-r4-C rc=0 [00:21:27] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r4-C/summary.json
+[ozarchy-8r-300m-r4-C] fds max/end val0 421/126 val1 416/127 val2 416/126 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r4-C node exe md5 94053e26 on 3 nodes (arm C)
+CHECK OK ozarchy-8r-300m-r4-C node env on 3 nodes (arm C: TORUS_RETENTION_BLOCKS=1000 TORUS_DA_GC_INLINE=1; unset: TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r4-C markets=300
+CHECK OK ozarchy-8r-300m-r4-C run.log: 1 lines matching 'in_flight_tail='commit'' (arm C)
+CHECK OK ozarchy-8r-300m-r4-C run.log: 1 lines matching '--in-flight-tail commit' (arm C)
+CHECK OK ozarchy-8r-300m-r4-C bench.log: 1 lines matching '^In-flight cap 4 action' (arm C)
+CHECK OK ozarchy-8r-300m-r4-C run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm C)
+CHECK OK ozarchy-8r-300m-r4-C run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm C)
+CHECK OK ozarchy-8r-300m-r4-C run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm C)
+CHECK OK ozarchy-8r-300m-r4-C run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm C)
+CHECK OK ozarchy-8r-300m-r4-C r8loadchk: arm C standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r4-C r8clchk: arm C Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r4-C r8flagchk: arm C (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=51/51,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r4-C r8pushchk: arm C threshold 524288 on 3 nodes, no clamp; val0:manifest=436,body=201,max_bytes=513369,prewarm=311/13815 val1:manifest=443,body=218,max_bytes=513373,prewarm=336/15656 val2:manifest=425,body=233,max_bytes=519973,prewarm=316/14223
+CHECK OK ozarchy-8r-300m-r4-C r8custchk: arm C TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008207640000000016s/count=1956 val1:custody_sum=0.0008280010000000025s/count=1956 val2:custody_sum=0.0007296710000000025s/count=1956
+CHECK OK ozarchy-8r-300m-r4-C r8retchk: arm C retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=1,gc_on=1,window1128=1 val1:retention_cmdline=1,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r4-C r8gcchk: arm C; val0:gc_deleted=359707,gc_s_sum=6.144447464999974,gc_count=4760 val1:gc_deleted=360107,gc_s_sum=5.991677358000002,gc_count=4761 val2:gc_deleted=360107,gc_s_sum=6.007005999999991,gc_count=4761
+CHECK OK ozarchy-8r-300m-r4-C r8slowchk: arm C; val0:slow_lines=1,slow_counter=1 val1:slow_lines=0,slow_counter=0 val2:slow_lines=1,slow_counter=1
+CHECK OK ozarchy-8r-300m-r4-C r8rejchk: arm C margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107445304,pct=0.000 val1:rej_margin=0,placed_accepted=107445304,pct=0.000 val2:rej_margin=0,placed_accepted=107445304,pct=0.000
+CHECK OK ozarchy-8r-300m-r4-C r8swapchk: arm C swap used 2575040 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r4-C r8diskchk: arm C fresh launch (CLEAN=1); val0 data_bytes=2722171094;val1 data_bytes=2692625951;val2 data_bytes=618530486;free_gb_after=104;
+CHECK OK ozarchy-8r-300m-r4-C r8modechk: arm C GC mode as specified (TORUS_DA_GC_INLINE environs 3); val0:worker=0,inline=1,handoffs=4760,handoff_s=6.149566475999991,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=1,handoffs=4761,handoff_s=5.996924015999981,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=1,handoffs=4761,handoff_s=6.012172153,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r4-C sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r4-C hardscan done
+CHECK SOAK ozarchy-8r-300m-r4-C: vmstat rows 369 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 72, du rows 183, metrics ok scrapes 515, metrics-1hz ok scrapes 1068, host-1hz rows 359
+[cell-step] ozarchy-8r-300m-r4-C rc=0 agree=yes md5_ok=yes metric=269437.1 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[00:22:37] HOST before ozarchy-8r-300m-r4-B: builds none; analysis none; load 7.01 23.28 27.71
+[00:22:37] START ozarchy-8r-300m-r4-B arm=B bin=a node_md5=94053e26 wrapper=0 env=TORUS_RETENTION_BLOCKS=1000 dur=300 markets=300 rate=76000 mem_avail_kb=56043788 swap_used_kb=2575040
+CHECK OK ozarchy-8r-300m-r4-B sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r4-B.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r4-B.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r4-B.service; no build lock: started inside a bench unit, whose launch holds it)
+[00:22:38] ozarchy-8r-300m-r4-B unit=bench-ozarchy-8r-300m-r4-B main_pid=1398311 harness_pid=1398318 (bash)
+[00:28:46] saved RocksDB LOG for ozarchy-8r-300m-r4-B: 3 files
+[00:28:47] data sizes for ozarchy-8r-300m-r4-B: val0 total_bytes 609004911 sst_bytes 436450925 sst_files 63 wal_bytes 0;val1 total_bytes 1657646431 sst_bytes 425816871 sst_files 55 wal_bytes 995108942;val2 total_bytes 1643754643 sst_bytes 425815189 sst_files 55 wal_bytes 995101420;
+[00:28:47] END ozarchy-8r-300m-r4-B rc=0 [00:28:45] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r4-B/summary.json
+[ozarchy-8r-300m-r4-B] fds max/end val0 419/145 val1 414/148 val2 417/141 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r4-B node exe md5 94053e26 on 3 nodes (arm B)
+CHECK OK ozarchy-8r-300m-r4-B node env on 3 nodes (arm B: TORUS_RETENTION_BLOCKS=1000; unset: TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r4-B markets=300
+CHECK OK ozarchy-8r-300m-r4-B run.log: 1 lines matching 'in_flight_tail='commit'' (arm B)
+CHECK OK ozarchy-8r-300m-r4-B run.log: 1 lines matching '--in-flight-tail commit' (arm B)
+CHECK OK ozarchy-8r-300m-r4-B bench.log: 1 lines matching '^In-flight cap 4 action' (arm B)
+CHECK OK ozarchy-8r-300m-r4-B run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm B)
+CHECK OK ozarchy-8r-300m-r4-B run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm B)
+CHECK OK ozarchy-8r-300m-r4-B run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm B)
+CHECK OK ozarchy-8r-300m-r4-B run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm B)
+CHECK OK ozarchy-8r-300m-r4-B r8loadchk: arm B standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r4-B r8clchk: arm B Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r4-B r8flagchk: arm B (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=52/52,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r4-B r8pushchk: arm B threshold 524288 on 3 nodes, no clamp; val0:manifest=461,body=191,max_bytes=507126,prewarm=324/14242 val1:manifest=427,body=221,max_bytes=496156,prewarm=350/16041 val2:manifest=439,body=195,max_bytes=523823,prewarm=329/14615
+CHECK OK ozarchy-8r-300m-r4-B r8custchk: arm B TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008131889999999992s/count=1934 val1:custody_sum=0.0007063390000000011s/count=1934 val2:custody_sum=0.0008119600000000008s/count=1934
+CHECK OK ozarchy-8r-300m-r4-B r8retchk: arm B retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 3); val0:retention_cmdline=1,gc_on=1,window1128=1 val1:retention_cmdline=1,gc_on=1,window1128=1 val2:retention_cmdline=1,gc_on=1,window1128=1
+CHECK OK ozarchy-8r-300m-r4-B r8gcchk: arm B; val0:gc_deleted=357372,gc_s_sum=7.406444913999977,gc_count=4868 val1:gc_deleted=357529,gc_s_sum=7.37943778499999,gc_count=4869 val2:gc_deleted=357529,gc_s_sum=7.135526550999999,gc_count=4869
+CHECK OK ozarchy-8r-300m-r4-B r8slowchk: arm B; val0:slow_lines=0,slow_counter=0 val1:slow_lines=1,slow_counter=1 val2:slow_lines=2,slow_counter=2
+CHECK OK ozarchy-8r-300m-r4-B r8rejchk: arm B margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107448860,pct=0.000 val1:rej_margin=0,placed_accepted=107448860,pct=0.000 val2:rej_margin=0,placed_accepted=107448860,pct=0.000
+CHECK OK ozarchy-8r-300m-r4-B r8swapchk: arm B swap used 2575028 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r4-B r8diskchk: arm B fresh launch (CLEAN=1); val0 data_bytes=609004911;val1 data_bytes=1657646431;val2 data_bytes=1643754643;free_gb_after=105;
+CHECK OK ozarchy-8r-300m-r4-B r8modechk: arm B GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=1,inline=0,handoffs=4868,handoff_s=0.09126429900000033,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=1,inline=0,handoffs=4869,handoff_s=0.07938666999999998,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=1,inline=0,handoffs=4869,handoff_s=0.07994043699999988,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r4-B sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r4-B hardscan done
+CHECK SOAK ozarchy-8r-300m-r4-B: vmstat rows 369 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 71, du rows 183, metrics ok scrapes 515, metrics-1hz ok scrapes 1067, host-1hz rows 358
+[cell-step] ozarchy-8r-300m-r4-B rc=0 agree=yes md5_ok=yes metric=266868.2 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[00:29:55] HOST before ozarchy-8r-300m-r4-A: builds none; analysis none; load 8.25 24.04 27.47
+[00:29:55] START ozarchy-8r-300m-r4-A arm=A bin=a node_md5=94053e26 wrapper=0 env=none dur=300 markets=300 rate=76000 mem_avail_kb=56127200 swap_used_kb=2575024
+CHECK OK ozarchy-8r-300m-r4-A sysctl (start): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+detach.sh: starting bench-ozarchy-8r-300m-r4-A.service (log /home/oz/bench-results-matched/ozarchy-8r-300m-r4-A.campaign.log; stop: systemctl --user stop bench-ozarchy-8r-300m-r4-A.service; no build lock: started inside a bench unit, whose launch holds it)
+[00:29:55] ozarchy-8r-300m-r4-A unit=bench-ozarchy-8r-300m-r4-A main_pid=1445268 harness_pid=1445275 (bash)
+[00:36:04] saved RocksDB LOG for ozarchy-8r-300m-r4-A: 3 files
+[00:36:04] data sizes for ozarchy-8r-300m-r4-A: val0 total_bytes 1445069477 sst_bytes 821430900 sst_files 80 wal_bytes 0;val1 total_bytes 4073639725 sst_bytes 801144363 sst_files 62 wal_bytes 1573167871;val2 total_bytes 4080794825 sst_bytes 801138993 sst_files 62 wal_bytes 1573170008;
+[00:36:04] END ozarchy-8r-300m-r4-A rc=0 [00:36:01] done -> /home/oz/bench-results-matched/ozarchy-8r-300m-r4-A/summary.json
+[ozarchy-8r-300m-r4-A] fds max/end val0 421/156 val1 419/156 val2 420/156 (limit soft/hard 524288/524288)
+CHECK OK ozarchy-8r-300m-r4-A node exe md5 94053e26 on 3 nodes (arm A)
+CHECK OK ozarchy-8r-300m-r4-A node env on 3 nodes (arm A: no arm env; unset: TORUS_RETENTION_BLOCKS TORUS_DA_GC_INLINE TORUS_SETTLE_DEFER_RESULTS TORUS_PARALLEL_MATCH_SETUP TORUS_FAST_SELL_TOP_UPS TORUS_EPOCH_FAST_PATH TORUS_EXEC_POOL_GRAIN TORUS_PARALLEL_BOOK_SAVE TORUS_PARALLEL_ENGINE TORUS_PARALLEL_CANCEL_ALL TORUS_EXEC_PARALLEL_KEYS TORUS_CKPT_DEFER_BOOKS TORUS_CONSENSUS_DIRECT_FAN TORUS_CONSENSUS_GOSSIP_MIRROR TORUS_CHECKPOINT_INTERVAL_MS TORUS_SHUTDOWN_TIMEOUT_SECS MALLOC_CONF LD_PRELOAD TORUS_DIRECT_PUSH_BODY_BYTES TORUS_PARALLEL_CANCEL_ALL_MIN_VISITS TORUS_CHECKPOINT_MAX_BYTES TORUS_DA_BODY_RETENTION TORUS_EXEC_PIPELINE TORUS_SAVE_BOOKS_WORKERS TORUS_BOOK_FAST_ENCODE TORUS_SETTLE_NO_MERGE TORUS_LEVEL_HASH_CACHE TORUS_DA_GC_SLOW_MS )
+CHECK OK ozarchy-8r-300m-r4-A markets=300
+CHECK OK ozarchy-8r-300m-r4-A run.log: 1 lines matching 'in_flight_tail='commit'' (arm A)
+CHECK OK ozarchy-8r-300m-r4-A run.log: 1 lines matching '--in-flight-tail commit' (arm A)
+CHECK OK ozarchy-8r-300m-r4-A bench.log: 1 lines matching '^In-flight cap 4 action' (arm A)
+CHECK OK ozarchy-8r-300m-r4-A run.log: 1 lines matching 'genesis markets=300 native_balances=100060 bulk_count=100000 md5=d694b81b3dd75b3dc24aaa9a730b9830' (arm A)
+CHECK OK ozarchy-8r-300m-r4-A run.log: 1 lines matching 'oracle feed pid [0-9]+;' (arm A)
+CHECK OK ozarchy-8r-300m-r4-A run.log: 1 lines matching '^  state_hash_activation = "?off"?$' (arm A)
+CHECK OK ozarchy-8r-300m-r4-A run.log: 1 lines matching '^\[[0-9:]+\] genesis evm\.block_interval=11 ' (arm A)
+CHECK OK ozarchy-8r-300m-r4-A r8loadchk: arm A standard load (markets=300 rate=76000 senders=5000 block_cap='400' band=5 cross=0.5 cancel=0.05 open_order_budget='900' retry_busy='1' max_in_flight='4' in_flight_tail='commit' cloid_share='0' dur=300s; bench flags match; oracle ON 30000/2000ms/walk 0 rc 0 accepted 948/948; no EVM load)
+CHECK OK ozarchy-8r-300m-r4-A r8clchk: arm A Classic on val0-2 (coalesced checkpoints ON)
+CHECK OK ozarchy-8r-300m-r4-A r8flagchk: arm A (F on) took-effect, re-send 250 on 3 environs; val0:db=0,fON=1,trust_cache=1,boundary_pipelined=54/54,pe_spawns=0 val1:db=0,fON=1,trust_cache=1,boundary_pipelined=54/54,pe_spawns=0 val2:db=0,fON=1,trust_cache=1,boundary_pipelined=54/54,pe_spawns=0
+CHECK OK ozarchy-8r-300m-r4-A r8pushchk: arm A threshold 524288 on 3 nodes, no clamp; val0:manifest=439,body=231,max_bytes=520493,prewarm=376/16578 val1:manifest=451,body=258,max_bytes=518213,prewarm=379/17639 val2:manifest=479,body=238,max_bytes=523383,prewarm=377/17101
+CHECK OK ozarchy-8r-300m-r4-A r8custchk: arm A TORUS_SHARD_CUSTODY=0 on 3 nodes; val0:custody_sum=0.0008308300000000022s/count=2096 val1:custody_sum=0.0016193419999999937s/count=2096 val2:custody_sum=0.0008672640000000017s/count=2095
+CHECK OK ozarchy-8r-300m-r4-A r8retchk: arm A retention as specified (environ TORUS_RETENTION_BLOCKS=1000 on 0); val0:retention_cmdline=0,gc_on=0,window1128=0 val1:retention_cmdline=0,gc_on=0,window1128=0 val2:retention_cmdline=0,gc_on=0,window1128=0
+CHECK OK ozarchy-8r-300m-r4-A r8gcchk: arm A; val0:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val1:gc_deleted=0,gc_s_sum=0.0,gc_count=0 val2:gc_deleted=0,gc_s_sum=0.0,gc_count=0
+CHECK OK ozarchy-8r-300m-r4-A r8slowchk: arm A; val0:slow_lines=0,slow_counter=0 val1:slow_lines=0,slow_counter=0 val2:slow_lines=0,slow_counter=0
+CHECK OK ozarchy-8r-300m-r4-A r8rejchk: arm A margin rejects <= 0%; val0:rej_margin=0,placed_accepted=107511776,pct=0.000 val1:rej_margin=0,placed_accepted=107511776,pct=0.000 val2:rej_margin=0,placed_accepted=107511776,pct=0.000
+CHECK OK ozarchy-8r-300m-r4-A r8swapchk: arm A swap used 2574696 kB (preflight 2583488 kB, limit +512 MB)
+CHECK OK ozarchy-8r-300m-r4-A r8diskchk: arm A fresh launch (CLEAN=1); val0 data_bytes=1445069477;val1 data_bytes=4073639725;val2 data_bytes=4080794825;free_gb_after=102;
+CHECK OK ozarchy-8r-300m-r4-A r8modechk: arm A GC mode as specified (TORUS_DA_GC_INLINE environs 0); val0:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val1:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA val2:worker=0,inline=0,handoffs=0,handoff_s=0.0,lag=0,coalesced=0,refused=0,fence_full=NA
+CHECK OK ozarchy-8r-300m-r4-A sysctl (end): kernel.perf_event_paranoid=2 vm.dirty_background_bytes=67108864 vm.dirty_bytes=268435456 paranoid=2 tracefs=700
+CHECK OK ozarchy-8r-300m-r4-A hardscan done
+CHECK SOAK ozarchy-8r-300m-r4-A: vmstat rows 369 (cell 300 s), mem samples 204, smaps snapshots 12, fd rows 72, du rows 183, metrics ok scrapes 513, metrics-1hz ok scrapes 1068, host-1hz rows 358
+[cell-step] ozarchy-8r-300m-r4-A rc=0 agree=yes md5_ok=yes metric=268088.3 flag=ok; artifacts: none; analysis: skipped (no --analysis-cmd)
+[00:37:07] MAIN CELLS END
+[00:37:07] RERUN PASS: nothing queued
+[00:37:07] CAMPAIGN END
+cells.tsv: 13 rows, 0 bad

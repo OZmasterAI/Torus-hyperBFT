@@ -1,0 +1,14 @@
+label	arm	rep	rc	agree	md5_ok	metric	flag
+ozarchy-8r-300m-w1	A	w1	0	yes	yes	268253.8	ok
+ozarchy-8r-300m-r1-A	A	r1	0	yes	yes	269275.4	ok
+ozarchy-8r-300m-r1-B	B	r1	0	yes	yes	266148.4	ok
+ozarchy-8r-300m-r1-C	C	r1	0	yes	yes	269550.4	ok
+ozarchy-8r-300m-r2-C	C	r2	0	yes	yes	269089.6	ok
+ozarchy-8r-300m-r2-B	B	r2	0	yes	yes	266175	ok
+ozarchy-8r-300m-r2-A	A	r2	0	yes	yes	270834.5	ok
+ozarchy-8r-300m-r3-A	A	r3	0	yes	yes	268873.5	ok
+ozarchy-8r-300m-r3-B	B	r3	0	yes	yes	267225.9	ok
+ozarchy-8r-300m-r3-C	C	r3	0	yes	yes	269366.7	ok
+ozarchy-8r-300m-r4-C	C	r4	0	yes	yes	269437.1	ok
+ozarchy-8r-300m-r4-B	B	r4	0	yes	yes	266868.2	ok
+ozarchy-8r-300m-r4-A	A	r4	0	yes	yes	268088.3	ok

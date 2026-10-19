@@ -1,0 +1,2 @@
+start 1792444630.287734881 dirty_bytes=268435456 dirty_background_bytes=67108864 dirty_ratio=0 dirty_background_ratio=0 dirty_expire_centisecs=3000 dirty_writeback_centisecs=1500 perf_event_paranoid=2 tracefs_mode=700
+end 1792445058.275778203 dirty_bytes=268435456 dirty_background_bytes=67108864 dirty_ratio=0 dirty_background_ratio=0 dirty_expire_centisecs=3000 dirty_writeback_centisecs=1500 perf_event_paranoid=2 tracefs_mode=700

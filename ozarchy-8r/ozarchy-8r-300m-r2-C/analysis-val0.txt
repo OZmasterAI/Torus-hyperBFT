@@ -1,0 +1,18 @@
+== win60 val0 (all samples)
+samples=320 span=319s
+WINDOW-AVG: placed/s=336971.5 matched/s=254975.7 blk/s(height)=13.737 committed/s=0.000 actions/s=1361.34
+BEST-60s:   placed/s=378340.0 matched/s=287311.7 blk/s=17.833
+WORST-60s:  blk/s(height)=9.717
+PEAK exec_queue_depth=4813
+TOTALS: placed=107493896 matched=81337249 resting=0 committed=0 height_delta=4382
+== phase60 val0
+FUNNEL: span=319s placed/s(win)=336971.5 matched/s(win)=254975.7 blk/s(win)=13.737 | best60 placed=378340 matched=287312 | worst60 blk/s=9.717 | peak_execq=66
+EARLY window: t=0s..60s (resting 0->12437353, exec_resting 0->156714)
+LATE  window: t=259s..319s (resting 55662297->65599078, exec_resting 337990->75540)
+phase(ms/block)               EARLY         LATE x(late/early)   [obs/blk E,L]
+load_books                     0.14         0.13       0.97   [1.0,0.9]
+root                           0.00         0.00       0.86   [0.0,0.0]
+state_write                  689.12       430.40       0.62   [0.0,0.0]
+evm_resync                     1.51         3.35       2.22   [0.0,0.0]
+flush                          0.00         0.00          -   [0.0,0.0]
+dirty_buckets/obs               0.0          0.0          -

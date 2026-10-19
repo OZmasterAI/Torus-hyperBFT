@@ -1,0 +1,59 @@
+{
+ "label": "ozarchy-8r-300m-r2-B",
+ "tag": "r2-B",
+ "arm": "B",
+ "rep": "r2",
+ "spec": "r2-B:B:300:none:",
+ "cell": "/home/oz/bench-results-matched/ozarchy-8r-300m-r2-B",
+ "rc_file": "/home/oz/bench-results-matched/ozarchy-8r-300m-r2-B.cell.rc",
+ "row": {
+  "label": "ozarchy-8r-300m-r2-B",
+  "arm": "B",
+  "rep": "r2",
+  "rc": "0",
+  "agree": "yes",
+  "md5_ok": "yes",
+  "metric": "266175",
+  "flag": "ok"
+ },
+ "reasons": [],
+ "artifacts": [],
+ "notes": {
+  "verdict": "ACCEPT",
+  "agreement": "AGREE",
+  "fail_reasons": [],
+  "unverified_reasons": [],
+  "crash_fail_reasons": null,
+  "validity_explained": true
+ },
+ "md5": {
+  "staged": "94053e26bad87a43845cddb509800d62",
+  "records": [
+   [
+    "node-environ-trie.txt",
+    "94053e26bad87a43845cddb509800d62"
+   ],
+   [
+    "node-environ-trie.txt",
+    "94053e26bad87a43845cddb509800d62"
+   ],
+   [
+    "node-environ-trie.txt",
+    "94053e26bad87a43845cddb509800d62"
+   ],
+   [
+    "summary.json binaries.torus_node_md5",
+    "94053e26bad87a43845cddb509800d62"
+   ]
+  ],
+  "problems": []
+ },
+ "analysis": {
+  "status": "skipped",
+  "detail": "no --analysis-cmd",
+  "metric": null
+ },
+ "metric_source": "summary.json headline.matched_s_avg",
+ "step_seconds": 0.0,
+ "written_at": "2026-10-19T23:46:08+0200"
+}

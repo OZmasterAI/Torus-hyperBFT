@@ -1,0 +1,20 @@
+{
+  "note": "TEST-ONLY keys, publicly known, never use on a real network. EVM (secp256k1) addresses of the 3 matched-bench devnet validators, so they can sign oracle price submissions. Derived from the hardhat/anvil dev mnemonic 'test test test test test test test test test test test junk' at m/44'/60'/0'/0/100, /101, /102 (cast wallet private-key --mnemonic-index 100..102); indices 0..99 are already used by the bench and devnet genesis files. index i = val i (RPC 8645/8646/8647). Consensus keys are the separate ed25519 keys in devnet/wsl/env.sh; devnet/wsl/gen-3val-genesis.sh writes these addresses into the 3 validator entries.",
+  "validators": [
+    {
+      "index": 0,
+      "address": "0x8c3229ec621644789d7f61faa82c6d0e5f97d43d",
+      "private_key": "0xdae4671006c60a3619556ace98eca6f6e092948d05b13070a27ac492a4fba419"
+    },
+    {
+      "index": 1,
+      "address": "0x9586a4833970847aef259ad5bfb7aa8901ddf746",
+      "private_key": "0x13986e078393fca89aedc2ecd014df01dfbff153434c04b2e38cfedcbef710f7"
+    },
+    {
+      "index": 2,
+      "address": "0x0e9971c0005d91336c1441b8f03c1c4fe5fb4584",
+      "private_key": "0x7382cc0c1dd9fc4ff87ed969fafac4c040ebd4890d0b8fa35781524df5b15476"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+pid=1068428 Max open files            524288               524288               files     
+pid=1068471 Max open files            524288               524288               files     
+pid=1068514 Max open files            524288               524288               files     

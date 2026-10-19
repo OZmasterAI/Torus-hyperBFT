@@ -1,0 +1,41 @@
+{
+  "sent": 948,
+  "accepted": 948,
+  "rejected": 0,
+  "last_error": "",
+  "rounds": 158,
+  "markets": 300,
+  "mark_probe": {
+    "marketId": "0x1",
+    "markPrice": "30000.00000000",
+    "indexPrice": "30000.00000000",
+    "lastTradePrice": "29999.00000000",
+    "timestamp": 4783
+  },
+  "per_validator": [
+    {
+      "index": 0,
+      "address": "0x8c3229ec621644789d7f61faa82c6d0e5f97d43d",
+      "sent": 316,
+      "accepted": 316,
+      "rejected": 0,
+      "last_error": ""
+    },
+    {
+      "index": 1,
+      "address": "0x9586a4833970847aef259ad5bfb7aa8901ddf746",
+      "sent": 316,
+      "accepted": 316,
+      "rejected": 0,
+      "last_error": ""
+    },
+    {
+      "index": 2,
+      "address": "0x0e9971c0005d91336c1441b8f03c1c4fe5fb4584",
+      "sent": 316,
+      "accepted": 316,
+      "rejected": 0,
+      "last_error": ""
+    }
+  ]
+}
