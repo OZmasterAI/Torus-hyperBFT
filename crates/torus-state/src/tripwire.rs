@@ -103,9 +103,9 @@ mod imp {
     pub fn check(_entry: &'static str) {}
 }
 
-pub use imp::{arm, armed, Armed};
-pub(crate) use imp::exempt;
 pub(crate) use imp::check;
+pub(crate) use imp::exempt;
+pub use imp::{arm, armed, Armed};
 
 /// A planted raw-DB bypass's own entry (test-probes): trips like a raw
 /// `StateDb` read when armed.
@@ -155,31 +155,90 @@ mod tests {
         let code = B256::repeat_byte(7);
         type Read = Box<dyn Fn(&StateDb) + Sync>;
         let entries: Vec<(&str, Read)> = vec![
-            ("get_cf_raw", Box::new(|db| drop(db.get_cf_raw(CF_ACCOUNTS, b"k")))),
-            ("StateBackend::get_cf_raw", Box::new(|db| drop(StateBackend::get_cf_raw(db, CF_ACCOUNTS, b"k")))),
-            ("multi_get_cf_raw", Box::new(|db| drop(db.multi_get_cf_raw(CF_ACCOUNTS, &[b"k".as_slice()])))),
-            ("get_cf_len", Box::new(|db| drop(StateBackend::get_cf_len(db, CF_ACCOUNTS, b"k")))),
-            ("iterate_cf", Box::new(|db| drop(StateBackend::iterate_cf(db, CF_ACCOUNTS, None)))),
-            ("iterate_cf_from", Box::new(|db| drop(StateBackend::iterate_cf_from(db, CF_ACCOUNTS, b"", 4)))),
-            ("iterate_cf_prefix_from", Box::new(|db| drop(StateBackend::iterate_cf_prefix_from(db, CF_ACCOUNTS, b"k", b"k", 4)))),
-            ("prefix_exists", Box::new(|db| drop(StateBackend::prefix_exists(db, CF_ACCOUNTS, b"k")))),
-            ("basic_ref", Box::new(|db| drop(db.basic_ref(Address::ZERO)))),
-            ("storage_ref", Box::new(|db| drop(db.storage_ref(Address::ZERO, U256::from(1))))),
-            ("code_by_hash_ref", Box::new(move |db| drop(db.code_by_hash_ref(code)))),
+            (
+                "get_cf_raw",
+                Box::new(|db| drop(db.get_cf_raw(CF_ACCOUNTS, b"k"))),
+            ),
+            (
+                "StateBackend::get_cf_raw",
+                Box::new(|db| drop(StateBackend::get_cf_raw(db, CF_ACCOUNTS, b"k"))),
+            ),
+            (
+                "multi_get_cf_raw",
+                Box::new(|db| drop(db.multi_get_cf_raw(CF_ACCOUNTS, &[b"k".as_slice()]))),
+            ),
+            (
+                "get_cf_len",
+                Box::new(|db| drop(StateBackend::get_cf_len(db, CF_ACCOUNTS, b"k"))),
+            ),
+            (
+                "iterate_cf",
+                Box::new(|db| drop(StateBackend::iterate_cf(db, CF_ACCOUNTS, None))),
+            ),
+            (
+                "iterate_cf_from",
+                Box::new(|db| drop(StateBackend::iterate_cf_from(db, CF_ACCOUNTS, b"", 4))),
+            ),
+            (
+                "iterate_cf_prefix_from",
+                Box::new(|db| {
+                    drop(StateBackend::iterate_cf_prefix_from(
+                        db,
+                        CF_ACCOUNTS,
+                        b"k",
+                        b"k",
+                        4,
+                    ))
+                }),
+            ),
+            (
+                "prefix_exists",
+                Box::new(|db| drop(StateBackend::prefix_exists(db, CF_ACCOUNTS, b"k"))),
+            ),
+            (
+                "basic_ref",
+                Box::new(|db| drop(db.basic_ref(Address::ZERO))),
+            ),
+            (
+                "storage_ref",
+                Box::new(|db| drop(db.storage_ref(Address::ZERO, U256::from(1)))),
+            ),
+            (
+                "code_by_hash_ref",
+                Box::new(move |db| drop(db.code_by_hash_ref(code))),
+            ),
             ("block_hash_ref", Box::new(|db| drop(db.block_hash_ref(1)))),
-            ("get_account", Box::new(|db| drop(db.get_account(&Address::ZERO)))),
+            (
+                "get_account",
+                Box::new(|db| drop(db.get_account(&Address::ZERO))),
+            ),
             ("get_block_hash", Box::new(|db| drop(db.get_block_hash(1)))),
-            ("get_storage", Box::new(|db| drop(db.get_storage(&Address::ZERO, &U256::from(1))))),
+            (
+                "get_storage",
+                Box::new(|db| drop(db.get_storage(&Address::ZERO, &U256::from(1)))),
+            ),
             ("get_code", Box::new(move |db| drop(db.get_code(&code)))),
-            ("exists_cf_raw", Box::new(|db| drop(db.exists_cf_raw(CF_ACCOUNTS, b"k")))),
+            (
+                "exists_cf_raw",
+                Box::new(|db| drop(db.exists_cf_raw(CF_ACCOUNTS, b"k"))),
+            ),
             ("all_accounts", Box::new(|db| drop(db.all_accounts()))),
-            ("account_storage", Box::new(|db| drop(db.account_storage(&Address::ZERO)))),
-            ("inner", Box::new(|db| {
-                let _ = db.inner();
-            })),
-            ("cf_handle", Box::new(|db| {
-                let _ = db.cf_handle(CF_ACCOUNTS);
-            })),
+            (
+                "account_storage",
+                Box::new(|db| drop(db.account_storage(&Address::ZERO))),
+            ),
+            (
+                "inner",
+                Box::new(|db| {
+                    let _ = db.inner();
+                }),
+            ),
+            (
+                "cf_handle",
+                Box::new(|db| {
+                    let _ = db.cf_handle(CF_ACCOUNTS);
+                }),
+            ),
         ];
         for (name, read) in &entries {
             assert!(!trips(|| read(&db)), "{name}: unarmed");
@@ -212,16 +271,22 @@ mod tests {
             code: None,
             account_id: None,
         });
-        db.put_cf_raw(CF_ACCOUNTS, addr.as_slice(), &account).unwrap();
-        db.put_cf_raw(CF_CODE, B256::repeat_byte(9).as_slice(), &[0x60, 0x00]).unwrap();
+        db.put_cf_raw(CF_ACCOUNTS, addr.as_slice(), &account)
+            .unwrap();
+        db.put_cf_raw(CF_CODE, B256::repeat_byte(9).as_slice(), &[0x60, 0x00])
+            .unwrap();
         db.put_cf_raw(
             CF_STORAGE,
             &crate::db::storage_key(&addr, &U256::from(3)),
             &U256::from(4).to_be_bytes::<32>(),
         )
         .unwrap();
-        db.put_cf_raw(CF_BLOCK_HEADERS, &7u64.to_be_bytes(), B256::repeat_byte(2).as_slice())
-            .unwrap();
+        db.put_cf_raw(
+            CF_BLOCK_HEADERS,
+            &7u64.to_be_bytes(),
+            B256::repeat_byte(2).as_slice(),
+        )
+        .unwrap();
         db.put_cf_raw(CF_NATIVE_BALANCES, b"bal", b"v").unwrap();
         let parent = {
             let ov = NativeStateOverlay::new(db.clone());
@@ -230,19 +295,54 @@ mod tests {
         };
         let ov = NativeStateOverlay::with_layers(db.clone(), Some(parent), None, None);
         let _armed = arm();
-        assert_eq!(ov.get_cf_raw(CF_NATIVE_BALANCES, b"bal").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(
+            ov.get_cf_raw(CF_NATIVE_BALANCES, b"bal").unwrap(),
+            Some(b"v".to_vec())
+        );
         assert_eq!(ov.get_cf_len(CF_NATIVE_BALANCES, b"bal").unwrap(), Some(1));
         assert_eq!(ov.iterate_cf(CF_NATIVE_BALANCES, None).unwrap().len(), 2);
-        assert_eq!(ov.iterate_cf_from(CF_NATIVE_BALANCES, b"", 8).unwrap().len(), 2);
-        assert_eq!(ov.iterate_cf_prefix_from(CF_NATIVE_BALANCES, b"b", b"b", 8).unwrap().len(), 1);
+        assert_eq!(
+            ov.iterate_cf_from(CF_NATIVE_BALANCES, b"", 8)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            ov.iterate_cf_prefix_from(CF_NATIVE_BALANCES, b"b", b"b", 8)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(ov.prefix_exists(CF_NATIVE_BALANCES, b"ba").unwrap());
         let state = EvmBlockState::new(&ov);
         assert_eq!(state.db.basic_ref(addr).unwrap().map(|a| a.nonce), Some(1));
-        assert_eq!(state.db.storage_ref(addr, U256::from(3)).unwrap(), U256::from(4));
-        assert_eq!(state.db.code_by_hash_ref(B256::repeat_byte(9)).unwrap().original_byte_slice(), &[0x60, 0x00]);
+        assert_eq!(
+            state.db.storage_ref(addr, U256::from(3)).unwrap(),
+            U256::from(4)
+        );
+        assert_eq!(
+            state
+                .db
+                .code_by_hash_ref(B256::repeat_byte(9))
+                .unwrap()
+                .original_byte_slice(),
+            &[0x60, 0x00]
+        );
         assert_eq!(state.db.block_hash_ref(7).unwrap(), B256::repeat_byte(2));
-        assert_eq!(state.journal.get_cf_raw(CF_NATIVE_BALANCES, b"parent").unwrap(), Some(b"p".to_vec()));
-        assert_eq!(state.journal.get_cf_raw(CF_NATIVE_BALANCES, b"bal").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(
+            state
+                .journal
+                .get_cf_raw(CF_NATIVE_BALANCES, b"parent")
+                .unwrap(),
+            Some(b"p".to_vec())
+        );
+        assert_eq!(
+            state
+                .journal
+                .get_cf_raw(CF_NATIVE_BALANCES, b"bal")
+                .unwrap(),
+            Some(b"v".to_vec())
+        );
         // Not a blanket exemption: the raw DB still trips right after.
         assert!(trips(|| drop(db.get_cf_raw(CF_NATIVE_BALANCES, b"bal"))));
     }

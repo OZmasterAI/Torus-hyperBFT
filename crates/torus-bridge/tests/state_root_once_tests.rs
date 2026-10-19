@@ -139,7 +139,12 @@ fn catchup_root_computed_once_and_identical_to_recompute_path() {
 
     let runs_before = evm_root_engine_runs();
     let validated = validator()
-        .validate_block_for_catchup(&make_block(), torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
+        .validate_block_for_catchup(
+            &make_block(),
+            torus_bridge::EvmReads::Db(&db),
+            &EvmExecutor::new(TORUS_CHAIN_ID),
+            torus_bridge::RootMode::OnE,
+        )
         .expect("catchup validation");
     assert_eq!(
         evm_root_engine_runs() - runs_before,
@@ -171,7 +176,12 @@ fn catchup_root_computed_once_and_identical_to_recompute_path() {
     build_trie_to_cf(&db2).unwrap();
 
     let validated2 = validator()
-        .validate_block_for_catchup(&make_block(), torus_bridge::EvmReads::Db(&db2), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
+        .validate_block_for_catchup(
+            &make_block(),
+            torus_bridge::EvmReads::Db(&db2),
+            &EvmExecutor::new(TORUS_CHAIN_ID),
+            torus_bridge::RootMode::OnE,
+        )
         .expect("catchup validation (recompute path)");
     let root_b = commit_evm_bundle_incremental(&db2, &validated2.bundle, None)
         .expect("commit with recompute");

@@ -52,35 +52,61 @@ fn core_writer_due_reads_layers() {
     // Parent only: the previous block queued a row for H, not durable yet.
     let (_d1, db) = open();
     let parent = frozen(&db, H - 1, |ov| {
-        ov.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 0), b"row").unwrap();
+        ov.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 0), b"row")
+            .unwrap();
     });
-    assert!(!NativeExecutor::core_writer_due(&db, H).unwrap(), "the raw DB has no row");
+    assert!(
+        !NativeExecutor::core_writer_due(&db, H).unwrap(),
+        "the raw DB has no row"
+    );
     let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent));
-    assert!(NativeExecutor::core_writer_due(&ov, H).unwrap(), "parent-layer row -> due");
-    assert!(!NativeExecutor::core_writer_due(&ov, H + 1).unwrap(), "other target");
+    assert!(
+        NativeExecutor::core_writer_due(&ov, H).unwrap(),
+        "parent-layer row -> due"
+    );
+    assert!(
+        !NativeExecutor::core_writer_due(&ov, H + 1).unwrap(),
+        "other target"
+    );
 
     // Drained in L, still in the DB: not due.
     let (_d2, db) = open();
-    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 0), b"row").unwrap();
-    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H + 1, 0), b"next").unwrap();
+    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 0), b"row")
+        .unwrap();
+    db.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H + 1, 0), b"next")
+        .unwrap();
     let drained = frozen(&db, H - 2, |ov| {
-        ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 0)).unwrap();
+        ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 0))
+            .unwrap();
     });
     let mut l = CheckpointLayer::new();
     l.merge(&drained);
-    assert!(NativeExecutor::core_writer_due(&db, H).unwrap(), "the raw DB still has the row");
+    assert!(
+        NativeExecutor::core_writer_due(&db, H).unwrap(),
+        "the raw DB still has the row"
+    );
     let ov = NativeStateOverlay::with_layers(db.clone(), None, Some(Arc::new(l)), None);
-    assert!(!NativeExecutor::core_writer_due(&ov, H).unwrap(), "L tombstone -> not due");
-    assert!(NativeExecutor::core_writer_due(&ov, H + 1).unwrap(), "the next target's DB row");
+    assert!(
+        !NativeExecutor::core_writer_due(&ov, H).unwrap(),
+        "L tombstone -> not due"
+    );
+    assert!(
+        NativeExecutor::core_writer_due(&ov, H + 1).unwrap(),
+        "the next target's DB row"
+    );
 
     // Only in L (merged, not durable): due.
     let (_d3, db) = open();
     let queued = frozen(&db, H - 3, |ov| {
-        ov.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 3), b"row").unwrap();
+        ov.put_cf_raw(CF_CORE_WRITER_QUEUE, &queue_key(H, 3), b"row")
+            .unwrap();
     });
     let mut l = CheckpointLayer::new();
     l.merge(&queued);
     let ov = NativeStateOverlay::with_layers(db.clone(), None, Some(Arc::new(l)), None);
-    assert!(NativeExecutor::core_writer_due(&ov, H).unwrap(), "L row -> due");
+    assert!(
+        NativeExecutor::core_writer_due(&ov, H).unwrap(),
+        "L row -> due"
+    );
     assert!(!NativeExecutor::core_writer_due(&db, H).unwrap());
 }

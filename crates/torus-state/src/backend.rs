@@ -1677,14 +1677,20 @@ impl NativeStateOverlay {
         layer: crate::probes::Layer,
         hit: Option<&[u8]>,
     ) {
-        crate::probes::record_point(id.name(), key, layer, || hit.is_some(), || {
-            let db = self.db.get_cf_raw(id.name(), key).ok().flatten();
-            if LEN {
-                db.as_deref().map(<[u8]>::len) != hit.map(<[u8]>::len)
-            } else {
-                db.as_deref() != hit
-            }
-        });
+        crate::probes::record_point(
+            id.name(),
+            key,
+            layer,
+            || hit.is_some(),
+            || {
+                let db = self.db.get_cf_raw(id.name(), key).ok().flatten();
+                if LEN {
+                    db.as_deref().map(<[u8]>::len) != hit.map(<[u8]>::len)
+                } else {
+                    db.as_deref() != hit
+                }
+            },
+        );
     }
 
     /// `test-probes`: the probe tags of `lower`'s slots (parent, L, C).
@@ -1721,7 +1727,10 @@ impl NativeStateOverlay {
             };
             let shadowed = |k: &[u8]| {
                 own.lookup(id, k).is_some()
-                    || lower[..i].iter().flatten().any(|s| s.lookup(id, k).is_some())
+                    || lower[..i]
+                        .iter()
+                        .flatten()
+                        .any(|s| s.lookup(id, k).is_some())
             };
             let cfp = layer.cf(id);
             let from = (std::ops::Bound::Included(start), std::ops::Bound::Unbounded);
@@ -1735,7 +1744,10 @@ impl NativeStateOverlay {
                 .range::<[u8], _>(from)
                 .map(|k| (k.as_slice(), None))
                 .take_while(|(k, _)| within(k));
-            writes.chain(deletes).filter(|(k, _)| !shadowed(k)).collect()
+            writes
+                .chain(deletes)
+                .filter(|(k, _)| !shadowed(k))
+                .collect()
         })
     }
 
@@ -2140,7 +2152,8 @@ impl NativeStateOverlay {
     ) -> Result<(), StateError> {
         use crate::cf::{CF_ACCOUNTS, CF_CODE, CF_STORAGE};
         use crate::db::{encode_account_info, storage_key};
-        let id = |cf: &str| intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()));
+        let id =
+            |cf: &str| intern_cf(cf).ok_or_else(|| StateError::MissingColumnFamily(cf.to_string()));
         let (accounts, storage, code) = (id(CF_ACCOUNTS)?, id(CF_STORAGE)?, id(CF_CODE)?);
         // Move the journal's rows out (its pending set is left empty) and
         // release the journal before taking this overlay's lock.
@@ -2161,7 +2174,11 @@ impl NativeStateOverlay {
         for (address, acct) in &bundle.state {
             match &acct.info {
                 Some(info) => {
-                    put(state.cf_mut(accounts), address.to_vec(), encode_account_info(info).to_vec());
+                    put(
+                        state.cf_mut(accounts),
+                        address.to_vec(),
+                        encode_account_info(info).to_vec(),
+                    );
                     let cfp = state.cf_mut(storage);
                     for (slot, sv) in &acct.storage {
                         let key = storage_key(address, slot).to_vec();
@@ -2185,7 +2202,11 @@ impl NativeStateOverlay {
         }
         let cfp = state.cf_mut(code);
         for (code_hash, bytecode) in &bundle.contracts {
-            put(cfp, code_hash.to_vec(), bytecode.original_byte_slice().to_vec());
+            put(
+                cfp,
+                code_hash.to_vec(),
+                bytecode.original_byte_slice().to_vec(),
+            );
         }
         // Item 7 option 0 (task 3.6, plan C7): the absorbed rows by kind.
         #[cfg(feature = "test-probes")]
@@ -2212,10 +2233,12 @@ impl NativeStateOverlay {
             bump("absorb.slot_put", c[2]);
             bump("absorb.slot_delete", c[3]);
             bump("absorb.code_put", c[4]);
-            let journal_rows = |cf: &str| {
-                intern_cf(cf).map_or(0, |id| rows.cf(id).writes.len() as u64)
-            };
-            bump("absorb.queue_row", journal_rows(crate::cf::CF_CORE_WRITER_QUEUE));
+            let journal_rows =
+                |cf: &str| intern_cf(cf).map_or(0, |id| rows.cf(id).writes.len() as u64);
+            bump(
+                "absorb.queue_row",
+                journal_rows(crate::cf::CF_CORE_WRITER_QUEUE),
+            );
             bump("absorb.cursor_row", journal_rows(crate::cf::CF_FEE_CONFIG));
         }
         // The journal's pending set: puts and deletes are disjoint per key.
@@ -3159,7 +3182,14 @@ impl StateBackend for NativeStateOverlay {
             .map(|item| item.map_err(StateError::from));
         let out = merge_from(&pending, &lower, id, start, limit, dbi)?;
         #[cfg(feature = "test-probes")]
-        self.probe_range(id, &pending, &lower, start, |_: &[u8]| true, limit_cut(&out, limit));
+        self.probe_range(
+            id,
+            &pending,
+            &lower,
+            start,
+            |_: &[u8]| true,
+            limit_cut(&out, limit),
+        );
         Ok(out)
     }
 
@@ -3206,7 +3236,12 @@ impl StateBackend for NativeStateOverlay {
                 id.name(),
                 key,
                 crate::probes::Layer::Db,
-                || StateBackend::get_cf_len(&self.db, cf, key).ok().flatten().is_some(),
+                || {
+                    StateBackend::get_cf_len(&self.db, cf, key)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                },
                 || false,
             );
         }
@@ -3305,7 +3340,10 @@ impl StateBackend for NativeStateOverlay {
             }
         };
         let exists = 'exists: {
-            if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix).next().is_some() {
+            if writes_under(&self.pending.read().unwrap().cf(id).writes, prefix)
+                .next()
+                .is_some()
+            {
                 break 'exists true;
             }
             for layer in lower.iter().flatten() {
@@ -3586,9 +3624,10 @@ mod tests {
             for s in [vec![], vec![2], vec![3], vec![4], vec![6]] {
                 let start = [pre.clone(), s].concat();
                 for limit in 1..=4 {
-                    check(format!("iterate_cf_from {c} {combo:?} {start:?} {limit}"), &|ov| {
-                        format!("{:?}", ov.iterate_cf_from(cf, &start, limit).unwrap())
-                    });
+                    check(
+                        format!("iterate_cf_from {c} {combo:?} {start:?} {limit}"),
+                        &|ov| format!("{:?}", ov.iterate_cf_from(cf, &start, limit).unwrap()),
+                    );
                     check(
                         format!("iterate_cf_prefix_from {c} {combo:?} {start:?} {limit}"),
                         &|ov| {
@@ -3646,7 +3685,10 @@ mod tests {
             parent_hits(&|| {
                 ov.iterate_cf_from(cf, &q(0), 3).unwrap();
             }),
-            probes::Count { hits: 1, inflight: 1 },
+            probes::Count {
+                hits: 1,
+                inflight: 1
+            },
             "q5 returned: the parent determined it, the DB lacks it"
         );
     }
@@ -3717,10 +3759,18 @@ mod tests {
             let k = key(c);
             type Read<'r> = &'r dyn Fn(&NativeStateOverlay) -> String;
             let reads: [(&str, Read); 4] = [
-                ("get_cf_raw", &|ov| format!("{:?}", ov.get_cf_raw(cf, &k).unwrap())),
-                ("get_cf_len", &|ov| format!("{:?}", ov.get_cf_len(cf, &k).unwrap())),
-                ("iterate_cf", &|ov| format!("{:?}", ov.iterate_cf(cf, Some(&k)).unwrap())),
-                ("prefix_exists", &|ov| format!("{:?}", ov.prefix_exists(cf, &k).unwrap())),
+                ("get_cf_raw", &|ov| {
+                    format!("{:?}", ov.get_cf_raw(cf, &k).unwrap())
+                }),
+                ("get_cf_len", &|ov| {
+                    format!("{:?}", ov.get_cf_len(cf, &k).unwrap())
+                }),
+                ("iterate_cf", &|ov| {
+                    format!("{:?}", ov.iterate_cf(cf, Some(&k)).unwrap())
+                }),
+                ("prefix_exists", &|ov| {
+                    format!("{:?}", ov.prefix_exists(cf, &k).unwrap())
+                }),
             ];
             for (what, f) in reads {
                 p.reset();
@@ -3739,7 +3789,10 @@ mod tests {
         // The Codex case by name: an equal-length parent row is a hit, not
         // in flight, for a length read; a row of another length is in flight.
         let (len_quiet, len_inflight) = (("get_cf_len", 1, false), ("get_cf_len", 1, true));
-        assert!(seen.contains(&len_quiet) && seen.contains(&len_inflight), "{seen:?}");
+        assert!(
+            seen.contains(&len_quiet) && seen.contains(&len_inflight),
+            "{seen:?}"
+        );
     }
 
     /// Review H3 (s517): `iterate_cf_from(start, limit)` == the first `limit`
@@ -5866,8 +5919,15 @@ mod tests {
             let address = Address::repeat_byte((a as u8) * 16 + next(16) as u8);
             let mut storage = StorageWithOriginalValues::default();
             for _ in 0..next(5) {
-                let present = if next(3) == 0 { U256::ZERO } else { U256::from(1 + next(1000)) };
-                storage.insert(U256::from(next(8)), StorageSlot::new_changed(U256::from(next(9)), present));
+                let present = if next(3) == 0 {
+                    U256::ZERO
+                } else {
+                    U256::from(1 + next(1000))
+                };
+                storage.insert(
+                    U256::from(next(8)),
+                    StorageSlot::new_changed(U256::from(next(9)), present),
+                );
             }
             let acct = match next(4) {
                 0 => BundleAccount::new(
@@ -5878,13 +5938,14 @@ mod tests {
                 ),
                 1 => BundleAccount::new(None, None, storage, AccountStatus::Destroyed),
                 _ => {
-                    let code = (next(2) == 0).then(|| {
-                        Bytecode::new_raw(Bytes::from(vec![0x60, next(255) as u8, 0x00]))
-                    });
+                    let code = (next(2) == 0)
+                        .then(|| Bytecode::new_raw(Bytes::from(vec![0x60, next(255) as u8, 0x00])));
                     let info = AccountInfo {
                         balance: U256::from(next(1_000_000)),
                         nonce: next(9),
-                        code_hash: code.as_ref().map_or(revm::primitives::KECCAK_EMPTY, |c| c.hash_slow()),
+                        code_hash: code
+                            .as_ref()
+                            .map_or(revm::primitives::KECCAK_EMPTY, |c| c.hash_slow()),
                         code: code.clone(),
                         account_id: None,
                     };
@@ -5903,12 +5964,19 @@ mod tests {
             if next(4) == 0 {
                 journal.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key).unwrap();
             } else {
-                journal.put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &[next(255) as u8; 9]).unwrap();
+                journal
+                    .put_cf_raw(CF_CORE_WRITER_QUEUE, &key, &[next(255) as u8; 9])
+                    .unwrap();
             }
         }
-        for cursor in [&b"core_writer_last_order_target"[..], b"core_writer_full_order_run"] {
+        for cursor in [
+            &b"core_writer_last_order_target"[..],
+            b"core_writer_full_order_run",
+        ] {
             if next(2) == 0 {
-                journal.put_cf_raw(CF_FEE_CONFIG, cursor, &next(500).to_be_bytes()).unwrap();
+                journal
+                    .put_cf_raw(CF_FEE_CONFIG, cursor, &next(500).to_be_bytes())
+                    .unwrap();
             }
         }
         (bundle, journal)
@@ -5955,7 +6023,9 @@ mod tests {
     }
 
     /// The overlay's own pending rows per CF name (`None` = tombstone).
-    fn o0_pending_rows(ov: &NativeStateOverlay) -> BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>> {
+    fn o0_pending_rows(
+        ov: &NativeStateOverlay,
+    ) -> BTreeMap<(&'static str, Vec<u8>), Option<Vec<u8>>> {
         let state = ov.pending.read().unwrap();
         let mut out = BTreeMap::new();
         for (i, cfp) in state.cfs.iter().enumerate() {
@@ -6028,18 +6098,22 @@ mod tests {
                 let (db, _d) = rsh_db();
                 // Pre-state, so deletions are observable.
                 for a in 0..16u8 {
-                    db.put_cf_raw(CF_ACCOUNTS, &[a * 16 + 3; 20], b"pre").unwrap();
+                    db.put_cf_raw(CF_ACCOUNTS, &[a * 16 + 3; 20], b"pre")
+                        .unwrap();
                 }
                 let (bundle, journal) = o0_random_evm_block(&db, seed);
                 let native = |ov: &NativeStateOverlay| {
                     let first = bundle.state.keys().next().copied().unwrap();
-                    ov.put_cf_raw(CF_ACCOUNTS, first.as_slice(), b"credited").unwrap();
+                    ov.put_cf_raw(CF_ACCOUNTS, first.as_slice(), b"credited")
+                        .unwrap();
                     ov.delete_cf_raw(CF_ACCOUNTS, &[0x33; 20]).unwrap();
                     let mut q = 101u64.to_be_bytes().to_vec();
                     q.extend_from_slice(&0u64.to_be_bytes());
                     ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &q).unwrap();
-                    ov.put_cf_raw(CF_FEE_CONFIG, b"core_writer_full_order_run", b"native").unwrap();
-                    ov.put_cf_raw(crate::cf::CF_NATIVE_BALANCES, &[seed as u8], b"bal").unwrap();
+                    ov.put_cf_raw(CF_FEE_CONFIG, b"core_writer_full_order_run", b"native")
+                        .unwrap();
+                    ov.put_cf_raw(crate::cf::CF_NATIVE_BALANCES, &[seed as u8], b"bal")
+                        .unwrap();
                 };
                 let ov = NativeStateOverlay::new(db.clone());
                 let prefix = if absorb {

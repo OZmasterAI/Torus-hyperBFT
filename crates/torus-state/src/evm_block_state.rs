@@ -20,8 +20,8 @@ use revm::state::AccountInfo;
 use crate::backend::{NativeStateOverlay, StateBackend};
 use crate::cf::{CF_ACCOUNTS, CF_BLOCK_HEADERS, CF_CODE, CF_STORAGE};
 use crate::db::{
-    code_hash_is_empty, decode_account_info, decode_block_hash, decode_code,
-    decode_storage_value, storage_key, StateDb,
+    code_hash_is_empty, decode_account_info, decode_block_hash, decode_code, decode_storage_value,
+    storage_key, StateDb,
 };
 use crate::error::StateError;
 
@@ -88,8 +88,11 @@ impl revm::DatabaseRef for LayeredEvmDb<'_> {
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        Ok(decode_block_hash(self.get(CF_BLOCK_HEADERS, &number.to_be_bytes())?.as_deref())
-            .unwrap_or(B256::ZERO))
+        Ok(decode_block_hash(
+            self.get(CF_BLOCK_HEADERS, &number.to_be_bytes())?
+                .as_deref(),
+        )
+        .unwrap_or(B256::ZERO))
     }
 }
 

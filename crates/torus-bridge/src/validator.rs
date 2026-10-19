@@ -137,7 +137,14 @@ impl BlockValidator {
         state_db: &StateDb,
         evm_executor: &EvmExecutor,
     ) -> Result<ValidatedBlock, BridgeError> {
-        self.validate_block_inner(block, EvmReads::Db(state_db), evm_executor, None, false, RootMode::OnE)
+        self.validate_block_inner(
+            block,
+            EvmReads::Db(state_db),
+            evm_executor,
+            None,
+            false,
+            RootMode::OnE,
+        )
     }
 
     /// Validate with parent header for base_fee verification.

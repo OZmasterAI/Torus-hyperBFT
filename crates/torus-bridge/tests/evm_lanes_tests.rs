@@ -129,7 +129,12 @@ fn catchup_validation_charges_each_sender_its_lane_while_big_blocks_are_on() {
             signed_transfer(&kb, 0, 21_000),
         ];
         let v = validator()
-            .validate_block_for_catchup(&block(100, m, txs), torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
+            .validate_block_for_catchup(
+                &block(100, m, txs),
+                torus_bridge::EvmReads::Db(&db),
+                &EvmExecutor::new(TORUS_CHAIN_ID),
+                torus_bridge::RootMode::OnE,
+            )
             .unwrap();
         assert_eq!(v.receipts.len(), 2);
         (
@@ -156,7 +161,12 @@ fn a_tx_above_the_small_limit_runs_only_at_a_big_height() {
         let (_dir, db) = open_test_db();
         fund(&db, &sender);
         let v = validator()
-            .validate_block_for_catchup(&block(height, 50, vec![signed_transfer(&k, 0, 5_000_000)]), torus_bridge::EvmReads::Db(&db), &EvmExecutor::new(TORUS_CHAIN_ID), torus_bridge::RootMode::OnE)
+            .validate_block_for_catchup(
+                &block(height, 50, vec![signed_transfer(&k, 0, 5_000_000)]),
+                torus_bridge::EvmReads::Db(&db),
+                &EvmExecutor::new(TORUS_CHAIN_ID),
+                torus_bridge::RootMode::OnE,
+            )
             .unwrap();
         v.receipts.len()
     };
@@ -179,8 +189,16 @@ fn catchup_validation_reads_layered_equals_db_and_skip_computes_no_root() {
     let (_dir, db) = open_test_db();
     fund(&db, &a);
     fund(&db, &b);
-    db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&b), &[1]).unwrap();
-    let blk = block(100, 50, vec![signed_transfer(&ka, 0, 21_000), signed_transfer(&kb, 0, 21_000)]);
+    db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&b), &[1])
+        .unwrap();
+    let blk = block(
+        100,
+        50,
+        vec![
+            signed_transfer(&ka, 0, 21_000),
+            signed_transfer(&kb, 0, 21_000),
+        ],
+    );
     let exec = EvmExecutor::new(TORUS_CHAIN_ID);
     let summary = |v: &torus_bridge::ValidatedBlock| {
         (
@@ -210,7 +228,11 @@ fn catchup_validation_reads_layered_equals_db_and_skip_computes_no_root() {
         on_db.evm_root_updates.as_ref().map(|(r, _)| *r),
         layered.evm_root_updates.as_ref().map(|(r, _)| *r)
     );
-    assert_eq!(overlay.pending_write_count(), 0, "the block overlay is only read");
+    assert_eq!(
+        overlay.pending_write_count(),
+        0,
+        "the block overlay is only read"
+    );
     let skip = validator()
         .validate_block_for_catchup(&blk, EvmReads::Db(&db), &exec, RootMode::Skip)
         .unwrap();
@@ -241,12 +263,18 @@ fn lane_row_in_parent_layer_sets_big_fee() {
     fund(&db, &sender);
     let parent = {
         let ov = NativeStateOverlay::new(db.clone());
-        ov.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender), &[1]).unwrap();
+        ov.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender), &[1])
+            .unwrap();
         ov.freeze(99)
     };
     let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent));
     let layered = validator()
-        .validate_block_for_catchup(&blk(), EvmReads::Layered(EvmBlockState::new(&overlay)), &exec, RootMode::OnE)
+        .validate_block_for_catchup(
+            &blk(),
+            EvmReads::Layered(EvmBlockState::new(&overlay)),
+            &exec,
+            RootMode::OnE,
+        )
         .unwrap();
     assert_eq!(fee(layered), (3 * GWEI, 21_000), "big: the parent's row");
     let raw = validator()
@@ -257,17 +285,24 @@ fn lane_row_in_parent_layer_sets_big_fee() {
     // Row in the DB, tombstoned in L (the sender went small, not durable yet).
     let (_d2, db) = open_test_db();
     fund(&db, &sender);
-    db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender), &[1]).unwrap();
+    db.put_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender), &[1])
+        .unwrap();
     let small = {
         let ov = NativeStateOverlay::new(db.clone());
-        ov.delete_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender)).unwrap();
+        ov.delete_cf_raw(CF_NATIVE_ORACLE, &evm_lane_key(&sender))
+            .unwrap();
         ov.freeze(98)
     };
     let mut l = CheckpointLayer::new();
     l.merge(&small);
     let overlay = NativeStateOverlay::with_layers(db.clone(), None, Some(Arc::new(l)), None);
     let layered = validator()
-        .validate_block_for_catchup(&blk(), EvmReads::Layered(EvmBlockState::new(&overlay)), &exec, RootMode::OnE)
+        .validate_block_for_catchup(
+            &blk(),
+            EvmReads::Layered(EvmBlockState::new(&overlay)),
+            &exec,
+            RootMode::OnE,
+        )
         .unwrap();
     assert_eq!(fee(layered), (GWEI, 0), "small: L's tombstone");
 }

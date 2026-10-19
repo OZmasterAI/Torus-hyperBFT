@@ -1942,27 +1942,55 @@ fn pending_count_matches_prefix_exists() {
     };
     for (t, n) in [(3u64, 1u64), (4, 3), (6, 2), (u64::MAX, 1)] {
         for s in 0..n {
-            db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(t, s), b"row").unwrap();
+            db.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(t, s), b"row")
+                .unwrap();
         }
     }
     let ov = NativeStateOverlay::new(db.clone());
     ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(3, 0)).unwrap();
     ov.delete_cf_raw(CF_CORE_WRITER_QUEUE, &key(4, 1)).unwrap();
-    ov.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(5, 0), b"row").unwrap();
-    let expect_db = [(2u64, 0usize), (3, 1), (4, 3), (5, 0), (6, 2), (7, 0), (u64::MAX, 1)];
-    let expect_ov = [(2u64, 0usize), (3, 0), (4, 2), (5, 1), (6, 2), (7, 0), (u64::MAX, 1)];
+    ov.put_cf_raw(CF_CORE_WRITER_QUEUE, &key(5, 0), b"row")
+        .unwrap();
+    let expect_db = [
+        (2u64, 0usize),
+        (3, 1),
+        (4, 3),
+        (5, 0),
+        (6, 2),
+        (7, 0),
+        (u64::MAX, 1),
+    ];
+    let expect_ov = [
+        (2u64, 0usize),
+        (3, 0),
+        (4, 2),
+        (5, 1),
+        (6, 2),
+        (7, 0),
+        (u64::MAX, 1),
+    ];
     for (t, n) in expect_db {
-        assert_eq!(CoreWriterQueue::pending_count(&db, t).unwrap(), n, "db target {t}");
         assert_eq!(
-            db.prefix_exists(CF_CORE_WRITER_QUEUE, &t.to_be_bytes()).unwrap(),
+            CoreWriterQueue::pending_count(&db, t).unwrap(),
+            n,
+            "db target {t}"
+        );
+        assert_eq!(
+            db.prefix_exists(CF_CORE_WRITER_QUEUE, &t.to_be_bytes())
+                .unwrap(),
             n > 0,
             "db target {t}"
         );
     }
     for (t, n) in expect_ov {
-        assert_eq!(CoreWriterQueue::pending_count(&ov, t).unwrap(), n, "overlay target {t}");
         assert_eq!(
-            ov.prefix_exists(CF_CORE_WRITER_QUEUE, &t.to_be_bytes()).unwrap(),
+            CoreWriterQueue::pending_count(&ov, t).unwrap(),
+            n,
+            "overlay target {t}"
+        );
+        assert_eq!(
+            ov.prefix_exists(CF_CORE_WRITER_QUEUE, &t.to_be_bytes())
+                .unwrap(),
             n > 0,
             "overlay target {t}"
         );
@@ -2008,8 +2036,12 @@ fn enqueue_reads_cursor_rows_from_layers() {
                 .map(move |(k, v)| (cf, k, v))
         })
         .collect();
-    assert!(rows.iter().any(|(_, k, _)| k.as_slice() == CORE_WRITER_FIRST_OPEN_TARGET_KEY));
-    assert!(rows.iter().any(|(_, k, _)| k.as_slice() == CORE_WRITER_LAST_ORDER_TARGET_KEY));
+    assert!(rows
+        .iter()
+        .any(|(_, k, _)| k.as_slice() == CORE_WRITER_FIRST_OPEN_TARGET_KEY));
+    assert!(rows
+        .iter()
+        .any(|(_, k, _)| k.as_slice() == CORE_WRITER_LAST_ORDER_TARGET_KEY));
     let next = |state: &NativeStateOverlay| {
         let seqs = vec![
             CoreWriterQueue::enqueue(state, &order(100, 1)).unwrap(),
@@ -2024,7 +2056,11 @@ fn enqueue_reads_cursor_rows_from_layers() {
         (seqs, view)
     };
     let want = next(&NativeStateOverlay::new(db.clone()));
-    assert_eq!(want.0, vec![2, 3, 0, 4], "past the full target, then K = 1 at 106");
+    assert_eq!(
+        want.0,
+        vec![2, 3, 0, 4],
+        "past the full target, then K = 1 at 106"
+    );
 
     let frozen = |empty: &StateDb| {
         let ov = NativeStateOverlay::new(empty.clone());

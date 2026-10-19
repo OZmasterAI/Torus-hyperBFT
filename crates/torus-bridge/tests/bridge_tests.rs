@@ -536,9 +536,12 @@ fn state_root_compute_read_fault_is_a_state_error() {
     db.put_account(&signing_key_address(&sk), &test_account(ten_eth))
         .unwrap();
 
-    let catchup = h
-        .validator
-        .validate_block_for_catchup(&proposed.block, torus_bridge::EvmReads::Db(&db), &h.executor, torus_bridge::RootMode::OnE);
+    let catchup = h.validator.validate_block_for_catchup(
+        &proposed.block,
+        torus_bridge::EvmReads::Db(&db),
+        &h.executor,
+        torus_bridge::RootMode::OnE,
+    );
     assert!(
         matches!(
             catchup,
@@ -562,7 +565,12 @@ fn state_root_compute_read_fault_is_a_state_error() {
     );
     // Control: the same block on the healthy DB validates on both paths.
     h.validator
-        .validate_block_for_catchup(&proposed.block, torus_bridge::EvmReads::Db(&h.db), &h.executor, torus_bridge::RootMode::OnE)
+        .validate_block_for_catchup(
+            &proposed.block,
+            torus_bridge::EvmReads::Db(&h.db),
+            &h.executor,
+            torus_bridge::RootMode::OnE,
+        )
         .expect("healthy catch-up");
     h.validator
         .validate_block(&proposed.block, &h.db, &h.executor)

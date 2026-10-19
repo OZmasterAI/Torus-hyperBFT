@@ -1029,6 +1029,8 @@ two guards, R4).
 - **F16 (open, pre-merge).** `cargo fmt --check` on the P set: 3534 hunks on the branch vs 3334 on `fd94818d`, all from
   G0-G3 (G4's lines are clean). Section 11's "fmt counts not above main's" is open; a whole-file `rustfmt` also
   rewrites main's own debt, so format only the branch's hunks.
+- **F16 fixed.** rustfmt applied to the branch's own hunks only (whole for the 4 new files; hunks that would rewrite
+  main's own unformatted lines skipped): P set 3333 hunks vs 3334 on `fd94818d` (-1: a main line the branch rewrote).
 - Clippy: the branch had 20 warnings over main (all on G0-G3 lines, mostly tests); `795cc291` brings it to main's 322
   with the same lint set. Known load-flaky `hot_path_fails_view_fast_when_body_never_arrives` failed once in the first
   P-set run (S395: load-flaky by design), passed in the rerun.

@@ -33,8 +33,8 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use torus_bridge::{
-    sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator,
-    NativeExecContext, NativeExecutor,
+    sort_native_actions_indexed, BlockCommitter, BlockProposer, BlockValidator, NativeExecContext,
+    NativeExecutor,
 };
 use torus_economics::{EpochManager, EpochRotationPlan, PlanEvm, SlashReason, StakingManager};
 use torus_evm::{EvmExecutor, TORUS_CHAIN_ID};
@@ -3827,7 +3827,9 @@ impl ExecutionContext {
                 let evm_reads_from = evm_view.as_ref().unwrap_or(&overlay);
                 #[cfg(not(test))]
                 let evm_reads_from = &overlay;
-                let reads = torus_bridge::EvmReads::Layered(torus_state::EvmBlockState::new(evm_reads_from));
+                let reads = torus_bridge::EvmReads::Layered(torus_state::EvmBlockState::new(
+                    evm_reads_from,
+                ));
                 let _armed = torus_state::tripwire::arm();
                 self.validator.validate_block_for_catchup(
                     torus_block,
@@ -3875,7 +3877,9 @@ impl ExecutionContext {
                     // Item 7 option 0 (task 3.6): plan section 5.2's path flags.
                     #[cfg(test)]
                     if pipelined {
-                        if height.is_multiple_of(torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL) {
+                        if height.is_multiple_of(
+                            torus_state::running_hash::STATE_HASH_CHECKPOINT_INTERVAL,
+                        ) {
                             self.test_path("evm.fast.attest");
                         }
                         if EpochManager::is_epoch_boundary(height, self.epoch_length) {
@@ -3887,7 +3891,8 @@ impl ExecutionContext {
                         if validated.receipts.iter().any(|r| !r.status) {
                             self.test_path("evm.fast.revert");
                         }
-                        if validated.big_gas_used > 0 && validated.gas_used > validated.big_gas_used {
+                        if validated.big_gas_used > 0 && validated.gas_used > validated.big_gas_used
+                        {
                             self.test_path("evm.fast.both_lanes");
                         }
                         test_bundle_rows = validated
@@ -3895,9 +3900,9 @@ impl ExecutionContext {
                             .state
                             .iter()
                             .filter_map(|(a, acct)| {
-                                acct.info.as_ref().map(|i| {
-                                    (*a, torus_state::db::encode_account_info(i).to_vec())
-                                })
+                                acct.info
+                                    .as_ref()
+                                    .map(|i| (*a, torus_state::db::encode_account_info(i).to_vec()))
                             })
                             .collect();
                     }
@@ -3964,91 +3969,94 @@ impl ExecutionContext {
                             bundle: validated.bundle,
                         });
                     } else {
-                    // Phase A: the hashed mirror + the incremental trie nodes ride the block's
-                    // flush batch as its prefix, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
-                    // CF_ACCOUNTS (keeps the incremental root's base correct across
-                    // restarts/replay). On an incremental error only the trie work is dropped
-                    // (the plain rows are already in the overlay, as the old plain fallback
-                    // wrote them), so a trie bug can never halt the chain (the full-scan root
-                    // stays primary unless the flag is on). Item 7 option 0 (task 2.3, F4):
-                    // the dropped trie work marks the trie stale in the same batch (the root
-                    // then routes to the full scan, boot rebuilds), and a stale trie is never
-                    // extended. Reading or putting the marker fails only on a local fault.
-                    let stale = torus_state::incremental::is_evm_trie_stale(&self.state_db);
-                    #[cfg(test)]
-                    let stale = if self.test_replay_fault == Some(ReplayFault::EvmTrieStaleRead) {
-                        Err(injected_fault("EVM trie stale marker read"))
-                    } else {
-                        stale
-                    };
-                    let batch = match stale {
-                        Ok(true) => Ok(rocksdb::WriteBatch::default()),
-                        Ok(false) => match torus_state::incremental::evm_block_trie_batch(
-                            &self.state_db,
-                            &validated.bundle,
-                            precomputed_root,
-                        ) {
-                            Ok((_root, batch)) => Ok(batch),
+                        // Phase A: the hashed mirror + the incremental trie nodes ride the block's
+                        // flush batch as its prefix, so CF_HASHED_*/CF_TRIE_* stay in lockstep with
+                        // CF_ACCOUNTS (keeps the incremental root's base correct across
+                        // restarts/replay). On an incremental error only the trie work is dropped
+                        // (the plain rows are already in the overlay, as the old plain fallback
+                        // wrote them), so a trie bug can never halt the chain (the full-scan root
+                        // stays primary unless the flag is on). Item 7 option 0 (task 2.3, F4):
+                        // the dropped trie work marks the trie stale in the same batch (the root
+                        // then routes to the full scan, boot rebuilds), and a stale trie is never
+                        // extended. Reading or putting the marker fails only on a local fault.
+                        let stale = torus_state::incremental::is_evm_trie_stale(&self.state_db);
+                        #[cfg(test)]
+                        let stale = if self.test_replay_fault == Some(ReplayFault::EvmTrieStaleRead)
+                        {
+                            Err(injected_fault("EVM trie stale marker read"))
+                        } else {
+                            stale
+                        };
+                        let batch = match stale {
+                            Ok(true) => Ok(rocksdb::WriteBatch::default()),
+                            Ok(false) => match torus_state::incremental::evm_block_trie_batch(
+                                &self.state_db,
+                                &validated.bundle,
+                                precomputed_root,
+                            ) {
+                                Ok((_root, batch)) => Ok(batch),
+                                Err(e) => {
+                                    tracing::error!(%e, height, "incremental EVM batch failed; the plain EVM rows land without a hashed mirror / trie update; EVM trie marked stale (full-scan root until the boot rebuild)");
+                                    let mut batch = rocksdb::WriteBatch::default();
+                                    torus_state::incremental::mark_evm_trie_stale(
+                                        &self.state_db,
+                                        &mut batch,
+                                    )
+                                    .map(|()| batch)
+                                }
+                            },
+                            Err(e) => Err(e),
+                        };
+                        let mut batch = match batch {
+                            Ok(batch) => batch,
                             Err(e) => {
-                                tracing::error!(%e, height, "incremental EVM batch failed; the plain EVM rows land without a hashed mirror / trie update; EVM trie marked stale (full-scan root until the boot rebuild)");
-                                let mut batch = rocksdb::WriteBatch::default();
-                                torus_state::incremental::mark_evm_trie_stale(
-                                    &self.state_db,
-                                    &mut batch,
-                                )
-                                .map(|()| batch)
+                                self.fail_stop_on_fault(
+                                    torus_block,
+                                    fold_header,
+                                    "EVM trie stale marker",
+                                    &e,
+                                );
+                                return;
                             }
-                        },
-                        Err(e) => Err(e),
-                    };
-                    let mut batch = match batch {
-                        Ok(batch) => batch,
-                        Err(e) => {
-                            self.fail_stop_on_fault(
-                                torus_block,
-                                fold_header,
-                                "EVM trie stale marker",
-                                &e,
-                            );
-                            return;
+                        };
+                        // s114 (CoreWriter follow-up 1): the node-local link of
+                        // each queued row to its EVM tx rides the same batch as
+                        // the row itself (nothing when the block queued nothing).
+                        match torus_state::corewriter_tx::append_links(
+                            &self.state_db,
+                            &mut batch,
+                            &validated.core_writer_links,
+                        ) {
+                            Ok(()) => evm_batch = Some(batch),
+                            Err(e2) => {
+                                // Executing the native phase without the block's EVM
+                                // writes would make a partial block durable.
+                                tracing::error!(%e2, height, "FATAL: could not build the EVM batch (links) — fail-stop");
+                                self.exec_failed.store(true, Ordering::SeqCst);
+                                return;
+                            }
                         }
-                    };
-                    // s114 (CoreWriter follow-up 1): the node-local link of
-                    // each queued row to its EVM tx rides the same batch as
-                    // the row itself (nothing when the block queued nothing).
-                    match torus_state::corewriter_tx::append_links(
-                        &self.state_db,
-                        &mut batch,
-                        &validated.core_writer_links,
-                    ) {
-                        Ok(()) => evm_batch = Some(batch),
-                        Err(e2) => {
-                            // Executing the native phase without the block's EVM
-                            // writes would make a partial block durable.
-                            tracing::error!(%e2, height, "FATAL: could not build the EVM batch (links) — fail-stop");
-                            self.exec_failed.store(true, Ordering::SeqCst);
-                            return;
+                        // Receipts / logs / tx indices are written only here, so a
+                        // storage fault (RocksDB, a missing CF) fail-stops BEFORE the
+                        // flush: the marker stays below the block and the restart's
+                        // replay rewrites them (an applied block is never re-executed).
+                        // A serialization error is deterministic (same block and
+                        // receipts on every node): only logged, as before.
+                        match self.commit_block_metadata(torus_block, &validated.receipts) {
+                            Ok(_) => {}
+                            Err(torus_bridge::BridgeError::State(e)) => {
+                                self.fail_stop_on_fault(
+                                    torus_block,
+                                    fold_header,
+                                    "EVM block metadata (receipts) write",
+                                    &e,
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, height, "failed to commit block metadata")
+                            }
                         }
-                    }
-                    // Receipts / logs / tx indices are written only here, so a
-                    // storage fault (RocksDB, a missing CF) fail-stops BEFORE the
-                    // flush: the marker stays below the block and the restart's
-                    // replay rewrites them (an applied block is never re-executed).
-                    // A serialization error is deterministic (same block and
-                    // receipts on every node): only logged, as before.
-                    match self.commit_block_metadata(torus_block, &validated.receipts) {
-                        Ok(_) => {}
-                        Err(torus_bridge::BridgeError::State(e)) => {
-                            self.fail_stop_on_fault(
-                                torus_block,
-                                fold_header,
-                                "EVM block metadata (receipts) write",
-                                &e,
-                            );
-                            return;
-                        }
-                        Err(e) => tracing::error!(%e, height, "failed to commit block metadata"),
-                    }
                     } // end serial EVM batch / metadata
                 }
                 // R02 branch 5 (owner option A): a precompile hit a LOCAL
@@ -4982,7 +4990,10 @@ impl ExecutionContext {
                 (pipelined && resident_rows.attached()).then(|| overlay.own_pending_delta());
             let resident_ok;
             if pipelined {
-                debug_assert!(evm_batch.is_none(), "a pipelined block never built an evm_batch");
+                debug_assert!(
+                    evm_batch.is_none(),
+                    "a pipelined block never built an evm_batch"
+                );
                 // bl2 exec pipeline FAST PATH. The applied-height marker goes into
                 // the overlay too (CF_CONSENSUS_META is a non-root CF — root-
                 // neutral; the flush appends the same key/bytes again, so the
@@ -5015,10 +5026,14 @@ impl ExecutionContext {
                 {
                     let _s = torus_state::probes::scope(torus_state::probes::Reader::Test);
                     if test_bundle_rows.iter().any(|(a, row)| {
-                        StateBackend::get_cf_raw(&overlay, torus_state::cf::CF_ACCOUNTS, a.as_slice())
-                            .ok()
-                            .flatten()
-                            .as_deref()
+                        StateBackend::get_cf_raw(
+                            &overlay,
+                            torus_state::cf::CF_ACCOUNTS,
+                            a.as_slice(),
+                        )
+                        .ok()
+                        .flatten()
+                        .as_deref()
                             != Some(row.as_slice())
                     }) {
                         self.test_path("evm.native_credit_same_block");
@@ -5033,7 +5048,10 @@ impl ExecutionContext {
                     if self.checkpoint.is_some() {
                         window.extend(test_bundle_rows.iter().map(|(a, _)| *a));
                     }
-                    if evm_job.as_ref().is_some_and(|j| j.bundle.state.is_empty() && j.side.receipts.is_empty()) {
+                    if evm_job
+                        .as_ref()
+                        .is_some_and(|j| j.bundle.state.is_empty() && j.side.receipts.is_empty())
+                    {
                         // C11c: an all-skipped section with a native phase.
                         self.test_path("handoff.flush.all_skipped_evm");
                     }
@@ -5425,7 +5443,11 @@ impl ExecutionContext {
                         && j.side.links.is_empty()),
                     "a Marker never carries absorbed rows (plan F2)"
                 );
-                debug_assert_eq!(marker_status.is_some(), has_evm, "an EVM Marker has a status");
+                debug_assert_eq!(
+                    marker_status.is_some(),
+                    has_evm,
+                    "an EVM Marker has a status"
+                );
                 #[cfg(test)]
                 if evm_job.is_some() {
                     self.test_path("marker.evm_side");
@@ -22203,11 +22225,15 @@ mod crash_recovery_tests {
         link_blocks(&mut blocks);
 
         let (_cfg, db) = make_test_config_and_db();
-        db.put_account(&k256_address(&key), &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))))
-            .unwrap();
+        db.put_account(
+            &k256_address(&key),
+            &account(KECCAK_EMPTY_CODE, U256::from(10u128.pow(18))),
+        )
+        .unwrap();
         let code_hash = alloy_primitives::keccak256(&twice);
         db.put_code(&code_hash, &twice).unwrap();
-        db.put_account(&contract, &account(code_hash, U256::ZERO)).unwrap();
+        db.put_account(&contract, &account(code_hash, U256::ZERO))
+            .unwrap();
         torus_state::incremental::ensure_trie_built(&db).unwrap();
 
         let probe = Probe::new();
@@ -22242,16 +22268,27 @@ mod crash_recovery_tests {
             .iter()
             .filter(|r| matches!(r.reader, Reader::Native | Reader::DueCheck))
             .collect();
-        assert!(native.is_empty(), "native-phase reads of block 1's journal rows: {native:?}");
+        assert!(
+            native.is_empty(),
+            "native-phase reads of block 1's journal rows: {native:?}"
+        );
         assert!(
             watched.iter().any(|r| r.cf == CF_FEE_CONFIG),
             "the EVM part reads the cursor (the watch works): {watched:?}"
         );
         // The rows are durable: four order rows at 1 + K, the cursor at 11.
         for s in 0..4u64 {
-            assert!(db.get_cf_raw(CF_CORE_WRITER_QUEUE, &qkey(11, s)).unwrap().is_some(), "seq {s}");
+            assert!(
+                db.get_cf_raw(CF_CORE_WRITER_QUEUE, &qkey(11, s))
+                    .unwrap()
+                    .is_some(),
+                "seq {s}"
+            );
         }
-        assert!(db.get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_LAST_ORDER_TARGET_KEY).unwrap().is_some());
+        assert!(db
+            .get_cf_raw(CF_FEE_CONFIG, CORE_WRITER_LAST_ORDER_TARGET_KEY)
+            .unwrap()
+            .is_some());
     }
 
     /// s114 (CoreWriter follow-up 1): block 1's EVM txs queue CoreWriter rows
@@ -22382,7 +22419,9 @@ mod crash_recovery_tests {
                 );
             } else {
                 assert!(
-                    StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None).unwrap().is_empty(),
+                    StateBackend::iterate_cf(&db, CF_CORE_WRITER_TX, None)
+                        .unwrap()
+                        .is_empty(),
                     "ckpt={ckpt:?} fast: the links ride the window"
                 );
             }
@@ -26571,7 +26610,9 @@ mod crash_recovery_tests {
                 q3.extend_from_slice(&0u64.to_be_bytes());
                 let parent = ctx.last_job.lock().unwrap().clone().unwrap();
                 assert!(
-                    parent.lookup_row(CF_CORE_WRITER_QUEUE, &q3).is_some_and(|r| r.is_some()),
+                    parent
+                        .lookup_row(CF_CORE_WRITER_QUEUE, &q3)
+                        .is_some_and(|r| r.is_some()),
                     "fast: block 2's queue row (target 3) is in block 3's parent layer"
                 );
             } else {
@@ -26618,7 +26659,11 @@ mod crash_recovery_tests {
             dumps.push(dump_all_cfs(&db));
         }
         assert_dumps_equal(&dumps[0], &dumps[1], "CoreWriter due: pipeline off vs on");
-        assert_dumps_equal(&dumps[0], &dumps[2], "CoreWriter due: pipeline off vs EVM fast path");
+        assert_dumps_equal(
+            &dumps[0],
+            &dumps[2],
+            "CoreWriter due: pipeline off vs EVM fast path",
+        );
     }
 
     /// Phase 3 step 2 variant of the main-branch test: a real EVM tx queues
@@ -26644,14 +26689,29 @@ mod crash_recovery_tests {
         };
         // Item 7 option 0 (task 3.7): each W configuration also with the EVM
         // fast path on (block 2 pipelined; its row in the parent / L).
-        let configs: [(&str, bool, Option<crate::exec_pipeline::CheckpointPolicy>, bool); 7] = [
+        let configs: [(
+            &str,
+            bool,
+            Option<crate::exec_pipeline::CheckpointPolicy>,
+            bool,
+        ); 7] = [
             ("pipeline off", false, None, false),
             ("interval 0", true, None, false),
             ("interval 15000", true, Some(ckpt_15000), false),
             ("interval never", true, Some(ckpt_never()), false),
             ("interval 0, EVM fast path", true, None, true),
-            ("interval 15000, EVM fast path", true, Some(ckpt_15000), true),
-            ("interval never, EVM fast path", true, Some(ckpt_never()), true),
+            (
+                "interval 15000, EVM fast path",
+                true,
+                Some(ckpt_15000),
+                true,
+            ),
+            (
+                "interval never, EVM fast path",
+                true,
+                Some(ckpt_never()),
+                true,
+            ),
         ];
         let mut dumps = Vec::new();
         for (what, on, ckpt, fast) in configs {
@@ -26696,7 +26756,11 @@ mod crash_recovery_tests {
             dispatch_and_execute(&ctx, &db, &blocks[1]);
             assert!(!ctx.exec_failed.load(Ordering::SeqCst), "{what}: block 2");
             if fast {
-                assert_eq!(last_job(&ctx), Some(2), "{what}: the EVM block is pipelined");
+                assert_eq!(
+                    last_job(&ctx),
+                    Some(2),
+                    "{what}: the EVM block is pipelined"
+                );
                 if ckpt.is_some() {
                     assert!(ctx.flush_worker.as_ref().unwrap().wait_idle());
                     assert_eq!(
@@ -27640,8 +27704,16 @@ mod crash_recovery_tests {
                 .is_none(),
             "{what}: no status row of {h}"
         );
-        assert_eq!(o0_rows_at(db, torus_state::cf::CF_RECEIPTS, h), 0, "{what}: no receipt of {h}");
-        assert_eq!(o0_hash_index_at(db, h), 0, "{what}: no hash -> number row of {h}");
+        assert_eq!(
+            o0_rows_at(db, torus_state::cf::CF_RECEIPTS, h),
+            0,
+            "{what}: no receipt of {h}"
+        );
+        assert_eq!(
+            o0_hash_index_at(db, h),
+            0,
+            "{what}: no hash -> number row of {h}"
+        );
     }
 
     /// Item 7 option 0 (task 3.7): [`r02_assert_fault_fail_stops_then_replays`]
@@ -27667,7 +27739,10 @@ mod crash_recovery_tests {
         }
         assert!(ctx.pipeline_barrier());
         assert!(!ctx.exec_failed.load(Ordering::SeqCst), "fast: control");
-        assert_eq!(ctx.test_paths.lock().unwrap().get("block.pipelined.evm"), Some(&1));
+        assert_eq!(
+            ctx.test_paths.lock().unwrap().get("block.pipelined.evm"),
+            Some(&1)
+        );
         drop(ctx);
         check(&db_ref);
 
@@ -27689,11 +27764,21 @@ mod crash_recovery_tests {
             "fast {fault:?}: the faulted EVM block took the fast path"
         );
         ctx.pipeline_barrier();
-        assert!(ctx.exec_failed.load(Ordering::SeqCst), "fast {fault:?}: must fail-stop");
+        assert!(
+            ctx.exec_failed.load(Ordering::SeqCst),
+            "fast {fault:?}: must fail-stop"
+        );
         drop(ctx);
-        assert_eq!(read_native_applied_height(&db), prefix.last().map(|b| b.header.height));
+        assert_eq!(
+            read_native_applied_height(&db),
+            prefix.last().map(|b| b.header.height)
+        );
         r02_assert_no_side_rows(&db, top, &format!("fast {fault:?}"));
-        assert_dumps_equal(&before, &dump_all_cfs(&db), "R02 fast: nothing of the block flushed");
+        assert_dumps_equal(
+            &before,
+            &dump_all_cfs(&db),
+            "R02 fast: nothing of the block flushed",
+        );
         drop(db);
         let db = StateDb::open(&dir).expect("reopen");
         torus_state::running_hash::capture_begin(&db);
@@ -27706,9 +27791,17 @@ mod crash_recovery_tests {
             .iter()
             .map(|(h, _)| *h)
             .collect();
-        assert_eq!(rehashed, vec![top], "fast {fault:?}: the replay re-hashes the faulted height");
+        assert_eq!(
+            rehashed,
+            vec![top],
+            "fast {fault:?}: the replay re-hashes the faulted height"
+        );
         assert_eq!(read_native_applied_height(&db), Some(top));
-        assert_dumps_equal(&dump_all_cfs(&db_ref), &dump_all_cfs(&db), "R02 fast: replay vs no fault");
+        assert_dumps_equal(
+            &dump_all_cfs(&db_ref),
+            &dump_all_cfs(&db),
+            "R02 fast: replay vs no fault",
+        );
     }
 
     /// The `ClaimRewards` action R02 branch 2 replays: `nonce` is in the
@@ -28219,11 +28312,16 @@ mod crash_recovery_tests {
             assert_eq!(r02_receipt_status(db, 2), Some(true));
         });
         // Item 7 option 0 (task 3.7): the same on the EVM fast path.
-        r02_assert_fault_fail_stops_then_replays_fast(&blocks, &|db| r02_fund(db, &key), ReplayFault::EvmLocalFault, &|db| {
-            assert!(r02_nonce_consumed(db, &b));
-            assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
-            assert_eq!(r02_receipt_status(db, 2), Some(true));
-        });
+        r02_assert_fault_fail_stops_then_replays_fast(
+            &blocks,
+            &|db| r02_fund(db, &key),
+            ReplayFault::EvmLocalFault,
+            &|db| {
+                assert!(r02_nonce_consumed(db, &b));
+                assert_eq!(r02_evm_nonce(db, &key), 1, "the EVM tx ran");
+                assert_eq!(r02_receipt_status(db, 2), Some(true));
+            },
+        );
     }
 
     /// Item 7 option 0 (task 2.3): the serial EVM section's read of the EVM
@@ -28540,7 +28638,11 @@ mod crash_recovery_tests {
                 .iter()
                 .map(|(h, _)| *h)
                 .collect();
-            assert_eq!(rehashed, vec![2], "on={on} fast={fast}: the replay re-hashes the faulted height");
+            assert_eq!(
+                rehashed,
+                vec![2],
+                "on={on} fast={fast}: the replay re-hashes the faulted height"
+            );
             assert_eq!(read_native_applied_height(&db), Some(2), "on={on}");
             assert_dumps_equal(
                 &dump_all_cfs(&db_ref),
@@ -30690,7 +30792,10 @@ mod crash_recovery_tests {
                 if e < from || e % 5 != 0 || (e - 3..=e + 1).any(special) {
                     return None;
                 }
-                let reuse = evm_heights.iter().copied().find(|&r| r > e + 1 && !special(r))?;
+                let reuse = evm_heights
+                    .iter()
+                    .copied()
+                    .find(|&r| r > e + 1 && !special(r))?;
                 Some(O0Eip161 {
                     seed,
                     recreate,
@@ -31255,9 +31360,17 @@ mod crash_recovery_tests {
                     to: z,
                 },
             )],
-            vec![sign(O0_EMPTIED[0], 2, NativeAction::TransferToPerp { amount: unit(5) })],
+            vec![sign(
+                O0_EMPTIED[0],
+                2,
+                NativeAction::TransferToPerp { amount: unit(5) },
+            )],
             vec![],
-            vec![sign(O0_EMPTIED[0], 4, NativeAction::TransferToSpot { amount: unit(2) })],
+            vec![sign(
+                O0_EMPTIED[0],
+                4,
+                NativeAction::TransferToSpot { amount: unit(2) },
+            )],
             vec![],
         ];
         let mut chain = Vec::new();
@@ -31439,7 +31552,9 @@ mod crash_recovery_tests {
                     .filter(|r| r.key == key && r.height == c.refund && r.reader == Reader::Native)
                     .collect();
                 let what = format!("{cfg:?} {c:?}: {at:?}");
-                let first = at.first().unwrap_or_else(|| panic!("no native read of Z: {what}"));
+                let first = at
+                    .first()
+                    .unwrap_or_else(|| panic!("no native read of Z: {what}"));
                 match c.recreate {
                     O0Recreate::SameBlock => {
                         assert_eq!(
@@ -31765,7 +31880,8 @@ mod crash_recovery_tests {
                 let x = o0_sha(&refs);
                 if let Some(old) = before.get(&h) {
                     if *old != x {
-                        self.errors.push(format!("h_n of {h} changed when hashed again"));
+                        self.errors
+                            .push(format!("h_n of {h} changed when hashed again"));
                     }
                 }
                 self.hn.insert(h, x);
@@ -32339,8 +32455,11 @@ mod crash_recovery_tests {
             .collect();
         let (rh_height, rh) =
             torus_state::running_hash::read_running_hash(db).expect("a running hash");
-        let (incremental, _) =
-            torus_state::incremental::incremental_evm_root(db, &revm::database::BundleState::default()).unwrap();
+        let (incremental, _) = torus_state::incremental::incremental_evm_root(
+            db,
+            &revm::database::BundleState::default(),
+        )
+        .unwrap();
         let full = torus_state::trie::compute_state_root_from_db(db).unwrap();
         assert_eq!(
             incremental, full,
@@ -32885,7 +33004,11 @@ mod crash_recovery_tests {
         let (nodes, finals) = o0_run_agreeing(&blocks, &cfgs);
         for node in &nodes {
             let holds = node.ctl.as_ref().unwrap().st.lock().unwrap().holds;
-            assert!(holds >= 10, "{:?}: the controller parked W {holds} times", node.cfg);
+            assert!(
+                holds >= 10,
+                "{:?}: the controller parked W {holds} times",
+                node.cfg
+            );
         }
         o0_assert_golden(&nodes, &finals);
     }
@@ -33021,9 +33144,11 @@ mod crash_recovery_tests {
                     vec![signed_eip1559_gas(
                         &oracle_key(O0_USERS[0]),
                         evm_nonce - 1,
-                        alloy_primitives::TxKind::Call(torus_core::precompiles::precompile_address(
-                            torus_core::precompiles::ADDR_LOCKBOX,
-                        )),
+                        alloy_primitives::TxKind::Call(
+                            torus_core::precompiles::precompile_address(
+                                torus_core::precompiles::ADDR_LOCKBOX,
+                            ),
+                        ),
                         o0_call("depositToNative(uint128)", &[o0_word(wei)]),
                         U256::from(wei),
                         300_000,
@@ -33035,7 +33160,10 @@ mod crash_recovery_tests {
                         torus_core::precompiles::ADDR_BALANCE_READER,
                     ))
                     .to_vec();
-                    input.extend(o0_call("getBalances(address)", &[o0_word_addr(oracle_addr(trader))]));
+                    input.extend(o0_call(
+                        "getBalances(address)",
+                        &[o0_word_addr(oracle_addr(trader))],
+                    ));
                     vec![signed_eip1559_gas(
                         &oracle_key(O0_USERS[0]),
                         evm_nonce - 1,
@@ -33050,9 +33178,11 @@ mod crash_recovery_tests {
                     vec![signed_eip1559_gas(
                         &oracle_key(O0_USERS[0]),
                         evm_nonce - 1,
-                        alloy_primitives::TxKind::Call(torus_core::precompiles::precompile_address(
-                            torus_core::precompiles::ADDR_BALANCE_READER,
-                        )),
+                        alloy_primitives::TxKind::Call(
+                            torus_core::precompiles::precompile_address(
+                                torus_core::precompiles::ADDR_BALANCE_READER,
+                            ),
+                        ),
                         o0_call("getBalances(address)", &[o0_word_addr(oracle_addr(trader))]),
                         U256::ZERO,
                         300_000,
@@ -33647,7 +33777,8 @@ mod crash_recovery_tests {
             StateBackend::iterate_cf(&db, torus_state::cf::CF_NATIVE_HASHED, None).unwrap();
         assert!(!mirror.is_empty());
         for (k, _) in &mirror {
-            db.put_cf_raw(torus_state::cf::CF_NATIVE_HASHED, k, &[0]).unwrap();
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_HASHED, k, &[0])
+                .unwrap();
         }
         let mirror_rows = |db: &StateDb| {
             StateBackend::iterate_cf(db, torus_state::cf::CF_NATIVE_HASHED, None).unwrap()
@@ -33657,9 +33788,17 @@ mod crash_recovery_tests {
         let pre = o0_hashed_account(&b.db, trader);
         assert_ne!(pre, want);
         b.run(&blocks[..1]);
-        assert_eq!(mirror_rows(&b.db), before, "trie maintenance failed: no mirror row rewritten");
+        assert_eq!(
+            mirror_rows(&b.db),
+            before,
+            "trie maintenance failed: no mirror row rewritten"
+        );
         let w = b.ctx.as_ref().unwrap().flush_worker.as_ref().unwrap();
-        assert_eq!(w.durable_height(), 1, "TrieStale: the batch landed, W goes on");
+        assert_eq!(
+            w.durable_height(),
+            1,
+            "TrieStale: the batch landed, W goes on"
+        );
         assert_eq!(read_native_applied_height(&b.db), Some(1));
         assert_eq!(
             o0_hashed_account(&b.db, trader),
@@ -33688,19 +33827,32 @@ mod crash_recovery_tests {
         let (config, db) = o0_fixture();
         torus_state::native_trie::build_native_trie_to_cf(&db).unwrap();
         for (k, _) in mirror_rows(&db) {
-            db.put_cf_raw(torus_state::cf::CF_NATIVE_HASHED, &k, &[0]).unwrap();
+            db.put_cf_raw(torus_state::cf::CF_NATIVE_HASHED, &k, &[0])
+                .unwrap();
         }
         let before = mirror_rows(&db);
         let mut b = O0Node::with_fixture(O0Cfg::piped(P5Ckpt::Every5, O0Run::D), (config, db));
         b.run(&blocks);
-        assert_eq!(mirror_rows(&b.db), before, "trie maintenance failed: no mirror row rewritten");
+        assert_eq!(
+            mirror_rows(&b.db),
+            before,
+            "trie maintenance failed: no mirror row rewritten"
+        );
         let w = b.ctx.as_ref().unwrap().flush_worker.as_ref().unwrap();
-        assert_eq!(w.durable_height(), 5, "TrieStale: the window landed, W goes on");
+        assert_eq!(
+            w.durable_height(),
+            5,
+            "TrieStale: the window landed, W goes on"
+        );
         let l = b.ledger();
         assert_eq!(l.calls, vec![(WCheckpoint, 5)]);
         l.assert_complete(5, "TrieStale checkpoint at 5");
         drop(l);
-        assert_eq!(o0_hashed_account(&b.db, trader), want, "the checkpoint resynced");
+        assert_eq!(
+            o0_hashed_account(&b.db, trader),
+            want,
+            "the checkpoint resynced"
+        );
     }
 
     /// Plan task 0.4: the hook snapshot drops the dispatcher's header and
@@ -33828,7 +33980,12 @@ mod crash_recovery_tests {
         assert!(gate.wait_received(2), "W received the EVM block's job");
         let ctx = node.ctx.as_ref().unwrap();
         let sender = oracle_addr(O0_USERS[0]);
-        let parent = ctx.last_job.lock().unwrap().clone().expect("pipelined: a parent layer");
+        let parent = ctx
+            .last_job
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("pipelined: a parent layer");
         assert_eq!(parent.height(), 2);
         let row = parent
             .lookup_row(torus_state::cf::CF_ACCOUNTS, sender.as_slice())
@@ -33840,17 +33997,46 @@ mod crash_recovery_tests {
             "the EVM tx executed"
         );
         assert_eq!(read_native_applied_height(&node.db), Some(1), "W holds 2");
-        assert_eq!(o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 2), 0, "no receipt on E");
-        assert_eq!(o0_hash_index_at(&node.db, 2), 0, "no hash -> number row on E");
+        assert_eq!(
+            o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 2),
+            0,
+            "no receipt on E"
+        );
+        assert_eq!(
+            o0_hash_index_at(&node.db, 2),
+            0,
+            "no hash -> number row on E"
+        );
         let p = o0_paths(&node);
-        for k in ["block.pipelined.evm", "evm.fast", "evm.absorb", "evm.job", "handoff.flush"] {
+        for k in [
+            "block.pipelined.evm",
+            "evm.fast",
+            "evm.absorb",
+            "evm.job",
+            "handoff.flush",
+        ] {
             assert!(p.get(k).copied().unwrap_or(0) >= 1, "{k}: {p:?}");
         }
         assert_eq!(p.get("block.serial.evm"), None, "{p:?}");
         gate.release();
-        assert!(node.ctx.as_ref().unwrap().flush_worker.as_ref().unwrap().wait_idle());
-        assert_eq!(o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 2), 1, "W wrote the receipt");
-        assert_eq!(o0_hash_index_at(&node.db, 2), 1, "W wrote the hash -> number row");
+        assert!(node
+            .ctx
+            .as_ref()
+            .unwrap()
+            .flush_worker
+            .as_ref()
+            .unwrap()
+            .wait_idle());
+        assert_eq!(
+            o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 2),
+            1,
+            "W wrote the receipt"
+        );
+        assert_eq!(
+            o0_hash_index_at(&node.db, 2),
+            1,
+            "W wrote the hash -> number row"
+        );
         let p = o0_paths(&node);
         assert_eq!(p.get("w.evm_side.flush"), Some(&1), "{p:?}");
         assert_eq!(p.get("w.evm_step.flush"), Some(&1), "{p:?}");
@@ -33881,13 +34067,20 @@ mod crash_recovery_tests {
             };
             let t1 = gate.ticket();
             gate.hold(t1);
-            assert_eq!(gate.stats().timeouts, 1, "rearm {rearm}: no release, timed out");
+            assert_eq!(
+                gate.stats().timeouts,
+                1,
+                "rearm {rearm}: no release, timed out"
+            );
             let t2 = gate.ticket();
             let start = std::time::Instant::now();
             gate.hold(t2);
             let s = gate.stats();
             if rearm {
-                assert!(start.elapsed() >= DeferredGate::TIMEOUT, "held again: {s:?}");
+                assert!(
+                    start.elapsed() >= DeferredGate::TIMEOUT,
+                    "held again: {s:?}"
+                );
                 assert_eq!((s.timeouts, s.held, s.open), (2, 0, false), "{s:?}");
                 let t3 = gate.ticket();
                 gate.release();
@@ -34008,7 +34201,11 @@ mod crash_recovery_tests {
         let mut node = O0Node::new(O0Cfg::piped(P5Ckpt::Every5, O0Run::G).fast());
         node.run(&blocks);
         let ctx = node.ctx.as_ref().expect("no fail-stop");
-        assert_eq!(ctx.ckpt.lock().unwrap().shared_fallbacks, 0, "L / C never shared");
+        assert_eq!(
+            ctx.ckpt.lock().unwrap().shared_fallbacks,
+            0,
+            "L / C never shared"
+        );
         assert_eq!(
             ctx.resident_books.lock().unwrap().rows_shared_fallbacks(),
             0,
@@ -34017,7 +34214,11 @@ mod crash_recovery_tests {
         let journal = node
             .probe
             .total(|r, l, _| r == Reader::Journal && l.frozen());
-        assert!(journal.hits > 0, "journal reads through the layers:\n{}", node.probe.report());
+        assert!(
+            journal.hits > 0,
+            "journal reads through the layers:\n{}",
+            node.probe.report()
+        );
         let p = o0_paths(&node);
         assert!(p.get("evm.fast").copied().unwrap_or(0) >= 10, "{p:?}");
         let _ = Layer::Own;
@@ -34043,13 +34244,24 @@ mod crash_recovery_tests {
         ];
         let nodes = o0_run(&blocks, &cfgs, &[]);
         let s = &nodes[0];
-        assert!(s.ledger().status[&3].is_some(), "{kind:?}: S has a status row at 3");
+        assert!(
+            s.ledger().status[&3].is_some(),
+            "{kind:?}: S has a status row at 3"
+        );
         let fin = o0_final(s, &blocks);
         for node in &nodes {
             let what = format!("{kind:?} {:?}", node.cfg);
             node.ledger().assert_complete(6, &what);
-            assert_eq!(o0_hash_index_at(&node.db, 3), hash_index, "{what}: hash -> number");
-            assert_eq!(o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 3), 0, "{what}: receipts");
+            assert_eq!(
+                o0_hash_index_at(&node.db, 3),
+                hash_index,
+                "{what}: hash -> number"
+            );
+            assert_eq!(
+                o0_rows_at(&node.db, torus_state::cf::CF_RECEIPTS, 3),
+                0,
+                "{what}: receipts"
+            );
             assert!(
                 node.db
                     .get_cf_raw(torus_state::cf::CF_BLOCK_ACTION_STATUS, &3u64.to_be_bytes())
@@ -34087,8 +34299,14 @@ mod crash_recovery_tests {
     #[test]
     fn fast_path_failed_evm_section_writes_status_with_marker() {
         for (cfg, p) in o0_fast_case(O0Hand::Failed, 0) {
-            assert!(o0_has(&p, "evm.failed") && o0_has(&p, "marker.evm_status"), "{cfg:?}: {p:?}");
-            assert!(!o0_has(&p, "marker.evm_side"), "{cfg:?}: no EVM part: {p:?}");
+            assert!(
+                o0_has(&p, "evm.failed") && o0_has(&p, "marker.evm_status"),
+                "{cfg:?}: {p:?}"
+            );
+            assert!(
+                !o0_has(&p, "marker.evm_side"),
+                "{cfg:?}: no EVM part: {p:?}"
+            );
             if cfg.ckpt == P5Ckpt::PerBlock {
                 assert!(o0_has(&p, "w.status.marker"), "{cfg:?}: {p:?}");
                 assert!(!o0_has(&p, "w.evm_side.marker"), "{cfg:?}: {p:?}");
@@ -34101,13 +34319,22 @@ mod crash_recovery_tests {
     /// The flags of an all-skipped section `Ok` without a native phase
     /// (C11b; C11d with an interval: the Marker becomes a Digest).
     fn o0_assert_all_skipped_marker(cfg: O0Cfg, p: &BTreeMap<&'static str, u64>) {
-        assert!(o0_has(p, "evm.ok.all_skipped") && o0_has(p, "marker.evm_side"), "{cfg:?}: {p:?}");
+        assert!(
+            o0_has(p, "evm.ok.all_skipped") && o0_has(p, "marker.evm_side"),
+            "{cfg:?}: {p:?}"
+        );
         if cfg.ckpt == P5Ckpt::PerBlock {
-            assert!(o0_has(p, "w.evm_side.marker") && o0_has(p, "w.status.marker"), "{cfg:?}: {p:?}");
+            assert!(
+                o0_has(p, "w.evm_side.marker") && o0_has(p, "w.status.marker"),
+                "{cfg:?}: {p:?}"
+            );
         } else {
             assert!(o0_has(p, "w.evm_side.digest"), "{cfg:?}: {p:?}");
         }
-        assert!(!o0_has(p, "w.evm_step.flush") && !o0_has(p, "w.evm_fold.digest"), "{cfg:?}: no trie work: {p:?}");
+        assert!(
+            !o0_has(p, "w.evm_step.flush") && !o0_has(p, "w.evm_fold.digest"),
+            "{cfg:?}: no trie work: {p:?}"
+        );
     }
 
     /// Plan task 3.3 (C11b): every tx one nonce above its sender's
@@ -34135,14 +34362,23 @@ mod crash_recovery_tests {
     #[test]
     fn fast_path_all_skipped_block_with_native_phase_writes_hash_index() {
         for (cfg, p) in o0_fast_case(O0Hand::SkippedNative, 1) {
-            assert!(o0_has(&p, "evm.ok.all_skipped") && o0_has(&p, "evm.job"), "{cfg:?}: {p:?}");
-            assert!(!o0_has(&p, "marker.evm_status"), "{cfg:?}: a native phase: {p:?}");
+            assert!(
+                o0_has(&p, "evm.ok.all_skipped") && o0_has(&p, "evm.job"),
+                "{cfg:?}: {p:?}"
+            );
+            assert!(
+                !o0_has(&p, "marker.evm_status"),
+                "{cfg:?}: a native phase: {p:?}"
+            );
             if cfg.ckpt == P5Ckpt::PerBlock {
                 assert!(o0_has(&p, "w.evm_side.flush"), "{cfg:?}: {p:?}");
             } else {
                 assert!(o0_has(&p, "w.evm_side.digest"), "{cfg:?}: {p:?}");
             }
-            assert!(!o0_has(&p, "w.evm_step.flush") && !o0_has(&p, "w.evm_fold.digest"), "{cfg:?}: {p:?}");
+            assert!(
+                !o0_has(&p, "w.evm_step.flush") && !o0_has(&p, "w.evm_fold.digest"),
+                "{cfg:?}: {p:?}"
+            );
         }
     }
 
@@ -34191,12 +34427,13 @@ mod crash_recovery_tests {
         latch: O0Latch,
         replay_crash: bool,
     ) -> Result<Vec<u64>, String> {
-        use torus_state::cf::{
-            CF_BLOCK_ACTION_STATUS, CF_RECEIPTS, CF_TX_HASH_TO_LOCATION,
-        };
+        use torus_state::cf::{CF_BLOCK_ACTION_STATUS, CF_RECEIPTS, CF_TX_HASH_TO_LOCATION};
         let marker = |db: &StateDb| read_native_applied_height(db).unwrap_or(0);
         if marker(&node.db) != d {
-            return Err(format!("step 1: marker {} with W held, want {d}", marker(&node.db)));
+            return Err(format!(
+                "step 1: marker {} with W held, want {d}",
+                marker(&node.db)
+            ));
         }
         let gate = node.gate.clone().expect("a pipelined node");
         {
@@ -34318,7 +34555,10 @@ mod crash_recovery_tests {
                 return Err("step 5: the replay fail-stopped".into());
             }
             if top.height != last {
-                return Err(format!("step 5: the replay reached {}, want {last}", top.height));
+                return Err(format!(
+                    "step 5: the replay reached {}, want {last}",
+                    top.height
+                ));
             }
             let want: Vec<u64> = (from + 1..=last).collect();
             if got != want {
@@ -34362,7 +34602,9 @@ mod crash_recovery_tests {
         let d = read_native_applied_height(&node.db).unwrap_or(0);
         let held = || match ckpt {
             P5Ckpt::PerBlock => assert!(gate.wait_received(hold_at), "W received the held job"),
-            _ => o0_wait("the checkpoint parked", || gate.parked_checkpoint().is_some()),
+            _ => o0_wait("the checkpoint parked", || {
+                gate.parked_checkpoint().is_some()
+            }),
         };
         for b in &blocks[hold_at as usize - 1..fault_at as usize - 1] {
             o0_step(&node, b);
@@ -34393,7 +34635,11 @@ mod crash_recovery_tests {
             .unwrap_or_else(|d| panic!("{what}: diverged at {}: {}", d.height, d.what));
         assert!(c.hn == n && c.status == n && c.side == n, "{what}: {c:?}");
         assert!(o0_dump_keys_covered(&s.ledger(), &node.ledger()), "{what}");
-        assert_eq!(o0_final(&s, blocks), o0_final(&node, blocks), "{what}: final state");
+        assert_eq!(
+            o0_final(&s, blocks),
+            o0_final(&node, blocks),
+            "{what}: final state"
+        );
     }
 
     /// The hand stream of the fault / crash tests: `n` blocks, `Native`
@@ -34428,8 +34674,18 @@ mod crash_recovery_tests {
         disarm(&mut node);
         let p = o0_paths(&node);
         assert!(o0_has(&p, flag), "{what}: {p:?}");
-        assert!(o0_has(&p, "block.pipelined.evm"), "{what}: on the fast path: {p:?}");
-        assert!(node.ctx.as_ref().unwrap().exec_failed.load(Ordering::SeqCst), "{what}");
+        assert!(
+            o0_has(&p, "block.pipelined.evm"),
+            "{what}: on the fast path: {p:?}"
+        );
+        assert!(
+            node.ctx
+                .as_ref()
+                .unwrap()
+                .exec_failed
+                .load(Ordering::SeqCst),
+            "{what}"
+        );
         let replayed = o0_crash(&mut node, d, fault_at, O0Latch::E, false)
             .unwrap_or_else(|e| panic!("{what}: {e}"));
         assert_eq!(replayed, (d + 1..=fault_at).collect::<Vec<_>>(), "{what}");
@@ -34492,7 +34748,10 @@ mod crash_recovery_tests {
             (node, d)
         };
         assert_eq!(d, 5, "{what}: the checkpoint at 5 is durable, 10 held");
-        assert!(!gate.fail_next.load(Ordering::SeqCst), "{what}: the merge failed");
+        assert!(
+            !gate.fail_next.load(Ordering::SeqCst),
+            "{what}: the merge failed"
+        );
         let p = o0_paths(&node);
         assert!(o0_has(&p, "evm.local_fault"), "{what}: {p:?}");
         let journal_deferred = node.probe.total(|r, l, cf| {
@@ -34500,9 +34759,12 @@ mod crash_recovery_tests {
                 && l == torus_state::probes::Layer::LDeferred
                 && cf == torus_state::cf::CF_NATIVE_BALANCES
         });
-        assert_eq!(journal_deferred.hits, 0, "{what}: no deferred answer, an error");
-        let replayed = o0_crash(&mut node, d, 13, O0Latch::E, false)
-            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(
+            journal_deferred.hits, 0,
+            "{what}: no deferred answer, an error"
+        );
+        let replayed =
+            o0_crash(&mut node, d, 13, O0Latch::E, false).unwrap_or_else(|e| panic!("{what}: {e}"));
         assert_eq!(replayed, (6..=13).collect::<Vec<_>>(), "{what}");
         node.ctx.as_ref().unwrap().ckpt.lock().unwrap().test_gate = None;
         o0_assert_matches_serial(node, &blocks, 13, what);
@@ -34513,12 +34775,30 @@ mod crash_recovery_tests {
     /// EVM block (`fail_stop_on_fault`).
     #[test]
     fn fast_path_absorb_put_fault_fail_stops() {
-        let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_replay_fault = Some(ReplayFault::AbsorbPut);
+        let arm = |n: &mut O0Node| {
+            n.ctx.as_mut().unwrap().test_replay_fault = Some(ReplayFault::AbsorbPut)
+        };
         let disarm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_replay_fault = None;
         let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
-        o0_fault_case(P5Ckpt::PerBlock, &blocks, 3, 4, "evm.absorb_fault", arm, disarm);
+        o0_fault_case(
+            P5Ckpt::PerBlock,
+            &blocks,
+            3,
+            4,
+            "evm.absorb_fault",
+            arm,
+            disarm,
+        );
         let blocks = o0_fault_blocks(15, &[(13, O0Hand::Evm)]);
-        o0_fault_case(P5Ckpt::Every5, &blocks, 10, 13, "evm.absorb_fault", arm, disarm);
+        o0_fault_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            "evm.absorb_fault",
+            arm,
+            disarm,
+        );
     }
 
     /// Plan task 3.5: one crash point. The fast node runs `blocks` with W
@@ -34542,7 +34822,14 @@ mod crash_recovery_tests {
         let what = format!("{ckpt:?} {what}");
         let (mut node, d) = o0_held_run(ckpt, blocks, hold_at, last, arm);
         if latch == O0Latch::E {
-            assert!(node.ctx.as_ref().unwrap().exec_failed.load(Ordering::SeqCst), "{what}: E latched");
+            assert!(
+                node.ctx
+                    .as_ref()
+                    .unwrap()
+                    .exec_failed
+                    .load(Ordering::SeqCst),
+                "{what}: E latched"
+            );
         }
         let replayed = o0_crash(&mut node, d, last, latch, replay_crash)
             .unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -34565,10 +34852,33 @@ mod crash_recovery_tests {
     fn fast_path_crash_before_absorb_replays() {
         let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_before_absorb = true;
         let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
-        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 3, 4, O0Latch::E, false, &[4], arm, "before absorb");
-        assert!(o0_has(&p, "crash.before_absorb") && !o0_has(&p, "evm.absorb_fault"), "{p:?}");
+        let p = o0_crash_case(
+            P5Ckpt::PerBlock,
+            &blocks,
+            3,
+            4,
+            O0Latch::E,
+            false,
+            &[4],
+            arm,
+            "before absorb",
+        );
+        assert!(
+            o0_has(&p, "crash.before_absorb") && !o0_has(&p, "evm.absorb_fault"),
+            "{p:?}"
+        );
         let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (13, O0Hand::Evm)]);
-        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, false, &[8, 13], arm, "before absorb");
+        o0_crash_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            O0Latch::E,
+            false,
+            &[8, 13],
+            arm,
+            "before absorb",
+        );
     }
 
     /// Plan task 3.5 (C19): a crash after the absorb, before the hand-off
@@ -34577,10 +34887,33 @@ mod crash_recovery_tests {
     fn fast_path_crash_after_absorb_replays() {
         let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_after_evm_section = true;
         let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
-        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 3, 4, O0Latch::E, false, &[4], arm, "after absorb");
-        assert!(o0_has(&p, "crash.after_evm_section") && o0_has(&p, "evm.absorb"), "{p:?}");
+        let p = o0_crash_case(
+            P5Ckpt::PerBlock,
+            &blocks,
+            3,
+            4,
+            O0Latch::E,
+            false,
+            &[4],
+            arm,
+            "after absorb",
+        );
+        assert!(
+            o0_has(&p, "crash.after_evm_section") && o0_has(&p, "evm.absorb"),
+            "{p:?}"
+        );
         let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (13, O0Hand::Evm)]);
-        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, false, &[8, 13], arm, "after absorb");
+        o0_crash_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            O0Latch::E,
+            false,
+            &[8, 13],
+            arm,
+            "after absorb",
+        );
     }
 
     /// Plan task 3.5 (C19): a crash after the hand-off, before the write:
@@ -34590,9 +34923,29 @@ mod crash_recovery_tests {
     #[test]
     fn fast_path_crash_after_handoff_replays() {
         let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
-        o0_crash_case(P5Ckpt::PerBlock, &blocks, 4, 4, O0Latch::WFail, false, &[4], |_| {}, "after hand-off");
+        o0_crash_case(
+            P5Ckpt::PerBlock,
+            &blocks,
+            4,
+            4,
+            O0Latch::WFail,
+            false,
+            &[4],
+            |_| {},
+            "after hand-off",
+        );
         let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (12, O0Hand::Evm)]);
-        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::WFail, false, &[8, 12], |_| {}, "after hand-off");
+        o0_crash_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            O0Latch::WFail,
+            false,
+            &[8, 12],
+            |_| {},
+            "after hand-off",
+        );
     }
 
     /// Plan task 3.5 (C19): a crash inside W's EVM trie step (the panic
@@ -34601,11 +34954,37 @@ mod crash_recovery_tests {
     #[test]
     fn fast_path_crash_in_w_evm_trie_step_replays() {
         let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
-        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 4, 4, O0Latch::WPanic, false, &[4], |_| {}, "W EVM step");
-        assert!(o0_has(&p, "w.evm_step.flush"), "the step ran (and panicked): {p:?}");
+        let p = o0_crash_case(
+            P5Ckpt::PerBlock,
+            &blocks,
+            4,
+            4,
+            O0Latch::WPanic,
+            false,
+            &[4],
+            |_| {},
+            "W EVM step",
+        );
+        assert!(
+            o0_has(&p, "w.evm_step.flush"),
+            "the step ran (and panicked): {p:?}"
+        );
         let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (12, O0Hand::Evm)]);
-        let p = o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::WPanic, false, &[8, 12], |_| {}, "W EVM step");
-        assert!(o0_has(&p, "w.evm_step.checkpoint"), "the step ran (and panicked): {p:?}");
+        let p = o0_crash_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            O0Latch::WPanic,
+            false,
+            &[8, 12],
+            |_| {},
+            "W EVM step",
+        );
+        assert!(
+            o0_has(&p, "w.evm_step.checkpoint"),
+            "the step ran (and panicked): {p:?}"
+        );
     }
 
     /// Plan task 3.5 (C19): a crash during the replay of an EVM block: the
@@ -34617,7 +34996,17 @@ mod crash_recovery_tests {
     fn fast_path_crash_during_replay_of_an_evm_block() {
         let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_after_evm_section = true;
         let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (13, O0Hand::Evm)]);
-        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, true, &[8, 13], arm, "replay crash");
+        o0_crash_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            O0Latch::E,
+            true,
+            &[8, 13],
+            arm,
+            "replay crash",
+        );
     }
 
     /// Plan task 3.5 (C19, R1): a crash with an all-skipped block's Marker
@@ -34628,10 +35017,30 @@ mod crash_recovery_tests {
     fn fast_path_crash_with_all_skipped_marker_held_replays_its_hash_index() {
         let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_before_absorb = true;
         let blocks = o0_fault_blocks(6, &[(3, O0Hand::NonceSkipped), (4, O0Hand::Evm)]);
-        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 3, 4, O0Latch::E, false, &[3, 4], arm, "Marker held");
+        let p = o0_crash_case(
+            P5Ckpt::PerBlock,
+            &blocks,
+            3,
+            4,
+            O0Latch::E,
+            false,
+            &[3, 4],
+            arm,
+            "Marker held",
+        );
         assert!(o0_has(&p, "marker.evm_side"), "{p:?}");
         let blocks = o0_fault_blocks(15, &[(12, O0Hand::Skipped), (13, O0Hand::Evm)]);
-        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, false, &[12, 13], arm, "Marker held");
+        o0_crash_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            O0Latch::E,
+            false,
+            &[12, 13],
+            arm,
+            "Marker held",
+        );
     }
 
     /// Plan task 3.5 (C19): repeated crashes on one node, each through the
@@ -34639,11 +35048,15 @@ mod crash_recovery_tests {
     /// the same node runs on), and the whole run equals S.
     #[test]
     fn fast_path_repeated_crashes_replay_to_serial() {
-        let blocks = o0_fault_blocks(12, &[(4, O0Hand::Evm), (9, O0Hand::Evm), (11, O0Hand::Reader)]);
+        let blocks = o0_fault_blocks(
+            12,
+            &[(4, O0Hand::Evm), (9, O0Hand::Evm), (11, O0Hand::Reader)],
+        );
         let (mut node, d) = o0_held_run(P5Ckpt::PerBlock, &blocks, 3, 4, |n| {
             n.ctx.as_mut().unwrap().test_crash_after_evm_section = true
         });
-        let first = o0_crash(&mut node, d, 4, O0Latch::E, false).unwrap_or_else(|e| panic!("crash 1: {e}"));
+        let first =
+            o0_crash(&mut node, d, 4, O0Latch::E, false).unwrap_or_else(|e| panic!("crash 1: {e}"));
         assert_eq!(first, vec![3, 4]);
         node.run(&blocks[4..8]);
         let gate = node.gate.clone().unwrap();
@@ -34652,8 +35065,8 @@ mod crash_recovery_tests {
         assert_eq!(d, 8);
         o0_step(&node, &blocks[8]);
         assert!(gate.wait_received(9));
-        let second =
-            o0_crash(&mut node, d, 9, O0Latch::WPanic, false).unwrap_or_else(|e| panic!("crash 2: {e}"));
+        let second = o0_crash(&mut node, d, 9, O0Latch::WPanic, false)
+            .unwrap_or_else(|e| panic!("crash 2: {e}"));
         assert_eq!(second, vec![9]);
         assert_eq!(node.restarts, 2);
         o0_assert_matches_serial(node, &blocks, 9, "repeated crashes");
@@ -34671,17 +35084,29 @@ mod crash_recovery_tests {
         for held in [3u64, 4] {
             let (mut node, d) = o0_held_run(P5Ckpt::PerBlock, &blocks, held, held, |_| {});
             assert_eq!(d, held - 1);
-            assert_eq!(read_native_applied_height(&node.db), Some(d), "W holds {held}");
+            assert_eq!(
+                read_native_applied_height(&node.db),
+                Some(d),
+                "W holds {held}"
+            );
             let ctx = node.ctx.take().unwrap();
             drop(ctx);
-            assert_eq!(read_native_applied_height(&node.db), Some(held), "the drop landed {held}");
+            assert_eq!(
+                read_native_applied_height(&node.db),
+                Some(held),
+                "the drop landed {held}"
+            );
             assert!(node
                 .db
                 .get_cf_raw(CF_BLOCK_ACTION_STATUS, &held.to_be_bytes())
                 .unwrap()
                 .is_some());
             if held == 4 {
-                assert_eq!(o0_rows_at(&node.db, CF_RECEIPTS, 4), 1, "the EVM side rows landed");
+                assert_eq!(
+                    o0_rows_at(&node.db, CF_RECEIPTS, 4),
+                    1,
+                    "the EVM side rows landed"
+                );
                 assert_eq!(o0_hash_index_at(&node.db, 4), 1);
             }
         }
@@ -34722,7 +35147,13 @@ mod crash_recovery_tests {
 
     /// `probe.<reader>.<layer>.<cf>.<field>` of a coverage map, summed over
     /// the CFs (`cf` = `None`) or one CF.
-    fn o0_pv(c: &BTreeMap<String, u64>, reader: &str, layer: &str, cf: Option<&str>, field: &str) -> u64 {
+    fn o0_pv(
+        c: &BTreeMap<String, u64>,
+        reader: &str,
+        layer: &str,
+        cf: Option<&str>,
+        field: &str,
+    ) -> u64 {
         let head = format!("probe.{reader}.{layer}.");
         let tail = format!(".{field}");
         c.iter()
@@ -34823,57 +35254,299 @@ mod crash_recovery_tests {
         //   spill) and C16's caught frame are stream inputs (`O0Fed` floors)
         //   checked by the golden; C19: task 3.5's tests.
         let table: Vec<(&str, &str, Metric, Reach)> = vec![
-            ("C1", "EVM height pipelined", flag!("block.pipelined.evm"), all),
-            ("C2", "flag on, serial: slash", flag!("evm.serial_flag_on.slash"), all),
-            ("C2", "flag on, serial: replay after restart", flag!("evm.serial_flag_on.no_worker"), all),
-            ("C2", "flag on, serial: epoch flag off", flag!("evm.serial_flag_on.epoch"), epoch_off_r),
-            ("C3", "revm accounts, parent in flight", pv!("Revm", "Parent", Some("cf_accounts"), "inflight"), parent),
-            ("C3", "revm accounts, L main in flight", pv!("Revm", "LMain", Some("cf_accounts"), "inflight"), interval),
-            ("C3", "revm accounts, C in flight", pv!("Revm", "Checkpoint", Some("cf_accounts"), "inflight"), every5_g),
-            ("C3", "revm storage, L main in flight", pv!("Revm", "LMain", Some("cf_storage"), "inflight"), never),
-            ("C3", "revm accounts from the DB", pv!("Revm", "Db", Some("cf_accounts"), "hits"), all),
-            ("C3", "revm storage from the DB", pv!("Revm", "Db", Some("cf_storage"), "hits"), all),
-            ("C3", "revm code from the DB", pv!("Revm", "Db", Some("cf_code"), "hits"), all),
-            ("C4", "journal oracle, parent in flight", pv!("Journal", "Parent", Some("cf_native_oracle"), "inflight"), parent),
-            ("C4", "journal accounts, L main in flight", pv!("Journal", "LMain", Some("cf_accounts"), "inflight"), interval_epoch_on),
-            ("C4", "journal balances, L deferred in flight", pv!("Journal", "LDeferred", Some("cf_native_balances"), "inflight"), interval_epoch_on),
-            ("C4", "journal positions, L deferred in flight", pv!("Journal", "LDeferred", Some("cf_native_positions"), "inflight"), never),
-            ("C4", "journal fee-config cursor, L main in flight", pv!("Journal", "LMain", Some("cf_fee_config"), "inflight"), never),
-            ("C4", "journal bbo, L main in flight", pv!("Journal", "LMain", Some("cf_native_bbo"), "inflight"), never),
-            ("C4", "journal fee-config cursor, C in flight", pv!("Journal", "Checkpoint", Some("cf_fee_config"), "inflight"), every5_g),
-            ("C4", "journal from the DB", pv!("Journal", "Db", None, "hits"), all),
-            ("C4", "journal queue rows from the DB", pv!("Journal", "Db", Some("cf_core_writer_queue"), "hits"), all),
-            ("C4", "journal staking from the DB", pv!("Journal", "Db", Some("cf_staking_rewards"), "hits"), all),
-            ("C5", "lane read, L main in flight", pv!("Lane", "LMain", None, "inflight"), interval),
-            ("C6", "due-check true from an in-flight parent row", pv!("DueCheck", "Parent", Some("cf_core_writer_queue"), "inflight"), g_or_never),
-            ("C7", "absorb: account put", flag!("absorb.account_put"), all),
-            ("C7", "absorb: account delete", flag!("absorb.account_delete"), all),
+            (
+                "C1",
+                "EVM height pipelined",
+                flag!("block.pipelined.evm"),
+                all,
+            ),
+            (
+                "C2",
+                "flag on, serial: slash",
+                flag!("evm.serial_flag_on.slash"),
+                all,
+            ),
+            (
+                "C2",
+                "flag on, serial: replay after restart",
+                flag!("evm.serial_flag_on.no_worker"),
+                all,
+            ),
+            (
+                "C2",
+                "flag on, serial: epoch flag off",
+                flag!("evm.serial_flag_on.epoch"),
+                epoch_off_r,
+            ),
+            (
+                "C3",
+                "revm accounts, parent in flight",
+                pv!("Revm", "Parent", Some("cf_accounts"), "inflight"),
+                parent,
+            ),
+            (
+                "C3",
+                "revm accounts, L main in flight",
+                pv!("Revm", "LMain", Some("cf_accounts"), "inflight"),
+                interval,
+            ),
+            (
+                "C3",
+                "revm accounts, C in flight",
+                pv!("Revm", "Checkpoint", Some("cf_accounts"), "inflight"),
+                every5_g,
+            ),
+            (
+                "C3",
+                "revm storage, L main in flight",
+                pv!("Revm", "LMain", Some("cf_storage"), "inflight"),
+                never,
+            ),
+            (
+                "C3",
+                "revm accounts from the DB",
+                pv!("Revm", "Db", Some("cf_accounts"), "hits"),
+                all,
+            ),
+            (
+                "C3",
+                "revm storage from the DB",
+                pv!("Revm", "Db", Some("cf_storage"), "hits"),
+                all,
+            ),
+            (
+                "C3",
+                "revm code from the DB",
+                pv!("Revm", "Db", Some("cf_code"), "hits"),
+                all,
+            ),
+            (
+                "C4",
+                "journal oracle, parent in flight",
+                pv!("Journal", "Parent", Some("cf_native_oracle"), "inflight"),
+                parent,
+            ),
+            (
+                "C4",
+                "journal accounts, L main in flight",
+                pv!("Journal", "LMain", Some("cf_accounts"), "inflight"),
+                interval_epoch_on,
+            ),
+            (
+                "C4",
+                "journal balances, L deferred in flight",
+                pv!(
+                    "Journal",
+                    "LDeferred",
+                    Some("cf_native_balances"),
+                    "inflight"
+                ),
+                interval_epoch_on,
+            ),
+            (
+                "C4",
+                "journal positions, L deferred in flight",
+                pv!(
+                    "Journal",
+                    "LDeferred",
+                    Some("cf_native_positions"),
+                    "inflight"
+                ),
+                never,
+            ),
+            (
+                "C4",
+                "journal fee-config cursor, L main in flight",
+                pv!("Journal", "LMain", Some("cf_fee_config"), "inflight"),
+                never,
+            ),
+            (
+                "C4",
+                "journal bbo, L main in flight",
+                pv!("Journal", "LMain", Some("cf_native_bbo"), "inflight"),
+                never,
+            ),
+            (
+                "C4",
+                "journal fee-config cursor, C in flight",
+                pv!("Journal", "Checkpoint", Some("cf_fee_config"), "inflight"),
+                every5_g,
+            ),
+            (
+                "C4",
+                "journal from the DB",
+                pv!("Journal", "Db", None, "hits"),
+                all,
+            ),
+            (
+                "C4",
+                "journal queue rows from the DB",
+                pv!("Journal", "Db", Some("cf_core_writer_queue"), "hits"),
+                all,
+            ),
+            (
+                "C4",
+                "journal staking from the DB",
+                pv!("Journal", "Db", Some("cf_staking_rewards"), "hits"),
+                all,
+            ),
+            (
+                "C5",
+                "lane read, L main in flight",
+                pv!("Lane", "LMain", None, "inflight"),
+                interval,
+            ),
+            (
+                "C6",
+                "due-check true from an in-flight parent row",
+                pv!(
+                    "DueCheck",
+                    "Parent",
+                    Some("cf_core_writer_queue"),
+                    "inflight"
+                ),
+                g_or_never,
+            ),
+            (
+                "C7",
+                "absorb: account put",
+                flag!("absorb.account_put"),
+                all,
+            ),
+            (
+                "C7",
+                "absorb: account delete",
+                flag!("absorb.account_delete"),
+                all,
+            ),
             ("C7", "absorb: slot put", flag!("absorb.slot_put"), all),
-            ("C7", "absorb: zero-slot delete", flag!("absorb.slot_delete"), all),
+            (
+                "C7",
+                "absorb: zero-slot delete",
+                flag!("absorb.slot_delete"),
+                all,
+            ),
             ("C7", "absorb: code put", flag!("absorb.code_put"), all),
             ("C7", "absorb: queue row", flag!("absorb.queue_row"), all),
             ("C7", "absorb: cursor row", flag!("absorb.cursor_row"), all),
-            ("C9", "native credit to this block's EVM account", flag!("evm.native_credit_same_block"), all),
-            ("C9", "native credit to a window's EVM account", flag!("evm.native_credit_in_window"), never_or_epoch_off),
-            ("C10", "EVM height at an attest height", flag!("evm.fast.attest"), epoch_on),
-            ("C10", "EVM epoch boundary pipelined", flag!("evm.fast.epoch"), epoch_on),
-            ("C11a", "failed section: Marker, status, no EVM part", flag!("evm.fast.failed"), all),
-            ("C11b", "all skipped, no native phase: Marker with side rows", flag!("marker.evm_side"), all),
-            ("C11c", "all skipped with a native phase", flag!("handoff.flush.all_skipped_evm"), all),
-            ("C11d", "Marker with side rows -> Digest", flag!("handoff.marker_to_digest.evm"), interval),
-            ("C13", "W EVM step in a Flush", flag!("w.evm_step.flush"), perblock),
-            ("C13", "W EVM step in a Digest -> Checkpoint", flag!("w.evm_step.checkpoint"), interval),
-            ("C13", "W EVM step in a barrier's drain", flag!("w.evm_step.drain"), never_or_epoch_off),
-            ("C14", "big and small lane at one height", flag!("evm.fast.both_lanes"), all),
-            ("C16", "revert on the fast path", flag!("evm.fast.revert"), all),
-            ("C17", "BLOCKHASH from the DB through the overlay", pv!("Revm", "Db", Some("cf_block_headers"), "hits"), all),
-            ("C18", "a deferred-read wait", flag!("deferred.read_wait"), g_interval),
-            ("C20", "EVM height on a held parent, an in-flight read of it", pv!("Revm", "Parent", None, "inflight"), g0),
-            ("C20", "EVM height on a held checkpoint, an in-flight read of it", pv!("Revm", "Checkpoint", None, "inflight"), every5_g),
+            (
+                "C9",
+                "native credit to this block's EVM account",
+                flag!("evm.native_credit_same_block"),
+                all,
+            ),
+            (
+                "C9",
+                "native credit to a window's EVM account",
+                flag!("evm.native_credit_in_window"),
+                never_or_epoch_off,
+            ),
+            (
+                "C10",
+                "EVM height at an attest height",
+                flag!("evm.fast.attest"),
+                epoch_on,
+            ),
+            (
+                "C10",
+                "EVM epoch boundary pipelined",
+                flag!("evm.fast.epoch"),
+                epoch_on,
+            ),
+            (
+                "C11a",
+                "failed section: Marker, status, no EVM part",
+                flag!("evm.fast.failed"),
+                all,
+            ),
+            (
+                "C11b",
+                "all skipped, no native phase: Marker with side rows",
+                flag!("marker.evm_side"),
+                all,
+            ),
+            (
+                "C11c",
+                "all skipped with a native phase",
+                flag!("handoff.flush.all_skipped_evm"),
+                all,
+            ),
+            (
+                "C11d",
+                "Marker with side rows -> Digest",
+                flag!("handoff.marker_to_digest.evm"),
+                interval,
+            ),
+            (
+                "C13",
+                "W EVM step in a Flush",
+                flag!("w.evm_step.flush"),
+                perblock,
+            ),
+            (
+                "C13",
+                "W EVM step in a Digest -> Checkpoint",
+                flag!("w.evm_step.checkpoint"),
+                interval,
+            ),
+            (
+                "C13",
+                "W EVM step in a barrier's drain",
+                flag!("w.evm_step.drain"),
+                never_or_epoch_off,
+            ),
+            (
+                "C14",
+                "big and small lane at one height",
+                flag!("evm.fast.both_lanes"),
+                all,
+            ),
+            (
+                "C16",
+                "revert on the fast path",
+                flag!("evm.fast.revert"),
+                all,
+            ),
+            (
+                "C17",
+                "BLOCKHASH from the DB through the overlay",
+                pv!("Revm", "Db", Some("cf_block_headers"), "hits"),
+                all,
+            ),
+            (
+                "C18",
+                "a deferred-read wait",
+                flag!("deferred.read_wait"),
+                g_interval,
+            ),
+            (
+                "C20",
+                "EVM height on a held parent, an in-flight read of it",
+                pv!("Revm", "Parent", None, "inflight"),
+                g0,
+            ),
+            (
+                "C20",
+                "EVM height on a held checkpoint, an in-flight read of it",
+                pv!("Revm", "Checkpoint", None, "inflight"),
+                every5_g,
+            ),
         ];
         let covs: Vec<BTreeMap<String, u64>> = nodes.iter().map(o0_coverage).collect();
         let mut low = Vec::new();
-        println!("o0 coverage floor (row | what | {}):", nodes.iter().map(|n| format!("{:?}/{:?}{}", n.cfg.ckpt, n.cfg.run, if n.cfg.epoch_fast { "" } else { "/epoch-off" })).collect::<Vec<_>>().join(" | "));
+        println!(
+            "o0 coverage floor (row | what | {}):",
+            nodes
+                .iter()
+                .map(|n| format!(
+                    "{:?}/{:?}{}",
+                    n.cfg.ckpt,
+                    n.cfg.run,
+                    if n.cfg.epoch_fast { "" } else { "/epoch-off" }
+                ))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
         for (row, what, metric, reach) in &table {
             let vals: Vec<String> = nodes
                 .iter()
@@ -34883,7 +35556,11 @@ mod crash_recovery_tests {
                     if reach(&n.cfg) && v == 0 {
                         low.push(format!("{row} {what}: {:?}", n.cfg));
                     }
-                    if reach(&n.cfg) { v.to_string() } else { format!("({v})") }
+                    if reach(&n.cfg) {
+                        v.to_string()
+                    } else {
+                        format!("({v})")
+                    }
                 })
                 .collect();
             println!("  {row} | {what} | {}", vals.join(" | "));
@@ -34892,14 +35569,33 @@ mod crash_recovery_tests {
         for (n, c) in nodes.iter().zip(&covs) {
             let what = format!("{:?}", n.cfg);
             if n.cfg.ckpt == P5Ckpt::PerBlock && n.cfg.run == O0Run::D {
-                assert_eq!(o0_pv(c, "Revm", "Parent", None, "inflight") + o0_pv(c, "Journal", "Parent", None, "inflight") + o0_pv(c, "Lane", "Parent", None, "inflight") + o0_pv(c, "DueCheck", "Parent", None, "inflight") + o0_pv(c, "Native", "Parent", None, "inflight"), 0, "{what}: D at interval 0 has no in-flight parent");
+                assert_eq!(
+                    o0_pv(c, "Revm", "Parent", None, "inflight")
+                        + o0_pv(c, "Journal", "Parent", None, "inflight")
+                        + o0_pv(c, "Lane", "Parent", None, "inflight")
+                        + o0_pv(c, "DueCheck", "Parent", None, "inflight")
+                        + o0_pv(c, "Native", "Parent", None, "inflight"),
+                    0,
+                    "{what}: D at interval 0 has no in-flight parent"
+                );
             }
             if n.cfg.run == O0Run::D {
-                let reads_c: u64 = ["Revm", "Journal", "Lane", "DueCheck", "Native"].iter().map(|r| o0_pv(c, r, "Checkpoint", None, "hits")).sum();
+                let reads_c: u64 = ["Revm", "Journal", "Lane", "DueCheck", "Native"]
+                    .iter()
+                    .map(|r| o0_pv(c, r, "Checkpoint", None, "hits"))
+                    .sum();
                 assert_eq!(reads_c, 0, "{what}: D mode never reads C");
             }
-            assert_eq!(c.get("deferred.read_waits_over_1").copied().unwrap_or(0), 0, "{what}: <= 1 deferred-read wait per block");
-            assert_eq!((n.layer_shared, n.rows_shared), (0, 0), "{what}: L / C and R never shared");
+            assert_eq!(
+                c.get("deferred.read_waits_over_1").copied().unwrap_or(0),
+                0,
+                "{what}: <= 1 deferred-read wait per block"
+            );
+            assert_eq!(
+                (n.layer_shared, n.rows_shared),
+                (0, 0),
+                "{what}: L / C and R never shared"
+            );
             assert_eq!(n.failed_at, None, "{what}");
         }
     }
@@ -34929,10 +35625,15 @@ mod crash_recovery_tests {
         node.run(&blocks[3..]);
         let p = o0_paths(&node);
         assert_eq!(p.get("evm.serial_flag_on.nondurable"), Some(&1), "{p:?}");
-        assert_eq!(p.get("block.pipelined.evm"), Some(&1), "the durable EVM block 5: {p:?}");
+        assert_eq!(
+            p.get("block.pipelined.evm"),
+            Some(&1),
+            "the durable EVM block 5: {p:?}"
+        );
         node.finish();
         node.ledger().assert_complete(6, "non-durable EVM block");
-        o0_compare(&s.ledger(), &node.ledger()).unwrap_or_else(|d| panic!("diverged at {}: {}", d.height, d.what));
+        o0_compare(&s.ledger(), &node.ledger())
+            .unwrap_or_else(|d| panic!("diverged at {}: {}", d.height, d.what));
         assert_eq!(o0_final(&s, &blocks), o0_final(&node, &blocks));
     }
 
@@ -34949,14 +35650,29 @@ mod crash_recovery_tests {
         let forced = O0_ALL_SKIPPED
             .iter()
             .map(|(h, k, p)| (*h, 1, format!("{k:?} {p:?}")))
-            .chain(std::iter::once((O0_SECTION_ERROR, 0, "failed section".to_string())));
+            .chain(std::iter::once((
+                O0_SECTION_ERROR,
+                0,
+                "failed section".to_string(),
+            )));
         for (h, hash_rows, name) in forced {
             assert!(
-                node.db.get_cf_raw(CF_BLOCK_ACTION_STATUS, &h.to_be_bytes()).unwrap().is_some(),
+                node.db
+                    .get_cf_raw(CF_BLOCK_ACTION_STATUS, &h.to_be_bytes())
+                    .unwrap()
+                    .is_some(),
                 "{what}: {name} at {h}: status row"
             );
-            assert_eq!(o0_hash_index_at(&node.db, h), hash_rows, "{what}: {name} at {h}: hash -> number");
-            assert_eq!(o0_rows_at(&node.db, CF_RECEIPTS, h), 0, "{what}: {name} at {h}: no receipt");
+            assert_eq!(
+                o0_hash_index_at(&node.db, h),
+                hash_rows,
+                "{what}: {name} at {h}: hash -> number"
+            );
+            assert_eq!(
+                o0_rows_at(&node.db, CF_RECEIPTS, h),
+                0,
+                "{what}: {name} at {h}: no receipt"
+            );
         }
     }
 
@@ -34975,11 +35691,17 @@ mod crash_recovery_tests {
     ) {
         use torus_bridge::native_executor::BookMode;
         let (blocks, fed) = o0_blocks(300, O0_SEED);
-        let mut cfgs = vec![O0Cfg { mode, ..O0Cfg::serial() }];
+        let mut cfgs = vec![O0Cfg {
+            mode,
+            ..O0Cfg::serial()
+        }];
         for &ckpt in ckpts {
             for run in [O0Run::D, O0Run::G] {
                 for fast in [false, true] {
-                    let c = O0Cfg { mode, ..O0Cfg::piped(ckpt, run) };
+                    let c = O0Cfg {
+                        mode,
+                        ..O0Cfg::piped(ckpt, run)
+                    };
                     cfgs.push(tweak(if fast { c.fast() } else { c }));
                 }
             }
@@ -34994,12 +35716,22 @@ mod crash_recovery_tests {
                 continue;
             }
             if node.cfg.evm_fast {
-                assert!(get("block.pipelined.evm") >= fed.evm_blocks - 12, "{what}: {p:?}");
+                assert!(
+                    get("block.pipelined.evm") >= fed.evm_blocks - 12,
+                    "{what}: {p:?}"
+                );
                 assert_eq!(get("block.serial.evm"), 0, "{what}: {p:?}");
-                assert_eq!((node.layer_shared, node.rows_shared), (0, 0), "{what}: shared");
+                assert_eq!(
+                    (node.layer_shared, node.rows_shared),
+                    (0, 0),
+                    "{what}: shared"
+                );
             } else {
                 assert_eq!(get("block.pipelined.evm"), 0, "{what}: {p:?}");
-                assert!(get("block.serial.evm") >= fed.evm_blocks - 2, "{what}: {p:?}");
+                assert!(
+                    get("block.serial.evm") >= fed.evm_blocks - 2,
+                    "{what}: {p:?}"
+                );
             }
             if node.cfg.run == O0Run::G {
                 // With Never the controller parks only triggered checkpoints
@@ -35012,7 +35744,10 @@ mod crash_recovery_tests {
                     (P5Ckpt::Never, true) => 1,
                     _ => 10,
                 };
-                assert!(holds >= floor, "{what}: the controller parked W {holds} times");
+                assert!(
+                    holds >= floor,
+                    "{what}: the controller parked W {holds} times"
+                );
             }
         }
         if mode == BookMode::Classic {
@@ -35021,7 +35756,11 @@ mod crash_recovery_tests {
         println!(
             "o0 matrix {mode:?} {ckpts:?}: {} nodes agree with S{}",
             nodes.len(),
-            if mode == BookMode::Classic { " and the golden" } else { "" }
+            if mode == BookMode::Classic {
+                " and the golden"
+            } else {
+                ""
+            }
         );
     }
 
@@ -35032,48 +35771,76 @@ mod crash_recovery_tests {
     /// Plan 5.3: Classic, interval 0, flag off / on, D / G.
     #[test]
     fn o0_equivalence_classic_interval0() {
-        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::PerBlock], o0_same);
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::Classic,
+            &[P5Ckpt::PerBlock],
+            o0_same,
+        );
     }
 
     /// Plan 5.3: Classic, Every5.
     #[test]
     fn o0_equivalence_classic_every5() {
-        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Every5], o0_same);
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::Classic,
+            &[P5Ckpt::Every5],
+            o0_same,
+        );
     }
 
     /// Plan 5.3: Classic, Never (checkpoints at attest / epoch heights,
     /// barriers and shutdown only).
     #[test]
     fn o0_equivalence_classic_never() {
-        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Never], o0_same);
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::Classic,
+            &[P5Ckpt::Never],
+            o0_same,
+        );
     }
 
     /// Plan 5.3: OrderRows, interval 0 (against S in OrderRows).
     #[test]
     fn o0_equivalence_orderrows_interval0() {
-        o0_matrix(torus_bridge::native_executor::BookMode::OrderRows, &[P5Ckpt::PerBlock], o0_same);
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::OrderRows,
+            &[P5Ckpt::PerBlock],
+            o0_same,
+        );
     }
 
     /// Plan 5.3: OrderRows, Every5.
     #[test]
     fn o0_equivalence_orderrows_every5() {
-        o0_matrix(torus_bridge::native_executor::BookMode::OrderRows, &[P5Ckpt::Every5], o0_same);
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::OrderRows,
+            &[P5Ckpt::Every5],
+            o0_same,
+        );
     }
 
     /// Plan 5.3: OrderRows, Never.
     #[test]
     fn o0_equivalence_orderrows_never() {
-        o0_matrix(torus_bridge::native_executor::BookMode::OrderRows, &[P5Ckpt::Never], o0_same);
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::OrderRows,
+            &[P5Ckpt::Never],
+            o0_same,
+        );
     }
 
     /// Plan 5.3: Classic Every5 with the epoch flag off (epoch boundaries
     /// barrier, so do the EVM heights on them: C2).
     #[test]
     fn o0_equivalence_classic_every5_epoch_off() {
-        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Every5], |c| O0Cfg {
-            epoch_fast: false,
-            ..c
-        });
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::Classic,
+            &[P5Ckpt::Every5],
+            |c| O0Cfg {
+                epoch_fast: false,
+                ..c
+            },
+        );
     }
 
     /// Plan 5.3: the deferred book modes 2 / 3 (they refuse an interval):
@@ -35126,7 +35893,11 @@ mod crash_recovery_tests {
             torus_state::checkpoint_layer::books_deferred(),
             "TORUS_CKPT_DEFER_BOOKS=1: the book CF in L's deferred part"
         );
-        o0_matrix(torus_bridge::native_executor::BookMode::Classic, &[P5Ckpt::Every5], o0_same);
+        o0_matrix(
+            torus_bridge::native_executor::BookMode::Classic,
+            &[P5Ckpt::Every5],
+            o0_same,
+        );
     }
 
     // ---- Item 7 option 0 task 3.8: mixed replicas ----
@@ -35158,12 +35929,18 @@ mod crash_recovery_tests {
                 .map(|n| torus_state::running_hash::read_checkpoint(&n.db, h))
                 .collect();
             assert!(cps[0].is_some(), "{run:?}: a state-hash checkpoint at {h}");
-            assert!(cps.iter().all(|c| *c == cps[0]), "{run:?}: attestation rows at {h}: {cps:?}");
+            assert!(
+                cps.iter().all(|c| *c == cps[0]),
+                "{run:?}: attestation rows at {h}: {cps:?}"
+            );
         }
         for (i, a) in nodes.iter().enumerate() {
             for b in &nodes[i + 1..] {
                 let c = o0_compare(&a.ledger(), &b.ledger()).unwrap_or_else(|d| {
-                    panic!("{:?} vs {:?} diverged at {}: {}", a.cfg, b.cfg, d.height, d.what)
+                    panic!(
+                        "{:?} vs {:?} diverged at {}: {}",
+                        a.cfg, b.cfg, d.height, d.what
+                    )
                 });
                 assert!(c.hn >= 300 && c.status >= 300 && c.side >= 300, "{c:?}");
             }
@@ -35305,13 +36082,17 @@ mod crash_recovery_tests {
         };
         set(&mut rows.iter().map(|(cf, k, v)| (*cf, k, v.as_ref())));
         let want = run(&quiet, &o0_poison_overlay(db, &Vec::new(), None), true);
-        set(&mut rows.iter().zip(&before).map(|((cf, k, _), b)| (*cf, k, b.as_ref())));
+        set(&mut rows
+            .iter()
+            .zip(&before)
+            .map(|((cf, k, _), b)| (*cf, k, b.as_ref())));
         assert_ne!(want, stale, "{what}: the case is not vacuous");
         for &l in at {
             let probe = Probe::new();
             let got = run(&probe, &o0_poison_overlay(db, rows, Some(l)), true);
             assert_eq!(got, want, "{what}: rows only in {l:?}");
-            let hit = probe.total(|r, layer, cf| r == reader && layer == l.layer() && cfs.contains(&cf));
+            let hit =
+                probe.total(|r, layer, cf| r == reader && layer == l.layer() && cfs.contains(&cf));
             assert!(
                 hit.inflight >= 1,
                 "{what}: {reader:?} answered in flight by {l:?}: {hit:?}\n{}",
@@ -35323,7 +36104,10 @@ mod crash_recovery_tests {
         planted.plant(Plant::NoTripwire);
         for &l in at {
             let got = run(&planted, &o0_poison_overlay(db, rows, Some(l)), true);
-            assert_eq!(got, stale, "{what}: the planted {plant:?} answers stale ({l:?})");
+            assert_eq!(
+                got, stale,
+                "{what}: the planted {plant:?} answers stale ({l:?})"
+            );
         }
         let planted = Probe::new();
         planted.plant(plant);
@@ -35338,21 +36122,22 @@ mod crash_recovery_tests {
                     .cloned()
                     .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_default();
-                assert!(trips && msg.contains("raw-DB tripwire"), "{what}: {plant:?} panicked: {msg}");
+                assert!(
+                    trips && msg.contains("raw-DB tripwire"),
+                    "{what}: {plant:?} panicked: {msg}"
+                );
             }
-            Ok(()) => assert!(!trips, "{what}: the armed tripwire missed the planted {plant:?}"),
+            Ok(()) => assert!(
+                !trips,
+                "{what}: the armed tripwire missed the planted {plant:?}"
+            ),
         }
     }
 
     /// A precompile call through the block's journal (`EvmBlockState`, as
     /// the fast path builds it), labelled `Journal`: its output, and the
     /// queue / fee-config rows the journal then holds (a writer's effect).
-    fn o0_poison_precompile(
-        ov: &NativeStateOverlay,
-        id: u16,
-        input: &[u8],
-        block: u64,
-    ) -> String {
+    fn o0_poison_precompile(ov: &NativeStateOverlay, id: u16, input: &[u8], block: u64) -> String {
         use torus_state::cf::{CF_CORE_WRITER_QUEUE, CF_FEE_CONFIG};
         let state = torus_state::EvmBlockState::new(ov);
         let out = {
@@ -35373,7 +36158,10 @@ mod crash_recovery_tests {
         let _s = torus_state::probes::scope(torus_state::probes::Reader::Test);
         let q = StateBackend::iterate_cf(&state.journal, CF_CORE_WRITER_QUEUE, None).unwrap();
         let f = StateBackend::iterate_cf(&state.journal, CF_FEE_CONFIG, None).unwrap();
-        let keys: Vec<String> = q.iter().map(|(k, _)| alloy_primitives::hex::encode(k)).collect();
+        let keys: Vec<String> = q
+            .iter()
+            .map(|(k, _)| alloy_primitives::hex::encode(k))
+            .collect();
         format!("{out:?} queue {keys:?} fee {f:?}")
     }
 
@@ -35400,7 +36188,10 @@ mod crash_recovery_tests {
         let ctx = make_exec_ctx(&config, &db);
         // A row of the fixture, removed from the DB (the stale state).
         let take = |cf: &'static str, key: Vec<u8>| -> O0Rows {
-            let v = db.get_cf_raw(cf, &key).unwrap().unwrap_or_else(|| panic!("{cf} row in the fixture"));
+            let v = db
+                .get_cf_raw(cf, &key)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{cf} row in the fixture"));
             db.delete_cf_raw(cf, &key).unwrap();
             vec![(cf, key, Some(v))]
         };
@@ -35409,36 +36200,118 @@ mod crash_recovery_tests {
         // C3: the revm adapter.
         let user = oracle_addr(O0_USERS[1]);
         let rows = take(CF_ACCOUNTS, user.to_vec());
-        o0_poison_case("revm account", &db, Reader::Revm, &[CF_ACCOUNTS], &rows, &all, Plant::BypassRevm, true, &|ov| {
-            format!("{:?}", torus_state::EvmBlockState::new(ov).db.basic_ref(user).unwrap())
-        });
+        o0_poison_case(
+            "revm account",
+            &db,
+            Reader::Revm,
+            &[CF_ACCOUNTS],
+            &rows,
+            &all,
+            Plant::BypassRevm,
+            true,
+            &|ov| {
+                format!(
+                    "{:?}",
+                    torus_state::EvmBlockState::new(ov)
+                        .db
+                        .basic_ref(user)
+                        .unwrap()
+                )
+            },
+        );
         let slots = o0_addr(O0_SLOTS);
-        let rows = take(CF_STORAGE, torus_state::db::storage_key(&slots, &U256::from(2)).to_vec());
-        o0_poison_case("revm storage", &db, Reader::Revm, &[CF_STORAGE], &rows, &all, Plant::BypassRevm, true, &|ov| {
-            format!("{:?}", torus_state::EvmBlockState::new(ov).db.storage_ref(slots, U256::from(2)).unwrap())
-        });
+        let rows = take(
+            CF_STORAGE,
+            torus_state::db::storage_key(&slots, &U256::from(2)).to_vec(),
+        );
+        o0_poison_case(
+            "revm storage",
+            &db,
+            Reader::Revm,
+            &[CF_STORAGE],
+            &rows,
+            &all,
+            Plant::BypassRevm,
+            true,
+            &|ov| {
+                format!(
+                    "{:?}",
+                    torus_state::EvmBlockState::new(ov)
+                        .db
+                        .storage_ref(slots, U256::from(2))
+                        .unwrap()
+                )
+            },
+        );
         let code = alloy_primitives::keccak256(&o0_contracts()[0].1);
         let rows = take(CF_CODE, code.to_vec());
-        o0_poison_case("revm code", &db, Reader::Revm, &[CF_CODE], &rows, &all, Plant::BypassRevm, true, &|ov| {
-            format!("{:?}", torus_state::EvmBlockState::new(ov).db.code_by_hash_ref(code).unwrap().original_bytes())
-        });
+        o0_poison_case(
+            "revm code",
+            &db,
+            Reader::Revm,
+            &[CF_CODE],
+            &rows,
+            &all,
+            Plant::BypassRevm,
+            true,
+            &|ov| {
+                format!(
+                    "{:?}",
+                    torus_state::EvmBlockState::new(ov)
+                        .db
+                        .code_by_hash_ref(code)
+                        .unwrap()
+                        .original_bytes()
+                )
+            },
+        );
         // C4: the journal (reader and writer precompiles).
         let v4 = oracle_addr(P2_V4);
-        let rows = take(CF_NATIVE_POSITIONS, torus_core::position::position_key(&v4, 1).to_vec());
-        let input = o0_call("getPosition(address,bytes32)", &[o0_word_addr(v4), o0_word(1)]);
-        o0_poison_case("journal positions", &db, Reader::Journal, &[CF_NATIVE_POSITIONS], &rows, &deferred, Plant::BypassJournal, false, &|ov| {
-            o0_poison_precompile(ov, ADDR_ORDER_BOOK_READER, &input, 50)
-        });
+        let rows = take(
+            CF_NATIVE_POSITIONS,
+            torus_core::position::position_key(&v4, 1).to_vec(),
+        );
+        let input = o0_call(
+            "getPosition(address,bytes32)",
+            &[o0_word_addr(v4), o0_word(1)],
+        );
+        o0_poison_case(
+            "journal positions",
+            &db,
+            Reader::Journal,
+            &[CF_NATIVE_POSITIONS],
+            &rows,
+            &deferred,
+            Plant::BypassJournal,
+            false,
+            &|ov| o0_poison_precompile(ov, ADDR_ORDER_BOOK_READER, &input, 50),
+        );
         let trader = oracle_addr(C5_TRADERS[1]);
         let input = o0_call("getBalances(address)", &[o0_word_addr(trader)]);
         let rows = take(CF_NATIVE_BALANCES, trader.to_vec());
-        o0_poison_case("journal balances", &db, Reader::Journal, &[CF_NATIVE_BALANCES], &rows, &deferred, Plant::BypassJournal, false, &|ov| {
-            o0_poison_precompile(ov, ADDR_BALANCE_READER, &input, 50)
-        });
+        o0_poison_case(
+            "journal balances",
+            &db,
+            Reader::Journal,
+            &[CF_NATIVE_BALANCES],
+            &rows,
+            &deferred,
+            Plant::BypassJournal,
+            false,
+            &|ov| o0_poison_precompile(ov, ADDR_BALANCE_READER, &input, 50),
+        );
         let rows = take(CF_ACCOUNTS, trader.to_vec());
-        o0_poison_case("journal accounts", &db, Reader::Journal, &[CF_ACCOUNTS], &rows, &all, Plant::BypassJournal, false, &|ov| {
-            o0_poison_precompile(ov, ADDR_BALANCE_READER, &input, 50)
-        });
+        o0_poison_case(
+            "journal accounts",
+            &db,
+            Reader::Journal,
+            &[CF_ACCOUNTS],
+            &rows,
+            &all,
+            Plant::BypassJournal,
+            false,
+            &|ov| o0_poison_precompile(ov, ADDR_BALANCE_READER, &input, 50),
+        );
         // An aggregate price of market 9 (none in the fixture): price 16 BE,
         // block 8 BE, 4 bytes, timestamp 8 BE (`decode_agg`).
         let mut agg = b"agg".to_vec();
@@ -35449,30 +36322,62 @@ mod crash_recovery_tests {
         price.extend_from_slice(&1_000u64.to_be_bytes());
         let rows: O0Rows = vec![(CF_NATIVE_ORACLE, agg, Some(price))];
         let input = o0_call("getPrice(bytes32)", &[o0_word(9)]);
-        o0_poison_case("journal oracle", &db, Reader::Journal, &[CF_NATIVE_ORACLE], &rows, &all, Plant::BypassJournal, false, &|ov| {
-            o0_poison_precompile(ov, ADDR_ORACLE_READER, &input, 50)
-        });
+        o0_poison_case(
+            "journal oracle",
+            &db,
+            Reader::Journal,
+            &[CF_NATIVE_ORACLE],
+            &rows,
+            &all,
+            Plant::BypassJournal,
+            false,
+            &|ov| o0_poison_precompile(ov, ADDR_ORACLE_READER, &input, 50),
+        );
         let rows = take(CF_NATIVE_MARKETS, 2u64.to_be_bytes().to_vec());
         let input = o0_call("getMarkets()", &[]);
-        o0_poison_case("journal markets", &db, Reader::Journal, &[CF_NATIVE_MARKETS], &rows, &all, Plant::BypassJournal, false, &|ov| {
-            o0_poison_precompile(ov, ADDR_BALANCE_READER, &input, 50)
-        });
+        o0_poison_case(
+            "journal markets",
+            &db,
+            Reader::Journal,
+            &[CF_NATIVE_MARKETS],
+            &rows,
+            &all,
+            Plant::BypassJournal,
+            false,
+            &|ov| o0_poison_precompile(ov, ADDR_BALANCE_READER, &input, 50),
+        );
         let staker = oracle_addr(O0_USERS[2]);
         let mut perm = staker.to_vec();
         perm.extend_from_slice(&U256::from(77u64).to_be_bytes::<32>());
         perm.extend_from_slice(&[0u8; 8]);
         let rows: O0Rows = vec![(CF_STAKING_PERMANENT, staker.to_vec(), Some(perm))];
         let input = o0_call("getStakingInfo(address)", &[o0_word_addr(staker)]);
-        o0_poison_case("journal staking", &db, Reader::Journal, &[CF_STAKING_PERMANENT], &rows, &all, Plant::BypassJournal, false, &|ov| {
-            o0_poison_precompile(ov, ADDR_STAKING_READER, &input, 50)
-        });
+        o0_poison_case(
+            "journal staking",
+            &db,
+            Reader::Journal,
+            &[CF_STAKING_PERMANENT],
+            &rows,
+            &all,
+            Plant::BypassJournal,
+            false,
+            &|ov| o0_poison_precompile(ov, ADDR_STAKING_READER, &input, 50),
+        );
         let mut bbo = 5i128.to_be_bytes().to_vec();
         bbo.extend_from_slice(&9i128.to_be_bytes());
         let rows: O0Rows = vec![(CF_NATIVE_BBO, 3u64.to_be_bytes().to_vec(), Some(bbo))];
         let input = o0_call("bbo(bytes32)", &[o0_word(3)]);
-        o0_poison_case("journal bbo", &db, Reader::Journal, &[CF_NATIVE_BBO], &rows, &all, Plant::BypassJournal, false, &|ov| {
-            o0_poison_precompile(ov, ADDR_BBO_READER, &input, 50)
-        });
+        o0_poison_case(
+            "journal bbo",
+            &db,
+            Reader::Journal,
+            &[CF_NATIVE_BBO],
+            &rows,
+            &all,
+            Plant::BypassJournal,
+            false,
+            &|ov| o0_poison_precompile(ov, ADDR_BBO_READER, &input, 50),
+        );
         // The enqueue (CoreWriter placeOrder at block 95, K = 10): a block
         // in flight set the last order target to 110 and queued (110, 0), so
         // the order lands at (110, 1); stale: (105, 0).
@@ -35488,9 +36393,17 @@ mod crash_recovery_tests {
             (CF_CORE_WRITER_QUEUE, q110.clone(), Some(vec![1, 2, 3])),
         ];
         for plant in [Plant::BypassEnqueue, Plant::BypassJournal] {
-            o0_poison_case("enqueue cursor + queue", &db, Reader::Journal, &[CF_FEE_CONFIG, CF_CORE_WRITER_QUEUE], &cursor, &all, plant, plant == Plant::BypassEnqueue, &|ov| {
-                o0_poison_precompile(ov, ADDR_CORE_WRITER, &place, 95)
-            });
+            o0_poison_case(
+                "enqueue cursor + queue",
+                &db,
+                Reader::Journal,
+                &[CF_FEE_CONFIG, CF_CORE_WRITER_QUEUE],
+                &cursor,
+                &all,
+                plant,
+                plant == Plant::BypassEnqueue,
+                &|ov| o0_poison_precompile(ov, ADDR_CORE_WRITER, &place, 95),
+            );
         }
         // A full target in flight (200 rows at 105): get_cf_len of its last
         // slot answers from the layer, the order moves to 106.
@@ -35501,14 +36414,41 @@ mod crash_recovery_tests {
                 (CF_CORE_WRITER_QUEUE, k, Some(vec![seq as u8]))
             })
             .collect();
-        o0_poison_case("enqueue full target", &db, Reader::Journal, &[CF_CORE_WRITER_QUEUE], &full, &all, Plant::BypassEnqueue, true, &|ov| {
-            o0_poison_precompile(ov, ADDR_CORE_WRITER, &place, 95)
-        });
+        o0_poison_case(
+            "enqueue full target",
+            &db,
+            Reader::Journal,
+            &[CF_CORE_WRITER_QUEUE],
+            &full,
+            &all,
+            Plant::BypassEnqueue,
+            true,
+            &|ov| o0_poison_precompile(ov, ADDR_CORE_WRITER, &place, 95),
+        );
         // C5: the lane read.
-        let lane: O0Rows = vec![(CF_NATIVE_ORACLE, evm_lane_key(&user).to_vec(), Some(vec![1]))];
-        o0_poison_case("lane", &db, Reader::Lane, &[CF_NATIVE_ORACLE], &lane, &all, Plant::BypassLane, true, &|ov| {
-            format!("{:?}", torus_state::EvmBlockState::new(ov).lane_read(CF_NATIVE_ORACLE, &evm_lane_key(&user)).unwrap())
-        });
+        let lane: O0Rows = vec![(
+            CF_NATIVE_ORACLE,
+            evm_lane_key(&user).to_vec(),
+            Some(vec![1]),
+        )];
+        o0_poison_case(
+            "lane",
+            &db,
+            Reader::Lane,
+            &[CF_NATIVE_ORACLE],
+            &lane,
+            &all,
+            Plant::BypassLane,
+            true,
+            &|ov| {
+                format!(
+                    "{:?}",
+                    torus_state::EvmBlockState::new(ov)
+                        .lane_read(CF_NATIVE_ORACLE, &evm_lane_key(&user))
+                        .unwrap()
+                )
+            },
+        );
         // C6: the CoreWriter due-check of height 120: true from a row only
         // in flight; false over an in-flight tombstone of a row still in the
         // DB.
@@ -35519,10 +36459,30 @@ mod crash_recovery_tests {
         let mut q120 = 120u64.to_be_bytes().to_vec();
         q120.extend_from_slice(&0u64.to_be_bytes());
         let row: O0Rows = vec![(CF_CORE_WRITER_QUEUE, q120.clone(), Some(vec![9]))];
-        o0_poison_case("due-check row", &db, Reader::DueCheck, &[CF_CORE_WRITER_QUEUE], &row, &all, Plant::BypassDueCheck, true, &due);
+        o0_poison_case(
+            "due-check row",
+            &db,
+            Reader::DueCheck,
+            &[CF_CORE_WRITER_QUEUE],
+            &row,
+            &all,
+            Plant::BypassDueCheck,
+            true,
+            &due,
+        );
         db.put_cf_raw(CF_CORE_WRITER_QUEUE, &q120, &[9]).unwrap();
         let tomb: O0Rows = vec![(CF_CORE_WRITER_QUEUE, q120, None)];
-        o0_poison_case("due-check tombstone", &db, Reader::DueCheck, &[CF_CORE_WRITER_QUEUE], &tomb, &all, Plant::BypassDueCheck, true, &due);
+        o0_poison_case(
+            "due-check tombstone",
+            &db,
+            Reader::DueCheck,
+            &[CF_CORE_WRITER_QUEUE],
+            &tomb,
+            &all,
+            Plant::BypassDueCheck,
+            true,
+            &due,
+        );
     }
 
     // ---- Item 7 option 0 task 3.6: planted bypasses on the stream (plan 5.4) ----
@@ -35576,7 +36536,10 @@ mod crash_recovery_tests {
                     .cloned()
                     .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_default();
-                assert!(msg.contains("raw-DB tripwire"), "{plant:?}: another panic: {msg}");
+                assert!(
+                    msg.contains("raw-DB tripwire"),
+                    "{plant:?}: another panic: {msg}"
+                );
                 true
             }
         }
@@ -35599,14 +36562,22 @@ mod crash_recovery_tests {
     /// Every5 / Never. Prints every verdict.
     fn o0_assert_bypass_caught(plant: torus_state::probes::Plant, trips: bool, caught: &[usize]) {
         let (blocks, _) = o0_blocks(300, O0_SEED);
-        assert_eq!(o0_planted_trips(&blocks, plant), trips, "{plant:?}: the tripwire");
+        assert_eq!(
+            o0_planted_trips(&blocks, plant),
+            trips,
+            "{plant:?}: the tripwire"
+        );
         let verdicts = o0_planted_fast(&blocks, &o0_bypass_cfgs(), &[plant], o0_fixture);
         for (cfg, v) in &verdicts {
             println!("{plant:?} {:?} {:?}: {v:?}", cfg.ckpt, cfg.run);
         }
         assert!(caught.iter().any(|&i| i < 2), "{plant:?}: Every5 or Never");
         for &i in caught {
-            assert!(verdicts[i].1.is_err(), "{plant:?}: {:?} must catch it: {verdicts:?}", verdicts[i].0);
+            assert!(
+                verdicts[i].1.is_err(),
+                "{plant:?}: {:?} must catch it: {verdicts:?}",
+                verdicts[i].0
+            );
         }
     }
 
@@ -35624,7 +36595,9 @@ mod crash_recovery_tests {
     /// parent / L / C puts the cancel at seq 0, over a spilled row.
     fn o0_enqueue_blocks() -> Vec<O0Block> {
         use O0Hand::*;
-        let kinds: Vec<O0Hand> = (0..30).map(|i| [Native, CancelLoop, Cancel, Native, Native][i % 5]).collect();
+        let kinds: Vec<O0Hand> = (0..30)
+            .map(|i| [Native, CancelLoop, Cancel, Native, Native][i % 5])
+            .collect();
         o0_hand_blocks(&kinds)
     }
 
@@ -35638,7 +36611,10 @@ mod crash_recovery_tests {
         assert!(ok.iter().all(|(_, v)| v.is_ok()), "unplanted: {ok:?}");
         let v = o0_planted_fast(&blocks, &o0_bypass_cfgs(), &[plant], o0_fixture);
         println!("{plant:?} (enqueue stream): {v:?}");
-        assert!(v.iter().all(|(_, v)| v.is_err()), "{plant:?} caught in every config: {v:?}");
+        assert!(
+            v.iter().all(|(_, v)| v.is_err()),
+            "{plant:?} caught in every config: {v:?}"
+        );
     }
 
     /// Plan 5.4: the journal without layers (`NativeStateOverlay::new(db)`):
@@ -35648,7 +36624,10 @@ mod crash_recovery_tests {
     fn o0_planted_bypass_journal_is_caught() {
         use torus_state::probes::Plant::BypassJournal;
         let (blocks, _) = o0_blocks(300, O0_SEED);
-        assert!(!o0_planted_trips(&blocks, BypassJournal), "an overlay read: no trip");
+        assert!(
+            !o0_planted_trips(&blocks, BypassJournal),
+            "an overlay read: no trip"
+        );
         o0_assert_enqueue_bypass_caught(BypassJournal);
     }
 
@@ -35666,11 +36645,16 @@ mod crash_recovery_tests {
         use O0Hand::*;
         let (blocks, _) = o0_blocks(300, O0_SEED);
         assert!(o0_planted_trips(&blocks, BypassDueCheck), "the tripwire");
-        let kinds: Vec<O0Hand> = (0..30).map(|i| [Native, Deposit, Empty, Native, Native][i % 5]).collect();
+        let kinds: Vec<O0Hand> = (0..30)
+            .map(|i| [Native, Deposit, Empty, Native, Native][i % 5])
+            .collect();
         let blocks = o0_hand_blocks(&kinds);
         let v = o0_planted_fast(&blocks, &o0_bypass_cfgs(), &[BypassDueCheck], o0_fixture);
         println!("BypassDueCheck (deposit, empty): {v:?}");
-        assert!(v.iter().all(|(_, v)| v.is_err()), "caught in every config: {v:?}");
+        assert!(
+            v.iter().all(|(_, v)| v.is_err()),
+            "caught in every config: {v:?}"
+        );
         // Not vacuous: unplanted, the same configs agree with S.
         let ok = o0_planted_fast(&blocks, &o0_bypass_cfgs(), &[], o0_fixture);
         assert!(ok.iter().all(|(_, v)| v.is_ok()), "{ok:?}");
@@ -35743,7 +36727,9 @@ mod crash_recovery_tests {
     #[test]
     fn o0_planted_skip_deferred_part() {
         use O0Hand::*;
-        let kinds: Vec<O0Hand> = (0..30).map(|i| [Native, Empty, ReadBalances][i % 3]).collect();
+        let kinds: Vec<O0Hand> = (0..30)
+            .map(|i| [Native, Empty, ReadBalances][i % 3])
+            .collect();
         let blocks = o0_hand_blocks(&kinds);
         let cfgs = [
             O0Cfg::piped(P5Ckpt::Every5, O0Run::D).fast(),
@@ -35757,9 +36743,18 @@ mod crash_recovery_tests {
                     && l == torus_state::probes::Layer::LDeferred
                     && cf == torus_state::cf::CF_NATIVE_BALANCES
             });
-            assert!(d.inflight > 0, "{:?}: journal reads in flight from L's deferred part: {d:?}", node.cfg);
+            assert!(
+                d.inflight > 0,
+                "{:?}: journal reads in flight from L's deferred part: {d:?}",
+                node.cfg
+            );
         }
-        let v = o0_planted_fast(&blocks, &cfgs, &[torus_state::probes::Plant::SkipDeferredEvm], o0_fixture_recorder);
+        let v = o0_planted_fast(
+            &blocks,
+            &cfgs,
+            &[torus_state::probes::Plant::SkipDeferredEvm],
+            o0_fixture_recorder,
+        );
         println!("skip deferred (EVM section): {v:?}");
         assert!(v.iter().all(|(_, v)| v.is_err()), "caught: {v:?}");
     }
@@ -37336,7 +38331,11 @@ mod crash_recovery_tests {
                 evm_on.pipelined, expected_evm_on,
                 "{what}, EVM fast path on: EVM boundary 8 pipelined, slash boundary 12 serial"
             );
-            assert_fast_path_runs_equal(&serial, &evm_on, &format!("{what}: EVM fast path on vs serial"));
+            assert_fast_path_runs_equal(
+                &serial,
+                &evm_on,
+                &format!("{what}: EVM fast path on vs serial"),
+            );
         }
         let evm_sender = k256::ecdsa::SigningKey::from_slice(&[61u8; 32]).unwrap();
         assert_eq!(
@@ -37367,9 +38366,15 @@ mod crash_recovery_tests {
     /// the serial run.
     #[test]
     fn evm_fast_path_flag_absent_evm_heights_stay_serial() {
-        assert!(!crate::exec_pipeline::parse_evm_fast_path(None), "unset: off");
+        assert!(
+            !crate::exec_pipeline::parse_evm_fast_path(None),
+            "unset: off"
+        );
         let (config, db) = make_test_config_and_db();
-        assert!(!make_exec_ctx(&config, &db).evm_fast_path, "a test context: off");
+        assert!(
+            !make_exec_ctx(&config, &db).evm_fast_path,
+            "a test context: off"
+        );
         let serial = fast_path_run(false, false, None, Some(8), Some(12));
         let expected: Vec<u64> = (1..=13).filter(|h| *h != 8 && *h != 12).collect();
         for (what, policy) in [
@@ -37378,7 +38383,10 @@ mod crash_recovery_tests {
             ("every 5", Some(ckpt_every(5))),
         ] {
             let off = fast_path_run_evm(true, true, false, policy, Some(8), Some(12));
-            assert_eq!(off.pipelined, expected, "{what}: EVM height 8 serial without the flag");
+            assert_eq!(
+                off.pipelined, expected,
+                "{what}: EVM height 8 serial without the flag"
+            );
             assert_fast_path_runs_equal(&serial, &off, &format!("{what}: flag absent vs serial"));
         }
     }

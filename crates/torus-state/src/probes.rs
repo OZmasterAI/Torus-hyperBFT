@@ -517,13 +517,31 @@ mod tests {
         assert!(p.watched().is_empty(), "nothing installed: nothing logged");
         let _i = install(p.clone());
         p.set_height(7);
-        record_point("x", b"z", Layer::Own, || false, || unreachable!("Own is never in flight"));
+        record_point(
+            "x",
+            b"z",
+            Layer::Own,
+            || false,
+            || unreachable!("Own is never in flight"),
+        );
         {
             let _s = scope(Reader::Native);
             p.set_height(8);
             record_point("x", b"z", Layer::Checkpoint, || true, || true);
-            record_point("x", b"other", Layer::Checkpoint, || unreachable!("unwatched"), || true);
-            record_point("y", b"z", Layer::Db, || unreachable!("unwatched CF"), || false);
+            record_point(
+                "x",
+                b"other",
+                Layer::Checkpoint,
+                || unreachable!("unwatched"),
+                || true,
+            );
+            record_point(
+                "y",
+                b"z",
+                Layer::Db,
+                || unreachable!("unwatched CF"),
+                || false,
+            );
         }
         let w = p.watched();
         let row = |height, reader, layer, inflight, found| WatchedRead {
@@ -543,7 +561,11 @@ mod tests {
             ]
         );
         let c = p.counts();
-        assert_eq!(c[&(Reader::Native, Layer::Checkpoint, "x")].hits, 2, "unwatched reads still count");
+        assert_eq!(
+            c[&(Reader::Native, Layer::Checkpoint, "x")].hits,
+            2,
+            "unwatched reads still count"
+        );
         assert_eq!(c[&(Reader::Native, Layer::Db, "y")].hits, 1);
     }
 }

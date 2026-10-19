@@ -378,7 +378,15 @@ mod f1 {
         let alice = addr_word(ALICE);
         let market = u_word(MARKET as u128);
         // (case, cf, key, undecodable row, fault message part, precompile, calldata)
-        type Case = (&'static str, &'static str, Vec<u8>, Vec<u8>, &'static str, u16, Vec<u8>);
+        type Case = (
+            &'static str,
+            &'static str,
+            Vec<u8>,
+            Vec<u8>,
+            &'static str,
+            u16,
+            Vec<u8>,
+        );
         let cases: Vec<Case> = vec![
             (
                 "0x0800 getPosition: Position row",
@@ -417,22 +425,42 @@ mod f1 {
             let tx = || tx_to(id, data.clone(), U256::ZERO, 200_000);
             let (_d, db) = db_without("no-such-cf");
             db.put_cf_raw(cf, &key, &row).unwrap();
-            local(ex.execute_block(&db, &block_cfg(), vec![tx()], true).map(drop), part, format!("{what} (block)"));
+            local(
+                ex.execute_block(&db, &block_cfg(), vec![tx()], true)
+                    .map(drop),
+                part,
+                format!("{what} (block)"),
+            );
             let overlay = torus_state::StateOverlay::new(db.clone());
             local(
-                ex.execute_block_with_overlay(&overlay, &block_cfg(), vec![tx()], true).map(drop),
+                ex.execute_block_with_overlay(&overlay, &block_cfg(), vec![tx()], true)
+                    .map(drop),
                 part,
                 format!("{what} (overlay)"),
             );
-            local(ex.execute_tx(&db, &block_cfg(), tx()).map(drop), part, format!("{what} (tx)"));
-            local(ex.execute_call(&db, &block_cfg(), tx()).map(drop), part, format!("{what} (eth_call)"));
+            local(
+                ex.execute_tx(&db, &block_cfg(), tx()).map(drop),
+                part,
+                format!("{what} (tx)"),
+            );
+            local(
+                ex.execute_call(&db, &block_cfg(), tx()).map(drop),
+                part,
+                format!("{what} (eth_call)"),
+            );
             // Control: the codec's row at the same key.
             let (_d, db) = db_without("no-such-cf");
             if cf == CF_NATIVE_POSITIONS {
                 seed(&db);
             } else if cf == CF_NATIVE_BALANCES {
                 PositionManager::new(db.clone())
-                    .put_native_balance(&ALICE, &NativeBalance { available: fp(5), order_margin: FixedPoint::ZERO })
+                    .put_native_balance(
+                        &ALICE,
+                        &NativeBalance {
+                            available: fp(5),
+                            order_margin: FixedPoint::ZERO,
+                        },
+                    )
                     .unwrap();
             } else {
                 db.put_cf_raw(cf, &key, &[0u8; 32]).unwrap();
@@ -440,7 +468,11 @@ mod f1 {
             let b = ex
                 .execute_block(&db, &block_cfg(), vec![tx()], true)
                 .unwrap_or_else(|e| panic!("{what} (control): {e:?}"));
-            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true), "{what} (control)");
+            assert_eq!(
+                (b.receipts.len(), b.receipts[0].status),
+                (1, true),
+                "{what} (control)"
+            );
         }
     }
 

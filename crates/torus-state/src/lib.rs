@@ -16,10 +16,10 @@ pub mod native_da;
 pub mod native_trie;
 pub mod nonce_window;
 pub mod overlay;
-pub mod pruner;
 /// Item 7 option 0 step 0: test-only overlay read probes (`test-probes`).
 #[cfg(feature = "test-probes")]
 pub mod probes;
+pub mod pruner;
 pub mod read_view;
 pub mod resident_rows;
 pub mod retention;
@@ -29,9 +29,9 @@ pub mod snapshot;
 pub mod spawn_count;
 pub mod trade_rows;
 pub mod trie;
+pub mod trie_cursor;
 /// Item 7 option 0 (task 1.6): the raw-DB tripwire (debug / test-probes builds).
 pub mod tripwire;
-pub mod trie_cursor;
 
 pub use backend::{
     AtomicWriteOp, FrozenPending, HashExtras, NativeFlushStats, NativeStateOverlay,
