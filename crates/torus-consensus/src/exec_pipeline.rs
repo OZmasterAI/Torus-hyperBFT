@@ -928,6 +928,7 @@ fn latch_failstop(env: &WorkerEnv, shared: &Shared) {
     shared.failed.store(true, Ordering::SeqCst);
 }
 
+#[derive(Debug)]
 enum JobError {
     /// The atomic batch did NOT land (RocksDB write error / missing CF).
     Write(String),
@@ -1194,6 +1195,35 @@ fn resync_evm(env: &WorkerEnv, height: u64, evm_addrs: Vec<Address>) {
         m.exec_evm_resync_seconds
             .observe(resync_timer.elapsed().as_secs_f64());
     }
+}
+
+/// Item 7 option 0 (task 2.1): stage a fast-path EVM block's side rows
+/// (receipts, hash -> number, tx index, CoreWriter links:
+/// [`torus_bridge::EvmSideRows`]) into W's sidecar overlay, so they join the
+/// block's atomic batch (Flush, Marker) or the window's side rows (Digest,
+/// written by the Checkpoint), like the action status. None of them is hashed
+/// or a root CF. A receipt that does not serialize is deterministic (the same
+/// block and receipts on every node): logged, and no side row is staged, as
+/// `commit_block_metadata` writes none on the serial path. A put error is a
+/// code bug (an unregistered CF): the job fails, so W latches the fail-stop
+/// and nothing of the block lands.
+#[cfg_attr(not(test), allow(dead_code))]
+fn stage_evm_side_rows(
+    overlay: &torus_state::NativeStateOverlay,
+    side: &torus_bridge::EvmSideRows,
+) -> Result<(), JobError> {
+    let rows = match side.rows() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(%e, height = side.height, "flush worker: the EVM side rows do not encode (deterministic); none written");
+            return Ok(());
+        }
+    };
+    for (cf, key, value) in rows {
+        torus_state::StateBackend::put_cf_raw(overlay, cf, &key, &value)
+            .map_err(|e| JobError::Write(format!("EVM side row ({cf}): {e}")))?;
+    }
+    Ok(())
 }
 
 fn observe_flush_stats(env: &WorkerEnv, stats: &torus_state::NativeFlushStats) {
@@ -1858,5 +1888,147 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker, Some(5u64.to_be_bytes().to_vec()));
+    }
+
+    // ---- Item 7 option 0 step 2 (the W side of the EVM fast path) ----
+
+    /// The four side-row CFs of an EVM block (plan task 2.1).
+    const O0_SIDE_CFS: [&str; 4] = [
+        torus_state::cf::CF_RECEIPTS,
+        torus_state::cf::CF_BLOCK_HASH_TO_NUMBER,
+        torus_state::cf::CF_TX_HASH_TO_LOCATION,
+        torus_state::cf::CF_CORE_WRITER_TX,
+    ];
+
+    /// A test EVM block at `height` with `n` receipts (every other tx
+    /// skipped: the receipts' `tx_index` has holes, D5) and `l` CoreWriter
+    /// links.
+    #[allow(clippy::type_complexity)]
+    fn o0_side_block(
+        height: u64,
+        n: u32,
+        l: u64,
+    ) -> (
+        torus_types::TorusBlock,
+        Vec<torus_types::Receipt>,
+        Vec<(u64, u64, torus_state::corewriter_tx::CoreWriterTxLink)>,
+    ) {
+        let mut header = torus_bridge::genesis_parent_header(30_000_000, 5);
+        header.height = height;
+        header.timestamp = 1_700_000_000_000 + height;
+        let block = torus_types::TorusBlock {
+            header,
+            native_actions: Vec::new(),
+            evm_transactions: (0..2 * n).map(|i| vec![0xEE, i as u8]).collect(),
+            core_writer_actions: Vec::new(),
+        };
+        let block_hash = alloy_primitives::keccak256(block.header.canonical_header_bytes());
+        let receipts = (0..n)
+            .map(|i| torus_types::Receipt {
+                tx_hash: alloy_primitives::B256::repeat_byte(0x10 + i as u8),
+                block_number: height,
+                block_hash,
+                tx_index: 2 * i + 1,
+                cumulative_gas_used: 21_000 * u64::from(i + 1),
+                gas_used: 21_000,
+                contract_address: (i % 2 == 1).then(|| Address::repeat_byte(0xC0 + i as u8)),
+                logs: vec![torus_types::Log {
+                    address: Address::repeat_byte(0xA0 + i as u8),
+                    topics: vec![alloy_primitives::B256::repeat_byte(i as u8)],
+                    data: vec![i as u8; 3],
+                }],
+                logs_bloom: Default::default(),
+                status: i % 3 != 2,
+                effective_gas_price: 7,
+            })
+            .collect();
+        let links = (0..l)
+            .map(|seq| {
+                (
+                    height + 1 + seq % 2,
+                    seq,
+                    torus_state::corewriter_tx::CoreWriterTxLink {
+                        tx_hash: alloy_primitives::B256::repeat_byte(0x10 + seq as u8),
+                        call_index: seq as u32,
+                    },
+                )
+            })
+            .collect();
+        (block, receipts, links)
+    }
+
+    /// Task 2.1: W's encoding of `EvmSideRows` (staged into its sidecar,
+    /// written by its flush) gives byte-equal receipts, hash -> number, tx
+    /// index and CoreWriter-link rows to the serial path's
+    /// `commit_block_metadata` + `append_links`, minus the header and the
+    /// body. Zero receipts (an all-skipped block, plan F2): exactly one row,
+    /// the hash -> number row.
+    #[test]
+    fn evm_side_rows_equal_commit_block_metadata() {
+        for (n, l) in [(0u32, 0u64), (1, 0), (0, 2), (3, 2), (6, 5)] {
+            let height = 40 + u64::from(n);
+            let (block, receipts, links) = o0_side_block(height, n, l);
+            let what = format!("{n} receipts, {l} links");
+
+            // Today's serial path.
+            let (reference, _r) = temp_env(None);
+            let reference = reference.state_db;
+            torus_bridge::BlockCommitter::commit_block_metadata(&reference, &block, &receipts)
+                .unwrap();
+            let mut batch = rocksdb::WriteBatch::default();
+            torus_state::corewriter_tx::append_links(&reference, &mut batch, &links).unwrap();
+            reference.write(batch).unwrap();
+
+            // W: the side rows staged into the sidecar overlay, flushed.
+            let (env, _w) = temp_env(None);
+            let db = env.state_db;
+            let overlay = torus_state::NativeStateOverlay::new(db.clone());
+            let side = torus_bridge::EvmSideRows::of(&block, receipts.clone(), links.clone());
+            stage_evm_side_rows(&overlay, &side).unwrap();
+            overlay
+                .freeze(height)
+                .flush_on_worker(None, &db, None, None, None, None)
+                .unwrap();
+
+            for cf in O0_SIDE_CFS {
+                let want = torus_state::StateBackend::iterate_cf(&reference, cf, None).unwrap();
+                let got = torus_state::StateBackend::iterate_cf(&db, cf, None).unwrap();
+                assert_eq!(got, want, "{what}: {cf}");
+            }
+            for cf in [
+                torus_state::cf::CF_BLOCK_HEADERS,
+                torus_state::cf::CF_BLOCK_BODIES,
+            ] {
+                assert!(
+                    !torus_state::StateBackend::iterate_cf(&reference, cf, None)
+                        .unwrap()
+                        .is_empty(),
+                    "{what}: the serial path writes {cf}"
+                );
+                assert!(
+                    torus_state::StateBackend::iterate_cf(&db, cf, None)
+                        .unwrap()
+                        .is_empty(),
+                    "{what}: W never writes {cf} (a dispatch row)"
+                );
+            }
+            let count = |cf| {
+                torus_state::StateBackend::iterate_cf(&db, cf, None)
+                    .unwrap()
+                    .len()
+            };
+            assert_eq!(count(torus_state::cf::CF_BLOCK_HASH_TO_NUMBER), 1, "{what}");
+            assert_eq!(count(torus_state::cf::CF_RECEIPTS), n as usize, "{what}");
+            assert_eq!(
+                count(torus_state::cf::CF_TX_HASH_TO_LOCATION),
+                n as usize,
+                "{what}"
+            );
+            assert_eq!(
+                count(torus_state::cf::CF_CORE_WRITER_TX),
+                l as usize,
+                "{what}"
+            );
+        }
     }
 }
