@@ -1520,17 +1520,30 @@ impl NativeStateOverlay {
     /// deferred part still being merged (Codex P3, p3 merge wait r1).
     #[inline]
     fn lookup_lower(&self, id: CfId, key: &[u8]) -> Result<Option<Option<&[u8]>>, StateError> {
+        self.lookup_lower_as::<false>(id, key)
+    }
+
+    /// [`Self::lookup_lower`] for a caller that observes `LEN`gths only
+    /// (`get_cf_len`): the `test-probes` counters then compare lengths, so a
+    /// layer row of the DB row's length counts as a hit, not in flight
+    /// (Codex round 2 P2 on 84ce3a57). The answer is the same either way.
+    #[inline]
+    fn lookup_lower_as<const LEN: bool>(
+        &self,
+        id: CfId,
+        key: &[u8],
+    ) -> Result<Option<Option<&[u8]>>, StateError> {
         if let Some(hit) = self
             .parent_for_reads()
             .and_then(|p| p.state.lookup(id, key))
         {
             #[cfg(feature = "test-probes")]
-            self.probe_point(id, key, crate::probes::Layer::Parent, hit);
+            self.probe_point::<LEN>(id, key, crate::probes::Layer::Parent, hit);
             return Ok(Some(hit));
         }
         if let Some(hit) = self.layer_for(id)?.and_then(|l| l.lookup(id, key)) {
             #[cfg(feature = "test-probes")]
-            self.probe_point(id, key, self.l_tag(id), hit);
+            self.probe_point::<LEN>(id, key, self.l_tag(id), hit);
             return Ok(Some(hit));
         }
         let hit = self
@@ -1538,7 +1551,7 @@ impl NativeStateOverlay {
             .and_then(|c| c.pending_state().lookup(id, key));
         #[cfg(feature = "test-probes")]
         if let Some(hit) = hit {
-            self.probe_point(id, key, crate::probes::Layer::Checkpoint, hit);
+            self.probe_point::<LEN>(id, key, crate::probes::Layer::Checkpoint, hit);
         }
         Ok(hit)
     }
@@ -1554,11 +1567,23 @@ impl NativeStateOverlay {
     }
 
     /// `test-probes`: count a point read `layer` answered with `hit`
-    /// (`None`: a tombstone); in flight iff the DB answers otherwise now.
+    /// (`None`: a tombstone); in flight iff the DB answers otherwise now,
+    /// in what the caller observes: the bytes, or with `LEN` the length.
     #[cfg(feature = "test-probes")]
-    fn probe_point(&self, id: CfId, key: &[u8], layer: crate::probes::Layer, hit: Option<&[u8]>) {
+    fn probe_point<const LEN: bool>(
+        &self,
+        id: CfId,
+        key: &[u8],
+        layer: crate::probes::Layer,
+        hit: Option<&[u8]>,
+    ) {
         crate::probes::record(id.name(), layer, || {
-            self.db.get_cf_raw(id.name(), key).ok().flatten().as_deref() != hit
+            let db = self.db.get_cf_raw(id.name(), key).ok().flatten();
+            if LEN {
+                db.as_deref().map(<[u8]>::len) != hit.map(<[u8]>::len)
+            } else {
+                db.as_deref() != hit
+            }
         });
     }
 
@@ -2889,7 +2914,7 @@ impl StateBackend for NativeStateOverlay {
                 crate::probes::record(id.name(), crate::probes::Layer::Resident, || false);
                 return Ok(rows.get_len(key));
             }
-            if let Some(hit) = self.lookup_lower(id, key)? {
+            if let Some(hit) = self.lookup_lower_as::<true>(id, key)? {
                 return Ok(hit.map(<[u8]>::len));
             }
             #[cfg(feature = "test-probes")]
@@ -3320,6 +3345,96 @@ mod tests {
             probes::Count { hits: 1, inflight: 1 },
             "q5 returned: the parent determined it, the DB lacks it"
         );
+    }
+
+    /// Codex round 2 P2 on 84ce3a57: a probe counts a layer in flight iff
+    /// what the CALLER observes differs without it. `get_cf_len` observes
+    /// a length only, so a parent row of the DB row's length with other
+    /// bytes is a parent hit, never in flight (it was: the probe compared
+    /// bytes). Over every layering of one key (DB: absent / "db"; parent:
+    /// none / "w" (other length) / "xy" (same length, other bytes) / "db"
+    /// (equal) / tombstone; own: none / write / tombstone), for every read
+    /// kind: the parent is in flight iff the same read with the parent
+    /// skipped (`Plant::SkipParent`, only the DB below) answers otherwise.
+    #[cfg(feature = "test-probes")]
+    #[test]
+    fn o0_probes_count_what_the_caller_observes() {
+        use crate::probes::{self, Layer, Plant, Probe};
+        let (db, _dir) = temp_db();
+        let cf = CF_NATIVE_BALANCES;
+        let mut combos = Vec::new();
+        for in_db in [false, true] {
+            for parent in 0..5u8 {
+                for own in 0..3u8 {
+                    combos.push((in_db, parent, own));
+                }
+            }
+        }
+        let key = |c: usize| vec![b'k', c as u8];
+        for (c, &(in_db, _, _)) in combos.iter().enumerate() {
+            if in_db {
+                db.put_cf_raw(cf, &key(c), b"db").unwrap();
+            }
+        }
+        let parent_ov = NativeStateOverlay::new(db.clone());
+        for (c, &(_, op, _)) in combos.iter().enumerate() {
+            match op {
+                1 => parent_ov.put_cf_raw(cf, &key(c), b"w").unwrap(),
+                2 => parent_ov.put_cf_raw(cf, &key(c), b"xy").unwrap(),
+                3 => parent_ov.put_cf_raw(cf, &key(c), b"db").unwrap(),
+                4 => parent_ov.delete_cf_raw(cf, &key(c)).unwrap(),
+                _ => {}
+            }
+        }
+        let parent = parent_ov.freeze(1);
+        let own = |ov: &NativeStateOverlay| {
+            for (c, &(_, _, op)) in combos.iter().enumerate() {
+                match op {
+                    1 => ov.put_cf_raw(cf, &key(c), b"own").unwrap(),
+                    2 => ov.delete_cf_raw(cf, &key(c)).unwrap(),
+                    _ => {}
+                }
+            }
+        };
+        let overlay = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+        own(&overlay);
+        let skipped = {
+            let plant = Probe::new();
+            plant.plant(Plant::SkipParent);
+            let _i = probes::install(plant);
+            let ov = NativeStateOverlay::with_parent(db.clone(), Some(parent.clone()));
+            own(&ov);
+            ov
+        };
+        let p = Probe::new();
+        let _i = probes::install(p.clone());
+        let mut seen = std::collections::BTreeSet::new();
+        for (c, combo) in combos.iter().enumerate() {
+            let k = key(c);
+            let reads: [(&str, &dyn Fn(&NativeStateOverlay) -> String); 4] = [
+                ("get_cf_raw", &|ov| format!("{:?}", ov.get_cf_raw(cf, &k).unwrap())),
+                ("get_cf_len", &|ov| format!("{:?}", ov.get_cf_len(cf, &k).unwrap())),
+                ("iterate_cf", &|ov| format!("{:?}", ov.iterate_cf(cf, Some(&k)).unwrap())),
+                ("prefix_exists", &|ov| format!("{:?}", ov.prefix_exists(cf, &k).unwrap())),
+            ];
+            for (what, f) in reads {
+                p.reset();
+                let got = f(&overlay);
+                let n = p.total(|_, l, _| l == Layer::Parent);
+                let differs = got != f(&skipped);
+                assert!(n.hits <= 1, "{what} {combo:?}: {n:?}");
+                assert_eq!(
+                    n.inflight > 0,
+                    differs,
+                    "{what} {combo:?}: {n:?}, answer differs without the parent: {differs}"
+                );
+                seen.insert((what, n.hits, differs));
+            }
+        }
+        // The Codex case by name: an equal-length parent row is a hit, not
+        // in flight, for a length read; a row of another length is in flight.
+        let (len_quiet, len_inflight) = (("get_cf_len", 1, false), ("get_cf_len", 1, true));
+        assert!(seen.contains(&len_quiet) && seen.contains(&len_inflight), "{seen:?}");
     }
 
     /// Review H3 (s517): `iterate_cf_from(start, limit)` == the first `limit`
