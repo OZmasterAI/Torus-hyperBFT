@@ -14710,6 +14710,226 @@ so 3 is used. The libc samples have no symbols (stripped local symbols). Their h
   (`8i-analyse.py`, `8i.txt`, `8i-cells.json`, `8i-prof.py`, `8i-prof-K{1,3,6}.txt`). Tools `ozarchy-8i-tools/`,
   binaries `ozarchy-8f-stage/`.
 
+## 97. Step 8k: explore workflow: 21 new ideas ranked; L3.3 exact-size Classic book encoder built and A/B'd (A = main `0f5bef38`, B = `exp/8k-book-fast-encode` `4b916ecf` with `TORUS_BOOK_FAST_ENCODE=1`), standard load and 1M-resting deep book, 300 markets, 600 s cells, n = 3 (campaigns ozarchy-8k / ozarchy-8kd, archy, 2026-10-19)
+
+**8k ran Phases 1-5 of `docs/perf/8k-explore-workflow.md` in one day. Phase 2 proposed 21 new ideas: 4 are dead,
+15 are backlog and 2 were picked. Top 5 by score: L3.3 1.60, L2.2 0.84, L3.1 0.54, L5.1 0.47, L2.1 0.37. Pick 1 is
+L3.3, an exact-size Classic book encoder (node-local, byte-identical, behind `TORUS_BOOK_FAST_ENCODE`, default off).
+It was built and tested: workspace nextest 4161 passed, 0 failed, and flag on equals flag off on a 130-block
+pipelined app stream. It passed its microbench gate on books of spread size (P1M encode -29.9 to -36.0%), but not on
+equal-size books (-5.5 to -18.7%, below the 20% STOP line). The ranker's own design, an exact size pass, failed its
+microbench (-9 to -16%) and was replaced. L3.3 was benched A B B A A B on the standard load and on the 1M-resting
+deep book (ozarchy-8kd). All 14 cells are valid by the driver checks. **There is no verdict.** The
+Phase 5 analysis (exec-path merge rule, paired CIs, save_books per 1k fills) was not run before the workflow moved
+on. The driver's headline matched/s by cell is in 97.4. It is raw and unjudged. Pick 2, L2.2 (no-merge position
+flush), is written but not compiled: the bench held the host and the build lock until the run ended.**
+
+Question (bench queue step 8k, owner s131): find, rank, build and A/B the most promising improvement to the chain's
+throughput or latency that has not already been explored. Deliver an idea report, a prototype on its own branch, a
+bench verdict and this section. Never merge to main. Keep off item 7 option 0's and RH4's code, item 6 Phase 5 and
+checkpoint slicing.
+
+### 97.1 Method
+
+* Docs branch `docs/perf-section-97-8k` (from origin/main `4811e2b0` + section 96). Every event is in the
+  append-only log `docs/perf/8k-explore-log.md`.
+* **Phase 1** (one survey agent, 04:46-04:52): `docs/perf/8k-explore-survey.md` lists 177 already-explored items in
+  12 areas. Each has its verdict and source doc, plus the baseline cost table with the sections cited. It is the
+  "already explored" filter.
+* **Phase 2** (6 lens agents: consensus and cadence, execution engine, state and storage, networking and DA,
+  cryptography, wildcard): 21 ideas, 3-4 per lens (L1.1-L6.3).
+* **Phase 3** (one critic per idea, then one ranker, 05:23-05:27): every critic verdict is "weakened" (a new, lower
+  estimate) or "dead". score = G x C x L x R / days, using the critic's estimate, not the proposer's (formula in
+  `docs/perf/8k-explore-ideas.md`). The idea report was committed (`bf978e72`) before any build.
+* **Phase 4** (one builder per pick, in sequence): own branch, worktree and `CARGO_TARGET_DIR`; tests first; a
+  microbench gate at half the expected gain.
+* **Phase 5** (one bench agent): standard load plus the shape the idea targets, A B B A A B, n = 3.
+
+### 97.2 Ideas (full table: `docs/perf/8k-explore-ideas.md`)
+
+| rank | id | idea | locality | critic | score | final status |
+|---|---|---|---|---|---|---|
+| 1 | L3.3 | Exact-size fixed-layout Classic book encoder | node-local, byte-identical | weakened (P1M save_books -30 to -50%, matched/s +3 to +8%; standard ~0) | 1.60 | built, benched, verdict pending |
+| 2 | L2.2 | No-merge position flush | node-local, byte-identical | weakened (exec on-CPU per 1k fills -3 to -6%) | 0.84 | written, not compiled |
+| 3 | L3.1 | Checkpoint-coalesced Classic book save | node-local | weakened (P1M +8 to +17%; 0 once the running hash is activated; 18c area) | 0.54 | backlog |
+| 4 | L5.1 | EIP-712 item-hash memo cache | node-local | weakened (CPU -2 to -6.5%, upper end a bench artefact; matched/s 0) | 0.47 | backlog |
+| 5 | L2.1 | Streamed in-order settle | node-local | weakened (block_ms -2.5 to -5 ms, matched/s +0.5 to +3%; needs a fallback proof) | 0.37 | backlog |
+
+* Dead: L2.4 (dense trader slots; the s82 hasher precedent showed no gain), L3.2 (running hash v2; the hash is off in
+  every cell and the code is 18c's), L3.4 (FIFO compaction for the DA CF; the owner ruled FIFO out and it breaks heal
+  / RH4), L6.2 (attestation-window commitment; premise false, it re-opens Phase 5).
+* The largest consensus-changing idea, L6.1 (window-committed order books, 0.14), was not picked. Its gain is not
+  clearly larger than the node-local ideas, and the Rules block it until option 0 lands.
+
+### 97.3 What was built: L3.3 on `exp/8k-book-fast-encode` `4b916ecf`
+
+* One commit on origin/main `0f5bef38`, pushed to origin (not main). Worktree `/home/oz/projects/wt/8k-book-fast-encode`.
+* Flag `TORUS_BOOK_FAST_ENCODE=1`, default off. It is read once through a OnceLock, and tests can pin it per thread
+  (`with_book_fast_encode`). When it is on, the Classic arm of `save_order_books` and `save_book_full` call
+  `OrderBook::encode_classic` instead of `borsh::to_vec`.
+* `encode_classic` writes the same bytes as the custom borsh impls (`Order` at order_book.rs:4336, `OrderBook` at
+  :4604). It sizes the output Vec once from counts the book already holds: header + 97 B per resting order + 16 B per
+  resting cloid + the pending stops. Each order is written from one stack record. On live books the size is exact
+  (capacity == len, checked by tests and the bench). The bytes never depend on it.
+* Files: new `crates/torus-core/src/order_book/classic_encode.rs`, `classic_encode_tests.rs` and
+  `crates/torus-core/benches/book_encode.rs`. Edited `order_book.rs` (mod lines), `crates/torus-core/Cargo.toml`
+  (tikv-jemallocator as a Linux-only dev-dependency, plus the bench target), `Cargo.lock`, and
+  `crates/torus-bridge/src/native_executor.rs` (the flag and the two call sites). In
+  `crates/torus-consensus/src/app.rs`, one test function was added inside `crash_recovery_tests`. It is outside 18c's
+  EVM section, block overlay and flush worker, but app.rs is 18c's file, so a merge may need a trivial resolution.
+* **Tests (tests first; RED on the stub, 4 of 4 failed, then GREEN):**
+  * Targeted run: 8 of 8 passed. They are 5 torus-core encode tests (2 of them proptests over random books: both
+    sides, empty, last_trade_price None / Some, cloid None / Some, every OrderType and TIF, pending stops), 2 flag
+    parse / pin tests, and `app::crash_recovery_tests::book_fast_encode_state_equals_flag_off`.
+  * The app test runs 130 P2 blocks with reduce-only places and cloids, pipelined, with a checkpoint every 5 blocks.
+    Flag on equals flag off in the per-block write sets (receipts included), the running hash (active), every CF dump
+    and the native root. It also checks that the on run took the fast path. Flipping one byte in `encode_classic`
+    made it fail at height 1.
+  * Workspace nextest: 4161 passed, 0 failed, 0 flaky, 44 skipped. Doc tests: 1 passed.
+  * One earlier workspace run had 1 failure: `torus-network` `resubscribe_wedge
+    restarted_validator_single_stale_connection_within_budget`, AddrInUse on a port bind. It is unrelated and passed
+    on two later full runs.
+* **Microbench** (`benches/book_encode.rs`): release build with jemalloc as the global allocator, as in the node.
+  300 books, bytes equal for every book. Arms interleaved A B S S B A, 30 samples per arm, one process per shape,
+  pinned with taskset. Encode-time cut of `encode_classic` vs `borsh::to_vec`:
+
+| shape | resting orders | cut | borsh median | fast median |
+|---|---|---|---|---|
+| P1M, book sizes spread +-50% around 5,333 (4 processes) | 1.6M | -29.9 to -36.0% (1.43-1.56x) | 45.4-49.3 ms | 29.6-33.1 ms |
+| P1M, every book at 5,333 orders (517 KB, borsh's best case) | 1.6M | -5.5 to -18.7% | - | - |
+| P1M, spec variant with an exact size pass (spread sizes) | 1.6M | -9 to -16% | - | - |
+| mixed (10% cloids, stops) | - | -15 to -38% | - | - |
+| P0 | 0.21M | -5 to -23% | - | - |
+
+  STOP line: a cut under 20% at 1.6M. The builder judged it passed on the spread-size shape, which models books of
+  different depths. The equal-size shape is below it.
+
+### 97.4 Bench (Phase 5)
+
+* **Arms:** A = origin/main `0f5bef38` (the merge-base), node md5 `0d24371e849027211a69b3cf5c2c41a4`. B = `4b916ecf`
+  with `TORUS_BOOK_FAST_ENCODE=1` in the arm env, node md5 `b0a4c2f11966bde155e150a4d99e7108`. Both arms use A's
+  bench-throughput `708eb332` and torus-tx-flood `dd59d50d`, so only the node differs.
+* **Builds:** one recipe for both arms (plain release `--locked`, each package alone, own worktrees and target dirs
+  `~/.cargo-target-8k-a` / `-b`, seeded by reflink from `.cargo-target-8f`). md5s are in
+  `~/bench-results-matched/ozarchy-8k-stage/build/md5s.txt`. Tools are frozen from `0f5bef38` in
+  `ozarchy-8k-tools/` (100k genesis) and `ozarchy-8k-tools-deep/` (the 1M genesis of 8i, md5 `a644d0a7`).
+* **Checks:** `8k-checks.sh` = the p8g checks plus three new ones. `k8fastchk` checks the flag took effect: B logs
+  on=true once per node, A logs nothing. `k8swapchk` stops the campaign if swap grows by more than 512 MB.
+  `k8deepchk` checks the deep shape (1M resting orders, 1M accounts). The driver also checks node md5 on 3 nodes and
+  the node env.
+* **Smokes:** CHECK OK on B, A and deep B (60 s; 250.8k / 262.1k / 218.6k matched/s; not measurements). The first B
+  smoke was void because of a driver regex (`state_hash_activation = off` is now printed without quotes). The regex
+  was fixed and the smoke rerun. The void attempt is kept in `ozarchy-8k-run/attempts/`.
+* **Campaigns:**
+  * `ozarchy-8k`: standard load (hsdb-300m, 300 markets, rate 76,000), a 300 s gated warm-up (A), then A B B A A B
+    with 600 s cells. 06:32-08:01, `campaign.done` exit=0.
+  * `ozarchy-8kd`: the deep book of sections 93 / 96 (BULK_COUNT=1000000, PRELOAD=1000000), same order, chained on
+    exit 0 of the standard campaign. 08:02-09:54, `campaign.done` exit=0, "cells.tsv: 7 rows, 0 bad", no reruns.
+
+**Metrics (the Phase 5 analysis was not run, so nothing here is judged):**
+
+| metric | A mean | B mean | paired B/A (95% CI) |
+|---|---|---|---|
+| exec-thread on-CPU ms per 1k fills | not available | not available | not available |
+| native blocks/s | not available | not available | not available |
+| block p50 ms | not available | not available | not available |
+| block p99 ms | not available | not available | not available |
+| timeouts per 1,000 native blocks | not available | not available | not available |
+| matched/s | not available | not available | not available |
+| CPU-s per 1M fills | not available | not available | not available |
+| save_order_books ms per native block | not available | not available | not available |
+
+**Driver per-cell table (`cells.tsv`):** these are the driver's own fields: rc, AGREE, node md5 on 3 nodes, the
+headline matched/s and its cell flag. Every listed cell passed every CHECK in its campaign log, and neither log
+has a CELL-FLAG or VOID line. ACCEPT / PASS and the per-cell re-check from raw files are part of the pending
+analysis.
+
+| campaign | cell | arm | rc | AGREE | md5 ok | matched/s (driver) | flag |
+|---|---|---|---|---|---|---|---|
+| ozarchy-8k | w1 (warm-up) | A | 0 | yes | yes | 260,002.0 | ok |
+| ozarchy-8k | r1-A | A | 0 | yes | yes | 258,837.8 | ok |
+| ozarchy-8k | r1-B | B | 0 | yes | yes | 261,113.5 | ok |
+| ozarchy-8k | r2-B | B | 0 | yes | yes | 261,747.6 | ok |
+| ozarchy-8k | r2-A | A | 0 | yes | yes | 261,420.8 | ok |
+| ozarchy-8k | r3-A | A | 0 | yes | yes | 259,493.0 | ok |
+| ozarchy-8k | r3-B | B | 0 | yes | yes | 260,508.9 | ok |
+| ozarchy-8kd | w1 (warm-up) | A | 0 | yes | yes | 225,058.6 | ok |
+| ozarchy-8kd | r1-A | A | 0 | yes | yes | 223,981.1 | ok |
+| ozarchy-8kd | r1-B | B | 0 | yes | yes | 225,491.2 | ok |
+| ozarchy-8kd | r2-B | B | 0 | yes | yes | 228,425.2 | ok |
+| ozarchy-8kd | r2-A | A | 0 | yes | yes | 223,548.5 | ok |
+| ozarchy-8kd | r3-A | A | 0 | yes | yes | 225,053.9 | ok |
+| ozarchy-8kd | r3-B | B | 0 | yes | yes | 228,116.5 | ok |
+
+* Raw arithmetic on the driver metric only (no CI, not a verdict):
+  * Standard: A 259,917, B 261,123 (B/A 1.0046; pairs 1.0088 / 1.0013 / 1.0039). B's mean is inside A's own
+    range in this campaign (258.8-261.4k) and inside the baseline band of ~257-265k (sections 94, 95, as cited in
+    the 8k prompt). This is what the ranker expected ("standard ~0").
+  * Deep book: A 224,195, B 227,344 (B/A 1.0140; pairs 1.0067 / 1.0218 / 1.0136). B is above A in all 3 pairs,
+    but by less than the +3 to +8% the critic expected for matched/s at P1M. `k8deepchk` saw 1M resting orders and
+    1M accounts in the cells.
+* The deciding rows (save_books per 1k fills, exec on-CPU per 1k fills, native blocks/s, p50 / p99) need the analysis.
+
+### 97.5 Verdict
+
+**No verdict yet.** Both campaigns are valid by the driver checks (14 of 14 cells rc 0, AGREE, md5 ok, flag ok). The
+exec-path merge rule could not be applied because the analysis was not run: the deep campaign ended at 09:54, after
+the workflow's Phase 5 step had returned. The raw matched/s fits "standard ~0". On the deep book it is +1.4% (3 of 3
+pairs positive), below the expected +3 to +8%. **Recommendation: more work (finish the analysis),
+not a merge candidate yet.** L3.3 becomes a merge candidate (flag default off) only if the analysis shows a clear
+save_books per 1k fills cut at 1M with no regression on the merge-rule rows at the standard load.
+
+### 97.6 What did not work
+
+* **The ranker's L3.3 design (an exact size pass) died at its microbench.** On the spread-size P1M shape it cut encode
+  time by only 9-16%, under the 20% STOP line. The size pass reads every resting order a second time, about 10 ms at
+  1.6M orders, and that cancels most of the gain. The built design takes the size from counts the book already
+  holds. The spec variant stays in the code (`#[doc(hidden)] encode_classic_size_pass`) for the record.
+* **The fixed-layout record is not where the gain is.** Writing each order from one stack record saves only about
+  3%, because the encode is memory-bound. Almost all of the measured cut comes from removing borsh's doubling-growth
+  copies (the 15% memmove row of s96.3 and part of the serialize row). So the gain depends on where each book sits
+  relative to a power-of-two capacity. On equal-size books of 5,333 orders (517 KB, just under borsh's 512 KiB growth
+  step) the cut was -5.5 to -18.7%, below the STOP line. Before benching, the builder expected the P1M save_books gain
+  at the low end of the -30 to -50% range or below, because s96.3's serialize share includes page faults this change
+  does not remove.
+* **L2.2 was never compiled.** It is the second pick (0.84), aimed at standard-load exec on-CPU. Its code, tests and
+  microbench are written but uncommitted in `/home/oz/projects/wt/8k-settle-no-merge` (branch point `0f5bef38`):
+  * `PositionCache::flush_with_runs`;
+  * the pass-B runs in `settle_market_results_parallel_runs`;
+  * `ubench_position_cache_flush_runs` at the s94 and q8re shapes;
+  * 3 torus-core and 4 torus-bridge differential tests;
+  * the app test `settle_no_merge_state_equals_flag_off`.
+
+  The L3.3 bench held the host and the build lock from 06:32, and the Rules forbid building during a bench. Nothing
+  was compiled, there was no RED run, and no microbench ran. So this is no evidence for or against the idea. It is
+  an unfinished build, and its STOP gate (a saving under 1.0 ms per block) has not been tested.
+* **Process:** the workflow asked for the bench output and the L2.2 output before the long campaigns ended, and the
+  agents' wait hook blocked waits longer than about 1.8 h. As a result, the 8k bench produced valid cells but no
+  judged result, and the second build produced no compile. A Phase 5 that holds ~3h20 of bench time needs either a
+  follow-up analyst step after `campaign.done`, or a shorter campaign.
+
+### 97.7 Next
+
+* **Analyst (first; both campaigns are done, `campaign.done` exit=0 in both run dirs; check the host is quiet):**
+  * Run `python3 -I ~/bench-results-matched/ozarchy-8k-run/analyst/8k-analyse.py <RUN_DIR>` on both run dirs. It is
+    adapted from p8g's script and not yet tested on real cells.
+  * Re-check every cell from its raw files (rc, ACCEPT / AGREE / PASS, node md5 on 3 nodes).
+  * Fill in the table in 97.4 with paired CIs, judge by the exec-path merge rule, and write the verdict as a new
+    sub-section (97.8) and log entries. Do not edit this section's raw tables.
+* **L2.2:** seed `/home/oz/.cargo-target-8k-settle-no-merge` by reflink from `.cargo-target-8f`, then build under
+  the heavy build lock. After that: RED run on a stub, microbench (STOP below 1.0 ms per block), targeted tests,
+  workspace nextest, commit, and push `exp/8k-settle-no-merge` (never main). Bench it on the standard cells only if
+  it passes the gate.
+* **Next best idea after these two:** L3.1, checkpoint-coalesced Classic book save (0.54; P1M +8 to +17%). Its value
+  is 0 once the running hash is activated, and its hook sits in 18c's area, so it is an owner / 18c call. Its
+  falsifier is in the ideas doc. Run it after L3.3's verdict, because both attack the same row.
+* **Data:**
+  * Cells: `~/bench-results-matched/ozarchy-8k-300m-*` and `ozarchy-8kd-300m-*`.
+  * Campaign dirs: `ozarchy-8k-run/campaign/` and `ozarchy-8kd-run/campaign/` (`campaign.log`, `cells.tsv`, `smoke/`).
+  * Chain log: `ozarchy-8k-run/chain-8kd.log`. Void smoke: `ozarchy-8k-run/attempts/`.
+  * Tools, specs, drivers and checks: `ozarchy-8k-tools/` (`8k-spec.json`, `8kd-spec.json`, `8k-checks.sh`,
+    `chain-8kd.sh`) and `ozarchy-8k-tools-deep/`. Binaries and md5s: `ozarchy-8k-stage/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
