@@ -989,6 +989,53 @@ two guards, R4).
 - Codex torus-adversarial review of the branch (`codex_worktree.py`, scope branch). Its fixes come with tests.
   Then Q11.
 
+**Done (G4, 2026-10-19, on `04a25711`; 4.4 is 18c's).** Commits: 4.1 `4249c92c`, 4.2 `53ace0c9` + `a070eafd`,
+4.3 `998719d7`, clippy `795cc291`, harness fix F15 `9bc80fce`.
+- 4.1: as planned. `prune_committed_txs(h)` keeps the raw DB; both share `prune_committed_with` (a height closure
+  called once, before the first nonce read). Tests: `prune_on_view_uses_view_height_and_view_nonces` (decision 7's
+  nonce and height rules on a view; the raw-DB prune does not see the view's nonce; the view's height wins over the
+  DB marker), guard `prune_without_view_reads_db_marker`. Deviation: `notify_block_committed` (design point 8, "both
+  functions") stays on the raw DB: it has no production caller (F3). `torus-node` reads the flag once more for the
+  commit handler (an invalid value warns twice).
+- 4.2: `torus_exec_evm_fast_path_blocks`, `torus_flush_worker_evm_trie_seconds` as planned (W times
+  `evm_window_prefix`: a fast-path block's step at interval 0, a checkpoint window's otherwise), plus three cheap
+  series Q11 reads: `torus_exec_evm_blocks` (all EVM blocks: the pipelined share), `torus_exec_evm_idle_before_seconds`
+  (per EVM block, E from the previous block's end to this one's start, the barrier included, as the q5-gaps view) and
+  `torus_exec_evm_block_seconds` (exec ms at EVM heights). `torus_exec_evm_seconds` unchanged (same count flag off and
+  on). The startup line of 3.1 now also names the view prune, the checkpoint rule and the metrics. Tests:
+  `evm_fast_path_metrics_register` (telemetry), `evm_fast_path_metrics_count_evm_blocks_and_w_trie_step` (flag off /
+  on at interval 0, on Every5, on without W).
+- 4.3: config reference (the row, a section "EVM fast path (item 7 option 0)" with the 4 a freshness rule and the
+  metrics), new `docs/api/eth-head.md`, `docs/monitoring-setup.md` rows, the design's status line. Deviation:
+  `docs/perf/bench-queue.md` (Q11) is not edited on this branch; 18c queues Q11 on main.
+- **What Q11 (section 6) can read from metrics:** pass 2 (fast / all EVM blocks; idle p50 from
+  `torus_exec_evm_idle_before_seconds`, buckets 0.5, 1, 2, 4, 8 ms...: "p50 < 5 ms" holds if >= 50% fall in the
+  4 ms bucket, a p50 between 4 and 8 ms needs the log lines), pass 3 (`torus_exec_checkpoint_deferred_read_waits`),
+  pass 4 (`torus_exec_resident_rows_rebuilds`, `torus_exec_checkpoint_layer_shared`), pass 5
+  (`torus_exec_checkpoints`, `torus_exec_checkpoint_layer_bytes`); report rows: `torus_exec_evm_seconds` per EVM block
+  (sum / `torus_exec_evm_blocks_total`; other blocks observe ~0), exec ms at EVM heights vs others
+  (`torus_exec_evm_block_seconds` vs `torus_exec_block_seconds`), `torus_flush_worker_evm_trie_seconds`, W busy
+  (`torus_flush_worker_seconds`, `_checkpoint_seconds`), native blocks (`torus_exec_native_blocks`), timeouts and
+  `no_proposal` (`torus_consensus_timeout_total`, `torus_view_timeout_no_proposal`). **Not from metrics:** matched/s,
+  CPU-s / 1M, exec-thread on-CPU (`sched_by_node`), block p50 / p99, commit -> exec lag (logs; order-age exec minus
+  commit approximates it), the exec queue PEAK (`torus_exec_queue_depth` is a gauge: the max of the scrapes), the EVM
+  checks of pass 6 (`evm_load.py`: landed, `off_cadence_blocks`, eth head; attestation and fail-stop lines in the logs).
+- **F15 (harness, found by the G4 gates).** `o0_coverage_floor_per_config` lost its C18 row (a deferred-read wait,
+  G mode Every5 epoch-off) in 1 of 5 `o0_*` runs at load average 260 on 18 cores. Cause: `DeferredGate`'s 2 s hold
+  timeout opened the gate for the rest of the run (right for the item 6 p3 tests, which count a timeout as a
+  failure), so one block slower than 2 s dropped every later forced wait. Fix: `DeferredGate::rearming()` for the
+  option 0 G-mode nodes: a timed-out hold lets only its own merge through. Test
+  `deferred_gate_rearm_holds_after_a_timeout`. The p3 tests keep the default gate.
+- **F16 (open, pre-merge).** `cargo fmt --check` on the P set: 3534 hunks on the branch vs 3334 on `fd94818d`, all from
+  G0-G3 (G4's lines are clean). Section 11's "fmt counts not above main's" is open; a whole-file `rustfmt` also
+  rewrites main's own debt, so format only the branch's hunks.
+- Clippy: the branch had 20 warnings over main (all on G0-G3 lines, mostly tests); `795cc291` brings it to main's 322
+  with the same lint set. Known load-flaky `hot_path_fails_view_fast_when_body_never_arrives` failed once in the first
+  P-set run (S395: load-flaky by design), passed in the rerun.
+- Gates: P set nextest 3706 / 3706 (40 skipped) on `795cc291`; torus-consensus 525 / 525 after F15; rest of the
+  workspace 474 passed (1 skipped); doc tests rc=0 (1 passed); `o0_*` 48 / 48 twice after F15; release
+  `cargo build -p torus-node` OK; `RUSTFLAGS="-D warnings"` build of the P set (all targets) OK; clippy 322 = main.
+
 Step 4 size: ~150-300 lines (estimate).
 
 ### Step 5: Q11 and the default
