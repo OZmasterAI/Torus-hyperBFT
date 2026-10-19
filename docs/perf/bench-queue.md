@@ -624,7 +624,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per node, x 2.0, 4 / 4), not the DA GC; with the GC it accounts for CPU per fill; exec us / fill +14-16% in
    state-compaction seconds (23% vs 13% of seconds); blocks/s link medium-low (bigger blocks, saturated exec); no
    RocksDB stalls. Next: retention-on arm with block-body pruning off. Raw 8r data: branch `data/ozarchy-8r` 7c8323ac.**
-8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; right after 8l; ~40 min). 8p
+8s. **b0 screen: Classic vs mode 3 + b0 (mode 3 with checkpoints)** (owner s131; NOW: pause 8l, run 8s, then 8l
+   restarts from scratch; ~40 min). 8p
    (section 102): mode 3 wins deep (blocks/s 2.16x) but loses shallow (blocks/s 0.62x, p50 3.3x, CPU per fill +17%)
    because modes 2/3 flushed every block. b0 (`perf/mode3-checkpoints-b0` `c2fbfbc0`, Codex torus-adversarial approve,
    137 targeted tests): with a checkpoint interval set, modes 2/3 use checkpoints; the write half of the book save runs
