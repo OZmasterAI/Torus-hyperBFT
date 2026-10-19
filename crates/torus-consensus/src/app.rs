@@ -3804,6 +3804,7 @@ impl ExecutionContext {
                     if self.test_crash_before_absorb {
                         // Item 7 option 0 (task 3.5): a crash after the EVM
                         // part, before the absorb: latched, as a crash is.
+                        self.test_path("crash.before_absorb");
                         self.exec_failed.store(true, Ordering::SeqCst);
                         return;
                     }
@@ -3995,6 +3996,7 @@ impl ExecutionContext {
         // without the latch would land the held jobs (plan F10).
         #[cfg(test)]
         if self.test_crash_after_evm_section {
+            self.test_path("crash.after_evm_section");
             self.exec_failed.store(true, Ordering::SeqCst);
             return;
         }
@@ -33438,7 +33440,6 @@ mod crash_recovery_tests {
 
     /// Plan task 3.5 (R4): how a crash is latched (step 2 of `o0_crash`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    #[allow(dead_code)] // W-side latches and `Off`: task 3.5's crash tests
     enum O0Latch {
         /// E latched `exec_failed` itself (a fail-stop, or a crash seam).
         E,
@@ -33808,6 +33809,183 @@ mod crash_recovery_tests {
         o0_fault_case(P5Ckpt::PerBlock, &blocks, 3, 4, "evm.absorb_fault", arm, disarm);
         let blocks = o0_fault_blocks(15, &[(13, O0Hand::Evm)]);
         o0_fault_case(P5Ckpt::Every5, &blocks, 10, 13, "evm.absorb_fault", arm, disarm);
+    }
+
+    /// Plan task 3.5: one crash point. The fast node runs `blocks` with W
+    /// held from `hold_at` (interval 0: that block's job; Every5: the
+    /// checkpoint in flight) through `last`, `arm` set right before `last`;
+    /// the crash goes through `o0_crash` with `latch` (never a bare drop);
+    /// the replay re-hashes exactly d+1..=last, which must hold every height
+    /// of `must_replay`; then the run equals S. Returns the node's path flags.
+    #[allow(clippy::too_many_arguments)]
+    fn o0_crash_case(
+        ckpt: P5Ckpt,
+        blocks: &[O0Block],
+        hold_at: u64,
+        last: u64,
+        latch: O0Latch,
+        replay_crash: bool,
+        must_replay: &[u64],
+        arm: impl FnOnce(&mut O0Node),
+        what: &str,
+    ) -> BTreeMap<&'static str, u64> {
+        let what = format!("{ckpt:?} {what}");
+        let (mut node, d) = o0_held_run(ckpt, blocks, hold_at, last, arm);
+        if latch == O0Latch::E {
+            assert!(node.ctx.as_ref().unwrap().exec_failed.load(Ordering::SeqCst), "{what}: E latched");
+        }
+        let replayed = o0_crash(&mut node, d, last, latch, replay_crash)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(replayed, (d + 1..=last).collect::<Vec<_>>(), "{what}");
+        for h in must_replay {
+            assert!(replayed.contains(h), "{what}: {h} replayed: {replayed:?}");
+        }
+        let paths = o0_paths(&node);
+        let restarts = node.restarts;
+        assert_eq!(restarts, 1 + u64::from(replay_crash), "{what}");
+        o0_assert_matches_serial(node, blocks, last, &what);
+        paths
+    }
+
+    /// Plan task 3.5 (C19): a crash after the fast-path EVM part, before the
+    /// absorb (latched seam), with the parent's job (interval 0) or the
+    /// checkpoint (Every5) held: the marker stays at d, nothing of the lost
+    /// heights lands, the replay re-executes them (the EVM block too).
+    #[test]
+    fn fast_path_crash_before_absorb_replays() {
+        let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_before_absorb = true;
+        let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
+        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 3, 4, O0Latch::E, false, &[4], arm, "before absorb");
+        assert!(o0_has(&p, "crash.before_absorb") && !o0_has(&p, "evm.absorb_fault"), "{p:?}");
+        let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (13, O0Hand::Evm)]);
+        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, false, &[8, 13], arm, "before absorb");
+    }
+
+    /// Plan task 3.5 (C19): a crash after the absorb, before the hand-off
+    /// (`test_crash_after_evm_section`, now latched).
+    #[test]
+    fn fast_path_crash_after_absorb_replays() {
+        let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_after_evm_section = true;
+        let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
+        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 3, 4, O0Latch::E, false, &[4], arm, "after absorb");
+        assert!(o0_has(&p, "crash.after_evm_section") && o0_has(&p, "evm.absorb"), "{p:?}");
+        let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (13, O0Hand::Evm)]);
+        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, false, &[8, 13], arm, "after absorb");
+    }
+
+    /// Plan task 3.5 (C19): a crash after the hand-off, before the write:
+    /// interval 0, the EVM block's own Flush held and failed
+    /// (`gate.fail_next`); Every5, the checkpoint whose window holds an EVM
+    /// block (8) held and failed, a later EVM block (12) handed off behind it.
+    #[test]
+    fn fast_path_crash_after_handoff_replays() {
+        let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
+        o0_crash_case(P5Ckpt::PerBlock, &blocks, 4, 4, O0Latch::WFail, false, &[4], |_| {}, "after hand-off");
+        let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (12, O0Hand::Evm)]);
+        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::WFail, false, &[8, 12], |_| {}, "after hand-off");
+    }
+
+    /// Plan task 3.5 (C19): a crash inside W's EVM trie step (the panic
+    /// seam, before its batch; `worker_loop` catches it and latches): the
+    /// EVM block's Flush (interval 0), the checkpoint's window step (Every5).
+    #[test]
+    fn fast_path_crash_in_w_evm_trie_step_replays() {
+        let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
+        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 4, 4, O0Latch::WPanic, false, &[4], |_| {}, "W EVM step");
+        assert!(o0_has(&p, "w.evm_step.flush"), "the step ran (and panicked): {p:?}");
+        let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (12, O0Hand::Evm)]);
+        let p = o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::WPanic, false, &[8, 12], |_| {}, "W EVM step");
+        assert!(o0_has(&p, "w.evm_step.checkpoint"), "the step ran (and panicked): {p:?}");
+    }
+
+    /// Plan task 3.5 (C19): a crash during the replay of an EVM block: the
+    /// first crash (latched, Every5, checkpoint held) loses 6..=13; the
+    /// replay context crashes through the same latched seam at its first EVM
+    /// block (8), so 6..=7 land and 8..=13 are lost again; the second
+    /// replay re-executes exactly those.
+    #[test]
+    fn fast_path_crash_during_replay_of_an_evm_block() {
+        let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_after_evm_section = true;
+        let blocks = o0_fault_blocks(15, &[(8, O0Hand::Evm), (13, O0Hand::Evm)]);
+        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, true, &[8, 13], arm, "replay crash");
+    }
+
+    /// Plan task 3.5 (C19, R1): a crash with an all-skipped block's Marker
+    /// held (interval 0: the wrong-nonce Marker at 3 parked, the crash at the
+    /// EVM block 4; Every5: the undecodable Marker at 12 digested behind the
+    /// held checkpoint): its hash -> number row comes back from the replay.
+    #[test]
+    fn fast_path_crash_with_all_skipped_marker_held_replays_its_hash_index() {
+        let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_crash_before_absorb = true;
+        let blocks = o0_fault_blocks(6, &[(3, O0Hand::NonceSkipped), (4, O0Hand::Evm)]);
+        let p = o0_crash_case(P5Ckpt::PerBlock, &blocks, 3, 4, O0Latch::E, false, &[3, 4], arm, "Marker held");
+        assert!(o0_has(&p, "marker.evm_side"), "{p:?}");
+        let blocks = o0_fault_blocks(15, &[(12, O0Hand::Skipped), (13, O0Hand::Evm)]);
+        o0_crash_case(P5Ckpt::Every5, &blocks, 10, 13, O0Latch::E, false, &[12, 13], arm, "Marker held");
+    }
+
+    /// Plan task 3.5 (C19): repeated crashes on one node, each through the
+    /// latch with jobs held (interval 0: E seam at 4, W step panic at 9; then
+    /// the same node runs on), and the whole run equals S.
+    #[test]
+    fn fast_path_repeated_crashes_replay_to_serial() {
+        let blocks = o0_fault_blocks(12, &[(4, O0Hand::Evm), (9, O0Hand::Evm), (11, O0Hand::Reader)]);
+        let (mut node, d) = o0_held_run(P5Ckpt::PerBlock, &blocks, 3, 4, |n| {
+            n.ctx.as_mut().unwrap().test_crash_after_evm_section = true
+        });
+        let first = o0_crash(&mut node, d, 4, O0Latch::E, false).unwrap_or_else(|e| panic!("crash 1: {e}"));
+        assert_eq!(first, vec![3, 4]);
+        node.run(&blocks[4..8]);
+        let gate = node.gate.clone().unwrap();
+        gate.hold_from(9);
+        let d = read_native_applied_height(&node.db).unwrap_or(0);
+        assert_eq!(d, 8);
+        o0_step(&node, &blocks[8]);
+        assert!(gate.wait_received(9));
+        let second =
+            o0_crash(&mut node, d, 9, O0Latch::WPanic, false).unwrap_or_else(|e| panic!("crash 2: {e}"));
+        assert_eq!(second, vec![9]);
+        assert_eq!(node.restarts, 2);
+        o0_assert_matches_serial(node, &blocks, 9, "repeated crashes");
+    }
+
+    /// Plan task 3.5 guard (F10, the Codex probe): a bare drop is a clean
+    /// shutdown, not a crash. Interval 0, W held at a native block's Flush,
+    /// and at a flag-on EVM block's Flush: a drop without the latch lands
+    /// the held job (marker d -> last, its status and side rows present).
+    /// This is why every crash goes through `o0_crash`.
+    #[test]
+    fn o0_bare_drop_lands_held_jobs() {
+        use torus_state::cf::{CF_BLOCK_ACTION_STATUS, CF_RECEIPTS};
+        let blocks = o0_fault_blocks(4, &[(4, O0Hand::Evm)]);
+        for held in [3u64, 4] {
+            let (mut node, d) = o0_held_run(P5Ckpt::PerBlock, &blocks, held, held, |_| {});
+            assert_eq!(d, held - 1);
+            assert_eq!(read_native_applied_height(&node.db), Some(d), "W holds {held}");
+            let ctx = node.ctx.take().unwrap();
+            drop(ctx);
+            assert_eq!(read_native_applied_height(&node.db), Some(held), "the drop landed {held}");
+            assert!(node
+                .db
+                .get_cf_raw(CF_BLOCK_ACTION_STATUS, &held.to_be_bytes())
+                .unwrap()
+                .is_some());
+            if held == 4 {
+                assert_eq!(o0_rows_at(&node.db, CF_RECEIPTS, 4), 1, "the EVM side rows landed");
+                assert_eq!(o0_hash_index_at(&node.db, 4), 1);
+            }
+        }
+    }
+
+    /// Plan task 3.5 guard (R4): `o0_crash` with its step 2 switched off (no
+    /// latch: a bare drop with W held at the flag-on EVM block's Flush)
+    /// fails at step 4: the harness catches a crash that is not one.
+    #[test]
+    fn o0_crash_protocol_rejects_unlatched_crash() {
+        let blocks = o0_fault_blocks(4, &[(4, O0Hand::Evm)]);
+        let (mut node, d) = o0_held_run(P5Ckpt::PerBlock, &blocks, 4, 4, |_| {});
+        let err = o0_crash(&mut node, d, 4, O0Latch::Off, false).expect_err("not a crash");
+        assert!(err.starts_with("step 4: marker 4"), "{err}");
     }
 
     // ======================================================================
