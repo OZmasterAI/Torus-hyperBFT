@@ -29,6 +29,14 @@
 # sourced from frames without locals and its variables kept (load_checks); each check runs through _run_check,
 # which unsets every other visible name and re-declares the file's. The prefix _DRV_ is the driver's (preflight
 # refuses a checks file that uses it). Limits: load_checks' header.
+# Post-cell work (bench queue pacing rule, s131): what decides the next cell runs right after each cell (POST_INLINE);
+# the report-only scans (POST_ENDPASS) run once, in end_pass, after the campaign's last cell (main cells, reruns, or
+# a CAMPAIGN STOP) and before campaign.done, from each cell's preserved logs: run-cell.sh DEFER_REPORT_SCANS=1 leaves
+# the ingest eviction counts and val<i>.log.excerpt to $TOOLS/cell-endpass.sh, and hardscan / soakchk move here too.
+# Genesis reuse: each cell gets GENESIS_CACHE_DIR=$RUN/genesis-cache (run-cell.sh: an unchanged genesis key reuses
+# the cached genesis, "genesis reused (key ..., md5 ...)"). Both need a run-cell.sh that has them (preflight_post;
+# an older frozen copy runs as before). Opt out per arm or spec-wide with harness_env DEFER_REPORT_SCANS=0 /
+# GENESIS_CACHE_DIR="" (the arm's harness env comes after the driver's on run-cell.sh's env line).
 # Test-only overrides: DRIVER_PROC (a fake /proc: node exe/environ, meminfo), DRIVER_DETACH (a fake detach.sh).
 set -u
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
@@ -36,6 +44,16 @@ PROC=${DRIVER_PROC:-/proc}
 HARNESS=$TOOLS/run-cell.sh
 DETACH=${DRIVER_DETACH:-$TOOLS/campaign/detach.sh}
 SOAKPY=$TOOLS/soak-sampler.py   # samplers: the hand drivers' 1 Hz sidecar (tools/matched-bench/soak-sampler.py)
+ENDPASS=$TOOLS/cell-endpass.sh  # end_pass: a cell's deferred report-only node-log scans (run-cell.sh DEFER_REPORT_SCANS=1)
+DEFER_SCANS=0           # 1 = cells run with DEFER_REPORT_SCANS=1 (preflight_post: run-cell.sh has it, nothing in-line reads them)
+GENESIS_REUSE=0         # 1 = cells run with GENESIS_CACHE_DIR=$RUN/genesis-cache (preflight_post: run-cell.sh has it)
+ENDPASS_LABELS=()       # every started cell, in order: end_pass runs cell-endpass.sh on those with deferred-scans.json
+END_SCANS=()            # label:dur of each cell that reached its report scans (hardscan, soakchk): end_pass runs them
+# post-cell work, classified (show_plan POSTCELL; test_make_driver.py checks cell() and end_pass against these lists).
+# In-line: validity and stop decisions, records of state the next cell overwrites, the cells.tsv row / rerun queue
+POST_INLINE="node-death md5chk envchk marketchk expectchk campaignchecks sysctlchk warmgatechk fdsum savelog cell_step"
+# End pass: report-only (HARD FINDING / CHECK SOAK lines, run-cell.sh's REPORT_SCANS via cell-endpass.sh)
+POST_ENDPASS="cell-endpass hardscan soakchk"
 UNIT_NAME=$CAMPAIGN
 MIN_FREE_MB=${MIN_FREE_MB:-20000}
 QUIET_WAIT_S=${QUIET_WAIT_S:-3600}
@@ -58,7 +76,8 @@ DRIVER_VARS="CAMPAIGN R RUN P WT_H TOOLS DEVNET MARKETS RATE MAX_BUSY_PCT NODES 
  ABIN AENV AXE AHENV ARMS ENV_NAMES PROC_REC_RE EXP_ARM EXP_FILE EXP_RE EXP_MIN EXP_MAX CELLS SMOKE_CELL
  ANALYSIS_CMD ANALYSIS_METRIC SAMPLERS HOST_CHECKS MIN_MEM_AVAIL_KB SYSCTL_WANT SELF PROC HARNESS DETACH SOAKPY
  UNIT_NAME MIN_FREE_MB QUIET_WAIT_S QUIET_SAMPLE_S SMOKE GENESIS_ROOT DD METS FD_STOP CRASHCELL SYSCTL_REC SYSCTL_PIN GENESIS_INPUTS MODE SM
- TAGS STARTED_LABEL CELL_FAIL GATE_TAGS CHECKS_SOURCE CHECK_FNS DRIVER_VARS"
+ TAGS STARTED_LABEL CELL_FAIL GATE_TAGS CHECKS_SOURCE CHECK_FNS ENDPASS DEFER_SCANS GENESIS_REUSE ENDPASS_LABELS END_SCANS
+ POST_INLINE POST_ENDPASS DRIVER_VARS"
 # run-cell.sh generates each cell's genesis from ITS OWN repo root ($TOOLS/../..), not from the harness worktree
 # it is handed (which only launches the nodes): a frozen tools copy must carry these, equal to the harness's
 GENESIS_INPUTS="devnet/wsl/gen-3val-genesis.sh devnet/wsl/bench-validator-keys.json devnet/genesis.json
@@ -103,6 +122,8 @@ show_plan() { # [smoke]: the plan as tables (make-driver tests compare these wit
     fi
     if [ -n "$GATE_TAGS" ]; then echo "WARMGATE on $GATE_TAGS"; else echo "WARMGATE off"; fi
     if [ -n "$CHECKS_SOURCE" ]; then echo "CHECKS $CHECKS_SOURCE $CHECK_FNS"; else echo "CHECKS none"; fi
+    echo "POSTCELL inline $POST_INLINE"
+    echo "POSTCELL endpass $POST_ENDPASS (once, after the last cell, before campaign.done)"
     if [ "$HOST_CHECKS" = 1 ]; then
         echo "HOSTCHECK on min_mem_avail_kb=$MIN_MEM_AVAIL_KB"
         for k in $(sysctl_names); do echo "SYSCTL $k ${SYSCTL_WANT[$k]:-pinned}"; done
@@ -588,9 +609,11 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
     # OVERWRITE=1 (as Job 4): sysctl.txt and the samplers' files are in the cell dir before run-cell.sh, which refuses
     # a non-empty dir without it; this function refused an existing cell dir above (the spec may only repeat it)
     E=(TARGET_DIR="${BDIR[$b]}" TOOLS_DIR="$TOOLS" DATA_ROOT="$DEVNET" RESULTS_ROOT="$R" OVERWRITE=1)
-    for kv in ${AHENV[$arm]}; do E+=("$kv"); done
     [ "${BWRAP[$b]}" = 1 ] || E+=(EXPECT_NODE_MD5="${BMD5[$b]}")
     [ -z "${BBMD5[$b]}" ] || E+=(EXPECT_BENCH_MD5="${BBMD5[$b]}")
+    [ "$DEFER_SCANS" != 1 ] || E+=(DEFER_REPORT_SCANS=1)
+    [ "$GENESIS_REUSE" != 1 ] || E+=(GENESIS_CACHE_DIR="$RUN/genesis-cache")
+    for kv in ${AHENV[$arm]}; do E+=("$kv"); done   # after the driver's: an arm may opt out (DEFER_REPORT_SCANS=0 ...)
     "$DETACH" "$label" "$R/$label.campaign.log" bash -c 'rcf=$1; shift; env "$@"; echo "rc=$?" > "$rcf"' cellwrap "$rcf" \
         "${E[@]}" "$HARNESS" "$WT_H" "$label" "$MARKETS" "$dur" "$RATE" "${AXE[$arm]}" \
         || { stopbg "$EP" "$DP" "$KP" "$MP" "$FP" "$SKP" "$VMP"; CELL_FAIL=abort-detach; return 1; }
@@ -644,10 +667,7 @@ cell() { # tag arm dur kind killat. return 0 = go on, 1 = stop the campaign (a s
         warmgatechk "$label" "$rc" || crc=1
     fi
     [ "$crc" = 0 ] || { CELL_FAIL=check; return 1; }
-    hardscan "$label"
-    if [ "$SAMPLERS" = 1 ]; then
-        soakchk "$label" "$dur"
-    fi
+    END_SCANS+=("$label:$dur")   # hardscan, soakchk: report-only, end_pass runs them after the campaign's last cell
     [ "$rc" = 0 ] || log "CELL FAIL $label: run-cell rc=$rc -> recorded (cells.tsv row + rerun), continuing"
     if [ "$fdok" = 1 ]; then log "STOP: a node held > $FD_STOP open fds in $label"; CELL_FAIL=stop-fd; return 1; fi
     return 0
@@ -661,6 +681,7 @@ run_spec() { # SPEC [SUFFIX]: one cell, then its write-up step (cells.tsv row, C
     STARTED_LABEL= CELL_FAIL=
     cell "$tg" "$arm" "$dur" "$kind" "$killat"; crc=$?
     if [ "$STARTED_LABEL" = "$label" ]; then
+        ENDPASS_LABELS+=("$label")
         [ "$crc" = 0 ] || { xr=${CELL_FAIL:-check}; log "$label failed the campaign (cell rc $crc): step flags it bad:$xr"; }
         CELL_STEP_SUMMARY_MD5=$(step_summary_md5 "$arm") \
             cell_step "$RUN" "$R/$label" "$label" "$tg" "$arm" "${tg%%-*}" "${BMD5[${ABIN[$arm]}]}" "$spec" "$xr"
@@ -675,6 +696,49 @@ run_cells() { # the campaign: each of CELLS through run_spec in order; 1 = stopp
     for c in "${CELLS[@]}"; do
         run_spec "$c" || { log "CAMPAIGN STOP at ${c%%:*} (queued reruns not run: $RUN/rerun-queue.tsv)"; return 1; }
     done
+}
+
+end_pass() { # once, after the campaign's last cell (no cell runs any more), before campaign.done: each started cell's
+    # deferred report-only node-log scans (cell-endpass.sh, on the cells with deferred-scans.json), then hardscan and
+    # soakchk of the cells that reached them (END_SCANS), cell by cell. Never fails the campaign: a failed cell scan
+    # is an END PASS FAIL line and keeps its marker (rerun by hand: cell-endpass.sh <cell dir>)
+    local label c dur t0 n=0 bad=0 r
+    [ ${#ENDPASS_LABELS[@]} -gt 0 ] || return 0
+    t0=$(date +%s)
+    log "END PASS start: ${#ENDPASS_LABELS[@]} cells (report-only scans: $POST_ENDPASS)"
+    for label in "${ENDPASS_LABELS[@]}"; do
+        if [ -e "$R/$label/deferred-scans.json" ]; then
+            n=$((n + 1)); "$ENDPASS" "$R/$label"; r=$?
+            [ "$r" = 0 ] || { bad=$((bad + 1)); log "END PASS FAIL $label: $ENDPASS rc=$r (marker kept)"; }
+        fi
+        for c in "${END_SCANS[@]}"; do
+            [ "${c%:*}" = "$label" ] || continue
+            dur=${c##*:}
+            hardscan "$label"
+            if [ "$SAMPLERS" = 1 ]; then
+                soakchk "$label" "$dur"
+            fi
+        done
+    done
+    log "END PASS done in $(( $(date +%s) - t0 ))s: $n cells with deferred scans ($bad failed), ${#END_SCANS[@]} hardscans"
+}
+
+run_campaign() { # the cells, the rerun pass (not in smoke), then the end pass; the EXIT trap writes campaign.done after
+    # this returns. 1 = stopped
+    local rc=0
+    if run_cells; then
+        log "MAIN CELLS END"
+        if [ "${SMOKE:-0}" != 1 ]; then
+            cell_step_rerun_pass "$RUN" run_spec || { log "CAMPAIGN STOP in the rerun pass"; rc=1; }
+        fi
+    else
+        rc=1
+    fi
+    end_pass
+    [ "$rc" = 0 ] || return 1
+    log "CAMPAIGN END"
+    [ -s "$RUN/cells.tsv" ] && awk -F'\t' 'NR > 1 {n++; if ($8 != "ok") b++} END {printf "cells.tsv: %d rows, %d bad\n", n, b}' "$RUN/cells.tsv"
+    return 0
 }
 
 # ---- preflight ----
@@ -756,10 +820,47 @@ preflight_genesis() { # the genesis inputs under run-cell.sh's repo root GENESIS
     return 0
 }
 
+deferred_readers() { # why the report scans must stay in-line: an expectation or the checks file reads one of their
+    # outputs (val<i>.log.excerpt, run.log's ingest line, summary.json .ingest evictions); empty = none does
+    local i
+    for i in "${!EXP_FILE[@]}"; do
+        case ${EXP_FILE[$i]} in
+            *.log.excerpt) echo "expectation '${EXP_RE[$i]}' reads ${EXP_FILE[$i]};" ;;
+            run.log) grep -qiE 'ingest|evict' <<< "${EXP_RE[$i]}" && echo "expectation '${EXP_RE[$i]}' reads run.log's ingest line;" ;;
+        esac
+    done
+    [ -z "$CHECKS_SOURCE" ] || ! grep -qiE 'excerpt|evict|ingest' "$CHECKS_SOURCE" \
+        || echo "$CHECKS_SOURCE mentions excerpt / evict / ingest;"
+    return 0
+}
+
+preflight_post() { # what run-cell.sh in TOOLS supports: the end pass (DEFER_REPORT_SCANS) and genesis reuse
+    # (GENESIS_CACHE_DIR). An older frozen run-cell.sh has neither: the cells run as before
+    local f why
+    DEFER_SCANS=0; GENESIS_REUSE=0
+    if grep -q 'DEFER_REPORT_SCANS' "$HARNESS" 2>/dev/null; then
+        for f in "$TOOLS/log-scans.sh" "$ENDPASS"; do
+            [ -f "$f" ] || PF "$f missing: $HARNESS needs it (copy it from tools/matched-bench into tools_dir)"
+        done
+        why=$(deferred_readers)
+        if [ -n "$why" ]; then
+            echo "PREFLIGHT NOTE: report-only scans stay in-line (no end pass): $why"
+        else
+            DEFER_SCANS=1
+        fi
+    fi
+    if grep -q 'GENESIS_CACHE_DIR' "$HARNESS" 2>/dev/null; then
+        [ -f "$TOOLS/genesis_cache.py" ] || PF "$TOOLS/genesis_cache.py missing: $HARNESS needs it (copy it from tools/matched-bench into tools_dir)"
+        GENESIS_REUSE=1
+    fi
+    return 0
+}
+
 preflight_static() { # preflight_paths, then the spec checks (load_checks), from this frame: it has no locals, which
     # the checks file would see at source time or set instead of its own variables (load_checks)
     preflight_paths
     load_checks
+    preflight_post
 }
 
 preflight_paths() { # paths, tools, genesis inputs, staged md5s (a wrapper's md5 = the md5 of the node it execs)
@@ -817,7 +918,8 @@ preflight_host() { # run mode only: inside a bench unit, nothing else running, n
 
 host_str() { # the PREFLIGHT OK line's warm-up gate / campaign checks / samplers / host checks part
     local k g=${GATE_TAGS// /,} c=${CHECK_FNS// /,}
-    printf 'warmgate=%s checks=%s samplers=%s host_checks=%s' "${g:-off}" "${c:-none}" "$SAMPLERS" "$HOST_CHECKS"
+    printf 'warmgate=%s checks=%s samplers=%s host_checks=%s end_pass=%s genesis_reuse=%s' "${g:-off}" "${c:-none}" \
+        "$SAMPLERS" "$HOST_CHECKS" "$DEFER_SCANS" "$GENESIS_REUSE"
     [ "$HOST_CHECKS" = 1 ] || return 0
     printf ' min_mem_avail_kb=%s' "$MIN_MEM_AVAIL_KB"
     for k in $(sysctl_names); do printf ' %s=%s' "$k" "${SYSCTL_WANT[$k]:-pinned}"; done
@@ -874,11 +976,5 @@ export CELL_STEP_TIMEOUT=${CELL_STEP_TIMEOUT:-900} CELL_STEP_ANALYSIS_TIMEOUT=${
 # shellcheck source=../cell-step.sh
 source "$TOOLS/cell-step.sh" || PF "cannot source $TOOLS/cell-step.sh"
 log "PREFLIGHT OK CAMPAIGN=$UNIT_NAME driver=$SELF RUN=$RUN P=$P genesis_root=$GENESIS_ROOT arms=${ARMS[*]} baseline=$BASELINE markets=$MARKETS rate=$RATE $(host_str) cells=${#CELLS[@]}: $TAGS"
-run_cells || exit 1
-log "MAIN CELLS END"
-if [ "${SMOKE:-0}" != 1 ]; then
-    cell_step_rerun_pass "$RUN" run_spec || { log "CAMPAIGN STOP in the rerun pass"; exit 1; }
-fi
-log "CAMPAIGN END"
-[ -s "$RUN/cells.tsv" ] && awk -F'\t' 'NR > 1 {n++; if ($8 != "ok") b++} END {printf "cells.tsv: %d rows, %d bad\n", n, b}' "$RUN/cells.tsv"
+run_campaign || exit 1
 exit 0

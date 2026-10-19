@@ -44,6 +44,12 @@ fake /proc (DRIVER_PROC). Pinned:
 12. campaign checks (spec checks {source, per_cell}): the source file is sourced at preflight (each function must
    be defined, no driver function or name redefined), each function runs after every cell as `fn <label> <arm>`
    with the driver's R / AENV / ...; non-zero = CHECK FAIL, the cell's row bad:check, the campaign stops.
+15. post-cell work (bench queue pacing rule, s131): the POST_INLINE steps run in cell() / run_spec, the
+   POST_ENDPASS ones (cell-endpass.sh, hardscan, soakchk) only in end_pass, which run_campaign calls once after
+   the last cell (also on a CAMPAIGN STOP) and before the EXIT trap's campaign.done; each cell gets
+   DEFER_REPORT_SCANS=1 and GENESIS_CACHE_DIR=$RUN/genesis-cache when run-cell.sh supports them (preflight_post;
+   an expectation or checks file that reads a deferred output keeps the scans in-line), an arm's harness_env
+   opts out.
 """
 
 import glob
@@ -99,6 +105,9 @@ TOOL_FILES = [
     "cell_step.py",
     "campaign/detach.sh",
     "soak-sampler.py",
+    "log-scans.sh",
+    "cell-endpass.sh",
+    "genesis_cache.py",
 ]
 
 
@@ -377,6 +386,9 @@ CELL_WIRING = [
     'if [ -e "$R/$label/node-death.txt" ]; then',
     'hardscan "$label"',
 ]
+# the Job 4 cell() wiring that a generated driver runs in end_pass instead (report-only, bench queue pacing rule s131:
+# once after the campaign's last cell): checked there, and absent from the generated cell()
+CELL_WIRING_ENDPASS = ['hardscan "$label"']
 # cell(): the Job 4 drivers' failure handling around them (substrings)
 CELL_HANDLING = [
     'sysctlchk "$label" start || { CELL_FAIL=abort-sysctl; return 1; }',
@@ -420,10 +432,19 @@ class GoldenTest(Base):
         for who, txt in (("Job 4 " + kind, hand), ("generated", gen)):
             body = func_text(txt, "cell")
             lines = [ln.strip() for ln in body.splitlines()]
+            wiring = CELL_WIRING
+            if who == "generated":
+                wiring = [m for m in CELL_WIRING if m not in CELL_WIRING_ENDPASS]
+                ep = [ln.strip() for ln in func_text(txt, "end_pass").splitlines()]
+                for m in CELL_WIRING_ENDPASS:
+                    self.assertNotIn(
+                        m, lines, "generated cell() still runs %s in-line" % m
+                    )
+                    self.assertIn(m, ep, "generated end_pass lacks %s" % m)
             self.assertEqual(
-                [m for m in CELL_WIRING if m not in lines], [], "%s cell()" % who
+                [m for m in wiring if m not in lines], [], "%s cell()" % who
             )
-            idx = [lines.index(m) for m in CELL_WIRING]
+            idx = [lines.index(m) for m in wiring]
             self.assertEqual(idx, sorted(idx), "%s cell(): wiring order" % who)
             for s in CELL_HANDLING:
                 self.assertIn(s, body, "%s cell()" % who)
@@ -909,6 +930,10 @@ run_spec "r1-M1:M1:120:none:"; echo "m=$?"
     def test_body_wiring(self):
         t = open(self.drv).read()
         self.assertIn("cell_step_rerun_pass", t)
+        self.assertIn("\nrun_campaign || exit 1\nexit 0\n", t)
+        rc = func_text(t, "run_campaign")
+        self.assertLess(rc.index("cell_step_rerun_pass"), rc.index("end_pass"))
+        self.assertLess(rc.index("end_pass"), rc.index('log "CAMPAIGN END"'))
         self.assertNotRegex(t, r"cell_step [^\n]*&\s*$")
         self.assertIn("campaign.done", t)
         self.assertIn('"$DETACH" "$label"', t)  # every cell in its own bench unit
@@ -1473,6 +1498,8 @@ for k, v in json.loads(os.environ.get("FAKE_SUMMARY") or "{}").items():
     s.setdefault(k, {}).update(v)
 json.dump(s, open(sys.argv[1], "w"))' "$OUT/summary.json" "$markets"
 for i in 0 1 2; do echo "2026-10-15T00:00:00.000Z  INFO torus_node: fake val$i" | gzip > "$OUT/val$i.log.gz"; done
+echo "harness env DEFER_REPORT_SCANS=${DEFER_REPORT_SCANS:-unset} GENESIS_CACHE_DIR=${GENESIS_CACHE_DIR-unset}" >> "$OUT/run.log"
+[ "${DEFER_REPORT_SCANS:-0}" != 1 ] || echo '{"version": 1, "scans": "x", "bench_submitted": "5", "ingest_log_bytes": [9, 9, 9]}' > "$OUT/deferred-scans.json"
 stopall
 exit "${FAKE_RC:-0}"
 """
@@ -1908,6 +1935,7 @@ class CellRunTest(FakeHostBase):
                 "export CELL_STEP_LOG=$RUN/campaign.log",
                 pre,
                 'run_spec "r1-A:A:120:none:"; echo "RUN_SPEC_RC=$?"',
+                "end_pass",
             ]
         )
         e = dict(os.environ)
@@ -1974,6 +2002,11 @@ class CellRunTest(FakeHostBase):
             "[%s] fds max/end" % LB,
         ):
             self.assertIn(s, out)
+        # report-only: hardscan and soakchk run in end_pass, after the cell (run_spec) returned
+        rc_at = out.index("RUN_SPEC_RC=0")
+        self.assertGreater(out.index("CHECK OK %s hardscan done" % LB), rc_at)
+        self.assertGreater(out.index("CHECK SOAK %s" % LB), rc_at)
+        self.assertLess(out.index("[%s] fds max/end" % LB), rc_at)
         self.assertEqual(self.row(spec)[7], "ok", out)
         self.assertEqual(sampler_procs(self.cell), [], "soak sampler left running")
 
@@ -3000,6 +3033,232 @@ class WarmGateRunTest(FakeHostBase):
             ],
         )
         self.assertEqual([r[7] for r in self.rows(spec)], ["ok"])
+
+
+# ---------------------------------------------------------------- post-cell work: in-line vs the end pass (s131)
+
+
+class PostCellClassificationTest(Base):
+    """the driver's POST_INLINE / POST_ENDPASS lists against the code: every end-pass step runs only in end_pass
+    (never in cell(), i.e. never while a later cell could run), every in-line step runs in cell() / run_spec"""
+
+    # how each listed step shows in the driver text
+    INLINE_CALLS = {
+        "node-death": 'if [ -e "$R/$label/node-death.txt" ]; then',
+        "md5chk": "cellchecks",
+        "envchk": "cellchecks",
+        "marketchk": "cellchecks",
+        "expectchk": "cellchecks",
+        "campaignchecks": 'campaignchecks "$label" "$arm"',
+        "sysctlchk": 'sysctlchk "$label" end',
+        "warmgatechk": 'warmgatechk "$label" "$rc"',
+        "fdsum": 'fdsum "$label"',
+        "savelog": 'savelog "$label"',
+    }
+    ENDPASS_CALLS = {
+        "cell-endpass": '"$ENDPASS" "$R/$label"',
+        "hardscan": 'hardscan "$label"',
+        "soakchk": 'soakchk "$label" "$dur"',
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.drv = self.generate(self.write_spec(minimal_spec(self.tmp)))
+        self.text = open(self.drv).read()
+
+    def lists(self):
+        r = self.lib(self.drv, 'echo "$POST_INLINE"; echo "$POST_ENDPASS"')
+        a, b = r.stdout.splitlines()
+        return a.split(), b.split()
+
+    def test_lists_cover_the_code(self):
+        inline, endpass = self.lists()
+        self.assertEqual(sorted(set(inline) - {"cell_step"}), sorted(self.INLINE_CALLS))
+        self.assertEqual(sorted(endpass), sorted(self.ENDPASS_CALLS))
+        self.assertEqual(set(inline) & set(endpass), set())
+        cell = func_text(self.text, "cell")
+        spec = func_text(self.text, "run_spec")
+        ep = func_text(self.text, "end_pass")
+        for k, call in self.INLINE_CALLS.items():
+            self.assertIn(call, cell, "in-line %s" % k)
+            self.assertNotIn(call, ep, "in-line %s in the end pass" % k)
+        cc = func_text(self.text, "cellchecks")
+        for k in ("md5chk", "envchk", "marketchk", "expectchk"):
+            self.assertIn(k + ' "$1"', cc)
+        self.assertIn("cell_step ", spec)
+        for k, call in self.ENDPASS_CALLS.items():
+            self.assertIn(call, ep, "end pass %s" % k)
+            self.assertNotIn(call, cell, "end pass %s in cell()" % k)
+            self.assertNotIn(call, spec, "end pass %s in run_spec" % k)
+            self.assertNotIn(call, func_text(self.text, "run_cells"))
+
+    def test_show_lists_them(self):
+        plan = self.plan(self.drv)
+        inline, endpass = self.lists()
+        self.assertIn("POSTCELL inline %s" % " ".join(inline), plan)
+        self.assertIn(
+            "POSTCELL endpass %s (once, after the last cell, before campaign.done)"
+            % " ".join(endpass),
+            plan,
+        )
+
+
+class PreflightPostTest(Base):
+    """preflight_post: the end pass and genesis reuse follow what run-cell.sh in tools_dir supports"""
+
+    def dry(self, spec):
+        drv = self.generate(self.write_spec(spec))
+        r = subprocess.run([drv, "dry"], capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_current_tools_turn_both_on(self):
+        rc, out = self.dry(minimal_spec(self.tmp))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=1 genesis_reuse=1", out)
+
+    def test_old_run_cell_runs_as_before(self):
+        spec = minimal_spec(self.tmp)
+        with open(os.path.join(spec["tools_dir"], "run-cell.sh"), "w") as f:
+            f.write("#!/bin/bash\n# an older run-cell.sh without the knobs\n")
+        rc, out = self.dry(spec)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("end_pass=0 genesis_reuse=0", out)
+
+    def test_missing_helpers_fail_preflight(self):
+        for f in ("log-scans.sh", "cell-endpass.sh", "genesis_cache.py"):
+            with self.subTest(f=f):
+                spec = minimal_spec(self.tmp)
+                p = os.path.join(spec["tools_dir"], f)
+                os.rename(p, p + ".away")
+                try:
+                    rc, out = self.dry(spec)
+                finally:
+                    os.rename(p + ".away", p)
+                self.assertEqual(rc, 1, out)
+                self.assertIn("PREFLIGHT FAIL: %s missing" % p, out)
+
+    def test_a_reader_of_a_deferred_output_keeps_them_in_line(self):
+        for exp in (
+            {"file": "val0.log.excerpt", "regex": "book mode"},
+            {"file": "run.log", "regex": "ingest: bench submitted"},
+        ):
+            with self.subTest(exp=exp):
+                rc, out = self.dry(minimal_spec(self.tmp, expect=[exp]))
+                self.assertEqual(rc, 0, out)
+                self.assertIn("PREFLIGHT NOTE: report-only scans stay in-line", out)
+                self.assertIn("end_pass=0 genesis_reuse=1", out)
+        rc, out = self.dry(
+            minimal_spec(
+                self.tmp, expect=[{"file": "run.log", "regex": "genesis built"}]
+            )
+        )
+        self.assertIn("end_pass=1", out)
+
+
+class EndPassRunTest(FakeHostBase):
+    """run_campaign for real against the fakes (as CellRunTest; cell-endpass.sh is the real one in the frozen
+    tools copy): the end pass runs once, after the last cell and before campaign.done, also when the campaign
+    stops"""
+
+    def campaign(self, spec, cells, **env):
+        drv = self.generate(self.write_spec(spec, "ep.json"), "ep.sh")
+        os.makedirs(spec["run_dir"], exist_ok=True)
+        script = "\n".join(
+            [
+                "DRIVER_LIB_ONLY=1; . %s || exit 99" % shlex.quote(drv),
+                "HARNESS=%s" % shlex.quote(os.path.join(self.bin, "run-cell.sh")),
+                "quiet() { return 0; }",
+                "CELLS=(%s)" % " ".join(shlex.quote(c) for c in cells),
+                '. "$TOOLS/cell-step.sh" || exit 98',
+                "export CELL_STEP_LOG=$RUN/campaign.log",
+                "sysctl_pin",
+                "DEFER_SCANS=1; GENESIS_REUSE=1",
+                # main's trap: campaign.done when the driver exits
+                """trap 'rc=$?; echo "DONE-MARKER exit=$rc"; echo "exit=$rc" > "$RUN/campaign.done"' EXIT""",
+                "run_campaign",
+            ]
+        )
+        e = dict(os.environ)
+        e.update(
+            self.env(
+                DRIVER_DETACH=os.path.join(self.bin, "detach.sh"),
+                FAKE_PROC=self.proc,
+                FAKE_RUN_S="4",
+            )
+        )
+        e.update(env)
+        out = os.path.join(self.tmp, "ep.out")
+        with open(out, "w") as fo:
+            r = subprocess.run(
+                ["bash", "-c", script],
+                stdout=fo,
+                stderr=subprocess.STDOUT,
+                env=e,
+                timeout=600,
+            )
+        return r.returncode, open(out).read()
+
+    def test_end_pass_once_after_the_last_cell_before_done(self):
+        spec = minimal_spec(self.tmp)
+        cells = ["r1-A:A:120:none:", "r1-M1:M1:120:none:", "r2-A:A:120:none:"]
+        rc, out = self.campaign(spec, cells)
+        self.assertEqual(rc, 0, out)
+        labels = ["test-camp-10m-" + c.split(":")[0] for c in cells]
+        last_end = max(out.index("] END %s rc=0" % lb) for lb in labels)
+        self.assertEqual(out.count("END PASS start: 3 cells"), 1, out)
+        start = out.index("END PASS start")
+        self.assertGreater(
+            start, last_end, "the end pass ran while cells were still running"
+        )
+        for lb in labels:
+            self.assertEqual(out.count("END PASS OK %s:" % lb), 1, out)
+            self.assertGreater(out.index("END PASS OK %s:" % lb), last_end)
+            self.assertGreater(out.index("CHECK OK %s hardscan done" % lb), last_end)
+            cell = os.path.join(spec["results_root"], lb)
+            self.assertFalse(os.path.exists(os.path.join(cell, "deferred-scans.json")))
+            self.assertTrue(os.path.exists(os.path.join(cell, "val0.log.excerpt")))
+            runlog = open(os.path.join(cell, "run.log")).read()
+            self.assertIn(
+                "harness env DEFER_REPORT_SCANS=1 GENESIS_CACHE_DIR=%s/genesis-cache"
+                % spec["run_dir"],
+                runlog,
+            )
+            self.assertIn(
+                "ingest: bench submitted=5 actions; mempool nonce-expired evictions per node: 0 0 0 ",
+                runlog,
+            )
+        self.assertLess(out.index("END PASS done"), out.index("CAMPAIGN END"))
+        self.assertLess(out.index("CAMPAIGN END"), out.index("DONE-MARKER exit=0"))
+        self.assertEqual(
+            open(os.path.join(spec["run_dir"], "campaign.done")).read(), "exit=0\n"
+        )
+
+    def test_end_pass_runs_on_a_campaign_stop(self):
+        """a failed warm-up gate stops the campaign: the end pass still completes the started cell, before
+        campaign.done; no hardscan for it (as before: a cell that fails its checks never reached it)"""
+        spec = minimal_spec(self.tmp)
+        rc, out = self.campaign(
+            spec,
+            ["w1:A:120:none:", "r1-A:A:120:none:"],
+            FAKE_SUMMARY='{"validity": {"verdict": "REJECT"}}',
+        )
+        self.assertEqual(rc, 1, out)
+        self.assertIn("CAMPAIGN STOP at w1", out)
+        self.assertIn("END PASS OK test-camp-10m-w1:", out)
+        self.assertNotIn("hardscan done", out)
+        self.assertNotIn("CAMPAIGN END", out)
+        self.assertLess(out.index("END PASS done"), out.index("DONE-MARKER exit=1"))
+
+    def test_arm_harness_env_opts_out(self):
+        spec = minimal_spec(
+            self.tmp, harness_env={"DEFER_REPORT_SCANS": "0", "GENESIS_CACHE_DIR": ""}
+        )
+        rc, out = self.campaign(spec, ["r1-A:A:120:none:"])
+        self.assertEqual(rc, 0, out)
+        runlog = open(os.path.join(spec["results_root"], LB, "run.log")).read()
+        self.assertIn("harness env DEFER_REPORT_SCANS=0 GENESIS_CACHE_DIR=\n", runlog)
+        self.assertNotIn("END PASS OK", out)
+        self.assertIn("CHECK OK %s hardscan done" % LB, out)
 
 
 if __name__ == "__main__":

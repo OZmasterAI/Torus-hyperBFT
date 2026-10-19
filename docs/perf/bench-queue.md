@@ -431,6 +431,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    the next genesis included where possible). Don't wait for an agent wake-up between cells; the driver chains them.
    quiet() now gates on a 5 s CPU busy sample (`max_busy_pct`, default 10) instead of the 1-min load average (commit
    "matched-bench: quiet() gates on a 5 s CPU busy sample", the commit that adds this line).
+   Generated drivers also run the report-only post-cell scans (ingest evictions, log excerpts, hardscan, soakchk) once after the last cell (`end_pass`, before `campaign.done`; validity scans stay in-line), and reuse an unchanged genesis per cell (`GENESIS_CACHE_DIR=$RUN/genesis-cache`, key = every genesis input, md5 checked; tools/matched-bench/README.md "Post-cell work", "Genesis reuse").
 8n. **L2.2 screen (8k pick 2), NEXT** (owner s131; ~40 min). `exp/8k-settle-no-merge` `dbe14b21`
    (`TORUS_SETTLE_NO_MERGE=1`, byte-identical; microbench -5.3 to -7.0 ms per block) vs main `0f5bef38` (its base).
    One binary per arm, md5 checked. Shape: the 8i P1M deep book (1M-account genesis, `PRELOAD=1000000`), standard

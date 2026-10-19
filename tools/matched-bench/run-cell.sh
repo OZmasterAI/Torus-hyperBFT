@@ -301,6 +301,29 @@
 #                Off the default the bench gets --funded-bulk-end 60+N (the
 #                funded spam keys sit at the top of that range). Logged in the
 #                cell= line; summary.json .genesis.bulk_count.
+#   GENESIS_CACHE_DIR=<dir>  reuse the genesis when none of its inputs changed
+#                (the campaign driver sets <run_dir>/genesis-cache; unset or
+#                empty = build every cell, as before). genesis_cache.py keys
+#                every input: the generator scripts and their data (incl.
+#                testnet/genesis-weighted-full.json + params sidecar and the
+#                base genesis), this script, MARKETS, BULK_COUNT, the
+#                TIMEOUT_BASE_MS / EVM_BLOCK_INTERVAL of EXTRA_ENV, LIQ_THIN,
+#                LIQ_THIN_AVAIL, the ambient STATE_HASH_ACTIVATION / BASE /
+#                BULK_OFFSET / NATIVE_AVAIL / EVM_WEI, jq's version. A cached
+#                entry (<key>.genesis, its md5 re-checked on the copy) replaces
+#                the generator, weighted_full_check and the jq checks (their
+#                values come from the entry): "genesis reused (key K, md5 M)";
+#                else "genesis built (key K, md5 M)" and the entry is stored.
+#                A cached md5 mismatch rebuilds. FORCE=1: only an entry a
+#                FORCE=1 cell built is reused, so the first FORCE=1 cell of a
+#                campaign rebuilds as before and later ones reuse its result.
+#                Data dirs stay fresh per cell (launch-3val.sh CLEAN=1).
+#   DEFER_REPORT_SCANS=1  the campaign driver's end pass: the report-only
+#                node-log scans (log-scans.sh REPORT_SCANS: the ingest
+#                eviction counts and val<i>.log.excerpt) are left to
+#                cell-endpass.sh, which the driver runs once after the
+#                campaign's last cell (deferred-scans.json marks the cell
+#                until then). Validity scans stay in-line. Default 0.
 #   PRELOAD=N    bench queue 8f: after node ready (and fresh oracle marks)
 #                and BEFORE the metrics-before snapshot, the samplers and the
 #                load, `bench-throughput preload` places N non-crossing resting
@@ -398,6 +421,8 @@ CANCEL_BY_ID_FRACTION=${CANCEL_BY_ID_FRACTION:-}
 MODIFY_FRACTION=${MODIFY_FRACTION:-}
 CLOID_SHARE=${CLOID_SHARE:-}
 BULK_COUNT=${BULK_COUNT:-100000}
+GENESIS_CACHE_DIR=${GENESIS_CACHE_DIR:-}
+DEFER_REPORT_SCANS=${DEFER_REPORT_SCANS:-0}
 PRELOAD=${PRELOAD:-0}
 PRELOAD_PER_OWNER=${PRELOAD_PER_OWNER:-900}
 PRELOAD_OWNER_OFFSET=${PRELOAD_OWNER_OFFSET:-}
@@ -634,6 +659,13 @@ for f in "$CROSS_FRACTION" "$CANCEL_FRACTION"; do
     [[ "$f" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || { echo "FATAL: fraction '$f' must be in [0,1]" >&2; exit 2; }
 done
 [ -x "$TOOLS_DIR/digest-node.sh" ] || { echo "FATAL: $TOOLS_DIR/digest-node.sh missing" >&2; exit 1; }
+# The post-cell node-log scans (in-line, or report-only ones deferred to the campaign end pass) and the genesis
+# cache are this script's own helpers (SELF_DIR, like evm_load.py / preload.py), never a candidate's copy.
+case "$DEFER_REPORT_SCANS" in 0|1) ;; *) echo "FATAL: DEFER_REPORT_SCANS must be 0 or 1 (got '$DEFER_REPORT_SCANS')" >&2; exit 2 ;; esac
+# shellcheck source=log-scans.sh
+. "$SELF_DIR/log-scans.sh" 2>/dev/null || { echo "FATAL: $SELF_DIR/log-scans.sh missing (copy it beside run-cell.sh)" >&2; exit 1; }
+[ -z "$GENESIS_CACHE_DIR" ] || [ -f "$SELF_DIR/genesis_cache.py" ] \
+    || { echo "FATAL: GENESIS_CACHE_DIR is set but $SELF_DIR/genesis_cache.py is missing (copy it beside run-cell.sh)" >&2; exit 1; }
 # BULK_COUNT: the genesis' funded bulk senders; the load's must be among them.
 [[ "$BULK_COUNT" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "FATAL: BULK_COUNT must be a positive integer (got '$BULK_COUNT')" >&2; exit 2; }
 { [[ "$SENDERS" =~ ^[0-9]+$ ]] && [ "$SENDERS" -le "$BULK_COUNT" ]; } \
@@ -1044,21 +1076,57 @@ log "bench-throughput md5=$MD5_BENCH ($BENCH, mtime $(date -r "$BENCH" +%FT%T))$
     || die "bench-throughput md5 $MD5_BENCH != EXPECT_BENCH_MD5 $EXPECT_BENCH_MD5 ($BENCH is not the binary built for this cell: stale-binary trap)"
 
 # ---------------------------------------------------------------- 2. genesis
-log "generating $MARKETS-market 3-val genesis -> $GENESIS"
 # s68: TIMEOUT_BASE_MS is a genesis parameter, not a node env var, and genesis is
 # generated before EXTRA_ENV is exported, so lift it out of EXTRA_ENV here.
 # Absent => the generator's default.
 GEN_TIMEOUT_BASE_MS=""
 for kv in $EXTRA_ENV; do case $kv in TIMEOUT_BASE_MS=*) GEN_TIMEOUT_BASE_MS=${kv#*=} ;; esac; done
-if [ "${FORCE:-0}" != 1 ]; then
-    WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
+# GENESIS_CACHE_DIR: the key of every genesis input (genesis_cache.py); a cached
+# entry for it replaces the generator and the checks below (header: GENESIS_CACHE_DIR).
+genesis_key() { # key | store ARGS...: genesis_cache.py with this cell's key inputs
+    local cmd=$1; shift
+    python3 -I "$SELF_DIR/genesis_cache.py" "$cmd" --root "$MAINREPO" --run-cell "$SELF_DIR/run-cell.sh" \
+        --param MARKETS="$MARKETS" --param BULK_COUNT="$BULK_COUNT" --param TIMEOUT_BASE_MS="$GEN_TIMEOUT_BASE_MS" \
+        --param EVM_BLOCK_INTERVAL="$GEN_EVM_BLOCK_INTERVAL" --param LIQ_THIN="$LIQ_THIN" --param LIQ_THIN_AVAIL="$LIQ_THIN_AVAIL" "$@"
+}
+genesis_key_store() {
+    genesis_key store --dir "$GENESIS_CACHE_DIR" --genesis "$GENESIS" --md5 "$GEN_MD5" $GEN_FORCED \
+        --meta label="$LABEL" --meta markets="$GEN_MARKETS" --meta native_balances="$GEN_ACCTS" --meta bulk_count="$GEN_BULK" \
+        --meta timeout_base_ms="$GEN_TBMS" --meta evm_block_interval="$GEN_EVM_N" --meta liq_thin_rows="${LIQ_THIN_ROWS:-}" \
+        2>>"$OUT/run.log"
+}
+GEN_REUSED=0; GEN_KEY=""; GEN_FORCED=""
+[ "${FORCE:-0}" = 1 ] && GEN_FORCED=--forced
+if [ -n "$GENESIS_CACHE_DIR" ]; then
+    GEN_KEY=$(genesis_key key 2>>"$OUT/run.log") || die "genesis key failed (genesis_cache.py, see run.log)"
+    GEN_META=$(python3 -I "$SELF_DIR/genesis_cache.py" fetch --dir "$GENESIS_CACHE_DIR" --key "$GEN_KEY" --dest "$GENESIS" $GEN_FORCED 2>"$OUT/genesis-cache.err")
+    case $? in
+        0) GEN_REUSED=1 ;;
+        1) log "genesis cache: $(cat "$OUT/genesis-cache.err") -> building" ;;
+        *) log "WARNING: genesis cache: $(cat "$OUT/genesis-cache.err") -> rebuilding (the entry is overwritten)" ;;
+    esac
+    rm -f -- "${OUT:?}/genesis-cache.err"
 fi
-TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
-    || die "genesis generation failed (see run.log)"
-log "genesis timeout_base_ms=$(jq '.consensus.timeout_base_ms' "$GENESIS")"
-# The genesis EVM cadence N must be the cell's: EVM_BLOCK_INTERVAL, else the
-# node default. A mismatch = a hand-patched weighted-full genesis carried over.
-GEN_EVM_N=$(jq -r ".evm.block_interval // $DEFAULT_EVM_N" "$GENESIS")
+if [ "$GEN_REUSED" = 1 ]; then
+    # The entry holds the values the build path reads with jq below (its md5 was re-checked on the copy).
+    # (the one field that may be empty comes last: read collapses adjacent tabs)
+    IFS=$'\t' read -r GEN_MD5 GEN_MARKETS GEN_ACCTS GEN_BULK GEN_TBMS GEN_EVM_N GEN_BUILT LIQ_THIN_ROWS < <(jq -r \
+        '[.md5, .markets, .native_balances, .bulk_count, .timeout_base_ms, .evm_block_interval, .built_at, (.liq_thin_rows // "")] | @tsv' <<<"$GEN_META")
+    log "genesis reused (key $GEN_KEY, md5 $GEN_MD5) from $GENESIS_CACHE_DIR (built $GEN_BUILT${GEN_FORCED:+ under FORCE=1}): generator, weighted-full check and jq passes skipped -> $GENESIS"
+    log "genesis timeout_base_ms=$GEN_TBMS"
+else
+    log "generating $MARKETS-market 3-val genesis -> $GENESIS"
+    if [ "${FORCE:-0}" != 1 ]; then
+        WHY=$(weighted_full_check "$MAINREPO/testnet/genesis-weighted-full.json" "$SENDERS") || die "$WHY"
+    fi
+    TIMEOUT_BASE_MS=$GEN_TIMEOUT_BASE_MS EVM_BLOCK_INTERVAL=$GEN_EVM_BLOCK_INTERVAL MARKETS=$MARKETS BULK_COUNT=$BULK_COUNT OUT="$GENESIS" BENCH_BIN="$BENCH" "$MAINREPO/devnet/wsl/gen-3val-genesis.sh" >>"$OUT/run.log" 2>&1 \
+        || die "genesis generation failed (see run.log)"
+    GEN_TBMS=$(jq '.consensus.timeout_base_ms' "$GENESIS")
+    log "genesis timeout_base_ms=$GEN_TBMS"
+    # The genesis EVM cadence N must be the cell's: EVM_BLOCK_INTERVAL, else the
+    # node default. A mismatch = a hand-patched weighted-full genesis carried over.
+    GEN_EVM_N=$(jq -r ".evm.block_interval // $DEFAULT_EVM_N" "$GENESIS")
+fi
 WANT_EVM_N=${GEN_EVM_BLOCK_INTERVAL:-$DEFAULT_EVM_N}
 [ "$GEN_EVM_N" = "$WANT_EVM_N" ] \
     || die "genesis evm.block_interval=$GEN_EVM_N, wanted $WANT_EVM_N (EVM_BLOCK_INTERVAL='$GEN_EVM_BLOCK_INTERVAL'): gen-3val-genesis.sh copies .evm from $MAINREPO/testnet/genesis-weighted-full.json; remove a hand patch there (set N per cell with EXTRA_ENV EVM_BLOCK_INTERVAL=N)"
@@ -1068,17 +1136,34 @@ else
     log "genesis evm.block_interval=$GEN_EVM_N (absent: node default)"
 fi
 if [ "$LIQ_THIN" -gt 0 ]; then
-    LIQ_THIN_ROWS=$(liq_thin_patch "$GENESIS" "$LIQ_THIN" "$LIQ_THIN_AVAIL" 2>>"$OUT/run.log") \
-        || die "LIQ_THIN=$LIQ_THIN genesis patch failed (see run.log)"
+    if [ "$GEN_REUSED" != 1 ]; then
+        LIQ_THIN_ROWS=$(liq_thin_patch "$GENESIS" "$LIQ_THIN" "$LIQ_THIN_AVAIL" 2>>"$OUT/run.log") \
+            || die "LIQ_THIN=$LIQ_THIN genesis patch failed (see run.log)"
+    fi
     log "LIQ_THIN=$LIQ_THIN: native available=$LIQ_THIN_AVAIL on $LIQ_THIN_ROWS genesis rows 'bulk-test 60'..'bulk-test $((60 + LIQ_THIN - 1))' (load senders 0..$((LIQ_THIN - 1)); under a shock the EVEN ones lose on every position)"
 fi
-# One jq pass (each parses the whole genesis: ~3 s at BULK_COUNT=1M).
-read -r GEN_MARKETS GEN_ACCTS GEN_BULK < <(jq -r '[(.markets|length), (.native_balances|length),
-    ([.native_balances[] | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length)] | @tsv' "$GENESIS")
-GEN_MD5=$(md5sum "$GENESIS" | cut -d' ' -f1)
+if [ "$GEN_REUSED" != 1 ]; then
+    # One jq pass (each parses the whole genesis: ~3 s at BULK_COUNT=1M).
+    read -r GEN_MARKETS GEN_ACCTS GEN_BULK < <(jq -r '[(.markets|length), (.native_balances|length),
+        ([.native_balances[] | (.note // "") | select(test("^bulk-test [0-9]+$"))] | length)] | @tsv' "$GENESIS")
+    GEN_MD5=$(md5sum "$GENESIS" | cut -d' ' -f1)
+fi
 [ "$GEN_MARKETS" = "$MARKETS" ] || die "genesis has $GEN_MARKETS markets, wanted $MARKETS"
 [ "$GEN_BULK" = "$BULK_COUNT" ] || die "genesis has $GEN_BULK bulk-test senders, wanted BULK_COUNT=$BULK_COUNT"
 log "genesis markets=$GEN_MARKETS native_balances=$GEN_ACCTS bulk_count=$GEN_BULK md5=$GEN_MD5"
+if [ "$GEN_REUSED" != 1 ]; then
+    if [ -n "$GENESIS_CACHE_DIR" ]; then
+        # Keyed again by the store, after the build: a first (or FORCE=1) build writes the weighted-full genesis.
+        if GEN_SKEY=$(genesis_key_store); then
+            GEN_KEY=$GEN_SKEY
+            log "genesis built (key $GEN_KEY, md5 $GEN_MD5${GEN_FORCED:+, FORCE=1}); cached in $GENESIS_CACHE_DIR"
+        else
+            log "WARNING: genesis built (md5 $GEN_MD5) but not cached (genesis_cache.py store failed, see run.log): the next cell builds again"
+        fi
+    else
+        log "genesis built (no GENESIS_CACHE_DIR: not cached)"
+    fi
+fi
 if evm_load_on; then
     # Sender keys (deterministic bench keys) live beside the devnet's pids and
     # logs, never in the results dir; evm_load_stop deletes them.
@@ -1663,10 +1748,19 @@ cat "$OUT/agreement.jsonl" >> "$OUT/run.log"
 # ingest accounting: actions the mempool evicted as nonce-expired (NONCE_WINDOW_MS=60s —
 # a backlog older than 60 s is dropped silently; the bench's "submitted" therefore
 # overstates what the chain executed).
-EVICTED=$(for i in 0 1 2; do sed -E 's/\x1b\[[0-9;]*m//g' "$RUN_DIR/val$i.log" | grep "evicted nonce-expired" \
-    | awk '{for(k=1;k<=NF;k++) if($k ~ /^evicted=/){split($k,a,"="); s+=a[2]}} END{printf "%d ", s+0}'; done)
+# Report-only (summary.json .ingest, never a verdict): with DEFER_REPORT_SCANS=1 the
+# campaign end pass scans each preserved log up to its length now (log-scans.sh).
+# [report-scans:ingest]
 BENCH_SUBMITTED=$(grep -oE 'Submitted \(load-gen accepted\): [0-9,]+' "$OUT/bench.log" | grep -oE '[0-9,]+$' | tr -d ,)
-log "ingest: bench submitted=${BENCH_SUBMITTED:-?} actions; mempool nonce-expired evictions per node: $EVICTED"
+if [ "$DEFER_REPORT_SCANS" = 1 ]; then
+    EVICTED=""
+    INGEST_LOG_BYTES=$(file_bytes "$RUN_DIR/val0.log" "$RUN_DIR/val1.log" "$RUN_DIR/val2.log")
+    log "ingest scan deferred to the campaign end pass (DEFER_REPORT_SCANS=1; node log bytes $INGEST_LOG_BYTES; bench submitted=${BENCH_SUBMITTED:-?} actions)"
+else
+    EVICTED=$(for i in 0 1 2; do ingest_evicted "$RUN_DIR/val$i.log"; done)
+    log "$(ingest_line "$BENCH_SUBMITTED" "$EVICTED")"
+fi
+# [/report-scans:ingest]
 
 # EVM load: what landed, read from val0 after the digest (read-only RPCs, so
 # they cannot disturb it): executed EVM txs per height from the EVM load's start
@@ -1696,10 +1790,16 @@ fi
 DISSEM=$(python3 "$TOOLS_DIR/collect_logs.py" --logs "$RUN_DIR/val0.log" "$RUN_DIR/val1.log" "$RUN_DIR/val2.log" \
     --out "$OUT/log-summary.json") || { log "log collection failed"; exit 1; }
 log "dissemination/pacing log counts: $DISSEM"
+# The node logs are preserved here (val<i>.log.gz, always in-line: the next cell's
+# launch overwrites RUN_DIR/val<i>.log); the excerpt is report-only (DEFER_REPORT_SCANS=1:
+# the campaign end pass writes it from the .gz, deferred-scans.json marks the cell).
+# [report-scans:save]
 for i in 0 1 2; do
-    grep -E ' ERROR | WARN |panicked|FAIL-STOP|fail-stop|book mode|resident|parallel|member cache|commit-lag|S470|manifest|FULL-BODY push|native block-selection caps|body fetch|OUTBOUND FAILURE|exec-backlog pacing' "$RUN_DIR/val$i.log" | head -400 > "$OUT/val$i.log.excerpt"
+    [ "$DEFER_REPORT_SCANS" = 1 ] || log_excerpt "$RUN_DIR/val$i.log" > "$OUT/val$i.log.excerpt"
     gzip -c "$RUN_DIR/val$i.log" > "$OUT/val$i.log.gz"
 done
+[ "$DEFER_REPORT_SCANS" != 1 ] || write_deferred_marker "$OUT" "${BENCH_SUBMITTED:-}" "$INGEST_LOG_BYTES"
+# [/report-scans:save]
 
 # ---- crash gate: scan the killed node's log TAIL — everything it wrote AFTER
 # the SIGKILL (crash-kill.sh restarted it with the log appended and recorded the

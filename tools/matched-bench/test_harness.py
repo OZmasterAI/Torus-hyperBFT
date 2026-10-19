@@ -2798,6 +2798,7 @@ def sandbox_repo(tmp):
     os.makedirs(tools)
     os.makedirs(wsl)
     shutil.copy2(RUN_CELL_SH, tools)
+    shutil.copy2(os.path.join(HERE, "log-scans.sh"), tools)  # run-cell.sh sources it at preflight
     shutil.copy2(os.path.join(REPO, "devnet", "wsl", "bench-validator-keys.json"), wsl)
     for p in (
         os.path.join(tools, "digest-node.sh"),
@@ -4357,7 +4358,8 @@ class EvmLoadHarnessTest(unittest.TestCase):
             ),
         )
         scan = s.index('"$SELF_DIR/evm_load.py" scan')
-        self.assertLess(s.index('log "ingest: bench submitted='), scan)
+        # the ingest accounting (in-line, or deferred to the campaign end pass: test_cell_endpass.py)
+        self.assertLess(s.index("# [/report-scans:ingest]"), scan)
         self.assertLess(
             scan,
             s.index(
