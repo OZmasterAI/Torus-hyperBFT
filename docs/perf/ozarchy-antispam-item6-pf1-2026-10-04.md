@@ -14930,6 +14930,117 @@ save_books per 1k fills cut at 1M with no regression on the merge-rule rows at t
   * Tools, specs, drivers and checks: `ozarchy-8k-tools/` (`8k-spec.json`, `8kd-spec.json`, `8k-checks.sh`,
     `chain-8kd.sh`) and `ozarchy-8k-tools-deep/`. Binaries and md5s: `ozarchy-8k-stage/`.
 
+### 97.8 Bench result (Phase 5 analysis, s68, 2026-10-19)
+
+The tables in 97.4 and the verdict in 97.5 are left as written; this sub-section replaces them as the result.
+
+* **Script:** `~/bench-results-matched/ozarchy-8k-run/analyst/8k-analyse.py`, run with `python3 -I` on both run dirs
+  (outputs `analyst/8k.txt`, `analyst/8kd.txt`). Validated first on p8g's cells: its output equals
+  `ozarchy-p8g-run/analyst/p8g.txt` on every cell and every row, except the md5 column, which is False there as
+  expected (the 8k arm md5s are hard-coded). Its boundary-block scan reads the checks' cached log lines
+  (`k8-loglines-<node>.txt`); on r1-B val0 they give the same count of boundary lines as the full log (120 / 120). No
+  bug was found, so the script was not changed. Paired B/A ratios are per round (r1, r2, r3), geomean with a t 95% CI
+  on 2 df.
+* **Cell re-check from raw files:** all 14 cells (2 x warm-up + 12 measured) are valid:
+  * `<cell>.cell.rc` 0, summary.json validity ACCEPT, agreement_verdict AGREE (block hash, state root, state digest
+    and counters equal on 3 nodes), liveness PASS, panic_or_failstop_lines 0, error_lines 0.
+  * `node-environ-trie.txt`: 3 of 3 node processes at the arm's md5 in every cell (A `0d24371e`, B `b0a4c2f1`).
+  * Flag took effect in B only: `TORUS_BOOK_FAST_ENCODE=1` in `node-env-all.txt` on 3 nodes in every B cell and on 0
+    in every A cell; `k8fastchk` on=1 on 3 nodes in B, lines=0 in A.
+  * Deep cells: genesis line `native_balances=1000060 bulk_count=1000000` (md5 `4c8b8af8`) and `k8deepchk`
+    resting=1000000 in all 7. Standard cells: `bulk_count=100000` (md5 `d694b81b`).
+  * Neither `campaign.log` has a CELL-FLAG, VOID or non-OK CHECK line; both end "RERUN PASS: nothing queued". The
+    only "fail-stop" text in the node logs is the INFO line `running state hash fail-stop ... on=false`.
+  * Excluded: none.
+
+**Per cell** (node means; timeouts = consensus timeouts, sum of 3 nodes):
+
+| campaign | cell | matched/s | native blk/s | block p50 / p99 ms | exec on-CPU ms / 1k fills | save_books ms / native blk | save_books ms / 1k fills | timeouts |
+|---|---|---|---|---|---|---|---|---|
+| 8k | w1-A | 260,002.0 | 17.571 | 13 / 526 | 2.734 | 3.03 | 0.217 | 0 |
+| 8k | r1-A | 258,837.8 | 18.217 | 13 / 505 | 2.726 | 2.85 | 0.206 | 1 |
+| 8k | r1-B | 261,113.5 | 17.774 | 13 / 504 | 2.725 | 2.59 | 0.183 | 0 |
+| 8k | r2-B | 261,747.6 | 16.844 | 13 / 538 | 2.671 | 2.73 | 0.181 | 0 |
+| 8k | r2-A | 261,420.8 | 15.673 | 14 / 633 | 2.724 | 3.56 | 0.221 | 0 |
+| 8k | r3-A | 259,493.0 | 15.028 | 13 / 705 | 2.699 | 3.60 | 0.217 | 0 |
+| 8k | r3-B | 260,508.9 | 15.086 | 13 / 724 | 2.671 | 3.01 | 0.181 | 0 |
+| 8kd | w1-A | 225,058.6 | 3.573 | 192 / 1,338 | 3.387 | 60.93 | 1.003 | 3 |
+| 8kd | r1-A | 223,981.1 | 3.350 | 208 / 1,555 | 3.405 | 68.07 | 1.042 | 10 |
+| 8kd | r1-B | 225,491.2 | 3.242 | 226 / 1,508 | 3.299 | 60.29 | 0.891 | 6 |
+| 8kd | r2-B | 228,425.2 | 3.603 | 192 / 1,489 | 3.297 | 55.95 | 0.903 | 7 |
+| 8kd | r2-A | 223,548.5 | 3.339 | 210 / 1,412 | 3.402 | 68.66 | 1.050 | 7 |
+| 8kd | r3-A | 225,053.9 | 3.173 | 220 / 1,444 | 3.391 | 72.18 | 1.040 | 9 |
+| 8kd | r3-B | 228,116.5 | 3.100 | 237 / 1,514 | 3.273 | 62.63 | 0.879 | 7 |
+
+**Arm means (n = 3, warm-ups excluded) and paired B/A:**
+
+| metric | standard A | standard B | standard B/A (95% CI) | deep A | deep B | deep B/A (95% CI) |
+|---|---|---|---|---|---|---|
+| exec-thread on-CPU ms per 1k fills | 2.717 | 2.689 | 0.9899 [0.9664, 1.0140] | 3.399 | 3.289 | **0.9676 [0.9622, 0.9731]** |
+| native blocks/s | 16.306 | 16.568 | 1.0172 [0.8991, 1.1509] | 3.287 | 3.315 | 1.0067 [0.8666, 1.1694] |
+| block p50 ms | 13.57 | 13.35 | 0.9847 [0.8330, 1.1640] | 212.39 | 218.15 | 1.0233 [0.8018, 1.3060] |
+| block p99 ms | 614.4 | 588.3 | 0.9545 [0.7409, 1.2295] | 1,470.2 | 1,503.4 | 1.0234 [0.9106, 1.1502] |
+| timeouts per 1,000 native blocks (pooled) | 0.034 (1 / 29,467) | 0.000 (0 / 29,937) | n/a (A 0 in 2 rounds) | 4.377 (26 / 5,940) | 3.339 (20 / 5,990) | 0.7705 [0.4654, 1.2757] |
+| matched/s | 259,917 | 261,123 | 1.0046 [0.9952, 1.0142] | 224,194 | 227,344 | 1.0140 [0.9955, 1.0330] |
+| CPU-s per 1M fills | 23.49 | 23.51 | 1.0007 [0.9877, 1.0138] | 24.68 | 24.74 | 1.0021 [0.9943, 1.0099] |
+| fills per native block | 15,516 | 15,302 | 0.9872 [0.8788, 1.1089] | 66,720 | 66,974 | 1.0026 [0.8877, 1.1323] |
+| exec block_ms | 57.2 | 56.3 | 0.9851 [0.8640, 1.1231] | 294.3 | 290.3 | 0.9849 [0.8678, 1.1177] |
+| exec ms per 1k fills | 3.692 | 3.684 | 0.9979 [0.9827, 1.0133] | 4.412 | 4.334 | **0.9824 [0.9776, 0.9871]** |
+| save_order_books ms per native block | 3.34 | 2.78 | 0.8345 [0.6744, 1.0327] | 69.64 | 59.62 | **0.8556 [0.7679, 0.9532]** |
+| save_order_books ms per 1k fills | 0.215 | 0.181 | **0.8454 [0.7617, 0.9382]** | 1.044 | 0.891 | **0.8534 [0.8355, 0.8716]** |
+| exec engine ms per 1k fills | 2.930 | 2.947 | 1.0058 [0.9899, 1.0221] | 2.504 | 2.574 | **1.0281 [1.0199, 1.0365]** |
+| exec runqueue wait ms per 1k fills | 0.133 | 0.135 | 1.0141 [0.9999, 1.0285] | 0.120 | 0.127 | **1.0550 [1.0134, 1.0983]** |
+
+Bold: CI excludes 1. The timeouts row in the script's mean-of-cells table is 0.030 / 0.000 (standard) and
+4.382 / 3.349 (deep); the pooled figures above come from its per-arm line.
+
+* **Steps vs noise (matched/s):** standard step +1,206 against a pooled replicate sd of 1,046 (A sd 1,343, B 619):
+  1.15 sd, not resolved. Deep step +3,150 against a pooled sd of 1,265 (A 775, B 1,612): 2.49 sd, all 3 pairs
+  positive (1.0067 / 1.0218 / 1.0136), but the paired CI [0.9955, 1.0330] still spans 1: not resolved.
+* **Merge rule (bench-queue.md, exec-path A/B):** met on both shapes. No row is on the wrong side of 1:
+  * Exec-thread on-CPU ms per 1k fills falls on the deep book (-3.2%, CI below 1). On the standard load it is -1.0%,
+    CI spanning 1, so the change adds no exec-thread CPU there.
+  * Native blocks/s, p50 and p99: every CI spans 1 on both shapes (the block-rate rows are wide, as in p8g).
+  * Timeouts per 1,000 native blocks: 1 -> 0 (standard), 4.377 -> 3.339 (deep, CI spans 1).
+  * CPU-s per 1M fills: flat on both (CIs span 1).
+* **Mechanism, sized:** on the deep book save_order_books falls 10.0 ms per native block (69.64 -> 59.62), which is
+  3.4% of the 294 ms exec block, and 0.153 ms per 1k fills, which is 3.5% of exec ms per 1k fills (4.412). Part of
+  that is given back elsewhere: the exec engine timer rises 0.070 ms per 1k fills (+2.8%, CI above 1; verify, match
+  and replay guard per block all +2-4%, CIs spanning 1), and the exec-thread runqueue wait rises 0.007 ms per 1k fills
+  (+5.5%), too small to explain the engine rise. The net is exec ms per 1k fills -1.8% (CI below 1). With the exec
+  thread ~96% busy (exec busy share 0.967 A, 0.959 B), a -1.8% exec cost per fill predicts about +1.8% matched/s; the
+  measured +1.4% (not resolved) is consistent with it. On the standard load save_order_books is 0.215 ms of 3.692 ms
+  per 1k fills (5.8%); its -15.5% cut is -0.033 ms (-0.9% of exec), inside the noise of exec ms per 1k fills (-0.2%,
+  CI spans 1), so matched/s ~0 there, as the ranker said.
+* **Against the expectations:**
+  * Ranker: standard ~0 (matches); deep save_books -30 to -50% and matched/s +3 to +8% (measured -14.7% per 1k fills
+    and +1.4%, not resolved): about half the low end of the expected cut and below the expected throughput gain.
+  * Microbench: encode -30 to -36% on size-spread books, -5.5 to -18.7% on equal-size books. The bench cut (-14.7% to
+    -15.5% of the whole save_order_books timer, both shapes) sits in the equal-size range. Two readings, neither
+    tested here: the benched books sit nearer a power-of-two capacity than the microbench's spread shape (the gain
+    is the removed borsh growth copies, 97.6), and the timer also holds work the change does not touch (s96.3: encode
+    73% + memmove 15% of save_books at P1M, the rest alloc, journal drop and overlay put).
+  * The engine +2.8% per 1k fills on the deep book is not explained by this run. The change does not touch the
+    engine; one candidate is allocator state (B returns different-size blocks to jemalloc), not checked.
+* **Drift:** matched/s shows no trend in run order (standard A 258.8k / 261.4k / 259.5k; deep A 224.0k / 223.5k /
+  225.1k). On the standard load native blocks/s falls through the campaign in both arms (18.22, 17.77, 16.84, 15.67,
+  15.03, 15.09 in run order) while fills per block rise, so the block-rate rows carry a campaign trend; A B B A A B
+  balances a linear trend, and those rows are not judged beyond "CI spans 1".
+
+**Verdict: merge rule met on both shapes; a real but small gain.** save_order_books per 1k fills -15% on both shapes
+(CIs below 1), exec-thread on-CPU per 1k fills -3.2% and exec ms per 1k fills -1.8% on the 1M-resting deep book
+(CIs below 1), nothing worse on the merge-rule rows. matched/s is not resolved on either shape (standard +0.5%, deep
++1.4%, both CIs span 1). The gain is well below the ranker's deep-book expectation. Confidence: high on cell validity
+and on the save_books and exec on-CPU cuts (tight CIs, 3 of 3 pairs); medium on the verdict, because the throughput
+step is unresolved and the deep engine +2.8% is unexplained.
+
+**Recommendation: merge candidate, flag default off** (`TORUS_BOOK_FAST_ENCODE`, byte-identical output, 97.3). It
+meets the condition set in 97.5 (a clear save_books per 1k fills cut at 1M, no merge-rule regression at the standard
+load). Before turning it on by default: (1) to resolve deep matched/s, add 2 deep pairs (B A, A B; ~17 min per deep
+cell start to start, ~70 min): the per-round ratio sd of this run gives a CI half-width of ~0.9% at n = 5 (1.2% at
+n = 4), under the +1.4% step; (2) find the deep exec engine +2.8% per 1k fills (a perf profile of one A and one B deep cell, engine
+phase). L3.1 attacks the same row and should be measured on top of L3.3.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
