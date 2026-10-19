@@ -1577,7 +1577,7 @@ impl NativeStateOverlay {
         layer: crate::probes::Layer,
         hit: Option<&[u8]>,
     ) {
-        crate::probes::record(id.name(), layer, || {
+        crate::probes::record_point(id.name(), key, layer, || hit.is_some(), || {
             let db = self.db.get_cf_raw(id.name(), key).ok().flatten();
             if LEN {
                 db.as_deref().map(<[u8]>::len) != hit.map(<[u8]>::len)
@@ -2745,7 +2745,13 @@ impl StateBackend for NativeStateOverlay {
                 let state = self.pending.read().unwrap();
                 if let Some(hit) = state.lookup(id, key) {
                     #[cfg(feature = "test-probes")]
-                    crate::probes::record(id.name(), crate::probes::Layer::Own, || false);
+                    crate::probes::record_point(
+                        id.name(),
+                        key,
+                        crate::probes::Layer::Own,
+                        || hit.is_some(),
+                        || false,
+                    );
                     return Ok(hit.map(<[u8]>::to_vec));
                 }
             }
@@ -2753,7 +2759,13 @@ impl StateBackend for NativeStateOverlay {
             // and the parent layer, which R already holds.
             if let Some(rows) = self.resident(id) {
                 #[cfg(feature = "test-probes")]
-                crate::probes::record(id.name(), crate::probes::Layer::Resident, || false);
+                crate::probes::record_point(
+                    id.name(),
+                    key,
+                    crate::probes::Layer::Resident,
+                    || rows.get(key).is_some(),
+                    || false,
+                );
                 return Ok(rows.get(key));
             }
             // bl2 exec pipeline: previous block's frozen set (read-your-writes);
@@ -2762,7 +2774,13 @@ impl StateBackend for NativeStateOverlay {
                 return Ok(hit.map(<[u8]>::to_vec));
             }
             #[cfg(feature = "test-probes")]
-            crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
+            crate::probes::record_point(
+                id.name(),
+                key,
+                crate::probes::Layer::Db,
+                || self.db.get_cf_raw(cf, key).ok().flatten().is_some(),
+                || false,
+            );
         }
         self.db.get_cf_raw(cf, key)
     }
@@ -2905,20 +2923,38 @@ impl StateBackend for NativeStateOverlay {
                 let state = self.pending.read().unwrap();
                 if let Some(hit) = state.lookup(id, key) {
                     #[cfg(feature = "test-probes")]
-                    crate::probes::record(id.name(), crate::probes::Layer::Own, || false);
+                    crate::probes::record_point(
+                        id.name(),
+                        key,
+                        crate::probes::Layer::Own,
+                        || hit.is_some(),
+                        || false,
+                    );
                     return Ok(hit.map(<[u8]>::len));
                 }
             }
             if let Some(rows) = self.resident(id) {
                 #[cfg(feature = "test-probes")]
-                crate::probes::record(id.name(), crate::probes::Layer::Resident, || false);
+                crate::probes::record_point(
+                    id.name(),
+                    key,
+                    crate::probes::Layer::Resident,
+                    || rows.get_len(key).is_some(),
+                    || false,
+                );
                 return Ok(rows.get_len(key));
             }
             if let Some(hit) = self.lookup_lower_as::<true>(id, key)? {
                 return Ok(hit.map(<[u8]>::len));
             }
             #[cfg(feature = "test-probes")]
-            crate::probes::record(id.name(), crate::probes::Layer::Db, || false);
+            crate::probes::record_point(
+                id.name(),
+                key,
+                crate::probes::Layer::Db,
+                || StateBackend::get_cf_len(&self.db, cf, key).ok().flatten().is_some(),
+                || false,
+            );
         }
         StateBackend::get_cf_len(&self.db, cf, key)
     }

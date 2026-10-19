@@ -14,6 +14,13 @@
 //! after a drain, or a C hit whose checkpoint already landed, is a hit and
 //! not in flight).
 //!
+//! A test can also WATCH single keys ([`Probe::watch`]): every point read
+//! of a watched key is then logged with the block height the test set
+//! ([`Probe::set_height`]), the reader, the layer that answered, whether it
+//! was in flight and whether a row was found ([`WatchedRead`]). The counters
+//! cannot attribute a read to one key or one height; the watch can (plan
+//! task 0.1: where the re-creation of an EIP-161-deleted account reads it).
+//!
 //! The probe also carries the planted faults of plan section 5.4: an overlay
 //! built on a thread whose probe has [`Plant::SkipParent`] (or
 //! `SkipCheckpoint`, `SkipDeferred`) reads as if that layer were absent. With
@@ -21,7 +28,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The layer that answered a read (newest first, then the DB).
@@ -99,6 +106,21 @@ impl std::ops::AddAssign for Count {
     }
 }
 
+/// One point read of a watched key ([`Probe::watch`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchedRead {
+    pub cf: &'static str,
+    pub key: Vec<u8>,
+    /// The height the test set last ([`Probe::set_height`]).
+    pub height: u64,
+    pub reader: Reader,
+    pub layer: Layer,
+    /// As [`Count::inflight`] (never for `Own`, `Resident`, `Db`).
+    pub inflight: bool,
+    /// The answer was a row (`false`: absent, or a layer's tombstone).
+    pub found: bool,
+}
+
 /// A planted fault: overlays built while it is set read without that layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plant {
@@ -122,6 +144,10 @@ pub(crate) struct Skip {
 #[derive(Default)]
 pub struct Probe {
     counts: Mutex<BTreeMap<(Reader, Layer, &'static str), Count>>,
+    /// The watched `(cf, key)`s and their reads, in order.
+    watch: Mutex<Vec<(&'static str, Vec<u8>)>>,
+    watched: Mutex<Vec<WatchedRead>>,
+    height: AtomicU64,
     skip_parent: AtomicBool,
     skip_checkpoint: AtomicBool,
     skip_deferred: AtomicBool,
@@ -164,6 +190,30 @@ impl Probe {
             }
         }
         out
+    }
+
+    /// Log every point read of `key` in `cf` from now on ([`Self::watched`]).
+    pub fn watch(&self, cf: &'static str, key: Vec<u8>) {
+        self.watch.lock().unwrap().push((cf, key));
+    }
+
+    /// The height the next watched reads are logged at (the test sets it
+    /// before each block).
+    pub fn set_height(&self, h: u64) {
+        self.height.store(h, Ordering::SeqCst);
+    }
+
+    /// Every watched read so far, in order.
+    pub fn watched(&self) -> Vec<WatchedRead> {
+        self.watched.lock().unwrap().clone()
+    }
+
+    fn watches(&self, cf: &str, key: &[u8]) -> bool {
+        self.watch
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(c, k)| *c == cf && k.as_slice() == key)
     }
 
     /// Forget every count (the plants stay).
@@ -250,6 +300,35 @@ pub(crate) fn record(cf: &'static str, layer: Layer, inflight: impl FnOnce() -> 
     }
 }
 
+/// [`record`] for a point read of `key`; a watched key is also logged,
+/// with `found` (evaluated only then) telling whether a row came back.
+pub(crate) fn record_point(
+    cf: &'static str,
+    key: &[u8],
+    layer: Layer,
+    found: impl FnOnce() -> bool,
+    inflight: impl FnOnce() -> bool,
+) {
+    let probe = ACTIVE.with(|a| a.borrow().clone());
+    if let Some(p) = probe {
+        let reader = READER.with(|r| r.get());
+        let inflight = layer.frozen() && inflight();
+        p.add(reader, layer, cf, inflight);
+        if p.watches(cf, key) {
+            let read = WatchedRead {
+                cf,
+                key: key.to_vec(),
+                height: p.height.load(Ordering::SeqCst),
+                reader,
+                layer,
+                inflight,
+                found: found(),
+            };
+            p.watched.lock().unwrap().push(read);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +378,43 @@ mod tests {
         p.plant(Plant::SkipParent);
         let _i = install(p);
         assert!(skip().parent && !skip().checkpoint && !skip().deferred);
+    }
+
+    #[test]
+    fn o0_probe_watch_logs_watched_point_reads_only() {
+        let p = Probe::new();
+        p.watch("x", b"z".to_vec());
+        record_point("x", b"z", Layer::Db, || true, || true);
+        assert!(p.watched().is_empty(), "nothing installed: nothing logged");
+        let _i = install(p.clone());
+        p.set_height(7);
+        record_point("x", b"z", Layer::Own, || false, || unreachable!("Own is never in flight"));
+        {
+            let _s = scope(Reader::Native);
+            p.set_height(8);
+            record_point("x", b"z", Layer::Checkpoint, || true, || true);
+            record_point("x", b"other", Layer::Checkpoint, || unreachable!("unwatched"), || true);
+            record_point("y", b"z", Layer::Db, || unreachable!("unwatched CF"), || false);
+        }
+        let w = p.watched();
+        let row = |height, reader, layer, inflight, found| WatchedRead {
+            cf: "x",
+            key: b"z".to_vec(),
+            height,
+            reader,
+            layer,
+            inflight,
+            found,
+        };
+        assert_eq!(
+            w,
+            vec![
+                row(7, Reader::Other, Layer::Own, false, false),
+                row(8, Reader::Native, Layer::Checkpoint, true, true),
+            ]
+        );
+        let c = p.counts();
+        assert_eq!(c[&(Reader::Native, Layer::Checkpoint, "x")].hits, 2, "unwatched reads still count");
+        assert_eq!(c[&(Reader::Native, Layer::Db, "y")].hits, 1);
     }
 }

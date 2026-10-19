@@ -345,13 +345,37 @@ finding, not a re-bless). Task 3.1's commit names the fix commit in its message,
       new row `236-247`); Z's `TransferToPerp` of its whole EVM balance rewrites the row with balance 0 and keeps it
       (`lockbox.rs:62-103`, `build_evm_balance_update` preserves nonce and code hash and never deletes); a zero-value
       EVM call to Z in a later block then deletes the row (revm state clear; `apply_bundle_plain` deletes
-      CF_ACCOUNTS, `torus-state/src/incremental.rs:291-294`). Z's `TransferToSpot` re-creates it, and Z sends again
-      from nonce 0. The stream runs this cycle for 3 addresses (`O0_EMPTIED`): fund at e-3, drain at e-2, touch at
-      the EVM height e (`e % 5 == 0`, so drain and touch share one Every5 window), re-fund at e+1, Z's create (new
-      storage) at the next EVM height (seed `O0_SEED`: touches at 20, 30, 60; reuse at 25, 40, 65). Fed counter
-      `eip161_cross_block` (floor 3); `o0_stream_eip161_cycles_delete_and_recreate` checks each row on the serial
-      run (written, empty, gone, re-created at nonce 0, nonce 1). The golden was re-written with the cycles (serial,
-      interval 0 and Every5 agree).
+      CF_ACCOUNTS, `torus-state/src/incremental.rs:291-294`). A native credit re-creates it, and Z sends again
+      from nonce 0. The stream runs this cycle for 5 addresses (`O0_EMPTIED`, shape `O0Recreate`, alternating):
+      fund at e-3, drain at e-2, touch at the EVM height e (`e % 5 == 0`, so drain and touch share one Every5
+      window), then the re-creation in one of two shapes, then Z's create (new storage) at the next EVM height:
+      - **next-block** (3 cycles, fed `eip161_cross_block`, floor 3): Z's `TransferToSpot` at e+1, the first height
+        of the next window. Seed `O0_SEED`: touches 20, 60, 90; reuse 25, 65, 95.
+      - **same-block** (2 cycles, fed `eip161_same_block`, floor 2): a trader's `Withdraw { to: Z }` in block e's
+        native phase, which runs after the EVM section: deletion and re-creation in one block, one window. Touches
+        30, 70; reuse 40, 80.
+      `o0_stream_eip161_cycles_delete_and_recreate` checks each row on the serial run (written, empty, then gone
+      and re-created at nonce 0 / re-created in the touch block, then nonce 1).
+      `o0_eip161_recreation_reads_by_layer` (serial, G interval 0, G Every5 with parked checkpoints) pins where
+      the re-creation reads Z, with a key watch on the probe (`Probe::watch` / `set_height`, test-probes only: the
+      per-(reader, layer, CF) counters cannot attribute a read to one key or height):
+      - same-block: every native-phase read of Z in block e is answered by the block's own pending layer, the
+        first with the tombstone `seed_from_bundle` put there for the EVM deletion (all three configurations).
+      - next-block: **today the deletion is never read from an in-flight layer**. e is an EVM height, so it
+        barriers (the barrier closes the window into a checkpoint and drains W, `pipeline_barrier`) and its
+        serial flush writes the deletion to the DB with the marker. At e+1 the overlay has no parent, L or C, and
+        the re-fund's first read of Z is a DB miss. The test pins that (no frozen-layer read of Z at e+1).
+        With the flag on, e is pipelined and its deletion sits in the parent / C at e+1: task 3.6 asserts that
+        read in flight (the stream already has the input).
+      **Why no EVM re-creation inside the deletion's Every5 window.** The deletion is an EVM touch at an EVM
+      height e, which with `TEST_EVM_BLOCK_INTERVAL` 5 is on the Every5 grid (e % 5 == 0; flag on, the
+      checkpoint triggers at `height - base >= 5`, base a checkpoint height, attest and epoch heights are
+      multiples of 5 too): e is the last height of its window. An EVM re-creation (a value transfer to Z or Z's
+      own tx) needs a later EVM height, at least e+5, the last height of the next window. A re-creation by a later
+      tx of block e itself collapses into the block's bundle (Z stays a put, no deletion reaches any layer), and
+      today every EVM height ends its window anyway (barrier). The re-creation inside the window is therefore
+      native: the same-block shape. The golden was re-written with the 5 cycles (serial, interval 0 and Every5
+      agree).
   - `TransferToSpot` in a native block, spent by the next EVM height; `TransferToPerp` in the same block as EVM txs.
   - Native credits (fees, rewards) to EVM accounts the window's EVM bundles also touch.
   - Big lane: the fixture header carries `evm_big_block_interval` M = 10 (big heights `h % 10 == 0`, with
@@ -758,6 +782,9 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
   `o0_coverage_floor_per_config` (in-flight hits, 5.2) and the planted bypasses of 5.4.
 - Also update `epoch_fast_path_evm_or_slash_boundary_stays_serial`: with the EVM flag on, an EVM boundary block is
   pipelined; a slash or a non-durable header still barriers.
+- And flip the next-block half of `o0_eip161_recreation_reads_by_layer` (task 0.1): with the flag on, the re-fund at
+  e+1 reads Z's EIP-161 deletion from an in-flight layer (parent at interval 0, C or L with Every5 in G mode) at
+  least once per configuration; the same-block half (the block's own pending layer) stays.
 
 **Task 3.7: existing EVM tests on the fast path**
 - `corewriter_evm_row_drains_in_empty_next_block` (+ `_with_interval`, `app.rs:25834`, `25923`),

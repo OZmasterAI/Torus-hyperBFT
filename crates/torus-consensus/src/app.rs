@@ -29349,8 +29349,33 @@ mod crash_recovery_tests {
     const O0_USERS: [u8; 4] = [0x31, 0x32, 0x33, 0x34];
     /// Addresses that only ever get native credits (`Withdraw { to }`),
     /// drained to an empty EVM account natively, then deleted by an EVM
-    /// touch (EIP-161) and re-funded (`O0Fed::eip161_cross_block`).
-    const O0_EMPTIED: [u8; 3] = [0x41, 0x42, 0x43];
+    /// touch (EIP-161) and re-created natively: at the next height
+    /// (`O0Recreate::NextBlock`, `O0Fed::eip161_cross_block`) or in the
+    /// touch block's own native phase (`O0Recreate::SameBlock`,
+    /// `O0Fed::eip161_same_block`).
+    const O0_EMPTIED: [u8; 5] = [0x41, 0x42, 0x43, 0x44, 0x45];
+
+    /// Where an EIP-161 cycle re-creates its deleted Z (plan task 0.1).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum O0Recreate {
+        /// Z's own `TransferToSpot` at e + 1: the first height of the next
+        /// Every5 window (the touch height e is a checkpoint height).
+        NextBlock,
+        /// A `Withdraw { to: Z }` in block e's native phase, which runs
+        /// after the EVM section: Z is deleted and re-created in one block,
+        /// one window.
+        SameBlock,
+    }
+
+    /// The shape of the cycle of `O0_EMPTIED[i]`: alternating, next-block
+    /// first (3 next-block cycles, 2 same-block ones).
+    fn o0_recreate(i: usize) -> O0Recreate {
+        if i % 2 == 0 {
+            O0Recreate::NextBlock
+        } else {
+            O0Recreate::SameBlock
+        }
+    }
     /// The trader that turns big (`EvmUserModify`) at height 8.
     const O0_BIG_TRADER: u8 = C5_TRADERS[0];
 
@@ -29585,8 +29610,11 @@ mod crash_recovery_tests {
         evm_all_skipped_undecodable_marker: u64,
         evm_all_skipped_undecodable_native: u64,
         evm_all_skipped_undecodable_ckpt: u64,
-        /// EIP-161 cycles (`O0_EMPTIED`), one per address.
+        /// EIP-161 cycles (`O0_EMPTIED`), one per address: re-created at
+        /// the next height (next Every5 window) ...
         eip161_cross_block: u64,
+        /// ... and re-created in the touch block's native phase.
+        eip161_same_block: u64,
         eip161: Vec<O0Eip161>,
     }
 
@@ -29594,12 +29622,15 @@ mod crash_recovery_tests {
     /// `Withdraw { to: Z }` at `fund` (its CF_ACCOUNTS row: nonce 0, no
     /// code), drains it to an empty account by its own `TransferToPerp` at
     /// `drain`, a zero-value EVM call to Z at `touch` (1-4 heights later,
-    /// the same Every5 window) deletes the row, Z's `TransferToSpot` at
-    /// `refund` re-creates it, and Z deploys a storage-writing contract
-    /// from nonce 0 at the EVM height `reuse`.
+    /// the same Every5 window) deletes the row, a native credit at `refund`
+    /// re-creates it (`NextBlock`: Z's `TransferToSpot` of 2 units at
+    /// `touch + 1`; `SameBlock`: a trader's `Withdraw { to: Z }` of 3 units
+    /// in block `touch`'s native phase, `refund == touch`), and Z deploys a
+    /// storage-writing contract from nonce 0 at the EVM height `reuse`.
     #[derive(Clone, Copy, Debug)]
     struct O0Eip161 {
         seed: u8,
+        recreate: O0Recreate,
         fund: u64,
         drain: u64,
         touch: u64,
@@ -29644,6 +29675,7 @@ mod crash_recovery_tests {
                 ("evm_after_fatal", self.evm_after_fatal, 1),
                 ("evm_section_error", self.evm_section_error, 1),
                 ("eip161_cross_block", self.eip161_cross_block, 3),
+                ("eip161_same_block", self.eip161_same_block, 2),
                 (
                     "all_skipped_nonce_marker",
                     self.evm_all_skipped_nonce_marker,
@@ -29743,8 +29775,9 @@ mod crash_recovery_tests {
     /// window's bundles touch); the big lane (an `EvmUserModify` at 8, big
     /// heights carrying both lanes); EIP-161 cycles (`O0Eip161`: an address
     /// with only native credits drained natively to an empty account,
-    /// deleted by an EVM touch in the same Every5 window, re-funded and
-    /// re-used). Forced EVM heights at epoch boundaries,
+    /// deleted by an EVM touch in the same Every5 window, re-created at the
+    /// next height or in the touch block's own native phase, and re-used).
+    /// Forced EVM heights at epoch boundaries,
     /// attest heights, a slash height, the fatal block's successor, a failed
     /// section, and the all-skipped blocks (`O0_ALL_SKIPPED`).
     fn o0_blocks(n: u64, seed: u64) -> (Vec<O0Block>, O0Fed) {
@@ -29846,7 +29879,8 @@ mod crash_recovery_tests {
                 || x == O0_SECTION_ERROR
         };
         let mut from = 20;
-        for seed in O0_EMPTIED {
+        for (i, seed) in O0_EMPTIED.into_iter().enumerate() {
+            let recreate = o0_recreate(i);
             let cycle = evm_heights.iter().copied().find_map(|e| {
                 if e < from || e % 5 != 0 || (e - 3..=e + 1).any(special) {
                     return None;
@@ -29854,16 +29888,23 @@ mod crash_recovery_tests {
                 let reuse = evm_heights.iter().copied().find(|&r| r > e + 1 && !special(r))?;
                 Some(O0Eip161 {
                     seed,
+                    recreate,
                     fund: e - 3,
                     drain: e - 2,
                     touch: e,
-                    refund: e + 1,
+                    refund: match recreate {
+                        O0Recreate::NextBlock => e + 1,
+                        O0Recreate::SameBlock => e,
+                    },
                     reuse,
                 })
             });
             let Some(c) = cycle else { break };
             from = c.reuse + 1;
-            fed.eip161_cross_block += 1;
+            match recreate {
+                O0Recreate::NextBlock => fed.eip161_cross_block += 1,
+                O0Recreate::SameBlock => fed.eip161_same_block += 1,
+            }
             fed.eip161.push(c);
             let z = oracle_addr(seed);
             let unit = |n: u128| U256::from(n * FixedPoint::ONE.raw() as u128);
@@ -29882,12 +29923,25 @@ mod crash_recovery_tests {
                 seed,
                 NativeAction::TransferToPerp { amount: unit(5) },
             );
-            push_native(
-                &mut blocks,
-                c.refund,
-                seed,
-                NativeAction::TransferToSpot { amount: unit(2) },
-            );
+            match recreate {
+                O0Recreate::NextBlock => push_native(
+                    &mut blocks,
+                    c.refund,
+                    seed,
+                    NativeAction::TransferToSpot { amount: unit(2) },
+                ),
+                // Block e's native phase runs after its EVM section: the
+                // credit re-creates Z right after the touch deleted it.
+                O0Recreate::SameBlock => push_native(
+                    &mut blocks,
+                    c.refund,
+                    C5_TRADERS[1],
+                    NativeAction::Withdraw {
+                        amount: unit(3),
+                        to: z,
+                    },
+                ),
+            }
         }
         let lockbox =
             torus_core::precompiles::precompile_address(torus_core::precompiles::ADDR_LOCKBOX);
@@ -30449,15 +30503,27 @@ mod crash_recovery_tests {
     }
 
     /// Plan task 0.1 (guard on the stream's EIP-161 cycles, so the fed
-    /// counter is not vacuous): the option 0 stream run serially to the
-    /// last cycle's reuse height leaves each Z with a row after its fund,
-    /// an empty row after its drain, no row after the touch, a row of 2
-    /// units at nonce 0 after the re-fund, and nonce 1 after the reuse.
+    /// counters are not vacuous): the option 0 stream run serially to the
+    /// last cycle's reuse height leaves each Z with a row after its fund
+    /// and an empty row after its drain. A next-block cycle then has no row
+    /// after the touch and a row of 2 units at nonce 0 after the re-fund; a
+    /// same-block cycle has a row of 3 units at nonce 0 after the touch
+    /// block (deleted by its EVM section, re-created by its native phase:
+    /// the deletion itself is pinned by `o0_eip161_recreation_reads_by_layer`).
+    /// Nonce 1 after the reuse.
     #[test]
     fn o0_stream_eip161_cycles_delete_and_recreate() {
         let (blocks, fed) = o0_blocks(300, O0_SEED);
         assert_eq!(fed.eip161.len(), O0_EMPTIED.len(), "{:?}", fed.eip161);
+        for shape in [O0Recreate::NextBlock, O0Recreate::SameBlock] {
+            assert!(
+                fed.eip161.iter().any(|c| c.recreate == shape),
+                "no {shape:?} cycle: {:?}",
+                fed.eip161
+            );
+        }
         let last = fed.eip161.iter().map(|c| c.reuse).max().unwrap();
+        let wei = |n: u128| U256::from(n * 10u128.pow(18));
         let mut node = O0Node::new(O0Cfg::serial());
         let mut seen = 0;
         for b in &blocks[..last as usize] {
@@ -30466,16 +30532,21 @@ mod crash_recovery_tests {
             for c in &fed.eip161 {
                 let row = node.db.get_account(&oracle_addr(c.seed)).unwrap();
                 let what = format!("{c:?} at {h}: {row:?}");
+                let same = c.recreate == O0Recreate::SameBlock;
                 if h == c.fund {
                     let r = row.expect(&what);
-                    assert_eq!((r.balance, r.nonce), (U256::from(5u128 * 10u128.pow(18)), 0), "{what}");
+                    assert_eq!((r.balance, r.nonce), (wei(5), 0), "{what}");
                 } else if h == c.drain {
                     assert!(row.expect(&what).is_empty(), "{what}");
+                } else if h == c.touch && same {
+                    assert_eq!(c.refund, c.touch, "{what}");
+                    let r = row.expect(&what);
+                    assert_eq!((r.balance, r.nonce), (wei(3), 0), "{what}");
                 } else if h == c.touch {
                     assert_eq!(row, None, "{what}");
                 } else if h == c.refund {
                     let r = row.expect(&what);
-                    assert_eq!((r.balance, r.nonce), (U256::from(2u128 * 10u128.pow(18)), 0), "{what}");
+                    assert_eq!((r.balance, r.nonce), (wei(2), 0), "{what}");
                 } else if h == c.reuse {
                     assert_eq!(row.expect(&what).nonce, 1, "{what}");
                 } else {
@@ -30484,8 +30555,99 @@ mod crash_recovery_tests {
                 seen += 1;
             }
         }
-        assert_eq!(seen, 5 * O0_EMPTIED.len());
+        let rows: usize = fed
+            .eip161
+            .iter()
+            .map(|c| match c.recreate {
+                O0Recreate::NextBlock => 5,
+                O0Recreate::SameBlock => 4,
+            })
+            .sum();
+        assert_eq!(seen, rows);
         println!("o0 eip161 cycles: {:?}", fed.eip161);
+    }
+
+    /// Plan task 0.1 (where the re-creation reads Z's deletion), with the
+    /// probes' key watch on every Z's CF_ACCOUNTS row, in serial, G
+    /// interval 0 and G Every5 (checkpoints parked by the controller):
+    /// - same-block: every native-phase read of Z in the touch block is
+    ///   answered by the block's own pending layer, the first with the
+    ///   tombstone the EVM bundle's deletion seeded (`seed_from_bundle`);
+    /// - next-block: TODAY the re-fund's first read of Z is answered by the
+    ///   DB (absent) and no read of Z there is served by a frozen layer:
+    ///   the touch height is an EVM height, so a barrier (checkpoint
+    ///   included) and a serial flush make the deletion durable before
+    ///   e + 1 runs. No read of an EIP-161 deletion can be in flight on
+    ///   today's code. With the option 0 flag on, the deletion sits in the
+    ///   parent / L / C at e + 1: task 3.6 flips this half to "in flight".
+    #[test]
+    fn o0_eip161_recreation_reads_by_layer() {
+        use torus_state::probes::{Layer, Reader};
+        let (blocks, fed) = o0_blocks(300, O0_SEED);
+        let last = fed.eip161.iter().map(|c| c.reuse).max().unwrap();
+        let cfgs = [
+            O0Cfg::serial(),
+            O0Cfg::piped(P5Ckpt::PerBlock, O0Run::G),
+            O0Cfg::piped(P5Ckpt::Every5, O0Run::G),
+        ];
+        let (blocks, fed) = (&blocks[..last as usize], &fed);
+        let runs: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = cfgs
+                .iter()
+                .map(|cfg| {
+                    s.spawn(move || {
+                        let mut node = O0Node::new(*cfg);
+                        for c in &fed.eip161 {
+                            node.probe
+                                .watch(torus_state::cf::CF_ACCOUNTS, oracle_addr(c.seed).to_vec());
+                        }
+                        node.run(blocks);
+                        node.finish();
+                        (node.cfg, node.probe.watched())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        for (cfg, reads) in &runs {
+            for c in &fed.eip161 {
+                let key = oracle_addr(c.seed).to_vec();
+                let at: Vec<_> = reads
+                    .iter()
+                    .filter(|r| r.key == key && r.height == c.refund && r.reader == Reader::Native)
+                    .collect();
+                let what = format!("{cfg:?} {c:?}: {at:?}");
+                let first = at.first().unwrap_or_else(|| panic!("no native read of Z: {what}"));
+                match c.recreate {
+                    O0Recreate::SameBlock => {
+                        assert_eq!(
+                            (first.layer, first.found),
+                            (Layer::Own, false),
+                            "the touch's deletion, from the block's own pending layer: {what}"
+                        );
+                        assert!(at.iter().all(|r| r.layer == Layer::Own), "{what}");
+                    }
+                    O0Recreate::NextBlock => {
+                        assert_eq!(
+                            (first.layer, first.found, first.inflight),
+                            (Layer::Db, false, false),
+                            "today: the deletion is durable at e + 1: {what}"
+                        );
+                        assert!(!at.iter().any(|r| r.layer.frozen()), "{what}");
+                    }
+                }
+            }
+        }
+        for (cfg, reads) in &runs {
+            let mut by: BTreeMap<(Layer, bool), u64> = BTreeMap::new();
+            for r in reads {
+                *by.entry((r.layer, r.inflight)).or_default() += 1;
+            }
+            println!("o0 eip161 watched reads {cfg:?}: (layer, in flight) -> reads {by:?}");
+        }
     }
 
     /// The seed of the option 0 stream (golden and every option 0 run).
@@ -31080,6 +31242,7 @@ mod crash_recovery_tests {
             }
             let _probe = torus_state::probes::install(self.probe.clone());
             let h = b.block.header.height;
+            self.probe.set_height(h);
             let what = format!("{:?}", self.cfg);
             let durable = persist_committed_block_durably(&self.db, &b.block);
             let ctx = self.ctx.as_mut().expect("a context");
