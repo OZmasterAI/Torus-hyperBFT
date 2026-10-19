@@ -1403,8 +1403,11 @@ impl CoreWriterQueue {
     /// cannot let a cancel overtake its order); any other kind targets `block_queued + 1`. A
     /// target that already holds [`torus_types::CORE_WRITER_DRAIN_CAP`] rows sends the row on
     /// to the next block with room, so no block drains more than the cap and rows keep queue
-    /// order. Rows are queued only by EVM blocks (serial barriers), so each is in the raw DB
-    /// before its target's due-check (`NativeExecutor::core_writer_due`).
+    /// order. Rows are queued only by EVM blocks; item 7 option 0 (tasks 1.3, 1.4): the
+    /// target's due-check (`NativeExecutor::core_writer_due`) reads the block overlay, so a
+    /// row counts whether or not it is durable yet, and every read here (the delay, the
+    /// cursor rows, the full-target probes, `next_sequence`) goes through `state_db`, the
+    /// block's journal over the block overlay's layers (parent, L, C, then the DB).
     ///
     /// Codex P2: the walk skips the targets [`CORE_WRITER_FIRST_OPEN_TARGET_KEY`] and
     /// [`CORE_WRITER_FULL_ORDER_RUN_KEY`] know are full, so a backlog of full targets costs

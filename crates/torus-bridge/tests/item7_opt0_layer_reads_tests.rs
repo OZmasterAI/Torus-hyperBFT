@@ -5,7 +5,10 @@
 //!
 //! - task 1.3: `NativeExecutor::core_writer_due` over the block overlay
 //!   (design test 3c);
-//! - task 1.4: the lane read of `validate_block_for_catchup`.
+//! - task 1.4: the lane read of `validate_block_for_catchup` is pinned in
+//!   `evm_lanes_tests` (`lane_row_in_parent_layer_sets_big_fee`, next to its
+//!   block helpers), the enqueue reads in torus-core `precompile_tests`
+//!   (`enqueue_reads_cursor_rows_from_layers`).
 
 use std::sync::Arc;
 

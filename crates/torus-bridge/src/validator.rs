@@ -59,6 +59,19 @@ pub enum EvmReads<'a> {
 }
 
 impl<'a> EvmReads<'a> {
+    /// Item 7 option 0 (task 1.4): a point read before the execution (the
+    /// lane read): the DB, or the block overlay with its layers.
+    pub fn get_cf_raw(
+        &self,
+        cf: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, torus_state::StateError> {
+        match self {
+            EvmReads::Db(db) => db.get_cf_raw(cf, key),
+            EvmReads::Layered(state) => state.lane_read(cf, key),
+        }
+    }
+
     /// The DB under the reads (the EVM root compute reads it).
     pub fn state_db(&self) -> &'a StateDb {
         match self {
@@ -202,9 +215,10 @@ impl BlockValidator {
         let tx_envs: Vec<_> = decoded_txs.iter().map(|(_, d)| d.tx_env.clone()).collect();
 
         // Item 7 step 2: while big blocks are on (M > 0) a sender whose `EvmUserModify` row says big
-        // pays the big base fee (owner answer 7: the row when the block executes). An EVM block
-        // runs after a barrier, so the DB is current. A read fault is a local fault (fail-stop),
-        // never "small".
+        // pays the big base fee (owner answer 7: the row when the block executes). Item 7 option 0
+        // (task 1.4): the row is read through `reads`, i.e. through the block overlay when the
+        // block runs over its layers, so a row an earlier block wrote and W has not made durable
+        // yet counts. A read fault is a local fault (fail-stop), never "small".
         let mut big_lane = torus_evm::BigLane {
             base_fee: block.header.big_base_fee_per_gas,
             ..Default::default()
@@ -213,7 +227,7 @@ impl BlockValidator {
             let callers: std::collections::HashSet<Address> =
                 decoded_txs.iter().map(|(_, d)| d.tx_env.caller).collect();
             for caller in callers {
-                let row = state_db
+                let row = reads
                     .get_cf_raw(
                         torus_state::cf::CF_NATIVE_ORACLE,
                         &torus_state::cf::evm_lane_key(&caller),

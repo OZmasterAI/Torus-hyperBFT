@@ -98,6 +98,15 @@ impl<'a> EvmBlockState<'a> {
         }
     }
 
+    /// Item 7 option 0 (task 1.4): a point read through the block overlay
+    /// (own pending -> parent -> L -> C -> DB): the block's lane read (the
+    /// senders' `EvmUserModify` rows), probe-labelled `Lane`.
+    pub fn lane_read(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        #[cfg(feature = "test-probes")]
+        let _scope = crate::probes::scope(crate::probes::Reader::Lane);
+        StateBackend::get_cf_raw(self.db.overlay(), cf, key)
+    }
+
     /// The DB under the layers (the serial EVM root compute reads it).
     pub fn state_db(&self) -> &'a StateDb {
         self.db.overlay().db()
