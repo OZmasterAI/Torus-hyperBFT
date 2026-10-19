@@ -2158,6 +2158,45 @@ impl Mempool {
     /// `EVM_INFLIGHT_KEEP_BLOCKS`. A `drained` entry below its sender's state nonce goes too
     /// (a leak bound: each normally settles at its height, committed or reinserted).
     pub fn prune_committed_txs(&self, executed_height: u64) {
+        // One raw-DB read per sender (today's prune, `TORUS_EVM_FAST_PATH` off).
+        self.prune_committed_with(|| executed_height, &self.state);
+    }
+
+    /// Item 7 option 0 (task 4.1, R9 / F3): [`Self::prune_committed_txs`] on the published
+    /// read view, for `TORUS_EVM_FAST_PATH` (decision 2: `torus-node` calls it only with the
+    /// flag on). With the flag, an EVM block's nonces sit in the view's layers until its
+    /// checkpoint, so the raw DB lags; the view answers every ingress key (CF_ACCOUNTS
+    /// included) as of >= its height. One [`Self::ingress_state`] handle: `executed_height`
+    /// is the view's height, read from it first, then the nonces through the same handle,
+    /// so the height is never newer than the nonces (step 2's rule: the applied marker of
+    /// the state the nonces are read from). No view (interval 0, the pipeline off, after a
+    /// barrier): the DB's applied marker (absent or unreadable = 0), then the DB's nonces,
+    /// exactly what the commit handler did before.
+    pub fn prune_committed_txs_on_view(&self) {
+        let view = self.ingress_state();
+        let executed_height = || {
+            view.height().unwrap_or_else(|| {
+                view.db()
+                    .get_cf_raw(
+                        torus_state::cf::CF_CONSENSUS_META,
+                        torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                    .map_or(0, u64::from_be_bytes)
+            })
+        };
+        self.prune_committed_with(executed_height, &view);
+    }
+
+    /// The prune of [`Self::prune_committed_txs`]: `executed_height` is called once, before
+    /// the first nonce read from `state` (and not at all with no sender to prune).
+    fn prune_committed_with<S: torus_state::backend::StateBackend>(
+        &self,
+        executed_height: impl FnOnce() -> u64,
+        state: &S,
+    ) {
         let senders: Vec<alloy_primitives::Address> = {
             // Item 7 step 2: both lanes (a sender is in one at a time) and the in-flight filter.
             let lanes = self.evm.read().unwrap();
@@ -2171,11 +2210,12 @@ impl Mempool {
         if senders.is_empty() {
             return;
         }
-        // One raw-DB read per sender, outside the pool lock.
+        let executed_height = executed_height();
+        // One read per sender, outside the pool lock.
         let state_nonces: std::collections::HashMap<Address, u64> = senders
             .iter()
             .map(|sender| {
-                let account = self.state.get_account(sender).ok().flatten();
+                let account = state.get_account(sender).ok().flatten();
                 (*sender, account.map(|a| a.nonce).unwrap_or(0))
             })
             .collect();
@@ -5907,6 +5947,158 @@ mod tests {
         pool.prune_committed_txs(10);
         pool.add_evm_tx(inflight_resigned(&s, 0))
             .expect("height 10 executed without moving the nonce: released");
+    }
+
+    // ---- item 7 option 0 (task 4.1, R9 / F3): the prune on the published view ----
+
+    /// Set the raw DB's applied marker (what `torus-node`'s commit handler read before
+    /// task 4.1).
+    fn set_db_marker(state: &StateDb, height: u64) {
+        state
+            .put_cf_raw(
+                torus_state::cf::CF_CONSENSUS_META,
+                torus_state::cf::META_NATIVE_APPLIED_HEIGHT,
+                &height.to_be_bytes(),
+            )
+            .unwrap();
+    }
+
+    /// A published view at `height` whose one frozen block holds `accounts` (EVM account
+    /// rows not in the DB yet: the block is above the last checkpoint).
+    fn view_with_accounts(
+        state: &StateDb,
+        height: u64,
+        accounts: &[(Address, u64)],
+    ) -> torus_state::ReadView {
+        use torus_state::backend::StateBackend as _;
+        let o = torus_state::NativeStateOverlay::new(state.clone());
+        for (addr, nonce) in accounts {
+            o.put_account(
+                addr,
+                &AccountInfo {
+                    balance: U256::from(10u64.pow(18)),
+                    nonce: *nonce,
+                    code_hash: B256::ZERO,
+                    code: None,
+                    account_id: None,
+                },
+            )
+            .unwrap();
+        }
+        torus_state::ReadView::new(state.clone(), height, vec![o.freeze(height)], None)
+    }
+
+    /// Item 7 option 0 (task 4.1, R9): decision 7's prune rule re-run on a published view.
+    /// `prune_committed_txs_on_view` takes `executed_height` from the view (not the DB
+    /// marker) and the state nonces through the same view (not the raw DB):
+    /// - the nonce half (`inflight_entry_drops_once_the_state_nonce_catches_up` on the view):
+    ///   the sender's nonce 2 exists only in the view's frozen block; the raw-DB prune keeps
+    ///   the in-flight entry, the view prune drops it;
+    /// - the height half (`skipped_committed_tx_releases_its_nonce_once_its_height_executes`
+    ///   on the view): a view at 9 keeps the reservation of a tx committed at 10, also with
+    ///   the DB marker at 10 (a marker the view's height is what counts); a view at 10 with
+    ///   the DB marker absent releases it.
+    ///
+    /// RED before: no `prune_committed_txs_on_view` (compile error).
+    #[test]
+    fn prune_on_view_uses_view_height_and_view_nonces() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+
+        // Nonce half.
+        let s = intrinsic_case(&state, 249);
+        let addr = address_from_key(&s);
+        let raws = [0, 1].map(|nonce| inflight_tx(&s, nonce));
+        for raw in &raws {
+            pool.add_evm_tx(raw.clone()).unwrap();
+        }
+        pool.remove_committed_evm(10, &raws);
+        pool.publish_read_view(Some(view_with_accounts(&state, 9, &[])));
+        pool.prune_committed_txs_on_view();
+        assert_eq!(
+            pool.evm.read().unwrap().committed_next.get(&addr),
+            Some(&(2, 10)),
+            "view nonce 0 (the DB's) is below the entry"
+        );
+        pool.publish_read_view(Some(view_with_accounts(&state, 9, &[(addr, 2)])));
+        pool.prune_committed_txs(9);
+        assert_eq!(
+            pool.evm.read().unwrap().committed_next.get(&addr),
+            Some(&(2, 10)),
+            "the raw-DB prune does not see the view's nonce"
+        );
+        pool.prune_committed_txs_on_view();
+        assert!(
+            pool.evm.read().unwrap().committed_next.is_empty(),
+            "the view's state nonce reached the entry"
+        );
+        pool.add_evm_tx(inflight_tx(&s, 2)).unwrap();
+        assert_eq!(pool.pending_nonce(&addr), 3, "view nonce + pooled");
+
+        // Height half (a second pool: the first one's view is published).
+        let (_dir2, state2) = setup();
+        let pool2 = lane_pool(&state2);
+        let t = intrinsic_case(&state2, 250);
+        let raw0 = inflight_tx(&t, 0);
+        pool2.add_evm_tx(raw0.clone()).unwrap();
+        pool2.remove_committed_evm(10, std::slice::from_ref(&raw0));
+        set_db_marker(&state2, 10);
+        pool2.publish_read_view(Some(view_with_accounts(&state2, 9, &[])));
+        pool2.prune_committed_txs_on_view();
+        let err = pool2.add_evm_tx(inflight_resigned(&t, 0)).unwrap_err();
+        assert_nonce_too_low(err, address_from_key(&t), (0, 1));
+        let (_dir3, state3) = setup();
+        let pool3 = lane_pool(&state3);
+        intrinsic_case(&state3, 250);
+        pool3.add_evm_tx(raw0.clone()).unwrap();
+        pool3.remove_committed_evm(10, std::slice::from_ref(&raw0));
+        pool3.publish_read_view(Some(view_with_accounts(&state3, 10, &[])));
+        pool3.prune_committed_txs_on_view();
+        pool3
+            .add_evm_tx(inflight_resigned(&t, 0))
+            .expect("the view says height 10 executed without moving the nonce: released");
+    }
+
+    /// Item 7 option 0 (task 4.1, guard): with no view published (interval 0, the exec
+    /// pipeline off, a barrier) `prune_committed_txs_on_view` is today's prune: the DB's
+    /// applied marker (absent = 0) as `executed_height`, raw-DB nonces.
+    #[test]
+    fn prune_without_view_reads_db_marker() {
+        let (_dir, state) = setup();
+        let pool = lane_pool(&state);
+        let t = intrinsic_case(&state, 251);
+        let raw0 = inflight_tx(&t, 0);
+        pool.add_evm_tx(raw0.clone()).unwrap();
+        pool.remove_committed_evm(10, std::slice::from_ref(&raw0));
+        let s = intrinsic_case(&state, 252);
+        let addr = address_from_key(&s);
+        let raws = [0, 1].map(|nonce| inflight_tx(&s, nonce));
+        for raw in &raws {
+            pool.add_evm_tx(raw.clone()).unwrap();
+        }
+        pool.remove_committed_evm(20, &raws);
+        for (marker, what) in [(None, "marker absent = 0"), (Some(9), "marker 9")] {
+            if let Some(m) = marker {
+                set_db_marker(&state, m);
+            }
+            pool.prune_committed_txs_on_view();
+            let err = pool.add_evm_tx(inflight_resigned(&t, 0)).unwrap_err();
+            assert_nonce_too_low(err, address_from_key(&t), (0, 1));
+            assert_eq!(
+                pool.evm.read().unwrap().committed_next.get(&addr),
+                Some(&(2, 20)),
+                "{what}"
+            );
+        }
+        fund(&state, &addr, U256::from(10u64.pow(18)), 2);
+        set_db_marker(&state, 10);
+        pool.prune_committed_txs_on_view();
+        assert!(
+            !pool.evm.read().unwrap().committed_next.contains_key(&addr),
+            "the DB nonce reached the entry"
+        );
+        pool.add_evm_tx(inflight_resigned(&t, 0))
+            .expect("the DB marker says height 10 executed: released");
     }
 
     // ---- item 7 step 2: re-send tracking (B14, decision 7) ----

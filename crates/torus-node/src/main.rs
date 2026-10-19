@@ -1011,6 +1011,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     let state_db_for_handler = state_db.clone();
     let mempool_for_handler = mempool.clone();
+    // Item 7 option 0 (task 4.1, decision 2): with `TORUS_EVM_FAST_PATH` the commit prune
+    // reads the published ingress view; without it today's raw-DB prune (read once here, as
+    // the exec context reads it once at construction).
+    let prune_on_view = torus_consensus::exec_pipeline::evm_fast_path_enabled();
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
         &state_db,
     )));
@@ -1107,16 +1111,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if height == 0 {
                 return;
             }
-            // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read before
-            // the state nonces the prune reads from the same DB. Not `height`: the header row
-            // is written at commit, before execution.
-            let executed = state_db_for_handler
-                .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
-                .ok()
-                .flatten()
-                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-                .map_or(0, u64::from_be_bytes);
-            mempool_for_handler.prune_committed_txs(executed);
+            if prune_on_view {
+                // Item 7 option 0 (task 4.1, R9): the view's height, then its nonces, through
+                // one handle (the DB marker and DB nonces when no view is published).
+                mempool_for_handler.prune_committed_txs_on_view();
+            } else {
+                // Item 7 step 2 (decision 7): the raw DB's applied marker (absent = 0), read
+                // before the state nonces the prune reads from the same DB. Not `height`: the
+                // header row is written at commit, before execution.
+                let executed = state_db_for_handler
+                    .get_cf_raw(CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                    .map_or(0, u64::from_be_bytes);
+                mempool_for_handler.prune_committed_txs(executed);
+            }
             latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
             match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
                 Ok(Some(data)) if data.len() > 32 => {
