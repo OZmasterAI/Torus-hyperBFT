@@ -482,6 +482,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    exec-thread on-CPU per 1k fills; also report matched/s, native blocks/s, p50 / p99, RSS, data-dir size, boot time
    on the 1M genesis. Question: which mode should the testnet genesis use? A winner gets a longer A/B before any
    default or genesis change.
+8o. **8h rerun: does retention cost native blocks/s?** (owner s131; after 8m; ~1 h 30). Section 95 left blocks/s and
+   p50 / p99 open (per pair r1 A 12.6 / B 13.1, r2 A 16.4 / B 9.3 blk/s; the owner reads r2-B as a possible
+   regression). Since then: RH4 slow-pass logging is merged (main `32648b44`: a WARN line per GC pass over 50 ms with
+   phase timings, `torus_da_gc_last_pass_max_seconds`, `torus_da_gc_slow_passes_total`), and
+   `docs/plans/rh4-retention-early-cost.md` found ~1 ms per block of retention work before the first deleting pass.
+   **Binary:** one build of main `32648b44` (code defaults; 512 KB from `env.sh`; custody 0). A = no retention, B =
+   `TORUS_RETENTION_BLOCKS=1000` via `EXTRA_ENV`. Standard unpaced load, 300 markets, **300 s** cells, warm-up, then
+   A B B A three times (n = 6 pairs). Report per cell and per pair: native blocks/s (whole cell and after the first
+   deleting pass), fills per block, p50 / p99, timeouts, **blocks/s per minute from minute 1** with the first
+   deleting pass marked, every slow-pass WARN line, `torus_da_gc_seconds` count / sum, held passes by reason. Judge on
+   this campaign's 6 pairs alone (8h ran on an older main without exec-hash; report its 2 pairs next to it, not
+   pooled). Verdict in plain words: if B is lower than its paired A in most pairs, say so; prune-by-default waits for
+   this.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
