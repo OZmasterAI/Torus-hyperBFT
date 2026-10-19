@@ -1414,6 +1414,12 @@ pub struct NativeStateOverlay {
     /// fault makes this overlay's reads skip (none without a probe).
     #[cfg(feature = "test-probes")]
     skip: crate::probes::Skip,
+    /// Item 7 option 0 (step 3, test-only): the planted enqueue bypass
+    /// (`Plant::BypassEnqueue`, plan 5.4) of a journal: its CF_FEE_CONFIG /
+    /// CF_CORE_WRITER_QUEUE reads skip the layers (own pending, then the
+    /// raw DB, tripping the armed tripwire).
+    #[cfg(feature = "test-probes")]
+    bypass_enqueue: bool,
 }
 
 impl std::fmt::Debug for NativeStateOverlay {
@@ -1481,6 +1487,8 @@ impl NativeStateOverlay {
             inflight,
             #[cfg(feature = "test-probes")]
             skip: crate::probes::skip(),
+            #[cfg(feature = "test-probes")]
+            bypass_enqueue: false,
         }
     }
 
@@ -1500,7 +1508,34 @@ impl NativeStateOverlay {
             inflight: self.inflight.clone(),
             #[cfg(feature = "test-probes")]
             skip: self.skip,
+            #[cfg(feature = "test-probes")]
+            bypass_enqueue: crate::probes::planted(crate::probes::Plant::BypassEnqueue),
         }
+    }
+
+    /// `test-probes` (plan 5.4, `Plant::BypassEnqueue`): for a planted
+    /// journal's enqueue CFs, the same overlay without its layers (own
+    /// pending, then the DB); the bypass's own entry trips an armed
+    /// tripwire like a raw `StateDb` read.
+    #[cfg(feature = "test-probes")]
+    fn enqueue_bypass(&self, cf: &str) -> Option<Self> {
+        if !self.bypass_enqueue
+            || !(cf == crate::cf::CF_FEE_CONFIG || cf == crate::cf::CF_CORE_WRITER_QUEUE)
+        {
+            return None;
+        }
+        crate::tripwire::check_planted("planted enqueue bypass");
+        Some(Self {
+            db: self.db.clone(),
+            pending: self.pending.clone(),
+            parent: None,
+            resident: None,
+            layer: None,
+            deferred: None,
+            inflight: None,
+            skip: self.skip,
+            bypass_enqueue: false,
+        })
     }
 
     #[cfg(test)]
@@ -2891,6 +2926,10 @@ fn overlay_sorted<'a>(
 
 impl StateBackend for NativeStateOverlay {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::get_cf_raw(&flat, cf, key);
+        }
         // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
         // bottom of its layered read, never a raw-DB bypass.
         let _exempt = crate::tripwire::exempt();
@@ -2990,6 +3029,10 @@ impl StateBackend for NativeStateOverlay {
         cf: &str,
         prefix: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::iterate_cf(&flat, cf, prefix);
+        }
         // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
         // bottom of its layered read, never a raw-DB bypass.
         let _exempt = crate::tripwire::exempt();
@@ -3047,6 +3090,10 @@ impl StateBackend for NativeStateOverlay {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::iterate_cf_from(&flat, cf, start, limit);
+        }
         // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
         // bottom of its layered read, never a raw-DB bypass.
         let _exempt = crate::tripwire::exempt();
@@ -3082,6 +3129,10 @@ impl StateBackend for NativeStateOverlay {
 
     /// The layered point-read rule (pending, R, parent, DB) on lengths only.
     fn get_cf_len(&self, cf: &str, key: &[u8]) -> Result<Option<usize>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::get_cf_len(&flat, cf, key);
+        }
         // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
         // bottom of its layered read, never a raw-DB bypass.
         let _exempt = crate::tripwire::exempt();
@@ -3135,6 +3186,10 @@ impl StateBackend for NativeStateOverlay {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::iterate_cf_prefix_from(&flat, cf, prefix, start, limit);
+        }
         // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
         // bottom of its layered read, never a raw-DB bypass.
         let _exempt = crate::tripwire::exempt();
@@ -3186,6 +3241,10 @@ impl StateBackend for NativeStateOverlay {
     /// stops at the first one no layer tombstones — it skips at most the
     /// tombstones under `prefix`.
     fn prefix_exists(&self, cf: &str, prefix: &[u8]) -> Result<bool, StateError> {
+        #[cfg(feature = "test-probes")]
+        if let Some(flat) = self.enqueue_bypass(cf) {
+            return StateBackend::prefix_exists(&flat, cf, prefix);
+        }
         // Item 7 option 0 (task 1.6): the overlay's DB fall-through is the
         // bottom of its layered read, never a raw-DB bypass.
         let _exempt = crate::tripwire::exempt();

@@ -271,6 +271,10 @@ const TEST_EVM_BLOCK_INTERVAL: u64 = 5;
 struct DeferredGate {
     state: std::sync::Mutex<DeferredGateState>,
     cv: std::sync::Condvar,
+    /// Item 7 option 0 (task 3.4): the next merge that passes the gate
+    /// panics before its deferred half (the merge thread's failure seam:
+    /// reads of L's deferred part then get `StateError::Io`).
+    fail_next: AtomicBool,
 }
 
 #[cfg(test)]
@@ -309,6 +313,10 @@ impl DeferredGate {
         } else if !s.open {
             s.timeouts += 1;
             s.open = true;
+        }
+        drop(s);
+        if self.fail_next.swap(false, Ordering::SeqCst) {
+            panic!("injected since-checkpoint deferred merge failure (test)");
         }
     }
 
@@ -1286,6 +1294,10 @@ struct ExecutionContext {
     /// EVM section, where a hard crash before the native flush would stop.
     #[cfg(test)]
     test_crash_after_evm_section: bool,
+    /// Item 7 option 0 (task 3.5): the same crash after the EVM part and
+    /// before the absorb of its rows (latched).
+    #[cfg(test)]
+    test_crash_before_absorb: bool,
     /// Test-only write-fault injection (R01): `Some(h)` makes every serial
     /// flush of height `h` (native state + marker, EVM marker, marker only)
     /// return an I/O error before anything is written, as a failed atomic
@@ -1463,6 +1475,9 @@ enum ReplayFault {
     /// Item 7 option 0 (task 2.3): the serial EVM section's read of the EVM
     /// trie stale marker (`incremental::is_evm_trie_stale`) failed.
     EvmTrieStaleRead,
+    /// Item 7 option 0 (task 3.4): the absorb of the block's EVM rows into
+    /// its overlay failed (a put error; only a code bug reaches it).
+    AbsorbPut,
 }
 
 /// R02 test seam: the error an injected fault returns (a failed RocksDB access).
@@ -2675,6 +2690,12 @@ impl ExecutionContext {
             ))
             .into());
         }
+        // Item 7 option 0 (plan 5.4): the planted bypass reads the raw DB
+        // (an armed tripwire trips on it).
+        #[cfg(test)]
+        if torus_state::probes::planted(torus_state::probes::Plant::BypassDueCheck) {
+            return Ok(NativeExecutor::core_writer_due(&self.state_db, height)?);
+        }
         Ok(NativeExecutor::core_writer_due(state, height)?)
     }
 
@@ -3779,7 +3800,23 @@ impl ExecutionContext {
                     // Task 3.2: on the fast path the journal (an overlay over the block's
                     // layers) is dropped here, so no handle on L, its deferred part or C
                     // outlives the EVM part (else `take_layer` copies them).
-                    if let Err(e) = overlay.absorb_evm(&validated.bundle, validated.native_writes) {
+                    #[cfg(test)]
+                    if self.test_crash_before_absorb {
+                        // Item 7 option 0 (task 3.5): a crash after the EVM
+                        // part, before the absorb: latched, as a crash is.
+                        self.exec_failed.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    let absorbed = overlay.absorb_evm(&validated.bundle, validated.native_writes);
+                    #[cfg(test)]
+                    let absorbed = if self.test_replay_fault == Some(ReplayFault::AbsorbPut) {
+                        Err(injected_fault("EVM rows absorb put"))
+                    } else {
+                        absorbed
+                    };
+                    if let Err(e) = absorbed {
+                        #[cfg(test)]
+                        self.test_path("evm.absorb_fault");
                         self.fail_stop_on_fault(
                             torus_block,
                             fold_header,
@@ -3903,6 +3940,8 @@ impl ExecutionContext {
                 // applied marker stays below it, the restart replays it. Only
                 // this variant: every other EVM error keeps the arm below.
                 Err(torus_bridge::BridgeError::Evm(torus_evm::EvmError::LocalFault(reason))) => {
+                    #[cfg(test)]
+                    self.test_path("evm.local_fault");
                     tracing::error!(
                         height,
                         %reason,
@@ -3919,6 +3958,8 @@ impl ExecutionContext {
                 // the incremental-vs-full-scan oracle). Never a block outcome:
                 // fail-stop exactly as the arm above.
                 Err(torus_bridge::BridgeError::State(e)) => {
+                    #[cfg(test)]
+                    self.test_path("evm.state_fault");
                     tracing::error!(
                         height,
                         %e,
@@ -3949,8 +3990,12 @@ impl ExecutionContext {
             m.exec_evm_seconds
                 .observe(evm_timer.elapsed().as_secs_f64());
         }
+        // Item 7 option 0 (task 3.5, R4): the seam latches the fail-stop
+        // before it returns, as a crash leaves the node: with W held, a drop
+        // without the latch would land the held jobs (plan F10).
         #[cfg(test)]
         if self.test_crash_after_evm_section {
+            self.exec_failed.store(true, Ordering::SeqCst);
             return;
         }
 
@@ -3972,6 +4017,10 @@ impl ExecutionContext {
         let core_writer_due = {
             #[cfg(test)]
             let _probe_scope = torus_state::probes::scope(torus_state::probes::Reader::DueCheck);
+            // Item 7 option 0 (step 3): on the pipelined path the due-check
+            // reads through the overlay only (tripwire armed: debug /
+            // test-probes builds).
+            let _armed = pipelined.then(torus_state::tripwire::arm);
             self.core_writer_due(&overlay, height)
         };
         let core_writer_due = match core_writer_due {
@@ -6447,6 +6496,8 @@ impl TorusApp {
             test_reference_paths: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
+            #[cfg(test)]
+            test_crash_before_absorb: false,
             #[cfg(test)]
             test_fail_flush_at: None,
             #[cfg(test)]
@@ -15092,6 +15143,8 @@ mod crash_recovery_tests {
             test_reference_paths: false,
             #[cfg(test)]
             test_crash_after_evm_section: false,
+            #[cfg(test)]
+            test_crash_before_absorb: false,
             #[cfg(test)]
             test_fail_flush_at: None,
             #[cfg(test)]
@@ -31238,6 +31291,33 @@ mod crash_recovery_tests {
             }
         }
 
+        /// [`Self::take_hn`], returning the heights it drained (sorted,
+        /// each once): the replay's re-hashed heights (task 3.5).
+        fn take_hn_heights(&mut self, db: &StateDb) -> Vec<u64> {
+            let before = self.hn.clone();
+            let captured = torus_state::running_hash::capture_drain(db);
+            let mut heights: Vec<u64> = captured.iter().map(|(h, _)| *h).collect();
+            heights.sort_unstable();
+            heights.dedup();
+            for (h, entries) in captured {
+                let mut parts: Vec<Vec<u8>> = Vec::new();
+                for (id, k, v) in &entries {
+                    parts.push(vec![*id]);
+                    parts.push(k.clone());
+                    parts.push(v.clone().map_or(vec![0], |v| [&[1u8][..], &v].concat()));
+                }
+                let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+                let x = o0_sha(&refs);
+                if let Some(old) = before.get(&h) {
+                    if *old != x {
+                        self.errors.push(format!("h_n of {h} changed when hashed again"));
+                    }
+                }
+                self.hn.insert(h, x);
+            }
+            heights
+        }
+
         /// Every height 1..=n has its `h_n`, status and side rows; no hook
         /// or replay invariant broke.
         fn assert_complete(&self, n: u64, what: &str) {
@@ -32338,6 +32418,10 @@ mod crash_recovery_tests {
         /// A plain EVM transfer whose section fails
         /// (`ReplayFault::EvmSectionError`), no native action.
         Failed,
+        /// Item 7 option 0 (task 3.4): an EVM tx calling the balance reader
+        /// precompile (0x0801 `getBalances` of the trader): a journal read
+        /// of CF_NATIVE_BALANCES (a deferred CF of L).
+        Reader,
     }
 
     fn o0_hand_blocks(kinds: &[O0Hand]) -> Vec<O0Block> {
@@ -32367,7 +32451,8 @@ mod crash_recovery_tests {
                 | O0Hand::Evm
                 | O0Hand::Skipped
                 | O0Hand::NonceSkipped
-                | O0Hand::Failed => vec![],
+                | O0Hand::Failed
+                | O0Hand::Reader => vec![],
             };
             let mut b = make_block(1, actions);
             b.header.height = h;
@@ -32381,6 +32466,19 @@ mod crash_recovery_tests {
                         alloy_primitives::TxKind::Call(o0_addr(0xB1)),
                         vec![],
                         U256::from(10u128.pow(18)),
+                    )]
+                }
+                O0Hand::Reader => {
+                    evm_nonce += 1;
+                    vec![signed_eip1559_gas(
+                        &oracle_key(O0_USERS[0]),
+                        evm_nonce - 1,
+                        alloy_primitives::TxKind::Call(torus_core::precompiles::precompile_address(
+                            torus_core::precompiles::ADDR_BALANCE_READER,
+                        )),
+                        o0_call("getBalances(address)", &[o0_word_addr(oracle_addr(trader))]),
+                        U256::ZERO,
+                        300_000,
                     )]
                 }
                 O0Hand::Skipped | O0Hand::SkippedNative => vec![vec![0xde, 0xad, 0xbe, 0xef]],
@@ -33334,6 +33432,382 @@ mod crash_recovery_tests {
             }
             assert!(!o0_has(&p, "w.evm_step.flush") && !o0_has(&p, "w.evm_fold.digest"), "{cfg:?}: {p:?}");
         }
+    }
+
+    // ---- Item 7 option 0 tasks 3.4 / 3.5: local faults, latched crashes ----
+
+    /// Plan task 3.5 (R4): how a crash is latched (step 2 of `o0_crash`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[allow(dead_code)] // W-side latches and `Off`: task 3.5's crash tests
+    enum O0Latch {
+        /// E latched `exec_failed` itself (a fail-stop, or a crash seam).
+        E,
+        /// `gate.fail_next()`: W fails its oldest held job and latches.
+        WFail,
+        /// The panic seam inside W's next EVM trie step (caught: W latches).
+        WPanic,
+        /// No latch (only the guard `o0_crash_protocol_rejects_unlatched_crash`).
+        Off,
+    }
+
+    /// The per-CF dump hashes of `db` at completed height `d` (the hook's
+    /// form: off-batch rows above `d` filtered, empty CFs left out).
+    fn o0_dump_at(db: &StateDb, d: u64) -> BTreeMap<&'static str, O0Hash> {
+        o0_snapshot(db, d)
+            .iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(cf, rows)| (*cf, o0_cf_hash(rows)))
+            .collect()
+    }
+
+    /// Plan task 3.5 (R4): the crash protocol from step 2 on. Step 1 is the
+    /// caller's: `d` = the durable marker while W is held, `last` = the
+    /// highest height handed off or faulted. Step 2: latch before releasing
+    /// (`latch`). Step 3: `!wait_idle()` and `exec_failed` (skipped with
+    /// `Off`). Drop the context. Step 4: the marker is still `d`; no status,
+    /// receipt, hash -> number, tx location or CoreWriter link row of (d,
+    /// last]; the whole DB (CF_HASHED_* and CF_TRIE_* included) equals the
+    /// completion hook's snapshot at `d`. Step 5: a restart replays to
+    /// `last` (`replay_crash`: the replay context first crashes through its
+    /// latched seam at its first EVM block, the protocol's steps 3-4 run at
+    /// its marker, then a second restart) and re-hashes exactly the lost
+    /// heights. The node goes on with a fresh context (W attached). Returns
+    /// the heights the replays re-hashed, or the first step that failed.
+    fn o0_crash(
+        node: &mut O0Node,
+        d: u64,
+        last: u64,
+        latch: O0Latch,
+        replay_crash: bool,
+    ) -> Result<Vec<u64>, String> {
+        use torus_state::cf::{
+            CF_BLOCK_ACTION_STATUS, CF_RECEIPTS, CF_TX_HASH_TO_LOCATION,
+        };
+        let marker = |db: &StateDb| read_native_applied_height(db).unwrap_or(0);
+        if marker(&node.db) != d {
+            return Err(format!("step 1: marker {} with W held, want {d}", marker(&node.db)));
+        }
+        let gate = node.gate.clone().expect("a pipelined node");
+        {
+            let ctx = node.ctx.as_ref().expect("a context");
+            match latch {
+                O0Latch::E => {
+                    if !ctx.exec_failed.load(Ordering::SeqCst) {
+                        return Err("step 2: E did not latch the fail-stop".into());
+                    }
+                }
+                O0Latch::WFail => gate.fail_next(),
+                O0Latch::WPanic => ctx.test_evm_step_panic.store(true, Ordering::SeqCst),
+                O0Latch::Off => {}
+            }
+            gate.release();
+            if latch != O0Latch::Off {
+                let w = ctx.flush_worker.as_ref().expect("W attached");
+                if w.wait_idle() {
+                    return Err("step 3: W wrote its held jobs (wait_idle true)".into());
+                }
+                if !ctx.exec_failed.load(Ordering::SeqCst) {
+                    return Err("step 3: the fail-stop is not latched".into());
+                }
+            }
+        }
+        let ctx = node.ctx.take().unwrap();
+        let paths = ctx.test_paths.clone();
+        drop(ctx);
+        for (k, v) in std::mem::take(&mut *paths.lock().unwrap()) {
+            *node.paths.entry(k).or_default() += v;
+        }
+        node.ledger().take_hn(&node.db);
+        // Step 4, also for the replay's own crash (`at` = its marker).
+        let step4 = |node: &O0Node, at: u64, last: u64| -> Result<(), String> {
+            let m = marker(&node.db);
+            if m != at {
+                return Err(format!(
+                    "step 4: marker {m} after the drop, want {at} (lost heights {}..={last})",
+                    at + 1
+                ));
+            }
+            for x in at + 1..=last {
+                let side = [
+                    node.db
+                        .get_cf_raw(CF_BLOCK_ACTION_STATUS, &x.to_be_bytes())
+                        .unwrap()
+                        .is_some(),
+                    o0_rows_at(&node.db, CF_RECEIPTS, x) > 0,
+                    o0_hash_index_at(&node.db, x) > 0,
+                    StateBackend::iterate_cf(&node.db, CF_TX_HASH_TO_LOCATION, None)
+                        .unwrap()
+                        .iter()
+                        .any(|(_, v)| v.get(..8) == Some(&x.to_be_bytes()[..])),
+                ];
+                if side.iter().any(|b| *b) {
+                    return Err(format!(
+                        "step 4: a row of lost height {x} landed (status, receipts, hash -> number, tx location: {side:?})"
+                    ));
+                }
+            }
+            if at > 0 {
+                let want = node.ledger().dumps.get(&at).cloned();
+                let now = o0_dump_at(&node.db, at);
+                match want {
+                    None => return Err(format!("step 4: no hook snapshot at {at}")),
+                    Some(want) if want != now => {
+                        let cf = want
+                            .keys()
+                            .chain(now.keys())
+                            .find(|cf| want.get(*cf) != now.get(*cf))
+                            .copied();
+                        return Err(format!(
+                            "step 4: the DB after the drop differs from the snapshot at {at} in {cf:?}"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            Ok(())
+        };
+        step4(node, d, last)?;
+        // Step 5: the restart (serial replay; W attached after it).
+        let mut heights = Vec::new();
+        let mut from = d;
+        let mut crash_replay = replay_crash;
+        loop {
+            let mut replay = node.new_ctx();
+            replay.test_crash_after_evm_section = crash_replay;
+            let (top, parked) = TorusApp::replay_committed(&node.db, &replay);
+            let got = node.ledger().take_hn_heights(&node.db);
+            if parked.is_some() {
+                return Err(format!("step 5: the replay parked at {parked:?}"));
+            }
+            if crash_replay {
+                // The replay's crash: latched at its first EVM block.
+                crash_replay = false;
+                if !replay.exec_failed.load(Ordering::SeqCst) {
+                    return Err("step 5: the replay's crash seam did not fire".into());
+                }
+                let paths = replay.test_paths.clone();
+                drop(replay);
+                for (k, v) in std::mem::take(&mut *paths.lock().unwrap()) {
+                    *node.paths.entry(k).or_default() += v;
+                }
+                let m = marker(&node.db);
+                let want: Vec<u64> = (from + 1..=m).collect();
+                if got != want || m >= last {
+                    return Err(format!(
+                        "step 5: the crashed replay hashed {got:?}, want {want:?} (marker {m}, last {last})"
+                    ));
+                }
+                step4(node, m, last)?;
+                heights.extend(got);
+                from = m;
+                node.restarts += 1;
+                continue;
+            }
+            if replay.exec_failed.load(Ordering::SeqCst) {
+                return Err("step 5: the replay fail-stopped".into());
+            }
+            if top.height != last {
+                return Err(format!("step 5: the replay reached {}, want {last}", top.height));
+            }
+            let want: Vec<u64> = (from + 1..=last).collect();
+            if got != want {
+                return Err(format!("step 5: the replay hashed {got:?}, want {want:?}"));
+            }
+            heights.extend(got);
+            node.attach(&mut replay);
+            node.ctx = Some(replay);
+            node.restarts += 1;
+            return Ok(heights);
+        }
+    }
+
+    /// The fast node's run around a fault or crash (tasks 3.4 / 3.5): the
+    /// blocks below `hold_at` drained (D); then W held (interval 0:
+    /// `hold_from(hold_at)`, so `hold_at` is the parent's job; Every5:
+    /// `hold_checkpoints`, so the checkpoint in flight is parked) and the
+    /// blocks `hold_at..=fault_at` stepped without a drain, `arm` called
+    /// right before `fault_at`. Returns the node and the durable marker
+    /// with W held (`d`).
+    fn o0_held_run(
+        ckpt: P5Ckpt,
+        blocks: &[O0Block],
+        hold_at: u64,
+        fault_at: u64,
+        arm: impl FnOnce(&mut O0Node),
+    ) -> (O0Node, u64) {
+        let mut node = O0Node::new(O0Cfg::piped(ckpt, O0Run::D).fast());
+        node.run(&blocks[..hold_at as usize - 1]);
+        let gate = node.gate.clone().unwrap();
+        match ckpt {
+            P5Ckpt::PerBlock => {
+                assert!(
+                    fault_at == hold_at || fault_at == hold_at + 1,
+                    "interval 0: one held job"
+                );
+                gate.hold_from(hold_at);
+            }
+            _ => gate.hold_checkpoints(),
+        }
+        let d = read_native_applied_height(&node.db).unwrap_or(0);
+        let held = || match ckpt {
+            P5Ckpt::PerBlock => assert!(gate.wait_received(hold_at), "W received the held job"),
+            _ => o0_wait("the checkpoint parked", || gate.parked_checkpoint().is_some()),
+        };
+        for b in &blocks[hold_at as usize - 1..fault_at as usize - 1] {
+            o0_step(&node, b);
+        }
+        if fault_at > hold_at {
+            held();
+        }
+        arm(&mut node);
+        o0_step(&node, &blocks[fault_at as usize - 1]);
+        if fault_at == hold_at {
+            held();
+        }
+        (node, d)
+    }
+
+    /// Run `node` (crashed and replayed) to the end of `blocks` and compare
+    /// it with S over the same blocks: ledgers by height and completed
+    /// height, final state (R5: the result equals S's hook snapshots).
+    fn o0_assert_matches_serial(mut node: O0Node, blocks: &[O0Block], from: u64, what: &str) {
+        node.run(&blocks[from as usize..]);
+        node.finish();
+        let mut s = O0Node::new(O0Cfg::serial());
+        s.run(blocks);
+        s.finish();
+        let n = blocks.len() as u64;
+        node.ledger().assert_complete(n, what);
+        let c = o0_compare(&s.ledger(), &node.ledger())
+            .unwrap_or_else(|d| panic!("{what}: diverged at {}: {}", d.height, d.what));
+        assert!(c.hn == n && c.status == n && c.side == n, "{what}: {c:?}");
+        assert!(o0_dump_keys_covered(&s.ledger(), &node.ledger()), "{what}");
+        assert_eq!(o0_final(&s, blocks), o0_final(&node, blocks), "{what}: final state");
+    }
+
+    /// The hand stream of the fault / crash tests: `n` blocks, `Native`
+    /// except the listed heights.
+    fn o0_fault_blocks(n: u64, at: &[(u64, O0Hand)]) -> Vec<O0Block> {
+        let kinds: Vec<O0Hand> = (1..=n)
+            .map(|h| {
+                at.iter()
+                    .find(|(x, _)| *x == h)
+                    .map_or(O0Hand::Native, |(_, k)| *k)
+            })
+            .collect();
+        o0_hand_blocks(&kinds)
+    }
+
+    /// Plan task 3.4: a local fault at the fast-path EVM block `fault_at`
+    /// with the parent's job (interval 0) or the checkpoint (Every5) held:
+    /// E fail-stops (path `flag`), W refuses the held jobs, the crash
+    /// protocol holds (marker at d, no row of (d, fault_at], replay of
+    /// exactly d+1..=fault_at), and the run then equals S.
+    fn o0_fault_case(
+        ckpt: P5Ckpt,
+        blocks: &[O0Block],
+        hold_at: u64,
+        fault_at: u64,
+        flag: &str,
+        arm: impl FnOnce(&mut O0Node),
+        disarm: impl FnOnce(&mut O0Node),
+    ) {
+        let what = format!("{ckpt:?} fault {flag} at {fault_at}");
+        let (mut node, d) = o0_held_run(ckpt, blocks, hold_at, fault_at, arm);
+        disarm(&mut node);
+        let p = o0_paths(&node);
+        assert!(o0_has(&p, flag), "{what}: {p:?}");
+        assert!(o0_has(&p, "block.pipelined.evm"), "{what}: on the fast path: {p:?}");
+        assert!(node.ctx.as_ref().unwrap().exec_failed.load(Ordering::SeqCst), "{what}");
+        let replayed = o0_crash(&mut node, d, fault_at, O0Latch::E, false)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(replayed, (d + 1..=fault_at).collect::<Vec<_>>(), "{what}");
+        o0_assert_matches_serial(node, blocks, fault_at, &what);
+    }
+
+    /// Plan task 3.4 (C12): a read fault of the fast path's revm adapter
+    /// (`LayeredEvmDb`, a `StateError` through revm's `EVMError::Database`)
+    /// is a local fault: E fail-stops, never a revert or a skipped EVM part.
+    #[test]
+    fn fast_path_adapter_read_fault_fail_stops() {
+        use torus_state::probes::Plant::FaultRevmRead;
+        let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
+        o0_fault_case(
+            P5Ckpt::PerBlock,
+            &blocks,
+            3,
+            4,
+            "evm.local_fault",
+            |n| n.probe.plant(FaultRevmRead),
+            |n| n.probe.unplant(FaultRevmRead),
+        );
+        let blocks = o0_fault_blocks(15, &[(13, O0Hand::Evm)]);
+        o0_fault_case(
+            P5Ckpt::Every5,
+            &blocks,
+            10,
+            13,
+            "evm.local_fault",
+            |n| n.probe.plant(FaultRevmRead),
+            |n| n.probe.unplant(FaultRevmRead),
+        );
+    }
+
+    /// Plan task 3.4 (task 1.1's option 0 extension): with Every5 and the
+    /// checkpoint at 10 held, the merge of block 11 into L fails in its
+    /// deferred half (the merge thread's failure seam). Block 13's reader
+    /// precompile reads CF_NATIVE_BALANCES through the journal (no R); the
+    /// parent (12, empty) misses, so the read reaches L's lost deferred part:
+    /// `StateError::Io`, a `CoreError::State` in the precompile, a local
+    /// fault: E fail-stops (never a revert), and the replay equals S.
+    #[test]
+    fn fast_path_deferred_merge_failure_under_journal_fail_stops() {
+        let blocks = o0_fault_blocks(15, &[(12, O0Hand::Empty), (13, O0Hand::Reader)]);
+        let gate = Arc::new(DeferredGate::default());
+        let g = gate.clone();
+        let what = "deferred merge failure under the journal";
+        let (mut node, d) = {
+            let mut node = O0Node::new(O0Cfg::piped(P5Ckpt::Every5, O0Run::D).fast());
+            node.ctx.as_ref().unwrap().ckpt.lock().unwrap().test_gate = Some(g);
+            node.run(&blocks[..9]);
+            let w = node.gate.clone().unwrap();
+            w.hold_checkpoints();
+            let d = read_native_applied_height(&node.db).unwrap_or(0);
+            for b in &blocks[9..12] {
+                o0_step(&node, b);
+            }
+            gate.fail_next.store(true, Ordering::SeqCst);
+            o0_step(&node, &blocks[12]);
+            (node, d)
+        };
+        assert_eq!(d, 5, "{what}: the checkpoint at 5 is durable, 10 held");
+        assert!(!gate.fail_next.load(Ordering::SeqCst), "{what}: the merge failed");
+        let p = o0_paths(&node);
+        assert!(o0_has(&p, "evm.local_fault"), "{what}: {p:?}");
+        let journal_deferred = node.probe.total(|r, l, cf| {
+            r == torus_state::probes::Reader::Journal
+                && l == torus_state::probes::Layer::LDeferred
+                && cf == torus_state::cf::CF_NATIVE_BALANCES
+        });
+        assert_eq!(journal_deferred.hits, 0, "{what}: no deferred answer, an error");
+        let replayed = o0_crash(&mut node, d, 13, O0Latch::E, false)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(replayed, (6..=13).collect::<Vec<_>>(), "{what}");
+        node.ctx.as_ref().unwrap().ckpt.lock().unwrap().test_gate = None;
+        o0_assert_matches_serial(node, &blocks, 13, what);
+    }
+
+    /// Plan task 3.4: a failed put of the absorb (only a code bug reaches
+    /// it: a frozen overlay, an unregistered CF) fail-stops the fast-path
+    /// EVM block (`fail_stop_on_fault`).
+    #[test]
+    fn fast_path_absorb_put_fault_fail_stops() {
+        let arm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_replay_fault = Some(ReplayFault::AbsorbPut);
+        let disarm = |n: &mut O0Node| n.ctx.as_mut().unwrap().test_replay_fault = None;
+        let blocks = o0_fault_blocks(6, &[(4, O0Hand::Evm)]);
+        o0_fault_case(P5Ckpt::PerBlock, &blocks, 3, 4, "evm.absorb_fault", arm, disarm);
+        let blocks = o0_fault_blocks(15, &[(13, O0Hand::Evm)]);
+        o0_fault_case(P5Ckpt::Every5, &blocks, 10, 13, "evm.absorb_fault", arm, disarm);
     }
 
     // ======================================================================

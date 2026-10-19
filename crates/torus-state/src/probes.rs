@@ -122,7 +122,12 @@ pub struct WatchedRead {
 }
 
 /// A planted fault: overlays built while it is set read without that layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Item 7 option 0 (step 3): also the planted raw-DB bypasses of plan
+/// section 5.4 (one per reader class of the fast-path EVM section), a
+/// local read fault of the revm adapter (task 3.4) and a switch that keeps
+/// the tripwire from arming (so a bypass is shown to diverge, not only to
+/// trip it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Plant {
     /// Skip the pipelined parent layer.
     SkipParent,
@@ -130,6 +135,25 @@ pub enum Plant {
     SkipCheckpoint,
     /// Skip L's deferred part.
     SkipDeferred,
+    /// The revm adapter (`LayeredEvmDb`) reads the raw `StateDb`.
+    BypassRevm,
+    /// The writer-precompile journal is an overlay without layers
+    /// (`NativeStateOverlay::new(db)`).
+    BypassJournal,
+    /// The lane read (`EvmBlockState::lane_read`) reads the raw `StateDb`.
+    BypassLane,
+    /// The journal's enqueue reads (CF_FEE_CONFIG cursor rows,
+    /// CF_CORE_WRITER_QUEUE probes / scans) read its own pending set, then
+    /// the raw `StateDb` (no layers).
+    BypassEnqueue,
+    /// The CoreWriter due-check reads the raw `StateDb` (torus-consensus).
+    BypassDueCheck,
+    /// The revm adapter's next reads fail (`StateError::Io`): a local read
+    /// fault of the fast path (task 3.4).
+    FaultRevmRead,
+    /// `tripwire::arm` does not arm on this thread (a planted bypass then
+    /// shows its divergence instead of tripping).
+    NoTripwire,
 }
 
 /// The layers an overlay skips (all `false` without a probe).
@@ -153,6 +177,8 @@ pub struct Probe {
     skip_parent: AtomicBool,
     skip_checkpoint: AtomicBool,
     skip_deferred: AtomicBool,
+    /// Item 7 option 0 (step 3): every plant (the skips too).
+    plants: Mutex<std::collections::BTreeSet<Plant>>,
 }
 
 impl Probe {
@@ -162,12 +188,35 @@ impl Probe {
 
     /// Plant `p` (overlays built from now on, on threads with this probe).
     pub fn plant(&self, p: Plant) {
-        match p {
-            Plant::SkipParent => &self.skip_parent,
-            Plant::SkipCheckpoint => &self.skip_checkpoint,
-            Plant::SkipDeferred => &self.skip_deferred,
+        self.set_plant(p, true);
+    }
+
+    /// Remove plant `p` (a height-scoped fault).
+    pub fn unplant(&self, p: Plant) {
+        self.set_plant(p, false);
+    }
+
+    fn set_plant(&self, p: Plant, on: bool) {
+        let skip = match p {
+            Plant::SkipParent => Some(&self.skip_parent),
+            Plant::SkipCheckpoint => Some(&self.skip_checkpoint),
+            Plant::SkipDeferred => Some(&self.skip_deferred),
+            _ => None,
+        };
+        if let Some(flag) = skip {
+            flag.store(on, Ordering::SeqCst);
         }
-        .store(true, Ordering::SeqCst);
+        let mut plants = self.plants.lock().unwrap();
+        if on {
+            plants.insert(p);
+        } else {
+            plants.remove(&p);
+        }
+    }
+
+    /// Whether `p` is planted.
+    pub fn has(&self, p: Plant) -> bool {
+        self.plants.lock().unwrap().contains(&p)
     }
 
     fn skip(&self) -> Skip {
@@ -293,6 +342,11 @@ pub fn scope(reader: Reader) -> Scoped {
 /// Whether a probe is installed on this thread.
 pub fn active() -> bool {
     ACTIVE.with(|a| a.borrow().is_some())
+}
+
+/// Whether plant `p` is set on this thread's probe (`false` without one).
+pub fn planted(p: Plant) -> bool {
+    ACTIVE.with(|a| a.borrow().as_ref().is_some_and(|probe| probe.has(p)))
 }
 
 /// The layers an overlay built now on this thread skips.

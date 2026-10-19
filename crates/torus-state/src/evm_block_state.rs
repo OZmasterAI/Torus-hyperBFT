@@ -45,6 +45,18 @@ impl<'a> LayeredEvmDb<'a> {
     fn get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         #[cfg(feature = "test-probes")]
         let _scope = crate::probes::scope(crate::probes::Reader::Revm);
+        #[cfg(feature = "test-probes")]
+        {
+            use crate::probes::{planted, Plant};
+            if planted(Plant::FaultRevmRead) {
+                return Err(StateError::Io(std::io::Error::other(
+                    "injected revm adapter read failure (test)",
+                )));
+            }
+            if planted(Plant::BypassRevm) {
+                return self.overlay.db().get_cf_raw(cf, key);
+            }
+        }
         StateBackend::get_cf_raw(self.overlay, cf, key)
     }
 }
@@ -92,6 +104,13 @@ impl<'a> EvmBlockState<'a> {
     /// Over `overlay`'s layers. The journal gets a pending set of its own and
     /// no R; `overlay` itself is only read.
     pub fn new(overlay: &'a NativeStateOverlay) -> Self {
+        #[cfg(feature = "test-probes")]
+        if crate::probes::planted(crate::probes::Plant::BypassJournal) {
+            return Self {
+                db: LayeredEvmDb::new(overlay),
+                journal: NativeStateOverlay::new(overlay.db().clone()),
+            };
+        }
         Self {
             db: LayeredEvmDb::new(overlay),
             journal: overlay.journal_over_layers(),
@@ -104,6 +123,10 @@ impl<'a> EvmBlockState<'a> {
     pub fn lane_read(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
         #[cfg(feature = "test-probes")]
         let _scope = crate::probes::scope(crate::probes::Reader::Lane);
+        #[cfg(feature = "test-probes")]
+        if crate::probes::planted(crate::probes::Plant::BypassLane) {
+            return self.state_db().get_cf_raw(cf, key);
+        }
         StateBackend::get_cf_raw(self.db.overlay(), cf, key)
     }
 

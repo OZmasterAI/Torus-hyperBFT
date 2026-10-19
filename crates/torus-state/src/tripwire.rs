@@ -22,18 +22,25 @@ mod imp {
     }
 
     /// Disarms on drop (nests).
-    pub struct Armed(());
+    pub struct Armed(bool);
 
     impl Drop for Armed {
         fn drop(&mut self) {
-            ARMED.with(|a| a.set(a.get() - 1));
+            if self.0 {
+                ARMED.with(|a| a.set(a.get() - 1));
+            }
         }
     }
 
-    /// Arm the tripwire on this thread until the guard drops.
+    /// Arm the tripwire on this thread until the guard drops (test-probes:
+    /// not while the thread's probe has `Plant::NoTripwire`).
     pub fn arm() -> Armed {
-        ARMED.with(|a| a.set(a.get() + 1));
-        Armed(())
+        #[cfg(feature = "test-probes")]
+        let on = !crate::probes::planted(crate::probes::Plant::NoTripwire);
+        #[cfg(not(feature = "test-probes"))]
+        let on = true;
+        ARMED.with(|a| a.set(a.get() + u32::from(on)));
+        Armed(on)
     }
 
     /// Whether the tripwire is armed on this thread.
@@ -99,6 +106,13 @@ mod imp {
 pub use imp::{arm, armed, Armed};
 pub(crate) use imp::exempt;
 pub(crate) use imp::check;
+
+/// A planted raw-DB bypass's own entry (test-probes): trips like a raw
+/// `StateDb` read when armed.
+#[cfg(feature = "test-probes")]
+pub(crate) fn check_planted(entry: &'static str) {
+    imp::check(entry);
+}
 
 #[cfg(all(test, any(debug_assertions, feature = "test-probes")))]
 mod tests {
