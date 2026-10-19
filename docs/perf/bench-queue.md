@@ -564,6 +564,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    the boot line). Judge by: matched/s, native blocks/s, p50 / p99, timeouts, exec-thread on-CPU per 1k fills,
    flush-worker ms per 1k fills and busy share, whole-process CPU-s per 1M fills, save_books, RSS, data-dir growth.
    Question: should the testnet genesis use mode 3, given its shallow-book cost?
+8r. **8o rerun with the RH4 GC worker** (owner s131; after 8p; ~1 h 50). 8o (section 100): retention 1000 cost block
+   p50 +8.1% (6/6 pairs), blocks/s ~-4%, CPU per fill +1.4%, from the GC running ~1.5 ms per block on the consensus
+   thread. Fix: `perf/rh4-gc-worker` `a0181b8b` (pushed, not merged): consensus only hands the GC a job on a bounded
+   queue; a worker thread does record / delete / write; a pin fence protects bodies under check (Codex
+   torus-adversarial round 3: approve). **One binary** from `a0181b8b` (code defaults; 512 KB from `env.sh`; custody
+   0). Arms: **A** = no retention; **B** = `TORUS_RETENTION_BLOCKS=1000` (worker GC, the default on this branch);
+   **C** = `TORUS_RETENTION_BLOCKS=1000` + `TORUS_DA_GC_INLINE=1` (the old inline GC, as 8o's B), all via `EXTRA_ENV`.
+   Standard unpaced load, 300 markets, 300 s cells, warm-up then A B C C B A twice (n = 4 per arm). Tools: main
+   `3aaaa046` or later. Report as 8o (per cell and per pair, whole / post first deleting pass / pre windows, blocks/s
+   per minute from minute 1, slow-pass WARN lines) plus the worker metrics (handoff seconds, queue depth, lag,
+   coalesced heights, fence pins / refused / held `fence_full`). Verdicts: B vs A (does the worker remove 8o's
+   regression: p50, blocks/s, CPU per fill within noise?) and C vs A (does 8o's regression reproduce on this
+   binary?). Prune-by-default waits for this.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
