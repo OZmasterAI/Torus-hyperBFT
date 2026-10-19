@@ -2640,9 +2640,14 @@ impl ExecutionContext {
         self.execute_committed_block_with(torus_block, pending_slashes, DurableRows::default())
     }
 
-    /// [`NativeExecutor::core_writer_due`] on this context's DB (the R02
-    /// test seam can make the queue read fail).
-    fn core_writer_due(&self, height: u64) -> Result<bool, torus_bridge::BridgeError> {
+    /// [`NativeExecutor::core_writer_due`] through the block overlay `state`
+    /// (item 7 option 0 task 1.3; the R02 test seam can make the queue read
+    /// fail).
+    fn core_writer_due(
+        &self,
+        state: &NativeStateOverlay,
+        height: u64,
+    ) -> Result<bool, torus_bridge::BridgeError> {
         #[cfg(test)]
         if self.test_replay_fault == Some(ReplayFault::CoreWriterDueRead) {
             return Err(torus_core::error::CoreError::State(injected_fault(
@@ -2650,7 +2655,7 @@ impl ExecutionContext {
             ))
             .into());
         }
-        Ok(NativeExecutor::core_writer_due(&self.state_db, height)?)
+        Ok(NativeExecutor::core_writer_due(state, height)?)
     }
 
     /// [`native_applied_height`] of this context's DB (the R02 test seam can
@@ -3594,6 +3599,56 @@ impl ExecutionContext {
             "execution pipeline: executing finalized block"
         );
 
+        // Item 7 option 0 (task 1.3): the block overlay is built BEFORE the EVM
+        // section, so the block's EVM rows can be absorbed into it (task 1.2) and
+        // the CoreWriter due-check reads through it after the absorb. On the
+        // serial path it has no layers (every read is the DB read it was); on the
+        // pipelined path (no EVM yet) this only moves `checkpoint_read_layers`
+        // ahead of the empty EVM section.
+        // bl2 exec pipeline: the overlay is built BEFORE verify so that the
+        // session lookup and the nonce replay guard below read through it —
+        // on the fast path its parent layer is the previous block's (possibly
+        // not yet durable) pending set, which is where a session created or a
+        // nonce consumed by block N−1 lives. On the serial path the overlay is
+        // empty with no parent, so every read is exactly the DB read it was.
+        // Item 2 (C1): it is built before the native gate so the oracle
+        // due-check reads DB + the pipelined parent layer (block h−1's rows may
+        // not be durable yet) — never `self.state_db` alone, which would diverge.
+        let parent = if pipelined {
+            self.last_job.lock().unwrap().clone()
+        } else {
+            None
+        };
+        debug_assert!(
+            parent.as_ref().is_none_or(|p| p.height() + 1 == height),
+            "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
+            parent.as_ref().map(|p| p.height())
+        );
+        // Item 6 Phase 3: under the parent, L (two parts) and C (checkpoint
+        // interval only).
+        let (layer, deferred, inflight) = if pipelined {
+            match self.checkpoint_read_layers() {
+                Ok(layers) => layers,
+                Err(()) => {
+                    tracing::error!(
+                        height,
+                        "FATAL: since-checkpoint layer merge panicked — fail-stop"
+                    );
+                    self.exec_failed.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+        let mut overlay = NativeStateOverlay::with_split_layers(
+            self.state_db.clone(),
+            parent,
+            layer,
+            deferred,
+            inflight,
+        );
+
         // ---- EVM execution ----
         // PROFILER (s470): time the whole EVM section (validate + commit bundle +
         // block metadata) so it is attributed rather than sitting in the block
@@ -3792,7 +3847,15 @@ impl ExecutionContext {
         // value is already burned, so a stranded credit is lost value).
         // R02 branch 8 (B): a queue read error is a node fault: fail-stop
         // (C4), never "assume due" — as the oracle / liquidation due-checks.
-        let core_writer_due = match self.core_writer_due(height) {
+        // Item 7 option 0 (task 1.3): through the block overlay (DB + in-flight
+        // layers), after the EVM part; this block's own queue rows target later
+        // heights, so they never answer for `height`.
+        let core_writer_due = {
+            #[cfg(test)]
+            let _probe_scope = torus_state::probes::scope(torus_state::probes::Reader::DueCheck);
+            self.core_writer_due(&overlay, height)
+        };
+        let core_writer_due = match core_writer_due {
             Ok(due) => due,
             Err(e) => {
                 tracing::error!(%e, height, "FATAL: CoreWriter due-check read failed — halting execution pipeline (fail-stop)");
@@ -3803,49 +3866,6 @@ impl ExecutionContext {
                 return;
             }
         };
-        // bl2 exec pipeline: the overlay is built BEFORE verify so that the
-        // session lookup and the nonce replay guard below read through it —
-        // on the fast path its parent layer is the previous block's (possibly
-        // not yet durable) pending set, which is where a session created or a
-        // nonce consumed by block N−1 lives. On the serial path the overlay is
-        // empty with no parent, so every read is exactly the DB read it was.
-        // Item 2 (C1): it is built before the native gate so the oracle
-        // due-check reads DB + the pipelined parent layer (block h−1's rows may
-        // not be durable yet) — never `self.state_db` alone, which would diverge.
-        let parent = if pipelined {
-            self.last_job.lock().unwrap().clone()
-        } else {
-            None
-        };
-        debug_assert!(
-            parent.as_ref().is_none_or(|p| p.height() + 1 == height),
-            "bl2: parent layer must be the immediate predecessor (parent={:?}, height={height})",
-            parent.as_ref().map(|p| p.height())
-        );
-        // Item 6 Phase 3: under the parent, L (two parts) and C (checkpoint
-        // interval only).
-        let (layer, deferred, inflight) = if pipelined {
-            match self.checkpoint_read_layers() {
-                Ok(layers) => layers,
-                Err(()) => {
-                    tracing::error!(
-                        height,
-                        "FATAL: since-checkpoint layer merge panicked — fail-stop"
-                    );
-                    self.exec_failed.store(true, Ordering::SeqCst);
-                    return;
-                }
-            }
-        } else {
-            (None, None, None)
-        };
-        let mut overlay = NativeStateOverlay::with_split_layers(
-            self.state_db.clone(),
-            parent,
-            layer,
-            deferred,
-            inflight,
-        );
         // D12 nonce window: the nonce rows this block's cutoff passes, deleted
         // in the native phase below or, without one, riding the marker set.
         // R02: a read fault is not "nothing expired" (other nodes delete

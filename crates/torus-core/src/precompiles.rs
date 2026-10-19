@@ -1567,27 +1567,12 @@ impl CoreWriterQueue {
         Ok(actions)
     }
 
-    /// Count pending actions for a given block number.
-    pub fn pending_count(state_db: &StateDb, block_number: u64) -> Result<usize, CoreError> {
-        let db = state_db.inner();
-        let cf = db
-            .cf_handle(CF_CORE_WRITER_QUEUE)
-            .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
-
+    /// Count pending actions for a given block number, through any backend
+    /// (the DB, or a block overlay with its layers). `> 0` is exactly
+    /// [`StateBackend::prefix_exists`] on the target's prefix (the due-check).
+    pub fn pending_count(state: &impl StateBackend, block_number: u64) -> Result<usize, CoreError> {
         let prefix = block_number.to_be_bytes();
-        let iter = torus_state::db::prefix_iter(db, &cf, &prefix);
-
-        let mut count = 0usize;
-        for item in iter {
-            let (key, _) =
-                item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            count += 1;
-        }
-
-        Ok(count)
+        Ok(state.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?.len())
     }
 
     /// Find the next sequence number for a target block.
