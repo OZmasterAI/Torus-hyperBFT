@@ -15311,6 +15311,203 @@ Run order: w1-C, C, M3, M1, CD, M2, C_P0, M1_P0.
   `FROZEN.txt`). The stage is in `ozarchy-8m-stage/` (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis
   is in `ozarchy-8m-run/analyst/` (`8m-analyse.py` = 8n's `cell()` / `extra()` with a one-row-per-cell output; `8m.txt`).
 
+## 100. Step 8o, 8h rerun: does retention cost native blocks/s? Main `32648b44` (RH4 slow-pass logging), no retention vs `TORUS_RETENTION_BLOCKS=1000`, standard unpaced load, 300 markets, 300 s cells, n = 6 pairs (campaign ozarchy-8o, archy, 2026-10-19)
+
+**Yes, most likely, and by a small amount. B ran fewer native blocks/s than its paired A in 5 of 6 pairs, both over the
+whole load (A 13.48 vs B 12.95 blk/s, B / A 0.961 [0.914, 1.010]) and after the first deleting pass (14.56 vs 13.84,
+0.951 [0.890, 1.016]). Both CIs only just reach 1, so the blocks/s cost (~4-5%) is likely but not proven. Block p50 is
+higher in B in 6 of 6 pairs, and here the CI excludes 1: 14.5 -> 15.7 ms (1.081 [1.060, 1.101]); after the first
+deleting pass 13.9 -> 15.0 ms (1.080 [1.046, 1.116]). Before the first deleting pass (load +0-80 s) B / A blocks/s is
+0.996 (3 / 6 lower), but p50 is already +19% (1.187 [1.014, 1.389]), which fits the ~1 ms per block of early retention
+work in `docs/plans/rh4-retention-early-cost.md`. Block p99 is 779 -> 805 ms (1.034 [0.975, 1.096], 4 / 6 higher).
+Timeouts are too few to rank (0.6 vs 0.4 per cell, node mean). CPU-s per 1M fills is +1.4% (22.72 -> 23.04, 1.014
+[1.004, 1.025], 6 / 6 higher), and +2.2% after the first deleting pass. Exec-thread on-CPU per 1k fills is +0.6% (CI
+spans 1), and matched/s is 268,516 -> 267,707 (0.997 [0.992, 1.002]). The GC pass costs 1.43-1.65 ms per native block
+on the consensus thread (p50 0.23-0.31 ms, p99 10.1-11.0 ms per pass), and B's blocks are 4-5% bigger. 29 passes
+logged the slow-pass WARN (50.9-189.3 ms, median 66.1), and in every one of them 95% of the time is the batch write
+(`write_ms`). No pass was held and none failed. Plain verdict: B is lower than its paired A in most pairs (5 / 6 on
+blocks/s, 6 / 6 on p50). Retention 1000 fails the exec-path merge rule on block p50, and probably on blocks/s, so
+prune-by-default should not go in as it is.**
+
+Question (bench queue step 8o, owner s131): section 95 left native blocks/s and block p50 / p99 open at n = 2 (per pair
+r1 A 12.6 / B 13.1, r2 A 16.4 / B 9.3 blk/s; the owner reads r2-B as a possible regression). Since then RH4's
+slow-pass logging is merged (main `32648b44`), and `docs/plans/rh4-retention-early-cost.md` found ~1 ms per block of
+retention work before the first deleting pass. Is B lower than its paired A in most pairs? Prune-by-default waits for
+this answer.
+
+### 100.1 Setup
+
+* One binary: main `32648b44`, built `cargo build --release --locked -p torus-node / bench-throughput /
+  torus-tx-flood` in a new detached worktree `wt/8o-32648b44`, `CARGO_TARGET_DIR` `~/.cargo-target-8o` (reflink copy of
+  `~/.cargo-target-8m`). Node md5 `7585952e706dbc6f1a425bc1f1e3a1ab`, bench `35e25abd`, flood `dd59d50d`. Staged in
+  `ozarchy-8o-stage/a`. Code defaults (Classic books, 15 s checkpoints, F on, PC 8, trust cache on; `TORUS_BOOK_ROWS`
+  empty overrides run-cell.sh's `RECORD_ENV` 3). Re-send 250 ms and the 512 KB push threshold come from `env.sh`,
+  custody 0. `TORUS_DA_GC_SLOW_MS` absent (50 ms default).
+* Arms: A = no retention (archive). B = `TORUS_RETENTION_BLOCKS=1000` through the arm's `EXTRA_ENV` (start-node.sh
+  passes `--retention-blocks=1000`: state pruner, block-tree pruner, DA body GC window 1128).
+* Took-effect checks (`ozarchy-8o-tools/8o-checks.sh`, p8h's renamed plus two):
+  * `o8retchk`: B = `--retention-blocks=1000` on every node's cmdline (sampler record), one `DA body GC on` line with
+    `window=1128` per node, the env on 3 environs; A = none of these.
+  * `o8gcchk`: B = `torus_da_bodies_gc_deleted_total` > 0 on every node; A = absent or 0.
+  * `o8slowchk` (new): B = one `slow_ms=50` config line per node, and the `DA body GC: slow pass` WARN lines (copied to
+    `<cell>/o8-slowpass.txt`) equal `torus_da_gc_slow_passes_total` per node; A = no line, counter absent or 0.
+  * `o8swapchk` (8m's): stop on swap growth > 512 MB over preflight.
+  * Self-tested: the smoke (B) passes as B and fails `o8retchk` / `o8gcchk` / `o8slowchk` as A; p8h's r1-B (old binary)
+    fails `o8slowchk` as B.
+* Shape: standard unpaced load (hsdb-300m): 300 markets, rate 76,000, 5,000 senders, BLOCK_CAP 400, RETRY_BUSY,
+  MAX_IN_FLIGHT 4, OPEN_ORDER_BUDGET 900, oracle on, IN_FLIGHT_TAIL commit, CLOID_SHARE 0, native only, default 100k
+  genesis (cell genesis md5 `d694b81b`), CLEAN=1 (fresh data dirs per cell). Cells run 300 s.
+* Cells, one detached driver (`ozarchy-8o-campaign.sh`, quiet gate: 5 s CPU-busy sample < 10%): smoke B 180 s (its own
+  `launch smoke`), then w1 A 300 s (gated), then A B B A three times: r1-A r1-B r2-B r2-A r3-A r3-B r4-B r4-A r5-A r5-B
+  r6-B r6-A. Pair k = rk-A / rk-B.
+* Windows per pair: whole = load +0 s to the shorter load end; post = B's first deleting pass (first 1 Hz scrape with
+  `torus_da_bodies_gc_deleted_total` > 0 on every node) + 5 s to the same end. With 300 s cells the first deleting
+  pass at ~load + 90 s leaves ~200 s of post window.
+* Tools: `ozarchy-8o-tools`, frozen from `32648b44` (tools/ = 8m's, devnet/ = 8m's = p8h's, p8h's 100k
+  `genesis-weighted-full.json`). Sidecar `o8-sampler.py` (= p8h's) in its own unit `o8sampler-main`, 60 s per node.
+* Run: 16:32:43-18:05:13 (92.5 min). Pacing: END -> next START was 53-54 s for all 12 gaps. Of that, 48-49 s is the
+  post-cell step (checks and records, END -> `cell-step/<label>.json`) and 5-6 s is the rest. The quiet gate never
+  held a start (every HOST line: builds none, analysis none). Smoke -> w1 took 137 s (two separate launches).
+* Host: archy, 62 GB, 32 CPUs. MemAvailable >= 56.19 GB at every start. Swap used was 1,757,024 kB at preflight and
+  1,755,388 kB after the last cell (no growth). `kernel.perf_event_paranoid` was 2 at every start and end. No cargo,
+  rustc or indexer ran during the cells.
+
+### 100.2 Validity
+
+All 14 cells (smoke, w1, 12 measured) ended rc 0, ACCEPT / AGREE / PASS, with 0 panic or fail-stop lines. The running
+node exe md5 was `7585952e` on 3 / 3 nodes in every cell (42 / 42). The campaign logged 313 CHECK OK plus the smoke's
+25, with 0 CHECK FAIL, 0 CHECK WARN, 0 HARD FINDING and no CELL-FLAG. Margin rejects were 0% in every cell. The
+took-effect checks held: every B node had `--retention-blocks=1000`, `DA body GC on` with window 1128, and
+`slow_ms=50`, and its slow-pass WARN lines equal `torus_da_gc_slow_passes_total`. No A node had any of these. The
+warm-up gate passed (w1 268,549 matched/s, 1 timeout).
+
+### 100.3 Per pair (`ozarchy-8o-run/analyst/o8.txt`; node mean; whole = load +0 to +302/303 s, post = B's first deleting pass + 5 s to the same end)
+
+B's first deleting pass came at load +80 s in every pair (+81 s in r3), so post = +86/87 s to +302/303 s (215-217 s).
+
+| pair | native blk/s whole A / B | B / A | native blk/s post A / B | B / A | p50 ms whole A / B | p99 ms whole A / B | p50 ms post A / B | p99 ms post A / B | timeouts whole A / B |
+|---|---|---|---|---|---|---|---|---|---|
+| r1 | 13.782 / 12.825 | 0.931 | 14.740 / 13.528 | 0.918 | 14.4 / 15.8 | 755 / 822 | 13.9 / 15.4 | 724 / 798 | 0.0 / 0.0 |
+| r2 | 12.699 / 13.201 | 1.040 | 13.414 / 14.117 | 1.052 | 14.7 / 15.8 | 829 / 786 | 14.2 / 15.1 | 791 / 745 | 1.3 / 0.7 |
+| r3 | 13.596 / 12.692 | 0.934 | 14.651 / 13.715 | 0.936 | 14.9 / 15.7 | 769 / 811 | 14.6 / 15.0 | 711 / 765 | 1.7 / 0.3 |
+| r4 | 13.868 / 12.844 | 0.926 | 15.301 / 13.584 | 0.888 | 14.0 / 15.4 | 752 / 819 | 13.2 / 14.8 | 690 / 792 | 0.0 / 1.0 |
+| r5 | 13.815 / 13.810 | 1.000 | 14.926 / 14.909 | 0.999 | 14.1 / 15.0 | 774 / 765 | 13.5 / 14.3 | 743 / 714 | 0.0 / 0.3 |
+| r6 | 13.126 / 12.349 | 0.941 | 14.332 / 13.201 | 0.921 | 14.8 / 16.3 | 796 / 830 | 14.0 / 15.4 | 761 / 799 | 0.3 / 0.0 |
+
+Paired B / A (geomean of the 6 per-pair ratios, 95% CI, 5 df, t = 2.571; timeouts as the mean difference):
+
+| metric | window | A mean | B mean | B / A [95% CI] | pairs with B < A |
+|---|---|---|---|---|---|
+| native blocks/s | whole | 13.481 | 12.953 | 0.9608 [0.9138, 1.0102] | 5 / 6 |
+| native blocks/s | post | 14.561 | 13.842 | 0.9507 [0.8897, 1.0159] | 5 / 6 |
+| native blocks/s | pre (+0-80 s) | 10.771 | 10.725 | 0.9959 [0.9469, 1.0475] | 3 / 6 |
+| block p50 ms | whole | 14.5 | 15.7 | 1.0806 [1.0602, 1.1013] | 0 / 6 |
+| block p50 ms | post | 13.9 | 15.0 | 1.0801 [1.0455, 1.1159] | 0 / 6 |
+| block p50 ms | pre | 19.0 | 22.5 | 1.1869 [1.0143, 1.3888] | 0 / 6 |
+| block p99 ms | whole | 779 | 805 | 1.0337 [0.9751, 1.0958] | 2 / 6 |
+| block p99 ms | post | 737 | 769 | 1.0438 [0.9615, 1.1332] | 2 / 6 |
+| timeouts per cell (node mean) | whole | 0.6 | 0.4 | -0.17 [-1.02, +0.68] | 3 / 6 |
+| fills per native block | whole / post | 19,941 / 18,402 | 20,691 / 19,245 | 1.0377 [0.9846, 1.0937] / 1.0462 [0.9747, 1.1229] | 2 / 6 |
+| matched/s | whole | 268,516 | 267,707 | 0.9970 [0.9917, 1.0023] | 4 / 6 |
+| matched/s | post | 267,434 | 265,995 | 0.9946 [0.9854, 1.0039] | 5 / 6 |
+| CPU-s per 1M fills | whole | 22.72 | 23.04 | 1.0141 [1.0036, 1.0246] | 0 / 6 |
+| CPU-s per 1M fills | post | 22.88 | 23.37 | 1.0215 [1.0074, 1.0359] | 0 / 6 |
+| CPU-s per 1M fills | pre | 22.34 | 22.24 | 0.9955 [0.9843, 1.0068] | 4 / 6 |
+| exec-thread on-CPU ms per 1k fills | whole load | 2.673 | 2.689 | 1.0060 [0.9976, 1.0145] | 1 / 6 |
+| exec block_ms | whole | 72.5 | 75.6 | 1.0423 [0.9865, 1.1013] | 1 / 6 |
+
+Native blocks/s per minute from minute 1 (node mean; the first deleting pass falls in minute 2, at +80 s):
+
+| cell | m1 | m2 (first deleting pass) | m3 | m4 | m5 |
+|---|---|---|---|---|---|
+| r1-A | 10.16 | 14.57 | 14.24 | 13.74 | 15.15 |
+| r1-B | 10.39 | 12.89 | 14.72 | 12.48 | 12.69 |
+| r2-B | 9.92 | 13.79 | 15.67 | 13.03 | 13.89 |
+| r2-A | 10.01 | 12.42 | 13.10 | 13.10 | 13.55 |
+| r3-A | 10.01 | 13.91 | 15.44 | 11.97 | 15.23 |
+| r3-B | 8.88 | 13.43 | 15.27 | 13.16 | 13.00 |
+| r4-B | 9.79 | 13.28 | 14.72 | 14.67 | 12.19 |
+| r4-A | 9.53 | 12.62 | 15.57 | 14.17 | 16.12 |
+| r5-A | 9.81 | 14.91 | 15.48 | 14.08 | 14.04 |
+| r5-B | 10.08 | 13.76 | 15.79 | 14.23 | 14.74 |
+| r6-B | 9.70 | 12.27 | 15.13 | 12.75 | 12.14 |
+| r6-A | 8.86 | 13.42 | 15.38 | 13.58 | 14.23 |
+
+Per-minute B / A (geomean of 6 pairs): m1 1.007 (2 / 6 lower), m2 0.972 (4 / 6), m3 1.025 (3 / 6), m4 0.996 (3 / 6),
+m5 0.890 [0.779, 1.017] (4 / 6). Minute 1 shows no difference: B does not start in a different block regime. The gap
+opens from minute 2 on, and it is largest in minute 5. Run order shows no drift: A ran 13.78 / 12.70 / 13.60 / 13.87 /
+13.82 / 13.13 blk/s (whole) and B 12.83 / 13.20 / 12.69 / 12.84 / 13.81 / 12.35. Every cell stayed in the same regime:
+19-22k fills per block, 266-270k matched/s.
+
+8h for reference (section 95, main `687eac9e` without exec-hash, 900 s cells; not pooled): post-pass blocks/s r1 A
+12.61 / B 13.12 (1.040), r2 A 16.42 / B 9.32 (0.568). 8o's six pairs are 0.89-1.05. None comes near r2's 0.57, so
+that one looks like the regime spread, not a GC effect.
+
+### 100.4 GC (B cells; node mean; per pass = `torus_da_gc_seconds` sum / count)
+
+| cell | passes, cell | GC s, cell | ms per pass, post | ms per native blk, post | p50 / p99 ms per pass, cell (p99 max node) | bodies deleted, cell | held passes | slow-pass WARN lines (counter, 3 nodes) |
+|---|---|---|---|---|---|---|---|---|
+| r1-B | 4,832 | 5.982 | 1.584 | 1.571 | 0.225 / 10.77 (10.99) | 356,354 | 0 | 5 (5) |
+| r2-B | 5,016 | 5.978 | 1.488 | 1.490 | 0.311 / 10.34 (10.64) | 359,714 | 0 | 0 (0) |
+| r3-B | 4,834 | 6.177 | 1.576 | 1.578 | 0.298 / 10.68 (10.89) | 355,959 | 0 | 7 (7) |
+| r4-B | 4,897 | 6.187 | 1.578 | 1.610 | 0.282 / 10.55 (10.95) | 354,329 | 0 | 7 (7) |
+| r5-B | 5,158 | 6.037 | 1.433 | 1.438 | 0.248 / 10.12 (10.63) | 361,739 | 0 | 4 (4) |
+| r6-B | 4,768 | 6.179 | 1.647 | 1.675 | 0.293 / 11.02 (11.22) | 353,249 | 0 | 6 (6) |
+
+The pass count includes passes before the window reaches back (they record and delete nothing), so it is > native
+blocks. No `torus_da_gc_held_passes` reason appeared in any cell (8h: 3 `dispatch_behind`).
+
+Slow-pass WARN lines (`<cell>/o8-slowpass.txt`; t = s after the load start; all `dispatch_lag=0 held=none
+error=none`, `tail_ms` <= 0.12, `delete_scan_ms` <= 0.25, `record_ms` <= 1.9):
+
+| cell | node: t s, total ms (write / restore ms), bodies deleted |
+|---|---|
+| r1-B | val0: 127, 68.2 (64.1 / 3.2), 2; val1: 254, 89.6 (86.6 / 1.8), 371; val1: 254, 51.1 (47.0 / 2.9), 400; val2: 127, 75.4 (69.1 / 5.2), 2; val2: 156, 58.5 (55.2 / 2.0), 400 |
+| r2-B | none |
+| r3-B | val0: 59, 51.9 (49.7 / 1.7), 0; val0: 129, 119.3 (116.1 / 2.0), 400; val0: 154, 122.7 (112.5 / 9.3), 0; val1: 74, 50.9 (49.6 / 0.8), 0; val1: 130, 76.9 (73.7 / 2.0), 400; val2: 74, 58.6 (55.7 / 0.8), 0; val2: 215, 98.0 (95.7 / 1.3), 0 |
+| r4-B | val0: 197, 58.5 (51.7 / 5.8), 0; val0: 216, 64.8 (62.4 / 1.3), 0; val1: 128, 189.3 (184.9 / 2.8), 400; val1: 184, 125.0 (121.3 / 2.4), 0; val1: 216, 60.0 (56.7 / 2.0), 0; val1: 232, 59.6 (58.5 / 0.7), 0; val2: 127, 76.4 (71.7 / 3.2), 400 |
+| r5-B | val1: 59, 122.2 (120.0 / 1.5), 0; val1: 125, 55.8 (50.3 / 4.0), 0; val1: 126, 66.1 (60.6 / 4.7), 400; val2: 72, 66.0 (62.2 / 2.4), 0 |
+| r6-B | val0: 128, 75.5 (72.4 / 1.9), 0; val0: 157, 60.2 (56.9 / 2.4), 0; val0: 236, 51.4 (49.5 / 1.0), 400; val1: 127, 55.8 (53.1 / 1.9), 68; val1: 265, 68.0 (64.5 / 2.3), 92; val2: 127, 72.1 (67.0 / 3.9), 68 |
+
+* 29 lines, 50.9-189.3 ms (median 66.1). `write_ms` is 95.1% of their total time. The slow part is the one RocksDB
+  batch write (record, deletes and GC state together), not the scans, the tail decode or the restore.
+* 15 of the 29 deleted nothing, and 5 came before the first deleting pass (+59-74 s). So a write of only the record
+  and GC state can stall as well: the stall is in RocksDB, not in the delete volume.
+* 11 of the 29 fall in load +120-135 s, in 5 of the 6 B cells. One case was checked: r4-B val1's 189 ms pass
+  (+128 s) came 1.3 s after the state DB's `Flushing all column families ... max_total_wal_size is 2147483648`
+  (rocksdb-LOG-val1). A cells hit the same 2 GiB WAL flushes, but they write no GC batch on the consensus thread.
+  The other lines were not matched to the LOG.
+* `torus_da_gc_last_pass_max_seconds` (1 Hz) peaked at 36.9-125.0 ms per cell. It misses some slow passes (r4-B's 189 ms)
+  because every scraper (1 Hz, the sampler, metrics-after) resets the max-since-scrape. Use the WARN lines and the
+  counter.
+
+### 100.5 Verdict, limits and next
+
+* Plain verdict: **B is lower than its paired A in most pairs.** Native blocks/s is lower in 5 / 6 pairs, whole and
+  after the first deleting pass (-3.9% / -4.9%, CI upper bound 1.010 / 1.016). Block p50 is higher in 6 / 6 (+8%,
+  CI excludes 1), and it is already higher before the first deleting pass. CPU-s per 1M fills is higher in 6 / 6 (+1.4%,
+  CI excludes 1). matched/s, p99, timeouts and exec-thread on-CPU are not resolved (CIs span 1 or 0).
+* Under the exec-path merge rule (native blocks/s, block p50 / p99 and timeouts must not get worse), retention 1000
+  fails on p50 and probably on blocks/s. Prune-by-default should not ship as it is.
+* Mechanism (consistent, not proven): the pass runs on the consensus thread inside the commit dispatch, at ~1.5 ms
+  per native block (p99 ~11 ms, rare 50-190 ms write stalls). That lengthens the block cycle, the blocks get 4-5%
+  bigger (fills per block 1.038 / 1.046) and blocks/s falls. Before the first deleting pass the early retention work
+  (`rh4-retention-early-cost.md`, ~1 ms per block) already moves p50 but not blocks/s.
+* Next, for the owner / 18c: take the GC write off the consensus thread's commit path. Options are to defer it to
+  W or a GC thread, or to batch it every N blocks. Then rerun this exact A B B A x 3 (`ozarchy-8o-tools`, regenerate
+  with new labels). The slow passes are RocksDB write stalls (`write_ms`), so a separate WAL / write path or a smaller
+  `max_total_wal_size` interaction is worth a look as well.
+* Limits: 300 s cells give a 215-217 s post window, so a slow drift over hours is not covered (section 95 ran 900 s).
+  The load is native only (no EVM tail decode). No restart or crash-kill with retention on, custody 0 only. The
+  pairs are adjacent in time, but two B cells sit back to back in each ABBA block. Timeouts are too few (0-2 per
+  cell) to say anything.
+* Data: `~/bench-results-matched/ozarchy-8o-300m-{smoke-s0,w1,r1-A,...,r6-A}` (per cell `o8-slowpass.txt`,
+  `o8-push.txt`, `o8-disk.txt`, `o8-swap.txt`). Campaign files are in `ozarchy-8o-run/campaign/` (`campaign.log`,
+  `cells.tsv`, `cell-step/`, `smoke/`), and the 60 s sampler rows in `ozarchy-8o-run/o8-samples/`. Tools are in
+  `ozarchy-8o-tools/` (`8o-spec.json`, `8o-checks.sh`, `o8-sampler.py`, `ozarchy-8o-campaign.sh`, `FROZEN.txt`). The
+  stage is in `ozarchy-8o-stage/` (`build/build.sh`, `build/md5s.txt`, `build/build.log`). Analysis is in
+  `ozarchy-8o-run/analyst/` (`o8-analyse.py`, adapted from `p8h-analyse.py`, with `o8.txt` and `o8-analyse.json`).
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl

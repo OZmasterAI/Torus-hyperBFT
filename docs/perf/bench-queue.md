@@ -512,6 +512,23 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    this campaign's 6 pairs alone (8h ran on an older main without exec-hash; report its 2 pairs next to it, not
    pooled). Verdict in plain words: if B is lower than its paired A in most pairs, say so; prune-by-default waits for
    this.
+   **Done s68 (ozarchy-8o, one binary main `32648b44`, node `7585952e`, smoke B 180 s, w1 A 300 s, then A B B A x 3,
+   300 s, n = 6 pairs; perf doc section 100).**
+   * Validity: all 14 cells ACCEPT / AGREE / PASS, md5 42 / 42, 313 CHECK OK + smoke 25, 0 CHECK FAIL, no swap growth.
+     Retention took effect on every B node (cmdline, GC on window 1128, slow_ms=50) and on no A node.
+   * Verdict: **B is lower than its paired A in most pairs.** Native blocks/s is lower in 5 / 6: whole 13.481 ->
+     12.953 (0.961 [0.914, 1.010]), after the first deleting pass (+80 s) 14.561 -> 13.842 (0.951 [0.890, 1.016]).
+     Block p50 is higher in 6 / 6: 14.5 -> 15.7 ms (1.081 [1.060, 1.101]). Before the first deleting pass it is
+     already +19% while blocks/s is equal. p99 779 -> 805 ms (CI spans 1). Timeouts 0.6 vs 0.4 per cell. CPU-s per
+     1M fills +1.4% (6 / 6). matched/s -0.3%.
+   * Per minute: m1 equal (1.007), the gap opens from m2 on (m5 0.890). No drift by run order, same block regime in
+     every cell. 8h's r2 0.568 is not reproduced (8o pairs 0.89-1.05).
+   * GC: 1.43-1.65 ms per native block on the consensus thread, p99 ~10-11 ms per pass, 0 held passes. 29 slow-pass
+     WARN lines (50.9-189.3 ms), 95% of their time `write_ms`. 11 fall in load +120-135 s; one checked lines up
+     with the state DB's 2 GiB `max_total_wal_size` flush.
+   * Fails the exec-path rule on p50 (probably on blocks/s too): prune-by-default should not ship as it is. Next: move
+     the GC write off the consensus commit path, then rerun the same A B B A x 3.
+   * Inter-cell gaps 53-54 s (post-cell step 48-49 s, rest 5-6 s).
 8q. **L2.2 full A/B (fixed)** (owner s131; after 8o; ~1 h). A = main `0f5bef38` (L2.2's base), B =
    `exp/8k-settle-no-merge-fix` `ddf41758` with `TORUS_SETTLE_NO_MERGE=1` (archy's `dbe14b21` + the fix for Codex's P1
    on aliased position rows: per-cache market-id ranges, exact flag-off fallback on overlap; Codex torus review no
