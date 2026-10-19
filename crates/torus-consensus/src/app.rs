@@ -5503,6 +5503,10 @@ impl ExecutionContext {
             m.block_transactions_count.observe(tx_count as f64);
             let block_secs = block_timer.elapsed().as_secs_f64();
             m.exec_block_seconds.observe(block_secs);
+            // Item 7 option 0 (task 4.2): exec ms at EVM heights (bench Q11).
+            if has_evm {
+                m.exec_evm_block_seconds.observe(block_secs);
+            }
             // Item 6 Phase 2 step 0.2: oracle-only blocks timed apart (the
             // harness's per-interval means cannot isolate them), and the
             // process's thread spawns per exec-path site.
@@ -33856,7 +33860,8 @@ mod crash_recovery_tests {
     ///   EVM block (a Marker on the fast path) counts in both.
     /// - `torus_exec_evm_idle_before_seconds` is observed once per EVM
     ///   block after the first block (Q11's "exec idle before an EVM
-    ///   block").
+    ///   block"), `torus_exec_evm_block_seconds` once per EVM block (exec
+    ///   ms at EVM heights; the rest is `torus_exec_block_seconds` minus it).
     /// - `torus_flush_worker_evm_trie_seconds` is W's EVM trie step: one per
     ///   fast-path EVM block with a non-empty bundle at interval 0, one per
     ///   checkpoint whose window holds one with an interval, never on the
@@ -33896,6 +33901,7 @@ mod crash_recovery_tests {
                 3,
                 "{what}"
             );
+            assert_eq!(v(&text, "torus_exec_evm_block_seconds_count"), 3, "{what}");
             assert_eq!(
                 v(&text, "torus_flush_worker_evm_trie_seconds_count"),
                 trie,

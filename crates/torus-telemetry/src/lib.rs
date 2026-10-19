@@ -442,6 +442,9 @@ pub struct Metrics {
     /// an EVM block" (Q5: ~0.5 s p50, the barrier's checkpoint and W drain).
     /// Includes the wait for the block to arrive when exec is caught up.
     pub exec_evm_idle_before_seconds: Histogram,
+    /// Item 7 option 0 (task 4.2): `exec_block_seconds` of the blocks with
+    /// EVM txs only (bench Q11's "exec ms at EVM heights vs others").
+    pub exec_evm_block_seconds: Histogram,
     /// PROFILER (s470): per-block order-book LOAD + REBUILD. `NativeExecContext`
     /// is reconstructed every block, and its constructor scans the whole
     /// `cf_native_order_books` CF and rebuilds every resting order into memory
@@ -2093,6 +2096,12 @@ impl Metrics {
              execution start (its barrier included; also the wait for the block when caught up)",
             exec_evm_idle_before_seconds.clone(),
         );
+        let exec_evm_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_evm_block_seconds",
+            "Item 7 option 0: torus_exec_block_seconds of the blocks with EVM txs only",
+            exec_evm_block_seconds.clone(),
+        );
 
         let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
@@ -3025,6 +3034,7 @@ impl Metrics {
             exec_evm_blocks,
             exec_evm_fast_path_blocks,
             exec_evm_idle_before_seconds,
+            exec_evm_block_seconds,
             exec_load_books_seconds,
             exec_margin_configs_seconds,
             exec_action_status_seconds,
@@ -3799,10 +3809,11 @@ mod tests {
             "torus_exec_evm_blocks_total 0",
             "torus_exec_evm_fast_path_blocks_total 0",
             "torus_exec_evm_idle_before_seconds_count 0",
+            "torus_exec_evm_block_seconds_count 0",
             "torus_flush_worker_evm_trie_seconds_count 0",
             "torus_exec_evm_seconds_count 0",
         ] {
-            assert!(text.contains(name), "{name} not registered:\n{text}");
+            assert!(text.contains(name), "{name} not registered at zero");
         }
     }
 
