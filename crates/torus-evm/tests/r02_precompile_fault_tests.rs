@@ -357,6 +357,93 @@ mod f1 {
         assert!(!r.success, "writer in eth_call reverts");
     }
 
+    /// Item 7 option 0 task 1.1 audit (guard): the precompile sources that
+    /// DECODE a stored row at a key the calldata picks. 0x0800 getPosition
+    /// (`Position` Borsh, a 28-byte `trader ‖ market` key in
+    /// CF_NATIVE_POSITIONS), 0x0801 getBalances (`NativeBalance` Borsh, a
+    /// 20-byte trader key in CF_NATIVE_BALANCES) and 0x080e bbo (a 32-byte
+    /// row check, an 8-byte market key in CF_NATIVE_BBO). Every key such a
+    /// call can address is written only by that row's codec (put_position
+    /// and R's write-back; put_native_balance, credit_native and genesis;
+    /// write_bbo_rows, always 32 bytes). The CFs' other rows have other key
+    /// lengths (the 24-byte `cvlm` volume rows). So an undecodable row there
+    /// is this node's row fault, not a function of the calldata: a local
+    /// fault (the block aborts, the node fail-stops), never a revert, on the
+    /// block, overlay and single-tx paths and in eth_call. The same calls on
+    /// codec-written rows succeed (control).
+    #[test]
+    fn f1_undecodable_stored_row_is_a_local_fault() {
+        use torus_core::position::{position_key, NativeBalance};
+        use torus_state::cf::CF_NATIVE_BBO;
+        let alice = addr_word(ALICE);
+        let market = u_word(MARKET as u128);
+        // (case, cf, key, undecodable row, fault message part, precompile, calldata)
+        type Case = (&'static str, &'static str, Vec<u8>, Vec<u8>, &'static str, u16, Vec<u8>);
+        let cases: Vec<Case> = vec![
+            (
+                "0x0800 getPosition: Position row",
+                CF_NATIVE_POSITIONS,
+                position_key(&ALICE, MARKET).to_vec(),
+                vec![9u8; 111],
+                "unsupported Position schema version",
+                ADDR_ORDER_BOOK_READER,
+                call("getPosition(address,bytes32)", &[alice, market]),
+            ),
+            (
+                "0x0801 getBalances: NativeBalance row",
+                CF_NATIVE_BALANCES,
+                ALICE.to_vec(),
+                vec![9u8; 33],
+                "unsupported NativeBalance schema version",
+                ADDR_BALANCE_READER,
+                call("getBalances(address)", &[alice]),
+            ),
+            (
+                "0x080e bbo: bbo row",
+                CF_NATIVE_BBO,
+                MARKET.to_be_bytes().to_vec(),
+                vec![1u8; 31],
+                "not 32",
+                torus_core::precompiles::ADDR_BBO_READER,
+                call("bbo(bytes32)", &[market]),
+            ),
+        ];
+        let local = |r: Result<(), EvmError>, part: &str, what: String| match r {
+            Err(EvmError::LocalFault(msg)) => assert!(msg.contains(part), "{what}: {msg}"),
+            other => panic!("{what}: expected EvmError::LocalFault, got {other:?}"),
+        };
+        for (what, cf, key, row, part, id, data) in cases {
+            let ex = EvmExecutor::new(TORUS_CHAIN_ID);
+            let tx = || tx_to(id, data.clone(), U256::ZERO, 200_000);
+            let (_d, db) = db_without("no-such-cf");
+            db.put_cf_raw(cf, &key, &row).unwrap();
+            local(ex.execute_block(&db, &block_cfg(), vec![tx()], true).map(drop), part, format!("{what} (block)"));
+            let overlay = torus_state::StateOverlay::new(db.clone());
+            local(
+                ex.execute_block_with_overlay(&overlay, &block_cfg(), vec![tx()], true).map(drop),
+                part,
+                format!("{what} (overlay)"),
+            );
+            local(ex.execute_tx(&db, &block_cfg(), tx()).map(drop), part, format!("{what} (tx)"));
+            local(ex.execute_call(&db, &block_cfg(), tx()).map(drop), part, format!("{what} (eth_call)"));
+            // Control: the codec's row at the same key.
+            let (_d, db) = db_without("no-such-cf");
+            if cf == CF_NATIVE_POSITIONS {
+                seed(&db);
+            } else if cf == CF_NATIVE_BALANCES {
+                PositionManager::new(db.clone())
+                    .put_native_balance(&ALICE, &NativeBalance { available: fp(5), order_margin: FixedPoint::ZERO })
+                    .unwrap();
+            } else {
+                db.put_cf_raw(cf, &key, &[0u8; 32]).unwrap();
+            }
+            let b = ex
+                .execute_block(&db, &block_cfg(), vec![tx()], true)
+                .unwrap_or_else(|e| panic!("{what} (control): {e:?}"));
+            assert_eq!((b.receipts.len(), b.receipts[0].status), (1, true), "{what} (control)");
+        }
+    }
+
     /// Healthy control: the fault cases succeed on a DB with every CF (so
     /// the fault, not the call, is what fails above).
     #[test]

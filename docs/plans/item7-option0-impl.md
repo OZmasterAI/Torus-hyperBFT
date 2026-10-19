@@ -539,6 +539,23 @@ Everything in step 1 runs on today's paths. The golden must stay byte-equal afte
   `InvalidPrecompileInput` first, with a test.
 - Verify: `cargo nextest run -E 'rdeps(torus-evm)' $F`; golden unchanged (no fault in the stream).
 - Decision 3 (settled, R3): the fix ships on its own branch ahead of option 0; gate D1 enforces the order.
+- **Done (s131, on base `fd94818d`, F1 fix `86cd520f` + scan fix `a361e764`).** (1) The tests exist under other
+  names, all green: `balance_reader_read_fault_is_a_local_fault` and `enqueue_read_fault_is_a_local_fault` are
+  cases of `f1_precompile_read_fault_is_a_local_fault` (`0x0801 getBalances balance read`, CF_NATIVE_BALANCES;
+  `0x0810 placeOrder delay read`, CF_FEE_CONFIG; 8 cases, block / overlay / tx paths) plus
+  `f1_reader_read_fault_in_eth_call_is_an_error`; the guard is `f1_deterministic_precompile_errors_stay_reverts`;
+  `precompile_read_fault_fail_stops_block` (+ `precompile_scan_fault_fail_stops_block`) in torus-consensus. Added
+  here: `f1_undecodable_stored_row_is_a_local_fault` (guard, the row-decoding sources). (2) The audit (table in the
+  commit message): every `State` / `Borsh` source reachable from `execute_precompile_metered` is a local storage
+  fault (19: 18 reads, every CF a constant, and the journal's puts) or a local row fault (3: `Position` and `NativeBalance` decodes, the bbo
+  row length; the calldata picks the key, but every key it can address is written only by that row's codec), plus
+  one unreachable `Borsh` (encoding a `QueuedAction` into a `Vec`). No `MissingCf` / `BookCorrupt` source is
+  reachable. **No input-dependent source**: nothing maps to `InvalidPrecompileInput`, no behaviour change, golden
+  byte-equal. (3) **Option 0 extension, no code now:** on the fast path the journal (and the revm adapter) reads
+  through the block overlay, so a read that reaches L's deferred part after its merge failed returns
+  `StateError::Io` (`backend.rs` `layer_for`, "since-checkpoint layer merge failed"). From a precompile it is
+  `CoreError::State`, a local fault: the provider records it, the block aborts with `EvmError::LocalFault` and E
+  fail-stops, like a missing CF today. Tested in task 3.4 (`fast_path_deferred_merge_failure_under_journal_fail_stops`).
 
 **Task 1.2: absorb the EVM rows into the block overlay on the serial path**
 - Test first:
@@ -732,7 +749,9 @@ Step 2 size: ~580-800 lines (estimate; +30-50 for the Marker's `evm` field and i
 
 **Task 3.4: local faults on the fast path**
 - Test first: `fast_path_adapter_read_fault_fail_stops`, `fast_path_deferred_merge_failure_under_journal_fail_stops`
-  (the merge thread's failure seam), `fast_path_absorb_put_fault_fail_stops`. The faults are injected in G mode with
+  (the merge thread's failure seam; task 1.1's option 0 extension: a precompile journal read that reaches L's
+  deferred part after a failed merge gets `StateError::Io`, so `CoreError::State`, a local fault: never a revert),
+  `fast_path_absorb_put_fault_fail_stops`. The faults are injected in G mode with
   the parent's job (interval 0) or the checkpoint (interval) still held (R2). Each is a fail-stop on E, which latches
   `exec_failed`, so W must refuse the held jobs (`exec_pipeline.rs:742-744`) and not land them. The checks follow
   task 3.5's crash protocol (R4): d = the marker before the fault; before the drop, `exec_failed` is set and
