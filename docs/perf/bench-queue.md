@@ -693,9 +693,8 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    body persist) and the exec thread's (checkpoint upkeep, freeze, flush handoff, settle wait), plus RocksDB write /
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
-   **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). Queue (s131): 8s and 8u done; **8v now**, then 8l (from scratch), 8t, then the RH4 rerun (8w). Section 105 (8u)
-   must add native blocks/s, block p50 / p99 and CPU-s per 1M fills (B / A) for the L3.3 default-on call (analysis
-   only, alongside 8v).
+   **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l done; **8t running**, then **8x** (b1 screen), **8y** (L3.1 A/B),
+   then 8w (RH4 rerun). Run them back to back.
    **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
    merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
    1.086, p50 0.884 on the deep book), so their baselines shift slightly vs older sections: compare against
@@ -709,7 +708,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    timer on main). A1 aims at the right mechanism (87 judged the put by its mean, the gap is its tail); cheaper:
    write the manifest outside the state DB's write queue or off the consensus thread. Missing: timers on the put and
    the commit handler, a checkpoint DB-write start / end line. Gaps 14-19 s (`end_pass=0`, switched too late).**
-8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8v; ~1 h 50). 8r (section 103.6): the
+8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8y; ~1 h 50). 8r (section 103.6): the
    cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
    `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
    `a0181b8b`, pushed, not merged; Codex torus review: no findings): `TORUS_PRUNE_MODE=filter` (default) saves the
@@ -722,6 +721,32 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `cf_block_bodies` L0 count, SSTs / bytes dropped whole, on-disk size at cell end. Verdicts: B vs A (retention
    within noise: p50, blocks/s, CPU per fill?) and C vs A (does 8r's cost reproduce on this binary?). Prune-by-default
    and the RH4 merge wait on this.
+8x. **b1 screen: mode 3 with checkpoints, book write off the exec thread** (owner s131; after 8t; ~50 min, then ~2 h
+   A/B if it passes). 8s (section 104): b0 (pass 2 on E when checkpoints are on) moved the ~20-22 ms/blk write half
+   onto the saturated exec thread: deep native blocks/s mode 3 / Classic 2.16x (8p) -> 1.28x, shallow p50 14 -> 136 ms.
+   b1 keeps pass 2 on the flush worker W, reading through `window.side`; checkpoint = L + side + marker in one batch.
+   **One binary** `perf/mode3-b1` `ab4ded4e` (on option 0 `f8a45a2d` + b0; Codex torus review: no findings; nextest
+   4196/4196), code defaults, 512 KB from `env.sh`, custody 0, `TORUS_CHECKPOINT_MAX_BYTES` unset (a cap with mode 2/3
+   refuses to start). Arms, all this binary: **C** = Classic, 15 s checkpoints; **F** = `TORUS_BOOK_ROWS=3` with
+   checkpoints off (`TORUS_CHECKPOINT_INTERVAL_MS=0`: 8p's per-block-flush mode 3, the in-campaign target); **B1** =
+   `TORUS_BOOK_ROWS=3` with 15 s checkpoints. Note: this binary predates L3.3's merge, so C is Classic without L3.3.
+   Shapes: shallow (standard load) and deep (8i P1M); warm-up, then one 300 s cell per arm per shape (C F B1 per
+   shape). Report: native blocks/s, matched/s, block p50 / p99, exec-thread and W busy, exec on-CPU ms per 1k fills,
+   CPU-s per 1M fills, `exec_save_books_write_seconds` vs `torus_flush_worker_save_books_write_seconds` (E's write
+   share = total minus W's), checkpoints per node, any fail-stop / tripwire line (must be 0). **Pass:** deep B1/C
+   blocks/s near F/C; shallow B1 >= F on blocks/s and p50; B1 CPU per fill no worse than b0's +8.9% vs Classic
+   (section 104); E's write share ~0. If it passes: C vs B1 full A/B, n = 3 per shape (~2 h), right after.
+8y. **L3.1 A/B: Classic book save once per checkpoint window** (owner s131; after 8x; ~1 h 30). Classic encodes every
+   dirty book's whole blob each block (`save_order_books` 78.9 ms per block at P1M). L3.1 skips the per-block encode and
+   encodes each owed book once at every window close. **One binary** `perf/l31-coalesced-save` `b7bb3666` (on option 0
+   `f8a45a2d` + L3.3 cherry-pick `7d1c2510` + L3.1 `54fbc7f6` + liquidation-step timer `b7bb3666`; Codex torus review:
+   no findings; nextest 4197/4197). Running state hash OFF (L3.1 refuses to run with any activation height), 15 s
+   checkpoints, `TORUS_CHECKPOINT_MAX_BYTES` unset (a cap keeps L3.1 off). Arms: **A** = `TORUS_BOOK_FAST_ENCODE=1`;
+   **B** = A + `TORUS_BOOK_COALESCE=1` (check the startup log says on). Shapes: deep (8i P1M) and standard, A B B A per
+   shape (n = 2), 300 s cells. Report: native blocks/s, matched/s, block p50 / p99, exec on-CPU ms per 1k fills, CPU-s
+   per 1M fills, `exec_save_books_seconds`, the window-close spike (`torus_exec_book_coalesce_close_seconds` and
+   `_close_books`; design estimate ~56 ms at P1M), `_skipped`, the new `torus_exec_liquidation_step_seconds` (8u's open
+   question), and `torus_exec_resident_rebuilds` (must stay 1). Verdict under the exec-path merge rule.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
