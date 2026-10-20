@@ -17,3 +17,14 @@ fail-fast = false
 [[profile.default.overrides]]
 filter = "test(update_view_on_schedule_keeps_cumulative_deadline)"
 retries = 2
+
+# RH4 GC fence: asserts a one-hash pin's wall-clock wait while a full fence
+# releases (bounded lock holds). Other tests on every core can preempt the
+# releasing thread mid-chunk and stretch the wait 10-100x; run it alone.
+[[profile.default.overrides]]
+filter = "test(a_pin_waits_at_most_one_release_chunk)"
+threads-required = "num-cpus"
+
+[[profile.ci.overrides]]
+filter = "test(a_pin_waits_at_most_one_release_chunk)"
+threads-required = "num-cpus"

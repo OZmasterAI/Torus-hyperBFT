@@ -4046,6 +4046,76 @@ mod tests {
         handle.stop().unwrap();
     }
 
+    /// s132: with `TORUS_PRUNE_MODE=filter` the pruned rows stay on disk
+    /// until a compaction drops them; the body RPCs must answer exactly as
+    /// with the eager range delete, heights just below the cutoff included.
+    #[tokio::test]
+    async fn pruned_history_rpcs_answer_identically_in_range_and_filter_mode() {
+        use jsonrpsee::core::client::ClientT;
+        use std::sync::atomic::AtomicU64;
+        use torus_state::prune_filter::PruneMode;
+        use torus_state::{PrunerConfig, StatePruner};
+        let mut answers = Vec::new();
+        for mode in [PruneMode::Range, PruneMode::Filter] {
+            let dir = TempDir::new().unwrap();
+            let state = StateDb::open_with_prune_mode(dir.path(), mode).unwrap();
+            let body = TorusBlockBody {
+                native_actions: vec![],
+                evm_transactions: vec![],
+                core_writer_actions: vec![],
+            };
+            for h in 1..=12u64 {
+                store_header(&state, &test_header(h, 0, 1_000_000_000));
+                store_body(&state, h, &body);
+                state
+                    .put_cf_raw(
+                        torus_state::cf::CF_BLOCK_ACTION_STATUS,
+                        &h.to_be_bytes(),
+                        &torus_state::action_status::BlockActionStatus::default().encode(),
+                    )
+                    .unwrap();
+            }
+            store_applied_height(&state, 12);
+            let cfg = PrunerConfig {
+                retention_blocks: 4,
+                prune_interval_blocks: 1,
+                batch_size: 3,
+                trade_retention_blocks: None,
+            };
+            let mut pruner = StatePruner::new(state.clone(), cfg, Arc::new(AtomicU64::new(0)));
+            assert_eq!(pruner.maybe_prune(12).unwrap(), 8, "cutoff 8");
+            let cf = state.cf_handle(CF_BLOCK_BODIES).unwrap();
+            let on_disk = state.inner().get_cf(cf, 7u64.to_be_bytes()).unwrap().is_some();
+            assert_eq!(on_disk, mode == PruneMode::Filter, "{mode:?}: height 7 on disk");
+
+            let mempool = Arc::new(Mempool::new(state.clone(), MempoolConfig::default()));
+            let executor = Arc::new(EvmExecutor::new(TORUS_CHAIN_ID));
+            let (handle, addr) = start_server(state, mempool, executor).await;
+            let client = jsonrpsee::http_client::HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap();
+            let mut got = Vec::new();
+            for h in 1..=12u64 {
+                let body: serde_json::Value = client
+                    .request("torus_getBlockBody", jsonrpsee::rpc_params![h])
+                    .await
+                    .unwrap();
+                assert_eq!(body.is_null(), h < 8, "{mode:?}: body {h}");
+                got.push(body);
+                let block: Result<serde_json::Value, _> = client
+                    .request(
+                        "eth_getBlockByNumber",
+                        jsonrpsee::rpc_params![format!("{h:#x}"), true],
+                    )
+                    .await;
+                got.push(block.unwrap_or_else(|e| serde_json::Value::String(e.to_string())));
+            }
+            handle.stop().unwrap();
+            answers.push(got);
+        }
+        assert_eq!(answers[0], answers[1], "range vs filter answers");
+    }
+
     /// s84 decision 1: `torus_getBlockBody` reports each native action's and
     /// EVM tx's executed/skipped status from the block's record; `null` until
     /// the block executed (no record yet); empty lists for a block without

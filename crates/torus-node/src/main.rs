@@ -1389,7 +1389,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .with_trades_pruned_handle(trades_pruned_handle);
         let latest_for_pruner = latest_height_handle.clone();
         let metrics_for_pruner = metrics.clone();
+        let prune_cutoff = state_db.prune_cutoff().clone();
+        info!(
+            prune_mode = ?prune_cutoff.mode(),
+            filter_cutoff = pruner.filter_cutoff(),
+            "state pruner mode (TORUS_PRUNE_MODE)"
+        );
+        metrics.pruner_filter_cutoff.set(pruner.filter_cutoff() as i64);
         tokio::spawn(async move {
+            let (mut files_seen, mut rows_seen) = (0u64, 0u64);
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
@@ -1415,6 +1423,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                 };
+                // s132: filter-mode counters (deltas of the running totals).
+                let files = pruner.files_dropped_total();
+                metrics_for_pruner
+                    .pruner_files_dropped
+                    .inc_by(files.saturating_sub(files_seen));
+                files_seen = files;
+                let rows = prune_cutoff.filter_rows_dropped();
+                metrics_for_pruner
+                    .pruner_filter_rows_dropped
+                    .inc_by(rows.saturating_sub(rows_seen));
+                rows_seen = rows;
+                metrics_for_pruner
+                    .pruner_filter_cutoff
+                    .set(pruner.filter_cutoff() as i64);
                 match res {
                     Ok(0) => {}
                     Ok(n) => {
