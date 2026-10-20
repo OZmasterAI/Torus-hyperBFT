@@ -1,7 +1,8 @@
 //! 8k L3.3 microbench: the Classic whole-book encode, `borsh::to_vec(book)`
-//! (today's `save_order_books` Classic arm) vs `OrderBook::encode_classic`
-//! (`TORUS_BOOK_FAST_ENCODE=1`: one allocation sized from the cloid index,
-//! one copy per resting order) vs `encode_classic_size_pass` (the ranker's
+//! (`save_order_books`' Classic arm with `TORUS_BOOK_FAST_ENCODE=0`) vs
+//! `OrderBook::encode_classic` (the default since s131: one allocation sized
+//! from the cloid index, one copy per resting order) vs
+//! `encode_classic_size_pass` (the ranker's
 //! spec: an exact size pass over every order first), jemalloc as the global
 //! allocator as in the node.
 //!
