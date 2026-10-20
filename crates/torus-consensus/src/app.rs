@@ -1321,7 +1321,8 @@ struct ExecutionContext {
     /// flight C and the window bookkeeping (E-only; the mutex is
     /// uncontended). Unused while `checkpoint` is `None`.
     ckpt: std::sync::Mutex<CkptState>,
-    /// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, default off): pipelined
+    /// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, requested by default since
+    /// s131; `0` = off): pipelined
     /// blocks with resident Classic books skip the per-block whole-book
     /// encode; each window close encodes the window's dirty books once
     /// (`CkptState::unsaved`). Set by [`Self::configure_book_coalesce`]
@@ -3507,8 +3508,26 @@ impl ExecutionContext {
     /// `consensus.state_hash_activation_height`; with the hash on, h_n needs
     /// every block's book bytes, so this needs L6.1 first) and the process's
     /// book settings ([`torus_bridge::native_executor::book_coalesce_blocker`]).
-    /// Otherwise warns once with the reason and stays off.
+    /// Otherwise warns once with the reason and stays off. Requested by
+    /// default since s131 (perf doc section 110): unset / empty / `1` /
+    /// `true`; `0` / `false` turn it off without a log line.
     fn configure_book_coalesce(&mut self, requested: bool, hash_activation: Option<u64>) {
+        self.configure_book_coalesce_with(
+            requested,
+            hash_activation,
+            torus_bridge::native_executor::book_coalesce_blocker(),
+        );
+    }
+
+    /// [`Self::configure_book_coalesce`] with the process's book-settings
+    /// blocker passed in (`book_blocker`: `book_coalesce_blocker()` in
+    /// production; tests pass `book_coalesce_blocker_for(..)`).
+    fn configure_book_coalesce_with(
+        &mut self,
+        requested: bool,
+        hash_activation: Option<u64>,
+        book_blocker: Option<&'static str>,
+    ) {
         self.book_coalesce = false;
         if !requested {
             return;
@@ -3524,13 +3543,14 @@ impl ExecutionContext {
         } else if hash_activation.is_some() {
             Some("the running state hash is configured (genesis state_hash_activation_height)")
         } else {
-            torus_bridge::native_executor::book_coalesce_blocker()
+            book_blocker
         };
         match blocker {
             Some(reason) => tracing::warn!(
                 reason,
                 ?hash_activation,
-                "TORUS_BOOK_COALESCE=1 ignored: L3.1 coalesced Classic book save stays OFF"
+                "TORUS_BOOK_COALESCE requested (on by default; 0 = off) but a precondition fails: \
+                 L3.1 coalesced Classic book save stays OFF"
             ),
             None => {
                 tracing::info!("TORUS_BOOK_COALESCE: L3.1 coalesced Classic book save ON (one encode per dirty book per checkpoint window)");
@@ -39064,6 +39084,96 @@ mod crash_recovery_tests {
         assert_write_sets_equal(&off.captured, &on.captured, "L3.1 requested, hash on");
         assert_eq!(off.hash, on.hash, "running hash");
         assert_dumps_equal(&off.dump, &on.dump, "L3.1 requested, hash on");
+    }
+
+    /// 8k L3.1 default ON (owner s131, perf doc section 110): with
+    /// `TORUS_BOOK_COALESCE` unset the startup gate turns L3.1 on where every
+    /// precondition holds (checkpoint interval, no byte cap, running hash not
+    /// configured, Classic + resident books + the untouched-block advance),
+    /// with no warning; when any one fails it stays off with exactly ONE
+    /// warning naming the reason. `0` is off without a log line.
+    #[test]
+    fn l31_on_by_default_where_preconditions_hold() {
+        use torus_bridge::native_executor::{book_coalesce_blocker_for, BookMode};
+        let default = crate::exec_pipeline::parse_book_coalesce(None);
+        assert!(default, "TORUS_BOOK_COALESCE unset: requested");
+        let (config, db) = p2_fixture();
+        let mut ctx = make_exec_ctx(&config, &db);
+        let classic = book_coalesce_blocker_for(BookMode::Classic, true, true);
+        assert_eq!(classic, None, "Classic + resident + advance: no blocker");
+        let capped = crate::exec_pipeline::CheckpointPolicy {
+            max_bytes: Some(256 << 20),
+            ..ckpt_every(5)
+        };
+        let warns = |logs: &str| {
+            logs.lines()
+                .filter(|l| l.contains("WARN") && l.contains("TORUS_BOOK_COALESCE"))
+                .count()
+        };
+        // (checkpoint, hash activation, book blocker, reason fragment)
+        let blocked: Vec<(
+            Option<crate::exec_pipeline::CheckpointPolicy>,
+            Option<u64>,
+            Option<&'static str>,
+            &str,
+        )> = vec![
+            (None, None, classic, "no checkpoint interval"),
+            (Some(capped), None, classic, "byte cap"),
+            (Some(ckpt_every(5)), Some(1), classic, "running state hash"),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::LevelAuthorityChunked, true, true),
+                "not Classic",
+            ),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::OrderRows, true, true),
+                "not Classic",
+            ),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::Classic, false, true),
+                "resident books are off",
+            ),
+            (
+                Some(ckpt_every(5)),
+                None,
+                book_coalesce_blocker_for(BookMode::Classic, true, false),
+                "untouched-block advance is off",
+            ),
+        ];
+        for (ckpt, hash, book, reason) in blocked {
+            ctx.checkpoint = ckpt;
+            ctx.book_coalesce = true;
+            let logs = capture_logs(|| ctx.configure_book_coalesce_with(default, hash, book));
+            assert!(!ctx.book_coalesce, "{reason}: stays off");
+            assert_eq!(warns(&logs), 1, "{reason}: one warning\n{logs}");
+            assert!(logs.contains(reason), "{reason}: named\n{logs}");
+            assert!(!logs.contains("save ON"), "{reason}\n{logs}");
+        }
+        // Every precondition holds: on, no warning, the ON line once (bench
+        // harnesses grep for it).
+        for ckpt in [ckpt_every(5), ckpt_never()] {
+            ctx.checkpoint = Some(ckpt);
+            let logs = capture_logs(|| ctx.configure_book_coalesce_with(default, None, classic));
+            assert!(ctx.book_coalesce, "preconditions hold: on by default");
+            assert_eq!(warns(&logs), 0, "{logs}");
+            assert_eq!(
+                logs.matches("L3.1 coalesced Classic book save ON").count(),
+                1,
+                "{logs}"
+            );
+        }
+        // `0` / `false`: the kill switch, silent.
+        for v in ["0", "false"] {
+            let requested = crate::exec_pipeline::parse_book_coalesce(Some(v));
+            let logs = capture_logs(|| ctx.configure_book_coalesce_with(requested, None, classic));
+            assert!(!ctx.book_coalesce, "{v}: off");
+            assert!(!logs.contains("TORUS_BOOK_COALESCE"), "{v}: silent\n{logs}");
+        }
     }
 
     /// 8k L3.1 (e), mutation: a close that skips its coalesced encode (the
