@@ -663,6 +663,7 @@ impl Network for LibP2PNetwork {
     }
 
     fn broadcast(&mut self, message: Message) {
+        crate::swarm::note_advance_view_queued(&message);
         let _ = self.command_tx.send(NetworkCommand::Broadcast { message });
     }
 

@@ -29,7 +29,10 @@ use crate::{
         receiving::{ProgressMessageReceiveError, ProgressMessageStub},
         sending::SenderHandle,
     },
-    pacemaker::implementation::{boot_view, Pacemaker, PacemakerConfiguration, ViewInfo},
+    pacemaker::{
+        implementation::{boot_view, Pacemaker, PacemakerConfiguration, ViewInfo},
+        messages::PacemakerMessage,
+    },
     types::data_types::{BufferSize, ChainID, ViewNumber},
 };
 
@@ -341,11 +344,13 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
             Some(due) => std::cmp::min(recv_deadline, due),
             None => recv_deadline,
         };
+        crate::qc_advance_timers::recv_begin();
         let received = if body_before_expiry {
             self.pm_stub.recv_before_body_retry(self.chain_id, view_info.view, recv_deadline)
         } else {
             self.pm_stub.recv(self.chain_id, view_info.view, recv_deadline)
         };
+        crate::qc_advance_timers::recv_end();
         match received {
             Ok((origin, msg)) => match msg {
                 ProgressMessage::HotStuffMessage(msg) => {
@@ -373,8 +378,12 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                     if let Some(view) = self.hotstuff.take_leader_skip() {
                         self.skip_to_leader_view(view);
                     }
+                    crate::qc_advance_timers::msg_handled();
                 }
                 ProgressMessage::PacemakerMessage(msg) => {
+                    let is_advance_view = matches!(msg, PacemakerMessage::AdvanceView(_));
+                    crate::qc_advance_timers::pacemaker_msg_received(&origin, is_advance_view);
+                    let view_before = self.pacemaker.query().view;
                     if let Err(e) =
                         self.pacemaker
                             .on_receive_msg(msg, &origin, &mut self.block_tree)
@@ -384,6 +393,11 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                             e
                         );
                     }
+                    crate::qc_advance_timers::pacemaker_msg_handled(
+                        &origin,
+                        is_advance_view,
+                        self.pacemaker.query().view > view_before,
+                    );
                 }
                 ProgressMessage::BlockSyncAdvertiseMessage(msg) => {
                     if let Err(e) = self.block_sync_client.on_receive_msg(
@@ -396,6 +410,7 @@ impl<N: Network + 'static, K: KVStore, A: App<K> + 'static> Algorithm<N, K, A> {
                             e
                         );
                     }
+                    crate::qc_advance_timers::msg_handled();
                 }
             },
             Err(ProgressMessageReceiveError::Disconnected) => {

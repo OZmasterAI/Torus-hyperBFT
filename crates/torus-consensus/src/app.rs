@@ -8614,6 +8614,8 @@ impl App<RocksKVStore> for TorusApp {
         };
 
         let datum_bytes = datum.bytes();
+        // s131 qc_to_advance timers: per-block steps of this callback.
+        let decode_timer = std::time::Instant::now();
         // The HEADER is always in the datum; only CompactBlock BODIES need the DA
         // store. Extract the header up front and advance last_header from it
         // UNCONDITIONALLY (below) so a missing body can never freeze consensus
@@ -8664,6 +8666,11 @@ impl App<RocksKVStore> for TorusApp {
         };
 
         let height = header.height;
+        if let Some(ref m) = self.metrics {
+            m.qc_advance
+                .commit_feed_decode_seconds
+                .observe(decode_timer.elapsed().as_secs_f64());
+        }
 
         // Item 7 step 1: EVM txs of our own proposals that lost at this height
         // go back to the pool.
@@ -8675,9 +8682,11 @@ impl App<RocksKVStore> for TorusApp {
         // Item 7 step 2 (decision 7): the in-flight filter (every commit, also to expire entries).
         // The lost-proposal reinsert and the re-send follow below, once this header's N and M
         // are in the prediction.
+        let evm_timer = std::time::Instant::now();
         if let Some(ref mempool) = self.mempool {
             mempool.remove_committed_evm(height, committed_evm);
         }
+        let mut evm_secs = evm_timer.elapsed().as_secs_f64();
         // Decision 9 (Codex P2 on 6bcbec7e): this block's txs are out of the pool now, so the
         // proposal walk ([`TreeAncestry`]) can stop here (re-deliveries come in ascending order).
         self.fed_hotstuff_height = self.fed_hotstuff_height.max(Some(block.height.int()));
@@ -8714,7 +8723,13 @@ impl App<RocksKVStore> for TorusApp {
         // durable (`dispatch_to_exec`). Without this, a SIGKILL in the
         // commit->persist window strands the hole with no way to pull bodies
         // (`missing=0`, t12-r3-full h1165).
+        let manifest_timer = std::time::Instant::now();
         persist_commit_manifest(&self.state_db, height, datum_bytes);
+        if let Some(ref m) = self.metrics {
+            m.qc_advance
+                .commit_feed_manifest_seconds
+                .observe(manifest_timer.elapsed().as_secs_f64());
+        }
 
         // Committed: these hashes leave the in-flight window. The mempool prunes
         // them via `remove_committed_native` when the block actually executes.
@@ -8742,8 +8757,13 @@ impl App<RocksKVStore> for TorusApp {
         // C6: tracking before the update targeted a boundary's lost txs under the old N). A
         // re-delivery below the exec frontier returned above: that height was settled at its
         // first delivery.
+        let evm_timer = std::time::Instant::now();
         self.reinsert_lost_evm(height, committed_evm);
         self.resend_due_evm(height);
+        evm_secs += evm_timer.elapsed().as_secs_f64();
+        if let Some(ref m) = self.metrics {
+            m.qc_advance.commit_feed_evm_seconds.observe(evm_secs);
+        }
 
         // Slashes detected during THIS commit ride with THIS block into the
         // strict-order queue (applied when the block executes, in order).
@@ -8752,7 +8772,13 @@ impl App<RocksKVStore> for TorusApp {
         // Regime-B strict-order execution: hand blocks to the pipeline strictly in
         // ascending height with no gaps. A missing-body block becomes a head-of-line
         // hole; every later committed block waits behind it until it heals.
+        let enqueue_timer = std::time::Instant::now();
         self.enqueue_for_execution(height, source, slashes);
+        if let Some(ref m) = self.metrics {
+            m.qc_advance
+                .commit_feed_enqueue_seconds
+                .observe(enqueue_timer.elapsed().as_secs_f64());
+        }
     }
 
     /// MonadBFT B3: Handle speculative rollback due to leader equivocation.
@@ -9481,6 +9507,9 @@ impl TorusApp {
                 m.exec_queue_depth.inc();
             }
             self.exec_queue_len.fetch_add(1, Ordering::Relaxed);
+            // s131: time in the exec channel send (blocking mode: blocked on a
+            // full queue). Observed on success only.
+            let send_timer = std::time::Instant::now();
             if nonblocking_exec_dispatch() {
                 match tx.try_send(msg) {
                     Ok(()) => {}
@@ -9550,6 +9579,11 @@ impl TorusApp {
                     "execution pipeline channel closed — FAIL-STOP: halting block production, voting, and finalization"
                 );
                 return DispatchOutcome::Failed;
+            }
+            if let Some(ref m) = self.metrics {
+                m.qc_advance
+                    .exec_dispatch_send_seconds
+                    .observe(send_timer.elapsed().as_secs_f64());
             }
             // In the channel: its count now rides the block. No-op with the
             // knob off.
