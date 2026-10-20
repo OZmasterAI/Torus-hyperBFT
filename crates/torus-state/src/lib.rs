@@ -45,7 +45,10 @@ pub use db::{
 };
 pub use error::StateError;
 pub use evm_block_state::{EvmBlockState, LayeredEvmDb};
-pub use native_da::{DaReadTiming, NativeDaStore};
+pub use native_da::{
+    DaGcHistory, DaGcHoldReason, DaGcLimits, DaGcOutcome, DaGcPassStats, DaReadTiming,
+    NativeDaStore, NoDaGcHistory,
+};
 pub use overlay::StateOverlay;
 pub use pruner::{dir_size_bytes, read_trades_pruned_height, PrunerConfig, StatePruner};
 pub use read_view::ReadView;

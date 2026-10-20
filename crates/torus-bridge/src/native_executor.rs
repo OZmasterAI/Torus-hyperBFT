@@ -627,25 +627,18 @@ pub fn parse_settle_defer_results(v: Option<&str>) -> bool {
     on_by_default_flag("TORUS_SETTLE_DEFER_RESULTS", v)
 }
 
-/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, OFF by default): pure
-/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
-/// `false` = off; anything else is warned and off.
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, ON by default since s131,
+/// perf doc section 105): pure parse (`on_by_default_flag`). `0` or `false`
+/// (trimmed, any case) = off; unset, empty, `1` or `true` = on; anything
+/// else is warned and on.
+///
+/// Classic book mode only (`TORUS_BOOK_ROWS` unset or `0`): modes 1, 2 and 3
+/// never call the Classic encoder, so the flag does nothing there. If the
+/// testnet genesis picks mode 3 (pending bench 8p and the owner's book-mode
+/// decision), remove this flag and `encode_classic` in a cleanup.
 #[doc(hidden)]
 pub fn parse_book_fast_encode(v: Option<&str>) -> bool {
-    let Some(v) = v else {
-        return false;
-    };
-    match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
-        _ => {
-            tracing::warn!(
-                value = v,
-                "TORUS_BOOK_FAST_ENCODE: not empty, 1, true, 0 or false (any case); using the default (off)"
-            );
-            false
-        }
-    }
+    on_by_default_flag("TORUS_BOOK_FAST_ENCODE", v)
 }
 
 thread_local! {
@@ -677,12 +670,13 @@ pub fn book_fast_encodes_on_this_thread() -> u64 {
     BOOK_FAST_ENCODES.with(std::cell::Cell::get)
 }
 
-/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE=1`, node-local, off by default): the
-/// Classic save encodes each dirty book with `OrderBook::encode_classic`
-/// (one allocation sized from the book's counts, one copy per resting order)
-/// instead of `borsh::to_vec` (1 KiB start, doubling: the blob is copied on
-/// every growth). Same bytes (proptest `classic_encode_tests`). The thread's
-/// pin if set, else the env read once per process.
+/// 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, node-local, on by default; `0` turns
+/// it off): the Classic save encodes each dirty book with
+/// `OrderBook::encode_classic` (one allocation sized from the book's counts,
+/// one copy per resting order) instead of `borsh::to_vec` (1 KiB start,
+/// doubling: the blob is copied on every growth). Same bytes (proptest
+/// `classic_encode_tests`). The thread's pin if set, else the env read once
+/// per process.
 fn book_fast_encode_enabled() -> bool {
     if let Some(on) = BOOK_FAST_ENCODE_PIN.with(std::cell::Cell::get) {
         return on;
@@ -713,14 +707,18 @@ mod book_fast_encode_flag_tests {
         BOOK_FAST_ENCODE_PIN,
     };
 
-    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    /// On by default (s131, bench 8u section 105): unset, empty, `1` /
+    /// `true` and garbage (warned) are on; only `0` / `false` (trimmed, any
+    /// case) turn it off.
     #[test]
-    fn parse_off_by_default() {
-        assert!(!parse_book_fast_encode(None));
-        for v in ["1", " 1", "1\n", "true", "TRUE", " True "] {
+    fn parse_on_by_default() {
+        assert!(parse_book_fast_encode(None));
+        for v in [
+            "", " ", "1", " 1", "1\n", "true", "TRUE", " True ", "2", "on", "yes", "01",
+        ] {
             assert!(parse_book_fast_encode(Some(v)), "{v:?}");
         }
-        for v in ["", " ", "0", "false", "FALSE", "2", "on", "yes", "01"] {
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_book_fast_encode(Some(v)), "{v:?}");
         }
     }
@@ -743,6 +741,137 @@ mod book_fast_encode_flag_tests {
                 .unwrap();
         });
         assert_eq!(pin(), None);
+    }
+}
+
+/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, OFF by default): pure
+/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
+/// `false` = off; anything else is warned and off.
+#[doc(hidden)]
+pub fn parse_settle_no_merge(v: Option<&str>) -> bool {
+    let Some(v) = v else {
+        return false;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => true,
+        "" | "0" | "false" => false,
+        _ => {
+            tracing::warn!(
+                value = v,
+                "TORUS_SETTLE_NO_MERGE: not empty, 1, true, 0 or false (any case); using the default (off)"
+            );
+            false
+        }
+    }
+}
+
+thread_local! {
+    /// 8k L2.2: [`with_settle_no_merge`]'s per-thread pin; `None` = the env.
+    static SETTLE_NO_MERGE_PIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// 8k L2.2: end-of-call flushes on this thread that wrote pass B's
+    /// per-market caches unmerged (tests: proves the flag-on arm took the
+    /// no-merge path).
+    static SETTLE_NO_MERGE_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 8k L2.2: end-of-call flushes on this thread whose runs were not
+    /// provably disjoint, so they were merged in order and `flush_all`-ed
+    /// (the flag-off sequence; also `torus_exec_settle_no_merge_fallbacks`).
+    static SETTLE_NO_MERGE_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 8k L2.2: runs `f` with `TORUS_SETTLE_NO_MERGE` pinned to `on` on this
+/// thread (tests and differential runs: env vars are per process and race
+/// across test threads). Pass B and the end-of-call flush run on the calling
+/// thread, so the pin reaches them. The previous pin comes back when `f`
+/// returns or unwinds.
+#[doc(hidden)]
+pub fn with_settle_no_merge<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SETTLE_NO_MERGE_PIN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SETTLE_NO_MERGE_PIN.with(|c| c.replace(Some(on))));
+    f()
+}
+
+/// 8k L2.2: unmerged end-of-call flushes this thread ran so far.
+#[doc(hidden)]
+pub fn settle_no_merge_flushes_on_this_thread() -> u64 {
+    SETTLE_NO_MERGE_FLUSHES.with(std::cell::Cell::get)
+}
+
+/// 8k L2.2: end-of-call flushes with runs this thread ran so far that fell
+/// back to merge + `flush_all` (runs not provably disjoint).
+#[doc(hidden)]
+pub fn settle_no_merge_fallbacks_on_this_thread() -> u64 {
+    SETTLE_NO_MERGE_FALLBACKS.with(std::cell::Cell::get)
+}
+
+/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`, node-local, off by default): the
+/// parallel settle's pass B keeps each market's plan cache as a run instead
+/// of `merge_disjoint`-ing it into the batch cache, and the end-of-call
+/// flush writes the batch cache and the runs together in the same sorted key
+/// order (`PositionCache::flush_with_runs`): the same writes in the same
+/// order, without moving every entry into one map. The thread's pin if set,
+/// else the env read once per process.
+fn settle_no_merge_enabled() -> bool {
+    if let Some(on) = SETTLE_NO_MERGE_PIN.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = parse_settle_no_merge(std::env::var("TORUS_SETTLE_NO_MERGE").ok().as_deref());
+        tracing::info!(
+            on,
+            "TORUS_SETTLE_NO_MERGE: settle pass B writes per-market position caches unmerged"
+        );
+        on
+    })
+}
+
+#[cfg(test)]
+mod settle_no_merge_flag_tests {
+    use super::{
+        parse_settle_no_merge, settle_no_merge_enabled, with_settle_no_merge, SETTLE_NO_MERGE_PIN,
+    };
+
+    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    #[test]
+    fn parse_off_by_default() {
+        assert!(!parse_settle_no_merge(None));
+        for v in ["1", " 1", "1\n", "true", "TRUE", " True "] {
+            assert!(parse_settle_no_merge(Some(v)), "{v:?}");
+        }
+        for v in ["", " ", "0", "false", "FALSE", "2", "on", "yes", "01"] {
+            assert!(!parse_settle_no_merge(Some(v)), "{v:?}");
+        }
+    }
+
+    /// The pin wins over the env, nests, restores (also on unwind) and stays
+    /// on its thread.
+    #[test]
+    fn pin_overrides_nests_and_restores() {
+        let pin = || SETTLE_NO_MERGE_PIN.with(|c| c.get());
+        assert_eq!(pin(), None);
+        assert_eq!(
+            settle_no_merge_enabled(),
+            parse_settle_no_merge(std::env::var("TORUS_SETTLE_NO_MERGE").ok().as_deref())
+        );
+        with_settle_no_merge(true, || {
+            assert!(settle_no_merge_enabled());
+            with_settle_no_merge(false, || assert!(!settle_no_merge_enabled()));
+            assert_eq!(pin(), Some(true));
+            std::thread::spawn(move || assert_eq!(SETTLE_NO_MERGE_PIN.with(|c| c.get()), None))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(pin(), None);
+        let unwound = std::panic::catch_unwind(|| {
+            with_settle_no_merge(true, || -> () { panic!("inside the pin") })
+        });
+        assert!(unwound.is_err());
+        assert_eq!(pin(), None, "restored on unwind");
     }
 }
 
@@ -8355,6 +8484,12 @@ impl NativeExecutor {
         // read-modify-writes per fill; they hit this map and flush once
         // (sorted keys) at the end of the call.
         let mut pos_cache = PositionCache::new();
+        // 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`): the parallel settle's
+        // per-market position caches, kept unmerged and written with
+        // `pos_cache` by one sorted flush below. Empty with the flag off, on
+        // the sequential path and after a plan-failure fallback.
+        let mut pos_runs: Vec<PositionCache> = Vec::new();
+        let settle_no_merge = settle_no_merge_enabled();
         let mut vol_cache = VolumeCache::default();
 
         // L3-ENG: resolve the engine worker count (0 = serial prepare).
@@ -8782,7 +8917,7 @@ impl NativeExecutor {
                 } => w.max(1),
                 _ => settle_worker_cap(),
             };
-            Self::settle_market_results_parallel(
+            Self::settle_market_results_parallel_runs(
                 ctx,
                 market_results,
                 &market_batches,
@@ -8790,6 +8925,7 @@ impl NativeExecutor {
                 &mut total_gas,
                 &mut bal_cache,
                 &mut pos_cache,
+                settle_no_merge.then_some(&mut pos_runs),
                 &mut vol_cache,
                 settle_workers,
             );
@@ -8815,15 +8951,42 @@ impl NativeExecutor {
         // r6: the two sorted flush_all walks are the tail of Phase 4 and were
         // only ever visible lumped into `exec_phase_settle_seconds`.
         let cache_flush_timer = std::time::Instant::now();
-        // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
+        // Plan 9.8: the per-row reference flushes one merged cache.
         #[cfg(any(test, feature = "test-reference-paths"))]
-        let pos_flushed = if ctx.test_flush_per_row {
-            pos_cache.flush_all_per_row(&ctx.positions)
+        if ctx.test_flush_per_row {
+            for run in pos_runs.drain(..) {
+                pos_cache.merge_disjoint(run);
+            }
+        }
+        // 8k L2.2: pass B's unmerged runs and `pos_cache` in one sorted
+        // flush: the writes and their order are those of merge + flush_all.
+        // Runs not provably disjoint (an opaque row put one market's key in
+        // another market's cache) ARE merged + flush_all-ed, counted here
+        // (decided before any write, so a failing flush is counted too).
+        let pos_flushed = if !pos_runs.is_empty() {
+            if pos_cache.runs_disjoint(&pos_runs) {
+                SETTLE_NO_MERGE_FLUSHES.with(|c| c.set(c.get() + 1));
+            } else {
+                SETTLE_NO_MERGE_FALLBACKS.with(|c| c.set(c.get() + 1));
+                if let Some(ref m) = ctx.metrics {
+                    m.exec_settle_no_merge_fallbacks.inc();
+                }
+            }
+            pos_cache
+                .flush_with_runs(&mut pos_runs, &ctx.positions)
+                .map(|_| ())
         } else {
-            pos_cache.flush_all(&ctx.positions)
+            // Plan 9.8: the test-only per-row reference (P2-2's comparison point).
+            #[cfg(any(test, feature = "test-reference-paths"))]
+            let flushed = if ctx.test_flush_per_row {
+                pos_cache.flush_all_per_row(&ctx.positions)
+            } else {
+                pos_cache.flush_all(&ctx.positions)
+            };
+            #[cfg(not(any(test, feature = "test-reference-paths")))]
+            let flushed = pos_cache.flush_all(&ctx.positions);
+            flushed
         };
-        #[cfg(not(any(test, feature = "test-reference-paths")))]
-        let pos_flushed = pos_cache.flush_all(&ctx.positions);
         if let Err(e) = pos_flushed {
             ctx.fatal_error = Some(format!("position cache flush failed: {e}"));
         }
@@ -9550,6 +9713,7 @@ impl NativeExecutor {
     /// already computed them. R02 branch 6a: such a read is a local fault
     /// and both modes fail-stop the block on it (same step), so neither
     /// post-state is ever flushed.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn settle_market_results_parallel<T: StateBackend>(
         ctx: &mut NativeExecContext<T>,
@@ -9559,6 +9723,41 @@ impl NativeExecutor {
         total_gas: &mut u64,
         bal_cache: &mut BalanceCache,
         pos_cache: &mut PositionCache,
+        vol_cache: &mut VolumeCache,
+        max_workers: usize,
+    ) {
+        Self::settle_market_results_parallel_runs(
+            ctx,
+            market_results,
+            market_batches,
+            results,
+            total_gas,
+            bal_cache,
+            pos_cache,
+            None,
+            vol_cache,
+            max_workers,
+        )
+    }
+
+    /// `settle_market_results_parallel`; 8k L2.2: with `pos_runs`
+    /// (`TORUS_SETTLE_NO_MERGE=1`) pass B pushes each market's plan cache
+    /// onto it, in market order, instead of merging it into `pos_cache`; the
+    /// caller writes both with `PositionCache::flush_with_runs`. Nothing in
+    /// pass B reads `pos_cache` (C1: positions flush at the end of the
+    /// call), so only where the entries sit changes. A plan-failure fallback
+    /// runs the sequential loop into `pos_cache` and leaves `pos_runs`
+    /// empty.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_market_results_parallel_runs<T: StateBackend>(
+        ctx: &mut NativeExecContext<T>,
+        market_results: Vec<crate::market_workers::MarketBatchResult>,
+        market_batches: &HashMap<MarketId, Vec<PreparedOrder<'_>>>,
+        results: &mut [NativeActionResult],
+        total_gas: &mut u64,
+        bal_cache: &mut BalanceCache,
+        pos_cache: &mut PositionCache,
+        mut pos_runs: Option<&mut Vec<PositionCache>>,
         vol_cache: &mut VolumeCache,
         max_workers: usize,
     ) {
@@ -9736,7 +9935,11 @@ impl NativeExecutor {
         // One allocation for every market's position entries: merging 300
         // caches into an unreserved map rehashes it at each doubling
         // (capacity only; ubench_position_cache: ~1.2 -> ~0.7 us/entry).
-        pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum());
+        // 8k L2.2: with runs, no merge, so no reserve either.
+        match pos_runs.as_deref_mut() {
+            Some(runs) => runs.reserve(plans.len()),
+            None => pos_cache.reserve(plans.iter().map(|p| p.pos_cache.len()).sum()),
+        }
         // s58 (`TORUS_SETTLE_DEFER_RESULTS=1`): each placed order's book
         // reject, by flat index (`Some` = placed here, written after the
         // market loop). 1 byte per action (`FailureReason` is a Copy u8
@@ -9761,7 +9964,11 @@ impl NativeExecutor {
 
             // This market's position mutations become part of the batch cache
             // (disjoint keys across markets; single sorted flush at call end).
-            pos_cache.merge_disjoint(plan.pos_cache);
+            // 8k L2.2: or a run, flushed with it in the same key order.
+            match pos_runs.as_deref_mut() {
+                Some(runs) => runs.push(plan.pos_cache),
+                None => pos_cache.merge_disjoint(plan.pos_cache),
+            }
 
             let prepared = match market_batches.get(&market_id) {
                 Some(p) => p,
@@ -14321,17 +14528,56 @@ pub type IndexedActions = (Vec<(Address, NativeAction)>, Vec<u32>);
 pub fn sort_native_actions_indexed(
     actions: Vec<(Address, NativeAction)>,
 ) -> (IndexedActions, IndexedActions) {
+    sort_keyed(actions.into_iter().enumerate().map(|(i, (sender, action))| {
+        (action_sort_key(&sender, &action), i as u32, (sender, action))
+    }))
+}
+
+/// Split keyed entries (in input order) into the pre-EVM and post-EVM lists
+/// and sort each one deterministically.
+fn sort_keyed(entries: impl Iterator<Item = KeyedAction>) -> (IndexedActions, IndexedActions) {
     let mut pre_evm = Vec::new();
     let mut post_evm = Vec::new();
-    for (i, (sender, action)) in actions.into_iter().enumerate() {
-        let key = action_sort_key(&sender, &action);
-        let entry = (key, i as u32, (sender, action));
-        match key.0 {
+    for entry in entries {
+        match entry.0 .0 {
             ActionCategory::Cancellation | ActionCategory::NonGtcOrder => pre_evm.push(entry),
             _ => post_evm.push(entry),
         }
     }
     (sort_deterministic(pre_evm), sort_deterministic(post_evm))
+}
+
+/// [`sort_native_actions_indexed`] with each action's content hash
+/// (`keccak256(canonical_bytes)`) supplied by the caller: `sort_hashes[i]`
+/// belongs to `actions[i]`. The exec path takes them from the verify pass
+/// (`batch_verify_native_actions_cached_with_sort_hashes`), which absorbs the
+/// canonical bytes once for both the trust-cache key and this hash (section
+/// 92 step 8e). Same keys, same stable sort, so the same lists and positions
+/// as [`sort_native_actions_indexed`]. Debug builds recompute every hash and
+/// assert it. Panics if the lengths differ.
+pub fn sort_native_actions_indexed_with_sort_hashes(
+    actions: Vec<(Address, NativeAction)>,
+    sort_hashes: Vec<B256>,
+) -> (IndexedActions, IndexedActions) {
+    assert_eq!(
+        actions.len(),
+        sort_hashes.len(),
+        "one sort hash per action (caller bug: the hashes would shift)"
+    );
+    sort_keyed(
+        actions
+            .into_iter()
+            .zip(sort_hashes)
+            .enumerate()
+            .map(|(i, ((sender, action), hash))| {
+                debug_assert_eq!(
+                    hash,
+                    alloy_primitives::keccak256(action.canonical_bytes()),
+                    "sort hash of action {i} is not keccak(canonical_bytes)"
+                );
+                ((classify_action(&action), sender, hash), i as u32, (sender, action))
+            }),
+    )
 }
 
 /// Deterministic sort key for a native action.

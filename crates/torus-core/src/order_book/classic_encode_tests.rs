@@ -1,7 +1,8 @@
-//! 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`): `OrderBook::encode_classic` must be
-//! byte-identical to `borsh::to_vec(book)` (the custom `BorshSerialize` impls
-//! of `Order`, `StopOrder` and `OrderBook`) for every book, and
-//! `classic_encoded_len` must be its exact length.
+//! 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, on by default since s131: every Classic
+//! save takes this path unless the flag is `0`): `OrderBook::encode_classic`
+//! must be byte-identical to `borsh::to_vec(book)` (the custom
+//! `BorshSerialize` impls of `Order`, `StopOrder` and `OrderBook`) for every
+//! book, and `classic_encoded_len` must be its exact length.
 
 use super::*;
 use proptest::prelude::*;

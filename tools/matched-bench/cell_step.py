@@ -10,6 +10,8 @@ campaign's archived analysis on it, and appends one row to <RUN_DIR>/cells.tsv.
                       [--analysis-cmd TEMPLATE] [--analysis-key TEMPLATE] [--analysis-metric KEY]
                       [--analysis-timeout S] [--extra-reasons R1,R2] [--no-summary-md5]
   cell_step.py pending-reruns --run-dir RUN
+  cell_step.py analysis-words --run-dir RUN --analysis-cmd TEMPLATE --cell CELL_DIR LABEL TAG ARM [--cell ...]
+      (the campaign preflight: the analysis command's words as `record` runs them for each cell, NUL-terminated)
 
 cells.tsv (fixed contract): header written once, then one row per finished cell,
 tab-separated:  label arm rep rc agree md5_ok metric flag
@@ -88,7 +90,8 @@ QUEUE = "rerun-queue.tsv"
 TSV = "cells.tsv"
 V = ("val0", "val1", "val2")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# crash-kill.sh crash_scan_restart_tail: panics=$(cnt 'panicked|FAIL-STOP|fail-stop|conflicting blocks')
+# Pre-s131 crash-kill.sh crash_scan_restart_tail pattern (no level filter; it counted the INFO
+# `on=false` line). Kept to classify cells summarized before the ERROR-level rule.
 PANIC_RE = re.compile(r"panicked|FAIL-STOP|fail-stop|conflicting blocks")
 BENIGN_FAILSTOP_RE = re.compile(
     r" INFO \S+: running state hash fail-stop \(TORUS_STATE_HASH_FAILSTOP\) on=false\s*$"
@@ -392,40 +395,82 @@ def judge(cell, summary, rc_num, md5ok):
 # ---------------------------------------------------------------- analysis
 
 
+def step_dir_of(run):
+    return os.path.join(run, "cell-step")
+
+
 def fill(tok, ph):
     for k, v in ph.items():
         tok = tok.replace("{" + k + "}", v)
     return tok
 
 
-def run_analysis(a, cell, step_dir):
-    global CHILD
-    out = os.path.join(step_dir, a.label + ".analysis.json")
-    logp = os.path.join(step_dir, a.label + ".analysis.log")
-    if os.path.exists(out):
-        os.remove(out)
+def analysis_out(step_dir, label):
+    return os.path.join(step_dir, label + ".analysis.json")
+
+
+def analysis_argv(cmd, run_dir, cell, label, tag, arm, out):
+    """(placeholders, argv, why): cmd split (shlex.split) and filled as run_analysis runs it; why = the reason
+    it cannot run (argv None). Also the campaign preflight's view of it (analysis-words)."""
     cell_n = os.path.normpath(cell)
-    if not cell_n.endswith(a.tag):
+    if not cell_n.endswith(tag):
         return (
-            "fail",
             None,
-            "cell dir %s does not end with the tag %s (no {prefix})" % (cell_n, a.tag),
+            None,
+            "cell dir %s does not end with the tag %s (no {prefix})" % (cell_n, tag),
         )
     ph = {
         "out": out,
-        "prefix": cell_n[: -len(a.tag)],
-        "tag": a.tag,
-        "arm": a.arm,
-        "label": a.label,
+        "prefix": cell_n[: -len(tag)],
+        "tag": tag,
+        "arm": arm,
+        "label": label,
         "cell": cell_n,
-        "run": os.path.normpath(a.run_dir),
+        "run": os.path.normpath(run_dir),
     }
     try:
-        argv = [fill(t, ph) for t in shlex.split(a.analysis_cmd)]
+        argv = [fill(t, ph) for t in shlex.split(cmd)]
     except ValueError as e:  # e.g. "No closing quotation": a broken command is a failed analysis, not a lost row
-        return "fail", None, "cannot parse the analysis command %r: %s" % (a.analysis_cmd, e)
+        return ph, None, "cannot parse the analysis command %r: %s" % (cmd, e)
     if not argv:
-        return "fail", None, "empty analysis command"
+        return ph, None, "empty analysis command"
+    return ph, argv, None
+
+
+def analysis_words(a):
+    """analysis-words: the words of --analysis-cmd as run_analysis runs it for each --cell (CELL_DIR LABEL TAG
+    ARM), each distinct word once in first-seen order, NUL-terminated on stdout. Exit 1 (reason on stderr,
+    nothing on stdout) when it cannot run for one of them. The campaign preflight notes the script paths in
+    them that are no file before the first cell, advisory only (a script path built from a placeholder is noted
+    as each cell fills it)."""
+    words, seen = [], set()
+    for cell, label, tag, arm in a.cell or []:
+        out = analysis_out(step_dir_of(a.run_dir), label)
+        _ph, argv, why = analysis_argv(
+            a.analysis_cmd, a.run_dir, cell, label, tag, arm, out
+        )
+        if why:
+            sys.stderr.write("cell_step analysis-words: %s: %s\n" % (label, why))
+            return 1
+        for w in argv:
+            if w not in seen:
+                seen.add(w)
+                words.append(w)
+    sys.stdout.write("".join(w + "\0" for w in words))
+    return 0
+
+
+def run_analysis(a, cell, step_dir):
+    global CHILD
+    out = analysis_out(step_dir, a.label)
+    logp = os.path.join(step_dir, a.label + ".analysis.log")
+    if os.path.exists(out):
+        os.remove(out)
+    ph, argv, why = analysis_argv(
+        a.analysis_cmd, a.run_dir, cell, a.label, a.tag, a.arm, out
+    )
+    if why:
+        return "fail", None, why
     t0 = time.time()
     with open(logp, "w") as lf:
         lf.write("# %s\n" % " ".join(shlex.quote(x) for x in argv))
@@ -542,7 +587,7 @@ def record(a):
                 % (name, v),
             )
     os.makedirs(run, exist_ok=True)
-    step_dir = os.path.join(run, "cell-step")
+    step_dir = step_dir_of(run)
     os.makedirs(step_dir, exist_ok=True)
     tsv = os.path.join(run, TSV)
     log = a.campaign_log or os.path.join(run, "campaign.log")
@@ -719,6 +764,12 @@ def main():
     r.add_argument("--no-summary-md5", action="store_true")
     p = sub.add_parser("pending-reruns")
     p.add_argument("--run-dir", required=True)
+    w = sub.add_parser("analysis-words")
+    w.add_argument("--run-dir", required=True)
+    w.add_argument("--analysis-cmd", required=True)
+    w.add_argument(
+        "--cell", nargs=4, action="append", metavar=("CELL_DIR", "LABEL", "TAG", "ARM")
+    )
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGHUP, on_term)
@@ -730,6 +781,8 @@ def main():
         except Exception:  # noqa: BLE001 — distinct code; cell-step.sh writes the bad:step-error row
             traceback.print_exc()
             return 5
+    if a.cmd == "analysis-words":
+        return analysis_words(a)
     return pending(a)
 
 

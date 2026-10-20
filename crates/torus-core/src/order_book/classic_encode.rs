@@ -1,5 +1,6 @@
-//! 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`): an exact-size encoder for the Classic
-//! whole-book blob.
+//! 8k L3.3 (`TORUS_BOOK_FAST_ENCODE`, on by default since s131; `0` or
+//! `false` falls back to `borsh::to_vec`): an exact-size encoder for the
+//! Classic whole-book blob.
 //!
 //! [`OrderBook::encode_classic`] returns the same bytes as
 //! `borsh::to_vec(book)` (the custom `BorshSerialize` impls of `Order`,
@@ -14,6 +15,13 @@
 //!
 //! The layout is the Classic blob's and must never diverge from it: the
 //! `classic_encode_tests` proptest pins the two byte for byte.
+//!
+//! Scope (s131): only the Classic book mode (`TORUS_BOOK_ROWS` unset or `0`)
+//! calls this. Modes 1, 2 and 3 never do. If the testnet genesis picks mode 3
+//! (pending bench 8p and the owner's book-mode decision), this encoder and its
+//! flag are dead code: remove them in a cleanup. Default on since s131 (perf
+//! doc section 105, bench 8u: the exec-engine timer rise of section 97.8 is
+//! not a scheduling artefact; deep book blocks/s 1.086, p99 0.919, n = 1).
 
 use super::*;
 

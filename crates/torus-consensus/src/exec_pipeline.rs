@@ -94,8 +94,9 @@ pub fn epoch_fast_path_explicit() -> bool {
 }
 
 /// Item 7 option 0 (task 3.1, `docs/plans/item7-option0-impl.md`): the EVM
-/// fast path (`TORUS_EVM_FAST_PATH`, node-local, default OFF until bench Q11
-/// passes, read once at startup by `TorusApp::try_new`): a block with EVM
+/// fast path (`TORUS_EVM_FAST_PATH`, node-local, default ON since s131 (bench
+/// Q11, perf doc section 107), read once at startup by `TorusApp::try_new`
+/// and by `torus-node` for the commit prune): a block with EVM
 /// txs takes the pipelined path like a native block. Its EVM part reads
 /// through the block overlay, its EVM rows ride its pending set, its EVM
 /// trie work and its receipts / indices / CoreWriter links move to W. Same
@@ -106,16 +107,17 @@ pub fn evm_fast_path_enabled() -> bool {
     parse_evm_fast_path(std::env::var("TORUS_EVM_FAST_PATH").ok())
 }
 
-/// Pure parse of `TORUS_EVM_FAST_PATH` (default OFF): `1` or `true` = on;
-/// unset, empty, `0` or `false` = off; anything else = OFF with a warning,
-/// so a typo never enables a consensus-timing change.
+/// Pure parse of `TORUS_EVM_FAST_PATH` (default on since s131, as
+/// [`parse_epoch_fast_path`]): unset, empty, `1` or `true` = on; `0` or
+/// `false` = off; anything else = OFF with a warning, so a typo in an
+/// explicit value never silently enables a consensus-timing change.
 pub fn parse_evm_fast_path(raw: Option<String>) -> bool {
     let Some(raw) = raw else {
-        return false;
+        return true;
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
+        "" | "1" | "true" => true,
+        "0" | "false" => false,
         other => {
             tracing::warn!(
                 value = other,
@@ -126,7 +128,9 @@ pub fn parse_evm_fast_path(raw: Option<String>) -> bool {
     }
 }
 
-/// Whether `TORUS_EVM_FAST_PATH` is set at all (the startup log).
+/// Whether `TORUS_EVM_FAST_PATH` is set at all (for the startup log: the
+/// default-on fast path without the exec pipeline is an info line, an
+/// explicit request a warning).
 pub fn evm_fast_path_explicit() -> bool {
     std::env::var_os("TORUS_EVM_FAST_PATH").is_some()
 }
@@ -1604,16 +1608,17 @@ mod tests {
     /// section 84). Unset, empty, `1` / `true` (any case, trimmed) = on;
     /// `0` / `false` = off; anything else = off with a warning, so a typo
     /// never silently enables a consensus-timing change.
-    /// Item 7 option 0 (task 3.1): `TORUS_EVM_FAST_PATH` is OFF by default
-    /// (until Q11). `1` / `true` (any case, trimmed) = on; unset, empty, `0`
-    /// / `false` = off; anything else = off with a warning.
+    /// Item 7 option 0: `TORUS_EVM_FAST_PATH` is ON by default since s131
+    /// (owner, perf doc section 107, bench 8l). Unset, empty, `1` / `true`
+    /// (any case, trimmed) = on; `0` / `false` = off; anything else = off
+    /// with a warning, as `TORUS_EPOCH_FAST_PATH`.
     #[test]
-    fn parse_evm_fast_path_default_off() {
-        assert!(!parse_evm_fast_path(None), "unset: off");
-        for v in ["1", " 1 ", "true", "TRUE", " True "] {
+    fn parse_evm_fast_path_default_on() {
+        assert!(parse_evm_fast_path(None), "unset: on");
+        for v in ["", " ", "1", " 1 ", "true", "TRUE", " True "] {
             assert!(parse_evm_fast_path(Some(v.to_string())), "{v:?}");
         }
-        for v in ["", " ", "0", " 0 ", "false", "FALSE", " False "] {
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_evm_fast_path(Some(v.to_string())), "{v:?}");
         }
         // Garbage: off (warned), never on.

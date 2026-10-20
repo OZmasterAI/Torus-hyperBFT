@@ -21,7 +21,10 @@ use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256};
 use torus_state::backend::StateBackend as _;
-use torus_state::{DaReadTiming, ErasureParams, NativeDaStore, StateDb, StateError, StoredShard};
+use torus_state::{
+    DaGcHistory, DaGcLimits, DaGcOutcome, DaGcPassStats, DaReadTiming, ErasureParams,
+    NativeDaStore, StateDb, StateError, StoredShard,
+};
 use torus_types::SignedNativeAction;
 
 use crate::verified_cache::FifoCache;
@@ -1740,6 +1743,78 @@ impl Mempool {
         self.da_store.get_shard(&hash.0, index).ok().flatten()
     }
 
+    /// RH4: one durable DA body GC pass for a dispatched committed height,
+    /// see [`NativeDaStore::gc_committed_with_history`] (`hashes`: `None` =
+    /// the height's record is unknown, left for the next pass; `keep_from`:
+    /// no row at or above it is deleted; `history` back-fills heights the GC
+    /// has no record for and says whether dispatch is behind its committed
+    /// tip). Best effort: a store error is logged and reads as a held pass
+    /// (`hold_reason` = `StoreError`). The pass's batch did not land, so the
+    /// GC cursor stays behind and the next pass back-fills this height from
+    /// `history` before deleting anything (a failed record is retried, never
+    /// dropped).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gc_committed_native_da(
+        &self,
+        height: u64,
+        hashes: Option<&[B256]>,
+        shard_count: u16,
+        retention: u64,
+        keep_from: u64,
+        limits: DaGcLimits,
+        history: &dyn DaGcHistory,
+    ) -> DaGcOutcome {
+        self.gc_committed_native_da_timed(
+            height,
+            hashes,
+            shard_count,
+            retention,
+            keep_from,
+            limits,
+            history,
+            &mut DaGcPassStats::default(),
+        )
+    }
+
+    /// [`gc_committed_native_da`](Self::gc_committed_native_da), and where
+    /// the pass spent its time ([`DaGcPassStats`], added to `stats`; RH4
+    /// slow-pass observability; a failed pass also sets `stats.error`). The
+    /// same decisions and writes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gc_committed_native_da_timed(
+        &self,
+        height: u64,
+        hashes: Option<&[B256]>,
+        shard_count: u16,
+        retention: u64,
+        keep_from: u64,
+        limits: DaGcLimits,
+        history: &dyn DaGcHistory,
+        stats: &mut DaGcPassStats,
+    ) -> DaGcOutcome {
+        match self.da_store.gc_committed_with_history_timed(
+            height,
+            hashes,
+            shard_count,
+            retention,
+            keep_from,
+            limits,
+            history,
+            stats,
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!(height, "native DA body GC pass failed: {e}");
+                stats.error = Some(e.to_string());
+                DaGcOutcome {
+                    deletion_held: true,
+                    hold_reason: Some(torus_state::DaGcHoldReason::StoreError),
+                    ..DaGcOutcome::default()
+                }
+            }
+        }
+    }
+
     /// Mirror native-action bodies into the durable DA store (proposer guarantee:
     /// every body referenced by a block we propose stays reconstructable).
     /// One atomic WriteBatch + one arrival-notifier wake for the whole block —
@@ -3035,6 +3110,36 @@ mod tests {
             latched(),
             "the 3rd consecutive failure must latch the fail-stop"
         );
+    }
+
+    /// RH4 P3 (claude-review r4): a GC pass the store rejects deleted
+    /// nothing and says so (`store_error`, counted in
+    /// `torus_da_gc_held_passes`), never "nothing to do".
+    #[test]
+    fn gc_committed_native_da_store_error_is_a_held_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(StateDb::open(dir.path()).unwrap());
+        let ro = StateDb::open_read_only(dir.path()).unwrap();
+        let pool = Mempool::with_da_store(
+            ro.clone(),
+            NativeDaStore::new(ro),
+            MempoolConfig::default(),
+        );
+        let limits = DaGcLimits {
+            max_rows: 8,
+            max_deletes: 1024,
+        };
+        let out = pool.gc_committed_native_da(
+            5,
+            Some(&[B256::repeat_byte(7)]),
+            0,
+            4,
+            u64::MAX,
+            limits,
+            &torus_state::NoDaGcHistory,
+        );
+        assert!(out.deletion_held);
+        assert_eq!(out.hold_reason, Some(torus_state::DaGcHoldReason::StoreError));
     }
 
     /// R01b (review): a read-only pool with the fail-stop latch installed, and

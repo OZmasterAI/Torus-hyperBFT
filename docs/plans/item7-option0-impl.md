@@ -1,6 +1,11 @@
 # Implementation Plan: item 7 step 3 option 0, the EVM fast path
 
-Status (s128): PLAN revision 2, nothing built. Design: `docs/plans/item7-step3-design.md` revision 2 (on main;
+Status (s131): **BUILT and MERGED, `TORUS_EVM_FAST_PATH` ON by default** (owner s131). Steps 0-4 (G0-G4) built on
+`feat/item7-option0` (`f8a45a2d`), merged to main via `merge/item7-option0`; bench Q11 (step 8l, perf doc section
+107, n = 4, 25/25 valid) passed: at EVM load flag on vs off exec-thread CPU per 1k fills 0.981 [0.972, 0.991],
+matched/s 1.079, blocks/s 3.53x, p99 0.496x; no EVM load inert; branch flag-off vs main not worse. The default flip
+is its own commit on the merge branch; `TORUS_EVM_FAST_PATH=0` turns it off per node. Plan history: (s128) PLAN
+revision 2, nothing built. Design: `docs/plans/item7-step3-design.md` revision 2 (on main;
 section 7 picks 1-11 accepted by the owner s127). This plan covers option 0 only: design phases P1 and P2 (section 4.1). T (P3) gets
 its own plan after P2 merges; C0 stays parked (design question 6). Format: `item7-step2-impl.md`,
 `item6-phase5-impl.md`.
@@ -56,7 +61,7 @@ P="-p torus-types -p torus-genesis -p torus-bridge -p torus-consensus -p torus-e
 
 ## Design decision (short)
 
-Behind the node-local flag `TORUS_EVM_FAST_PATH` (default off until Q11 passes, then on), a block with EVM txs takes
+Behind the node-local flag `TORUS_EVM_FAST_PATH` (default off until Q11 passes, then on; on since s131), a block with EVM txs takes
 the pipelined path like any native block. Its EVM part reads through the block's layered overlay (own pending ->
 parent -> L -> C -> DB), never the raw DB. Its EVM rows (bundle plain rows, writer-precompile journal rows) enter the
 block overlay, so they ride the frozen set, the digest, L and the checkpoint. Its EVM trie work moves to the flush

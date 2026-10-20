@@ -36,7 +36,19 @@ node_peers() {
 start_node() {
     local idx=${1-} mode=${2:-truncate}
     local key p2p rpc met peers dd log
+    local retention=()
     peers=$(node_peers "$idx") || { echo "start_node: bad validator index '$idx'" >&2; return 1; }
+    # Optional history retention (Q9 data-dir growth soak): TORUS_RETENTION_BLOCKS=N
+    # passes --retention-blocks=N (state pruner + block-tree pruner; the DA body
+    # GC window derives from it, see torus_consensus::da_gc). Unset or empty =
+    # archive, exactly as before. Appended last so the --data-dir match in
+    # crash-kill.sh is unchanged; launch and restart read the same variable.
+    if [ -n "${TORUS_RETENTION_BLOCKS:-}" ]; then
+        case "$TORUS_RETENTION_BLOCKS" in
+            *[!0-9]*) echo "start_node: TORUS_RETENTION_BLOCKS='$TORUS_RETENTION_BLOCKS' is not a block count" >&2; return 1 ;;
+        esac
+        retention=("--retention-blocks=$TORUS_RETENTION_BLOCKS")
+    fi
     key=$(node_var KEY "$idx"); p2p=$(node_var P2P "$idx")
     rpc=$(node_var RPC "$idx"); met=$(node_var MET "$idx")
     [ -n "$key" ] && [ -n "$p2p" ] && [ -n "$rpc" ] && [ -n "$met" ] || {
@@ -57,6 +69,7 @@ start_node() {
         --metrics-addr="127.0.0.1:$met" \
         --log-level=info \
         --native-gossip=true \
+        ${retention[@]+"${retention[@]}"} \
         >> "$log" 2>&1 &
     STARTED_PID=$!
 }
