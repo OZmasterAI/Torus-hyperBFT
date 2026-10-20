@@ -39925,7 +39925,7 @@ mod crash_recovery_tests {
         f()
     }
 
-    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, off by default): pass B
+    /// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, on by default): pass B
     /// keeps each market's position cache unmerged and the end-of-call flush
     /// writes them with the batch cache in the same key order. Over the 130
     /// P2 blocks with reduce-only places and cloids (fills, closes and flips
@@ -39942,8 +39942,8 @@ mod crash_recovery_tests {
             parse_settle_no_merge, settle_no_merge_fallbacks_on_this_thread,
             settle_no_merge_flushes_on_this_thread, with_settle_no_merge, BookMode,
         };
-        assert!(!parse_settle_no_merge(None), "off by default");
-        assert!(parse_settle_no_merge(Some("1")));
+        assert!(parse_settle_no_merge(None), "on by default");
+        assert!(!parse_settle_no_merge(Some("0")));
         let (blocks, _, cloid_places) = p2_blocks_with(true, true);
         assert!(!cloid_places.is_empty(), "the stream places cloids");
         let run = |on: bool| {

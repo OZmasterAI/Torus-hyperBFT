@@ -17323,6 +17323,598 @@ Findings:
   resolved only for the exec-thread CPU row, and the latency rows rest on n = 2 with one noisy A rep.
 * Data: `~/bench-results-matched/ozarchy-8y{d,s}-{w1,r1-A,r1-B,r2-B,r2-A}` (per-cell `8y-bookmode.txt`, `8y-coalesce.txt`); smokes kept as `ozarchy-8y{d,s}-smoke-s0-mode3-unused`; run `ozarchy-8y-run/` (`8y-analysis.md`, `yd/`, `ys/`, `chain-main.log`, `contention-main.tsv`, `posthoc-main.log`, `analyst/8y-analyse.py` = 8t's script + L3.1 rows, `8y-deep.txt`, `8y-std.txt`); tools `ozarchy-8y-tools/`; stage `ozarchy-8y-stage/`.
 
+## 111. Step 8z, Classic cadence check: does the b1 binary slow Classic? Two binaries, O = `feat/item7-option0` `f8a45a2d` vs B = `perf/mode3-b1` `ab4ded4e`, both Classic, 15 s checkpoints, no EVM load, standard shape, O B B O, 300 s cells, n = 2 (campaign ozarchy-8z, archy, 2026-10-20)
+
+**b1 is not cleared for merge on this evidence: on Classic, B runs at 0.746x O's native blocks/s (pairs 0.743, 0.748; 95% CI [0.712, 0.780]) with equal per-fill cost (exec ms per 1k fills 0.998, exec on-CPU 0.999, CPU-s per 1M fills 0.998, matched/s 1.005). That is the spec's second branch: report it, 18c bisects b0 (`704a089d`) vs b1 (`244a767c`) with this shallow Classic ABBA. The size is ~0.75x, not section 109's ~0.6x (8x's C cell sat lower still). The per-minute series shows no level flip inside any cell (minutes 2-5: O 13.2-16.7, B 10.0-12.6 blk/s, no overlap), so it is a steady binary effect, not the cadence swing section 109 suspected. B cuts the same fill stream into fewer, bigger blocks (1.32x fills and exec ms per block): p50 1.20x, p99 1.24x, timeouts 0.11 -> 0.77 per 1,000 blocks; wall ms per committed block +23 ms with per-fill exec cost unchanged, so the extra time is per-block overhead outside per-fill exec work. 8z O falls inside 8l Noff's 12.3-16.0 range.**
+
+Question (bench queue step 8z, owner s131): section 109 found Classic on `ab4ded4e` running shallow at 8.10 native blocks/s, p50 31 ms, ~30k fills per block, vs 12.3-16.0 / ~18k on the same base in 8l. A read-only code study (s131) found no Classic-path change in b0 / b1. Is it a cadence flip or a binary effect? Verdict rule: B / O blocks/s within noise (or both arms swinging alike) -> b1 cleared to merge; B consistently slower with equal per-fill cost -> report it.
+
+### 111.1 Setup
+
+- O = origin/feat/item7-option0 `f8a45a2d`, torus-node md5 `74598d33b5711263ed141faf960d9c22` (copied from
+  ozarchy-8l4-stage/b = 8l's NB). B = origin/perf/mode3-b1 `ab4ded4e`, torus-node `f19d9385434ce737909530c804649909`
+  (copied from ozarchy-8x-stage/m). No rebuild. Stage ~/bench-results-matched/ozarchy-8z-stage/{o,b}, build/md5s.txt.
+- **One bench-throughput / tx-flood pair for both arms: ab4ded4e `ec15372b` / `dd59d50d`** (8x's pair). This is valid
+  because tools/ is unchanged between f8a45a2d and ab4ded4e. In the crates the bench links, the changes are comments,
+  an unused `FrozenPending::touches_any` and one new telemetry histogram, so the client behaves the same. 8l also ran
+  one pair for all arms. With this pair, arm B repeats 8x C's node + bench exactly.
+- Tools frozen from main `1a297eff` (git archive; identical to 8y's 8a5d4aeb tree), harness worktree
+  wt/8z-h-1a297eff, drivers made from specs by make-driver.py (ozarchy-8z-tools/gen/mkspecs.py). Standard shape: 100k
+  genesis d694b81b, no pre-load, 300 markets, rate 76000, the harness env of 8x / 8y. 15 s checkpoints (code default),
+  state hash off.
+- Classic: node_env `TORUS_BOOK_ROWS=` (empty, as 8l Noff; 8x C used `=0`; `parse_book_rows_mode` maps empty, `0`
+  and unset to Classic in both commits, and it is the only read site).
+- Cells: w1 O 120 s (gated), then r1-O r1-B r2-B r2-O, 300 s, in one unit (bench-ozarchy-8z-main), end_pass=1 (end
+  passes and checks ran post hoc, outside the unit). Gaps from END to the next START: 5, 5, 6, 5 s.
+- Smokes: B 60 s (ozarchy-8zs-smoke-s0) and O 60 s (ozarchy-8zso-smoke-s0, its own driver), 0 CHECK FAIL.
+  Negative tests of z8bmchk (non-Classic env, EVM fast path env, an injected 'EVM fast path ON' line, unknown arm) all
+  FAIL as they should: ozarchy-8z-run/negtest/neg.log.
+
+### 111.2 Validity and contention
+
+All 5 main cells: bench rc 0, ACCEPT, AGREE; node exe md5 3/3 matching the arm's staged md5 (re-checked from
+node-environ-trie.txt); post hoc 111 CHECK OK, 0 CHECK FAIL, 0 hard findings (posthoc-main.log); end pass 0 failed.
+
+Per node (z8-flags.txt / z8-bookmode.txt in each cell, 15 node records per flag):
+- book mode: `TORUS_BOOK_ROWS=` on 3/3 environs. Classic metrics: rows written 0, levels written 0, drain 0,
+  about 2 dirty book entries per block, no deferred-save or b1 line.
+- one `checkpoint_interval=Some(15s)` line and 'coalesced state checkpoints ON' on every node.
+- EVM fast path: `TORUS_EVM_FAST_PATH` absent, 0 'EVM fast path' lines on every node (off in both, code default).
+- L3.3: `TORUS_BOOK_FAST_ENCODE` absent, 0 lines (not compiled into either binary). L3.1: `TORUS_BOOK_COALESCE` absent,
+  0 lines.
+
+Contention (z8-foreign.py on contention-main.tsv; owner FOREIGN CPU rule; in 8z, nice >= 10 processes flag too):
+Telegram was never running (pre-cell check and every sample). No foreign process averaged > 0.1 core or spiked
+> 0.5 core in any load window, so no reruns. The largest single process was claude: avg 0.062, max 0.123 in r2-B.
+Next were Hyprland (~0.04) and foot (~0.03). The summed foreign CPU per window was 0.13-0.19 core, nice >= 10 was 0,
+and the mean non-bench CPU was 1.35-1.61 cores.
+
+### 111.3 Per cell
+
+Node means over the bench window. blk/s = native blocks/s; p50 / p99 = block commit interval (ms); exec ms and exec
+on-CPU ms are per 1k fills; CPU-s is per 1M fills; ckpts = per node, whole cell / inside the bench window.
+
+| cell | blk/s | worst60 | fills/blk | p50 | p99 | matched/s | exec ms | exec on-CPU | CPU-s | exec busy | timeouts (/1k blk) | ckpts/node |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| w1 O (120 s) | 13.57 | 12.42 | 15.6k | 13.0 | 710 | 256.2k | 3.74 | 2.85 | 22.71 | 0.79 | 0 (0) | 22 / 16 |
+| r1-O | 14.70 | 10.47 | 16.4k | 14.0 | 721 | 258.3k | 3.83 | 2.85 | 23.21 | 0.92 | 1 (0.23) | 49 / 44 |
+| r1-B | 10.92 | 8.85 | 21.9k | 16.6 | 875 | 262.1k | 3.79 | 2.82 | 22.92 | 0.91 | 3 (0.91) | 39 / 33 |
+| r2-B | 10.55 | 8.15 | 22.9k | 17.5 | 885 | 261.0k | 3.78 | 2.83 | 23.02 | 0.91 | 2 (0.63) | 38-39 / 32-33 |
+| r2-O | 14.10 | 9.63 | 17.4k | 14.5 | 697 | 262.1k | 3.76 | 2.80 | 22.84 | 0.92 | 0 (0) | 47 / 42 |
+
+Checkpoints track the block count, about 1 per 100 blocks (epoch boundaries) plus the interval, as in section 109.
+
+Other summary.json headline fields (O r1 / r2 vs B r1 / r2): wall ms per committed block 68.0 / 70.9 vs 91.5 / 94.7.
+Consensus-thread ms per block 10.5 / 10.7 vs 12.2 / 13.2. Pipelined ms 6.0 / 5.5 vs 7.7 / 7.5. Handoff wait 0.02 in all
+cells. Placed/s is equal (343-348k).
+
+### 111.4 Per arm and paired B / O (n = 2)
+
+| metric | O mean | B mean | r1 B/O | r2 B/O | mean B/O | 95% t-CI (pairs, log) |
+|---|---|---|---|---|---|---|
+| native blk/s | 14.40 | 10.73 | 0.743 | 0.748 | **0.746** | [0.712, 0.780] |
+| worst-60 s blk/s | 10.05 | 8.50 | 0.845 | 0.846 | 0.846 | [0.842, 0.849] |
+| fills per block | 16.9k | 22.4k | 1.338 | 1.313 | 1.325 | [1.175, 1.495] |
+| block p50 ms | 14.2 | 17.0 | 1.185 | 1.208 | 1.197 | [1.058, 1.353] |
+| block p99 ms | 709 | 880 | 1.214 | 1.270 | 1.242 | [0.931, 1.655] |
+| matched/s | 260.2k | 261.6k | 1.015 | 0.996 | 1.005 | [0.892, 1.133] |
+| exec ms / 1k fills | 3.793 | 3.784 | 0.989 | 1.006 | 0.998 | [0.895, 1.113] |
+| exec on-CPU ms / 1k fills | 2.825 | 2.822 | 0.990 | 1.009 | 0.999 | [0.887, 1.126] |
+| CPU-s / 1M fills | 23.02 | 22.97 | 0.988 | 1.008 | 0.998 | [0.876, 1.136] |
+| exec busy | 0.923 | 0.910 | 0.984 | 0.989 | 0.987 | [0.955, 1.019] |
+| exec ms per block | 64.1 | 84.8 | 1.324 | 1.321 | 1.322 | [1.307, 1.338] |
+| timeouts / 1k blocks | 0.11 | 0.77 | | | | |
+
+With n = 2 the t-CI uses t(0.975, 1) = 12.7, so it is wide even when the two pairs agree closely. The blocks/s pairs
+differ by 0.005.
+
+### 111.5 Blocks/s per minute
+
+| cell | m1 | m2 | m3 | m4 | m5 |
+|---|---|---|---|---|---|
+| w1 O | 13.39 | 13.96 | | | |
+| r1-O | 11.03 | 14.75 | 14.29 | 16.01 | 16.73 |
+| r1-B | 9.39 | 11.66 | 12.56 | 11.73 | 9.97 |
+| r2-B | 8.91 | 11.81 | 11.53 | 10.05 | 11.48 |
+| r2-O | 10.25 | 13.22 | 15.46 | 14.28 | 16.49 |
+
+Matched/s per minute is flat at 253-267k in every cell and both arms (8z-series.tsv). Neither arm shows a level flip
+inside a cell. In minutes 2-5, O runs 13.2-16.7 and B runs 10.0-12.6, with no overlap. Both arms start lower in minute
+1. The O cells climb through the cell and the B cells do not.
+
+### 111.6 Comparison with 8x shallow C and 8l Noff
+
+| cell | node | blk/s | fills/blk | p50 | p99 | matched/s | exec on-CPU | CPU-s | per-minute blk/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 8xs-w1 C | B f19d9385 | 7.89 | 26.0k | 32.8 | 914 | 270.4k | 2.76 | 22.48 | 7.9 8.2 |
+| 8xs-r1-C | B f19d9385 | 8.10 | 30.1k | 31.2 | 940 | 264.8k | 2.78 | 22.85 | 8.5 8.3 9.5 7.8 6.6 |
+| 8l4 r1-Noff (600 s) | O 74598d33 | 12.31 | 20.0k | 18.3 | 806 | 259.1k | 2.84 | 23.54 | 10.3-14.6 |
+| 8l4 r2-Noff | O | 14.47 | 17.1k | 14.7 | 692 | 257.7k | 2.84 | 23.61 | 10.6-18.3 |
+| 8l4 r3-Noff | O | 12.72 | 19.7k | 15.4 | 807 | 259.0k | 2.85 | 23.57 | 10.4-15.2 |
+| 8l4 r4-Noff | O | 16.03 | 15.6k | 13.3 | 616 | 257.2k | 2.83 | 23.57 | 10.6-18.4 |
+
+8z O (14.10-14.70) falls inside 8l Noff's 12.3-16.0 range. 8z B (10.55-10.92) is faster than 8x C (8.10) but sits
+below every O cell measured so far: 4 in 8l and 2 in 8z, run under two tool versions and two bench pairs. Per-fill
+cost is the same within ~3% across all three campaigns (exec on-CPU 2.76-2.85, CPU-s 22.5-23.6). Two things differ by
+binary: blocks per second, and with them block size and latency.
+
+### 111.7 Reading, limits and data
+
+Matched/s follows the load and the exec thread is ~91% busy in both arms. B therefore cuts the same fill stream into
+fewer, bigger blocks: 1.32x fills per block, 1.32x exec ms per block, and 0.75x blocks/s. That cost shows up as block
+latency (p50 1.20x, p99 1.24x) and as timeouts (0.77 vs 0.11 per 1k blocks), not as throughput. Per-fill exec cost is
+unchanged, so the extra time per block comes from outside per-fill exec work. Wall ms per committed block is +23 ms
+and consensus-thread ms per block is +2 ms. The b0 / b1 changes to exec_pipeline.rs / app.rs (the Digest job, the
+W tripwire, per-block flags) are the candidates; the 8z data cannot separate b0 from b1. Next step per spec: 18c
+bisects b0 (`704a089d`) vs b1 (`244a767c`) with this same shallow Classic ABBA.
+
+* Limits: n = 2 (t(0.975, 1) = 12.7, so CIs are wide even though the two pairs agree to 0.005 on blocks/s); one bench / flood pair (`ec15372b` / `dd59d50d`, from `ab4ded4e`; tools/ unchanged between the commits) for both arms.
+* Data: `~/bench-results-matched/ozarchy-8zs-{w1,r1-O,r1-B,r2-B,r2-O}`; smokes `ozarchy-8zs-smoke-s0`, `ozarchy-8zso-smoke-s0`; run `ozarchy-8z-run/` (`8z-analysis.md`, `zs/campaign.log`, `chain-main.log`, `contention-main.tsv`, `posthoc-main.log`, `negtest/`, `analyst/` with `8z-analyse.py`, `8z-cells.tsv`, `8z-series.tsv`, `8z-ref-cells.tsv`, `8z-ref-series.tsv`); tools `ozarchy-8z-tools/` (8z-stage.sh also fixes 8y's lost contention path in the pre-cell log line); stage `ozarchy-8z-stage/{o,b}`.
+
+### 111.8 Follow-up (18c s131, bench queue 8z2 part 1): where B's fewer, bigger blocks come from (analysis of the 8z cells, no new cells)
+
+**The gap is consensus-side, in the long commit intervals; no single phase holds a new fixed wait, and exec cost per
+second is equal.** Mean commit interval O 69.8 vs B 91.2 ms (+21.4 ms per commit). Intervals > 128 ms carry +22.3 ms
+(104% of the gap; the buckets have no 100 ms edge), > 256 ms alone +21.0 ms (98%): 92 vs 144 per 1k commits.
+Timeouts add +0.57 ms per commit (3%; O 0.33 / 0.33, B 2.33 / 1.00 per node, mostly `after_vote`);
+`view_entered_past_deadline` is 0 everywhere; views per commit 1.000.
+
+* Per-view phases scale 1.13-1.45x per view with the same per-second totals (block-size ratio 1.30). Only
+  `qc_to_advance` (collector: PC to the next StartView) is clearly above it in both pairs: 21.1 -> 30.6 ms per view
+  (1.45x; r1 1.38, r2 1.53), its > 256 ms tail 5.0 -> 11.7 per 1k commits. Then `qc_collect` 48.6 -> 60.9 ms (1.25x),
+  `proposal_arrival` 1.31x. The phases nest across roles, so none can be read as the cause.
+* Build / validate: block_build per 1k txs 1.065x (mostly select 1.097x; ~+0.4 ms per commit), validate_block 0.935x.
+* Exec side saturated and equal per second: exec_block 982 vs 986 ms/s; every exec sub-timer within +-6 ms/s and
+  1.22-1.40x per block. Checkpoint upkeep / settle_wait / deferred_join / wait together add < 1 ms per block.
+  exec_queue_depth mean 35.5 vs 34.0, near the 64 cap 25-33% of the time in both arms, with no consensus stall on it.
+  flush_worker 1.31x per call, 1.00x per second.
+* Within cells (10 s bins), wall ms per commit = a + b x txs: O a = 48-50 ms, B a = 75-84 ms (B fits weak, r <= 0.3):
+  B carries ~+30 ms per view independent of block size, so its bigger blocks (1.30x txs per commit, mempool 2.1k vs
+  1.4k) follow from the slower cadence. hotstuff-algo is ~25% on-CPU in both arms (not CPU-bound).
+* `mempool_remove_committed` is the one commit-feed timer above size scaling: 1.32 -> 2.22 ms per block (1.69x), still
+  only ~+0.9 ms per commit.
+* Missing to name the leg: sub-timers inside `qc_to_advance` (commit-chain update, commit persist, mempool
+  remove_committed, the exec send, AdvanceView), hotstuff-algo's off-CPU wait reason, and proposer-selection stats.
+  Next per 8z2 part 2: the fresh-target rebuild of `ab4ded4e` (md5 vs `f19d9385`) tests the top suspect, the build.
+* Confidence: high that the gap lives in the long intervals with equal exec cost per second; medium that B has a
+  size-independent per-view excess; low on which leg. Report: `~/bench-results-matched/ozarchy-8z-tools/analyst/
+  8z-followup.md` (scripts `8z2-extract.py`, `8z2-tables.py`, `8z2-tails.py`, `8z2-regress.py` and outputs alongside).
+
+## 112. Step 8w, RH4 3-arm rerun with the state-pruner compaction filter: one binary `perf/rh4-gc-worker` `baffa3a5`, A = no retention vs B = `TORUS_RETENTION_BLOCKS=1000` (filter, the branch default) vs C = retention 1000 + `TORUS_PRUNE_MODE=range` (8r's path), standard unpaced load, 300 markets, 300 s cells, A B C C B A twice, n = 4 per arm (campaign ozarchy-8w, archy, 2026-10-20)
+
+**The filter removes the part of 8r's cost that reproduces on this binary (CPU per fill and compaction); blocks/s is not resolved at n = 4. B / A: block p50 1.003 [0.925, 1.088], CPU-s per 1M fills 1.003 [0.991, 1.016], exec-thread on-CPU per 1k fills 1.003 [0.983, 1.023], matched/s 0.999, timeouts unchanged; native blocks/s 0.963 [0.906, 1.025] (lower in 4 / 4, CI spans 1), mostly before the filter acts (pre window 0.905, minute 1 0.935, when B and C run the same code). C / A reproduces 8r's CPU / compaction / matched/s cost (CPU-s per 1M +1.6% [1.2, 2.0], exec on-CPU +1.4%, matched/s -1.0% in 4 / 4, state compaction CPU x1.80 post, `cf_block_bodies` compaction 12 jobs / 21.6 s vs A's 6 / 7.3 s per node; 8r 12 / 22.9) but not its blocks/s cost (0.994 [0.84, 1.17], p50 0.979; 8r 0.949 / 0.989). The filter cuts the extra `cf_block_bodies` compaction CPU by 74% (+14.3 -> +3.7 s per node per cell); all of B's pruning was whole-SST drops (6-11 SSTs, 235-364 MB per node per cell), the compaction filter's row path dropped 0 rows in 300 s; the slowest filter pass took 399 ms on the background pruner thread. Under the exec-path merge rule B passes p50, p99 and timeouts; blocks/s -3.7% with a CI spanning 1 is the owner's call; n >= 6 at 900 s would resolve it.**
+
+### 112.1 Setup
+
+* Binary: one build of `origin/perf/rh4-gc-worker` `baffa3a5` (8r's `a0181b8b` + the prune filter). Node md5
+  `afb09e79c70ec2ad59e445b209e4854d` on 3 / 3 nodes in all 13 cells (stage `~/bench-results-matched/ozarchy-8w-stage`,
+  `build/md5s.txt`). Tools frozen from main `651c288b` (`ozarchy-8w-tools/FROZEN.txt`; `tools/matched-bench` identical
+  to 8y's `8a5d4aeb`).
+* Arms (EXTRA_ENV): **A** = no retention. **B** = `TORUS_RETENTION_BLOCKS=1000` (filter, the branch default). **C** =
+  `TORUS_RETENTION_BLOCKS=1000` + `TORUS_PRUNE_MODE=range` (as 8r's B: DA GC on the worker, range deletes). All arms:
+  code defaults, 512 KB push threshold, custody 0, state hash off, Classic book (w8clchk, 13 / 13), and
+  `TORUS_BOOK_FAST_ENCODE` effectively off (env unset on every node; the knob string is not in `baffa3a5`, which
+  predates L3.3; w8fastchk 13 / 13).
+* Load: standard unpaced, 300 markets, 300 s cells. Order w1 (A), then A B C C B A twice, so n = 4 per arm. Gaps
+  between cells were 6 s (8r: 67-70 s).
+* Cells: `~/bench-results-matched/ozarchy-8w-300m-{w1,r1-A,r1-B,r1-C,r2-C,r2-B,r2-A,r3-A,r3-B,r3-C,r4-C,r4-B,r4-A}`.
+  Not used here: `ozarchy-8w-300m-smoke-s0` (B smoke, 180 s), `ozarchy-8wc-300m-smoke-s0` (C smoke, 180 s; campaign
+  files in `ozarchy-8w-run/smokeC/smoke`), and `ozarchy-8w-300m-w1-paused-unused` (warm-up cut off when 8w paused
+  for 8z at 16:08).
+* Windows (as 8r): whole = load +0 to the shortest load end of the replicate's three cells (+302/+303 s). Post = the
+  later of B's and C's first deleting DA GC pass + 5 s, to the same end: r1 +87, r2 +96, r3 +76, r4 +86 s (206-227
+  s). Pre = +0 to the post start. The first deleting GC pass was at B +81 / +90 / +70 / +76 s and C +76 / +69 / +70 /
+  +80 s. State pruner passes were at about +68, +158 and +248 s after load start (a fourth at +308-311 s in r1-C and
+  r2-B; r4-C at +68 / +158 / +218 / +278).
+
+### 112.2 Validity and post-hoc checks
+
+* Post hoc `ozarchy-8w-tools/8w-posthoc.sh main` (run niced at 18:31, done 18:48; output `ozarchy-8w-run/posthoc-main.txt`):
+  end pass over 13 cells with 0 failed and 13 hardscans; **313 CHECK OK, 0 CHECK FAIL, 0 CHECK WARN, 0 HARD FINDING**;
+  13 CHECK SOAK lines; `POSTHOC CELL OK` 13 / 13 (`POSTHOC checks ozarchy-8w: 13 cells, 0 with a CHECK FAIL`). The
+  smoke post hoc (`posthoc-smoke.txt`, earlier) passed: 2 / 2 cells, 0 CHECK FAIL.
+* All 13 cells rc 0, ACCEPT / AGREE / PASS, md5 ok, no rerun, no CELL-FLAG. Margin rejects 0%. Swap stayed at the
+  preflight level (2,963-2,964 MB, limit +512 MB).
+* The arms took effect on every node (w8modechk / w8retchk / startup log):
+
+| arm | startup `prune_mode` (val0 / 1 / 2) | `TORUS_PRUNE_MODE` in environ | `cf_block_bodies` compaction filter factory (LOG) | DA GC | pass lines |
+|---|---|---|---|---|---|
+| A | none (no state pruner) | unset | `torus-prune-below-cutoff` (cutoff 0, no-op) | off | 0 |
+| B | Filter / Filter / Filter, 4 / 4 cells | unset (default) | `torus-prune-below-cutoff` | worker | `pruning complete (filter mode)`, 3-4 per cell |
+| C | Range / Range / Range, 4 / 4 cells | `range` | None | worker | `pruning complete` (range), 3-4 per cell |
+
+* Contention (`foreign-main.txt`, `contention-main.tsv`, 30 s samples): Telegram never ran. Every measured cell passes
+  the foreign-CPU rule: foreign mean 0.08-0.19 cores, single process avg <= 0.049 and max <= 0.100. kthread was
+  0.87-0.88 cores in A and 0.71-0.83 in B / C. Other non-bench CPU was 0.29-0.43 cores. The unmeasured w1 had one
+  0.82-core python3 spike (the 8z analysis) and was not rerun (w1 matched/s 263,539).
+
+### 112.3 Per cell, whole window (run order; node mean)
+
+| cell | native blk/s | fills / blk | p50 ms | p99 ms | matched/s | CPU-s / 1M fills | exec ms / 1k fills | exec on-CPU ms / 1k fills (load) | timeouts / 1k blk | state compaction CPU s/s | `cf_block_bodies` L0 mean | process cores |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| r1-A | 13.934 | 19,145 | 14.2 | 749 | 266,767 | 22.72 | 3.626 | 2.699 | 0.237 | 0.066 | 2.35 | 6.060 |
+| r1-B | 13.839 | 19,205 | 14.1 | 750 | 265,746 | 22.87 | 3.665 | 2.707 | 0.000 | 0.079 | 1.83 | 6.077 |
+| r1-C | 15.535 | 17,047 | 13.6 | 645 | 264,817 | 23.14 | 3.699 | 2.725 | 0.071 | 0.123 | 2.31 | 6.129 |
+| r2-C | 13.919 | 18,976 | 15.2 | 729 | 264,135 | 23.23 | 3.691 | 2.730 | 0.000 | 0.122 | 2.11 | 6.136 |
+| r2-B | 14.450 | 18,365 | 14.0 | 708 | 265,380 | 23.05 | 3.702 | 2.711 | 0.000 | 0.089 | 0.53 | 6.116 |
+| r2-A | 15.755 | 16,901 | 14.2 | 572 | 266,280 | 22.83 | 3.659 | 2.682 | 0.070 | 0.075 | 0.81 | 6.079 |
+| r3-A | 14.388 | 18,486 | 14.8 | 724 | 265,978 | 22.93 | 3.695 | 2.722 | 0.000 | 0.079 | 1.63 | 6.098 |
+| r3-B | 14.307 | 18,601 | 14.2 | 719 | 266,117 | 22.74 | 3.605 | 2.680 | 0.077 | 0.083 | 2.63 | 6.052 |
+| r3-C | 13.622 | 19,227 | 13.8 | 778 | 261,901 | 23.23 | 3.714 | 2.755 | 0.000 | 0.115 | 1.93 | 6.085 |
+| r4-C | 15.182 | 17,449 | 13.5 | 654 | 264,899 | 23.04 | 3.685 | 2.725 | 0.000 | 0.117 | 1.78 | 6.103 |
+| r4-B | 13.812 | 19,401 | 15.2 | 713 | 267,952 | 22.84 | 3.665 | 2.710 | 0.161 | 0.079 | 0.73 | 6.119 |
+| r4-A | 14.531 | 18,391 | 14.1 | 719 | 267,244 | 22.73 | 3.618 | 2.677 | 0.000 | 0.075 | 1.36 | 6.073 |
+
+Run order shows no drift: A ran 13.93 / 15.76 / 14.39 / 14.53 blk/s, B 13.84 / 14.45 / 14.31 / 13.81, C 15.54 /
+13.92 / 13.62 / 15.18. Every cell stayed in one regime: 17-19k fills per block and 262-268k matched/s. Timeouts were
+0-1 per cell (node mean 0.0-1.0), all in the pre window.
+
+Native blocks/s per minute (node mean; * = first deleting DA GC pass):
+
+| cell | m1 | m2 | m3 | m4 | m5 |
+|---|---|---|---|---|---|
+| r1-A | 11.19 | 13.74 | 16.57 | 14.97 | 13.71 |
+| r1-B | 9.96 | 13.78* | 16.64 | 14.27 | 14.44 |
+| r1-C | 10.90 | 13.46* | 16.05 | 17.06 | 19.17 |
+| r2-C | 10.84 | 14.50* | 16.36 | 14.38 | 13.66 |
+| r2-B | 9.72 | 11.41* | 16.47 | 15.36 | 18.59 |
+| r2-A | 10.33 | 15.66 | 15.20 | 17.51 | 18.84 |
+| r3-A | 10.81 | 13.17 | 16.14 | 15.82 | 16.53 |
+| r3-B | 11.54 | 14.86* | 16.47 | 14.10 | 14.99 |
+| r3-C | 11.09 | 13.65* | 14.33 | 15.55 | 14.01 |
+| r4-C | 9.62 | 13.49* | 17.12 | 16.39 | 18.28 |
+| r4-B | 10.14 | 12.68* | 16.64 | 14.09 | 15.26 |
+| r4-A | 11.87 | 15.37 | 15.31 | 16.01 | 14.61 |
+
+Per-minute B / A: m1 0.935, m2 0.908, m3 1.048, **m4 0.900 [0.846, 0.958] (4 / 4 lower)**, m5 0.996. C / A: m1 0.960,
+m2 0.953, m3 1.009, m4 0.985, m5 1.018 (all CIs span 1). Minute 1 comes before any prune or GC deletion, when B and
+C run the same code. Even there C / B is 1.027 [0.90, 1.18], which is the size of the cell-to-cell noise. The B / A
+m4 dip matches 8r's (B / A m4 0.920, 4 / 4). It sits in the minute after the second filter pass (+158 s, 3 SSTs
+dropped). C / A shows no such dip. With 10 per-minute tests, one CI excluding 1 can happen by chance. This is a note
+only, not a result.
+
+### 112.4 Arm means and paired ratios (n = 4 per arm; ratio = geomean of the 4 per-replicate ratios, 95% t CI, 3 df, t = 3.182; timeouts as a mean difference)
+
+| metric | window | A | B | C | B / A [95% CI] | B < A | C / A [95% CI] | C < A |
+|---|---|---|---|---|---|---|---|---|
+| matched/s | whole | 266,567 | 266,299 | 263,938 | 0.9990 [0.9940, 1.0040] | 2/4 | 0.9901 [0.9843, 0.9960] | 4/4 |
+| matched/s | post | 265,691 | 264,852 | 261,899 | 0.9968 [0.9889, 1.0048] | 3/4 | 0.9857 [0.9750, 0.9965] | 4/4 |
+| native blocks/s | whole | 14.652 | 14.102 | 14.564 | 0.9633 [0.9055, 1.0247] | 4/4 | 0.9935 [0.8431, 1.1707] | 2/4 |
+| native blocks/s | post | 15.585 | 15.321 | 15.607 | 0.9844 [0.9261, 1.0463] | 3/4 | 0.9994 [0.7704, 1.2965] | 2/4 |
+| native blocks/s | pre | 12.300 | 11.105 | 11.898 | 0.9045 [0.7442, 1.0994] | 3/4 | 0.9674 [0.7979, 1.1727] | 2/4 |
+| fills per native block | whole | 18,231 | 18,893 | 18,175 | 1.0371 [0.9752, 1.1030] | 0/4 | 0.9966 [0.8475, 1.1720] | 2/4 |
+| fills per native block | post | 17,113 | 17,308 | 16,904 | 1.0127 [0.9507, 1.0788] | 1/4 | 0.9863 [0.7608, 1.2786] | 2/4 |
+| block p50 ms | whole | 14.3 | 14.4 | 14.0 | 1.0029 [0.9246, 1.0878] | 3/4 | 0.9785 [0.8905, 1.0752] | 3/4 |
+| block p50 ms | post | 14.0 | 14.0 | 14.0 | 0.9989 [0.9070, 1.1002] | 3/4 | 0.9914 [0.8341, 1.1782] | 3/4 |
+| block p99 ms | whole | 691 | 722 | 702 | 1.0510 [0.8828, 1.2512] | 2/4 | 1.0181 [0.7680, 1.3497] | 2/4 |
+| block p99 ms | post | 638 | 642 | 626 | 1.0104 [0.8962, 1.1391] | 2/4 | 0.9762 [0.6116, 1.5581] | 2/4 |
+| exec ms per 1k fills | whole | 3.649 | 3.659 | 3.697 | 1.0027 [0.9738, 1.0325] | 1/4 | 1.0132 [1.0014, 1.0251] | 0/4 |
+| exec ms per 1k fills | post | 3.668 | 3.679 | 3.732 | 1.0028 [0.9720, 1.0347] | 1/4 | 1.0173 [1.0030, 1.0319] | 0/4 |
+| exec-thread on-CPU ms per 1k fills | whole load | 2.695 | 2.702 | 2.734 | 1.0026 [0.9825, 1.0232] | 1/4 | 1.0144 [1.0078, 1.0210] | 0/4 |
+| CPU-s per 1M fills | whole | 22.80 | 22.87 | 23.16 | 1.0032 [0.9909, 1.0157] | 1/4 | 1.0159 [1.0116, 1.0202] | 0/4 |
+| CPU-s per 1M fills | post | 23.07 | 23.21 | 23.61 | 1.0061 [0.9956, 1.0168] | 1/4 | 1.0237 [1.0178, 1.0296] | 0/4 |
+| timeouts per 1k native blocks | whole | 0.077 | 0.059 | 0.018 | -0.02 [-0.30, +0.26] | 2/4 | -0.06 [-0.18, +0.07] | 2/4 |
+| timeouts per 1k native blocks | post | 0 | 0 | 0 | 0 | - | 0 | - |
+| state DB compaction CPU s/s (all CFs) | whole | 0.074 | 0.082 | 0.119 | 1.1196 [0.9956, 1.2591] | 0/4 | 1.6227 [1.3796, 1.9086] | 0/4 |
+| state DB compaction CPU s/s (all CFs) | post | 0.082 | 0.094 | 0.147 | 1.1461 [1.0117, 1.2984] | 0/4 | 1.8022 [1.4829, 2.1902] | 0/4 |
+| state compact write MB/s | post | 1.61 | 2.14 | 3.48 | 1.3327 [1.2415, 1.4307] | 0/4 | 2.1663 [1.9604, 2.3938] | 0/4 |
+| consensus DB compaction CPU s/s | post | 0.174 | 0.174 | 0.166 | 0.9970 [0.9436, 1.0534] | 3/4 | 0.9515 [0.9001, 1.0058] | 3/4 |
+| `cf_block_bodies` L0 mean (1 Hz) | post | 2.13 | 1.97 | 2.85 | 0.816 [0.379, 1.756] | 3/4 | 1.414 [0.717, 2.789] | 1/4 |
+| process CPU cores | post | 6.128 | 6.146 | 6.184 | 1.0030 [0.9874, 1.0188] | 1/4 | 1.0091 [0.9952, 1.0231] | 1/4 |
+
+C / B (whole): CPU-s per 1M 1.013 [1.003, 1.023] (0 / 4 lower), matched/s 0.991 (4 / 4 lower), state compaction CPU
+1.449 [1.325, 1.585], blocks/s 1.031 [0.899, 1.183], p50 0.976.
+
+### 112.5 State DB, pruner and disk (per node; mean (sd) of the 4 cells per arm; ratios as section 4)
+
+| metric | A | B | C | B / A | C / A |
+|---|---|---|---|---|---|
+| `cf_block_bodies` compaction jobs per cell (LOG) | 6.0 (0) | 9.0 (0) | 12.0 (0) | 1.50 | 2.00 |
+| `cf_block_bodies` compaction CPU s per cell (LOG) | 7.28 (0.11) | 10.94 (0.09) | 21.55 (0.75) | 1.503 [1.472, 1.534] | 2.960 [2.813, 3.116] |
+| `cf_block_bodies` compaction in / out MB | 453 / 259 | 680 / 389 | 1,226 / 666 | 1.50 / 1.50 | 2.70 / 2.57 |
+| `cf_block_bodies` records in -> out (r1..r4 range) | 2.4-2.6k -> same | 3.7-4.1k -> same (0 dropped) | 9.4-10.4k -> 6.6-7.2k | - | - |
+| `cf_block_bodies` trivial moves (LOG `Moving #`) | 14 | 1 | 1 | 0.07 | 0.07 |
+| state DB compaction CPU s per cell (metrics-after, all CFs) | 20.0-23.9 | 23.7-27.2 | 35.4-37.3 | - | - |
+| SSTs dropped whole (`DeleteFilesInRange`) per node per cell | 0 | 7.8 (2.2): 7 / 11 / 7 / 6 | 0 | - | - |
+| MB dropped whole per node per cell | 0 | 268 (64): 236 / 364 / 237 / 235 | 0 | - | - |
+| compaction-filter rows dropped (`torus_pruner_filter_rows_dropped_total`) | 0 | **0 in every B cell** | 0 (filter not installed) | - | - |
+| blocks pruned (metric) / cutoff | 0 | 3,300 (523) / cutoff = pruned height | 3,527 (665) | - | - |
+| prune pass elapsed ms (B log; C does not log it) | - | mostly 2-36; max 399 (r2-B val0, 3rd pass), 154 (r2-B val2, 1st pass, 0 files), 140 (r4-B) | - | - | - |
+| state SST MB / files at cell end (du after stop) | 739 (62) / 72 | 325 (72) / 48 | 299 (39) / 56 | 0.433 [0.341, 0.550] | 0.403 [0.349, 0.464] |
+| live state SST MB at load end (60 s sidecar) | 682 (62) | 304 (63) | 421 (72) | 0.441 [0.366, 0.531] | 0.611 [0.429, 0.870] |
+| live consensus SST MB at load end | 591 (28) | 166 (14) | 170 (28) | 0.280 | 0.284 |
+| live state + consensus total MB at load end (incl. WAL) | 3,669 (278) | 2,883 (86) | 2,957 (136) | 0.787 [0.721, 0.860] | 0.807 [0.730, 0.893] |
+
+Per node, the three validators agree within 0.1-0.7 s on each compaction-CPU figure in every cell (whole cell,
+state / consensus / bb, s): r1-A 20.0 / 47.5 / 7.2, r1-B 24.1 / 45.3 / 10.9, r1-C 37.3 / 43.4 / 21.7, r2-C 36.9 /
+45.5 / 22.2, r2-B 26.5-27.2 / 47-48 / 10.9-11.3, r2-A 22.5 / 48.2 / 7.4, r3-A 23.7 / 48.2 / 7.4, r3-B 25.8 / 44.6 /
+10.9, r3-C 36.5 / 45.1 / 22.1, r4-C 35.5 / 44.3 / 20.6, r4-B 25.6 / 46.5 / 10.9, r4-A 22.8 / 46.4 / 7.3 (val0 shown
+where the nodes are the same; full table in `w8-extra.txt`). The du WAL figure (0-1.4 GB) depends on when the node
+stopped relative to WAL recycling, so the totals use SST bytes.
+
+Notes:
+* B removes old bodies only by dropping whole SSTs. Over 300 s the compaction filter dropped no row in any B cell.
+  Every B `cf_block_bodies` compaction had records in = records out. So rows below the cutoff in SSTs that straddle
+  it stay on disk until a later compaction (reads hide them). The filter's row-dropping path was not exercised by
+  this load.
+* B's residual cost: 3 more `cf_block_bodies` compactions per cell (9 vs 6), +3.7 s CPU per node per cell (+50%),
+  compact write +33% post. They rewrite rows without dropping any. Both retention arms lose the trivial moves A gets
+  (14 -> 1 per node). The extra jobs fit the trivial moves that become real compactions. Cause not resolved; the
+  prune meta key lives in `cf_block_headers`, not in `cf_block_bodies`.
+* The 1 Hz `cf_block_bodies` L0 mean does not separate the arms in 8w: post A 2.13, B 1.97, C 2.85, with per-pair
+  ratios from 0.53 to 2.6 (8r: A 1.20, B / C 3.3). Treat it as noise here.
+* The longest filter pass (399 ms) ran on the background pruner thread, not on the commit path. Slow DA GC passes
+  (worker, >= 50 ms): B 5 lines (50-72 ms, write share 74%), C 13 lines (51-161 ms, write share 94%).
+
+### 112.6 Comparison with 8r (section 103 / 103.6)
+
+8w C is the same path as 8r B (DA GC on the worker plus range deletes). 8r C (inline GC) has no 8w counterpart.
+
+| metric (whole unless noted) | 8r A | 8r B / A (worker + range) | 8w A | 8w C / A (worker + range) | 8w B / A (worker + filter) |
+|---|---|---|---|---|---|
+| native blocks/s | 13.420 | 0.949 [0.820, 1.099], 3/4 | 14.652 | 0.994 [0.843, 1.171], 2/4 | 0.963 [0.906, 1.025], 4/4 |
+| native blocks/s post | 14.493 | 0.940 [0.854, 1.035] | 15.585 | 0.999 [0.770, 1.297] | 0.984 [0.926, 1.046] |
+| block p50 | 14.9 ms | 0.989 [0.882, 1.110] | 14.3 ms | 0.979 [0.891, 1.075] | 1.003 [0.925, 1.088] |
+| block p99 | 784 ms | 1.031 [0.951, 1.118] | 691 ms | 1.018 [0.768, 1.350] | 1.051 [0.883, 1.251] |
+| matched/s | 269,543 | 0.990 [0.979, 1.000], 4/4 | 266,567 | 0.990 [0.984, 0.996], 4/4 | 0.999 [0.994, 1.004] |
+| CPU-s per 1M fills | 22.59 | 1.020 [1.008, 1.033] | 22.80 | 1.016 [1.012, 1.020] | 1.003 [0.991, 1.016] |
+| CPU-s per 1M fills post | 22.95 | 1.028 [1.012, 1.044] | 23.07 | 1.024 [1.018, 1.030] | 1.006 [0.996, 1.017] |
+| exec on-CPU ms per 1k fills | 2.678 | 1.015 [1.000, 1.029] | 2.695 | 1.014 [1.008, 1.021] | 1.003 [0.983, 1.023] |
+| state compaction CPU s/s post | 0.077 | x1.97 [1.74, 2.24] | 0.082 | x1.80 [1.48, 2.19] | x1.15 [1.01, 1.30] |
+| state compact write MB/s post | 1.51 | x2.37 | 1.61 | x2.17 | x1.33 |
+| `cf_block_bodies` LOG jobs / CPU s per node | 6 / 7.30 | 12 / 22.86 | 6 / 7.28 | 12 / 21.55 | 9 / 10.94 |
+| consensus compaction CPU post | 0.172 | x1.08 | 0.174 | x0.95 | x1.00 |
+| gaps between cells | 67-70 s | | 6 s | | |
+
+8w A matches 8r A on `cf_block_bodies` compaction (6 jobs, 7.3 s, 453 / 259 MB). A's native blocks/s is 9% higher
+(14.65 vs 13.42) and its p99 is 12% lower. One candidate is the 6 s gaps against 8r's ~68 s; this is not tested.
+
+### 112.7 Verdicts
+
+* **B vs A (retention 1000 with the filter): within noise on p50 and CPU per fill. Blocks/s is not resolved.** Block
+  p50 1.003 [0.925, 1.088], post 0.999. CPU-s per 1M fills 1.003 [0.991, 1.016]. Exec-thread on-CPU per 1k fills
+  1.003 [0.983, 1.023]. Exec ms per 1k fills 1.003. Process cores 1.003. Matched/s 0.999 [0.994, 1.004]. Timeouts
+  are unchanged. Native blocks/s is 0.963 [0.906, 1.025] whole (4 / 4 lower) and 0.984 [0.926, 1.046] post (3 / 4).
+  The CIs span 1, and the gap is largest before the filter acts: pre 0.905, minute 1 0.935, when B and C run the same
+  code and C / A is 0.960. So the data do not tie the blocks/s gap to the filter. They do not show B equal to A
+  either.
+* **C vs A (8r's path on this binary): 8r's CPU and compaction cost comes back; its blocks/s cost does not.** CPU-s
+  per 1M fills +1.6% [1.2, 2.0] whole and +2.4% post (8r +2.0% / +2.8%). Exec on-CPU +1.4% (8r +1.5%). Matched/s -1.0%
+  in 4 / 4 (8r -1.0%). State compaction CPU x1.62 whole / x1.80 post (8r x1.97 post). `cf_block_bodies` compaction
+  12 jobs / 21.6 s vs 7.3 (8r 12 / 22.9). Native blocks/s 0.994 [0.843, 1.171] and p50 0.979, so there is no
+  blocks/s or p50 cost this time (8r 0.949 / 0.989).
+* **Does the filter fix 8r's cost? Yes for the cost that reproduces.** It removes about 74% of the extra
+  `cf_block_bodies` compaction CPU (+14.3 -> +3.7 s per node per cell) and about 81% of the extra post state
+  compaction CPU (+0.065 -> +0.012 s/s). It brings CPU per fill, exec-thread CPU and matched/s back inside noise
+  (C / B CPU-s 1.013 [1.003, 1.023], matched/s 0.991 in 4 / 4). It also keeps the state DB at least as small at cell
+  end (325 vs 299 MB du; live 304 vs 421 MB). For blocks/s this rerun cannot say: the old path showed no blocks/s
+  cost here, so there was nothing for the filter to fix.
+* Under the exec-path merge rule (native blocks/s, p50 / p99, timeouts not worse): B passes p50, p99 and timeouts.
+  Blocks/s is -3.7% whole with a CI that spans 1 (0.906-1.025). Calling it a pass or a fail is the owner's decision.
+  A longer or larger-n A / B run (n >= 6, 900 s) would resolve it.
+
+### 112.8 Limits and data
+
+* n = 4 per arm, 3 df. Blocks/s varies between cells by +-0.5-1.0 blk/s (sd A 0.78, C 0.94), so a ~4% blocks/s effect
+  cannot be resolved. C's blocks/s CI (0.84-1.17) is wider than in 8r.
+* Gaps between cells were 6 s, against 8r's 67-70 s. Back-to-back cells mean the next cell starts while the host is
+  still writing back the last one. A's baseline is 9% faster in blocks/s than 8r's.
+* Each replicate is three adjacent cells (A B C / C B A), so B is always the middle cell, between A and C.
+* Over 300 s, the compaction filter's row-dropping path never ran (0 rows), and only whole-SST drops removed data.
+  A longer run would exercise it.
+* Only the state DB LOG is copied. The RocksDB background, GC worker and pruner threads have no per-thread CPU.
+  State compaction CPU s/s counts all state CFs (`cf_native_positions` included; the same in all arms in 8r).
+
+* Data and scripts:
+* Scripts and outputs: `~/bench-results-matched/ozarchy-8w-tools/analyst/`. `w8-analyse.py` is 8r's
+  `r8-analyse.py` with md5 `afb09e79`, plus exec ms / 1k fills, timeouts / 1k blocks, compaction CPU, L0, process
+  cores, and per-cell pruner / LOG / du extras. Its outputs are `w8.txt` and `w8-analyse.json`. `w8-extra.py` writes
+  `w8-extra.txt` and `w8-extra.json` (modes, pruner, LOG `cf_block_bodies`, disk, per node, contention).
+* Post hoc: `~/bench-results-matched/ozarchy-8w-run/posthoc-main.txt` (+ `posthoc-main.done`, exit 0) and
+  `posthoc-smoke.txt`. Per-cell outputs: `w8-prune.txt`, `w8-fastenc.txt`, `w8-slowpass.txt`, `w8-worker.txt`,
+  `w8-disk.txt`, `w8-swap.txt`, `w8-push.txt`.
+* Campaign: `~/bench-results-matched/ozarchy-8w-run/campaign/` (`cells.tsv`, `campaign.log`, `cell-step/`,
+  `endpass-state.txt`), plus `chain-main.log`, `contention-main.tsv`, `foreign-main.txt`, `w8-samples/` and
+  `w8-sampler-main.log`.
+
+## 113. Step 9a, merged-main baseline with every s131 default on: one binary main `654f047c` (= `5013cc79` + docs), code defaults, N = no EVM load vs E = `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`, Classic, 15 s checkpoints, standard shape, N E E N, 300 s cells, n = 2 (campaign ozarchy-9a, archy, 2026-10-20)
+
+**No regression visible. Merged main with all s131 defaults on matches the per-feature A/Bs: N runs 268.8k matched/s,
+15.47 native blocks/s, block p50 / p99 14 / 659 ms, 0 timeouts, exec-thread on-CPU 2.503 ms per 1k fills and 22.77
+CPU-s per 1M fills. Every metric is within ~1.5% of section 108 B (L2.2 on, 268.6k, 15.58 blocks/s), and exec on-CPU
+per fill is 2% lower (2.557 there, with L3.3 off; L3.3 and option 0 are on here). The EVM load costs nothing measurable: E / N
+matched/s 0.999 [0.944, 1.058], CPU-s per 1M 1.002 [0.983, 1.021], exec on-CPU per 1k fills 1.004 [0.963, 1.047],
+blocks/s 1.011, p50 0.992, 1 timeout in 9,463 E blocks (after_vote). In section 107 (other binaries, indicative only) the
+EVM load cost ~3.4% of block rate (Noff 13.88, Eon 13.41 blocks/s); here N 15.47, E 15.64. One thing to watch: the
+flush worker (off the exec thread) takes 8% more per 1k fills under E (1.081 [0.85, 1.37]), unresolved at n = 2.**
+
+### 113.1 Setup
+
+* Binary: one fresh build of main `654f047c` (`git diff --stat 5013cc79 654f047c -- ':!docs'` is empty) in worktree
+  `wt/9a-654f047c`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9a`, 8l4 flags (plain `release --locked`, one package at
+  a time, clang + mold from `.cargo/config`). Node md5 `ce0f110ce3501c55018754bba685caa9` on 3 / 3 nodes in all 5 cells;
+  bench `eaf9f007`, flood `dd59d50d` (`~/bench-results-matched/ozarchy-9a-stage/build/md5s.txt`). The node carries
+  `TORUS_EVM_FAST_PATH`, `TORUS_SETTLE_NO_MERGE`, `TORUS_BOOK_FAST_ENCODE` and `torus_exec_evm_fast_path_blocks` (checked
+  with `strings`).
+* Tools frozen from main `654f047c` (`ozarchy-9a-tools/FROZEN.txt`), so the cell line logs book mode and flags; same
+  N = 11 bench genesis as 8z.
+* Both arms: code defaults, nothing set (so L2.2, L3.3, option 0 E, PC, F, D / M / T on), 512 KB push threshold from
+  `env.sh`, custody 0, Classic (no `TORUS_BOOK_ROWS`; every `cell=` line shows `book_mode=classic`, flags unset),
+  15 s checkpoints, standard (hsdb-300m) load. **N** = no EVM load; **E** = `EVM_LOAD_RATE=10 EVM_LOAD_SENDERS=40`
+  (8l's E).
+* Order: w1 (N, 120 s, warm-up gate), then N E E N at 300 s, so n = 2 per arm. Campaign 19:33-20:02.
+* Cells: `~/bench-results-matched/ozarchy-9a-{w1,r1-N,r1-E,r2-E,r2-N}`.
+
+### 113.2 Validity
+
+* 5 / 5 cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, no-merge
+  fallbacks 0 on every node, boundary checkpoints all pipelined (true:false 58-60:0 per node).
+* Both E cells landed 3000 / 3000 EVM transactions, none off-cadence.
+* Contention (30 s sampler + post-run foreign-CPU check, adapted from 8z): no foreign process averaged over 0.1 core in
+  any cell (largest: claude, 0.054). A Telegram process showed up in 4 / 4 samples of the warm-up and 5 / 10 of r1-N
+  but never in the top-5 CPU list (under ~0.02 core), so no cell was rerun.
+
+### 113.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | timeouts | RSS mean / max MB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| w1 | N | 272,345 | 15.352 | 15,234 | 51.7 | 14 / 662 | 22.19 | 2.474 | 0 | 3,537 / 4,370 |
+| r1 | N | 267,311 | 15.248 | 16,496 | 57.5 | 14 / 679 | 22.79 | 2.507 | 0 | 3,610 / 4,326 |
+| r1 | E | 268,343 | 15.891 | 15,834 | 54.9 | 14 / 644 | 22.80 | 2.509 | 1 | 3,560 / 4,350 |
+| r2 | E | 268,816 | 15.393 | 16,233 | 56.3 | 14 / 671 | 22.83 | 2.518 | 0 | 3,671 / 4,473 |
+| r2 | N | 270,212 | 15.686 | 16,133 | 55.9 | 14 / 640 | 22.76 | 2.499 | 0 | 3,636 / 4,478 |
+
+Replicate spread: N matched/s CV 0.76%, CPU-s per 1M CV 0.11%; E 0.12% and 0.10%.
+
+### 113.4 Arm means, E / N, and the references (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | N | E | E / N [95% CI] | section 108 B (L2.2 on, `eabec5e5`) | N / 108 B |
+|---|---|---|---|---|---|
+| matched/s | 268,762 | 268,580 | 0.999 [0.944, 1.058] | 268.6k | 1.001 |
+| native blocks/s | 15.47 | 15.64 | 1.011 [0.69, 1.48] | 15.58 | 0.993 |
+| fills per native block | 16,314 | 16,033 | 0.983 | 16,247 | 1.004 |
+| block p50 / p99 ms | 14 / 659 | 14 / 657 | 0.992 / 0.997 | 14 / 649 | 1.00 / 1.015 |
+| timeouts per 1k native blocks | 0.000 (0 / 9,373) | 0.106 (1 / 9,463, after_vote) | n/a | 0 | n/a |
+| exec ms per 1k fills | 3.473 | 3.468 | 0.999 [0.956, 1.043] | 3.491 | 0.995 |
+| **exec-thread on-CPU ms per 1k fills** | 2.503 | 2.513 | 1.004 [0.963, 1.047] | 2.557 | 0.979 |
+| CPU-s per 1M fills | 22.77 | 22.82 | 1.002 [0.983, 1.021] | 22.66 | 1.005 |
+| RSS mean / max MB | 3,623 / 4,402 | 3,615 / 4,412 | 0.998 / 1.002 | 3,579 / 4,472 | 1.012 / 0.984 |
+| settle phase ms per 1k fills | 0.954 | 0.953 | 0.999 | | |
+| flush_all ms per 1k fills | 0.442 | 0.442 | 0.998 | | |
+| save_order_books ms per 1k fills | 0.187 | 0.190 | 1.016 [0.979, 1.055] | | |
+| flush worker ms per 1k fills | 0.314 | 0.339 | 1.081 [0.85, 1.37] | | |
+| exec busy share | 0.876 | 0.870 | 0.992 | | |
+
+Section 107 (8l4's binaries, Noff / Eon, indicative only): 13.88 / 13.41 native blocks/s, E / N ~0.966. Here 15.47 /
+15.64.
+
+### 113.5 Verdict
+
+* **No regression visible** against the per-feature A/Bs: matched/s, blocks/s, p50 / p99, exec ms per fill and CPU-s
+  per 1M fills on merged main all sit within ~1.5% of section 108 B, which is inside run-to-run noise between campaigns.
+  Exec-thread on-CPU per 1k fills is 2.1% lower than 108 B, consistent with L3.3 (section 105), off in both of 108's
+  arms (`eabec5e5` predates its default-on), now being on (different binary, genesis and campaign, so not a measured
+  effect).
+* The EVM load at 10 / s no longer moves the native path: every per-fill row is E / N 0.98-1.02 with CIs around 1.
+* Watch: flush worker ms per 1k fills +8% under E (both rounds higher, 1.06 / 1.10; CI spans 1). It runs off the exec
+  thread and does not show in exec on-CPU or blocks/s.
+
+### 113.6 Limits and data
+
+* n = 2 per arm, 1 df: the blocks/s, p99 and per-block CIs are wide (blocks/s 0.69-1.48). Only per-fill rows resolve.
+* The section 107 / 108 references are other binaries and campaigns (108 also another genesis, `d694b81b`, and L3.3
+  off); the comparison is indicative.
+* Analysis: `~/bench-results-matched/ozarchy-9a-run/analyst/9a.txt` (`9a-analyse.py`, a copy of 8t's).
+* Campaign: `~/bench-results-matched/ozarchy-9a-run/campaign/` (`campaign.log`, `cells.tsv`), `contention-main.tsv`;
+  spec and driver `ozarchy-9a-tools/{9a-spec.json,ozarchy-9a-campaign.sh}`; build `ozarchy-9a-stage/build/`.
+
+## 114. Step 9b, L2.1 A/B: streamed in-order settle: one binary `perf/l21-streamed-settle` `df9e1d8a`, both arms `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1`, A = those vs B = A + `TORUS_SETTLE_STREAMED=1`, Classic, 15 s checkpoints, no EVM load, deep (8i P1M) and standard shapes, A B B A, 300 s cells, n = 2 (campaign ozarchy-9b, archy, 2026-10-20)
+
+**L2.1 raises block rate and lowers latency but fails the exec-path merge rule on deep: exec-thread on-CPU per 1k fills
+1.044 [1.009, 1.081] (both rounds 1.04-1.05), standard 1.035 [0.934, 1.146]. Everything else under the rule is better or
+flat: native blocks/s deep 1.206 [0.911, 1.596] (3.68 -> 4.43), standard 1.103 [0.834, 1.460] (15.04 -> 16.60); block
+p50 deep 0.679 (179 -> 122 ms), standard 0.970 [0.930, 1.012]; p99 deep 0.882, standard 0.871; matched/s deep 1.021
+[0.983, 1.061], standard 0.998; CPU-s per 1M fills deep 0.997, standard 0.989; exec wall per 1k fills deep 0.978
+[0.968, 0.989]. Deep timeouts went up, 5 -> 10 (2.25 -> 3.73 per 1k blocks; view-timeout reasons 8 -> 25, mostly
+after_vote); standard 1 -> 0. Fallbacks 0 in every cell. The extra exec-thread work is wake-up cost: runqueue wait per 1k
+fills doubles (deep 2.11x, standard 1.88x), consistent with `StreamRx::take` parking the exec thread per market and the
+pool unparking it; exec-pool CPU per 1k fills falls 5-8%. Verdict: not a default-on candidate under the rule as written;
+default-off merge only as an owner exception. Suggested next step: batch the wake-ups (or spin briefly before parking)
+and rerun deep at n = 3.**
+
+### 114.1 Setup
+
+* Binary: one fresh build of `origin/perf/l21-streamed-settle` `df9e1d8a` (on main `be87c86e`) in worktree
+  `wt/9b-df9e1d8a`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9b`, 8l4 flags (plain `release --locked`, one package
+  at a time, clang + mold). Node md5 `c7ce653406267d8749b6f5e07a42a392` on 3 / 3 nodes in all 10 cells; bench
+  `7779bff1`, flood `dd59d50d` (`~/bench-results-matched/ozarchy-9b-stage/build/md5s.txt`). The node carries
+  `TORUS_SETTLE_STREAMED`, `TORUS_SETTLE_NO_MERGE` and `TORUS_BOOK_FAST_ENCODE` (checked with `strings`).
+* Tools: 9a's freeze of main `654f047c` (`ozarchy-9a-tools`), checked identical.
+* Both arms: code defaults plus `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` (the base predates the s131
+  default flips), Classic (no `TORUS_BOOK_ROWS`; every `cell=` line shows `book_mode=classic` and the arm's flags, also
+  in node-env on all 3 nodes), 15 s checkpoints, 512 KB push threshold, custody 0, no EVM load. **B** adds
+  `TORUS_SETTLE_STREAMED=1`.
+* Shapes: **deep** = 8i P1M on 8y's 1M genesis (`a644d0a7`, PRELOAD and BULK_COUNT 1,000,000); **standard** =
+  hsdb-300m. Per shape: w1 (A, warm-up), then A B B A at 300 s, n = 2 per arm.
+* Cells: `~/bench-results-matched/ozarchy-9b{d,s}-{w1,r1-A,r1-B,r2-B,r2-A}`.
+
+### 114.2 Validity
+
+* 10 / 10 cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, boundary
+  checkpoints all pipelined.
+* Fallbacks: no-merge and streamed-resumed (`torus_exec_settle_streamed_resumed_fallbacks`) 0 / 0 / 0 in every cell.
+  Streamed markets per native block: A 0; B deep 191-204 (45 early), standard 97-101 (18 early), so the flag was live
+  in B only.
+* Contention: no foreign process averaged over 0.1 core (max 0.10 in deep w1, 0.04 in the measured cells); no rerun.
+* Pool busy: the node has no pool metric, so a /proc sampler of the `torus-exec-pool` threads ran (`b9-pool.py`,
+  `pool-main.tsv`; 32 pool threads).
+
+### 114.3 Per cell (run order; node mean)
+
+| shape | cell | arm | matched/s | native blk/s | fills/blk | exec block ms | block p50 / p99 ms | CPU-s / 1M | timeouts |
+|---|---|---|---|---|---|---|---|---|---|
+| deep | w1 | A | 218,863 | 4.902 | 40,439 | 173.7 | 88 / 1,228 | 25.83 | 1 |
+| deep | r1 | A | 231,349 | 3.689 | 60,272 | 255.6 | 169 / 1,416 | 24.82 | 1 |
+| deep | r1 | B | 235,575 | 4.548 | 50,546 | 209.5 | 110 / 1,197 | 24.63 | 5 |
+| deep | r2 | B | 238,905 | 4.321 | 53,651 | 220.4 | 133 / 1,165 | 24.52 | 5 |
+| deep | r2 | A | 233,219 | 3.663 | 61,221 | 256.9 | 188 / 1,266 | 24.48 | 4 |
+| std | w1 | A | 276,884 | 13.756 | 17,192 | 60.3 | 14 / 762 | 22.11 | 0 |
+| std | r1 | A | 270,897 | 14.778 | 17,166 | 59.5 | 14 / 731 | 22.58 | 0 |
+| std | r1 | B | 269,770 | 16.669 | 15,222 | 50.1 | 14 / 615 | 22.47 | 0 |
+| std | r2 | B | 270,464 | 16.521 | 15,489 | 50.1 | 14 / 615 | 22.12 | 0 |
+| std | r2 | A | 270,448 | 15.307 | 16,646 | 57.7 | 14 / 681 | 22.52 | 1 |
+
+### 114.4 Arm means and B / A (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | deep A | deep B | deep B / A | std A | std B | std B / A |
+|---|---|---|---|---|---|---|
+| **exec-thread on-CPU ms per 1k fills** | 3.200 | 3.342 | **1.044 [1.009, 1.081]** | 2.541 | 2.629 | 1.035 [0.934, 1.146] |
+| native blocks/s | 3.676 | 4.434 | 1.206 [0.911, 1.596] | 15.04 | 16.60 | 1.103 [0.834, 1.460] |
+| block p50 ms | 179 | 122 | 0.679 [0.409, 1.128] | 14 | 14 | 0.970 [0.930, 1.012] |
+| block p99 ms | 1,341 | 1,181 | 0.882 [0.511, 1.522] | 706 | 615 | 0.871 [0.555, 1.367] |
+| timeouts per 1k native blocks | 2.25 (5 / 2,224) | 3.73 (10 / 2,683) | n/a | 0.11 (1 / 9,101) | 0 (0 / 10,040) | n/a |
+| view-timeout reasons (all / after_vote / leader / no_vote) | 8 / 8 / 0 / 0 | 25 / 20 / 4 / 1 | | 1 / 1 / 0 / 0 | 0 | |
+| matched/s | 232,284 | 237,240 | 1.021 [0.983, 1.061] | 270,672 | 270,117 | 0.998 [0.972, 1.025] |
+| CPU-s per 1M fills | 24.65 | 24.57 | 0.997 [0.941, 1.056] | 22.55 | 22.29 | 0.989 [0.909, 1.076] |
+| exec ms per 1k fills | 4.219 | 4.127 | 0.978 [0.968, 0.989] | 3.468 | 3.262 | 0.941 [0.848, 1.043] |
+| fills per native block | 60,746 | 52,099 | 0.858 | 16,906 | 15,356 | 0.908 |
+| exec-thread on-CPU s per cell | 224.5 | 239.6 | 1.068 | 208.0 | 214.8 | 1.033 |
+| exec-thread runqueue wait ms per 1k fills | 0.123 | 0.260 | 2.115 | 0.123 | 0.231 | 1.880 |
+| exec busy share | 0.942 | 0.953 | 1.011 | 0.882 | 0.831 | 0.943 |
+| settle phase ms / blk (per 1k fills) | 52.15 (0.858) | 46.64 (0.895) | 0.894 (1.043) | 16.80 (0.993) | 14.93 (0.972) | 0.889 (0.979) |
+| settle pass A ms / blk | 8.73 | 2.47 | 0.283 | 3.00 | 0.94 | 0.312 |
+| settle pass B ms / blk (per 1k fills) | 16.44 (0.271) | 16.06 (0.308) | 0.977 (1.139) | 5.09 (0.301) | 4.89 (0.318) | 0.960 (1.057) |
+| exec-pool on-CPU cores | 1.445 | 1.399 | 0.968 [0.888, 1.055] | 1.611 | 1.487 | 0.923 [0.853, 0.999] |
+| exec-pool on-CPU ms per 1k fills | 6.233 | 5.903 | 0.947 [0.883, 1.016] | 5.953 | 5.506 | 0.925 [0.832, 1.029] |
+| RSS mean MB | 6,231 | 6,252 | 1.003 | 3,665 | 3,687 | 1.006 |
+
+### 114.5 Verdict
+
+* **Merge rule (section 91, owner s128):** B adds exec-thread CPU per fill on deep with the CI above 1 (1.044 [1.009,
+  1.081]); standard points the same way (1.035, CI spans 1). Under the rule as written L2.1 does not merge default on.
+  Blocks/s, p50 and p99 move the right way on both shapes and CPU-s per 1M fills is flat, so this is not the failure
+  the rule guards against (bigger blocks, lower block rate): block rate rises because pass A overlaps matching (pass A
+  per block -70%), while the exec thread itself does ~7% (deep) / ~3% (std) more on-CPU work per cell.
+* **Where the extra exec-thread work comes from:** runqueue wait per 1k fills roughly doubles and pass B per 1k fills
+  rises (1.14 deep, 1.06 std), while pool CPU per fill falls. This fits the per-market park / unpark handoff in
+  `StreamRx::take` (`crates/torus-bridge/src/exec_pool.rs`: the exec thread parks on each market not yet ready and a
+  worker unparks it). Not profiled, so not localized beyond that.
+* **Deep timeouts doubled** (5 -> 10, both B cells 5; reasons 8 -> 25, after_vote 20, leader 4). Small counts at n = 2;
+  not resolved, but it is the wrong direction for the rule.
+* **Options for the owner:** (1) do not merge; (2) merge default off as an exception (+21% / +10% blocks/s, lower p50
+  and p99, 0 fallbacks); (3) cut the wake-ups (batch several markets per handoff or spin briefly before parking), then
+  rerun deep at n = 3 for exec on-CPU per fill and timeouts. Not measured here: the flag-off cost against main (both
+  arms ran the same binary).
+
+### 114.6 Limits and data
+
+* n = 2 per arm, 1 df: blocks/s, p50 and p99 CIs span 1 despite both rounds agreeing in direction.
+* Exec-pool busy comes from a 1 Hz /proc sampler of the `torus-exec-pool` threads, not from a node metric.
+* Analysis: `~/bench-results-matched/ozarchy-9b-run/analyst/` (`9b-analyse.py`; `9b-deep.txt`, `9b-std.txt`).
+* Campaign: `~/bench-results-matched/ozarchy-9b-run/{deep,std}/` (`cells.tsv`, `campaign.log`), `chain-main.log`,
+  `contention-main.tsv`, `pool-main.tsv`; tools and specs `ozarchy-9b-tools/` (`9bd-spec.json`, `9bs-spec.json`,
+  drivers, `9b-chain.sh`, `b9-contention.py`, `b9-foreign.py`, `b9-pool.py`); build `ozarchy-9b-stage/build/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
