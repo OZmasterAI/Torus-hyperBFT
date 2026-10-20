@@ -24,8 +24,8 @@ use torus_evm::EvmExecutor;
 use torus_genesis::Genesis;
 use torus_mempool::{Mempool, MempoolConfig};
 use torus_network::{LibP2PNetwork, NetworkConfig};
-use torus_rpc::{find_latest_height, BlockNotifier, RpcServer};
-use torus_state::cf::{CF_BLOCK_HEADERS, CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
+use torus_rpc::{find_latest_height, BlockNotifier, HeadPublisher, RpcServer};
+use torus_state::cf::{CF_CONSENSUS_META, META_NATIVE_APPLIED_HEIGHT};
 use torus_state::{PrunerConfig, StateDb, StatePruner};
 use torus_types::ChainConfig;
 
@@ -1055,7 +1055,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Block notifier + shared height counter (consensus replica <-> RPC server)
     let notifier = BlockNotifier::new();
-    let notifier_for_replica = notifier.clone();
     // s80: newTrades / userFills are fed from execution (each executed block's
     // fills), not read back from the DB at commit; fills are recorded only
     // while a stream subscriber exists. Set before the replica starts.
@@ -1080,7 +1079,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let latest_height_shared = Arc::new(std::sync::atomic::AtomicU64::new(find_latest_height(
         &state_db,
     )));
-    let latest_height_for_handler = latest_height_shared.clone();
+    // T5.3: one publisher of the RPC height + WS heads, fed by the commit
+    // handler (the header frontier after each commit) and by the consensus
+    // header-persisted hook (each height once its off-thread header write
+    // landed, which can be after its commit event): the last committed height
+    // becomes visible even when no commit follows. In order, each height once.
+    let head_publisher = Arc::new(HeadPublisher::new(
+        state_db.clone(),
+        notifier.clone(),
+        latest_height_shared.clone(),
+    ));
+    let head_publisher_for_hook = head_publisher.clone();
+    app.set_header_persisted_hook(Arc::new(move |height: u64| {
+        head_publisher_for_hook.publish_up_to(height);
+    }));
 
     // 8. Start replica with on_commit_block handler for WebSocket subscriptions.
     // View-phase timing: one recorder clone per lifecycle event, timestamps taken
@@ -1186,15 +1198,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &mempool_for_handler,
                 Some(&metrics_for_handler),
             );
-            latest_height_for_handler.store(height, std::sync::atomic::Ordering::Relaxed);
-            match state_db_for_handler.get_cf_raw(CF_BLOCK_HEADERS, &height.to_be_bytes()) {
-                Ok(Some(data)) if data.len() > 32 => {
-                    if let Ok(header) = serde_json::from_slice::<serde_json::Value>(&data[32..]) {
-                        notifier_for_replica.notify_new_block(header);
-                    }
-                }
-                _ => {}
-            }
+            head_publisher.publish_up_to(height);
         })
         .build()
         .start();
@@ -1976,6 +1980,7 @@ fn scopeguard_observe<F: FnOnce()>(f: F) -> impl Drop {
 mod tests {
     use super::*;
     use clap::Parser;
+    use torus_state::cf::CF_BLOCK_HEADERS;
 
     /// R19 follow-up (owner s112): a genesis with a duplicate validator or an
     /// address in both accounts[] and evm_alloc refuses to start, naming the
