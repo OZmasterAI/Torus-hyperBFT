@@ -4938,6 +4938,8 @@ impl ExecutionContext {
             // mark (`begin_block_oracle` above). The EVM ran before this phase:
             // precompile readers see a block's liquidations from the next block.
             ctx.liq_value_sum = self.liq_value_sum;
+            // 8u follow-up: the step's own exec-thread timer (inside the tail).
+            let liq_timer = std::time::Instant::now();
             #[cfg(test)]
             let _ = match self.test_adl_work {
                 Some(w) => NativeExecutor::run_liquidations_with(
@@ -4950,6 +4952,10 @@ impl ExecutionContext {
             };
             #[cfg(not(test))]
             let _ = NativeExecutor::run_liquidations(&mut ctx);
+            if let Some(ref m) = self.metrics {
+                m.exec_liquidation_step_seconds
+                    .observe(liq_timer.elapsed().as_secs_f64());
+            }
             #[cfg(test)]
             if let Some(probe) = self.test_block_probe.as_ref() {
                 probe(&ctx);
@@ -17617,6 +17623,7 @@ mod crash_recovery_tests {
             "torus_exec_settle_pass_b_seconds",
             "torus_exec_cache_flush_seconds",
             "torus_exec_post_engine_tail_seconds",
+            "torus_exec_liquidation_step_seconds",
             "torus_exec_engine_untimed_seconds",
         ] {
             assert!(
