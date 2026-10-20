@@ -181,7 +181,7 @@ python3 tools/matched-bench/test_harness.py
    `min(height)-5` via `eth_getBlockByNumber` on every node, a sha256 state
    digest per node (every market's `torus_getOrderBook` + `torus_getOpenInterest`
    + `torus_getBalances` of 50 bench senders), matched/placed/resting/actions
-   counters (must be identical), `panicked|FAIL-STOP` and `ERROR` line counts.
+   counters (must be identical), `panicked` + ERROR-level fail-stop line counts and `ERROR` line counts.
    **Liquidation-stress cells only** (`LIQ_THIN>0` or `ORACLE_SHOCK_BP>0`): the
    digest also covers the three protocol accounts of
    `torus_core::liquidation` — `LIQUIDATOR_VAULT` (`0x746f...766c74`,
@@ -486,7 +486,19 @@ break every later cell).
 - `exec_queue_depth_at_kill` — committed-but-unexecuted blocks already queued
   on E when it died (that part of the rewind is inherent, pipeline or not).
 - `rewind_beyond_exec_queue` = the two subtracted — **what the pipeline cost.
-  Must be <= 2** (depth-1 hand-off + the in-flight batch).
+  Must be <= `max_rewind_beyond_exec_queue`**: 2 with checkpoints off
+  (per-block flush: depth-1 hand-off + the in-flight batch); 202 with
+  coalesced checkpoints on (`checkpoint_interval_s` set, default 15 s on
+  validators). The durable marker is then the last checkpoint W finished, so a
+  kill replays the open checkpoint window plus at most one checkpoint W was
+  still writing, and neither spans more than 100 blocks because every 100th
+  height forces a checkpoint: 2 + 2 x 100 (`max_rewind_hard_cap`). No
+  block-rate estimate: a survivor's rate does not bound the killed node's span
+  (summarize.py `rewind_limit`).
+- `panic_or_failstop_lines` (restart scan) counts `panicked` lines and
+  fail-stop / FATAL / conflicting-blocks lines **at ERROR level only**; the
+  startup `INFO ... running state hash fail-stop (...) on=false` is not one
+  (crash-kill.sh `crash_failstop_count`).
 - `pipeline_flag_confirmed` — the restarted node logged
   `bl2 exec pipeline ENABLED`. Required when the cell env has
   `TORUS_EXEC_PIPELINE=1`, otherwise the gate crash-tested the serial path and

@@ -939,19 +939,25 @@ class CrashKillGuardTest(unittest.TestCase):
 
     def test_panic_count_ignores_info_level_failstop_config_line(self):
         """s83: every running-hash node logs `INFO ... fail-stop (...) on=false`
-        at startup; counting it made every hash cell DISAGREE. Real fail-stops
-        (ERROR/WARN) and raw `panicked` lines must still count."""
+        at startup; counting it made every hash cell DISAGREE. s131: WARN lines
+        only MENTION fail-stop too ("fail-stop is off, so it keeps running");
+        the node emits every real fail-stop at ERROR. Count raw `panicked`
+        lines plus fail-stop / FATAL / conflicting-blocks lines at ERROR only
+        (same rule as crash-kill.sh crash_failstop_count)."""
         with open(RUN_CELL_SH) as f:
-            line = next(l for l in f if l.lstrip().startswith("panics=$(grep"))
+            line = next(l for l in f if l.lstrip().startswith("panics=$("))
         esc = "\x1b"
         sample = (
             "\n".join(
                 [
                     f"{esc}[2m2026-10-01T22:25:23Z{esc}[0m {esc}[32m INFO{esc}[0m state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
                     "2026-10-01T22:25:23Z  INFO state_hash: running state hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false",
-                    f"{esc}[2m2026-10-01T22:30:00Z{esc}[0m {esc}[31mERROR{esc}[0m state_hash: STATE HASH FAIL-STOP latched at checkpoint 1900",
+                    "2026-10-01T22:26:00Z  WARN state_hash: running state hash: this node diverged from the on-chain quorum hash at this checkpoint (recorded); fail-stop is off, so it keeps running",
+                    f"{esc}[2m2026-10-01T22:27:00Z{esc}[0m {esc}[33m WARN{esc}[0m state_hash: node is hash-unverified: no fail-stop decision on the quorum mismatch",
+                    f"{esc}[2m2026-10-01T22:30:00Z{esc}[0m {esc}[31mERROR{esc}[0m state_hash: FAIL-STOP (TORUS_STATE_HASH_FAILSTOP=1): latching exec_failed, node stops voting",
+                    "2026-10-01T22:30:30Z ERROR exec_pipeline: FATAL: flush worker PANICKED \u2014 latching fail-stop height=7",
                     "thread 'torus-execution' panicked at crates/x.rs:1:1",
-                    "2026-10-01T22:31:00Z  WARN app: Latching fail-stop: conflicting blocks",
+                    '{"timestamp":"x","level":"ERROR","fields":{"message":"CRITICAL SAFETY VIOLATION: two conflicting blocks were finalized at the same height. Latching fail-stop"}}',
                 ]
             )
             + "\n"
@@ -965,7 +971,15 @@ class CrashKillGuardTest(unittest.TestCase):
             text=True,
             env=dict(os.environ, lg=lg),
         )
-        self.assertEqual(r.stdout.strip(), "3", r.stderr)
+        self.assertEqual(r.stdout.strip(), "4", r.stderr)
+        # an absent log is 0, never empty
+        r = subprocess.run(
+            ["bash", "-c", line.strip() + '; echo "$panics"'],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, lg=lg + ".missing"),
+        )
+        self.assertEqual(r.stdout.strip(), "0", r.stderr)
 
     def test_open_order_budget_reaches_the_bench_only_when_set(self):
         """OPEN_ORDER_BUDGET=N -> bench --open-order-budget N (keeps senders
@@ -1552,6 +1566,14 @@ class CrashGateSummaryTest(unittest.TestCase):
         "--digest-quiescent",
         "1",
     ]
+    # The pre-Phase-3 per-block flush: the durable applied height trails the
+    # executed one by the depth-1 hand-off only.
+    PER_BLOCK = [
+        "--node-env",
+        json.dumps({"TORUS_EXEC_PIPELINE": "1", "TORUS_CHECKPOINT_INTERVAL_MS": "0"}),
+        "--digest-quiescent",
+        "1",
+    ]
 
     def setUp(self):
         self.d = tempfile.mkdtemp(prefix="crash-summ-")
@@ -1578,10 +1600,12 @@ class CrashGateSummaryTest(unittest.TestCase):
         self.assertEqual(s["headline"]["crash_gate"], "PASS")
 
     def test_rewind_beyond_the_exec_queue_is_bounded(self):
-        """depth-1 pipelining may cost ONE extra block of replay on top of the
-        committed-but-unexecuted queue. Five is a broken fence."""
+        """Per-block flush (checkpoint interval 0): depth-1 pipelining may cost
+        ONE extra block of replay on top of the committed-but-unexecuted queue.
+        Five is a broken fence."""
         write_crash(self.d, gap=8, queue=3)
-        s, _ = run_summarize(self.d, extra=self.ON)
+        s, _ = run_summarize(self.d, extra=self.PER_BLOCK)
+        self.assertEqual(s["crash"]["max_rewind_beyond_exec_queue"], 2)
         self.assertEqual(s["crash"]["rewind_beyond_exec_queue"], 5)
         self.assertEqual(s["crash"]["verdict"], "FAIL")
 
@@ -1767,6 +1791,143 @@ class CrashGateSummaryTest(unittest.TestCase):
         self.assertEqual(a["counters_compared_nodes"], ["val0", "val1", "val2"])
         self.assertFalse(a["counters_equal"])
         self.assertEqual(a["agreement_verdict"], "DISAGREE")
+
+
+def add_failed_scrapes(d, node="val0", offsets=(140, 145, 150)):
+    """Append the rows a FAILED metrics scrape leaves in sampler.csv: every
+    metric 0 at that timestamp (Codex review of d7867617: such a row made a
+    rate-based bound negative and failed a valid recovery)."""
+    p = os.path.join(d, "sampler.csv")
+    with open(p) as f:
+        ncols = len(f.readline().strip().split(",")) - 2
+    with open(p, "a") as f:
+        for off in offsets:
+            f.write("%d,%s,%s\n" % (BENCH_START + off, node, ",".join(["0"] * ncols)))
+
+
+class CheckpointRewindBoundTest(unittest.TestCase):
+    """Bench 8l (perf doc 107.6): with coalesced checkpoints (15 s, the
+    validator default) the durable applied height is the LAST checkpoint W
+    finished, so a SIGKILL legitimately replays the open checkpoint window
+    plus at most one checkpoint W was still writing (8l: 27 blocks, 23 beyond
+    the exec queue, digests agree). The old constant bound of 2 rejected that
+    valid cell. Every 100th height forces a checkpoint, so with checkpoints on
+    the bound is 2 + 2 x 100 = 202; with them off it stays 2."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="ckpt-rewind-")
+        self.addCleanup(shutil.rmtree, self.d, ignore_errors=True)
+        write_cell(self.d, 1_000, 1_000)
+        write_agreement(self.d, ["same"] * 3)
+
+    def env(self, **kw):
+        e = {"TORUS_EXEC_PIPELINE": "1"}
+        e.update(kw)
+        return ["--node-env", json.dumps(e), "--digest-quiescent", "1"]
+
+    def crash(self, gap, queue, **kw):
+        write_crash(self.d, gap=gap, queue=queue, kill_ts=BENCH_START + 150.0, **kw)
+
+    def test_8l_shape_23_beyond_the_queue_passes(self):
+        """8l Con: 27-block replay, 23 beyond the exec queue, default 15 s."""
+        self.crash(gap=27, queue=4)
+        s, _ = run_summarize(self.d, extra=self.env())
+        c = s["crash"]
+        self.assertEqual(c["rewind_beyond_exec_queue"], 23)
+        self.assertEqual(c["checkpoint_interval_s"], 15.0)
+        self.assertEqual(c["max_rewind_beyond_exec_queue"], 202)
+        self.assertEqual(c["max_rewind_hard_cap"], 202)
+        self.assertEqual(c["verdict"], "PASS", c["fail_reasons"])
+        self.assertEqual(s["headline"]["crash_gate"], "PASS")
+
+    def test_failed_scrape_rows_do_not_affect_the_bound(self):
+        """Zero-valued rows from a failed val0 scrape around the kill: a
+        23-block and a full-span (2 + 2 x 100) replay both still PASS."""
+        add_failed_scrapes(self.d)
+        for gap in (4 + 23, 4 + 202):
+            self.crash(gap=gap, queue=4)
+            s, _ = run_summarize(self.d, extra=self.env())
+            c = s["crash"]
+            self.assertEqual(c["max_rewind_beyond_exec_queue"], 202, gap)
+            self.assertEqual(c["verdict"], "PASS", (gap, c["fail_reasons"]))
+
+    def test_full_span_replay_passes_explicit_interval(self):
+        """Open window (<= 100 blocks) + one checkpoint W was still writing
+        (<= 100) + the hand-off slack 2: the worst valid case."""
+        self.crash(gap=4 + 202, queue=4)
+        s, _ = run_summarize(
+            self.d, extra=self.env(TORUS_CHECKPOINT_INTERVAL_MS="15000")
+        )
+        self.assertEqual(s["crash"]["checkpoint_interval_s"], 15.0)
+        self.assertEqual(s["crash"]["verdict"], "PASS", s["crash"]["fail_reasons"])
+
+    def test_runaway_rewind_beyond_202_fails(self):
+        add_failed_scrapes(self.d)
+        self.crash(gap=4 + 203, queue=4)
+        s, _ = run_summarize(self.d, extra=self.env())
+        c = s["crash"]
+        self.assertEqual(c["verdict"], "FAIL")
+        self.assertTrue(any("rewind 203" in r for r in c["fail_reasons"]), c["fail_reasons"])
+        self.assertEqual(s["headline"]["crash_gate"], "FAIL")
+
+    def test_per_block_configs_keep_the_tight_bound(self):
+        """Interval 0, the flush worker off, or a deferred book mode (the role
+        default yields to it) all mean the per-block flush: bound 2."""
+        self.crash(gap=4 + 3, queue=4)
+        for env in (
+            self.env(TORUS_CHECKPOINT_INTERVAL_MS="0"),
+            self.env(TORUS_EXEC_PIPELINE="0"),
+            self.env(TORUS_BOOK_ROWS="3"),
+        ):
+            s, _ = run_summarize(self.d, extra=env)
+            c = s["crash"]
+            self.assertIsNone(c["checkpoint_interval_s"], env)
+            self.assertEqual(c["max_rewind_beyond_exec_queue"], 2, env)
+            self.assertEqual(c["verdict"], "FAIL", env)
+
+    def test_interval_parse_matches_the_node(self):
+        """TORUS_CHECKPOINT_INTERVAL_MS parses like the node's
+        exec_pipeline::parse_checkpoint_interval: blank after trim -> the 15 s
+        default; else Rust `trim().parse::<u64>()` (optional leading '+',
+        ASCII digits, <= u64::MAX); 0 or any Err (incl. overflow) -> OFF."""
+        self.crash(gap=4 + 3, queue=4)
+        cases = (
+            ("+15000", 15.0),
+            (" 15000 ", 15.0),
+            ("\t15000\n", 15.0),
+            ("   ", 15.0),            # blank = unset = role default
+            ("18446744073709551615", 18446744073709551615 / 1000.0),  # u64::MAX
+            ("18446744073709551616", None),  # overflow -> Err -> off
+            ("0", None),
+            ("+0", None),
+            ("+", None),
+            ("-15000", None),
+            ("++15000", None),
+            ("15_000", None),
+            ("15000ms", None),
+            ("\u0661\u0665", None),  # non-ASCII digits: Rust rejects
+        )
+        for raw, want in cases:
+            s, _ = run_summarize(
+                self.d, extra=self.env(TORUS_CHECKPOINT_INTERVAL_MS=raw)
+            )
+            c = s["crash"]
+            self.assertEqual(c["checkpoint_interval_s"], want, repr(raw))
+            self.assertEqual(
+                c["max_rewind_beyond_exec_queue"], 2 if want is None else 202, repr(raw)
+            )
+
+    def test_each_kill_of_a_multi_crash_cell_gets_the_checkpoint_bound(self):
+        self.crash(gap=27, queue=4, seq=1)
+        write_crash(
+            self.d, gap=4 + 203, queue=4, name="crash-2.json", seq=2,
+            kill_at=180, kill_ts=BENCH_START + 180.0,
+        )
+        s, _ = run_summarize(self.d, extra=self.env())
+        ks = s["crash_kills"]
+        self.assertEqual([k["verdict"] for k in ks], ["PASS", "FAIL"], ks)
+        self.assertEqual(ks[1]["max_rewind_beyond_exec_queue"], 202)
+        self.assertEqual(s["headline"]["crash_gate"], "FAIL")
 
 
 # ------------------------------------ run-cell.sh: s76 BENCH_RPCS (bench ingress)
@@ -1984,7 +2145,7 @@ class MultiCrashSummaryTest(unittest.TestCase):
 
     def test_a_later_kill_with_an_unbounded_rewind_fails(self):
         self.kill(2, gap=8, queue=3)
-        s, _ = run_summarize(self.d, extra=self.ON)
+        s, _ = run_summarize(self.d, extra=CrashGateSummaryTest.PER_BLOCK)
         self.assertEqual(s["crash_kills"][1]["rewind_beyond_exec_queue"], 5)
         self.assertEqual(s["headline"]["crash_gate"], "FAIL")
 
@@ -2174,6 +2335,47 @@ class CrashScanTest(unittest.TestCase):
         self.assertEqual(j["gap"], 0)
         self.assertIsNone(j["applied_height_at_crash"])
         self.assertFalse(j["pipeline_enabled_line"])
+
+    # ---- 8l (perf doc 107.6): only REAL fail-stops count ------------------
+    ESC = "\x1b"
+
+    def test_info_failstop_config_line_is_not_a_failstop(self):
+        """Every node logs `INFO ... running state hash fail-stop (...) on=false`
+        at startup; the restart tail counted it and REJECTed a valid crash cell.
+        WARN mentions ("fail-stop is off", "no fail-stop decision") are not
+        fail-stops either: the node emits every real one at ERROR."""
+        e = self.ESC
+        j = self.scan(
+            REPLAY_TAIL
+            + "2026-10-20T06:31:02.1Z  INFO torus_consensus::state_hash: running state "
+            "hash fail-stop (TORUS_STATE_HASH_FAILSTOP) on=false\n"
+            + f"{e}[2m2026-10-20T06:31:02.1Z{e}[0m {e}[32m INFO{e}[0m "
+            f"{e}[2mtorus_consensus::state_hash{e}[0m{e}[2m:{e}[0m running state hash "
+            f"fail-stop (TORUS_STATE_HASH_FAILSTOP) {e}[3mon{e}[0m{e}[2m={e}[0mfalse\n"
+            + "2026-10-20T06:35:00.1Z  WARN torus_consensus::state_hash: running state "
+            "hash: this node diverged from the on-chain quorum hash at this checkpoint "
+            "(recorded); fail-stop is off, so it keeps running\n"
+            + '{"timestamp":"x","level":"INFO","fields":{"message":"running state hash '
+            'fail-stop (TORUS_STATE_HASH_FAILSTOP)","on":false}}\n'
+        )
+        self.assertEqual(j["panic_or_failstop_lines"], 0)
+        self.assertEqual(j["gap"], 11)
+
+    def test_real_failstop_lines_count(self):
+        e = self.ESC
+        j = self.scan(
+            REPLAY_TAIL
+            + "2026-10-20T06:40:00.1Z ERROR torus_consensus::exec_pipeline: FATAL: flush "
+            "worker PANICKED \u2014 latching fail-stop height=1200\n"
+            + f"{e}[2m2026-10-20T06:40:01.1Z{e}[0m {e}[31mERROR{e}[0m "
+            f"{e}[2mtorus_consensus::state_hash{e}[0m: FAIL-STOP "
+            "(TORUS_STATE_HASH_FAILSTOP=1): latching exec_failed, node stops voting\n"
+            + '{"timestamp":"x","level":"ERROR","fields":{"message":"CRITICAL SAFETY '
+            "VIOLATION: a DIFFERENT block arrived at an already-applied height \u2014 two "
+            'conflicting blocks were finalized at the same height."}}\n'
+            + "thread 'torus-execution' panicked at crates/x.rs:1:1\n"
+        )
+        self.assertEqual(j["panic_or_failstop_lines"], 4)
 
     def test_counts_panics_holes_and_errors(self):
         j = self.scan(
