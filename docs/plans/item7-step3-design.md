@@ -1,6 +1,9 @@
 # Design: item 7 step 3, isolate trading from EVM
 
-Status: revision 2 (s127), DESIGN ONLY, for the owner. Nothing built. Revision 1 (`3b79a617`) went through two
+Status: revision 2 (s127). **Option 0 (P1 + P2) BUILT** on `feat/item7-option0` (plan `item7-option0-impl.md`,
+steps 0-4, G0-G4, 2026-10-19), behind `TORUS_EVM_FAST_PATH`; Q11 passed (perf doc section 107) and the owner merged it
+with the flag **on by default** (s131; `TORUS_EVM_FAST_PATH=0` turns it off per node). RPC freshness as
+question 4 a (`docs/api/eth-head.md`). T (P3), HL order and C0 are not built. Revision 1 (`3b79a617`) went through two
 adversarial reviews: Codex (`reviews/codex-item7-step3-adv.md`, needs-attention: P1 + P2) and Claude
 (`reviews/item7-step3-claude-review.md`, build with changes: 3 high, 5 medium, 2 weak spots, missing tests). Every
 finding is verified in code and handled; section 10 maps each one to the change. Owner direction s127 is in: the RPC
@@ -162,7 +165,7 @@ Keep the EVM path on the DB and make the barrier cheaper. It does not work out:
 So a narrower barrier is either the same write or a new durability model. Option 0 removes the need for one.
 
 ### 0. EVM blocks on the pipelined path, same order (recommended base)
-- **Mechanism.** Behind a node-local flag `TORUS_EVM_FAST_PATH` (default off until Q11, as `TORUS_EPOCH_FAST_PATH`,
+- **Mechanism.** Behind a node-local flag `TORUS_EVM_FAST_PATH` (default off until Q11, as `TORUS_EPOCH_FAST_PATH`; on since s131,
   `exec_pipeline.rs:57-66`), drop `!has_evm` from the pipelined predicate (`app.rs:3163-3173`), then:
   1. **Overlay first.** Build the block's layered overlay (parent, L, deferred part, C: `checkpoint_read_layers`,
      `app.rs:2643`) before the EVM section (today it is built after it, `app.rs:3415-3448`). The EVM section stays the

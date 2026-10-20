@@ -58,6 +58,11 @@ main at or after 50d2316c.
   `TORUS_HEADER_RESEND_MS=3000` (`=0` = off). Compare against results from before the merge only with the
   pre-merge arms' env spelled out. Binaries built before it (M `e3d11cb9`, Q9's `e1be6c15` / `b2dd21a4`, step Z's
   `9d770519`) keep the old defaults: their arms set PC + F by env, as in sections 83-87.
+- **Defaults change (s131, item 7 option 0 merge `merge/item7-option0`; binaries built from main after it):** an arm
+  that leaves E (`TORUS_EVM_FAST_PATH`) unset gets the EVM fast path ON. A flag-off arm must set `TORUS_EVM_FAST_PATH=0`
+  (an `absent_env` entry for it now means ON). Without EVM load (`EVM_LOAD_RATE` unset) the flag is inert (section 107).
+  Binaries built before the merge (`f8a45a2d` and branches on it: `perf/mode3-b1`, `perf/l31-coalesced-save`) keep it
+  off when unset.
 - Block rate from cells shorter than about 5 min is indicative only: under sustained load it falls to exec pace
   (5.9 -> 3.0 blocks/s by minute 5) while matched/s stays flat (section 79). matched/s stays the primary metric.
 - Watch `no_proposal` in every replicate (1 in the s58dmt check cell, 1 in the s58safe soak).
@@ -704,8 +709,9 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    body persist) and the exec thread's (checkpoint upkeep, freeze, flush handoff, settle wait), plus RocksDB write /
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
-   **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l done; **8t running**, then **8x** (b1 screen), **8y** (L3.1 A/B),
-   then 8w (RH4 rerun). Run them back to back.
+   **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l, 8t, 8x done; **8y running** (L3.1 A/B), then **8z** (Classic
+   cadence check, clears b1), then 8w (RH4 rerun). Run them back to back. A merged-main baseline follows once L2.2
+   default-on lands.
    **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
    merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
    1.086, p50 0.884 on the deep book), so their baselines shift slightly vs older sections: compare against
@@ -719,7 +725,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    timer on main). A1 aims at the right mechanism (87 judged the put by its mean, the gap is its tail); cheaper:
    write the manifest outside the state DB's write queue or off the consensus thread. Missing: timers on the put and
    the commit handler, a checkpoint DB-write start / end line. Gaps 14-19 s (`end_pass=0`, switched too late).**
-8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8y; ~1 h 50). 8r (section 103.6): the
+8w. **RH4 3-arm rerun: state pruner compaction filter** (owner s131; after 8z; ~1 h 50). 8r (section 103.6): the
    cost both retention arms share is state-DB compaction of `cf_block_bodies` from the state pruner's
    `delete_range_cf` range deletes (compaction CPU x2.0, L0 3.3 vs 1.2). Fix: `perf/rh4-gc-worker` `baffa3a5` (on
    `a0181b8b`, pushed, not merged; Codex torus review: no findings): `TORUS_PRUNE_MODE=filter` (default) saves the
@@ -747,6 +753,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    share = total minus W's), checkpoints per node, any fail-stop / tripwire line (must be 0). **Pass:** deep B1/C
    blocks/s near F/C; shallow B1 >= F on blocks/s and p50; B1 CPU per fill no worse than b0's +8.9% vs Classic
    (section 104); E's write share ~0. If it passes: C vs B1 full A/B, n = 3 per shape (~2 h), right after.
+   **Done s70 (ozarchy-8x, section 109; `ab4ded4e` node `f19d9385`, 8 / 8 cells valid, 250 CHECK OK, 0 tripwire /
+   fail-stop lines; deep C and F rerun after a Telegram overlap, originals kept as *-telegram-unused): FAIL on the CPU
+   rule, A/B not run. CPU-s per 1M fills B1 +13.3% shallow / +11.4% deep vs Classic (limit b0's +8.9%; F +16.8% /
+   +20.1%). Passes the other three: deep B1 / C blocks/s 3.18x (F 1.86x), p50 17 ms (F 75, C 210), matched/s 1.129;
+   shallow B1 11.59 vs F 6.38 blk/s, p50 16 vs 62 ms, matched/s 0.967; E's write share 0. Extra CPU is off the exec
+   thread (exec on-CPU per fill -0.08 / -0.82): W ~+1.4-1.5 (book write + per-block digest), deep state compaction
+   +0.78, unnamed threads ~+1.2. Caveat: shallow Classic on this binary is slow (8.10 blk/s, p50 31 ms vs 12-14 /
+   14-18 elsewhere): check before any A/B. CPU rule vs throughput gain: owner's call.**
 8y. **L3.1 A/B: Classic book save once per checkpoint window** (owner s131; after 8x; ~1 h 30). Classic encodes every
    dirty book's whole blob each block (`save_order_books` 78.9 ms per block at P1M). L3.1 skips the per-block encode and
    encodes each owed book once at every window close. **One binary** `perf/l31-coalesced-save` `b7bb3666` (on option 0
@@ -758,6 +772,19 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per 1M fills, `exec_save_books_seconds`, the window-close spike (`torus_exec_book_coalesce_close_seconds` and
    `_close_books`; design estimate ~56 ms at P1M), `_skipped`, the new `torus_exec_liquidation_step_seconds` (8u's open
    question), and `torus_exec_resident_rebuilds` (must stay 1). Verdict under the exec-path merge rule.
+8z. **Classic cadence check: does the b1 binary slow Classic?** (owner s131; after 8y; ~35 min). Section 109: Classic on
+   `perf/mode3-b1` `ab4ded4e` ran shallow at 8.10 native blocks/s, p50 31 ms, ~30k fills per block (w1 7.89 too) vs
+   12.3-16.0 / ~18k on the same base in 8l (section 107 Noff, `f8a45a2d`) and 13.7-14.2 elsewhere. A read-only code
+   study (s131) found no Classic-path change in b0 / b1 (Classic keeps the serial save on E; `Job::Digest.books` is
+   None; the deferred-books flag never sets) and equal per-fill costs (exec on-CPU 2.78 vs 2.67-2.84 ms per 1k fills,
+   CPU-s per 1M 22.85): likely a cadence flip, not code. **Two binaries:** **O** = `feat/item7-option0` `f8a45a2d`;
+   **B** = `perf/mode3-b1` `ab4ded4e`. Both Classic (`TORUS_BOOK_ROWS` unset), 15 s checkpoints, code defaults (L3.3 and
+   the EVM fast path are off on both: they predate those defaults), no EVM load, standard (shallow) shape. Warm-up,
+   then O B B O (n = 2), 300 s cells. Report per cell and per arm: native blocks/s, fills per block, block p50 / p99,
+   matched/s, exec ms and exec on-CPU ms per 1k fills, CPU-s per 1M fills, exec busy, checkpoints per node, and the
+   blocks/s time series per minute (a cadence flip shows as a level shift within or between cells). **Verdict:** B/A
+   blocks/s within noise (or both arms swinging alike) -> b1 cleared to merge; B consistently ~0.6x with equal
+   per-fill cost -> report it (18c then bisects b0 vs b1).
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 

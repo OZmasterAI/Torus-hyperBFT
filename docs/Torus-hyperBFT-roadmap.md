@@ -37,7 +37,7 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 - **P0.0 activation-height gating:** not started; only `state_hash_activation_height` exists. Tracked in P0.0.
 - **Liquidator-vault deficit (P5):** monitoring is done. Owner s131 (as decided s99): for the testnet, seed the liquidator vault with capital in the genesis, with ADL as the backstop once the vault runs dry; an HLP-style deposit vault before mainnet. Still open: the seed amount. Tracked in P5.
 - **Aliased opaque position rows in the parallel settle:** answer "can they exist?" first, then fix before the testnet genesis. Tracked in Pre-testnet decisions.
-- **EVM proposer concentration (Q12):** pick N coprime to the validator count or rotate by EVM height; genesis-bound. Tracked in Pre-testnet decisions.
+- **EVM proposer concentration (Q12):** decided s131: keep N = 11 for the testnet (coprime to 3 / 4 validators); revisit before mainnet. Tracked in Pre-testnet decisions.
 - **Retention default (prune by default or not):** GC-pass logging, from-block-1 check and an 8h rerun first; perf doc sections 95 and 103.6. Tracked in Pre-testnet decisions.
 - **Book storage mode for the genesis (Classic vs mode 3):** bench 8p / 8s and owner decision. Tracked in Pre-testnet decisions and `docs/perf/bench-queue.md`.
 - **Running state hash in the genesis:** whether the testnet genesis sets `consensus.state_hash_activation_height` (absent = running hash off; `docs/plans/running-state-hash-impl.md`). Owner decision before the genesis.
@@ -247,6 +247,8 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
 
 ## Tier 5 — Latency: block cadence and tail *(after item 6 and item 7; added s121)*
 
+> **Status s131:** item 7 steps 1-2 merged (s123, s127); step 3 option 0, the EVM fast path, merged s131 and on by default (`TORUS_EVM_FAST_PATH`, perf doc section 107: EVM blocks no longer barrier the exec pipeline). T, HL order and C0 not built.
+>
 > **Order (owner s121):** item 7 steps 1-2 (EVM lanes, `plans/item7-evm-lanes.md`; overdue, see there) -> item 6 Phase 5 build steps (after archy's step 0 re-profile) -> Tier 5. Tier 5 comes after item 7 because item 7 changes the block cadence itself (EVM only every Nth block, then HL-style small and big blocks). The measurement-only first steps of T5.1 and T5.2 need no code and can run on archy's rig whenever it is free.
 >
 > **Why after item 6:** item 6 (Phases 1-5) targets matched/s on the exec-bound axis. Block time is where Hyperliquid is furthest ahead: HL publishes a 0.2 s median and 0.9 s p99 end-to-end latency (co-located client, request to committed response; HL docs, HyperCore overview) and runs ~70 ms blocks (unofficial figure). Our bench (300 markets, Phase 4 node, section 71 of `perf/ozarchy-antispam-item6-pf1-2026-10-04.md`) runs ~310 ms per block with a block-time p99 of 1.29-1.43 s. The numbers are not like for like (HL: end-to-end latency at normal load; ours: block interval under a saturating bench, 3 validators on one host), so step 1 of each item is measuring them the same way.
@@ -455,6 +457,8 @@ Tiers 1-4 are mostly done: T1.1-T1.6, T2.1-T2.4, T3.2, T4.1-T4.3 and the T4.4 jo
   rotation. Not a throughput issue, but all EVM ordering (and its MEV) sits with one validator. Option 0 does not
   change it. Decide before the testnet genesis: pick N coprime to the validator count, or rotate the EVM proposer by
   EVM height instead of view (consensus change, genesis-bound).
+  **Decision (owner s131): keep N = 11 for the testnet** (coprime to the planned 3 or 4 validators, so no
+  concentration). Revisit before mainnet (rotate by EVM height, own design) once the validator set grows or changes.
 - **Validator history retention.** Prune by default (`--retention-blocks`) only if Q9 (main vs main + RH4 DA body GC
   with `TORUS_RETENTION_BLOCKS=1000`) proves it works; the production N is decided after Q9 (starting point about
   100,000 blocks, about 5-9 h a validator can be offline and still catch up without state sync). Owner s126.

@@ -475,6 +475,24 @@ pub struct Metrics {
     /// bundle + block metadata). Near-zero in native-only bench cells; observed
     /// on every block so the residual accounts for it.
     pub exec_evm_seconds: Histogram,
+    /// Item 7 option 0 (task 4.2): executed blocks with EVM txs, on either
+    /// path (an all-skipped EVM section included). With
+    /// `exec_evm_fast_path_blocks` it gives bench Q11's "pipelined share at
+    /// EVM heights".
+    pub exec_evm_blocks: Counter,
+    /// Item 7 option 0 (task 4.2): blocks with EVM txs that ran pipelined
+    /// (`TORUS_EVM_FAST_PATH` with a flush worker; no barrier). 0 with the
+    /// flag off.
+    pub exec_evm_fast_path_blocks: Counter,
+    /// Item 7 option 0 (task 4.2): per block with EVM txs, the exec thread's
+    /// time from the end of the previous block to the start of this one's
+    /// execution (after its barrier, if any): bench Q11's "exec idle before
+    /// an EVM block" (Q5: ~0.5 s p50, the barrier's checkpoint and W drain).
+    /// Includes the wait for the block to arrive when exec is caught up.
+    pub exec_evm_idle_before_seconds: Histogram,
+    /// Item 7 option 0 (task 4.2): `exec_block_seconds` of the blocks with
+    /// EVM txs only (bench Q11's "exec ms at EVM heights vs others").
+    pub exec_evm_block_seconds: Histogram,
     /// PROFILER (s470): per-block order-book LOAD + REBUILD. `NativeExecContext`
     /// is reconstructed every block, and its constructor scans the whole
     /// `cf_native_order_books` CF and rebuilds every resting order into memory
@@ -769,6 +787,12 @@ pub struct Metrics {
     /// Item 6 Phase 3: flush-worker wall time per checkpoint job (the one
     /// batch: build, root, write, EVM resync).
     pub flush_worker_checkpoint_seconds: Histogram,
+    /// Item 7 option 0 (task 4.2): the flush worker's EVM trie step (the
+    /// hashed mirror and trie nodes of a fast-path EVM block at interval 0,
+    /// of a checkpoint window holding one otherwise), inside
+    /// `flush_worker_seconds` / `flush_worker_checkpoint_seconds`. Never
+    /// observed with `TORUS_EVM_FAST_PATH` off (the EVM root runs on E).
+    pub flush_worker_evm_trie_seconds: Histogram,
     /// s77 order latency: age `now - nonce` of every native action at each
     /// stage (see [`OrderStage`]). The bench stamps `nonce = now_ms` when it
     /// signs, so on the bench this is time since submission.
@@ -2134,6 +2158,32 @@ impl Metrics {
             exec_evm_seconds.clone(),
         );
 
+        let exec_evm_blocks = Counter::default();
+        registry.register(
+            "torus_exec_evm_blocks",
+            "Item 7 option 0: executed blocks with EVM txs (either path)",
+            exec_evm_blocks.clone(),
+        );
+        let exec_evm_fast_path_blocks = Counter::default();
+        registry.register(
+            "torus_exec_evm_fast_path_blocks",
+            "Item 7 option 0: blocks with EVM txs executed pipelined (TORUS_EVM_FAST_PATH, no barrier)",
+            exec_evm_fast_path_blocks.clone(),
+        );
+        let exec_evm_idle_before_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 16));
+        registry.register(
+            "torus_exec_evm_idle_before_seconds",
+            "Item 7 option 0: exec thread time from the previous block's end to an EVM block's \
+             execution start (its barrier included; also the wait for the block when caught up)",
+            exec_evm_idle_before_seconds.clone(),
+        );
+        let exec_evm_block_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
+        registry.register(
+            "torus_exec_evm_block_seconds",
+            "Item 7 option 0: torus_exec_block_seconds of the blocks with EVM txs only",
+            exec_evm_block_seconds.clone(),
+        );
+
         let exec_load_books_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 14));
         registry.register(
             "torus_exec_load_books_seconds",
@@ -2597,6 +2647,13 @@ impl Metrics {
             "torus_flush_worker_checkpoint_seconds",
             "Item 6 Phase 3: flush worker wall time per checkpoint job",
             flush_worker_checkpoint_seconds.clone(),
+        );
+        let flush_worker_evm_trie_seconds = Histogram::new(exponential_buckets(0.0005, 2.0, 14));
+        registry.register(
+            "torus_flush_worker_evm_trie_seconds",
+            "Item 7 option 0: flush worker EVM trie step (hashed mirror + trie nodes) per fast-path \
+             EVM block (interval 0) or per checkpoint window holding one",
+            flush_worker_evm_trie_seconds.clone(),
         );
 
         // s77 order latency: 5 ms .. ~11 min. Under overload an order can wait
@@ -3089,6 +3146,10 @@ impl Metrics {
             exec_book_levels_deleted,
             exec_block_seconds,
             exec_evm_seconds,
+            exec_evm_blocks,
+            exec_evm_fast_path_blocks,
+            exec_evm_idle_before_seconds,
+            exec_evm_block_seconds,
             exec_load_books_seconds,
             exec_margin_configs_seconds,
             exec_action_status_seconds,
@@ -3160,6 +3221,7 @@ impl Metrics {
             exec_checkpoint_read_views_live,
             exec_checkpoint_oldest_live_age_blocks,
             flush_worker_checkpoint_seconds,
+            flush_worker_evm_trie_seconds,
             order_age_admit_seconds,
             order_age_commit_seconds,
             order_age_exec_seconds,
@@ -3903,6 +3965,24 @@ mod tests {
             text.contains("torus_flush_worker_depth 0"),
             "flush_worker_depth must start at 0:\n{text}",
         );
+    }
+
+    /// Item 7 option 0 (task 4.2): the EVM fast path series bench Q11 reads (plan section
+    /// 6), registered with zero observations so its summarizer can tell "absent series"
+    /// (a binary without them) from "zero value" (no EVM block on the fast path).
+    #[test]
+    fn evm_fast_path_metrics_register() {
+        let text = Metrics::new().encode();
+        for name in [
+            "torus_exec_evm_blocks_total 0",
+            "torus_exec_evm_fast_path_blocks_total 0",
+            "torus_exec_evm_idle_before_seconds_count 0",
+            "torus_exec_evm_block_seconds_count 0",
+            "torus_flush_worker_evm_trie_seconds_count 0",
+            "torus_exec_evm_seconds_count 0",
+        ] {
+            assert!(text.contains(name), "{name} not registered at zero");
+        }
     }
 
     /// r6 engine-untimed-attribution: the six sub-timers that decompose the

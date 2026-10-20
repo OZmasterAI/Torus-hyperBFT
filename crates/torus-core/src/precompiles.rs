@@ -1403,8 +1403,11 @@ impl CoreWriterQueue {
     /// cannot let a cancel overtake its order); any other kind targets `block_queued + 1`. A
     /// target that already holds [`torus_types::CORE_WRITER_DRAIN_CAP`] rows sends the row on
     /// to the next block with room, so no block drains more than the cap and rows keep queue
-    /// order. Rows are queued only by EVM blocks (serial barriers), so each is in the raw DB
-    /// before its target's due-check (`NativeExecutor::core_writer_due`).
+    /// order. Rows are queued only by EVM blocks; item 7 option 0 (tasks 1.3, 1.4): the
+    /// target's due-check (`NativeExecutor::core_writer_due`) reads the block overlay, so a
+    /// row counts whether or not it is durable yet, and every read here (the delay, the
+    /// cursor rows, the full-target probes, `next_sequence`) goes through `state_db`, the
+    /// block's journal over the block overlay's layers (parent, L, C, then the DB).
     ///
     /// Codex P2: the walk skips the targets [`CORE_WRITER_FIRST_OPEN_TARGET_KEY`] and
     /// [`CORE_WRITER_FULL_ORDER_RUN_KEY`] know are full, so a backlog of full targets costs
@@ -1567,27 +1570,12 @@ impl CoreWriterQueue {
         Ok(actions)
     }
 
-    /// Count pending actions for a given block number.
-    pub fn pending_count(state_db: &StateDb, block_number: u64) -> Result<usize, CoreError> {
-        let db = state_db.inner();
-        let cf = db
-            .cf_handle(CF_CORE_WRITER_QUEUE)
-            .ok_or(CoreError::MissingCf(CF_CORE_WRITER_QUEUE))?;
-
+    /// Count pending actions for a given block number, through any backend
+    /// (the DB, or a block overlay with its layers). `> 0` is exactly
+    /// [`StateBackend::prefix_exists`] on the target's prefix (the due-check).
+    pub fn pending_count(state: &impl StateBackend, block_number: u64) -> Result<usize, CoreError> {
         let prefix = block_number.to_be_bytes();
-        let iter = torus_state::db::prefix_iter(db, &cf, &prefix);
-
-        let mut count = 0usize;
-        for item in iter {
-            let (key, _) =
-                item.map_err(|e| CoreError::State(torus_state::StateError::RocksDb(e)))?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            count += 1;
-        }
-
-        Ok(count)
+        Ok(state.iterate_cf(CF_CORE_WRITER_QUEUE, Some(&prefix))?.len())
     }
 
     /// Find the next sequence number for a target block.
