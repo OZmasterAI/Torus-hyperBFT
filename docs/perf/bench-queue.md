@@ -716,7 +716,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
    **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l, 8t, 8x done; **8y running** (L3.1 A/B), then **8z** (Classic
-   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build; part 2 paused by the owner). **9a (merged-main baseline) is next**, then 8z2 (resumed), then 9b (L2.1 A/B). Run them back to back. A merged-main baseline follows once L2.2
+   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build; part 2 paused by the owner). **9a (merged-main baseline) is next**, then 8z2 (resumed), then 9b (L2.1 A/B), then 9c (T5.3 A/B). Run them back to back. A merged-main baseline follows once L2.2
    default-on lands.
    **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
    merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
@@ -846,6 +846,22 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    (n = 2), 300 s cells. Report under the exec-path merge rule: exec-thread on-CPU per 1k fills, native blocks/s, block
    p50 / p99, timeouts per 1k blocks, matched/s, CPU-s per 1M fills, plus settle / pass B ms per block, pool busy and
    fallbacks (must be 0 in clean cells). Verdict: merge candidate (default off or on) or not.
+9c. **T5.3 A/B: commit manifest in the consensus DB + off-thread header/body write** (owner s131; after 9b; ~45 min).
+   Section 106: block p99 inside checkpoint DB-write windows 1,071 vs 542 ms (G = 529); 446 ms of it is the consensus
+   commit hook waiting behind its own node's checkpoint batch in the state DB (`persist_commit_manifest`). Fix on
+   `perf/t53-manifest-consensus-db` `f72eda52` (on main `689b4c54`): manifest in the consensus DB (still the first
+   synchronous durable action); dispatch's header + body state-DB write on one FIFO writer thread (exec waits on a
+   per-height ticket); manifest pruned only after the state-DB write is durable; RPC / WS heads published once the
+   header is readable. Unit measurement: commit hook with a held 400k-entry state-DB batch 1,320 ms (old) -> 0.9 ms.
+   Reviews: Codex torus (1 P2, fixed) + [claude-review] (2 P3, fixed); nextest 4207/4207. **One binary** `f72eda52`,
+   code defaults, Classic, 15 s checkpoints, standard shape (no EVM load). That base predates the s131 default flips,
+   so set in BOTH arms `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1`. Arms: **A** = `TORUS_MANIFEST_IN_STATE_DB=1`
+   (old path); **B** = default. Warm-up, then A B B A, 600 s cells. Report: in-window vs out-of-window block p99 and G
+   (windows from the new `torus_exec_checkpoint_db_write_{start,end}_ms` gauges / "checkpoint db write" log line),
+   native blocks/s, p50, timeouts, matched/s, CPU-s per 1M fills, and the timers `torus_on_committed_block_seconds`,
+   `torus_commit_manifest_seconds`, `torus_commit_persist_write_seconds` (writer thread),
+   `torus_exec_commit_persist_wait_seconds`, `torus_commit_manifest_prune_seconds`. Verdict: does G fall toward 0, at
+   no cost to blocks/s or CPU?
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
