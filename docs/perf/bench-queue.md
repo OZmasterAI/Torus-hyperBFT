@@ -638,6 +638,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    on-CPU per 1k fills, `save_books` ms per block and per 1k fills, flush-worker ms per 1k fills and busy share,
    CPU-s per 1M fills, RSS; and compare with 8p's mode 3 (per-block flush) cells. Question: does b0 close mode 3's
    shallow gap while keeping most of its deep win? It decides whether b1 gets built. Tools: main `3aaaa046` or later.
+   **Done s68 (ozarchy-8s = 8ss shallow + 8sd deep, section 104; b0 `c2fbfbc0` node `fde31231`, tools `be87c86e`, 6 / 6
+   cells valid, md5 18 / 18, 0 CHECK FAIL; every B node ran 15 s checkpoints with the b0 exec-thread save, no per-block
+   flush): no, b0 widens the shallow gap: matched/s B / A 0.911 (8p 0.937), blocks/s 13.65 -> 3.99 (3.2x fills per
+   block), p50 14 -> 136 ms, timeouts 1 -> 9. It keeps a smaller deep win: matched/s 1.061 (8p 1.087), blocks/s 1.28x
+   (8p 2.16x), p50 189 -> 107 ms. CPU per 1M fills falls to +8.9% / +5.7% over Classic (8p +17.3% / +18.5%) and the
+   flush worker is busy 0.11 / 0.12 (8p 0.42 / 0.41). The cost moved to the saturated exec thread: the write half is
+   ~20-22 ms per block (save_books 29.8 / 28.3 ms per block). b0 is not enough; if mode 3 is still wanted, build b1
+   (the write half off the exec thread, with checkpoints) and re-test both shapes. Gaps 15-17 s shallow, 69 s deep.**
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
