@@ -22,6 +22,13 @@ Why: Q7 run 1 (s66) ran the bare defaults (MAX_IN_FLIGHT, IN_FLIGHT_TAIL, OPEN_O
 unset): ~140-156k matched/s instead of ~240-250k, deeper books, ~76k fills per block vs ~50k, ~4.9 vs ~2.9 ms exec per
 1k fills. The A/B stayed fair but not at the load every other bench uses.
 
+**Run the queue back to back (owner s131):** archy runs every ready item in queue order without stopping between
+them and without asking. When a campaign's cells finish, launch the next ready item right away; write, commit and
+push the finished item's doc section (perf doc section + its Done line here, on a `docs/perf-section-*` branch;
+18c merges) while the next campaign's warm-up and cells run. Doc work never holds the bench idle. Stop only when the
+queue has no ready item, a cell fails validity, an item needs an owner action (e.g. `perf_event_paranoid`), or 18c
+or the owner says stop; then say why in one line.
+
 **Exec-path A/B merge rule (owner s128, after section 91):** any A/B that decides a merge of an exec-path change
 judges, besides matched/s, exec ms per 1k fills and CPU-s per 1M fills: **exec-thread on-CPU ms per 1k fills**, native
 blocks/s, block p50 / p99 and timeouts per 1,000 blocks. A change that adds exec-thread CPU per fill (CI above 1) or
