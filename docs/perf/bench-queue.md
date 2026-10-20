@@ -645,11 +645,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    settle / pass B / cache flush ms per block, fallbacks (must be 0). (2) **Timeouts**, deep book (8i P1M), **900 s**
    cells, A B B A (n = 2): timeouts per 1,000 blocks and per pair, view-timeout reasons (`torus_view_timeout_*`),
    p99. Verdict: default-on candidate or not; say plainly whether timeouts rise with B.
-8u. **L3.3 engine-timer profile** (owner s131; after 8t; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
+8u. **L3.3 engine-timer profile** (owner s131; NOW: right after 8s, before 8l; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
    showed exec engine ms per 1k fills +2.8% [1.020, 1.037] and runqueue wait +5.5% on the deep book (section 97.8),
    unexplained. One main binary, 1M deep book (8i P1M), A = flag unset, B = `TORUS_BOOK_FAST_ENCODE=1`, one 300 s cell
-   each with the Q8 perf recipe on the exec thread (user-space sampling; `perf_event_paranoid` stays as is unless the
-   owner says otherwise). Report the engine phase split A vs B (match, settle, cancel-all, allocation, memmove,
+   each with the Q8 perf recipe on the exec thread, **`perf_event_paranoid=1` for this run only** (owner sets it before
+   8u and restores 2 after; kernel sampling is needed for page faults, kernel time and off-CPU stacks, which the
+   scheduling-artefact question depends on; log the value at every cell start and end). Report the engine phase split A vs B (match, settle, cancel-all, allocation, memmove,
    jemalloc, page faults) and whether the rise is real or a scheduling artefact. Only matters if Classic stays.
 8v. **T5.3 attribution: block p99 inside checkpoint windows** (owner s131; after 8u; ~1 h incl. analysis; no code).
    Roadmap T5.3: during a checkpoint DB write, block p99 sits ~500-650 ms above the out-of-window p99 (sections 87,
@@ -661,7 +662,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
    **Order (owner s131):** 8u and 8v run **before** the RH4 3-arm rerun, which still waits on 18c's compaction-filter
-   build and its review. Queue after 8s: 8l, 8t, 8u, 8v, then the RH4 rerun.
+   build and its review. Queue after 8s (8s finished, analysis running): 8u now, then 8l, 8t, 8v, then the RH4 rerun.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
