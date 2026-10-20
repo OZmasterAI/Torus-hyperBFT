@@ -406,8 +406,9 @@ pub struct Metrics {
     /// 8k L2.1: of those, markets applied while a later market's job was
     /// still running (the overlap the flag buys).
     pub exec_settle_streamed_early_markets: Counter,
-    /// 8k L2.1: parallel-settle fallbacks that resumed the sequential loop
-    /// after a streamed prefix (a plan failed after pass B began). Expected 0.
+    /// 8k L2.1: parallel-settle fallbacks after a streamed prefix (a plan
+    /// failed after pass B began: the prefix is undone and flag off's
+    /// sequential fallback replayed). Expected 0.
     pub exec_settle_streamed_resumed_fallbacks: Counter,
     /// Post-engine tail on the exec thread: core-writer drain, governance,
     /// fee distribution and the epoch boundary.
@@ -1942,7 +1943,7 @@ impl Metrics {
         let exec_settle_streamed_resumed_fallbacks = Counter::default();
         registry.register(
             "torus_exec_settle_streamed_resumed_fallbacks",
-            "TORUS_SETTLE_STREAMED=1 parallel-settle fallbacks resumed after a streamed pass B prefix (expected 0)",
+            "TORUS_SETTLE_STREAMED=1 parallel-settle fallbacks after a streamed pass B prefix, undone and replayed (expected 0)",
             exec_settle_streamed_resumed_fallbacks.clone(),
         );
 

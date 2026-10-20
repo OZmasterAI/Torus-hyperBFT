@@ -36,10 +36,11 @@ use std::sync::{Arc, Mutex};
 use alloy_primitives::{Address, B256};
 
 use torus_bridge::native_executor::{
-    parse_settle_streamed, settle_streamed_calls_on_this_thread,
-    settle_streamed_early_on_this_thread, settle_streamed_hybrid_on_this_thread,
-    with_settle_no_merge, with_settle_stream_probe, with_settle_streamed, BookMode,
-    NativeActionResult, NativeExecContext, NativeExecutor, ResidentBooks, SettleStreamProbe,
+    in_maker_snapshot_read_on_this_thread, parse_settle_streamed,
+    settle_streamed_calls_on_this_thread, settle_streamed_early_on_this_thread,
+    settle_streamed_hybrid_on_this_thread, with_settle_no_merge, with_settle_stream_probe,
+    with_settle_streamed, BookMode, NativeActionResult, NativeExecContext, NativeExecutor,
+    ResidentBooks, SettleStreamProbe,
 };
 use torus_bridge::state_root::compute_native_state_root;
 use torus_core::position::{position_key, MarginType, NativeBalance, Position};
@@ -57,14 +58,23 @@ use torus_types::{FixedPoint, MarketId, NativeAction, OrderType, PlaceOrderParam
 /// One write, in issue order: (cf, key, `Some(value)` or a delete).
 type Write = (String, Vec<u8>, Option<Vec<u8>>);
 
+/// Point reads per `(cf, key)`.
+type ReadCounts = BTreeMap<(String, Vec<u8>), usize>;
+
 #[derive(Default)]
 struct Faults {
-    /// The n-th (1-based) point read of this position row in the block
-    /// fails, once.
-    read_nth: Option<(Vec<u8>, usize)>,
-    /// Every write of this `(cf, key)` fails.
-    write: Option<(String, Vec<u8>)>,
+    /// One-shot read faults: the n-th (1-based, counted per block) point
+    /// read of `(cf, key)` fails, once.
+    reads: Vec<(String, Vec<u8>, usize)>,
+    /// Every write of these `(cf, key)` fails.
+    writes: Vec<(String, Vec<u8>)>,
+    /// Every maker snapshot read of these `(cf, key)` fails (matching:
+    /// counts of those reads depend on scheduling, so no n-th read).
+    snapshot: Vec<(String, Vec<u8>)>,
+    /// Read and write faults that fired (compared flag off vs on).
     hits: usize,
+    /// Snapshot faults that fired (scheduling-dependent: not compared).
+    snapshot_hits: usize,
 }
 
 /// Wraps the block's `NativeStateOverlay`: records every write in order and
@@ -74,16 +84,32 @@ struct Recorder {
     inner: NativeStateOverlay,
     log: Arc<Mutex<Vec<Write>>>,
     faults: Arc<Mutex<Faults>>,
-    position_reads: Arc<Mutex<BTreeMap<Vec<u8>, usize>>>,
+    /// Point reads per `(cf, key)` in the block, maker snapshot reads left
+    /// out (below).
+    reads: Arc<Mutex<ReadCounts>>,
+    /// Matching's maker snapshot reads per `(cf, key)` in the block
+    /// ([`in_maker_snapshot_read_on_this_thread`]): once per maker per Phase
+    /// 3 worker thread, so their number depends on which thread matched
+    /// which market (flag off vs flag off too). Neither counted in `reads`
+    /// nor faulted: "the n-th read of a key" stays the same read whatever
+    /// the scheduling.
+    snapshot_reads: Arc<Mutex<ReadCounts>>,
 }
 
 impl Recorder {
+    fn new(inner: NativeStateOverlay) -> Self {
+        Self {
+            inner,
+            log: Arc::default(),
+            faults: Arc::default(),
+            reads: Arc::default(),
+            snapshot_reads: Arc::default(),
+        }
+    }
+
     fn write_fault(&self, cf: &str, key: &[u8]) -> Result<(), StateError> {
         let mut f = self.faults.lock().unwrap();
-        if f.write
-            .as_ref()
-            .is_some_and(|(c, k)| c == cf && k.as_slice() == key)
-        {
+        if f.writes.iter().any(|(c, k)| c == cf && k.as_slice() == key) {
             f.hits += 1;
             return Err(StateError::Io(std::io::Error::other(
                 "injected write failure",
@@ -95,25 +121,42 @@ impl Recorder {
 
 impl StateBackend for Recorder {
     fn get_cf_raw(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
-        if cf == CF_NATIVE_POSITIONS {
-            let n = {
-                let mut reads = self.position_reads.lock().unwrap();
-                let n = reads.entry(key.to_vec()).or_default();
-                *n += 1;
-                *n
-            };
+        if in_maker_snapshot_read_on_this_thread() {
+            let mut snap = self.snapshot_reads.lock().unwrap();
+            *snap.entry((cf.to_string(), key.to_vec())).or_default() += 1;
+            drop(snap);
             let mut f = self.faults.lock().unwrap();
-            if f.read_nth
-                .as_ref()
-                .is_some_and(|(k, nth)| k.as_slice() == key && *nth == n)
+            if f.snapshot
+                .iter()
+                .any(|(c, k)| c == cf && k.as_slice() == key)
             {
-                f.read_nth = None;
-                f.hits += 1;
+                f.snapshot_hits += 1;
                 return Err(StateError::Io(std::io::Error::other(
-                    "injected one-shot read failure",
+                    "injected snapshot read failure",
                 )));
             }
+            drop(f);
+            return self.inner.get_cf_raw(cf, key);
         }
+        let n = {
+            let mut reads = self.reads.lock().unwrap();
+            let n = reads.entry((cf.to_string(), key.to_vec())).or_default();
+            *n += 1;
+            *n
+        };
+        let mut f = self.faults.lock().unwrap();
+        if let Some(at) = f
+            .reads
+            .iter()
+            .position(|(c, k, nth)| c == cf && k.as_slice() == key && *nth == n)
+        {
+            f.reads.remove(at);
+            f.hits += 1;
+            return Err(StateError::Io(std::io::Error::other(
+                "injected one-shot read failure",
+            )));
+        }
+        drop(f);
         self.inner.get_cf_raw(cf, key)
     }
     fn put_cf_raw(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), StateError> {
@@ -342,6 +385,10 @@ struct CallOut {
     fills: Vec<TradeFill>,
     extras: Vec<FillExtras>,
     fatal: Option<String>,
+    /// The reader fault channel after the call (R02: a read error a reader
+    /// cannot return, e.g. matching's maker snapshot; fail-stops the block
+    /// at commit, as `fatal`, without changing the call's control flow).
+    reader_fault: Option<String>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -377,6 +424,8 @@ struct RunStats {
     position_deletes: usize,
     position_puts: usize,
     hits: usize,
+    /// Snapshot faults that fired ([`Faults::snapshot_hits`]).
+    snapshot_hits: usize,
     /// The fatal error that ended the run, if any (also compared in the
     /// outcome; kept here so tests can assert the fail-stop happened).
     fatal: Option<String>,
@@ -387,6 +436,14 @@ struct RunStats {
     /// settle gate is certain to pass, so below it nothing reads positions
     /// for plans (Codex P2).
     position_reads: Reads,
+    /// Point reads per `(cf, key)` per block, every CF (fault picks),
+    /// matching's maker snapshot reads left out ([`Recorder`]).
+    reads: Vec<ReadCounts>,
+    /// Matching's maker snapshot reads per `(cf, key)` per block (not
+    /// compared: scheduling-dependent).
+    snapshot_reads: Vec<ReadCounts>,
+    /// The same counts after each call of each block (cumulative).
+    call_reads: Vec<Vec<ReadCounts>>,
 }
 
 /// Per-block position reads; `Debug` prints only the sizes.
@@ -407,8 +464,19 @@ impl std::fmt::Debug for Reads {
 #[derive(Clone, Debug)]
 enum LastBlockFault {
     None,
+    /// The n-th read of this position row fails, once.
     ReadNth(Vec<u8>, usize),
+    /// Every write of this position row fails.
     Write(Vec<u8>),
+    /// The n-th read of `(cf, key)` fails, once.
+    ReadCfNth(&'static str, Vec<u8>, usize),
+    /// Every write of `(cf, key)` fails.
+    WriteCf(&'static str, Vec<u8>),
+    /// Every maker snapshot read of `(cf, key)` fails (matching; a reader
+    /// fault).
+    SnapshotCf(&'static str, Vec<u8>),
+    /// All of these.
+    Many(Vec<LastBlockFault>),
     /// This market's plan (pass A) panics in every call of the last block
     /// (recovered: the sequential fallback).
     PlanPanic(MarketId),
@@ -482,6 +550,28 @@ struct Run {
     jitter: u64,
 }
 
+/// Arms `fault` (the backend's faults and the probe's panics).
+fn arm(fault: &LastBlockFault, f: &mut Faults, probe: &mut SettleStreamProbe) {
+    match fault {
+        LastBlockFault::None => {}
+        LastBlockFault::ReadNth(k, n) => {
+            f.reads
+                .push((CF_NATIVE_POSITIONS.to_string(), k.clone(), *n))
+        }
+        LastBlockFault::Write(k) => f.writes.push((CF_NATIVE_POSITIONS.to_string(), k.clone())),
+        LastBlockFault::ReadCfNth(cf, k, n) => f.reads.push((cf.to_string(), k.clone(), *n)),
+        LastBlockFault::WriteCf(cf, k) => f.writes.push((cf.to_string(), k.clone())),
+        LastBlockFault::SnapshotCf(cf, k) => f.snapshot.push((cf.to_string(), k.clone())),
+        LastBlockFault::PlanPanic(m) => probe.plan_panic = Some(*m),
+        LastBlockFault::MatchPanic(m) => probe.match_panic = Some(*m),
+        LastBlockFault::Many(all) => {
+            for one in all {
+                arm(one, f, probe);
+            }
+        }
+    }
+}
+
 /// Feeds `blocks` through one context per block over a fresh overlay on one
 /// DB (flushed after each block, as the committer does). A block that goes
 /// fatal is never flushed and ends the run. The flags are whatever the
@@ -508,12 +598,7 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
     let hybrid_before = settle_streamed_hybrid_on_this_thread();
     for (h, block) in blocks.iter().enumerate() {
         let last = h + 1 == blocks.len();
-        let rec = Recorder {
-            inner: NativeStateOverlay::new(db.clone()),
-            log: Arc::default(),
-            faults: Arc::default(),
-            position_reads: Arc::default(),
-        };
+        let rec = Recorder::new(NativeStateOverlay::new(db.clone()));
         let mut probe = SettleStreamProbe {
             jitter_seed: if r.jitter == 0 {
                 0
@@ -523,16 +608,7 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
             ..SettleStreamProbe::default()
         };
         if last {
-            let mut f = rec.faults.lock().unwrap();
-            match fault {
-                LastBlockFault::None => {}
-                LastBlockFault::ReadNth(k, n) => f.read_nth = Some((k.clone(), *n)),
-                LastBlockFault::Write(k) => {
-                    f.write = Some((CF_NATIVE_POSITIONS.to_string(), k.clone()))
-                }
-                LastBlockFault::PlanPanic(m) => probe.plan_panic = Some(*m),
-                LastBlockFault::MatchPanic(m) => probe.match_panic = Some(*m),
-            }
+            arm(fault, &mut rec.faults.lock().unwrap(), &mut probe);
         }
         let mut ctx = NativeExecContext::new(
             rec.clone(),
@@ -547,6 +623,7 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
         );
         ctx.record_fills = r.record_fills;
         let mut calls = Vec::new();
+        let mut call_reads = Vec::new();
         for batch in block {
             let pass_a = ctx.phase_accum.settle_pass_a_ns;
             let pass_b = ctx.phase_accum.settle_pass_b_ns;
@@ -576,9 +653,13 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
                 .filter(|w| w.0 == CF_NATIVE_POSITIONS && w.2.is_none())
                 .count();
             let fatal = ctx.fatal_error.clone();
-            if fatal.is_some() {
-                stats.fatal = fatal.clone();
+            let reader_fault = ctx.reader_fault.get().cloned();
+            // The committer's view (`take_fatal_error`): `fatal_error`, else
+            // the reader fault.
+            if let Some(f) = fatal.clone().or_else(|| reader_fault.clone()) {
+                stats.fatal = Some(f);
             }
+            call_reads.push(rec.reads.lock().unwrap().clone());
             calls.push(CallOut {
                 writes,
                 results: res.results.iter().map(row).collect(),
@@ -586,13 +667,16 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
                 fills,
                 extras,
                 fatal: fatal.clone(),
+                reader_fault,
             });
             if fatal.is_some() {
                 break;
             }
         }
         stats.fallbacks += ctx.phase_accum.settle_fallbacks;
-        let fatal = ctx.fatal_error.is_some();
+        // A reader fault fail-stops the block as `fatal_error` does (the
+        // committer never flushes it).
+        let fatal = ctx.fatal_error.is_some() || ctx.reader_fault.get().is_some();
         if !fatal {
             ctx.save_order_books();
         }
@@ -603,11 +687,21 @@ fn run(blocks: &[Block], r: Run, fault: &LastBlockFault) -> (RunOut, RunStats) {
             pending: rec.inner.dirty_native_keys(),
             save_writes,
         });
+        let reads = std::mem::take(&mut *rec.reads.lock().unwrap());
+        stats.position_reads.0.push(
+            reads
+                .iter()
+                .filter(|((cf, _), _)| cf == CF_NATIVE_POSITIONS)
+                .map(|((_, k), n)| (k.clone(), *n))
+                .collect(),
+        );
+        stats.reads.push(reads);
         stats
-            .position_reads
-            .0
-            .push(std::mem::take(&mut *rec.position_reads.lock().unwrap()));
+            .snapshot_reads
+            .push(std::mem::take(&mut *rec.snapshot_reads.lock().unwrap()));
+        stats.call_reads.push(call_reads);
         stats.hits += rec.faults.lock().unwrap().hits;
+        stats.snapshot_hits += rec.faults.lock().unwrap().snapshot_hits;
         drop(ctx);
         if fatal {
             assert!(last, "only the last block may go fatal (block {})", h + 1);
@@ -634,8 +728,10 @@ fn assert_same(off: &RunOut, on: &RunOut, label: &str) {
         assert_eq!(
             a.calls.len(),
             b.calls.len(),
-            "{label}: block {} calls",
-            h + 1
+            "{label}: block {} calls (fatal off {:?}, on {:?})",
+            h + 1,
+            a.calls.iter().find_map(|c| c.fatal.as_ref()),
+            b.calls.iter().find_map(|c| c.fatal.as_ref()),
         );
         for (c, (x, y)) in a.calls.iter().zip(&b.calls).enumerate() {
             assert!(
@@ -676,6 +772,7 @@ fn assert_streamed_equivalent(
         };
         let (clean, clean_stats) = off_run(&LastBlockFault::None);
         let fault = fault(&clean, &clean_stats);
+        let label = format!("{label}, fault {fault:?}");
         let (off, off_stats) = off_run(&fault);
         assert_eq!(
             off_stats.streamed_calls, 0,
@@ -1196,12 +1293,7 @@ fn reused_ctx_run(blocks: &[Block], cap: usize, record_fills: bool, market: Mark
             .put_native_balance(&addr(n), &bal)
             .unwrap();
     }
-    let rec = Recorder {
-        inner: NativeStateOverlay::new(db.clone()),
-        log: Arc::default(),
-        faults: Arc::default(),
-        position_reads: Arc::default(),
-    };
+    let rec = Recorder::new(NativeStateOverlay::new(db.clone()));
     // Resident books: the cancel-all index is built (at the first
     // cancel-all) only in resident mode.
     let mut resident = ResidentBooks::default();
@@ -1251,6 +1343,7 @@ fn reused_ctx_run(blocks: &[Block], cap: usize, record_fills: bool, market: Mark
             fills: Vec::new(),
             extras: Vec::new(),
             fatal: ctx.fatal_error.clone(),
+            reader_fault: ctx.reader_fault.get().cloned(),
         });
     };
     let none = SettleStreamProbe::default();
@@ -1375,4 +1468,308 @@ fn settle_streamed_match_panic_restores_context_across_block_rollover() {
             }
         }
     }
+}
+
+// ---- Fallback replay (Codex round 2): faults in the streamed prefix ----
+
+/// Codex P2 (L2.1 review, round 2): a maker's balance read fails in the
+/// streamed pass B of market 1 (its first settle read: maker 1 is no sender
+/// of the call, so the call's balance cache does not hold it), then a later
+/// market's plan panics. Flag off falls back before any pass B and its
+/// sequential loop stops the taker's order at the failed fill (taker
+/// position 2 of 4); streamed, market 1 already went through pass B with
+/// its whole position plan. Every read of maker 1's balance in the last
+/// block is faulted in turn (one at a time), with markets 2 and 3 panicking,
+/// at caps 1, 2 and 8, with and without a fill subscriber, L2.2 off and on:
+/// flag on must equal flag off (writes, results, fills, fatal, DB, root).
+#[test]
+fn settle_streamed_prefix_balance_fault_then_plan_panic_matches_flag_off() {
+    let (gtc, ioc) = (TimeInForce::GTC, TimeInForce::IOC);
+    let block1: Block = [
+        vec![
+            // Maker 1 goes short 4 at 101 in market 1 (markets 2, 3 alike).
+            place(addr(1), order(1, false, fp(101), fp(4), gtc)),
+            place(addr(2), order(1, true, fp(101), fp(4), ioc)),
+            place(addr(3), order(2, false, fp(101), fp(4), gtc)),
+            place(addr(4), order(2, true, fp(101), fp(4), ioc)),
+            place(addr(5), order(3, false, fp(101), fp(4), gtc)),
+            place(addr(6), order(3, true, fp(101), fp(4), ioc)),
+        ],
+        vec![
+            // Maker 1 rests a closing buy (first in time), maker 7 behind it.
+            place(addr(1), order(1, true, fp(99), fp(2), gtc)),
+            place(addr(7), order(1, true, fp(99), fp(2), gtc)),
+            place(addr(3), order(2, true, fp(99), fp(2), gtc)),
+            place(addr(5), order(3, true, fp(99), fp(2), gtc)),
+        ],
+    ];
+    let block2: Block = [
+        vec![
+            // Taker 8 sells 4: fill 0 closes maker 1's short (a PnL credit:
+            // maker 1's balance is read), fill 1 hits maker 7.
+            place(addr(8), order(1, false, fp(99), fp(4), ioc)),
+            place(addr(9), order(2, false, fp(99), fp(2), ioc)),
+            place(addr(10), order(3, false, fp(99), fp(2), ioc)),
+        ],
+        vec![
+            place(addr(11), order(1, true, fp(98), fp(1), gtc)),
+            place(addr(12), order(2, true, fp(98), fp(1), gtc)),
+            place(addr(13), order(3, true, fp(98), fp(1), gtc)),
+        ],
+    ];
+    let blocks = vec![block1, block2];
+    let maker = addr(1).as_slice().to_vec();
+    let mut settle_faults = 0usize;
+    for market in [2u64, 3] {
+        for cap in [1usize, 2, 8] {
+            for record_fills in [true, false] {
+                let r = forced(cap, record_fills);
+                let (_, clean) =
+                    with_settle_streamed(false, || run(&blocks, r, &LastBlockFault::None));
+                let reads = clean
+                    .reads
+                    .last()
+                    .unwrap()
+                    .get(&(CF_NATIVE_BALANCES.to_string(), maker.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                assert!(reads >= 1, "maker 1's balance is read in the last block");
+                for n in 1..=reads + 1 {
+                    let fault = LastBlockFault::Many(vec![
+                        LastBlockFault::ReadCfNth(CF_NATIVE_BALANCES, maker.clone(), n),
+                        LastBlockFault::PlanPanic(market),
+                    ]);
+                    let what = format!(
+                        "maker balance read {n}/{reads} + plan panic {market}, cap {cap}, \
+                         record_fills {record_fills}"
+                    );
+                    let pick = |_: &RunOut, _: &RunStats| fault.clone();
+                    for (no_merge, off, ons) in
+                        assert_streamed_equivalent(&blocks, r, &[0, 0x2F00D], &pick, &what)
+                    {
+                        if off
+                            .fatal
+                            .as_deref()
+                            .is_some_and(|f| f.starts_with("settle maker fill"))
+                        {
+                            settle_faults += 1;
+                            for on in ons {
+                                assert!(
+                                    on.hybrid >= 1,
+                                    "{what}, L2.2 {no_merge}: the fault hit the streamed \
+                                     prefix before the fallback ({on:?})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        settle_faults > 0,
+        "some read hit the settle (pass B / sequential)"
+    );
+}
+
+/// The last block's balance and position rows its calls write (fault picks).
+fn last_block_written(clean: &RunOut) -> Vec<(&'static str, Vec<u8>)> {
+    let mut keys: Vec<(&'static str, Vec<u8>)> = Vec::new();
+    for call in &clean.blocks.last().expect("blocks").calls {
+        for w in &call.writes {
+            for cf in [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS] {
+                if w.0 == cf && !keys.iter().any(|(c, k)| *c == cf && *k == w.1) {
+                    keys.push((cf, w.1.clone()));
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// One random fault for the last block, picked from what the clean flag-off
+/// run read and wrote there: a one-shot read failure of a balance or a
+/// position row at any of its reads (Phase 2, the matching reader, pass A,
+/// pass B, the sequential loop, the cum-volume flush), a plan panic, a match
+/// panic, or a failing write (the end-of-call flush).
+fn one_random_fault(
+    rng: &mut Lcg,
+    reads: &[(&'static str, Vec<u8>, usize)],
+    snapshot: &[(&'static str, Vec<u8>)],
+    written: &[(&'static str, Vec<u8>)],
+    markets: u64,
+) -> LastBlockFault {
+    let read_of = |rng: &mut Lcg, cf: &str| {
+        let of_cf: Vec<_> = reads.iter().filter(|r| r.0 == cf).collect();
+        if of_cf.is_empty() {
+            return LastBlockFault::PlanPanic(1 + rng.below(markets));
+        }
+        let (cf, key, count) = of_cf[rng.below(of_cf.len() as u64) as usize].clone();
+        LastBlockFault::ReadCfNth(cf, key, 1 + rng.below(count as u64) as usize)
+    };
+    match rng.below(11) {
+        0..=3 => read_of(rng, CF_NATIVE_BALANCES),
+        4..=5 => read_of(rng, CF_NATIVE_POSITIONS),
+        6 | 7 => LastBlockFault::PlanPanic(1 + rng.below(markets)),
+        8 => LastBlockFault::MatchPanic(1 + rng.below(markets)),
+        10 if snapshot.is_empty() => LastBlockFault::PlanPanic(1 + rng.below(markets)),
+        10 => {
+            let (cf, key) = snapshot[rng.below(snapshot.len() as u64) as usize].clone();
+            LastBlockFault::SnapshotCf(cf, key)
+        }
+        _ if written.is_empty() => LastBlockFault::MatchPanic(1 + rng.below(markets)),
+        _ => {
+            let (cf, key) = written[rng.below(written.len() as u64) as usize].clone();
+            LastBlockFault::WriteCf(cf, key)
+        }
+    }
+}
+
+/// Randomized fault / panic matrix: `cases` random streams (2-8 markets, 2-3
+/// blocks, storms of 20-160 actions; forced parallel at caps 1, 2 or 8, the
+/// engine path, or production Auto; with or without a fill subscriber,
+/// aliased rows and a scheduling perturbation), each with one or two random
+/// faults in the last block ([`one_random_fault`]); a third of the cases pair
+/// a plan panic with a balance read fault (the round-2 class: a fault in the
+/// streamed prefix, then a fallback). Flag on must equal flag off, L2.2 off
+/// and on. Returns (cases that fell back after a streamed prefix, cases that
+/// went fatal) so callers can check the matrix is not vacuous.
+fn fault_matrix(seed: u64, cases: usize) -> (usize, usize) {
+    let mut rng = Lcg(seed);
+    let (mut replays, mut fatal) = (0usize, 0usize);
+    for case in 0..cases {
+        let markets = 2 + rng.below(7);
+        let n_blocks = 2 + rng.below(2) as usize;
+        let storm = 20 + rng.below(141);
+        let stream_seed = rng.next();
+        let blocks = stream(stream_seed, markets, n_blocks, storm);
+        let mode = match rng.below(6) {
+            0 => Mode::Auto,
+            1 => Mode::Engine(4),
+            k => Mode::Forced {
+                parallel: true,
+                cap: [1usize, 2, 8, 8][k as usize - 2],
+            },
+        };
+        let r = Run {
+            mode,
+            record_fills: rng.below(2) == 0,
+            aliases: rng.below(4) == 0,
+            jitter: 0,
+        };
+        let jitter = if rng.below(2) == 0 { 0 } else { rng.next() | 1 };
+        let fault_seed = rng.next();
+        let pick = |clean: &RunOut, stats: &RunStats| {
+            let mut rng = Lcg(fault_seed);
+            let reads: Vec<(&'static str, Vec<u8>, usize)> = stats
+                .reads
+                .last()
+                .expect("blocks")
+                .iter()
+                .filter_map(|((cf, k), n)| {
+                    let cf = [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS]
+                        .into_iter()
+                        .find(|c| c == cf)?;
+                    Some((cf, k.clone(), *n))
+                })
+                .collect();
+            let snapshot: Vec<(&'static str, Vec<u8>)> = stats
+                .snapshot_reads
+                .last()
+                .expect("blocks")
+                .keys()
+                .filter_map(|(cf, k)| {
+                    let cf = [CF_NATIVE_BALANCES, CF_NATIVE_POSITIONS]
+                        .into_iter()
+                        .find(|c| c == cf)?;
+                    Some((cf, k.clone()))
+                })
+                .collect();
+            let written = last_block_written(clean);
+            let one = |rng: &mut Lcg| one_random_fault(rng, &reads, &snapshot, &written, markets);
+            match rng.below(3) {
+                // The round-2 class, aimed: a maker that closes a position
+                // in the last block's first call and sends nothing in it
+                // (so the call's balance cache does not hold it: its first
+                // settle read is a backend read, often its PnL credit in
+                // pass B) fails at its last read of that call, and a higher
+                // market's plan panics (so its market streams before the
+                // fallback). Random if no such maker.
+                0 => {
+                    let call0 = &clean.blocks.last().expect("blocks").calls[0];
+                    let senders: Vec<Address> = blocks.last().expect("blocks")[0]
+                        .iter()
+                        .map(|(s, _)| *s)
+                        .collect();
+                    let makers: Vec<(Address, MarketId)> = call0
+                        .fills
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, f)| {
+                            let maker_sold = f.taker_side == 0;
+                            f.market < markets
+                                && !senders.contains(&f.maker)
+                                && call0.extras.get(*i).is_none_or(|x| {
+                                    (maker_sold && x.maker_start_raw > 0)
+                                        || (!maker_sold && x.maker_start_raw < 0)
+                                })
+                        })
+                        .map(|(_, f)| (f.maker, f.market))
+                        .collect();
+                    let calls = &stats.call_reads.last().expect("blocks");
+                    if makers.is_empty() {
+                        one(&mut rng)
+                    } else {
+                        let (maker, market) = makers[rng.below(makers.len() as u64) as usize];
+                        let key = maker.as_slice().to_vec();
+                        let panic = market + 1 + rng.below(markets - market);
+                        // Its last counted read of the call (a settle read;
+                        // matching's snapshot reads are not counted).
+                        match calls[0].get(&(CF_NATIVE_BALANCES.to_string(), key.clone())) {
+                            Some(&n) => LastBlockFault::Many(vec![
+                                LastBlockFault::PlanPanic(panic),
+                                LastBlockFault::ReadCfNth(CF_NATIVE_BALANCES, key, n),
+                            ]),
+                            None => one(&mut rng),
+                        }
+                    }
+                }
+                1 => one(&mut rng),
+                _ => LastBlockFault::Many(vec![one(&mut rng), one(&mut rng)]),
+            }
+        };
+        let what = format!(
+            "matrix {seed:#x} case {case}: {markets} markets, {n_blocks} blocks, storm {storm}, \
+             fault seed {fault_seed:#x}"
+        );
+        for (_, off, ons) in assert_streamed_equivalent(&blocks, r, &[jitter], &pick, &what) {
+            fatal += usize::from(off.fatal.is_some());
+            replays += usize::from(ons.iter().any(|on| on.hybrid > 0));
+        }
+    }
+    (replays, fatal)
+}
+
+#[test]
+fn settle_streamed_fault_matrix_a() {
+    let (replays, fatal) = fault_matrix(0x8C21_3A7A_0001, 12);
+    assert!(replays > 0 && fatal > 0, "replays {replays}, fatal {fatal}");
+}
+
+#[test]
+fn settle_streamed_fault_matrix_b() {
+    let (replays, fatal) = fault_matrix(0x8C21_3A7A_0002, 12);
+    assert!(replays > 0 && fatal > 0, "replays {replays}, fatal {fatal}");
+}
+
+#[test]
+fn settle_streamed_fault_matrix_c() {
+    let (replays, fatal) = fault_matrix(0x8C21_3A7A_0003, 12);
+    assert!(replays > 0 && fatal > 0, "replays {replays}, fatal {fatal}");
+}
+
+#[test]
+fn settle_streamed_fault_matrix_d() {
+    let (replays, fatal) = fault_matrix(0x8C21_3A7A_0004, 12);
+    assert!(replays > 0 && fatal > 0, "replays {replays}, fatal {fatal}");
 }
