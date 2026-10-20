@@ -835,6 +835,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per 1M fills, RSS; and place them next to section 108 B (L2.2 on: 268.6k, 15.58 blk/s) and section 107 Noff / Eon
    (13.88 / 13.41 blk/s) as references (different binaries, so indicative only). No verdict needed beyond "no
    regression visible"; flag anything clearly worse.
+   **Done s72 (ozarchy-9a, section 113; main `654f047c` node `ce0f110c`, tools `654f047c`, 5 / 5 cells valid, Classic,
+   flags unset, EVM 3000 / 3000 landed in both E cells, no foreign-CPU rerun): no regression visible. N 268.8k matched/s,
+   15.47 blk/s, p50 / p99 14 / 659 ms, 0 timeouts, exec on-CPU 2.503 ms per 1k fills, 22.77 CPU-s per 1M: within ~1.5%
+   of 108 B, exec on-CPU 2% lower (L3.3 off there). E / N matched/s 0.999 [0.944, 1.058], CPU-s per 1M 1.002, exec
+   on-CPU 1.004, blocks/s 1.011, 1 timeout in 9,463 E blocks. Watch: flush worker per 1k fills 1.081 [0.85, 1.37] under
+   E (off the exec thread).**
 9b. **L2.1 A/B: streamed in-order settle** (owner s131; after 9a and 8z2; ~1 h 30). L2.1 (`TORUS_SETTLE_STREAMED`,
    default off) starts each market's pass B as soon as that market is matched (in market order) instead of after all
    markets; on any fallback it undoes the streamed prefix and replays the call on the flag-off path. Branch
