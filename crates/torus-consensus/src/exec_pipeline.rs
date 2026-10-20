@@ -229,6 +229,33 @@ pub fn checkpoint_interval_explicit() -> bool {
     checkpoint_interval_env_set(std::env::var("TORUS_CHECKPOINT_INTERVAL_MS").ok().as_deref())
 }
 
+/// 8k L3.1 (`TORUS_BOOK_COALESCE`, node-local, default off): pure parse.
+/// `1` or `true` (trimmed, any case) = requested; unset, empty, `0` or
+/// `false` = off; anything else is warned and off. Requested is not on: the
+/// node also needs a checkpoint interval, Classic + resident books and the
+/// running hash not configured (`ExecutionContext::configure_book_coalesce`).
+pub fn parse_book_coalesce(v: Option<&str>) -> bool {
+    let Some(v) = v else {
+        return false;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => true,
+        "" | "0" | "false" => false,
+        _ => {
+            tracing::warn!(
+                value = v,
+                "TORUS_BOOK_COALESCE: not empty, 1, true, 0 or false (any case); using the default (off)"
+            );
+            false
+        }
+    }
+}
+
+/// [`parse_book_coalesce`] of the environment.
+pub fn book_coalesce_requested() -> bool {
+    parse_book_coalesce(std::env::var("TORUS_BOOK_COALESCE").ok().as_deref())
+}
+
 /// `TORUS_CHECKPOINT_MAX_BYTES`: cap on the since-checkpoint layer's bytes.
 pub fn checkpoint_max_bytes() -> Option<u64> {
     parse_checkpoint_max_bytes(std::env::var("TORUS_CHECKPOINT_MAX_BYTES").ok())
@@ -1641,6 +1668,18 @@ mod tests {
             Some(268_435_456)
         );
         assert_eq!(parse_checkpoint_max_bytes(Some("lots".into())), None);
+    }
+
+    /// 8k L3.1: `TORUS_BOOK_COALESCE` is off unless `1` / `true`.
+    #[test]
+    fn book_coalesce_flag_parse() {
+        for on in ["1", " 1 ", "true", "TRUE", " True"] {
+            assert!(parse_book_coalesce(Some(on)), "{on:?}");
+        }
+        assert!(!parse_book_coalesce(None));
+        for off in ["", " ", "0", "false", "FALSE", "yes", "2", "on"] {
+            assert!(!parse_book_coalesce(Some(off)), "{off:?}");
+        }
     }
 
     /// Step 6: the compiled default. Unset or empty = the role default
