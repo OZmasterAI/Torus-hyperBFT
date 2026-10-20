@@ -668,6 +668,12 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    settle / pass B / cache flush ms per block, fallbacks (must be 0). (2) **Timeouts**, deep book (8i P1M), **900 s**
    cells, A B B A (n = 2): timeouts per 1,000 blocks and per pair, view-timeout reasons (`torus_view_timeout_*`),
    p99. Verdict: default-on candidate or not; say plainly whether timeouts rise with B.
+   **Done s70 (ozarchy-8t, section 108; main `eabec5e5` node `32120afc`, 12 / 12 cells valid, 314 CHECK OK, 0 FAIL,
+   fallbacks 0 everywhere, L3.3 off in both arms; gaps 5-6 s): L2.2 is a default-on candidate. Standard (n = 3): exec-
+   thread on-CPU per 1k fills 0.957 [0.936, 0.978], blocks/s 1.095 [1.080, 1.111], p99 0.877 [0.832, 0.924], p50 0.959
+   (spans 1), CPU-s per 1M 0.997, matched/s 0.998 (load-bound), timeouts 0 vs 0; settle -20% per block, cache flush
+   +12%. Deep 900 s (n = 2): timeouts do not rise, 27 vs 28 (5.09 vs 5.19 per 1k blocks), view timeouts 64 vs 63, same
+   reasons; pooled with 8n / 8q 46 vs 48; exec on-CPU 0.977, blocks/s 1.018, matched/s 1.015, p50 / p99 flat.**
 8u. **L3.3 engine-timer profile** (owner s131; DONE s131, section 105; ~40 min). L3.3 (`TORUS_BOOK_FAST_ENCODE`, merged flag off)
    showed exec engine ms per 1k fills +2.8% [1.020, 1.037] and runqueue wait +5.5% on the deep book (section 97.8),
    unexplained. One main binary, 1M deep book (8i P1M), A = flag unset, B = `TORUS_BOOK_FAST_ENCODE=1`, one 300 s cell
