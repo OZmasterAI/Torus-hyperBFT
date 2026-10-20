@@ -772,6 +772,14 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    per 1M fills, `exec_save_books_seconds`, the window-close spike (`torus_exec_book_coalesce_close_seconds` and
    `_close_books`; design estimate ~56 ms at P1M), `_skipped`, the new `torus_exec_liquidation_step_seconds` (8u's open
    question), and `torus_exec_resident_rebuilds` (must stay 1). Verdict under the exec-path merge rule.
+   **Done s70 (ozarchy-8y, section 110; `b7bb3666` node `127dac63`, 10 / 10 cells valid, 0 CHECK FAIL, resident
+   rebuilds 1, state hash off, coalesce ON in every B node; no foreign-CPU rerun): L3.1 passes the exec-path merge rule
+   in both shapes. Deep (n = 2): matched/s 1.160 [1.077, 1.249], exec-thread on-CPU per 1k fills 0.802 [0.760, 0.847],
+   CPU-s per 1M 0.947, blocks/s 3.42 -> 15.76, p50 193 -> 13 ms, p99 1,461 -> 672 ms, timeouts 2.91 -> 0.42 per 1k blocks
+   (save_order_books 52.2 -> 0.64 ms per block; blocks 62k -> 15k fills). Standard: exec on-CPU 0.958 [0.936, 0.980],
+   CPU-s per 1M 1.001, matched/s 1.022, blocks/s 1.25, p50 0.87, p99 0.84 (CIs span 1). Window close P1M mean 61 ms
+   (design ~56), p99 ~126 ms, ~49 per 300 s; standard 4.6 ms. Liquidation step = 99.5% of 8u's tail, 1.91 ms per block
+   + 0.127 ms per 1k fills in both arms. Harness: `run-cell.sh` RECORD_ENV pins `TORUS_BOOK_ROWS=3`, so set `=0`.**
 8z. **Classic cadence check: does the b1 binary slow Classic?** (owner s131; after 8y; ~35 min). Section 109: Classic on
    `perf/mode3-b1` `ab4ded4e` ran shallow at 8.10 native blocks/s, p50 31 ms, ~30k fills per block (w1 7.89 too) vs
    12.3-16.0 / ~18k on the same base in 8l (section 107 Noff, `f8a45a2d`) and 13.7-14.2 elsewhere. A read-only code
