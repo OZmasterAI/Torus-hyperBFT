@@ -716,7 +716,7 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    stall / flush activity and per-thread CPU if sampled. Name the dominant phase of the in-window gap with numbers.
    This decides whether A1 or something else gets built.
    **Order (owner s131):** 8u and 8v run before 8l and the RH4 3-arm rerun (8w; filter built and reviewed, `baffa3a5`). **Queue (owner s131, latest):** 8s, 8u, 8v, 8l, 8t, 8x done; **8y running** (L3.1 A/B), then **8z** (Classic
-   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build). Run them back to back. A merged-main baseline follows once L2.2
+   cadence check, clears b1), then 8w (RH4 rerun), then 8z2 (conditional, clean b1 build; part 2 paused by the owner). **9a (merged-main baseline) is next.** Run them back to back. A merged-main baseline follows once L2.2
    default-on lands.
    **L3.3 default-on (owner s131):** `TORUS_BOOK_FAST_ENCODE` becomes on by default (branch `perf/l33-default-on`,
    merges on owner call). Classic cells on any binary built after that merge include L3.3 (section 105: blocks/s
@@ -824,6 +824,17 @@ reserved. Warm-up gate on by default (`"gate": false` restores the old behaviour
    `exec_checkpoint_{wait,upkeep,settle_wait,deferred_join}` per checkpoint; note in section 111. (2) Rebuild `ab4ded4e`
    in a FRESH target dir with the 8l4 flags; if its md5 differs from `f19d9385`, run 8z2 = 8z's spec with O vs B-clean
    (ABBA n = 2); if identical, report and 18c bisects b0 (`704a089d`) vs b1 (`244a767c`).
+9a. **Merged-main baseline: every s131 default on** (owner s131; NEXT, ready now; ~35 min). Main `5013cc79` or later
+   carries all agreed defaults: exec-hash quick wins (section 94), L3.3 `TORUS_BOOK_FAST_ENCODE` on (105), L2.2
+   `TORUS_SETTLE_NO_MERGE` on (108), item 7 option 0 `TORUS_EVM_FAST_PATH` on (107). Question: the new main baseline,
+   and did anything go backwards vs the per-feature A/Bs? **One binary** (main, code defaults, nothing set; 512 KB from
+   `env.sh`; custody 0), Classic (no `TORUS_BOOK_ROWS`; pull tools from main so the cell line logs book_mode + flags),
+   15 s checkpoints, standard (hsdb-300m) shape. Arms: **N** = no EVM load; **E** = `EVM_LOAD_RATE=10
+   EVM_LOAD_SENDERS=40` (8l's E). Warm-up, then N E E N (n = 2), 300 s cells. Report per arm: matched/s, native
+   blocks/s, fills per block, block p50 / p99, timeouts per 1k blocks, exec ms and exec on-CPU ms per 1k fills, CPU-s
+   per 1M fills, RSS; and place them next to section 108 B (L2.2 on: 268.6k, 15.58 blk/s) and section 107 Noff / Eon
+   (13.88 / 13.41 blk/s) as references (different binaries, so indicative only). No verdict needed beyond "no
+   regression visible"; flag anything clearly worse.
 10. **[PARKED s128, owner: A1 not built; sections 87, 89; moved to roadmap T5.3] Q6. 71.8 checkpoint slicing A/B**, only if step Z says GO and 18c then builds A1 (not built; Items, Q6). Run after steps 4-5 have settled the Q1 / Q4 defaults (both touch
    checkpoint code, so they move slicing's baseline).
 
