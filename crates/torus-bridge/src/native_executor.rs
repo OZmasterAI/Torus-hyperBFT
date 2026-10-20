@@ -744,25 +744,13 @@ mod book_fast_encode_flag_tests {
     }
 }
 
-/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, OFF by default): pure
-/// parse. `1` or `true` (trimmed, any case) = on; unset, empty, `0` or
-/// `false` = off; anything else is warned and off.
+/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, ON by default since s131,
+/// perf doc section 108): pure parse (`on_by_default_flag`). `0` or `false`
+/// (trimmed, any case) = off; unset, empty, `1` or `true` = on; anything
+/// else is warned and on.
 #[doc(hidden)]
 pub fn parse_settle_no_merge(v: Option<&str>) -> bool {
-    let Some(v) = v else {
-        return false;
-    };
-    match v.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => true,
-        "" | "0" | "false" => false,
-        _ => {
-            tracing::warn!(
-                value = v,
-                "TORUS_SETTLE_NO_MERGE: not empty, 1, true, 0 or false (any case); using the default (off)"
-            );
-            false
-        }
-    }
+    on_by_default_flag("TORUS_SETTLE_NO_MERGE", v)
 }
 
 thread_local! {
@@ -808,13 +796,13 @@ pub fn settle_no_merge_fallbacks_on_this_thread() -> u64 {
     SETTLE_NO_MERGE_FALLBACKS.with(std::cell::Cell::get)
 }
 
-/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE=1`, node-local, off by default): the
-/// parallel settle's pass B keeps each market's plan cache as a run instead
-/// of `merge_disjoint`-ing it into the batch cache, and the end-of-call
-/// flush writes the batch cache and the runs together in the same sorted key
-/// order (`PositionCache::flush_with_runs`): the same writes in the same
-/// order, without moving every entry into one map. The thread's pin if set,
-/// else the env read once per process.
+/// 8k L2.2 (`TORUS_SETTLE_NO_MERGE`, node-local, on by default; `0` turns
+/// it off): the parallel settle's pass B keeps each market's plan cache as a
+/// run instead of `merge_disjoint`-ing it into the batch cache, and the
+/// end-of-call flush writes the batch cache and the runs together in the same
+/// sorted key order (`PositionCache::flush_with_runs`): the same writes in
+/// the same order, without moving every entry into one map. The thread's pin
+/// if set, else the env read once per process.
 fn settle_no_merge_enabled() -> bool {
     if let Some(on) = SETTLE_NO_MERGE_PIN.with(std::cell::Cell::get) {
         return on;
@@ -836,14 +824,18 @@ mod settle_no_merge_flag_tests {
         parse_settle_no_merge, settle_no_merge_enabled, with_settle_no_merge, SETTLE_NO_MERGE_PIN,
     };
 
-    /// Off by default: only `1` / `true` (trimmed, any case) turn it on.
+    /// On by default (s131, bench 8t section 108): unset, empty, `1` /
+    /// `true` and garbage (warned) are on; only `0` / `false` (trimmed, any
+    /// case) turn it off.
     #[test]
-    fn parse_off_by_default() {
-        assert!(!parse_settle_no_merge(None));
-        for v in ["1", " 1", "1\n", "true", "TRUE", " True "] {
+    fn parse_on_by_default() {
+        assert!(parse_settle_no_merge(None));
+        for v in [
+            "", " ", "1", " 1", "1\n", "true", "TRUE", " True ", "2", "on", "yes", "01",
+        ] {
             assert!(parse_settle_no_merge(Some(v)), "{v:?}");
         }
-        for v in ["", " ", "0", "false", "FALSE", "2", "on", "yes", "01"] {
+        for v in ["0", " 0 ", "false", "FALSE", " False "] {
             assert!(!parse_settle_no_merge(Some(v)), "{v:?}");
         }
     }
