@@ -7,8 +7,7 @@ block (T0), block-timestamp validation (T0b/T1), time-based aggregation 10 s /
 60 s (T2/T8), submission hardening (T3/T4), block-start aggregation (T5–T7).
 Review follow-ups (s517): fresh price needs >= 3 reporters holding
 > 2/3 of the Active stake (see *Decisions* 4–5, *Notes* below). The
-timestamp lower bound (M2): implemented pre-testnet (branch
-`fix/pretestnet-p0-p1`), see Decision 5.
+timestamp lower bound (M2) is NOT implemented — open, see Decision 5.
 Not merged / pushed. Liquidation (item 3): done on `feat/liquidation`
 (`docs/plans/liquidation.md`). Next: B (feeder), then C (HL mark). Client / deploy notes: `docs/parity-audit-fixes-s515.md`.
 
@@ -120,18 +119,7 @@ A now, on this branch (it is the "item 2" as listed), then B as its own item
    low-stake head-count majority cut the honest high-stake reports and set
    the price. Otherwise the last price is kept and goes stale. HL documents
    only a stake-weighted median; > 2/3 matches the BFT honest-stake bound.
-5. **Timestamp lower bound (review M2) — DONE pre-testnet (branch
-   `fix/pretestnet-p0-p1`).** Main now validates bodies before the vote
-   (973cc74, e89eaaa), which is what this waited for. Rule, placed like
-   the 5 s ahead bound (`check_timestamp_lag` next to
-   `check_timestamp_drift` in `check_proposal_data`): a replica refuses to
-   VOTE for a proposal whose timestamp is more than 30 s
-   (`MAX_BLOCK_TIMESTAMP_LAG_SECS`) behind its clock. Pre-vote only: a
-   certified block is accepted at insertion, block sync, execution and
-   crash replay however old it is (catch-up never reads the clock), so it
-   cannot wedge. A proposal delivered more than 30 s late gets no vote; the
-   view times out and the next leader proposes with `max(now, parent.ts)`.
-   The analysis below was written before that change. A
+5. **Timestamp lower bound (review M2) — OPEN, not implemented.** A
    byzantine leader can propose `ts = parent.ts` after a stall, so an old
    aggregate has age 0 in that block. A "reject ts < local − 30 s" rule
    cannot be enforced today: every body (fresh or recovered late) reaches
