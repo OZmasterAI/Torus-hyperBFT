@@ -40421,6 +40421,11 @@ mod crash_recovery_tests {
         (ctx, mempool, db, blocks)
     }
 
+    /// How long the retention tests wait for the threads behind E (dropper,
+    /// merge, slice) to settle before counting. Polled: idle it takes ms; on a
+    /// loaded host those threads can be off-CPU for seconds.
+    const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// The retention gauges once a block is done: (live objects, live bytes,
     /// read views, oldest live age in blocks).
     fn retention_gauges(ctx: &ExecutionContext) -> (i64, i64, i64, i64) {
@@ -40531,8 +40536,11 @@ mod crash_recovery_tests {
             drop(view);
             // The dropper and the merge / slice threads run behind E: give
             // them a moment before counting (they never hold more than a
-            // block or two).
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // block or two). The loop ends as soon as both hold (ms when
+            // idle); the deadline only bounds a real leak. 5 s was too short
+            // on a loaded host (seen: "h519: stats 1 live / 2 views vs 2 seen
+            // alive" under a full-workspace run, passes alone).
+            let deadline = Instant::now() + SETTLE_DEADLINE;
             let bounded = |s: &[u64], l: &[u64]| {
                 s.iter()
                     .chain(l.iter())
@@ -40624,7 +40632,7 @@ mod crash_recovery_tests {
         let (ctx, mempool, db, blocks) = retention_fixture(62, EVERY);
         let stats = ctx.ckpt.lock().unwrap().retention.clone();
         let settle = |want_views: i64| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + SETTLE_DEADLINE;
             while stats.read_views() != want_views && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(2));
             }

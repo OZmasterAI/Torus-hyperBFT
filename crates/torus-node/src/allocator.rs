@@ -117,14 +117,56 @@ mod tests {
         );
     }
 
+    /// The orderings jemalloc documents (jemalloc(3), 5.3): `stats.active` is
+    /// ">= stats.allocated", `stats.resident` is "larger than stats.active",
+    /// `stats.mapped` is "larger than stats.active"; `active` and `resident`
+    /// are page multiples. There is "no strict ordering" between `mapped` and
+    /// `resident`, and `retained` is excluded from `mapped` and unrelated to
+    /// the others, so neither pair is compared.
+    ///
+    /// Those orderings hold for a QUIESCENT process only. `epoch::advance`
+    /// (ctl_refresh) merges each arena's counters with relaxed atomic loads,
+    /// in sequence and without stopping other threads: `active` is the
+    /// arena's `nactive` read in `arena_basic_stats_merge`; `allocated`
+    /// (bins, large stats) is read after it; `resident` is a SECOND read of
+    /// `nactive` + `ndirty` in `pa_shard_stats_merge`. Another thread
+    /// allocating in between gives `allocated > active`; one freeing pages
+    /// that are purged in between (freed pages move to dirty, a purge drops
+    /// them) gives `resident < active`. Seen once under heavy host load
+    /// (active 50982912, resident 49717248). Measured (s131, a throwaway
+    /// probe: 4 threads churning 0.25-4 MiB Vecs, 20k snapshots): 1089 with
+    /// `active < allocated`; with `MALLOC_CONF=dirty_decay_ms:0` also 1 with
+    /// `resident < active`. So the orderings are asserted on SOME snapshot
+    /// out of a bounded number: a torn snapshot is retried, while a wrong
+    /// field mapping in `stats()` (or stats that read 0) fails every attempt.
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     #[test]
     fn stats_are_readable_and_published() {
-        let s = stats().expect("jemalloc stats");
-        assert!(s.allocated > 0, "{s:?}");
-        assert!(s.active >= s.allocated, "{s:?}");
-        assert!(s.resident >= s.active, "{s:?}");
-        assert!(s.mapped >= s.active, "{s:?}");
+        const PAGE: u64 = 4096; // jemalloc's page is a power of two >= 4 KiB
+        const ATTEMPTS: usize = 100;
+        let consistent = |s: &Stats| {
+            s.allocated > 0
+                && s.active >= s.allocated
+                && s.resident >= s.active
+                && s.mapped >= s.active
+                && s.active % PAGE == 0
+                && s.resident % PAGE == 0
+        };
+        let mut torn = Vec::new();
+        let s = loop {
+            let s = stats().expect("jemalloc stats");
+            if consistent(&s) {
+                break s;
+            }
+            torn.push(s);
+            assert!(
+                torn.len() < ATTEMPTS,
+                "no consistent jemalloc snapshot in {ATTEMPTS} tries; first and last: {:?} {:?}",
+                torn[0],
+                torn[torn.len() - 1]
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
         let m = torus_telemetry::Metrics::new();
         publish(&m.jemalloc, &s);
         let text = m.encode();
