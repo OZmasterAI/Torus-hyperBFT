@@ -17915,6 +17915,126 @@ and rerun deep at n = 3.**
   `contention-main.tsv`, `pool-main.tsv`; tools and specs `ozarchy-9b-tools/` (`9bd-spec.json`, `9bs-spec.json`,
   drivers, `9b-chain.sh`, `b9-contention.py`, `b9-foreign.py`, `b9-pool.py`); build `ozarchy-9b-stage/build/`.
 
+## 115. Step 9c, T5.3 A/B: commit manifest in the consensus DB + off-thread header / body write: one binary `perf/t53-manifest-consensus-db` `f72eda52`, both arms `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1`, A = `TORUS_MANIFEST_IN_STATE_DB=1` (old path) vs B = default (new path), Classic, 15 s checkpoints, standard shape, no EVM load, A B B A, 600 s cells, n = 2 (campaign ozarchy-9c, archy, 2026-10-20)
+
+**The commit hook no longer waits behind the checkpoint batch, and G falls by ~78% but not to 0. Block p99 inside the
+checkpoint DB-write windows (union of the 3 nodes' windows) A 917 -> B 485 ms, B / A 0.53 [0.42, 0.67]; out of window
+465 -> 385 ms (0.83, CI spans 1); G = in - out 452 -> 100 ms (0.22, both rounds 0.20 / 0.25, CI [0.04, 1.12]). Inside
+each node's own windows G is 511 -> 245 ms (0.48). Commit hook p99 in window 815 -> 93 ms (0.11); in-window block
+p50 184 -> 19 ms. No cost found: native blocks/s 16.7 -> 20.1 (1.20, both rounds 1.14 / 1.26, CI [0.64, 2.25]), block
+p50 0.95, p99 0.82, matched/s 0.997 [0.958, 1.037], CPU-s per 1M fills 1.018 [0.995, 1.040], exec-thread on-CPU per 1k
+fills 1.026 [0.935, 1.126] (passes the exec-path merge rule: CI spans 1; B's blocks are 17% smaller). Watch: timeouts
+0 -> 3 in 24,153 B blocks (0.12 per 1k; view-timeout reasons 2 -> 7, 5 no_vote); the persist write on the new writer
+thread is 2.3x slower per block (mean 1.66 -> 3.80 ms, p99 15.6 -> 29.0) and the manifest prune p99 is 115 ms, both
+off the consensus thread; exec waits on the writer only 0.02 ms mean (p99 0.10). A's in-window / out p99 and G sit below
+section 106 (1,071 / 542 / 529 ms) because L2.2 + L3.3 give smaller checkpoint batches (108-118 vs 128 MB).**
+
+### 115.1 Setup
+
+* Binary: one fresh build of `origin/perf/t53-manifest-consensus-db` `f72eda52` (on main `689b4c54`) in worktree
+  `wt/9c-f72eda52`, fresh `CARGO_TARGET_DIR` `~/.cargo-target-9c`, 8l4 flags (plain `release --locked`, one package
+  at a time, clang + mold). Node md5 `af6b207d7efea10eafeaa7e6388ee588` on 3 / 3 nodes in every cell; bench `0962a086`,
+  flood `dd59d50d` (`~/bench-results-matched/ozarchy-9c-stage/build/md5s.txt`). `strings` shows
+  `TORUS_MANIFEST_IN_STATE_DB`, `TORUS_SETTLE_NO_MERGE`, `TORUS_BOOK_FAST_ENCODE` and the new T5.3 metrics.
+* Tools: 9a's freeze of main `654f047c` (`git diff 654f047c..origin/main` over tools, devnet and testnet inputs empty).
+* Both arms: code defaults plus `TORUS_SETTLE_NO_MERGE=1 TORUS_BOOK_FAST_ENCODE=1` (the base predates the s131
+  default flips), Classic (every `cell=` line `book_mode=classic` with the arm's flags), 15 s checkpoints, 512 KB push
+  threshold, custody 0, standard (hsdb-300m) load, no EVM load. **A** adds `TORUS_MANIFEST_IN_STATE_DB=1`; each node
+  logged its manifest home (A true, B false, 3 / 3 nodes per cell).
+* Order: w1 (A, warm-up), then A B B A at 600 s, n = 2 per arm. r2-A rerun (see 115.2).
+* Cells: `~/bench-results-matched/ozarchy-9c-{w1,r1-A,r1-B,r2-B}` and `ozarchy-9crr-r2-A` (used as r2 A; the
+  original `ozarchy-9c-r2-A` is kept, not used).
+* Windows (section 106's method, `9c-t53.py`): each node's checkpoint DB-write windows from its "checkpoint db write"
+  log lines (gauge `torus_exec_checkpoint_db_write_{start,end}_ms` start counts match the log count on every node).
+  "Union" = a block interval counts as in window if it overlaps any of the 3 nodes' windows; "own" = only the node's own.
+  G = in-window p99 - out-of-window p99.
+
+### 115.2 Validity
+
+* All used cells rc 0, ACCEPT / AGREE / PASS, right node md5 on every node, 0 panic and 0 fail-stop lines, no-merge
+  fallbacks 0, boundary checkpoints all pipelined.
+* Contention: the original r2-A averaged 0.128 core of foreign load (codex and the desktop, 0.2-0.4 core in its last
+  ~2.5 min), so it was rerun as `ozarchy-9crr-r2-A` (warm-up `ozarchy-9crr-w1` first). The rerun averaged 0.106 core
+  total foreign load (mostly another Claude session and the desktop), with no single foreign process over 0.1 core,
+  so it passes the per-process rule and was not rerun again. All other cells 0.04-0.05 core. With the original r2-A
+  instead of the rerun, G union is A 476 vs B 100 (B / A 0.21) and in-window p99 936 vs 485: same conclusion.
+
+### 115.3 Per cell (run order; node mean)
+
+| cell | arm | matched/s | native blk/s | fills/blk | block p50 / p99 ms | CPU-s / 1M | exec on-CPU ms / 1k fills | timeouts | ckpt write ms mean (MB) |
+|---|---|---|---|---|---|---|---|---|---|
+| w1 | A | 268,308 | 15.171 | 15,429 | 13 / 663 | 22.26 | 2.518 | 0 | 408 (121.8) |
+| r1 | A | 264,114 | 17.821 | 14,451 | 14 / 503 | 23.63 | 2.632 | 0 | 382 (108.4) |
+| r1 | B | 262,439 | 20.360 | 12,599 | 13 / 480 | 24.00 | 2.681 | 1 | 332 (96.8) |
+| r2 | B | 263,391 | 19.762 | 12,946 | 14 / 480 | 23.81 | 2.664 | 2 | 354 (100.6) |
+| r2 (rerun) | A | 263,443 | 15.670 | 16,285 | 14 / 661 | 23.36 | 2.578 | 0 | 401 (118.4) |
+
+### 115.4 Checkpoint windows (ms, mean of 3 nodes)
+
+| cell | arm | union in p50 / p99 | union out p50 / p99 | **G union** | own in p99 | G own | hook in p50 / p99 / max | hook stalls >= 50 ms in / out |
+|---|---|---|---|---|---|---|---|---|
+| r1 | A | 204.5 / 928 | 11.1 / 423 | **505** | 969 | 540 | 21.8 / 836 / 1,234 | 259 / 529 |
+| r1 | B | 18.8 / 482 | 10.5 / 383 | **99** | 616 | 228 | 0.02 / 109 / 392 | 41 / 251 |
+| r2 | B | 19.5 / 488 | 11.6 / 387 | **101** | 654 | 261 | 0.03 / 78 / 729 | 45 / 255 |
+| r2 (rerun) | A | 163.4 / 905 | 11.7 / 508 | **398** | 989 | 482 | 8.0 / 795 / 982 | 204 / 439 |
+
+### 115.5 Arm means and B / A (ratio = geomean of the 2 per-round ratios, 95% t CI, 1 df)
+
+| metric | A | B | B / A [95% CI] |
+|---|---|---|---|
+| block p99 in window (union) | 917 | 485 | 0.53 [0.42, 0.67] |
+| block p99 out of window (union) | 465 | 385 | 0.83 [0.28, 2.46] |
+| **G (union)** | **452** | **100** | **0.22 [0.04, 1.12]** |
+| G (own windows) | 511 | 245 | 0.48 [0.10, 2.34] |
+| commit hook p99 in window | 815 | 93 | 0.11 [0.02, 0.67] |
+| checkpoint DB write ms mean | 391 | 343 | 0.88 [0.79, 0.97] |
+| native blocks/s | 16.75 | 20.06 | 1.20 [0.64, 2.25] |
+| block p50 / p99 ms (whole cell) | 14 / 582 | 13 / 480 | 0.95 / 0.82 |
+| timeouts per 1k native blocks | 0 (0 / 20,195) | 0.124 (3 / 24,153) | n/a |
+| view-timeout reasons (all / no_vote / after_vote / leader) | 2 / 0 / 2 / 0 | 7 / 5 / 0 / 2 | |
+| matched/s | 263,779 | 262,915 | 0.997 [0.958, 1.037] |
+| CPU-s per 1M fills | 23.49 | 23.90 | 1.018 [0.995, 1.040] |
+| **exec-thread on-CPU ms per 1k fills** | 2.605 | 2.672 | 1.026 [0.935, 1.126] |
+| fills per native block | 15,368 | 12,772 | 0.83 |
+| RSS mean MB | 3,607 | 3,454 | 0.96 |
+
+Timers (3 nodes, mean / bucket p99, ms):
+
+| timer | A | B |
+|---|---|---|
+| `torus_on_committed_block_seconds` | 13.3 / 189 | 8.9 / 153 |
+| `torus_commit_manifest_seconds` | 1.88 / 3.05 | 0.04 / 0.50 |
+| `torus_commit_persist_write_seconds` | 1.66 / 15.6 (inline) | 3.80 / 29.0 (writer thread) |
+| `torus_exec_commit_persist_wait_seconds` | absent | 0.02 / 0.10 |
+| `torus_commit_manifest_prune_seconds` | absent | 12.9 / 115 (about 1 per 20 blocks) |
+
+### 115.6 Verdict
+
+* **G falls toward 0 but does not reach it:** 452 -> 100 ms on the union windows, 511 -> 245 ms on each node's own
+  windows. The part section 106 put on `persist_commit_manifest` is gone: the hook's in-window p99 drops 815 -> 93 ms
+  and its in-window p50 22 / 8 -> 0.02 ms. What remains in window (own-window p99 ~635 vs ~390 out) is not the
+  manifest; not localized here.
+* **No cost to blocks/s or CPU:** blocks/s +20% (both rounds up), matched/s and CPU-s per 1M flat, exec-thread on-CPU
+  per fill within noise (passes the merge rule). The checkpoint write itself is 12% shorter (smaller batches without
+  the manifest; 97-101 vs 108-118 MB).
+* **Watch before merge:** 3 timeouts in B vs 0 in A (5 of 7 view timeouts no_vote); small counts at n = 2. The writer
+  thread's persist write is ~2.3x slower per block (it now contends with the checkpoint batch instead of the
+  consensus thread), and exec rarely waits on it (p99 0.10 ms).
+* Merge call is the owner's / 18c's: the question asked (does G fall, at no cost) answers yes for the fall and yes for
+  no cost, with the timeouts as the one open item.
+
+### 115.7 Limits and data
+
+* n = 2 per arm, 1 df: the G and blocks/s CIs span 1 even though both rounds agree in direction.
+* r2 A is a rerun cell run ~15 min after the others and has slightly more foreign load (0.106 core in total).
+* B logs 69 / 102 commit-hook fires per cell (of ~33k) with no matching "sending to execution pipeline" line (A: 0-1);
+  they are left out of the hook rows.
+* Analysis: `~/bench-results-matched/ozarchy-9c-run/analyst/` (`9c-analyse.py`; `9c-combined.txt` = rerun as r2 A,
+  `9c-std.txt` = original r2 A; `9c-t53-combined.{txt,json}` and `9c-t53-all.txt` from `ozarchy-9c-tools/9c-t53.py`;
+  `9c-foreign.txt`, `9crr-foreign.txt`).
+* Campaign: `~/bench-results-matched/ozarchy-9c-run/` (`std/`, `rerun/`, `combined/cells.tsv`, `chain-main.log`,
+  `contention-main.tsv`, `rerun-chain/`); tools `ozarchy-9c-tools/`; build `ozarchy-9c-stage/build/`.
+
 ## Open
 
 - **Restart path (section 46, review log row 51):** (1) `a44bdde6` handles only SIGINT; SIGTERM (`systemctl
